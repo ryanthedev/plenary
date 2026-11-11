@@ -6,8 +6,6 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| p5-auth (builder) | t14s | done p5-auth | reported, idle |
-| p5-authv (verifier) | t153 | verifier p5-authv: OIDC + tenancy | RUNNING |
 | pd-drawh (builder) | t14y | done pd-drawh (platform) | reported, idle |
 | pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | RUNNING |
 
@@ -106,3 +104,13 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   - **M6:** only tenant admins grant `owner`; board owners grant up to editor; a board's last owner is protected.
   - **Codex-only ensemble accepted** for this job (not waiting 69 h for agy); the re-check will be by t153.
 - Fix round on builder t14s (12% context): M1-M7, L3, L6, L7, L8, each with a test.
+
+## 2026-11-11 p5-auth: DONE (commit 91fb274)
+
+- Verifier p5-authv (t153): PASS; fix round (M1-M7, L3, L6-L8) re-checked PASS. `bun test` re-run by me: 143
+  pass, 0 fail. Ensemble: codex only (accepted).
+- Accepted for M2 (re-check R1, MEDIUM): two concurrent owner removals can both pass the last-owner check (no
+  role gained; a tenant admin repairs it). Real fix = an atomic check in the engine's SQL Registry; sent to engine.
+- For engine (PROTOCOL.md): § Tenancy should say "authoritative email" (M1) and the owner-grant rule (M6).
+- Not done (by brief): real Google client (waits for the CEO's credentials), HTTP wiring (phase 3), persistence.
+- Cleanup: tabs closed, t14s and t153 killed and removed.

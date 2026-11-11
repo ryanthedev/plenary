@@ -6,8 +6,10 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| p5-auth (builder) | t14s | worker p5-auth: OIDC + tenancy | RUNNING |
-| p8-ign (builder) | t150 | worker p8-ign: ignore files | RUNNING |
+| p5-auth (builder) | t14s | done p5-auth | reported, idle |
+| p5-authv (verifier) | t153 | verifier p5-authv: OIDC + tenancy | RUNNING |
+| p8-ign (builder) | t150 | done p8-ign | reported, idle |
+| p8-ignv (verifier) | t152 | verifier p8-ignv: ignore files | RUNNING |
 | pd-drawh (builder) | t14y | worker pd-drawh: drawh proposal | RUNNING |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
@@ -47,3 +49,18 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   requires an sdd ensemble review (codex + agy + any harness passing check_adapter; two agreeing = HIGH candidate,
   confirmed or refuted in the report). No platform verifier was running when it arrived. Running builders
   (t14s, t14y, t150) get it via BRIEF-BASE.md; not interrupted.
+
+## 2026-11-11 p5-auth and p8-ign built; verifiers running
+
+- p5-auth (t14s): 28 auth tests, full suite 82 pass; registry signatures listed in docs/m2/reports/p5-auth.md,
+  unchanged since first draft (relayed to proxy). Verifier p5-authv (t153), with sdd ensemble.
+- p8-ign (t150): ignore files, explicit Dockerfile copies, CI clone of herdr-draw. Verifier p8-ignv (t152), with
+  sdd ensemble.
+- Decisions on the builder's open questions (reversible, mine):
+  - **Tenant bootstrap:** operator-created for M2 (an operator command/env at server start creates a tenant
+    for a domain and names its first admin). The first sign-in from a domain does NOT create a tenant, since any
+    Workspace could otherwise claim a tenant on a shared server. Built with the phase-3 wiring.
+  - **Share-link guests sign in** (any Google account) in M2; no anonymous guest sessions.
+- Sent to engine via proxy (PROTOCOL.md is theirs): § Auth says `verify`/`role` resolve null and never throw,
+  so a registry outage looks like a refusal (`auth`, not `unavailable`). Proposal: throw on infrastructure
+  errors and let the gateway answer `unavailable`.

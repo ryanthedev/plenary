@@ -7,6 +7,7 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
 | pd-drawh (builder) | t14y | done pd-drawh (platform) | fix round RUNNING |
+| p8-cluster-env (builder) | t170 | worker p8-cluster-env (platform): cluster compose + CI services | RUNNING |
 | pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | FAIL (2 HIGH), idle; re-checks after fix |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
@@ -176,3 +177,4 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   into the HTTP-wiring job (same function). (2) Spec says gmail needs no `email_verified`; code always requires
   it (safer). Spec change asked of engine via proxy.
 - Sessions t166, t16h closed, killed, removed.
+- p8-cluster-env (t170) started on the proxy's suggestion: cluster compose (Postgres, NATS, MinIO, 3 nodes, LB) and CI services job. Proposed env names go to engine.

@@ -14,3 +14,5 @@
   ensemble review of the diff (codex + agy + any harness passing check_adapter; two agreeing = HIGH candidate,
   confirm or refute it); builders may farm file-disjoint sub-tasks (tests, fixtures, boilerplate) to harnesses in
   git worktrees and own the diff; check usage/quota before a big fan-out. Your Herdr tab still owns the job.
+- Never `pkill`/`killall` by pattern (OFFICE.md, Cleaning up sessions): record the PIDs of browsers and servers you
+  start, kill only those, and use free ports (port 0), never hard-coded ones.

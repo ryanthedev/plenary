@@ -44,3 +44,5 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 proxy: no pkill/killall; kill by recorded PID; no hard-coded ports (t14r and t14v both used Chrome on 9333). In OFFICE.md. t14r and t14v are both blocked on pkill prompts; the CEO has to press 2 in both.
 - 2026-11-11 proxy: sdd check_adapter: only codex works (agy quota exhausted ~70h; grok, kimi, mistral not signed in; qwen not installed). Ensembles are single-harness until the CEO signs some in (optional ask).
 - 2026-11-11 proxy: MAX_VERSION_JUMP vs drawh seeding an old board (first-write exemption or an import path) sent to engine to decide in the v1 spec.
+- 2026-11-11 engine: no first-write exemption from MAX_VERSION_JUMP; seeding = client-side import (version 1, fresh versionNonce, same ids). Relayed to platform for the drawh patch.
+- 2026-11-11 owner refused the t14r/t14v pkill prompts and steered both to kill by PID; rule also in BRIEF-BASE.md (d2e6e5f). Manager watches checked: engine 3, client 2, platform 4 monitors armed. Client caught both blocks; what stalled was who may answer a prompt (classifier refuses send_keys for managers and proxy).

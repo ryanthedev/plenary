@@ -67,6 +67,16 @@ read it with `herdr_agent read lines:5`), and a parent tells a child past 60% to
 - Never: make anything public, register names/domains/packages, publish to npm, edit herdr-draw or
   packages/core, put secrets in the repo or in chat.
 
+## Keep the train moving (CEO, 2026-11-11: "you need to keep the train moving...choo choo")
+
+- **The CEO is never a gate.** Spec reviews and mock approvals are shown to the CEO but nobody waits for them:
+  once a job passes verification, the next phase starts. CEO feedback arrives as change requests, handled like
+  any other job.
+- **Always have the next job running.** When a job is committed, its manager starts the next one the same turn.
+  Run every job whose files and dependencies allow it in parallel (PLAN.md ownership); nobody sits idle.
+- **Only these wait for the CEO:** credentials (the Google OAuth client), spending money, anything public. Work
+  around them (dev tokens, stubs) and keep going.
+
 ## Unsticking and escalating
 
 - A blocked session is its parent's job, not the CEO's: read its screen within a minute. Approve a permission

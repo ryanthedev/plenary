@@ -7,8 +7,6 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
 | p5-auth (builder) | t14s | worker p5-auth: OIDC + tenancy | RUNNING |
-| p8-ci (builder) | t14t | done p8-ci | reported, idle |
-| p8-civ (verifier) | t14w | done p8-civ | PASS, idle |
 | p8-ign (builder) | t150 | worker p8-ign: ignore files | RUNNING |
 | pd-drawh (builder) | t14y | worker pd-drawh: drawh proposal | RUNNING |
 
@@ -40,3 +38,8 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 - For the proxy/engine (not platform files): CI can't compare packages/core against herdr-draw, because
   `test/core-source.test.js` skips that half when `../herdr-draw` is absent (always, on a runner). Hash check of
   core vs SOURCE.json still runs. Options: a second checkout of herdr-draw at the SOURCE.json commit, or accept.
+- Proxy: close it. CI clones public herdr-draw to ../herdr-draw at the SOURCE.json commit before `bun test`
+  (test file untouched). Added to p8-ign (t150). Pinned = proves core equals herdr-draw at that commit; newer
+  herdr-draw changes are still caught only on dev machines.
+- Cleanup (OFFICE.md "Cleaning up sessions"): closed tabs, `hc kill` + `hc rm` on t14t (p8-ci) and t14w
+  (p8-civ); both now `not_found`. No servers or scratch terminals were left running. Removed from the roster.

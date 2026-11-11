@@ -15,8 +15,8 @@ subagents are fine only for quick read-only lookups inside one session.
 | Builder | `worker <job>: <what>` | Builds one job from its brief. |
 | Verifier | `verifier <job>v: <what>` | Checks one job adversarially. Never the builder. |
 
-Tabs are never left as a bare number. When a session is done or recycled, rename its tab `done <job>` or
-`retired <role>`. Labels: every session gets `--label herdr.space=sp21a427967d02459948b4c10156ff82ae` (the
+Tabs are never left as a bare number. When a session finishes its turn, rename its tab `done <job>` or
+`retired <role>` until its parent cleans it up (below). Labels: every session gets `--label herdr.space=sp21a427967d02459948b4c10156ff82ae` (the
 plenary space) and `--label plenary=<role-or-job>`; only the proxy gets `role=orchestrator` (see
 ~/repos/herdr-stage/ROLES.md).
 
@@ -58,6 +58,16 @@ prompt cache is cold, so continuing costs as much as a fresh start): write docs/
 labels and brief line "Read docs/m2/handoff/<…>.md and continue as <role>.", rename its own tab
 `retired <role>`, and stop. Parents check too: the pane footer shows context use (e.g. `Opus 5.5 · medium · 9%`;
 read it with `herdr_agent read lines:5`), and a parent tells a child past 60% to hand off. Keep sessions short-lived: one job per worker.
+
+## Cleaning up sessions (CEO, 2026-11-11: "make sure old agent sessions are being cleaned up")
+
+- When a worker's or verifier's job is committed, or a session is retired after its hand-off is committed, its
+  **parent** closes that session's tab (`herdr_tab close`, engine core), ends its terminal (`hc kill <id>`, then
+  `hc rm <id>`), and removes it from its roster (reports/manager-<track>.md; COMMITMENTS.md for managers).
+- Also kill any test servers, scratch terminals or background processes the job started.
+- Only terminals the team started, by id. Never kill by name or pattern; never touch another space's terminals.
+- Keep no `done` or `retired` tabs around once their work is committed. A verifier whose job came back FAIL may
+  be closed once its report is committed; the builder stays only if it is reused for the fix round.
 
 ## Commits and pushes
 

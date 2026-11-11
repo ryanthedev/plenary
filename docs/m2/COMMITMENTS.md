@@ -36,3 +36,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 proxy: phase 2 waits for the spec's PASS (it implements the exact parts being fixed); the engine runs a phase-3 server scaffold in parallel so the track isn't idle.
 - 2026-11-11 proxy: CI gets a read-only clone of herdr-draw (public repo) at the SOURCE.json commit as ../herdr-draw, so test/core-source.test.js compares on CI too instead of skipping. Proxy re-ran bun test after 8f89d4f: 80 pass, 0 fail (working tree, incl. other builders' uncommitted tests; manager saw 65).
 - 2026-11-11 CEO via owner: reports to the CEO are actions only (credentials, spending, public, a link to look at); no status, no FYIs. In OFFICE.md.
+- 2026-11-11 CEO via owner: parents close and kill finished sessions (committed job or committed hand-off) and any servers/scratch terminals they started; no done/retired tabs kept. In OFFICE.md.

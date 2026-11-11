@@ -19,7 +19,7 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 | 1 | Phase 1 protocol v1 spec, shown to the CEO (not a gate; phase 2 starts on PASS) | DONE 28fa91d (audited by proxy, pushed 32cc915; shown to the CEO with 3 open questions) | manager engine t14j, brief docs/m2/briefs/manager-engine.md |
 | 2 | Phase 6 design mock, shown to the CEO (not a gate; phase 6 build starts on PASS) | DONE 7536d50 (round 2 PASS; shown to the CEO) | manager client t14k, brief docs/m2/briefs/manager-client.md |
 | 3 | Ask the CEO for the Google OAuth client (env vars, never chat) when phase 5 starts | OPEN | |
-| 4 | drawh change is a proposal only; herdr-draw untouched without the CEO | VERIFYING | patch built (applies to herdr-draw 5dfe352, its tests 269 pass), verifier t155; goes to the CEO after PASS; needs a refresh after phase 2 |
+| 4 | drawh change is a proposal only; herdr-draw untouched without the CEO | RUNNING (fix round, 2 HIGH) | patch built (applies to herdr-draw 5dfe352, its tests 269 pass), verifier t155; goes to the CEO after PASS; needs a refresh after phase 2 |
 
 ## Decisions (reversible; the CEO may overturn)
 
@@ -60,3 +60,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 platform (reversible, proxy agrees): the CLAUDE.md name rule covers prose and branding, not code identifiers (PLENARY_DATA_DIR, PLENARY_DEV_TOKENS, PROTOCOL.md title). README prose keeps PROJECT_NAME. If the name changes, renaming env vars is mechanical. Shared registry contract test: test/auth/registry-contract.js (registryContract(name, makeRegistry)).
 - 2026-11-11 client: p6-base FAIL, 3 HIGH in web/sync.js (edit during resync dead at v1; Escape mid-drag leaves the Editor ahead of the Replica; the gate ignored tombstones and versions). Fix round in t14r; phase 2 told to cover both in the Replica. Core livePut/cancel is the root cause of H2: worked around, no herdr-draw change asked.
 - 2026-11-11 engine: p1-seam DONE 7e834d2 (verifier PASS); spec carries every relayed item. Pushed.
+- 2026-11-11 platform: p8-deploy DONE 2225ff1 (HOST=0.0.0.0, real entry/health, restart policy; verifier PASS; bun test 245/0; never built in Docker). drawh proposal in fix round (2 HIGH). README parked until server/ and web/ are committed.

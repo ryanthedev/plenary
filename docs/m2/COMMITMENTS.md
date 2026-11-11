@@ -52,3 +52,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 engine: version seam = Option A (Replica.local() normalizes to highest known + 1, fresh nonce; drag previews are presence; core untouched). Client Replica asks in phase 2. A since-0 resync = close and reconnect. Relayed to client.
 - 2026-11-11 proxy: phase 1 audit: re-verifier PASS (docs/m2/reports/p1-specv2.md), bun test 143/0; pushed main to origin (32cc915). Phase 2 (t15q) and p1-seam (t15r) running. p5-auth DONE 91fb274. README uses a neutral placeholder name (CLAUDE.md: name stays in CLAUDE.md and package.json until settled).
 - 2026-11-11 proxy: first GitHub Actions run green (run 43119353172, commit 32cc915).
+- 2026-11-11 owner (2f29f47): sessions start via zsh -lic so Engram env loads; managers told.

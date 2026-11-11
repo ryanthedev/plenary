@@ -81,6 +81,10 @@ read it with `herdr_agent read lines:5`), and a parent tells a child past 60% to
   `hc rm <id>`), and removes it from its roster (reports/manager-<track>.md; COMMITMENTS.md for managers).
 - Also kill any test servers, scratch terminals or background processes the job started.
 - Only terminals the team started, by id. Never kill by name or pattern; never touch another space's terminals.
+- **Never kill by pattern** (`pkill`, `killall`, `pkill -f`): a `Bash(pkill *)` ask rule blocks the session on a
+  prompt nobody else may answer, and two sessions' processes look alike (2026-11-11: t14r and t14v both ran headless
+  Chrome on port 9333). Start browsers and servers from a script that records the PID, then kill that PID only.
+  Pick a free port per session (port 0, or read the actual port back), never a hard-coded one.
 - Keep no `done` or `retired` tabs around once their work is committed. A verifier whose job came back FAIL may
   be closed once its report is committed; the builder stays only if it is reused for the fix round.
 

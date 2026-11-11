@@ -9,7 +9,7 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 | owner | t13s | owner (audits) | idle after starting the proxy |
 | proxy | t14h | ★ proxy (talk here) | running |
 | manager engine | t14j | manager engine | p1 spec fixed, re-verifying (verifier t151); p3 server scaffold builder t14z running |
-| manager platform | t14q | manager platform | running: p5-auth (builder t14s), p8-ci DONE 8f89d4f, p8-ign (builder t150), drawh proposal (builder t14y) |
+| manager platform | t14q | manager platform | running: p5-auth (builder t14s), p8-ci DONE 8f89d4f; p5-auth verifying (t153), p8-ign verifying (t152); drawh proposal (builder t14y) |
 | manager client | t14k | manager client | running: phase 6 mock verifying (verifier t14v) + p6-base canvas core (builder t14r) |
 
 ## Commitments
@@ -38,3 +38,5 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 CEO via owner: reports to the CEO are actions only (credentials, spending, public, a link to look at); no status, no FYIs. In OFFICE.md.
 - 2026-11-11 CEO via owner: parents close and kill finished sessions (committed job or committed hand-off) and any servers/scratch terminals they started; no done/retired tabs kept. In OFFICE.md.
 - 2026-11-11 CEO via owner: sdd harnesses as helpers (verifier ensemble reviews, builder sub-tasks in worktrees, mock images, quota check first). In OFFICE.md and BRIEF-BASE.md.
+- 2026-11-11 proxy: t14r (p6-base) is blocked on a pkill -f "chrome-prof" prompt (would kill by pattern). Managers and the proxy are refused, by the auto-mode classifier, from pressing keys in another session's dialog, so the CEO has to press 2 there. Then manager client steers it to kill by PID.
+- 2026-11-11 proxy: Auth verify/role return null = refused (close reason: auth), throw = infrastructure error (close reason: unavailable, retryable). Platform (reversible): tenants are created by an operator in M2; share-link guests sign in with Google, no anonymous guests. Sent to engine for the spec.

@@ -43,3 +43,7 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   herdr-draw changes are still caught only on dev machines.
 - Cleanup (OFFICE.md "Cleaning up sessions"): closed tabs, `hc kill` + `hc rm` on t14t (p8-ci) and t14w
   (p8-civ); both now `not_found`. No servers or scratch terminals were left running. Removed from the roster.
+- 2026-11-11 CEO rule (commit 9218fdf, OFFICE.md "sdd helpers"): every platform verifier brief from now on
+  requires an sdd ensemble review (codex + agy + any harness passing check_adapter; two agreeing = HIGH candidate,
+  confirmed or refuted in the report). No platform verifier was running when it arrived. Running builders
+  (t14s, t14y, t150) get it via BRIEF-BASE.md; not interrupted.

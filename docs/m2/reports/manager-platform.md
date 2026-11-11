@@ -10,6 +10,7 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 | pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | RUNNING |
 | p8-readme (builder) | t15s | done p8-readme (platform) | reported, idle |
 | p8-readmev (verifier) | t161 | verifier p8-readmev (platform): repo README | RUNNING |
+| p5-fix (builder) | t166 | worker p5-fix (platform): auth fixes | RUNNING |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
 
@@ -126,3 +127,13 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 - Queued for platform (deploy/, after phase 3 commits): deploy files still say server/main.js "comes in phase
   3"; compose needs `HOST=0.0.0.0`, dev tokens by name, `restart`, and a live HEALTHCHECK.
 - For the CEO via proxy (only if wanted): no LICENSE yet; README says none is granted.
+
+## 2026-11-11 p5-fix started (engine's three items, via proxy)
+
+- Checked first: (1) port.js swallows every error: true. (2) authoritativeEmail accepts any set `hd`: true;
+  rule becomes `hd` = the email's domain, or @gmail.com. (3) partly: admin `setGrant` already enforces owner-grant
+  and last-owner rules with a test (tenancy.test.js "M6"); raw `registry.setGrant` has neither. The last-owner
+  check moves into the Registry contract too (atomic in SQL; closes p5-authv R1); caller rules stay in admin.
+- Trade-off logged: a Workspace user whose email is on a secondary domain (email domain ≠ `hd`) can no longer
+  claim an invite by email; member role via `hd` and share links still work.
+- Builder t166 (Opus, auto, login shell). Verifier to follow.

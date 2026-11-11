@@ -8,9 +8,8 @@ Manager terminal: `t14j` (tab `manager engine`). Parent: proxy `t14h`.
 |---|---|---|---|
 | p3-scaffold (builder) | t14z | done p3-scaffold (engine) | fix round RUNNING (23% context; runs Fable 5.2) |
 | p2-recovery (builder) | t15q | worker p2-recovery (engine): room recovery | RUNNING |
-| p1-seam (builder) | t15r | done p1-seam (engine) | reported, idle |
-| p3-registry (builder) | t169 | worker p3-registry (engine): SQLite registry | RUNNING |
-| p1-seamv (verifier) | t165 | verifier p1-seamv (engine): protocol v1 follow-up | RUNNING |
+| p3-registry (builder) | t169 | done p3-registry (engine) | reported (206 pass), idle |
+| p3-registryv (verifier) | t16m | verifier p3-registryv (engine): SQLite registry | RUNNING |
 | p3-scaffoldv (verifier) | t158 | done p3-scaffoldv (engine): FAIL, 1 HIGH | FAIL reported, idle |
 
 ## 2026-11-11 phase 1 (protocol v1 spec)
@@ -93,3 +92,13 @@ Manager terminal: `t14j` (tab `manager engine`). Parent: proxy `t14h`.
   (setGrant wording, secondary-domain limit, depth 64) checked; 2 MEDIUM, 7 LOW (text; queued for the next spec
   touch: M1 op too big for the bus, M2 pacing "may happen" for multi-tab users, L1 id-less refusal, L3 where depth
   is counted, L5 crash between createBoard and owner grant). My `bun test`: 205 pass, 0 fail. Committed.
+
+- p1-seam committed 7e834d2. Cleanup: t15r, t165 tabs closed, terminals killed and removed; off the roster.
+- p3-registry reported (docs/m2/reports/p3-registry.md): SQLite Registry passes platform's contract (18) + 5 own
+  tests; 206 pass. main.js wiring diff in its report (persists the dev board id in dev-board.json; keeps owner on
+  restart), routed to t14z after its fix round. Postgres needs SELECT ... FOR UPDATE in setGrant. Verifier t16m.
+- p3-registryv t16m: **PASS** (docs/m2/reports/p3-registryv.md): 4 LOW; 3-process race (owner count never < 1),
+  SIGKILL durability, differential fuzz vs memoryRegistry identical, no injection, tenant isolation, injected clock.
+  **Commit held:** its test imports test/auth/registry-contract.js, still
+  uncommitted in platform's p5-fix. Commit right after p5-fix lands (asked the proxy to ping).
+- p5-fix landed (4e16752). Registry committed; my `bun test` before commit is the line below in git log's body.

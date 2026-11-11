@@ -1,0 +1,48 @@
+# Plenary local stack (skeleton). Run from the repo root:
+#   docker compose -f deploy/compose.yml up --build
+# Secrets come from your shell or an untracked .env; none are written here.
+
+services:
+  plenary:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: plenary:dev
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      PORT: "8080"
+      PLENARY_DATA_DIR: /data
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Google sign-in (phase 5); values come from the environment only.
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      # Cluster adapters (phase 4); empty means single node (SQLite, in-memory bus, local disk).
+      # DATABASE_URL: ${DATABASE_URL:-}
+      # NATS_URL: ${NATS_URL:-}
+    volumes:
+      - plenary-data:/data
+    # restart: unless-stopped   # enable in phase 3; until server/main.js exists it would crash-loop
+
+  # phase 4: Postgres store for the cluster adapter.
+  # postgres:
+  #   image: postgres:17
+  #   environment:
+  #     POSTGRES_USER: plenary
+  #     POSTGRES_DB: plenary
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+  #   ports:
+  #     - "127.0.0.1:5432:5432"
+  #   volumes:
+  #     - postgres-data:/var/lib/postgresql/data
+
+  # phase 4: NATS bus for the cluster adapter.
+  # nats:
+  #   image: nats:2
+  #   command: ["-js"]
+  #   ports:
+  #     - "127.0.0.1:4222:4222"
+
+volumes:
+  plenary-data:
+  # postgres-data:   # phase 4

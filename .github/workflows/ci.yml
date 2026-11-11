@@ -1,0 +1,41 @@
+# CI: every gate runs as `bun test` on push and pull request.
+# No secrets, no registry login, no deploy step. Nothing is published from here.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # actions/checkout v7.0.1 (SHA read with `git ls-remote` on 2026-11-11)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      # oven-sh/setup-bun v2.2.0 (SHA read with `git ls-remote` on 2026-11-11)
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.4
+
+      # There are no dependencies today; install only once a lockfile exists.
+      - name: Install (only if a lockfile exists)
+        run: |
+          if [ -f bun.lock ] || [ -f bun.lockb ]; then
+            bun install --frozen-lockfile
+          else
+            echo "No lockfile; skipping install."
+          fi
+
+      - name: Test
+        run: bun test

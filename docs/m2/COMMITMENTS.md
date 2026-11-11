@@ -17,7 +17,7 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 | # | What | Status | Evidence |
 |---|---|---|---|
 | 1 | Phase 1 protocol v1 spec, shown to the CEO (not a gate; phase 2 starts on PASS) | RUNNING (fix round) | manager engine t14j, brief docs/m2/briefs/manager-engine.md |
-| 2 | Phase 6 design mock, shown to the CEO (not a gate; phase 6 build starts on PASS) | VERIFYING | manager client t14k, brief docs/m2/briefs/manager-client.md |
+| 2 | Phase 6 design mock, shown to the CEO (not a gate; phase 6 build starts on PASS) | RUNNING (fix round 1) | manager client t14k, brief docs/m2/briefs/manager-client.md |
 | 3 | Ask the CEO for the Google OAuth client (env vars, never chat) when phase 5 starts | OPEN | |
 | 4 | drawh change is a proposal only; herdr-draw untouched without the CEO | VERIFYING | patch built (applies to herdr-draw 5dfe352, its tests 269 pass), verifier t155; goes to the CEO after PASS; needs a refresh after phase 2 |
 
@@ -47,3 +47,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 engine: no first-write exemption from MAX_VERSION_JUMP; seeding = client-side import (version 1, fresh versionNonce, same ids). Relayed to platform for the drawh patch.
 - 2026-11-11 owner refused the t14r/t14v pkill prompts and steered both to kill by PID; rule also in BRIEF-BASE.md (d2e6e5f). Manager watches checked: engine 3, client 2, platform 4 monitors armed. Client caught both blocks; what stalled was who may answer a prompt (classifier refuses send_keys for managers and proxy).
 - 2026-11-11 platform: p5-auth back for a fix round (an invite could be claimed by a consumer account with a stale verified third-party email). Rule: trust an email only where Google is authoritative (@gmail.com, or email_verified + hd). Sent to engine for § Tenancy.
+- 2026-11-11 client: mock verifier FAIL (HIGH: viewer view showed durable writes; MEDIUM: read-only write controls live, note authors tagged v0, phone docks missing buttons). Fix round 1 in t14m; t14v re-checks.

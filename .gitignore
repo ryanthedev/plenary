@@ -1,2 +1,36 @@
 node_modules
 .DS_Store
+
+# Secrets: env files anywhere in the tree (Compose reads deploy/.env). A committed template is allowed.
+.env
+.env.*
+!.env.example
+# Google's downloaded OAuth client file (client id/secret come from env only).
+client_secret*.json
+# Other credential files: direnv's exports, private keys, SSH keys, service-account style JSON keys.
+.envrc
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+*credentials*.json
+
+# Local databases (SQLite and its sidecar files).
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+
+# Local data and blob directories (PLENARY_DATA_DIR pointed at the repo; Compose itself uses a named volume).
+/data/
+/blobs/
+/deploy/data/
+/deploy/blobs/

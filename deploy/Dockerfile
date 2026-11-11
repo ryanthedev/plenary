@@ -9,7 +9,15 @@ WORKDIR /app
 
 # There are no dependencies today. Once a lockfile exists, copy package.json and
 # the lockfile first and run `bun install --frozen-lockfile --production` here.
-COPY --chown=bun:bun . .
+#
+# Copy only what the server runs, by name; never `COPY . .`. A stray file in the working tree (.env, a local
+# database, .git) cannot reach the image this way. The root .dockerignore is the second line of defence: it
+# also filters inside these directories (for example server/.env or web/x.db).
+# A new top-level runtime directory must be added here.
+COPY --chown=bun:bun package.json ./
+COPY --chown=bun:bun packages/ ./packages/
+COPY --chown=bun:bun server/ ./server/
+COPY --chown=bun:bun web/ ./web/
 
 # SQLite database and blobs live here; compose mounts a named volume on it.
 RUN mkdir -p /data && chown bun:bun /data

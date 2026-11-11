@@ -1,0 +1,53 @@
+# Build context is the repo root. deploy/Dockerfile copies four named paths (package.json, packages/, server/,
+# web/); this file is the second line of defence: it filters inside those paths and keeps the context small.
+# Docker matches these against the context root: unlike .gitignore, a bare `*.db` only matches at the top
+# level, so patterns that must match at any depth start with `**/`.
+
+# Repo history, CI, docs and agent notes: not needed to run the server.
+.git
+.github
+.gitignore
+.dockerignore
+docs
+CLAUDE.md
+
+# Packaging files. Docker reads deploy/Dockerfile itself; nothing in deploy/ is used at runtime.
+# This also keeps deploy/.env (where Compose reads secrets) out of the image.
+deploy
+
+# Tests run in CI from a checkout, not from the image; test/ holds fakes (a fake identity provider, a fake
+# store) that should not ship. Nothing in server/, web/ or packages/ imports from test/.
+test
+
+# Dependencies are installed inside the image (once a lockfile exists), never copied from the host.
+**/node_modules
+**/.DS_Store
+
+# Secrets, at any depth. No exception for .env.example: the image does not need the template.
+**/.env
+**/.env.*
+**/client_secret*.json
+**/.envrc
+**/*.pem
+**/*.key
+**/id_rsa*
+**/id_ed25519*
+**/*credentials*.json
+
+# Local databases (SQLite and its sidecar files), at any depth.
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.db-journal
+**/*.sqlite
+**/*.sqlite-wal
+**/*.sqlite-shm
+**/*.sqlite-journal
+**/*.sqlite3
+**/*.sqlite3-wal
+**/*.sqlite3-shm
+**/*.sqlite3-journal
+
+# Local data and blob directories at the repo root (the container uses /data on a volume).
+data
+blobs

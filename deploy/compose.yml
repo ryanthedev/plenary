@@ -1,6 +1,10 @@
 # Plenary local stack (skeleton). Run from the repo root:
 #   docker compose -f deploy/compose.yml up --build
-# Secrets come from your shell or an untracked .env; none are written here.
+# Secrets come from your shell or deploy/.env (git-ignored; Compose reads .env beside this file); none are
+# written here.
+
+# Fixed project name, so the volume is always `plenary_plenary-data` whatever the directory is called.
+name: plenary
 
 services:
   plenary:

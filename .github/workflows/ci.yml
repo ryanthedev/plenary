@@ -11,7 +11,9 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded runs on pull requests only. On main a running run is never cancelled, but GitHub keeps
+  # only one pending run per group: several quick pushes to main can still drop a run that had not started.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -36,6 +38,29 @@ jobs:
           else
             echo "No lockfile; skipping install."
           fi
+
+      # test/core-source.test.js compares packages/core with ../herdr-draw/core and skips that check when the
+      # directory is missing. Put herdr-draw there, at the commit packages/core/SOURCE.json names, so the check
+      # runs in CI too. Public repo, anonymous read-only clone; nothing is pushed. A full clone (not shallow),
+      # because SOURCE.json holds a short SHA and a shallow clone cannot resolve one.
+      # This proves core equals herdr-draw AT THAT COMMIT. It does not notice newer herdr-draw commits.
+      - name: Check out herdr-draw at the commit in SOURCE.json
+        run: |
+          set -euo pipefail
+          sha="$(bun -e 'const c = JSON.parse(require("node:fs").readFileSync("packages/core/SOURCE.json", "utf8")).commit; if (typeof c !== "string" || !/^[0-9a-f]{7,40}$/.test(c)) { console.error("SOURCE.json: commit is missing or is not a hex SHA"); process.exit(1); } console.log(c);')"
+          if [ -e ../herdr-draw ]; then
+            echo "../herdr-draw already exists; refusing to reuse it." >&2
+            exit 1
+          fi
+          git clone --quiet --no-tags https://github.com/ryanthedev/herdr-draw ../herdr-draw
+          # Fails, with a message, if the SHA is unknown or (for a short SHA) ambiguous.
+          full="$(git -C ../herdr-draw rev-parse --verify --quiet "${sha}^{commit}")" || {
+            echo "herdr-draw has no single commit matching '$sha' (from packages/core/SOURCE.json): unknown or ambiguous." >&2
+            exit 1
+          }
+          git -C ../herdr-draw checkout --quiet --detach "$full"
+          test -d ../herdr-draw/core
+          echo "herdr-draw at $full (SOURCE.json commit: $sha)"
 
       - name: Test
         run: bun test

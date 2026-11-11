@@ -17,7 +17,8 @@ A board has two streams, each its own document with herdr-draw's merge rules:
 | `notes` | annotations, highlights, comments as elements | owner, editor, annotator, commenter |
 
 Viewers write nothing. Roles come from the server's auth port, never from the client. Annotators and
-commenters change only the notes they made; owners and editors may change or delete anyone's.
+commenters change only the notes they made, and never a stream's settings; owners and editors may change or
+delete anyone's.
 
 ## The op (unchanged from herdr-draw)
 
@@ -29,7 +30,7 @@ commenters change only the notes they made; owners and editors may change or del
 - **A version can't jump** more than 1,000 past the room's copy of that element in one op, so no one can lock
   an element with a huge version.
 - **`appState` keys are a fixed set**, each checked: `layers` (1–100 of `{id, name, visible, locked, opacity 0–100}`),
-  `grid` (0–1000), `snap` (boolean), `timeline` (`{duration}` up to an hour). Unknown keys are refused.
+  `grid` (0–1000), `snap` (boolean), `timeline` (`{duration}` up to an hour). Unknown keys, including prototype names (`__proto__`, `constructor`), are refused.
 - **`appState` keys have no version.** They merge by `seq`: a key takes the value from the highest-`seq` op that
   set it. Clients overlay their own unacknowledged patches on top until acknowledged.
 - **Pictures** never travel in ops. An image element refers to `fileId` (SHA-1 of the bytes); the bytes go

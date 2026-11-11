@@ -60,6 +60,8 @@ export class Room {
     if (!canWrite(c.role, msg.stream)) return c.send({ t: "error", id: msg.id, code: "forbidden", message: `${c.role} can't write to ${msg.stream}` });
     const key = `${c.user}|${msg.id}`;
     if (this.opSeq.has(key)) return c.send({ t: "ack", id: msg.id, seq: this.opSeq.get(key) });   // a resend
+    // The notes stream's settings (its layers) are the moderators': annotators and commenters add notes only.
+    if (msg.op.appState && !canWrite(c.role, "board")) return c.send({ t: "error", id: msg.id, code: "forbidden", message: "only owners and editors change settings" });
     const doc = this.streams[msg.stream];
     for (const el of msg.op.elements ?? []) {
       if (el.version > (doc.getAny(el.id)?.version ?? 0) + MAX_VERSION_JUMP) return c.send({ t: "error", id: msg.id, code: "bad-op", message: `version of ${el.id} jumps too far` });

@@ -53,7 +53,8 @@ const APP_KEYS = {
 export function appStateProblem(patch) {
   if (!isObj(patch)) return "appState must be an object";
   for (const [k, v] of Object.entries(patch)) {
-    if (!APP_KEYS[k]) return `unknown board setting ${JSON.stringify(k)}`;
+    // Own keys only: "__proto__" or "constructor" would otherwise find Object.prototype's members.
+    if (!Object.prototype.hasOwnProperty.call(APP_KEYS, k)) return `unknown board setting ${JSON.stringify(k)}`;
     if (!APP_KEYS[k](v)) return `bad value for ${k}`;
   }
   return null;
@@ -61,5 +62,8 @@ export function appStateProblem(patch) {
 
 /** appState patch keys win by seq: the value from the highest-seq op that set each key. */
 export function mergeAppState(state, seqs, patch, seq) {
-  for (const [k, v] of Object.entries(patch)) if (seq > (seqs[k] ?? 0)) { state[k] = v; seqs[k] = seq; }
+  for (const [k, v] of Object.entries(patch)) {
+    if (!Object.prototype.hasOwnProperty.call(APP_KEYS, k)) continue;   // never a prototype key, whoever sent it
+    if (seq > (seqs[k] ?? 0)) { state[k] = v; seqs[k] = seq; }
+  }
 }

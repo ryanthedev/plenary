@@ -97,3 +97,24 @@ test("board settings are checked: unknown keys and bad values are refused", () =
   w.send(c, "board", { appState: { grid: 20, snap: false, layers: [{ id: "base", name: "Layer 1", visible: true, locked: false, opacity: 100 }] } }); w.settle();
   expect(w.room.streams.board.appState.herdr.grid).toBe(20);
 });
+
+test("prototype keys in settings are refused, and don't crash the room", () => {
+  const w = world(["editor"], 29);
+  w.settle();
+  const c = w.clients[0];
+  for (const raw of ['{"__proto__":{"grid":1}}', '{"constructor":1}', '{"toString":1}']) {
+    const appState = JSON.parse(raw);
+    expect(() => w.room.receive(c.conn, { t: "op", id: `${c.r.client}:${raw}`, stream: "board", op: { appState } })).not.toThrow();
+    expect(errors(c).at(-1).code).toBe("bad-op");
+  }
+  expect(Object.getPrototypeOf(w.room.streams.board.appState.herdr)).toBe(Object.prototype);
+});
+
+test("annotators can't change the notes stream's settings", () => {
+  const w = world(["annotator"], 30);
+  w.settle();
+  const c = w.clients[0];
+  w.send(c, "notes", { appState: { grid: 40 } }); w.settle();
+  expect(w.room.streams.notes.appState.herdr.grid).toBeUndefined();
+  expect(c.r.streams.notes.appState.herdr.grid).toBeUndefined();   // undone on the sender too
+});

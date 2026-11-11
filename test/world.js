@@ -10,7 +10,7 @@ const rngOf = seed => () => { seed |= 0; seed = (seed + 0x6d2b79f5) | 0; let t =
 export function world(roles, seed = 1) {
   const rng = rngOf(seed), log = new MemoryLog();
   const table = Object.fromEntries(roles.map((role, i) => [`tok${i}`, { user: `u${i}`, role }]));
-  const room = new Room({ board: "b1", auth: tableAuth(table), log });
+  const room = new Room({ board: "b1", tenant: "t1", auth: tableAuth(table), log });
   const wire = m => jsonCodec.decode(jsonCodec.encode(m));
   const clients = roles.map((role, i) => ({ i, role, token: `tok${i}`, r: new Replica({ client: `c${i}` }), inbox: [], outbox: [], conn: null }));
   const connect = c => {
@@ -29,6 +29,7 @@ export function world(roles, seed = 1) {
       const k = Math.floor(rng() * c.inbox.length), m = c.inbox[k];
       if (rng() < 0.85) c.inbox.splice(k, 1);   // otherwise it stays, and arrives again later
       c.r.receive(m);
+      if (c.r.resync) { drop(c); connect(c); }   // a refused op: start over from the room's copy
     }
     return true;
   };

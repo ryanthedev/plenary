@@ -7,9 +7,10 @@ import { emptyScene, clone } from "../core/model.js";
 import { STREAMS, mergeAppState } from "./envelope.js";
 
 export class Replica {
-  /** @param {{ client: string }} o — a stable id for this client (op ids are `client:counter`) */
+  /** @param {{ client: string }} o — a name for this client; each Replica adds its own session part, so a
+   *  reloaded page reusing the name never collides with its old op ids (`client.session:counter`). */
   constructor({ client }) {
-    this.client = client; this.counter = 0;
+    this.client = `${client}.${Math.floor(Math.random() * 2 ** 31).toString(36)}`; this.counter = 0;
     this.reset();
   }
 
@@ -29,6 +30,7 @@ export class Replica {
 
   /** The hello to send on (re)connect, then every unacknowledged op again (same ids: the room dedupes). */
   connectMessages(token, board) {
+    this.resync = false;
     return [{ t: "hello", token, board, since: this.applied, client: this.client }, ...[...this.pending.values()].map(p => p.msg)];
   }
 
@@ -49,7 +51,9 @@ export class Replica {
     // Previews (drags, cursors) are shown over the board, never merged into it: a preview may tie with the
     // final op on version and win on the tie-break, and the room never applies previews.
     if (msg.t === "transient") { for (const el of msg.op.elements ?? []) this.previews.set(el.id, el); return; }
-    if (msg.t === "error" && msg.id && this.pending.has(msg.id)) { this.pending.delete(msg.id); this.refused = (this.refused ?? 0) + 1; }
+    // A refused op was already shown here: drop it and start over from the room's copy (PROTOCOL rule 7).
+    // The caller reconnects when `resync` is set; the other pending ops are resent then.
+    if (msg.t === "error" && msg.id && this.pending.has(msg.id)) { this.pending.delete(msg.id); this.reset(); this.resync = true; }
   }
 
   snapshot(msg) {

@@ -4,19 +4,20 @@
 
 import { Doc } from "../core/doc.js";
 import { emptyScene, clone } from "../core/model.js";
-import { STREAMS, canWrite, opProblem, mergeAppState } from "./envelope.js";
+import { STREAMS, canWrite, opProblem, mergeAppState, MAX_VERSION_JUMP, MAX_CLIENT_CHARS } from "./envelope.js";
 
 export class Room {
-  /** @param {{ board: string, auth: import("./ports.js").Auth, log: import("./ports.js").Log }} o */
-  constructor({ board, auth, log }) {
-    this.board = board; this.auth = auth; this.log = log;
+  /** @param {{ board: string, tenant: string, auth: import("./ports.js").Auth, log: import("./ports.js").Log }} o */
+  constructor({ board, tenant, auth, log }) {
+    this.board = board; this.tenant = tenant; this.auth = auth; this.log = log;
     this.seq = 0;
     this.streams = {};
     this.appSeq = {};
     for (const s of STREAMS) { this.streams[s] = new Doc(emptyScene()); this.appSeq[s] = {}; }
     this.tail = [];                     // entries after `base` (the log kept for catch-up)
     this.base = { seq: 0, snapshot: this.snapshot() };
-    this.opSeq = new Map();             // op id → seq it got (repeats get the same ack). TODO: bound per client.
+    this.opSeq = new Map();             // "user|op id" → seq it got (repeats get the same ack). TODO: bound per client.
+    this.noteAuthor = new Map();        // notes element id → the user who made it
     this.conns = new Set();
   }
 
@@ -32,8 +33,12 @@ export class Room {
   }
 
   hello(c, msg) {
+    if (msg.board !== this.board) return c.send({ t: "error", code: "auth", message: "this is another board" });
+    if (typeof msg.client !== "string" || !msg.client || msg.client.length > MAX_CLIENT_CHARS || msg.client.includes(":"))
+      return c.send({ t: "error", code: "bad-op", message: "hello needs a client id (no colon)" });
     const who = this.auth.check(msg.token, this.board);
-    if (!who) return c.send({ t: "error", code: "auth", message: "token refused" });
+    // The tenant comes from the board, on the server: a token from another tenant gets nothing here.
+    if (!who || who.tenant !== this.tenant) return c.send({ t: "error", code: "auth", message: "token refused" });
     Object.assign(c, { user: who.user, role: who.role, client: msg.client });
     c.send({ t: "welcome", seq: this.seq, role: who.role, user: who.user });
     const since = Number(msg.since) || 0;
@@ -49,18 +54,30 @@ export class Room {
   op(c, msg) {
     const problem = opProblem(msg);
     if (problem) return c.send({ t: "error", id: msg.id, ...problem });
+    // Op ids are "client:counter" under this connection's own client id, and dedupe is per user, so no one
+    // can suppress another person's op by sending its id first.
+    if (!msg.id.startsWith(c.client + ":")) return c.send({ t: "error", id: msg.id, code: "bad-op", message: "op ids start with your client id" });
     if (!canWrite(c.role, msg.stream)) return c.send({ t: "error", id: msg.id, code: "forbidden", message: `${c.role} can't write to ${msg.stream}` });
-    if (this.opSeq.has(msg.id)) return c.send({ t: "ack", id: msg.id, seq: this.opSeq.get(msg.id) });   // a resend
+    const key = `${c.user}|${msg.id}`;
+    if (this.opSeq.has(key)) return c.send({ t: "ack", id: msg.id, seq: this.opSeq.get(key) });   // a resend
+    const doc = this.streams[msg.stream];
+    for (const el of msg.op.elements ?? []) {
+      if (el.version > (doc.getAny(el.id)?.version ?? 0) + MAX_VERSION_JUMP) return c.send({ t: "error", id: msg.id, code: "bad-op", message: `version of ${el.id} jumps too far` });
+      // Annotators and commenters change only their own notes; owners and editors moderate everyone's.
+      const author = msg.stream === "notes" && this.noteAuthor.get(el.id);
+      if (author && author !== c.user && !canWrite(c.role, "board")) return c.send({ t: "error", id: msg.id, code: "forbidden", message: "that note is someone else's" });
+    }
     if (msg.transient) {   // relayed, never logged or applied
       for (const o of this.conns) if (o !== c && o.user) o.send({ t: "transient", stream: msg.stream, op: msg.op, by: c.user });
       return;
     }
-    const entry = { seq: this.seq + 1, stream: msg.stream, op: msg.op, by: c.user, id: msg.id };
+    const entry = { seq: this.seq + 1, board: this.board, tenant: this.tenant, stream: msg.stream, op: msg.op, by: c.user, id: msg.id };
     this.log.append(entry);   // durable before anything else (rule 1)
     this.seq = entry.seq;
     this.apply(entry);
     this.tail.push(entry);
-    this.opSeq.set(msg.id, entry.seq);
+    this.opSeq.set(key, entry.seq);
+    if (msg.stream === "notes") for (const el of msg.op.elements ?? []) if (!this.noteAuthor.has(el.id)) this.noteAuthor.set(el.id, c.user);
     c.send({ t: "ack", id: msg.id, seq: entry.seq });
     for (const o of this.conns) if (o.user) o.send({ t: "entries", entries: [entry] });
   }

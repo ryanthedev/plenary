@@ -6,12 +6,12 @@ Manager terminal: `t14j` (tab `manager engine`). Parent: proxy `t14h`.
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| p1-spec (builder) | t14n | worker p1-spec: protocol v1 spec | reported, idle |
-| p1-specv (verifier) | t14p | done p1-specv | FAIL reported, idle |
-| p1-spec fix round | t14n | worker p1-spec: protocol v1 spec | reported, idle |
-| p1-specv2 (re-verifier) | t151 | verifier p1-specv2: protocol v1 spec, round 2 | RUNNING |
-| p3-scaffold (builder) | t14z | done p3-scaffold (engine) | reported (128 tests pass), idle |
-| p3-scaffoldv (verifier) | t158 | verifier p3-scaffoldv (engine): server scaffold | RUNNING |
+| p3-scaffold (builder) | t14z | done p3-scaffold (engine) | fix round RUNNING (23% context; runs Fable 5.2) |
+| p2-recovery (builder) | t15q | worker p2-recovery (engine): room recovery | RUNNING |
+| p1-seam (builder) | t15r | done p1-seam (engine) | reported, idle |
+| p3-registry (builder) | t169 | worker p3-registry (engine): SQLite registry | RUNNING |
+| p1-seamv (verifier) | t165 | verifier p1-seamv (engine): protocol v1 follow-up | RUNNING |
+| p3-scaffoldv (verifier) | t158 | done p3-scaffoldv (engine): FAIL, 1 HIGH | FAIL reported, idle |
 
 ## 2026-11-11 phase 1 (protocol v1 spec)
 
@@ -74,3 +74,22 @@ Manager terminal: `t14j` (tab `manager engine`). Parent: proxy `t14h`.
     welcome in this incarnation; the gateway tells the room when a connection closes; the room drops its `n` state.
   - M5 records races: a refusal on `records` only drops that op from the pending overlay (no reset, no resync);
     no-op record actions (repeat resolve/react, dead target) are accepted, logged and acked.
+- p1 committed 28fa91d. Cleanup: t14n, t14p, t151 tabs closed, terminals killed and removed (checked with
+  `hc ls --all`); dropped from the roster. Started p2-recovery (t15q) and p1-seam (t15r) the same turn.
+- Standing rule (owner, 2f29f47): new sessions start via `zsh -lic 'exec "$@"' zsh claude …` so Engram gets its
+  env. Running sessions pick it up when they recycle.
+- p1-seam reported (docs/m2/reports/p1-seam.md): all 12 items + round-2 findings in PROTOCOL.md (461 to 630
+  lines), no renames, 143/143. It lists platform code that now disagrees with the spec (port.js swallows throws;
+  oidc.js accepts any hd; registry.js has no last-owner check) and extra phase-2 rows. Verifier p1-seamv t165 started.
+- p3-scaffoldv t158: **FAIL** (docs/m2/reports/p3-scaffoldv.md). H1: a few deeply nested (~30,000 levels) but
+  valid ops stall the whole process ~2 s on every join, permanently (they're in the log). Held: kill -9 x6 (3,593
+  acked ops, 0 lost/duplicated), late append, slow reader, traversal, pre-auth reach. 5 MEDIUM, 8 LOW.
+  Fix: t14z (gateway depth scan <= 64 before decode, encode catch-up once; its MEDIUM/LOWs); t15r (§ Limits depth
+  64); t15q (opProblem depth check, iterative). t165 told to include the new spec edit.
+- Proxy decision: engine owns the durable Registry. p3-registry (t169) builds a SQLite adapter in server/registry/
+  against server/auth/registry.js, incl. atomic last-owner in setGrant; must pass platform's factory contract test
+  (test/auth/). main.js wiring goes to t14z after its fix round.
+- p1-seamv t165: **PASS** (docs/m2/reports/p1-seamv.md): 12 items + all round-2 findings closed; late edits
+  (setGrant wording, secondary-domain limit, depth 64) checked; 2 MEDIUM, 7 LOW (text; queued for the next spec
+  touch: M1 op too big for the bus, M2 pacing "may happen" for multi-tab users, L1 id-less refusal, L3 where depth
+  is counted, L5 crash between createBoard and owner grant). My `bun test`: 205 pass, 0 fail. Committed.

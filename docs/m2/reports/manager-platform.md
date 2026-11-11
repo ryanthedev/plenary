@@ -168,3 +168,4 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 
 - Verifier p8-deployv (t16j): PASS, no HIGH/MEDIUM. `bun test` re-run by me: 245 pass, 0 fail (engine fixed its
   four). Image never built, compose never run (no Docker). Sessions t16b, t16j closed, killed, removed.
+- Proxy: engine's SQLite Registry commit waits on p5-fix (imports registry-contract.js and mint). On p5-fix commit, message t14j and t14h with the commit id.

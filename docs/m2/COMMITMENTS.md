@@ -9,7 +9,7 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 | owner | t13s | owner (audits) | idle after starting the proxy |
 | proxy | t14h | ★ proxy (talk here) | running |
 | manager engine | t14j | manager engine | p1 spec fixed, re-verifying (verifier t151); p3 server scaffold builder t14z running |
-| manager platform | t14q | manager platform | running: p5-auth (builder t14s), p8-ci DONE 8f89d4f; p5-auth verifying (t153), p8-ign verifying (t152); drawh proposal (builder t14y) |
+| manager platform | t14q | manager platform | running: p5-auth (builder t14s), p8-ci DONE 8f89d4f; p5-auth verifying (t153), p8-ign DONE 4fc4c71; drawh proposal (builder t14y) |
 | manager client | t14k | manager client | running: phase 6 mock verifying (verifier t14v) + p6-base canvas core (builder t14r) |
 
 ## Commitments
@@ -42,3 +42,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 proxy: Auth verify/role return null = refused (close reason: auth), throw = infrastructure error (close reason: unavailable, retryable). Platform (reversible): tenants are created by an operator in M2; share-link guests sign in with Google, no anonymous guests. Sent to engine for the spec.
 - 2026-11-11 owner: every session gets plenary.reports-to=<parent id>; worker/verifier tabs name their track, e.g. `worker p2-recovery (engine): room recovery`. Running sessions relabelled and renamed by the proxy.
 - 2026-11-11 proxy: no pkill/killall; kill by recorded PID; no hard-coded ports (t14r and t14v both used Chrome on 9333). In OFFICE.md. t14r and t14v are both blocked on pkill prompts; the CEO has to press 2 in both.
+- 2026-11-11 proxy: sdd check_adapter: only codex works (agy quota exhausted ~70h; grok, kimi, mistral not signed in; qwen not installed). Ensembles are single-harness until the CEO signs some in (optional ask).

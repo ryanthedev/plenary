@@ -20,10 +20,29 @@ nothing is registered or published yet. Do not create GitHub repos, orgs, npm pa
 - Self-hosting means open source, not a one-process product.
 - The server never runs layout; clients do (as herdr-draw does).
 
+## Decisions (2026-11-11, M2 scope, from the person)
+
+- **M2 is a scale-ready product**, replacing "adopt infrastructure only when measured" for M2: one program,
+  two roles (gateways hold sockets and fan out; room hosts sequence one board each, sharded by board, with a
+  lease and takeover). One process on one machine; many behind a load balancer.
+- **Eventually consistent is fine** for delivery; still one sequencer per board, and an acknowledged op is
+  never lost. Presence (cursors, laser, emotes) is never saved and may drop.
+- **Swappable adapters:** single-node = SQLite (`synchronous=FULL`), in-memory bus, local disk; cluster =
+  **Postgres + NATS**, S3-compatible blobs. Logs go to the terminal (structured).
+- **Sign-in:** dev tokens, then Google (OIDC) with the OAuth client in the person's Omniping Google Cloud
+  project; client id/secret from env only. **Tenant = Google Workspace domain; anyone else by invite or
+  share link.** Boards are created by an admin endpoint (`POST /boards`), never by a hello.
+- **Full canvas UI** over core's Editor (design mock approved before building) and **full collaboration**:
+  annotations, cursors, avatars, selections, laser, draw, highlighter, emotes, reactions, comment threads,
+  a connection status pill.
+- **drawh** gets the protocol by byte-identical copy + SOURCE.json for now; maybe a published package later
+  (nothing published until the person says so).
+
 ## Milestones
 
-M0 herdr-draw today · **M1 core package + protocol v0 (this repo now)** · M2 server v0 + web client ·
-M3 presenter features + smoothness · M4 split tiers, load test to 100k · M5 mobile · M6 enterprise ·
+M0 herdr-draw today · M1 core package + protocol v0 (done) · **M2 scale-ready product: server (single
+node and cluster), Google sign-in, multi-tenant, full canvas + collaboration, ~10k-client load test** ·
+M3 smoothing · M4 load test to 100k and tuning · M5 mobile · M6 enterprise (SCIM, audit) ·
 M7 multi-region · M8 hardening. Each milestone's gate becomes a CI check.
 
 ## Shape

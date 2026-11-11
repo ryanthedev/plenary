@@ -55,3 +55,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 owner (2f29f47): sessions start via zsh -lic so Engram env loads; managers told.
 - 2026-11-11 proxy: start command pins --model opus --permission-mode auto (t15y came up as Fable 5.2 in manual mode under zsh -lic); OFFICE.md b8bce5b.
 - 2026-11-11 engine: p1-seam written, verifier t165. Three p5-auth code gaps (null-vs-throw in port.js, hd must equal email domain, setGrant last-owner/owner-grant) sent to platform as job p5-fix.
+- 2026-11-11 platform (reversible): authoritative email = hd equal to the email domain or @gmail.com; secondary-domain Workspace users claim access via the hd member role or share links, not email invites. Last-owner check moves into the Registry contract (atomic in SQL).

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plenary mock · legend</title>
+<style>
+  :root { --bg: #f6f6f8; --fg: #1b1b1f; --muted: #5f636b; --border: #e2e2e8; --card: #fff; --accent: #6965db; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #18181b; --fg: #e9ecef; --muted: #a6a6b0; --border: #313137; --card: #1f1f23; --accent: #a8a5ff; } }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 60px; }
+  h1 { font-size: 22px; margin: 0 0 4px; } h2 { font-size: 16px; margin: 28px 0 8px; }
+  p { margin: 6px 0; } a { color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  .tag { display: inline-block; font-size: 11px; font-weight: 600; color: #fff; padding: 1px 6px; border-radius: 4px; white-space: nowrap; }
+  .core { background: #2f9e44; } .v0 { background: #1971c2; } .v1 { background: #9c36b5; } .new { background: #e8590c; }
+  .muted { color: var(--muted); } code { font-size: 12px; }
+  .scroll { overflow-x: auto; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Plenary design mock: legend</h1>
+  <p class="muted">M2 phases 6 (canvas UI) and 7 (collaboration). <a href="index.html">← back to the mock</a> · <a href="phone.html">phone frames</a>.
+    Turn on <b>show sources</b> in the mock's MOCK bar to see these tags on every surface.</p>
+
+  <h2>Where each thing comes from</h2>
+  <div class="scroll"><table>
+    <tr><th>Tag</th><th>Means</th></tr>
+    <tr><td><span class="tag core">core …</span></td><td>Exists today in <code>packages/core</code> (the named Editor method, constant or module). The web/ client draws it.</td></tr>
+    <tr><td><span class="tag v0">v0 …</span></td><td>In PROTOCOL.md v0 as committed (roles, the <code>notes</code> stream, ack/resend, <code>welcome.role</code>).</td></tr>
+    <tr><td><span class="tag v1">v1 …</span></td><td><b>Needs protocol v1 (phase 1).</b> Named after the v1 draft in PROTOCOL.md (presence, <code>records</code>, <code>here</code>, Blobs), which the CEO has not reviewed yet. It may change.</td></tr>
+    <tr><td><span class="tag new">new in web/</span></td><td>Not in core or the protocol. The web/ client builds it on top: highlighter and note tools, PNG export, the connection pill, the touch layout.</td></tr>
+  </table></div>
+
+  <h2>Who can touch what</h2>
+  <p>Presenter = PROTOCOL.md <code>owner</code>/<code>editor</code>. Annotator = <code>annotator</code>. Viewer = <code>viewer</code>. The role comes from the server, never the client.</p>
+  <div class="scroll"><table>
+    <tr><th></th><th>Presenter</th><th>Annotator</th><th>Viewer</th></tr>
+    <tr><td>Board drawing (<code>board</code> stream): every tool, side panel, Mermaid, library, layers, animate, frames</td><td>✔ write</td><td>read only (selection and panel limited to own notes)</td><td>read only</td></tr>
+    <tr><td>Notes, highlights, pictures (<code>notes</code> stream). The mock also gives annotators pen, arrow, text and eraser there: <b>beyond the v1 draft</b> (open question)</td><td>✔ anyone's</td><td>✔ own only; others' show 🔒 (knowing authors: <span class="tag v1">v1 snapshot noteAuthor</span>)</td><td>read</td></tr>
+    <tr><td>Comments: start, reply, resolve, react (<code>records</code>, v1)</td><td>✔</td><td>✔</td><td>read only</td></tr>
+    <tr><td>Cursor, selection shown to others (v1 presence)</td><td>✔ seen by everyone</td><td>✔ seen by presenters and annotators (mock choice; v1 draft caps at 50)</td><td>— (sends none)</td></tr>
+    <tr><td>Laser (core tool; v1 presence)</td><td>✔</td><td>—</td><td>—</td></tr>
+    <tr><td>Emotes (v1 presence, fixed set)</td><td>✔</td><td>✔</td><td>✔ (counted, not shown per person)</td></tr>
+    <tr><td>Undo / redo, tool lock</td><td>✔</td><td>✔ (own notes)</td><td>—</td></tr>
+    <tr><td>Pan, zoom, fit, frames ‹ ›, theme</td><td>✔</td><td>✔</td><td>✔</td></tr>
+    <tr><td>Export (SVG; PNG new)</td><td>✔</td><td>—</td><td>—</td></tr>
+  </table></div>
+
+  <h2>Connection pill</h2>
+  <div class="scroll"><table>
+    <tr><th>State</th><th>Shown when</th><th>Source</th></tr>
+    <tr><td>Live</td><td>Socket open, <code>welcome</code> received with a writing role.</td><td><span class="tag new">new in web/</span> over <span class="tag v0">v0 welcome</span></td></tr>
+    <tr><td>Reconnecting · N edits waiting</td><td>Socket dropped, retrying. N = <code>Replica.pending.size</code> (never shown to viewers, who write nothing durable: they see "the live view is paused"); they are resent with the same ids (rule 2). Others' cursors and laser are hidden (stale presence is never shown).</td><td><span class="tag v0">v0 rule 2</span></td></tr>
+    <tr><td>Offline · N edits waiting</td><td>Retries gave up or the browser says offline. Viewers see only "the live view is paused". For writers, pending edits live in the tab's memory only: closing the tab loses them (the banner says so).</td><td><span class="tag v0">v0 Replica</span></td></tr>
+    <tr><td>View only</td><td><code>welcome.role</code> is <code>viewer</code>. For a non-viewer session (mock: role presenter + read-only), a banner explains the downgrade and every write control is disabled. Emotes still work (viewers may send them).</td><td><span class="tag v0">v0 welcome.role</span></td></tr>
+  </table></div>
+
+  <h2>Not in this mock, on purpose</h2>
+  <p class="muted">Sign-in, share/invite, board picker, follow-the-presenter, minimap, chat, video, polls, AI. The brief keeps them out; the ones a role may need are open questions in docs/m2/reports/p6-mock.md.</p>
+</main>
+</body>
+</html>

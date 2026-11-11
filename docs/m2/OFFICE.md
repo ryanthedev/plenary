@@ -27,11 +27,12 @@ plenary space), `--label plenary=<role-or-job>` and `--label plenary.reports-to=
 hc run --bg --no-parent --cwd /Users/r/repos/plenary \
   --label herdr.space=sp21a427967d02459948b4c10156ff82ae --label plenary=<job> \
   --label plenary.reports-to=<your terminal id> \
-  -- zsh -lic 'exec "$@"' zsh claude --settings /Users/r/.config/claude/settings.shared.json --plugin-dir /Users/r/repos/engram \
+  -- zsh -lic 'exec "$@"' zsh claude --model opus --permission-mode auto --settings /Users/r/.config/claude/settings.shared.json --plugin-dir /Users/r/repos/engram \
   --plugin-dir /Users/r/repos/herderp --plugin-dir /Users/r/repos/sdd "Read <brief path> and do it."
 ```
 
-The `zsh -lic` wrapper gives the session your shell profile's environment (ENGRAM_ADDR/ENGRAM_TOKEN), so Engram
+`--model opus --permission-mode auto` are required: under the login shell a session came up as Fable 5.2 in manual
+mode and blocked on its first prompt (t15y, 2026-11-11). The `zsh -lic` wrapper gives the session your shell profile's environment (ENGRAM_ADDR/ENGRAM_TOKEN), so Engram
 works; without it Engram fails with "name resolver error". Then right away: find its tab (herdr_agent get, engine core) and rename it (herdr_tab rename, engine core).
 Record the terminal id in COMMITMENTS.md. Steer a running session with `herdr_agent prompt`; watch with
 `herdr_agent watch` piped into Monitor, re-armed whenever it expires. Kill only terminals you started.

@@ -12,12 +12,13 @@ subagents are fine only for quick read-only lookups inside one session.
 | Owner | `owner (audits)` | Started the team. Audits the proxy's commits on request. Mostly idle. |
 | Proxy | `★ proxy (talk here)`, `role=orchestrator` | The CEO's contact. Runs the managers, owns COMMITMENTS.md, audits every phase before it's pushed, asks the CEO only for decisions that are theirs. |
 | Manager | `manager <track>` | Runs one track (PLAN.md). Writes briefs, starts builders and verifiers, unsticks them, re-runs tests, commits by path, reports to the proxy. |
-| Builder | `worker <job>: <what>` | Builds one job from its brief. |
-| Verifier | `verifier <job>v: <what>` | Checks one job adversarially. Never the builder. |
+| Builder | `worker <job> (<track>): <what>` | Builds one job from its brief. |
+| Verifier | `verifier <job>v (<track>): <what>` | Checks one job adversarially. Never the builder. |
 
 Tabs are never left as a bare number. When a session finishes its turn, rename its tab `done <job>` or
 `retired <role>` until its parent cleans it up (below). Labels: every session gets `--label herdr.space=sp21a427967d02459948b4c10156ff82ae` (the
-plenary space) and `--label plenary=<role-or-job>`; only the proxy gets `role=orchestrator` (see
+plenary space), `--label plenary=<role-or-job>` and `--label plenary.reports-to=<parent terminal id>` (owner
+2026-11-11: make the hierarchy visible; managers report to the proxy, workers and verifiers to their manager); only the proxy gets `role=orchestrator` (see
 ~/repos/herdr-stage/ROLES.md).
 
 ## Starting a session
@@ -25,6 +26,7 @@ plenary space) and `--label plenary=<role-or-job>`; only the proxy gets `role=or
 ```
 hc run --bg --no-parent --cwd /Users/r/repos/plenary \
   --label herdr.space=sp21a427967d02459948b4c10156ff82ae --label plenary=<job> \
+  --label plenary.reports-to=<your terminal id> \
   -- claude --settings /Users/r/.config/claude/settings.shared.json --plugin-dir /Users/r/repos/engram \
   --plugin-dir /Users/r/repos/herderp --plugin-dir /Users/r/repos/sdd "Read <brief path> and do it."
 ```

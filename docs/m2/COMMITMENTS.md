@@ -61,3 +61,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 client: p6-base FAIL, 3 HIGH in web/sync.js (edit during resync dead at v1; Escape mid-drag leaves the Editor ahead of the Replica; the gate ignored tombstones and versions). Fix round in t14r; phase 2 told to cover both in the Replica. Core livePut/cancel is the root cause of H2: worked around, no herdr-draw change asked.
 - 2026-11-11 engine: p1-seam DONE 7e834d2 (verifier PASS); spec carries every relayed item. Pushed.
 - 2026-11-11 platform: p8-deploy DONE 2225ff1 (HOST=0.0.0.0, real entry/health, restart policy; verifier PASS; bun test 245/0; never built in Docker). drawh proposal in fix round (2 HIGH). README parked until server/ and web/ are committed.
+- 2026-11-11 platform: p5-fix DONE 4e16752 (verifier PASS vs spec 7e834d2; bun test 254/0). Small follow-up on 2 older MEDIUMs (createBoard ownerless-board report, gmail email_verified wording).

@@ -8,8 +8,10 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 |---|---|---|---|
 | pd-drawh (builder) | t14y | done pd-drawh (platform) | reported, idle |
 | pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | RUNNING |
-| p5-fix (builder) | t166 | worker p5-fix (platform): auth fixes | RUNNING |
-| p8-deploy (builder) | t16b | worker p8-deploy (platform): deploy matches server | RUNNING |
+| p5-fix (builder) | t166 | done p5-fix (platform) | reported, idle |
+| p5-fixv (verifier) | t16h | verifier p5-fixv (platform): auth fixes | RUNNING |
+| p8-deploy (builder) | t16b | done p8-deploy (platform) | reported, idle |
+| p8-deployv (verifier) | t16j | verifier p8-deployv (platform): deploy matches server | RUNNING |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
 
@@ -151,3 +153,11 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   git (server/main.js, server/*, test/server/, web/, test/web/). Commit README.md + docs/m2/briefs/p8-readme*.md +
   docs/m2/reports/p8-readme*.md by path once those land (re-run `bun test` and the path check first). Sessions
   t15s and t161 closed, killed, removed.
+
+## 2026-11-11 p5-fix and p8-deploy built; verifiers running
+
+- `bun test test/auth`: 65 pass, 0 fail. Full suite: 4 failures, all in engine's untracked test/server
+  (gateway "bad frames": `version` code vs test; two "H1" nesting; "M1/M4 slow sign-in"). p5-fixv must rule out
+  that p5-fix's error propagation causes any of them; reported to the proxy for engine.
+- p5-fix risk for engine: two dev tokens sharing a name (one owner) now throw `last-owner` at start
+  (server/main.js:52); the contract test needs adapters to honour an injected `now`.

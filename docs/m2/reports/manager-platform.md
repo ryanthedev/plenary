@@ -68,3 +68,8 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   track, e.g. `worker p5-wire (platform): …`. The proxy relabelled my existing sessions.
 - pd-drawh (t14y) asked to run `pkill -f "standin.js 8793"`; declined (no pattern kills), steered to
   `kill $PID`. Nothing had started, so nothing was left running.
+- 2026-11-11 rule (OFFICE.md): no pkill/killall; servers started by a script that records the PID, killed by
+  that PID only; free ports (port 0). Sent to running t14y (pd-drawh) and t153 (p5-authv); goes in every new
+  brief.
+- p8-ignv (t152): PASS, no HIGH. Only codex passed `check_adapter`, so the two-harness rule could not fire.
+  Fix round on t150 (MEDIUM 1: key/credential files not ignored; LOW 2-4); t152 re-checks after.

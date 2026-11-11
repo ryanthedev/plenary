@@ -114,7 +114,7 @@ read it with `herdr_agent read lines:5`), and a parent tells a child past 60% to
   prompt that stays inside its brief (`herdr_agent send_keys keys:["1"] engine:"core"`); refuse anything outside
   it (press 2) and steer it to a safe route.
 - Only the CEO's decisions go to the CEO (product calls, spending, credentials, anything public). The proxy sets
-  a timer (`herdr-app do time.timer-<n>m`) and puts the ask as the last line of its own pane. Everything
+  a timer (`herdr-app do "time.timer-<n>m @$HC_TERMINAL_ID <the ask>"`; the bare form is refused) and puts the ask as the last line of its own pane. Everything
   reversible: decide, log it under Decisions in COMMITMENTS.md, keep going.
 - Reports to the CEO contain **only actions the CEO must take** (CEO, 2026-11-11: "i only really want you to let me
   know now what I need to do. and that's it."): credentials, spending, anything public, or a link to look at. No

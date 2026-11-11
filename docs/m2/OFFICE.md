@@ -50,6 +50,19 @@ docs/m2/briefs/<job>.md = docs/m2/BRIEF-BASE.md + the job: goal in the CEO's wor
 4. The manager re-runs `bun test` itself before committing. Say FIXED only when checked; say where.
 5. The proxy audits each finished phase (reads the reports, re-runs the gates) before it pushes.
 
+## sdd helpers (CEO, 2026-11-11: "and we have things like sdd. etc to help")
+
+Herdr tabs stay the unit of ownership; the sdd MCP tools (every session has the sdd plugin) are helpers. Load the
+`sdd:subagent-driven-development` skill before the first sdd call.
+
+1. **Verifiers** also run an sdd ensemble review of the job's diff (codex + agy + every other harness that passes
+   `check_adapter`). A finding two harnesses agree on is a HIGH candidate; the verifier confirms or refutes it
+   and says which in its report.
+2. **Builders** may hand scoped, file-disjoint sub-tasks (tests, fixtures, boilerplate adapters) to sdd harnesses
+   in git worktrees, then own and review the diff before it lands. The builder answers for every line.
+3. **Mock assets:** agy or codex image generation where it helps the design mock.
+4. **Before a big fan-out**, check `usage` and quota.
+
 ## Recycling (context efficiency)
 
 A session hands off when **its context reaches ~60%**, or when it **resumes after more than an hour idle** (the

@@ -10,3 +10,7 @@
 - Report to docs/m2/reports/<job>.md: what changed (files), tests added, how you checked it, what you did NOT
   verify, risks. Then stop and leave your session idle.
 - Blocked on a decision? Write the question as the last line of your pane and in the report; your manager reads it.
+- sdd helpers (OFFICE.md, "sdd helpers"; load `sdd:subagent-driven-development` first): verifiers add an sdd
+  ensemble review of the diff (codex + agy + any harness passing check_adapter; two agreeing = HIGH candidate,
+  confirm or refute it); builders may farm file-disjoint sub-tasks (tests, fixtures, boilerplate) to harnesses in
+  git worktrees and own the diff; check usage/quota before a big fan-out. Your Herdr tab still owns the job.

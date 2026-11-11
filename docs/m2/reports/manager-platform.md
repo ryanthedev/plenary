@@ -94,3 +94,15 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   2^53 and lock the element). Seeding is a client-side import: drawh rewrites each element's version to 1 with a
   fresh versionNonce, ids kept; no new message, no server path. Goes into the drawh patch's fix round if t155
   sends it back, else the post-phase-2 refresh.
+
+## 2026-11-11 p5-authv: PASS with 7 MEDIUM; fix round sent back
+
+- Verifier t153: no auth bypass, cross-tenant access, forgery or existence leak. Only codex passed
+  `check_adapter` (agy out of quota ~69 h; grok/kimi/mistral not signed in), so one harness, run twice.
+- Decisions (mine, reversible):
+  - **M1 = unverified.** A Google account is trusted for an email only when Google is authoritative
+    (@gmail.com, or `email_verified` + `hd`). Guests on other domains reach a board by share link, not by invite
+    to their email. So the job is treated as FAIL until fixed.
+  - **M6:** only tenant admins grant `owner`; board owners grant up to editor; a board's last owner is protected.
+  - **Codex-only ensemble accepted** for this job (not waiting 69 h for agy); the re-check will be by t153.
+- Fix round on builder t14s (12% context): M1-M7, L3, L6, L7, L8, each with a test.

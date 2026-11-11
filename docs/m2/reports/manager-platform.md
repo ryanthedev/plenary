@@ -8,9 +8,10 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 |---|---|---|---|
 | pd-drawh (builder) | t14y | done pd-drawh (platform) | reported, idle |
 | pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | RUNNING |
-| p8-readme (builder) | t15s | done p8-readme (platform) | reported, idle |
+| p8-readme (builder) | t15s | done p8-readme (platform) | fix round RUNNING |
 | p8-readmev (verifier) | t161 | verifier p8-readmev (platform): repo README | RUNNING |
 | p5-fix (builder) | t166 | worker p5-fix (platform): auth fixes | RUNNING |
+| p8-deploy (builder) | t16b | worker p8-deploy (platform): deploy matches server | RUNNING |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
 
@@ -137,3 +138,14 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 - Trade-off logged: a Workspace user whose email is on a secondary domain (email domain ≠ `hd`) can no longer
   claim an invite by email; member role via `hd` and share links still work.
 - Builder t166 (Opus, auto, login shell). Verifier to follow.
+
+## 2026-11-11 engine items from p3-scaffoldv; README verdict
+
+- Proxy: engine builds the SQLite/Postgres Registry adapters in server/ against platform's contract; in-memory
+  registry.js stays the reference. Added to p5-fix: a shared contract test `registryContract(name, makeRegistry)`
+  in test/auth/registry-contract.js for both.
+- `HOST=0.0.0.0` and the stale phase-3 notes: new job p8-deploy (t16b), files deploy/ + .dockerignore.
+- p8-readmev (t161): FAIL on one HIGH, the real name via env var names (PLENARY_DATA_DIR, PLENARY_DEV_TOKENS).
+  **Ruling (mine, reversible):** the name rule covers prose and branding; identifiers in code (env vars, file
+  names, the committed PROTOCOL.md title) keep their names until a rename. README prose keeps `PROJECT_NAME`.
+  Fix round on t15s for MEDIUM 2 (tenancy IS wired; OIDC, sessions, invites, links, admin API are not), LOW 3, 4.

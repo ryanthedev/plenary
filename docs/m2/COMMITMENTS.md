@@ -8,16 +8,16 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 |---|---|---|---|
 | owner | t13s | owner (audits) | idle after starting the proxy |
 | proxy | t14h | ★ proxy (talk here) | running |
-| manager engine | t14j | manager engine | verifying: phase 1 spec (builder t14n done, verifier t14p) |
-| manager platform | t14q | manager platform | running: p5-auth (builder t14s) and p8-ci (builder t14t) |
-| manager client | t14k | manager client | running: phase 6 mock (builder t14m) + p6-base canvas core (builder t14r) |
+| manager engine | t14j | manager engine | p1 spec FAILED verification (2 HIGH, 7 MED, 10 LOW; docs/m2/reports/p1-specv.md), builder t14n fixing + Registry seam; asked to start p3 scaffold in parallel |
+| manager platform | t14q | manager platform | running: p5-auth (builder t14s), p8-ci verifying (verifier t14w), drawh proposal (builder t14y) |
+| manager client | t14k | manager client | running: phase 6 mock verifying (verifier t14v) + p6-base canvas core (builder t14r) |
 
 ## Commitments
 
 | # | What | Status | Evidence |
 |---|---|---|---|
-| 1 | Phase 1 protocol v1 spec, shown to the CEO (not a gate; phase 2 starts on PASS) | VERIFYING | manager engine t14j, brief docs/m2/briefs/manager-engine.md |
-| 2 | Phase 6 design mock, shown to the CEO (not a gate; phase 6 build starts on PASS) | RUNNING | manager client t14k, brief docs/m2/briefs/manager-client.md |
+| 1 | Phase 1 protocol v1 spec, shown to the CEO (not a gate; phase 2 starts on PASS) | RUNNING (fix round) | manager engine t14j, brief docs/m2/briefs/manager-engine.md |
+| 2 | Phase 6 design mock, shown to the CEO (not a gate; phase 6 build starts on PASS) | VERIFYING | manager client t14k, brief docs/m2/briefs/manager-client.md |
 | 3 | Ask the CEO for the Google OAuth client (env vars, never chat) when phase 5 starts | OPEN | |
 | 4 | drawh change is a proposal only; herdr-draw untouched without the CEO | OPEN | |
 
@@ -32,3 +32,5 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 proxy: Auth port shape (draft v1: async verify(token) and role(identity, board), awaited at the gateway before hello) relayed from engine to platform. If verification changes it, the proxy re-relays it.
 - 2026-11-11 platform (reversible): a Workspace member's default role on a board = per-board memberRole set at POST /boards, default viewer. Store needs a create call; invites/links/grants live in a registry port (server/auth/registry.js) until engine backs it. Sent to engine for the v1 spec.
 - 2026-11-11 engine: Registry becomes a named port in PROTOCOL.md (boards, tenants, invites, share links, grants; createBoard; Store.board moves to Registry.board; Store keeps log + checkpoints), shaped after platform's server/auth/registry.js. Platform keeps those method names stable. Relayed.
+- 2026-11-11 proxy: platform owns the root .dockerignore and .gitignore (whole file; other tracks ask via the proxy). Reason: COPY . . was sending .git into the image, and .env* wasn't ignored.
+- 2026-11-11 proxy: phase 2 waits for the spec's PASS (it implements the exact parts being fixed); the engine runs a phase-3 server scaffold in parallel so the track isn't idle.

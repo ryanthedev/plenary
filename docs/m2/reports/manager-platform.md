@@ -8,8 +8,6 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 |---|---|---|---|
 | pd-drawh (builder) | t14y | done pd-drawh (platform) | reported, idle |
 | pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | RUNNING |
-| p8-readme (builder) | t15s | done p8-readme (platform) | fix round RUNNING |
-| p8-readmev (verifier) | t161 | verifier p8-readmev (platform): repo README | RUNNING |
 | p5-fix (builder) | t166 | worker p5-fix (platform): auth fixes | RUNNING |
 | p8-deploy (builder) | t16b | worker p8-deploy (platform): deploy matches server | RUNNING |
 
@@ -149,3 +147,7 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   **Ruling (mine, reversible):** the name rule covers prose and branding; identifiers in code (env vars, file
   names, the committed PROTOCOL.md title) keep their names until a rename. README prose keeps `PROJECT_NAME`.
   Fix round on t15s for MEDIUM 2 (tenancy IS wired; OIDC, sessions, invites, links, admin API are not), LOW 3, 4.
+- p8-readme: VERIFIED (re-check PASS, t161), **not committed**: README.md links to engine/client files not yet in
+  git (server/main.js, server/*, test/server/, web/, test/web/). Commit README.md + docs/m2/briefs/p8-readme*.md +
+  docs/m2/reports/p8-readme*.md by path once those land (re-run `bun test` and the path check first). Sessions
+  t15s and t161 closed, killed, removed.

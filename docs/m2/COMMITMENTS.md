@@ -19,7 +19,7 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 | 1 | Phase 1 protocol v1 spec, shown to the CEO (not a gate; phase 2 starts on PASS) | RUNNING (fix round) | manager engine t14j, brief docs/m2/briefs/manager-engine.md |
 | 2 | Phase 6 design mock, shown to the CEO (not a gate; phase 6 build starts on PASS) | VERIFYING | manager client t14k, brief docs/m2/briefs/manager-client.md |
 | 3 | Ask the CEO for the Google OAuth client (env vars, never chat) when phase 5 starts | OPEN | |
-| 4 | drawh change is a proposal only; herdr-draw untouched without the CEO | OPEN | |
+| 4 | drawh change is a proposal only; herdr-draw untouched without the CEO | VERIFYING | patch built (applies to herdr-draw 5dfe352, its tests 269 pass), verifier t155; goes to the CEO after PASS; needs a refresh after phase 2 |
 
 ## Decisions (reversible; the CEO may overturn)
 
@@ -43,3 +43,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 owner: every session gets plenary.reports-to=<parent id>; worker/verifier tabs name their track, e.g. `worker p2-recovery (engine): room recovery`. Running sessions relabelled and renamed by the proxy.
 - 2026-11-11 proxy: no pkill/killall; kill by recorded PID; no hard-coded ports (t14r and t14v both used Chrome on 9333). In OFFICE.md. t14r and t14v are both blocked on pkill prompts; the CEO has to press 2 in both.
 - 2026-11-11 proxy: sdd check_adapter: only codex works (agy quota exhausted ~70h; grok, kimi, mistral not signed in; qwen not installed). Ensembles are single-harness until the CEO signs some in (optional ask).
+- 2026-11-11 proxy: MAX_VERSION_JUMP vs drawh seeding an old board (first-write exemption or an import path) sent to engine to decide in the v1 spec.

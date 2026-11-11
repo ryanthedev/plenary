@@ -56,8 +56,8 @@ A session hands off when **its context reaches ~60%**, or when it **resumes afte
 prompt cache is cold, so continuing costs as much as a fresh start): write docs/m2/handoff/<role-or-job>.md
 (state, what's next, open threads, terminal ids it owns), commit it by path, start its successor with the same
 labels and brief line "Read docs/m2/handoff/<…>.md and continue as <role>.", rename its own tab
-`retired <role>`, and stop. Parents check too: a manager whose worker looks past 60% (long run, `/context` if
-visible) tells it to hand off. Keep sessions short-lived: one job per worker.
+`retired <role>`, and stop. Parents check too: the pane footer shows context use (e.g. `Opus 5.5 · medium · 9%`;
+read it with `herdr_agent read lines:5`), and a parent tells a child past 60% to hand off. Keep sessions short-lived: one job per worker.
 
 ## Commits and pushes
 

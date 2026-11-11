@@ -8,7 +8,8 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 |---|---|---|---|
 | pd-drawh (builder) | t14y | done pd-drawh (platform) | reported, idle |
 | pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | RUNNING |
-| p8-readme (builder) | t15s | worker p8-readme (platform): repo README | RUNNING |
+| p8-readme (builder) | t15s | done p8-readme (platform) | reported, idle |
+| p8-readmev (verifier) | t161 | verifier p8-readmev (platform): repo README | RUNNING |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
 
@@ -119,3 +120,9 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   appear (CLAUDE.md: the name lives only in CLAUDE.md and package.json for now). Asked the proxy.
 - 2026-11-11 rule (commit 2f29f47): new sessions start as `hc run ... -- zsh -lic 'exec "$@"' zsh claude <args>`
   so they get Engram's env from the login profile. Running sessions are not restarted.
+- p8-readme built (t15s). Verifier first started as t15z with the login-shell wrapper but no `--model opus
+  --permission-mode auto`; it came up as Fable 5.2, so I removed it within a minute and restarted it as t161
+  (Opus 5.5, auto). README commit waits until the engine/client files it links to are committed.
+- Queued for platform (deploy/, after phase 3 commits): deploy files still say server/main.js "comes in phase
+  3"; compose needs `HOST=0.0.0.0`, dev tokens by name, `restart`, and a live HEALTHCHECK.
+- For the CEO via proxy (only if wanted): no LICENSE yet; README says none is granted.

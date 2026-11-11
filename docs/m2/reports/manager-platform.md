@@ -8,8 +8,6 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 |---|---|---|---|
 | pd-drawh (builder) | t14y | done pd-drawh (platform) | reported, idle |
 | pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | RUNNING |
-| p5-fix (builder) | t166 | done p5-fix (platform) | reported, idle |
-| p5-fixv (verifier) | t16h | verifier p5-fixv (platform): auth fixes | RUNNING |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
 
@@ -169,3 +167,12 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 - Verifier p8-deployv (t16j): PASS, no HIGH/MEDIUM. `bun test` re-run by me: 245 pass, 0 fail (engine fixed its
   four). Image never built, compose never run (no Docker). Sessions t16b, t16j closed, killed, removed.
 - Proxy: engine's SQLite Registry commit waits on p5-fix (imports registry-contract.js and mint). On p5-fix commit, message t14j and t14h with the commit id.
+
+## 2026-11-11 p5-fix: DONE (commit 4e16752)
+
+- Verifier p5-fixv (t16h): PASS against PROTOCOL.md 7e834d2. `bun test` re-run by me: 254 pass, 0 fail.
+  Engine (t14j) and proxy told the commit id directly (engine's SQLite Registry depends on it).
+- Old MEDIUMs, not from this job: (1) createBoard throws without the board id if the owner grant fails. Fold
+  into the HTTP-wiring job (same function). (2) Spec says gmail needs no `email_verified`; code always requires
+  it (safer). Spec change asked of engine via proxy.
+- Sessions t166, t16h closed, killed, removed.

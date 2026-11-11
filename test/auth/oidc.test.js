@@ -263,3 +263,14 @@ test("L7: hd is trimmed", async () => {
   expect((await v(await idp.mint({ hd: "  Acme.com " }))).domain).toBe("acme.com");
   expect((await v(await idp.mint({ hd: "   " }))).domain).toBe(null);
 });
+
+// ---- Fix round (p5-fix) ----
+
+test("p5-fix 2: with hd, the email counts only if its domain IS hd (case-insensitive, trimmed)", async () => {
+  expect((await v(await idp.mint({ email: "x@other.com", hd: "acme.com" }))).email).toBe(null);
+  expect((await v(await idp.mint({ email: "x@sub.acme.com", hd: "acme.com" }))).email).toBe(null);
+  expect((await v(await idp.mint({ email: "x@other.com", hd: "acme.com" }))).domain).toBe("acme.com");   // still a member
+  expect((await v(await idp.mint({ email: "X@ACME.com", hd: "  Acme.COM " }))).email).toBe("x@acme.com");
+  expect((await v(await idp.mint({ email: "x@acme.com", hd: "acme.com", email_verified: false }))).email).toBe(null);
+  expect((await v(await idp.mint({ email: "gus@gmail.com", hd: "acme.com" }))).email).toBe("gus@gmail.com");
+});

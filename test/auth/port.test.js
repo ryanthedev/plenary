@@ -38,7 +38,7 @@ test("session tokens: issue/verify round-trip; tamper, wrong key, expiry refused
   await expect(sessions({ key: "short" })).rejects.toThrow();
 });
 
-test("port: verify takes session or (configured) dev tokens, never a Google ID token; never throws", async () => {
+test("port: verify takes session or (configured) dev tokens, never a Google ID token; bad input is null", async () => {
   const idp = await fakeIdp(); await idp.addKey("k1");
   const registry = memoryRegistry();
   const s = await sessions({ key: KEY });
@@ -109,4 +109,34 @@ test("L8: a dev entry without a usable name is refused at config; a Map works", 
   expect(() => devAuth({ enabled: true, tokens: { "dev-a": { name: "a b" } } })).toThrow();
   const d = devAuth({ enabled: true, tokens: new Map([["dev-a", { name: "a" }]]) });
   expect((await d.verify("dev-a")).user).toBe("dev:a");
+});
+
+// ---- Fix round (p5-fix) ----
+
+test("p5-fix 1: a Registry outage propagates from role(); refusals stay null", async () => {
+  const registry = memoryRegistry();
+  const admin = { user: "google:root", name: "Root", email: null, domain: "acme.com" };
+  const acme = await registry.createTenant({ domain: "acme.com", admins: [admin.user] });
+  const b = await createBoard({ caller: admin, tenant: acme.id }, { registry });
+  let down = false;
+  const flaky = new Proxy(registry, { get: (r, k) => (typeof r[k] === "function" ? (...a) => { if (down) throw new Error("registry down"); return r[k](...a); } : r[k]) });
+  const s = await sessions({ key: KEY });
+  const auth = authPort({ sessions: s, tenancy: tenancy({ registry: flaky }) });
+  expect(await auth.role(ann, b.id)).toBe("viewer");
+  expect(await auth.role(ann, "b-nope")).toBe(null);                       // unknown board: refused
+  expect(await auth.role({ ...ann, domain: "globex.com", user: "google:x" }, b.id)).toBe(null);  // no role: refused
+  expect(await auth.role(null, b.id)).toBe(null);                          // bad input: refused
+  down = true;
+  await expect(auth.role(ann, b.id)).rejects.toThrow("registry down");
+  // The stand-in gateway turns that into `unavailable`, not `auth`.
+  const store = fakeStore(registry);
+  expect(await gatewayHello({ token: await s.issue(ann), board: b.id, client: "c1" }, { auth, store })).toEqual({ error: "unavailable" });
+});
+
+test("p5-fix 1: verify refuses bad tokens with null but lets a verifier's failure through", async () => {
+  const s = await sessions({ key: KEY });
+  const broken = { async verify(t) { if (t === "boom") throw new Error("verifier down"); return null; } };
+  const auth = authPort({ sessions: s, dev: broken, tenancy: tenancy({ registry: memoryRegistry() }) });
+  for (const bad of [undefined, null, 1, {}, "", "junk", "s1.a.b", "s1.!!.??"]) expect(await auth.verify(bad)).toBe(null);
+  await expect(auth.verify("boom")).rejects.toThrow("verifier down");
 });

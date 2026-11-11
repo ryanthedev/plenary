@@ -204,3 +204,41 @@ test("M6: only tenant admins grant owner; owners grant up to editor; the last ow
   // Bob is now the last owner; he can't step down.
   await expect(setGrant({ caller: bob, board: board.id, user: bob.user, role: "editor" }, { registry })).rejects.toMatchObject({ code: "last-owner" });
 });
+
+// ---- Fix round (p5-fix) ----
+
+test("p5-fix 3: registry.setGrant refuses to remove or demote the last owner, and changes nothing", async () => {
+  const before = await registry.grants(board.id);
+  for (const role of [null, "editor", "viewer"])
+    await expect(registry.setGrant(board.id, admin.user, role)).rejects.toMatchObject({ code: "last-owner" });
+  expect(await registry.grants(board.id)).toEqual(before);
+  // Granting owner to an owner, or touching a non-owner, is fine.
+  await registry.setGrant(board.id, admin.user, "owner");
+  await registry.setGrant(board.id, ann.user, "editor");
+  await registry.setGrant(board.id, ann.user, null);
+  // With a second owner, one may go; then the other is the last.
+  await registry.setGrant(board.id, bob.user, "owner");
+  await registry.setGrant(board.id, admin.user, null);
+  await expect(registry.setGrant(board.id, bob.user, "editor")).rejects.toMatchObject({ code: "last-owner" });
+  expect(await registry.grant(board.id, bob.user)).toBe("owner");
+});
+
+test("p5-fix 3 (p5-authv R1): two concurrent demotions of the only two owners leave one owner", async () => {
+  await setGrant({ caller: admin, board: board.id, user: ann.user, role: "owner" }, { registry });
+  // Both owners step down at once.
+  const r = await Promise.allSettled([
+    setGrant({ caller: admin, board: board.id, user: admin.user, role: "editor" }, { registry }),
+    setGrant({ caller: ann, board: board.id, user: ann.user, role: null }, { registry }),
+  ]);
+  expect(r.filter(x => x.status === "fulfilled").length).toBe(1);
+  const lost = r.find(x => x.status === "rejected");
+  expect(lost.reason).toBeInstanceOf(AdminError);
+  expect(lost.reason.code).toBe("last-owner");
+  expect((await registry.grants(board.id)).filter(g => g.role === "owner").length).toBe(1);
+  // A tenant admin removing both owners at once: same result.
+  await setGrant({ caller: admin, board: board.id, user: bob.user, role: "owner" }, { registry });
+  const owners = (await registry.grants(board.id)).filter(g => g.role === "owner").map(g => g.user);
+  expect(owners.length).toBe(2);
+  await Promise.allSettled(owners.map(user => setGrant({ caller: admin, board: board.id, user, role: null }, { registry })));
+  expect((await registry.grants(board.id)).filter(g => g.role === "owner").length).toBe(1);
+});

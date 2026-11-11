@@ -1,11 +1,22 @@
-// The Registry port: tenants, the board registry, per-board grants, invites and share links. Platform-local for
-// now (Store has `board(id)` but no create call and no home for the rest); the engine will back it with SQLite /
-// Postgres and PROTOCOL.md will name it. Method names here are STABLE: the engine builds against them.
+// The Registry port (PROTOCOL.md § Registry): tenants, the board registry (`Registry.board(id)`; the Store has no
+// board lookup), per-board grants, invites and share links. This file holds the in-memory adapter; the engine backs
+// the same port with SQLite / Postgres, tested by test/auth/registry-contract.js. Method names are STABLE.
+//
+// Last owner: `setGrant` refuses to remove or demote a board's last `owner` grant, throwing an error whose
+// `code` is "last-owner" (match on the code, not the class: other adapters throw their own). The check and the
+// write are one atomic step (here: no await between them; in SQL: one transaction or a conditional write), and a
+// refused call changes nothing. Caller rules (who may grant what) live in server/admin/boards.js.
 //
 // Every method is async. Ids are server-minted over [a-z0-9-] (no ".", "*", ">"), never a domain name, so they
 // are safe in bus subjects (PROTOCOL.md § Bus).
 
 import { randomId, normEmail } from "./util.js";
+
+/** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code === "last-owner"`. */
+export class RegistryError extends Error {
+  /** @param {"last-owner"} code */
+  constructor(code, message) { super(message); this.name = "RegistryError"; this.code = code; }
+}
 
 /**
  * @typedef {"owner"|"editor"|"annotator"|"commenter"|"viewer"} Role
@@ -21,7 +32,7 @@ import { randomId, normEmail } from "./util.js";
  *   addTenantAdmin(tenant: string, user: string): Promise<void>,
  *   createBoard(o: { tenant: string, title?: string, memberRole?: Role|null }): Promise<Board>,
  *   board(id: string): Promise<Board|null>,
- *   setGrant(board: string, user: string, role: Role|null): Promise<void>,
+ *   setGrant(board: string, user: string, role: Role|null): Promise<void>,   // rejects code "last-owner" (atomic)
  *   grant(board: string, user: string): Promise<Role|null>,
  *   grants(board: string): Promise<{ user: string, role: Role }[]>,
  *   createInvite(o: { board: string, email: string, role: Role, expiresAt?: number|null, by: string }): Promise<Invite>,
@@ -89,7 +100,11 @@ export function memoryRegistry({ now = Date.now } = {}) {
     async setGrant(board, user, role) {
       if (!boards.has(board)) throw new Error("registry: no such board");
       if (!grants.has(board)) grants.set(board, new Map());
-      if (role == null) grants.get(board).delete(user); else grants.get(board).set(user, role);
+      const g = grants.get(board);
+      // Check and write with no await in between: atomic in one JS process.
+      if (g.get(user) === "owner" && role !== "owner" && [...g.values()].filter(r => r === "owner").length <= 1)
+        throw new RegistryError("last-owner", "a board keeps at least one owner");
+      if (role == null) g.delete(user); else g.set(user, role);
     },
     async grant(board, user) { return grants.get(board)?.get(user) ?? null; },
     async grants(board) { return [...(grants.get(board) ?? [])].map(([user, role]) => ({ user, role })); },

@@ -5,7 +5,12 @@
 // If § Auth changes shape, this file is the one to change.
 //
 // `verify` accepts a server session token (session.js) or, only when configured, a dev token (dev.js). It never
-// accepts a Google ID token, never touches the network, and returns null (never throws) on bad input.
+// accepts a Google ID token and never touches the network.
+//
+// Refusal vs outage (p5-fix): `null` means REFUSED (the gateway answers `auth`): a malformed, forged, expired or
+// unknown token, a bad signature, an unknown board, no role. Infrastructure failures (a Registry that throws, a
+// verifier that fails) are NOT refusals: they propagate, and the gateway answers `unavailable`. So verifiers and
+// tenancy.role return null for "not mine / invalid" and let genuine failures escape; nothing here catches.
 
 /** @typedef {import("./oidc.js").Identity} Identity */
 
@@ -19,14 +24,14 @@ export function authPort({ sessions, dev, tenancy }) {
     async verify(token) {
       if (typeof token !== "string" || !token) return null;
       for (const v of verifiers) {
-        try { const id = await v.verify(token); if (id) return id; } catch { /* refuse */ }
+        const id = await v.verify(token);
+        if (id) return id;
       }
       return null;
     },
-    // PROTOCOL.md § Auth: resolve null on refusal, never throw. A registry outage therefore also answers `auth`;
-    // see the p5-auth report (open point) on whether it should be `unavailable` instead.
+    // null on refusal (bad identity, unknown board, no role); a Registry error rejects (→ `unavailable`).
     async role(identity, board) {
-      try { return await tenancy.role(identity, board); } catch { return null; }
+      return tenancy.role(identity, board);
     },
   };
 }

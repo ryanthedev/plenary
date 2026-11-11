@@ -118,14 +118,18 @@ const MAX_TOKEN_AGE_SEC = 86_400;
 
 /**
  * The email, only when Google is authoritative for it (Google's "Verify the Google ID token" guide): it ends in
- * `@gmail.com`, or `email_verified` is true AND `hd` is set. A consumer account's third-party email may have
- * changed hands since Google verified it, so it must not claim an invite. Otherwise null.
+ * `@gmail.com`, or `email_verified` is true AND `hd` equals the email's domain (`hd` arrives trimmed and
+ * lower-cased). A consumer account's third-party email may have changed hands since Google verified it, and an
+ * `hd` account's email on another domain isn't vouched for by that Workspace, so neither may claim an invite.
+ * (A Workspace user on a secondary domain therefore gets no email: still a member via `hd`, and links work.)
+ * `email_verified` is required in every case. Otherwise null.
  */
 function authoritativeEmail(c, hd) {
   if (c.email_verified !== true || typeof c.email !== "string") return null;
   const e = c.email.trim().toLowerCase();
   if (!e || e.length > 320 || !/^[^@\s]+@[^@\s]+$/.test(e)) return null;
-  return e.endsWith("@gmail.com") || hd ? e : null;
+  if (e.endsWith("@gmail.com")) return e;
+  return hd && e.slice(e.lastIndexOf("@") + 1) === hd ? e : null;
 }
 
 /**

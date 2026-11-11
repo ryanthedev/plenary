@@ -6,7 +6,7 @@
 //   invites and links:      the board's owner (grant) or an admin of the board's tenant.
 //   grants:                 a tenant admin sets any role, owner included. A board owner sets roles up to editor,
 //                           and may change an owner's grant only if it is their own. Nobody removes or demotes a
-//                           board's last owner (code `last-owner`).
+//                           board's last owner (code `last-owner`; the Registry enforces it atomically too).
 // Refusals throw AdminError. For anything naming a board, an unknown board and a caller without rights get the
 // same `forbidden` error, so existence doesn't leak.
 
@@ -74,7 +74,12 @@ export async function setGrant({ caller, board, user, role }, { registry }) {
     const owners = (await registry.grants(b.id)).filter(g => g.role === "owner");
     if (owners.length <= 1) throw new AdminError("last-owner", "a board keeps at least one owner");
   }
-  await registry.setGrant(b.id, user, role);
+  // The check above is a fast path; the Registry re-checks atomically, which settles concurrent calls.
+  try { await registry.setGrant(b.id, user, role); }
+  catch (err) {
+    if (err?.code === "last-owner") throw new AdminError("last-owner", "a board keeps at least one owner");
+    throw err;
+  }
 }
 
 /** Invite an email to a board. Works across domains. */

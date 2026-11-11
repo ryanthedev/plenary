@@ -90,3 +90,7 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 - For engine (via proxy): the room refuses an element more than 1,000 versions ahead (`MAX_VERSION_JUMP`), so an
   old, heavily edited board file can't be fully seeded. Should a first write of an element be exempt?
 - Next platform job after these: wire auth + admin into server/ once phase 3 (engine) is committed.
+- Engine (via proxy) on drawh seeding: no first-write exemption (an exempt first write could claim a version near
+  2^53 and lock the element). Seeding is a client-side import: drawh rewrites each element's version to 1 with a
+  fresh versionNonce, ids kept; no new message, no server path. Goes into the drawh patch's fix round if t155
+  sends it back, else the post-phase-2 refresh.

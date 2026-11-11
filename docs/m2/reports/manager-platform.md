@@ -8,7 +8,8 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 |---|---|---|---|
 | p5-auth (builder) | t14s | done p5-auth | reported, idle |
 | p5-authv (verifier) | t153 | verifier p5-authv: OIDC + tenancy | RUNNING |
-| pd-drawh (builder) | t14y | worker pd-drawh: drawh proposal | RUNNING |
+| pd-drawh (builder) | t14y | done pd-drawh (platform) | reported, idle |
+| pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | RUNNING |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
 
@@ -80,3 +81,12 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 - Left open (LOW): `web/dev.html` ships in the image until phase 3 decides how the client is served;
   SOURCE.json's 7-char SHA could become ambiguous (engine's file; full SHA would fix it).
 - Cleanup: tabs closed, t150 and t152 killed and removed.
+
+## 2026-11-11 pd-drawh built; verifier running
+
+- Builder t14y: patch (docs/m2/proposals/drawh-server.patch, base herdr-draw 5dfe352) + one-page proposal; applies
+  cleanly, herdr-draw tests 269 pass (258 before); herdr-draw checkout untouched. Copied protocol is v0, so a
+  small follow-up is expected after phase 2. Verifier pd-drawhv (t155) with sdd ensemble.
+- For engine (via proxy): the room refuses an element more than 1,000 versions ahead (`MAX_VERSION_JUMP`), so an
+  old, heavily edited board file can't be fully seeded. Should a first write of an element be exempt?
+- Next platform job after these: wire auth + admin into server/ once phase 3 (engine) is committed.

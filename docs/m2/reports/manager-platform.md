@@ -8,8 +8,6 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 |---|---|---|---|
 | p5-auth (builder) | t14s | done p5-auth | reported, idle |
 | p5-authv (verifier) | t153 | verifier p5-authv: OIDC + tenancy | RUNNING |
-| p8-ign (builder) | t150 | done p8-ign | reported, idle |
-| p8-ignv (verifier) | t152 | verifier p8-ignv: ignore files | RUNNING |
 | pd-drawh (builder) | t14y | worker pd-drawh: drawh proposal | RUNNING |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
@@ -73,3 +71,12 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   brief.
 - p8-ignv (t152): PASS, no HIGH. Only codex passed `check_adapter`, so the two-harness rule could not fire.
   Fix round on t150 (MEDIUM 1: key/credential files not ignored; LOW 2-4); t152 re-checks after.
+
+## 2026-11-11 p8-ign: DONE (commit 4fc4c71)
+
+- Verifier p8-ignv (t152): PASS; fix round (MEDIUM 1 key/credential files, LOW 2-4) re-checked PASS.
+  `bun test` re-run by me: 125 pass, 0 fail; `git ls-files -ci --exclude-standard` empty.
+- Still unverified: no Docker here (`.dockerignore` result simulated); workflow never run on GitHub.
+- Left open (LOW): `web/dev.html` ships in the image until phase 3 decides how the client is served;
+  SOURCE.json's 7-char SHA could become ambiguous (engine's file; full SHA would fix it).
+- Cleanup: tabs closed, t150 and t152 killed and removed.

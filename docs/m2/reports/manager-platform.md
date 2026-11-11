@@ -8,6 +8,7 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 |---|---|---|---|
 | pd-drawh (builder) | t14y | done pd-drawh (platform) | reported, idle |
 | pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | RUNNING |
+| p8-readme (builder) | t15s | worker p8-readme (platform): repo README | RUNNING |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
 
@@ -114,3 +115,5 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 - For engine (PROTOCOL.md): § Tenancy should say "authoritative email" (M1) and the owner-grant rule (M6).
 - Not done (by brief): real Google client (waits for the CEO's credentials), HTTP wiring (phase 3), persistence.
 - Cleanup: tabs closed, t14s and t153 killed and removed.
+- Next job started: p8-readme (t15s). README uses a `PROJECT_NAME` placeholder until the proxy says the name may
+  appear (CLAUDE.md: the name lives only in CLAUDE.md and package.json for now). Asked the proxy.

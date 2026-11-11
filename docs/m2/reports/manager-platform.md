@@ -117,3 +117,5 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 - Cleanup: tabs closed, t14s and t153 killed and removed.
 - Next job started: p8-readme (t15s). README uses a `PROJECT_NAME` placeholder until the proxy says the name may
   appear (CLAUDE.md: the name lives only in CLAUDE.md and package.json for now). Asked the proxy.
+- 2026-11-11 rule (commit 2f29f47): new sessions start as `hc run ... -- zsh -lic 'exec "$@"' zsh claude <args>`
+  so they get Engram's env from the login profile. Running sessions are not restarted.

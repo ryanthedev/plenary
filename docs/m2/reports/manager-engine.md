@@ -8,8 +8,6 @@ Manager terminal: `t14j` (tab `manager engine`). Parent: proxy `t14h`.
 |---|---|---|---|
 | p3-scaffold (builder) | t14z | done p3-scaffold (engine) | fix round RUNNING (23% context; runs Fable 5.2) |
 | p2-recovery (builder) | t15q | worker p2-recovery (engine): room recovery | RUNNING |
-| p3-registry (builder) | t169 | done p3-registry (engine) | reported (206 pass), idle |
-| p3-registryv (verifier) | t16m | verifier p3-registryv (engine): SQLite registry | RUNNING |
 | p3-scaffoldv (verifier) | t158 | done p3-scaffoldv (engine): FAIL, 1 HIGH | FAIL reported, idle |
 
 ## 2026-11-11 phase 1 (protocol v1 spec)
@@ -102,3 +100,8 @@ Manager terminal: `t14j` (tab `manager engine`). Parent: proxy `t14h`.
   **Commit held:** its test imports test/auth/registry-contract.js, still
   uncommitted in platform's p5-fix. Commit right after p5-fix lands (asked the proxy to ping).
 - p5-fix landed (4e16752). Registry committed; my `bun test` before commit is the line below in git log's body.
+- Registry committed f2eb88b (my bun test 254 pass, 0 fail). Cleanup: t169, t16m closed, killed, removed.
+- t14z fix round reported (254 green); asked it to wire the SQLite Registry into main.js + a restart test before
+  re-verification.
+- Queued for the next spec touch: § Tenancy authoritative email = email_verified AND (@gmail.com OR hd == email
+  domain) (platform; gmail does not skip email_verified). Plus p1-seamv's 2 MEDIUM / 7 LOW.

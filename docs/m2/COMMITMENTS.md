@@ -63,3 +63,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 platform: p8-deploy DONE 2225ff1 (HOST=0.0.0.0, real entry/health, restart policy; verifier PASS; bun test 245/0; never built in Docker). drawh proposal in fix round (2 HIGH). README parked until server/ and web/ are committed.
 - 2026-11-11 platform: p5-fix DONE 4e16752 (verifier PASS vs spec 7e834d2; bun test 254/0). Small follow-up on 2 older MEDIUMs (createBoard ownerless-board report, gmail email_verified wording).
 - 2026-11-11 engine: SQLite Registry DONE f2eb88b (verifier PASS; bun test 254/0). Scaffold fix round done; t14z wiring the Registry into main.js with a restart test, then re-verify.
+- 2026-11-11 client: drag previews through the server pause (gateway refuses v0 transient ops) until p6-sync2 moves them to v1 presence after phase 2; engine pings client directly when it lands.

@@ -10,8 +10,6 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 | pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | RUNNING |
 | p5-fix (builder) | t166 | done p5-fix (platform) | reported, idle |
 | p5-fixv (verifier) | t16h | verifier p5-fixv (platform): auth fixes | RUNNING |
-| p8-deploy (builder) | t16b | done p8-deploy (platform) | reported, idle |
-| p8-deployv (verifier) | t16j | verifier p8-deployv (platform): deploy matches server | RUNNING |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
 
@@ -165,3 +163,8 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   100-200 saves on big/busy boards, measured). H2: `--server` anywhere in argv (even text after `--`) switches
   mode. Plus M1-M5, L1-L6. Fix round on t14y (20% context, idle 31 min): H1, H2, M1-M5, L1-L3, and engine's
   seeding rule (version 1 + fresh versionNonce). t155 re-checks after.
+
+## 2026-11-11 p8-deploy: DONE (commit 2225ff1)
+
+- Verifier p8-deployv (t16j): PASS, no HIGH/MEDIUM. `bun test` re-run by me: 245 pass, 0 fail (engine fixed its
+  four). Image never built, compose never run (no Docker). Sessions t16b, t16j closed, killed, removed.

@@ -161,3 +161,7 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   that p5-fix's error propagation causes any of them; reported to the proxy for engine.
 - p5-fix risk for engine: two dev tokens sharing a name (one owner) now throw `last-owner` at start
   (server/main.js:52); the contract test needs adapters to honour an injected `now`.
+- pd-drawhv (t155): FAIL, 2 HIGH. H1: a save landing during the bridge's file write is lost silently (~1 in
+  100-200 saves on big/busy boards, measured). H2: `--server` anywhere in argv (even text after `--`) switches
+  mode. Plus M1-M5, L1-L6. Fix round on t14y (20% context, idle 31 min): H1, H2, M1-M5, L1-L3, and engine's
+  seeding rule (version 1 + fresh versionNonce). t155 re-checks after.

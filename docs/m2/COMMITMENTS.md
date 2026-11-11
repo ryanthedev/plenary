@@ -8,8 +8,8 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 |---|---|---|---|
 | owner | t13s | owner (audits) | idle after starting the proxy |
 | proxy | t14h | ★ proxy (talk here) | running |
-| manager engine | t14j | manager engine | p1 spec FAILED verification (2 HIGH, 7 MED, 10 LOW; docs/m2/reports/p1-specv.md), builder t14n fixing + Registry seam; asked to start p3 scaffold in parallel |
-| manager platform | t14q | manager platform | running: p5-auth (builder t14s), p8-ci verifying (verifier t14w), drawh proposal (builder t14y) |
+| manager engine | t14j | manager engine | p1 spec fixed, re-verifying (verifier t151); p3 server scaffold builder t14z running |
+| manager platform | t14q | manager platform | running: p5-auth (builder t14s), p8-ci DONE 8f89d4f, p8-ign (builder t150), drawh proposal (builder t14y) |
 | manager client | t14k | manager client | running: phase 6 mock verifying (verifier t14v) + p6-base canvas core (builder t14r) |
 
 ## Commitments
@@ -34,3 +34,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 engine: Registry becomes a named port in PROTOCOL.md (boards, tenants, invites, share links, grants; createBoard; Store.board moves to Registry.board; Store keeps log + checkpoints), shaped after platform's server/auth/registry.js. Platform keeps those method names stable. Relayed.
 - 2026-11-11 proxy: platform owns the root .dockerignore and .gitignore (whole file; other tracks ask via the proxy). Reason: COPY . . was sending .git into the image, and .env* wasn't ignored.
 - 2026-11-11 proxy: phase 2 waits for the spec's PASS (it implements the exact parts being fixed); the engine runs a phase-3 server scaffold in parallel so the track isn't idle.
+- 2026-11-11 proxy: CI gets a read-only clone of herdr-draw (public repo) at the SOURCE.json commit as ../herdr-draw, so test/core-source.test.js compares on CI too instead of skipping. Proxy re-ran bun test after 8f89d4f: 80 pass, 0 fail (working tree, incl. other builders' uncommitted tests; manager saw 65).

@@ -17,7 +17,7 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 | # | What | Status | Evidence |
 |---|---|---|---|
 | 1 | Phase 1 protocol v1 spec, shown to the CEO (not a gate; phase 2 starts on PASS) | DONE 28fa91d (audited by proxy, pushed 32cc915; shown to the CEO with 3 open questions) | manager engine t14j, brief docs/m2/briefs/manager-engine.md |
-| 2 | Phase 6 design mock, shown to the CEO (not a gate; phase 6 build starts on PASS) | RUNNING (fix round 1) | manager client t14k, brief docs/m2/briefs/manager-client.md |
+| 2 | Phase 6 design mock, shown to the CEO (not a gate; phase 6 build starts on PASS) | DONE 7536d50 (round 2 PASS; shown to the CEO) | manager client t14k, brief docs/m2/briefs/manager-client.md |
 | 3 | Ask the CEO for the Google OAuth client (env vars, never chat) when phase 5 starts | OPEN | |
 | 4 | drawh change is a proposal only; herdr-draw untouched without the CEO | VERIFYING | patch built (applies to herdr-draw 5dfe352, its tests 269 pass), verifier t155; goes to the CEO after PASS; needs a refresh after phase 2 |
 
@@ -53,3 +53,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 proxy: phase 1 audit: re-verifier PASS (docs/m2/reports/p1-specv2.md), bun test 143/0; pushed main to origin (32cc915). Phase 2 (t15q) and p1-seam (t15r) running. p5-auth DONE 91fb274. README uses a neutral placeholder name (CLAUDE.md: name stays in CLAUDE.md and package.json until settled).
 - 2026-11-11 proxy: first GitHub Actions run green (run 43119353172, commit 32cc915).
 - 2026-11-11 owner (2f29f47): sessions start via zsh -lic so Engram env loads; managers told.
+- 2026-11-11 proxy: start command pins --model opus --permission-mode auto (t15y came up as Fable 5.2 in manual mode under zsh -lic); OFFICE.md b8bce5b.

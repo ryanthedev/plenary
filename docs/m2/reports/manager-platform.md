@@ -64,3 +64,7 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 - Sent to engine via proxy (PROTOCOL.md is theirs): § Auth says `verify`/`role` resolve null and never throw,
   so a registry outage looks like a refusal (`auth`, not `unavailable`). Proposal: throw on infrastructure
   errors and let the gateway answer `unavailable`.
+- 2026-11-11 owner rule: every session I start gets `--label plenary.reports-to=t14q` and a tab name with the
+  track, e.g. `worker p5-wire (platform): …`. The proxy relabelled my existing sessions.
+- pd-drawh (t14y) asked to run `pkill -f "standin.js 8793"`; declined (no pattern kills), steered to
+  `kill $PID`. Nothing had started, so nothing was left running.

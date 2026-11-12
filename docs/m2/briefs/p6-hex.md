@@ -81,3 +81,15 @@ auth port and fake come from p6-ports; you add `web/adapters/auth/http.js` (fetc
 - **M2 test gaps in test/web/core/signin.test.js:** a console trap (no logging), a percent-encoded `#code=%41%42`
   hostile case, and a spy on clock.random (or Math.random stubbed to throw) for the retry jitter.
 - The LOWs listed there.
+
+## Carried from p6-edge2v (docs/m2/reports/p6-edge2v.md) — manager decisions
+
+- **M1 presence gate (DECISION, t14k):** add `backlogBytes()` to the transport port (ws.js: bufferedAmount + pre-open
+  queue bytes; bufferless transports: 0). The core sends presence only when the backlog is ≤ ~16 KB (about one frame
+  in flight), and v0 `transient: true` ops count as presence for this rule (skip them, never real ops). Keep
+  `congested()` (256 KB) for the status pill only. Contract test for backlogBytes.
+- **M2:** localRoom (`congested: () => false`, `backlogBytes: () => 0`, `bufferless: true`) and sharedNet (decide its
+  buffer: a worker-side cap or report the MessagePort backlog) implement the full port; run `transportContract` on
+  localRoom in-repo. Until both do, sync.js calls them optionally (`?.()`), never assuming they exist.
+- LOW L1 (a wrapped-globals test proving no global timer runs when a clock is given; the verifier's scratch test is in
+  its report), L2, L3.

@@ -19,16 +19,34 @@
 //                      client has since reopened, closed or seen a drop. This is a gateway that has not yet seen
 //                      the close and keeps flushing (the normal case for a WebSocket or a SharedWorker), and the
 //                      only way to test the generation check itself (p6-portsv H1). hold() and emit() may be async.
+// Backpressure (p6-edgev M1; the port's congested() and hard cap). REQUIRED of every driver, never skipped:
+//   stall()            async: the far side stops reading the CURRENT connection, so what the client sends piles up
+//                      in its outbound backlog (a slow uplink). A new connection (reopen) starts unstalled.
+//   drain()            async: the far side reads everything on the current connection again (backlog to zero) and
+//                      keeps reading.
+//   trickle(n)         async: the far side reads n bytes of the current connection's backlog and stays stalled
+//                      (a slow but moving link).
+//   advance(ms)        async: move the transport's clock (the clock port it was given) by ms.
+//   bufferless: true   instead of the four hooks, for a transport with no outbound buffer (in-memory): then
+//                      congested() is asserted to stay false, and nothing else of this section runs.
+// Traffic the far side ignores: { t: "pad", s } (a request/answer driver must ignore unknown t).
 // Only what the contract says is asserted: no buffering before onMessage, sync or async delivery both fine, and the
 // onDrop tests run only when the adapter has onDrop.
 
 import { describe, test, expect, beforeEach } from "bun:test";
+import { CONGESTED_BYTES, HARD_CAP_BYTES, HARD_CAP_MS, HARD_CAP_SAMPLE_MS } from "../../../web/ports/transport.js";
+
+/** A message that encodes to about n bytes of JSON (ASCII), which the far side ignores. */
+export const pad = n => ({ t: "pad", s: "x".repeat(Math.max(0, n - 18)) });
 
 /**
  * @typedef {{ transport: import("../../../web/ports/transport.js").Transport, request(i: number): object,
  *             answerOf(m: object): number | undefined, serve(): void | Promise<void>, flush(): Promise<void>,
  *             drop(): void | Promise<void>,
- *             hold(): ((i: number) => void | Promise<void>) | Promise<(i: number) => void | Promise<void>> }} TransportDriver
+ *             hold(): ((i: number) => void | Promise<void>) | Promise<(i: number) => void | Promise<void>>,
+ *             stall?(): void | Promise<void>, drain?(): void | Promise<void>, advance?(ms: number): void | Promise<void>,
+ *             trickle?(n: number): void | Promise<void>,
+ *             bufferless?: boolean }} TransportDriver
  * @param {string} name
  * @param {() => TransportDriver | Promise<TransportDriver>} makeTransport
  * @param {{ skip?: boolean }} [opts]
@@ -164,6 +182,183 @@ export function transportContract(name, makeTransport, opts = {}) {
       await old(7);
       await d.flush();
       expect(got).toEqual([]);
+    });
+
+    // ── backpressure (p6-edgev M1): congested() and the hard cap ──
+    describe("backpressure", () => {
+      test("congested() is implemented, and false on a fresh connection", () => {
+        expect(typeof t.congested).toBe("function");
+        expect(t.congested()).toBe(false);
+      });
+
+      test("the driver declares bufferless or provides stall, drain, trickle and advance (never a silent skip)", () => {
+        if (d.bufferless === true) return;
+        for (const k of ["stall", "drain", "trickle", "advance"]) expect(typeof d[k]).toBe("function");
+      });
+
+      test("bufferless: congested() stays false whatever is sent", async () => {
+        if (d.bufferless !== true) return;
+        for (let k = 0; k < 5; k++) t.send(pad(CONGESTED_BYTES));
+        expect(t.congested()).toBe(false);
+        await d.flush();
+        expect(t.congested()).toBe(false);
+      });
+
+      const buffered = () => d.bufferless !== true;
+
+      test("watermark: under it not congested, over it congested, drained not congested", async () => {
+        if (!buffered()) return;
+        await d.stall();
+        t.send(pad(CONGESTED_BYTES / 2));
+        expect(t.congested()).toBe(false);
+        t.send(pad(CONGESTED_BYTES / 2 + 1024));
+        expect(t.congested()).toBe(true);
+        await d.drain();
+        expect(t.congested()).toBe(false);
+      });
+
+      test("congested drops nothing: everything sent while congested arrives, in order", async () => {
+        if (!buffered()) return;
+        await d.stall();
+        t.send(pad(CONGESTED_BYTES + 1024));
+        expect(t.congested()).toBe(true);
+        ask(1, 2, 3);
+        await d.drain();
+        await d.flush();
+        expect(got).toEqual([1, 2, 3]);
+      });
+
+      test("reopen gives a connection that is not congested; close() is never congested", async () => {
+        if (!buffered()) return;
+        await d.stall();
+        t.send(pad(CONGESTED_BYTES + 1024));
+        expect(t.congested()).toBe(true);
+        reopen();
+        expect(t.congested()).toBe(false);
+        await d.stall();
+        t.send(pad(CONGESTED_BYTES + 1024));
+        expect(t.congested()).toBe(true);
+        close();
+        expect(t.congested()).toBe(false);
+      });
+
+      test("hard cap: a stalled backlog over the cap (nothing drains) for the whole hold is one drop; reopen then works", async () => {
+        if (!buffered()) return;
+        await d.stall();
+        t.send(pad(HARD_CAP_BYTES + 1024));
+        await d.advance(HARD_CAP_MS - HARD_CAP_SAMPLE_MS);
+        await d.flush();
+        expect(drops).toBe(0);
+        await d.advance(2 * HARD_CAP_SAMPLE_MS);
+        await d.flush();
+        expect(drops).toBe(1);
+        expect(t.congested()).toBe(false);               // the dead connection's backlog is gone with it
+        await d.advance(3 * HARD_CAP_MS);
+        await d.flush();
+        expect(drops).toBe(1);
+        reopen();
+        ask(1);
+        await d.flush();
+        expect(got).toEqual([1]);
+      });
+
+      // Manager decision 2026-11-12: only a link that makes no drain progress is dropped, never a slow one.
+      test("hard cap: a slow link that stays over the cap but keeps draining is never dropped", async () => {
+        if (!buffered()) return;
+        await d.stall();
+        t.send(pad(HARD_CAP_BYTES + 512 * 1024));
+        for (let k = 0; k < 40; k++) {                  // 40 s over the cap, 8 KB leaving per second
+          await d.trickle(8 * 1024);
+          await d.advance(HARD_CAP_SAMPLE_MS);
+        }
+        await d.flush();
+        expect(drops).toBe(0);
+        expect(t.congested()).toBe(true);
+      });
+
+      test("hard cap: draining while the client adds more (the backlog grows) is still progress, no drop", async () => {
+        if (!buffered()) return;
+        await d.stall();
+        t.send(pad(HARD_CAP_BYTES + 1024));
+        for (let k = 0; k < 30; k++) {
+          await d.trickle(8 * 1024);
+          t.send(pad(16 * 1024));                        // more in than out: the backlog rises every second
+          await d.advance(HARD_CAP_SAMPLE_MS);
+        }
+        await d.flush();
+        expect(drops).toBe(0);
+      });
+
+      test("hard cap: stalled while the client keeps sending is a drop (adding is not draining)", async () => {
+        if (!buffered()) return;
+        await d.stall();
+        t.send(pad(HARD_CAP_BYTES + 1024));
+        for (let k = 0; k < 9; k++) { t.send(pad(1024)); await d.advance(HARD_CAP_SAMPLE_MS); }
+        await d.flush();
+        expect(drops).toBe(0);
+        for (let k = 0; k < 2; k++) { t.send(pad(1024)); await d.advance(HARD_CAP_SAMPLE_MS); }
+        await d.flush();
+        expect(drops).toBe(1);
+      });
+
+      test("hard cap: the hold counts from the last progress: a link that drains, then stops, drops 10 s later", async () => {
+        if (!buffered()) return;
+        await d.stall();
+        t.send(pad(HARD_CAP_BYTES + 512 * 1024));
+        for (let k = 0; k < 15; k++) { await d.trickle(8 * 1024); await d.advance(HARD_CAP_SAMPLE_MS); }
+        await d.advance(HARD_CAP_MS - HARD_CAP_SAMPLE_MS);  // stopped: 9 s with nothing leaving
+        await d.flush();
+        expect(drops).toBe(0);
+        await d.advance(2 * HARD_CAP_SAMPLE_MS);
+        await d.flush();
+        expect(drops).toBe(1);
+      });
+
+      test("hard cap: a backlog that drains before the hold ends is no drop", async () => {
+        if (!buffered()) return;
+        await d.stall();
+        t.send(pad(HARD_CAP_BYTES + 1024));
+        await d.advance(HARD_CAP_MS / 2);
+        await d.drain();
+        await d.advance(2 * HARD_CAP_MS);
+        await d.flush();
+        expect(drops).toBe(0);
+      });
+
+      test("hard cap: one sample under the cap restarts the hold", async () => {
+        if (!buffered()) return;
+        await d.stall();
+        t.send(pad(HARD_CAP_BYTES + 1024));
+        await d.advance(HARD_CAP_MS - 2 * HARD_CAP_SAMPLE_MS);
+        await d.drain();
+        await d.advance(2 * HARD_CAP_SAMPLE_MS);          // a sample sees the drained backlog
+        await d.stall();
+        t.send(pad(HARD_CAP_BYTES + 1024));
+        await d.advance(HARD_CAP_MS - 2 * HARD_CAP_SAMPLE_MS);
+        await d.flush();
+        expect(drops).toBe(0);                           // 18 s over in all, but never 10 s straight
+        await d.advance(4 * HARD_CAP_SAMPLE_MS);
+        await d.flush();
+        expect(drops).toBe(1);
+      });
+
+      test("hard cap: reopen or close during the hold cancels it (no drop)", async () => {
+        if (!buffered()) return;
+        await d.stall();
+        t.send(pad(HARD_CAP_BYTES + 1024));
+        await d.advance(HARD_CAP_MS / 2);
+        reopen();
+        await d.advance(2 * HARD_CAP_MS);
+        await d.flush();
+        expect(drops).toBe(0);
+        await d.stall();
+        t.send(pad(HARD_CAP_BYTES + 1024));
+        await d.advance(HARD_CAP_MS / 2);
+        close();
+        await d.advance(2 * HARD_CAP_MS);
+        await d.flush();
+        expect(drops).toBe(0);
+      });
     });
 
     describe("onDrop (when the adapter has it)", () => {

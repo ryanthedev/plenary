@@ -19,7 +19,14 @@ const flush = async () => { for (let i = 0; i < 10; i++) await Promise.resolve()
 const touched = [];
 const tripwire = name => new Proxy({}, { get(_t, k) { touched.push(`${name}.${String(k)}`); return () => null; } });
 let savedGlobals;
+// Console trap (p6-edgev M2): the core never logs (the code and the token are secrets).
+let logged = [], savedConsole = {};
 beforeEach(() => {
+  logged = []; savedConsole = {};
+  for (const k of ["log", "info", "warn", "error", "debug", "trace"]) {
+    savedConsole[k] = console[k];
+    console[k] = (...a) => { logged.push([k, ...a]); };
+  }
   clock = virtualClock({ t0: T0, seed: 7 });
   auth = fakeAuth({ now: clock.now });
   storage = memoryStore();
@@ -31,6 +38,8 @@ beforeEach(() => {
   }
 });
 afterEach(() => {
+  Object.assign(console, savedConsole);  // restore first, so a failure below can still be printed
+  expect(logged).toEqual([]);
   for (const [g, d] of Object.entries(savedGlobals)) { if (d) Object.defineProperty(globalThis, g, d); else delete globalThis[g]; }
   expect(touched).toEqual([]);           // never localStorage, never sessionStorage directly (the root passes the port)
 });
@@ -90,6 +99,8 @@ describe("takeSignIn: hostile fragments are rejected before any request", () => 
     ["two code=", "#code=aaa&code=bbb"],
     ["the same code twice", "#code=aaa&code=aaa"],
     ["escaped", "#code=a%20b"],
+    ["escaped, valid once decoded", "#code=%41%42"],
+    ["over MAX_FRAGMENT only by padding (the code itself is fine)", "#" + "&x=1".repeat(Math.ceil(MAX_FRAGMENT / 4)) + "&code=abc"],
     ["odd characters", "#code=a<script>"],
     ["a dot", "#code=a.b"],
     ["unicode", "#code=Zoë"],
@@ -104,6 +115,13 @@ describe("takeSignIn: hostile fragments are rejected before any request", () => 
       expect(r).toMatchObject({ token: null, outcome: "bad-fragment" });
     });
   }
+  test("a fragment of exactly MAX_FRAGMENT characters is still looked at", async () => {
+    const tail = "&code=abc";
+    const f = "#" + "x".repeat(MAX_FRAGMENT - tail.length) + tail;
+    expect(f.length - 1).toBe(MAX_FRAGMENT);
+    await takeSignIn(env(f));
+    expect(calls).toEqual(["abc"]);
+  });
   test("a rejected fragment still restores a stored session (it is just not replaced)", async () => {
     const first = await takeSignIn(env(`#code=${auth.mint()}`));
     calls = [];
@@ -180,6 +198,28 @@ describe("takeSignIn: one jittered retry", () => {
     expect(x).toBeGreaterThanOrEqual(RETRY_MIN_MS);
     expect(y).toBeGreaterThanOrEqual(RETRY_MIN_MS);
     expect(x).not.toBe(y);
+  });
+
+  test("the jitter comes from clock.random, never Math.random: the retry lands exactly at MIN + floor(r × SPREAD)", async () => {
+    for (const r of [0, 0.25, 0.999]) {
+      const base = virtualClock({ t0: T0 });
+      let draws = 0;
+      clock = { ...base, random: () => { draws++; return r; } };
+      const a = { n: 0, async exchange() { return this.n++ ? { error: "invalid-code" } : { error: "network" }; } };
+      const savedRandom = Math.random;
+      Math.random = () => { throw new Error("Math.random used"); };
+      let p;
+      try { p = takeSignIn(env("#code=abc", { auth: a })); await flush(); }
+      finally { Math.random = savedRandom; }
+      const wait = RETRY_MIN_MS + Math.floor(r * RETRY_SPREAD_MS);
+      expect(draws).toBe(1);
+      base.advance(wait - 1);
+      await flush();
+      expect(a.n).toBe(1);
+      base.advance(1);
+      await p;
+      expect(a.n).toBe(2);
+    }
   });
 
   test("an adapter error outside AUTH_ERRORS counts as unavailable (and is retried)", async () => {

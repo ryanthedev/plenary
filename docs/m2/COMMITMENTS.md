@@ -95,3 +95,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 client: p6-land PASS; client half of p2-land ready. Security MEDIUM: the #token= fragment persists in browser history. Decision: platform p5-code (single-use code of 60 s or less via POST /auth/exchange); client wires it in p6-hex; not merge-blocking.
 - 2026-11-11 platform: Google sign-in passes every scripted check against the real client; the human login is the only step left. The proxy relays the CEO steps (docs/m2/reports/p5-google.md) after verifier t18z passes.
 - 2026-11-11 platform: p5-hex DONE 02b7434 (auth/admin ports and adapters, IdP and Verifier contract tests, import-rule test; bun test 376/0). p5-code started (t196).
+- 2026-11-11 platform: p5-google DONE 95971bd (dev harness + live check; secret scan 0 hits; bun test 478/0). CEO asked for one human Google login.

@@ -13,13 +13,15 @@
 //
 // Extra routes (dev only):
 //   GET /             a "Sign in with Google" link
-//   GET /signed-in    postLoginUrl. Its script takes the session token from the URL fragment, removes it from the
-//                     address bar, and asks /whoami; the page then shows only "signed in as <email>".
+//   GET /signed-in    postLoginUrl. Its script takes the one-time sign-in code from the URL fragment (`#code=`),
+//                     removes it from the address bar, and trades it at POST /auth/exchange (same origin, the
+//                     exchange cookie riding along) for the session; the page then shows only "signed in as
+//                     <email>". The session token stays in a script variable, never in a URL (brief p5-code).
 //   GET /whoami       Bearer session token → { email } (verified and decoded server-side; never echoes the token)
 //
 // Secrets: the client id and secret are never logged. Logs carry method, path (no query string) and status only.
 
-import { httpRoutes, LOGIN_COOKIE } from "../server/auth/http.js";
+import { httpRoutes, LOGIN_COOKIE, EXCHANGE_COOKIE } from "../server/auth/http.js";
 import { googleOidc } from "../server/auth/oidc.js";
 import { sessions as makeSessions } from "../server/auth/session.js";
 import { memoryRegistry } from "../server/auth/registry.js";
@@ -36,13 +38,14 @@ const HOME = `<p><a href="/auth/login">Sign in with Google</a></p>`;
 const SIGNED_IN = `<p id="who">checking…</p>
 <script>
   const p = new URLSearchParams(location.hash.slice(1));
-  const token = p.get("token");
-  history.replaceState(null, "", location.pathname);          // the token leaves the address bar at once
+  const code = p.get("code");
+  history.replaceState(null, "", location.pathname);          // the code leaves the address bar at once
   const who = document.getElementById("who");
-  if (!token) who.textContent = "not signed in";
-  else fetch("/whoami", { headers: { authorization: "Bearer " + token } })
-    .then(r => r.ok ? r.json() : Promise.reject(r.status))
-    .then(j => { who.textContent = "signed in as " + j.email; })
+  if (!code) who.textContent = "not signed in";
+  else fetch("/auth/exchange", { method: "POST", credentials: "same-origin",
+      headers: { "content-type": "application/json" }, body: JSON.stringify({ code }) })
+    .then(r => r.ok ? r.json() : r.json().then(j => Promise.reject(r.status + " " + j.error), () => Promise.reject(r.status)))
+    .then(s => { who.textContent = "signed in as " + (s.email ?? "(no Google-verified email; user " + s.user + ")"); })
     .catch(s => { who.textContent = "sign-in failed (" + s + ")"; });
 </script>`;
 
@@ -89,8 +92,10 @@ export async function startDevGoogle({ env = process.env, port = PORT, hostname 
       const path = new URL(req.url).pathname;
       // On the callback, whether the browser sent the login cookie back (its presence only, never its value): the
       // first thing to check when a real sign-in ends in login-failed.
-      const extra = path === "/auth/callback"
-        ? { loginCookie: (req.headers.get("cookie") ?? "").split(";").some(c => c.trim().startsWith(LOGIN_COOKIE + "=")) } : {};
+      // On the exchange, likewise whether the exchange cookie came back.
+      const has = name => (req.headers.get("cookie") ?? "").split(";").some(c => c.trim().startsWith(name + "="));
+      const extra = path === "/auth/callback" ? { loginCookie: has(LOGIN_COOKIE) }
+        : path === "/auth/exchange" ? { exchangeCookie: has(EXCHANGE_COOKIE) } : {};
       log({ msg: "http", method: req.method, path, status: res.status, ...extra });
       return res;
     },

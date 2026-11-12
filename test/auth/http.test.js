@@ -1,6 +1,6 @@
 // End to end through server/auth/http.js against the fake IdP (no network): sign-in, the admin API, share links.
 import { test, expect, beforeAll, beforeEach, afterAll } from "bun:test";
-import { httpRoutes, LOGIN_COOKIE } from "../../server/auth/http.js";
+import { httpRoutes, LOGIN_COOKIE, EXCHANGE_COOKIE } from "../../server/auth/http.js";
 import { googleOidc } from "../../server/auth/oidc.js";
 import { sessions as makeSessions } from "../../server/auth/session.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
@@ -10,12 +10,12 @@ import { devAuth } from "../../server/auth/dev.js";
 import { fakeIdp, CLIENT_ID } from "./fake-idp.js";
 
 const ORIGIN = "https://plenary.test";
-const APP = "https://app.plenary.test/";
+const APP = "https://plenary.test/";   // one origin with the callback: a deployment that can sign in
 const config = {
   cookieKey: "k".repeat(32),
   postLoginUrl: APP,
-  postLogoutUrl: "https://app.plenary.test/bye",
-  boardUrl: "https://app.plenary.test/b/{board}",
+  postLogoutUrl: "https://plenary.test/bye",
+  boardUrl: "https://plenary.test/b/{board}",
   publicUrl: ORIGIN,
 };
 
@@ -44,11 +44,25 @@ beforeEach(async () => {
 });
 
 const call = (path, init = {}) => routes(new Request(ORIGIN + path, init));
-const cookieOf = res => {
-  const c = res.headers.getSetCookie().find(s => s.startsWith(LOGIN_COOKIE + "="));
+const cookieOf = (res, name = LOGIN_COOKIE) => {
+  const c = res.headers.getSetCookie().find(s => s.startsWith(name + "="));
   return c ? c.split(";")[0] : null;
 };
-const fragToken = loc => new URLSearchParams(new URL(loc).hash.slice(1)).get("token");
+const APP_ORIGIN = new URL(APP).origin;
+const fragCode = loc => new URLSearchParams(new URL(loc).hash.slice(1)).get("code");
+/** POST /auth/exchange as the web client would (same origin, the exchange cookie riding along). */
+const exchangeCall = (code, { cookie, origin = APP_ORIGIN, via = routes, base = ORIGIN, headers = {} } = {}) =>
+  via(new Request(base + "/auth/exchange", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...(origin ? { origin } : {}), ...(cookie ? { cookie } : {}), ...headers },
+    body: JSON.stringify({ code }),
+  }));
+/** The session token a callback response leads to, via the code exchange. */
+async function fragToken(res) {
+  const r = await exchangeCall(fragCode(res.headers.get("location")), { cookie: cookieOf(res, EXCHANGE_COOKIE) });
+  expect(r.status).toBe(200);
+  return (await r.json()).token;
+}
 
 /** GET /auth/login (or a /links/:id), then the callback with a fake code. Returns { res, start, cookie }. */
 async function signIn(who, { startPath = "/auth/login", claims = {}, tamper } = {}) {
@@ -65,7 +79,7 @@ async function signIn(who, { startPath = "/auth/login", claims = {}, tamper } = 
 async function tokenFor(who) {
   const { res } = await signIn(who);
   expect(res.status).toBe(302);
-  return fragToken(res.headers.get("location"));
+  return fragToken(res);
 }
 const api = (path, token, method = "GET", body) => call(path, {
   method,
@@ -86,13 +100,13 @@ test("full flow: login → token → POST /boards → invite → link → anothe
   for (const a of ["Path=/", "Secure", "HttpOnly", "SameSite=Lax", "Max-Age=600"]) expect(set).toContain(a);
   expect(set).not.toContain("Domain");
 
-  // Callback: token in the fragment of the configured URL, never the query; login cookie cleared.
+  // Callback: a one-time code in the fragment of the configured URL, never the query; login cookie cleared.
   const { res } = await signIn(ADMIN);
   const loc = res.headers.get("location");
-  expect(loc.startsWith(APP + "#token=")).toBe(true);
+  expect(loc.startsWith(APP + "#code=")).toBe(true);
   expect(new URL(loc).search).toBe("");
   expect(res.headers.getSetCookie().some(c => c.startsWith(LOGIN_COOKIE + "=;") && c.includes("Max-Age=0"))).toBe(true);
-  const admin = fragToken(loc);
+  const admin = await fragToken(res);
   expect(await sessions.verify(admin)).toMatchObject({ user: "google:1001", domain: "acme.com" });
   // The idp received the PKCE verifier.
   expect(idp.tokenRequests.at(-1).code_verifier).toMatch(/^[A-Za-z0-9_-]{43}$/);
@@ -121,7 +135,8 @@ test("full flow: login → token → POST /boards → invite → link → anothe
   // A guest (gmail, no tenant) opens the link signed out: sign-in runs, the callback redeems, lands on the board.
   const guest = await signIn(GUEST, { startPath: `/links/${link.id}` });
   const gl = guest.res.headers.get("location");
-  expect(gl.startsWith(`https://app.plenary.test/b/${board.id}#token=`)).toBe(true);
+  expect(gl.startsWith(`https://plenary.test/b/${board.id}#code=`)).toBe(true);
+  expect(await sessions.verify(await fragToken(guest.res))).toMatchObject({ user: "google:2001" });
   expect(await tenancy.role({ user: "google:2001", email: "carol@gmail.com", domain: null }, board.id)).toBe("annotator");
 
   // The invitee signs in and gets the invite's role; a member gets memberRole.
@@ -150,7 +165,7 @@ test("GET /links/:id with a Bearer redeems at once; a dead link is 404", async (
   const guest = await tokenFor(GUEST);
   const r = await api(`/links/${link.id}`, guest);
   expect(r.status).toBe(200);
-  expect(await r.json()).toEqual({ board: board.id, url: `https://app.plenary.test/b/${board.id}` });
+  expect(await r.json()).toEqual({ board: board.id, url: `https://plenary.test/b/${board.id}` });
   expect(await tenancy.role(await sessions.verify(guest), board.id)).toBe("viewer");
   expect((await api(`/links/nope`, guest)).status).toBe(404);
   await api(`/boards/${board.id}/links/${link.id}`, admin, "DELETE");
@@ -160,8 +175,9 @@ test("GET /links/:id with a Bearer redeems at once; a dead link is 404", async (
 test("a dead link at sign-in still signs in, flagged in the fragment, landing on postLoginUrl", async () => {
   const { res } = await signIn(GUEST, { startPath: "/links/not-a-link" });
   const loc = res.headers.get("location");
-  expect(loc.startsWith(APP + "#token=")).toBe(true);
+  expect(loc.startsWith(APP + "#code=")).toBe(true);
   expect(new URLSearchParams(new URL(loc).hash.slice(1)).get("link")).toBe("invalid");
+  expect(await sessions.verify(await fragToken(res))).toMatchObject({ user: "google:2001" });
 });
 
 test("the link rides in the signed login cookie, never in a URL parameter", async () => {
@@ -237,15 +253,21 @@ test("no open redirect: the request can't choose where the browser goes", async 
     idp.codes.set("c-" + p, await idp.mint({ ...ADMIN, nonce: loc.searchParams.get("nonce") }));
     const q = new URLSearchParams({ code: "c-" + p, state: loc.searchParams.get("state"), [p]: "https://evil.example/" });
     const res = await routes(new Request(ORIGIN + "/auth/callback?" + q, { headers: { cookie: cookieOf(start), host: "evil.example" } }));
-    expect(res.headers.get("location").startsWith(APP + "#token=")).toBe(true);
+    expect(res.headers.get("location").startsWith(APP + "#code=")).toBe(true);
     const out = await call(`/auth/logout?${p}=https://evil.example/`);
-    expect(out.headers.get("location")).toBe("https://app.plenary.test/bye");
+    expect(out.headers.get("location")).toBe("https://plenary.test/bye");
   }
   // Config is checked: relative, non-http and fragment URLs are refused at build time.
-  for (const bad of ["/relative", "javascript:alert(1)", "https://app.plenary.test/#x"])
+  for (const bad of ["/relative", "javascript:alert(1)", "https://plenary.test/#x"])
     expect(() => build({ config: { ...config, postLoginUrl: bad } })).toThrow();
-  expect(() => build({ config: { ...config, boardUrl: "https://app.plenary.test/b/" } })).toThrow();
+  expect(() => build({ config: { ...config, boardUrl: "https://plenary.test/b/" } })).toThrow();
   expect(() => build({ config: { ...config, cookieKey: "short" } })).toThrow();
+  // One origin (p5-codev MEDIUM 1): any URL off postLoginUrl's origin is refused at build time with a clear error.
+  for (const [k, v] of [["postLogoutUrl", "https://app.plenary.test/bye"], ["boardUrl", "https://app.plenary.test/b/{board}"],
+    ["publicUrl", "https://links.plenary.test"], ["boardUrl", "http://plenary.test/b/{board}"], ["postLogoutUrl", "https://plenary.test:8443/bye"]])
+    expect(() => build({ config: { ...config, [k]: v } })).toThrow(`config.${k} must be on postLoginUrl's origin`);
+  expect(() => build({ config: { ...config, postLoginUrl: "https://app.plenary.test/" } })).toThrow("must be on postLoginUrl's origin");
+  expect(() => build({ config: { ...config, postLogoutUrl: undefined, publicUrl: undefined } })).not.toThrow();
 });
 
 test("logout clears the login cookie and redirects; the session token stays valid until exp (stateless)", async () => {
@@ -434,7 +456,13 @@ test("over a real socket (Bun.serve on port 0): login → callback → POST /boa
   idp.codes.set("sock", await idp.mint({ ...ADMIN, nonce: loc.searchParams.get("nonce") }));
   const cb = await fetch(`${base}/auth/callback?code=sock&state=${loc.searchParams.get("state")}`, { redirect: "manual", headers: { cookie: cookieOf(start) } });
   expect(cb.status).toBe(302);
-  const tok = fragToken(cb.headers.get("location"));
+  const ex = await fetch(base + "/auth/exchange", {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: APP_ORIGIN, cookie: cookieOf(cb, EXCHANGE_COOKIE) },
+    body: JSON.stringify({ code: fragCode(cb.headers.get("location")) }),
+  });
+  expect(ex.status).toBe(200);
+  const tok = (await ex.json()).token;
   const r = await fetch(base + "/boards", { method: "POST", headers: { authorization: "Bearer " + tok, "content-type": "application/json" }, body: '{"title":"sock"}' });
   expect(r.status).toBe(201);
   expect((await fetch(base + "/health")).status).toBe(404);   // ours returned null; this bare server 404s
@@ -467,13 +495,17 @@ test("dev tokens: refused unless a dev verifier is configured and enabled; accep
 
 // ---- replay guard: amortised O(1) pruning and a fail-closed cap (p5-httpv MEDIUM 1) ----
 
-/** A handler whose oidc refuses every code at once, plus a forger of valid login cookies (the test holds the key). */
-async function guardRig(over = {}) {
+/**
+ * A handler with a stub oidc, plus a forger of valid login cookies (the test holds the key). `accept`: the stub's
+ * finish succeeds (302; the state takes a guard slot) or refuses every code (400; since p5-code no slot is taken).
+ */
+async function guardRig({ accept = true, ...over } = {}) {
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(config.cookieKey), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  const h = build({ oidc: { begin: async () => ({}), finish: async () => null }, ...over });
+  const who = { user: "google:9", name: "G", email: "g@acme.com", domain: "acme.com" };
+  const h = build({ oidc: { begin: async () => ({}), finish: async () => (accept ? who : null) }, ...over });
   let n = 0;
-  /** One callback with a fresh, valid cookie and its state; the bogus code makes it 400 after the state is used. */
+  /** One callback with a fresh, valid login cookie for `state` (a fresh state by default). */
   const hit = async (state = "st-" + n++) => {
     const p = b64(new TextEncoder().encode(JSON.stringify({ s: state, n: "n", v: "v", exp: Math.floor(now() / 1000) + 600 })));
     const mac = b64(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode("l1." + p)));
@@ -516,17 +548,41 @@ test("replay guard: pruning visits O(1) entries per callback as live states grow
 
 test("replay guard: a hard cap fails closed (503, cookie cleared); expiry frees room; replays still 400", async () => {
   const { hit } = await guardRig({ config: { ...config, maxLoginStates: 3 } });
-  for (const s of ["a", "b", "c"]) expect((await hit(s)).status).toBe(400);         // used (bogus code → 400)
+  for (const s of ["a", "b", "c"]) expect((await hit(s)).status).toBe(302);         // used: three good logins
   const full = await hit("d");
   expect(full.status).toBe(503);
   expect(await full.json()).toEqual({ error: "unavailable" });
   expect(full.headers.getSetCookie().some(c => c.startsWith(LOGIN_COOKIE + "=;") && c.includes("Max-Age=0"))).toBe(true);
   expect(await (await hit("a")).json()).toEqual({ error: "login-failed" });         // a replay is still a refusal
   clock.t += 601_000;                                                                 // all three expire
-  expect((await hit("d")).status).toBe(400);                                         // room again: back to normal
+  expect((await hit("d")).status).toBe(302);                                         // room again: back to normal
   // A good login through the real oidc still works under a cap with room left.
   routes = build({ config: { ...config, maxLoginStates: 1 } });
   const { res } = await signIn(ADMIN);
   expect(res.status).toBe(302);
   expect((await signIn(ADMIN)).res.status).toBe(503);                                // full → refused, not unguarded
+});
+
+test("replay guard: bogus-code callbacks take no slot, so they can't lock sign-in out; replays still refused (p5-googlev MEDIUM 2)", async () => {
+  const cap = { ...config, maxLoginStates: 3 };
+  // An anonymous client with free login cookies and bogus codes: every one is 400, none fills the guard.
+  const { hit } = await guardRig({ accept: false, config: cap });
+  for (let i = 0; i < 50; i++) expect((await hit()).status).toBe(400);
+  // Same shape against the real oidc + fake Google: bogus codes refused by Google, then a real login still works.
+  routes = build({ config: cap });
+  for (let i = 0; i < 10; i++) {
+    const start = await call("/auth/login");
+    const st = new URL(start.headers.get("location")).searchParams.get("state");
+    await loginFailed(await call(`/auth/callback?code=bogus-${i}&state=${st}`, { headers: { cookie: cookieOf(start) } }));
+  }
+  const good = await signIn(ADMIN);
+  expect(good.res.status).toBe(302);
+  // A replay of that successful callback is still refused (before any call to Google)...
+  const before = idp.tokenRequests.length;
+  await loginFailed(await call(`/auth/callback?${new URLSearchParams({ code: good.code, state: good.state })}`, { headers: { cookie: good.cookie } }));
+  expect(idp.tokenRequests.length).toBe(before);
+  // ...and a state whose first callback failed may be retried (it took no slot), but once it succeeds it is spent.
+  const { hit: ok } = await guardRig({ config: cap });
+  expect((await ok("s-1")).status).toBe(302);
+  expect((await ok("s-1")).status).toBe(400);
 });

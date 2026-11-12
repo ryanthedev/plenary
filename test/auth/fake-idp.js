@@ -14,8 +14,14 @@ export async function fakeIdp({ now = () => Date.now() } = {}) {
     jwksFetches: 0,
     cacheControl: null,   // e.g. "public, max-age=60"
     tokenRequests: [],
-    /** what the token endpoint returns for a code */
+    /** what the token endpoint returns for a code (lenient: reusable, no PKCE check) */
     codes: new Map(),
+    /** code → { idToken, challenge }: Google-like codes, PKCE-checked (S256) and single use. See strictCode(). */
+    strict: new Map(),
+    /** Register a Google-like code for the sign-in whose authorize URL is `url` (its code_challenge binds it). */
+    strictCode(code, idToken, url) {
+      idp.strict.set(code, { idToken, challenge: new URL(url).searchParams.get("code_challenge") });
+    },
     async addKey(kid) { keys.set(kid, await rsaKey()); return keys.get(kid); },
     removeKey(kid) { keys.delete(kid); },
     async jwks() {
@@ -46,6 +52,13 @@ export async function fakeIdp({ now = () => Date.now() } = {}) {
       if (url === "https://oauth2.googleapis.com/token") {
         const form = new URLSearchParams(init.body);
         idp.tokenRequests.push(Object.fromEntries(form));
+        const s = idp.strict.get(form.get("code"));
+        if (s) {
+          idp.strict.delete(form.get("code"));          // single use, like Google
+          const v = form.get("code_verifier") ?? "";
+          const got = b64url(await crypto.subtle.digest("SHA-256", utf8(v)));
+          return got === s.challenge ? Response.json({ id_token: s.idToken }) : new Response('{"error":"invalid_grant"}', { status: 400 });
+        }
         const id_token = idp.codes.get(form.get("code"));
         return id_token ? Response.json({ id_token }) : new Response("{}", { status: 400 });
       }

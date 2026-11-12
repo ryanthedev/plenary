@@ -49,12 +49,17 @@ edit to a file I don't own). The brief allowed `scripts/`.
 4. **Click "Sign in with Google"**, pick the test account, and accept the consent screen ("unverified app"
    warning is expected in Testing; continue).
 5. **Success looks like:** the browser lands on `http://localhost:8080/signed-in` and the page reads
-   **"signed in as you@domain"**. The address bar shows no token (the page removes the fragment).
+   **"signed in as you@domain"**. The address bar shows no code and no token: the page removes the `#code=…`
+   fragment at once, then trades the code for the session at `POST /auth/exchange` (p5-code; the session token
+   never appears in a URL).
    A Workspace account on a secondary domain, or a non-Gmail consumer address, shows "(no Google-verified email;
    user google:…)": that is our authoritative-email rule, still a successful sign-in.
 6. **Failure looks like:** a JSON page `{"error":"login-failed"}` at `/auth/callback`. Check the terminal's log
    line for `/auth/callback` first: `"loginCookie":false` means the browser dropped the login cookie (try Chrome);
    `true` means Google or the token check refused. Report it with the browser name.
+   Or, after p5-code, the page at `/signed-in` reads **"sign-in failed (400 invalid-code)"**: the exchange was
+   refused. Check the log line for `/auth/exchange`: `"exchangeCookie":false` means the browser dropped the
+   exchange cookie; `true` means the code was stale (over 60 s) or already used. Sign in again from step 4.
 7. **Stop the harness:** Ctrl-C in its terminal, or `kill <N>` with the PID it printed.
 
 ## Systems design (distributed-systems-design v0.1.0, APPLIER, brief)

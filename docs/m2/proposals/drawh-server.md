@@ -1,6 +1,8 @@
 # Proposal: `drawh --server` (herdr-draw talks to Plenary)
 
-2026-11-12, round 4: moved onto protocol v1.1 (settings compare-and-set); file-side settings are back. Verified with findings by pd-drawh4v; the round 4 fix (H1, H2, M2) is applied, not yet re-verified. **Decision needed: apply `drawh-server.patch` to herdr-draw, or
+2026-11-12, round 4: moved onto protocol v1.1 (settings compare-and-set); file-side settings are back. Final check by pd-drawh4v (patch f4f9b05a…): FAIL by the letter on one ~20 ms same-batch window (F5, listed under
+limits), accepted under the manager's hard stop; everything else holds, no peer change undone. Next: one live run of
+`drawh --server` against the real Plenary server after the phase-2 merge. **Decision needed: apply `drawh-server.patch` to herdr-draw, or
 not.** Nothing is applied; herdr-draw is untouched (still at 5dfe352, clean).
 
 ## What it does

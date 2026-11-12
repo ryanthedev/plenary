@@ -1,6 +1,6 @@
 # Report: manager engine
 
-Manager terminal: `t14j` (tab `manager engine`). Parent: proxy `t14h`.
+Manager terminal: `t18m` (tab `manager engine`; successor of t14j, retired 2026-11-11). Parent: proxy `t14h`.
 
 ## Workers
 
@@ -195,3 +195,5 @@ Manager terminal: `t14j` (tab `manager engine`). Parent: proxy `t14h`.
 - p11-protov round 3: FAIL on one narrow MEDIUM R3-M1 (a second change to a held key re-stamps its base past an unseen peer entry); R2-M1/M2 fixed; fuzz 900/900, convergence 4,000, recovery 800 pass. Decision: a held key's base is fixed by its first held change (+ own floor). t18b fix round 3 incl. R2-L1.
 - Client: p7-collab verified (46ca1cd report), files uncommitted in the worktree for the merge. Agreed: merge at p6-landv PASS (+ engine gates: scaffold commit, rebase, p2-swap verified); client's p6-hex and p7-wire run on main after.
 - Handing off to a successor manager at ~52% context (both running jobs are in waiting states). Handoff: docs/m2/handoff/manager-engine.md.
+- t18m took over as manager engine from t14j's handoff (94b1ae9). Told client t14k, platform t187, proxy t14h. Watching t18c (scaffold final gate, background batch running) and t171 (v1.1 code round 4).
+- p11-protov round 4: **PASS** (398/0 in the worktree, re-run by me). v1.1 code committed on p2-land as 5d55112. Told t187, t14k, t14h. Closed t18b and t171. Open LOWs L1/L3/L4 carried to the architecture audit; nit: 'acknowledged' -> 'settled' at the next spec touch.

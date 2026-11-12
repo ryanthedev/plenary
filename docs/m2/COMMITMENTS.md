@@ -7,7 +7,7 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 | Role / job | Terminal | Tab label | Status |
 |---|---|---|---|
 | owner | t13s | owner (audits) | idle after starting the proxy |
-| proxy | t14h | ★ proxy (talk here) | running |
+| proxy | t1bx | ★ proxy · t1bx (talk here) | running (successor of t14h; handoff docs/m2/handoff/proxy.md, 9d06783) |
 | manager engine | t18m | manager engine | running (successor of t14j; handoff docs/m2/handoff/manager-engine.md, 94b1ae9): scaffold final gate t18c, v1.1 code verify t171 |
 | manager platform | t187 | manager platform | running (successor of t14q; handoff docs/m2/handoff/manager-platform.md, 9266173): drawh round 3 (t185, verifier t155) |
 | manager client | t14k | manager client · t14k | running: p6-ports fix round (t18r); p6-hex and p7-wire on main after the p2-land merge |
@@ -26,7 +26,7 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 ## Decisions (reversible; the CEO may overturn)
 
 - 2026-11-11 owner: three tracks (engine, client, platform) with disjoint ownership; platform starts after phase 3.
-- 2026-11-11 proxy: managers report to the proxy by `herdr_agent prompt` to t14h plus docs/m2/reports/manager-<track>.md; managers keep their own worker rosters there, the proxy keeps this file.
+- 2026-11-11 proxy: managers report to the proxy by `herdr_agent prompt` to the proxy (t1bx from 2026-11-11) plus docs/m2/reports/manager-<track>.md; managers keep their own worker rosters there, the proxy keeps this file.
 - 2026-11-11 proxy: Engram was unreachable at start (name resolver error); proceeding without recall.
 - 2026-11-11 proxy: highlighter, notes-as-tool and image aren't core tool ids (manager client). The mock labels them "new in web/" or "needs protocol v1"; the engine's v1 spec must say how each one travels (sent to t14j).
 - 2026-11-11 proxy: an automatic security review flagged medium DOM XSS in docs/m2/design/phone.html (URL text inserted as HTML). Engine routed it to manager client (t14k); it must be fixed before the mock passes verification.
@@ -99,3 +99,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 platform: p5-google DONE 95971bd (dev harness + live check; secret scan 0 hits; bun test 478/0). CEO asked for one human Google login.
 - 2026-11-11 platform: drawh 3b FAIL (undo lost when a peer change lands in between); hard stop: scope cut ships (while connected, settings flow room to file only; a loud line on file-side changes). File-side settings return in drawh round 4 on v1.1 compare-and-set.
 - 2026-11-11 client: p6-ports FAIL, 4 HIGH (contract tests too weak); fix round in t18r.
+- 2026-11-11 proxy: proxy t14h handed off to t1bx (9d06783); managers now report to t1bx; t185 and t155 relabelled reports-to=t187 (were t14q).

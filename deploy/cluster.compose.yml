@@ -3,7 +3,8 @@
 #   docker compose -f deploy/cluster.compose.yml up --build
 #
 # server/main.js has no cluster adapters yet, so each app node still runs single-node (SQLite, in-memory bus, local
-# disk) and ignores the cluster env below (names confirmed by engine).
+# disk). DATABASE_URL and NATS_URL below only switch on cluster mode, which requires COOKIE_KEY; the rest of the
+# cluster env is not read yet (names confirmed by engine).
 #
 # Roles (PLENARY_ROLES, comma list of `gateway` and `host`, default `gateway,host`):
 #   app-1  gateway,host    app-2  gateway only    app-3  host only
@@ -14,8 +15,11 @@
 # before applying profiles, so required ${VAR:?} secrets in compose.yml could break the plain single-node `up`.
 #
 # Values come from your shell or deploy/.env (git-ignored); none are written here. Required:
-#   POSTGRES_PASSWORD, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD
+#   POSTGRES_PASSWORD, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, COOKIE_KEY
 # POSTGRES_PASSWORD goes into a URL unescaped: use letters and digits only.
+# COOKIE_KEY: at least 32 bytes, generate one with `openssl rand -hex 32`. All three app nodes get the same value
+# (one variable, set once in x-app-env), because each node must verify cookies and sessions the others signed.
+# main.js refuses to start in cluster mode (DATABASE_URL or NATS_URL set) without it.
 
 # Own project name, so this stack never shares containers or volumes with the single-node `plenary` project.
 name: plenary-cluster
@@ -44,9 +48,12 @@ x-app: &app
       condition: service_completed_successfully
   restart: unless-stopped
 
-# Env shared by the three app nodes. Names main.js reads today: PORT, PLENARY_DATA_DIR, LOG_LEVEL, PLENARY_DEV_TOKENS.
+# Env shared by the three app nodes. Names main.js reads today: PORT, PLENARY_DATA_DIR, LOG_LEVEL, PLENARY_DEV_TOKENS,
+# COOKIE_KEY (and optional SESSION_KEY, GOOGLE_*, OIDC_REDIRECT_URI, PUBLIC_URL; not set here: see deploy/README.md).
 x-app-env: &app-env
   PORT: "8080"
+  # Signs login/exchange cookies and sessions. One value for every node; never written in this repo.
+  COOKIE_KEY: ${COOKIE_KEY:?set COOKIE_KEY (at least 32 bytes, the same on every node; generate with openssl rand -hex 32)}
   # Each node keeps its own /data inside its container (no shared volume: three SQLite writers on one file would
   # corrupt it). Nothing here survives `down`; the cluster's durable state will be Postgres and the blob store.
   PLENARY_DATA_DIR: /data

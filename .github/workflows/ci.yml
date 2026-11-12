@@ -203,6 +203,16 @@ jobs:
           fi
           echo "Blob store up ($cid), bucket $S3_BUCKET exists."
 
+      # server/main.js refuses cluster mode (DATABASE_URL or NATS_URL set, as in this job) without COOKIE_KEY. Today no
+      # test hands process.env to start() (it reads only its argument), so this is for anything in this job that
+      # starts the server from the job's env. A fresh random key per run, masked in the log; never a literal here.
+      - name: Generate a throwaway COOKIE_KEY
+        run: |
+          set -euo pipefail
+          key="$(openssl rand -hex 32)"
+          echo "::add-mask::$key"
+          echo "COOKIE_KEY=$key" >> "$GITHUB_ENV"
+
       # Engine's cluster-adapter tests read DATABASE_URL, NATS_URL and S3_* above (each skips when its variable is
       # unset, so local `bun test` without services still passes).
       - name: Test

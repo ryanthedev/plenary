@@ -23,6 +23,11 @@ services:
       # Dev tokens, for local use only: JSON mapping token to user. Empty = off, and every hello is refused
       # (sign-in is not wired into server/main.js yet). See deploy/README.md.
       PLENARY_DEV_TOKENS: ${PLENARY_DEV_TOKENS:-}
+      # Optional, at least 32 bytes (`openssl rand -hex 32`). Signs sign-in cookies and sessions. Unset = a random key
+      # per start, so every restart signs everyone out; set it in deploy/.env for anything you keep running.
+      # No value here on purpose: Compose passes it from your shell or deploy/.env, and leaves it unset otherwise
+      # (an empty string would be refused by main.js as too short).
+      COOKIE_KEY:
       # Google sign-in: server/main.js does not read these yet. Uncomment when it does; values from env only.
       # GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       # GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}

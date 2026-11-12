@@ -34,6 +34,15 @@ These are the variables `server/main.js` reads; nothing else is read.
 | `PLENARY_DATA_DIR` | `/data` | `plenary.db` (SQLite) and `blobs/` go here. Compose mounts the `plenary-data` volume on it. |
 | `PLENARY_DEV_TOKENS` | unset | JSON: `{ "<token>": { "name": "ann", "role": "editor", "email"?, "domain"? } }`. Unset or empty = off. Invalid JSON is logged and treated as off. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Logs are structured, to stdout. |
+| `COOKIE_KEY` | unset | At least 32 bytes; signs sign-in cookies and sessions. Unset on a single node = a random key per start (every restart signs everyone out). **Required in cluster mode** (`DATABASE_URL` or `NATS_URL` set): the server refuses to start without it, and every node must have the same value. |
+| `SESSION_KEY` | unset | At least 32 bytes; signs sessions only, if you want it separate from `COOKIE_KEY` (default: `COOKIE_KEY`). Not set by either compose file. |
+
+**Generate `COOKIE_KEY`** once and keep it in `deploy/.env` (never in the repo); `compose.yml` passes it through if
+set and leaves it unset otherwise:
+
+```sh
+echo "COOKIE_KEY=$(openssl rand -hex 32)" >> deploy/.env
+```
 
 **Dev tokens are for local use only.** Anyone holding a token is that user; there is no expiry or sign-in. Never
 set them on a server others can reach. To use them, put a value in `deploy/.env` with single quotes around the
@@ -62,6 +71,7 @@ The Compose project is named `plenary` (`name:` in `compose.yml`), so the data v
 CI (`.github/workflows/ci.yml`) runs `bun test` on every push and pull request. Before the tests it clones
 herdr-draw (public, read-only) at the commit in `packages/core/SOURCE.json`, so the core-copy check runs there too.
 Both jobs install with `bun install --frozen-lockfile` and fail if `bun.lock` is missing or out of date.
+The cluster job generates a throwaway `COOKIE_KEY` per run (`openssl rand -hex 32`, masked in the log).
 A second job, `test-cluster-services`, runs the same `bun test` with Postgres (a service container), NATS and an
 S3-compatible blob store, and `DATABASE_URL`, `NATS_URL` and `S3_*` set, so engine's cluster-adapter tests run there.
 NATS is started in a step with `docker run` and `cluster/nats.conf`, because the 2 MB `max_payload` can only come from
@@ -95,15 +105,26 @@ and stable across that node's restarts (a fixed value per service).
 **Cluster env** (names confirmed by engine; Compose sets them): `DATABASE_URL`, `NATS_URL`, `S3_ENDPOINT`, `S3_BUCKET`,
 `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `PLENARY_NODE_ID`, `PLENARY_ROLES`.
 
-Put the three required secrets in `deploy/.env` (git-ignored) or your shell, with your own values. Use letters and
-digits for `POSTGRES_PASSWORD`, because it goes into `DATABASE_URL` unescaped:
+Put the four required secrets in `deploy/.env` (git-ignored) or your shell, with your own values. Use letters and
+digits for `POSTGRES_PASSWORD`, because it goes into `DATABASE_URL` unescaped. `COOKIE_KEY` is one value that Compose
+gives to **all three app nodes**: each node must accept cookies and sessions another node signed, and `server/main.js`
+refuses to start in cluster mode without it. Compose stops with `set COOKIE_KEY …` if it is missing.
 
 ```sh
 # deploy/.env
 POSTGRES_PASSWORD=<letters-and-digits>
 MINIO_ROOT_USER=<user>
 MINIO_ROOT_PASSWORD=<at-least-8-chars>
+COOKIE_KEY=<openssl rand -hex 32>
 ```
+
+```sh
+echo "COOKIE_KEY=$(openssl rand -hex 32)" >> deploy/.env   # once; every node reads this one value
+```
+
+Google sign-in in the cluster is not wired in this file: `x-app-env` passes none of `GOOGLE_CLIENT_ID`,
+`GOOGLE_CLIENT_SECRET`, `OIDC_REDIRECT_URI` or `PUBLIC_URL`, so setting them in `deploy/.env` does nothing until they
+are added there. The last two default to `http://localhost:8080`, not the load balancer's `:8090`.
 
 ```sh
 docker compose -f deploy/cluster.compose.yml up --build
@@ -113,10 +134,14 @@ docker compose -f deploy/cluster.compose.yml down          # add -v to delete th
 
 **What is missing:**
 
-- **Cluster adapters and roles.** `server/main.js` reads none of `DATABASE_URL`, `NATS_URL`, `S3_*`,
+- **Cluster adapters and roles.** `server/main.js` uses `DATABASE_URL` and `NATS_URL` only to decide it is in cluster
+  mode (and so require `COOKIE_KEY`); it reads none of `DATABASE_URL`, `NATS_URL`, `S3_*`,
   `PLENARY_NODE_ID` or `PLENARY_ROLES` yet, so every node still runs both roles regardless of its setting. Each node runs single-node: its own SQLite in its container (lost on `down`),
   its own in-memory bus, its own dev board. Two clients that land on different nodes do not see each other.
 - **Leases and takeover.** The phase-4 test ("kill a board's host, another takes over, no acked op lost") cannot run
   until engine's leases exist.
-- **Never run here.** This file was checked for YAML syntax, the Caddyfile with `caddy validate`, and every image tag
-  against the registry; no container has been started from it.
+- **Run once, on Podman, not Docker (2026-11-12, p8-cookie).** With `COOKIE_KEY` set, all three app nodes start in
+  cluster mode and the load balancer answers `/health` with 200. Docker Compose 5.1.3 against Podman 5.8.2's API split the
+  exec-form app healthcheck at its first space and marked the nodes unhealthy (which of the two splits it is not
+  isolated), so that run used a local override with a `CMD-SHELL` healthcheck.
+  Not yet run on Docker itself.

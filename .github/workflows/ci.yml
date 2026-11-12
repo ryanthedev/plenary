@@ -64,3 +64,94 @@ jobs:
 
       - name: Test
         run: bun test
+
+  # Phase 4: the same `bun test` with Postgres and NATS (2 MB max_payload) beside it, so engine's cluster-adapter tests have somewhere
+  # to run. Today nothing reads DATABASE_URL or NATS_URL, so this job runs exactly what `test` runs.
+  # It does not clone herdr-draw: test/core-source.test.js skips here, and the `test` job above covers it.
+  test-cluster-services:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17.11-alpine3.23
+        env:
+          POSTGRES_USER: plenary
+          POSTGRES_DB: plenary
+          # Throwaway literal on purpose: this database lives only inside this CI job's service container, is
+          # reachable only from the runner, and holds nothing. It is not a secret and is used nowhere else.
+          POSTGRES_PASSWORD: plenary-ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U plenary -d plenary"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    # NATS is not a service container: PROTOCOL.md (Bus) needs max_payload 2 MB, which NATS takes only from a config
+    # file (nats-server 2.15.3 has no --max_payload flag), and service containers start before checkout, so they
+    # cannot mount one. The "Start NATS" step runs it with deploy/cluster/nats.conf, the file Compose uses.
+    env:
+      # Env names confirmed by engine.
+      DATABASE_URL: postgres://plenary:plenary-ci-only@127.0.0.1:5432/plenary
+      NATS_URL: nats://127.0.0.1:4222
+    steps:
+      # actions/checkout v7.0.1 (SHA read with `git ls-remote` on 2026-11-11)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      # oven-sh/setup-bun v2.2.0 (SHA read with `git ls-remote` on 2026-11-11)
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.4
+
+      - name: Install (only if a lockfile exists)
+        run: |
+          if [ -f bun.lock ] || [ -f bun.lockb ]; then
+            bun install --frozen-lockfile
+          else
+            echo "No lockfile; skipping install."
+          fi
+
+      # Plain `docker run` on the runner's own Docker: anonymous pull of a pinned public image, no registry login,
+      # no secrets. Published on the runner's loopback only. The container id is recorded and only that container
+      # is stopped. The step fails unless /varz reports max_payload 2097152 (2 MB, NATS counts MB as 1024*1024).
+      - name: Start NATS (max_payload 2 MB, from deploy/cluster/nats.conf)
+        run: |
+          set -euo pipefail
+          cid="$(docker run -d --rm \
+            -p 127.0.0.1:4222:4222 \
+            -v "$GITHUB_WORKSPACE/deploy/cluster/nats.conf:/etc/nats/plenary.conf:ro" \
+            nats:2.15.3-alpine nats-server --config /etc/nats/plenary.conf)"
+          echo "NATS_CONTAINER_ID=$cid" >> "$GITHUB_ENV"
+          ok=
+          for _ in $(seq 1 30); do
+            if docker exec "$cid" wget -q -O /dev/null http://127.0.0.1:8222/healthz; then ok=1; break; fi
+            sleep 1
+          done
+          if [ -z "$ok" ]; then
+            echo "NATS did not become healthy in 30 s." >&2
+            docker logs "$cid" >&2 || true
+            exit 1
+          fi
+          # Capture first, then grep: piping into `grep -q` under pipefail can fail falsely (grep exits at the match,
+          # the writer gets SIGPIPE). A failed fetch leaves varz empty, which fails the check below.
+          varz="$(docker exec "$cid" wget -q -O - http://127.0.0.1:8222/varz)" || varz=""
+          if ! grep -Eq '"max_payload": *2097152\b' <<<"$varz"; then
+            echo "NATS max_payload is not 2097152." >&2
+            grep max_payload <<<"$varz" >&2 || true
+            exit 1
+          fi
+          echo "NATS up ($cid), max_payload 2097152."
+
+      # TODO(engine phase 4): engine's Postgres store and NATS bus tests plug in here. They read DATABASE_URL and
+      # NATS_URL above (skip when unset, so local `bun test` without services still passes).
+      - name: Test
+        run: bun test
+
+      - name: Stop NATS
+        if: always()
+        run: |
+          if [ -n "${NATS_CONTAINER_ID:-}" ]; then
+            docker stop "$NATS_CONTAINER_ID"
+          fi

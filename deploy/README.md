@@ -6,7 +6,8 @@ public images.
 | File | What |
 |---|---|
 | `Dockerfile` | Single-node image on `oven/bun:1.4.4-slim`. Runs `bun run server/main.js` as the non-root `bun` user, listens on 0.0.0.0:8080, data in `/data`, health check on `GET /health`. |
-| `compose.yml` | One `plenary` service with a named volume for SQLite and blobs, published on `127.0.0.1:8080` only, `restart: unless-stopped`. Postgres and NATS arrive in phase 4. |
+| `compose.yml` | One `plenary` service with a named volume for SQLite and blobs, published on `127.0.0.1:8080` only, `restart: unless-stopped`. |
+| `cluster.compose.yml`, `cluster/` | Phase-4 cluster shape (not functional yet): see [Cluster](#cluster-phase-4-not-functional-yet). |
 
 ```sh
 docker build -f deploy/Dockerfile -t plenary:dev .      # context is the repo root
@@ -59,3 +60,58 @@ The Compose project is named `plenary` (`name:` in `compose.yml`), so the data v
 
 CI (`.github/workflows/ci.yml`) runs `bun test` on every push and pull request. Before the tests it clones
 herdr-draw (public, read-only) at the commit in `packages/core/SOURCE.json`, so the core-copy check runs there too.
+A second job, `test-cluster-services`, runs the same `bun test` with Postgres (a service container) and NATS and
+`DATABASE_URL`/`NATS_URL` set, ready for engine's phase-4 adapter tests (nothing reads them yet). NATS is started in a
+step with `docker run` and `cluster/nats.conf`, because the 2 MB `max_payload` can only come from a config file and
+service containers start before checkout; the step fails unless NATS reports `max_payload` 2097152.
+
+## Cluster (phase 4, not functional yet)
+
+`cluster.compose.yml` is the phase-4 shape: Postgres, NATS, an S3-compatible blob store, three app nodes and a Caddy
+load balancer. It is a separate Compose project (`plenary-cluster`), so it never touches the single-node stack above,
+whose `compose.yml` is unchanged.
+
+| Service | Image | Role |
+|---|---|---|
+| `postgres` | `postgres:17.11-alpine3.23` | Store (cluster adapter, not written yet). Volume `postgres-data`. |
+| `nats` | `nats:2.15.3-alpine` | Bus, NATS core (no JetStream). Config `cluster/nats.conf` raises `max_payload` to 2 MB, as PROTOCOL.md asks. |
+| `blobs` | `pgsty/minio:RELEASE.2026-08-04T00-00-00Z` | S3-compatible blobs. MinIO stopped publishing `minio/minio` on Docker Hub; this is a community-maintained MinIO fork. |
+| `blobs-init` | same | One shot: creates the bucket (`S3_BUCKET`, default `plenary`), then exits. |
+| `app-1` | built from `Dockerfile` | `server/main.js`, roles `gateway,host`. No published ports. |
+| `app-2` | same | Roles `gateway` only. |
+| `app-3` | same | Roles `host` only: never behind the load balancer. |
+| `lb` | `caddy:2.11.9-alpine` | Routes `/ws` (WebSocket) and `/health` to the **gateway** nodes only (`app-1`, `app-2`), round robin with health checks; everything else is 404. The only published port: `127.0.0.1:8090` (`PLENARY_LB_PORT`). |
+
+**Roles.** `PLENARY_ROLES` is a comma list of `gateway` (holds client sockets, fans out) and `host` (sequences
+boards), default `gateway,host`. The stack runs two gateways and two room hosts, so "gateways separate from room
+hosts" is exercised and a killed host's boards have another host to move to. `PLENARY_NODE_ID` is unique per node
+and stable across that node's restarts (a fixed value per service).
+
+**Cluster env** (names confirmed by engine; Compose sets them): `DATABASE_URL`, `NATS_URL`, `S3_ENDPOINT`, `S3_BUCKET`,
+`S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `PLENARY_NODE_ID`, `PLENARY_ROLES`.
+
+Put the three required secrets in `deploy/.env` (git-ignored) or your shell, with your own values. Use letters and
+digits for `POSTGRES_PASSWORD`, because it goes into `DATABASE_URL` unescaped:
+
+```sh
+# deploy/.env
+POSTGRES_PASSWORD=<letters-and-digits>
+MINIO_ROOT_USER=<user>
+MINIO_ROOT_PASSWORD=<at-least-8-chars>
+```
+
+```sh
+docker compose -f deploy/cluster.compose.yml up --build
+curl -s http://127.0.0.1:8090/health
+docker compose -f deploy/cluster.compose.yml down          # add -v to delete the Postgres and blob volumes
+```
+
+**What is missing:**
+
+- **Cluster adapters and roles.** `server/main.js` reads none of `DATABASE_URL`, `NATS_URL`, `S3_*`,
+  `PLENARY_NODE_ID` or `PLENARY_ROLES` yet, so every node still runs both roles regardless of its setting. Each node runs single-node: its own SQLite in its container (lost on `down`),
+  its own in-memory bus, its own dev board. Two clients that land on different nodes do not see each other.
+- **Leases and takeover.** The phase-4 test ("kill a board's host, another takes over, no acked op lost") cannot run
+  until engine's leases exist.
+- **Never run here.** This file was checked for YAML syntax, the Caddyfile with `caddy validate`, and every image tag
+  against the registry; no container has been started from it.

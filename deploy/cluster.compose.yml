@@ -1,0 +1,180 @@
+# Plenary cluster stack, phase-4 shape (NOT FUNCTIONAL YET): Postgres, NATS, S3-compatible blobs, 3 app nodes and a
+# load balancer. Run from the repo root:
+#   docker compose -f deploy/cluster.compose.yml up --build
+#
+# server/main.js has no cluster adapters yet, so each app node still runs single-node (SQLite, in-memory bus, local
+# disk) and ignores the cluster env below (names confirmed by engine).
+#
+# Roles (PLENARY_ROLES, comma list of `gateway` and `host`, default `gateway,host`):
+#   app-1  gateway,host    app-2  gateway only    app-3  host only
+# Two gateways (the LB routes only to these) and two room hosts (so a killed host's boards have somewhere to go). See deploy/README.md, "Cluster (phase 4, not functional yet)".
+#
+# A separate file (not Compose profiles in compose.yml) so this stack has its own project name, port and volumes and
+# never touches the single-node `plenary` service. Also (expected, not tested): Compose interpolates a whole file
+# before applying profiles, so required ${VAR:?} secrets in compose.yml could break the plain single-node `up`.
+#
+# Values come from your shell or deploy/.env (git-ignored); none are written here. Required:
+#   POSTGRES_PASSWORD, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD
+# POSTGRES_PASSWORD goes into a URL unescaped: use letters and digits only.
+
+# Own project name, so this stack never shares containers or volumes with the single-node `plenary` project.
+name: plenary-cluster
+
+# Shared settings for the three app nodes.
+x-app: &app
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  image: plenary:cluster-dev
+  # No published ports: the load balancer is the only way in.
+  # Same GET /health check as deploy/Dockerfile, polled every 5 s instead of 30 s so the load balancer (which waits
+  # for `service_healthy`) starts sooner and a killed node shows as unhealthy sooner.
+  healthcheck:
+    test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:8080/health').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+    interval: 5s
+    timeout: 3s
+    retries: 3
+    start_period: 10s
+  depends_on:
+    postgres:
+      condition: service_healthy
+    nats:
+      condition: service_healthy
+    blobs-init:
+      condition: service_completed_successfully
+  restart: unless-stopped
+
+# Env shared by the three app nodes. Names main.js reads today: PORT, PLENARY_DATA_DIR, LOG_LEVEL, PLENARY_DEV_TOKENS.
+x-app-env: &app-env
+  PORT: "8080"
+  # Each node keeps its own /data inside its container (no shared volume: three SQLite writers on one file would
+  # corrupt it). Nothing here survives `down`; the cluster's durable state will be Postgres and the blob store.
+  PLENARY_DATA_DIR: /data
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  # Local use only. Each node mints its own dev board today, so a board id from one node is unknown to the others.
+  PLENARY_DEV_TOKENS: ${PLENARY_DEV_TOKENS:-}
+  DATABASE_URL: postgres://plenary:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (letters and digits)}@postgres:5432/plenary
+  NATS_URL: nats://nats:4222
+  # S3_* are also the names Bun's built-in S3 client reads from env.
+  S3_ENDPOINT: http://blobs:9000
+  S3_BUCKET: ${S3_BUCKET:-plenary}
+  S3_REGION: us-east-1
+  # The app uses the store's root credentials here; a scoped key per app is a later hardening step.
+  S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
+  S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+
+services:
+  postgres:
+    # 17 matches the commented block in compose.yml.
+    image: postgres:17.11-alpine3.23
+    environment:
+      POSTGRES_USER: plenary
+      POSTGRES_DB: plenary
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (letters and digits)}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "plenary", "-d", "plenary"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  nats:
+    # The -alpine variant, because the plain tag is a scratch image with no shell or wget for a healthcheck.
+    image: nats:2.15.3-alpine
+    command: ["nats-server", "--config", "/etc/nats/plenary.conf"]
+    volumes:
+      - ./cluster/nats.conf:/etc/nats/plenary.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  blobs:
+    # S3-compatible blob store. MinIO no longer publishes images on Docker Hub (minio/minio is gone); this is
+    # pgsty/minio, a community-maintained MinIO fork (AGPL-3.0). It ships `mc` and `curl`.
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    command: ["minio", "server", "/data"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+    volumes:
+      - blobs-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # One shot: create the bucket, then exit 0. Same image as `blobs`, for its `mc`.
+  blobs-init:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    depends_on:
+      blobs:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+      S3_BUCKET: ${S3_BUCKET:-plenary}
+    # The image's entrypoint prepends `minio` to any command, so bypass it. `$$` hands `$` to the shell, so the
+    # secrets are read from the container's env at run time, not written into the command.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        mc alias set local http://blobs:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null &&
+        mc mb --ignore-existing "local/$$S3_BUCKET"
+    restart: "no"
+
+  app-1:
+    <<: *app
+    environment:
+      <<: *app-env
+      # Unique per node and stable across its restarts: a fixed literal per service.
+      PLENARY_NODE_ID: app-1
+      PLENARY_ROLES: gateway,host
+
+  app-2:
+    <<: *app
+    environment:
+      <<: *app-env
+      PLENARY_NODE_ID: app-2
+      PLENARY_ROLES: gateway
+
+  app-3:
+    <<: *app
+    environment:
+      <<: *app-env
+      PLENARY_NODE_ID: app-3
+      # Host only: not behind the LB. Still serves /health for the Compose healthcheck (engine: keep that).
+      PLENARY_ROLES: host
+
+  lb:
+    image: caddy:2.11.9-alpine
+    # The only published port, on the host's loopback. 8090, so it can run beside the single-node stack (8080).
+    ports:
+      - "127.0.0.1:${PLENARY_LB_PORT:-8090}:8080"
+    volumes:
+      - ./cluster/Caddyfile:/etc/caddy/Caddyfile:ro
+    # Waits for the gateway nodes only; app-3 is host-only and never receives client traffic.
+    depends_on:
+      app-1:
+        condition: service_healthy
+      app-2:
+        condition: service_healthy
+    # Healthy while at least one gateway node answers /health through Caddy.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  blobs-data:

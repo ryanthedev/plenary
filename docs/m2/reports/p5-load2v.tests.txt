@@ -1,0 +1,310 @@
+# p5-load2v scratch test sources (not in the tree). Run: bun test <file> from the repo root; p5l2v-pg needs DATABASE_URL.
+
+==== p5l2v-adv.test.js ====
+// p5-load2v scratch adversarial tests (not for the tree).
+import { test, expect } from "bun:test";
+const R = "/Users/r/repos/plenary";
+const { memoryRegistry } = await import(R + "/server/auth/registry.js");
+const { tenancy, roleCache, identityKey } = await import(R + "/server/auth/tenancy.js");
+
+const T0 = Date.UTC(2026, 10, 12);
+async function setup() {
+  const clock = { t: T0 }, now = () => clock.t;
+  const raw = memoryRegistry({ now });
+  const acme = await raw.createTenant({ domain: "acme.com", admins: [] });
+  const board = await raw.createBoard({ tenant: acme.id, title: "b", memberRole: "viewer" });
+  return { clock, now, raw, acme, board, plain: tenancy({ registry: raw, now }) };
+}
+// engine's key, verbatim from server/gateway.js:591
+const engineKey = c => `${c.user}\n${c.identity?.email ?? ""}\n${c.identity?.domain ?? ""}`;
+
+test("identityKey equals engine's key for null/undefined/''/missing fields", () => {
+  for (const email of [null, undefined, "", "a@x.com"]) for (const domain of [null, undefined, "", "acme.com"]) {
+    const identity = { user: "google:1" };
+    if (email !== undefined) identity.email = email;
+    if (domain !== undefined) identity.domain = domain;
+    expect(identityKey(identity)).toBe(engineKey({ user: identity.user, identity }));
+  }
+});
+
+test("null/undefined/'' email and domain share a key AND an answer (combine reads truthiness)", async () => {
+  const { raw, board, plain, now } = await setup();
+  await raw.setGrant(board.id, "google:g", "editor");
+  const vs = [{ user: "google:g", email: null, domain: null }, { user: "google:g" }, { user: "google:g", email: "", domain: "" }];
+  const answers = await Promise.all(vs.map(v => plain.role(v, board.id)));
+  expect(new Set(answers).size).toBe(1);
+  const cache = roleCache({ registry: raw, now });
+  for (const v of vs) expect(await cache.role(v, board.id)).toBe("editor");
+  expect(cache.stats().hits).toBe(2);
+});
+
+test("email case: two keys, both answered from the invite (no leak, just two entries)", async () => {
+  const { raw, board, now } = await setup();
+  await raw.createInvite({ board: board.id, email: "ed@x.com", role: "editor", by: "google:root" });
+  const cache = roleCache({ registry: raw, now });
+  const a = { user: "google:e", email: "Ed@x.com", domain: null }, b = { user: "google:e", email: "ed@x.com", domain: null };
+  const m = await cache.rolesFor(board.id, [a, b]);
+  expect(m.get(identityKey(a))).toBe("editor");
+  expect(m.get(identityKey(b))).toBe("editor");
+});
+
+test("three identities of one user: invalidate(board,user) drops all; other users kept", async () => {
+  const { raw, board, now } = await setup();
+  await raw.setGrant(board.id, "google:u", "editor");
+  await raw.setGrant(board.id, "google:w", "editor");
+  const cache = roleCache({ registry: raw, now });
+  const ids = [{ user: "google:u", email: "a@x.com", domain: null }, { user: "google:u", email: null, domain: "acme.com" }, { user: "google:u" }];
+  const w = { user: "google:w" };
+  for (const i of [...ids, w]) await cache.role(i, board.id);
+  await raw.setGrant(board.id, "google:u", null);
+  cache.invalidate(board.id, "google:u");
+  for (const i of ids) expect(await cache.role(i, board.id)).toBe(i.domain === "acme.com" ? "viewer" : null);
+  const h = cache.stats().hits;
+  expect(await cache.role(w, board.id)).toBe("editor");
+  expect(cache.stats().hits).toBe(h + 1);
+});
+
+test("eviction then invalidate: byUser index stays consistent (evicted identity does not resurrect)", async () => {
+  const { raw, board, now } = await setup();
+  await raw.setGrant(board.id, "google:u", "editor");
+  const cache = roleCache({ registry: raw, now, maxEntries: 2 });
+  const a = { user: "google:u", email: "a@x.com" }, b = { user: "google:u", email: "b@x.com" }, c = { user: "google:u", email: "c@x.com" };
+  await cache.role(a, board.id); await cache.role(b, board.id); await cache.role(c, board.id);   // a evicted
+  expect(cache.stats().entries).toBe(2);
+  await raw.setGrant(board.id, "google:u", null);
+  cache.invalidate(board.id, "google:u");
+  expect(cache.stats().entries).toBe(0);
+  for (const i of [a, b, c]) expect(await cache.role(i, board.id)).toBe(null);
+});
+
+test("concurrent hello for identity B during rolesFor for identity A: B's stale fill is discarded", async () => {
+  const { raw, board, now } = await setup();
+  await raw.setGrant(board.id, "google:u", "editor");
+  let release, entered; const gate = new Promise(r => (release = r)), inside = new Promise(r => (entered = r));
+  const held = { ...raw, grant: async (b, u) => { const v = await raw.grant(b, u); entered(); await gate; return v; } };
+  const cache = roleCache({ registry: held, now });
+  const A = { user: "google:u", email: "a@x.com" }, B = { user: "google:u", email: "b@x.com" };
+  const hello = cache.role(B, board.id);          // reads grant=editor, held
+  await inside;
+  await raw.setGrant(board.id, "google:u", null);
+  const pass = cache.rolesFor(board.id, [A]);     // uses grants(), not grant(): not held
+  const m = await pass;
+  expect(m.get(identityKey(A))).toBe(null);
+  release();
+  expect(await hello).toBe("editor");             // the in-flight answer itself is stale (as without a cache)
+  // ...but it must not have been cached
+  expect(await cache.role(B, board.id)).toBe(null);
+});
+
+test("revokeLink + invalidate(board) drops the memoized link record (linkTtlMs 30 s)", async () => {
+  const { raw, board, now, clock } = await setup();
+  const l = await raw.createLink({ board: board.id, role: "editor", by: "google:root" });
+  await raw.addLinkUse(l.id, "google:g");
+  const cache = roleCache({ registry: raw, now });
+  const g = { user: "google:g" };
+  expect(await cache.role(g, board.id)).toBe("editor");
+  await raw.revokeLink(l.id);
+  cache.invalidate(board.id);
+  expect(await cache.role(g, board.id)).toBe(null);
+  // without the invalidate, the TTLs: role 30 s, link 30 s
+  const l2 = await raw.createLink({ board: board.id, role: "editor", by: "google:root" });
+  await raw.addLinkUse(l2.id, "google:h");
+  const h = { user: "google:h" };
+  expect(await cache.role(h, board.id)).toBe("editor");
+  await raw.revokeLink(l2.id);
+  clock.t += 30_001;
+  expect(await cache.role(h, board.id)).toBe(null);
+});
+
+test("newline in a user id collides keys: one identity's answer is served to another (theoretical)", async () => {
+  const { raw, board, now } = await setup();
+  // needs "\n" in two fields: a user id AND an email/domain (neither reachable from Google or dev tokens today)
+  await raw.createInvite({ board: board.id, email: "b\nb@x.com", role: "editor", by: "google:root" });
+  const real = { user: "google:a", email: "b\nb@x.com", domain: null };  // invited editor
+  const odd = { user: "google:a\nb", email: "b@x.com", domain: null };   // no invite, no grant: no rights
+
+  expect(identityKey(real)).toBe(identityKey(odd));
+  const cache = roleCache({ registry: raw, now });
+  expect(await cache.role(real, board.id)).toBe("editor");
+  expect(await cache.role(odd, board.id)).toBe("editor");   // LEAK: served real's cached answer
+  const m = await tenancy({ registry: raw, now }).rolesFor(board.id, [odd, real]);
+  expect(m.size).toBe(1);                                    // and resolveMany answers only the first
+});
+
+test("chained TTLs: a link memoized by A, revoked with no message; B's first hello at +29 s rides the memo", async () => {
+  const { raw, board, now, clock } = await setup();
+  const l = await raw.createLink({ board: board.id, role: "editor", by: "google:root" });
+  await raw.addLinkUse(l.id, "google:a"); await raw.addLinkUse(l.id, "google:b");
+  const cache = roleCache({ registry: raw, now });
+  const A = { user: "google:a" }, B = { user: "google:b" };
+  expect(await cache.role(A, board.id)).toBe("editor");      // memoizes link at T (linkTtlMs 30 s)
+  await raw.revokeLink(l.id);                                  // message lost: no invalidate
+  const out = {};
+  for (const dt of [29_000, 31_000, 58_000, 59_001]) { clock.t = T0 + dt; out[dt] = await cache.role(B, board.id); }
+  console.log("B after revoke:", JSON.stringify(out));
+});
+
+==== p5l2v-pg.test.js ====
+// p5-load2v: rolesFor/roleCache over the Postgres registry, many identities per user, vs per-identity tenancy.role.
+import { test, expect } from "bun:test";
+import { SQL } from "bun";
+const R = "/Users/r/repos/plenary";
+const { postgresRegistry } = await import(R + "/server/registry/postgres.js");
+const { tenancy, roleCache, identityKey } = await import(R + "/server/auth/tenancy.js");
+
+test("pg: rolesFor (plain, cached) equals tenancy.role for every identity, 2-3 identities per user", async () => {
+  const sql = new SQL({ url: process.env.DATABASE_URL, max: 4 });
+  const schema = "p5l2v_" + Date.now().toString(36);
+  const reg = await postgresRegistry({ sql, schema });
+  try {
+    const t = await reg.createTenant({ domain: "acme.com" });
+    const b = await reg.createBoard({ tenant: t.id, title: "x", memberRole: "viewer" });
+    const link = await reg.createLink({ board: b.id, role: "editor", by: "google:root" });
+    const ids = [];
+    for (let i = 0; i < 300; i++) {
+      const user = "google:" + i;
+      if (i % 5 === 0) await reg.setGrant(b.id, user, "annotator");
+      if (i % 7 === 0) await reg.addLinkUse(link.id, user);
+      if (i % 3 === 0) await reg.createInvite({ board: b.id, email: `inv${i}@x.com`, role: "editor", by: "google:root" });
+      ids.push({ user, email: `inv${i}@x.com`, domain: null });       // invited if i%3==0
+      ids.push({ user, email: `other${i}@x.com`, domain: "acme.com" }); // member
+      if (i % 2) ids.push({ user, email: null, domain: null });         // bare
+    }
+    const plain = tenancy({ registry: reg });
+    const want = new Map();
+    for (const id of ids) want.set(identityKey(id), await plain.role(id, b.id));
+    const shuffled = [...ids].sort(() => Math.random() - 0.5);
+    const got1 = await plain.rolesFor(b.id, shuffled);
+    const cache = roleCache({ registry: reg });
+    const got2 = await cache.rolesFor(b.id, shuffled);
+    expect(got1.size).toBe(want.size);
+    for (const [k, r] of want) { expect(got1.get(k)).toBe(r); expect(got2.get(k)).toBe(r); }
+    for (const id of ids) expect(await cache.role(id, b.id)).toBe(want.get(identityKey(id)));   // served from the write-through
+    expect(new Set(want.values()).size).toBeGreaterThan(2);
+  } finally {
+    await reg.close?.();
+    await sql.unsafe(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await sql.close();
+  }
+}, 60_000);
+
+==== p5l2bv.test.js (Re-check 2b; P5_ROOT=<tree> selects the tree) ====
+// p5-load2bv: the link-memo cap on a role entry's life (MEDIUM 0), boundary and multi-link.
+import { test, expect } from "bun:test";
+const R = process.env.P5_ROOT ?? "/Users/r/repos/plenary";
+const { memoryRegistry } = await import(R + "/server/auth/registry.js");
+const { roleCache } = await import(R + "/server/auth/tenancy.js");
+
+const T0 = Date.UTC(2026, 10, 12);
+async function setup() {
+  const clock = { t: T0 }, now = () => clock.t;
+  const raw = memoryRegistry({ now });
+  const t = await raw.createTenant({ domain: "acme.com", admins: [] });
+  const board = await raw.createBoard({ tenant: t.id, title: "b", memberRole: null });
+  return { clock, now, raw, board };
+}
+
+test("boundary: memo at T0, revoke lost; B is editor at +29.999 s, refused at +30 s and +30.001 s", async () => {
+  const { raw, board, now, clock } = await setup();
+  const l = await raw.createLink({ board: board.id, role: "editor", by: "google:root" });
+  await raw.addLinkUse(l.id, "google:a"); await raw.addLinkUse(l.id, "google:b");
+  const cache = roleCache({ registry: raw, now });
+  expect(await cache.role({ user: "google:a" }, board.id)).toBe("editor");   // memo at T0
+  await raw.revokeLink(l.id);
+  clock.t = T0 + 29_999;
+  expect(await cache.role({ user: "google:b" }, board.id)).toBe("editor");   // rides the memo, entry capped at T0+30 s
+  expect(await cache.role({ user: "google:b" }, board.id)).toBe("editor");   // served from the cache
+  clock.t = T0 + 30_000;
+  expect(await cache.role({ user: "google:b" }, board.id)).toBe(null);
+  clock.t = T0 + 30_001;
+  expect(await cache.role({ user: "google:b" }, board.id)).toBe(null);
+  expect(await cache.role({ user: "google:a" }, board.id)).toBe(null);
+});
+
+test("several links: the entry ends at the OLDEST link memo (min), not the newest", async () => {
+  const { raw, board, now, clock } = await setup();
+  const l1 = await raw.createLink({ board: board.id, role: "editor", by: "google:root" });
+  const l2 = await raw.createLink({ board: board.id, role: "viewer", by: "google:root" });
+  await raw.addLinkUse(l1.id, "google:a");                                   // A memoizes l1 at T0
+  await raw.addLinkUse(l2.id, "google:c");                                   // C memoizes l2 at T0+20 s
+  await raw.addLinkUse(l1.id, "google:b"); await raw.addLinkUse(l2.id, "google:b");
+  const cache = roleCache({ registry: raw, now });
+  expect(await cache.role({ user: "google:a" }, board.id)).toBe("editor");
+  clock.t = T0 + 20_000;
+  expect(await cache.role({ user: "google:c" }, board.id)).toBe("viewer");
+  await raw.revokeLink(l1.id);                                               // lost message
+  clock.t = T0 + 25_000;
+  expect(await cache.role({ user: "google:b" }, board.id)).toBe("editor");   // l1 memo (stale) + l2 memo
+  clock.t = T0 + 29_999;
+  expect(await cache.role({ user: "google:b" }, board.id)).toBe("editor");
+  clock.t = T0 + 30_000;
+  expect(await cache.role({ user: "google:b" }, board.id)).toBe("viewer");   // l1 re-read: revoked; l2 still memo'd
+  clock.t = T0 + 45_000;
+  expect(await cache.role({ user: "google:b" }, board.id)).toBe("viewer");
+});
+
+test("a joined in-flight link read is capped by the ORIGINAL read's start, not the joiner's", async () => {
+  const { raw, board, now, clock } = await setup();
+  const l = await raw.createLink({ board: board.id, role: "editor", by: "google:root" });
+  await raw.addLinkUse(l.id, "google:a"); await raw.addLinkUse(l.id, "google:b");
+  let release; const gate = new Promise(r => (release = r)); let entered; const inside = new Promise(r => (entered = r));
+  const held = { ...raw, link: async id => { const v = await raw.link(id); entered(); await gate; return v; } };
+  const cache = roleCache({ registry: held, now });
+  const pa = cache.role({ user: "google:a" }, board.id);     // link read starts at T0
+  await inside;
+  clock.t = T0 + 10_000;
+  const pb = cache.role({ user: "google:b" }, board.id);     // joins A's read at T0+10 s
+  await new Promise(r => setTimeout(r, 5));
+  release();
+  expect(await pa).toBe("editor"); expect(await pb).toBe("editor");
+  await raw.revokeLink(l.id);
+  clock.t = T0 + 30_000;                                      // A's read began at T0: both entries end here
+  expect(await cache.role({ user: "google:b" }, board.id)).toBe(null);
+});
+
+test("rolesFor (the pass path) reads links fresh: a lost revoke is seen at once", async () => {
+  const { raw, board, now } = await setup();
+  const l = await raw.createLink({ board: board.id, role: "editor", by: "google:root" });
+  await raw.addLinkUse(l.id, "google:a");
+  const cache = roleCache({ registry: raw, now });
+  expect(await cache.role({ user: "google:a" }, board.id)).toBe("editor");
+  await raw.revokeLink(l.id);
+  const m = await cache.rolesFor(board.id, [{ user: "google:a" }]);
+  expect([...m.values()]).toEqual([null]);
+  // rolesFor alone does NOT refresh the link memo: a hello right after the pass still rides it (bounded by the cap)
+  expect(await cache.role({ user: "google:a" }, board.id)).toBe("editor");
+});
+
+test("the gateway's real pass order (invalidate(board), then rolesFor): the next hello is refused", async () => {
+  const { raw, board, now } = await setup();
+  const l = await raw.createLink({ board: board.id, role: "editor", by: "google:root" });
+  await raw.addLinkUse(l.id, "google:a");
+  const cache = roleCache({ registry: raw, now });
+  expect(await cache.role({ user: "google:a" }, board.id)).toBe("editor");
+  await raw.revokeLink(l.id);
+  cache.invalidate(board.id);
+  await cache.rolesFor(board.id, [{ user: "google:a" }]);
+  expect(await cache.role({ user: "google:a" }, board.id)).toBe(null);
+});
+
+==== mutate.sh (Re-check 2b) ====
+#!/bin/zsh
+# Runs each mutation on the scratch copy only, restoring from the main tree after each.
+S=/private/tmp/claude-501/-Users-r-repos-plenary/fa69bfcb-e83d-4134-b86a-cf327166d462/scratchpad
+M=$S/mut2b
+O=/Users/r/repos/plenary/server/auth/tenancy.js
+F=$M/server/auth/tenancy.js
+cd $M
+run() { P5_ROOT=$M bun test test/auth/role-cache.test.js $S/p5l2bv.test.js 2>&1 | grep -E "\(fail\)|^ *[0-9]+ (pass|fail)"; cp $O $F; }
+sub() { python3 -c "import sys; p,a,b=sys.argv[1:]; s=open(p).read(); assert s.count(a)==1, 'anchor'; open(p,'w').write(s.replace(a,b))" $F "$1" "$2"; }
+
+echo "--- none"; run
+echo "--- C1 cap removed"
+sub '    for (const l of links) if (l) r.until = Math.min(r.until, recordUntil(l));' ''; run
+echo "--- C2 cap by the last link only"
+sub 'for (const l of links) if (l) r.until = Math.min(r.until, recordUntil(l));' '{ const l = links[links.length - 1]; if (l) r.until = Math.min(r.until, recordUntil(l)); }'; run
+echo "--- C3 a joiner capped by its own start"
+sub 'from = p ? flight.t : t;' 'from = t;'; run
+echo "--- M8 invalidate(board, user) drops only the first identity"
+sub 'for (const ek of [...(byUser.get(k) ?? [])]) remove(ek);' '{ const f = [...(byUser.get(k) ?? [])][0]; if (f) remove(f); }'; run
+cmp $O $F && echo restored

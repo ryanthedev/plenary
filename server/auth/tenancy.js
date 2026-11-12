@@ -30,6 +30,13 @@ import { higher, capTo, normEmail, ROLES, LINK_ROLES, INVITE_ROLES } from "./uti
 /** Users per `linkUsesFor` call (SQL bind limits; a 100k pass is 100 queries, not one 100k-parameter one). */
 export const USE_CHUNK = 1000;
 
+/**
+ * The key `rolesFor` answers by: what a role reads (user; email, for invites; domain, for membership). The gateway's
+ * re-check pass groups connections by exactly this key and looks its answers up with it.
+ * @param {{ user: string, email?: string|null, domain?: string|null }} id
+ */
+export const identityKey = id => `${id.user}\n${id.email ?? ""}\n${id.domain ?? ""}`;
+
 const live = (x, t) => x && !x.revoked && (x.expiresAt == null || t < x.expiresAt);
 const okIdentity = id => !!id && typeof id.user === "string";
 
@@ -50,8 +57,12 @@ export function combine({ board, tenant, grant, invites, links }, identity, t) {
   return { role: r ?? null, until };
 }
 
-/** @param {{ registry: Registry, now?: () => number }} deps */
-export function tenancy({ registry, now = Date.now }) {
+/**
+ * @param {{ registry: Registry, now?: () => number, recordUntil?: (record: object) => number }} deps
+ *   recordUntil: for a cache over this tenancy (roleCache): until when a link record `resolve` read may be relied on
+ *   (its memo's end). `resolve`'s `until` is capped by it, so an answer never outlives the records it was built from.
+ */
+export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity }) {
   /** One user's role with the time it may change by itself. @returns {Promise<Resolved>} */
   async function resolve(identity, boardId) {
     if (!okIdentity(identity) || typeof boardId !== "string") return { role: null, until: Infinity };
@@ -63,18 +74,23 @@ export function tenancy({ registry, now = Date.now }) {
     const links = [];
     for (const id of await registry.linkUses(board.id, identity.user)) links.push(await registry.link(id));
     const tenant = identity.domain && board.memberRole ? await registry.tenant(board.tenant) : null;
-    return combine({ board, tenant, grant, invites, links }, identity, t);
+    const r = combine({ board, tenant, grant, invites, links }, identity, t);
+    // Board and tenant: the fields read never change. Links can (revokeLink): cap by every link record read.
+    for (const l of links) if (l) r.until = Math.min(r.until, recordUntil(l));
+    return r;
   }
 
   /**
-   * Many users' roles on one board, from the board's rows read once. Identities are keyed by `user` (the first
-   * identity of a user wins). @returns {Promise<Map<string, Resolved>>} every requested user present
+   * Many identities' roles on one board, from the board's rows read once. Keyed by `identityKey` (user, email,
+   * domain: what a role reads), so two identities of one user (tabs signed in with different emails or domains) get
+   * their own answers (p5-loadv finding 2). @returns {Promise<Map<string, Resolved & { identity: Identity }>>}
+   * one entry per distinct requested identity key
    */
   async function resolveMany(boardId, identities) {
     const ids = new Map();
-    for (const id of identities ?? []) if (okIdentity(id) && !ids.has(id.user)) ids.set(id.user, id);
+    for (const id of identities ?? []) if (okIdentity(id)) { const k = identityKey(id); if (!ids.has(k)) ids.set(k, id); }
     const out = new Map();
-    const none = () => { for (const u of ids.keys()) out.set(u, { role: null, until: Infinity }); return out; };
+    const none = () => { for (const [k, id] of ids) out.set(k, { role: null, until: Infinity, identity: id }); return out; };
     if (typeof boardId !== "string" || !ids.size) return none();
     const board = await registry.board(boardId);
     if (!board) return none();
@@ -90,19 +106,20 @@ export function tenancy({ registry, now = Date.now }) {
     }
     /** @type {Map<string, string[]>} user → link ids used on this board */
     let uses = new Map();
+    const users = [...new Set(all.map(id => id.user))];   // link uses are per user, whatever the email or domain
     if (typeof registry.linkUsesFor === "function") {
-      for (let i = 0; i < all.length; i += USE_CHUNK) {
-        const got = await registry.linkUsesFor(board.id, all.slice(i, i + USE_CHUNK).map(id => id.user));
-        for (const [u, ls] of got) if (ids.has(u)) uses.set(u, ls);
+      for (let i = 0; i < users.length; i += USE_CHUNK) {
+        const chunk = users.slice(i, i + USE_CHUNK), want = new Set(chunk);
+        for (const [u, ls] of await registry.linkUsesFor(board.id, chunk)) if (want.has(u)) uses.set(u, ls);
       }
-    } else for (const id of all) uses.set(id.user, await registry.linkUses(board.id, id.user));
+    } else for (const u of users) uses.set(u, await registry.linkUses(board.id, u));
     let linkById = new Map();
     for (const ls of uses.values()) if (ls.length) { linkById = new Map((await registry.links(board.id)).map(l => [l.id, l])); break; }
     const tenant = board.memberRole && all.some(id => id.domain) ? await registry.tenant(board.tenant) : null;
-    for (const id of all) {
+    for (const [k, id] of ids) {
       const invites = id.email ? invitesBy.get(normEmail(id.email)) ?? [] : [];
       const links = (uses.get(id.user) ?? []).map(l => linkById.get(l) ?? null);
-      out.set(id.user, combine({ board, tenant, grant: grants.get(id.user) ?? null, invites, links }, id, t));
+      out.set(k, { ...combine({ board, tenant, grant: grants.get(id.user) ?? null, invites, links }, id, t), identity: id });
     }
     return out;
   }
@@ -112,10 +129,10 @@ export function tenancy({ registry, now = Date.now }) {
     async role(identity, boardId) { return (await resolve(identity, boardId)).role; },
     resolve,
     resolveMany,
-    /** @returns {Promise<Map<string, Role|null>>} user → role, one entry per distinct requested user */
+    /** @returns {Promise<Map<string, Role|null>>} identityKey(identity) → role, one entry per distinct requested identity */
     async rolesFor(boardId, identities) {
       const m = await resolveMany(boardId, identities);
-      return new Map([...m].map(([u, r]) => [u, r.role]));
+      return new Map([...m].map(([k, r]) => [k, r.role]));
     },
 
     /**
@@ -137,7 +154,7 @@ export function tenancy({ registry, now = Date.now }) {
   };
 }
 
-const tenancyOver = (registry, now) => tenancy({ registry, now });
+const tenancyOver = (registry, now, recordUntil) => tenancy({ registry, now, recordUntil });
 
 // ---- roleCache: a role cache over `tenancy` (p5-load; p-audit F8). Depends only on the Registry port. ----
 //
@@ -162,13 +179,24 @@ const tenancyOver = (registry, now) => tenancy({ registry, now });
 // Errors are never cached: a Registry failure propagates (the gateway answers `unavailable`).
 
 /**
- * @param {{ registry: Registry, now?: () => number, ttlMs?: number, recordTtlMs?: number, maxEntries?: number, maxRecords?: number }} o
- *   ttlMs: a role entry's longest life (default 30 s; keep it ≤ the gateway's 60 s re-check, see the report);
- *   recordTtlMs: board / tenant / link records (default 60 s).
+ * @param {{ registry: Registry, now?: () => number, ttlMs?: number, recordTtlMs?: number, linkTtlMs?: number, maxEntries?: number, maxRecords?: number }} o
+ *   ttlMs: a role entry's longest life, counted from when the oldest changeable data it rests on was read (default
+ *     30 s; keep it ≤ the gateway's 60 s re-check, see the report). An entry built from a memoized link record ends no
+ *     later than that record's memo (p5-load2v MEDIUM 0), so with linkTtlMs ≤ ttlMs a role is never served from data
+ *     more than ttlMs old;
+ *   recordTtlMs: board and tenant records (default 10 min, above the 60 s pass, so a pass reads them from memory). The
+ *     fields the cache reads from them (board.id, board.memberRole, board.tenant, tenant.domain) never change: the
+ *     port has no update or delete for either (p5-loadv finding 6). `tenant.admins` DOES change at runtime
+ *     (addTenantAdmin, add-only): never serve `admins` (or any field but those four) from this memo; admin checks
+ *     read the Registry (server/admin/boards.js). IF a future port adds one (setMemberRole,
+ *     deleteBoard, a tenant domain change), that write must announce `{ board }` (every board of the tenant, for a
+ *     tenant change) and `invalidate(board)` must then also drop the board and tenant records: today it drops roles
+ *     and links only;
+ *   linkTtlMs: link records (default 30 s; a link changes by revokeLink, which announces `{ board }` and drops them).
  */
 const STAMP_MAX = 10_000;
 
-export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlMs = 60_000, maxEntries = 200_000, maxRecords = 100_000 }) {
+export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlMs = 600_000, linkTtlMs = 30_000, maxEntries = 200_000, maxRecords = 100_000 }) {
   if (!registry) throw new Error("roleCache: registry is required");
   const stats = { hits: 0, misses: 0, fills: 0, discarded: 0, recordHits: 0, recordMisses: 0 };
 
@@ -188,12 +216,12 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
   function memo(kind, fetch) {
     return async id => {
       const k = kind + ":" + id, t = now(), hit = records.get(k);
-      if (hit && hit.until > t) { stats.recordHits++; return structuredClone(hit.value); }
+      if (hit && hit.until > t) { stats.recordHits++; return mark(kind, structuredClone(hit.value), hit.until); }
       stats.recordMisses++;
       // Join a read in flight only if nothing was invalidated since it began: a reader that starts after an
       // invalidation must not be handed a record read before it (it would pass its own stamp check with old data).
       const flight = recordReads.get(k);
-      let p = flight && flight.c0 === clock ? flight.p : null;
+      let p = flight && flight.c0 === clock ? flight.p : null, from = p ? flight.t : t;
       if (!p) {
         const c0 = clock;
         reading++;
@@ -202,42 +230,57 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
           // null is not memoized (a link created later must be found); a link whose board was invalidated meanwhile neither
           if (v && !(board && (boardStamp.get(board) ?? 0) > c0)) {
             if (records.size >= maxRecords) { const [ok, ov] = records.entries().next().value; records.delete(ok); if (ov.board) linksOf.get(ov.board)?.delete(ok); }
-            records.set(k, { value: v, until: t + recordTtlMs, board });
+            records.set(k, { value: v, until: t + ttlOf(kind), board });
             if (board) { if (!linksOf.has(board)) linksOf.set(board, new Set()); linksOf.get(board).add(k); }
           }
           return v;
         }).finally(() => { if (recordReads.get(k)?.p === p) recordReads.delete(k); endRead(); });
-        recordReads.set(k, { p, c0 });
+        recordReads.set(k, { p, c0, t });
       }
       const v = await p;
-      return v ? structuredClone(v) : v;
+      return v ? mark(kind, structuredClone(v), from + ttlOf(kind)) : v;
     };
   }
+  const ttlOf = kind => (kind === "link" ? linkTtlMs : recordTtlMs);
+  /** @type {WeakMap<object, number>} a link record handed to tenancy → the end of the memo it came from */
+  const linkUntil = new WeakMap();
+  const mark = (kind, v, until) => { if (kind === "link") linkUntil.set(v, until); return v; };
   const board = memo("board", id => registry.board(id));
   const view = { ...registry, board, tenant: memo("tenant", id => registry.tenant(id)), link: memo("link", id => registry.link(id)) };
-  const tenancy = tenancyOver(view, now);
+  const tenancy = tenancyOver(view, now, l => linkUntil.get(l) ?? Infinity);
 
   // ---- roles ----
-  /** @type {Map<string, { board: string, user: string, role: Role, email: string|null, domain: string|null, until: number }>} insertion order = age */
+  // Entries are keyed by board + identityKey (user, email, domain), as the gateway groups connections, so two
+  // identities of one user each have their own entry. Indexed by board and by (board, user) for invalidation.
+  // Stamps stay per (board, user): coarser than per identity, so never staler.
+  /** @type {Map<string, { board: string, user: string, role: Role, until: number }>} insertion order = age */
   const entries = new Map();
   /** @type {Map<string, Set<string>>} board → its entry keys */ const byBoard = new Map();
-  function put(b, user, identity, role, until) {
-    const k = ukey(b, user);
-    entries.delete(k);
-    if (entries.size >= maxEntries) { const [ok, oe] = entries.entries().next().value; entries.delete(ok); byBoard.get(oe.board)?.delete(ok); }
-    entries.set(k, { board: b, user, role, email: identity.email ?? null, domain: identity.domain ?? null, until });
-    if (!byBoard.has(b)) byBoard.set(b, new Set());
-    byBoard.get(b).add(k);
+  /** @type {Map<string, Set<string>>} board + user → its entry keys (one per identity) */ const byUser = new Map();
+  const ekey = (b, identity) => b + "\n" + identityKey(identity);
+  const index = (m, k, v) => { if (!m.has(k)) m.set(k, new Set()); m.get(k).add(v); };
+  const unindex = (m, k, v) => { const s = m.get(k); if (s) { s.delete(v); if (!s.size) m.delete(k); } };
+  function remove(k) {
+    const e = entries.get(k);
+    if (!e) return;
+    entries.delete(k); unindex(byBoard, e.board, k); unindex(byUser, ukey(e.board, e.user), k);
   }
-  function dropBoard(b) { for (const k of byBoard.get(b) ?? []) entries.delete(k); byBoard.delete(b); }
+  function put(b, identity, role, until) {
+    const k = ekey(b, identity);
+    remove(k);
+    if (entries.size >= maxEntries) remove(entries.keys().next().value);
+    entries.set(k, { board: b, user: identity.user, role, until });
+    index(byBoard, b, k); index(byUser, ukey(b, identity.user), k);
+  }
+  function dropBoard(b) { for (const k of [...(byBoard.get(b) ?? [])]) remove(k); }
 
   return {
     /** A role for a hello: cached, or read and cached. @returns {Promise<Role|null>} */
     async role(identity, boardId) {
       if (!identity || typeof identity.user !== "string" || typeof boardId !== "string") return null;
-      const k = ukey(boardId, identity.user), t0 = now(), e = entries.get(k);
-      if (e && e.until > t0 && e.email === (identity.email ?? null) && e.domain === (identity.domain ?? null)) { stats.hits++; return e.role; }
-      if (e) { entries.delete(k); byBoard.get(boardId)?.delete(k); }
+      const k = ekey(boardId, identity), t0 = now(), e = entries.get(k);
+      if (e && e.until > t0) { stats.hits++; return e.role; }
+      if (e) remove(k);
       stats.misses++;
       const c0 = clock;
       reading++;
@@ -247,7 +290,7 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
         // fill (before endRead clears the stamps)
         if (r && r.role != null) {
           if (stale(boardId, identity.user, c0)) stats.discarded++;
-          else { const until = Math.min(t0 + ttlMs, r.until); if (until > now()) { put(boardId, identity.user, identity, r.role, until); stats.fills++; } }
+          else { const until = Math.min(t0 + ttlMs, r.until); if (until > now()) { put(boardId, identity, r.role, until); stats.fills++; } }
         }
         endRead();
       }
@@ -267,21 +310,21 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
       finally {
         if (m) {
           const boardMoved = (boardStamp.get(boardId) ?? 0) > c0, others = reading > 1;
-          const byUser = new Map();
-          for (const id of identities ?? []) if (id && typeof id.user === "string" && !byUser.has(id.user)) byUser.set(id.user, id);
-          for (const [user, r] of m) {
-            const k = ukey(boardId, user), moved = boardMoved || (userStamp.get(k) ?? 0) > c0;
-            if (entries.delete(k)) byBoard.get(boardId)?.delete(k);
+          // `moved` for every identity first (stamps below must not mark this call's own other identities moved)
+          const rows = [...m.values()].map(r => ({ r, uk: ukey(boardId, r.identity.user) }));
+          for (const x of rows) x.moved = boardMoved || (userStamp.get(x.uk) ?? 0) > c0;
+          for (const { r, uk, moved } of rows) {
+            remove(ekey(boardId, r.identity));
             // a hello's read in flight began before this one ended: it must not overwrite this fresher answer
-            if (others) { if (userStamp.size < STAMP_MAX) userStamp.set(k, ++clock); else boardStamp.set(boardId, ++clock); }   // boardMoved was read above
+            if (others) { if (userStamp.size < STAMP_MAX) userStamp.set(uk, ++clock); else boardStamp.set(boardId, ++clock); }
             if (r.role == null || moved) continue;
             const until = Math.min(t0 + ttlMs, r.until);
-            if (until > now()) put(boardId, user, byUser.get(user), r.role, until);
+            if (until > now()) put(boardId, r.identity, r.role, until);
           }
         }
         endRead();
       }
-      return new Map([...m].map(([u, r]) => [u, r.role]));
+      return new Map([...m].map(([k, r]) => [k, r.role]));
     },
 
     /** Drop a board's cached roles and link records, or one user's role. Synchronous; call it before re-reading. */
@@ -289,7 +332,7 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
       if (typeof boardId !== "string") return;
       if (typeof user === "string") {
         const k = ukey(boardId, user);
-        if (entries.delete(k)) byBoard.get(boardId)?.delete(k);
+        for (const ek of [...(byUser.get(k) ?? [])]) remove(ek);   // every identity of the user
         // While reads are in flight, stamp the user; past STAMP_MAX user stamps (a redemption wave on a slow
         // Registry), stamp the whole board instead: coarser (more discarded fills), never staler, and bounded.
         if (reading) { if (userStamp.size < STAMP_MAX) userStamp.set(k, ++clock); else boardStamp.set(boardId, ++clock); }

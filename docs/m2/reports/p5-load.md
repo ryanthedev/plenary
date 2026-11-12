@@ -281,3 +281,153 @@ It touches 11 files.
    many explicit grants, add `grantsFor`.
 5. **Hello generation:** a `{ board, user }` message doesn't bump it, so a redeemer's hello in flight may go live with
    the lower role until the next timed pass (an upgrade delay only).
+
+## Round 2 (p5-load2, fix round; scope cut by t187 mid-round)
+
+t187 narrowed this round because engine's `gateway.js` is still mid-edit (p2-tune r2):
+
+- **Done now, in my files only:** steps 1, 2 (GAP-M3 only), 3, 6 and 7.
+- **Pending (below):** steps 4–5 (the patch re-cut and its gates) and the gateway gap tests (GAP-M4, GAP-M6, M7).
+- **Base recorded for the re-cut:** `git hash-object server/gateway.js` = `30cdfcf3a70e904ae60f5df27a8c370b8777a53a`
+  (main tree, uncommitted, at the start of this round). It may have moved since.
+
+### What changed
+
+| File | Change |
+|---|---|
+| `server/auth/tenancy.js` | **Finding 2 (step 1):** new export `identityKey(id)` = `` `${id.user}\n${id.email ?? ""}\n${id.domain ?? ""}` ``, engine's exact key (gateway.js:590–591, confirmed by t187), for the gateway to import rather than re-spell. Details below. |
+| `server/auth/tenancy.js` | **Finding 6 (step 3):** the record TTL is split. Details below. |
+| `test/auth/role-cache.test.js` | **GAP-M3** adopted verbatim from `p5-loadv.tests.txt`. **New two-identity test.** Lookups now use `identityKey`. 16 tests. |
+
+**Step 1, identity keying:**
+
+- **`resolveMany` and `rolesFor`** (plain and cached) answer per identity key, not per user. Link uses are still
+  fetched once per distinct user (they don't depend on email or domain).
+- **Cache entries** are keyed by board + `identityKey`, so two identities of one user are cached side by side.
+- **`invalidate(board, user)`** drops every identity of that user (a per-(board, user) index).
+- **Stamps** stay per (board, user): coarser than per identity, so never staler.
+- **`rolesFor` write-through** computes `moved` for all identities before stamping any, so one identity's stamp doesn't
+  mark the call's other identities as moved.
+
+**Step 3, record TTLs:**
+
+- **Board and tenant records:** `recordTtlMs` default is now 10 min (was 60 s), above the 60 s pass, so a
+  steady-state pass costs 4 queries, not 6.
+- **Link records:** a separate `linkTtlMs`, default 30 s, because a link changes on `revokeLink`.
+- **If a future port adds an update or delete** (for example `setMemberRole`, `deleteBoard` or a tenant domain
+  change), that write must:
+  - announce `{ board }` (every board of the tenant, for a tenant change);
+  - and `invalidate(board)` must then also drop the board and tenant records. Today it drops roles and links only.
+  - The JSDoc of `roleCache` says this.
+
+### Tests and checks
+
+- **Two-identity test:** one user, one identity with an invited email (`editor`) and one without (`null`). Both
+  answers come back from `tenancy.rolesFor`, the per-user fallback (no `linkUsesFor`) and `roleCache.rolesFor`, in
+  both orders.
+  - `cache.role` gives each its own answer, and both are cached side by side (2 hits).
+  - `invalidate(board, user)` drops both.
+  - It also asserts `identityKey` spells a missing domain as `''`.
+- **Mutations** (applied one at a time, restored, `cmp` clean):
+
+  | Mutation | Result |
+  |---|---|
+  | M3: write-through ignores `moved` | GAP-M3 fails (1 fail) |
+  | `identityKey = id => id.user` (the collapsed key of finding 2) | The two-identity test fails, plus "another email or domain misses" (2 fail) |
+
+- **Full `bun test`:** 1135 pass, 125 skip, 1 fail:
+  `(fail) packages/core is still herdr-draw's core (re-copy when herdr-draw's core changes)`. Not this job: the sibling
+  herdr-draw checkout has uncommitted edits in `core/editor.js` and `core/geometry.js`, as in round 1. `test/auth` is
+  172 pass, 0 fail.
+
+### Pending (waiting for engine's commit id from t187)
+
+- **Step 4, the re-cut of `docs/m2/reports/p5-load.patch`** onto engine's committed `gateway.js`, following the
+  verifier's merge plan:
+  - keep engine's `rc.cut` check before the chunk fetch;
+  - feed a chunk error into engine's `ok[]` and `sum.errors` accounting and its "registry down" early stop;
+  - bound `rolesFor` with `recheckLookupMs`, as `roleWithin` does (finding 1), then re-run `p5v-hang`;
+  - group by and look up with `identityKey(g.identity)`, importing it from `tenancy.js`. The map from `rolesFor` is
+    now keyed that way, so `roles.get(g.user)` would return `undefined`, which reads as null and closes the
+    connection: the re-cut must use the key.
+- **Step 4 gateway gap tests:** GAP-M4 and GAP-M6 (from `p5-loadv.tests.txt`), plus a new test catching M7 (the
+  pass-start `w.gen++` removed), each confirmed failing under its mutation.
+- **Step 5 gates:**
+  - `git apply --check` on a copy of the tree;
+  - full `bun test` on scratch (tree + patch), with and without `DATABASE_URL` (Podman Postgres), every failure named
+    and compared to the unpatched tree;
+  - the p5-loadv revocation table re-run on the merged gateway.
+- **The current `p5-load.patch` is stale:** it was cut from `f1ee465`, and its gateway hunk uses `roles.get(g.user)`,
+  which no longer matches the identity-keyed `rolesFor`. Engine must not apply it.
+
+### Finding 5: proposed PROTOCOL.md sentence (step 6; I don't edit PROTOCOL.md)
+
+For § Auth, Re-checking live connections, after the timed-pass bullet:
+
+> "A gateway may answer a hello's role from a per-gateway cache. If a `grants` message is lost, a NEW connection may
+> therefore be admitted with the old role until the gateway's next timed re-check, which reads the Registry fresh and
+> treats the connection like any other live one, or until the cache entry's life ends (at most 30 s), whichever is
+> first. A revoke is never hidden longer than it would be without the cache."
+
+(Updated in Round 2b to p5-load2v's wording. Three things to note:
+
+- **Not live yet:** this describes the cache once the re-cut patch wires it in.
+- **"At most 30 s"** holds after Round 2b's link-memo cap.
+- **"Like any other live one":** a connection already admitted follows the live-connection rules. If that pass's
+  Registry read fails, it is kept and retried, 2/4/8 s.)
+
+### Design check (step 7; distributed-systems-design, APPLIER, short)
+
+- **Time bound (finding 1; applies at the re-cut):**
+  - **Rule:** every Registry wait on the revocation path must be bounded. A pass holds its board's one pass chain, so
+    an unbounded `rolesFor` blocks the queued `grants` pass, and with it every revoke on that board.
+  - **What the bound buys:** with `rolesFor` raced against `recheckLookupMs` (2 s), a hung Registry costs at most
+    2 s per chunk. A chunk error becomes per-identity errors in engine's accounting: a grants pass fails closed; a
+    timed pass keeps and retries; the first-batch "registry down" check stops the pass.
+  - **Cost:** a chunk of 1,000 that times out fails 1,000 identities together, where per-user lookups would fail them
+    one by one. That is acceptable: a Registry that can't answer one board query in 2 s can't answer per-user queries
+    either.
+  - **Abandoned reads:** a late `rolesFor` that settles after its timeout must not write through. It doesn't, if the
+    pass calls `invalidate(board)` again on timeout (stamps the board). Do that in the re-cut.
+- **Per-identity keying (finding 2, done):**
+  - **Why:** a role is a function of (user, email, domain), so the cache key, the batch key and the gateway's grouping
+    key must be one function. Exporting `identityKey` from core and importing it in the gateway removes the
+    two-spellings hazard that caused finding 2.
+  - **Cost:** two identities of one user mean two cache entries. Bounded by `maxEntries`; rare in practice.
+  - **Invalidation:** stays per (board, user) (a revoke names a user, not an email), via the per-user index.
+
+## Round 2b (p5-load2b: verifier p5-load2v PASS, one MEDIUM)
+
+**Files touched:** `server/auth/tenancy.js`, `test/auth/role-cache.test.js`, this report.
+
+| Item | Change |
+|---|---|
+| **MEDIUM 0, option (b)** | A role entry's `until` is capped at the end of the memo of every link record it was built from. The cache stamps each link record it hands out with that record's memo end (a `WeakMap`). `tenancy` gains an optional `recordUntil(record)` hook (default `Infinity`), and `resolve` caps its `until` by it. **Result:** a new hello after a lost link revoke is admitted for at most `ttlMs` (30 s; `linkTtlMs` 30 s ≤ `ttlMs`), not ~60 s. Board and tenant records are not capped: the fields read from them never change. The `rolesFor` path reads `links(board)` fresh, so it needs no cap. The `ttlMs` JSDoc now says what the bound is counted from, and that it holds with `linkTtlMs ≤ ttlMs`. |
+| **LOW 3** | The two-identity test now caches three entries (two of gus, one of ann). After `invalidate(board, "google:gus")` it asserts `stats().entries` = 1, that both gus identities miss, and that ann's entry is still a hit. |
+| **LOW 2** | The `recordTtlMs` JSDoc names the four fields the cache reads (`board.id`, `board.memberRole`, `board.tenant`, `tenant.domain`) and says they never change. It also says `tenant.admins` does change at runtime (`addTenantAdmin`, add-only), and must never be served from this memo; admin checks read the Registry. |
+| **LOW 5** | The proposed PROTOCOL sentence (Round 2, finding 5) now uses p5-load2v's wording, with "at most 30 s" and the live-connection qualification. PROTOCOL.md is not edited. |
+| Not in scope | LOW 1 (a newline inside two identity fields could collide keys): it must change together with engine's gateway key. |
+
+**New test, "chained TTLs" (p5-load2v's shape, as assertions):**
+
+1. A's hello memoizes the link record at T0.
+2. `revokeLink` is called, and the `grants` message is lost.
+3. B's first hello at T0 + 29 s is `editor`: it rides the 29 s old memo.
+4. At T0 + 30.001 s, B and A are both `null`. Without the cap, B stayed `editor` until T0 + 59 s.
+
+**Mutations** (one at a time, then restored; `cmp` clean):
+
+| Mutation | `test/auth/role-cache.test.js` |
+|---|---|
+| Cap removed (no `recordUntil` in `resolve`) | 1 fail: "chained TTLs" |
+| M8: `invalidate(board, user)` drops only the first identity | 1 fail: the two-identity test |
+
+**Gates:**
+
+- `bun test test/auth`: 175 pass, 0 fail.
+- Full `bun test`: 1143 pass, 131 skip, 1 fail:
+  `(fail) packages/core is still herdr-draw's core (re-copy when herdr-draw's core changes)`. That is the known
+  unrelated failure: the sibling herdr-draw checkout has uncommitted `core/` edits.
+
+**Still pending (from Round 2):** the patch re-cut onto engine's committed `gateway.js`, and the gateway gap tests
+GAP-M4, GAP-M6 and M7, waiting for engine's commit id from t187.

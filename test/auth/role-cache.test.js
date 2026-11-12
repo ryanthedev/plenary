@@ -2,7 +2,7 @@
 // Registry batch `linkUsesFor`, and share-link redemption no longer announcing on `grants` (server/main.js).
 import { test, expect, beforeEach } from "bun:test";
 import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy, roleCache, combine, USE_CHUNK } from "../../server/auth/tenancy.js";
+import { tenancy, roleCache, combine, identityKey, USE_CHUNK } from "../../server/auth/tenancy.js";
 import { memoryBus } from "../../server/bus/memory.js";
 import { subjects } from "../../server/bus/port.js";
 import { announcingRegistry } from "../../server/main.js";
@@ -63,13 +63,13 @@ test("a revoke whose `grants` message was lost: the next rolesFor (timed pass) r
   await raw.setGrant(board.id, hal.user, null);
   expect(await cache.role(gus, board.id)).toBe("editor");      // stale: no message reached this node
   // rolesFor alone is fresh and writes through for the users it read...
-  expect((await cache.rolesFor(board.id, [gus])).get(gus.user)).toBe(null);
+  expect((await cache.rolesFor(board.id, [gus])).get(identityKey(gus))).toBe(null);
   expect(await cache.role(gus, board.id)).toBe(null);
   expect(await cache.role(hal, board.id)).toBe("editor");        // ...hal was not in it
   // the timed pass (the gateway patch): invalidate(board), then rolesFor over its live users (gus only, hal has no
   // socket here): every other entry of the board is gone too
   cache.invalidate(board.id);
-  expect((await cache.rolesFor(board.id, [gus])).get(gus.user)).toBe(null);
+  expect((await cache.rolesFor(board.id, [gus])).get(identityKey(gus))).toBe(null);
   expect(await cache.role(gus, board.id)).toBe(null);
   expect(await cache.role(hal, board.id)).toBe(null);
   // and with no pass at all, the TTL ends it
@@ -99,7 +99,7 @@ test("expiry without a message: an entry lives no longer than the soonest invite
   // the same through rolesFor's write-through
   const l2 = await raw.createLink({ board: board.id, role: "viewer", expiresAt: clock.t + 1_000, by: "google:root" });
   await raw.addLinkUse(l2.id, gus.user);
-  expect((await cache.rolesFor(board.id, [gus])).get(gus.user)).toBe("viewer");
+  expect((await cache.rolesFor(board.id, [gus])).get(identityKey(gus))).toBe("viewer");
   expect(await cache.role(gus, board.id)).toBe("viewer");
   const misses = cache.stats().misses;
   clock.t += 1_000;
@@ -183,10 +183,74 @@ test("a hello's read in flight during rolesFor never overwrites the fresher writ
   const hello = cache.role(gus, board.id);                          // reads "editor", held
   await new Promise(r => setTimeout(r, 0));
   await raw.setGrant(board.id, gus.user, "viewer");                 // the message was lost
-  expect((await cache.rolesFor(board.id, [gus])).get(gus.user)).toBe("viewer");   // grants(board): not held
+  expect((await cache.rolesFor(board.id, [gus])).get(identityKey(gus))).toBe("viewer");   // grants(board): not held
   gate = null; open();
   expect(await hello).toBe("editor");
   expect(await cache.role(gus, board.id)).toBe("viewer");          // the write-through stands
+});
+
+test("GAP-M3 (p5-loadv): rolesFor in flight across invalidate(board) does not write its stale answer", async () => {
+  const raw = memoryRegistry();
+  const t = await raw.createTenant({ domain: null });
+  const b = await raw.createBoard({ tenant: t.id, memberRole: null });
+  await raw.setGrant(b.id, "u", "editor");
+  let open; const gate = new Promise(r => { open = r; }); let hold = true, grantCalls = 0;
+  const reg = { ...raw, grants: async x => { const v = await raw.grants(x); if (hold) { hold = false; await gate; } return v; }, grant: async (x, u) => { grantCalls++; return raw.grant(x, u); } };
+  const c = roleCache({ registry: reg, ttlMs: 3_600_000 });
+  const p = c.rolesFor(b.id, [{ user: "u" }]);
+  await new Promise(r => setTimeout(r, 5));
+  await raw.setGrant(b.id, "u", null); c.invalidate(b.id);
+  open(); await p;
+  expect(await c.role({ user: "u" }, b.id)).toBe(null);
+  expect(grantCalls).toBe(1);
+});
+
+test("two identities of one user (one invited email, one not) each get their own answer: rolesFor, fallback and cache", async () => {
+  const cache = roleCache({ registry: reg, now });
+  const ten = tenancy({ registry: reg, now }), fallback = tenancy({ registry: counting(raw, { drop: ["linkUsesFor"] }).reg, now });
+  const oldId = id("google:gus", null, "old@gmail.com"), newId = id("google:gus", null, "new@gmail.com");
+  await raw.createInvite({ board: board.id, email: oldId.email, role: "editor", by: "google:root" });
+  expect(identityKey(oldId)).toBe("google:gus\nold@gmail.com\n");          // engine's spelling: missing fields as ''
+  for (const order of [[newId, oldId], [oldId, newId]]) {
+    for (const m of [await ten.rolesFor(board.id, order), await fallback.rolesFor(board.id, order), await cache.rolesFor(board.id, order)]) {
+      expect(m.size).toBe(2);
+      expect(m.get(identityKey(oldId))).toBe("editor");
+      expect(m.get(identityKey(newId))).toBe(null);
+    }
+  }
+  expect(await cache.role(oldId, board.id)).toBe("editor");
+  expect(await cache.role(newId, board.id)).toBe(null);
+  // both identities cached side by side; a per-user invalidate drops both
+  const member = { ...newId, domain: "acme.com" };
+  expect(await cache.role(member, board.id)).toBe("viewer");
+  const hits = cache.stats().hits;
+  expect(await cache.role(oldId, board.id)).toBe("editor");
+  expect(await cache.role(member, board.id)).toBe("viewer");
+  expect(cache.stats().hits).toBe(hits + 2);
+  const other = id("google:ann");
+  expect(await cache.role(other, board.id)).toBe("viewer");                   // another user's entry, kept below
+  expect(cache.stats().entries).toBe(3);
+  cache.invalidate(board.id, "google:gus");
+  expect(cache.stats().entries).toBe(1);                                      // EVERY identity of gus dropped (p5-load2v LOW 3)
+  expect(await cache.role(member, board.id)).toBe("viewer");
+  expect(await cache.role(oldId, board.id)).toBe("editor");
+  expect(cache.stats().hits).toBe(hits + 2);                                  // both missed
+  expect(await cache.role(other, board.id)).toBe("viewer");
+  expect(cache.stats().hits).toBe(hits + 3);                                  // ann's kept
+});
+
+test("chained TTLs (p5-load2v MEDIUM 0): a role built on a memoized link record ends with that record's memo", async () => {
+  const cache = roleCache({ registry: reg, now });                            // ttlMs 30 s, linkTtlMs 30 s
+  const l = await raw.createLink({ board: board.id, role: "editor", by: "google:root" });
+  await raw.addLinkUse(l.id, "google:a"); await raw.addLinkUse(l.id, "google:b");
+  const A = id("google:a", null), B = id("google:b", null);
+  expect(await cache.role(A, board.id)).toBe("editor");                       // memoizes the link record at T0
+  await raw.revokeLink(l.id);                                                  // the `grants` message is lost
+  clock.t = T0 + 29_000;
+  expect(await cache.role(B, board.id)).toBe("editor");                       // rides the 29 s old link memo...
+  clock.t = T0 + 30_001;
+  expect(await cache.role(B, board.id)).toBe(null);                           // ...but its entry ends with it, not at T0+59 s
+  expect(await cache.role(A, board.id)).toBe(null);
 });
 
 test("null is never cached; an identity with another email or domain misses; errors are never cached", async () => {
@@ -246,8 +310,8 @@ test("differential: tenancy.role, tenancy.rolesFor (batch and fallback) and role
     const batch = await ten.rolesFor(b.id, people), fb = await fallback.rolesFor(b.id, people);
     for (const p of people) {
       const one = await ten.role(p, b.id);
-      expect(batch.get(p.user)).toBe(one);
-      expect(fb.get(p.user)).toBe(one);
+      expect(batch.get(identityKey(p))).toBe(one);
+      expect(fb.get(identityKey(p))).toBe(one);
       expect(await cache.role(p, b.id)).toBe(one);
       expect(await cache.role(p, b.id)).toBe(one);
     }
@@ -260,7 +324,7 @@ test("rolesFor: unknown board → every user null; users deduplicated; chunks of
   const m = await ten.rolesFor(board.id, [...people, people[0]]);
   expect(m.size).toBe(USE_CHUNK + 1);
   expect(calls.linkUsesFor).toBe(2);
-  expect(m.get("google:c0")).toBe("viewer");
+  expect(m.get(identityKey(people[0]))).toBe("viewer");
   const none = await ten.rolesFor("b-nope", people.slice(0, 2));
   expect([...none.values()]).toEqual([null, null]);
   expect(combine({ board, tenant: acme, grant: null, invites: [], links: [] }, id("google:z"), T0)).toEqual({ role: "viewer", until: Infinity });

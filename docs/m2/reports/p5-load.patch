@@ -1,3 +1,18 @@
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+index 4b42a58..fb1acf6 100644
+--- a/PROTOCOL.md
++++ b/PROTOCOL.md
+@@ -661,6 +661,10 @@ All ports are async (Promises; QuickJS has them). The room imports none of them
+     first batch of lookups fails stops (the Registry looks down); the users it didn't reach are unchanged until the
+     next pass. So a short Registry blip closes nobody, one failing user closes only their own connections, and an
+     expired link outlives its `expiresAt` by at most about 60 s + 14 s while the Registry answers.
++  - **Role cache.** A gateway may answer a hello's role from a per-gateway cache. If a `grants` message is lost, a
++    NEW connection may therefore be admitted with the old role until the gateway's next timed re-check, which reads
++    the Registry fresh and treats the connection like any other live one, or until the cache entry's life ends (at
++    most 30 s), whichever is first. The cache never hides a revoke past the next timed pass.
+ 
+ ### Registry
+ 
 diff --git a/server/auth/port.js b/server/auth/port.js
 index 495c682..e8a74df 100644
 --- a/server/auth/port.js
@@ -199,10 +214,10 @@ index dd5bc1b..480d9ea 100644
    const oidc = env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET
      ? googleOidc({ clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET, redirectUri, fetch: fetchFn })
 diff --git a/server/registry/postgres.js b/server/registry/postgres.js
-index 6ba5298..c9053d8 100644
+index ec4fba5..07fdb06 100644
 --- a/server/registry/postgres.js
 +++ b/server/registry/postgres.js
-@@ -266,6 +266,17 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
+@@ -355,6 +355,17 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
        if (!key(board) || !key(user)) return [];
        return (await db.unsafe(`SELECT link FROM ${U} WHERE board = $1 AND member = $2 ORDER BY n`, [board, user])).map(r => r.link);
      },
@@ -221,10 +236,10 @@ index 6ba5298..c9053d8 100644
      /** What a write transaction runs with, read back from Postgres (for /health and tests). */
      settings() {
 diff --git a/server/registry/sqlite.js b/server/registry/sqlite.js
-index 4b8f49e..7818ede 100644
+index 0092028..b4e50e6 100644
 --- a/server/registry/sqlite.js
 +++ b/server/registry/sqlite.js
-@@ -129,6 +129,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
+@@ -137,6 +137,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
      useN: db.query("SELECT coalesce(max(n), 0) + 1 AS n FROM reg_link_uses WHERE board = ? AND member = ?"),
      insUse: db.query("INSERT INTO reg_link_uses (board, member, link, n) VALUES (?, ?, ?, ?) ON CONFLICT (board, member, link) DO NOTHING"),
      uses: db.query("SELECT link FROM reg_link_uses WHERE board = ? AND member = ? ORDER BY n"),
@@ -232,7 +247,7 @@ index 4b8f49e..7818ede 100644
    };
  
    const ready = () => { if (!open) throw new Error("registry: closed"); };
-@@ -262,6 +263,15 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
+@@ -270,6 +271,15 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
        ready();
        return str(board) && str(user) ? q.uses.all(board, user).map(r => r.link) : [];
      },
@@ -272,10 +287,10 @@ index c972ead..0744435 100644
    await a.setGrant(board.id, "google:gus", "editor");
    await a.revokeLink(link.id);
 diff --git a/test/server/pg-registry.test.js b/test/server/pg-registry.test.js
-index 8c1dfee..1902a50 100644
+index 9cfa1e8..b707324 100644
 --- a/test/server/pg-registry.test.js
 +++ b/test/server/pg-registry.test.js
-@@ -29,7 +29,7 @@ describe.skipIf(!url)("postgres registry", () => {
+@@ -37,7 +37,7 @@ describe.skipIf(!url)("postgres registry", () => {
      const r = await postgresRegistry({ sql: client(), schema, now });
      schemas.set(r, schema);
      return r;
@@ -284,17 +299,17 @@ index 8c1dfee..1902a50 100644
  
    // The same contract as a runtime role: USAGE on the schema and row rights on tables an owner created, nothing more
    // (PROTOCOL.md § Store, "Least privilege"). One role for the file; each test's schema is migrated by the owner
-@@ -55,7 +55,7 @@ describe.skipIf(!url)("postgres registry", () => {
-     const r = await postgresRegistry({ sql: app ?? client(), schema, now });
-     schemas.set(r, schema);
-     return r;
+@@ -65,7 +65,7 @@ describe.skipIf(!url)("postgres registry", () => {
+       schemas.set(r, schema);
+       return r;
+     } catch (err) { await drop(schema); throw err; }
 -  }, { cleanup: async r => { await r.close(); await drop(schemas.get(r)); schemas.delete(r); } });
 +  }, { cleanup: async r => { await r.close(); await drop(schemas.get(r)); schemas.delete(r); }, batch: true });
  
    test("a write transaction runs with synchronous_commit=on", async () => {
      const schema = schemaName();
 diff --git a/test/server/registry.test.js b/test/server/registry.test.js
-index 0c2f848..34860ea 100644
+index ad729d1..b8a7379 100644
 --- a/test/server/registry.test.js
 +++ b/test/server/registry.test.js
 @@ -15,7 +15,7 @@ let n = 0;
@@ -305,7 +320,7 @@ index 0c2f848..34860ea 100644
 +registryContract("sqlite", async ({ now }) => sqliteRegistry({ path: file(), now, fullfsync: false }), { cleanup: r => r.close(), batch: true });
  
  describe("sqlite registry", () => {
-   test("pragmas: WAL, synchronous=FULL, fullfsync on by default", async () => {
+   test("pragmas: WAL, synchronous=FULL, fullfsync on by default; start-up leaves the whole busy_timeout", async () => {
 diff --git a/test/server/revocation.test.js b/test/server/revocation.test.js
 index 5463ea5..b6256c7 100644
 --- a/test/server/revocation.test.js
@@ -371,10 +386,10 @@ index 275906f..6930c74 100644
      /** The live Room for the test board (null if not open). */
 diff --git a/test/server/role-cache.test.js b/test/server/role-cache.test.js
 new file mode 100644
-index 0000000..b93a6c1
+index 0000000..7ad495a
 --- /dev/null
 +++ b/test/server/role-cache.test.js
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,190 @@
 +// p5-load: the gateway over the role cache (server/auth/tenancy.js roleCache), as server/main.js wires it:
 +// invalidation on `grants` before the hello re-ask and the pass, `{ board, user }` scoped to one user with no pass,
 +// cached roles dropped when the board's watch is released, and the timed pass batched through auth.rolesFor.
@@ -526,5 +541,42 @@ index 0000000..b93a6c1
 +  await publish(r, {});
 +  expect((await s.whenClosed(4000)).code).toBe(1008);
 +  expect((await r.health()).body.gateway.rechecks.timeouts).toBeGreaterThanOrEqual(1);
++  await r.stop();
++}, 20000);
++
++// V1 and V2 adopted from the p5-load3v verifier (docs/m2/reports/p5-load3v.adv.test.js.txt).
++test("V1: a timed-out rolesFor chunk whose answer (read BEFORE a lost revoke) lands late never fills the cache: the next hello is refused", async () => {
++  const raw = memoryRegistry();
++  let hold = false, entered, release;
++  const inP = new Promise(res => { entered = res; }), gate = new Promise(res => { release = res; });
++  const registry = { ...raw, grants: async b => {
++    const snap = await raw.grants(b);                 // read now...
++    if (hold) { hold = false; entered(); await gate; } // ...answered late
++    return snap;
++  } };
++  const r = await rig({ cache: { ttlMs: 3_600_000 }, registry, limits: { roleRecheckMs: 1_000, recheckLookupMs: 300 } });
++  const keep = await join(r, "viewer"); await keep.next(m => m.t === "welcome");
++  const x = await join(r, "editor"); await x.next(m => m.t === "welcome");
++  hold = true;
++  await inP;                                                       // a timed pass read the rows (editor still granted)
++  await r.registry.setGrant(r.ids.board, "dev:editor", null);      // revoke; the `grants` message is lost
++  await until(async () => (await r.health()).body.gateway.rechecks.timeouts >= 1, "the chunk timed out");
++  release(); await sleep(20);                                      // the stale answer lands now
++  const y = await join(r, "editor", { client: "after" });
++  expect(await outcome(y)).toBe("closed 1008");
++  await r.stop();
++}, 20000);
++
++test("V2: a grants pass in chunks: one failed chunk fails closed only ITS identities; the next chunk's unchanged user stays", async () => {
++  let failNext = false;
++  const r = await rig({ cache: {}, limits: { recheckBatch: 1 },
++    wrapAuth: a => ({ ...a, rolesFor: (b, ids) => { if (failNext) { failNext = false; return Promise.reject(new Error("registry blip")); } return a.rolesFor(b, ids); } }) });
++  const first = await join(r, "editor"); await first.next(m => m.t === "welcome");
++  const second = await join(r, "annotator"); await second.next(m => m.t === "welcome");
++  failNext = true;
++  await publish(r, {});
++  expect((await first.whenClosed(4000)).code).toBe(1013);         // its chunk failed: fail closed
++  await sleep(300);
++  expect(second.closed).toBe(null);                                // read fine in its own chunk, role unchanged
 +  await r.stop();
 +}, 20000);

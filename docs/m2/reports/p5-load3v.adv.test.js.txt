@@ -1,0 +1,72 @@
+// p5-load3v (verifier): adversarial checks of the patched gateway over roleCache. Scratch only.
+import { test, expect, afterAll } from "bun:test";
+import { rig, tokenOf } from "./rig.js";
+import { cleanup, sleep, until } from "./helpers.js";
+import { memoryRegistry } from "../../server/auth/registry.js";
+
+afterAll(cleanup);
+const hello = (r, name, extra = {}) => ({ t: "hello", v: 1, token: tokenOf(name), board: r.ids.board, since: 0, client: name, ...extra });
+const join = async (r, name, extra) => { const s = await r.sock(); s.send(hello(r, name, extra)); return s; };
+const outcome = s => Promise.race([s.next(m => m.t === "welcome").then(() => "welcome"), s.whenClosed(5000).then(c => "closed " + c.code)]);
+
+test("V1: a timed-out rolesFor chunk whose answer (read BEFORE a lost revoke) lands late never fills the cache: the next hello is refused", async () => {
+  const raw = memoryRegistry();
+  let hold = false, entered, release;
+  const inP = new Promise(res => { entered = res; }), gate = new Promise(res => { release = res; });
+  const registry = { ...raw, grants: async b => {
+    const snap = await raw.grants(b);                 // read now...
+    if (hold) { hold = false; entered(); await gate; } // ...answered late
+    return snap;
+  } };
+  const r = await rig({ cache: { ttlMs: 3_600_000 }, registry, limits: { roleRecheckMs: 1_000, recheckLookupMs: 300 } });
+  const keep = await join(r, "viewer"); await keep.next(m => m.t === "welcome");
+  const x = await join(r, "editor"); await x.next(m => m.t === "welcome");
+  hold = true;
+  await inP;                                                       // a timed pass read the rows (editor still granted)
+  await r.registry.setGrant(r.ids.board, "dev:editor", null);      // revoke; the `grants` message is lost
+  await until(async () => (await r.health()).body.gateway.rechecks.timeouts >= 1, "the chunk timed out");
+  release(); await sleep(20);                                      // the stale answer lands now
+  const y = await join(r, "editor", { client: "after" });
+  expect(await outcome(y)).toBe("closed 1008");
+  await r.stop();
+}, 20000);
+
+test("V2: a grants pass in chunks: one failed chunk fails closed only ITS identities; the next chunk's unchanged user stays", async () => {
+  let failNext = false;
+  const r = await rig({ cache: {}, limits: { recheckBatch: 1 },
+    wrapAuth: a => ({ ...a, rolesFor: (b, ids) => { if (failNext) { failNext = false; return Promise.reject(new Error("registry blip")); } return a.rolesFor(b, ids); } }) });
+  const first = await join(r, "editor"); await first.next(m => m.t === "welcome");
+  const second = await join(r, "annotator"); await second.next(m => m.t === "welcome");
+  failNext = true;
+  await r.bus.publish((await import("../../server/bus/port.js")).subjects.grants(r.ids.tenant, r.ids.board), { board: r.ids.board }); await r.bus.flush?.();
+  expect((await first.whenClosed(4000)).code).toBe(1013);         // its chunk failed: fail closed
+  await sleep(300);
+  expect(second.closed).toBe(null);                                // read fine in its own chunk, role unchanged
+  await r.stop();
+}, 20000);
+
+test("V3 (codex #2): a pass's own read fills the cache, a revoke lands after it (message lost), a NEW hello is admitted from it; the NEXT timed pass closes it", async () => {
+  const raw = memoryRegistry();
+  let hold = false, entered, release;
+  const inP = new Promise(res => { entered = res; }), gate = new Promise(res => { release = res; });
+  const registry = { ...raw, grants: async b => {
+    const snap = await raw.grants(b);
+    if (hold) { hold = false; entered(); await gate; }
+    return snap;
+  } };
+  const r = await rig({ cache: { ttlMs: 3_600_000 }, registry, limits: { roleRecheckMs: 1_000 } });
+  const keep = await join(r, "viewer"); await keep.next(m => m.t === "welcome");
+  const x = await join(r, "editor"); await x.next(m => m.t === "welcome");
+  hold = true;
+  await inP;                                                       // the pass read the rows: editor granted
+  await r.registry.setGrant(r.ids.board, "dev:editor", null);      // revoke after the read; message lost
+  release(); await sleep(20);                                      // in time: the pass's answer fills the cache
+  const y = await join(r, "editor", { client: "after" });
+  const first = await outcome(y);
+  const t0 = Date.now();
+  if (first === "welcome") expect((await y.whenClosed(4000)).code).toBe(1008);   // bounded by the next timed pass
+  else expect(first).toBe("closed 1008");
+  expect((await x.whenClosed(4000)).code).toBe(1008);
+  console.log("V3: new hello first got", first, "; closed after", Date.now() - t0, "ms");
+  await r.stop();
+}, 20000);

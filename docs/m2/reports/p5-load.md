@@ -588,3 +588,71 @@ The 48 main-tree failures, verbatim (`bun test 2>&1 | grep -E '\(fail\)'`, durat
 - **`batch: true` hunks:** if the registry test rework lands first, re-apply the two one-line `batch: true` hunks by
   hand.
 - **Keep the wiring together:** `roleCache` wiring (`main.js`) and the gateway invalidation must land together.
+
+## Round 4 (p5-load4): patch re-cut onto 426757d, V1/V2 adopted, PROTOCOL sentence as a hunk
+
+**Base commit:** `426757daef8f03275368cd926603cf17cf041b09` (HEAD). All work was done in a clean HEAD worktree in my
+scratchpad. In the main tree, only this report and `docs/m2/reports/p5-load.patch` were written.
+
+### What changed in the patch
+
+- **Re-cut:** two hunks no longer applied, and I applied them by hand. Both add `batch: true`:
+  - `test/server/pg-registry.test.js`: the runtime-role contract's options, which c2024f3 moved after a `try … catch`.
+  - `test/server/registry.test.js`: the sqlite contract line. Its context changed: the pragmas test now also checks
+    `busy_timeout`.
+- **Behaviour unchanged otherwise:** I diffed the `+`/`-` lines of the old and new patches. The only differences are
+  the PROTOCOL hunk and the V1/V2 tests. Every other hunk applied by offset only.
+- **V1 and V2** are now at the end of `test/server/role-cache.test.js`, copied verbatim from
+  `p5-load3v.adv.test.js.txt` with two adaptations: the duplicate `outcome` helper is dropped (the file already has
+  an identical one), and V2 uses the file's own `publish` helper. That file now has 10 tests.
+- **PROTOCOL.md hunk:** adds a "**Role cache.**" sub-bullet to § Auth, Re-checking live connections. It goes after the
+  Errors sub-bullet, the last bullet on re-check timing, and carries the LOW B sentence verbatim (ending "The cache
+  never hides a revoke past the next timed pass."). Engine and CEO decide whether to apply it.
+- **Files (12):** PROTOCOL.md, server/auth/port.js, server/gateway.js, server/main.js, server/registry/postgres.js,
+  server/registry/sqlite.js, test/auth/role-cache.test.js, test/server/pg-registry.test.js,
+  test/server/registry.test.js, test/server/revocation.test.js, test/server/rig.js, test/server/role-cache.test.js
+  (new).
+
+### Apply checks
+
+| Check | Output |
+|---|---|
+| `git apply --check`, fresh clean worktree of 426757d | Passes (rc 0, no output) |
+| `git apply --check`, main tree (with other sessions' uncommitted edits) | Passes (rc 0, no output) |
+| `git apply -3 --check`, main tree | Fails, but only with `error: test/server/revocation.test.js: does not match index`. The other 11 files report "Applied patch … cleanly". The failure comes from another session's uncommitted edits to `revocation.test.js`: `-3` needs the working file to match the index. The plain check passes, so this conflict is not textual. |
+
+### Mutations (on the patched worktree, `server/gateway.js` restored after each, `cmp` clean)
+
+| Mutation | Result over `test/server/role-cache.test.js` |
+|---|---|
+| None (baseline) | 10 pass, 0 fail |
+| Drop `auth.invalidate?.(b.board)` from the chunk `catch` | **V1 fails** (`expect(received).toBe(expected)`); 9 pass |
+| Drop `chunkErr = null` after a good chunk | **V2 fails** (`expect(received).toBe(expected)`); 9 pass |
+
+### Gates (patched worktree)
+
+The gated worktree's `git diff HEAD` is byte-identical (`cmp`) to the shipped `docs/m2/reports/p5-load.patch`.
+
+| Run | Result |
+|---|---|
+| Full `bun test`, no `DATABASE_URL` | **1174 pass, 136 skip, 0 fail** (1310 tests, 113 s) |
+| Full `bun test`, `DATABASE_URL` = Podman Postgres 17.11 | **1279 pass, 34 skip, 0 fail** (1313 tests, 131 s). The container (`1875fdeb8ef2`) was mine, started with `--rm` and stopped, and it is confirmed gone. No other container was touched. |
+
+- **Worktree setup:** a scratch worktree has no `node_modules`. My first no-DB run therefore failed 3 NATS tests
+  (`Cannot find module '@nats-io/transport-node'`), and unpatched HEAD failed the same 3 in the same worktree setup.
+  After I linked the main tree's `node_modules`, they pass. They were never the patch's failures.
+- **core-source:** `test/core-source.test.js` passes in the worktree (2 pass, run on its own), so the known unrelated
+  failure did not show up this round.
+
+### Not verified
+
+- **The main tree:** I did not run tests on the main tree with the patch applied. In particular, I did not check that
+  `test/server/revocation.test.js` passes with another session's uncommitted edits and this patch's hunk combined.
+  The plain `--check` passing only means the hunk fits textually. I did not run NATS or real load.
+
+### For engine (when applying)
+
+- **Command:** `git apply docs/m2/reports/p5-load.patch` applied to the main tree at the time of this check. Other
+  sessions are still editing `test/server/revocation.test.js`, so re-run `git apply --check` first.
+- **Keep it whole:** the `roleCache` wiring in `main.js` and the gateway invalidation must still land together.
+- **PROTOCOL.md:** drop the PROTOCOL.md hunk if engine and CEO decline the sentence.

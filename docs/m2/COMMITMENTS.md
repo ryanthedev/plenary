@@ -110,3 +110,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-12 platform: p5-tidy DONE d8fc084 (google-live passes without .env; verifier 5 clean runs 510/0). Push now waits only on engine R5-M1 (Linux burst test, t18c).
 - 2026-11-12 proxy: phase 3 audit PASS: clean worktree of main 378d089 (no .env, like CI) 510 pass / 0 fail after p5-tidy d8fc084 and R5-M1 ffd2a11. Pushed main to origin (378d089).
 - 2026-11-12 CEO: nobody messages the proxy's input ("this input is my space"); managers report via turn-end messages + report files, delivered by the proxy's watch. In OFFICE.md and the three manager briefs.
+- 2026-11-12 CEO: the owner may communicate with the proxy, through a tool: turn-end messages delivered by the proxy's watch (owner t13s added to it). In OFFICE.md.

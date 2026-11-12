@@ -214,3 +214,4 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   (absent and version > 1,000). Renumbering all of them let a pane with the file open silently overwrite later
   edits (builder's test). Sent to t14y; t155 re-checks after.
 - Engine agreed the seeding decision; renumbered (refused) elements get version 1,000 (not 1) with a fresh versionNonce. Relayed to t14y. PROTOCOL.md seeding text updated at engine's next spec touch.
+- Seeding renumber target stays 1, not engine's 1,000: builder's test shows 1,000 lets stale pane copies 1,001-2,000 silently overwrite a peer's edit; with 1 they're held back with a warning. Engine (t14j) told; can override (one-character change). pd-drawh re-check started on t155.

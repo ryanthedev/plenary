@@ -121,3 +121,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-12 platform: p8-cookie DONE 601f8e9 (cluster compose and CI supply COOKIE_KEY; verifier PASS, 5 LOW).
 - 2026-11-12 engine/platform: a stock dev server has no admin, so POST /boards is refused for every dev token. Decision: idempotent bootstrapTenant + CLI in server/admin/ (platform), called from main.js's dev path only for admin-flagged dev tokens; production needs the same first-admin bootstrap.
 - 2026-11-12 engine: p-arch DONE 44dd1aa (test/architecture.test.js + test/arch-scan.js, hexagonal import rules; verifier no HIGH, 3 MEDIUM in a follow-up round). Commitment 5 partly met (boundary test in place).
+- 2026-11-12 engine: p-arch follow-up DONE 3a7520d (round 2, no HIGH/MEDIUM). Architecture audit p-audit (server/ + packages/protocol) started.

@@ -14,12 +14,13 @@ phase 4 leases/takeover.
 
 | Job | Terminal | Status |
 |---|---|---|
-| p2-tune (builder, plenary-p2-tune) | t1fw | RUNNING (brief docs/m2/briefs/p2-tune.md) |
-| p-audit (plenary-p-audit) | t1g5 | RUNNING read-only audit on a 3a7520d snapshot (brief docs/m2/briefs/p-audit.md) |
-| p-serve (builder, plenary-p-serve) | t1g3 | reported; session not resumed after the 03:44 crash (resume: claude --resume 6e2aeee8-b46c-40c1-9528-5d31208282ee) |
-| p-servev (verifier, plenary-p-servev) | t1g8 | RUNNING (resumed by proxy after crash) |
+| p2-tune (builder, plenary-p2-tune) | t1fw | reported; waits on its verifier |
+| p2-tunev (verifier, plenary-p2-tunev) | t1gf | RUNNING (brief docs/m2/briefs/p2-tunev.md) |
+| p4-store-lease (builder, plenary-p4-store-lease) | t1gd | RUNNING: Store lease + epoch fence (brief docs/m2/briefs/p4-store-lease.md) |
+| p-serve r2 (builder resumed, plenary-p-serve-r2) | t1gj | RUNNING: fix H1 (docs/m2/briefs/p-serve-r2.md); old terminal t1g3 is a plain shell, close after |
+| p-servev (verifier, plenary-p-servev) | t1g8 | FAIL (1 HIGH H1: import scanner drops an import after a comment with "import"; 3 LOW). Re-verify after r2 |
 
-Closed: t1fx, t1g0, t1fm, t1fn, t1dh, t15q, t186, t188, t18c, t18b, t171, t16y, t158, t17d, t17p, t17f, t17m, t17j.
+Closed: t1g5, t1fx, t1g0, t1fm, t1fn, t1dh, t15q, t186, t188, t18c, t18b, t171, t16y, t158, t17d, t17p, t17f, t17m, t17j.
 Leftover scratch: t17j ~1 GB, t18c 168 MB in their scratchpads.
 
 ## 2026-11-11 phase 1 (protocol v1 spec)
@@ -233,3 +234,8 @@ Leftover scratch: t17j ~1 GB, t18c 168 MB in their scratchpads.
 - Platform p5-devadmin: (1) sqliteRegistry 'database is locked' on concurrent first open -> platform fixes (busy_timeout); check engine's store/sqlite.js too. (3) spec note queued: § Registry email:<addr> admins before first sign-in.
 - 03:44: herdr-core lost its holder; every agent killed; proxy resumed t18m, t1g8, t1g5, t1fw in place. Watches re-armed. p-serve reported (works; page boot blocked by client's main.js importing denied dev transports; told t14k). Extra flaky v1 checkpoint test sent to p2-tune R6.
 - Second restart (after 03:44): team idle, Monitors dead; proxy re-prompted t1g8 (p-servev), t1g5 (p-audit), t1fw (p2-tune), all working again. Watch re-armed (bapeatrdv). Next: p-servev PASS -> commit static serving; p2-tune report -> verifier plenary-p2-tunev; p-audit -> fix jobs, then phase 4.
+- p-audit reported (docs/m2/reports/p-audit.md): log safe; fan-out, presence, leases, some ports not ready for the NFRs. Job plan: p4-store-lease (Store lease + epoch fence, started t1gd) -> its verifier -> p4-host (room host uses it) -> p4-wire (main.js wiring); p-fanout (protocol/gateway fan-out, snapshot tail) after p2-tune lands; then p-ports. Sent platform t187 F4 (no grants announce on addLinkUse, main.js:73), F8 (role cache invalidated by grants + batched timed re-check), F9 serving side (HTTP snapshot endpoint). Closed t1g5.
+- p2-tune reported (t1fw); verifier p2-tunev started (t1gf). On PASS: commit by path, then p-fanout; then apply p4-store-lease's PROTOCOL.md proposal.
+- p-servev FAIL (docs/m2/reports/p-servev.md): H1 scanner bug (comment containing "import" swallows the next import; /ports/storage.js 404, page can't boot). Fix round r2 started (t1gj, resumed builder session). Same grammar bug in test/arch-scan.js importsOf: queued (p-arch lineage, with R2-L1).
+- Platform t187: p5-devadmin committed 7a44278 (PASS, LOWs). p5-pgpriv (in verification) fixes the SQLite registry lock with a WAL check + bounded busy retry (onBusyRetry); queued: copy it into server/store/sqlite.js after p4-store-lease (t1gd owns server/store/* now). Answers the queued busy_timeout item.
+- Platform t187 re F4/F8/F9: F4+F8 = job p5-load (worker t1gh, ETA ~1.5h with verifier); gateway.js changes (read {board,user} on grants, role-cache invalidation) come as a patch in docs/m2/reports/p5-load.md for engine to apply; proposed batched port rolesFor(boardId, identities) -> Map (+ grantsFor if needed). F9 = job p5-snap (snapshot ticket in welcome, GET /boards/:id/snapshot?seq=&t=<ticket>), starts when p-fanout fixes the snapshot/tail message shape: TELL t187 then. p5-pgpriv commit id follows (verifier t1gg).

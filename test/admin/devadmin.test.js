@@ -107,6 +107,64 @@ test("CLI: an email admin off --domain, or a control character, exits 2 naming t
   expect(existsSync(join(dir, "registry.db"))).toBe(false);
 });
 
+test("CLI: DEL, C1 CSI, RLO, ZWSP and NEL in an admin entry, a domain or an unknown flag reach stderr escaped, never raw", async () => {
+  const dir = tempDir();
+  const RAW = { DEL: "\u007f", CSI: "\u009b", RLO: "\u202e", ZWSP: "\u200b", NEL: "\u0085", LS: "\u2028", TAG: "\u{e0001}" };
+  const enc = new TextEncoder();
+  const has = (hay, needle) => { for (let i = 0; i + needle.length <= hay.length; i++) if (needle.every((b, j) => hay[i + j] === b)) return true; return false; };
+  for (const [name, c] of Object.entries(RAW)) {
+    for (const argv of [
+      ["--domain", "acme.com", "--admin", "dev:a" + c + "nn"],              // admin entry (normAdmin)
+      ["--domain", "acme" + c + ".com", "--admin", "dev:ann"],             // domain (normDomain)
+      ["--domain", "acme.com", "--admin", "dev:ann", "--nope" + c + "[2J"], // unknown flag (parseArgs)
+      ["--domain", "acme.com", "--admin", "dev:ann", "--x" + c + "=1"],     // unknown flag, inline value
+    ]) {
+      const x = io();
+      expect(await run(argv, { PLENARY_DATA_DIR: dir }, x.io)).toBe(2);
+      const err = x.o.err.join("\n");
+      const bytes = enc.encode(err);
+      expect(has(bytes, [...enc.encode(c)]), `${name} raw in: ${JSON.stringify(err)}`).toBe(false);
+      expect(/[\p{Cc}\p{Cf}\u2028\u2029]/u.test(err.replaceAll("\n", ""))).toBe(false);   // only usage's own newline
+      const n = c.codePointAt(0);
+      expect(err).toContain(n > 0xffff ? `\\u{${n.toString(16)}}` : "\\u" + n.toString(16).padStart(4, "0"));
+    }
+  }
+  expect(existsSync(join(dir, "registry.db"))).toBe(false);
+});
+
+const UNSAFE_RE = new RegExp("[\\p{Cc}\\p{Cf}\\u2028\\u2029]", "u");
+
+// p5-tidyv V1: the exit-1 `failed:` line echoes a path from argv or env. A real process, real stderr bytes; cwd is a
+// temp dir and the env is explicit, so no checkout .env (DATABASE_URL) is loaded.
+test("CLI process: a --data-dir or PLENARY_DATA_DIR with DEL, C1 CSI or RLO fails (exit 1) with stderr escaped, still JSON", async () => {
+  const cwd = tempDir();
+  const file = join(cwd, "not-a-dir");
+  await Bun.write(file, "x");                                   // mkdir under a regular file fails, naming the path
+  const script = join(import.meta.dir, "../../scripts/admin-bootstrap.js");
+  const RAW = { DEL: String.fromCodePoint(0x7f), CSI: String.fromCodePoint(0x9b), RLO: String.fromCodePoint(0x202e), TAG: String.fromCodePoint(0xe0001) };
+  const enc = new TextEncoder();
+  const has = (hay, needle) => { for (let i = 0; i + needle.length <= hay.length; i++) if (needle.every((b, j) => hay[i + j] === b)) return true; return false; };
+  for (const [name, c] of Object.entries(RAW)) {
+    const dir = join(file, "d" + c + "2J");
+    for (const [args, extra] of [[["--data-dir", dir], {}], [[], { PLENARY_DATA_DIR: dir }]]) {
+      const p = Bun.spawn([process.execPath, script, "--domain", "acme.com", "--admin", "dev:ann", ...args], {
+        cwd, env: { PATH: process.env.PATH ?? "", ...extra }, stdout: "pipe", stderr: "pipe",
+      });
+      const [code, errBytes, out] = [await p.exited, new Uint8Array(await new Response(p.stderr).arrayBuffer()), await new Response(p.stdout).text()];
+      const label = `${name} ${args.length ? "--data-dir" : "PLENARY_DATA_DIR"}`;
+      expect(code, label).toBe(1);
+      expect(out, label).toBe("");
+      expect(has(errBytes, [...enc.encode(c)]), label).toBe(false);
+      const text = new TextDecoder().decode(errBytes).trim();
+      expect(UNSAFE_RE.test(text), label).toBe(false);
+      const line = JSON.parse(text);                             // still one valid JSON line
+      expect(line.ok).toBe(false);
+      expect(line.error).toStartWith("failed: ");
+      expect(line.error).toContain("d" + c + "2J");              // and it round-trips to the real path
+    }
+  }
+}, 30000);
+
 test("CLI: a Registry it can't open exits 1 and never prints the URL", async () => {
   const x = io();
   const secret = "postgres://user:s3cr3t-pw@127.0.0.1:1/db";

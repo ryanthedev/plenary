@@ -65,15 +65,26 @@ test("before Google: no cookie, a forged cookie, Google's ?error=, a wrong state
   expect(idp.tokenRequests.length).toBe(0);                                      // none of these reached Google
 });
 
+/** A body whose read rejects with a TimeoutError, as fetch's AbortSignal.timeout does mid-body. */
+const stalled = () => new ReadableStream({ pull(c) { c.error(Object.assign(new Error("timed out " + DESC), { name: "TimeoutError" })); } });
+
 test("Google's token endpoint: its RFC 6749 error name, never error_description; others by status", async () => {
   const cases = [
     [() => Response.json({ error: "invalid_grant", error_description: DESC }, { status: 400 }), "invalid_grant"],
     [() => Response.json({ error: "invalid_client", error_description: DESC }, { status: 401 }), "invalid_client"],
     [() => Response.json({ error: "made_up_" + DESC }, { status: 401 }), "token_http_401"],
-    [() => new Response("<html>" + DESC, { status: 502 }), "token_http_502"],
+    [() => new Response("<html>" + DESC, { status: 502 }), "bad_token_response"],   // not JSON, whatever the status
+    [() => new Response("", { status: 503 }), "bad_token_response"],
     [() => { throw new Error("connect failed: https://oauth2.googleapis.com/token?" + DESC); }, "idp_unreachable"],
     [() => { throw Object.assign(new Error("timed out " + DESC), { name: "TimeoutError" }); }, "idp_timeout"],
     [() => Response.json({ id_token: "not.a.jwt" }), "bad_token"],
+    // Google answered, but not with JSON: not "unreachable" (p5-google2v L2)
+    [() => new Response("<html>" + DESC, { status: 200 }), "bad_token_response"],
+    [() => new Response("", { status: 200 }), "bad_token_response"],
+    [() => new Response("{\"id_token\":", { status: 201, headers: { "content-type": "application/json" } }), "bad_token_response"],
+    // the timeout also covers reading the body: still idp_timeout, on either branch
+    [() => new Response(stalled(), { status: 200 }), "idp_timeout"],
+    [() => new Response(stalled(), { status: 500 }), "idp_timeout"],
   ];
   for (const [respond, cause] of cases) {
     tokenOverride = respond;
@@ -84,6 +95,49 @@ test("Google's token endpoint: its RFC 6749 error name, never error_description;
     expect(onlyCause("4/real-looking-code", b.state)).toBe(cause);
   }
 });
+
+// p5-tidyv V2, V3: a real socket, not a synthetic Response (Bun's fetch reads an empty real body as JSON `null`, and
+// a reset mid-body rejects the body read). A raw node:net server on port 0 writes one canned answer per connection.
+/** @param {(s: import("node:net").Socket) => void} answer */
+async function rawServer(answer) {
+  const { createServer } = await import("node:net");
+  const srv = createServer(s => { s.on("error", () => {}); s.once("data", () => answer(s)); });
+  await new Promise(r => srv.listen(0, "127.0.0.1", r));
+  return { port: srv.address().port, close: () => new Promise(r => srv.close(r)) };
+}
+const EXPECTED = { state: "s".repeat(20), nonce: "n".repeat(20), verifier: "v".repeat(43) };
+async function causeFrom(answer) {
+  const srv = await rawServer(answer);
+  try {
+    const heard = [];
+    // A timeout well past the answer, so a loaded full run can't turn a reset into idp_timeout.
+    const o = googleOidc({ clientId: CLIENT_ID, clientSecret: SECRET, redirectUri: ORIGIN + "/auth/callback", timeoutMs: 8000,
+      fetch: (_u, init) => fetch(`http://127.0.0.1:${srv.port}/token`, init) });
+    expect(await o.finish({ code: "4/real-looking-code", state: EXPECTED.state, expected: EXPECTED, why: c => heard.push(c) })).toBeNull();
+    expect(heard.length).toBe(1);
+    return heard[0];
+  } finally { await srv.close(); }
+}
+const head = (status, extra) => `HTTP/1.1 ${status} X\r\ncontent-type: application/json\r\n${extra}\r\n`;
+
+test("token answer on a real socket: a reset mid-body is idp_unreachable; an empty body is bad_token_response", async () => {
+  for (const status of [200, 500]) {
+    // headers and part of a body, then a reset: the network failed, whatever the status (V2)
+    expect(await causeFrom(s => { s.write(head(status, "content-length: 500\r\n") + "{\"id_token\":\"abc"); setTimeout(() => s.destroy(), 50); }),
+      `reset, ${status}`).toBe("idp_unreachable");
+    expect(await causeFrom(s => { s.write(head(status, "content-length: 500\r\n") + "{\"error\":\"invalid_gr"); setTimeout(() => s.resetAndDestroy?.() ?? s.destroy(), 50); }),
+      `RST, ${status}`).toBe("idp_unreachable");
+  }
+  for (const status of [200, 503]) {
+    // an empty body, by length or chunked, is not JSON (V3)
+    expect(await causeFrom(s => s.end(head(status, "content-length: 0\r\n"))), `empty, ${status}`).toBe("bad_token_response");
+    expect(await causeFrom(s => s.end(head(status, "transfer-encoding: chunked\r\n") + "0\r\n\r\n")), `empty chunked, ${status}`).toBe("bad_token_response");
+  }
+  // and a whole JSON answer still means what it says, on a real socket too
+  const body = JSON.stringify({ error: "invalid_grant", error_description: DESC });
+  expect(await causeFrom(s => s.end(head(400, `content-length: ${body.length}\r\n`) + body))).toBe("invalid_grant");
+  expect(await causeFrom(s => s.end(head(200, "content-length: 4\r\n") + "null"))).toBe("bad_token");
+}, 30000);
 
 test("ID-token refusals name the check that failed", async () => {
   const cases = [
@@ -158,6 +212,20 @@ test("a throwing logger changes no answer; a cause that isn't a plain label is d
   expect(onlyCause("leaked")).toBe("idp_refused");
 });
 
+test("sign-in succeeds but the exchange code can't be made: 503, logged as mint_failed (p5-google2v L4)", async () => {
+  const registry = memoryRegistry();
+  const r = httpRoutes({ registry, sessions: await makeSessions({ key: "s".repeat(32) }), tenancy: makeTenancy({ registry }), config, log,
+    oidc: { begin: async () => ({ url: "https://idp.test/a?state=" + "m".repeat(20), state: "m".repeat(20), nonce: "n", verifier: "v" }),
+      // a BigInt user id: JSON.stringify inside mintCode throws, the cheapest way to make it fail
+      finish: async () => ({ user: 10n, name: null, email: null, domain: null }) } });
+  const b = await begin(r);
+  lines = [];
+  const res = await callback(r, { state: b.state, code: "x" }, b.cookie);
+  expect(res.status).toBe(503);
+  expect(await res.json()).toEqual({ error: "unavailable" });
+  expect(onlyCause(b.state)).toBe("mint_failed");
+});
+
 test("a state- or code-shaped string handed to `why` is never logged", async () => {
   for (const bad of ["abcdefghijklmnopqrstuvwxyzabcdef", "k3j4h5g6f7d8s9a0q1w2e3r4t5y6u7i8", "4/0AfJohXn", "Bad_Case", "a_b_c_d_e"]) {
     const registry = memoryRegistry();
@@ -193,11 +261,65 @@ test("verifyIdToken: a throwing `why` changes no verdict; every cause either fil
   expect(heard).toEqual(["bad_token"]);
   for (const c of CAUSES) expect(c.replace("<status>", "502")).toMatch(/^[a-z]{1,12}(?:_[a-z]{1,12}){0,3}(?:_\d{3})?$/);   // http.js's filter admits each
   for (const c of SIGN_IN_CAUSES) expect(c).toMatch(/^[a-z0-9_:<>]{1,40}$/);
-  // The causes in the source match the lists (a new refusal must be added to CAUSES on purpose).
+  // The causes in the source match the lists, both ways (p5-tidyv V5): a new refusal must be added to a list on
+  // purpose, and a list holds no label the code never logs.
   const src = await Bun.file(new URL("../../server/auth/oidc.js", import.meta.url)).text();
-  for (const m of src.matchAll(/\bno\("([a-z_]+)"\)/g)) expect(CAUSES).toContain(m[1]);
   const http = await Bun.file(new URL("../../server/auth/http.js", import.meta.url)).text();
-  for (const m of http.matchAll(/\b(?:fail|failed)\("([a-z_]+)"\)/g)) expect(SIGN_IN_CAUSES).toContain(m[1]);
+  const fromOidc = sourceLabels(src, ["no"]);
+  const fromHttp = sourceLabels(http, ["fail", "failed"]);
+  expect(fromOidc).toContain("bad_token_response");   // a ternary label
+  expect(fromOidc).toContain("token_http_<>");        // a template literal
+  expect(fromHttp).toContain("bad_login_cookie");     // a ternary label
+  expect(fromHttp).toContain("idp_error:<>");         // a template literal
+  expect(fromHttp).toContain("idp_threw");            // the `cause ??=` fallback
+  for (const c of fromOidc) expect(CAUSES.map(norm)).toContain(c);
+  for (const c of fromHttp) expect(SIGN_IN_CAUSES.map(norm)).toContain(c);
+  // The other way: every listed label is in the source. The only ones that aren't literals are oidc.js's RFC 6749
+  // names, passed through as `e` after TOKEN_ERRORS.includes(e).
+  const RFC6749 = ["invalid_request", "invalid_client", "invalid_grant", "unauthorized_client", "unsupported_grant_type", "invalid_scope"];
+  expect(CAUSES.map(norm).filter(c => !fromOidc.includes(c)).sort()).toEqual([...RFC6749].sort());
+  expect(SIGN_IN_CAUSES.map(norm).filter(c => !fromHttp.includes(c))).toEqual([]);
+  // The scanner itself: single quotes, template literals and a call split over lines are all seen.
+  expect(sourceLabels("no('a_b');\nno(`c_d_${x}`);\nreturn no(\n  x\n    ? \"e_f\"\n    : 'g_h'\n);", ["no"]).sort())
+    .toEqual(["a_b", "c_d_<>", "e_f", "g_h"]);
+  expect(sourceLabels("fail(`x_${y}_z`)", ["fail"])).toEqual(["x_<>_z"]);
+});
+
+/** A placeholder in either form (`<status>`, `<n>`, `${res.status}`) as `<>`. */
+const norm = s => s.replace(/<[^>]*>/g, "<>");
+
+/**
+ * Every lowercase label written as a string literal ("…", '…' or `…`, `${…}` read as `<>`) anywhere inside a call
+ * to one of `calls`, the call's whole text up to its closing parenthesis, over any number of lines; plus a
+ * `cause ??= "…"` fallback.
+ */
+function sourceLabels(text, calls) {
+  const out = new Set();
+  const literals = s => [...s.matchAll(/"([^"\n]*)"|'([^'\n]*)'|`([^`]*)`/g)].map(m => norm((m[1] ?? m[2] ?? m[3]).replace(/\$\{[^}]*\}/g, "<>")));
+  const add = s => { for (const l of literals(s)) if (/^[a-z][a-z0-9_:]*(?:<>[a-z0-9_:]*)*$/.test(l)) out.add(l); };
+  for (const m of text.matchAll(new RegExp(`\\b(?:${calls.join("|")})\\(`, "g"))) {
+    let depth = 1, i = m.index + m[0].length;
+    for (; i < text.length && depth > 0; i++) depth += text[i] === "(" ? 1 : text[i] === ")" ? -1 : 0;
+    add(text.slice(m.index + m[0].length, i - 1));
+  }
+  for (const m of text.matchAll(/\bcause\s*\?\?=\s*([^;\n]*)/g)) add(m[1]);
+  return [...out];
+}
+
+// p5-tidyv V5: the CEO's hand-off table (docs/m2/reports/p5-google2.md, section (e)) lists exactly what can be logged.
+test("the hand-off cause table lists every label the server can log, and nothing else", async () => {
+  const doc = await Bun.file(new URL("../../docs/m2/reports/p5-google2.md", import.meta.url)).text();
+  const from = doc.indexOf("**(e) If it fails:**");
+  expect(from).toBeGreaterThan(-1);
+  const rows = doc.slice(from).split("\n").slice(1).filter(Boolean);
+  const table = rows.slice(0, rows.findIndex(r => !r.startsWith("|")));
+  expect(table[0]).toMatch(/^\| `cause` \|/);
+  const listed = table.slice(2).flatMap(r => [...r.split("|")[1].matchAll(/`([^`]+)`/g)].map(m => norm(m[1])));
+  const known = [...new Set([...CAUSES, ...SIGN_IN_CAUSES].map(norm))];
+  for (const c of known) expect(listed, `${c} missing from the table`).toContain(c);
+  // A concrete example of a pattern row (`idp_error:server_error`, `token_http_502`) is fine; anything else isn't.
+  const instance = l => known.filter(k => k.endsWith("<>")).some(k => l.startsWith(k.slice(0, -2)) && /^[a-z0-9_]+$/.test(l.slice(k.length - 2)));
+  for (const l of listed) expect(known.includes(l) || instance(l), `${l} is in the table but never logged`).toBe(true);
 });
 
 test("restart mid-login / a second gateway: same COOKIE_KEY finishes the login; a different key logs bad_login_cookie", async () => {

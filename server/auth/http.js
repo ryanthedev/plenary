@@ -285,7 +285,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
     if (used === "replay") return fail("state_used");
     if (used === "full") { failed("replay_guard_full"); return withCookie(err(503, "unavailable"), clearLogin); }
     let x;
-    try { x = await mintCode(identity); } catch { return withCookie(err(503, "unavailable"), clearLogin); }
+    try { x = await mintCode(identity); } catch { failed("mint_failed"); return withCookie(err(503, "unavailable"), clearLogin); }
     const frag = "#code=" + x.code;   // base64url: URL-safe as is
     if (expected.link) {
       let r = null, outage = false;
@@ -432,10 +432,11 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
 /**
  * Causes this file adds to oidc.js's CAUSES for a failed callback. `idp_error:<name>` carries Google's `error`
  * parameter only when it is one of AUTHORIZE_ERRORS (RFC 6749 § 4.1.2.1, OIDC Core § 3.1.2.6); else plain idp_error.
- * `idp_refused`: the IdP refused without naming a cause (an adapter with no `why`).
+ * `idp_refused`: the IdP refused without naming a cause (an adapter with no `why`). `mint_failed` (503): sign-in
+ * succeeded but the exchange code couldn't be made (p5-google2v L4).
  */
 export const SIGN_IN_CAUSES = Object.freeze(["no_login_cookie", "bad_login_cookie", "idp_error", "idp_error:<name>",
-  "state_mismatch", "no_code", "state_used", "idp_threw", "idp_refused", "replay_guard_full"]);
+  "state_mismatch", "no_code", "state_used", "idp_threw", "idp_refused", "replay_guard_full", "mint_failed"]);
 const AUTHORIZE_ERRORS = ["access_denied", "invalid_request", "unauthorized_client", "unsupported_response_type",
   "invalid_scope", "server_error", "temporarily_unavailable", "interaction_required", "login_required",
   "consent_required", "account_selection_required", "invalid_request_uri", "invalid_request_object"];

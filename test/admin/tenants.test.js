@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SQL } from "bun";
-import { bootstrapTenant, normAdmin, normDomain } from "../../server/admin/tenants.js";
+import { bootstrapTenant, normAdmin, normDomain, shown } from "../../server/admin/tenants.js";
 import { createBoard } from "../../server/admin/boards.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { sqliteRegistry } from "../../server/registry/sqlite.js";
@@ -90,7 +90,9 @@ for (const [name, make] of ADAPTERS) describe(`bootstrapTenant: ${name}`, () => 
   }));
 
   test("an email admin off the tenant's domain, or any control character, is refused and nothing is written", withReg(async r => {
-    for (const admin of ["bob@evil.com", "email:bob@evil.com", "bob@sub.acme.com", "bob@acme.com.", "x@acme.com\0", "google:12\u000134", "dev:ann\u007f", "a\u200b@acme.com", "google:1\u0085"])
+    for (const admin of ["bob@evil.com", "email:bob@evil.com", "bob@sub.acme.com", "bob@acme.com.", "x@acme.com\0", "google:12\u000134", "dev:ann\u007f", "a\u200b@acme.com", "google:1\u0085",
+      // control characters at either end, which trim() would strip: the check runs on the raw value (p5-devadmin2v F3)
+      "alice@acme.com\n", "\tdev:ann"])
       await expect(bootstrapTenant({ registry: r, domain: "acme.com", admins: ["dev:ok", admin] })).rejects.toMatchObject({ code: "bad-request" });
     expect(await r.tenantByDomain("acme.com")).toBe(null);
     const ok = await bootstrapTenant({ registry: r, domain: "Acme.com", admins: ["Bob@ACME.com"] });
@@ -109,6 +111,51 @@ test("normDomain / normAdmin", () => {
   expect(normAdmin("dev:ann", "acme.com")).toBe("dev:ann");
   expect(() => normAdmin("bob@evil.com", "acme.com")).toThrow(/tenant's domain acme\.com: "bob@evil\.com"/);
   expect(() => normAdmin("x@y\0")).toThrow(/control character: "x@y\\u0000"/);
+});
+
+// Every control or format character an error message echoes is escaped (p5-devadmin2v F1, F2).
+const RAW = ["\u007f", "\u009b", "\u202e", "\u200b", "\u0085", "\u2028", "\u2029", "\u00ad", "\u{e0001}"];
+const hasRaw = s => RAW.some(c => s.includes(c)) || /[\p{Cc}\p{Cf}\u2028\u2029]/u.test(s);
+
+test("shown: control and format characters as \\uXXXX (astral as \\u{…}), at most 80 code points, no split pair", () => {
+  expect(shown("a\u007fb\u009b2J\u202e\u200b\u0085\u2028\u2029\u00ad\u{e0001}")).toBe(
+    '"a\\u007fb\\u009b2J\\u202e\\u200b\\u0085\\u2028\\u2029\\u00ad\\u{e0001}"');
+  expect(shown("bell\u0007\n")).toBe('"bell\\u0007\\n"');              // C0 as JSON.stringify writes it
+  expect(shown(null)).toBe('""');
+  const long = shown("😀".repeat(100));
+  expect(long).toBe(JSON.stringify("😀".repeat(80)) + "…");              // cut to 80 code points of the value
+  expect(/[\ud800-\udbff](?![\udc00-\udfff])/.test(long)).toBe(false);
+  expect(shown("x".repeat(80))).toBe(JSON.stringify("x".repeat(80)));     // 80 is not cut
+});
+
+// p5-tidyv V4: the value is cut before it is escaped, so an escape is never cut in half, and an unsafe character
+// past the cut is still named.
+test("shown: a long value never ends in half an escape and never hides why it was refused", () => {
+  const RLO = String.fromCodePoint(0x202e), TAG = String.fromCodePoint(0xe0001);
+  // the two trailing cases from V4: the offender is inside the 80, so it is shown whole, then the closing quote
+  expect(shown("dev:" + "a".repeat(70) + RLO)).toBe('"dev:' + "a".repeat(70) + '\\u202e"');
+  expect(shown("a".repeat(77) + TAG)).toBe('"' + "a".repeat(77) + '\\u{e0001}"');
+  // past the cut: the cut value, then `…`, then the first unsafe character's code point and position
+  expect(shown("dev:" + "a".repeat(100) + RLO)).toBe('"dev:' + "a".repeat(76) + '"… (U+202E at code point 105)');
+  expect(shown("a".repeat(90) + TAG + "\u007f")).toBe('"' + "a".repeat(80) + '"… (U+E0001 at code point 91)');
+  // one at position 80 is inside the cut: shown escaped, no note
+  expect(shown("a".repeat(79) + RLO + "b".repeat(5))).toBe('"' + "a".repeat(79) + '\\u202e"…');
+  // normDomain of a long domain with a trailing DEL says what is wrong with it
+  let msg = "";
+  try { normDomain("a".repeat(63) + ".bbbbbbbbbb.example.com" + "\u007f"); } catch (e) { msg = e.message; }
+  expect(msg).toContain("(U+007F at code point 87)");
+  expect(hasRaw(msg)).toBe(false);
+});
+
+test("normAdmin and normDomain errors never echo a raw control or format character", () => {
+  for (const c of RAW) {
+    for (const f of [() => normAdmin("dev:a" + c + "nn"), () => normAdmin("bob" + c + "@evil.com", "acme.com"), () => normDomain("acme" + c + ".com")]) {
+      let msg = null;
+      try { f(); } catch (e) { msg = e.message; }
+      expect(msg).not.toBeNull();
+      expect(hasRaw(msg)).toBe(false);
+    }
+  }
 });
 
 describe("an email-named admin is matched at sign-in (boards.js)", () => {

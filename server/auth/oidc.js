@@ -190,10 +190,12 @@ const TOKEN_ERRORS = ["invalid_request", "invalid_client", "invalid_grant", "una
 
 /**
  * Every label `finish`'s `why` can hear (fixed strings; safe to log). `token_http_<status>` covers a token-endpoint
- * refusal without a known error name.
+ * refusal (JSON body) without a known error name; `bad_token_response`, a token answer whose body isn't JSON (an
+ * empty body included); `idp_unreachable`, a network failure before the whole answer was read.
  */
 export const CAUSES = Object.freeze([
   "bad_expected", "state_mismatch", "no_code", ...TOKEN_ERRORS, "token_http_<status>", "idp_timeout", "idp_unreachable",
+  "bad_token_response",
   "bad_config", "bad_token", "bad_alg", "unknown_kid", "bad_sig", "bad_iss", "bad_aud", "bad_time", "expired", "stale",
   "bad_nonce", "bad_sub",
 ]);
@@ -235,9 +237,13 @@ export function googleOidc(config) {
       if (!expected || !ok(expected.state) || !ok(expected.nonce) || !ok(expected.verifier)) return no("bad_expected");
       if (state !== expected.state) return no("state_mismatch");
       if (typeof code !== "string" || !code) return no("no_code");
-      let body;
+      // Three steps, three kinds of label (p5-tidyv V2, V3): reaching Google and reading its whole answer (a
+      // network failure, a reset mid-body included, is `idp_unreachable`; the timeout covers both and is
+      // `idp_timeout`); then parsing it (not JSON, an empty body included, is `bad_token_response`, whatever the
+      // status); then what it says.
+      let res, text, body;
       try {
-        const res = await fetch(GOOGLE.token, {
+        res = await fetch(GOOGLE.token, {
           method: "POST",
           signal: AbortSignal.timeout(config.timeoutMs ?? 10_000),
           headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -246,14 +252,14 @@ export function googleOidc(config) {
             redirect_uri: redirectUri, code_verifier: expected.verifier,
           }).toString(),
         });
-        if (!res.ok) {
-          // Google's `error` field only, and only a name from RFC 6749 § 5.2; never `error_description` or the body.
-          let e = null;
-          try { e = (await res.json())?.error; } catch { /* not JSON */ }
-          return no(TOKEN_ERRORS.includes(e) ? e : `token_http_${res.status}`);
-        }
-        body = await res.json();
+        text = await res.text();
       } catch (e) { return no(e?.name === "TimeoutError" ? "idp_timeout" : "idp_unreachable"); }
+      try { body = JSON.parse(text); } catch { return no("bad_token_response"); }
+      if (!res.ok) {
+        // Google's `error` field only, and only a name from RFC 6749 § 5.2; never `error_description` or the body.
+        const e = body?.error;
+        return no(TOKEN_ERRORS.includes(e) ? e : `token_http_${res.status}`);
+      }
       return verifyIdToken(body?.id_token, { clientId, nonce: expected.nonce, keys, now, skewSec, why: no });
     },
     /** Verify an ID token directly (exposed for tests and for a future token-exchange endpoint). */

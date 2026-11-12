@@ -124,12 +124,25 @@ There must be no "COOKIE_KEY is not set" warning; `.env` has one.
 | `bad_login_cookie` | The cookie was signed with another key or is older than 10 min (for example, the server restarted with no `COOKIE_KEY`) | Start again from (c). |
 | *(no line at all; Google shows its own error page, e.g. "Access blocked")* | Google refused before calling us back: usually the account isn't a test user, or a redirect URI mismatch | Add the account under Google Auth Platform → Audience → Test users; open `http://localhost:8080/` exactly. |
 | `idp_error:access_denied` | You pressed Cancel on Google's consent screen | Start again from (c). |
+| `idp_error:<other name>` (e.g. `idp_error:server_error`, `idp_error:temporarily_unavailable`, `idp_error:login_required`) | Google sent you back with a standard error instead of a sign-in | Wait a minute and start again from (c). If it repeats, report the cause. |
+| `idp_error` (no name) | Google sent you back with an error whose name we don't recognise, so we don't print it | Start again from (c). If it repeats, report it. |
 | `state_mismatch`, `no_code`, `state_used` | The callback URL was altered, or reused (back button, double submit) | Start again from (c). |
 | `invalid_grant` | Google refused the code: too old or already used | Start again from (c), without lingering. |
 | `invalid_client` | The client id or secret in `.env` is wrong | Check `.env` (don't paste it anywhere). |
-| `idp_timeout`, `idp_unreachable`, `token_http_<n>` | Google couldn't be reached, or answered oddly | Check the network and retry. |
-| `bad_aud`, `bad_iss`, `bad_nonce`, `bad_sig`, `unknown_kid`, `expired`, `bad_time`, `stale` | Google's ID token failed a check | Shouldn't happen. Report the cause. |
+| `invalid_request`, `unauthorized_client`, `unsupported_grant_type`, `invalid_scope` | Google refused how our server asked for the token (a bug on our side or an OAuth client setting) | Shouldn't happen. Report the cause. |
+| `idp_timeout`, `idp_unreachable`, `token_http_<n>` | Google couldn't be reached in time, the connection dropped before its whole answer arrived, or Google answered the token request with error status `<n>` and no standard error name | Check the network and retry. |
+| `bad_token_response` | Google's token answer arrived whole but wasn't JSON, whatever its status, an empty answer included (a proxy or captive portal in the way, or a Google outage page) | Retry. If it repeats, check for a proxy, then report. |
+| `bad_token`, `bad_alg`, `bad_aud`, `bad_iss`, `bad_nonce`, `bad_sig`, `bad_sub`, `expired`, `bad_time`, `stale` | Google's ID token was missing, malformed, or failed a check | Shouldn't happen. Report the cause. |
+| `unknown_kid` | Google's ID token was signed with a key we don't have, or Google's key endpoint couldn't be reached to fetch its keys (the server reads a failed key fetch as an unknown key) | Wait a minute and retry. If it repeats, report the cause. |
+| `bad_config`, `bad_expected` | The server's own sign-in setup, or the login state in the cookie, was incomplete | Shouldn't happen. Report the cause. |
+| `idp_refused`, `idp_threw` | The sign-in adapter refused without giving a reason, or crashed | Shouldn't happen with Google. Report the cause. |
 | `replay_guard_full` (503) | Over 100k sign-ins in 10 min on one process | Not expected here. |
+| `mint_failed` (503) | Google signed you in, but the server couldn't make the one-time code that hands the sign-in to the page | Start again from (c). If it repeats, report it. |
+
+This table lists every label the server can log (p5-tidy): every cause goes through one function, `failed` in
+`server/auth/http.js`, and the labels it can receive are exactly oidc.js `CAUSES` plus http.js `SIGN_IN_CAUSES`.
+`test/auth/signin-cause.test.js` checks that every label written in either file's source is in those lists and the
+other way round, and that this table names exactly those labels (p5-tidy round 3).
 
 The exchange step can fail separately: the page says "sign-in failed (invalid-code)". That is the 60 s exchange window or a dropped exchange cookie. Sign in again.
 
@@ -147,7 +160,7 @@ If `POST /boards` gives **403 `forbidden`**, the admin match failed. Admin by em
 | (b) | **Yes**: `PLENARY_DATA_DIR=<scratch> bun server/main.js`, PID 6498 recorded | The log showed the three lines above and no `COOKIE_KEY` warning. Probes: `/health` 200; `/` and `/?board=b-x` 200 HTML; `/auth/login` 302 to Google with `client_id=<client-id>`, `redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth%2Fcallback`, S256 and the `__Host-plen_login` cookie (HttpOnly, SameSite=Lax); a cookieless `/auth/callback` gave `login-failed` and logged `cause: "no_login_cookie"`; `POST /boards` without auth gave 401 `auth`. Stopped with `kill 6498`; logged `server stopped`; 8080 free. |
 | (c) | **No.** `/` was fetched with curl (200 HTML), not rendered in a browser. I didn't open `/auth/login` in a browser. You consented already, so Google might redirect straight back with a real code, and that would be a login. | — |
 | (d) | **Rehearsed without Google**, on the same scratch dir | **Setup:** in-process `start()`, random keys, a session for `ceo@example.com` / `example.com`. **Board:** `POST /boards` gave 201 on the CLI's tenant; a non-member gave 403 `forbidden`. **Join:** hello gave `welcome`, role **owner**. **Ops:** 3 board ops acked at seq 1–3. **After a full stop and start:** `welcome` at seq 3, and the catch-up snapshot is at seq 3. The ops were settings ops on the board stream, not strokes drawn in the web app. That last part is yours. |
-| (e) | Partly | Every cause above is produced in `signin-cause.test.js`. `invalid_grant` and `invalid_client` were also produced live. |
+| (e) | Partly | Most causes in the table are produced in `signin-cause.test.js` (not yet `bad_config`, `bad_expected`, `bad_time`, `bad_sub` or `stale`), and a test there checks the table lists every label the code can log. `invalid_grant` and `invalid_client` were also produced live. |
 | (f) | Server stopped (above) | The scratch dir is under the session scratchpad, not the repo. I didn't delete it (my sandbox refused an `rm -rf`). It holds only placeholder data. |
 
 ## Systems design (APPLIER, brief): harness vs real server

@@ -19,7 +19,7 @@
 
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
-import { bootstrapTenant, normDomain, normAdmin } from "../server/admin/tenants.js";
+import { bootstrapTenant, normDomain, normAdmin, shown, escapeUnsafe } from "../server/admin/tenants.js";
 import { sqliteRegistry } from "../server/registry/sqlite.js";
 import { postgresRegistry } from "../server/registry/postgres.js";
 
@@ -40,7 +40,7 @@ export function parseArgs(argv) {
     if (flag === "--domain") o.domain = value();
     else if (flag === "--admin") o.admins.push(value());
     else if (flag === "--data-dir") o.dataDir = value();
-    else throw new UsageError(`unknown argument: ${flag}`);
+    else throw new UsageError(`unknown argument: ${shown(flag)}`);   // escaped: argv can hold any byte
   }
   if (!o.domain) throw new UsageError("--domain is required");
   // A tenant with no admins can't create boards; refuse rather than make one. Re-runs still only add.
@@ -77,8 +77,11 @@ export async function run(argv, env = {}, { out = s => console.log(s), err = s =
     out(JSON.stringify({ ok: true, registry: store, tenant: tenant.id, domain: tenant.domain, created, added, admins: tenant.admins }));
     return 0;
   } catch (e) {
-    // Messages only: a driver error could carry connection details, so no stack and no cause.
-    err(JSON.stringify({ ok: false, error: e?.code === "bad-request" ? e.message : `failed: ${String(e?.message ?? e).replace(/postgres(ql)?:\/\/\S+/gi, "<url>")}` }));
+    // Messages only: a driver error could carry connection details, so no stack and no cause. URLs are redacted
+    // first, then the whole line is escaped: a path or database name from argv/env can hold DEL, C1 or bidi
+    // characters (p5-tidyv V1). Still valid JSON (`json: true`).
+    const line = JSON.stringify({ ok: false, error: e?.code === "bad-request" ? e.message : `failed: ${String(e?.message ?? e).replace(/postgres(ql)?:\/\/\S+/gi, "<url>")}` });
+    err(escapeUnsafe(line, { json: true }));
     return e?.code === "bad-request" ? 2 : 1;
   } finally {
     try { await registry?.close(); } catch { /* closing is best effort */ }

@@ -7,6 +7,7 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
 | pd-drawh (builder) | t14y | done pd-drawh (platform) | fix round RUNNING |
+| p5-flake (builder) | t182 | worker p5-flake (platform): deterministic replay-guard test | RUNNING |
 | pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | FAIL (2 HIGH), idle; re-checks after fix |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
@@ -234,3 +235,4 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   reverts a peer's board-settings change for everyone (28 of 35 while an agent draws; codex agrees). Graded HIGH
   by me. Plus RM1 (FAT disk: swap is a plain rename), RM2 (link fallback losses, accepted), RM3 (seeding hazard
   facts for the doc). Fix round 2 on t14y (40% context; told to hand off at 60%).
+- p5-flake (t182): test/auth/http.test.js:503 asserted a wall-clock ratio (failed 2/132 under load, found by client's p6-land). Replace with a deterministic count; must still fail on the old O(n) pruning.

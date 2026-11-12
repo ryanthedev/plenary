@@ -10,10 +10,10 @@ subagents are fine only for quick read-only lookups inside one session.
 |---|---|---|
 | CEO | (the user) | Goals and decisions. Talks to the proxy. |
 | Owner | `owner (audits)` | Started the team. Audits the proxy's commits on request. Mostly idle. |
-| Proxy | `★ proxy (talk here)`, `role=orchestrator` | The CEO's contact. Runs the managers, owns COMMITMENTS.md, audits every phase before it's pushed, asks the CEO only for decisions that are theirs. |
-| Manager | `manager <track>` | Runs one track (PLAN.md). Writes briefs, starts builders and verifiers, unsticks them, re-runs tests, commits by path, reports to the proxy. |
-| Builder | `worker <job> (<track>): <what>` | Builds one job from its brief. |
-| Verifier | `verifier <job>v (<track>): <what>` | Checks one job adversarially. Never the builder. |
+| Proxy | `★ proxy · <id> (talk here)`, `role=orchestrator` | The CEO's contact. Runs the managers, owns COMMITMENTS.md, audits every phase before it's pushed, asks the CEO only for decisions that are theirs. |
+| Manager | `manager <track> · <id>` | Runs one track (PLAN.md). Writes briefs, starts builders and verifiers, unsticks them, re-runs tests, commits by path, reports to the proxy. |
+| Builder | `worker <job> (<track>) · <id>: <what>` | Builds one job from its brief. |
+| Verifier | `verifier <job>v (<track>) · <id>: <what>` | Checks one job adversarially. Never the builder. |
 
 Tabs are never left as a bare number. When a session finishes its turn, rename its tab `done <job>` or
 `retired <role>` until its parent cleans it up (below). Labels: every session gets `--label herdr.space=sp21a427967d02459948b4c10156ff82ae` (the
@@ -24,17 +24,20 @@ plenary space), `--label plenary=<role-or-job>` and `--label plenary.reports-to=
 ## Starting a session
 
 ```
-hc run --bg --no-parent --cwd /Users/r/repos/plenary \
+hc run --bg --no-parent --cwd /Users/r/repos/plenary --name <name> \
   --label herdr.space=sp21a427967d02459948b4c10156ff82ae --label plenary=<job> \
   --label plenary.reports-to=<your terminal id> \
-  -- zsh -lic 'exec "$@"' zsh claude --model opus --permission-mode auto --settings /Users/r/.config/claude/settings.shared.json --plugin-dir /Users/r/repos/engram \
+  -- zsh -lic 'exec "$@"' zsh claude -n <name> --model opus --permission-mode auto --settings /Users/r/.config/claude/settings.shared.json --plugin-dir /Users/r/repos/engram \
   --plugin-dir /Users/r/repos/herderp --plugin-dir /Users/r/repos/sdd \
   --plugin-dir /Users/r/repos/systems-design.skill "Read <brief path> and do it."
 ```
 
 `--model opus --permission-mode auto` are required: under the login shell a session came up as Fable 5.2 in manual
 mode and blocked on its first prompt (t15y, 2026-11-11). The `zsh -lic` wrapper gives the session your shell profile's environment (ENGRAM_ADDR/ENGRAM_TOKEN), so Engram
-works; without it Engram fails with "name resolver error". Then right away: find its tab (herdr_agent get, engine core) and rename it (herdr_tab rename, engine core).
+works; without it Engram fails with "name resolver error". **Names** (CEO via owner, 2026-11-11; ~/repos/herdr-office/docs/briefs/names.md): every session gets a proper name
+(a-z, 0-9 and `-` only, 32 characters at most): builder `plenary-<job>`, verifier `plenary-<job>v`, manager
+`plenary-manager-<track>`, the same in `hc run --name` and `claude -n`. Its tab label carries the terminal id (`<id>`)
+as in the table above. Then right away: find its tab (herdr_agent get, engine core) and rename it (herdr_tab rename, engine core).
 Record the terminal id in COMMITMENTS.md. Steer a running session with `herdr_agent prompt`; watch with
 `herdr_agent watch` piped into Monitor, re-armed whenever it expires. Kill only terminals you started.
 

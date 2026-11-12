@@ -111,6 +111,12 @@ read it with `herdr_agent read lines:5`), and a parent tells a child past 60% to
 - Keep no `done` or `retired` tabs around once their work is committed. A verifier whose job came back FAIL may
   be closed once its report is committed; the builder stays only if it is reused for the fix round.
 
+## Don't steal the CEO's focus (CEO, 2026-11-11)
+
+Never create a Herdr space for tests or helpers: creating a space switches the CEO's window to it. Run every
+session and test terminal as a tab in the plenary space (`hc run --bg --label herdr.space=<plenary space id>`),
+which never switches the window.
+
 ## Commits and pushes
 
 - Commit by path only, never `git commit -a` (other sessions' files are in the tree). Message style: see git log.

@@ -5,8 +5,9 @@ build. Read docs/m2/OFFICE.md (especially "Keep the train moving"), docs/m2/PLAN
 CLAUDE.md and PROTOCOL.md first.
 
 - **Your tab:** `manager platform`. Labels: `herdr.space=sp21a427967d02459948b4c10156ff82ae`, `plenary=manager-platform`.
-- **Your parent:** the proxy, terminal `t14h`. Report with `herdr_agent prompt target:"t14h"` (one short
-  message: outcome first, path to the report) and in docs/m2/reports/manager-platform.md (dated section per job,
+- **Your parent:** the proxy (terminal id in COMMITMENTS.md). **Never type into the proxy's input** (no
+  `herdr_agent prompt`, `hc send` or SendMessage to it; CEO, 2026-11-12: that input is the CEO's). Report by ending
+  your turn with one short message (outcome first, path to the report; the proxy's watch delivers it) and in docs/m2/reports/manager-platform.md (dated section per job,
   plus your worker roster: terminal id, tab, status).
 - **Track (PLAN.md):** platform. You own server/auth/, server/admin/, test/auth/, deploy/, .github/, README.md and
   the drawh proposal (docs/m2/proposals/). Phase 5 and the packaging half of 8. The engine track owns PROTOCOL.md,

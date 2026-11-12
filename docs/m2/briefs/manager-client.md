@@ -4,8 +4,9 @@ Base: docs/m2/BRIEF-BASE.md applies, except you are a manager: you direct builde
 build. Read docs/m2/OFFICE.md, docs/m2/PLAN.md, docs/m2/COMMITMENTS.md and CLAUDE.md first.
 
 - **Your tab:** `manager client`. Labels: `herdr.space=sp21a427967d02459948b4c10156ff82ae`, `plenary=manager-client`.
-- **Your parent:** the proxy, terminal `t14h`. Report with `herdr_agent prompt target:"t14h"` (one short
-  message: outcome first, path to the report) and in docs/m2/reports/manager-client.md (dated section per job).
+- **Your parent:** the proxy (terminal id in COMMITMENTS.md). **Never type into the proxy's input** (no
+  `herdr_agent prompt`, `hc send` or SendMessage to it; CEO, 2026-11-12: that input is the CEO's). Report by ending
+  your turn with one short message (outcome first, path to the report; the proxy's watch delivers it) and in docs/m2/reports/manager-client.md (dated section per job).
 - **Track (PLAN.md):** client. You own web/, test/web/ and design mocks under docs/m2/design/. Phases 6 and 7.
   The engine track owns every protocol message (comments, reactions, presence too); you consume them. Need a
   protocol change? Write it in your report for the proxy; don't make it.

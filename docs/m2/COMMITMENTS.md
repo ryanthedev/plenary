@@ -26,7 +26,7 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 ## Decisions (reversible; the CEO may overturn)
 
 - 2026-11-11 owner: three tracks (engine, client, platform) with disjoint ownership; platform starts after phase 3.
-- 2026-11-11 proxy: managers report to the proxy by `herdr_agent prompt` to the proxy (t1bx from 2026-11-11) plus docs/m2/reports/manager-<track>.md; managers keep their own worker rosters there, the proxy keeps this file.
+- 2026-11-11 proxy: managers report to the proxy (superseded 2026-11-12: by turn-end messages the proxy's watch delivers, never by prompting the proxy) plus docs/m2/reports/manager-<track>.md; managers keep their own worker rosters there, the proxy keeps this file.
 - 2026-11-11 proxy: Engram was unreachable at start (name resolver error); proceeding without recall.
 - 2026-11-11 proxy: highlighter, notes-as-tool and image aren't core tool ids (manager client). The mock labels them "new in web/" or "needs protocol v1"; the engine's v1 spec must say how each one travels (sent to t14j).
 - 2026-11-11 proxy: an automatic security review flagged medium DOM XSS in docs/m2/design/phone.html (URL text inserted as HTML). Engine routed it to manager client (t14k); it must be fixed before the mock passes verification.
@@ -108,3 +108,5 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-12 proxy: live Google sign-in works end to end against the real OAuth client (CEO's login; server log shows callback and code exchange 200). Platform told.
 - 2026-11-12 engine: phase 3 scaffold DONE 7b6a5dd (round 5 PASS), Postgres b804f3b and NATS/S3 bbdae0e (verifiers PASS). Proxy audit in a clean worktree (no .env, like CI): 508 pass, 2 fail (test/auth/google-live.test.js safeFetch cases; platform fixing in p5-tidy t1d8). GitHub CI red since 04:13Z (fake-idp.js was uncommitted; fixed by 3f6b489). Push held until p5-tidy and the Linux burst-test fix (R5-M1, t18c) land, then a clean re-run and push.
 - 2026-11-12 platform: p5-tidy DONE d8fc084 (google-live passes without .env; verifier 5 clean runs 510/0). Push now waits only on engine R5-M1 (Linux burst test, t18c).
+- 2026-11-12 proxy: phase 3 audit PASS: clean worktree of main 378d089 (no .env, like CI) 510 pass / 0 fail after p5-tidy d8fc084 and R5-M1 ffd2a11. Pushed main to origin (378d089).
+- 2026-11-12 CEO: nobody messages the proxy's input ("this input is my space"); managers report via turn-end messages + report files, delivered by the proxy's watch. In OFFICE.md and the three manager briefs.

@@ -135,6 +135,15 @@ which never switches the window.
 - **Only these wait for the CEO:** credentials (the Google OAuth client), spending money, anything public. Work
   around them (dev tokens, stubs) and keep going.
 
+## The proxy's input is the CEO's (CEO, 2026-11-12: "this input is my space. that's why it says talk here")
+
+- **Nobody types into the proxy's session:** no `herdr_agent prompt`, `hc send`, `hc keys` or SendMessage to the
+  proxy. Only the CEO and the owner (relaying CEO rules) write there.
+- **Managers report through tools:** end the turn with one short message (outcome first, report path) and keep
+  docs/m2/reports/manager-<track>.md current. The proxy's `herdr_agent watch` delivers the last message; the
+  proxy reads the report. Something urgent: say so in the first words of that last message.
+- The proxy still steers managers with `herdr_agent prompt` (their input isn't the CEO's).
+
 ## Unsticking and escalating
 
 - A blocked session is its parent's job, not the CEO's: read its screen within a minute. Approve a permission

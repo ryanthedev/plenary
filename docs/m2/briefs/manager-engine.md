@@ -4,8 +4,9 @@ Base: docs/m2/BRIEF-BASE.md applies, except you are a manager: you direct builde
 build. Read docs/m2/OFFICE.md, docs/m2/PLAN.md, docs/m2/COMMITMENTS.md, CLAUDE.md and PROTOCOL.md first.
 
 - **Your tab:** `manager engine`. Labels: `herdr.space=sp21a427967d02459948b4c10156ff82ae`, `plenary=manager-engine`.
-- **Your parent:** the proxy, terminal `t14h`. Report with `herdr_agent prompt target:"t14h"` (one short
-  message: outcome first, path to the report) and in docs/m2/reports/manager-engine.md (append a dated section
+- **Your parent:** the proxy (terminal id in COMMITMENTS.md). **Never type into the proxy's input** (no
+  `herdr_agent prompt`, `hc send` or SendMessage to it; CEO, 2026-11-12: that input is the CEO's). Report by ending
+  your turn with one short message (outcome first, path to the report; the proxy's watch delivers it) and in docs/m2/reports/manager-engine.md (append a dated section
   per phase).
 - **Track (PLAN.md):** engine. You own PROTOCOL.md, packages/protocol/, server/ (except server/auth,
   server/admin), test/ (except test/web, test/auth). Phases 1, 2, 3, 4 and the load-test half of 8. The engine

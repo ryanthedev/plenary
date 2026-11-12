@@ -7,6 +7,7 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
 | pd-drawh (builder) | t14y | done pd-drawh (platform) | fix round RUNNING |
+| p8-deps (builder) | t17n | worker p8-deps (platform): lockfile in image + CI S3 | RUNNING |
 | pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | FAIL (2 HIGH), idle; re-checks after fix |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
@@ -223,3 +224,4 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 - Not done: real Google client (CEO credentials), web/ reading `#token` (client track).
 - Sessions t17b, t17c closed, killed, removed.
 - Engine: httpRoutes wiring goes into engine's next job p2-swap (after scaffold round-3 verification), with a test that POST /boards via dev Bearer creates a board a socket client joins. Engine will notify.
+- p8-deps (t17n) started for engine's p4-natss3: Dockerfile installs bun.lock (--frozen-lockfile --production); CI cluster job gets MinIO + bucket + throwaway S3_* values. Commit only after engine's commit with package.json + bun.lock (t14j to send its id).

@@ -15,7 +15,8 @@ phase 4 leases/takeover.
 | Job | Terminal | Status |
 |---|---|---|
 | p2-tune (builder, plenary-p2-tune) | t1fw | RUNNING (brief docs/m2/briefs/p2-tune.md) |
-| p-arch (builder, plenary-p-arch) | t1fx | RUNNING (brief docs/m2/briefs/p-arch.md) |
+| p-arch (builder, plenary-p-arch) | t1fx | reported, idle (1 allowlisted: blobs/s3.js -> blobs/disk.js) |
+| p-archv (verifier, plenary-p-archv) | t1g0 | RUNNING (brief docs/m2/briefs/p-archv.md) |
 
 Closed: t1fm, t1fn, t1dh, t15q, t186, t188, t18c, t18b, t171, t16y, t158, t17d, t17p, t17f, t17m, t17j.
 Leftover scratch: t17j ~1 GB, t18c 168 MB in their scratchpads.
@@ -218,3 +219,6 @@ Leftover scratch: t17j ~1 GB, t18c 168 MB in their scratchpads.
 - p2-swapv t1fn: FAIL (H1 revocation during hello; M1 recheck fails open; M2 exp (now on main e82a537); M3 link/invite expiry; 6 LOW). Rebased p2-land onto main (b18de1d, autostash clean). Fix round 1 to t1fm. Decisions: L3 keep byte-triggered checkpoint and amend § Recovery When; L5 add grants to § Bus; L1 `here` becomes its own job (queued); L4 to p-arch.
 - Fix round 1 (t1fm) done in 7 min: all listed fixed; done-when 443/0 plain. Round 2 re-verify sent to t1fn.
 - p2-swapv round 2 PASS (R1/R2 MEDIUM at scale, R3-R6 LOW -> p2-tune). Committed 3ca0b05 on p2-land (884/0); merged into main dcbdae6 (884/0 on main). Started p2-tune (t1fw, incl. `here`) and p-arch (t1fx). Platform: p5-pgpriv waits on p-arch's commit id.
+- Client t14k: p6-hex started on main (web/**); needs test/arch-scan.js from p-arch: ping t14k with p-arch's commit id (also t187).
+- Platform t187: flake v1.test.js token-expiry test (5 s timeout under load). Added to p2-tune R6 (t1fw).
+- p-arch (t1fx) reported in 15 min: test green, plants fail; server/pg/schema.js; pg contracts 44/0. Allowlisted s3.js->disk.js (fix: server/blobs/port.js). Open question: restrict adapters to ports + explicit shared list. Verifier t1g0 started.

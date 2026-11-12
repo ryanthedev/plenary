@@ -4,15 +4,15 @@ Manager terminal: `t18m` (tab `manager engine`; successor of t14j, retired 2026-
 
 ## Workers (current; updated every turn)
 
-In flight: p2-swap (t1fm, name plenary-p2-swap2; t1dh retired) in worktree /Users/r/repos/plenary-p2 (p2-land rebased on main, head
-892ee6e); t18c fixing R5-M1 (Linux burst test, test only) in the shared tree. Proxy t1bx holds the push until R5-M1
+In flight: p2-swap (t1fm, name plenary-p2-swap2; t1dh retired) in worktree /Users/r/repos/plenary-p2 (p2-land rebased on main again, head
+b18de1d); t18c fixing R5-M1 (Linux burst test, test only) in the shared tree. Proxy t1bx holds the push until R5-M1
 and platform's p5-tidy land: ping t1bx when R5-M1 commits. After p2-swap: verifier (CHECKER) + client p6-landv
 already PASS, then one merge into main, send id to t14k and t1bx; then p-arch + architecture audit.
 
 | Job | Terminal | Status |
 |---|---|---|
-| p2-swap (builder, plenary-p2-swap2) | t1fm | reported (done-when 429/0, 488/0 with PG+NATS), idle; kept for a fix round |
-| p2-swapv (verifier, plenary-p2-swapv) | t1fn | RUNNING (worktree, read-only) |
+| p2-swap (builder, plenary-p2-swap2) | t1fm | RUNNING fix round 1 (H1, M1, M3, M2 e2e, L2, L3/L5 spec, L6) |
+| p2-swapv (verifier, plenary-p2-swapv) | t1fn | FAIL reported (1 HIGH revocation race); idle, re-verifies after fix round 1 |
 
 On main: 7b6a5dd scaffold, b804f3b p4-pg, bbdae0e p4-natss3. On p2-land: a68e9dc v1.1 code, 892ee6e client.
 Closed: t1dh, t15q (+ its worktree), t186, t188, t18c, t18b, t171, t16y, t158, t17d, t17p, t17f, t17m, t17j. Leftover scratch: t17j ~1 GB and t18c 168 MB in their
@@ -211,3 +211,6 @@ scratchpads (their rm was refused); remove when convenient.
 - Closed t15q, t186, t188 (work committed); removed t15q's scratch worktree. p2-swap t1dh handing off at 36% (finishing a welcome-ordering fix first); successor expected same turn.
 - t1dh handed off to t1fm (plenary-p2-swap2); t1dh closed. Told platform t187: deploy/cluster.compose.yml needs COOKIE_KEY (main.js refuses cluster mode without it after p2-swap).
 - p2-swap (t1fm) reported: done-when green (429/0; 488/0 with PG+NATS); feed checkpoint-race fix; queue cap + idle tests; PG least privilege tested; no SEAM(p2) left. Platform asks: session verify() return exp; grants publish from registry. p-arch to absorb test/server/architecture.test.js. Verifier t1fn started (brief docs/m2/briefs/p2-swapv.md).
+- Platform t187: p5-exp started (verify returns exp); grants announce stays a main.js decorator (agreed); p5-pgpriv after the merge, on p-arch's server/pg/schema.js helper (needSchema/ensureSchema/migrate); p8-cookie on the merge id. p-arch must move migrate() too.
+- Platform p5-exp landed e82a537 (identity.exp flat integer seconds; dev tokens none). Platform waits on the merge id for p8-cookie, p5-pgpriv, live drawh run.
+- p2-swapv t1fn: FAIL (H1 revocation during hello; M1 recheck fails open; M2 exp (now on main e82a537); M3 link/invite expiry; 6 LOW). Rebased p2-land onto main (b18de1d, autostash clean). Fix round 1 to t1fm. Decisions: L3 keep byte-triggered checkpoint and amend § Recovery When; L5 add grants to § Bus; L1 `here` becomes its own job (queued); L4 to p-arch.

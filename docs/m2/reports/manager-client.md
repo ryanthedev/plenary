@@ -4,7 +4,7 @@
 
 - **Me:** manager client, terminal t14k. Report to the proxy **t1bx** ONLY by ending my turn with one short message (outcome
   first, report path; "Urgent:" first if urgent). NEVER prompt/hc send/SendMessage t1bx (CEO rule, 2026-11-12). Workers report to me only. engine manager **t18m**; platform manager **t187**.
-- **In flight (after the 03:44 kill; proxy resumed sessions in place):** p6-hexv (t1g6, resumed, watched) verifying
+- **In flight (after the 03:44 kill and a second restart; proxy re-prompted t1g6; my watch re-armed, task bb1cht2aw):** p6-hexv (t1g6, working, no report yet) verifying
   p6-hex (builder t1fy: DONE, NOT resumed; resume only for the fix round with
   `claude --resume 81338670-c0eb-4e92-9f26-43be782b08a0 --model opus --permission-mode auto` in a NEW terminal, never
   prompting a plain shell). Known HIGH already decided: main.js = production root (ws.js, HTTP auth, sign-in), new

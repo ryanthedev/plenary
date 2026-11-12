@@ -274,8 +274,10 @@ test("M1: one writer's burst doesn't freeze the process: /health keeps answering
   // ~130 ms per 4,000 ops on Linux), but WHEN /health answers: in the middle of a burst, with some of its acks
   // arrived and some not. A loop the burst held would answer only before the burst starts or after its last ack.
   // So bursts are sent until /health has answered mid-burst MID times, counted, not timed. A frozen loop never
-  // does: it gives up after MAX_BURSTS and fails. (Checked: with the breather disabled, 0 mid-burst answers.)
-  const B = 2000, MID = 3, MAX_BURSTS = 10;
+  // does: it gives up after MAX_BURSTS and fails. Measured over 10 bursts of 2,000 (Bun 1.4.4): breather on,
+  // 414–570 mid-burst answers on macOS and 23–25 on Linux; breather disabled, 0 on macOS and 1–3 on Linux (the loop
+  // still turns between inbound socket reads). The bar sits between them with over 2× margin each way.
+  const B = 2000, MID = 10, MAX_BURSTS = 10;
   let acks = 0, scanned = 0;
   const countAcks = () => { for (; scanned < s.msgs.length; scanned++) if (s.msgs[scanned].t === "ack") acks++; return acks; };
   let burstStart = 0, inBurst = false, polling = true, polls = 0; const mid = new Set();

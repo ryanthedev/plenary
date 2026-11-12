@@ -759,3 +759,42 @@ My recommendation: B. A is tight enough that any growth in the snapshot shape br
   would remove it.
 - **The room host sends `bytes` on the bus.** The NATS adapter (not mine) must pass the field through. The gateway
   measures the text itself if the field is missing.
+
+# R5-M1 (after docs/m2/reports/p3-scaffoldv3.md "Round 5": the M1 burst test fails on Linux)
+
+**Fixed, test only.** One test changed: "M1: one writer's burst doesn't freeze the process" in
+`test/server/outbound.test.js`. No server code changed. Not committed.
+
+**The cause (the verifier's, confirmed):** the test assumed a 4,000-op burst lasts seconds, as it does with macOS's
+`fullfsync`. On Linux it takes ~130 ms, so `/health` saw fewer than the 10 points of progress the test required.
+
+**The test now:**
+- **Same property:** `/health` answers *in the middle of* a burst, with some of that burst's acks arrived and some
+  not. A loop held by the burst answers only before it or after its last ack.
+- **Driven by count, not time:** bursts of 2,000 ops are sent until 10 mid-burst answers have been seen, up to 10
+  bursts. The test asserts every op of every burst was acked and at least 10 mid-burst answers.
+- **Why 10:** counted over 10 bursts (Bun 1.4.4), it sits between the two cases with over 2× margin each way.
+
+  | | Breather on | Breather disabled (loop held between socket reads) |
+  |---|---|---|
+  | macOS | 414–570 | 0 |
+  | Linux (Podman, `oven/bun:1.4.4`) | 23–25 | 1–3 |
+
+  With the breather disabled, the loop still turns between inbound socket reads. That's why Linux shows a few
+  mid-burst answers even then, and why the bar isn't 1.
+
+**Checked:**
+
+| Where | Result |
+|---|---|
+| macOS, the test alone | **20 / 20 pass** |
+| macOS, beside two full `bun test` suites | **10 / 10 pass** |
+| macOS, whole `outbound.test.js` | 22 pass, 0 fail |
+| Linux (Podman, `oven/bun:1.4.4`, Linux 6.17 aarch64, repo mounted read-only) | **20 / 20 pass**; whole file 21 pass, 1 skip (no python3 in the image), 0 fail |
+| Not vacuous: breather disabled | **Fails**: macOS 1 / 1 (0 mid-burst answers), Linux 5 / 5 |
+
+- **How the breather was disabled:** on macOS, `server/breather.js` was changed for one run, then restored and
+  checked byte-identical with `cmp`. On Linux, a modified copy was mounted over it in the container; the repo file
+  was untouched.
+
+**Not verified:** Linux on x86-64 or on CI hardware; the full Linux suite (only this file).

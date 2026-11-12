@@ -200,9 +200,15 @@ An `error` with no `id` is not about an op (a `blob` request: `bad-op`, `forbidd
 12. **Timeouts and backoff (client; clock injected).** The client closes the connection and reconnects when: no
     `welcome` arrives within **10 s** of its hello; or it is behind `welcome.seq` and no `snapshot` or `entries`
     message arrives for **10 s**; or rule 2's op timeout fires. Before each reconnect (also after `unavailable`)
-    it waits min(30 s, 0.5 s × 2^k) × a random factor in [0.5, 1), k = failed attempts in a row; k resets once it
-    has applied `welcome.seq`. Guaranteed: a lost hello, `welcome`, catch-up message, `ack` or `error` never
-    strands a client, and pending ops are kept throughout. May drop: time only.
+    it waits min(30 s, 0.5 s × 2^k) × a random factor in [0.5, 1), k = failed attempts in a row. A failed attempt
+    is a connection that ended by one of these timeouts, by `unavailable`, or by the socket closing without the
+    client asking; each connection counts once. k resets to 0 only after a connection has **proven itself**: it
+    applied `welcome.seq` and then stayed connected for **10 s** more (the silent 10 s before a timeout don't
+    count). Being welcomed, or caught up, is not enough:
+    a server that welcomes and then drops still meets growing waits. The reset is applied when the next wait is
+    worked out (so a proven connection that then fails counts as the first failure). Guaranteed: a lost hello,
+    `welcome`, catch-up message, `ack` or `error` never strands a client, and pending ops are kept throughout.
+    May drop: time only.
 13. **Pending ops belong to a user.** If `welcome.user` differs from the user who made the client's pending ops
     (someone else signed in), the client drops them before resending anything and tells the UI how many.
 

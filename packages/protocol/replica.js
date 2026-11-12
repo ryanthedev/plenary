@@ -27,7 +27,8 @@ export class Replica {
   constructor({ client, now = Date.now, random = Math.random }) {
     this.client = `${client}.${Math.floor(Math.random() * 2 ** 31).toString(36)}`; this.counter = 0;
     this.now = now; this.random = random;
-    this.fails = 0;             // failed connections in a row (rule 12); back to 0 once caught up
+    this.fails = 0;             // failed connections in a row (rule 12); back to 0 only after a proven connection
+    this.goodAt = null;         // when this connection caught up to welcome.seq (null: not yet)
     this.helloAt = null; this.progressAt = null;
     this.pending = new Map();   // op id → { stream, op, msg, ackSeq?, wrote, answered, resend }: kept across resets and connections
     this.tokens = OP_RATE.burst; this.tokensAt = now();   // the send pace: a bucket of OP_RATE
@@ -50,8 +51,8 @@ export class Replica {
     this.confirmedRecords = new Records();   // comments and reactions as the room ordered them
     this.noteAuthor = new Map();         // notes element id → who made it (which notes an annotator may change)
     this.buffer = new Map();             // seq → entry, arrived ahead of a gap
-    this.previews = new Map();           // element id → others' in-flight preview (display only)
-    this.previewOf = new Map();          // element id → { user, client, at }
+    this.previewBy = new Map();          // "stream\nid" → { stream, el, user, client, at }: others' in-flight previews (display only)
+    this.previews = new Map();           // element id → element, every stream together (kept for callers that predate previewsOf)
     this.overlay();
   }
 
@@ -67,7 +68,8 @@ export class Replica {
     // A stale op was dropped but the copy still shows it (the connection ended before the resync): start from 0.
     if (this.staleSeen) { this.staleSeen = false; this.reset(); }
     this.resync = false; this.needAuth = false; this.welcomed = false; this.target = null;
-    this.helloAt = this.now(); this.progressAt = null;
+    this.proven();
+    this.helloAt = this.now(); this.progressAt = null; this.counted = false;
     for (const p of this.pending.values()) { p.wrote = null; p.answered = false; p.resend = p.msg.sentAt !== undefined; }
     return [{ t: "hello", v: PROTOCOL_VERSION, token, board, since: this.applied, client: this.client }];
   }
@@ -171,7 +173,8 @@ export class Replica {
   outgoing() {
     if (this.stopped || this.resync || this.needAuth || this.helloAt === null) return [];   // after `auth`: nothing until signed in again
     const t = this.now(), out = [];
-    if (this.overdue(t)) { this.fails++; this.resync = true; return []; }
+    // A timeout means the server was silent for the last 10 s: that stretch doesn't count as staying up.
+    if (this.overdue(t)) { this.failed(t - CONNECT_TIMEOUT_MS); return []; }
     if (!this.welcomed) return [];
     this.refill(t);
     for (let p; this.tokens >= 1 && (p = this.nextToSend());) {
@@ -191,8 +194,29 @@ export class Replica {
     return left;
   }
 
+  // This connection failed: one more toward the backoff (once per connection), and a new one is wanted.
+  failed(upTo = this.now()) { if (!this.counted) { this.proven(upTo); this.counted = true; this.fails++; } this.resync = true; }
+
+  // Rule 12: the count goes back to 0 only for a connection that proved itself: caught up to welcome.seq
+  // and still connected 10 s later (`upTo`: when it stopped being good). Looked at when the next wait is
+  // worked out, once per connection.
+  proven(upTo = this.now()) {
+    if (this.goodAt !== null && upTo - this.goodAt >= CONNECT_TIMEOUT_MS) this.fails = 0;
+    this.goodAt = null;
+  }
+
+  /**
+   * The caller's socket closed or errored without the replica asking for it (`resync` was not set): a drop
+   * before `welcome`, mid catch-up, or later. Counts toward the rule-12 backoff like a timeout does, once
+   * per connection, and sets `resync`. Pending ops and the copy are kept. A close never resets the count,
+   * clean or not, and neither does a welcome: only a connection that caught up and then stayed up 10 s
+   * does, so a server that welcomes and then drops still meets growing waits. Don't call it for a close
+   * the caller started itself.
+   */
+  connectionFailed() { if (this.helloAt !== null && !this.resync) this.failed(); this.helloAt = null; }
+
   /** ms to wait before opening the next connection (rule 12): min(30 s, 0.5 s × 2^k) × a random factor in [0.5, 1). */
-  reconnectWait() { return Math.min(BACKOFF.maxMs, BACKOFF.baseMs * 2 ** Math.min(this.fails, 16)) * (0.5 + this.random() / 2); }
+  reconnectWait() { this.proven(); return Math.min(BACKOFF.maxMs, BACKOFF.baseMs * 2 ** Math.min(this.fails, 16)) * (0.5 + this.random() / 2); }
 
   /** ms until the pace lets the next waiting op go (0 = now), or null if none is waiting on the pace. */
   paceWait() {
@@ -239,7 +263,7 @@ export class Replica {
     if (other) for (const id of [...this.pending.keys()]) { this.pending.delete(id); did.dropped.push(id); }
     this.welcomed = true; this.role = msg.role; this.user = msg.user; this.target = msg.seq; this.horizon = msg.horizon ?? 0;
     this.progressAt = this.now();
-    if (this.applied >= this.target) this.fails = 0;
+    if (this.applied >= this.target) this.goodAt = this.now();
     if (other) { if (did.dropped.length) { this.discarded = (this.discarded ?? 0) + did.dropped.length; this.discard(did); } return; }
     // The room has forgotten this client (§ Op ids): ops sent before its horizon may or may not have been
     // logged, and the room would answer `stale`. Drop them now, and start over from the room's copy.
@@ -273,7 +297,7 @@ export class Replica {
       if (e.stream === "records") { this.confirmedRecords.apply(e.op, e.by, e.at, e.name ?? null); this.recordsRev++; }
       else if (this.streams[e.stream]) {
         for (const el of e.op.elements ?? []) {
-          this.previews.delete(el.id); this.previewOf.delete(el.id);
+          this.dropPreview(e.stream, el.id);
           if (e.stream === "notes" && !this.noteAuthor.has(el.id)) this.noteAuthor.set(el.id, e.by);
         }
         if (e.op.elements) this.streams[e.stream].apply({ elements: e.op.elements });
@@ -286,7 +310,7 @@ export class Replica {
       did.entries.push(e);
     }
     if (did.entries.length && this.pending.size) this.restampAll(p => p.msg.sentAt === undefined);
-    if (this.welcomed && this.applied >= this.target) this.fails = 0;   // caught up: the connection is good
+    if (this.welcomed && this.applied >= this.target && this.goodAt === null) this.goodAt = this.now();   // caught up; proven 10 s from now
     this.settle(did);
     this.afterAnswers(did);   // an applied entry answers a resend as well as an ack does
   }
@@ -300,7 +324,7 @@ export class Replica {
 
   error(msg, did) {
     if (msg.code === "version") { this.stopped = "version"; return; }
-    if (msg.code === "unavailable") { if (!this.resync) this.fails++; this.resync = true; return; }   // not a refusal: every pending op is kept
+    if (msg.code === "unavailable") { this.failed(); return; }   // not a refusal: every pending op is kept
     if (msg.code === "auth") { this.needAuth = true; return; }        // kept too; sign in again, then reconnect
     const p = msg.id !== undefined ? this.pending.get(msg.id) : null;
     if (!p) return;
@@ -323,15 +347,32 @@ export class Replica {
   presence(msg) {
     const t = this.now();
     for (const m of msg.batch ?? []) {
-      if (m.k === "preview") for (const el of m.elements ?? []) { this.previews.set(el.id, el); this.previewOf.set(el.id, { user: m.user, client: m.client, at: t }); }
-      else if (m.k === "leave") for (const [id, o] of this.previewOf) if (o.user === m.user && o.client === m.client) { this.previews.delete(id); this.previewOf.delete(id); }
+      if (m.k === "preview" && ELEMENT_STREAMS.includes(m.stream)) for (const el of m.elements ?? []) {
+        this.previewBy.set(`${m.stream}\n${el.id}`, { stream: m.stream, el, user: m.user, client: m.client, at: t });
+        this.previews.set(el.id, el);
+      } else if (m.k === "leave") for (const o of [...this.previewBy.values()]) if (o.user === m.user && o.client === m.client) this.dropPreview(o.stream, o.el.id);
     }
+  }
+
+  dropPreview(stream, id) {
+    if (!this.previewBy.delete(`${stream}\n${id}`)) return;
+    // The all-streams view keeps the id while another stream still previews an element with it.
+    const other = ELEMENT_STREAMS.map(s => this.previewBy.get(`${s}\n${id}`)).find(Boolean);
+    if (other) this.previews.set(id, other.el); else this.previews.delete(id);
   }
 
   /** Drop previews not updated for 5 s (§ Presence). Call it from the render loop. */
   prunePreviews() {
     const t = this.now();
-    for (const [id, o] of this.previewOf) if (t - o.at >= PREVIEW_TTL_MS) { this.previews.delete(id); this.previewOf.delete(id); }
+    for (const o of [...this.previewBy.values()]) if (t - o.at >= PREVIEW_TTL_MS) this.dropPreview(o.stream, o.el.id);
+  }
+
+  /** Others' live previews on one stream (expired ones dropped first): what a view bound to that stream draws. */
+  previewsOf(stream) {
+    this.prunePreviews();
+    const out = [];
+    for (const o of this.previewBy.values()) if (o.stream === stream) out.push(o.el);
+    return out;
   }
 
   // Shown appState = the room's order, with this client's unacknowledged patches on top.

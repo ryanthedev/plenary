@@ -164,7 +164,7 @@ test("rule 2's timeout counts from the send, not from waiting on the pace; then 
   expect([a.r.pending.size, d.log.entries.length]).toEqual([0, 101]);
 });
 
-test("rule 12: no welcome, or no catch-up progress, for 10 s asks for a reconnect; waits grow, with jitter, and reset once caught up", () => {
+test("rule 12: no welcome, or no catch-up progress, for 10 s asks for a reconnect; waits grow, with jitter, and reset after a proven connection", () => {
   const d = direct(), clock = { t: 0 }, other = link(d, clock, "u0", "editor", "o").open().sync();
   other.r.local("board", { elements: [rect("x")] }); other.sync();
   let roll = 0;
@@ -188,10 +188,11 @@ test("rule 12: no welcome, or no catch-up progress, for 10 s asks for a reconnec
   r.receive({ t: "welcome", seq: 1, role: "editor", user: "u1", high: 0, horizon: 0, rv: 1 });
   clock.t += 9000;
   r.receive({ t: "entries", entries: [d.log.entries[0]] });                   // progress: caught up
-  expect(r.fails).toBe(0);
+  expect(r.fails).toBe(12);                                                   // caught up is not yet proven
   clock.t += 60_000; r.outgoing();
   expect(r.resync).toBe(false);                                               // an idle, healthy connection never times out
-  expect(r.reconnectWait()).toBe(250);
+  expect(r.reconnectWait()).toBe(250);                                        // it stayed up: the next wait starts over
+  expect(r.fails).toBe(0);
 });
 
 test("unavailable and auth are not refusals: pending ops are kept, the copy is kept; version stops the client", () => {
@@ -206,7 +207,7 @@ test("unavailable and auth are not refusals: pending ops are kept, the copy is k
   clock.t += 60_000;                                                          // no timer may turn a refusal into a blind retry
   expect([a.r.outgoing(), a.r.wait(), a.r.resync, a.r.fails]).toEqual([[], null, false, 1]);
   a.open().sync();
-  expect([a.r.pending.size, d.log.entries.length, a.r.fails]).toEqual([0, 2, 0]);
+  expect([a.r.pending.size, d.log.entries.length, a.r.fails]).toEqual([0, 2, 1]);   // caught up, not yet proven
   const b = link(d, clock, "u2", "editor", "b").open().sync();
   b.r.local("board", { elements: [rect("never")] });
   b.r.receive({ t: "entries", entries: [{ ...d.log.entries[0], seq: 3, rv: 99 }] });                // rules this app doesn't know
@@ -304,4 +305,98 @@ test("previews expire after 5 s, clear on leave and on the final op's entry", ()
   r.receive({ t: "presence", batch: [{ user: "u9", client: "y", k: "leave" }] });
   expect([...r.previews.keys()]).toEqual(["three"]);
   expect(r.streams.board.getAny("three")).toBe(null);                         // never merged into the board
+});
+
+test("previews are kept per stream: a notes view never lists board previews, and one stream's final op clears only its own", () => {
+  const clock = { t: 0 }, r = new Replica({ client: "p", now: () => clock.t });
+  const batch = (stream, id, extra = {}) => ({ t: "presence", batch: [{ user: "u9", client: "x", k: "preview", stream, elements: [rect(id, extra)] }] });
+  r.receive(batch("board", "b1")); r.receive(batch("notes", "n1")); r.receive(batch("board", "same", { x: 1 })); r.receive(batch("notes", "same", { x: 2 }));
+  expect(r.previewsOf("board").map(el => el.id).sort()).toEqual(["b1", "same"]);
+  expect(r.previewsOf("notes").map(el => [el.id, el.x]).sort()).toEqual([["n1", 0], ["same", 2]]);
+  expect(r.previewsOf("records")).toEqual([]);
+  expect([...r.previews.keys()].sort()).toEqual(["b1", "n1", "same"]);          // the all-streams view older callers use
+  r.receive({ t: "presence", batch: [{ user: "u9", client: "x", k: "preview", elements: [rect("no-stream")] }] });   // no stream: ignored
+  expect(r.previews.has("no-stream")).toBe(false);
+  // The final op for "same" lands on the board: the board preview goes, the notes one stays.
+  r.receive({ t: "welcome", seq: 0, role: "viewer", user: "u1", horizon: 0, rv: 1 });
+  r.receive({ t: "entries", entries: [{ seq: 1, board: "b1", tenant: "t1", stream: "board", op: { elements: [rect("same")] }, by: "u9", id: "x:1", at: 1, rv: 1 }] });
+  expect(r.previewsOf("board").map(el => el.id)).toEqual(["b1"]);
+  expect(r.previewsOf("notes").map(el => el.id).sort()).toEqual(["n1", "same"]);
+  expect(r.previews.get("same").x).toBe(2);
+  clock.t += 4000; r.receive(batch("notes", "n1"));                           // refreshed; the rest expire at 5 s
+  clock.t += 1000;
+  expect([r.previewsOf("board"), r.previewsOf("notes").map(el => el.id), [...r.previews.keys()]]).toEqual([[], ["n1"], ["n1"]]);
+  r.receive({ t: "presence", batch: [{ user: "u9", client: "x", k: "leave" }] });
+  expect(r.previewsOf("notes")).toEqual([]);
+});
+
+test("a socket that drops counts toward the backoff: before welcome, after it, once per connection; only catching up resets it", () => {
+  const d = direct(), clock = { t: 0 }, a = link(d, clock);
+  const m = a.r.local("board", { elements: [rect("kept")] });
+  const waits = [];
+  for (let i = 0; i < 4; i++) {                                               // the socket dies before any welcome, four times
+    a.r.connectMessages("tok", "b1");
+    a.r.connectionFailed();
+    expect([a.r.resync, a.r.outgoing(), a.r.wait()]).toEqual([true, [], null]);
+    waits.push(a.r.reconnectWait());
+  }
+  expect(waits).toEqual([500, 1000, 2000, 4000]);                             // min(30 s, 0.5 s × 2^k) × 0.5 (the test's random is 0)
+  expect([a.r.fails, a.r.pending.size, a.r.pending.has(m.id)]).toEqual([4, 1, true]);
+  a.r.connectMessages("tok", "b1");                                           // welcomed, then dropped mid catch-up: still a failure
+  a.r.receive({ t: "welcome", seq: 5, role: "editor", user: "u1", high: 0, horizon: 0, rv: 1 });
+  a.r.connectionFailed(); a.r.connectionFailed();                             // told twice (error, then close): counted once
+  expect(a.r.fails).toBe(5);
+  a.r.connectMessages("tok", "b1");                                           // a timeout and then the close it causes: counted once
+  clock.t += 10_000; a.r.outgoing(); a.r.connectionFailed();
+  expect(a.r.fails).toBe(6);
+  a.r.connectMessages("tok", "b1");                                           // `unavailable`, then the server's close: once
+  a.r.receive({ t: "error", code: "unavailable", message: "moving" }); a.r.connectionFailed();
+  expect(a.r.fails).toBe(7);
+  a.open().sync();                                                            // a good connection: caught up, and it stays up
+  expect([a.r.fails, a.r.pending.size, d.log.entries.length]).toEqual([7, 0, 1]);
+  clock.t += 10_000;
+  a.r.connectionFailed();                                                     // proven, then dropped: counted as the first failure
+  expect([a.r.fails, a.r.resync, a.r.applied, a.r.reconnectWait()]).toEqual([1, true, 1, 500]);
+  const idle = new Replica({ client: "never", now: () => clock.t });
+  idle.connectionFailed();                                                    // no connection was ever started: nothing to count
+  expect([idle.fails, idle.resync]).toEqual([0, false]);
+});
+
+test("a server that welcomes and then drops still meets growing waits; only 10 s of staying up after catch-up starts them over", () => {
+  const d = direct(), clock = { t: 0 }, a = link(d, clock);
+  const drops = [], timeouts = [];
+  for (let i = 0; i < 6; i++) {                                               // an idle board: welcome.seq == applied, then the socket drops
+    a.open().sync();
+    expect([a.r.welcomed, a.r.applied, a.r.target]).toEqual([true, 0, 0]);
+    clock.t += 9999;                                                          // not quite 10 s
+    a.r.connectionFailed();
+    drops.push(a.r.reconnectWait());
+  }
+  expect(drops).toEqual([500, 1000, 2000, 4000, 8000, 15_000]);
+  a.open().sync(); clock.t += 10_000;                                         // this one stays up 10 s: proven
+  a.r.connectionFailed();
+  expect([a.r.reconnectWait(), a.r.fails]).toEqual([500, 1]);
+  // The same with an op that gets no answer for 10 s on each connection (welcomed, caught up, then silence).
+  const b = link(d, clock, "u2", "editor", "b");
+  for (let i = 0; i < 6; i++) {
+    b.open().sync();
+    b.r.local("board", { elements: [rect(`t${i}`)] });
+    b.r.outgoing();                                                           // written; the answer never comes
+    clock.t += 9999; b.r.outgoing(); expect(b.r.resync).toBe(false);
+    clock.t += 1; b.r.outgoing(); expect(b.r.resync).toBe(true);
+    timeouts.push(b.r.reconnectWait());
+  }
+  expect(timeouts).toEqual([500, 1000, 2000, 4000, 8000, 15_000]);
+  expect(b.r.pending.size).toBe(1);                                           // each was resent and acked on the next connection; the last is kept
+  // A connection that worked for 10 s and only then went silent is a first failure again.
+  b.open().sync(); clock.t += 10_000;
+  b.r.local("board", { elements: [rect("late")] }); b.r.outgoing();
+  clock.t += 10_000; b.r.outgoing();
+  expect([b.r.resync, b.r.reconnectWait()]).toEqual([true, 500]);
+  // A refusal's resync after a long healthy connection is not held back by old failures.
+  b.open().sync(); clock.t += 10_000;
+  const bad = b.r.local("board", { appState: { bogus: 1 } });
+  d.room.receive(b.c, JSON.parse(JSON.stringify(b.r.outgoing()[0])), { n: ++b.n });
+  b.down();
+  expect([b.r.resync, b.r.pending.has(bad.id), b.r.reconnectWait(), b.r.fails]).toEqual([true, false, 250, 0]);
 });

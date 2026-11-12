@@ -104,3 +104,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 CEO: recycle threshold stays at 60%; the CEO may refresh sessions themselves at any time (a session the CEO restarts resumes from its handoff/report files).
 - 2026-11-11 client: p6-ports DONE 4850319 (round 2 PASS; bun test 588/0, re-run by manager). t18r, t1b9 closed. p6-hex waits on the p2-land merge; proxy asked client to start the file-disjoint slice now (new files only).
 - 2026-11-11 platform: p5-code DONE 3f6b489 (one-time #code + POST /auth/exchange, no token in any URL; one origin enforced; verifier PASS + re-check PASS in real Chromium; bun test 510/0). Google sign-in re-asked of the CEO.
+- 2026-11-11 client: p6-edge (t1cy) building on main, new files only (file-disjoint slice of p6-hex) while p2-land merges.

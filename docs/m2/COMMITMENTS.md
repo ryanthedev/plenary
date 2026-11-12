@@ -97,3 +97,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 platform: p5-hex DONE 02b7434 (auth/admin ports and adapters, IdP and Verifier contract tests, import-rule test; bun test 376/0). p5-code started (t196).
 - 2026-11-11 platform: p5-google DONE 95971bd (dev harness + live check; secret scan 0 hits; bun test 478/0). CEO asked for one human Google login.
 - 2026-11-11 platform: drawh 3b FAIL (undo lost when a peer change lands in between); hard stop: scope cut ships (while connected, settings flow room to file only; a loud line on file-side changes). File-side settings return in drawh round 4 on v1.1 compare-and-set.
+- 2026-11-11 client: p6-ports FAIL, 4 HIGH (contract tests too weak); fix round in t18r.

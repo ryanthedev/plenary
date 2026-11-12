@@ -72,6 +72,18 @@ Swap every `SEAM(p2)` in the server to the phase 2 protocol (packages/protocol a
 - **Postgres least privilege** (p4-pgv MEDIUM): the app role must work without owning the tables: skip DDL when the
   schema already exists, or a separate migrate step. Test it with a non-owner role.
 
+## Also: two gateway gaps from the security review of 7b6a5dd (both MEDIUM)
+
+- **Live queue cap:** gateway.js caps a connection's queued bytes only before it is `live`. Apply a per-connection
+  byte cap to `c.q` (and to whatever queues ops toward the room) in every state; past it, stop reading or close with
+  `limit`. Together with the per-connection op bucket above.
+- **Revocation:** a connection keeps the role it had at hello. When a grant, invite or link changes (Registry
+  mutation), the board's live connections must be re-checked: publish a per-board "grants changed" message, and the
+  gateway re-runs `auth.role` for its connections on that board and closes or downgrades the ones that no longer
+  qualify. Also close a connection when its token's expiry passes (keep `exp` from verify). If the Registry side
+  needs platform code (server/auth/, server/registry/ are theirs), put a port-level hook in the gateway, test it
+  with a fake, and write in your report what platform must call.
+
 ## Done when
 
 - In the worktree: `bun test test/*.test.js test/server test/auth` all green (test/web is client's, in progress);

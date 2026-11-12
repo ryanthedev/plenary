@@ -138,7 +138,7 @@ which never switches the window.
 ## The proxy's input is the CEO's (CEO, 2026-11-12: "this input is my space. that's why it says talk here")
 
 - **Nobody types into the proxy's session:** no `herdr_agent prompt`, `hc send`, `hc keys` or SendMessage to the
-  proxy. Only the CEO and the owner (relaying CEO rules) write there.
+  proxy. Only the CEO writes there. The owner leaves CEO rules in OFFICE.md (committed); the proxy reads git log.
 - **Managers report through tools:** end the turn with one short message (outcome first, report path) and keep
   docs/m2/reports/manager-<track>.md current. The proxy's `herdr_agent watch` delivers the last message; the
   proxy reads the report. Something urgent: say so in the first words of that last message.

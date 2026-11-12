@@ -1,0 +1,184 @@
+// The hexagonal import rule for server/auth and server/admin (docs/m2/OFFICE.md "Architecture"; brief p5-hex).
+// Engine owns the repo-wide test/architecture.test.js; this one covers platform's folders only.
+//
+//   port      a port module: typedefs, shared port pieces (mint, RegistryError), no adapter code
+//   core      application logic that depends only on ports (and other core)
+//   adapter   a driven adapter (implements a port: memory Registry, Google IdP, session / dev verifiers)
+//   driving   a driving adapter (HTTP): calls into the core; gets its driven adapters injected
+//
+// Rules, for every file in scope:
+//   1. it is classified in CLASSES below (a new file must be added, on purpose);
+//   2. it imports no `adapter` and no `driving` file (adapters never import each other; the core and the ports
+//      never import an adapter; http.js gets adapters injected), counting static `import`/`export … from`,
+//      `import()` and JSDoc `import("…")` types;
+//   3. it imports nothing outside server/auth and server/admin by relative path (no reaching into another
+//      folder's adapters).
+// And inbound, for every other file under server/: only the composition root (server/main.js) may import an
+// auth/admin `adapter` or `driving` file.
+
+import { test, expect } from "bun:test";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join, dirname, posix } from "node:path";
+
+const ROOT = join(import.meta.dir, "..", "..");
+
+/** @type {Record<string, "port"|"core"|"adapter"|"driving">} */
+export const CLASSES = {
+  "server/auth/registry-port.js": "port",    // Registry typedefs, mint, RegistryError
+  "server/auth/idp-port.js": "port",         // Identity, the IdP port (begin/finish), the Verifier port
+  "server/auth/port.js": "port",             // the Auth port (verify, role) and authPort, composed over injected verifiers + tenancy
+  "server/auth/util.js": "core",             // roles, base64url, ids: pure helpers
+  "server/auth/tenancy.js": "core",          // role resolution over the Registry port
+  "server/admin/boards.js": "core",          // admin use cases over the Registry port
+  "server/auth/registry.js": "adapter",      // in-memory Registry
+  "server/auth/oidc.js": "adapter",          // Google OIDC (IdP port)
+  "server/auth/session.js": "adapter",       // session tokens (Verifier port, plus issue())
+  "server/auth/dev.js": "adapter",           // dev tokens (Verifier port)
+  "server/auth/http.js": "driving",          // HTTP routes
+};
+const SCOPE = ["server/auth", "server/admin"];
+const COMPOSITION_ROOTS = ["server/main.js"];
+
+
+/**
+ * Relative imports in `src`, each `{ spec, kind }`: kind "runtime" for static import/export-from (spaced or not),
+ * side-effect import, import() with a quoted or template-literal specifier, and require(); "type" for a JSDoc
+ * `import("…")` (an import() on a comment line). A static import or require() on a comment line is ignored.
+ * Not caught (unusual here; verifier p5-hexv LOW 3): a block comment between import and its "(", import.meta.resolve, an apostrophe
+ * inside a comment within a multi-line import.
+ */
+export function importsOf(src) {
+  const out = new Map();
+  const add = (spec, kind) => out.set(spec + " " + kind, { spec, kind });
+  const stat = /(?:^|[;\s{}])(import|export)\b\s*(?:[^"'\x60;]*?\bfrom\s*)?["'](\.{1,2}\/[^"']+)["']/g;
+  const dyn = /\bimport\(\s*(["'\x60])(\.{1,2}\/[^"'\x60$]+)\1\s*\)/g;
+  const req = /\brequire\(\s*(["'\x60])(\.{1,2}\/[^"'\x60$]+)\1\s*\)/g;
+  // The keyword's own position decides "on a comment line" (for `export`, too: p5-hexv MEDIUM 1).
+  for (const m of src.matchAll(stat)) if (!onComment(src, m.index + m[0].indexOf(m[1]))) add(m[2], "runtime");
+  for (const m of src.matchAll(dyn)) add(m[2], onComment(src, m.index) ? "type" : "runtime");
+  for (const m of src.matchAll(req)) if (!onComment(src, m.index)) add(m[2], "runtime");
+  return [...out.values()];
+}
+
+/** Is position `i` on a comment line (starts with //, /*, or * after indentation)? */
+function onComment(src, i) {
+  const line = src.slice(src.lastIndexOf("\n", i - 1) + 1, i).trimStart();
+  return line.startsWith("//") || line.startsWith("/*") || line.startsWith("*");
+}
+
+/** `spec` imported from repo-relative `from`, as a repo-relative posix path. */
+const resolve = (from, spec) => posix.normalize(posix.join(posix.dirname(from), spec));
+
+const inScope = p => SCOPE.some(d => p.startsWith(d + "/"));
+
+/**
+ * The rule as a pure function.
+ * @param {{ path: string, src: string }[]} files   repo-relative paths
+ * @param {Record<string, string>} classes
+ * @returns {string[]} violations, each "from -> to: why"
+ */
+export function violations(files, classes, roots = COMPOSITION_ROOTS) {
+  const out = [];
+  const bad = to => classes[to] === "adapter" || classes[to] === "driving";
+  for (const { path, src } of files) {
+    const targets = importsOf(src).map(({ spec, kind }) => ({ to: resolve(path, spec), kind }));
+    if (inScope(path)) {
+      if (!classes[path]) { out.push(`${path}: unclassified (add it to CLASSES)`); continue; }
+      for (const { to, kind } of targets) {
+        const k = `${path} -> ${to} [${kind}]`;
+        if (!inScope(to)) out.push(`${k}: reaches outside server/auth and server/admin`);
+        else if (!classes[to]) out.push(`${k}: imports an unclassified path (extensionless? add it to CLASSES)`);
+        else if (bad(to)) out.push(`${k}: ${classes[path]} imports ${classes[to]}`);
+      }
+    } else if (!roots.includes(path)) {
+      for (const { to, kind } of targets)
+        if (inScope(to) && (bad(to) || !classes[to])) out.push(`${path} -> ${to} [${kind}]: only a composition root may import ${classes[to] ?? "an unclassified path"}`);
+    }
+  }
+  return out;
+}
+
+function walk(dir) {
+  const out = [];
+  for (const name of readdirSync(join(ROOT, dir))) {
+    const rel = dir + "/" + name;
+    if (statSync(join(ROOT, rel)).isDirectory()) out.push(...walk(rel));
+    else if (rel.endsWith(".js")) out.push({ path: rel, src: readFileSync(join(ROOT, rel), "utf8") });
+  }
+  return out;
+}
+
+const key = v => v.slice(0, v.indexOf("]:") + 1);
+
+test("server/auth and server/admin follow the hexagonal import rule", () => {
+  expect(violations(walk("server"), CLASSES)).toEqual([]);
+});
+
+test("every classified file exists", () => {
+  for (const p of Object.keys(CLASSES)) expect(statSync(join(ROOT, p)).isFile()).toBe(true);
+});
+
+// ---- the checker itself, on synthetic sources (a re-introduced violation of each kind fails) ----
+
+const C = { "server/auth/a.js": "adapter", "server/auth/b.js": "adapter", "server/auth/c.js": "core",
+  "server/auth/p.js": "port", "server/auth/h.js": "driving" };
+const one = (path, src) => violations([{ path, src }], C);
+
+test("checker: adapter -> adapter by static import", () => {
+  expect(one("server/auth/a.js", `import { x } from "./b.js";`)).toEqual(["server/auth/a.js -> server/auth/b.js [runtime]: adapter imports adapter"]);
+  expect(one("server/auth/a.js", `import {\n  x,\n  y,\n} from "./b.js"`)).toHaveLength(1);
+  expect(one("server/auth/a.js", `export { x } from "./b.js";`)).toHaveLength(1);
+  expect(one("server/auth/a.js", `import "./b.js";`)).toHaveLength(1);
+});
+
+test("checker: core -> adapter by import() and by a JSDoc type", () => {
+  expect(one("server/auth/c.js", `const m = await import("./a.js");`)).toHaveLength(1);
+  expect(one("server/auth/c.js", `/** @typedef {import("./a.js").T} T */`)).toEqual(["server/auth/c.js -> server/auth/a.js [type]: core imports adapter"]);
+  expect(one("server/auth/p.js", `/** @param {import('./a.js').T} t */`)).toHaveLength(1);
+});
+
+test("checker: driving -> adapter, and reaching outside the scope", () => {
+  expect(one("server/auth/h.js", `import { a } from "./a.js";`)).toHaveLength(1);
+  expect(one("server/auth/c.js", `import { s } from "../store/sqlite.js";`)).toEqual(["server/auth/c.js -> server/store/sqlite.js [runtime]: reaches outside server/auth and server/admin"]);
+});
+
+test("checker: allowed imports, look-alikes and unclassified files", () => {
+  expect(one("server/auth/a.js", `import { x } from "./p.js"; import { y } from "./c.js"; /** @type {import("./p.js").T} */`)).toEqual([]);
+  expect(one("server/auth/a.js", `const k = await crypto.subtle.importKey("raw", raw, {}, false, []);`)).toEqual([]);
+  expect(one("server/auth/a.js", `import { SQL } from "bun";`)).toEqual([]);
+  expect(one("server/auth/new.js", `export const x = 1;`)).toEqual(["server/auth/new.js: unclassified (add it to CLASSES)"]);
+});
+
+test("checker: inbound, only a composition root imports an auth adapter", () => {
+  expect(one("server/registry/x.js", `import { mint } from "../auth/a.js";`)).toEqual(["server/registry/x.js -> server/auth/a.js [runtime]: only a composition root may import adapter"]);
+  expect(one("server/registry/x.js", `import { mint } from "../auth/p.js";`)).toEqual([]);
+  expect(one("server/main.js", `import { a } from "./auth/a.js";`)).toEqual([]);
+});
+
+test("checker: a runtime import and a JSDoc type of the same file are reported separately", () => {
+  const src = `import { mint } from "../auth/a.js";\n/** @returns {import("../auth/a.js").R} */`;
+  const v = one("server/registry/x.js", src);
+  expect(v.map(key).sort()).toEqual(["server/registry/x.js -> server/auth/a.js [runtime]", "server/registry/x.js -> server/auth/a.js [type]"]);
+});
+
+test("checker: an export … from / export * from directly below a comment line is caught (p5-hexv MEDIUM 1)", () => {
+  expect(one("server/auth/c.js", `// Convenience re-export for callers.\nexport { a } from "./a.js";`)).toEqual(["server/auth/c.js -> server/auth/a.js [runtime]: core imports adapter"]);
+  expect(one("server/auth/c.js", `/** doc */\nexport * from "./a.js";`)).toHaveLength(1);
+  expect(one("server/auth/c.js", ` * see below\nimport { a } from "./a.js";`)).toHaveLength(1);
+  // still ignored: the same lines commented out
+  expect(one("server/auth/c.js", `// export { a } from "./a.js";\n// import { a } from "./a.js";\n * export * from "./a.js";`)).toEqual([]);
+});
+
+test("checker: unspaced import, template-literal import() and require() (p5-hexv LOW 3)", () => {
+  expect(one("server/auth/c.js", `import{a}from"./a.js";`)).toHaveLength(1);
+  expect(one("server/auth/c.js", `export*from"./a.js";`)).toHaveLength(1);
+  expect(one("server/auth/c.js", "const m = await import(`./a.js`);")).toHaveLength(1);
+  expect(one("server/auth/c.js", `const m = require("./a.js");`)).toEqual(["server/auth/c.js -> server/auth/a.js [runtime]: core imports adapter"]);
+  expect(one("server/auth/c.js", `// const m = require("./a.js");`)).toEqual([]);
+  expect(one("server/auth/c.js", `export const x = "./a.js"; export function f() { return "./a.js"; }`)).toEqual([]);
+});
+
+test("checker: an extensionless or unknown in-scope target is a violation", () => {
+  expect(one("server/auth/a.js", `import { x } from "./b";`)).toEqual(["server/auth/a.js -> server/auth/b [runtime]: imports an unclassified path (extensionless? add it to CLASSES)"]);
+  expect(one("server/registry/x.js", `import { x } from "../auth/a";`)).toHaveLength(1);
+});

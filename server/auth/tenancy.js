@@ -12,9 +12,9 @@
 
 import { higher, capTo, ROLES, LINK_ROLES, INVITE_ROLES } from "./util.js";
 
-/** @typedef {import("./registry.js").Registry} Registry */
-/** @typedef {import("./registry.js").Role} Role */
-/** @typedef {import("./oidc.js").Identity} Identity */
+/** @typedef {import("./registry-port.js").Registry} Registry */
+/** @typedef {import("./registry-port.js").Role} Role */
+/** @typedef {import("./idp-port.js").Identity} Identity */
 
 const live = (x, t) => x && !x.revoked && (x.expiresAt == null || t < x.expiresAt);
 

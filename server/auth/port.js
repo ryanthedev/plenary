@@ -1,4 +1,6 @@
-// The Auth port adapter (PROTOCOL.md § Auth): the only thing the gateway imports from server/auth.
+// The Auth port (PROTOCOL.md § Auth), and `authPort`, its one implementation: a composition over injected Verifier
+// adapters (session.js, dev.js) and tenancy.js, importing no adapter. The only thing the gateway imports from
+// server/auth. The Identity and Verifier types it uses live in idp-port.js.
 //   verify(token) → Promise<{ user, name, email, domain } | null>
 //   role(identity, board) → Promise<role | null>
 // The gateway awaits both (plus the board lookup) before it forwards a hello; the room sees only {user, role, client}.
@@ -12,11 +14,17 @@
 // verifier that fails) are NOT refusals: they propagate, and the gateway answers `unavailable`. So verifiers and
 // tenancy.role return null for "not mine / invalid" and let genuine failures escape; nothing here catches.
 
-/** @typedef {import("./oidc.js").Identity} Identity */
+/**
+ * The Auth port, as the gateway sees it.
+ * @typedef {import("./idp-port.js").Identity} Identity
+ * @typedef {import("./idp-port.js").Verifier} Verifier
+ * @typedef {{ verify(token: unknown): Promise<Identity|null>, role(id: Identity, board: string): Promise<string|null> }} Auth
+ */
 
 /**
- * @param {{ sessions?: { verify(t: string): Promise<Identity|null> }, dev?: { verify(t: string): Promise<Identity|null> },
+ * @param {{ sessions?: Verifier, dev?: Verifier,
  *   tenancy: { role(id: Identity, board: string): Promise<string|null> } }} deps
+ * @returns {Auth}
  */
 export function authPort({ sessions, dev, tenancy }) {
   const verifiers = [sessions, dev].filter(Boolean);

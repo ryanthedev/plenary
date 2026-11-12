@@ -2,7 +2,7 @@
 // `{ enabled: true, tokens }` explicitly (`tokens` a plain object or a Map; every entry needs a name); with no config, or enabled without a table, every token is refused.
 // Dev users are namespaced "dev:<name>", so they can never collide with a Google user ("google:<sub>").
 
-/** @typedef {import("./oidc.js").Identity} Identity */
+/** @typedef {import("./idp-port.js").Identity} Identity */
 
 /** @param {{ enabled?: boolean, tokens?: Record<string, { name: string, email?: string, domain?: string }> }} [config] */
 export function devAuth(config) {

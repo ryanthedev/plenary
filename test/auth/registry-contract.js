@@ -1,4 +1,4 @@
-// The Registry contract (PROTOCOL.md § Registry; typedef in server/auth/registry.js), as reusable bun tests.
+// The Registry contract (PROTOCOL.md § Registry; typedef in server/auth/registry-port.js), as reusable bun tests.
 // Every Registry adapter (memory here; SQLite / Postgres in the engine) runs the same suite:
 //
 //   import { registryContract } from "<repo>/test/auth/registry-contract.js";
@@ -12,7 +12,7 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 
 /**
  * @param {string} name
- * @param {(o: { now: () => number }) => Promise<import("../../server/auth/registry.js").Registry>} makeRegistry
+ * @param {(o: { now: () => number }) => Promise<import("../../server/auth/registry-port.js").Registry>} makeRegistry
  * @param {{ cleanup?: (r: any) => Promise<void>|void }} [opts]
  */
 export function registryContract(name, makeRegistry, opts = {}) {

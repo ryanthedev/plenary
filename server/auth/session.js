@@ -9,7 +9,7 @@
 
 import { b64url, unb64url, utf8, fromUtf8 } from "./util.js";
 
-/** @typedef {import("./oidc.js").Identity} Identity */
+/** @typedef {import("./idp-port.js").Identity} Identity */
 
 /** @param {{ key: Uint8Array|string, ttlSec?: number, now?: () => number }} config */
 export async function sessions({ key, ttlSec = 12 * 3600, now = Date.now }) {

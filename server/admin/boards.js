@@ -12,8 +12,8 @@
 
 import { ROLES, LINK_ROLES, INVITE_ROLES, normEmail } from "../auth/util.js";
 
-/** @typedef {import("../auth/registry.js").Registry} Registry */
-/** @typedef {import("../auth/oidc.js").Identity} Identity */
+/** @typedef {import("../auth/registry-port.js").Registry} Registry */
+/** @typedef {import("../auth/idp-port.js").Identity} Identity */
 
 export class AdminError extends Error {
   /**

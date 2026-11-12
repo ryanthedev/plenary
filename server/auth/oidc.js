@@ -14,7 +14,7 @@ export const GOOGLE = {
   issuers: ["https://accounts.google.com", "accounts.google.com"],
 };
 
-/** @typedef {{ user: string, name: string|null, email: string|null, domain: string|null }} Identity */
+/** @typedef {import("./idp-port.js").Identity} Identity */
 
 // ---- PKCE (RFC 7636) ----
 
@@ -185,6 +185,7 @@ export async function verifyIdToken(token, { clientId, nonce, keys, now = Date.n
 /**
  * @param {{ clientId: string, clientSecret: string, redirectUri: string, fetch: typeof fetch,
  *   now?: () => number, skewSec?: number, jwksCooldownMs?: number, timeoutMs?: number }} config
+ * @returns {import("./idp-port.js").IdP & { keys: ReturnType<typeof jwksCache>, verifyIdToken(token: string, nonce: string): Promise<Identity|null> }}
  */
 export function googleOidc(config) {
   const { clientId, clientSecret, redirectUri, fetch, now = Date.now, skewSec = 60 } = config;
@@ -209,7 +210,8 @@ export function googleOidc(config) {
      * Finish sign-in: check `state`, exchange the code (with the PKCE verifier), verify the ID token.
      * @returns {Promise<Identity|null>}
      */
-    async finish({ code, state, expected }) {
+    async finish(o) {
+      const { code, state, expected } = o && typeof o === "object" ? o : {};
       const ok = v => typeof v === "string" && v.length > 0;
       if (!expected || !ok(expected.state) || !ok(expected.nonce) || !ok(expected.verifier)) return null;
       if (state !== expected.state) return null;

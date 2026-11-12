@@ -76,7 +76,7 @@ const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
 
 /**
  * @param {{ registry: object, sessions: { issue(id: object): Promise<string>, verify(t: string): Promise<object|null> },
- *   oidc?: { begin(): Promise<{url: string, state: string, nonce: string, verifier: string}>, finish(o: object): Promise<object|null> } | null,
+ *   oidc?: import("./idp-port.js").IdP | null,
  *   tenancy: { redeemLink(id: object, link: string): Promise<{board: string}|null>, tenantOf(id: object): Promise<{id: string}|null> },
  *   now?: () => number, config: object, dev?: { enabled?: boolean, verify(t: string): Promise<object|null> } | null,
  *   testHooks?: { pruned?(p: { visited: number, expired: number, live: number }): void } | null }} deps   (tests only, not an API)

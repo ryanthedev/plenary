@@ -1,63 +1,26 @@
-// The Registry port (PROTOCOL.md § Registry): tenants, the board registry (`Registry.board(id)`; the Store has no
-// board lookup), per-board grants, invites and share links. This file holds the in-memory adapter; the engine backs
-// the same port with SQLite / Postgres, tested by test/auth/registry-contract.js. Method names are STABLE.
-//
-// Last owner: `setGrant` refuses to remove or demote a board's last `owner` grant, throwing an error whose
-// `code` is "last-owner" (match on the code, not the class: other adapters throw their own). The check and the
-// write are one atomic step (here: no await between them; in SQL: one transaction or a conditional write), and a
-// refused call changes nothing. Caller rules (who may grant what) live in server/admin/boards.js.
-//
-// Every method is async. Ids are server-minted over [a-z0-9-] (no ".", "*", ">"), never a domain name, so they
-// are safe in bus subjects (PROTOCOL.md § Bus).
+// The in-memory Registry adapter (tests, single-process dev). The port (typedefs, `mint`, `RegistryError`, the
+// last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
-import { randomId, normEmail } from "./util.js";
+import { normEmail } from "./util.js";
+import { mint, RegistryError } from "./registry-port.js";
 
-/** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code === "last-owner"`. */
-export class RegistryError extends Error {
-  /** @param {"last-owner"} code */
-  constructor(code, message) { super(message); this.name = "RegistryError"; this.code = code; }
-}
+// Re-exported only until engine's registry adapters (server/registry/sqlite.js, postgres.js) import
+// registry-port.js; then delete these lines (brief p5-hex).
+export { mint, RegistryError };
 
 /**
- * @typedef {"owner"|"editor"|"annotator"|"commenter"|"viewer"} Role
- * @typedef {{ id: string, domain: string|null, admins: string[], createdAt: number }} Tenant
- * @typedef {{ id: string, tenant: string, title: string, memberRole: Role|null, createdAt: number }} Board
- * @typedef {{ id: string, board: string, email: string, role: Role, expiresAt: number|null, revoked: boolean, by: string, createdAt: number }} Invite
- * @typedef {{ id: string, board: string, role: Role, expiresAt: number|null, revoked: boolean, by: string, createdAt: number }} Link
- *
- * @typedef {{
- *   createTenant(o: { domain: string|null, admins?: string[] }): Promise<Tenant>,
- *   tenant(id: string): Promise<Tenant|null>,
- *   tenantByDomain(domain: string): Promise<Tenant|null>,
- *   addTenantAdmin(tenant: string, user: string): Promise<void>,
- *   createBoard(o: { tenant: string, title?: string, memberRole?: Role|null }): Promise<Board>,
- *   board(id: string): Promise<Board|null>,
- *   setGrant(board: string, user: string, role: Role|null): Promise<void>,   // rejects code "last-owner" (atomic)
- *   grant(board: string, user: string): Promise<Role|null>,
- *   grants(board: string): Promise<{ user: string, role: Role }[]>,
- *   createInvite(o: { board: string, email: string, role: Role, expiresAt?: number|null, by: string }): Promise<Invite>,
- *   invite(id: string): Promise<Invite|null>,
- *   invites(board: string): Promise<Invite[]>,
- *   invitesFor(board: string, email: string): Promise<Invite[]>,
- *   revokeInvite(id: string): Promise<boolean>,
- *   createLink(o: { board: string, role: Role, expiresAt?: number|null, by: string }): Promise<Link>,
- *   link(id: string): Promise<Link|null>,
- *   links(board: string): Promise<Link[]>,
- *   revokeLink(id: string): Promise<boolean>,
- *   addLinkUse(link: string, user: string): Promise<void>,
- *   linkUses(board: string, user: string): Promise<string[]>,
- * }} Registry
+ * @typedef {import("./registry-port.js").Registry} Registry
+ * @typedef {import("./registry-port.js").Role} Role
+ * @typedef {import("./registry-port.js").Tenant} Tenant
+ * @typedef {import("./registry-port.js").Board} Board
+ * @typedef {import("./registry-port.js").Invite} Invite
+ * @typedef {import("./registry-port.js").Link} Link
  */
 
-/** Tenant ids: "t-" + 12 of [a-z0-9]. Board ids: "b-" + 16. Invite ids: "i-" + 16. Link ids: 26 (≈ 134 bits). */
-export const mint = {
-  tenant: () => "t-" + randomId(12),
-  board: () => "b-" + randomId(16),
-  invite: () => "i-" + randomId(16),
-  link: () => randomId(26),
-};
-
-/** An in-memory Registry (tests, single-process dev). Returns copies, so callers can't mutate its state. */
+/**
+ * An in-memory Registry (tests, single-process dev). Returns copies, so callers can't mutate its state.
+ * @returns {Registry}
+ */
 export function memoryRegistry({ now = Date.now } = {}) {
   /** @type {Map<string, Tenant>} */ const tenants = new Map();
   /** @type {Map<string, string>} */ const byDomain = new Map();

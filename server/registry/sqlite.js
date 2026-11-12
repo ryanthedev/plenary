@@ -15,7 +15,7 @@
 // `user`; insertion order is an explicit `n` column (Postgres: BIGSERIAL / identity), upserts use ON CONFLICT.
 
 import { Database } from "bun:sqlite";
-import { mint } from "../auth/registry.js";
+import { mint } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 
 /** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code`. */
@@ -29,7 +29,7 @@ const str = v => typeof v === "string";
 /**
  * @param {{ path: string, now?: () => number, fullfsync?: boolean, busyTimeoutMs?: number }} o
  *   `path` is a file (":memory:" for throwaway use).
- * @returns {import("../auth/registry.js").Registry & { close(): Promise<void>, pragmas(): object }}
+ * @returns {import("../auth/registry-port.js").Registry & { close(): Promise<void>, pragmas(): object }}
  */
 export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTimeoutMs = 5000 }) {
   const db = new Database(path, { create: true, strict: true });

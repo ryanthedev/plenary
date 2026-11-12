@@ -155,3 +155,99 @@ Earlier run, 42 files, one denied:
 **Question for t18m:** shared-worker/client.js and transport/local.js are both on the deny list, but `web/main.js`
 imports them statically, so the served page can't boot. Should client drop or gate those imports on the served
 page (my recommendation, for example main.js wiring ws.js), or should the deny list change?
+
+## Round 2 (2026-11-12): import scanner fix (p-servev FAIL H1)
+
+**Status: H1 fixed. `/ports/storage.js` is now served (200), and the allowlist matches an independent crawl of the
+page's graph: 39 files on both sides.** The main.js blocker above (two denied imports) still stands; that is client's.
+
+### What changed
+
+| File | Change |
+|---|---|
+| `server/static.js` | `scanModule` now uses Bun's parser instead of regexes (details below). A module that doesn't parse is logged as `unparseable (its imports are not served)` instead of throwing. The header comment documents L2. |
+| `test/server/static.test.js` | 4 new tests; the scanner test rewritten (below). |
+| `server/server.js` | No change this round. |
+
+### How the scanner works now, and why
+
+- **Imports come from Bun's parser.** `scanModule` calls `new Bun.Transpiler({ loader: "js" }).scanImports()`, which
+  parses the module, so a comment or a string that mentions `import` can't add an import or hide one.
+- **Two shapes Bun's scanner doesn't report.** `new URL("literal", import.meta.url)` (the Worker pattern the brief
+  requires) and a computed `import(x)` (logged, never served) are still matched by regex, but on `transformSync`'s
+  output, which has every comment removed.
+- **One remaining over-match.** A string literal whose text looks like `new URL("./x.js", import.meta.url)` would
+  still match. It could only add a file that exists in a mount and passes the deny list, so the worst case is
+  serving one extra file, never escaping the allowlist.
+- **Why Bun's parser and not a hand-written comment and string stripper:**
+  - It is exact. A hand-written stripper has to tell regex literals from division, which is the classic trap.
+  - Bun-specific code is fine here: static.js is the server's HTTP adapter and never runs in Herdr.
+  - It costs about 14 ms of start-up per server.
+- **L2 (documented, not changed):** in index.html, only relative `src`/`href` are followed. An absolute one is
+  skipped and logged as `not a relative path`. main.js and style.css are served anyway because they are fixed
+  entries, but any other file referenced absolutely would be 404.
+- **L1 and L3:** no change, per the brief (L1 is Bun's HTTP parser; L3 is an M4 lever).
+
+### Tests added (19 in the file now; static.test.js + architecture.test.js: 35 pass)
+
+- **H1, scanner:** the two-line comment shape from the verifier's report (`// … adapters never import each other.`,
+  a second comment line, then the real import), plus a block-comment variant.
+- **H1, through `staticSite`:** a planted root where `session.js` has that comment. `/ports/storage.js` must be on
+  the allowlist and return 200.
+- **Unparseable module:** it is logged, and nothing it imports is served.
+- **Real tree vs an independent crawl:**
+  - The crawl uses `Bun.build({ metafile: true })` from web/main.js, so it is Bun's bundler resolver, not
+    static.js's code.
+  - It walks the bundler's import graph from main.js, stops at denied files and maps paths to URLs by mount.
+  - The test requires the allowlist to equal the crawl plus index.html and style.css, and checks that
+    `/ports/storage.js` is in it.
+- **Scanner test rewritten:** round 1's version fed invalid JavaScript (a bare ` * @returns` line), which a real
+  parser rejects. It now uses valid source with a JSDoc type, a line comment, a block comment and a string that
+  each mention import.
+
+**Mutation check:** in a scratch copy of the tree (since deleted), I restored round 1's regex scanner (`STAT` + `DYN`
++ `onComment`). 3 tests failed:
+
+- H1 scanner
+- H1 through staticSite
+- the real-tree-vs-bundler test
+
+All three pass with the fix. The rewritten scanner test passes under both scanners; it guards the comment and string
+cases, not H1.
+
+### Checks
+
+- **Owned gates:** `bun test test/server/static.test.js test/architecture.test.js`: 35 pass, 0 fail.
+  `bun test test/server`: 200 pass, 0 fail.
+- **Full suite, three runs.** The shared tree was changing under me during all three; each run had exactly 1
+  failure, never in a file I own:
+
+  | Run | Result | The one failure |
+  |---|---|---|
+  | 1 | 1062 pass, 1 fail | `test/server/v1.test.js` "a board feed picks up the host's checkpoint…" timed out at 15 s |
+  | 2 | 1062 pass, 1 fail | the same v1 test |
+  | 3 | 1067 pass, 1 fail | v1 passed; `test/web/core/signin.test.js` "a throwing replaceFragment is survived" failed (got `url-not-cleared`) |
+
+  - **The v1 test:** it passes alone and in `bun test test/server`. `test/server/v1.test.js` and `server/feed.js`
+    are modified in the tree right now by another session (the test's new comment cites t18m). Static's start-up
+    cost (~14 ms per server, before the test's waits begin) can't plausibly cause a 15 s timeout. Not proven.
+  - **The signin test:** client's sign-in code, which I don't own; static.js has no part in it.
+  - **So** I can't show a fully green `bun test` in the shared tree right now. Every failure is in a file under
+    another session's active edit.
+- **Manual check:**
+  - `PORT=0 bun server/main.js` with dev tokens and a scratch data dir: port 50323, PID 42575, killed by that PID.
+    Scratch data, the scratch copy and the scripts are deleted.
+  - Start-up log: `static: serving files: 39, skipped: 2`. The two skipped are the known denied imports from
+    main.js.
+  - `/ports/storage.js` returned 200 `text/javascript`.
+  - A crawl with Bun's bundler, run separately from the test, found the same 39 files, and every one returned 200
+    from the live server.
+
+### Not verified, and risks
+
+- **No browser load:** the main.js blocker remains.
+- **One over-match path:** the `new URL` string literal case above.
+- **Not touched, per the brief:** `test/arch-scan.js` keeps the same regex bug.
+
+**Question for t18m (still open from round 1):** web/main.js imports two denied files, so the page can't boot.
+Should client drop or gate them (my recommendation), or should the deny list change?

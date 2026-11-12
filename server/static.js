@@ -50,13 +50,14 @@ export const MIME = Object.freeze({
 
 /**
  * Never served, even when reached from the page. Tested on the URL path (e.g. "/collab/x.js", "/packages/core/a.js").
- * web/dev.html, web/dev.js, web/collab/**, web/adapters/transport/shared-worker/**, web/adapters/transport/local.js
+ * web/dev*.html|js, web/core/dev-users.js, web/adapters/storage/memory.js (p7-archtest C-16), web/collab/**, web/adapters/transport/shared-worker/**, web/adapters/transport/local.js
  * and web/adapters/<x>/fake.js are web-root rules (client's list, t18m 2026-11-12). web/adapters/collab/ is served
  * (sync.js is the production collab adapter); its fake.js is covered by the <x>/fake.js rule; clock/virtual.js, test/, docs/, server/, node_modules/ and dotfiles are denied at any depth.
  */
 export const DENY = Object.freeze([
-  { why: "web/dev.html (dev page)", test: p => p === "/dev.html" },
-  { why: "web/dev.js (dev page)", test: p => p === "/dev.js" },
+  { why: "web/dev*.html|js (dev pages and their roots)", test: p => /^\/dev[^/]*\.(js|html)$/.test(p) },
+  { why: "web/core/dev-users.js (dev token table)", test: p => p === "/core/dev-users.js" },
+  { why: "web/adapters/storage/memory.js (test store)", test: p => p === "/adapters/storage/memory.js" },
   { why: "web/collab/** (dev harness)", test: p => p.startsWith("/collab/") },
   { why: "web/adapters/transport/shared-worker/** (in-browser dev room)", test: p => p.startsWith("/adapters/transport/shared-worker/") },
   { why: "web/adapters/transport/local.js (in-page dev room)", test: p => p === "/adapters/transport/local.js" },

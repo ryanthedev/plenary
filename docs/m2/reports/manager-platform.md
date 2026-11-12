@@ -213,3 +213,4 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 - Decision (mine, reversible; engine told via proxy): renumber on seeding only the elements the room would refuse
   (absent and version > 1,000). Renumbering all of them let a pane with the file open silently overwrite later
   edits (builder's test). Sent to t14y; t155 re-checks after.
+- Engine agreed the seeding decision; renumbered (refused) elements get version 1,000 (not 1) with a fresh versionNonce. Relayed to t14y. PROTOCOL.md seeding text updated at engine's next spec touch.

@@ -19,6 +19,7 @@ import { syncCollabPort } from "./adapters/collab/sync.js";
 import { showGate, hideGate } from "./adapters/dom/gate.js";
 import { takeSignIn, signInNotice } from "./core/signin.js";
 import { createSession } from "./core/session.js";
+import { rememberBoard, takeReturnBoard } from "./core/roles.js";
 
 const clock = browserClock();
 
@@ -26,6 +27,7 @@ const clock = browserClock();
 if (location.hash) showGate({ title: "Signing in…" });
 
 // First thing: the sign-in fragment off the address bar (takeSignIn drops it before anything else).
+const tabStore = sessionStore();
 const signIn = await takeSignIn({
   fragment: location.hash,
   replaceFragment: () => { if (location.hash) history.replaceState(history.state, "", location.pathname + location.search); },
@@ -35,10 +37,17 @@ const signIn = await takeSignIn({
 });
 
 const q = new URLSearchParams(location.search);
-const board = /^[\w-]{1,64}$/.test(q.get("board") ?? "") ? q.get("board") : null;
+const asked = /^[\w-]{1,64}$/.test(q.get("board") ?? "") ? q.get("board") : null;
+// Back from "Sign in again" (C-9): the server's login lands on its fixed page, so the board this tab left comes from
+// session storage (the board id only, once, after a fresh sign-in), and goes back into the address bar.
+const back = takeReturnBoard(tabStore, { outcome: signIn.outcome, board: asked });
+if (back) { q.set("board", back); history.replaceState(history.state, "", `${location.pathname}?${q}`); }
+const board = asked ?? back;
 const signInLink = { href: "/auth/login", text: "Sign in with Google" };
 
 if (!signIn.token) {
+  // Signed out on a board's link (an expired sign-in, after a reload): the gate's sign-in comes back to that board.
+  if (board) rememberBoard(tabStore, board);
   showGate({ title: "Sign in to Plenary", detail: signInNotice({ ...signIn, dev: null }) ?? "Sign in with your work Google account to open this board.", link: signInLink });
 } else if (!board) {
   showGate({ title: "No board in this link", detail: "Open the board from the link you were sent." });
@@ -55,6 +64,10 @@ if (!signIn.token) {
     // The collaboration UI over this session (presence and records ride the board connection; web/adapters/collab/sync.js).
     collab: (S, o) => syncCollabPort(S, { name: me.name, ...o }),
     notice: signInNotice({ ...signIn, dev: null }, me.name),
+    clock,
+    // exp: seconds (the sign-in contract); the page warns before it on the clock's ms scale.
+    expAt: Number.isFinite(signIn.exp) ? signIn.exp * 1000 : null,
+    relogin: { href: signInLink.href, go: () => { rememberBoard(tabStore, board); location.assign(signInLink.href); } },
   });
   hideGate();
   globalThis.plenary = app;

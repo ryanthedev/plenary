@@ -6,7 +6,7 @@
   first, report path; "Urgent:" first if urgent). NEVER prompt/hc send/SendMessage t1bx (CEO rule, 2026-11-12). Workers report to me only. engine manager **t18m**; platform manager **t187**.
 - **In flight (audit fix jobs, launched 2026-11-12):** p7-perf J1 (t1h2: pins/notes/selection per-frame cost, C-1/6/7/15),
   p7-chrome J2 (t1h3: chrome rebuilds, online/visibility probe, auth banner, clock, C-2/4/6/8/9/17), p7-archtest J4
-  (t1h4: runtime-globals test, dev-module list vs static.js DENY, ws rig, C-10/14/16). Briefs docs/m2/briefs/<job>.md. p7-perf **committed** (p7-perfv PASS round 2; t1h2/t1h7 closed; follow-up MED: zoomToFit caps at scale 4, so threads on one point never split; drawer lists them). Was: verifier p7-perfv (t1h7) **FAIL round 1** (9 surviving mutants + M1 cluster click never opens, M2 refused selection re-walks 100k ids/frame, M3 domClock unguarded); round 2 done by t1h2 (29/29 mutants killed), re-verify round 2 sent to t1h7. p7-archtest **committed** (verifier PASS round 2; t1h4/t1h9 closed; follow-ups R2-MED-1 port-omission fallback, R2-MED-2 regex after `)` in codeOnly). p7-chrome built (t1h3): verifier p7-chromev next.
+  (t1h4: runtime-globals test, dev-module list vs static.js DENY, ws rig, C-10/14/16). Briefs docs/m2/briefs/<job>.md. p7-perf **committed** (p7-perfv PASS round 2; t1h2/t1h7 closed; follow-up MED: zoomToFit caps at scale 4, so threads on one point never split; drawer lists them). Was: verifier p7-perfv (t1h7) **FAIL round 1** (9 surviving mutants + M1 cluster click never opens, M2 refused selection re-walks 100k ids/frame, M3 domClock unguarded); round 2 done by t1h2 (29/29 mutants killed), re-verify round 2 sent to t1h7. p7-archtest **committed** (verifier PASS round 2; t1h4/t1h9 closed; follow-ups R2-MED-1 port-omission fallback, R2-MED-2 regex after `)` in codeOnly). p7-chrome **committed** (p7-chromev PASS round 2: 17 survivors killed, 53/54, last equivalent; t1h3/t1hh closed; follow-ups MEDIUM-1 resume jitter width for J3, LOW-1 done).
   Monitor bjtqgxkut watches all three. On each report: write <job>v brief, launch verifier, commit by path on PASS.
 - **Done:** p7-audit committed **ea47b46** (7 HIGH: 3 client, 4 engine; engine findings E-1..E-4 sent to t18m with the
   Replica `tab`-option question; t1h1 closed). p7-wire2 committed **001813a** (p7-wirev PASS rounds 2-3: cap retries on rule-12 backoff, auth refusal wins
@@ -30,7 +30,6 @@
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| p7-chrome | t1h3 | worker p7-chrome (client) · t1h3: chrome and liveness | built, idle for verdict |
 
 ## 2026-11-11 — phase-6 design mock
 
@@ -317,7 +316,14 @@
   the clock/random lets a package fall back to a global (overlaps t18m E-2); R2-MED-2 a regex after `)` still blinds codeOnly;
   4 LOW. p7-archtest committed; t1h4 and t1h9 closed.
 - p7-chrome done (t1h3): chrome rebuilds 0 on pan/incoming ops, online/visible reconnect, Sign in again + expiry warning,
-  clock port to collab, jumpTo scale. Verifier p7-chromev to launch.
+  clock port to collab, jumpTo scale. Verifier p7-chromev launched (t1hh); t1h2/t1h7 closed.
 - p7-perfv round 2 PASS (t1h7): 12 round-1 survivors killed, 3 MEDIUM fixed, 16 new mutants killed or equivalent. Follow-up
   MEDIUM: zoomToFit caps at scale 4 and can't split threads on one element, so that cluster never opens (drawer lists them).
   p7-perf committed alone (test/web 708/0 on HEAD + its files in a scratch worktree); t1h2 and t1h7 closed.
+- p7-chromev FAIL round 1 (t1hh), tests only: HIGH-T1 probe guard, T2 main.js token/return, T3 clock rule, T4 nine part-key
+  fields untested (17 survivors). Round 2 to t1h3: append the verifier's tests file, drop dead setTimer/clearTimer/raf
+  aliases (LOW-1). Follow-up MEDIUM-1: 0–2 s resume jitter is narrow for 100k viewers; decide in J3 / engine gateway admission.
+- p7-chrome round 2 done (t1h3): ui-app.test.js 27 pass (checked here), aliases dropped; bun test 1318/3 fail (core-source drift +
+  2 server tests in engine's uncommitted files). Re-verify round 2 sent to t1hh.
+- p7-chromev round 2 PASS (t1hh): all 17 survivors killed, aliases removal behaviour-neutral (Chrome 0 rebuilds), bun test
+  1319/2 fail (core-source herdr-draw; gateway.test.js fails only with engine's uncommitted server files). p7-chrome committed; t1h3/t1hh closed.

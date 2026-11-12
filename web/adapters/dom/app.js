@@ -9,8 +9,8 @@ import { isMermaid } from "../../../packages/core/mermaid.js";
 import { isLabel } from "../../../packages/core/model.js";
 import { parseLibrary } from "../../../packages/core/library.js";
 import { paint, imageCache, THEMES, color as safeColor } from "./paint.js";
-import { toolsFor, pillFor, pillTitleFor, connectionBanner } from "../../core/roles.js";
-import { renderPanel, loadLibrary, saveLibrary, addToLibrary } from "./panel.js";
+import { toolsFor, pillFor, pillTitleFor, connectionBanner, expiryNotice, shouldProbe, RESUME_PROBE_MS } from "../../core/roles.js";
+import { renderPanel, loadLibrary, saveLibrary, addToLibrary, propsModel } from "./panel.js";
 import { exportSvg, paintPng, loadPictures } from "./export.js";
 import { h, $, replace } from "./dom.js";
 import { mountCollab } from "./collab/ui.js";
@@ -22,15 +22,21 @@ import { hitTest } from "../../../packages/core/geometry.js";
  * @param {{ startSession: (o: { mine: string[], onChange: () => void }) => ReturnType<typeof import("../../core/session.js").createSession>,
  *           net: import("../../ports/net.js").Net, board: string, me: { user: string, name: string, role: string | null },
  *           prefs: import("../../ports/storage.js").Storage, theme?: string | null, notice?: string | null,
- *           collab?: (S: object, o: { jumpTo(p: { x: number, y: number }): void }) => object }} o
+ *           collab?: (S: object, o: { jumpTo(p: { x: number, y: number, scale?: number }): void }) => object,
+ *           clock: import("../../ports/clock.js").Clock, expAt?: number | null,
+ *           relogin?: { href: string, go(): void } | null }} o
  *   collab: the root's collab port factory (web/ports/collab.js; production and dev: web/adapters/collab/sync.js over
  *   the session). The collaboration UI (./collab/ui.js) mounts over it: avatars, emotes, cursors, selections, laser,
  *   previews, comment threads. Without it the page has none of that.
  *   startSession: the root's createSession with everything but the page's own bits. prefs: the per-browser store
  *   (local storage; a failing store reads as empty). notice: shown once (sign-in, share link).
+ *   clock: the root's clock port (banner countdowns, the hidden-tab timer, the collab UI). expAt: when the sign-in
+ *   ends (ms on the clock's now() scale), null when unknown: the page warns EXPIRY_WARN_MS before it. relogin: where
+ *   a refused or expiring page signs in again (href shown, go() remembers the board and leaves); null = no link (dev).
  * @returns {{ S: object, ui: object, net: object, setTheme(t: string): void, openDialog(d: string): void, setPanel(op: object): void }}
  */
-export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null }) {
+export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null }) {
+  if (!clock || typeof clock.now !== "function" || typeof clock.mono !== "function") throw new Error("mountApp: the clock port is required");
   const get = k => { try { return prefs.get(k); } catch { return null; } };
   const put = (k, v) => { try { prefs.set(k, v); } catch {} };
   const ui = {
@@ -55,12 +61,17 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // ── collaboration (p7-wire): the collab UI over the root's port, presence painted on its own canvas ──
   const overlay = h("canvas.collab-overlay", { "aria-hidden": "true" });
   canvas.after(overlay);
+  // Centre the board on a world point; `scale` (optional: a cluster click zooms in) is clamped to the page's zoom
+  // limits, and the centre is worked out at the new scale.
+  const ZOOM_MIN = 0.1, ZOOM_MAX = 8;
   const jumpTo = p => {
-    const B = S.eds.board, { w, h: hh } = B.size, sc = B.view.scale;
-    B.view = { ...B.view, x: w / 2 / sc - p.x, y: hh / 2 / sc - p.y }; B.changed(); S.syncView("board"); chromeDirty = true;
+    const B = S.eds.board, { w, h: hh } = B.size;
+    const sc = Number.isFinite(p.scale) && p.scale > 0 ? Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, p.scale)) : B.view.scale;
+    B.view = { ...B.view, scale: sc, x: w / 2 / sc - p.x, y: hh / 2 / sc - p.y }; B.changed(); S.syncView("board"); chromeDirty = true;
   };
   const port = collabPort ? collabPort(S, { jumpTo }) : null;
-  const collab = port ? mountCollab({ root: $("#canvas"), canvasOverlay: overlay, port, theme: ui.theme,
+  // The clock port (C-6) and the frame scheduler.
+  const collab = port ? mountCollab({ root: $("#canvas"), canvasOverlay: overlay, port, theme: ui.theme, clock, frame: fn => requestAnimationFrame(fn),
     view: { toScreen: p => S.eds.board.toScreen(p), toWorld: p => S.eds.board.toWorld(p), get scale() { return S.eds.board.view.scale; } } }) : null;
   if (collab) collab.showDrawer("comments");
   const worldAt = p => S.eds.board.toWorld(p);
@@ -126,7 +137,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const BUTTONS = ["left", "middle", "right"];
   const at = e => { const r = canvas.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
   let last = { t: 0, x: 0, y: 0, n: 0 }, clicks = 1, space = false;
-  const countClick = e => { const p = at(e), now = performance.now(); const n = now - last.t < 400 && Math.hypot(p.x - last.x, p.y - last.y) < 6 ? last.n + 1 : 1; last = { t: now, ...p, n }; return n; };
+  const countClick = e => { const p = at(e), now = clock.mono(); const n = now - last.t < 400 && Math.hypot(p.x - last.x, p.y - last.y) < 6 ? last.n + 1 : 1; last = { t: now, ...p, n }; return n; };
   const pmods = e => ({ ...mods(e), button: BUTTONS[e.button] ?? "left", clickCount: clicks, space });
 
   // Touch: one finger draws (or pans with the Hand); two fingers pinch-zoom and pan.
@@ -153,7 +164,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (pinch && touches.size === 2) {
       const [a, b] = [...touches.values()], d = Math.hypot(a.x - b.x, a.y - b.y), mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
       S.wheel({ x: pinch.mid.x - mid.x, y: pinch.mid.y - mid.y }, mid, {}); pinch.mid = mid;
-      S.zoomAt(Math.max(0.1, Math.min(8, pinch.scale * d / Math.max(1, pinch.d))), mid);
+      S.zoomAt(Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, pinch.scale * d / Math.max(1, pinch.d))), mid);
       return;
     }
     if (!pinch) S.pointerMove(at(e), pmods(e));
@@ -173,9 +184,9 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   canvas.addEventListener("pointercancel", up);
   canvas.addEventListener("wheel", e => {
     e.preventDefault();
-    if (e.ctrlKey || e.metaKey) { const s = S.eds.board.view.scale * Math.exp(-e.deltaY * 0.01); S.zoomAt(Math.max(0.1, Math.min(8, s)), at(e)); }
+    if (e.ctrlKey || e.metaKey) { const s = S.eds.board.view.scale * Math.exp(-e.deltaY * 0.01); S.zoomAt(Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, s)), at(e)); }
     else S.wheel({ x: e.deltaX, y: e.deltaY }, at(e), mods(e));
-    chromeDirty = true;
+    // No chromeDirty (C-2): the zoom % is updated in place; nothing else the chrome shows moves with the view.
   }, { passive: false });
   canvas.addEventListener("dblclick", e => e.preventDefault());
 
@@ -237,10 +248,54 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   });
 
   // ── chrome ──
-  let toastTimer = 0;
+  // What the chrome shows from the boards, computed once per Doc revision (Doc.rev bumps on every applied change,
+  // local or the room's; never on a pan or zoom), so a frame never scans every element (C-2, C-8).
+  const perRev = fn => { let d = null, r = -1, v; return doc => (doc === d && doc.rev === r ? v : ((d = doc), (r = doc.rev), (v = fn(doc)))); };
+  const notesInfo = perRev(doc => {
+    const labels = new Map(), notes = [];
+    for (const e of doc.live()) { if (!isLabel(e)) notes.push(e); else if (e.containerId && !labels.has(e.containerId)) labels.set(e.containerId, e); }
+    notes.sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0));
+    return { notes, labels };
+  });
+  const boardInfo = perRev(() => {
+    const B = S.eds.board, live = B.doc.live();
+    const counts = {};
+    for (const e of live) if (!isLabel(e)) { const l = e.customData?.layer ?? ""; counts[l] = (counts[l] ?? 0) + 1; }
+    const frames = B.frames();
+    const marks = [...new Set(live.map(e => e.customData?.anim?.start).filter(Number.isFinite))];
+    return { frames, framesSig: JSON.stringify(frames.map(f => [f.id, f.name ?? ""])), marks, dur: B.duration(), counts: JSON.stringify(counts) };
+  });
+  const notesCount = () => notesInfo(S.eds.notes.doc).notes.length;
+  // Updated in place every frame (cheap compares), never by a rebuild: the zoom % and the connection pill.
+  const zoomPct = h("span.pct");
+  const tl = { fill: null, head: null, text: null, sig: "" };
+  function timelineInPlace() {
+    if (!tl.fill || S.role !== "presenter") return;
+    const B = S.eds.board, { dur } = boardInfo(B.doc), t = B.time() ?? 0, pct = Math.min(100, (t / dur) * 100);
+    const sig = `${pct}|${t}`;
+    if (sig === tl.sig) return;
+    tl.sig = sig;
+    tl.fill.style.width = `${pct}%`; tl.head.style.left = `${pct}%`;
+    tl.text.textContent = `${(t / 1000).toFixed(1)}s / ${(dur / 1000).toFixed(1)}s`;
+  }
+  const pillEl = h("span.pill");
+  let pillSig = "";
+  function inPlace() {
+    timelineInPlace();
+    const z = `${Math.round(S.eds.board.view.scale * 100)}%`;
+    if (zoomPct.textContent !== z) zoomPct.textContent = z;
+    const pill = pillFor({ status: S.status, online: S.online, pending: S.pending, role: S.effective, readOnly: S.readOnly, congested: S.congested });
+    const sig = JSON.stringify([pill, pillTitle(pill.cls)]);
+    if (sig === pillSig) return;
+    pillSig = sig;
+    pillEl.className = `pill ${pill.cls}`; pillEl.title = pillTitle(pill.cls);
+    replace(pillEl, h("span.dot"), pill.text, pill.sub ? h("span.sub", {}, ` · ${pill.sub}`) : null);
+  }
+  let toastTimer = null;
   function toast(text, ms = 1800) {
     const el = $("#toast"); el.textContent = text; el.hidden = false;
-    clearTimeout(toastTimer); toastTimer = setTimeout(() => { el.hidden = true; }, ms);
+    if (toastTimer != null) clock.clear(toastTimer);
+    toastTimer = clock.set(() => { toastTimer = null; el.hidden = true; }, ms);
   }
   const setPanel = op => { const n = applyPanel(ui.panel, op); if (n !== ui.panel) { ui.panel = n; put("plenary.panel", serializePanel(n)); } chromeDirty = true; };
   function setLibrary(items) { ui.library = items; saveLibrary(prefs, items); chromeDirty = true; }
@@ -258,8 +313,6 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   function topbar() {
     const role = S.role, tools = toolsFor(role), may = S.may();
     const core = tools.filter(t => !["image", "note", "highlighter"].includes(t.id)), extras = tools.filter(t => ["image", "note", "highlighter"].includes(t.id));
-    const pill = pillFor({ status: S.status, online: S.online, pending: S.pending, role: S.effective, readOnly: S.readOnly, congested: S.congested });
-    const notesCount = S.eds.notes.doc.live().filter(e => !isLabel(e)).length;
     return [
       h("div.tools.desk-only", {}, core.map(t => toolButton(t)), extras.length ? h("span.sep") : null, extras.map(t => toolButton(t, ".new")),
         role !== "viewer" ? [h("span.sep"),
@@ -271,12 +324,12 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       role === "presenter" ? [
         h("button.btn.ghost.desk-only", { title: "Insert a Mermaid flowchart", disabled: !may, onclick: () => openDialog("mermaid") }, "◇→"),
         h("button.btn.ghost.desk-only", { title: "Export SVG / PNG (⌘⇧E)", onclick: () => openDialog("export") }, "⤓")] : null,
-      h("button.btn.ghost.desk-only", { title: "Notes", onclick: () => { ui.drawer = ui.drawer ? null : "notes"; chromeDirty = true; } }, "❏ Notes ", h("span.dim", {}, String(notesCount))),
+      h("button.btn.ghost.desk-only", { title: "Notes", onclick: () => { ui.drawer = ui.drawer ? null : "notes"; chromeDirty = true; } }, "❏ Notes ", h("span.dim", {}, String(notesCount()))),
       collab ? h("button.btn.ghost.desk-only", { title: "Comments (or right-click the board)", onclick: () => { ui.drawer = ui.drawer === "comments" ? null : "comments"; chromeDirty = true; } }, "💬") : null,
       // Who's here (`here`): the collab UI's live avatar row, kept across rebuilds (a node, moved, never rebuilt here).
       collab ? collab.parts.avatars : h("div.avatars", {},
         h("span.stack", {}, h("span.av.live", { style: { background: "var(--u-me)" }, title: `${me.name} (you)` }, me.name.slice(0, 2).toUpperCase()))),
-      h(`span.pill.${pill.cls}`, { title: pillTitle(pill.cls) }, h("span.dot"), pill.text, pill.sub ? h("span.sub", {}, ` · ${pill.sub}`) : null),
+      pillEl,                                                   // the pill: one node, updated in place (inPlace)
       role !== "viewer" ? h("button.tb.desk-only" + (ui.panel.open ? ".on" : ""), { title: "Side panel (I)", onclick: () => setPanel({ type: "open" }) }, h("span.ic", {}, "◧"), h("span.k", {}, "I")) : null,
       h("button.tb" + (role === "viewer" ? "" : ".theme-btn"), { title: "Light / dark", onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, ui.theme === "dark" ? "☀" : "☾")),
     ];
@@ -284,10 +337,10 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const pillTitle = cls => pillTitleFor({ cls, status: S.status, viewer: S.effective === "viewer", readOnly: S.readOnly });
 
   function hud() {
-    const B = S.eds.board, fs = B.frames(), i = fs.findIndex(f => f.id === B.frameAt), may = S.may();
+    const B = S.eds.board, fs = boardInfo(B.doc).frames, i = fs.findIndex(f => f.id === B.frameAt), may = S.may();
     const bl = [
       h("div.grp" + (S.role === "viewer" ? ".desk-only" : ""), {}, h("button.tb", { title: "Previous frame (PgUp)", onclick: () => S.stepFrame(-1) }, "‹"), h("span.pct", {}, fs.length ? `${i < 0 ? "–" : i + 1} / ${fs.length}` : "0 / 0"), h("button.tb", { title: "Next frame (PgDn)", onclick: () => S.stepFrame(1) }, "›")),
-      h("div.grp.desk-only", {}, h("button.tb", { title: "Zoom out (⌘-)", onclick: () => S.zoomAt(B.view.scale / 1.2) }, "−"), h("span.pct", {}, `${Math.round(B.view.scale * 100)}%`),
+      h("div.grp.desk-only", {}, h("button.tb", { title: "Zoom out (⌘-)", onclick: () => S.zoomAt(B.view.scale / 1.2) }, "−"), zoomPct,
         h("button.tb", { title: "Zoom in (⌘=)", onclick: () => S.zoomAt(B.view.scale * 1.2) }, "+"), h("button.tb", { title: "Fit everything (⇧1)", onclick: () => S.fit() }, "⤢")),
       S.role !== "viewer" ? h("div.grp.phone-only", {}, h("button.tb", { title: "Fit everything", onclick: () => S.fit() }, "⤢")) : null,
       S.role !== "viewer" ? h("div.grp.phone-only", {}, h("button.tb", { disabled: !may, title: "Undo", onclick: () => S.act(S.active, e => e.undo()) }, "↶"), h("button.tb", { disabled: !may, title: "Redo", onclick: () => S.act(S.active, e => e.redo()) }, "↷")) : null,
@@ -304,19 +357,22 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const el = $("#timeline"), B = S.eds.board;
     el.hidden = S.role !== "presenter";
     if (el.hidden) return;
-    const dur = B.duration(), t = B.time() ?? 0, pct = Math.min(100, (t / dur) * 100);
-    const marks = [...new Set(B.doc.live().map(e => e.customData?.anim?.start).filter(Number.isFinite))].map(s => h("div.mark", { style: { left: `${(s / dur) * 100}%` } }));
+    const { dur, marks: starts } = boardInfo(B.doc);
+    const marks = starts.map(s => h("div.mark", { style: { left: `${(s / dur) * 100}%` } }));
+    // The head, fill and time are kept and moved in place every frame while playing (inPlace).
+    tl.fill = h("div.fill"); tl.head = h("div.head"); tl.text = h("span.t"); tl.sig = "";
     const track = h("div.track", { title: "Click to scrub", onclick: e => { const r = e.currentTarget.getBoundingClientRect(); B.play = null; B.scrub = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * dur; B.changed(); chromeDirty = true; } },
-      h("div.fill", { style: { width: `${pct}%` } }), marks, h("div.head", { style: { left: `${pct}%` } }));
+      tl.fill, marks, tl.head);
     replace(el, h("button.c", { title: "Play / pause (⇧Space)", onclick: () => { B.playToggle(); chromeDirty = true; } }, B.play ? "❚❚" : "▶"),
-      h("button.c", { title: "Back to editing (Esc)", onclick: () => { B.stopPlay(); chromeDirty = true; } }, "■"), track, h("span.t", {}, `${(t / 1000).toFixed(1)}s / ${(dur / 1000).toFixed(1)}s`));
+      h("button.c", { title: "Back to editing (Esc)", onclick: () => { B.stopPlay(); chromeDirty = true; } }, "■"), track, tl.text);
+    timelineInPlace();
   }
 
   // The notes stream as a list: text, author (you, or unknown until v1's noteAuthor), jump / edit / delete.
   function notesList() {
     const N = S.eds.notes, may = S.may();
-    const notes = N.doc.live().filter(e => !isLabel(e)).sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0));
-    const label = e => (e.type === "text" ? e.text : N.doc.labelOf(e)?.text) || { freedraw: "Highlight / drawing", image: "Picture", arrow: "Arrow", line: "Line" }[e.type] || "Note";
+    const { notes, labels } = notesInfo(N.doc);
+    const label = e => (e.type === "text" ? e.text : labels.get(e.id)?.text) || { freedraw: "Highlight / drawing", image: "Picture", arrow: "Arrow", line: "Line" }[e.type] || "Note";
     const rows = notes.slice(0, 200).map(e => {
       const mine = S.isMine(e.id), canChange = may && mine;
       const jump = () => { N.fit([e]); S.syncView("notes"); chromeDirty = true; };
@@ -399,7 +455,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (format === "svg") blob = new Blob([exportSvg(doc, { page, theme: ui.theme, scale })], { type: "image/svg+xml" });
     else { const cv = paintPng(doc, document.createElement("canvas"), { page, theme: ui.theme, scale, loadImage: await loadPictures(doc.files) }); blob = await new Promise(r => cv.toBlob(r, "image/png")); }
     const a = h("a", { href: URL.createObjectURL(blob), download: name }); document.body.append(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    clock.set(() => URL.revokeObjectURL(a.href), 5000);
   }
   function dialogs() {
     const d = $("#dialogs"), may = S.may();
@@ -434,13 +490,24 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     } else d.replaceChildren();
   }
 
+  // Sign in again (C-9): a link (so it reads as one and opens in a new tab if asked), whose click remembers this
+  // board and leaves through the root's relogin.go(). The link carries nothing but its fixed path.
+  const reloginLink = () => h("a.btn.primary", { href: relogin.href, onclick: e => { if (e.button || e.metaKey || e.ctrlKey || e.shiftKey) return; e.preventDefault(); relogin.go(); } }, "Sign in again");
+  // The cap's countdown in whole seconds, on the clock port (C-17: nextTryAt is the clock's now(), so is this).
+  const nextTryIn = () => { const n = S.limitedNextTry; return n == null ? null : Math.max(0, n - clock.now()); };
+  const expiry = () => expiryNotice({ expAt, now: clock.now() });
   function banners() {
-    const out = [], next = S.limitedNextTry;
+    const out = [];
     const b = connectionBanner({ status: S.status, online: S.online, viewer: S.effective === "viewer", pending: S.pending, readOnly: S.readOnly,
-      limited: S.limited, nextTryIn: next == null ? null : Math.max(0, next - Date.now()) });
+      limited: S.limited, nextTryIn: nextTryIn(), relogin: !!relogin });
     if (b) out.push(h("div.banner", {}, b.text,
+      b.relogin ? [reloginLink(), " "] : null,
       b.action === "reload" ? h("button.btn", { onclick: () => location.reload() }, "Reload")
         : b.action === "retry" ? h("button.btn", { onclick: () => S.reconnect() }, S.status === "limited" ? "Retry now" : S.online ? "Retry" : "Retry now") : null));
+    // Before the sign-in ends (or once it has, while the link still holds): warn, with the way out. Not when the
+    // refused banner already offers it.
+    const x = S.status === "refused" ? null : expiry();
+    if (x) out.push(h("div.banner.expiry", {}, x.text, relogin ? reloginLink() : "Reload the page after signing in again."));
     // Settings changes the room refused (stale-setting: someone changed the same setting first). Retry when ready.
     for (const r of S.settingsRefused) {
       const what = r.keys.join(", ") || "a setting";
@@ -451,60 +518,130 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     return out;
   }
 
-  let chromeAt = 0, chromeKey = "", chromeHeld = false;
+  // The chrome is a set of parts, each rebuilt only when what it shows changes (C-2, C-8). Two triggers:
+  //   chromeDirty  a local action (click, key, tool, resize, a session event): every part rebuilds, at once.
+  //   a part key   what that part shows, computed at most every CHROME_MS while anything moved (S.version(), the
+  //                connection): incoming ops, a pan or a zoom leave every key alone, so nothing rebuilds.
+  // Keys read per-revision memos (notesInfo, boardInfo), never a scan per frame. ui.rebuilds counts rebuilds per part.
+  const CHROME_MS = 250;
+  const rebuilds = ui.rebuilds = { topbar: 0, panel: 0, drawer: 0, timeline: 0, hud: 0, overlays: 0, dock: 0, sheet: 0, dialogs: 0 };
+  let chromeAt = -Infinity, gateKey = "", chromeHeld = false;
   document.addEventListener("pointerdown", e => { if (e.target !== canvas) chromeHeld = true; }, true);
   addEventListener("pointerup", () => { chromeHeld = false; }, true);
   addEventListener("pointercancel", () => { chromeHeld = false; }, true);
-  function chrome() {
-    const now = performance.now();
-    const key = [S.version(), S.status, S.limitedNextTry == null ? "" : Math.ceil((S.limitedNextTry - Date.now()) / 1000), S.pending, S.role, S.effective, S.tool, S.online, S.congested, JSON.stringify(S.settingsRefused.map(r => [r.stream, r.i, r.ready])), ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.library.length, S.toolLock(), JSON.stringify(ui.export), ui.mermaid.elbow].join("|");
-    if (!chromeDirty && key === chromeKey) return;
-    if (chromeHeld) return;                                   // a press on the chrome: don't swap the button under it
-    if ((S.gesture || !chromeDirty) && now - chromeAt < 250) return;   // mid-drag, playback, incoming ops: a few times a second          // mid-drag: refresh a few times a second at most
-    chromeDirty = false; chromeKey = key; chromeAt = now;
-    document.body.classList.toggle("stale", S.status !== "live");
-    replace($("#topbar"), topbar());
-    // Don't rebuild a panel or drawer the person is typing in.
-    const busy = el => el.contains(document.activeElement) && /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
+  // Don't rebuild a panel or drawer the person is typing in.
+  const busy = el => el.contains(document.activeElement) && /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName);
+  // What every part depends on from the page and the session (a change rebuilds them all, as chromeDirty does).
+  const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.library.length].join("|");
+  const notesRowsKey = () => {
+    const { notes, labels } = notesInfo(S.eds.notes.doc);
+    return JSON.stringify([notes.length, S.mine.size, notes.slice(0, 200).map(e => [e.id, e.text ?? labels.get(e.id)?.text ?? "", e.backgroundColor, e.strokeColor, S.isMine(e.id)])]);
+  };
+  // The side panel shows the active Editor's style and selection (propsModel), the board's frames, layers and their
+  // counts, the active layer, the playback chip and the library (panel.js renderPanel).
+  const panelKey = () => {
+    const B = S.eds.board, ed = S.eds[S.role === "annotator" ? "notes" : S.active], bi = boardInfo(B.doc);
+    return JSON.stringify([propsModel(ed), B.sel.size > 0, S.eds.notes.sel.size > 0, B.selected()[0]?.customData?.anim?.preset ?? null,
+      bi.framesSig, B.frameAt, !!B.play, B.doc.layers, bi.counts, B.activeLayer]);
+  };
+  const parts = {
+    topbar: { key: () => notesCount(), build: () => replace($("#topbar"), topbar()) },
+    panel: { key: () => (S.role === "viewer" || !ui.panel.open ? "" : panelKey()), build: buildPanel },
+    drawer: { key: () => (ui.drawer === "notes" ? notesRowsKey() : ""), build: buildDrawer },
+    timeline: { key: () => { const B = S.eds.board, bi = boardInfo(B.doc), t = B.time(); return S.role !== "presenter" ? "" : JSON.stringify([bi.marks, bi.dur, !!B.play, B.play ? null : t]); }, build: timeline },
+    hud: { key: () => JSON.stringify([boardInfo(S.eds.board.doc).framesSig, S.eds.board.frameAt]), build: hud },
+    overlays: { key: () => JSON.stringify([S.status, S.online, S.pending, S.limited, nextTryIn() == null ? null : Math.ceil(nextTryIn() / 1000), S.settingsRefused.map(r => [r.stream, r.i, r.ready, r.code, r.keys]), expiry()?.bucket ?? null]), build: () => replace($("#overlays"), banners()) },
+    dock: { key: () => "", build: dock },
+    sheet: { key: () => (!ui.sheet || !isPhone() ? "" : ui.sheet === "panel" ? panelKey() : ui.sheet === "tools" ? "" : notesRowsKey()), build: sheetView },
+    dialogs: { key: () => (ui.dialog === "export" ? `${S.eds.board.doc.rev}|${JSON.stringify(ui.export)}` : `${ui.mermaid.elbow}`), build: dialogs },
+  };
+  const keys = {};
+  function buildPanel() {
     const panel = $("#panel"), lay = panelLayout(ui.panel, $(".main").getBoundingClientRect().width);
     panel.hidden = S.role === "viewer" || !lay.show;
-    if (!panel.hidden && !busy(panel)) {
-      panel.style.width = `${lay.width}px`;
-      const edge = h("div.edge", { title: "Drag to resize (180–520 px)", onpointerdown: e => {
-        e.preventDefault(); const sw = ui.panel.width, sx = e.clientX;
-        const mv = ev => setPanel({ type: "width", width: dragWidth(sw, sx, ev.clientX) }), end = () => { removeEventListener("pointermove", mv); removeEventListener("pointerup", end); };
-        addEventListener("pointermove", mv); addEventListener("pointerup", end);
-      } });
-      const top = panel.scrollTop;
-      replace(panel, edge, panelNodes());
-      panel.classList.toggle("ro", !S.may());
-      panel.scrollTop = top;
-    }
+    if (panel.hidden) return true;
+    if (busy(panel)) return false;
+    panel.style.width = `${lay.width}px`;
+    const edge = h("div.edge", { title: "Drag to resize (180–520 px)", onpointerdown: e => {
+      e.preventDefault(); const sw = ui.panel.width, sx = e.clientX;
+      const mv = ev => setPanel({ type: "width", width: dragWidth(sw, sx, ev.clientX) }), end = () => { removeEventListener("pointermove", mv); removeEventListener("pointerup", end); };
+      addEventListener("pointermove", mv); addEventListener("pointerup", end);
+    } });
+    const top = panel.scrollTop;
+    replace(panel, edge, panelNodes());
+    panel.classList.toggle("ro", !S.may());
+    panel.scrollTop = top;
+    return true;
+  }
+  function buildDrawer() {
     const drawer = $("#drawer");
     drawer.hidden = !ui.drawer;
-    if (ui.drawer && !busy(drawer)) replace(drawer, h("header", {}, h("h3", {}, "Annotations"), drawerTabs("drawer"), h("button.tb", { title: "Close", onclick: () => { ui.drawer = null; chromeDirty = true; } }, "✕")), drawerBody(ui.drawer));
+    if (!ui.drawer) return true;
+    if (busy(drawer)) return false;
+    replace(drawer, h("header", {}, h("h3", {}, "Annotations"), drawerTabs("drawer"), h("button.tb", { title: "Close", onclick: () => { ui.drawer = null; chromeDirty = true; } }, "✕")), drawerBody(ui.drawer));
+    return true;
+  }
+  function chrome() {
+    inPlace();
+    document.body.classList.toggle("stale", S.status !== "live");
     $("#veil").hidden = S.online;
-    replace($("#overlays"), banners());
-    timeline(); hud(); dock(); sheetView(); dialogs();
+    const now = clock.mono();
+    // Countdowns (the cap's retry, the sign-in's expiry) tick once a second; playback every frame (its key buckets it).
+    const ticking = expAt != null || S.limitedNextTry != null ? Math.floor(clock.now() / 1000) : "";
+    const gate = [S.version(), S.status, S.pending, S.online, S.congested, S.limited, S.limitedNextTry, ticking, S.eds.board.play ? now : ""].join("|");
+    if (!chromeDirty && gate === gateKey) return;
+    if (chromeHeld) return;                                   // a press on the chrome: don't swap the button under it
+    if ((S.gesture || !chromeDirty) && now - chromeAt < CHROME_MS) return;   // mid-drag, playback, incoming ops: a few times a second at most
+    const env = envKey(), force = chromeDirty || env !== keys.env;
+    chromeDirty = false; gateKey = gate; chromeAt = now; keys.env = env;
+    for (const [name, part] of Object.entries(parts)) {
+      const k = part.key();
+      if (!force && k === keys[name]) continue;
+      if (part.build() === false) { keys[name] = undefined; continue; }   // busy: try again later
+      keys[name] = k; rebuilds[name]++;
+    }
   }
 
   // ── loop ──
-  addEventListener("online", () => { S.online = true; chromeDirty = true; });
+  // Link liveness, page side (C-4). Back online, or back to the front after RESUME_PROBE_MS hidden: the link may have
+  // died without a close (Wi-Fi switch, sleep, a NAT timeout) and nothing else would notice while the board is quiet,
+  // so reconnect (the session handle's only lever; the hello's `since` keeps it a small catch-up). Both are jittered
+  // up to PROBE_JITTER_MS (clock.random): a whole office's network coming back, or a whole all-hands switching back
+  // to the board at once, must not arrive as one wave of hellos.
+  // The idle-link watchdog itself is sync.js's (J3, after engine's heartbeat E-1).
+  // A tab coming back skips the reconnect when the room spoke within HEARD_MS (presence, here, emotes, records: any
+  // room event): its link is alive, and on a busy all-hands that is every tab, so a mass return sends no hellos.
+  const PROBE_JITTER_MS = 2000, HEARD_MS = 10_000;
+  let probeTimer = null, hiddenAt = null, heard = null;
+  S.onRoom(() => { heard = { mono: clock.mono(), wall: clock.now() }; });
+  const since = t => Math.max(clock.mono() - t.mono, clock.now() - t.wall);
+  const probe = () => {
+    if (probeTimer != null) clock.clear(probeTimer);
+    probeTimer = clock.set(() => { probeTimer = null; if (shouldProbe({ status: S.status, gesture: S.gesture })) S.reconnect(); }, clock.random() * PROBE_JITTER_MS);
+  };
+  addEventListener("online", () => { S.online = true; chromeDirty = true; probe(); });
   addEventListener("offline", () => { S.online = false; chromeDirty = true; });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") { hiddenAt = { mono: clock.mono(), wall: clock.now() }; return; }
+    const was = hiddenAt; hiddenAt = null;
+    // Either clock: mono may not advance through a laptop's sleep on every platform; a false positive costs one reconnect.
+    if (was && since(was) > RESUME_PROBE_MS && !(heard && since(heard) <= HEARD_MS)) probe();
+  });
   matchMedia("(max-width: 640px)").addEventListener("change", () => { chromeDirty = true; });
   setTheme(ui.theme);
-  let savedMine = 0;
+  let savedMine = 0, fitted = false;
+  // First catch-up done: show everything once.
+  function fitOnce() { if (fitted || S.status !== "live") return; fitted = true; if (S.eds.board.doc.live().length || S.eds.notes.doc.live().length) S.fit(); }
   (function frame() {
     const live = S.eds.board.needsTick() || S.eds.notes.needsTick();
-    if (dirty || live || seen !== S.version()) { dirty = false; draw(); seen = S.version(); if (live) chromeDirty = chromeDirty || !!S.eds.board.play; }
+    if (dirty || live || seen !== S.version()) { dirty = false; draw(); seen = S.version(); }
     collabTick();
+    fitOnce();
     const f = S.takeFlash(); if (f) toast(f);
     chrome();
     if (S.mine.size !== savedMine) { savedMine = S.mine.size; put(mineKey, JSON.stringify([...S.mine].slice(-5000))); }
     requestAnimationFrame(frame);
   })();
-  // First catch-up done: show everything once.
-  const fitOnce = setInterval(() => { if (S.status === "live") { clearInterval(fitOnce); if (S.eds.board.doc.live().length || S.eds.notes.doc.live().length) S.fit(); } }, 50);
 
   if (notice) toast(notice, 6000);
   return { S, ui, net, collab, port, setTheme, openDialog, setPanel, startComment };

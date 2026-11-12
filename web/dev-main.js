@@ -52,6 +52,9 @@ const app = mountApp({
   net, board, me, prefs: localStore(), theme: q.get("theme"),
   collab: (S, o) => syncCollabPort(S, { name: me.name, ...o }),
   notice: signInNotice(signIn, me.name),
+  // The in-browser rooms know only dev tokens: no Google sign-in to go back to (relogin null), and dev tokens never
+  // expire (exp null). A real exchanged session's exp still warns.
+  clock, expAt: Number.isFinite(signIn.exp) ? signIn.exp * 1000 : null, relogin: null,
 });
 hideGate();
 globalThis.plenary = app;

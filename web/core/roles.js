@@ -84,9 +84,11 @@ export function pillFor({ status, online = true, pending = 0, role, readOnly = f
 // choices are tested: a capped tab shows only the cap's banner (p7-wirev LOW-1), with when it tries again.
 //   status: the session's merged status; viewer: the effective chrome is the viewer's; limited: the cap's message;
 //   nextTryIn: ms until the cap's next automatic try (null: none armed).
-export function connectionBanner({ status, online = true, viewer = false, pending = 0, readOnly = false, limited = null, nextTryIn = null }) {
+export function connectionBanner({ status, online = true, viewer = false, pending = 0, readOnly = false, limited = null, nextTryIn = null, relogin = false }) {
   if (status === "stopped") return { text: `⚠ This app is older than the board's room and has stopped: reload to update it.${pending ? ` Reloading loses ${pending} edits not yet acknowledged.` : ""} `, action: "reload" };
-  if (status === "refused") return { text: "⚠ The room refused this sign-in (token or board). ", action: "retry" };
+  // Refused (`auth`): Retry reconnects with the same token, which a dead token can't pass, so the banner also offers a
+  // fresh sign-in (p7-chrome, C-9). `relogin`: the page has a sign-in to go to (production; the dev rooms have none).
+  if (status === "refused") return { text: `⚠ The room refused this sign-in (token or board).${relogin ? ` Sign in again to keep going${pending ? `; ${pending} unsent ${pending === 1 ? "edit" : "edits"} in this tab are lost when you leave` : ""}.` : ""} `, action: "retry", relogin: !!relogin };
   if (status === "limited") {
     const when = nextTryIn == null ? "" : ` Trying again ${nextTryIn < 1000 ? "now" : `in ${Math.ceil(nextTryIn / 1000)} s`}.`;
     return { text: `⚠ This board is open in too many of your tabs (${limited ?? "the room's limit"}). Close one; this tab gets in by itself.${when} `, action: "retry" };
@@ -95,6 +97,53 @@ export function connectionBanner({ status, online = true, viewer = false, pendin
   if (status !== "live") return { text: viewer ? "⟳ Connecting… the live view is paused." : `⟳ Connecting… ${pending ? `${pending} edits waiting. ` : ""}Keep working: they're sent with the same ids when the room is back.`, action: null };
   if (readOnly) return { text: "👁 Read-only: the server gave this session a lower role. Ask the board's owner for edit access.", action: null };
   return null;
+}
+
+/** How long before the sign-in's expiry the page warns (C-9). */
+export const EXPIRY_WARN_MS = 5 * 60_000;
+
+/**
+ * The sign-in expiry warning, or null. expAt: when the sign-in ends (ms, the clock's now() scale), null when unknown
+ * (dev tokens); now: the clock's now(). The room checks the token on each hello, so an expired sign-in keeps a
+ * live link until the next reconnect, which is then refused: the warning says so before it happens.
+ * @returns {{ text: string, expired: boolean, bucket: string } | null}  bucket: changes only when the text does.
+ */
+export function expiryNotice({ expAt = null, now, warnMs = EXPIRY_WARN_MS }) {
+  if (!Number.isFinite(expAt) || !Number.isFinite(now)) return null;
+  const left = expAt - now;
+  if (left > warnMs) return null;
+  if (left <= 0) return { text: "⚠ Your sign-in has ended. The board stays live until the connection drops; sign in again now so you're not cut off. ", expired: true, bucket: "ended" };
+  const min = Math.ceil(left / 60_000);
+  return { text: `⚠ Your sign-in ends in ${min} min. Sign in again to stay connected. `, expired: false, bucket: `m${min}` };
+}
+
+/** After this long hidden, a tab coming back to the front reconnects (C-4): its link may have died unseen. */
+export const RESUME_PROBE_MS = 30_000;
+
+/**
+ * Should the page reconnect now (C-4: the browser came back online, or a tab long hidden came back)? Never while
+ * refused or stopped (the same token or app is refused again) or capped (it would defeat the cap's backoff), and
+ * never under a gesture in flight. The session handle offers only reconnect(): the hello carries `since`, so a
+ * healthy link pays a small catch-up, not a snapshot.
+ */
+export function shouldProbe({ status, gesture = null }) {
+  return !gesture && !["refused", "stopped", "limited"].includes(status);
+}
+
+/** The board a page asked to come back to after signing in (C-9): the server's login lands on its fixed page. */
+export const RETURN_KEY = "plenary.return";
+const BOARD_RE = /^[\w-]{1,64}$/;
+/** Remember `board` before leaving for sign-in. Never throws (a failing store just loses the way back). */
+export function rememberBoard(storage, board) { try { if (BOARD_RE.test(board ?? "")) storage.set(RETURN_KEY, board); } catch {} }
+/**
+ * The board to return to, once: read and removed. Only after a fresh sign-in (`signed-in`) on a page with no board
+ * of its own; anything not a board id is ignored. Never throws.
+ */
+export function takeReturnBoard(storage, { outcome, board }) {
+  let v = null;
+  try { v = storage.get(RETURN_KEY); if (v !== null) storage.remove(RETURN_KEY); } catch { return null; }
+  if (outcome !== "signed-in" || board) return null;
+  return BOARD_RE.test(v ?? "") ? v : null;
 }
 
 /** The pill's tooltip for a pill class (pillFor's `cls`). The cap's text wins over the viewer's "no live connection". */

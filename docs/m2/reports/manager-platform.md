@@ -228,3 +228,5 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   commit of package.json + bun.lock (t14j to send its id). Then commit by path: deploy/Dockerfile, deploy/README.md,
   .dockerignore, .github/workflows/ci.yml, docs/m2/briefs/p8-deps*.md, docs/m2/reports/p8-deps*.md (re-run bun test
   first; re-check the diff if those files moved). Sessions t17n, t17r closed, killed, removed.
+- p8-deps: DONE, committed after engine's 0d40b86 (package.json + bun.lock). `bun install --frozen-lockfile` clean,
+  bun test 315 pass, YAML parses.

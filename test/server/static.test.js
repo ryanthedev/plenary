@@ -20,7 +20,6 @@ const DENIED = {
   "web/adapters/transport/shared-worker/client.js": "/adapters/transport/shared-worker/client.js",
   "web/adapters/auth/fake.js": "/adapters/auth/fake.js",
   "web/adapters/collab/fake.js": "/adapters/collab/fake.js",
-  "web/adapters/collab/other.js": "/adapters/collab/other.js",
   "web/adapters/transport/local.js": "/adapters/transport/local.js",
   "web/adapters/clock/virtual.js": "/adapters/clock/virtual.js",
   "web/core/clock/virtual.js": "/core/clock/virtual.js",
@@ -118,11 +117,12 @@ test("every deny-list path is 404 even though the page imports it, and the walk 
 
 test("the deny rules themselves, by path", () => {
   for (const u of ["/dev.html", "/dev.js", "/collab/a.js", "/collab/x/y.css", "/adapters/transport/shared-worker/worker.js",
-    "/adapters/storage/fake.js", "/adapters/clock/virtual.js", "/adapters/collab/x.js", "/adapters/transport/local.js", "/collab/dev.html", "/x/clock/virtual.js", "/packages/core/clock/virtual.js",
+    "/adapters/storage/fake.js", "/adapters/clock/virtual.js", "/adapters/collab/fake.js", "/adapters/transport/local.js", "/collab/dev.html", "/x/clock/virtual.js", "/packages/core/clock/virtual.js",
     "/test/a.js", "/a/test/b.js", "/docs/a.html", "/server/main.js", "/.env", "/a/.git/config", "/node_modules/x.js"])
     expect([u, !!denied(u)]).toEqual([u, true]);
   for (const u of ["/index.html", "/main.js", "/adapters/dom/app.js", "/adapters/transport/ws.js", "/adapters/clock/browser.js",
-    "/core/dev-users.js", "/packages/core/editor.js", "/adapters/dom/collab/ui.js", "/fake.js"])
+    "/core/dev-users.js", "/packages/core/editor.js", "/adapters/dom/collab/ui.js", "/fake.js",
+    "/adapters/collab/sync.js", "/adapters/collab/x.js"])
     expect([u, !!denied(u)]).toEqual([u, false]);
 });
 
@@ -321,7 +321,10 @@ async function bundlerGraph() {
     if (rel.startsWith("packages/core/") || rel.startsWith("packages/protocol/")) return "/" + rel;
     return null;
   };
-  const served = new Set(["/index.html", "/style.css"]), seen = new Set(), q = [join(repo, "web/main.js")];
+  // index.html's own stylesheets, read with a plain regex here (not static.js's scanHtml), so the crawl stays independent.
+  const html = await Bun.file(join(repo, "web/index.html")).text();
+  const sheets = [...html.matchAll(/<link\s+rel="stylesheet"\s+href="([^"]+)"/g)].map(m => "/" + m[1]);
+  const served = new Set(["/index.html", ...sheets.filter(u => !denied(u))]), seen = new Set(), q = [join(repo, "web/main.js")];
   while (q.length) {
     const f = q.shift();
     if (seen.has(f)) continue;

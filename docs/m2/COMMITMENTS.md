@@ -118,3 +118,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-12 platform: p5-exp DONE e82a537 (session verify returns expiry so the gateway can close on expiry; verifier PASS).
 - 2026-11-12 engine: p2-swap verifier FAIL (t1fn): 1 HIGH, 3 MEDIUM, 6 LOW, all revocation/spec gaps, no acknowledged-op loss; fix round on t1fm. p2-land merge waits on it.
 - 2026-11-12 proxy: phase 2 audit PASS: merge dcbdae6 (v1/v1.1 spec+code, server on v1.1 via p2-swap round 2 PASS, client p6-land + p7-collab); clean worktree of 152883a: 884 pass / 80 skip / 0 fail. Pushed to origin. Next: p2-tune + p-arch (engine), p6-hex t1fy (client), 3 platform jobs incl. p8-cookie; drawh live run against the real server.
+- 2026-11-12 platform: p8-cookie DONE 601f8e9 (cluster compose and CI supply COOKIE_KEY; verifier PASS, 5 LOW).

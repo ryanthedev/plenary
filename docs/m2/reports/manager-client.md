@@ -4,10 +4,9 @@
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| p6-ui (builder) | t160 | done p6-ui (client) | DONE, report docs/m2/reports/p6-ui.md (verifying) |
-| p6-uiv (verifier) | t172 | verifier p6-uiv (client): canvas UI | RUNNING (brief docs/m2/briefs/p6-uiv.md) |
+| p6-land (builder) | t17s | done p6-land (client) | DONE in worktree, report plenary-p2/docs/m2/reports/p6-land.md (verifying) |
+| p6-landv (verifier) | t181 | verifier p6-landv (client): client landing | RUNNING (brief docs/m2/briefs/p6-landv.md) |
 | p6-sync2 (builder) | t173 | done p6-sync2 (client) | DONE in worktree, report plenary-p2/docs/m2/reports/p6-sync2.md (verifying) |
-| p6-sync2v (verifier) | t176 | verifier p6-sync2v (client): sync onto phase-2 Replica | RUNNING (brief docs/m2/briefs/p6-sync2v.md) |
 
 ## 2026-11-11 — phase-6 design mock
 
@@ -137,3 +136,33 @@
   others' notes, no HTML injection, 5 tabs converged. MEDIUM M1: a draft typed when the connection drops is lost
   (session.js:88). LOWs: ownership trusts localStorage, silent drop on downgrade, small mock gaps, a test gap.
   Carried into the next client job.
+
+- p6-ui committed 3c32a5f; engine told (p2-land must include it). t160 and t172 closed, killed, removed.
+- Sequencing (told the proxy): after t176's verdict, ONE worktree job "p6-land" = previewsOf/connectionFailed
+  wiring + p6-ui breaks under the new sync.js + p6-uiv M1 (draft lost on disconnect). Not a parallel web/ui job on
+  main: it would collide with the same files at merge. Phase 7 (docs/m2/briefs/p7-collab.md, DRAFT) starts when
+  p2-land merges; it needs the new Replica's presence and records.
+- Engine committed the Replica fixes on p2-land (3ba2495): previewsOf(stream), connectionFailed(); backoff now resets
+  only after a connection has caught up AND stayed up 10 s (rule 12). For p6-land: re-run sync tests against
+  3ba2495 (a backoff-reset assumption may change). p2-land's rebase onto main (incl. p6-ui 3c32a5f) comes after the
+  scaffold fix round; engine pings first.
+- Platform p5-http (4fad32a, via proxy): the post-login session token arrives in the URL fragment `#token=`; web/
+  reads it, keeps it for the hello, clears the hash. Dev tokens stay (sign-in answers 503 until the CEO's Google
+  client exists). Folded into p6-land (brief docs/m2/briefs/p6-land.md, ready), which starts after t176's verdict.
+- Engine rebased p2-land onto main 2f0dda2 (incl. p6-ui 3c32a5f, platform 4fad32a); head 794298e. Worktree bun test
+  292/292 including p6-ui's tests under the new sync.js. t176 told. p6-land can start right after t176's verdict.
+- p6-sync2v FAIL at 794298e (docs/m2/reports/p6-sync2v.md): sync.js holds every gate, but merged with p6-ui a resync
+  leaves a SharedWorker tab "Connecting..." for good and loses its waiting edit on reload (H1): sync.js's close()
+  means "reopen follows", while net.js/room-worker.js's close() means "finished". M1: a transport without reopen()
+  loops forever. M2: `stopped` shows "Connecting...". M3 is engine's (restamp() skips when the top of the chain
+  leads, so mid-resync chains send stale versions); sent to t14j.
+- DECISION (mine, reversible): one transport contract. reopen() is required and drops the old connection (a
+  generation per connection); close() means finished, called only by handle.close(); resync never calls close().
+  p6-land (t17s, fresh session: t173 was idle over 1 h) does it plus a SharedWorker resync test.
+- Engine accepted M3: restamp() re-stamps the whole never-sent chain per element (room version r -> r+1, r+2, ...;
+  fresh nonces; sent ops keep their bytes). t15q is doing it in replica.js + test/replica.test.js only, so there's
+  no collision with p6-land. p6-land's verifier must re-run p6-sync2v's D5a busy-window seeds after it lands.
+- Engine's M3 fix verified (t171 PASS) and committed on p2-land: the whole never-sent chain is re-stamped. p6-land files untouched. p6-land's re-verify re-runs D5a.
+- p6-land done (t17s): worktree bun test 321/321 (re-run by me), no files outside client paths. One flaky test seen,
+  platform's test/auth/http.test.js:503 (wall-clock ratio, 2 of 132 full runs): to the proxy for platform.
+- p6-landv (t181) started fresh (t176 was idle ~1 h). p6-sync2v's FAIL report committed on main; t176 closed.

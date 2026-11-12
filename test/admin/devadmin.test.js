@@ -86,7 +86,7 @@ test("CLI: creates the tenant on SQLite, prints one JSON line, re-runs as a no-o
 
 test("CLI: bad arguments exit 2 with usage and touch nothing", async () => {
   const dir = tempDir();
-  for (const argv of [[], ["--admin", "dev:ann"], ["--domain"], ["--domain", "acme.com", "--nope"], ["--domain", "localhost"], ["--domain", "acme.com", "--admin", "ann"]]) {
+  for (const argv of [[], ["--admin", "dev:ann"], ["--domain", "acme.test"], ["--domain=acme.test", "--data-dir", dir], ["--domain"], ["--domain", "acme.com", "--nope"], ["--domain", "localhost"], ["--domain", "acme.com", "--admin", "ann"]]) {
     const x = io();
     expect(await run(argv, { PLENARY_DATA_DIR: dir }, x.io)).toBe(2);
     expect(x.o.out).toEqual([]);
@@ -94,6 +94,17 @@ test("CLI: bad arguments exit 2 with usage and touch nothing", async () => {
   }
   expect(existsSync(join(dir, "registry.db"))).toBe(false);
   expect(parseArgs(["--domain=acme.com", "--admin", "a@acme.com", "--admin", "dev:b"])).toEqual({ domain: "acme.com", admins: ["a@acme.com", "dev:b"] });
+});
+
+test("CLI: an email admin off --domain, or a control character, exits 2 naming the entry and touches nothing", async () => {
+  const dir = tempDir();
+  for (const [bad, shown] of [["bob@evil.com", '"bob@evil.com"'], ["x@acme.com\u0007", '"x@acme.com\\u0007"']]) {
+    const x = io();
+    expect(await run(["--domain", "acme.com", "--admin", "dev:ann", "--admin", bad], { PLENARY_DATA_DIR: dir }, x.io)).toBe(2);
+    expect(x.o.out).toEqual([]);
+    expect(x.o.err.join("\n")).toContain(shown);
+  }
+  expect(existsSync(join(dir, "registry.db"))).toBe(false);
 });
 
 test("CLI: a Registry it can't open exits 1 and never prints the URL", async () => {

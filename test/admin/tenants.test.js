@@ -88,6 +88,14 @@ for (const [name, make] of ADAPTERS) describe(`bootstrapTenant: ${name}`, () => 
       await expect(bootstrapTenant({ registry: r, domain: "acme.com", admins: [admin] })).rejects.toMatchObject({ code: "bad-request" });
     expect(await r.tenantByDomain("acme.com")).toBe(null);
   }));
+
+  test("an email admin off the tenant's domain, or any control character, is refused and nothing is written", withReg(async r => {
+    for (const admin of ["bob@evil.com", "email:bob@evil.com", "bob@sub.acme.com", "bob@acme.com.", "x@acme.com\0", "google:12\u000134", "dev:ann\u007f", "a\u200b@acme.com", "google:1\u0085"])
+      await expect(bootstrapTenant({ registry: r, domain: "acme.com", admins: ["dev:ok", admin] })).rejects.toMatchObject({ code: "bad-request" });
+    expect(await r.tenantByDomain("acme.com")).toBe(null);
+    const ok = await bootstrapTenant({ registry: r, domain: "Acme.com", admins: ["Bob@ACME.com"] });
+    expect(ok.tenant.admins).toEqual(["email:bob@acme.com"]);
+  }));
 });
 
 test("normDomain / normAdmin", () => {
@@ -97,6 +105,10 @@ test("normDomain / normAdmin", () => {
   expect(normAdmin("dev:ann")).toBe("dev:ann");
   expect(normAdmin("email:Bob@Acme.com")).toBe("email:bob@acme.com");
   expect(normAdmin("bob@acme.com")).toBe("email:bob@acme.com");
+  expect(normAdmin("Bob@Acme.com", "acme.com")).toBe("email:bob@acme.com");
+  expect(normAdmin("dev:ann", "acme.com")).toBe("dev:ann");
+  expect(() => normAdmin("bob@evil.com", "acme.com")).toThrow(/tenant's domain acme\.com: "bob@evil\.com"/);
+  expect(() => normAdmin("x@y\0")).toThrow(/control character: "x@y\\u0000"/);
 });
 
 describe("an email-named admin is matched at sign-in (boards.js)", () => {
@@ -119,9 +131,17 @@ describe("an email-named admin is matched at sign-in (boards.js)", () => {
       await expect(createBoard({ caller, tenant: tenant.id }, { registry })).rejects.toMatchObject({ code: "forbidden" });
   });
 
+  test("a dev token claiming the vouched-looking email and the tenant's domain never matches an email entry", async () => {
+    const { registry, tenant } = await setup();
+    const caller = { user: "dev:alice", name: "alice", email: "alice@acme.com", domain: "acme.com" };
+    await expect(createBoard({ caller, tenant: tenant.id }, { registry })).rejects.toMatchObject({ code: "forbidden" });
+  });
+
   test("an email entry never matches by user id, and a user-id admin still works", async () => {
     const registry = memoryRegistry();
-    const { tenant } = await bootstrapTenant({ registry, domain: "acme.com", admins: ["dev:ann"] });
+    // The tenant really holds email:alice@acme.com, so only the user-id guard stands between the caller and admin.
+    const { tenant } = await bootstrapTenant({ registry, domain: "acme.com", admins: ["dev:ann", "alice@acme.com"] });
+    expect(tenant.admins).toContain("email:alice@acme.com");
     await createBoard({ caller: { user: "dev:ann", name: "ann", email: null, domain: null }, tenant: tenant.id }, { registry });
     await expect(createBoard({ caller: { user: "email:alice@acme.com", name: null, email: null, domain: "acme.com" }, tenant: tenant.id }, { registry })).rejects.toMatchObject({ code: "forbidden" });
   });

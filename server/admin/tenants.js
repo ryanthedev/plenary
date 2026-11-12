@@ -10,9 +10,11 @@
 // How an admin is named (`admins` entries):
 //   google:<sub>   a Google user (Identity.user), known only after their first sign-in
 //   dev:<name>     a dev-token user
-//   email:<addr>   anyone by email, before their first sign-in. Matched by server/admin/boards.js when the
-//                  caller's IdP-vouched email is that address AND the caller's Workspace domain is the tenant's.
-// A bare address (`alice@acme.com`) is taken as email:<addr>. Emails are lower-cased.
+//   email:<addr>   anyone by email, before their first sign-in. Matched by server/admin/boards.js only for a
+//                  Google caller (user google:<sub>) whose IdP-vouched email is that address AND whose Workspace
+//                  domain is the tenant's; a dev token claiming that email never matches. The address must be on
+//                  the tenant's own domain (anything else could never match, so it is refused).
+// A bare address (`alice@acme.com`) is taken as email:<addr>. Emails are lower-cased. Control characters are refused.
 
 import { normEmail } from "../auth/util.js";
 
@@ -34,13 +36,29 @@ export function normDomain(d) {
   return s;
 }
 
-/** An admin name in its stored form: google:<sub>, dev:<name> or email:<addr>; throws on anything else. */
-export function normAdmin(a) {
+// Control characters (C0, DEL, C1) and Unicode format characters (zero-width, bidi overrides): never in an admin name.
+const CONTROL = /[\p{Cc}\p{Cf}]/u;
+
+/**
+ * An admin name in its stored form: google:<sub>, dev:<name> or email:<addr>; throws on anything else.
+ * With `domain` (the tenant's, already normalised), an email admin must be on exactly that domain: the match in
+ * server/admin/boards.js needs the caller's Workspace domain to be the tenant's and Google's `hd` to equal the
+ * email's domain, so an address elsewhere could never match anyone. Any control character is refused.
+ * @param {unknown} a
+ * @param {string} [domain]
+ */
+export function normAdmin(a, domain) {
   const s = typeof a === "string" ? a.trim() : "";
+  const shown = JSON.stringify(typeof a === "string" ? a : String(a ?? "")).slice(0, 80);
+  if (typeof a === "string" && CONTROL.test(a)) throw new BootstrapError(`admin name has a control character: ${shown}`);
   if (/^google:[^\s]{1,255}$/.test(s) || /^dev:[A-Za-z0-9_.@-]{1,64}$/.test(s)) return s;
   const e = normEmail(s.startsWith("email:") ? s.slice(6) : s);
-  if (e && EMAIL.test(e) && e.length <= 320) return "email:" + e;
-  throw new BootstrapError(`not an admin name (google:<sub>, dev:<name> or an email): ${JSON.stringify(s).slice(0, 80)}`);
+  if (e && EMAIL.test(e) && e.length <= 320) {
+    if (domain !== undefined && e.slice(e.lastIndexOf("@") + 1) !== domain)
+      throw new BootstrapError(`email admin is not on the tenant's domain ${domain}: ${shown}`);
+    return "email:" + e;
+  }
+  throw new BootstrapError(`not an admin name (google:<sub>, dev:<name> or an email): ${shown}`);
 }
 
 /**
@@ -50,7 +68,7 @@ export function normAdmin(a) {
 export async function bootstrapTenant({ registry, domain, admins = [] }) {
   const d = normDomain(domain);
   if (!Array.isArray(admins)) throw new BootstrapError("admins must be a list");
-  const want = [...new Set(admins.map(normAdmin))];
+  const want = [...new Set(admins.map(a => normAdmin(a, d)))];
 
   let t = await registry.tenantByDomain(d), created = false;
   if (!t) {

@@ -33,15 +33,18 @@ const bad = m => new AdminError("bad-request", m);
 
 /**
  * A tenant admin is named by user id (google:<sub>, dev:<name>) or, before their first sign-in, by email
- * (`email:<addr>`, server/admin/tenants.js). An email entry matches only a caller whose email the IdP vouches for
- * (Identity.email is set only then) AND whose Workspace domain is the tenant's, so a guest from another domain
- * holding that address elsewhere never becomes admin.
+ * (`email:<addr>`, server/admin/tenants.js). An email entry matches only a Google caller (user google:<sub>: the
+ * only verifier whose email is IdP-vouched; a dev token's email is whatever the operator typed) whose email is
+ * that address AND whose Workspace domain is the tenant's, so a guest from another domain holding that address
+ * elsewhere never becomes admin. An `email:` entry is never matched as a user id (no verifier mints such an id;
+ * defense in depth).
  */
 async function isTenantAdmin(registry, caller, tenantId) {
   if (!caller || typeof caller.user !== "string" || typeof tenantId !== "string") return false;
   const t = await registry.tenant(tenantId);
   if (!t) return false;
-  if (t.admins.includes(caller.user)) return true;
+  if (!caller.user.startsWith("email:") && t.admins.includes(caller.user)) return true;
+  if (!caller.user.startsWith("google:")) return false;
   const email = normEmail(caller.email);
   return !!email && !!t.domain && caller.domain === t.domain && t.admins.includes("email:" + email);
 }

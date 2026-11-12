@@ -4,9 +4,10 @@
 //   bun scripts/admin-bootstrap.js --domain acme.com --admin alice@acme.com [--admin google:<sub>] [--admin dev:ann]
 //
 // --domain   the Google Workspace domain (the `hd` claim); required
-// --admin    repeatable; google:<sub>, dev:<name>, or an email (stored as email:<addr>). An email admin is matched at
-//            sign-in when the IdP vouches for that email and the user's Workspace domain is the tenant's, so the
-//            first admin can be named before they have ever signed in.
+// --admin    required, repeatable; google:<sub>, dev:<name>, or an email on --domain (stored as email:<addr>). An
+//            email admin is matched at Google sign-in when Google vouches for that email and the user's Workspace
+//            domain is the tenant's, so the first admin can be named before they have ever signed in. An email on
+//            another domain, or any control character, is refused (exit 2, naming the entry).
 // --data-dir the single node's data directory (default: PLENARY_DATA_DIR, else ./data), as server/main.js reads it
 //
 // Which Registry: DATABASE_URL set → Postgres (schema "public", the adapter's default); else SQLite at
@@ -42,6 +43,8 @@ export function parseArgs(argv) {
     else throw new UsageError(`unknown argument: ${flag}`);
   }
   if (!o.domain) throw new UsageError("--domain is required");
+  // A tenant with no admins can't create boards; refuse rather than make one. Re-runs still only add.
+  if (o.admins.length === 0) throw new UsageError("--admin is required (at least one)");
   return o;
 }
 class UsageError extends Error {}
@@ -54,7 +57,11 @@ class UsageError extends Error {}
  */
 export async function run(argv, env = {}, { out = s => console.log(s), err = s => console.error(s) } = {}) {
   let args;
-  try { args = parseArgs(argv); normDomain(args.domain); args.admins.forEach(normAdmin); }   // validate before opening anything
+  try {   // validate before opening anything
+    args = parseArgs(argv);
+    const domain = normDomain(args.domain);
+    for (const a of args.admins) normAdmin(a, domain);
+  }
   catch (e) { err(`${e.message}\n${USAGE}`); return 2; }
 
   let registry, store;

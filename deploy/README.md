@@ -82,6 +82,62 @@ throwaway CI-only literals written in the workflow.
 
 ## Cluster (phase 4, not functional yet)
 
+## Postgres roles (least privilege)
+
+Not live yet: `server/main.js` does not use the Postgres adapters (see [What is missing](#cluster-phase-4-not-functional-yet)
+below). This is how the adapters behave, for when it does.
+
+PROTOCOL.md § Store, "Least privilege": a Plenary node can run as a Postgres role that reads and writes the tables
+but does not own the schema. The Registry (`server/registry/postgres.js`, tables `reg_*`) and the Store
+(`server/store/postgres.js`, tables `pl_*`) start the same way: under an advisory lock they look each table and index
+up (`to_regclass`) and create only what is missing. They never ALTER, DROP or GRANT anything. So use two roles:
+
+| Role | Rights | Used by |
+|---|---|---|
+| owner (`plenary_owner`) | owns the database, so its `public` schema (Postgres 15+); creates the tables | the migrate step, once per schema and after an upgrade that adds a table |
+| runtime (`plenary_app`) | `USAGE` on the schema; `SELECT, INSERT, UPDATE, DELETE` on its tables; no `CREATE` | every node's `DATABASE_URL` |
+
+Dev, CI and `cluster.compose.yml` use one owner role for both, which also works: the first node to start creates
+everything. Several nodes starting at once against an empty schema is safe: the advisory lock (one per schema) makes
+them create the tables one after another, and each later one finds them and creates nothing.
+
+**1. Create the roles and database, as an admin** (a superuser, or a role with `CREATEROLE` and `CREATEDB`):
+
+```sql
+CREATE ROLE plenary_owner LOGIN PASSWORD '<your own>';
+CREATE ROLE plenary_app LOGIN PASSWORD '<your own>';
+CREATE DATABASE plenary OWNER plenary_owner;
+```
+
+On Postgres 15 and later the new database's `public` schema belongs to its owner and nobody else may create in it.
+On 14 and older, also run `REVOKE CREATE ON SCHEMA public FROM PUBLIC;` in the new database (not tested here).
+
+**2. Migrate, as the owner.** There is no `plenary migrate` command yet (phase 4); starting both adapters once does
+the same thing. `PLENARY_PG_SCHEMA` is only this one-liner's variable (default `public`):
+
+```sh
+DATABASE_URL='postgres://plenary_owner:…@db/plenary' bun -e '
+import { postgresRegistry } from "./server/registry/postgres.js";
+import { postgresStore } from "./server/store/postgres.js";
+const url = process.env.DATABASE_URL, schema = process.env.PLENARY_PG_SCHEMA || "public";
+await (await postgresRegistry({ url, schema })).close();
+await (await postgresStore({ url, schema })).close();
+console.log("migrated", schema);'
+```
+
+**3. Grant the runtime role, as the owner** (`psql` on database `plenary`). Identity columns need no sequence grant.
+The `DEFAULT PRIVILEGES` line covers tables the owner creates later, so a migrate that adds a table needs no new grant:
+
+```sql
+GRANT USAGE ON SCHEMA public TO plenary_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO plenary_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO plenary_app;
+```
+
+**If start-up is refused**, a runtime-role node stops with `postgres registry: start-up in schema "…" was refused for
+lack of a privilege (permission denied …)`. Either a table is missing (run step 2) or the role lacks its grants (run
+step 3). The Store's message is Postgres's own `permission denied …`.
+
 `cluster.compose.yml` is the phase-4 shape: Postgres, NATS, an S3-compatible blob store, three app nodes and a Caddy
 load balancer. It is a separate Compose project (`plenary-cluster`), so it never touches the single-node stack above,
 whose `compose.yml` is unchanged.

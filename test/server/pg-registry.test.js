@@ -1,10 +1,11 @@
 // The Postgres Registry (server/registry/postgres.js): platform's shared contract, plus what only Postgres has:
 // the last-owner check under real concurrency (two connections), a deterministic row-lock race, same answers as
-// the in-memory adapter on edge cases (garbage ids, NUL), and durability across a reopen.
+// the in-memory adapter on edge cases (garbage ids, NUL), durability across a reopen, least privilege (PROTOCOL.md
+// § Store, "Least privilege") and concurrent start-up on an empty schema.
 // Skips unless DATABASE_URL is set. Each test gets its own schema, dropped after.
 import { describe, test, expect, afterAll } from "bun:test";
 import { SQL } from "bun";
-import { postgresRegistry } from "../../server/registry/postgres.js";
+import { postgresRegistry, registryTables, REGISTRY_INDEXES } from "../../server/registry/postgres.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { registryContract } from "../auth/registry-contract.js";
 
@@ -13,7 +14,10 @@ const url = process.env.DATABASE_URL;
 describe.skipIf(!url)("postgres registry", () => {
   /** @type {SQL} */ let sql;
   const client = () => (sql ??= new SQL({ url, max: 4 }));
-  afterAll(async () => { if (sql) await sql.close(); });
+  afterAll(async () => {
+    if (priv.app) { await priv.app.close(); await client().unsafe(`DROP ROLE IF EXISTS "${priv.role}"`); }
+    if (sql) await sql.close();
+  });
   let n = 0;
   const schemaName = () => `pl_test_reg_${process.pid}_${Date.now().toString(36)}_${++n}`;
   const drop = s => client().unsafe(`DROP SCHEMA IF EXISTS "${s}" CASCADE`);
@@ -23,6 +27,32 @@ describe.skipIf(!url)("postgres registry", () => {
   registryContract("postgres", async ({ now }) => {
     const schema = schemaName();
     const r = await postgresRegistry({ sql: client(), schema, now });
+    schemas.set(r, schema);
+    return r;
+  }, { cleanup: async r => { await r.close(); await drop(schemas.get(r)); schemas.delete(r); } });
+
+  // The same contract as a runtime role: USAGE on the schema and row rights on tables an owner created, nothing more
+  // (PROTOCOL.md § Store, "Least privilege"). One role for the file; each test's schema is migrated by the owner
+  // client, then granted. If the DATABASE_URL role can't create roles, the factory falls back to the owner (warned
+  // once), as the least-privilege tests below skip.
+  const priv = { role: `pl_test_regrt_${process.pid}`, pass: "pl-test-" + Date.now().toString(36), app: null, off: false };
+  const runtime = async () => {
+    if (priv.app || priv.off) return priv.app;
+    const [{ ok }] = await client().unsafe("SELECT rolsuper OR rolcreaterole AS ok FROM pg_roles WHERE rolname = current_user");
+    if (!ok) { priv.off = true; console.warn("pg-registry: runtime-role contract runs as the owner (the DATABASE_URL role can't create roles)"); return null; }
+    await client().unsafe(`CREATE ROLE "${priv.role}" LOGIN PASSWORD '${priv.pass}'`);
+    const u = new URL(url); u.username = priv.role; u.password = priv.pass;
+    return (priv.app = new SQL({ url: u.toString(), max: 4 }));
+  };
+  registryContract("postgres (runtime role: no CREATE, row rights only)", async ({ now }) => {
+    const schema = schemaName();
+    await (await postgresRegistry({ sql: client(), schema })).close();          // the owner migrates
+    const app = await runtime();
+    if (app) {
+      await client().unsafe(`GRANT USAGE ON SCHEMA "${schema}" TO "${priv.role}"`);
+      await client().unsafe(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO "${priv.role}"`);
+    }
+    const r = await postgresRegistry({ sql: app ?? client(), schema, now });
     schemas.set(r, schema);
     return r;
   }, { cleanup: async r => { await r.close(); await drop(schemas.get(r)); schemas.delete(r); } });
@@ -187,6 +217,78 @@ describe.skipIf(!url)("postgres registry", () => {
     const mem = await run(memoryRegistry({ now }));
     for (let i = 0; i < mem.length; i++) expect([i, pg[i]]).toEqual([i, mem[i]]);
     expect(pg.length).toBe(mem.length);
+  });
+
+  test("least privilege: an owner migrates; a role with only USAGE and row grants starts the registry and passes the contract calls, and can't create anything", async () => {
+    // Needs a DATABASE_URL role that may create roles (CI's and a local cluster's superuser can); skipped otherwise.
+    const [{ ok }] = await client().unsafe("SELECT rolsuper OR rolcreaterole AS ok FROM pg_roles WHERE rolname = current_user");
+    if (!ok) { console.warn("pg-registry: skipping the least-privilege test (the DATABASE_URL role can't create roles)"); return; }
+    const schema = schemaName(), bare = schemaName(), role = `pl_test_regapp_${process.pid}_${++n}`, pass = "pl-test-" + Date.now().toString(36);
+    const owner = await postgresRegistry({ sql: client(), schema });              // the owner migrates (tables + indexes)
+    await owner.close();
+    await client().unsafe(`CREATE ROLE "${role}" LOGIN PASSWORD '${pass}'`);
+    await client().unsafe(`CREATE SCHEMA "${bare}"`);                            // made for the app, never migrated
+    for (const sch of [schema, bare]) await client().unsafe(`GRANT USAGE ON SCHEMA "${sch}" TO "${role}"`);
+    await client().unsafe(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO "${role}"`);
+    const u = new URL(url); u.username = role; u.password = pass;
+    const app = new SQL({ url: u.toString(), max: 2 });
+    try {
+      const [{ can }] = await app.unsafe("SELECT has_schema_privilege($1, 'CREATE') AS can", [schema]);
+      expect(can).toBe(false);                                                    // really not the owner
+      const r = await postgresRegistry({ sql: app, schema });                     // starts: everything exists, no CREATE runs
+      // Every kind of write (identity columns included: no sequence grant needed) and read, as the runtime role.
+      const t = await r.createTenant({ domain: "acme.com", admins: ["google:a"] });
+      await r.addTenantAdmin(t.id, "google:b");
+      const b = await r.createBoard({ tenant: t.id, title: "x" });
+      await r.setGrant(b.id, "google:a", "owner");
+      await r.setGrant(b.id, "google:b", "editor");
+      await r.setGrant(b.id, "google:b", null);
+      await expect(r.setGrant(b.id, "google:a", null)).rejects.toMatchObject({ code: "last-owner" });
+      const i = await r.createInvite({ board: b.id, email: "c@d.e", role: "viewer", by: "google:a" });
+      expect(await r.revokeInvite(i.id)).toBe(true);
+      const l = await r.createLink({ board: b.id, role: "viewer", by: "google:a" });
+      await r.addLinkUse(l.id, "google:g");
+      expect(await r.linkUses(b.id, "google:g")).toEqual([l.id]);
+      expect((await r.tenant(t.id)).admins).toEqual(["google:a", "google:b"]);
+      expect(await r.grants(b.id)).toEqual([{ user: "google:a", role: "owner" }]);
+      await r.close();
+      // The same role on a schema nobody migrated: refused loudly, with what to do (so the start above created nothing).
+      const err = await postgresRegistry({ sql: app, schema: bare }).then(() => null, e => e);
+      expect(err?.message).toMatch(/^postgres registry: start-up in schema "pl_test_reg_\w+" was refused for lack of a privilege \(permission denied.*run the migrate step as the schema owner/);
+      expect(err.cause?.errno).toBe("42501");
+      expect((await client().unsafe(`SELECT count(*)::int AS c FROM pg_tables WHERE schemaname = $1`, [bare]))[0].c).toBe(0);
+      await expect(app.unsafe(`CREATE TABLE "${schema}".reg_extra (x INT)`)).rejects.toThrow(/permission denied/);
+    } finally {
+      await app.close();
+      await drop(schema); await drop(bare);
+      await client().unsafe(`DROP ROLE IF EXISTS "${role}"`);
+    }
+  });
+
+  test("start-up creates exactly the declared tables and indexes, and a second start changes nothing", async () => {
+    const schema = schemaName();
+    const catalog = async () => (await client().unsafe(
+      `SELECT c.relname, c.relkind FROM pg_class c JOIN pg_namespace ns ON ns.oid = c.relnamespace WHERE ns.nspname = $1 ORDER BY 1`, [schema]))
+      .map(r => `${r.relkind}:${r.relname}`);
+    try {
+      await (await postgresRegistry({ sql: client(), schema })).close();
+      const first = await catalog();
+      for (const t of Object.keys(registryTables(schema))) expect(first).toContain(`r:${t}`);
+      for (const i of Object.keys(REGISTRY_INDEXES)) expect(first).toContain(`i:${i}`);
+      await (await postgresRegistry({ sql: client(), schema })).close();
+      expect(await catalog()).toEqual(first);
+    } finally { await drop(schema); }
+  });
+
+  test("eight nodes starting at once against an empty schema: all start, one set of tables, and they share data", async () => {
+    const schema = schemaName();
+    const hs = await Promise.all(Array.from({ length: 8 }, () => postgresRegistry({ url, schema, max: 1 })));
+    try {
+      const [{ c }] = await client().unsafe("SELECT count(*)::int AS c FROM pg_tables WHERE schemaname = $1", [schema]);
+      expect(c).toBe(Object.keys(registryTables(schema)).length);
+      const t = await hs[0].createTenant({ domain: null });
+      for (const h of hs) expect((await h.tenant(t.id))?.id).toBe(t.id);
+    } finally { for (const h of hs) await h.close(); await drop(schema); }
   });
 
   test("durable: everything survives close and reopen (a fresh pool)", async () => {

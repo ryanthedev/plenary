@@ -13,13 +13,20 @@
 // Lookups never throw on bad input: a garbage id (non-string, or a string holding NUL, which Postgres refuses as
 // text) resolves to null / [] / false (PROTOCOL.md § Auth: null = `auth`, a throw = `unavailable`).
 //
+// Least privilege (PROTOCOL.md § Store, "Least privilege"; the Registry too): start-up creates only what is missing
+// (migrate() in server/pg/schema.js for the tables, the same to_regclass look-up here for the two indexes), so the
+// server may run as a role with USAGE on the schema and SELECT/INSERT/UPDATE/DELETE on these tables, against a schema
+// an owner role created ahead of time. Nothing here ever ALTERs, DROPs or GRANTs. A start-up refused for lack of a
+// privilege (a missing table with no CREATE right, or no USAGE) throws "postgres registry: start-up in schema … was
+// refused for lack of a privilege (…)", naming both fixes (deploy/README.md, Postgres roles).
+//
 // The factory is async (schema created on start, idempotently, under an advisory lock). Pass `url` (the adapter
 // owns that pool) or `sql` (a Bun SQL client you own). `schema` names the Postgres schema. Never reads env.
 
 import { SQL } from "bun";
 import { mint } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
-import { needSchema, ensureSchema } from "../pg/schema.js";
+import { needSchema, migrate } from "../pg/schema.js";
 
 /** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code`. */
 export class PgRegistryError extends Error {
@@ -28,6 +35,34 @@ export class PgRegistryError extends Error {
 }
 
 const UNIQUE = "23505";
+/** Postgres SQLSTATE for "permission denied" (insufficient_privilege). */
+const DENIED = "42501";
+
+/**
+ * The Registry's tables, in foreign-key order (§ Registry, § Store "Least privilege"). Created by `migrate`
+ * (server/pg/schema.js), which looks each one up first and creates only what is missing; an operator may create them
+ * ahead of time as the owner role. `$S` stands for the quoted schema name. Identity columns (`n`) keep insertion
+ * order; a runtime role needs no sequence grant for them (identity sequences are used through the table's INSERT).
+ */
+const REGISTRY_TABLE_DDL = {
+  reg_tenants: "id TEXT PRIMARY KEY, domain TEXT UNIQUE, created_at BIGINT NOT NULL",
+  reg_tenant_admins: "tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), member TEXT NOT NULL, n BIGINT GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (tenant, member)",
+  reg_boards: "id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), title TEXT NOT NULL, member_role TEXT, created_at BIGINT NOT NULL",
+  reg_grants: "board TEXT NOT NULL REFERENCES $S.reg_boards(id), member TEXT NOT NULL, role TEXT NOT NULL, n BIGINT GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (board, member)",
+  reg_invites: "n BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES $S.reg_boards(id), email TEXT NOT NULL, role TEXT NOT NULL, expires_at BIGINT, revoked BOOLEAN NOT NULL, by_user TEXT, created_at BIGINT NOT NULL",
+  reg_links: "n BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES $S.reg_boards(id), role TEXT NOT NULL, expires_at BIGINT, revoked BOOLEAN NOT NULL, by_user TEXT, created_at BIGINT NOT NULL",
+  reg_link_uses: "board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES $S.reg_links(id), n BIGINT GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (board, member, link)",
+};
+/** Index name → "table (columns)"; created after the tables, only if missing (to_regclass), like the tables. */
+export const REGISTRY_INDEXES = {
+  reg_invites_board: "reg_invites (board, email)",
+  reg_links_board: "reg_links (board)",
+};
+/** The tables' column definitions for one schema (foreign keys name it), as `migrate` takes them. */
+export const registryTables = schema => {
+  const q = `"${needSchema(schema)}"`;
+  return Object.fromEntries(Object.entries(REGISTRY_TABLE_DDL).map(([k, v]) => [k, v.replaceAll("$S", q)]));
+};
 /** A string Postgres will take as text (no NUL). */
 const key = v => typeof v === "string" && !v.includes("\0");
 const num = v => (v == null ? null : Number(v));
@@ -49,32 +84,21 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
   try {
     await db.begin(async tx => {
       await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-schema:${s}`]);
-      await ensureSchema(tx, s);
-      await tx.unsafe(`CREATE TABLE IF NOT EXISTS ${T} (
-        id TEXT PRIMARY KEY, domain TEXT UNIQUE, created_at BIGINT NOT NULL)`);
-      await tx.unsafe(`CREATE TABLE IF NOT EXISTS ${A} (
-        tenant TEXT NOT NULL REFERENCES ${T}(id), member TEXT NOT NULL, n BIGINT GENERATED ALWAYS AS IDENTITY,
-        PRIMARY KEY (tenant, member))`);
-      await tx.unsafe(`CREATE TABLE IF NOT EXISTS ${BD} (
-        id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES ${T}(id), title TEXT NOT NULL,
-        member_role TEXT, created_at BIGINT NOT NULL)`);
-      await tx.unsafe(`CREATE TABLE IF NOT EXISTS ${G} (
-        board TEXT NOT NULL REFERENCES ${BD}(id), member TEXT NOT NULL, role TEXT NOT NULL,
-        n BIGINT GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (board, member))`);
-      await tx.unsafe(`CREATE TABLE IF NOT EXISTS ${I} (
-        n BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES ${BD}(id),
-        email TEXT NOT NULL, role TEXT NOT NULL, expires_at BIGINT, revoked BOOLEAN NOT NULL, by_user TEXT,
-        created_at BIGINT NOT NULL)`);
-      await tx.unsafe(`CREATE INDEX IF NOT EXISTS reg_invites_board ON ${I} (board, email)`);
-      await tx.unsafe(`CREATE TABLE IF NOT EXISTS ${L} (
-        n BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES ${BD}(id),
-        role TEXT NOT NULL, expires_at BIGINT, revoked BOOLEAN NOT NULL, by_user TEXT, created_at BIGINT NOT NULL)`);
-      await tx.unsafe(`CREATE INDEX IF NOT EXISTS reg_links_board ON ${L} (board)`);
-      await tx.unsafe(`CREATE TABLE IF NOT EXISTS ${U} (
-        board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES ${L}(id),
-        n BIGINT GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (board, member, link))`);
+      await migrate(tx, s, registryTables(s));
+      for (const [name, def] of Object.entries(REGISTRY_INDEXES)) {
+        const [{ r }] = await tx.unsafe("SELECT to_regclass($1) AS r", [`"${s}".${name}`]);
+        if (r === null) await tx.unsafe(`CREATE INDEX ${name} ON "${s}".${def}`);
+      }
     });
-  } catch (err) { if (owned) await db.close(); throw err; }
+  } catch (err) {
+    if (owned) await db.close();
+    if (err?.errno === DENIED) {
+      throw new Error(`postgres registry: start-up in schema "${s}" was refused for lack of a privilege (${err.message}). `
+        + "If tables are missing, run the migrate step as the schema owner; otherwise grant this role USAGE on the schema "
+        + "and SELECT, INSERT, UPDATE, DELETE on its tables (deploy/README.md, Postgres roles)", { cause: err });
+    }
+    throw err;
+  }
 
   const ready = () => { if (!open) throw new Error("registry: closed"); };
   /** One durable write transaction. */

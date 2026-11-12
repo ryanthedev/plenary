@@ -27,6 +27,22 @@ export class SqlRegistryError extends Error {
 const str = v => typeof v === "string";
 
 /**
+ * Runs `f`, retrying while SQLite reports BUSY/LOCKED, with a short growing backoff (5 ms doubling, at most 100 ms,
+ * plus jitter), until `deadline` (ms since epoch); then throws the last error. Only for start-up statements that
+ * SQLite may refuse without consulting the busy handler. Blocks (start-up is synchronous).
+ */
+function onBusyRetry(deadline, f) {
+  for (let delay = 5; ; delay = Math.min(delay * 2, 100)) {
+    try { return f(); }
+    catch (err) {
+      const busy = typeof err?.code === "string" && (err.code.startsWith("SQLITE_BUSY") || err.code.startsWith("SQLITE_LOCKED"));
+      if (!busy || Date.now() >= deadline) throw err;
+      Bun.sleepSync(delay + Math.floor(Math.random() * delay));
+    }
+  }
+}
+
+/**
  * @param {{ path: string, now?: () => number, fullfsync?: boolean, busyTimeoutMs?: number }} o
  *   `path` is a file (":memory:" for throwaway use).
  * @returns {import("../auth/registry-port.js").Registry & { close(): Promise<void>, pragmas(): object }}
@@ -34,14 +50,23 @@ const str = v => typeof v === "string";
 export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTimeoutMs = 5000 }) {
   const db = new Database(path, { create: true, strict: true });
   let open = true;
-  db.run(`PRAGMA busy_timeout=${Math.max(0, Math.floor(busyTimeoutMs))}`);
-  db.run("PRAGMA journal_mode=WAL");
+  const wait = Math.max(0, Math.floor(busyTimeoutMs));
+  db.run(`PRAGMA busy_timeout=${wait}`);
+  // Several processes opening one brand-new file at once (N nodes or bootstrap scripts): switching to WAL needs an
+  // exclusive lock, and SQLite returns BUSY for it without calling the busy handler, so busy_timeout alone doesn't
+  // help (reproduced: ~1 in 10 of 12 simultaneous opens failed at this pragma). So: skip the switch once the file
+  // already reads WAL (it is persistent), and retry it, and the first schema transaction, with a short backoff
+  // until the same busy_timeout budget runs out. Every later statement waits through the busy handler as usual.
+  const deadline = Date.now() + wait;
+  onBusyRetry(deadline, () => {
+    if (db.query("PRAGMA journal_mode").get()?.journal_mode !== "wal") db.run("PRAGMA journal_mode=WAL");
+  });
   db.run("PRAGMA synchronous=FULL");
   db.run(`PRAGMA fullfsync=${fullfsync ? "ON" : "OFF"}`);
   db.run(`PRAGMA checkpoint_fullfsync=${fullfsync ? "ON" : "OFF"}`);
   db.run("PRAGMA foreign_keys=ON");
 
-  db.transaction(() => {
+  onBusyRetry(deadline, () => db.transaction(() => {
     db.run(`CREATE TABLE IF NOT EXISTS reg_tenants (
       id TEXT PRIMARY KEY, domain TEXT UNIQUE, created_at INTEGER NOT NULL)`);
     db.run(`CREATE TABLE IF NOT EXISTS reg_tenant_admins (
@@ -65,7 +90,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     db.run(`CREATE TABLE IF NOT EXISTS reg_link_uses (
       board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES reg_links(id), n INTEGER NOT NULL,
       PRIMARY KEY (board, member, link))`);
-  }).immediate();
+  }).immediate());
 
   const q = {
     tenant: db.query("SELECT id, domain, created_at FROM reg_tenants WHERE id = ?"),

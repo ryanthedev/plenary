@@ -201,3 +201,4 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   the session token to the web client in the URL fragment of a configured post-login URL (no open redirect);
   API routes use `Authorization: Bearer` (no cookie auth on mutations, so no CSRF surface).
 - Mount hook proposed to engine (t14j): `httpRoutes(deps) → (req) => Response | null`; awaiting their answer.
+- Engine agreed the hook: httpRoutes(deps) → async (req, url) => Response | null, mounted via createServer({ http }) AFTER engine routes; /health, /ws, /blobs/*, /metrics reserved for engine; return own 4xx/5xx (throws become 500). Engine wires main.js when http.js lands: tell t14j then. Relayed to t17b.

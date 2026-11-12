@@ -16,7 +16,8 @@ phase 4 leases/takeover.
 |---|---|---|
 | p2-tune (builder, plenary-p2-tune) | t1fw | RUNNING (brief docs/m2/briefs/p2-tune.md) |
 | p-audit (plenary-p-audit) | t1g5 | RUNNING read-only audit on a 3a7520d snapshot (brief docs/m2/briefs/p-audit.md) |
-| p-serve (builder, plenary-p-serve) | t1g3 | RUNNING (brief docs/m2/briefs/p-serve.md; server/static.js, server.js mount, test/server/static.test.js) |
+| p-serve (builder, plenary-p-serve) | t1g3 | reported; session not resumed after the 03:44 crash (resume: claude --resume 6e2aeee8-b46c-40c1-9528-5d31208282ee) |
+| p-servev (verifier, plenary-p-servev) | t1g8 | RUNNING (resumed by proxy after crash) |
 
 Closed: t1fx, t1g0, t1fm, t1fn, t1dh, t15q, t186, t188, t18c, t18b, t171, t16y, t158, t17d, t17p, t17f, t17m, t17j.
 Leftover scratch: t17j ~1 GB, t18c 168 MB in their scratchpads.
@@ -228,3 +229,6 @@ Leftover scratch: t17j ~1 GB, t18c 168 MB in their scratchpads.
 - p-archv PASS (3 MEDIUM, 8 LOW). Committed p-arch 44dd1aa (arch + store/registry/auth tests 179/0). Sent id to t187 (p5-pgpriv) and t14k (arch-scan). Decision: limit driven adapters to ports + explicit shared list (auth/http.js exempt). Follow-up to t1fx incl. platform's scripts/admin-bootstrap.js composition root.
 - p-arch follow-up (t1fx) done: M1-M3, adapter shared-list rule, DRIVING group (auth/http.js, server.js, static.js), admin-bootstrap root, server/blobs/port.js (allowlist empty), LOWs L1(opt-in),L2,L3,L5,L7. bun test 1044/0. Round 2 verify sent to t1g0.
 - p-archv round 2 PASS (4 new LOW, chiefly R2-L1: `/*` inside a string/regex earlier on the line hides an import; queue for later). Committed follow-up 3a7520d; told t187. Closed t1fx, t1g0. Started p-audit (t1g5).
+- Client t14k: final web/ paths + extended deny list forwarded to p-serve (t1g3). Open: web/core/dev-users.js may move to a dev-only root.
+- Platform p5-devadmin: (1) sqliteRegistry 'database is locked' on concurrent first open -> platform fixes (busy_timeout); check engine's store/sqlite.js too. (3) spec note queued: § Registry email:<addr> admins before first sign-in.
+- 03:44: herdr-core lost its holder; every agent killed; proxy resumed t18m, t1g8, t1g5, t1fw in place. Watches re-armed. p-serve reported (works; page boot blocked by client's main.js importing denied dev transports; told t14k). Extra flaky v1 checkpoint test sent to p2-tune R6.

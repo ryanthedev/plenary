@@ -13,17 +13,23 @@ import { toolsFor, pillFor } from "../../core/roles.js";
 import { renderPanel, loadLibrary, saveLibrary, addToLibrary } from "./panel.js";
 import { exportSvg, paintPng, loadPictures } from "./export.js";
 import { h, $, replace } from "./dom.js";
+import { mountCollab } from "./collab/ui.js";
+import { hitTest } from "../../../packages/core/geometry.js";
 
 /**
  * Mount the page on index.html's DOM.
  * @param {{ startSession: (o: { mine: string[], onChange: () => void }) => ReturnType<typeof import("../../core/session.js").createSession>,
  *           net: import("../../ports/net.js").Net, board: string, me: { user: string, name: string, role: string | null },
- *           prefs: import("../../ports/storage.js").Storage, theme?: string | null, notice?: string | null }} o
+ *           prefs: import("../../ports/storage.js").Storage, theme?: string | null, notice?: string | null,
+ *           collab?: (S: object, o: { jumpTo(p: { x: number, y: number }): void }) => object }} o
+ *   collab: the root's collab port factory (web/ports/collab.js; production and dev: web/adapters/collab/sync.js over
+ *   the session). The collaboration UI (./collab/ui.js) mounts over it: avatars, emotes, cursors, selections, laser,
+ *   previews, comment threads. Without it the page has none of that.
  *   startSession: the root's createSession with everything but the page's own bits. prefs: the per-browser store
  *   (local storage; a failing store reads as empty). notice: shown once (sign-in, share link).
  * @returns {{ S: object, ui: object, net: object, setTheme(t: string): void, openDialog(d: string): void, setPanel(op: object): void }}
  */
-export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null }) {
+export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null }) {
   const get = k => { try { return prefs.get(k); } catch { return null; } };
   const put = (k, v) => { try { prefs.set(k, v); } catch {} };
   const ui = {
@@ -44,6 +50,35 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const isPhone = () => matchMedia("(max-width: 640px)").matches;
   const canvas = $("#board"), ink = $("#ink"), ctx = canvas.getContext("2d");
   const allFiles = () => ({ ...S.eds.notes.doc.files, ...S.eds.board.doc.files });
+
+  // ── collaboration (p7-wire): the collab UI over the root's port, presence painted on its own canvas ──
+  const overlay = h("canvas.collab-overlay", { "aria-hidden": "true" });
+  canvas.after(overlay);
+  const jumpTo = p => {
+    const B = S.eds.board, { w, h: hh } = B.size, sc = B.view.scale;
+    B.view = { ...B.view, x: w / 2 / sc - p.x, y: hh / 2 / sc - p.y }; B.changed(); S.syncView("board"); chromeDirty = true;
+  };
+  const port = collabPort ? collabPort(S, { jumpTo }) : null;
+  const collab = port ? mountCollab({ root: $("#canvas"), canvasOverlay: overlay, port, theme: ui.theme,
+    view: { toScreen: p => S.eds.board.toScreen(p), toWorld: p => S.eds.board.toWorld(p), get scale() { return S.eds.board.view.scale; } } }) : null;
+  if (collab) collab.showDrawer("comments");
+  const worldAt = p => S.eds.board.toWorld(p);
+  // What I have selected goes out as presence (latest wins; the outbox paces it).
+  let selKey = "";
+  function sendSelection() {
+    if (!collab) return;
+    const stream = S.active, ids = [...S.eds[stream].sel], key = `${stream}|${ids.join(",")}`;
+    if (key !== selKey && collab.selection(stream, ids)) selKey = key;
+  }
+  // Right-click (or the 💬 button): a comment on the element under the pointer, else on that spot.
+  function startComment(p) {
+    if (!collab) return;
+    const w = worldAt(p), n = S.eds.notes, b = S.eds.board;
+    const hitN = hitTest(n.doc, w, n.tol()), hitB = hitN ? null : hitTest(b.doc, w, b.tol());
+    const el = hitN ?? hitB, on = el ? { stream: hitN ? "notes" : "board", element: isLabel(el) && el.containerId ? el.containerId : el.id } : null;
+    collab.startComment(w, on);
+  }
+  canvas.addEventListener("contextmenu", e => { if (!collab) return; e.preventDefault(); startComment(at(e)); });
   const image = imageCache(allFiles, () => { dirty = true; });
   let dirty = true, seen = -1;
 
@@ -115,6 +150,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     clicks = Math.max(e.detail || 0, countClick(e));
     if (S.tool === "image") { openPicker(); return; }
     S.pointerDown(at(e), pmods(e));
+    if (collab && S.tool === "laser" && e.button === 0) collab.laser(worldAt(at(e)));
   });
   canvas.addEventListener("pointermove", e => {
     if (touches.has(e.pointerId)) touches.set(e.pointerId, at(e));
@@ -125,11 +161,17 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       return;
     }
     if (!pinch) S.pointerMove(at(e), pmods(e));
+    if (collab && !pinch) {
+      const w = worldAt(at(e));
+      collab.pointer(w);
+      if (S.tool === "laser" && S.gesture && (e.buttons & 1)) collab.laser(w);
+    }
   });
   const up = e => {
     touches.delete(e.pointerId);
     if (pinch) { if (touches.size === 0) pinch = null; return; }
     S.pointerUp(at(e), pmods(e)); chromeDirty = true;
+    sendSelection();
   };
   canvas.addEventListener("pointerup", up);
   canvas.addEventListener("pointercancel", up);
@@ -206,7 +248,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   }
   const setPanel = op => { const n = applyPanel(ui.panel, op); if (n !== ui.panel) { ui.panel = n; put("plenary.panel", serializePanel(n)); } chromeDirty = true; };
   function setLibrary(items) { ui.library = items; saveLibrary(prefs, items); chromeDirty = true; }
-  const setTheme = t => { ui.theme = t; document.documentElement.dataset.theme = t; dirty = true; chromeDirty = true; };
+  const setTheme = t => { ui.theme = t; document.documentElement.dataset.theme = t; dirty = true; chromeDirty = true; collab?.setTheme(t); };
   function openDialog(d) { ui.dialog = d; ui.sheet = null; chromeDirty = true; }
   const keyLabel = t => (t.keys?.length ? t.keys.map(k => k.toUpperCase()).join(" ") : "");
 
@@ -220,7 +262,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   function topbar() {
     const role = S.role, tools = toolsFor(role), may = S.may();
     const core = tools.filter(t => !["image", "note", "highlighter"].includes(t.id)), extras = tools.filter(t => ["image", "note", "highlighter"].includes(t.id));
-    const pill = pillFor({ status: S.status, online: S.online, pending: S.pending, role: S.effective, readOnly: S.readOnly });
+    const pill = pillFor({ status: S.status, online: S.online, pending: S.pending, role: S.effective, readOnly: S.readOnly, congested: S.congested });
     const notesCount = S.eds.notes.doc.live().filter(e => !isLabel(e)).length;
     return [
       h("div.tools.desk-only", {}, core.map(t => toolButton(t)), extras.length ? h("span.sep") : null, extras.map(t => toolButton(t, ".new")),
@@ -234,8 +276,9 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         h("button.btn.ghost.desk-only", { title: "Insert a Mermaid flowchart", disabled: !may, onclick: () => openDialog("mermaid") }, "◇→"),
         h("button.btn.ghost.desk-only", { title: "Export SVG / PNG (⌘⇧E)", onclick: () => openDialog("export") }, "⤓")] : null,
       h("button.btn.ghost.desk-only", { title: "Notes", onclick: () => { ui.drawer = ui.drawer ? null : "notes"; chromeDirty = true; } }, "❏ Notes ", h("span.dim", {}, String(notesCount))),
-      // SEAM(phase 7, v1 `here`): the avatar row and viewer count. Today: just you.
-      h("div.avatars", { title: "Who's here arrives with presence (phase 7)" },
+      collab ? h("button.btn.ghost.desk-only", { title: "Comments (or right-click the board)", onclick: () => { ui.drawer = ui.drawer === "comments" ? null : "comments"; chromeDirty = true; } }, "💬") : null,
+      // Who's here (`here`): the collab UI's live avatar row, kept across rebuilds (a node, moved, never rebuilt here).
+      collab ? collab.parts.avatars : h("div.avatars", {},
         h("span.stack", {}, h("span.av.live", { style: { background: "var(--u-me)" }, title: `${me.name} (you)` }, me.name.slice(0, 2).toUpperCase()))),
       h(`span.pill.${pill.cls}`, { title: pillTitle(pill.cls) }, h("span.dot"), pill.text, pill.sub ? h("span.sub", {}, ` · ${pill.sub}`) : null),
       role !== "viewer" ? h("button.tb.desk-only" + (ui.panel.open ? ".on" : ""), { title: "Side panel (I)", onclick: () => setPanel({ type: "open" }) }, h("span.ic", {}, "◧"), h("span.k", {}, "I")) : null,
@@ -247,7 +290,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     return {
       connected: "Connected: every edit is acknowledged by the board's room.",
       reconnecting: "Connecting or catching up. Edits not yet acknowledged are kept and resent with the same ids.",
-      offline: "No connection. Unacknowledged edits stay in this tab and are resent on reconnect; closing the tab loses them.",
+      offline: S.status === "limited" ? "This board is open in too many of your tabs. Close one, then press Retry." : "No connection. Unacknowledged edits stay in this tab and are resent on reconnect; closing the tab loses them.",
       readonly: S.readOnly ? "The server gave this session a lower role (welcome.role): nothing you do is sent." : "You're watching: viewers change nothing on the board.",
     }[cls];
   }
@@ -261,10 +304,12 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       S.role !== "viewer" ? h("div.grp.phone-only", {}, h("button.tb", { title: "Fit everything", onclick: () => S.fit() }, "⤢")) : null,
       S.role !== "viewer" ? h("div.grp.phone-only", {}, h("button.tb", { disabled: !may, title: "Undo", onclick: () => S.act(S.active, e => e.undo()) }, "↶"), h("button.tb", { disabled: !may, title: "Redo", onclick: () => S.act(S.active, e => e.redo()) }, "↷")) : null,
     ];
-    // SEAM(phase 7, v1 presence `emote` + `emotes` counts): the emote bar. Disabled until presence exists.
-    const bc = h("div.grp.reactions.stub", { title: "Emotes arrive with presence (phase 7)" }, ["👍", "👏", "🎉", "❤️", "😂", "❓"].map(e => h("button.tb", { disabled: true }, e)), h("span.sep"), h("button.tb", { disabled: true }, "✨"));
-    replace($("#hudBL"), bl); replace($("#hudBC"), bc);
-    replace($("#hudBR"), h("div.grp.phone-only.stub", {}, h("button.tb", { disabled: true, title: "Emotes arrive with presence (phase 7)" }, "👏")));
+    // The emote bar and the phones' one emote button: the collab UI's live nodes (moved in once, then kept).
+    replace($("#hudBL"), bl);
+    if (collab) {
+      if (collab.parts.emotes.parentNode !== $("#hudBC")) replace($("#hudBC"), collab.parts.emotes);
+      if (collab.parts.emoteButton.parentNode !== $("#hudBR")) replace($("#hudBR"), collab.parts.emoteButton);
+    }
   }
 
   function timeline() {
@@ -304,8 +349,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     return [h("div.notes-list", {}, rows.length ? rows : h("div.hint", { style: { padding: "6px 8px" } }, "No notes yet."), notes.length > 200 ? h("div.hint", {}, `${notes.length - 200} more`) : null), compose];
   }
   function drawerBody(which) {
-    // SEAM(phase 7, v1 records): comment threads.
-    if (which === "comments") return [h("div.notes-list", {}, h("div.hint", { style: { padding: "8px" } }, "Comment threads arrive in phase 7 (v1 records)."))];
+    // Comment threads: the collab UI's drawer (its own Notes/Comments header is hidden here; ours switches).
+    if (which === "comments") { if (!collab) return [h("div.notes-list", {}, h("div.hint", { style: { padding: "8px" } }, "No comments here."))]; collab.showDrawer("comments"); return [collab.parts.drawer]; }
     return notesList();
   }
   function drawerTabs(key) {
@@ -408,6 +453,14 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     else if (!S.online) out.push(h("div.banner", {}, viewer ? "⚠ You're offline. The live view is paused until you reconnect." : (S.pending ? `⚠ You're offline. ${S.pending} ${S.pending === 1 ? "edit waits" : "edits wait"} in this tab and send when you reconnect. Closing the tab loses them.` : "⚠ You're offline. Nothing is waiting to send; edits you make now are kept in this tab until you reconnect."), " ", h("button.btn", { onclick: () => S.reconnect() }, "Retry now")));
     else if (st !== "live") out.push(h("div.banner", {}, viewer ? "⟳ Connecting… the live view is paused." : `⟳ Connecting… ${S.pending ? `${S.pending} edits waiting. ` : ""}Keep working: they're sent with the same ids when the room is back.`));
     else if (S.readOnly) out.push(h("div.banner", {}, "👁 Read-only: the server gave this session a lower role. Ask the board's owner for edit access."));
+    if (st === "limited") out.push(h("div.banner", {}, `⚠ This board is open in too many of your tabs (${S.limited ?? "the room's limit"}). Close one, then `, h("button.btn", { onclick: () => S.reconnect() }, "Retry")));
+    // Settings changes the room refused (stale-setting: someone changed the same setting first). Retry when ready.
+    for (const r of S.settingsRefused) {
+      const what = r.keys.join(", ") || "a setting";
+      out.push(h("div.banner", {}, r.code === "stale-setting" ? `⚠ Your change to ${what} was not saved: someone changed it first. ` : `⚠ Your change to ${what} was refused (${r.code}). `,
+        r.ready ? h("button.btn", { onclick: () => { S.retrySetting(r.stream, r.i); chromeDirty = true; } }, "Apply mine again") : h("span.dim", {}, "Waiting for their change… "),
+        " ", h("button.btn", { onclick: () => { S.dismissSetting(r.stream, r.i); chromeDirty = true; } }, "Keep theirs")));
+    }
     return out;
   }
 
@@ -417,7 +470,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   addEventListener("pointercancel", () => { chromeHeld = false; }, true);
   function chrome() {
     const now = performance.now();
-    const key = [S.version(), S.status, S.pending, S.role, S.effective, S.tool, S.online, ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.library.length, S.toolLock(), JSON.stringify(ui.export), ui.mermaid.elbow].join("|");
+    const key = [S.version(), S.status, S.pending, S.role, S.effective, S.tool, S.online, S.congested, JSON.stringify(S.settingsRefused.map(r => [r.stream, r.i, r.ready])), ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.library.length, S.toolLock(), JSON.stringify(ui.export), ui.mermaid.elbow].join("|");
     if (!chromeDirty && key === chromeKey) return;
     if (chromeHeld) return;                                   // a press on the chrome: don't swap the button under it
     if ((S.gesture || !chromeDirty) && now - chromeAt < 250) return;   // mid-drag, playback, incoming ops: a few times a second          // mid-drag: refresh a few times a second at most
@@ -453,10 +506,14 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   addEventListener("offline", () => { S.online = false; chromeDirty = true; });
   matchMedia("(max-width: 640px)").addEventListener("change", () => { chromeDirty = true; });
   setTheme(ui.theme);
-  let savedMine = 0;
+  let savedMine = 0, layoutKey = "";
   (function frame() {
     const live = S.eds.board.needsTick() || S.eds.notes.needsTick();
     if (dirty || live || seen !== S.version()) { dirty = false; draw(); seen = S.version(); if (live) chromeDirty = chromeDirty || !!S.eds.board.play; }
+    // My selection as presence, whatever changed it (a click, Escape, select-all, a tool switch): no ghost selections.
+    sendSelection();
+    // Pins and the popover follow the view and the elements they anchor to.
+    if (collab) { const v = S.eds.board.view, k = `${v.x}|${v.y}|${v.scale}|${S.version()}`; if (k !== layoutKey) { layoutKey = k; collab.layout(); } }
     const f = S.takeFlash(); if (f) toast(f);
     chrome();
     if (S.mine.size !== savedMine) { savedMine = S.mine.size; put(mineKey, JSON.stringify([...S.mine].slice(-5000))); }
@@ -466,5 +523,5 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const fitOnce = setInterval(() => { if (S.status === "live") { clearInterval(fitOnce); if (S.eds.board.doc.live().length || S.eds.notes.doc.live().length) S.fit(); } }, 50);
 
   if (notice) toast(notice, 6000);
-  return { S, ui, net, setTheme, openDialog, setPanel };
+  return { S, ui, net, collab, port, setTheme, openDialog, setPanel, startComment };
 }

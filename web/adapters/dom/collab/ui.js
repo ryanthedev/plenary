@@ -25,6 +25,8 @@ import { drawPresence } from "./draw.js";
 import { missingFromPort } from "../../../ports/collab.js";
 
 const BAR = EMOTES.slice(0, 6);
+/** Avatars a phone shows (collab.css hides the rest). */
+export const PHONE_AVATARS = 2;
 const fmt = n => (n >= 10_000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k` : String(n));
 const watching = n => n.toLocaleString("en-US");
 
@@ -62,10 +64,12 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
   function renderAvatars() {
     const { writers, writerCount, viewers } = presence.view().here;
     parts.avatars.classList.toggle("stale", !live());
-    const shown = writers.slice(0, maxAvatars), more = writerCount - shown.length;
-    if (!changed("avatars", JSON.stringify([shown, more, viewers]))) return;
+    // Phones show the first PHONE_AVATARS (collab.css), desktops maxAvatars: each gets its own +N (p7-collabv M3).
+    const shown = writers.slice(0, maxAvatars), more = writerCount - shown.length, phoneMore = writerCount - Math.min(shown.length, PHONE_AVATARS);
+    if (!changed("avatars", JSON.stringify([shown, more, phoneMore, viewers]))) return;
+    const badge = (cls, n) => (n > 0 ? h(`span.av.more.${cls}`, { title: `${watching(writerCount)} people can write` }, `+${fmt(n)}`) : null);
     replace(parts.avatars,
-      h("span.stack", {}, shown.map(w => av(w.user, w.name ?? "Someone", ".live")), more > 0 ? h("span.av.more", { title: `${watching(writerCount)} people can write` }, `+${fmt(more)}`) : null),
+      h("span.stack", {}, shown.map(w => av(w.user, w.name ?? "Someone", ".live")), badge("desk-more", more), badge("phone-more", phoneMore)),
       h("span.watching", { title: `${watching(viewers)} watching` }, h("span.eye", {}, "👁 "), h("b", {}, watching(viewers)), h("span.wtxt", {}, " watching")));
   }
 

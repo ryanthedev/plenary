@@ -69,10 +69,14 @@ export function createPresence({ now, me, role, flags = FLAGS }) {
     leave(user, client) { peers.delete(key(user, client)); },
     /** A floating emote (a writer's, mine or another's). */
     float(e, user) { floaters.push({ id: ++seq, e, user, at: now(), lane: seq % 5 }); },
+    // A count-only `here` (no `writers` field: PROTOCOL.md § Presence, sent when only a count changed) keeps the last
+    // list and names; only an explicit list (even []) replaces them.
     here(msg) {
-      const writers = (Array.isArray(msg?.writers) ? msg.writers : []).slice(0, HERE_MAX_WRITERS)
-        .filter(w => w && typeof w.user === "string").map(w => ({ user: w.user, name: typeof w.name === "string" ? w.name : null, role: w.role }));
-      here = { writers, writerCount: Math.max(Number(msg?.writerCount) || 0, writers.length), viewers: Math.max(0, Number(msg?.viewers) || 0) };
+      const listed = Array.isArray(msg?.writers);
+      const writers = listed ? msg.writers.slice(0, HERE_MAX_WRITERS)
+        .filter(w => w && typeof w.user === "string").map(w => ({ user: w.user, name: typeof w.name === "string" ? w.name : null, role: w.role })) : here.writers;
+      const count = v => (Number.isFinite(Number(v)) && v !== undefined && v !== null ? Math.max(0, Number(v)) : null);
+      here = { writers, writerCount: Math.max(count(msg?.writerCount) ?? here.writerCount, writers.length), viewers: count(msg?.viewers) ?? here.viewers };
       writerBy = new Map(writers.map(w => [w.user, w]));
     },
     /** One `emotes` window: viewers' emotes per emoji. */

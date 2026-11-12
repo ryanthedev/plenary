@@ -13,6 +13,8 @@ import { presenceProblem, presenceLimiter } from "../../../packages/protocol/pre
 import { jsonCodec } from "../../../packages/protocol/codec.js";
 import { streamState, fullState, seeded } from "../../core/sync.js";
 
+const RANK = { owner: 0, editor: 1, annotator: 2, commenter: 3, viewer: 4 };
+
 /**
  * An in-process reference room behind a gateway stand-in, with its own little network, for the dev page and
  * tests. Every message crosses the JSON codec; each link keeps its order (a WebSocket). The stand-in does
@@ -57,28 +59,77 @@ export function localRoom({ board = "b1", tenant = "t1", users, auto = false, se
   }
   function leave(link) { if (link.conn?.user) relay(link, { user: link.conn.user, client: link.conn.client, k: "leave" }); }
 
+  // `here` and `emotes` as a gateway sends them (PROTOCOL.md § Presence), simplified for one in-page gateway: no
+  // pacing. Writers = users with a writer connection (a user's tabs count once), viewers = viewer connections. On a
+  // change every welcomed link gets `here`: with the writer list when it changed, else count-only (no `writers`);
+  // a joiner always gets the list. Viewers' emotes are summed per 500 ms window into `emotes`, never relayed.
+  let hereLast = null;
+  function hereNow() {
+    const by = new Map(); let viewers = 0;
+    for (const l of links) {
+      if (!l.who) continue;
+      if (l.who.role === "viewer") { viewers++; continue; }
+      const w = by.get(l.who.user);
+      if (!w || RANK[l.who.role] < RANK[w.role]) by.set(l.who.user, { user: l.who.user, name: l.who.name ?? l.who.user, role: l.who.role });
+    }
+    const writers = [...by.values()].sort((a, b) => RANK[a.role] - RANK[b.role] || (a.user < b.user ? -1 : 1)).slice(0, 50);
+    return { writers, writerCount: by.size, viewers };
+  }
+  function hereSend(joiner = null) {
+    const h = hereNow(), list = JSON.stringify(h.writers), was = hereLast;
+    hereLast = { list, writerCount: h.writerCount, viewers: h.viewers };
+    const listChanged = !was || was.list !== list, changed = listChanged || was.writerCount !== h.writerCount || was.viewers !== h.viewers;
+    for (const l of links) {
+      if (!l.who || !l.conn) continue;
+      if (l === joiner || listChanged) l.down.push(wire({ t: "here", ...h }));
+      else if (changed) l.down.push(wire({ t: "here", writerCount: h.writerCount, viewers: h.viewers }));
+      else continue;
+      kick();
+    }
+  }
+  const later = (fn, ms) => (clock ? timers.set(fn, ms) : setTimeout(fn, ms));
+  let emoteWindow = null;
+  function countEmote(e) {
+    if (!emoteWindow) {
+      emoteWindow = {};
+      later(() => {
+        const counts = emoteWindow; emoteWindow = null;
+        for (const l of links) if (l.who && l.conn) { l.down.push(wire({ t: "emotes", counts })); kick(); }
+      }, 500);
+    }
+    emoteWindow[e] = (emoteWindow[e] ?? 0) + 1;
+  }
+
   // A message from a client, as the gateway hands it on.
   function up(link, msg) {
     if (msg.t === "hello") {
       const who = auth.check(msg.token, msg.board);
       if (!who) { link.down.push(wire({ t: "error", code: "auth", message: "token refused" })); kick(); return; }
       const { token, ...hello } = msg;
-      return room.receive(link.conn, hello, { n: ++link.n, ...who });
+      const r = room.receive(link.conn, hello, { n: ++link.n, ...who });
+      link.who = { user: who.user, role: who.role, name: users[msg.token]?.name ?? who.name ?? who.user };
+      hereSend(link);
+      return r;
     }
     if (msg.t === "presence") {
       const c = link.conn, ok = !!c.user && presenceProblem(msg, c.role) === null && link.limiter.allow(msg.k);
       presence.push({ user: c.user, msg, ok });
-      if (ok) { const { t, ...rest } = msg; relay(link, { user: c.user, client: c.client, ...rest }); }
+      if (ok && msg.k === "emote" && c.role === "viewer") countEmote(msg.e);
+      else if (ok) { const { t, ...rest } = msg; relay(link, { user: c.user, client: c.client, ...rest }); }
       return;
     }
     room.receive(link.conn, msg, { n: ++link.n });
   }
 
   function join() {
-    const link = { up: [], down: [], handler: () => {}, dropped: () => {}, conn: null, gen: 0, n: 0, limiter: presenceLimiter(now), done: false };
+    const link = { up: [], down: [], handler: () => {}, dropped: () => {}, conn: null, gen: 0, n: 0, limiter: presenceLimiter(now), done: false, who: null };
     // Every connection has its own generation: whatever the old one queued or still answers is never
     // delivered once it is dropped (the transport contract in this file's header).
-    const drop = () => { if (link.conn) { leave(link); room.disconnect(link.conn); } link.conn = null; link.gen++; link.up = []; link.down = []; };
+    const drop = () => {
+      if (link.conn) { leave(link); room.disconnect(link.conn); }
+      link.conn = null; link.gen++; link.up = []; link.down = [];
+      if (link.who) { link.who = null; hereSend(); }
+    };
     const open = () => {
       if (link.done) return;
       drop();
@@ -138,8 +189,11 @@ export function localRoom({ board = "b1", tenant = "t1", users, auto = false, se
   /** Move the virtual clock by `ms`, firing the timers due on the way (no deliveries). */
   function advance(ms) { const until = time.t + ms; while (tick(until)); time.t = until; }
 
+  /** Test hook: a server message to every welcomed link (a gateway's `here`, `emotes`, ...). */
+  function broadcast(m) { for (const l of links) if (l.who && l.conn) { l.down.push(wire(m)); kick(); } }
+
   return {
-    join, step, settle, advance, deliverUp, tick: () => tick(), log, presence, now, timers, random, clock: clockPort,
+    join, step, settle, broadcast, advance, deliverUp, tick: () => tick(), log, presence, now, timers, random, clock: clockPort,
     get seq() { return room.seq; }, get pendingTimers() { return time.q.length; },
     compact: () => room.checkpoint(),
     state: stream => streamState(room.streams[stream ?? "board"]),

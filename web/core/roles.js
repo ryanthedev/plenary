@@ -65,13 +65,17 @@ export const clipboardKey = (key, m = {}) => !!(m.cmd || m.ctrl) && ["c", "x", "
 export const settingsKey = (key, m = {}) => !!(m.cmd || m.ctrl) && String(key) === "'";
 
 // Pill text per connection state, as in the mock. Viewers never have edits waiting.
-export function pillFor({ status, online = true, pending = 0, role, readOnly = false }) {
+// `congested`: the outbound backlog is over CONGESTED_BYTES (web/ports/transport.js); `limited`: the room refused this
+// tab's connection by the writer-connection cap (8 per user and board): no retry loop, the user closes a tab first.
+export function pillFor({ status, online = true, pending = 0, role, readOnly = false, congested = false }) {
   const waiting = role === "viewer" || !pending ? "" : `${pending} edit${pending === 1 ? "" : "s"} waiting`;
   // stopped: the room speaks rules this app doesn't know. It never retries; only an update helps.
   if (status === "stopped") return { cls: "offline", text: "Update needed", sub: "reload the app" };
   if (status === "refused") return { cls: "offline", text: "Refused", sub: "sign in again" };
+  if (status === "limited") return { cls: "offline", text: "Too many tabs", sub: "close one, then retry" };
   if (!online) return { cls: "offline", text: "Offline", sub: waiting };
   if (status !== "live") return { cls: "reconnecting", text: status === "catching-up" ? "Catching up…" : "Connecting…", sub: waiting };
-  if (role === "viewer" || readOnly) return { cls: "readonly", text: "View only", sub: "" };
-  return { cls: "connected", text: "Live", sub: waiting };
+  const slow = congested ? "slow link" : "";
+  if (role === "viewer" || readOnly) return { cls: "readonly", text: "View only", sub: slow };
+  return { cls: congested ? "reconnecting" : "connected", text: "Live", sub: [slow, waiting].filter(Boolean).join(" · ") };
 }

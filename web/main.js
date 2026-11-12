@@ -15,6 +15,7 @@ import { localStore } from "./adapters/storage/local.js";
 import { httpAuth } from "./adapters/auth/http.js";
 import { wsNet, sameOriginWsUrl } from "./adapters/transport/ws.js";
 import { mountApp } from "./adapters/dom/app.js";
+import { syncCollabPort } from "./adapters/collab/sync.js";
 import { showGate, hideGate } from "./adapters/dom/gate.js";
 import { takeSignIn, signInNotice } from "./core/signin.js";
 import { createSession } from "./core/session.js";
@@ -51,6 +52,8 @@ if (!signIn.token) {
       join: () => net.join(), token: signIn.token, board, client: "web", user: me.user, mine, onChange, clock,
     }),
     net, board, me, prefs: localStore(), theme: q.get("theme"),
+    // The collaboration UI over this session (presence and records ride the board connection; web/adapters/collab/sync.js).
+    collab: (S, o) => syncCollabPort(S, { name: me.name, ...o }),
     notice: signInNotice({ ...signIn, dev: null }, me.name),
   });
   hideGate();

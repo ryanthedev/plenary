@@ -124,7 +124,7 @@ export function globalsIn(file, src) {
 /** Dev-only modules: never in the production page's graph (server/static.js denies these paths too). */
 export const isDevModule = p =>
   p === "web/core/dev-users.js" || p === "web/adapters/transport/local.js" || p.startsWith("web/adapters/transport/shared-worker/") ||
-  p.startsWith("web/adapters/collab/") || /^web\/adapters\/[^/]+\/fake\.js$/.test(p) || p === "web/adapters/clock/virtual.js" ||
+  /^web\/adapters\/[^/]+\/fake\.js$/.test(p) || p === "web/adapters/clock/virtual.js" ||
   /^web\/dev[^/]*\.(js|html)$/.test(p) || p.startsWith("web/collab/");
 /** Every file a browser loads from `entry`: runtime imports, followed transitively (JSDoc type imports load nothing). */
 export function runtimeGraph(entry, imp) {
@@ -232,6 +232,9 @@ describe("web/ architecture (hexagonal boundaries)", () => {
     expect(graph.length).toBeGreaterThan(15);
     expect(graph.filter(isDevModule)).toEqual([]);
     expect(graph).toContain("web/adapters/transport/ws.js");
+    // p7-wire: the collab UI is production, over the sync-side port (never the fake).
+    expect(graph).toContain("web/adapters/collab/sync.js");
+    expect(graph).toContain("web/adapters/dom/collab/ui.js");
     expect(graph.filter(p => !(p.startsWith("web/") || p.startsWith("packages/core/") || p.startsWith("packages/protocol/")))).toEqual([]);
     expect(graph.filter(p => { try { readFileSync(join(ROOT, p)); return false; } catch { return true; } })).toEqual([]);
     const html = readFileSync(join(ROOT, "web/index.html"), "utf8");

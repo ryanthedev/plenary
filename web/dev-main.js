@@ -15,6 +15,7 @@ import { httpAuth } from "./adapters/auth/http.js";
 import { sharedNet } from "./adapters/transport/shared-worker/client.js";
 import { localNet } from "./adapters/transport/local.js";
 import { mountApp } from "./adapters/dom/app.js";
+import { syncCollabPort } from "./adapters/collab/sync.js";
 import { showGate, hideGate } from "./adapters/dom/gate.js";
 import { DEV_USERS } from "./core/dev-users.js";
 import { pageSignIn, signInNotice } from "./core/signin.js";
@@ -49,6 +50,7 @@ const app = mountApp({
     join: () => net.join(), token: signIn.token, board, client: signIn.dev ?? "web", user: me.user, mine, onChange, clock,
   }),
   net, board, me, prefs: localStore(), theme: q.get("theme"),
+  collab: (S, o) => syncCollabPort(S, { name: me.name, ...o }),
   notice: signInNotice(signIn, me.name),
 });
 hideGate();

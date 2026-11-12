@@ -87,6 +87,7 @@ export function createFakePort(o = {}) {
   for (const n of o.notes ?? []) elements.notes.set(n.id, n);
   const noteAuthors = new Map(Object.entries(o.noteAuthors ?? {}));
   const previews = { board: [], notes: [] };
+  let lastHere = { writers: [], writerCount: 0, viewers: 0 };
 
   const port = {
     role: o.role ?? "editor",
@@ -142,8 +143,9 @@ export function createFakePort(o = {}) {
     },
     presence(batch) { fire("presence", batch); },
     leave(user, client) { fire("leave", user, client); },
-    here(msg) { fire("here", msg); },
-    emotes(msg) { fire("emotes", msg); },
+    // A count-only `here` (no writers: PROTOCOL.md § Presence) keeps the last list, as the port requires.
+    here(msg) { lastHere = { writers: Array.isArray(msg?.writers) ? msg.writers : lastHere.writers, writerCount: msg?.writerCount ?? lastHere.writerCount, viewers: msg?.viewers ?? lastHere.viewers }; fire("here", copy(lastHere)); },
+    emotes(msg) { fire("emotes", { counts: copy(msg?.counts ?? {}) }); },
     setStatus(status, role = port.role) { port.status = status; port.role = role; fire("status", status, role); },
     setElement(stream, id, el) { if (el) elements[stream].set(id, el); else elements[stream].delete(id); },
     setNoteAuthor(id, user) { noteAuthors.set(id, user); },

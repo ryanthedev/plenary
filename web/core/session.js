@@ -70,9 +70,20 @@ export function createSession({ join, token, board, client = "web", mine = [], n
   };
   const clocked = Object.fromEntries(Object.entries({ clock, timers, now, random }).filter(([, v]) => v != null));
 
+  // Room events of each connection (bindEditor's onRoom: presence, here, emotes, records, refused, role, settings,
+  // limit) for the collab port (web/adapters/collab/sync.js) and the chrome. A listener gets (stream, event).
+  const roomFns = new Set();
+  s.onRoom = fn => { roomFns.add(fn); return () => roomFns.delete(fn); };
+  const statusFns = new Set();
+  /** fn(stream, status) on every status change of either connection. */
+  s.onStatus = fn => { statusFns.add(fn); return () => statusFns.delete(fn); };
+
   for (const stream of ["board", "notes"]) {
     const ed = eds[stream];
-    binds[stream] = bindEditor(ed, { transport: watched(stream), token, board, client: `${client}-${stream}`, stream, onStatus: () => { s.refreshRole(); onChange(); }, ...clocked });
+    binds[stream] = bindEditor(ed, { transport: watched(stream), token, board, client: `${client}-${stream}`, stream,
+      onStatus: st => { s.refreshRole(); for (const fn of [...statusFns]) fn(stream, st); onChange(); },
+      onRoom: ev => { if (ev.type === "settings" || ev.type === "limit") onChange(); for (const fn of [...roomFns]) fn(stream, ev); },
+      ...clocked });
     const inner = ed.onOp;
     ed.onOp = op => {
       if (!allowed(stream, op)) {
@@ -102,7 +113,13 @@ export function createSession({ join, token, board, client = "web", mine = [], n
     effective: { get: () => uiRole(s.roleSeen) },
     readOnly: { get: () => !!s.chrome && ORDER[uiRole(s.roleSeen)] < ORDER[s.chrome] },
     // The worse of the two streams: stopped (update the app) > refused (sign in) > connecting > catching-up > live.
-    status: { get: () => { const a = binds.board.status, b = binds.notes.status; for (const w of ["stopped", "refused"]) if (a === w || b === w) return w; return a === b ? a : a === "live" ? b : a; } },
+    status: { get: () => { const a = binds.board.status, b = binds.notes.status; for (const w of ["stopped", "refused", "limited"]) if (a === w || b === w) return w; return a === b ? a : a === "live" ? b : a; } },
+    // Either connection's outbound backlog over CONGESTED_BYTES (web/ports/transport.js): the pill says "slow link".
+    congested: { get: () => binds.board.congested() || binds.notes.congested() },
+    /** The writer-connection cap's message while either connection is stopped by it, else null. */
+    limited: { get: () => binds.board.limited ?? binds.notes.limited ?? null },
+    /** Refused settings changes of both streams: [{ stream, i, code, keys, values, ready }] (i: the bind's index). */
+    settingsRefused: { get: () => ["board", "notes"].flatMap(st => binds[st].settingsRefused.map((e, i) => ({ ...e, stream: st, i }))) },
     pending: { get: () => binds.board.pending + binds.notes.pending },
     ed: { get: () => eds[s.active] },
   });
@@ -300,10 +317,18 @@ export function createSession({ join, token, board, client = "web", mine = [], n
   s.textEditor = () => (eds.board.text ? eds.board : eds.notes.text ? eds.notes : null);
   s.takeFlash = () => { const f = s.flash ?? eds.board.flash ?? eds.notes.flash; s.flash = eds.board.flash = eds.notes.flash = null; return f; };
 
+  /** Apply a refused settings change again (only when it is `ready`), or forget it. */
+  s.retrySetting = (stream, i) => { const r = binds[stream]?.retrySetting(i) ?? false; onChange(); return r; };
+  s.dismissSetting = (stream, i) => { binds[stream]?.dismissSetting(i); onChange(); };
+  /** Who the room says this person is (welcome.user), else the root's display-only user. */
+  s.roomUser = () => roomUser ?? user;
+
   /** Reconnect both streams now; `token` signs in again after `refused`. */
   s.reconnect = token => { binds.board.reconnect(token); binds.notes.reconnect(token); };
   /** Dev/test hook: both connections drop without asking (the transport's fail(), where it has one). */
   s.dropConnection = () => { for (const t of Object.values(links)) t.fail?.(); };
+  /** Test hook: the transports as bindEditor holds them (board, notes). */
+  s.links = links;
   return s;
 }
 

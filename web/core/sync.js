@@ -45,7 +45,7 @@ const GESTURE_ENDS = ["pointerDown", "pointerUp", "key", "setTool"];
  *   only 0 means something: no timers at all (a resync reconnects at once; nothing times out). Tests use it.
  *   now / random: the clock (ms) and jitter source handed to the Replica; tests pass a virtual clock.
  */
-export function bindEditor(editor, { transport, token: firstToken, board, client = "web", stream = "board", onStatus = () => {},
+export function bindEditor(editor, { transport, token: firstToken, board, client = "web", stream = "board", onStatus = () => {}, onRoom = () => {},
   timeoutMs = 10_000, clock = null, timers = clock ? { set: clock.set, clear: clock.clear } : null, now = clock?.now, random = clock?.random }) {
   if (typeof transport?.reopen !== "function") throw new TypeError("bindEditor: the transport must have reopen() (web/ports/transport.js)");
   if (typeof now !== "function" || typeof random !== "function" || (timeoutMs !== 0 && typeof timers?.set !== "function"))
@@ -60,6 +60,15 @@ export function bindEditor(editor, { transport, token: firstToken, board, client
   let status = "connecting";
   let resets = 0, timer = null, closed = false;
   let down = false;               // resync asked for: the connection is closed, the backoff runs, input is ignored
+  // The writer-connection cap (PROTOCOL.md § Messages: a ninth writer connection gets an id-less `limit` before its
+  // welcome, then is closed). Retrying on the backoff would only be refused again, forever: stop here, say so, and
+  // wait for reconnect() (the user closed a tab and pressed Retry).
+  let limited = null;             // the room's message, while stopped by the cap
+  let roleSeen = null;            // the last non-null welcome.role: kept across resyncs (Replica.reset clears its own)
+  let recordsRev = replica.recordsRev;
+  // Settings ops the room refused (did.refusedSettings), for the app to show; `ready` once did.retryReady says a
+  // retry would be built on the value that beat it (§ Settings, "stale-setting is soft").
+  const settingsRefused = [];
   const setStatus = s => { if (s !== status) { status = s; onStatus(s); } };
   const send = m => transport.send(m);
 
@@ -92,6 +101,7 @@ export function bindEditor(editor, { transport, token: firstToken, board, client
   // Status from the Replica's state. Entering `live` loads the Editor from the caught-up Replica.
   function refreshStatus() {
     if (replica.stopped) return setStatus("stopped");
+    if (limited) return setStatus("limited");
     if (replica.needAuth) return setStatus("refused");
     if (down || !replica.welcomed) return setStatus("connecting");
     if (replica.applied < replica.target) return setStatus("catching-up");
@@ -101,6 +111,7 @@ export function bindEditor(editor, { transport, token: firstToken, board, client
   // After every receive, local change and timer: send what the Replica lets go, then one timer.
   function pump() {
     if (closed || down) return;
+    if (limited) { refreshStatus(); if (timer != null) { timers.clear(timer); timer = null; } return; }
     if (!replica.resync) {
       refreshStatus();
       // A never-sent op is re-stamped when an entry overtakes it (that entry's ids are fed to the Editor) or
@@ -166,7 +177,16 @@ export function bindEditor(editor, { transport, token: firstToken, board, client
   }
 
   transport.onMessage(msg => {
-    if (closed || down) return;
+    if (closed || down || limited) return;
+    if (msg?.t === "error" && msg.code === "limit" && msg.id === undefined && !replica.welcomed) {
+      limited = typeof msg.message === "string" ? msg.message : "too many open connections";
+      pump(); onRoom({ type: "limit", message: limited }); return;
+    }
+    if (msg?.t === "here" || msg?.t === "emotes") { onRoom({ type: msg.t, msg }); return; }
+    // A rule-5 refusal of one of my records ops: look it up before receive() drops it from pending.
+    const was = msg?.t === "error" && msg.id !== undefined ? replica.pending.get(msg.id) : null;
+    const refusedRecord = was?.stream === "records" && !["stale", "unavailable", "auth", "version", "stale-setting"].includes(msg.code)
+      ? { op: clone(was.op), code: msg.code, message: typeof msg.message === "string" ? msg.message : "" } : null;
     const did = replica.receive(msg);
     if (status === "live" && !did.reset && !replica.resync) {
       if (did.snapshot) loadEditor();
@@ -178,13 +198,34 @@ export function bindEditor(editor, { transport, token: firstToken, board, client
       }
     }
     pump();
+    afterReceive(msg, did, refusedRecord);
   });
+
+  // What the collab port and the app hear from this connection, after the Replica took the message.
+  function afterReceive(msg, did, refusedRecord) {
+    if (msg?.t === "presence" && Array.isArray(msg.batch)) onRoom({ type: "presence", batch: msg.batch });
+    if (refusedRecord && did.dropped.includes(msg.id)) onRoom({ type: "refused", ...refusedRecord });
+    if (replica.role && replica.role !== roleSeen) { roleSeen = replica.role; onRoom({ type: "role", role: roleSeen }); }
+    if (did.refusedSettings.length || did.retryReady.length) {
+      for (const r of did.refusedSettings) {
+        const values = { ...(r.appState ?? {}), ...(r.held ?? {}) };
+        settingsRefused.push({ id: r.id, stream: r.stream, code: r.code, keys: Object.keys(values), values, ready: false });
+      }
+      for (const r of did.retryReady) {
+        const e = [...settingsRefused].reverse().find(x => x.id === r.id && x.stream === r.stream && !x.ready);
+        if (e) e.ready = true;
+      }
+      onRoom({ type: "settings" });
+    }
+    recordsChanged();
+  }
+  function recordsChanged() { if (replica.recordsRev !== recordsRev) { recordsRev = replica.recordsRev; onRoom({ type: "records" }); } }
 
   // The connection dropped without our asking: one failed attempt toward the backoff (rule 12), then the
   // usual resync. Ignored while already down (a reopen is coming), closed, or waiting on sign-in / an update
   // (reconnecting with the same token or app would only be refused again).
   transport.onDrop?.(() => {
-    if (closed || down || replica.stopped || replica.needAuth) return;
+    if (closed || down || limited || replica.stopped || replica.needAuth) return;
     replica.connectionFailed();
     pump();
   });
@@ -227,6 +268,59 @@ export function bindEditor(editor, { transport, token: firstToken, board, client
     get pending() { return replica.pending.size; },
     /** The role the room gave this connection (from welcome), or null. */
     get role() { return replica.role ?? null; },
+    /** The last role the room gave (welcome.role), kept through a resync, when `role` is null. */
+    get lastRole() { return roleSeen; },
+    /** This connection's wire client id (hello.client = the name plus the Replica's session part): presence names it. */
+    get client() { return replica.client; },
+    /** Who the room says this connection is (welcome.user), or null before the first welcome. */
+    get user() { return replica.user ?? null; },
+    /** Stopped by the writer-connection cap: the room's message, or null. reconnect() tries again. */
+    get limited() { return limited; },
+    /** Is the transport's outbound backlog over CONGESTED_BYTES (the status pill's "slow link")? */
+    congested: () => !closed && !!transport.congested?.(),
+    /**
+     * One presence message (PROTOCOL.md § Presence) on this connection: { t: "presence", k, ...fields }. Sent only
+     * while live, within the role's kinds and rates, and while backlogBytes() <= PRESENCE_BACKLOG_BYTES (the presence
+     * gate: skipped, never queued). True if it went out.
+     */
+    sendPresence(k, fields) {
+      if (closed || status !== "live") return false;
+      if ((transport.backlogBytes?.() ?? 0) > PRESENCE_BACKLOG_BYTES) return false;
+      const m = { ...clone(fields ?? {}), t: "presence", k };
+      if (presenceProblem(m, replica.role) !== null || !limiter.allow(k)) return false;
+      send(m); return true;
+    },
+    /** One `records` action (§ Records): shown at once, sent through the Replica's pacing, kept until acked. */
+    record(op) { if (closed) return null; const m = replica.local("records", op); pump(); recordsChanged(); return m?.id ?? null; },
+    /** Comments as shown (the room's, my unacked actions on top; snapshot shape). Cached per change by the Replica. */
+    recordsState: () => replica.recordsState(),
+    /** A number that changes whenever recordsState() may have. */
+    get recordsRev() { return replica.recordsRev; },
+    /** My unacknowledged records actions, oldest first: [{ op }]. */
+    pendingRecords: () => replica.pendingOf("records").map(({ op }) => ({ op })),
+    /** Others' previews on a stream, with the sender: [{ el, user, client }] (expired ones dropped). */
+    previewEntries: s => replica.previewEntries(s).map(p => ({ el: p.element, user: p.user, client: p.client })),
+    /** Who made a notes element (the v1 snapshot's noteAuthor, then entries), or null. */
+    noteAuthor: id => replica.noteAuthor.get(id) ?? null,
+    /** An element of a stream as this copy shows it (pending ops on top), or null when absent or deleted. Not a clone: read only. */
+    element: (s, id) => { const el = replica.streams[s]?.getAny(id); return el && !el.isDeleted ? el : null; },
+    /** The live elements of a stream (not deleted). Not clones: read only. */
+    elements: s => [...(replica.streams[s]?.byId.values() ?? [])].filter(e => !e.isDeleted),
+    /** Settings ops the room refused: [{ id, stream, code, keys, values, ready }]. */
+    get settingsRefused() { return settingsRefused.map(e => ({ ...e, keys: [...e.keys], values: { ...e.values } })); },
+    /** Apply a refused settings change again on the current base (only once it is `ready`). False if not ready or gone. */
+    retrySetting(i) {
+      const e = settingsRefused[i];
+      if (!e || !e.ready || closed) return false;
+      settingsRefused.splice(i, 1);
+      const pick = {};
+      for (const k of e.keys) if (k in e.values) pick[k] = e.values[k];
+      if (e.stream === stream) { replica.local(stream, { appState: pick }); syncSettings(); pump(); }
+      onRoom({ type: "settings" });
+      return true;
+    },
+    /** Forget a refused settings change (the user accepts the board's value). */
+    dismissSetting(i) { if (settingsRefused[i]) { settingsRefused.splice(i, 1); onRoom({ type: "settings" }); } },
     /** Ops dropped without knowing whether they landed (forgotten client, `stale`): a count for the UI. */
     get unconfirmed() { return replica.unconfirmed; },
     /** Ops dropped because another user signed in on this client (rule 13): a count for the UI. */
@@ -240,6 +334,7 @@ export function bindEditor(editor, { transport, token: firstToken, board, client
     reconnect(newToken) {
       if (typeof newToken === "string" && newToken) token = newToken;
       if (timer != null) { timers.clear(timer); timer = null; }
+      limited = null;
       reopen();
     },
     /** End a gesture without committing it (pointercancel): what it previewed goes back to the room's copy. */

@@ -1,14 +1,20 @@
-// The collab port: everything the collaboration UI (web/collab) needs from the sync layer, and nothing else.
-// the collab UI never imports packages/protocol; a later job (p7-wire) makes web/core/sync.js's bindEditor provide this
-// object and passes it to mountCollab (web/adapters/dom/collab/ui.js). web/adapters/collab/fake.js is a stand-in for tests and
-// the dev page. Names are PROTOCOL.md v1.1's unless noted; "ADDED" marks what the p7-collab brief didn't list
-// but the UI needs.
+// The collab port: everything the collaboration UI (web/adapters/dom/collab/ui.js) needs from the sync layer, and
+// nothing else. The collab UI never imports packages/protocol. Adapters: web/adapters/collab/sync.js (production and
+// dev rooms: over web/core/session.js, whose bindEditor handles are the only protocol readers) and
+// web/adapters/collab/fake.js (tests, web/collab/dev.html). Contract test: test/web/contracts/collab-contract.js.
+// Names are PROTOCOL.md v1.1's unless noted; "ADDED" marks what the p7-collab brief didn't list but the UI needs.
 //
 // ── Who I am ────────────────────────────────────────────────────────────────────────────────────────────────
 //   role      string  the protocol role from `welcome.role`: owner | editor | annotator | commenter | viewer.
 //                     Never the UI's presenter/annotator/viewer: a commenter sends cursors and writes records.
-//   me        { user, name, client }   welcome.user, the signed-in display name, this connection's client id
-//   status    string  web/core/sync.js status names: connecting | catching-up | live | refused | stopped
+//             Once seen it is never null: while a connection is re-established it is the last role the room gave,
+//             so records actions still queue offline.
+//   me        { user, name, client }   welcome.user, the signed-in display name, the client id of the connection
+//             that carries presence (the id others' batches name me by). ONE stable object whose fields may update
+//             (user arrives with welcome; rule 13 may change it): mount any time, read the fields live.
+//   status    string  web/core/sync.js status names: connecting | catching-up | live | refused | stopped | limited
+//             (the writer-connection cap). It is the status of the connection that carries presence and records,
+//             not a merge of a tab's connections (the status pill shows the merge).
 //   onStatus(fn(status, role)) → unsubscribe                                                        ADDED
 //             called when `status` or `role` changes (presence clears and the emote bar disables off live).
 //
@@ -21,19 +27,25 @@
 //
 // ── Presence in ─────────────────────────────────────────────────────────────────────────────────────────────
 //   onPresence(fn(batch)) → unsubscribe   others' presence: [{ user, client, k, …fields }], k = cursor | select |
-//             laser | preview | emote | leave (a `leave` inside a batch is handled like onLeave).
+//             laser | preview | emote | leave (a `leave` inside a batch is handled like onLeave). Each message once:
+//             never this tab's own (any of its connections), never twice through two connections.
 //   onLeave(fn(user, client)) → unsubscribe
 //   previews(stream) → [{ el, user, client }]   others' live previews on `board` or `notes` (expired ones
-//             dropped). ADDED: the sender, which Replica.previewsOf doesn't return today (Replica.previewBy has it).
+//             dropped; Replica.previewEntries). ADDED: the sender.
 //   onHere(fn({ writers: [{ user, name, role }], writerCount, viewers })) → unsubscribe
-//   onEmotes(fn({ counts: { emoji: n } })) → unsubscribe     viewers' emotes, summed per 500 ms window
+//             always the full shape: a count-only `here` (no `writers`, PROTOCOL.md § Presence) keeps the last
+//             list and updates only the counts; an explicit `writers: []` clears it.
+//   onEmotes(fn({ counts: { emoji: n } })) → unsubscribe     viewers' emotes, summed per 500 ms window (`t` dropped)
 //
 // ── Records (comments) ──────────────────────────────────────────────────────────────────────────────────────
 //   records() → { threads, pending }
 //             threads: the snapshot shape (§ Records) with this client's unacknowledged actions applied on top
 //             (Replica.recordsState()); pending: [{ op }] this client's unacknowledged `records` actions, oldest
 //             first (ADDED: the snapshot shape alone can't say what is pending).
-//   onRecords(fn()) → unsubscribe   records() may have changed (an entry, an ack, a refusal, a local action)
+//   onRecords(fn()) → unsubscribe   records() may have changed (an entry, an ack, a refusal, a local action).
+//             MAY be coalesced to at most one call per animation frame (the sync adapter does: p7-collabv M4), so
+//             never rely on one call per change; records() is current whenever it is read. Records actions are
+//             paced by the Replica's op bucket (20/s), so the UI never paces them itself.
 //   thread({ id, anchor, text })   reply({ id, thread, text })   resolve({ id })   reopen({ id })
 //   react({ id, emoji })   unreact({ id, emoji })   deleteComment({ id })
 //             each sends one `records` op: { do: "thread" | "reply" | "resolve" | "reopen" | "delete", … } and

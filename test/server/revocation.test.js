@@ -69,7 +69,8 @@ test("H1: grants removed DURING the role lookup (it answered from the old grants
 
 test("M1: a re-check whose role lookup throws fails closed: `unavailable` 1013, and the reconnecting hello is refused", async () => {
   let boom = false;
-  const r = await rig({ wrapAuth: a => ({ ...a, role: async (id, b) => { if (boom) throw new Error("registry down"); return a.role(id, b); } }) });
+  const r = await rig({ wrapAuth: a => ({ ...a, role: async (id, b) => { if (boom) throw new Error("registry down"); return a.role(id, b); },
+    rolesFor: async (b, ids) => { if (boom) throw new Error("registry down"); return a.rolesFor(b, ids); } }) });   // the pass's batch (p5-load)
   const s = await r.sock(); s.send(hello(r, "editor")); await s.next(m => m.t === "welcome");
   await r.registry.setGrant(r.ids.board, "dev:editor", null);
   boom = true;

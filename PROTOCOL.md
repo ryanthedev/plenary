@@ -661,6 +661,10 @@ All ports are async (Promises; QuickJS has them). The room imports none of them 
     first batch of lookups fails stops (the Registry looks down); the users it didn't reach are unchanged until the
     next pass. So a short Registry blip closes nobody, one failing user closes only their own connections, and an
     expired link outlives its `expiresAt` by at most about 60 s + 14 s while the Registry answers.
+  - **Role cache.** A gateway may answer a hello's role from a per-gateway cache. If a `grants` message is lost, a
+    NEW connection may therefore be admitted with the old role until the gateway's next timed re-check, which reads
+    the Registry fresh and treats the connection like any other live one, or until the cache entry's life ends (at
+    most 30 s), whichever is first. The cache never hides a revoke past the next timed pass.
 
 ### Registry
 

@@ -25,7 +25,8 @@
 
 /**
  * @param {{ sessions?: Verifier, dev?: Verifier,
- *   tenancy: { role(id: Identity, board: string): Promise<string|null> } }} deps
+ *   tenancy: { role(id: Identity, board: string): Promise<string|null>,
+ *     rolesFor?(board: string, ids: Identity[]): Promise<Map<string, string|null>>, invalidate?(board: string, user?: string): void } }} deps
  * @returns {Auth}
  */
 export function authPort({ sessions, dev, tenancy }) {
@@ -43,5 +44,8 @@ export function authPort({ sessions, dev, tenancy }) {
     async role(identity, board) {
       return tenancy.role(identity, board);
     },
+    // p5-load: the batch (Map user → role|null, fresh) and the cache's invalidation, when the tenancy has them.
+    ...(typeof tenancy.rolesFor === "function" ? { rolesFor: (board, identities) => tenancy.rolesFor(board, identities) } : {}),
+    ...(typeof tenancy.invalidate === "function" ? { invalidate: (board, user) => tenancy.invalidate(board, user) } : {}),
   };
 }

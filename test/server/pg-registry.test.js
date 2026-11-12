@@ -37,7 +37,7 @@ describe.skipIf(!url)("postgres registry", () => {
     const r = await postgresRegistry({ sql: client(), schema, now });
     schemas.set(r, schema);
     return r;
-  }, { cleanup: async r => { await r.close(); await drop(schemas.get(r)); schemas.delete(r); } });
+  }, { cleanup: async r => { await r.close(); await drop(schemas.get(r)); schemas.delete(r); }, batch: true });
 
   // The same contract as a runtime role: USAGE on the schema and row rights on tables an owner created, nothing more
   // (PROTOCOL.md § Store, "Least privilege"). One role for the file; each test's schema is migrated by the owner
@@ -65,7 +65,7 @@ describe.skipIf(!url)("postgres registry", () => {
       schemas.set(r, schema);
       return r;
     } catch (err) { await drop(schema); throw err; }
-  }, { cleanup: async r => { await r.close(); await drop(schemas.get(r)); schemas.delete(r); } });
+  }, { cleanup: async r => { await r.close(); await drop(schemas.get(r)); schemas.delete(r); }, batch: true });
 
   test("a write transaction runs with synchronous_commit=on", async () => {
     const schema = schemaName();

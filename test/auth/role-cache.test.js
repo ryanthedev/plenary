@@ -372,7 +372,7 @@ test("rolesFor: unknown board → every user null; users deduplicated; chunks of
 
 // ---- F4: share-link redemption no longer announces ----
 
-test("announcingRegistry: addLinkUse announces nothing; grants, invites and links still announce { board }", async () => {
+test("announcingRegistry: addLinkUse announces { board, user } only; grants, invites and links still announce { board }", async () => {
   const bus = memoryBus();
   const got = [];
   bus.subscribe(subjects.grants(acme.id, board.id), m => got.push(m));
@@ -385,7 +385,8 @@ test("announcingRegistry: addLinkUse announces nothing; grants, invites and link
   await a.addLinkUse(link.id, "google:gus");
   await tenancy({ registry: a, now }).redeemLink(id("google:hal"), link.id);
   await bus.flush();
-  expect(got).toEqual([]);
+  expect(got).toEqual([{ board: board.id, user: "google:gus" }, { board: board.id, user: "google:hal" }]);
+  got.length = 0;
   expect(await raw.linkUses(board.id, "google:hal")).toEqual([link.id]);
   await a.setGrant(board.id, "google:gus", "editor");
   await a.revokeLink(link.id);

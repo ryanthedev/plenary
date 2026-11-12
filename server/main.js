@@ -41,7 +41,7 @@ import { diskBlobs } from "./blobs/disk.js";
 import { authPort } from "./auth/port.js";
 import { devAuth } from "./auth/dev.js";
 import { sqliteRegistry } from "./registry/sqlite.js";
-import { tenancy as makeTenancy } from "./auth/tenancy.js";
+import { tenancy as makeTenancy, roleCache } from "./auth/tenancy.js";
 import { sessions as makeSessions } from "./auth/session.js";
 import { googleOidc } from "./auth/oidc.js";
 import { httpRoutes } from "./auth/http.js";
@@ -60,8 +60,16 @@ const keyOk = k => typeof k === "string" && new TextEncoder().encode(k).length >
  * board on every redemption. The redeemer's other open sockets pick up the higher role on the next timed re-check.
  */
 export function announcingRegistry(registry, bus, log) {
-  const announce = async board => {
-    try { const b = await registry.board(board); if (b) await bus.publish(subjects.grants(b.tenant, b.id), { board: b.id }); }
+  // board → tenant and link → board never change (the port has no update for either): remembered, bounded, so a
+  // redemption wave costs no extra Registry reads (p5-load).
+  const tenantOf = new Map(), boardOfLink = new Map();
+  const remember = (m, k, v) => { if (m.size >= 10_000) m.delete(m.keys().next().value); m.set(k, v); };
+  const announce = async (board, user) => {
+    try {
+      let tenant = tenantOf.get(board);
+      if (!tenant) { const b = await registry.board(board); if (!b) return; tenant = b.tenant; remember(tenantOf, board, tenant); }
+      await bus.publish(subjects.grants(tenant, board), typeof user === "string" ? { board, user } : { board });
+    }
     catch (err) { log.warn("grants announcement failed", { board, err }); }
   };
   const after = (name, boardOf) => async (...args) => {
@@ -78,6 +86,14 @@ export function announcingRegistry(registry, bus, log) {
     revokeInvite: after("revokeInvite", async id => (await registry.invite(id).catch(() => null))?.board),
     createLink: after("createLink", o => o?.board),
     revokeLink: after("revokeLink", async id => (await registry.link(id).catch(() => null))?.board),
+    // Scoped to the redeemer: gateways drop that user's cached role only (no re-check pass; it only adds access).
+    async addLinkUse(link, user) {
+      let board = boardOfLink.get(link);
+      if (!board) { board = (await registry.link(link).catch(() => null))?.board; if (typeof board === "string") remember(boardOfLink, link, board); }
+      const out = await registry.addLinkUse(link, user);
+      if (typeof board === "string") await announce(board, String(user));
+      return out;
+    },
   };
 }
 
@@ -116,7 +132,8 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch } = {}
   const dev = devAuth(tokens ? { enabled: true, tokens } : undefined);
   const sessions = await makeSessions({ key: sessionKey });
   const tenancy = makeTenancy({ registry });
-  const auth = authPort({ sessions, dev, tenancy });
+  // Hellos read roles through a per-process cache; the gateway invalidates it on `grants` and its timed pass reads fresh (p5-load).
+  const auth = authPort({ sessions, dev, tenancy: roleCache({ registry, now: Date.now }) });
   // Google sign-in only when both halves of the OAuth client are there; otherwise /auth answers 503.
   const oidc = env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET
     ? googleOidc({ clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET, redirectUri, fetch: fetchFn })

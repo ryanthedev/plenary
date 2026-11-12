@@ -30,6 +30,7 @@ import { boardFeed } from "./feed.js";
 import { isId } from "./ids.js";
 import { quietLogger } from "./log.js";
 import { breathe } from "./breather.js";
+import { identityKey } from "./auth/tenancy.js";   // the one spelling of the re-check grouping key (p5-load)
 
 export const LIMITS = {
   maxFrameBytes: 4 * 1024 * 1024,   // transport cap: an op is ≤ 1,000,000 chars (≤ 3 bytes each); above this Bun closes with 1009
@@ -80,6 +81,7 @@ export const LIMITS = {
   recheckRetryMs: 2_000,                    // the first retry's wait; it doubles
   recheckLookupMs: 2_000,                   // one re-check lookup that hasn't settled by then is an error (a hung Registry call)
   recheckConcurrency: 8,                    // role lookups in flight per pass (an async Registry: a pass isn't users × round trip)
+  recheckBatch: 1_000,                      // identities per auth.rolesFor call, when the Auth port has it (p5-load: O(1) Registry queries per chunk)
   // § Presence, `here`.
   hereMax: 50,                              // writers listed
   hereMs: 1_000,                            // `here` to clients and `.here` publishes: at most this often
@@ -493,9 +495,14 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     const key = `${tenant}/${board}`;
     let w = grantWatches.get(key);
     if (!w) {
-      w = { gen: 0, refs: 0, unsub: () => {} };
+      w = { gen: 0, refs: 0, board, unsub: () => {} };
       const self = w;
-      w.unsub = bus.subscribe(subjects.grants(tenant, board), () => {
+      w.unsub = bus.subscribe(subjects.grants(tenant, board), m => {
+        // p5-load: drop cached roles FIRST (synchronously), so the hello re-ask and the pass below read fresh.
+        // `{ board, user }` (a share-link use) only RAISES that user's access: drop their cached role, nothing else
+        // (no pass, no gen bump; their open sockets get the higher role on the next timed pass). Never a revoke.
+        if (typeof m?.user === "string") { auth.invalidate?.(board, m.user); return; }
+        auth.invalidate?.(board);
         self.gen++;
         const b = boards.get(key);
         if (b) requestRecheck(b, "grants");
@@ -510,6 +517,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     const { key, w } = c.watch; c.watch = null;
     if (--w.refs > 0) return;
     w.unsub(); if (grantWatches.get(key) === w) grantWatches.delete(key);
+    auth.invalidate?.(w.board);   // no watch, no invalidations: cached roles for this board must not outlive it (p5-load)
   }
 
   // ---- re-checking live connections' roles (PROTOCOL.md § Auth, Re-checking live connections) ----
@@ -558,6 +566,14 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     });
     return Promise.race([Promise.resolve().then(() => auth.role(identity, board)), late]).finally(() => clearTimeout(timer));
   }
+  /** `auth.rolesFor`, bounded the same way (p5-load): a chunk that hasn't settled in recheckLookupMs is an error for each of its identities. */
+  function rolesWithin(identities, board) {
+    let timer;
+    const late = new Promise((_, reject) => {
+      timer = setTimeout(() => { rechecks.timeouts++; reject(Object.assign(new Error(`role lookup took over ${lim.recheckLookupMs} ms`), { name: "TimeoutError", code: "timeout" })); }, lim.recheckLookupMs);
+    });
+    return Promise.race([Promise.resolve().then(() => auth.rolesFor(board, identities)), late]).finally(() => clearTimeout(timer));
+  }
 
   /** Arm the board's one retry timer for the earliest due among its failing connections (none: no timer). */
   function armRetry(b) {
@@ -587,10 +603,11 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       const c = ws.data;
       if (c.state !== "live") continue;
       if (kind === "retry" && !(c.checkFails && c.retryDue <= t0)) continue;
-      // Grouped by what `auth.role` reads (user, email for invites, domain for membership), not by user id alone.
-      const key = `${c.user}\n${c.identity?.email ?? ""}\n${c.identity?.domain ?? ""}`;
+      // Grouped by what `auth.role` reads (user, email for invites, domain for membership), not by user id alone:
+      // tenancy.js's identityKey, the key auth.rolesFor answers by (p5-load).
+      const key = identityKey({ user: c.user, email: c.identity?.email, domain: c.identity?.domain });
       let g = byKey.get(key);
-      if (!g) { g = { user: c.user, identity: c.identity, conns: [], writer: false }; byKey.set(key, g); all.push(g); }
+      if (!g) { g = { key, user: c.user, identity: c.identity, conns: [], writer: false }; byKey.set(key, g); all.push(g); }
       g.conns.push(ws);
       if (c.role !== "viewer") g.writer = true;
     }
@@ -612,10 +629,24 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       c.retryDue = t + lim.recheckRetryMs * 2 ** (c.checkFails - 1);
       rc.failing.add(ws); sum.kept++;
     };
+    // p5-load: an Auth port with rolesFor answers a chunk of identities from the board's rows read once (fresh, never
+    // the cache), bounded like roleWithin. The pass first drops the board's cached roles (so it ends holding only what
+    // it read: a lost `grants` message is caught here) and bumps the board's hello generation (a hello still waiting
+    // may have read a cached role from before this pass, which this pass won't see: it asks again).
+    const batched = typeof auth.rolesFor === "function";
+    let roles = null, chunkErr = null, chunkEnd = 0;
+    if (batched) {
+      auth.invalidate?.(b.board);
+      const w = grantWatches.get(b.key); if (w) w.gen++;
+    }
     const one = async g => {
       let role, err = null;
-      rechecks.roleCalls++;
-      try { role = await roleWithin(g.identity, b.board); } catch (e) { err = e; lastErr = e; sum.errors++; }
+      if (batched) {
+        if (chunkErr) { err = chunkErr; lastErr = chunkErr; sum.errors++; } else role = roles.get(g.key) ?? null;
+      } else {
+        rechecks.roleCalls++;
+        try { role = await roleWithin(g.identity, b.board); } catch (e) { err = e; lastErr = e; sum.errors++; }
+      }
       for (const ws of g.conns) {
         const c = ws.data;
         if (c.state !== "live") continue;
@@ -634,7 +665,16 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       if (boards.get(b.key) !== b) break;
       // A `grants` ask arrived: stop here (the users not reached are unchanged) and let the grants pass run now.
       if (rc.cut && !failClosed) { stopped = "cut"; rechecks.cut++; break; }
-      const batch = users.slice(next, next + lim.recheckConcurrency); next += batch.length;
+      if (batched && next >= chunkEnd) {
+        chunkEnd = next + lim.recheckBatch;
+        rechecks.roleCalls++;
+        try { roles = await rolesWithin(users.slice(next, chunkEnd).map(g => g.identity), b.board); chunkErr = null; }
+        // A failed or late chunk: its identities take the error path below; invalidate so a late answer can't write through.
+        catch (e) { roles = null; chunkErr = e; auth.invalidate?.(b.board); }
+        if (boards.get(b.key) !== b) break;
+      }
+      // Never past the chunk read: an identity outside it would read as "no role" and be closed.
+      const batch = users.slice(next, Math.min(next + lim.recheckConcurrency, batched ? chunkEnd : Infinity)); next += batch.length;
       const ok = await Promise.all(batch.map(one));
       // The Registry looks down (every lookup in the first batch failed): a timed pass stops; the users not reached
       // are unchanged, and the failed ones retry on their own schedule.

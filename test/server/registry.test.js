@@ -15,7 +15,7 @@ let n = 0;
 const file = () => join(dir, `r${++n}.db`);
 
 // Platform's contract, on a fresh file per test (a file, not :memory:, so WAL and fsync are in play).
-registryContract("sqlite", async ({ now }) => sqliteRegistry({ path: file(), now, fullfsync: false }), { cleanup: r => r.close() });
+registryContract("sqlite", async ({ now }) => sqliteRegistry({ path: file(), now, fullfsync: false }), { cleanup: r => r.close(), batch: true });
 
 describe("sqlite registry", () => {
   test("pragmas: WAL, synchronous=FULL, fullfsync on by default; start-up leaves the whole busy_timeout", async () => {

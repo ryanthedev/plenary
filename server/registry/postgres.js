@@ -355,6 +355,17 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       if (!key(board) || !key(user)) return [];
       return (await db.unsafe(`SELECT link FROM ${U} WHERE board = $1 AND member = $2 ORDER BY n`, [board, user])).map(r => r.link);
     },
+    // The optional batch (registry-port.js): one query, the users bound as one JSON array.
+    async linkUsesFor(board, users) {
+      ready();
+      const out = new Map();
+      const us = (users ?? []).filter(key);
+      if (!key(board) || !us.length) return out;
+      const rows = await db.unsafe(`SELECT member, link FROM ${U} WHERE board = $1
+        AND member IN (SELECT jsonb_array_elements_text($2::text::jsonb)) ORDER BY member, n`, [board, JSON.stringify(us)]);
+      for (const r of rows) { if (!out.has(r.member)) out.set(r.member, []); out.get(r.member).push(r.link); }
+      return out;
+    },
 
     /** What a write transaction runs with, read back from Postgres (for /health and tests). */
     settings() {

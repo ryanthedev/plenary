@@ -8,7 +8,7 @@ import { diskBlobs } from "../../server/blobs/disk.js";
 import { authPort } from "../../server/auth/port.js";
 import { devAuth } from "../../server/auth/dev.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy } from "../../server/auth/tenancy.js";
+import { tenancy, roleCache } from "../../server/auth/tenancy.js";
 import { Replica } from "../../packages/protocol/replica.js";
 import { jsonCodec } from "../../packages/protocol/codec.js";
 import { tempDir, sleep, until } from "./helpers.js";
@@ -19,7 +19,7 @@ export const SECRET = "S3CR3T";
 export const tokenOf = name => `${SECRET}-${name}-token`;
 
 /**
- * @param {{ verifyDelayMs?: number, wrapStore?: (s: object) => object, wrapAuth?: (a: object) => object,
+ * @param {{ verifyDelayMs?: number, cache?: object, wrapStore?: (s: object) => object, wrapAuth?: (a: object) => object,
  *   wrapRegistry?: (r: object) => object, wrapBus?: (b: object) => object, limits?: object, host?: object, dir?: string, registry?: object, ids?: object }} [o]
  * Pass `dir`, `registry` and `ids` from an earlier rig to restart "the same server" on the same data.
  */
@@ -40,12 +40,16 @@ export async function rig(o = {}) {
   // One dev user per role (named after it), spare editors, and a stranger with a valid token but no role anywhere.
   const names = [...ROLES, ...Array.from({ length: 8 }, (_, i) => "editor" + i), "stranger"];
   const dev = devAuth({ enabled: true, tokens: Object.fromEntries(names.map(n => [tokenOf(n), { name: n }])) });
-  let auth = authPort({ dev, tenancy: tenancy({ registry }) });
+  // `o.cache`: roleCache options → hellos read through the role cache, as server/main.js wires it (p5-load).
+  let auth = authPort({ dev, tenancy: o.cache ? roleCache({ registry, ...o.cache }) : tenancy({ registry }) });
   const calls = { verify: 0, role: 0, board: 0 };
+  const cacheCalls = { rolesFor: 0, invalidate: 0 };
   const inner = auth;
   auth = {
     async verify(t) { calls.verify++; if (o.verifyDelayMs) await sleep(o.verifyDelayMs); return inner.verify(t); },
     async role(id, b) { calls.role++; return inner.role(id, b); },
+    ...(inner.rolesFor ? { async rolesFor(b, ids) { cacheCalls.rolesFor++; return inner.rolesFor(b, ids); } } : {}),
+    ...(inner.invalidate ? { invalidate(b, u) { cacheCalls.invalidate++; return inner.invalidate(b, u); } } : {}),
   };
   if (o.wrapAuth) auth = o.wrapAuth(auth);
   let reg = { ...registry, async board(id) { calls.board++; return registry.board(id); } };
@@ -62,7 +66,7 @@ export async function rig(o = {}) {
   const server = createServer({ auth, registry: reg, store, bus, blobs: diskBlobs({ dir: join(dir, "blobs") }), log, port: 0, limits: { opRate: 1e6, opBurst: 1e6, ...(o.limits ?? {}), feed }, host: o.host });   // the gateway's op pace is off unless a test sets it
 
   const self = {
-    dir, lines, log, registry, ids, store, rawStore, bus, server, inbox, calls,
+    dir, lines, log, registry, ids, store, rawStore, bus, server, inbox, calls, cacheCalls,
     logs: () => lines.map(l => JSON.parse(l)),
     health: async () => { const res = await fetch(server.url + "/health"); return { status: res.status, body: await res.json() }; },
     /** The live Room for the test board (null if not open). */

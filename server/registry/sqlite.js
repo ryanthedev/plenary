@@ -137,6 +137,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     useN: db.query("SELECT coalesce(max(n), 0) + 1 AS n FROM reg_link_uses WHERE board = ? AND member = ?"),
     insUse: db.query("INSERT INTO reg_link_uses (board, member, link, n) VALUES (?, ?, ?, ?) ON CONFLICT (board, member, link) DO NOTHING"),
     uses: db.query("SELECT link FROM reg_link_uses WHERE board = ? AND member = ? ORDER BY n"),
+    usesFor: db.query("SELECT member, link FROM reg_link_uses WHERE board = ? AND member IN (SELECT value FROM json_each(?)) ORDER BY member, n"),
   };
 
   const ready = () => { if (!open) throw new Error("registry: closed"); };
@@ -269,6 +270,15 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     async linkUses(board, user) {
       ready();
       return str(board) && str(user) ? q.uses.all(board, user).map(r => r.link) : [];
+    },
+    // The optional batch (registry-port.js): one query, the users bound as one JSON array.
+    async linkUsesFor(board, users) {
+      ready();
+      const out = new Map();
+      const us = (users ?? []).filter(str);
+      if (!str(board) || !us.length) return out;
+      for (const r of q.usesFor.all(board, JSON.stringify(us))) { if (!out.has(r.member)) out.set(r.member, []); out.get(r.member).push(r.link); }
+      return out;
     },
 
     /** What the registry was opened with, read back from SQLite (for /health and tests). */

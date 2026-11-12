@@ -1,0 +1,104 @@
+// Single-node entry point: `bun server/main.js`. SQLite store, in-memory bus, local-disk blobs, dev-token auth.
+//
+// Environment (no secrets in the repo; none of these values is ever logged):
+//   PORT                 default 8080 (0 = any free port)
+//   HOST                 default 127.0.0.1 (a container needs HOST=0.0.0.0)
+//   PLENARY_DATA_DIR     data directory, default ./data  (plenary.db, blobs/); the name deploy/ uses
+//   PLENARY_DEV_TOKENS   JSON: { "<token>": { "name": "ann", "role": "editor", "email"?, "domain"? } }. Unset = dev
+//                        tokens off, so every hello is refused until sign-in is wired (platform track).
+//   LOG_LEVEL            debug | info | warn | error
+//   PLENARY_MAX_CONNS_PER_USER   open sockets one user may hold (default 64). A load test that shares a few dev
+//                        tokens between thousands of clients must raise it.
+//
+// The Registry (tenants, boards, grants, invites, links) is durable: SQLite in <data>/registry.db, next to the
+// log in <data>/plenary.db, so boards and their ops both survive a restart or a kill -9.
+// SEAM(platform): POST /boards and Google sign-in are not wired here yet (createServer({ http }) is where they go).
+// Until they are, with dev tokens on, there is one dev board: created on the first start, its id kept in
+// <data>/dev-board.json and reused afterwards (and logged). Each dev user gets the role its token names (default
+// editor; if two tokens name one user, the highest role). A restart never demotes the board's last owner.
+
+import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { createLogger } from "./log.js";
+import { createServer } from "./server.js";
+import { sqliteStore } from "./store/sqlite.js";
+import { memoryBus } from "./bus/memory.js";
+import { diskBlobs } from "./blobs/disk.js";
+import { authPort } from "./auth/port.js";
+import { devAuth } from "./auth/dev.js";
+import { sqliteRegistry } from "./registry/sqlite.js";
+import { tenancy } from "./auth/tenancy.js";
+import { ROLES } from "../packages/protocol/envelope.js";
+
+export async function start(env = process.env) {
+  const log = createLogger({ level: env.LOG_LEVEL || "info" });
+  const dataDir = env.PLENARY_DATA_DIR || "./data";
+  mkdirSync(dataDir, { recursive: true });
+
+  let tokens = null;
+  if (env.PLENARY_DEV_TOKENS) {
+    try { tokens = JSON.parse(env.PLENARY_DEV_TOKENS); } catch { tokens = null; }
+    if (!tokens || typeof tokens !== "object" || Array.isArray(tokens)) { log.error("PLENARY_DEV_TOKENS is not a JSON object; dev tokens stay off"); tokens = null; }
+  }
+
+  const store = sqliteStore({ path: join(dataDir, "plenary.db") });
+  const bus = memoryBus({ onError: (err, subject) => log.error("bus subscriber failed", { subject, err }) });
+  const blobs = diskBlobs({ dir: join(dataDir, "blobs") });
+  const registry = sqliteRegistry({ path: join(dataDir, "registry.db") });
+  const dev = devAuth(tokens ? { enabled: true, tokens } : undefined);
+  const auth = authPort({ dev, tenancy: tenancy({ registry }) });
+
+  let devBoard = null;
+  if (dev.enabled) {
+    // Reuse the dev board across restarts (the Registry has no list call to find it by).
+    const devFile = join(dataDir, "dev-board.json");
+    let saved = null;
+    if (existsSync(devFile)) { try { saved = JSON.parse(readFileSync(devFile, "utf8")).board; } catch { saved = null; } }
+    // Not in a try: a Registry that can't answer must fail the start, not mint a second dev board.
+    let board = typeof saved === "string" ? await registry.board(saved) : null;
+    if (!board) {
+      const tenant = await registry.createTenant({ domain: null });
+      board = await registry.createBoard({ tenant: tenant.id, title: "dev board", memberRole: null });
+      // Written whole or not at all (a kill mid-write must not leave half a file that hides the board).
+      writeFileSync(devFile + ".tmp", JSON.stringify({ board: board.id }));
+      renameSync(devFile + ".tmp", devFile);
+    }
+    // Two tokens may name the same user: one grant per user, the highest role wins (ROLES is highest first), so
+    // one start never lowers a grant it has just made.
+    const best = new Map();
+    for (const t of Object.values(tokens)) {
+      if (!t || typeof t.name !== "string" || !t.name) continue;
+      const user = "dev:" + t.name, role = ROLES.includes(t.role) ? t.role : "editor";
+      if (!best.has(user) || ROLES.indexOf(role) < ROLES.indexOf(best.get(user))) best.set(user, role);
+    }
+    // Across restarts a token's role may have dropped. The Registry refuses to demote a board's last owner
+    // (code "last-owner"): that grant is kept and the start goes on. Raises go first, so a new owner named in the
+    // same start is in place before an old one is lowered.
+    const byRank = [...best].sort((a, b) => ROLES.indexOf(a[1]) - ROLES.indexOf(b[1]));
+    for (const [user, role] of byRank) {
+      try { await registry.setGrant(board.id, user, role); }
+      catch (err) { if (err?.code !== "last-owner") throw err; log.warn("a dev token would demote the dev board's last owner; kept as owner", { user }); }
+    }
+    devBoard = board.id;
+    log.warn("dev tokens are ON: not for production", { board: board.id, tenant: board.tenant, users: best.size });
+  } else log.warn("dev tokens are off and sign-in is not wired yet: every hello will be refused");
+
+  const perUser = Number(env.PLENARY_MAX_CONNS_PER_USER);
+  const limits = Number.isSafeInteger(perUser) && perUser > 0 ? { maxConnsPerUser: perUser } : undefined;
+  const server = createServer({ auth, registry, store, bus, blobs, log, limits, port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1" });
+  return { server, store, bus, registry, log, devBoard, async stop() { await server.stop(); await bus.close(); await store.close(); await registry.close(); } };
+}
+
+if (import.meta.main) {
+  const log = createLogger({ level: process.env.LOG_LEVEL || "info" });
+  // Handlers catch their own errors; these are the last line, so one bug never takes every board down with it.
+  process.on("uncaughtException", err => log.error("uncaught exception", { err }));
+  process.on("unhandledRejection", err => log.error("unhandled rejection", { err }));
+  const app = await start();
+  let stopping = false;
+  for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, async () => {
+    if (stopping) return; stopping = true;
+    try { await app.stop(); } catch (err) { log.error("shutdown failed", { err }); }
+    process.exit(0);
+  });
+}

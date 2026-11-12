@@ -222,3 +222,4 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 - Open LOWs (M8 hardening): no rate limit on callbacks (1:1 outbound call to Google); logout local only.
 - Not done: real Google client (CEO credentials), web/ reading `#token` (client track).
 - Sessions t17b, t17c closed, killed, removed.
+- Engine: httpRoutes wiring goes into engine's next job p2-swap (after scaffold round-3 verification), with a test that POST /boards via dev Bearer creates a board a socket client joins. Engine will notify.

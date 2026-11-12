@@ -4,17 +4,14 @@
 
 - **Me:** manager client, terminal t14k. Report to the proxy **t1bx** ONLY by ending my turn with one short message (outcome
   first, report path; "Urgent:" first if urgent). NEVER prompt/hc send/SendMessage t1bx (CEO rule, 2026-11-12). Workers report to me only. engine manager **t18m**; platform manager **t187**.
-- **In flight:** p6-hexv ROUND 2 in **t1g6** (brief docs/m2/briefs/p6-hexv.md "## Round 2"), re-verifying the p6-hex fix
-  round (DONE in t1gk, report p6-hex.md §9; test/web 552/0 re-run by me). Watch task on t1g6.
-- **p6-hexv verdict: FAIL** (docs/m2/reports/p6-hexv.md): the known HIGH plus LOWs; 1044 pass / 0 fail; 14/14 mutants caught.
-  Verifier t1g6 idle, kept for the re-verify. Old builder shell t1fy no longer used.
-- **After the fix round:** re-verify (t1g6; also the browser checks it skipped: refused op + resync, drop mid-typing, served
-  page via p-serve) → commit web/ + test/web by path (p6-hex.md §8) → send engine (t18m) the commit id for p-serve's
-  re-crawl → close t1gk, t1g6 → start p7-wire.
+- **In flight:** p7-wire builder in **t1gq** (session 260aa90c; brief docs/m2/briefs/p7-wire.md; tab
+  `worker p7-wire (client) · t1gq: collab over sync`). Watch task on t1gq (30 min, re-arm on expiry).
+- **Done:** p6-hex committed **06bf267** (p6-hexv PASS round 2). t1gk and t1g6 closed, killed and removed.
+- **When p7-wire reports:** check its report and `bun test test/web`, then write and launch p7-wirev (verifier, CHECKER + sdd).
 - **M4 load-test plan item (from p6-hexv):** two transports per tab (~200k hellos at 100k joins).
 - **Asked engine (unanswered):** is the ws path same-origin `/ws`, token only in hello (no subprotocol/query)?
 - **Main:** phase 2 merged (dcbdae6); p2-land worktree retired. test/arch-scan.js on main (44dd1aa).
-- **Next, in order:** p6-hex fix round → p7-wire (docs/m2/briefs/p7-wire.md) → an architecture audit of web/.
+- **Next, in order:** p7-wire → p7-wirev → commit → an architecture audit of web/.
 - **Start command:** OFFICE.md "Starting a session" (names plenary-<job>[v], --model opus --permission-mode auto,
   systems-design plugin, zsh -lic wrapper). Tab: `worker <job> (client) · <id>: <what>`.
 
@@ -22,8 +19,7 @@
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| p6-hex (fix round) | t1gk | worker p6-hex (client) · t1gk: web ports and adapters (fix round) | fix round DONE (§9); idle until the re-verify |
-| p6-hexv (verifier) | t1g6 | verifier p6-hexv (client) · t1g6: web ports and adapters | round 2 RUNNING |
+| p7-wire (builder) | t1gq | worker p7-wire (client) · t1gq: collab over sync | RUNNING |
 
 ## 2026-11-11 — phase-6 design mock
 
@@ -278,3 +274,4 @@
 - p6-hex fix round DONE (t1gk, 7 min): all 9 items with tests + mutations; production page boots on the real server rig over /ws (20/20). test/web 552/0 (me). Round 2 sent to t1g6.
 - 2026-11-12: engine (t18m) FYI: static serving committed (ea978ac, main.js import-graph allowlist); `here` count-only
   frames coming with p2-tune r2. Both added to docs/m2/briefs/p7-wire.md.
+- 2026-11-12: p6-hexv PASS (round 2) → p6-hex committed 06bf267; t1gk, t1g6 cleaned up. p7-wire brief finalised (state at start, collab contract test, both roots, Done when); builder launched in t1gq.

@@ -10,7 +10,7 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 | proxy | t1bx | ★ proxy · t1bx (talk here) | running (successor of t14h; handoff docs/m2/handoff/proxy.md, 9d06783) |
 | manager engine | t18m | manager engine | running (successor of t14j; handoff docs/m2/handoff/manager-engine.md, 94b1ae9): scaffold final gate t18c, v1.1 code verify t171 |
 | manager platform | t187 | manager platform | running (successor of t14q; handoff docs/m2/handoff/manager-platform.md, 9266173): drawh round 3 (t185, verifier t155) |
-| manager client | t14k | manager client · t14k | running: p6-hex fix round (t1gk), re-verify by p6-hexv (t1g6); then p7-wire |
+| manager client | t14k | manager client · t14k | running: p7-wire (t1gq, collab over sync, both roots); then p7-wirev, then a web/ architecture audit |
 
 ## Commitments
 
@@ -124,3 +124,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-12 engine: p-arch follow-up DONE 3a7520d (round 2, no HIGH/MEDIUM). Architecture audit p-audit (server/ + packages/protocol) started.
 - 2026-11-12 proxy: every local agent was killed at 03:44 (herdr-core holder loss; terminals kept as plain zsh). Proxy resumed in place (claude --resume, --model opus, auto, plugin dirs, via zsh -lic): owner t13s, managers t18m t14k t187, in-flight t1g8 t1g7 t1g6 t1g5 t1g4 t1fw t1ft. Done builders t1g3 t1g1 t1fy and retired proxy t14h left as shells. Watches re-armed.
 - 2026-11-12 client: p6-hexv FAIL (known HIGH: main.js must be the production root, plus LOWs; 1044 pass / 0 fail). Fix round running in t1gk (resumed builder). Two transports per tab goes on the M4 load-test plan.
+- 2026-11-12 client: p6-hex committed 06bf267 (web/ hexagonal; production root on ws + HTTP auth; p6-hexv PASS round 2). p7-wire started (t1gq).

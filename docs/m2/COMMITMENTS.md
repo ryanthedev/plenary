@@ -18,7 +18,7 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 |---|---|---|---|
 | 1 | Phase 1 protocol v1 spec, shown to the CEO (not a gate; phase 2 starts on PASS) | DONE 28fa91d (audited by proxy, pushed 32cc915; shown to the CEO with 3 open questions) | manager engine t14j, brief docs/m2/briefs/manager-engine.md |
 | 2 | Phase 6 design mock, shown to the CEO (not a gate; phase 6 build starts on PASS) | DONE 7536d50 (round 2 PASS; shown to the CEO) | manager client t14k, brief docs/m2/briefs/manager-client.md |
-| 3 | Ask the CEO for the Google OAuth client (env vars, never chat) when phase 5 starts | OPEN | |
+| 3 | Ask the CEO for the Google OAuth client (env vars, never chat) when phase 5 starts | ASKED 2026-11-11 (p5-http 4fad32a done; sign-in answers 503 until set) | |
 | 4 | drawh change is a proposal only; herdr-draw untouched without the CEO | RUNNING (fix round, 2 HIGH) | patch built (applies to herdr-draw 5dfe352, its tests 269 pass), verifier t155; goes to the CEO after PASS; needs a refresh after phase 2 |
 
 ## Decisions (reversible; the CEO may overturn)
@@ -74,3 +74,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 engine: scaffold re-verify FAIL, 1 HIGH (catch-up sent as one frame; ~280 legal 1 MB note rewrites make a board unjoinable; non-reading viewers pin memory). Fix in t14z: streamed bounded catch-up with backpressure, buffer budget, per-user connection cap. Flaky test = rig.js timing, fixed with a 50x stability run.
 - 2026-11-11 engine: phase-4 adapters started in parallel: p4-pg t17d (Postgres Store + Registry, atomic last-owner) and p4-natss3 t17f (NATS Bus + S3 Blobs; adds one NATS client dependency, pinned in bun.lock). Engine allowed brew install postgresql@17 nats-server on this Mac for local tests (servers run by PID, no brew services).
 - 2026-11-11 platform (reversible): drawh seeding renumbers only elements the room would refuse (absent and version > 1,000), not all of them, to avoid silent overwrites from open Herdr panes. Sent to engine to confirm. drawh lost saves 0/4,541. p5-http PASS, MEDIUM in a fix round.
+- 2026-11-11 platform: p5-http DONE 4fad32a (httpRoutes; verifier PASS; bun test 315/0). Engine wires it into main.js in p2-swap. Client told about #token= in the post-login URL.

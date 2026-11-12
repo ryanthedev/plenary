@@ -6,9 +6,6 @@
 |---|---|---|---|
 | p6-land (builder) | t17s | done p6-land (client) | DONE in worktree, report plenary-p2/docs/m2/reports/p6-land.md (verifying) |
 | p6-landv (verifier) | t181 | verifier p6-landv (client): client landing | RUNNING (brief docs/m2/briefs/p6-landv.md) |
-| p7-collab (builder) | t18g | done p7-collab (client) | DONE in worktree (verifying) |
-| p7-collabv (verifier) | t18j | verifier p7-collabv (client): collaboration UI | RUNNING (brief docs/m2/briefs/p7-collabv.md) |
-| p6-sync2 (builder) | t173 | done p6-sync2 (client) | DONE in worktree, report plenary-p2/docs/m2/reports/p6-sync2.md (verifying) |
 
 ## 2026-11-11 — phase-6 design mock
 
@@ -205,3 +202,14 @@
   for the NFRs. All carried into docs/m2/briefs/p7-wire.md (draft; after p6-hex). p7-collab's code stays
   uncommitted in the worktree for engine's p2-land merge. t18g, t18j closed; t173 (p6-sync2, superseded by p6-land)
   closed too.
+- Engine agreed: merge p2-land without waiting for p6-hex/p7-wire; those run on main afterwards (briefs updated).
+  The merge carries phase 2 + v1.1 + p6-land (once t181 passes) + p7-collab. Engine's gates first: scaffold commit,
+  rebase, p2-swap (server onto v1) verified. previewEntries/pendingOf land on p2-land before the merge.
+- Engine manager is now t18m (t14j retired; handoff docs/m2/handoff/manager-engine.md). Message t18m from now on.
+- Engine v1.1 code committed on p2-land 5d55112 (previewEntries/pendingOf included). LOW for client: refusedSettings/retryReady need a consumer in web/; added to the p7-wire brief.
+- p6-landv PASS (docs/m2/reports/p6-landv.md), heads 2c53a90 and 5d55112: no HIGH; p6-sync2v H1/M1/M2 and p6-uiv
+  M1/L2 closed. MEDIUM M1: Chrome's History DB (and the navigation-timing entry, L1) keeps the post-login URL with
+  `#token=`; history.replaceState can't undo a visit already recorded. DECISION (mine, reversible): does NOT block
+  the merge (not fixable in web/; the brief's storage rule targets what the client stores). Escalated to platform via
+  the proxy: deliver a short-lived single-use code in the fragment and exchange it by POST for the session (or an
+  HttpOnly cookie), so no long-lived token ever sits in a URL. LOWs L2–L5 go to p6-hex/p7-wire.

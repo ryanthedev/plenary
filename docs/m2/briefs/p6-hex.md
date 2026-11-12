@@ -4,7 +4,7 @@ Base: docs/m2/BRIEF-BASE.md applies, including **Architecture** (hexagonal) and 
 docs/m2/OFFICE.md ("Architecture"), CLAUDE.md, PROTOCOL.md first.
 
 - **Your tab:** `worker p6-hex (client): web/ ports and adapters`. Manager: `manager client` (t14k).
-- **Where:** the worktree /Users/r/repos/plenary-p2 (branch p2-land). Don't commit; engine merges p2-land.
+- **Where:** main (/Users/r/repos/plenary), after engine merges p2-land (phase 2 + v1.1 + p6-land + p7-collab). Your manager commits.
 - **You own:** web/** and test/web/** in the worktree, plus your report docs/m2/reports/p6-hex.md. The web/ rules
   in the architecture test: see "Boundary test" (coordinated with engine, which owns test/architecture.test.js).
 - **Design first (required):** apply the `distributed-systems-design` skill in **APPLIER** mode before moving code

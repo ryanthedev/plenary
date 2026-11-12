@@ -190,3 +190,4 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 - Verifier p8-cluster-envv (t174): PASS; re-check of engine's amendments PASS; R-M1 (pipefail/SIGPIPE false
   failure in the CI /varz check) fixed by t170 and checked by me (capture, then grep). `bun test`: 263 pass.
 - Nothing run in Docker or on GitHub. Sessions t170, t174 closed, killed, removed.
+- 2026-11-11 proxy: first GitHub run of CI (run 43126348872) green for both jobs, test and test-cluster-services. The workflow and the Postgres/NATS services now verified on GitHub (Docker image and compose still never run).

@@ -56,3 +56,11 @@ No behaviour change. Same tests green, more tests added. Move web/ to ports and 
 LOW L2 (the `?as=` dev path still stores a fragment token), L3 (localRoom's generation check has no test that
 depends on it: add one in the transport contract), L4 (offline banner says "0 edits wait" when nothing waits), L5 (the
 unverified identity from the token payload reaches non-display code: keep it display-only).
+
+## Sign-in code exchange (platform p5-code; proxy, 2026-11-11)
+
+The post-login fragment will carry a single-use code (≤ 60 s), not the session token. web/ exchanges it by
+`POST /auth/exchange` for the session token, then keeps the token in memory and sessionStorage as today; the fragment
+is still cleared at once. Wire it as an `auth` port with an HTTP adapter (and a fake for tests), so core never calls
+fetch. Exact request and response shape: from platform, via your manager. If it hasn't arrived when you get there,
+build the port and the fake, and leave the HTTP adapter as the last step.

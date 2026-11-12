@@ -4,7 +4,7 @@
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| (none running) | | | waiting on engine's p2-land merge; next: p6-hex on main |
+| p6-ports (builder) | t18r | worker p6-ports (client): web ports + contract tests | RUNNING on main (new files only) |
 
 ## 2026-11-11 — phase-6 design mock
 
@@ -214,3 +214,9 @@
   HttpOnly cookie), so no long-lived token ever sits in a URL. LOWs L2–L5 go to p6-hex/p7-wire.
 
 - t17s and t181 closed, killed, removed. No client sessions running; p6-hex starts when engine (t18m) sends the merge id.
+- Proxy agreed: no merge block. Platform's p5-code puts a single-use code (≤ 60 s) in the fragment, exchanged by POST /auth/exchange. Wired in p6-hex as an auth port plus an HTTP adapter; platform sends the shape.
+- Engine committed the client files on p2-land (3fa2d3a, worktree 398/0); the merge still waits on engine's gates.
+  No new work in the worktree. p6-hex touches files p2-land changes, so it waits for the merge, but its first half
+  is all new files: p6-ports (t18r, on main, brief docs/m2/briefs/p6-ports.md) builds web/ports (transport, storage,
+  clock, auth), the storage/clock/auth-fake adapters and contract tests now. The p6-hex brief now includes platform's
+  code exchange (auth port + HTTP adapter).

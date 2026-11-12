@@ -1,4 +1,4 @@
-// The rules every message obeys (PROTOCOL.md v1): streams, roles, what an op may hold, the limits.
+// The rules every message obeys (PROTOCOL.md v1.1): streams, roles, what an op may hold, the limits.
 // Pure: imports nothing, so a room, a browser, a phone and a Herdr pane all check the same way.
 
 export const PROTOCOL_VERSION = 1;
@@ -19,7 +19,9 @@ export const canWrite = (role, stream) => (WRITERS[stream] ?? []).includes(role)
 /** Owners and editors change or delete anyone's work, and set a stream's settings. */
 export const canModerate = role => canWrite(role, "board");
 
-export const MAX_OP_CHARS = 1_000_000;   // one op, JSON-encoded; bigger ones are refused ("too-large")
+// One op, as UTF-8 bytes of its JSON; bigger ones are refused ("too-large"). Bytes, not chars: 1M CJK chars
+// are 3 MB, which no 2 MB bus message carries (§ Limits). Counted by hand (utf8Bytes): no TextEncoder here.
+export const MAX_OP_BYTES = 1_000_000;
 // How far one op may raise an element's version past the room's copy (an absent element counts as 0).
 // Unbounded, one client could send version 2^53 and no one could ever change that element again.
 export const MAX_VERSION_JUMP = 1000;
@@ -43,7 +45,10 @@ export const OP_RATE = { perSecond: 20, burst: 100 };
 export const OP_TIMEOUT_MS = 10_000;     // rule 2: an op with no answer this long makes the connection suspect
 export const CONNECT_TIMEOUT_MS = 10_000; // rule 12: no welcome, or no catch-up progress, for this long
 export const BACKOFF = { baseMs: 500, maxMs: 30_000 };   // rule 12: min(max, base × 2^k) × a random factor in [0.5, 1)
-export const APPEND_TIMEOUT_MS = 5000;   // § Recovery: shorter than the client's, so clients hear `unavailable` first
+export const APPEND_TIMEOUT_MS = 4000;   // § Recovery: two appends (8 s) fit inside the client's 10 s
+export const MAX_WRITER_CONNS = 8;       // § Pacing: writer connections per (user, board) per gateway; a ninth gets "limit"
+export const PING_IDLE_MS = 10_000;      // § Pacing: a gateway pings a connection that sent nothing this long
+export const CONN_SILENCE_MS = 30_000;   // § Pacing: and closes one it heard nothing from (no frame, no pong) this long
 export const GATEWAY_SILENCE_MS = 30_000; // rule 6: a gateway not heard from this long has lost its connections
 export const MAX_NAME_CHARS = 200;
 export const CHECKPOINT_EVERY = 1000;    // § Recovery, "When"
@@ -68,7 +73,28 @@ const isObj = v => !!v && typeof v === "object" && !Array.isArray(v);
 const isId = v => typeof v === "string" && v.length > 0 && v.length <= MAX_ID_CHARS;
 const isNum = v => typeof v === "number" && Number.isFinite(v);
 
-export const MAX_OP_DEPTH = 64;          // objects and arrays inside one op; deeper is refused ("bad-op")
+// Objects and arrays inside one op (the op object is level 1); deeper is refused ("bad-op"). A client →
+// server frame may be 64 deep (the gateway checks it), so an op fits in its frame (+1) and a bus message (+2).
+export const MAX_OP_DEPTH = 62;
+export const MAX_FRAME_DEPTH = 64;
+
+/**
+ * The UTF-8 length of a string, counted by hand (the pure package can't use TextEncoder). A surrogate pair
+ * is one 4-byte character; a lone surrogate counts 3 (what an encoder writes for it, U+FFFD).
+ */
+export function utf8Bytes(str) {
+  let n = 0;
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+      const d = str.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d <= 0xdfff) { n += 4; i++; } else n += 3;
+    } else n += 3;
+  }
+  return n;
+}
 
 /** Is `value` nested deeper than `max` levels (the value itself is level 1)? A loop, never recursion. */
 export function deeperThan(value, max) {
@@ -86,10 +112,10 @@ export function deeperThan(value, max) {
  * What's wrong with an op message, or null. Shape first (`bad-op`, `no-files`, `too-large`), then the id
  * and `sentAt` (§ Limits, order of checks), so a bad id never hides a shape error. Roles are the room's job.
  * @param {object} msg
- * @param {number} [chars] the op's JSON length, when the caller already has it
+ * @param {number} [bytes] the op's JSON size in UTF-8 bytes, when the caller already has it (v1.1: bytes, no longer chars)
  * @returns {null | { code: string, message: string }}
  */
-export function opProblem(msg, chars) {
+export function opProblem(msg, bytes) {
   if (!STREAMS.includes(msg.stream)) return bad(`unknown stream ${JSON.stringify(msg.stream)}`);
   const op = msg.op;
   if (!isObj(op)) return bad("op must be an object");
@@ -108,9 +134,12 @@ export function opProblem(msg, chars) {
       }
     }
     if (op.appState !== undefined) { const why = appStateProblem(op.appState); if (why) return bad(why); }
+    // § Settings: a settings op stands alone and names the appSeq each key was based on.
+    if (op.appState !== undefined && op.elements !== undefined) return bad("a settings op carries no elements: send them as two ops");
+    if (op.appState !== undefined || op.appBase !== undefined) { const why = appBaseProblem(op.appState, op.appBase); if (why) return bad(why); }
     if (!op.elements?.length && !op.appState) return bad("empty op");
   }
-  if ((chars ?? JSON.stringify(op).length) > MAX_OP_CHARS) return { code: "too-large", message: `an op is limited to ${MAX_OP_CHARS} characters` };
+  if ((bytes ?? utf8Bytes(JSON.stringify(op))) > MAX_OP_BYTES) return { code: "too-large", message: `an op is limited to ${MAX_OP_BYTES} bytes of UTF-8 JSON` };
   if (!parseOpId(msg.id)) return bad("op ids are client:counter, the counter a positive integer");
   if (!Number.isSafeInteger(msg.sentAt) || msg.sentAt < 0) return bad("op needs sentAt (the seq you had applied when you first sent it)");
   return null;
@@ -162,6 +191,22 @@ export function appStateProblem(patch) {
     // Own keys only: "__proto__" or "constructor" would otherwise find Object.prototype's members.
     if (!Object.prototype.hasOwnProperty.call(APP_KEYS, k)) return `unknown board setting ${JSON.stringify(k)}`;
     if (!APP_KEYS[k](v)) return `bad value for ${k}`;
+  }
+  return null;
+}
+
+/**
+ * § Settings (compare-and-set): `appBase` has exactly the keys of `appState`, each an integer ≥ 0 (the
+ * appSeq that key's value was based on). Missing, extra or non-integer keys, or a base with no settings → a reason.
+ */
+export function appBaseProblem(appState, appBase) {
+  if (appState === undefined) return "appBase goes only with appState";
+  if (!isObj(appBase)) return "a settings op names its base: appBase { key: appSeq }";
+  const keys = Object.keys(appState), bases = Object.keys(appBase);
+  if (bases.length !== keys.length) return "appBase names exactly the keys appState sets";
+  for (const k of keys) {
+    if (!Object.prototype.hasOwnProperty.call(appBase, k)) return `appBase is missing ${k}`;
+    if (!Number.isSafeInteger(appBase[k]) || appBase[k] < 0) return `appBase.${k} must be an integer ≥ 0`;
   }
   return null;
 }

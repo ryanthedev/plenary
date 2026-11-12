@@ -357,7 +357,7 @@ test("after a rebuild, an old connection's op is refused unavailable, and its la
   expect(inbox.filter(m => m.t === "ack").map(m => [m.id, m.seq])).toEqual([["a:2", 2], ["a:3", 3]]);   // not stale
 });
 
-test("close notices, a gateway's connection list and 30 s of gateway silence drop what the room kept; a 5 s append is a failure", async () => {
+test("close notices, a gateway's connection list and 30 s of gateway silence drop what the room kept; a 4 s append is a failure", async () => {
   let t = 0;
   const slow = slowLog(), room = new Room({ board: "b1", tenant: "t1", log: slow, now: () => t });
   const open = (gateway, id) => { const inbox = [], c = room.connect(m => inbox.push(m), { gateway, id }); room.receive(c, { t: "hello", v: 1, board: "b1", since: 0, client: id }, { n: 1, user: `u-${id}`, role: "editor" }); return { c, inbox }; };
@@ -371,7 +371,7 @@ test("close notices, a gateway's connection list and 30 s of gateway silence dro
   t = 30_000; room.sweep();
   expect([b.c.closed, c.c.closed, room.conns.size]).toEqual([true, false, 1]);
   room.receive(c.c, { t: "op", id: "c:1", sentAt: 0, stream: "board", op: { elements: [rect("y")] } }, { n: 3 });
-  t += 4999; room.sweep(); expect(room.stopped).toBe(false);
+  t += 3999; room.sweep(); expect(room.stopped).toBe(false);
   t += 1; room.sweep();                                                 // the store never answered
   expect(room.stopped).toBe(true);
   expect(c.inbox.at(-1)).toMatchObject({ code: "unavailable", id: "c:1" });

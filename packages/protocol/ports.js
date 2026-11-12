@@ -9,6 +9,7 @@
  * @typedef {{
  *   append(entries: object[], expectSeq: number): void | Promise<void>,
  *   putCheckpoint?(cp: object): void | Promise<void>,
+ *   openEpoch?(): number,
  * }} Log
  */
 
@@ -20,7 +21,11 @@
  * @typedef {{ append(tenant: string, board: string, entries: object[], expectSeq: number): Promise<void>,
  *             read(tenant: string, board: string, fromSeq: number, limit: number): Promise<object[]>,
  *             putCheckpoint(tenant: string, board: string, cp: object): Promise<void>,
- *             getCheckpoint(tenant: string, board: string, beforeSeq?: number): Promise<null | object> }} Store
+ *             getCheckpoint(tenant: string, board: string, beforeSeq?: number): Promise<null | object>,
+ *             openEpoch(tenant: string, board: string): Promise<number>,
+ *             epoch(tenant: string, board: string): Promise<number> }} Store
+ *   openEpoch: a durable atomic increment of the board's epoch (1 on the first call), kept with its lease
+ *   record; every room build calls it before its first welcome. epoch: reads it, 0 = no room was ever built.
  * @typedef {{ publish(subject: string, msg: object): void, subscribe(subject: string, fn: (msg: object) => void): () => void }} Bus  at-most-once
  * @typedef {{ put(tenant: string, sha1: string, bytes: Uint8Array): Promise<void>, get(tenant: string, sha1: string): Promise<null | Uint8Array> }} Blobs
  */
@@ -44,7 +49,12 @@ export function tableAuth(table) {
 
 /** A Log in memory, with the Store's contract for one board: conditional append, read, checkpoints. */
 export class MemoryLog {
-  constructor() { this.entries = []; this.checkpoints = []; }
+  constructor() { this.entries = []; this.checkpoints = []; this.epochN = 0; }
+
+  /** A room is being built: the board's next epoch (1 on the first call), kept apart from the checkpoints (§ Recovery, Room identity). */
+  openEpoch() { return ++this.epochN; }
+  /** The latest epoch handed out; 0 = no room was ever built. */
+  epoch() { return this.epochN; }
 
   /** The last seq in the log (0 when empty). */
   get end() { return this.entries.length ? this.entries[this.entries.length - 1].seq : 0; }

@@ -128,6 +128,12 @@ Excalidraw's `version` and `versionNonce`; `appState` is a shallow patch of `app
   or an op with both `appState` and `elements` → `bad-op`. (A settings op stands alone, so refusing it never takes
   elements with it.) `Replica.local()` splits a mixed local change into two ops, elements first, then settings, so
   an honest client never sends a mixed one.
+- **What "based on" means (the client).** A key's base is the newest `appSeq` of that key the client had
+  confirmed when the value was made, or the `seq` of its own acknowledged settings op for the key, whichever is
+  higher. A resync doesn't lower it: the client keeps each key's last confirmed `appSeq` across a reset, so a
+  change made while its copy is being rebuilt is based on what the user saw, and is accepted unless someone
+  else changed the key meanwhile. It is forgotten only when another user signs in (rule 13) or when the Store
+  lost acknowledged entries (§ Recovery, Room identity), because then the room may no longer have it.
 - **The check.** After the op-id table (§ Limits, order of checks), the room compares each key's base with that
   key's `appSeq` in its **speculative** state. All equal: the op is logged, and its `seq` becomes every key's new
   `appSeq`. Any differs: the whole op is refused `stale-setting` and nothing is logged. Like every refusal decided
@@ -141,11 +147,23 @@ Excalidraw's `version` and `versionNonce`; `appState` is a shallow patch of `app
   and the `error` names no key, so "any key passed its base" is exactly what the room's check implies. The refused key's
   entry is durable before the held refusal is sent, so the client always receives it, by the bus or the Store poll.)
 - **One in flight per key.** A client sends at most one settings op per (stream, key) until that op is settled.
-  Later local changes to the key stay in the overlay. They go out as one op when it settles, with base = the
-  higher of the confirmed `appSeq` and the settled op's `seq`. If that op was refused, the held changes to the
-  key are dropped with it (they were built on the refused value), and the app is told. If it was answered `stale`
-  (§ Op ids: it may or may not have landed), the held changes wait for the resync that follows and then go out
-  as one op with base = the key's `appSeq` in the resynced confirmed copy.
+  Later local changes to the key stay in the overlay and go out as one op when it settles. **A held change's base
+  is fixed when the key is first held:** per key, the higher of the key's base when it was first held (what
+  the client had confirmed then, as above; later changes to a held key keep that base, because while it is held
+  the screen shows the held value, so a peer's entry confirmed meanwhile was never seen) and, once it settles, the `seq` of this client's own preceding
+  op on that key. Never the confirmed `appSeq` at release time: an entry applied after the change was made, which
+  the held value hid on screen, was never seen, so a held change that would overwrite it is refused
+  `stale-setting` and the app is told. If the preceding op was refused, the held changes to the key are dropped
+  with it (they were built on the refused value), and the app is told. If it was answered `stale` (§ Op ids: it
+  may or may not have landed), the held changes wait for the resync that follows and then go out on the same
+  fixed base; if the `stale` op had landed, or anyone else changed the key, that op is refused `stale-setting`
+  (its retry gate opens at once: the conflict is already applied).
+- **Forgetting.** When the client forgets what it saw (another user signs in, rule 13, or the Store lost
+  acknowledged entries), held changes lose their base: they are dropped, and the app is told (it may retry on
+  the resynced copy). A settings op always carries a base for every key it sets.
+- **After a Store loss** (a writer's `welcome` from a higher epoch whose `seq` is below what the client applied),
+  a settings op the client stamped before the loss may name a base the room no longer has. A `stale-setting` for
+  such an op arms no retry gate: the app is told it may retry at once, on the resynced copy.
 - **Imports carry bases too.** A drawh import that sends the file's settings sends them as an ordinary settings op
   with `appBase` from its confirmed copy after catch-up; on `stale-setting` the board's settings win (as when
   joining a board that already has them).
@@ -426,6 +444,10 @@ rebuilt without guessing from the last entry.
   - **Higher than seen, and `welcome.seq` below the `seq` it has applied:** the Store lost acked entries (§ Known
     limits, per-node durability). Resync with `since: 0`.
   - **Higher than seen otherwise:** a normal rebuild. Nothing more to do (rules 2 and 6 already cover resends).
+  - **Checked against what came before this connection.** Live entries and the room's `welcome` travel on
+    different bus subjects, so a gateway may deliver an entry before the `welcome`. The client keeps any
+    `entries` or `snapshot` that arrive before this connection's `welcome` and applies them right after it, so
+    "the `seq` it has applied" never includes them and a reordering never looks like a Store loss.
 - **Guaranteed:** two room incarnations of a board never share an epoch, and a later one has a higher epoch.
   **May drop:** a viewer's `welcome` built while a rebuild is under way may carry the previous epoch. A connection
   that stays up through a rebuild gets no new `welcome`. A writer meets the rebuild on its next op (`unavailable`,

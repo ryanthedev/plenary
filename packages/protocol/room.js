@@ -1,4 +1,4 @@
-// The reference room: the one sequencer for a board (PROTOCOL.md v1). Its state is a pure function of the
+// The reference room: the one sequencer for a board (PROTOCOL.md v1.1). Its state is a pure function of the
 // log, so it can be rebuilt from a checkpoint plus the entries after it (§ Recovery). Storage comes in
 // through the Log port; identity comes with the hello, already verified by a gateway (rule 8): a room
 // never sees a token. It never runs layout, and it never sees presence.
@@ -42,13 +42,17 @@ export function catchUp(base, tail, since) {
 export class Room {
   /**
    * A new, empty room. To bring a board back, use Room.rebuild or Room.fromLog.
-   * @param {{ board: string, tenant: string, log: import("./ports.js").Log, now?: () => number,
+   * @param {{ board: string, tenant: string, log: import("./ports.js").Log, now?: () => number, epoch?: number,
    *           rules?: object, auto?: boolean, report?: (what: string, detail: object) => void }} o
-   *   `now`: the room's clock in ms (entries carry it as `at`). `rules`: per rules version { W, H, every };
-   *   only tests pass it. `auto`: checkpoint by itself (§ Recovery, "When"). `report`: errors worth logging.
+   *   `now`: the room's clock in ms (entries carry it as `at`). `epoch`: this incarnation's number from
+   *   Store.openEpoch, which the host calls before building the room (§ Recovery, Room identity); every
+   *   welcome carries it. Omitted: the log's openEpoch() if it has one, else 1. `rules`: per rules version { W, H, every }; only tests pass it. `auto`: checkpoint
+   *   by itself (§ Recovery, "When"). `report`: errors worth logging.
    */
-  constructor({ board, tenant, log, now = Date.now, rules = RULES, auto = true, report = () => {} }) {
-    Object.assign(this, { board, tenant, log, now, rules, auto, report });
+  constructor({ board, tenant, log, now = Date.now, epoch, rules = RULES, auto = true, report = () => {} }) {
+    // A host passes the epoch it opened; without one, open the log's next (so two builds never share one), else 1.
+    if (epoch === undefined) epoch = typeof log?.openEpoch === "function" ? log.openEpoch() : 1;
+    Object.assign(this, { board, tenant, log, now, epoch, rules, auto, report });
     this.conns = new Set();
     this.queue = [];          // accepted, not yet handed to an append: [{ entry, c, key, counter, horizon }]
     this.inflight = null;     // the batch in the one append in flight
@@ -181,9 +185,11 @@ export class Room {
   /**
    * Rebuild from a synchronous log (MemoryLog): the latest checkpoint that matches the log, then the
    * entries after it. A server with async ports reads the same things itself and calls Room.rebuild.
+   * Without an `epoch` it opens the log's next one (MemoryLog.openEpoch), as a host would before building.
    */
   static fromLog(opts) {
     const report = opts.report ?? (() => {});
+    if (opts.epoch === undefined && typeof opts.log.openEpoch === "function") opts = { ...opts, epoch: opts.log.openEpoch() };
     for (let before = Infinity; ;) {
       const cp = opts.log.getCheckpoint?.(before) ?? null;
       try { return Room.rebuild({ ...opts, checkpoint: cp, entries: opts.log.read(cp && cp.seq > 0 ? cp.seq : 1) }); }
@@ -205,7 +211,7 @@ export class Room {
     let cp;
     if (this.seq === this.resolved) cp = this.fold();
     else {   // unresolved entries are merged into the live state: replay the resolved ones apart from it
-      const r = new Room({ board: this.board, tenant: this.tenant, log: null, now: this.now, rules: this.rules, auto: false });
+      const r = new Room({ board: this.board, tenant: this.tenant, log: null, now: this.now, epoch: this.epoch, rules: this.rules, auto: false });
       r.load(this.base);
       for (const e of this.tail) r.applyEntry(e);
       cp = r.fold();
@@ -230,6 +236,12 @@ export class Room {
     if (gateway !== null) this.heard.set(gateway, this.now());
     return c;
   }
+  /**
+   * The `.entries` heartbeat (§ Bus): the resolved seq and this incarnation's epoch. A room host publishes it
+   * every 2 s; gateways use the epoch for viewers' welcomes.
+   */
+  heartbeat() { return { seq: this.resolved, epoch: this.epoch }; }
+
   /** The close notice (rule 6): the connection is gone, and so is what the room kept for it. */
   disconnect(c) { if (c) { c.closed = true; this.conns.delete(c); } }
 
@@ -242,7 +254,7 @@ export class Room {
 
   /**
    * Timed rules, by the injected clock (a host calls this now and then; the room starts no timer):
-   * a gateway silent for 30 s loses all its connections, and an append in flight for 5 s has failed.
+   * a gateway silent for 30 s loses all its connections, and an append in flight for 4 s has failed.
    */
   sweep() {
     const t = this.now();
@@ -289,7 +301,7 @@ export class Room {
     c.send({
       t: "welcome", seq: this.resolved, role: c.role, user: c.user,
       ...(c.role === "viewer" ? {} : { high: waiting ? waiting.high : this.clients.get(key)?.high ?? 0 }),
-      horizon: this.resolvedHorizon, rv: RULES_VERSION,
+      horizon: this.resolvedHorizon, rv: RULES_VERSION, room: { board: this.board, epoch: this.epoch },
     });
     for (const m of this.catchUp(Number.isSafeInteger(msg.since) && msg.since > 0 ? msg.since : 0)) c.send(m);
   }
@@ -336,6 +348,13 @@ export class Room {
     } else {
       // A stream's settings (its layers) are the moderators': annotators add notes only.
       if (msg.op.appState && !mod) return refuse(no("forbidden", "only owners and editors change settings"));
+      // § Settings (compare-and-set), after the op-id table: every key's base must be its appSeq in the
+      // speculative state, or the whole op is refused and nothing is logged. A soft refusal, held like the others.
+      if (msg.op.appState) {
+        const seqs = this.appSeq[msg.stream];
+        for (const k of Object.keys(msg.op.appState)) if (msg.op.appBase[k] !== (seqs[k] ?? 0))
+          return refuse(no("stale-setting", `${k} changed since your copy (appSeq ${seqs[k] ?? 0}, your base ${msg.op.appBase[k]}): re-read it`), this.seq);
+      }
       const doc = this.streams[msg.stream], cap = CAPS[msg.stream], fresh = new Set();
       let size = this.chars[msg.stream];
       for (const el of msg.op.elements ?? []) {

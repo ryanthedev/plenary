@@ -62,7 +62,7 @@ test("a refused element op: receive() says so, the copy is reset, pending ops st
   const [refusal, ack] = a.inbox; a.inbox = [];
   expect([refusal.code, refusal.id, ack.t]).toEqual(["forbidden", bad.id, "ack"]);
   const did = a.r.receive(refusal);
-  expect(did).toEqual({ entries: [], snapshot: false, reset: true, settled: [], dropped: [bad.id] });
+  expect(did).toEqual({ entries: [], snapshot: false, reset: true, settled: [], dropped: [bad.id], refusedSettings: [], retryReady: [] });
   expect([a.r.resync, a.r.applied]).toEqual([true, 0]);
   expect(a.r.streams.board.getAny("theirs")).toBe(null);                      // the copy is gone…
   expect(a.r.streams.notes.get("my-note")).toBeTruthy();                      // …but the pending note is still shown
@@ -89,6 +89,7 @@ test("receive() returns what it applied: entries in seq order, a snapshot, what 
   expect(a.r.pending.size).toBe(1);
   d.room.checkpoint();
   const late = link(d, clock, "u2", "viewer", "late").open();
+  late.r.receive(late.inbox[0]);                                              // its welcome (catch-up applies only after it)
   expect(late.r.receive(late.inbox[1])).toMatchObject({ snapshot: true, entries: [] });
   expect(late.r.streams.board.live().length).toBe(2);
 });

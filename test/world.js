@@ -16,7 +16,7 @@ export function world(roles, seed = 1, opts = {}) {
   const w = { rng, log, reports, t: 1_000_000 };
   const now = () => w.t;
   const roomOpts = { board: "b1", tenant: "t1", log, now, report: (what, detail) => reports.push({ what, ...detail }), ...opts };
-  w.room = new Room(roomOpts);
+  w.room = new Room({ ...roomOpts, epoch: log.openEpoch() });
   const wire = m => jsonCodec.decode(jsonCodec.encode(m));
   const replica = name => new Replica({ client: name, now });
   const clients = roles.map((role, i) => ({ i, role, token: `tok${i}`, r: replica(`c${i}`), inbox: [], outbox: [], conn: null, n: 0 }));
@@ -66,7 +66,7 @@ export function world(roles, seed = 1, opts = {}) {
   const settle = (depth = 0) => {
     let n = 0; while (step()) if (++n > 400000) throw new Error("network never settled");
     if (depth > 50) throw new Error("clients never settled");
-    for (const c of clients) if (c.conn && c.r.pending.size) { drop(c); connect(c); settle(depth + 1); }
+    for (const c of clients) if (c.conn && (c.r.pending.size || c.r.held.board || c.r.held.notes)) { drop(c); connect(c); settle(depth + 1); }
   };
   const send = (c, stream, op) => c.r.local(stream, op);
   clients.forEach(connect);
@@ -75,9 +75,9 @@ export function world(roles, seed = 1, opts = {}) {
    * The room's process dies and a new one is rebuilt from the log (optionally checkpointing first).
    * Gateways close every connection of the old room, so the clients reconnect; `keep` leaves them as they are.
    */
-  const rebuild = ({ checkpoint = false, keep = false } = {}) => {
+  const rebuild = ({ checkpoint = false, keep = false, epoch } = {}) => {
     if (checkpoint) w.room.checkpoint();
-    w.room = Room.fromLog(roomOpts);
+    w.room = Room.fromLog({ ...roomOpts, ...(epoch !== undefined ? { epoch } : {}) });   // opens the log's next epoch unless given
     if (!keep) for (const c of clients) if (c.conn) { c.conn = null; connect(c); }
     return w.room;
   };

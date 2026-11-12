@@ -1,11 +1,14 @@
-// A client's copy of a board (PROTOCOL.md v1): applies the room's entries in seq order, whatever order they
+// A client's copy of a board (PROTOCOL.md v1.1): applies the room's entries in seq order, whatever order they
 // arrive in, and shows its own ops at once (optimistic) until the room acknowledges them.
 // Runs in a browser, a phone, Node or a Herdr pane: imports only the core's model and merge rules.
 //
 // How a caller drives it (the Replica never touches a socket or a timer; the clock is passed in):
 //   1. On every new connection: send connectMessages(token, board) (the hello, nothing else).
 //   2. Give every message from the server to receive(msg). It returns what it applied.
-//   3. A local change: local(stream, op). Do NOT send what it returns yourself.
+//   3. A local change: local(stream, op). Do NOT send what it returns yourself. A change with both elements
+//      and settings goes out as two ops (elements first). Settings carry `appBase` and are sent one op per
+//      (stream, key) at a time; later changes wait (`held`) and show at once. receive() reports refused
+//      settings in `did.refusedSettings` and, once a refused key's conflict is applied here, `did.retryReady`.
 //   4. After each of 1–3, and when a timer set from wait() fires: send everything outgoing() returns.
 //      outgoing() holds ops back until `welcome`, holds new ops until catch-up is done, sends each op once
 //      per connection and paces them to the published rate (rule 2, § Limits).
@@ -16,7 +19,7 @@
 
 import { Doc } from "../core/doc.js";
 import { emptyScene, clone, randomInt } from "../core/model.js";
-import { ELEMENT_STREAMS, PROTOCOL_VERSION, RULES, OP_RATE, OP_TIMEOUT_MS, CONNECT_TIMEOUT_MS, BACKOFF, mergeAppState } from "./envelope.js";
+import { ELEMENT_STREAMS, PROTOCOL_VERSION, RULES, OP_RATE, OP_TIMEOUT_MS, CONNECT_TIMEOUT_MS, BACKOFF, mergeAppState, appBaseProblem } from "./envelope.js";
 import { Records } from "./records.js";
 import { PREVIEW_TTL_MS } from "./presence.js";
 
@@ -36,11 +39,24 @@ export class Replica {
     this.user = null; this.role = null;
     this.stopped = null; this.needAuth = false; this.resync = false;
     this.welcomed = false; this.target = null; this.horizon = 0; this.staleSeen = false;
+    this.board = null;          // the board of the current hello (welcome.room.board must match)
+    this.early = [];            // entries and snapshots of this connection that arrived before its welcome
+    this.epoch = null;          // the last welcome.room.epoch seen (viewers only record it)
+    this.epochSeen = 0;         // the highest epoch seen in a writer's welcome (rule 12; kept across resets)
+    // § Settings. Kept across resets and connections, like pending ops:
+    this.held = {};             // stream → { key: value }: settings changes waiting for a key's op in flight (or its retry gate)
+    this.floor = {};            // stream → { key: seq }: the seq of my latest acknowledged settings op per key
+    this.gates = [];            // refused (stale-setting) ops: [{ id, stream, appBase }] until a key's confirmed appSeq passes its base
+    this.seen = {};             // stream → { key: appSeq }: the newest confirmed appSeq per key, kept across resets (what the user saw)
+    this.heldBase = {};         // stream → { key: base }: each held key's base, fixed when its latest change was made
+    for (const s of ELEMENT_STREAMS) { this.held[s] = null; this.floor[s] = {}; this.seen[s] = {}; this.heldBase[s] = {}; }
     this.reset();
   }
 
   /** Forget the room's copy (a resync follows). Pending ops are kept, and stay shown on top of the empty copy. */
   reset() {
+    // § Settings: a resync doesn't lower a key's base. Keep what this copy had confirmed before it goes.
+    if (this.appSeq) for (const s of ELEMENT_STREAMS) for (const [k, v] of Object.entries(this.appSeq[s] ?? {})) if (v > (this.seen[s][k] ?? 0)) this.seen[s][k] = v;
     this.applied = 0;                    // the highest seq applied; everything up to it is in
     this.streams = {}; this.confirmed = {}; this.appSeq = {}; this.confirmedVersion = {};
     for (const s of ELEMENT_STREAMS) {
@@ -68,7 +84,8 @@ export class Replica {
   connectMessages(token, board) {
     // A stale op was dropped but the copy still shows it (the connection ended before the resync): start from 0.
     if (this.staleSeen) { this.staleSeen = false; this.reset(); }
-    this.resync = false; this.needAuth = false; this.welcomed = false; this.target = null;
+    this.resync = false; this.needAuth = false; this.welcomed = false; this.target = null; this.board = board;
+    this.early = [];   // entries and snapshots of this connection that arrived before its welcome
     this.proven();
     this.helloAt = this.now(); this.progressAt = null; this.counted = false;
     for (const p of this.pending.values()) { p.wrote = null; p.answered = false; p.resend = p.msg.sentAt !== undefined; }
@@ -78,24 +95,126 @@ export class Replica {
   /**
    * A local change: shown now, queued for the room (send it with outgoing()). On an element stream every
    * element goes out one version past the highest this replica knows for its id (confirmed or pending),
-   * with a fresh versionNonce, so an editor's per-move version bumps never reach the wire. The returned
-   * message holds the elements as sent.
+   * with a fresh versionNonce, so an editor's per-move version bumps never reach the wire.
+   *
+   * `keepVersions` (an import, drawh's seeding): elements go out with their own version and nonce, and are
+   * never re-stamped, not even on a resync. Deciding which to renumber or hold back is the importer's job
+   * (PROTOCOL.md § The element op, seeding; roomVersion() gives the confirmed copy's version).
+   *
+   * Settings (`appState`) never travel with elements: a mixed change becomes two ops, elements first. A
+   * settings op carries `appBase` (each key's confirmed appSeq now, or my last acknowledged op's seq for it,
+   * whichever is higher); any `appBase` passed in is ignored. While a key has an op in flight (sent or not,
+   * no ack yet) or is waiting on a retry gate, changes to it are held, shown, and sent as one op later.
+   *
+   * Returns the elements op's message when there is one, else the settings op's; a held settings change
+   * returns a stand-in `{ t: "op", id: null, held: true, stream, op }` (nothing to send).
    */
-  local(stream, op) {
+  local(stream, op, { keepVersions = false } = {}) {
     const records = stream === "records";
     if (!records && !ELEMENT_STREAMS.includes(stream)) throw new Error(`unknown stream ${stream}`);
     const mine = clone(op);
-    if (!records) {
+    if (records) { const msg = this.push(stream, mine); this.recordsRev++; return msg; }
+    const { appState, appBase, ...rest } = mine;
+    let out = null;
+    if (rest.elements?.length || appState === undefined) {
       const doc = this.streams[stream];
-      for (const el of mine.elements ?? []) {
-        el.version = (doc.getAny(el.id)?.version ?? 0) + 1; el.versionNonce = randomInt();
+      for (const el of rest.elements ?? []) {
+        if (!keepVersions) { el.version = (doc.getAny(el.id)?.version ?? 0) + 1; el.versionNonce = randomInt(); }
         doc.apply({ elements: [el] });
       }
+      out = this.push(stream, rest, keepVersions);
     }
-    const msg = { t: "op", id: `${this.client}:${++this.counter}`, stream, op: mine };
-    this.pending.set(msg.id, { stream, op: mine, msg, wrote: null, answered: false, resend: false });
-    if (records) this.recordsRev++; else this.showAppState(stream);
+    if (appState !== undefined) { const m = this.setting(stream, appState); out = out ?? m; }
+    this.showAppState(stream);
+    return out;
+  }
+
+  // A new op with the next counter, pending (outgoing() sends it). Counters rise in the order ops are made
+  // and sent, so a held settings change gets its id only when it is released.
+  push(stream, op, keep = false) {
+    // A settings op always names a base for every key it sets (§ Settings); anything else is a bug here.
+    if (op.appState !== undefined) { const why = appBaseProblem(op.appState, op.appBase); if (why) throw new Error(`replica built a bad settings op: ${why}`); }
+    const msg = { t: "op", id: `${this.client}:${++this.counter}`, stream, op };
+    this.pending.set(msg.id, { stream, op, msg, wrote: null, answered: false, resend: false, keep });
     return msg;
+  }
+
+  // A settings change: an op now, or held behind a busy key (one op in flight per (stream, key)). One
+  // held patch per stream: a change that touches any busy key waits whole, and so does everything after it.
+  setting(stream, patch) {
+    const keys = Object.keys(patch);
+    if (this.held[stream] || keys.some(k => this.busy(stream, k))) {
+      this.held[stream] = { ...(this.held[stream] ?? {}), ...patch };
+      // Fixed by the key's first held change: while held, the screen shows the held value, so a peer's entry
+      // confirmed meanwhile was never seen and must not raise the base (§ Settings, "One in flight per key").
+      for (const k of keys) if (!Object.prototype.hasOwnProperty.call(this.heldBase[stream], k)) this.heldBase[stream][k] = this.basesOf(stream, [k])[k];
+      return { t: "op", id: null, held: true, stream, op: { appState: { ...patch } } };
+    }
+    return this.push(stream, { appState: patch, appBase: this.basesOf(stream, keys) });
+  }
+
+  /**
+   * The appSeq a new settings op for these keys is based on: the newest this replica confirmed (kept across
+   * resyncs), or my last acknowledged op's seq, whichever is higher.
+   */
+  basesOf(stream, keys) {
+    const out = {};
+    for (const k of keys) out[k] = Math.max(this.appSeq[stream][k] ?? 0, this.seen[stream][k] ?? 0, this.floor[stream][k] ?? 0);
+    return out;
+  }
+
+  /** Is a settings key busy: an op of mine for it not yet acknowledged, or a refusal still waiting for its conflict? */
+  busy(stream, key) {
+    for (const p of this.pending.values()) if (p.stream === stream && p.op.appState && p.ackSeq === undefined && Object.prototype.hasOwnProperty.call(p.op.appState, key)) return true;
+    return this.gates.some(g => g.stream === stream && Object.prototype.hasOwnProperty.call(g.appBase, key));
+  }
+
+  // Forget what this replica knew of the room's settings history (rule 13: another user; or the Store lost
+  // entries). Held changes lose their base with it: they are dropped and reported (the app may retry), never
+  // sent on a base they weren't made on (§ Settings, "Forgetting").
+  forgetSettings(did, code) {
+    for (const s of ELEMENT_STREAMS) {
+      const h = this.held[s];
+      if (h) {
+        did.refusedSettings.push({ id: null, stream: s, code, appState: h, appBase: null, held: { ...h } });
+        did.retryReady.push({ id: null, stream: s, keys: Object.keys(h) });
+        this.held[s] = null; this.showAppState(s);
+      }
+      this.floor[s] = {}; this.seen[s] = {}; this.heldBase[s] = {};
+    }
+  }
+
+  /** Held settings changes, per stream (null when none). */
+  heldSettings() { const out = {}; for (const s of ELEMENT_STREAMS) out[s] = this.held[s] ? { ...this.held[s] } : null; return out; }
+
+  // § Settings, "stale-setting is soft": a refused op's gate opens once the confirmed appSeq of any of its
+  // keys has passed (is greater than) the refused base, so a retry never runs against an entry not yet applied.
+  openGates(did) {
+    for (let i = 0; i < this.gates.length; i++) {
+      const g = this.gates[i], seqs = this.appSeq[g.stream];
+      if (!Object.keys(g.appBase).some(k => (seqs[k] ?? 0) > g.appBase[k])) continue;
+      this.gates.splice(i--, 1);
+      did.retryReady.push({ id: g.id, stream: g.stream, keys: Object.keys(g.appBase) });
+    }
+  }
+
+  // Held changes go out as one op once none of their keys is busy, and only on a connection that has
+  // caught up (after a `stale`, only after the resync), so their base comes from the current copy.
+  release() {
+    if (this.stopped || this.resync || this.staleSeen || !this.welcomed || this.applied < this.target) return;
+    for (const s of ELEMENT_STREAMS) {
+      const h = this.held[s];
+      if (!h || Object.keys(h).some(k => this.busy(s, k))) continue;
+      this.held[s] = null;
+      // The base was fixed when the value was made, raised only by my own preceding op on the key once it
+      // settled (floor). Never the confirmed appSeq now: an entry applied since was hidden by the held value,
+      // so the user never saw it, and overwriting it must be refused (§ Settings, "One in flight per key").
+      const base = {};
+      for (const k of Object.keys(h)) base[k] = Math.max(this.heldBase[s][k], this.floor[s][k] ?? 0);
+      this.heldBase[s] = {};
+      this.push(s, { appState: h, appBase: base });
+      this.showAppState(s);
+    }
   }
 
   // Put the pending element ops on top of the copy as it is now, and stamp again every op that has never
@@ -108,7 +227,8 @@ export class Replica {
     const next = new Map();   // "stream\nid" → the highest version so far: the room's, then my pending ops in order
     for (const p of this.pending.values()) {
       if (p.stream === "records" || !p.op.elements) continue;
-      const doc = this.streams[p.stream], unsent = p.msg.sentAt === undefined;
+      // A kept-version op (an import) is never re-stamped: it is counted like one already sent.
+      const doc = this.streams[p.stream], unsent = p.msg.sentAt === undefined && !p.keep;
       for (const el of p.op.elements) {
         const key = `${p.stream}\n${el.id}`, base = next.get(key) ?? this.roomVersion(p.stream, el.id);
         if (!unsent) { next.set(key, Math.max(base, el.version)); doc.apply({ elements: [el] }); continue; }
@@ -239,17 +359,31 @@ export class Replica {
    * `settled` op ids (confirmed) and `dropped` op ids (refused, stale or unconfirmable).
    */
   receive(msg) {
-    const did = { entries: [], snapshot: false, reset: false, settled: [], dropped: [] };
+    const did = { entries: [], snapshot: false, reset: false, settled: [], dropped: [], refusedSettings: [], retryReady: [] };
     if (!msg || this.stopped) return did;
     if (msg.t === "snapshot" || msg.t === "entries") this.progressAt = this.now();
-    if (msg.t === "welcome") this.welcome(msg, did);
+    if ((msg.t === "snapshot" || msg.t === "entries") && !this.welcomed && this.helloAt !== null) { this.early.push(msg); return did; }
+    if (msg.t === "welcome") {
+      this.welcome(msg, did);
+      // Entries that beat the welcome here (§ Recovery, Room identity) apply only now, after its checks.
+      const early = this.early; this.early = [];
+      if (this.welcomed && !this.resync && !this.stopped) for (const m of early) {
+        if (m.t === "snapshot") this.snapshot(m, did);
+        else { for (const e of m.entries ?? []) if (e.seq > this.applied && !this.buffer.has(e.seq)) this.buffer.set(e.seq, e); this.drain(did); }
+      }
+    }
     else if (msg.t === "snapshot") this.snapshot(msg, did);
     else if (msg.t === "entries") {
       for (const e of msg.entries ?? []) if (e.seq > this.applied && !this.buffer.has(e.seq)) this.buffer.set(e.seq, e);
       this.drain(did);
     } else if (msg.t === "ack") {
       const p = this.pending.get(msg.id);
-      if (p) { p.ackSeq = msg.seq; p.answered = true; this.settle(did); this.afterAnswers(did); }
+      if (p) {
+        p.ackSeq = msg.seq; p.answered = true;
+        // The next op for these keys is based on this one (§ Settings, "One in flight per key").
+        if (p.op.appState) for (const k of Object.keys(p.op.appState)) this.floor[p.stream][k] = Math.max(this.floor[p.stream][k] ?? 0, msg.seq);
+        this.settle(did); this.afterAnswers(did); this.release();
+      }
     } else if (msg.t === "presence") this.presence(msg);
     else if (msg.t === "error") this.error(msg, did);
     return did;
@@ -258,17 +392,42 @@ export class Replica {
   welcome(msg, did) {
     if (this.welcomed) return;   // one welcome per connection; a repeat changes nothing
     if (msg.rv !== undefined && !RULES[msg.rv]) { this.stopped = "version"; return; }
+    // Rule 12 and § Recovery, Room identity. (A welcome with no `room` is from a pre-v1.1 server: not checked.)
+    const room = msg.room;
+    if (room && typeof room === "object") {
+      if (room.board !== this.board) { this.failed(); return; }          // another board: close, reconnect
+      if (msg.high !== undefined && Number.isSafeInteger(room.epoch)) {  // a writer's welcome, built by the room
+        if (room.epoch < this.epochSeen) { this.failed(); return; }      // a stale host: close, reconnect
+        const lost = room.epoch > this.epochSeen && msg.seq < this.applied;
+        this.epochSeen = room.epoch;
+        if (lost) {                                                     // the Store lost acked entries: resync from 0
+          // My acked seqs, the appSeqs I saw and refused bases may name entries the room no longer has: forget
+          // them, or a base could stay above the room's appSeq (always refused) and a gate never open. A
+          // settings op stamped before the loss opens no gate if it is refused (§ Settings, "After a Store loss").
+          for (const p of this.pending.values()) if (p.op.appState) p.lost = true;
+          this.gates = [];
+          this.epoch = room.epoch; this.discard(did);
+          this.forgetSettings(did, "store-lost");
+          return;
+        }
+      }
+      this.epoch = room.epoch;   // a viewer's (gateway-built) welcome may lag: only recorded
+    }
     // Rule 13: pending ops belong to the user who made them. Someone else signed in: drop them, say how many.
     const other = this.user !== null && this.user !== msg.user;
-    if (other) for (const id of [...this.pending.keys()]) { this.pending.delete(id); did.dropped.push(id); }
+    if (other) {
+      for (const id of [...this.pending.keys()]) { this.pending.delete(id); did.dropped.push(id); }
+      this.gates = [];   // held changes are dropped and reported by forgetSettings() below
+    }
     this.welcomed = true; this.role = msg.role; this.user = msg.user; this.target = msg.seq; this.horizon = msg.horizon ?? 0;
     this.progressAt = this.now();
     if (this.applied >= this.target) this.goodAt = this.now();
-    if (other) { if (did.dropped.length) { this.discarded = (this.discarded ?? 0) + did.dropped.length; this.discard(did); } return; }
+    if (other) { if (did.dropped.length) { this.discarded = (this.discarded ?? 0) + did.dropped.length; this.discard(did); } this.forgetSettings(did, "user-changed"); return; }
     // The room has forgotten this client (§ Op ids): ops sent before its horizon may or may not have been
     // logged, and the room would answer `stale`. Drop them now, and start over from the room's copy.
     if (msg.high === 0) for (const [id, p] of this.pending) if (p.msg.sentAt !== undefined && p.msg.sentAt < this.horizon) { this.pending.delete(id); did.dropped.push(id); }
     if (did.dropped.length) this.discard(did, did.dropped.length);
+    this.release();
   }
 
   // Rule 5: throw the copy away and ask for a fresh connection with since 0.
@@ -308,7 +467,12 @@ export class Replica {
       }
       this.applied = e.seq;
       // Rule 4: an applied entry with one of my pending ids, made by me, settles that op, ack or not.
-      if (e.by === this.user && this.pending.delete(e.id)) { did.settled.push(e.id); this.recordsRev++; }
+      if (e.by === this.user && this.pending.has(e.id)) {
+        const p = this.pending.get(e.id); this.pending.delete(e.id);
+        // Settled by its entry, ack or not: the next held change to these keys is based on it (§ Settings).
+        if (p.op.appState) for (const k of Object.keys(p.op.appState)) this.floor[p.stream][k] = Math.max(this.floor[p.stream][k] ?? 0, e.seq);
+        did.settled.push(e.id); this.recordsRev++;
+      }
       if (this.streams[e.stream]) this.showAppState(e.stream);
       did.entries.push(e);
     }
@@ -316,6 +480,8 @@ export class Replica {
     if (this.welcomed && this.applied >= this.target && this.goodAt === null) this.goodAt = this.now();   // caught up; proven 10 s from now
     this.settle(did);
     this.afterAnswers(did);   // an applied entry answers a resend as well as an ack does
+    this.openGates(did);
+    this.release();
   }
 
   // An acknowledged op whose entry is applied (or covered by a snapshot) is no longer pending.
@@ -332,6 +498,23 @@ export class Replica {
     const p = msg.id !== undefined ? this.pending.get(msg.id) : null;
     if (!p) return;
     this.pending.delete(msg.id); did.dropped.push(msg.id);
+    if (p.op.appState && msg.code !== "stale") {
+      // A refused settings op takes the held changes to its keys with it: they were built on its value.
+      const keys = Object.keys(p.op.appState), h = this.held[p.stream];
+      let held = null;
+      if (h) for (const k of keys) if (Object.prototype.hasOwnProperty.call(h, k)) { (held = held ?? {})[k] = h[k]; delete h[k]; delete this.heldBase[p.stream][k]; }
+      if (h && !Object.keys(h).length) this.held[p.stream] = null;
+      did.refusedSettings.push({ id: msg.id, stream: p.stream, code: msg.code, appState: p.op.appState, appBase: p.op.appBase, held });
+      if (msg.code === "stale-setting") {
+        // Soft (§ Settings): only the overlay changes. No reset, no resync; the confirmed copy is right.
+        // Stamped before a Store loss: its base may be one the room no longer has, so no gate (retry at once).
+        if (p.lost) did.retryReady.push({ id: msg.id, stream: p.stream, keys });
+        else this.gates.push({ id: msg.id, stream: p.stream, appBase: { ...p.op.appBase } });
+        this.showAppState(p.stream);
+        this.openGates(did); this.afterAnswers(did); this.release();
+        return;
+      }
+    }
     if (msg.code === "stale") { this.staleSeen = true; this.unconfirmed++; this.afterAnswers(did); }
     // Records apply in seq order, so the confirmed copy is already right: the op just leaves the overlay.
     else if (p.stream === "records") { this.recordsRev++; this.afterAnswers(did); }
@@ -370,6 +553,24 @@ export class Replica {
     for (const o of [...this.previewBy.values()]) if (t - o.at >= PREVIEW_TTL_MS) this.dropPreview(o.stream, o.el.id);
   }
 
+  /** Others' live previews on one stream with who sent them: [{ element, user, client, at }] (expired ones dropped first, as previewsOf). */
+  previewEntries(stream) {
+    this.prunePreviews();
+    const out = [];
+    for (const o of this.previewBy.values()) if (o.stream === stream) out.push({ element: o.el, user: o.user, client: o.client, at: o.at });
+    return out;
+  }
+
+  /**
+   * This client's unacknowledged ops on one stream, in send order: [{ id, op, sent }], `sent` = written to a
+   * socket at least once. Held settings changes aren't ops yet (heldSettings()). `op` is a copy.
+   */
+  pendingOf(stream) {
+    const out = [];
+    for (const [id, p] of this.pending) if (p.stream === stream && p.ackSeq === undefined) out.push({ id, op: clone(p.op), sent: p.msg.sentAt !== undefined });
+    return out;
+  }
+
   /** Others' live previews on one stream (expired ones dropped first): what a view bound to that stream draws. */
   previewsOf(stream) {
     this.prunePreviews();
@@ -382,6 +583,7 @@ export class Replica {
   showAppState(stream) {
     const doc = this.streams[stream], next = { ...this.confirmed[stream] };
     for (const p of this.pending.values()) if (p.stream === stream && p.op.appState) Object.assign(next, p.op.appState);
+    if (this.held[stream]) Object.assign(next, this.held[stream]);
     doc.appState.herdr = next; doc.rev++; doc._sorted = null;
   }
 

@@ -95,8 +95,10 @@ test("board settings are checked: unknown keys and bad values are refused", () =
   const c = w.clients[0];
   let n = 0;
   for (const appState of [{ evil: 1 }, { grid: -5 }, { grid: "20" }, { layers: [] }, { layers: [{ id: "x" }] }, { snap: "yes" }, { timeline: { duration: Infinity } }]) {
-    w.raw(c, { t: "op", id: `${c.r.client}:${++n}`, stream: "board", op: { appState } });
+    const appBase = Object.fromEntries(Object.keys(appState).map(k => [k, 0]));   // a well-formed base: the value is what's refused
+    w.raw(c, { t: "op", id: `${c.r.client}:${++n}`, stream: "board", op: { appState, appBase } });
     expect([appState, errors(c).at(-1).code]).toEqual([appState, "bad-op"]);
+    expect(w.log.entries.length).toBe(0);
   }
   w.send(c, "board", { appState: { grid: 20, snap: false, layers: [{ id: "base", name: "Layer 1", visible: true, locked: false, opacity: 100 }] } }); w.settle();
   expect(w.room.streams.board.appState.herdr.grid).toBe(20);
@@ -108,8 +110,8 @@ test("prototype keys in settings are refused, and don't crash the room", () => {
   const c = w.clients[0];
   let n = 0;
   for (const raw of ['{"__proto__":{"grid":1}}', '{"constructor":1}', '{"toString":1}']) {
-    const appState = JSON.parse(raw);
-    expect(() => w.raw(c, { t: "op", id: `${c.r.client}:${++n}`, stream: "board", op: { appState } })).not.toThrow();
+    const appState = JSON.parse(raw), appBase = JSON.parse(raw.replace(/:\{"grid":1\}|:1/, ":0"));   // same keys, a well-formed base
+    expect(() => w.raw(c, { t: "op", id: `${c.r.client}:${++n}`, stream: "board", op: { appState, appBase } })).not.toThrow();
     expect(errors(c).at(-1).code).toBe("bad-op");
   }
   expect(Object.getPrototypeOf(w.room.streams.board.appState.herdr)).toBe(Object.prototype);

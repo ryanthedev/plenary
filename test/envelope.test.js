@@ -45,13 +45,13 @@ test("an image's fileId is 40 lowercase hex characters", () => {
   for (const fileId of ["../t-other/x", "A".repeat(40), "a".repeat(39), 5]) expect([fileId, opProblem(image(fileId))?.code]).toEqual([fileId, "bad-op"]);
 });
 
-test("an op nested deeper than 64 levels is refused; a 30,000-deep one quickly, with no crash and nothing logged", () => {
-  expect(MAX_OP_DEPTH).toBe(64);
-  expect(opProblem(op({ op: { elements: [nested(61)] } }))).toBe(null);            // 3 + 61 = 64 levels pass
-  expect(opProblem(op({ op: { elements: [nested(62)] } })).code).toBe("bad-op");
+test("an op nested deeper than 62 levels is refused; a 30,000-deep one quickly, with no crash and nothing logged", () => {
+  expect(MAX_OP_DEPTH).toBe(62);
+  expect(opProblem(op({ op: { elements: [nested(59)] } }))).toBe(null);            // 3 + 59 = 62 levels pass
+  expect(opProblem(op({ op: { elements: [nested(60)] } })).code).toBe("bad-op");
   const deep = nested(30_000), started = performance.now();
-  expect(deeperThan(deep, 64)).toBe(true);
-  expect(opProblem(op({ op: { elements: [deep] } }))).toMatchObject({ code: "bad-op", message: "an op nests at most 64 levels deep" });
+  expect(deeperThan(deep, 62)).toBe(true);
+  expect(opProblem(op({ op: { elements: [deep] } }))).toMatchObject({ code: "bad-op", message: "an op nests at most 62 levels deep" });
   let arrays = []; for (let i = 0; i < 30_000; i++) arrays = [arrays];
   expect(opProblem(op({ op: { elements: arrays } })).code).toBe("bad-op");
   expect(opProblem(op({ stream: "records", op: { do: "thread", id: "t", text: "x", anchor: { point: deep } } })).code).toBe("bad-op");

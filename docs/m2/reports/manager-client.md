@@ -4,8 +4,7 @@
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| p6-land (builder) | t17s | done p6-land (client) | DONE in worktree, report plenary-p2/docs/m2/reports/p6-land.md (verifying) |
-| p6-landv (verifier) | t181 | verifier p6-landv (client): client landing | RUNNING (brief docs/m2/briefs/p6-landv.md) |
+| (none running) | | | waiting on engine's p2-land merge; next: p6-hex on main |
 
 ## 2026-11-11 — phase-6 design mock
 
@@ -213,3 +212,5 @@
   the merge (not fixable in web/; the brief's storage rule targets what the client stores). Escalated to platform via
   the proxy: deliver a short-lived single-use code in the fragment and exchange it by POST for the session (or an
   HttpOnly cookie), so no long-lived token ever sits in a URL. LOWs L2–L5 go to p6-hex/p7-wire.
+
+- t17s and t181 closed, killed, removed. No client sessions running; p6-hex starts when engine (t18m) sends the merge id.

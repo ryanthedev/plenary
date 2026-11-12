@@ -50,3 +50,9 @@ No behaviour change. Same tests green, more tests added. Move web/ to ports and 
 - Headless browser: web/index.html (three tabs, SharedWorker room), `?net=local`, web/dev.html behave as before.
 - Report: the design section (skill, APPLIER), the file move map (old → new), ports, contract tests, how you checked,
   NOT verified, risks. Processes: never pkill/killall, PIDs only, port 0.
+
+## Carried from p6-landv (docs/m2/reports/p6-landv.md)
+
+LOW L2 (the `?as=` dev path still stores a fragment token), L3 (localRoom's generation check has no test that
+depends on it: add one in the transport contract), L4 (offline banner says "0 edits wait" when nothing waits), L5 (the
+unverified identity from the token payload reaches non-display code: keep it display-only).

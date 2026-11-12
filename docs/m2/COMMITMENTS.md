@@ -79,3 +79,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 platform: p8-deps DONE 723f6c6 (after engine lockfile 0d40b86); image installs bun.lock frozen; CI S3 store with throwaway values.
 - 2026-11-11 engine: scaffold round 3 FAIL, 2 HIGH (a since-0 catch-up over the 64 MiB per-user budget is always refused; a kill -9 test flake at a count boundary). Fix round 3 in t14z. The scaffold is the single blocker: phase 2 (verified on p2-land), Postgres and NATS/S3 adapters (verified) all wait on it.
 - 2026-11-11 platform: p5-flake DONE c0ff386 (the replay-guard test counts pruner visits; 100/100 under load).
+- 2026-11-11 platform: drawh re-check 2 FAIL (settings have no version, so a stale save and a revert are indistinguishable); round 3 (the last) with a fresh builder; t14y retired. Sent to engine: settings version/base, and a room identity in welcome. README PASS stale; refresh after p2-swap. Platform manager handing off at 52%.

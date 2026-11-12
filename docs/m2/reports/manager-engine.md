@@ -4,19 +4,21 @@ Manager terminal: `t18m` (tab `manager engine`; successor of t14j, retired 2026-
 
 ## Workers (current; updated every turn)
 
-In flight: p2-swap (t1fm, name plenary-p2-swap2; t1dh retired) in worktree /Users/r/repos/plenary-p2 (p2-land rebased on main again, head
-b18de1d); t18c fixing R5-M1 (Linux burst test, test only) in the shared tree. Proxy t1bx holds the push until R5-M1
-and platform's p5-tidy land: ping t1bx when R5-M1 commits. After p2-swap: verifier (CHECKER) + client p6-landv
-already PASS, then one merge into main, send id to t14k and t1bx; then p-arch + architecture audit.
+Phase 2 merged into main: dcbdae6 (bun test 884/0). Told t14k, t187. p2-land worktree retired (remove it once
+nobody needs it: `git worktree remove /Users/r/repos/plenary-p2`).
+In flight (shared tree, disjoint files): p2-tune (gateway.js, feed.js, test/server/**, PROTOCOL text) and p-arch
+(test/architecture.test.js, test/arch-scan.js, server/pg/schema.js, store/postgres.js, registry/postgres.js import
+line, deletes test/server/architecture.test.js). On p-arch commit: send the id to platform t187 (p5-pgpriv waits on
+it). After p-arch: architecture audit (server/ + packages/protocol, hexagonal + skill CHECKER vs NFRs), then
+phase 4 leases/takeover.
 
 | Job | Terminal | Status |
 |---|---|---|
-| p2-swap (builder, plenary-p2-swap2) | t1fm | RUNNING fix round 1 (H1, M1, M3, M2 e2e, L2, L3/L5 spec, L6) |
-| p2-swapv (verifier, plenary-p2-swapv) | t1fn | FAIL reported (1 HIGH revocation race); idle, re-verifies after fix round 1 |
+| p2-tune (builder, plenary-p2-tune) | t1fw | RUNNING (brief docs/m2/briefs/p2-tune.md) |
+| p-arch (builder, plenary-p-arch) | t1fx | RUNNING (brief docs/m2/briefs/p-arch.md) |
 
-On main: 7b6a5dd scaffold, b804f3b p4-pg, bbdae0e p4-natss3. On p2-land: a68e9dc v1.1 code, 892ee6e client.
-Closed: t1dh, t15q (+ its worktree), t186, t188, t18c, t18b, t171, t16y, t158, t17d, t17p, t17f, t17m, t17j. Leftover scratch: t17j ~1 GB and t18c 168 MB in their
-scratchpads (their rm was refused); remove when convenient.
+Closed: t1fm, t1fn, t1dh, t15q, t186, t188, t18c, t18b, t171, t16y, t158, t17d, t17p, t17f, t17m, t17j.
+Leftover scratch: t17j ~1 GB, t18c 168 MB in their scratchpads.
 
 ## 2026-11-11 phase 1 (protocol v1 spec)
 
@@ -214,3 +216,5 @@ scratchpads (their rm was refused); remove when convenient.
 - Platform t187: p5-exp started (verify returns exp); grants announce stays a main.js decorator (agreed); p5-pgpriv after the merge, on p-arch's server/pg/schema.js helper (needSchema/ensureSchema/migrate); p8-cookie on the merge id. p-arch must move migrate() too.
 - Platform p5-exp landed e82a537 (identity.exp flat integer seconds; dev tokens none). Platform waits on the merge id for p8-cookie, p5-pgpriv, live drawh run.
 - p2-swapv t1fn: FAIL (H1 revocation during hello; M1 recheck fails open; M2 exp (now on main e82a537); M3 link/invite expiry; 6 LOW). Rebased p2-land onto main (b18de1d, autostash clean). Fix round 1 to t1fm. Decisions: L3 keep byte-triggered checkpoint and amend § Recovery When; L5 add grants to § Bus; L1 `here` becomes its own job (queued); L4 to p-arch.
+- Fix round 1 (t1fm) done in 7 min: all listed fixed; done-when 443/0 plain. Round 2 re-verify sent to t1fn.
+- p2-swapv round 2 PASS (R1/R2 MEDIUM at scale, R3-R6 LOW -> p2-tune). Committed 3ca0b05 on p2-land (884/0); merged into main dcbdae6 (884/0 on main). Started p2-tune (t1fw, incl. `here`) and p-arch (t1fx). Platform: p5-pgpriv waits on p-arch's commit id.

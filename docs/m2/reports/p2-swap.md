@@ -140,3 +140,27 @@ client ──ws──> gateway ──.inbox (n-numbered)──> room host (Room 
 ## History
 
 - Cherry-picked ffd2a11 as the manager asked; it also touched docs/m2/reports/p3-scaffold.md (not only the test).
+
+## Fix round 1 (verifier p2-swapv FAIL: H1, M1, M2, M3, L2, L3, L5, L6)
+
+**Done-when (2026-11-12, worktree rebased by the manager onto main b18de1d):** plain **443 pass, 80 skip, 0 fail**
+(523 tests, 34 files); with a temporary Postgres 17 and NATS (max_payload 2 MB) **502 pass, 19 skip, 0 fail**. The
+google-live failures are gone (main's d8fc084). Not this round: L1 (`here`, its own job), L4 (to p-arch).
+
+| # | Fix | Where | Test (each mutation-checked: undoing the fix turns it red) |
+|---|---|---|---|
+| H1 | A per-board **grants watch** (the `grants` subscription plus a generation counter), opened right after the board lookup and **before** `auth.role`, held until the socket closes (also for a board's first connection). Just before going live, if the generation moved, `auth.role` runs again: no role → `auth` 1008; a different role → `unavailable` 1012 (writer ↔ viewer changes the hello's path, so it reconnects). Nothing is awaited between that check and going live, so any later message's re-check covers the socket. The subscription moved out of `joinBoard` (one per board, ref-counted). | server/gateway.js `watchGrants`, `hello` | revocation.test.js: verifier's A1 shape (revoked while the room build is gated); revoked *during* the role lookup (fails if the watch opens after the check); role changed → 1012; no grants message → one role lookup only |
+| M1 | A re-check whose `auth.role` throws **fails closed**: `unavailable` 1013 "could not re-check your access: reconnect"; the reconnecting hello does the check. | gateway.js `recheck` | revocation.test.js M1 (A7 shape) |
+| M3 | Every live connection's role is re-checked on a timer, `roleRecheckMs` (default 60 s), besides `grants`. | gateway.js `roleTimer` | revocation.test.js M3 (link expiring in 800 ms, timer 200 ms; the owner stays) |
+| M2 | Nothing to change engine-side: platform's e82a537 returns `exp`. End-to-end test with the real `sessions()` verify (ttl 2 s): the socket closes `auth` 1008 "your sign-in expired", and the token opens no new one. | — | revocation.test.js M2 |
+| L6 | The expiry timer re-arms: `expiryWait(exp, now)` is 0 once passed, else at most setTimeout's cap; when the capped wait ends before `exp`, it waits the rest instead of closing. | gateway.js `expiryWait`, `arm` | revocation.test.js L6 (unit test of the wait the timer uses: 30 days → cap, then the rest, then 0) |
+| L2 | A gap in the Store log is **corruption** (§ Recovery). The feed stops at it, logs an error once per gap ("the Store log has a gap…") and sets `gapAt`; a new hello on that board is refused `unavailable` 1013 and logged ("hello refused: the board's log has a gap") instead of being welcomed at the seq before the gap. Cleared if the Store later fills it. My call: refuse rather than serve a short board silently; live viewers already past welcome just stop at the gap (logged). | server/feed.js `repair`, gateway.js `hello` | revocation.test.js L2 (A8 shape) |
+| L3 | PROTOCOL.md § Recovery "When": the byte trigger (`tailFoldBytes`, default 8 MB, with the same half-size bound) is allowed at any entry count, whichever comes first. | PROTOCOL.md (worktree) | existing outbound/v1 fold tests |
+| L5 | PROTOCOL.md § Bus: `.grants` added to the subject list with its message `{ board }` and what gateways do. The gateway connection list `{ gateway, conns }` was already there (the `.inbox` bullet). | PROTOCOL.md (worktree) | — |
+
+- **Files this round:** server/gateway.js, server/feed.js, PROTOCOL.md (7 lines), test/server/revocation.test.js (new, 8 tests).
+- **Not verified:** the 60 s default timer's cost at load (one `auth.role` per live connection per minute: 100k viewers
+  on one gateway would be ~1,700 Registry lookups/s; worth a look at the load test, or platform could make `role()`
+  return when its answer expires so only those connections need a timer).
+- **Spec note:** a viewer-only board with a log gap now refuses joins; PROTOCOL.md doesn't say what a gateway does
+  on a gap (only that the room refuses to start). Manager: add a line to § Bus or § Recovery if you agree.

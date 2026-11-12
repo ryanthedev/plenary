@@ -3,11 +3,16 @@
 Base: docs/m2/BRIEF-BASE.md applies. Read docs/m2/OFFICE.md ("Architecture"), CLAUDE.md, test/purity.test.js (the
 pattern to follow), then every .js file under packages/ and server/ (imports only).
 
-- **Your tab:** `worker p-arch (engine): architecture boundary test`. Manager: `manager engine`, terminal `t14j`.
-- **You own:** test/architecture.test.js (new) only. Don't edit code; violations become fix jobs.
+- **Your tab:** `worker p-arch (engine) · <your id>: architecture boundary test`. Manager: `manager engine`, terminal
+  `t18m`. Report to t18m only; never message the proxy (t1bx).
+- **You own:** test/architecture.test.js and test/arch-scan.js (new), server/pg/schema.js (new),
+  server/store/postgres.js, the import line(s) only in server/registry/postgres.js (platform's file, agreed), and
+  test/server/architecture.test.js (p2-swap's narrow engine test: fold it into yours and delete it). Don't edit other
+  code; other violations become fix jobs. p2-tune runs concurrently on server/gateway.js, server/feed.js and the
+  rest of test/server/: never touch those.
 - **Systems design skill:** apply `distributed-systems-design` (APPLIER mode) before writing (if not listed, read
   /Users/r/repos/systems-design.skill/skills/distributed-systems-design/SKILL.md and its references/).
-- **Report:** docs/m2/reports/p-arch.md. Then stop, idle. Don't commit.
+- **Report:** docs/m2/reports/p-arch.md. Then stop, idle. Don't commit. Work in /Users/r/repos/plenary (main, phase 2 merged at dcbdae6).
 
 ## Goal (CEO: hexagonal architecture)
 
@@ -37,5 +42,10 @@ proposed fix job.
   and `bun test` stays green.
 
 **Known violation to fix in this job (p5-hexv L8):** server/registry/postgres.js imports `needSchema`/`ensureSchema`
-from ../store/postgres.js (adapter to adapter). Move both into a shared Postgres helper (e.g. server/pg/schema.js,
-not an adapter of any port) that both adapters import; run the Postgres store and registry contracts after.
+from ../store/postgres.js (adapter to adapter). Move both, plus `migrate(tx, schema)` (p2-swap's least-privilege
+start-up), into a shared Postgres helper (e.g. server/pg/schema.js,
+not an adapter of any port) that both adapters import; run the Postgres store and registry contracts after
+(local brew postgresql@17 with DATABASE_URL; start it yourself, record the PID, stop it after).
+
+**Also known (p2-swapv L4):** p2-swap's test/server/architecture.test.js keeps a hand-written core list and doesn't
+check adapter to adapter at all; yours must derive the sets from folders, not a hand-kept list.

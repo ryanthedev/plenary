@@ -185,3 +185,93 @@ Fix idea (engine): re-run `auth.role` for every live connection on a slow timer 
 1. H1 in server/gateway.js (engine): this alone gates.
 2. M1 and M3 in server/gateway.js (engine): fix in the same round, since both are cheap and on the same path.
 3. For platform, not gating this job: M2 (`sessions.verify` returns `exp`).
+
+---
+
+# Round 2 (fix round 1 by t1fm; p2-land rebased onto main, head b18de1d), 2026-11-12
+
+**PASS**, with 2 MEDIUM and 4 LOW to fix before the M2 load test. Every round-1 finding in scope is fixed and its
+new test is real. No HIGH. The two MEDIUMs are new availability holes that the fixes opened at scale: neither loses
+data or lets a revoked user keep access.
+
+Changed this round: server/gateway.js, server/feed.js, PROTOCOL.md (2 edits), test/server/revocation.test.js
+(new, 8 tests). Worktree unchanged by me.
+
+## Round-1 findings, re-run
+
+| # | Repro | Now |
+|---|---|---|
+| H1 revocation race | A1 | **fixed**: hello refused `auth`, nothing logged. The `grants` watch opens before the role check, and a generation counter forces a second look if it moved during the awaits (gateway.js:602-628) |
+| M1 re-check error kept the role | A7 | **fixed**: `unavailable` 1013, closed; the reconnecting hello is refused. (This fix opened R2 below.) |
+| M2 real session expiry | A2 with the real `sessions()` verify | **fixed**: identity carries `exp`, socket closed at expiry |
+| M3 link/invite expiry | M3 test with `roleRecheckMs: 300` | **fixed**: live socket closed `auth` "your access to this board was removed" on the timed re-check (default every 60 s, gateway.js:76). (This fix opened R1 below.) |
+| L2 log gap | A8b: gap on a cold board | **fixed**: viewer and writer both get `unavailable`, error logged. (My old A8 put the gap under a live room, which can't happen honestly: that room's next append conflicts and its rebuild refuses the gap.) |
+| L3 byte-triggered checkpoint | reading PROTOCOL.md § Recovery "When" | **fixed**: written into the spec |
+| L5 `grants` subject | reading PROTOCOL.md § Bus | **fixed**: subject and message documented |
+| L6 24.8-day timer cap | reading gateway.js:642-650, `expiryWait` | **fixed**: re-arms until `exp` has passed; unit test in revocation.test.js |
+| L1 `here`, L4 architecture test | — | out of scope this round (manager) |
+
+**The new tests are real** (mutation in a scratch copy): with the generation loop removed, the 3 H1 tests fail;
+with the re-check `catch` back to `continue`, the M1 test fails; with the role timer disabled, the M3 test fails.
+
+**PROTOCOL.md edits:** minimal (2 hunks) and they match the code. A nit: § Recovery "When" says "whichever comes
+first" about two triggers, one of which (the half-size bound) applies to both. It reads oddly but is not wrong.
+
+## New findings
+
+| # | Sev | What | Where |
+|---|---|---|---|
+| R1 | MEDIUM | Every re-check pass is one unbroken chain of `auth.role` calls over all of a board's connections, with no yield and no coalescing. Each `grants` message starts another full pass, and so does the 60 s timer. With the SQLite Registry each `role()` is ~11 µs of synchronous work, so the gateway's event loop stalls for the whole pass | gateway.js:495-508, :476-481, :576 |
+| R2 | MEDIUM | Fail-closed (the M1 fix) also applies to the timed pass: one short Registry blip that a pass meets closes **every** live connection on the gateway (writers and viewers), so they all reconnect and catch up again | gateway.js:503, :576 |
+| R3 | LOW | Revocation is asynchronous: until the re-check reaches a connection, its ops still go to the room. The window is the time from the Registry change to that connection's turn in the pass, which R1 makes grow with connection count (codex) | gateway.js:495 |
+| R4 | LOW | A foreign-board entry at exactly seq + 1 stops the feed and logs an error, but doesn't set `gapAt`, so new joins are welcomed short. Corruption-only (codex; confirmed by reading feed.js:63-66, :80-83) | feed.js:80 |
+| R5 | LOW | The 60 s timed re-check and fail-closed-on-error aren't in PROTOCOL.md, so a reader can't tell how fast an expiring link or invite takes effect | PROTOCOL.md § Bus / § Auth |
+| R6 | LOW | Flaky test: "clients converge through the Room … (seed 1)" timed out "clients to settle" (10 s) in 2 of ~70 runs, both while the machine was busy; 0 of 46 instrumented runs failed, so the cause wasn't captured. Not shown to be from this round | test/server/gateway.test.js:644 |
+
+### R1 repro (attack: 2,000 real viewer sockets, SQLite Registry, one gateway)
+
+Probe = a 2 ms `setInterval` in the gateway's process, measuring its worst delay.
+
+| Trigger | Worst event-loop stall |
+|---|---|
+| nothing | 3 ms |
+| 1 `grants` message | 45 ms |
+| 20 `grants` messages (an admin adding 20 invites) | 260 ms |
+
+Directly, 100,000 sequential `tenancy.role` calls on the SQLite Registry take 1,144 ms with the loop blocked for
+1,140 ms (11 µs a call). So a gateway holding 100k connections freezes ~1 s every 60 s, and ~1 s more per `grants`
+message: no frames, no pings, no acks meanwhile (NFR: editors < 150 ms). With Postgres the calls yield, but each
+pass is 100k × ~5 queries.
+
+Fix ideas: one pass in flight per board, with a dirty flag so N `grants` messages cost one more pass, not N;
+`breathe()` inside the loop; spread the timed pass over its interval; cache one answer per user within a pass.
+
+### R2 repro (attack: 300 sockets, `roleRecheckMs: 1000`, `auth.role` throws for ~1 s)
+
+A healthy timed pass closes 0 of 300 connections. A ~1 s blip closes **300 of 300** (code 1013), at 300 `role` calls.
+At 100k viewers that is a self-inflicted mass reconnect plus catch-up from a database hiccup, and a Postgres
+failover of a few seconds is certain to meet a pass.
+
+Fix ideas: keep the security property where it matters, and shrink the blast radius. On a `grants`-triggered
+re-check, retry a few times over a few seconds and then fail closed. On the timed pass, keep the connection on an
+error and try again next pass (the timer exists for expiry, which a later pass still catches). Or close only
+connections whose access came from something time-limited (a link or invite with `expiresAt`).
+
+## Done-when, round 2
+
+| Gate | Result |
+|---|---|
+| `bun test test/*.test.js test/server test/auth`, plain | **green**: 443 pass, 80 skip, 0 fail (a first run had 1 fail, R6, while my 2,000-socket attack shared the machine) |
+| …with DATABASE_URL + NATS_URL | **green**: 502 pass, 19 skip, 0 fail (scratch postgresql@17 and nats-server on OS-assigned ports, PIDs 83261 and 83262, stopped after). google-live now passes |
+| kill -9 through main.js, 20 rounds | **pass**, 90 s. Same load as round 1: one writer streaming, up to 200 unacked ops in flight at each kill, ≥ 3,000 acks. Every acked op at its seq, none twice |
+| Earlier attacks (A3–A6, A9, S1) | still pass |
+| No `SEAM(p2)` | still none |
+
+## sdd
+
+codex (effort high) on the round-2 revocation and feed code: 2 findings, both confirmed as LOW (R3, R4). agy,
+kimi and mistral were still unusable (quota or login), so there was no second harness and no two-harness agreement.
+
+## Recommendation
+
+Commit. Fix R1 and R2 before the ~10k-client M2 load test, which is where they would show; R3 shrinks with R1.

@@ -131,26 +131,65 @@ function prefixFor(src, out) {
 const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /**
+ * Throws, naming `file`, if `src` holds a `with` statement (p8-globalsv L1): inside a `with` body `define` rewrites
+ * nothing, so neither check could see a global or an import() there. `with` is a SyntaxError in every ES module, but
+ * Bun's transpiler accepts it, and a type-only port is loaded by no test, so the check itself must refuse it.
+ * Decided by the parser, never by the text: every raw word `with` is a candidate.
+ *   - Swapped for a token `<pre>w<n>`, defined to `<pre>v<n>`: printed `<pre>v<n>` means the token was a free
+ *     reference, and only a `with` keyword in code becomes one (`with` is reserved, so it is never a name); in a
+ *     comment, string, template text or regex, or as a property, member or method name, it isn't printed as `v`.
+ *   - That swap can also break the parse: `with (o) { … }` becomes `<tok>(o) { … }`. The same is true of an import
+ *     attribute (`import j from "./a.json" with { type: "json" }`). So a candidate whose identifier probe doesn't
+ *     parse is probed again swapped for `if`: `with ( Expression ) Statement` is exactly `if ( Expression ) Statement`
+ *     (no else), so a `with` statement always parses as an `if`, and an import attribute never does.
+ * All candidates are swapped at once first; one at a time only if that copy doesn't parse.
+ */
+function refuseWith(file, src, base) {
+  const cands = [...src.matchAll(/\bwith\b/g)].map((m, n) => ({ at: m.index, n }));
+  if (!cands.length) return;
+  const pre = prefixFor(src, base);
+  const t = withDefine(Object.fromEntries(cands.map(({ n }) => [`${pre}w${n}`, `${pre}v${n}`])));
+  const swap = (list, as) => {
+    let s = "", at = 0;
+    for (const c of list) { s += src.slice(at, c.at) + (as ?? `${pre}w${c.n}`); at = c.at + "with".length; }
+    try { return t.transformSync(s + src.slice(at) + AS_MODULE); } catch { return null; }
+  };
+  const free = (c, text) => new RegExp(`${escapeRe(pre)}v${c.n}(?![\\w$])`).test(text);
+  const isWith = c => { const one = swap([c]); return one !== null ? free(c, one) : swap([c], "if") !== null; };
+  const all = swap(cands);
+  const hit = all !== null ? cands.find(c => free(c, all)) : cands.find(isWith);
+  if (hit) {
+    const line = src.slice(0, hit.at).split(/\r\n|[\n\r\u2028\u2029]/).length;
+    throw new Error(`${file}: a \`with\` statement (line ${line}): names inside it are unknown to the parser, and no ES module may hold one`);
+  }
+}
+
+/**
  * [{ file, global }] for every free reference to a forbidden browser global in a core source, in CORE_GLOBALS order.
  * Method (brief p8-globals): Bun.Transpiler's `define` rewrites only free references (a shadowed binding, a member
  * name, a property key, a string, a template's text, a regex and a comment are left alone; `${…}` is code), so each
  * name is defined to a unique sentinel and the printed output is read for sentinels. Only the neighbours of a sentinel
- * in that canonical output are looked at: `(` or `?.(` after it (a call), `new ` before it (a construction), and for
- * a dotted name's object `?.prop` or `["prop"]` after it. Throws if the parser rejects `src`.
- * Known limit: inside a `with (o) { … }` body define rewrites nothing; `with` is a SyntaxError in every ES module
- * (each web/core file is one; Bun refuses to load it), and core-runtime-globals.test.js imports every core module.
+ * in that canonical output are looked at: for `Date(` and `Function(` every use counts except as the object of `.`,
+ * `?.` or `[` or the operand of typeof / instanceof (p8-globals2), and for a dotted name's object `?.prop` or
+ * `["prop"]` after it. Throws if the parser rejects `src`, or if it holds a `with` statement (refuseWith).
  */
 export function globalsIn(file, src) {
-  const pre = prefixFor(src, printed(file, src));
+  const base = printed(file, src);
+  refuseWith(file, src, base);
+  const pre = prefixFor(src, base);
   const define = Object.fromEntries(DEFINED.map((n, i) => [n, `${pre}${i}`]));
   const out = printed(file, src, withDefine(define));
   const seen = new Set();                                         // indexes of rules hit
   for (const m of out.matchAll(new RegExp(`${escapeRe(pre)}(\\d+)(?![\\w$])`, "g"))) {
-    const name = DEFINED[+m[1]], after = out.slice(m.index + m[0].length), before = out.slice(Math.max(0, m.index - 8), m.index);
+    const name = DEFINED[+m[1]], after = out.slice(m.index + m[0].length), before = out.slice(Math.max(0, m.index - 12), m.index);
     CORE_GLOBALS.forEach((r, k) => {
       if (r.name === name) {
         if (!r.call) seen.add(k);
-        else if (/^\s*(\?\.\s*)?\(/.test(after) || (/(^|[^\w$])new\s+$/.test(before) && !/^\s*(\?\.|\.|\[)/.test(after))) seen.add(k);
+        // p8-globals2 (L2, L3): any use counts (a call, a construction, a tagged template, a compound callee such as
+        // `(0, Date)()`, `Date?.()`, an alias) except as the object of a member access (`Date.UTC`, `Date?.x`, `Date[k]`) or the
+        // operand of typeof / instanceof, and that only when the sentinel itself isn't called, optionally called or
+        // tagged: in `typeof Date()` the operand is the call (p8-globals2v H1).
+        else if (!/^\s*(\?\.(?!\s*\()|\.|\[)/.test(after) && !(/(^|[^\w$])(typeof|instanceof)\s+$/.test(before) && !/^\s*(\?\.\s*)?[(`]/.test(after))) seen.add(k);
       } else if (r.name.startsWith(name + ".") && r.name !== "import.meta") {
         const prop = escapeRe(r.name.slice(name.length + 1));
         if (new RegExp(`^\\s*(\\?\\.\\s*${prop}(?![\\w$])|(\\?\\.\\s*)?\\[\\s*(["'\`])${prop}\\3\\s*\\])`).test(after)) seen.add(k);
@@ -171,10 +210,11 @@ export function globalsIn(file, src) {
  *   - all candidates are swapped at once; if that copy doesn't parse (a static `import … from` swapped becomes
  *     `<tok> … from`, which never parses), each is probed alone, and one whose own probe fails is a static import
  *     (a swap in a comment, a string or a call never breaks a parse), so no import() call.
- * Throws if the parser rejects `src` itself.
+ * Throws if the parser rejects `src` itself, or if it holds a `with` statement (refuseWith).
  */
 export function computedImports(src, file = "<source>") {
   const base = printed(file, src);
+  refuseWith(file, src, base);
   const cands = [...src.matchAll(/\bimport\b/g)].map((m, n) => ({ at: m.index, n }));
   if (!cands.length) return [];
   const pre = prefixFor(src, base);
@@ -402,6 +442,67 @@ describe("web/ architecture (hexagonal boundaries)", () => {
     expect(hits("function fetch() {} fetch(u);")).toEqual([]);                  // a top-level function is a real binding
     // Bun's own import.meta properties are import.meta too.
     for (const p of ["main", "require('x')", "resolve('x')", "env.X", "hot", "dirname", "path"]) expect(hits(`const v = import.meta.${p};`)).toEqual(["import.meta"]);
+  });
+
+  test("p8-globals2 (L2, L3, L4): Date and Function count in any use but a member access, typeof or instanceof", () => {
+    const hits = src => globalsIn("web/core/x.js", src).map(v => v.global);
+    // L2: compound callees (HEAD missed these too).
+    expect(hits("const d = new (0, Date)();")).toEqual(["Date("]);
+    expect(hits("const d = (0, Date)();")).toEqual(["Date("]);
+    expect(hits('const g = new (0, Function)("return this")();')).toEqual(["Function("]);
+    // L3: tagged templates.
+    expect(hits("const d = Date`x`;")).toEqual(["Date("]);
+    expect(hits("const g = Function`return this`();")).toEqual(["Function("]);
+    // Aliases and hand-offs are uses too (tightened).
+    expect(hits("const D = Date; D.now();")).toEqual(["Date("]);
+    expect(hits("f(Function); const a = [Date];")).toEqual(["Date(", "Function("]);
+    // L4: an optional call on its own.
+    expect(hits("Date?.();")).toEqual(["Date("]);
+    expect(hits('Function?.("x");')).toEqual(["Function("]);
+    // Unchanged: member access, typeof, instanceof.
+    expect(hits("Date.UTC(1); Date?.x; Date[k]; Date?.[k]; typeof Date; x instanceof Function; new Date.Sub();")).toEqual([]);
+    expect(hits("Date.now(); Date?.now(); Date[\"now\"]();")).toEqual(["Date.now"]);
+    expect(hits("x instanceof Date && typeof Function === 'function';")).toEqual([]);
+  });
+
+  test("p8-globals2v H1: typeof / instanceof exempt the bare name only, never a call, optional call or tag of it", () => {
+    const hits = src => globalsIn("web/core/x.js", src).map(v => v.global);
+    expect(hits("const t = typeof Date();")).toEqual(["Date("]);
+    expect(hits("const t = typeof Date?.();")).toEqual(["Date("]);
+    expect(hits("const t = typeof Function('return this')();")).toEqual(["Function("]);
+    expect(hits("const t = typeof Function('globalThis.fetch(1)')();")).toEqual(["Function("]);
+    expect(hits("x instanceof Date();")).toEqual(["Date("]);
+    expect(hits("x = typeof\nDate();")).toEqual(["Date("]);
+    expect(hits("x = typeof (Date)();")).toEqual(["Date("]);
+    expect(hits("x = typeof /*c*/ Date();")).toEqual(["Date("]);
+    expect(hits("const t = typeof Date`x`;")).toEqual(["Date("]);
+    expect(hits("const t = typeof Function`return this`;")).toEqual(["Function("]);
+    // Still [] (the bare name as the operand):
+    expect(hits("typeof Date; x instanceof Function; typeof Date === 'function';")).toEqual([]);
+    expect(hits("const t = typeof Date;")).toEqual([]);
+    expect(hits("x instanceof Function;")).toEqual([]);
+    expect(hits("if (typeof Date === 'function') f();")).toEqual([]);
+  });
+
+  test("p8-globals2 (L1): a `with` statement is a loud failure in both checks; the word `with` elsewhere is not", () => {
+    const g = src => () => globalsIn("web/core/x.js", src), c = src => () => computedImports(src, "web/ports/p.js");
+    for (const src of ["with (o) { document.title; }", "function f(o) {\n  with (o)\n  { return import(d); }\n}",
+      "with (o) x.y;", "const f = () => `${(() => { with (o) { return 1; } })()}`;", "a: with (o) { break a; }",
+      "if (x) with (o) y; else z;", "class A { static { with (o) {} } }", "/* with */ const s = 'with'; with(o){}"]) {
+      expect(g(src)).toThrow(/web\/core\/x\.js: a `with` statement \(line \d+\)/);
+      expect(c(src)).toThrow(/web\/ports\/p\.js: a `with` statement/);
+    }
+    expect(c("const a = 1;\nfunction f(o) {\n  with (o) {}\n}")).toThrow(/\(line 3\)/);
+    // Not a with statement: comments, strings, templates, regex, property, member and method names, import attributes,
+    // and names that merely contain "with".
+    for (const src of ["// with (o) { document }\n/* with (o) {} */ const s = 'with (o) {}', t = \"with\", u = `with (o) ${1}`;",
+      "const r = /with (o)/; const o = { with: 1, 'with': 2 }; o.with; o?.with; o['with'];",
+      "class A { with() {} static with = 1; #with = 2; get with() { return 1; } } const b = { with() {} };",
+      'import j from "./a.json" with { type: "json" };\nexport { k } from "./b.json" with { type: "json" };',
+      "const withX = 1, $with = 2, with_ = 3; withX + $with + with_;", 'const m = import("./a.json", { with: { type: "json" } });']) {
+      expect(g(src)).not.toThrow();
+      expect(c(src)).not.toThrow();
+    }
   });
 
   test("p8-globals: R4-L1 (a raw U+2028 / U+2029 inside a string) ends nothing; CR and LS line breaks still break", () => {

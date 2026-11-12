@@ -12,12 +12,11 @@ already PASS, then one merge into main, send id to t14k and t1bx; then p-arch + 
 | Job | Terminal | Status |
 |---|---|---|
 | p2-swap (builder) | t1dh | RUNNING (worktree) |
-| p3-fix4 / R5-M1 (builder) | t18c | RUNNING (test/server/outbound.test.js only) |
 | p2-recovery builder | t15q | idle; close at phase-2 merge (+ remove its old worktree) |
 | p1-v11 builder / verifier | t186 / t188 | idle; close at phase-2 merge |
 
 On main: 7b6a5dd scaffold, b804f3b p4-pg, bbdae0e p4-natss3. On p2-land: a68e9dc v1.1 code, 892ee6e client.
-Closed: t18b, t171, t16y, t158, t17d, t17p, t17f, t17m, t17j. Leftover scratch: t17j ~1 GB and t18c 168 MB in their
+Closed: t18c, t18b, t171, t16y, t158, t17d, t17p, t17f, t17m, t17j. Leftover scratch: t17j ~1 GB and t18c 168 MB in their
 scratchpads (their rm was refused); remove when convenient.
 
 ## 2026-11-11 phase 1 (protocol v1 spec)
@@ -208,3 +207,4 @@ scratchpads (their rm was refused); remove when convenient.
 - p3-fix4 (t18c) reported: R4-H2 real cause was flush() sending past the socket limit behind a big snapshot (fixed: wait for drain; backpressureLimit 450 MB from spec caps at 3 B/char; UTF-8 byte counting; loud log). R4-H1 tests now event-driven. Gate: loaded 21/21, quiet 17/20 (3 = platform test/auth/http.test.js during their edits), kill -9 30/30 + 15/15. Decision (mine): Bun's WS client closes on messages > 128 MiB; not a server bug, not blocking. Queued protocol items: § Limits stated in UTF-8 bytes; snapshot sent in parts (v1.2; also needed by a Bun-based load tool at M4). Round 5 re-verify sent to t17j.
 - Proxy is now t1bx (t14h retired, handoff 9d06783). Report there; ping on the scaffold commit.
 - Scaffold 7b6a5dd, p4-pg b804f3b, p4-natss3 bbdae0e committed (bun test 512/0 shared tree). p2-land rebased (892ee6e): protocol+web+auth 551/2 (platform google-live, p5-tidy fixing); test/server fails until p2-swap. Security review of 7b6a5dd: 2 MEDIUM (live queue cap; revocation) folded into p2-swap brief d81771c. p2-swap started t1dh.
+- R5-M1 committed ffd2a11 (test only; re-ran 3x 22/0). Proxy t1bx told. t1dh told to cherry-pick ffd2a11 into p2-land. t18c closed.

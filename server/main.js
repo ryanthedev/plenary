@@ -1,4 +1,8 @@
-// Single-node entry point: `bun server/main.js`. SQLite store, in-memory bus, local-disk blobs, dev-token auth.
+// Entry point (single node or one cluster node): `bun server/main.js`.
+//   Single node (neither DATABASE_URL nor NATS_URL): SQLite store and registry, in-memory bus, both roles.
+//   Cluster node (both set): Postgres store and registry, NATS bus, the roles PLENARY_ROLES names.
+//   Blobs are local disk (PLENARY_DATA_DIR) in both modes. Nothing in server/ reads or writes blobs today (only
+//   createServer passes them through), so per-node disk is no gap yet; S3-compatible blobs are a later job.
 //
 // Environment (no secrets in the repo; none of these values is ever logged):
 //   PORT                 default 8080 (0 = any free port)
@@ -20,6 +24,22 @@
 //                        Missing on a single node: a random key per process (sign-ins don't survive a restart).
 //                        Missing in cluster mode (DATABASE_URL or NATS_URL set): the server refuses to start.
 //   SESSION_KEY          ≥ 32 bytes; signs session tokens (default: COOKIE_KEY)
+//   DATABASE_URL         Postgres for the Store (server/store/postgres.js) and the Registry (server/registry/postgres.js).
+//   NATS_URL             NATS for the Bus (server/bus/nats.js; the connection is named after PLENARY_NODE_ID).
+//                        Either URL set = cluster mode, and then BOTH are required: one without the other refuses the
+//                        start (a Postgres store with an in-memory bus would split-brain across nodes). Their values
+//                        carry passwords: never logged, never in an error (only the names are).
+//   PLENARY_NODE_ID      this node's id: [a-z0-9-], 1-32 chars, else the start is refused. Default: the hostname,
+//                        lowercased, other characters turned into "-", cut to 32. Room leases name their holder
+//                        "<node>-<pid>-<random>". Logged at start.
+//   PLENARY_ROLES        comma list of gateway, host (spaces trimmed, any case); default both. Empty, unknown or
+//                        repeated names refuse the start; a single node (no URLs) refuses anything but both.
+//                        gateway: sockets, sign-in, POST /boards, the web app. host: room hosts (one sequencer per
+//                        board, under its Store lease). A gateway-only node asks the cluster's hosts to open a board
+//                        over NATS, so a cluster needs at least one host node. A host-only node serves /health only.
+//   PLENARY_LEASE_TTL_MS a room lease's ttl, integer ms from 3 to 600000, default 10000. EVERY NODE MUST USE THE SAME
+//                        VALUE: watchers time takeovers by it, and a gateway-only node waits this long for a host's
+//                        answer before telling the writer `unavailable`.
 //
 // start(env) reads ONLY its `env` argument (never process.env), so tests behave the same in every checkout
 // (Bun auto-loads .env into process.env). No value from env is ever logged, only names.
@@ -31,12 +51,17 @@
 // <data>/dev-board.json and reused afterwards (and logged). Each dev user gets the role its token names (default
 // editor; if two tokens name one user, the highest role). A restart never demotes the board's last owner.
 
+import { hostname as osHostname } from "node:os";
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { createLogger } from "./log.js";
 import { createServer } from "./server.js";
 import { sqliteStore } from "./store/sqlite.js";
+import { postgresStore } from "./store/postgres.js";
 import { memoryBus } from "./bus/memory.js";
+import { natsBus } from "./bus/nats.js";
+import { postgresRegistry } from "./registry/postgres.js";
+import { checkLeaseTtl } from "./room-host.js";
 import { diskBlobs } from "./blobs/disk.js";
 import { authPort } from "./auth/port.js";
 import { devAuth } from "./auth/dev.js";
@@ -51,6 +76,64 @@ import { ROLES } from "../packages/protocol/envelope.js";
 
 const KEY_MIN = 32;
 const keyOk = k => typeof k === "string" && new TextEncoder().encode(k).length >= KEY_MIN;
+
+const NODE_ID = /^[a-z0-9-]{1,32}$/;
+const ROLE_NAMES = ["gateway", "host"];
+
+/** The default node id: the hostname, lowercased, other characters turned into "-", cut to 32 (never refused). */
+export function defaultNodeId(host) {
+  return String(host ?? "").toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 32) || "node";
+}
+
+/**
+ * Reads the cluster part of env (nothing else), or throws an Error naming the variable. Never puts a URL's value
+ * in a message. @returns {{ cluster: boolean, node: string, roles: { gateway: boolean, host: boolean }, leaseTtlMs: number }}
+ */
+export function nodeConfig(env, host = osHostname()) {
+  const hasDb = !!env.DATABASE_URL, hasNats = !!env.NATS_URL, cluster = hasDb || hasNats;
+  if (cluster && !hasDb) throw new Error("DATABASE_URL is required in cluster mode (NATS_URL is set): every node needs the shared Postgres store; an in-memory one would split-brain across nodes");
+  if (cluster && !hasNats) throw new Error("NATS_URL is required in cluster mode (DATABASE_URL is set): every node needs the shared NATS bus; an in-memory one would split-brain across nodes");
+  let node;
+  if (env.PLENARY_NODE_ID !== undefined) {
+    node = env.PLENARY_NODE_ID;
+    if (!NODE_ID.test(node)) throw new Error("PLENARY_NODE_ID must be 1-32 characters of a-z, 0-9 and -");
+  } else node = defaultNodeId(host);
+  let roles = { gateway: true, host: true };
+  if (env.PLENARY_ROLES !== undefined) {
+    const names = String(env.PLENARY_ROLES).split(",").map(r => r.trim().toLowerCase());
+    if (names.some(r => !r)) throw new Error("PLENARY_ROLES has an empty name: use a comma list of gateway, host");
+    const bad = names.find(r => !ROLE_NAMES.includes(r));
+    if (bad !== undefined) throw new Error(`PLENARY_ROLES names an unknown role "${bad.slice(0, 20)}": use gateway, host`);
+    if (new Set(names).size !== names.length) throw new Error("PLENARY_ROLES names a role twice");
+    roles = { gateway: names.includes("gateway"), host: names.includes("host") };
+    if (!cluster && !(roles.gateway && roles.host)) throw new Error("PLENARY_ROLES on a single node (no DATABASE_URL or NATS_URL) must be both gateway and host");
+  }
+  let leaseTtlMs = 10_000;
+  if (env.PLENARY_LEASE_TTL_MS !== undefined) {
+    const raw = String(env.PLENARY_LEASE_TTL_MS).trim();
+    leaseTtlMs = /^\d+$/.test(raw) ? Number(raw) : NaN;
+    try { checkLeaseTtl(leaseTtlMs); }
+    catch (err) { throw new Error(`PLENARY_LEASE_TTL_MS: ${err instanceof RangeError ? err.message.replace("leaseTtlMs", "the lease ttl") : "invalid"}`); }
+  }
+  return { cluster, node, roles, leaseTtlMs };
+}
+
+/** Text with every secret part of the given URLs (the whole URL, user:password, the password) replaced by "***". */
+export function redact(text, urls) {
+  let out = String(text ?? "");
+  const parts = [];
+  for (const u of urls) {
+    if (!u) continue;
+    parts.push(u);
+    try {
+      const p = new URL(u);
+      if (p.password) { parts.push(p.password); try { parts.push(decodeURIComponent(p.password)); } catch { /* raw is enough */ } }
+      if (p.username && p.password) parts.push(`${p.username}:${p.password}`);
+    } catch { /* not a URL: the whole value is still replaced */ }
+  }
+  for (const s of parts.filter(Boolean).sort((a, b) => b.length - a.length)) out = out.split(s).join("***");
+  return out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]*@/gi, "$1***@");
+}
 
 /**
  * The Registry with every change to who may use a board, except a share-link use, announced on the board's `grants`
@@ -98,8 +181,12 @@ export function announcingRegistry(registry, bus, log) {
 }
 
 /** @param {Record<string, string|undefined>} env @param {{ fetch?: typeof fetch }} [deps] tests pass a stub fetch for Google */
-export async function start(env = {}, { fetch: fetchFn = globalThis.fetch } = {}) {
-  const log = createLogger({ level: env.LOG_LEVEL || "info" });
+export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write, hostname, adapters } = {}) {
+  // write: tests capture log lines; hostname: tests fix the default node id; adapters: tests replace the cluster
+  // adapter factories ({ postgresStore?, postgresRegistry?, natsBus? }) with fakes.
+  const log = createLogger({ level: env.LOG_LEVEL || "info", ...(write ? { write } : {}) });
+  // Every refusal of the cluster env comes before anything is created, connected or listening.
+  const { cluster, node, roles, leaseTtlMs } = nodeConfig(env, hostname ?? osHostname());
   const dataDir = env.PLENARY_DATA_DIR || "./data";
   mkdirSync(dataDir, { recursive: true });
 
@@ -111,7 +198,6 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch } = {}
 
   // Keys. In cluster mode every node must share them, so a missing one refuses the start; on one node a random
   // key per process works (sign-ins and sessions then don't survive a restart).
-  const cluster = !!(env.DATABASE_URL || env.NATS_URL);
   let cookieKey = env.COOKIE_KEY;
   if (cookieKey !== undefined && !keyOk(cookieKey)) throw new Error(`COOKIE_KEY must be at least ${KEY_MIN} bytes`);
   if (cookieKey === undefined) {
@@ -124,10 +210,13 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch } = {}
   const redirectUri = env.OIDC_REDIRECT_URI || "http://localhost:8080/auth/callback";
   const origin = env.PUBLIC_URL ? new URL(env.PUBLIC_URL).origin : new URL(redirectUri).origin;
 
-  const store = sqliteStore({ path: join(dataDir, "plenary.db") });
-  const bus = memoryBus({ onError: (err, subject) => log.error("bus subscriber failed", { subject, err }) });
+  log.info("node", { node, roles, cluster, leaseTtlMs });
+  const { store, bus, rawRegistry } = cluster ? await openCluster(env, node, log, adapters) : {
+    store: sqliteStore({ path: join(dataDir, "plenary.db") }),
+    bus: memoryBus({ onError: (err, subject) => log.error("bus subscriber failed", { subject, err }) }),
+    rawRegistry: sqliteRegistry({ path: join(dataDir, "registry.db") }),
+  };
   const blobs = diskBlobs({ dir: join(dataDir, "blobs") });
-  const rawRegistry = sqliteRegistry({ path: join(dataDir, "registry.db") });
   const registry = announcingRegistry(rawRegistry, bus, log);
   const dev = devAuth(tokens ? { enabled: true, tokens } : undefined);
   const sessions = await makeSessions({ key: sessionKey });
@@ -141,7 +230,8 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch } = {}
   log.info("sign-in", { google: !!oidc, devTokens: dev.enabled, cluster });
 
   let devBoard = null;
-  if (dev.enabled) {
+  if (dev.enabled && !roles.gateway) log.info("dev tokens are set but this node has no gateway: no dev board here");
+  else if (dev.enabled) {
     // Reuse the dev board across restarts (the Registry has no list call to find it by).
     const devFile = join(dataDir, "dev-board.json");
     let saved = null;
@@ -196,9 +286,35 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch } = {}
     boardUrl: env.BOARD_URL || `${origin}/?board={board}`,
     publicUrl: origin,
   };
-  const http = httpRoutes({ registry, sessions, oidc, tenancy, now: Date.now, config, ...(dev.enabled ? { dev } : {}) });
-  const server = createServer({ auth, registry, store, bus, blobs, log, limits, http, port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1" });
-  return { server, store, bus, registry, log, devBoard, oidc, async stop() { await server.stop(); await bus.close(); await store.close(); await rawRegistry.close(); } };
+  const http = httpRoutes({ registry, sessions, oidc, tenancy, now: Date.now, config, log: log.child({ component: "auth" }), ...(dev.enabled ? { dev } : {}) });
+  const server = createServer({ auth, registry, store, bus, blobs, log, limits, http, port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
+    roles, node, host: { hostname: node, leaseTtlMs } });
+  return { server, store, bus, registry, log, devBoard, oidc, node, roles, cluster, leaseTtlMs,
+    async stop() { await server.stop(); await bus.close(); await store.close(); await rawRegistry.close(); } };
+}
+
+/**
+ * The cluster adapters: Postgres store and registry (DATABASE_URL), NATS bus (NATS_URL, named after the node).
+ * A failure closes what already opened and throws an Error naming the variable, with every URL part redacted.
+ */
+async function openCluster(env, node, log, adapters = {}) {
+  const make = { postgresStore, postgresRegistry, natsBus, ...adapters };
+  const urls = [env.DATABASE_URL, env.NATS_URL];
+  const opened = [];
+  const open = async (what, name, fn) => {
+    try { const x = await fn(); opened.push(x); return x; }
+    catch (err) {
+      for (const x of opened.reverse()) await Promise.resolve().then(() => x.close()).catch(() => {});
+      const code = typeof err?.code === "string" ? ` [${redact(err.code, urls).slice(0, 40)}]` : "";
+      throw new Error(`could not open the ${what} (${name})${code}: ${redact(err?.message ?? String(err), urls).slice(0, 500)}`);
+    }
+  };
+  const store = await open("Postgres store", "DATABASE_URL", () => make.postgresStore({ url: env.DATABASE_URL }));
+  const rawRegistry = await open("Postgres registry", "DATABASE_URL", () => make.postgresRegistry({ url: env.DATABASE_URL }));
+  const bus = await open("NATS bus", "NATS_URL", () => make.natsBus({ url: env.NATS_URL, name: node,
+    onError: (err, subject) => log.error("bus error", { subject, err: redact(err?.message ?? String(err), urls).slice(0, 500), code: typeof err?.code === "string" ? err.code : undefined }) }));
+  log.info("cluster adapters open", { store: "postgres", registry: "postgres", bus: "nats" });
+  return { store, bus, rawRegistry };
 }
 
 if (import.meta.main) {
@@ -207,7 +323,10 @@ if (import.meta.main) {
   // Handlers catch their own errors; these are the last line, so one bug never takes every board down with it.
   process.on("uncaughtException", err => log.error("uncaught exception", { err }));
   process.on("unhandledRejection", err => log.error("unhandled rejection", { err }));
-  const app = await start(env);
+  let app;
+  // A refused start (bad env, an adapter that won't open) prints its message and exits non-zero, before listening.
+  try { app = await start(env); }
+  catch (err) { log.error("start refused", { message: redact(err?.message ?? String(err), [env.DATABASE_URL, env.NATS_URL]) }); process.exit(1); }
   let stopping = false;
   for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, async () => {
     if (stopping) return; stopping = true;

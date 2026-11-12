@@ -511,3 +511,29 @@ test("L7: past 1,000 held hellos on a watched board, the extra ones are answered
     await until(() => g.got.filter(m => m.close === 1013).length === 1_005, "the held ones at the silence", 6_000);
   } finally { await Bh.close(); await raw.close(); await bus.close(); }
 }, 15000);
+
+test("R2-L1: `welcomed` shrinks with `conns` (close notices, a listing, the sweep); a lost lease still tells only welcomed live connections", async () => {
+  const bus = memoryBus(), st = stallable(sqliteStore({ path: join(tempDir(), "plenary.db") }));
+  const host = roomHost({ store: st.store, bus, leaseTtlMs: 900, sweepMs: 50 });
+  const g = fakeGateway(bus);
+  try {
+    await host.open(T, B);
+    const conns = Array.from({ length: 2000 }, (_, i) => `c-${i}`);
+    for (const c of conns) g.hello(c, "k" + c);
+    await until(() => new Set(g.got.filter(m => m.msg?.t === "welcome").map(m => m.conn)).size === 2000, "2,000 welcomes", 20000);
+    // 1,000 close notices, then a listing that names only 500 of the other 1,000 (the rest are closed by it).
+    for (const c of conns.slice(0, 1000)) await bus.publish(subjects.inbox(T, B), { n: 2, conn: c, gateway: "g-1", closed: true });
+    const live = conns.slice(1000, 1500);
+    await bus.publish(subjects.inbox(T, B), { gateway: "g-1", conns: live });
+    await host.idle(T, B);
+    await sleep(120);   // a sweep or two
+    const p = await host.peek(T, B);
+    expect([p.conns, p.welcomed]).toEqual([500, 500]);
+    // The lease is lost: 1013 goes to exactly the 500 welcomed live connections, nobody else.
+    const before = g.got.length;
+    st.renew = "null";
+    await until(() => g.got.slice(before).filter(m => m.close === 1013).length >= 500, "the 1013s", 5000);
+    await sleep(100);
+    expect(g.got.slice(before).filter(m => m.close === 1013).map(m => m.conn).sort()).toEqual([...live].sort());
+  } finally { await host.close(); }
+}, 40000);

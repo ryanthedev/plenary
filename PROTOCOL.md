@@ -757,6 +757,13 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   close notice as `{ n, conn, gateway, closed: true }`; and, every 5 s, `{ gateway, conns: [conn…] }` listing that
   gateway's open writer connections on the board (rule 6). A lost close notice is repaired by the next list; a
   lost reply by rule 2's or rule 12's timeout.
+- **Remote open** (a gateway-only node; no tenant or board in the subject): `plen-hosts.open` carries
+  `{ tenant, board, gateway, n }` to every room host, which opens the board itself (takes the lease or watches the
+  holder) and only then answers `{ n, board, state: "held" | "watching" }` on `plen-hosts.opened.<requester>`. The
+  gateway forwards the writer's hello on the first `held`; a `watching` answer starts a grace of
+  min(1000 ms, ttl / 4), after which it forwards anyway. No answer within the lease ttl: the hello is answered
+  `unavailable`. Nothing is cached: every writer hello asks again. So a cluster with a gateway-only node needs at least
+  one host node.
 - **Message size: 2 MB cap.** A deployment's bus must carry 2 MB messages (NATS: raise `max_payload`; headers
   count toward it). What travels:
   - **Never on the bus:** catch-up and snapshots. The gateway reads them from the Store (or its cached tail) and

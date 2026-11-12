@@ -58,6 +58,12 @@ export function splitEntries(entries, items, maxBytes) {
 /** The longest lease ttl the Store takes (§ Store: a positive integer up to 10 min). */
 const MAX_TTL_MS = 10 * 60_000;
 
+/** Throws RangeError unless `ms` is a lease ttl the room host takes (an integer from 3 ms to 10 min). Returns it. */
+export function checkLeaseTtl(ms) {
+  if (!Number.isSafeInteger(ms) || ms < 3 || ms > MAX_TTL_MS) throw new RangeError(`leaseTtlMs must be an integer from 3 to ${MAX_TTL_MS}`);
+  return ms;
+}
+
 /**
  * A holder id for one room-host instance: `<host>-<pid>-<random>`. Unique per instance (two in one process differ by
  * the random part), and an id the Store accepts ([a-z0-9-], at most 64 chars), so ":" can't be the separator.
@@ -87,7 +93,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   //   its size), the host checkpoints once that log reaches this many chars AND half the state's size, so a board
   //   rewritten in a few huge ops still gets a bounded catch-up, and a rewrite never costs more than 2× the log.
   //   (An extension of § Recovery "When": a byte trigger, asked for since the scaffold; see the p2-swap report.)
-  if (!Number.isSafeInteger(leaseTtlMs) || leaseTtlMs < 3 || leaseTtlMs > MAX_TTL_MS) throw new RangeError(`leaseTtlMs must be an integer from 3 to ${MAX_TTL_MS}`);
+  checkLeaseTtl(leaseTtlMs);
   const perf = monotonic;   // the lease's clock: elapsed time on this host only (tests fake a stall with it)
   const me = holder ?? newHolder(hostname);
   const renewEvery = Math.floor(leaseTtlMs / 3);
@@ -105,6 +111,8 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   /** key → the latest slot whose lease this host acquired (close() releases them) */
   const held = new Map();
   /** key → a board held by another host, watched for a takeover */
+  /** A connection leaves the slot: out of `conns` and out of `welcomed` together (R2-L1: the set only grew). */
+  const drop = (slot, ck) => { slot.conns.delete(ck); slot.welcomed.delete(ck); };
   /** The host deadline has passed: this slot can't know it still holds the lease (HIGH-1). By performance.now(). */
   const expired = slot => perf() >= slot.okAt + leaseTtlMs - renewEvery;
   const watches = new Map();
@@ -435,7 +443,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     // A lost lease tells only the connections this slot welcomed (HIGH-1): any other hello on the board is the new
     // holder's or a watcher's to answer.
     for (const [ck, c] of slot.conns) if (!slot.leaseLost || slot.welcomed.has(ck)) reply(c.gateway, c.id, UNAVAILABLE, 1013);
-    slot.conns.clear();
+    slot.conns.clear(); slot.welcomed.clear();
   }
 
   /** A Room connection whose replies go to its gateway; only welcome/ack/error travel (catch-up is the gateway's). */
@@ -449,7 +457,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       if (msg.t === "welcome") slot.welcomed.add(ck);
       const end = msg.t === "error" && msg.code === "unavailable";   // every unavailable ends the connection
       reply(gateway, conn, codec.encode(msg), end ? 1013 : undefined);
-      if (end) { slot.conns.delete(ck); slot.welcomed.delete(ck); if (!c.closed) slot.room.disconnect(c); }
+      if (end) { drop(slot, ck); if (!c.closed) slot.room.disconnect(c); }
     }, { gateway, id: conn });
     slot.conns.set(ck, c);
     return c;
@@ -466,14 +474,14 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     // Every 5 s, a gateway's open writer connections on this board: the rest are closed (a lost close notice).
     if (Array.isArray(m.conns)) {
       room.listed(m.gateway, m.conns);
-      for (const [ck, c] of slot.conns) if (c.closed) slot.conns.delete(ck);
+      for (const [ck, c] of slot.conns) if (c.closed) drop(slot, ck);
       return;
     }
     if (typeof m.conn !== "string") return;
     const ck = `${m.gateway}/${m.conn}`;
     if (slot.dead) { if (!m.closed) reply(m.gateway, m.conn, UNAVAILABLE, 1013); return; }
     let c = slot.conns.get(ck);
-    if (m.closed) { if (c) { room.disconnect(c); slot.conns.delete(ck); } return; }
+    if (m.closed) { if (c) { room.disconnect(c); drop(slot, ck); } return; }
     const msg = m.msg;
     if (!msg || typeof msg !== "object") return;
     if (!c && msg.t === "hello") c = connect(slot, m.gateway, m.conn);
@@ -493,18 +501,18 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       // Nothing was accepted: only the sender hears. The message counts as received (rule 6), so the connection's
       // next one is no gap. A hello that blew up leaves no half-open connection.
       if (Number.isSafeInteger(m.n) && Number.isSafeInteger(c.n) && m.n > c.n) c.n = m.n;
-      if (isHello) { room.disconnect(c); slot.conns.delete(ck); return reply(m.gateway, m.conn, UNAVAILABLE, 1013); }
+      if (isHello) { room.disconnect(c); drop(slot, ck); return reply(m.gateway, m.conn, UNAVAILABLE, 1013); }
       return reply(m.gateway, m.conn, codec.encode({ t: "error", ...(typeof msg.id === "string" ? { id: msg.id.slice(0, 256) } : {}), code: "bad-op", message: "that message could not be handled" }));
     }
     // A refused hello (version, board, client id): the Room dropped it; the gateway closes the socket after the error.
-    if (isHello && c.closed && slot.conns.get(ck) === c) { slot.conns.delete(ck); reply(m.gateway, m.conn, undefined, 1008); }
+    if (isHello && c.closed && slot.conns.get(ck) === c) { drop(slot, ck); reply(m.gateway, m.conn, undefined, 1008); }
   }
 
   const sweep = setInterval(() => {
     for (const p of slots.values()) p.then(slot => {
       if (slot.dead) return;
       try { slot.room.sweep(); } catch (err) { log.error("room sweep failed", { board: slot.board, err }); }
-      for (const [ck, c] of slot.conns) if (c.closed) slot.conns.delete(ck);
+      for (const [ck, c] of slot.conns) if (c.closed) drop(slot, ck);
     }, () => {});
   }, sweepMs);
   sweep.unref?.();
@@ -524,17 +532,21 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     /**
      * Make sure this board is served: its room running here under the board's Store lease (built from the Store and
      * listening on its inbox), or, when another host holds the lease live, resolves with no room here (that host
-     * serves the inbox over the bus) and watches the board for a takeover.
+     * serves the inbox over the bus) and watches the board for a takeover. Resolves "held" (the room runs here,
+     * listening on its inbox) or "watching" (another host holds the lease).
+     * @returns {Promise<"held"|"watching">}
      */
     async open(tenant, board) {
       if (closed) throw closedError();
       const key = `${tenant}/${board}`;
       const p = slots.get(key);
-      if (p) { await p; return; }
+      if (p) { await p; return "held"; }
       const w = watches.get(key);
-      if (w) { w.wanted = perf(); return; }
+      if (w) { w.wanted = perf(); return "watching"; }
       const r = await claimOnce(tenant, board, key);
-      if (r?.held !== undefined) watch(tenant, board, key, r.held);
+      if (r?.held === undefined) return "held";
+      watch(tenant, board, key, r.held);
+      return "watching";
     },
     /** Resolves when the board's bus traffic is delivered and its room has nothing in flight (tests, shutdown). */
     async idle(tenant, board) {
@@ -549,7 +561,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     /** The running room for a board, or null (tests and /health only). */
     async peek(tenant, board) {
       const slot = await slots.get(`${tenant}/${board}`)?.catch(() => null);
-      return slot ? { room: slot.room, epoch: slot.epoch, durable: slot.durable, conns: slot.conns.size, tailBytes: slot.room.status().tailChars } : null;
+      return slot ? { room: slot.room, epoch: slot.epoch, durable: slot.durable, conns: slot.conns.size, welcomed: slot.welcomed.size, tailBytes: slot.room.status().tailChars } : null;
     },
     /** rooms: built or being built here; waiting: boards held by another host and watched for a takeover. */
     stats: () => ({ rooms: slots.size, waiting: watches.size }),
@@ -581,6 +593,100 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
         } catch (err) { log.warn("lease release failed; it lapses within its ttl", { tenant: slot.tenant, board: slot.board, err }); }
       }
       held.clear(); slots.clear();
+    },
+  };
+}
+
+// ---- remote open (p4-wire): a gateway-only node asks the cluster's room hosts over the bus ----
+
+/**
+ * Every room host serves `subjects.open`: each request `{ tenant, board, gateway, n }` runs this host's own
+ * `open(tenant, board)` (idempotent: held, building or watched returns once settled; otherwise it acquires or starts
+ * watching), then replies `{ n, board, state }` on `subjects.opened(gateway)`. A reply goes only after the local open
+ * settled, so a "held" reply means the room already listens on the board's inbox. A local open that throws sends no
+ * reply (logged): the requester times out. Returns the unsubscribe.
+ * @param {{ bus: object, rooms: { open(tenant: string, board: string): Promise<string> }, log?: object }} o
+ */
+export function serveOpens({ bus, rooms, log = quietLogger }) {
+  return bus.subscribe(subjects.open, m => {
+    if (!m || typeof m !== "object") return;
+    const { tenant, board, gateway, n } = m;
+    let to;
+    try { subjects.entries(tenant, board); to = subjects.opened(gateway); } catch { return; }   // bad ids: nobody to serve
+    if (!Number.isSafeInteger(n)) return;
+    Promise.resolve().then(() => rooms.open(tenant, board)).then(
+      state => bus.publish(to, { n, board, state: state === "held" ? "held" : "watching" })?.catch?.(err => log.warn("open reply refused", { tenant, board, err })),
+      err => log.error("remote open failed here; no reply", { tenant, board, err }),
+    ).catch(err => log.error("remote open reply failed", { tenant, board, err }));
+  });
+}
+
+/**
+ * The `rooms` a gateway-only node hands its gateway (gateway.js needs `open(tenant, board)` only). `open` broadcasts
+ * on `subjects.open`. A "held" reply resolves it at once (that host's room already listens on the inbox). A
+ * "watching" reply starts a grace of min(1000, timeoutMs / 4) ms: a "held" reply within it still resolves at once,
+ * and at its end the open resolves "watching" (some host watches the board, so the hello's inbox path still works).
+ * Why wait: on a cold board the watcher usually answers before the winner has built its room, and a hello sent then
+ * is answered 1013 (or lost) instead of welcomed (p4-wire round 2). No reply at all rejects after `timeoutMs` (the
+ * gateway then answers the hello `unavailable`). Never cached: every writer hello asks again, because a replaced
+ * host has no room until someone asks. At most one request in flight per board; other opens share it.
+ * @param {{ bus: object, node: string, timeoutMs: number, log?: object }} o node: this node's id (the requester id is
+ *   `r-<node>-<random>`, unique per instance).
+ */
+export function remoteRooms({ bus, node, timeoutMs, log = quietLogger }) {
+  checkLeaseTtl(timeoutMs);
+  const rand = Array.from(crypto.getRandomValues(new Uint8Array(4)), b => b.toString(16).padStart(2, "0")).join("");
+  const me = `r-${String(node ?? "").toLowerCase().replace(/[^a-z0-9-]+/g, "-").slice(0, 32)}-${rand}`.replace(/-{2,}/g, "-");
+  /** key → { n, board, promise, resolve, reject, timer } */
+  const inflight = new Map();
+  /** n → key */
+  const byN = new Map();
+  let next = 0, closed = false;
+  const graceMs = Math.min(1000, Math.floor(timeoutMs / 4));
+  const settle = (key, err, state) => {
+    const r = inflight.get(key);
+    if (!r) return;
+    inflight.delete(key); byN.delete(r.n); clearTimeout(r.timer); clearTimeout(r.grace);
+    if (err) r.reject(err); else r.resolve(state);
+  };
+  const unsub = bus.subscribe(subjects.opened(me), m => {
+    const key = byN.get(m?.n);
+    if (key === undefined) return;   // late (timed out) or someone else's
+    const r = inflight.get(key);
+    if (r?.board !== m.board) return;
+    if (m.state === "held") return settle(key, null, "held");
+    if (r.grace) return;   // already waiting out the grace from an earlier "watching"
+    r.grace = setTimeout(() => settle(key, null, "watching"), graceMs);
+    r.grace.unref?.();
+  });
+  return {
+    requester: me,
+    open(tenant, board) {
+      if (closed) return Promise.reject(new PortError("closed", "the gateway is closed"));
+      const key = `${tenant}/${board}`;
+      const have = inflight.get(key);
+      if (have) return have.promise;
+      let msg;
+      try { subjects.entries(tenant, board); msg = { tenant, board, gateway: me, n: ++next }; }
+      catch (err) { return Promise.reject(err); }
+      const r = { n: msg.n, board };
+      r.promise = new Promise((res, rej) => { r.resolve = res; r.reject = rej; });
+      r.timer = setTimeout(() => settle(key, new PortError("unavailable", "no room host answered the open: is a host node running?")), timeoutMs);
+      r.timer.unref?.();
+      inflight.set(key, r); byN.set(r.n, key);
+      Promise.resolve().then(() => bus.publish(subjects.open, msg)).catch(err => {
+        log.warn("remote open publish failed", { tenant, board, err });
+        settle(key, err instanceof PortError ? err : new PortError("unavailable", "the open request could not be sent"));
+      });
+      return r.promise;
+    },
+    async idle() { await bus.flush(); },
+    async peek() { return null; },
+    graceMs,
+    stats: () => ({ rooms: 0, waiting: 0, opening: inflight.size }),
+    async close() {
+      closed = true; unsub();
+      for (const key of [...inflight.keys()]) settle(key, new PortError("closed", "the gateway is closed"));
     },
   };
 }

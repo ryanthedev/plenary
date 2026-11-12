@@ -101,8 +101,8 @@ test("main.js: without dev tokens every hello is refused (off by default), and a
 
 const WS = port => `ws://127.0.0.1:${port}/ws`;
 const devTokens = roles => JSON.stringify(Object.fromEntries(Object.entries(roles).map(([name, role]) => [`${TOKEN}-${name}`, { name, role }])));
-async function boot(dir, roles) {
-  const p = spawn({ PLENARY_DATA_DIR: dir, PLENARY_DEV_TOKENS: devTokens(roles) });
+async function boot(dir, roles, env = {}) {
+  const p = spawn({ PLENARY_DATA_DIR: dir, PLENARY_DEV_TOKENS: devTokens(roles), ...env });
   const { port } = await p.line("server listening");
   const { board, tenant } = await p.line("dev tokens are ON: not for production");
   return { p, port, board, tenant };
@@ -150,10 +150,11 @@ test("main.js started twice on one data dir: the same board, its acked ops, and 
   } finally { a.p.child.kill("SIGKILL"); b?.p.child.kill("SIGKILL"); }
 }, 30000);
 
-// A kill -9 leaves the dead process's room lease live for up to its ttl (room-host leaseTtlMs, 10 s by default): a
-// writer's hello in that window is answered `unavailable` (1013) or times out at the gateway, and the client retries,
-// as a real client does. Anything else is a failure, and so is no welcome within the ttl + 3 s.
-const LEASE_TTL_MS = 10_000;
+// A kill -9 leaves the dead process's room lease live for up to its ttl (PLENARY_LEASE_TTL_MS, passed to the child from
+// this one constant): a writer's hello in that window is answered `unavailable` (1013) or times out at the gateway,
+// and the client retries, as a real client does. Anything else is a failure, and so is no welcome within the ttl + 3 s.
+const LEASE_TTL_MS = 3_000;
+const leaseEnv = { PLENARY_LEASE_TTL_MS: String(LEASE_TTL_MS) };
 async function welcomedAfterRestart(port, board, name) {
   const end = Date.now() + LEASE_TTL_MS + 3_000;
   for (;;) {
@@ -170,7 +171,8 @@ async function welcomedAfterRestart(port, board, name) {
 
 test("kill -9 mid-stream, restart: every acked op is present, at its seq, once; resends land once", async () => {
   const dir = tempDir();
-  let cur = await boot(dir, { ann: "owner" });
+  let cur = await boot(dir, { ann: "owner" }, leaseEnv);
+  expect((await cur.p.line("node")).leaseTtlMs).toBe(LEASE_TTL_MS);   // the env var reached the room host's ttl
   const board = cur.board, acked = new Map();     // op id → seq, as acknowledged by any incarnation
   let counter = 0;
   const sent = [];
@@ -196,7 +198,7 @@ test("kill -9 mid-stream, restart: every acked op is present, at its seq, once; 
       await cur.p.child.exited; clearInterval(pump);
       await s.whenClosed(); record();
       expect(sent.length).toBeGreaterThan(acked.size);                   // some ops really were cut off unacked
-      cur = await boot(dir, { ann: "owner" });
+      cur = await boot(dir, { ann: "owner" }, leaseEnv);
       expect(cur.board).toBe(board);
     }
     // After the last restart: resend once more (every unacked op and the sample), then read the whole board back.
@@ -223,7 +225,7 @@ test("kill -9 mid-stream, restart: every acked op is present, at its seq, once; 
     expect(acked.size).toBeGreaterThanOrEqual(450);                                       // true by construction (150 a round)
     for (const [id, at] of acked) expect([id, seqOf.get(id)]).toEqual([id, at]);          // every acked op, at its acked seq
   } finally { cur.p.child.kill("SIGKILL"); }
-}, 150000);   // up to three lease waits (ttl + 3 s each) on top of the run
+}, 90000);   // up to three lease waits (ttl + 3 s each) on top of the run
 
 test("main.js: PLENARY_MAX_CONNS_PER_USER sets the per-user connection cap", async () => {
   const p = spawn({ PLENARY_DATA_DIR: tempDir(), PLENARY_DEV_TOKENS: devTokens({ ann: "editor" }), PLENARY_MAX_CONNS_PER_USER: "2" });
@@ -311,3 +313,140 @@ test("revocation: a grant change through the Registry closes a connection that l
     expect(t2.msgs.at(-1)).toMatchObject({ t: "error", code: "unavailable" });
   } finally { await app.stop(); }
 });
+
+// ---- p4-wire: the cluster env (no Postgres or NATS needed: every case here is refused or single node) ----
+import { nodeConfig, defaultNodeId, redact } from "../../server/main.js";
+
+const PW = "hunter2-FAKE-pw";
+const PG = `postgres://plen:${PW}@127.0.0.1:1/plenary`, NATS = `nats://plen:${PW}@127.0.0.1:1`;
+const KEY = { COOKIE_KEY: "k".repeat(32) };
+
+/** start(env) that must be refused: the error and every log line, both free of the fake password. */
+const refused = (env, pattern) => refusedWith(env, {}, pattern);
+async function refusedWith(env, deps, pattern) {
+  const lines = [];
+  let err = null;
+  try { const app = await start({ ...devEnv(tempDir()), LOG_LEVEL: "debug", ...env }, { write: l => lines.push(l), ...deps }); await app.stop(); }
+  catch (e) { err = e; }
+  expect(err).not.toBe(null);
+  expect(err.message).toMatch(pattern);
+  for (const text of [err.message, String(err), err.stack ?? "", JSON.stringify(err.cause ?? null), ...lines]) {
+    expect(text).not.toContain(PW);
+    expect(text).not.toContain("127.0.0.1:1/plenary");
+  }
+  return { err, lines };
+}
+
+test("p4-wire: one cluster URL without the other refuses the start, naming the missing one, never the URL's value", async () => {
+  await refused({ DATABASE_URL: PG, ...KEY }, /^NATS_URL is required in cluster mode/);
+  await refused({ NATS_URL: NATS, ...KEY }, /^DATABASE_URL is required in cluster mode/);
+  await refused({ DATABASE_URL: PG }, /NATS_URL/);                 // before COOKIE_KEY's own refusal
+});
+
+test("p4-wire: both URLs set but unreachable: the adapter's error names the variable and carries no URL part", async () => {
+  const { err } = await refused({ DATABASE_URL: PG, NATS_URL: NATS, ...KEY }, /^could not open the Postgres (store|registry) \(DATABASE_URL\)/);
+  expect(err.message).not.toContain("plen:");
+});
+
+/** Fake cluster adapters whose errors quote the full URL (password included), as a careless driver might. */
+function leakyAdapters({ failPg = false } = {}) {
+  const closed = [];
+  const fake = name => ({ close: async () => { closed.push(name); } });
+  return {
+    closed,
+    adapters: {
+      async postgresStore({ url }) { if (failPg) throw Object.assign(new Error(`connect failed to ${url} (password ${PW})`), { code: `E_${PW}` }); return fake("store"); },
+      async postgresRegistry() { return fake("registry"); },
+      async natsBus({ url, onError }) {
+        onError(new Error(`stale connection to ${url}`), "");   // a bus error line, logged before the open fails
+        throw new Error(`could not connect to ${url}: auth for user plen with ${PW} refused; servers: ${new URL(url).host}`);
+      },
+    },
+  };
+}
+
+test("p4-wire: a NATS open failure after Postgres opened: the error names NATS_URL, both Postgres halves are closed, no URL part anywhere", async () => {
+  const { adapters, closed } = leakyAdapters();
+  const { err, lines } = await refusedWith({ DATABASE_URL: PG, NATS_URL: NATS, ...KEY }, { adapters }, /^could not open the NATS bus \(NATS_URL\): could not connect to \*\*\*/);
+  expect(closed.sort()).toEqual(["registry", "store"]);
+  expect(err.message).not.toContain("plen:");
+  const busLine = lines.map(l => JSON.parse(l)).find(l => l.msg === "bus error");
+  expect(busLine?.err).toBe("stale connection to ***");
+});
+
+test("p4-wire: a Postgres open failure quoting its URL is redacted (message and code); nothing else was opened", async () => {
+  const { adapters, closed } = leakyAdapters({ failPg: true });
+  const { err } = await refusedWith({ DATABASE_URL: PG, NATS_URL: NATS, ...KEY }, { adapters }, /^could not open the Postgres store \(DATABASE_URL\) \[E_\*\*\*\]: connect failed to \*\*\* \(password \*\*\*\)$/);
+  expect(closed).toEqual([]);
+  expect(err.message).not.toContain("127.0.0.1:1");
+});
+
+test("p4-wire: PLENARY_NODE_ID: [a-z0-9-], 1-32, else refused; the default is the hostname made safe, never refused", async () => {
+  for (const bad of ["", "App-1", "a_b", "a.b", "x".repeat(33), "ä"]) await refused({ PLENARY_NODE_ID: bad }, /^PLENARY_NODE_ID/);
+  expect(nodeConfig({ PLENARY_NODE_ID: "app-1" }).node).toBe("app-1");
+  expect(nodeConfig({ PLENARY_NODE_ID: "x".repeat(32) }).node).toBe("x".repeat(32));
+  expect(defaultNodeId("Ryans-MacBook.local")).toBe("ryans-macbook-local");
+  const long = defaultNodeId("Some.Very.Long_Host-Name.example.internal.corp");
+  expect(long).toMatch(/^[a-z0-9-]{1,32}$/);
+  expect(long.length).toBe(32);
+  expect(defaultNodeId("")).toBe("node");
+  expect(nodeConfig({}, "Host.Example").node).toBe("host-example");
+  // The node id is logged at start and names the room host's lease holder.
+  const lines = [];
+  const app = await start(devEnv(tempDir(), { LOG_LEVEL: "info", PLENARY_NODE_ID: "app-9" }), { write: l => lines.push(l) });
+  try {
+    expect(lines.map(l => JSON.parse(l)).find(l => l.msg === "node")).toMatchObject({ node: "app-9", roles: { gateway: true, host: true }, cluster: false, leaseTtlMs: 10000 });
+    expect(app.server.rooms.holder).toMatch(new RegExp(`^app-9-${process.pid}-[0-9a-f]+$`));
+  } finally { await app.stop(); }
+});
+
+test("p4-wire: PLENARY_ROLES: comma list, trimmed, any case; empty, unknown or repeated refused; a single node only takes both", async () => {
+  expect(nodeConfig({ DATABASE_URL: PG, NATS_URL: NATS, PLENARY_ROLES: " Gateway " }).roles).toEqual({ gateway: true, host: false });
+  expect(nodeConfig({ DATABASE_URL: PG, NATS_URL: NATS, PLENARY_ROLES: "host" }).roles).toEqual({ gateway: false, host: true });
+  expect(nodeConfig({ DATABASE_URL: PG, NATS_URL: NATS, PLENARY_ROLES: "HOST, gateway" }).roles).toEqual({ gateway: true, host: true });
+  expect(nodeConfig({}).roles).toEqual({ gateway: true, host: true });
+  expect(nodeConfig({ PLENARY_ROLES: "gateway,host" }).roles).toEqual({ gateway: true, host: true });
+  for (const bad of ["", " ", "gateway,", ",host", "gateway,,host", "relay", "gateway,gateway", "host, HOST"])
+    await refused({ DATABASE_URL: PG, NATS_URL: NATS, ...KEY, PLENARY_ROLES: bad }, /^PLENARY_ROLES/);
+  for (const one of ["gateway", "host"]) await refused({ PLENARY_ROLES: one }, /^PLENARY_ROLES on a single node/);
+});
+
+test("p4-wire: PLENARY_LEASE_TTL_MS: an integer in room-host's range, else refused naming the variable; default 10000", async () => {
+  expect(nodeConfig({}).leaseTtlMs).toBe(10000);
+  expect(nodeConfig({ PLENARY_LEASE_TTL_MS: "3000" }).leaseTtlMs).toBe(3000);
+  expect(nodeConfig({ PLENARY_LEASE_TTL_MS: "600000" }).leaseTtlMs).toBe(600000);
+  for (const bad of ["", "2", "0", "-5", "1.5", "10s", "600001", "1e4", "abc"]) await refused({ PLENARY_LEASE_TTL_MS: bad }, /^PLENARY_LEASE_TTL_MS/);
+});
+
+test("p4-wire: redact() removes the URL, user:password and the password, raw or decoded, and any userinfo", () => {
+  const u = "postgres://me:p%40ss-FAKE@db:5432/x";
+  const out = redact(`a ${u} b me:p%40ss-FAKE c p@ss-FAKE d nats://other:zz@h:1`, [u]);
+  for (const bit of ["p%40ss-FAKE", "p@ss-FAKE", "zz@"]) expect(out).not.toContain(bit);
+});
+
+test("p4-wire: the auth routes log through the server's logger (component auth, LOG_LEVEL honoured), not their own stdout line", async () => {
+  const google = { GOOGLE_CLIENT_ID: "fake-id.apps.example", GOOGLE_CLIENT_SECRET: "fake-secret", ...KEY };
+  for (const [level, expectLine] of [["info", true], ["error", false]]) {
+    const lines = [];
+    const app = await start(devEnv(tempDir(), { ...google, LOG_LEVEL: level }), { write: l => lines.push(l), fetch: async () => new Response("{}", { status: 500 }) });
+    try {
+      const res = await fetch(app.server.url + "/auth/callback?state=x&code=y", { redirect: "manual" });
+      expect(res.status).toBe(400);
+      const got = lines.map(l => JSON.parse(l)).filter(l => l.msg === "sign-in failed");
+      if (expectLine) expect(got).toEqual([expect.objectContaining({ component: "auth", level: "warn", cause: "no_login_cookie" })]);
+      else expect(got).toEqual([]);
+    } finally { await app.stop(); }
+  }
+});
+
+test("p4-wire: on the CLI a refused start prints its message (no URL value) and exits non-zero before listening", async () => {
+  for (const env of [{ DATABASE_URL: PG, COOKIE_KEY: "k".repeat(32) }, { PLENARY_ROLES: "nope" }, { PLENARY_LEASE_TTL_MS: "1" }]) {
+    const p = spawn({ PLENARY_DATA_DIR: tempDir(), ...env });
+    const code = await p.child.exited;
+    expect(code).not.toBe(0);
+    const all = p.out.text + p.out.err;
+    expect(p.lines().map(l => JSON.parse(l)).find(l => l.msg === "start refused")?.message).toMatch(/NATS_URL|PLENARY_ROLES|PLENARY_LEASE_TTL_MS/);
+    expect(all).not.toContain(PW);
+    expect(all).not.toContain("server listening");
+  }
+}, 20000);

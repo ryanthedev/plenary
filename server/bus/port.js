@@ -42,4 +42,8 @@ export const subjects = {
   grants: (tenant, board) => `plen.${needId(tenant, "tenant")}.${needId(board, "board")}.grants`,
   /** Room → gateway: { conn, data, close? } (welcome, ack, error only). SEAM(p4): § Bus names it per board, `plen.<tenant>.<board>.gw.<gateway>`. */
   gateway: gateway => `plen-gw.${needId(gateway, "gateway")}`,
+  /** Gateway-only node → every room host: { tenant, board, gateway, n } "make sure this board is served" (p4-wire). */
+  open: "plen-hosts.open",
+  /** Room host → the requester that asked: { n, board, state: "held" | "watching" }, after its local open settled. */
+  opened: requester => `plen-hosts.opened.${needId(requester, "requester")}`,
 };

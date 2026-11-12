@@ -39,12 +39,12 @@ const UNIQUE = "23505";
  * up first and creates only what is missing. An operator may run that as the owner role ahead of time
  * (`plenary migrate` is phase 4's).
  */
-export const STORE_TABLES = {
+export const STORE_TABLES = Object.freeze({
   pl_entries: "tenant TEXT NOT NULL, board TEXT NOT NULL, seq BIGINT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq)",
   pl_checkpoints: "tenant TEXT NOT NULL, board TEXT NOT NULL, seq BIGINT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq)",
   // The board's lease record: its epoch now (§ Recovery, Room identity); phase 4 adds the holder and expiry.
   pl_leases: "tenant TEXT NOT NULL, board TEXT NOT NULL, epoch BIGINT NOT NULL, PRIMARY KEY (tenant, board)",
-};
+});
 
 /**
  * @param {{ url?: string, sql?: import("bun").SQL, max?: number, schema?: string, keepCheckpoints?: number }} o

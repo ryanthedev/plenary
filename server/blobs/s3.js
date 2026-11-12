@@ -24,7 +24,7 @@
 // SEAM(p3): the per-tenant quota (§ Limits) is not enforced here, as in disk.js.
 
 import { needId, isSha1, PortError } from "../ids.js";
-import { checkBlob, imageKind, MAX_BLOB_BYTES } from "./disk.js";
+import { checkBlob, imageKind, MAX_BLOB_BYTES } from "./port.js";
 
 export { MAX_BLOB_BYTES };
 

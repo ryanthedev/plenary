@@ -191,3 +191,105 @@ Postgres PID 66087 stopped with `pg_ctl stop` on its own data dir (checked: proc
 stopped pgdata were NOT deleted: `rm -rf` was refused by a permission rule. They sit only in this session's private
 scratchpad (/private/tmp/claude-501/-Users-r-repos-plenary/d173e83a-a248-4e83-ac8d-31e428f3bf47/scratchpad: pgdata,
 case, tree, review, bin), nothing in the repo.
+
+---
+
+# Round 2 (2026-11-12): t1fx's follow-up on 44dd1aa
+
+Scope: `git diff 44dd1aa -- test/arch-scan.js test/architecture.test.js server/blobs server/store/postgres.js` plus
+untracked server/blobs/port.js, all uncommitted. I changed nothing in the tree but this report. Plants ran in a fresh
+scratch copy per case (packages/, server/, scripts/, test/arch-scan.js, test/architecture.test.js; that copy also
+held the untracked server/static.js and scripts/admin-bootstrap.js from other sessions).
+
+## Verdict: PASS (no HIGH). M1, M2, M3 FIXED (checked by plant, below). 0 MEDIUM, 4 LOW new.
+
+## Re-plants (scratch, `bun test test/architecture.test.js`; baseline copy green)
+
+| Plant | Round 1 | Round 2 |
+|---|---|---|
+| M1 `server/gateway.js`: `import { x } from "./main.js"` | missed | caught, `imports-root` |
+| M1 gateway imports `../scripts/dev-google.js`; `bus/nats.js` imports `../main.js` | missed | caught |
+| M2 `/* hot path */ import { a } from "./store/sqlite.js";` | missed | caught, `core->adapter` |
+| M2 the same with `require`; `b */ import …` closing a multi-line comment | missed | caught |
+| M3 `import { SQL } from "bun"` in gateway; `node:fs` in feed.js; `@nats-io/…` in bus/port.js; `import("@nats-io/…")`, `require("bun:sqlite")` in room-host | missed | caught, `core->package` |
+| M3 new `packages/natsbus/bus.js`; new top-level `server/redis-cache.js` | missed | caught (unclassified, and the sub-folder test for packages/) |
+| Q3 `store/sqlite.js` -> `../gateway.js`; `bus/nats.js` -> `../room-host.js`; `blobs/disk.js` -> `../auth/tenancy.js`; `auth/oidc.js` -> `../admin/boards.js`; `pg/schema.js` -> `../feed.js` | missed | caught, `adapter->core` |
+| driving `auth/http.js` -> `../gateway.js` | n/a | passes, as decided (DRIVING may import core) |
+| driving `server.js` -> `./store/sqlite.js` | n/a | caught, `adapter->adapter` |
+| `blobs/s3.js` -> `./disk.js` (allowlist now empty) | allowlisted | caught, `adapter->adapter` |
+| `scripts/x.ts`, `deploy/x.js` wiring an adapter (L2) | missed | caught, `wiring` |
+| harmless new `scripts/seed.js` (L3) | fails | fails, now documented as on purpose |
+
+## New findings (all LOW)
+
+**R2-L1: the M2 fix opens a narrow new miss (a regression against 44dd1aa).** `onComment` now treats any `/*` earlier
+on the import's line as an open comment, even inside a string or regex. Repro, with the old and new scanners side by
+side (`importsOf("server/gateway.js", src)`):
+- `const glob = "src/*"; import { a } from "./store/sqlite.js";` gives 1 edge before and 0 now.
+- `const re = /a\/*/; const m = require("./store/sqlite.js");` gives 1 edge before and 0 now.
+- With `import("…")` the edge survives as kind "type", which is still checked.
+
+It needs a glob or regex with `/*` on the same line as a static import or require, which is rare. Fix: skip `/*`
+inside quotes when judging (or blank string literals first, as test/web/architecture.test.js already does). Add it
+to the known-miss list until fixed.
+
+**R2-L2: a code line starting with `*` hides a static import or require on it.** An example is a generator method
+`*gen() { … require("./store/sqlite.js") }`, or a continued multiplication. Rare; known-miss list.
+
+**R2-L3: absolute specifiers are invisible.** `import { a } from "/Users/…/server/store/sqlite.js"` is neither REL
+nor BARE (BARE excludes a leading `/`), so it passes. This was also true in round 1, which I didn't report. Bun
+resolves absolute paths. Fix: treat a leading `/` as "unresolved", or add it to the known-miss list.
+
+**R2-L4: a core file may start the whole program via a URL edge.** `new Worker(new URL("./main.js", import.meta.url))`
+from gateway.js passes: the URL rule deliberately lets a "url" edge name a composition root (a worker entry). This is
+by design and documented. Noted so the exception stays deliberate.
+
+## API backward compatibility (client's test/web/architecture.test.js)
+
+Compatible. Checked in three ways:
+- **Scanner output:** the old (44dd1aa) and new `listFiles` and `importsOf` give identical results on all 100 files
+  under web/, server/, packages/ and scripts/: same file list, same `{to, kind}` per file.
+- **New parameters are optional:** `importsOf`'s 4th parameter (`{ urls }`) and `checkBoundaries`'
+  `adapterMayImport`, `allowPackage` and `urls` all default off.
+- **Client's test:** test/web/architecture.test.js passes (7 tests, with test/architecture.test.js: 23 pass).
+
+The one unconditional new rule, `imports-root`, finds nothing in web/ today.
+
+## Blobs port move
+
+No behaviour change:
+- **Moved code:** `imageKind.toString()` and `checkBlob.toString()` in server/blobs/port.js equal the 44dd1aa
+  disk.js versions, and `MAX_BLOB_BYTES` is equal.
+- **disk.js:** re-exports the same objects, and its export set is unchanged (`MAX_BLOB_BYTES`, `checkBlob`,
+  `diskBlobs`, `imageKind`).
+- **s3.js:** now imports these from port.js.
+- **Tests:** test/server/ports.test.js and test/server/s3-blobs.test.js give 27 pass, 11 skip, 0 fail. The S3
+  suite skips cleanly without S3 credentials (skip-safe), but I did not run it live.
+
+server/blobs/port.js counts as core (a port) and uses the `Bun.CryptoHasher` global, as disk.js did. Globals are
+outside the package rule, as the test header says.
+
+## Is L1 (URL edges) opt-in acceptable? Yes
+
+The engine test turns it on (`urls: true`). Turning it on for client's web test in scratch makes client's own
+"adapter-imports" rule flag one legitimate edge:
+`web/adapters/transport/shared-worker/client.js -> …/shared-worker/worker.js`. That is a SharedWorker starting its
+own entry file in the same adapter. Default-on would have turned client's test red. Recommendation: client opts in
+once its rule treats a "url" edge into a worker entry as allowed.
+
+## Gates
+
+| Gate | Result |
+|---|---|
+| test/architecture.test.js + test/web/architecture.test.js | 23 pass, 0 fail |
+| test/server/ports.test.js + s3-blobs.test.js | 27 pass, 11 skip, 0 fail |
+| `bun test` (whole tree, with other sessions' concurrent edits) | 1044 pass, 83 skip, 0 fail, 61 files: no failures in anyone's files |
+| Postgres | not re-run: server/store/postgres.js changed only by `Object.freeze(STORE_TABLES)` (L5), and `migrate` only reads it |
+
+## Not verified (round 2)
+
+- S3 and NATS live.
+- Postgres contracts after the freeze (reasoned above, not run).
+- The R2-L1 and R2-L3 fixes I suggest.
+
+Scratch for round 2 is in the same session scratchpad (bin/, case/); deleting it is still refused by the permission rule.

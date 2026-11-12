@@ -1,10 +1,23 @@
 # Manager client: report
 
+## Now (kept current every turn; a refreshed manager starts here)
+
+- **Me:** manager client, terminal t14k. Report to the proxy **t1bx**; engine manager **t18m**; platform manager **t187**.
+- **In flight:** p6-ports round 2 (verifier t1b9 re-checking builder t18r's fix round). On PASS: commit web/ports,
+  web/adapters, test/web/contracts, test/web/adapters + reports by path, close t18r and t1b9, report to t1bx.
+- **Waiting on engine:** the p2-land merge into main (carries phase 2, v1.1, p6-land, p7-collab). t18m pings first.
+- **Next, in order:** p6-hex (docs/m2/briefs/p6-hex.md: move web/ onto the ports, auth HTTP adapter per
+  docs/m2/contracts/auth-exchange.md, test/web/architecture.test.js on engine's test/arch-scan.js) → p7-wire
+  (docs/m2/briefs/p7-wire.md) → an architecture audit of web/.
+- **Start command:** OFFICE.md "Starting a session" (names plenary-<job>[v], --model opus --permission-mode auto,
+  systems-design plugin, zsh -lic wrapper). Tab: `worker <job> (client) · <id>: <what>`.
+
 ## Workers
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| p6-ports (builder) | t18r | worker p6-ports (client): web ports + contract tests | RUNNING on main (new files only) |
+| p6-ports (builder) | t18r | done p6-ports (client) · t18r | fix round 1 done; re-verifying |
+| p6-portsv (verifier) | t1b9 | verifier p6-portsv (client) · t1b9: web ports, round 2 | RUNNING round 2 |
 
 ## 2026-11-11 — phase-6 design mock
 
@@ -220,3 +233,18 @@
   is all new files: p6-ports (t18r, on main, brief docs/m2/briefs/p6-ports.md) builds web/ports (transport, storage,
   clock, auth), the storage/clock/auth-fake adapters and contract tests now. The p6-hex brief now includes platform's
   code exchange (auth port + HTTP adapter).
+- Platform (t187) sent the sign-in exchange shape; saved as docs/m2/contracts/auth-exchange.md. p6-ports (auth port + fake) and p6-hex (HTTP adapter + wiring) point at it.
+- p6-ports done (t18r): web/ports (transport, storage, clock, auth), web/adapters/{storage,clock,auth/fake},
+  test/web/contracts + adapters. bun test 556 run, 0 fail, 78 skip (re-run by me). Transport contract passes against
+  p2-land's real localRoom (13/13). For p6-hex: bindEditor's `close?` must become required (import the port);
+  web/collab/ui.js's clock shape { now, setTimer, clearTimer } must move to the port's { now, set, clear, random }.
+  Asked platform (t187) whether user/name/email are always strings, domain null outside a Workspace, and whether
+  `{error: "network"}` is OK. Verifier p6-portsv (t1b9) started (CHECKER on the port design).
+- Platform answered: user always a non-empty string; name/email/domain each string or null; exp integer seconds; {error:"network"} agreed. Saved in docs/m2/contracts/auth-exchange.md. web/ports/auth.js:28 types name/email as plain strings: verifier t1b9 told to judge against the real shape.
+- Naming rule (7f680a3): new sessions get --name plenary-<job>[v] (a-z0-9-, <=32) in both hc run --name and claude -n; tab 'worker <job> (<track>) · <id>: <what>' / 'verifier <job>v (<track>) · <id>: <what>'.
+- p6-portsv FAIL (docs/m2/reports/p6-portsv.md): 4 HIGH. H1 the transport contract misses late far-side traffic on an
+  old connection (the localRoom gen-check mutation survives); H2 auth name/email must be string|null; H3 authContract
+  can't catch collapsed errors; H4 storageContract misses key collisions. M1 virtual clock exact-boundary timer; M2
+  no monotonic time in Clock. Import rules hold. Fix round 1 sent to t18r (16%); t1b9 kept to re-verify.
+- The proxy is now t1bx (t14h retired; handoff 9d06783). Report to t1bx.
+- p6-ports fix round 1 done (t18r): all 4 HIGH, both MEDIUM, named LOWs; bun test 585 run, 0 fail (re-run by me). t1b9 on round 2.

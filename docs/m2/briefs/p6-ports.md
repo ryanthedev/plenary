@@ -23,8 +23,9 @@ docs/m2/OFFICE.md ("Architecture"), CLAUDE.md, docs/m2/briefs/p6-hex.md (the who
    - `storage.js`: get/set/remove of strings by key; may be unavailable (private mode, quota): a defined failure value
      or throw, never a silent wrong answer.
    - `clock.js`: now(), set(fn, ms) → handle, clear(handle), random().
-   - `auth.js`: `exchange(code) → Promise<{ token } | { error }>` for platform's sign-in code exchange (POST
-     /auth/exchange; exact shape comes from platform via your manager; write the port now and mark the shape TBD).
+   - `auth.js`: `exchange(code) → Promise<{ token, user, name, email, domain, exp } | { error }>` for platform's
+     sign-in code exchange. The exact shape is in docs/m2/contracts/auth-exchange.md (errors `invalid-code`,
+     `bad-origin`, `unavailable`, plus a network failure value of your choosing). The fake adapter covers each.
 2. **Contract tests**, test/web/contracts/, mirroring test/auth/registry-contract.js: `transportContract(name,
    makeAdapter)`, `storageContract`, `clockContract`, `authContract`; each registers describe/test blocks against a
    fresh adapter per test; a real-service adapter skips with `describe.skipIf` when its env is unset.

@@ -62,5 +62,5 @@ unverified identity from the token payload reaches non-display code: keep it dis
 The post-login fragment will carry a single-use code (≤ 60 s), not the session token. web/ exchanges it by
 `POST /auth/exchange` for the session token, then keeps the token in memory and sessionStorage as today; the fragment
 is still cleared at once. Wire it as an `auth` port with an HTTP adapter (and a fake for tests), so core never calls
-fetch. Exact request and response shape: from platform, via your manager. If it hasn't arrived when you get there,
-build the port and the fake, and leave the HTTP adapter as the last step.
+fetch. Exact shape: docs/m2/contracts/auth-exchange.md (`#code=`, POST /auth/exchange, credentials same-origin). The
+auth port and fake come from p6-ports; you add `web/adapters/auth/http.js` (fetch) and wire it in the root.

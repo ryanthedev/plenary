@@ -7,8 +7,6 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
 | pd-drawh (builder) | t14y | done pd-drawh (platform) | fix round RUNNING |
-| p8-cluster-env (builder) | t170 | done p8-cluster-env (platform) | reported, idle |
-| p8-cluster-envv (verifier) | t174 | verifier p8-cluster-envv (platform): cluster compose + CI services | RUNNING |
 | pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | FAIL (2 HIGH), idle; re-checks after fix |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
@@ -186,3 +184,9 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 - Engine (t14j) confirmed the cluster env names, added PLENARY_ROLES (gateway,host; compose runs at least one
   gateway-only and one host-only node), and NATS max_payload 2MB (PROTOCOL.md § Bus) for compose and CI. Sent to
   builder t170; verifier t174 re-checks the amended files after its current pass.
+
+## 2026-11-11 p8-cluster-env: DONE (commit 33b4cd8)
+
+- Verifier p8-cluster-envv (t174): PASS; re-check of engine's amendments PASS; R-M1 (pipefail/SIGPIPE false
+  failure in the CI /varz check) fixed by t170 and checked by me (capture, then grep). `bun test`: 263 pass.
+- Nothing run in Docker or on GitHub. Sessions t170, t174 closed, killed, removed.

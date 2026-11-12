@@ -21,7 +21,7 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 | 6 | CEO does one live Google sign-in (bun scripts/dev-google.js, http://localhost:8080/) | DONE 2026-11-12 04:44Z (server log: /auth/login 302, /auth/callback 302 loginCookie true, /signed-in 200, POST /auth/exchange 200; proxy ran the server, CEO signed in) | docs/m2/reports/p5-google.md "Hand-off" |
 | 3 | Ask the CEO for the Google OAuth client (env vars, never chat) when phase 5 starts | DONE 2026-11-11 | Web client "canvas-dev-local" in Omniping project gen-lang-client-0027800234 (consent screen already External/Testing); redirect http://localhost:8080/auth/callback; keys in .env (gitignored, 0600) via the downloaded JSON, never shown in chat |
 | 5 | Hexagonal architecture enforced (boundary test) and the systems design skill used on every design-bearing job; architecture audit per track | RUNNING | OFFICE.md "Architecture"; managers told |
-| 4 | drawh change is a proposal only; herdr-draw untouched without the CEO | ASKED 2026-11-12: proposal c3adcba to the CEO (approve/reject); proxy recommends waiting for round 4 on v1.1 (t1ds) | builder t185, verifier t155; goes to the CEO for approval after PASS |
+| 4 | drawh change is a proposal only; herdr-draw untouched without the CEO | ASKED 2026-11-12: round-4 proposal 6961449 (v1.1; patch sha256 f4f9b05a…) to the CEO; proxy recommends one live run against the real server after the p2-land merge, then approve | builder t185, verifier t155; goes to the CEO for approval after PASS |
 
 ## Decisions (reversible; the CEO may overturn)
 
@@ -114,3 +114,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-12 platform: drawh proposal committed c3adcba (docs/m2/proposals/drawh-server.md + .patch; re-check 4b: four asked items pass, one narrow hand-edit-only gap accepted by the manager). Shown to the CEO. Round 4 (v1.1, t1ds) running.
 - 2026-11-12 client: p6-edge DONE ac91d62 (sign-in HTTP adapter, WebSocket transport; verifier no HIGH; bun test 684/0 by manager). p6-hex waits on the p2-land merge.
 - 2026-11-12 client: p6-edge2 DONE ff87a3c (WebSocket backpressure, a full buffer stuck 10 s = dropped; sign-in test gaps; verifier no HIGH; bun test 755/0 by manager).
+- 2026-11-12 platform: drawh round 4 DONE 6961449 (protocol v1.1, file-side settings back; final check FAIL by the letter on one ~20 ms same-batch refusal window, reported under the manager's hard stop; herdr-draw tests 316/0; patch hash matches the verifier's). Proposal doc header still says 'not yet re-verified' (stale).

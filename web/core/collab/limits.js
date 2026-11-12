@@ -1,5 +1,5 @@
 // Protocol constants the collaboration UI needs, mirrored from packages/protocol (PROTOCOL.md v1.1 § Presence,
-// § Records, § Streams). web/collab never imports packages/protocol (only web/sync.js talks to the protocol), so
+// § Records, § Streams). web/core/collab never imports packages/protocol (only web/core/sync.js talks to the protocol), so
 // these are copies; test/web/collab/limits.test.js fails if any drifts from the protocol's own values.
 
 export const ROLES = ["owner", "editor", "annotator", "commenter", "viewer"];

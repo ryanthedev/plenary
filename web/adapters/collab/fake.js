@@ -4,7 +4,7 @@
 // Records sent through it stay pending until `ackAll()` / `ack(n)` (or at once with `autoAck`), so the
 // pending overlay can be seen and tested.
 
-import { canWrite, canModerate, RECORDS } from "./limits.js";
+import { canWrite, canModerate, RECORDS } from "../../core/collab/limits.js";
 
 const copy = v => JSON.parse(JSON.stringify(v));
 

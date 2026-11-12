@@ -1,4 +1,6 @@
-**FAIL**
+**PASS (round 2)**
+
+(Round 1 was FAIL on one HIGH; see "## Round 2" at the end for the re-verification.)
 
 # Verifier report: p6-hexv (verifies p6-hex, web/ into hexagonal shape)
 
@@ -120,3 +122,96 @@ dives, wrap-up. It covers p6-hex.md §1.
 - **Safari, Firefox and mobile.** Headless Chrome only.
 - **The served page through p-serve's deny rules.** I didn't run it. The HIGH comes from reading the imports against the deny list plus the manager's report.
 - **Ensemble review:** codex only. agy was out of quota and no other harness was run.
+
+## Round 2
+
+**Verdict: PASS.** All 9 fix items are closed and their mutants are killed. The production page, served by the
+real server through static.js's allowlist, boots live with no 404 and talks only over `/ws` with the token only in
+`hello`. Every drawing tool works end to end, and a drop mid-typing keeps the draft. The one full-suite failure is
+outside web/.
+
+Verified 2026-11-12 against main's working tree (p6-hex plus its fix round, uncommitted). Read-only: mutants ran in
+a scratch copy; browser runs used the rig (port 0) and headless Chrome (debug port 0), killed by recorded PID only.
+
+### 1. The 9 fix items
+
+| # | Item | Closed? | Evidence |
+|---|---|---|---|
+| 1 | **HIGH** production root imported dev rooms | Yes | main.js imports no dev module; index.html loads only main.js. Mutants 1a (main.js imports dev-users), 1b (transitive, dom/app.js imports local.js), 1c (shared-worker client), 1d (second `<script>` in index.html): all killed (1, 1, 3, 1 failing tests). The architecture test also checks the dev root's graph *does* hold dev modules, so it is not vacuous. |
+| 2 | MEDIUM blank page during the exchange | Yes | Signed-out served page shows "Sign in to Plenary … Sign in with Google" (browser, below). |
+| 3 | `codeOnly` blanked `${…}` | Yes | Mutants 3 (old behaviour) and 3b (`${Date.now()}` in real core): killed (1 each). |
+| 4 | `new Date(`, `Date(`, `self` missed | Yes | Mutants 4a (`new Date()` in core) and 4b (`self` in core): killed (1 each). |
+| 5 | ws allowlist kept alive by a JSDoc import | Yes | Mutant 5 (runtime codec import removed, JSDoc kept): stale-allowlist fires, killed. |
+| 6 | DECISION fail closed | Yes | Mutants 6 and 6p (fail-open restored, both entry points): killed (1 each). The only change to an existing signin.test.js assertion is the decided one (`url-not-cleared`, no token, no request); I found nothing else weakened. |
+| 7 | Token never in a URL write | Yes | Mutants 7a (fragment passed to replaceFragment): killed (1); 7b (exchange before replace): killed (7). Browser: no token in any request URL, WS URL, header or location (below). |
+| 8 | `congested()` doc ahead of code | Yes | web/ports/transport.js:26–33 now says it is read by nothing today and exists for p7-wire's pill. |
+| 9 | localRoom `clock: true` easy to miss | Yes | web/adapters/transport/local.js:24–29 documents it. |
+
+13 mutants, 13 killed.
+
+### 2. Production page, served by the real server
+
+Rig: `test/server/rig.js` (createServer with static.js's allowlist and `/ws`, dev auth tokens, port 0), headless Chrome.
+
+| Check | Result |
+|---|---|
+| No stored session | The "Sign in to Plenary … Sign in with Google" gate |
+| Stored session (dev token) | `live`, role presenter (owner), gate gone |
+| Responses | 41, all 200/101/304; no 4xx/5xx, no failed load, no console error |
+| Modules loaded | main.js's graph only; the only `local.js` hit is `/adapters/storage/local.js` (the production storage adapter, not the dev transport) |
+| WebSockets | 2, both `ws://127.0.0.1:<port>/ws` |
+| Token | In no WS URL, request URL, request header, or location; sessionStorage holds only `plenary.session`; localStorage empty |
+| Frames sent | hello, hello, presence ×6, op; only the two hellos carry the token |
+| Draw | rectangle: 0 → 1 element, 1 op acked |
+| Dev paths | 404: /dev-main.html, /dev-main.js, /dev.html, /dev.js, /adapters/transport/local.js, /adapters/transport/shared-worker/worker.js, /core/dev-users.js, /collab/dev.html |
+| Production paths | 200: /index.html, /main.js |
+
+### 3. Round 1 skips, now in the browser
+
+**A. Drop mid-typing (served production page, real `/ws`):**
+
+| Step | Result |
+|---|---|
+| Boot | live in 125 ms; the earlier rectangle persisted (1 element) |
+| Text tool, click on the canvas | text box opened; typed "draft one" |
+| Drop (closed both open sockets from page script) | status `connecting` |
+| Typed " two" while down | draft "draft one two" |
+| Reconnect | live after 809 ms, 2 new hellos; draft still "draft one two" |
+| Escape | committed; texts ["draft one two"]; 1 op sent |
+| Reload | ["draft one two"] persisted on the server |
+| Errors | none |
+
+**B. Every drawing tool (web/dev-main.html `?net=local`, ada as presenter):** boot live in 108 ms; each gesture
+hit `CANVAS#board`; each `setTool` read back the requested tool.
+
+| Tool | Stream | Element |
+|---|---|---|
+| rectangle, diamond, ellipse, arrow, line, freedraw | board | one each |
+| text | board | text "hi text" |
+| frame | board | frame (placed first in z-order) |
+| highlighter | notes | freedraw |
+| note | notes | rectangle + text "hi note" |
+
+The only error was a favicon.ico 404 from my scratch static server (not a finding).
+
+**Round 1's "erratic per-tool counts" were my driver, not a regression.** Its 800×600 viewport put gestures at
+y up to 615, off the canvas. With a 1400×1000 viewport and a hit-test before each gesture, every tool works.
+
+**C. Refused op plus resync: NOT checked in the browser.** Neither root exposes a hook to make the room refuse an
+op (localRoom's refusal hook isn't on `plenary`), and forcing it would mean editing code. It stays covered by
+test/web's sync and transport contract tests.
+
+### 4. Full `bun test`
+
+1083 pass, 112 skip, **1 fail**, 1196 tests across 63 files.
+
+- **The failure is outside web/:** `packages/core is still herdr-draw's core` (test/core-source.test.js), which is
+  packages/core drifting from SOURCE.json. p6-hex touches neither. Not this job's.
+- `bun test test/web`: 0 failures (the manager's 552 / 0 stands).
+
+### NOT checked (round 2)
+
+- **Refused op plus resync in the browser** (C above); unit and contract tests only.
+- **eraser, laser, image, select and hand by gesture.** Only the drawing tools above were driven.
+- **A viewer or annotator on the served page.** Round 1 checked roles on the dev page only.
+- **A real Google `#code` end to end** (the rig has no OIDC), **`wss:` behind TLS** (unit-tested via `sameOriginWsUrl` only), **Safari, Firefox, mobile.**

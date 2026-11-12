@@ -1,10 +1,10 @@
 // Dev page for web/collab: the collab UI over the fake port. Fake data only. Two peers (Maya presenting with a
 // laser and a drag, Dev selecting), annotators with cursors, a hostile display name, and a crowd of viewers
 // sending emotes. Click the board to comment on a spot; click a shape to comment on it.
-import { createFakePort } from "./fake-port.js";
-import { mountCollab } from "./ui.js";
-import { h, replace } from "./dom.js";
-import { ROLES, EMOTES } from "./limits.js";
+import { createFakePort } from "../adapters/collab/fake.js";
+import { mountCollab } from "../adapters/dom/collab/ui.js";
+import { h, replace } from "../adapters/dom/collab/dom.js";
+import { ROLES, EMOTES } from "../core/collab/limits.js";
 
 const q = new URLSearchParams(location.search);
 const pick = (k, list, d) => (list.includes(q.get(k)) ? q.get(k) : d);

@@ -1,6 +1,6 @@
 // The Canvas2D painter: every item kind core emits becomes the right context calls.
 import { test, expect } from "bun:test";
-import { paint, imageCache, THEMES, color } from "../../web/paint.js";
+import { paint, imageCache, THEMES, color } from "../../web/adapters/dom/paint.js";
 import { Editor } from "../../packages/core/editor.js";
 import { makeElement } from "../../packages/core/model.js";
 import { LIGHT, DARK } from "../../packages/core/export.js";

@@ -12,6 +12,9 @@ import { virtualClock } from "../../../web/adapters/clock/virtual.js";
 import { CONGESTED_BYTES, HARD_CAP_BYTES, HARD_CAP_MS, HARD_CAP_SAMPLE_MS } from "../../../web/ports/transport.js";
 
 /** @returns {import("./transport-contract.js").TransportDriver} */
+/** A message's encoded size in UTF-8 bytes (what a socket buffers), never UTF-16 characters. */
+const utf8 = m => new TextEncoder().encode(JSON.stringify(m)).length;
+
 export function referenceTransport() {
   let gen = 0, done = false, onMsg = () => {}, onDrop = () => {};
   const clock = virtualClock();
@@ -22,7 +25,7 @@ export function referenceTransport() {
   function serve(c) {                                       // read what the client sent on c, queue the answers
     while (c.open && !c.stalled && c.up.length) {
       const m = c.up.shift();
-      c.bytes = Math.max(0, c.bytes - JSON.stringify(m).length);
+      c.bytes = Math.max(0, c.bytes - utf8(m));
       if (m?.t === "req") setTimeout(() => { if (c.gen === gen && !done) onMsg({ t: "ans", i: m.i }); }, 0);
     }
   }
@@ -62,12 +65,13 @@ export function referenceTransport() {
       const c = conn;
       if (!c || done) return;
       c.up.push(m);
-      const n = JSON.stringify(m).length;
+      const n = utf8(m);                                   // UTF-8 bytes, as ws.js (p6-edge2v L3)
       c.bytes += n; c.added += n;
       watchCap(c);
       setTimeout(() => serve(c), 0);
     },
     congested: () => !done && !!conn && conn.bytes > CONGESTED_BYTES,
+    backlogBytes: () => (!done && conn ? conn.bytes : 0),
     onMessage(fn) { onMsg = fn; },
     onDrop(fn) { onDrop = fn; },
     reopen: open,

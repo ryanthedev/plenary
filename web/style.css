@@ -274,3 +274,9 @@ body.stale .av.live::after { display: none; }
 body.stale .watching { opacity: .45; }
 .c[disabled], .sw[disabled], .btn[disabled] { opacity: .4; cursor: not-allowed; }
 .panel.ro .sec h4 { opacity: .7; }
+/* The page before the canvas (web/adapters/dom/gate.js): signing in, or signed out. */
+.signin-gate { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; background: var(--chrome); color: var(--fg); }
+.signin-gate > div { max-width: min(420px, calc(100vw - 32px)); text-align: center; }
+.signin-gate h1 { font-size: 18px; font-weight: 600; margin: 0 0 8px; }
+.signin-gate p { color: var(--muted); margin: 0 0 16px; }
+.signin-gate a.btn { display: inline-block; text-decoration: none; }

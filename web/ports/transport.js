@@ -1,9 +1,9 @@
 // Transport port: how web/'s core (sync.js) talks to one board stream. Driven port; types and limits only, no logic.
 // Imports nothing. Contract test: test/web/contracts/transport-contract.js (transportContract).
 //
-// Contract: the p2-land header of web/sync.js, plus rules marked [added] that the header leaves implicit. p2's
-// localRoom keeps them all (transportContract run against it, outside the repo); net.js sharedNet keeps them as far as
-// its page side goes (read, not run; its worker side unchecked).
+// Contract: the p2-land header of web/sync.js (web/core/sync.js now points here), plus rules marked [added] that the
+// header leaves implicit. Run in the repo against every transport: reference, local, shared-worker (page side, fake
+// port), ws (fake WebSocket) — test/web/contracts and test/web/adapters/transport-*.test.js.
 //   A transport is ONE logical link to a room, carried over a sequence of connections. Each connection has a
 //   generation; at any moment at most one generation is current.
 //   send(msg)      Queue one message object on the CURRENT connection (a wire transport runs the codec). [added]
@@ -28,11 +28,19 @@
 //                  over CONGESTED_BYTES (256 KB). A pure read: it never throws, never drops anything itself (the
 //                  transport cannot tell presence from ops), is false after close() and describes the NEW
 //                  connection right after reopen(). A transport with no outbound buffer (in-memory) returns false.
-//                  What the CORE must do with it (sync.js; p6-hex): while congested(), do not send `presence`
-//                  messages (PROTOCOL.md § Presence: k = cursor, select, laser, preview, emote; they may drop at any
-//                  hop). For the latest-wins kinds (cursor, select, preview) keep only the latest and send it once
-//                  congested() is false; laser and emote are simply dropped. NEVER skip or delay hello, any `op`
-//                  (appState included), or anything the room acknowledges. Ops queue behind the backlog.
+//                  Today: implemented by every transport and contract-tested, but READ BY NOTHING. It exists for the
+//                  status pill (p7-wire wires the pill to it); the presence gate reads backlogBytes() below, never
+//                  congested() (manager decision, p6-edge2v M1).
+//                  Whatever the backlog, the core NEVER skips or delays hello, any `op` (appState included), or
+//                  anything the room acknowledges. Ops queue behind the backlog.
+//   backlogBytes() REQUIRED to implement, optional to call (manager decision, p6-edge2v M1). The CURRENT connection's
+//                  outbound backlog in bytes (UTF-8 of the encoded frames queued before open + what the socket has not
+//                  yet put on the wire; ws.js: queued bytes + bufferedAmount). A pure read like congested(): never
+//                  throws, 0 after close() and right after reopen(), and 0 always for a bufferless transport. The core
+//                  sends presence (PROTOCOL.md § Presence: cursor, select, laser, preview, emote; a v0 `transient`
+//                  op too) only while backlogBytes() <= PRESENCE_BACKLOG_BYTES, about one frame in flight; above it
+//                  presence is skipped, never queued (the next move or the commit supersedes a latest-wins kind;
+//                  laser and emote may drop at any hop anyway).
 //   Hard cap [added]: a backlog over HARD_CAP_BYTES (4 MB) that makes NO DRAIN PROGRESS for HARD_CAP_MS (10 s)
 //                  counts as an unasked drop: the transport closes that connection and reports onDrop once. Measured
 //                  on the clock port's mono(), sampled at least every HARD_CAP_SAMPLE_MS. Progress between two
@@ -54,10 +62,13 @@
  * @property {() => void} close
  * @property {(fn: () => void) => void} [onDrop]
  * @property {() => boolean} congested
+ * @property {() => number} backlogBytes
  */
 
 /** Outbound backlog (bytes) above which the core stops sending presence. */
 export const CONGESTED_BYTES = 256 * 1024;
+/** Outbound backlog (bytes) at or under which the core still sends presence (about one preview frame in flight). */
+export const PRESENCE_BACKLOG_BYTES = 16 * 1024;
 /** Outbound backlog (bytes) that, with no drain progress for HARD_CAP_MS, counts as a dead link (onDrop). */
 export const HARD_CAP_BYTES = 4 * 1024 * 1024;
 export const HARD_CAP_MS = 10_000;

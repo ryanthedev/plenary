@@ -1,7 +1,7 @@
 // Role gating and pacing of everything the collab UI sends, checked against packages/protocol's own rules.
 import { test, expect } from "bun:test";
-import { createOutbox, mayPresence, recordProblem } from "../../../web/collab/gate.js";
-import { createFakePort } from "../../../web/collab/fake-port.js";
+import { createOutbox, mayPresence, recordProblem } from "../../../web/core/collab/gate.js";
+import { createFakePort } from "../../../web/adapters/collab/fake.js";
 import { presenceProblem, presenceLimiter, PRESENCE, EMOTES } from "../../../packages/protocol/presence.js";
 import { ROLES, canWrite } from "../../../packages/protocol/envelope.js";
 import { Records } from "../../../packages/protocol/records.js";

@@ -1,8 +1,8 @@
 // The collab UI over the fake port, in a fake DOM where every HTML sink throws.
 import { test, expect, beforeEach } from "bun:test";
 import { installDom, byClass, button } from "./fake-dom.js";
-import { mountCollab } from "../../../web/collab/ui.js";
-import { createFakePort } from "../../../web/collab/fake-port.js";
+import { mountCollab } from "../../../web/adapters/dom/collab/ui.js";
+import { createFakePort } from "../../../web/adapters/collab/fake.js";
 import { fakeClock } from "./clock.js";
 
 const EVIL = `<img src=x onerror="alert(1)">`, EVIL2 = `</p><script>alert(2)</script>`;

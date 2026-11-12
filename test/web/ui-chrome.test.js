@@ -2,9 +2,10 @@
 import { test, expect } from "bun:test";
 import { Editor, TOOLS } from "../../packages/core/editor.js";
 import { defaultPanel, applyPanel, panelSections } from "../../packages/core/panel.js";
-import { uiRole, toolsFor, mayUseTool, streamFor, viewKey, clipboardKey, pillFor } from "../../web/ui/roles.js";
-import { propsModel, availableFor, STYLE_ROWS, loadLibrary, saveLibrary } from "../../web/ui/panel.js";
-import { toSvg, exportSvg, paintPng } from "../../web/ui/export.js";
+import { uiRole, toolsFor, mayUseTool, streamFor, viewKey, clipboardKey, pillFor } from "../../web/core/roles.js";
+import { propsModel, availableFor, STYLE_ROWS, loadLibrary, saveLibrary } from "../../web/adapters/dom/panel.js";
+import { memoryStore } from "../../web/adapters/storage/memory.js";
+import { toSvg, exportSvg, paintPng } from "../../web/adapters/dom/export.js";
 
 test("role → chrome, and the tools each gets", () => {
   expect(["owner", "editor", "annotator", "commenter", "viewer", null, "root"].map(uiRole)).toEqual(["presenter", "presenter", "annotator", "viewer", "viewer", "viewer", "viewer"]);
@@ -62,13 +63,17 @@ test("panel state: tabs and stack through applyPanel; sections hide when empty",
 });
 
 test("library round-trips through storage; junk reads as empty", () => {
-  const mem = new Map(), store = { getItem: k => mem.get(k) ?? null, setItem: (k, v) => mem.set(k, v) };
+  const store = memoryStore(), mem = { set: (k, v) => store.set(k, v) };
   expect(loadLibrary(store)).toEqual([]);
   mem.set("plenary.library", "{not json"); expect(loadLibrary(store)).toEqual([]);
   const ed = new Editor(); ed.setTool("ellipse"); ed.pointerDown({ x: 0, y: 0 }); ed.pointerMove({ x: 50, y: 50 }); ed.pointerUp({ x: 50, y: 50 });
   const item = ed.libraryItem("Dot");
   saveLibrary(store, [item]);
   expect(loadLibrary(store).map(i => i.name)).toEqual(["Dot"]);
+  // An unavailable store (private mode, blocked site data): reads as empty, saving never throws.
+  const gone = memoryStore({ unavailable: true });
+  expect(loadLibrary(gone)).toEqual([]);
+  expect(() => saveLibrary(gone, [item])).not.toThrow();
 });
 
 test("SVG export: board only, cropped, sanitised", () => {

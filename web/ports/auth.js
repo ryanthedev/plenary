@@ -21,7 +21,7 @@
 //       "network"       no answer at all (offline, DNS, a dropped connection). Client-only (agreed with platform; the
 //                       server never sends it). Same as unavailable for retry.
 //   The token is a secret: an adapter never logs it (nor the code) and never puts it in a URL. The caller keeps it in memory and
-//   sessionStorage (never localStorage), as web/ui/token.js does today.
+//   sessionStorage (never localStorage), as web/core/signin.js does.
 //
 // Failure behaviour: every failure is a value, so the sign-in path has one branch per outcome and no try/catch.
 

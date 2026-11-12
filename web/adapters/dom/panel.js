@@ -2,12 +2,12 @@
 // The model (what's on, what's available) is pure and tested; render() builds DOM with ./dom.js.
 // Every write goes through session.act(stream, fn): the role and connection gate it, not the disabled look.
 
-import { STROKES, FILLS, WIDTHS, STYLES } from "../../packages/core/editor.js";
-import { panelSections, applyPanel } from "../../packages/core/panel.js";
-import { PRESET_NAMES } from "../../packages/core/anim.js";
-import { FONT_FAMILY, fontClass } from "../../packages/core/style.js";
-import { isShape, isLabel, layerOf } from "../../packages/core/model.js";
-import { parseLibrary, mergeLibrary } from "../../packages/core/library.js";
+import { STROKES, FILLS, WIDTHS, STYLES } from "../../../packages/core/editor.js";
+import { panelSections, applyPanel } from "../../../packages/core/panel.js";
+import { PRESET_NAMES } from "../../../packages/core/anim.js";
+import { FONT_FAMILY, fontClass } from "../../../packages/core/style.js";
+import { isShape, isLabel, layerOf } from "../../../packages/core/model.js";
+import { parseLibrary, mergeLibrary } from "../../../packages/core/library.js";
 
 export const HEADS = [["none", null, null], ["→", null, "arrow"], ["↔", "arrow", "arrow"], ["▶", null, "triangle"], ["▷", null, "triangle_outline"], ["●", null, "dot"], ["◆", null, "diamond"], ["⊣", null, "bar"]];
 export const OPACITIES = [100, 75, 50, 25];
@@ -62,8 +62,10 @@ const isOn = (m, key, val) => {
 
 // ── library (per browser, localStorage; .excalidrawlib in and out) ──
 const LIB_KEY = "plenary.library";
-export function loadLibrary(store) { try { return parseLibrary(store?.getItem(LIB_KEY) ?? "") ; } catch { return []; } }
-export function saveLibrary(store, items) { try { store?.setItem(LIB_KEY, JSON.stringify({ type: "excalidrawlib", version: 2, libraryItems: items })); } catch {} }
+/** The per-browser library from the storage port (web/ports/storage.js); a missing, junk or unavailable store reads as empty. */
+export function loadLibrary(store) { try { return parseLibrary(store?.get(LIB_KEY) ?? ""); } catch { return []; } }
+/** Save the library; a full or unavailable store (STORAGE_UNAVAILABLE) is survived: the library stays in memory. */
+export function saveLibrary(store, items) { try { store?.set(LIB_KEY, JSON.stringify({ type: "excalidrawlib", version: 2, libraryItems: items })); } catch {} }
 export function addToLibrary(items, incoming) { return mergeLibrary(items, incoming); }
 
 /**

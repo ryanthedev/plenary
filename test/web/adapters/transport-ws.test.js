@@ -393,3 +393,37 @@ describe.skipIf(!hasBun)("ws transport adapter over a real socket", () => {
     t.close();
   });
 });
+
+// p6-edge2v L1: with a clock given, the hard-cap hold uses only that clock, never a global timer or global time.
+test("with a clock given, the hold touches no global timer or global time", () => {
+  const sockets = [];
+  class WS {
+    constructor(url) { this.url = url; this.readyState = 0; this.bufferedAmount = 0; this.closed = false; sockets.push(this); }
+    open() { this.readyState = 1; this.onopen?.({}); }
+    send(d) { if (this.readyState !== 1) throw new Error("state"); this.bufferedAmount += typeof d === "string" ? Buffer.byteLength(d) : d.byteLength; }
+    close() { this.readyState = 3; this.closed = true; }
+  }
+  const clock = virtualClock();
+  const t = wsTransport({ url: "wss://x/ws", WebSocket: WS, clock });
+  let drops = 0; t.onDrop(() => drops++);
+  sockets.at(-1).open();
+  const big = n => ({ t: "pad", s: "x".repeat(n) });
+  const saved = { st: globalThis.setTimeout, si: globalThis.setInterval, ct: globalThis.clearTimeout, dn: Date.now, pn: performance.now };
+  const used = [];
+  globalThis.setTimeout = (...a) => { used.push("setTimeout"); return saved.st(...a); };
+  globalThis.setInterval = (...a) => { used.push("setInterval"); return saved.si(...a); };
+  globalThis.clearTimeout = (...a) => { used.push("clearTimeout"); return saved.ct(...a); };
+  Date.now = () => { used.push("Date.now"); return saved.dn.call(Date); };
+  performance.now = () => { used.push("performance.now"); return saved.pn.call(performance); };
+  try {
+    t.send(big(HARD_CAP_BYTES + 1024));
+    t.congested(); t.backlogBytes();
+    clock.advance(HARD_CAP_MS + HARD_CAP_SAMPLE_MS);
+    t.reopen(); sockets.at(-1).open(); t.send(big(HARD_CAP_BYTES + 1024)); t.reopen(); t.close();
+  } finally {
+    Object.assign(globalThis, { setTimeout: saved.st, setInterval: saved.si, clearTimeout: saved.ct });
+    Date.now = saved.dn; performance.now = saved.pn;
+  }
+  expect(drops).toBe(1);
+  expect(used).toEqual([]);
+});

@@ -4,7 +4,11 @@
 // the room. Every network run is seeded (localRoom's `seed`, or an explicit rng).
 import { test, expect } from "bun:test";
 import { Editor, TOOLS } from "../../packages/core/editor.js";
-import { bindEditor, localRoom, editorState, seeded } from "../../web/sync.js";
+import { bindEditor, editorState, seeded } from "../../web/core/sync.js";
+import { localRoom } from "../../web/adapters/transport/local.js";
+import { virtualClock } from "../../web/adapters/clock/virtual.js";
+import { browserClock } from "../../web/adapters/clock/browser.js";
+import { PRESENCE_BACKLOG_BYTES } from "../../web/ports/transport.js";
 
 const USERS = {
   owner: { user: "u0", role: "owner" }, ed: { user: "u1", role: "editor" }, view: { user: "u2", role: "viewer" },
@@ -12,7 +16,7 @@ const USERS = {
 };
 
 // The network's virtual clock for a binding: the Replica's deadlines and backoff run on it, and settle() fires them.
-const clocked = net => ({ timers: net.timers, now: net.now });
+const clocked = net => ({ clock: net.clock });
 
 function setup(tokens = ["owner", "ed"], { seed = 1, stream = "board" } = {}) {
   const net = localRoom({ users: USERS, seed, clock: true });
@@ -350,7 +354,7 @@ test("pictures stay out of ops (the room refuses files) but stay in the Editor a
 test("rule 2: the hello goes alone; unacked ops are resent after welcome, never-sent ones after catch-up (M1)", () => {
   const sent = []; let deliver;
   const tr = { send: m => sent.push(JSON.parse(JSON.stringify(m))), onMessage: fn => { deliver = fn; }, reopen: () => {} };
-  const ed = new Editor(), s = bindEditor(ed, { transport: tr, token: "x", board: "b1", client: "c", timeoutMs: 0 });
+  const ed = new Editor(), s = bindEditor(ed, { transport: tr, token: "x", board: "b1", client: "c", timeoutMs: 0, clock: virtualClock() });
   expect(sent.map(m => m.t)).toEqual(["hello"]);
   drag(ed, "rectangle", { x: 0, y: 0 }, { x: 40, y: 40 });           // before welcome: held
   expect(sent.filter(m => m.t === "op")).toEqual([]);
@@ -548,7 +552,7 @@ test("cancelGesture mid-erase clears the pending erase: the next stroke elsewher
 test("settings: own patch unacked across a reconnect, a peer's later patch, then a late ack", () => {
   const sent = []; let deliver;
   const tr = { send: m => sent.push(JSON.parse(JSON.stringify(m))), onMessage: fn => { deliver = fn; }, reopen: () => {} };
-  const ed = new Editor(), s = bindEditor(ed, { transport: tr, token: "x", board: "b1", client: "c", timeoutMs: 0 });
+  const ed = new Editor(), s = bindEditor(ed, { transport: tr, token: "x", board: "b1", client: "c", timeoutMs: 0, clock: virtualClock() });
   deliver({ t: "welcome", seq: 0, role: "editor", user: "u1" });
   ed.setAppState({ grid: 10 });
   const mine = sent.filter(m => m.t === "op").at(-1);
@@ -718,7 +722,7 @@ test("status: an unknown rules version stops (stopped); a later auth error asks 
   for (const [msg, want] of [[{ t: "welcome", seq: 0, role: "editor", user: "u1", rv: 999 }, "stopped"], [{ t: "error", code: "auth", message: "expired" }, "refused"]]) {
     const sent = []; let deliver; const seen = [];
     const tr = { send: m => sent.push(m), onMessage: fn => { deliver = fn; }, reopen: () => {} };
-    const ed = new Editor(), s = bindEditor(ed, { transport: tr, token: "x", board: "b1", client: "c", timeoutMs: 0, onStatus: st => seen.push(st) });
+    const ed = new Editor(), s = bindEditor(ed, { transport: tr, token: "x", board: "b1", client: "c", timeoutMs: 0, clock: virtualClock(), onStatus: st => seen.push(st) });
     if (want === "refused") { deliver({ t: "welcome", seq: 0, role: "editor", user: "u1" }); expect(s.status).toBe("live"); }
     deliver(msg);
     expect(s.status).toBe(want);
@@ -732,7 +736,7 @@ test("status: an unknown rules version stops (stopped); a later auth error asks 
 test("status: another user signing in on this client discards the old user's ops (rule 13), counted", () => {
   const sent = []; let deliver;
   const tr = { send: m => sent.push(m), onMessage: fn => { deliver = fn; }, reopen: () => {} };
-  const ed = new Editor(), s = bindEditor(ed, { transport: tr, token: "x", board: "b1", client: "c", timeoutMs: 0 });
+  const ed = new Editor(), s = bindEditor(ed, { transport: tr, token: "x", board: "b1", client: "c", timeoutMs: 0, clock: virtualClock() });
   deliver({ t: "welcome", seq: 0, role: "editor", user: "u1" });
   ed.setAppState({ grid: 10 });
   s.reconnect();
@@ -770,7 +774,7 @@ test("previews: at most the published rate leaves the client; a viewer sends non
 test("status: a stale answer counts the op as unconfirmed", () => {
   const sent = []; let deliver;
   const tr = { send: m => sent.push(m), onMessage: fn => { deliver = fn; }, reopen: () => {} };
-  const ed = new Editor(), s = bindEditor(ed, { transport: tr, token: "x", board: "b1", client: "c", timeoutMs: 0 });
+  const ed = new Editor(), s = bindEditor(ed, { transport: tr, token: "x", board: "b1", client: "c", timeoutMs: 0, clock: virtualClock() });
   deliver({ t: "welcome", seq: 0, role: "editor", user: "u1" });
   ed.setAppState({ grid: 10 });
   const op = sent.filter(m => m.t === "op").at(-1);
@@ -779,10 +783,10 @@ test("status: a stale answer counts the op as unconfirmed", () => {
   expect(s.pending).toBe(0);
 });
 
-test("real timers (the page's defaults): a refusal resyncs after the backoff and converges", async () => {
+test("real timers (the page's clock, browserClock): a refusal resyncs after the backoff and converges", async () => {
   const net = localRoom({ users: USERS, auto: true });
-  const o = new Editor(), so = bindEditor(o, { transport: net.join(), token: "owner", board: "b1" });
-  const v = new Editor(), sv = bindEditor(v, { transport: net.join(), token: "view", board: "b1" });
+  const o = new Editor(), so = bindEditor(o, { transport: net.join(), token: "owner", board: "b1", clock: browserClock() });
+  const v = new Editor(), sv = bindEditor(v, { transport: net.join(), token: "view", board: "b1", clock: browserClock() });
   await new Promise(r => setTimeout(r, 50));
   drag(o, "diamond", { x: 0, y: 0 }, { x: 50, y: 50 });
   drag(v, "rectangle", { x: 100, y: 100 }, { x: 200, y: 200 });
@@ -925,4 +929,62 @@ test("a drop report is ignored while down, after stopped, and after close: no ex
     expect(s.status).toBe(before.status);
     if (when === "down") { expect(before.timers).toEqual([500]); for (const x of [...timers.values()]) x.fn(); expect(sent.filter(m => m.t === "hello").length).toBe(2); }
   }
+});
+
+test("no global fallback: bindEditor without a clock (or now, random, timers) throws; timeoutMs 0 needs no timers", () => {
+  const net = localRoom({ users: USERS, clock: true });
+  const bind = o => bindEditor(new Editor(), { transport: net.join(), token: "owner", board: "b1", ...o });
+  expect(() => bind({})).toThrow(TypeError);
+  expect(() => bind({ now: net.now, timers: net.timers })).toThrow(TypeError);            // no random
+  expect(() => bind({ now: net.now, random: net.random })).toThrow(TypeError);            // no timers
+  expect(() => bind({ now: net.now, random: net.random, timeoutMs: 0 })).not.toThrow();
+  expect(() => bind({ clock: net.clock })).not.toThrow();
+});
+
+// Presence gate (manager decision, p6-edge2v M1): a drag preview (presence k: "preview") goes out only while the
+// transport's backlog is <= PRESENCE_BACKLOG_BYTES; hello and real ops are never gated.
+test("presence gate: over 16 KB of backlog no preview is sent, but the commit and a reconnect's hello are", () => {
+  const net = localRoom({ users: USERS, clock: true });
+  let backlog = 0;
+  const sent = [];
+  const inner = net.join();
+  const tr = { ...inner, send: m => { sent.push(m); inner.send(m); }, backlogBytes: () => backlog };
+  const ed = new Editor(), s = bindEditor(ed, { transport: tr, token: "owner", board: "b1", ...clocked(net) });
+  const peer = new Editor(), sp = bindEditor(peer, { transport: net.join(), token: "ed", board: "b1", ...clocked(net) });
+  net.settle();
+  drag(ed, "rectangle", { x: 10, y: 10 }, { x: 110, y: 90 });
+  net.settle();
+  const id = ed.doc.live()[0].id;
+  const previews = () => sent.filter(m => m.t === "presence" && m.k === "preview").length;
+  const ops = () => sent.filter(m => m.t === "op").length;
+
+  // Under the gate (exactly at it counts as under): a move sends previews.
+  backlog = PRESENCE_BACKLOG_BYTES;
+  let p0 = previews();
+  ed.setTool("select"); ed.select([id]);
+  drag(ed, null, centre(ed, id), { x: 300, y: 300 }, 6, false);
+  expect(previews()).toBeGreaterThan(p0);
+  ed.pointerUp({ x: 300, y: 300 }, {});
+  net.settle();
+
+  // Over the gate: the move sends no preview at all; the commit (a real op) still goes out and lands.
+  backlog = PRESENCE_BACKLOG_BYTES + 1;
+  p0 = previews();
+  const o0 = ops();
+  ed.select([id]);
+  drag(ed, null, centre(ed, id), { x: 500, y: 400 }, 6, false);
+  expect(previews()).toBe(p0);
+  ed.pointerUp({ x: 500, y: 400 }, {});
+  expect(ops()).toBeGreaterThan(o0);
+  net.settle();
+  expect(s.pending).toBe(0);
+  expect(sp.peek(id).x).toBe(s.peek(id).x);
+
+  // A reconnect while congested: the hello is never gated.
+  const h0 = sent.filter(m => m.t === "hello").length;
+  s.reconnect();
+  expect(sent.filter(m => m.t === "hello").length).toBe(h0 + 1);
+  net.settle();
+  expect(s.status).toBe("live");
+  s.close(); sp.close();
 });

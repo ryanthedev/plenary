@@ -13,8 +13,9 @@
 
 import { canWrite, canModerate } from "./limits.js";
 
-/** A fresh record id (≤ 64 chars). `rand` is injectable for tests. */
-export function newRecordId(rand = Math.random) {
+/** A fresh record id (≤ 64 chars). `rand`: the clock port's random (core code never reads Math.random itself). */
+export function newRecordId(rand) {
+  if (typeof rand !== "function") throw new TypeError("newRecordId: pass a random source (clock.random)");
   let s = "";
   for (let i = 0; i < 14; i++) s += "abcdefghijklmnopqrstuvwxyz0123456789"[Math.floor(rand() * 36)];
   return `c${s}`;

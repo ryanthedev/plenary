@@ -15,20 +15,20 @@
 //   collab.setTheme(theme) · collab.destroy()
 
 import { h, replace } from "./dom.js";
-import { EMOTES, canWrite } from "./limits.js";
-import { FLAGS } from "./flags.js";
-import { createOutbox, recordProblem, mayPresence } from "./gate.js";
-import { createPresence, colorOf, initials, FLOAT_MS } from "./presence-model.js";
-import { recordsView, newRecordId, ago, cornerOf } from "./records-model.js";
-import { notesView, safeColor } from "./notes-model.js";
+import { EMOTES, canWrite } from "../../../core/collab/limits.js";
+import { FLAGS } from "../../../core/collab/flags.js";
+import { createOutbox, recordProblem, mayPresence } from "../../../core/collab/gate.js";
+import { createPresence, colorOf, initials, FLOAT_MS } from "../../../core/collab/presence-model.js";
+import { recordsView, newRecordId, ago, cornerOf } from "../../../core/collab/records-model.js";
+import { notesView, safeColor } from "../../../core/collab/notes-model.js";
 import { drawPresence } from "./draw.js";
-import { missingFromPort } from "./port.js";
+import { missingFromPort } from "../../../ports/collab.js";
 
 const BAR = EMOTES.slice(0, 6);
 const fmt = n => (n >= 10_000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k` : String(n));
 const watching = n => n.toLocaleString("en-US");
 
-export function mountCollab({ root, canvasOverlay = null, port, view, theme = "light", clock = null, flags = FLAGS, idGen = newRecordId, maxAvatars = 5 }) {
+export function mountCollab({ root, canvasOverlay = null, port, view, theme = "light", clock = null, flags = FLAGS, idGen = () => newRecordId(Math.random), maxAvatars = 5 }) {
   const missing = missingFromPort(port);
   if (missing.length) throw new Error(`collab port lacks ${missing.join(", ")}`);
   const C = clock ?? { now: () => Date.now(), setTimer: (fn, ms) => setTimeout(fn, ms), clearTimer: t => clearTimeout(t) };
@@ -121,7 +121,7 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
       const p = screen(t), first = t.comments.find(c => !c.deleted);
       for (const [c, on] of [["resolved", !!t.resolved], ["active", S.open === t.id], ["pending", t.pending], ["detached", t.detached]]) el.classList.toggle(c, on);
       el.style.setProperty("background", colorOf(t.by)); el.style.setProperty("left", `${p.x}px`); el.style.setProperty("top", `${p.y - 28}px`);
-      el.setAttribute("title", `${t.name}: ${first?.text ?? ""}`);
+      el.setAttribute("title", `${t.name ?? "Someone"}: ${first?.text ?? ""}`);
       const label = t.resolved ? "✓" : String(t.count);
       if (el.textContent !== label) replace(el, label);
     }
@@ -174,7 +174,7 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     // Rebuild the head and messages only when what they show changed (a click mid-rebuild is lost).
     if (changed("pop", JSON.stringify([t, S.reactFor, port.role, Math.floor(C.now() / 30_000)]))) {
       replace(pop.head,
-        t.resolved ? [h("span", {}, "✓"), h("b", {}, `Resolved by ${t.resolved.name}`)] : h("span.anchor", {}, anchorText(t)),
+        t.resolved ? [h("span", {}, "✓"), h("b", {}, `Resolved by ${t.resolved.name ?? "someone"}`)] : h("span.anchor", {}, anchorText(t)),
         h("span.spacer"),
         t.canResolve ? h("button.btn", { disabled: t.statePending, onclick: () => recordOp(t.resolved ? "reopen" : "resolve", { do: t.resolved ? "reopen" : "resolve", id: t.id }) }, t.resolved ? "Reopen" : "✓ Resolve") : null,
         h("button.tb", { title: "Close", onclick: () => openThread(null) }, "✕"));
@@ -254,7 +254,7 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
         return h(`div.note-row.thread-row${t.resolved ? ".done" : ""}${S.open === t.id ? ".on" : ""}`, { "data-thread": t.id, role: "button", tabindex: "0",
           onclick: go, onkeydown: e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } } },
           av(t.by, t.name), h("div.txt", {}, h("div", {}, first?.text ?? ""),
-            h("div.meta", {}, h("span", {}, t.name), h("span", {}, anchorText(t))),
+            h("div.meta", {}, h("span", {}, t.name ?? "Someone"), h("span", {}, anchorText(t))),
             h("div.acts", {}, h("span", {}, `${t.count} ${t.count === 1 ? "message" : "messages"}`), t.resolved ? h("span", {}, "✓ resolved") : null, t.pending ? h("span.sending", {}, "sending…") : null)));
       }) : h("div.hint", {}, S.list === "open" ? (rv.canWrite ? "No open comments. Pick the comment tool, or right-click the board." : "No open comments.") : "Nothing resolved yet."));
     }

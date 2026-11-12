@@ -8,5 +8,5 @@ transportContract("reference", () => referenceTransport());
 transportContract("reference (bufferless)", () => {
   const d = referenceTransport();
   const { stall, drain, advance, ...rest } = d;
-  return { ...rest, transport: { ...d.transport, congested: () => false }, bufferless: true };
+  return { ...rest, transport: { ...d.transport, congested: () => false, backlogBytes: () => 0 }, bufferless: true };
 });

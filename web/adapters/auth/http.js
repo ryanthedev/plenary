@@ -50,6 +50,7 @@ export function httpAuth({ fetch, base = "", timeoutMs = 10_000, timers = null }
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code }),
         cache: "no-store",
+        redirect: "error",                  // p6-edgev LOW-3: never follow a redirect with the code (fetch rejects: "network")
         signal,
       });
     } catch { return { error: "network" }; }

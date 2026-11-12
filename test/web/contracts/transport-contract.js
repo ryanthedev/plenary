@@ -19,7 +19,7 @@
 //                      client has since reopened, closed or seen a drop. This is a gateway that has not yet seen
 //                      the close and keeps flushing (the normal case for a WebSocket or a SharedWorker), and the
 //                      only way to test the generation check itself (p6-portsv H1). hold() and emit() may be async.
-// Backpressure (p6-edgev M1; the port's congested() and hard cap). REQUIRED of every driver, never skipped:
+// Backpressure (p6-edgev M1; the port's congested(), backlogBytes() and hard cap). REQUIRED of every driver, never skipped:
 //   stall()            async: the far side stops reading the CURRENT connection, so what the client sends piles up
 //                      in its outbound backlog (a slow uplink). A new connection (reopen) starts unstalled.
 //   drain()            async: the far side reads everything on the current connection again (backlog to zero) and
@@ -204,7 +204,51 @@ export function transportContract(name, makeTransport, opts = {}) {
         expect(t.congested()).toBe(false);
       });
 
+      // backlogBytes() (manager decision, p6-edge2v M1): the number the core's presence gate reads.
+      test("backlogBytes() is implemented, a number, and 0 on a fresh connection", () => {
+        expect(typeof t.backlogBytes).toBe("function");
+        expect(t.backlogBytes()).toBe(0);
+      });
+
+      test("bufferless: backlogBytes() stays 0 whatever is sent", async () => {
+        if (d.bufferless !== true) return;
+        for (let k = 0; k < 5; k++) t.send(pad(CONGESTED_BYTES));
+        expect(t.backlogBytes()).toBe(0);
+        await d.flush();
+        expect(t.backlogBytes()).toBe(0);
+      });
+
       const buffered = () => d.bufferless !== true;
+
+      test("backlogBytes() counts what is not yet on the wire, agrees with congested(), and is 0 after drain, reopen and close", async () => {
+        if (!buffered()) return;
+        const n = 20 * 1024, near = (v, want) => { expect(v).toBeGreaterThanOrEqual(want - 64); expect(v).toBeLessThanOrEqual(want + 256); };
+        await d.stall();
+        t.send(pad(n));
+        near(t.backlogBytes(), n);
+        t.send(pad(n));
+        near(t.backlogBytes(), 2 * n);
+        expect(t.congested()).toBe(t.backlogBytes() > CONGESTED_BYTES);
+        await d.trickle(n);
+        near(t.backlogBytes(), n);
+        await d.drain();
+        await d.stall();
+        t.send({ t: "pad", s: "é".repeat(n / 2) });     // 2 UTF-8 bytes per character: bytes, not characters
+        near(t.backlogBytes(), n);
+        await d.drain();
+        expect(t.backlogBytes()).toBe(0);
+        await d.stall();
+        t.send(pad(CONGESTED_BYTES + 1024));
+        expect(t.congested()).toBe(true);
+        expect(t.backlogBytes()).toBeGreaterThan(CONGESTED_BYTES);
+        reopen();
+        expect(t.backlogBytes()).toBe(0);
+        await d.stall();
+        t.send(pad(n));
+        expect(t.backlogBytes()).toBeGreaterThan(0);
+        close();
+        expect(t.backlogBytes()).toBe(0);
+      });
 
       test("watermark: under it not congested, over it congested, drained not congested", async () => {
         if (!buffered()) return;

@@ -14,53 +14,48 @@
 //   a gesture ends without a commit (Escape, a tool key, cancel) → replica.reconcile puts back the
 //   Replica's copy of what it only previewed
 //
-// ── Transport contract (one for every transport: web/ui/net.js shared and local, room-worker.js, localRoom,
-//    and a future WebSocket one) ──
-//   send(msg)        queue one message object on the current connection (a wire transport runs the codec).
-//   onMessage(fn)    fn(msg) for each message of the CURRENT connection, in order.
-//   reopen()         REQUIRED. Drop the current connection and open a new one. From the moment it is called,
-//                    no message (and no onDrop) of an older connection is ever delivered: a transport keeps a
-//                    generation per connection (localRoom: link.gen; net.js shared: a fresh link id each time)
-//                    and drops anything tagged with an old one. The room refuses a second hello on one
-//                    connection, so a transport without reopen() could never recover from a resync.
-//   close()          Finished for good: no reopen follows. Only the handle's close() calls it; sync.js's own
-//                    resync path never does (while down it ignores input, waits reconnectWait(), then reopen()).
-//   onDrop?(fn)      Optional. fn() when the current connection closed or errored WITHOUT sync.js asking (a
-//                    socket drop, before welcome or later). sync.js then counts it (replica.connectionFailed()),
-//                    waits reconnectWait() and reopens. A transport never reports a close sync.js started
-//                    (reopen, close) or one of an older connection.
+// Transport: web/ports/transport.js (its header is the contract this file relies on: reopen required, close final,
+// onDrop for unasked drops, backlogBytes for the presence gate). Clock: web/ports/clock.js, passed in by the root;
+// this file never reads the global clock, timers or random (core rule, test/web/architecture.test.js).
+// Presence gate (manager decision, p6-edge2v M1): a drag preview (presence k: "preview") goes out only
+// while transport.backlogBytes() <= PRESENCE_BACKLOG_BYTES (16 KB, about one frame in flight); above it the preview
+// is skipped, never queued: the next move or the commit supersedes it. Hello and real ops are never gated.
 
-import { Replica } from "../packages/protocol/replica.js";
-import { Room } from "../packages/protocol/room.js";
-import { tableAuth, MemoryLog } from "../packages/protocol/ports.js";
-import { presenceProblem, presenceLimiter, MAX_PREVIEW_ELEMENTS } from "../packages/protocol/presence.js";
-import { jsonCodec } from "../packages/protocol/codec.js";
-import { clone } from "../packages/core/model.js";
+import { Replica } from "../../packages/protocol/replica.js";
+import { presenceProblem, presenceLimiter, MAX_PREVIEW_ELEMENTS } from "../../packages/protocol/presence.js";
+import { clone } from "../../packages/core/model.js";
+import { PRESENCE_BACKLOG_BYTES } from "../ports/transport.js";
 
 // Editor calls after which a gesture may have ended (sync.js reconciles then). Wrapped on the instance;
 // core is untouched.
 const GESTURE_ENDS = ["pointerDown", "pointerUp", "key", "setTool"];
-const REAL_TIMERS = { set: (fn, ms) => setTimeout(fn, ms), clear: h => clearTimeout(h) };
 
 /**
  * Bind an Editor to a board stream over a transport. Takes over `editor.onOp` (a caller may wrap it after).
- * @param {import("../packages/core/editor.js").Editor} editor
- * @param {{ transport: { send(m: object): void, onMessage(fn: (m: object) => void): void, reopen(): void, close?(): void, onDrop?(fn: () => void): void },
+ * @param {import("../../packages/core/editor.js").Editor} editor
+ * @param {{ transport: import("../ports/transport.js").Transport,
  *           token: string, board: string, client?: string, stream?: string, onStatus?: (s: string) => void,
- *           timeoutMs?: number, timers?: { set(fn: () => void, ms: number): any, clear(h: any): void },
+ *           timeoutMs?: number, clock?: import("../ports/clock.js").Clock,
+ *           timers?: { set(fn: () => void, ms: number): any, clear(h: any): void },
  *           now?: () => number, random?: () => number }} o
+ *   clock: the clock port (the root passes browserClock()). timers / now / random: the same three separately (tests
+ *   pass a virtual network's); each one given wins over the clock's. Required: now and random, and timers unless
+ *   timeoutMs is 0. There is no global fallback.
  *   timeoutMs: kept for compatibility. The Replica now owns every deadline (rule 2's 10 s, rule 12's backoff);
  *   only 0 means something: no timers at all (a resync reconnects at once; nothing times out). Tests use it.
  *   now / random: the clock (ms) and jitter source handed to the Replica; tests pass a virtual clock.
  */
 export function bindEditor(editor, { transport, token: firstToken, board, client = "web", stream = "board", onStatus = () => {},
-  timeoutMs = 10_000, timers = REAL_TIMERS, now = Date.now, random = Math.random }) {
-  if (typeof transport?.reopen !== "function") throw new TypeError("bindEditor: the transport must have reopen() (see the transport contract in web/sync.js)");
+  timeoutMs = 10_000, clock = null, timers = clock ? { set: clock.set, clear: clock.clear } : null, now = clock?.now, random = clock?.random }) {
+  if (typeof transport?.reopen !== "function") throw new TypeError("bindEditor: the transport must have reopen() (web/ports/transport.js)");
+  if (typeof now !== "function" || typeof random !== "function" || (timeoutMs !== 0 && typeof timers?.set !== "function"))
+    throw new TypeError("bindEditor: pass the clock port (clock) or timers, now and random");
   const replica = new Replica({ client, now, random });
   let token = firstToken;
   const doc = () => replica.streams[stream];
   const timed = timeoutMs !== 0;
-  const limiter = presenceLimiter(now);
+  // Rate limits measure intervals: monotonic time when the clock port is given (p6-portsv R2-L4), else `now`.
+  const limiter = presenceLimiter(clock?.mono ?? now);
   // connecting → catching-up → live; "refused" (sign in again), "stopped" (the app must update)
   let status = "connecting";
   let resets = 0, timer = null, closed = false;
@@ -199,6 +194,7 @@ export function bindEditor(editor, { transport, token: firstToken, board, client
   function sendPreview(elements) {
     if (status !== "live") return;
     for (let i = 0; i < elements.length; i += MAX_PREVIEW_ELEMENTS) {
+      if ((transport.backlogBytes?.() ?? 0) > PRESENCE_BACKLOG_BYTES) return;   // presence gate: skip, never queue
       const m = replica.preview(stream, elements.slice(i, i + MAX_PREVIEW_ELEMENTS));
       if (presenceProblem(m, replica.role) === null && limiter.allow("preview")) send(m);
     }
@@ -249,7 +245,7 @@ export function bindEditor(editor, { transport, token: firstToken, board, client
     /** End a gesture without committing it (pointercancel): what it previewed goes back to the room's copy. */
     cancelGesture() { editor.g = null; editor.guides = []; editor.erasing = new Set(); reconcile(); editor.changed(); },
     /** Finished for good: no more sends, no timer, and the transport is closed (the only caller of its close()). */
-    close() { if (closed) return; closed = true; arm(); transport.close?.(); },
+    close() { if (closed) return; closed = true; arm(); transport.close(); },
     /** Live elements and settings of the bound stream, as plain data. */
     state: () => streamState(doc()),
     /** Every element (tombstones, versions, nonces) and settings of the bound stream, as plain data. */
@@ -291,119 +287,3 @@ export function seeded(seed = 1) {
   return () => { seed |= 0; seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
 }
 
-/**
- * An in-process reference room behind a gateway stand-in, with its own little network, for the dev page and
- * tests. Every message crosses the JSON codec; each link keeps its order (a WebSocket). The stand-in does
- * what a gateway does (rule 8): checks the token (refusing with `auth` itself), hands the room only
- * `{ user, role }` and `n`, and relays presence to the other links (rate-limited, checked; never to the room).
- * Delivery is queued, never synchronous: the room answers inside Editor.commit otherwise. `auto: true`
- * delivers on a microtask (the page); tests call `settle()` (or `step()` to interleave links). Which link
- * goes next is drawn from `seed`.
- * `clock: true` gives a virtual clock: pass `net.now` and `net.timers` to bindEditor, and `settle()` fires
- * due timers (advancing the clock) whenever the network is idle; `advance(ms)` moves it by hand.
- * @param {{ board?: string, tenant?: string, users: Record<string, { user: string, role: string }>, auto?: boolean, seed?: number, clock?: boolean }} o
- */
-export function localRoom({ board = "b1", tenant = "t1", users, auto = false, seed = 1, clock = false }) {
-  const time = { t: 0, q: [], n: 0 };
-  const now = clock ? () => time.t : Date.now;
-  const timers = {
-    set: (fn, ms) => { const h = ++time.n; time.q.push({ h, at: time.t + Math.max(0, ms), fn }); return h; },
-    clear: h => { time.q = time.q.filter(x => x.h !== h); },
-  };
-  const log = new MemoryLog();
-  const room = new Room({ board, tenant, log, now });
-  const auth = tableAuth(users);
-  const wire = m => jsonCodec.decode(jsonCodec.encode(m));
-  const links = [], own = seeded(seed), presence = [];
-  let scheduled = false;
-  const kick = () => { if (auto && !scheduled) { scheduled = true; queueMicrotask(() => { scheduled = false; settle(); }); } };
-
-  // Presence to every other welcomed link, as one gateway batch.
-  function relay(from, m) {
-    for (const l of links) if (l !== from && l.conn?.user) { l.down.push(wire({ t: "presence", batch: [m] })); kick(); }
-  }
-  function leave(link) { if (link.conn?.user) relay(link, { user: link.conn.user, client: link.conn.client, k: "leave" }); }
-
-  // A message from a client, as the gateway hands it on.
-  function up(link, msg) {
-    if (msg.t === "hello") {
-      const who = auth.check(msg.token, msg.board);
-      if (!who) { link.down.push(wire({ t: "error", code: "auth", message: "token refused" })); kick(); return; }
-      const { token, ...hello } = msg;
-      return room.receive(link.conn, hello, { n: ++link.n, ...who });
-    }
-    if (msg.t === "presence") {
-      const c = link.conn, ok = !!c.user && presenceProblem(msg, c.role) === null && link.limiter.allow(msg.k);
-      presence.push({ user: c.user, msg, ok });
-      if (ok) { const { t, ...rest } = msg; relay(link, { user: c.user, client: c.client, ...rest }); }
-      return;
-    }
-    room.receive(link.conn, msg, { n: ++link.n });
-  }
-
-  function join() {
-    const link = { up: [], down: [], handler: () => {}, dropped: () => {}, conn: null, gen: 0, n: 0, limiter: presenceLimiter(now), done: false };
-    // Every connection has its own generation: whatever the old one queued or still answers is never
-    // delivered once it is dropped (the transport contract in this file's header).
-    const drop = () => { if (link.conn) { leave(link); room.disconnect(link.conn); } link.conn = null; link.gen++; link.up = []; link.down = []; };
-    const open = () => {
-      if (link.done) return;
-      drop();
-      const gen = link.gen;
-      link.n = 0; link.limiter = presenceLimiter(now);
-      link.conn = room.connect(m => { if (link.gen === gen) { link.down.push(wire(m)); kick(); } });
-    };
-    open();
-    links.push(link);
-    return {
-      send: m => { if (link.conn) { link.up.push(wire(m)); kick(); } },
-      onMessage: fn => { link.handler = fn; },
-      onDrop: fn => { link.dropped = fn; },
-      reopen: open,
-      /** Finished for good: the link leaves the network. */
-      close: () => { drop(); link.done = true; const i = links.indexOf(link); if (i >= 0) links.splice(i, 1); },
-      /** Test hook: drop whatever is queued toward the client (a lost message). */
-      lose: () => { link.down = []; },
-      /** Test hook: the connection drops without the client asking (a socket closing); the client is told. */
-      fail: () => { if (!link.conn) return; drop(); link.dropped(); },
-    };
-  }
-
-  // One delivery on one link (client → room or room → client). False when nothing is queued.
-  function step(rng = own) {
-    const busy = links.filter(l => l.conn && (l.up.length || l.down.length));
-    if (!busy.length) return false;
-    const l = busy[Math.floor(rng() * busy.length)];
-    if (l.up.length && (!l.down.length || rng() < 0.5)) up(l, l.up.shift());
-    else l.handler(l.down.shift());
-    return true;
-  }
-  // The earliest due timer (virtual clock), the clock moved to it. False when none is set.
-  function tick(until = Infinity) {
-    if (!time.q.length) return false;
-    const next = time.q.reduce((a, b) => (b.at < a.at || (b.at === a.at && b.h < a.h) ? b : a));
-    if (next.at > until) return false;
-    time.q = time.q.filter(x => x !== next);
-    time.t = Math.max(time.t, next.at);
-    next.fn();
-    return true;
-  }
-  function settle(rng = own) {
-    let n = 0;
-    for (;;) {
-      while (step(rng)) if (++n > 1_000_000) throw new Error("network never settled");
-      if (!clock || !tick()) return;
-      if (++n > 1_000_000) throw new Error("timers never settled");
-    }
-  }
-  /** Move the virtual clock by `ms`, firing the timers due on the way (no deliveries). */
-  function advance(ms) { const until = time.t + ms; while (tick(until)); time.t = until; }
-
-  return {
-    join, step, settle, advance, tick: () => tick(), log, presence, now, timers,
-    get seq() { return room.seq; }, get pendingTimers() { return time.q.length; },
-    compact: () => room.checkpoint(),
-    state: stream => streamState(room.streams[stream ?? "board"]),
-    full: stream => fullState(room.streams[stream ?? "board"]),
-  };
-}

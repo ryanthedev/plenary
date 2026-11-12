@@ -1,11 +1,11 @@
 // Export: the board stream as SVG or PNG. Core's exportScene says what to paint, cropped (export.js);
 // writing pixels or markup is the adapter's job. The SVG writer is herdr-draw's adapters/svg/svg.js, ported
 // with its sanitising intact (board content is untrusted: an exported SVG opened in a browser must not run
-// anything). PNG paints the same items through web/paint.js onto a canvas, so it matches the screen.
+// anything). PNG paints the same items through ./paint.js onto a canvas, so it matches the screen.
 // Notes, selection, cursors and comments never show: only the board Editor's doc goes in.
 
-import { exportScene, boardTheme, LIGHT, DARK } from "../../packages/core/export.js";
-import { paint, imageCache, FACES } from "../paint.js";
+import { exportScene, boardTheme, LIGHT, DARK } from "../../../packages/core/export.js";
+import { paint, imageCache, FACES } from "./paint.js";
 
 const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 const num = (v, d = 0) => (Number.isFinite(+v) ? +v : d);

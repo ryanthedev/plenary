@@ -7,8 +7,8 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<!-- Plenary canvas. URL: ?board=<id>&as=<ada|bo|cy|di|ed|fi>&theme=light|dark&net=shared|local, and #token=<session> after sign-in
-     (dev tokens until sign-in is wired; web/ui/dev-users.js lists them). -->
+<!-- Plenary canvas (production): web/main.js over the server's /ws. URL: ?board=<id>&theme=light|dark, and
+     #code=<single-use code> after sign-in. The in-browser dev rooms live on web/dev-main.html (never served). -->
 <div class="app">
   <header class="topbar" id="topbar"></header>
   <div class="main">
@@ -31,6 +31,6 @@
   <footer class="timeline" id="timeline" hidden></footer>
 </div>
 <input type="file" id="picker" accept="image/png,image/jpeg,image/gif,image/webp,.excalidrawlib" multiple hidden>
-<script type="module" src="app.js"></script>
+<script type="module" src="main.js"></script>
 </body>
 </html>

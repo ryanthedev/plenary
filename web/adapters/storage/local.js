@@ -1,5 +1,5 @@
 // Storage adapter: the browser's localStorage (per origin, kept across sessions: the library, preferences).
-// NEVER for the session token (web/ui/token.js: sessionStorage only). Implements web/ports/storage.js.
+// NEVER for the session token (web/core/signin.js keeps it in session storage only). Implements web/ports/storage.js.
 // Same few lines as session.js on purpose: adapters never import each other.
 //
 // Every failure becomes STORAGE_UNAVAILABLE: the global missing, its getter throwing (SecurityError when site data

@@ -1,13 +1,16 @@
-// Dev page: two core Editors side by side, each bound (web/sync.js) to one in-process reference Room, each
-// painted by web/paint.js. A bare tool picker from TOOLS and nothing else: the product chrome comes after
-// the design mock. Everything protocol-side goes through web/sync.js.
+// Dev page: two core Editors side by side, each bound (web/core/sync.js) to one in-process reference Room
+// (web/adapters/transport/local.js), each painted by web/adapters/dom/paint.js. A composition root. A bare tool picker from TOOLS and nothing else: the product chrome comes after
+// the design mock. Everything protocol-side goes through web/core/sync.js.
 
 import { Editor, TOOLS } from "../packages/core/editor.js";
-import { bindEditor, localRoom } from "./sync.js";
-import { paint, imageCache, THEMES } from "./paint.js";
+import { bindEditor } from "./core/sync.js";
+import { localRoom } from "./adapters/transport/local.js";
+import { browserClock } from "./adapters/clock/browser.js";
+import { paint, imageCache, THEMES } from "./adapters/dom/paint.js";
 
 const USERS = { "dev-owner": { user: "ada", role: "owner" }, "dev-editor": { user: "bo", role: "editor" } };
 const net = localRoom({ users: USERS, auto: true });
+const clock = browserClock();
 
 let themeName = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 const panes = [];
@@ -27,7 +30,7 @@ function addPane(token, label) {
 
   const editor = new Editor();
   const pane = { editor, canvas, dirty: true, seen: -1, space: false };
-  const sync = bindEditor(editor, { transport: net.join(), token, board: "b1", client: label, onStatus: () => { pane.dirty = true; } });
+  const sync = bindEditor(editor, { transport: net.join(), token, board: "b1", client: label, clock, onStatus: () => { pane.dirty = true; } });
   pane.sync = sync;
   const image = imageCache(() => editor.doc.files, () => { pane.dirty = true; });
 

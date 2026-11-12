@@ -1,20 +1,23 @@
-// Where a page's transports come from (sync.js's transport port; its contract is in web/sync.js's header).
-//   shared: the SharedWorker room (room-worker.js → room-host.js): every tab of this browser on one board
-//           edits together.
-//   local:  an in-page reference Room (sync.js localRoom) when SharedWorker is missing. One tab only.
-// SEAM(phase 3): a WebSocket transport to the server goes here (wanted in sync.js: the codec lives there).
-// Also the Blobs stand-in: put(file) shares picture bytes; onFile(fn) receives them.
-
-import { localRoom } from "../sync.js";
-import { DEV_USERS } from "./dev-users.js";
+// Transport adapter, page side of the SharedWorker dev room: implements web/ports/net.js (join → a transport of
+// web/ports/transport.js, plus the blobs stand-in put/onFile). The worker side is host.js (driven over a MessagePort)
+// with worker.js as its entry. Every tab of this browser on one board edits together.
+//
+// Generation: one link id per connection. reopen() closes the old link and joins a new one, and only the current
+// link has handlers here, so nothing of an older connection is delivered.
+// Backpressure: bufferless. postMessage to a worker of the same browser has no network uplink to fill (the
+// MessagePort queue drains as fast as the worker's event loop; a stuck worker shows as silence, which the
+// Replica's watchdog turns into a resync), so congested() is false and backlogBytes() 0 (manager decision M2:
+// "decide its buffer" — decided: report none, rather than invent a worker-side cap that measures nothing real).
+// Without SharedWorker (an old Safari, Herdr) sharedNet returns null; the composition root falls back to localNet.
 
 /**
  * @param {{ board: string, url?: URL, worker?: { port: MessagePort } }} o
- *   worker: an object with a `port` (tests pass a fake); default a SharedWorker on room-worker.js.
+ *   worker: an object with a `port` (tests pass a fake); default a SharedWorker on worker.js.
+ * @returns {import("../../../ports/net.js").Net | null}  null when SharedWorker is missing or refuses to start.
  */
-export function sharedNet({ board, url = new URL("./room-worker.js", import.meta.url), worker }) {
+export function sharedNet({ board, url = new URL("./worker.js", import.meta.url), worker }) {
   if (!worker) {
-    try { worker = new SharedWorker(url, { type: "module", name: "plenary-room" }); } catch { return localNet({ board }); }
+    try { worker = new SharedWorker(url, { type: "module", name: "plenary-room" }); } catch { return null; }
   }
   const port = worker.port, handlers = new Map(), drops = new Map(), fileFns = [];
   let n = 0;
@@ -44,6 +47,8 @@ export function sharedNet({ board, url = new URL("./room-worker.js", import.meta
         onMessage: fn => { onMsg = fn; },
         onDrop: fn => { onDrop = fn; },
         reopen: open,
+        congested: () => false,
+        backlogBytes: () => 0,
         close: () => { done = true; open(); },
         /** Dev/test hook: this connection drops without the client asking. */
         fail: () => { if (link) port.postMessage({ t: "drop", link }); },
@@ -53,10 +58,3 @@ export function sharedNet({ board, url = new URL("./room-worker.js", import.meta
     onFile: fn => fileFns.push(fn),
   };
 }
-
-export function localNet({ board }) {
-  const net = localRoom({ board, users: DEV_USERS, auto: true });
-  return { kind: "local", join: () => net.join(), put: () => {}, onFile: () => {} };
-}
-
-export { DEV_USERS };

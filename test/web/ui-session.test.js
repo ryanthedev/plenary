@@ -1,9 +1,11 @@
 // The canvas session (web/ui/session.js): two Editors per person through the in-process reference Room,
 // role gating counted at the transport (no forbidden op ever leaves), and annotators' note ownership.
 import { test, expect } from "bun:test";
-import { localRoom, editorState } from "../../web/sync.js";
-import { createSession } from "../../web/ui/session.js";
+import { editorState } from "../../web/core/sync.js";
+import { localRoom } from "../../web/adapters/transport/local.js";
+import { createSession } from "../../web/core/session.js";
 import { TOOLS } from "../../packages/core/editor.js";
+import { browserClock } from "../../web/adapters/clock/browser.js";
 
 const USERS = {
   "t-ada": { user: "ada", role: "owner" }, "t-bo": { user: "bo", role: "editor" },
@@ -21,7 +23,7 @@ function person(net, token, o = {}) {
     t.onMessage = fn => on(m => { if (m.t === "error") sent.errors++; if (m.t === "welcome" && o.role?.()) m = { ...m, role: o.role() }; fn(m); });
     return t;
   };
-  const s = createSession({ join, token, board: "b1", client: token, user: USERS[token].user });
+  const s = createSession({ join, token, board: "b1", client: token, user: USERS[token].user, clock: browserClock() });
   s.setSize(1000, 700);
   s.sent_ = sent;
   return s;
@@ -185,4 +187,18 @@ test("a downgrade to viewer keeps the chrome, greys it, and sends nothing", () =
   expect(ada.sent_).toEqual(before);
   expect(ada.blocked).toBe(0);
   expect(ada.pending).toBe(0);
+});
+
+// p6-landv L5: the note lock compares a note's author with the user the ROOM named in welcome, never the page's
+// display identity (which comes from sign-in and is display-only).
+test("note lock: the author is checked against welcome.user, not the display identity passed in", () => {
+  const net = localRoom({ users: USERS, clock: true });
+  const s = createSession({ join: () => net.join(), token: "t-cy", board: "b1", client: "cy", user: "not-cy", noteAuthor: () => "cy", clock: net.clock });
+  expect(s.isMine("n1")).toBe(false);                 // before welcome: only the display identity, which isn't cy
+  net.settle();
+  expect(s.effective).toBe("annotator");
+  expect(s.isMine("n1")).toBe(true);                  // the room says this connection is cy
+  const other = createSession({ join: () => net.join(), token: "t-di", board: "b1", client: "di", user: "cy", noteAuthor: () => "cy", clock: net.clock });
+  net.settle();
+  expect(other.isMine("n1")).toBe(false);             // claiming "cy" for display doesn't make di the author
 });

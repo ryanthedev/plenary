@@ -3,7 +3,7 @@
 // devicePixelRatio first). Names are drawn with fillText, which never parses anything.
 // `view`: { toScreen({x, y}) → {x, y} } plus the zoom as `scale` or `view.scale` (an Editor works as is).
 
-import { LASER_FADE_MS } from "./presence-model.js";
+import { LASER_FADE_MS } from "../../../core/collab/presence-model.js";
 
 export const LASER = { light: "#e03131", dark: "#ff6b6b" };
 const FONT = '600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif';

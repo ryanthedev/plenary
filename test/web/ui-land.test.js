@@ -3,12 +3,13 @@
 // host posted before it saw a reopen is still in flight when the tab has moved on. Also: ?net=local
 // (localRoom), drafts kept across a drop (p6-uiv M1), the downgrade toast (L2), and `stopped` (p6-sync2v M2).
 import { test, expect } from "bun:test";
-import { localRoom, editorState } from "../../web/sync.js";
-import { createSession } from "../../web/ui/session.js";
-import { sharedNet } from "../../web/ui/net.js";
-import { roomHost } from "../../web/ui/room-host.js";
-import { pillFor } from "../../web/ui/roles.js";
-import { DEV_USERS } from "../../web/ui/dev-users.js";
+import { editorState } from "../../web/core/sync.js";
+import { localRoom } from "../../web/adapters/transport/local.js";
+import { createSession } from "../../web/core/session.js";
+import { sharedNet } from "../../web/adapters/transport/shared-worker/client.js";
+import { roomHost } from "../../web/adapters/transport/shared-worker/host.js";
+import { pillFor } from "../../web/core/roles.js";
+import { DEV_USERS } from "../../web/core/dev-users.js";
 
 // Two ends of a port; postMessage queues a structured clone for the other end until flush().
 function portPair() {
@@ -33,13 +34,13 @@ function settleAll(net, pairs) {
 
 // A browser with tabs on one SharedWorker room host (board b1, the dev users).
 function browser() {
-  const host = roomHost({ options: { clock: true } });
+  const host = roomHost({ makeNet: board => localRoom({ board, users: DEV_USERS, clock: true }) });
   const net = host.room("b1").net, pairs = [];
   const tab = as => {
     const pair = portPair(); pairs.push(pair);
     host.connect(pair.host);
     const n = sharedNet({ board: "b1", worker: { port: pair.tab } });
-    const s = createSession({ join: () => n.join(), token: `dev-${as}`, board: "b1", client: as, user: as, timers: net.timers, now: net.now });
+    const s = createSession({ join: () => n.join(), token: `dev-${as}`, board: "b1", client: as, user: as, clock: net.clock });
     s.setSize(1000, 700);
     return s;
   };
@@ -112,7 +113,7 @@ test("shared transport: a message or drop report the host posted for the old con
 
 test("?net=local (localRoom): a resync comes back live and the next drawing converges", () => {
   const net = localRoom({ board: "b1", users: DEV_USERS, clock: true });
-  const mk = as => { const s = createSession({ join: () => net.join(), token: `dev-${as}`, board: "b1", client: as, user: as, timers: net.timers, now: net.now }); s.setSize(1000, 700); return s; };
+  const mk = as => { const s = createSession({ join: () => net.join(), token: `dev-${as}`, board: "b1", client: as, user: as, clock: net.clock }); s.setSize(1000, 700); return s; };
   const ada = mk("ada"), bo = mk("bo");
   net.settle();
   ada.eds.board.setAppState({ bogus: 1 }); net.settle();
@@ -155,7 +156,7 @@ test("p6-uiv L2: a downgrade mid-typing drops the write and says so", () => {
   const net = localRoom({ board: "b1", users: DEV_USERS, clock: true });
   let role = null;
   const join = () => { const t = net.join(), on = t.onMessage; return { ...t, onMessage: fn => on(m => fn(m.t === "welcome" && role ? { ...m, role } : m)) }; };
-  const ada = createSession({ join, token: "dev-ada", board: "b1", client: "ada", user: "ada", timers: net.timers, now: net.now });
+  const ada = createSession({ join, token: "dev-ada", board: "b1", client: "ada", user: "ada", clock: net.clock });
   ada.setSize(1000, 700);
   net.settle();
   ada.setTool("text"); ada.pointerDown({ x: 300, y: 300 }); ada.pointerUp({ x: 300, y: 300 });
@@ -173,7 +174,7 @@ test("p6-sync2v M2: `stopped` wins the combined status and has its own pill, nev
   const net = localRoom({ board: "b1", users: DEV_USERS, clock: true });
   let deliver = null;
   const stub = { send() {}, onMessage: fn => { deliver = fn; }, reopen() {}, close() {} };
-  const s = createSession({ join: stream => (stream === "notes" ? stub : net.join()), token: "dev-ada", board: "b1", timers: net.timers, now: net.now });
+  const s = createSession({ join: stream => (stream === "notes" ? stub : net.join()), token: "dev-ada", board: "b1", clock: net.clock });
   deliver({ t: "welcome", seq: 0, role: "owner", user: "ada", rv: 999 });  // notes: rules this app doesn't know
   expect(s.binds.notes.status).toBe("stopped");
   expect(s.binds.board.status).toBe("connecting");

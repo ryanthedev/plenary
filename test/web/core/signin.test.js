@@ -73,9 +73,13 @@ describe("takeSignIn: the code in the fragment", () => {
     }
   });
 
-  test("a throwing replaceFragment is survived", async () => {
+  // Manager decision (p6-hexv, fail closed): a throwing replaceFragment is survived (no throw out of takeSignIn), but
+  // the code is never exchanged while it may still sit in the URL.
+  test("a throwing replaceFragment is survived, and fails closed: no exchange, outcome url-not-cleared", async () => {
     const r = await takeSignIn(env(`#code=${auth.mint()}`, { replaceFragment: () => { throw new Error("SecurityError"); } }));
-    expect(r.outcome).toBe("signed-in");
+    expect(r.outcome).toBe("url-not-cleared");
+    expect(r.token).toBeNull();
+    expect(calls).toEqual([]);
   });
 
   test("the share-link outcome comes through with or without a code", async () => {

@@ -67,6 +67,7 @@ describe("http auth adapter", () => {
     expect(init.credentials).toBe("same-origin");
     expect(init.headers).toEqual({ "Content-Type": "application/json" });
     expect(JSON.parse(init.body)).toEqual({ code });
+    expect(init.redirect).toBe("error");                // p6-edgev LOW-3: a redirect never carries the code on
   });
 
   test("base is a prefix of the path", async () => {

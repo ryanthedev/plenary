@@ -51,6 +51,23 @@ describe("virtual clock", () => {
 });
 
 describe("browser clock", () => {
+  // p6-portsv R2-L1: where performance.now exists, mono() IS it (not the Date.now clamp).
+  test("with performance.now present, mono() follows it, not Date.now", () => {
+    const perf = Object.getOwnPropertyDescriptor(globalThis, "performance"), realNow = Date.now;
+    let p = 1000;
+    try {
+      Object.defineProperty(globalThis, "performance", { value: { now: () => p }, configurable: true, writable: true });
+      Date.now = () => 5;
+      const c = browserClock();
+      expect(c.mono()).toBe(1000);
+      p = 1234.5;
+      expect(c.mono()).toBe(1234.5);
+    } finally {
+      Date.now = realNow;
+      if (perf) Object.defineProperty(globalThis, "performance", perf);
+    }
+  });
+
   test("without performance.now (Herdr's QuickJS), mono() is Date.now clamped: a backward wall step never shows", () => {
     const perf = Object.getOwnPropertyDescriptor(globalThis, "performance"), realNow = Date.now;
     let wall = 1_000_000;

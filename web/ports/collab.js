@@ -1,6 +1,6 @@
 // The collab port: everything the collaboration UI (web/collab) needs from the sync layer, and nothing else.
-// web/collab never imports packages/protocol; a later job (p7-wire) makes web/sync.js's bindEditor provide this
-// object and passes it to mountCollab (web/collab/ui.js). web/collab/fake-port.js is a stand-in for tests and
+// the collab UI never imports packages/protocol; a later job (p7-wire) makes web/core/sync.js's bindEditor provide this
+// object and passes it to mountCollab (web/adapters/dom/collab/ui.js). web/adapters/collab/fake.js is a stand-in for tests and
 // the dev page. Names are PROTOCOL.md v1.1's unless noted; "ADDED" marks what the p7-collab brief didn't list
 // but the UI needs.
 //
@@ -8,7 +8,7 @@
 //   role      string  the protocol role from `welcome.role`: owner | editor | annotator | commenter | viewer.
 //                     Never the UI's presenter/annotator/viewer: a commenter sends cursors and writes records.
 //   me        { user, name, client }   welcome.user, the signed-in display name, this connection's client id
-//   status    string  web/sync.js status names: connecting | catching-up | live | refused | stopped
+//   status    string  web/core/sync.js status names: connecting | catching-up | live | refused | stopped
 //   onStatus(fn(status, role)) → unsubscribe                                                        ADDED
 //             called when `status` or `role` changes (presence clears and the emote bar disables off live).
 //
@@ -16,8 +16,8 @@
 //   send(kind, fields)  one presence message, sent as-is: { t: "presence", k: kind, ...fields }.
 //             kind is the WIRE name: "cursor" {x, y} · "select" {stream, ids} · "laser" {pts: [[x, y, t]]} ·
 //             "emote" {e}. (The brief called the second one "selection"; on the wire and here it is "select".)
-//             web/collab/gate.js decides what to send and when (role table, rates, coalescing, the 10 s
-//             repeat); the port only forwards. `preview` is not sent from here: web/sync.js already sends it.
+//             web/core/collab/gate.js decides what to send and when (role table, rates, coalescing, the 10 s
+//             repeat); the port only forwards. `preview` is not sent from here: web/core/sync.js already sends it.
 //
 // ── Presence in ─────────────────────────────────────────────────────────────────────────────────────────────
 //   onPresence(fn(batch)) → unsubscribe   others' presence: [{ user, client, k, …fields }], k = cursor | select |

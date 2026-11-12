@@ -28,7 +28,7 @@ const TOKEN_MAX = 8192;
 
 /**
  * @typedef {{ user: string, name: string | null, email: string | null, domain: string | null }} Identity
- * @typedef {"signed-in" | "restored" | "none" | "bad-fragment" | "invalid-code" | "bad-origin" | "unavailable" | "network"} Outcome
+ * @typedef {"signed-in" | "restored" | "none" | "bad-fragment" | "url-not-cleared" | "invalid-code" | "bad-origin" | "unavailable" | "network"} Outcome
  * @typedef {{ token: string | null, identity: Identity | null, exp: number | null, outcome: Outcome,
  *             link: "invalid" | "unavailable" | null }} SignIn
  */
@@ -123,7 +123,7 @@ export function devSignIn({ query = "", allowed = null }) {
  * fails, the stored session (if any, unexpired) is returned, and `outcome` says what happened to the fragment.
  *
  * outcome: "signed-in" (exchanged now) · "restored" (stored session, no code) · "none" (neither) · "bad-fragment"
- * (rejected before any request) · or the exchange's final error ("invalid-code", "bad-origin", "unavailable",
+ * (rejected before any request) · "url-not-cleared" (replaceFragment threw: the code is never sent) · or the exchange's final error ("invalid-code", "bad-origin", "unavailable",
  * "network"). link: the share-link outcome from the fragment (exactly one `link=` of a known value), else null.
  *
  * @param {{ fragment: string, replaceFragment: () => void, storage: import("../ports/storage.js").Storage,
@@ -132,7 +132,10 @@ export function devSignIn({ query = "", allowed = null }) {
  */
 export async function takeSignIn({ fragment, replaceFragment, storage, auth, clock }) {
   // Off the address bar first, before anything can copy it (history, a bookmark, a screenshot, a referrer).
-  try { replaceFragment(); } catch {}
+  // Fail closed (manager decision, p6-hexv): if the fragment could not be dropped, the code is NOT exchanged (it would
+  // stay in the URL while it works); outcome "url-not-cleared", and the stored session (if any) is used as usual.
+  let cleared = true;
+  try { replaceFragment(); } catch { cleared = false; }
 
   const params = parseFragment(fragment);
   let link = null, code = null, outcome = null;
@@ -145,6 +148,7 @@ export async function takeSignIn({ fragment, replaceFragment, storage, auth, clo
     else if (codes.length > 0) outcome = "bad-fragment";
   }
 
+  if (code !== null && !cleared) { code = null; outcome = "url-not-cleared"; }
   if (code !== null) {
     let r = normalize(await auth.exchange(code));
     if (RETRYABLE.includes(r.error) && !r.final) {
@@ -164,4 +168,56 @@ export async function takeSignIn({ fragment, replaceFragment, storage, auth, clo
     token: kept?.token ?? null, identity: kept?.identity ?? null, exp: kept?.exp ?? null,
     outcome: outcome ?? (kept ? "restored" : "none"), link,
   };
+}
+
+/**
+ * The page's whole sign-in choice (p6-hex; was web/ui/token.js chooseSignIn + app.js). In order:
+ *   1. an explicit, known `?as=<name>` (one of devUsers' "dev-<name>" keys) is the dev path: token "dev-<name>". The
+ *      fragment is still dropped from the address bar, but nothing in it is exchanged or stored (p6-landv L2);
+ *   2. else takeSignIn: a `#code` exchanged now, or the stored session;
+ *   3. else dev `fallback` (the in-browser rooms' default user).
+ * `dev` names the dev user (null for a real session). `identity` is display-only (p6-landv L5): the room decides the
+ * real user and role on every hello. `outcome`/`link` say what happened to the fragment (signInNotice words it).
+ * @param {{ query: string, fragment: string, replaceFragment: () => void, storage: import("../ports/storage.js").Storage,
+ *           auth: import("../ports/auth.js").Auth, clock: import("../ports/clock.js").Clock,
+ *           devUsers: Record<string, object>, fallback?: string }} o
+ * @returns {Promise<SignIn & { dev: string | null }>}
+ */
+export async function pageSignIn({ query, fragment, replaceFragment, storage, auth, clock, devUsers, fallback = "ada" }) {
+  const names = Object.keys(devUsers).filter(k => k.startsWith("dev-")).map(k => k.slice(4));
+  const dev = devSignIn({ query, allowed: names });
+  if (dev) {
+    try { replaceFragment(); } catch {}
+    const links = parseFragment(fragment)?.get("link") ?? [];
+    const link = links.length === 1 && LINKS.includes(links[0]) ? links[0] : null;
+    return { ...dev, dev: dev.token.slice(4), link };
+  }
+  const s = await takeSignIn({ fragment, replaceFragment, storage, auth, clock });
+  if (s.token) return { ...s, dev: null };
+  return { token: `dev-${fallback}`, identity: null, exp: null, outcome: s.outcome, link: s.link, dev: fallback };
+}
+
+/**
+ * What to tell the person after sign-in, or null. Never blames the person for a code the network spent (p6-edgev
+ * LOW-4: a lost answer then a retry reads as invalid-code), and says when the tab is still someone else (LOW-5).
+ * @param {SignIn & { dev?: string | null }} s
+ * @param {string | null} [still]  the display name the tab is still signed in as, when an exchange failed
+ */
+export function signInNotice(s, still = null) {
+  const parts = [];
+  if (s.link === "invalid") parts.push("That share link is not valid (it may have expired).");
+  else if (s.link === "unavailable") parts.push("Share links are unavailable right now. Try the link again later.");
+  const failed = {
+    "bad-fragment": "That sign-in link wasn't readable.",
+    "url-not-cleared": "Sign-in stopped: the sign-in link couldn't be removed from the address bar.",
+    "invalid-code": "That sign-in link has expired or was already used.",
+    "bad-origin": "Sign-in isn't set up for this address.",
+    unavailable: "Sign-in couldn't finish: the server didn't answer.",
+    network: "Sign-in couldn't finish: no connection.",
+  }[s.outcome];
+  if (failed) {
+    parts.push(failed);
+    parts.push(s.dev === null && s.token && still ? `Still signed in as ${still}.` : "Sign in again.");
+  }
+  return parts.length ? parts.join(" ") : null;
 }

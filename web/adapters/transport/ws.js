@@ -193,7 +193,29 @@ export function wsTransport({ url, WebSocket: WS, codec = jsonCodec, maxQueued =
       if (done || !c || c.dropped) return false;
       return backlog(c) > watermark;
     },
+    /** The current connection's backlog in bytes (queued before open + bufferedAmount); 0 when closed or dropped. */
+    backlogBytes() {
+      const c = cur;
+      if (done || !c || c.dropped) return 0;
+      return backlog(c);
+    },
     reopen() { if (!done) open(); },
     close() { done = true; retire(cur); cur = null; },
   };
+}
+
+/**
+ * The net (web/ports/net.js) over WebSockets: one wsTransport per join() to the same gateway URL. No blob path yet
+ * (pictures go through signed blob URLs in v1; until then put does nothing and onFile never fires).
+ * @param {{ url: string, WebSocket: new (url: string) => any, clock?: Pick<import("../../ports/clock.js").Clock, "mono" | "set" | "clear"> }} o
+ * @returns {import("../../ports/net.js").Net}
+ */
+export function wsNet({ url, WebSocket: WS, clock }) {
+  if (typeof url !== "string" || !/^wss?:\/\//.test(url)) throw new TypeError("wsNet: a ws:// or wss:// url is required");
+  return { kind: "ws", join: () => wsTransport({ url, WebSocket: WS, ...(clock ? { clock } : {}) }), put: () => {}, onFile: () => {} };
+}
+
+/** The gateway's URL for a page at `loc` (same origin, path /ws; wss on https). Never carries a token. */
+export function sameOriginWsUrl(loc) {
+  return `${loc.protocol === "https:" ? "wss:" : "ws:"}//${loc.host}/ws`;
 }

@@ -38,7 +38,7 @@ export function createPresence({ now, me, role, flags = FLAGS }) {
   const key = (u, c) => `${u}\n${c}`;
   const isMe = (u, c) => u === me.user && c === me.client;
 
-  const self = {
+  const model = {
     get role() { return role; },
     setRole(r) { role = r; },
     roleOf: user => writerBy.get(user)?.role ?? null,
@@ -46,7 +46,7 @@ export function createPresence({ now, me, role, flags = FLAGS }) {
     /** Should I see this user's cursor, selection and previews? */
     shows(user) {
       if (role !== "viewer" || !flags.viewersSeePresentersOnly) return true;
-      return PRESENTER.includes(self.roleOf(user));
+      return PRESENTER.includes(model.roleOf(user));
     },
 
     /** One `presence` batch. */
@@ -54,7 +54,7 @@ export function createPresence({ now, me, role, flags = FLAGS }) {
       const t = now();
       for (const m of Array.isArray(batch) ? batch : []) {
         if (!m || typeof m.user !== "string" || typeof m.client !== "string" || isMe(m.user, m.client)) continue;
-        if (m.k === "leave") { self.leave(m.user, m.client); continue; }
+        if (m.k === "leave") { model.leave(m.user, m.client); continue; }
         const k = key(m.user, m.client);
         const p = peers.get(k) ?? { user: m.user, client: m.client, at: t, lasers: [] };
         peers.set(k, p); p.at = t;
@@ -63,7 +63,7 @@ export function createPresence({ now, me, role, flags = FLAGS }) {
         else if (m.k === "laser" && Array.isArray(m.pts) && m.pts.length) {
           const pts = m.pts.filter(q => Array.isArray(q) && q.length === 3 && q.every(Number.isFinite));
           if (pts.length) p.lasers.push({ at: t, pts });
-        } else if (m.k === "emote" && EMOTES.includes(m.e)) self.float(m.e, m.user);
+        } else if (m.k === "emote" && EMOTES.includes(m.e)) model.float(m.e, m.user);
       }
     },
     leave(user, client) { peers.delete(key(user, client)); },
@@ -96,10 +96,10 @@ export function createPresence({ now, me, role, flags = FLAGS }) {
 
     /** What to draw now. */
     view() {
-      self.prune();
+      model.prune();
       const t = now(), cursors = [], selections = [], lasers = [];
       for (const p of peers.values()) {
-        const name = self.nameOf(p.user) ?? "Someone", color = colorOf(p.user), show = self.shows(p.user);
+        const name = model.nameOf(p.user) ?? "Someone", color = colorOf(p.user), show = model.shows(p.user);
         if (show && p.cursor) cursors.push({ user: p.user, client: p.client, name, color, x: p.cursor.x, y: p.cursor.y });
         if (show && p.select?.ids.length) selections.push({ user: p.user, client: p.client, name, color, stream: p.select.stream, ids: p.select.ids });
         for (const l of p.lasers) {
@@ -113,5 +113,5 @@ export function createPresence({ now, me, role, flags = FLAGS }) {
       return { cursors, selections, lasers, floaters: floaters.map(f => ({ ...f, age: t - f.at })), counts, here };
     },
   };
-  return self;
+  return model;
 }

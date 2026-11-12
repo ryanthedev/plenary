@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Plenary collab dev</title>
 <link rel="stylesheet" href="../style.css">
-<link rel="stylesheet" href="collab.css">
+<link rel="stylesheet" href="../adapters/dom/collab/collab.css">
 <style>
   .devbar { font-size: 11px; color: var(--muted); }
   .devbar select { font: inherit; }
@@ -17,7 +17,7 @@
 </style>
 </head>
 <body>
-<!-- The collaboration UI over the fake port (web/collab/fake-port.js), with two fake peers and a crowd.
+<!-- The collaboration UI over the fake port (web/adapters/collab/fake.js), with two fake peers and a crowd.
      Serve the repo root over HTTP (module scripts don't load from file://) and open /web/collab/dev.html.
      URL: ?role=owner|editor|annotator|commenter|viewer&theme=light|dark&open=<thread id>&drawer=notes|comments
      &picker=1&pending=1&conn=offline&still=1 (no animation: for screenshots). -->

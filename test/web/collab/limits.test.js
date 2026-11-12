@@ -2,7 +2,7 @@
 import { test, expect } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import * as L from "../../../web/collab/limits.js";
+import * as L from "../../../web/core/collab/limits.js";
 import * as P from "../../../packages/protocol/presence.js";
 import { ROLES, CAPS, MAX_ID_CHARS, canWrite, canModerate } from "../../../packages/protocol/envelope.js";
 

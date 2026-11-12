@@ -1,6 +1,6 @@
 // Others' presence: expiry, leave, names from `here`, who sees whose cursor, emotes vs counts.
 import { test, expect } from "bun:test";
-import { createPresence, colorOf, initials, LASER_FADE_MS } from "../../../web/collab/presence-model.js";
+import { createPresence, colorOf, initials, LASER_FADE_MS } from "../../../web/core/collab/presence-model.js";
 import { presenceCoalescer } from "../../../packages/protocol/presence.js";
 import { fakeClock } from "./clock.js";
 

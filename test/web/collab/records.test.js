@@ -1,8 +1,8 @@
 // Comment threads: order with the pending overlay, anchors following and detaching, rights per role, and the
 // fake port's records reducer agreeing with the protocol's Records.
 import { test, expect } from "bun:test";
-import { recordsView, newRecordId, ago } from "../../../web/collab/records-model.js";
-import { createFakePort, applyRecord } from "../../../web/collab/fake-port.js";
+import { recordsView, newRecordId, ago } from "../../../web/core/collab/records-model.js";
+import { createFakePort, applyRecord } from "../../../web/adapters/collab/fake.js";
 import { Records } from "../../../packages/protocol/records.js";
 import { ROLES } from "../../../packages/protocol/envelope.js";
 
@@ -110,8 +110,15 @@ test("records reducer (fake port) equals the protocol's Records on the same acti
 });
 
 test("record ids are ≤ 64 chars and differ; ago() reads", () => {
-  const ids = new Set(Array.from({ length: 200 }, () => newRecordId()));
+  const ids = new Set(Array.from({ length: 200 }, () => newRecordId(Math.random)));
   expect(ids.size).toBe(200);
   for (const id of ids) expect(id.length).toBeLessThanOrEqual(64);
   expect([ago(0, 10_000), ago(0, 180_000), ago(0, 7_200_000), ago(0, 3 * 86_400_000)]).toEqual(["now", "3 min", "2 h", "3 d"]);
+});
+
+test("newRecordId takes its random source from the caller (the clock port), never Math.random", () => {
+  expect(() => newRecordId()).toThrow(TypeError);
+  const real = Math.random;
+  Math.random = () => { throw new Error("core read Math.random"); };
+  try { expect(newRecordId(() => 0)).toBe("c" + "a".repeat(14)); } finally { Math.random = real; }
 });

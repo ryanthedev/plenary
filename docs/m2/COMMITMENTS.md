@@ -19,6 +19,7 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 | 1 | Phase 1 protocol v1 spec, shown to the CEO (not a gate; phase 2 starts on PASS) | DONE 28fa91d (audited by proxy, pushed 32cc915; shown to the CEO with 3 open questions) | manager engine t14j, brief docs/m2/briefs/manager-engine.md |
 | 2 | Phase 6 design mock, shown to the CEO (not a gate; phase 6 build starts on PASS) | DONE 7536d50 (round 2 PASS; shown to the CEO) | manager client t14k, brief docs/m2/briefs/manager-client.md |
 | 3 | Ask the CEO for the Google OAuth client (env vars, never chat) when phase 5 starts | ASKED 2026-11-11 (p5-http 4fad32a done; sign-in answers 503 until set) | |
+| 5 | Hexagonal architecture enforced (boundary test) and the systems design skill used on every design-bearing job; architecture audit per track | RUNNING | OFFICE.md "Architecture"; managers told |
 | 4 | drawh change is a proposal only; herdr-draw untouched without the CEO | RUNNING (fix round, 2 HIGH) | patch built (applies to herdr-draw 5dfe352, its tests 269 pass), verifier t155; goes to the CEO after PASS; needs a refresh after phase 2 |
 
 ## Decisions (reversible; the CEO may overturn)

@@ -28,7 +28,8 @@ hc run --bg --no-parent --cwd /Users/r/repos/plenary \
   --label herdr.space=sp21a427967d02459948b4c10156ff82ae --label plenary=<job> \
   --label plenary.reports-to=<your terminal id> \
   -- zsh -lic 'exec "$@"' zsh claude --model opus --permission-mode auto --settings /Users/r/.config/claude/settings.shared.json --plugin-dir /Users/r/repos/engram \
-  --plugin-dir /Users/r/repos/herderp --plugin-dir /Users/r/repos/sdd "Read <brief path> and do it."
+  --plugin-dir /Users/r/repos/herderp --plugin-dir /Users/r/repos/sdd \
+  --plugin-dir /Users/r/repos/systems-design.skill "Read <brief path> and do it."
 ```
 
 `--model opus --permission-mode auto` are required: under the login shell a session came up as Fable 5.2 in manual
@@ -66,6 +67,23 @@ Herdr tabs stay the unit of ownership; the sdd MCP tools (every session has the 
    in git worktrees, then own and review the diff before it lands. The builder answers for every line.
 3. **Mock assets:** agy or codex image generation where it helps the design mock.
 4. **Before a big fan-out**, check `usage` and quota.
+
+## Architecture (CEO, 2026-11-11: "make sure we are doing hexagonal application architecture and use the systems design skill")
+
+- **Hexagonal (ports and adapters), everywhere.** The core (packages/protocol: Room, Replica, codec; the server's
+  room host and gateway logic; web/'s sync and UI state) depends only on ports, never on an adapter or a framework.
+  - **Driven ports:** Store, Registry, Bus, Blobs, Auth, Clock, Transport, Log. Adapters sit in their own folder
+    (`server/store/sqlite.js`, `server/bus/nats.js`, `web/transport/ws.js`, ...).
+  - **Driving adapters:** HTTP, WebSocket and the browser's DOM call into the core through its public API.
+  - **Composition roots:** `server/main.js` and the web entry are the only files that pick adapters and wire them.
+  - **Dependency rule:** an adapter never imports another adapter, and the core never imports an adapter. Every
+    port has a contract test that every adapter of it passes (like `registryContract`). A boundary test
+    (`test/architecture.test.js`, engine owns it; client adds web/ rules) fails the build on a wrong import.
+- **Systems design skill:** every design-bearing brief (new component, port, scaling or failure behaviour) tells the
+  builder to apply the `distributed-systems-design` skill (APPLIER mode) before writing code. Every verifier of such
+  a job runs it in CHECKER mode against the design and reports what it found. The skill lives at
+  `/Users/r/repos/systems-design.skill` (pass `--plugin-dir` for it in the start command); if it doesn't show in the
+  skill list, read `skills/distributed-systems-design/SKILL.md` and its `references/` directly.
 
 ## Recycling (context efficiency)
 

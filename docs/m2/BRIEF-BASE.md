@@ -16,3 +16,7 @@
   git worktrees and own the diff; check usage/quota before a big fan-out. Your Herdr tab still owns the job.
 - Never `pkill`/`killall` by pattern (OFFICE.md, Cleaning up sessions): record the PIDs of browsers and servers you
   start, kill only those, and use free ports (port 0), never hard-coded ones.
+- Architecture (OFFICE.md, "Architecture"): hexagonal. Core code depends only on ports; adapters live in their own
+  folder and never import each other; only composition roots (server/main.js, the web entry) wire adapters; every
+  adapter passes its port's contract test. For any design-bearing job, apply the `distributed-systems-design` skill
+  (builders: APPLIER mode before coding; verifiers: CHECKER mode on the design) and say so in your report.

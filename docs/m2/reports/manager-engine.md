@@ -4,17 +4,17 @@ Manager terminal: `t18m` (tab `manager engine`; successor of t14j, retired 2026-
 
 ## Workers (current; updated every turn)
 
-In flight: p2-swap (t1dh, name plenary-p2-swap) in worktree /Users/r/repos/plenary-p2 (p2-land rebased on main, head
+In flight: p2-swap (t1fm, name plenary-p2-swap2; t1dh retired) in worktree /Users/r/repos/plenary-p2 (p2-land rebased on main, head
 892ee6e); t18c fixing R5-M1 (Linux burst test, test only) in the shared tree. Proxy t1bx holds the push until R5-M1
 and platform's p5-tidy land: ping t1bx when R5-M1 commits. After p2-swap: verifier (CHECKER) + client p6-landv
 already PASS, then one merge into main, send id to t14k and t1bx; then p-arch + architecture audit.
 
 | Job | Terminal | Status |
 |---|---|---|
-| p2-swap (builder) | t1dh | RUNNING (worktree) |
+| p2-swap (builder, successor plenary-p2-swap2) | t1fm | RUNNING (worktree; handoff docs/m2/handoff/p2-swap.md) |
 
 On main: 7b6a5dd scaffold, b804f3b p4-pg, bbdae0e p4-natss3. On p2-land: a68e9dc v1.1 code, 892ee6e client.
-Closed: t15q (+ its worktree), t186, t188, t18c, t18b, t171, t16y, t158, t17d, t17p, t17f, t17m, t17j. Leftover scratch: t17j ~1 GB and t18c 168 MB in their
+Closed: t1dh, t15q (+ its worktree), t186, t188, t18c, t18b, t171, t16y, t158, t17d, t17p, t17f, t17m, t17j. Leftover scratch: t17j ~1 GB and t18c 168 MB in their
 scratchpads (their rm was refused); remove when convenient.
 
 ## 2026-11-11 phase 1 (protocol v1 spec)
@@ -208,3 +208,4 @@ scratchpads (their rm was refused); remove when convenient.
 - R5-M1 committed ffd2a11 (test only; re-ran 3x 22/0). Proxy t1bx told. t1dh told to cherry-pick ffd2a11 into p2-land. t18c closed.
 - CEO rule (2026-11-12): never prompt/hc send the proxy t1bx; report by ending the turn with one short message (outcome first, report path); 'URGENT' first if urgent. Phase 3 audited and pushed to origin (378d089, clean 510/0).
 - Closed t15q, t186, t188 (work committed); removed t15q's scratch worktree. p2-swap t1dh handing off at 36% (finishing a welcome-ordering fix first); successor expected same turn.
+- t1dh handed off to t1fm (plenary-p2-swap2); t1dh closed. Told platform t187: deploy/cluster.compose.yml needs COOKIE_KEY (main.js refuses cluster mode without it after p2-swap).

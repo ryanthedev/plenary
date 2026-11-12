@@ -204,3 +204,12 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 - Mount hook proposed to engine (t14j): `httpRoutes(deps) → (req) => Response | null`; awaiting their answer.
 - Engine agreed the hook: httpRoutes(deps) → async (req, url) => Response | null, mounted via createServer({ http }) AFTER engine routes; /health, /ws, /blobs/*, /metrics reserved for engine; return own 4xx/5xx (throws become 500). Engine wires main.js when http.js lands: tell t14j then. Relayed to t17b.
 - p5-http built (291 pass). Decision: Bearer accepts dev tokens only when a dev verifier is configured. Engine told http.js landed (wire against the commit). Verifier t17c.
+
+## 2026-11-11 pd-drawh fix round result; seeding decision
+
+- H1 re-measured with the verifier's scripts: 15 of 1,560 saves lost before; 0 of 4,541 with the default atomic
+  swap (~46 ms per write); 0 of 3,842 with the hard-link fallback as shipped. H2, M1-M5, L1-L6 fixed.
+  Patch: applies cleanly, herdr-draw 282 pass, plenary 292 pass, herdr-draw checkout untouched.
+- Decision (mine, reversible; engine told via proxy): renumber on seeding only the elements the room would refuse
+  (absent and version > 1,000). Renumbering all of them let a pane with the file open silently overwrite later
+  edits (builder's test). Sent to t14y; t155 re-checks after.

@@ -6,9 +6,19 @@ Manager terminal: `t14j` (tab `manager engine`). Parent: proxy `t14h`.
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| p3-scaffold (builder) | t14z | done p3-scaffold (engine) | fix round RUNNING (23% context; runs Fable 5.2) |
-| p2-recovery (builder) | t15q | worker p2-recovery (engine): room recovery | RUNNING |
+| p3-fix4 (builder) | t18c | worker p3-fix4 (engine): scaffold fix round 4 | RUNNING (from the handoff) |
+| p2-recovery (builder) | t15q | done p2-recovery (engine) | reported, idle (kept for a fix round) |
+| p2-recoveryv (verifier) | t171 | verifier p2-recoveryv (engine): room recovery | RUNNING (in worktree plenary-p2) |
 | p3-scaffoldv (verifier) | t158 | done p3-scaffoldv (engine): FAIL, 1 HIGH | FAIL reported, idle |
+| p4-pg (builder) | t17d | done p4-pg (engine) | reported, idle |
+| p4-pgv (verifier) | t17p | verifier p4-pgv (engine): Postgres store + registry | PASS, idle |
+| p4-natss3 (builder) | t17f | done p4-natss3 (engine) | reported, idle |
+| p4-natss3v (verifier) | t17m | verifier p4-natss3v (engine): NATS bus + S3 blobs | RUNNING |
+| p1-v11 (builder) | t186 | done p1-v11 (engine) | reported, idle |
+| p1-v11v (verifier) | t188 | verifier p1-v11v (engine): protocol v1.1 spec | RUNNING |
+| p11-proto (builder) | t18b | worker p11-proto (engine): protocol v1.1 code | RUNNING (worktree: packages/protocol, test/*.js) |
+| p3-scaffoldv2 (re-verifier) | t16y | verifier p3-scaffoldv2 (engine): server scaffold, round 2 | FAIL reported, idle |
+| p3-scaffoldv3 (re-verifier) | t17j | verifier p3-scaffoldv3 (engine): server scaffold, round 3 | RUNNING |
 
 ## 2026-11-11 phase 1 (protocol v1 spec)
 
@@ -105,3 +115,72 @@ Manager terminal: `t14j` (tab `manager engine`). Parent: proxy `t14h`.
   re-verification.
 - Queued for the next spec touch: § Tenancy authoritative email = email_verified AND (@gmail.com OR hd == email
   domain) (platform; gmail does not skip email_verified). Plus p1-seamv's 2 MEDIUM / 7 LOW.
+- t14z: fix round + Registry wired into main.js (restart and 3x kill -9 tests through main.js); 261 pass.
+  Gateway now refuses v0 `transient` previews (`bad-op`): client's drag previews stop reaching peers until
+  presence (told the proxy). Re-verifier p3-scaffoldv2 t16y started.
+- On phase 2 commit: tell manager client (t14k) directly with the commit id, as well as the proxy (client's p6-sync2 moves drag previews to presence on it).
+- p2-recovery (t15q) reported: built, 79 top-level tests (25 runs green); landing alone turns 31 other-track
+  tests red (17 test/server, 14 test/web). **Decision: land as one commit with the seam swaps, never red.** Patch
+  applied on branch `p2-land`, worktree /Users/r/repos/plenary-p2, commit 359c50d (167 green there); patch copy in
+  my scratchpad. Accepted readings: resends keep their bytes (only never-sent ops re-stamped), eight emotes,
+  records.js. Verifier p2-recoveryv t171 runs in the worktree. Next: after p3-scaffoldv2 passes and the scaffold
+  commits, rebase p2-land and start an engine swap job (room-host.js, gateway.js, rig.js) on it; recommended to the
+  proxy that client's p6-sync2 builds web/sync.js on the same branch. Leftover: t15q's scratch worktree at its
+  scratchpad/wt (remove with `git worktree remove --force` after landing).
+- Queued for the next spec touch: name the emote set and add records.js to the phase-2 file list.
+- Proxy approved the landing plan: client commits p6-base on main and pings me; I rebase p2-land (after the
+  scaffold commits too); client's p6-sync2 works in the p2-land worktree on web/sync.js + test/web/ only; my swap
+  job does room-host.js, gateway.js, rig.js there. One commit, all green, after the verifiers pass; I merge; the
+  proxy audits phase 2 on that commit before pushing.
+- p2-land rebased onto client's f1886d5 (head b8bf648); top-level 79/79, 54 test/web reds expected (p6-sync2). Told t14k the worktree is ready and that Replica wait()/reconnectWait() own ack timeout + backoff; told t171 the new commit id.
+- Phase 4 env (confirmed to platform t14q): DATABASE_URL, NATS_URL, S3_* (Bun S3), PLENARY_NODE_ID (unique, stable per node), PLENARY_ROLES=gateway,host (default both; compose runs a gateway-only and a host-only node). NATS max_payload 2 MB per § Bus, not the 1 MB default.
+- p2-recoveryv t171: **PASS** (docs/m2/reports/p2-recoveryv.md): no HIGH/MEDIUM, 4 LOW; 6,000 convergence runs with restarts, 800 recovery runs with records, resend-after-resync logged once; the loosened assertion is a nonce tie (harmless). Swap brief drafted: docs/m2/briefs/p2-swap.md (starts after the scaffold commits and p2-land is rebased).
+- Platform's cluster env committed 33b4cd8: deploy/cluster.compose.yml (Postgres, NATS 2 MB, S3, 3 nodes with PLENARY_ROLES gateway/host/both behind Caddy); CI has Postgres + NATS services with TODO hooks for phase-4 tests.
+- Client p6-sync2 built in the worktree (252/252); verifier t176 there. Two Replica findings from it (presence ignores stream; no backoff growth for a socket that drops before welcome) sent to t15q as fix round 2 in the worktree (replica.js + test/replica.test.js, backward-compatible). Ping t14k before any p2-land rebase.
+- t15q fix round 2 done (previewsOf(stream), connectionFailed(); 254/254 in worktree). Verifier t171 re-checking it; API sent to t14k.
+- t171 fix-round-2 check: FAIL (MEDIUM): backoff resets on welcome when already caught up, so welcome-then-drop storms at 500 ms (rule 12 as written). Decision: reset only after caught up AND 10 s connected (checked at the next failure). t15q fix round 3: rule 12 in the worktree's PROTOCOL.md + replica.js + test.
+- Client p6-ui committed on main 3c32a5f (built on old sync.js); p2-land needs it on the next rebase. Rebase order: wait for t15q round 3 + t171 check, t16y scaffold verdict + scaffold commit, then ping t14k, then rebase --autostash.
+- p3-scaffoldv2 t16y: **FAIL** (docs/m2/reports/p3-scaffoldv2.md). H1: catch-up sent as one frame vs a 256 MB bound:
+  an annotator's 280 legal ~1 MB rewrites make a board unjoinable (survives restart); non-reading viewers pin ~a
+  board's size each (no budget, presence keeps them alive). M1 burst freezes the process; M2 unmarked spec
+  divergences. Flaky gateway convergence test = L5, a test timing bug in rig.js settled() (not a server bug).
+  Sent back to t14z (31%): stream catch-up in bounded frames with backpressure; fold tail by bytes; process
+  buffered-bytes budget + per-user connection cap; yield in bursts; fix settled(); 50x stability run.
+- t171: fix round 3 PASS. Committed fix rounds 2-3 on p2-land as 3ba2495 (PROTOCOL.md rule 12, replica.js, test/replica.test.js); client's web files stay uncommitted in the worktree. Phase 2 protocol side is done; waiting on the scaffold fix round 2 (t14z) before rebase + swap.
+- Agreed with platform (t14q) on HTTP mount: server/auth/http.js httpRoutes(deps) -> async (req, url) => Response|null, passed as createServer({ http }); engine routes first; reserved /health, /ws, /blobs/*, /metrics; Bearer OK for browsers/admin, nothing drawh needs behind Bearer-only. main.js wiring is engine's, after http.js lands.
+- Platform's server/auth/http.js landed uncommitted (verifier p5-httpv). Wire main.js against the committed version when t14q sends the commit id: http: httpRoutes({ registry, sessions, oidc, tenancy, now, config, dev? }).
+- Phase 4 adapters started in parallel (proxy: keep the train moving), new files only, disjoint from t14z:
+  p4-pg (t17d): Postgres Store + Registry (Bun.sql, registryContract, FOR UPDATE last-owner), store-contract.js;
+  p4-natss3 (t17f): NATS Bus + S3 Blobs (Bun S3Client), bus/blobs contract files, adds the NATS client dep. Tests
+  skip without DATABASE_URL / NATS_URL / S3_ENDPOINT. Allowed local installs: brew postgresql@17, nats-server (no
+  brew services); minio already installed. Leases/takeover wait for phase 3's commit.
+- drawh seeding refined (platform, agreed): send elements unchanged except ones the room would refuse (absent AND version > 1,000), renumbered to 1 (platform's test showed 1,000 lets stale 1,001-2,000 copies overwrite silently; I agreed), fresh nonce. Queued for the next spec touch.
+- t14z fix round 2 done (315 pass, 3 full runs). Round-3 verifier t17j started; it re-runs round 2's attacks against main.js from a separate process and the flaky test 100x.
+- Platform's p5-http committed 4fad32a. Its main.js wiring is folded into the p2-swap brief (main.js is under t17j's verification now; p2-swap runs on the rebased branch that will include 4fad32a).
+- p2-land rebased onto main 2f0dda2 (p6-ui + p5-http) at client's request; head 794298e; client's uncommitted files re-applied; worktree 292/0. Told t14k and t176. One more rebase after the scaffold commits.
+- p4-natss3 (t17f) reported: NATS Bus + S3 Blobs pass contracts vs real nats-server 2.15.3 + MinIO; added @nats-io/transport-node@3.4.0 + bun.lock. Verifier t17m started. Bus-cap risk (room-host frames > 2 MB) folded into p2-swap brief. Platform asks sent to proxy (Dockerfile bun install --frozen-lockfile; CI MinIO for S3 tests).
+- Platform's p8-deps (Dockerfile bun install --frozen-lockfile; CI MinIO + S3_* vars) commits only after my p4-natss3 commit (package.json + bun.lock): send t14q that commit id.
+- p4-pg (t17d) reported: Postgres Store + Registry pass contracts vs local Postgres 17.11 (brew postgresql@17; brew's post-install initdb'd /opt/homebrew/var/postgresql@17, never started). Async factories; pool max must be sized. Verifier t17p started.
+- Client's p6-sync2v M3 (replica restamp skips when the chain's top already leads; ops during a resync go out stale, 2/40 seeds lose a tie): decision, re-stamp the whole never-sent chain per element (r+1, r+2, ...). t15q fix round 4 in the worktree (replica.js + test only); client's p6-land runs there on web/** concurrently.
+- Fix round 4 PASS (t171); committed on p2-land.
+- p4-pgv t17p: **PASS** (docs/m2/reports/p4-pgv.md): both contracts vs real Postgres 17.11; conditional-append
+  and last-owner races hold across OS processes; 1 MEDIUM (start-up DDL needs the app role to own its tables, so
+  a migration-style deploy with a least-privilege role fails: queue for phase 4 wiring, e.g. skip DDL when the
+  schema exists or a separate migrate step), 3 LOW. **Commit held:** server/store/postgres.js imports
+  server/ids.js, which is still untracked (scaffold); commit right after the scaffold.
+- p4-natss3v t17m: **FAIL** (docs/m2/reports/p4-natss3v.md). H1: Bun's S3Client reads S3_SESSION_TOKEN/AWS_SESSION_TOKEN from env despite explicit config (every call fails on hosts with AWS session env). M1 no S3 call timeout (hangs 300 s+). M2 NATS outage buffers publishes unbounded (800 MB measured). Sent back to t17f (14%).
+- Committed package.json + bun.lock alone as 0d40b86 so platform's p8-deps could land (t14q told). NATS/S3 adapter code commits later (fix round + depends on the scaffold's server/ids.js, bus/memory.js).
+- Platform's p8-deps committed 723f6c6: CI cluster-services exports S3_* (MinIO on 127.0.0.1:9000) next to DATABASE_URL and NATS_URL; Docker image installs from bun.lock.
+- p4-natss3v round 2: PASS (H1, M1, M2 fixed live). New M3: a frozen (SIGSTOP) NATS server still buffers unbounded and replays stale messages. Since the commit waits on the scaffold anyway, sent M3 to t17f now (short pings + outbound byte cap + no replay).
+- p4-natss3v round 3: **PASS** (M3 frozen NATS fixed). NATS/S3 adapters verified; commit held until the scaffold commits (imports server/ids.js, bus/memory.js).
+- p3-scaffoldv3 t17j: **FAIL** (docs/m2/reports/p3-scaffoldv3.md). Round 2 closed and measured (joins 2 ms; 48 non-readers 282 MB, cut in 15 s; /health 32 ms in a 6,400-op burst). H1: since-0 catch-up > 64 MiB per-user budget always refused (frames admitted before drain). H2: kill -9 test boundary flake 1/30. Lead: malformed snapshot frames in Bun's WS client 1/14. Sent to t14z (42%) as fix round 3: shared catch-up frames don't count against the user budget, pulled on drain; durability assertion instead of a count; handoff if > 55%.
+- Proxy: if scaffold round-4 verify fails, the fix goes to a fresh builder (t14z writes docs/m2/handoff/p3-scaffold.md first), not a 4th round in t14z. Next scaffold verifier's PASS bar includes the kill -9 gate rerun 30+ times.
+- p1-v11 (t186) started: spec-only v1.1 on the worktree's PROTOCOL.md: settings compare-and-set by per-key base appSeq (soft refusal), welcome room {board, epoch}, plus all queued spec items. Lands with phase 2. Code follow-up after it passes.
+- p1-v11 reported (worktree PROTOCOL.md, 321/0 there); its 13 open-question decisions accepted provisionally (D1-D13: all-or-nothing settings op, one in flight per key, epoch via Store.openEpoch in the lease record, <= 8 writer conns per user/board/gateway, 4 s append timeout, ...). Verifier t188 started. Note: manager platform is now t187 (recycled).
+- t14z fix round 3 done (328 pass, 70 skip, 0 fail x3; lead not reproduced: 800/800 frames identical). Round-4 verify by t17j (24%): joins above the 64 MiB budget, kill -9 gate 30x, full bun test 20x.
+- p1-v11v t188: PASS (no HIGH; 4 MEDIUM text gaps: multi-key settings retry, dead-socket counting in the 8-conn cap, rule 12 vs room identity epoch checks, settings base after stale). Sent back to t186 to close before commit (lands with phase 2 anyway); t188 re-checks.
+- p1-v11 (v1.1 spec) committed on p2-land as cb343b9 (R2-M1 'passed' fix in; protocol tests 89/0 there). Lands with phase 2. v1.1 code (settings CAS, room epoch + Store.openEpoch) is a follow-up job after phase 2 merges, timed with drawh's round. t186/t188 kept until the merge.
+- p11-proto (t18b) started: v1.1 code in packages/protocol on p2-land (settings CAS, epoch, appBase, keepVersions, codec id-first, openEpoch). Server half later (with/after p2-swap). Told platform t187: commit id on p2-land when verified; don't assume API beyond the spec; treat missing welcome.room as unknown epoch until the server half.
+- p3-scaffoldv3 round 4 (t17j): **FAIL**. Round 3's H1/H2 closed and measured (all catch-ups over budget join; kill -9 30/30; 20/20 concurrent joiners). R4-H1: full suite 8/20 failed (outbound.test.js:399 assumes a socket-buffer size; :358 timing; 1 platform test timeout under load). R4-H2: a snapshot over Bun's backpressureLimit (~138 MB UTF-8) can't be sent (1006, no log). Per the proxy: fresh builder p3-fix4 (t18c) from t14z's handoff. Decision: admit by UTF-8 bytes; backpressureLimit above the largest snapshot the stream caps allow; loud log otherwise; stable event-driven tests; pass bar 20/20 full runs.
+
+- t14z retired: handoff committed 346ccd9; tab closed, terminal killed and removed.

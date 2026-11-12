@@ -7,8 +7,6 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
 | pd-drawh (builder) | t14y | done pd-drawh (platform) | fix round RUNNING |
-| p5-http (builder) | t17b | done p5-http (platform) | reported, idle |
-| p5-httpv (verifier) | t17c | verifier p5-httpv (platform): sign-in + admin HTTP routes | RUNNING |
 | pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | FAIL (2 HIGH), idle; re-checks after fix |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
@@ -215,3 +213,12 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   edits (builder's test). Sent to t14y; t155 re-checks after.
 - Engine agreed the seeding decision; renumbered (refused) elements get version 1,000 (not 1) with a fresh versionNonce. Relayed to t14y. PROTOCOL.md seeding text updated at engine's next spec touch.
 - Seeding renumber target stays 1, not engine's 1,000: builder's test shows 1,000 lets stale pane copies 1,001-2,000 silently overwrite a peer's edit; with 1 they're held back with a warning. Engine (t14j) told; can override (one-character change). pd-drawh re-check started on t155.
+
+## 2026-11-11 p5-http: DONE (commit 4fad32a)
+
+- Verifier p5-httpv (t17c): PASS (codex, grok: no findings); MEDIUM 1 (replay guard O(n), uncapped) fixed and
+  re-checked PASS. `bun test` re-run by me: 315 pass, 0 fail. Engine (t14j) told the commit id and the main.js
+  line; `oidc` null → sign-in routes 503 `sign-in-unavailable` (checked: http.js:15,140,147).
+- Open LOWs (M8 hardening): no rate limit on callbacks (1:1 outbound call to Google); logout local only.
+- Not done: real Google client (CEO credentials), web/ reading `#token` (client track).
+- Sessions t17b, t17c closed, killed, removed.

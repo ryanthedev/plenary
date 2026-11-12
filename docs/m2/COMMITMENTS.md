@@ -66,3 +66,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 client: drag previews through the server pause (gateway refuses v0 transient ops) until p6-sync2 moves them to v1 presence after phase 2; engine pings client directly when it lands.
 - 2026-11-11 proxy: phase 2 lands as one green commit from branch p2-land (worktree ../plenary-p2) with engine seam swaps and client p6-sync2 (web/sync.js); p6-base commits on main first. Engine merges; proxy audits before push.
 - 2026-11-11 client: p6-base DONE f1886d5 (round 2 PASS; bun test 263/263). p6-ui built, verifier t172. p6-sync2 waits for engine's rebased p2-land worktree.
+- 2026-11-11 platform: p8-cluster-env built (verifier t174). Proposed cluster env names sent to engine to confirm, plus a role switch (PLAN phase 4 separates gateways and room hosts). Dev blob store is pgsty/minio (pinned community fork, AGPL-3.0), referenced by image only and swappable (service name blobs).

@@ -7,7 +7,9 @@
 - **In flight (audit fix jobs, launched 2026-11-12):** p7-perf J1 (t1h2: pins/notes/selection per-frame cost, C-1/6/7/15),
   p7-chrome J2 (t1h3: chrome rebuilds, online/visibility probe, auth banner, clock, C-2/4/6/8/9/17), p7-archtest J4
   (t1h4: runtime-globals test, dev-module list vs static.js DENY, ws rig, C-10/14/16). Briefs docs/m2/briefs/<job>.md. p7-perf **committed** (p7-perfv PASS round 2; t1h2/t1h7 closed; follow-up MED: zoomToFit caps at scale 4, so threads on one point never split; drawer lists them). Was: verifier p7-perfv (t1h7) **FAIL round 1** (9 surviving mutants + M1 cluster click never opens, M2 refused selection re-walks 100k ids/frame, M3 domClock unguarded); round 2 done by t1h2 (29/29 mutants killed), re-verify round 2 sent to t1h7. p7-archtest **committed** (verifier PASS round 2; t1h4/t1h9 closed; follow-ups R2-MED-1 port-omission fallback, R2-MED-2 regex after `)` in codeOnly). p7-chrome **committed** (p7-chromev PASS round 2: 17 survivors killed, 53/54, last equivalent; t1h3/t1hh closed; follow-ups MEDIUM-1 resume jitter width for J3, LOW-1 done).
-  Monitor bjtqgxkut watches all three. On each report: write <job>v brief, launch verifier, commit by path on PASS.
+  **J3 p8-one-link committed** (p8-one-linkv PASS round 2: H1 reset-window lock test, L1 s.mine cleared on user change;
+  one WebSocket/hello/snapshot per tab, 188,514 B vs 377,126 B on join; t1ht/t1hx closed). `tab` is minted but not sent
+  (one-line flip in web/core/sync.js openLink when t18m pings); the C-4 watchdog waits for engine's E-1.
 - **Done:** p7-audit committed **ea47b46** (7 HIGH: 3 client, 4 engine; engine findings E-1..E-4 sent to t18m with the
   Replica `tab`-option question; t1h1 closed). p7-wire2 committed **001813a** (p7-wirev PASS rounds 2-3: cap retries on rule-12 backoff, auth refusal wins
   over the cap, mutants killed; test/web 615/0 re-run by me). p7-wire **e4cba6c**. p6-hex **06bf267**. t1gq, t1gw closed.
@@ -16,13 +18,15 @@
   same on board and notes connections); here.viewers counts distinct (user, tab); writer cap = 8 tabs per (user, board)
   per gateway. Engine writes PROTOCOL.md and gateway.js after p2-tune r2 (t18m 2026-11-12: "hours, not days"; may build against the
   shape now). **Don't send `tab` until t18m pings.** Then a
-  small client job p7-tab. (b) one connection per tab stays on the M4 plan.
+  small client job p7-tab (now a one-line flip inside J3's files). (b) one connection per tab: pulled forward into J3.
   **t18m 2026-11-12:** engine adds `new Replica({tab})` (connectMessages puts hello.tab); web/ only passes the option, no
   wrapper. Engine order: spec, gateway + Replica, verifier, then ping. E-1..E-7 queued; E-4 goes into p-fanout.
 - **M4 load-test plan item (from p6-hexv):** two transports per tab (~200k hellos at 100k joins).
 - **Main:** phase 2 merged (dcbdae6); p2-land worktree retired. test/arch-scan.js on main (44dd1aa).
-- **Next, in order:** p7-tab (after t18m's ping; built with `tab` off if the ping is late), then J3 p8-one-link (needs
-  p7-tab and engine's E-1 downstream heartbeat). J5 is M3.
+- **Next, in order:** p7-tab flip (after t18m's ping); C-4 watchdog after E-1; tidy job (app.js: MEDIUM-1 resume jitter
+  width, L8 mine set saved under the old user's key; LOW-R2-1, LOW-3, R2-MED-2, zoomToFit cap; p8-one-linkv L2 dead
+  merged getters session.js, L3 wrapTransport always adds reopen, L4 sequenced ignores the stream, L5 live snapshot
+  reloads every bind, L6 dropConnection no-op on the ws transport). J5 is M3.
 - **Start command:** OFFICE.md "Starting a session" (names plenary-<job>[v], --model opus --permission-mode auto,
   systems-design plugin, zsh -lic wrapper). Tab: `worker <job> (client) · <id>: <what>`.
 
@@ -327,3 +331,9 @@
   2 server tests in engine's uncommitted files). Re-verify round 2 sent to t1hh.
 - p7-chromev round 2 PASS (t1hh): all 17 survivors killed, aliases removal behaviour-neutral (Chrome 0 rebuilds), bun test
   1319/2 fail (core-source herdr-draw; gateway.test.js fails only with engine's uncommitted server files). p7-chrome committed; t1h3/t1hh closed.
+- 2026-11-12: proxy asked for unblocked client work. M2 features all present; load test is engine's. Started J3 p8-one-link (t1ht) without the watchdog and with `tab` held back.
+- 2026-11-12: t1ht asked to edit 7 two-link assertions (ui-app, ui-land, collab/wire, collab/wire2). Granted: link shape only, nothing a test checks may be dropped; brief's ownership line updated; verifier to diff them.
+- 2026-11-12: p8-one-link reported done (one socket per tab, half the join bytes); verifier p8-one-linkv (t1hx) launched.
+- 2026-11-12: p8-one-linkv FAIL round 1 (H1 test-only: lock test never enters the reset window; V5/V6/V8 survive). Fix round 2 sent to t1ht.
+- 2026-11-12: p8-one-link round 2 done (H1 test, L1 fix, mutants killed); re-verify round 2 sent to t1hx.
+- 2026-11-12: p8-one-linkv round 2 PASS (t1hx; new LOW L8 to the tidy job). J3 committed by path; t1ht/t1hx closed.

@@ -1,0 +1,77 @@
+// p8-one-link gate: headless Chrome on the production rig (test/server/rig.js, port 0). Usage: bun drive.js <repoRoot> <label>
+import { spawn } from "node:child_process";
+import { mkdtempSync, readFileSync, existsSync, appendFileSync } from "node:fs";
+import { join } from "node:path";
+const [root, label] = process.argv.slice(2);
+const { rig: makeRig, settled, tokenOf } = await import(join(root, "test/server/rig.js"));
+const { makeElement } = await import(join(root, "packages/core/model.js"));
+const CHROME = process.env.HOME + "/Library/Caches/ms-playwright/chromium-1217/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing";
+const SP = process.env.SP;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const r = await makeRig();
+let chrome = null;
+try {
+  // ── the board: 300 shapes, 50 notes, 100 threads (owner over a real socket) ──
+  const o = r.client("owner");
+  await o.connect();
+  await settled(r, [o]);
+  for (let i = 0; i < 300; i += 50) o.send("board", { elements: Array.from({ length: 50 }, (_, k) => makeElement("rectangle", { x: (i + k) * 20, y: 0, width: 15, height: 15 })) });
+  for (let i = 0; i < 50; i += 25) o.send("notes", { elements: Array.from({ length: 25 }, (_, k) => makeElement("rectangle", { x: (i + k) * 30, y: 300, width: 190, height: 96, backgroundColor: "#ffec99" })) });
+  for (let i = 0; i < 100; i++) o.send("records", { do: "thread", id: `th${i}`, anchor: { point: { x: i * 10, y: 500 } }, text: `thread ${i} ` + "x".repeat(40) });
+  await settled(r, [o], 30_000);
+  { const room = await r.room(); room?.checkpoint(); }   // so a joiner's catch-up is a snapshot, as on a long-lived board
+  await sleep(300);
+  await o.drop();
+
+  // ── Chrome ──
+  const prof = mkdtempSync(join(SP, "prof-"));
+  chrome = spawn(CHROME, ["--headless=new", "--remote-debugging-port=0", `--user-data-dir=${prof}`, "--no-first-run", "--no-default-browser-check", "about:blank"], { stdio: "ignore" });
+  appendFileSync(join(SP, "pids"), `${chrome.pid} chrome ${label}\n`);
+  const portFile = join(prof, "DevToolsActivePort");
+  for (let i = 0; i < 100 && !existsSync(portFile); i++) await sleep(100);
+  const port = readFileSync(portFile, "utf8").split("\n")[0];
+  const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+  const page = targets.find(t => t.type === "page");
+  const ws = new WebSocket(page.webSocketDebuggerUrl);
+  await new Promise(res => ws.onopen = res);
+  let id = 0; const wait = new Map(); const events = [];
+  ws.onmessage = e => { const m = JSON.parse(e.data); if (m.id && wait.has(m.id)) { wait.get(m.id)(m); wait.delete(m.id); } else if (m.method) events.push(m); };
+  const cdp = (method, params = {}) => new Promise(res => { const i = ++id; wait.set(i, res); ws.send(JSON.stringify({ id: i, method, params })); });
+  await cdp("Network.enable"); await cdp("Page.enable"); await cdp("Runtime.enable");
+  const session = JSON.stringify({ token: tokenOf("viewer"), user: "dev:viewer", name: "viewer", exp: Math.floor(Date.now() / 1000) + 3600 });
+  await cdp("Page.addScriptToEvaluateOnNewDocument", { source: `try { sessionStorage.setItem("plenary.session", ${JSON.stringify(session)}); } catch {}` });
+  await cdp("Page.navigate", { url: `${r.server.url}/?board=${r.ids.board}` });
+  let live = null;
+  for (let i = 0; i < 100; i++) {
+    await sleep(100);
+    const v = await cdp("Runtime.evaluate", { expression: "globalThis.plenary?.S?.status ?? globalThis.plenary?.session?.status ?? document.body.className", returnByValue: true });
+    live = v.result?.result?.value;
+    if (/live/.test(String(live)) && !/stale/.test(String(live))) break;
+  }
+  await sleep(1500);   // settle: catch-up and the first presence/here
+  const eval_ = async x => (await cdp("Runtime.evaluate", { expression: x, returnByValue: true })).result?.result?.value;
+  const shown = await eval_("(() => { const a = globalThis.plenary; const S = a?.S ?? a?.session; return S ? { status: S.status, board: S.eds.board.doc.live().length, notes: S.eds.notes.doc.live().length } : Object.keys(a ?? {}); })()");
+  const sockets = events.filter(e => e.method === "Network.webSocketCreated");
+  const recv = events.filter(e => e.method === "Network.webSocketFrameReceived");
+  const sent = events.filter(e => e.method === "Network.webSocketFrameSent");
+  const parse = d => { try { return JSON.parse(d); } catch { return null; } };
+  const per = sockets.map(s => {
+    const mine = x => x.params.requestId === s.params.requestId;
+    const inn = recv.filter(mine), out = sent.filter(mine);
+    return {
+      url: s.params.url.replace(/^ws:\/\/[^/]+/, ""),
+      hellos: out.filter(f => parse(f.params.response.payloadData)?.t === "hello").length,
+      helloHasTab: out.some(f => "tab" in (parse(f.params.response.payloadData) ?? {}) && parse(f.params.response.payloadData)?.t === "hello"),
+      snapshots: inn.filter(f => parse(f.params.response.payloadData)?.t === "snapshot").length,
+      framesIn: inn.length,
+      types: inn.map(f => parse(f.params.response.payloadData)?.t ?? "?").join(","),
+      bytesIn: inn.reduce((a, f) => a + Buffer.byteLength(f.params.response.payloadData, "utf8"), 0),
+    };
+  });
+  const out = { label, shown, sockets: sockets.length, per, totalBytesIn: per.reduce((a, p) => a + p.bytesIn, 0) };
+  console.log(JSON.stringify(out, null, 1));
+  ws.close();
+} finally {
+  if (chrome) { chrome.kill("SIGTERM"); await sleep(500); try { process.kill(chrome.pid, 0); chrome.kill("SIGKILL"); } catch {} }
+  await r.stop();
+}

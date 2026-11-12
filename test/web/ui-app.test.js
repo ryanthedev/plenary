@@ -200,23 +200,24 @@ test("C-4: back online and back from a long hide reconnect (both jittered); a sh
   net.advance(1400); step();
   expect(reopens()).toBe(0);
   net.advance(200); step(5);
-  expect(reopens()).toBe(2);                                   // both links, once
+  expect(joins.length).toBe(1);                                // p8-one-link: one link per tab
+  expect(reopens()).toBe(1);                                   // the one link, once
   expect(S.status).toBe("live");
   // Hidden 10 s: nothing. Hidden 31 s: reconnect.
   const hide = ms => { page.doc.visibilityState = "hidden"; page.doc.fire("visibilitychange"); net.advance(ms); page.doc.visibilityState = "visible"; page.doc.fire("visibilitychange"); net.advance(2001); step(5); };   // + the jitter
-  hide(10_000); expect(reopens()).toBe(2);
-  hide(31_000); expect(reopens()).toBe(4);
+  hide(10_000); expect(reopens()).toBe(1);
+  hide(31_000); expect(reopens()).toBe(2);
   expect(S.status).toBe("live");
   // Hidden 40 s, but the room spoke 6 s before it came back (a busy board's presence): the link is alive, no hello.
   page.doc.visibilityState = "hidden"; page.doc.fire("visibilitychange");
   net.advance(34_000); net.broadcast({ t: "here", writerCount: 1, viewers: 0 }); while (net.step());
   net.advance(6_000); page.doc.visibilityState = "visible"; page.doc.fire("visibilitychange"); net.advance(2001); step(5);
-  expect(reopens()).toBe(4);
+  expect(reopens()).toBe(2);
   // The same, heard 11 s before: silent long enough, reconnect.
   page.doc.visibilityState = "hidden"; page.doc.fire("visibilitychange");
   net.advance(29_000); net.broadcast({ t: "here", writerCount: 1, viewers: 0 }); while (net.step());
   net.advance(11_000); page.doc.visibilityState = "visible"; page.doc.fire("visibilitychange"); net.advance(2001); step(5);
-  expect(reopens()).toBe(6);
+  expect(reopens()).toBe(3);
   expect(joins.length).toBe(n0);
   // Never while refused, stopped or capped, nor under a gesture.
   for (const status of ["refused", "stopped", "limited"]) expect(shouldProbe({ status })).toBe(false);

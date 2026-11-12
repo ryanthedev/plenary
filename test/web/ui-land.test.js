@@ -174,10 +174,16 @@ test("p6-sync2v M2: `stopped` wins the combined status and has its own pill, nev
   const net = localRoom({ board: "b1", users: DEV_USERS, clock: true });
   let deliver = null;
   const stub = { send() {}, onMessage: fn => { deliver = fn; }, reopen() {}, close() {} };
-  const s = createSession({ join: stream => (stream === "notes" ? stub : net.join()), token: "dev-ada", board: "b1", clock: net.clock });
-  deliver({ t: "welcome", seq: 0, role: "owner", user: "ada", rv: 999 });  // notes: rules this app doesn't know
+  // p8-one-link: one link per tab, so both streams stop together; the merge rule is checked with the board bind
+  // forced to "connecting" (as a second link used to be).
+  let joined = 0;
+  const s = createSession({ join: () => { joined++; return stub; }, token: "dev-ada", board: "b1", clock: net.clock });
+  expect(joined).toBe(1);
+  deliver({ t: "welcome", seq: 0, role: "owner", user: "ada", rv: 999 });  // rules this app doesn't know
   expect(s.binds.notes.status).toBe("stopped");
-  expect(s.binds.board.status).toBe("connecting");
+  expect(s.binds.board.status).toBe("stopped");
+  expect(s.status).toBe("stopped");
+  Object.defineProperty(s.binds.board, "status", { get: () => "connecting", configurable: true });
   expect(s.status).toBe("stopped");
   const pill = pillFor({ status: "stopped", pending: 2, role: "presenter" });
   expect(pill.text).toBe("Update needed");

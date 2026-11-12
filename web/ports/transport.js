@@ -1,4 +1,6 @@
-// Transport port: how web/'s core (sync.js) talks to one board stream. Driven port; types and limits only, no logic.
+// Transport port: how web/'s core (sync.js) talks to a board: ONE transport per tab carries every stream (p8-one-link).
+// Driven port; types and limits only, no logic. Members may live on a prototype (a class): the session wraps each one
+// explicitly (web/core/session.js wrapTransport), and test/web/contracts/class-transport.test.js holds it to that.
 // Imports nothing. Contract test: test/web/contracts/transport-contract.js (transportContract).
 //
 // Contract: the p2-land header of web/sync.js (web/core/sync.js now points here), plus rules marked [added] that the

@@ -192,13 +192,16 @@ test("frame: my selection goes out whenever it changed (Escape, select-all), not
   expect(calls.sel.filter(x => x[0] === "2").length).toBe(3);
 });
 
-test("congested: either connection's backlog shows on the pill, and a viewer's pill says slow link too", () => {
+test("congested: the link's backlog shows on the pill, and a viewer's pill says slow link too", () => {
   const sc = scripted();
   const s = createSession({ join: sc.join, token: "tk", board: "b1", client: "me", user: "me", clock: sc.clock });
   expect(s.congested).toBe(false);
-  sc.links[1].congested = true;                       // the notes connection only
+  expect(sc.links.length).toBe(1);                    // p8-one-link: one link per tab
+  sc.links[0].congested = true;
   expect(s.congested).toBe(true);
-  sc.links[1].congested = false; sc.links[0].congested = true;
+  sc.links[0].congested = false;
+  expect(s.congested).toBe(false);
+  sc.links[0].congested = true;
   expect(s.congested).toBe(true);
   expect(pillFor({ status: "live", role: "viewer", congested: true })).toMatchObject({ cls: "readonly", sub: "slow link" });
   expect(pillFor({ status: "live", role: "viewer" }).sub).toBe("");
@@ -250,8 +253,9 @@ test("LOW-1: limited shows only the cap banner (no Connecting…), with the next
 test("LOW-1: the session's limitedNextTry is the bind's armed retry", () => {
   const sc = scripted();
   const s = createSession({ join: sc.join, token: "tk", board: "b1", client: "me", user: "me", clock: sc.clock });
-  sc.links[0].on(WELCOME());
-  sc.links[1].on({ t: "error", code: "limit", message: CAP }); sc.links[1].dropped();
+  // p8-one-link: the one link is capped before its welcome (the cap answers a hello, never a welcomed link).
+  expect(sc.links.length).toBe(1);
+  sc.links[0].on({ t: "error", code: "limit", message: CAP }); sc.links[0].dropped();
   expect(s.status).toBe("limited");
   expect(s.limitedNextTry).toBe(750);
   sc.advance(750);

@@ -4,10 +4,11 @@
 //
 // Design choice (brief's "known design question"): two Editors, one per stream. Core's Editor edits one
 // Doc, and each stream has its own settings (layers live in appState per stream), so merging both into one
-// Doc would need sync.js to split ops by element and keep two appStates apart. bindEditor already takes a
-// `stream`, so two Editors need no sync.js change. Cost today: two links (two hellos) per person, because
-// each bindEditor makes its own Replica. Wanted in sync.js (report): bindEditors sharing one Replica and
-// one connection.
+// Doc would need sync.js to split ops by element and keep two appStates apart.
+// One link per tab (p8-one-link, C-3): both Editors bind to streams of ONE sync.js link (one transport, one
+// Replica, one hello, one snapshot), since the Replica holds every stream. `binds.board` and `binds.notes` are the
+// two binds' handles; the link's own members (status, role, pending, presence, records) are the same on both, and
+// `connection` is the link alone (the collab port reads it).
 //
 // Write gating has two layers: (1) input never reaches an Editor's write paths when the role or the
 // connection forbids it (tools, keys, panel actions all pass `act`/`may`); (2) a backstop around each
@@ -17,7 +18,7 @@
 import { Editor, TOOLS } from "../../packages/core/editor.js";
 import { makeElement, isLabel } from "../../packages/core/model.js";
 import { hitTest, shapeAt } from "../../packages/core/geometry.js";
-import { bindEditor } from "./sync.js";
+import { openLink } from "./sync.js";
 import { uiRole, mayUseTool, streamFor, canEdit, viewKey, clipboardKey, settingsKey, EXTRAS } from "./roles.js";
 
 export const NOTE = { width: 190, height: 96, fill: "#ffec99" };
@@ -25,65 +26,95 @@ export const HIGHLIGHT = { strokeColor: "#fab005", strokeWidth: 16, opacity: 40,
 const ORDER = { viewer: 0, annotator: 1, presenter: 2 };
 
 /**
- * @param {{ join: () => object, token: string, board: string, client?: string, mine?: Iterable<string>,
+ * The transport as sync.js gets it: every member of the port (web/ports/transport.js) wrapped explicitly, so a
+ * class-based adapter (members on its prototype, or getters) keeps them all (p7-audit C-5: `{ ...t }` copied only own
+ * enumerable members). `fail` (the dev hook's unasked drop) is kept where the adapter has one; optional members
+ * the adapter lacks stay absent.
+ * @param {import("../ports/transport.js").Transport & { fail?: () => void }} t
+ */
+export function wrapTransport(t) {
+  const w = {
+    send: m => t.send(m),
+    onMessage: fn => t.onMessage(fn),
+    reopen: () => t.reopen(),
+    close: () => t.close(),
+    congested: () => (typeof t.congested === "function" ? !!t.congested() : false),
+    backlogBytes: () => (typeof t.backlogBytes === "function" ? t.backlogBytes() : 0),
+  };
+  if (typeof t.onDrop === "function") w.onDrop = fn => t.onDrop(fn);
+  if (typeof t.fail === "function") w.fail = () => t.fail();
+  return w;
+}
+
+/** A browser tab's id (hello.tab, once engine sends it): 16 base-36 characters from the clock port's random. */
+export function mintTab(random) {
+  let id = "";
+  while (id.length < 16) id += Math.floor(random() * 36 ** 4).toString(36).padStart(4, "0");
+  return id.slice(0, 16);
+}
+
+/**
+ * @param {{ join: () => object, token: string, board: string, client?: string, tab?: string, mine?: Iterable<string>,
  *           noteAuthor?: (id: string) => string | null, user?: string, onChange?: () => void,
  *           clock?: import("../ports/clock.js").Clock, timers?: object, now?: () => number, random?: () => number }} o
- *   join: a fresh transport per stream (sync.js's transport port). mine: note ids this person made (kept by the
- *   page across reloads). noteAuthor: the v1 snapshot's table when it exists (SEAM(v1): null in v0).
+ *   join: the tab's one transport (sync.js's transport port), called once. mine: note ids this person made (kept by
+ *   the page across reloads). noteAuthor: the v1 snapshot's table when it exists (SEAM(v1): null in v0).
+ *   tab: this browser tab's id; minted once from `random` (or the clock's) when not given. Kept in s.tab and handed
+ *   to sync.js, which does not send it yet (hello.tab is engine's, not in PROTOCOL.md).
  *   clock: the clock port (the root passes browserClock()); the Editors' clock is its now(). timers / now / random:
- *   handed to bindEditor over the clock's (tests). No global fallback: bindEditor throws without a clock.
+ *   handed to sync.js over the clock's (tests). No global fallback: sync.js throws without a clock.
  */
-export function createSession({ join, token, board, client = "web", mine = [], noteAuthor = () => null, user = null, onChange = () => {}, clock, timers, now, random } = {}) {
+export function createSession({ join, token, board, client = "web", tab = null, mine = [], noteAuthor = () => null, user = null, onChange = () => {}, clock, timers, now, random } = {}) {
   const wall = now ?? clock?.now;
   const edClock = typeof wall === "function" ? () => wall() : undefined;
   const eds = { board: new Editor({ clock: edClock }), notes: new Editor({ clock: edClock }) };
   const binds = {};
+  const draw = random ?? clock?.random;
   const s = {
     eds, binds, active: "board", tool: "hand", roleSeen: null, chrome: null, blocked: 0, sent: 0,
     mine: new Set(mine), penStyle: null, online: true, gesture: null, flash: null,
+    tab: tab ?? (typeof draw === "function" ? mintTab(draw) : null),
   };
 
-  // What the room has said, read off our own transports (bindEditor's handle exposes no role or ids):
-  // the role from welcome, note ids the room has sequenced (so a write to one is a change, not a create),
-  // and the v1 snapshot's noteAuthor table when it comes (SEAM(v1): absent in v0).
-  const known = new Set(), authors = new Map();
-  let lastRole = null;
-  // Who the room says this connection is (welcome.user, checked by the gateway): the note lock uses it, never the
-  // sign-in identity, which is display-only (p6-landv L5). `user` (the root's) is only a fallback before welcome.
-  let roomUser = null;
-  function sniff(m) {
-    if (!m || typeof m !== "object") return;
-    if (m.t === "welcome" && m.role) lastRole = m.role;
-    if (m.t === "welcome" && typeof m.user === "string" && m.user) roomUser = m.user;
-    if (m.t === "entries") for (const e of m.entries ?? []) if (e.stream === "notes") for (const el of e.op?.elements ?? []) known.add(el.id);
-    if (m.t === "snapshot") {
-      for (const el of m.streams?.notes?.elements ?? []) known.add(el.id);
-      if (m.noteAuthor && typeof m.noteAuthor === "object") for (const [id, u] of Object.entries(m.noteAuthor)) authors.set(id, u);
-    }
-  }
-  // The transport as sync.js gets it (its contract: web/ports/transport.js), with the room's messages read on
-  // the way in. Kept in s.links for the dev hook dropConnection().
-  const links = {};
-  const watched = stream => {
-    const t = join(stream);
-    return links[stream] = { ...t, send: m => t.send(m), onMessage: fn => t.onMessage(m => { sniff(m); fn(m); }), reopen: () => t.reopen() };
-  };
+  // The tab's one transport, as sync.js holds it (kept in s.link for the dev hook dropConnection()).
+  const link = wrapTransport(join());
   const clocked = Object.fromEntries(Object.entries({ clock, timers, now, random }).filter(([, v]) => v != null));
 
-  // Room events of each connection (bindEditor's onRoom: presence, here, emotes, records, refused, role, settings,
-  // limit) for the collab port (web/adapters/collab/sync.js) and the chrome. A listener gets (stream, event).
+  // Room events of the link (sync.js's onRoom: presence, here, emotes, records, refused, role, settings, limit) for
+  // the collab port (web/core/collab/port.js) and the chrome. A listener gets (stream, event): `stream` is the
+  // settings event's stream, and "board" for the link's other events (the name they had when the board link carried
+  // them). Each event comes once.
   const roomFns = new Set();
   s.onRoom = fn => { roomFns.add(fn); return () => roomFns.delete(fn); };
   const statusFns = new Set();
-  /** fn(stream, status) on every status change of either connection. */
+  /** fn(status) on every status change of the link. */
   s.onStatus = fn => { statusFns.add(fn); return () => statusFns.delete(fn); };
+
+  const wire = openLink({ transport: link, token, board, client, tab: s.tab,
+    onStatus: st => { s.refreshRole(); for (const fn of [...statusFns]) fn(st); onChange(); },
+    onRoom: ev => { if (ev.type === "settings" || ev.type === "limit") onChange(); for (const fn of [...roomFns]) fn(ev.type === "settings" ? ev.stream : "board", ev); },
+    ...clocked });
+  /** The link alone (sync.js's link members: status, role, user, client, presence, records, notes reads). */
+  s.connection = wire.api;
+  const C = wire.api;
+  // Note ids the room has sequenced (so a write to one is a change, not a create), and who the room says this
+  // connection is (welcome.user, checked by the gateway): the note lock uses it, never the sign-in identity, which is
+  // display-only (p6-landv L5). `user` (the root's) is only a fallback before welcome.
+  const known = id => C.sequenced("notes", id);
+  const roomUser = () => C.lastUser;
+  // The notes this person made (s.mine) belong to one room user: when the room says this tab is now someone else
+  // (rule 13: the same tab signed in again as another user), forget them, so the reset window's fallback to s.mine
+  // can't hand the old user's notes to the new one (p8-one-linkv L1).
+  let mineUser = null;
+  const mineNow = () => {
+    const u = C.lastUser;
+    if (u != null) { if (mineUser != null && u !== mineUser) s.mine.clear(); mineUser = u; }
+    return s.mine;
+  };
 
   for (const stream of ["board", "notes"]) {
     const ed = eds[stream];
-    binds[stream] = bindEditor(ed, { transport: watched(stream), token, board, client: `${client}-${stream}`, stream,
-      onStatus: st => { s.refreshRole(); for (const fn of [...statusFns]) fn(stream, st); onChange(); },
-      onRoom: ev => { if (ev.type === "settings" || ev.type === "limit") onChange(); for (const fn of [...roomFns]) fn(stream, ev); },
-      ...clocked });
+    binds[stream] = wire.bind(ed, stream);
     const inner = ed.onOp;
     ed.onOp = op => {
       if (!allowed(stream, op)) {
@@ -92,17 +123,18 @@ export function createSession({ join, token, board, client = "web", mine = [], n
         s.flash = s.readOnly || s.effective === "viewer" ? "Not sent: the room now gives you view-only access" : "Not sent: your role can't make that change";
         binds[stream].reconnect(); onChange(); return;
       }
-      if (stream === "notes") for (const el of op.elements ?? []) if (!known.has(el.id)) s.mine.add(el.id);
+      if (stream === "notes") for (const el of op.elements ?? []) if (!known(el.id)) mineNow().add(el.id);
       if (op.elements?.length || op.appState) s.sent++;
       inner(op);
     };
   }
+  wire.start();
 
   // ── role ──
   // Replica.reset() clears its role, so the last one seen is kept. The chrome is set by the first role seen;
   // a lower role later (a downgrade on reconnect) keeps that chrome, greyed (readOnly).
   s.refreshRole = () => {
-    const r = lastRole;
+    const r = C.lastRole;
     if (!r) return;
     s.roleSeen = r;
     const ui = uiRole(r);
@@ -122,7 +154,8 @@ export function createSession({ join, token, board, client = "web", mine = [], n
     limitedNextTry: { get: () => { const t = [binds.board.nextTryAt, binds.notes.nextTryAt].filter(v => v != null); return t.length ? Math.min(...t) : null; } },
     /** Refused settings changes of both streams: [{ stream, i, code, keys, values, ready }] (i: the bind's index). */
     settingsRefused: { get: () => ["board", "notes"].flatMap(st => binds[st].settingsRefused.map((e, i) => ({ ...e, stream: st, i }))) },
-    pending: { get: () => binds.board.pending + binds.notes.pending },
+    // The link's: both binds count the same Replica's pending ops.
+    pending: { get: () => binds.board.pending },
     ed: { get: () => eds[s.active] },
   });
 
@@ -139,9 +172,9 @@ export function createSession({ join, token, board, client = "web", mine = [], n
   // Is this note element one the person may change? Presenters moderate every note.
   s.isMine = id => {
     if (s.effective === "presenter") return true;
-    const a = authors.get(id) ?? noteAuthor(id);
-    if (a != null) return a === (roomUser ?? user);
-    return s.mine.has(id);
+    const a = C.noteAuthor(id) ?? noteAuthor(id);
+    if (a != null) return a === (roomUser() ?? user);
+    return mineNow().has(id);
   };
 
   function allowed(stream, op) {
@@ -149,7 +182,7 @@ export function createSession({ join, token, board, client = "web", mine = [], n
     if (!roleMay() || !streamOk(stream)) return false;
     if (stream === "notes" && s.effective !== "presenter") {
       if (op.appState) return false;                                 // a stream's settings are the moderators'
-      for (const el of op.elements ?? []) if (known.has(el.id) && !s.isMine(el.id)) return false;
+      for (const el of op.elements ?? []) if (known(el.id) && !s.isMine(el.id)) return false;
     }
     return true;
   }
@@ -323,14 +356,14 @@ export function createSession({ join, token, board, client = "web", mine = [], n
   s.retrySetting = (stream, i) => { const r = binds[stream]?.retrySetting(i) ?? false; onChange(); return r; };
   s.dismissSetting = (stream, i) => { binds[stream]?.dismissSetting(i); onChange(); };
   /** Who the room says this person is (welcome.user), else the root's display-only user. */
-  s.roomUser = () => roomUser ?? user;
+  s.roomUser = () => roomUser() ?? user;
 
-  /** Reconnect both streams now; `token` signs in again after `refused`. */
-  s.reconnect = token => { binds.board.reconnect(token); binds.notes.reconnect(token); };
-  /** Dev/test hook: both connections drop without asking (the transport's fail(), where it has one). */
-  s.dropConnection = () => { for (const t of Object.values(links)) t.fail?.(); };
-  /** Test hook: the transports as bindEditor holds them (board, notes). */
-  s.links = links;
+  /** Reconnect the link now (one reopen, one hello); `token` signs in again after `refused`. */
+  s.reconnect = token => C.reconnect(token);
+  /** Dev/test hook: the link drops without asking (the transport's fail(), where it has one). */
+  s.dropConnection = () => { link.fail?.(); };
+  /** Test hook: the tab's one transport as sync.js holds it. */
+  s.link = link;
   return s;
 }
 

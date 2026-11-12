@@ -19,7 +19,7 @@ const EL = id => ({ id, type: "rectangle", x: 1, y: 2, width: 3, height: 4, vers
 test("me.client is the board connection's wire id: the peer sees my presence under it", async () => {
   const d = await syncRig("editor");
   expect(d.port.me.client).toBe(d.me.binds.board.client);
-  expect(d.port.me.client).not.toBe(d.me.binds.notes.client);
+  expect(d.me.binds.notes.client).toBe(d.port.me.client);   // p8-one-link: one link, one wire id for both streams
   expect(d.port.me.user).toBe("me");
   const got = [];
   d.bo.onRoom((stream, ev) => { if (stream === "board" && ev.type === "presence") got.push(...ev.batch); });
@@ -84,10 +84,10 @@ test("M4: onRecords is coalesced: 40 entries in one delivery run make one call, 
 test("the presence gate: nothing goes out over 16 KB of backlog, and nothing while not live", async () => {
   const d = await syncRig("editor");
   const B = d.me.binds.board;
-  d.me.links.board.backlogBytes = () => 16 * 1024 + 1;
-  // links.board is the session's wrapper; bindEditor holds that same object, so this reaches its gate.
+  d.me.link.backlogBytes = () => 16 * 1024 + 1;
+  // s.link is the session's wrapper; sync.js holds that same object, so this reaches its gate.
   expect(B.sendPresence("cursor", { x: 1, y: 1 })).toBe(false);
-  d.me.links.board.backlogBytes = () => 16 * 1024;
+  d.me.link.backlogBytes = () => 16 * 1024;
   expect(B.sendPresence("cursor", { x: 2, y: 2 })).toBe(true);
   d.me.dropConnection();
   expect(B.sendPresence("select", { stream: "board", ids: [] })).toBe(false);
@@ -105,16 +105,19 @@ function capRig() {
   return { b, sent, advance, events, refuse: () => { handler({ t: "error", code: "limit", message: "at most 8 open writer connections per user on a board" }); dropped(); } };
 }
 
-test("writer cap: the session's merged status is limited when either connection is", () => {
+test("writer cap: the session's merged status is limited when its one link is (both streams' binds say so)", () => {
   const links = [];
   const join = () => { const l = { sent: [], on: () => {} }; links.push(l); return { send: m => l.sent.push(m), onMessage: fn => { l.on = fn; }, onDrop: () => {}, reopen: () => {}, close: () => {}, congested: () => false, backlogBytes: () => 0 }; };
   const clock = { now: () => 0, mono: () => 0, random: () => 0.5, set: () => 0, clear: () => {} };
   const s = createSession({ join, token: "tk", board: "b1", client: "me", user: "me", clock });
-  const [board, notes] = links;
-  board.on({ t: "welcome", seq: 0, role: "editor", user: "me", high: 0, horizon: 0, rv: 1, room: { board: "b1", epoch: 1 } });
+  // p8-one-link: one link carries both streams, so the cap's refusal reaches both binds at once.
+  expect(links.length).toBe(1);
+  const [link] = links;
   expect(s.status).not.toBe("limited");
-  notes.on({ t: "error", code: "limit", message: "at most 8 open writer connections per user on a board" });
+  link.on({ t: "error", code: "limit", message: "at most 8 open writer connections per user on a board" });
   expect(s.status).toBe("limited");
+  expect(s.binds.notes.limited).toMatch(/at most 8/);
+  expect(s.binds.board.limited).toMatch(/at most 8/);
   expect(s.limited).toMatch(/at most 8/);
 });
 

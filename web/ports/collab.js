@@ -1,6 +1,7 @@
 // The collab port: everything the collaboration UI (web/adapters/dom/collab/ui.js) needs from the sync layer, and
 // nothing else. The collab UI never imports packages/protocol. Adapters: web/adapters/collab/sync.js (production and
-// dev rooms: over web/core/session.js, whose bindEditor handles are the only protocol readers) and
+// dev rooms: core's policy in web/core/collab/port.js over the session's one link, sync.js being the only protocol
+// reader, plus the browser's frame scheduler) and
 // web/adapters/collab/fake.js (tests, web/collab/dev.html). Contract test: test/web/contracts/collab-contract.js.
 // Names are PROTOCOL.md v1.1's unless noted; "ADDED" marks what the p7-collab brief didn't list but the UI needs.
 //
@@ -9,12 +10,12 @@
 //                     Never the UI's presenter/annotator/viewer: a commenter sends cursors and writes records.
 //             Once seen it is never null: while a connection is re-established it is the last role the room gave,
 //             so records actions still queue offline.
-//   me        { user, name, client }   welcome.user, the signed-in display name, the client id of the connection
-//             that carries presence (the id others' batches name me by). ONE stable object whose fields may update
+//   me        { user, name, client }   welcome.user, the signed-in display name, the client id of the tab's one
+//             link, which carries presence (the id others' batches name me by). ONE stable object whose fields may update
 //             (user arrives with welcome; rule 13 may change it): mount any time, read the fields live.
 //   status    string  web/core/sync.js status names: connecting | catching-up | live | refused | stopped | limited
-//             (the writer-connection cap). It is the status of the connection that carries presence and records,
-//             not a merge of a tab's connections (the status pill shows the merge).
+//             (the writer-connection cap). It is the status of the tab's one link, which carries presence and
+//             records (the status pill adds congestion and the browser's online flag).
 //   onStatus(fn(status, role)) → unsubscribe                                                        ADDED
 //             called when `status` or `role` changes (presence clears and the emote bar disables off live).
 //
@@ -28,7 +29,7 @@
 // ── Presence in ─────────────────────────────────────────────────────────────────────────────────────────────
 //   onPresence(fn(batch)) → unsubscribe   others' presence: [{ user, client, k, …fields }], k = cursor | select |
 //             laser | preview | emote | leave (a `leave` inside a batch is handled like onLeave). Each message once:
-//             never this tab's own (any of its connections), never twice through two connections.
+//             never this tab's own (its link's client id), never twice.
 //   onLeave(fn(user, client)) → unsubscribe
 //   previews(stream) → [{ el, user, client }]   others' live previews on `board` or `notes` (expired ones
 //             dropped; Replica.previewEntries). ADDED: the sender.

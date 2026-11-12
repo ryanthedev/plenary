@@ -11,7 +11,7 @@ export async function syncRig(role, { users: extra = {} } = {}) {
   const frames = [];
   const frame = fn => frames.push(fn);
   const sent = [];
-  const join = () => { const t = net.join(); return { ...t, send: m => { if (m.t === "presence") sent.push(m); t.send(m); } }; };
+  const join = () => { const t = net.join(), send = t.send.bind(t); t.send = m => { if (m.t === "presence") sent.push(m); send(m); }; return t; };
   const me = createSession({ join, token: "t-me", board: "b1", client: "me", user: "me", clock: net.clock });
   const bo = createSession({ join: () => net.join(), token: "t-bo", board: "b1", client: "bo", user: "bo", clock: net.clock });
   const port = syncCollabPort(me, { name: "Me", frame });

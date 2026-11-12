@@ -19,7 +19,7 @@
 import { SQL } from "bun";
 import { mint } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
-import { needSchema, ensureSchema } from "../store/postgres.js";
+import { needSchema, ensureSchema } from "../pg/schema.js";
 
 /** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code`. */
 export class PgRegistryError extends Error {

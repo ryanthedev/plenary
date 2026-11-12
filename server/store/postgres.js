@@ -8,8 +8,8 @@
 //   getCheckpoint(tenant, board, beforeSeq?)    the highest seq (below beforeSeq, if given), never the last write
 //   openEpoch(tenant, board), epoch(tenant, board)   the board's epoch in its lease record (pl_leases)
 //
-// Least privilege: start-up creates only missing tables (migrate(), to_regclass first), so the server may run as a
-// role that reads and writes the tables without owning the schema.
+// Least privilege: start-up creates only missing tables (migrate() in server/pg/schema.js, to_regclass first), so
+// the server may run as a role that reads and writes the tables without owning the schema.
 //
 // Durable = the write's transaction commits with `SET LOCAL synchronous_commit = on` (the WAL record is flushed on
 // this server before COMMIT returns; synchronous standbys, if any are configured, also confirm). It is set per
@@ -27,50 +27,24 @@
 
 import { SQL } from "bun";
 import { needId, PortError } from "../ids.js";
+import { needSchema, migrate } from "../pg/schema.js";
 
 const MAX_READ = 10_000;
 const posInt = v => Number.isSafeInteger(v) && v > 0;
-const SCHEMA = /^[a-z_][a-z0-9_]{0,62}$/;
 /** Postgres SQLSTATE for a unique violation. Bun's PostgresError carries it as `errno`. */
 const UNIQUE = "23505";
 
-/** A schema name we may splice into SQL: lower-case identifier characters only. */
-export function needSchema(schema) {
-  if (typeof schema !== "string" || !SCHEMA.test(schema)) throw new Error(`postgres: bad schema name ${JSON.stringify(schema)}`);
-  return schema;
-}
-
 /**
- * Creates the schema unless it exists. The existence check comes first because Postgres checks CREATE on the
- * database before IF NOT EXISTS, so a least-privilege role would fail on a schema an operator made for it.
- * Call inside the start-up transaction, after the advisory lock.
+ * The Store's tables (§ Store, Least privilege). Created by `migrate` (server/pg/schema.js), which looks each table
+ * up first and creates only what is missing. An operator may run that as the owner role ahead of time
+ * (`plenary migrate` is phase 4's).
  */
-export async function ensureSchema(tx, schema) {
-  const s = needSchema(schema);
-  if (!(await tx.unsafe("SELECT 1 AS x FROM pg_namespace WHERE nspname = $1", [s])).length) await tx.unsafe(`CREATE SCHEMA "${s}"`);
-}
-
-/**
- * The Store's DDL, creating only what is missing (§ Store, Least privilege). Each table is looked up first
- * (to_regclass): Postgres checks CREATE privilege before IF NOT EXISTS, so a role that may read and write the tables
- * but not own the schema starts fine against a migrated schema, and only an owner role ever runs a CREATE.
- * Call inside a transaction, after the advisory lock (postgresStore does). An operator may run it as the owner
- * role ahead of time (`plenary migrate` is phase 4's).
- */
-export async function migrate(tx, schema) {
-  const s = needSchema(schema);
-  await ensureSchema(tx, s);
-  const tables = {
-    pl_entries: "tenant TEXT NOT NULL, board TEXT NOT NULL, seq BIGINT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq)",
-    pl_checkpoints: "tenant TEXT NOT NULL, board TEXT NOT NULL, seq BIGINT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq)",
-    // The board's lease record: its epoch now (§ Recovery, Room identity); phase 4 adds the holder and expiry.
-    pl_leases: "tenant TEXT NOT NULL, board TEXT NOT NULL, epoch BIGINT NOT NULL, PRIMARY KEY (tenant, board)",
-  };
-  for (const [name, cols] of Object.entries(tables)) {
-    const [{ r }] = await tx.unsafe("SELECT to_regclass($1) AS r", [`"${s}".${name}`]);
-    if (r === null) await tx.unsafe(`CREATE TABLE "${s}".${name} (${cols})`);
-  }
-}
+export const STORE_TABLES = {
+  pl_entries: "tenant TEXT NOT NULL, board TEXT NOT NULL, seq BIGINT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq)",
+  pl_checkpoints: "tenant TEXT NOT NULL, board TEXT NOT NULL, seq BIGINT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq)",
+  // The board's lease record: its epoch now (§ Recovery, Room identity); phase 4 adds the holder and expiry.
+  pl_leases: "tenant TEXT NOT NULL, board TEXT NOT NULL, epoch BIGINT NOT NULL, PRIMARY KEY (tenant, board)",
+};
 
 /**
  * @param {{ url?: string, sql?: import("bun").SQL, max?: number, schema?: string, keepCheckpoints?: number }} o
@@ -88,7 +62,7 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
   try {
     await db.begin(async tx => {
       await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-schema:${s}`]);
-      await migrate(tx, s);
+      await migrate(tx, s, STORE_TABLES);
     });
   } catch (err) { if (owned) await db.close(); throw err; }
 

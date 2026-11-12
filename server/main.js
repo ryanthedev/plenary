@@ -4,8 +4,12 @@
 //   PORT                 default 8080 (0 = any free port)
 //   HOST                 default 127.0.0.1 (a container needs HOST=0.0.0.0)
 //   PLENARY_DATA_DIR     data directory, default ./data  (plenary.db, blobs/); the name deploy/ uses
-//   PLENARY_DEV_TOKENS   JSON: { "<token>": { "name": "ann", "role": "editor", "email"?, "domain"? } }. Unset = dev
-//                        tokens off, so every hello is refused until sign-in is wired (platform track).
+//   PLENARY_DEV_TOKENS   JSON: { "<token>": { "name": "ann", "role": "editor", "email"?, "domain"?, "admin"? } }.
+//                        Unset = dev tokens off (then only Google sign-in, if configured, admits anyone).
+//                        For each `domain` with a token flagged `"admin": true`, the start makes that domain's
+//                        tenant if missing and adds those users as its admins (server/admin/tenants.js), so they can
+//                        POST /boards. Domains with no admin token get no tenant from here.
+//                        Additive: dropping `admin` later removes nobody (the operator CLI is scripts/admin-bootstrap.js).
 //   LOG_LEVEL            debug | info | warn | error
 //   PLENARY_MAX_CONNS_PER_USER   open sockets one user may hold (default 64). A load test that shares a few dev
 //                        tokens between thousands of clients must raise it.
@@ -41,6 +45,7 @@ import { tenancy as makeTenancy } from "./auth/tenancy.js";
 import { sessions as makeSessions } from "./auth/session.js";
 import { googleOidc } from "./auth/oidc.js";
 import { httpRoutes } from "./auth/http.js";
+import { bootstrapTenant } from "./admin/tenants.js";
 import { subjects } from "./bus/port.js";
 import { ROLES } from "../packages/protocol/envelope.js";
 
@@ -148,8 +153,21 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch } = {}
       catch (err) { if (err?.code !== "last-owner") throw err; log.warn("a dev token would demote the dev board's last owner; kept as owner", { user }); }
     }
     devBoard = board.id;
+    // Each dev domain with a token flagged admin gets its tenant, those users as its admins (p5-devadmin). A bad
+    // domain is skipped with an error log; a Registry failure fails the start.
+    const domains = new Map();
+    for (const t of Object.values(tokens)) {
+      if (t?.admin !== true || typeof t.name !== "string" || !t.name || typeof t.domain !== "string" || !t.domain) continue;
+      const d = t.domain.trim().toLowerCase();
+      domains.set(d, [...(domains.get(d) ?? []), "dev:" + t.name]);
+    }
+    for (const [domain, admins] of domains) {
+      try { const r = await bootstrapTenant({ registry, domain, admins }); log.info("dev tenant", { tenant: r.tenant.id, domain, created: r.created, added: r.added }); }
+      catch (err) { if (err?.code !== "bad-request") throw err; log.error("dev token domain skipped", { domain, err }); }
+    }
     log.warn("dev tokens are ON: not for production", { board: board.id, tenant: board.tenant, users: best.size });
-  } else log.warn("dev tokens are off and sign-in is not wired yet: every hello will be refused");
+  } else if (oidc) log.info("dev tokens are off: sign-in is Google only");
+  else log.warn("dev tokens are off and Google sign-in is not configured (GOOGLE_CLIENT_ID/SECRET): every hello will be refused");
 
   const perUser = Number(env.PLENARY_MAX_CONNS_PER_USER);
   const limits = Number.isSafeInteger(perUser) && perUser > 0 ? { maxConnsPerUser: perUser } : undefined;

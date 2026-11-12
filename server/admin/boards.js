@@ -2,7 +2,7 @@
 // A hello never creates a board; only createBoard does.
 //
 // Who may do what:
-//   createBoard:            an admin of the named tenant (by user id).
+//   createBoard:            an admin of the named tenant (by user id, or by email: isTenantAdmin below).
 //   invites and links:      the board's owner (grant) or an admin of the board's tenant.
 //   grants:                 a tenant admin sets any role, owner included. A board owner sets roles up to editor,
 //                           and may change an owner's grant only if it is their own. Nobody removes or demotes a
@@ -31,10 +31,19 @@ export class AdminError extends Error {
 const forbidden = () => new AdminError("forbidden", "not allowed");
 const bad = m => new AdminError("bad-request", m);
 
+/**
+ * A tenant admin is named by user id (google:<sub>, dev:<name>) or, before their first sign-in, by email
+ * (`email:<addr>`, server/admin/tenants.js). An email entry matches only a caller whose email the IdP vouches for
+ * (Identity.email is set only then) AND whose Workspace domain is the tenant's, so a guest from another domain
+ * holding that address elsewhere never becomes admin.
+ */
 async function isTenantAdmin(registry, caller, tenantId) {
   if (!caller || typeof caller.user !== "string" || typeof tenantId !== "string") return false;
   const t = await registry.tenant(tenantId);
-  return !!t && t.admins.includes(caller.user);
+  if (!t) return false;
+  if (t.admins.includes(caller.user)) return true;
+  const email = normEmail(caller.email);
+  return !!email && !!t.domain && caller.domain === t.domain && t.admins.includes("email:" + email);
 }
 
 /** The board, if the caller may manage it; else throws `forbidden` (unknown board included). */

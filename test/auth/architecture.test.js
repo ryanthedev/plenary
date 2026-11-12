@@ -30,6 +30,7 @@ export const CLASSES = {
   "server/auth/util.js": "core",             // roles, base64url, ids: pure helpers
   "server/auth/tenancy.js": "core",          // role resolution over the Registry port
   "server/admin/boards.js": "core",          // admin use cases over the Registry port
+  "server/admin/tenants.js": "core",         // bootstrapTenant over the Registry port (its CLI root: scripts/admin-bootstrap.js)
   "server/auth/registry.js": "adapter",      // in-memory Registry
   "server/auth/oidc.js": "adapter",          // Google OIDC (IdP port)
   "server/auth/session.js": "adapter",       // session tokens (Verifier port, plus issue())

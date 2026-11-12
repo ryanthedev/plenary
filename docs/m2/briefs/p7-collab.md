@@ -1,43 +1,60 @@
-# Brief: p7-collab (phase-7 collaboration UI) — DRAFT, starts when p2-land merges to main
+# Brief: p7-collab (phase-7 collaboration UI, part 1: everything behind a collab port)
 
 Base: docs/m2/BRIEF-BASE.md applies. Read docs/m2/OFFICE.md, docs/m2/PLAN.md (phase 7), CLAUDE.md, PROTOCOL.md v1
-(§ Streams, § Presence, § Records, rules 5 and 11) first.
+(§ Streams, § Presence, § Records, the `here`/`emotes`/`presence` messages, rules 5 and 11) first.
 
 - **Your tab:** `worker p7-collab (client): collaboration UI`. Manager: `manager client` (t14k).
-- **You own:** web/ui/** (new files for presence and records, plus edits to existing ones), web/app.js,
-  web/index.html, web/style.css, test/web/ui-*.test.js, test/web/collab*.test.js, your report.
-- **Owned by others:** web/sync.js and test/web/sync*.test.js (the client's sync layer; ask your manager for a
-  change; it may be a separate job), packages/protocol and server/ (engine). docs/m2/design/ is the verified mock.
+- **Where:** the worktree **/Users/r/repos/plenary-p2** (branch p2-land). Don't commit; engine merges p2-land.
+- **You own exactly:** `web/collab/**` and `test/web/collab/**` (new), plus your report docs/m2/reports/p7-collab.md
+  in the worktree. **Nothing else.** web/sync.js, web/app.js, web/index.html, web/style.css, web/ui/** and the other
+  test/web files belong to p6-land (being verified now); packages/protocol and server/ are engine's.
+- **Read only:** packages/protocol/{replica,presence,records…}.js on p2-land (to match message shapes and limits),
+  docs/m2/design/ (the verified mock: its phase-7 rows in README.md, mock.js, mock.css), web/ui/ (how p6-ui renders).
 
-## Goal (PLAN.md phase 7)
+## Why the split
 
-"Full collaboration: live cursors with names, avatar row, others' selections, laser, draw, highlighter, emotes,
-reactions, comment threads, annotations (notes stream), connection status pill." Build it to the mock
-(docs/m2/design/, the phase-7 rows of its README.md) over the v1 protocol:
+sync.js exposes no presence or records API yet, and it is under verification. So you build all of phase 7 behind an
+interface, the **collab port**, and a later job (p7-wire, after p6-land passes) makes `bindEditor` provide it and
+mounts your UI in app.js. You may not import packages/protocol from web/collab (the seam: only web/sync.js calls the
+protocol); constants you need (rates, caps, the emote set), read them and mirror them in one file, web/collab/limits.js,
+with a test that compares them to packages/protocol (tests may import it).
 
-- **Presence** (§ Presence): `cursor`, selections, `laser`, `preview` (others' drags in flight, from the sync
-  handle's per-stream previews), `emote`; never saved, may drop; send at the § Presence rates; drop a client's
-  presence on `leave` or 30 s of silence.
-- **`here`:** the avatar row (writers ≤ 50, `writerCount`, viewer count "N watching").
-- **`emotes`:** viewers' summed counts per 500 ms; the crowd bar.
-- **Records** (§ Records): comment threads anchored to an element or a point, replies, resolve/reopen, reactions on
-  comments; roles per § Streams (commenter writes records only; viewers read).
-- **Annotations:** the notes stream drawer, with v1 `noteAuthor` from the snapshot replacing p6-ui's localStorage
-  ownership (p6-uiv L1).
-- **Status pill:** connected / reconnecting / offline / read-only / stopped (new status from p6-sync2), with
-  viewers never showing pending edits (p6-mockv HIGH #1).
+## The collab port (you write it down at the top of web/collab/port.js as JSDoc; p7-wire implements it)
 
-## Done when (PLAN.md)
+- `role`, `me` ({ user, name, client }), `status` (sync status names).
+- Presence out: `send(kind, fields)` for `cursor`, `selection`, `laser`, `emote` (§ Presence fields). Rate limits and
+  the role table are enforced on your side too (never send what the role can't).
+- Presence in: `onPresence(fn(batch))`, `onLeave(fn(user, client))`, `previews(stream)`.
+- `onHere(fn({ writers, writerCount, viewers }))`, `onEmotes(fn({ counts }))`.
+- Records: `records()` (current state incl. pending), `onRecords(fn)`, and ops `thread`, `reply`, `resolve`, `reopen`,
+  `react`, `unreact`, `deleteComment` with the fields § Records defines; refusals come back as errors per rule 5.
+- `noteAuthor(id)` (v1 snapshot), for the notes drawer.
+Make a **fake port** (web/collab/fake-port.js) for tests and a dev page.
 
-- All of it works across two nodes (the phase-3/4 server, when it is up; until then two tabs over the in-page room
-  and the phase-3 single node), and headless tests cover comments, reactions and presence (send rates, expiry on
-  `leave`/30 s, role gating of records, viewers' emotes only as counts).
-- `bun test` passes; browser check at 1440 and 390 px, light and dark, every role.
-- Report docs/m2/reports/p7-collab.md. Processes: never pkill/killall, PIDs only, port 0. sdd helpers allowed.
+## Build (to the mock, over the port)
 
-## Open before start (manager fills in)
+- **Presence model** (pure, tested): others' cursors with names and colors, selections, laser trails that fade,
+  previews; drop a client on `leave` or 30 s of silence; send at the § Presence rates (cursor 20/s etc.); writers'
+  emotes float, viewers' emotes only as counts.
+- **Avatar row** from `here` (≤ 50 writers, "+N", "N watching"); **emote bar** (fixed set, viewers too, disabled when
+  not live) and the crowd counts.
+- **Records model** (pure, tested): threads anchored to an element (follows it; orphaned when deleted) or a point;
+  replies; resolve/reopen; reactions on comments only; role rules (commenter and up write, viewers read, nobody edits
+  others' comments unless § Records says so); pending overlay until acked.
+- **Comment UI:** pins on the canvas, the thread popover, the comments list (open/resolved), compose box.
+- **Notes drawer** with authors from `noteAuthor`.
+- **Renderers** (DOM, textContent only, never innerHTML with data; canvas overlays as pure draw functions taking a
+  2D context and the view) that p7-wire mounts: export a `mountCollab({ root, canvasOverlay, port, view, theme })`.
+- A dev page web/collab/dev.html over the fake port (two fake peers, a crowd) to check it by eye, light and dark,
+  1440 and 390 px.
+- CEO questions still open (docs/m2/reports/p6-mock.md): viewers see presenters' cursors only (mock default),
+  no follow-presenter view, reactions on comments only. Keep each behind one flag in web/collab/flags.js.
 
-- The sync handle's presence/records API after p2-land merges (does sync.js expose `presence`, `here`, `emotes`,
-  records ops, or does a sync job add them first?).
-- CEO questions still open (docs/m2/reports/p6-mock.md): do viewers see annotators' cursors (mock: presenters only);
-  a "follow presenter" view; saved reactions on the board. Build the mock's default; keep each behind one flag.
+## Done when
+
+- `bun test` passes in the worktree (all of it). Tests: presence expiry and rates, role gating of every send and
+  record op, records ordering with pending overlay, anchors following and orphaning, viewers' emotes only as counts,
+  hostile names and comment text never reach the DOM as HTML.
+- The dev page checked in headless Chrome at both widths and themes; screenshots in your scratchpad.
+- Report: the port as built (exactly what p7-wire must provide), files, tests, how you checked, NOT verified, risks.
+- Processes: never pkill/killall, PIDs only, port 0. sdd helpers allowed; you own every line.

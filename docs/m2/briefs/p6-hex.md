@@ -1,0 +1,52 @@
+# Brief: p6-hex (web/ into hexagonal shape) — starts after p6-landv and p7-collabv pass
+
+Base: docs/m2/BRIEF-BASE.md applies, including **Architecture** (hexagonal) and the **systems design skill**. Read
+docs/m2/OFFICE.md ("Architecture"), CLAUDE.md, PROTOCOL.md first.
+
+- **Your tab:** `worker p6-hex (client): web/ ports and adapters`. Manager: `manager client` (t14k).
+- **Where:** the worktree /Users/r/repos/plenary-p2 (branch p2-land). Don't commit; engine merges p2-land.
+- **You own:** web/** and test/web/** in the worktree, plus your report docs/m2/reports/p6-hex.md. The web/ rules
+  in the architecture test: see "Boundary test" (coordinated with engine, which owns test/architecture.test.js).
+- **Design first (required):** apply the `distributed-systems-design` skill in **APPLIER** mode before moving code
+  (if it isn't in your skill list, read /Users/r/repos/systems-design.skill/skills/distributed-systems-design/
+  SKILL.md and its references/). Write the result as the first section of your report: the ports, their contracts,
+  failure behaviour (drops, reconnects, backoff, storage unavailable), and what is core vs adapter.
+
+## Goal (CEO, 2026-11-11: "hexagonal application architecture")
+
+No behaviour change. Same tests green, more tests added. Move web/ to ports and adapters:
+
+| Layer | What | Rule |
+|---|---|---|
+| **core** `web/core/` | sync (Editor ↔ Replica binding), session and roles (UI state, role gating), collab models (presence, records) | imports only packages/*, web/ports/, other web/core files. No DOM, Worker, WebSocket, localStorage/sessionStorage, location/history, `Date.now`/`setTimeout`/`Math.random` direct |
+| **ports** `web/ports/` | `transport.js` (the contract now at the top of sync.js: send, onMessage, reopen required, close final, onDrop), `storage.js` (get/set/remove, may throw or be unavailable), `clock.js` (now, set/clear timer, random) | JSDoc + an exported contract test function per port |
+| **adapters** `web/adapters/` | `transport/shared-worker.js` (+ its worker host), `transport/local.js` (localRoom, moved out of sync.js), later `transport/ws.js` (phase-3 server); `storage/session.js`, `storage/local.js`, `storage/memory.js`; `clock/browser.js`, `clock/virtual.js`; `dom/` (app chrome, panel, export, canvas paint, collab renderers) | an adapter imports core and ports only, never another adapter |
+| **composition roots** | `web/main.js` (index.html's entry; today's app.js wiring), `web/dev.js`, `web/collab/dev` page | the only files that import adapters and wire them |
+
+- Sign-in token (web/ui/token.js) reads location/history/storage: those become the storage port plus a small
+  `location` port or a parameter from the root.
+- Keep the protocol seam: only web/core/sync.js imports packages/protocol (the local transport adapter may import
+  the reference Room for the dev/in-browser room; say so in the rules).
+- **Contract tests:** test/web/contracts/: every transport adapter (shared-worker via a fake port, local) passes the
+  transport contract (generation per connection, no old-connection delivery after reopen, onDrop only for the
+  current connection, close final); every storage adapter passes the storage contract; both clocks pass the clock
+  contract.
+- **Contract test shape (agreed with engine):** mirror test/auth/registry-contract.js: a module
+  `test/web/contracts/transport-contract.js` exporting `transportContract(name, makeAdapter)` that registers
+  describe/test blocks against a fresh adapter per test (same for `storageContract`, `clockContract`); each
+  adapter's own test file calls it, with adapter-specific tests beside it; a real-service adapter (the future ws.js)
+  skips via `describe.skipIf` when its env is unset.
+- **Boundary test (agreed with engine):** your own file test/web/architecture.test.js (never engine's
+  test/architecture.test.js). It reuses engine's `test/arch-scan.js` (`importsOf(file)`, `checkBoundaries({ files,
+  isCore, isAdapter, adapterGroup, compositionRoots, allowed, allowlist })` → violations; API at its top). Rules:
+  core imports no adapter and no browser global; adapters don't import each other; only roots import adapters. An
+  allowlist is explicit, commented and shrink-only (fails on new violations and on stale entries). If arch-scan.js
+  isn't in the worktree yet when you get there, ask your manager; don't write your own scanner.
+
+## Done when
+
+- `bun test` passes in the worktree (all of it); no existing test/web assertion weakened; contract and boundary
+  tests added and each fails when its rule is broken (mutation check).
+- Headless browser: web/index.html (three tabs, SharedWorker room), `?net=local`, web/dev.html behave as before.
+- Report: the design section (skill, APPLIER), the file move map (old → new), ports, contract tests, how you checked,
+  NOT verified, risks. Processes: never pkill/killall, PIDs only, port 0.

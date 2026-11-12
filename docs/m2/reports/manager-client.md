@@ -6,6 +6,8 @@
 |---|---|---|---|
 | p6-land (builder) | t17s | done p6-land (client) | DONE in worktree, report plenary-p2/docs/m2/reports/p6-land.md (verifying) |
 | p6-landv (verifier) | t181 | verifier p6-landv (client): client landing | RUNNING (brief docs/m2/briefs/p6-landv.md) |
+| p7-collab (builder) | t18g | done p7-collab (client) | DONE in worktree (verifying) |
+| p7-collabv (verifier) | t18j | verifier p7-collabv (client): collaboration UI | RUNNING (brief docs/m2/briefs/p7-collabv.md) |
 | p6-sync2 (builder) | t173 | done p6-sync2 (client) | DONE in worktree, report plenary-p2/docs/m2/reports/p6-sync2.md (verifying) |
 
 ## 2026-11-11 — phase-6 design mock
@@ -166,3 +168,40 @@
 - p6-land done (t17s): worktree bun test 321/321 (re-run by me), no files outside client paths. One flaky test seen,
   platform's test/auth/http.test.js:503 (wall-clock ratio, 2 of 132 full runs): to the proxy for platform.
 - p6-landv (t181) started fresh (t176 was idle ~1 h). p6-sync2v's FAIL report committed on main; t176 closed.
+- Proxy: start phase 7 now in the worktree, disjoint from p6-land. sync.js exposes no presence/records API yet and is
+  under verification, so DECISION (mine): p7-collab (t18g) builds all of phase 7 in web/collab/** and
+  test/web/collab/** behind a "collab port" interface (JSDoc in web/collab/port.js; a fake port for tests and a dev
+  page); no protocol imports there (constants mirrored in web/collab/limits.js, checked by a test). A later p7-wire job
+  (after p6-landv passes) makes bindEditor provide the port and mounts the UI in app.js.
+- Watch: engine runs "p11-proto: protocol v1.1 code" now. If v1.1 changes presence/records shapes, p7-collab's
+  limits test catches the constants; ask engine for the v1.1 delta before p7-wire.
+- Engine on v1.1 (PROTOCOL.md cb343b9 on p2-land): no change to presence/records/here/emote shapes or roles. The
+  emote set is fixed: 👍 ❤️ 😂 🎉 👏 😮 🙏 🔥 (told t18g). Other v1.1 changes, for p7-wire / sync.js later:
+  welcome.room {board, epoch}; settings ops carry per-key appBase with a soft `stale-setting` refusal (drop that op
+  only, no resync); the Replica splits mixed element+settings changes; op frames start {"t":"op","id":; a writer
+  connection cap of 8 per (user, board) per gateway (`limit`, close), which the UI must show, not retry in a loop.
+  Engine pings if p11-proto adds sync.js-facing API.
+- p7-collab done (t18g): only web/collab/** + test/web/collab/** (+ report); worktree 390/390 re-run by me. Port gaps
+  sent to engine: previewsOf drops the sender; no accessor for unacked records ops. For p7-wire: two connections
+  per tab (feed presence from one, me.client = that connection, merge statuses), onStatus on role change, the
+  writer cap `limit` close. Verifier p7-collabv (t18j) started.
+- Engine accepted both, additive: `replica.previewEntries(stream)` -> [{ element, user, client, at }] (others' live
+  previews; previewsOf unchanged) and `replica.pendingOf(stream)` -> [{ id, op, sent }] (this client's unacked ops in
+  send order; for `records` the pending overlay). They land after engine's v1.1 verification round; engine pings with
+  the p2-land commit. p7-wire builds to these names.
+- CEO rule (1f25e61, via proxy): hexagonal everywhere + the distributed-systems-design skill (builders APPLIER
+  before coding, verifiers CHECKER). New sessions add `--plugin-dir /Users/r/repos/systems-design.skill`.
+  Client plan: p6-hex (brief docs/m2/briefs/p6-hex.md) after p6-landv and p7-collabv pass: web/core (sync,
+  session, collab models), web/ports (transport, storage, clock + contract tests), web/adapters/{transport,storage,
+  clock,dom}, web/main.js as the composition root; web/ boundary rules in test/web/architecture.test.js (asked
+  engine whether to reuse its helper; engine owns test/architecture.test.js). Then p7-wire builds in that shape. An
+  architecture audit of web/ runs after p6 and p7 land. Running verifier t18j told to add a CHECKER pass.
+- Engine agreed (a): its p-arch job adds test/arch-scan.js (importsOf, checkBoundaries; shrink-only allowlist); client
+  writes test/web/architecture.test.js reusing it. Contract shape: mirror test/auth/registry-contract.js
+  (xContract(name, makeAdapter), a fresh adapter per test, describe.skipIf for real services). p6-hex brief updated.
+  Engine pings with the arch-scan commit.
+- p7-collabv PASS (docs/m2/reports/p7-collabv.md): no HIGH; MEDIUM M1 the port gaps p7-wire closes, M2 no test for a
+  mid-session role change, M3 +N undercount on phones, M4 records change costs O(all records). CHECKER: shape sound
+  for the NFRs. All carried into docs/m2/briefs/p7-wire.md (draft; after p6-hex). p7-collab's code stays
+  uncommitted in the worktree for engine's p2-land merge. t18g, t18j closed; t173 (p6-sync2, superseded by p6-land)
+  closed too.

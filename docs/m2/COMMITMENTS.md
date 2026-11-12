@@ -100,3 +100,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 platform: drawh 3b FAIL (undo lost when a peer change lands in between); hard stop: scope cut ships (while connected, settings flow room to file only; a loud line on file-side changes). File-side settings return in drawh round 4 on v1.1 compare-and-set.
 - 2026-11-11 client: p6-ports FAIL, 4 HIGH (contract tests too weak); fix round in t18r.
 - 2026-11-11 proxy: proxy t14h handed off to t1bx (9d06783); managers now report to t1bx; t185 and t155 relabelled reports-to=t187 (were t14q).
+- 2026-11-11 platform: p5-code verifier PASS (t1bh; no session token or user details in any URL, real Chromium); 2 MEDIUMs being fixed before commit.

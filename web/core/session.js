@@ -26,23 +26,18 @@ export const HIGHLIGHT = { strokeColor: "#fab005", strokeWidth: 16, opacity: 40,
 const ORDER = { viewer: 0, annotator: 1, presenter: 2 };
 
 /**
- * The transport as sync.js gets it: every member of the port (web/ports/transport.js) wrapped explicitly, so a
- * class-based adapter (members on its prototype, or getters) keeps them all (p7-audit C-5: `{ ...t }` copied only own
- * enumerable members). `fail` (the dev hook's unasked drop) is kept where the adapter has one; optional members
- * the adapter lacks stay absent.
+ * The transport as sync.js gets it: every member of the port (web/ports/transport.js) the adapter has, wrapped
+ * explicitly, so a class-based adapter (members on its prototype, or getters) keeps them all (p7-audit C-5: `{ ...t }`
+ * copied only own enumerable members). A member the adapter lacks stays absent (p8-one-linkv L3), so sync.js's own
+ * checks (a transport without reopen() is refused) still fire through createSession. `fail` is the dev hook's
+ * unasked drop, kept where the adapter has one.
  * @param {import("../ports/transport.js").Transport & { fail?: () => void }} t
  */
 export function wrapTransport(t) {
-  const w = {
-    send: m => t.send(m),
-    onMessage: fn => t.onMessage(fn),
-    reopen: () => t.reopen(),
-    close: () => t.close(),
-    congested: () => (typeof t.congested === "function" ? !!t.congested() : false),
-    backlogBytes: () => (typeof t.backlogBytes === "function" ? t.backlogBytes() : 0),
-  };
-  if (typeof t.onDrop === "function") w.onDrop = fn => t.onDrop(fn);
-  if (typeof t.fail === "function") w.fail = () => t.fail();
+  const w = {};
+  for (const k of ["send", "onMessage", "reopen", "close", "congested", "backlogBytes", "onDrop", "fail"]) {
+    if (typeof t?.[k] === "function") w[k] = (...a) => t[k](...a);
+  }
   return w;
 }
 
@@ -72,7 +67,7 @@ export function createSession({ join, token, board, client = "web", tab = null, 
   const draw = random ?? clock?.random;
   const s = {
     eds, binds, active: "board", tool: "hand", roleSeen: null, chrome: null, blocked: 0, sent: 0,
-    mine: new Set(mine), penStyle: null, online: true, gesture: null, flash: null,
+    penStyle: null, online: true, gesture: null, flash: null,
     tab: tab ?? (typeof draw === "function" ? mintTab(draw) : null),
   };
 
@@ -86,12 +81,16 @@ export function createSession({ join, token, board, client = "web", tab = null, 
   // them). Each event comes once.
   const roomFns = new Set();
   s.onRoom = fn => { roomFns.add(fn); return () => roomFns.delete(fn); };
+  const heardFns = new Set();
+  /** fn() on every message from the room on the link (never a local action): the page's "is the link alive" signal. */
+  s.onHeard = fn => { heardFns.add(fn); return () => heardFns.delete(fn); };
   const statusFns = new Set();
   /** fn(status) on every status change of the link. */
   s.onStatus = fn => { statusFns.add(fn); return () => statusFns.delete(fn); };
 
   const wire = openLink({ transport: link, token, board, client, tab: s.tab,
     onStatus: st => { s.refreshRole(); for (const fn of [...statusFns]) fn(st); onChange(); },
+    onHeard: () => { for (const fn of [...heardFns]) fn(); },
     onRoom: ev => { if (ev.type === "settings" || ev.type === "limit") onChange(); for (const fn of [...roomFns]) fn(ev.type === "settings" ? ev.stream : "board", ev); },
     ...clocked });
   /** The link alone (sync.js's link members: status, role, user, client, presence, records, notes reads). */
@@ -105,12 +104,15 @@ export function createSession({ join, token, board, client = "web", tab = null, 
   // The notes this person made (s.mine) belong to one room user: when the room says this tab is now someone else
   // (rule 13: the same tab signed in again as another user), forget them, so the reset window's fallback to s.mine
   // can't hand the old user's notes to the new one (p8-one-linkv L1).
+  // Every read of s.mine goes through this (a getter), so no reader sees the old user's set after a switch (L8).
+  const mineSet = new Set(mine);
   let mineUser = null;
   const mineNow = () => {
     const u = C.lastUser;
-    if (u != null) { if (mineUser != null && u !== mineUser) s.mine.clear(); mineUser = u; }
-    return s.mine;
+    if (u != null) { if (mineUser != null && u !== mineUser) mineSet.clear(); mineUser = u; }
+    return mineSet;
   };
+  Object.defineProperty(s, "mine", { get: mineNow, enumerable: true });
 
   for (const stream of ["board", "notes"]) {
     const ed = eds[stream];
@@ -144,18 +146,18 @@ export function createSession({ join, token, board, client = "web", tab = null, 
     role: { get: () => s.chrome ?? "viewer" },
     effective: { get: () => uiRole(s.roleSeen) },
     readOnly: { get: () => !!s.chrome && ORDER[uiRole(s.roleSeen)] < ORDER[s.chrome] },
-    // The worse of the two streams: stopped (update the app) > refused (sign in) > connecting > catching-up > live.
-    status: { get: () => { const a = binds.board.status, b = binds.notes.status; for (const w of ["stopped", "refused", "limited"]) if (a === w || b === w) return w; return a === b ? a : a === "live" ? b : a; } },
-    // Either connection's outbound backlog over CONGESTED_BYTES (web/ports/transport.js): the pill says "slow link".
-    congested: { get: () => binds.board.congested() || binds.notes.congested() },
-    /** The writer-connection cap's message while either connection is stopped by it, else null. */
-    limited: { get: () => binds.board.limited ?? binds.notes.limited ?? null },
-    /** While limited: the earliest armed retry (the clock's now() ms), or null. */
-    limitedNextTry: { get: () => { const t = [binds.board.nextTryAt, binds.notes.nextTryAt].filter(v => v != null); return t.length ? Math.min(...t) : null; } },
+    // The link's (p8-one-link: both binds share it, so a merge of the two compared the link with itself, L2).
+    status: { get: () => C.status },
+    // The link's outbound backlog over CONGESTED_BYTES (web/ports/transport.js): the pill says "slow link".
+    congested: { get: () => C.congested() },
+    /** The writer-connection cap's message while the link is stopped by it, else null. */
+    limited: { get: () => C.limited ?? null },
+    /** While limited: when the link's backoff tries again (the clock's now() ms), or null. */
+    limitedNextTry: { get: () => C.nextTryAt ?? null },
     /** Refused settings changes of both streams: [{ stream, i, code, keys, values, ready }] (i: the bind's index). */
     settingsRefused: { get: () => ["board", "notes"].flatMap(st => binds[st].settingsRefused.map((e, i) => ({ ...e, stream: st, i }))) },
-    // The link's: both binds count the same Replica's pending ops.
-    pending: { get: () => binds.board.pending },
+    // The link's: one Replica's pending ops, every stream.
+    pending: { get: () => C.pending },
     ed: { get: () => eds[s.active] },
   });
 

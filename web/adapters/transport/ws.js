@@ -20,6 +20,7 @@
 //     2026-11-12). The timer belongs to its socket and dies with it.
 //   - onDrop: only the current socket's unasked close or error (connect refused, the server or a proxy closing, a
 //     frame the codec rejects), at most once per socket. Never for reopen() or close().
+//   - fail() (the dev hook dropConnection()): the current socket drops as an unasked close would (onDrop once).
 //   - close() is final: the socket is closed, nothing more is delivered, send/reopen do nothing.
 //   - No token here at all: the URL is used exactly as given and no subprotocol is passed (Sec-WebSocket-Protocol
 //     is a header). The token travels only in the `hello` the core sends (PROTOCOL.md, Herdr refuses credential headers).
@@ -200,6 +201,9 @@ export function wsTransport({ url, WebSocket: WS, codec = jsonCodec, maxQueued =
       return backlog(c);
     },
     reopen() { if (!done) open(); },
+    /** Dev/test hook (session.dropConnection): the current socket drops as if the network cut it: closed, and onDrop
+     *  reported once, exactly like an unasked close (p8-one-linkv L6). Does nothing after close() or with no socket. */
+    fail() { if (cur) fail(cur); },
     close() { done = true; retire(cur); cur = null; },
   };
 }

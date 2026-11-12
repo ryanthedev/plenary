@@ -63,10 +63,12 @@ export function bindEditor(editor, { stream = "board", ...o }) {
  *   now / random: the clock (ms) and jitter source handed to the Replica; tests pass a virtual clock.
  *   tab: this browser tab's id (createSession mints it). Kept, NOT sent yet: engine's `new Replica({ tab })` (hello.tab)
  *   is not in PROTOCOL.md. Turning it on is the one marked line below.
+ *   onHeard(): every message the room sends on the current connection (welcome, entries, here, presence, …), and
+ *   only those: local actions (a records op shown at once, a dismissed setting) never fire it.
  *   onRoom(ev): what the room said, once per link: presence, here, emotes, records, refused, role, limit, and
  *   settings ({ type: "settings", stream }).
  */
-export function openLink({ transport, token: firstToken, board, client = "web", tab = null, onStatus = () => {}, onRoom = () => {},
+export function openLink({ transport, token: firstToken, board, client = "web", tab = null, onStatus = () => {}, onRoom = () => {}, onHeard = () => {},
   timeoutMs = 10_000, clock = null, timers = clock ? { set: clock.set, clear: clock.clear } : null, now = clock?.now, random = clock?.random }) {
   if (typeof transport?.reopen !== "function") throw new TypeError("bindEditor: the transport must have reopen() (web/ports/transport.js)");
   if (typeof now !== "function" || typeof random !== "function" || (timeoutMs !== 0 && typeof timers?.set !== "function"))
@@ -81,6 +83,7 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
   // connecting → catching-up → live; "refused" (sign in again), "stopped" (the app must update)
   let status = "connecting";
   let timer = null, closed = false, started = false;
+  let hellos = 0;                 // hellos sent on this link (every connect: the first, backoff, reconnect())
   let down = false;               // resync asked for: the connection is closed, the backoff runs, input is ignored
   // The writer-connection cap (PROTOCOL.md § Pacing: a ninth writer connection gets an id-less `limit` before its
   // welcome, then is closed). It counts as a failed attempt under rule 12 and reconnects on the Replica's backoff
@@ -119,6 +122,7 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
 
   function connect() {
     const [hello] = replica.connectMessages(token, board);
+    hellos++;
     setStatus(limited ? "limited" : "connecting");
     send(hello);
     pump();
@@ -160,6 +164,7 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
 
   transport.onMessage(msg => {
     if (closed || down) return;
+    onHeard();                            // a message from the room on the current connection (never a local action)
     if (msg?.t === "error" && msg.code === "limit" && msg.id === undefined && !replica.welcomed) {
       limited = typeof msg.message === "string" ? msg.message : "too many open connections";
       replica.connectionFailed();          // rule 12: a failed attempt (its close that follows is then ignored: `down`)
@@ -177,7 +182,9 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
     if (replica.user) userSeen = replica.user;
     if (limited && replica.welcomed) limited = null;   // in: the cap let this connection through
     if (status === "live" && !did.reset && !replica.resync) {
-      if (did.snapshot) for (const b of binds) b.load();
+      // A snapshot carries every element stream (PROTOCOL.md: streams { board, notes }; replica.snapshot loads each),
+      // so each bind whose stream it holds reloads (p8-one-linkv L5: not just the first bind).
+      if (did.snapshot) { const held = msg?.t === "snapshot" ? msg.streams : null; for (const b of binds) if (!held || Object.hasOwn(held, b.stream)) b.load(); }
       else {
         const ids = new Map();
         for (const e of did.entries) {
@@ -237,6 +244,8 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
     get role() { return replica.role ?? null; },
     /** The last role the room gave (welcome.role), kept through a resync, when `role` is null. */
     get lastRole() { return roleSeen; },
+    /** How many hellos this link has sent (each connect, whatever started it). */
+    get hellos() { return hellos; },
     /** This link's wire client id (hello.client = the name plus the Replica's session part): presence names it. */
     get client() { return replica.client; },
     /** Who the room says this connection is (welcome.user), or null before the first welcome. */

@@ -39,7 +39,8 @@ function mount(o = {}) {
   const port = createFakePort({ role: o.role ?? "editor", me, now: clock.now, threads: board.threads, elements: board.elements, notes: board.notes, noteAuthors: board.noteAuthors });
   const calls = { element: 0, notes: 0, records: 0 };
   for (const k of ["element", "notes", "records"]) { const f = port[k]; port[k] = (...a) => { calls[k]++; return f(...a); }; }
-  const collab = mountCollab({ root: dom.root, port, view, clock, frame: fn => frames.push(fn), pinCap: o.pinCap ?? PIN_CAP });
+  if (o.maxScale) view.maxScale = o.maxScale;
+  const collab = mountCollab({ root: dom.root, port, view, clock, frame: fn => frames.push(fn), pinCap: o.pinCap ?? PIN_CAP, onList: o.onList ?? null });
   const S = frameState(view), tick = collabFrame(S, collab);
   tick();
   const pins = () => dom.root.findAll(e => e.hasClass("pin") && !e.hasClass("cluster"));
@@ -322,4 +323,89 @@ test("M1: zoomToFit centres the members and fits them, zooming at least 2× and 
   expect(zoomToFit({ x0: 0, y0: 0, x1: 1000, y1: 500 }, { w: 1200, h: 800, scale: 0.05 })).toEqual({ x: 500, y: 250, scale: 0.96 });
   expect(zoomToFit({ x0: 10, y0: 10, x1: 10, y1: 10 }, { w: 1200, h: 800, scale: 0.5 }).scale).toBe(4);        // coincident: max
   expect(zoomToFit({ x0: 0, y0: 0, x1: 1e6, y1: 1e6 }, { w: 1200, h: 800, scale: 0.01 }).scale).toBe(0.02);    // at least 2×
+});
+
+// ── p8-tidy ──
+const spot = (n, { x0 = 1000, y0 = 1000, w = 90, h = 60, seed = 3 } = {}) => {
+  const r = seeded(seed);
+  return { threads: Array.from({ length: n }, (_, i) => ({ id: `s${i}`, by: `u${i % 7}`, name: `User ${i % 7}`, at: 1_000_000 + i, anchor: { point: { x: x0 + (w ? Math.floor(r() * w) : 0), y: y0 + (h ? Math.floor(r() * h) : 0) } },
+    comments: [{ id: `sc${i}`, by: `u${i % 7}`, name: `User ${i % 7}`, at: 1_000_000 + i, text: `spot ${i}`, reactions: {} }] })), elements: {}, notes: [], noteAuthors: {} };
+};
+const honourJump = m => { const jumps = []; m.port.jumpTo = ({ x, y, scale }) => { jumps.push({ x, y, scale }); m.view.v.scale = scale ?? m.view.v.scale; m.view.v.x = 600 / m.view.v.scale - x; m.view.v.y = 400 / m.view.v.scale - y; }; return jumps; };
+const rows = m => m.collab.parts.drawer.findAll(e => e.hasClass("thread-row"));
+const biggest = m => m.clusters().reduce((a, b) => (Number(b.textContent) > Number(a.textContent) ? b : a));
+
+test("p8-tidy zoomToFit: a cluster zooms up to the page's max scale, and lists its members when it can't split", () => {
+  expect(zoomToFit({ x0: 0, y0: 0, x1: 10, y1: 10 }, { w: 1200, h: 800, scale: 4, maxScale: 8 }).scale).toBe(8);
+  expect(zoomToFit({ x0: 0, y0: 0, x1: 10, y1: 10 }, { w: 1200, h: 800, scale: 4, maxScale: 8 }).list).toBeUndefined();
+  expect(zoomToFit({ x0: 0, y0: 0, x1: 10, y1: 10 }, { w: 1200, h: 800, scale: 8, maxScale: 8 }).list).toBe(true);    // at max
+  expect(zoomToFit({ x0: 5, y0: 5, x1: 5, y1: 5 }, { w: 1200, h: 800, scale: 0.5, maxScale: 8 }).list).toBe(true);   // one point
+  expect(zoomToFit({ x0: 0, y0: 0, x1: 1000, y1: 500 }, { w: 1200, h: 800, scale: 0.05, maxScale: 8 }).list).toBeUndefined();
+});
+
+test("p8-tidy zoomToFit (p7-perfv MEDIUM): 600 threads in a 90×60 spot at 4×: a click zooms to 8×, then lists the cluster in the drawer", () => {
+  let listed = 0;
+  const m = mount({ board: spot(600), pinCap: 50, maxScale: 8, onList: w => { expect(w).toBe("comments"); listed++; } });
+  const jumps = honourJump(m);
+  m.view.v.scale = 4; m.view.v.x = 600 / 4 - 1045; m.view.v.y = 400 / 4 - 1030; m.tick();
+  expect(m.clusters().length).toBeGreaterThan(0);
+  biggest(m).click(); m.tick();
+  expect(jumps.at(-1).scale).toBe(8);                                 // past the old cap of 4
+  expect(m.view.v.scale).toBe(8);
+  expect(listed).toBe(0);
+  // At the max, a cluster can't zoom further: its click lists exactly its members (no jump, no loop).
+  const c = biggest(m), n = Number(c.textContent);
+  expect(c.getAttribute("title")).toMatch(/click to list them/);
+  const before = jumps.length;
+  c.click(); m.tick();
+  expect(jumps.length).toBe(before);
+  expect(listed).toBe(1);
+  expect(rows(m).length).toBe(n);
+  expect(m.collab.parts.drawer.textContent).toContain(`${n} threads here`);
+  // "Show all" goes back to every open thread.
+  m.collab.parts.drawer.find(e => e.tagName === "BUTTON" && e.textContent === "Show all").click();
+  expect(rows(m).length).toBe(600);
+  m.collab.destroy();
+});
+
+test("p8-tidy zoomToFit: 20 threads on one point (one element's corner) list on the first click, at any zoom", () => {
+  let listed = 0;
+  const m = mount({ board: spot(20, { w: 0, h: 0 }), pinCap: 5, maxScale: 8, onList: () => { listed++; } });
+  const jumps = honourJump(m);
+  m.view.v.scale = 1; m.view.v.x = 600 - 1000; m.view.v.y = 400 - 1000; m.tick();
+  expect(m.clusters().length).toBe(1);
+  m.clusters()[0].click(); m.tick();
+  expect(jumps).toEqual([]);
+  expect(listed).toBe(1);
+  expect(rows(m).map(r => r.getAttribute("data-thread")).sort()).toEqual(Array.from({ length: 20 }, (_, i) => `s${i}`).sort());
+  // Opening one from the list makes it a pin (keep).
+  rows(m)[0].click(); m.tick();
+  expect(m.pins().length).toBeGreaterThan(0);
+  m.collab.destroy();
+});
+
+test("p8-tidy LOW-3: 30 quick emote clicks are never lost silently: each one is sent, or lands while the control shows it is cooling", () => {
+  const m = mount({ threads: 10 });
+  const bar = () => m.collab.parts.emotes;
+  const btn = bar().find(e => e.tagName === "BUTTON" && e.textContent.startsWith("👍")) ?? bar().find(e => e.tagName === "BUTTON");
+  const sends = () => m.port.sent.filter(x => x.k === "emote").length;
+  let sent = 0, cooled = 0;
+  for (let i = 0; i < 30; i++) {
+    const n = sends(), coolingShown = bar().hasClass("cooling") && btn.getAttribute("aria-disabled") === "true" && /Cooling down/.test(btn.getAttribute("title"));
+    btn.click();
+    if (sends() > n) { sent++; expect(coolingShown).toBe(false); expect(bar().hasClass("cooling")).toBe(true); }
+    else { cooled++; expect(coolingShown).toBe(true); }
+    m.clock.advance(20);
+  }
+  expect(sent + cooled).toBe(30);
+  expect(sent).toBeGreaterThanOrEqual(2);                              // 600 ms at 4/s: about 3
+  expect(sent).toBeLessThanOrEqual(3);
+  // The pacing itself is unchanged: never two sends within 250 ms.
+  const at = m.port.sent.filter(x => x.k === "emote").map(x => x.at);
+  for (let i = 1; i < at.length; i++) expect(at[i] - at[i - 1]).toBeGreaterThanOrEqual(250);
+  // The cooldown ends on its own: the control shows it is ready again.
+  m.clock.advance(300);
+  expect(bar().hasClass("cooling")).toBe(false);
+  expect(btn.getAttribute("aria-disabled")).toBe("false");
+  m.collab.destroy();
 });

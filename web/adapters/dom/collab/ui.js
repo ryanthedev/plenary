@@ -13,6 +13,9 @@
 //                  clearTimer, raf } is still read (mono = now) until test/web/collab moves to the port shape.
 //   frame          frame scheduler fn(cb): the overlay repaints on it (default: frame.js's domFrame)
 //   pinCap         at most this many pins in the DOM; past it, threads in view cluster into counted bubbles
+//   view.maxScale  optional: the page's zoom limit (app.js: 8); a cluster click zooms up to it (default 4)
+//   onList         optional fn("comments"): a cluster click that can't zoom apart (members on one point, or the
+//                  view at maxScale) lists them in the comments drawer; the host shows its drawer then
 //   collab.parts   { avatars, emotes, emoteButton, drawer }: elements for the top bar, the bottom bar (desktop),
 //                  the bottom-right corner (phones: one 👏 that opens the picker) and the drawer
 //   collab.pointer(world) · collab.selection(stream, ids) · collab.laser(world)   → presence out (paced)
@@ -24,7 +27,7 @@
 //   collab.setTheme(theme) · collab.destroy()
 
 import { h, replace } from "./dom.js";
-import { EMOTES, canWrite } from "../../../core/collab/limits.js";
+import { EMOTES, PRESENCE, canWrite } from "../../../core/collab/limits.js";
 import { FLAGS } from "../../../core/collab/flags.js";
 import { createOutbox, recordProblem, mayPresence } from "../../../core/collab/gate.js";
 import { createPresence, colorOf, initials, FLOAT_MS } from "../../../core/collab/presence-model.js";
@@ -50,7 +53,7 @@ function clockPort(clock) {
   return { now: clock.now, mono: clock.mono ?? clock.now, set: clock.set ?? clock.setTimer, clear: clock.clear ?? clock.clearTimer, random: clock.random ?? dom.random };
 }
 
-export function mountCollab({ root, canvasOverlay = null, port, view, theme = "light", clock = null, frame = null, flags = FLAGS, idGen = null, maxAvatars = 5, pinCap = PIN_CAP }) {
+export function mountCollab({ root, canvasOverlay = null, port, view, theme = "light", clock = null, frame = null, flags = FLAGS, idGen = null, maxAvatars = 5, pinCap = PIN_CAP, onList = null }) {
   const missing = missingFromPort(port);
   if (missing.length) throw new Error(`collab port lacks ${missing.join(", ")}`);
   const C = clockPort(clock);
@@ -59,7 +62,7 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
   // Deadlines and ages run on mono (a wall jump neither expires peers nor keeps them): presence, floats, pacing.
   const presence = createPresence({ now: C.mono, me: port.me, role: port.role, flags });
   const outbox = createOutbox(port, { now: C.mono, setTimer: C.set, clearTimer: C.clear });
-  const S = { drawer: "comments", list: "open", open: null, compose: null, picker: false, reactFor: null, drafts: new Map(), toast: null, toastTimer: null, theme };
+  const S = { drawer: "comments", list: "open", only: null, open: null, compose: null, picker: false, reactFor: null, drafts: new Map(), toast: null, toastTimer: null, theme };
   const live = () => port.status === "live";
   // recordsView once per records change (port.records() identity, an onRecords call, role or me), not per frame.
   // A board change only re-resolves element anchors (reanchor). `rvRev` bumps whenever what it shows changed.
@@ -106,8 +109,19 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
   }
 
   // ── emote bar and picker ──
+  // Emotes go out at most PRESENCE.emote.rate a second (PROTOCOL.md § Pacing; the outbox drops the rest). A click is
+  // never lost silently (p7-wirev LOW-3): after each send the whole control shows it is cooling down (class
+  // `cooling`, aria-disabled, the title says why) until the gap has passed, so a click in that window lands on a
+  // control that visibly isn't taking emotes. Not coalesced: a held emote would arrive late and mean nothing.
+  const EMOTE_GAP_MS = 1000 / PRESENCE.emote.rate;
+  let emoteAt = -Infinity, coolTimer = null;
+  const cooling = () => C.mono() - emoteAt < EMOTE_GAP_MS;
   function sendEmote(e) {
     if (!outbox.emote(e)) return false;
+    emoteAt = C.mono();
+    if (coolTimer != null) C.clear(coolTimer);
+    coolTimer = C.set(() => { coolTimer = null; renderEmotes(); }, EMOTE_GAP_MS);
+    renderEmotes();
     // Writers' emotes float for everyone (presence); a viewer's is only ever counted (`emotes`).
     if (port.role !== "viewer") { presence.float(e, port.me.user); renderFloats(); }
     return true;
@@ -120,11 +134,15 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
   const pickerEl = h("div.emote-picker.collab-picker", { role: "menu", hidden: true }, EMOTES.map(e => h("button", { title: e, onclick: () => sendEmote(e) }, e)));
   pickHost.append(pickerEl);
   function renderEmotes() {
-    const counts = presence.view().counts, on = live() && mayPresence(port.role, "emote");
+    const counts = presence.view().counts, on = live() && mayPresence(port.role, "emote"), cool = on && cooling();
     if (!on) S.picker = false;
+    const coolTitle = `Cooling down: emotes go out at most ${PRESENCE.emote.rate} a second`;
+    for (const el of [parts.emotes, parts.emoteButton, pickerEl]) el.classList.toggle("cooling", cool);
+    for (const b of [...bar.map(x => x.btn), ...pickerEl.childNodes]) b.setAttribute("aria-disabled", String(cool));
+    for (const b of pickerEl.childNodes) b.setAttribute("title", cool ? coolTitle : b.textContent);
     for (const b of bar) {
       b.btn.disabled = !on;
-      b.btn.setAttribute("title", on ? `Send ${b.e}: never saved. Writers' emotes float up live; viewers' are counted every 500 ms.` : "Emotes need a live connection");
+      b.btn.setAttribute("title", cool ? coolTitle : on ? `Send ${b.e}: never saved. Writers' emotes float up live; viewers' are counted every 500 ms.` : "Emotes need a live connection");
       const text = counts[b.e] ? fmt(counts[b.e]) : "";
       if (b.n.textContent !== text) replace(b.n, text);
     }
@@ -193,15 +211,17 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
       keepC.add(c.key);
       let rec = clusterEls.get(c.key);
       if (!rec) {
-        // A click zooms to fit the cluster's members (port.jumpTo's optional scale), so it opens into its pins.
-        rec = { el: h("button.pin.cluster", { "data-cluster": c.key, onclick: ev => { ev.stopPropagation?.(); port.jumpTo?.(rec.where); } }), at: {}, where: null };
+        // A click zooms to fit the cluster's members (port.jumpTo's optional scale), so it opens into its pins. When
+        // zooming can't split it (members on one point, or the view at its max scale), it lists them instead.
+        rec = { el: h("button.pin.cluster", { "data-cluster": c.key, onclick: ev => { ev.stopPropagation?.(); if (rec.where.list) listThreads(rec.ids); else port.jumpTo?.(rec.where); } }), at: {}, where: null, ids: [] };
         clusterEls.set(c.key, rec); pins.append(rec.el);
       }
-      rec.where = zoomToFit(c.bounds, { w: root.clientWidth || 1200, h: root.clientHeight || 800, scale: sc });
+      rec.ids = c.ids;
+      rec.where = zoomToFit(c.bounds, { w: root.clientWidth || 1200, h: root.clientHeight || 800, scale: sc, ...(Number.isFinite(view.maxScale) ? { maxScale: view.maxScale } : {}) });
       const p = screen(c);
       put(rec, "left", `${p.x}px`, v => rec.el.style.setProperty("left", v));
       put(rec, "top", `${p.y - 28}px`, v => rec.el.style.setProperty("top", v));
-      put(rec, "title", `${c.n} comment threads here: click to zoom in`, v => rec.el.setAttribute("title", v));
+      put(rec, "title", `${c.n} comment threads here: click to ${rec.where.list ? "list them" : "zoom in"}`, v => rec.el.setAttribute("title", v));
       put(rec, "label", fmt(c.n), v => replace(rec.el, v));
     }
     for (const [key, rec] of clusterEls) if (!keepC.has(key)) { rec.el.remove(); clusterEls.delete(key); }
@@ -302,10 +322,12 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
 
   // ── drawer: header, tabs and the scroller are kept; only the rows are rebuilt, and only when they changed ──
   const tabNotes = h("button", { onclick: () => showDrawer("notes") }), tabComments = h("button", { onclick: () => showDrawer("comments") });
-  const tabOpen = h("button", { onclick: () => { S.list = "open"; renderDrawer(); } }), tabResolved = h("button", { onclick: () => { S.list = "resolved"; renderDrawer(); } });
+  const tabOpen = h("button", { onclick: () => { S.list = "open"; S.only = null; renderDrawer(); } }), tabResolved = h("button", { onclick: () => { S.list = "resolved"; S.only = null; renderDrawer(); } });
   const listTabs = h("div.collab-listtabs", {}, h("span.seg", {}, tabOpen, tabResolved));
+  // A cluster's own list (listThreads): only its threads, until "Show all" or a list tab.
+  const onlyText = h("span"), onlyBar = h("div.collab-only", { hidden: true }, onlyText, " ", h("button", { onclick: () => { S.only = null; renderDrawer(); } }, "Show all"));
   const scroller = h("div.notes-list");
-  parts.drawer.append(h("header", {}, h("h3", {}, "Annotations"), h("span.seg", {}, tabNotes, tabComments)), listTabs, scroller);
+  parts.drawer.append(h("header", {}, h("h3", {}, "Annotations"), h("span.seg", {}, tabNotes, tabComments)), listTabs, onlyBar, scroller);
   const label = (el, text, on) => { if (el.textContent !== text) replace(el, text); el.classList.toggle("on", on); };
   // The notes rows are built only while the notes tab shows (C-7); the comments tab's "Notes N" label is a count
   // refreshed on the 1 s tick (the port has no notes-changed signal to key it on).
@@ -317,6 +339,9 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     label(tabNotes, `Notes ${fmt(notesTotal)}`, S.drawer === "notes"); label(tabComments, `Comments ${fmt(rv.open.length)}`, S.drawer === "comments");
     label(tabOpen, `Open ${rv.open.length}`, S.list === "open"); label(tabResolved, `Resolved ${rv.resolved.length}`, S.list === "resolved");
     listTabs.hidden = S.drawer !== "comments";
+    const only = S.drawer === "comments" && S.only ? rv.threads.filter(t => S.only.has(t.id)) : null;
+    onlyBar.hidden = !only;
+    if (only) { const text = `${only.length} ${only.length === 1 ? "thread" : "threads"} here`; if (onlyText.textContent !== text) replace(onlyText, text); }
     if (S.drawer === "notes") {
       sigs.drawerRev = null;     // the comments rows must be rebuilt on the way back
       if (!changed("drawer", JSON.stringify(["notes", nv]))) return;
@@ -331,12 +356,13 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
             n.locked ? h("span.lock", {}, `🔒 ${n.author}'s`) : null)))) : h("div.hint", {}, "No notes yet."),
         nv.more ? h("div.hint", {}, `${fmt(nv.more)} more`) : null);
     } else {
-      const list = S.list === "open" ? rv.open : rv.resolved;
+      const list = only ?? (S.list === "open" ? rv.open : rv.resolved);
+      const which = only ? `only:${[...S.only].join(",")}` : S.list;
       // Keyed on what the rows show, so a reaction or a here doesn't rebuild every row; built only when the
       // records view changed (rvRev), else the last key stands.
-      if (sigs.drawerRev === `${S.list}|${S.open}|${rvRev}`) return;
-      sigs.drawerRev = `${S.list}|${S.open}|${rvRev}`;
-      if (!changed("drawer", JSON.stringify(["comments", S.list, S.open, list.map(t => [t.id, t.name, t.count, t.pending, t.detached, t.point, t.comments.find(c => !c.deleted)?.text])]))) return;
+      if (sigs.drawerRev === `${which}|${S.open}|${rvRev}`) return;
+      sigs.drawerRev = `${which}|${S.open}|${rvRev}`;
+      if (!changed("drawer", JSON.stringify(["comments", which, S.open, list.map(t => [t.id, t.name, t.count, t.pending, t.detached, t.point, t.comments.find(c => !c.deleted)?.text])]))) return;
       replace(scroller, list.length ? list.map(t => {
         const first = t.comments.find(c => !c.deleted);
         const go = () => { openThread(t.id); port.jumpTo?.({ x: t.x, y: t.y }); };
@@ -376,6 +402,8 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
   }
   function openThread(id) { S.open = id; S.compose = null; S.reactFor = null; renderAll(); }
   function showDrawer(which) { if (which === "notes" || which === "comments") S.drawer = which; renderDrawer(); }
+  /** List these threads (a cluster zoom can't split) in the comments drawer, and ask the host to show it. */
+  function listThreads(ids) { S.only = new Set(ids); S.drawer = "comments"; renderDrawer(); onList?.("comments"); }
 
   // ── port events ──
   const offs = [
@@ -423,6 +451,6 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     get statusRev() { return statusRev; },
     get state() { return { open: S.open, compose: S.compose && { x: S.compose.x, y: S.compose.y, on: S.compose.on }, drawer: S.drawer, list: S.list, picker: S.picker, toast: S.toast }; },
     /** Unmount: unsubscribe, stop timers, remove the layer, and release the port (port.destroy, when it has one). */
-    destroy() { for (const off of offs) off?.(); outbox.close(); if (tickTimer) C.clear(tickTimer); if (S.toastTimer) C.clear(S.toastTimer); layer.remove(); port.destroy?.(); },
+    destroy() { for (const off of offs) off?.(); outbox.close(); if (tickTimer) C.clear(tickTimer); if (S.toastTimer) C.clear(S.toastTimer); if (coolTimer != null) C.clear(coolTimer); layer.remove(); port.destroy?.(); },
   };
 }

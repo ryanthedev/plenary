@@ -81,18 +81,19 @@ function installPage() {
 }
 const fireWin = (t, ev = {}) => { for (const fn of winL[t] ?? []) fn({ preventDefault() {}, ...ev }); };
 
-const USERS = { "t-ada": { user: "ada", role: "owner" }, "t-bo": { user: "bo", role: "editor" }, "t-cy": { user: "cy", role: "annotator" } };
+const USERS = { "t-ada": { user: "ada", role: "owner" }, "t-bo": { user: "bo", role: "editor" }, "t-cy": { user: "cy", role: "annotator" },
+  "t-di": { user: "di", role: "annotator" }, "t-vi": { user: "vi", role: "viewer" } };
 
 /** ada's page over a room with bo (a second presenter, headless) on the same virtual clock. */
-function setup({ expAt = null, relogin = null, collab = false, role = null } = {}) {
+function setup({ expAt = null, relogin = null, collab = false, role = null, token = "t-ada", prefs = memoryStore(), wrap = null } = {}) {
   installPage();
   const net = localRoom({ users: USERS, clock: true });
   const joins = [], hooks = {};
   const bo = createSession({ join: () => net.join(), token: "t-bo", board: "b1", client: "bo", user: "bo", clock: net.clock });
   bo.setSize(1200, 800);
   const app = mountApp({
-    startSession: ({ mine, onChange }) => createSession({ join: () => { const t = net.join(); joins.push(t); return t; }, token: "t-ada", board: "b1", client: "ada", user: "ada", mine, onChange, clock: net.clock }),
-    net: { kind: "local", put() {}, onFile() {} }, board: "b1", me: { user: "ada", name: "Ada", role }, prefs: memoryStore(), theme: "light",
+    startSession: ({ mine, onChange }) => createSession({ join: () => { const t = net.join(); joins.push(t); return wrap ? wrap(t) : t; }, token, board: "b1", client: USERS[token].user, user: USERS[token].user, mine, onChange, clock: net.clock }),
+    net: { kind: "local", put() {}, onFile() {} }, board: "b1", me: { user: USERS[token].user, name: "Ada", role }, prefs, theme: "light",
     clock: net.clock, expAt, relogin,
     collab: collab ? (S, o) => { hooks.jumpTo = o.jumpTo; return syncCollabPort(S, { name: "Ada", frame: fn => net.clock.set(fn, 16), ...o }); } : null,
   });
@@ -100,7 +101,7 @@ function setup({ expAt = null, relogin = null, collab = false, role = null } = {
   // Deliveries until quiet, then 16 ms of timers (never settle(): the collab UI's frame loop re-arms forever).
   const step = (n = 1) => { for (let i = 0; i < n; i++) { while (net.step()); net.advance(16); while (net.step()); const q = frames; frames = []; for (const fn of q) fn(); } };
   step(3);
-  return { net, app, S: app.S, bo, step, joins, hooks };
+  return { net, app, S: app.S, bo, step, joins, hooks, prefs };
 }
 const counts = () => Object.fromEntries(["topbar", "panel", "drawer", "timeline"].map(id => [id, page.byId[id].replaced ?? 0]));
 const delta = (a, b) => Object.fromEntries(Object.keys(a).map(k => [k, b[k] - a[k]]));
@@ -298,11 +299,10 @@ test("C-17: the cap's countdown reads the clock port, not Date.now", () => {
   const { S, step, net } = rig;
   // Fake the cap on the session: nextTryAt on the clock's now() scale (virtual: near 0, far from Date.now()).
   const at = net.clock.now() + 12_000;
-  for (const b of [S.binds.board, S.binds.notes]) {
-    Object.defineProperty(b, "nextTryAt", { get: () => at, configurable: true });
-    Object.defineProperty(b, "limited", { get: () => "8 writer connections", configurable: true });
-    Object.defineProperty(b, "status", { get: () => "limited", configurable: true });
-  }
+  // p8-tidy L2: the session reads the link (S.connection) alone, so the cap is faked there.
+  Object.defineProperty(S.connection, "nextTryAt", { get: () => at, configurable: true });
+  Object.defineProperty(S.connection, "limited", { get: () => "8 writer connections", configurable: true });
+  Object.defineProperty(S.connection, "status", { get: () => "limited", configurable: true });
   step(20);
   expect(text(page.byId.overlays)).toMatch(/Trying again in 12 s/);
   net.advance(5000); step(20);
@@ -498,7 +498,7 @@ test("K1 the page's own probe honours shouldProbe: no reconnect while refused, c
   // capped
   rig = setup(); ({ S, step, net, joins } = rig);
   reopens = reopenCounter(joins);
-  for (const b of [S.binds.board, S.binds.notes]) Object.defineProperty(b, "status", { get: () => "limited", configurable: true });
+  Object.defineProperty(S.connection, "status", { get: () => "limited", configurable: true });   // p8-tidy L2: the link's
   fireWin("online"); net.advance(2001); step(5);
   expect(reopens()).toBe(0);
 });
@@ -579,4 +579,293 @@ test("K6 a mid-session role downgrade (new welcome) on a quiet page: topbar tool
     expect(rect().disabled).toBe(true);
     expect(page.byId.panel.className).toContain("ro");
   } finally { USERS["t-ada"].role = prev; }
+});
+
+// ── p8-tidy ──
+const reopenCount = joins => { for (const t of joins) { const r = t.reopen; t.reopen = () => { t.reopened = (t.reopened ?? 0) + 1; r(); }; } return () => joins.reduce((a, t) => a + (t.reopened ?? 0), 0); };
+/** Fire `online` with the clock's random pinned to `r`; returns the page's reopen counter. */
+function onlineAt(rig, r) {
+  const { net, step, joins } = rig, reopens = reopenCount(joins);
+  fireWin("offline"); step();
+  const random = net.clock.random; net.clock.random = () => r; fireWin("online"); net.clock.random = random;
+  return reopens;
+}
+
+test("p8-tidy MEDIUM-1: the resume jitter follows the role: editors 0–2 s, annotators and viewers 0–15 s", () => {
+  // An editor (ada, owner → presenter) at the top of the window: within 2 s.
+  rig = setup();
+  expect(rig.S.effective).toBe("presenter");
+  let reopens = onlineAt(rig, 0.99);
+  rig.net.advance(1970); rig.step();
+  expect(reopens()).toBe(1);
+  // A viewer and an annotator at the same draw: nothing by 2 s (nor by 14.8 s), then once by 15 s.
+  for (const token of ["t-vi", "t-cy"]) {
+    rig = setup({ token });
+    expect(rig.S.effective).toBe(token === "t-vi" ? "viewer" : "annotator");
+    reopens = onlineAt(rig, 0.99);
+    rig.net.advance(2500); rig.step();
+    expect(reopens()).toBe(0);
+    rig.net.advance(12_300); rig.step();
+    expect(reopens()).toBe(0);                                   // 14.8 s < 0.99 × 15 s
+    rig.net.advance(200); rig.step(5);
+    expect(reopens()).toBe(1);
+    expect(rig.S.status).toBe("live");
+  }
+  // A long hide comes back on the same windows.
+  rig = setup({ token: "t-vi" });
+  reopens = reopenCount(rig.joins);
+  const random = rig.net.clock.random; rig.net.clock.random = () => 0.5;
+  page.doc.visibilityState = "hidden"; page.doc.fire("visibilitychange"); rig.net.advance(31_000);
+  page.doc.visibilityState = "visible"; page.doc.fire("visibilitychange"); rig.net.clock.random = random;
+  rig.net.advance(7000); rig.step(); expect(reopens()).toBe(0);
+  rig.net.advance(600); rig.step(5); expect(reopens()).toBe(1);   // 0.5 × 15 s = 7.5 s
+});
+
+test("p8-tidy MEDIUM-1: the user's own click (the pill, Retry) reconnects at once and cancels the waiting probe", () => {
+  rig = setup({ token: "t-vi" });
+  const { S, net, step } = rig;
+  const reopens = onlineAt(rig, 0.99);                          // a probe armed for 14.85 s
+  // Not live (forced on the link, the one thing the session reads): the pill click reconnects now.
+  const real = Object.getOwnPropertyDescriptor(S.connection, "status");
+  let forced = "connecting";
+  Object.defineProperty(S.connection, "status", { get: () => forced ?? real.get.call(S.connection), configurable: true });
+  step(2);
+  const pill = find(page.byId.topbar, e => /^pill\b/.test(e.className));
+  expect(pill.className).not.toMatch(/live/);
+  pill.click();
+  expect(reopens()).toBe(1);
+  forced = null; step(5);
+  expect(S.status).toBe("live");
+  net.advance(16_000); step(5);
+  expect(reopens()).toBe(1);                                    // the probe was cancelled: no second hello
+  // While live the pill does nothing.
+  find(page.byId.topbar, e => /^pill\b/.test(e.className)).click();
+  expect(reopens()).toBe(1);
+});
+
+test("p8-tidy MEDIUM-1: Retry (offline banner) also cancels the waiting probe; a role not known yet takes the wide window", () => {
+  rig = setup({ token: "t-vi" });
+  const { S, net, step } = rig;
+  const reopens = onlineAt(rig, 0.99);                          // a probe armed for 14.85 s
+  fireWin("offline"); step(3);                                  // offline again: the banner offers Retry now
+  const retry = find(page.byId.overlays, e => e.tagName === "BUTTON" && /^Retry/.test(e.textContent));
+  expect(retry).toBeTruthy();
+  retry.click();
+  expect(reopens()).toBe(1);
+  for (let k = 0; k < 16; k++) { net.advance(1000); step(1); }   // deliveries in between (one 16 s jump would starve the hello)
+  expect(reopens()).toBe(1);                                    // the probe armed by `online` was cancelled
+  void S;
+  // Unknown role (no welcome seen): the wide window even on an editor's page.
+  rig = setup();
+  const r2 = reopenCount(rig.joins);
+  rig.S.roleSeen = null;
+  fireWin("offline"); rig.step();
+  const random = rig.net.clock.random; rig.net.clock.random = () => 0.5; fireWin("online"); rig.net.clock.random = random;
+  rig.net.advance(2500); rig.step();
+  expect(r2()).toBe(0);                                         // not 0.5 × 2 s
+  rig.net.advance(5100); rig.step(5);
+  expect(r2()).toBe(1);                                         // 0.5 × 15 s
+});
+
+test("p8-tidy L8: after a same-tab switch to another user, the old user's stored notes survive; the new user's go under their own key", () => {
+  const prefs = memoryStore();
+  rig = setup({ token: "t-cy", prefs });
+  const { S, net, step, app } = rig;
+  app.ui.drawer = "notes"; step(3);                               // the notes list reads isMine (it used to clear lazily)
+  S.placeNote({ x: 100, y: 100 }, "cy's"); step(10);
+  const id = S.eds.notes.doc.live().find(e => e.type === "rectangle").id;
+  expect(JSON.parse(prefs.get("plenary.mine.b1.cy"))).toContain(id);
+  prefs.set("plenary.mine.b1.di", JSON.stringify(["di-old"]));    // di's own notes from an earlier visit
+  S.reconnect("t-di");
+  let n = 0; while (S.connection.lastUser !== "di" && n++ < 500) net.step(() => 0);
+  step(10);
+  expect(S.connection.lastUser).toBe("di");
+  expect(JSON.parse(prefs.get("plenary.mine.b1.cy"))).toContain(id);   // cy's set is not overwritten by the empty one
+  expect(S.mine.has(id)).toBe(false);                                 // and cy's note isn't di's
+  expect(S.mine.has("di-old")).toBe(true);                            // di's stored set is read under di's key
+  S.placeNote({ x: 300, y: 100 }, "di's"); step(10);
+  const id2 = S.eds.notes.doc.live().find(e => e.type === "rectangle" && e.id !== id).id;
+  expect(JSON.parse(prefs.get("plenary.mine.b1.di"))).toEqual(expect.arrayContaining(["di-old", id2]));
+  expect(JSON.parse(prefs.get("plenary.mine.b1.cy"))).not.toContain(id2);
+});
+
+test("p8-tidy zoomToFit, wired: on the page a cluster zooms to 8× (the page's max, not 4), then one that can't split opens the comments drawer", () => {
+  rig = setup({ collab: true });
+  const { app, S, net, step } = rig;
+  // 320 threads in a 30×20 spot: past the collab UI's pin cap (300), so they cluster.
+  for (let i = 0; i < 320; i++) app.port.thread({ id: `p${i}`, anchor: { point: { x: 400 + (i % 30), y: 300 + (Math.floor(i / 30) % 20) } }, text: `t${i}` });
+  for (let i = 0; i < 40; i++) { net.advance(1000); step(2); }
+  expect(S.pending).toBe(0);
+  app.ui.drawer = null; step(3);
+  const clusters = () => app.collab.layer.all().filter(e => /\bcluster\b/.test(e.className));
+  const big = () => clusters().reduce((a, b) => (Number(b.textContent) > Number(a.textContent) ? b : a));
+  expect(clusters().length).toBeGreaterThan(0);
+  big().click(); step(3);
+  expect(S.eds.board.view.scale).toBe(8);                          // past the old cap of 4, clamped by jumpTo's 8
+  expect(app.ui.drawer).toBe(null);
+  expect(clusters().length).toBeGreaterThan(0);                    // 320 in 30×20 at 8×: still over the cap
+  const n = Number(big().textContent);
+  big().click(); step(3);
+  expect(S.eds.board.view.scale).toBe(8);
+  expect(app.ui.drawer).toBe("comments");                         // the page's drawer shows the list
+  expect(page.byId.drawer.hidden).toBe(false);
+  expect(text(page.byId.drawer)).toContain(`${n} threads here`);
+});
+
+// ── p8-tidy round 2 ──
+test("p8-tidyv H3: a resume probe stands down when the link was heard after it was armed (the backoff already restored it)", () => {
+  // The verifier's case: a viewer, random 0.99, `online` arms a probe for 14.85 s; the socket then really drops and
+  // the Replica's backoff reconnects and goes live first. The probe must not replace that link: one hello per return.
+  rig = setup({ token: "t-vi" });
+  const { S, net, step } = rig;
+  const hellos = [];
+  for (const t of rig.joins) { const send = t.send; t.send = m => { if (m?.t === "hello") hellos.push(net.clock.now()); return send(m); }; }
+  const reopens = onlineAt(rig, 0.99);
+  S.dropConnection(); step(1);
+  for (let k = 0; k < 20; k++) { net.advance(1000); step(1); }
+  expect(S.status).toBe("live");
+  expect(reopens()).toBe(1);                                    // the backoff's, not the probe's
+  expect(hellos.length).toBe(1);
+  // The control: nothing heard after arming (a silent link) → the probe reconnects.
+  rig = setup({ token: "t-vi" });
+  const r2 = onlineAt(rig, 0.99);
+  for (let k = 0; k < 16; k++) { rig.net.advance(1000); rig.step(1); }
+  expect(r2()).toBe(1);
+  // A welcome alone (no room event reaches the page) after arming is enough to stand down.
+  let quiet = false;
+  const ROOM_EVENTS = new Set(["here", "emotes", "presence", "leave"]);
+  rig = setup({ token: "t-vi", wrap: t => ({ ...t, reopen: () => t.reopen(), onMessage: fn => t.onMessage(m => { if (!(quiet && ROOM_EVENTS.has(m?.t))) fn(m); }) }) });
+  let roomEvents = 0;
+  rig.S.onRoom(() => { roomEvents++; });
+  const r3 = onlineAt(rig, 0.99);
+  quiet = true; const ev0 = roomEvents;
+  rig.S.reconnect(); for (let k = 0; k < 16; k++) { rig.net.advance(1000); rig.step(1); }
+  expect(roomEvents).toBe(ev0);                                 // nothing but the welcome and catch-up was heard
+  expect(rig.S.status).toBe("live");
+  expect(r3()).toBe(1);                                         // the reconnect's only
+});
+
+test("p8-tidyv H1: the pill click is refused while refused, capped, stopped or mid-gesture; it reconnects when connecting", () => {
+  for (const [status, gesture, want] of [["refused", null, 0], ["limited", null, 0], ["stopped", null, 0], ["connecting", "board", 0], ["connecting", null, 1]]) {
+    rig = setup({ token: "t-vi" });
+    const { S, step, joins } = rig;
+    const reopens = reopenCount(joins);
+    Object.defineProperty(S.connection, "status", { get: () => status, configurable: true });
+    S.gesture = gesture;
+    step(2);
+    find(page.byId.topbar, e => /^pill\b/.test(e.className)).click();
+    expect([status, gesture, reopens()]).toEqual([status, gesture, want]);
+    S.gesture = null;
+  }
+});
+
+test("p8-tidyv L1: a double-click on the pill while a reconnect is in flight opens one socket", () => {
+  rig = setup({ token: "t-vi" });
+  const { S, net, step, joins } = rig;
+  const reopens = reopenCount(joins);
+  const real = Object.getOwnPropertyDescriptor(S.connection, "status");
+  let forced = "connecting";
+  Object.defineProperty(S.connection, "status", { get: () => forced ?? real.get.call(S.connection), configurable: true });
+  step(2);
+  const pill = () => find(page.byId.topbar, e => /^pill\b/.test(e.className));
+  pill().click(); pill().click();
+  expect(reopens()).toBe(1);
+  // Once the link's status moves on (or after the in-flight window), a click works again.
+  forced = null; for (let k = 0; k < 2; k++) { net.advance(500); step(1); }
+  expect(S.status).toBe("live");                               // within the 5 s in-flight window: the status change ends it
+  forced = "connecting"; step(2);
+  pill().click();
+  expect(reopens()).toBe(2);
+});
+
+// ── p8-tidy round 3 ──
+/** setup() whose page transport can hold every message from the room (hold.on = true): a silent or dead link. */
+function heldSetup(o = {}) {
+  const hold = { on: false };
+  const r = setup({ ...o, wrap: t => ({ ...t, reopen: () => t.reopen(), onMessage: fn => t.onMessage(m => { if (!hold.on) fn(m); }) }) });
+  return { ...r, hold };
+}
+const tickTo = (rig, ms, by = 500) => { for (let t = 0; t < ms; t += by) { rig.net.advance(by); rig.step(1); } };
+
+test("p8-tidyv R2-M2: a probe stands down while a hello it didn't send waits for its welcome (backoff after a real drop)", () => {
+  // The verifier's case: a viewer, a probe armed for 7.5 s, a real drop at 2 s, the backoff reopens with every reply held.
+  let rig2 = heldSetup({ token: "t-vi" });
+  rig = rig2;
+  let reopens = onlineAt(rig2, 0.5);
+  tickTo(rig2, 2000);
+  rig2.hold.on = true;
+  rig2.S.dropConnection(); rig2.step(1);
+  tickTo(rig2, 6500);                                            // to 8.5 s: past the probe (7.5 s), before the watchdog
+  expect(reopens()).toBe(1);                                     // the backoff's only
+  expect(rig2.S.status).toBe("connecting");
+  // Control: nothing sent, nothing heard (a silent dead link): the probe reopens.
+  rig2 = heldSetup({ token: "t-vi" }); rig = rig2;
+  reopens = onlineAt(rig2, 0.5);
+  rig2.hold.on = true;
+  tickTo(rig2, 8500);
+  expect(reopens()).toBe(1);
+});
+
+test("p8-tidyv R2-H1: a room event (here) on a live link after `online` stops the probe", () => {
+  rig = setup({ token: "t-vi" });
+  const reopens = onlineAt(rig, 0.99);
+  tickTo(rig, 3000, 1000);
+  rig.net.broadcast({ t: "here", writerCount: 1, viewers: 2 }); while (rig.net.step());
+  tickTo(rig, 14_000, 1000);
+  expect(reopens()).toBe(0);
+});
+
+test("p8-tidyv R2-H2: the L1 guard ends after 5 s even when the status never changes", () => {
+  const r = heldSetup({ token: "t-vi" }); rig = r;
+  const reopens = reopenCount(r.joins);
+  Object.defineProperty(r.S.connection, "status", { get: () => "connecting", configurable: true });
+  r.step(2);
+  const pill = () => find(page.byId.topbar, e => /^pill\b/.test(e.className));
+  r.hold.on = true;
+  pill().click();
+  expect(reopens()).toBe(1);
+  tickTo(r, 4000);
+  pill().click();
+  expect(reopens()).toBe(1);                                     // still in flight at 4 s
+  tickTo(r, 1500);                                               // 5.5 s, the hello still unanswered (watchdog at 10 s)
+  pill().click();
+  expect(reopens()).toBe(2);
+});
+
+test("p8-tidyv R2-H3: Retry goes through reconnectNow: a double-click reconnects once, and a held welcome isn't replaced by a probe", () => {
+  const r = heldSetup({ token: "t-vi" }); rig = r;
+  const reopens = onlineAt(r, 0.5);                              // a probe armed for 7.5 s
+  fireWin("offline"); r.step(3);
+  const retry = find(page.byId.overlays, e => e.tagName === "BUTTON" && /^Retry/.test(e.textContent));
+  expect(retry).toBeTruthy();
+  r.hold.on = true;                                              // the click's welcome is held
+  retry.click(); retry.click();
+  expect(reopens()).toBe(1);
+  tickTo(r, 8500);                                               // past the probe's fire time, before the watchdog
+  expect(reopens()).toBe(1);
+});
+
+test("p8-tidyv R2-L1: a local action inside the jitter window doesn't count as heard: the probe still reopens a silent link", () => {
+  const r = heldSetup(); rig = r;                                // ada, an owner: the 2 s window
+  const reopens = onlineAt(r, 0.99);                             // probe at 1.98 s
+  r.hold.on = true;
+  let roomEvents = 0; r.S.onRoom(() => { roomEvents++; });
+  r.net.advance(500); r.step(1);
+  r.S.connection.record({ do: "thread", id: "r3l1", anchor: { point: { x: 1, y: 1 } }, text: "local" });   // shown at once: a local onRoom
+  expect(roomEvents).toBeGreaterThan(0);
+  tickTo(r, 2000);
+  expect(reopens()).toBe(1);
+});
+
+// ── p8-tidy round 4 ──
+test("p8-tidyv R3-H1: a message on the old socket while the link is down (a resync's backoff) isn't heard: the probe still reopens", () => {
+  let deliver = null;
+  rig = setup({ token: "t-vi", wrap: t => ({ ...t, reopen: () => t.reopen(), onMessage: fn => { deliver = fn; t.onMessage(fn); } }) });
+  const { S, net, step } = rig;
+  deliver({ t: "error", code: "unavailable", message: "room moving" });   // resync: down, the backoff (≥ 500 ms) armed
+  expect(S.status).toBe("connecting");
+  const reopens = onlineAt(rig, 0.01);                           // then a probe, armed for 150 ms (viewer: 0.01 × 15 s)
+  deliver({ t: "here", writerCount: 1, viewers: 3 });           // the old socket still delivers while down
+  net.advance(200); step(1);                                     // the probe fires before the backoff
+  expect(reopens()).toBe(1);
 });

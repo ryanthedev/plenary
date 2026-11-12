@@ -158,11 +158,14 @@ function clusterInto(inside, cell, cap, keep) {
 
 /**
  * Where a cluster click goes: the centre of its members' bounds, at the scale that fits them in `fit` of the
- * viewport (w × h px), at least `minStep` × the current scale (each click zooms in) and at most `maxScale`.
+ * viewport (w × h px), at least `minStep` × the current scale (each click zooms in) and at most `maxScale` (the page
+ * passes its own zoom limit: 8 in app.js). `list: true` when zooming can't split the cluster: its members share one
+ * point (the fit is infinite) or the view is already at `maxScale`. The click then lists them (the drawer) instead.
  */
 export function zoomToFit(bounds, { w, h, scale, fit = 0.8, minStep = 2, maxScale = 4 }) {
   const bw = Math.max(0, bounds.x1 - bounds.x0), bh = Math.max(0, bounds.y1 - bounds.y0);
   const fitScale = Math.min(bw ? (w * fit) / bw : Infinity, bh ? (h * fit) / bh : Infinity);
   const target = Math.min(Math.max(fitScale, scale * minStep), Math.max(maxScale, scale));
-  return { x: (bounds.x0 + bounds.x1) / 2, y: (bounds.y0 + bounds.y1) / 2, scale: target };
+  const list = fitScale === Infinity || scale >= maxScale;
+  return { x: (bounds.x0 + bounds.x1) / 2, y: (bounds.y0 + bounds.y1) / 2, scale: target, ...(list ? { list: true } : {}) };
 }

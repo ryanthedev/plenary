@@ -36,6 +36,8 @@ test("the wrapper keeps every prototype member a spread loses, `fail` included; 
   const bare = wrapTransport({ send() {}, onMessage() {}, reopen() {}, close() {} });
   expect("onDrop" in bare).toBe(false);
   expect("fail" in bare).toBe(false);
-  expect(bare.congested()).toBe(false);
-  expect(bare.backlogBytes()).toBe(0);
+  // p8-one-linkv L3: nothing the adapter lacks is made up (sync.js reads congested/backlogBytes as optional).
+  expect("congested" in bare).toBe(false);
+  expect("backlogBytes" in bare).toBe(false);
+  expect(Object.keys(bare).sort()).toEqual(["close", "onMessage", "reopen", "send"]);
 });

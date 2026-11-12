@@ -10,6 +10,10 @@ import { isLabel } from "../../../packages/core/model.js";
 import { parseLibrary } from "../../../packages/core/library.js";
 import { paint, imageCache, THEMES, color as safeColor } from "./paint.js";
 import { toolsFor, pillFor, pillTitleFor, connectionBanner, expiryNotice, shouldProbe, RESUME_PROBE_MS } from "../../core/roles.js";
+
+/** The resume probe's jitter window (ms) for a page role (uiRole: presenter | annotator | viewer; null = not known yet). */
+export const PROBE_JITTER_MS = Object.freeze({ presenter: 2000, other: 15_000 });
+export const probeJitterMs = role => (role === "presenter" ? PROBE_JITTER_MS.presenter : PROBE_JITTER_MS.other);
 import { renderPanel, loadLibrary, saveLibrary, addToLibrary, propsModel } from "./panel.js";
 import { exportSvg, paintPng, loadPictures } from "./export.js";
 import { h, $, replace } from "./dom.js";
@@ -45,7 +49,11 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     mermaid: { src: "flowchart LR\n  A[Idea] --> B[Spec]\n  B --> C{Review?}\n  C -->|yes| D[Build]\n  C -->|no| B\n  D --> E[Ship]", elbow: true },
     export: { format: "svg", scale: 2, page: "board" },
   };
-  const mineKey = `plenary.mine.${board}.${me.user}`;
+  // The notes this person made on this board, kept per user (p8-one-linkv L8): the key follows the user the room says
+  // this tab is (welcome.user), so after a same-tab switch to another user the emptied set never overwrites the old
+  // user's stored one. Before the first welcome it is the sign-in's user.
+  const mineKeyOf = user => `plenary.mine.${board}.${user}`;
+  const mineKey = mineKeyOf(me.user);
   let chromeDirty = true;
   const S = startSession({
     mine: (() => { try { const v = JSON.parse(get(mineKey) ?? "[]"); return Array.isArray(v) ? v : []; } catch { return []; } })(),
@@ -72,7 +80,9 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const port = collabPort ? collabPort(S, { jumpTo }) : null;
   // The clock port (C-6) and the frame scheduler.
   const collab = port ? mountCollab({ root: $("#canvas"), canvasOverlay: overlay, port, theme: ui.theme, clock, frame: fn => requestAnimationFrame(fn),
-    view: { toScreen: p => S.eds.board.toScreen(p), toWorld: p => S.eds.board.toWorld(p), get scale() { return S.eds.board.view.scale; } } }) : null;
+    view: { toScreen: p => S.eds.board.toScreen(p), toWorld: p => S.eds.board.toWorld(p), get scale() { return S.eds.board.view.scale; }, maxScale: ZOOM_MAX },
+    // A cluster that can't zoom apart lists its threads in the comments drawer (the phone's sheet): show it.
+    onList: which => { if (isPhone()) ui.sheet = which; else ui.drawer = which; chromeDirty = true; } }) : null;
   if (collab) collab.showDrawer("comments");
   const worldAt = p => S.eds.board.toWorld(p);
   // Selection presence and pin layout, once per frame (./collab/frame.js).
@@ -278,7 +288,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     tl.fill.style.width = `${pct}%`; tl.head.style.left = `${pct}%`;
     tl.text.textContent = `${(t / 1000).toFixed(1)}s / ${(dur / 1000).toFixed(1)}s`;
   }
-  const pillEl = h("span.pill");
+  // The pill: a click while not live reconnects now (the user's own click skips the resume jitter, C-4 / p8-tidy).
+  const pillEl = h("span.pill", { onclick: () => { if (S.status !== "live" && shouldProbe({ status: S.status, gesture: S.gesture })) reconnectNow(); } });
   let pillSig = "";
   function inPlace() {
     timelineInPlace();
@@ -503,7 +514,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (b) out.push(h("div.banner", {}, b.text,
       b.relogin ? [reloginLink(), " "] : null,
       b.action === "reload" ? h("button.btn", { onclick: () => location.reload() }, "Reload")
-        : b.action === "retry" ? h("button.btn", { onclick: () => S.reconnect() }, S.status === "limited" ? "Retry now" : S.online ? "Retry" : "Retry now") : null));
+        : b.action === "retry" ? h("button.btn", { onclick: reconnectNow }, S.status === "limited" ? "Retry now" : S.online ? "Retry" : "Retry now") : null));
     // Before the sign-in ends (or once it has, while the link still holds): warn, with the way out. Not when the
     // refused banner already offers it.
     const x = S.status === "refused" ? null : expiry();
@@ -606,18 +617,44 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // Link liveness, page side (C-4). Back online, or back to the front after RESUME_PROBE_MS hidden: the link may have
   // died without a close (Wi-Fi switch, sleep, a NAT timeout) and nothing else would notice while the board is quiet,
   // so reconnect (the session handle's only lever; the hello's `since` keeps it a small catch-up). Both are jittered
-  // up to PROBE_JITTER_MS (clock.random): a whole office's network coming back, or a whole all-hands switching back
-  // to the board at once, must not arrive as one wave of hellos.
+  // (clock.random): a whole office's network coming back, or a whole all-hands switching back to the board at once,
+  // must not arrive as one wave of hellos. The window follows the role (manager, p8-tidy): editors (presenters) are
+  // few and need < 150 ms, so 0–2 s; annotators and viewers are the 100k, so 0–15 s (100k over 15 s is about 6.7k
+  // hellos/s, versus 50k/s over 2 s). A role not known yet takes the wide window. The user's own click (Retry, the
+  // pill) skips the jitter and cancels a probe still waiting. Gateway hello admission (engine) is the backstop.
   // The idle-link watchdog itself is sync.js's (J3, after engine's heartbeat E-1).
   // A tab coming back skips the reconnect when the room spoke within HEARD_MS (presence, here, emotes, records: any
   // room event): its link is alive, and on a busy all-hands that is every tab, so a mass return sends no hellos.
-  const PROBE_JITTER_MS = 2000, HEARD_MS = 10_000;
+  const HEARD_MS = 10_000;
   let probeTimer = null, hiddenAt = null, heard = null;
-  S.onRoom(() => { heard = { mono: clock.mono(), wall: clock.now() }; });
+  // A probe remembers two counts when armed and stands down at fire time if either moved: messages heard from the room
+  // (S.onHeard: welcome, here, presence, … never a local action, p8-tidyv R2-L1), so the link is alive (H3); and hellos
+  // the link sent (any reconnect: backoff, pill, Retry), so a hello is already out and waiting for its welcome
+  // (R2-M2). Replacing either would send a second hello for one return, doubling a return wave.
+  let heardN = 0;
+  S.onHeard(() => { heard = { mono: clock.mono(), wall: clock.now() }; heardN++; });
   const since = t => Math.max(clock.mono() - t.mono, clock.now() - t.wall);
+  const cancelProbe = () => { if (probeTimer != null) { clock.clear(probeTimer); probeTimer = null; } };
+  // The user's own reconnect (Retry, the pill). One at a time (p8-tidyv L1): a second click while it is in flight does
+  // nothing. In flight until the link's status next changes, or USER_RECONNECT_MS at most.
+  const USER_RECONNECT_MS = 5000;
+  let userReconnect = null;
+  const endUserReconnect = () => { if (userReconnect != null) { clock.clear(userReconnect); userReconnect = null; } };
+  S.onStatus(() => { endUserReconnect(); });
+  function reconnectNow() {
+    if (userReconnect != null) return;
+    cancelProbe(); S.reconnect(); chromeDirty = true;
+    userReconnect = clock.set(() => { userReconnect = null; }, USER_RECONNECT_MS);
+  }
   const probe = () => {
-    if (probeTimer != null) clock.clear(probeTimer);
-    probeTimer = clock.set(() => { probeTimer = null; if (shouldProbe({ status: S.status, gesture: S.gesture })) S.reconnect(); }, clock.random() * PROBE_JITTER_MS);
+    cancelProbe();
+    const armed = heardN, armedHellos = S.connection.hellos;
+    probeTimer = clock.set(() => {
+      probeTimer = null;
+      if (heardN !== armed) return;                        // heard since armed: the link is alive (H3)
+      if (S.connection.hellos !== armedHellos) return;     // a hello went out since armed: wait for it (R2-M2)
+      if (shouldProbe({ status: S.status, gesture: S.gesture })) S.reconnect();
+    }, clock.random() * probeJitterMs(S.roleSeen ? S.effective : null));
   };
   addEventListener("online", () => { S.online = true; chromeDirty = true; probe(); });
   addEventListener("offline", () => { S.online = false; chromeDirty = true; });
@@ -629,7 +666,18 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   });
   matchMedia("(max-width: 640px)").addEventListener("change", () => { chromeDirty = true; });
   setTheme(ui.theme);
-  let savedMine = 0, fitted = false;
+  let savedMine = 0, fitted = false, mineUser = me.user;
+  function saveMine() {
+    const u = S.connection.lastUser;
+    if (u != null && u !== mineUser) {
+      // Another user on this tab: the session has forgotten the old user's notes (S.mine reads the room's user), so
+      // start from what is stored under the new user's key; the old user's key is never written again.
+      mineUser = u;
+      try { const v = JSON.parse(get(mineKeyOf(u)) ?? "[]"); if (Array.isArray(v)) for (const id of v) if (typeof id === "string") S.mine.add(id); } catch {}
+      savedMine = S.mine.size; return;
+    }
+    if (S.mine.size !== savedMine) { savedMine = S.mine.size; put(mineKeyOf(mineUser), JSON.stringify([...S.mine].slice(-5000))); }
+  }
   // First catch-up done: show everything once.
   function fitOnce() { if (fitted || S.status !== "live") return; fitted = true; if (S.eds.board.doc.live().length || S.eds.notes.doc.live().length) S.fit(); }
   (function frame() {
@@ -639,7 +687,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     fitOnce();
     const f = S.takeFlash(); if (f) toast(f);
     chrome();
-    if (S.mine.size !== savedMine) { savedMine = S.mine.size; put(mineKey, JSON.stringify([...S.mine].slice(-5000))); }
+    saveMine();
     requestAnimationFrame(frame);
   })();
 

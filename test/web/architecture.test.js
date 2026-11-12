@@ -105,17 +105,20 @@ const CORE_GLOBALS = [
 const REGEX_KEYWORDS = new Set(["return", "typeof", "case", "do", "else", "in", "of", "new", "delete", "void", "throw", "instanceof", "yield", "await"]);
 export function codeOnly(src) {
   let out = "", i = 0;
-  const blank = c => (c === "\n" ? "\n" : " ");
+  // JS line terminators (LF, CR, LS, PS): each ends a // comment, a string's line and a regex literal, and counts as
+  // a line break for ASI; blanking keeps them, so the rules below still see the break (p8-tidy round 4).
+  const isLT = c => c === "\n" || c === "\r" || c === "\u2028" || c === "\u2029";
+  const blank = c => (isLT(c) ? c : " ");
   // Code until the end, or (inExpr) until the "}" that closes a template's ${.
   function code(inExpr) {
     let depth = 0;
     while (i < src.length) {
       const c = src[i], n = src[i + 1];
-      if (c === "/" && n === "/") { while (i < src.length && src[i] !== "\n") { out += " "; i++; } continue; }
+      if (c === "/" && n === "/") { while (i < src.length && !isLT(src[i])) { out += " "; i++; } continue; }
       if (c === "/" && n === "*") { const e = src.indexOf("*/", i + 2), end = e < 0 ? src.length : e + 2; while (i < end) out += blank(src[i++]); continue; }
       if (c === '"' || c === "'") {
         out += src[i++];
-        while (i < src.length && src[i] !== c && src[i] !== "\n") { if (src[i] === "\\") { out += " "; i++; } if (i < src.length) out += blank(src[i++]); }
+        while (i < src.length && src[i] !== c && !isLT(src[i])) { if (src[i] === "\\") { out += " "; i++; } if (i < src.length) out += blank(src[i++]); }
         if (i < src.length) out += src[i++];
         continue;
       }
@@ -131,18 +134,79 @@ export function codeOnly(src) {
     let j = out.length - 1;
     while (j >= 0 && /\s/.test(out[j])) j--;
     if (j < 0) return true;
+    // "++" / "--": postfix (it ends a value, so "/" divides: i++ / 2, a[i]++ / 2, (a)++ / 2) only when what precedes it
+    // ends a value ON THE SAME LINE (JS allows no line break before a postfix ++/--) and isn't a block's "}": a word that
+    // isn't a keyword, "]", or a ")" that doesn't close an if/while/for/with head. Otherwise it is a prefix one, and a
+    // regex may follow: ++/\//.lastIndex, x\n++/\//… , { … } ++/\//… (p8-tidyv R2-M1, R3-M1).
+    if ((out[j] === "+" || out[j] === "-") && out[j - 1] === out[j]) {
+      let k = j - 2;
+      while (k >= 0 && /\s/.test(out[k])) { if (isLT(out[k])) return true; k--; }
+      return out[k] === "}" || !endsValue(k);
+    }
     if (/[(,=:[!&|?{};+\-*%<>~^]/.test(out[j])) return true;
-    if (!/[\w$]/.test(out[j])) return false;                 // ) ] " ' ` and the like end a value: division
+    if (out[j] === ")") return closesStatementHead(j);        // if (x) /re/ … starts a regex; (a + b) / 2 divides
+    if (!/[\w$]/.test(out[j])) return false;                 // ] " ' ` and the like end a value: division
     let k = j;
     while (k >= 0 && /[\w$]/.test(out[k])) k--;
-    return REGEX_KEYWORDS.has(out.slice(k + 1, j + 1));
+    const word = out.slice(k + 1, j + 1);
+    // `of` is a keyword only inside a for (…) head (for (const x of …), for await ([a] of …), with or without line
+    // breaks); anywhere else it is a name, so "/" divides (R2-L2, R3-L1: const z = y\nof / 2).
+    if (word === "of") return inForHead(k) && endsValue(k);
+    return REGEX_KEYWORDS.has(word);
+  }
+  // Is out[k] inside the parens of a for / for await head (an unclosed "(" whose head word is for)?
+  function inForHead(k) {
+    let depth = 0;
+    for (; k >= 0; k--) {
+      if (out[k] === ")") depth++;
+      else if (out[k] === "(") { if (depth === 0) break; depth--; }
+    }
+    if (k < 0) return false;
+    let w = wordBefore(k);
+    if (w.word === "await") w = wordBefore(w.start);
+    return w.word === "for" && !w.member;
+  }
+  // Does the code up to out[k] (spaces skipped) end a value: a non-keyword word, "]", "}" or a ")" that isn't a
+  // statement head's?
+  function endsValue(k) {
+    while (k >= 0 && /\s/.test(out[k])) k--;
+    if (k < 0) return false;
+    if (out[k] === "]" || out[k] === "}") return true;
+    if (out[k] === ")") return !closesStatementHead(k);
+    if (!/[\w$]/.test(out[k])) return false;
+    let m = k;
+    while (m >= 0 && /[\w$]/.test(out[m])) m--;
+    return !REGEX_KEYWORDS.has(out.slice(m + 1, k + 1));
+  }
+  // Does the ")" at out[j] close the head of if / while / for / with (p7-archtestv R2-MED-2)? Then a statement follows
+  // and a "/" there starts a regex. Strings and regex bodies are already blanked in `out`, so parens balance.
+  function closesStatementHead(j) {
+    let depth = 0, k = j;
+    for (; k >= 0; k--) {
+      if (out[k] === ")") depth++;
+      else if (out[k] === "(" && --depth === 0) break;
+    }
+    if (k < 0) return false;
+    let w = wordBefore(k);
+    if (w.word === "await") w = wordBefore(w.start);        // for await (…) /re/ (p8-tidyv M1)
+    return ["if", "while", "for", "with"].includes(w.word) && !w.member;
+  }
+  // The identifier ending just before out[k] (spaces skipped): { word, start, member } (member: preceded by ".").
+  function wordBefore(k) {
+    k--;
+    while (k >= 0 && /\s/.test(out[k])) k--;
+    const e = k;
+    while (k >= 0 && /[\w$]/.test(out[k])) k--;
+    const start = k + 1;
+    while (k >= 0 && /\s/.test(out[k])) k--;
+    return { word: out.slice(start, e + 1), start, member: k >= 0 && out[k] === "." };
   }
   // A regex body until its closing "/" (escapes and [...] classes honoured), blanked; the flags stay as code.
   function regex() {
     let inClass = false;
-    while (i < src.length && src[i] !== "\n") {
+    while (i < src.length && !isLT(src[i])) {
       const c = src[i];
-      if (c === "\\") { out += " "; i++; if (i < src.length && src[i] !== "\n") { out += " "; i++; } continue; }
+      if (c === "\\") { out += " "; i++; if (i < src.length && !isLT(src[i])) { out += " "; i++; } continue; }
       if (c === "[") inClass = true;
       else if (c === "]") inClass = false;
       else if (c === "/" && !inClass) { out += src[i++]; return; }
@@ -293,6 +357,19 @@ describe("web/ architecture (hexagonal boundaries)", () => {
     expect(hits("const s = `a ${`b ${document.title} c`} d`;")).toEqual(["document"]);
     expect(hits("const s = `document ${'location'} ${{ a: 1 }.a} Date.now`;")).toEqual([]);
     expect(hits("const s = `${x}`; const t = setTimeout;")).toEqual(["setTimeout"]);   // the scan resumes after a template
+    // p7-archtestv R2-MED-2: after the ")" of an if head a "/" starts a regex, so the line's Date.now stays code.
+    expect(hits("if (client) /\\//.test(board); const t = Date.now();")).toEqual(["Date.now"]);
+    expect(hits("const m = (a + b) / 2; const t = Date.now(); // a comment")).toEqual(["Date.now"]);
+    expect(hits("const m = (a + b) / 2; // Date.now in a comment")).toEqual([]);
+    // p8-tidyv M1 and L6: the line after for await (…) /re/ and after i++ / 2 stays code.
+    expect(hits("for await (const x of y) /\\//.test(x); const t = Date.now();")).toEqual(["Date.now"]);
+    expect(hits("i++ / 2; const t = Date.now(); // x")).toEqual(["Date.now"]);
+    expect(hits("++/\\//.lastIndex; const t = Date.now();")).toEqual(["Date.now"]);
+    expect(hits("x = --/\\//.lastIndex; const t = Date.now();")).toEqual(["Date.now"]);
+    expect(hits("const x = of / 2; const t = Date.now(); const y = 1 / 3;")).toEqual(["Date.now"]);
+    for (const line of ["x\n++/\\//.lastIndex; import(d); Date.now();", "if (x) { x = 2 } ++/\\//.lastIndex; import(d); Date.now();",
+      "const a = [1]\n--/\\//.lastIndex; import(d); Date.now();", "x = { a: 1 }\n++/\\//.lastIndex; import(d); Date.now();",
+      "const f = () => {}\n++/\\//.lastIndex; import(d); Date.now();", "const z = y\nof / 2; Date.now(); const w = 1 / 3;"]) expect(hits(line)).toEqual(["Date.now"]);
     // p6-hexv: the wall clock through Date(), and the worker global self.
     expect(hits("const d = new Date();")).toEqual(["Date("]);
     expect(hits("const s = Date();")).toEqual(["Date("]);
@@ -366,6 +443,52 @@ describe("web/ architecture (hexagonal boundaries)", () => {
     expect(n("const m = await import ( spec );")).toBe(1);
     expect(n("x.import(y);")).toBe(0);                                            // a method named import
     expect(n("const r = /\\//; import(board).catch(() => {});")).toBe(1);         // p7-archtestv MED-2
+    // p7-archtestv R2-MED-2: a regex after the ")" of an if/while/for/with head, then a computed import on that line.
+    expect(n("if (client) /\\//.test(board); import(board).then(m => m); const t = Date.now();")).toBe(1);
+    // p8-tidyv H2: each head word on its own (a "//" inside the regex would open a comment if read as division).
+    expect(n("while (go) /\\//.test(s); import(spec)")).toBe(1);
+    expect(n("for (;;) /\\//.test(c); import(d)")).toBe(1);
+    expect(n("x.if(a) / 2; // import(y)")).toBe(0);                             // a method named if: division
+    expect(n("x . if (a) / 2; // import(y)")).toBe(0);
+    // p8-tidyv M1: for await (…) /re/.
+    expect(n("for await (const x of y) /\\//.test(x); import(d); Date.now();")).toBe(1);
+    expect(n("const a = await (p) / 2; // import(y)")).toBe(0);                  // await alone: division
+    expect(n("await (p) / 2; // import(y)")).toBe(0);
+    // p8-tidyv L6: a postfix ++ / -- ends the value, so "/" divides.
+    expect(n("i++ / 2; import(d); Date.now(); // x")).toBe(1);
+    expect(n("i-- / 2; import(d); // x")).toBe(1);
+    // p8-tidyv R2-M1: a prefix ++ / -- may take a regex; postfix ones still divide.
+    expect(n("++/\\//.lastIndex; import(d); Date.now();")).toBe(1);
+    expect(n("x = --/\\//.lastIndex; import(d); Date.now();")).toBe(1);
+    expect(n("a[i]++ / 2; import(d); // x")).toBe(1);
+    expect(n("(a)++ / 2; import(d); // x")).toBe(1);
+    expect(n("if (x) ++/\\//.lastIndex; import(d);")).toBe(1);
+    expect(n("return ++/\\//.lastIndex; import(d);")).toBe(1);
+    // p8-tidyv R2-L2: `of` as a name divides; `for (… of /re/)` still starts a regex.
+    expect(n("const x = of / 2; import(d); const y = 1 / 3;")).toBe(1);
+    expect(n("for (const x of /\\//.exec(s)) import(d);")).toBe(1);
+    expect(n("for (const [a] of /\\//.exec(s)) import(d);")).toBe(1);
+    // p8-tidyv R3-M1: a line break (or a block's "}") before ++/-- makes it prefix, so a regex may follow.
+    expect(n("x\n++/\\//.lastIndex; import(d); Date.now();")).toBe(1);
+    expect(n("if (x) { x = 2 } ++/\\//.lastIndex; import(d); Date.now();")).toBe(1);
+    expect(n("const a = [1]\n--/\\//.lastIndex; import(d); Date.now();")).toBe(1);
+    expect(n("x = { a: 1 }\n++/\\//.lastIndex; import(d); Date.now();")).toBe(1);
+    expect(n("const f = () => {}\n++/\\//.lastIndex; import(d); Date.now();")).toBe(1);
+    expect(n("x /* c */ ++ / 2; import(d); // x")).toBe(1);                      // same line through a comment: postfix
+    // p8-tidyv R3-L1: `of` as a name after a line break; a for head with line breaks still reads `of` as a keyword.
+    expect(n("const z = y\nof / 2; import(d); const w = 1 / 3;")).toBe(1);
+    expect(n("for (const x\nof /\\//.exec(s)) import(d);")).toBe(1);
+    expect(n("for await (const x of /\\//.exec(s)) import(d);")).toBe(1);
+    expect(n("f(y, of / 2); import(d); const w = 1 / 3;")).toBe(1);
+    expect(n("for (let i = of / 2; i < 1; i++) import(d);")).toBe(1);           // `of` as a name inside a classic for head
+    // Round 4, the builder's own evasion: CR, LS (U+2028) and PS (U+2029) are line breaks too (ASI, and they end a //
+    // comment and a regex literal). Bun parses and runs these.
+    expect(n("x\r++/\\//.lastIndex; import(d); Date.now();")).toBe(1);
+    expect(n("x\u2028++/\\//.lastIndex; import(d); Date.now();")).toBe(1);
+    expect(n("x\u2029--/\\//.lastIndex; import(d); Date.now();")).toBe(1);
+    expect(n("const s = 1; // a comment\u2028import(d);")).toBe(1);
+    expect(n("const s = 1; // a comment\rimport(d);")).toBe(1);
+    expect(n("const mid = (a + b) / 2; import(x); // (a + b) / 2 divides")).toBe(1);   // division still divides
   });
 
   test("the globals rule also catches Function(, eval and import.meta (synthetic sources)", () => {

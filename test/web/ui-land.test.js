@@ -173,9 +173,10 @@ test("p6-uiv L2: a downgrade mid-typing drops the write and says so", () => {
 test("p6-sync2v M2: `stopped` wins the combined status and has its own pill, never Connecting…", () => {
   const net = localRoom({ board: "b1", users: DEV_USERS, clock: true });
   let deliver = null;
-  const stub = { send() {}, onMessage: fn => { deliver = fn; }, reopen() {}, close() {} };
-  // p8-one-link: one link per tab, so both streams stop together; the merge rule is checked with the board bind
-  // forced to "connecting" (as a second link used to be).
+  let dropFn = null, dropped = 0;
+  const stub = { send() {}, onMessage: fn => { deliver = fn; }, reopen() {}, close() {}, onDrop: fn => { dropFn = fn; }, fail: () => { dropped++; dropFn?.(); } };
+  // p8-one-link: one link per tab, so both streams stop together. p8-tidy L2: the session reads the link alone (no
+  // merge of two binds), and `stopped` must still win: it stays through a drop and a reconnect, and beats `refused`.
   let joined = 0;
   const s = createSession({ join: () => { joined++; return stub; }, token: "dev-ada", board: "b1", clock: net.clock });
   expect(joined).toBe(1);
@@ -183,8 +184,21 @@ test("p6-sync2v M2: `stopped` wins the combined status and has its own pill, nev
   expect(s.binds.notes.status).toBe("stopped");
   expect(s.binds.board.status).toBe("stopped");
   expect(s.status).toBe("stopped");
-  Object.defineProperty(s.binds.board, "status", { get: () => "connecting", configurable: true });
+  s.dropConnection();                                                          // an unasked drop (the stub's own fail → onDrop)
+  expect(dropped).toBe(1);
   expect(s.status).toBe("stopped");
+  s.reconnect();                                                               // a fresh hello
+  expect(s.status).toBe("stopped");
+  expect(s.binds.board.status).toBe("stopped");
+  // Refused, then the room says the rules are too new: `stopped` wins over `refused` (the update comes first).
+  let deliver2 = null;
+  const s2 = createSession({ join: () => ({ send() {}, onMessage: fn => { deliver2 = fn; }, reopen() {}, close() {} }), token: "dev-ada", board: "b1", clock: net.clock });
+  deliver2({ t: "welcome", seq: 0, role: "owner", user: "ada" });
+  expect(s2.status).toBe("live");
+  deliver2({ t: "error", code: "auth", message: "sign in again" });
+  expect(s2.status).toBe("refused");
+  deliver2({ t: "error", code: "version", message: "rules too new" });
+  expect(s2.status).toBe("stopped");
   const pill = pillFor({ status: "stopped", pending: 2, role: "presenter" });
   expect(pill.text).toBe("Update needed");
   expect(pill.text).not.toMatch(/Connecting/);

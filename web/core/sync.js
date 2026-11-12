@@ -60,10 +60,12 @@ export function bindEditor(editor, { transport, token: firstToken, board, client
   let status = "connecting";
   let resets = 0, timer = null, closed = false;
   let down = false;               // resync asked for: the connection is closed, the backoff runs, input is ignored
-  // The writer-connection cap (PROTOCOL.md § Messages: a ninth writer connection gets an id-less `limit` before its
-  // welcome, then is closed). Retrying on the backoff would only be refused again, forever: stop here, say so, and
-  // wait for reconnect() (the user closed a tab and pressed Retry).
-  let limited = null;             // the room's message, while stopped by the cap
+  // The writer-connection cap (PROTOCOL.md § Pacing: a ninth writer connection gets an id-less `limit` before its
+  // welcome, then is closed). It counts as a failed attempt under rule 12 and reconnects on the Replica's backoff
+  // (min(30 s, 0.5 s × 2^k) × [0.5, 1): about one try per 15–30 s once settled, never a loop), so a tab gets in
+  // by itself once a slot frees. `limited` stays set (the UI's banner) until a welcome; reconnect() tries at once.
+  let limited = null;             // the room's message, from the cap's refusal until the next welcome
+  let nextTryAt = null;           // when the backoff reopens (now()-based), while one is armed
   let roleSeen = null;            // the last non-null welcome.role: kept across resyncs (Replica.reset clears its own)
   let recordsRev = replica.recordsRev;
   // Settings ops the room refused (did.refusedSettings), for the app to show; `ready` once did.retryReady says a
@@ -76,10 +78,12 @@ export function bindEditor(editor, { transport, token: firstToken, board, client
   function arm() {
     if (timer != null) { timers.clear(timer); timer = null; }
     if (closed) return;
+    nextTryAt = null;
     if (down) {
       const ms = replica.reconnectWait();
       if (!timed) return reopen();
-      timer = timers.set(() => { timer = null; reopen(); }, ms);
+      nextTryAt = now() + ms;
+      timer = timers.set(() => { timer = null; nextTryAt = null; reopen(); }, ms);
       return;
     }
     if (!timed) return;
@@ -89,20 +93,20 @@ export function bindEditor(editor, { transport, token: firstToken, board, client
 
   function connect() {
     const [hello] = replica.connectMessages(token, board);
-    setStatus("connecting");
+    setStatus(limited ? "limited" : "connecting");
     send(hello);
     pump();
   }
   function reopen() { if (closed) return; down = false; transport.reopen(); connect(); }
   // The Replica asked for a fresh connection. The old one stays as it is (its messages are ignored from
   // now on) until reopen() replaces it: close() is for good, never part of a resync.
-  function goDown() { down = true; setStatus("connecting"); arm(); }
+  function goDown() { down = true; setStatus(limited ? "limited" : "connecting"); arm(); }
 
   // Status from the Replica's state. Entering `live` loads the Editor from the caught-up Replica.
   function refreshStatus() {
     if (replica.stopped) return setStatus("stopped");
+    if (replica.needAuth) return setStatus("refused");   // a refusal wins over the cap (p7-wirev R2-M1)
     if (limited) return setStatus("limited");
-    if (replica.needAuth) return setStatus("refused");
     if (down || !replica.welcomed) return setStatus("connecting");
     if (replica.applied < replica.target) return setStatus("catching-up");
     if (status !== "live") { loadEditor(); setStatus("live"); }
@@ -111,7 +115,6 @@ export function bindEditor(editor, { transport, token: firstToken, board, client
   // After every receive, local change and timer: send what the Replica lets go, then one timer.
   function pump() {
     if (closed || down) return;
-    if (limited) { refreshStatus(); if (timer != null) { timers.clear(timer); timer = null; } return; }
     if (!replica.resync) {
       refreshStatus();
       // A never-sent op is re-stamped when an entry overtakes it (that entry's ids are fed to the Editor) or
@@ -177,9 +180,10 @@ export function bindEditor(editor, { transport, token: firstToken, board, client
   }
 
   transport.onMessage(msg => {
-    if (closed || down || limited) return;
+    if (closed || down) return;
     if (msg?.t === "error" && msg.code === "limit" && msg.id === undefined && !replica.welcomed) {
       limited = typeof msg.message === "string" ? msg.message : "too many open connections";
+      replica.connectionFailed();          // rule 12: a failed attempt (its close that follows is then ignored: `down`)
       pump(); onRoom({ type: "limit", message: limited }); return;
     }
     if (msg?.t === "here" || msg?.t === "emotes") { onRoom({ type: msg.t, msg }); return; }
@@ -188,6 +192,7 @@ export function bindEditor(editor, { transport, token: firstToken, board, client
     const refusedRecord = was?.stream === "records" && !["stale", "unavailable", "auth", "version", "stale-setting"].includes(msg.code)
       ? { op: clone(was.op), code: msg.code, message: typeof msg.message === "string" ? msg.message : "" } : null;
     const did = replica.receive(msg);
+    if (limited && replica.welcomed) limited = null;   // in: the cap let this connection through
     if (status === "live" && !did.reset && !replica.resync) {
       if (did.snapshot) loadEditor();
       else {
@@ -225,7 +230,7 @@ export function bindEditor(editor, { transport, token: firstToken, board, client
   // usual resync. Ignored while already down (a reopen is coming), closed, or waiting on sign-in / an update
   // (reconnecting with the same token or app would only be refused again).
   transport.onDrop?.(() => {
-    if (closed || down || limited || replica.stopped || replica.needAuth) return;
+    if (closed || down || replica.stopped || replica.needAuth) return;
     replica.connectionFailed();
     pump();
   });
@@ -274,8 +279,10 @@ export function bindEditor(editor, { transport, token: firstToken, board, client
     get client() { return replica.client; },
     /** Who the room says this connection is (welcome.user), or null before the first welcome. */
     get user() { return replica.user ?? null; },
-    /** Stopped by the writer-connection cap: the room's message, or null. reconnect() tries again. */
-    get limited() { return limited; },
+    /** Refused by the writer-connection cap: the room's message until a welcome, else null. It retries on the backoff by itself; reconnect() tries at once. */
+    get limited() { return replica.needAuth ? null : limited; },   // refused (`auth`) wins over the cap: no stale cap shown
+    /** While limited: when the backoff tries again (ms, the clock's now()), or null when no try is armed. */
+    get nextTryAt() { return limited ? nextTryAt : null; },
     /** Is the transport's outbound backlog over CONGESTED_BYTES (the status pill's "slow link")? */
     congested: () => !closed && !!transport.congested?.(),
     /**

@@ -61,6 +61,8 @@
 //   element(stream, id) → { x, y, width, height } | null   null when absent or deleted; anchors follow it  ADDED
 //   jumpTo?({ x, y })              optional: center the view on a world point                       ADDED
 //   editNote?(id), deleteNote?(id) optional: the drawer shows edit/delete only when these exist     ADDED
+//   destroy?()                     optional: release the port (no more callbacks, a queued records frame included);
+//                                  mountCollab's destroy() calls it                                  ADDED (p7-wire2)
 
 /** Members a port must have. Optional ones (jumpTo, editNote, deleteNote) are left out. */
 export const PORT_MEMBERS = [

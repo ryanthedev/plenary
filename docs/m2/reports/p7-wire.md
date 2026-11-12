@@ -170,3 +170,113 @@ Each mutant was applied to one file, the collab tests were run (`test/web/collab
 - **`collab.layout()` runs on every view or board change** (pin re-placement, O(threads) per frame while panning or with incoming ops). Fine for tens of threads; for thousands, cull pins to the viewport.
 - **The comments drawer** is the collab UI's own node inside the page drawer, with its own header hidden by CSS. The page's notes tab is unchanged (`editNote` and `deleteNote` aren't offered on the port), so notes rows there still say "You" or "—" rather than names.
 - **`limited`** is a new status name (web/core/sync.js and the session). Anything else switching on status (e.g. drawh) won't know it.
+
+## Round 2 (p7-wire2: fix round for p7-wirev)
+
+**Done.** The writer cap now retries on rule 12's backoff, as PROTOCOL.md § Pacing says, and the verifier's 12 untested mutants now have tests. LOW-1 and LOW-2 are fixed; LOW-3 is left as decided.
+
+- **Tests:** `bun test test/web` passes (614). Full `bun test`: see the end of this section.
+- **Mutations:** 21 of 21 mutants killed, each run against the whole `test/web`.
+- **Headless Chrome, production rig:** the same user opened 5 tabs. Tab 5 was capped, showing only the cap banner and the cap tooltip. 817 ms after tab 1 closed, tab 5 was live, with no click.
+
+Applied the systems design skill (APPLIER, chapter 4 rate limiting and chapter 12 reconnects): a refused connection is one failed attempt on the existing backoff. There is no second timer, no floor and no queue, so a capped tab settles at one try per 15–30 s, which is far from a loop.
+
+### Changes
+
+| File | Change |
+|---|---|
+| `web/core/sync.js` | **The cap retries.** The id-less `limit` before welcome counts as a failed attempt (`replica.connectionFailed()`) and goes down on the Replica's own backoff (`reconnectWait()`); its close is then ignored (`down`). `limited` stays set through every retry until a welcome clears it, so the status stays `limited`, never "connecting", during retries. `nextTryAt` gives the armed retry's time. `reconnect()` (Retry) still tries at once. Removed: the `pump` early return, and the `limited` guards on `onMessage` and `onDrop`. |
+| `web/core/session.js` | `limitedNextTry`: the earliest armed retry of the two connections. |
+| `web/core/roles.js` | **New:** `connectionBanner()` (pure; at most one connection banner; a capped tab gets only the cap's, with "Trying again in N s") and `pillTitleFor()` (the cap's text wins over the viewer's "no live connection"). The pill's sub-text for the cap is now "close one: retrying by itself". |
+| `web/adapters/dom/app.js` | Banners and the pill tooltip come from those two (LOW-1). The countdown is part of the chrome key, so it refreshes each second. Per-frame collab work moved to `./collab/frame.js`. |
+| `web/adapters/dom/collab/frame.js` | **New:** `collabFrame(S, collab)`. Each frame it sends my selection when it changed (whatever changed it) and re-lays pins when the view or board changed. Testable without a DOM. |
+| `web/adapters/dom/collab/ui.js` | `destroy()` calls `port.destroy?.()` (LOW-2). |
+| `web/adapters/collab/sync.js` | `destroy()` also drops every subscriber, so a records frame queued before it runs with no one listening. |
+| `web/ports/collab.js` | Optional `destroy?()` documented. |
+| `test/web/collab/wire2.test.js` | **New:** 16 tests (below). |
+| `test/web/collab/wire.test.js` | The old "no reconnect loop, wait for Retry" cap test is removed (superseded). |
+
+### Tests and mutants (each test fails under its mutant; whole `test/web` run per mutant; all 21 killed)
+
+| Mutant | Killed by (`wire2.test.js` unless noted) |
+|---|---|
+| **V1** `record()` dropped over the 16 KB presence gate | "records ops are never dropped by the presence gate" |
+| **V2** id-less `limit` caught after welcome (a blob refusal) | "cap: an id-less limit AFTER welcome…never stops the tab" |
+| **V3** `limit` with an id caught as the cap | "cap: an error with an id before any welcome…never trips the cap" (the guard is pinned even though a real op's answer can't come before its welcome); also "a limit WITH an id…onRefused says it" |
+| **V4** `retrySetting` before `ready` | "stale-setting: no retry before ready; ready lands on the refused change whose key moved" |
+| **V5** `ready` set on the wrong entry | same test: two refusals, and only the first one's key moves |
+| **V6** selection not sent from the frame | "frame: my selection goes out whenever it changed…" |
+| **V7** `layout()` not called from the frame | same |
+| **V8** `congested` reads the board connection only | "congested: either connection's backlog shows on the pill…" |
+| **V9** viewer pill drops "slow link" | same |
+| **V10** `me.user` never updated from welcome | "me.user follows welcome.user (rule 13)…" |
+| **V11** `notes()` read from the board connection | "notes() and noteAuthor come from the notes connection: my own unacked note shows at once" |
+| **V12** `noteAuthor` asks the board connection first | same (the board copy is made to answer wrong) |
+| **C1** the cap's refusal not counted as a failed attempt | "cap: the refusal itself is the failed attempt: a close that never comes (half-open)…" (without it, the retry waits for the 10 s watchdog) |
+| **C2** `limited` not cleared on welcome | "cap: a slot frees: the next automatic try gets in…" |
+| **C3** a retry shows "connecting" instead of `limited` | "cap: refused, the tab stays limited and tries again on the backoff, with no click" |
+| **C4** `nextTryAt` not the armed time | same |
+| **C5** a fixed fast retry instead of the backoff | same, and "cap: a tab that stays capped never tries more often than rule 12 allows" (waits 750, 1500, 3000, 6000 ms…, then 15–30 s; nothing early, exactly one try each) |
+| **L1a** `limited` falls through to "Connecting…" | "LOW-1: limited shows only the cap banner…" |
+| **L1b** the pill tooltip ignores the cap | same |
+| **L2a** `mountCollab.destroy()` keeps the port | "LOW-2: mountCollab's destroy() calls port.destroy()…" |
+| **L2b** subscribers kept after `port.destroy()` (a queued records frame fires) | same |
+
+**Also tested, no mutant needed:**
+- "cap: Retry still tries at once".
+- "the session's limitedNextTry is the bind's armed retry", plus merged status `limited` (round 1).
+
+**Equivalent, removed rather than tested:** a `destroyed` flag in the sync adapter. Dropping the subscribers already silences a queued frame (L2b covers it).
+
+### Headless Chrome (production rig, port 0, real tree; Chrome PID recorded and killed; rig stopped)
+
+**Setup:** `test/server/rig.js` with dev token `editor`, so all 5 tabs are the same user. Tabs 1–4 live: 8 writer connections.
+
+**Tab 5 while capped:**
+- Status `limited`.
+- One banner only: "⚠ This board is open in too many of your tabs (at most 8 open writer connections per user on a board). Close one; this tab gets in by itself. Trying again now. [Retry now]". No "Connecting…".
+- Pill: "Too many tabs".
+- Tooltip: "This board is open in too many of your tabs. Close one: this tab tries again by itself (or press Retry)."
+- Screenshot: `cap-t5-limited.png`.
+
+**After closing tab 1** (`Target.closeTarget`):
+- Tab 5 went live 817 ms later, with no click: notes first, then board.
+- Banners gone, pill "Live", `limited` null.
+- Screenshot: `cap-t5-live.png`.
+
+**Errors:** no console errors, no failed requests.
+
+**Not measured in that run:** the gap between hellos (asserted on the virtual clock instead). Screenshots are in the scratchpad's `p7/` folder.
+
+**NOT verified:** a tab capped for minutes in a real browser (the 15–30 s settling is tested on the virtual clock only); a half-open socket on the real gateway; LOW-3 (left as decided).
+
+**Full `bun test`:** 1159 pass, 1 fail: `test/core-source.test.js`, the known drift on main. Nothing new fails.
+
+**Change after the Chrome run:** the pill's sub-text changed from "close one, then retry" (what the screenshot shows) to "close one: retrying by itself". Only `pillFor`'s string changed, and its test checks the pill's main text. Not re-run in Chrome.
+
+## Round 3 (p7-wirev R2-M1: an `auth` refusal wins over the cap)
+
+**Fixed.** Before, a capped tab whose automatic retry was refused `auth` kept the cap banner forever. Now it shows "refused" and the sign-in banner, and stops trying.
+
+**Changes (`web/core/sync.js`):**
+- **Check order:** `refreshStatus()` checks `replica.needAuth` before `limited`.
+- **Getter:** `limited` reads null while `needAuth` is set, so nothing shows a stale cap (the session's `S.limited` and the banner text included).
+- **`connect()` and `goDown()` checked, no change needed:**
+  - An `auth` refusal never goes down: it sets no resync, and its close is ignored (`onDrop` returns on `needAuth`).
+  - `reconnect()` (Retry or sign-in) clears `limited` before connecting.
+
+**Test** (`test/web/collab/wire2.test.js`, virtual clock): "cap, then `auth` on the automatic retry: refused (not limited), the refused banner, and no more hellos".
+- The tab is capped, its retry goes out at 750 ms, and the retry is refused `auth`.
+- Then the status is `refused`, `limited` is null, no retry is armed, and `connectionBanner` gives the "refused this sign-in" banner.
+- 10 virtual minutes later, still 2 hellos and still `refused`.
+
+**Mutants** (each run against all of `test/web`):
+
+| Mutant | Result |
+|---|---|
+| The old order (`limited` before `needAuth` in `refreshStatus`) | **Killed** by the test above |
+| The `limited` getter shows the stale cap while refused | **Killed** by the same test |
+
+**Also tried:** clearing `limited` when `auth` arrives, together with the new order. That made the old-order mutant equivalent (either change alone fixed it), so I kept the order as the single mechanism plus the masking getter. Both are now killable.
+
+**Tests:** `bun test test/web` passes (615). Not re-run in Chrome (the change is in the status logic, and the virtual-clock test drives the real bind).

@@ -118,6 +118,8 @@ export function createSession({ join, token, board, client = "web", mine = [], n
     congested: { get: () => binds.board.congested() || binds.notes.congested() },
     /** The writer-connection cap's message while either connection is stopped by it, else null. */
     limited: { get: () => binds.board.limited ?? binds.notes.limited ?? null },
+    /** While limited: the earliest armed retry (the clock's now() ms), or null. */
+    limitedNextTry: { get: () => { const t = [binds.board.nextTryAt, binds.notes.nextTryAt].filter(v => v != null); return t.length ? Math.min(...t) : null; } },
     /** Refused settings changes of both streams: [{ stream, i, code, keys, values, ready }] (i: the bind's index). */
     settingsRefused: { get: () => ["board", "notes"].flatMap(st => binds[st].settingsRefused.map((e, i) => ({ ...e, stream: st, i }))) },
     pending: { get: () => binds.board.pending + binds.notes.pending },

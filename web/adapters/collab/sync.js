@@ -51,7 +51,7 @@ export function syncCollabPort(session, { name, frame = null, jumpTo = null }) {
     cache = null;
     if (scheduled) return;
     scheduled = true;
-    next(() => { scheduled = false; fire("records"); });
+    next(() => { scheduled = false; fire("records"); });   // after destroy() no one is subscribed: nothing runs
   };
 
   const offs = [
@@ -97,7 +97,8 @@ export function syncCollabPort(session, { name, frame = null, jumpTo = null }) {
     noteAuthor: id => N.noteAuthor(id) ?? B.noteAuthor(id),
     notes: () => N.elements("notes"),
     element: (stream, id) => bounds((stream === "notes" ? N : B).element(stream, id)),
-    destroy() { for (const off of offs) off(); },
+    /** Release: no more callbacks, including a records frame already queued. mountCollab's destroy() calls it. */
+    destroy() { for (const off of offs) off(); for (const k in subs) subs[k].clear(); },
   };
   if (jumpTo) port.jumpTo = jumpTo;
   return port;

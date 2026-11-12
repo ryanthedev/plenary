@@ -72,10 +72,39 @@ export function pillFor({ status, online = true, pending = 0, role, readOnly = f
   // stopped: the room speaks rules this app doesn't know. It never retries; only an update helps.
   if (status === "stopped") return { cls: "offline", text: "Update needed", sub: "reload the app" };
   if (status === "refused") return { cls: "offline", text: "Refused", sub: "sign in again" };
-  if (status === "limited") return { cls: "offline", text: "Too many tabs", sub: "close one, then retry" };
+  if (status === "limited") return { cls: "offline", text: "Too many tabs", sub: "close one: retrying by itself" };
   if (!online) return { cls: "offline", text: "Offline", sub: waiting };
   if (status !== "live") return { cls: "reconnecting", text: status === "catching-up" ? "Catching up…" : "Connecting…", sub: waiting };
   const slow = congested ? "slow link" : "";
   if (role === "viewer" || readOnly) return { cls: "readonly", text: "View only", sub: slow };
   return { cls: congested ? "reconnecting" : "connected", text: "Live", sub: [slow, waiting].filter(Boolean).join(" · ") };
+}
+
+// The connection banner over the canvas (one at most), as text and the one action it offers. Pure, so the chrome's
+// choices are tested: a capped tab shows only the cap's banner (p7-wirev LOW-1), with when it tries again.
+//   status: the session's merged status; viewer: the effective chrome is the viewer's; limited: the cap's message;
+//   nextTryIn: ms until the cap's next automatic try (null: none armed).
+export function connectionBanner({ status, online = true, viewer = false, pending = 0, readOnly = false, limited = null, nextTryIn = null }) {
+  if (status === "stopped") return { text: `⚠ This app is older than the board's room and has stopped: reload to update it.${pending ? ` Reloading loses ${pending} edits not yet acknowledged.` : ""} `, action: "reload" };
+  if (status === "refused") return { text: "⚠ The room refused this sign-in (token or board). ", action: "retry" };
+  if (status === "limited") {
+    const when = nextTryIn == null ? "" : ` Trying again ${nextTryIn < 1000 ? "now" : `in ${Math.ceil(nextTryIn / 1000)} s`}.`;
+    return { text: `⚠ This board is open in too many of your tabs (${limited ?? "the room's limit"}). Close one; this tab gets in by itself.${when} `, action: "retry" };
+  }
+  if (!online) return { text: viewer ? "⚠ You're offline. The live view is paused until you reconnect." : (pending ? `⚠ You're offline. ${pending} ${pending === 1 ? "edit waits" : "edits wait"} in this tab and send when you reconnect. Closing the tab loses them.` : "⚠ You're offline. Nothing is waiting to send; edits you make now are kept in this tab until you reconnect."), action: "retry" };
+  if (status !== "live") return { text: viewer ? "⟳ Connecting… the live view is paused." : `⟳ Connecting… ${pending ? `${pending} edits waiting. ` : ""}Keep working: they're sent with the same ids when the room is back.`, action: null };
+  if (readOnly) return { text: "👁 Read-only: the server gave this session a lower role. Ask the board's owner for edit access.", action: null };
+  return null;
+}
+
+/** The pill's tooltip for a pill class (pillFor's `cls`). The cap's text wins over the viewer's "no live connection". */
+export function pillTitleFor({ cls, status, viewer = false, readOnly = false }) {
+  if (status === "limited") return "This board is open in too many of your tabs. Close one: this tab tries again by itself (or press Retry).";
+  if (viewer && cls !== "readonly") return "No live connection. The live view is paused until it's back.";
+  return {
+    connected: "Connected: every edit is acknowledged by the board's room.",
+    reconnecting: "Connecting or catching up. Edits not yet acknowledged are kept and resent with the same ids.",
+    offline: "No connection. Unacknowledged edits stay in this tab and are resent on reconnect; closing the tab loses them.",
+    readonly: readOnly ? "The server gave this session a lower role (welcome.role): nothing you do is sent." : "You're watching: viewers change nothing on the board.",
+  }[cls];
 }

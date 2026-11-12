@@ -331,6 +331,7 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     draw,
     setTheme(t) { S.theme = t === "dark" ? "dark" : "light"; paint(); },
     get state() { return { open: S.open, compose: S.compose && { x: S.compose.x, y: S.compose.y, on: S.compose.on }, drawer: S.drawer, list: S.list, picker: S.picker, toast: S.toast }; },
-    destroy() { for (const off of offs) off?.(); outbox.close(); if (tickTimer) C.clearTimer(tickTimer); if (S.toastTimer) C.clearTimer(S.toastTimer); layer.remove(); },
+    /** Unmount: unsubscribe, stop timers, remove the layer, and release the port (port.destroy, when it has one). */
+    destroy() { for (const off of offs) off?.(); outbox.close(); if (tickTimer) C.clearTimer(tickTimer); if (S.toastTimer) C.clearTimer(S.toastTimer); layer.remove(); port.destroy?.(); },
   };
 }

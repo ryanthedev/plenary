@@ -105,22 +105,6 @@ function capRig() {
   return { b, sent, advance, events, refuse: () => { handler({ t: "error", code: "limit", message: "at most 8 open writer connections per user on a board" }); dropped(); } };
 }
 
-test("writer cap: an id-less limit before welcome stops the link: status limited, said once, no reconnect loop", () => {
-  const r = capRig();
-  expect(r.sent.filter(m => m.t === "hello").length).toBe(1);
-  r.refuse();
-  expect(r.b.status).toBe("limited");
-  expect(r.b.limited).toMatch(/at most 8/);
-  expect(r.events.filter(e => e.type === "limit").length).toBe(1);
-  r.advance(10 * 60_000);                                     // ten minutes: no backoff ever fires a new hello
-  expect(r.sent.filter(m => m.t === "hello").length).toBe(1);
-  expect(r.b.status).toBe("limited");
-  r.b.reconnect();                                            // the user closed a tab and pressed Retry
-  expect(r.sent.filter(m => m.t === "hello").length).toBe(2);
-  expect(r.b.limited).toBe(null);
-  expect(r.b.status).toBe("connecting");
-});
-
 test("writer cap: the session's merged status is limited when either connection is", () => {
   const links = [];
   const join = () => { const l = { sent: [], on: () => {} }; links.push(l); return { send: m => l.sent.push(m), onMessage: fn => { l.on = fn; }, onDrop: () => {}, reopen: () => {}, close: () => {}, congested: () => false, backlogBytes: () => 0 }; };

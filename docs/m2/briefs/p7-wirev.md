@@ -48,3 +48,29 @@ Single harness unless more pass check_adapter; confirm or refute each finding. N
 docs/m2/reports/p7-wirev.md: **PASS or FAIL** first line; HIGH / MEDIUM / LOW with file:line; "Design check (CHECKER)";
 what you did NOT check. HIGH = a Must-close item not really closed, a weakened test, a boundary rule that doesn't bite,
 a dev module in the production graph, a token leak, presence sent over the backlog gate or real ops dropped by it. Stop.
+
+## Round 2 (manager, 2026-11-12)
+
+The builder ran the fix round docs/m2/briefs/p7-wire2.md. Its report is docs/m2/reports/p7-wire.md § Round 2, and the
+work is `git diff web test/web` plus the new files test/web/collab/wire2.test.js and web/adapters/dom/collab/frame.js.
+Check:
+
+1. **MEDIUM-1:** a `limit` before welcome counts as a failed attempt under rule 12 and reconnects by itself on rule 12's
+   backoff (no extra floor). PROTOCOL.md § Pacing's ~30 s + backoff promise holds. Retry still tries at once. A `limit`
+   after welcome, or one with an `id`, is not treated as the cap.
+2. **MEDIUM-2:** each of your 12 mutants is now killed. Re-run them yourself; also try the builder's 9 new ones.
+3. **LOW-1 and LOW-2:** only the cap banner shows, with the cap tooltip; `destroy()` releases the port; a frame queued
+   before destroy does nothing.
+4. **Serving:** the new web/adapters/dom/collab/frame.js is reachable from main.js (served, no 404 through the rig).
+5. **No `tab` in hello;** no test weakened; test/web/architecture.test.js still bites.
+6. **Chrome:** on the production rig (port 0) with 5 tabs as one user, close one, and tab 5 goes live with no click.
+
+Report: append "## Round 2" to docs/m2/reports/p7-wirev.md, PASS or FAIL first, then hc t14k. Stop.
+
+## Round 3 (manager, 2026-11-12): R2-M1 only
+
+The builder's fix is in docs/m2/reports/p7-wire.md § Round 3: `refreshStatus` checks `needAuth` before `limited`, and the
+`limited` getter reads null while refused. Check only this: your repro (capped, then `auth` on the retry) now gives
+`refused` and the sign-in banner with no more hellos; the old-order mutant dies; Retry and the plain cap path still work;
+nothing else in the diff changed since round 2. Append "## Round 3" to docs/m2/reports/p7-wirev.md, PASS or FAIL first,
+then hc t14k. Stop.

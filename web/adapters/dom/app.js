@@ -9,11 +9,12 @@ import { isMermaid } from "../../../packages/core/mermaid.js";
 import { isLabel } from "../../../packages/core/model.js";
 import { parseLibrary } from "../../../packages/core/library.js";
 import { paint, imageCache, THEMES, color as safeColor } from "./paint.js";
-import { toolsFor, pillFor } from "../../core/roles.js";
+import { toolsFor, pillFor, pillTitleFor, connectionBanner } from "../../core/roles.js";
 import { renderPanel, loadLibrary, saveLibrary, addToLibrary } from "./panel.js";
 import { exportSvg, paintPng, loadPictures } from "./export.js";
 import { h, $, replace } from "./dom.js";
 import { mountCollab } from "./collab/ui.js";
+import { collabFrame } from "./collab/frame.js";
 import { hitTest } from "../../../packages/core/geometry.js";
 
 /**
@@ -63,13 +64,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     view: { toScreen: p => S.eds.board.toScreen(p), toWorld: p => S.eds.board.toWorld(p), get scale() { return S.eds.board.view.scale; } } }) : null;
   if (collab) collab.showDrawer("comments");
   const worldAt = p => S.eds.board.toWorld(p);
-  // What I have selected goes out as presence (latest wins; the outbox paces it).
-  let selKey = "";
-  function sendSelection() {
-    if (!collab) return;
-    const stream = S.active, ids = [...S.eds[stream].sel], key = `${stream}|${ids.join(",")}`;
-    if (key !== selKey && collab.selection(stream, ids)) selKey = key;
-  }
+  // Selection presence and pin layout, once per frame (./collab/frame.js).
+  const collabTick = collab ? collabFrame(S, collab) : () => {};
   // Right-click (or the 💬 button): a comment on the element under the pointer, else on that spot.
   function startComment(p) {
     if (!collab) return;
@@ -171,7 +167,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     touches.delete(e.pointerId);
     if (pinch) { if (touches.size === 0) pinch = null; return; }
     S.pointerUp(at(e), pmods(e)); chromeDirty = true;
-    sendSelection();
+    collabTick();
   };
   canvas.addEventListener("pointerup", up);
   canvas.addEventListener("pointercancel", up);
@@ -285,15 +281,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       h("button.tb" + (role === "viewer" ? "" : ".theme-btn"), { title: "Light / dark", onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, ui.theme === "dark" ? "☀" : "☾")),
     ];
   }
-  function pillTitle(cls) {
-    if (S.effective === "viewer" && cls !== "readonly") return "No live connection. The live view is paused until it's back.";
-    return {
-      connected: "Connected: every edit is acknowledged by the board's room.",
-      reconnecting: "Connecting or catching up. Edits not yet acknowledged are kept and resent with the same ids.",
-      offline: S.status === "limited" ? "This board is open in too many of your tabs. Close one, then press Retry." : "No connection. Unacknowledged edits stay in this tab and are resent on reconnect; closing the tab loses them.",
-      readonly: S.readOnly ? "The server gave this session a lower role (welcome.role): nothing you do is sent." : "You're watching: viewers change nothing on the board.",
-    }[cls];
-  }
+  const pillTitle = cls => pillTitleFor({ cls, status: S.status, viewer: S.effective === "viewer", readOnly: S.readOnly });
 
   function hud() {
     const B = S.eds.board, fs = B.frames(), i = fs.findIndex(f => f.id === B.frameAt), may = S.may();
@@ -447,13 +435,12 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   }
 
   function banners() {
-    const out = [], viewer = S.effective === "viewer", st = S.status;
-    if (st === "stopped") out.push(h("div.banner", {}, `⚠ This app is older than the board's room and has stopped: reload to update it.${S.pending ? ` Reloading loses ${S.pending} edits not yet acknowledged.` : ""} `, h("button.btn", { onclick: () => location.reload() }, "Reload")));
-    else if (st === "refused") out.push(h("div.banner", {}, "⚠ The room refused this sign-in (token or board). ", h("button.btn", { onclick: () => S.reconnect() }, "Retry")));
-    else if (!S.online) out.push(h("div.banner", {}, viewer ? "⚠ You're offline. The live view is paused until you reconnect." : (S.pending ? `⚠ You're offline. ${S.pending} ${S.pending === 1 ? "edit waits" : "edits wait"} in this tab and send when you reconnect. Closing the tab loses them.` : "⚠ You're offline. Nothing is waiting to send; edits you make now are kept in this tab until you reconnect."), " ", h("button.btn", { onclick: () => S.reconnect() }, "Retry now")));
-    else if (st !== "live") out.push(h("div.banner", {}, viewer ? "⟳ Connecting… the live view is paused." : `⟳ Connecting… ${S.pending ? `${S.pending} edits waiting. ` : ""}Keep working: they're sent with the same ids when the room is back.`));
-    else if (S.readOnly) out.push(h("div.banner", {}, "👁 Read-only: the server gave this session a lower role. Ask the board's owner for edit access."));
-    if (st === "limited") out.push(h("div.banner", {}, `⚠ This board is open in too many of your tabs (${S.limited ?? "the room's limit"}). Close one, then `, h("button.btn", { onclick: () => S.reconnect() }, "Retry")));
+    const out = [], next = S.limitedNextTry;
+    const b = connectionBanner({ status: S.status, online: S.online, viewer: S.effective === "viewer", pending: S.pending, readOnly: S.readOnly,
+      limited: S.limited, nextTryIn: next == null ? null : Math.max(0, next - Date.now()) });
+    if (b) out.push(h("div.banner", {}, b.text,
+      b.action === "reload" ? h("button.btn", { onclick: () => location.reload() }, "Reload")
+        : b.action === "retry" ? h("button.btn", { onclick: () => S.reconnect() }, S.status === "limited" ? "Retry now" : S.online ? "Retry" : "Retry now") : null));
     // Settings changes the room refused (stale-setting: someone changed the same setting first). Retry when ready.
     for (const r of S.settingsRefused) {
       const what = r.keys.join(", ") || "a setting";
@@ -470,7 +457,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   addEventListener("pointercancel", () => { chromeHeld = false; }, true);
   function chrome() {
     const now = performance.now();
-    const key = [S.version(), S.status, S.pending, S.role, S.effective, S.tool, S.online, S.congested, JSON.stringify(S.settingsRefused.map(r => [r.stream, r.i, r.ready])), ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.library.length, S.toolLock(), JSON.stringify(ui.export), ui.mermaid.elbow].join("|");
+    const key = [S.version(), S.status, S.limitedNextTry == null ? "" : Math.ceil((S.limitedNextTry - Date.now()) / 1000), S.pending, S.role, S.effective, S.tool, S.online, S.congested, JSON.stringify(S.settingsRefused.map(r => [r.stream, r.i, r.ready])), ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.library.length, S.toolLock(), JSON.stringify(ui.export), ui.mermaid.elbow].join("|");
     if (!chromeDirty && key === chromeKey) return;
     if (chromeHeld) return;                                   // a press on the chrome: don't swap the button under it
     if ((S.gesture || !chromeDirty) && now - chromeAt < 250) return;   // mid-drag, playback, incoming ops: a few times a second          // mid-drag: refresh a few times a second at most
@@ -506,14 +493,11 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   addEventListener("offline", () => { S.online = false; chromeDirty = true; });
   matchMedia("(max-width: 640px)").addEventListener("change", () => { chromeDirty = true; });
   setTheme(ui.theme);
-  let savedMine = 0, layoutKey = "";
+  let savedMine = 0;
   (function frame() {
     const live = S.eds.board.needsTick() || S.eds.notes.needsTick();
     if (dirty || live || seen !== S.version()) { dirty = false; draw(); seen = S.version(); if (live) chromeDirty = chromeDirty || !!S.eds.board.play; }
-    // My selection as presence, whatever changed it (a click, Escape, select-all, a tool switch): no ghost selections.
-    sendSelection();
-    // Pins and the popover follow the view and the elements they anchor to.
-    if (collab) { const v = S.eds.board.view, k = `${v.x}|${v.y}|${v.scale}|${S.version()}`; if (k !== layoutKey) { layoutKey = k; collab.layout(); } }
+    collabTick();
     const f = S.takeFlash(); if (f) toast(f);
     chrome();
     if (S.mine.size !== savedMine) { savedMine = S.mine.size; put(mineKey, JSON.stringify([...S.mine].slice(-5000))); }

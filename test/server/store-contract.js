@@ -7,13 +7,17 @@
 //   store            the store under test
 //   another()        opens a second handle on the SAME data (a reopen after close, or a second host)
 //   cleanup()        optional; runs after the test (drop the schema, remove the file)
+//   advance(ms)      optional; moves the store's lease clock forward (an adapter with an injected clock, shared by
+//                    `another()`). Without it, the lease cases wait out a short real ttl on the database's clock.
 // The adapter is expected to keep the newest 3 checkpoints per board (the adapters' default `keepCheckpoints`).
-// Refusals are matched by `err.code` (PortError codes: conflict, bad-entry, bad-id, closed).
+// Refusals are matched by `err.code` (PortError codes: conflict, fenced, bad-entry, bad-id, closed).
 // Adapter-specific checks (pragmas, settings) stay in the adapter's own test file.
 
 import { describe, test, expect, afterEach } from "bun:test";
 
 const T = "t-aaa", B = "b-one";
+/** Lease ttls: LONG never lapses inside a test; SHORT is waited out by `expire()`. */
+const LONG = 60_000, SHORT = 300;
 export const entry = (seq, o = {}) => ({ seq, board: B, tenant: T, stream: "board", op: { appState: { grid: seq } }, by: "u1", id: `c:${seq}`, ...o });
 export const code = async p => { try { await p; return "resolved"; } catch (e) { return e.code ?? `threw ${e.message}`; } };
 
@@ -30,7 +34,9 @@ export function storeContract(name, make) {
       handles.push(h.store);
       if (h.cleanup) cleanups.push(h.cleanup);
       const another = async () => { const s = await h.another(); handles.push(s); return s; };
-      return { store: h.store, another };
+      // Let a lease taken with SHORT lapse: on the injected clock, or by waiting on the database's.
+      const expire = async () => { if (h.advance) h.advance(SHORT + 1); else await Bun.sleep(SHORT + 150); };
+      return { store: h.store, another, expire };
     };
     afterEach(async () => {
       for (const s of handles.splice(0)) await s.close();
@@ -216,6 +222,150 @@ export function storeContract(name, make) {
       // Ids are checked like every other call.
       expect(await code(store.openEpoch("../x", B))).toBe("bad-id");
       expect(await code(store.epoch(T, "B.*"))).toBe("bad-id");
+    });
+
+    // ---- Lease and epoch fence (PROTOCOL.md § Recovery, Room identity; phase 4) ----
+
+    test("lease: acquire is exclusive; another holder gets it only after expiry, and every acquire bumps the epoch", async () => {
+      const { store, expire } = await fresh();
+      expect(await store.lease(T, B)).toBe(null);
+      const a1 = await store.acquire(T, B, "h-a", LONG);
+      expect(a1.epoch).toBe(1);
+      expect(Number.isSafeInteger(a1.expiresAt)).toBe(true);
+      expect(await store.acquire(T, B, "h-b", LONG)).toBe(null);                    // held: refused
+      expect(await store.epoch(T, B)).toBe(1);                                       // a refusal bumps nothing
+      expect(await store.lease(T, B)).toMatchObject({ holder: "h-a", epoch: 1, live: true });
+      // The same holder again = a new room incarnation (a rebuild): a new epoch, so its old room is fenced off.
+      expect((await store.acquire(T, B, "h-a", SHORT)).epoch).toBe(2);
+      await expire();
+      expect(await store.lease(T, B)).toMatchObject({ holder: "h-a", epoch: 2, live: false });
+      expect((await store.acquire(T, B, "h-b", LONG)).epoch).toBe(3);                // takeover after expiry
+      expect(await store.acquire(T, B, "h-a", LONG)).toBe(null);
+      expect(await store.lease(T, B)).toMatchObject({ holder: "h-b", epoch: 3, live: true });
+      expect(await store.epoch(T, B)).toBe(3);
+      expect(await store.lease(T, "b-two")).toBe(null);                             // per board
+      expect((await store.acquire(T, "b-two", "h-a", LONG)).epoch).toBe(1);
+    });
+
+    test("lease: two holders on two handles race for a free lease; exactly one wins each round", async () => {
+      const { store: a, another } = await fresh();
+      const b = await another();
+      for (let round = 1; round <= 10; round++) {
+        const got = await Promise.all([a.acquire(T, B, "h-a", LONG), b.acquire(T, B, "h-b", LONG)]);
+        const won = got.filter(Boolean);
+        expect(won.length).toBe(1);
+        expect(won[0].epoch).toBe(round);
+        const holder = got[0] ? "h-a" : "h-b";
+        expect((await b.lease(T, B)).holder).toBe(holder);
+        await (got[0] ? a : b).release(T, B, holder, round);                         // free for the next round
+      }
+    });
+
+    test("lease: renew only as the holder at its epoch; it keeps the lease past the first ttl", async () => {
+      const { store, expire } = await fresh();
+      const a = await store.acquire(T, B, "h-a", SHORT);
+      const r = await store.renew(T, B, "h-a", a.epoch, LONG);
+      expect(r.epoch).toBe(a.epoch);
+      expect(r.expiresAt).toBeGreaterThan(a.expiresAt);
+      await expire();                                                                 // the first ttl is over
+      expect(await store.acquire(T, B, "h-b", LONG)).toBe(null);                    // still held, renewed
+      expect(await store.renew(T, B, "h-b", a.epoch, LONG)).toBe(null);             // not the holder
+      expect(await store.renew(T, B, "h-a", a.epoch + 1, LONG)).toBe(null);         // not its epoch
+      // Lapsed, nobody took it: the holder may still renew (no one else has an epoch to be fenced by).
+      await store.renew(T, B, "h-a", a.epoch, SHORT);
+      await expire();
+      expect((await store.renew(T, B, "h-a", a.epoch, LONG))?.epoch).toBe(a.epoch);
+      // Taken over: the old holder's renew fails, and so does a renew at the old epoch by the new holder.
+      await store.renew(T, B, "h-a", a.epoch, SHORT);
+      await expire();
+      const b = await store.acquire(T, B, "h-b", LONG);
+      expect(b.epoch).toBe(a.epoch + 1);
+      expect(await store.renew(T, B, "h-a", a.epoch, LONG)).toBe(null);
+      expect(await store.renew(T, B, "h-b", a.epoch, LONG)).toBe(null);
+      expect(await store.lease(T, B)).toMatchObject({ holder: "h-b", epoch: b.epoch, live: true });
+    });
+
+    test("lease: release frees it at once (idempotent, holder and epoch checked) and keeps the epoch", async () => {
+      const { store } = await fresh();
+      const a = await store.acquire(T, B, "h-a", LONG);
+      await store.release(T, B, "h-b", a.epoch);                                    // not the holder: nothing
+      await store.release(T, B, "h-a", a.epoch + 1);                                // not its epoch: nothing
+      expect(await store.lease(T, B)).toMatchObject({ holder: "h-a", live: true });
+      await store.release(T, B, "h-a", a.epoch);
+      await store.release(T, B, "h-a", a.epoch);                                    // twice is fine
+      expect(await store.lease(T, B)).toMatchObject({ holder: null, epoch: a.epoch, live: false });
+      expect(await store.epoch(T, B)).toBe(a.epoch);
+      expect((await store.acquire(T, B, "h-b", LONG)).epoch).toBe(a.epoch + 1);     // no wait for the ttl
+      await store.release(T, B, "h-a", a.epoch);                                    // a stale release can't free b's lease
+      expect((await store.lease(T, B)).holder).toBe("h-b");
+    });
+
+    test("fence: after a takeover the stale holder's append and checkpoint are refused as fenced and write nothing", async () => {
+      const { store: a, another, expire } = await fresh();
+      const b = await another();
+      const la = await a.acquire(T, B, "h-a", SHORT);
+      await a.append(T, B, [entry(1)], 0, la.epoch);
+      await a.putCheckpoint(T, B, { seq: 1, by: "a" }, la.epoch);
+      await expire();
+      const lb = await b.acquire(T, B, "h-b", LONG);
+      expect(lb.epoch).toBe(la.epoch + 1);
+      expect(await code(a.append(T, B, [entry(2, { by: "a" })], 1, la.epoch))).toBe("fenced");
+      expect(await code(a.putCheckpoint(T, B, { seq: 1000, by: "a" }, la.epoch))).toBe("fenced");
+      // Stale on both counts: "fenced" (stop) wins over "conflict" (rebuild).
+      expect(await code(a.append(T, B, [entry(1)], 0, la.epoch))).toBe("fenced");
+      expect(await a.lastSeq(T, B)).toBe(1);
+      expect((await a.getCheckpoint(T, B)).seq).toBe(1);
+      await b.append(T, B, [entry(2, { by: "b" })], 1, lb.epoch);                   // the new holder writes
+      await b.putCheckpoint(T, B, { seq: 2, by: "b" }, lb.epoch);
+      expect((await a.read(T, B, 1, 10)).map(e => e.by)).toEqual(["u1", "b"]);
+      expect((await a.getCheckpoint(T, B)).by).toBe("b");
+      // A future epoch, or any epoch on a board nobody ever leased, is fenced too.
+      expect(await code(b.append(T, B, [entry(3)], 2, lb.epoch + 1))).toBe("fenced");
+      expect(await code(b.append(T, "b-two", [entry(1, { board: "b-two" })], 0, 1))).toBe("fenced");
+      // SEAM(p4): without an epoch the write is unfenced (today's room host).
+      await a.append(T, B, [entry(3)], 2);
+      expect(await a.lastSeq(T, B)).toBe(3);
+      for (const bad of [0, -1, 1.5, "2", null]) {
+        expect(await code(b.append(T, B, [entry(4)], 3, bad))).toBe("bad-entry");
+        expect(await code(b.putCheckpoint(T, B, { seq: 4 }, bad))).toBe("bad-entry");
+      }
+    });
+
+    test("fence: a released lease still fences its old epoch out once someone takes the board", async () => {
+      const { store } = await fresh();
+      const a = await store.acquire(T, B, "h-a", LONG);
+      await store.release(T, B, "h-a", a.epoch);
+      await store.append(T, B, [entry(1)], 0, a.epoch);                             // released, nobody else: still its epoch
+      const b = await store.acquire(T, B, "h-b", LONG);
+      expect(await code(store.append(T, B, [entry(2)], 1, a.epoch))).toBe("fenced");
+      await store.append(T, B, [entry(2)], 1, b.epoch);
+    });
+
+    test("openEpoch and the lease share one record: openEpoch takes the board without a lease and fences the holder", async () => {
+      const { store } = await fresh();
+      const a = await store.acquire(T, B, "h-a", LONG);
+      expect(await store.openEpoch(T, B)).toBe(a.epoch + 1);
+      expect(await store.lease(T, B)).toMatchObject({ holder: null, epoch: a.epoch + 1, live: false });
+      expect(await store.renew(T, B, "h-a", a.epoch, LONG)).toBe(null);
+      expect(await code(store.append(T, B, [entry(1)], 0, a.epoch))).toBe("fenced");
+      await store.append(T, B, [entry(1)], 0, a.epoch + 1);                         // the openEpoch room's epoch
+      expect((await store.acquire(T, B, "h-b", LONG)).epoch).toBe(a.epoch + 2);     // unheld: no wait
+    });
+
+    test("lease calls check ids, holder, epoch and ttl", async () => {
+      const { store } = await fresh();
+      for (const bad of ["", "a.b", "*", "../x", "A", 7, null]) {
+        expect(await code(store.acquire(bad, B, "h-a", LONG))).toBe("bad-id");
+        expect(await code(store.acquire(T, B, bad, LONG))).toBe("bad-id");
+        expect(await code(store.renew(T, bad, "h-a", 1, LONG))).toBe("bad-id");
+        expect(await code(store.release(T, B, bad, 1))).toBe("bad-id");
+        expect(await code(store.lease(bad, B))).toBe("bad-id");
+      }
+      for (const ttl of [0, -1, 1.5, "100", 10 * 60_000 + 1]) expect(await code(store.acquire(T, B, "h-a", ttl))).toBe("bad-entry");
+      expect(await code(store.renew(T, B, "h-a", undefined, LONG))).toBe("bad-entry");
+      expect(await code(store.renew(T, B, "h-a", 0, LONG))).toBe("bad-entry");
+      expect(await code(store.release(T, B, "h-a", undefined))).toBe("bad-entry");
+      expect(await store.lease(T, B)).toBe(null);                                   // nothing was written
     });
   });
 }

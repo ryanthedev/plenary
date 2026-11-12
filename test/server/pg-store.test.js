@@ -4,7 +4,7 @@
 // dropped after; one client is shared by the file.
 import { describe, test, expect, afterAll } from "bun:test";
 import { SQL } from "bun";
-import { postgresStore } from "../../server/store/postgres.js";
+import { postgresStore, LEASE_UPGRADE_SQL } from "../../server/store/postgres.js";
 import { storeContract, entry, code } from "./store-contract.js";
 
 const url = process.env.DATABASE_URL;
@@ -27,7 +27,7 @@ describe.skipIf(!url)("postgres store", () => {
   test("a write transaction runs with synchronous_commit=on and fsync on", async () => {
     const schema = schemaName();
     const store = await postgresStore({ sql: client(), schema });
-    try { expect(await store.settings()).toEqual({ synchronous_commit: "on", fsync: "on" }); }
+    try { expect(await store.settings()).toEqual({ synchronous_commit: "on", fsync: "on", idle_in_transaction_session_timeout: "5s" }); }
     finally { await store.close(); await drop(schema); }
   });
 
@@ -70,6 +70,233 @@ describe.skipIf(!url)("postgres store", () => {
       other.release();
       await store.close();
       await drop(schema);
+    }
+  });
+
+  test("fence: an append waits on a takeover's uncommitted epoch bump, then is fenced; on its rollback it lands", async () => {
+    const schema = schemaName();
+    const store = await postgresStore({ url, schema, max: 2 });           // its own pool: a different connection for sure
+    const other = await client().reserve();
+    try {
+      const { epoch } = await store.acquire(T, B, "h-a", 60_000);
+      await store.append(T, B, [entry(1)], 0, epoch);
+      for (const [end, want] of [["COMMIT", "fenced"], ["ROLLBACK", "resolved"]]) {
+        const at = await store.lastSeq(T, B), cur = await store.epoch(T, B);
+        await other.unsafe("BEGIN");
+        await other.unsafe(`UPDATE "${schema}".pl_leases SET epoch = epoch + 1, holder = 'h-b' WHERE tenant = $1 AND board = $2`, [T, B]);
+        let settled = false;
+        const p = code(store.append(T, B, [entry(at + 1)], at, cur)).finally(() => { settled = true; });
+        await Bun.sleep(200);
+        expect(settled).toBe(false);                              // FOR SHARE waits for the takeover to decide
+        await other.unsafe(end);
+        expect(await p).toBe(want);
+        if (end === "COMMIT") await other.unsafe(`UPDATE "${schema}".pl_leases SET holder = 'h-a' WHERE tenant = $1 AND board = $2`, [T, B]);
+      }
+      expect((await store.read(T, B, 1, 10)).map(e => e.seq)).toEqual([1, 2]);   // the fenced one wrote nothing
+      // And the other way round: a takeover waits for an append in flight, so it commits after it, never before.
+      const cur = await store.epoch(T, B);
+      await other.unsafe("BEGIN");
+      await other.unsafe(`SELECT epoch FROM "${schema}".pl_leases WHERE tenant = $1 AND board = $2 FOR SHARE`, [T, B]);   // an append's lock
+      let taken = false;
+      const take = store.renew(T, B, "h-a", cur, 60_000).finally(() => { taken = true; });   // a lease write: waits (within its lock bound)
+      await Bun.sleep(200);
+      expect(taken).toBe(false);
+      await other.unsafe("COMMIT");
+      expect((await take).epoch).toBe(cur);
+    } finally {
+      other.release();
+      await store.close();
+      await drop(schema);
+    }
+  });
+
+  test("lease expiry is on the database's clock: expiresAt = clock_timestamp() + ttl", async () => {
+    const schema = schemaName();
+    const store = await postgresStore({ sql: client(), schema });
+    try {
+      const [{ t0 }] = await client().unsafe("SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint AS t0");
+      const got = await store.acquire(T, B, "h-a", 5_000);
+      const [{ t1 }] = await client().unsafe("SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint AS t1");
+      expect(got.expiresAt).toBeGreaterThanOrEqual(Number(t0) + 5_000);
+      expect(got.expiresAt).toBeLessThanOrEqual(Number(t1) + 5_000);
+      expect(await store.lease(T, B)).toEqual({ holder: "h-a", epoch: 1, expiresAt: got.expiresAt, live: true });
+    } finally { await store.close(); await drop(schema); }
+  });
+
+  test("a pl_leases made before the lease (epoch only) is refused at start-up, never ALTERed; after the owner's upgrade it starts and keeps its epochs", async () => {
+    const schema = schemaName();
+    await client().unsafe(`CREATE SCHEMA "${schema}"`);
+    await client().unsafe(`CREATE TABLE "${schema}".pl_leases (tenant TEXT NOT NULL, board TEXT NOT NULL, epoch BIGINT NOT NULL, PRIMARY KEY (tenant, board))`);
+    await client().unsafe(`INSERT INTO "${schema}".pl_leases VALUES ($1, $2, 5)`, [T, B]);
+    const cols = async () => (await client().unsafe(`SELECT attname FROM pg_attribute WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped ORDER BY attnum`,
+      [`"${schema}".pl_leases`])).map(r => r.attname);
+    try {
+      const err = await postgresStore({ sql: client(), schema }).then(() => null, e => e);
+      expect(err?.code).toBe("needs-migration");
+      expect(err.message).toContain(LEASE_UPGRADE_SQL(schema));
+      expect(await cols()).toEqual(["tenant", "board", "epoch"]);                  // start-up changed nothing
+      await client().unsafe(LEASE_UPGRADE_SQL(schema));                            // the operator's step, as the owner
+      await client().unsafe(LEASE_UPGRADE_SQL(schema));                            // idempotent
+      const store = await postgresStore({ sql: client(), schema });
+      expect(await store.lease(T, B)).toEqual({ holder: null, epoch: 5, expiresAt: null, live: false });
+      expect((await store.acquire(T, B, "h-a", 60_000)).epoch).toBe(6);
+      await store.append(T, B, [entry(1)], 0, 6);
+      await store.close();
+    } finally { await drop(schema); }
+  });
+
+  test("start-up waits at most lockTimeoutMs for the schema's start-up lock, then fails with a clear lock-timeout", async () => {
+    const schema = schemaName();
+    const holder = await client().reserve();
+    try {
+      await holder.unsafe("BEGIN");
+      await holder.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-schema:${schema}`]);   // a wedged migrator
+      const t0 = Date.now();
+      const err = await postgresStore({ sql: client(), schema, lockTimeoutMs: 300 }).then(() => null, e => e);
+      expect(err?.code).toBe("lock-timeout");
+      expect(err.message).toContain(`schema "${schema}"`);
+      expect(Date.now() - t0).toBeLessThan(5_000);
+      await holder.unsafe("COMMIT");
+      const store = await postgresStore({ sql: client(), schema, lockTimeoutMs: 300 });   // lock free: starts
+      await store.close();
+    } finally { holder.release(); await drop(schema); }
+  });
+
+  // ---- Round 2 (p4-store-leasev H1, M1, L3) ----
+
+  const DBMS = "SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint AS t";
+
+  for (const what of ["append", "checkpoint"]) test(`H1 window: a takeover can't commit while a fenced ${what} is past its fence check`, async () => {
+    // Kills "the fence runs outside the write's transaction": the write is parked after its fence (an uncommitted row
+    // at the key it inserts), and a takeover must wait for it (FOR SHARE held in the write's transaction).
+    const schema = schemaName();
+    const store = await postgresStore({ url, schema, max: 2 });
+    const parker = await client().reserve(), taker = await client().reserve();
+    try {
+      const { epoch } = await store.acquire(T, B, "h-a", 60_000);
+      await store.append(T, B, [entry(1)], 0, epoch);
+      await parker.unsafe("BEGIN");
+      if (what === "append") await parker.unsafe(`INSERT INTO "${schema}".pl_entries VALUES ($1, $2, 2, '{}')`, [T, B]);
+      else await parker.unsafe(`INSERT INTO "${schema}".pl_checkpoints VALUES ($1, $2, 9, '{}')`, [T, B]);
+      let wrote = null, took = false;
+      const w = (what === "append" ? code(store.append(T, B, [entry(2)], 1, epoch)) : code(store.putCheckpoint(T, B, { seq: 9, by: "a" }, epoch)))
+        .then(r => { wrote = r; return r; });
+      await Bun.sleep(200);
+      const take = taker.unsafe(`UPDATE "${schema}".pl_leases SET epoch = epoch + 1, holder = 'h-b' WHERE tenant = $1 AND board = $2`, [T, B])
+        .then(() => { took = true; });
+      await Bun.sleep(200);
+      expect(took).toBe(false);                                    // the takeover waits behind the parked write
+      expect(wrote).toBe(null);
+      await parker.unsafe("ROLLBACK");
+      expect(await w).toBe("resolved");                            // fenced in before the takeover: it lands
+      await take;
+      expect(await store.epoch(T, B)).toBe(epoch + 1);
+    } finally { parker.release(); taker.release(); await store.close(); await drop(schema); }
+  });
+
+  test("H1 host clock: a host clock an hour off changes nothing; expiresAt and liveness follow the database", async () => {
+    const schema = schemaName();
+    const store = await postgresStore({ url, schema, max: 2 });
+    const real = Date.now;
+    try {
+      Date.now = () => real() + 3_600_000;                         // this host is an hour ahead
+      const t0 = Number((await client().unsafe(DBMS))[0].t);
+      const a = await store.acquire(T, B, "h-a", 5_000);
+      const t1 = Number((await client().unsafe(DBMS))[0].t);
+      expect(a.expiresAt).toBeGreaterThanOrEqual(t0 + 5_000);
+      expect(a.expiresAt).toBeLessThanOrEqual(t1 + 5_000);
+      Date.now = () => real() - 3_600_000;                         // an hour behind: a live lease stays live
+      expect((await store.lease(T, B)).live).toBe(true);
+      expect(await store.acquire(T, B, "h-b", 5_000)).toBe(null);
+    } finally { Date.now = real; await store.close(); await drop(schema); }
+  });
+
+  test("H1 clock_timestamp, not now(): acquire's expiry is stamped after its lock wait", async () => {
+    const schema = schemaName();
+    const store = await postgresStore({ url, schema, max: 2 });
+    const blocker = await client().reserve();
+    try {
+      await store.acquire(T, B, "h-a", 1);
+      await Bun.sleep(5);
+      await blocker.unsafe("BEGIN");
+      await blocker.unsafe(`SELECT 1 FROM "${schema}".pl_leases WHERE tenant = $1 AND board = $2 FOR UPDATE`, [T, B]);
+      const p = store.acquire(T, B, "h-b", 5_000);
+      await Bun.sleep(800);
+      const tr = Number((await blocker.unsafe(DBMS))[0].t);
+      await blocker.unsafe("COMMIT");
+      expect((await p).expiresAt).toBeGreaterThanOrEqual(tr + 5_000);   // judged after the wait, not at its start
+    } finally { blocker.release(); await store.close(); await drop(schema); }
+  });
+
+  test("M1: a takeover behind a stalled holder's transaction settles within leaseLockTimeoutMs as unavailable, then succeeds once it ends", async () => {
+    // The verifier's repro: an open transaction holding FOR SHARE on the lease row stands in for a paused append.
+    const schema = schemaName();
+    const store = await postgresStore({ url, schema, max: 2, leaseLockTimeoutMs: 500 });
+    const stalled = await client().reserve();
+    try {
+      await store.acquire(T, B, "h-a", 200);
+      await stalled.unsafe("BEGIN");
+      await stalled.unsafe(`SELECT epoch FROM "${schema}".pl_leases WHERE tenant = $1 AND board = $2 FOR SHARE`, [T, B]);
+      await Bun.sleep(300);
+      expect((await store.lease(T, B)).live).toBe(false);
+      const t0 = performance.now();
+      const got = await Promise.race([code(store.acquire(T, B, "h-b", 60_000)), Bun.sleep(3_000).then(() => "still waiting")]);
+      expect(got).toBe("unavailable");                             // a PortError the caller retries, not a hang
+      expect(performance.now() - t0).toBeLessThan(1_500);
+      expect(await code(store.renew(T, B, "h-a", 1, 60_000))).toBe("unavailable");   // renew and release are bounded too
+      expect(await code(store.release(T, B, "h-a", 1))).toBe("unavailable");
+      await stalled.unsafe("COMMIT");
+      expect((await store.acquire(T, B, "h-b", 60_000))?.epoch).toBe(2);
+    } finally { stalled.release(); await store.close(); await drop(schema); }
+  });
+
+  test("M1: a holder paused mid-write is cut off by the server (idle_in_transaction_session_timeout), so the takeover goes through", async () => {
+    const schema = schemaName();
+    const own = new SQL({ url, max: 2 });
+    // The holder's client: a real fenced append that stops sending right after its fence (FOR SHARE), as a paused
+    // process or a partition would, leaving its transaction open on the server.
+    let resume, fenced;
+    const pause = new Promise(r => { resume = r; }), atFence = new Promise(r => { fenced = r; });
+    const pausing = tx => new Proxy(tx, { get: (t, k) => k !== "unsafe" ? (typeof t[k] === "function" ? t[k].bind(t) : t[k])
+      : async (q, args) => { const out = await t.unsafe(q, args); if (/FOR SHARE/.test(q)) { fenced(); await pause; } return out; } });
+    const holderSql = new Proxy(own, { get: (o, k) => k === "begin" ? f => o.begin(tx => f(pausing(tx))) : (typeof o[k] === "function" ? o[k].bind(o) : o[k]) });
+    const holder = await postgresStore({ sql: holderSql, schema, txIdleTimeoutMs: 300 });
+    const other = await postgresStore({ sql: client(), schema, leaseLockTimeoutMs: 5_000 });
+    try {
+      expect((await other.settings()).idle_in_transaction_session_timeout).toBe("5s");      // every write transaction sets it
+      const { epoch } = await holder.acquire(T, B, "h-a", 100);
+      const p = code(holder.append(T, B, [entry(1)], 0, epoch));
+      await atFence;                                                // paused, its FOR SHARE held
+      await Bun.sleep(150);                                         // the lease lapses
+      const t0 = performance.now();
+      const took = await other.acquire(T, B, "h-b", 60_000);        // waits only until the server ends the paused transaction
+      expect(took?.epoch).toBe(epoch + 1);
+      expect(performance.now() - t0).toBeLessThan(2_000);
+      resume();
+      expect(await p).not.toBe("resolved");                         // the paused write never lands
+      expect(await other.lastSeq(T, B)).toBe(0);
+    } finally { resume(); await holder.close(); await other.close(); await own.close().catch(() => {}); await drop(schema); }
+  });
+
+  test("L3: a role without UPDATE on pl_leases is refused at start-up (denied), not at its first fenced write", async () => {
+    const [{ ok }] = await client().unsafe("SELECT rolsuper OR rolcreaterole AS ok FROM pg_roles WHERE rolname = current_user");
+    if (!ok) { console.warn("pg-store: skipping L3 (the DATABASE_URL role can't create roles)"); return; }
+    const schema = schemaName(), role = `pl_test_app_${process.pid}_${++n}`, pass = "pl-test-" + Date.now().toString(36);
+    const owner = await postgresStore({ sql: client(), schema });
+    await owner.close();
+    await client().unsafe(`CREATE ROLE "${role}" LOGIN PASSWORD '${pass}'`);
+    await client().unsafe(`GRANT USAGE ON SCHEMA "${schema}" TO "${role}"`);
+    await client().unsafe(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO "${role}"`);
+    await client().unsafe(`REVOKE UPDATE ON "${schema}".pl_leases FROM "${role}"`);
+    const u = new URL(url); u.username = role; u.password = pass;
+    const app = new SQL({ url: u.toString(), max: 2 });
+    try {
+      const err = await postgresStore({ sql: app, schema }).then(() => null, e => e);
+      expect(err?.code).toBe("denied");
+      expect(err.message).toContain("UPDATE on pl_leases");
+    } finally {
+      await app.close(); await drop(schema);
+      await client().unsafe(`DROP ROLE IF EXISTS "${role}"`);
     }
   });
 
@@ -120,11 +347,17 @@ describe.skipIf(!url)("postgres store", () => {
       await store.append(T, B, [entry(1)], 0);
       expect((await store.read(T, B, 1, 10)).map(e => e.seq)).toEqual([1]);
       expect(await store.openEpoch(T, B)).toBe(1);
+      const l = await store.acquire(T, B, "h-a", 60_000);                         // lease writes and FOR SHARE need only row grants
+      await store.append(T, B, [entry(2)], 1, l.epoch);
+      await store.renew(T, B, "h-a", l.epoch, 60_000);
+      await store.release(T, B, "h-a", l.epoch);
       await store.putCheckpoint(T, B, { seq: 1, id: "c:1", by: "u1", at: 1 });
       expect((await store.getCheckpoint(T, B))?.seq).toBe(1);
       await store.close();
       // The same role on a schema nobody migrated: refused (it may not CREATE), so the test above proves least privilege.
-      await expect(postgresStore({ sql: app, schema: bare })).rejects.toThrow(/permission denied/);
+      const denied = await postgresStore({ sql: app, schema: bare }).then(() => null, e => e);
+      expect(denied?.code).toBe("denied");                                       // wrapped, with the fix in the message
+      expect(denied.message).toMatch(/permission denied.*run the migrate step as the schema owner/s);
       await expect(app.unsafe(`CREATE TABLE "${schema}".pl_extra (x INT)`)).rejects.toThrow(/permission denied/);
     } finally {
       await app.close();

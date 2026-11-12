@@ -1,16 +1,23 @@
 // The Store port on SQLite (PROTOCOL.md § Store): the durable log and checkpoints for a single node.
 //
-//   append(tenant, board, entries, expectSeq)   atomic and conditional; a stale expectSeq throws PortError "conflict"
+//   append(tenant, board, entries, expectSeq, epoch?)   atomic and conditional; a stale expectSeq throws PortError
+//                                               "conflict"; with `epoch`, one that isn't the board's lease epoch
+//                                               throws "fenced" (checked in the same transaction)
 //   read(tenant, board, fromSeq, limit, maxBytes?)   entries with seq >= fromSeq, ascending, at most `limit`
 //                                               (and, if maxBytes is given, about that much text: always >= 1 entry)
 //   lastSeq(tenant, board)                      the board's last seq (0 = empty)
-//   putCheckpoint(tenant, board, cp)            kept by cp.seq; the newest few per board are kept
+//   putCheckpoint(tenant, board, cp, epoch?)    kept by cp.seq; the newest few per board are kept; fenced like append
 //   getCheckpoint(tenant, board, beforeSeq?)    the highest seq (below beforeSeq, if given), never the last write
 //   openEpoch(tenant, board)                    durable atomic increment of the board's epoch (1 on the first call)
 //   epoch(tenant, board)                        the board's epoch, 0 if no room was ever built
+//   acquire(tenant, board, holder, ttlMs)       take the board's lease if free, expired or ours; always a new epoch
+//   renew(tenant, board, holder, epoch, ttlMs)  extend it, only as its holder at that epoch; else null
+//   release(tenant, board, holder, epoch)       give it up (idempotent); the epoch stays
+//   lease(tenant, board)                        { holder, epoch, expiresAt, live } or null
 //
-// The epoch lives in the board's lease record (`leases`), not in a checkpoint (PROTOCOL.md § Recovery, Room
-// identity). Single node has one host holding every lease; the record is the same shape phase 4's lease takes.
+// The epoch lives in the board's lease record (`leases`: holder, epoch, expires_at), not in a checkpoint
+// (PROTOCOL.md § Recovery, Room identity). Expiry is judged on the store's clock only (`now`, injected for tests):
+// on SQLite the store is one process, so its clock is the database's. Never compare it with another host's clock.
 //
 // Durable = WAL + synchronous=FULL (+ fullfsync on macOS, where a plain fsync doesn't reach the platter): a
 // resolved append survives a process crash and power loss. The API is async (Postgres will be); SQLite itself
@@ -21,10 +28,15 @@ import { Database } from "bun:sqlite";
 import { needId, PortError } from "../ids.js";
 
 const MAX_READ = 10_000;
+/** The longest lease (ms): a holder that dies with a longer one would block its board for that long. */
+const MAX_TTL = 10 * 60_000;
 const posInt = v => Number.isSafeInteger(v) && v > 0;
 
-/** @param {{ path: string, fullfsync?: boolean, busyTimeoutMs?: number, keepCheckpoints?: number }} o — `path` is a file (":memory:" for throwaway use). */
-export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3 }) {
+/**
+ * @param {{ path: string, fullfsync?: boolean, busyTimeoutMs?: number, keepCheckpoints?: number, now?: () => number }} o
+ *   `path` is a file (":memory:" for throwaway use). `now`: the lease clock in ms (default Date.now; tests inject one).
+ */
+export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3, now = Date.now }) {
   const db = new Database(path, { create: true, strict: true });
   let open = true;
   db.run(`PRAGMA busy_timeout=${Math.max(0, Math.floor(busyTimeoutMs))}`);
@@ -39,13 +51,26 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
     tenant TEXT NOT NULL, board TEXT NOT NULL, seq INTEGER NOT NULL, data TEXT NOT NULL,
     PRIMARY KEY (tenant, board, seq)) WITHOUT ROWID`);
 
+  // The lease record: holder NULL = nobody holds it (released, or a single-node openEpoch, which takes no lease).
   db.run(`CREATE TABLE IF NOT EXISTS leases (
-    tenant TEXT NOT NULL, board TEXT NOT NULL, epoch INTEGER NOT NULL,
+    tenant TEXT NOT NULL, board TEXT NOT NULL, epoch INTEGER NOT NULL, holder TEXT, expires_at INTEGER,
     PRIMARY KEY (tenant, board)) WITHOUT ROWID`);
+  // A file made before the lease columns existed (epoch only): add them; its rows read as unheld.
+  const cols = new Set(db.query("PRAGMA table_info(leases)").all().map(c => c.name));
+  for (const [col, type] of [["holder", "TEXT"], ["expires_at", "INTEGER"]]) if (!cols.has(col)) db.run(`ALTER TABLE leases ADD COLUMN ${col} ${type}`);
 
   const qOpenEpoch = db.query(`INSERT INTO leases (tenant, board, epoch) VALUES (?, ?, 1)
-    ON CONFLICT (tenant, board) DO UPDATE SET epoch = epoch + 1 RETURNING epoch`);
+    ON CONFLICT (tenant, board) DO UPDATE SET epoch = epoch + 1, holder = NULL, expires_at = NULL RETURNING epoch`);
   const qEpoch = db.query("SELECT epoch FROM leases WHERE tenant = ? AND board = ?");
+  // ?1 tenant ?2 board ?3 holder ?4 new expiry ?5 now. The WHERE is judged on the row as it stands, in the write lock.
+  const qAcquire = db.query(`INSERT INTO leases (tenant, board, epoch, holder, expires_at) VALUES (?1, ?2, 1, ?3, ?4)
+    ON CONFLICT (tenant, board) DO UPDATE SET epoch = epoch + 1, holder = ?3, expires_at = ?4
+    WHERE holder IS NULL OR expires_at IS NULL OR expires_at <= ?5 OR holder = ?3
+    RETURNING epoch, expires_at`);
+  const qRenew = db.query(`UPDATE leases SET expires_at = ?5 WHERE tenant = ?1 AND board = ?2 AND holder = ?3 AND epoch = ?4
+    RETURNING epoch, expires_at`);
+  const qRelease = db.query("UPDATE leases SET holder = NULL, expires_at = NULL WHERE tenant = ? AND board = ? AND holder = ? AND epoch = ?");
+  const qLease = db.query("SELECT holder, epoch, expires_at FROM leases WHERE tenant = ? AND board = ?");
   const qLast = db.query("SELECT max(seq) AS m FROM entries WHERE tenant = ? AND board = ?");
   const qInsert = db.query("INSERT INTO entries (tenant, board, seq, data) VALUES (?, ?, ?, ?)");
   const qRead = db.query("SELECT data FROM entries WHERE tenant = ? AND board = ? AND seq >= ? ORDER BY seq ASC LIMIT ?");
@@ -59,11 +84,21 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
   const qPruneCp = db.query(`DELETE FROM checkpoints WHERE tenant = ?1 AND board = ?2 AND seq NOT IN
     (SELECT seq FROM checkpoints WHERE tenant = ?1 AND board = ?2 ORDER BY seq DESC LIMIT ?3)`);
   const qGetCp = db.query("SELECT data FROM checkpoints WHERE tenant = ? AND board = ? AND seq < ? ORDER BY seq DESC LIMIT 1");
-  const putCpTx = db.transaction((tenant, board, seq, data) => { qPutCp.run(tenant, board, seq, data); qPruneCp.run(tenant, board, keepCheckpoints); });
+  /** The epoch fence: inside the write transaction, so no takeover lands between the check and the write. */
+  const fence = (tenant, board, epoch) => {
+    if (epoch === undefined) return;   // SEAM(p4): unfenced until room-host passes its lease epoch
+    const cur = qEpoch.get(tenant, board)?.epoch ?? 0;
+    if (cur !== epoch) throw new PortError("fenced", `the board's lease is at epoch ${cur}, not ${epoch}`);
+  };
+  const putCpTx = db.transaction((tenant, board, seq, data, epoch) => {
+    fence(tenant, board, epoch);
+    qPutCp.run(tenant, board, seq, data); qPruneCp.run(tenant, board, keepCheckpoints);
+  });
 
   // BEGIN IMMEDIATE: the write lock is taken before the read, so two handles (two processes) can't both see the
   // same last seq and both insert. The primary key is the second fence.
-  const appendTx = db.transaction((tenant, board, rows, expectSeq) => {
+  const appendTx = db.transaction((tenant, board, rows, expectSeq, epoch) => {
+    fence(tenant, board, epoch);   // first: a fenced host hears "fenced" (stop), not "conflict" (rebuild)
     const last = qLast.get(tenant, board).m ?? 0;
     if (last !== expectSeq) throw new PortError("conflict", `board is at seq ${last}, not ${expectSeq}`);
     for (const [seq, data] of rows) qInsert.run(tenant, board, seq, data);
@@ -73,11 +108,18 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
     if (!open) throw new PortError("closed", "the store is closed");
     needId(tenant, "tenant"); needId(board, "board");
   };
+  const needEpoch = epoch => { if (epoch !== undefined && !posInt(epoch)) throw new PortError("bad-entry", "epoch must be a positive integer"); };
+  const needTtl = ttlMs => { if (!posInt(ttlMs) || ttlMs > MAX_TTL) throw new PortError("bad-entry", `ttlMs must be a positive integer up to ${MAX_TTL}`); };
+  const clock = () => { const t = now(); if (!Number.isSafeInteger(t)) throw new PortError("bad-clock", "the store's clock gave a non-integer"); return t; };
+  const granted = row => row ? { epoch: row.epoch, expiresAt: row.expires_at } : null;
 
   return {
-    /** Writes every entry or none, only if the board's last seq is `expectSeq`. Resolves once durable. */
-    async append(tenant, board, entries, expectSeq) {
-      ready(tenant, board);
+    /**
+     * Writes every entry or none, only if the board's last seq is `expectSeq` and, when `epoch` is given, only if it
+     * is the board's lease epoch (else PortError "fenced"). Resolves once durable.
+     */
+    async append(tenant, board, entries, expectSeq, epoch) {
+      ready(tenant, board); needEpoch(epoch);
       if (!Number.isSafeInteger(expectSeq) || expectSeq < 0) throw new PortError("bad-entry", "expectSeq must be a non-negative integer");
       if (!Array.isArray(entries) || !entries.length) throw new PortError("bad-entry", "append needs at least one entry");
       // Everything is checked and serialised before the transaction starts: a bad entry writes nothing.
@@ -89,7 +131,7 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
         if (typeof data !== "string") throw new PortError("bad-entry", `entry ${i} can't be serialised`);
         return [e.seq, data];
       });
-      try { appendTx.immediate(tenant, board, rows, expectSeq); }
+      try { appendTx.immediate(tenant, board, rows, expectSeq, epoch); }
       catch (err) {
         if (err instanceof PortError) throw err;
         // The unique key fired: someone else holds that seq. Same answer as a stale expectSeq.
@@ -130,10 +172,10 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
     },
 
     /** Stores `cp` under its seq (`cp.seq` is required; the rest is the room's). An older one never hides a newer one. */
-    async putCheckpoint(tenant, board, cp) {
-      ready(tenant, board);
+    async putCheckpoint(tenant, board, cp, epoch) {
+      ready(tenant, board); needEpoch(epoch);
       if (!cp || typeof cp !== "object" || !Number.isSafeInteger(cp.seq) || cp.seq < 0) throw new PortError("bad-entry", "a checkpoint needs a seq");
-      putCpTx.immediate(tenant, board, cp.seq, JSON.stringify(cp));
+      putCpTx.immediate(tenant, board, cp.seq, JSON.stringify(cp), epoch);
     },
 
     /** The checkpoint with the highest seq; with `beforeSeq`, the highest below it (to step back past a bad one). */
@@ -144,7 +186,10 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
       return row ? JSON.parse(row.data) : null;
     },
 
-    /** A room is being built: the board's next epoch, durable before it resolves (§ Recovery, Room identity). */
+    /**
+     * A room is being built: the board's next epoch, durable before it resolves (§ Recovery, Room identity).
+     * Single node: it takes the board without a lease (holder cleared), so any lease holder is fenced off.
+     */
     async openEpoch(tenant, board) {
       ready(tenant, board);
       return db.transaction(() => qOpenEpoch.get(tenant, board).epoch).immediate();
@@ -154,6 +199,39 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
     async epoch(tenant, board) {
       ready(tenant, board);
       return qEpoch.get(tenant, board)?.epoch ?? 0;
+    },
+
+    /**
+     * Takes the board's lease if nobody holds it, it has expired (on this store's clock), or `holder` holds it.
+     * Every success is a new room incarnation: the epoch rises by 1, durably, in the same step. null = held by another.
+     * @returns {Promise<null | { epoch: number, expiresAt: number }>} expiresAt is on the store's clock, not the caller's
+     */
+    async acquire(tenant, board, holder, ttlMs) {
+      ready(tenant, board); needId(holder, "holder"); needTtl(ttlMs);
+      return db.transaction(() => { const t = clock(); return granted(qAcquire.get(tenant, board, holder, t + ttlMs, t)); }).immediate();
+    },
+
+    /** Extends the lease to now + ttlMs, only for its holder at that epoch (even if it lapsed and nobody took it). */
+    async renew(tenant, board, holder, epoch, ttlMs) {
+      ready(tenant, board); needId(holder, "holder"); needEpoch(epoch); needTtl(ttlMs);
+      if (epoch === undefined) throw new PortError("bad-entry", "renew needs the lease's epoch");
+      return db.transaction(() => granted(qRenew.get(tenant, board, holder, epoch, clock() + ttlMs))).immediate();
+    },
+
+    /** Gives the lease up if `holder` holds it at `epoch`; otherwise does nothing. The epoch is kept. */
+    async release(tenant, board, holder, epoch) {
+      ready(tenant, board); needId(holder, "holder"); needEpoch(epoch);
+      if (epoch === undefined) throw new PortError("bad-entry", "release needs the lease's epoch");
+      db.transaction(() => qRelease.run(tenant, board, holder, epoch)).immediate();
+    },
+
+    /** The lease record, judged on this store's clock: `live` = held and not expired. null = no room was ever built. */
+    async lease(tenant, board) {
+      ready(tenant, board);
+      const row = qLease.get(tenant, board);
+      if (!row) return null;
+      const live = row.holder !== null && row.expires_at !== null && row.expires_at > clock();
+      return { holder: row.holder, epoch: row.epoch, expiresAt: row.expires_at, live };
     },
 
     /** What the store was opened with, read back from SQLite (for /health and tests). */

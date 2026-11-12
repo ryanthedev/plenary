@@ -18,9 +18,9 @@ const file = () => join(dir, `r${++n}.db`);
 registryContract("sqlite", async ({ now }) => sqliteRegistry({ path: file(), now, fullfsync: false }), { cleanup: r => r.close() });
 
 describe("sqlite registry", () => {
-  test("pragmas: WAL, synchronous=FULL, fullfsync on by default", async () => {
+  test("pragmas: WAL, synchronous=FULL, fullfsync on by default; start-up leaves the whole busy_timeout", async () => {
     const r = sqliteRegistry({ path: file() });
-    expect(r.pragmas()).toEqual({ journal_mode: "wal", synchronous: 2, fullfsync: 1 });
+    expect(r.pragmas()).toEqual({ journal_mode: "wal", synchronous: 2, fullfsync: 1, busy_timeout: 5000 });
     await r.close();
   });
 

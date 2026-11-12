@@ -80,8 +80,6 @@ The blob store is the same `pgsty/minio` image and tag as `cluster.compose.yml`,
 runner's loopback; the step creates the bucket and fails unless the store reports it. Its `S3_*` values are
 throwaway CI-only literals written in the workflow.
 
-## Cluster (phase 4, not functional yet)
-
 ## Postgres roles (least privilege)
 
 Not live yet: `server/main.js` does not use the Postgres adapters (see [What is missing](#cluster-phase-4-not-functional-yet)
@@ -135,8 +133,50 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE O
 ```
 
 **If start-up is refused**, a runtime-role node stops with `postgres registry: start-up in schema "…" was refused for
-lack of a privilege (permission denied …)`. Either a table is missing (run step 2) or the role lacks its grants (run
-step 3). The Store's message is Postgres's own `permission denied …`.
+lack of a privilege (permission denied …)` (the Store's reads `postgres store: …` the same way), code `denied`.
+Either a table is missing (run step 2) or the role lacks its grants (run step 3). Both adapters check every table
+right they use at start-up, so a role with `USAGE` but missing grants is refused there, naming what it lacks (e.g.
+`lacks DELETE on reg_link_uses`), not on its first request:
+
+- **Registry:** `SELECT, INSERT, UPDATE, DELETE` on every `reg_*` table.
+- **Store:** `SELECT, INSERT` on `pl_entries`; `SELECT, INSERT, DELETE` on `pl_checkpoints`; `SELECT, INSERT, UPDATE`
+  on `pl_leases` (the epoch fence's `FOR SHARE` needs `UPDATE`).
+
+Step 3's grants cover both.
+
+**Upgrading a schema made before the lease (phase 4).** Nodes refuse to start with `needs-migration` if `pl_leases`
+lacks `holder` and `expires_at`. Run once, as the owner role, on each Plenary schema:
+`ALTER TABLE "<schema>".pl_leases ADD COLUMN IF NOT EXISTS holder TEXT, ADD COLUMN IF NOT EXISTS expires_at BIGINT;`
+It is idempotent and keeps every board's epoch. (Start-up itself never runs it: nodes still never ALTER.)
+
+### Registry time limits
+
+Every Registry call on Postgres answers or rejects within a bound, and a rejection reaches the client as
+`unavailable` (it reconnects). Options of `postgresRegistry` (`server/registry/postgres.js`, header "Timeouts" and
+"The gate"):
+
+| Option | Default | What it bounds | Rejects with code |
+|---|---|---|---|
+| `lockTimeoutMs` | 15 s | a statement waiting on a lock; start-up waiting on the schema's start-up lock | `lock-timeout` |
+| `statementTimeoutMs` | 15 s | a statement running, lock waits included (fires first when the two are equal) | `statement-timeout` |
+| `maxInFlight` | the pool's `max` (Bun: 10) | calls sent at once, so Bun never queues one behind a stuck connection | — |
+| `maxQueued` | 10 × `maxInFlight` | calls waiting for a connection; past it a call is refused at once, nothing sent | `overloaded` |
+| `queueTimeoutMs` | 0.2 × the smaller limit + 50 ms | a call's wait for a connection; it is then refused and never sent | `queue-timeout` |
+| (fixed) | the larger limit + 1 s after sending | a sent call with no answer (dead peer); it may still have taken effect | `client-timeout` |
+
+**For a cluster, set `statementTimeoutMs` and `lockTimeoutMs` to 3–5 s**, above the gateway's 2 s re-check bound
+(`recheckLookupMs`). The main reason: `queueTimeoutMs` is then 0.65–1.05 s, below those 2 s, so a re-check lookup the
+gateway has already given up on is never sent. With the 15 s defaults `queueTimeoutMs` is 3050 ms, and an abandoned
+lookup can still take a connection. Each connection is also pinned for less time under a stuck lock. Measured:
+behind a stuck lock every call settles by about 1 × the lock limit, sent or not.
+
+- **Bursts:** more than `maxInFlight + maxQueued` calls at once (110 with the defaults) get `overloaded` straight
+  away, even on a healthy pool. Raise `maxQueued` if a node sees bigger bursts; `queueTimeoutMs`, not the queue's
+  length, bounds how long a queued call waits.
+- **A shared pool:** the gate assumes the Registry is its pool's only user; pass `maxInFlight` below the pool's `max`
+  if the pool is shared.
+
+## Cluster (phase 4, not functional yet)
 
 `cluster.compose.yml` is the phase-4 shape: Postgres, NATS, an S3-compatible blob store, three app nodes and a Caddy
 load balancer. It is a separate Compose project (`plenary-cluster`), so it never touches the single-node stack above,

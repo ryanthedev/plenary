@@ -30,14 +30,20 @@ const str = v => typeof v === "string";
  * Runs `f`, retrying while SQLite reports BUSY/LOCKED, with a short growing backoff (5 ms doubling, at most 100 ms,
  * plus jitter), until `deadline` (ms since epoch); then throws the last error. Only for start-up statements that
  * SQLite may refuse without consulting the busy handler. Blocks (start-up is synchronous).
+ *
+ * A hard cap: before each attempt `busy_timeout` is set to what is left of the budget, so a statement that waits in
+ * SQLite's busy handler can't run past the deadline either, and no sleep runs past it. `f` always runs at least once.
+ * The caller restores its own busy_timeout afterwards.
  */
-function onBusyRetry(deadline, f) {
+function onBusyRetry(db, deadline, f) {
   for (let delay = 5; ; delay = Math.min(delay * 2, 100)) {
+    db.run(`PRAGMA busy_timeout=${Math.max(0, deadline - Date.now())}`);
     try { return f(); }
     catch (err) {
       const busy = typeof err?.code === "string" && (err.code.startsWith("SQLITE_BUSY") || err.code.startsWith("SQLITE_LOCKED"));
-      if (!busy || Date.now() >= deadline) throw err;
-      Bun.sleepSync(delay + Math.floor(Math.random() * delay));
+      const left = deadline - Date.now();
+      if (!busy || left <= 0) throw err;
+      Bun.sleepSync(Math.min(left, delay + Math.floor(Math.random() * delay)));
     }
   }
 }
@@ -56,9 +62,10 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
   // exclusive lock, and SQLite returns BUSY for it without calling the busy handler, so busy_timeout alone doesn't
   // help (reproduced: ~1 in 10 of 12 simultaneous opens failed at this pragma). So: skip the switch once the file
   // already reads WAL (it is persistent), and retry it, and the first schema transaction, with a short backoff
-  // until the same busy_timeout budget runs out. Every later statement waits through the busy handler as usual.
+  // until the same busy_timeout budget runs out, in total (onBusyRetry caps each attempt's busy wait at what is
+  // left). Every later statement waits through the busy handler as usual, with the full busy_timeout again.
   const deadline = Date.now() + wait;
-  onBusyRetry(deadline, () => {
+  onBusyRetry(db, deadline, () => {
     if (db.query("PRAGMA journal_mode").get()?.journal_mode !== "wal") db.run("PRAGMA journal_mode=WAL");
   });
   db.run("PRAGMA synchronous=FULL");
@@ -66,7 +73,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
   db.run(`PRAGMA checkpoint_fullfsync=${fullfsync ? "ON" : "OFF"}`);
   db.run("PRAGMA foreign_keys=ON");
 
-  onBusyRetry(deadline, () => db.transaction(() => {
+  onBusyRetry(db, deadline, () => db.transaction(() => {
     db.run(`CREATE TABLE IF NOT EXISTS reg_tenants (
       id TEXT PRIMARY KEY, domain TEXT UNIQUE, created_at INTEGER NOT NULL)`);
     db.run(`CREATE TABLE IF NOT EXISTS reg_tenant_admins (
@@ -91,6 +98,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES reg_links(id), n INTEGER NOT NULL,
       PRIMARY KEY (board, member, link))`);
   }).immediate());
+  db.run(`PRAGMA busy_timeout=${wait}`);                     // start-up spent part of it; runtime gets the whole budget
 
   const q = {
     tenant: db.query("SELECT id, domain, created_at FROM reg_tenants WHERE id = ?"),
@@ -266,7 +274,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     /** What the registry was opened with, read back from SQLite (for /health and tests). */
     pragmas() {
       const one = name => Object.values(db.query(`PRAGMA ${name}`).get())[0];
-      return { journal_mode: one("journal_mode"), synchronous: one("synchronous"), fullfsync: one("fullfsync") };
+      return { journal_mode: one("journal_mode"), synchronous: one("synchronous"), fullfsync: one("fullfsync"), busy_timeout: one("busy_timeout") };
     },
 
     async close() { if (!open) return; open = false; db.close(); },

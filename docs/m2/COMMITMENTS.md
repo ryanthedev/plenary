@@ -10,7 +10,7 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 | proxy | t14h | ★ proxy (talk here) | running |
 | manager engine | t18m | manager engine | running (successor of t14j; handoff docs/m2/handoff/manager-engine.md, 94b1ae9): scaffold final gate t18c, v1.1 code verify t171 |
 | manager platform | t187 | manager platform | running (successor of t14q; handoff docs/m2/handoff/manager-platform.md, 9266173): drawh round 3 (t185, verifier t155) |
-| manager client | t14k | manager client | running: phase 6 mock verifying (verifier t14v) + p6-base canvas core (builder t14r) |
+| manager client | t14k | manager client · t14k | running: p6-ports fix round (t18r); p6-hex and p7-wire on main after the p2-land merge |
 
 ## Commitments
 
@@ -18,9 +18,10 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 |---|---|---|---|
 | 1 | Phase 1 protocol v1 spec, shown to the CEO (not a gate; phase 2 starts on PASS) | DONE 28fa91d (audited by proxy, pushed 32cc915; shown to the CEO with 3 open questions) | manager engine t14j, brief docs/m2/briefs/manager-engine.md |
 | 2 | Phase 6 design mock, shown to the CEO (not a gate; phase 6 build starts on PASS) | DONE 7536d50 (round 2 PASS; shown to the CEO) | manager client t14k, brief docs/m2/briefs/manager-client.md |
+| 6 | CEO does one live Google sign-in (bun scripts/dev-google.js, http://localhost:8080/) | ASKED 2026-11-11 | docs/m2/reports/p5-google.md "Hand-off" |
 | 3 | Ask the CEO for the Google OAuth client (env vars, never chat) when phase 5 starts | DONE 2026-11-11 | Web client "canvas-dev-local" in Omniping project gen-lang-client-0027800234 (consent screen already External/Testing); redirect http://localhost:8080/auth/callback; keys in .env (gitignored, 0600) via the downloaded JSON, never shown in chat |
 | 5 | Hexagonal architecture enforced (boundary test) and the systems design skill used on every design-bearing job; architecture audit per track | RUNNING | OFFICE.md "Architecture"; managers told |
-| 4 | drawh change is a proposal only; herdr-draw untouched without the CEO | RUNNING (fix round, 2 HIGH) | patch built (applies to herdr-draw 5dfe352, its tests 269 pass), verifier t155; goes to the CEO after PASS; needs a refresh after phase 2 |
+| 4 | drawh change is a proposal only; herdr-draw untouched without the CEO | RUNNING (scope cut after 3b FAIL; round 4 on v1.1) | builder t185, verifier t155; goes to the CEO for approval after PASS |
 
 ## Decisions (reversible; the CEO may overturn)
 

@@ -1018,3 +1018,427 @@ It does not mention the remaining gap.
 Scratchpad `/private/tmp/claude-501/-Users-r-repos-plenary/7c151fa9-5670-49b0-b142-66f2d5ad1c5a/scratchpad/r7/probe/`:
 `opt2.test.js` (in-process; case 7 is section 1, case 9 the remaining gap), `loud.sh` (sections 2 and 3 live), `settings.sh` (R1),
 `recheck.test.js`. Stand-ins on port 0, stopped by their recorded PIDs; no processes or mounts left.
+
+# Round 4 check (v1.1) (2026-11-12, pd-drawh4v)
+
+**FAIL by the letter of the bar, on one narrow finding; the manager's call.** After a `stale-setting`, a newer value
+the user saves to the key **after the refusal's line is printed**, before the bridge has written the board's value
+back, is overwritten with no further line (H1 below). This is the builder's open question (2). Normally the window is
+the ~20 ms before the next pass, but a failed write-back or a half-written file holds it open until a pass succeeds.
+Also **1 HIGH by the letter with negligible reach** (H2: a 32-bit hash collision takes the quiet path; codex's finding,
+confirmed), **2 MEDIUM** and **3 LOW**. Everything else the round was for holds:
+- **Settings rules:** R1, R2a, R2b, R3 and case V pass live, loud or sent, never silent.
+- **Epoch:** rules as the brief states.
+- **Gates:** all pass. No peer change was undone anywhere.
+
+Patch checked: `docs/m2/proposals/drawh-server.patch`, sha256 `0cbf6109011b43b2…` (matches the brief), on herdr-draw
+5dfe352. Labels: **live** = real `drawh --server` against my stand-in; **in-process** = the real `Bridge` on the
+reference `Room` (probe file below); **read** = code.
+
+## Gates
+
+| Gate | Result |
+|---|---|
+| `git apply --check` + apply, fresh `git clone --local` of 5dfe352 | clean (11 paths) |
+| herdr-draw `bun test` there (after `bun install --frozen-lockfile`) | **304 pass, 0 fail** |
+| Plenary protocol tests, p2-land worktree (`bun test test/*.test.js`) | **128 pass, 0 fail** |
+| Plenary main tree `bun test --path-ignore-patterns 'test/web/adapters/transport-ws*'` | **627 pass, 78 skip, 0 fail** (705 tests, 35 files) |
+| herdr-draw untouched | status empty, HEAD 5dfe352, no stash, one worktree (before and after) |
+| Protocol copy | 7 files byte-identical to `git show 5d55112:packages/protocol/*`, each sha256 in SOURCE.json, commit 5d55112. The p2-land HEAD is 1db625c, with `git diff 5d55112 HEAD -- packages/protocol PROTOCOL.md` empty |
+
+## HIGH by the bar (narrow)
+
+### H1. After `stale-setting`, a newer value saved after the refusal's line is overwritten silently
+
+- **Cause (read):** `settingsAnswers()` sets the key's gate to `"writeback"` and prints the line at once
+  (`cli/bridge.js` ~347). In the next pass that writes successfully, `settingsFrom()` skips a `"writeback"` key with no
+  check on what the file now holds (~231), and `pull()` writes the board's value over it (~520). Only a write that
+  succeeds turns the gate to `"wait"` (~431). From then on a newer value is held and judged, which is the intended
+  design (the builder's test "a gate still shut").
+- **When the gate stays `"writeback"` past the refusal:** the peer's conflicting entry arrives after the refusal (the
+  builder's own test models this as "travels on another bus subject"). When it arrives in the same batch,
+  `retryReady` opens the gate at once and the newer value is judged loudly (probes P1 to P4: one "older copy" line
+  each).
+- **In-process (probe file, tests P6, P8, P4b),** with grid 10, user 20 refused, peer 30, refusal delivered before
+  the peer's entry. The user saves 40 after the refusal's line:
+
+| Probe | What holds the window open | File after the pass | Lines after the user's 40 |
+|---|---|---|---|
+| P6 | nothing (40 lands before the 20 ms pass) | 10, then 30 when the entry comes | **0** |
+| P8 | the write-back write failed ("the disk says no") | 10, then 30 | **0** (the runner's own "can't write" line came before the 40) |
+| P4b | the file was half-written at refusal time | 10, then 30 | **0** ("isn't valid JSON" came before the 40) |
+| P5 (control) | 40 saved after the write-back | 40, sent, board 40 | 0 (correct: built on the current file) |
+| P7 (control) | socket dropped, reconnect | 30 | 1 "older copy" line (loud) |
+
+- **Why it counts as silent:** the only grid line was printed before the 40 was made, and it says "To change it,
+  set it again", which is what the user did. P8 is the worst case: after a disk error, every new value for the key
+  is overwritten without a word until a write-back succeeds.
+- **The doc understates it:** `drawh-server.md` ("what can still go wrong") says "a second change made in the same
+  instant goes with it (said once, by the refusal's line)". P8 and P4b show it is not one instant, and the line comes
+  before the change, not for it.
+- **Also seen:** the write-back writes the bridge's copy of the board (10), not the board's value (30), until the
+  entry arrives. This lasts briefly and corrects itself.
+- **Live (`probe/stale.sh`, new; the stand-in got a `lag` control):** 12 trials, with the op delayed 400 ms and the
+  peer's entry 900 ms, and the newer value saved 0 to 250 ms after the peer's change.
+  - **Result:** the newer value was never sent and was lost in all 12. Each trial printed at least 1 grid line (8
+    trials had 1 line, 4 had 2).
+  - **What live did NOT show:** it did not isolate the window. In the 1-line trials the newer value most likely
+    landed before the refusal, where the Replica held it and dropped it with the refused op (`replica.js` ~502). In
+    that case the refusal's line comes after it and covers it. So live neither confirms nor rules out the silent
+    case; the in-process probes do confirm it.
+- **Fix direction (untested):** at write-back, compare the file's value with the refused op's value (or the
+  `looked` copy). If they differ, the user changed the key since, so treat it like `"wait"`: hold it and judge it
+  when the gate opens. Then fix the doc line.
+
+### H2. A 32-bit hash collision takes the quiet path (codex; confirmed; negligible reach)
+
+- **Cause (read):** `hashOf` (`cli/bridge.js:31`) is 32-bit FNV-1a over `canon(v)`. Rule 2 ("an untouched old
+  copy") trusts `hash === hashOf(v)`.
+- **In-process (P11):** a file with timeline `{"duration":562789}` is copied; a peer sets 1000; the user edits the old
+  copy to `{"duration":779192}` (same hash, from codex). Result: the file and board end at 1000, with **0 lines**.
+  With 779193 (P11b): 1 line.
+- **Reach:** about 2⁻³² per edit made on a stale copy; no ordinary use will hit it. It is listed as HIGH only
+  because the bar makes any silent loss HIGH.
+- **Fix:** store the canonical value (settings are small) or a 64-bit-plus hash in the marker.
+
+## MEDIUM
+
+- **M1. Open question (1): a snapshot answer to the tip check is "another room" even when `welcome.room` vouches.**
+  In-process (P9):
+  - **Setup:** a bridge in step (grid 10) is stopped. The user sets grid 50 on the current file; nobody else touches
+    grid. The room checkpoints, and the bridge restarts with its saved state. The welcome carries
+    `room {board:"b1", epoch:1}`, the same as before.
+  - **Result:** the line "this is not the board this file was last in step with … starting over" is printed (false),
+    then grid 50 is **refused** ("changed on a copy older … or this bridge can't tell"), and the file is back to 10.
+  - **Why it is MEDIUM:** it is loud, so it meets the bar, but it is a false alarm. It throws away a valid offline
+    change after any restart that finds the room checkpointed past the bridge's tip.
+  - **Relax it (suggestion):** once real servers send `room` (after p2-swap), trust a writer welcome with the same
+    board and the same epoch over a snapshot answer.
+- **M2. The `stale-setting` line doesn't name the value it drops.** With H1 or a held change, more than one value
+  can go under one line. The `distributed-systems-design` checker (Ch15: first write wins plus a *conflicted copy*)
+  says the loser should be kept or at least shown: say the dropped value(s) in the line.
+
+## LOW
+
+- **L1.** A viewer's welcome is not epoch-checked (by design, "a viewer's may lag"; in-process, a lower epoch on a
+  viewer welcome: no reconnect). Viewers send nothing, so nothing is lost.
+- **L2.** The ensemble was thin: agy was out of quota ("RESOURCE_EXHAUSTED (code 429): Individual quota reached …
+  Resets in 61h56m"), and kimi and mistral are not signed in.
+- **L3.** The doc's limits heading still says "(round 4, not re-verified yet)".
+
+## Epoch (in-process, hand-fed welcomes, and read)
+
+| Welcome | Result |
+|---|---|
+| no `room` | no line, no reconnect, caught up (unknown epoch, not an error) |
+| `room.board` "b2" | another room, one line, reconnect |
+| epoch 5, then 3 | another room ("its room is number 3 … number 5") |
+| epoch 2, then 4, seq not behind | epoch 4, no line |
+
+Retry (read and in-process): a gate opens only on `retryReady` for that key. The file's value is then judged
+afresh: if it is still the board's, nothing happens; if it is a change made on the old copy, it is refused loudly
+(builder's test and P1 to P4). This is correct, apart from H1, which happens before the gate turns to `"wait"`.
+
+## Consistency model: `distributed-systems-design` CHECKER (v0.1.0; Ch6, Ch15)
+
+- **Right:**
+  - **One version scalar per key:** a single sequencer per board makes a scalar enough; no vector clock is needed
+    (Ch6).
+  - **Conflict rule:** first write wins via the room's compare-and-set (Ch15).
+  - **Lost acks:** the op id plus base is resent and answered again.
+  - **Restart:** state is persisted, and ops lost to a restart never take the quiet path.
+  - **Pruned history:** `MAX_HIST` falls back to loud, never quiet.
+- **Gaps found:**
+  - **H1:** the write-back is a blind write to the file, not checked against the file's value.
+  - **H2:** a weak fingerprint is used as a version identity.
+  - **M2:** no conflicted copy and no named loser.
+  - **M1:** a false "another room" from a snapshot.
+- **Not applicable:** infrastructure items such as the load balancer, cache, CDN and sharding (one bridge, one
+  file).
+
+## sdd ensemble (new hunks: `diff -ru` of `cli/` and the tests against the committed proposal applied)
+
+| Harness | Result |
+|---|---|
+| codex (high effort) | 1 HIGH: the hash collision. Confirmed (H2) |
+| grok | "Clean, no findings". It describes the write-back as safe ("a newer user change … is held in `deferred`"), which P6, P8 and P4b refute: that holds only after the write-back has been written |
+| agy | failed twice: out of quota (429, above) |
+| kimi, mistral | `check_adapter` failed (not signed in, no API key) |
+
+No two reviewers agreed on anything. H1 is mine, from the builder's open question.
+
+## Live reruns (scripts copied to my scratchpad, paths repointed)
+
+The builder's copies differ from my originals only as declared: the stand-in is on v1.1 (`meta` from `tableAuth`,
+`new Room` without `auth`, the peer via `local()`+`outgoing()`), and `vlive2.sh` has `cd rv2`. I added a `lag`
+control to the stand-in. The runs use bun as the runner, on macOS APFS.
+
+These runs were on the patch `0cbf6109…`. The run was **stopped part-way** when the round 4 fix arrived (I stopped
+it by its own PIDs). The results that finished, from `live/live-results.txt`:
+
+| Script | Result |
+|---|---|
+| vlive2.sh (case V) | 20 sent; the peer's 30 kept; the undo to 10 on the old copy **refused, 1 line**, file and board stay 30; 10 on the current file sent (board 10) |
+| undo.sh | hide;show back to back: the room ends shown **20/20**, 0 lines; hide then 1.2 s then show: hide reached the room **10/10** |
+| toggle.sh | 2 to 5 toggles at 0, 0.3 and 1 s apart: board wrong **0** times, 0 lines; the agent's stale save undoes the user's hide (the documented, accepted limit) |
+| toggle2.sh | 3 toggles 0.1/0.15/0.2 s apart ×15, 5 toggles ×10: wrong **0**, 0 lines |
+| stale.sh (new) | see H1 |
+| toggle3.sh, settings.sh, measure.sh, measure_s.sh | not run on this cut (stopped); rerun on the fix, see "Round 4 re-check" |
+
+## Not verified
+
+- A real v1.1 server, a real Herdr pane, Linux, `wss://`, node as the runner.
+- That a real cluster delivers a refusal before the conflicting entry (H1's precondition); it is modelled only.
+- agy's review.
+
+## How to rerun
+
+Scratchpad `/private/tmp/claude-501/-Users-r-repos-plenary/a17ae338-83af-49dd-b71c-6057a91e8133/scratchpad/`:
+- **`hd`:** the fresh clone with the patch applied; `hd/test/probe-v.test.js` holds probes P1 to P11, P4b and E.
+  Run `bun test test/probe-v.test.js`; it prints, it does not assert.
+- **`live/`:** the scripts; `live/probe/stale.sh` is new.
+- Stand-ins run on port 0 and are stopped by their recorded PIDs.
+
+# Round 4 re-check (2026-11-12, pd-drawh4v, patch sha256 `ed615d64f2734765…`)
+
+**FAIL by the letter of the bar, on one narrow remainder of H1; the manager's call.** The fix closes what was
+reported: a newer value saved after the refusal's line is now held and then said (in-process and live), and the hash
+is gone. One variant is still silent:
+- **The variant:** after the line, the user saves a new value and then goes **back to the value the refusal
+  dropped**, both before the peer's entry arrives.
+- **What happens:** the last save is overwritten with no new line.
+- **Evidence:** in-process V5; live 8/8 in two timings; codex found it independently. That makes two sources: HIGH
+  confirmed.
+
+M2 is fixed. M1 is not fixed: it is loud and loses nothing (graded below). The gates and all live settings scripts
+pass, with no peer change undone anywhere.
+
+Since the last check, only `cli/bridge.js` changed (100-line diff: `printOf` instead of `hashOf`, `refusedVals`, the
+`"writeback"` branch, the refusal line) plus 4 tests. I checked the code and ran my own probes; t1f4's report section
+had not landed when I started.
+
+## Gates
+
+| Gate | Result |
+|---|---|
+| `git apply --check` + apply, fresh `git clone --local` of 5dfe352 (`hd2`) | clean (11 paths) |
+| herdr-draw `bun test` there | **308 pass, 0 fail** |
+| Plenary protocol, p2-land (`bun test test/*.test.js`) | **128 pass, 0 fail** |
+| Plenary main, `--path-ignore-patterns 'test/web/adapters/transport-ws*'` | **627 pass, 78 skip, 0 fail** |
+| Protocol copy | 7 files byte-identical to `5d55112:packages/protocol/` |
+| herdr-draw untouched | status empty, HEAD 5dfe352, no stash, one worktree |
+
+## (1) H1: probes on the fix (in-process, `hd2/test/probe-r.test.js`)
+
+The setup in every row: grid 10; the user's 20 is refused; a peer sets 30; the refusal arrives before the peer's
+entry (the gate stays `"writeback"`). "END" is the state after the entry arrives.
+
+| Probe | What the user does after the refusal's line | Before the entry | END | Verdict |
+|---|---|---|---|---|
+| V1 (was P6) | saves 40 before the pass | file 40, held | 30, **1 "older copy" line** | fixed, loud |
+| V2 (was P8) | write-back fails, then saves 40 | file 40, held | 30, 1 line | fixed, loud |
+| V3 (was P4b) | the file was half-written at refusal; completes with 40 | file 40, held | 30, 1 line | fixed, loud |
+| V4 | two newer values: 40, then 50 | file 50, held | 30, 1 line | fixed, loud |
+| **V5** | **40, then back to the dropped 20** | 40 is held; then 20 is overwritten (file 10, gate `"wait"`) | file 30, **0 lines** | **silent** |
+| V6 | write-back fails; the file still holds 20 and "setting 20 again" changes nothing | file 10 | 30, 0 lines | not a change (the doc's rule); LOW |
+| V7 | the dropped 20 again, after the write-back landed (gate `"wait"`) | held | 30, 1 line | loud |
+| V8 | restart while the gate is `"writeback"` (file 20) | | 30, 1 line | loud |
+| V9 | saves 40, then restart while the gate is `"writeback"` | | 30, 1 line | loud |
+| V10 | same-batch refusal (the gate opens at once), then 40 | | 30, 1 line | loud |
+| V11 | same batch; the dropped 20 again on the current file | | **20 sent**, board 20 | correct |
+
+- **V5 cause (read):** `cli/bridge.js` ~236 lets a value in `refusedVals` through to `pull()`, which overwrites it,
+  even after the bridge has seen and held a different value for the key since the refusal. The set compares values
+  only, so it cannot tell "the file still holds the refused 20" from "the user went 20 → 40 → 20".
+- **The doc is wrong here:** `drawh-server.md` ("what can still go wrong") says "the same value set again on a file
+  that still shows it is no change". In V5 the file did not still show it; it showed 40 in between, and the bridge
+  saw that.
+- **Fix direction (untested):** once a pass has deferred a non-dropped value for k, drop k's `refusedVals`, or move
+  its gate to `"wait"`. Every later value for k is then held and judged. V6 (never left the dropped value) stays
+  as it is.
+- **The refusal line:** it now names the dropped value(s), including the Replica's held ones (live trial 12:
+  "dropped from this file: grid 20, grid 52"). **M2 is fixed.**
+
+## (2) H2: canonical values (in-process)
+
+- **P11 (codex's colliding pair):** `{"duration":779192}` on an old copy is now **said** (1 line); before the fix it
+  was silent. **Fixed.**
+- **R1 (an untouched old copy):** still quiet, 0 lines.
+- **Large or odd value:** I used 100 layers (the protocol's maximum), names of about 190 characters with Cyrillic,
+  an emoji, U+2028, quotes and a backslash. The file was 62 KB.
+  - **Seeding:** all 100 seeded.
+  - **Old copy with keys reordered and re-indented by another tool:** quiet (`canon` sorts keys).
+  - **One layer name changed on an old copy:** 1 line.
+  - **Set again on the current file:** sent.
+- **LOW (marker size):** the marker now holds a second copy of each settings value, about 2× the settings bytes. That
+  is about 20 KB more in the large case above; harmless.
+- **LOW (codex, old markers):** a file marked by the pre-fix bridge carries a hash, so after a peer change its
+  untouched old copy is said instead of quiet. The noise is loud, not a loss, and only testers have such files (the
+  patch was never applied).
+
+## (3) The MEDIUMs
+
+- **M2 (the line doesn't name the dropped value): fixed.**
+- **M1 (a snapshot answer to the tip check is "another room" even when `welcome.room` vouches): not fixed. MEDIUM
+  stays; it loses no edit and undoes no peer change.**
+  - **Probe (in-process, M1 in `probe-r`):** a bridge in step is stopped. Offline, the user sets grid 50, moves
+    shape `a` and adds `new1`. The peer moves `p`, sets snap, and adds 5 shapes. The room checkpoints, then the
+    bridge restarts.
+  - **Room after the restart:** `a` moved (sent), `new1` present, the peer's `p` edit kept, snap = the peer's.
+  - **File after the restart:** the same.
+  - **Lines:** 3: the false "not the board this file was last in step with"; **grid 50 refused**, loud, so the user
+    must set it again; and a misleading "snap … changed on a copy older" line, though the user never touched snap.
+  - **How it can't lose anything:** after the fresh start, every settings key's base reads as unknown (`since` is
+    null), so the rule never takes the quiet path. Shapes go only when they beat the board's copy.
+
+## (4) Live, on `hd2` (my copies of the scripts; the stand-in has the `lag` control)
+
+| Script | Result |
+|---|---|
+| **stale2.sh MODE=one** (new: a running watcher saves 40+i the instant the refusal's line appears; op lag 400 ms, peer entry lag 900 ms) | **8/8**: newer value held, then said ("older copy" line), file and board 30. Fixed live |
+| **stale2.sh MODE=back GAP=0.15** (40+i, then the dropped 20) | **8/8 silent**: file and board 30; the only line is the refusal's, printed before both saves |
+| **stale2.sh MODE=back GAP=0.35** (longer than the 250 ms file poll, so the bridge saw 40+i) | **8/8 silent**: same. V5 reproduced live |
+| stale.sh (12 trials) | 11 trials: 2 lines (refusal, then "older copy" for the newer value). Trial 12: 1 line, which names both ("dropped from this file: grid 20, grid 52": the newer value was held by the Replica and dropped with the op) |
+| vlive2.sh (case V) | 20 sent; the undo on the old copy refused, 1 line; 10 on the current file sent |
+| undo.sh | room shown **20/20**, 0 lines; hide reached **10/10** |
+| toggle.sh | wrong **0** at every spacing, 0 lines; the agent's stale save undoes the hide (the accepted limit) |
+| toggle2.sh | wrong **0/55**, 0 lines |
+| toggle3.sh (R3) | wrong **0/50**, 0 lines |
+| settings.sh (R1) | busy: 386 saves, 36 peer changes, **UNDONE 0, lines 0**; calm: 42 saves, 54 changes, **UNDONE 0, lines 0** |
+| measure_s.sh | q1: 174 saves, 434 peer entries; q4: 174 saves, 90 peer entries. **LOST 0**, file-only 0, peer missing 0; final grid 184 = file = board; 0 lines |
+
+Stand-ins ran on port 0 and were stopped by their PIDs; bridges were stopped by `$!`. No `standin.js` or
+`drawh --server` of mine is left. I stopped my earlier, superseded run by its own PIDs. A stand-in under the builder's
+scratchpad path (`cb9f64e3…`) was running at the time; it is not mine, and I left it alone.
+
+## sdd ensemble on the fix hunks
+
+| Harness | Result |
+|---|---|
+| codex (high) | **HIGH: the return to a refused value is overwritten silently** (= V5, confirmed); LOW: old hash markers are noisy (confirmed by reading; graded LOW above) |
+| grok | "No findings; apply it". It misses V5 |
+| agy | out of quota (429, resets in about 62 h); not retried |
+
+## Not verified
+
+- A real v1.1 server, a real Herdr pane, Linux, `wss://`, node as the runner.
+- That a real cluster delivers a refusal before the conflicting entry (H1's precondition); I modelled it with lag.
+- measure.sh (shapes only) was not rerun: the write path for shapes didn't change.
+
+# Round 4 final check (2026-11-12, pd-drawh4v, patch sha256 `f4f9b05a2d3ec81e…`)
+
+**FAIL by the letter, on one more narrow silent case in the refusal window (F5 below). Under the manager's hard stop
+it is reported, not sent back for another fix round.** Everything named in the brief holds:
+- **V5:** fixed in-process and in both of my live timings (8/8 each, now loud).
+- **Variants:** back and forth several times, and a restart inside the window, are loud.
+- **Normal paths:** the refusal gives one line.
+- **Settings rules:** R1, R2a, R2b, R3 and case V hold live.
+- **No peer change undone anywhere.**
+
+The silent case left:
+- **When:** the **same-batch** refusal, where the peer's entry comes with the refusal. That is the normal path on a
+  single node, and the gate opens at once.
+- **What:** the user saves a new value and then goes back to the dropped one, between the refusal's line and the
+  bridge's next pass.
+- **Result:** the final value is written back with no line after it. In-process F5 and F5n; live 8/8.
+- **Window:** about 20 ms after the refusal's line, so only an automated writer, or a save already on its way, can
+  land in it.
+
+**The patch on disk is the final cut named in the report:** `docs/m2/proposals/drawh-server.patch`, sha256
+`f4f9b05a2d3ec81ed6189cf161e539972b81ed37747a5c1815b69831ef4d44e6`, as named in pd-drawh.md "Round 4 fix". It applies
+to 5dfe352, base and protocol 5d55112 as the header says.
+
+## Gates
+
+| Gate | Result |
+|---|---|
+| `git apply --check` + apply, fresh `git clone --local` of 5dfe352 (`hd3`) | clean (11 paths) |
+| herdr-draw `bun test` there | **316 pass, 0 fail** |
+| Plenary protocol, p2-land (HEAD 1db625c; protocol unchanged since 5d55112) | **128 pass, 0 fail** |
+| Plenary main, `--path-ignore-patterns 'test/web/adapters/transport-ws*'` | **627 pass, 78 skip, 0 fail** (705 tests) |
+| Protocol copy | 7 files byte-identical to `5d55112:packages/protocol/` |
+| herdr-draw untouched | see the end |
+
+Since the re-check, only `cli/bridge.js` (`stamp`, `refusedAt`, `attempts`, `looked` not recorded while a key is
+held) and one line of `cli/plenary.js` (`stamp` = `ino:mtimeMs:size`) changed: a 102-line diff, which I read in full.
+
+## In-process (`hd3/test/probe-f.test.js`, new: the builder's own rig, which bumps a stamp on every save)
+
+Setup: grid 10; the user's 20 is refused; a peer sets 30. "Lag" means the refusal arrives before the peer's entry
+(gate `"writeback"`); "same batch" means they arrive together (the gate opens at once). The user's saves come after
+the refusal's line. "END" is after the entry.
+
+| Probe | The user | Before the entry | END lines (after the refusal's) | Verdict |
+|---|---|---|---|---|
+| F1 (V5 seen, lag) | 40, pass, 20 | 20 held | file 30, **1** | fixed, loud |
+| F2 (V5 fast, lag) | 40, 20, no pass between | 20 held (stamp) | 30, **1** | fixed, loud |
+| F3 (back and forth ×3, lag) | 40,20,40,20,40,20, a pass after each | held | 30, 1 | loud |
+| F3b (back and forth, fast, lag) | 40,20,40,20, then one pass | held | 30, 1 | loud |
+| F3c (lag) | write-back fails, then 40, 20 | held | 30, 1 | loud |
+| F4 (restart inside the window) | 40, pass, 20, restart | | 30, 1 | loud |
+| F4b (restart) | 40, 20 unseen, restart | | 30, 1 | loud |
+| F4c (restart) | nobody saved (file 20), restart | | 30, 1 | loud (the refused 20 is said again) |
+| F6 (normal path, same batch) | nothing | | 30; the refusal's line **only** | one line |
+| F7 (normal path, lag) | nothing | | 30; the refusal's line only | one line |
+| F8 (lag) | an agent saves a shape (grid untouched) | held | 30, 1 (the documented "fresh attempt" behaviour); shape on the board | loud |
+| F5s (same batch) | 40, pass, 20 | | 40 said; then 20 on the current file **sent**, board 20 | correct |
+| **F5 (same batch)** | **40, 20, no pass between** | | **file 30, 0** | **silent** |
+| **F5n (same batch)** | **saves 20 again (a new save, same bytes)** | | **30, 0** | **silent by the "fresh attempt" rule; the doc calls it "no change"** |
+
+My earlier probes, rerun on the final cut (`probe-r`, `probe-v`; their rig has no stamp), all pass:
+- **V1–V4, V7–V10:** held, then 1 line.
+- **V5:** 40 held, 20 held, END 1 line.
+- **V6:** quiet (not a change).
+- **V11:** sent.
+- **P11:** 1 line.
+- **R1:** quiet.
+- **Large layers:** as before.
+- **P5:** sent.
+- **M1/P9:** unchanged false alarm.
+- 31 pass.
+
+**F5 cause (read, corrected with codex):**
+- In the same batch, `retryReady` opens the gate in the same `receive()` as the refusal, so the next pass never sees
+  `"writeback"`, and the stamp and `attempts` logic (`cli/bridge.js` ~241) doesn't run.
+- The file the user ends on (20, the marker unchanged) is byte for byte what the bridge last read or wrote, so
+  `looked` matches. The marker's op is in `refusedOps`, so `unsent` is false, and the key is skipped at ~251
+  (`if (looked && !unsent) continue`). `pull()` then writes 30.
+- Without `looked`, the "untouched old copy" quiet path (~262) would skip it too: the marker's value matches, and the
+  refused op never landed, so it is not "mine".
+- `looked` compares content only, never the stamp.
+
+**Reach:**
+- **Normal path:** a single node always sends the entry with the refusal.
+- **Window:** from the refusal's line to the pass, which runs 20 ms after the message (`cli/plenary.js`).
+- **Save already in flight:** a save that landed after the bridge's last read but before the refusal is also covered
+  by the line, since the line comes after it and names 20 as dropped. So "after the line" means within ~20 ms: an
+  automated writer (an agent, a pane's undo/redo burst), not a person reacting to the line.
+
+**Fix direction (untested, for the record):** keep the refused file's stamp per key even when the gate opens in the same
+batch. Then treat a key whose file has a newer stamp and still holds a dropped value as a fresh attempt: skip
+neither at `looked` nor at the quiet path.
+
+## Live (`live/probe/stale2.sh`, my copy; a running watcher saves the instant the refusal's line appears)
+
+| Timing | Mode | Result |
+|---|---|---|
+| lag (op 400 ms, entry 900 ms), GAP 0.15 s | 40+i then the dropped 20 | **8/8 loud** (2 lines: the refusal, then "changed on a copy older"); was 8/8 silent on `ed615d64` |
+| lag, GAP 0.35 s | the same | **8/8 loud**; was 8/8 silent |
+| same batch (entry lag 0), GAP 0.005 s | the same | **8/8 silent**: file and board 30, only the refusal's line (F5 live) |
+| same batch | 40+i only | 6/6 loud (2 lines) |
+
+FINAL_LIVE_PLACEHOLDER
+
+## Not verified
+
+- A real v1.1 server, a real Herdr pane, Linux, `wss://`, node as the runner.
+
+## sdd ensemble on the final hunks (`final-hunks.diff`)
+
+My prompt named the same-batch case as a place to hunt, so codex's agreement is not independent.
+
+| Harness | Result |
+|---|---|
+| codex (high) | **HIGH: same-batch refusal, 40 then back to 20 overwritten silently** = F5 (confirmed in-process and live; its line ~251 is right, see the cause). **LOW:** a key in `attempts` can linger when its value equals the board's (`same(v, shown[k])` skips before `attempts.delete`), so a later untouched old copy of that key gets an extra line. That is loud, not a loss. Confirmed by reading; not probed |
+| grok | "CLEAN". It misses F5 (third round in a row that grok has missed the confirmed case) |
+| agy | out of quota (429; not retried) |

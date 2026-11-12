@@ -700,3 +700,361 @@ fails the second.
 are in-process tested.
 
 **Doc:** `drawh-server.md` counts updated; one sentence each on invalid values and on the first change after a start.
+
+## Round 4 (v1.1) (2026-11-11, brief pd-drawh4: protocol v1.1)
+
+**Status: done. Code, in-process tests, gates and live reruns pass; herdr-draw's `CLAUDE.md` in the patch updated (second session, 2026-11-12, see "Second session" at the end).** The design section was written before coding; "As built" below corrects it.
+
+### Design (APPLIER, `distributed-systems-design` v0.1.0)
+
+- **Scope (from the brief, no new assumptions):** one bridge, one file, one board; a handful of local writers on the
+  file (drawh commands, a pane, the bridge) and any number of peers on the board. Scale is trivial (a few saves a
+  second); correctness of settings under races is the whole job. No estimate changes anything here.
+- **Shape: two hops, each with its own compare-and-set.**
+  - **Bridge → room:** v1.1's `appBase`, stamped by the Replica (the caller's is ignored). It covers entries the
+    room has that the bridge hasn't applied yet. `stale-setting` = first write wins (Ch15's rule; the line is the
+    "conflicted copy" the user sees).
+  - **File → bridge:** the Replica stamps the base of *its* copy at `local()` time, so a stale save handed to
+    `local()` goes out on the current base and the room accepts it (R1 again). So the file must carry the base it
+    was built on. Per-key version = the room's `appSeq` (one sequencer per board: a scalar per key suffices, no
+    vector clock, Ch6).
+- **What the marker becomes.** Round 3's generation id, its 64-entry table and `snap`/`sent`/`last` go. In their
+  place a per-key base marker written with every bridge write: `appState.herdr.plenaryBase = { room, keys: { k:
+  [base, hash] } }`, where `base` is the Replica's base for k at the write, `hash` a short hash of the value
+  written, `room` a lineage id (new whenever the bridge starts over on another room). Never sent (excluded from
+  ops). No marker, or another lineage: the file's base is the one recorded when the file was last found in step
+  unmarked (`written`), else 0.
+- **The rule, per key k whose file value f differs from the board's shown value:**
+  1. **Nothing changed by anyone else since the file's base** (every entry on k after the base is this bridge's
+     own, or there is none): send f via `local()`. The room's check covers what the bridge hasn't applied.
+  2. **Someone else changed k since the base, and f is the value the file was written with** (hash matches): an
+     old copy of the file, untouched. The board wins, written back, **no line** (R1 stays quiet).
+  3. **Otherwise** (someone else changed k since, and f is a change made on that old copy, or the base can't be
+     told): the board wins, written back, **one line**. Case V lands here: loud, never silent.
+- **`stale-setting`:** soft. The board's value is written to the file with one line naming the key(s) (and any held
+  changes dropped with it). The key is gated: no `local()` for it until `did.retryReady` names it; meanwhile a new
+  file change to it is neither sent nor overwritten, then judged afresh by the rule.
+- **Epoch:** `welcome.room` read by the bridge before the Replica. Missing room = unknown epoch, not an error (tip
+  check still runs). Another board, or a writer welcome with an epoch lower than the highest seen (persisted
+  across restarts): another room, the round-2 rule (one warning, a fresh Replica, start over from its copy).
+- **Elements:** `local(…, { keepVersions: true })`; renumber/hold-back decided against `roomVersion()` plus my
+  pending ops (the room's speculative copy), not the shown copy.
+
+### Failure note (what each does now)
+
+| Failure | What happens |
+|---|---|
+| **Lost refusal** (the `stale-setting` never arrives: connection drops) | The op stays pending in the Replica and is resent on the next connection with the same id and base; the room answers it again (ack if it had landed, else `stale-setting` again). Nothing is lost or doubled; the line comes on the answer that arrives. |
+| **Resync mid-change** (`stale`, a refused element op, a reconnect) | The file keeps its marker; the Replica keeps `seen`/`floor` across the reset, so a change judged after the resync gets the base the user saw. The bridge judges only when caught up. |
+| **Epoch change** | Higher, `seq` not behind: a normal rebuild, nothing to do. Higher with `seq` behind (Store lost entries) or lower than seen, or another board: another room: fresh Replica, new lineage (old markers read as unmarked, so the board's settings win, seeding only unset keys). |
+| **Restart** | State file keeps applied, tip, appSeq, epoch, lineage and the bridge's earlier client ids. Entries on a key after the saved `appSeq` by an earlier client id count as the bridge's own; entries before it are unknown, so a file base older than the saved one falls under rule 3 (loud), never silent. |
+
+### As built (corrects the design above where they differ)
+
+- **The quiet path needs a third condition:** an untouched old copy is quiet only if this bridge sent nothing on the
+  key since that copy's base. Without it, case V (change, peer change, undo on the old copy) was silent again
+  (found by its test).
+- **`looked`:** the file's settings and marker exactly as the bridge last read or wrote them. Such a file is the
+  board's news not yet written (push() runs before pull()): not judged. Without it, the bridge's own sent change
+  followed by a peer's read as a change on an old copy (found by the R2b test). Not recorded on a pass that holds a
+  change behind a gate (else that change was overwritten silently once the gate opened: found by its test).
+- **Stamp write after a settings send:** after sending a file-side settings change the bridge writes the file once,
+  with a fresh marker. Without it, copies of a file the bridge never rewrote can't be told apart, and the R1 test
+  failed. A disk that refuses that write costs the marker only (sync() does not throw for it).
+- **Op-named markers:** a key whose value is my op still in flight is marked with that op's id; resolved to its seq
+  once it lands (kept in the state file, so it survives a restart). A marker naming an op that neither landed, is in
+  flight, nor was refused out loud (lost to a restart, a `stale`, a dropped connection) is an unsent change: it never
+  takes a quiet path (the advisor's finding 1; test).
+- **Unmarked files:** the implied marker is taken once per key (the oldest). With `looked` and the stamp write this
+  is equivalent to keeping the newest (its mutation survives; reasoning in the mutation table).
+- **Runner:** sends only what `outgoing()` returns, after every message and pass and on a `wait()` timer.
+  `closed()` spends a decided reconnect, and `flush()` asks for one only while a socket is open (the advisor's
+  finding 2: a pass between close and open could abort the new socket).
+- **Elements:** `keepVersions`; renumber and hold-back judged against `roomVersion()` or my own pending op's version
+  (the room's speculative copy), not the shown copy. Op size in UTF-8 bytes (`MAX_OP_BYTES`). Settings never ride
+  with elements (the Replica splits), so `settingsAlone`/`attach` are gone.
+- **Another room** (a wrong board, a lower epoch, a seq behind): a fresh Replica and a new lineage (a reset one keeps
+  bases and gates from the old room). Messages after a reconnect is decided are ignored (found by the room-identity
+  test: the wrong board's catch-up was applied into the fresh copy).
+
+### How much of round 3's marker is still needed (the brief's question), with evidence
+
+- **Needed: the base the file was built on.** Test "v1.1 evidence: …": a Replica caught up on a peer's change, handed
+  the stale value, sends it on the current base and the v1.1 room accepts it. So without the file's base, R1 returns.
+- **Needed: the value it was written with (a hash),** only to keep an untouched old copy quiet (R1 runs were 80 lines
+  a minute under option 2).
+- **Dropped:** the generation id, the 64-entry table, `snap`/`sent`/`last` and the rule order of 3b. "Was the key
+  changed by anyone else since this base" (the room's appSeq history by author) replaces all of them; the room's
+  compare-and-set covers what the bridge hasn't applied.
+
+### Changed files (herdr-draw, in the patch)
+
+`protocol/*` (re-copied from p2-land 5d55112, 7 files; SOURCE.json), `cli/bridge.js` (rewritten settings, epoch,
+v1.1 sending), `cli/plenary.js` (`react()`: pace timer, reconnect), `test/plenary.test.js`, `mods/herdr-draw/` (built).
+
+### Tests (`test/plenary.test.js`: 46; herdr-draw total 304)
+
+Replaced the 4 option-2 settings tests; added: evidence (Replica stamp), R1 + marker never sent, R2a/R2b, R3 (case J,
+3 and 5 toggles), case V (+ codex's variant), `stale-setting` (said, written back, retry), a shut gate (change held,
+then judged), seeding/newcomer, invalid values, restart (marker, earlier client ids), room identity (no `room`,
+another board, lower epoch), an op lost with a restart, reconnect not aborted (two), unwritable disk (two).
+Existing tests adapted: hello has `v: 1`; the rig plays gateway (`meta` from `tableAuth`); peers send `outgoing()`;
+a fast injected clock (pacing); `room.compact()` → `checkpoint()`.
+
+**Mutation check** (each rule broken on purpose, `../mut.py` in my scratchpad):
+
+| Rule broken | Tests failing |
+|---|---|
+| lost op's change takes the quiet path | 1 |
+| `closed()` keeps a decided reconnect | 2 |
+| no socket guard in `flush()` + the above | 1 |
+| stamp-only write throws | 1 |
+| no `looked` | 1 (the unwritable-disk test) |
+| deferred pass recorded as looked | 1 |
+| messages applied after reconnect decided | 1 |
+| quiet despite own sends since base (case V) | 1 |
+| op-named marker not resolved | 3 |
+| no stamp after a settings send | 3 |
+| gate ignored | 1 |
+| lower epoch accepted | 1 |
+| `keepVersions` off | 5 |
+| unmarked base overwritten instead of kept | **0**: equivalent under `looked` + stamp (an old copy matching the newer record is the current file byte for byte) |
+
+### Gates
+
+- `git apply --check` and apply on a fresh clone of 5dfe352 (`hdv7`): clean; tree identical to the working clone.
+  herdr-draw `bun test` there: **304 pass, 0 fail**. Built mod current (`diff -r build/herdr-draw mods/herdr-draw`).
+- **Patch:** 6,289 lines, sha256 `9b50663e57c8aed1…`, header names 5dfe352 and protocol 5d55112. (Superseded by the second session's re-cut: 6,301 lines, `0cbf6109…`.)
+- **Plenary, p2-land worktree:** `bun test test/*.test.js` (protocol): **128 pass, 0 fail**. Full `bun test` there
+  fails in server tests only, while another session has `server/` and `test/server/` modified, uncommitted
+  (gateway, room-host, stores). Failing (first 16 named): `an unreachable Google never prints the client id` (two),
+  `H1: an annotator rewriting one note…`, `H1: a tail bigger than any one frame…`, `H1 (round 3)` ×3, `H1: sockets
+  that never read…`, `H1: non-readers spread over several accounts…`, `a joiner that waits too long for room…`,
+  `a cap on connections per user…`, `M1: one writer's burst…/health…`, `a writer active during catch-up…`,
+  `trickle readers…`, `a reader getting through its catch-up…`, `joiners parked across folds…`. None import drawh
+  code; I touched nothing in plenary but these docs.
+- **herdr-draw untouched:** status empty, HEAD 5dfe352, no stash, one worktree.
+
+### Not verified
+
+- ~~Live scripts not rerun~~: rerun in the second session (below), on a changed stand-in.
+- **A real v1.1 server**, inside Herdr, Linux, `wss://`: as before.
+- **Not seen by a verifier or an sdd ensemble.**
+
+### Risks
+
+- The settings rule is new and only in-process tested; rounds 2 to 3b each failed verification on a case like these.
+- Limits listed in drawh-server.md ("Settings, what can still go wrong").
+- ~~herdr-draw's `CLAUDE.md` inside the patch still describes option 2 and protocol v0~~: fixed in the second session.
+
+### Housekeeping
+
+- Scratch: `/private/tmp/claude-501/-Users-r-repos-plenary/fe5a16fd-b5d6-49a5-aa8d-fbe99e4936d4/scratchpad/` (`hd`
+  working clone, `hdv6`/`hdv7` gate clones, `mut.py`). No processes or servers left running; none started outside
+  bun's test runner (its stand-ins bind port 0 and stop themselves).
+
+### Second session (2026-11-12, from docs/m2/handoff/pd-drawh4.md)
+
+**herdr-draw `CLAUDE.md` (in the patch).** The drawh --server notes now describe v1.1: settings both ways (the
+`plenaryBase` marker, the three-way rule, `stale-setting` + `retryReady`, the stamp write, `--once` exit 2), room
+recognition by `welcome.room` first, then the tip check on every reconnect (the only check without `room`), seeding judged against `roomVersion()` with
+`keepVersions`, the state file's new fields (checked against `Bridge.state()`/restore), "tested against the v1.1
+reference Room". No code changed.
+
+**Gates, re-cut patch.** (Superseded by the Round 4 fix's cut, below.) 6,301 lines, sha256 `0cbf6109011b43b22534a8ceef38767d8584db9d764f897ef149e3d2a152762b`,
+header unchanged (5dfe352, protocol 5d55112). (Cut twice this session; the numbers below are for the final cut, gate
+clone `hdv9`, tree `baa19f2f…`; the live runs used `hdv8`, the first cut, which differs only in that `CLAUDE.md` line.)
+- Fresh `git clone --local` of herdr-draw at 5dfe352 (`hdv9`, my scratchpad; `hdv8` for the first cut, same results): `git apply --check` and apply clean;
+  tree identical to the working clone's. `bun install --frozen-lockfile` (the clone has no
+  `node_modules`; without it 14 suites fail to import `playwright-core`), then `bun test`: **304 pass, 0 fail**.
+- Plenary protocol tests in the p2-land worktree: **128 pass, 0 fail**. Its HEAD has moved to 1db625c, but
+  `git diff 5d55112 HEAD -- packages/protocol PROTOCOL.md` is empty, so the copy is still current.
+- herdr-draw untouched: status empty, HEAD 5dfe352, no stash, one worktree.
+
+**Live reruns.** The verifier's scripts, **copied and changed** (originals untouched), in
+`/private/tmp/claude-501/-Users-r-repos-plenary/cb9f64e3-d9af-4116-8ca1-078d0a0041bb/scratchpad/live/`, run on `hdv8`
+(the applied patch), bun as runner, macOS APFS. Changes:
+- `standin.js` (from r5/probe): `new Room` without `auth`; the stand-in plays gateway and passes
+  `tableAuth(TABLE).check(token, board)` as the hello's `meta`; the peer's changes go through `local()` +
+  `outgoing()` (with a fast clock so the Replica's pace never holds them). Everything else as before.
+- `env.sh`: paths to my scratchpad. `vlive2.sh`: `cd rs` → `cd rv2` (it ran in a folder left from an earlier round;
+  absent here). `measure.sh` (r4) and `undo.sh` (a269c857 live/) unchanged.
+- **New, mine:** `measure_s.sh` + `m-swap/race_s.py`: `measure.sh`'s rows q1 and q4 with the writer also changing
+  `grid` on every save, so the stamp write after a settings send races the writer (plain `measure.sh` writes shapes
+  only and never triggers it).
+
+| Script | What | Result |
+|---|---|---|
+| vlive2.sh | case V live: 20 on an old copy, peer 30, undo to 10 on the same old copy; then 10 on the current file | 20 sent (board 20); peer 30; undo **refused, 1 line**, board and file 30; 10 on the current file sent (board 10), no further line |
+| undo.sh | hide;show back to back ×20; hide, 1.2 s, show ×10 | room ends shown **20/20**, 0 lines; hide reached the room **10/10** |
+| toggle.sh | own toggles 2-5, 0/0.3/1 s apart (56 runs) | board wrong **0** times, 0 lines |
+| toggle.sh, last part | an agent's save that read the file before the user's hide lands after it | board and file back to shown, 0 lines: **the documented limit** ("an agent's save that read the file before your settings change … undoes your change", drawh-server.md), graded MEDIUM by the verifier in re-check 3 ("the own-undo limit is as it was", pd-drawhv.md); unchanged, not a regression. Silent, so it is the one case here that is neither sent nor refused loudly |
+| toggle2.sh | 3 toggles 0.1/0.15/0.2 s apart ×15, 5 toggles 0.15 s ×10 | wrong **0/55**, 0 lines |
+| toggle3.sh | R3: hide, show, hide 0.1 s apart ×50 | wrong **0/50**, 0 lines |
+| settings.sh | R1: real drawh adds (~135 ms each) while a peer changes grid every 1.5 s | busy 60 s: 317 saves, 36 peer changes, **undone 0, lines 0**; calm 90 s: 42 saves, 54 changes, **undone 0, lines 0** (option 2 gave 80 lines a minute) |
+| measure.sh (m-swap) | H1 table, same rows as round 2 | **LOST 0** on every row (ctl, q1-q4, growing board to 3,750 shapes); file-only 0; peer missing 0; no leftover temp files. Same verdict as r4's table; throughput on the 5 ms/5 ms row was lower (429 saves and 1,487 peer entries vs 491 and 1,771), **not investigated** (machine load or v1.1 pacing) |
+| measure_s.sh (new) | q1/q4 with a settings change on every save | 172 and 175 saves, **LOST 0**, file-only 0, final grid in file = board = last written (182, 185), **0 lines** |
+
+Stand-ins on port 0, each killed by the PID it wrote; bridges by their `$!`. Afterwards no `standin.js` or
+`drawh --server` process left (`ps`).
+
+**Still not verified:** a real v1.1 server (`welcome.room` from real servers after p2-swap), a real Herdr pane as
+the writer, Linux, `wss://`, node as runner live. `measure_s.sh` checks the final grid only, not that every
+intermediate value reached the board (each was built on the current file, so rule 1 sends it; not counted). Not seen
+by a verifier or an ensemble. Engram: recalled (matches this report), nothing written.
+
+
+## Round 4 fix (2026-11-12, from t187 after pd-drawh4v)
+
+**Status: H1, H2, M2 and the re-check's V5 fixed; M1 not fixed (reason below). Gates pass; live settings reruns on
+the final cut below. Not committed; the V5 fix is not re-verified.** Two passes: the first fix (patch `ed615d64…`,
+re-checked by pd-drawh4v, "# Round 4 re-check": FAIL on V5), then the V5 fix and the held-write fix (final patch
+below). The manager's hard stop: if the next re-check finds another silent case in this refusal window, the
+remaining narrow cases are accepted as documented limits.
+
+### What changed (`cli/bridge.js`, `cli/plenary.js`, `test/plenary.test.js`, herdr-draw `CLAUDE.md`, built mod)
+
+- **H1 (a newer value overwritten silently after `stale-setting`).** The refusal now records, per key, the canonical
+  value(s) it dropped (the op's value and any held change: `refusedVals`, cleared when `retryReady` opens the gate).
+  While a key's gate is `"writeback"`, `settingsFrom()` no longer skips it blindly. A file value that is one of
+  the dropped ones is still written back by `pull()`, under the refusal's line. **Any other value was saved after
+  the line**: it is held exactly like a `"wait"` key (deferred, so `pull()` leaves it and the marker keeps its old
+  base), and it is judged when the gate opens by the normal rule. A value made without the peer's change gets the
+  "changed on a copy older" line. This also covers a failed write-back and a half-written file, since the gate stays
+  `"writeback"` until a write succeeds and the check runs on every pass.
+  - **Limit:** setting the very value the line just named, on a file that still shows it, is no change and is
+    written back. That is the same bytes the line already reported.
+- **Found while checking the H1 fix (in-process probe, then fixed): a held change was still overwritten unsaid** when
+  the pass holding it also wrote the file (another key sent, so the stamp write; or a save landing during the write)
+  and `retryReady` came before another pass. The after-write path recorded `looked` while a key was held, so the next
+  pass took the file as "already looked at" and `pull()` wrote the board's value over the held one. This affected
+  round 4's `"wait"` hold too, not only the new one. Fix: after a write, `looked` is not recorded while a key is
+  deferred (the same guard the no-write path had). Three tests (hold in `"writeback"`, in `"wait"`, and the 40
+  landing during the write) gave the final file 30 with only the refusal's line before the fix; now there is one
+  "changed on a copy older" line for the 40.
+- **V5 (the re-check: 20 refused, the user saves 40, then goes back to 20, before the peer's entry; the 20 was
+  overwritten silently, live 8/8 in two timings, codex agreed).** The dropped values now count as "the file still
+  shows it" only on the very save the refusal came to, and only until another value is seen:
+  - **(a) Forget on a newer value.** Once a pass holds a non-dropped value for the key under `"writeback"`, the key's
+    dropped values are forgotten, so any later value is held too. This covers the timing where the bridge saw the 40
+    (verifier's GAP 0.35 s).
+  - **(b) The file's stamp.** The runner (`cli/plenary.js`) passes `stamp()` = `inode:mtimeMs:size` of the board
+    file (every writer replaces it by rename, so each save has a new inode). The bridge records the stamp on each
+    read and after each of its writes, and keeps the one current when the refusal came. A dropped value in a file
+    with another stamp was saved again since: held. This covers 20 → 40 → 20 between two of the runner's 250 ms
+    looks (GAP 0.15 s). The bridge stays pure: `stamp` is injected like `read`/`write`, and defaults to null
+    (unknown, so only (a) applies).
+  - **(c) No quiet path for a fresh attempt.** A held fresh attempt's marker names the refused value, so without
+    this, judging it would take the "untouched old copy" path and write the board's value back silently (found by
+    the V5 test). A key held this way is judged with the quiet path off: one "changed on a copy older" line.
+  - **Behaviour change:** a save after the refusal that doesn't touch the key (an agent's shape) also has a new stamp,
+    so the dropped value it still carries is held and said again (2 lines in all). That is loud, not lost; the
+    manager's rule ("a save on a newer copy … that carries a dropped value is a fresh attempt: hold and say it").
+  - **Left as a limit:** a runner that can't stat the file (then 20 → 40 → 20 inside one look is taken as the refused
+    file and written back under the refusal's line), and a writer that rewrites in place with the same size inside
+    one mtime tick. The verifier's V6 (write-back fails, nobody saves, the file still holds 20) stays quiet: not a
+    change.
+- **H2 (32-bit hash on the quiet path).** The marker now stores the value's canonical JSON itself (`printOf = canon`),
+  compared exactly, with no hash, so no collision is possible. This keeps `cli/bridge.js` free of I/O and of
+  `node:crypto`. Cost: the marker repeats each setting's value (settings are small; `layers` is the largest).
+  Markers written by the round-4 patch hold hashes, so they no longer match: such a file's changes on an old copy are
+  said (loud), never quiet. The state file's `unmarked` entries hold values too (old ones read as hashes: loud, the
+  same way).
+- **M2 (the refusal's line doesn't name what it drops).** Contained, so done. The line ends with "(dropped from this
+  file: grid 20, grid 41)", listing each dropped value (truncated at 80 characters).
+- **M1 (a snapshot answer to the tip check counts as another room even when `welcome.room` vouches): not fixed.
+  It isn't a contained fix:**
+  - **Epoch is not unique per store.** `welcome.room` is `{ board, epoch }`, and the epoch is counted per store. A
+    wiped or replaced server starts again at epoch 1. (Read from `MemoryLog.openEpoch()` and the ports comment "1 on
+    the first call", not from a real Store.) Reach: it needs a wiped store whose seq has already passed the bridge's
+    `applied`, or the welcome's "seq behind" rule catches it first. So "same board,
+    same epoch" can't tell the original room from a new one, and a snapshot carries no entry id to compare.
+  - **The wrong guess is the dangerous one.** Trusting it would merge the file into a different board's history
+    (`seen` versions, settings bases) with no line. Today's rule is loud: a false alarm, plus a refused offline
+    change.
+  - **What would fix it:** a room-instance id that a new store can't repeat, for example a random nonce in
+    `welcome.room` or in the snapshot. That is a protocol change, outside this round.
+  - **Unchanged:** the verifier's P9 still prints the false "another room" line and refuses the offline grid 50. Now
+    listed as a limit in drawh-server.md.
+
+### Tests (`test/plenary.test.js`: 58; herdr-draw total 316)
+
+New:
+- **H1 ×2:** the verifier's sequence (refusal line printed with the dropped value, newer 40 saved before the
+  write-back; plain, and with the write-back failing once). Each checks that 40 is held, not sent and not
+  overwritten, and that once the peer's entry arrives it is judged with one line: 2 grid lines in all.
+- **H1, normal path:** the refused value itself written back, then the board's value. One line in all.
+- **H2:** codex's colliding pair (timeline 562789 to 779192 on an old copy after a peer's 1000): said once. The
+  untouched old copy stays quiet.
+
+- **V5 ×4:** back to the dropped value after a newer one: "seen" (a pass between, as live GAP 0.35), "seen, no stamp",
+  "fast" (both between two passes, as live GAP 0.15: only the stamp tells), each held and then said once; "fast, no
+  stamp" pins the documented limit (written back). **V5 control:** the write-back fails once and nobody saves: the
+  dropped 20 is written back under the refusal's one line.
+- The H1 "write-back fails once" test no longer saves a shape before the failing write (that save would now count as
+  a fresh attempt, by design): the write-back fails with nobody saving.
+- **A held change survives a write made while it waits ×3** (`"writeback"`, `"wait"`, a save landing during the
+  write): judged with one line when the gate opens.
+
+Mutation check: H1's skip restored gives 2 failing; "always skip" gives 2; "never skip" gives 3; the FNV hash
+restored gives 1; `looked` recorded after a write despite a held key gives 3; V5: no forgetting on a newer value
+gives 1 ("seen, no stamp"), the stamp ignored gives 1 ("fast"), a fresh attempt allowed the quiet path gives 2.
+
+**The verifier's in-process probes** (`probe-r.test.js`, V0 to V11 and M1, copied unchanged, run on the final cut
+`hdv12`; its rig has no stamp): V1 to V4 held then 1 line; **V5: 40 held, then 20 held (gate `"writeback"`, file 20),
+END 1 line**; V6 quiet (not a change); V7 to V10 1 line; V11 20 sent; M1 unchanged (false "another room"). 17 pass.
+Earlier, `probe-v.test.js` on the first fix:
+
+| Probe | Before | After |
+|---|---|---|
+| P6 | file 40, 0 lines | 40 held, then 1 line |
+| P8 | file 40, 0 lines | 40 held, then 1 line |
+| P4b | file 40, 0 lines | 40 held, then 1 line |
+| P11 | 0 lines | 1 line |
+| P1 to P5, P7 | unchanged | P5 control still sent quietly |
+| P9 (M1) | false alarm | unchanged |
+| E (epoch) | as before | as before |
+
+### Gates
+
+- **Patch (final):** `docs/m2/proposals/drawh-server.patch`, 6,481 lines, sha256
+  `f4f9b05a2d3ec81ed6189cf161e539972b81ed37747a5c1815b69831ef4d44e6`, header unchanged (5dfe352, protocol 5d55112).
+  (First fix: 6,377 lines, `ed615d64…`, the one pd-drawh4v re-checked.)
+- **Fresh clone:** `git clone --local` of 5dfe352 (`hdv12`): apply --check and apply clean, tree `ef7725c0…`
+  identical to the working clone's. `bun test`: **316 pass, 0 fail**.
+- **Plenary:** protocol tests in p2-land (HEAD 1db625c, protocol unchanged since 5d55112): **128 pass, 0 fail**. Main
+  tree (6d6b5f2) `bun test --path-ignore-patterns 'test/web/adapters/transport-ws*'`: **627 pass, 78 skip, 0 fail**
+  (705 tests, 35 files).
+- **herdr-draw untouched:** status empty, HEAD 5dfe352, no stash, one worktree.
+
+### Live reruns (settings scripts, on `hdv10`, bun, macOS APFS)
+
+These are the same copies as the second session, with the verifier's stand-in (its `lag` control added) and its new
+`stale.sh`, both copied unchanged. Folder:
+`/private/tmp/claude-501/-Users-r-repos-plenary/cb9f64e3-d9af-4116-8ca1-078d0a0041bb/scratchpad/live/`
+(`fix-results.txt`).
+
+| Script | Result |
+|---|---|
+| stale.sh (H1 live, 12 trials) | the newer value is never silent. 9 trials: 2 lines (the refusal, then "changed on a copy older" for the newer value). 3 trials (newer value 0 to 50 ms after the peer's): 1 line, which names it, e.g. "dropped from this file: grid 20, grid 41" (it reached the Replica before the refusal and was held, then dropped with the op). Board and file 30 in all; no op with the newer value sent. The verifier's run had 8 one-line trials naming nothing new |
+| vlive2.sh (case V) | as before: undo refused, 1 line; set on the current file sent |
+| undo.sh | 20/20, 10/10, 0 lines |
+| toggle.sh / toggle2.sh / toggle3.sh | 0 wrong of 56 / 55 / 50, 0 lines; the agent's-stale-save limit unchanged (silent, MEDIUM, documented) |
+| settings.sh (R1) | busy: 339 saves, 36 peer changes; calm: 42, 54. **Undone 0, lines 0** |
+| measure_s.sh | q1/q4 with a setting change on every save: LOST 0, final grid matches, 0 lines |
+
+Stand-ins and bridges were stopped by their recorded PIDs, and none of mine are left running. One `standin.js` is
+running from the verifier's scratchpad (`a17ae338…`, PID 20801). It is not mine, so I left it.
+
+### Docs
+
+- **drawh-server.md:** the `stale-setting` bullet (names the dropped values; a later value is held and judged); the
+  limit "a second change made in the same instant goes with it" replaced by the real rule; the limits heading no
+  longer says "not re-verified yet" without context (L3).
+- **herdr-draw CLAUDE.md:** marker = the value's canonical JSON; the dropped-values line and the hold.
+
+### Not verified / risks
+
+- Not re-verified by a verifier or an ensemble. A real v1.1 server, a real pane, Linux, `wss://`.
+- M1 stays a false alarm after a restart that meets a checkpointed room.
+- Markers now grow with `layers` (no measurement of file size; a few hundred bytes for a typical board).

@@ -1,6 +1,6 @@
 # Proposal: `drawh --server` (herdr-draw talks to Plenary)
 
-2026-11-11, revised after three rounds of verification; settings scope cut (option 2) after re-check 3b. **Decision needed: apply `drawh-server.patch` to herdr-draw, or
+2026-11-12, round 4: moved onto protocol v1.1 (settings compare-and-set); file-side settings are back. Verified with findings by pd-drawh4v; the round 4 fix (H1, H2, M2) is applied, not yet re-verified. **Decision needed: apply `drawh-server.patch` to herdr-draw, or
 not.** Nothing is applied; herdr-draw is untouched (still at 5dfe352, clean).
 
 ## What it does
@@ -11,7 +11,7 @@ board with no network code of its own.
 
 | | |
 |---|---|
-| **File → board** | Elements the file has newer (by `version`) go out as protocol ops, through a protocol `Replica`. Layers, grid, snap and timeline do **not** go out from the file once the board has them: they are changed on the board (below). A board that has none takes the file's. |
+| **File → board** | Elements the file has newer (by `version`) go out as protocol ops, through a protocol `Replica`, with the file's own versions (`keepVersions`). Layers, grid, snap and timeline changed in the file go out too, judged by the base the file was built on, and the room's compare-and-set settles the rest (below). |
 | **Board → file** | Entries from the room are merged into the file (newer version wins), other fields of the file kept. |
 | **Sign-in** | The token is sent in the first message (`hello`) only. No header, never in the URL (a URL carrying one is refused), never printed, never on disk. From `--token` or `PLENARY_TOKEN`. |
 | **Catching up** | `since` comes from a small state file (`~/.cache/herdr-draw/plenary/<hash>.json`): the next run asks only for what is new, and sends edits made while it was stopped. |
@@ -19,11 +19,11 @@ board with no network code of its own.
 | **`--once`** | Catch up, send, wait for the acks, exit. Exit 0: file and board agree. Exit 2: they agree except for changes that could not be sent (refused, or a read-only role). Exit 1: anything else. |
 | **Without `--server`** | drawh runs the same code as today. `--server` is the switch only before a command word and before `--`; after either it is ordinary text. |
 
-## What is in the patch (23 files, +2868 −3, against herdr-draw 5dfe352)
+## What is in the patch (against herdr-draw 5dfe352)
 
 | Path | What |
 |---|---|
-| `protocol/` + `SOURCE.json` | plenary's `packages/protocol`, byte for byte, at plenary b78f6ec (unchanged in plenary since), sha256 per file. Beside `core/`, because its files import `../core/doc.js`. |
+| `protocol/` + `SOURCE.json` | plenary's `packages/protocol`, byte for byte, at plenary 5d55112 (p2-land, protocol v1.1), sha256 per file. Beside `core/`, because its files import `../core/doc.js`. |
 | `cli/bridge.js` | the deciding (no I/O): diff file against replica, send, merge back, saved state, checks on what the server sends |
 | `cli/files.js` | replaces the board file without losing someone else's save (below) |
 | `cli/plenary.js` | the runner: socket, reconnect with a growing delay, deadlines, exit codes. Node 22+ or bun |
@@ -79,28 +79,34 @@ four rows twice and the last three three times.
 - **Assumes** every writer replaces the file by rename. drawh, the pane's `writeTextFile` ("replaced atomically") and
   its big-file path (`mv`) do. A tool that writes the board in place could still lose a save.
 
-## Board settings: set on the board, not from the file (option 2, the scope cut)
+## Board settings: changed from the file again, on protocol v1.1 (round 4)
 
-Layers, grid, snap and timeline have no version numbers in protocol v0, so the bridge can't tell a stale save (a drawh
-command that read the file before someone else's change and saved after it) from a real change made in the file.
-Three rounds of trying (a time window, then a generation marker) each failed verification on a case where one or the
-other was lost silently. So, decided 2026-11-11 by the platform manager:
+v1.1 makes settings compare-and-set: each settings op names, per key, the `appSeq` it was based on, and the room
+refuses a stale one (`stale-setting`, soft). The Replica stamps that base from **its** copy, so the bridge must still
+know which copy of the file a save was built on: otherwise a stale save would go out on the current base and be
+accepted (a test shows it). So the file carries a small marker, and there are two checks, one per hop.
 
-- **While connected, settings flow board → file only.** A value in the file that differs from the board's, for a key
-  the board has, is never sent. The board's value is written back to the file, with one line each time: "board
-  settings are set on the board, not from this file: grid in this file differs from the board's (a change made here,
-  or an older copy of the file saved over it) and is put back to the board's value; to change it, use the board (the
-  web app)". A value the room would refuse (grid 2000, a layer without `locked`) gets the same line, marked "not a
-  valid value". `--once` exits 2 when that happened (a change in the file that did not reach the board).
-- **Exception, seeding:** a key the board has never set is sent from the file (once), so a new board takes the
-  file's layers, grid and so on.
-- **A peer's change arriving is not a change made here:** the bridge remembers what it last wrote into the file (or
-  found there in step with the board), so a file that simply hasn't been given the board's new value yet prints
-  nothing, from the first change after a start on.
-- **R1 holds by construction:** a stale save can't undo anyone's settings change, because nothing from the file is
-  sent once the board has the key (live: 0 of 36 and 0 of 54 undone).
-- **Comes back with protocol v1.1:** its settings compare-and-set (each op names the `appSeq` it was based on; the
-  room refuses a stale key) lets the room tell the two apart. Then file-side settings can be sent again (round 4).
+- **The marker.** Every bridge write puts `appState.herdr.plenaryBase` in the file: per key, the base the file's value
+  stands on (and, while the bridge's own op for it is in flight, that op's id). It is never sent. A file the bridge
+  never wrote is judged by the bases it had when the bridge first found it in step.
+- **File → bridge, per key whose value differs from the board's:**
+  - nobody else changed the key since the file's base: **sent** (a deliberate revert, a quick toggle, your own undo);
+  - someone else did, and the file still holds the value it was written with, and the bridge sent nothing on the key
+    since: an old copy of the file, untouched (an agent's save that read it before). **The board's value is written
+    back, quietly** (R1);
+  - anything else (a change made on an old copy, or one whose op was lost): **the board's value is written back, with
+    one line** ("… was changed on a copy older than the board's value …; to change it, set it again"). Setting it
+    again on the current file is sent.
+- **Bridge → room:** the room's check covers what the bridge hasn't applied yet. `stale-setting` is soft: the board's
+  value is written back with one line naming the key and the value(s) dropped, and that key waits for the Replica's
+  `retryReady` before a new change to it is judged. A change made meanwhile (even before the write-back has landed:
+  any value other than the dropped ones) stays in the file, unsent and not overwritten, and is judged when the gate
+  opens, out loud if it was made without the peer's value.
+- **After sending a settings change** the bridge writes the file once (a fresh marker), so the next copy can be told
+  from the old one. A disk that refuses the write costs the marker, not the change.
+- **`--once`** exits 2 when a settings change did not reach the board (refused, or kept back with a line).
+- **Seeding** falls out of the same rule: a key the board has never set has no one else's change since base 0, so the
+  file's value is sent.
 
 ## Decided: which shapes are renumbered, and to what
 
@@ -141,9 +147,8 @@ reference `Room` and run the real `drawh --server` against it.
 ## What is NOT tested
 
 - **A real Plenary server.** None exists. Only the reference `Room`.
-- **Protocol v1.** The copied code is v0 (as `packages/protocol` is today); PROTOCOL.md is already v1. The hello has no
-  `v: 1`, and resends don't wait for `welcome`. After phase 2 lands: re-copy `protocol/`, update SOURCE.json, adjust
-  `cli/bridge.js` where the Replica's API changed.
+- **A real v1.1 server.** The copy is p2-land 5d55112 (protocol v1.1); tests run against its reference `Room`. Real
+  servers send `welcome.room` only after engine's p2-swap; until then the bridge's tip check is the room check.
 - **Inside Herdr.** Nothing here runs in Herdr's QuickJS runtime, and Herdr's own WebSocket is not used: the socket
   lives in node or bun, started by drawh. A pane that connects by itself is a later, separate change.
 - **A real pane beside a running bridge**, and `herdr-app check` on the built mod with its new folders (`cli/`,
@@ -173,10 +178,11 @@ reference `Room` and run the real `drawh --server` against it.
     file and is held back from then on (warning, exit 2).
   - **So:** send an old board for the first time with no pane open on the file. Ordinary shapes are not affected:
     their versions are never lowered, and a pane's remembered copy loses to a later edit as it should (tested).
-- **Recognising the room.** Protocol v0 gives a room no name. The bridge asks for the last entry it applied and
-  compares op id and author; another server or a reset one is noticed, said, and the board is taken again from its
-  copy (the file's own shapes are then sent to it). **For the engine track:** v1's `welcome` should carry a room
-  identity; this check is a stand-in.
+- **Recognising the room.** v1.1's `welcome.room` is read first: another board, or a writer's welcome with an epoch
+  lower than one seen (kept across restarts), is another room: said once, a fresh copy, nothing from a wrong board
+  is applied. The old check (the last entry applied, by op id and author) still runs on every reconnect, and is
+  the only one when a welcome has no `room` (servers before p2-swap). A snapshot in answer to that check (the room checkpointed past it) still counts as another
+  room: the file's shapes are sent again and its settings markers are dropped.
 - **A wiped or different server behind the same URL gets the whole file sent again**, with one warning line.
 - **A hand-edited invalid setting nobody has set yet is dropped quietly.** If the file holds a value the protocol
   would refuse (say `snap: "yes"`) for a setting the board has never set, it is not sent and nothing is printed; when a
@@ -185,13 +191,30 @@ reference `Room` and run the real `drawh --server` against it.
 - **Board stream only.** Notes, comments and presence are not shown or sent.
 - **Pictures:** image elements travel, their bytes don't (the protocol refuses `files`; the blob port isn't built).
 - **Joining a board that already has layers:** the board's settings win over the file's.
-- **Board settings are changed on the board (the web app), not in the file**, until protocol v1.1's compare-and-set
-  (round 4) brings file-side settings back. A change made in the file (`drawh layer --hide`, the pane's layer panel,
-  grid, snap) is put back to the board's value with a line; only a key the board has never set is taken from the file.
-- **The line is noisy while an agent draws and someone changes settings on the board:** each drawh save built before
-  that change carries the old value, which is indistinguishable from a real change, so each one is put back and said
-  (live: 80 lines in 60 s with a peer changing the grid every 1.5 s and drawh adding shapes back to back; 4 in 90 s at
-  one shape every 2 s). Nothing is lost; the board's value always wins.
+- **Settings, what can still go wrong (round 4, final check by pd-drawh4v; the cases below are accepted limits):**
+  - **An agent's save that read the file before your settings change and lands after it undoes your change** on the
+    board too (it already had in the file): your change and that save both stand on the same base. (Round 3's limit.)
+  - **`layers` is one key:** a change to one layer made on an old copy loses to anyone's change to any layer since.
+  - **On a disk that refuses writes,** an old copy set to exactly the value now in the file is that file byte for
+    byte and is taken as it (quietly); any other change made on an old copy is said.
+  - **After a `stale-setting`,** a value the refusal's line named is written back only while the file is the very save
+    the refusal came to (same inode, mtime and size) and nothing else was seen in it for that key since. Any other
+    value, or the dropped one saved again (20, then 40, then back to 20), is held and judged when the key's gate opens,
+    and said. Narrow cases stay: a writer that rewrites the file in place
+    (no rename) with the same size inside one mtime tick, and a runner that can't stat the file at all (then only "a
+    newer value was seen" counts, so 20 → 40 → 20 between two of its 250 ms looks is taken as the refused file). A save that doesn't touch
+    the key (an agent's shape) also counts as a new save: its dropped value is said again (loud, not lost).
+  - **A same-batch refusal (the usual case on one node), about 20 ms wide:** a new value saved and then the dropped
+    one saved again, both between the refusal's line and the bridge's next pass, is written back with no further line
+    (only the refusal's line, which named that value). Only an automated writer or a save already on its way can land
+    in that window (pd-drawh4v F5, accepted under the manager's hard stop).
+  - **A restart that meets a checkpointed room** (the server answers the bridge's tip check with a snapshot) is
+    taken as another room, even when `welcome.room` names the same board and epoch: a false "this is not the board
+    …" line, and a settings change made in the file while the bridge was stopped is refused (loudly). Epochs restart
+    at 1 on a new store, so they can't tell a wiped server from the same one; fixing this needs a room id a new
+    store can't repeat (a protocol change).
+  - **Lines:** an untouched old copy is quiet now (round 4 vs 80 lines a minute under option 2), but a change made on
+    an old copy is said each time.
 - **A change the room refuses stays in the local file**, with a warning that names the element, and is tried again
   only by a new run. An op holding several shapes is taken apart first, so one bad shape doesn't hold back the rest.
 - **The token and the process list.** The running bridge has the token in its environment for as long as it runs

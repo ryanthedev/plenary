@@ -20,7 +20,7 @@ const json = (status, body) => new Response(JSON.stringify(body), { status, head
 export function createServer({ auth, registry, store, bus, blobs = null, log = quietLogger, port = 0, hostname = "127.0.0.1", http, limits, host = {} }) {
   const started = Date.now();
   const rooms = roomHost({ store, bus, log, ...host });
-  const gw = makeGateway({ auth, registry, bus, rooms, log, limits });
+  const gw = makeGateway({ auth, registry, store, bus, rooms, log, limits });
 
   const server = Bun.serve({
     port, hostname,

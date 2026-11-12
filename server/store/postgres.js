@@ -6,6 +6,10 @@
 //   lastSeq(tenant, board)                      the board's last seq (0 = empty)
 //   putCheckpoint(tenant, board, cp)            kept by cp.seq; the newest few per board are kept
 //   getCheckpoint(tenant, board, beforeSeq?)    the highest seq (below beforeSeq, if given), never the last write
+//   openEpoch(tenant, board), epoch(tenant, board)   the board's epoch in its lease record (pl_leases)
+//
+// Least privilege: start-up creates only missing tables (migrate(), to_regclass first), so the server may run as a
+// role that reads and writes the tables without owning the schema.
 //
 // Durable = the write's transaction commits with `SET LOCAL synchronous_commit = on` (the WAL record is flushed on
 // this server before COMMIT returns; synchronous standbys, if any are configured, also confirm). It is set per
@@ -47,6 +51,28 @@ export async function ensureSchema(tx, schema) {
 }
 
 /**
+ * The Store's DDL, creating only what is missing (§ Store, Least privilege). Each table is looked up first
+ * (to_regclass): Postgres checks CREATE privilege before IF NOT EXISTS, so a role that may read and write the tables
+ * but not own the schema starts fine against a migrated schema, and only an owner role ever runs a CREATE.
+ * Call inside a transaction, after the advisory lock (postgresStore does). An operator may run it as the owner
+ * role ahead of time (`plenary migrate` is phase 4's).
+ */
+export async function migrate(tx, schema) {
+  const s = needSchema(schema);
+  await ensureSchema(tx, s);
+  const tables = {
+    pl_entries: "tenant TEXT NOT NULL, board TEXT NOT NULL, seq BIGINT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq)",
+    pl_checkpoints: "tenant TEXT NOT NULL, board TEXT NOT NULL, seq BIGINT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq)",
+    // The board's lease record: its epoch now (§ Recovery, Room identity); phase 4 adds the holder and expiry.
+    pl_leases: "tenant TEXT NOT NULL, board TEXT NOT NULL, epoch BIGINT NOT NULL, PRIMARY KEY (tenant, board)",
+  };
+  for (const [name, cols] of Object.entries(tables)) {
+    const [{ r }] = await tx.unsafe("SELECT to_regclass($1) AS r", [`"${s}".${name}`]);
+    if (r === null) await tx.unsafe(`CREATE TABLE "${s}".${name} (${cols})`);
+  }
+}
+
+/**
  * @param {{ url?: string, sql?: import("bun").SQL, max?: number, schema?: string, keepCheckpoints?: number }} o
  * @returns {Promise<{ append: Function, read: Function, lastSeq: Function, putCheckpoint: Function,
  *   getCheckpoint: Function, settings(): Promise<object>, close(): Promise<void> }>}
@@ -57,18 +83,12 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
   const owned = !sql;
   const db = sql ?? new SQL(max ? { url, max } : url);
   let open = true;
-  const E = `"${s}".pl_entries`, C = `"${s}".pl_checkpoints`;
+  const E = `"${s}".pl_entries`, C = `"${s}".pl_checkpoints`, L = `"${s}".pl_leases`;
 
   try {
     await db.begin(async tx => {
       await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-schema:${s}`]);
-      await ensureSchema(tx, s);
-      await tx.unsafe(`CREATE TABLE IF NOT EXISTS ${E} (
-        tenant TEXT NOT NULL, board TEXT NOT NULL, seq BIGINT NOT NULL, data TEXT NOT NULL,
-        PRIMARY KEY (tenant, board, seq))`);
-      await tx.unsafe(`CREATE TABLE IF NOT EXISTS ${C} (
-        tenant TEXT NOT NULL, board TEXT NOT NULL, seq BIGINT NOT NULL, data TEXT NOT NULL,
-        PRIMARY KEY (tenant, board, seq))`);
+      await migrate(tx, s);
     });
   } catch (err) { if (owned) await db.close(); throw err; }
 
@@ -168,6 +188,21 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
       const rows = await db.unsafe(`SELECT data FROM ${C} WHERE tenant = $1 AND board = $2 AND seq < $3
         ORDER BY seq DESC LIMIT 1`, [tenant, board, beforeSeq ?? Number.MAX_SAFE_INTEGER]);
       return rows.length ? JSON.parse(rows[0].data) : null;
+    },
+
+    /** A room is being built: the board's next epoch (1 on the first call), committed durably before it resolves. */
+    async openEpoch(tenant, board) {
+      ready(tenant, board);
+      const rows = await write(tx => tx.unsafe(`INSERT INTO ${L} (tenant, board, epoch) VALUES ($1, $2, 1)
+        ON CONFLICT (tenant, board) DO UPDATE SET epoch = ${L}.epoch + 1 RETURNING epoch`, [tenant, board]));
+      return Number(rows[0].epoch);
+    },
+
+    /** The board's latest epoch; 0 = no room was ever built. */
+    async epoch(tenant, board) {
+      ready(tenant, board);
+      const rows = await db.unsafe(`SELECT epoch FROM ${L} WHERE tenant = $1 AND board = $2`, [tenant, board]);
+      return rows.length ? Number(rows[0].epoch) : 0;
     },
 
     /** What a write transaction runs with, read back from Postgres (for /health and tests). */

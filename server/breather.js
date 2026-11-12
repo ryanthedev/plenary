@@ -4,7 +4,8 @@
 // units of work, wherever the work is; it returns at once unless the process has gone `sliceMs` without yielding,
 // and then waits one turn of the event loop (setImmediate), which lets sockets, timers and HTTP run.
 // One slice clock for the whole process: ten boards busy at once still yield every `sliceMs`, not ten times that.
-// SEAM(p2): § Pacing and group commit bound a burst properly; this only turns a freeze into latency.
+// A writer's burst is bounded by § Pacing (the gateway's per-connection op bucket) and group commit; this still keeps
+// a long rebuild or a feed's Store repair from holding the loop (it turns a freeze into latency, nothing more).
 
 /** @param {{ sliceMs?: number, now?: () => number }} [o] */
 export function createBreather({ sliceMs = 8, now = () => performance.now() } = {}) {

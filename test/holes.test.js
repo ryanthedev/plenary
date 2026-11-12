@@ -1,16 +1,14 @@
 // Holes the convergence gate can't see, because its ops all come from long-lived replicas and touch().
 import { test, expect } from "bun:test";
-import { world } from "./world.js";
-import { Replica } from "../packages/protocol/replica.js";
+import { world, errors } from "./world.js";
 import { makeElement, touch, clone } from "../packages/core/model.js";
 
-const errors = c => c.inbox.filter(m => m.t === "error");
 
 test("a reloaded client reusing its name doesn't collide with its old op ids", () => {
   const w = world(["editor", "viewer"], 21);
   const c = w.clients[0];
   w.send(c, "board", { elements: [makeElement("rectangle", { id: "first" })] }); w.settle();
-  c.r = new Replica({ client: "c0" });                 // the page reloads: same name, counter back at 0
+  c.r = w.replica("c0");                           // the page reloads: same name, counter back at 0
   w.drop(c); w.connect(c); w.settle();
   w.send(c, "board", { elements: [makeElement("rectangle", { id: "second" })] }); w.settle();
   expect(w.room.streams.board.get("second")).toBeTruthy();
@@ -22,7 +20,7 @@ test("one user can't send ops under another client's id", () => {
   w.settle();
   const [a, b] = w.clients;
   const m = w.send(a, "board", { elements: [makeElement("rectangle")] }); w.settle();
-  w.room.receive(b.conn, { ...m, op: { elements: [makeElement("rectangle", { id: "spoof" })] } });
+  w.raw(b, { t: "op", id: m.id, stream: "board", op: { elements: [makeElement("rectangle", { id: "spoof" })] } });
   expect(errors(b).at(-1).code).toBe("bad-op");
   expect(w.room.streams.board.get("spoof")).toBe(null);
 });
@@ -31,7 +29,7 @@ test("elements without a versionNonce are refused (ties need one)", () => {
   const w = world(["editor"], 23);
   w.settle();
   const c = w.clients[0], el = makeElement("rectangle"); delete el.versionNonce;
-  w.room.receive(c.conn, { t: "op", id: `${c.r.client}:99`, stream: "board", op: { elements: [el] } });
+  w.raw(c, { t: "op", id: `${c.r.client}:99`, stream: "board", op: { elements: [el] } });
   expect(errors(c).at(-1).code).toBe("bad-op");
 });
 
@@ -49,12 +47,17 @@ test("a refused op is undone on the sender: it re-syncs to the room's state", ()
   expect(ann.r.state()).toEqual(ed.r.state());
 });
 
-test("hello for another board, or a token from another tenant, is refused; entries carry board and tenant", () => {
+test("hello for another board is refused; the role comes from the gateway, never the client; entries carry board and tenant", () => {
   const w = world(["editor"], 25);
   const c = w.clients[0];
-  w.room.receive(c.conn, { t: "hello", token: "tok0", board: "other", since: 0, client: c.r.client });
+  c.outbox = [];
+  w.raw(c, { t: "hello", v: 1, token: "tok0", board: "other", since: 0, client: c.r.client });
   expect(errors(c).at(-1).code).toBe("auth");
-  w.settle();
+  const loose = w.room.connect(m => c.inbox.push(m));          // a hello with no verified identity, claiming a role
+  w.room.receive(loose, { t: "hello", v: 1, board: "b1", since: 0, client: "x", user: "u0", role: "owner" });
+  expect(errors(c).at(-1).code).toBe("auth");
+  expect(loose.user).toBe(null);
+  w.drop(c); w.connect(c); w.settle();
   w.send(c, "board", { elements: [makeElement("rectangle")] }); w.settle();
   expect(w.log.entries[0]).toMatchObject({ board: "b1", tenant: "t1", by: "u0" });
 });
@@ -65,7 +68,7 @@ test("no one can lock an element with a huge version", () => {
   const [a, b] = w.clients, el = makeElement("rectangle", { id: "lockme" });
   w.send(a, "board", { elements: [el] }); w.settle();
   const evil = clone(w.room.streams.board.get("lockme")); evil.version = Number.MAX_SAFE_INTEGER;
-  w.room.receive(b.conn, { t: "op", id: `${b.r.client}:1`, stream: "board", op: { elements: [evil] } });
+  w.raw(b, { t: "op", id: `${b.r.client}:1`, stream: "board", op: { elements: [evil] } });
   expect(errors(b).at(-1).code).toBe("bad-op");
   const ok = touch(clone(w.room.streams.board.get("lockme"))); ok.x = 5;
   w.send(a, "board", { elements: [ok] }); w.settle();
@@ -90,9 +93,12 @@ test("board settings are checked: unknown keys and bad values are refused", () =
   const w = world(["editor"], 28);
   w.settle();
   const c = w.clients[0];
+  let n = 0;
   for (const appState of [{ evil: 1 }, { grid: -5 }, { grid: "20" }, { layers: [] }, { layers: [{ id: "x" }] }, { snap: "yes" }, { timeline: { duration: Infinity } }]) {
-    w.room.receive(c.conn, { t: "op", id: `${c.r.client}:${JSON.stringify(appState)}`, stream: "board", op: { appState } });
+    const appBase = Object.fromEntries(Object.keys(appState).map(k => [k, 0]));   // a well-formed base: the value is what's refused
+    w.raw(c, { t: "op", id: `${c.r.client}:${++n}`, stream: "board", op: { appState, appBase } });
     expect([appState, errors(c).at(-1).code]).toEqual([appState, "bad-op"]);
+    expect(w.log.entries.length).toBe(0);
   }
   w.send(c, "board", { appState: { grid: 20, snap: false, layers: [{ id: "base", name: "Layer 1", visible: true, locked: false, opacity: 100 }] } }); w.settle();
   expect(w.room.streams.board.appState.herdr.grid).toBe(20);
@@ -102,9 +108,10 @@ test("prototype keys in settings are refused, and don't crash the room", () => {
   const w = world(["editor"], 29);
   w.settle();
   const c = w.clients[0];
+  let n = 0;
   for (const raw of ['{"__proto__":{"grid":1}}', '{"constructor":1}', '{"toString":1}']) {
-    const appState = JSON.parse(raw);
-    expect(() => w.room.receive(c.conn, { t: "op", id: `${c.r.client}:${raw}`, stream: "board", op: { appState } })).not.toThrow();
+    const appState = JSON.parse(raw), appBase = JSON.parse(raw.replace(/:\{"grid":1\}|:1/, ":0"));   // same keys, a well-formed base
+    expect(() => w.raw(c, { t: "op", id: `${c.r.client}:${++n}`, stream: "board", op: { appState, appBase } })).not.toThrow();
     expect(errors(c).at(-1).code).toBe("bad-op");
   }
   expect(Object.getPrototypeOf(w.room.streams.board.appState.herdr)).toBe(Object.prototype);

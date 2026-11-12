@@ -102,6 +102,37 @@ describe.skipIf(!url)("postgres store", () => {
     await drop(schema);
   });
 
+  test("least privilege: an owner migrates; a role with only USAGE and row grants then starts the store and writes, and can't create anything", async () => {
+    // Needs a DATABASE_URL role that may create roles (CI's and a local cluster's superuser can); skipped otherwise.
+    const [{ ok }] = await client().unsafe("SELECT rolsuper OR rolcreaterole AS ok FROM pg_roles WHERE rolname = current_user");
+    if (!ok) { console.warn("pg-store: skipping the least-privilege test (the DATABASE_URL role can't create roles)"); return; }
+    const schema = schemaName(), bare = schemaName(), role = `pl_test_app_${process.pid}_${++n}`, pass = "pl-test-" + Date.now().toString(36);
+    const owner = await postgresStore({ sql: client(), schema });                 // the owner migrates (creates the tables)
+    await owner.close();
+    await client().unsafe(`CREATE ROLE "${role}" LOGIN PASSWORD '${pass}'`);
+    await client().unsafe(`CREATE SCHEMA "${bare}"`);                            // made for the app, never migrated
+    for (const sch of [schema, bare]) await client().unsafe(`GRANT USAGE ON SCHEMA "${sch}" TO "${role}"`);
+    await client().unsafe(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO "${role}"`);
+    const u = new URL(url); u.username = role; u.password = pass;
+    const app = new SQL({ url: u.toString(), max: 2 });
+    try {
+      const store = await postgresStore({ sql: app, schema });                   // starts: every table exists, no CREATE runs
+      await store.append(T, B, [entry(1)], 0);
+      expect((await store.read(T, B, 1, 10)).map(e => e.seq)).toEqual([1]);
+      expect(await store.openEpoch(T, B)).toBe(1);
+      await store.putCheckpoint(T, B, { seq: 1, id: "c:1", by: "u1", at: 1 });
+      expect((await store.getCheckpoint(T, B))?.seq).toBe(1);
+      await store.close();
+      // The same role on a schema nobody migrated: refused (it may not CREATE), so the test above proves least privilege.
+      await expect(postgresStore({ sql: app, schema: bare })).rejects.toThrow(/permission denied/);
+      await expect(app.unsafe(`CREATE TABLE "${schema}".pl_extra (x INT)`)).rejects.toThrow(/permission denied/);
+    } finally {
+      await app.close();
+      await drop(schema); await drop(bare);
+      await client().unsafe(`DROP ROLE IF EXISTS "${role}"`);
+    }
+  });
+
   test("bad schema names and missing connection are refused", async () => {
     await expect(postgresStore({ sql: client(), schema: 'x"; DROP TABLE y; --' })).rejects.toThrow("bad schema name");
     await expect(postgresStore({ sql: client(), schema: "Upper" })).rejects.toThrow("bad schema name");

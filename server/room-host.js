@@ -1,257 +1,241 @@
-// The room host: runs one packages/protocol Room per open board and joins it to the Store and the Bus.
+// The room host: runs one packages/protocol Room (v1.1) per open board and joins it to the Store and the Bus.
+// Core code: it depends on the Store and Bus ports only (main.js picks the adapters).
 //
-// THE ONLY FILE THAT TOUCHES Room'S INTERNALS. Today's Room is v0 (sync auth.check, sync log.append, no rebuild,
-// no checkpoint). Everything here that bridges that to PROTOCOL.md v1 is marked SEAM(p2); when phase 2 lands
-// (Room.rebuild, applyEntry, checkpoint(), {user, role} in the hello context) those blocks are replaced, and the
-// gateway, Store, Bus and tests stay as they are.
-//
-// What the host guarantees, whatever the Room does inside:
-//   - One message at a time per board, in inbox order (rule 6).
-//   - Rule 1: nothing a message made the room say (ack, broadcast, catch-up) leaves before the entries that
-//     message logged are durable in the Store. If the append fails or times out, none of it leaves, ever: the
-//     room is thrown away, its connections get `unavailable` and are closed, and the next hello rebuilds it from
-//     the Store (§ Recovery, "Append failure or timeout").
-//   - Rule 8: the room gets {user, role} from the gateway. It never sees a token.
+// What it does around the Room (PROTOCOL.md § Recovery, § Bus, rule 6):
+//   - Build: Store.openEpoch first (welcomes nobody before it resolves), then the latest checkpoint that matches the
+//     log (stepping back past a bad one) and the log after it, into Room.rebuild. A failed room is thrown away and
+//     the next open builds a new one (a new epoch).
+//   - Log adapter: { append(entries, expectSeq), putCheckpoint(cp) } over the Store. The Room holds every ack,
+//     refusal and dedupe wait until the append resolves (group commit: one append in flight). When an append
+//     resolves, its entries are published on `.entries` (split under the bus cap) before the Room acks them.
+//   - Append timeout (4 s): the append's promise rejects, and the Room fails itself (nothing unresolved is acked).
+//   - Only `welcome`, `ack` and `error` go back to a gateway (`.gw.<gateway>`). The Room's own catch-up and live
+//     broadcasts are not sent: gateways serve catch-up from the Store and fan out from `.entries` (rules 3, 8).
+//   - Every `unavailable` the Room says ends that connection (a gap, an unknown connection, a stopped room): the
+//     gateway is told to close it, and the client reconnects and is welcomed afresh.
+//   - Timers: room.sweep() (gateway silence, by the room's clock) and the `{ seq, epoch }` heartbeat every 2 s.
 
 import { Room } from "../packages/protocol/room.js";
 import { jsonCodec } from "../packages/protocol/codec.js";
-import { subjects } from "./bus/memory.js";
+import { subjects, MAX_BUS_BYTES, utf8Length } from "./bus/port.js";
 import { quietLogger } from "./log.js";
 import { PortError } from "./ids.js";
 import { breathe } from "./breather.js";
 
+const REPLIES = new Set(["welcome", "ack", "error"]);
+// A hello's catch-up is the gateway's (rule 8): the Room is told the client is at the end of time, so it builds none.
+const NO_CATCH_UP = Number.MAX_SAFE_INTEGER;
+
 /**
- * @param {{ store: object, bus: object, log?: object, codec?: object, pageSize?: number, compactEvery?: number, appendTimeoutMs?: number }} o
+ * Split encoded entries into `.entries` messages under the bus cap, in seq order (§ Bus). One entry always goes,
+ * even alone over the cap (the bus then refuses it, and gateways repair from the Store).
+ * @param {{ seq: number }[]} entries @param {string[]} items their encoded text, same order
+ * @returns {{ from: number, to: number, items: string[] }[]}
  */
-export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, pageSize = 100, pageBytes = 4 * 1024 * 1024, compactEvery = 1000,
-  tailFoldBytes = 8 * 1024 * 1024, chunkBytes = 1024 * 1024, appendTimeoutMs = 5_000 }) {
-  // pageSize / pageBytes: one Store read during a rebuild holds at most this many entries and about this much text
-  //   (an entry may be 1,000,000 chars). SEAM(p2): with checkpoints a rebuild reads only the tail after one.
-  // compactEvery / tailFoldBytes: the kept tail is folded into the snapshot when it reaches this many entries OR
-  //   this much text, so a board's catch-up is its real state plus at most tailFoldBytes, however often one
-  //   element was rewritten. SEAM(p2): § Recovery checkpoints by entry count only; a byte trigger is a spec ask.
-  // chunkBytes: no `entries` frame of a catch-up is bigger than this (one entry bigger than it travels alone).
-  // appendTimeoutMs: § Recovery, "append 5 s".
-  /** @type {Map<string, Promise<object>>} key "tenant/board" → the slot, once rebuilt */
+export function splitEntries(entries, items, maxBytes) {
+  const out = [], room = maxBytes - 64;   // the envelope: {"from":…,"to":…,"items":[…]}
+  let cur = null, bytes = 0;
+  for (let i = 0; i < entries.length; i++) {
+    const n = utf8Length(JSON.stringify(items[i])) + 1;   // as a JSON string inside the array (escapes count)
+    if (cur && bytes + n > room) { out.push(cur); cur = null; }
+    if (!cur) { cur = { from: entries[i].seq, to: entries[i].seq, items: [] }; bytes = 0; }
+    cur.items.push(items[i]); cur.to = entries[i].seq; bytes += n;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/**
+ * @param {{ store: object, bus: object, log?: object, codec?: object, now?: () => number, appendTimeoutMs?: number,
+ *   sweepMs?: number, heartbeatMs?: number, pageSize?: number, pageBytes?: number, rules?: object, maxBusBytes?: number }} o
+ *   now: the rooms' clock (entries' `at`, the 30 s gateway silence). rules: per rules version { W, H, every } (tests).
+ */
+export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now = Date.now, appendTimeoutMs = 4_000, sweepMs = 1_000,
+  heartbeatMs = 2_000, pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rules, maxBusBytes = bus.maxBytes ?? MAX_BUS_BYTES, tailFoldBytes = 8 * 1024 * 1024 }) {
+  // tailFoldBytes: besides the Room's own rule (every 1,000 entries, once the log since the last checkpoint is half
+  //   its size), the host checkpoints once that log reaches this many chars AND half the state's size, so a board
+  //   rewritten in a few huge ops still gets a bounded catch-up, and a rewrite never costs more than 2× the log.
+  //   (An extension of § Recovery "When": a byte trigger, asked for since the scaffold; see the p2-swap report.)
+  /** @type {Map<string, Promise<object>>} key "tenant/board" → the slot, once built */
   const slots = new Map();
   let closed = false;
 
-  // SEAM(p2): Room.rebuild({ checkpoint, entries }). Until then: replay the whole log into a fresh v0 Room by hand,
-  // mirroring what Room.op does after log.append. No checkpoint is read or written (their contents are still moving).
-  function replay(room, e) {
-    room.seq = e.seq;
-    room.apply(e);
-    room.tail.push(e);
-    room.opSeq.set(`${e.by}|${e.id}`, e.seq);
-    if (e.stream === "notes") for (const el of e.op.elements ?? []) if (!room.noteAuthor.has(el.id)) room.noteAuthor.set(el.id, e.by);
+  const reply = (gateway, conn, data, close) => {
+    try { bus.publish(subjects.gateway(gateway), { conn, ...(data !== undefined ? { data } : {}), ...(close ? { close } : {}) })?.catch?.(() => {}); }
+    catch { /* a bad gateway id: nobody to tell */ }
+  };
+  const UNAVAILABLE = codec.encode({ t: "error", code: "unavailable", message: "the board is restarting: reconnect" });
+
+  /** Publish resolved entries on `.entries`, once, encoded once, split under the cap. Never throws. */
+  function publishEntries(slot, entries) {
+    try {
+      const items = entries.map(e => codec.encode(e));
+      for (const m of splitEntries(entries, items, maxBusBytes)) {
+        const p = bus.publish(subjects.entries(slot.tenant, slot.board), m);
+        // Refused (over the cap, a bus outage): gateways repair from the Store (heartbeat gap, 5 s silence poll).
+        p?.catch?.(err => log.error("entries publish refused; gateways repair from the Store", { tenant: slot.tenant, board: slot.board, from: m.from, to: m.to, err }));
+      }
+    } catch (err) { log.error("entries publish failed", { tenant: slot.tenant, board: slot.board, err }); }
+  }
+
+  function withTimeout(p) {
+    let timer;
+    const t = new Promise((_, rej) => { timer = setTimeout(() => rej(new PortError("timeout", "the store did not answer in time")), appendTimeoutMs); });
+    return Promise.race([p, t]).finally(() => clearTimeout(timer));
+  }
+
+  /** The Room's log: the Store, bound to one board. */
+  function logOf(slot) {
+    const { tenant, board } = slot;
+    return {
+      append(entries, expectSeq) {
+        return withTimeout(store.append(tenant, board, entries, expectSeq)).then(() => {
+          slot.durable = entries[entries.length - 1].seq; publishEntries(slot, entries);
+          setTimeout(() => foldIfDue(slot), 0);   // after the Room has moved these entries to resolved
+        });
+      },
+      putCheckpoint(cp) {
+        const p = store.putCheckpoint(tenant, board, cp);
+        slot.writes.add(p); p.finally(() => slot.writes.delete(p)).catch(() => {});
+        return p;
+      },
+    };
+  }
+
+  /** The byte trigger (tailFoldBytes, above). Only when nothing is unresolved, so the fold is of resolved state. */
+  function foldIfDue(slot) {
+    const room = slot.room;
+    if (slot.dead || room.stopped || room.inflight || room.queue.length || room.seq !== room.resolved) return;
+    if (room.tailChars < tailFoldBytes || room.tailChars * 2 < room.chars.board + room.chars.notes + room.records.chars) return;
+    try { room.checkpoint(); } catch (err) { log.error("checkpoint failed", { board: slot.board, err }); }
+  }
+
+  /** Read every entry from `from` to the log's end, in bounded pages. */
+  async function readFrom(tenant, board, from) {
+    const all = [];
+    for (let next = from; ;) {
+      const page = await store.read(tenant, board, next, pageSize, pageBytes);
+      if (!page.length) break;
+      for (const e of page) all.push(e);
+      next = page[page.length - 1].seq + 1;
+      await breathe();   // a long log must not hold the event loop for the whole rebuild
+    }
+    return all;
   }
 
   async function load(tenant, board, key) {
-    const slot = {
-      key, tenant, board, room: null, dead: false, unsub: () => {},
-      ctx: null,            // the verified {user, role, tenant} of the message being handled
-      batch: [],            // entries the room logged while handling it
-      out: [],              // what the room said while handling it: [{ gateway, conn, data, close? }]
-      durable: 0,           // the last seq known to be in the Store
-      conns: new Map(),     // "gateway/conn" → { gateway, conn, rc }
-      chain: Promise.resolve(),
-      tailBytes: 0,         // text size of the kept tail (what a since-0 joiner is sent after the snapshot)
-      snapOf: null, snapFrame: null,   // the encoded snapshot frame of room.base (one encode per base, not per joiner)
-      chunksOf: null, chunksLen: 0, chunks: [],   // the tail as bounded `entries` frames, per (base, tail length)
+    const slot = { key, tenant, board, room: null, epoch: 0, dead: false, unsub: () => {}, conns: new Map(), writes: new Set(), durable: 0 };
+    // § Recovery, Room identity: the epoch is opened (durably) before anything else, so two builds never share one.
+    slot.epoch = await store.openEpoch(tenant, board);
+    const report = (what, detail) => {
+      if (what === "stopped") { log.error("room stopped", { tenant, board, seq: detail?.seq, err: detail?.err }); fail(slot); }
+      else log.error(`room: ${what}`, { tenant, board, ...detail });
     };
-    // SEAM(p2): the Room takes {user, role} in the hello context instead of calling auth.check. Until then its
-    // "auth" hands back what the gateway already verified; the token was stripped before the hello got here.
-    // SEAM(p2): async Store + group commit. Until then the Room's sync log.append only collects; handle() awaits
-    // the real append before releasing anything (so the room's memory is briefly ahead of the Store, and is
-    // discarded if the append fails).
-    slot.room = new Room({ board, tenant, auth: { check: () => slot.ctx }, log: { append: e => { slot.batch.push(e); } } });
-
-    let next = 1;
-    for (;;) {
-      const page = await store.read(tenant, board, next, pageSize, pageBytes);
-      for (let i = 0; i < page.length; i++) {
-        const e = page[i];
-        // A gap or a repeated seq is corruption: refuse to start (§ Recovery, Rebuild).
-        if (!e || e.seq !== next || e.board !== board || e.tenant !== tenant) throw new PortError("corrupt-log", `log of ${board} breaks at seq ${next}`);
-        replay(slot.room, e); next++;
-        // Fold as the log is replayed, by the same rule as live, so a rebuilt room's tail is bounded too. Sizes
-        // come from the Store (`page.bytes`) when it gives them, so nothing is encoded just to be measured.
-        slot.tailBytes += page.bytes?.[i] ?? textOf(e).length;
-        foldIfDue(slot);
+    const opts = { board, tenant, log: logOf(slot), now, epoch: slot.epoch, report, ...(rules ? { rules } : {}) };
+    for (let before; ;) {
+      const cp = await store.getCheckpoint(tenant, board, before);
+      const entries = await readFrom(tenant, board, cp && cp.seq > 0 ? cp.seq : 1);
+      try { slot.room = Room.rebuild({ ...opts, checkpoint: cp, entries }); break; }
+      catch (err) {
+        if (err?.code !== "bad-checkpoint" || !cp) throw new PortError(err?.code ?? "corrupt-log", err?.message ?? String(err));
+        log.error("bad checkpoint: stepping back", { tenant, board, seq: cp.seq, message: err.message });
+        before = cp.seq;
       }
-      if (!page.length) break;   // an empty page is the end; a short one may just be the store's own cap
-      await breathe();           // a long log must not hold the event loop for the whole rebuild
     }
-    slot.durable = next - 1;
+    slot.durable = slot.room.resolved;
     if (closed) throw new PortError("closed", "the room host is closed");
     slot.unsub = bus.subscribe(subjects.inbox(tenant, board), m => {
-      slot.chain = slot.chain.then(() => handle(slot, m)).catch(err => { log.error("room host: handler failed", { tenant, board, err }); });
+      try { onInbox(slot, m); } catch (err) { log.error("room host: inbox handler failed", { tenant, board, err }); }
     });
-    log.info("room opened", { tenant, board, seq: slot.durable });
+    // Gateways learn the new epoch now (viewers' welcomes), not 2 s from now.
+    bus.publish(subjects.entries(tenant, board), slot.room.heartbeat())?.catch?.(() => {});
+    log.info("room opened", { tenant, board, seq: slot.durable, epoch: slot.epoch });
     return slot;
   }
 
-  // SEAM(p2): checkpoints. Until then the kept tail is folded in memory (Room.compact) so a late joiner gets a
-  // snapshot, not the whole log. Only between messages, when everything in memory is durable.
-  function foldIfDue(slot) {
-    if (slot.room.tail.length < compactEvery && slot.tailBytes < tailFoldBytes) return;
-    slot.room.compact(); slot.tailBytes = 0;
-  }
-
-  // SEAM(p4): § Bus also has the room publish a `{ seq }` heartbeat on `.entries` every 2 s, and a `.here` subject
-  // (who is on the board). Neither is sent: on the in-memory bus an entry can't be lost, and `here` is p2's.
-  // SEAM(p4): § Bus names the reply subject `plen.<tenant>.<board>.gw.<gateway>` (per board); here it is one subject
-  // per gateway (subjects.gateway), which a single node can't tell apart. § Bus also says catch-up and snapshots
-  // never travel on the bus (the gateway reads them from the Store); here they still do, in frames of at most
-  // chunkBytes, except the snapshot, which is one frame however large the board is.
-  const reply = (gateway, conn, msg, close) => bus.publish(subjects.gateway(gateway), { conn, data: codec.encode(msg), ...(close ? { close } : {}) });
-  const UNAVAILABLE = { t: "error", code: "unavailable", message: "the board is restarting: reconnect" };
-
-  /** Throw the room away. Nothing it said for the failed message is sent; everyone reconnects and it rebuilds. */
-  function fail(slot, why) {
+  /** Throw the room away: its connections are told `unavailable` and closed; the next open builds a new one. */
+  function fail(slot) {
     if (slot.dead) return;
     slot.dead = true; slot.unsub();
     if (slots.get(slot.key) === slot.promise) slots.delete(slot.key);
-    log.error("room stopped", { tenant: slot.tenant, board: slot.board, why, seq: slot.durable, conns: slot.conns.size });
-    for (const c of slot.conns.values()) reply(c.gateway, c.conn, UNAVAILABLE, 1013);
-    slot.conns.clear(); slot.batch = []; slot.out = [];
+    try { slot.room.fail(new PortError("stopped", "the room host stopped this room")); } catch { /* already stopped */ }
+    for (const c of slot.conns.values()) reply(c.gateway, c.id, UNAVAILABLE, 1013);
+    slot.conns.clear();
   }
 
-  // Encoding is the expensive part of fan-out and of catch-up, so each entry is turned into text exactly once,
-  // whoever it is sent to and however often: live broadcast, a late joiner's tail, the entries subject.
-  const entryText = new WeakMap();
-  const textOf = e => { let s = entryText.get(e); if (s === undefined) { s = codec.encode(e); entryText.set(e, s); } return s; };
-  // An `entries` frame built from the cached pieces (JSON codec only; another codec encodes the frame whole).
-  const entriesFrame = list => (codec === jsonCodec ? `{"t":"entries","entries":[${list.map(textOf).join(",")}]}` : codec.encode({ t: "entries", entries: list }));
-  // The UTF-8 size of shared catch-up text, measured once when the text is built: the gateway budgets sockets in
-  // bytes, and a snapshot can be hundreds of MB, so it is sent along (`bytes`) rather than measured per joiner.
-  const utf8Bytes = s => (typeof s === "string" ? Buffer.byteLength(s, "utf8") : s?.byteLength ?? 0);
-  const encode = msg => (msg.t === "entries" && Array.isArray(msg.entries) ? entriesFrame(msg.entries) : codec.encode(msg));
+  /** A Room connection whose replies go to its gateway; only welcome/ack/error travel (catch-up is the gateway's). */
+  function connect(slot, gateway, conn) {
+    const ck = `${gateway}/${conn}`;
+    const c = slot.room.connect(msg => {
+      if (!msg || !REPLIES.has(msg.t)) return;
+      const end = msg.t === "error" && msg.code === "unavailable";   // every unavailable ends the connection
+      reply(gateway, conn, codec.encode(msg), end ? 1013 : undefined);
+      if (end) { slot.conns.delete(ck); if (!c.closed) slot.room.disconnect(c); }
+    }, { gateway, id: conn });
+    slot.conns.set(ck, c);
+    return c;
+  }
 
-  // SEAM(p2): catch-up. Mirrors Room.hello's catch-up (room.js). The Room is asked for the welcome only (it is told
-  // the client is up to date) and the host adds these frames after it:
-  //   - the snapshot, encoded once per base (one frame: PROTOCOL.md has no chunked snapshot);
-  //   - the tail as `entries` frames of at most chunkBytes each, built once per (base, tail) from cached entry text
-  //     and shared by every joiner. The gateway paces them by the socket's backpressure.
-  function tailChunks(slot) {
-    const room = slot.room, tail = room.tail;
-    if (slot.chunksOf !== room.base) { slot.chunksOf = room.base; slot.chunks = []; slot.chunksLen = 0; }
-    if (slot.chunksLen === tail.length) return slot.chunks;
-    // The tail only grows (until the next fold), so chunks already full never change: only the open last one is
-    // rebuilt. Joiners queued an hour apart share every closed chunk; each can differ in at most the last.
-    const chunks = slot.chunks;
-    if (chunks.length && !chunks[chunks.length - 1].closed) chunks.pop();
-    let i = chunks.length ? chunks[chunks.length - 1].to - room.base.seq : 0, cur = [], bytes = 0;
-    const emit = closed => { const data = entriesFrame(cur); chunks.push({ from: cur[0].seq, to: cur[cur.length - 1].seq, closed, data, bytes: utf8Bytes(data), key: `${slot.key}/c${room.base.seq}.${cur[0].seq}-${cur[cur.length - 1].seq}` }); cur = []; bytes = 0; };
-    for (; i < tail.length; i++) {
-      const n = textOf(tail[i]).length;
-      if (cur.length && bytes + n > chunkBytes) emit(true);
-      cur.push(tail[i]); bytes += n;
+  /** One inbox message (§ Bus): hello/op `{ n, conn, gateway, user, name, role, client, msg }`, a close notice, or a list. */
+  function onInbox(slot, m) {
+    if (!m || typeof m.gateway !== "string") return;
+    const room = slot.room;
+    // Every 5 s, a gateway's open writer connections on this board: the rest are closed (a lost close notice).
+    if (Array.isArray(m.conns)) {
+      room.listed(m.gateway, m.conns);
+      for (const [ck, c] of slot.conns) if (c.closed) slot.conns.delete(ck);
+      return;
     }
-    if (cur.length) emit(bytes >= chunkBytes);
-    slot.chunksLen = tail.length;
-    return chunks;
-  }
-  function catchUp(slot, since) {
-    const room = slot.room, frames = [];
-    if (since < room.base.seq) {
-      if (slot.snapOf !== room.base) { slot.snapFrame = codec.encode({ t: "snapshot", seq: room.base.seq, ...room.base.snapshot }); slot.snapBytes = utf8Bytes(slot.snapFrame); slot.snapOf = room.base; }
-      frames.push({ data: slot.snapFrame, bytes: slot.snapBytes, shared: `${slot.key}/s${room.base.seq}` });
-      since = room.base.seq;
-    }
-    for (const ch of tailChunks(slot)) {
-      if (ch.to <= since) continue;
-      // A reconnecting client that starts inside a chunk gets that one cut to what it lacks (the tail is ascending
-      // and gapless from base.seq + 1, so entries sit at known indexes); every later chunk is the shared one.
-      // Only shared text carries a key; the cut chunk is this joiner's own (at most one chunk).
-      if (ch.from > since) frames.push({ data: ch.data, bytes: ch.bytes, shared: ch.key });
-      else frames.push({ data: entriesFrame(room.tail.slice(since - room.base.seq, ch.to - room.base.seq)), shared: false });
-    }
-    return frames;
-  }
-
-  function appendWithTimeout(slot, batch) {
-    let timer;
-    const timeout = new Promise((_, rej) => { timer = setTimeout(() => rej(new PortError("timeout", "the store did not answer in time")), appendTimeoutMs); });
-    return Promise.race([store.append(slot.tenant, slot.board, batch, slot.durable), timeout]).finally(() => clearTimeout(timer));
-  }
-
-  /** One inbox message (§ Bus): { n, conn, gateway, user, name, role, client, msg } or { n, conn, gateway, closed: true }. */
-  async function handle(slot, m) {
-    // One writer's burst is thousands of these in a row, each a synchronous fsync: let the rest of the process run.
-    await breathe();
-    if (!m || typeof m.conn !== "string" || typeof m.gateway !== "string") return;
+    if (typeof m.conn !== "string") return;
     const ck = `${m.gateway}/${m.conn}`;
     if (slot.dead) { if (!m.closed) reply(m.gateway, m.conn, UNAVAILABLE, 1013); return; }
     let c = slot.conns.get(ck);
-    // SEAM(p4): § Bus also has a list of each gateway's open connections every 5 s, which repairs a lost close
-    // notice. Not sent or read yet: on the in-memory bus a close notice can't be lost.
-    if (m.closed) { if (c) { slot.room.disconnect(c.rc); slot.conns.delete(ck); } return; }
+    if (m.closed) { if (c) { room.disconnect(c); slot.conns.delete(ck); } return; }
     const msg = m.msg;
     if (!msg || typeof msg !== "object") return;
-    if (!c) {
-      // Not a hello: a connection from before this room was rebuilt. It reconnects.
-      if (msg.t !== "hello") { reply(m.gateway, m.conn, UNAVAILABLE, 1013); return; }
-      c = { gateway: m.gateway, conn: m.conn, rc: null, n: 0 };
-      // Serialised now, not when it is sent: what the Room hands out may change before the append resolves.
-      c.rc = slot.room.connect(out => { slot.out.push({ gateway: c.gateway, conn: c.conn, data: encode(out) }); });
-      slot.conns.set(ck, c);
-    }
-    // Rule 6: messages are numbered per connection. A gap means the bus lost one (it is at-most-once), so later ops
-    // may depend on one the room never saw: the connection is closed and the client reconnects and resends.
-    // (Never happens on the in-memory bus; it is here for NATS.)
-    if (typeof m.n === "number") {
-      if (c.n && m.n !== c.n + 1) {
-        log.warn("inbox gap", { tenant: slot.tenant, board: slot.board, conn: c.conn, expected: c.n + 1, got: m.n });
-        slot.room.disconnect(c.rc); slot.conns.delete(ck);
-        reply(c.gateway, c.conn, UNAVAILABLE, 1013); return;
-      }
-      c.n = m.n;
-    }
-    const isHello = msg.t === "hello";
-    const since = isHello && Number.isSafeInteger(msg.since) && msg.since > 0 ? msg.since : 0;
-
-    slot.ctx = { user: m.user, role: m.role, tenant: slot.tenant }; slot.batch = []; slot.out = [];
-    // A hello: the Room sends only the welcome (it is told `since` = its own seq); catch-up is ours, below.
-    try { slot.room.receive(c.rc, isHello ? { ...msg, since: slot.room.seq } : msg); }
-    catch (err) {
+    if (!c && msg.t === "hello") c = connect(slot, m.gateway, m.conn);
+    // Not a hello and not known: a connection this room never welcomed (rule 6). The Room answers `unavailable`
+    // (with the op's id) to a connection it doesn't hold; the reply carries the close.
+    if (!c) c = { send: out => reply(m.gateway, m.conn, codec.encode(out), 1013), gateway: m.gateway, id: m.conn, closed: true };
+    // What "accepted something" looks like from outside: a new seq, or an op counted as unresolved (the Room counts
+    // it just before it applies the entry, so a throw mid-apply shows here even though seq hasn't moved).
+    const mark = () => { let n = room.seq; for (const w of room.unresolved.values()) n += w.n; return n; };
+    const isHello = msg.t === "hello", before = mark();
+    try {
+      room.receive(c, isHello ? { ...msg, since: NO_CATCH_UP } : msg, { n: m.n, user: m.user, role: m.role, name: m.name });
+    } catch (err) {
       log.error("room threw on a message", { tenant: slot.tenant, board: slot.board, kind: typeof msg.t === "string" ? msg.t.slice(0, 20) : null, err });
-      // It logged something and then threw: its memory may be half-applied. Nothing was appended; start over.
-      if (slot.batch.length) return fail(slot, "room threw after logging");
-      slot.out = [];
-      // A hello that blew up leaves no half-open connection: it is told to come back.
-      if (isHello) { slot.room.disconnect(c.rc); slot.conns.delete(ck); reply(c.gateway, c.conn, UNAVAILABLE, 1013); return; }
-      reply(c.gateway, c.conn, { t: "error", ...(typeof msg.id === "string" ? { id: msg.id.slice(0, 256) } : {}), code: "bad-op", message: "that message could not be handled" });
-      return;
-    } finally { slot.ctx = null; }
-    const batch = slot.batch, out = slot.out; slot.batch = []; slot.out = [];
-    // Accepted hello: the catch-up, from resolved state only (nothing is in flight between messages).
-    if (isHello && c.rc.user) for (const f of catchUp(slot, since)) out.push({ gateway: c.gateway, conn: c.conn, data: f.data, catchup: f.shared || undefined, bytes: f.shared ? f.bytes : undefined });
-
-    if (batch.length) {
-      try { await appendWithTimeout(slot, batch); }
-      catch (err) { log.error("append failed", { tenant: slot.tenant, board: slot.board, expectSeq: slot.durable, err }); return fail(slot, `append: ${err?.code ?? "error"}`); }
-      slot.durable = batch[batch.length - 1].seq;
-      for (const e of batch) slot.tailBytes += textOf(e).length;
-      // § Bus: the room publishes entries after the append resolves. SEAM(p4): gateways will fan out from this
-      // subject (and repair gaps from the Store); today each connection still gets them from the Room itself.
-      bus.publish(subjects.entries(slot.tenant, slot.board), { from: batch[0].seq, to: slot.durable, data: entriesFrame(batch) });
+      // It accepted something and then threw: its speculative state may be half-applied. Start over from the Store.
+      if (mark() !== before) return fail(slot);
+      // Nothing was accepted: only the sender hears. The message counts as received (rule 6), so the connection's
+      // next one is no gap. A hello that blew up leaves no half-open connection.
+      if (Number.isSafeInteger(m.n) && Number.isSafeInteger(c.n) && m.n > c.n) c.n = m.n;
+      if (isHello) { room.disconnect(c); slot.conns.delete(ck); return reply(m.gateway, m.conn, UNAVAILABLE, 1013); }
+      return reply(m.gateway, m.conn, codec.encode({ t: "error", ...(typeof msg.id === "string" ? { id: msg.id.slice(0, 256) } : {}), code: "bad-op", message: "that message could not be handled" }));
     }
-    // The gateway refused nothing, yet the Room refused the hello: don't leave a half-open connection.
-    const refusedHello = isHello && !c.rc.user;
-    if (refusedHello) { slot.room.disconnect(c.rc); slot.conns.delete(ck); }
-    for (let i = 0; i < out.length; i++) {
-      const o = out[i], last = refusedHello && i === out.length - 1;
-      // `catchup` names shared, encode-once catch-up text (a snapshot, a whole chunk): the gateway keeps only a
-      // reference to it per joiner, counts each name once, and pulls it into each socket as that socket drains.
-      bus.publish(subjects.gateway(o.gateway), { conn: o.conn, data: o.data, ...(o.catchup ? { catchup: o.catchup, bytes: o.bytes } : {}), ...(last ? { close: 1008 } : {}) });
-    }
-    foldIfDue(slot);
+    // A refused hello (version, board, client id): the Room dropped it; the gateway closes the socket after the error.
+    if (isHello && c.closed && slot.conns.get(ck) === c) { slot.conns.delete(ck); reply(m.gateway, m.conn, undefined, 1008); }
   }
+
+  const sweep = setInterval(() => {
+    for (const p of slots.values()) p.then(slot => {
+      if (slot.dead) return;
+      try { slot.room.sweep(); } catch (err) { log.error("room sweep failed", { board: slot.board, err }); }
+      for (const [ck, c] of slot.conns) if (c.closed) slot.conns.delete(ck);
+    }, () => {});
+  }, sweepMs);
+  sweep.unref?.();
+  // § Bus: the heartbeat repairs a lost last entry and tells gateways the epoch (for viewers' welcomes).
+  const beat = setInterval(() => {
+    for (const p of slots.values()) p.then(slot => {
+      if (!slot.dead) bus.publish(subjects.entries(slot.tenant, slot.board), slot.room.heartbeat())?.catch?.(() => {});
+    }, () => {});
+  }, heartbeatMs);
+  beat.unref?.();
 
   return {
     /**
-     * Make sure this board's room is running here (rebuilt from the Store) and listening on its inbox.
+     * Make sure this board's room is running here (built from the Store) and listening on its inbox.
      * SEAM(p4): placement. On one node the gateway calls this directly; in a cluster a lease decides which host opens a board.
      */
     async open(tenant, board) {
@@ -259,27 +243,39 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, pag
       const key = `${tenant}/${board}`;
       let p = slots.get(key);
       if (!p) {
-        p = load(tenant, board, key).then(slot => { slot.promise = p; return slot; });
+        p = load(tenant, board, key).then(slot => { slot.promise = p; if (slot.dead) slots.delete(key); return slot; });
         slots.set(key, p);
         p.catch(err => { if (slots.get(key) === p) slots.delete(key); log.error("room failed to open", { tenant, board, err }); });
       }
       await p;
     },
-    /** Resolves when every message already in the board's inbox has been handled (tests, clean shutdown). */
+    /** Resolves when the board's bus traffic is delivered and its room has nothing in flight (tests, shutdown). */
     async idle(tenant, board) {
-      const slot = await slots.get(`${tenant}/${board}`)?.catch(() => null);
-      if (!slot) return;
-      await bus.flush?.();
-      let seen;
-      do { seen = slot.chain; await seen; await bus.flush?.(); } while (seen !== slot.chain);
+      for (let i = 0; i < 10_000; i++) {
+        await bus.flush?.();
+        const slot = await slots.get(`${tenant}/${board}`)?.catch(() => null);
+        if (!slot || slot.dead || (!slot.room.inflight && !slot.room.queue.length && !slot.room.held.length)) { await bus.flush?.(); return; }
+        await new Promise(r => setTimeout(r, 1));
+      }
     },
     /** The running room for a board, or null (tests and /health only). */
-    async peek(tenant, board) { const slot = await slots.get(`${tenant}/${board}`)?.catch(() => null); return slot ? { room: slot.room, durable: slot.durable, conns: slot.conns.size, tailBytes: slot.tailBytes } : null; },
+    async peek(tenant, board) {
+      const slot = await slots.get(`${tenant}/${board}`)?.catch(() => null);
+      return slot ? { room: slot.room, epoch: slot.epoch, durable: slot.durable, conns: slot.conns.size, tailBytes: slot.room.tailChars } : null;
+    },
     stats: () => ({ rooms: slots.size }),
+    /** Stop every room: a checkpoint of each (§ Recovery, "When": on a clean stop), then stop listening. */
     async close() {
-      closed = true;
+      closed = true; clearInterval(sweep); clearInterval(beat);
       const all = await Promise.all([...slots.values()].map(p => p.catch(() => null)));
-      for (const slot of all) if (slot) { slot.dead = true; slot.unsub(); await slot.chain.catch(() => {}); }
+      for (const slot of all) {
+        if (!slot || slot.dead) continue;
+        slot.unsub();
+        try { if (slot.room.resolved > slot.room.base.seq && !slot.room.inflight && !slot.room.queue.length) slot.room.checkpoint(); }
+        catch (err) { log.error("checkpoint on stop failed", { board: slot.board, err }); }
+        slot.dead = true;
+        await Promise.allSettled([...slot.writes]);
+      }
       slots.clear();
     },
   };

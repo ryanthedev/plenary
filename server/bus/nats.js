@@ -18,10 +18,11 @@
 // needs node_modules.
 
 import { PortError } from "../ids.js";
-export { subjects } from "./memory.js";
+export { subjects } from "./port.js";
 
 /** § Bus: a deployment's bus must carry 2 MB messages. Bigger publishes are refused (PortError "too-large"). */
-export const MAX_BUS_BYTES = 2 * 1024 * 1024;
+import { MAX_BUS_BYTES } from "./port.js";
+export { MAX_BUS_BYTES };
 
 const SUBJECT = /^[a-z0-9-]+(\.[a-z0-9-]+)*$/;
 const isSubject = s => typeof s === "string" && s.length <= 512 && SUBJECT.test(s);
@@ -190,6 +191,7 @@ export async function natsBus({ url, name = "plenary", onError = () => {}, conne
   };
 
   return {
+    maxBytes: MAX_BUS_BYTES,
     /** Resolves once the message is handed to the client (not once it is delivered: there is no delivery receipt). */
     publish(subject, msg) {
       if (closed) return Promise.resolve();

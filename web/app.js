@@ -3,6 +3,10 @@
 // through web/sync.js (via the session and web/ui/net.js); every write goes through session.act/setTool/key.
 //
 // URL: ?board=<id> &as=<dev user: ada bo cy di ed fi> &theme=light|dark &net=shared|local
+//      #token=<session token> (after Google sign-in; web/ui/token.js reads it and clears it at once)
+// Who signs in: an explicit ?as= is the dev path (token dev-<as>); else the session token from sign-in (the
+// fragment, or sessionStorage after a reload); else dev ada. The in-browser rooms know only dev tokens, so a
+// real session token is refused there until the phase-3 WebSocket transport is wired (SEAM in net.js).
 
 import { Editor } from "../packages/core/editor.js";
 import { parsePanel, serializePanel, applyPanel, panelLayout, dragWidth } from "../packages/core/panel.js";
@@ -16,13 +20,18 @@ import { sharedNet, localNet, DEV_USERS } from "./ui/net.js";
 import { renderPanel, loadLibrary, saveLibrary, addToLibrary } from "./ui/panel.js";
 import { exportSvg, paintPng, loadPictures } from "./ui/export.js";
 import { h, $, replace } from "./ui/dom.js";
+import { takeToken, tokenIdentity, chooseSignIn } from "./ui/token.js";
+
+// First thing: the sign-in fragment off the address bar.
+const signIn = takeToken({ location, history, storage: (() => { try { return sessionStorage; } catch { return null; } })() });
 
 // ── setup ──
 const q = new URLSearchParams(location.search);
 const ok = (v, re) => (typeof v === "string" && re.test(v) ? v : null);
 const board = ok(q.get("board"), /^[\w-]{1,64}$/) ?? "demo";
-const as = DEV_USERS[`dev-${q.get("as")}`] ? q.get("as") : "ada";
-const me = DEV_USERS[`dev-${as}`];
+const who = chooseSignIn({ as: q.get("as"), token: signIn.token, devUsers: DEV_USERS });
+const real = who.dev ? null : who.token, as = who.dev;
+const me = real ? { role: null, ...(tokenIdentity(real) ?? { user: "me", name: "You" }) } : DEV_USERS[`dev-${as}`];
 const store = (() => { try { return localStorage; } catch { return null; } })();
 const get = k => { try { return store?.getItem(k); } catch { return null; } };
 const put = (k, v) => { try { store?.setItem(k, v); } catch {} };
@@ -37,7 +46,7 @@ const mineKey = `plenary.mine.${board}.${me.user}`;
 const net = q.get("net") === "local" ? localNet({ board }) : sharedNet({ board });
 let chromeDirty = true;
 const S = createSession({
-  join: () => net.join(), token: `dev-${as}`, board, client: as, user: me.user,
+  join: () => net.join(), token: who.token, board, client: as ?? "web", user: me.user,
   mine: (() => { try { return JSON.parse(get(mineKey) ?? "[]"); } catch { return []; } })(),
   onChange: () => { chromeDirty = true; },
 });
@@ -406,7 +415,8 @@ function dialogs() {
 
 function banners() {
   const out = [], viewer = S.effective === "viewer", st = S.status;
-  if (st === "refused") out.push(h("div.banner", {}, "⚠ The room refused this sign-in (token or board). ", h("button.btn", { onclick: () => S.reconnect() }, "Retry")));
+  if (st === "stopped") out.push(h("div.banner", {}, `⚠ This app is older than the board's room and has stopped: reload to update it.${S.pending ? ` Reloading loses ${S.pending} edits not yet acknowledged.` : ""} `, h("button.btn", { onclick: () => location.reload() }, "Reload")));
+  else if (st === "refused") out.push(h("div.banner", {}, "⚠ The room refused this sign-in (token or board). ", h("button.btn", { onclick: () => S.reconnect() }, "Retry")));
   else if (!S.online) out.push(h("div.banner", {}, viewer ? "⚠ You're offline. The live view is paused until you reconnect." : `⚠ You're offline. ${S.pending} edits wait in this tab and send when you reconnect. Closing the tab loses them.`, " ", h("button.btn", { onclick: () => S.reconnect() }, "Retry now")));
   else if (st !== "live") out.push(h("div.banner", {}, viewer ? "⟳ Connecting… the live view is paused." : `⟳ Connecting… ${S.pending ? `${S.pending} edits waiting. ` : ""}Keep working: they're sent with the same ids when the room is back.`));
   else if (S.readOnly) out.push(h("div.banner", {}, "👁 Read-only: the server gave this session a lower role. Ask the board's owner for edit access."));
@@ -468,3 +478,4 @@ let savedMine = 0;
 const fitOnce = setInterval(() => { if (S.status === "live") { clearInterval(fitOnce); if (S.eds.board.doc.live().length || S.eds.notes.doc.live().length) S.fit(); } }, 50);
 
 globalThis.plenary = { S, ui, net, setTheme, openDialog, setPanel };
+if (signIn.link) toast(signIn.link === "invalid" ? "That share link is not valid (it may have expired)." : "Share links are unavailable right now. Try the link again later.");

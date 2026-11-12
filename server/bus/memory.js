@@ -6,24 +6,17 @@
 // Messages are passed by reference here; a network bus serialises them, so publish only plain data and never
 // change a message after publishing it.
 
-import { needId } from "../ids.js";
+import { subjects, busBytes, MAX_BUS_BYTES } from "./port.js";
+import { PortError } from "../ids.js";
 
-/** Subject names. Every id is checked, so a subject can't be widened or pointed at another tenant. */
-export const subjects = {
-  /** Published by the room after the append resolves: { from, to, data } (data = the encoded `entries` frame). */
-  entries: (tenant, board) => `plen.${needId(tenant, "tenant")}.${needId(board, "board")}.entries`,
-  /** Published by gateways; never saved. */
-  presence: (tenant, board) => `plen.${needId(tenant, "tenant")}.${needId(board, "board")}.presence`,
-  /** Published by gateways: viewers' emotes, summed. Never saved. */
-  emotes: (tenant, board) => `plen.${needId(tenant, "tenant")}.${needId(board, "board")}.emotes`,
-  /** Gateway → room: { n, conn, gateway, user, name, role, client, msg } or { n, conn, gateway, closed: true }. */
-  inbox: (tenant, board) => `plen.${needId(tenant, "tenant")}.${needId(board, "board")}.inbox`,
-  /** Room → gateway: { conn, data?, catchup?, close? }, "addressed to conn". SEAM(p4): § Bus names it per board, `plen.<tenant>.<board>.gw.<gateway>`. */
-  gateway: gateway => `plen-gw.${needId(gateway, "gateway")}`,
-};
+export { subjects };
 
-/** @param {{ onError?: (err: unknown, subject: string) => void }} [o] */
-export function memoryBus({ onError = () => {} } = {}) {
+/**
+ * @param {{ onError?: (err: unknown, subject: string) => void, maxBytes?: number }} [o]
+ *   maxBytes: the message cap (§ Bus, 2 MB by default, as NATS); a bigger publish is refused like NATS refuses it
+ *   (the promise rejects with PortError "too-large", and onError hears of it). Tests pass a small one.
+ */
+export function memoryBus({ onError = () => {}, maxBytes = MAX_BUS_BYTES } = {}) {
   /** @type {Map<string, Set<Function>>} */
   const subs = new Map();
   let queue = [], draining = false, closed = false;
@@ -51,6 +44,10 @@ export function memoryBus({ onError = () => {} } = {}) {
     /** Resolves once the message is queued (not once it is delivered: there is no delivery receipt). */
     async publish(subject, msg) {
       if (closed || typeof subject !== "string") return;
+      if (maxBytes !== Infinity) {
+        const size = busBytes(msg);
+        if (size > maxBytes) { const err = new PortError("too-large", `a bus message is limited to ${maxBytes} bytes (this one is ${size})`); onError(err, subject); throw err; }
+      }
       queue.push([subject, msg]); schedule();
     },
     /** @returns {() => void} unsubscribe */
@@ -63,6 +60,7 @@ export function memoryBus({ onError = () => {} } = {}) {
     /** Resolves when everything published so far has been handed to subscribers (tests, clean shutdown). */
     flush() { return queue.length || draining ? new Promise(res => idle.push(res)) : Promise.resolve(); },
     subscriberCount: subject => subs.get(subject)?.size ?? 0,
+    maxBytes,
     async close() { closed = true; queue = []; subs.clear(); },
   };
 }

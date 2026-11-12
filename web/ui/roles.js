@@ -67,6 +67,8 @@ export const settingsKey = (key, m = {}) => !!(m.cmd || m.ctrl) && String(key) =
 // Pill text per connection state, as in the mock. Viewers never have edits waiting.
 export function pillFor({ status, online = true, pending = 0, role, readOnly = false }) {
   const waiting = role === "viewer" || !pending ? "" : `${pending} edit${pending === 1 ? "" : "s"} waiting`;
+  // stopped: the room speaks rules this app doesn't know. It never retries; only an update helps.
+  if (status === "stopped") return { cls: "offline", text: "Update needed", sub: "reload the app" };
   if (status === "refused") return { cls: "offline", text: "Refused", sub: "sign in again" };
   if (!online) return { cls: "offline", text: "Offline", sub: waiting };
   if (status !== "live") return { cls: "reconnecting", text: status === "catching-up" ? "Catching up…" : "Connecting…", sub: waiting };

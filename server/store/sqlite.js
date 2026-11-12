@@ -6,6 +6,11 @@
 //   lastSeq(tenant, board)                      the board's last seq (0 = empty)
 //   putCheckpoint(tenant, board, cp)            kept by cp.seq; the newest few per board are kept
 //   getCheckpoint(tenant, board, beforeSeq?)    the highest seq (below beforeSeq, if given), never the last write
+//   openEpoch(tenant, board)                    durable atomic increment of the board's epoch (1 on the first call)
+//   epoch(tenant, board)                        the board's epoch, 0 if no room was ever built
+//
+// The epoch lives in the board's lease record (`leases`), not in a checkpoint (PROTOCOL.md § Recovery, Room
+// identity). Single node has one host holding every lease; the record is the same shape phase 4's lease takes.
 //
 // Durable = WAL + synchronous=FULL (+ fullfsync on macOS, where a plain fsync doesn't reach the platter): a
 // resolved append survives a process crash and power loss. The API is async (Postgres will be); SQLite itself
@@ -34,13 +39,20 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
     tenant TEXT NOT NULL, board TEXT NOT NULL, seq INTEGER NOT NULL, data TEXT NOT NULL,
     PRIMARY KEY (tenant, board, seq)) WITHOUT ROWID`);
 
+  db.run(`CREATE TABLE IF NOT EXISTS leases (
+    tenant TEXT NOT NULL, board TEXT NOT NULL, epoch INTEGER NOT NULL,
+    PRIMARY KEY (tenant, board)) WITHOUT ROWID`);
+
+  const qOpenEpoch = db.query(`INSERT INTO leases (tenant, board, epoch) VALUES (?, ?, 1)
+    ON CONFLICT (tenant, board) DO UPDATE SET epoch = epoch + 1 RETURNING epoch`);
+  const qEpoch = db.query("SELECT epoch FROM leases WHERE tenant = ? AND board = ?");
   const qLast = db.query("SELECT max(seq) AS m FROM entries WHERE tenant = ? AND board = ?");
   const qInsert = db.query("INSERT INTO entries (tenant, board, seq, data) VALUES (?, ?, ?, ?)");
   const qRead = db.query("SELECT data FROM entries WHERE tenant = ? AND board = ? AND seq >= ? ORDER BY seq ASC LIMIT ?");
   const qSizes = db.query("SELECT length(data) AS n FROM entries WHERE tenant = ? AND board = ? AND seq >= ? ORDER BY seq ASC LIMIT ?");
-  // SEAM(p2): § Recovery decides how a bad checkpoint is dealt with. Today the first write for a seq is kept, a
-  // second writer at that seq is ignored, one older than the newest `keepCheckpoints` is pruned at once, and there
-  // is no call to remove a bad one (a rebuild steps past it with getCheckpoint's beforeSeq).
+  // § Recovery (PROTOCOL.md, Store and "bad checkpoint"): a checkpoint whose entry S doesn't match the log is skipped,
+  // never deleted: the room's rebuild and each gateway's feed step past it with getCheckpoint's beforeSeq. A second
+  // writer at the same seq is ignored; one older than the newest `keepCheckpoints` is pruned at once.
   // One row per (board, seq); the first write for a seq is kept. Older ones stay so a rebuild can step back past
   // a bad checkpoint (getCheckpoint's beforeSeq); all but the newest `keepCheckpoints` are pruned.
   const qPutCp = db.query("INSERT OR IGNORE INTO checkpoints (tenant, board, seq, data) VALUES (?, ?, ?, ?)");
@@ -130,6 +142,18 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
       if (beforeSeq !== undefined && (!Number.isSafeInteger(beforeSeq) || beforeSeq < 0)) throw new PortError("bad-entry", "beforeSeq must be a non-negative integer");
       const row = qGetCp.get(tenant, board, beforeSeq ?? Number.MAX_SAFE_INTEGER);
       return row ? JSON.parse(row.data) : null;
+    },
+
+    /** A room is being built: the board's next epoch, durable before it resolves (§ Recovery, Room identity). */
+    async openEpoch(tenant, board) {
+      ready(tenant, board);
+      return db.transaction(() => qOpenEpoch.get(tenant, board).epoch).immediate();
+    },
+
+    /** The board's latest epoch; 0 = no room was ever built. */
+    async epoch(tenant, board) {
+      ready(tenant, board);
+      return qEpoch.get(tenant, board)?.epoch ?? 0;
     },
 
     /** What the store was opened with, read back from SQLite (for /health and tests). */

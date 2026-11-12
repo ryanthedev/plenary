@@ -1,10 +1,16 @@
 // The gateway: holds the sockets. It decodes frames, proves who is there, and passes verified messages to the
 // board's room over the bus; what the room answers comes back over the bus, already encoded, addressed to a conn.
 //
-// Rule 8 (auth before the room): the first frame must be a hello. The gateway awaits Auth.verify(token), the
-// Registry's board lookup and Auth.role(identity, board), in that order, and only then publishes the hello,
-// WITHOUT the token, as { n, conn, gateway, user, role, client, msg }. Any refusal answers `auth` and closes; an
-// unknown board and a board without a role get the same answer (rule 7).
+// Rule 8 (auth before the room): the first frame must be a hello (`v: 1`). The gateway awaits Auth.verify(token),
+// the Registry's board lookup and Auth.role(identity, board), in that order. Any refusal answers `auth` and closes;
+// an unknown board and a board without a role get the same answer (rule 7). Then it subscribes to the board (its
+// feed: catch-up and live entries, rules 3 and 8) and, for a writer only, publishes the hello WITHOUT the token as
+// { n, conn, gateway, user, name, role, client, msg }. A viewer's hello never leaves the gateway: it is welcomed here.
+//
+// After welcome: ops are paced per connection (20/s, burst 100, queued in order) and numbered `n` toward the room
+// (rule 6); a close notice and a 5 s list of open writer connections keep the room's `n` state bounded. Presence is
+// checked, rate-limited, relayed over the bus and coalesced every 50 ms: it never reaches the room or the log.
+// A `grants` message re-checks every connection's role on the board (revocation); a token's expiry closes it.
 //
 // Bad frames never reach a room and never throw out of here: binary, nested too deep, not JSON, not an object,
 // no `t`, a second hello, an unknown `t`. Before hello: `error` and close. After: `error`, and a close after a few
@@ -16,8 +22,10 @@
 // there is no room for is told `unavailable`, a reader that drains nothing for stallMs is cut, whatever it sends.
 
 import { jsonCodec } from "../packages/protocol/codec.js";
-import { ROLES, MAX_CLIENT_CHARS } from "../packages/protocol/envelope.js";
-import { subjects } from "./bus/memory.js";
+import { ROLES, MAX_CLIENT_CHARS, PROTOCOL_VERSION, RULES_VERSION, opProblem, parseOpId } from "../packages/protocol/envelope.js";
+import { presenceProblem, presenceLimiter, presenceCoalescer, EMOTES } from "../packages/protocol/presence.js";
+import { subjects, busBytes, MAX_BUS_BYTES } from "./bus/port.js";
+import { boardFeed } from "./feed.js";
 import { isId } from "./ids.js";
 import { quietLogger } from "./log.js";
 import { breathe } from "./breather.js";
@@ -55,9 +63,23 @@ export const LIMITS = {
   maxConnQueuedBytes: 16 * 1024 * 1024,     // a connection's own queued frames (live traffic behind a slow socket or a catch-up)
   maxSharedQueuedBytes: 256 * 1024 * 1024,  // distinct catch-up text that queues still reference (text the room has since replaced stays alive through them)
   sweepMs: 1_000,                           // how often stalls and budgets are re-read from the sockets
+  // § Pacing and § Limits (v1.1).
+  opRate: 20, opBurst: 100,                 // durable ops per connection: a token bucket; over-rate ops wait in order
+  maxOpQueue: 500,                          // ops waiting for a token, per connection…
+  maxOpQueueBytes: 8 * 1024 * 1024,         // …or their bytes: past either, `unavailable` and close
+  maxLiveQueuedBytes: 8 * 1024 * 1024,      // frames read from a live socket and not yet handled
+  maxWritersPerUserBoard: 8,                // writer connections per (user, board) on this gateway; a ninth gets `limit`
+  idleTimeoutSec: 30,                       // heard nothing (no frame, no pong) for this long: closed
+  presenceMs: 50,                           // coalesced presence goes out this often
+  emoteWindowMs: 500,                       // viewers' emotes are summed per window
+  connListMs: 5_000,                        // open writer connections are listed to each room this often
+  roleRecheckMs: 60_000,                    // every live connection's role is computed again this often (a link or invite expiring is not a `grants` message)
+  feed: {},                                 // options for each board's feed (pollMs, chunkBytes, …; tests)
 };
 
 const isObj = v => !!v && typeof v === "object" && !Array.isArray(v);
+/** How long to wait before looking at a token's expiry again: 0 once it has passed, never more than setTimeout's cap. */
+export const expiryWait = (expSec, nowMs) => Math.max(0, Math.min(2 ** 31 - 1, expSec * 1000 - nowMs));
 let counter = 0;
 const mintId = prefix => `${prefix}-${Date.now().toString(36)}${Math.floor(Math.random() * 36 ** 6).toString(36)}-${(++counter).toString(36)}`;
 
@@ -88,13 +110,17 @@ const OP_ID = /^\s*\{\s*"t"\s*:\s*"op"\s*,\s*"id"\s*:\s*"([^"\\]{1,256})"/;
  * @param {{
  *   auth: { verify(token: string): Promise<object|null>, role(identity: object, board: string): Promise<string|null> },
  *   registry: { board(id: string): Promise<{ id: string, tenant: string }|null> },
+ *   store: { read: Function, getCheckpoint: Function, epoch: Function },
  *   bus: object,
  *   rooms: { open(tenant: string, board: string): Promise<void> },
  *   log?: object, codec?: object, id?: string, limits?: Partial<typeof LIMITS>, now?: () => number,
  * }} o
  */
-export function gateway({ auth, registry, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now }) {
+export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed }) {
   const lim = { ...LIMITS, ...limits };
+  const maxBusBytes = bus.maxBytes ?? MAX_BUS_BYTES;
+  /** @type {Map<string, number>} "user|board" → open writer connections (§ Pacing) */
+  const writersBy = new Map();
   /** @type {Map<string, any>} conn id → ws */
   const conns = new Map();
   const counts = { accepted: 0, refusedAuth: 0, badFrames: 0, cut: 0, turnedAway: 0 };
@@ -156,15 +182,20 @@ export function gateway({ auth, registry, bus, rooms, log = quietLogger, codec =
     const c = ws.data;
     if (c.state === "closed") return;
     const wasLive = c.state === "live";
-    c.state = "closed"; clearTimeout(c.timer); conns.delete(c.id);
+    c.state = "closed"; clearTimeout(c.timer); clearTimeout(c.expTimer); clearTimeout(c.opTimer); conns.delete(c.id);
+    unwatchGrants(c);
     if (c.q) { queuedTotal -= c.qBytes; c.q.length = 0; c.qBytes = 0; }   // frames still waiting are dropped with the socket, not held
     if (wasLive) {
       owedTotal -= c.owed; bump(owedByUser, c.user, -c.owed); bump(connsByUser, c.user, -1);
+      if (c.wkey) bump(writersBy, c.wkey, -1);
       socketTotal -= c.buffered; bump(socketByUser, c.user, -c.buffered); c.buffered = 0;
-      c.owed = 0; dropQueue(c); waiters.delete(ws);
-      // § Bus: the close notice.
-      bus.publish(subjects.inbox(c.tenant, c.board), { n: ++c.n, conn: c.id, gateway: id, closed: true });
+      c.owed = 0; dropQueue(c); waiters.delete(ws); c.opq.length = 0;
+      // § Bus: the close notice (rule 6), for a connection the room heard of.
+      if (c.forwarded) bus.publish(subjects.inbox(c.tenant, c.board), { n: ++c.n, conn: c.id, gateway: id, closed: true })?.catch?.(() => {});
+      // § Presence: `leave`, so everyone drops this connection's cursor now rather than in 30 s.
+      if (c.welcomed) bus.publish(subjects.presence(c.tenant, c.board), { gateway: id, user: c.user, client: c.client, leave: true })?.catch?.(() => {});
     }
+    leaveBoard(ws);   // also a connection that joined its board and closed during the rest of its hello
     try { ws.close(code, reason); } catch { /* already closed */ }
     if (wasLive && waiters.size) queueMicrotask(wake);   // the room it held is free
   };
@@ -301,36 +332,46 @@ export function gateway({ auth, registry, bus, rooms, log = quietLogger, codec =
     flush(ws);
   }
 
-  // Room → gateway: { conn, data, catchup?, close? }. `data` is an encoded frame; the room host encoded it once.
-  // `catchup` marks the shared catch-up text (the snapshot and the whole-tail chunks).
+  /**
+   * Queue a catch-up frame `{ data, bytes, shared }`. Shared text (a snapshot, a whole chunk) is encode-once text
+   * many joiners hold: it is counted once however many queues hold it, and pulled into each socket as it drains.
+   */
+  function pushShared(ws, f) {
+    const c = ws.data;
+    if (c.state !== "live") return;
+    if (!f.shared) return push(ws, f.data);
+    const len = sharedText.get(f.shared)?.len ?? (Number.isSafeInteger(f.bytes) && f.bytes >= 0 ? f.bytes : bytesOf(f.data));
+    // New text that would take the distinct queued catch-up text over its bound: the joiners who have waited the
+    // longest (they hold the oldest text) are told to come back, then, if that isn't enough, this one.
+    if (!sharedText.has(f.shared) && sharedBytes + len > lim.maxSharedQueuedBytes) {
+      const waiting = [...waiters].filter(w => w !== ws && w.data.state === "live").sort((x, y) => x.data.waitSince - y.data.waitSince);
+      for (const w of waiting) { if (sharedBytes + len <= lim.maxSharedQueuedBytes) break; turnAway(w, "too much superseded catch-up text held by waiting joiners"); }
+      // One text bigger than the whole bound is still held when it is the only one (`sharedBytes > 0`): otherwise
+      // a board that size could never be joined. So the bound is max(maxSharedQueuedBytes, the largest one text).
+      if (sharedBytes + len > lim.maxSharedQueuedBytes && sharedBytes > 0) return turnAway(ws, "too much catch-up text queued");
+    }
+    hold(f.shared, len);
+    c.out.push({ data: f.data, len, shared: f.shared }); flush(ws);
+  }
+
+  // Room → gateway: { conn, data?, close? }: `welcome`, `ack`, `error` only (§ Bus), encoded once by the room host.
   const unsub = bus.subscribe(subjects.gateway(id), m => {
     const ws = conns.get(m?.conn);
     if (!ws || ws.data.state !== "live") return;
     const c = ws.data;
-    if (!c.answered) { c.answered = true; clearTimeout(c.timer); }
+    if (m.data !== undefined && typeof m.data !== "string" && !(m.data instanceof Uint8Array)) return;
+    if (!c.welcomed && !c.welcoming && m.data !== undefined) {
+      let msg = null;
+      try { msg = codec.decode(m.data); } catch { msg = null; }
+      if (msg?.t === "welcome") { welcomed(ws, m.data, Number.isSafeInteger(msg.seq) ? msg.seq : 0); if (m.close) end(ws, m.close, "closed by the room"); return; }
+    }
     if (m.close) {
       // The room is sending this connection away: what was queued for it is dropped, not delivered first.
       dropQueue(c);
       if (m.data !== undefined) { try { ws.send(m.data); } catch { /* gone */ } }
-      return end(ws, m.close, "closed by the room");
+      return end(ws, m.close, m.close === 1008 ? "refused by the room" : "closed by the room");
     }
-    if (typeof m.data !== "string" && !(m.data instanceof Uint8Array)) return;
-    if (typeof m.catchup === "string" && m.catchup) {
-      // UTF-8 bytes, measured once per text: the room host sends `bytes` with it (a board's snapshot is one string of
-      // up to hundreds of MB); otherwise the count already held for this name, else it is measured here.
-      const len = sharedText.get(m.catchup)?.len ?? (Number.isSafeInteger(m.bytes) && m.bytes >= 0 ? m.bytes : bytesOf(m.data));
-      // New text that would take the distinct queued catch-up text over its bound: the joiners who have waited the
-      // longest (they hold the oldest text) are told to come back, then, if that isn't enough, this one.
-      if (!sharedText.has(m.catchup) && sharedBytes + len > lim.maxSharedQueuedBytes) {
-        const waiting = [...waiters].filter(w => w !== ws && w.data.state === "live").sort((a, b) => a.data.waitSince - b.data.waitSince);
-        for (const w of waiting) { if (sharedBytes + len <= lim.maxSharedQueuedBytes) break; turnAway(w, "too much superseded catch-up text held by waiting joiners"); }
-        // One text bigger than the whole bound is still held when it is the only one (`sharedBytes > 0`): otherwise
-        // a board that size could never be joined. So the bound is max(maxSharedQueuedBytes, the largest one text).
-        if (sharedBytes + len > lim.maxSharedQueuedBytes && sharedBytes > 0) return turnAway(ws, "too much catch-up text queued");
-      }
-      hold(m.catchup, len);
-      c.out.push({ data: m.data, len, shared: m.catchup }); flush(ws);
-    } else push(ws, m.data);
+    if (m.data !== undefined) push(ws, m.data);
   });
 
   // The sweep: re-reads every socket (drain events are the fast path; this is the safety net), restarts queues
@@ -372,10 +413,172 @@ export function gateway({ auth, registry, bus, rooms, log = quietLogger, codec =
     if (++c.strikes >= lim.maxStrikes) end(ws, 1008, "too many bad frames");
   }
 
+  // ---- boards: one feed, presence relay and emote sums per board this gateway serves ----
+
+  /** @type {Map<string, any>} "tenant/board" → board state */
+  const boards = new Map();
+  const welcomedOn = b => [...b.conns].filter(ws => ws.data.state === "live" && ws.data.welcomed);
+
+  function onLive(b, { from, to, data }) {
+    for (const ws of b.conns) {
+      const c = ws.data;
+      if (c.state !== "live" || c.next === undefined || to < c.next) continue;
+      // The feed hands every resolved entry once, in order, and a connection joins it at the feed's seq: no cut needed.
+      if (from > c.next) { log.error("feed skipped entries for a connection", { conn: c.id, next: c.next, from }); cut(ws, "missed entries"); continue; }
+      push(ws, data); c.next = to + 1;
+    }
+  }
+
+  /** Join a board (subscribe its subjects before anything is forwarded or served: § Bus). Resolves once its feed is ready. */
+  async function joinBoard(ws, tenant, board) {
+    const key = `${tenant}/${board}`;
+    let b = boards.get(key);
+    if (!b) {
+      b = { key, tenant, board, conns: new Set(), refs: 0, coalescer: presenceCoalescer(), mine: {}, sums: new Map(), unsubs: [] };
+      b.feed = feedOf({ tenant, board, store, bus, log, codec, onLive: e => onLive(b, e), ...lim.feed });
+      b.unsubs.push(bus.subscribe(subjects.presence(tenant, board), m => {
+        if (!m || typeof m.user !== "string" || typeof m.client !== "string") return;
+        if (m.leave) b.coalescer.leave(m.user, m.client); else if (m.msg && typeof m.msg === "object") b.coalescer.add(m.user, m.client, m.msg);
+      }));
+      b.unsubs.push(bus.subscribe(subjects.emotes(tenant, board), m => {
+        if (!m || !Number.isSafeInteger(m.window) || !m.counts || typeof m.counts !== "object") return;
+        const sum = b.sums.get(m.window) ?? {};
+        for (const e of EMOTES) if (Number.isSafeInteger(m.counts[e]) && m.counts[e] > 0) sum[e] = (sum[e] ?? 0) + m.counts[e];
+        b.sums.set(m.window, sum);
+      }));
+      boards.set(key, b);
+    }
+    b.refs++; ws.data.b = b;
+    await b.feed.ready;
+    return b;
+  }
+  function leaveBoard(ws) {
+    const c = ws.data, b = c.b;
+    if (!b) return;
+    c.b = null; b.conns.delete(ws);
+    if (--b.refs > 0) return;
+    boards.delete(b.key); b.feed.close(); for (const u of b.unsubs) u();
+  }
+
+  // ---- revocation: a board's `grants` subject, watched from before a hello's role check until its socket closes ----
+  /** @type {Map<string, { gen: number, refs: number, unsub: () => void }>} "tenant/board" → its grants watch */
+  const grantWatches = new Map();
+  /**
+   * Watch a board's `grants` for this connection. Every message bumps `gen` and re-checks the board's live
+   * connections; a hello compares `gen` before its role check with `gen` just before it goes live, so a change
+   * that lands while it waits (on the feed, on a room rebuild) is never lost, even for a board's first connection.
+   */
+  function watchGrants(c, tenant, board) {
+    const key = `${tenant}/${board}`;
+    let w = grantWatches.get(key);
+    if (!w) {
+      w = { gen: 0, refs: 0, unsub: () => {} };
+      const self = w;
+      w.unsub = bus.subscribe(subjects.grants(tenant, board), () => {
+        self.gen++;
+        const b = boards.get(key);
+        if (b) recheck(b).catch(err => log.error("gateway: grants re-check failed", { board, err }));
+      });
+      grantWatches.set(key, w);
+    }
+    w.refs++; c.watch = { key, w };
+    return w;
+  }
+  function unwatchGrants(c) {
+    if (!c.watch) return;
+    const { key, w } = c.watch; c.watch = null;
+    if (--w.refs > 0) return;
+    w.unsub(); if (grantWatches.get(key) === w) grantWatches.delete(key);
+  }
+
+  /** Grants, invites or links changed on this board (or the slow timer fired): every connection's role is computed again. */
+  async function recheck(b) {
+    for (const ws of [...b.conns]) {
+      const c = ws.data;
+      if (c.state !== "live") continue;
+      let role;
+      // Fail closed: a Registry that can't answer now can't vouch for the old role. `unavailable`, so the client
+      // reconnects and its hello does the check (§ Errors: the client keeps its pending ops).
+      try { role = await auth.role(c.identity, b.board); }
+      catch (err) { if (c.state === "live") { log.warn("role re-check failed: connection closed", { conn: c.id, err }); refuse(ws, "unavailable", "could not re-check your access: reconnect", 1013, "role re-check failed"); } continue; }
+      if (c.state !== "live") continue;
+      if (!ROLES.includes(role)) { log.info("access removed: connection closed", { conn: c.id, board: b.board, user: c.user }); refuse(ws, "auth", "your access to this board was removed", 1008, "auth"); }
+      else if (role !== c.role) { log.info("role changed: connection closed to rejoin", { conn: c.id, board: b.board, user: c.user, from: c.role, to: role }); refuse(ws, "unavailable", "your role on this board changed: reconnect", 1012, "role changed"); }
+    }
+  }
+
+  /** Send the welcome, then the catch-up up to at least `upTo`; live entries follow from where it ends. */
+  function welcomed(ws, welcomeData, upTo) {
+    const c = ws.data;
+    // `welcomed` turns on only as the welcome frame is queued, so no presence, emote or op answer can reach the
+    // socket before it; `welcoming` stops a second welcome being taken meanwhile.
+    c.welcoming = true; c.answered = true; clearTimeout(c.timer);
+    const b = c.b, since = c.since;
+    b.feed.reach(upTo).then(() => b.feed.atomically(() => {
+      if (c.state !== "live") return;
+      push(ws, typeof welcomeData === "function" ? welcomeData() : welcomeData);
+      c.welcomed = true;
+      for (const f of b.feed.catchUp(since)) pushShared(ws, f);
+      c.next = b.feed.seq + 1;
+    })).catch(err => { log.error("catch-up failed", { conn: c.id, err }); if (c.state === "live") refuse(ws, "unavailable", "try again shortly", 1013, "unavailable"); });
+  }
+
+  // Presence out: every 50 ms, each board's coalesced batch to its welcomed connections, without their own.
+  const presenceTimer = setInterval(() => {
+    try {
+      for (const b of boards.values()) {
+        if (!b.coalescer.size) continue;
+        const batch = b.coalescer.flush(), full = codec.encode({ t: "presence", batch });
+        for (const ws of welcomedOn(b)) {
+          const c = ws.data;
+          if (c.outBytes > lim.maxConnQueuedBytes / 2) continue;   // presence may drop: a reader this far behind skips it
+          const mine = x => x.user === c.user && x.client === c.client;
+          if (!batch.some(mine)) { push(ws, full); continue; }
+          const rest = batch.filter(x => !mine(x));
+          if (rest.length) push(ws, codec.encode({ t: "presence", batch: rest }));
+        }
+      }
+    } catch (err) { log.error("gateway: presence flush failed", { err }); }
+  }, lim.presenceMs);
+  presenceTimer.unref?.();
+
+  // Emotes: viewers' counts per 500 ms window are published on `.emotes`; every gateway sums all gateways' counts
+  // for a window and sends the total once the window is a full window old (late counts from other gateways land).
+  const emoteTimer = setInterval(() => {
+    try {
+      const w = Math.floor(now() / lim.emoteWindowMs);
+      for (const b of boards.values()) {
+        for (const [win, counts] of Object.entries(b.mine)) {
+          if (Number(win) >= w) continue;
+          delete b.mine[win];
+          bus.publish(subjects.emotes(b.tenant, b.board), { gateway: id, window: Number(win), counts })?.catch?.(() => {});
+        }
+        for (const [win, counts] of b.sums) {
+          if (win > w - 2) continue;
+          b.sums.delete(win);
+          const data = codec.encode({ t: "emotes", counts });
+          for (const ws of welcomedOn(b)) push(ws, data);
+        }
+      }
+    } catch (err) { log.error("gateway: emote tick failed", { err }); }
+  }, lim.emoteWindowMs);
+  emoteTimer.unref?.();
+
+  // Rule 6: every 5 s, each board's open writer connections, so a room drops the ones whose close notice was lost.
+  const listTimer = setInterval(() => {
+    for (const b of boards.values()) {
+      const list = [...b.conns].filter(ws => ws.data.state === "live" && ws.data.forwarded).map(ws => ws.data.id);
+      if (list.length) bus.publish(subjects.inbox(b.tenant, b.board), { gateway: id, conns: list })?.catch?.(() => {});
+    }
+  }, lim.connListMs);
+  listTimer.unref?.();
+  // Time-based loss of access (a share link or an invite passing its `expiresAt`) sends no `grants` message.
+  const roleTimer = setInterval(() => { for (const b of boards.values()) recheck(b).catch(err => log.error("gateway: timed role re-check failed", { board: b.board, err })); }, lim.roleRecheckMs);
+  roleTimer.unref?.();
+
   async function hello(ws, msg) {
     const c = ws.data;
-    // SEAM(p2): `v: 1` becomes required once Replica sends it (today's Replica sends no `v`).
-    if (msg.v !== undefined && msg.v !== 1) return badFrame(ws, "hello-version", "this server speaks protocol v1", "version");
+    if (msg.v !== PROTOCOL_VERSION) return badFrame(ws, "hello-version", `this server speaks protocol v${PROTOCOL_VERSION}`, "version");
     if (typeof msg.client !== "string" || !msg.client || msg.client.length > MAX_CLIENT_CHARS || msg.client.includes(":"))
       return badFrame(ws, "hello-client", "hello needs a client id (no colon)");
     if (msg.since !== undefined && (!Number.isSafeInteger(msg.since) || msg.since < 0)) return badFrame(ws, "hello-since", "since must be a non-negative integer");
@@ -389,39 +592,138 @@ export function gateway({ auth, registry, bus, rooms, log = quietLogger, codec =
     try { identity = await auth.verify(msg.token); } catch (err) { return down("verify", { name: String(err?.name ?? "Error").slice(0, 60), code: typeof err?.code === "string" ? err.code.slice(0, 60) : undefined }); }
     if (c.state !== "auth") return;                       // the socket closed while we waited
     if (!identity || typeof identity.user !== "string" || !identity.user) return deny("token");
+    // A token past its expiry is refused now; a live connection is closed when it passes (below).
+    if (Number.isFinite(identity.exp) && identity.exp * 1000 <= now()) return deny("expired");
     // The board id is only a lookup key here; subjects and store keys are built from the registry's own record.
     if (!isId(msg.board)) return deny("board");
     try { board = await registry.board(msg.board); } catch (err) { return down("board", err); }
     if (c.state !== "auth") return;
     if (!board || board.id !== msg.board || !isId(board.id) || !isId(board.tenant)) return deny("board");
+    const watch = watchGrants(c, board.tenant, board.id);   // before the role check (released when the socket closes)
+    let gen = watch.gen;
     try { role = await auth.role(identity, board.id); } catch (err) { return down("role", err); }
     if (c.state !== "auth") return;
     if (!ROLES.includes(role)) return deny("role");
-    // My choice (PROTOCOL.md § Known limits: "no cap on connections per user"): one account can't hold every
-    // socket of the process. Configurable, because load tests share a few dev tokens.
+    const writer = role !== "viewer", wkey = `${identity.user}|${board.id}`;
+    // My choice (no spec cap across boards): one account can't hold every socket of the process. Configurable.
     if ((connsByUser.get(identity.user) ?? 0) >= lim.maxConnsPerUser) { log.warn("hello refused: too many connections for one user", { conn: c.id, user: identity.user }); return refuse(ws, "unavailable", "too many connections for this user", 1013, "user connection cap"); }
-    // SEAM(p4): rule 8, viewers never reach the room. Today every role, viewers too, is forwarded and becomes a
-    // Room connection; the 100k-viewer design needs the gateway to serve a viewer's catch-up and live entries
-    // itself (from the Store and the entries subject, subscribed BEFORE the hello is forwarded).
-    try { await rooms.open(board.tenant, board.id); } catch (err) { return down("room", err); }
+    // § Pacing: at most 8 writer connections per (user, board) on this gateway; a ninth gets `limit` (no id), closed.
+    const tooMany = () => writer && (writersBy.get(wkey) ?? 0) >= lim.maxWritersPerUserBoard;
+    if (tooMany()) { log.warn("hello refused: writer connection cap", { conn: c.id, user: identity.user, board: board.id }); return refuse(ws, "limit", `at most ${lim.maxWritersPerUserBoard} open writer connections per user on a board`, 1008, "writer cap"); }
+    // Subscribe to the board before anything is forwarded or served (§ Bus), then make sure its room runs (writers only:
+    // rule 8, viewers never reach the room).
+    try { await joinBoard(ws, board.tenant, board.id); } catch (err) { return down("feed", err); }
     if (c.state !== "auth") return;
-    // The cap again, in the same step that counts this connection: hellos that were waiting together on the
-    // awaits above all passed the first check.
+    if (writer) { try { await rooms.open(board.tenant, board.id); } catch (err) { return down("room", err); } }
+    if (c.state !== "auth") return;
+    // Grants changed while this hello waited: ask again. A different role (writer ↔ viewer changes the path above)
+    // is told to reconnect; no role is refused. Nothing is awaited between the last check and going live below.
+    while (watch.gen !== gen) {
+      gen = watch.gen;
+      let again;
+      try { again = await auth.role(identity, board.id); } catch (err) { return down("role", err); }
+      if (c.state !== "auth") return;
+      if (!ROLES.includes(again)) return deny("role");
+      if (again !== role) { log.info("hello: role changed while it waited", { conn: c.id, from: role, to: again }); return refuse(ws, "unavailable", "your role on this board changed: reconnect", 1012, "role changed"); }
+    }
+    if (c.b?.feed.gapAt) { log.error("hello refused: the board's log has a gap", { conn: c.id, board: board.id, at: c.b.feed.gapAt }); return refuse(ws, "unavailable", "this board can't be served right now", 1013, "log gap"); }
+    // The caps again, in the same step that counts this connection: hellos that waited together all passed the first check.
     if ((connsByUser.get(identity.user) ?? 0) >= lim.maxConnsPerUser) { log.warn("hello refused: too many connections for one user", { conn: c.id, user: identity.user }); return refuse(ws, "unavailable", "too many connections for this user", 1013, "user connection cap"); }
+    if (tooMany()) { log.warn("hello refused: writer connection cap", { conn: c.id, user: identity.user, board: board.id }); return refuse(ws, "limit", `at most ${lim.maxWritersPerUserBoard} open writer connections per user on a board`, 1008, "writer cap"); }
 
-    Object.assign(c, { state: "live", tenant: board.tenant, board: board.id, user: identity.user, name: typeof identity.name === "string" ? identity.name.slice(0, 200) : null, role, client: msg.client,
-      out: [], outBytes: 0, buffered: 0, owed: 0, blocked: false, flushing: false, waitSince: 0, progressAt: now(), winStart: now(), winDrained: 0 });
+    Object.assign(c, { state: "live", tenant: board.tenant, board: board.id, user: identity.user, identity, name: typeof identity.name === "string" ? identity.name.slice(0, 200) : null, role, client: msg.client,
+      since: msg.since ?? 0, welcomed: false, next: undefined, wkey: writer ? wkey : null,
+      out: [], outBytes: 0, buffered: 0, owed: 0, blocked: false, flushing: false, waitSince: 0, progressAt: now(), winStart: now(), winDrained: 0,
+      opq: [], opqBytes: 0, tokens: lim.opBurst, tokenAt: now(), opTimer: null, limiter: presenceLimiter(now) });
+    c.b.conns.add(ws);
     bump(connsByUser, c.user, 1);
-    counts.accepted++;   // the hello timer keeps running until the room's first frame arrives (the bus may drop a hello)
+    if (writer) bump(writersBy, wkey, 1);
+    counts.accepted++;
+    if (Number.isFinite(identity.exp)) {
+      // setTimeout can't wait past 2^31-1 ms (24.8 days): a later expiry re-arms when that fires.
+      const arm = () => {
+        const wait = expiryWait(identity.exp, now());
+        if (wait > 0) { c.expTimer = setTimeout(() => { if (c.state === "live") arm(); }, wait); c.expTimer.unref?.(); return; }
+        if (c.state === "live") { log.info("token expired: connection closed", { conn: c.id }); refuse(ws, "auth", "your sign-in expired", 1008, "auth"); }
+      };
+      arm();
+    }
     log.info("hello accepted", { conn: c.id, tenant: c.tenant, board: c.board, user: c.user, role });
-    forward(c, { t: "hello", board: board.id, since: msg.since ?? 0, client: msg.client });   // no token past this line
+    if (!writer) {
+      // Rule 8: a viewer's hello never leaves the gateway. Its welcome carries the feed's seq and latest known epoch.
+      return welcomed(ws, () => codec.encode({ t: "welcome", seq: c.b.feed.seq, role, user: c.user, horizon: 0, rv: RULES_VERSION, room: { board: c.board, epoch: c.b.feed.epoch } }), 0);
+    }
+    // The hello timer keeps running until the room's welcome arrives (the bus may drop a hello).
+    c.forwarded = true;
+    forward(ws, { t: "hello", v: PROTOCOL_VERSION, board: board.id, client: msg.client });   // no token past this line
   }
 
   // § Bus: gateway → room as { n, conn, gateway, user, name, role, client, msg }, numbered per connection (rule 6).
-  // SEAM(p2): rule 11 says an op that arrives before `welcome` gets `auth`. Today's v0 Replica sends its unacked
-  // ops right behind its hello, so frames queued behind the hello are forwarded as soon as the hello is (the room
-  // handles them in `n` order, hello first). v1's Replica resends after `welcome`; then this becomes a refusal.
-  const forward = (c, msg) => bus.publish(subjects.inbox(c.tenant, c.board), { n: ++c.n, conn: c.id, gateway: id, user: c.user, name: c.name, role: c.role, client: c.client, msg });
+  // The size is checked BEFORE a number is used, so a message the bus can't carry never makes a gap.
+  function forward(ws, msg) {
+    const c = ws.data;
+    const env = { n: c.n + 1, conn: c.id, gateway: id, user: c.user, name: c.name, role: c.role, client: c.client, msg };
+    if (busBytes(env) > maxBusBytes) return false;
+    c.n++;
+    bus.publish(subjects.inbox(c.tenant, c.board), env)?.catch?.(err => log.error("inbox publish refused", { conn: c.id, err }));
+    return true;
+  }
+
+  /** § Pacing: the gateway's own bucket per connection (20/s, burst 100). Over-rate ops wait in order; never refused. */
+  function pumpOps(ws) {
+    const c = ws.data;
+    if (c.state !== "live") return;
+    const t = now();
+    c.tokens = Math.min(lim.opBurst, c.tokens + Math.max(0, t - c.tokenAt) * lim.opRate / 1000); c.tokenAt = t;
+    while (c.opq.length && c.tokens >= 1) {
+      const { msg, size } = c.opq.shift();
+      c.opqBytes -= size; c.tokens -= 1;
+      // § Limits: an op the bus can't carry is answered `too-large` with its id, never left unanswered.
+      if (!forward(ws, msg)) push(ws, codec.encode({ t: "error", id: msg.id, code: "too-large", message: "that op is too large to forward" }));
+    }
+    if (c.opq.length && !c.opTimer) {
+      c.opTimer = setTimeout(() => { c.opTimer = null; pumpOps(ws); }, Math.max(1, Math.ceil((1 - c.tokens) * 1000 / lim.opRate)));
+    }
+  }
+
+  function op(ws, msg, size) {
+    const c = ws.data;
+    const id_ = typeof msg.id === "string" ? { id: msg.id.slice(0, 256) } : {};
+    const answer = (code, message) => push(ws, codec.encode({ t: "error", ...id_, code, message }));
+    // Rule 11: before `welcome`, ops get `auth`.
+    if (!c.welcomed) return answer("auth", "wait for welcome");
+    // Rule 8: viewers write nothing durable and never reach the room. Answered in the room's order of checks
+    // (§ Limits): shape, then id, then role.
+    if (c.role === "viewer") {
+      const why = opProblem(msg);
+      if (why) return answer(why.code, why.message);
+      if (parseOpId(msg.id)?.client !== c.client) return answer("bad-op", "op ids start with your client id");
+      return answer("forbidden", "viewers can't write");
+    }
+    // v0's `transient: true` was removed in v1 (previews are presence). Refused rather than stripped: stripped, a
+    // preview would be logged as a durable op. No strike: an old client sends many while dragging.
+    if (msg.transient !== undefined) return answer("bad-op", "transient ops were removed in protocol v1");
+    // § Pacing, queue cap: 500 ops or 8 MB; past it `unavailable` and close (the client keeps its ops and resends).
+    if (c.opq.length >= lim.maxOpQueue || c.opqBytes + size > lim.maxOpQueueBytes) { log.warn("op queue full", { conn: c.id, ops: c.opq.length }); return refuse(ws, "unavailable", "too many ops queued: slow down and reconnect", 1013, "op queue full"); }
+    // Only the fields an op has travel on.
+    c.opq.push({ msg: { t: "op", id: msg.id, sentAt: msg.sentAt, stream: msg.stream, op: msg.op }, size }); c.opqBytes += size;
+    pumpOps(ws);
+  }
+
+  /** Presence (§ Presence): checked, rate-limited, relayed over the bus; it never touches the room or the log. */
+  function presence(ws, msg) {
+    const c = ws.data;
+    if (!c.welcomed) return;                                       // rule 11: dropped before welcome
+    if (presenceProblem(msg, c.role) || !c.limiter.allow(msg.k)) return;   // bad or over the rate: dropped, no error
+    if (msg.k === "emote" && c.role === "viewer") {                // viewers' emotes only as summed counts
+      const w = Math.floor(now() / lim.emoteWindowMs), counts = c.b.mine[w] ?? (c.b.mine[w] = {});
+      counts[msg.e] = (counts[msg.e] ?? 0) + 1;
+      return;
+    }
+    const pick = { cursor: ["x", "y"], select: ["stream", "ids"], laser: ["pts"], preview: ["stream", "elements"], emote: ["e"] }[msg.k];
+    const clean = { k: msg.k }; for (const f of pick) clean[f] = msg[f];
+    bus.publish(subjects.presence(c.tenant, c.board), { gateway: id, user: c.user, client: c.client, msg: clean })?.catch?.(() => {});
+  }
 
   async function frame(ws, data) {
     const c = ws.data;
@@ -440,18 +742,8 @@ export function gateway({ auth, registry, bus, rooms, log = quietLogger, codec =
       if (msg.t === "presence") return;                   // rule 11: presence before welcome is dropped
       return badFrame(ws, "no-hello", "say hello first", "auth");
     }
-    // SEAM(p2): § Limits, durable ops per connection (20/s, burst 100: queue, then refuse with `limit`). Not enforced yet.
-    if (msg.t === "op") {
-      // v0's `transient: true` (an unlogged, unthrottled relay that today's Room still implements) was removed in
-      // v1 (previews are presence). It is refused here rather than stripped: stripped, a preview would be logged
-      // as a durable op. No strike: an old client sends many while dragging. SEAM(p2): goes when the Room drops it.
-      if (msg.transient !== undefined) return push(ws, codec.encode({ t: "error", ...(typeof msg.id === "string" ? { id: msg.id.slice(0, 256) } : {}), code: "bad-op", message: "transient ops were removed in protocol v1" }));
-      // Only the fields an op has travel on.
-      return void forward(c, { t: "op", id: msg.id, stream: msg.stream, op: msg.op });
-    }
-    // SEAM(p2): presence (packages/protocol/presence.js: shapes, rates, coalescing), relayed over
-    // subjects.presence without touching the room. Until then it is dropped, silently, as the spec allows.
-    if (msg.t === "presence") return;
+    if (msg.t === "op") return op(ws, msg, data.length);
+    if (msg.t === "presence") return presence(ws, msg);
     // Rule 11: one board per connection. A second hello gets `bad-op` and the connection is closed.
     if (msg.t === "hello") { counts.badFrames++; log.warn("frame refused", { conn: c.id, why: "second-hello", state: c.state }); return refuse(ws, "bad-op", "already said hello", 1008, "second hello"); }
     // SEAM(p3): `blob` (signed URLs) is not served yet; it is refused like an unknown type.
@@ -482,7 +774,9 @@ export function gateway({ auth, registry, bus, rooms, log = quietLogger, codec =
       // Bun drops a frame handed to a socket already holding more than this. flush() never does (see there); it is set
       // above the largest snapshot § Limits allows plus a user's budget, so live traffic behind a snapshot rarely waits.
       backpressureLimit,
-      idleTimeout: 120,
+      // § Pacing: a connection heard from not at all (no frame, no pong) for 30 s is closed; Bun pings idle ones.
+      idleTimeout: lim.idleTimeoutSec,
+      sendPings: true,
       open(ws) {
         try {
           const c = ws.data;
@@ -503,13 +797,10 @@ export function gateway({ auth, registry, bus, rooms, log = quietLogger, codec =
           const size = sizeOf(data);
           // The first frame is the hello: refused here, before it is held, if it is too large to be one.
           if (c.first) { c.first = false; if (size > lim.maxHelloChars) return badFrame(ws, "hello-too-large", "hello is too large", "too-large"); }
-          // What waits behind the hello's awaits is bounded in bytes, so one socket can't pin gigabytes while a
-          // port is slow. SEAM(p2): today's Replica sends its unacked ops right behind the hello; a client holding
-          // more than this must wait for v1 (resend after `welcome`) or for fast auth. It is told `unavailable`.
-          // (Once live nothing awaits, so the queue only ever holds what one burst from the socket delivered.)
-          if (c.state !== "live") {
-            if (c.qBytes + size + lim.frameOverheadBytes > lim.maxQueuedBytes) { log.warn("frame queue overflow", { conn: c.id, state: c.state }); return refuse(ws, "unavailable", "too much sent before welcome", 1013, "queue overflow"); }
-          }
+          // What waits to be read is bounded in bytes in every state, so one socket can't pin gigabytes: before
+          // welcome behind a slow port (small cap), and once live behind the frame pump (§ Pacing's 8 MB).
+          const cap = c.state === "live" ? lim.maxLiveQueuedBytes : lim.maxQueuedBytes;
+          if (c.qBytes + size + lim.frameOverheadBytes > cap) { log.warn("frame queue overflow", { conn: c.id, state: c.state }); return refuse(ws, "unavailable", "too much sent at once", 1013, "queue overflow"); }
           // …and over the whole process, so many sockets behind one slow port can't add up without bound.
           if (c.state !== "live" && queuedTotal + size + lim.frameOverheadBytes > lim.maxTotalQueuedBytes) { log.warn("frame queue overflow: process", { conn: c.id, state: c.state }); return refuse(ws, "unavailable", "the server is busy: try again shortly", 1013, "queue overflow"); }
           c.q.push(data); c.qBytes += size + lim.frameOverheadBytes; queuedTotal += size + lim.frameOverheadBytes;
@@ -528,8 +819,15 @@ export function gateway({ auth, registry, bus, rooms, log = quietLogger, codec =
     stats: () => {
       let owed = 0;
       for (const ws of conns.values()) { const c = ws.data; if (c.state === "live") { try { owed += ws.getBufferedAmount(); } catch { /* gone */ } owed += c.outBytes; } }
-      return { conns: conns.size, ...counts, owedBytes: owed, owedTracked: owedTotal, queuedBytes: queuedTotal, users: connsByUser.size, waitingJoiners: waiters.size, sharedBytes, sharedTexts: sharedText.size };
+      return { conns: conns.size, ...counts, owedBytes: owed, owedTracked: owedTotal, queuedBytes: queuedTotal, users: connsByUser.size, waitingJoiners: waiters.size, sharedBytes, sharedTexts: sharedText.size, boards: boards.size };
     },
-    async close() { clearInterval(sweep); unsub(); for (const ws of [...conns.values()]) end(ws, 1001, "server closing"); },
+    /** A board's feed as this gateway holds it (null if it serves no one there): its base checkpoint, seq and tail. */
+    feed: (tenant, board) => { const f = boards.get(`${tenant}/${board}`)?.feed; return f ? { base: f.base.seq, seq: f.seq, tail: f.tail.length, tailBytes: f.tailBytes } : null; },
+    /** Re-check every connection's role on a board now (what a `grants` message does). */
+    recheck: async board => { for (const b of boards.values()) if (b.board === board) await recheck(b); },
+    async close() {
+      clearInterval(sweep); clearInterval(presenceTimer); clearInterval(emoteTimer); clearInterval(listTimer); clearInterval(roleTimer); unsub();
+      for (const ws of [...conns.values()]) end(ws, 1001, "server closing");
+    },
   };
 }

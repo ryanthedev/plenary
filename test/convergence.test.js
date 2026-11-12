@@ -24,7 +24,7 @@ function edit(w, c) {
   w.send(c, stream, { elements: [touch(el)] });
 }
 
-for (const seed of [1, 2, 3, 4, 5, 6, 7, 8]) test(`replicas converge under shuffled, duplicated delivery and reconnects (seed ${seed})`, () => {
+for (const seed of [1, 2, 3, 4, 5, 6, 7, 8]) test(`replicas converge under shuffled, duplicated delivery, reconnects and room restarts (seed ${seed})`, () => {
   const w = world(["owner", "editor", "editor", "annotator", "viewer"], seed);
   for (let round = 0; round < 400; round++) {
     const c = w.clients[Math.floor(w.rng() * w.clients.length)];
@@ -32,11 +32,13 @@ for (const seed of [1, 2, 3, 4, 5, 6, 7, 8]) test(`replicas converge under shuff
     if (w.rng() < 0.02 && c.conn) w.drop(c);                    // the phone goes to sleep
     if (!c.conn && w.rng() < 0.3) w.connect(c);                // and wakes up
     for (let k = 0; k < 3; k++) w.step();
-    if (round === 200) w.room.compact();                       // later joiners start from a snapshot
+    if (round === 120) w.rebuild();                            // the room dies; rebuilt from the whole log
+    if (round === 200) w.room.checkpoint();                    // later joiners start from a snapshot
+    if (round === 300) w.rebuild();                            // rebuilt again, from the checkpoint + the log after it
   }
   for (const c of w.clients) if (!c.conn) w.connect(c);
   w.settle();
-  const want = roomState(w.room);
+  const want = roomState(w.room), want2 = w.room.state();
   expect(want.applied).toBeGreaterThan(50);
   expect(want.board.elements.length).toBeGreaterThan(5);
   expect(want.notes.elements.length).toBeGreaterThan(0);
@@ -45,6 +47,9 @@ for (const seed of [1, 2, 3, 4, 5, 6, 7, 8]) test(`replicas converge under shuff
     expect(c.r.state()).toEqual(want);
   }
   expect(w.log.entries.length).toBe(w.room.seq);               // every seq logged exactly once
+  expect(w.log.entries.map(e => e.seq)).toEqual(w.log.entries.map((_, i) => i + 1));
+  expect(new Set(w.log.entries.map(e => `${e.by}|${e.id}`)).size).toBe(w.log.entries.length);   // no op logged twice
+  expect(w.rebuild({ keep: true }).state()).toEqual(want2);
 });
 
 test("two editors change the same element at the same version: every copy keeps the same winner", () => {
@@ -54,9 +59,12 @@ test("two editors change the same element at the same version: every copy keeps 
   const a = touch(clone(w.clients[0].r.streams.board.get("shared"))); a.x = 100;
   const b = touch(clone(w.clients[1].r.streams.board.get("shared"))); b.x = 200;
   expect(a.version).toBe(b.version);
-  w.send(w.clients[0], "board", { elements: [a] }); w.send(w.clients[1], "board", { elements: [b] }); w.settle();
+  // local() stamps what goes out (one past the copy it knows, fresh nonce): compare the elements as sent.
+  const sa = w.send(w.clients[0], "board", { elements: [a] }).op.elements[0], sb = w.send(w.clients[1], "board", { elements: [b] }).op.elements[0];
+  expect(sa.version).toBe(sb.version);
+  w.settle();
   const x = w.room.streams.board.get("shared").x;
-  expect(x).toBe(a.versionNonce < b.versionNonce ? 100 : 200);
+  expect(x).toBe(sa.versionNonce < sb.versionNonce ? 100 : 200);
   for (const c of w.clients) expect(c.r.streams.board.get("shared").x).toBe(x);
 });
 

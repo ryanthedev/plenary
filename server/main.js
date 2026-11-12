@@ -9,11 +9,21 @@
 //   LOG_LEVEL            debug | info | warn | error
 //   PLENARY_MAX_CONNS_PER_USER   open sockets one user may hold (default 64). A load test that shares a few dev
 //                        tokens between thousands of clients must raise it.
+//   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET   Google sign-in; both set → /auth routes work, else they answer 503
+//   OIDC_REDIRECT_URI    default http://localhost:8080/auth/callback (must be on PUBLIC_URL's origin)
+//   PUBLIC_URL           this server's origin as browsers see it, default the redirect URI's origin
+//   COOKIE_KEY           ≥ 32 bytes; signs login/exchange cookies (and sessions, unless SESSION_KEY is set).
+//                        Missing on a single node: a random key per process (sign-ins don't survive a restart).
+//                        Missing in cluster mode (DATABASE_URL or NATS_URL set): the server refuses to start.
+//   SESSION_KEY          ≥ 32 bytes; signs session tokens (default: COOKIE_KEY)
+//
+// start(env) reads ONLY its `env` argument (never process.env), so tests behave the same in every checkout
+// (Bun auto-loads .env into process.env). No value from env is ever logged, only names.
 //
 // The Registry (tenants, boards, grants, invites, links) is durable: SQLite in <data>/registry.db, next to the
 // log in <data>/plenary.db, so boards and their ops both survive a restart or a kill -9.
-// SEAM(platform): POST /boards and Google sign-in are not wired here yet (createServer({ http }) is where they go).
-// Until they are, with dev tokens on, there is one dev board: created on the first start, its id kept in
+// POST /boards and sign-in are platform's HTTP routes (server/auth/http.js), mounted here. With dev tokens on there
+// is also one dev board: created on the first start, its id kept in
 // <data>/dev-board.json and reused afterwards (and logged). Each dev user gets the role its token names (default
 // editor; if two tokens name one user, the highest role). A restart never demotes the board's last owner.
 
@@ -27,10 +37,45 @@ import { diskBlobs } from "./blobs/disk.js";
 import { authPort } from "./auth/port.js";
 import { devAuth } from "./auth/dev.js";
 import { sqliteRegistry } from "./registry/sqlite.js";
-import { tenancy } from "./auth/tenancy.js";
+import { tenancy as makeTenancy } from "./auth/tenancy.js";
+import { sessions as makeSessions } from "./auth/session.js";
+import { googleOidc } from "./auth/oidc.js";
+import { httpRoutes } from "./auth/http.js";
+import { subjects } from "./bus/port.js";
 import { ROLES } from "../packages/protocol/envelope.js";
 
-export async function start(env = process.env) {
+const KEY_MIN = 32;
+const keyOk = k => typeof k === "string" && new TextEncoder().encode(k).length >= KEY_MIN;
+
+/**
+ * The Registry with every change to who may use a board announced on the board's `grants` subject, so gateways
+ * re-check their connections' roles (revocation). Reads pass through. A failed lookup only skips the announcement.
+ */
+export function announcingRegistry(registry, bus, log) {
+  const announce = async board => {
+    try { const b = await registry.board(board); if (b) await bus.publish(subjects.grants(b.tenant, b.id), { board: b.id }); }
+    catch (err) { log.warn("grants announcement failed", { board, err }); }
+  };
+  const after = (name, boardOf) => async (...args) => {
+    const before = await boardOf(...args);
+    const out = await registry[name](...args);
+    const board = before ?? (out && typeof out === "object" ? out.board : null);
+    if (typeof board === "string") await announce(board);
+    return out;
+  };
+  return {
+    ...registry,
+    setGrant: after("setGrant", board => board),
+    createInvite: after("createInvite", o => o?.board),
+    revokeInvite: after("revokeInvite", async id => (await registry.invite(id).catch(() => null))?.board),
+    createLink: after("createLink", o => o?.board),
+    revokeLink: after("revokeLink", async id => (await registry.link(id).catch(() => null))?.board),
+    addLinkUse: after("addLinkUse", async link => (await registry.link(link).catch(() => null))?.board),
+  };
+}
+
+/** @param {Record<string, string|undefined>} env @param {{ fetch?: typeof fetch }} [deps] tests pass a stub fetch for Google */
+export async function start(env = {}, { fetch: fetchFn = globalThis.fetch } = {}) {
   const log = createLogger({ level: env.LOG_LEVEL || "info" });
   const dataDir = env.PLENARY_DATA_DIR || "./data";
   mkdirSync(dataDir, { recursive: true });
@@ -41,12 +86,35 @@ export async function start(env = process.env) {
     if (!tokens || typeof tokens !== "object" || Array.isArray(tokens)) { log.error("PLENARY_DEV_TOKENS is not a JSON object; dev tokens stay off"); tokens = null; }
   }
 
+  // Keys. In cluster mode every node must share them, so a missing one refuses the start; on one node a random
+  // key per process works (sign-ins and sessions then don't survive a restart).
+  const cluster = !!(env.DATABASE_URL || env.NATS_URL);
+  let cookieKey = env.COOKIE_KEY;
+  if (cookieKey !== undefined && !keyOk(cookieKey)) throw new Error(`COOKIE_KEY must be at least ${KEY_MIN} bytes`);
+  if (cookieKey === undefined) {
+    if (cluster) throw new Error("COOKIE_KEY is required in cluster mode (DATABASE_URL or NATS_URL is set): every node must sign with the same key");
+    cookieKey = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
+    log.warn("COOKIE_KEY is not set: using a random key for this process; sign-ins won't survive a restart");
+  }
+  const sessionKey = env.SESSION_KEY ?? cookieKey;
+  if (!keyOk(sessionKey)) throw new Error(`SESSION_KEY must be at least ${KEY_MIN} bytes`);
+  const redirectUri = env.OIDC_REDIRECT_URI || "http://localhost:8080/auth/callback";
+  const origin = env.PUBLIC_URL ? new URL(env.PUBLIC_URL).origin : new URL(redirectUri).origin;
+
   const store = sqliteStore({ path: join(dataDir, "plenary.db") });
   const bus = memoryBus({ onError: (err, subject) => log.error("bus subscriber failed", { subject, err }) });
   const blobs = diskBlobs({ dir: join(dataDir, "blobs") });
-  const registry = sqliteRegistry({ path: join(dataDir, "registry.db") });
+  const rawRegistry = sqliteRegistry({ path: join(dataDir, "registry.db") });
+  const registry = announcingRegistry(rawRegistry, bus, log);
   const dev = devAuth(tokens ? { enabled: true, tokens } : undefined);
-  const auth = authPort({ dev, tenancy: tenancy({ registry }) });
+  const sessions = await makeSessions({ key: sessionKey });
+  const tenancy = makeTenancy({ registry });
+  const auth = authPort({ sessions, dev, tenancy });
+  // Google sign-in only when both halves of the OAuth client are there; otherwise /auth answers 503.
+  const oidc = env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET
+    ? googleOidc({ clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET, redirectUri, fetch: fetchFn })
+    : null;
+  log.info("sign-in", { google: !!oidc, devTokens: dev.enabled, cluster });
 
   let devBoard = null;
   if (dev.enabled) {
@@ -55,7 +123,7 @@ export async function start(env = process.env) {
     let saved = null;
     if (existsSync(devFile)) { try { saved = JSON.parse(readFileSync(devFile, "utf8")).board; } catch { saved = null; } }
     // Not in a try: a Registry that can't answer must fail the start, not mint a second dev board.
-    let board = typeof saved === "string" ? await registry.board(saved) : null;
+    let board = typeof saved === "string" ? await rawRegistry.board(saved) : null;
     if (!board) {
       const tenant = await registry.createTenant({ domain: null });
       board = await registry.createBoard({ tenant: tenant.id, title: "dev board", memberRole: null });
@@ -85,16 +153,24 @@ export async function start(env = process.env) {
 
   const perUser = Number(env.PLENARY_MAX_CONNS_PER_USER);
   const limits = Number.isSafeInteger(perUser) && perUser > 0 ? { maxConnsPerUser: perUser } : undefined;
-  const server = createServer({ auth, registry, store, bus, blobs, log, limits, port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1" });
-  return { server, store, bus, registry, log, devBoard, async stop() { await server.stop(); await bus.close(); await store.close(); await registry.close(); } };
+  const config = {
+    cookieKey,
+    postLoginUrl: env.POST_LOGIN_URL || `${origin}/`,
+    boardUrl: env.BOARD_URL || `${origin}/?board={board}`,
+    publicUrl: origin,
+  };
+  const http = httpRoutes({ registry, sessions, oidc, tenancy, now: Date.now, config, ...(dev.enabled ? { dev } : {}) });
+  const server = createServer({ auth, registry, store, bus, blobs, log, limits, http, port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1" });
+  return { server, store, bus, registry, log, devBoard, oidc, async stop() { await server.stop(); await bus.close(); await store.close(); await rawRegistry.close(); } };
 }
 
 if (import.meta.main) {
-  const log = createLogger({ level: process.env.LOG_LEVEL || "info" });
+  const env = process.env;   // the process entry point is the one place that reads the real environment
+  const log = createLogger({ level: env.LOG_LEVEL || "info" });
   // Handlers catch their own errors; these are the last line, so one bug never takes every board down with it.
   process.on("uncaughtException", err => log.error("uncaught exception", { err }));
   process.on("unhandledRejection", err => log.error("unhandled rejection", { err }));
-  const app = await start();
+  const app = await start(env);
   let stopping = false;
   for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, async () => {
     if (stopping) return; stopping = true;

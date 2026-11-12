@@ -80,3 +80,8 @@ Report (design already written): docs/m2/reports/p2-swap.md.
   cluster mode only gates COOKIE_KEY.
 - Registry Postgres least privilege is platform's (server/registry/).
 - This handoff and the report are uncommitted in the shared tree (BRIEF-BASE: workers don't commit).
+
+## Status 2026-11-12: DONE
+
+All "Next" items done; see docs/m2/reports/p2-swap.md (done-when output, fixes, adapted tests, risks, platform asks).
+Nothing committed (manager merges).

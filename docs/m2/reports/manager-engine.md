@@ -11,7 +11,8 @@ already PASS, then one merge into main, send id to t14k and t1bx; then p-arch + 
 
 | Job | Terminal | Status |
 |---|---|---|
-| p2-swap (builder, successor plenary-p2-swap2) | t1fm | RUNNING (worktree; handoff docs/m2/handoff/p2-swap.md) |
+| p2-swap (builder, plenary-p2-swap2) | t1fm | reported (done-when 429/0, 488/0 with PG+NATS), idle; kept for a fix round |
+| p2-swapv (verifier, plenary-p2-swapv) | t1fn | RUNNING (worktree, read-only) |
 
 On main: 7b6a5dd scaffold, b804f3b p4-pg, bbdae0e p4-natss3. On p2-land: a68e9dc v1.1 code, 892ee6e client.
 Closed: t1dh, t15q (+ its worktree), t186, t188, t18c, t18b, t171, t16y, t158, t17d, t17p, t17f, t17m, t17j. Leftover scratch: t17j ~1 GB and t18c 168 MB in their
@@ -209,3 +210,4 @@ scratchpads (their rm was refused); remove when convenient.
 - CEO rule (2026-11-12): never prompt/hc send the proxy t1bx; report by ending the turn with one short message (outcome first, report path); 'URGENT' first if urgent. Phase 3 audited and pushed to origin (378d089, clean 510/0).
 - Closed t15q, t186, t188 (work committed); removed t15q's scratch worktree. p2-swap t1dh handing off at 36% (finishing a welcome-ordering fix first); successor expected same turn.
 - t1dh handed off to t1fm (plenary-p2-swap2); t1dh closed. Told platform t187: deploy/cluster.compose.yml needs COOKIE_KEY (main.js refuses cluster mode without it after p2-swap).
+- p2-swap (t1fm) reported: done-when green (429/0; 488/0 with PG+NATS); feed checkpoint-race fix; queue cap + idle tests; PG least privilege tested; no SEAM(p2) left. Platform asks: session verify() return exp; grants publish from registry. p-arch to absorb test/server/architecture.test.js. Verifier t1fn started (brief docs/m2/briefs/p2-swapv.md).

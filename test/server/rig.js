@@ -100,6 +100,7 @@ export function client(rig, name, cname = name, o = {}) {
   const c = {
     name, r: new Replica({ client: cname, ...(o.now ? { now: o.now } : {}), ...(o.random ? { random: o.random } : {}) }),
     s: null, msgs: [], errors: [], connects: 0, wantOpen: false, timer: null, maxWaitMs: o.maxWaitMs ?? 50, board: o.board,
+    drops: 0,   // bumped by every drop(): a socket that finishes opening after a drop is closed, never adopted (R6)
     // connect() and reconnect() each share one in-flight promise: a test loop that calls connect() while a resync
     // is reconnecting gets that same socket, never a second one racing it.
     connect() {
@@ -109,7 +110,13 @@ export function client(rig, name, cname = name, o = {}) {
     },
     async open_() {
       c.wantOpen = true; c.connects++;
-      const s = await sock(rig.server.wsUrl); c.s = s;
+      const drops = c.drops;
+      if (o.beforeOpen) await o.beforeOpen();
+      const s = await sock(rig.server.wsUrl);
+      // R6: a drop() while this socket was opening (the old one still looked open) set wantOpen false. Adopting this
+      // socket anyway left an open socket nobody wanted, whose next resync was ignored. It is closed instead.
+      if (c.drops !== drops) { s.close(); return c; }
+      c.s = s;
       s.ws.onmessage = e => {
         if (c.s !== s) return;
         const m = jsonCodec.decode(e.data); c.msgs.push(m);
@@ -133,7 +140,7 @@ export function client(rig, name, cname = name, o = {}) {
       const w = c.r.wait();
       if (w !== null) { c.timer = setTimeout(() => c.pump(), Math.max(1, w)); c.timer.unref?.(); }
     },
-    async drop() { c.wantOpen = false; clearTimeout(c.timer); const s = c.s; c.s = null; if (s) await s.close(); },
+    async drop() { c.drops++; c.wantOpen = false; clearTimeout(c.timer); const s = c.s; c.s = null; if (s) await s.close(); },
     reconnect() {
       if (c.reconnecting) return c.reconnecting;
       c.reconnecting = (async () => { await c.drop(); await sleep(Math.min(c.r.reconnectWait(), c.maxWaitMs)); return c.connect(); })().finally(() => { c.reconnecting = null; });
@@ -156,13 +163,22 @@ export function client(rig, name, cname = name, o = {}) {
  * socket and an empty copy, and treating that as done was a race in this helper, not in the server.
  */
 export async function settled(rig, clients, ms = 10000) {
-  await until(async () => {
-    await rig.idle();
-    // Viewers never open a room (rule 8): with none running, the Store's end is what everyone must reach.
-    const room = await rig.room();
-    const end = room ? room.resolved : await rig.rawStore.lastSeq(rig.ids.tenant, rig.ids.board);
-    return clients.every(c => !c.busy && !c.r.resync && (!c.open || (c.r.welcomed && c.r.pending.size === 0 && c.r.applied === end)));
-  }, "clients to settle", ms);
+  let end = 0;
+  const done = c => !c.busy && !c.r.resync && (!c.open || (c.r.welcomed && c.r.pending.size === 0 && c.r.applied === end));
+  try {
+    await until(async () => {
+      await rig.idle();
+      // Viewers never open a room (rule 8): with none running, the Store's end is what everyone must reach.
+      const room = await rig.room();
+      end = room ? room.resolved : await rig.rawStore.lastSeq(rig.ids.tenant, rig.ids.board);
+      return clients.every(done);
+    }, "clients to settle", ms);
+  } catch (err) {
+    // Say who didn't settle and in what state, so a rare timeout can be diagnosed from one failure.
+    const who = clients.filter(c => !done(c)).map(c => ({ name: c.r.client ?? c.name, busy: c.busy, resync: c.r.resync, open: c.open, welcomed: c.r.welcomed,
+      pending: c.r.pending.size, applied: c.r.applied, end, connects: c.connects, wantOpen: c.wantOpen, wait: c.r.wait?.(), errors: c.errors.slice(-3), last: c.msgs.slice(-3).map(m => m.t) }));
+    throw new Error(`${err.message}: ${JSON.stringify(who)}`);
+  }
 }
 
 /** The room's state in the shape of Replica.state(). */

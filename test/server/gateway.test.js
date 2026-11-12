@@ -8,6 +8,9 @@ import { makeElement, touch, clone } from "../../packages/core/model.js";
 afterAll(cleanup);
 const rect = (id, x = 0) => makeElement("rectangle", { id, x, y: 0, width: 10, height: 10 });
 const hello = (r, name, extra = {}) => ({ t: "hello", v: 1, token: tokenOf(name), board: r.ids.board, since: 0, client: "raw", ...extra });
+// `here` (presence summary, § Presence) comes right after catch-up and on every count change; these tests are about the
+// op stream, so they read past it.
+const noHere = m => m.t !== "here";
 const noSecrets = r => expect(r.lines.join("")).not.toContain(SECRET);
 
 test("/health answers 200 with small JSON; other paths 404; /ws without an upgrade 426", async () => {
@@ -95,7 +98,7 @@ test("slow auth: ops after welcome are acked in order and numbered per connectio
   s.send({ t: "op", id: "raw:3", sentAt: 0, stream: "board", op: { elements: [rect("c")] } });
   await s.next(m => m.t === "ack" && m.id === "raw:3");
   // The room publishes each entry before it acks it (§ Bus), and the feed delivers in seq order.
-  expect(s.msgs.map(m => m.t === "ack" ? `ack ${m.id}@${m.seq}` : m.t)).toEqual(["welcome", "entries", "ack raw:2@1", "entries", "ack raw:3@2"]);
+  expect(s.msgs.filter(noHere).map(m => m.t === "ack" ? `ack ${m.id}@${m.seq}` : m.t)).toEqual(["welcome", "entries", "ack raw:2@1", "entries", "ack raw:3@2"]);
   expect(r.inbox.map(m => [m.n, m.msg.t])).toEqual([[1, "hello"], [2, "op"], [3, "op"]]);
   await r.stop();
 });
@@ -245,9 +248,9 @@ test("rule 1: nothing is acked or broadcast before the append resolves", async (
   // A viewer who joins while the append is in flight is welcomed at the resolved seq and shown nothing unresolved.
   const late = await r.sock(); late.send(hello(r, "viewer", { client: "late" }));
   await sleep(80);
-  expect(a.msgs.map(m => m.t)).toEqual(["welcome"]);
-  expect(b.msgs.map(m => m.t)).toEqual(["welcome"]);
-  expect(late.msgs.map(m => [m.t, m.seq])).toEqual([["welcome", 0]]);
+  expect(a.msgs.filter(noHere).map(m => m.t)).toEqual(["welcome"]);
+  expect(b.msgs.filter(noHere).map(m => m.t)).toEqual(["welcome"]);
+  expect(late.msgs.filter(noHere).map(m => [m.t, m.seq])).toEqual([["welcome", 0]]);
   expect(await r.rawStore.lastSeq(r.ids.tenant, r.ids.board)).toBe(0);
   const g = gate; gate = null; g.resolve();
   await a.next(m => m.t === "ack" && m.id === "a:2");
@@ -480,7 +483,7 @@ test("H1: a 30,000-deep op is refused before it is parsed, nothing is stored, an
   const [late, health] = await Promise.all([r.sock().then(async s => { s.send(hello(r, "viewer", { client: "late" })); await s.next(m => m.t === "entries"); return s; }), r.health()]);
   expect(performance.now() - t0).toBeLessThan(500);
   expect(health.status).toBe(200);
-  expect(late.msgs.map(m => m.t)).toEqual(["welcome", "entries"]);
+  expect(late.msgs.filter(noHere).map(m => m.t)).toEqual(["welcome", "entries"]);
   expect(watcher.msgs.filter(m => m.t === "entries").length).toBe(1);    // only the one valid op was broadcast
   expect(a.ws.readyState).toBe(WebSocket.OPEN);
   await r.stop();
@@ -497,7 +500,7 @@ test("H1: catch-up is right for every `since`, and the same bytes go to every jo
   await w.next(m => m.t === "ack" && m.id === "w:8");
   await w.close(); await r.idle();                                       // the board's feed goes; joiners start one from the Store
   const join = async since => { const s = await r.sock(); s.send(hello(r, "viewer", { client: "j" + since, since })); await s.next(m => m.t === "welcome"); await r.idle(); await r.bus.flush(); await sleep(20); return s; };
-  const shape = s => s.msgs.map(m => (m.t === "entries" ? `entries ${m.entries.map(e => e.seq)}` : m.t === "snapshot" ? `snapshot@${m.seq}` : m.t));
+  const shape = s => s.msgs.filter(noHere).map(m => (m.t === "entries" ? `entries ${m.entries.map(e => e.seq)}` : m.t === "snapshot" ? `snapshot@${m.seq}` : m.t));
   expect(shape(await join(0))).toEqual(["welcome", "snapshot@5", "entries 6,7,8"]);
   expect(shape(await join(3))).toEqual(["welcome", "snapshot@5", "entries 6,7,8"]);
   expect(shape(await join(5))).toEqual(["welcome", "entries 6,7,8"]);
@@ -567,7 +570,7 @@ test("M5: a v0 `transient` op is refused, not relayed and not logged; an inbox g
   expect(a.msgs.filter(m => m.t === "error").length).toBe(12);            // each answered by id, and no strike-out
   expect(a.msgs.filter(m => m.t === "error").every(m => m.code === "bad-op" && /^a:\d+$/.test(m.id))).toBe(true);
   await r.idle(); await r.bus.flush(); await sleep(20);
-  expect(v.msgs.map(m => m.t)).toEqual(["welcome", "entries"]);           // no `transient` relay reached the viewer
+  expect(v.msgs.filter(noHere).map(m => m.t)).toEqual(["welcome", "entries"]);           // no `transient` relay reached the viewer
   expect(r.inbox.filter(m => m.msg?.t === "op").map(m => Object.keys(m.msg).sort())).toEqual([["id", "op", "sentAt", "stream", "t"]]);
   expect((await r.rawStore.read(r.ids.tenant, r.ids.board, 1, 10)).map(e => e.id)).toEqual(["a:13"]);
 

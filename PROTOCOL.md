@@ -257,7 +257,7 @@ Server → client
 | `entries` | `entries: [{ seq, board, tenant, stream, op, by, id, at, rv, name? }]` | catch-up and live, ascending `seq`; `name` only on `records` entries (§ Records) |
 | `ack` | `id`, `seq` | the entry is durable (§ Store says against what); it is never lost short of losing the Store's own media |
 | `presence` | `batch: [{ user, client, k, … }]` | coalesced others' presence |
-| `here` | `writers: [{ user, name, role }]` (≤ 50), `writerCount`, `viewers` (count) | who's on the board (§ Presence); sent on change, at most 1/s |
+| `here` | `writers: [{ user, name, role }]` (≤ 50), `writerCount`, `viewers` (count) | who's on the board (§ Presence); sent on change, at most 1/s (every 5 s on big boards); without `writers` when only a count changed |
 | `emotes` | `counts: { emoji: n }` | viewers' emotes summed per 500 ms |
 | `blob` | `sha1`, `url` | a signed URL, 5 minutes, one blob, one verb |
 | `error` | `id?`, `code`, `message` | codes below |
@@ -530,6 +530,21 @@ may drop at any hop. It doesn't touch the room: gateways relay it over the bus (
   change and at least every 5 s; every gateway merges what it heard in the last 15 s and sends `here` to its
   clients on change, at most 1/s. `writers` lists at most 50 (owners and editors first, then the most recently
   active); `writerCount` is the full number. Best effort, like all presence: counts may lag or be briefly wrong.
+  - **What is counted.** A writer is a user with an owner, editor, annotator or commenter connection; `writerCount`
+    counts users (a user's tabs count once). `viewers` counts viewer **connections** (two tabs count twice): a
+    gateway can't de-duplicate 100k viewers across gateways without lists, and the bus message must stay small.
+  - **Merging.** Each gateway keeps the latest `.here` message per gateway id (its own included) for 15 s. Users in
+    the merged lists appear once (their highest role and latest `active`); `writerCount` = those listed users plus,
+    for each gateway, its writers it couldn't list (its `writerCount` minus its list). Exact while every gateway's
+    list is complete (≤ 50 writers each); past that, a user connected through two gateways may count twice.
+  - **Pacing.** A gateway publishes on `.here` when its own numbers change, at most once a second, and at least
+    every 5 s. It sends `here` to its clients when the merged answer changes, at most once a second, and to a
+    joiner right after its catch-up. **Big boards:** where this gateway holds more than 1,000 connections on the
+    board, it sends `here` at most every 5 s (a 50-writer `here` is ~4 KB; 1/s to 100k viewers would be 400 MB/s).
+    Sending to many connections yields to the event loop as it goes; one send at a time per board.
+  - **Count-only `here`.** When only `writerCount` or `viewers` changed, `here` leaves out `writers`; a client keeps
+    its last list and names (an explicit list, even `[]`, replaces them). A joiner's first `here` always carries the
+    list. (At 100k connections a 50-writer list every second would be ~400 MB/s; counts alone are tens of bytes.)
 
 ## Records
 
@@ -625,6 +640,27 @@ All ports are async (Promises; QuickJS has them). The room imports none of them 
 - The gateway awaits both, plus `Registry.board(board)`, **before** it forwards the hello: a room sees only verified
   `{user, name, role, client}`.
 - The role holds for the connection's life; revoking it closes the user's connections (M6 detail).
+- **Re-checking live connections.** A gateway computes the role of its live connections on a board again (1) on
+  every `.grants` message for that board (§ Bus) and (2) on a timer, every **60 s**, because time passing changes
+  roles without any message (a share link or invite past its `expiresAt`, § Tenancy). So an expiring link or invite
+  takes effect within about 60 s; a `grants` change within one pass. A connection that lost its role is answered
+  `auth` and closed; one whose role changed is answered `unavailable` and closed (it reconnects with the new role).
+  - **One pass at a time per board.** A `grants` message during a pass runs one more pass after it, however many
+    arrive: never a pass per message. A timer tick during a pass is skipped. A `grants` message during a timed or
+    retry pass also cuts that pass short at its next batch (the users it didn't reach keep their role until the
+    grants pass, which checks everyone).
+  - **Per user, not per connection.** A user's connections on a board share one `role` answer per pass (grouped
+    by user, email and domain: what `role` reads). Users with
+    a writer connection are checked first (they are the ones who could write). The pass yields between users, so it
+    never holds a gateway's event loop.
+  - **Errors (`role` throws, or hasn't answered in 2 s).** After a `grants` message, **fail closed**: that user's connections are answered
+    `unavailable` and closed, and their hellos do the check again (a Registry that can't answer can't vouch for a
+    role that was just changed). On the timed pass, **keep and retry**: the connection stays open and is checked
+    again after 2 s, 4 s, 8 s (counted per connection; a good answer resets the count); after 3 failed retries
+    (about 14 s of outage) that connection alone is answered `unavailable` and closed. A timed pass whose whole
+    first batch of lookups fails stops (the Registry looks down); the users it didn't reach are unchanged until the
+    next pass. So a short Registry blip closes nobody, one failing user closes only their own connections, and an
+    expired link outlives its `expiresAt` by at most about 60 s + 14 s while the Registry answers.
 
 ### Registry
 
@@ -696,7 +732,13 @@ The log, checkpoints and each board's epoch (boards live in the Registry).
   and `.here` (gateways), `.inbox` (gateway → room, numbered per connection: rule 6), `.gw.<gateway>` (room →
   that one gateway: `welcome`, `ack`, `error`, each addressed to a `conn`), and `.grants` (whoever changes the
   board's grants, invites or links → gateways: `{ board }`; each gateway computes its connections' roles again and
-  closes the ones that lost access or changed role). Gateway ids are server-minted like the others.
+  closes the ones that lost access or changed role; § Auth, Re-checking live connections, also says when they
+re-check without one). `.grants` is at-most-once like all bus traffic: a lost one is repaired by the next timed
+  pass (≤ 60 s). Gateway ids are server-minted like the others.
+- **`.here` messages** (gateway → gateways, never saved): `{ gateway, writers: [{ user, name, role, active }]
+  (≤ 50), writerCount, viewers }` = that gateway's own writer users on the board (the 50 it would show first, with
+  `active` = the time of their last op or presence, ms), its number of writer users, and its number of viewer
+  connections. Small by construction (≤ 50 entries) whatever the board's size.
 - **At-most-once.** Entries carry `seq`, so a gateway that sees a gap reads the missing range from the Store and
   delivers in order; duplicates are dropped by `seq`. Presence has no repair.
 - **A lost last entry is repaired two ways.** While it runs, the room publishes a `{ seq, epoch }` **heartbeat**

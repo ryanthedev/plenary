@@ -174,17 +174,20 @@ test("§ Pacing: over-rate ops wait in the gateway in order and are all acked; p
 });
 
 test("a connection is closed with `auth` when its token's expiry passes; an expired token is refused at hello", async () => {
-  let exp = Math.floor(Date.now() / 1000) + 1;
-  const r = await rig({ wrapAuth: a => ({ ...a, verify: async t => { const id = await a.verify(t); return id && { ...id, exp }; } }) });
+  // The expiry is stamped when verify runs (1-2 s ahead), not before the rig is built: on a loaded machine, building
+  // the rig and saying hello took over a second, the token was already expired at hello, and the welcome never came
+  // (bun's 5 s default timeout, manager t18m, 2026-11-12). `expired` switches to a past expiry for the second half.
+  let expired = false;
+  const r = await rig({ wrapAuth: a => ({ ...a, verify: async t => { const id = await a.verify(t); return id && { ...id, exp: Math.floor(Date.now() / 1000) + (expired ? -1 : 2) }; } }) });
   const s = await r.sock(); s.send(hello(r, "editor")); await s.next(m => m.t === "welcome");
   expect((await s.whenClosed(5_000)).code).toBe(1008);
   expect(s.msgs.at(-1)).toMatchObject({ t: "error", code: "auth", message: "your sign-in expired" });
-  exp = Math.floor(Date.now() / 1000) - 1;
+  expired = true;
   const late = await r.sock(); late.send(hello(r, "editor"));
   expect((await late.whenClosed()).code).toBe(1008);
   expect(late.msgs).toEqual([{ t: "error", code: "auth", message: "not allowed" }]);
   await r.stop();
-});
+}, 20000);
 
 test("rule 6: a room forgets a gateway silent for 30 s (its clock), unless the gateway's 5 s connection lists keep it heard", async () => {
   for (const lists of [true, false]) {
@@ -200,25 +203,37 @@ test("rule 6: a room forgets a gateway silent for 30 s (its clock), unless the g
   }
 });
 
-test("a board feed picks up the host's checkpoint written just after the entries that triggered it (on the next heartbeat): a joiner from 0 gets one snapshot, not a long tail", async () => {
-  // One 50 KB text rewritten 10 times: the host folds by bytes every second op (tailFoldBytes 64 KB; the board stays
-  // 50 KB, so the 2x bound always holds). Its checkpoint is written right after the entries are published, so the
-  // feed's look on those entries misses it; the heartbeat (2 s) brings the retry.
+test("a board feed picks up the host's checkpoint written just after the entries that triggered it (on the next heartbeat): a joiner from 0 gets that snapshot and only the entries after it", async () => {
+  // One 50 KB text rewritten 10 times: the host folds by bytes (tailFoldBytes 64 KB) only when nothing is in flight
+  // (room-host.js foldIfDue). Its checkpoint is written right after the entries are published, so the feed's look on
+  // those entries misses it; the heartbeat (2 s) brings the retry.
+  // Deterministic order (p2-tunev LOW 2): op 1, then ops 2 and 3 together (op 2's fold is skipped while 3 is in flight),
+  // then 4 to 10 one at a time. Folds land on 3, 5, 7, 9 and op 10 alone is under the trigger, so the room's base
+  // settles at 9, not 10. The test asserts on whatever base the room settles at, never on a fixed seq.
   const r = await rig({ host: { tailFoldBytes: 64 * 1024 } });
   const w = await r.sock(); w.send(hello(r, "editor")); await w.next(m => m.t === "welcome");
   const text = n => ({ id: "note", type: "text", version: n, versionNonce: n, x: 0, y: 0, width: 10, height: 10, isDeleted: false, text: String(n % 10).repeat(50_000) });
-  for (let n = 1; n <= 10; n++) { w.send(op("editor", n, text(n))); await w.next(m => m.t === "ack" && m.id === `editor:${n}`); }
+  const ack = n => w.next(m => m.t === "ack" && m.id === `editor:${n}`);
+  w.send(op("editor", 1, text(1))); await ack(1);
+  w.send(op("editor", 2, text(2))); w.send(op("editor", 3, text(3))); await ack(2); await ack(3);
+  for (let n = 4; n <= 10; n++) { w.send(op("editor", n, text(n))); await ack(n); }
   await r.idle();
-  expect((await r.room()).base.seq).toBe(10);                           // the host folded on the last op
+  // The host folds in a setTimeout(0) queued when the entries resolve: once resolved is 10, one more macrotask turn
+  // has run every fold that will ever come.
+  await until(async () => (await r.room()).resolved === 10, "the room to resolve op 10", 15000);
+  await sleep(0); await sleep(0);
+  const base = (await r.room()).base.seq;
+  expect(base).toBeGreaterThan(0);                                         // the byte trigger folded at least once
   const feed = () => r.server.gateway.feed(r.ids.tenant, r.ids.board);
-  await until(() => feed()?.base === 10, "the feed to rebase onto seq 10", 4000);
-  expect(feed()).toMatchObject({ base: 10, seq: 10, tail: 0 });
+  await until(() => feed()?.base === base, `the feed to rebase onto seq ${base} (on the next heartbeat)`, 15000);
+  expect(feed()).toMatchObject({ base, seq: 10, tail: 10 - base });
   const j = await r.sock(); j.send(hello(r, "viewer"));
   const snap = await j.next(m => m.t === "snapshot");
-  expect(snap.seq).toBe(10);
-  expect(snap.streams.board.elements.map(e => [e.id, e.version])).toEqual([["note", 10]]);
+  expect(snap.seq).toBe(base);
+  await until(() => j.msgs.filter(m => m.t === "entries").flatMap(m => m.entries ?? []).length >= 10 - base, "the tail after the snapshot");
   await sleep(100);
-  expect(j.msgs.filter(m => m.t === "entries")).toEqual([]);             // nothing after the snapshot: no tail to send
+  const seqs = j.msgs.filter(m => m.t === "entries").flatMap(m => (m.entries ?? []).map(e => e.seq));
+  expect(seqs).toEqual(Array.from({ length: 10 - base }, (_, i) => base + 1 + i));   // only what follows the snapshot
   expect(w.closed).toBe(null);
   await r.stop();
 }, 20000);

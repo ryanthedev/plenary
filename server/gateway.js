@@ -10,7 +10,8 @@
 // After welcome: ops are paced per connection (20/s, burst 100, queued in order) and numbered `n` toward the room
 // (rule 6); a close notice and a 5 s list of open writer connections keep the room's `n` state bounded. Presence is
 // checked, rate-limited, relayed over the bus and coalesced every 50 ms: it never reaches the room or the log.
-// A `grants` message re-checks every connection's role on the board (revocation); a token's expiry closes it.
+// A `grants` message and a 60 s timer re-check every connection's role on the board (revocation; § Auth, Re-checking
+// live connections: one pass at a time per board, per user, yielding); a token's expiry closes it.
 //
 // Bad frames never reach a room and never throw out of here: binary, nested too deep, not JSON, not an object,
 // no `t`, a second hello, an unknown `t`. Before hello: `error` and close. After: `error`, and a close after a few
@@ -74,7 +75,19 @@ export const LIMITS = {
   emoteWindowMs: 500,                       // viewers' emotes are summed per window
   connListMs: 5_000,                        // open writer connections are listed to each room this often
   roleRecheckMs: 60_000,                    // every live connection's role is computed again this often (a link or invite expiring is not a `grants` message)
-  feed: {},                                 // options for each board's feed (pollMs, chunkBytes, …; tests)
+  // § Auth, Re-checking live connections: errors on the timed pass keep the connection and retry.
+  recheckRetries: 3,                        // failed timed checks retried this many times (after 2 s, 4 s, 8 s), then closed
+  recheckRetryMs: 2_000,                    // the first retry's wait; it doubles
+  recheckLookupMs: 2_000,                   // one re-check lookup that hasn't settled by then is an error (a hung Registry call)
+  recheckConcurrency: 8,                    // role lookups in flight per pass (an async Registry: a pass isn't users × round trip)
+  // § Presence, `here`.
+  hereMax: 50,                              // writers listed
+  hereMs: 1_000,                            // `here` to clients and `.here` publishes: at most this often
+  herePublishMs: 5_000,                     // `.here` published at least this often
+  hereTtlMs: 15_000,                        // another gateway's `.here` counts this long
+  hereBigBoard: 1_000,                      // more connections than this on a board here…
+  hereBigMs: 5_000,                         // …and `here` goes to them at most this often
+  feed: {},                               // options for each board's feed (pollMs, chunkBytes, …; tests)
 };
 
 const isObj = v => !!v && typeof v === "object" && !Array.isArray(v);
@@ -188,6 +201,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     if (wasLive) {
       owedTotal -= c.owed; bump(owedByUser, c.user, -c.owed); bump(connsByUser, c.user, -1);
       if (c.wkey) bump(writersBy, c.wkey, -1);
+      hereCount(c, -1);
       socketTotal -= c.buffered; bump(socketByUser, c.user, -c.buffered); c.buffered = 0;
       c.owed = 0; dropQueue(c); waiters.delete(ws); c.opq.length = 0;
       // § Bus: the close notice (rule 6), for a connection the room heard of.
@@ -434,7 +448,9 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     const key = `${tenant}/${board}`;
     let b = boards.get(key);
     if (!b) {
-      b = { key, tenant, board, conns: new Set(), refs: 0, coalescer: presenceCoalescer(), mine: {}, sums: new Map(), unsubs: [] };
+      b = { key, tenant, board, conns: new Set(), refs: 0, coalescer: presenceCoalescer(), mine: {}, sums: new Map(), unsubs: [], rc: newRecheck(),
+        // `here` (§ Presence): this gateway's writer users and viewer connections, the latest `.here` per gateway, what was sent.
+        hw: new Map(), hv: 0, hFrom: new Map(), hChanged: false, hPubAt: 0, hText: null, hCountText: null, hKey: null, hVer: 0, hOut: false, hSentAt: 0, hSending: false };
       b.feed = feedOf({ tenant, board, store, bus, log, codec, onLive: e => onLive(b, e), ...lim.feed });
       b.unsubs.push(bus.subscribe(subjects.presence(tenant, board), m => {
         if (!m || typeof m.user !== "string" || typeof m.client !== "string") return;
@@ -445,6 +461,10 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
         const sum = b.sums.get(m.window) ?? {};
         for (const e of EMOTES) if (Number.isSafeInteger(m.counts[e]) && m.counts[e] > 0) sum[e] = (sum[e] ?? 0) + m.counts[e];
         b.sums.set(m.window, sum);
+      }));
+      b.unsubs.push(bus.subscribe(hereSubject(tenant, board), m => {
+        const msg = hereCheck(m);
+        if (msg && msg.gateway !== id) b.hFrom.set(msg.gateway, { msg, at: now() });   // our own is kept locally
       }));
       boards.set(key, b);
     }
@@ -458,6 +478,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     c.b = null; b.conns.delete(ws);
     if (--b.refs > 0) return;
     boards.delete(b.key); b.feed.close(); for (const u of b.unsubs) u();
+    clearTimeout(b.rc.retryTimer); b.rc.retryTimer = null;
   }
 
   // ---- revocation: a board's `grants` subject, watched from before a hello's role check until its socket closes ----
@@ -477,7 +498,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       w.unsub = bus.subscribe(subjects.grants(tenant, board), () => {
         self.gen++;
         const b = boards.get(key);
-        if (b) recheck(b).catch(err => log.error("gateway: grants re-check failed", { board, err }));
+        if (b) requestRecheck(b, "grants");
       });
       grantWatches.set(key, w);
     }
@@ -491,20 +512,137 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     w.unsub(); if (grantWatches.get(key) === w) grantWatches.delete(key);
   }
 
-  /** Grants, invites or links changed on this board (or the slow timer fired): every connection's role is computed again. */
-  async function recheck(b) {
-    for (const ws of [...b.conns]) {
+  // ---- re-checking live connections' roles (PROTOCOL.md § Auth, Re-checking live connections) ----
+  // Kinds of pass, by strictness: a `grants` pass fails closed on a Registry error; a `timed` pass (the 60 s timer)
+  // keeps the connection and retries; a `retry` pass looks only at connections whose retry is due.
+  const STRICT = { retry: 1, timed: 2, grants: 3 };
+  const rechecks = { passes: 0, roleCalls: 0, skipped: 0, retries: 0, timeouts: 0, cut: 0 };
+  // running: the pass chain; runKind: the kind of the pass running now; cut: a `grants` ask arrived during a weaker
+  // pass (it stops at its next batch boundary); again: the one queued follow-up; failing: connections whose last
+  // check errored (each with its own count and due time); retryTimer: armed for the earliest due.
+  const newRecheck = () => ({ running: null, runKind: null, cut: false, again: null, failing: new Set(), retryTimer: null });
+  /**
+   * Ask for a pass over board `b`. One pass in flight per board: asks that arrive during it run ONE more pass after
+   * it, of the strictest kind asked (N `grants` messages during a pass cost one more pass, not N). A timer tick
+   * during a pass is skipped. A `grants` ask during a `timed` or `retry` pass cuts that pass short at its next batch
+   * boundary, so the grants pass never waits behind a weaker one. Resolves once a pass that started after this call
+   * has finished; never rejects.
+   */
+  function requestRecheck(b, kind) {
+    const rc = b.rc;
+    if (rc.running) {
+      if (kind === "timed") { rechecks.skipped++; return rc.running; }
+      if (!rc.again) { let resolve; const promise = new Promise(res => { resolve = res; }); rc.again = { kind, promise, resolve }; }
+      else if (STRICT[kind] > STRICT[rc.again.kind]) rc.again.kind = kind;
+      if (STRICT[kind] > STRICT[rc.runKind]) rc.cut = true;
+      return rc.again.promise;
+    }
+    rc.running = (async () => {
+      for (let job = { kind }; job;) {
+        rc.runKind = job.kind; rc.cut = false;
+        try { await recheckPass(b, job.kind); } catch (err) { log.error("gateway: role re-check failed", { board: b.board, err }); }
+        job.resolve?.();
+        job = rc.again; rc.again = null;
+        if (job && boards.get(b.key) !== b) { job.resolve(); job = null; }   // the board was left meanwhile
+      }
+      rc.running = null; rc.runKind = null; rc.cut = false;
+    })();
+    return rc.running;
+  }
+
+  /** `auth.role`, bounded: a lookup that hasn't settled in recheckLookupMs is an error (a hung Registry call). */
+  function roleWithin(identity, board) {
+    let timer;
+    const late = new Promise((_, reject) => {
+      timer = setTimeout(() => { rechecks.timeouts++; reject(Object.assign(new Error(`role lookup took over ${lim.recheckLookupMs} ms`), { name: "TimeoutError", code: "timeout" })); }, lim.recheckLookupMs);
+    });
+    return Promise.race([Promise.resolve().then(() => auth.role(identity, board)), late]).finally(() => clearTimeout(timer));
+  }
+
+  /** Arm the board's one retry timer for the earliest due among its failing connections (none: no timer). */
+  function armRetry(b) {
+    const rc = b.rc;
+    clearTimeout(rc.retryTimer); rc.retryTimer = null;
+    if (boards.get(b.key) !== b) return;
+    let due = Infinity;
+    for (const ws of rc.failing) { if (ws.data.state !== "live" || !ws.data.checkFails) rc.failing.delete(ws); else due = Math.min(due, ws.data.retryDue); }
+    if (due === Infinity) return;
+    rc.retryTimer = setTimeout(() => { rc.retryTimer = null; rechecks.retries++; if (boards.get(b.key) === b) requestRecheck(b, "retry"); }, Math.max(0, due - now()));
+    rc.retryTimer.unref?.();
+  }
+
+  /**
+   * One pass: the board's live connections grouped by user (a user's tabs share one `auth.role` answer), users with a
+   * writer connection first, `recheckConcurrency` lookups in flight, yielding to the event loop between batches (so a
+   * pass over 100k connections is latency for nobody, not a freeze). Errors are per user: they close or keep that
+   * user only. Closes are summed and logged once per pass.
+   */
+  async function recheckPass(b, kind) {
+    rechecks.passes++;
+    const rc = b.rc, all = [], byKey = new Map(), t0 = now();
+    let seen = 0;
+    const scan = kind === "retry" ? [...rc.failing] : b.conns;
+    for (const ws of scan) {
+      if (++seen % 1024 === 0) await breathe();
       const c = ws.data;
       if (c.state !== "live") continue;
-      let role;
-      // Fail closed: a Registry that can't answer now can't vouch for the old role. `unavailable`, so the client
-      // reconnects and its hello does the check (§ Errors: the client keeps its pending ops).
-      try { role = await auth.role(c.identity, b.board); }
-      catch (err) { if (c.state === "live") { log.warn("role re-check failed: connection closed", { conn: c.id, err }); refuse(ws, "unavailable", "could not re-check your access: reconnect", 1013, "role re-check failed"); } continue; }
-      if (c.state !== "live") continue;
-      if (!ROLES.includes(role)) { log.info("access removed: connection closed", { conn: c.id, board: b.board, user: c.user }); refuse(ws, "auth", "your access to this board was removed", 1008, "auth"); }
-      else if (role !== c.role) { log.info("role changed: connection closed to rejoin", { conn: c.id, board: b.board, user: c.user, from: c.role, to: role }); refuse(ws, "unavailable", "your role on this board changed: reconnect", 1012, "role changed"); }
+      if (kind === "retry" && !(c.checkFails && c.retryDue <= t0)) continue;
+      // Grouped by what `auth.role` reads (user, email for invites, domain for membership), not by user id alone.
+      const key = `${c.user}\n${c.identity?.email ?? ""}\n${c.identity?.domain ?? ""}`;
+      let g = byKey.get(key);
+      if (!g) { g = { user: c.user, identity: c.identity, conns: [], writer: false }; byKey.set(key, g); all.push(g); }
+      g.conns.push(ws);
+      if (c.role !== "viewer") g.writer = true;
     }
+    const users = [...all.filter(g => g.writer), ...all.filter(g => !g.writer)];
+    const failClosed = kind === "grants", sum = { kind, users: users.length, removed: 0, changed: 0, errors: 0, failedClosed: 0, kept: 0, retriesSpent: 0 };
+    let next = 0, lastErr = null, stopped = null;
+    const close = ws => refuse(ws, "unavailable", "could not re-check your access: reconnect", 1013, "role re-check failed");
+    const failed = ws => {
+      const c = ws.data;
+      // A `grants` pass fails closed: a Registry that can't answer now can't vouch for a role that was just changed.
+      // `unavailable`, so the client reconnects and its hello does the check (it keeps its pending ops).
+      if (failClosed) { sum.failedClosed++; rc.failing.delete(ws); return close(ws); }
+      // A timed or retry pass keeps the connection (a short blip must not drop a whole gateway) and retries it on its
+      // own schedule (2/4/8 s), then closes it. A timed pass landing between its retries doesn't spend one.
+      const t = now();
+      if (c.checkFails && c.retryDue > t) { sum.kept++; return; }
+      c.checkFails = (c.checkFails ?? 0) + 1;
+      if (c.checkFails > lim.recheckRetries) { sum.retriesSpent++; rc.failing.delete(ws); return close(ws); }
+      c.retryDue = t + lim.recheckRetryMs * 2 ** (c.checkFails - 1);
+      rc.failing.add(ws); sum.kept++;
+    };
+    const one = async g => {
+      let role, err = null;
+      rechecks.roleCalls++;
+      try { role = await roleWithin(g.identity, b.board); } catch (e) { err = e; lastErr = e; sum.errors++; }
+      for (const ws of g.conns) {
+        const c = ws.data;
+        if (c.state !== "live") continue;
+        if (err) { failed(ws); continue; }
+        if (c.checkFails) { c.checkFails = 0; rc.failing.delete(ws); }
+        if (!ROLES.includes(role)) { sum.removed++; refuse(ws, "auth", "your access to this board was removed", 1008, "auth"); }
+        else if (role !== c.role) { sum.changed++; refuse(ws, "unavailable", "your role on this board changed: reconnect", 1012, "role changed"); }
+      }
+      return !err;
+    };
+    // ONE chain, yielding between batches: up to recheckConcurrency lookups in flight at once (an async Registry
+    // isn't users × round trip), then one breathe(). Not N concurrent chains: the process breather yields per chain,
+    // so 8 chains each took their own 8 ms slice in the same loop turn (measured: timers held ~65 ms, not ~8 ms).
+    for (let first = true; next < users.length; first = false) {
+      await breathe();
+      if (boards.get(b.key) !== b) break;
+      // A `grants` ask arrived: stop here (the users not reached are unchanged) and let the grants pass run now.
+      if (rc.cut && !failClosed) { stopped = "cut"; rechecks.cut++; break; }
+      const batch = users.slice(next, next + lim.recheckConcurrency); next += batch.length;
+      const ok = await Promise.all(batch.map(one));
+      // The Registry looks down (every lookup in the first batch failed): a timed pass stops; the users not reached
+      // are unchanged, and the failed ones retry on their own schedule.
+      if (first && kind === "timed" && !ok.some(Boolean)) { stopped = "registry down"; break; }
+    }
+    if (sum.removed || sum.changed) log.info("role re-check: connections closed", { board: b.board, kind, removed: sum.removed, changed: sum.changed });
+    if (lastErr) log.warn("role re-check: the Registry failed", { board: b.board, ...sum, stopped, err: lastErr });
+    armRetry(b);
   }
 
   /** Send the welcome, then the catch-up up to at least `upTo`; live entries follow from where it ends. */
@@ -520,8 +658,122 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       c.welcomed = true;
       for (const f of b.feed.catchUp(since)) pushShared(ws, f);
       c.next = b.feed.seq + 1;
+      // Who's here, right after the catch-up: the full list. A board this gateway hasn't published for yet gets its
+      // own entry now (else the first joiner's list is empty until the next tick); otherwise the cached list, at most
+      // one tick old, so a join costs no merge.
+      if (!b.hFrom.has(id)) { const t = now(); b.hFrom.set(id, { msg: hereMine(b), at: t }); hereRefresh(b, t); }
+      else if (!b.hText) hereRefresh(b, now());
+      push(ws, b.hText); c.hVer = b.hVer;
     })).catch(err => { log.error("catch-up failed", { conn: c.id, err }); if (c.state === "live") refuse(ws, "unavailable", "try again shortly", 1013, "unavailable"); });
   }
+
+  // ---- `here` (PROTOCOL.md § Presence, `here`; § Bus `.here`): never logged, bounded per board ----
+  const RANK = { owner: 0, editor: 1, annotator: 2, commenter: 3 };
+  const WRITER_ROLES = Object.keys(RANK);
+  // § Bus names `.here` beside `.presence`; built from the port's checked presence subject (ids validated there).
+  // SEAM(bus): server/bus/port.js could name it (`subjects.here`); this file doesn't own the port.
+  const hereSubject = (tenant, board) => subjects.presence(tenant, board).slice(0, -".presence".length) + ".here";
+  /** A `.here` message from the bus, checked and cut to its fields, or null. */
+  function hereCheck(m) {
+    if (!isObj(m) || !isId(m.gateway) || !Array.isArray(m.writers) || m.writers.length > lim.hereMax) return null;
+    if (!Number.isSafeInteger(m.writerCount) || m.writerCount < m.writers.length || !Number.isSafeInteger(m.viewers) || m.viewers < 0) return null;
+    const writers = [];
+    for (const w of m.writers) {
+      if (!isObj(w) || typeof w.user !== "string" || !w.user || w.user.length > 256 || !(w.role in RANK)) return null;
+      writers.push({ user: w.user, name: typeof w.name === "string" ? w.name.slice(0, 200) : null, role: w.role, active: Number.isFinite(w.active) ? w.active : 0 });
+    }
+    return { gateway: m.gateway, writers, writerCount: m.writerCount, viewers: m.viewers };
+  }
+  /** A connection going live (+1) or closing (-1): counted per board, per user for writers. No scan of the board. */
+  function hereCount(c, by) {
+    const b = c.b;
+    if (!b || c.hereCounted === (by > 0)) return;
+    c.hereCounted = by > 0; b.hChanged = true;
+    if (c.role === "viewer") { b.hv += by; return; }
+    let w = b.hw.get(c.user);
+    if (!w) { if (by < 0) return; w = { name: c.name, roles: [0, 0, 0, 0], conns: 0, active: now() }; b.hw.set(c.user, w); }
+    w.roles[RANK[c.role]] += by; w.conns += by;
+    if (w.conns <= 0) b.hw.delete(c.user);
+  }
+  const hereActive = c => { const w = c.role !== "viewer" && c.b?.hw.get(c.user); if (w) w.active = now(); };
+  /**
+   * Who makes the list: owners, then editors, then everyone else (annotators and commenters alike) by most recent
+   * activity; at most hereMax. The list itself is then in a stable order (role, then user id), so activity alone
+   * doesn't change it: only who is on it, or their role or name, does.
+   */
+  const TIER = r => (r === "owner" ? 0 : r === "editor" ? 1 : 2);
+  const hereTop = list => list.sort((x, y) => TIER(x.role) - TIER(y.role) || y.active - x.active).slice(0, lim.hereMax);
+  const hereOrder = list => list.sort((x, y) => RANK[x.role] - RANK[y.role] || (x.user < y.user ? -1 : x.user > y.user ? 1 : 0));
+  /** This gateway's own `.here` message for a board. */
+  function hereMine(b) {
+    const list = [];
+    for (const [user, w] of b.hw) list.push({ user, name: w.name, role: WRITER_ROLES[w.roles.findIndex(n => n > 0)], active: w.active });
+    return { gateway: id, writers: hereTop(list), writerCount: b.hw.size, viewers: b.hv };
+  }
+  /** Every gateway's latest (15 s), merged: users once (highest role, latest activity); unlisted writers added as counts. */
+  function hereMerged(b, t) {
+    const users = new Map(); let extra = 0, viewers = 0;
+    for (const [gw, { msg, at }] of b.hFrom) {
+      if (gw !== id && t - at > lim.hereTtlMs) { b.hFrom.delete(gw); continue; }
+      viewers += msg.viewers; extra += msg.writerCount - msg.writers.length;
+      for (const w of msg.writers) {
+        const u = users.get(w.user);
+        if (!u) users.set(w.user, { ...w });
+        else { if (RANK[w.role] < RANK[u.role]) u.role = w.role; if (w.active > u.active) { u.active = w.active; u.name = w.name; } }
+      }
+    }
+    const writers = hereOrder(hereTop([...users.values()])).map(({ user, name, role }) => ({ user, name, role }));
+    return { t: "here", writers, writerCount: users.size + extra, viewers };
+  }
+  /**
+   * Re-merge the board's `here`. Two encodings: the full message, and the count-only one (no `writers`: the client
+   * keeps its last list). The list's version moves only when the list changes, so a count change (a viewer joining
+   * or leaving, the common case on a big board) costs the small message, not the 50-writer one. Says whether
+   * anything changed.
+   */
+  function hereRefresh(b, t) {
+    const m = hereMerged(b, t), key = JSON.stringify(m.writers);
+    const count = codec.encode({ t: "here", writerCount: m.writerCount, viewers: m.viewers });
+    if (key !== b.hKey) { b.hKey = key; b.hVer++; }
+    else if (count === b.hCountText) return false;
+    b.hText = codec.encode(m); b.hCountText = count;
+    return true;
+  }
+  /**
+   * Send `here` to every welcomed connection on the board, yielding as it goes: the full list to a connection that
+   * hasn't had this version of it (a list change, or a reader that skipped one), the count-only message to the rest.
+   * Both are encoded once per board.
+   */
+  async function hereSend(b) {
+    b.hSending = true; b.hOut = false; b.hSentAt = now();
+    const full = b.hText, count = b.hCountText, ver = b.hVer;
+    try {
+      let n = 0;
+      for (const ws of b.conns) {
+        if (++n % 256 === 0) await breathe();
+        const c = ws.data;
+        if (c.state !== "live" || !c.welcomed || c.outBytes > lim.maxConnQueuedBytes / 2) continue;   // a reader this far behind skips it (it may drop)
+        if (c.hVer === ver) push(ws, count);
+        else { push(ws, full); c.hVer = ver; }
+      }
+    } finally { b.hSending = false; }
+  }
+  const hereTimer = setInterval(() => {
+    try {
+      const t = now();
+      for (const b of boards.values()) {
+        if ((b.hChanged && t - b.hPubAt >= lim.hereMs) || t - b.hPubAt >= lim.herePublishMs) {
+          const mine = hereMine(b);
+          b.hChanged = false; b.hPubAt = t; b.hFrom.set(id, { msg: mine, at: t });
+          bus.publish(hereSubject(b.tenant, b.board), mine)?.catch?.(() => {});
+        }
+        if (hereRefresh(b, t)) b.hOut = true;
+        const every = b.conns.size > lim.hereBigBoard ? lim.hereBigMs : lim.hereMs;
+        if (b.hOut && !b.hSending && t - b.hSentAt >= every) hereSend(b).catch(err => log.error("gateway: here send failed", { err }));
+      }
+    } catch (err) { log.error("gateway: here tick failed", { err }); }
+  }, Math.max(10, Math.min(lim.hereMs, lim.herePublishMs, lim.hereBigMs)));
+  hereTimer.unref?.();
 
   // Presence out: every 50 ms, each board's coalesced batch to its welcomed connections, without their own.
   const presenceTimer = setInterval(() => {
@@ -529,11 +781,14 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       for (const b of boards.values()) {
         if (!b.coalescer.size) continue;
         const batch = b.coalescer.flush(), full = codec.encode({ t: "presence", batch });
+        // Whose presence is in the batch, looked up once per connection: a mass close (thousands of `leave`s) must
+        // not make this connections × batch (p2-tune: 2,000 leaves × 2,000 connections held the loop ~130 ms).
+        const senders = new Set(batch.map(x => `${x.user}\n${x.client}`));
         for (const ws of welcomedOn(b)) {
           const c = ws.data;
           if (c.outBytes > lim.maxConnQueuedBytes / 2) continue;   // presence may drop: a reader this far behind skips it
           const mine = x => x.user === c.user && x.client === c.client;
-          if (!batch.some(mine)) { push(ws, full); continue; }
+          if (!senders.has(`${c.user}\n${c.client}`)) { push(ws, full); continue; }
           const rest = batch.filter(x => !mine(x));
           if (rest.length) push(ws, codec.encode({ t: "presence", batch: rest }));
         }
@@ -573,7 +828,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
   }, lim.connListMs);
   listTimer.unref?.();
   // Time-based loss of access (a share link or an invite passing its `expiresAt`) sends no `grants` message.
-  const roleTimer = setInterval(() => { for (const b of boards.values()) recheck(b).catch(err => log.error("gateway: timed role re-check failed", { board: b.board, err })); }, lim.roleRecheckMs);
+  const roleTimer = setInterval(() => { for (const b of boards.values()) requestRecheck(b, "timed"); }, lim.roleRecheckMs);
   roleTimer.unref?.();
 
   async function hello(ws, msg) {
@@ -636,6 +891,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       out: [], outBytes: 0, buffered: 0, owed: 0, blocked: false, flushing: false, waitSince: 0, progressAt: now(), winStart: now(), winDrained: 0,
       opq: [], opqBytes: 0, tokens: lim.opBurst, tokenAt: now(), opTimer: null, limiter: presenceLimiter(now) });
     c.b.conns.add(ws);
+    hereCount(c, +1);
     bump(connsByUser, c.user, 1);
     if (writer) bump(writersBy, wkey, 1);
     counts.accepted++;
@@ -706,6 +962,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     // § Pacing, queue cap: 500 ops or 8 MB; past it `unavailable` and close (the client keeps its ops and resends).
     if (c.opq.length >= lim.maxOpQueue || c.opqBytes + size > lim.maxOpQueueBytes) { log.warn("op queue full", { conn: c.id, ops: c.opq.length }); return refuse(ws, "unavailable", "too many ops queued: slow down and reconnect", 1013, "op queue full"); }
     // Only the fields an op has travel on.
+    hereActive(c);
     c.opq.push({ msg: { t: "op", id: msg.id, sentAt: msg.sentAt, stream: msg.stream, op: msg.op }, size }); c.opqBytes += size;
     pumpOps(ws);
   }
@@ -720,6 +977,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       counts[msg.e] = (counts[msg.e] ?? 0) + 1;
       return;
     }
+    hereActive(c);
     const pick = { cursor: ["x", "y"], select: ["stream", "ids"], laser: ["pts"], preview: ["stream", "elements"], emote: ["e"] }[msg.k];
     const clean = { k: msg.k }; for (const f of pick) clean[f] = msg[f];
     bus.publish(subjects.presence(c.tenant, c.board), { gateway: id, user: c.user, client: c.client, msg: clean })?.catch?.(() => {});
@@ -819,14 +1077,15 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     stats: () => {
       let owed = 0;
       for (const ws of conns.values()) { const c = ws.data; if (c.state === "live") { try { owed += ws.getBufferedAmount(); } catch { /* gone */ } owed += c.outBytes; } }
-      return { conns: conns.size, ...counts, owedBytes: owed, owedTracked: owedTotal, queuedBytes: queuedTotal, users: connsByUser.size, waitingJoiners: waiters.size, sharedBytes, sharedTexts: sharedText.size, boards: boards.size };
+      return { conns: conns.size, ...counts, rechecks: { ...rechecks, running: [...boards.values()].filter(b => b.rc.running).length }, owedBytes: owed, owedTracked: owedTotal, queuedBytes: queuedTotal, users: connsByUser.size, waitingJoiners: waiters.size, sharedBytes, sharedTexts: sharedText.size, boards: boards.size };
     },
     /** A board's feed as this gateway holds it (null if it serves no one there): its base checkpoint, seq and tail. */
     feed: (tenant, board) => { const f = boards.get(`${tenant}/${board}`)?.feed; return f ? { base: f.base.seq, seq: f.seq, tail: f.tail.length, tailBytes: f.tailBytes } : null; },
-    /** Re-check every connection's role on a board now (what a `grants` message does). */
-    recheck: async board => { for (const b of boards.values()) if (b.board === board) await recheck(b); },
+    /** Re-check every connection's role on a board now: `grants` (what a grants message does) or `timed` (the timer). */
+    recheck: async (board, kind = "grants") => { for (const b of [...boards.values()]) if (b.board === board) await requestRecheck(b, kind === "timed" ? "timed" : "grants"); },
     async close() {
-      clearInterval(sweep); clearInterval(presenceTimer); clearInterval(emoteTimer); clearInterval(listTimer); clearInterval(roleTimer); unsub();
+      clearInterval(sweep); clearInterval(presenceTimer); clearInterval(emoteTimer); clearInterval(listTimer); clearInterval(roleTimer); clearInterval(hereTimer); unsub();
+      for (const b of boards.values()) { clearTimeout(b.rc.retryTimer); b.rc.retryTimer = null; }
       for (const ws of [...conns.values()]) end(ws, 1001, "server closing");
     },
   };

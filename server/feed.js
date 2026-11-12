@@ -72,14 +72,22 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
    * in the log itself: corruption (§ Recovery: a room refuses to start on it). The feed stops there, says so loudly
    * once per gap, and sets `gapAt` so the gateway refuses new joins (`unavailable`) instead of welcoming them at the
    * seq before the gap, where they would silently never get anything newer. Cleared if the Store later fills it.
+   * An entry at seq + 1 that belongs to another board is treated the same way (it is never served).
    */
   async function repair(upTo = Infinity) {
     while (self.seq < upTo && !self.closed) {
       const page = await store.read(tenant, board, self.seq + 1, pageSize, pageBytes);
       if (!page.length) break;
       if (apply(page.map(fromStore)) === 0) {
+        // Nothing in a non-empty page continues the feed: a gap, or an entry at seq + 1 that can't be served
+        // (another board's). Either way joins are refused until it is fixed (R4: a foreign entry used to stop the
+        // feed without `gapAt`, so joiners were welcomed short).
         const at = self.seq + 1;
-        if (page[0]?.seq !== at && self.gapAt !== at) { self.gapAt = at; log.error("feed: the Store log has a gap: entries after it are not served", { tenant, board, missing: at, next: page[0]?.seq ?? null }); }
+        if (self.gapAt !== at) {
+          self.gapAt = at;
+          if (page[0]?.seq !== at) log.error("feed: the Store log has a gap: entries after it are not served", { tenant, board, missing: at, next: page[0]?.seq ?? null });
+          else log.error("feed: the Store log has an entry it can't serve: entries from it on are not served", { tenant, board, at });
+        }
         break;
       }
       if (self.gapAt && self.seq >= self.gapAt) { log.warn("feed: the log gap is filled", { tenant, board, at: self.gapAt }); self.gapAt = 0; }

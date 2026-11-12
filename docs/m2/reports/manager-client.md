@@ -3,7 +3,8 @@
 ## Now (kept current every turn; a refreshed manager starts here)
 
 - **Me:** manager client, terminal t14k. Report to the proxy **t1bx**; engine manager **t18m**; platform manager **t187**.
-- **In flight:** nothing running. p6-ports committed (round 2 PASS); t18r and t1b9 closed.
+- **In flight:** p6-edge (t1cy, builder; brief docs/m2/briefs/p6-edge.md): auth HTTP adapter, ws transport adapter,
+  web/core/signin.js, authContract R2-M1/L2 fixes. New files only, on main. Next: its verifier p6-edgev.
 - **Waiting on engine:** the p2-land merge into main (carries phase 2, v1.1, p6-land, p7-collab). t18m pings first.
 - **Next, in order:** p6-hex (docs/m2/briefs/p6-hex.md: move web/ onto the ports, auth HTTP adapter per
   docs/m2/contracts/auth-exchange.md, test/web/architecture.test.js on engine's test/arch-scan.js) → p7-wire
@@ -15,7 +16,7 @@
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| (none running) | | | waiting on engine's p2-land merge; next p6-hex |
+| p6-edge (builder) | t1cy | worker p6-edge (client) · t1cy: edge adapters + sign-in | RUNNING on main (new files + auth-contract.js) |
 
 ## 2026-11-11 — phase-6 design mock
 
@@ -247,3 +248,4 @@
 - The proxy is now t1bx (t14h retired; handoff 9d06783). Report to t1bx.
 - p6-ports fix round 1 done (t18r): all 4 HIGH, both MEDIUM, named LOWs; bun test 585 run, 0 fail (re-run by me). t1b9 on round 2.
 - p6-portsv round 2 PASS (0 HIGH, 1 MEDIUM R2-M1 auth `force` optional, 4 LOW). bun test 588 run, 0 fail (me). Committed p6-ports; R2-M1/L1/L2/L4 carried into p6-hex. t18r, t1b9 closed.
+- Proxy: keep moving before the merge. Started p6-edge (t1cy, plenary-p6-edge): the new-file part of p6-hex (auth HTTP adapter, ws transport adapter with the codec, web/core/signin.js, authContract fixes). arch-scan.js isn't on main yet, so the boundary test stays in p6-hex.

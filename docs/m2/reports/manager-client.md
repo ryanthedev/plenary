@@ -3,8 +3,7 @@
 ## Now (kept current every turn; a refreshed manager starts here)
 
 - **Me:** manager client, terminal t14k. Report to the proxy **t1bx**; engine manager **t18m**; platform manager **t187**.
-- **In flight:** p6-ports round 2 (verifier t1b9 re-checking builder t18r's fix round). On PASS: commit web/ports,
-  web/adapters, test/web/contracts, test/web/adapters + reports by path, close t18r and t1b9, report to t1bx.
+- **In flight:** nothing running. p6-ports committed (round 2 PASS); t18r and t1b9 closed.
 - **Waiting on engine:** the p2-land merge into main (carries phase 2, v1.1, p6-land, p7-collab). t18m pings first.
 - **Next, in order:** p6-hex (docs/m2/briefs/p6-hex.md: move web/ onto the ports, auth HTTP adapter per
   docs/m2/contracts/auth-exchange.md, test/web/architecture.test.js on engine's test/arch-scan.js) → p7-wire
@@ -16,8 +15,7 @@
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| p6-ports (builder) | t18r | done p6-ports (client) · t18r | fix round 1 done; re-verifying |
-| p6-portsv (verifier) | t1b9 | verifier p6-portsv (client) · t1b9: web ports, round 2 | RUNNING round 2 |
+| (none running) | | | waiting on engine's p2-land merge; next p6-hex |
 
 ## 2026-11-11 — phase-6 design mock
 
@@ -248,3 +246,4 @@
   no monotonic time in Clock. Import rules hold. Fix round 1 sent to t18r (16%); t1b9 kept to re-verify.
 - The proxy is now t1bx (t14h retired; handoff 9d06783). Report to t1bx.
 - p6-ports fix round 1 done (t18r): all 4 HIGH, both MEDIUM, named LOWs; bun test 585 run, 0 fail (re-run by me). t1b9 on round 2.
+- p6-portsv round 2 PASS (0 HIGH, 1 MEDIUM R2-M1 auth `force` optional, 4 LOW). bun test 588 run, 0 fail (me). Committed p6-ports; R2-M1/L1/L2/L4 carried into p6-hex. t18r, t1b9 closed.

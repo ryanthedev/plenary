@@ -64,3 +64,11 @@ The post-login fragment will carry a single-use code (≤ 60 s), not the session
 is still cleared at once. Wire it as an `auth` port with an HTTP adapter (and a fake for tests), so core never calls
 fetch. Exact shape: docs/m2/contracts/auth-exchange.md (`#code=`, POST /auth/exchange, credentials same-origin). The
 auth port and fake come from p6-ports; you add `web/adapters/auth/http.js` (fetch) and wire it in the root.
+
+## Carried from p6-portsv round 2 (docs/m2/reports/p6-portsv.md)
+
+- R2-M1: authContract's failure tests silently pass when an adapter offers no `force`: make `force` required for
+  adapters run under the contract, or give the HTTP adapter a fake-fetch hook the contract drives (your http.js must
+  not slip through).
+- R2-L2: add an `exp`-in-seconds sanity check to authContract (an HTTP adapter returning ms must fail).
+- R2-L1 (browser clock uses performance.now when present) and R2-L4 (items listed there for you).

@@ -1,0 +1,522 @@
+// End to end through server/auth/http.js against the fake IdP (no network): sign-in, the admin API, share links.
+import { test, expect, beforeAll, beforeEach, afterAll } from "bun:test";
+import { httpRoutes, LOGIN_COOKIE } from "../../server/auth/http.js";
+import { googleOidc } from "../../server/auth/oidc.js";
+import { sessions as makeSessions } from "../../server/auth/session.js";
+import { memoryRegistry } from "../../server/auth/registry.js";
+import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
+import { createBoard } from "../../server/admin/boards.js";
+import { devAuth } from "../../server/auth/dev.js";
+import { fakeIdp, CLIENT_ID } from "./fake-idp.js";
+
+const ORIGIN = "https://plenary.test";
+const APP = "https://app.plenary.test/";
+const config = {
+  cookieKey: "k".repeat(32),
+  postLoginUrl: APP,
+  postLogoutUrl: "https://app.plenary.test/bye",
+  boardUrl: "https://app.plenary.test/b/{board}",
+  publicUrl: ORIGIN,
+};
+
+const clock = { t: Date.UTC(2026, 10, 11, 12) };
+const now = () => clock.t;
+let idp, registry, sessions, oidc, tenancy, routes, acme;
+
+const ADMIN = { sub: "1001", email: "ann@acme.com", hd: "acme.com", name: "Ann" };
+const MEMBER = { sub: "1002", email: "max@acme.com", hd: "acme.com", name: "Max" };
+const GUEST = { sub: "2001", email: "carol@gmail.com", hd: undefined, name: "Carol" };
+const INVITEE = { sub: "3001", email: "bob@globex.com", hd: "globex.com", name: "Bob" };
+
+beforeAll(async () => { idp = await fakeIdp({ now }); await idp.addKey("k1"); });
+
+function build(over = {}) {
+  return httpRoutes({ registry, sessions, oidc, tenancy, now, config, ...over });
+}
+beforeEach(async () => {
+  clock.t = Date.UTC(2026, 10, 11, 12);
+  registry = memoryRegistry({ now });
+  sessions = await makeSessions({ key: "s".repeat(32), now });
+  oidc = googleOidc({ clientId: CLIENT_ID, clientSecret: "secret", redirectUri: ORIGIN + "/auth/callback", fetch: idp.fetch, now });
+  tenancy = makeTenancy({ registry, now });
+  acme = await registry.createTenant({ domain: "acme.com", admins: ["google:1001"] });
+  routes = build();
+});
+
+const call = (path, init = {}) => routes(new Request(ORIGIN + path, init));
+const cookieOf = res => {
+  const c = res.headers.getSetCookie().find(s => s.startsWith(LOGIN_COOKIE + "="));
+  return c ? c.split(";")[0] : null;
+};
+const fragToken = loc => new URLSearchParams(new URL(loc).hash.slice(1)).get("token");
+
+/** GET /auth/login (or a /links/:id), then the callback with a fake code. Returns { res, start, cookie }. */
+async function signIn(who, { startPath = "/auth/login", claims = {}, tamper } = {}) {
+  const start = await call(startPath);
+  expect(start.status).toBe(302);
+  const loc = new URL(start.headers.get("location"));
+  const cookie = cookieOf(start);
+  const code = "code-" + Math.random().toString(36).slice(2);
+  idp.codes.set(code, await idp.mint({ ...who, nonce: loc.searchParams.get("nonce"), ...claims }));
+  const q = new URLSearchParams({ code, state: loc.searchParams.get("state") });
+  const res = await call("/auth/callback?" + q, { headers: { cookie: tamper ? tamper(cookie) : cookie } });
+  return { res, start, cookie, code, state: loc.searchParams.get("state") };
+}
+async function tokenFor(who) {
+  const { res } = await signIn(who);
+  expect(res.status).toBe(302);
+  return fragToken(res.headers.get("location"));
+}
+const api = (path, token, method = "GET", body) => call(path, {
+  method,
+  headers: { ...(token ? { authorization: "Bearer " + token } : {}), ...(body !== undefined ? { "content-type": "application/json" } : {}) },
+  body: body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body),
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+
+test("full flow: login → token → POST /boards → invite → link → another user redeems → roles resolve", async () => {
+  // Login: 302 to Google with PKCE S256, state and nonce; the cookie is __Host-, Secure, HttpOnly, Lax, ≤ 10 min.
+  const start = await call("/auth/login");
+  const google = new URL(start.headers.get("location"));
+  expect(google.origin + google.pathname).toBe("https://accounts.google.com/o/oauth2/v2/auth");
+  expect(google.searchParams.get("code_challenge_method")).toBe("S256");
+  expect(google.searchParams.get("redirect_uri")).toBe(ORIGIN + "/auth/callback");
+  const set = start.headers.getSetCookie()[0];
+  for (const a of ["Path=/", "Secure", "HttpOnly", "SameSite=Lax", "Max-Age=600"]) expect(set).toContain(a);
+  expect(set).not.toContain("Domain");
+
+  // Callback: token in the fragment of the configured URL, never the query; login cookie cleared.
+  const { res } = await signIn(ADMIN);
+  const loc = res.headers.get("location");
+  expect(loc.startsWith(APP + "#token=")).toBe(true);
+  expect(new URL(loc).search).toBe("");
+  expect(res.headers.getSetCookie().some(c => c.startsWith(LOGIN_COOKIE + "=;") && c.includes("Max-Age=0"))).toBe(true);
+  const admin = fragToken(loc);
+  expect(await sessions.verify(admin)).toMatchObject({ user: "google:1001", domain: "acme.com" });
+  // The idp received the PKCE verifier.
+  expect(idp.tokenRequests.at(-1).code_verifier).toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+  // POST /boards: tenant from the caller's identity.
+  const cb = await api("/boards", admin, "POST", { title: "All hands", memberRole: "annotator" });
+  expect(cb.status).toBe(201);
+  const { board } = await cb.json();
+  expect(board).toMatchObject({ tenant: acme.id, title: "All hands", memberRole: "annotator" });
+  expect(await registry.grant(board.id, "google:1001")).toBe("owner");
+
+  // Invite (cross-domain), list it.
+  const inv = await api(`/boards/${board.id}/invites`, admin, "POST", { email: "Bob@Globex.com", role: "editor" });
+  expect(inv.status).toBe(201);
+  const { invite } = await inv.json();
+  expect(invite).toMatchObject({ board: board.id, email: "bob@globex.com", role: "editor" });
+  expect((await (await api(`/boards/${board.id}/invites`, admin)).json()).invites.map(i => i.id)).toEqual([invite.id]);
+
+  // Share link, list it.
+  const lk = await api(`/boards/${board.id}/links`, admin, "POST", { role: "annotator" });
+  expect(lk.status).toBe(201);
+  const { link, url } = await lk.json();
+  expect(url).toBe(`${ORIGIN}/links/${link.id}`);
+  expect((await (await api(`/boards/${board.id}/links`, admin)).json()).links.map(l => l.id)).toEqual([link.id]);
+
+  // A guest (gmail, no tenant) opens the link signed out: sign-in runs, the callback redeems, lands on the board.
+  const guest = await signIn(GUEST, { startPath: `/links/${link.id}` });
+  const gl = guest.res.headers.get("location");
+  expect(gl.startsWith(`https://app.plenary.test/b/${board.id}#token=`)).toBe(true);
+  expect(await tenancy.role({ user: "google:2001", email: "carol@gmail.com", domain: null }, board.id)).toBe("annotator");
+
+  // The invitee signs in and gets the invite's role; a member gets memberRole.
+  const bob = await sessions.verify(await tokenFor(INVITEE));
+  expect(await tenancy.role(bob, board.id)).toBe("editor");
+  const max = await sessions.verify(await tokenFor(MEMBER));
+  expect(await tenancy.role(max, board.id)).toBe("annotator");
+
+  // Grants: the owner raises the guest to editor; then revoke invite and link.
+  const g = await api(`/boards/${board.id}/grants/${encodeURIComponent("google:2001")}`, admin, "PUT", { role: "editor" });
+  expect(g.status).toBe(204);
+  expect(await registry.grant(board.id, "google:2001")).toBe("editor");
+  expect((await api(`/boards/${board.id}/invites/${invite.id}`, admin, "DELETE")).status).toBe(204);
+  expect(await tenancy.role(bob, board.id)).toBe(null);
+  expect((await api(`/boards/${board.id}/links/${link.id}`, admin, "DELETE")).status).toBe(204);
+  // Last owner can't be demoted.
+  const lo = await api(`/boards/${board.id}/grants/${encodeURIComponent("google:1001")}`, admin, "PUT", { role: "editor" });
+  expect(lo.status).toBe(409);
+  expect(await lo.json()).toEqual({ error: "last-owner" });
+});
+
+test("GET /links/:id with a Bearer redeems at once; a dead link is 404", async () => {
+  const admin = await tokenFor(ADMIN);
+  const { board } = await (await api("/boards", admin, "POST", {})).json();
+  const { link } = await (await api(`/boards/${board.id}/links`, admin, "POST", { role: "viewer" })).json();
+  const guest = await tokenFor(GUEST);
+  const r = await api(`/links/${link.id}`, guest);
+  expect(r.status).toBe(200);
+  expect(await r.json()).toEqual({ board: board.id, url: `https://app.plenary.test/b/${board.id}` });
+  expect(await tenancy.role(await sessions.verify(guest), board.id)).toBe("viewer");
+  expect((await api(`/links/nope`, guest)).status).toBe(404);
+  await api(`/boards/${board.id}/links/${link.id}`, admin, "DELETE");
+  expect((await api(`/links/${link.id}`, guest)).status).toBe(404);
+});
+
+test("a dead link at sign-in still signs in, flagged in the fragment, landing on postLoginUrl", async () => {
+  const { res } = await signIn(GUEST, { startPath: "/links/not-a-link" });
+  const loc = res.headers.get("location");
+  expect(loc.startsWith(APP + "#token=")).toBe(true);
+  expect(new URLSearchParams(new URL(loc).hash.slice(1)).get("link")).toBe("invalid");
+});
+
+test("the link rides in the signed login cookie, never in a URL parameter", async () => {
+  const start = await call("/links/abcdefabcdefabcdefabcdefab");
+  const google = start.headers.get("location");
+  expect(google).not.toContain("abcdefabcdefabcdefabcdefab");
+  const v = cookieOf(start).split("=")[1];
+  const payload = JSON.parse(atob(v.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+  expect(payload.l).toBe("abcdefabcdefabcdefabcdefab");
+});
+
+// ---- login cookie, state, nonce ----
+
+const loginFailed = async res => {
+  expect(res.status).toBe(400);
+  expect(await res.json()).toEqual({ error: "login-failed" });
+  expect(res.headers.getSetCookie().some(c => c.startsWith(LOGIN_COOKIE + "=;") && c.includes("Max-Age=0"))).toBe(true);
+  expect(res.headers.get("location")).toBe(null);
+};
+
+test("missing, tampered, forged-prefix and expired login cookies are refused", async () => {
+  await loginFailed((await signIn(ADMIN, { tamper: () => "" })).res);
+  await loginFailed((await signIn(ADMIN, { tamper: c => c.slice(0, -3) + (c.at(-3) === "A" ? "B" : "A") + c.slice(-2) })).res);
+  // Payload swapped (another state) with the old MAC.
+  await loginFailed((await signIn(ADMIN, {
+    tamper: c => {
+      const [name, v] = [c.slice(0, c.indexOf("=")), c.slice(c.indexOf("=") + 1)];
+      const [, p, mac] = v.split(".");
+      const obj = JSON.parse(atob(p.replace(/-/g, "+").replace(/_/g, "/")));
+      obj.exp += 3600;
+      const p2 = btoa(JSON.stringify(obj)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      return `${name}=l1.${p2}.${mac}`;
+    },
+  })).res);
+  // A session token can't stand in for the login cookie.
+  const tok = await tokenFor(ADMIN);
+  await loginFailed((await signIn(ADMIN, { tamper: () => `${LOGIN_COOKIE}=${tok}` })).res);
+  // Expired: 10 min + 1 s after the login started (the expiry is inside the signed payload).
+  const start = await call("/auth/login");
+  const loc = new URL(start.headers.get("location"));
+  clock.t += 601_000;
+  idp.codes.set("late", await idp.mint({ ...ADMIN, nonce: loc.searchParams.get("nonce") }));
+  await loginFailed(await call(`/auth/callback?code=late&state=${loc.searchParams.get("state")}`, { headers: { cookie: cookieOf(start) } }));
+});
+
+test("state mismatch, missing code, and an IdP error are refused", async () => {
+  const start = await call("/auth/login");
+  const loc = new URL(start.headers.get("location"));
+  idp.codes.set("c-state", await idp.mint({ ...ADMIN, nonce: loc.searchParams.get("nonce") }));
+  const h = { headers: { cookie: cookieOf(start) } };
+  await loginFailed(await call("/auth/callback?code=c-state&state=wrong", h));
+  await loginFailed(await call(`/auth/callback?state=${loc.searchParams.get("state")}`, h));
+  await loginFailed(await call(`/auth/callback?error=access_denied&state=${loc.searchParams.get("state")}`, h));
+  // Another login's state cookie doesn't pair with this state.
+  const other = await call("/auth/login");
+  await loginFailed(await call(`/auth/callback?code=c-state&state=${loc.searchParams.get("state")}`, { headers: { cookie: cookieOf(other) } }));
+});
+
+test("nonce: a token minted for another login is refused; a replayed callback is refused", async () => {
+  await loginFailed((await signIn(ADMIN, { claims: { nonce: "someone-elses-nonce" } })).res);
+  // Replay of a good callback (same cookie, same state, same code) in this process.
+  const { res, cookie, code, state } = await signIn(ADMIN);
+  expect(res.status).toBe(302);
+  await loginFailed(await call(`/auth/callback?${new URLSearchParams({ code, state })}`, { headers: { cookie } }));
+});
+
+test("no open redirect: the request can't choose where the browser goes", async () => {
+  for (const p of ["redirect", "next", "return_to", "redirect_uri", "url"]) {
+    const start = await call(`/auth/login?${p}=https://evil.example/`);
+    const loc = new URL(start.headers.get("location"));
+    expect(loc.origin).toBe("https://accounts.google.com");
+    expect(loc.searchParams.get("redirect_uri")).toBe(ORIGIN + "/auth/callback");
+    idp.codes.set("c-" + p, await idp.mint({ ...ADMIN, nonce: loc.searchParams.get("nonce") }));
+    const q = new URLSearchParams({ code: "c-" + p, state: loc.searchParams.get("state"), [p]: "https://evil.example/" });
+    const res = await routes(new Request(ORIGIN + "/auth/callback?" + q, { headers: { cookie: cookieOf(start), host: "evil.example" } }));
+    expect(res.headers.get("location").startsWith(APP + "#token=")).toBe(true);
+    const out = await call(`/auth/logout?${p}=https://evil.example/`);
+    expect(out.headers.get("location")).toBe("https://app.plenary.test/bye");
+  }
+  // Config is checked: relative, non-http and fragment URLs are refused at build time.
+  for (const bad of ["/relative", "javascript:alert(1)", "https://app.plenary.test/#x"])
+    expect(() => build({ config: { ...config, postLoginUrl: bad } })).toThrow();
+  expect(() => build({ config: { ...config, boardUrl: "https://app.plenary.test/b/" } })).toThrow();
+  expect(() => build({ config: { ...config, cookieKey: "short" } })).toThrow();
+});
+
+test("logout clears the login cookie and redirects; the session token stays valid until exp (stateless)", async () => {
+  const tok = await tokenFor(ADMIN);
+  const out = await call("/auth/logout");
+  expect(out.status).toBe(302);
+  expect(out.headers.getSetCookie().some(c => c.startsWith(LOGIN_COOKIE + "=;") && c.includes("Max-Age=0"))).toBe(true);
+  expect(await sessions.verify(tok)).not.toBe(null);
+});
+
+// ---- bearer ----
+
+test("Bearer missing, malformed, forged or expired → 401 auth; cookies never authenticate", async () => {
+  const tok = await tokenFor(ADMIN);
+  const r = await api("/boards", null, "POST", {});
+  expect(r.status).toBe(401);
+  expect(r.headers.get("www-authenticate")).toBe("Bearer");
+  expect(await r.json()).toEqual({ error: "auth" });
+  for (const h of ["Basic abc", "Bearer", "Bearer  ", "bearer s1.x.y", "Bearer " + tok.slice(0, -2) + "AA", tok]) {
+    const res = await call("/boards", { method: "POST", headers: { authorization: h, "content-type": "application/json" }, body: "{}" });
+    expect(res.status).toBe(401);
+  }
+  const viaCookie = await call("/boards", { method: "POST", headers: { cookie: `session=${tok}; token=${tok}`, "content-type": "application/json" }, body: "{}" });
+  expect(viaCookie.status).toBe(401);
+  clock.t += 13 * 3600_000;                                // past the 12 h session
+  expect((await api(`/boards`, tok, "POST", {})).status).toBe(401);
+});
+
+// ---- admin rules ----
+
+test("POST /boards: non-admin and tenantless callers get 403; a tenant field is refused and creates nothing", async () => {
+  let creates = 0;
+  const counting = { ...registry, createBoard: async o => { creates++; return registry.createBoard(o); } };
+  routes = build({ registry: counting });
+  const member = await tokenFor(MEMBER), guest = await tokenFor(GUEST), admin = await tokenFor(ADMIN);
+  for (const t of [member, guest]) {
+    const r = await api("/boards", t, "POST", { title: "x" });
+    expect(r.status).toBe(403);
+    expect(await r.json()).toEqual({ error: "forbidden" });
+  }
+  const other = await registry.createTenant({ domain: "globex.com", admins: ["google:1001"] });
+  const r = await api("/boards", admin, "POST", { tenant: other.id });
+  expect(r.status).toBe(400);
+  expect(await r.json()).toEqual({ error: "unknown-field", field: "tenant" });
+  expect(creates).toBe(0);
+  const bad = await api("/boards", admin, "POST", { memberRole: "owner" });
+  expect(bad.status).toBe(400);
+  expect((await bad.json()).error).toBe("bad-request");
+  expect(creates).toBe(0);
+});
+
+test("an unknown board and a board the caller can't manage give byte-identical answers", async () => {
+  const admin = await tokenFor(ADMIN), member = await tokenFor(MEMBER);
+  const { board } = await (await api("/boards", admin, "POST", {})).json();
+  const { link } = await (await api(`/boards/${board.id}/links`, admin, "POST", { role: "viewer" })).json();
+  const cases = b => [
+    [`/boards/${b}/invites`, "GET"], [`/boards/${b}/invites`, "POST", { email: "a@b.com", role: "viewer" }],
+    [`/boards/${b}/invites/i-x`, "DELETE"], [`/boards/${b}/links`, "GET"], [`/boards/${b}/links`, "POST", { role: "viewer" }],
+    [`/boards/${b}/links/${link.id}`, "DELETE"], [`/boards/${b}/grants/google%3A9`, "PUT", { role: "viewer" }],
+  ];
+  const known = cases(board.id), unknown = cases("b-0000000000000000"), weird = cases("..%2F");
+  for (let i = 0; i < known.length; i++) {
+    const a = await api(known[i][0], member, known[i][1], known[i][2]);
+    const b = await api(unknown[i][0], member, unknown[i][1], unknown[i][2]);
+    const c = await api(weird[i][0], member, weird[i][1], weird[i][2]);
+    expect([a.status, b.status, c.status]).toEqual([403, 403, 403]);
+    const [ta, tb, tc] = [await a.text(), await b.text(), await c.text()];
+    expect(ta).toBe(tb);
+    expect(ta).toBe(tc);
+    expect([...a.headers]).toEqual([...b.headers]);
+  }
+  // A link id from this board can't be revoked through another board the caller manages.
+  const { board: b2 } = await (await api("/boards", admin, "POST", {})).json();
+  expect((await api(`/boards/${b2.id}/links/${link.id}`, admin, "DELETE")).status).toBe(403);
+});
+
+// ---- bodies ----
+
+test("bodies: JSON only, capped at 16 KB (counted as read), objects only, unknown fields refused", async () => {
+  const admin = await tokenFor(ADMIN);
+  const post = (body, headers = {}) => call("/boards", { method: "POST", headers: { authorization: "Bearer " + admin, "content-type": "application/json", ...headers }, body });
+  const big = JSON.stringify({ title: "x".repeat(17_000) });
+  expect((await post(big)).status).toBe(413);
+  // No Content-Length (a stream): still cut off at the cap.
+  const stream = new ReadableStream({ start(c) { for (let i = 0; i < 40; i++) c.enqueue(new TextEncoder().encode("x".repeat(1000))); c.close(); } });
+  const sr = await post(stream);
+  expect(sr.status).toBe(413);
+  expect(await sr.json()).toEqual({ error: "too-large" });
+  // A lying (small) Content-Length doesn't help either.
+  expect((await post(big, { "content-length": "10" })).status).toBe(413);
+  expect(await (await post("{nope")).json()).toEqual({ error: "bad-json" });
+  expect((await post("")).status).toBe(400);
+  expect(await (await post("[]")).json()).toEqual({ error: "bad-request" });
+  expect(await (await post("null")).json()).toEqual({ error: "bad-request" });
+  expect(await (await post('{"title":"a","x":1}')).json()).toEqual({ error: "unknown-field", field: "x" });
+  expect(await (await post('{"__proto__":{"admin":true}}')).json()).toEqual({ error: "unknown-field", field: "__proto__" });
+  const form = await post("title=a", { "content-type": "application/x-www-form-urlencoded" });
+  expect(form.status).toBe(415);
+  expect((await post('{"title":"ok"}', { "content-type": "application/json; charset=utf-8" })).status).toBe(201);
+  // Grants need `role` (null removes).
+  const { board } = await (await post("{}")).json();
+  const g = p => call(`/boards/${board.id}/grants/google%3A9`, { method: "PUT", headers: { authorization: "Bearer " + admin, "content-type": "application/json" }, body: p });
+  expect((await g("{}")).status).toBe(400);
+  expect((await g('{"role":"viewer"}')).status).toBe(204);
+  expect((await g('{"role":null}')).status).toBe(204);
+  expect(await registry.grant(board.id, "google:9")).toBe(null);
+  // A bad percent-escape in a path segment is a 400, not a throw.
+  expect((await call(`/boards/${board.id}/grants/%E0%A4%A`, { method: "PUT", headers: { authorization: "Bearer " + admin, "content-type": "application/json" }, body: '{"role":"viewer"}' })).status).toBe(400);
+});
+
+// ---- outages ----
+
+test("a Registry that throws gives 503 unavailable, never 403 or 500", async () => {
+  const admin = await tokenFor(ADMIN);
+  const { board } = await (await api("/boards", admin, "POST", {})).json();
+  const down = new Proxy(registry, { get: () => async () => { throw new Error("db down"); } });
+  routes = build({ registry: down, tenancy: makeTenancy({ registry: down, now }) });
+  const reqs = [
+    api("/boards", admin, "POST", {}), api(`/boards/${board.id}/invites`, admin), api(`/boards/${board.id}/links`, admin, "POST", { role: "viewer" }),
+    api(`/boards/${board.id}/grants/google%3A9`, admin, "PUT", { role: "viewer" }), api(`/links/abc`, admin),
+  ];
+  for (const r of await Promise.all(reqs)) {
+    expect(r.status).toBe(503);
+    expect(await r.json()).toEqual({ error: "unavailable" });
+  }
+  // A session verifier that throws is an outage too.
+  routes = build({ sessions: { ...sessions, verify: async () => { throw new Error("x"); } } });
+  expect((await api(`/boards/${board.id}/invites`, admin)).status).toBe(503);
+  // A link redeem outage at sign-in still signs in, flagged.
+  routes = build({ tenancy: { ...tenancy, redeemLink: async () => { throw new Error("x"); } } });
+  const { res } = await signIn(GUEST, { startPath: "/links/abc" });
+  expect(new URLSearchParams(new URL(res.headers.get("location")).hash.slice(1)).get("link")).toBe("unavailable");
+});
+
+test("createBoard: an owner grant that fails twice reports the board id (503); one failure is retried", async () => {
+  const admin = await tokenFor(ADMIN);
+  let fails = 2;
+  const flaky = { ...registry, setGrant: async (...a) => { if (fails-- > 0) throw new Error("db blip"); return registry.setGrant(...a); } };
+  routes = build({ registry: flaky });
+  const r = await api("/boards", admin, "POST", { title: "orphan" });
+  expect(r.status).toBe(503);
+  const body = await r.json();
+  expect(body.error).toBe("owner-grant-failed");
+  expect(body.board).toMatch(/^b-[a-z0-9]{16}$/);
+  expect(await registry.board(body.board)).toMatchObject({ title: "orphan" });
+  expect(await registry.grant(body.board, "google:1001")).toBe(null);
+  fails = 1;
+  const ok = await api("/boards", admin, "POST", { title: "retried" });
+  expect(ok.status).toBe(201);
+  expect(await registry.grant((await ok.json()).board.id, "google:1001")).toBe("owner");
+  // Directly against the admin layer as well.
+  fails = 5;
+  await expect(createBoard({ caller: { user: "google:1001" }, tenant: acme.id }, { registry: flaky }))
+    .rejects.toMatchObject({ code: "owner-grant-failed", board: expect.stringMatching(/^b-/) });
+});
+
+// ---- mounting ----
+
+test("not my route: /health, /ws, /blobs/*, /metrics and unknown paths give null; wrong method 405", async () => {
+  for (const p of ["/health", "/ws", "/blobs/abc", "/blobs/t/x/y", "/metrics", "/", "/auth", "/auth/other", "/boards/x", "/boards/x/y", "/links", "/links/a/b", "/varz"])
+    for (const m of ["GET", "POST", "PUT", "DELETE"]) expect(await call(p, { method: m })).toBe(null);
+  const r = await call("/boards", { method: "GET" });
+  expect(r.status).toBe(405);
+  expect(r.headers.get("allow")).toBe("POST");
+  // The engine passes the parsed URL as the second argument; it is used if given.
+  expect(await routes(new Request(ORIGIN + "/boards", { method: "GET" }), new URL(ORIGIN + "/health"))).toBe(null);
+});
+
+test("no oidc configured: sign-in routes answer 503; the Bearer API still works", async () => {
+  routes = build({ oidc: null, config: { ...config, cookieKey: undefined } });
+  expect((await call("/auth/login")).status).toBe(503);
+  expect(await (await call("/auth/callback?code=x&state=y")).json()).toEqual({ error: "sign-in-unavailable" });
+  expect((await call("/links/abc")).status).toBe(503);
+  const tok = await sessions.issue({ user: "google:1001", name: "Ann", email: "ann@acme.com", domain: "acme.com" });
+  expect((await api("/boards", tok, "POST", {})).status).toBe(201);
+});
+
+let server;
+afterAll(() => server?.stop(true));
+test("over a real socket (Bun.serve on port 0): login → callback → POST /boards", async () => {
+  server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: async req => (await routes(req, new URL(req.url))) ?? new Response("nf", { status: 404 }) });
+  const base = `http://127.0.0.1:${server.port}`;
+  const start = await fetch(base + "/auth/login", { redirect: "manual" });
+  expect(start.status).toBe(302);
+  const loc = new URL(start.headers.get("location"));
+  idp.codes.set("sock", await idp.mint({ ...ADMIN, nonce: loc.searchParams.get("nonce") }));
+  const cb = await fetch(`${base}/auth/callback?code=sock&state=${loc.searchParams.get("state")}`, { redirect: "manual", headers: { cookie: cookieOf(start) } });
+  expect(cb.status).toBe(302);
+  const tok = fragToken(cb.headers.get("location"));
+  const r = await fetch(base + "/boards", { method: "POST", headers: { authorization: "Bearer " + tok, "content-type": "application/json" }, body: '{"title":"sock"}' });
+  expect(r.status).toBe(201);
+  expect((await fetch(base + "/health")).status).toBe(404);   // ours returned null; this bare server 404s
+});
+
+test("dev tokens: refused unless a dev verifier is configured and enabled; accepted when it is", async () => {
+  await registry.addTenantAdmin(acme.id, "dev:ann");
+  const tokens = { "dev-ann": { name: "ann", domain: "acme.com" } };
+  // Not configured (the default): a dev token is just a bad Bearer.
+  expect((await api("/boards", "dev-ann", "POST", {})).status).toBe(401);
+  // Configured but off (devAuth with no config, or enabled !== true): still refused.
+  routes = build({ dev: devAuth() });
+  expect((await api("/boards", "dev-ann", "POST", {})).status).toBe(401);
+  routes = build({ dev: devAuth({ enabled: false, tokens }) });
+  expect((await api("/boards", "dev-ann", "POST", {})).status).toBe(401);
+  // A verifier object that doesn't say it's enabled is ignored, even if it would accept.
+  routes = build({ dev: { verify: async () => ({ user: "dev:ann", name: "ann", email: null, domain: "acme.com" }) } });
+  expect((await api("/boards", "dev-ann", "POST", {})).status).toBe(401);
+  // Configured and on: accepted; unknown dev tokens still refused; session tokens still work.
+  routes = build({ dev: devAuth({ enabled: true, tokens }) });
+  const r = await api("/boards", "dev-ann", "POST", { title: "dev" });
+  expect(r.status).toBe(201);
+  expect(await registry.grant((await r.json()).board.id, "dev:ann")).toBe("owner");
+  expect((await api("/boards", "dev-bob", "POST", {})).status).toBe(401);
+  expect((await api("/boards", await tokenFor(ADMIN), "POST", {})).status).toBe(201);
+  // A dev verifier that throws is an outage, not a refusal.
+  routes = build({ dev: { enabled: true, verify: async () => { throw new Error("x"); } } });
+  expect((await api("/boards", "dev-ann", "POST", {})).status).toBe(503);
+});
+
+// ---- replay guard: amortised O(1) pruning and a fail-closed cap (p5-httpv MEDIUM 1) ----
+
+/** A handler whose oidc refuses every code at once, plus a forger of valid login cookies (the test holds the key). */
+async function guardRig(over = {}) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(config.cookieKey), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const h = build({ oidc: { begin: async () => ({}), finish: async () => null }, ...over });
+  let n = 0;
+  /** One callback with a fresh, valid cookie and its state; the bogus code makes it 400 after the state is used. */
+  const hit = async (state = "st-" + n++) => {
+    const p = b64(new TextEncoder().encode(JSON.stringify({ s: state, n: "n", v: "v", exp: Math.floor(now() / 1000) + 600 })));
+    const mac = b64(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode("l1." + p)));
+    return h(new Request(`${ORIGIN}/auth/callback?code=bogus&state=${state}`, { headers: { cookie: `${LOGIN_COOKIE}=l1.${p}.${mac}` } }));
+  };
+  return { hit };
+}
+const msPerCall = async (hit, calls, tick = 0) => {
+  const t0 = performance.now();
+  for (let i = 0; i < calls; i++) { clock.t += tick; await hit(); }
+  return (performance.now() - t0) / calls;
+};
+
+test("replay guard: per-callback cost stays flat as live states grow, with and without expiry churn", async () => {
+  // Small map vs large map: time the last 1,000 callbacks. The old full scan was ~6x slower at 60k than at 5k.
+  const small = await guardRig();
+  await msPerCall(small.hit, 2_000);
+  const a = await msPerCall(small.hit, 1_000);
+  const big = await guardRig();
+  await msPerCall(big.hit, 40_000);
+  const b = await msPerCall(big.hit, 1_000);
+  // Churn: ~40k live, the clock moves 15 ms per callback, so every call also expires one entry from the front.
+  const churn = await guardRig();
+  await msPerCall(churn.hit, 40_000, 15);
+  const c = await msPerCall(churn.hit, 1_000, 15);
+  console.log(`replay guard ms/callback: 3k live ${a.toFixed(4)}, 41k live ${b.toFixed(4)}, 40k live + churn ${c.toFixed(4)}`);
+  expect(b / a).toBeLessThan(3);
+  expect(c / a).toBeLessThan(3);
+}, 60_000);
+
+test("replay guard: a hard cap fails closed (503, cookie cleared); expiry frees room; replays still 400", async () => {
+  const { hit } = await guardRig({ config: { ...config, maxLoginStates: 3 } });
+  for (const s of ["a", "b", "c"]) expect((await hit(s)).status).toBe(400);         // used (bogus code → 400)
+  const full = await hit("d");
+  expect(full.status).toBe(503);
+  expect(await full.json()).toEqual({ error: "unavailable" });
+  expect(full.headers.getSetCookie().some(c => c.startsWith(LOGIN_COOKIE + "=;") && c.includes("Max-Age=0"))).toBe(true);
+  expect(await (await hit("a")).json()).toEqual({ error: "login-failed" });         // a replay is still a refusal
+  clock.t += 601_000;                                                                 // all three expire
+  expect((await hit("d")).status).toBe(400);                                         // room again: back to normal
+  // A good login through the real oidc still works under a cap with room left.
+  routes = build({ config: { ...config, maxLoginStates: 1 } });
+  const { res } = await signIn(ADMIN);
+  expect(res.status).toBe(302);
+  expect((await signIn(ADMIN)).res.status).toBe(503);                                // full → refused, not unguarded
+});

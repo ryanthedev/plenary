@@ -1,4 +1,4 @@
-// Admin functions: POST /boards and invite / share-link management, as plain functions (HTTP wiring is phase 3).
+// Admin functions: POST /boards and invite / share-link management, as plain functions (HTTP wiring: server/auth/http.js).
 // A hello never creates a board; only createBoard does.
 //
 // Who may do what:
@@ -16,8 +16,17 @@ import { ROLES, LINK_ROLES, INVITE_ROLES, normEmail } from "../auth/util.js";
 /** @typedef {import("../auth/oidc.js").Identity} Identity */
 
 export class AdminError extends Error {
-  /** @param {"forbidden"|"bad-request"|"last-owner"} code */
-  constructor(code, message) { super(message); this.code = code; }
+  /**
+   * @param {"forbidden"|"bad-request"|"last-owner"|"owner-grant-failed"} code
+   * @param {string} [message]
+   * @param {{ board?: string, cause?: unknown }} [extra]  `board`: the id of a board created without its owner grant
+   */
+  constructor(code, message, extra = {}) {
+    super(message);
+    this.code = code;
+    if (extra.board) this.board = extra.board;
+    if (extra.cause !== undefined) this.cause = extra.cause;
+  }
 }
 const forbidden = () => new AdminError("forbidden", "not allowed");
 const bad = m => new AdminError("bad-request", m);
@@ -55,8 +64,15 @@ export async function createBoard({ caller, tenant, title = "", memberRole = "vi
   if (memberRole !== null && (!ROLES.includes(memberRole) || memberRole === "owner")) throw bad("bad memberRole");
   if (typeof title !== "string" || title.length > 200) throw bad("bad title");
   const board = await registry.createBoard({ tenant, title, memberRole });
-  await registry.setGrant(board.id, caller.user, "owner");
-  return board;
+  // PROTOCOL.md § Registry: createBoard takes no creator, so the owner grant is a second call. Retry it once; if it
+  // still fails, report the failure WITH the board id (never success for an ownerless board). A tenant admin can
+  // still fix that board: they manage every board of their tenant, owner grants included.
+  let last;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { await registry.setGrant(board.id, caller.user, "owner"); return board; }
+    catch (err) { last = err; }
+  }
+  throw new AdminError("owner-grant-failed", `board ${board.id} was created but its owner grant failed`, { board: board.id, cause: last });
 }
 
 /** Give a user an explicit role on a board (or remove it with null). See the rules at the top. */

@@ -90,3 +90,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 platform: auth/admin audit found 1 real violation (the SQLite/Postgres Registry adapters import mint from the in-memory adapter), plus type-only Identity imports from oidc.js and an unwritten IdP port. p5-hex (t18k) fixes them; engine agreed to platform editing the 3 import lines in its adapter files (a named seam exception).
 - 2026-11-11 platform: drawh re-check 3 FAIL, 1 narrow HIGH (rapid toggles drop the third); round 3b with a hard stop (another HIGH ships the scope cut). Proxy agreed.
 - 2026-11-11 proxy: engine manager t14j handed off to t18m (94b1ae9); t14j closed and removed; engine workers relabelled reports-to=t18m.
+- 2026-11-11 engine: protocol v1.1 code committed on p2-land 5d55112 (p11-protov PASS round 4; bun test 398/0); lands with the phase-2 merge.

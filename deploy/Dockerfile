@@ -7,14 +7,19 @@ FROM oven/bun:1.4.4-slim
 
 WORKDIR /app
 
-# There are no dependencies today. Once a lockfile exists, copy package.json and
-# the lockfile first and run `bun install --frozen-lockfile --production` here.
-#
-# Copy only what the server runs, by name; never `COPY . .`. A stray file in the working tree (.env, a local
-# database, .git) cannot reach the image this way. The root .dockerignore is the second line of defence: it
-# also filters inside these directories (for example server/.env or web/x.db).
+# Dependencies first, so this layer is rebuilt only when package.json or bun.lock changes (layer caching).
+# --frozen-lockfile: fail if bun.lock does not match package.json, never rewrite it. --production: no devDependencies.
+# node_modules comes only from this install: .dockerignore excludes every host node_modules from the context.
+# The install runs as root, so node_modules is root-owned and read-only to the `bun` user the server runs as.
+# The download cache goes to a temporary directory removed in the same layer, so it never ships in the image.
+COPY package.json bun.lock ./
+RUN BUN_INSTALL_CACHE_DIR=/tmp/bun-install-cache bun install --frozen-lockfile --production \
+ && rm -rf /tmp/bun-install-cache
+
+# Then the source. Copy only what the server runs, by name; never `COPY . .`. A stray file in the working tree
+# (.env, a local database, .git, a host node_modules) cannot reach the image this way. The root .dockerignore is
+# the second line of defence: it also filters inside these directories (for example server/.env or web/x.db).
 # A new top-level runtime directory must be added here.
-COPY --chown=bun:bun package.json ./
 COPY --chown=bun:bun packages/ ./packages/
 COPY --chown=bun:bun server/ ./server/
 # web/ is the browser client. server/main.js does not import or serve it yet; it is copied so the image is

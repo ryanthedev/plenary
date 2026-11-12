@@ -5,7 +5,7 @@ public images.
 
 | File | What |
 |---|---|
-| `Dockerfile` | Single-node image on `oven/bun:1.4.4-slim`. Runs `bun run server/main.js` as the non-root `bun` user, listens on 0.0.0.0:8080, data in `/data`, health check on `GET /health`. |
+| `Dockerfile` | Single-node image on `oven/bun:1.4.4-slim`. Installs dependencies from `bun.lock` (`bun install --frozen-lockfile --production`) in their own layer, then copies the source. Runs `bun run server/main.js` as the non-root `bun` user, listens on 0.0.0.0:8080, data in `/data`, health check on `GET /health`. |
 | `compose.yml` | One `plenary` service with a named volume for SQLite and blobs, published on `127.0.0.1:8080` only, `restart: unless-stopped`. |
 | `cluster.compose.yml`, `cluster/` | Phase-4 cluster shape (not functional yet): see [Cluster](#cluster-phase-4-not-functional-yet). |
 
@@ -53,17 +53,22 @@ When sign-in is wired they come from your shell or `deploy/.env`, never this rep
   the compose file (`deploy/`), not from the repo root or your current directory.
 - **Git:** `.env` and `.env.*` are git-ignored everywhere in the repo; only `.env.example` (a template with no
   values) may be committed.
-- **Image:** the Dockerfile copies four named paths (`package.json`, `packages/`, `server/`, `web/`), and the root
-  `.dockerignore` also keeps `.env*`, databases, `.git`, `docs/`, `test/` and all of `deploy/` out of the image.
+- **Image:** the Dockerfile copies five named paths (`package.json`, `bun.lock`, `packages/`, `server/`, `web/`), and
+  the root `.dockerignore` also keeps `.env*`, databases, `.git`, `docs/`, `test/`, all of `deploy/` and every host
+  `node_modules` out of the image. `node_modules` in the image comes only from the frozen install.
 
 The Compose project is named `plenary` (`name:` in `compose.yml`), so the data volume is `plenary_plenary-data`.
 
 CI (`.github/workflows/ci.yml`) runs `bun test` on every push and pull request. Before the tests it clones
 herdr-draw (public, read-only) at the commit in `packages/core/SOURCE.json`, so the core-copy check runs there too.
-A second job, `test-cluster-services`, runs the same `bun test` with Postgres (a service container) and NATS and
-`DATABASE_URL`/`NATS_URL` set, ready for engine's phase-4 adapter tests (nothing reads them yet). NATS is started in a
-step with `docker run` and `cluster/nats.conf`, because the 2 MB `max_payload` can only come from a config file and
-service containers start before checkout; the step fails unless NATS reports `max_payload` 2097152.
+Both jobs install with `bun install --frozen-lockfile` and fail if `bun.lock` is missing or out of date.
+A second job, `test-cluster-services`, runs the same `bun test` with Postgres (a service container), NATS and an
+S3-compatible blob store, and `DATABASE_URL`, `NATS_URL` and `S3_*` set, so engine's cluster-adapter tests run there.
+NATS is started in a step with `docker run` and `cluster/nats.conf`, because the 2 MB `max_payload` can only come from
+a config file and service containers start before checkout; the step fails unless NATS reports `max_payload` 2097152.
+The blob store is the same `pgsty/minio` image and tag as `cluster.compose.yml`, started with `docker run` on the
+runner's loopback; the step creates the bucket and fails unless the store reports it. Its `S3_*` values are
+throwaway CI-only literals written in the workflow.
 
 ## Cluster (phase 4, not functional yet)
 

@@ -1,5 +1,5 @@
-# Build context is the repo root. deploy/Dockerfile copies four named paths (package.json, packages/, server/,
-# web/); this file is the second line of defence: it filters inside those paths and keeps the context small.
+# Build context is the repo root. deploy/Dockerfile copies five named paths (package.json, bun.lock, packages/,
+# server/, web/); this file is the second line of defence: it filters inside those paths and keeps the context small.
 # Docker matches these against the context root: unlike .gitignore, a bare `*.db` only matches at the top
 # level, so patterns that must match at any depth start with `**/`.
 
@@ -19,7 +19,8 @@ deploy
 # store) that should not ship. Nothing in server/, web/ or packages/ imports from test/.
 test
 
-# Dependencies are installed inside the image (once a lockfile exists), never copied from the host.
+# Dependencies are installed inside the image from bun.lock (`bun install --frozen-lockfile --production`), never
+# copied from the host. bun.lock itself must stay in the context: never list it here.
 **/node_modules
 **/.DS_Store
 

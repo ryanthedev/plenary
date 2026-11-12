@@ -113,3 +113,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-12 CEO: the owner may communicate with the proxy, through a tool: turn-end messages delivered by the proxy's watch (owner t13s added to it). In OFFICE.md.
 - 2026-11-12 platform: drawh proposal committed c3adcba (docs/m2/proposals/drawh-server.md + .patch; re-check 4b: four asked items pass, one narrow hand-edit-only gap accepted by the manager). Shown to the CEO. Round 4 (v1.1, t1ds) running.
 - 2026-11-12 client: p6-edge DONE ac91d62 (sign-in HTTP adapter, WebSocket transport; verifier no HIGH; bun test 684/0 by manager). p6-hex waits on the p2-land merge.
+- 2026-11-12 client: p6-edge2 DONE ff87a3c (WebSocket backpressure, a full buffer stuck 10 s = dropped; sign-in test gaps; verifier no HIGH; bun test 755/0 by manager).

@@ -1,9 +1,19 @@
 # Proposal: `drawh --server` (herdr-draw talks to Plenary)
 
 2026-11-12, round 4: moved onto protocol v1.1 (settings compare-and-set); file-side settings are back. Final check by pd-drawh4v (patch f4f9b05a…): FAIL by the letter on one ~20 ms same-batch window (F5, listed under
-limits), accepted under the manager's hard stop; everything else holds, no peer change undone. Next: one live run of
-`drawh --server` against the real Plenary server after the phase-2 merge. **Decision needed: apply `drawh-server.patch` to herdr-draw, or
-not.** Nothing is applied; herdr-draw is untouched (still at 5dfe352, clean).
+limits), accepted under the manager's hard stop; everything else holds, no peer change undone.
+
+2026-11-12, security fixes (pd-drawh-live; patch **680ec536…**): the three medium findings of the security review are
+fixed in the patch: the swap helper runs `python3 -I` (no planted module is loaded), scratch files beside the board get
+random names and are created exclusively (a file or symlink already at the name is refused, never followed), and
+every line the bridge (`drawh --server`) prints has control characters and terminal escapes stripped, the token masked
+before and after, and is capped at 600 characters. One test each, 16 of 16 mutations caught. Report: docs/m2/reports/pd-drawh-live.md, "Security fixes".
+
+2026-11-12, live run and fix round (pd-drawh-live; patch 930623ea…, superseded by 680ec536…): run against the real Plenary server (dcbdae6,
+single node). It worked, and found two faults, both fixed in this patch: every clean server restart was taken as
+"another room" and threw away a settings change made while the bridge was stopped (M1); a new drawh file joining a board
+exited `--once` with 2 and a false warning (M2). Report: docs/m2/reports/pd-drawh-live.md. **Decision needed: apply
+`drawh-server.patch` to herdr-draw, or not.** Nothing is applied; herdr-draw is untouched (still at 5dfe352, clean).
 
 ## What it does
 
@@ -31,7 +41,7 @@ board with no network code of its own.
 | `cli/plenary.js` | the runner: socket, reconnect with a growing delay, deadlines, exit codes. Node 22+ or bun |
 | `cli/drawh` | `--server` mode: checks flags and path, starts the runner with the token in its environment (not argv) |
 | `scripts/build.sh`, `mods/herdr-draw/` | the built mod carries the bridge and the protocol copy (herdr-draw's release test needs the refreshed build) |
-| `test/plenary.test.js` | 33 tests |
+| `test/plenary.test.js` | 69 tests |
 | `CLAUDE.md` | shape and gotchas |
 
 ## A save by someone else while the bridge is writing (the verifier's HIGH finding)
@@ -128,15 +138,27 @@ accepted (a test shows it). So the file carries a small marker, and there are tw
 ```sh
 git clone --local ~/repos/herdr-draw /tmp/hd && cd /tmp/hd
 git apply ~/repos/plenary/docs/m2/proposals/drawh-server.patch
-cp -R ~/repos/herdr-draw/node_modules . && bun test          # 291 pass (258 before)
+cp -R ~/repos/herdr-draw/node_modules . && bun test          # 327 pass (258 before)
 ```
 
-There is no Plenary server to point it at yet (phase 3). The tests start a local WebSocket around the protocol's
-reference `Room` and run the real `drawh --server` against it.
+The tests start a local WebSocket around the protocol's reference `Room` and run the real `drawh --server` against it.
+Against the real server: `bun server/main.js` in plenary with `PLENARY_DEV_TOKENS` set (main.js's header), a board id
+(the dev board in `<data>/dev-board.json`, or `POST /boards`), then
+`PLENARY_TOKEN=… drawh --server ws://127.0.0.1:PORT/ws --board ID FILE` (the commands of the live run are in
+docs/m2/reports/pd-drawh-live.md).
 
 ## What was checked
 
-- **Patch:** `git apply --check` and apply in a fresh clone of 5dfe352; `bun test` there: 291 pass, 0 fail.
+- **Patch:** `git apply --check` and apply in a fresh clone of 5dfe352; `bun test` there: 327 pass, 0 fail. The
+  protocol copy is byte-identical to plenary main's `packages/protocol` (unchanged since dcbdae6).
+- **Live, against the real server** (plenary dcbdae6, single node, dev tokens; pd-drawh-live): shapes and settings both
+  ways between two bridges, stale copies, the room's `stale-setting`, `--once` exit codes, catch-up after a bridge
+  restart, `welcome.room` epochs, a clean server stop in the middle of a 120-shape burst: no acknowledged op lost
+  (board, both files and a viewer's copy agree element for element). After the fix round: no false "not the board"
+  line on a restart, a settings change made while the bridge was stopped reaches the board, one a peer changed meanwhile
+  is refused out loud, and a new drawh file joins quietly with exit 0.
+- **Fix round mutation check:** 13 mutations of the new code (each rule of the snapshot check, the history carry-over,
+  the snapshot tip, the new-file rule), each caught by a test; one more was equivalent and its code was dropped.
 - **Plenary:** `bun test --path-ignore-patterns 'test/web/adapters/transport-ws*'`: 573 pass, 78 skipped, 0 fail (no plenary code touched; that file is another session's work in progress).
 - **Every verifier finding that is code has a test** (table in `docs/m2/reports/pd-drawh.md`, "Fix round"); the two
   that aren't (temp folders left by tests, a wrong sentence in this page) were checked by hand.
@@ -148,9 +170,8 @@ reference `Room` and run the real `drawh --server` against it.
 
 ## What is NOT tested
 
-- **A real Plenary server.** None exists. Only the reference `Room`.
-- **A real v1.1 server.** The copy is p2-land 5d55112 (protocol v1.1); tests run against its reference `Room`. Real
-  servers send `welcome.room` only after engine's p2-swap; until then the bridge's tip check is the room check.
+- **A crash of the real server** (`kill -9`): only clean stops were run live. Cluster mode (Postgres + NATS), a
+  takeover between nodes, and the Room's own 1,000-entry checkpoint against the real server (in process only).
 - **Inside Herdr.** Nothing here runs in Herdr's QuickJS runtime, and Herdr's own WebSocket is not used: the socket
   lives in node or bun, started by drawh. A pane that connects by itself is a later, separate change.
 - **A real pane beside a running bridge**, and `herdr-app check` on the built mod with its new folders (`cli/`,
@@ -183,8 +204,19 @@ reference `Room` and run the real `drawh --server` against it.
 - **Recognising the room.** v1.1's `welcome.room` is read first: another board, or a writer's welcome with an epoch
   lower than one seen (kept across restarts), is another room: said once, a fresh copy, nothing from a wrong board
   is applied. The old check (the last entry applied, by op id and author) still runs on every reconnect, and is
-  the only one when a welcome has no `room` (servers before p2-swap). A snapshot in answer to that check (the room checkpointed past it) still counts as another
-  room: the file's shapes are sent again and its settings markers are dropped.
+  the only one when a welcome has no `room` (servers before p2-swap). A snapshot in answer to that check (the room
+  checkpointed at or past it: every clean server stop, and the Room every 1,000 entries) is judged by what it holds:
+  not behind the tip, every element this copy confirmed at the same or a later version, every settings key at the same
+  or a later `appSeq` with the same value at the same one. Then it is the same room, with the history of who changed
+  what carried over (a key the snapshot moved counts as someone else's change). Otherwise another room: the file's
+  shapes are sent again and its settings markers are dropped.
+  - **Not by epoch alone** (the manager's rule was: same room when the epoch is strictly higher). A clean restart does
+    raise the epoch, but the 1,000-entry checkpoint keeps it, and a wiped server raises it too after its own restarts.
+    The contents check covers all three. It does not tell a different server apart if that server holds everything
+    this copy confirmed (the same shapes at the same or later versions, the same keys no older): then nothing is lost
+    by treating it as this room, and its settings changes count as someone else's (refused out loud, never silently).
+  - **A server that steps back to an older checkpoint** (a bad one on disk) answers a bridge that last caught up from
+    a snapshot with entries instead: no entry to compare, so another room (said, the file's shapes sent again).
 - **A wiped or different server behind the same URL gets the whole file sent again**, with one warning line.
 - **A hand-edited invalid setting nobody has set yet is dropped quietly.** If the file holds a value the protocol
   would refuse (say `snap: "yes"`) for a setting the board has never set, it is not sent and nothing is printed; when a
@@ -192,7 +224,9 @@ reference `Room` and run the real `drawh --server` against it.
   such values; a hand edit or another tool can (re-check 4b, accepted by the manager).
 - **Board stream only.** Notes, comments and presence are not shown or sent.
 - **Pictures:** image elements travel, their bytes don't (the protocol refuses `files`; the blob port isn't built).
-- **Joining a board that already has layers:** the board's settings win over the file's.
+- **Joining a board that already has layers:** the board's settings win over the file's. A new drawh file carries drawh's
+  default layer list (one "Layer 1"); with no marker for it, that is nobody's change: the board's layers are taken
+  quietly and `--once` exits 0. Any other layers in a new file are the board's too, said once.
 - **Settings, what can still go wrong (round 4, final check by pd-drawh4v; the cases below are accepted limits):**
   - **An agent's save that read the file before your settings change and lands after it undoes your change** on the
     board too (it already had in the file): your change and that save both stand on the same base. (Round 3's limit.)
@@ -210,11 +244,6 @@ reference `Room` and run the real `drawh --server` against it.
     one saved again, both between the refusal's line and the bridge's next pass, is written back with no further line
     (only the refusal's line, which named that value). Only an automated writer or a save already on its way can land
     in that window (pd-drawh4v F5, accepted under the manager's hard stop).
-  - **A restart that meets a checkpointed room** (the server answers the bridge's tip check with a snapshot) is
-    taken as another room, even when `welcome.room` names the same board and epoch: a false "this is not the board
-    …" line, and a settings change made in the file while the bridge was stopped is refused (loudly). Epochs restart
-    at 1 on a new store, so they can't tell a wiped server from the same one; fixing this needs a room id a new
-    store can't repeat (a protocol change).
   - **Lines:** an untouched old copy is quiet now (round 4 vs 80 lines a minute under option 2), but a change made on
     an old copy is said each time.
 - **A change the room refuses stays in the local file**, with a warning that names the element, and is tried again

@@ -2,7 +2,7 @@ drawh --server: proposal patch for herdr-draw. NOT applied; the CEO decides (doc
 Base: herdr-draw 5dfe352 (git diff --cached against that HEAD). protocol/ = plenary packages/protocol at 5d55112 (protocol v1.1, p2-land).
 Apply: git apply docs/m2/proposals/drawh-server.patch   (from a herdr-draw checkout at 5dfe352)
 diff --git a/CLAUDE.md b/CLAUDE.md
-index 03b1a14..b752516 100644
+index 03b1a14..8397d76 100644
 --- a/CLAUDE.md
 +++ b/CLAUDE.md
 @@ -28,6 +28,11 @@ adapters/herdr/  the Herdr mod: GPUI events → editor; display list → GPUI. s
@@ -22,11 +22,11 @@ index 03b1a14..b752516 100644
  ## Dev loop
  
 -- `bun test` (258 tests). `drawh mermaid` runs core/mermaid.js through node (or bun), so agents and the pane lay out alike. Snapshots land in `test/out/*.png` (headless Chromium from Playwright's cache).
-+- `bun test` (291 tests). `drawh mermaid` runs core/mermaid.js through node (or bun), so agents and the pane lay out alike. Snapshots land in `test/out/*.png` (headless Chromium from Playwright's cache).
++- `bun test` (324 tests). `drawh mermaid` runs core/mermaid.js through node (or bun), so agents and the pane lay out alike. Snapshots land in `test/out/*.png` (headless Chromium from Playwright's cache).
  - `scripts/dev-sync.sh` builds `build/herdr-draw` (adapter + core + svg + drawh) and installs a **copy** into `~/.config/herdr-app/mods/herdr-draw`.
  - `scripts/release.sh` refreshes `mods/herdr-draw`, the built mod people install from GitHub (herdr.dev); run it before
    committing user-facing changes (`test/release.test.js` fails while it's stale).
-@@ -150,3 +155,51 @@ sent only to that window's id; quit it by its pid when done.
+@@ -150,3 +155,60 @@ sent only to that window's id; quit it by its pid when done.
    the store polls the stamp every 1.5 s. Up to exec's 8 MiB. ⌘O in a space on that machine lists its boards. That
    machine's own Herdr doesn't list itself in `machines()`, so the same pane there reads locally. Export is local-only.
  - Writers other than the pane must bump `version` on every element they change (drawh does), or the pane may keep its copy.
@@ -36,14 +36,16 @@ index 03b1a14..b752516 100644
 +  the seq, the last entry's id, the element versions the file and the board last agreed on, the settings `appSeq`, the
 +  room's epoch and lineage, the bridge's earlier client ids). Board stream only; pictures'
 +  bytes don't travel. The pane has no network code: it sees the board through the file, as it sees drawh. Tested against the
-+  protocol's v1.1 reference Room only (in process, and behind a local WebSocket); no Plenary server existed when this was written.
++  protocol's v1.1 reference Room (in process, and behind a local WebSocket), and run live once against the real Plenary
++  server at dcbdae6 (single node; plenary docs/m2/reports/pd-drawh-live.md).
 +- The bridge never renames over the board blind (drawh and the pane don't lock, and a save landing mid-write would vanish):
 +  `cli/files.js` swaps the new file and the board atomically (`renamex_np(RENAME_SWAP)` through a one-line python, macOS) and
 +  merges whatever it took out that it didn't expect. Off APFS (HFS+ refuses the swap), or with `DRAWH_WRITE=link`, it hard-links the board aside
 +  and renames: that leaves a window (about 0.25 ms) it can't see into; it waits for a drawh save in flight
 +  (`<board>.drawh.tmp`) but can't see the pane's coming, and it says so once at start. Both assume every
 +  writer replaces the file by rename (drawh, `writeTextFile` and the big-file path do). Its temp names are
-+  `<board>.plenary-<pid>.tmp|.old`; a save it could not parse is kept as `<board>.plenary-unmerged-*`.
++  `<board>.plenary-<16 random hex>.tmp|.old`, new for every write and created exclusively (anything already at the
++  name, a file or a symlink, is refused, never followed); a save it could not parse is kept as `<board>.plenary-unmerged-*`.
 +- Seeding (decided with Plenary's platform manager, 2026-11-11): the room refuses a version more than 1,000 past its own
 +  copy, and a shape it has never had counts as version 0. So only a shape new to the board **whose version is past 1,000** is
 +  sent as version 1 with a new nonce (same id), and the file is renumbered to match; every other shape keeps its version
@@ -67,23 +69,30 @@ index 03b1a14..b752516 100644
 +  change the bridge writes the file once (a fresh marker). A key the board has never set is seeded from the file.
 +  `--once` exits 2 when a settings change did not reach the board. `test/plenary.test.js` pins R1-R3 and case V
 +  (plenary's pd-drawh report).
-+- Before its first write the bridge tries the swap on two scratch files beside the board (`<board>.plenary-<pid>.probe*`):
++- Before its first write the bridge tries the swap on two scratch files beside the board (`<board>.plenary-<random>.probe*`):
 +  FAT accepts `renamex_np(RENAME_SWAP)` and just renames. No real swap → link mode (HFS+ too); no hard links either
 +  (exFAT) → it refuses to replace the board at all and says so once (the file's changes still go to the board).
 +- Recognising the room: `welcome.room` (board and epoch) is read first; another board, or a writer's welcome with an epoch
 +  lower than one seen (kept in the state file), is another room. Then, on every reconnect (and alone, when a server
 +  before Plenary's p2-swap sends no `room`), the bridge asks for the last entry it applied (`since` one less than needed)
-+  and compares op id and author. Another room
-+  (another server, a reset one, a snapshot in answer to that check) means a fresh Replica and start over from the board's
++  and compares op id and author. A snapshot in answer (the room checkpointed at or past that entry: every clean server
++  stop does, and the Room every 1,000 entries) has no entry to show, so it is judged by what it holds (`agrees()`): not
++  behind the tip, every element confirmed here at the same or a later version, every settings key at the same or a later
++  `appSeq` and the same value at the same one. Then it is the same room: the settings history carries over (`skipped()`
++  adds one entry per key the snapshot moved, someone else's unless one of mine landed there), and the tip becomes the
++  snapshot's seq (`id` null), so the next run is recognised the same way. Another room (another server, a reset one, a
++  snapshot that contradicts this copy, entries without the tip) means a fresh Replica and start over from the board's
 +  copy: the file's shapes are sent again and its settings markers are dropped.
++- A new file's layers: drawh writes a default layer list into every new file (`layers()` in cli/drawh). With no marker
++  for it, that value is nobody's change: the board's layers are taken quietly (`DEFAULT_LAYERS` in cli/bridge.js).
 +- `drawh --server` is the mode switch only before a command word and before `--` (`server_mode` in cli/drawh; `COMMANDS`
 +  there must list every subcommand: `test/plenary.test.js` checks it against `drawh -h`).
 diff --git a/cli/bridge.js b/cli/bridge.js
 new file mode 100644
-index 0000000..0e0074a
+index 0000000..7d4d79a
 --- /dev/null
 +++ b/cli/bridge.js
-@@ -0,0 +1,563 @@
+@@ -0,0 +1,627 @@
 +// Keeps one .excalidraw file and one Plenary board in step (drawh --server). The pane and drawh already
 +// meet at the file, so this is the only network code herdr-draw needs: file changes become protocol ops,
 +// the room's entries are written back. No I/O here: the runner (plenary.js) hands in read/write and a
@@ -119,6 +128,22 @@ index 0000000..0e0074a
 +const EMPTY = () => ({ type: "excalidraw", version: 2, source: "herdr-draw", elements: [], appState: { viewBackgroundColor: "#ffffff" }, files: {} });
 +const short = t => t.length > 80 ? `${t.slice(0, 77)}...` : t;
 +const list = keys => keys.length === 1 ? keys[0] : `${keys.slice(0, -1).join(", ")} and ${keys[keys.length - 1]}`;
++// A line for the terminal. Lines carry text a server sent (error messages, user names, roles, board ids), so nothing
++// in one may steer the terminal: escape sequences (CSI, OSC and the like) go whole, every other control character,
++// C1 control and bidirectional override becomes "?", and a line is cut at MAX_LINE characters.
++const MAX_LINE = 600;
++export function clean(line) {
++  const t = String(line)
++    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, "")                       // OSC … BEL / ST (titles, links, clipboard)
++    .replace(/\x1b[P^_][^\x1b]*(?:\x1b\\)?/g, "")                               // DCS, PM, APC … ST
++    .replace(/\x1b\[[0-?]*[ -/]*[@-~]?/g, "")                                    // CSI (colours, cursor, clear screen)
++    .replace(/\x1b[ -/]*[0-~]?/g, "")                                             // any other escape
++    .replace(/[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "?");
++  return t.length > MAX_LINE ? `${t.slice(0, MAX_LINE)}… (cut)` : t;
++}
++
++// The layers drawh writes into a new file (cli/drawh, layers()). In a file no marker speaks for, that is nobody's change.
++const DEFAULT_LAYERS = canon([{ id: "base", name: "Layer 1", visible: true, locked: false, opacity: 100 }]);
 +
 +/** What's wrong with a decoded frame from the server, or null. The Replica trusts its input; this doesn't. */
 +export function frameProblem(msg) {
@@ -268,6 +293,40 @@ index 0000000..0e0074a
 +  // Settings history starts at the copy's appSeq (a snapshot or a restore says nothing about who wrote before).
 +  startHistory() { this.hist = {}; this.histFrom = { ...this.replica.appSeq[STREAM] }; }
 +
++  /**
++   * A snapshot in answer to the tip check: is it this room's? It has no entry to show, so it is judged by what it
++   * holds. This room's never contradicts this copy: it is not behind the tip, and every element confirmed here is in
++   * it at the same or a later version (tombstones are kept), every settings key at the same or a later appSeq, with
++   * the same value at the same appSeq. A wiped or different server fails that (shapes missing, a key behind, another
++   * value at the same seq) or is behind; a lower epoch was caught at the welcome. A server that passes it holds all
++   * of this copy, so taking it as this room's loses nothing: changes it made since count as someone else's (loud).
++   */
++  agrees(msg, c) {
++    const r = this.replica, s = msg.streams?.[STREAM];
++    if (!seqOk(msg.seq) || msg.seq < c.seq || !isObj(s) || !Array.isArray(s.elements)) return false;
++    const els = new Map(s.elements.filter(isObj).map(e => [e.id, e]));
++    for (const [id, v] of r.confirmedVersion[STREAM]) { const e = els.get(id); if (!e || !(e.version >= v)) return false; }
++    const theirs = isObj(msg.appSeq?.[STREAM]) ? msg.appSeq[STREAM] : {}, shown = isObj(s.appState?.herdr) ? s.appState.herdr : {};
++    for (const [k, mine] of Object.entries(r.appSeq[STREAM])) {
++      if (!seqOk(theirs[k]) || theirs[k] < mine) return false;
++      if (theirs[k] === mine && !same(shown[k], r.confirmed[STREAM][k])) return false;
++    }
++    return true;
++  }
++
++  // A snapshot of this room skipped the entries between: per settings key it moved, one entry at its new appSeq,
++  // someone else's unless it is one of mine that landed. "Nobody else changed it since" then still answers right for
++  // a file built on the old base: unchanged key, its change is sent; changed key, it is refused out loud.
++  skipped(before) {
++    const now = this.replica.appSeq[STREAM], mineAt = new Set(Object.values(this.landed));
++    for (const k of SETTINGS) {
++      if (!seqOk(now[k]) || now[k] <= (before[k] ?? 0)) continue;
++      const h = this.hist[k] ??= [];
++      h.push({ seq: now[k], mine: mineAt.has(now[k]), id: null });
++      if (h.length > MAX_HIST) this.histFrom[k] = h.shift().seq;
++    }
++  }
++
 +  // An entry on a settings key: remember who wrote it, so "nobody else changed it since" can be answered.
 +  record(e) {
 +    if (e.stream !== STREAM || !isObj(e.op.appState)) return;
@@ -335,6 +394,10 @@ index 0000000..0e0074a
 +      const attempt = this.attempts.delete(k);   // (its marker may name the refused value: that is not an untouched old copy)
 +      const [base, hash, unsent] = this.markOf(herdr, k), since = this.since(k, base);
 +      if (looked && !unsent) continue;
++      // A new file joining a board: drawh's default layers, with no marker for them, are not a change anyone made. The
++      // board's are written back quietly and nothing is held (--once exits 0). (A board no one has set layers on shows
++      // the same default, core's doc: there is nothing to send either way.)
++      if (k === "layers" && hash === null && !unsent && !attempt && canon(v) === DEFAULT_LAYERS) continue;
 +      if (appStateProblem({ [k]: v }) !== null) {
 +        if (own(ordered, k) && hash !== printOf(v)) invalid.push(k);   // a key the board has: put back, said; unset: stays here, unsent
 +        continue;
@@ -403,6 +466,7 @@ index 0000000..0e0074a
 +
 +  take(msg) {
 +    const r = this.replica;
++    let keep = false;                      // a snapshot recognised as this room's: the settings history carries over
 +    if (msg.t === "welcome") {
 +      this.welcome = msg.seq; this.role = msg.role; this.user = msg.user;
 +      // v1.1 room identity (a welcome without `room` is a server before v1.1: the tip check below is all there is).
@@ -415,8 +479,14 @@ index 0000000..0e0074a
 +      if (msg.seq < r.applied) { this.welcome = null; if (room && msg.high !== undefined) this.epoch = room.epoch; return this.otherRoom(); }   // behind what this file saw
 +    } else if (this.check && !(msg.t === "error" && !msg.id)) {   // (a refusal or "unavailable" says nothing about which room this is)
 +      const c = this.check; this.check = null;
-+      const e = msg.t === "entries" ? msg.entries.find(e => e.seq === c.seq) : null;
-+      if (!e || e.id !== c.id || e.by !== c.by) return this.otherRoom();
++      if (msg.t === "snapshot") {
++        // The room checkpointed at or past the tip (a clean restart, a takeover, every 1,000 entries): no entry to show.
++        if (!this.agrees(msg, c)) return this.otherRoom();
++        keep = true;
++      } else {
++        const e = msg.t === "entries" ? msg.entries.find(e => e.seq === c.seq) : null;
++        if (!e || e.id !== c.id || e.by !== c.by) return this.otherRoom();
++      }
 +    }
 +    if (msg.t === "error") {
 +      const p = msg.id ? r.pending.get(msg.id) : null;
@@ -427,13 +497,16 @@ index 0000000..0e0074a
 +      }
 +    }
 +    if (msg.t === "entries") for (const e of msg.entries) if (e.seq > r.applied) this.seenEntries.set(e.seq, { id: e.id, by: e.by });
-+    const before = r.applied;
++    const before = r.applied, seqsBefore = { ...r.appSeq[STREAM] };
 +    const did = r.receive(msg);
-+    if (did.snapshot || r.applied < before) this.startHistory();
++    if (did.snapshot && keep) this.skipped(seqsBefore);
++    else if (did.snapshot || r.applied < before) this.startHistory();
 +    for (const e of did.entries) this.record(e);
 +    if (r.applied !== before) {
 +      const t = this.seenEntries.get(r.applied);
-+      this.tip = t ? { seq: r.applied, id: t.id, by: t.by } : null;   // null after a snapshot: no entry to show next time
++      // After a snapshot there is no entry to show next time: the tip is the snapshot's seq, and the next hello's
++      // answer is judged by agrees() (a room that answers it with entries instead has no such entry: another room).
++      this.tip = t ? { seq: r.applied, id: t.id, by: t.by } : did.snapshot ? { seq: r.applied, id: null, by: null } : null;
 +      for (const k of [...this.seenEntries.keys()]) if (k <= r.applied) this.seenEntries.delete(k);
 +    }
 +    this.settingsAnswers(did);
@@ -735,10 +808,10 @@ index b446219..8e885e4 100755
      o = sub.add_parser("open"); o.add_argument("file"); o.add_argument("--down", action="store_true")
 diff --git a/cli/files.js b/cli/files.js
 new file mode 100644
-index 0000000..c3fb192
+index 0000000..9250444
 --- /dev/null
 +++ b/cli/files.js
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,160 @@
 +// How drawh --server writes the board file without losing someone else's save.
 +//
 +// drawh and the pane both save by read, change, write a temp file, rename over the board. Nobody locks.
@@ -767,6 +840,7 @@ index 0000000..c3fb192
 +
 +import { readFileSync, writeFileSync, renameSync, linkSync, unlinkSync, statSync } from "node:fs";
 +import { spawnSync } from "node:child_process";
++import { randomBytes } from "node:crypto";
 +
 +const SWAP = `import ctypes, ctypes.util, os, sys
 +if sys.platform != "darwin": sys.exit(3)
@@ -774,7 +848,18 @@ index 0000000..c3fb192
 +if libc.renamex_np(os.fsencode(sys.argv[1]), os.fsencode(sys.argv[2]), 2) != 0:   # 2 = RENAME_SWAP
 +    sys.exit(4 if ctypes.get_errno() == 2 else 3)
 +`;
++// python -I (isolated): no current folder, no user site folder and no PYTHON* variables on its module path, so a
++// ctypes.py (or any module) planted where drawh runs is never imported by the swap.
++const PY = ["-I", "-c", SWAP];
 +const gone = path => { try { unlinkSync(path); } catch {} };
++// Our scratch names beside the board: unguessable (random per write), and created exclusively (O_CREAT|O_EXCL, which
++// never follows a symlink): if anything already sits at the name, a file or a link someone planted, it is refused.
++const scratchName = (path, what) => `${path}.plenary-${randomBytes(8).toString("hex")}.${what}`;
++const refuse = p => Object.assign(new Error(`refusing to write ${p}: something is already there (a file or a link)`), { code: "EEXIST" });
++const create = (p, text) => {
++  try { writeFileSync(p, text, { flag: "wx" }); }
++  catch (e) { if (e.code === "EEXIST") throw refuse(p); throw e; }
++};
 +const pause = ms => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch {} };
 +const parses = text => { try { JSON.parse(text); return true; } catch { return false; } };
 +
@@ -785,10 +870,12 @@ index 0000000..c3fb192
 +    this.path = path; this.python = python; this.mode = mode === "link" ? "link" : "swap"; this.warn = warn;
 +    this.link = link; this.probed = false;                  // (`link`: for tests of a disk without hard links)
 +    this.patience = patience; this.theirTmp = `${path}.drawh.tmp`; this.stale = null;
-+    this.tmp = `${path}.plenary-${process.pid}.tmp`;       // our own names: drawh's saves use `.drawh.tmp`
-+    this.aside = `${path}.plenary-${process.pid}.old`;
++    this.tmp = null; this.aside = null;                     // our own names, new for every write (drawh's saves use `.drawh.tmp`)
 +    this.kept = 0;
 +  }
++
++  /** A new scratch name beside the board (one place, so a test can plant something at the name it will use). */
++  scratch(what) { return scratchName(this.path, what); }
 +
 +  /** The board's text, or null when there is no file. */
 +  read() { try { return readFileSync(this.path, "utf8"); } catch (e) { if (e.code === "ENOENT") return null; throw e; } }
@@ -804,9 +891,10 @@ index 0000000..c3fb192
 +      if (expected === null && this.read() === null) { try { writeFileSync(this.path, text, { flag: "wx" }); return; } catch (e) { if (e.code !== "EEXIST") throw e; } }
 +      throw new Error(NO_SAFE_WRITE);
 +    }
-+    writeFileSync(this.tmp, text);
++    this.tmp = this.scratch("tmp"); this.aside = this.scratch("old"); this.madeAside = false;
++    create(this.tmp, text);                                  // (refused: thrown before the finally, so a planted link stays where it was)
 +    try { return this.exchange(expected); }
-+    finally { gone(this.tmp); gone(this.aside); }
++    finally { gone(this.tmp); if (this.madeAside) gone(this.aside); }   // (the aside only if we linked it: never someone else's)
 +  }
 +
 +  // Once, before the first write: does this disk really do what the mode needs? Tried on two scratch
@@ -814,19 +902,23 @@ index 0000000..c3fb192
 +  probe() {
 +    if (this.probed) return;
 +    this.probed = true;
-+    const a = `${this.path}.plenary-${process.pid}.probe1`, b = `${this.path}.plenary-${process.pid}.probe2`, c = `${this.path}.plenary-${process.pid}.probe3`;
++    const a = this.scratch("probe1"), b = this.scratch("probe2"), c = this.scratch("probe3");
 +    const text = p => { try { return readFileSync(p, "utf8"); } catch { return null; } };
++    const made = [], make = (p, t) => { create(p, t); made.push(p); };   // only what we made is ours to remove
 +    try {
 +      if (this.mode === "swap") {
-+        writeFileSync(a, "1"); writeFileSync(b, "2");
-+        const r = spawnSync(this.python, ["-c", SWAP, a, b], { stdio: "ignore" });
++        make(a, "1"); make(b, "2");
++        const r = spawnSync(this.python, [...PY, a, b], { stdio: "ignore" });
 +        if (!(r.status === 0 && text(a) === "2" && text(b) === "1")) { this.mode = "link"; this.fellBack = true; }
 +      }
 +      if (this.mode === "link") {
-+        writeFileSync(a, "1"); gone(c);
-+        try { this.link(a, c); if (text(c) !== "1") throw new Error("no link"); } catch { this.mode = "none"; }
++        if (made.includes(a)) gone(a);                     // (ours, from the swap try; anything else at the name is refused)
++        make(a, "1");
++        try { this.link(a, c); made.push(c); if (text(c) !== "1") throw new Error("no link"); }
++        catch (e) { if (e.code === "EEXIST") throw refuse(c); this.mode = "none"; }   // (a link refuses an existing name: something planted, not a disk without links)
 +      }
-+    } finally { gone(a); gone(b); gone(c); }
++    } catch (e) { this.probed = false; throw e; }        // (a refused scratch name: try again, with new names, next write)
++    finally { for (const p of made) gone(p); }
 +    if (this.mode === "none") this.warn(NO_SAFE_WRITE);
 +    else if (this.fellBack) this.warn(LINK_WARNING);
 +  }
@@ -850,15 +942,15 @@ index 0000000..c3fb192
 +        catch (e) { if (e.code !== "EEXIST") throw e; continue; }
 +      }
 +      if (this.mode === "swap") {
-+        const r = spawnSync(this.python, ["-c", SWAP, this.tmp, this.path], { stdio: "ignore" });
++        const r = spawnSync(this.python, [...PY, this.tmp, this.path], { stdio: "ignore" });
 +        if (r.status === 0) { at = this.tmp; }
 +        else if (r.status === 4) continue;                 // the board vanished under us: start again
 +        else { this.mode = "link"; this.warn(LINK_WARNING); }   // (it passed the probe, and fails now: python gone?)
 +      }
 +      if (this.mode === "link") {
 +        this.letDrawhLand();
-+        gone(this.aside);
-+        try { this.link(this.path, this.aside); } catch (e) { if (e.code === "ENOENT") continue; throw e; }
++        try { this.link(this.path, this.aside); this.madeAside = true; }   // (a hard link refuses an existing name, like wx)
++        catch (e) { if (e.code === "ENOENT") continue; if (e.code === "EEXIST") throw refuse(this.aside); throw e; }
 +        renameSync(this.tmp, this.path);
 +        at = this.aside;
 +      }
@@ -867,7 +959,7 @@ index 0000000..c3fb192
 +      // Someone else's save. Rename-writers leave it whole; give an in-place writer a moment to finish.
 +      for (let i = 0; i < 6 && !parses(old); i++) { pause(50); old = readFileSync(at, "utf8"); }
 +      if (!parses(old)) {
-+        const keep = `${this.path}.plenary-unmerged-${Date.now()}-${++this.kept}`;
++        const keep = `${this.path}.plenary-unmerged-${Date.now()}-${++this.kept}-${randomBytes(4).toString("hex")}`;   // (a rename: replaces, never follows, a link at the name)
 +        renameSync(at, keep);
 +        this.warn(`a save by someone else was not valid JSON when the bridge replaced it; kept as ${keep}, not merged`);
 +        return;
@@ -882,10 +974,10 @@ index 0000000..c3fb192
 +export const LINK_WARNING = "replacing the board file in two steps (this disk can't swap files in one, or DRAWH_WRITE=link asked for it): a save by the pane, or by drawh, that lands in exactly that instant can be lost";
 diff --git a/cli/plenary.js b/cli/plenary.js
 new file mode 100644
-index 0000000..94b9232
+index 0000000..3093779
 --- /dev/null
 +++ b/cli/plenary.js
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,166 @@
 +// drawh --server: the process that holds the socket. Started by drawh (node 22+ or bun: both have a
 +// WebSocket built in), never by the pane. The deciding is in bridge.js, the file writing in files.js;
 +// this file is the socket, the timers and the exit codes.
@@ -904,7 +996,7 @@ index 0000000..94b9232
 +import { createHash } from "node:crypto";
 +import { homedir } from "node:os";
 +import { join } from "node:path";
-+import { Bridge } from "./bridge.js";
++import { Bridge, clean } from "./bridge.js";
 +import { BoardFile, LINK_WARNING, NO_SAFE_WRITE } from "./files.js";
 +import { jsonCodec } from "../protocol/codec.js";
 +
@@ -915,7 +1007,11 @@ index 0000000..94b9232
 +const ms = (name, fallback) => { const n = Number(process.env[name]); return Number.isFinite(n) && n > 0 ? n : fallback; };
 +const RETRY = ms("DRAWH_RETRY_MS", 1000), RETRY_MAX = RETRY * 30, STALL = ms("DRAWH_STALL_MS", 20000);
 +
-+const say = line => process.stderr.write(`drawh: ${token ? String(line).split(token).join("***") : line}\n`);
++// The token is masked first; then clean(): text a server sent can't steer the terminal, and a line is capped.
++// The token is masked before clean() (so the length cap can't cut it in half) and again after (a server that
++// echoes it with an escape inside would otherwise have it put back together by the stripping).
++const mask = line => token ? String(line).split(token).join("***") : String(line);
++const say = line => process.stderr.write(`drawh: ${mask(clean(mask(line)))}\n`);
 +const die = (line, code = 1) => { say(line); process.exit(code); };
 +
 +if (!server || !board || !file) die("usage: drawh --server URL --board ID [--token T] [--once] FILE");
@@ -1050,10 +1146,10 @@ index 0000000..94b9232
 +connect();
 diff --git a/mods/herdr-draw/cli/bridge.js b/mods/herdr-draw/cli/bridge.js
 new file mode 100644
-index 0000000..0e0074a
+index 0000000..7d4d79a
 --- /dev/null
 +++ b/mods/herdr-draw/cli/bridge.js
-@@ -0,0 +1,563 @@
+@@ -0,0 +1,627 @@
 +// Keeps one .excalidraw file and one Plenary board in step (drawh --server). The pane and drawh already
 +// meet at the file, so this is the only network code herdr-draw needs: file changes become protocol ops,
 +// the room's entries are written back. No I/O here: the runner (plenary.js) hands in read/write and a
@@ -1089,6 +1185,22 @@ index 0000000..0e0074a
 +const EMPTY = () => ({ type: "excalidraw", version: 2, source: "herdr-draw", elements: [], appState: { viewBackgroundColor: "#ffffff" }, files: {} });
 +const short = t => t.length > 80 ? `${t.slice(0, 77)}...` : t;
 +const list = keys => keys.length === 1 ? keys[0] : `${keys.slice(0, -1).join(", ")} and ${keys[keys.length - 1]}`;
++// A line for the terminal. Lines carry text a server sent (error messages, user names, roles, board ids), so nothing
++// in one may steer the terminal: escape sequences (CSI, OSC and the like) go whole, every other control character,
++// C1 control and bidirectional override becomes "?", and a line is cut at MAX_LINE characters.
++const MAX_LINE = 600;
++export function clean(line) {
++  const t = String(line)
++    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, "")                       // OSC … BEL / ST (titles, links, clipboard)
++    .replace(/\x1b[P^_][^\x1b]*(?:\x1b\\)?/g, "")                               // DCS, PM, APC … ST
++    .replace(/\x1b\[[0-?]*[ -/]*[@-~]?/g, "")                                    // CSI (colours, cursor, clear screen)
++    .replace(/\x1b[ -/]*[0-~]?/g, "")                                             // any other escape
++    .replace(/[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "?");
++  return t.length > MAX_LINE ? `${t.slice(0, MAX_LINE)}… (cut)` : t;
++}
++
++// The layers drawh writes into a new file (cli/drawh, layers()). In a file no marker speaks for, that is nobody's change.
++const DEFAULT_LAYERS = canon([{ id: "base", name: "Layer 1", visible: true, locked: false, opacity: 100 }]);
 +
 +/** What's wrong with a decoded frame from the server, or null. The Replica trusts its input; this doesn't. */
 +export function frameProblem(msg) {
@@ -1238,6 +1350,40 @@ index 0000000..0e0074a
 +  // Settings history starts at the copy's appSeq (a snapshot or a restore says nothing about who wrote before).
 +  startHistory() { this.hist = {}; this.histFrom = { ...this.replica.appSeq[STREAM] }; }
 +
++  /**
++   * A snapshot in answer to the tip check: is it this room's? It has no entry to show, so it is judged by what it
++   * holds. This room's never contradicts this copy: it is not behind the tip, and every element confirmed here is in
++   * it at the same or a later version (tombstones are kept), every settings key at the same or a later appSeq, with
++   * the same value at the same appSeq. A wiped or different server fails that (shapes missing, a key behind, another
++   * value at the same seq) or is behind; a lower epoch was caught at the welcome. A server that passes it holds all
++   * of this copy, so taking it as this room's loses nothing: changes it made since count as someone else's (loud).
++   */
++  agrees(msg, c) {
++    const r = this.replica, s = msg.streams?.[STREAM];
++    if (!seqOk(msg.seq) || msg.seq < c.seq || !isObj(s) || !Array.isArray(s.elements)) return false;
++    const els = new Map(s.elements.filter(isObj).map(e => [e.id, e]));
++    for (const [id, v] of r.confirmedVersion[STREAM]) { const e = els.get(id); if (!e || !(e.version >= v)) return false; }
++    const theirs = isObj(msg.appSeq?.[STREAM]) ? msg.appSeq[STREAM] : {}, shown = isObj(s.appState?.herdr) ? s.appState.herdr : {};
++    for (const [k, mine] of Object.entries(r.appSeq[STREAM])) {
++      if (!seqOk(theirs[k]) || theirs[k] < mine) return false;
++      if (theirs[k] === mine && !same(shown[k], r.confirmed[STREAM][k])) return false;
++    }
++    return true;
++  }
++
++  // A snapshot of this room skipped the entries between: per settings key it moved, one entry at its new appSeq,
++  // someone else's unless it is one of mine that landed. "Nobody else changed it since" then still answers right for
++  // a file built on the old base: unchanged key, its change is sent; changed key, it is refused out loud.
++  skipped(before) {
++    const now = this.replica.appSeq[STREAM], mineAt = new Set(Object.values(this.landed));
++    for (const k of SETTINGS) {
++      if (!seqOk(now[k]) || now[k] <= (before[k] ?? 0)) continue;
++      const h = this.hist[k] ??= [];
++      h.push({ seq: now[k], mine: mineAt.has(now[k]), id: null });
++      if (h.length > MAX_HIST) this.histFrom[k] = h.shift().seq;
++    }
++  }
++
 +  // An entry on a settings key: remember who wrote it, so "nobody else changed it since" can be answered.
 +  record(e) {
 +    if (e.stream !== STREAM || !isObj(e.op.appState)) return;
@@ -1305,6 +1451,10 @@ index 0000000..0e0074a
 +      const attempt = this.attempts.delete(k);   // (its marker may name the refused value: that is not an untouched old copy)
 +      const [base, hash, unsent] = this.markOf(herdr, k), since = this.since(k, base);
 +      if (looked && !unsent) continue;
++      // A new file joining a board: drawh's default layers, with no marker for them, are not a change anyone made. The
++      // board's are written back quietly and nothing is held (--once exits 0). (A board no one has set layers on shows
++      // the same default, core's doc: there is nothing to send either way.)
++      if (k === "layers" && hash === null && !unsent && !attempt && canon(v) === DEFAULT_LAYERS) continue;
 +      if (appStateProblem({ [k]: v }) !== null) {
 +        if (own(ordered, k) && hash !== printOf(v)) invalid.push(k);   // a key the board has: put back, said; unset: stays here, unsent
 +        continue;
@@ -1373,6 +1523,7 @@ index 0000000..0e0074a
 +
 +  take(msg) {
 +    const r = this.replica;
++    let keep = false;                      // a snapshot recognised as this room's: the settings history carries over
 +    if (msg.t === "welcome") {
 +      this.welcome = msg.seq; this.role = msg.role; this.user = msg.user;
 +      // v1.1 room identity (a welcome without `room` is a server before v1.1: the tip check below is all there is).
@@ -1385,8 +1536,14 @@ index 0000000..0e0074a
 +      if (msg.seq < r.applied) { this.welcome = null; if (room && msg.high !== undefined) this.epoch = room.epoch; return this.otherRoom(); }   // behind what this file saw
 +    } else if (this.check && !(msg.t === "error" && !msg.id)) {   // (a refusal or "unavailable" says nothing about which room this is)
 +      const c = this.check; this.check = null;
-+      const e = msg.t === "entries" ? msg.entries.find(e => e.seq === c.seq) : null;
-+      if (!e || e.id !== c.id || e.by !== c.by) return this.otherRoom();
++      if (msg.t === "snapshot") {
++        // The room checkpointed at or past the tip (a clean restart, a takeover, every 1,000 entries): no entry to show.
++        if (!this.agrees(msg, c)) return this.otherRoom();
++        keep = true;
++      } else {
++        const e = msg.t === "entries" ? msg.entries.find(e => e.seq === c.seq) : null;
++        if (!e || e.id !== c.id || e.by !== c.by) return this.otherRoom();
++      }
 +    }
 +    if (msg.t === "error") {
 +      const p = msg.id ? r.pending.get(msg.id) : null;
@@ -1397,13 +1554,16 @@ index 0000000..0e0074a
 +      }
 +    }
 +    if (msg.t === "entries") for (const e of msg.entries) if (e.seq > r.applied) this.seenEntries.set(e.seq, { id: e.id, by: e.by });
-+    const before = r.applied;
++    const before = r.applied, seqsBefore = { ...r.appSeq[STREAM] };
 +    const did = r.receive(msg);
-+    if (did.snapshot || r.applied < before) this.startHistory();
++    if (did.snapshot && keep) this.skipped(seqsBefore);
++    else if (did.snapshot || r.applied < before) this.startHistory();
 +    for (const e of did.entries) this.record(e);
 +    if (r.applied !== before) {
 +      const t = this.seenEntries.get(r.applied);
-+      this.tip = t ? { seq: r.applied, id: t.id, by: t.by } : null;   // null after a snapshot: no entry to show next time
++      // After a snapshot there is no entry to show next time: the tip is the snapshot's seq, and the next hello's
++      // answer is judged by agrees() (a room that answers it with entries instead has no such entry: another room).
++      this.tip = t ? { seq: r.applied, id: t.id, by: t.by } : did.snapshot ? { seq: r.applied, id: null, by: null } : null;
 +      for (const k of [...this.seenEntries.keys()]) if (k <= r.applied) this.seenEntries.delete(k);
 +    }
 +    this.settingsAnswers(did);
@@ -1619,10 +1779,10 @@ index 0000000..0e0074a
 +}
 diff --git a/mods/herdr-draw/cli/files.js b/mods/herdr-draw/cli/files.js
 new file mode 100644
-index 0000000..c3fb192
+index 0000000..9250444
 --- /dev/null
 +++ b/mods/herdr-draw/cli/files.js
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,160 @@
 +// How drawh --server writes the board file without losing someone else's save.
 +//
 +// drawh and the pane both save by read, change, write a temp file, rename over the board. Nobody locks.
@@ -1651,6 +1811,7 @@ index 0000000..c3fb192
 +
 +import { readFileSync, writeFileSync, renameSync, linkSync, unlinkSync, statSync } from "node:fs";
 +import { spawnSync } from "node:child_process";
++import { randomBytes } from "node:crypto";
 +
 +const SWAP = `import ctypes, ctypes.util, os, sys
 +if sys.platform != "darwin": sys.exit(3)
@@ -1658,7 +1819,18 @@ index 0000000..c3fb192
 +if libc.renamex_np(os.fsencode(sys.argv[1]), os.fsencode(sys.argv[2]), 2) != 0:   # 2 = RENAME_SWAP
 +    sys.exit(4 if ctypes.get_errno() == 2 else 3)
 +`;
++// python -I (isolated): no current folder, no user site folder and no PYTHON* variables on its module path, so a
++// ctypes.py (or any module) planted where drawh runs is never imported by the swap.
++const PY = ["-I", "-c", SWAP];
 +const gone = path => { try { unlinkSync(path); } catch {} };
++// Our scratch names beside the board: unguessable (random per write), and created exclusively (O_CREAT|O_EXCL, which
++// never follows a symlink): if anything already sits at the name, a file or a link someone planted, it is refused.
++const scratchName = (path, what) => `${path}.plenary-${randomBytes(8).toString("hex")}.${what}`;
++const refuse = p => Object.assign(new Error(`refusing to write ${p}: something is already there (a file or a link)`), { code: "EEXIST" });
++const create = (p, text) => {
++  try { writeFileSync(p, text, { flag: "wx" }); }
++  catch (e) { if (e.code === "EEXIST") throw refuse(p); throw e; }
++};
 +const pause = ms => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch {} };
 +const parses = text => { try { JSON.parse(text); return true; } catch { return false; } };
 +
@@ -1669,10 +1841,12 @@ index 0000000..c3fb192
 +    this.path = path; this.python = python; this.mode = mode === "link" ? "link" : "swap"; this.warn = warn;
 +    this.link = link; this.probed = false;                  // (`link`: for tests of a disk without hard links)
 +    this.patience = patience; this.theirTmp = `${path}.drawh.tmp`; this.stale = null;
-+    this.tmp = `${path}.plenary-${process.pid}.tmp`;       // our own names: drawh's saves use `.drawh.tmp`
-+    this.aside = `${path}.plenary-${process.pid}.old`;
++    this.tmp = null; this.aside = null;                     // our own names, new for every write (drawh's saves use `.drawh.tmp`)
 +    this.kept = 0;
 +  }
++
++  /** A new scratch name beside the board (one place, so a test can plant something at the name it will use). */
++  scratch(what) { return scratchName(this.path, what); }
 +
 +  /** The board's text, or null when there is no file. */
 +  read() { try { return readFileSync(this.path, "utf8"); } catch (e) { if (e.code === "ENOENT") return null; throw e; } }
@@ -1688,9 +1862,10 @@ index 0000000..c3fb192
 +      if (expected === null && this.read() === null) { try { writeFileSync(this.path, text, { flag: "wx" }); return; } catch (e) { if (e.code !== "EEXIST") throw e; } }
 +      throw new Error(NO_SAFE_WRITE);
 +    }
-+    writeFileSync(this.tmp, text);
++    this.tmp = this.scratch("tmp"); this.aside = this.scratch("old"); this.madeAside = false;
++    create(this.tmp, text);                                  // (refused: thrown before the finally, so a planted link stays where it was)
 +    try { return this.exchange(expected); }
-+    finally { gone(this.tmp); gone(this.aside); }
++    finally { gone(this.tmp); if (this.madeAside) gone(this.aside); }   // (the aside only if we linked it: never someone else's)
 +  }
 +
 +  // Once, before the first write: does this disk really do what the mode needs? Tried on two scratch
@@ -1698,19 +1873,23 @@ index 0000000..c3fb192
 +  probe() {
 +    if (this.probed) return;
 +    this.probed = true;
-+    const a = `${this.path}.plenary-${process.pid}.probe1`, b = `${this.path}.plenary-${process.pid}.probe2`, c = `${this.path}.plenary-${process.pid}.probe3`;
++    const a = this.scratch("probe1"), b = this.scratch("probe2"), c = this.scratch("probe3");
 +    const text = p => { try { return readFileSync(p, "utf8"); } catch { return null; } };
++    const made = [], make = (p, t) => { create(p, t); made.push(p); };   // only what we made is ours to remove
 +    try {
 +      if (this.mode === "swap") {
-+        writeFileSync(a, "1"); writeFileSync(b, "2");
-+        const r = spawnSync(this.python, ["-c", SWAP, a, b], { stdio: "ignore" });
++        make(a, "1"); make(b, "2");
++        const r = spawnSync(this.python, [...PY, a, b], { stdio: "ignore" });
 +        if (!(r.status === 0 && text(a) === "2" && text(b) === "1")) { this.mode = "link"; this.fellBack = true; }
 +      }
 +      if (this.mode === "link") {
-+        writeFileSync(a, "1"); gone(c);
-+        try { this.link(a, c); if (text(c) !== "1") throw new Error("no link"); } catch { this.mode = "none"; }
++        if (made.includes(a)) gone(a);                     // (ours, from the swap try; anything else at the name is refused)
++        make(a, "1");
++        try { this.link(a, c); made.push(c); if (text(c) !== "1") throw new Error("no link"); }
++        catch (e) { if (e.code === "EEXIST") throw refuse(c); this.mode = "none"; }   // (a link refuses an existing name: something planted, not a disk without links)
 +      }
-+    } finally { gone(a); gone(b); gone(c); }
++    } catch (e) { this.probed = false; throw e; }        // (a refused scratch name: try again, with new names, next write)
++    finally { for (const p of made) gone(p); }
 +    if (this.mode === "none") this.warn(NO_SAFE_WRITE);
 +    else if (this.fellBack) this.warn(LINK_WARNING);
 +  }
@@ -1734,15 +1913,15 @@ index 0000000..c3fb192
 +        catch (e) { if (e.code !== "EEXIST") throw e; continue; }
 +      }
 +      if (this.mode === "swap") {
-+        const r = spawnSync(this.python, ["-c", SWAP, this.tmp, this.path], { stdio: "ignore" });
++        const r = spawnSync(this.python, [...PY, this.tmp, this.path], { stdio: "ignore" });
 +        if (r.status === 0) { at = this.tmp; }
 +        else if (r.status === 4) continue;                 // the board vanished under us: start again
 +        else { this.mode = "link"; this.warn(LINK_WARNING); }   // (it passed the probe, and fails now: python gone?)
 +      }
 +      if (this.mode === "link") {
 +        this.letDrawhLand();
-+        gone(this.aside);
-+        try { this.link(this.path, this.aside); } catch (e) { if (e.code === "ENOENT") continue; throw e; }
++        try { this.link(this.path, this.aside); this.madeAside = true; }   // (a hard link refuses an existing name, like wx)
++        catch (e) { if (e.code === "ENOENT") continue; if (e.code === "EEXIST") throw refuse(this.aside); throw e; }
 +        renameSync(this.tmp, this.path);
 +        at = this.aside;
 +      }
@@ -1751,7 +1930,7 @@ index 0000000..c3fb192
 +      // Someone else's save. Rename-writers leave it whole; give an in-place writer a moment to finish.
 +      for (let i = 0; i < 6 && !parses(old); i++) { pause(50); old = readFileSync(at, "utf8"); }
 +      if (!parses(old)) {
-+        const keep = `${this.path}.plenary-unmerged-${Date.now()}-${++this.kept}`;
++        const keep = `${this.path}.plenary-unmerged-${Date.now()}-${++this.kept}-${randomBytes(4).toString("hex")}`;   // (a rename: replaces, never follows, a link at the name)
 +        renameSync(at, keep);
 +        this.warn(`a save by someone else was not valid JSON when the bridge replaced it; kept as ${keep}, not merged`);
 +        return;
@@ -1766,10 +1945,10 @@ index 0000000..c3fb192
 +export const LINK_WARNING = "replacing the board file in two steps (this disk can't swap files in one, or DRAWH_WRITE=link asked for it): a save by the pane, or by drawh, that lands in exactly that instant can be lost";
 diff --git a/mods/herdr-draw/cli/plenary.js b/mods/herdr-draw/cli/plenary.js
 new file mode 100644
-index 0000000..94b9232
+index 0000000..3093779
 --- /dev/null
 +++ b/mods/herdr-draw/cli/plenary.js
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,166 @@
 +// drawh --server: the process that holds the socket. Started by drawh (node 22+ or bun: both have a
 +// WebSocket built in), never by the pane. The deciding is in bridge.js, the file writing in files.js;
 +// this file is the socket, the timers and the exit codes.
@@ -1788,7 +1967,7 @@ index 0000000..94b9232
 +import { createHash } from "node:crypto";
 +import { homedir } from "node:os";
 +import { join } from "node:path";
-+import { Bridge } from "./bridge.js";
++import { Bridge, clean } from "./bridge.js";
 +import { BoardFile, LINK_WARNING, NO_SAFE_WRITE } from "./files.js";
 +import { jsonCodec } from "../protocol/codec.js";
 +
@@ -1799,7 +1978,11 @@ index 0000000..94b9232
 +const ms = (name, fallback) => { const n = Number(process.env[name]); return Number.isFinite(n) && n > 0 ? n : fallback; };
 +const RETRY = ms("DRAWH_RETRY_MS", 1000), RETRY_MAX = RETRY * 30, STALL = ms("DRAWH_STALL_MS", 20000);
 +
-+const say = line => process.stderr.write(`drawh: ${token ? String(line).split(token).join("***") : line}\n`);
++// The token is masked first; then clean(): text a server sent can't steer the terminal, and a line is capped.
++// The token is masked before clean() (so the length cap can't cut it in half) and again after (a server that
++// echoes it with an escape inside would otherwise have it put back together by the stripping).
++const mask = line => token ? String(line).split(token).join("***") : String(line);
++const say = line => process.stderr.write(`drawh: ${mask(clean(mask(line)))}\n`);
 +const die = (line, code = 1) => { say(line); process.exit(code); };
 +
 +if (!server || !board || !file) die("usage: drawh --server URL --board ID [--token T] [--once] FILE");
@@ -5385,17 +5568,17 @@ index 749e4ac..ff6055f 100755
  echo "$out"
 diff --git a/test/plenary.test.js b/test/plenary.test.js
 new file mode 100644
-index 0000000..9a26d2f
+index 0000000..5ee4eb7
 --- /dev/null
 +++ b/test/plenary.test.js
-@@ -0,0 +1,1090 @@
+@@ -0,0 +1,1389 @@
 +// drawh --server: a board file kept in step with a Plenary board. The room here is the protocol's own
 +// reference Room (protocol/room.js), in process or behind a local WebSocket: there is no Plenary server yet.
 +import { test, expect } from "bun:test";
-+import { mkdtempSync, readFileSync, writeFileSync, readdirSync, existsSync, rmSync, chmodSync } from "node:fs";
++import { mkdtempSync, readFileSync, writeFileSync, readdirSync, existsSync, rmSync, chmodSync, symlinkSync, mkdirSync } from "node:fs";
 +import { tmpdir } from "node:os";
 +import { createHash } from "node:crypto";
-+import { Bridge, frameProblem } from "../cli/bridge.js";
++import { Bridge, frameProblem, clean } from "../cli/bridge.js";
 +import { BoardFile, LINK_WARNING, NO_SAFE_WRITE } from "../cli/files.js";
 +import { Room } from "../protocol/room.js";
 +import { Replica } from "../protocol/replica.js";
@@ -5876,9 +6059,12 @@ index 0000000..9a26d2f
 +  expect(room.streams.board.appState.herdr.mystery).toBe(undefined);
 +  const late = rig(room, { text: sceneText([], { layers: [layers[0]], grid: 20 }), token: "tok-bob" });
 +  late.b.sync();
-+  expect(late.herdr().layers.map(l => l.name)).toEqual(["Layer 1", "Flow"]);    // the board's, not the newcomer's (said)
-+  expect(said(late.warned, `layers in this file ${OLD}`)).toBe(1);
++  expect(late.herdr().layers.map(l => l.name)).toEqual(["Layer 1", "Flow"]);    // the board's, not the newcomer's
++  expect(said(late.warned, `layers in this file ${OLD}`)).toBe(0);              // drawh's default layers: nobody's change, quiet (M2)
 +  expect(grid(room)).toBe(20);                                                   // a key no one had set: the file's
++  const other = rig(room, { text: sceneText([], { layers: [layer("base", "Mine")] }), token: "tok-bob" });
++  other.b.sync();
++  expect([other.herdr().layers.map(l => l.name), said(other.warned, `layers in this file ${OLD}`)]).toEqual([["Layer 1", "Flow"], 1]);   // anything else: said
 +  late.f.races.push(text => built(text, s => { s.appState.herdr.timeline = { duration: 9000 }; }));
 +  const bob = peer(room); bob.send("board", { elements: [rect("q")] }); late.b.sync();
 +  expect(room.streams.board.appState.herdr.timeline).toEqual({ duration: 9000 });  // a seed racing in through the merge
@@ -6142,11 +6328,15 @@ index 0000000..9a26d2f
 +  // a file that lost what the state had seen (another file, a backup) starts from 0
 +  const three = rig(room, { text: sceneText([rect("z")]), saved: wire(two.b.state()) });
 +  expect(three.sent[0].since).toBe(0);
-+  // a state with no entry to recognise the room by (it caught up from a snapshot) starts from 0 too
++  // a state that caught up from a snapshot has no entry to show: its tip is the snapshot's seq, the next run asks from
++  // there, and the room's snapshot answer is recognised by its contents (no "not the board", nothing sent again)
 +  room.checkpoint();
 +  const snap = rig(room, { text: null, token: "tok-bob" }); snap.b.sync();
-+  expect(snap.b.state().tip).toBe(null);
-+  expect(rig(room, { text: snap.f.text, saved: wire(snap.b.state()), token: "tok-bob" }).sent[0].since).toBe(0);
++  expect(snap.b.state().tip).toEqual({ seq: room.seq, id: null, by: null });
++  const again = rig(room, { text: snap.f.text, saved: wire(snap.b.state()), token: "tok-bob" });
++  expect(again.sent[0].since).toBe(room.seq - 1);
++  again.run();
++  expect([again.warned, again.sent.filter(m => m.t === "op").length, again.b.settled()]).toEqual([[], 0, true]);
 +});
 +
 +test("a saved state pointed at another room: behind it or ahead of it, the bridge notices, says so, and both sides get everything", () => {
@@ -6169,6 +6359,198 @@ index 0000000..9a26d2f
 +  expect(two.els().map(e => e.id).sort()).toEqual(["mine1", "mine2", "other0", "other1", "other2", "other3", "other4"]);
 +  expect(two.warned.filter(l => l.includes("not the board")).length).toBe(1);
 +  expect(two.b.settled()).toBe(true);
++});
++
++// ---- the room checkpointed past the bridge (live run pd-drawh-live, M1) ----
++
++// A clean stop as the real server does it (room-host.js: a checkpoint of each room on a clean stop), then a rebuild from
++// the same log, which opens the next epoch: what a restart or a takeover looks like to a client.
++const restart = room => { room.checkpoint(); return Room.fromLog({ board: "b1", tenant: "t1", log: room.log }); };
++// One address whose room can be swapped underneath the bridges (the same URL, a new server process behind it).
++const host = room => { const h = { room, connect: f => h.room.connect(f), receive: (...a) => h.room.receive(...a), disconnect: (...a) => h.room.disconnect(...a) }; return h; };
++
++test("M1: a clean server restart (checkpoint, a higher epoch) is the same room: no 'not the board', nothing re-sent, a settings change made while the bridge was stopped is sent", () => {
++  const room = newRoom(), bob = peer(room);
++  const one = rig(room, { text: sceneText([rect("a")], { grid: 10 }) });
++  one.run();
++  bob.send("board", { elements: [rect("b")] }); one.b.sync();
++  const saved = wire(one.b.state());
++  expect(saved.epoch).toBe(1);
++  room.disconnect(one.conn);
++  edit(one.f, s => { s.appState.herdr.grid = 30; s.elements.push(rect("offline")); });   // made while the bridge was stopped
++  const r2 = restart(room);
++  expect([r2.epoch, r2.base.seq]).toEqual([2, saved.applied]);                  // checkpointed exactly at the bridge's tip
++  const two = rig(r2, { text: one.f.text, saved });
++  expect(two.sent[0].since).toBe(saved.applied - 1);
++  two.run();
++  expect(two.warned).toEqual([]);                                               // was: "this is not the board ..." and grid 30 refused
++  expect([grid(r2), two.herdr().grid, !!r2.streams.board.get("offline"), two.b.epoch, two.b.settled()]).toEqual([30, 30, true, 2, true]);
++  const ids = two.sent.filter(m => m.t === "op" && m.op.elements).flatMap(m => m.op.elements.map(e => e.id));
++  expect(ids).toEqual(["offline"]);                                             // a and b were already there: not sent again
++});
++
++test("M1: across a clean restart, a key a peer changed while the bridge was stopped is refused out loud, and the peer's value stays", () => {
++  const room = newRoom(), one = rig(room, { text: sceneText([rect("a")], { grid: 10 }) });
++  one.run();
++  const saved = wire(one.b.state());
++  room.disconnect(one.conn);
++  edit(one.f, s => { s.appState.herdr.grid = 30; });
++  peer(room).send("board", { appState: { grid: 50 } });                        // the peer, before the stop: inside the checkpoint
++  const r2 = restart(room);
++  expect(r2.base.seq).toBeGreaterThan(saved.applied);                           // the snapshot skips the peer's entry
++  const two = rig(r2, { text: one.f.text, saved });
++  two.run();
++  expect([grid(r2), two.herdr().grid, said(two.warned, `grid in this file ${OLD}`), said(two.warned, "not the board")]).toEqual([50, 50, 1, 0]);
++  expect(two.b.held).toBeGreaterThan(0);                                        // --once: exit 2, the change did not reach the board
++  // and a peer change after the restart, before the bridge is back (an entry, not inside the snapshot): the same
++  const three = rig(r2, { text: two.f.text, saved: wire(two.b.state()) });
++  r2.disconnect(three.conn);
++  const save3 = wire(three.b.state());
++  edit(three.f, s => { s.appState.herdr.grid = 31; });
++  peer(r2).send("board", { appState: { grid: 60 } });
++  const four = rig(r2, { text: three.f.text, saved: save3 });
++  four.run();
++  expect([grid(r2), four.herdr().grid, said(four.warned, `grid in this file ${OLD}`)]).toEqual([60, 60, 1]);
++});
++
++test("M1: an untouched old copy of the file stays quiet across a snapshot of the same room (the history before the gap is kept)", () => {
++  const h = host(newRoom()), bob = peer(h.room);
++  const a = rig(h, { text: sceneText([rect("a")], { grid: 10 }) });
++  a.run();
++  bob.send("board", { appState: { grid: 15 } }); a.b.sync();                    // the file is written: marked at grid 15's base
++  const stale = a.f.text;
++  bob.send("board", { appState: { grid: 25 } }); a.b.sync();                    // the bridge sees the peer's change as an entry (the bridge sends nothing on grid)
++  a.b.closed();                                                                 // the connection drops; the room moves on and checkpoints
++  for (let i = 0; i < 3; i++) bob.send("board", { elements: [rect(`p${i}`)] });
++  h.room.checkpoint();
++  a.connect(); a.run();
++  expect(a.warned).toEqual([]);
++  a.f.text = built(stale, s => s.elements.push(rect("x"))); a.f.n++; a.run();   // an agent's save from an old read lands
++  expect([grid(h.room), a.herdr().grid, said(a.warned, OLD)]).toEqual([25, 25, 0]);   // the board's, quietly (R1)
++});
++
++// The room's real answer to a hello from `saved` (a welcome, then a snapshot), with the snapshot changed by `change`.
++function answered(room, saved, text, change) {
++  const msgs = [], c = room.connect(m => msgs.push(wire(m)));
++  deliver(room, c, { t: "hello", v: 1, token: TOKEN, board: "b1", since: saved.applied - 1, client: "probe" });
++  room.disconnect(c);
++  const snap = msgs.find(m => m.t === "snapshot");
++  change(snap);
++  const warned = [], b = new Bridge({ board: "b1", saved, now: fast(), read: () => text, write: () => {}, warn: l => warned.push(l) });
++  b.open(TOKEN, () => {});
++  for (const m of msgs) { b.receive(m); if (b.reconnect) break; }
++  return { other: said(warned, "not the board") === 1 && b.reconnect, snap };
++}
++
++test("M1: what makes a snapshot answer another room: behind the tip, a confirmed shape missing or older, a key behind, another value at the same seq", () => {
++  const room = newRoom(), one = rig(room, { text: sceneText([rect("a"), rect("b")], { grid: 10 }) });
++  one.run();
++  edit(one.f, s => { s.elements[0].x = 5; touch(s.elements[0]); }); one.run();   // a at version 2
++  const saved = wire(one.b.state()), text = one.f.text;
++  room.disconnect(one.conn);
++  room.checkpoint();
++  const els = s => s.streams.board.elements;
++  const cases = [
++    ["untouched (control)", () => {}, false],
++    ["behind the tip", s => { s.seq = saved.applied - 1; }, true],
++    ["a confirmed shape missing", s => { s.streams.board.elements = els(s).filter(e => e.id !== "b"); }, true],
++    ["a confirmed shape at an older version", s => { els(s).find(e => e.id === "a").version = 1; }, true],
++    ["a newer version is fine", s => { els(s).find(e => e.id === "a").version = 9; }, false],
++    ["a key behind", s => { s.appSeq.board.grid -= 1; }, true],
++    ["a key missing", s => { delete s.appSeq.board.grid; }, true],
++    ["another value at the same seq", s => { s.streams.board.appState.herdr.grid = 11; }, true],
++    ["another value at a later seq is fine", s => { s.appSeq.board.grid += 1; s.streams.board.appState.herdr.grid = 11; s.seq += 1; }, false],
++  ];
++  for (const [name, change, other] of cases) expect([name, answered(room, saved, text, change).other]).toEqual([name, other]);
++});
++
++test("M1: a running bridge rides a clean server restart: reconnects, no line, nothing re-sent, edits flow both ways after", () => {
++  const h = host(newRoom()), bob0 = peer(h.room);
++  const a = rig(h, { text: sceneText([rect("a")], { grid: 10 }) });
++  a.run();
++  bob0.send("board", { elements: [rect("b")] }); a.b.sync();
++  const ops = a.sent.filter(m => m.t === "op").length;
++  h.room = restart(h.room);                                                     // the server stops cleanly and comes back
++  a.b.closed(); a.connect(); a.run();
++  expect([a.warned, a.sent.filter(m => m.t === "op").length, a.b.epoch, a.b.settled()]).toEqual([[], ops, 2, true]);
++  const bob = peer(h.room);
++  bob.send("board", { elements: [rect("c")] }); a.b.sync();
++  edit(a.f, s => { s.appState.herdr.grid = 40; s.elements.push(rect("d")); }); a.run();
++  expect([a.els().map(e => e.id).sort(), grid(h.room), !!h.room.streams.board.get("d")]).toEqual([["a", "b", "c", "d"], 40, true]);
++});
++
++test("M1: rejoining after the room checkpointed past the bridge on its own (every 1,000 entries, same epoch) is the same room", () => {
++  const room = newRoom(), one = rig(room, { text: sceneText([rect("a")], { grid: 10 }) });
++  one.run();
++  const saved = wire(one.b.state());
++  room.disconnect(one.conn);
++  const bob = peer(room);
++  for (let i = 0; i < 1100; i++) bob.send("board", { elements: [rect(`p${i}`)] });   // the Room's own rule checkpoints on the way
++  expect(room.base.seq).toBeGreaterThan(saved.applied);
++  expect(room.catchUp(saved.applied - 1)[0].t).toBe("snapshot");               // what the bridge's hello will get
++  edit(one.f, s => { s.appState.herdr.grid = 30; });
++  const two = rig(room, { text: one.f.text, saved });
++  two.run();
++  expect(two.warned).toEqual([]);
++  expect([room.epoch, two.b.epoch, grid(room), two.els().length, two.b.settled()]).toEqual([1, 1, 30, 1101, true]);
++  expect(two.sent.filter(m => m.t === "op" && m.op.elements).length).toBe(0);   // nothing re-sent
++  // a peer changed a key in that stretch, and the file changed it too: refused out loud, not taken as an old copy's quiet case
++  const three = rig(room, { text: two.f.text, saved: wire(two.b.state()) });
++  room.disconnect(three.conn);
++  const save3 = wire(three.b.state());
++  for (let i = 0; i < 1000; i++) bob.send("board", { elements: [rect(`q${i}`)] });
++  bob.send("board", { appState: { grid: 70 } });
++  for (let i = 0; i < 1000; i++) bob.send("board", { elements: [rect(`s${i}`)] });
++  room.checkpoint();                                                            // past the peer's change too: the snapshot skips it
++  expect(room.base.seq).toBe(room.seq);
++  edit(three.f, s => { s.appState.herdr.grid = 31; });
++  const four = rig(room, { text: three.f.text, saved: save3 });
++  four.run();
++  expect([grid(room), four.herdr().grid, said(four.warned, `grid in this file ${OLD}`), said(four.warned, "not the board")]).toEqual([70, 70, 1, 0]);
++});
++
++test("M1: a wiped or different server that checkpointed past the saved seq is still another room (shapes missing from its snapshot), whatever its epoch", () => {
++  const A = newRoom(), one = rig(A, { text: sceneText([rect("mine1"), rect("mine2")], { grid: 10 }) });
++  one.run();
++  const saved = wire(one.b.state()), text = one.f.text;
++  for (const epoch of [1, 2]) {                                                 // the same epoch, and a higher one
++    const B = new Room({ board: "b1", tenant: "t1", log: new MemoryLog(), epoch }), bob = peer(B);
++    for (let i = 0; i < 5; i++) bob.send("board", { elements: [rect(`other${i}`)] });
++    B.checkpoint();
++    expect(B.catchUp(saved.applied - 1)[0].t).toBe("snapshot");
++    const two = rig(B, { text, saved });
++    two.run();
++    expect([epoch, said(two.warned, "not the board")]).toEqual([epoch, 1]);
++    expect([!!B.streams.board.get("mine1"), !!B.streams.board.get("mine2"), two.els().length, two.b.settled()]).toEqual([true, true, 7, true]);
++  }
++  // a snapshot at the same seq whose value for a key differs at the same appSeq is another room too
++  const C = new Room({ board: "b1", tenant: "t1", log: new MemoryLog() }), c = peer(C);
++  c.send("board", { elements: [rect("mine1"), rect("mine2")].map((e, i) => ({ ...JSON.parse(text).elements[i] })) });
++  c.send("board", { appState: { grid: 99 } });
++  while (C.seq < saved.applied) c.send("board", { elements: [rect(`pad${C.seq}`)] });
++  C.checkpoint();
++  const three = rig(C, { text, saved });
++  three.run();
++  expect(said(three.warned, "not the board")).toBe(1);
++});
++
++test("M2: a new file with drawh's default layers joining a board that has layers takes the board's quietly; nothing held (--once exits 0); a viewer too", () => {
++  const room = newRoom(), bob = peer(room);
++  bob.send("board", { appState: { layers: [layer("base", "Layer 1"), layer("n", "Notes")] } });
++  const fresh = sceneText([rect("c1")], { layers: [layer("base", "Layer 1")] });   // what `drawh add` writes into a new file
++  const a = rig(room, { text: fresh });
++  a.run();
++  expect([a.warned, a.b.held, a.b.settled(), a.herdr().layers.map(l => l.name), !!room.streams.board.get("c1")]).toEqual([[], 0, true, ["Layer 1", "Notes"], true]);
++  const v = rig(room, { text: fresh, token: "tok-view" });
++  v.run();
++  expect([v.warned.filter(l => l.includes("layers")), v.herdr().layers.map(l => l.name)]).toEqual([[], ["Layer 1", "Notes"]]);
++  // a board no one has set layers on shows the same default (core's doc): the new file and the board agree, quietly
++  const empty = newRoom(), s = rig(empty, { text: fresh });
++  s.run();
++  expect(empty.streams.board.appState.herdr.layers.map(l => l.name)).toEqual(["Layer 1"]);
++  // once the bridge has marked the file, the same default value is a change someone made: judged as one (sent here)
++  edit(a.f, s => { s.appState.herdr.layers = [layer("base", "Layer 1")]; }); a.run();
++  expect(room.streams.board.appState.herdr.layers.map(l => l.name)).toEqual(["Layer 1"]);
 +});
 +
 +// ---- a server that misbehaves ----
@@ -6240,6 +6622,9 @@ index 0000000..9a26d2f
 +      open(ws) { ws.data.conn = room.connect(m => { if (s.mode !== "silent") ws.send(jsonCodec.encode(m)); }); },
 +      message(ws, data) {
 +        const m = jsonCodec.decode(String(data)); if (m.t === "hello") hellos.push(m);
++        if (m.t === "hello" && s.mode === "hostile") return void ws.send(jsonCodec.encode({ t: "error", code: "x\x1b]0;pwned\x07", message: `\x1b[2J\x1b]8;;http://evil/\x1b\\click\x1b]8;;\x1b\\ \u202eevil\r\x00${"A".repeat(5000)}` }));
++        if (m.t === "hello" && s.mode === "garbage") return void ws.send(`not json \x1b]0;pwned\x07 \x1b[2J {`);
++        if (m.t === "hello" && s.mode === "echo") return void ws.send(jsonCodec.encode({ t: "error", code: "x", message: `your token: ${m.token.slice(0, 5)}\x1b[0m${m.token.slice(5)}` }));
 +        if (m.t === "op" && s.mode === "unavailable") return void ws.send(jsonCodec.encode({ t: "error", code: "unavailable", message: "busy" }));
 +        if (m.t === "op" && s.mode === "refuse") return void ws.send(jsonCodec.encode({ t: "error", id: m.id, code: "bad-op", message: "no thanks" }));
 +        deliver(room, ws.data.conn, m);
@@ -6478,4 +6863,101 @@ index 0000000..9a26d2f
 +  f.text = built(base, s => { s.appState.herdr.grid = 25; });                     // an old copy (from before my change) changed
 +  try { b.sync(); } catch {}   // (an old copy set to 20 would be this file byte for byte: no rule can tell them apart; a limit)
 +  expect([grid(room), said(warned, OLD)]).toEqual([30, 1]);
++});
++
++// ---- security: what drawh runs, writes and prints ----
++
++// The swap is a python -c. Without -I (isolated), python puts the current folder (and PYTHONPATH) first on its
++// module path, so a ctypes.py planted where drawh runs would be run by the swap.
++test("the swap's python is isolated: a ctypes.py planted in the current folder or on PYTHONPATH is never imported", () => {
++  if (process.platform !== "darwin") return;
++  const dir = scratch(), path = `${dir}/b.excalidraw`, marker = `${dir}/pwned`, cwd = process.cwd(), env = process.env.PYTHONPATH;
++  try {
++    mkdirSync(`${dir}/lib`);
++    const evil = `open(${JSON.stringify(marker)}, "a").write("imported\\n")\nfrom importlib import import_module\n`;
++    writeFileSync(`${dir}/ctypes.py`, evil); writeFileSync(`${dir}/lib/ctypes.py`, evil);
++    process.chdir(dir); process.env.PYTHONPATH = `${dir}/lib`;
++    const disk = new BoardFile(path, { python: Bun.which("python3") });
++    disk.replace("{\"n\":1}", null);
++    writeFileSync(path, "{\"theirs\":1}");
++    expect(disk.replace("{\"n\":2}", "{\"n\":1}")).toEqual({ replaced: "{\"theirs\":1}" });
++    expect([existsSync(marker), disk.mode, disk.read()]).toEqual([false, "swap", "{\"n\":2}"]);   // not imported, and it still swapped
++  } finally { process.chdir(cwd); if (env === undefined) delete process.env.PYTHONPATH; else process.env.PYTHONPATH = env; done(dir); }
++});
++
++// Our temp names sit beside the board, in a folder others may write to. A guessable name (a pid) lets someone
++// plant a symlink there first, and a plain write would then write through it to wherever it points.
++test("scratch files beside the board have unguessable names, and anything already at one (a planted symlink) is refused, not followed", () => {
++  const dir = scratch(), path = `${dir}/b.excalidraw`, victim = `${dir}/victim`;
++  try {
++    for (const mode of ["swap", "link"]) {
++      const disk = new BoardFile(path, { mode, python: Bun.which("python3") }), names = [], scratchOf = disk.scratch.bind(disk);
++      disk.scratch = what => { const n = scratchOf(what); names.push(n); return n; };
++      disk.replace("{\"n\":1}", disk.read()); disk.replace("{\"n\":2}", "{\"n\":1}");
++      expect(names.length).toBeGreaterThanOrEqual(4);
++      for (const n of names) expect(n.slice(path.length)).toMatch(/^\.plenary-[0-9a-f]{16}\.[a-z0-9]+$/);
++      expect(new Set(names).size).toBe(names.length);                            // new every time
++      expect(names.some(n => n.includes(String(process.pid)))).toBe(false);
++      // someone planted a link at the name the next write will use (as if they had guessed it)
++      writeFileSync(victim, "precious");
++      // every name this mode makes: tmp and the probes by exclusive write, the aside and probe3 by hard link
++      const used = mode === "swap" ? ["tmp", "probe1", "probe2"] : ["tmp", "old", "probe1", "probe3"];
++      for (const at of used) {
++        const planted = `${path}.plenary-planted.${at}`;
++        rmSync(planted, { force: true }); symlinkSync(victim, planted);
++        disk.scratch = what => what === at ? planted : scratchOf(what);
++        if (at.startsWith("probe")) disk.probed = false;
++        expect(() => disk.replace("{\"n\":3}", "{\"n\":2}")).toThrow(/refusing to write .*already there/);
++        expect([readFileSync(victim, "utf8"), disk.read(), disk.mode]).toEqual(["precious", "{\"n\":2}", mode]);   // not written through, board untouched, no false fallback
++        rmSync(planted);                                                          // (and left where it was: not ours to remove)
++      }
++      if (mode === "swap") {                                                      // swap mode never makes the aside: something there is not ours
++        const planted = `${path}.plenary-planted.old`;
++        symlinkSync(victim, planted);
++        disk.scratch = what => what === "old" ? planted : scratchOf(what);
++        expect(disk.replace("{\"n\":3}", "{\"n\":2}")).toBe(undefined);
++        expect(disk.read()).toBe("{\"n\":3}"); disk.replace("{\"n\":2}", "{\"n\":3}");
++        rmSync(planted);                                                          // (still there: left alone)
++      }
++      disk.scratch = scratchOf;
++      expect(disk.replace("{\"n\":3}", "{\"n\":2}")).toBe(undefined);         // with a fresh name, all is well again
++      rmSync(path);
++    }
++    expect(readdirSync(dir).sort()).toEqual(["victim"]);                          // nothing of ours left behind
++  } finally { done(dir); }
++});
++
++// Text from the server (an error's code and message, the user name in the welcome) reaches the terminal. Terminal
++// escapes in it could retitle the window, plant a link, clear the screen, or reorder what the line seems to say.
++test("text from the server is printed without terminal escapes or control characters, and cut to a length", async () => {
++  expect(clean("a\x1b]0;pwned\x07b")).toBe("ab");                               // OSC (window title), ended by BEL
++  expect(clean("a\x1b]8;;http://evil/\x1b\\x\x1b]8;;\x1b\\b")).toBe("axb");     // OSC 8 link, ended by ST
++  expect(clean("\x1b[2J\x1b[31mred\x1b[0m")).toBe("red");                         // CSI
++  expect(clean("\x1bPq#0\x1b\\ok")).toBe("ok");                                    // DCS
++  expect(clean("a\rb\x00c\x07d\u202ee\u2066f\x9bg")).toBe("a?b?c?d?e?f?g");     // controls and bidi overrides, made visible
++  expect(clean("x".repeat(600))).toBe("x".repeat(600));
++  expect(clean("x".repeat(601))).toBe(`${"x".repeat(600)}… (cut)`);
++  expect(clean("plain: ünïcode ✓")).toBe("plain: ünïcode ✓");
++  const s = standIn(), dir = scratch(), f = `${dir}/b.excalidraw`;
++  try {
++    s.mode = "hostile";
++    const r = await drawh(["--server", s.url, "--board", "b1", "--once", f], { PLENARY_TOKEN: TOKEN, DRAWH_STATE_DIR: `${dir}/state` });
++    expect(r.code).toBe(1);
++    expect(r.err).toContain("the server said no");
++    expect(/[\x00-\x09\x0b-\x1f\x7f-\x9f\u202e]/.test(r.err)).toBe(false);
++    expect(r.err).not.toContain("pwned");
++    expect(r.err.length).toBeLessThan(1000);
++    expect(r.err).toContain("… (cut)");
++    // A frame that is not JSON at all, with escapes in it: never printed raw (not even in a parse error).
++    s.mode = "garbage";
++    const g = await drawh(["--server", s.url, "--board", "b1", "--once", f], { PLENARY_TOKEN: TOKEN, DRAWH_STATE_DIR: `${dir}/state` });
++    expect(g.code).not.toBe(0);
++    expect(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/.test(g.err)).toBe(false);
++    expect(g.err).not.toContain("pwned");
++    // The token echoed back with an escape inside it: stripping the escape must not print the token whole.
++    s.mode = "echo";
++    const e = await drawh(["--server", s.url, "--board", "b1", "--once", f], { PLENARY_TOKEN: TOKEN, DRAWH_STATE_DIR: `${dir}/state` });
++    expect(e.err).toContain("your token: ***");
++    expect(e.err).not.toContain(TOKEN);
++  } finally { s.stop(); done(dir); }
 +});

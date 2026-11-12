@@ -1,4 +1,4 @@
-# Brief: p6-hex (web/ into hexagonal shape) — starts after p6-landv and p7-collabv pass
+# Brief: p6-hex (web/ into hexagonal shape) — on main after the phase-2 merge (dcbdae6)
 
 Base: docs/m2/BRIEF-BASE.md applies, including **Architecture** (hexagonal) and the **systems design skill**. Read
 docs/m2/OFFICE.md ("Architecture"), CLAUDE.md, PROTOCOL.md first.
@@ -93,3 +93,16 @@ auth port and fake come from p6-ports; you add `web/adapters/auth/http.js` (fetc
   localRoom in-repo. Until both do, sync.js calls them optionally (`?.()`), never assuming they exist.
 - LOW L1 (a wrapped-globals test proving no global timer runs when a clock is given; the verifier's scratch test is in
   its report), L2, L3.
+
+## State at start (manager, 2026-11-12)
+
+- main at dcbdae6 (phase 2 merged: p6-land and p7-collab are in web/). Already on main from earlier jobs:
+  web/ports/{transport,storage,clock,auth}.js, web/adapters/{storage,clock,auth,transport/ws.js}, web/core/signin.js,
+  test/web/contracts/*, test/web/adapters/*, test/web/core/*. Build on them; don't redo them.
+- Name `plenary-p6-hex`; tab `worker p6-hex (client) · <id>: web ports and adapters`. Report to your manager only.
+- The /Users/r/repos/plenary-p2 worktree is retired: never use it.
+- **test/arch-scan.js is not on main yet** (engine's p-arch). Do the move first; write test/web/architecture.test.js
+  last. If arch-scan.js still isn't there, stop at that step and say so in your report; don't write your own scanner.
+- web/collab moves too: models (presence, records, notes, gate, limits, flags) to web/core/collab/, renderers (ui.js,
+  draw.js, dom.js, collab.css) to web/adapters/dom/collab/, fake-port.js to web/adapters/collab/fake.js, port.js to
+  web/ports/collab.js. Keep p7-wire's job (the real collab adapter) out of scope.

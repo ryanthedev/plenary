@@ -4,8 +4,9 @@
 
 - **Me:** manager client, terminal t14k. Report to the proxy **t1bx** ONLY by ending my turn with one short message (outcome
   first, report path; "Urgent:" first if urgent). NEVER prompt/hc send/SendMessage t1bx (CEO rule, 2026-11-12). Workers report to me only. engine manager **t18m**; platform manager **t187**.
-- **In flight:** nothing running. p6-edge2 committed (verified PASS); t1f2 and t1f8 closed.
-- **Waiting on engine:** the p2-land merge into main. p2-land rebased onto main, head 892ee6e (client files 892ee6e,
+- **In flight:** p6-hex (t1fy, plenary-p6-hex, on main; brief docs/m2/briefs/p6-hex.md): web/ into core/ports/adapters.
+  Its boundary test waits on engine's test/arch-scan.js (p-arch t1fx, ~1.5–3 h; written now, skipped until it exists).
+- **Phase 2 merged into main: dcbdae6** (p2-land worktree retired; never use it). Before that: p2-land rebased onto main, head 892ee6e (client files 892ee6e,
   v1.1 a68e9dc); p2-swap (server onto v1) now running there. No client work in the worktree until t18m sends the merge id.
 - **Next, in order:** p6-hex (docs/m2/briefs/p6-hex.md: move web/ onto the ports, auth HTTP adapter per
   docs/m2/contracts/auth-exchange.md, test/web/architecture.test.js on engine's test/arch-scan.js) → p7-wire
@@ -17,7 +18,7 @@
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| (none running) | | | waiting on engine's p2-land merge; next p6-hex |
+| p6-hex (builder) | t1fy | worker p6-hex (client) · t1fy: web ports and adapters | RUNNING on main |
 
 ## 2026-11-11 — phase-6 design mock
 
@@ -261,3 +262,4 @@
 - p6-edge2 done (t1f2), 743 run 0 fail (me). DECISION (mine, reversible): the hard-cap drop requires no drain progress for 10 s, not just bytes held, so slow links aren't dropped or looped. Sent back to t1f2 before verification. Note for p6-hex: localRoom and sharedNet must implement congested() (localRoom bufferless false; sharedNet needs a worker-side cap).
 - p6-edge2 decision change done (t1f2). Verifier p6-edge2v (t1f8, plenary-p6-edge2v) started.
 - p6-edge2v PASS (no HIGH; M1 presence gate too high at 256 KB, M2 localRoom/sharedNet lack congested()). bun test 755 run, 0 fail (me). DECISIONS: backlogBytes() on the port, presence only at <=16 KB, transient ops count as presence, 256 KB congested() for the pill only; optional calls until all transports implement it. Into p6-hex. Committed p6-edge2; t1f2, t1f8 closed.
+- Phase 2 merged (dcbdae6, 964 tests green on main). p6-hex started (t1fy). arch-scan.js lands later (p-arch t1fx); p6-hex writes the boundary test against the fixed signature, skipped until then.

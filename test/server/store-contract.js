@@ -197,5 +197,25 @@ export function storeContract(name, make) {
         expect(await code(a.append(T, B, [entry(at + 1)], at))).toBe("conflict");    // the fenced host stays fenced
       }
     });
+
+    test("epoch: 0 before any room, +1 per openEpoch, durable, per board, and concurrent opens never share one", async () => {
+      const { store, another } = await fresh();
+      expect(await store.epoch(T, B)).toBe(0);
+      expect(await store.openEpoch(T, B)).toBe(1);
+      expect(await store.openEpoch(T, B)).toBe(2);
+      expect(await store.epoch(T, B)).toBe(2);
+      expect(await store.epoch(T, "b-two")).toBe(0);           // per board
+      expect(await store.openEpoch(T, "b-two")).toBe(1);
+      expect(await store.epoch("t-bbb", B)).toBe(0);           // per tenant
+      // A second handle (a reopen, or another host) sees it, and its opens interleave without repeats.
+      const b = await another();
+      expect(await b.epoch(T, B)).toBe(2);
+      const got = await Promise.all([store.openEpoch(T, B), b.openEpoch(T, B), store.openEpoch(T, B), b.openEpoch(T, B)]);
+      expect(got.sort((x, y) => x - y)).toEqual([3, 4, 5, 6]);
+      expect(await store.epoch(T, B)).toBe(6);
+      // Ids are checked like every other call.
+      expect(await code(store.openEpoch("../x", B))).toBe("bad-id");
+      expect(await code(store.epoch(T, "B.*"))).toBe("bad-id");
+    });
   });
 }

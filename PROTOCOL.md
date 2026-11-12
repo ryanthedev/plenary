@@ -400,7 +400,9 @@ older version of a deleted element would bring it back on that client only.
   that changes a merge result bumps `rv`) and the `appState` key set. A client that meets a `welcome` or an entry
   with an `rv` it doesn't know stops, as on `version`: the app must update.
 - **When.** Every 1,000 entries, or later: not until the bytes logged since the last checkpoint reach half that
-  checkpoint's size (so rewriting a big checkpoint costs at most about 2× the log). Also when the room is stopped
+  checkpoint's size (so rewriting a big checkpoint costs at most about 2× the log). Also, at any entry count, once
+  those bytes reach the host's byte trigger (`tailFoldBytes`, default 8 MB) and that same half-size bound, whichever
+  comes first: a few huge ops make catch-up bounded without waiting for 1,000 entries. Also when the room is stopped
   cleanly. The copy is of the **resolved** state at `seq` S, taken synchronously; the write is asynchronous.
 - **Order of durability.** A checkpoint at S holds only resolved entries, so entries ≤ S are durable. Log entries
   **< S** may be pruned only after checkpoint S is durable (entry S itself stays: the rebuild check needs it); M2
@@ -691,9 +693,10 @@ The log, checkpoints and each board's epoch (boards live in the Registry).
 - Tenant and board ids are server-minted (`[a-z0-9-]`, no `.`, `*`, `>`), never a domain name, so subjects can't
   collide or wildcard across tenants.
 - Subjects per board: `plen.<tenant>.<board>.entries` (the room, after an append resolves), `.presence`, `.emotes`
-  and `.here` (gateways), `.inbox` (gateway → room, numbered per connection: rule 6), and `.gw.<gateway>` (room →
-  that one gateway: `welcome`, `ack`, `error`, each addressed to a `conn`). Gateway ids are server-minted like the
-  others.
+  and `.here` (gateways), `.inbox` (gateway → room, numbered per connection: rule 6), `.gw.<gateway>` (room →
+  that one gateway: `welcome`, `ack`, `error`, each addressed to a `conn`), and `.grants` (whoever changes the
+  board's grants, invites or links → gateways: `{ board }`; each gateway computes its connections' roles again and
+  closes the ones that lost access or changed role). Gateway ids are server-minted like the others.
 - **At-most-once.** Entries carry `seq`, so a gateway that sees a gap reads the missing range from the Store and
   delivers in order; duplicates are dropped by `seq`. Presence has no repair.
 - **A lost last entry is repaired two ways.** While it runs, the room publishes a `{ seq, epoch }` **heartbeat**

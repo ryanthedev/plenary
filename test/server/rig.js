@@ -57,7 +57,9 @@ export async function rig(o = {}) {
   const inbox = [];
   bus.subscribe(subjects.inbox(ids.tenant, ids.board), m => inbox.push(m));
   bus.subscribe(subjects.inbox(ids.tenant, ids.otherBoard), m => inbox.push(m));
-  const server = createServer({ auth, registry: reg, store, bus, blobs: diskBlobs({ dir: join(dir, "blobs") }), log, port: 0, limits: o.limits, host: o.host });
+  // Catch-up frames are the gateway's now (its board feed): the scaffold's room-host knobs map onto the feed's.
+  const feed = { ...(o.host?.chunkBytes ? { chunkBytes: o.host.chunkBytes } : {}), ...(o.host?.tailFoldBytes ? { rebaseBytes: Math.max(1, Math.floor(o.host.tailFoldBytes / 4)) } : {}), ...(o.limits?.feed ?? {}) };
+  const server = createServer({ auth, registry: reg, store, bus, blobs: diskBlobs({ dir: join(dir, "blobs") }), log, port: 0, limits: { opRate: 1e6, opBurst: 1e6, ...(o.limits ?? {}), feed }, host: o.host });   // the gateway's op pace is off unless a test sets it
 
   const self = {
     dir, lines, log, registry, ids, store, rawStore, bus, server, inbox, calls,
@@ -88,10 +90,16 @@ export async function sock(url) {
   return s;
 }
 
-/** A Replica on a real socket: connects, resends, reconnects when the Replica asks for a resync. */
-export function client(rig, name, cname = name) {
+/**
+ * A Replica on a real socket, driven the v1 way (packages/protocol/replica.js, "How to drive it"): after every
+ * receive and local change, send what outgoing() returns; when wait() says so, call it again (the pace, the 10 s
+ * answer timeout); when `resync` is set, close, wait reconnectWait() (capped by `maxWaitMs` so tests stay quick), and
+ * open a new connection. `o.now`/`o.random` go to the Replica.
+ */
+export function client(rig, name, cname = name, o = {}) {
   const c = {
-    name, r: new Replica({ client: cname }), s: null, msgs: [], errors: [], connects: 0, wantOpen: false,
+    name, r: new Replica({ client: cname, ...(o.now ? { now: o.now } : {}), ...(o.random ? { random: o.random } : {}) }),
+    s: null, msgs: [], errors: [], connects: 0, wantOpen: false, timer: null, maxWaitMs: o.maxWaitMs ?? 50, board: o.board,
     // connect() and reconnect() each share one in-flight promise: a test loop that calls connect() while a resync
     // is reconnecting gets that same socket, never a second one racing it.
     connect() {
@@ -107,22 +115,37 @@ export function client(rig, name, cname = name) {
         const m = jsonCodec.decode(e.data); c.msgs.push(m);
         if (m.t === "error") c.errors.push(m);
         c.r.receive(m);
-        if (c.r.resync) c.reconnect().catch(() => {});
+        c.pump();
       };
-      for (const m of c.r.connectMessages(tokenOf(name), rig.ids.board)) s.send(m);
+      // A close the client didn't ask for counts as a failed attempt (rule 12); the test decides when to reconnect.
+      const prev = s.ws.onclose;
+      s.ws.onclose = e => { prev?.(e); if (c.s === s && !c.r.resync) c.r.connectionFailed(); };
+      for (const m of c.r.connectMessages(tokenOf(name), c.board ?? rig.ids.board)) s.send(m);
       return c;
     },
-    async drop() { c.wantOpen = false; const s = c.s; c.s = null; if (s) await s.close(); },
+    /** Send what the Replica wants sent now, and come back when it says to. Reconnects when it asks for a resync. */
+    pump() {
+      clearTimeout(c.timer); c.timer = null;
+      if (c.r.resync) { if (c.wantOpen) c.reconnect().catch(() => {}); return; }
+      if (!c.open) return;
+      for (const m of c.r.outgoing()) c.s.send(m);
+      if (c.r.resync) { if (c.wantOpen) c.reconnect().catch(() => {}); return; }
+      const w = c.r.wait();
+      if (w !== null) { c.timer = setTimeout(() => c.pump(), Math.max(1, w)); c.timer.unref?.(); }
+    },
+    async drop() { c.wantOpen = false; clearTimeout(c.timer); const s = c.s; c.s = null; if (s) await s.close(); },
     reconnect() {
       if (c.reconnecting) return c.reconnecting;
-      c.reconnecting = (async () => { await c.drop(); return c.connect(); })().finally(() => { c.reconnecting = null; });
+      c.reconnecting = (async () => { await c.drop(); await sleep(Math.min(c.r.reconnectWait(), c.maxWaitMs)); return c.connect(); })().finally(() => { c.reconnecting = null; });
       return c.reconnecting;
     },
     /** Between a drop and the new socket's hello: not open, but not done either. */
     get busy() { return !!(c.connecting || c.reconnecting); },
     get open() { return !!c.s && c.s.ws.readyState === WebSocket.OPEN; },
-    /** A local change: shown at once, sent if connected (else resent on the next connect). */
-    send(stream, op) { const m = c.r.local(stream, op); if (c.open) c.s.send(m); return m; },
+    /** A local change: shown at once, sent when the Replica's pace and catch-up allow. */
+    send(stream, op) { const m = c.r.local(stream, op); c.pump(); return m; },
+    /** A presence message (cursor, select, laser, emote; previews through Replica.preview). Sent as is when open. */
+    presence(msg) { if (c.open) c.s.send({ t: "presence", ...msg }); },
   };
   return c;
 }
@@ -135,15 +158,16 @@ export function client(rig, name, cname = name) {
 export async function settled(rig, clients, ms = 10000) {
   await until(async () => {
     await rig.idle();
+    // Viewers never open a room (rule 8): with none running, the Store's end is what everyone must reach.
     const room = await rig.room();
-    if (!room) return false;
-    return clients.every(c => !c.busy && !c.r.resync && (!c.open || (c.r.pending.size === 0 && c.r.applied === room.seq)));
+    const end = room ? room.resolved : await rig.rawStore.lastSeq(rig.ids.tenant, rig.ids.board);
+    return clients.every(c => !c.busy && !c.r.resync && (!c.open || (c.r.welcomed && c.r.pending.size === 0 && c.r.applied === end)));
   }, "clients to settle", ms);
 }
 
 /** The room's state in the shape of Replica.state(). */
 export function roomState(room) {
-  const out = { applied: room.seq };
+  const out = { applied: room.resolved };
   for (const s of ["board", "notes"]) { const d = room.streams[s]; out[s] = { elements: [...d.byId.values()].sort((a, b) => (a.id < b.id ? -1 : 1)), appState: d.appState.herdr }; }
   return out;
 }

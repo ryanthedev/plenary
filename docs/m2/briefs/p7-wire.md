@@ -21,7 +21,9 @@ consumer in web/: show the dropped setting, and offer or perform the retry when 
 
 - **`here` may come without a list** (p2-tune round 2; spec in PROTOCOL.md § Presence): the writer list comes only on a
   writer change or to a joiner; a viewer-count change sends a count-only `here`. Keep the last writer list and update only
-  the count; test that a count-only `here` never clears avatars.
+  the count; test that a count-only `here` never clears avatars. Exact shape (t18m): `{t:'here', writerCount, viewers}` with
+  **no `writers` field**. Today web/core/collab/presence-model.js:73 swaps in `[]` when `writers` is absent: fix it to keep
+  the last list (and `writerBy`) and update only `writerCount`/`viewers`.
 - **Static serving (ea978ac):** server/static.js serves only web/main.js's import graph plus index.html and style.css. A new
   production web file must be reachable by import from main.js, or it 404s.
 

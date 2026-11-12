@@ -115,3 +115,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-12 client: p6-edge DONE ac91d62 (sign-in HTTP adapter, WebSocket transport; verifier no HIGH; bun test 684/0 by manager). p6-hex waits on the p2-land merge.
 - 2026-11-12 client: p6-edge2 DONE ff87a3c (WebSocket backpressure, a full buffer stuck 10 s = dropped; sign-in test gaps; verifier no HIGH; bun test 755/0 by manager).
 - 2026-11-12 platform: drawh round 4 DONE 6961449 (protocol v1.1, file-side settings back; final check FAIL by the letter on one ~20 ms same-batch refusal window, reported under the manager's hard stop; herdr-draw tests 316/0; patch hash matches the verifier's). Proposal doc header still says 'not yet re-verified' (stale).
+- 2026-11-12 platform: p5-exp DONE e82a537 (session verify returns expiry so the gateway can close on expiry; verifier PASS).

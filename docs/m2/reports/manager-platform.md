@@ -183,3 +183,6 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   AGPL-3.0), since official MinIO images left Docker Hub; service named `blobs` so a swap (rustfs, garage) touches
   only it. Proposed env names for engine: DATABASE_URL, NATS_URL, S3_ENDPOINT/BUCKET/REGION/ACCESS_KEY_ID/
   SECRET_ACCESS_KEY (Bun's S3 client reads these), PLENARY_NODE_ID. Verifier t174.
+- Engine (t14j) confirmed the cluster env names, added PLENARY_ROLES (gateway,host; compose runs at least one
+  gateway-only and one host-only node), and NATS max_payload 2MB (PROTOCOL.md § Bus) for compose and CI. Sent to
+  builder t170; verifier t174 re-checks the amended files after its current pass.

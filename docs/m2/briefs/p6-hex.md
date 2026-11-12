@@ -106,3 +106,12 @@ auth port and fake come from p6-ports; you add `web/adapters/auth/http.js` (fetc
 - web/collab moves too: models (presence, records, notes, gate, limits, flags) to web/core/collab/, renderers (ui.js,
   draw.js, dom.js, collab.css) to web/adapters/dom/collab/, fake-port.js to web/adapters/collab/fake.js, port.js to
   web/ports/collab.js. Keep p7-wire's job (the real collab adapter) out of scope.
+
+## Fix-round item from engine's p-serve (manager DECISION, 2026-11-12)
+
+The served page can't boot: main.js statically imports the dev rooms (transport/shared-worker/client.js, local.js),
+which p-serve denies (404 → the module graph fails). **web/main.js is the production root:** ws.js transport (same-origin
+`/ws`, token only in hello), HTTP auth, sign-in via `#code`; no dev rooms, no web/core/dev-users.js, no `?as=`.
+**web/dev-main.js** (new, dev-only root) with its own dev page wires the in-browser rooms and DEV_USERS; index.html never
+loads it. Add a test that main.js's import graph contains no dev module (use arch-scan importsOf). Tell your manager when
+done so engine re-runs p-serve's crawl.

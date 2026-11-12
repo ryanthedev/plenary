@@ -4,13 +4,16 @@
 
 - **Me:** manager client, terminal t14k. Report to the proxy **t1bx** ONLY by ending my turn with one short message (outcome
   first, report path; "Urgent:" first if urgent). NEVER prompt/hc send/SendMessage t1bx (CEO rule, 2026-11-12). Workers report to me only. engine manager **t18m**; platform manager **t187**.
-- **In flight:** p6-hex (t1fy, plenary-p6-hex, on main; brief docs/m2/briefs/p6-hex.md): web/ into core/ports/adapters.
-  Its boundary test waits on engine's test/arch-scan.js (p-arch t1fx, ~1.5–3 h; written now, skipped until it exists).
-- **Phase 2 merged into main: dcbdae6** (p2-land worktree retired; never use it). Before that: p2-land rebased onto main, head 892ee6e (client files 892ee6e,
-  v1.1 a68e9dc); p2-swap (server onto v1) now running there. No client work in the worktree until t18m sends the merge id.
-- **Next, in order:** p6-hex (docs/m2/briefs/p6-hex.md: move web/ onto the ports, auth HTTP adapter per
-  docs/m2/contracts/auth-exchange.md, test/web/architecture.test.js on engine's test/arch-scan.js) → p7-wire
-  (docs/m2/briefs/p7-wire.md) → an architecture audit of web/.
+- **In flight (after the 03:44 kill; proxy resumed sessions in place):** p6-hexv (t1g6, resumed, watched) verifying
+  p6-hex (builder t1fy: DONE, NOT resumed; resume only for the fix round with
+  `claude --resume 81338670-c0eb-4e92-9f26-43be782b08a0 --model opus --permission-mode auto` in a NEW terminal, never
+  prompting a plain shell). Known HIGH already decided: main.js = production root (ws.js, HTTP auth, sign-in), new
+  dev-only root web/dev-main.js (engine p-serve's crawl: main.js imports denied dev rooms → page can't boot).
+- **On p6-hexv verdict:** fix round (the HIGH + findings) → re-verify → commit web/ + test/web by path (p6-hex.md §8 adds/
+  modifies/deletes) → send engine (t18m) the commit id for p-serve's re-crawl → close t1fy, t1g6 → start p7-wire.
+- **Asked engine (unanswered):** is the ws path same-origin `/ws`, token only in hello (no subprotocol/query)?
+- **Main:** phase 2 merged (dcbdae6); p2-land worktree retired. test/arch-scan.js on main (44dd1aa).
+- **Next, in order:** p6-hex fix round → p7-wire (docs/m2/briefs/p7-wire.md) → an architecture audit of web/.
 - **Start command:** OFFICE.md "Starting a session" (names plenary-<job>[v], --model opus --permission-mode auto,
   systems-design plugin, zsh -lic wrapper). Tab: `worker <job> (client) · <id>: <what>`.
 
@@ -18,7 +21,8 @@
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| p6-hex (builder) | t1fy | worker p6-hex (client) · t1fy: web ports and adapters | RUNNING on main |
+| p6-hex (builder) | t1fy | done p6-hex (client) · t1fy | DONE (verifying) |
+| p6-hexv (verifier) | t1g6 | verifier p6-hexv (client) · t1g6: web ports and adapters | RUNNING (brief docs/m2/briefs/p6-hexv.md) |
 
 ## 2026-11-11 — phase-6 design mock
 
@@ -263,3 +267,9 @@
 - p6-edge2 decision change done (t1f2). Verifier p6-edge2v (t1f8, plenary-p6-edge2v) started.
 - p6-edge2v PASS (no HIGH; M1 presence gate too high at 256 KB, M2 localRoom/sharedNet lack congested()). bun test 755 run, 0 fail (me). DECISIONS: backlogBytes() on the port, presence only at <=16 KB, transient ops count as presence, 256 KB congested() for the pill only; optional calls until all transports implement it. Into p6-hex. Committed p6-edge2; t1f2, t1f8 closed.
 - Phase 2 merged (dcbdae6, 964 tests green on main). p6-hex started (t1fy). arch-scan.js lands later (p-arch t1fx); p6-hex writes the boundary test against the fixed signature, skipped until then.
+- Engine will serve web/ at / (after p2-tune). Sent provisional answers: entry web/index.html -> main.js; also serve packages/core and packages/protocol at /packages/*; never serve dev pages, the in-browser dev room, fakes, test/docs/server (allowlist from main.js's import graph); CSP/nosniff/no-referrer/no-cache+ETag. Confirm final paths after p6-hex.
+- Engine took the serving answers as-is into p-serve (docs/m2/briefs/p-serve.md). Owe t18m the final paths after p6-hex.
+- Engine's p-arch landed (44dd1aa): test/arch-scan.js on main. Told p6-hex (t1fy) to run its boundary test against it for real.
+- p6-hex done (t1fy): test/web 543/0 (me); full-suite fails 3 in engine's untracked test/server/static.test.js (p-serve). Final paths sent to t18m. Open: main.js imports web/core/dev-users.js (verifier judges a dev-only root). Verifier p6-hexv (t1g6) started.
+- BLOCKER from engine's p-serve: the served page can't boot (main.js imports the denied dev rooms). DECISION: main.js = production root (ws.js, HTTP auth, sign-in; no dev rooms/dev-users/?as=); web/dev-main.js = dev-only root. In p6-hex's fix round after t1g6's verdict; t1g6 records it as a known HIGH. Asked t18m to confirm /ws same-origin and token only in hello. Owe t18m the commit id for a p-serve re-crawl.
+- 03:44: all agents killed; proxy resumed me and t1g6 in place. Watches re-armed; known-HIGH message resent to t1g6. t1fy not resumed (done).

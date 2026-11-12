@@ -2,7 +2,8 @@
 // it with `createServer({ http: httpRoutes(deps) })`: its own routes run first, then these, then a 404.
 //
 //   httpRoutes(deps) → async (req: Request, url?: URL) => Response | null      (null = "not my route")
-//   deps = { registry, sessions, oidc, tenancy, now, config, dev? }
+//   deps = { registry, sessions, oidc, tenancy, now, config, dev?, testHooks? }
+//     testHooks: tests only, not an API. { pruned({ visited, expired, live }) } runs after each replay-guard prune.
 //     dev: optional dev-token verifier (server/auth/dev.js devAuth). Only when given AND enabled does Bearer accept
 //          dev tokens as well as session tokens; off by default.
 //     config.cookieKey      ≥ 32 bytes (string or bytes), signs the login cookie. Required when `oidc` is set.
@@ -77,9 +78,10 @@ const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
  * @param {{ registry: object, sessions: { issue(id: object): Promise<string>, verify(t: string): Promise<object|null> },
  *   oidc?: { begin(): Promise<{url: string, state: string, nonce: string, verifier: string}>, finish(o: object): Promise<object|null> } | null,
  *   tenancy: { redeemLink(id: object, link: string): Promise<{board: string}|null>, tenantOf(id: object): Promise<{id: string}|null> },
- *   now?: () => number, config: object, dev?: { enabled?: boolean, verify(t: string): Promise<object|null> } | null }} deps
+ *   now?: () => number, config: object, dev?: { enabled?: boolean, verify(t: string): Promise<object|null> } | null,
+ *   testHooks?: { pruned?(p: { visited: number, expired: number, live: number }): void } | null }} deps   (tests only, not an API)
  */
-export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Date.now, config = {}, dev = null }) {
+export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Date.now, config = {}, dev = null, testHooks = null }) {
   if (!registry || !sessions || !tenancy) throw new Error("http: registry, sessions and tenancy are required");
   const postLoginUrl = absUrl(config.postLoginUrl, "postLoginUrl");
   const postLogoutUrl = config.postLogoutUrl ? absUrl(config.postLogoutUrl, "postLogoutUrl") : postLoginUrl;
@@ -129,7 +131,9 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
   /** @returns {"ok"|"replay"|"full"} */
   const useState = state => {
     const t = now();
-    for (const [s, exp] of usedStates) { if (exp > t) break; usedStates.delete(s); }
+    let visited = 0, expired = 0;
+    for (const [s, exp] of usedStates) { visited++; if (exp > t) break; usedStates.delete(s); expired++; }
+    testHooks?.pruned?.({ visited, expired, live: usedStates.size });
     if (usedStates.has(state)) return "replay";
     if (usedStates.size >= maxStates) return "full";
     usedStates.set(state, t + LOGIN_TTL_SEC * 1000);

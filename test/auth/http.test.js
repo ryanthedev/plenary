@@ -481,28 +481,37 @@ async function guardRig(over = {}) {
   };
   return { hit };
 }
-const msPerCall = async (hit, calls, tick = 0) => {
-  const t0 = performance.now();
-  for (let i = 0; i < calls; i++) { clock.t += tick; await hit(); }
-  return (performance.now() - t0) / calls;
-};
+const drive = async (hit, calls, tick = 0) => { for (let i = 0; i < calls; i++) { clock.t += tick; await hit(); } };
 
-test("replay guard: per-callback cost stays flat as live states grow, with and without expiry churn", async () => {
-  // Small map vs large map: time the last 1,000 callbacks. The old full scan was ~6x slower at 60k than at 5k.
-  const small = await guardRig();
-  await msPerCall(small.hit, 2_000);
-  const a = await msPerCall(small.hit, 1_000);
-  const big = await guardRig();
-  await msPerCall(big.hit, 40_000);
-  const b = await msPerCall(big.hit, 1_000);
-  // Churn: ~40k live, the clock moves 15 ms per callback, so every call also expires one entry from the front.
-  const churn = await guardRig();
-  await msPerCall(churn.hit, 40_000, 15);
-  const c = await msPerCall(churn.hit, 1_000, 15);
-  console.log(`replay guard ms/callback: 3k live ${a.toFixed(4)}, 41k live ${b.toFixed(4)}, 40k live + churn ${c.toFixed(4)}`);
-  expect(b / a).toBeLessThan(3);
-  expect(c / a).toBeLessThan(3);
-}, 60_000);
+test("replay guard: pruning visits O(1) entries per callback as live states grow, with and without expiry churn", async () => {
+  // Deterministic: a tests-only hook counts the map entries each prune visits (no wall clock). Front-popping visits
+  // every expired entry it deletes plus at most one live entry, where it stops. The old full scan visited every live
+  // entry on every callback, so at 5k live it would visit ~5,000 per callback here, not ≤ 1.
+  const rig = async (calls, tick) => {
+    const seen = [];
+    const { hit } = await guardRig({ testHooks: { pruned: p => seen.push(p) } });
+    await drive(hit, calls, tick);
+    return seen;
+  };
+  const check = seen => {
+    for (const { visited, expired } of seen) expect(visited - expired).toBeLessThanOrEqual(1);   // ≤ 1 live entry
+    const visited = seen.reduce((n, p) => n + p.visited, 0), expired = seen.reduce((n, p) => n + p.expired, 0);
+    expect(expired).toBeLessThanOrEqual(seen.length);                 // each entry is inserted, so deleted, at most once
+    expect(visited).toBeLessThanOrEqual(2 * seen.length);             // amortised O(1)
+  };
+  // No churn: the map only grows (to 5k live); every prune visits exactly the one live front entry.
+  const flat = await rig(5_000, 0);
+  expect(flat.length).toBe(5_000);
+  expect(flat.at(-1).live).toBe(4_999);
+  expect(flat.slice(1).every(p => p.visited === 1 && p.expired === 0)).toBe(true);
+  check(flat);
+  // Churn: the clock moves 240 ms per callback, so after 2,500 calls (600 s) each call also expires ~1 entry from
+  // the front and live states hold at ~2,500.
+  const churn = await rig(5_000, 240);
+  expect(churn.reduce((n, p) => n + p.expired, 0)).toBeGreaterThanOrEqual(2_400);
+  expect(churn.at(-1).live).toBeLessThanOrEqual(2_501);
+  check(churn);
+});
 
 test("replay guard: a hard cap fails closed (503, cookie cleared); expiry frees room; replays still 400", async () => {
   const { hit } = await guardRig({ config: { ...config, maxLoginStates: 3 } });

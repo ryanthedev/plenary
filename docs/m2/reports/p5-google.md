@@ -141,3 +141,10 @@ prints it. The live test's two authorization-URL fetches would have printed `cli
 - **Secret scan, rerun after the last edit:** 0 hits for the client id, the secret and `COOKIE_KEY` across 333 files (327 tracked + untracked, 6 scratch). Only counts were printed.
 
 **Not verified:** a real outage while the harness serves a browser login. It is covered indirectly: `googleOidc.finish` already swallows thrown fetches (p5-googlev's injected-throw check), and it now receives `safeFetch` errors, which hold no URL.
+
+## Human login: PASSED (2026-11-12 04:44Z)
+
+The CEO signed in with the real Omniping client through `scripts/dev-google.js` (after p5-code, 3f6b489), relayed by
+the proxy (t1bx). Server log: `GET /auth/login` 302; `GET /auth/callback` 302 `loginCookie: true`; `GET /signed-in`
+200; `POST /auth/exchange` 200 `exchangeCookie: true`. The harness was stopped by its PID. This closes the
+end-to-end sign-in thread for the dev harness; a rerun against the real server follows engine's p2-swap.

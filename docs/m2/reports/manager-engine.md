@@ -12,11 +12,9 @@ already PASS, then one merge into main, send id to t14k and t1bx; then p-arch + 
 | Job | Terminal | Status |
 |---|---|---|
 | p2-swap (builder) | t1dh | RUNNING (worktree) |
-| p2-recovery builder | t15q | idle; close at phase-2 merge (+ remove its old worktree) |
-| p1-v11 builder / verifier | t186 / t188 | idle; close at phase-2 merge |
 
 On main: 7b6a5dd scaffold, b804f3b p4-pg, bbdae0e p4-natss3. On p2-land: a68e9dc v1.1 code, 892ee6e client.
-Closed: t18c, t18b, t171, t16y, t158, t17d, t17p, t17f, t17m, t17j. Leftover scratch: t17j ~1 GB and t18c 168 MB in their
+Closed: t15q (+ its worktree), t186, t188, t18c, t18b, t171, t16y, t158, t17d, t17p, t17f, t17m, t17j. Leftover scratch: t17j ~1 GB and t18c 168 MB in their
 scratchpads (their rm was refused); remove when convenient.
 
 ## 2026-11-11 phase 1 (protocol v1 spec)
@@ -209,3 +207,4 @@ scratchpads (their rm was refused); remove when convenient.
 - Scaffold 7b6a5dd, p4-pg b804f3b, p4-natss3 bbdae0e committed (bun test 512/0 shared tree). p2-land rebased (892ee6e): protocol+web+auth 551/2 (platform google-live, p5-tidy fixing); test/server fails until p2-swap. Security review of 7b6a5dd: 2 MEDIUM (live queue cap; revocation) folded into p2-swap brief d81771c. p2-swap started t1dh.
 - R5-M1 committed ffd2a11 (test only; re-ran 3x 22/0). Proxy t1bx told. t1dh told to cherry-pick ffd2a11 into p2-land. t18c closed.
 - CEO rule (2026-11-12): never prompt/hc send the proxy t1bx; report by ending the turn with one short message (outcome first, report path); 'URGENT' first if urgent. Phase 3 audited and pushed to origin (378d089, clean 510/0).
+- Closed t15q, t186, t188 (work committed); removed t15q's scratch worktree. p2-swap t1dh handing off at 36% (finishing a welcome-ordering fix first); successor expected same turn.

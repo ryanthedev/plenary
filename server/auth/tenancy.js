@@ -159,17 +159,21 @@ const tenancyOver = (registry, now, recordUntil) => tenancy({ registry, now, rec
 // ---- roleCache: a role cache over `tenancy` (p5-load; p-audit F8). Depends only on the Registry port. ----
 //
 // What it caches, per process (one gateway node):
-//   - roles per (board, user), for hellos. Only a role (never null: a refusal is always read fresh), keyed also by
-//     the identity's email and domain (a role depends on both). An entry lives until the soonest of: `ttlMs`
-//     after the read began, and the soonest `expiresAt` of any live invite or link it depended on (time-based loss
-//     sends no message). Bounded by `maxEntries` (oldest dropped first).
-//   - the records the port can't change once written: board and tenant (memberRole and domain have no update
-//     method), and link records by id (a link changes only by revokeLink, which announces on `grants`). `live()` is
-//     evaluated on every use, so a memoized link still expires on time. Lookups of the same record share one read.
+//   - roles per (board, identityKey): user, email and domain, the key the gateway's re-check groups by (a role
+//     depends on all three). Only a role (never null: a refusal is always read fresh). An entry lives until the
+//     soonest of: `ttlMs` after the read began; the soonest `expiresAt` of any live invite or link it depended on
+//     (time-based loss sends no message); and the end of the memo of every link record it was built from (p5-load2v
+//     MEDIUM 0: a joiner of an in-flight link read counts from that read's start), so with linkTtlMs ≤ ttlMs no
+//     entry rests on link data more than ttlMs old. Bounded by `maxEntries` (oldest dropped first).
+//   - the records whose read fields can't change once written: board and tenant for 10 min (board.id, memberRole,
+//     tenant, tenant.domain have no update method; `admins` does change and is never served from here), and link
+//     records by id for 30 s (a link changes only by revokeLink, which announces on `grants`). `live()` is evaluated
+//     on every use, so a memoized link still expires on time. Lookups of the same record share one read, unless an
+//     invalidation came between.
 //
 // Consistency (the one rule that matters: a revoke is never hidden longer than without the cache):
 //   - `invalidate(board)` (a `grants` message `{ board }`, and the gateway releasing its watch of a board) drops
-//     the board's roles and link records; `invalidate(board, user)` drops one user's role. The gateway calls it
+//     the board's roles and link records; `invalidate(board, user)` drops every identity of one user. The gateway calls it
 //     synchronously in its `grants` subscriber, BEFORE bumping its hello generation and before its re-check pass.
 //   - A read in flight across an invalidation never fills the cache (stamps per board and per (board, user), so a
 //     stream of per-user invalidations doesn't starve the rest of the board).

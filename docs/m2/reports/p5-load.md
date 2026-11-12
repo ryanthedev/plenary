@@ -367,7 +367,7 @@ For § Auth, Re-checking live connections, after the timed-pass bullet:
 > "A gateway may answer a hello's role from a per-gateway cache. If a `grants` message is lost, a NEW connection may
 > therefore be admitted with the old role until the gateway's next timed re-check, which reads the Registry fresh and
 > treats the connection like any other live one, or until the cache entry's life ends (at most 30 s), whichever is
-> first. A revoke is never hidden longer than it would be without the cache."
+> first. The cache never hides a revoke past the next timed pass."
 
 (Updated in Round 2b to p5-load2v's wording. Three things to note:
 
@@ -431,3 +431,160 @@ For § Auth, Re-checking live connections, after the timed-pass bullet:
 
 **Still pending (from Round 2):** the patch re-cut onto engine's committed `gateway.js`, and the gateway gap tests
 GAP-M4, GAP-M6 and M7, waiting for engine's commit id from t187.
+
+## Round 3 (p5-load3: patch re-cut onto engine's a90cd6b; LOWs A–D)
+
+### Patch: `docs/m2/reports/p5-load.patch`
+
+Re-cut against HEAD `a90cd6b` (`server/gateway.js` blob `a22f1fb`, the same as the tree), on top of this round's
+platform files (`tenancy.js` and `role-cache.test.js`, uncommitted in the tree). It touches 11 files.
+
+**`server/gateway.js`.** Engine's batching (`recheckConcurrency`), `rc.cut`, per-user errors (`sum.errors`, `ok[]`,
+`failed()`/retry schedule), the "registry down" stop and count-only `here` are all kept as they are.
+
+- **Key:** imports `identityKey` from `./auth/tenancy.js` and groups by it; the inline spelling is gone. Each group
+  carries its `key`.
+- **New limit:** `recheckBatch: 1000`.
+- **New `rolesWithin(identities, board)`:** `auth.rolesFor` bounded by `recheckLookupMs`, the same race as
+  `roleWithin`, counted in `rechecks.timeouts` (finding 1).
+- **`grants` subscriber:** `{ board }` calls `auth.invalidate?.(board)` before `gen++`. `{ board, user }` calls
+  `auth.invalidate?.(board, user)` and returns: no pass, no `gen++`, never a revoke.
+- **`unwatchGrants`:** releasing a board's last watch calls `auth.invalidate?.(board)`.
+- **`recheckPass`, when `auth.rolesFor` exists:**
+  1. At the start: `auth.invalidate?.(b.board)` (LOW A) and the board watch's `gen++` (M7).
+  2. Per chunk: after engine's `rc.cut` check, one `rolesWithin` per `recheckBatch` identities. A chunk error or
+     timeout becomes that chunk's per-identity error inside engine's `one()` (`sum.errors`, `ok[]`, fail closed on
+     grants, keep and retry on timed, the "registry down" first-batch stop), and calls `invalidate(board)` so a late
+     answer can't write through.
+  3. Answers are looked up with `roles.get(g.key)`. Concurrency batches never run past the chunk read.
+- **Without `rolesFor`:** the code is engine's, unchanged.
+
+**The other files** (same content as the round 1 patch, re-applied cleanly to a90cd6b):
+
+| File | Change |
+|---|---|
+| `server/auth/port.js` | Passes `rolesFor` and `invalidate` through. |
+| `server/main.js` | `roleCache` wired for hellos; `addLinkUse` announces `{ board, user }`, with link-to-board and board-to-tenant memoized. |
+| `server/registry/sqlite.js`, `postgres.js` | `linkUsesFor`. |
+| `test/server/registry.test.js`, `pg-registry.test.js` | `batch: true`. |
+| `test/server/rig.js` | `cache` option, `cacheCalls`. |
+| `test/server/revocation.test.js` | M1 also fails `rolesFor`. |
+| `test/auth/role-cache.test.js` | F4 test expects `{ board, user }`. |
+| `test/server/role-cache.test.js` (new) | 8 tests, below. |
+
+**Key-equality test not added:** no second spelling of the key remains (`grep` for the inline template in
+`server/` and `test/`: none), so the verifier's key-equality test is moot.
+
+### Tests
+
+- **`test/server/role-cache.test.js`** (in the patch), 8 tests:
+  - warm hello served from the cache, and a `{ board }` revoke closes and refuses;
+  - `{ board, user }` runs no pass;
+  - cached roles go when the last socket closes;
+  - chunked timed pass with no per-user calls;
+  - **GAP-M4:** a new hello while a revoke waits behind a running pass is refused;
+  - **GAP-M6 (LOW A):** a cached user who left, revoke lost: refused after one pass;
+  - **M7 (new):** two hellos waiting on the room (one served from the cache) when a timed pass runs, revoke lost:
+    both refused 1008;
+  - **finding 1:** `rolesFor` hangs during a timed pass; a revoke still closes within 4 s; `rechecks.timeouts` ≥ 1.
+- **`test/auth/role-cache.test.js`** (tree), 19 tests. New:
+  - **C2 (LOW D):** several links; the entry ends at the oldest link memo.
+  - **C3 (LOW D):** a joiner of an in-flight link read is capped from that read's start.
+- **LOW C:** the `roleCache` header comment now says entries are keyed by `identityKey`, describes the link-memo cap
+  (joiners count from the read's start), gives the record lifetimes (board and tenant 10 min with `admins` never
+  served; links 30 s), and says `invalidate(board, user)` drops every identity.
+- **LOW B:** the proposed PROTOCOL sentence (Round 2, finding 5) now ends "The cache never hides a revoke past the
+  next timed pass." PROTOCOL.md is not edited.
+
+### Mutations (one at a time, restored, `cmp` clean)
+
+| Mutation | Result |
+|---|---|
+| M4: subscriber keeps the cache on `{ board }` | GAP-M4 fails |
+| M6: no pass-start `invalidate` (LOW A) | GAP-M6 fails (and M7) |
+| M7: no pass-start `gen++` | M7 fails |
+| `rolesFor` unbounded (plain `auth.rolesFor`) | finding 1 test fails |
+| Chunk overrun (concurrency batch not capped at the chunk) | "chunked timed pass" fails |
+| C2: cap by the last link only | C2 fails |
+| C3: a joiner capped from its own start | C3 fails |
+
+The gateway mutations ran over `test/server/role-cache.test.js` and `revocation.test.js`; the tenancy mutations over
+`test/auth/role-cache.test.js`.
+
+### Gates
+
+| Run | Result |
+|---|---|
+| `git apply --check`, clean worktree of HEAD + this round's platform files | Applies |
+| `git apply --check`, main tree | Fails on `test/server/pg-registry.test.js` and `test/server/registry.test.js` only. Someone has uncommitted edits next to those `batch: true` lines (a new `busy_timeout` pragma test and pg-registry rework). Once those land, the two one-line hunks need re-applying (or `git apply -3`). The other 9 files apply to the tree as it is. |
+| Full `bun test`, worktree (HEAD + platform files + patch), no `DATABASE_URL` | **1171 pass, 122 skip, 0 fail** |
+| Same, `DATABASE_URL` = Podman Postgres 17.11 | **1262 pass, 34 skip, 0 fail**. The container (`c61457cd906d`) was mine, stopped with `--rm`, and is confirmed gone; no other container touched. |
+| Full `bun test`, isolated worktree (HEAD + only this round's platform files) | **1162 pass, 120 skip, 0 fail** |
+| `bun test test/auth`, main tree | Green (19 in `role-cache.test.js`) |
+| Full `bun test`, main tree | 1157 pass, 135 skip, **48 fail**, run while other sessions had uncommitted edits in `server/room-host.js`, `packages/protocol/room.js`, `ports.js`, the stores, `gateway.test.js` and `revocation.test.js`. They are room, append, Store and catch-up tests, nearly all 5–30 s timeouts. The run took 867 s, against about 110 s isolated. **None is this job's:** the isolated run of HEAD + my files is 0 fail. The known core-source failure is in that list too; it can't run in the worktrees (no herdr-draw beside them). |
+
+The 48 main-tree failures, verbatim (`bun test 2>&1 | grep -E '\(fail\)'`, durations cut):
+
+```
+(fail) packages/core is still herdr-draw's core (re-copy when herdr-draw's core changes)
+(fail) H1: an annotator rewriting one note over and over leaves the board joinable, before and after a restart
+(fail) H1: a tail bigger than any one frame arrives as bounded frames, in order, complete
+(fail) H1 (round 3): a board bigger than a user's whole budget is joinable from scratch: a snapshot bigger than the share
+(fail) H1 (round 3): a board bigger than a user's whole budget is joinable from scratch: a tail bigger than the share
+(fail) H1 (round 3): a slow reader of a board bigger than its budget gets all of it; the server never owes it more than a socket's worth
+(fail) H1: sockets that never read stay under the budget, are cut even while they send presence, and lock nobody else out
+(fail) H1: non-readers spread over several accounts can't keep joiners out: the longest-stalled is cut to make room
+(fail) a joiner that waits too long for room is told `unavailable`, not left hanging
+(fail) M1: one writer's burst doesn't freeze the process: /health keeps answering all the way through
+(fail) L5: a client refused by the room resyncs, and settled() waits for it (the helper's old race, made certain)
+(fail) Store.read can stop a page by size (an extension to § Store), and reports each entry's stored size
+(fail) a writer active during catch-up doesn't get a slow joiner (or its other tab) cut
+(fail) trickle readers can't hold the budget against a joiner: the one too slow to ever finish makes way (needs python3: skipped without it)
+(fail) a reader getting through its catch-up at a fair pace is left alone: the joiner behind it waits its turn
+(fail) joiners parked across folds can't pin a board's worth of replaced text each: the longest-waiting are told to come back
+(fail) R4-H2: a board whose snapshot is several times the old socket limit joins from since 0, with live traffic queued behind it
+(fail) R4-H2: with the limit BELOW the snapshot, flush() holds frames behind it until the socket drains: nothing dropped
+(fail) R4-H2: a frame over the socket limit (past the spec's caps) is still sent, and logged loudly once per text
+(fail) the order is verify, then board, then role, then the room; the room gets {user, role, client} and never the token
+(fail) slow auth: ops after welcome are acked in order and numbered per connection
+(fail) bad frames get an error and/or a close, never reach a room, and never kill the process
+(fail) rule 1: nothing is acked or broadcast before the append resolves
+(fail) the entries subject carries each entry once, after it is durable
+(fail) when the append rejects: no ack ever, everyone gets `unavailable`, and the room rebuilds from the Store
+(fail) when the append conflicts: no ack ever, everyone gets `unavailable`, and the room rebuilds from the Store
+(fail) when the append times out: no ack ever, everyone gets `unavailable`, and the room rebuilds from the Store
+(fail) when the append times out and then lands late: no ack ever, everyone gets `unavailable`, and the room rebuilds from the Store
+(fail) a room that throws: before logging, only the sender hears; after logging, the room is rebuilt and nothing is stored
+(fail) lifecycle: sockets that close mid-auth or after hello leave no room connections behind
+(fail) a log with a gap or a foreign entry is corruption: the room refuses to start, the server lives
+(fail) H1: a 30,000-deep op is refused before it is parsed, nothing is stored, and joins stay fast
+(fail) H1: catch-up is right for every `since`, and the same bytes go to every joiner
+(fail) M1/M4: what waits behind a slow sign-in is bounded in bytes; 1,500 small unsent ops still get through
+(fail) M5: a v0 `transient` op is refused, not relayed and not logged; an inbox gap closes the connection
+(fail) L5: a Room that throws on a hello leaves no half-open connection
+(fail) clients converge through the Room over real sockets, with drops and reconnects, and survive a server restart (seed 1)
+(fail) clients converge through the Room over real sockets, with drops and reconnects, and survive a server restart (seed 2)
+(fail) H1: grants removed while a hello waits on the room (the board's first connection) → refused `auth`, nothing logged
+(fail) H1: a role changed while a hello waits → `unavailable` 1012 (reconnect); unchanged grants cost no second look
+(fail) L2: a gap in the Store log is logged as an error and a new viewer is refused `unavailable`, not welcomed short
+(fail) presence is relayed between two clients (not back to its sender) and never reaches the room, the log or a checkpoint
+(fail) a resend after a server restart gets the same seq (rule 2 across restarts); nothing is logged twice
+(fail) the bus cap: `.entries` batches are split under it in seq order, and an op too big for the inbox gets `too-large` with its id
+(fail) § Pacing: over-rate ops wait in the gateway in order and are all acked; past the queue cap the connection gets `unavailable`
+(fail) rule 6: a room forgets a gateway silent for 30 s (its clock), unless the gateway's 5 s connection lists keep it heard
+(fail) a board feed picks up the host's checkpoint written just after the entries that triggered it (on the next heartbeat): a joiner from 0 gets that snapshot and only the entries after it
+(fail) § Pacing: frames read from a live socket faster than they are handled are capped in bytes: past maxLiveQueuedBytes, `unavailable` and close
+```
+
+### Not verified
+
+- **Real load and NATS:** no 100k run, and the gateway behaviour was not run over NATS.
+- **The p5-loadv revocation table** was not re-run as a table. Its cases are covered by the gateway tests above
+  (in-flight read, waiting tab, lost message, hung lookup) and `revocation.test.js`.
+
+### For engine (when applying)
+
+- **Apply order:** apply after manager commits this round's `tenancy.js` and `role-cache.test.js`.
+- **`batch: true` hunks:** if the registry test rework lands first, re-apply the two one-line `batch: true` hunks by
+  hand.
+- **Keep the wiring together:** `roleCache` wiring (`main.js`) and the gateway invalidation must land together.

@@ -253,6 +253,46 @@ test("chained TTLs (p5-load2v MEDIUM 0): a role built on a memoized link record 
   expect(await cache.role(A, board.id)).toBe(null);
 });
 
+test("C2 (p5-load2v LOW D): several links: the entry ends at the OLDEST link memo (min), not the newest", async () => {
+  const l1 = await raw.createLink({ board: board.id, role: "editor", by: "google:root" });
+  const l2 = await raw.createLink({ board: board.id, role: "viewer", by: "google:root" });
+  await raw.addLinkUse(l1.id, "google:a"); await raw.addLinkUse(l2.id, "google:c");
+  await raw.addLinkUse(l1.id, "google:b"); await raw.addLinkUse(l2.id, "google:b");
+  const cache = roleCache({ registry: reg, now });
+  const A = id("google:a", null), B = id("google:b", null), C = id("google:c", null);
+  expect(await cache.role(A, board.id)).toBe("editor");                      // l1 memoized at T0
+  clock.t = T0 + 20_000;
+  expect(await cache.role(C, board.id)).toBe("viewer");                      // l2 memoized at T0+20 s
+  await raw.revokeLink(l1.id);                                                // lost message
+  clock.t = T0 + 25_000;
+  expect(await cache.role(B, board.id)).toBe("editor");                      // stale l1 memo + l2 memo
+  clock.t = T0 + 29_999;
+  expect(await cache.role(B, board.id)).toBe("editor");
+  clock.t = T0 + 30_000;
+  expect(await cache.role(B, board.id)).toBe("viewer");                      // l1 re-read: revoked; l2 still memoized
+});
+
+test("C3 (p5-load2v LOW D): a joiner of an in-flight link read is capped from that read's start, not its own", async () => {
+  let gate = null, entered;
+  const slow = { ...reg, link: async l => { const v = await reg.link(l); if (gate) { const g = gate; gate = null; entered(); await g; } return v; } };
+  const cache = roleCache({ registry: slow, now });
+  const l = await raw.createLink({ board: board.id, role: "editor", by: "google:root" });
+  await raw.addLinkUse(l.id, "google:a"); await raw.addLinkUse(l.id, "google:b");
+  let open; gate = new Promise(r => { open = r; });
+  const inRead = new Promise(r => { entered = r; });
+  const pa = cache.role(id("google:a", null), board.id);                    // starts the link read at T0, held
+  await inRead;
+  clock.t = T0 + 20_000;
+  const pb = cache.role(id("google:b", null), board.id);                    // joins it at T0+20 s
+  await new Promise(r => setTimeout(r, 0));
+  open();
+  expect(await pa).toBe("editor"); expect(await pb).toBe("editor");
+  await raw.revokeLink(l.id);                                                // lost message
+  clock.t = T0 + 30_001;                                                     // the read began at T0: both entries end by T0+30 s
+  expect(await cache.role(id("google:b", null), board.id)).toBe(null);
+  expect(await cache.role(id("google:a", null), board.id)).toBe(null);
+});
+
 test("null is never cached; an identity with another email or domain misses; errors are never cached", async () => {
   const cache = roleCache({ registry: reg, now });
   const gus = id("google:gus", null, "gus@gmail.com");

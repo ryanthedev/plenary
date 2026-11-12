@@ -22,18 +22,26 @@ index 495c682..e8a74df 100644
    };
  }
 diff --git a/server/gateway.js b/server/gateway.js
-index f1ee465..8888791 100644
+index a22f1fb..ac2af33 100644
 --- a/server/gateway.js
 +++ b/server/gateway.js
-@@ -80,6 +80,7 @@ export const LIMITS = {
+@@ -30,6 +30,7 @@ import { boardFeed } from "./feed.js";
+ import { isId } from "./ids.js";
+ import { quietLogger } from "./log.js";
+ import { breathe } from "./breather.js";
++import { identityKey } from "./auth/tenancy.js";   // the one spelling of the re-check grouping key (p5-load)
+ 
+ export const LIMITS = {
+   maxFrameBytes: 4 * 1024 * 1024,   // transport cap: an op is ≤ 1,000,000 chars (≤ 3 bytes each); above this Bun closes with 1009
+@@ -80,6 +81,7 @@ export const LIMITS = {
    recheckRetryMs: 2_000,                    // the first retry's wait; it doubles
-   recheckStopAfterErrors: 3,                // a timed pass meeting this many errors in a row stops (the Registry is down)
+   recheckLookupMs: 2_000,                   // one re-check lookup that hasn't settled by then is an error (a hung Registry call)
    recheckConcurrency: 8,                    // role lookups in flight per pass (an async Registry: a pass isn't users × round trip)
-+  recheckBatch: 1_000,                      // users per auth.rolesFor call, when the Auth port has it (p5-load: O(1) Registry queries per chunk)
++  recheckBatch: 1_000,                      // identities per auth.rolesFor call, when the Auth port has it (p5-load: O(1) Registry queries per chunk)
    // § Presence, `here`.
    hereMax: 50,                              // writers listed
    hereMs: 1_000,                            // `here` to clients and `.here` publishes: at most this often
-@@ -493,9 +494,14 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger,
+@@ -493,9 +495,14 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger,
      const key = `${tenant}/${board}`;
      let w = grantWatches.get(key);
      if (!w) {
@@ -43,14 +51,14 @@ index f1ee465..8888791 100644
 -      w.unsub = bus.subscribe(subjects.grants(tenant, board), () => {
 +      w.unsub = bus.subscribe(subjects.grants(tenant, board), m => {
 +        // p5-load: drop cached roles FIRST (synchronously), so the hello re-ask and the pass below read fresh.
-+        // `{ board, user }` (a share-link use) only adds access for that user: drop their cached role, nothing else
-+        // (their open sockets get the higher role on the next timed pass).
++        // `{ board, user }` (a share-link use) only RAISES that user's access: drop their cached role, nothing else
++        // (no pass, no gen bump; their open sockets get the higher role on the next timed pass). Never a revoke.
 +        if (typeof m?.user === "string") { auth.invalidate?.(board, m.user); return; }
 +        auth.invalidate?.(board);
          self.gen++;
          const b = boards.get(key);
          if (b) requestRecheck(b, "grants");
-@@ -510,6 +516,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger,
+@@ -510,6 +517,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger,
      const { key, w } = c.watch; c.watch = null;
      if (--w.refs > 0) return;
      w.unsub(); if (grantWatches.get(key) === w) grantWatches.delete(key);
@@ -58,49 +66,81 @@ index f1ee465..8888791 100644
    }
  
    // ---- re-checking live connections' roles (PROTOCOL.md § Auth, Re-checking live connections) ----
-@@ -575,10 +582,24 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger,
-       if (c.checkFails > lim.recheckRetries) { sum.retriesSpent++; return refuse(ws, "unavailable", "could not re-check your access: reconnect", 1013, "role re-check failed"); }
-       sum.kept++;
+@@ -558,6 +566,14 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger,
+     });
+     return Promise.race([Promise.resolve().then(() => auth.role(identity, board)), late]).finally(() => clearTimeout(timer));
+   }
++  /** `auth.rolesFor`, bounded the same way (p5-load): a chunk that hasn't settled in recheckLookupMs is an error for each of its identities. */
++  function rolesWithin(identities, board) {
++    let timer;
++    const late = new Promise((_, reject) => {
++      timer = setTimeout(() => { rechecks.timeouts++; reject(Object.assign(new Error(`role lookup took over ${lim.recheckLookupMs} ms`), { name: "TimeoutError", code: "timeout" })); }, lim.recheckLookupMs);
++    });
++    return Promise.race([Promise.resolve().then(() => auth.rolesFor(board, identities)), late]).finally(() => clearTimeout(timer));
++  }
+ 
+   /** Arm the board's one retry timer for the earliest due among its failing connections (none: no timer). */
+   function armRetry(b) {
+@@ -587,10 +603,11 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger,
+       const c = ws.data;
+       if (c.state !== "live") continue;
+       if (kind === "retry" && !(c.checkFails && c.retryDue <= t0)) continue;
+-      // Grouped by what `auth.role` reads (user, email for invites, domain for membership), not by user id alone.
+-      const key = `${c.user}\n${c.identity?.email ?? ""}\n${c.identity?.domain ?? ""}`;
++      // Grouped by what `auth.role` reads (user, email for invites, domain for membership), not by user id alone:
++      // tenancy.js's identityKey, the key auth.rolesFor answers by (p5-load).
++      const key = identityKey({ user: c.user, email: c.identity?.email, domain: c.identity?.domain });
+       let g = byKey.get(key);
+-      if (!g) { g = { user: c.user, identity: c.identity, conns: [], writer: false }; byKey.set(key, g); all.push(g); }
++      if (!g) { g = { key, user: c.user, identity: c.identity, conns: [], writer: false }; byKey.set(key, g); all.push(g); }
+       g.conns.push(ws);
+       if (c.role !== "viewer") g.writer = true;
+     }
+@@ -612,10 +629,24 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger,
+       c.retryDue = t + lim.recheckRetryMs * 2 ** (c.checkFails - 1);
+       rc.failing.add(ws); sum.kept++;
      };
-+    // p5-load: an Auth port with rolesFor answers a chunk of users from the board's rows read once (fresh, never the
-+    // cache). The pass then starts by dropping the board's cached roles, so it ends holding only what it read.
++    // p5-load: an Auth port with rolesFor answers a chunk of identities from the board's rows read once (fresh, never
++    // the cache), bounded like roleWithin. The pass first drops the board's cached roles (so it ends holding only what
++    // it read: a lost `grants` message is caught here) and bumps the board's hello generation (a hello still waiting
++    // may have read a cached role from before this pass, which this pass won't see: it asks again).
 +    const batched = typeof auth.rolesFor === "function";
-+    let roles = null, batchErr = null, chunkEnd = 0;
++    let roles = null, chunkErr = null, chunkEnd = 0;
 +    if (batched) {
 +      auth.invalidate?.(b.board);
-+      // A hello still waiting may have read a cached role from before this pass, and this pass won't see it (it is
-+      // not live yet): bump its generation so it asks again, now from the Registry.
 +      const w = grantWatches.get(b.key); if (w) w.gen++;
 +    }
      const one = async g => {
        let role, err = null;
 -      rechecks.roleCalls++;
--      try { role = await auth.role(g.identity, b.board); inRow = 0; } catch (e) { err = e; lastErr = e; inRow++; }
+-      try { role = await roleWithin(g.identity, b.board); } catch (e) { err = e; lastErr = e; sum.errors++; }
 +      if (batched) {
-+        if (batchErr) { err = batchErr; lastErr = batchErr; inRow++; } else { role = roles.get(g.user) ?? null; inRow = 0; }
++        if (chunkErr) { err = chunkErr; lastErr = chunkErr; sum.errors++; } else role = roles.get(g.key) ?? null;
 +      } else {
 +        rechecks.roleCalls++;
-+        try { role = await auth.role(g.identity, b.board); inRow = 0; } catch (e) { err = e; lastErr = e; inRow++; }
++        try { role = await roleWithin(g.identity, b.board); } catch (e) { err = e; lastErr = e; sum.errors++; }
 +      }
        for (const ws of g.conns) {
          const c = ws.data;
          if (c.state !== "live") continue;
-@@ -594,7 +615,14 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger,
-     while (next < users.length && !stopped) {
-       await breathe();
+@@ -634,7 +665,16 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger,
        if (boards.get(b.key) !== b) break;
+       // A `grants` ask arrived: stop here (the users not reached are unchanged) and let the grants pass run now.
+       if (rc.cut && !failClosed) { stopped = "cut"; rechecks.cut++; break; }
 -      const batch = users.slice(next, next + lim.recheckConcurrency); next += batch.length;
 +      if (batched && next >= chunkEnd) {
 +        chunkEnd = next + lim.recheckBatch;
 +        rechecks.roleCalls++;
-+        try { roles = await auth.rolesFor(b.board, users.slice(next, chunkEnd).map(g => g.identity)); batchErr = null; }
-+        catch (e) { roles = null; batchErr = e; }
++        try { roles = await rolesWithin(users.slice(next, chunkEnd).map(g => g.identity), b.board); chunkErr = null; }
++        // A failed or late chunk: its identities take the error path below; invalidate so a late answer can't write through.
++        catch (e) { roles = null; chunkErr = e; auth.invalidate?.(b.board); }
 +        if (boards.get(b.key) !== b) break;
 +      }
-+      const batch = users.slice(next, Math.min(next + lim.recheckConcurrency, batched ? chunkEnd : Infinity)); next += batch.length;   // never past the chunk read
-       await Promise.all(batch.map(one));
-       if (!failClosed && inRow >= lim.recheckStopAfterErrors) stopped = true;
-     }
++      // Never past the chunk read: an identity outside it would read as "no role" and be closed.
++      const batch = users.slice(next, Math.min(next + lim.recheckConcurrency, batched ? chunkEnd : Infinity)); next += batch.length;
+       const ok = await Promise.all(batch.map(one));
+       // The Registry looks down (every lookup in the first batch failed): a timed pass stops; the users not reached
+       // are unchanged, and the failed ones retry on their own schedule.
 diff --git a/server/main.js b/server/main.js
 index dd5bc1b..480d9ea 100644
 --- a/server/main.js
@@ -208,6 +248,29 @@ index 4b8f49e..7818ede 100644
  
      /** What the registry was opened with, read back from SQLite (for /health and tests). */
      pragmas() {
+diff --git a/test/auth/role-cache.test.js b/test/auth/role-cache.test.js
+index c972ead..0744435 100644
+--- a/test/auth/role-cache.test.js
++++ b/test/auth/role-cache.test.js
+@@ -372,7 +372,7 @@ test("rolesFor: unknown board → every user null; users deduplicated; chunks of
+ 
+ // ---- F4: share-link redemption no longer announces ----
+ 
+-test("announcingRegistry: addLinkUse announces nothing; grants, invites and links still announce { board }", async () => {
++test("announcingRegistry: addLinkUse announces { board, user } only; grants, invites and links still announce { board }", async () => {
+   const bus = memoryBus();
+   const got = [];
+   bus.subscribe(subjects.grants(acme.id, board.id), m => got.push(m));
+@@ -385,7 +385,8 @@ test("announcingRegistry: addLinkUse announces nothing; grants, invites and link
+   await a.addLinkUse(link.id, "google:gus");
+   await tenancy({ registry: a, now }).redeemLink(id("google:hal"), link.id);
+   await bus.flush();
+-  expect(got).toEqual([]);
++  expect(got).toEqual([{ board: board.id, user: "google:gus" }, { board: board.id, user: "google:hal" }]);
++  got.length = 0;
+   expect(await raw.linkUses(board.id, "google:hal")).toEqual([link.id]);
+   await a.setGrant(board.id, "google:gus", "editor");
+   await a.revokeLink(link.id);
 diff --git a/test/server/pg-registry.test.js b/test/server/pg-registry.test.js
 index 8c1dfee..1902a50 100644
 --- a/test/server/pg-registry.test.js
@@ -308,10 +371,10 @@ index 275906f..6930c74 100644
      /** The live Room for the test board (null if not open). */
 diff --git a/test/server/role-cache.test.js b/test/server/role-cache.test.js
 new file mode 100644
-index 0000000..5af4e6b
+index 0000000..b93a6c1
 --- /dev/null
 +++ b/test/server/role-cache.test.js
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,153 @@
 +// p5-load: the gateway over the role cache (server/auth/tenancy.js roleCache), as server/main.js wires it:
 +// invalidation on `grants` before the hello re-ask and the pass, `{ board, user }` scoped to one user with no pass,
 +// cached roles dropped when the board's watch is released, and the timed pass batched through auth.rolesFor.
@@ -388,26 +451,80 @@ index 0000000..5af4e6b
 +  for (const s of [0, 1, 2, 4]) expect(socks[s].closed).toBe(null);
 +  await r.stop();
 +}, 20000);
-diff --git a/test/auth/role-cache.test.js b/test/auth/role-cache.test.js
-index f4152c5..78fc3d9 100644
---- a/test/auth/role-cache.test.js
-+++ b/test/auth/role-cache.test.js
-@@ -268,7 +268,7 @@ test("rolesFor: unknown board → every user null; users deduplicated; chunks of
- 
- // ---- F4: share-link redemption no longer announces ----
- 
--test("announcingRegistry: addLinkUse announces nothing; grants, invites and links still announce { board }", async () => {
-+test("announcingRegistry: addLinkUse announces { board, user } only; grants, invites and links still announce { board }", async () => {
-   const bus = memoryBus();
-   const got = [];
-   bus.subscribe(subjects.grants(acme.id, board.id), m => got.push(m));
-@@ -281,7 +281,8 @@ test("announcingRegistry: addLinkUse announces nothing; grants, invites and link
-   await a.addLinkUse(link.id, "google:gus");
-   await tenancy({ registry: a, now }).redeemLink(id("google:hal"), link.id);
-   await bus.flush();
--  expect(got).toEqual([]);
-+  expect(got).toEqual([{ board: board.id, user: "google:gus" }, { board: board.id, user: "google:hal" }]);
-+  got.length = 0;
-   expect(await raw.linkUses(board.id, "google:hal")).toEqual([link.id]);
-   await a.setGrant(board.id, "google:gus", "editor");
-   await a.revokeLink(link.id);
++
++// ---- p5-load3: gap tests from p5-loadv / p5-load2v (GAP-M4, GAP-M6), M7, and the bounded rolesFor (finding 1) ----
++
++/** A memory Registry whose named reads can be held at a gate (the next call of that name waits until `open()`). */
++function gated() {
++  const raw = memoryRegistry();
++  const gates = {};
++  const hold = name => { let open; const p = new Promise(r => { open = r; }); let entered; const inP = new Promise(r => { entered = r; }); gates[name] = { p, open, entered, inP }; return gates[name]; };
++  const wrap = name => async (...a) => { const g = gates[name]; if (g) { delete gates[name]; g.entered(); await g.p; } return raw[name](...a); };
++  const registry = { ...raw };
++  for (const k of ["grant", "grants", "invitesFor", "linkUses", "linkUsesFor", "links", "link"]) registry[k] = wrap(k);
++  return { raw, registry, hold };
++}
++const outcome = s => Promise.race([s.next(m => m.t === "welcome").then(() => "welcome"), s.whenClosed(5000).then(c => "closed " + c.code)]);
++
++test("GAP-M4: a revoke message arriving while a timed pass runs: a NEW hello in that window is refused", async () => {
++  const g = gated();
++  const r = await rig({ cache: { ttlMs: 3_600_000 }, registry: g.registry, limits: { roleRecheckMs: 300 } });
++  const a = await join(r, "editor"); await a.next(m => m.t === "welcome");
++  const h = g.hold("grants");
++  await h.inP;                                                     // a timed pass is inside rolesFor
++  const warm = await join(r, "editor", { client: "warm" }); await warm.next(m => m.t === "welcome");   // refills the cache after the pass began
++  await r.registry.setGrant(r.ids.board, "dev:editor", null);
++  await publish(r, {});                                            // the grants pass queues behind the held one
++  const b = await join(r, "editor", { client: "window" });
++  const got = await outcome(b);
++  h.open();
++  expect(got).toBe("closed 1008");
++  await r.stop();
++}, 20000);
++
++test("GAP-M6 (LOW A): a cached user who left (others stay), revoke message lost: after one timed pass their new hello is refused", async () => {
++  const r = await rig({ cache: { ttlMs: 3_600_000 }, limits: { roleRecheckMs: 300 } });
++  const keep = await join(r, "viewer"); await keep.next(m => m.t === "welcome");
++  const x = await join(r, "editor"); await x.next(m => m.t === "welcome");
++  await x.close();
++  await until(async () => (await r.health()).body.gateway.conns === 1, "x gone");
++  await r.registry.setGrant(r.ids.board, "dev:editor", null);      // lost
++  const p0 = (await r.health()).body.gateway.rechecks.passes;
++  await until(async () => (await r.health()).body.gateway.rechecks.passes >= p0 + 1, "a pass");
++  const y = await join(r, "editor", { client: "back" });
++  expect(await outcome(y)).toBe("closed 1008");
++  await r.stop();
++}, 20000);
++
++test("M7: hellos waiting on the room when a timed pass runs (one served from the cache) ask again: a lost revoke refuses them", async () => {
++  let gatedRoom = true, openRoom;
++  const roomGate = new Promise(res => { openRoom = res; });
++  const r = await rig({ cache: { ttlMs: 3_600_000 }, limits: { roleRecheckMs: 300 },
++    wrapStore: s => ({ ...s, openEpoch: async (...a) => { if (gatedRoom) await roomGate; return s.openEpoch(...a); } }) });
++  const keep = await join(r, "viewer"); await keep.next(m => m.t === "welcome");   // keeps the board's watch (viewers open no room)
++  const a = await join(r, "editor");                               // reads its role (cached), then waits on the room
++  await until(() => r.calls.role >= 2, "a's role check");
++  const b = await join(r, "editor", { client: "b" });              // served from the cache, waits on the same room
++  await until(() => r.calls.role >= 3, "b's role check");
++  await r.registry.setGrant(r.ids.board, "dev:editor", null);      // the `grants` message is lost
++  const p0 = (await r.health()).body.gateway.rechecks.passes;
++  await until(async () => (await r.health()).body.gateway.rechecks.passes >= p0 + 1, "a timed pass (a and b are not live: it can't see them)");
++  gatedRoom = false; openRoom();
++  expect(await outcome(a)).toBe("closed 1008");
++  expect(await outcome(b)).toBe("closed 1008");
++  expect(keep.closed).toBe(null);
++  await r.stop();
++}, 20000);
++
++test("finding 1: a timed pass whose rolesFor never settles is bounded by recheckLookupMs; a revoke still closes", async () => {
++  let hang = false;
++  const r = await rig({ cache: {}, limits: { roleRecheckMs: 200, recheckLookupMs: 300 }, wrapAuth: a => ({ ...a, rolesFor: (b, ids) => (hang ? new Promise(() => {}) : a.rolesFor(b, ids)) }) });
++  const s = await join(r, "editor"); await s.next(m => m.t === "welcome");
++  hang = true; await sleep(400);                                    // a timed pass is now stuck in rolesFor
++  hang = false;
++  await r.registry.setGrant(r.ids.board, "dev:editor", null);
++  await publish(r, {});
++  expect((await s.whenClosed(4000)).code).toBe(1008);
++  expect((await r.health()).body.gateway.rechecks.timeouts).toBeGreaterThanOrEqual(1);
++  await r.stop();
++}, 20000);

@@ -242,6 +242,22 @@ export class Room {
    */
   heartbeat() { return { seq: this.resolved, epoch: this.epoch }; }
 
+  /**
+   * A read-only snapshot of where the room stands, for a host (p-audit F14: a host reads this, never the fields).
+   * inflight: entries in the append in flight (0 = none); queued: accepted, not yet handed to an append;
+   * unresolvedCount: entries accepted and not yet durable; tailChars / stateChars: the kept log's size and the
+   * state's (board + notes + records, as the checkpoint rule weighs them); held: answers waiting on unresolved entries.
+   */
+  status() {
+    let unresolvedCount = 0;
+    for (const w of this.unresolved.values()) unresolvedCount += w.n;
+    return {
+      inflight: this.inflight ? this.inflight.length : 0, queued: this.queue.length, unresolvedCount,
+      tailChars: this.tailChars, stateChars: this.chars.board + this.chars.notes + this.records.chars,
+      resolved: this.resolved, seq: this.seq, baseSeq: this.base.seq, held: this.held.length, stopped: this.stopped,
+    };
+  }
+
   /** The close notice (rule 6): the connection is gone, and so is what the room kept for it. */
   disconnect(c) { if (c) { c.closed = true; this.conns.delete(c); } }
 

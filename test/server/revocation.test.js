@@ -14,11 +14,11 @@ const hello = (r, name, extra = {}) => ({ t: "hello", v: 1, token: tokenOf(name)
 const op = (client, n, el) => ({ t: "op", id: `${client}:${n}`, sentAt: 0, stream: "board", op: { elements: [el] } });
 const grantsChanged = async r => { await r.bus.publish(subjects.grants(r.ids.tenant, r.ids.board), { board: r.ids.board }); await r.bus.flush?.(); };
 
-/** A rig whose room build waits on a gate (store.openEpoch), so a hello sits between its role check and going live. */
+/** A rig whose room build waits on a gate (store.acquire), so a hello sits between its role check and going live. */
 async function gatedRig(o = {}) {
   const gate = deferred();
   let gated = true;
-  const r = await rig({ ...o, wrapStore: s => ({ ...s, openEpoch: async (...a) => { if (gated) await gate.promise; return s.openEpoch(...a); } }) });
+  const r = await rig({ ...o, wrapStore: s => ({ ...s, acquire: async (...a) => { if (gated) await gate.promise; return s.acquire(...a); } }) });
   return { r, open: () => { gated = false; gate.resolve(); } };
 }
 

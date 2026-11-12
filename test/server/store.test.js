@@ -48,7 +48,7 @@ test("a file made before the lease (epoch-only leases table) is upgraded in plac
   old.close();
   const store = sqliteStore({ path });
   expect(await store.epoch(T, B)).toBe(5);
-  expect(await store.lease(T, B)).toEqual({ holder: null, epoch: 5, expiresAt: null, live: false });
+  expect(await store.lease(T, B)).toEqual({ holder: null, epoch: 5, expiresAt: null, live: false, remainingMs: 0 });
   expect((await store.acquire(T, B, "h-a", 1_000)).epoch).toBe(6);                // unheld: taken at once
   await store.append(T, B, [entry(1)], 0, 6);
   expect(await store.openEpoch(T, B)).toBe(7);

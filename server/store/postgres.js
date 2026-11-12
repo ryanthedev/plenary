@@ -1,11 +1,11 @@
 // The Store port on Postgres (PROTOCOL.md § Store): the durable log and checkpoints for a cluster.
 // Same contract as server/store/sqlite.js (method names, errors, the `maxBytes` / `bytes` read extension):
 //
-//   append(tenant, board, entries, expectSeq, epoch?)   atomic and conditional; a stale expectSeq throws PortError
-//                                               "conflict"; with `epoch`, one that isn't the lease's throws "fenced"
+//   append(tenant, board, entries, expectSeq, epoch)    atomic and conditional; a stale expectSeq throws PortError
+//                                               "conflict"; an `epoch` not the lease's throws "fenced"; none: "bad-entry"
 //   read(tenant, board, fromSeq, limit, maxBytes?)   entries with seq >= fromSeq, ascending, at most `limit`
 //   lastSeq(tenant, board)                      the board's last seq (0 = empty)
-//   putCheckpoint(tenant, board, cp, epoch?)    kept by cp.seq; the newest few per board are kept; fenced like append
+//   putCheckpoint(tenant, board, cp, epoch)     kept by cp.seq; the newest few per board are kept; fenced like append
 //   getCheckpoint(tenant, board, beforeSeq?)    the highest seq (below beforeSeq, if given), never the last write
 //   openEpoch(tenant, board), epoch(tenant, board)   the board's epoch in its lease record (pl_leases)
 //   acquire / renew / release / lease           the board's lease (holder, epoch, expires_at), as in sqlite.js
@@ -19,7 +19,8 @@
 // Bounded waits (p4-store-leasev M1): every write transaction runs with idle_in_transaction_session_timeout
 // (`txIdleTimeoutMs`), so a holder paused mid-write is cut off by the server and its FOR SHARE lock released; lease
 // calls run with lock_timeout (`leaseLockTimeoutMs`, and at most half the ttl), and a lock wait past it is PortError
-// "unavailable": try again.
+// "unavailable": try again. A write the server cut off (SQLSTATE 25P03) is PortError "unavailable" too: none of it
+// committed.
 //
 // The epoch fence: a fenced append or checkpoint reads the lease row FOR SHARE in its own transaction. A takeover's
 // acquire (an UPDATE of that row) waits for every such write in flight to commit, and a write that starts after it
@@ -73,8 +74,8 @@ const LEASE_COLUMNS = Object.freeze({ holder: "TEXT", expires_at: "BIGINT" });
  */
 export const LEASE_UPGRADE_SQL = schema =>
   `ALTER TABLE "${needSchema(schema)}".pl_leases ADD COLUMN IF NOT EXISTS holder TEXT, ADD COLUMN IF NOT EXISTS expires_at BIGINT;`;
-/** SQLSTATEs: insufficient_privilege; lock_not_available (lock_timeout fired). */
-const DENIED = "42501", LOCK_TIMEOUT = "55P03";
+/** SQLSTATEs: insufficient_privilege; lock_not_available (lock_timeout fired); idle_in_transaction_session_timeout. */
+const DENIED = "42501", LOCK_TIMEOUT = "55P03", IDLE_CUT = "25P03";
 /** What the Store's statements need on each table (L3: probed at start-up, so a misgrant fails at open). */
 const NEEDS = Object.freeze({
   pl_entries: ["SELECT", "INSERT"],
@@ -156,17 +157,21 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
       });
     } catch (err) {
       if (lockMs && err?.errno === LOCK_TIMEOUT) throw new PortError("unavailable", "the lease row is locked by another session: try again");
+      // R2-L2: the server ended this transaction because its client went quiet mid-write (a pause, a partition).
+      // Nothing of it committed; like any Store failure the caller retries or rebuilds. Never "fenced".
+      if (err?.errno === IDLE_CUT) throw Object.assign(new PortError("unavailable", "the database ended this write: its client paused mid-transaction"), { cause: err });
       throw err;
     }
   };
   /** A lease call's lock bound: leaseLockTimeoutMs, and at most half its ttl. */
   const leaseLock = ttlMs => Math.min(leaseLockTimeoutMs, ttlMs === undefined ? leaseLockTimeoutMs : ttlMs / 2);
   const needEpoch = epoch => { if (epoch !== undefined && !posInt(epoch)) throw new PortError("bad-entry", "epoch must be a positive integer"); };
+  /** Every write is fenced (p4-host, L5): append and putCheckpoint without the writer's lease epoch are refused. */
+  const needWriteEpoch = epoch => { if (!posInt(epoch)) throw new PortError("bad-entry", "a write needs the board's lease epoch (a positive integer)"); };
   const needTtl = ttlMs => { if (!posInt(ttlMs) || ttlMs > MAX_TTL) throw new PortError("bad-entry", `ttlMs must be a positive integer up to ${MAX_TTL}`); };
   const granted = rows => rows.length ? { epoch: Number(rows[0].epoch), expiresAt: Number(rows[0].expires_at) } : null;
   /** The epoch fence, inside a write transaction: FOR SHARE holds off a takeover until this transaction ends. */
   const fence = async (tx, tenant, board, epoch) => {
-    if (epoch === undefined) return;   // SEAM(p4): unfenced until room-host passes its lease epoch
     const rows = await tx.unsafe(`SELECT epoch FROM ${L} WHERE tenant = $1 AND board = $2 FOR SHARE`, [tenant, board]);
     const cur = rows.length ? Number(rows[0].epoch) : 0;
     if (cur !== epoch) throw new PortError("fenced", `the board's lease is at epoch ${cur}, not ${epoch}`);
@@ -176,11 +181,11 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
 
   return {
     /**
-     * Writes every entry or none, only if the board's last seq is `expectSeq` and, when `epoch` is given, only if it
-     * is the board's lease epoch (else PortError "fenced"). Resolves once durable.
+     * Writes every entry or none, only if the board's last seq is `expectSeq` and only if `epoch` is
+     * the board's lease epoch (else PortError "fenced"; no epoch at all is "bad-entry": every write is fenced). Resolves once durable.
      */
     async append(tenant, board, entries, expectSeq, epoch) {
-      ready(tenant, board); needEpoch(epoch);
+      ready(tenant, board); needWriteEpoch(epoch);
       if (!Number.isSafeInteger(expectSeq) || expectSeq < 0) throw new PortError("bad-entry", "expectSeq must be a non-negative integer");
       if (!Array.isArray(entries) || !entries.length) throw new PortError("bad-entry", "append needs at least one entry");
       // Everything is checked and serialised before the transaction starts: a bad entry writes nothing.
@@ -247,7 +252,7 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
      * `keepCheckpoints` per board are pruned in the same transaction. An older one never hides a newer one.
      */
     async putCheckpoint(tenant, board, cp, epoch) {
-      ready(tenant, board); needEpoch(epoch);
+      ready(tenant, board); needWriteEpoch(epoch);
       if (!cp || typeof cp !== "object" || !Number.isSafeInteger(cp.seq) || cp.seq < 0) throw new PortError("bad-entry", "a checkpoint needs a seq");
       const data = JSON.stringify(cp);
       await write(async tx => {
@@ -317,14 +322,19 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
         WHERE tenant = $1 AND board = $2 AND holder = $3 AND epoch = $4`, [tenant, board, holder, epoch]), leaseLock());
     },
 
-    /** The lease record, judged on the database's clock: `live` = held and not expired. null = no room ever built. */
+    /**
+     * The lease record, judged on the database's clock: `live` = held and not expired; `remainingMs` = expires_at −
+     * the database's now (0 unless live), computed in the same statement, so a caller never compares clocks.
+     * null = no room ever built.
+     */
     async lease(tenant, board) {
       ready(tenant, board);
-      const rows = await db.unsafe(`SELECT holder, epoch, expires_at, (holder IS NOT NULL AND expires_at > ${DB_NOW}) AS live
-        FROM ${L} WHERE tenant = $1 AND board = $2`, [tenant, board]);
+      const rows = await db.unsafe(`SELECT holder, epoch, expires_at, n.now, (holder IS NOT NULL AND expires_at > n.now) AS live
+        FROM ${L}, (SELECT ${DB_NOW} AS now) n WHERE tenant = $1 AND board = $2`, [tenant, board]);
       if (!rows.length) return null;
-      const r = rows[0];
-      return { holder: r.holder, epoch: Number(r.epoch), expiresAt: r.expires_at === null ? null : Number(r.expires_at), live: r.live === true };
+      const r = rows[0], live = r.live === true;
+      return { holder: r.holder, epoch: Number(r.epoch), expiresAt: r.expires_at === null ? null : Number(r.expires_at), live,
+        remainingMs: live ? Number(r.expires_at) - Number(r.now) : 0 };
     },
 
     /** What a write transaction runs with, read back from Postgres (for /health and tests). */

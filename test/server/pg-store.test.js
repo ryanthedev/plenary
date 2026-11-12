@@ -5,7 +5,7 @@
 import { describe, test, expect, afterAll } from "bun:test";
 import { SQL } from "bun";
 import { postgresStore, LEASE_UPGRADE_SQL } from "../../server/store/postgres.js";
-import { storeContract, entry, code } from "./store-contract.js";
+import { storeContract, entry, code, own } from "./store-contract.js";
 
 const url = process.env.DATABASE_URL;
 const T = "t-aaa", B = "b-one";
@@ -36,11 +36,12 @@ describe.skipIf(!url)("postgres store", () => {
     const store = await postgresStore({ url, schema, max: 2 });           // its own pool: a different connection for sure
     const other = await client().reserve();
     try {
-      await store.append(T, B, [entry(1)], 0);
+      const e = await own(store);
+      await store.append(T, B, [entry(1)], 0, e);
       await other.unsafe("BEGIN");
       await other.unsafe(`INSERT INTO "${schema}".pl_entries (tenant, board, seq, data) VALUES ($1, $2, 2, $3)`, [T, B, JSON.stringify(entry(2, { by: "other" }))]);
       let settled = false;
-      const p = code(store.append(T, B, [entry(2)], 1)).finally(() => { settled = true; });
+      const p = code(store.append(T, B, [entry(2)], 1, e)).finally(() => { settled = true; });
       await Bun.sleep(200);
       expect(settled).toBe(false);                                // blocked on the unique key, not decided yet
       await other.unsafe("COMMIT");
@@ -58,10 +59,11 @@ describe.skipIf(!url)("postgres store", () => {
     const store = await postgresStore({ url, schema, max: 2 });
     const other = await client().reserve();
     try {
-      await store.append(T, B, [entry(1)], 0);
+      const e = await own(store);
+      await store.append(T, B, [entry(1)], 0, e);
       await other.unsafe("BEGIN");
       await other.unsafe(`INSERT INTO "${schema}".pl_entries (tenant, board, seq, data) VALUES ($1, $2, 2, 'x')`, [T, B]);
-      const p = code(store.append(T, B, [entry(2)], 1));
+      const p = code(store.append(T, B, [entry(2)], 1, e));
       await Bun.sleep(100);
       await other.unsafe("ROLLBACK");
       expect(await p).toBe("resolved");
@@ -119,7 +121,7 @@ describe.skipIf(!url)("postgres store", () => {
       const [{ t1 }] = await client().unsafe("SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint AS t1");
       expect(got.expiresAt).toBeGreaterThanOrEqual(Number(t0) + 5_000);
       expect(got.expiresAt).toBeLessThanOrEqual(Number(t1) + 5_000);
-      expect(await store.lease(T, B)).toEqual({ holder: "h-a", epoch: 1, expiresAt: got.expiresAt, live: true });
+      expect(await store.lease(T, B)).toEqual({ holder: "h-a", epoch: 1, expiresAt: got.expiresAt, live: true, remainingMs: expect.any(Number) });
     } finally { await store.close(); await drop(schema); }
   });
 
@@ -138,7 +140,7 @@ describe.skipIf(!url)("postgres store", () => {
       await client().unsafe(LEASE_UPGRADE_SQL(schema));                            // the operator's step, as the owner
       await client().unsafe(LEASE_UPGRADE_SQL(schema));                            // idempotent
       const store = await postgresStore({ sql: client(), schema });
-      expect(await store.lease(T, B)).toEqual({ holder: null, epoch: 5, expiresAt: null, live: false });
+      expect(await store.lease(T, B)).toEqual({ holder: null, epoch: 5, expiresAt: null, live: false, remainingMs: 0 });
       expect((await store.acquire(T, B, "h-a", 60_000)).epoch).toBe(6);
       await store.append(T, B, [entry(1)], 0, 6);
       await store.close();
@@ -250,6 +252,25 @@ describe.skipIf(!url)("postgres store", () => {
     } finally { stalled.release(); await store.close(); await drop(schema); }
   });
 
+  test("R2-L1: a lease call's lock wait is capped at half its ttl, even when leaseLockTimeoutMs is longer", async () => {
+    const schema = schemaName();
+    const store = await postgresStore({ url, schema, max: 2, leaseLockTimeoutMs: 5_000 });
+    const stalled = await client().reserve();
+    try {
+      await store.acquire(T, B, "h-a", 60_000);
+      await stalled.unsafe("BEGIN");
+      await stalled.unsafe(`SELECT epoch FROM "${schema}".pl_leases WHERE tenant = $1 AND board = $2 FOR SHARE`, [T, B]);
+      for (const call of [() => store.renew(T, B, "h-a", 1, 400), () => store.acquire(T, B, "h-b", 400)]) {
+        const t0 = performance.now();
+        const got = await Promise.race([code(call()), Bun.sleep(3_000).then(() => "still waiting")]);
+        const took = performance.now() - t0;
+        expect(got).toBe("unavailable");
+        expect(took).toBeGreaterThanOrEqual(150);                  // it did wait on the lock (ttl/2 = 200 ms) ...
+        expect(took).toBeLessThan(400);                            // ... and never past its own ttl (not 5 s)
+      }
+    } finally { await stalled.unsafe("ROLLBACK").catch(() => {}); stalled.release(); await store.close(); await drop(schema); }
+  });
+
   test("M1: a holder paused mid-write is cut off by the server (idle_in_transaction_session_timeout), so the takeover goes through", async () => {
     const schema = schemaName();
     const own = new SQL({ url, max: 2 });
@@ -273,7 +294,7 @@ describe.skipIf(!url)("postgres store", () => {
       expect(took?.epoch).toBe(epoch + 1);
       expect(performance.now() - t0).toBeLessThan(2_000);
       resume();
-      expect(await p).not.toBe("resolved");                         // the paused write never lands
+      expect(await p).toBe("unavailable");                          // never lands; R2-L2: a PortError, not a raw PostgresError (25P03)
       expect(await other.lastSeq(T, B)).toBe(0);
     } finally { resume(); await holder.close(); await other.close(); await own.close().catch(() => {}); await drop(schema); }
   });
@@ -307,8 +328,9 @@ describe.skipIf(!url)("postgres store", () => {
       const opened = await Promise.allSettled(Array.from({ length: 10 }, () => postgresStore({ url, schema, max: 2 })));   // concurrent schema creation too
       stores = opened.filter(x => x.status === "fulfilled").map(x => x.value);
       expect(opened.filter(x => x.status === "rejected").map(x => String(x.reason))).toEqual([]);
+      const e = await own(stores[0]);   // one epoch for all: this race is the conditional append's (the fence's is in the contract)
       for (let at = 0; at < 10; at++) {
-        const res = await Promise.all(stores.map((s, i) => code(s.append(T, B, [entry(at + 1, { by: `h${i}` })], at))));
+        const res = await Promise.all(stores.map((s, i) => code(s.append(T, B, [entry(at + 1, { by: `h${i}` })], at, e))));
         expect(res.filter(r => r === "resolved").length).toBe(1);
         expect(res.filter(r => r === "conflict").length).toBe(9);
       }
@@ -344,14 +366,14 @@ describe.skipIf(!url)("postgres store", () => {
     const app = new SQL({ url: u.toString(), max: 2 });
     try {
       const store = await postgresStore({ sql: app, schema });                   // starts: every table exists, no CREATE runs
-      await store.append(T, B, [entry(1)], 0);
-      expect((await store.read(T, B, 1, 10)).map(e => e.seq)).toEqual([1]);
       expect(await store.openEpoch(T, B)).toBe(1);
       const l = await store.acquire(T, B, "h-a", 60_000);                         // lease writes and FOR SHARE need only row grants
+      await store.append(T, B, [entry(1)], 0, l.epoch);
+      expect((await store.read(T, B, 1, 10)).map(e => e.seq)).toEqual([1]);
       await store.append(T, B, [entry(2)], 1, l.epoch);
       await store.renew(T, B, "h-a", l.epoch, 60_000);
+      await store.putCheckpoint(T, B, { seq: 1, id: "c:1", by: "u1", at: 1 }, l.epoch);
       await store.release(T, B, "h-a", l.epoch);
-      await store.putCheckpoint(T, B, { seq: 1, id: "c:1", by: "u1", at: 1 });
       expect((await store.getCheckpoint(T, B))?.seq).toBe(1);
       await store.close();
       // The same role on a schema nobody migrated: refused (it may not CREATE), so the test above proves least privilege.

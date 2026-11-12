@@ -3,6 +3,9 @@
 //
 // Contract every adapter keeps: exact subjects, at-most-once, ordered per subject, asynchronous delivery, and a
 // publish over MAX_BUS_BYTES is refused (the returned promise rejects with PortError "too-large"; nothing is sent).
+// Every adapter also has `flush()` (resolves once what was published so far has left this process: memory hands it
+// to subscribers, NATS does its round trip, an adapter with nothing to wait for resolves at once) and `maxBytes`
+// (its message cap). Core code calls flush() unconditionally (p-audit F15).
 
 import { needId } from "../ids.js";
 

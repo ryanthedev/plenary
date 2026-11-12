@@ -150,6 +150,24 @@ test("main.js started twice on one data dir: the same board, its acked ops, and 
   } finally { a.p.child.kill("SIGKILL"); b?.p.child.kill("SIGKILL"); }
 }, 30000);
 
+// A kill -9 leaves the dead process's room lease live for up to its ttl (room-host leaseTtlMs, 10 s by default): a
+// writer's hello in that window is answered `unavailable` (1013) or times out at the gateway, and the client retries,
+// as a real client does. Anything else is a failure, and so is no welcome within the ttl + 3 s.
+const LEASE_TTL_MS = 10_000;
+async function welcomedAfterRestart(port, board, name) {
+  const end = Date.now() + LEASE_TTL_MS + 3_000;
+  for (;;) {
+    const s = await connect(port, board, name);
+    const got = await until(() => s.msgs.find(m => m.t === "welcome") ?? (s.closed ? "closed" : null), "a welcome or a close", Math.max(1, end - Date.now())).catch(() => "timeout");
+    if (got !== "closed" && got !== "timeout") return s;
+    if (got === "closed") {
+      expect(s.closed.code).toBe(1013);
+      expect(s.msgs.filter(m => m.t === "error").map(m => m.code)).toEqual(["unavailable"]);
+    } else s.close();
+    if (Date.now() >= end) throw new Error(`no welcome within the lease ttl + 3 s (${LEASE_TTL_MS + 3_000} ms)`);
+  }
+}
+
 test("kill -9 mid-stream, restart: every acked op is present, at its seq, once; resends land once", async () => {
   const dir = tempDir();
   let cur = await boot(dir, { ann: "owner" });
@@ -166,8 +184,9 @@ test("kill -9 mid-stream, restart: every acked op is present, at its seq, once; 
   const op = n => ({ t: "op", id: `ann:${n}`, sentAt: 0, stream: "board", op: { elements: [{ id: "tick", type: "rectangle", version: n, versionNonce: n, x: n % 1000, y: 0, width: 1, height: 1, isDeleted: false }] } });
   try {
     for (let round = 0; round < 3; round++) {
-      const s = await connect(cur.port, board, "ann");
-      await s.next(m => m.t === "welcome");
+      // Round 0 is a fresh boot: a plain welcome. Only after a kill does the client retry (L8).
+      const s = round === 0 ? await connect(cur.port, board, "ann") : await welcomedAfterRestart(cur.port, board, "ann");
+      if (round === 0) await s.next(m => m.t === "welcome");
       const record = () => { for (const m of s.msgs) if (m.t === "ack") { if (acked.has(m.id)) expect([m.id, m.seq]).toEqual([m.id, acked.get(m.id)]); acked.set(m.id, m.seq); } };
       for (const m of resends()) s.send(m);
       const pump = setInterval(() => { record(); for (let k = 0; k < 5 && unacked().length < MAX_UNACKED; k++) { const m = op(++counter); sent.push(m); try { s.send(m); } catch { /* socket died with the server */ } } }, 5);
@@ -182,8 +201,7 @@ test("kill -9 mid-stream, restart: every acked op is present, at its seq, once; 
     }
     // After the last restart: resend once more (every unacked op and the sample), then read the whole board back.
     // ann:1 is far below the window: it is answered `stale` (not logged now), never acked with a guess or logged twice.
-    const s = await connect(cur.port, board, "ann");
-    await s.next(m => m.t === "welcome");
+    const s = await welcomedAfterRestart(cur.port, board, "ann");
     const last = resends();
     expect(last.some(m => acked.has(m.id))).toBe(true);
     for (const m of [sent[0], ...last]) s.send(m);
@@ -205,7 +223,7 @@ test("kill -9 mid-stream, restart: every acked op is present, at its seq, once; 
     expect(acked.size).toBeGreaterThanOrEqual(450);                                       // true by construction (150 a round)
     for (const [id, at] of acked) expect([id, seqOf.get(id)]).toEqual([id, at]);          // every acked op, at its acked seq
   } finally { cur.p.child.kill("SIGKILL"); }
-}, 90000);
+}, 150000);   // up to three lease waits (ttl + 3 s each) on top of the run
 
 test("main.js: PLENARY_MAX_CONNS_PER_USER sets the per-user connection cap", async () => {
   const p = spawn({ PLENARY_DATA_DIR: tempDir(), PLENARY_DEV_TOKENS: devTokens({ ann: "editor" }), PLENARY_MAX_CONNS_PER_USER: "2" });

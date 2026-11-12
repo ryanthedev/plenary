@@ -72,7 +72,7 @@ test("the order is verify, then board, then role, then the room; the room gets {
   const r = await rig({
     wrapAuth: a => ({ verify: async t => { order.push("verify"); const v = await a.verify(t); order.push("verified"); return v; }, role: async (i, b) => { order.push("role"); const v = await a.role(i, b); order.push("role known"); return v; } }),
     wrapRegistry: g => ({ ...g, board: async id => { order.push("board"); const v = await g.board(id); order.push("board known"); return v; } }),
-    wrapStore: s => ({ ...s, openEpoch: async (...a) => { order.push("room opens"); return s.openEpoch(...a); } }),
+    wrapStore: s => ({ ...s, acquire: async (...a) => { order.push("room opens"); return s.acquire(...a); } }),
   });
   const s = await r.sock();
   s.send(hello(r, "editor", { extra: `${SECRET}-smuggled` }));
@@ -263,7 +263,7 @@ test("rule 1: nothing is acked or broadcast before the append resolves", async (
 });
 
 test("the entries subject carries each entry once, after it is durable", async () => {
-  const r = await rig();
+  const r = await rig({ host: { heartbeatMs: 50 } });   // a quick heartbeat, so a later beat comes within the test
   const { subjects } = await import("../../server/bus/memory.js");
   const seen = [], beats = [];
   r.bus.subscribe(subjects.entries(r.ids.tenant, r.ids.board), async m => { if (!m.items) return beats.push(m); seen.push({ ...m, durableThen: await r.rawStore.lastSeq(r.ids.tenant, r.ids.board) }); });
@@ -275,7 +275,10 @@ test("the entries subject carries each entry once, after it is durable", async (
   expect(seen.every(m => m.items.length === m.to - m.from + 1 && m.durableThen >= m.to)).toBe(true);
   expect(JSON.parse(seen[0].items[0])).toMatchObject({ seq: 1, tenant: r.ids.tenant, board: r.ids.board, id: expect.stringMatching(/:1$/) });
   // The room's heartbeat names its epoch (§ Bus); it is published as soon as the room is built.
-  expect(beats[0]).toEqual({ seq: 0, epoch: 1 });
+  // The first one, of a newly built room only, says `opened` (a host waiting on the lease answers the hellos it held).
+  expect(beats[0]).toEqual({ seq: 0, epoch: 1, opened: true });
+  await until(() => beats.length >= 2, "a later heartbeat", 2_000);
+  expect(beats.at(-1)).toEqual({ seq: 3, epoch: 1 });                     // later beats: no `opened`
   await r.stop();
 });
 
@@ -283,18 +286,18 @@ for (const mode of ["rejects", "conflicts", "times out", "times out and then lan
   let fail = false, late = null; const never = deferred(), landNow = deferred();
   const r = await rig({
     host: mode.startsWith("times out") ? { appendTimeoutMs: 400 } : {},
-    wrapStore: s => ({ ...s, append: async (tenant, board, entries, expectSeq) => {
-      if (!fail) return s.append(tenant, board, entries, expectSeq);
+    wrapStore: s => ({ ...s, append: async (tenant, board, entries, expectSeq, ...rest) => {
+      if (!fail) return s.append(tenant, board, entries, expectSeq, ...rest);
       if (mode === "rejects") throw new Error("disk full");
       if (mode === "times out") return never.promise;
       if (mode === "times out and then lands late") {
         // The write the room gave up on is still on its way to the disk; the test decides when it arrives.
-        late = landNow.promise.then(() => s.append(tenant, board, entries, expectSeq)).then(() => "landed", e => e.code);
+        late = landNow.promise.then(() => s.append(tenant, board, entries, expectSeq, ...rest)).then(() => "landed", e => e.code);
         return never.promise;
       }
       // Another host got there first: the real store says conflict.
-      await s.append(tenant, board, [{ ...entries[0], id: "usurper:1", by: "dev:other", op: { elements: [rect("theirs")] } }], expectSeq);
-      return s.append(tenant, board, entries, expectSeq);
+      await s.append(tenant, board, [{ ...entries[0], id: "usurper:1", by: "dev:other", op: { elements: [rect("theirs")] } }], expectSeq, ...rest);
+      return s.append(tenant, board, entries, expectSeq, ...rest);
     } }),
   });
   const a = await r.sock(), b = await r.sock();
@@ -332,7 +335,7 @@ for (const mode of ["rejects", "conflicts", "times out", "times out and then lan
   if (late) {
     // The late write now reaches a Store that has moved on: it is fenced off, and the op is still there once.
     landNow.resolve();
-    expect(await late).toBe("conflict");
+    expect(await late).toBe("fenced");
     expect((await r.rawStore.read(r.ids.tenant, r.ids.board, 1, 100)).map(e => e.id)).toEqual(["a:1", "a:2"]);
     c.send({ t: "op", id: "a:4", sentAt: 0, stream: "board", op: { elements: [rect("after")] } });   // and the room is fine
     expect(await c.next(m => m.t === "ack" && m.id === "a:4")).toEqual({ t: "ack", id: "a:4", seq: 3 });

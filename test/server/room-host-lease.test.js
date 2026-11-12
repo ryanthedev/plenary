@@ -1,0 +1,513 @@
+// The room host on the Store lease (p4-host): one path for a single node and a cluster. acquire/renew/release, the
+// holder-only inbox, the takeover, the dead-holder window, the host deadline and the clean release.
+// Postgres cases run when DATABASE_URL is set; the rest use SQLite files.
+import { test, expect, afterAll, describe } from "bun:test";
+import { join } from "node:path";
+import { SQL } from "bun";
+import { roomHost, newHolder } from "../../server/room-host.js";
+import { sqliteStore } from "../../server/store/sqlite.js";
+import { postgresStore } from "../../server/store/postgres.js";
+import { memoryBus, subjects } from "../../server/bus/memory.js";
+import { PROTOCOL_VERSION } from "../../packages/protocol/envelope.js";
+import { makeElement } from "../../packages/core/model.js";
+import { rig, tokenOf } from "./rig.js";
+import { cleanup, tempDir, sleep, until } from "./helpers.js";
+import { code } from "./store-contract.js";
+
+afterAll(cleanup);
+
+const T = "t-aaa", B = "b-one";
+const rect = (id, x = 0) => makeElement("rectangle", { id, x, y: 0, width: 10, height: 10 });
+const never = () => new Promise(() => {});
+
+/** A gateway as the room host sees it over the bus: inbox messages out, `{ conn, data, close }` replies in. */
+function fakeGateway(bus, id = "g-1") {
+  const got = [], n = new Map();
+  bus.subscribe(subjects.gateway(id), m => got.push({ conn: m.conn, close: m.close, msg: m.data ? JSON.parse(m.data) : null }));
+  const send = (conn, client, msg) => { const k = (n.get(conn) ?? 0) + 1; n.set(conn, k); return bus.publish(subjects.inbox(T, B), { n: k, conn, gateway: id, user: "dev:ed", name: "ed", role: "editor", client, msg }); };
+  return {
+    got,
+    of: conn => got.filter(m => m.conn === conn),
+    hello: (conn, client) => send(conn, client, { t: "hello", v: PROTOCOL_VERSION, board: B, client }),
+    op: (conn, client, k) => send(conn, client, { t: "op", id: `${client}:${k}`, sentAt: 0, stream: "board", op: { elements: [rect(`e${k}`, k)] } }),
+    welcome: conn => until(() => got.find(m => m.conn === conn && m.msg?.t === "welcome")?.msg, `${conn}'s welcome`, 5000),
+    answer: (conn, ms) => until(() => got.find(m => m.conn === conn && (m.msg?.t === "welcome" || m.close))?.msg, `${conn}'s answer`, ms),
+    ack: (conn, id) => until(() => got.find(m => m.conn === conn && m.msg?.t === "ack" && m.msg.id === id)?.msg, `ack ${id}`, 5000),
+  };
+}
+
+/** A store whose lease and writes a test can stall: renew "ok" | "hang" | "null"; append "ok" | "hold" (kept in `held`). */
+function stallable(store) {
+  const s = { renew: "ok", append: "ok", held: [], renews: 0 };
+  s.store = {
+    ...store,
+    renew: (...a) => { s.renews++; return s.renew === "hang" ? never() : s.renew === "null" ? Promise.resolve(null) : store.renew(...a); },
+    append: (...a) => { if (s.append !== "hold") return store.append(...a); s.held.push(a); return never(); },
+  };
+  return s;
+}
+
+const sqliteMaker = () => {
+  const path = join(tempDir(), "plenary.db");
+  return { open: async () => sqliteStore({ path }), drop: async () => {} };
+};
+const pgUrl = process.env.DATABASE_URL;
+let pgN = 0;
+const pgMaker = () => {
+  const schema = `pl_test_host_${process.pid}_${Date.now().toString(36)}_${++pgN}`;
+  return { open: () => postgresStore({ url: pgUrl, schema, max: 2 }), drop: async () => { const a = new SQL({ url: pgUrl, max: 1 }); await a.unsafe(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); await a.close(); } };
+};
+
+test("holder ids: unique per instance, an id the Store accepts, overridable", () => {
+  const a = newHolder("Ryans-MacBook.local"), b = newHolder("Ryans-MacBook.local");
+  expect(a).not.toBe(b);
+  for (const h of [a, newHolder(""), newHolder(undefined), newHolder("x".repeat(200) + "!!")]) expect(h).toMatch(/^[a-z0-9][a-z0-9-]{0,63}$/);
+  expect(a.startsWith(`ryans-macbook-local-${process.pid}-`)).toBe(true);
+  const bus = memoryBus();
+  const h1 = roomHost({ store: {}, bus }), h2 = roomHost({ store: {}, bus }), h3 = roomHost({ store: {}, bus, holder: "h-test" });
+  expect(h1.holder).not.toBe(h2.holder);
+  expect(h3.holder).toBe("h-test");
+  for (const h of [h1, h2, h3]) h.close();
+});
+
+test("two room hosts on one Store and one bus, writers on both gateways: one welcome per hello, no duplicate acks, one sequencer", async () => {
+  // The p-audit F5 repro. heartbeatMs 100: the waiting host's silence rule (2 heartbeats) is exercised for ~1.5 s.
+  const a = await rig({ host: { heartbeatMs: 100 } });
+  const b = await rig({ dir: a.dir, registry: a.registry, ids: a.ids, wrapBus: () => a.bus, host: { heartbeatMs: 100 } });
+  try {
+    const socks = [];
+    for (let i = 0; i < 4; i++) {
+      const r = i % 2 ? b : a, s = await r.sock();
+      s.send({ t: "hello", v: 1, token: tokenOf("editor" + i), board: a.ids.board, since: 0, client: "w" + i });
+      await s.next(m => m.t === "welcome", "welcome", 5000);
+      socks.push(s);
+    }
+    for (let k = 1; k <= 15; k++) {
+      for (const [i, s] of socks.entries()) s.send({ t: "op", id: `w${i}:${k}`, sentAt: 0, stream: "board", op: { elements: [rect(`w${i}-${k}`, k)] } });
+      await sleep(100);
+    }
+    for (const [i, s] of socks.entries()) await s.next(m => m.t === "ack" && m.id === `w${i}:15`, "last ack", 5000);
+    await sleep(300);
+    for (const [i, s] of socks.entries()) {
+      expect(s.msgs.filter(m => m.t === "welcome").length).toBe(1);
+      const acks = s.msgs.filter(m => m.t === "ack").map(m => m.id);
+      expect(acks).toEqual(Array.from({ length: 15 }, (_, k) => `w${i}:${k + 1}`));   // each once, in order
+      expect(s.msgs.filter(m => m.t === "error")).toEqual([]);
+      expect(s.closed).toBe(null);
+    }
+    // One sequencer: one host built the room; the other waits on the lease (and never served the inbox).
+    const rooms = [a, b].map(r => r.server.rooms.stats());
+    expect(rooms.map(x => x.rooms).sort()).toEqual([0, 1]);
+    expect(rooms.map(x => x.waiting).sort()).toEqual([0, 1]);
+    for (const r of [a, b]) expect(r.logs().filter(l => /room stopped/.test(l.msg))).toEqual([]);
+    const log = await a.rawStore.read(a.ids.tenant, a.ids.board, 1, 1000);
+    expect(log.map(e => e.seq)).toEqual(Array.from({ length: 60 }, (_, i) => i + 1));
+    expect(new Set(log.map(e => e.id)).size).toBe(60);
+  } finally { await b.stop(); await a.stop(); }
+}, 20000);
+
+for (const [name, maker] of [["sqlite", sqliteMaker], ["postgres", pgMaker]]) describe.skipIf(name === "postgres" && !pgUrl)(`takeover (${name})`, () => {
+  test("holder A stops renewing (no release); B takes over after expiry; A's late append is fenced; every op A acked is in the log", async () => {
+    const m = maker(), raw = await m.open(), rawB = await m.open(), bus = memoryBus();
+    const sa = stallable(raw);
+    const A = roomHost({ store: sa.store, bus, holder: "h-a", leaseTtlMs: 600, heartbeatMs: 100, appendTimeoutMs: 300 });
+    const Bh = roomHost({ store: rawB, bus, holder: "h-b", leaseTtlMs: 600, heartbeatMs: 100 });
+    try {
+      await A.open(T, B);
+      const eA = (await A.peek(T, B)).epoch;
+      await Bh.open(T, B);                                                   // held live by A: no room here
+      expect(await Bh.peek(T, B)).toBe(null);
+      expect(Bh.stats()).toEqual({ rooms: 0, waiting: 1 });
+      const g = fakeGateway(bus);
+      g.hello("c1", "a");
+      expect(await g.welcome("c1")).toMatchObject({ seq: 0, room: { epoch: eA } });
+      for (let k = 1; k <= 3; k++) { g.op("c1", "a", k); await g.ack("c1", `a:${k}`); }
+      // A stalls: its renews hang and its next append is held (past the 4 s-style timeout, here 300 ms).
+      sa.renew = "hang"; sa.append = "hold";
+      g.op("c1", "a", 4);
+      await until(() => g.of("c1").some(x => x.close === 1013), "c1 told unavailable", 3000);
+      await until(async () => (await Bh.peek(T, B)) !== null, "B's takeover", 5000);
+      const eB = (await Bh.peek(T, B)).epoch;
+      expect(eB).toBeGreaterThan(eA);
+      expect(await A.peek(T, B)).toBe(null);                                 // A stopped its room
+      // A's write lands only now, after B acquired: fenced, and nothing of it is in the log.
+      expect(sa.held.length).toBe(1);
+      expect(await code(raw.append(...sa.held[0]))).toBe("fenced");
+      const acked = g.got.filter(x => x.msg?.t === "ack").map(x => x.msg.id);
+      expect(acked).toEqual(["a:1", "a:2", "a:3"]);
+      expect((await rawB.read(T, B, 1, 100)).map(e => e.id)).toEqual(acked);
+      // The client reconnects: B welcomes it with every acked op, and sequences on.
+      g.hello("c2", "a");
+      expect(await g.welcome("c2")).toMatchObject({ seq: 3, room: { epoch: eB } });
+      g.op("c2", "a", 4);
+      expect(await g.ack("c2", "a:4")).toEqual({ t: "ack", id: "a:4", seq: 4 });
+      expect(g.got.filter(x => x.msg?.t === "welcome").length).toBe(2);     // one per hello, never one from each host
+    } finally { await A.close(); await Bh.close(); await raw.close(); await rawB.close(); await bus.close(); await m.drop(); }
+  }, 20000);
+
+  test("clean restart: close checkpoints, settles its writes, releases; a new host opens the board with no wait", async () => {
+    const m = maker(), raw = await m.open(), bus = memoryBus();
+    const A = roomHost({ store: raw, bus, holder: "h-a", leaseTtlMs: 30_000 });
+    try {
+      await A.open(T, B);
+      const g = fakeGateway(bus);
+      g.hello("c1", "a"); await g.welcome("c1");
+      for (let k = 1; k <= 3; k++) { g.op("c1", "a", k); await g.ack("c1", `a:${k}`); }
+      await A.close();
+      expect(await raw.lease(T, B)).toMatchObject({ holder: null, live: false });   // released
+      expect((await raw.getCheckpoint(T, B))?.seq).toBe(3);                          // checkpointed before the release
+      const C = roomHost({ store: raw, bus, leaseTtlMs: 30_000 });
+      try {
+        const t0 = performance.now();
+        await C.open(T, B);
+        expect(performance.now() - t0).toBeLessThan(2_000);                          // not the 30 s ttl
+        expect((await C.peek(T, B))?.durable).toBe(3);
+        expect(C.stats()).toEqual({ rooms: 1, waiting: 0 });
+      } finally { await C.close(); }
+    } finally { await A.close(); await raw.close(); await bus.close(); await m.drop(); }
+  }, 20000);
+});
+
+test("the dead-holder window: a writer's hello gets an answer within ttl + 3 s, and a reconnect after takeover is welcomed with every acked op", async () => {
+  // A dies without a release (kill -9): its bus traffic and its renews stop. B starts after, and sees A's live lease.
+  const m = sqliteMaker(), raw = await m.open(), rawB = await m.open(), bus = memoryBus();
+  let dead = false;
+  const deadBus = { ...bus, publish: (s, x) => (dead ? Promise.resolve() : bus.publish(s, x)), subscribe: (s, fn) => bus.subscribe(s, x => { if (!dead) fn(x); }) };
+  const sa = stallable(raw);
+  const ttl = 1_000;
+  const A = roomHost({ store: sa.store, bus: deadBus, holder: "h-a", leaseTtlMs: ttl, heartbeatMs: 200 });
+  const Bh = roomHost({ store: rawB, bus, holder: "h-b", leaseTtlMs: ttl, heartbeatMs: 200 });
+  try {
+    await A.open(T, B);
+    const g = fakeGateway(bus);
+    g.hello("c1", "a"); await g.welcome("c1");
+    for (let k = 1; k <= 3; k++) { g.op("c1", "a", k); await g.ack("c1", `a:${k}`); }
+    dead = true; sa.renew = "hang";
+    await Bh.open(T, B);
+    expect(Bh.stats().waiting).toBe(1);                                      // A's lease is still live
+    // The client's first hello in the window: answered (welcome or unavailable) within ttl + 3 s, never left hanging.
+    const t0 = performance.now();
+    g.hello("c2", "a");
+    const first = await g.answer("c2", ttl + 3_000);
+    expect(performance.now() - t0).toBeLessThan(ttl + 3_000);
+    expect(first.t === "welcome" || (first.t === "error" && first.code === "unavailable")).toBe(true);
+    // It reconnects (open again, as the gateway does, then hello) until welcomed: every acked op is there.
+    let welcome = first.t === "welcome" ? first : null;
+    for (let i = 3; !welcome; i++) {
+      expect(performance.now() - t0).toBeLessThan(ttl + 3_000);
+      await sleep(100);
+      await Bh.open(T, B);
+      g.hello(`c${i}`, "a");
+      const got = await g.answer(`c${i}`, ttl + 3_000);
+      if (got.t === "welcome") welcome = got;
+      else expect(got).toMatchObject({ t: "error", code: "unavailable" });
+    }
+    expect(welcome.seq).toBe(3);
+    expect(welcome.room.epoch).toBeGreaterThan((await rawB.lease(T, B)).epoch - 1);
+    expect((await rawB.read(T, B, 1, 100)).map(e => e.id)).toEqual(["a:1", "a:2", "a:3"]);
+  } finally { dead = false; await A.close(); await Bh.close(); await raw.close(); await rawB.close(); await bus.close(); }
+}, 20000);
+
+test("a live remote holder's board is never answered by the waiting host, however long it waits", async () => {
+  const m = sqliteMaker(), raw = await m.open(), bus = memoryBus();
+  const A = roomHost({ store: raw, bus, holder: "h-a", leaseTtlMs: 600, heartbeatMs: 100 });
+  const Bh = roomHost({ store: raw, bus, holder: "h-b", leaseTtlMs: 600, heartbeatMs: 100 });
+  try {
+    await A.open(T, B); await Bh.open(T, B);
+    const g = fakeGateway(bus);
+    for (let i = 0; i < 10; i++) { g.hello(`c${i}`, `x${i}`); await sleep(150); }      // 1.5 s: past 2 heartbeats many times, and two ttls
+    await bus.flush(); await sleep(100);
+    expect(g.got.filter(x => x.msg?.t === "welcome").length).toBe(10);
+    expect(g.got.filter(x => x.close || x.msg?.t === "error")).toEqual([]);
+    expect(Bh.stats()).toEqual({ rooms: 0, waiting: 1 });                             // its attempts found A live each time
+  } finally { await A.close(); await Bh.close(); await raw.close(); await bus.close(); }
+}, 10000);
+
+test("losing the lease stops the room without a release: a null renew, and a fenced write", async () => {
+  for (const how of ["renew null", "fenced checkpoint"]) {
+    const m = sqliteMaker(), raw = await m.open(), bus = memoryBus();
+    const sa = stallable(raw);
+    // ttl 3 s: the host deadline is 2 s away, so a stop within ~1.5 s is the null renew / the fence, not the deadline.
+    const A = roomHost({ store: sa.store, bus, holder: "h-a", leaseTtlMs: 3_000 });
+    try {
+      await A.open(T, B);
+      const g = fakeGateway(bus);
+      g.hello("c1", "a"); await g.welcome("c1");
+      g.op("c1", "a", 1); await g.ack("c1", "a:1");
+      const t0 = performance.now();
+      if (how === "renew null") sa.renew = "null";
+      else {   // renews hang (the deadline is 2 s off), the board moves on, and the next write is fenced
+        sa.renew = "hang";
+        await raw.openEpoch(T, B); (await A.peek(T, B)).room.checkpoint();
+      }
+      await until(() => g.of("c1").some(x => x.close === 1013), "c1 told unavailable", 3_000);
+      expect(performance.now() - t0).toBeLessThan(how === "renew null" ? 1_800 : 600);
+      expect(await A.peek(T, B)).toBe(null);
+      const l = await raw.lease(T, B);
+      if (how === "renew null") expect(l).toMatchObject({ holder: "h-a", live: true });    // never released on a fail
+      await A.close();                                                                     // a lost lease isn't released at close either
+      if (how === "renew null") expect((await raw.lease(T, B)).holder).toBe("h-a");
+    } finally { await A.close(); await raw.close(); await bus.close(); }
+  }
+}, 20000);
+
+test("the host deadline: renews that never answer stop the room before the lease can lapse, by performance.now(), not the rooms' clock", async () => {
+  const m = sqliteMaker(), raw = await m.open(), bus = memoryBus();
+  const sa = stallable(raw);
+  // The rooms' clock runs backwards a minute per call: a deadline judged on it would never come.
+  let fake = 1e13;
+  const A = roomHost({ store: sa.store, bus, holder: "h-a", leaseTtlMs: 900, now: () => (fake -= 60_000) });
+  try {
+    await A.open(T, B);
+    const g = fakeGateway(bus);
+    g.hello("c1", "a"); await g.welcome("c1");
+    await sleep(700);                                                      // two renews went through
+    expect(sa.renews).toBeGreaterThanOrEqual(2);
+    expect(await A.peek(T, B)).not.toBe(null);
+    sa.renew = "hang";
+    const t0 = performance.now();
+    await until(() => g.of("c1").some(x => x.close === 1013), "c1 told unavailable", 3_000);
+    // Deadline = the last good renew's send time + ttl − ttl/3 (600 ms): stopped before the Store's lease lapses.
+    expect(performance.now() - t0).toBeLessThan(900);
+    expect(await A.peek(T, B)).toBe(null);
+  } finally { await A.close(); await raw.close(); await bus.close(); }
+}, 10000);
+
+test("renew starts before the rebuild: a rebuild longer than the ttl keeps the lease", async () => {
+  const m = sqliteMaker(), raw = await m.open(), bus = memoryBus();
+  const { epoch } = await raw.acquire(T, B, "h-seed", 60_000);
+  await raw.append(T, B, [{ seq: 1, board: B, tenant: T, stream: "board", op: { elements: [rect("x")] }, by: "u", id: "c:1", at: 0, rv: 1 }], 0, epoch);
+  await raw.release(T, B, "h-seed", epoch);
+  let slow = true;
+  const store = { ...raw, read: async (...a) => { if (slow) { slow = false; await sleep(1_200); } return raw.read(...a); } };
+  const A = roomHost({ store, bus, holder: "h-a", leaseTtlMs: 600 });
+  const Bh = roomHost({ store: raw, bus, holder: "h-b", leaseTtlMs: 600 });
+  try {
+    const opening = A.open(T, B);
+    await sleep(800);                                                      // past A's ttl, mid-rebuild
+    expect(await raw.acquire(T, B, "h-b", 600)).toBe(null);               // still A's: it renewed while building
+    await opening;
+    expect((await A.peek(T, B))?.durable).toBe(1);
+  } finally { await A.close(); await Bh.close(); await raw.close(); await bus.close(); }
+}, 10000);
+
+// ---- Round 2 (p4-hostv): each verifier repro as a test ----
+
+test("HIGH-1: a holder woken from a stall past its deadline serves nothing that queued meanwhile; the new holder's connections hear only it", async () => {
+  // In-process stall: A's inbound bus traffic is queued and its lease clock (and the Store's) jumps past the ttl, while
+  // its real timers (renew every 10 s, heartbeat 10 s) don't run: exactly what a SIGSTOP leaves behind.
+  let off = 0, frozen = false;
+  const queued = [], fromA = [];
+  const raw = sqliteStore({ path: join(tempDir(), "plenary.db"), now: () => Date.now() + off });
+  const bus = memoryBus();
+  const busA = {
+    ...bus,
+    publish: (s, m) => { if (s.startsWith("plen-gw.")) fromA.push(m); return bus.publish(s, m); },
+    subscribe: (s, fn) => bus.subscribe(s, m => (frozen ? queued.push(() => fn(m)) : fn(m))),
+  };
+  const sa = stallable(raw);
+  const opts = { leaseTtlMs: 30_000, heartbeatMs: 10_000, sweepMs: 10_000 };
+  const A = roomHost({ store: sa.store, bus: busA, holder: "h-a", monotonic: () => performance.now() + off, ...opts });
+  const Bh = roomHost({ store: raw, bus, holder: "h-b", ...opts });
+  try {
+    await A.open(T, B);
+    const g = fakeGateway(bus);
+    g.hello("c1", "a"); await g.welcome("c1");
+    for (let k = 1; k <= 3; k++) { g.op("c1", "a", k); await g.ack("c1", `a:${k}`); }
+    // The stall: A hears nothing and runs nothing; 40 s pass on every lease clock.
+    frozen = true; sa.renew = "hang"; off += 40_000;
+    await Bh.open(T, B);                                                     // the lease lapsed: B takes the board
+    expect((await Bh.peek(T, B))?.epoch).toBe(2);
+    g.hello("c2", "a"); expect(await g.welcome("c2")).toMatchObject({ seq: 3, room: { epoch: 2 } });
+    g.hello("x1", "x"); await g.welcome("x1");
+    g.op("x1", "x", 1); await g.ack("x1", "x:1");
+    g.op("c2", "a", 4); await g.ack("c2", "a:4");
+    const before = fromA.length;
+    // A wakes: what queued is delivered before any of its timers run.
+    frozen = false;
+    for (const f of queued.splice(0)) f();
+    await bus.flush(); await sleep(100); await bus.flush();
+    const late = fromA.slice(before);
+    expect(late.filter(m => m.conn === "c2" || m.conn === "x1")).toEqual([]);   // no welcome, ack or 1013 from the dead epoch
+    expect(late.every(m => m.conn === "c1" && m.close === 1013)).toBe(true);    // only its own welcomed connection is told
+    expect(await A.peek(T, B)).toBe(null);
+    expect((await Bh.peek(T, B))?.conns).toBe(2);                                // B still serves c2 and x1
+    expect(g.of("c2").filter(m => m.msg?.t === "welcome").length).toBe(1);
+    expect(g.of("x1").filter(m => m.msg?.t === "welcome").length).toBe(1);
+    expect((await raw.read(T, B, 1, 100)).map(e => e.id)).toEqual(["a:1", "a:2", "a:3", "x:1", "a:4"]);
+  } finally { await A.close(); await Bh.close(); await raw.close(); await bus.close(); }
+}, 15000);
+
+test("MEDIUM-1 (repro C): the holder dies right after a renew; a watcher takes over within ttl + ttl/3 + 500 ms, not 2 ttl", async () => {
+  const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
+  const ttl = 2_000;
+  await raw.acquire(T, B, "h-dead", ttl);
+  const Bh = roomHost({ store: raw, bus, holder: "h-b", leaseTtlMs: ttl, heartbeatMs: 100 });
+  try {
+    const w0 = performance.now();
+    await Bh.open(T, B);
+    expect(Bh.stats().waiting).toBe(1);
+    // Nothing heartbeats, so B goes "silent" at ~200 ms and attempts then: the lease is live. The holder's last renew
+    // lands at ~300 ms, so it expires just after the next attempt a whole ttl would bring (200 + ttl + margin): only
+    // an attempt armed for the Store's remainingMs (then every ttl/3) takes the board near its expiry.
+    await until(() => performance.now() - w0 >= 300, "t", 1000);
+    const l = await raw.lease(T, B);
+    expect(await raw.renew(T, B, "h-dead", l.epoch, ttl)).not.toBe(null);
+    const death = performance.now();
+    await until(async () => (await Bh.peek(T, B)) !== null, "B's takeover", 10_000);
+    expect(performance.now() - death).toBeLessThan(ttl + ttl / 3 + 500);
+  } finally { await Bh.close(); await raw.close(); await bus.close(); }
+}, 15000);
+
+test("L2 (repro B): a clean release is taken by a watcher already in place within one ttl/3 (here: at once, on the release)", async () => {
+  // ttl 9 s, heartbeat 2 s: the silence rule (4 s) and the ttl/3 retry (3 s) are both too slow to pass this; only
+  // the holder's `released` message is.
+  const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
+  const ttl = 9_000;
+  const A = roomHost({ store: raw, bus, holder: "h-a", leaseTtlMs: ttl });
+  const Bh = roomHost({ store: raw, bus, holder: "h-b", leaseTtlMs: ttl });
+  try {
+    await A.open(T, B); await Bh.open(T, B);
+    await sleep(300);
+    const t0 = performance.now();
+    await A.close();                                                         // a rolling deploy: clean, released
+    await until(async () => (await Bh.peek(T, B)) !== null, "B serves the board", 5_000);
+    expect(performance.now() - t0).toBeLessThan(1_000);
+    const g = fakeGateway(bus);
+    g.hello("c1", "a"); await g.welcome("c1");
+  } finally { await A.close(); await Bh.close(); await raw.close(); await bus.close(); }
+}, 15000);
+
+test("MEDIUM-2 (repro A): a hello forwarded while the holder is still building is answered (1013), and the retry is welcomed", async () => {
+  const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
+  let slow = true;
+  const slowStore = { ...raw, read: async (...a) => { if (slow) { slow = false; await sleep(1_500); } return raw.read(...a); } };
+  const A = roomHost({ store: slowStore, bus, holder: "h-a", leaseTtlMs: 10_000 });   // default heartbeat 2 s
+  const Bh = roomHost({ store: raw, bus, holder: "h-b", leaseTtlMs: 10_000 });
+  try {
+    const opening = A.open(T, B);
+    await sleep(50);
+    await Bh.open(T, B);
+    expect(Bh.stats().waiting).toBe(1);
+    const g = fakeGateway(bus);
+    const t0 = performance.now();
+    g.hello("c1", "a");                                                      // mid-build: A's inbox isn't served yet
+    await opening;
+    const first = await g.answer("c1", 3_000);
+    expect(first).toMatchObject({ t: "error", code: "unavailable" });
+    expect(performance.now() - t0).toBeLessThan(2_500);                      // A's build (1.5 s), not the gateway's 10 s
+    g.hello("c2", "a");
+    expect(await g.welcome("c2")).toMatchObject({ seq: 0 });
+    expect(g.of("c2").filter(m => m.close).length).toBe(0);
+  } finally { await A.close(); await Bh.close(); await raw.close(); await bus.close(); }
+}, 15000);
+
+test("MEDIUM-3 (repro F): a renew that never settles is timed out and retried; a Store that stays hung stops the room at the deadline", async () => {
+  const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
+  let hang = "no", renews = 0;
+  const store = { ...raw, renew: (...a) => { renews++; if (hang === "once") { hang = "no"; return never(); } if (hang === "always") return never(); return raw.renew(...a); } };
+  const A = roomHost({ store, bus, holder: "h-a", leaseTtlMs: 900 });
+  try {
+    await A.open(T, B);
+    await sleep(400);
+    hang = "once"; const r0 = renews;
+    await sleep(1_500);
+    expect(renews - r0).toBeGreaterThanOrEqual(3);                          // the hung one, then fresh ones each tick
+    expect(await A.peek(T, B)).not.toBe(null);                               // never past the deadline
+    const g = fakeGateway(bus);
+    g.hello("c1", "a"); await g.welcome("c1");
+    hang = "always"; const r1 = renews, t0 = performance.now();
+    await until(() => g.of("c1").some(x => x.close === 1013), "stopped at the deadline", 3_000);
+    expect(performance.now() - t0).toBeLessThan(900);
+    expect(renews - r1).toBeGreaterThanOrEqual(1);
+    expect((await raw.lease(T, B)).holder).toBe("h-a");                     // not released
+  } finally { await A.close(); await raw.close(); await bus.close(); }
+}, 10000);
+
+test("L1 (repro G): the host deadline counts from the renew's send time (slow renews, then they hang)", async () => {
+  const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
+  let mode = "slow", lastSend = 0;
+  const store = { ...raw, renew: async (...a) => {
+    if (mode === "hang") return never();
+    lastSend = performance.now(); await sleep(250); return raw.renew(...a);
+  } };
+  // ttl 1.8 s: renew every 600 ms, each bounded at 300 ms (so these 250 ms renews succeed); deadline = last good
+  // send + 1,200. Judged from the receive time it would be ~250 ms later.
+  const ttl = 1_800;
+  const A = roomHost({ store, bus, holder: "h-a", leaseTtlMs: ttl });
+  try {
+    await A.open(T, B);
+    const g = fakeGateway(bus);
+    g.hello("c1", "a"); await g.welcome("c1");
+    await sleep(1_500);
+    await until(() => performance.now() - lastSend > 260, "the in-flight renew landed", 2_000);
+    const sendOfLastGood = lastSend;
+    mode = "hang";
+    await until(() => g.of("c1").some(x => x.close === 1013), "stopped", 4_000);
+    expect(performance.now() - sendOfLastGood).toBeLessThan(ttl - 600 + 100);
+  } finally { await A.close(); await raw.close(); await bus.close(); }
+}, 10000);
+
+test("L3 (repro H): an event-loop stall past the deadline stops the room; a renew after that doesn't revive it", async () => {
+  for (const ms of [700, 1500]) {
+    const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
+    const A = roomHost({ store: raw, bus, holder: "h-a", leaseTtlMs: 900 });
+    try {
+      await A.open(T, B); await sleep(350);
+      const end = performance.now() + ms; while (performance.now() < end) { /* block the event loop */ }
+      await sleep(400);                                                      // the overdue ticks run
+      expect(await A.peek(T, B)).toBe(null);
+      await A.open(T, B);                                                    // only a new acquire reopens it
+      expect((await A.peek(T, B))?.epoch).toBe(2);
+    } finally { await A.close(); await raw.close(); await bus.close(); }
+  }
+}, 10000);
+
+test("L4: close() settles an append in flight before it releases the lease", async () => {
+  const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
+  let gate = null, order = [];
+  const store = { ...raw,
+    append: async (...a) => { if (gate) await gate; const r = await raw.append(...a); order.push("append landed"); return r; },
+    release: async (...a) => { order.push("release"); return raw.release(...a); } };
+  const A = roomHost({ store, bus, holder: "h-a", leaseTtlMs: 30_000 });
+  try {
+    await A.open(T, B);
+    const g = fakeGateway(bus);
+    g.hello("c1", "a"); await g.welcome("c1");
+    let open; gate = new Promise(r => { open = r; });
+    g.op("c1", "a", 1); await bus.flush(); await sleep(20);
+    const closing = A.close();
+    await sleep(200);
+    expect(order).toEqual([]);                                               // still waiting on the append
+    open(); await closing;
+    expect(order).toEqual(["append landed", "release"]);
+    expect((await raw.read(T, B, 1, 10)).map(e => e.id)).toEqual(["a:1"]);
+  } finally { await A.close(); await raw.close(); await bus.close(); }
+}, 10000);
+
+test("L5: a build that fails for a reason other than the lease stops renewing and releases the lease", async () => {
+  const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
+  let broken = true;
+  const store = { ...raw, getCheckpoint: async (...a) => { if (broken) throw new Error("disk read error"); return raw.getCheckpoint(...a); } };
+  const A = roomHost({ store, bus, holder: "h-a", leaseTtlMs: 30_000 });
+  try {
+    expect(await code(A.open(T, B))).not.toBe("resolved");
+    await until(async () => (await raw.lease(T, B))?.holder === null, "released", 2_000);
+    expect((await raw.acquire(T, B, "h-b", 1_000))?.epoch).toBe(2);       // another host takes it with no wait
+  } finally { await A.close(); await raw.close(); await bus.close(); }
+}, 10000);
+
+test("L7: past 1,000 held hellos on a watched board, the extra ones are answered unavailable at once", async () => {
+  const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
+  await raw.acquire(T, B, "h-dead", 30_000);                               // a holder that is gone: nothing heartbeats
+  const Bh = roomHost({ store: raw, bus, holder: "h-b", leaseTtlMs: 30_000, heartbeatMs: 2_000 });
+  try {
+    await Bh.open(T, B);
+    const g = fakeGateway(bus);
+    for (let i = 0; i < 1_005; i++) g.hello(`c${i}`, `x${i}`);
+    await bus.flush(); await sleep(50);
+    const answered = new Set(g.got.filter(m => m.close === 1013).map(m => m.conn));
+    expect([...answered].sort()).toEqual(["c1000", "c1001", "c1002", "c1003", "c1004"]);
+    await until(() => g.got.filter(m => m.close === 1013).length === 1_005, "the held ones at the silence", 6_000);
+  } finally { await Bh.close(); await raw.close(); await bus.close(); }
+}, 15000);

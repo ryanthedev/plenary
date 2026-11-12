@@ -1,19 +1,19 @@
 // The Store port on SQLite (PROTOCOL.md § Store): the durable log and checkpoints for a single node.
 //
-//   append(tenant, board, entries, expectSeq, epoch?)   atomic and conditional; a stale expectSeq throws PortError
-//                                               "conflict"; with `epoch`, one that isn't the board's lease epoch
-//                                               throws "fenced" (checked in the same transaction)
+//   append(tenant, board, entries, expectSeq, epoch)    atomic and conditional; a stale expectSeq throws PortError
+//                                               "conflict"; an `epoch` that isn't the board's lease epoch
+//                                               throws "fenced" (checked in the same transaction); none: "bad-entry"
 //   read(tenant, board, fromSeq, limit, maxBytes?)   entries with seq >= fromSeq, ascending, at most `limit`
 //                                               (and, if maxBytes is given, about that much text: always >= 1 entry)
 //   lastSeq(tenant, board)                      the board's last seq (0 = empty)
-//   putCheckpoint(tenant, board, cp, epoch?)    kept by cp.seq; the newest few per board are kept; fenced like append
+//   putCheckpoint(tenant, board, cp, epoch)     kept by cp.seq; the newest few per board are kept; fenced like append
 //   getCheckpoint(tenant, board, beforeSeq?)    the highest seq (below beforeSeq, if given), never the last write
 //   openEpoch(tenant, board)                    durable atomic increment of the board's epoch (1 on the first call)
 //   epoch(tenant, board)                        the board's epoch, 0 if no room was ever built
 //   acquire(tenant, board, holder, ttlMs)       take the board's lease if free, expired or ours; always a new epoch
 //   renew(tenant, board, holder, epoch, ttlMs)  extend it, only as its holder at that epoch; else null
 //   release(tenant, board, holder, epoch)       give it up (idempotent); the epoch stays
-//   lease(tenant, board)                        { holder, epoch, expiresAt, live } or null
+//   lease(tenant, board)                        { holder, epoch, expiresAt, live, remainingMs } or null
 //
 // The epoch lives in the board's lease record (`leases`: holder, epoch, expires_at), not in a checkpoint
 // (PROTOCOL.md § Recovery, Room identity). Expiry is judged on the store's clock only (`now`, injected for tests):
@@ -86,7 +86,6 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
   const qGetCp = db.query("SELECT data FROM checkpoints WHERE tenant = ? AND board = ? AND seq < ? ORDER BY seq DESC LIMIT 1");
   /** The epoch fence: inside the write transaction, so no takeover lands between the check and the write. */
   const fence = (tenant, board, epoch) => {
-    if (epoch === undefined) return;   // SEAM(p4): unfenced until room-host passes its lease epoch
     const cur = qEpoch.get(tenant, board)?.epoch ?? 0;
     if (cur !== epoch) throw new PortError("fenced", `the board's lease is at epoch ${cur}, not ${epoch}`);
   };
@@ -109,17 +108,19 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
     needId(tenant, "tenant"); needId(board, "board");
   };
   const needEpoch = epoch => { if (epoch !== undefined && !posInt(epoch)) throw new PortError("bad-entry", "epoch must be a positive integer"); };
+  /** Every write is fenced (p4-host, L5): append and putCheckpoint without the writer's lease epoch are refused. */
+  const needWriteEpoch = epoch => { if (!posInt(epoch)) throw new PortError("bad-entry", "a write needs the board's lease epoch (a positive integer)"); };
   const needTtl = ttlMs => { if (!posInt(ttlMs) || ttlMs > MAX_TTL) throw new PortError("bad-entry", `ttlMs must be a positive integer up to ${MAX_TTL}`); };
   const clock = () => { const t = now(); if (!Number.isSafeInteger(t)) throw new PortError("bad-clock", "the store's clock gave a non-integer"); return t; };
   const granted = row => row ? { epoch: row.epoch, expiresAt: row.expires_at } : null;
 
   return {
     /**
-     * Writes every entry or none, only if the board's last seq is `expectSeq` and, when `epoch` is given, only if it
-     * is the board's lease epoch (else PortError "fenced"). Resolves once durable.
+     * Writes every entry or none, only if the board's last seq is `expectSeq` and only if `epoch` is
+     * the board's lease epoch (else PortError "fenced"; no epoch at all is "bad-entry": every write is fenced). Resolves once durable.
      */
     async append(tenant, board, entries, expectSeq, epoch) {
-      ready(tenant, board); needEpoch(epoch);
+      ready(tenant, board); needWriteEpoch(epoch);
       if (!Number.isSafeInteger(expectSeq) || expectSeq < 0) throw new PortError("bad-entry", "expectSeq must be a non-negative integer");
       if (!Array.isArray(entries) || !entries.length) throw new PortError("bad-entry", "append needs at least one entry");
       // Everything is checked and serialised before the transaction starts: a bad entry writes nothing.
@@ -173,7 +174,7 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
 
     /** Stores `cp` under its seq (`cp.seq` is required; the rest is the room's). An older one never hides a newer one. */
     async putCheckpoint(tenant, board, cp, epoch) {
-      ready(tenant, board); needEpoch(epoch);
+      ready(tenant, board); needWriteEpoch(epoch);
       if (!cp || typeof cp !== "object" || !Number.isSafeInteger(cp.seq) || cp.seq < 0) throw new PortError("bad-entry", "a checkpoint needs a seq");
       putCpTx.immediate(tenant, board, cp.seq, JSON.stringify(cp), epoch);
     },
@@ -225,13 +226,18 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
       db.transaction(() => qRelease.run(tenant, board, holder, epoch)).immediate();
     },
 
-    /** The lease record, judged on this store's clock: `live` = held and not expired. null = no room was ever built. */
+    /**
+     * The lease record, judged on this store's clock: `live` = held and not expired; `remainingMs` = how long until it
+     * expires on that clock (0 unless live), so a caller can wait for expiry without comparing clocks. null = no room
+     * was ever built.
+     */
     async lease(tenant, board) {
       ready(tenant, board);
       const row = qLease.get(tenant, board);
       if (!row) return null;
-      const live = row.holder !== null && row.expires_at !== null && row.expires_at > clock();
-      return { holder: row.holder, epoch: row.epoch, expiresAt: row.expires_at, live };
+      const t = clock();
+      const live = row.holder !== null && row.expires_at !== null && row.expires_at > t;
+      return { holder: row.holder, epoch: row.epoch, expiresAt: row.expires_at, live, remainingMs: live ? row.expires_at - t : 0 };
     },
 
     /** What the store was opened with, read back from SQLite (for /health and tests). */

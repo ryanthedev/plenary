@@ -357,7 +357,8 @@ test("L5: a client refused by the room resyncs, and settled() waits for it (the 
 test("Store.read can stop a page by size (an extension to § Store), and reports each entry's stored size", async () => {
   const store = sqliteStore({ path: join(tempDir(), "p.db") });
   const entry = (seq, chars) => ({ seq, board: "b-1", tenant: "t-1", stream: "board", op: { elements: [big("e", seq, chars)] }, by: "u", id: `c:${seq}` });
-  await store.append("t-1", "b-1", [entry(1, 50_000), entry(2, 50_000), entry(3, 50_000), entry(4, 10), entry(5, 300_000)], 0);
+  const { epoch } = await store.acquire("t-1", "b-1", "h-test", 60_000);   // every write is fenced (§ Store)
+  await store.append("t-1", "b-1", [entry(1, 50_000), entry(2, 50_000), entry(3, 50_000), entry(4, 10), entry(5, 300_000)], 0, epoch);
   const seqs = p => p.map(e => e.seq);
   expect(seqs(await store.read("t-1", "b-1", 1, 100))).toEqual([1, 2, 3, 4, 5]);
   expect(seqs(await store.read("t-1", "b-1", 1, 100, 120_000))).toEqual([1, 2]);

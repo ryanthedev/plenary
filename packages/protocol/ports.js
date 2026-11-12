@@ -18,20 +18,21 @@
  * per-board Log (above) made from the Store, and the verified identity with each hello.
  * @typedef {{ verify(token: string): Promise<null | { user: string, name: string, email: string, domain: string }>,
  *             role(identity: object, board: string): Promise<null | string> }} Auth  null = refused; a throw = unavailable
- * @typedef {{ append(tenant: string, board: string, entries: object[], expectSeq: number, epoch?: number): Promise<void>,
+ * @typedef {{ append(tenant: string, board: string, entries: object[], expectSeq: number, epoch: number): Promise<void>,
  *             read(tenant: string, board: string, fromSeq: number, limit: number, maxBytes?: number): Promise<object[] & { bytes: number[] }>,
  *             lastSeq(tenant: string, board: string): Promise<number>,
- *             putCheckpoint(tenant: string, board: string, cp: object, epoch?: number): Promise<void>,
+ *             putCheckpoint(tenant: string, board: string, cp: object, epoch: number): Promise<void>,
  *             getCheckpoint(tenant: string, board: string, beforeSeq?: number): Promise<null | object>,
  *             openEpoch(tenant: string, board: string): Promise<number>,
  *             epoch(tenant: string, board: string): Promise<number>,
  *             acquire(tenant: string, board: string, holder: string, ttlMs: number): Promise<null | StoreLease>,
  *             renew(tenant: string, board: string, holder: string, epoch: number, ttlMs: number): Promise<null | StoreLease>,
  *             release(tenant: string, board: string, holder: string, epoch: number): Promise<void>,
- *             lease(tenant: string, board: string): Promise<null | { holder: null | string, epoch: number, expiresAt: null | number, live: boolean }>,
+ *             lease(tenant: string, board: string): Promise<null | { holder: null | string, epoch: number, expiresAt: null | number, live: boolean, remainingMs: number }>,
  *             close(): Promise<void> }} Store
- *   append / putCheckpoint: with `epoch`, refused with code "fenced" unless it is the board's lease epoch, checked
- *   in the same transaction as the write (no stale holder's write lands after a takeover). Without it, unfenced.
+ *   append / putCheckpoint: `epoch` is required (no epoch: code "bad-entry"); refused with code "fenced" unless it is
+ *   the board's lease epoch, checked in the same transaction as the write (no stale holder's write lands after a
+ *   takeover). A room host passes the epoch of the lease it holds (acquire), and stops its room on "fenced".
  *   read: with `maxBytes`, the page stops near that much stored text (always >= 1 entry); `.bytes` = each entry's
  *   stored length. lastSeq: the board's last seq, 0 = empty.
  *   openEpoch: a durable atomic increment of the board's epoch (1 on the first call), kept with its lease
@@ -39,9 +40,14 @@
  *   acquire: the lease if free, expired or already `holder`'s; every success bumps the epoch (a new incarnation).
  *   renew / release: only as the holder at that epoch (renew null otherwise; release is a no-op). Expiry is judged
  *   on the Store's clock (the database's), never a host's: `expiresAt` is in that clock, not the caller's.
+ *   lease: `remainingMs` = ms until expiry on the Store's clock, measured there (0 unless live): a watcher waits that
+ *   long on its own clock, never comparing `expiresAt` with it.
  *   A lease call that can't get the lease row in time (another session holds it) throws code "unavailable": retry.
  * @typedef {{ epoch: number, expiresAt: number }} StoreLease
- * @typedef {{ publish(subject: string, msg: object): void, subscribe(subject: string, fn: (msg: object) => void): () => void }} Bus  at-most-once
+ * @typedef {{ publish(subject: string, msg: object): void | Promise<void>, subscribe(subject: string, fn: (msg: object) => void): () => void,
+ *             flush(): Promise<void>, maxBytes: number }} Bus  at-most-once
+ *   flush: resolves once everything published so far has left this process (memory: handed to subscribers; NATS:
+ *   its flush round trip; an adapter with nothing to wait for resolves at once). maxBytes: the message cap (§ Bus).
  * @typedef {{ put(tenant: string, sha1: string, bytes: Uint8Array): Promise<void>, get(tenant: string, sha1: string): Promise<null | Uint8Array> }} Blobs
  */
 
@@ -62,7 +68,11 @@ export function tableAuth(table) {
   };
 }
 
-/** A Log in memory, with the Store's contract for one board: conditional append, read, checkpoints. */
+/**
+ * A Log in memory, with the Store's contract for one board: conditional append, read, checkpoints. It has no lease
+ * and no fence (a Room in a test is its only writer), so it keeps its own shape: append(entries, expectSeq) and
+ * openEpoch(). The server's Store requires an epoch on every write; a room host binds it (server/room-host.js).
+ */
 export class MemoryLog {
   constructor() { this.entries = []; this.checkpoints = []; this.epochN = 0; }
 

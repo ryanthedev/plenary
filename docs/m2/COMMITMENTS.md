@@ -18,7 +18,7 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 |---|---|---|---|
 | 1 | Phase 1 protocol v1 spec, shown to the CEO (not a gate; phase 2 starts on PASS) | DONE 28fa91d (audited by proxy, pushed 32cc915; shown to the CEO with 3 open questions) | manager engine t14j, brief docs/m2/briefs/manager-engine.md |
 | 2 | Phase 6 design mock, shown to the CEO (not a gate; phase 6 build starts on PASS) | DONE 7536d50 (round 2 PASS; shown to the CEO) | manager client t14k, brief docs/m2/briefs/manager-client.md |
-| 6 | CEO does one live Google sign-in (bun scripts/dev-google.js, http://localhost:8080/) | ASKED again 2026-11-11 after p5-code 3f6b489 | docs/m2/reports/p5-google.md "Hand-off" |
+| 6 | CEO does one live Google sign-in (bun scripts/dev-google.js, http://localhost:8080/) | DONE 2026-11-12 04:44Z (server log: /auth/login 302, /auth/callback 302 loginCookie true, /signed-in 200, POST /auth/exchange 200; proxy ran the server, CEO signed in) | docs/m2/reports/p5-google.md "Hand-off" |
 | 3 | Ask the CEO for the Google OAuth client (env vars, never chat) when phase 5 starts | DONE 2026-11-11 | Web client "canvas-dev-local" in Omniping project gen-lang-client-0027800234 (consent screen already External/Testing); redirect http://localhost:8080/auth/callback; keys in .env (gitignored, 0600) via the downloaded JSON, never shown in chat |
 | 5 | Hexagonal architecture enforced (boundary test) and the systems design skill used on every design-bearing job; architecture audit per track | RUNNING | OFFICE.md "Architecture"; managers told |
 | 4 | drawh change is a proposal only; herdr-draw untouched without the CEO | RUNNING (scope cut after 3b FAIL; round 4 on v1.1) | builder t185, verifier t155; goes to the CEO for approval after PASS |
@@ -105,3 +105,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 client: p6-ports DONE 4850319 (round 2 PASS; bun test 588/0, re-run by manager). t18r, t1b9 closed. p6-hex waits on the p2-land merge; proxy asked client to start the file-disjoint slice now (new files only).
 - 2026-11-11 platform: p5-code DONE 3f6b489 (one-time #code + POST /auth/exchange, no token in any URL; one origin enforced; verifier PASS + re-check PASS in real Chromium; bun test 510/0). Google sign-in re-asked of the CEO.
 - 2026-11-11 client: p6-edge (t1cy) building on main, new files only (file-disjoint slice of p6-hex) while p2-land merges.
+- 2026-11-12 proxy: live Google sign-in works end to end against the real OAuth client (CEO's login; server log shows callback and code exchange 200). Platform told.

@@ -16,11 +16,14 @@
 //   - ports import nothing at runtime (JSDoc type imports of other ports are fine);
 //   - an adapter imports only packages/*, ports, core, and its own group;
 //   - core reads no browser global (DOM, Worker, WebSocket, storage, location/history, fetch, and no Date.now,
-//     setTimeout/setInterval, Math.random, performance, requestAnimationFrame directly): a token check over core's
-//     source with comments and string literals blanked (not an import scanner; the same technique as the sign-in
-//     source checks). Time, timers and randomness come from the clock port. Also no `Function(`, `eval` or
+//     setTimeout/setInterval, Math.random, performance, requestAnimationFrame directly), decided by Bun's parser
+//     (brief p8-globals): each name is a Bun.Transpiler `define` to a unique sentinel, and define rewrites only free
+//     (unbound) references, never a shadowed local, a member or property name, a string, a template's text, a regex
+//     or a comment. Time, timers and randomness come from the clock port. Also no `Function(`, `eval` or
 //     `import.meta` (p7-archtest, C-14: `Function("return this")()` reaches every global; core never needs a URL);
 //   - core has no computed import(): only a quoted (or ${}-free template) specifier, so the scanner sees every edge;
+//     also decided by the parser (each `import` keyword is swapped for a defined sentinel; see computedImports);
+//   - a file the parser rejects fails both checks loudly (it throws), never "no globals" (as arch-scan's "parse");
 //   - `new URL("./x.js", import.meta.url)` edges count (arch-scan's { urls: true }) in every rule and in the
 //     production graph, so a Worker or a dev module started by URL is checked like an import (p7-archtest, C-14);
 //   - one list of dev-only modules (DEV_MODULES), checked against server/static.js's DENY (p7-archtest, C-16).
@@ -79,170 +82,120 @@ export function webViolations(graph) {
   return out;
 }
 
-/** Browser globals core must not read, as patterns over code (member access like `x.location` is fine; only the bare
- *  global is caught). `Date(` covers `new Date(...)` and a bare `Date()` (the wall clock); `self` is the worker global. */
+/** Browser globals core must not read (member access like `x.location`, a property key or a shadowed local is fine;
+ *  only a free reference to the global is caught). `Date(` covers `new Date(...)` and a bare `Date()` (the wall
+ *  clock); `self` is the worker global. */
 const NAMES = ["document", "window", "globalThis", "self", "location", "history", "localStorage", "sessionStorage", "indexedDB",
   "navigator", "SharedWorker", "Worker", "WebSocket", "XMLHttpRequest", "fetch", "requestAnimationFrame", "cancelAnimationFrame",
   "matchMedia", "performance", "setTimeout", "setInterval", "clearTimeout", "clearInterval", "queueMicrotask", "Date.now",
   "Math.random", "crypto", "addEventListener", "postMessage", "console"];
+/** Each rule: `global` (the reported name), `name` (the free reference the parser looks for), and `call` (only a call
+ *  or a `new` of it counts). Reported in this order. */
 const CORE_GLOBALS = [
-  ...NAMES.map(g => ({ global: g, re: new RegExp(`(^|[^.\\w$])${g.replace(".", "\\.")}(?![\\w$])`, "m") })),
-  { global: "Date(", re: /(^|[^.\w$])Date\s*\(/m },
+  ...NAMES.map(g => ({ global: g, name: g })),
+  { global: "Date(", name: "Date", call: true },
   // p7-archtest (C-14): the doors to every global and to URLs. Function("return this")() is globalThis; eval runs code
   // no scan sees; import.meta.url is only for building module URLs, which core never does.
-  { global: "Function(", re: /(^|[^.\w$])Function\s*\(/m },
-  { global: "eval", re: /(^|[^.\w$])eval(?![\w$])/m },
-  { global: "import.meta", re: /(^|[^.\w$])import\s*\.\s*meta(?![\w$])/m },
+  { global: "Function(", name: "Function", call: true },
+  { global: "eval", name: "eval" },
+  { global: "import.meta", name: "import.meta" },
 ];
+/** Every name the parser is asked about: each rule's name, plus the object of each dotted name ("Date", "Math"), so
+ *  `Date?.now` and `Math["random"]` count as `Date.now` and `Math.random` too. */
+const DEFINED = [...new Set(CORE_GLOBALS.flatMap(r => (r.name.includes(".") && r.name !== "import.meta" ? [r.name, r.name.split(".")[0]] : [r.name])))];
+
+/** One transpiler per sentinel prefix (a define map is fixed at construction). deadCodeElimination is off, so code in
+ *  `if (false) { … }` is still printed (and still judged), as in arch-scan.js. */
+const plain = new Bun.Transpiler({ loader: "js", deadCodeElimination: false });
+const withDefine = define => new Bun.Transpiler({ loader: "js", deadCodeElimination: false, define });
+/** Appended to every source so the parser reads it as an ES module (strict, as the browser loads core). Without it Bun
+ *  parses a file with no import/export sloppily, and a block's `function fetch() {}` would bind a later `fetch(u)` to
+ *  itself (sloppy-mode hoisting), hiding a real global read. On its own line, so a trailing // comment can't eat it. */
+const AS_MODULE = "\nexport {};\n";
+/** `src` printed by the parser, or a loud error naming `file` (a file the parser rejects never reads as clean). */
+function printed(file, src, t = plain) {
+  try { return t.transformSync(src + AS_MODULE); }
+  catch (e) {
+    const list = Array.isArray(e?.errors) && e.errors.length ? e.errors : [e];
+    const why = list.slice(0, 3).map(x => (x?.position ? `${x.position.line}:${x.position.column} ` : "") + (x?.message ?? String(x))).join("; ");
+    throw new Error(`${file}: the parser rejects it, so its globals and imports are unknown: ${why}`);
+  }
+}
+/** A sentinel prefix found nowhere in `src` nor in its printed form (printing decodes escapes: "\x5f_g" prints "__g"),
+ *  so every sentinel in a printed output was put there by `define`, i.e. by the parser, never by the file's text. */
+function prefixFor(src, out) {
+  let pre = "__arch_g_";
+  while (src.includes(pre) || out.includes(pre)) pre += "_";
+  return pre;
+}
+const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /**
- * Source with comments and string-literal text blanked (lengths and newlines kept), so only code is checked. Template
- * literals keep their `${...}` expressions as code (p6-hexv: a global inside `${}` must still be caught), nested to
- * any depth. Regex literals (p7-archtestv MED-2): a "/" where an expression may start (after an operator, "(", ",",
- * "=", ... or a keyword such as return) opens one; its body is blanked like a string's, so `/\//` or `/["']/` can no
- * longer open a comment or a string that hides the rest of the line. A "/" after a value (a name, ")", "]") divides.
+ * [{ file, global }] for every free reference to a forbidden browser global in a core source, in CORE_GLOBALS order.
+ * Method (brief p8-globals): Bun.Transpiler's `define` rewrites only free references (a shadowed binding, a member
+ * name, a property key, a string, a template's text, a regex and a comment are left alone; `${…}` is code), so each
+ * name is defined to a unique sentinel and the printed output is read for sentinels. Only the neighbours of a sentinel
+ * in that canonical output are looked at: `(` or `?.(` after it (a call), `new ` before it (a construction), and for
+ * a dotted name's object `?.prop` or `["prop"]` after it. Throws if the parser rejects `src`.
+ * Known limit: inside a `with (o) { … }` body define rewrites nothing; `with` is a SyntaxError in every ES module
+ * (each web/core file is one; Bun refuses to load it), and core-runtime-globals.test.js imports every core module.
  */
-const REGEX_KEYWORDS = new Set(["return", "typeof", "case", "do", "else", "in", "of", "new", "delete", "void", "throw", "instanceof", "yield", "await"]);
-export function codeOnly(src) {
-  let out = "", i = 0;
-  // JS line terminators (LF, CR, LS, PS): each ends a // comment, a string's line and a regex literal, and counts as
-  // a line break for ASI; blanking keeps them, so the rules below still see the break (p8-tidy round 4).
-  const isLT = c => c === "\n" || c === "\r" || c === "\u2028" || c === "\u2029";
-  const blank = c => (isLT(c) ? c : " ");
-  // Code until the end, or (inExpr) until the "}" that closes a template's ${.
-  function code(inExpr) {
-    let depth = 0;
-    while (i < src.length) {
-      const c = src[i], n = src[i + 1];
-      if (c === "/" && n === "/") { while (i < src.length && !isLT(src[i])) { out += " "; i++; } continue; }
-      if (c === "/" && n === "*") { const e = src.indexOf("*/", i + 2), end = e < 0 ? src.length : e + 2; while (i < end) out += blank(src[i++]); continue; }
-      if (c === '"' || c === "'") {
-        out += src[i++];
-        while (i < src.length && src[i] !== c && !isLT(src[i])) { if (src[i] === "\\") { out += " "; i++; } if (i < src.length) out += blank(src[i++]); }
-        if (i < src.length) out += src[i++];
-        continue;
-      }
-      if (c === "`") { out += src[i++]; template(); continue; }
-      if (c === "/" && regexMayStart()) { out += src[i++]; regex(); continue; }
-      if (inExpr && c === "{") depth++;
-      if (inExpr && c === "}") { if (depth === 0) return; depth--; }
-      out += src[i++];
-    }
-  }
-  // Can a regex literal start here? Judged on the code emitted so far (strings are blanked, quotes kept).
-  function regexMayStart() {
-    let j = out.length - 1;
-    while (j >= 0 && /\s/.test(out[j])) j--;
-    if (j < 0) return true;
-    // "++" / "--": postfix (it ends a value, so "/" divides: i++ / 2, a[i]++ / 2, (a)++ / 2) only when what precedes it
-    // ends a value ON THE SAME LINE (JS allows no line break before a postfix ++/--) and isn't a block's "}": a word that
-    // isn't a keyword, "]", or a ")" that doesn't close an if/while/for/with head. Otherwise it is a prefix one, and a
-    // regex may follow: ++/\//.lastIndex, x\n++/\//… , { … } ++/\//… (p8-tidyv R2-M1, R3-M1).
-    if ((out[j] === "+" || out[j] === "-") && out[j - 1] === out[j]) {
-      let k = j - 2;
-      while (k >= 0 && /\s/.test(out[k])) { if (isLT(out[k])) return true; k--; }
-      return out[k] === "}" || !endsValue(k);
-    }
-    if (/[(,=:[!&|?{};+\-*%<>~^]/.test(out[j])) return true;
-    if (out[j] === ")") return closesStatementHead(j);        // if (x) /re/ … starts a regex; (a + b) / 2 divides
-    if (!/[\w$]/.test(out[j])) return false;                 // ] " ' ` and the like end a value: division
-    let k = j;
-    while (k >= 0 && /[\w$]/.test(out[k])) k--;
-    const word = out.slice(k + 1, j + 1);
-    // `of` is a keyword only inside a for (…) head (for (const x of …), for await ([a] of …), with or without line
-    // breaks); anywhere else it is a name, so "/" divides (R2-L2, R3-L1: const z = y\nof / 2).
-    if (word === "of") return inForHead(k) && endsValue(k);
-    return REGEX_KEYWORDS.has(word);
-  }
-  // Is out[k] inside the parens of a for / for await head (an unclosed "(" whose head word is for)?
-  function inForHead(k) {
-    let depth = 0;
-    for (; k >= 0; k--) {
-      if (out[k] === ")") depth++;
-      else if (out[k] === "(") { if (depth === 0) break; depth--; }
-    }
-    if (k < 0) return false;
-    let w = wordBefore(k);
-    if (w.word === "await") w = wordBefore(w.start);
-    return w.word === "for" && !w.member;
-  }
-  // Does the code up to out[k] (spaces skipped) end a value: a non-keyword word, "]", "}" or a ")" that isn't a
-  // statement head's?
-  function endsValue(k) {
-    while (k >= 0 && /\s/.test(out[k])) k--;
-    if (k < 0) return false;
-    if (out[k] === "]" || out[k] === "}") return true;
-    if (out[k] === ")") return !closesStatementHead(k);
-    if (!/[\w$]/.test(out[k])) return false;
-    let m = k;
-    while (m >= 0 && /[\w$]/.test(out[m])) m--;
-    return !REGEX_KEYWORDS.has(out.slice(m + 1, k + 1));
-  }
-  // Does the ")" at out[j] close the head of if / while / for / with (p7-archtestv R2-MED-2)? Then a statement follows
-  // and a "/" there starts a regex. Strings and regex bodies are already blanked in `out`, so parens balance.
-  function closesStatementHead(j) {
-    let depth = 0, k = j;
-    for (; k >= 0; k--) {
-      if (out[k] === ")") depth++;
-      else if (out[k] === "(" && --depth === 0) break;
-    }
-    if (k < 0) return false;
-    let w = wordBefore(k);
-    if (w.word === "await") w = wordBefore(w.start);        // for await (…) /re/ (p8-tidyv M1)
-    return ["if", "while", "for", "with"].includes(w.word) && !w.member;
-  }
-  // The identifier ending just before out[k] (spaces skipped): { word, start, member } (member: preceded by ".").
-  function wordBefore(k) {
-    k--;
-    while (k >= 0 && /\s/.test(out[k])) k--;
-    const e = k;
-    while (k >= 0 && /[\w$]/.test(out[k])) k--;
-    const start = k + 1;
-    while (k >= 0 && /\s/.test(out[k])) k--;
-    return { word: out.slice(start, e + 1), start, member: k >= 0 && out[k] === "." };
-  }
-  // A regex body until its closing "/" (escapes and [...] classes honoured), blanked; the flags stay as code.
-  function regex() {
-    let inClass = false;
-    while (i < src.length && !isLT(src[i])) {
-      const c = src[i];
-      if (c === "\\") { out += " "; i++; if (i < src.length && !isLT(src[i])) { out += " "; i++; } continue; }
-      if (c === "[") inClass = true;
-      else if (c === "]") inClass = false;
-      else if (c === "/" && !inClass) { out += src[i++]; return; }
-      out += " "; i++;
-    }
-  }
-  // Template text until the closing backtick; each ${ ... } inside is code.
-  function template() {
-    while (i < src.length) {
-      const c = src[i];
-      if (c === "\\") { out += " "; i++; if (i < src.length) out += blank(src[i++]); continue; }
-      if (c === "`") { out += src[i++]; return; }
-      if (c === "$" && src[i + 1] === "{") { out += "${"; i += 2; code(true); if (i < src.length) out += src[i++]; continue; }
-      out += blank(src[i++]);
-    }
-  }
-  code(false);
-  return out;
-}
-/** [{ file, global }] for every bare browser global in a core source. */
 export function globalsIn(file, src) {
-  const text = codeOnly(src), out = [];
-  for (const { global, re } of CORE_GLOBALS) if (re.test(text)) out.push({ file, global });
-  return out;
+  const pre = prefixFor(src, printed(file, src));
+  const define = Object.fromEntries(DEFINED.map((n, i) => [n, `${pre}${i}`]));
+  const out = printed(file, src, withDefine(define));
+  const seen = new Set();                                         // indexes of rules hit
+  for (const m of out.matchAll(new RegExp(`${escapeRe(pre)}(\\d+)(?![\\w$])`, "g"))) {
+    const name = DEFINED[+m[1]], after = out.slice(m.index + m[0].length), before = out.slice(Math.max(0, m.index - 8), m.index);
+    CORE_GLOBALS.forEach((r, k) => {
+      if (r.name === name) {
+        if (!r.call) seen.add(k);
+        else if (/^\s*(\?\.\s*)?\(/.test(after) || (/(^|[^\w$])new\s+$/.test(before) && !/^\s*(\?\.|\.|\[)/.test(after))) seen.add(k);
+      } else if (r.name.startsWith(name + ".") && r.name !== "import.meta") {
+        const prop = escapeRe(r.name.slice(name.length + 1));
+        if (new RegExp(`^\\s*(\\?\\.\\s*${prop}(?![\\w$])|(\\?\\.\\s*)?\\[\\s*(["'\`])${prop}\\3\\s*\\])`).test(after)) seen.add(k);
+      }
+    });
+  }
+  return CORE_GLOBALS.filter((_, k) => seen.has(k)).map(r => ({ file, global: r.global }));
 }
 
-/** [{ start, text }] for every import( in a source whose specifier is not a literal: a quoted string, or a template
- *  with no ${}. Matched on codeOnly (comments and string text blanked), judged on the original text. */
-export function computedImports(src) {
-  const code = codeOnly(src), out = [];
-  for (const m of code.matchAll(/(^|[^.\w$])import\s*\(/g)) {
-    const at = m.index + m[0].length;
-    const rest = src.slice(at);
-    const lit = rest.match(/^\s*(?:"[^"\\\n]*"|'[^'\\\n]*'|`[^`$\\]*`)\s*\)/);
-    if (!lit) out.push({ start: at, text: src.slice(m.index + m[1].length, at + 40).split("\n")[0] });
-  }
+/**
+ * [{ start, text }] for every import( call in a source whose specifier is not a literal: one quoted string, or a
+ * template with no ${} and no backslash, as the only argument. Decided by the parser (brief p8-globals):
+ *   - candidates: every raw-text word `import`; each is swapped for a token `<pre>a<n>`, and `<pre>a<n>` is defined to
+ *     `<pre>b<n>`. In code the token is a free reference, so `<pre>b<n>` is printed; in a comment it vanishes, in a
+ *     string, template text or regex it stays `<pre>a<n>`; as a member or property name (`x.import(…)`) it isn't free.
+ *   - a printed `<pre>b<n>(` is an import() call in code; the argument printed after it is judged (the printer's
+ *     canonical form: a string literal in quotes, a template, or anything else).
+ *   - all candidates are swapped at once; if that copy doesn't parse (a static `import … from` swapped becomes
+ *     `<tok> … from`, which never parses), each is probed alone, and one whose own probe fails is a static import
+ *     (a swap in a comment, a string or a call never breaks a parse), so no import() call.
+ * Throws if the parser rejects `src` itself.
+ */
+export function computedImports(src, file = "<source>") {
+  const base = printed(file, src);
+  const cands = [...src.matchAll(/\bimport\b/g)].map((m, n) => ({ at: m.index, n }));
+  if (!cands.length) return [];
+  const pre = prefixFor(src, base);
+  const t = withDefine(Object.fromEntries(cands.map(({ n }) => [`${pre}a${n}`, `${pre}b${n}`])));
+  const probe = list => {
+    let s = "", at = 0;
+    for (const c of list) { s += src.slice(at, c.at) + `${pre}a${c.n}`; at = c.at + "import".length; }
+    try { return t.transformSync(s + src.slice(at) + AS_MODULE); } catch { return null; }
+  };
+  const LITERAL = /^\(\s*("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`[^`$\\]*`)\s*\)/;
+  const out = [];
+  const judge = (c, text) => {
+    const m = new RegExp(`${escapeRe(pre)}b${c.n}(?![\\w$])`).exec(text);
+    if (!m) return;                                                // comment, string, member or property name
+    const after = text.slice(m.index + m[0].length);
+    if (!/^\s*\(/.test(after)) return;                             // import.meta and the like: not a call
+    if (!LITERAL.test(after.trimStart())) out.push({ start: c.at, text: src.slice(c.at, c.at + 46).split(/[\n\r\u2028\u2029]/)[0] });
+  };
+  const all = probe(cands);
+  if (all !== null) for (const c of cands) judge(c, all);
+  else for (const c of cands) { const one = probe([c]); if (one !== null) judge(c, one); }
   return out;
 }
 
@@ -379,11 +332,120 @@ describe("web/ architecture (hexagonal boundaries)", () => {
     expect(hits("const r = /\\//; const z = r && Date.now();")).toEqual(["Date.now"]);
     expect(hits("const r = /\\/*x/; setTimeout(f);")).toEqual(["setTimeout"]);
     expect(hits("const q = /[\"'`]/g; document.title;")).toEqual(["document"]);
-    expect(hits("const q = s.replace(/\\/\\//g, ''); return /a/.test(x) && fetch(u);")).toEqual(["fetch"]);
+    // p8-globals: a top-level return is a SyntaxError in a module, so the case sits in a function (same evasion).
+    expect(hits("function f() { const q = s.replace(/\\/\\//g, ''); return /a/.test(x) && fetch(u); }")).toEqual(["fetch"]);
     expect(hits("const h = a / b / 2; const w = (x) / y; setInterval(f);")).toEqual(["setInterval"]);   // division stays code
     expect(hits("const r = /Date.now() document/;")).toEqual([]);                                        // a regex body is not code
-    // Strict on purpose: a property key named like a global (`{ self: 1 }`) is flagged too; core simply avoids such names.
-    expect(hits("const o = { self: 1 };")).toEqual(["self"]);
+    // p8-globals (changed expectation, listed in docs/m2/reports/p8-globals.md): a property key named like a global
+    // (`{ self: 1 }`) is no read of the global, and the parser knows it; HEAD's text scan flagged it. The shorthand
+    // `{ self }` IS a read and is still caught.
+    expect(hits("const o = { self: 1 };")).toEqual([]);
+    expect(hits("const o = { self };")).toEqual(["self"]);
+  });
+
+  // ── p8-globals: the check is Bun's parser (define), proved name by name ──
+
+  // Written out, not derived from NAMES / CORE_GLOBALS, so dropping a name from either list fails here.
+  const EVERY_GLOBAL = ["document", "window", "globalThis", "self", "location", "history", "localStorage", "sessionStorage", "indexedDB",
+    "navigator", "SharedWorker", "Worker", "WebSocket", "XMLHttpRequest", "fetch", "requestAnimationFrame", "cancelAnimationFrame",
+    "matchMedia", "performance", "setTimeout", "setInterval", "clearTimeout", "clearInterval", "queueMicrotask", "Date.now",
+    "Math.random", "crypto", "addEventListener", "postMessage", "console", "Date(", "Function(", "eval", "import.meta"];
+  /** A bare use of each rule's global, in code. */
+  const use = g => g === "import.meta" ? "import.meta.url" : g.endsWith("(") ? `${g.slice(0, -1)}(1)` : g === "eval" ? "eval(x)" : `${g}.x`;
+
+  test("p8-globals: each global, on its own, is caught in code and nowhere else", () => {
+    const hits = src => globalsIn("web/core/x.js", src).map(v => v.global);
+    for (const g of EVERY_GLOBAL) {
+      expect([g, hits(`const v = ${use(g)};`)]).toEqual([g, [g]]);                    // a free reference
+      expect([g, hits(`const v = () => \`a \${${use(g)}} b\`;`)]).toEqual([g, [g]]);     // inside a template's ${}
+      expect([g, hits(`const v = o.${use(g)};`)]).toEqual([g, []]);                        // a member of something else
+      expect([g, hits(`const s = "${use(g)}", t = '${use(g)}', u = \`${use(g)}\`; // ${use(g)}\n/* ${use(g)} */ const r = /${use(g).replace(/[()]/g, "\\$&")}/;`)]).toEqual([g, []]);
+      if (g !== "import.meta" && g !== "eval") {                                           // neither can be a binding
+        const base = g.replace(/[.(].*/, "");
+        expect([g, hits(`function f(${base}) { return ${use(g)}; }`)]).toEqual([g, []]);  // shadowed by a parameter
+        expect([g, hits(`{ const ${base} = {}; ${use(g)}; }`)]).toEqual([g, []]);         // shadowed by a block's const
+      }
+    }
+  });
+
+  test("p8-globals: shadowing, hoisting, keys, dead code, Date/Math forms (changed and tightened expectations)", () => {
+    const hits = src => globalsIn("web/core/x.js", src).map(v => v.global);
+    // Changed (looser, no global read): shadowed locals, hoisted var/function, catch params, keys, class members.
+    expect(hits("const document = make(); document.title;")).toEqual([]);
+    expect(hits("function q() { return location.hash; } var location = { hash: '' };")).toEqual([]);
+    expect(hits("try { f() } catch (performance) { performance.now() }")).toEqual([]);
+    expect(hits("const { document: d } = o; class A { fetch() {} static self = 1 } o = { console: 1, ['x']: 2 };")).toEqual([]);
+    // But a shadow ends with its scope: the same name outside it is the global.
+    expect(hits("{ const document = 1; } document.title;")).toEqual(["document"]);
+    expect(hits("function f(fetch) { return fetch; } fetch(u);")).toEqual(["fetch"]);
+    expect(hits("const o = { [self]: 1 }; export default document;")).toEqual(["document", "self"]);
+    expect(hits("const t = typeof window; delete navigator.x; crypto = 1;")).toEqual(["window", "navigator", "crypto"]);
+    // Dead code is still code (deadCodeElimination is off).
+    expect(hits("if (false) { document.title; }")).toEqual(["document"]);
+    // Date( and Function( mean a call or a construction, as before; `new Date` without parens is one too (tightened:
+    // HEAD's text rule needed the "(").
+    expect(hits("const d = new Date;")).toEqual(["Date("]);
+    expect(hits("const d = new Date(1), e = Date?.(), f = new Function;")).toEqual(["Date(", "Function("]);
+    expect(hits("Date.UTC(1); x instanceof Date; new Date.Sub(); typeof Function;")).toEqual([]);   // as HEAD: no call of Date itself
+    // Dotted names through optional chaining and a quoted key (tightened: HEAD missed these).
+    expect(hits("Date?.now(); Math['random']();")).toEqual(["Date.now", "Math.random"]);
+    expect(hits('Date?.["now"](); Math?.random();')).toEqual(["Date.now", "Math.random"]);
+    expect(hits("Date . now();")).toEqual(["Date.now"]);
+    expect(hits("const Math = { random: () => 4 }; Math.random(); Date.nowish();")).toEqual([]);
+  });
+
+  test("p8-globals: every source is parsed as a module, so a block's function doesn't hoist over a global", () => {
+    const hits = src => globalsIn("web/core/x.js", src).map(v => v.global);
+    expect(hits("{ function fetch() {} } fetch(u);")).toEqual(["fetch"]);
+    expect(hits("if (x) { function setTimeout() {} } setTimeout(f, 1); // a trailing comment")).toEqual(["setTimeout"]);
+    expect(hits("export {}; { function fetch() {} } fetch(u);")).toEqual(["fetch"]);
+    expect(hits("function fetch() {} fetch(u);")).toEqual([]);                  // a top-level function is a real binding
+    // Bun's own import.meta properties are import.meta too.
+    for (const p of ["main", "require('x')", "resolve('x')", "env.X", "hot", "dirname", "path"]) expect(hits(`const v = import.meta.${p};`)).toEqual(["import.meta"]);
+  });
+
+  test("p8-globals: R4-L1 (a raw U+2028 / U+2029 inside a string) ends nothing; CR and LS line breaks still break", () => {
+    const hits = src => globalsIn("web/core/x.js", src).map(v => v.global);
+    expect(hits("const s = 'a\u2028'; import(d); Date.now();")).toEqual(["Date.now"]);
+    expect(hits('const s = "c\u2029d", u = `e\u2028`; setTimeout(f);')).toEqual(["setTimeout"]);
+    expect(computedImports("const s = 'a\u2028'; import(d); Date.now();")).toHaveLength(1);
+    expect(computedImports('const s = "c\u2029d"; import(d);')).toHaveLength(1);
+    expect(hits("const s = 1; // c\u2028document.title")).toEqual(["document"]);
+  });
+
+  test("p8-globals: the sentinel can't be forged by the file's own text (raw or escaped)", () => {
+    const hits = src => globalsIn("web/core/x.js", src).map(v => v.global);
+    expect(hits('const a = "__arch_g_0", b = "\\x5f_arch_g_1", c = "__arch_g_2(";')).toEqual([]);
+    expect(hits('const a = "__arch_g_0"; const t = Date.now();')).toEqual(["Date.now"]);
+    expect(computedImports('const a = "__arch_g_b0(x)", b = "\\x5f_arch_g_b1(y)"; import("./a.js");')).toEqual([]);
+    expect(computedImports('const a = "__arch_g_b0(x)"; import(a);')).toHaveLength(1);
+    // Escapes alone (no raw prefix in the file): printing decodes "\x5f" to "_", so the prefix must be absent from the
+    // printed output too.
+    expect(hits('const b = "\\x5f_arch_g_0";')).toEqual([]);
+    expect(computedImports('const a = "\\x5f_arch_g_b0(x)"; import("./a.js");')).toEqual([]);
+  });
+
+  test("p8-globals: a file the parser rejects fails loudly in both checks, never as clean", () => {
+    expect(() => globalsIn("web/core/x.js", "const ;")).toThrow(/web\/core\/x\.js: the parser rejects it/);
+    expect(() => globalsIn("web/core/x.js", "const s = 'a\nb'; document;")).toThrow(/parser rejects/);
+    expect(() => computedImports("import(", "web/core/y.js")).toThrow(/web\/core\/y\.js: the parser rejects it/);
+    expect(() => computedImports("function (", "web/core/y.js")).toThrow(/parser rejects/);
+  });
+
+  test("p8-globals: computed import() forms the parser decides (changed expectations listed in the report)", () => {
+    const n = src => computedImports(src).length;
+    expect(n("const m = await import /* c */ (name);")).toBe(1);                   // a comment between import and (
+    expect(n("const m = await import\n(name);")).toBe(1);
+    expect(n('import { a } from "./a.js";\nimport * as b from "./b.js";\nexport { c } from "./c.js";\nconst m = import(spec);')).toBe(1);   // static imports beside it
+    expect(n('import "./side.js";\nconst m = import("./x.js");')).toBe(0);
+    expect(n('const m = import("x", { with: { type: "json" } });')).toBe(1);       // as HEAD: only a lone literal
+    expect(n("const m = import.meta; const u = import.meta.url;")).toBe(0);         // not a call
+    expect(n("const v = `${import(spec)}`; /*! import(name) */")).toBe(1);
+    expect(n("if (false) { import(name); }")).toBe(1);                                // dead code is code
+    // Changed (looser; HEAD flagged them as computed, but each is one literal the scanner reads):
+    expect(n('const m = import(("./x.js"));')).toBe(0);
+    expect(n('const m = import("./\\u0078.js");')).toBe(0);
+    expect(n("const o = { import(x) { return x; } }; o?.import(y); class C { import(z) {} }")).toBe(0);
   });
 
   // Manager decision (p6-hex fix round): web/main.js is the production root; nothing it loads may be a dev module.
@@ -426,7 +488,7 @@ describe("web/ architecture (hexagonal boundaries)", () => {
   // ── p7-archtest (p7-audit C-14, C-16) ──
 
   test("core has no computed import(): every specifier is a literal the scanner sees", () => {
-    const hits = listFiles(["web/core", "web/ports"]).flatMap(f => computedImports(readFileSync(join(ROOT, f), "utf8")).map(h => `${f}: ${h.text}`));
+    const hits = listFiles(["web/core", "web/ports"]).flatMap(f => computedImports(readFileSync(join(ROOT, f), "utf8"), f).map(h => `${f}: ${h.text}`));
     expect(hits).toEqual([]);
   });
 
@@ -463,7 +525,7 @@ describe("web/ architecture (hexagonal boundaries)", () => {
     expect(n("a[i]++ / 2; import(d); // x")).toBe(1);
     expect(n("(a)++ / 2; import(d); // x")).toBe(1);
     expect(n("if (x) ++/\\//.lastIndex; import(d);")).toBe(1);
-    expect(n("return ++/\\//.lastIndex; import(d);")).toBe(1);
+    expect(n("function f() { return ++/\\//.lastIndex; import(d); }")).toBe(1);   // p8-globals: in a function (module)
     // p8-tidyv R2-L2: `of` as a name divides; `for (… of /re/)` still starts a regex.
     expect(n("const x = of / 2; import(d); const y = 1 / 3;")).toBe(1);
     expect(n("for (const x of /\\//.exec(s)) import(d);")).toBe(1);

@@ -4,14 +4,25 @@
 
 - **Me:** manager client, terminal t14k. Report to the proxy **t1bx** ONLY by ending my turn with one short message (outcome
   first, report path; "Urgent:" first if urgent). NEVER prompt/hc send/SendMessage t1bx (CEO rule, 2026-11-12). Workers report to me only. engine manager **t18m**; platform manager **t187**.
-- **In flight:** p7-wire builder in **t1gq** (session 260aa90c; brief docs/m2/briefs/p7-wire.md; tab
-  `worker p7-wire (client) · t1gq: collab over sync`). Watch task on t1gq (30 min, re-arm on expiry).
-- **Done:** p6-hex committed **06bf267** (p6-hexv PASS round 2). t1gk and t1g6 closed, killed and removed.
-- **When p7-wire reports:** check its report and `bun test test/web`, then write and launch p7-wirev (verifier, CHECKER + sdd).
+- **In flight (audit fix jobs, launched 2026-11-12):** p7-perf J1 (t1h2: pins/notes/selection per-frame cost, C-1/6/7/15),
+  p7-chrome J2 (t1h3: chrome rebuilds, online/visibility probe, auth banner, clock, C-2/4/6/8/9/17), p7-archtest J4
+  (t1h4: runtime-globals test, dev-module list vs static.js DENY, ws rig, C-10/14/16). Briefs docs/m2/briefs/<job>.md. p7-perf built; verifier p7-perfv (t1h7) **FAIL round 1** (9 surviving mutants + M1 cluster click never opens, M2 refused selection re-walks 100k ids/frame, M3 domClock unguarded); round 2 done by t1h2 (29/29 mutants killed), re-verify round 2 sent to t1h7. p7-archtest **committed** (verifier PASS round 2; t1h4/t1h9 closed; follow-ups R2-MED-1 port-omission fallback, R2-MED-2 regex after `)` in codeOnly). p7-chrome built (t1h3): verifier p7-chromev next.
+  Monitor bjtqgxkut watches all three. On each report: write <job>v brief, launch verifier, commit by path on PASS.
+- **Done:** p7-audit committed **ea47b46** (7 HIGH: 3 client, 4 engine; engine findings E-1..E-4 sent to t18m with the
+  Replica `tab`-option question; t1h1 closed). p7-wire2 committed **001813a** (p7-wirev PASS rounds 2-3: cap retries on rule-12 backoff, auth refusal wins
+  over the cap, mutants killed; test/web 615/0 re-run by me). p7-wire **e4cba6c**. p6-hex **06bf267**. t1gq, t1gw closed.
+- **Open LOW:** LOW-R2-1 (survivor C3a, a transient status event); LOW-3 (emotes dropped at 4/s) known.
+- **Engine call (t18m, viewer double count):** (a) hello gets an optional `tab` (random per browser tab, ≤ 64 chars,
+  same on board and notes connections); here.viewers counts distinct (user, tab); writer cap = 8 tabs per (user, board)
+  per gateway. Engine writes PROTOCOL.md and gateway.js after p2-tune r2 (t18m 2026-11-12: "hours, not days"; may build against the
+  shape now). **Don't send `tab` until t18m pings.** Then a
+  small client job p7-tab. (b) one connection per tab stays on the M4 plan.
+  **t18m 2026-11-12:** engine adds `new Replica({tab})` (connectMessages puts hello.tab); web/ only passes the option, no
+  wrapper. Engine order: spec, gateway + Replica, verifier, then ping. E-1..E-7 queued; E-4 goes into p-fanout.
 - **M4 load-test plan item (from p6-hexv):** two transports per tab (~200k hellos at 100k joins).
-- **Asked engine (unanswered):** is the ws path same-origin `/ws`, token only in hello (no subprotocol/query)?
 - **Main:** phase 2 merged (dcbdae6); p2-land worktree retired. test/arch-scan.js on main (44dd1aa).
-- **Next, in order:** p7-wire → p7-wirev → commit → an architecture audit of web/.
+- **Next, in order:** p7-tab (after t18m's ping; built with `tab` off if the ping is late), then J3 p8-one-link (needs
+  p7-tab and engine's E-1 downstream heartbeat). J5 is M3.
 - **Start command:** OFFICE.md "Starting a session" (names plenary-<job>[v], --model opus --permission-mode auto,
   systems-design plugin, zsh -lic wrapper). Tab: `worker <job> (client) · <id>: <what>`.
 
@@ -19,7 +30,9 @@
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| p7-wire (builder) | t1gq | worker p7-wire (client) · t1gq: collab over sync | RUNNING |
+| p7-perf | t1h2 | worker p7-perf (client) · t1h2: collab per-frame cost | round 2 done, idle for verdict |
+| p7-perfv | t1h7 | verifier p7-perfv (client) · t1h7: collab per-frame cost | re-verifying round 2; Monitor bnfa6ucug |
+| p7-chrome | t1h3 | worker p7-chrome (client) · t1h3: chrome and liveness | built, idle for verdict |
 
 ## 2026-11-11 — phase-6 design mock
 
@@ -275,3 +288,35 @@
 - 2026-11-12: engine (t18m) FYI: static serving committed (ea978ac, main.js import-graph allowlist); `here` count-only
   frames coming with p2-tune r2. Both added to docs/m2/briefs/p7-wire.md.
 - 2026-11-12: p6-hexv PASS (round 2) → p6-hex committed 06bf267; t1gk, t1g6 cleaned up. p7-wire brief finalised (state at start, collab contract test, both roots, Done when); builder launched in t1gq.
+- 2026-11-12: p7-wire2 committed 001813a (p7-wirev PASS rounds 2-3; R2-M1 fixed in round 3). t1gq, t1gw closed and removed.
+- 2026-11-12: proxy asked to start the web/ audit now; launched p7-audit (t1h1). t18m confirmed by hc: `tab` not in PROTOCOL.md/gateway.js yet, comes after p2-tune r2.
+
+## 2026-11-12 — audit fix jobs
+
+- p7-audit committed ea47b46 (t1h1 closed). Engine findings to t18m. Briefs p7-perf, p7-chrome, p7-archtest written with
+  disjoint file ownership (none touch hello/session, which p7-tab owns); builders t1h2, t1h3, t1h4 launched.
+- p7-perf built (80,002 to 1 DOM write per pan frame on 10k threads; 14/14 mutants). D1 accepted: default domClock in
+  frame.js (ui.js may not import clock/browser.js). Verifier p7-perfv (t1h7) launched. core-source.test.js fails because
+  herdr-draw has uncommitted edits to core/editor.js and geometry.js (not ours; not a p7-perf fault).
+- p7-archtest built (t1h4: C-10 ws rig, C-14 runtime globals, C-16 dev-module list; all 6 audit mutants killed; 1 skip = C-16).
+  static.js DENY misses /dev-main.js, /dev-main.html, /core/dev-users.js, /adapters/storage/memory.js: sent to t18m (engine
+  owns static.js). Verifier p7-archtestv (t1h9) launched.
+- t18m landed C-16 in 422526c (kept two lists; the both-ways test guards drift). Shrink-only test failed as designed; sent
+  t1h4 the unskip follow-up; told t1h9 to judge C-16 on the new version.
+- p7-perfv FAIL round 1 (docs/m2/reports/p7-perfv.md): behaviour and numbers hold; 9 mutants survive (fix: adopt its
+  appendix as perf-guards.test.js), MEDIUM M1-M3. Round 2 sent to t1h2: no app.js edits (p7-chrome's) without asking.
+- M1 ruling (t1h2 asked): Option A, a cluster click zooms to fit. ui.js passes jumpTo({x,y,scale}) + ports/collab.js line
+  (t1h2); app.js jumpTo honours scale (t1h3, owner of app.js). One writer per file.
+- p7-archtestv FAIL round 1 (docs/m2/reports/p7-archtestv.md): 2 HIGH in core-runtime-globals.test.js (no positive
+  control; alias handed to packages escapes, fix = getters on Date/Date.now/Math.random/timers), MED drove.error unasserted,
+  regex `//` blinds codeOnly. Round 2 to t1h4. replica.js:31 Math.random session id sent to t18m as FYI.
+- t18m: replica.js:31 confirmed, queued LOW with E-2 (an optional session option, not the injected random, since tests inject random: () => 0).
+- p7-perf round 2 done (t1h2): perf-guards.test.js, M1 ui.js jumpTo({x,y,scale}), M2 500-id cap, M3 clockContract;
+  29/29 mutants killed. t1h3's app.js jumpTo already honours scale (app.js:67-71). Re-verify round 2 sent to t1h7.
+- p7-archtest round 2 done (t1h4): probe controls, read-traps (accessing frame), drove.error, regex-aware codeOnly,
+  LOW 1/6/7; job files 61/0, full 1274 pass / 1 fail (core drift). Re-verify round 2 sent to t1h9.
+- p7-archtestv round 2 PASS (t1h9): all survivors killed, no false hits. Not blocking, follow-ups: R2-MED-1 core leaving out
+  the clock/random lets a package fall back to a global (overlaps t18m E-2); R2-MED-2 a regex after `)` still blinds codeOnly;
+  4 LOW. p7-archtest committed; t1h4 and t1h9 closed.
+- p7-chrome done (t1h3): chrome rebuilds 0 on pan/incoming ops, online/visible reconnect, Sign in again + expiry warning,
+  clock port to collab, jumpTo scale. Verifier p7-chromev to launch.

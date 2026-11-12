@@ -51,3 +51,20 @@ Single harness unless more pass check_adapter; confirm or refute each finding. N
 docs/m2/reports/p6-hexv.md: **PASS or FAIL** first line; HIGH / MEDIUM / LOW with file:line; "Design check (CHECKER)";
 what you did NOT check. HIGH = a behaviour change, a weakened or deleted test without reason, a boundary rule that
 doesn't bite, core using a browser global, a token leak, or a manager decision not applied. Stop.
+
+## Round 2 (manager, 2026-11-12): re-verify the fix round
+
+The builder's fix round is done: docs/m2/reports/p6-hex.md §9 (9 items, each with tests and mutation checks) and §8 (updated
+file list: new web/dev-main.js, web/dev-main.html, web/adapters/dom/gate.js; ws.js gains wsNet/sameOriginWsUrl).
+Manager re-ran `bun test test/web`: 552 pass / 0 fail.
+
+1. Each of the 9 fix items is really closed; re-run its mutation in a scratch copy where cheap. Item 6 changed an existing
+   signin.test.js assertion by manager DECISION (fail closed): that change is allowed; check nothing else was weakened.
+2. **Production page:** index.html loads only main.js; main.js's runtime graph holds no dev module (the new architecture test
+   bites); served through engine's static allowlist (test/server/rig.js, port 0) it boots with no 404 and talks over `/ws`
+   with the token only in hello.
+3. **What you skipped in round 1, where cheap:** refused op + resync and drop mid-typing in the browser (dev page now:
+   web/dev-main.html); every tool end to end.
+4. Full `bun test`; say which failures are outside web/.
+
+Report: append "## Round 2" to docs/m2/reports/p6-hexv.md and put **PASS or FAIL (round 2)** on its first line. Stop.

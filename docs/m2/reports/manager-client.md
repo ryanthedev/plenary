@@ -4,8 +4,8 @@
 
 - **Me:** manager client, terminal t14k. Report to the proxy **t1bx** ONLY by ending my turn with one short message (outcome
   first, report path; "Urgent:" first if urgent). NEVER prompt/hc send/SendMessage t1bx (CEO rule, 2026-11-12). Workers report to me only. engine manager **t18m**; platform manager **t187**.
-- **In flight:** p6-hex FIX ROUND in **t1gk** (resumed builder session 81338670; brief docs/m2/briefs/p6-hex.md
-  "Fix round", 9 items; HIGH = main.js becomes the production root, new web/dev-main.js). Watch task bv2d6o668.
+- **In flight:** p6-hexv ROUND 2 in **t1g6** (brief docs/m2/briefs/p6-hexv.md "## Round 2"), re-verifying the p6-hex fix
+  round (DONE in t1gk, report p6-hex.md §9; test/web 552/0 re-run by me). Watch task on t1g6.
 - **p6-hexv verdict: FAIL** (docs/m2/reports/p6-hexv.md): the known HIGH plus LOWs; 1044 pass / 0 fail; 14/14 mutants caught.
   Verifier t1g6 idle, kept for the re-verify. Old builder shell t1fy no longer used.
 - **After the fix round:** re-verify (t1g6; also the browser checks it skipped: refused op + resync, drop mid-typing, served
@@ -22,8 +22,8 @@
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| p6-hex (fix round) | t1gk | worker p6-hex (client) · t1gk: web ports and adapters (fix round) | RUNNING (brief "Fix round") |
-| p6-hexv (verifier) | t1g6 | verifier p6-hexv (client) · t1g6: web ports and adapters | FAIL reported; idle, kept for re-verify |
+| p6-hex (fix round) | t1gk | worker p6-hex (client) · t1gk: web ports and adapters (fix round) | fix round DONE (§9); idle until the re-verify |
+| p6-hexv (verifier) | t1g6 | verifier p6-hexv (client) · t1g6: web ports and adapters | round 2 RUNNING |
 
 ## 2026-11-11 — phase-6 design mock
 
@@ -275,3 +275,4 @@
 - BLOCKER from engine's p-serve: the served page can't boot (main.js imports the denied dev rooms). DECISION: main.js = production root (ws.js, HTTP auth, sign-in; no dev rooms/dev-users/?as=); web/dev-main.js = dev-only root. In p6-hex's fix round after t1g6's verdict; t1g6 records it as a known HIGH. Asked t18m to confirm /ws same-origin and token only in hello. Owe t18m the commit id for a p-serve re-crawl.
 - 03:44: all agents killed; proxy resumed me and t1g6 in place. Watches re-armed; known-HIGH message resent to t1g6. t1fy not resumed (done).
 - p6-hexv FAIL (t1g6): known HIGH (production root) + 7 LOWs + 2 design MEDIUMs (blank page during exchange → fix item 2; two transports per tab → M4 load-test plan). Fix round in t1gk (resumed session 81338670), brief p6-hex.md "Fix round". Watch bv2d6o668.
+- p6-hex fix round DONE (t1gk, 7 min): all 9 items with tests + mutations; production page boots on the real server rig over /ws (20/20). test/web 552/0 (me). Round 2 sent to t1g6.

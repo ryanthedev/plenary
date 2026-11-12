@@ -4,7 +4,8 @@
 
 - **Me:** manager client, terminal t14k. Report to the proxy **t1bx** ONLY by ending my turn with one short message (outcome
   first, report path; "Urgent:" first if urgent). NEVER prompt/hc send/SendMessage t1bx (CEO rule, 2026-11-12). Workers report to me only. engine manager **t18m**; platform manager **t187**.
-- **In flight:** nothing running. p6-edge committed (verified PASS); t1cy and t1dx closed.
+- **In flight:** p6-edge2 (t1f2, builder; brief docs/m2/briefs/p6-edge2.md): ws backpressure (`congested()` on the
+  transport port) + sign-in test gaps, p6-edgev's two MEDIUMs. Main only. Next: its verifier.
 - **Waiting on engine:** the p2-land merge into main. p2-land rebased onto main, head 892ee6e (client files 892ee6e,
   v1.1 a68e9dc); p2-swap (server onto v1) now running there. No client work in the worktree until t18m sends the merge id.
 - **Next, in order:** p6-hex (docs/m2/briefs/p6-hex.md: move web/ onto the ports, auth HTTP adapter per
@@ -17,7 +18,7 @@
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| (none running) | | | waiting on engine's p2-land merge; next p6-hex |
+| p6-edge2 (builder) | t1f2 | worker p6-edge2 (client) · t1f2: ws backpressure | RUNNING on main |
 
 ## 2026-11-11 — phase-6 design mock
 
@@ -256,3 +257,4 @@
 - CEO rule (OFFICE.md 'The proxy's input is the CEO's'): never message the proxy directly; end the turn with a short report instead. Phase 3 audited and pushed (378d089).
 - p6-edge done (t1cy): bun test 684 run, 0 fail (re-run by me). Risks: no ws backpressure watermark; fragment parse only unescaped values. Verifier p6-edgev (t1dx, plenary-p6-edgev) started.
 - p6-edgev PASS (no HIGH; M1 no ws backpressure, M2 three security rules not pinned by tests; 5 LOW). bun test 684 run, 0 fail (me). Committed p6-edge; M1/M2/LOWs carried into p6-hex. t1cy, t1dx closed.
+- p6-edge committed ac91d62. Started p6-edge2 (t1f2, plenary-p6-edge2) for p6-edgev M1 (backpressure) + M2 (test gaps): main-only files, so no wait for the merge. My context 45%.

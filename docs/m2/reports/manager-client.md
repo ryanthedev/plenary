@@ -4,10 +4,9 @@
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| p6-mock (builder) | t14m | done p6-mock (client) | fix round 1 done; re-verifying |
-| p6-mockv (verifier) | t14v | verifier p6-mockv (client): design mock, round 2 | RUNNING round 2 |
-| p6-base (builder) | t14r | done p6-base (client) | DONE, report docs/m2/reports/p6-base.md (verifying) |
-| p6-basev (verifier) | t15h | verifier p6-basev (client): canvas + sync core | RUNNING (brief docs/m2/briefs/p6-basev.md) |
+| p6-base (builder) | t14r | done p6-base (client) | fix round 1 done; re-verifying |
+| p6-basev (verifier) | t15h | verifier p6-basev (client): canvas + sync core, round 2 | RUNNING round 2 |
+| p6-ui (builder) | t160 | worker p6-ui (client): canvas UI | RUNNING (brief docs/m2/briefs/p6-ui.md) |
 
 ## 2026-11-11 — phase-6 design mock
 
@@ -82,3 +81,34 @@
   `mine` chips). One MEDIUM is left open in the mock: on phone, read-only leaves the More tools sheet live
   (mock.js:381-383). Not sent for another mock round; it's carried into p6-ui as a requirement, since the real
   client must guard it anyway. bun test 143/143, re-run by me before commit.
+- Mock committed 7536d50. t14m and t14v closed (tab close, hc kill, hc rm) and dropped from the roster. p6-ui started (t15y, zsh -lic wrapper, reports-to t14k).
+- BLOCKER: p6-ui (t15y), started with the new `zsh -lic` command, came up as Fable 5.2 in manual permission mode
+  (other sessions: Opus 5.5, auto), and blocked on its first prompt within 12 s. My classifier refused reading the
+  login env. Escalated to the proxy: fix the profile/command, or relaunch with the old command until then.
+- t15y killed and removed; p6-ui relaunched as t160 with --model opus --permission-mode auto (OFFICE.md fix).
+- p6-basev FAIL (docs/m2/reports/p6-basev.md): 3 HIGH in web/sync.js. H1: an edit made during a resync goes out at
+  version 1, is acked, and loses everywhere (an acked op with no effect). H2: Escape or a tool key mid-drag leaves
+  the Editor's version above the Replica's for good, so peers' edits never show (seen in a real browser). H3: the
+  gate's equality ignores tombstones/versions, so mutations survive. Plus 5 MEDIUM, 8 LOW. Painter and seam hold.
+- Fix round 1 sent to the same builder t14r (20% context): all findings; keep bindEditor's API stable for p6-ui
+  (t160) or list the changes; keep the version step in one function so phase 2 can drop it.
+- p6-base fix round 1 done (t14r): all HIGH/MEDIUM/LOW addressed; bun test 261/261 re-run by me; `.replica` gone
+  from sync.js. API changes for p6-ui are listed in p6-base.md. Verifier t15h started on round 2.
+- For engine (from t14r): test/server/main.test.js "kill -9 mid-stream" timed out once in a full run under load
+  (passed 5/5 alone, and on the next full run). Looks timing-sensitive.
+- Engine (via proxy): the gateway now refuses v0 `transient: true` ops (bad-op, the connection stays open).
+  web/sync.js:172-179 sends drag previews that way, so previews won't reach peers through the server. Decision:
+  not added to the p6-base fix round (packages/protocol has no presence code yet, and it would reset round 2).
+  It is the FIRST item of the queued p6-sync2 job (after phase 2's Replica): previews move to v1 presence.
+  p6-ui told not to use transient ops. Until then, through the server, peers see a drag only when it's committed.
+- Phase-2 landing plan (proxy, approved): p2-land branch, worktree /Users/r/repos/plenary-p2, one green commit.
+  My part: (1) commit p6-base on main as soon as round 2 passes, then tell engine t14j directly (it rebases p2-land);
+  (2) then run p6-sync2 in the worktree (brief docs/m2/briefs/p6-sync2.md, ready), against p2-recovery.md's
+  "API for the client track"; (3) p6-ui stays on main against sync.js's public API.
+- p6-sync2 owns web/sync.js and test/web/sync*/paint* only (not test/web/ui*, which is p6-ui's on main), so the merge
+  can't collide.
+- p6-basev round 2 PASS (0 HIGH, 3 MEDIUM, 6 LOW). MEDIUMs (per-op ack timer, backoff + version/unavailable codes,
+  a held-ops-survive-reconnect test) carried into p6-sync2's brief: the phase-2 Replica owns those timeouts.
+- p6-ui (t160) done: two Editors (board, notes), role gating at input plus an onOp backstop, the More sheet gated.
+  Verifier p6-uiv (t172) started. p6-ui's wanted sync.js changes (bindEditors sharing one Replica, a role getter
+  on the handle, a WebSocket transport) go to p6-sync2 where they fit the phase-2 API.

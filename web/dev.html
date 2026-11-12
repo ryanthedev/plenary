@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plenary dev canvas</title>
+<style>
+  /* Bare dev page: two Editors syncing through an in-process reference Room. The real chrome comes after
+     the design mock (web/index.html, web/ui/ belong to the UI job). */
+  :root { color-scheme: light dark; --bg: #f1f3f5; --fg: #1e1e1e; --line: #ced4da; --on: #6965db; }
+  :root[data-theme="dark"] { --bg: #1a1b1e; --fg: #e9ecef; --line: #373a40; --on: #a8a5ff; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 13px system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header { display: flex; gap: 12px; align-items: center; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+  main { flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); min-height: 0; }
+  .pane { position: relative; display: flex; flex-direction: column; background: var(--bg); min-width: 0; min-height: 0; }
+  .bar { display: flex; flex-wrap: wrap; gap: 2px; padding: 4px; align-items: center; }
+  .bar button { min-width: 28px; height: 28px; border: 1px solid var(--line); background: transparent; color: inherit; border-radius: 4px; cursor: pointer; }
+  .bar button[aria-pressed="true"] { border-color: var(--on); color: var(--on); }
+  .bar .who { margin-left: auto; padding: 0 6px; opacity: .8; }
+  .stage { position: relative; flex: 1; min-height: 0; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; outline: none; }
+  textarea { position: absolute; display: none; resize: none; border: 1px dashed var(--on); background: transparent; color: inherit; padding: 2px; outline: none; }
+</style>
+</head>
+<body>
+<header>
+  <strong>Plenary dev canvas</strong>
+  <span>two Editors · one in-process Room</span>
+  <button id="theme" type="button">theme</button>
+  <span id="seq"></span>
+</header>
+<main id="panes"></main>
+<script type="module" src="./dev.js"></script>
+</body>
+</html>

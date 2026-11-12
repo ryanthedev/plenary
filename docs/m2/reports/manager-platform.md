@@ -7,7 +7,8 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
 | pd-drawh (builder) | t14y | done pd-drawh (platform) | fix round RUNNING |
-| p8-cluster-env (builder) | t170 | worker p8-cluster-env (platform): cluster compose + CI services | RUNNING |
+| p8-cluster-env (builder) | t170 | done p8-cluster-env (platform) | reported, idle |
+| p8-cluster-envv (verifier) | t174 | verifier p8-cluster-envv (platform): cluster compose + CI services | RUNNING |
 | pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | FAIL (2 HIGH), idle; re-checks after fix |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
@@ -178,3 +179,7 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   it (safer). Spec change asked of engine via proxy.
 - Sessions t166, t16h closed, killed, removed.
 - p8-cluster-env (t170) started on the proxy's suggestion: cluster compose (Postgres, NATS, MinIO, 3 nodes, LB) and CI services job. Proposed env names go to engine.
+- p8-cluster-env built. Decision (mine, reversible): blob store = `pgsty/minio` (pinned community MinIO fork,
+  AGPL-3.0), since official MinIO images left Docker Hub; service named `blobs` so a swap (rustfs, garage) touches
+  only it. Proposed env names for engine: DATABASE_URL, NATS_URL, S3_ENDPOINT/BUCKET/REGION/ACCESS_KEY_ID/
+  SECRET_ACCESS_KEY (Bun's S3 client reads these), PLENARY_NODE_ID. Verifier t174.

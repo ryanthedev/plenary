@@ -7,7 +7,8 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
 | pd-drawh (builder) | t14y | done pd-drawh (platform) | fix round RUNNING |
-| p5-http (builder) | t17b | worker p5-http (platform): sign-in + admin HTTP routes | RUNNING |
+| p5-http (builder) | t17b | done p5-http (platform) | reported, idle |
+| p5-httpv (verifier) | t17c | verifier p5-httpv (platform): sign-in + admin HTTP routes | RUNNING |
 | pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | FAIL (2 HIGH), idle; re-checks after fix |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
@@ -202,3 +203,4 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   API routes use `Authorization: Bearer` (no cookie auth on mutations, so no CSRF surface).
 - Mount hook proposed to engine (t14j): `httpRoutes(deps) → (req) => Response | null`; awaiting their answer.
 - Engine agreed the hook: httpRoutes(deps) → async (req, url) => Response | null, mounted via createServer({ http }) AFTER engine routes; /health, /ws, /blobs/*, /metrics reserved for engine; return own 4xx/5xx (throws become 500). Engine wires main.js when http.js lands: tell t14j then. Relayed to t17b.
+- p5-http built (291 pass). Decision: Bearer accepts dev tokens only when a dev verifier is configured. Engine told http.js landed (wire against the commit). Verifier t17c.

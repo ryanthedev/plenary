@@ -4,22 +4,21 @@ Manager terminal: `t18m` (tab `manager engine`; successor of t14j, retired 2026-
 
 ## Workers (current; updated every turn)
 
-In flight: t17j verifying scaffold round 5 (fix by t18c). On PASS: bun test, commit server/ + test/server/ (scaffold),
-then p4-pg (keep postgres.js:20,:38 registry-port imports) and p4-natss3, ping proxy t1bx; then ping client t14k,
-rebase p2-land (worktree /Users/r/repos/plenary-p2, clean; head 3fa2d3a) onto main, start p2-swap
-(name plenary-p2-swap; brief docs/m2/briefs/p2-swap.md), merge, then p-arch + architecture audit.
+In flight: p2-swap (t1dh, name plenary-p2-swap) in worktree /Users/r/repos/plenary-p2 (p2-land rebased on main, head
+892ee6e); t18c fixing R5-M1 (Linux burst test, test only) in the shared tree. Proxy t1bx holds the push until R5-M1
+and platform's p5-tidy land: ping t1bx when R5-M1 commits. After p2-swap: verifier (CHECKER) + client p6-landv
+already PASS, then one merge into main, send id to t14k and t1bx; then p-arch + architecture audit.
 
 | Job | Terminal | Status |
 |---|---|---|
-| p3-fix4 (builder) | t18c | reported fix round 4, idle (kept for a fix round) |
-| p3-scaffoldv3 (verifier, round 5) | t17j | RUNNING |
-| p3-scaffoldv2 / p3-scaffoldv (old verifiers) | t16y / t158 | idle; close at scaffold commit |
-| p4-pg builder / verifier | t17d / t17p | PASS, idle; close after p4-pg commit |
-| p4-natss3 builder / verifier | t17f / t17m | PASS, idle; close after p4-natss3 commit |
+| p2-swap (builder) | t1dh | RUNNING (worktree) |
+| p3-fix4 / R5-M1 (builder) | t18c | RUNNING (test/server/outbound.test.js only) |
 | p2-recovery builder | t15q | idle; close at phase-2 merge (+ remove its old worktree) |
-| p1-v11 builder / verifier | t186 / t188 | committed cb343b9; close at phase-2 merge |
+| p1-v11 builder / verifier | t186 / t188 | idle; close at phase-2 merge |
 
-Committed on p2-land: 5d55112 (v1.1 code), 3fa2d3a (client p6-land + p7-collab). Closed: t18b, t171.
+On main: 7b6a5dd scaffold, b804f3b p4-pg, bbdae0e p4-natss3. On p2-land: a68e9dc v1.1 code, 892ee6e client.
+Closed: t18b, t171, t16y, t158, t17d, t17p, t17f, t17m, t17j. Leftover scratch: t17j ~1 GB and t18c 168 MB in their
+scratchpads (their rm was refused); remove when convenient.
 
 ## 2026-11-11 phase 1 (protocol v1 spec)
 
@@ -208,3 +207,4 @@ Committed on p2-land: 5d55112 (v1.1 code), 3fa2d3a (client p6-land + p7-collab).
 - New naming rule (OFFICE.md 7f680a3): sessions named plenary-<job> / plenary-<job>v via hc run --name and claude -n; tab labels carry ' · <id>'. Applies to every session I start (next: t17j re-verify is an existing session; p2-swap builder will be plenary-p2-swap).
 - p3-fix4 (t18c) reported: R4-H2 real cause was flush() sending past the socket limit behind a big snapshot (fixed: wait for drain; backpressureLimit 450 MB from spec caps at 3 B/char; UTF-8 byte counting; loud log). R4-H1 tests now event-driven. Gate: loaded 21/21, quiet 17/20 (3 = platform test/auth/http.test.js during their edits), kill -9 30/30 + 15/15. Decision (mine): Bun's WS client closes on messages > 128 MiB; not a server bug, not blocking. Queued protocol items: § Limits stated in UTF-8 bytes; snapshot sent in parts (v1.2; also needed by a Bun-based load tool at M4). Round 5 re-verify sent to t17j.
 - Proxy is now t1bx (t14h retired, handoff 9d06783). Report there; ping on the scaffold commit.
+- Scaffold 7b6a5dd, p4-pg b804f3b, p4-natss3 bbdae0e committed (bun test 512/0 shared tree). p2-land rebased (892ee6e): protocol+web+auth 551/2 (platform google-live, p5-tidy fixing); test/server fails until p2-swap. Security review of 7b6a5dd: 2 MEDIUM (live queue cap; revocation) folded into p2-swap brief d81771c. p2-swap started t1dh.

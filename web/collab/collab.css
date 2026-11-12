@@ -1,0 +1,64 @@
+/* web/collab: styles the collaboration UI adds on top of web/style.css (which already has .av, .pin, .pop,
+   .msg, .chip-r, .emote, .emote-picker, .note-row, .seg from the approved mock). Tokens only, both themes. */
+.collab-layer { position: absolute; inset: 0; pointer-events: none; z-index: 15; }
+.collab-layer .pin, .collab-layer .pop, .collab-layer .emote-picker, .collab-toast { pointer-events: auto; }
+.collab-pins, .collab-floats, .collab-pophost { position: absolute; inset: 0; }
+
+.pin { border: 0; }
+.pin.pending { opacity: .6; outline: 2px dashed var(--accent); outline-offset: 1px; }
+.pin.detached { box-shadow: 0 0 0 2px var(--chrome), 0 0 0 3px var(--warn); }
+
+.collab-pop textarea.field { color: var(--fg); resize: vertical; font: inherit; font-size: 12.5px; min-height: 34px; }
+.collab-pop .spacer { flex: 1; }
+.collab-pop .anchor.muted { color: var(--muted); font-size: 12px; }
+.collab-pop.compose .reply { margin-top: 12px; }
+.msg .mbody { min-width: 0; flex: 1; }
+.msg p { white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg p.deleted { color: var(--dim); font-style: italic; }
+.msg.pending { opacity: .62; }
+.msg .who { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 6px; overflow-wrap: anywhere; }
+.msg .who span { margin-left: 0; }
+.msg .who .sending { color: var(--accent); }
+.msg .who .del { margin-left: auto; font-size: 11px; white-space: nowrap; color: var(--muted); text-decoration: underline; }
+.react-chips.collab-chips { position: static; display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+.chip-r { cursor: pointer; color: var(--fg); }
+.chip-r[disabled] { cursor: default; }
+.chip-r.pending { border-style: dashed; }
+.collab-reactrow { display: flex; flex-wrap: wrap; gap: 2px; margin-top: 4px; background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 2px 4px; width: fit-content; }
+.collab-reactrow button { width: 28px; height: 28px; border-radius: 14px; font-size: 16px; }
+.collab-reactrow button:hover { background: var(--hover); }
+
+.collab-picker { left: 50%; transform: translateX(-50%); bottom: 62px; }
+.collab-float { bottom: 70px; animation: collab-rise 2.4s ease-out forwards; }
+@keyframes collab-rise { from { transform: translateY(0); opacity: 1; } to { transform: translateY(-140px); opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .collab-float { animation: collab-fade 2.4s linear forwards; } }
+@keyframes collab-fade { from { opacity: 1; } to { opacity: 0; } }
+
+.collab-toast { position: absolute; left: 50%; top: 12px; transform: translateX(-50%); background: var(--raised); color: var(--fg);
+  border: 1px solid var(--bad); border-radius: 8px; padding: 6px 12px; font-size: 12px; box-shadow: var(--shadow); max-width: min(480px, calc(100% - 32px)); overflow-wrap: anywhere; }
+
+.collab-avatars.stale .stack { opacity: .45; filter: grayscale(1); }
+.collab-avatars.stale .av.live::after { display: none; }
+.collab-emotes .tb b { font-weight: 600; font-variant-numeric: tabular-nums; margin-left: 2px; font-size: 11px; }
+
+.collab-drawer { display: flex; flex-direction: column; min-height: 0; height: 100%; }
+.collab-drawer .notes-list { overflow: auto; flex: 1; }
+.collab-drawer .note-row .txt { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+.collab-drawer .acts { display: flex; gap: 8px; font-size: 11px; color: var(--muted); margin-top: 2px; }
+.collab-drawer .meta { display: flex; gap: 8px; font-size: 11px; color: var(--muted); }
+.collab-drawer .author { font-weight: 600; }
+.collab-drawer .hint { padding: 8px; }
+.collab-listtabs { padding: 6px 8px 8px; }
+.thread-row { cursor: pointer; }
+.thread-row.done { opacity: .6; }
+.thread-row.on { background: var(--accent-soft); }
+.thread-row .av { margin: 0; flex-shrink: 0; }
+
+@media (max-width: 640px) {
+  .collab-picker { bottom: 130px; }
+  .collab-avatars .stack .av:nth-child(n+3):not(.more) { display: none; }
+  .collab-avatars .eye, .collab-avatars .wtxt { display: none; }
+  .collab-pop { left: 8px !important; right: 8px; width: auto; top: auto !important; bottom: 76px; }
+  .collab-emotes .tb:nth-child(n+4):not(:last-child) { display: none; }
+  .collab-emotes .sep { display: none; }
+}

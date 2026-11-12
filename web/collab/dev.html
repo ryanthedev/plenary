@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Plenary collab dev</title>
+<link rel="stylesheet" href="../style.css">
+<link rel="stylesheet" href="collab.css">
+<style>
+  .devbar { font-size: 11px; color: var(--muted); }
+  .devbar select { font: inherit; }
+  #board, #overlay { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #overlay { pointer-events: none; z-index: 4; }
+  .canvas { position: relative; flex: 1; overflow: hidden; background: var(--page); }
+  .main { flex: 1; display: flex; min-height: 0; }
+  @media (max-width: 640px) { .board-name small, .devbar { display: none; } .drawer { display: none; } }
+</style>
+</head>
+<body>
+<!-- The collaboration UI over the fake port (web/collab/fake-port.js), with two fake peers and a crowd.
+     Serve the repo root over HTTP (module scripts don't load from file://) and open /web/collab/dev.html.
+     URL: ?role=owner|editor|annotator|commenter|viewer&theme=light|dark&open=<thread id>&drawer=notes|comments
+     &picker=1&pending=1&conn=offline&still=1 (no animation: for screenshots). -->
+<div class="app">
+  <header class="topbar" id="topbar">
+    <span class="board-name">Q4 All-hands <small class="dim">· collab dev</small></span>
+    <span class="devbar" id="devbar"></span>
+    <span class="spacer"></span>
+    <span id="avatars"></span>
+    <button class="tb" id="themeBtn" title="Light / dark"></button>
+  </header>
+  <div class="main">
+    <aside class="drawer" id="drawer"></aside>
+    <div class="canvas" id="canvas">
+      <canvas id="board" aria-label="Board"></canvas>
+      <canvas id="overlay" aria-hidden="true"></canvas>
+      <div class="hud hud-bc" id="hudBC"></div>
+      <div class="hud hud-br" id="hudBR"></div>
+    </div>
+  </div>
+</div>
+<script type="module" src="dev.js"></script>
+</body>
+</html>

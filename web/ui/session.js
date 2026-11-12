@@ -26,11 +26,13 @@ const ORDER = { viewer: 0, annotator: 1, presenter: 2 };
 
 /**
  * @param {{ join: () => object, token: string, board: string, client?: string, mine?: Iterable<string>,
- *           noteAuthor?: (id: string) => string | null, user?: string, onChange?: () => void, clock?: () => number }} o
+ *           noteAuthor?: (id: string) => string | null, user?: string, onChange?: () => void, clock?: () => number,
+ *           timers?: object, now?: () => number, random?: () => number }} o
  *   join: a fresh transport per stream (sync.js's transport port). mine: note ids this person made (kept by the
  *   page across reloads). noteAuthor: the v1 snapshot's table when it exists (SEAM(v1): null in v0).
+ *   timers / now / random: handed to bindEditor (tests pass a virtual clock; the page uses the defaults).
  */
-export function createSession({ join, token, board, client = "web", mine = [], noteAuthor = () => null, user = null, onChange = () => {}, clock } = {}) {
+export function createSession({ join, token, board, client = "web", mine = [], noteAuthor = () => null, user = null, onChange = () => {}, clock, timers, now, random } = {}) {
   const eds = { board: new Editor({ clock }), notes: new Editor({ clock }) };
   const binds = {};
   const s = {
@@ -52,14 +54,26 @@ export function createSession({ join, token, board, client = "web", mine = [], n
       if (m.noteAuthor && typeof m.noteAuthor === "object") for (const [id, u] of Object.entries(m.noteAuthor)) authors.set(id, u);
     }
   }
-  const watched = stream => { const t = join(stream); return { ...t, send: m => t.send(m), onMessage: fn => t.onMessage(m => { sniff(m); fn(m); }), reopen: t.reopen && (() => t.reopen()) }; };
+  // The transport as sync.js gets it (its contract: web/sync.js header), with the room's messages read on
+  // the way in. Kept in s.links for the dev hook dropConnection().
+  const links = {};
+  const watched = stream => {
+    const t = join(stream);
+    return links[stream] = { ...t, send: m => t.send(m), onMessage: fn => t.onMessage(m => { sniff(m); fn(m); }), reopen: () => t.reopen() };
+  };
+  const clocked = Object.fromEntries(Object.entries({ timers, now, random }).filter(([, v]) => v != null));
 
   for (const stream of ["board", "notes"]) {
     const ed = eds[stream];
-    binds[stream] = bindEditor(ed, { transport: watched(stream), token, board, client: `${client}-${stream}`, stream, onStatus: () => { s.refreshRole(); onChange(); } });
+    binds[stream] = bindEditor(ed, { transport: watched(stream), token, board, client: `${client}-${stream}`, stream, onStatus: () => { s.refreshRole(); onChange(); }, ...clocked });
     const inner = ed.onOp;
     ed.onOp = op => {
-      if (!allowed(stream, op)) { s.blocked++; binds[stream].reconnect(); return; }
+      if (!allowed(stream, op)) {
+        s.blocked++;
+        // p6-uiv L2: say so; a draft or drag dropped silently looks like a bug.
+        s.flash = s.readOnly || s.effective === "viewer" ? "Not sent: the room now gives you view-only access" : "Not sent: your role can't make that change";
+        binds[stream].reconnect(); onChange(); return;
+      }
       if (stream === "notes") for (const el of op.elements ?? []) if (!known.has(el.id)) s.mine.add(el.id);
       if (op.elements?.length || op.appState) s.sent++;
       inner(op);
@@ -80,14 +94,21 @@ export function createSession({ join, token, board, client = "web", mine = [], n
     role: { get: () => s.chrome ?? "viewer" },
     effective: { get: () => uiRole(s.roleSeen) },
     readOnly: { get: () => !!s.chrome && ORDER[uiRole(s.roleSeen)] < ORDER[s.chrome] },
-    status: { get: () => { const a = binds.board.status, b = binds.notes.status; return a === b ? a : a === "refused" || b === "refused" ? "refused" : a === "live" ? b : a; } },
+    // The worse of the two streams: stopped (update the app) > refused (sign in) > connecting > catching-up > live.
+    status: { get: () => { const a = binds.board.status, b = binds.notes.status; for (const w of ["stopped", "refused"]) if (a === w || b === w) return w; return a === b ? a : a === "live" ? b : a; } },
     pending: { get: () => binds.board.pending + binds.notes.pending },
     ed: { get: () => eds[s.active] },
   });
 
-  const may = () => s.online !== false && canEdit(s.effective, s.readOnly) && canEdit(s.role);
+  // Two questions (p6-uiv M1). `may`: can a NEW gesture, tool or command start (needs the role and the browser
+  // online). The backstop asks only the role: a text box or drag already open when the connection drops
+  // still commits, and sync.js holds the op until the room is back (an acked op is never lost; an unsent
+  // one waits). Going offline never drops a draft.
+  const roleMay = () => canEdit(s.effective, s.readOnly) && canEdit(s.role);
+  const may = () => s.online !== false && roleMay();
+  const streamOk = stream => (stream === "notes" ? s.effective !== "viewer" : s.effective === "presenter");
   s.may = may;
-  s.canWriteStream = stream => may() && (stream === "notes" ? s.effective !== "viewer" : s.effective === "presenter");
+  s.canWriteStream = stream => may() && streamOk(stream);
 
   // Is this note element one the person may change? Presenters moderate every note.
   s.isMine = id => {
@@ -99,7 +120,7 @@ export function createSession({ join, token, board, client = "web", mine = [], n
 
   function allowed(stream, op) {
     if (!op.elements?.length && !op.appState) return true;          // files only: never sent (sync.js strips them)
-    if (!s.canWriteStream(stream)) return false;
+    if (!roleMay() || !streamOk(stream)) return false;
     if (stream === "notes" && s.effective !== "presenter") {
       if (op.appState) return false;                                 // a stream's settings are the moderators'
       for (const el of op.elements ?? []) if (known.has(el.id) && !s.isMine(el.id)) return false;
@@ -272,7 +293,10 @@ export function createSession({ join, token, board, client = "web", mine = [], n
   s.textEditor = () => (eds.board.text ? eds.board : eds.notes.text ? eds.notes : null);
   s.takeFlash = () => { const f = s.flash ?? eds.board.flash ?? eds.notes.flash; s.flash = eds.board.flash = eds.notes.flash = null; return f; };
 
-  s.reconnect = () => { binds.board.reconnect(); binds.notes.reconnect(); };
+  /** Reconnect both streams now; `token` signs in again after `refused`. */
+  s.reconnect = token => { binds.board.reconnect(token); binds.notes.reconnect(token); };
+  /** Dev/test hook: both connections drop without asking (the transport's fail(), where it has one). */
+  s.dropConnection = () => { for (const t of Object.values(links)) t.fail?.(); };
   return s;
 }
 

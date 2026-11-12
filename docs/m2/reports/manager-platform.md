@@ -230,3 +230,7 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   first; re-check the diff if those files moved). Sessions t17n, t17r closed, killed, removed.
 - p8-deps: DONE, committed after engine's 0d40b86 (package.json + bun.lock). `bun install --frozen-lockfile` clean,
   bun test 315 pass, YAML parses.
+- pd-drawhv re-check (t155): FAIL, 1 new HIGH (present since the first cut): R1, a stale drawh save silently
+  reverts a peer's board-settings change for everyone (28 of 35 while an agent draws; codex agrees). Graded HIGH
+  by me. Plus RM1 (FAT disk: swap is a plain rename), RM2 (link fallback losses, accepted), RM3 (seeding hazard
+  facts for the doc). Fix round 2 on t14y (40% context; told to hand off at 60%).

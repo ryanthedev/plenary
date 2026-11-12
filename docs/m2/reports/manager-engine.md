@@ -208,3 +208,4 @@ scratchpads (their rm was refused); remove when convenient.
 - Proxy is now t1bx (t14h retired, handoff 9d06783). Report there; ping on the scaffold commit.
 - Scaffold 7b6a5dd, p4-pg b804f3b, p4-natss3 bbdae0e committed (bun test 512/0 shared tree). p2-land rebased (892ee6e): protocol+web+auth 551/2 (platform google-live, p5-tidy fixing); test/server fails until p2-swap. Security review of 7b6a5dd: 2 MEDIUM (live queue cap; revocation) folded into p2-swap brief d81771c. p2-swap started t1dh.
 - R5-M1 committed ffd2a11 (test only; re-ran 3x 22/0). Proxy t1bx told. t1dh told to cherry-pick ffd2a11 into p2-land. t18c closed.
+- CEO rule (2026-11-12): never prompt/hc send the proxy t1bx; report by ending the turn with one short message (outcome first, report path); 'URGENT' first if urgent. Phase 3 audited and pushed to origin (378d089, clean 510/0).

@@ -7,8 +7,6 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
 | pd-drawh (builder) | t14y | done pd-drawh (platform) | fix round RUNNING |
-| p5-flake (builder) | t182 | done p5-flake (platform) | reported, idle |
-| p5-flakev (verifier) | t183 | verifier p5-flakev (platform): deterministic replay-guard test | RUNNING |
 | pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | FAIL (2 HIGH), idle; re-checks after fix |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
@@ -237,3 +235,6 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   by me. Plus RM1 (FAT disk: swap is a plain rename), RM2 (link fallback losses, accepted), RM3 (seeding hazard
   facts for the doc). Fix round 2 on t14y (40% context; told to hand off at 60%).
 - p5-flake (t182): test/auth/http.test.js:503 asserted a wall-clock ratio (failed 2/132 under load, found by client's p6-land). Replace with a deterministic count; must still fail on the old O(n) pruning.
+- p5-flake: DONE (commit c0ff386). Verifier PASS: no wall-clock assertion, fails on three O(n) mutations, 100/100
+  runs under full CPU load. bun test 325 pass. Declined the verifier's extra stress re-run (report already
+  complete); confirmed no leftover load processes. Sessions t182, t183 closed, killed, removed.

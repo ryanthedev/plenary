@@ -1,0 +1,307 @@
+// The client's copy (PROTOCOL.md rules 2, 4, 5, 12, 13; § Pacing; normalize on send), driven by hand:
+// one Replica on an ordered link to a room, with the clock in the test's hands.
+import { test, expect } from "bun:test";
+import { direct, world, errors } from "./world.js";
+import { Replica } from "../packages/protocol/replica.js";
+import { Doc } from "../packages/core/doc.js";
+import { makeElement, touch, clone, emptyScene } from "../packages/core/model.js";
+
+const rect = (id, extra = {}) => makeElement("rectangle", { id, ...extra });
+const wire = m => JSON.parse(JSON.stringify(m));
+
+/** A replica on a link: `open()` connects, `up()` sends what is due, `down()` delivers the room's answers. */
+function link(d, clock, user = "u1", role = "editor", name = "c") {
+  const l = { r: new Replica({ client: name, now: () => clock.t, random: () => 0 }), inbox: [], sent: [], c: null, n: 0, did: [] };
+  l.open = () => {
+    if (l.c) d.room.disconnect(l.c);
+    l.inbox = []; l.n = 0; l.c = d.room.connect(m => l.inbox.push(wire(m)));
+    const [hello] = l.r.connectMessages("tok", "b1");
+    d.room.receive(l.c, wire(hello), { n: ++l.n, user, role });
+    return l;
+  };
+  l.up = () => { const out = l.r.outgoing(); for (const m of out) { l.sent.push({ id: m.id, at: clock.t }); d.room.receive(l.c, wire(m), { n: ++l.n }); } return out; };
+  l.down = () => { const got = l.inbox; l.inbox = []; for (const m of got) l.did.push(l.r.receive(m)); return got; };
+  l.sync = () => { for (let i = 0; i < 10; i++) { l.down(); l.up(); } l.down(); return l; };
+  return l;
+}
+
+test("normalize on send: a 5,000-move drag then one send is accepted; a seeded element goes out at version 1", () => {
+  const d = direct(), clock = { t: 0 }, a = link(d, clock).open().sync();
+  a.r.local("board", { elements: [rect("box")] }); a.sync();
+  expect(d.room.streams.board.get("box").version).toBe(1);
+  const dragged = clone(a.r.streams.board.get("box"));
+  for (let i = 0; i < 5000; i++) { touch(dragged); dragged.x = i; }           // an editor bumps the version on every move
+  expect(dragged.version).toBe(5001);
+  const m = a.r.local("board", { elements: [dragged] });
+  expect(m.op.elements[0].version).toBe(2);                                   // one past what the replica knows
+  expect(m.op.elements[0].versionNonce).not.toBe(dragged.versionNonce);       // and a fresh nonce
+  expect(dragged.version).toBe(5001);                                         // the caller's object is left alone
+  a.sync();
+  expect(errors(a)).toEqual([]);
+  expect(a.r.pending.size).toBe(0);
+  expect(d.room.streams.board.get("box")).toMatchObject({ x: 4999, version: 2 });
+  // Seeding from a file: whatever version the file says, an id the replica doesn't know goes out at 1.
+  expect(a.r.local("board", { elements: [rect("seeded", { version: 9999 })] }).op.elements[0].version).toBe(1);
+  // Several pending edits of one element stack: 3, 4, 5.
+  const more = [1, 2, 3].map(i => a.r.local("board", { elements: [{ ...clone(a.r.streams.board.get("box")), x: -i }] }).op.elements[0].version);
+  expect(more).toEqual([3, 4, 5]);
+  a.sync();
+  expect(d.room.streams.board.get("box")).toMatchObject({ x: -3, version: 5 });
+  expect(d.room.streams.board.get("seeded").version).toBe(1);
+  expect(a.r.state().board).toEqual({ elements: [...d.room.streams.board.byId.values()].sort((x, y) => (x.id < y.id ? -1 : 1)), appState: d.room.streams.board.appState.herdr });
+});
+
+test("a refused element op: receive() says so, the copy is reset, pending ops stay visible, and the caller is told to reconnect from 0", () => {
+  const d = direct(), clock = { t: 0 }, ed = link(d, clock, "u0", "editor", "e").open().sync(), a = link(d, clock, "u1", "annotator", "a").open().sync();
+  ed.r.local("board", { elements: [rect("theirs")] }); ed.sync(); a.sync();
+  expect(a.r.applied).toBe(1);
+  const bad = a.r.local("board", { elements: [{ ...clone(a.r.streams.board.get("theirs")), x: 999 }] });   // an annotator can't write the board
+  const note = a.r.local("notes", { elements: [rect("my-note")] });                                         // a good op behind it
+  expect(a.r.streams.board.get("theirs").x).toBe(999);                        // shown at once
+  a.up();
+  const [refusal, ack] = a.inbox; a.inbox = [];
+  expect([refusal.code, refusal.id, ack.t]).toEqual(["forbidden", bad.id, "ack"]);
+  const did = a.r.receive(refusal);
+  expect(did).toEqual({ entries: [], snapshot: false, reset: true, settled: [], dropped: [bad.id] });
+  expect([a.r.resync, a.r.applied]).toEqual([true, 0]);
+  expect(a.r.streams.board.getAny("theirs")).toBe(null);                      // the copy is gone…
+  expect(a.r.streams.notes.get("my-note")).toBeTruthy();                      // …but the pending note is still shown
+  expect([...a.r.pending.keys()]).toEqual([note.id]);
+  expect(a.r.outgoing()).toEqual([]);                                         // nothing more on this connection
+  expect(a.r.connectMessages("tok", "b1")).toEqual([{ t: "hello", v: 1, token: "tok", board: "b1", since: 0, client: a.r.client }]);
+  a.open().sync();                                                            // a new connection, never a second hello
+  expect(a.r.pending.size).toBe(0);
+  expect(a.r.streams.board.get("theirs").x).toBe(0);
+  expect(d.log.entries.map(e => e.id)).toEqual([`${ed.r.client}:1`, note.id]);  // the note landed once
+});
+
+test("receive() returns what it applied: entries in seq order, a snapshot, what settled", () => {
+  const d = direct(), clock = { t: 0 }, a = link(d, clock, "u0", "editor", "a").open().sync(), b = link(d, clock, "u1", "editor", "b").open().sync();
+  const m = a.r.local("board", { elements: [rect("one")] }); a.r.local("board", { elements: [rect("two")] }); a.up();
+  const entries = b.inbox.flatMap(x => x.entries); b.inbox = [];
+  expect(b.r.receive({ t: "entries", entries: [entries[1]] }).entries).toEqual([]);                 // ahead of a gap: buffered
+  expect(b.r.receive({ t: "entries", entries: [entries[0]] }).entries.map(e => e.seq)).toEqual([1, 2]);
+  expect(b.r.receive({ t: "entries", entries }).entries).toEqual([]);                                // a repeat applies nothing
+  const acks = a.inbox.filter(x => x.t === "ack"), mine = a.inbox.filter(x => x.t === "entries"); a.inbox = [];
+  expect(a.r.receive(acks[0])).toMatchObject({ entries: [], settled: [] });                          // acked, entry not yet applied
+  expect(a.r.receive(mine[0])).toMatchObject({ settled: [m.id] });
+  expect(a.r.receive({ ...mine[1], entries: mine[1].entries.map(e => ({ ...e, by: "someone-else" })) }).settled).toEqual([]);   // rule 4: same id, another user
+  expect(a.r.pending.size).toBe(1);
+  d.room.checkpoint();
+  const late = link(d, clock, "u2", "viewer", "late").open();
+  expect(late.r.receive(late.inbox[1])).toMatchObject({ snapshot: true, entries: [] });
+  expect(late.r.streams.board.live().length).toBe(2);
+});
+
+test("ops wait for welcome; resends go right after it, new ops only once caught up; each op is written once per connection", () => {
+  const d = direct(), clock = { t: 0 }, other = link(d, clock, "u0", "editor", "o").open().sync();
+  for (let i = 0; i < 3; i++) other.r.local("board", { elements: [rect(`o${i}`)] });
+  other.sync();
+  const a = link(d, clock, "u1", "editor", "a");
+  const first = a.r.local("board", { elements: [rect("early")] });            // made before any connection
+  expect(a.r.outgoing()).toEqual([]);
+  a.open();
+  expect(a.r.outgoing()).toEqual([]);                                         // no welcome yet
+  const [welcome, catchUp] = a.inbox; a.inbox = [];
+  a.r.receive(welcome);
+  expect(a.r.outgoing()).toEqual([]);                                         // welcomed, but behind welcome.seq
+  a.r.receive(catchUp);
+  const out = a.up();
+  expect(out.map(m => [m.id, m.sentAt])).toEqual([[first.id, 3]]);            // sentAt = the seq applied when first sent
+  expect(a.r.outgoing()).toEqual([]);                                         // never resent on a live connection
+  clock.t += 9000;
+  expect(a.r.outgoing()).toEqual([]);
+  // The ack is lost with the connection. On the next one the op is a resend: it goes right after welcome.
+  for (let i = 3; i < 6; i++) other.r.local("board", { elements: [rect(`o${i}`)] });
+  other.sync();
+  a.open();
+  const second = a.r.local("board", { elements: [rect("later")] });
+  a.r.receive(a.inbox.shift());                                               // the welcome only: still behind
+  expect(a.r.outgoing().map(m => [m.id, m.sentAt])).toEqual([[first.id, 3]]); // same id, same sentAt; the new op waits
+  a.sync();
+  expect(a.sent.map(s => s.id)).toEqual([first.id, second.id]);
+  expect(d.log.entries.filter(e => e.by === "u1").map(e => e.id)).toEqual([first.id, second.id]);
+  expect(a.r.pending.size).toBe(0);
+});
+
+test("pacing: 250 pending ops leave at the rate after welcome (100, then 20 a second), none refused, all acked", () => {
+  const d = direct(), clock = { t: 0 }, a = link(d, clock).open().sync();
+  for (let i = 0; i < 250; i++) a.r.local("board", { elements: [rect(`e${i}`)] });
+  expect(a.r.outgoing().length).toBe(100);                                    // written, then the connection dies: lost
+  clock.t += 60_000;
+  a.open(); a.down();
+  expect(a.up().length).toBe(100);                                            // the burst
+  expect(a.r.paceWait()).toBe(50);                                            // one more in 50 ms
+  expect(a.up().length).toBe(0);
+  clock.t += 49; expect(a.up().length).toBe(0);
+  clock.t += 1; expect(a.up().length).toBe(1);
+  a.down();
+  while (a.r.paceWait() !== null) { clock.t += a.r.wait(); a.up(); a.down(); }
+  expect(a.sent.length).toBe(250);
+  const start = a.sent[0].at, bySecond = s => a.sent.filter(x => x.at - start >= s * 1000 && x.at - start < (s + 1) * 1000).length;
+  expect([0, 1, 2, 3, 4, 5, 6, 7].map(bySecond)).toEqual([119, 20, 20, 20, 20, 20, 20, 11]);   // 100 at once, then 20/s
+  expect(new Set(a.sent.map(s => s.id)).size).toBe(250);                      // each once
+  expect(a.sent.map(s => Number(s.id.split(":")[1]))).toEqual(Array.from({ length: 250 }, (_, i) => i + 1));   // in counter order
+  expect(a.did.flatMap(x => x.dropped)).toEqual([]);
+  expect(errors(a)).toEqual([]);
+  expect([a.r.pending.size, a.r.resync, d.log.entries.length]).toEqual([0, false, 250]);
+});
+
+test("rule 2's timeout counts from the send, not from waiting on the pace; then the connection is suspect and ops are kept", () => {
+  const d = direct(), clock = { t: 0 }, a = link(d, clock).open().sync();
+  for (let i = 0; i < 101; i++) a.r.local("board", { elements: [rect(`e${i}`)] });
+  a.up(); a.down();                                                           // 100 sent and acked; one waits for the pace
+  expect(a.r.pending.size).toBe(1);
+  clock.t += 30_000;                                                          // it waited far longer than 10 s, unsent
+  const [late] = a.r.outgoing();                                              // written now (to a socket that then stalls)
+  expect(late.id).toBe(`${a.r.client}:101`);
+  expect(a.r.resync).toBe(false);
+  expect(a.r.wait()).toBe(10_000);
+  clock.t += 9999; a.r.outgoing(); expect(a.r.resync).toBe(false);
+  clock.t += 1; expect(a.r.outgoing()).toEqual([]);
+  expect([a.r.resync, a.r.pending.size, a.r.applied]).toEqual([true, 1, 100]);   // reconnect; nothing dropped, no reset
+  a.open().sync();
+  expect([a.r.pending.size, d.log.entries.length]).toEqual([0, 101]);
+});
+
+test("rule 12: no welcome, or no catch-up progress, for 10 s asks for a reconnect; waits grow, with jitter, and reset once caught up", () => {
+  const d = direct(), clock = { t: 0 }, other = link(d, clock, "u0", "editor", "o").open().sync();
+  other.r.local("board", { elements: [rect("x")] }); other.sync();
+  let roll = 0;
+  const r = new Replica({ client: "t", now: () => clock.t, random: () => roll });
+  expect(r.wait()).toBe(null);                                                // not connected: nothing to wait for
+  r.connectMessages("tok", "b1");                                             // the hello is lost
+  expect(r.wait()).toBe(10_000);
+  clock.t += 9999; r.outgoing(); expect(r.resync).toBe(false);
+  clock.t += 1; r.outgoing();
+  expect([r.resync, r.fails]).toEqual([true, 1]);
+  expect(r.reconnectWait()).toBe(500);                                        // min(30 s, 0.5 s × 2^1) × 0.5
+  roll = 0.999; expect(Math.round(r.reconnectWait())).toBe(1000);             // × [0.5, 1)
+  roll = 0;
+  r.connectMessages("tok", "b1");
+  r.receive({ t: "welcome", seq: 1, role: "editor", user: "u1", high: 0, horizon: 0, rv: 1 });   // then the catch-up is lost
+  clock.t += 10_000; r.outgoing();
+  expect([r.resync, r.fails]).toEqual([true, 2]);
+  expect(r.reconnectWait()).toBe(1000);
+  r.fails = 12; expect(r.reconnectWait()).toBe(15_000);                       // capped at 30 s (× 0.5)
+  r.connectMessages("tok", "b1");
+  r.receive({ t: "welcome", seq: 1, role: "editor", user: "u1", high: 0, horizon: 0, rv: 1 });
+  clock.t += 9000;
+  r.receive({ t: "entries", entries: [d.log.entries[0]] });                   // progress: caught up
+  expect(r.fails).toBe(0);
+  clock.t += 60_000; r.outgoing();
+  expect(r.resync).toBe(false);                                               // an idle, healthy connection never times out
+  expect(r.reconnectWait()).toBe(250);
+});
+
+test("unavailable and auth are not refusals: pending ops are kept, the copy is kept; version stops the client", () => {
+  const d = direct(), clock = { t: 0 }, a = link(d, clock).open().sync();
+  a.r.local("board", { elements: [rect("kept")] }); a.sync();
+  const m = a.r.local("board", { elements: [rect("pending")] });
+  expect(a.r.receive({ t: "error", id: m.id, code: "unavailable", message: "moving" })).toMatchObject({ reset: false, dropped: [] });
+  expect([a.r.resync, a.r.pending.size, a.r.applied, a.r.fails]).toEqual([true, 1, 1, 1]);
+  a.r.connectMessages("tok", "b1");
+  a.r.receive({ t: "error", code: "auth", message: "sign in" });
+  expect([a.r.needAuth, a.r.resync, a.r.pending.size, a.r.applied]).toEqual([true, false, 1, 1]);
+  clock.t += 60_000;                                                          // no timer may turn a refusal into a blind retry
+  expect([a.r.outgoing(), a.r.wait(), a.r.resync, a.r.fails]).toEqual([[], null, false, 1]);
+  a.open().sync();
+  expect([a.r.pending.size, d.log.entries.length, a.r.fails]).toEqual([0, 2, 0]);
+  const b = link(d, clock, "u2", "editor", "b").open().sync();
+  b.r.local("board", { elements: [rect("never")] });
+  b.r.receive({ t: "entries", entries: [{ ...d.log.entries[0], seq: 3, rv: 99 }] });                // rules this app doesn't know
+  expect(b.r.stopped).toBe("version");
+  expect(b.r.outgoing()).toEqual([]);
+  expect(b.r.pending.size).toBe(1);
+});
+
+test("rule 13: pending ops belong to the user who made them; another user's welcome drops them and says how many", () => {
+  const d = direct(), clock = { t: 0 }, a = link(d, clock, "u1").open().sync();
+  a.r.local("board", { elements: [rect("ok")] }); a.sync();
+  a.r.local("board", { elements: [rect("u1-made-this")] }); a.r.local("board", { elements: [rect("and-this")] });
+  a.r.connectMessages("tok2", "b1");
+  const did = a.r.receive({ t: "welcome", seq: 1, role: "editor", user: "u2", high: 0, horizon: 0, rv: 1 });
+  expect(did.dropped.length).toBe(2);
+  expect([a.r.pending.size, a.r.discarded, did.reset, a.r.resync, a.r.user]).toEqual([0, 2, true, true, "u2"]);
+  expect(a.r.streams.board.getAny("u1-made-this")).toBe(null);
+  expect(a.r.outgoing()).toEqual([]);
+  expect(d.log.entries.length).toBe(1);
+});
+
+test("an edit made during a resync is stamped again against the fresh copy and lands live", () => {
+  const w = world(["editor", "editor"], 51);
+  w.settle();
+  const [a, b] = w.clients;
+  w.send(a, "board", { elements: [rect("shape", { x: 64 })] }); w.settle();
+  for (let i = 0; i < 4; i++) { w.send(b, "board", { elements: [clone(b.r.streams.board.get("shape"))] }); w.settle(); }
+  expect(w.room.streams.board.get("shape").version).toBe(5);
+  const onScreen = clone(a.r.streams.board.get("shape"));                     // what a's editor shows
+  const bad = w.send(a, "board", { appState: { bogus: 1 } });
+  w.flush(a);
+  expect(a.r.receive(errors(a).find(e => e.id === bad.id)).reset).toBe(true); // refused: the replica is empty now
+  expect(a.r.streams.board.getAny("shape")).toBe(null);
+  const m = w.send(a, "board", { elements: [{ ...onScreen, x: 564 }] });      // the user nudges it mid-resync
+  expect(m.op.elements[0].version).toBe(1);                                   // all the empty replica can know
+  expect(a.r.streams.board.get("shape").x).toBe(564);                         // and it shows
+  w.settle();                                                                 // reconnect from 0, catch up, then send
+  const entry = w.log.entries.find(e => e.id === m.id);
+  expect(entry.op.elements[0].version).toBe(6);                               // one past the room's copy, not 1
+  expect(w.room.streams.board.get("shape")).toMatchObject({ x: 564, version: 6 });
+  for (const c of w.clients) expect(c.r.streams.board.get("shape").x).toBe(564);
+  expect(a.r.state()).toEqual(b.r.state());
+  expect(w.log.entries.filter(e => e.id === m.id).length).toBe(1);
+});
+
+test("an unsent edit that a peer overtakes is stamped past the peer's before it goes (never acked dead)", () => {
+  const d = direct(), clock = { t: 0 }, a = link(d, clock, "u0", "editor", "a").open().sync(), b = link(d, clock, "u1", "editor", "b").open().sync();
+  a.r.local("board", { elements: [rect("s")] }); a.sync(); b.sync();
+  for (let i = 0; i < 100; i++) b.r.local("notes", { elements: [rect(`n${i}`)] });
+  b.up(); b.down();                                                           // b's burst is spent
+  const mine = b.r.local("board", { elements: [{ ...clone(b.r.streams.board.get("s")), x: 7 }] });   // waits for the pace, at version 2
+  for (let i = 0; i < 3; i++) { a.r.local("board", { elements: [{ ...clone(a.r.streams.board.get("s")), x: 100 + i }] }); a.sync(); }
+  b.down();                                                                   // a's three edits arrive first: the room is at version 4
+  const stamped = mine.op.elements[0].version;                                // 5, or 4 when b's nonce wins the tie at 4: it leads either way
+  expect(stamped === 5 || stamped === 4).toBe(true);
+  expect(b.r.streams.board.get("s").x).toBe(7);                               // b's own edit is still what b sees
+  clock.t += 1000; b.sync(); a.sync();
+  expect(d.room.streams.board.get("s")).toMatchObject({ x: 7, version: stamped });
+  expect(a.r.streams.board.get("s").x).toBe(7);
+});
+
+test("after a cancelled 5,000-move drag the replica's copy wins, so a peer's edit still applies", () => {
+  const d = direct(), clock = { t: 0 }, a = link(d, clock, "u0", "editor", "a").open().sync(), b = link(d, clock, "u1", "editor", "b").open().sync();
+  a.r.local("board", { elements: [rect("box")] }); a.sync(); b.sync();
+  // a's editor keeps its own copy of the stream (as web/ does), fed with what receive() returns.
+  const editor = new Doc(emptyScene());
+  const feed = did => { for (const e of did.entries) if (e.stream === "board" && e.op.elements) editor.apply({ elements: e.op.elements }); };
+  editor.apply({ elements: [clone(a.r.streams.board.get("box"))] });
+  const live = editor.get("box");
+  for (let i = 0; i < 5000; i++) { touch(live); live.x = i; }                 // the drag: a version per move, no op
+  // Escape: the gesture ends with no commit. The editor's copy is far ahead of the replica's, with nothing pending.
+  expect([editor.get("box").version, a.r.streams.board.get("box").version, a.r.hasPending("board", "box")]).toEqual([5001, 1, false]);
+  const back = a.r.reconcile("board", [...editor.byId.values()]);
+  expect(back.map(el => [el.id, el.version, el.x])).toEqual([["box", 1, 0]]);
+  editor.apply({ elements: back }, { force: true });                          // the replica's copy wins
+  b.r.local("board", { elements: [{ ...clone(b.r.streams.board.get("box")), x: 40 }] }); b.sync();
+  a.down(); a.did.slice(-2).forEach(feed);
+  expect(editor.get("box")).toMatchObject({ x: 40, version: 2 });             // the peer's edit applies
+  expect(editor.get("box")).toEqual(a.r.streams.board.get("box"));
+  // Nothing to reconcile while a real edit is pending, or when the editor is not ahead.
+  const pendingEdit = clone(editor.get("box")); touch(pendingEdit); touch(pendingEdit);
+  a.r.local("board", { elements: [pendingEdit] });
+  expect(a.r.reconcile("board", [pendingEdit])).toEqual([]);
+  expect(a.r.reconcile("board", [clone(a.r.streams.board.get("box"))])).toEqual([]);
+  expect(a.r.reconcile("board", [rect("never-sent", { version: 9 })])).toEqual([{ id: "never-sent", gone: true }]);
+});
+
+test("previews expire after 5 s, clear on leave and on the final op's entry", () => {
+  const clock = { t: 0 }, r = new Replica({ client: "p", now: () => clock.t });
+  const batch = (client, id) => ({ t: "presence", batch: [{ user: "u9", client, k: "preview", stream: "board", elements: [rect(id)] }] });
+  r.receive(batch("x", "one")); clock.t += 3000; r.receive(batch("y", "two"));
+  clock.t += 2000; r.prunePreviews();
+  expect([...r.previews.keys()]).toEqual(["two"]);
+  r.receive(batch("x", "three"));
+  r.receive({ t: "presence", batch: [{ user: "u9", client: "y", k: "leave" }] });
+  expect([...r.previews.keys()]).toEqual(["three"]);
+  expect(r.streams.board.getAny("three")).toBe(null);                         // never merged into the board
+});

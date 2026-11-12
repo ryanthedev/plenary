@@ -7,6 +7,7 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
 | pd-drawh (builder) | t14y | done pd-drawh (platform) | fix round RUNNING |
+| p5-http (builder) | t17b | worker p5-http (platform): sign-in + admin HTTP routes | RUNNING |
 | pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | FAIL (2 HIGH), idle; re-checks after fix |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
@@ -191,3 +192,12 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
   failure in the CI /varz check) fixed by t170 and checked by me (capture, then grep). `bun test`: 263 pass.
 - Nothing run in Docker or on GitHub. Sessions t170, t174 closed, killed, removed.
 - 2026-11-11 proxy: first GitHub run of CI (run 43126348872) green for both jobs, test and test-cluster-services. The workflow and the Postgres/NATS services now verified on GitHub (Docker image and compose still never run).
+
+## 2026-11-11 p5-http started (proxy's suggestion)
+
+- Standalone Request → Response handlers: /auth/login, /auth/callback, /auth/logout, POST /boards, invites, links
+  (incl. GET /links/:id redeem), grants. Folds in p5-fixv MEDIUM 1 (createBoard reports the board id on failure).
+- Design calls (mine, reversible): login state in a signed short-lived HttpOnly SameSite=Lax cookie; callback hands
+  the session token to the web client in the URL fragment of a configured post-login URL (no open redirect);
+  API routes use `Authorization: Bearer` (no cookie auth on mutations, so no CSRF surface).
+- Mount hook proposed to engine (t14j): `httpRoutes(deps) → (req) => Response | null`; awaiting their answer.

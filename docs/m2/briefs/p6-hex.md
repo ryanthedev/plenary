@@ -72,3 +72,12 @@ auth port and fake come from p6-ports; you add `web/adapters/auth/http.js` (fetc
   not slip through).
 - R2-L2: add an `exp`-in-seconds sanity check to authContract (an HTTP adapter returning ms must fail).
 - R2-L1 (browser clock uses performance.now when present) and R2-L4 (items listed there for you).
+
+## Carried from p6-edgev (docs/m2/reports/p6-edgev.md)
+
+- **M1 backpressure:** ws.js sends with no `bufferedAmount` check. Add a `congested()` (or `bufferedAmount`) signal to
+  the transport port; the core drops presence (never ops) above a watermark (about 256 KB); a buffer stuck over a hard
+  cap counts as a drop. Contract test for it.
+- **M2 test gaps in test/web/core/signin.test.js:** a console trap (no logging), a percent-encoded `#code=%41%42`
+  hostile case, and a spy on clock.random (or Math.random stubbed to throw) for the retry jitter.
+- The LOWs listed there.

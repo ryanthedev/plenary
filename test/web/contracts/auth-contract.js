@@ -2,14 +2,18 @@
 // reusable bun tests. Every auth adapter runs it:
 //
 //   authContract("fake", () => { const a = fakeAuth(); return { auth: a, mint: async f => a.mint(f), force: k => a.setFail(k) }; });
-//   authContract("http", makeHttp, { skip: !process.env.PLENARY_LIVE_EXCHANGE });   // a real server
+//   authContract("http", () => httpOverFakeFetch());   // test/web/adapters/auth-http.test.js
 //
 // makeAuth() returns a FRESH adapter and:
 //   mint(fields?)   → a valid, unused code whose session has these fields (name/email/domain may be null); for the
 //                     HTTP adapter, what the server's callback issues (with its __Host-plen_xchg cookie).
-//   force?(kind)    make every following exchange meet this failure: "bad-origin" (a 403), "unavailable" (a 503),
-//                   "network" (no answer: fetch throws), "malformed" (a 200 that is not the shape), null (normal).
-//                   The fake: setFail; http: a fake fetch. Absent (a live server): those tests are skipped.
+//   force(kind)     REQUIRED (p6-portsv R2-M1: a failure test must never pass silently because an adapter cannot be
+//                   forced). Make every following exchange meet this failure: "bad-origin" (a 403), "unavailable"
+//                   (a 503), "network" (no answer: fetch throws), "malformed" (a 200 that is JSON but not the
+//                   shape), null (normal). The fake: setFail; http: a fake fetch. A live server can't be forced, so
+//                   it gets its own tests, not this contract.
+// exp is integer SECONDS since the epoch (p6-portsv R2-L2): mint({ exp }) must come back unchanged, and every
+// session's exp is below 1e11 (a ms value today is ~1.8e12).
 // Errors are matched by value, from AUTH_ERRORS. Nothing may be logged while exchanging (the token and code are
 // secrets): console is watched in every test.
 
@@ -30,12 +34,13 @@ export function expectAuthResult(r) {
   for (const k of ["token", "user"]) { expect(typeof r[k]).toBe("string"); expect(r[k].length).toBeGreaterThan(0); }
   for (const k of ["name", "email", "domain"]) expect(nullableString(r[k])).toBe(true);
   expect(Number.isInteger(r.exp)).toBe(true);
+  expect(r.exp).toBeLessThan(1e11);       // seconds, not ms (R2-L2)
 }
 
 /**
  * @param {string} name
  * @param {() => { auth: import("../../../web/ports/auth.js").Auth, mint(fields?: object): Promise<string>,
- *                 force?(kind: "bad-origin" | "unavailable" | "network" | "malformed" | null): void }} makeAuth
+ *                 force(kind: "bad-origin" | "unavailable" | "network" | "malformed" | null): void }} makeAuth
  * @param {{ skip?: boolean }} [opts]
  */
 export function authContract(name, makeAuth, opts = {}) {
@@ -67,6 +72,13 @@ export function authContract(name, makeAuth, opts = {}) {
       expect(r.user.length).toBeGreaterThan(0);
     });
 
+    test("exp is seconds and passes through unchanged (never converted to or from ms)", async () => {
+      const exp = 1_900_000_000;                       // 2030, in seconds
+      const r = await auth.exchange(await mint({ exp }));
+      expectAuthResult(r);
+      expect(r.exp).toBe(exp);
+    });
+
     test("strings are passed through unchanged", async () => {
       const f = { user: "google:1234", name: "Zoë Ñ", email: "zoe@acme.com", domain: "acme.com" };
       expect(await auth.exchange(await mint(f))).toMatchObject(f);
@@ -93,10 +105,13 @@ export function authContract(name, makeAuth, opts = {}) {
     });
 
     // ── each failure keeps its own value and resolves (p6-portsv H3) ──
+    test("force() is provided (required: otherwise the failure tests below could not run)", () => {
+      expect(typeof force).toBe("function");
+    });
+
     const kinds = [["bad-origin", "bad-origin"], ["unavailable", "unavailable"], ["network", "network"], ["malformed", "unavailable"]];
     for (const [kind, want] of kinds) {
       test(`forced ${kind}: resolves (never rejects) to exactly { error: "${want}" }`, async () => {
-        if (!force) return;
         const code = await mint();
         force(kind);
         let r, threw = null;
@@ -107,7 +122,6 @@ export function authContract(name, makeAuth, opts = {}) {
     }
 
     test("the four failures stay distinct (never collapsed into one value)", async () => {
-      if (!force) return;
       const seen = [];
       for (const kind of ["bad-origin", "unavailable", "network"]) {
         const code = await mint();

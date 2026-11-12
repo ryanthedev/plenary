@@ -26,3 +26,9 @@ Platform tells manager client if the shape changes, and the p5-code commit id wh
   user IS, not how they got access (an invite or share-link user from a Workspace keeps their own domain).
 - `exp`: integer seconds since the epoch.
 - Client-only `{error: "network"}` for no answer or a network error: agreed; the server never sends that code.
+
+## Landed (platform p5-code, 3f6b489 on main)
+
+Shape as above; the 200 body types are pinned. The exchange cookie holds a signed payload (opaque to the client).
+**One origin:** httpRoutes refuses to start unless postLoginUrl, postLogoutUrl, the board URL base and the callback
+share one origin, so web/ and the auth routes are served from the same origin (relative `/auth/exchange` is right).

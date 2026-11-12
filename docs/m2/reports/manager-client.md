@@ -2,10 +2,11 @@
 
 ## Now (kept current every turn; a refreshed manager starts here)
 
-- **Me:** manager client, terminal t14k. Report to the proxy **t1bx**; engine manager **t18m**; platform manager **t187**.
-- **In flight:** p6-edge (t1cy, builder; brief docs/m2/briefs/p6-edge.md): auth HTTP adapter, ws transport adapter,
-  web/core/signin.js, authContract R2-M1/L2 fixes. New files only, on main. Next: its verifier p6-edgev.
-- **Waiting on engine:** the p2-land merge into main (carries phase 2, v1.1, p6-land, p7-collab). t18m pings first.
+- **Me:** manager client, terminal t14k. Report to the proxy **t1bx** ONLY by ending my turn with one short message (outcome
+  first, report path; "Urgent:" first if urgent). NEVER prompt/hc send/SendMessage t1bx (CEO rule, 2026-11-12). Workers report to me only. engine manager **t18m**; platform manager **t187**.
+- **In flight:** nothing running. p6-edge committed (verified PASS); t1cy and t1dx closed.
+- **Waiting on engine:** the p2-land merge into main. p2-land rebased onto main, head 892ee6e (client files 892ee6e,
+  v1.1 a68e9dc); p2-swap (server onto v1) now running there. No client work in the worktree until t18m sends the merge id.
 - **Next, in order:** p6-hex (docs/m2/briefs/p6-hex.md: move web/ onto the ports, auth HTTP adapter per
   docs/m2/contracts/auth-exchange.md, test/web/architecture.test.js on engine's test/arch-scan.js) → p7-wire
   (docs/m2/briefs/p7-wire.md) → an architecture audit of web/.
@@ -16,7 +17,7 @@
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| p6-edge (builder) | t1cy | worker p6-edge (client) · t1cy: edge adapters + sign-in | RUNNING on main (new files + auth-contract.js) |
+| (none running) | | | waiting on engine's p2-land merge; next p6-hex |
 
 ## 2026-11-11 — phase-6 design mock
 
@@ -249,3 +250,9 @@
 - p6-ports fix round 1 done (t18r): all 4 HIGH, both MEDIUM, named LOWs; bun test 585 run, 0 fail (re-run by me). t1b9 on round 2.
 - p6-portsv round 2 PASS (0 HIGH, 1 MEDIUM R2-M1 auth `force` optional, 4 LOW). bun test 588 run, 0 fail (me). Committed p6-ports; R2-M1/L1/L2/L4 carried into p6-hex. t18r, t1b9 closed.
 - Proxy: keep moving before the merge. Started p6-edge (t1cy, plenary-p6-edge): the new-file part of p6-hex (auth HTTP adapter, ws transport adapter with the codec, web/core/signin.js, authContract fixes). arch-scan.js isn't on main yet, so the boundary test stays in p6-hex.
+- Platform p5-code landed on main (3f6b489): exchange shape pinned; web/ and auth routes must be served from one origin. Noted in docs/m2/contracts/auth-exchange.md; told p6-edge.
+- Engine (t18m) rebasing p2-land onto main now (scaffold on main: 7b6a5dd, b804f3b, bbdae0e). No client writes in the worktree until it sends the new head.
+- p2-land rebased: head 892ee6e; 551 pass, 2 fail (platform's google-live, p5-tidy fixing); test/server red until p2-swap lands.
+- CEO rule (OFFICE.md 'The proxy's input is the CEO's'): never message the proxy directly; end the turn with a short report instead. Phase 3 audited and pushed (378d089).
+- p6-edge done (t1cy): bun test 684 run, 0 fail (re-run by me). Risks: no ws backpressure watermark; fragment parse only unescaped values. Verifier p6-edgev (t1dx, plenary-p6-edgev) started.
+- p6-edgev PASS (no HIGH; M1 no ws backpressure, M2 three security rules not pinned by tests; 5 LOW). bun test 684 run, 0 fail (me). Committed p6-edge; M1/M2/LOWs carried into p6-hex. t1cy, t1dx closed.

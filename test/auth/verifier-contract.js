@@ -1,10 +1,12 @@
 // The Verifier port contract (server/auth/idp-port.js: verify(token) → Identity | null, never throws on garbage),
 // as reusable bun tests. Every verifier the Auth port composes (session.js, dev.js) runs the same suite:
 //
-//   verifierContract("sessions", async () => ({ verifier, token, expected, expire }));
+//   verifierContract("sessions", async () => ({ verifier, token, expected, exp, now, expire }));
 //
-// `make()` returns a FRESH verifier plus a token it accepts and the Identity that token stands for. `expire()` is
-// optional: advance the verifier's clock past the token's lifetime.
+// `make()` returns a FRESH verifier plus a token it accepts and the Identity that token stands for (four keys).
+// An adapter whose tokens expire also returns `exp` (the integer seconds the token's Session must carry), `now()`
+// (its clock, ms) and `expire()` (advance that clock past the token's lifetime). One with no expiry (devAuth)
+// returns none of them, and its Session must OMIT `exp` (idp-port.js: absent = no expiry; never null).
 
 import { describe, test, expect } from "bun:test";
 
@@ -14,16 +16,33 @@ const GARBAGE = [undefined, null, 0, 1, NaN, true, {}, [], () => "x", Symbol.for
 /**
  * @param {string} name
  * @param {() => Promise<{ verifier: import("../../server/auth/idp-port.js").Verifier, token: string,
- *   expected: import("../../server/auth/idp-port.js").Identity, expire?: () => void }>} make
+ *   expected: import("../../server/auth/idp-port.js").Identity, exp?: number, now?: () => number, expire?: () => void }>} make
  */
 export function verifierContract(name, make) {
   describe(`Verifier contract: ${name}`, () => {
-    test("its own token gives exactly the Identity", async () => {
-      const { verifier, token, expected } = await make();
+    test("its own token gives exactly the Identity, plus exp only if the adapter has expiry", async () => {
+      const { verifier, token, expected, exp } = await make();
       const id = await verifier.verify(token);
-      expect(id).toEqual(expected);
-      expect(Object.keys(id).sort()).toEqual(["domain", "email", "name", "user"]);
+      expect(id).toEqual(exp === undefined ? expected : { ...expected, exp });
+      expect(Object.keys(id).sort()).toEqual(exp === undefined ? ["domain", "email", "name", "user"] : ["domain", "email", "exp", "name", "user"]);
       expect(id.user).toMatch(/^[a-z]+:./);
+      if (exp === undefined) expect("exp" in id).toBe(false);
+    });
+
+    test("exp, when present, is an integer in the future (seconds since the epoch)", async () => {
+      const { verifier, token, exp, now } = await make();
+      if (exp === undefined) return;
+      expect(typeof now).toBe("function");
+      const id = await verifier.verify(token);
+      expect(Number.isInteger(id.exp)).toBe(true);
+      expect(id.exp).toBeGreaterThan(Math.floor(now() / 1000));
+      expect(id.exp).toBeLessThan(1e11);   // seconds, not milliseconds
+    });
+
+    test("an adapter with expiry declares it fully (exp, now, expire together)", async () => {
+      const { exp, now, expire } = await make();
+      const has = [exp !== undefined, typeof now === "function", typeof expire === "function"];
+      expect(has.every(Boolean) || !has.some(Boolean)).toBe(true);
     });
 
     test("garbage gives null and never throws", async () => {
@@ -42,9 +61,10 @@ export function verifierContract(name, make) {
     });
 
     test("verify is repeatable (no state consumed)", async () => {
-      const { verifier, token, expected } = await make();
-      expect(await verifier.verify(token)).toEqual(expected);
-      expect(await verifier.verify(token)).toEqual(expected);
+      const { verifier, token } = await make();
+      const first = await verifier.verify(token);
+      expect(first).not.toBeNull();
+      expect(await verifier.verify(token)).toEqual(first);
     });
 
     test("an expired token gives null", async () => {

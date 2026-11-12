@@ -1,7 +1,8 @@
 // The Auth port (PROTOCOL.md § Auth), and `authPort`, its one implementation: a composition over injected Verifier
 // adapters (session.js, dev.js) and tenancy.js, importing no adapter. The only thing the gateway imports from
 // server/auth. The Identity and Verifier types it uses live in idp-port.js.
-//   verify(token) → Promise<{ user, name, email, domain } | null>
+//   verify(token) → Promise<{ user, name, email, domain, exp? } | null>   (a Session, idp-port.js; returned as the
+//     verifier gave it, so `exp` reaches the gateway, which closes the connection then; dev tokens have none)
 //   role(identity, board) → Promise<role | null>
 // The gateway awaits both (plus the board lookup) before it forwards a hello; the room sees only {user, role, client}.
 // If § Auth changes shape, this file is the one to change.
@@ -17,8 +18,9 @@
 /**
  * The Auth port, as the gateway sees it.
  * @typedef {import("./idp-port.js").Identity} Identity
+ * @typedef {import("./idp-port.js").Session} Session
  * @typedef {import("./idp-port.js").Verifier} Verifier
- * @typedef {{ verify(token: unknown): Promise<Identity|null>, role(id: Identity, board: string): Promise<string|null> }} Auth
+ * @typedef {{ verify(token: unknown): Promise<Session|null>, role(id: Identity, board: string): Promise<string|null> }} Auth
  */
 
 /**

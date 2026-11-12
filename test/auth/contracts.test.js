@@ -37,7 +37,8 @@ verifierContract("sessions", async () => {
   const clock = { t: Date.UTC(2026, 10, 11) };
   const s = await sessions({ key: "k".repeat(32), ttlSec: 3600, now: () => clock.t });
   const expected = { user: "google:1001", name: "Ann", email: "ann@acme.com", domain: "acme.com" };
-  return { verifier: s, token: await s.issue(expected), expected, expire: () => { clock.t += 3600_000; } };
+  const token = await s.issue(expected);
+  return { verifier: s, token, expected, exp: Math.floor(clock.t / 1000) + 3600, now: () => clock.t, expire: () => { clock.t += 3600_000; } };
 });
 
 verifierContract("devAuth", async () => ({

@@ -10,11 +10,14 @@
 import { b64url, unb64url, utf8, fromUtf8 } from "./util.js";
 
 /** @typedef {import("./idp-port.js").Identity} Identity */
+/** @typedef {import("./idp-port.js").Session} Session */
 
 /** @param {{ key: Uint8Array|string, ttlSec?: number, now?: () => number }} config */
 export async function sessions({ key, ttlSec = 12 * 3600, now = Date.now }) {
   const raw = typeof key === "string" ? utf8(key) : key;
   if (!raw || raw.length < 32) throw new Error("session: key must be at least 32 bytes");
+  // `exp` = iat + ttlSec must be an integer (the Verifier port and the exchange's 200 body promise one).
+  if (!Number.isInteger(ttlSec) || ttlSec <= 0) throw new Error("session: ttlSec must be a positive integer");
   const k = await crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
 
   return {
@@ -25,7 +28,8 @@ export async function sessions({ key, ttlSec = 12 * 3600, now = Date.now }) {
       const mac = await crypto.subtle.sign("HMAC", k, utf8("s1." + payload));
       return `s1.${payload}.${b64url(mac)}`;
     },
-    /** @returns {Promise<Identity|null>} */
+    /** The Identity plus `exp` (integer seconds since the epoch, always in the future), or null.
+     * @returns {Promise<Session|null>} */
     async verify(token) {
       if (typeof token !== "string" || token.length > 4096 || !token.startsWith("s1.")) return null;
       const parts = token.split(".");
@@ -34,9 +38,9 @@ export async function sessions({ key, ttlSec = 12 * 3600, now = Date.now }) {
         const ok = await crypto.subtle.verify("HMAC", k, unb64url(parts[2]), utf8("s1." + parts[1]));
         if (!ok) return null;
         const c = JSON.parse(fromUtf8(unb64url(parts[1])));
-        if (typeof c?.u !== "string" || !Number.isFinite(c.exp)) return null;
+        if (typeof c?.u !== "string" || !Number.isInteger(c.exp)) return null;
         if (Math.floor(now() / 1000) >= c.exp) return null;
-        return { user: c.u, name: c.n ?? null, email: c.e ?? null, domain: c.d ?? null };
+        return { user: c.u, name: c.n ?? null, email: c.e ?? null, domain: c.d ?? null, exp: c.exp };
       } catch { return null; }
     },
   };

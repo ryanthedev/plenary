@@ -27,7 +27,7 @@ test("session tokens: issue/verify round-trip; tamper, wrong key, expiry refused
   const s = await sessions({ key: KEY, ttlSec: 3600, now: () => t });
   const tok = await s.issue(ann);
   expect(tok).toMatch(/^s1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
-  expect(await s.verify(tok)).toEqual(ann);
+  expect(await s.verify(tok)).toEqual({ ...ann, exp: Math.floor(t / 1000) + 3600 });
   const [, p, m] = tok.split(".");
   expect(await s.verify(`s1.${p}x.${m}`)).toBe(null);
   expect(await s.verify(`s1.${p}.${m.slice(1)}A`)).toBe(null);
@@ -36,6 +36,21 @@ test("session tokens: issue/verify round-trip; tamper, wrong key, expiry refused
   expect(await s.verify(tok)).toBe(null);
   for (const bad of [null, "", "s1.", "s1.a.b.c", "s2." + p + "." + m]) expect(await s.verify(bad)).toBe(null);
   await expect(sessions({ key: "short" })).rejects.toThrow();
+  // exp must be an integer: a fractional or non-positive ttl is refused at start, not by every verify later.
+  for (const ttlSec of [1.5, 0, -1, NaN, "3600"]) await expect(sessions({ key: KEY, ttlSec })).rejects.toThrow();
+});
+
+test("session tokens: a payload whose exp is not an integer is refused, even with a good mac", async () => {
+  const t = Date.UTC(2026, 10, 11);
+  const raw = new TextEncoder().encode(KEY);
+  const k = await crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const b64 = b => Buffer.from(b).toString("base64url");
+  const s = await sessions({ key: KEY, now: () => t });
+  for (const exp of [Math.floor(t / 1000) + 3600.5, String(Math.floor(t / 1000) + 3600), null]) {
+    const payload = b64(JSON.stringify({ u: "google:1", n: null, e: null, d: null, iat: Math.floor(t / 1000), exp }));
+    const mac = b64(new Uint8Array(await crypto.subtle.sign("HMAC", k, new TextEncoder().encode("s1." + payload))));
+    expect(await s.verify(`s1.${payload}.${mac}`)).toBe(null);
+  }
 });
 
 test("port: verify takes session or (configured) dev tokens, never a Google ID token; bad input is null", async () => {
@@ -43,8 +58,15 @@ test("port: verify takes session or (configured) dev tokens, never a Google ID t
   const registry = memoryRegistry();
   const s = await sessions({ key: KEY });
   const auth = authPort({ sessions: s, dev: devAuth(), tenancy: tenancy({ registry }) });
-  expect(await auth.verify(await s.issue(ann))).toEqual(ann);
+  // The Auth port passes the verifier's Session through as is: `exp` reaches the gateway; dev tokens carry none.
+  const got = await auth.verify(await s.issue(ann));
+  expect(got).toEqual({ ...ann, exp: got.exp });
+  expect(Number.isInteger(got.exp) && got.exp > Date.now() / 1000).toBe(true);
   expect(await auth.verify(await idp.mint())).toBe(null);
+  const withDev = authPort({ sessions: s, dev: devAuth({ enabled: true, tokens: { "dev-ann": { name: "ann" } } }), tenancy: tenancy({ registry }) });
+  const dev = await withDev.verify("dev-ann");
+  expect(dev).toEqual({ user: "dev:ann", name: "ann", email: null, domain: null });
+  expect("exp" in dev).toBe(false);                     // no expiry = no key (the gateway sets no timer)
   expect(await auth.verify("dev-ann")).toBe(null);
   for (const bad of [undefined, null, 1, {}, ""]) expect(await auth.verify(bad)).toBe(null);
   expect(await auth.role(null, "b-x")).toBe(null);

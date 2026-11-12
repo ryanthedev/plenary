@@ -25,10 +25,17 @@
 //     begin() ignores any arguments.
 //
 // ---- Verifier port (sessions, dev tokens; composed by port.js into the Auth port's verify) ----
-//   verify(token) → Identity | null
+//   verify(token) → Session | null
 //     Offline (no network). null = "not mine or invalid": a non-string, empty, malformed, forged, expired or unknown
 //     token. Never throws on garbage input; a genuine infrastructure failure may reject (the Auth port lets it
 //     propagate, and the gateway answers `unavailable`).
+//     Session = the Identity's four keys plus, when the token expires, `exp`: integer seconds since the epoch,
+//     always in the future (an expired token is null). A token with no expiry (dev tokens) OMITS the key: never
+//     null, 0 or Infinity. The gateway closes a live connection at `exp`; with no `exp` it sets no timer, and the
+//     connection lives until it closes or a `grants` re-check drops its role.
+//     Why a separate Session type, flat: Identity stays exactly four keys because it is also what session.issue()
+//     takes and what the exchange cookie holds (who signed in, not for how long); flat because the gateway reads
+//     `identity.exp` and the same object goes on to role(identity, board) and the admin use cases unchanged.
 
 /**
  * @typedef {{ user: string, name: string|null, email: string|null, domain: string|null }} Identity
@@ -40,7 +47,9 @@
  *   finish(o: { code: unknown, state: unknown, expected: Partial<LoginStart>|null|undefined }): Promise<Identity|null>,
  * }} IdP
  *
- * @typedef {{ verify(token: unknown): Promise<Identity|null> }} Verifier
+ * @typedef {Identity & { exp?: number }} Session
+ *
+ * @typedef {{ verify(token: unknown): Promise<Session|null> }} Verifier
  */
 
 export {};

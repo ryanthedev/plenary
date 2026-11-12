@@ -251,3 +251,21 @@ test("a sessions adapter whose token carries no integer exp: 503, the code not s
   expect(r.status).toBe(503);
   expect((await exchange(code, { cookie })).status).toBe(200);
 });
+
+test("exp comes from the sessions adapter's verify(), not the token's format; no integer exp or a throw: 503, code not spent", async () => {
+  // An opaque token (no s1. format to decode): the 200 carries whatever exp verify() gives.
+  const fixed = node({ sessions: { issue: async () => "opaque-token", verify: async t => (t === "opaque-token" ? { user: "x:1", name: null, email: null, domain: null, exp: 4102444800 } : null) } });
+  let s = await signIn(ADMIN);
+  const r = await exchange(s.code, { cookie: s.cookie, via: fixed });
+  expect(r.status).toBe(200);
+  const b = await r.json();
+  expect(b.exp).toBe(4102444800);
+  expect(b.token).toBe("opaque-token");
+  expect(Object.keys(b).sort()).toEqual(["domain", "email", "exp", "name", "token", "user"]);
+  for (const verify of [async () => { throw new Error("down"); }, async () => ({ user: "x:1", name: null, email: null, domain: null }),
+    async () => ({ user: "x:1", name: null, email: null, domain: null, exp: 4102444800.5 }), async () => ({ user: "x:1", exp: "4102444800" })]) {
+    s = await signIn(ADMIN);
+    expect((await exchange(s.code, { cookie: s.cookie, via: node({ sessions: { issue: async () => "opaque-token", verify } }) })).status).toBe(503);
+    expect((await exchange(s.code, { cookie: s.cookie })).status).toBe(200);
+  }
+});

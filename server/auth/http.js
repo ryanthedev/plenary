@@ -99,7 +99,7 @@ class Refusal { constructor(res) { this.res = res; } }
 const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
 
 /**
- * @param {{ registry: object, sessions: { issue(id: object): Promise<string>, verify(t: string): Promise<object|null> },
+ * @param {{ registry: object, sessions: { issue(id: object): Promise<string>, verify(t: string): Promise<{ exp?: number }|null> },
  *   oidc?: import("./idp-port.js").IdP | null,
  *   tenancy: { redeemLink(id: object, link: string): Promise<{board: string}|null>, tenantOf(id: object): Promise<{id: string}|null> },
  *   now?: () => number, config: object, dev?: { enabled?: boolean, verify(t: string): Promise<object|null> } | null,
@@ -235,8 +235,10 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
     if (used === "full") return err(503, "unavailable");
     let token;
     try { token = await sessions.issue(x.identity); } catch { usedCodes.release(x.h); return err(503, "unavailable"); }
-    const exp = tokenExp(token);
-    // The contract promises an integer exp; a sessions adapter whose tokens don't carry one can't meet it.
+    // `exp` from the Verifier port (the token format is session.js's business). The contract promises an integer
+    // exp; a sessions adapter that can't give one for its own fresh token can't meet it.
+    let exp;
+    try { exp = (await sessions.verify(token))?.exp; } catch { exp = null; }
     if (!Number.isInteger(exp)) { usedCodes.release(x.h); return err(503, "unavailable"); }
     return withCookie(json(200, { token, ...x.identity, exp }), clearXchg);
   }
@@ -426,17 +428,4 @@ function sameString(a, b) {
   let d = 0;
   for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return d === 0;
-}
-
-/**
- * A session token's `exp` (seconds), read from its payload without verifying (we just issued it). Couples to
- * session.js's format `s1.<base64url JSON {…, exp}>.<mac>`; null for any other shape (sessions exposes no exp).
- */
-function tokenExp(token) {
-  try {
-    const p = typeof token === "string" ? token.split(".") : [];
-    if (p.length !== 3) return null;
-    const c = JSON.parse(fromUtf8(unb64url(p[1])));
-    return Number.isFinite(c?.exp) ? c.exp : null;
-  } catch { return null; }
 }

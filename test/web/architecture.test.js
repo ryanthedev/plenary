@@ -326,7 +326,7 @@ describe("web/ architecture (hexagonal boundaries)", () => {
       "adapter-imports: web/adapters/storage/local.js",
     ]);
     // A port's JSDoc type import is not a runtime import.
-    expect(webViolations([g("web/ports/net.js", ' * @property {() => import("./transport.js").Transport} join')])).toEqual([]);
+    expect(webViolations([g("web/ports/net.js", '/**\n * @property {() => import("./transport.js").Transport} join\n */')])).toEqual([]);
     // Shrink-only: a stale entry is a violation.
     expect(applyAllowlist([], [{ from: "web/x.js", to: "packages/protocol/room.js" }])).toEqual(["stale-allowlist: web/x.js -> packages/protocol/room.js"]);
     // checkBoundaries with the same classification catches a core -> adapter import and an unwired adapter import.

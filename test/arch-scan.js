@@ -1,5 +1,5 @@
 // Import-graph scanner for the hexagonal boundary tests (docs/m2/OFFICE.md "Architecture"; brief p-arch).
-// Static: it reads source text and parses import specifiers; it never executes a scanned file. Not a test file
+// Static: it parses source text with Bun's parser (brief p-scan); it never executes a scanned file. Not a test file
 // itself (no `.test.js`), so `bun test` only runs it through the tests that import it.
 //
 // API
@@ -12,19 +12,32 @@
 //   importsOf(file, src?, root?, { urls }?)
 //                             the relative imports of repo-relative `file` (read from `root`, or taken from `src`),
 //                             each `{ spec, to, kind }`: `to` is the target as a repo-relative posix path; `kind` is
-//                             "runtime" (static import / export … from, side-effect import, import() with a quoted
-//                             or template-literal specifier, require()) or "type" (a JSDoc `import("…")`, i.e. an
-//                             import() inside a comment). With `{ urls: true }`, also kind "url":
+//                             "runtime" (static import / export … from / export * from, side-effect import, import()
+//                             with a literal specifier, require()) or "type" (a JSDoc `import("…")`: an import()
+//                             inside a comment). With `{ urls: true }`, also kind "url":
 //                             `new URL("./x.js", import.meta.url)`, as in `new Worker(new URL(…))` (opt-in, p-archv L1). Bare specifiers ("bun", "node:fs") are not returned: see packagesOf.
-//                             An import inside a comment is ignored (commented out); "inside" is judged on the
-//                             import's own line: after `//`, inside a `/* … ` still open at it, or on a `*`
-//                             continuation line. A `/* … */` closed before the import does not hide it.
-//                             Known misses (unusual here): a block comment between `import` and its "(",
-//                             import.meta.resolve, computed specifiers, an apostrophe inside a comment within a
-//                             multi-line import. Known false positive (fails safe): an import-like string literal.
+//                             Throws (naming the file) if the parser rejects the file; never returns [] for it.
+//
+//     How (brief p-scan): Bun's parser decides everything; there is no hand-written lexer, so no regex-vs-division,
+//     comment or line-break rule can hide or invent an edge.
+//       runtime  Bun.Transpiler.scanImports (import-statement, dynamic-import, require-call; any other kind it
+//                reports counts as runtime too, never dropped).
+//       type     scanImports doesn't see comments. Every raw-text `import("lit")` is a candidate; each candidate's
+//                specifier is swapped for a unique sentinel and the copy is parsed again. A sentinel scanImports
+//                reports was code (already a runtime edge); one transformSync prints was in a string, template or
+//                regex literal (no edge); one in neither was dropped as a comment (a "type" edge). transformSync
+//                runs with deadCodeElimination off, so a string in dead code still prints and never reads as a
+//                comment. Legal comments (`/*! … */`, `//! …`) are printed, so an import() in one counts as a string
+//                (no edge): they aren't JSDoc, so they carry no types.
+//       url      each raw-text `new URL("lit", import.meta.url)` is swapped for `import("<sentinel>")` (same quote,
+//                so a candidate inside a string or template stays inside it); it is an edge only if scanImports
+//                reports that sentinel, i.e. only in code.
+//     Known misses: import.meta.resolve, computed specifiers (as before), a specifier holding "$" or a line break;
+//     the candidates are text patterns, so `new URL ("…", …)` with a space before "(" and a JSDoc `@import … from`
+//     tag are missed (neither occurs in the repo today); in a .ts file (none today) scanImports drops `import type`.
 //
 //   packagesOf(file, src?, root?)
-//                             the bare (package) imports of `file`, same grammar: `[{ spec, kind }]`, e.g.
+//                             the bare (package) imports of `file`, same parse (runtime and type; no url): `[{ spec, kind }]`, e.g.
 //                             { spec: "bun:sqlite", kind: "runtime" }
 //
 //   checkBoundaries({ files, isCore, isAdapter, adapterGroup, compositionRoots, allowed, allowlist, root,
@@ -54,6 +67,7 @@
 //     "unclassified"      from is neither core, adapter nor a composition root
 //     "adapter->core"     (with adapterMayImport) an adapter imports a non-adapter it may not
 //     "core->package"     (with allowPackage) a core file imports a bare package it may not (a framework, a driver)
+//     "parse"             the parser rejects the file (its imports are unknown, so it can't pass; `to` is "")
 //   Tests are not passed in `files`, so tests may import anything.
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
@@ -76,53 +90,85 @@ export function listFiles(dirs, root = ROOT) {
   return out.sort();
 }
 
-/**
- * Is position `i` inside a comment, judged on its own line: after `//`, inside a `/*` still open at `i`, or on a
- * `*` continuation line of a block comment (unless that comment closes before `i`). A `/* … *\/` that closes before
- * `i` doesn't count (p-archv M2).
- */
-function onComment(src, i) {
-  let p = src.slice(src.lastIndexOf("\n", i - 1) + 1, i).trimStart();
-  if (p.startsWith("*")) {                       // a continuation line, or the close of an earlier block comment
-    const k = p.indexOf("*/");
-    if (k < 0) return true;
-    p = p.slice(k + 2);
-  }
-  p = p.replace(/\/\*.*?\*\//g, "");             // block comments closed before i
-  return p.includes("/*") || p.trimStart().startsWith("//");
+const TS = /\.(m?ts|cts)$/;
+const parsers = {
+  js: new Bun.Transpiler({ loader: "js", deadCodeElimination: false }),
+  ts: new Bun.Transpiler({ loader: "ts", deadCodeElimination: false }),
+};
+// A literal specifier: the quote (group q), its text (group q+1), the same quote again.
+const LIT = q => String.raw`(["'\x60])([^"'\x60$\n\r\u2028\u2029]+)` + "\\" + q;
+const CAND = new RegExp(String.raw`\bimport\s*\(\s*${LIT(1)}\s*\)|\bnew\s+URL\(\s*${LIT(3)}\s*,\s*import\.meta\.url\s*\)`, "g");
+const isRel = spec => /^\.{1,2}\//.test(spec);
+const isBare = spec => !/^[./]/.test(spec) && !/\s/.test(spec);
+
+/** Why the parser refused `src`: its first messages, with line and column. */
+function why(e) {
+  const list = Array.isArray(e?.errors) && e.errors.length ? e.errors : [e];
+  return list.slice(0, 3).map(x => (x?.position ? `${x.position.line}:${x.position.column} ` : "") + (x?.message ?? String(x))).join("; ");
 }
 
-// Same grammar as test/auth/architecture.test.js (verified in p5-hexv), for relative or bare specifiers.
-const REL = String.raw`\.{1,2}\/[^"'\x60$]+`, BARE = String.raw`[^."'\x60$\/\s][^"'\x60$\s]*`;
-const grammar = spec => ({
-  stat: new RegExp(String.raw`(?:^|[;\s{}])(import|export)\b\s*(?:[^"'\x60;]*?\bfrom\s*)?["'](${spec})["']`, "g"),
-  dyn: new RegExp(String.raw`\bimport\(\s*(["'\x60])(${spec})\1\s*\)`, "g"),
-  req: new RegExp(String.raw`\brequire\(\s*(["'\x60])(${spec})\1\s*\)`, "g"),
-  url: new RegExp(String.raw`\bnew\s+URL\(\s*(["'\x60])(${spec})\1\s*,\s*import\.meta\.url\s*\)`, "g"),
-});
-const G_REL = grammar(REL), G_BARE = grammar(BARE);
+let last = { file: "", src: null, edges: null };   // checkBoundaries asks for packagesOf and importsOf of one file in a row
 
-function scan(src, g, add, urls) {
-  for (const m of src.matchAll(g.stat)) if (!onComment(src, m.index + m[0].indexOf(m[1]))) add(m[2], "runtime");
-  for (const m of src.matchAll(g.dyn)) add(m[2], onComment(src, m.index) ? "type" : "runtime");
-  for (const m of src.matchAll(g.req)) if (!onComment(src, m.index)) add(m[2], "runtime");
-  if (urls) for (const m of src.matchAll(g.url)) if (!onComment(src, m.index)) add(m[2], "url");
+/** Every edge of `src` as `{ spec, kind }` (relative and bare), by the parser (see "How" above). */
+function edgesOf(file, src) {
+  if (last.file === file && last.src === src) return last.edges;
+  const t = TS.test(file) ? parsers.ts : parsers.js;
+  const fail = e => { throw new Error(`${file}: the parser rejects it, so its imports are unknown: ${why(e)}`); };
+  let found;
+  try { found = t.scanImports(src); } catch (e) { fail(e); }
+  const edges = found.map(i => ({ spec: i.path, kind: "runtime" }));
+
+  const cands = [...src.matchAll(CAND)].map((m, n) => ({ m, n }));
+  // The token prefix occurs nowhere in `src`, so no token can already be in the file (a string holding one would
+  // otherwise read as "printed" and hide a type edge).
+  let pre = "__arch_scan_";
+  while (src.includes(pre)) pre += "_";
+  const token = n => `${pre}${n}__`;
+  /** Parse `src` with the candidates in `list` swapped for tokens: { code, printed }, or null if that won't parse. */
+  const probe = list => {
+    let out = "", at = 0;
+    for (const { m, n } of list) {
+      if (m[1] !== undefined) {                      // import("lit"): swap the specifier only
+        const i = m.index + m[0].indexOf(m[1] + m[2] + m[1]) + 1;
+        out += src.slice(at, i) + token(n); at = i + m[2].length;
+      } else {                                       // new URL("lit", import.meta.url): becomes import("<token>")
+        out += src.slice(at, m.index) + `import(${m[3]}${token(n)}${m[3]})`; at = m.index + m[0].length;
+      }
+    }
+    out += src.slice(at);
+    try { return { code: new Set(t.scanImports(out).map(i => i.path)), printed: t.transformSync(out) }; } catch { return null; }
+  };
+  const judge = ({ m, n }, { code, printed }) => {
+    if (m[1] !== undefined) { if (!code.has(token(n)) && !printed.includes(token(n))) edges.push({ spec: m[2], kind: "type" }); }
+    else if (code.has(token(n))) edges.push({ spec: m[4], kind: "url" });
+  };
+  if (cands.length) {
+    const all = probe(cands);
+    if (all) for (const c of cands) judge(c, all);
+    // A match can span code, e.g. `"import(" + x + ")"` (from one string's closing quote to the next's opening
+    // quote); its swap breaks the parse. Then probe one candidate at a time: a swap inside a comment never breaks
+    // a parse, so a candidate whose own probe doesn't parse is neither a comment nor code, and gives no edge.
+    else for (const c of cands) { const one = probe([c]); if (one) judge(c, one); }
+  }
+  last = { file, src, edges };
+  return edges;
 }
 
 export function importsOf(file, src, root = ROOT, { urls = false } = {}) {
   if (src === undefined) src = readFileSync(join(root, file), "utf8");
   const out = new Map();
-  scan(src, G_REL, (spec, kind) => {
+  for (const { spec, kind } of edgesOf(file, src)) {
+    if (!isRel(spec) || (kind === "url" && !urls)) continue;
     const to = posix.normalize(posix.join(posix.dirname(file), spec));
     out.set(to + " " + kind, { spec, to, kind });
-  }, urls);
+  }
   return [...out.values()];
 }
 
 export function packagesOf(file, src, root = ROOT) {
   if (src === undefined) src = readFileSync(join(root, file), "utf8");
   const out = new Map();
-  scan(src, G_BARE, (spec, kind) => out.set(spec + " " + kind, { spec, kind }));
+  for (const { spec, kind } of edgesOf(file, src)) if (isBare(spec) && kind !== "url") out.set(spec + " " + kind, { spec, kind });
   return [...out.values()];
 }
 
@@ -136,9 +182,12 @@ export function checkBoundaries({ files, isCore, isAdapter, adapterGroup, compos
     const src = typeof f === "string" ? undefined : f.src;
     const core = isCore(path), adapter = !core && isAdapter(path);
     if (!core && !adapter) { found.push({ rule: "unclassified", from: path, to: "", kind: "", message: `${path}: neither core, adapter nor a composition root` }); }
-    if (core && allowPackage) for (const { spec, kind } of packagesOf(path, src, root))
+    let edges, packages = [];
+    try { edges = importsOf(path, src, root, { urls }); if (core && allowPackage) packages = packagesOf(path, src, root); }
+    catch (e) { found.push({ rule: "parse", from: path, to: "", kind: "", message: e.message }); continue; }
+    for (const { spec, kind } of packages)
       if (!allowPackage(spec, path)) found.push({ rule: "core->package", from: path, to: spec, kind, message: `${path} -> ${spec} [${kind}]: core->package` });
-    for (const { to, kind } of importsOf(path, src, root, { urls })) {
+    for (const { to, kind } of edges) {
       const v = rule => found.push({ rule, from: path, to, kind, message: `${path} -> ${to} [${kind}]: ${rule}` });
       if (!/\.(m?js|cjs|m?ts|cts|json)$/.test(to)) { v("unresolved"); continue; }
       if (roots.has(to)) { if (kind !== "url") v("imports-root"); continue; }

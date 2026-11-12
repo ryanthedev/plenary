@@ -10,7 +10,8 @@
 //   1. it is classified in CLASSES below (a new file must be added, on purpose);
 //   2. it imports no `adapter` and no `driving` file (adapters never import each other; the core and the ports
 //      never import an adapter; http.js gets adapters injected), counting static `import`/`export … from`,
-//      `import()` and JSDoc `import("…")` types;
+//      `import()`, `require()` and JSDoc `import("…")` types (test/arch-scan.js's importsOf: Bun's parser, so a
+//      comment or string can't hide or invent one; a file the parser rejects is itself a violation);
 //   3. it imports nothing outside server/auth and server/admin by relative path (no reaching into another
 //      folder's adapters).
 // And inbound, for every other file under server/: only the composition root (server/main.js) may import an
@@ -18,7 +19,8 @@
 
 import { test, expect } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join, dirname, posix } from "node:path";
+import { join } from "node:path";
+import { importsOf } from "../arch-scan.js";
 
 const ROOT = join(import.meta.dir, "..", "..");
 
@@ -41,35 +43,6 @@ const SCOPE = ["server/auth", "server/admin"];
 const COMPOSITION_ROOTS = ["server/main.js"];
 
 
-/**
- * Relative imports in `src`, each `{ spec, kind }`: kind "runtime" for static import/export-from (spaced or not),
- * side-effect import, import() with a quoted or template-literal specifier, and require(); "type" for a JSDoc
- * `import("…")` (an import() on a comment line). A static import or require() on a comment line is ignored.
- * Not caught (unusual here; verifier p5-hexv LOW 3): a block comment between import and its "(", import.meta.resolve, an apostrophe
- * inside a comment within a multi-line import.
- */
-export function importsOf(src) {
-  const out = new Map();
-  const add = (spec, kind) => out.set(spec + " " + kind, { spec, kind });
-  const stat = /(?:^|[;\s{}])(import|export)\b\s*(?:[^"'\x60;]*?\bfrom\s*)?["'](\.{1,2}\/[^"']+)["']/g;
-  const dyn = /\bimport\(\s*(["'\x60])(\.{1,2}\/[^"'\x60$]+)\1\s*\)/g;
-  const req = /\brequire\(\s*(["'\x60])(\.{1,2}\/[^"'\x60$]+)\1\s*\)/g;
-  // The keyword's own position decides "on a comment line" (for `export`, too: p5-hexv MEDIUM 1).
-  for (const m of src.matchAll(stat)) if (!onComment(src, m.index + m[0].indexOf(m[1]))) add(m[2], "runtime");
-  for (const m of src.matchAll(dyn)) add(m[2], onComment(src, m.index) ? "type" : "runtime");
-  for (const m of src.matchAll(req)) if (!onComment(src, m.index)) add(m[2], "runtime");
-  return [...out.values()];
-}
-
-/** Is position `i` on a comment line (starts with //, /*, or * after indentation)? */
-function onComment(src, i) {
-  const line = src.slice(src.lastIndexOf("\n", i - 1) + 1, i).trimStart();
-  return line.startsWith("//") || line.startsWith("/*") || line.startsWith("*");
-}
-
-/** `spec` imported from repo-relative `from`, as a repo-relative posix path. */
-const resolve = (from, spec) => posix.normalize(posix.join(posix.dirname(from), spec));
-
 const inScope = p => SCOPE.some(d => p.startsWith(d + "/"));
 
 /**
@@ -82,7 +55,8 @@ export function violations(files, classes, roots = COMPOSITION_ROOTS) {
   const out = [];
   const bad = to => classes[to] === "adapter" || classes[to] === "driving";
   for (const { path, src } of files) {
-    const targets = importsOf(src).map(({ spec, kind }) => ({ to: resolve(path, spec), kind }));
+    let targets;
+    try { targets = importsOf(path, src); } catch (e) { out.push(e.message); continue; }
     if (inScope(path)) {
       if (!classes[path]) { out.push(`${path}: unclassified (add it to CLASSES)`); continue; }
       for (const { to, kind } of targets) {
@@ -165,9 +139,9 @@ test("checker: a runtime import and a JSDoc type of the same file are reported s
 test("checker: an export … from / export * from directly below a comment line is caught (p5-hexv MEDIUM 1)", () => {
   expect(one("server/auth/c.js", `// Convenience re-export for callers.\nexport { a } from "./a.js";`)).toEqual(["server/auth/c.js -> server/auth/a.js [runtime]: core imports adapter"]);
   expect(one("server/auth/c.js", `/** doc */\nexport * from "./a.js";`)).toHaveLength(1);
-  expect(one("server/auth/c.js", ` * see below\nimport { a } from "./a.js";`)).toHaveLength(1);
+  expect(one("server/auth/c.js", `/*\n * see below\n */\nimport { a } from "./a.js";`)).toEqual(["server/auth/c.js -> server/auth/a.js [runtime]: core imports adapter"]);
   // still ignored: the same lines commented out
-  expect(one("server/auth/c.js", `// export { a } from "./a.js";\n// import { a } from "./a.js";\n * export * from "./a.js";`)).toEqual([]);
+  expect(one("server/auth/c.js", `// export { a } from "./a.js";\n// import { a } from "./a.js";\n/*\n * export * from "./a.js";\n */`)).toEqual([]);
 });
 
 test("checker: unspaced import, template-literal import() and require() (p5-hexv LOW 3)", () => {

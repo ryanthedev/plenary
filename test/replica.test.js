@@ -400,3 +400,66 @@ test("a server that welcomes and then drops still meets growing waits; only 10 s
   b.down();
   expect([b.r.resync, b.r.pending.has(bad.id), b.r.reconnectWait(), b.r.fails]).toEqual([true, false, 250, 0]);
 });
+
+// p6-sync2v M3: ops made during a resync were stamped v1…vk on the empty copy; once k passed the room's
+// version only the top was re-stamped, so the lower ones went out at versions the room had already passed.
+for (const k of [1, 2, 4, 5, 7, 12]) test(`a chain of ${k} edits on one element made during a resync: none goes out at or below the room's version, and the last one wins`, () => {
+  for (let seed = 1; seed <= 40; seed++) {
+    const w = world(["editor", "editor"], 600 + seed);
+    w.settle();
+    const [a, b] = w.clients;
+    w.send(a, "board", { elements: [rect("shape", { x: 0 })] }); w.settle();
+    for (let i = 0; i < 3; i++) { w.send(b, "board", { elements: [clone(b.r.streams.board.get("shape"))] }); w.settle(); }
+    expect(w.room.streams.board.get("shape").version).toBe(4);                // the room's copy: r = 4
+    const onScreen = clone(a.r.streams.board.get("shape"));
+    const bad = w.send(a, "board", { appState: { bogus: 1 } });
+    w.flush(a);
+    a.r.receive(errors(a).find(e => e.id === bad.id));                        // refused: a's copy is empty, a resync is due
+    const chain = [], knew = new Map(), out = a.r.outgoing.bind(a.r);
+    // What a had confirmed of the room's copy at the moment each op left (a peer's edit still in flight is a fair race).
+    a.r.outgoing = () => { const ms = out(); for (const m of ms) if (!knew.has(m.id)) knew.set(m.id, a.r.roomVersion("board", "shape")); return ms; };
+    for (let i = 1; i <= k; i++) chain.push(w.send(a, "board", { elements: [{ ...onScreen, x: 1000 + i }] }).id);
+    const peer = seed % 2 ? w.send(b, "board", { elements: [{ ...clone(b.r.streams.board.get("shape")), x: -5 }] }).id : null;   // a concurrent v5
+    if (seed % 4 === 1) w.flush(b);                                           // sometimes the peer's edit is logged first for sure
+    for (let i = 0; i < (seed % 7) * 3; i++) w.step();
+    if (seed % 5 === 0) w.rebuild();                                          // and sometimes the room restarts in the middle
+    w.settle();
+    const sent = [];
+    for (const e of w.log.entries) for (const el of e.op.elements ?? []) if (el.id === "shape" && chain.includes(e.id)) sent.push({ at: chain.indexOf(e.id), version: el.version, knew: knew.get(e.id) });
+    expect([seed, sent.map(s => s.at)]).toEqual([seed, chain.map((_, i) => i)]);               // all logged, once, in order
+    expect([seed, sent.filter(s => !(s.knew >= 4) || s.version <= s.knew)]).toEqual([seed, []]);   // each went out above the room's version (≥ 4) as a knew it
+    expect([seed, sent.map(s => s.version - sent[0].version)]).toEqual([seed, chain.map((_, i) => i)]);   // r + 1, r + 2, … in send order
+    // With no peer racing, the chain's last op is the final state everywhere (with one, the usual merge decides; copies agree).
+    if (!peer) {
+      expect([seed, w.room.streams.board.get("shape").version]).toEqual([seed, 4 + k]);
+      expect([seed, w.room.streams.board.get("shape").x]).toEqual([seed, 1000 + k]);
+      for (const c of w.clients) expect([seed, c.r.streams.board.get("shape").x, c.r.pending.size]).toEqual([seed, 1000 + k, 0]);
+    }
+    expect(a.r.state()).toEqual(b.r.state());
+    if (peer) expect(w.log.entries.filter(e => e.id === peer).length).toBe(1);
+  }
+});
+
+test("re-stamping leaves ops already sent byte for byte, and counts them: unsent ops go after them", () => {
+  const d = direct(), clock = { t: 0 }, a = link(d, clock).open().sync();
+  a.r.local("board", { elements: [rect("s")] }); a.sync();                    // the room: v1
+  const first = a.r.local("board", { elements: [{ ...clone(a.r.streams.board.get("s")), x: 1 }] });
+  const [written] = a.r.outgoing();                                           // v2 is written; the connection dies before it arrives
+  const bytes = JSON.stringify(written);
+  const second = a.r.local("board", { elements: [{ ...clone(a.r.streams.board.get("s")), x: 2 }] });   // v3, never sent
+  const third = a.r.local("board", { elements: [{ ...clone(a.r.streams.board.get("s")), x: 3 }] });    // v4, never sent
+  const other = link(d, clock, "u2", "editor", "o").open().sync();
+  for (let i = 0; i < 5; i++) { other.r.local("board", { elements: [{ ...clone(other.r.streams.board.get("s")), x: -i }] }); other.sync(); }
+  expect(d.room.streams.board.get("s").version).toBe(6);                      // the room moved on to v6 meanwhile
+  expect(a.r.roomVersion("board", "s")).toBe(1);                              // a hasn't heard yet
+  a.open(); a.down();                                                         // welcome + catch-up
+  expect(a.r.roomVersion("board", "s")).toBe(6);
+  expect([second.op.elements[0].version, third.op.elements[0].version]).toEqual([7, 8]);   // past the room's copy, in order
+  expect(JSON.stringify(first)).toBe(bytes);                                  // the resend is the same op
+  expect(a.r.streams.board.get("s").x).toBe(3);                               // a still sees its latest edit
+  a.sync(); other.sync();
+  expect(d.log.entries.find(e => e.id === first.id).op.elements[0].version).toBe(2);   // logged as sent: an honest loser to v6
+  expect(d.room.streams.board.get("s")).toMatchObject({ x: 3, version: 8 });
+  expect(other.r.streams.board.get("s").x).toBe(3);
+  expect(a.r.roomVersion("board", "s")).toBe(8);
+});

@@ -42,8 +42,9 @@ export class Replica {
   /** Forget the room's copy (a resync follows). Pending ops are kept, and stay shown on top of the empty copy. */
   reset() {
     this.applied = 0;                    // the highest seq applied; everything up to it is in
-    this.streams = {}; this.confirmed = {}; this.appSeq = {};
+    this.streams = {}; this.confirmed = {}; this.appSeq = {}; this.confirmedVersion = {};
     for (const s of ELEMENT_STREAMS) {
+      this.confirmedVersion[s] = new Map();   // element id → the version of the room's copy (pending ops not counted)
       this.streams[s] = new Doc(emptyScene());
       this.confirmed[s] = { ...this.streams[s].appState.herdr };   // appState as the room ordered it
       this.appSeq[s] = {};
@@ -97,33 +98,31 @@ export class Replica {
     return msg;
   }
 
-  // The last pending element per stream and id: the one this replica's own edits end on.
-  tops() {
-    const tops = new Map();
-    for (const p of this.pending.values()) if (p.stream !== "records") for (const el of p.op.elements ?? []) tops.set(`${p.stream}\n${el.id}`, el);
-    return tops;
-  }
-
-  // Put a pending element op on top of the copy as it is now. Where someone else's copy leads instead of
-  // this replica's own pending edits, an op that has never been sent is stamped again: one version past
-  // the copy, fresh nonce (the pending edits after it follow, in order). So an edit made while the copy was
-  // empty (mid-resync) or behind never goes out at a stale version and gets acked dead. An op already sent
-  // keeps its bytes (a resend is the same op: rule 2).
-  restamp(p, tops = this.tops()) {
-    if (p.stream === "records" || !p.op.elements) return;
-    const doc = this.streams[p.stream], unsent = p.msg.sentAt === undefined;
-    for (const el of p.op.elements) {
-      const cur = doc.getAny(el.id), top = tops.get(`${p.stream}\n${el.id}`);
-      if (cur && top && cur.version === top.version && cur.versionNonce === top.versionNonce) continue;   // my edits lead already
-      if (unsent && cur && cur.version >= el.version) { el.version = cur.version + 1; el.versionNonce = randomInt(); }
-      doc.apply({ elements: [el] });
+  // Put the pending element ops on top of the copy as it is now, and stamp again every op that has never
+  // been sent: per element, with the room's version r (as this replica has confirmed it; 0 if it has none,
+  // and never below a pending op of mine that was already sent), the unsent ops get r + 1, r + 2, … in send
+  // order, each with a fresh nonce when its version changes. So an edit made while the copy was empty
+  // (mid-resync) or behind never goes out at a version the room already passed, to be acked dead or lose
+  // a tie a live client would win. An op already sent keeps its bytes (a resend is the same op: rule 2).
+  restampAll() {
+    const next = new Map();   // "stream\nid" → the highest version so far: the room's, then my pending ops in order
+    for (const p of this.pending.values()) {
+      if (p.stream === "records" || !p.op.elements) continue;
+      const doc = this.streams[p.stream], unsent = p.msg.sentAt === undefined;
+      for (const el of p.op.elements) {
+        const key = `${p.stream}\n${el.id}`, base = next.get(key) ?? this.roomVersion(p.stream, el.id);
+        if (!unsent) { next.set(key, Math.max(base, el.version)); doc.apply({ elements: [el] }); continue; }
+        if (el.version !== base + 1) { el.version = base + 1; el.versionNonce = randomInt(); }
+        next.set(key, el.version);
+        // It leads everything this replica knows; `force` only ever replaces an older stamp of my own.
+        const cur = doc.getAny(el.id);
+        if (!cur || cur.version !== el.version || cur.versionNonce !== el.versionNonce) doc.apply({ elements: [el] }, { force: true });
+      }
     }
   }
 
-  restampAll(only = () => true) {
-    const tops = this.tops();
-    for (const p of this.pending.values()) if (only(p)) this.restamp(p, tops);
-  }
+  /** The version of the room's copy of an element as this replica has confirmed it (no pending ops counted); 0 if none. */
+  roomVersion(stream, id) { return this.confirmedVersion[stream]?.get(id) ?? 0; }
 
   /** Does this replica hold an unacknowledged op for that element? */
   hasPending(stream, id) {
@@ -177,9 +176,10 @@ export class Replica {
     if (this.overdue(t)) { this.failed(t - CONNECT_TIMEOUT_MS); return []; }
     if (!this.welcomed) return [];
     this.refill(t);
+    let stamped = false;
     for (let p; this.tokens >= 1 && (p = this.nextToSend());) {
       this.tokens -= 1;
-      if (p.msg.sentAt === undefined) { this.restamp(p); p.msg.sentAt = this.applied; }
+      if (p.msg.sentAt === undefined) { if (!stamped) { this.restampAll(); stamped = true; } p.msg.sentAt = this.applied; }
       p.wrote = t; out.push(p.msg);
     }
     return out;
@@ -279,6 +279,7 @@ export class Replica {
     for (const s of ELEMENT_STREAMS) {
       const sc = msg.streams[s], doc = this.streams[s];
       doc.load({ elements: clone(sc.elements), appState: clone(sc.appState) });
+      this.confirmedVersion[s] = new Map(sc.elements.map(el => [el.id, el.version ?? 0]));
       this.confirmed[s] = { ...doc.appState.herdr };
       this.appSeq[s] = { ...(msg.appSeq?.[s] ?? {}) };
     }
@@ -299,6 +300,8 @@ export class Replica {
         for (const el of e.op.elements ?? []) {
           this.dropPreview(e.stream, el.id);
           if (e.stream === "notes" && !this.noteAuthor.has(el.id)) this.noteAuthor.set(el.id, e.by);
+          const seen = this.confirmedVersion[e.stream];
+          if ((el.version ?? 0) > (seen.get(el.id) ?? 0)) seen.set(el.id, el.version);
         }
         if (e.op.elements) this.streams[e.stream].apply({ elements: e.op.elements });
         if (e.op.appState) mergeAppState(this.confirmed[e.stream], this.appSeq[e.stream], e.op.appState, e.seq);
@@ -309,7 +312,7 @@ export class Replica {
       if (this.streams[e.stream]) this.showAppState(e.stream);
       did.entries.push(e);
     }
-    if (did.entries.length && this.pending.size) this.restampAll(p => p.msg.sentAt === undefined);
+    if (did.entries.length && this.pending.size) this.restampAll();
     if (this.welcomed && this.applied >= this.target && this.goodAt === null) this.goodAt = this.now();   // caught up; proven 10 s from now
     this.settle(did);
     this.afterAnswers(did);   // an applied entry answers a resend as well as an ack does

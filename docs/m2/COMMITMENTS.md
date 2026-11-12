@@ -102,3 +102,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 proxy: proxy t14h handed off to t1bx (9d06783); managers now report to t1bx; t185 and t155 relabelled reports-to=t187 (were t14q).
 - 2026-11-11 platform: p5-code verifier PASS (t1bh; no session token or user details in any URL, real Chromium); 2 MEDIUMs being fixed before commit.
 - 2026-11-11 CEO: recycle threshold stays at 60%; the CEO may refresh sessions themselves at any time (a session the CEO restarts resumes from its handoff/report files).
+- 2026-11-11 client: p6-ports DONE 4850319 (round 2 PASS; bun test 588/0, re-run by manager). t18r, t1b9 closed. p6-hex waits on the p2-land merge; proxy asked client to start the file-disjoint slice now (new files only).

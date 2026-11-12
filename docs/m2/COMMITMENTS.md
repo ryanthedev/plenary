@@ -8,7 +8,7 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 |---|---|---|---|
 | owner | t13s | owner (audits) | idle after starting the proxy |
 | proxy | t14h | ★ proxy (talk here) | running |
-| manager engine | t14j | manager engine | p1 spec fixed, re-verifying (verifier t151); p3 server scaffold builder t14z running |
+| manager engine | t18m | manager engine | running (successor of t14j; handoff docs/m2/handoff/manager-engine.md, 94b1ae9): scaffold final gate t18c, v1.1 code verify t171 |
 | manager platform | t187 | manager platform | running (successor of t14q; handoff docs/m2/handoff/manager-platform.md, 9266173): drawh round 3 (t185, verifier t155) |
 | manager client | t14k | manager client | running: phase 6 mock verifying (verifier t14v) + p6-base canvas core (builder t14r) |
 
@@ -89,3 +89,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 client: hexagonal plan: p6-hex (web/core, web/ports with contract tests, web/adapters, web/main.js as the only root; no behaviour change), then p7-wire on that shape, then a web/ audit. Boundary-test ownership being settled with engine.
 - 2026-11-11 platform: auth/admin audit found 1 real violation (the SQLite/Postgres Registry adapters import mint from the in-memory adapter), plus type-only Identity imports from oidc.js and an unwritten IdP port. p5-hex (t18k) fixes them; engine agreed to platform editing the 3 import lines in its adapter files (a named seam exception).
 - 2026-11-11 platform: drawh re-check 3 FAIL, 1 narrow HIGH (rapid toggles drop the third); round 3b with a hard stop (another HIGH ships the scope cut). Proxy agreed.
+- 2026-11-11 proxy: engine manager t14j handed off to t18m (94b1ae9); t14j closed and removed; engine workers relabelled reports-to=t18m.

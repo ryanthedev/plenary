@@ -1,24 +1,25 @@
 # Report: manager engine
 
-Manager terminal: `t18m` (tab `manager engine`; successor of t14j, retired 2026-11-11). Parent: proxy `t14h`.
+Manager terminal: `t18m` (tab `manager engine`; successor of t14j, retired 2026-11-11). Parent: proxy `t1bx` (t14h retired).
 
-## Workers
+## Workers (current; updated every turn)
 
-| Job | Terminal | Tab | Status |
-|---|---|---|---|
-| p3-fix4 (builder) | t18c | worker p3-fix4 (engine): scaffold fix round 4 | RUNNING (from the handoff) |
-| p2-recovery (builder) | t15q | done p2-recovery (engine) | reported, idle (kept for a fix round) |
-| p2-recoveryv (verifier) | t171 | verifier p2-recoveryv (engine): room recovery | RUNNING (in worktree plenary-p2) |
-| p3-scaffoldv (verifier) | t158 | done p3-scaffoldv (engine): FAIL, 1 HIGH | FAIL reported, idle |
-| p4-pg (builder) | t17d | done p4-pg (engine) | reported, idle |
-| p4-pgv (verifier) | t17p | verifier p4-pgv (engine): Postgres store + registry | PASS, idle |
-| p4-natss3 (builder) | t17f | done p4-natss3 (engine) | reported, idle |
-| p4-natss3v (verifier) | t17m | verifier p4-natss3v (engine): NATS bus + S3 blobs | RUNNING |
-| p1-v11 (builder) | t186 | done p1-v11 (engine) | reported, idle |
-| p1-v11v (verifier) | t188 | verifier p1-v11v (engine): protocol v1.1 spec | RUNNING |
-| p11-proto (builder) | t18b | worker p11-proto (engine): protocol v1.1 code | RUNNING (worktree: packages/protocol, test/*.js) |
-| p3-scaffoldv2 (re-verifier) | t16y | verifier p3-scaffoldv2 (engine): server scaffold, round 2 | FAIL reported, idle |
-| p3-scaffoldv3 (re-verifier) | t17j | verifier p3-scaffoldv3 (engine): server scaffold, round 3 | RUNNING |
+In flight: t17j verifying scaffold round 5 (fix by t18c). On PASS: bun test, commit server/ + test/server/ (scaffold),
+then p4-pg (keep postgres.js:20,:38 registry-port imports) and p4-natss3, ping proxy t1bx; then ping client t14k,
+rebase p2-land (worktree /Users/r/repos/plenary-p2, clean; head 3fa2d3a) onto main, start p2-swap
+(name plenary-p2-swap; brief docs/m2/briefs/p2-swap.md), merge, then p-arch + architecture audit.
+
+| Job | Terminal | Status |
+|---|---|---|
+| p3-fix4 (builder) | t18c | reported fix round 4, idle (kept for a fix round) |
+| p3-scaffoldv3 (verifier, round 5) | t17j | RUNNING |
+| p3-scaffoldv2 / p3-scaffoldv (old verifiers) | t16y / t158 | idle; close at scaffold commit |
+| p4-pg builder / verifier | t17d / t17p | PASS, idle; close after p4-pg commit |
+| p4-natss3 builder / verifier | t17f / t17m | PASS, idle; close after p4-natss3 commit |
+| p2-recovery builder | t15q | idle; close at phase-2 merge (+ remove its old worktree) |
+| p1-v11 builder / verifier | t186 / t188 | committed cb343b9; close at phase-2 merge |
+
+Committed on p2-land: 5d55112 (v1.1 code), 3fa2d3a (client p6-land + p7-collab). Closed: t18b, t171.
 
 ## 2026-11-11 phase 1 (protocol v1 spec)
 
@@ -197,3 +198,13 @@ Manager terminal: `t18m` (tab `manager engine`; successor of t14j, retired 2026-
 - Handing off to a successor manager at ~52% context (both running jobs are in waiting states). Handoff: docs/m2/handoff/manager-engine.md.
 - t18m took over as manager engine from t14j's handoff (94b1ae9). Told client t14k, platform t187, proxy t14h. Watching t18c (scaffold final gate, background batch running) and t171 (v1.1 code round 4).
 - p11-protov round 4: **PASS** (398/0 in the worktree, re-run by me). v1.1 code committed on p2-land as 5d55112. Told t187, t14k, t14h. Closed t18b and t171. Open LOWs L1/L3/L4 carried to the architecture audit; nit: 'acknowledged' -> 'settled' at the next spec touch.
+- Platform t187 (p5-hex): agreed sqlite.js:32 JSDoc type -> ../auth/registry-port.js in platform's commit (with :18). postgres.js:20,:38 already changed in the shared tree; they ride with my p4-pg commit. Check they're intact at commit time.
+- Proxy: Google OAuth client is in .env (gitignored). p2-swap brief: main.js builds googleOidc from GOOGLE_CLIENT_ID/SECRET, redirect OIDC_REDIRECT_URI default http://localhost:8080/auth/callback, 503 when absent; COOKIE_KEY from env (random + warning on a single node, refuse in cluster). Real sign-in checked after the merge (.env is not in the worktree).
+- Proxy approved the COOKIE_KEY design and added a random COOKIE_KEY (32 bytes hex) to .env.
+- Proxy/platform: Bun auto-loads .env in the shared tree. p2-swap brief: start(env) reads only its argument (main.js:93 LOG_LEVEL from process.env to fix); main.js tests pass explicit env objects (absent and fake Google vars); never log env.
+- Client t14k: p6-landv PASS (M1 token-in-history is platform-side, not blocking). Committed client files on p2-land as 3fa2d3a (398/0); worktree clean. Merge waits on scaffold + rebase + p2-swap.
+- Platform t187 (p5-hexv L8): server/registry/postgres.js:22 imports needSchema/ensureSchema from ../store/postgres.js (adapter -> adapter). Queued for p-arch: move them to a shared helper (e.g. server/pg/schema.js) that both Postgres adapters import; allowlist it until then. Commit p4-pg as verified first.
+- Platform p5-hex landed 02b7434 (sqlite.js:18,:32). postgres.js:20,:38 confirmed pointing at ../auth/registry-port.js in the tree; commit them with p4-pg, then tell t187 (auth/registry.js re-export of mint/RegistryError can then go).
+- New naming rule (OFFICE.md 7f680a3): sessions named plenary-<job> / plenary-<job>v via hc run --name and claude -n; tab labels carry ' · <id>'. Applies to every session I start (next: t17j re-verify is an existing session; p2-swap builder will be plenary-p2-swap).
+- p3-fix4 (t18c) reported: R4-H2 real cause was flush() sending past the socket limit behind a big snapshot (fixed: wait for drain; backpressureLimit 450 MB from spec caps at 3 B/char; UTF-8 byte counting; loud log). R4-H1 tests now event-driven. Gate: loaded 21/21, quiet 17/20 (3 = platform test/auth/http.test.js during their edits), kill -9 30/30 + 15/15. Decision (mine): Bun's WS client closes on messages > 128 MiB; not a server bug, not blocking. Queued protocol items: § Limits stated in UTF-8 bytes; snapshot sent in parts (v1.2; also needed by a Bun-based load tool at M4). Round 5 re-verify sent to t17j.
+- Proxy is now t1bx (t14h retired, handoff 9d06783). Report there; ping on the scaffold commit.

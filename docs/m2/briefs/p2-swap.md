@@ -41,6 +41,20 @@ Swap every `SEAM(p2)` in the server to the phase 2 protocol (packages/protocol a
   routes then answer 503); `dev` only when dev tokens are enabled. Test: POST /boards with a dev Bearer token creates
   a board a socket client can then join; /health and /ws are still the engine's.
 
+- **Google sign-in (proxy, 2026-11-11):** `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are in `.env` (gitignored;
+  Bun loads it). When both are set, main.js builds `googleOidc({ clientId, clientSecret, redirectUri, fetch })` from
+  server/auth/oidc.js, with `redirectUri` from env `OIDC_REDIRECT_URI`, default `http://localhost:8080/auth/callback`.
+  When either is missing, `oidc` is null and the /auth routes keep answering 503. `config.cookieKey` comes from env
+  `COOKIE_KEY` (>= 32 bytes); if it is missing on a single node, generate a random one per process and log a warning
+  (sign-ins then don't survive a restart); in cluster mode a missing key refuses to start. Never read, print or log
+  the secret values; tests use fake values and a stub fetch, never the real client. `.env` lives only in the shared tree, not your worktree: don't copy it; a real sign-in
+  is checked after the merge.
+- **Env isolation (proxy/platform, 2026-11-11):** Bun auto-loads `.env`, so runs in the shared tree carry the Google
+  vars and COOKIE_KEY while CI and your worktree don't. `start(env)` must read **only** its `env` argument (today
+  main.js:93 still reads `process.env.LOG_LEVEL`: move it to `env`). Every main.js test passes an explicit env object,
+  never `process.env`, including one with no Google vars (oidc null, /auth 503) and one with fake ones. Tests must
+  behave the same in every checkout. Never log env or any value from it beyond names.
+
 ## Also: keep every bus message under 2 MB (from p4-natss3)
 
 - NATS refuses publishes over 2 MB. room-host publishes catch-up snapshots as one frame and group-commit `.entries`

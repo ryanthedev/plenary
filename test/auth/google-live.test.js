@@ -15,7 +15,9 @@ import { LOGIN_COOKIE } from "../../server/auth/http.js";
 const ID = process.env.GOOGLE_CLIENT_ID, SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const LIVE = process.env.PLENARY_LIVE_GOOGLE === "1" && !!ID && !!SECRET;
 const where = u => { const x = new URL(u); return x.origin + x.pathname; };
-const leaks = s => (ID && s.includes(ID)) || (SECRET && s.includes(SECRET));
+// Always a boolean: with no .env, ID and SECRET are undefined and a bare `&&`/`||` chain would yield undefined,
+// which fails `toBe(false)` (p5-tidy).
+const leaks = s => Boolean((ID && s.includes(ID)) || (SECRET && s.includes(SECRET)));
 
 describe.skipIf(!LIVE)("Google sign-in, live (PLENARY_LIVE_GOOGLE=1)", () => {
   let h;

@@ -4,10 +4,6 @@
 import { normEmail } from "./util.js";
 import { mint, RegistryError } from "./registry-port.js";
 
-// Re-exported only until engine's registry adapters (server/registry/sqlite.js, postgres.js) import
-// registry-port.js; then delete these lines (brief p5-hex).
-export { mint, RegistryError };
-
 /**
  * @typedef {import("./registry-port.js").Registry} Registry
  * @typedef {import("./registry-port.js").Role} Role

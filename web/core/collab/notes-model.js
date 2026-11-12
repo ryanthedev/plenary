@@ -15,11 +15,13 @@ const KIND = { freedraw: "Highlight / drawing", image: "Picture", arrow: "Arrow"
  *   canEdit?: boolean, canDelete?: boolean, limit?: number }} o
  */
 export function notesView(elements, { me, role, noteAuthor, nameOf, canEdit = false, canDelete = false, limit = 200 }) {
-  const live = elements.filter(e => e && !e.isDeleted);
-  const labels = new Map(live.filter(isLabel).map(e => [e.containerId, e.text]));
-  const notes = live.filter(e => !isLabel(e)).sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0));
+  // Newest first (updated desc; equal `updated` keep their order), only the first `limit` built: a bounded heap,
+  // O(n log limit), never a sort of every note (p7-perf: 50k notes).
+  const { top, total } = newest(elements, limit);
+  const want = new Set(top.map(e => e.id)), labels = new Map();
+  for (const e of elements) if (e && !e.isDeleted && isLabel(e) && want.has(e.containerId)) labels.set(e.containerId, e.text);
   const writer = canWrite(role, "notes"), mod = canModerate(role);
-  const rows = notes.slice(0, limit).map(e => {
+  const rows = top.map(e => {
     const by = noteAuthor(e.id), mine = by === me.user, may = writer && (mod || mine);
     return {
       id: e.id, text: (e.type === "text" ? e.text : labels.get(e.id)) || KIND[e.type] || "Note",
@@ -30,5 +32,40 @@ export function notesView(elements, { me, role, noteAuthor, nameOf, canEdit = fa
       canEdit: may && canEdit, canDelete: may && canDelete, locked: writer && !may,
     };
   });
-  return { rows, total: notes.length, more: Math.max(0, notes.length - limit) };
+  return { rows, total, more: Math.max(0, total - limit) };
+}
+
+/** How many notes the drawer would list (live, labels not counted): one pass, no allocation. */
+export function notesCount(elements) {
+  let n = 0;
+  for (const e of elements) if (e && !e.isDeleted && !isLabel(e)) n++;
+  return n;
+}
+
+/** The `limit` newest live non-label notes, in the order a stable sort by `updated` desc gives, and how many there are. */
+function newest(elements, limit) {
+  // A min-heap in typed arrays (no allocation per note), "worse" on top: lower updated, or equal and a later index.
+  const k = Math.max(0, limit), U = new Float64Array(k), I = new Int32Array(k), E = new Array(k);
+  let size = 0, total = 0;
+  const worse = (a, b) => U[a] < U[b] || (U[a] === U[b] && I[a] > I[b]);
+  const swap = (a, b) => { const u = U[a]; U[a] = U[b]; U[b] = u; const i = I[a]; I[a] = I[b]; I[b] = i; const e = E[a]; E[a] = E[b]; E[b] = e; };
+  for (const e of elements) {
+    if (!e || e.isDeleted || isLabel(e)) continue;
+    const u = e.updated ?? 0, idx = total++;
+    if (!k) continue;
+    if (size < k) {
+      let i = size++; U[i] = u; I[i] = idx; E[i] = e;
+      while (i) { const p = (i - 1) >> 1; if (!worse(i, p)) break; swap(i, p); i = p; }
+    } else if (u > U[0]) {     // equal `updated` never displaces: the earlier note wins (stable order)
+      U[0] = u; I[0] = idx; E[0] = e;
+      for (let i = 0; ;) {
+        const l = 2 * i + 1, r = l + 1; let m = i;
+        if (l < size && worse(l, m)) m = l;
+        if (r < size && worse(r, m)) m = r;
+        if (m === i) break; swap(i, m); i = m;
+      }
+    }
+  }
+  const order = Array.from({ length: size }, (_, i) => i).sort((a, b) => U[b] - U[a] || I[a] - I[b]);
+  return { top: order.map(i => E[i]), total };
 }

@@ -59,7 +59,9 @@
 //   noteAuthor(id) → user | null   who made a notes element (v1 snapshot `noteAuthor`, then entries)
 //   notes() → elements             the notes stream's live (not deleted) elements                   ADDED
 //   element(stream, id) → { x, y, width, height } | null   null when absent or deleted; anchors follow it  ADDED
-//   jumpTo?({ x, y })              optional: center the view on a world point                       ADDED
+//   jumpTo?({ x, y, scale? })      optional: center the view on a world point                       ADDED
+//                                  scale (optional, p7-perf): also zoom to it (a cluster click fits its members);
+//                                  a port that ignores scale still centres
 //   editNote?(id), deleteNote?(id) optional: the drawer shows edit/delete only when these exist     ADDED
 //   destroy?()                     optional: release the port (no more callbacks, a queued records frame included);
 //                                  mountCollab's destroy() calls it                                  ADDED (p7-wire2)

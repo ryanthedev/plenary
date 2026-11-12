@@ -1,5 +1,7 @@
 // Clock adapter: the browser's own time, timers and Math.random. Implements web/ports/clock.js.
-// The only web/ file that may touch Date.now / performance.now / setTimeout / Math.random.
+// With web/adapters/dom/collab/frame.js's domClock() (the collab UI's fallback, a copy of this: p7-perf D1, kept
+// in step by test/web/collab/perf-clock.test.js), the only web/ code that may touch Date.now / performance.now /
+// setTimeout / Math.random.
 // mono: performance.now; where it is missing (Herdr's QuickJS may lack it) a clamp over Date.now that never goes
 // backwards (a backward wall step then freezes mono until the wall clock catches up: deadlines run late, not early).
 

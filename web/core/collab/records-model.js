@@ -73,6 +73,7 @@ export function recordsView(records, { me, role, element }) {
     });
     threads.push({
       id: t.id, by: t.by, name: nameFor(t.by, t.name, pending), at: t.at, x: at.x, y: at.y, detached, on,
+      ...(on ? { home: { x: a.x, y: a.y } } : {}),
       point: !!a.point, resolved: t.resolved ? { by: t.resolved.by, name: nameFor(t.resolved.by, t.resolved.name, pend.thread.has(t.id)), at: t.resolved.at } : null,
       pending, statePending: pend.thread.has(t.id), comments, count: comments.filter(c => !c.deleted).length,
       canReply: writer, canResolve: writer,
@@ -84,4 +85,84 @@ export function recordsView(records, { me, role, element }) {
     resolved: threads.filter(t => t.resolved),
     canWrite: writer,
   };
+}
+
+/**
+ * Re-resolve element anchors of a recordsView in place (the board changed, the records didn't): a pin follows its
+ * element, or falls back to the anchor's own point when the element is gone. O(element-anchored threads), no
+ * allocation for a thread that didn't move. Returns true if any thread moved or (de)tached. A thread whose element
+ * is gone and whose own point isn't finite keeps its last place (recordsView would have dropped it).
+ */
+export function reanchor(rv, element) {
+  let moved = false;
+  for (const t of rv.threads) {
+    if (!t.on) continue;
+    const b = element(t.on.stream, t.on.element);
+    const x = b ? b.x + b.width : t.home?.x, y = b ? b.y : t.home?.y;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    if (x !== t.x || y !== t.y || t.detached !== !b) { t.x = x; t.y = y; t.detached = !b; moved = true; }
+  }
+  return moved;
+}
+
+/**
+ * A user → display name index over the records, first match wins in the same order a scan would find it (each
+ * thread, then its comments, in order). Build once per records change; looking a name up is then O(1).
+ */
+export function nameIndex(records) {
+  const names = new Map();
+  for (const t of records?.threads ?? []) {
+    if (t.name && !names.has(t.by)) names.set(t.by, t.name);
+    for (const c of t.comments ?? []) if (c.name && !names.has(c.by)) names.set(c.by, c.name);
+  }
+  return names;
+}
+
+/**
+ * Which pins go in the DOM: the threads inside `box` (world coords: the viewport plus a margin), at most `cap` of
+ * them as pins; past the cap, the rest are grouped into clusters on a `cell`-sized world grid, each with a count.
+ * `keep` (a thread id, e.g. the open one) is always a pin when it is in the box. At most `maxClusters` clusters: the
+ * grid coarsens (cell × 2) until they fit. Pure; O(threads) arithmetic per grid tried.
+ * @param {{ id: string, x: number, y: number }[]} threads
+ * @param {{ box: { x0: number, y0: number, x1: number, y1: number }, cap: number, cell: number, keep?: string | null, maxClusters?: number }} o
+ * @returns {{ pins: object[], clusters: { key: string, x: number, y: number, n: number, ids: string[], bounds: { x0: number, y0: number, x1: number, y1: number } }[], inBox: number }}
+ */
+export function layoutPins(threads, { box, cap, cell, keep = null, maxClusters = Infinity }) {
+  const inside = [];
+  for (const t of threads) if (t.x >= box.x0 && t.x <= box.x1 && t.y >= box.y0 && t.y <= box.y1) inside.push(t);
+  if (inside.length <= cap) return { pins: inside, clusters: [], inBox: inside.length };
+  for (let size = cell; ; size *= 2) {
+    const out = clusterInto(inside, size, cap, keep);
+    if (out.clusters.length <= maxClusters || !(size < 1e12)) return { ...out, inBox: inside.length };
+  }
+}
+function clusterInto(inside, cell, cap, keep) {
+  // Over the cap: the open thread stays a pin; the rest cluster by grid cell. Lone threads in a cell stay pins
+  // while room remains under the cap; every other cell becomes one cluster at its members' mean position.
+  const cells = new Map(), pins = [];
+  for (const t of inside) {
+    if (t.id === keep) { pins.push(t); continue; }
+    const key = `${Math.floor(t.x / cell)},${Math.floor(t.y / cell)}`;
+    let c = cells.get(key);
+    if (!c) cells.set(key, (c = { key, sx: 0, sy: 0, members: [], x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity }));
+    c.sx += t.x; c.sy += t.y; c.members.push(t);
+    if (t.x < c.x0) c.x0 = t.x; if (t.y < c.y0) c.y0 = t.y; if (t.x > c.x1) c.x1 = t.x; if (t.y > c.y1) c.y1 = t.y;
+  }
+  const clusters = [];
+  for (const c of cells.values()) {
+    if (c.members.length === 1 && pins.length < cap) pins.push(c.members[0]);
+    else clusters.push({ key: c.key, x: c.sx / c.members.length, y: c.sy / c.members.length, n: c.members.length, ids: c.members.map(t => t.id), bounds: { x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1 } });
+  }
+  return { pins, clusters };
+}
+
+/**
+ * Where a cluster click goes: the centre of its members' bounds, at the scale that fits them in `fit` of the
+ * viewport (w × h px), at least `minStep` × the current scale (each click zooms in) and at most `maxScale`.
+ */
+export function zoomToFit(bounds, { w, h, scale, fit = 0.8, minStep = 2, maxScale = 4 }) {
+  const bw = Math.max(0, bounds.x1 - bounds.x0), bh = Math.max(0, bounds.y1 - bounds.y0);
+  const fitScale = Math.min(bw ? (w * fit) / bw : Infinity, bh ? (h * fit) / bh : Infinity);
+  const target = Math.min(Math.max(fitScale, scale * minStep), Math.max(maxScale, scale));
+  return { x: (bounds.x0 + bounds.x1) / 2, y: (bounds.y0 + bounds.y1) / 2, scale: target };
 }

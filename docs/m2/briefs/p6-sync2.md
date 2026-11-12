@@ -4,7 +4,10 @@ Base: docs/m2/BRIEF-BASE.md applies. Read docs/m2/OFFICE.md, CLAUDE.md, PROTOCOL
 
 - **Your tab:** `worker p6-sync2 (client): sync onto phase-2 Replica`. Manager: `manager client` (t14k).
 - **Where you work:** the git worktree **/Users/r/repos/plenary-p2** (branch `p2-land`), not /Users/r/repos/plenary.
-  `cd` there first; every path below is relative to it. Don't commit; the engine track merges p2-land as ONE commit
+  `cd` there first; every path below is relative to it. State at start: p2-land head b8bf648 (rebased onto
+  f1886d5); top-level tests green, 54 failures all in test/web (sync.js still on v0): yours to fix. Engine may
+  rebase p2-land again (with --autostash; it pings your manager first). Never touch packages/protocol,
+  test/*.js or server/ there. Don't commit; the engine track merges p2-land as ONE commit
   after both verifiers pass, so the tree must never go red.
 - **You own:** web/sync.js, test/web/sync*.test.js, test/web/paint*.test.js (only if a seam change breaks them), and
   your report docs/m2/reports/p6-sync2.md (in the worktree). Nothing else: web/ui/, web/index.html, web/app.js and
@@ -54,8 +57,10 @@ separate worktree; you own every line.
 
 ## Carried from p6-basev round 2 (docs/m2/reports/p6-basev.md)
 
-- **M1:** time each op from its send (rule 2: no ack or error within 10 s), not "no message for 10 s"; use the new
-  Replica's `wait()` if it owns the timing.
-- **M2:** backoff (rule 12, growing and jittered) and the `version` (stop) and `unavailable` (keep ops, back off)
-  codes; an id-less error other than `auth` must not reconnect every 10 s forever.
+- **M1 and M2 (timing, backoff): the Replica owns them now** (engine, 2026-11-11). `wait()` returns ms until the
+  next deadline (connect/catch-up watchdog, per-op OP_TIMEOUT_MS = 10 s; on expiry it asks for a reconnect, never
+  a live resend); `reconnectWait()` is the jittered exponential backoff, including `version`/`unavailable`. So
+  sync.js sets timers ONLY from `wait()`/`reconnectWait()` and calls `outgoing()`; remove the old watchdog and add no
+  second ack timer. Test that a lost ack on a busy board still triggers a reconnect, and that repeated failures
+  back off.
 - **M3:** a test that held ops survive a reconnect (drop `held` in `restart()` must fail it). LOW L1's test gaps too.

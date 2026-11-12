@@ -4,9 +4,10 @@
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| p6-base (builder) | t14r | done p6-base (client) | fix round 1 done; re-verifying |
-| p6-basev (verifier) | t15h | verifier p6-basev (client): canvas + sync core, round 2 | RUNNING round 2 |
-| p6-ui (builder) | t160 | worker p6-ui (client): canvas UI | RUNNING (brief docs/m2/briefs/p6-ui.md) |
+| p6-ui (builder) | t160 | done p6-ui (client) | DONE, report docs/m2/reports/p6-ui.md (verifying) |
+| p6-uiv (verifier) | t172 | verifier p6-uiv (client): canvas UI | RUNNING (brief docs/m2/briefs/p6-uiv.md) |
+| p6-sync2 (builder) | t173 | done p6-sync2 (client) | DONE in worktree, report plenary-p2/docs/m2/reports/p6-sync2.md (verifying) |
+| p6-sync2v (verifier) | t176 | verifier p6-sync2v (client): sync onto phase-2 Replica | RUNNING (brief docs/m2/briefs/p6-sync2v.md) |
 
 ## 2026-11-11 — phase-6 design mock
 
@@ -112,3 +113,27 @@
 - p6-ui (t160) done: two Editors (board, notes), role gating at input plus an onOp backstop, the More sheet gated.
   Verifier p6-uiv (t172) started. p6-ui's wanted sync.js changes (bindEditors sharing one Replica, a role getter
   on the handle, a WebSocket transport) go to p6-sync2 where they fit the phase-2 API.
+- p6-base committed f1886d5; engine (t14j) told to rebase p2-land. t14r and t15h closed, killed, removed.
+- Engine: p2-land rebased onto f1886d5 (head b8bf648); 54 failures all in test/web (sync.js on v0). The Replica owns
+  timing (wait(), per-op OP_TIMEOUT_MS 10 s, reconnectWait() backoff); sync.js must not add its own ack timer.
+  Brief updated. p6-sync2 started (t173) in the worktree; no commits there, engine merges.
+- p6-sync2 done (t173): worktree bun test 252/252 (re-run by me; main has 11 more, p6-ui's untracked tests). API: adds status
+  `stopped`, handle `unconfirmed`/`discarded`/`previews()`, transport `close()`; `timeoutMs` only 0 matters; nothing
+  stable removed. Visible regression: peers' drags in flight not drawn until someone paints `previews()` (p6-ui/phase 7).
+  localRoom changed (token check, `checkpoint()`), which may break p6-ui's room-worker/net at merge: verifier
+  p6-sync2v (t176) runs p6-ui's files against the new sync.js.
+- For engine (from p6-sync2): Replica.presence() drops m.stream, so previews aren't per stream; no backoff counted
+  for transport drops (Replica.fails only grows on its own timeouts/unavailable).
+- Engine accepted both Replica findings; t15q is fixing them in the worktree (previews keyed by (stream, id); a
+  connectionFailed()-style call). Once engine gives the exact API, a small follow-up wires sync.js to it (and paints
+  nothing yet). Verifier t176 told that replica.js may change under it.
+- Engine's Replica fix round 2 is in the worktree (p2-recovery.md "Fix round 2"): `previewsOf(stream)` (others'
+  live previews on one stream) and `connectionFailed()` (call on a socket close or error the Replica didn't ask
+  for; counts once per connection toward backoff; then reconnectWait() and reconnect; not for closes we started).
+  Worktree suite 254/254 with our web files. QUEUED for t173 right after t176's verdict (not now: it would change
+  the code under verification): handle.previews() uses previewsOf(stream); transports report unplanned
+  close/error, and sync.js calls connectionFailed(); tests for both, plus any t176 findings. Then t176 re-verifies.
+- p6-uiv PASS (docs/m2/reports/p6-uiv.md): no HIGH. Role gating held (0 forbidden ops), no annotator touched
+  others' notes, no HTML injection, 5 tabs converged. MEDIUM M1: a draft typed when the connection drops is lost
+  (session.js:88). LOWs: ownership trusts localStorage, silent drop on downgrade, small mock gaps, a test gap.
+  Carried into the next client job.

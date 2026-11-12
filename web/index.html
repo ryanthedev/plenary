@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Plenary</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<!-- Plenary canvas. URL: ?board=<id>&as=<ada|bo|cy|di|ed|fi>&theme=light|dark&net=shared|local
+     (dev tokens until sign-in is wired; web/ui/dev-users.js lists them). -->
+<div class="app">
+  <header class="topbar" id="topbar"></header>
+  <div class="main">
+    <aside class="drawer" id="drawer" hidden></aside>
+    <div class="canvas" id="canvas">
+      <canvas class="board" id="board" tabindex="0" aria-label="Board"></canvas>
+      <textarea class="ink" id="ink" spellcheck="false" aria-label="Text"></textarea>
+      <div class="offline-veil" id="veil" hidden></div>
+      <div id="overlays"></div>
+      <div class="toast" id="toast" hidden></div>
+      <div class="hud hud-bl" id="hudBL"></div>
+      <div class="hud hud-bc" id="hudBC"></div>
+      <div class="hud hud-br" id="hudBR"></div>
+      <div class="dock" id="dock"></div>
+    </div>
+    <aside class="panel" id="panel" hidden></aside>
+    <div class="sheet" id="sheet" hidden></div>
+    <div id="dialogs"></div>
+  </div>
+  <footer class="timeline" id="timeline" hidden></footer>
+</div>
+<input type="file" id="picker" accept="image/png,image/jpeg,image/gif,image/webp,.excalidrawlib" multiple hidden>
+<script type="module" src="app.js"></script>
+</body>
+</html>

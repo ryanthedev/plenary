@@ -6,8 +6,8 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| pd-drawh (builder) | t14y | done pd-drawh (platform) | fix round RUNNING |
-| pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | FAIL (2 HIGH), idle; re-checks after fix |
+| pd-drawh3 (builder, round 3) | t185 | worker pd-drawh3 (platform): drawh settings, round 3 | RUNNING |
+| pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | re-check 2 FAIL, idle; re-check 3 after round 3 |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel
 
@@ -238,3 +238,13 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 - p5-flake: DONE (commit c0ff386). Verifier PASS: no wall-clock assertion, fails on three O(n) mutations, 100/100
   runs under full CPU load. bun test 325 pass. Declined the verifier's extra stress re-run (report already
   complete); confirmed no leftover load processes. Sessions t182, t183 closed, killed, removed.
+
+## 2026-11-11 drawh re-check 2 FAIL; round 3; manager handoff
+
+- Re-check 2 (t155): R1 fixed, but the 10 s window silently bounces real settings reverts (R2a) and swallows a
+  change-and-change-back after any bounce (R2b). Root cause: settings carry no version. Round 3, the last, on a
+  fresh builder t185 (t14y at 46% retired, closed, removed): clock-free base-generation marker, or the scope cut
+  (settings room → file only) if the pane drops the marker. If re-check 3 fails, ship the scope cut.
+- Sent to engine via proxy: settings versions in the protocol; room identity in v1 welcome. README PASS is stale
+  (needs refresh + re-verify after p2-swap).
+- Handoff: docs/m2/handoff/manager-platform.md. t14q at ~53% context hands off now.

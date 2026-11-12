@@ -7,7 +7,8 @@ Manager terminal: `t14q` (tab `manager platform`). Parent: proxy `t14h`.
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
 | pd-drawh (builder) | t14y | done pd-drawh (platform) | fix round RUNNING |
-| p5-flake (builder) | t182 | worker p5-flake (platform): deterministic replay-guard test | RUNNING |
+| p5-flake (builder) | t182 | done p5-flake (platform) | reported, idle |
+| p5-flakev (verifier) | t183 | verifier p5-flakev (platform): deterministic replay-guard test | RUNNING |
 | pd-drawhv (verifier) | t155 | verifier pd-drawhv (platform): drawh proposal | FAIL (2 HIGH), idle; re-checks after fix |
 
 ## 2026-11-11 start: p5-auth and p8-ci in parallel

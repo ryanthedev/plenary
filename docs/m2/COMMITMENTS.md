@@ -8,9 +8,9 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 |---|---|---|---|
 | owner | t13s | owner (audits) | idle after starting the proxy |
 | proxy | t1bx | ★ proxy · t1bx (talk here) | running (successor of t14h; handoff docs/m2/handoff/proxy.md, 9d06783) |
-| manager engine | t18m | manager engine | running (successor of t14j; handoff docs/m2/handoff/manager-engine.md, 94b1ae9): scaffold final gate t18c, v1.1 code verify t171 |
+| manager engine | t18m | manager engine | running (successor of t14j; handoff docs/m2/handoff/manager-engine.md, 94b1ae9): p2-tune committed a90cd6b; p4-hostv FAILed (1 HIGH, 3 MEDIUM); fix round p4-host r2 done by t1h5 (brief docs/m2/briefs/p4-host-r2.md, report p4-host.md § Round 2), re-verify running in t1hd (p4-hostv round 2); p5-load patch held until p4-host commits; next p-fanout, tab counting, E-1/E-2 |
 | manager platform | t187 | manager platform | running (successor of t14q; handoff docs/m2/handoff/manager-platform.md, 9266173): drawh round 3 (t185, verifier t155) |
-| manager client | t14k | manager client · t14k | running: p7-wire (t1gq, collab over sync, both roots); then p7-wirev, then a web/ architecture audit |
+| manager client | t14k | manager client · t14k | audit p7-audit committed ea47b46 (7 HIGH; 4 engine ones sent to t18m); fix jobs p7-perf t1h2, p7-chrome t1h3, p7-archtest t1h4 building; p7-tab after engine's ping |
 
 ## Commitments
 
@@ -125,3 +125,8 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-12 proxy: every local agent was killed at 03:44 (herdr-core holder loss; terminals kept as plain zsh). Proxy resumed in place (claude --resume, --model opus, auto, plugin dirs, via zsh -lic): owner t13s, managers t18m t14k t187, in-flight t1g8 t1g7 t1g6 t1g5 t1g4 t1fw t1ft. Done builders t1g3 t1g1 t1fy and retired proxy t14h left as shells. Watches re-armed.
 - 2026-11-12 client: p6-hexv FAIL (known HIGH: main.js must be the production root, plus LOWs; 1044 pass / 0 fail). Fix round running in t1gk (resumed builder). Two transports per tab goes on the M4 load-test plan.
 - 2026-11-12 client: p6-hex committed 06bf267 (web/ hexagonal; production root on ws + HTTP auth; p6-hexv PASS round 2). p7-wire started (t1gq).
+- 2026-11-12 client: p7-wire built (collab over sync in both roots; test/web 598/0 by manager). Verifier p7-wirev t1gw. Engine call on per-connection viewer counts: (a) hello gets an optional per-tab `tab` id; viewers counted per (user, tab), writer cap 8 tabs per (user, board) per gateway. Client sends `tab` only after engine pings that it is in (after p2-tune r2). One connection per tab stays on the M4 plan.
+- 2026-11-12 client: p7-wire committed e4cba6c (p7-wirev PASS, 2 MEDIUM, 3 LOW). Decision: the writer-cap `limit` retries on rule-12 backoff as PROTOCOL.md § Pacing says (the brief's "no retry" was wrong). Fix round p7-wire2 in t1gq.
+- 2026-11-12 client: p7-wire2 committed 001813a (p7-wirev PASS rounds 2-3: writer cap retries on rule-12 backoff; auth refusal wins over the cap). Next: p7-tab after engine's ping.
+- 2026-11-12 engine: p2-tune committed a90cd6b (p2-tunev round 2 PASS). p4-host builder started (t1h5). Client p7-audit engine findings E-1..E-7 received and queued.
+- 2026-11-12 proxy: pushed main at f1bfee6 (48 commits since 02:58) after a clean-checkout gate (1358 pass / 144 skip / 0 fail); CI run 43288565368 green.

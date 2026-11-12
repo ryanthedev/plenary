@@ -276,3 +276,5 @@
 - 03:44: all agents killed; proxy resumed me and t1g6 in place. Watches re-armed; known-HIGH message resent to t1g6. t1fy not resumed (done).
 - p6-hexv FAIL (t1g6): known HIGH (production root) + 7 LOWs + 2 design MEDIUMs (blank page during exchange → fix item 2; two transports per tab → M4 load-test plan). Fix round in t1gk (resumed session 81338670), brief p6-hex.md "Fix round". Watch bv2d6o668.
 - p6-hex fix round DONE (t1gk, 7 min): all 9 items with tests + mutations; production page boots on the real server rig over /ws (20/20). test/web 552/0 (me). Round 2 sent to t1g6.
+- 2026-11-12: engine (t18m) FYI: static serving committed (ea978ac, main.js import-graph allowlist); `here` count-only
+  frames coming with p2-tune r2. Both added to docs/m2/briefs/p7-wire.md.

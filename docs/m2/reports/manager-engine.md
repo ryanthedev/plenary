@@ -15,8 +15,8 @@ phase 4 leases/takeover.
 | Job | Terminal | Status |
 |---|---|---|
 | p2-tune (builder, plenary-p2-tune) | t1fw | RUNNING (brief docs/m2/briefs/p2-tune.md) |
-| p-arch (builder, plenary-p-arch) | t1fx | reported, idle (1 allowlisted: blobs/s3.js -> blobs/disk.js) |
-| p-archv (verifier, plenary-p-archv) | t1g0 | RUNNING (brief docs/m2/briefs/p-archv.md) |
+| p-arch (builder, plenary-p-arch) | t1fx | committed 44dd1aa; RUNNING follow-up (3 MEDIUM, adapter shared-list rule, admin-bootstrap root, blobs port) |
+| p-archv (verifier, plenary-p-archv) | t1g0 | PASS, idle; re-checks the follow-up |
 | p-serve (builder, plenary-p-serve) | t1g3 | RUNNING (brief docs/m2/briefs/p-serve.md; server/static.js, server.js mount, test/server/static.test.js) |
 
 Closed: t1fm, t1fn, t1dh, t15q, t186, t188, t18c, t18b, t171, t16y, t158, t17d, t17p, t17f, t17m, t17j.
@@ -226,3 +226,4 @@ Leftover scratch: t17j ~1 GB, t18c 168 MB in their scratchpads.
 - Platform S1 (pd-drawh-live): POST /boards 403 on stock single node with dev tokens. Decision: platform builds server/admin bootstrapTenant + CLI (also for the first Google tenant) and adds a dev-only call in main.js (allowed: a few lines in the dev path).
 - Platform p8-readme2: (1) main.js:152 stale 'sign-in not wired' log: platform fixes it within its S1 main.js change. (2) GET / 404 after Google sign-in: engine job queued (p-serve: server.js serves web/ statically at /), after p2-tune; asked client t14k for entry file, excluded paths, headers.
 - Client t14k gave p-serve requirements (mounts, import-graph allowlist, deny list, CSP/headers). p-serve started (t1g3) now since its files are disjoint; p2-tune told to leave static files alone. Client sends final paths when p6-hex lands.
+- p-archv PASS (3 MEDIUM, 8 LOW). Committed p-arch 44dd1aa (arch + store/registry/auth tests 179/0). Sent id to t187 (p5-pgpriv) and t14k (arch-scan). Decision: limit driven adapters to ports + explicit shared list (auth/http.js exempt). Follow-up to t1fx incl. platform's scripts/admin-bootstrap.js composition root.

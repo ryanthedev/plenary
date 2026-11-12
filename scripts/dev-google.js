@@ -68,6 +68,7 @@ export async function startDevGoogle({ env = process.env, port = PORT, hostname 
   const oidc = googleOidc({ clientId, clientSecret, redirectUri: REDIRECT_URI, fetch });
   const routes = httpRoutes({
     registry, sessions, oidc, tenancy: makeTenancy({ registry }),
+    log: { warn: (msg, fields) => log({ msg, ...fields }) },          // "sign-in failed" { cause } (p5-googlev LOW 1)
     config: { cookieKey, postLoginUrl: `${ORIGIN}/signed-in`, boardUrl: `${ORIGIN}/b/{board}` },
   });
 
@@ -125,27 +126,41 @@ export async function safeFetch(input, init) {
  */
 export async function probeAuthorize(url, { fetch = safeFetch } = {}) {
   const g = await fetch(url, { redirect: "follow" });
-  const body = await g.text();
+  // Reading the body can fail after the headers arrived (a reset mid-body); Bun's error may then name the URL, so it
+  // gets the same treatment as safeFetch (p5-googlev re-check, new LOW).
+  let body;
+  try { body = await g.text(); } catch (e) { throw new Error("google unreachable: body " + (typeof e?.name === "string" && /^[A-Za-z]{1,40}$/.test(e.name) ? e.name : "error")); }
   const f = new URL(g.url);
   return { status: g.status, where: f.origin + f.pathname, path: f.pathname,
     errors: AUTH_ERRORS.filter(m => g.url.includes(m) || body.includes(m)) };
 }
 export const AUTH_ERRORS = ["redirect_uri_mismatch", "invalid_client", "unauthorized_client", "signin/oauth/error"];
 
-/** True when something already answers HTTP on host:port (so the browser's "localhost" might reach it). */
-async function answers(host, port) {
-  try { await fetch(`http://${host}:${port}/`, { signal: AbortSignal.timeout(1000) }); return true; }
-  catch { return false; }
+/**
+ * True when anything accepts a TCP connection on host:port, HTTP or not (p5-googlev LOW 2: a silent listener on
+ * [::1] must stop us too, or the browser's "localhost" may reach it instead of us).
+ */
+export async function listening(host, port, timeoutMs = 1000) {
+  return new Promise(resolve => {
+    let done = false;
+    const end = (v, sock) => { if (done) return; done = true; clearTimeout(t); try { sock?.end(); } catch {} resolve(v); };
+    const t = setTimeout(() => end(false), timeoutMs);
+    Bun.connect({ hostname: host, port, socket: { open: s => end(true, s), data() {}, error: () => end(false), close() {}, connectError: () => end(false) } })
+      .catch(() => end(false));
+  });
 }
 
+/** True when port is taken on 127.0.0.1 or ::1. */
+export const portBusy = async port => (await listening("127.0.0.1", port)) || (await listening("::1", port));
+
 if (import.meta.main) {
-  if (await answers("127.0.0.1", PORT) || await answers("[::1]", PORT)) {
+  if (await portBusy(PORT)) {
     console.error(`dev-google: something already answers on port ${PORT}; stop it first (the redirect URI fixes the port)`);
     process.exit(1);
   }
   let h;
   try { h = await startDevGoogle(); }
-  catch (e) { console.error(`dev-google: ${e.message}`); process.exit(1); }
+  catch (e) { console.error(String(e.message).startsWith("dev-google:") ? e.message : `dev-google: ${e.message}`); process.exit(1); }   // p5-googlev LOW 3
   console.error(`dev-google: pid ${process.pid}; open ${ORIGIN}/ (Ctrl-C or kill ${process.pid} to stop)`);
   for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => { h.stop(); process.exit(0); });
 }

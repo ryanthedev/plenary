@@ -138,38 +138,41 @@ function authoritativeEmail(c, hd) {
  * must contain it and, if it has several, `azp` must be clientId); `exp` and `iat` within `skewSec`; `nonce`
  * equals the expected one (required, non-empty). The Workspace domain is the `hd` claim, never the email.
  * @param {string} token
- * @param {{ clientId: string, nonce: string, keys: ReturnType<typeof jwksCache>, now?: () => number, skewSec?: number }} o
+ * `why(cause)`, if given, hears one fixed label when the token is refused (CAUSES below); never the token or a claim.
+ * @param {{ clientId: string, nonce: string, keys: ReturnType<typeof jwksCache>, now?: () => number, skewSec?: number,
+ *   why?: (cause: string) => void }} o
  * @returns {Promise<Identity|null>}
  */
-export async function verifyIdToken(token, { clientId, nonce, keys, now = Date.now, skewSec = 60 }) {
-  if (typeof clientId !== "string" || !clientId) return null;
-  if (typeof nonce !== "string" || !nonce) return null;
+export async function verifyIdToken(token, { clientId, nonce, keys, now = Date.now, skewSec = 60, why }) {
+  const no = cause => { try { why?.(cause); } catch { /* a reporter never changes the verdict */ } return null; };
+  if (typeof clientId !== "string" || !clientId) return no("bad_config");
+  if (typeof nonce !== "string" || !nonce) return no("bad_nonce");
   const jwt = parseJwt(token);
-  if (!jwt) return null;
+  if (!jwt) return no("bad_token");
   const { header, payload: c } = jwt;
-  if (header.alg !== "RS256" || typeof header.kid !== "string") return null;
-  if (header.crit !== undefined) return null;
+  if (header.alg !== "RS256" || typeof header.kid !== "string") return no("bad_alg");
+  if (header.crit !== undefined) return no("bad_alg");
 
   const key = await keys.key(header.kid);
-  if (!key) return null;
+  if (!key) return no("unknown_kid");
   let ok = false;
   try { ok = await crypto.subtle.verify({ name: "RSASSA-PKCS1-v1_5" }, key, jwt.sig, jwt.signed); } catch { ok = false; }
-  if (!ok) return null;
+  if (!ok) return no("bad_sig");
 
-  if (!GOOGLE.issuers.includes(c.iss)) return null;
-  if (typeof c.aud === "string") { if (c.aud !== clientId) return null; }
+  if (!GOOGLE.issuers.includes(c.iss)) return no("bad_iss");
+  if (typeof c.aud === "string") { if (c.aud !== clientId) return no("bad_aud"); }
   else if (Array.isArray(c.aud)) {
-    if (!c.aud.includes(clientId)) return null;
-    if (c.aud.length > 1 && c.azp !== clientId) return null;
-  } else return null;
+    if (!c.aud.includes(clientId)) return no("bad_aud");
+    if (c.aud.length > 1 && c.azp !== clientId) return no("bad_aud");
+  } else return no("bad_aud");
   const t = Math.floor(now() / 1000);
-  if (!Number.isFinite(c.exp) || !Number.isFinite(c.iat)) return null;
-  if (t > c.exp + skewSec) return null;
-  if (c.iat > t + skewSec) return null;
-  if (c.exp <= c.iat) return null;
-  if (c.iat < t - MAX_TOKEN_AGE_SEC) return null;       // Google ID tokens live 1 h; older than a day is stale
-  if (c.nonce !== nonce) return null;
-  if (typeof c.sub !== "string" || !c.sub || c.sub.length > 255) return null;
+  if (!Number.isFinite(c.exp) || !Number.isFinite(c.iat)) return no("bad_time");
+  if (t > c.exp + skewSec) return no("expired");
+  if (c.iat > t + skewSec) return no("bad_time");
+  if (c.exp <= c.iat) return no("bad_time");
+  if (c.iat < t - MAX_TOKEN_AGE_SEC) return no("stale");       // Google ID tokens live 1 h; older than a day is stale
+  if (c.nonce !== nonce) return no("bad_nonce");
+  if (typeof c.sub !== "string" || !c.sub || c.sub.length > 255) return no("bad_sub");
 
   const hd = typeof c.hd === "string" ? c.hd.trim().toLowerCase() : "";
   return {
@@ -181,6 +184,19 @@ export async function verifyIdToken(token, { clientId, nonce, keys, now = Date.n
 }
 
 // ---- The sign-in flow ----
+
+/** The OAuth token-endpoint error names (RFC 6749 § 5.2) a refusal may report as its cause. */
+const TOKEN_ERRORS = ["invalid_request", "invalid_client", "invalid_grant", "unauthorized_client", "unsupported_grant_type", "invalid_scope"];
+
+/**
+ * Every label `finish`'s `why` can hear (fixed strings; safe to log). `token_http_<status>` covers a token-endpoint
+ * refusal without a known error name.
+ */
+export const CAUSES = Object.freeze([
+  "bad_expected", "state_mismatch", "no_code", ...TOKEN_ERRORS, "token_http_<status>", "idp_timeout", "idp_unreachable",
+  "bad_config", "bad_token", "bad_alg", "unknown_kid", "bad_sig", "bad_iss", "bad_aud", "bad_time", "expired", "stale",
+  "bad_nonce", "bad_sub",
+]);
 
 /**
  * @param {{ clientId: string, clientSecret: string, redirectUri: string, fetch: typeof fetch,
@@ -208,14 +224,17 @@ export function googleOidc(config) {
     },
     /**
      * Finish sign-in: check `state`, exchange the code (with the PKCE verifier), verify the ID token.
+     * `o.why(cause)`, optional and outside the IdP port (http.js passes it to log a failed sign-in): on a refusal it
+     * hears one label from CAUSES. Never a code, token, claim or Google's error_description.
      * @returns {Promise<Identity|null>}
      */
     async finish(o) {
-      const { code, state, expected } = o && typeof o === "object" ? o : {};
+      const { code, state, expected, why } = o && typeof o === "object" ? o : {};
+      const no = cause => { try { if (typeof why === "function") why(cause); } catch { /* never changes the verdict */ } return null; };
       const ok = v => typeof v === "string" && v.length > 0;
-      if (!expected || !ok(expected.state) || !ok(expected.nonce) || !ok(expected.verifier)) return null;
-      if (state !== expected.state) return null;
-      if (typeof code !== "string" || !code) return null;
+      if (!expected || !ok(expected.state) || !ok(expected.nonce) || !ok(expected.verifier)) return no("bad_expected");
+      if (state !== expected.state) return no("state_mismatch");
+      if (typeof code !== "string" || !code) return no("no_code");
       let body;
       try {
         const res = await fetch(GOOGLE.token, {
@@ -227,10 +246,15 @@ export function googleOidc(config) {
             redirect_uri: redirectUri, code_verifier: expected.verifier,
           }).toString(),
         });
-        if (!res.ok) return null;
+        if (!res.ok) {
+          // Google's `error` field only, and only a name from RFC 6749 § 5.2; never `error_description` or the body.
+          let e = null;
+          try { e = (await res.json())?.error; } catch { /* not JSON */ }
+          return no(TOKEN_ERRORS.includes(e) ? e : `token_http_${res.status}`);
+        }
         body = await res.json();
-      } catch { return null; }
-      return verifyIdToken(body?.id_token, { clientId, nonce: expected.nonce, keys, now, skewSec });
+      } catch (e) { return no(e?.name === "TimeoutError" ? "idp_timeout" : "idp_unreachable"); }
+      return verifyIdToken(body?.id_token, { clientId, nonce: expected.nonce, keys, now, skewSec, why: no });
     },
     /** Verify an ID token directly (exposed for tests and for a future token-exchange endpoint). */
     verifyIdToken: (token, nonce) => verifyIdToken(token, { clientId, nonce, keys, now, skewSec }),

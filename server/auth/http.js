@@ -2,7 +2,12 @@
 // it with `createServer({ http: httpRoutes(deps) })`: its own routes run first, then these, then a 404.
 //
 //   httpRoutes(deps) → async (req: Request, url?: URL) => Response | null      (null = "not my route")
-//   deps = { registry, sessions, oidc, tenancy, now, config, dev?, testHooks? }
+//   deps = { registry, sessions, oidc, tenancy, now, config, dev?, log?, testHooks? }
+//     log: optional { warn(msg, fields) } (server/log.js shape). A failed callback logs ONE line,
+//          "sign-in failed" { cause }, cause from SIGN_IN_CAUSES below or oidc.js CAUSES (p5-googlev LOW 1): fixed
+//          labels only, never a code, state, token, cookie value or Google's error_description. Default: one JSON
+//          line on stdout in server/log.js's format, so the real server logs causes even when its composition root
+//          passes no logger (this file may not import server/log.js: test/auth/architecture.test.js rule 3).
 //     testHooks: tests only, not an API. { pruned({ visited, expired, live }) } runs after the first replay-guard prune of each
 //                callback (the up-front `seen` check; the later `use` prunes again without reporting).
 //     dev: optional dev-token verifier (server/auth/dev.js devAuth). Only when given AND enabled does Bearer accept
@@ -105,7 +110,7 @@ const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
  *   now?: () => number, config: object, dev?: { enabled?: boolean, verify(t: string): Promise<object|null> } | null,
  *   testHooks?: { pruned?(p: { visited: number, expired: number, live: number }): void } | null }} deps   (tests only, not an API)
  */
-export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Date.now, config = {}, dev = null, testHooks = null }) {
+export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Date.now, config = {}, dev = null, log = stdoutLog, testHooks = null }) {
   if (!registry || !sessions || !tenancy) throw new Error("http: registry, sessions and tenancy are required");
   const postLoginUrl = absUrl(config.postLoginUrl, "postLoginUrl");
   const postLogoutUrl = config.postLogoutUrl ? absUrl(config.postLogoutUrl, "postLogoutUrl") : postLoginUrl;
@@ -250,24 +255,35 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
     return redirect(b.url, [await sealLogin({ ...b, link })]);
   }
 
+  /** One "sign-in failed" line; a broken logger never changes the answer. */
+  const failed = cause => { try { log?.warn?.("sign-in failed", { cause }); } catch { /* logging is best effort */ } };
+
   async function callback(req, url) {
     if (!oidc) return err(503, "sign-in-unavailable");
-    const fail = () => withCookie(err(400, "login-failed"), clearLogin);
+    const fail = cause => { failed(cause); return withCookie(err(400, "login-failed"), clearLogin); };
     const expected = await openLogin(req);
-    if (!expected) return fail();
+    if (!expected) return fail(cookie(req, LOGIN_COOKIE) === null ? "no_login_cookie" : "bad_login_cookie");
     const state = url.searchParams.get("state"), code = url.searchParams.get("code");
-    if (url.searchParams.has("error") || state !== expected.state || !code) return fail();
+    if (url.searchParams.has("error")) {
+      const e = url.searchParams.get("error");
+      return fail(AUTHORIZE_ERRORS.includes(e) ? `idp_error:${e}` : "idp_error");
+    }
+    if (state !== expected.state) return fail("state_mismatch");
+    if (!code) return fail("no_code");
     // A state takes a replay-guard slot only once its callback SUCCEEDS (p5-googlev MEDIUM 2): a bogus code costs
     // no slot, so anonymous callbacks with free login cookies can't fill the guard and lock sign-in out. A used state
     // is refused up front (no Google call), and again after `finish` for two callbacks racing on one state (Google's
     // single-use code already lets only one of them through; the synchronous `use` is the second guard).
-    if (usedStates.seen(expected.state)) return fail();
-    let identity;
-    try { identity = await oidc.finish({ code, state, expected }); } catch { identity = null; }
-    if (!identity) return fail();
+    if (usedStates.seen(expected.state)) return fail("state_used");
+    let identity, cause = null;
+    // Label-shaped only: 1-4 short lowercase words joined by "_", optionally "_<3 digits>" (token_http_502). A state,
+    // nonce or code (32+ random chars, or mixed case) can never pass, whatever an adapter hands `why`.
+    const why = c => { if (cause === null && typeof c === "string" && /^[a-z]{1,12}(?:_[a-z]{1,12}){0,3}(?:_\d{3})?$/.test(c)) cause = c; };
+    try { identity = await oidc.finish({ code, state, expected, why }); } catch { identity = null; cause ??= "idp_threw"; }
+    if (!identity) return fail(cause ?? "idp_refused");
     const used = usedStates.use(expected.state);
-    if (used === "replay") return fail();
-    if (used === "full") return withCookie(err(503, "unavailable"), clearLogin);
+    if (used === "replay") return fail("state_used");
+    if (used === "full") { failed("replay_guard_full"); return withCookie(err(503, "unavailable"), clearLogin); }
     let x;
     try { x = await mintCode(identity); } catch { return withCookie(err(503, "unavailable"), clearLogin); }
     const frag = "#code=" + x.code;   // base64url: URL-safe as is
@@ -412,6 +428,25 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
     }
   };
 }
+
+/**
+ * Causes this file adds to oidc.js's CAUSES for a failed callback. `idp_error:<name>` carries Google's `error`
+ * parameter only when it is one of AUTHORIZE_ERRORS (RFC 6749 § 4.1.2.1, OIDC Core § 3.1.2.6); else plain idp_error.
+ * `idp_refused`: the IdP refused without naming a cause (an adapter with no `why`).
+ */
+export const SIGN_IN_CAUSES = Object.freeze(["no_login_cookie", "bad_login_cookie", "idp_error", "idp_error:<name>",
+  "state_mismatch", "no_code", "state_used", "idp_threw", "idp_refused", "replay_guard_full"]);
+const AUTHORIZE_ERRORS = ["access_denied", "invalid_request", "unauthorized_client", "unsupported_response_type",
+  "invalid_scope", "server_error", "temporarily_unavailable", "interaction_required", "login_required",
+  "consent_required", "account_selection_required", "invalid_request_uri", "invalid_request_object"];
+
+/** The default `log`: one JSON line on stdout, server/log.js's shape ({ ...fields, time, level, msg }). */
+const stdoutLog = {
+  warn(msg, fields) {
+    try { process.stdout.write(JSON.stringify({ ...fields, time: new Date().toISOString(), level: "warn", msg }) + "\n"); }
+    catch { /* a broken stdout must not take the server down */ }
+  },
+};
 
 /** One cookie's value from the request, or null. */
 function cookie(req, name) {

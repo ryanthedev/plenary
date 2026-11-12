@@ -21,7 +21,7 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 | 6 | CEO does one live Google sign-in (bun scripts/dev-google.js, http://localhost:8080/) | DONE 2026-11-12 04:44Z (server log: /auth/login 302, /auth/callback 302 loginCookie true, /signed-in 200, POST /auth/exchange 200; proxy ran the server, CEO signed in) | docs/m2/reports/p5-google.md "Hand-off" |
 | 3 | Ask the CEO for the Google OAuth client (env vars, never chat) when phase 5 starts | DONE 2026-11-11 | Web client "canvas-dev-local" in Omniping project gen-lang-client-0027800234 (consent screen already External/Testing); redirect http://localhost:8080/auth/callback; keys in .env (gitignored, 0600) via the downloaded JSON, never shown in chat |
 | 5 | Hexagonal architecture enforced (boundary test) and the systems design skill used on every design-bearing job; architecture audit per track | RUNNING | OFFICE.md "Architecture"; managers told |
-| 4 | drawh change is a proposal only; herdr-draw untouched without the CEO | RUNNING (scope cut after 3b FAIL; round 4 on v1.1) | builder t185, verifier t155; goes to the CEO for approval after PASS |
+| 4 | drawh change is a proposal only; herdr-draw untouched without the CEO | ASKED 2026-11-12: proposal c3adcba to the CEO (approve/reject); proxy recommends waiting for round 4 on v1.1 (t1ds) | builder t185, verifier t155; goes to the CEO for approval after PASS |
 
 ## Decisions (reversible; the CEO may overturn)
 
@@ -111,3 +111,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-12 proxy: phase 3 audit PASS: clean worktree of main 378d089 (no .env, like CI) 510 pass / 0 fail after p5-tidy d8fc084 and R5-M1 ffd2a11. Pushed main to origin (378d089).
 - 2026-11-12 CEO: nobody messages the proxy's input ("this input is my space"); managers report via turn-end messages + report files, delivered by the proxy's watch. In OFFICE.md and the three manager briefs.
 - 2026-11-12 CEO: the owner may communicate with the proxy, through a tool: turn-end messages delivered by the proxy's watch (owner t13s added to it). In OFFICE.md.
+- 2026-11-12 platform: drawh proposal committed c3adcba (docs/m2/proposals/drawh-server.md + .patch; re-check 4b: four asked items pass, one narrow hand-edit-only gap accepted by the manager). Shown to the CEO. Round 4 (v1.1, t1ds) running.

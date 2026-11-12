@@ -9,7 +9,7 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 | owner | t13s | owner (audits) | idle after starting the proxy |
 | proxy | t14h | ★ proxy (talk here) | running |
 | manager engine | t14j | manager engine | p1 spec fixed, re-verifying (verifier t151); p3 server scaffold builder t14z running |
-| manager platform | t14q | manager platform | running: p5-auth (builder t14s), p8-ci DONE 8f89d4f; p5-auth verifying (t153), p8-ign DONE 4fc4c71; drawh proposal (builder t14y) |
+| manager platform | t187 | manager platform | running (successor of t14q; handoff docs/m2/handoff/manager-platform.md, 9266173): drawh round 3 (t185, verifier t155) |
 | manager client | t14k | manager client | running: phase 6 mock verifying (verifier t14v) + p6-base canvas core (builder t14r) |
 
 ## Commitments
@@ -80,3 +80,4 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 - 2026-11-11 engine: scaffold round 3 FAIL, 2 HIGH (a since-0 catch-up over the 64 MiB per-user budget is always refused; a kill -9 test flake at a count boundary). Fix round 3 in t14z. The scaffold is the single blocker: phase 2 (verified on p2-land), Postgres and NATS/S3 adapters (verified) all wait on it.
 - 2026-11-11 platform: p5-flake DONE c0ff386 (the replay-guard test counts pruner visits; 100/100 under load).
 - 2026-11-11 platform: drawh re-check 2 FAIL (settings have no version, so a stale save and a revert are indistinguishable); round 3 (the last) with a fresh builder; t14y retired. Sent to engine: settings version/base, and a room identity in welcome. README PASS stale; refresh after p2-swap. Platform manager handing off at 52%.
+- 2026-11-11 proxy: platform manager t14q handed off to t187 (9266173); t14q closed and removed. Engine scheduled the drawh asks as p1-v11 (t186): settings compare-and-set on a per-key base appSeq with a soft refusal; welcome carries room {board, epoch}.

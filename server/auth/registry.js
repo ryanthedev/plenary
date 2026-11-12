@@ -100,5 +100,10 @@ export function memoryRegistry({ now = Date.now } = {}) {
       uses.get(k).add(link);
     },
     async linkUses(board, user) { return [...(uses.get(board + "\n" + user) ?? [])]; },
+    async linkUsesFor(board, users) {
+      const out = new Map();
+      for (const u of users ?? []) { const s = uses.get(board + "\n" + u); if (s?.size) out.set(u, [...s]); }
+      return out;
+    },
   };
 }

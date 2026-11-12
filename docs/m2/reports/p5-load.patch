@@ -1,0 +1,413 @@
+diff --git a/server/auth/port.js b/server/auth/port.js
+index 495c682..e8a74df 100644
+--- a/server/auth/port.js
++++ b/server/auth/port.js
+@@ -25,7 +25,8 @@
+ 
+ /**
+  * @param {{ sessions?: Verifier, dev?: Verifier,
+- *   tenancy: { role(id: Identity, board: string): Promise<string|null> } }} deps
++ *   tenancy: { role(id: Identity, board: string): Promise<string|null>,
++ *     rolesFor?(board: string, ids: Identity[]): Promise<Map<string, string|null>>, invalidate?(board: string, user?: string): void } }} deps
+  * @returns {Auth}
+  */
+ export function authPort({ sessions, dev, tenancy }) {
+@@ -43,5 +44,8 @@ export function authPort({ sessions, dev, tenancy }) {
+     async role(identity, board) {
+       return tenancy.role(identity, board);
+     },
++    // p5-load: the batch (Map user → role|null, fresh) and the cache's invalidation, when the tenancy has them.
++    ...(typeof tenancy.rolesFor === "function" ? { rolesFor: (board, identities) => tenancy.rolesFor(board, identities) } : {}),
++    ...(typeof tenancy.invalidate === "function" ? { invalidate: (board, user) => tenancy.invalidate(board, user) } : {}),
+   };
+ }
+diff --git a/server/gateway.js b/server/gateway.js
+index f1ee465..8888791 100644
+--- a/server/gateway.js
++++ b/server/gateway.js
+@@ -80,6 +80,7 @@ export const LIMITS = {
+   recheckRetryMs: 2_000,                    // the first retry's wait; it doubles
+   recheckStopAfterErrors: 3,                // a timed pass meeting this many errors in a row stops (the Registry is down)
+   recheckConcurrency: 8,                    // role lookups in flight per pass (an async Registry: a pass isn't users × round trip)
++  recheckBatch: 1_000,                      // users per auth.rolesFor call, when the Auth port has it (p5-load: O(1) Registry queries per chunk)
+   // § Presence, `here`.
+   hereMax: 50,                              // writers listed
+   hereMs: 1_000,                            // `here` to clients and `.here` publishes: at most this often
+@@ -493,9 +494,14 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger,
+     const key = `${tenant}/${board}`;
+     let w = grantWatches.get(key);
+     if (!w) {
+-      w = { gen: 0, refs: 0, unsub: () => {} };
++      w = { gen: 0, refs: 0, board, unsub: () => {} };
+       const self = w;
+-      w.unsub = bus.subscribe(subjects.grants(tenant, board), () => {
++      w.unsub = bus.subscribe(subjects.grants(tenant, board), m => {
++        // p5-load: drop cached roles FIRST (synchronously), so the hello re-ask and the pass below read fresh.
++        // `{ board, user }` (a share-link use) only adds access for that user: drop their cached role, nothing else
++        // (their open sockets get the higher role on the next timed pass).
++        if (typeof m?.user === "string") { auth.invalidate?.(board, m.user); return; }
++        auth.invalidate?.(board);
+         self.gen++;
+         const b = boards.get(key);
+         if (b) requestRecheck(b, "grants");
+@@ -510,6 +516,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger,
+     const { key, w } = c.watch; c.watch = null;
+     if (--w.refs > 0) return;
+     w.unsub(); if (grantWatches.get(key) === w) grantWatches.delete(key);
++    auth.invalidate?.(w.board);   // no watch, no invalidations: cached roles for this board must not outlive it (p5-load)
+   }
+ 
+   // ---- re-checking live connections' roles (PROTOCOL.md § Auth, Re-checking live connections) ----
+@@ -575,10 +582,24 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger,
+       if (c.checkFails > lim.recheckRetries) { sum.retriesSpent++; return refuse(ws, "unavailable", "could not re-check your access: reconnect", 1013, "role re-check failed"); }
+       sum.kept++;
+     };
++    // p5-load: an Auth port with rolesFor answers a chunk of users from the board's rows read once (fresh, never the
++    // cache). The pass then starts by dropping the board's cached roles, so it ends holding only what it read.
++    const batched = typeof auth.rolesFor === "function";
++    let roles = null, batchErr = null, chunkEnd = 0;
++    if (batched) {
++      auth.invalidate?.(b.board);
++      // A hello still waiting may have read a cached role from before this pass, and this pass won't see it (it is
++      // not live yet): bump its generation so it asks again, now from the Registry.
++      const w = grantWatches.get(b.key); if (w) w.gen++;
++    }
+     const one = async g => {
+       let role, err = null;
+-      rechecks.roleCalls++;
+-      try { role = await auth.role(g.identity, b.board); inRow = 0; } catch (e) { err = e; lastErr = e; inRow++; }
++      if (batched) {
++        if (batchErr) { err = batchErr; lastErr = batchErr; inRow++; } else { role = roles.get(g.user) ?? null; inRow = 0; }
++      } else {
++        rechecks.roleCalls++;
++        try { role = await auth.role(g.identity, b.board); inRow = 0; } catch (e) { err = e; lastErr = e; inRow++; }
++      }
+       for (const ws of g.conns) {
+         const c = ws.data;
+         if (c.state !== "live") continue;
+@@ -594,7 +615,14 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger,
+     while (next < users.length && !stopped) {
+       await breathe();
+       if (boards.get(b.key) !== b) break;
+-      const batch = users.slice(next, next + lim.recheckConcurrency); next += batch.length;
++      if (batched && next >= chunkEnd) {
++        chunkEnd = next + lim.recheckBatch;
++        rechecks.roleCalls++;
++        try { roles = await auth.rolesFor(b.board, users.slice(next, chunkEnd).map(g => g.identity)); batchErr = null; }
++        catch (e) { roles = null; batchErr = e; }
++        if (boards.get(b.key) !== b) break;
++      }
++      const batch = users.slice(next, Math.min(next + lim.recheckConcurrency, batched ? chunkEnd : Infinity)); next += batch.length;   // never past the chunk read
+       await Promise.all(batch.map(one));
+       if (!failClosed && inRow >= lim.recheckStopAfterErrors) stopped = true;
+     }
+diff --git a/server/main.js b/server/main.js
+index dd5bc1b..480d9ea 100644
+--- a/server/main.js
++++ b/server/main.js
+@@ -41,7 +41,7 @@ import { diskBlobs } from "./blobs/disk.js";
+ import { authPort } from "./auth/port.js";
+ import { devAuth } from "./auth/dev.js";
+ import { sqliteRegistry } from "./registry/sqlite.js";
+-import { tenancy as makeTenancy } from "./auth/tenancy.js";
++import { tenancy as makeTenancy, roleCache } from "./auth/tenancy.js";
+ import { sessions as makeSessions } from "./auth/session.js";
+ import { googleOidc } from "./auth/oidc.js";
+ import { httpRoutes } from "./auth/http.js";
+@@ -60,8 +60,16 @@ const keyOk = k => typeof k === "string" && new TextEncoder().encode(k).length >
+  * board on every redemption. The redeemer's other open sockets pick up the higher role on the next timed re-check.
+  */
+ export function announcingRegistry(registry, bus, log) {
+-  const announce = async board => {
+-    try { const b = await registry.board(board); if (b) await bus.publish(subjects.grants(b.tenant, b.id), { board: b.id }); }
++  // board → tenant and link → board never change (the port has no update for either): remembered, bounded, so a
++  // redemption wave costs no extra Registry reads (p5-load).
++  const tenantOf = new Map(), boardOfLink = new Map();
++  const remember = (m, k, v) => { if (m.size >= 10_000) m.delete(m.keys().next().value); m.set(k, v); };
++  const announce = async (board, user) => {
++    try {
++      let tenant = tenantOf.get(board);
++      if (!tenant) { const b = await registry.board(board); if (!b) return; tenant = b.tenant; remember(tenantOf, board, tenant); }
++      await bus.publish(subjects.grants(tenant, board), typeof user === "string" ? { board, user } : { board });
++    }
+     catch (err) { log.warn("grants announcement failed", { board, err }); }
+   };
+   const after = (name, boardOf) => async (...args) => {
+@@ -78,6 +86,14 @@ export function announcingRegistry(registry, bus, log) {
+     revokeInvite: after("revokeInvite", async id => (await registry.invite(id).catch(() => null))?.board),
+     createLink: after("createLink", o => o?.board),
+     revokeLink: after("revokeLink", async id => (await registry.link(id).catch(() => null))?.board),
++    // Scoped to the redeemer: gateways drop that user's cached role only (no re-check pass; it only adds access).
++    async addLinkUse(link, user) {
++      let board = boardOfLink.get(link);
++      if (!board) { board = (await registry.link(link).catch(() => null))?.board; if (typeof board === "string") remember(boardOfLink, link, board); }
++      const out = await registry.addLinkUse(link, user);
++      if (typeof board === "string") await announce(board, String(user));
++      return out;
++    },
+   };
+ }
+ 
+@@ -116,7 +132,8 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch } = {}
+   const dev = devAuth(tokens ? { enabled: true, tokens } : undefined);
+   const sessions = await makeSessions({ key: sessionKey });
+   const tenancy = makeTenancy({ registry });
+-  const auth = authPort({ sessions, dev, tenancy });
++  // Hellos read roles through a per-process cache; the gateway invalidates it on `grants` and its timed pass reads fresh (p5-load).
++  const auth = authPort({ sessions, dev, tenancy: roleCache({ registry, now: Date.now }) });
+   // Google sign-in only when both halves of the OAuth client are there; otherwise /auth answers 503.
+   const oidc = env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET
+     ? googleOidc({ clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET, redirectUri, fetch: fetchFn })
+diff --git a/server/registry/postgres.js b/server/registry/postgres.js
+index 6ba5298..c9053d8 100644
+--- a/server/registry/postgres.js
++++ b/server/registry/postgres.js
+@@ -266,6 +266,17 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
+       if (!key(board) || !key(user)) return [];
+       return (await db.unsafe(`SELECT link FROM ${U} WHERE board = $1 AND member = $2 ORDER BY n`, [board, user])).map(r => r.link);
+     },
++    // The optional batch (registry-port.js): one query, the users bound as one JSON array.
++    async linkUsesFor(board, users) {
++      ready();
++      const out = new Map();
++      const us = (users ?? []).filter(key);
++      if (!key(board) || !us.length) return out;
++      const rows = await db.unsafe(`SELECT member, link FROM ${U} WHERE board = $1
++        AND member IN (SELECT jsonb_array_elements_text($2::text::jsonb)) ORDER BY member, n`, [board, JSON.stringify(us)]);
++      for (const r of rows) { if (!out.has(r.member)) out.set(r.member, []); out.get(r.member).push(r.link); }
++      return out;
++    },
+ 
+     /** What a write transaction runs with, read back from Postgres (for /health and tests). */
+     settings() {
+diff --git a/server/registry/sqlite.js b/server/registry/sqlite.js
+index 4b8f49e..7818ede 100644
+--- a/server/registry/sqlite.js
++++ b/server/registry/sqlite.js
+@@ -129,6 +129,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
+     useN: db.query("SELECT coalesce(max(n), 0) + 1 AS n FROM reg_link_uses WHERE board = ? AND member = ?"),
+     insUse: db.query("INSERT INTO reg_link_uses (board, member, link, n) VALUES (?, ?, ?, ?) ON CONFLICT (board, member, link) DO NOTHING"),
+     uses: db.query("SELECT link FROM reg_link_uses WHERE board = ? AND member = ? ORDER BY n"),
++    usesFor: db.query("SELECT member, link FROM reg_link_uses WHERE board = ? AND member IN (SELECT value FROM json_each(?)) ORDER BY member, n"),
+   };
+ 
+   const ready = () => { if (!open) throw new Error("registry: closed"); };
+@@ -262,6 +263,15 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
+       ready();
+       return str(board) && str(user) ? q.uses.all(board, user).map(r => r.link) : [];
+     },
++    // The optional batch (registry-port.js): one query, the users bound as one JSON array.
++    async linkUsesFor(board, users) {
++      ready();
++      const out = new Map();
++      const us = (users ?? []).filter(str);
++      if (!str(board) || !us.length) return out;
++      for (const r of q.usesFor.all(board, JSON.stringify(us))) { if (!out.has(r.member)) out.set(r.member, []); out.get(r.member).push(r.link); }
++      return out;
++    },
+ 
+     /** What the registry was opened with, read back from SQLite (for /health and tests). */
+     pragmas() {
+diff --git a/test/server/pg-registry.test.js b/test/server/pg-registry.test.js
+index 8c1dfee..1902a50 100644
+--- a/test/server/pg-registry.test.js
++++ b/test/server/pg-registry.test.js
+@@ -29,7 +29,7 @@ describe.skipIf(!url)("postgres registry", () => {
+     const r = await postgresRegistry({ sql: client(), schema, now });
+     schemas.set(r, schema);
+     return r;
+-  }, { cleanup: async r => { await r.close(); await drop(schemas.get(r)); schemas.delete(r); } });
++  }, { cleanup: async r => { await r.close(); await drop(schemas.get(r)); schemas.delete(r); }, batch: true });
+ 
+   // The same contract as a runtime role: USAGE on the schema and row rights on tables an owner created, nothing more
+   // (PROTOCOL.md § Store, "Least privilege"). One role for the file; each test's schema is migrated by the owner
+@@ -55,7 +55,7 @@ describe.skipIf(!url)("postgres registry", () => {
+     const r = await postgresRegistry({ sql: app ?? client(), schema, now });
+     schemas.set(r, schema);
+     return r;
+-  }, { cleanup: async r => { await r.close(); await drop(schemas.get(r)); schemas.delete(r); } });
++  }, { cleanup: async r => { await r.close(); await drop(schemas.get(r)); schemas.delete(r); }, batch: true });
+ 
+   test("a write transaction runs with synchronous_commit=on", async () => {
+     const schema = schemaName();
+diff --git a/test/server/registry.test.js b/test/server/registry.test.js
+index 0c2f848..34860ea 100644
+--- a/test/server/registry.test.js
++++ b/test/server/registry.test.js
+@@ -15,7 +15,7 @@ let n = 0;
+ const file = () => join(dir, `r${++n}.db`);
+ 
+ // Platform's contract, on a fresh file per test (a file, not :memory:, so WAL and fsync are in play).
+-registryContract("sqlite", async ({ now }) => sqliteRegistry({ path: file(), now, fullfsync: false }), { cleanup: r => r.close() });
++registryContract("sqlite", async ({ now }) => sqliteRegistry({ path: file(), now, fullfsync: false }), { cleanup: r => r.close(), batch: true });
+ 
+ describe("sqlite registry", () => {
+   test("pragmas: WAL, synchronous=FULL, fullfsync on by default", async () => {
+diff --git a/test/server/revocation.test.js b/test/server/revocation.test.js
+index 5463ea5..b6256c7 100644
+--- a/test/server/revocation.test.js
++++ b/test/server/revocation.test.js
+@@ -69,7 +69,8 @@ test("H1: grants removed DURING the role lookup (it answered from the old grants
+ 
+ test("M1: a re-check whose role lookup throws fails closed: `unavailable` 1013, and the reconnecting hello is refused", async () => {
+   let boom = false;
+-  const r = await rig({ wrapAuth: a => ({ ...a, role: async (id, b) => { if (boom) throw new Error("registry down"); return a.role(id, b); } }) });
++  const r = await rig({ wrapAuth: a => ({ ...a, role: async (id, b) => { if (boom) throw new Error("registry down"); return a.role(id, b); },
++    rolesFor: async (b, ids) => { if (boom) throw new Error("registry down"); return a.rolesFor(b, ids); } }) });   // the pass's batch (p5-load)
+   const s = await r.sock(); s.send(hello(r, "editor")); await s.next(m => m.t === "welcome");
+   await r.registry.setGrant(r.ids.board, "dev:editor", null);
+   boom = true;
+diff --git a/test/server/rig.js b/test/server/rig.js
+index 275906f..6930c74 100644
+--- a/test/server/rig.js
++++ b/test/server/rig.js
+@@ -8,7 +8,7 @@ import { diskBlobs } from "../../server/blobs/disk.js";
+ import { authPort } from "../../server/auth/port.js";
+ import { devAuth } from "../../server/auth/dev.js";
+ import { memoryRegistry } from "../../server/auth/registry.js";
+-import { tenancy } from "../../server/auth/tenancy.js";
++import { tenancy, roleCache } from "../../server/auth/tenancy.js";
+ import { Replica } from "../../packages/protocol/replica.js";
+ import { jsonCodec } from "../../packages/protocol/codec.js";
+ import { tempDir, sleep, until } from "./helpers.js";
+@@ -19,7 +19,7 @@ export const SECRET = "S3CR3T";
+ export const tokenOf = name => `${SECRET}-${name}-token`;
+ 
+ /**
+- * @param {{ verifyDelayMs?: number, wrapStore?: (s: object) => object, wrapAuth?: (a: object) => object,
++ * @param {{ verifyDelayMs?: number, cache?: object, wrapStore?: (s: object) => object, wrapAuth?: (a: object) => object,
+  *   wrapRegistry?: (r: object) => object, wrapBus?: (b: object) => object, limits?: object, host?: object, dir?: string, registry?: object, ids?: object }} [o]
+  * Pass `dir`, `registry` and `ids` from an earlier rig to restart "the same server" on the same data.
+  */
+@@ -40,12 +40,16 @@ export async function rig(o = {}) {
+   // One dev user per role (named after it), spare editors, and a stranger with a valid token but no role anywhere.
+   const names = [...ROLES, ...Array.from({ length: 8 }, (_, i) => "editor" + i), "stranger"];
+   const dev = devAuth({ enabled: true, tokens: Object.fromEntries(names.map(n => [tokenOf(n), { name: n }])) });
+-  let auth = authPort({ dev, tenancy: tenancy({ registry }) });
++  // `o.cache`: roleCache options → hellos read through the role cache, as server/main.js wires it (p5-load).
++  let auth = authPort({ dev, tenancy: o.cache ? roleCache({ registry, ...o.cache }) : tenancy({ registry }) });
+   const calls = { verify: 0, role: 0, board: 0 };
++  const cacheCalls = { rolesFor: 0, invalidate: 0 };
+   const inner = auth;
+   auth = {
+     async verify(t) { calls.verify++; if (o.verifyDelayMs) await sleep(o.verifyDelayMs); return inner.verify(t); },
+     async role(id, b) { calls.role++; return inner.role(id, b); },
++    ...(inner.rolesFor ? { async rolesFor(b, ids) { cacheCalls.rolesFor++; return inner.rolesFor(b, ids); } } : {}),
++    ...(inner.invalidate ? { invalidate(b, u) { cacheCalls.invalidate++; return inner.invalidate(b, u); } } : {}),
+   };
+   if (o.wrapAuth) auth = o.wrapAuth(auth);
+   let reg = { ...registry, async board(id) { calls.board++; return registry.board(id); } };
+@@ -62,7 +66,7 @@ export async function rig(o = {}) {
+   const server = createServer({ auth, registry: reg, store, bus, blobs: diskBlobs({ dir: join(dir, "blobs") }), log, port: 0, limits: { opRate: 1e6, opBurst: 1e6, ...(o.limits ?? {}), feed }, host: o.host });   // the gateway's op pace is off unless a test sets it
+ 
+   const self = {
+-    dir, lines, log, registry, ids, store, rawStore, bus, server, inbox, calls,
++    dir, lines, log, registry, ids, store, rawStore, bus, server, inbox, calls, cacheCalls,
+     logs: () => lines.map(l => JSON.parse(l)),
+     health: async () => { const res = await fetch(server.url + "/health"); return { status: res.status, body: await res.json() }; },
+     /** The live Room for the test board (null if not open). */
+diff --git a/test/server/role-cache.test.js b/test/server/role-cache.test.js
+new file mode 100644
+index 0000000..5af4e6b
+--- /dev/null
++++ b/test/server/role-cache.test.js
+@@ -0,0 +1,76 @@
++// p5-load: the gateway over the role cache (server/auth/tenancy.js roleCache), as server/main.js wires it:
++// invalidation on `grants` before the hello re-ask and the pass, `{ board, user }` scoped to one user with no pass,
++// cached roles dropped when the board's watch is released, and the timed pass batched through auth.rolesFor.
++import { test, expect, afterAll } from "bun:test";
++import { rig, tokenOf } from "./rig.js";
++import { cleanup, sleep, until } from "./helpers.js";
++import { subjects } from "../../server/bus/port.js";
++import { memoryRegistry } from "../../server/auth/registry.js";
++
++afterAll(cleanup);
++const hello = (r, name, extra = {}) => ({ t: "hello", v: 1, token: tokenOf(name), board: r.ids.board, since: 0, client: name, ...extra });
++const publish = async (r, msg) => { await r.bus.publish(subjects.grants(r.ids.tenant, r.ids.board), { board: r.ids.board, ...msg }); await r.bus.flush?.(); };
++
++/** A memory Registry that counts `grant` reads (a role lookup that reached the Registry). */
++function countingRegistry() {
++  const raw = memoryRegistry(), n = { grant: 0, grants: 0 };
++  return { n, registry: { ...raw, grant: async (b, u) => { n.grant++; return raw.grant(b, u); }, grants: async b => { n.grants++; return raw.grants(b); } } };
++}
++const join = async (r, name, extra) => { const s = await r.sock(); s.send(hello(r, name, extra)); return s; };
++
++test("a second hello of a connected user is answered from the cache; a `{ board }` revoke still closes and refuses", async () => {
++  const { n, registry } = countingRegistry();
++  const r = await rig({ cache: {}, registry });
++  const a = await join(r, "editor"); await a.next(m => m.t === "welcome");
++  const before = n.grant;
++  const b = await join(r, "editor", { client: "tab2" }); await b.next(m => m.t === "welcome");
++  expect(n.grant).toBe(before);                                    // cached
++  await r.registry.setGrant(r.ids.board, "dev:editor", null);
++  await publish(r, {});
++  expect((await a.whenClosed(5000)).code).toBe(1008);
++  expect((await b.whenClosed(5000)).code).toBe(1008);
++  const c = await join(r, "editor", { client: "tab3" });
++  expect((await c.whenClosed(5000)).code).toBe(1008);
++  await r.stop();
++}, 20000);
++
++test("`{ board, user }` (a share-link use) drops that user's cached role and runs no re-check pass", async () => {
++  const r = await rig({ cache: {} });
++  const v = await join(r, "viewer"); await v.next(m => m.t === "welcome");
++  const passes = (await r.health()).body.gateway.rechecks.passes;
++  await r.registry.setGrant(r.ids.board, "dev:viewer", "editor");   // as if a link raised them: no `{ board }` message
++  await publish(r, { user: "dev:viewer" });
++  await sleep(50);
++  expect((await r.health()).body.gateway.rechecks.passes).toBe(passes);
++  expect(v.closed).toBe(null);                                      // their open socket keeps its role until the timed pass
++  const again = await join(r, "viewer", { client: "after-link" });
++  expect(await again.next(m => m.t === "welcome")).toMatchObject({ role: "editor" });
++  await r.stop();
++}, 20000);
++
++test("the board's cached roles go when its last socket closes (no watch, no invalidations): a later revoke is seen", async () => {
++  const r = await rig({ cache: { ttlMs: 3_600_000 } });
++  const a = await join(r, "editor"); await a.next(m => m.t === "welcome");
++  await a.close();
++  await until(async () => (await r.health()).body.gateway.conns === 0, "socket gone");
++  await r.registry.setGrant(r.ids.board, "dev:editor", null);       // no message reaches anyone
++  const b = await join(r, "editor", { client: "later" });
++  expect((await b.whenClosed(5000)).code).toBe(1008);
++  await r.stop();
++}, 20000);
++
++test("the timed pass reads through auth.rolesFor in chunks (no per-user role calls) and closes a lost-message revoke", async () => {
++  const r = await rig({ cache: { ttlMs: 3_600_000 }, limits: { roleRecheckMs: 200, recheckBatch: 2 } });
++  const names = ["editor0", "editor1", "editor2", "editor3", "editor4"];
++  const socks = [];
++  for (const nm of names) { const s = await join(r, nm); await s.next(m => m.t === "welcome"); socks.push(s); }
++  const roleCalls = r.calls.role;
++  await r.registry.setGrant(r.ids.board, "dev:editor3", null);       // the `grants` message was lost
++  expect((await socks[3].whenClosed(5000)).code).toBe(1008);
++  expect(r.calls.role).toBe(roleCalls);                              // the pass made no per-user call
++  expect(r.cacheCalls.rolesFor).toBeGreaterThanOrEqual(3);           // 5 users in chunks of 2
++  const again = await join(r, "editor3", { client: "back" });        // and the cache didn't keep the old role
++  expect((await again.whenClosed(5000)).code).toBe(1008);
++  for (const s of [0, 1, 2, 4]) expect(socks[s].closed).toBe(null);
++  await r.stop();
++}, 20000);
+diff --git a/test/auth/role-cache.test.js b/test/auth/role-cache.test.js
+index f4152c5..78fc3d9 100644
+--- a/test/auth/role-cache.test.js
++++ b/test/auth/role-cache.test.js
+@@ -268,7 +268,7 @@ test("rolesFor: unknown board → every user null; users deduplicated; chunks of
+ 
+ // ---- F4: share-link redemption no longer announces ----
+ 
+-test("announcingRegistry: addLinkUse announces nothing; grants, invites and links still announce { board }", async () => {
++test("announcingRegistry: addLinkUse announces { board, user } only; grants, invites and links still announce { board }", async () => {
+   const bus = memoryBus();
+   const got = [];
+   bus.subscribe(subjects.grants(acme.id, board.id), m => got.push(m));
+@@ -281,7 +281,8 @@ test("announcingRegistry: addLinkUse announces nothing; grants, invites and link
+   await a.addLinkUse(link.id, "google:gus");
+   await tenancy({ registry: a, now }).redeemLink(id("google:hal"), link.id);
+   await bus.flush();
+-  expect(got).toEqual([]);
++  expect(got).toEqual([{ board: board.id, user: "google:gus" }, { board: board.id, user: "google:hal" }]);
++  got.length = 0;
+   expect(await raw.linkUses(board.id, "google:hal")).toEqual([link.id]);
+   await a.setGrant(board.id, "google:gus", "editor");
+   await a.revokeLink(link.id);

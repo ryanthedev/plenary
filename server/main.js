@@ -53,8 +53,11 @@ const KEY_MIN = 32;
 const keyOk = k => typeof k === "string" && new TextEncoder().encode(k).length >= KEY_MIN;
 
 /**
- * The Registry with every change to who may use a board announced on the board's `grants` subject, so gateways
- * re-check their connections' roles (revocation). Reads pass through. A failed lookup only skips the announcement.
+ * The Registry with every change to who may use a board, except a share-link use, announced on the board's `grants`
+ * subject, so gateways re-check their connections' roles (revocation). Reads pass through. A failed lookup only
+ * skips the announcement. A share-link use (addLinkUse) is not announced (p5-load, p-audit F4): it only adds access,
+ * for the redeemer alone, whose next hello reads it fresh; announcing it made every gateway re-check the whole
+ * board on every redemption. The redeemer's other open sockets pick up the higher role on the next timed re-check.
  */
 export function announcingRegistry(registry, bus, log) {
   const announce = async board => {
@@ -75,7 +78,6 @@ export function announcingRegistry(registry, bus, log) {
     revokeInvite: after("revokeInvite", async id => (await registry.invite(id).catch(() => null))?.board),
     createLink: after("createLink", o => o?.board),
     revokeLink: after("revokeLink", async id => (await registry.link(id).catch(() => null))?.board),
-    addLinkUse: after("addLinkUse", async link => (await registry.link(link).catch(() => null))?.board),
   };
 }
 

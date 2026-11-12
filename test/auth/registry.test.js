@@ -3,4 +3,4 @@
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { registryContract } from "./registry-contract.js";
 
-registryContract("memory", async ({ now }) => memoryRegistry({ now }));
+registryContract("memory", async ({ now }) => memoryRegistry({ now }), { batch: true });

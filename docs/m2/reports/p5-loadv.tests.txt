@@ -1,0 +1,396 @@
+# p5-loadv scratch tests (not in the tree). Paths are relative to a scratch copy: HEAD + tree + server/gateway.js = blob f1ee465 + p5-load.patch (p5v-f4 and p5v-redeem: HEAD + this job's tree files only).
+
+=================== wt/test/server/p5v-adv.test.js
+// p5-loadv: adversarial revocation checks over the role cache, on the patched scratch copy only.
+import { test, expect, afterAll } from "bun:test";
+import { rig, tokenOf } from "./rig.js";
+import { cleanup, sleep, until } from "./helpers.js";
+import { subjects } from "../../server/bus/port.js";
+import { memoryRegistry } from "../../server/auth/registry.js";
+import { roleCache } from "../../server/auth/tenancy.js";
+import { announcingRegistry } from "../../server/main.js";
+
+afterAll(cleanup);
+const hello = (r, name, extra = {}) => ({ t: "hello", v: 1, token: tokenOf(name), board: r.ids.board, since: 0, client: name, ...extra });
+const publish = async (r, msg) => { await r.bus.publish(subjects.grants(r.ids.tenant, r.ids.board), { board: r.ids.board, ...msg }); await r.bus.flush?.(); };
+const join = async (r, name, extra) => { const s = await r.sock(); s.send(hello(r, name, extra)); return s; };
+const quiet = { warn() {}, info() {}, error() {}, debug() {} };
+
+/** A memory registry whose named reads can be held at a gate. */
+function gated() {
+  const raw = memoryRegistry();
+  const gates = {};
+  const hold = name => { let open; const p = new Promise(r => { open = r; }); let entered; const inP = new Promise(r => { entered = r; }); gates[name] = { p, open, entered, inP }; return gates[name]; };
+  const wrap = name => async (...a) => { const g = gates[name]; if (g) { delete gates[name]; g.entered(); await g.p; } return raw[name](...a); };
+  const registry = { ...raw };
+  for (const k of ["grant", "grants", "invitesFor", "linkUses", "linkUsesFor", "links", "link"]) registry[k] = wrap(k);
+  return { raw, registry, hold };
+}
+
+test("revoke during an in-flight hello read: the fill is discarded and the hello is refused", async () => {
+  const g = gated();
+  const r = await rig({ cache: {}, registry: g.registry });
+  const h = g.hold("grant");
+  const s = await join(r, "editor");
+  await h.inP;                                                          // hello is reading grant (old: editor)
+  await r.registry.setGrant(r.ids.board, "dev:editor", null);
+  await publish(r, {});
+  h.open();
+  expect((await s.whenClosed(5000)).code).toBe(1008);
+  const s2 = await join(r, "editor", { client: "again" });
+  expect((await s2.whenClosed(5000)).code).toBe(1008);
+  await r.stop();
+}, 20000);
+
+test("revoke during a cached hello (cache hit, then waiting on the room): re-ask reads fresh, refused", async () => {
+  let slowOpen = false;
+  const r = await rig({ cache: {} });
+  const a = await join(r, "editor"); await a.next(m => m.t === "welcome");
+  // second tab: cache hit; revoke lands before it goes live
+  const orig = r.server.rooms.open.bind(r.server.rooms);
+  const b = await join(r, "editor", { client: "tab2" });
+  await r.registry.setGrant(r.ids.board, "dev:editor", null);
+  await publish(r, {});
+  expect((await a.whenClosed(5000)).code).toBe(1008);
+  const cb = await b.whenClosed(5000);
+  expect([1008, 1012]).toContain(cb.code);
+  await r.stop();
+}, 20000);
+
+test("revoke during a rolesFor chunk (timed pass): the stale chunk is not written through; the socket closes; the next hello is refused", async () => {
+  const g = gated();
+  const r = await rig({ cache: { ttlMs: 3_600_000 }, registry: g.registry, limits: { roleRecheckMs: 300 } });
+  const a = await join(r, "editor"); await a.next(m => m.t === "welcome");
+  const h = g.hold("grants");
+  await h.inP;                                                           // the timed pass is inside rolesFor
+  await r.registry.setGrant(r.ids.board, "dev:editor", null);
+  await publish(r, {});
+  h.open();
+  expect((await a.whenClosed(5000)).code).toBe(1008);
+  const b = await join(r, "editor", { client: "b" });
+  expect((await b.whenClosed(5000)).code).toBe(1008);
+  await r.stop();
+}, 20000);
+
+test("two gateways sharing a bus and registry: a { board } revoke closes the user on both and both refuse the next hello", async () => {
+  const r1 = await rig({ cache: { ttlMs: 3_600_000 } });
+  const r2 = await rig({ cache: { ttlMs: 3_600_000 }, registry: r1.registry, ids: r1.ids, wrapBus: () => r1.bus });
+  const reg = announcingRegistry(r1.registry, r1.bus, quiet);
+  const a1 = await join(r1, "editor"); await a1.next(m => m.t === "welcome");
+  const a2 = await join(r2, "editor"); await a2.next(m => m.t === "welcome");
+  const b2 = await join(r2, "editor", { client: "warm" }); await b2.next(m => m.t === "welcome");   // r2 cache warm
+  await reg.setGrant(r1.ids.board, "dev:editor", null);
+  await r1.bus.flush?.();
+  for (const s of [a1, a2, b2]) expect((await s.whenClosed(5000)).code).toBe(1008);
+  for (const r of [r1, r2]) { const s = await join(r, "editor", { client: "x" }); expect((await s.whenClosed(5000)).code).toBe(1008); }
+  await r2.server.stop(); await r2.rawStore.close();
+  await r1.stop();
+}, 30000);
+
+test("lost message on one gateway: a NEW hello there is admitted from the cache until the next timed pass (today: refused at once)", async () => {
+  const r = await rig({ cache: { ttlMs: 3_600_000 }, limits: { roleRecheckMs: 1_500 } });
+  const a = await join(r, "editor"); await a.next(m => m.t === "welcome");
+  await r.registry.setGrant(r.ids.board, "dev:editor", null);            // message lost
+  const t0 = Date.now();
+  const b = await join(r, "editor", { client: "new" });
+  const first = await Promise.race([b.next(m => m.t === "welcome").then(() => "welcome"), b.whenClosed(5000).then(c => "closed " + c.code)]);
+  // record what happens; then the pass must close both
+  expect((await a.whenClosed(5000)).code).toBe(1008);
+  if (first === "welcome") expect((await b.whenClosed(5000)).code).toBe(1008);
+  console.log("LOST-MSG new hello:", first, "closed after", Date.now() - t0, "ms");
+  await r.stop();
+}, 20000);
+
+test("{ board, user } link-use racing a { board } revoke for another user: the revoke still closes", async () => {
+  const r = await rig({ cache: { ttlMs: 3_600_000 } });
+  const e = await join(r, "editor"); await e.next(m => m.t === "welcome");
+  const v = await join(r, "viewer"); await v.next(m => m.t === "welcome");
+  await r.registry.setGrant(r.ids.board, "dev:editor", null);
+  // both land in the same turn, user-scoped first
+  const p1 = r.bus.publish(subjects.grants(r.ids.tenant, r.ids.board), { board: r.ids.board, user: "dev:viewer" });
+  const p2 = r.bus.publish(subjects.grants(r.ids.tenant, r.ids.board), { board: r.ids.board });
+  await Promise.all([p1, p2]); await r.bus.flush?.();
+  expect((await e.whenClosed(5000)).code).toBe(1008);
+  await sleep(100);
+  expect(v.closed).toBe(null);
+  await r.stop();
+}, 20000);
+
+test("{ board, user } arriving during that user's in-flight hello read: the old (lower) role is not cached", async () => {
+  const g = gated();
+  const r = await rig({ cache: { ttlMs: 3_600_000 }, registry: g.registry });
+  const h = g.hold("grant");
+  const s = await join(r, "viewer");
+  await h.inP;
+  await r.registry.setGrant(r.ids.board, "dev:viewer", "editor");
+  await publish(r, { user: "dev:viewer" });
+  h.open();
+  const w = await s.next(m => m.t === "welcome");
+  console.log("in-flight hello went live as", w.role, "(upgrade delay only)");
+  const s2 = await join(r, "viewer", { client: "next" });
+  expect(await s2.next(m => m.t === "welcome")).toMatchObject({ role: "editor" });
+  await r.stop();
+}, 20000);
+
+test("role downgrade editor -> viewer: the socket gets 1012 and the next hello is a viewer, not the cached editor", async () => {
+  const r = await rig({ cache: { ttlMs: 3_600_000 } });
+  const a = await join(r, "editor"); await a.next(m => m.t === "welcome");
+  await r.registry.setGrant(r.ids.board, "dev:editor", "viewer");
+  await publish(r, {});
+  expect((await a.whenClosed(5000)).code).toBe(1012);
+  const b = await join(r, "editor", { client: "b" });
+  expect(await b.next(m => m.t === "welcome")).toMatchObject({ role: "viewer" });
+  await r.stop();
+}, 20000);
+
+test("share-link revoke through announcingRegistry: the link guest is closed and refused (memoized link record dropped)", async () => {
+  const r = await rig({ cache: { ttlMs: 3_600_000 } });
+  const reg = announcingRegistry(r.registry, r.bus, quiet);
+  const link = await reg.createLink({ board: r.ids.board, role: "editor", by: "dev:owner" });
+  await reg.addLinkUse(link.id, "dev:stranger");
+  await r.bus.flush?.();
+  const a = await join(r, "stranger"); expect(await a.next(m => m.t === "welcome")).toMatchObject({ role: "editor" });
+  const b = await join(r, "stranger", { client: "warm" }); await b.next(m => m.t === "welcome");
+  await reg.revokeLink(link.id); await r.bus.flush?.();
+  expect((await a.whenClosed(5000)).code).toBe(1008);
+  expect((await b.whenClosed(5000)).code).toBe(1008);
+  const c = await join(r, "stranger", { client: "c" });
+  expect((await c.whenClosed(5000)).code).toBe(1008);
+  await r.stop();
+}, 20000);
+
+test("unit: email or domain change misses the cache; an invite revoke for the new email is honoured", async () => {
+  const reg = memoryRegistry();
+  const t = await reg.createTenant({ domain: "acme.test" });
+  const b = await reg.createBoard({ tenant: t.id, memberRole: "editor" });
+  const inv = await reg.createInvite({ board: b.id, email: "x@other.test", role: "commenter", by: "o" });
+  const c = roleCache({ registry: reg, ttlMs: 3_600_000 });
+  expect(await c.role({ user: "u", email: null, domain: "acme.test" }, b.id)).toBe("editor");
+  expect(await c.role({ user: "u", email: "x@other.test", domain: null }, b.id)).toBe("commenter");   // domain dropped: miss
+  await reg.revokeInvite(inv.id); c.invalidate(b.id);
+  expect(await c.role({ user: "u", email: "x@other.test", domain: null }, b.id)).toBe(null);
+  expect(await c.role({ user: "u", email: "x@other.test", domain: "acme.test" }, b.id)).toBe("editor");
+});
+
+test("unit: rolesFor dedups by user: two identities of one user (different email) get ONE answer", async () => {
+  const reg = memoryRegistry();
+  const t = await reg.createTenant({ domain: "acme.test" });
+  const b = await reg.createBoard({ tenant: t.id, memberRole: null });
+  await reg.createInvite({ board: b.id, email: "old@x.test", role: "editor", by: "o" });
+  const c = roleCache({ registry: reg });
+  const m = await c.rolesFor(b.id, [{ user: "u", email: "new@x.test" }, { user: "u", email: "old@x.test" }]);
+  console.log("rolesFor two identities of one user:", [...m]);
+  expect(m.size).toBe(1);
+});
+
+test("GAP-M4: a revoke message arriving while a timed pass runs: a NEW hello in that window is refused", async () => {
+  const g = gated();
+  const r = await rig({ cache: { ttlMs: 3_600_000 }, registry: g.registry, limits: { roleRecheckMs: 300 } });
+  const a = await join(r, "editor"); await a.next(m => m.t === "welcome");
+  const h = g.hold("grants");
+  await h.inP;                                                     // a timed pass is inside rolesFor
+  const warm = await join(r, "editor", { client: "warm" }); await warm.next(m => m.t === "welcome");   // refills the cache after the pass began
+  await r.registry.setGrant(r.ids.board, "dev:editor", null);
+  await publish(r, {});                                            // grants pass queued behind it
+  const b = await join(r, "editor", { client: "window" });
+  const got = await Promise.race([b.next(m => m.t === "welcome").then(() => "welcome"), b.whenClosed(3000).then(c => "closed " + c.code)]);
+  h.open();
+  expect(got).toBe("closed 1008");
+  await r.stop();
+}, 20000);
+
+test("GAP-M3: unit: rolesFor in flight across invalidate(board) does not write its stale answer", async () => {
+  const raw = memoryRegistry();
+  const t = await raw.createTenant({ domain: null });
+  const b = await raw.createBoard({ tenant: t.id, memberRole: null });
+  await raw.setGrant(b.id, "u", "editor");
+  let open; const gate = new Promise(r => { open = r; }); let hold = true, grantCalls = 0;
+  const reg = { ...raw, grants: async x => { const v = await raw.grants(x); if (hold) { hold = false; await gate; } return v; }, grant: async (x, u) => { grantCalls++; return raw.grant(x, u); } };
+  const c = roleCache({ registry: reg, ttlMs: 3_600_000 });
+  const p = c.rolesFor(b.id, [{ user: "u" }]);
+  await new Promise(r => setTimeout(r, 5));
+  await raw.setGrant(b.id, "u", null); c.invalidate(b.id);
+  open(); await p;
+  expect(await c.role({ user: "u" }, b.id)).toBe(null);
+  expect(grantCalls).toBe(1);
+});
+
+test("GAP-M6: a cached user who left (others stay), revoke message lost: after one timed pass their new hello is refused", async () => {
+  const r = await rig({ cache: { ttlMs: 3_600_000 }, limits: { roleRecheckMs: 300 } });
+  const keep = await join(r, "viewer"); await keep.next(m => m.t === "welcome");
+  const x = await join(r, "editor"); await x.next(m => m.t === "welcome");
+  await x.close();
+  await until(async () => (await r.health()).body.gateway.conns === 1, "x gone");
+  await r.registry.setGrant(r.ids.board, "dev:editor", null);      // lost
+  const p0 = (await r.health()).body.gateway.rechecks.passes;
+  await until(async () => (await r.health()).body.gateway.rechecks.passes >= p0 + 1, "a pass");
+  const y = await join(r, "editor", { client: "back" });
+  const got = await Promise.race([y.next(m => m.t === "welcome").then(() => "welcome"), y.whenClosed(3000).then(c => "closed " + c.code)]);
+  expect(got).toBe("closed 1008");
+  await r.stop();
+}, 20000);
+
+=================== wt/test/server/p5v-hang.test.js
+import { test, expect, afterAll } from "bun:test";
+import { rig, tokenOf } from "./rig.js";
+import { cleanup, sleep } from "./helpers.js";
+import { subjects } from "../../server/bus/port.js";
+afterAll(cleanup);
+const hello = (r, name, extra = {}) => ({ t: "hello", v: 1, token: tokenOf(name), board: r.ids.board, since: 0, client: name, ...extra });
+test("HANG: a timed pass whose rolesFor never settles; a revoke message: is the revoked editor closed?", async () => {
+  let hang = false;
+  const r = await rig({ cache: {}, limits: { roleRecheckMs: 200 }, wrapAuth: a => ({ ...a, rolesFor: (b, ids) => hang ? new Promise(() => {}) : a.rolesFor(b, ids) }) });
+  const s = await r.sock(); s.send(hello(r, "editor")); await s.next(m => m.t === "welcome");
+  hang = true; await sleep(400);                                   // a timed pass is now stuck
+  hang = false;
+  await r.registry.setGrant(r.ids.board, "dev:editor", null);
+  await r.bus.publish(subjects.grants(r.ids.tenant, r.ids.board), { board: r.ids.board }); await r.bus.flush?.();
+  const got = await Promise.race([s.whenClosed(4000).then(c => "closed " + c.code), sleep(4000).then(() => "still open")]);
+  console.log("HANG result:", got);
+  await r.stop();
+}, 20000);
+
+=================== wt/p5v-counts.js
+// p5-loadv: independent query counts. bun p5v-counts.js [memory|sqlite|postgres]
+import { memoryRegistry } from "./server/auth/registry.js";
+import { sqliteRegistry } from "./server/registry/sqlite.js";
+import { postgresRegistry } from "./server/registry/postgres.js";
+import { tenancy, roleCache } from "./server/auth/tenancy.js";
+import { announcingRegistry } from "./server/main.js";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const kind = process.argv[2] ?? "memory";
+let raw, close = async () => {};
+if (kind === "memory") raw = memoryRegistry();
+else if (kind === "sqlite") { raw = sqliteRegistry({ path: join(mkdtempSync(join(tmpdir(), "p5v-")), "r.db"), fullfsync: false }); close = () => raw.close(); }
+else { const schema = "p5v_" + Math.random().toString(36).slice(2, 8); raw = await postgresRegistry({ url: process.env.DATABASE_URL, schema }); close = () => raw.close(); }
+
+// Counting wrapper: every Registry method call is one query.
+const n = {};
+const total = () => Object.values(n).reduce((a, b) => a + b, 0);
+const reset = () => { for (const k in n) delete n[k]; };
+const counted = (r, withBatch = true) => {
+  const o = {};
+  for (const [k, f] of Object.entries(r)) if (typeof f === "function" && (withBatch || k !== "linkUsesFor")) o[k] = (...a) => { n[k] = (n[k] ?? 0) + 1; return f.apply(r, a); };
+  return o;
+};
+
+// Fixture (the builder's shape): 500 Workspace members (email+domain), 250 invite guests, 250 link guests (email), 50 grants.
+const t = await raw.createTenant({ domain: "acme.test" });
+const b = await raw.createBoard({ tenant: t.id, title: "x", memberRole: "viewer" });
+const link = await raw.createLink({ board: b.id, role: "commenter", by: "o" });
+const ids = [];
+for (let i = 0; i < 500; i++) ids.push({ user: "m" + i, email: `m${i}@acme.test`, domain: "acme.test" });
+for (let i = 0; i < 250; i++) { ids.push({ user: "g" + i, email: `g${i}@guest.test`, domain: null }); await raw.createInvite({ board: b.id, email: `g${i}@guest.test`, role: "annotator", by: "o" }); }
+for (let i = 0; i < 250; i++) { ids.push({ user: "l" + i, email: `l${i}@else.test`, domain: null }); await raw.addLinkUse(link.id, "l" + i); }
+for (let i = 0; i < 50; i++) await raw.setGrant(b.id, ids[i * 20].user, "editor");
+
+const out = [];
+const row = (name, v) => { out.push([name, v]); };
+
+// Before: tenancy.role per user (HEAD's pass), and per hello (+1 gateway board read).
+{ reset(); const ten = tenancy({ registry: counted(raw) }); const truth = new Map();
+  for (const id of ids) truth.set(id.user, await ten.role(id, b.id));
+  row("before: timed pass 1000 users (tenancy.role each)", total());
+  reset(); await ten.role(ids[750], b.id); row("before: hello link guest (role only)", total());
+  reset(); await ten.role(ids[1], b.id); row("before: hello member (role only)", total());
+
+  // After: rolesFor batch, with and without linkUsesFor.
+  for (const withBatch of [true, false]) {
+    reset(); const c = roleCache({ registry: counted(raw, withBatch) });
+    const got = new Map();
+    for (let i = 0; i < ids.length; i += 1000) for (const [u, r] of await c.rolesFor(b.id, ids.slice(i, i + 1000))) got.set(u, r);
+    const agree = [...truth].every(([u, r]) => got.get(u) === r);
+    row(`after: timed pass 1000 users rolesFor, linkUsesFor=${withBatch} (agrees with role: ${agree})`, total());
+  }
+  // Hellos through the cache.
+  reset(); const c = roleCache({ registry: counted(raw) });
+  await c.role(ids[751], b.id); row("after: hello link guest, cold, board's first (role only)", total());
+  reset(); await c.role(ids[752], b.id); row("after: hello link guest, cold, board memoized", total());
+  reset(); await c.role(ids[3], b.id); row("after: hello member, cold, first tenant read", total());
+  reset(); await c.role(ids[5], b.id); row("after: hello member, cold, tenant memoized", total());
+  reset(); await c.role(ids[5], b.id); row("after: hello same user again (warm)", total());
+}
+// Redemption.
+{ const bus = { publish: async () => {}, subscribe: () => () => {} };
+  const link2 = await raw.createLink({ board: b.id, role: "commenter", by: "o" });
+  const quiet = { warn() {}, info() {}, error() {}, debug() {} };
+  reset(); const ann = announcingRegistry(counted(raw), bus, quiet); const ten = tenancy({ registry: ann });
+  await ten.redeemLink({ user: "r1" }, link2.id); row("redemption (patched main.js), first per link", total());
+  reset(); await ten.redeemLink({ user: "r2" }, link2.id); row("redemption (patched main.js), again", total());
+}
+// SQL edge: quotes, unicode, 5000 users in one linkUsesFor.
+if (raw.linkUsesFor) {
+  const odd = ["o'brien", 'dq"x', "ünï-çødé-用户", "a,b", "x\\y", "[]", "null", "  sp  "];
+  for (const u of odd) await raw.addLinkUse(link.id, u);
+  const many = [...odd, ...Array.from({ length: 5000 - odd.length }, (_, i) => "l" + i)];
+  const m = await raw.linkUsesFor(b.id, many);
+  let ok = true;
+  for (const u of many) { const one = await raw.linkUses(b.id, u); const got = m.get(u) ?? []; if (JSON.stringify(one) !== JSON.stringify(got)) { ok = false; console.log("MISMATCH", u, one, got); } }
+  row(`linkUsesFor 5000 users incl quotes/unicode equals linkUses each (${m.size} with uses)`, ok);
+  const none = await raw.linkUsesFor(b.id, []); row("linkUsesFor [] size", none.size);
+}
+console.log("== " + kind);
+for (const [k, v] of out) console.log(String(v).padStart(6), " ", k);
+await close();
+
+=================== wt/p5v-c2.js
+import { memoryRegistry } from "./server/auth/registry.js";
+import { roleCache } from "./server/auth/tenancy.js";
+const raw = memoryRegistry(); const n = {};
+const reg = Object.fromEntries(Object.entries(raw).map(([k, f]) => [k, (...a) => { n[k] = (n[k] ?? 0) + 1; return f(...a); }]));
+const t = await raw.createTenant({ domain: "acme.test" }); const b = await raw.createBoard({ tenant: t.id, memberRole: "viewer" });
+const l = await raw.createLink({ board: b.id, role: "commenter", by: "o" });
+const ids = Array.from({ length: 1000 }, (_, i) => ({ user: "u" + i, email: `u${i}@acme.test`, domain: i < 500 ? "acme.test" : null }));
+for (let i = 500; i < 750; i++) await raw.addLinkUse(l.id, "u" + i);
+const c = roleCache({ registry: reg });
+for (let pass = 1; pass <= 3; pass++) { for (const k in n) delete n[k]; c.invalidate(b.id); await c.rolesFor(b.id, ids); console.log("pass", pass, JSON.stringify(n)); }
+
+=================== wt-job/test/server/p5v-f4.test.js
+import { test, expect, afterAll } from "bun:test";
+import { rig, tokenOf } from "./rig.js";
+import { cleanup, sleep, until } from "./helpers.js";
+import { subjects } from "../../server/bus/port.js";
+import { announcingRegistry } from "../../server/main.js";
+import { tenancy } from "../../server/auth/tenancy.js";
+afterAll(cleanup);
+const quiet = { warn() {}, info() {}, error() {}, debug() {} };
+const hello = (r, name, extra = {}) => ({ t: "hello", v: 1, token: tokenOf(name), board: r.ids.board, since: 0, client: name, ...extra });
+const join = async (r, name, extra) => { const s = await r.sock(); s.send(hello(r, name, extra)); return s; };
+
+test("F4 unpatched: redemption publishes nothing, runs no pass; next hello gets the link role; open socket upgrades at the timed pass", async () => {
+  const r = await rig({ limits: { roleRecheckMs: 800 } });
+  const seen = []; r.bus.subscribe(subjects.grants(r.ids.tenant, r.ids.board), m => seen.push(m));
+  const reg = announcingRegistry(r.registry, r.bus, quiet);
+  const v = await join(r, "viewer"); await v.next(m => m.t === "welcome");
+  const link = await reg.createLink({ board: r.ids.board, role: "editor", by: "dev:owner" }); await r.bus.flush?.();
+  const n0 = seen.length, p0 = r.calls.role;
+  const t = tenancy({ registry: reg });
+  expect(await t.redeemLink({ user: "dev:viewer" }, link.id)).toEqual({ board: r.ids.board });
+  await r.bus.flush?.(); await sleep(50);
+  expect(seen.length).toBe(n0);
+  expect(r.calls.role).toBe(p0);
+  const again = await join(r, "viewer", { client: "after" });
+  expect(await again.next(m => m.t === "welcome")).toMatchObject({ role: "editor" });
+  const t0 = Date.now();
+  const c = await v.whenClosed(5000);
+  console.log("old viewer socket closed", c.code, "after", Date.now() - t0, "ms (timed pass)");
+  expect(c.code).toBe(1012);
+  await r.stop();
+}, 20000);
+
+=================== wt-job/p5v-redeem.js
+import { memoryRegistry } from "./server/auth/registry.js";
+import { tenancy } from "./server/auth/tenancy.js";
+const quiet = { warn() {}, info() {}, error() {}, debug() {} };
+for (const which of ["./server/main-head.js", "./server/main.js"]) {
+  const { announcingRegistry } = await import(which);
+  const raw = memoryRegistry(); const n = {}; const pubs = [];
+  const reg = Object.fromEntries(Object.entries(raw).map(([k, f]) => [k, (...a) => { n[k] = (n[k] ?? 0) + 1; return f(...a); }]));
+  const t = await raw.createTenant({ domain: null }); const b = await raw.createBoard({ tenant: t.id });
+  const l = await raw.createLink({ board: b.id, role: "editor", by: "o" });
+  const ten = tenancy({ registry: announcingRegistry(reg, { publish: async (s, m) => { pubs.push(m); }, subscribe: () => () => {} }, quiet) });
+  for (const u of ["r1", "r2"]) { for (const k in n) delete n[k]; pubs.length = 0; await ten.redeemLink({ user: u }, l.id); const tot = Object.values(n).reduce((a, c) => a + c, 0); console.log(which, u, "queries", tot, JSON.stringify(n), "published", JSON.stringify(pubs)); }
+}

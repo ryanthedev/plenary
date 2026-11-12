@@ -5,7 +5,8 @@
 //   registryContract("sqlite", async ({ now }) => sqliteRegistry({ path: ":memory:", now }));
 //
 // `makeRegistry({ now })` is an async factory returning a FRESH, empty Registry. `now()` is the test clock (ms);
-// the adapter must stamp `createdAt` with it. Optional third argument `{ cleanup(registry) }` runs after each test.
+// the adapter must stamp `createdAt` with it. Optional third argument `{ cleanup(registry), batch }`: cleanup runs
+// after each test; `batch: true` says the adapter implements the optional `linkUsesFor` and runs its tests.
 // The suite uses only the public Registry methods, and refusals are matched by `err.code`, never by class.
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
@@ -237,6 +238,29 @@ export function registryContract(name, makeRegistry, opts = {}) {
       expect(await r.linkUses(c.id, "google:ann")).toEqual([l3.id]);
       expect(await r.linkUses(b.id, "google:bob")).toEqual([]);
       await expect(r.addLinkUse("nope", "google:ann")).rejects.toThrow();
+    });
+
+    if (opts.batch) test("linkUsesFor (optional batch): equals linkUses per user; users with no use are absent", async () => {
+      const { t, b } = await tenantWithBoard();
+      const c = await r.createBoard({ tenant: t.id });
+      const l1 = await r.createLink({ board: b.id, role: "viewer", by: "google:root" });
+      const l2 = await r.createLink({ board: b.id, role: "editor", by: "google:root" });
+      const l3 = await r.createLink({ board: c.id, role: "viewer", by: "google:root" });
+      await r.addLinkUse(l1.id, "google:ann");
+      await r.addLinkUse(l2.id, "google:ann");
+      await r.addLinkUse(l2.id, "google:cy");
+      await r.addLinkUse(l3.id, "google:bob");
+      const users = ["google:ann", "google:bob", "google:cy", "google:nobody"];
+      const m = await r.linkUsesFor(b.id, users);
+      expect(m).toBeInstanceOf(Map);
+      expect([...m.keys()].sort()).toEqual(["google:ann", "google:cy"]);
+      for (const u of users) expect(m.get(u) ?? []).toEqual(await r.linkUses(b.id, u));
+      expect(await r.linkUsesFor(b.id, [])).toEqual(new Map());
+      expect([...(await r.linkUsesFor(c.id, users)).keys()]).toEqual(["google:bob"]);
+      // a full chunk (tenancy.js USE_CHUNK) in one call
+      const many = Array.from({ length: 1000 }, (_, i) => `google:u${i}`);
+      await r.addLinkUse(l1.id, many[999]);
+      expect((await r.linkUsesFor(b.id, many)).get(many[999])).toEqual([l1.id]);
     });
   });
 }

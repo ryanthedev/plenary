@@ -15,6 +15,12 @@
 // Consistency: reads see every write acknowledged before them (read-your-writes and no stale replica reads), so a
 // revoked grant, invite or link stops working on the very next role().
 //
+// Batch (p5-load, OPTIONAL): `linkUsesFor(board, users)` answers `linkUses(board, u)` for every u in `users` in one
+// round trip: a Map with an entry for each requested user that has at least one use on that board (absent = []),
+// each list in the order `linkUses` gives. Callers pass at most 1000 users per call (tenancy.js USE_CHUNK), so a
+// SQL adapter can bind them as one array parameter. An adapter without it is still a Registry: tenancy.js falls
+// back to one `linkUses` per user. test/auth/registry-contract.js checks it when the adapter passes { batch: true }.
+//
 // Every method is async. Ids are server-minted over [a-z0-9-] (no ".", "*", ">"), never a domain name, so they
 // are safe in bus subjects (PROTOCOL.md § Bus). Mint them with `mint` below, so every adapter shares the format.
 
@@ -62,6 +68,7 @@ export const mint = {
  *   revokeLink(id: string): Promise<boolean>,
  *   addLinkUse(link: string, user: string): Promise<void>,
  *   linkUses(board: string, user: string): Promise<string[]>,
+ *   linkUsesFor?(board: string, users: string[]): Promise<Map<string, string[]>>,   // OPTIONAL batch (below)
  * }} Registry
  */
 

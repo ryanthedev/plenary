@@ -4,13 +4,14 @@
 
 - **Me:** manager client, terminal t14k. Report to the proxy **t1bx** ONLY by ending my turn with one short message (outcome
   first, report path; "Urgent:" first if urgent). NEVER prompt/hc send/SendMessage t1bx (CEO rule, 2026-11-12). Workers report to me only. engine manager **t18m**; platform manager **t187**.
-- **In flight (after the 03:44 kill and a second restart; proxy re-prompted t1g6; my watch re-armed, task bb1cht2aw):** p6-hexv (t1g6, working, no report yet) verifying
-  p6-hex (builder t1fy: DONE, NOT resumed; resume only for the fix round with
-  `claude --resume 81338670-c0eb-4e92-9f26-43be782b08a0 --model opus --permission-mode auto` in a NEW terminal, never
-  prompting a plain shell). Known HIGH already decided: main.js = production root (ws.js, HTTP auth, sign-in), new
-  dev-only root web/dev-main.js (engine p-serve's crawl: main.js imports denied dev rooms → page can't boot).
-- **On p6-hexv verdict:** fix round (the HIGH + findings) → re-verify → commit web/ + test/web by path (p6-hex.md §8 adds/
-  modifies/deletes) → send engine (t18m) the commit id for p-serve's re-crawl → close t1fy, t1g6 → start p7-wire.
+- **In flight:** p6-hex FIX ROUND in **t1gk** (resumed builder session 81338670; brief docs/m2/briefs/p6-hex.md
+  "Fix round", 9 items; HIGH = main.js becomes the production root, new web/dev-main.js). Watch task bv2d6o668.
+- **p6-hexv verdict: FAIL** (docs/m2/reports/p6-hexv.md): the known HIGH plus LOWs; 1044 pass / 0 fail; 14/14 mutants caught.
+  Verifier t1g6 idle, kept for the re-verify. Old builder shell t1fy no longer used.
+- **After the fix round:** re-verify (t1g6; also the browser checks it skipped: refused op + resync, drop mid-typing, served
+  page via p-serve) → commit web/ + test/web by path (p6-hex.md §8) → send engine (t18m) the commit id for p-serve's
+  re-crawl → close t1gk, t1g6 → start p7-wire.
+- **M4 load-test plan item (from p6-hexv):** two transports per tab (~200k hellos at 100k joins).
 - **Asked engine (unanswered):** is the ws path same-origin `/ws`, token only in hello (no subprotocol/query)?
 - **Main:** phase 2 merged (dcbdae6); p2-land worktree retired. test/arch-scan.js on main (44dd1aa).
 - **Next, in order:** p6-hex fix round → p7-wire (docs/m2/briefs/p7-wire.md) → an architecture audit of web/.
@@ -21,8 +22,8 @@
 
 | Job | Terminal | Tab | Status |
 |---|---|---|---|
-| p6-hex (builder) | t1fy | done p6-hex (client) · t1fy | DONE (verifying) |
-| p6-hexv (verifier) | t1g6 | verifier p6-hexv (client) · t1g6: web ports and adapters | RUNNING (brief docs/m2/briefs/p6-hexv.md) |
+| p6-hex (fix round) | t1gk | worker p6-hex (client) · t1gk: web ports and adapters (fix round) | RUNNING (brief "Fix round") |
+| p6-hexv (verifier) | t1g6 | verifier p6-hexv (client) · t1g6: web ports and adapters | FAIL reported; idle, kept for re-verify |
 
 ## 2026-11-11 — phase-6 design mock
 
@@ -273,3 +274,4 @@
 - p6-hex done (t1fy): test/web 543/0 (me); full-suite fails 3 in engine's untracked test/server/static.test.js (p-serve). Final paths sent to t18m. Open: main.js imports web/core/dev-users.js (verifier judges a dev-only root). Verifier p6-hexv (t1g6) started.
 - BLOCKER from engine's p-serve: the served page can't boot (main.js imports the denied dev rooms). DECISION: main.js = production root (ws.js, HTTP auth, sign-in; no dev rooms/dev-users/?as=); web/dev-main.js = dev-only root. In p6-hex's fix round after t1g6's verdict; t1g6 records it as a known HIGH. Asked t18m to confirm /ws same-origin and token only in hello. Owe t18m the commit id for a p-serve re-crawl.
 - 03:44: all agents killed; proxy resumed me and t1g6 in place. Watches re-armed; known-HIGH message resent to t1g6. t1fy not resumed (done).
+- p6-hexv FAIL (t1g6): known HIGH (production root) + 7 LOWs + 2 design MEDIUMs (blank page during exchange → fix item 2; two transports per tab → M4 load-test plan). Fix round in t1gk (resumed session 81338670), brief p6-hex.md "Fix round". Watch bv2d6o668.

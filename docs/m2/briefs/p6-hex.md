@@ -115,3 +115,26 @@ which p-serve denies (404 → the module graph fails). **web/main.js is the prod
 **web/dev-main.js** (new, dev-only root) with its own dev page wires the in-browser rooms and DEV_USERS; index.html never
 loads it. Add a test that main.js's import graph contains no dev module (use arch-scan importsOf). Tell your manager when
 done so engine re-runs p-serve's crawl.
+
+## Fix round (manager, 2026-11-12, from docs/m2/reports/p6-hexv.md: FAIL on the known HIGH)
+
+Fix all of these, then update your report (§8 file list, a "Fix round" section, mutation checks) and tell your manager.
+
+1. **HIGH, web/main.js:16–19:** the production-root decision above (main.js = ws.js on same-origin `/ws`, token only
+   in hello, HTTP auth, `#code` sign-in; no dev rooms, no dev-users, no `?as=`; new web/dev-main.js + its own dev page
+   for the in-browser rooms and DEV_USERS; a test using arch-scan `importsOf` that main.js's whole import graph holds no
+   dev module, and that fails under a mutation). The headless checks from "Done when" run on the dev page now; the
+   production page must at least load its module graph with no 404 (a static server that serves only main.js's graph).
+2. **MEDIUM (design), blank page during the exchange (~22 s):** the root mounts a "Signing in…" state before the
+   exchange starts. Root-only.
+3. **LOW test/web/architecture.test.js:75:** `codeOnly` must still scan `${...}` expressions inside template literals.
+4. **LOW :66:** `CORE_GLOBALS` adds `new Date(`, bare `Date(` and `self`. Mutation-check 3 and 4.
+5. **LOW ws.js:59:** the ws.js allowlist entry counts only the runtime codec import, so it goes stale if that import
+   leaves (the JSDoc type import doesn't keep it alive). Mutation-check.
+6. **LOW signin.js:135 (DECISION: fail closed):** if `replaceFragment()` throws, don't exchange the code; return a
+   sign-in error outcome. Test it.
+7. **LOW page-signin.test.js:132:** assert the token never reaches a URL write (replaceFragment, history).
+8. **LOW ports/transport.js:28:** the `congested()` doc says what is true today (for the status pill; p7-wire reads it).
+9. **LOW local.js:31–33:** a doc comment that deadline tests must pass `clock: true`.
+
+Not yours: two transports per tab (the manager puts it on the M4 load-test plan).

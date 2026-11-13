@@ -46,7 +46,11 @@ export const OP_TIMEOUT_MS = 10_000;     // rule 2: an op with no answer this lo
 export const CONNECT_TIMEOUT_MS = 10_000; // rule 12: no welcome, or no catch-up progress, for this long
 export const BACKOFF = { baseMs: 500, maxMs: 30_000 };   // rule 12: min(max, base × 2^k) × a random factor in [0.5, 1)
 export const APPEND_TIMEOUT_MS = 4000;   // § Recovery: two appends (8 s) fit inside the client's 10 s
-export const MAX_WRITER_CONNS = 8;       // § Pacing: writer connections per (user, board) per gateway; a ninth gets "limit"
+export const MAX_WRITER_CONNS = 8;       // § Messages, hello.tab: distinct writer tabs per (user, board) per gateway; a ninth tab gets "limit"
+export const MAX_TAB_CONNS = 2;          // § Messages, hello.tab: writer connections per (user, board, tab) per gateway; a third gets "limit"
+// § Messages, hello.tab: an optional tab id, client-chosen (the web client mints 16 base-36 characters).
+export const TAB_RE = /^[A-Za-z0-9_-]{1,32}$/;
+export const isTab = v => typeof v === "string" && TAB_RE.test(v);
 export const PING_IDLE_MS = 10_000;      // § Pacing: a gateway pings a connection that sent nothing this long
 export const CONN_SILENCE_MS = 30_000;   // § Pacing: and closes one it heard nothing from (no frame, no pong) this long
 export const GATEWAY_SILENCE_MS = 30_000; // rule 6: a gateway not heard from this long has lost its connections

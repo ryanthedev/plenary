@@ -19,15 +19,18 @@
 
 import { Doc } from "../core/doc.js";
 import { emptyScene, clone, randomInt } from "../core/model.js";
-import { ELEMENT_STREAMS, PROTOCOL_VERSION, RULES, OP_RATE, OP_TIMEOUT_MS, CONNECT_TIMEOUT_MS, BACKOFF, mergeAppState, appBaseProblem } from "./envelope.js";
+import { ELEMENT_STREAMS, PROTOCOL_VERSION, RULES, OP_RATE, OP_TIMEOUT_MS, CONNECT_TIMEOUT_MS, BACKOFF, mergeAppState, appBaseProblem, isTab } from "./envelope.js";
 import { Records } from "./records.js";
 import { PREVIEW_TTL_MS } from "./presence.js";
 
 export class Replica {
-  /** @param {{ client: string, now?: () => number, random?: () => number }} o — a name for this client (each
+  /** @param {{ client: string, tab?: string, now?: () => number, random?: () => number }} o — a name for this client (each
    *  Replica adds its own session part, so a reloaded page reusing the name never collides with its old op
-   *  ids), a clock in ms, and a random source in [0, 1) for the backoff's jitter. */
-  constructor({ client, now = Date.now, random = Math.random }) {
+   *  ids), the browser tab it belongs to (sent as hello.tab, § Messages; omitted when not given), a clock in ms,
+   *  and a random source in [0, 1) for the backoff's jitter. */
+  constructor({ client, tab, now = Date.now, random = Math.random }) {
+    if (tab !== undefined && !isTab(tab)) throw new Error("tab must match /^[A-Za-z0-9_-]{1,32}$/");
+    this.tab = tab;
     this.client = `${client}.${Math.floor(Math.random() * 2 ** 31).toString(36)}`; this.counter = 0;
     this.now = now; this.random = random;
     this.fails = 0;             // failed connections in a row (rule 12); back to 0 only after a proven connection
@@ -89,7 +92,9 @@ export class Replica {
     this.proven();
     this.helloAt = this.now(); this.progressAt = null; this.counted = false;
     for (const p of this.pending.values()) { p.wrote = null; p.answered = false; p.resend = p.msg.sentAt !== undefined; }
-    return [{ t: "hello", v: PROTOCOL_VERSION, token, board, since: this.applied, client: this.client }];
+    const hello = { t: "hello", v: PROTOCOL_VERSION, token, board, since: this.applied, client: this.client };
+    if (this.tab !== undefined) hello.tab = this.tab;
+    return [hello];
   }
 
   /**

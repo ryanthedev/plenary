@@ -23,7 +23,7 @@
 // there is no room for is told `unavailable`, a reader that drains nothing for stallMs is cut, whatever it sends.
 
 import { jsonCodec } from "../packages/protocol/codec.js";
-import { ROLES, MAX_CLIENT_CHARS, PROTOCOL_VERSION, RULES_VERSION, opProblem, parseOpId } from "../packages/protocol/envelope.js";
+import { ROLES, MAX_CLIENT_CHARS, PROTOCOL_VERSION, RULES_VERSION, MAX_WRITER_CONNS, MAX_TAB_CONNS, opProblem, parseOpId, isTab } from "../packages/protocol/envelope.js";
 import { presenceProblem, presenceLimiter, presenceCoalescer, EMOTES } from "../packages/protocol/presence.js";
 import { subjects, busBytes, MAX_BUS_BYTES } from "./bus/port.js";
 import { boardFeed } from "./feed.js";
@@ -70,7 +70,8 @@ export const LIMITS = {
   maxOpQueue: 500,                          // ops waiting for a token, per connection…
   maxOpQueueBytes: 8 * 1024 * 1024,         // …or their bytes: past either, `unavailable` and close
   maxLiveQueuedBytes: 8 * 1024 * 1024,      // frames read from a live socket and not yet handled
-  maxWritersPerUserBoard: 8,                // writer connections per (user, board) on this gateway; a ninth gets `limit`
+  maxWritersPerUserBoard: MAX_WRITER_CONNS, // distinct writer TABS per (user, board) on this gateway; a ninth tab gets `limit` (§ Messages, hello.tab)
+  maxConnsPerTab: MAX_TAB_CONNS,            // writer connections per (user, board, tab) on this gateway; a third gets `limit`
   idleTimeoutSec: 30,                       // heard nothing (no frame, no pong) for this long: closed
   presenceMs: 50,                           // coalesced presence goes out this often
   emoteWindowMs: 500,                       // viewers' emotes are summed per window
@@ -134,8 +135,12 @@ const OP_ID = /^\s*\{\s*"t"\s*:\s*"op"\s*,\s*"id"\s*:\s*"([^"\\]{1,256})"/;
 export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed }) {
   const lim = { ...LIMITS, ...limits };
   const maxBusBytes = bus.maxBytes ?? MAX_BUS_BYTES;
-  /** @type {Map<string, number>} "user|board" → open writer connections (§ Pacing) */
+  // § Messages, hello.tab. A connection's tab key is "t:<tab>" for a hello with `tab`, else "c:<conn id>" (a tab of
+  // its own). The prefixes keep the two kinds apart: a client-chosen tab can never equal a connection's own key.
+  /** @type {Map<string, number>} "user|board" → distinct writer tabs open on this gateway */
   const writersBy = new Map();
+  /** @type {Map<string, number>} "user|board|tabKey" → writer connections of that tab on this gateway */
+  const tabConns = new Map();
   /** @type {Map<string, any>} conn id → ws */
   const conns = new Map();
   const counts = { accepted: 0, refusedAuth: 0, badFrames: 0, cut: 0, turnedAway: 0 };
@@ -202,7 +207,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     if (c.q) { queuedTotal -= c.qBytes; c.q.length = 0; c.qBytes = 0; }   // frames still waiting are dropped with the socket, not held
     if (wasLive) {
       owedTotal -= c.owed; bump(owedByUser, c.user, -c.owed); bump(connsByUser, c.user, -1);
-      if (c.wkey) bump(writersBy, c.wkey, -1);
+      if (c.tkey) { bump(tabConns, c.tkey, -1); if (!tabConns.has(c.tkey)) bump(writersBy, c.wkey, -1); }   // the tab's last connection
       hereCount(c, -1);
       socketTotal -= c.buffered; bump(socketByUser, c.user, -c.buffered); c.buffered = 0;
       c.owed = 0; dropQueue(c); waiters.delete(ws); c.opq.length = 0;
@@ -452,7 +457,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     if (!b) {
       b = { key, tenant, board, conns: new Set(), refs: 0, coalescer: presenceCoalescer(), mine: {}, sums: new Map(), unsubs: [], rc: newRecheck(),
         // `here` (§ Presence): this gateway's writer users and viewer connections, the latest `.here` per gateway, what was sent.
-        hw: new Map(), hv: 0, hFrom: new Map(), hChanged: false, hPubAt: 0, hText: null, hCountText: null, hKey: null, hVer: 0, hOut: false, hSentAt: 0, hSending: false };
+        hw: new Map(), hv: 0, hvTabs: new Map(), hFrom: new Map(), hChanged: false, hPubAt: 0, hText: null, hCountText: null, hKey: null, hVer: 0, hOut: false, hSentAt: 0, hSending: false };
       b.feed = feedOf({ tenant, board, store, bus, log, codec, onLive: e => onLive(b, e), ...lim.feed });
       b.unsubs.push(bus.subscribe(subjects.presence(tenant, board), m => {
         if (!m || typeof m.user !== "string" || typeof m.client !== "string") return;
@@ -729,7 +734,8 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     const b = c.b;
     if (!b || c.hereCounted === (by > 0)) return;
     c.hereCounted = by > 0; b.hChanged = true;
-    if (c.role === "viewer") { b.hv += by; return; }
+    // Viewers count by tab (§ Presence, `here`): "user|tabKey" → connections; hv = distinct viewer tabs.
+    if (c.role === "viewer") { bump(b.hvTabs, `${c.user}|${c.tabKey}`, by); b.hv = b.hvTabs.size; return; }
     let w = b.hw.get(c.user);
     if (!w) { if (by < 0) return; w = { name: c.name, roles: [0, 0, 0, 0], conns: 0, active: now() }; b.hw.set(c.user, w); }
     w.roles[RANK[c.role]] += by; w.conns += by;
@@ -877,6 +883,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     if (typeof msg.client !== "string" || !msg.client || msg.client.length > MAX_CLIENT_CHARS || msg.client.includes(":"))
       return badFrame(ws, "hello-client", "hello needs a client id (no colon)");
     if (msg.since !== undefined && (!Number.isSafeInteger(msg.since) || msg.since < 0)) return badFrame(ws, "hello-since", "since must be a non-negative integer");
+    if (msg.tab !== undefined && !isTab(msg.tab)) return badFrame(ws, "hello-tab", "tab must be 1-32 of A-Z a-z 0-9 _ -");
     c.state = "auth";
     const deny = why => { counts.refusedAuth++; log.info("hello refused", { conn: c.id, why }); refuse(ws, "auth", "not allowed", 1008, "auth"); };
     const down = (what, err) => { log.error("hello failed", { conn: c.id, what, err }); refuse(ws, "unavailable", "try again shortly", 1013, "unavailable"); };
@@ -900,11 +907,19 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     if (c.state !== "auth") return;
     if (!ROLES.includes(role)) return deny("role");
     const writer = role !== "viewer", wkey = `${identity.user}|${board.id}`;
+    const tabKey = msg.tab !== undefined ? `t:${msg.tab}` : `c:${c.id}`, tkey = `${wkey}|${tabKey}`;
     // My choice (no spec cap across boards): one account can't hold every socket of the process. Configurable.
     if ((connsByUser.get(identity.user) ?? 0) >= lim.maxConnsPerUser) { log.warn("hello refused: too many connections for one user", { conn: c.id, user: identity.user }); return refuse(ws, "unavailable", "too many connections for this user", 1013, "user connection cap"); }
-    // § Pacing: at most 8 writer connections per (user, board) on this gateway; a ninth gets `limit` (no id), closed.
-    const tooMany = () => writer && (writersBy.get(wkey) ?? 0) >= lim.maxWritersPerUserBoard;
-    if (tooMany()) { log.warn("hello refused: writer connection cap", { conn: c.id, user: identity.user, board: board.id }); return refuse(ws, "limit", `at most ${lim.maxWritersPerUserBoard} open writer connections per user on a board`, 1008, "writer cap"); }
+    // § Messages, hello.tab: at most 8 distinct writer tabs per (user, board) on this gateway, and 2 writer connections
+    // per tab (the tab is client-chosen). Over either: `limit` (no id), closed. A tab already open passes the tab cap.
+    const tooMany = () => {
+      if (!writer) return false;
+      const mine = tabConns.get(tkey) ?? 0;
+      if (mine >= lim.maxConnsPerTab) { log.warn("hello refused: connections per tab", { conn: c.id, user: identity.user, board: board.id }); refuse(ws, "limit", `at most ${lim.maxConnsPerTab} open writer connections per tab on a board`, 1008, "tab cap"); return true; }
+      if (mine === 0 && (writersBy.get(wkey) ?? 0) >= lim.maxWritersPerUserBoard) { log.warn("hello refused: writer connection cap", { conn: c.id, user: identity.user, board: board.id }); refuse(ws, "limit", `at most ${lim.maxWritersPerUserBoard} open writer connections per user on a board`, 1008, "writer cap"); return true; }
+      return false;
+    };
+    if (tooMany()) return;
     // Subscribe to the board before anything is forwarded or served (§ Bus), then make sure its room runs (writers only:
     // rule 8, viewers never reach the room).
     try { await joinBoard(ws, board.tenant, board.id); } catch (err) { return down("feed", err); }
@@ -924,16 +939,16 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     if (c.b?.feed.gapAt) { log.error("hello refused: the board's log has a gap", { conn: c.id, board: board.id, at: c.b.feed.gapAt }); return refuse(ws, "unavailable", "this board can't be served right now", 1013, "log gap"); }
     // The caps again, in the same step that counts this connection: hellos that waited together all passed the first check.
     if ((connsByUser.get(identity.user) ?? 0) >= lim.maxConnsPerUser) { log.warn("hello refused: too many connections for one user", { conn: c.id, user: identity.user }); return refuse(ws, "unavailable", "too many connections for this user", 1013, "user connection cap"); }
-    if (tooMany()) { log.warn("hello refused: writer connection cap", { conn: c.id, user: identity.user, board: board.id }); return refuse(ws, "limit", `at most ${lim.maxWritersPerUserBoard} open writer connections per user on a board`, 1008, "writer cap"); }
+    if (tooMany()) return;
 
     Object.assign(c, { state: "live", tenant: board.tenant, board: board.id, user: identity.user, identity, name: typeof identity.name === "string" ? identity.name.slice(0, 200) : null, role, client: msg.client,
-      since: msg.since ?? 0, welcomed: false, next: undefined, wkey: writer ? wkey : null,
+      since: msg.since ?? 0, welcomed: false, next: undefined, wkey: writer ? wkey : null, tkey: writer ? tkey : null, tabKey,
       out: [], outBytes: 0, buffered: 0, owed: 0, blocked: false, flushing: false, waitSince: 0, progressAt: now(), winStart: now(), winDrained: 0,
       opq: [], opqBytes: 0, tokens: lim.opBurst, tokenAt: now(), opTimer: null, limiter: presenceLimiter(now) });
     c.b.conns.add(ws);
     hereCount(c, +1);
     bump(connsByUser, c.user, 1);
-    if (writer) bump(writersBy, wkey, 1);
+    if (writer) { if (!tabConns.has(tkey)) bump(writersBy, wkey, 1); bump(tabConns, tkey, 1); }   // a tab's first connection opens the tab
     counts.accepted++;
     if (Number.isFinite(identity.exp)) {
       // setTimeout can't wait past 2^31-1 ms (24.8 days): a later expiry re-arms when that fires.

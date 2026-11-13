@@ -464,3 +464,20 @@ test("re-stamping leaves ops already sent byte for byte, and counts them: unsent
   expect(other.r.streams.board.get("s").x).toBe(3);
   expect(a.r.roomVersion("board", "s")).toBe(8);
 });
+
+test("hello.tab: `new Replica({ tab })` puts it in every hello; without `tab` the hello has no tab key; a bad tab throws", () => {
+  const withTab = new Replica({ client: "w", tab: "0123456789abcdef" });
+  const [h1] = withTab.connectMessages("tok", "b1");
+  expect(h1).toEqual({ t: "hello", v: 1, token: "tok", board: "b1", since: 0, client: withTab.client, tab: "0123456789abcdef" });
+  withTab.connectionFailed();
+  expect(withTab.connectMessages("tok", "b1")[0].tab).toBe("0123456789abcdef");   // the same tab on every reconnect
+  const plain = new Replica({ client: "p" });
+  const [h2] = plain.connectMessages("tok", "b1");
+  expect(Object.hasOwn(h2, "tab")).toBe(false);                               // absent, not `tab: undefined`
+  expect(JSON.parse(JSON.stringify(h2))).toEqual(h2);
+  for (const tab of ["", "x".repeat(33), "a:b", 7, null]) expect(() => new Replica({ client: "x", tab })).toThrow();
+  // The room ignores the field (only the gateway counts tabs): a hello with `tab` is welcomed as usual.
+  const d = direct(), got = [], c = d.room.connect(m => got.push(wire(m)));
+  d.room.receive(c, wire(h1), { n: 1, user: "u", role: "editor" });
+  expect(got[0]).toMatchObject({ t: "welcome", user: "u" });
+});

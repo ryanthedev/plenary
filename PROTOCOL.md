@@ -23,7 +23,7 @@ this spec changes the constants and checks named below.
 | Op size | ≤ 1,000,000 JSON **chars** | ≤ 1,000,000 **bytes** of UTF-8 JSON, so an op always fits the 2 MB bus; a gateway that can't forward an op answers `too-large` with its `id` (§ Limits) |
 | Nesting depth | "any frame or op" > 64 | a frame ≤ 64 levels (gateway), an op ≤ 62 (`opProblem`), so an op fits both a frame and a bus message (§ Limits) |
 | Frame refusals | could come with no `id` | an op frame starts `{"t":"op","id":…`, and the gateway names that `id` in a frame-level refusal (§ Limits) |
-| Gateway rate | one bucket per (user, board) | one bucket per connection, the same as the client's pacer; ≤ 8 writer connections per (user, board) per gateway (§ Pacing) |
+| Gateway rate | one bucket per (user, board) | one bucket per connection, the same as the client's pacer; ≤ 8 writer tabs and ≤ 2 writer connections per tab per (user, board) per gateway (§ Messages, `hello.tab`) |
 | Append timeout | 5 s | **4 s**, so two appends (an op queued behind the one in flight) finish inside the client's 10 s (§ Recovery) |
 | Bus | "nothing bigger than one op" | catch-up and snapshots never travel on the bus; `.entries` batches are split under 2 MB (§ Bus) |
 | Postgres | (unstated) | a server starts as a role that doesn't own the schema; DDL is a separate migrate step (§ Store) |
@@ -188,7 +188,7 @@ Durable writes are bounded so one writer can't flood the sequencer or bloat ever
 |---|---|
 | one op | ≤ 1,000,000 **bytes** of its UTF-8 JSON (`too-large`). Bytes, not chars: 1M CJK chars are 3 MB, which no 2 MB bus carries. Counted without `TextEncoder` (the pure package can't use it) |
 | nesting depth | the outermost object or array is level 1 (the op object itself, for an op). A **client → server frame** deeper than **64** is refused `bad-op` by the gateway, on the raw text before decoding. An **op** deeper than **62** is refused `bad-op` by `opProblem` (so replay and other transports are covered). So an accepted op fits in its frame (op + 1) and in the gateway's bus message (op + 2). Server → client frames aren't capped (an `entries` frame holds an op at op + 3) |
-| writer connections per (user, board) | ≤ 8 per gateway; a ninth writer `hello` gets `limit` (no `id`) and is closed (§ Pacing) |
+| writer tabs per (user, board) | ≤ 8 per gateway, ≤ 2 connections per tab; a ninth tab or a third connection of one tab gets `limit` (no `id`) and is closed (§ Messages, `hello.tab`) |
 | durable ops per connection | 20/s sustained, bursts of 100 (§ Pacing; never answered with `limit`) |
 | `board` stream | ≤ 100,000 element ids, ≤ 50 MB of JSON (tombstones count) |
 | `notes` stream | ≤ 200,000 element ids, ≤ 50 MB of JSON (tombstones count) |
@@ -218,10 +218,11 @@ that changed since.
 - **The gateway runs the same bucket per connection** (20/s, burst 100), so an honest client's ops never wait
   there beyond network jitter, however many tabs its user has open. An over-rate op is **queued** in arrival
   order, never refused and never reordered (rule 6).
-- **Connections per user:** a gateway holds at most **8** writer connections per (user, board). A ninth writer
-  `hello` gets `error` `limit` with no `id` and is closed. The client keeps its pending ops, tells the UI ("too
-  many open tabs on this board"), and retries with backoff (rule 12; it counts as a failed attempt). So one user
-  writes at most 8 × 20 ops/s through one gateway. A connection counts until the gateway sees it close.
+- **Connections per user:** a gateway holds at most **8** writer tabs per (user, board), and at most **2** writer
+  connections per tab (§ Messages, `hello.tab`). A writer `hello` for a ninth tab, or a third connection of one
+  tab, gets `error` `limit` with no `id` and is closed. The client keeps its pending ops, tells the UI ("too many
+  open tabs on this board"), and retries with backoff (rule 12; it counts as a failed attempt). So one user writes
+  at most 16 × 20 ops/s through one gateway. A connection counts until the gateway sees it close.
 - **Dead connections stop counting within 30 s.** The gateway sends a WebSocket ping on every connection that has
   sent nothing for **10 s**, and closes any connection it has heard nothing from (no frame, no pong) for **30 s**.
   So a half-open socket left by a flapping network frees its slot within 30 s, and a client refused `limit` for
@@ -243,7 +244,7 @@ Client → server
 
 | `t` | Fields | |
 |---|---|---|
-| `hello` | `v: 1`, `token`, `board`, `since`, `client` | first message; the token travels here, never in a header (Herdr refuses credential headers). `client` = name + per-session part, no colon, ≤ 128 chars. Unknown `v` → `version`, closed |
+| `hello` | `v: 1`, `token`, `board`, `since`, `client`, `tab?` | first message; the token travels here, never in a header (Herdr refuses credential headers). `client` = name + per-session part, no colon, ≤ 128 chars. `tab` = the browser tab this connection belongs to (§ Messages, `hello.tab`). Unknown `v` → `version`, closed |
 | `op` | `id` (`client:counter`), `sentAt`, `stream`, `op` | durable change; `counter` is a positive safe integer, larger than every earlier counter of this client; `sentAt` = the `seq` the client had applied when it first sent this op. Encoded with `t` then `id` first (§ Limits) |
 | `presence` | `k`, kind fields (§ Presence) | never logged, may drop |
 | `blob` | `sha1` (40 lowercase hex), `put?` | asks for a signed blob URL (§ Blobs) |
@@ -274,10 +275,46 @@ Error codes, and what the client does:
 | `version` | unknown protocol `v` | stop; the app must update |
 
 An `error` with no `id` is not about an op (a `blob` request: `bad-op`, `forbidden`, `limit`; a ninth writer
-connection: `limit`, then closed; an op frame with no readable id: `bad-op`; or a connection-wide `unavailable`,
+tab or a third connection of one tab: `limit`, then closed; an op frame with no readable id: `bad-op`; or a connection-wide `unavailable`,
 `auth`, `version`): nothing pending is dropped for it. Each ends: a `blob` refusal ends with that request (ask
 again later); a connection-level one ends the connection, and the client reconnects with backoff (or signs in
 again, or stops, per the table).
+
+### `hello.tab`
+
+A client may name the browser tab a connection belongs to, so the gateway counts tabs, not connections. A tab
+outlives its connections: a reconnect, or a resync (always a new connection, rule 5), opens a new one while the old
+one may still be closing.
+
+- **Format.** `tab` is optional; when present it is a string matching `/^[A-Za-z0-9_-]{1,32}$/` (`TAB_RE` in
+  envelope.js). Anything else (empty, too long, another character, not a string) is a bad hello: `error` `bad-op`,
+  closed, as for a bad `client`. The web client mints 16 base-36 characters per tab and reuses them for the tab's
+  life. The gateway never forwards `tab` to the room: it is a gateway-only count.
+- **No `tab` = its own tab.** A hello without `tab` (Herdr, drawh, older clients) counts as a tab of its own, one
+  per connection, which is how every connection counted before.
+- **What a tab is.** The pair (user, tab) on one board, on one gateway. Two users can't share a tab: the same `tab`
+  string from two users is two tabs.
+- **Writer cap: tabs.** A gateway admits at most **8 distinct writer tabs per (user, board)**. A writer hello that
+  would open a ninth tab gets `error` `limit` with no `id` and is closed (the client's handling is in § Pacing). A
+  further connection of one of the 8 tabs is not a ninth tab and passes this cap. This replaces the count of 8
+  writer **connections** in § Limits and § Pacing.
+- **Writer cap: connections per tab.** At most **2** writer connections per (user, board, tab) on a gateway; a
+  third gets the same `limit`, no `id`, and is closed. **Why both caps:** `tab` is chosen by the client, so with
+  the tab cap alone one tab could hold any number of connections and each would get its own op bucket (§ Pacing),
+  undoing the per-user bound. Two connections cover the honest overlap (the new connection opens before the
+  gateway has seen the old one close). Together: one user holds at most 8 × 2 = 16 writer connections per board
+  per gateway, so writes at most 16 × 20 ops/s through one gateway.
+- **Viewers** are not capped per tab (they write nothing and their connections reach no room); they are counted by
+  tab in `here` (§ Presence).
+- **When a tab stops counting.** When its last connection on that gateway closes (§ Pacing says when the gateway
+  sees a dead one close: within 30 s). Counts are kept per gateway; nothing about tabs travels on the bus beyond
+  the `viewers` number.
+- **Guaranteed:** an honest client (one tab id per tab, at most one reconnect in flight) with ≤ 8 tabs on a board
+  is never refused for tabs or connections per tab, beyond § Pacing's 30 s for a dead socket. A reconnect of an
+  existing tab is never refused for the 8-tab cap. **May happen:** a tab that reconnects twice while its first
+  socket is still half-open (not yet closed by § Pacing's 30 s rule) is refused `limit` on its third connection and
+  gets in on a later retry; the same tab connected through two gateways during a reconnect counts as two tabs, one
+  on each.
 
 ## Rules
 
@@ -531,8 +568,13 @@ may drop at any hop. It doesn't touch the room: gateways relay it over the bus (
   clients on change, at most 1/s. `writers` lists at most 50 (owners and editors first, then the most recently
   active); `writerCount` is the full number. Best effort, like all presence: counts may lag or be briefly wrong.
   - **What is counted.** A writer is a user with an owner, editor, annotator or commenter connection; `writerCount`
-    counts users (a user's tabs count once). `viewers` counts viewer **connections** (two tabs count twice): a
-    gateway can't de-duplicate 100k viewers across gateways without lists, and the bus message must stay small.
+    counts users (a user's tabs count once). `viewers` counts viewer **tabs**: distinct (user, tab) pairs with a
+    viewer connection on the board, per gateway (§ Messages, `hello.tab`), summed over gateways. Two connections of
+    one tab (a reconnect overlapping its old connection) count once; two tabs count twice; a hello without `tab`
+    counts as its own tab, so such connections count one each. Each gateway de-duplicates only its own: a gateway
+    can't de-duplicate 100k viewers across gateways without lists, and the bus message must stay small. **May
+    happen:** the same tab on two gateways during a reconnect counts twice, until the old gateway sees its
+    connection close.
   - **Merging.** Each gateway keeps the latest `.here` message per gateway id (its own included) for 15 s. Users in
     the merged lists appear once (their highest role and latest `active`); `writerCount` = those listed users plus,
     for each gateway, its writers it couldn't list (its `writerCount` minus its list). Exact while every gateway's
@@ -742,7 +784,7 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
 - **`.here` messages** (gateway → gateways, never saved): `{ gateway, writers: [{ user, name, role, active }]
   (≤ 50), writerCount, viewers }` = that gateway's own writer users on the board (the 50 it would show first, with
   `active` = the time of their last op or presence, ms), its number of writer users, and its number of viewer
-  connections. Small by construction (≤ 50 entries) whatever the board's size.
+  tabs (§ Presence, `here`). Small by construction (≤ 50 entries) whatever the board's size.
 - **At-most-once.** Entries carry `seq`, so a gateway that sees a gap reads the missing range from the Store and
   delivers in order; duplicates are dropped by `seq`. Presence has no repair.
 - **A lost last entry is repaired two ways.** While it runs, the room publishes a `{ seq, epoch }` **heartbeat**

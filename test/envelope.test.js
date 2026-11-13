@@ -1,7 +1,7 @@
 // The checks every op passes before a room looks at the board (PROTOCOL.md § Limits, § The element op).
 import { test, expect } from "bun:test";
 import { direct } from "./world.js";
-import { opProblem, parseOpId, isSha1, canWrite, recordProblem, deeperThan, STREAMS, ELEMENT_STREAMS, PROTOCOL_VERSION, RULES_VERSION, MAX_OP_DEPTH, OP_RATE, CAPS } from "../packages/protocol/envelope.js";
+import { opProblem, parseOpId, isSha1, canWrite, recordProblem, deeperThan, STREAMS, ELEMENT_STREAMS, PROTOCOL_VERSION, RULES_VERSION, MAX_OP_DEPTH, OP_RATE, CAPS, isTab, TAB_RE, MAX_WRITER_CONNS, MAX_TAB_CONNS } from "../packages/protocol/envelope.js";
 import { makeElement } from "../packages/core/model.js";
 
 const rect = (id, extra = {}) => makeElement("rectangle", { id, ...extra });
@@ -89,4 +89,11 @@ test("record actions are checked for shape", () => {
     { do: "reply", id: "r", text: "a" }, { do: "react", id: "t", emoji: "👍" }, { do: "react", id: "t", emoji: "x".repeat(33), on: true }, { do: "move", id: "t" }, null])
     expect([bad, recordProblem(bad)?.code]).toEqual([bad, "bad-op"]);
   expect(recordProblem({ do: "edit", id: "c", text: "x".repeat(10_001) }).code).toBe("limit");
+});
+
+test("hello.tab format (§ Messages, hello.tab): 1-32 of [A-Za-z0-9_-]; caps 8 tabs, 2 connections per tab", () => {
+  for (const ok of ["a", "Z", "0123456789abcdef", "a_b-C", "x".repeat(32)]) expect(isTab(ok)).toBe(true);
+  for (const bad of ["", "x".repeat(33), "a b", "a:b", "a.b", "a|b", "é", 1, null, undefined, ["a"], {}]) expect(isTab(bad)).toBe(false);
+  expect(TAB_RE.source).toBe("^[A-Za-z0-9_-]{1,32}$");
+  expect([MAX_WRITER_CONNS, MAX_TAB_CONNS]).toEqual([8, 2]);
 });

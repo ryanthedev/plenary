@@ -79,7 +79,44 @@ export function decodeMessage(payload, byteFields) {
 }
 
 /**
+ * NATS_URL → the client's connect options (p4-wire2 M1). The NATS client drops a URL's userinfo, so it is cut out
+ * here: `user:pass@` becomes `{ user, pass }`, a bare `token@` becomes `{ token }` (percent-decoded), and the server
+ * goes on without it. `url` is one URL, a comma-separated list or an array; each element may omit the scheme
+ * (`host:4222`). The rest of each element (scheme, host, port, path) is kept verbatim. The client takes one set of
+ * credentials for every server, so servers that carry different ones are refused ("bad-config"). No error here ever
+ * contains a value from the URL.
+ * @returns {{ servers: string[], user?: string, pass?: string, token?: string }}
+ */
+export function natsConnectOptions(url) {
+  const list = (Array.isArray(url) ? url : [url]).flatMap(u => String(u ?? "").split(",")).map(s => s.trim()).filter(Boolean);
+  if (!list.length) throw new TypeError("natsBus needs a url");
+  const decode = x => { try { return decodeURIComponent(x); } catch { return x; } };
+  const servers = [];
+  let auth = null, authKey = null;
+  for (const s of list) {
+    const scheme = /^[a-z][a-z0-9+.-]*:\/\//i.exec(s)?.[0] ?? "";
+    const rest = s.slice(scheme.length);
+    const end = rest.search(/[/?#]/);
+    const authority = end < 0 ? rest : rest.slice(0, end), tail = end < 0 ? "" : rest.slice(end);
+    const at = authority.lastIndexOf("@");
+    const host = at < 0 ? authority : authority.slice(at + 1);
+    if (!host) throw new PortError("bad-config", "a NATS server URL has no host");
+    servers.push(scheme + host + tail);
+    const info = at < 0 ? "" : authority.slice(0, at);
+    if (!info) continue;
+    const colon = info.indexOf(":");
+    const a = colon < 0 ? { token: decode(info) } : { user: decode(info.slice(0, colon)), pass: decode(info.slice(colon + 1)) };
+    if (colon >= 0 && !a.user) throw new PortError("bad-config", "a NATS server URL has a password but no user");
+    const key = JSON.stringify(a);
+    if (auth && key !== authKey) throw new PortError("bad-config", "the NATS server URLs carry different credentials; the NATS client takes one set for every server");
+    auth = a; authKey = key;
+  }
+  return { servers, ...(auth ?? {}) };
+}
+
+/**
  * Connects to NATS and returns a Bus. Rejects if the server can't carry 2 MB messages (max_payload).
+ * Credentials in `url` (user:pass@ or token@) go to the client as options (natsConnectOptions).
  *
  * Outages: the client reconnects forever. While it is disconnected (from the `disconnect` status event until
  * `reconnect`), publish is refused with PortError("unavailable"), so nothing piles up in memory; at-most-once
@@ -106,17 +143,19 @@ export function decodeMessage(payload, byteFields) {
  * that, the bus still goes down and refuses, but drops nothing queued until the client's own stale handling ends.
  * @param {{ url: string | string[], name?: string, onError?: (err: unknown, subject: string) => void,
  *           connectTimeoutMs?: number, reconnectWaitMs?: number, pingIntervalMs?: number, maxPingOut?: number,
- *           maxPendingBytes?: number, ackEveryMs?: number }} o — `url` from the caller (NATS_URL in deploy);
- *           nothing is read from env here.
+ *           maxPendingBytes?: number, ackEveryMs?: number, connect?: Function }} o — `url` from the caller (NATS_URL
+ *           in deploy); nothing is read from env here. connect: the client's connect (tests pass a fake).
  */
 export async function natsBus({ url, name = "plenary", onError = () => {}, connectTimeoutMs = 5000, reconnectWaitMs = 2000,
-  pingIntervalMs = 5000, maxPingOut = 2, maxPendingBytes = 32 * 1024 * 1024, ackEveryMs = 250 } = {}) {
+  pingIntervalMs = 5000, maxPingOut = 2, maxPendingBytes = 32 * 1024 * 1024, ackEveryMs = 250, connect: connectFn } = {}) {
   if (!url || (typeof url !== "string" && !Array.isArray(url))) throw new TypeError("natsBus needs a url");
-  const { connect, headers: makeHeaders } = await import("@nats-io/transport-node");
+  const target = natsConnectOptions(url);
+  const lib = await import("@nats-io/transport-node");
+  const connect = connectFn ?? lib.connect, makeHeaders = lib.headers;
   for (const [k, v] of Object.entries({ pingIntervalMs, maxPingOut, maxPendingBytes, ackEveryMs }))
     if (!Number.isFinite(v) || v <= 0) throw new TypeError(`natsBus ${k} must be a positive number`);
   if (maxPendingBytes < MAX_BUS_BYTES) throw new TypeError(`natsBus maxPendingBytes must be at least ${MAX_BUS_BYTES}`);
-  const nc = await connect({ servers: url, name, timeout: connectTimeoutMs, maxReconnectAttempts: -1, reconnectTimeWait: reconnectWaitMs,
+  const nc = await connect({ ...target, name, timeout: connectTimeoutMs, maxReconnectAttempts: -1, reconnectTimeWait: reconnectWaitMs,
     pingInterval: pingIntervalMs, maxPingOut });
   const serverMax = nc.info?.max_payload ?? 0;
   if (serverMax < MAX_BUS_BYTES) {

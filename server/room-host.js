@@ -626,14 +626,19 @@ export function serveOpens({ bus, rooms, log = quietLogger }) {
  * on `subjects.open`. A "held" reply resolves it at once (that host's room already listens on the inbox). A
  * "watching" reply starts a grace of min(1000, timeoutMs / 4) ms: a "held" reply within it still resolves at once,
  * and at its end the open resolves "watching" (some host watches the board, so the hello's inbox path still works).
+ * The ttl timer stops when the grace starts (p4-wire2 L4): a `watching` answer late in the ttl still resolves at the
+ * grace's end, so the slowest open takes timeoutMs + grace.
  * Why wait: on a cold board the watcher usually answers before the winner has built its room, and a hello sent then
  * is answered 1013 (or lost) instead of welcomed (p4-wire round 2). No reply at all rejects after `timeoutMs` (the
  * gateway then answers the hello `unavailable`). Never cached: every writer hello asks again, because a replaced
  * host has no room until someone asks. At most one request in flight per board; other opens share it.
- * @param {{ bus: object, node: string, timeoutMs: number, log?: object }} o node: this node's id (the requester id is
- *   `r-<node>-<random>`, unique per instance).
+ * @param {{ bus: object, node: string, timeoutMs: number, log?: object,
+ *   timers?: { setTimeout: Function, clearTimeout: Function } }} o node: this node's id (the requester id is
+ *   `r-<node>-<random>`, unique per instance). timers: the ttl and grace clock (tests pass a fake).
  */
-export function remoteRooms({ bus, node, timeoutMs, log = quietLogger }) {
+export function remoteRooms({ bus, node, timeoutMs, log = quietLogger, timers = globalThis }) {
+  const later = (fn, ms) => { const t = timers.setTimeout(fn, ms); t?.unref?.(); return t; };
+  const cancel = t => { if (t !== undefined && t !== null) timers.clearTimeout(t); };
   checkLeaseTtl(timeoutMs);
   const rand = Array.from(crypto.getRandomValues(new Uint8Array(4)), b => b.toString(16).padStart(2, "0")).join("");
   const me = `r-${String(node ?? "").toLowerCase().replace(/[^a-z0-9-]+/g, "-").slice(0, 32)}-${rand}`.replace(/-{2,}/g, "-");
@@ -646,7 +651,7 @@ export function remoteRooms({ bus, node, timeoutMs, log = quietLogger }) {
   const settle = (key, err, state) => {
     const r = inflight.get(key);
     if (!r) return;
-    inflight.delete(key); byN.delete(r.n); clearTimeout(r.timer); clearTimeout(r.grace);
+    inflight.delete(key); byN.delete(r.n); cancel(r.timer); cancel(r.grace);
     if (err) r.reject(err); else r.resolve(state);
   };
   const unsub = bus.subscribe(subjects.opened(me), m => {
@@ -656,8 +661,9 @@ export function remoteRooms({ bus, node, timeoutMs, log = quietLogger }) {
     if (r?.board !== m.board) return;
     if (m.state === "held") return settle(key, null, "held");
     if (r.grace) return;   // already waiting out the grace from an earlier "watching"
-    r.grace = setTimeout(() => settle(key, null, "watching"), graceMs);
-    r.grace.unref?.();
+    // A host answered: the ttl no longer applies (L4); the grace's end resolves it unless a "held" comes first.
+    cancel(r.timer); r.timer = null;
+    r.grace = later(() => settle(key, null, "watching"), graceMs);
   });
   return {
     requester: me,
@@ -671,11 +677,12 @@ export function remoteRooms({ bus, node, timeoutMs, log = quietLogger }) {
       catch (err) { return Promise.reject(err); }
       const r = { n: msg.n, board };
       r.promise = new Promise((res, rej) => { r.resolve = res; r.reject = rej; });
-      r.timer = setTimeout(() => settle(key, new PortError("unavailable", "no room host answered the open: is a host node running?")), timeoutMs);
-      r.timer.unref?.();
+      r.timer = later(() => settle(key, new PortError("unavailable", "no room host answered the open: is a host node running?")), timeoutMs);
       inflight.set(key, r); byN.set(r.n, key);
       Promise.resolve().then(() => bus.publish(subjects.open, msg)).catch(err => {
         log.warn("remote open publish failed", { tenant, board, err });
+        // Only this request (L5): a stale rejection must not settle a newer request for the same board.
+        if (inflight.get(key) !== r) return;
         settle(key, err instanceof PortError ? err : new PortError("unavailable", "the open request could not be sent"));
       });
       return r.promise;

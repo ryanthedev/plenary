@@ -27,10 +27,14 @@
 //   DATABASE_URL         Postgres for the Store (server/store/postgres.js) and the Registry (server/registry/postgres.js).
 //   NATS_URL             NATS for the Bus (server/bus/nats.js; the connection is named after PLENARY_NODE_ID).
 //                        Either URL set = cluster mode, and then BOTH are required: one without the other refuses the
-//                        start (a Postgres store with an in-memory bus would split-brain across nodes). Their values
-//                        carry passwords: never logged, never in an error (only the names are).
-//   PLENARY_NODE_ID      this node's id: [a-z0-9-], 1-32 chars, else the start is refused. Default: the hostname,
-//                        lowercased, other characters turned into "-", cut to 32. Room leases name their holder
+//                        start (a Postgres store with an in-memory bus would split-brain across nodes). Set but
+//                        empty (or blank) refuses the start too. Their values carry passwords: never logged, never in
+//                        an error (only the names are); every log line of the node is redacted (redactingLogger).
+//                        NATS_URL may be a comma list; its credentials (user:pass@ or token@, one set for all
+//                        servers) go to the NATS client as options (bus/nats.js natsConnectOptions).
+//   PLENARY_NODE_ID      this node's id: [a-z0-9-], 1-32 chars, a letter or digit at both ends, else the start is
+//                        refused. Default: the hostname, lowercased, other characters turned into "-", cut to 32,
+//                        edge dashes dropped. Room leases name their holder
 //                        "<node>-<pid>-<random>". Logged at start.
 //   PLENARY_ROLES        comma list of gateway, host (spaces trimmed, any case); default both. Empty, unknown or
 //                        repeated names refuse the start; a single node (no URLs) refuses anything but both.
@@ -39,7 +43,8 @@
 //                        over NATS, so a cluster needs at least one host node. A host-only node serves /health only.
 //   PLENARY_LEASE_TTL_MS a room lease's ttl, integer ms from 3 to 600000, default 10000. EVERY NODE MUST USE THE SAME
 //                        VALUE: watchers time takeovers by it, and a gateway-only node waits this long for a host's
-//                        answer before telling the writer `unavailable`.
+//                        first answer before telling the writer `unavailable` (a `watching` answer then resolves
+//                        after its grace, so at worst ttl + min(1000, ttl/4)).
 //
 // start(env) reads ONLY its `env` argument (never process.env), so tests behave the same in every checkout
 // (Bun auto-loads .env into process.env). No value from env is ever logged, only names.
@@ -77,12 +82,13 @@ import { ROLES } from "../packages/protocol/envelope.js";
 const KEY_MIN = 32;
 const keyOk = k => typeof k === "string" && new TextEncoder().encode(k).length >= KEY_MIN;
 
-const NODE_ID = /^[a-z0-9-]{1,32}$/;
+// A letter or digit at both ends (p4-wire2 L6): newHolder strips edge dashes, so "-" would not name the node.
+const NODE_ID = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
 const ROLE_NAMES = ["gateway", "host"];
 
-/** The default node id: the hostname, lowercased, other characters turned into "-", cut to 32 (never refused). */
+/** The default node id: the hostname, lowercased, other characters turned into "-", cut to 32, no "-" at either end (never refused). */
 export function defaultNodeId(host) {
-  return String(host ?? "").toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 32) || "node";
+  return String(host ?? "").toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 32).replace(/^-+|-+$/g, "") || "node";
 }
 
 /**
@@ -90,13 +96,16 @@ export function defaultNodeId(host) {
  * in a message. @returns {{ cluster: boolean, node: string, roles: { gateway: boolean, host: boolean }, leaseTtlMs: number }}
  */
 export function nodeConfig(env, host = osHostname()) {
-  const hasDb = !!env.DATABASE_URL, hasNats = !!env.NATS_URL, cluster = hasDb || hasNats;
+  // Present but empty is a mistake (an unset compose interpolation), not "single node" (p4-wire2 L7).
+  for (const name of ["DATABASE_URL", "NATS_URL"])
+    if (env[name] !== undefined && !String(env[name]).trim()) throw new Error(`${name} is set but empty: unset it for a single node, or give the URL for a cluster`);
+  const hasDb = env.DATABASE_URL !== undefined, hasNats = env.NATS_URL !== undefined, cluster = hasDb || hasNats;
   if (cluster && !hasDb) throw new Error("DATABASE_URL is required in cluster mode (NATS_URL is set): every node needs the shared Postgres store; an in-memory one would split-brain across nodes");
   if (cluster && !hasNats) throw new Error("NATS_URL is required in cluster mode (DATABASE_URL is set): every node needs the shared NATS bus; an in-memory one would split-brain across nodes");
   let node;
   if (env.PLENARY_NODE_ID !== undefined) {
     node = env.PLENARY_NODE_ID;
-    if (!NODE_ID.test(node)) throw new Error("PLENARY_NODE_ID must be 1-32 characters of a-z, 0-9 and -");
+    if (!NODE_ID.test(node)) throw new Error("PLENARY_NODE_ID must be 1-32 characters of a-z, 0-9 and -, starting and ending with a letter or digit");
   } else node = defaultNodeId(host);
   let roles = { gateway: true, host: true };
   if (env.PLENARY_ROLES !== undefined) {
@@ -118,21 +127,85 @@ export function nodeConfig(env, host = osHostname()) {
   return { cluster, node, roles, leaseTtlMs };
 }
 
-/** Text with every secret part of the given URLs (the whole URL, user:password, the password) replaced by "***". */
-export function redact(text, urls) {
-  let out = String(text ?? "");
+/**
+ * The secret parts of one env URL value, longest first: each comma-separated element whole, its userinfo password
+ * (raw and decoded) and `user:password`, a bare userinfo token (raw and decoded; not for postgres: URLs, where a bare
+ * userinfo is a user name), and the value of every query parameter whose name says pass, token, secret or key.
+ * Userinfo is cut out by hand as natsConnectOptions does (bus/nats.js), so both read the same credentials.
+ */
+export function urlSecrets(value) {
   const parts = [];
-  for (const u of urls) {
-    if (!u) continue;
-    parts.push(u);
-    try {
-      const p = new URL(u);
-      if (p.password) { parts.push(p.password); try { parts.push(decodeURIComponent(p.password)); } catch { /* raw is enough */ } }
-      if (p.username && p.password) parts.push(`${p.username}:${p.password}`);
-    } catch { /* not a URL: the whole value is still replaced */ }
+  const decode = x => { try { return decodeURIComponent(x); } catch { return x; } };
+  const both = x => { if (x) parts.push(x, decode(x)); };
+  const raw = String(value ?? "");
+  if (!raw.trim()) return [];
+  // The whole value too, not only its comma elements: a raw comma inside a password (postgres://u:pa,ss@h) is not a
+  // list separator there.
+  for (const el of [raw, ...raw.split(",").map(x => x.trim()).filter(Boolean)]) {
+    parts.push(el);
+    const scheme = /^[a-z][a-z0-9+.-]*:\/\//i.exec(el)?.[0] ?? "";
+    const rest = el.slice(scheme.length);
+    const end = rest.search(/[/?#]/);
+    const authority = end < 0 ? rest : rest.slice(0, end);
+    const at = authority.lastIndexOf("@");
+    const info = at < 0 ? "" : authority.slice(0, at);
+    if (info) {
+      const colon = info.indexOf(":");
+      if (colon >= 0) { both(info.slice(colon + 1)); if (colon > 0 && colon < info.length - 1) parts.push(info); }
+      else if (!/^postgres(ql)?:\/\//i.test(scheme)) both(info);
+    }
+    const q = el.indexOf("?");
+    if (q >= 0) for (const pair of el.slice(q + 1).split("#")[0].split("&")) {
+      const eq = pair.indexOf("=");
+      if (eq > 0 && /pass|token|secret|key/i.test(decode(pair.slice(0, eq)))) both(pair.slice(eq + 1));
+    }
   }
-  for (const s of parts.filter(Boolean).sort((a, b) => b.length - a.length)) out = out.split(s).join("***");
-  return out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]*@/gi, "$1***@");
+  return [...new Set(parts.filter(Boolean))].sort((a, b) => b.length - a.length);
+}
+
+/** Every secret part of the given URLs, deduplicated, longest first (for redact's `parts`). */
+const secretsOf = urls => [...new Set(urls.flatMap(urlSecrets))].sort((a, b) => b.length - a.length);
+
+/** Text with every secret part of the given URLs (urlSecrets) replaced by "***", and any `scheme://userinfo@` too. */
+export function redact(text, urls, parts = secretsOf(urls)) {
+  let out = String(text ?? "");
+  for (const s of parts) out = out.split(s).join("***");
+  // No quote, comma or space inside the userinfo: on a JSON log line this must not run from a URL to a later "@".
+  return out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@"',]*@/gi, "$1***@");
+}
+
+/**
+ * A logger whose every line has the URLs' secrets redacted (p4-wire2 L2): the message, every string field, and an
+ * Error's message, code and stack (log.js logs no `cause`), before log.js clips or escapes them. Errors stay
+ * Errors, so lines keep their shape. Children redact too. With no URL set it returns `log` unchanged.
+ */
+export function redactingLogger(log, urls) {
+  if (!urls.some(u => typeof u === "string" && u.trim())) return log;
+  const parts = secretsOf(urls);   // once, not per string
+  const r = t => redact(t, urls, parts);
+  const scrub = (v, depth) => {
+    if (typeof v === "string") return r(v);
+    if (v instanceof Error) {
+      const e = new Error(r(v.message));
+      e.name = r(v.name);
+      if (v.code !== undefined) e.code = r(String(v.code));
+      e.stack = v.stack ? r(v.stack) : undefined;
+      return e;
+    }
+    if (!v || typeof v !== "object" || depth >= 5 || ArrayBuffer.isView(v) || v instanceof ArrayBuffer) return v;
+    if (Array.isArray(v)) return v.map(x => scrub(x, depth + 1));
+    const out = {};
+    for (const [k, x] of Object.entries(v)) out[k] = scrub(x, depth + 1);
+    return out;
+  };
+  const wrap = inner => ({
+    debug: (msg, fields) => inner.debug(r(msg), scrub(fields, 0)),
+    info: (msg, fields) => inner.info(r(msg), scrub(fields, 0)),
+    warn: (msg, fields) => inner.warn(r(msg), scrub(fields, 0)),
+    error: (msg, fields) => inner.error(r(msg), scrub(fields, 0)),
+    child: fields => wrap(inner.child(scrub(fields, 0))),
+  });
+  return wrap(log);
 }
 
 /**
@@ -184,7 +257,8 @@ export function announcingRegistry(registry, bus, log) {
 export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write, hostname, adapters } = {}) {
   // write: tests capture log lines; hostname: tests fix the default node id; adapters: tests replace the cluster
   // adapter factories ({ postgresStore?, postgresRegistry?, natsBus? }) with fakes.
-  const log = createLogger({ level: env.LOG_LEVEL || "info", ...(write ? { write } : {}) });
+  // Every line this node logs, from any component, has the URLs' secrets redacted (p4-wire2 L2).
+  const log = redactingLogger(createLogger({ level: env.LOG_LEVEL || "info", ...(write ? { write } : {}) }), [env.DATABASE_URL, env.NATS_URL]);
   // Every refusal of the cluster env comes before anything is created, connected or listening.
   const { cluster, node, roles, leaseTtlMs } = nodeConfig(env, hostname ?? osHostname());
   const dataDir = env.PLENARY_DATA_DIR || "./data";
@@ -312,14 +386,15 @@ async function openCluster(env, node, log, adapters = {}) {
   const store = await open("Postgres store", "DATABASE_URL", () => make.postgresStore({ url: env.DATABASE_URL }));
   const rawRegistry = await open("Postgres registry", "DATABASE_URL", () => make.postgresRegistry({ url: env.DATABASE_URL }));
   const bus = await open("NATS bus", "NATS_URL", () => make.natsBus({ url: env.NATS_URL, name: node,
-    onError: (err, subject) => log.error("bus error", { subject, err: redact(err?.message ?? String(err), urls).slice(0, 500), code: typeof err?.code === "string" ? err.code : undefined }) }));
+    // `log` is the redacting logger: the error's message, code and stack are redacted there.
+    onError: (err, subject) => log.error("bus error", { subject, err }) }));
   log.info("cluster adapters open", { store: "postgres", registry: "postgres", bus: "nats" });
   return { store, bus, rawRegistry };
 }
 
 if (import.meta.main) {
   const env = process.env;   // the process entry point is the one place that reads the real environment
-  const log = createLogger({ level: env.LOG_LEVEL || "info" });
+  const log = redactingLogger(createLogger({ level: env.LOG_LEVEL || "info" }), [env.DATABASE_URL, env.NATS_URL]);
   // Handlers catch their own errors; these are the last line, so one bug never takes every board down with it.
   process.on("uncaughtException", err => log.error("uncaught exception", { err }));
   process.on("unhandledRejection", err => log.error("unhandled rejection", { err }));

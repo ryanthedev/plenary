@@ -371,7 +371,7 @@ test("p4-wire: a NATS open failure after Postgres opened: the error names NATS_U
   expect(closed.sort()).toEqual(["registry", "store"]);
   expect(err.message).not.toContain("plen:");
   const busLine = lines.map(l => JSON.parse(l)).find(l => l.msg === "bus error");
-  expect(busLine?.err).toBe("stale connection to ***");
+  expect(busLine?.err?.message).toBe("stale connection to ***");   // an Error, redacted by the node's logger (p4-wire2 L2)
 });
 
 test("p4-wire: a Postgres open failure quoting its URL is redacted (message and code); nothing else was opened", async () => {

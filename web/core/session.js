@@ -41,7 +41,11 @@ export function wrapTransport(t) {
   return w;
 }
 
-/** A browser tab's id (hello.tab, once engine sends it): 16 base-36 characters from the clock port's random. */
+/**
+ * A browser tab's id (sent as hello.tab): 16 base-36 characters from the clock port's random. Minted once per page load
+ * and kept in memory only: sessionStorage would be copied by the browser's "Duplicate tab", and two tabs sharing an id
+ * would trip the gateway's 2-connections-per-tab cap.
+ */
 export function mintTab(random) {
   let id = "";
   while (id.length < 16) id += Math.floor(random() * 36 ** 4).toString(36).padStart(4, "0");
@@ -55,7 +59,7 @@ export function mintTab(random) {
  *   join: the tab's one transport (sync.js's transport port), called once. mine: note ids this person made (kept by
  *   the page across reloads). noteAuthor: the v1 snapshot's table when it exists (SEAM(v1): null in v0).
  *   tab: this browser tab's id; minted once from `random` (or the clock's) when not given. Kept in s.tab and handed
- *   to sync.js, which does not send it yet (hello.tab is engine's, not in PROTOCOL.md).
+ *   to sync.js, which sends it in every hello of the link (reconnects and resyncs keep it). No random: no tab.
  *   clock: the clock port (the root passes browserClock()); the Editors' clock is its now(). timers / now / random:
  *   handed to sync.js over the clock's (tests). No global fallback: sync.js throws without a clock.
  */

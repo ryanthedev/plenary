@@ -122,7 +122,7 @@ test("writer cap: the session's merged status is limited when its one link is (b
 });
 
 test("writer cap: the pill says so", () => {
-  expect(pillFor({ status: "limited", role: "presenter" })).toMatchObject({ cls: "offline", text: "Too many tabs" });
+  expect(pillFor({ status: "limited", role: "presenter" })).toMatchObject({ cls: "offline", text: "Connection limit" });
   expect(pillFor({ status: "live", role: "presenter", congested: true }).sub).toContain("slow link");
   expect(pillFor({ status: "live", role: "presenter" }).sub).toBe("");
 });

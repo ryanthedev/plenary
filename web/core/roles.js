@@ -64,15 +64,19 @@ export const clipboardKey = (key, m = {}) => !!(m.cmd || m.ctrl) && ["c", "x", "
 // Keys that change a stream's settings (appState): only presenters (the room refuses others).
 export const settingsKey = (key, m = {}) => !!(m.cmd || m.ctrl) && String(key) === "'";
 
+/** Both writer caps end in the same id-less `limit` (a ninth tab, or a third connection of one tab), so this says both. */
+export const LIMIT_TEXT = "This board is open in too many of your tabs or windows, or this tab reconnected too quickly";
+
 // Pill text per connection state, as in the mock. Viewers never have edits waiting.
 // `congested`: the outbound backlog is over CONGESTED_BYTES (web/ports/transport.js); `limited`: the room refused this
-// tab's connection by the writer-connection cap (8 per user and board): no retry loop, the user closes a tab first.
+// tab's connection by a writer cap (8 tabs per user and board, or 2 connections per tab: the client can't tell which,
+// so no text names one). It retries on the backoff by itself; closing a tab may free a slot.
 export function pillFor({ status, online = true, pending = 0, role, readOnly = false, congested = false }) {
   const waiting = role === "viewer" || !pending ? "" : `${pending} edit${pending === 1 ? "" : "s"} waiting`;
   // stopped: the room speaks rules this app doesn't know. It never retries; only an update helps.
   if (status === "stopped") return { cls: "offline", text: "Update needed", sub: "reload the app" };
   if (status === "refused") return { cls: "offline", text: "Refused", sub: "sign in again" };
-  if (status === "limited") return { cls: "offline", text: "Too many tabs", sub: "close one: retrying by itself" };
+  if (status === "limited") return { cls: "offline", text: "Connection limit", sub: "close a tab: retrying by itself" };
   if (!online) return { cls: "offline", text: "Offline", sub: waiting };
   if (status !== "live") return { cls: "reconnecting", text: status === "catching-up" ? "Catching up…" : "Connecting…", sub: waiting };
   const slow = congested ? "slow link" : "";
@@ -91,7 +95,7 @@ export function connectionBanner({ status, online = true, viewer = false, pendin
   if (status === "refused") return { text: `⚠ The room refused this sign-in (token or board).${relogin ? ` Sign in again to keep going${pending ? `; ${pending} unsent ${pending === 1 ? "edit" : "edits"} in this tab are lost when you leave` : ""}.` : ""} `, action: "retry", relogin: !!relogin };
   if (status === "limited") {
     const when = nextTryIn == null ? "" : ` Trying again ${nextTryIn < 1000 ? "now" : `in ${Math.ceil(nextTryIn / 1000)} s`}.`;
-    return { text: `⚠ This board is open in too many of your tabs (${limited ?? "the room's limit"}). Close one; this tab gets in by itself.${when} `, action: "retry" };
+    return { text: `⚠ ${LIMIT_TEXT} (${limited ?? "the room's limit"}). Close one; this tab retries by itself.${when} `, action: "retry" };
   }
   if (!online) return { text: viewer ? "⚠ You're offline. The live view is paused until you reconnect." : (pending ? `⚠ You're offline. ${pending} ${pending === 1 ? "edit waits" : "edits wait"} in this tab and send when you reconnect. Closing the tab loses them.` : "⚠ You're offline. Nothing is waiting to send; edits you make now are kept in this tab until you reconnect."), action: "retry" };
   if (status !== "live") return { text: viewer ? "⟳ Connecting… the live view is paused." : `⟳ Connecting… ${pending ? `${pending} edits waiting. ` : ""}Keep working: they're sent with the same ids when the room is back.`, action: null };
@@ -148,7 +152,7 @@ export function takeReturnBoard(storage, { outcome, board }) {
 
 /** The pill's tooltip for a pill class (pillFor's `cls`). The cap's text wins over the viewer's "no live connection". */
 export function pillTitleFor({ cls, status, viewer = false, readOnly = false }) {
-  if (status === "limited") return "This board is open in too many of your tabs. Close one: this tab tries again by itself (or press Retry).";
+  if (status === "limited") return `${LIMIT_TEXT}. Close one: this tab retries by itself (or press Retry).`;
   if (viewer && cls !== "readonly") return "No live connection. The live view is paused until it's back.";
   return {
     connected: "Connected: every edit is acknowledged by the board's room.",

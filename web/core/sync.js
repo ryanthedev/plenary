@@ -61,8 +61,9 @@ export function bindEditor(editor, { stream = "board", ...o }) {
  *   timeoutMs: kept for compatibility. The Replica now owns every deadline (rule 2's 10 s, rule 12's backoff);
  *   only 0 means something: no timers at all (a resync reconnects at once; nothing times out). Tests use it.
  *   now / random: the clock (ms) and jitter source handed to the Replica; tests pass a virtual clock.
- *   tab: this browser tab's id (createSession mints it). Kept, NOT sent yet: engine's `new Replica({ tab })` (hello.tab)
- *   is not in PROTOCOL.md. Turning it on is the one marked line below.
+ *   tab: this browser tab's id (createSession mints it once per page load), sent in every hello of this link as
+ *   hello.tab (PROTOCOL.md § Messages, `hello.tab`): the gateway counts tabs, not connections. null: no `tab` key at all
+ *   (the gateway then counts this connection as a tab of its own).
  *   onHeard(): every message the room sends on the current connection (welcome, entries, here, presence, …), and
  *   only those: local actions (a records op shown at once, a dismissed setting) never fire it.
  *   onRoom(ev): what the room said, once per link: presence, here, emotes, records, refused, role, limit, and
@@ -73,8 +74,9 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
   if (typeof transport?.reopen !== "function") throw new TypeError("bindEditor: the transport must have reopen() (web/ports/transport.js)");
   if (typeof now !== "function" || typeof random !== "function" || (timeoutMs !== 0 && typeof timers?.set !== "function"))
     throw new TypeError("bindEditor: pass the clock port (clock) or timers, now and random");
-  // hello.tab (engine's Replica option): add `tab` to this call when PROTOCOL.md has it. Until then it is not sent.
-  const replica = new Replica({ client, now, random });
+  // hello.tab: the Replica puts `tab` in every hello (first, backoff, reconnect, resync) and throws on one that fails
+  // TAB_RE. It must be absent, not null, when there is none: Replica checks every value it is given.
+  const replica = new Replica({ client, ...(tab != null ? { tab } : {}), now, random });
   let token = firstToken;
   const timed = timeoutMs !== 0;
   // Rate limits measure intervals: monotonic time when the clock port is given (p6-portsv R2-L4), else `now`.
@@ -85,9 +87,10 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
   let timer = null, closed = false, started = false;
   let hellos = 0;                 // hellos sent on this link (every connect: the first, backoff, reconnect())
   let down = false;               // resync asked for: the connection is closed, the backoff runs, input is ignored
-  // The writer-connection cap (PROTOCOL.md § Pacing: a ninth writer connection gets an id-less `limit` before its
-  // welcome, then is closed). It counts as a failed attempt under rule 12 and reconnects on the Replica's backoff
-  // (min(30 s, 0.5 s × 2^k) × [0.5, 1): about one try per 15–30 s once settled, never a loop), so a tab gets in
+  // The writer caps (PROTOCOL.md § Messages, `hello.tab`: a ninth writer tab, or a third connection of one tab, gets
+  // an id-less `limit` before its welcome, then is closed; the client can't tell which). It counts as a failed
+  // attempt under rule 12 and reconnects on the Replica's backoff (min(30 s, 0.5 s × 2^k) × [0.5, 1): about one try
+  // per 15–30 s once settled, never a loop), so a tab gets in
   // by itself once a slot frees. `limited` stays set (the UI's banner) until a welcome; reconnect() tries at once.
   let limited = null;             // the room's message, from the cap's refusal until the next welcome
   let nextTryAt = null;           // when the backoff reopens (now()-based), while one is armed
@@ -166,7 +169,7 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
     if (closed || down) return;
     onHeard();                            // a message from the room on the current connection (never a local action)
     if (msg?.t === "error" && msg.code === "limit" && msg.id === undefined && !replica.welcomed) {
-      limited = typeof msg.message === "string" ? msg.message : "too many open connections";
+      limited = typeof msg.message === "string" ? msg.message : "too many tabs, or too many connections of this tab";
       replica.connectionFailed();          // rule 12: a failed attempt (its close that follows is then ignored: `down`)
       pump(); onRoom({ type: "limit", message: limited }); return;
     }

@@ -237,7 +237,7 @@ test("notes() and noteAuthor come from the notes connection: my own unacked note
 // ── LOW-1: a capped tab shows only the cap ──
 test("LOW-1: limited shows only the cap banner (no Connecting…), with the next try; the pill tooltip says the cap", () => {
   const b = connectionBanner({ status: "limited", viewer: true, limited: CAP, nextTryIn: 12_300 });
-  expect(b.text).toContain("too many of your tabs");
+  expect(b.text).toContain("too many of your tabs or windows, or this tab reconnected too quickly");
   expect(b.text).toContain(CAP);
   expect(b.text).toContain("in 13 s");
   expect(b.text).not.toMatch(/Connecting/);
@@ -246,7 +246,7 @@ test("LOW-1: limited shows only the cap banner (no Connecting…), with the next
   expect(connectionBanner({ status: "connecting", viewer: true }).text).toMatch(/Connecting/);
   expect(connectionBanner({ status: "live" })).toBe(null);
   // Before any welcome a capped tab's chrome is the viewer's: the cap still wins the tooltip.
-  expect(pillTitleFor({ cls: "offline", status: "limited", viewer: true })).toMatch(/too many of your tabs/);
+  expect(pillTitleFor({ cls: "offline", status: "limited", viewer: true })).toMatch(/too many of your tabs or windows, or this tab reconnected too quickly/);
   expect(pillTitleFor({ cls: "offline", status: "connecting", viewer: true })).toMatch(/No live connection/);
 });
 

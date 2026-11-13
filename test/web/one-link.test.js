@@ -139,7 +139,7 @@ test("a refused settings change goes to its own stream's bind", () => {
   expect(s.settingsRefused.map(e => [e.stream, e.i, e.keys[0]])).toEqual([["board", 0, "timeline"], ["notes", 0, "grid"]]);
 });
 
-test("tab: minted once per session from the clock's random, kept in s.tab, and NOT sent in the hello", () => {
+test("tab: minted once per session from the clock's random, kept in s.tab, and sent in every hello (p7-tab)", () => {
   const { net } = busyBoard();
   const a = counted(net, "t-ed"), b = counted(net, "t-cy");
   net.settle();
@@ -148,7 +148,8 @@ test("tab: minted once per session from the clock's random, kept in s.tab, and N
   expect(a.s.tab).not.toBe(b.s.tab);
   a.s.reconnect(); net.settle();
   expect(a.s.tab).toMatch(/^[0-9a-z]{16}$/);
-  for (const h of [...a.c.hellos, ...b.c.hellos]) expect("tab" in h).toBe(false);
+  for (const h of a.c.hellos) expect(h.tab).toBe(a.s.tab);
+  for (const h of b.c.hellos) expect(h.tab).toBe(b.s.tab);
   expect(a.c.hellos.length).toBe(2);
   // Given: kept as is. From the clock port's random only (a fixed random gives a fixed id).
   const c = counted(net, "t-bo", { tab: "given-tab" });

@@ -43,11 +43,13 @@ const RIG_GRACE_MS = 60_000;   // a rig dir touched in the last minute may be an
 const defaultTemp = () => process.env.TMPDIR || tmpdir();
 
 /** Total disk bytes and newest mtime (ms) of the tree at `p`, by lstat only (symlinks counted, never entered). */
-export function measure(p) {
-  const st = lstatSync(p);
+export function measure(p, stat = lstatSync, rootDev = undefined) {
+  const st = stat(p);
+  const device = rootDev ?? st.dev;
+  if (st.isDirectory() && st.dev !== device) throw new Error(`tree contains a directory on a different device: ${p}`);
   let bytes = st.blocks * 512, newest = st.mtimeMs;
   if (st.isDirectory()) for (const e of readdirSync(p)) {
-    const m = measure(join(p, e));
+    const m = measure(join(p, e), stat, device);
     bytes += m.bytes;
     newest = Math.max(newest, m.newest);
   }
@@ -58,8 +60,8 @@ export function measure(p) {
  * Every path any process has open (files, cwd, mapped files, unix sockets) from one `lsof`. Throws unless lsof ran and
  * answered: exit 0, or exit 1 with output (what lsof does when it could not inspect some process), never an empty answer.
  */
-export function openPaths(lsof = "lsof") {
-  const r = spawnSync(lsof, ["-w", "-n", "-P", "-F0n"], { encoding: "utf8", maxBuffer: 1 << 28, timeout: 60_000 });
+export function openPaths(lsof = "lsof", timeout = 60_000) {
+  const r = spawnSync(lsof, ["-w", "-n", "-P", "-F0n"], { encoding: "utf8", maxBuffer: 1 << 28, timeout });
   if (r.error) throw new Error(`lsof did not run (${r.error.code ?? r.error.message})`);
   if (r.status === null) throw new Error(`lsof was killed by ${r.signal}`);
   if (r.status > 1 || !r.stdout) throw new Error(`lsof exited ${r.status} without an answer`);
@@ -73,8 +75,8 @@ export function openPaths(lsof = "lsof") {
 const namesOf = out => out.split("\0").map(f => f.replace(/^\n/, "")).filter(f => f.startsWith("n/")).map(f => f.slice(1));
 
 /** Why `path` (a dir) cannot be removed by this lsof's view ("" = nothing has anything under it open). Any failure is a reason. */
-export function openUnder(path, lsof = "lsof") {
-  const r = spawnSync(lsof, ["-w", "-n", "-P", "-F0n", "+D", path], { encoding: "utf8", maxBuffer: 1 << 28, timeout: 60_000 });
+export function openUnder(path, lsof = "lsof", timeout = 60_000) {
+  const r = spawnSync(lsof, ["-w", "-n", "-P", "-F0n", "+D", path], { encoding: "utf8", maxBuffer: 1 << 28, timeout });
   if (r.error) return `in-use re-check failed: lsof did not run (${r.error.code ?? r.error.message})`;
   if (r.status === null) return `in-use re-check failed: lsof was killed by ${r.signal}`;
   if (r.status <= 1 && /(^|\0)\n?p\d/.test(r.stdout)) return "in use (re-check)";   // +D exits 1 even when it lists matches
@@ -123,22 +125,28 @@ const refuseBase = (p, what) => {
  * scratch, minAgeMs, now, lsof (binary), rigAlive(dir) => bool, yes.
  */
 export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), scratch = null, minAgeMs = 2 * HOUR, now = Date.now(),
-  lsof = "lsof", rigAlive = rigAliveViaCli, yes = false, force = false, uid = process.getuid(), beforeRemove = null } = {}) {
+  lsof = "lsof", rigAlive = rigAliveViaCli, yes = false, force = false, uid = process.getuid(), beforeRemove = null,
+  afterRename = null, stat = lstatSync, clock = Date.now, maxTimeMs = 5 * 60_000, openPathsFn = openPaths, openUnderFn = openUnder } = {}) {
   if (minAgeMs < MIN_SAFE_AGE_MS && !force) throw new Error(`--min-age under ${MIN_SAFE_AGE_MS / 60_000} minutes needs --force (a younger entry may still be in use)`);
   const items = [];
   const bases = [["temp", tempDir, isTempName], ["scratch", scratch, () => true]];
+  const deadline = clock() + maxTimeMs;
+  const timeLeft = () => Math.max(0, deadline - clock());
+  const existsLstat = p => { try { stat(p); return true; } catch (e) { if (e.code === "ENOENT") return false; throw e; } };
   let opens = null, opensError = null;
-  try { opens = [...new Set(openPaths(lsof).flatMap(p => { try { return [p, realpathSync(p)]; } catch { return [p]; } }))]; } catch (e) { opensError = e.message; }
+  if (timeLeft() <= 0) opensError = "skipped (time limit)";
+  else try { opens = [...new Set(openPathsFn(lsof, Math.min(60_000, timeLeft())).flatMap(p => { try { return [p, realpathSync(p)]; } catch { return [p]; } }))]; } catch (e) { opensError = e.message; }
 
   const consider = (target, base, name, extra) => {
     const path = join(base, name);
     const item = { target, path, bytes: 0, status: "kept", why: "" };
     items.push(item);
     try {
-      const st = lstatSync(path);
+      if (timeLeft() <= 0) { item.why = "skipped (time limit)"; return; }
+      const st = stat(path);
       if (st.isSymbolicLink()) { item.why = "symlink"; return; }
       if (st.uid !== uid) { item.why = `owned by uid ${st.uid}, not ${uid}`; return; }
-      const m = measure(path);
+      const m = measure(path, stat);
       item.bytes = m.bytes;
       const idle = now - m.newest;
       if (extra?.minIdleMs !== undefined ? idle < extra.minIdleMs : idle < minAgeMs) { item.why = "too young"; return; }
@@ -148,14 +156,28 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
         if (underAny(opens, realpathSync(path)) || underAny(opens, path)) { item.why = "in use"; return; }
       }
       if (!yes) { item.status = "would-remove"; return; }
-      if (now - measure(path).newest < (extra?.minIdleMs ?? minAgeMs)) { item.why = "touched while scanning"; return; }
+      const scanned = measure(path, stat);
+      const judged = stat(path);
+      if (judged.dev !== st.dev || judged.ino !== st.ino || judged.mtimeMs !== st.mtimeMs || now - scanned.newest < (extra?.minIdleMs ?? minAgeMs)) { item.why = "touched while scanning"; return; }
       beforeRemove?.(path);   // test seam: something may take the dir between the snapshot and here
       // Rename first so no new process can find it by its name, then look again with a per-path lsof; put it back on any doubt.
       const parked = name.startsWith(DELETING) ? path : join(base, DELETING + name);
-      if (parked !== path) { if (existsSync(parked)) { item.why = "a parked copy already exists"; return; } renameSync(path, parked); }
+      if (parked !== path) { if (existsLstat(parked)) { item.why = "a parked copy already exists"; return; } renameSync(path, parked); afterRename?.(parked, path); }
+      const parkedStat = stat(parked);
+      if (parkedStat.dev !== judged.dev || parkedStat.ino !== judged.ino || parkedStat.mtimeMs !== judged.mtimeMs || now - scanned.newest < (extra?.minIdleMs ?? minAgeMs)) {
+        if (parked !== path) { if (existsLstat(path)) item.why = "changed while parking; original path exists"; else renameSync(parked, path); }
+        if (!item.why) item.why = "changed while parking";
+        return;
+      }
+      if (timeLeft() <= 0) { item.why = "skipped (time limit)"; if (parked !== path) { if (existsLstat(path)) item.why = "skipped (time limit); original path exists"; else renameSync(parked, path); } return; }
       let why;
-      try { why = openUnder(parked, lsof); } catch (e) { why = `in-use re-check failed: ${e.message}`; }
-      if (why) { if (parked !== path) renameSync(parked, path); item.why = why; return; }
+      try { why = openUnderFn(parked, lsof, Math.min(60_000, timeLeft())); } catch (e) { why = `in-use re-check failed: ${e.message}`; }
+      if (timeLeft() <= 0) {
+        if (parked !== path) { if (existsLstat(path)) item.why = "skipped (time limit); original path exists"; else renameSync(parked, path); }
+        if (!item.why) item.why = "skipped (time limit)";
+        return;
+      }
+      if (why) { if (parked !== path) { if (existsLstat(path)) item.why = `${why}; original path exists`; else renameSync(parked, path); } if (!item.why) item.why = why; return; }
       rmSync(parked, { recursive: true, force: true });
       item.status = "removed";
     } catch (e) { item.status = "failed"; item.why = e.message; }
@@ -200,12 +222,12 @@ function parseDuration(s) {
 
 if (import.meta.main) {
   const a = process.argv.slice(2), opt = n => { const i = a.indexOf(n); return i < 0 ? undefined : a[i + 1]; };
-  const known = new Set(["--yes", "--verbose", "--force", "--min-age", "--scratch"]);
-  const bad = a.find((x, i) => x.startsWith("--") && !known.has(x) || !x.startsWith("--") && !["--min-age", "--scratch"].includes(a[i - 1]));
-  if (bad) { console.error(`unknown argument ${bad}\nusage: bun run clean [--yes] [--min-age 2h [--force]] [--scratch <dir>] [--verbose]`); process.exit(2); }
+  const known = new Set(["--yes", "--verbose", "--force", "--min-age", "--scratch", "--max-time"]);
+  const bad = a.find((x, i) => x.startsWith("--") && !known.has(x) || !x.startsWith("--") && !["--min-age", "--scratch", "--max-time"].includes(a[i - 1]));
+  if (bad) { console.error(`unknown argument ${bad}\nusage: bun run clean [--yes] [--min-age 2h [--force]] [--max-time 5m] [--scratch <dir>] [--verbose]`); process.exit(2); }
   const yes = a.includes("--yes");
   try {
-    const { items } = clean({ yes, minAgeMs: parseDuration(opt("--min-age") ?? "2h"), force: a.includes("--force"), scratch: opt("--scratch") ?? null });
+    const { items } = clean({ yes, minAgeMs: parseDuration(opt("--min-age") ?? "2h"), maxTimeMs: parseDuration(opt("--max-time") ?? "5m"), force: a.includes("--force"), scratch: opt("--scratch") ?? null });
     const mb = b => `${(b / 1e6).toFixed(1)} MB`.padStart(9);
     const shown = items.filter(i => i.status !== "kept" || a.includes("--verbose")), all = a.includes("--verbose") || shown.length <= 25;
     for (const i of all ? shown : [...shown].sort((x, y) => y.bytes - x.bytes).slice(0, 25)) console.log(`${i.status.padEnd(12)}${mb(i.bytes)}  ${i.target.padEnd(7)} ${i.path}${i.why ? `  (${i.why})` : ""}`);

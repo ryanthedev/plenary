@@ -2,7 +2,7 @@
 // "Old" is simulated by passing a `now` three hours ahead; processes that hold things open are our own, killed by pid.
 
 import { test, expect, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, existsSync, symlinkSync, rmSync, chmodSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, existsSync, symlinkSync, rmSync, chmodSync, realpathSync, lstatSync, renameSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
@@ -203,6 +203,76 @@ test("a failing per-path re-check puts the dir back", () => {
   expect(r.items[0].why).toMatch(/re-check failed/);
   expect(existsSync(d)).toBe(true);
   expect(readdirSyncNames(w.tempDir)).toEqual(["plenary-test-rechk1"]);
+});
+
+test("a parked entry whose identity or age changes after rename is put back and kept", () => {
+  const w = world(), d = entry(w.tempDir, "plenary-test-postid");
+  const r = clean({ ...w, now: LATER(), yes: true, afterRename: parked => {
+    if (parked === join(w.tempDir, ".plen-deleting-plenary-test-postid")) writeFileSync(join(parked, "changed"), "x");
+  } });
+  expect(byName(r, "plenary-test-postid")).toMatchObject({ status: "kept", why: "changed while parking" });
+  expect(existsSync(d)).toBe(true);
+});
+
+test("a different old directory swapped under the parked name is put back and kept", () => {
+  const w = world(), d = entry(w.tempDir, "plenary-test-swp111");
+  const away = join(w.tempDir, "original-parked-directory");
+  const replacementTime = new Date(Date.now() - 3 * 3_600_000);
+  utimesSync(d, replacementTime, replacementTime);
+  const r = clean({ ...w, now: LATER(), yes: true, afterRename: parked => {
+    if (parked === join(w.tempDir, ".plen-deleting-plenary-test-swp111")) {
+      renameSync(parked, away);
+      mkdirSync(parked);
+      utimesSync(parked, replacementTime, replacementTime);
+    }
+  } });
+  expect(byName(r, "plenary-test-swp111")).toMatchObject({ status: "kept", why: "changed while parking" });
+  expect(existsSync(d)).toBe(true);
+  expect(existsSync(away)).toBe(true);
+  expect(existsSync(join(w.tempDir, ".plen-deleting-plenary-test-swp111"))).toBe(false);
+});
+
+test("a recreated original name is never overwritten when a parked entry must be restored", () => {
+  const w = world(), d = entry(w.tempDir, "plenary-test-noclob");
+  const lsof = join(w.root, "lsof-recheck-fails");
+  writeFileSync(lsof, '#!/bin/sh\ncase "$*" in *+D*) exit 2;; esac\necho n/dev/null\n'); chmodSync(lsof, 0o755);
+  const r = clean({ ...w, lsof, now: LATER(), yes: true, afterRename: parked => {
+    if (parked.endsWith("plenary-test-noclob")) mkdirSync(d);
+  } });
+  expect(byName(r, "plenary-test-noclob")).toMatchObject({ status: "kept", why: expect.stringMatching(/original path exists/) });
+  expect(existsSync(d)).toBe(true);
+  expect(existsSync(join(w.tempDir, ".plen-deleting-plenary-test-noclob"))).toBe(true);
+});
+
+test("a directory tree crossing a device boundary is kept", () => {
+  const w = world(), d = entry(w.tempDir, "plenary-test-mount1");
+  const rootStat = lstatSync;
+  const r = clean({ ...w, now: LATER(), yes: true, stat: p => {
+    const st = rootStat(p);
+    return p === join(d, "sub") ? new Proxy(st, { get: (target, key) => key === "dev" ? target.dev + 1 : Reflect.get(target, key, target) }) : st;
+  } });
+  expect(byName(r, "plenary-test-mount1")).toMatchObject({ status: "failed", why: expect.stringMatching(/different device/) });
+  expect(existsSync(d)).toBe(true);
+});
+
+test("the total time limit skips candidates after the deadline", () => {
+  const w = world();
+  const first = entry(w.tempDir, "plenary-test-time01");
+  entry(w.tempDir, "plenary-test-time02");
+  let clockReads = 0;
+  const r = clean({ ...w, now: LATER(), yes: true, maxTimeMs: 10, clock: () => ++clockReads <= 7 ? 0 : 11,
+    openUnderFn: () => "" });
+  expect(r.items.map(i => [i.status, i.why])).toEqual([["removed", ""], ["kept", "skipped (time limit)"]]);
+  expect(existsSync(first)).toBe(false);
+  expect(readdirSyncNames(w.tempDir)).toEqual(["plenary-test-time02"]);
+});
+
+test("a stale .env file inside an exact temp candidate does not prevent cleanup", () => {
+  const w = world(), d = entry(w.tempDir, "plenary-test-env111");
+  writeFileSync(join(d, ".env"), "stale copy");
+  const r = clean({ ...w, now: LATER(), yes: true });
+  expect(byName(r, "plenary-test-env111")).toMatchObject({ status: "removed" });
+  expect(existsSync(d)).toBe(false);
 });
 
 test("an odd path (a newline in it): lsof -F0 output is parsed whole (escaped by lsof), the holder is seen, and the per-path check agrees", () => {

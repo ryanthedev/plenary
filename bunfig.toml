@@ -1,0 +1,3 @@
+[test]
+# Safety nets and the per-run temp root for every test file (test/preload.js).
+preload = ["./test/preload.js"]

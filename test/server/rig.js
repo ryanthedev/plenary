@@ -11,8 +11,7 @@ import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy, roleCache } from "../../server/auth/tenancy.js";
 import { Replica } from "../../packages/protocol/replica.js";
 import { jsonCodec } from "../../packages/protocol/codec.js";
-import { afterEach } from "bun:test";
-import { tempDir, sleep, until } from "./helpers.js";
+import { tempDir, sleep, until, testNets } from "./helpers.js";
 
 /**
  * The room host's heartbeat in tests (production default 2 s). Things a test waits for ride on it: the gateway's board feed
@@ -21,10 +20,11 @@ import { tempDir, sleep, until } from "./helpers.js";
  */
 export const HEARTBEAT_MS = 200;
 
-/** Every rig not yet stopped. A test that fails before its last line would leave a gateway and its sockets running: afterEach (below) stops them. */
-const live = new Set();
-export const stopRigs = () => Promise.all([...live].map(r => r.stop()));
-afterEach(stopRigs);   // registered once per test file that imports this module
+/**
+ * Every rig not yet stopped. A test that fails before its last line would leave a gateway and its sockets running:
+ * test/preload.js stops them after every test, in every file.
+ */
+export const stopRigs = () => Promise.all([...testNets().rigs].map(r => r.stop()));
 
 export const ROLES = ["owner", "editor", "annotator", "commenter", "viewer"];
 /** Every dev token contains this, so a test can assert no token ever reaches a log line. */
@@ -37,6 +37,7 @@ export const tokenOf = name => `${SECRET}-${name}-token`;
  * Pass `dir`, `registry` and `ids` from an earlier rig to restart "the same server" on the same data.
  */
 export async function rig(o = {}) {
+  const live = testNets().rigs;
   const dir = o.dir ?? tempDir();
   const lines = [];
   const log = createLogger({ write: l => lines.push(l), level: "debug" });
@@ -237,8 +238,8 @@ export async function rawSock(wsUrl, { frames = false } = {}) {
   const s = { socket, got: 0, ended: false };
   if (frames) {
     // Optional: parse the server's (unmasked) frames into `s.texts`, so a test can check what arrived, whatever its
-    // size (Bun's own client refuses a message over 128 MiB). Only text frames are kept; others are skipped.
-    s.texts = []; let parts = [], have = 0, need = -1, hdr = 0, op = 0;
+    // size (Bun's own client refuses a message over 128 MiB). Only text frames are kept; pings are counted (`s.pings`).
+    s.texts = []; s.pings = 0; let parts = [], have = 0, need = -1, hdr = 0, op = 0;
     const flat = () => { if (parts.length > 1) parts = [Buffer.concat(parts)]; return parts[0]; };
     s.parse = d => {
       parts.push(d); have += d.length;
@@ -253,6 +254,7 @@ export async function rawSock(wsUrl, { frames = false } = {}) {
         if (have < hdr + need) return;                   // the payload isn't all here yet (no concat until it is)
         const b = flat();
         if (op === 1) s.texts.push(b.toString("utf8", hdr, hdr + need));
+        else if (op === 9) s.pings++;                    // the server's keep-alive ping (never answered: no pong is sent)
         const left = b.subarray(hdr + need); parts = left.length ? [left] : []; have = left.length; need = -1;
       }
     };

@@ -3,7 +3,6 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { afterEach } from "bun:test";
 
 const made = [];
 /** A fresh temp directory (never inside the repo). Call cleanup() in afterAll. */
@@ -31,15 +30,22 @@ export const sha1 = bytes => createHash("sha1").update(bytes).digest("hex");
 /** A promise you resolve or reject from outside. */
 export function deferred() { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; }
 
-const children = new Set();
+/** test/preload.js's registries (bunfig.toml preload). Without it no safety net runs at all, so refuse loudly. */
+export function testNets() {
+  const nets = globalThis.__plenaryTestNets;
+  if (!nets) throw new Error("test/preload.js is not loaded: run `bun test` from the repo root (bunfig.toml preloads it)");
+  return nets;
+}
+
 /**
- * Bun.spawn whose child is killed (SIGKILL) and reaped after the test that started it, pass or fail: a test that threw
- * before its own finally used to leave a `bun server/main.js` (or a nats-server) running for hours.
+ * Bun.spawn whose child is killed (SIGKILL) and reaped after the test that started it, pass or fail (test/preload.js's
+ * afterEach, which runs for every test file): a test that threw before its own finally used to leave a
+ * `bun server/main.js` (or a nats-server) running for hours.
  */
 export function spawnTracked(...args) {
+  const { children } = testNets();
   const child = Bun.spawn(...args);
   children.add(child);
   child.exited.finally(() => children.delete(child)).catch(() => {});
   return child;
 }
-afterEach(async () => { const live = [...children]; for (const c of live) { try { c.kill("SIGKILL"); } catch { /* gone */ } } await Promise.all(live.map(c => c.exited.catch(() => {}))); });

@@ -2,7 +2,8 @@
   "test/admin/devadmin.test.js": [
     "// Only these keys: start() reads its argument, never process.env (so no DATABASE_URL from a checkout's .env).",
     "// temp dir and the env is explicit, so no checkout .env (DATABASE_URL) is loaded.",
-    "expect(await run([\"--domain\", \"acme.com\", \"--admin\", \"dev:ann\"], { DATABASE_URL: secret }, x.io)).toBe(1);"
+    "expect(await run([\"--domain\", \"acme.com\", \"--admin\", \"dev:ann\"], { DATABASE_URL: secret }, x.io)).toBe(1);",
+    "const code = await run([\"--domain\", \"acme.com\", \"--admin\", \"dev:ann\"], { DATABASE_URL: `postgres://u:secretpw@127.0.0.1:${hang.port}/db` }, { ...x.io, timeoutMs: 700 });"
   ],
   "test/auth/google-live-server.test.js": [
     "// no PLENARY_DEV_TOKENS (dev tokens off), no DATABASE_URL / NATS_URL (single node)"

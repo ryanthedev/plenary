@@ -1,14 +1,23 @@
-# Plenary cluster stack, phase-4 shape (NOT FUNCTIONAL YET): Postgres, NATS, S3-compatible blobs, 3 app nodes and a
+# Plenary cluster stack, phase-4 shape (not yet run as containers): Postgres, NATS, S3-compatible blobs, 3 app nodes and a
 # load balancer. Run from the repo root:
 #   docker compose -f deploy/cluster.compose.yml up --build
+# For local load tests and the takeover check without containers, use the native rig instead (deploy/cluster/RIG.md,
+# scripts/cluster-rig.js); it uses the same env names, the same role split, NATS max_payload 2 MB and Caddy.
 #
-# server/main.js has no cluster adapters yet, so each app node still runs single-node (SQLite, in-memory bus, local
-# disk). DATABASE_URL and NATS_URL below only switch on cluster mode, which requires COOKIE_KEY; the rest of the
-# cluster env is not read yet (names confirmed by engine).
+# Cluster env (p4-wire, 7bf171b; docs/m2/reports/p4-wirev.md): server/main.js reads DATABASE_URL (Postgres store and
+# registry), NATS_URL (NATS bus), PLENARY_NODE_ID (lease holder prefix; start and end it with a letter or digit),
+# PLENARY_ROLES (gateway/host split) and PLENARY_LEASE_TTL_MS, plus COOKIE_KEY, which cluster mode requires. Set
+# PLENARY_ROLES on every app node: an empty DATABASE_URL and NATS_URL (e.g. an unset interpolation) mean single node
+# (SQLite, in-memory bus), and the explicit roles make such a node refuse to start instead of running alone. NATS
+# stays without auth for now: the bus drops user:pass from NATS_URL (p4-wirev M1, engine's fix pending). S3_* are never
+# read: blobs stay on each node's local disk for M2 (engine, 2026-11-12), so the blobs services below are kept for
+# later and unused.
 #
-# Roles (PLENARY_ROLES, comma list of `gateway` and `host`, default `gateway,host`):
-#   app-1  gateway,host    app-2  gateway only    app-3  host only
-# Two gateways (the LB routes only to these) and two room hosts (so a killed host's boards have somewhere to go). See deploy/README.md, "Cluster (phase 4, not functional yet)".
+# Roles (PLENARY_ROLES, comma list of `gateway` and `host`, default `gateway,host`), the same split as the rig's default:
+#   app-1  gateway    app-2  gateway    app-3  host
+# The LB routes only to the gateways. For the takeover check ("kill a board's host, another takes over") add a second
+# host: copy app-3 as app-4 with PLENARY_NODE_ID: app-4 (the rig: --hosts 2). This file has not been run as containers
+# yet (header); the native rig has run this split with the same env (deploy/cluster/RIG.md).
 #
 # A separate file (not Compose profiles in compose.yml) so this stack has its own project name, port and volumes and
 # never touches the single-node `plenary` service. Also (expected, not tested): Compose interpolates a whole file
@@ -49,7 +58,9 @@ x-app: &app
   restart: unless-stopped
 
 # Env shared by the three app nodes. Names main.js reads today: PORT, PLENARY_DATA_DIR, LOG_LEVEL, PLENARY_DEV_TOKENS,
-# COOKIE_KEY (and optional SESSION_KEY, GOOGLE_*, OIDC_REDIRECT_URI, PUBLIC_URL; not set here: see deploy/README.md).
+# PLENARY_MAX_CONNS_PER_USER, COOKIE_KEY (and optional SESSION_KEY, GOOGLE_*, OIDC_REDIRECT_URI, PUBLIC_URL; not set
+# here: see deploy/README.md), and since p4-wire (7bf171b) the cluster env: DATABASE_URL, NATS_URL, PLENARY_NODE_ID,
+# PLENARY_ROLES, PLENARY_LEASE_TTL_MS.
 x-app-env: &app-env
   PORT: "8080"
   # Signs login/exchange cookies and sessions. One value for every node; never written in this repo.
@@ -58,8 +69,14 @@ x-app-env: &app-env
   # corrupt it). Nothing here survives `down`; the cluster's durable state will be Postgres and the blob store.
   PLENARY_DATA_DIR: /data
   LOG_LEVEL: ${LOG_LEVEL:-info}
-  # Local use only. Each node mints its own dev board today, so a board id from one node is unknown to the others.
+  # Local use only. Each gateway node (app-1, app-2; not the host-only app-3) creates its own dev board on its first
+  # start and keeps that id in its own /data. The registry is the shared Postgres, so every node knows every board, but
+  # the two gateways' dev boards are two different boards.
   PLENARY_DEV_TOKENS: ${PLENARY_DEV_TOKENS:-}
+  # Open sockets one user may hold (main.js default 64). A load test sharing a few dev tokens must raise it.
+  PLENARY_MAX_CONNS_PER_USER: ${PLENARY_MAX_CONNS_PER_USER:-64}
+  # Room-host lease length. Must be identical on every node: set once here, never per service.
+  PLENARY_LEASE_TTL_MS: ${PLENARY_LEASE_TTL_MS:-10000}
   DATABASE_URL: postgres://plenary:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (letters and digits)}@postgres:5432/plenary
   NATS_URL: nats://nats:4222
   # S3_* are also the names Bun's built-in S3 client reads from env.
@@ -144,7 +161,7 @@ services:
       <<: *app-env
       # Unique per node and stable across its restarts: a fixed literal per service.
       PLENARY_NODE_ID: app-1
-      PLENARY_ROLES: gateway,host
+      PLENARY_ROLES: gateway
 
   app-2:
     <<: *app

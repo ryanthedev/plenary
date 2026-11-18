@@ -4,25 +4,36 @@
 // The child runs in an empty temp cwd, so Bun's .env auto-load never pulls a checkout's .env into it, and through
 // `sh -c 'ulimit -n N; exec bun …'` so it can hold many sockets. Its stdout (JSON log lines) is kept in memory
 // and optionally copied to a log file; nothing from it is printed here.
+//
+// Orphan watch: the child also preloads this file (bun --preload) with PLENARY_LOAD_PARENT = the starting process's
+// PID. In the server process, the block at the bottom then checks every 500 ms that its parent is still that PID; if
+// not (run.js was SIGKILLed, or died before the server started), it sends itself SIGTERM (server/main.js's own clean
+// stop) and exits after 5 s if that did not end it. server/main.js itself is not changed.
 
 import { mkdtempSync, readFileSync, createWriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const MAIN = resolve(import.meta.dir, "../../server/main.js");
+const SELF = import.meta.path;
+export const ORPHAN_CHECK_MS = 500;
 
 /**
- * @param {{ tokensPath: string, dataDir?: string, env?: Record<string,string>, nofile?: number, logPath?: string, timeoutMs?: number }} o
+ * @param {{ tokensPath: string, dataDir?: string, env?: Record<string,string>, nofile?: number, logPath?: string, timeoutMs?: number, onChild?: (child: any) => void }} o
+ *   onChild: called with the child process as soon as it is spawned, before the server is up (a caller that must
+ *   stop it on a signal can't wait for this function to return).
  * @returns {Promise<{ pid: number, port: number, httpUrl: string, wsUrl: string, board: string, dataDir: string, child: any, lines: () => object[], stop: () => Promise<void> }>}
  */
-export async function startServer({ tokensPath, dataDir, env = {}, nofile = 65536, logPath, timeoutMs = 20000 }) {
+export async function startServer({ tokensPath, dataDir, env = {}, nofile = 65536, logPath, timeoutMs = 20000, onChild }) {
   dataDir ??= mkdtempSync(join(tmpdir(), "plenary-load-data-"));
   const cwd = mkdtempSync(join(tmpdir(), "plenary-load-cwd-"));
   const childEnv = {
     PATH: process.env.PATH, HOME: process.env.HOME, PORT: "0", PLENARY_DATA_DIR: dataDir, LOG_LEVEL: "info",
-    PLENARY_DEV_TOKENS: readFileSync(tokensPath, "utf8"), ...env,
+    PLENARY_DEV_TOKENS: readFileSync(tokensPath, "utf8"), ...env, PLENARY_LOAD_PARENT: String(process.pid),
   };
-  const child = Bun.spawn(["sh", "-c", `ulimit -n ${Math.floor(nofile)} 2>/dev/null; exec "$0" "$1"`, process.execPath, MAIN], { cwd, env: childEnv, stdout: "pipe", stderr: "pipe" });
+  // exec: the PID we get (and sample, and stop) is the server's own.
+  const child = Bun.spawn(["sh", "-c", `ulimit -n ${Math.floor(nofile)} 2>/dev/null; exec "$0" --preload "$2" "$1"`, process.execPath, MAIN, SELF], { cwd, env: childEnv, stdout: "pipe", stderr: "pipe" });
+  onChild?.(child);
   const out = { text: "", err: "" };
   const file = logPath ? createWriteStream(logPath, { mode: 0o600 }) : null;
   const pump = async (stream, k) => {
@@ -87,4 +98,16 @@ export function cpuPct(samples) {
     if (dt > 0) out.push(Math.round(((samples[i].cpuS - samples[i - 1].cpuS) / dt) * 1000) / 10);
   }
   return out;
+}
+
+// The orphan watch (see the header): runs only when preloaded into a server this file started.
+const loadParent = Number(process.env.PLENARY_LOAD_PARENT);
+if (loadParent > 0 && loadParent !== process.pid && Bun.main === MAIN) {
+  const watch = setInterval(() => {
+    if (process.ppid === loadParent) return;
+    clearInterval(watch);
+    process.kill(process.pid, "SIGTERM");
+    setTimeout(() => process.exit(1), 5000).unref?.();
+  }, ORPHAN_CHECK_MS);
+  watch.unref?.();
 }

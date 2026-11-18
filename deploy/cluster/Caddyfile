@@ -1,5 +1,6 @@
 # Load balancer for the phase-4 cluster stack (deploy/cluster.compose.yml). Plain HTTP inside the Compose network;
-# Compose publishes it on the host's 127.0.0.1 only.
+# Compose publishes it on the host's 127.0.0.1 only. The native rig (scripts/cluster-rig.js) generates the same shape
+# with 127.0.0.1 upstreams on probed ports.
 {
 	# No admin API and no automatic HTTPS: this is a local test stack behind loopback.
 	admin off
@@ -7,27 +8,20 @@
 }
 
 :8080 {
-	# Only the two endpoints server/main.js serves today. Caddy's reverse_proxy passes WebSocket upgrades as is.
+	# Every path goes to the gateways: /ws, /health, the HTTP API (/boards, /auth, /links, ...) and the web app, all
+	# served by server/main.js. Caddy's reverse_proxy passes WebSocket upgrades as is.
 	# Upstreams are the nodes with the `gateway` role only (PLENARY_ROLES in cluster.compose.yml): app-1 and app-2.
 	# app-3 is host-only and must never get client traffic.
-	@app path /ws /health
-	handle @app {
-		reverse_proxy app-1:8080 app-2:8080 {
-			# A WebSocket stays on the node it first reached; new connections are spread round robin.
-			lb_policy round_robin
-			# Retry another node for a request that could not connect (a killed node), for up to 5 s.
-			lb_try_duration 5s
-			# Active check: a node that fails GET /health is taken out until it passes again.
-			health_uri /health
-			health_interval 2s
-			health_timeout 1s
-			# Passive check: a node whose requests fail is skipped for 10 s.
-			fail_duration 10s
-		}
-	}
-
-	# Anything else: 404. The server does not serve web/ yet.
-	handle {
-		respond "not found" 404
+	reverse_proxy app-1:8080 app-2:8080 {
+		# A WebSocket stays on the node it first reached; new connections are spread round robin.
+		lb_policy round_robin
+		# Retry another node for a request that could not connect (a killed node), for up to 5 s.
+		lb_try_duration 5s
+		# Active check: a node that fails GET /health is taken out until it passes again.
+		health_uri /health
+		health_interval 2s
+		health_timeout 1s
+		# Passive check: a node whose requests fail is skipped for 10 s.
+		fail_duration 10s
 	}
 }

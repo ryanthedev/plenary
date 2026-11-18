@@ -1,5 +1,16 @@
 # Report: p8-load2 (fix round for p8-load after the p8-loadv FAIL)
 
+> **Corrections (2026-11-12, p8-load3, from the p8-load2v review, findings 1 and 10):**
+> - **125 writers:** viewer p99 was 1.8-12.4 s over 4 runs (8.5 s and 12.4 s here; 1.8 s and 3.5 s in
+>   p8-load2v's re-runs), not "8.5 s and 12.4 s". Degradation at 125 still holds in all 4; its size varies.
+> - **Load average:** 14.8 was the 1-minute load average before `k125`, not before the last run. Before the last
+>   run (`k105e`) it was 10.4.
+> - **Server CPU:** the "55-81% mean" below is the whole-run mean, idle ramp start included. Over the load phase
+>   it was 88-93% at 105 writers, 90% and 73% at 125, 82% and 85% at 150, 75% at 200. The degraded runs still
+>   used less CPU than the healthy 105-writer runs, so "not diagnosed" stands.
+> - **`drainMs`:** every folder of these runs (all ten under `p8-load2/`) holds the summed value, like the older
+>   folders. The calibration README now names them all.
+
 **Status: done. All 3 MEDIUM and all 10 LOW findings are fixed, plus one new bug (`drainMs`); 39 of 39 mutations
 are caught; gates green.**
 

@@ -8,6 +8,10 @@ import { LoadClient } from "./client.js";
 import { Hist } from "./stats.js";
 import { readTokensByRole } from "./tokens.js";
 
+// The load phase's CPU is judged only when the phase lasted at least this long (shorter: too few ms to mean much;
+// run.js refuses --duration under 1 s, so a real run always has it).
+export const LOAD_CPU_MIN_MS = 500;
+
 export class Stats {
   constructor(t0) { this.t0 = t0; this.counts = {}; this.closes = {}; this.errors = {}; this.hists = {}; this.joinsPerSec = {}; }
   count(k, n = 1) { this.counts[k] = (this.counts[k] ?? 0) + n; }
@@ -45,6 +49,13 @@ export async function runWorker(job, { onProgress } = {}) {
     cpuSpans.push([cpuWall, Date.now()]); cpuWall = Date.now();
     cpuPrev = process.cpuUsage(); cpuAt = t;
   }, 1000);
+  // Load-phase CPU, exactly: process CPU time between a mark at the phase's start (loadFrom, or now if that is past)
+  // and one at its end (right after the generation sleep), over the wall time between the two marks. A late timer
+  // (a pinned loop) only moves a mark; the CPU and the wall time are both taken at the mark, so they agree.
+  const loadFrom = job.loadFrom ?? job.t0;
+  let loadMark = null;
+  const markLoad = () => { loadMark = { cpu: process.cpuUsage(), t: performance.now() }; };
+  const loadTimer = loadFrom <= Date.now() ? (markLoad(), null) : setTimeout(markLoad, loadFrom - Date.now());
   const progress = onProgress ? setInterval(() => onProgress({ worker: job.worker ?? 0, joined: stats.counts.joined ?? 0, clients: job.clients.length, opsSent: stats.counts.opsSent ?? 0, closes: { ...stats.closes } }), 2000) : null;
 
   const starts = [];
@@ -57,6 +68,12 @@ export async function runWorker(job, { onProgress } = {}) {
   }
 
   await Bun.sleep(Math.max(0, job.genEndAt - Date.now()));
+  clearTimeout(loadTimer);
+  let cpuLoadMean = null, cpuLoadMs = 0;
+  if (loadMark) {
+    const u = process.cpuUsage(loadMark.cpu); cpuLoadMs = Math.round(performance.now() - loadMark.t);
+    if (cpuLoadMs >= LOAD_CPU_MIN_MS) cpuLoadMean = Math.round(((u.user + u.system) / 1000 / cpuLoadMs) * 1000) / 10;
+  }
   for (const s of starts) clearTimeout(s);
   for (const c of clients) c.stopGenerating();
 
@@ -77,11 +94,11 @@ export async function runWorker(job, { onProgress } = {}) {
 
   clearInterval(lagTimer); clearInterval(cpuTimer); if (progress) clearInterval(progress);
   for (const c of clients) c.close();
-  // The load phase (ramp done, still generating): the samples wholly inside it, so idle ramp and drain seconds
-  // don't dilute a generator that was pinned while it mattered. run.js judges validity on these.
-  const loadFrom = job.loadFrom ?? job.t0;
+  // The 1 s samples wholly inside the load phase (ramp done, still generating), kept for the record. run.js judges
+  // validity on cpuLoadMean (the marks above), so idle ramp and drain seconds don't dilute a pinned generator, and
+  // a load phase too short to hold a whole sample is still measured.
   const cpuLoad = cpu.filter((_, i) => cpuSpans[i][0] >= loadFrom - 50 && cpuSpans[i][1] <= job.genEndAt + 50);
-  return { worker: job.worker ?? 0, pid: process.pid, stats: stats.toJSON(), lag: lag.toJSON(), cpu, cpuLoad };
+  return { worker: job.worker ?? 0, pid: process.pid, stats: stats.toJSON(), lag: lag.toJSON(), cpu, cpuLoad, cpuLoadMean, cpuLoadMs };
 }
 
 if (import.meta.main) {
@@ -95,5 +112,9 @@ if (import.meta.main) {
     // Give the IPC message time to leave, then exit (open sockets are closing; don't wait for them).
     setTimeout(() => process.exit(0), 200);
   });
+  // Orphaned (the parent died without stopping us, e.g. SIGKILL): exit rather than load a server for nobody. The
+  // parent's PID comes from run.js (PLENARY_LOAD_PARENT), so a parent that died before we started is caught too.
+  const parent = Number(process.env.PLENARY_LOAD_PARENT) || process.ppid;
+  setInterval(() => { if (process.ppid !== parent) process.exit(0); }, 1000).unref?.();
   process.send({ type: "ready" });
 }

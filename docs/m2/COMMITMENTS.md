@@ -10,7 +10,7 @@ Every promise made to the CEO goes here the same turn. Status: OPEN, RUNNING, VE
 | proxy | t1bx | ★ proxy · t1bx (talk here) | running (successor of t14h; handoff docs/m2/handoff/proxy.md, 9d06783) |
 | manager engine | t18m | manager engine | running (successor of t14j; handoff docs/m2/handoff/manager-engine.md, 94b1ae9): p2-tune a90cd6b; p4-host 5b272ad; p5-load gateway patch 15210d3 (role cache, batched re-check); p4-wire committed 7bf171b (p4-wirev PASS, 1 MEDIUM NATS_URL userinfo ignored + 7 LOWs ticketed; t1j6, t1jd closed); p-tab committed 40cba26 (hello.tab, tab-counted writer cap and here.viewers; p-tabv PASS); p-scan committed e4b8cea (t1jc closed) (import scanners onto Bun.Transpiler); p4-wire2 committed ddc484a (p4-wire2v PASS, 4 LOWs deferred); E-1 heartbeat (p-hb) next; then E-2, p-fanout |
 | manager platform | t187 | manager platform | running (successor of t14q; handoff docs/m2/handoff/manager-platform.md, 9266173): drawh round 3 (t185, verifier t155) |
-| manager client | t14k | manager client · t14k | J3 p8-one-link committed f1bfee6; tidy p8-tidy committed 9494fd2; engine p-scan landed e4b8cea; client globals parser swap p8-globals committed 9473b86, fix round p8-globals2 (t1jj) for 4 LOWs; p7-tab after engine's ping; C-4 watchdog after E-1 |
+| manager client | t14k | manager client · t14k | J3 p8-one-link committed f1bfee6; tidy p8-tidy committed 9494fd2; engine p-scan landed e4b8cea; client globals parser swap committed 9473b86 + 2703540 (p8-globals2); p7-tab committed f466430; C-4 watchdog after E-1 |
 
 ## Commitments
 

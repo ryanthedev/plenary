@@ -44,16 +44,18 @@ test("stats: merging histograms gives the percentiles of all samples together (n
 function fakeWorker(worker, values, counts, closes) {
   const h = new Hist(); for (const v of values) h.add(v);
   const lag = new Hist(); lag.add(worker + 1);
-  return { worker, pid: 1000 + worker, cpu: [10, 20], lag: lag.toJSON(), stats: { counts, closes, errors: { unavailable: 1 }, hists: { "echo.editor": h.toJSON() }, joinsPerSec: { 0: counts.joined } } };
+  return { worker, pid: 1000 + worker, cpu: [10, 20], cpuLoadMean: 15, cpuLoadMs: 2000, lag: lag.toJSON(), stats: { counts, closes, errors: { unavailable: 1 }, hists: { "echo.editor": h.toJSON() }, joinsPerSec: { 0: counts.joined } } };
 }
 
 test("merge: two workers' counts add and their histograms merge exactly", () => {
+  // The slowest drain first: neither "last worker wins" nor (below, reversed) "first worker wins" can pass.
   const m = mergeResults([
-    fakeWorker(0, [1, 2, 3], { joined: 3, opsSent: 3, echoes: 3, clients: 3, drainMs: 700 }, { 1013: 2 }),
-    fakeWorker(1, [100, 200], { joined: 2, opsSent: 2, echoes: 2, clients: 2, drainMs: 900 }, { 1013: 1, 1006: 4 }),
+    fakeWorker(0, [1, 2, 3], { joined: 3, opsSent: 3, echoes: 3, clients: 3, drainMs: 900 }, { 1013: 2 }),
+    fakeWorker(1, [100, 200], { joined: 2, opsSent: 2, echoes: 2, clients: 2, drainMs: 700 }, { 1013: 1, 1006: 4 }),
   ]);
   // Counts add; drainMs is the slowest worker's drain, not the sum.
   expect(m.counts).toEqual({ joined: 5, opsSent: 5, echoes: 5, clients: 5, drainMs: 900 });
+  expect(mergeResults([fakeWorker(0, [1], { drainMs: 700 }, {}), fakeWorker(1, [1], { drainMs: 900 }, {})]).counts.drainMs).toBe(900);
   expect(m.closes).toEqual({ 1013: 3, 1006: 4 });
   expect(m.errors).toEqual({ unavailable: 2 });
   expect(m.joinsPerSec).toEqual({ 0: 5 });
@@ -114,6 +116,9 @@ test("live, 2 workers: 100 mixed clients join, every editor op is echoed, tokens
   expect(res.clients).toMatchObject({ planned: 100, joined: 100, neverJoined: 0, connectedAtEnd: 100 });
   // --procs 2: both workers ran their half, merged into one result.
   expect(res.generator.workers.map(w => w.clients)).toEqual([50, 50]);
+  // Each worker's CPU was judged over the load phase only: after the 0.5 s ramp, for the 3 s of load (not from t0).
+  for (const w of res.generator.workers) { expect(w.cpuPct.loadMs).toBeGreaterThan(2500); expect(w.cpuPct.loadMs).toBeLessThan(3250); }
+  expect(res.server.cpuPct.loadMean).toBeGreaterThanOrEqual(0);
   expect(res.join.latencyMs.n).toBe(100);
   expect(res.join.perSecond.reduce((n, x) => n + x.n, 0)).toBe(100);
   // Every editor op echoed (and acked); annotators' too.
@@ -152,7 +157,7 @@ test("live: a server that refuses (user connection cap 2, three viewers on one t
 
 test("valid: a generator late by > 100 ms (p99) or busier than 85% of a core marks the run invalid", () => {
   const counts = { editor: 1, annotator: 0, viewer: 0 }, base = { config: { url: "ws://x", board: "b" }, counts, startedAt: 0, finishedAt: 1 };
-  const w = (lagMs, cpu) => { const r = fakeWorker(0, [1], { joined: 1, clients: 1 }, {}); const lag = new Hist(); for (let i = 0; i < 100; i++) lag.add(lagMs); r.lag = lag.toJSON(); r.cpu = cpu; return r; };
+  const w = (lagMs, cpu) => { const r = fakeWorker(0, [1], { joined: 1, clients: 1 }, {}); const lag = new Hist(); for (let i = 0; i < 100; i++) lag.add(lagMs); r.lag = lag.toJSON(); r.cpu = cpu; r.cpuLoadMean = cpu.reduce((a, b) => a + b, 0) / cpu.length; return r; };
   expect(buildResult({ ...base, merged: mergeResults([w(5, [50, 60])]) })).toMatchObject({ valid: true, invalidReasons: [] });
   const late = buildResult({ ...base, merged: mergeResults([w(150, [50, 60])]) });
   expect(late.valid).toBe(false);

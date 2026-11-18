@@ -10,15 +10,26 @@
 //
 // --clients n splits n like the NFRs: the given editors (default 5), ~2% annotators, the rest viewers.
 // Writes <out>/result.json (schema SCHEMA below) and <out>/report.md. Prints progress lines; never a token.
-// Exit code (exitCode below): 0 = a good run: the generator did not saturate (result.valid) AND every planned
-// client joined at least once (result.clients.complete); 1 = the run finished but is not good (report.md's
-// headline says INVALID or INCOMPLETE and why); 2 = bad arguments or setup (nothing was measured).
+// Exit code (exitCode below): 0 = a good run: the generator did not saturate (result.valid) AND the run is complete
+// (result.complete): every planned client joined at least once (result.clients.complete) and the server answered
+// the ops (result.ops.answered): every op made (counted when made, sent or not) was acked by the drain's end, at
+// least 99% were echoed back to their sender, and each writer role that was due to make ops made at least one. A
+// role is due when it has clients and rate x duration >= 1.5 (its first op comes within 1.5/rate s); a run with no
+// role due (--op-rate 0 and no annotators, viewers only) needs no ops: it is judged on its joins (and any ops made). 1 = the run finished but is
+// not good (report.md's headline says INVALID or INCOMPLETE and why); 2 = bad arguments or setup, or stopped by
+// SIGTERM, SIGINT or SIGHUP (nothing complete was measured). On any of those, and on any setup failure, the
+// --local server and the workers this run started are stopped first; both also exit on their own within about 1 s
+// if this process dies without stopping them (SIGKILL).
+// Arguments: plain decimal numbers only (no 0x1, 1e3, blanks or empty values; --url/--board/--tokens/--out/--rig
+// may not be empty). Counts are whole numbers. Bounds: --editors, --annotators, --viewers, --clients ≤ 1000000;
+// --procs 1-256; --pool 1-10000; --viewers-per-user 1-10000; --ramp 1-100000 clients/s; --duration 1-3600 s;
+// --drain ≤ 600 s; --op-rate, --note-rate, --comment-rate, --cursor-rate ≤ 1000 /s.
 
 import { mkdirSync, writeFileSync, readFileSync, existsSync, mkdtempSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { Hist, addCounts } from "./stats.js";
-import { readTokensByRole, makeTokens, writeTokens } from "./tokens.js";
+import { readTokensByRole, readTokensTable, makeTokens, writeTokens } from "./tokens.js";
 import { startServer, psSample, cpuPct } from "./server.js";
 import { MAX_WRITER_CONNS } from "../../packages/protocol/envelope.js";
 
@@ -30,6 +41,15 @@ const ROLES = ["editor", "annotator", "viewer"];
 // than about the server, so the run is invalid.
 export const LAG_P99_LIMIT_MS = 100;
 export const CPU_MEAN_LIMIT = 85;
+// The server answered the ops: every op made acked by the drain's end, and at least this share echoed to its sender
+// (an echo can be cut off by a resync at the drain's end without loss; an ack cannot: an unacked op is a latency
+// sample missing from the histograms). Ops count when made, not when first written, and a writer role due to make
+// ops must have made some: a server that welcomes everyone and then stalls (no catch-up, so the Replica never
+// writes) or drops everyone for good (every op skipped offline) must not read VALID.
+export const ECHO_FLOOR_PCT = 99;   // integer math: 0.99 * n can round up by one
+// A writer role is due to make ops when rate x duration reaches this: each client's first op comes within 1.5/rate s.
+export const DUE_TICKS = 1.5;
+const WRITER_RATES = { editor: c => c.opRate ?? 0, annotator: c => Math.max(c.noteRate ?? 0, c.commentRate ?? 0) };
 
 const DEFAULTS = { editors: 5, annotators: 0, viewers: 0, ramp: 200, duration: 30, drain: 15, procs: 1, "op-rate": 2, "note-rate": 0.2, "comment-rate": 0.05, "cursor-rate": 5, pool: 20 };
 
@@ -74,11 +94,40 @@ export function planCounts(o) {
   }
   return { editor: editors, annotator: annotators ?? 0, viewer: viewers ?? 0 };
 }
-// Flag values: num for rates and seconds (any finite number ≥ 0), count for how many of something (a whole number ≥
-// min), positive for the ramp (> 0: 0 clients/s would never finish the ramp).
-const num = (v, d) => { if (v === undefined) return d; const n = Number(v); if (!Number.isFinite(n) || n < 0) throw new Error(`not a number ≥ 0: ${v}`); return n; };
-const count = (v, d, name, min = 0) => { if (v === undefined) return d; const n = Number(v); if (!Number.isSafeInteger(n) || n < min) throw new Error(`--${name} must be a whole number ≥ ${min}: ${v}`); return n; };
-const positive = (v, d, name) => { const n = num(v, d); if (!(n > 0)) throw new Error(`--${name} must be > 0: ${v}`); return n; };
+// Flag values: num for rates and seconds (a plain decimal ≥ 0), count for how many of something (a whole number ≥
+// min), atLeast for the ramp (≥ 1 client/s: slower would plan a ramp of hours) and the duration (≥ 1 s: the load
+// phase must be long enough to measure the generator's CPU). Only plain decimals: Number() would also take "",
+// " ", "0x1", "1e3" and "Infinity". Every value has an upper bound (MAX), so no flag plans years.
+export const MAX = { editors: 1e6, annotators: 1e6, viewers: 1e6, clients: 1e6, procs: 256, pool: 10000, "viewers-per-user": 10000, ramp: 100000, duration: 3600, drain: 600, "op-rate": 1000, "note-rate": 1000, "comment-rate": 1000, "cursor-rate": 1000 };
+const STRING_FLAGS = ["url", "board", "tokens", "out", "rig"];
+const blank = v => typeof v === "string" && v.trim() === "";
+const plain = (v, name, re, what) => {
+  if (blank(v)) throw new Error(`--${name} is empty`);
+  if (!re.test(String(v))) throw new Error(`--${name} must be ${what}: ${v}`);
+  const n = Number(v);
+  if (n > MAX[name]) throw new Error(`--${name} must be ≤ ${MAX[name]}: ${v}`);
+  return n;
+};
+const num = (v, d, name) => (v === undefined ? d : plain(v, name, /^(\d+(\.\d*)?|\.\d+)$/, "a number ≥ 0 (plain decimal)"));
+const count = (v, d, name, min = 0) => { if (v === undefined) return d; const n = plain(v, name, /^\d+$/, `a whole number ≥ ${min}`); if (n < min) throw new Error(`--${name} must be a whole number ≥ ${min}: ${v}`); return n; };
+const atLeast = (v, d, name, min, unit) => { const n = num(v, d, name); if (n < min) throw new Error(`--${name} must be ≥ ${min} ${unit}: ${v}`); return n; };
+
+/** Every flag value checked and converted (pure: throws the message run() exits 2 with). */
+export function parseOptions(o) {
+  for (const k of STRING_FLAGS) if (o[k] !== undefined && (typeof o[k] !== "string" || blank(o[k]))) throw new Error(`--${k} is empty`);
+  const counts = planCounts(o);
+  const procs = count(o.procs, DEFAULTS.procs, "procs", 1);
+  const ramp = atLeast(o.ramp, DEFAULTS.ramp, "ramp", 1, "client/s");
+  const duration = atLeast(o.duration, DEFAULTS.duration, "duration", 1, "s"), drain = num(o.drain, DEFAULTS.drain, "drain");
+  const cfg = { opRate: num(o["op-rate"], DEFAULTS["op-rate"], "op-rate"), noteRate: num(o["note-rate"], DEFAULTS["note-rate"], "note-rate"), commentRate: num(o["comment-rate"], DEFAULTS["comment-rate"], "comment-rate"), cursorRate: num(o["cursor-rate"], DEFAULTS["cursor-rate"], "cursor-rate"), pool: count(o.pool, DEFAULTS.pool, "pool", 1) };
+  const viewersPerUser = count(o["viewers-per-user"], 32, "viewers-per-user", 1);
+  return { counts, procs, ramp, duration, drain, cfg, viewersPerUser };
+}
+
+/** The writer roles due to make ops: clients planned and rate x duration ≥ DUE_TICKS (see the header). */
+export function dueRoles(counts, config) {
+  return Object.keys(WRITER_RATES).filter(r => (counts[r] ?? 0) > 0 && WRITER_RATES[r](config ?? {}) * (config?.duration ?? 0) >= DUE_TICKS);
+}
 
 /**
  * Who starts when, in which worker. Editors first (the presenters are there before the audience), then
@@ -132,14 +181,25 @@ export function mergeResults(results) {
     addCounts(m.counts, r.stats.counts); addCounts(m.closes, r.stats.closes); addCounts(m.errors, r.stats.errors); addCounts(m.joinsPerSec, r.stats.joinsPerSec);
     for (const [k, h] of Object.entries(r.stats.hists)) (m.hists[k] ??= new Hist()).merge(h);
     const lag = Hist.fromJSON(r.lag); m.lag.merge(lag);
-    // CPU judged over the load phase (cpuLoad); a run too short to hold a whole 1 s sample there falls back to all.
-    const cpu = r.cpu ?? [], load = r.cpuLoad?.length ? r.cpuLoad : cpu;
-    m.workers.push({ worker: r.worker, pid: r.pid, clients: r.stats.counts.clients ?? 0, lagMs: lag.summary(), cpuPct: { mean: avg(load), meanAllPhases: avg(cpu), max: cpu.length ? Math.max(...cpu) : null, samples: cpu.length, loadSamples: r.cpuLoad?.length ?? 0 } });
+    // CPU judged over the load phase (cpuLoadMean: the worker's marks at its start and end); null = not measured.
+    const cpu = r.cpu ?? [], loadMean = r.cpuLoadMean ?? null;
+    m.workers.push({ worker: r.worker, pid: r.pid, clients: r.stats.counts.clients ?? 0, lagMs: lag.summary(), cpuPct: { mean: loadMean, meanAllPhases: avg(cpu), max: cpu.length ? Math.max(...cpu) : null, samples: cpu.length, loadSamples: r.cpuLoad?.length ?? 0, loadMs: r.cpuLoadMs ?? 0 } });
   }
   if (drainMs !== null) m.counts.drainMs = drainMs;
   return m;
 }
 const avg = a => (a.length ? Math.round((a.reduce((x, y) => x + y, 0) / a.length) * 10) / 10 : null);
+
+/**
+ * result.server for --local: the server's ps samples (psSample) as CPU % of a core, over the whole run (mean, max,
+ * cpuSeries) and over the load phase only (loadMean: samples taken in [loadFrom, genEndAt], after the ramp, before
+ * the drain), and its peak RSS.
+ */
+export function serverStats(pid, samples, loadFrom, genEndAt) {
+  const cpu = cpuPct(samples), rss = samples.map(s => s.rssKb / 1024);
+  const cpuLoad = cpuPct(samples.filter(s => s.at >= loadFrom && s.at <= genEndAt));
+  return { pid, samples: samples.length, cpuPct: { mean: avg(cpu), max: cpu.length ? Math.max(...cpu) : null, loadMean: avg(cpuLoad) }, rssMb: { max: rss.length ? Math.round(Math.max(...rss)) : null }, cpuSeries: cpu };
+}
 
 /** The result.json object (schema SCHEMA). */
 export function buildResult({ merged, config, counts, startedAt, finishedAt, server }) {
@@ -149,7 +209,8 @@ export function buildResult({ merged, config, counts, startedAt, finishedAt, ser
   const reasons = [];
   for (const w of merged.workers) {
     if ((w.lagMs.p99 ?? 0) > LAG_P99_LIMIT_MS) reasons.push(`worker ${w.worker}: event-loop lag p99 ${w.lagMs.p99} ms > ${LAG_P99_LIMIT_MS} ms`);
-    if ((w.cpuPct.mean ?? 0) > CPU_MEAN_LIMIT) reasons.push(`worker ${w.worker}: CPU mean ${w.cpuPct.mean}% of a core > ${CPU_MEAN_LIMIT}%`);
+    if (w.cpuPct.mean === null) reasons.push(`worker ${w.worker}: CPU over the load phase not measured (${w.cpuPct.loadMs} ms of load phase)`);
+    else if (w.cpuPct.mean > CPU_MEAN_LIMIT) reasons.push(`worker ${w.worker}: CPU mean ${w.cpuPct.mean}% of a core > ${CPU_MEAN_LIMIT}%`);
   }
   const close1013 = merged.closes["1013"] ?? 0;
   const otherCloses = Object.entries(merged.closes).filter(([k]) => k !== "1013" && k !== "1000").reduce((n, [, v]) => n + v, 0);
@@ -158,11 +219,15 @@ export function buildResult({ merged, config, counts, startedAt, finishedAt, ser
   // Complete: every planned client got a welcome at least once (a run where some never joined measured a smaller
   // audience than it says, or nothing at all: a wrong URL).
   const complete = planned > 0 && joined === planned && neverJoined === 0;
+  const sent = c.opsSent ?? 0, acked = c.acks ?? 0, echoed = c.echoes ?? 0;
+  const made = Math.max(c.opsMade ?? 0, sent);   // an op is sent only after it is made
+  const due = dueRoles(counts, config), missing = due.filter(r => !(c[`opsMade_${r}`] > 0));
+  const answered = missing.length === 0 && (acked >= made && echoed * 100 >= made * ECHO_FLOOR_PCT);
   return {
     schema: SCHEMA,
     startedAt: new Date(startedAt).toISOString(), finishedAt: new Date(finishedAt).toISOString(),
     config,
-    valid: reasons.length === 0, invalidReasons: reasons,
+    valid: reasons.length === 0, invalidReasons: reasons, complete: complete && answered,
     clients: { planned, byRole: counts, joined, neverJoined, complete, connectedAtEnd: c.connectedAtEnd ?? 0 },
     join: {
       latencyMs: h.join?.summary() ?? new Hist().summary(),
@@ -171,11 +236,12 @@ export function buildResult({ merged, config, counts, startedAt, finishedAt, ser
       firstToLastS: secs.length ? secs[secs.length - 1] - secs[0] + 1 : 0,
     },
     ops: {
+      made: { total: made, editor: c.opsMade_editor ?? 0, annotator: c.opsMade_annotator ?? 0 }, due, missing,
       sent: { total: c.opsSent ?? 0, editor: c.opsSent_editor ?? 0, annotator: c.opsSent_annotator ?? 0 },
       acked: c.acks ?? 0, echoed: { total: c.echoes ?? 0, editor: c.echoes_editor ?? 0, annotator: c.echoes_annotator ?? 0 },
       dropped: c.dropped ?? 0, unanswered: c.unanswered ?? 0, unechoed: c.unechoed ?? 0, unacked: c.unacked ?? 0,
       skippedOffline: c.skippedOffline ?? 0, skippedBacklog: c.skippedBacklog ?? 0, presenceSent: c.presenceSent ?? 0,
-      drainMs: c.drainMs ?? 0,
+      drainMs: c.drainMs ?? 0, answered,
     },
     latencyMs: { ack: byRole("ack"), echo: byRole("echo"), delivery: byRole("delivery") },
     connections: {
@@ -191,12 +257,20 @@ export function buildResult({ merged, config, counts, startedAt, finishedAt, ser
 }
 
 /** The process exit code for a finished run: 0 only for a valid AND complete one (see the header). */
-export function exitCode(r) { return r.valid && r.clients.complete ? 0 : 1; }
+export function exitCode(r) { return r.valid && r.complete ? 0 : 1; }
 
-/** The headline word: INVALID (generator saturated) beats INCOMPLETE (not everyone joined) beats VALID. */
+/** The headline word: INVALID (generator saturated) beats INCOMPLETE (not everyone joined, or the ops not answered) beats VALID. */
 export function headline(r) {
   if (!r.valid) return "INVALID (the load generator saturated)";
   if (!r.clients.complete) return `INCOMPLETE (${r.clients.planned - r.clients.joined} of ${r.clients.planned} planned clients never joined)`;
+  if (!r.ops.answered) {
+    const o = r.ops, why = [], made = o.made?.total ?? o.sent.total;
+    for (const role of o.missing ?? []) why.push(`no ${role} op was made though ${r.clients.byRole[role]} ${role}(s) were due to (${o.skippedOffline} ops skipped offline, ${o.skippedBacklog} for backlog)`);
+    if (o.acked < made) why.push(`${made - o.acked} of ${made} ops made were never acked${made > o.sent.total ? ` (${made - o.sent.total} never sent)` : ""}`);
+    if (o.echoed.total * 100 < made * ECHO_FLOOR_PCT) why.push(`${made - o.echoed.total} of ${made} were never echoed to their sender`);
+    return `INCOMPLETE (${why.join("; ")})`;
+  }
+  if (!r.complete) return "INCOMPLETE";
   return "VALID";
 }
 
@@ -206,7 +280,7 @@ const fmt = s => (s.n ? `${s.p50} / ${s.p95} / ${s.p99} / ${s.max} (n=${s.n})` :
 export function renderReport(r) {
   const L = [];
   L.push(`# Load run ${r.startedAt}`, "");
-  L.push(`**${headline(r)}** · ${r.clients.joined}/${r.clients.planned} clients joined · ${r.ops.echoed.total}/${r.ops.sent.total} ops echoed · ${r.connections.close1013} closes 1013`, "");
+  L.push(`**${headline(r)}** · ${r.clients.joined}/${r.clients.planned} clients joined · ${r.ops.echoed.total}/${r.ops.made.total} ops echoed · ${r.connections.close1013} closes 1013`, "");
   if (!r.valid) { for (const x of r.invalidReasons) L.push(`- ${x}`); L.push(""); }
   L.push(`Target ${r.config.url} board ${r.config.board} · ${r.config.procs} worker(s) · ramp ${r.config.ramp}/s · duration ${r.config.duration} s · drain ${r.config.drain} s`, "");
   L.push("| Clients | editors | annotators | viewers | joined | never joined | connected at end |", "|---|---|---|---|---|---|---|");
@@ -215,13 +289,13 @@ export function renderReport(r) {
   for (const k of ["ack", "echo", "delivery"]) L.push(`| ${k} | ${ROLES.map(x => fmt(r.latencyMs[k][x])).join(" | ")} |`);
   L.push(`| join (hello → welcome) | ${fmt(r.join.latencyMs)} | | |`, "");
   L.push(`Joins: peak ${r.join.peakPerSecond}/s, first to last ${r.join.firstToLastS} s.`, "");
-  L.push("| Ops | sent | acked | echoed | dropped | unanswered | unechoed | skipped (offline / backlog) |", "|---|---|---|---|---|---|---|---|");
-  L.push(`| | ${r.ops.sent.total} (e ${r.ops.sent.editor}, a ${r.ops.sent.annotator}) | ${r.ops.acked} | ${r.ops.echoed.total} | ${r.ops.dropped} | ${r.ops.unanswered} | ${r.ops.unechoed} | ${r.ops.skippedOffline} / ${r.ops.skippedBacklog} |`, "");
+  L.push("| Ops | made | sent | acked | echoed | dropped | unanswered | unechoed | skipped (offline / backlog) |", "|---|---|---|---|---|---|---|---|---|");
+  L.push(`| | ${r.ops.made.total} | ${r.ops.sent.total} (e ${r.ops.sent.editor}, a ${r.ops.sent.annotator}) | ${r.ops.acked} | ${r.ops.echoed.total} | ${r.ops.dropped} | ${r.ops.unanswered} | ${r.ops.unechoed} | ${r.ops.skippedOffline} / ${r.ops.skippedBacklog} |`, "");
   const cn = r.connections;
   L.push(`Connections: ${cn.connects} opened, ${cn.welcomes} welcomes (${cn.rejoins} rejoins), ${cn.reconnects} reconnects, ${cn.resyncs} resyncs, ${cn.wsErrors} socket errors. Closes by code: ${JSON.stringify(cn.closes)}. Errors by code: ${JSON.stringify(cn.errors)}.`, "");
   L.push("| Generator worker | clients | lag p50 / p99 / max ms | CPU mean / max % of a core |", "|---|---|---|---|");
   for (const w of r.generator.workers) L.push(`| ${w.worker} | ${w.clients} | ${w.lagMs.p50} / ${w.lagMs.p99} / ${w.lagMs.max} | ${w.cpuPct.mean} / ${w.cpuPct.max} |`);
-  if (r.server) L.push("", `Server (pid ${r.server.pid}): CPU mean ${r.server.cpuPct.mean}% / max ${r.server.cpuPct.max}% of a core, RSS max ${r.server.rssMb.max} MB (${r.server.samples} ps samples).`);
+  if (r.server) L.push("", `Server (pid ${r.server.pid}): CPU mean over the load phase ${r.server.cpuPct.loadMean}% (whole run ${r.server.cpuPct.mean}%) / max ${r.server.cpuPct.max}% of a core, RSS max ${r.server.rssMb.max} MB (${r.server.samples} ps samples).`);
   return L.join("\n") + "\n";
 }
 
@@ -234,7 +308,7 @@ export function renderReport(r) {
  */
 export async function createBoard(wsUrl, tokensPath) {
   const base = wsUrl.replace(/^ws/, "http").replace(/\/ws\/?$/, "");
-  const table = JSON.parse(readFileSync(tokensPath, "utf8"));
+  const table = readTokensTable(tokensPath);   // never the parser's message: it can quote a token
   const admin = Object.entries(table).find(([, t]) => t?.admin === true && t.domain);
   if (!admin) throw new Error("--create-board needs a token with admin: true and a domain in the tokens file");
   const call = async (method, path, body) => {
@@ -252,11 +326,12 @@ export async function createBoard(wsUrl, tokensPath) {
   return id;
 }
 
-function spawnWorker(job, nofile, onProgress) {
+function spawnWorker(job, nofile, onProgress, onChild) {
   return new Promise((resolveP, reject) => {
     let done = false;
     const child = Bun.spawn(["sh", "-c", `ulimit -n ${nofile} 2>/dev/null; exec "$0" "$1"`, process.execPath, WORKER], {
       stdio: ["ignore", "inherit", "inherit"], serialization: "json",
+      env: { ...process.env, PLENARY_LOAD_PARENT: String(process.pid) },   // the worker's orphan watch (worker.js)
       ipc(msg) {
         if (msg.type === "ready") child.send(job);
         else if (msg.type === "progress") onProgress?.(msg);
@@ -264,41 +339,64 @@ function spawnWorker(job, nofile, onProgress) {
         else if (msg.type === "fail") { done = true; reject(new Error(`worker ${job.worker}: ${msg.message}`)); }
       },
     });
+    onChild?.(child);
     child.exited.then(code => { if (!done) reject(new Error(`worker ${job.worker} exited (${code}) without a result`)); });
   });
 }
 
-/** Run a whole load test. Returns the result object (also written to out/ when `out` is set). */
-export async function run(o, { log = s => console.log(s) } = {}) {
+/** Stop child processes: SIGTERM, then SIGKILL after 5 s; resolves when all have exited. */
+async function stopChildren(children) {
+  await Promise.all([...children].map(async c => {
+    if (c.exitCode !== null || c.signalCode) return;
+    try { c.kill("SIGTERM"); } catch { /* gone */ }
+    const t = setTimeout(() => { try { c.kill("SIGKILL"); } catch { /* gone */ } }, 5000);
+    await c.exited; clearTimeout(t);
+  }));
+}
+
+export const STOP_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"];
+
+/**
+ * Run a whole load test. Returns the result object (also written to out/ when `out` is set).
+ * Every child process it starts (the --local server, the workers) is stopped before it returns or throws, and, with
+ * `signals: true` (the CLI), on SIGTERM, SIGINT or SIGHUP, after which the process exits 2.
+ */
+export async function run(o, { log = s => console.log(s), signals = false } = {}) {
   let server = null, serverSamples = null;
   let url = o.url, tokensPath = o.tokens, board = o.board;
   if (o.rig) { const r = rigConfig(o.rig); url ??= r.url; tokensPath ??= r.tokens; board ??= r.board; }
-  const counts = planCounts(o);
-  const out = o.out ? resolve(o.out) : null;
-  if (out) mkdirSync(out, { recursive: true });
-  const procs = count(o.procs, DEFAULTS.procs, "procs", 1);
-  const ramp = positive(o.ramp, DEFAULTS.ramp, "ramp");
-  const duration = num(o.duration, DEFAULTS.duration), drain = num(o.drain, DEFAULTS.drain);
-  const cfg = { opRate: num(o["op-rate"], DEFAULTS["op-rate"]), noteRate: num(o["note-rate"], DEFAULTS["note-rate"]), commentRate: num(o["comment-rate"], DEFAULTS["comment-rate"]), cursorRate: num(o["cursor-rate"], DEFAULTS["cursor-rate"]), pool: count(o.pool, DEFAULTS.pool, "pool", 1) };
-  const viewersPerUser = count(o["viewers-per-user"], 32, "viewers-per-user", 1);
+  const { counts, procs, ramp, duration, drain, cfg, viewersPerUser } = parseOptions(o);
   const total = counts.editor + counts.annotator + counts.viewer;
   if (total < 1) throw new Error("no clients planned: give --clients, --editors, --annotators or --viewers");
   const fd = fdCheck(Math.ceil(total / procs));
   if (!fd.ok) throw new Error(fd.message);
+  const out = o.out ? resolve(o.out) : null;
+  if (out) mkdirSync(out, { recursive: true });
 
-  if (o.local) {
-    const dir = out ?? mkdtempSync(join(tmpdir(), "plenary-load-"));
-    if (!tokensPath) tokensPath = writeTokens(join(dir, "tokens"), makeTokens({ editors: counts.editor, annotators: counts.annotator, viewers: counts.viewer, viewersPerUser })).jsonPath;
-    else readTokensByRole(tokensPath);   // a bad tokens file stops here, before a server waits on it
-    server = await startServer({ tokensPath, env: o.serverEnv ?? {}, nofile: Math.max(fd.nofile, total + 1024), logPath: join(dir, "server.log") });
-    url = server.wsUrl; if (!o["create-board"]) board ??= server.board;
-    log(`local server pid ${server.pid} on port ${server.port}, board ${server.board}, log ${join(dir, "server.log")}`);
-  }
-  let boardCreated = false;
-  if (o["create-board"] && url && tokensPath) { board = await createBoard(url, tokensPath); boardCreated = true; log(`created board ${board}`); }
-  if (!url || !tokensPath || !board) throw new Error("need --url, --tokens and --board or --create-board (or --rig <dir>, or --local)");
-
+  // Every child this run starts, until it exits: stopped on the way out, whatever the way.
+  const children = new Set();
+  const track = c => { children.add(c); c.exited.then(() => children.delete(c)); };
+  let stopping = false;
+  const handlers = signals ? STOP_SIGNALS.map(sig => [sig, () => {
+    if (stopping) return; stopping = true;
+    log(`load: ${sig}: stopping ${children.size} child process(es)`);
+    if (server?.sampler) clearInterval(server.sampler);
+    stopChildren(children).finally(() => process.exit(2));
+  }]) : [];
+  for (const [sig, h] of handlers) process.on(sig, h);
   try {
+    if (o.local) {
+      const dir = out ?? mkdtempSync(join(tmpdir(), "plenary-load-"));
+      if (!tokensPath) tokensPath = writeTokens(join(dir, "tokens"), makeTokens({ editors: counts.editor, annotators: counts.annotator, viewers: counts.viewer, viewersPerUser })).jsonPath;
+      else readTokensByRole(tokensPath);   // a bad tokens file stops here, before a server waits on it
+      server = await startServer({ tokensPath, env: o.serverEnv ?? {}, nofile: Math.max(fd.nofile, total + 1024), logPath: join(dir, "server.log"), onChild: track });
+      url = server.wsUrl; if (!o["create-board"]) board ??= server.board;
+      log(`local server pid ${server.pid} on port ${server.port}, board ${server.board}, log ${join(dir, "server.log")}`);
+    }
+    let boardCreated = false;
+    if (o["create-board"] && url && tokensPath) { board = await createBoard(url, tokensPath); boardCreated = true; log(`created board ${board}`); }
+    if (!url || !tokensPath || !board) throw new Error("need --url, --tokens and --board or --create-board (or --rig <dir>, or --local)");
+
     const tokensByRole = readTokensByRole(tokensPath);
     const { jobs, viewersPerToken } = planClients(counts, { ramp, procs, tokensByRole });
     const rampMs = Math.ceil((total * 1000) / ramp);
@@ -307,6 +405,8 @@ export async function run(o, { log = s => console.log(s) } = {}) {
     const config = { url, board, boardCreated, procs, ramp, duration, drain, viewersPerToken, ...cfg, rampMs, nofile: fd.nofile };
     log(`plan: ${counts.editor} editors, ${counts.annotator} annotators, ${counts.viewer} viewers over ${procs} worker(s); ramp ${rampMs} ms, then ${duration} s, then drain ≤ ${drain} s`);
 
+    // Server CPU, sampled every second; the load phase's share (after the ramp, before the drain) is reported apart.
+    const loadFrom = t0 + rampMs;
     if (server) {
       serverSamples = [];
       const timer = setInterval(() => { const s = psSample(server.pid); if (s) serverSamples.push(s); }, 1000);
@@ -321,13 +421,13 @@ export async function run(o, { log = s => console.log(s) } = {}) {
       let joined = 0, ops = 0; for (const x of progress.values()) { joined += x.joined; ops += x.opsSent; }
       log(`  t+${Math.round((Date.now() - t0) / 1000)} s: ${joined}/${total} joined, ${ops} ops sent`);
     };
-    const results = await Promise.all(jobs.map((clients, worker) => spawnWorker({ url, board, tokensPath, t0, loadFrom: t0 + rampMs, genEndAt, drainMs: drain * 1000, clients, cfg, worker }, fd.nofile, onProgress)));
+    const onWorker = c => { track(c); log(`worker pid ${c.pid}`); };
+    const results = await Promise.all(jobs.map((clients, worker) => spawnWorker({ url, board, tokensPath, t0, loadFrom, genEndAt, drainMs: drain * 1000, clients, cfg, worker }, fd.nofile, onProgress, onWorker)));
     const finishedAt = Date.now();
     let serverInfo = null;
     if (server) {
       clearInterval(server.sampler);
-      const cpu = cpuPct(serverSamples), rss = serverSamples.map(s => s.rssKb / 1024);
-      serverInfo = { pid: server.pid, samples: serverSamples.length, cpuPct: { mean: avg(cpu), max: cpu.length ? Math.max(...cpu) : null }, rssMb: { max: rss.length ? Math.round(Math.max(...rss)) : null }, cpuSeries: cpu };
+      serverInfo = serverStats(server.pid, serverSamples, loadFrom, genEndAt);
     }
     const result = buildResult({ merged: mergeResults(results), config, counts, startedAt, finishedAt, server: serverInfo });
     if (out) {
@@ -337,7 +437,10 @@ export async function run(o, { log = s => console.log(s) } = {}) {
     }
     return result;
   } finally {
-    if (server) { if (server.sampler) clearInterval(server.sampler); await server.stop(); }
+    for (const [sig, h] of handlers) process.off(sig, h);
+    if (server?.sampler) clearInterval(server.sampler);
+    if (server) await server.stop();
+    await stopChildren(children);   // anything still running: a setup failure, a failed sibling worker
   }
 }
 
@@ -346,7 +449,7 @@ if (import.meta.main) {
   try { o = parseArgs(process.argv.slice(2)); } catch (err) { console.error(String(err.message)); process.exit(2); }
   if (o.help) { console.log((() => { const ls = readFileSync(import.meta.path, "utf8").split("\n"); return ls.slice(0, ls.findIndex(l => !l.startsWith("//"))).map(l => l.slice(3)).join("\n"); })()); process.exit(0); }
   try {
-    const r = await run(o);
+    const r = await run(o, { signals: true });
     console.log(renderReport(r));
     process.exit(exitCode(r));
   } catch (err) { console.error(`load: ${err.message}`); process.exit(2); }

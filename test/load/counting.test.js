@@ -94,6 +94,7 @@ test("the drain waits out an ack held after the entry, and reports ops never ack
   expect(c.acks).toBe(c.opsSent_editor);          // the held acks arrived during the drain and were counted
   expect(c.unacked).toBe(c.opsSent_annotator);    // exactly the ops never acked
   expect(c.drainMs).toBeGreaterThanOrEqual(drainMs - 50);   // it waited the whole drain for them
+  expect(c.drainMs).toBeLessThan(drainMs + 1000);           // and the drain only: from t0 it would be ~5.2 s
 }, 15000);
 
 // ---- saturation, measured by the worker's own samplers (V11, V12, finding 8) ----
@@ -168,14 +169,15 @@ test("fdCheck refuses more clients per worker than one process may open, and nam
 // ---- a run nobody (or not everybody) joined is not VALID and exits non-zero (finding 7) ----
 
 test("headline and exit code: VALID and 0 only when the generator was fine and every planned client joined", () => {
-  const r = (valid, planned, joined) => ({ valid, clients: { planned, joined, complete: planned > 0 && joined === planned } });
+  const ops = { sent: { total: 0 }, acked: 0, echoed: { total: 0 }, answered: true };
+  const r = (valid, planned, joined) => ({ valid, complete: planned > 0 && joined === planned, clients: { planned, joined, complete: planned > 0 && joined === planned }, ops });
   expect([headline(r(true, 4, 4)), exitCode(r(true, 4, 4))]).toEqual(["VALID", 0]);
   expect([headline(r(true, 4, 3)), exitCode(r(true, 4, 3))]).toEqual(["INCOMPLETE (1 of 4 planned clients never joined)", 1]);
   expect([headline(r(true, 1, 0)), exitCode(r(true, 1, 0))]).toEqual(["INCOMPLETE (1 of 1 planned clients never joined)", 1]);
   expect(exitCode(r(false, 4, 4))).toBe(1);
   expect(headline(r(false, 4, 0))).toStartWith("INVALID");
   // buildResult sets complete from the counts.
-  const m = mergeResults([{ worker: 0, pid: 1, cpu: [], lag: { n: 0, sum: 0, counts: [] }, stats: { counts: { joined: 2, neverJoined: 1, clients: 3 }, closes: {}, errors: {}, hists: {}, joinsPerSec: {} } }]);
+  const m = mergeResults([{ worker: 0, pid: 1, cpu: [], cpuLoadMean: 10, cpuLoadMs: 1000, lag: { n: 0, sum: 0, counts: [] }, stats: { counts: { joined: 2, neverJoined: 1, clients: 3 }, closes: {}, errors: {}, hists: {}, joinsPerSec: {} } }]);
   const res = buildResult({ merged: m, config: { url: "ws://x", board: "b" }, counts: { editor: 1, annotator: 0, viewer: 2 }, startedAt: 0, finishedAt: 1 });
   expect(res.clients).toMatchObject({ planned: 3, joined: 2, neverJoined: 1, complete: false });
   expect(res.valid).toBe(true);
@@ -202,7 +204,7 @@ test("arguments: --ramp 0 and fractional counts are refused before anything star
   expect(() => planCounts({ viewers: "-1" })).toThrow(/--viewers must be a whole number/);
   expect(planCounts({ editors: "2", viewers: "3" })).toEqual({ editor: 2, annotator: 0, viewer: 3 });
   const base = { local: true, editors: "1", duration: "1" };
-  await expect(run({ ...base, ramp: "0" }, { log: () => {} })).rejects.toThrow("--ramp must be > 0: 0");
+  await expect(run({ ...base, ramp: "0" }, { log: () => {} })).rejects.toThrow("--ramp must be ≥ 1 client/s: 0");
   await expect(run({ ...base, procs: "1.5" }, { log: () => {} })).rejects.toThrow(/--procs must be a whole number ≥ 1/);
   await expect(run({ ...base, procs: "0" }, { log: () => {} })).rejects.toThrow(/--procs must be a whole number ≥ 1/);
   await expect(run({ ...base, pool: "2.5" }, { log: () => {} })).rejects.toThrow(/--pool must be a whole number ≥ 1/);

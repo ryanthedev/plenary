@@ -17,11 +17,13 @@ curl -s http://127.0.0.1:8080/health                    # 200 + JSON
 
 ## What runs today
 
-- **Endpoints:** `GET /health` and the WebSocket at `/ws`. There is no web page on port 8080 yet: the server does
-  not serve `web/`, and `POST /boards` and Google sign-in are not wired into `server/main.js`.
+- **Endpoints:** `GET /health`, the WebSocket at `/ws`, `POST /boards` (and the board invite and link routes), and
+  Google sign-in at `/auth/*` (`server/auth/http.js`, mounted by `server/main.js`; the `/auth` routes answer 503
+  unless both `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are set). There is no web page on port 8080 yet: the
+  server does not serve `web/`.
 - **Without dev tokens** every `hello` is refused, so no client can join. The log says so at start.
-- **With dev tokens** the server creates one dev board at start and logs its id (`dev tokens are ON`). Boards live
-  in an in-memory registry, so the board id changes on every restart, although the op log in SQLite survives.
+- **With dev tokens** the server creates one dev board on its first start and logs its id each start (`dev tokens are ON`). The
+  registry is SQLite in `<data>/registry.db` and the board id is kept in `<data>/dev-board.json`, so restarts reuse it.
 
 ## Environment
 

@@ -41,15 +41,23 @@ export function writeTokens(dir, tokens) {
 }
 
 /**
+ * Read a tokens file as its JSON object ({ token: { name, role, domain?, admin? } }). The one place a tokens file is
+ * parsed: errors carry the path only, never the parser's message (it can quote the file's text, and that is tokens).
+ */
+export function readTokensTable(path) {
+  let table;
+  try { table = JSON.parse(readFileSync(path, "utf8")); } catch (err) { if (err?.code) throw err; throw new Error(`tokens file ${path} is not valid JSON`); }
+  if (!table || typeof table !== "object" || Array.isArray(table)) throw new Error(`tokens file ${path} is not a JSON object of token → { name, role }`);
+  return table;
+}
+
+/**
  * Read a tokens file and group its tokens by role, in a stable order (by user name). Accepts the dev-tokens JSON
  * object ({ token: { name, role } }; a missing role is "editor", as the server reads it).
  * @returns {{ editor: string[], annotator: string[], viewer: string[], owner: string[], commenter: string[] }}
  */
 export function readTokensByRole(path) {
-  // The parser's message is not passed on: it can quote the file's text, and that text is tokens.
-  let table;
-  try { table = JSON.parse(readFileSync(path, "utf8")); } catch (err) { if (err?.code) throw err; throw new Error(`tokens file ${path} is not valid JSON`); }
-  if (!table || typeof table !== "object" || Array.isArray(table)) throw new Error(`tokens file ${path} is not a JSON object of token → { name, role }`);
+  const table = readTokensTable(path);
   const out = { owner: [], editor: [], annotator: [], commenter: [], viewer: [] };
   const entries = Object.entries(table).sort((a, b) => String(a[1]?.name).localeCompare(String(b[1]?.name), "en", { numeric: true }));
   for (const [tok, t] of entries) (out[t?.role ?? "editor"] ?? out.editor).push(tok);

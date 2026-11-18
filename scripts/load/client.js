@@ -9,6 +9,8 @@
 //              a new thread every 400 replies: under the 500-per-thread cap), cursors at cursorRate/s
 //   viewer     receives only
 //
+// Counted: opsMade when an op is made (local()), opsSent when it is first written to a socket, acks and echoes once
+// per op. run.js judges the ops answered against opsMade.
 // Measured, into the worker's shared `stats` (scripts/load/stats.js histograms, mergeable across processes):
 //   join     hello sent → welcome (ms), per connection
 //   ack      op first written to the socket → its ack (ms), per sender role
@@ -166,7 +168,7 @@ export class LoadClient {
     if (!this.canWrite()) return;
     const i = this.seq++ % this.cfg.pool;
     const el = makeElement("rectangle", { id: `${this.name}-${stream[0]}${i}`, x: (this.seq * 7) % 2000, y: i * 40, width: 30, height: 30 });
-    this.replica.local(stream, { elements: [el] });
+    this.replica.local(stream, { elements: [el] }); this.made();
     this.flush();
   }
 
@@ -177,6 +179,7 @@ export class LoadClient {
       this.thread = id; this.replies = 0;
       this.replica.local("records", { do: "thread", id, anchor: { point: { x: this.seq, y: 0 } }, text: "load" });
     } else { this.replies++; this.replica.local("records", { do: "reply", id, thread: this.thread, text: "load" }); }
+    this.made();
     this.flush();
   }
 
@@ -186,6 +189,10 @@ export class LoadClient {
     ws.send(jsonCodec.encode({ t: "presence", k: "cursor", x: Math.random() * 1000, y: Math.random() * 1000 }));
     this.stats.count("presenceSent");
   }
+
+  // Counted when made (local()), not when first written: an op the Replica never gets to send (a welcome with no
+  // catch-up after it, a connection that never comes back) is still an op the server did not answer.
+  made() { this.stats.count("opsMade"); this.stats.count("opsMade_" + this.role); }
 
   pendingCount() { return this.replica.pending.size; }
 

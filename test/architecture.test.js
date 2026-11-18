@@ -46,6 +46,9 @@ const COMPOSITION_ROOTS = [
   "server/main.js",
   "scripts/dev-google.js",        // dev harness, self-described composition root for a local Google sign-in check (p5-google)
   "scripts/admin-bootstrap.js",   // platform: tenant bootstrap CLI; its core part, server/admin/tenants.js, imports only ports
+  "scripts/cluster-rig.js",       // platform (p8-rig): local cluster rig CLI; spawns processes, imports no project module
+  "scripts/load/run.js", "scripts/load/worker.js", "scripts/load/tokens.js", "scripts/load/client.js", "scripts/load/server.js",
+  "scripts/load/stats.js",        // platform (p8-load): load client; run.js and worker.js are entry points, the rest their modules
 ];
 /** Files in adapter folders that are not adapters (explicit; anything else there is an adapter). */
 const NOT_ADAPTERS = {

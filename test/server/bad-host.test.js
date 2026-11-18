@@ -42,3 +42,16 @@ test("malformed Host headers answer 400 with no stack and no error log line; the
     expect((await fetch(app.server.url + "/health")).status).toBe(200);
   } finally { await app.stop(); }
 });
+
+test("two servers in one process each log their own bad-Host line (the limiter is per server)", async () => {
+  const [a, b] = [[], []];
+  const d2 = mkdtempSync(join(tmpdir(), "plenary-badhost2-"));
+  const one = await start({ PLENARY_DATA_DIR: dir, PORT: "0", LOG_LEVEL: "debug" }, { write: l => a.push(l) });
+  const two = await start({ PLENARY_DATA_DIR: d2, PORT: "0", LOG_LEVEL: "debug" }, { write: l => b.push(l) });
+  try {
+    const bad = "GET /health HTTP/1.1\r\nHost: localhost:99999\r\n\r\n";
+    await raw(one.server.port, bad);
+    await raw(two.server.port, bad);
+    for (const lines of [a, b]) expect(lines.join("").split("\n").filter(l => l.includes("bad request")).length).toBe(1);
+  } finally { await one.stop(); await two.stop(); rmSync(d2, { recursive: true, force: true }); }
+});

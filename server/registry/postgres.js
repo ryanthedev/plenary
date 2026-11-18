@@ -110,6 +110,7 @@ const REGISTRY_TABLE_DDL = {
 };
 /** Index name → "table (columns)"; created after the tables, only if missing (to_regclass), like the tables. */
 export const REGISTRY_INDEXES = {
+  reg_tenant_admins_member: "reg_tenant_admins (member)",
   reg_invites_board: "reg_invites (board, email)",
   reg_links_board: "reg_links (board)",
 };
@@ -236,9 +237,10 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       const r = await one(db, `SELECT id FROM ${T} WHERE domain = $1`, [domain.toLowerCase()]);
       return r ? getTenant(db, r.id) : null;
     },
-    async isTenantAdmin(user) {
+    async tenantAdminsAmong(users) {
       ready();
-      return key(user) && !!(await one(db, `SELECT 1 AS x FROM ${A} WHERE member = $1 LIMIT 1`, [user]));
+      const rows = await db.unsafe(`SELECT DISTINCT member FROM ${A} WHERE member IN (SELECT jsonb_array_elements_text($1::jsonb))`, [JSON.stringify(users.filter(key))]);
+      return rows.map(r => r.member);
     },
     async addTenantAdmin(tenant, user) {
       ready();

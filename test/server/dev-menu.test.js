@@ -144,19 +144,32 @@ test("HOST reaches the gate: HOST=127.1 binds loopback but is not on the allowed
   } finally { await app.stop(); }
 });
 
-test("a dev name that is a tenant admin in the persistent Registry is never offered, whichever run made it admin", async () => {
+test("a dev name that is a tenant admin in the persistent Registry is never offered, whichever run made it admin (and the log says so)", async () => {
   const dir = tempDir();
   const e = tokens => ({ PLENARY_DATA_DIR: dir, PORT: "0", LOG_LEVEL: "error", PLENARY_DEV_TOKENS: JSON.stringify(tokens) });
   // Run 1: an admin token makes dev:ann a tenant admin (stored in the Registry).
   let app = await start(e({ "SECRET-ADM": { name: "ann", domain: "acme.test", admin: true } }));
   await app.stop();
   // Run 2: the same data dir, only a plain token for ann plus ada.
-  app = await start(e({ "tok-plain": { name: "ann", role: "editor" }, "tok-a": { name: "ada", role: "owner" } }));
+  const lines = [];
+  app = await start({ ...e({ "tok-plain": { name: "ann", role: "editor" }, "tok-a": { name: "ada", role: "owner" } }), LOG_LEVEL: "warn" }, { write: l => lines.push(l) });
   try {
     const body = await (await get(app)).json();
     expect(body.users.map(u => u.name)).toEqual(["ada"]);
     expect(JSON.stringify(body)).not.toContain("tok-plain");
+    // The start-up line is true: one user published, ann named as left out.
+    const got = lines.join("");
+    expect(got).toContain("ann is a tenant admin in the registry, so it is not offered");
+    expect(JSON.parse(got.split("\n").find(l => l.includes("dev sign-in menu is ON")))).toMatchObject({ users: 1 });
   } finally { await app.stop(); }
+  // Only an admin name left: the menu is OFF at start, with the reason, and the route is 404.
+  const l2 = [];
+  const off = await start({ ...e({ "tok-plain": { name: "ann", role: "editor" } }), LOG_LEVEL: "warn" }, { write: l => l2.push(l) });
+  try {
+    expect((await get(off)).status).toBe(404);
+    expect(l2.join("")).toContain("is OFF: no dev token is offerable");
+    expect(l2.join("")).not.toContain("dev sign-in menu is ON");
+  } finally { await off.stop(); }
 });
 
 test("scripts/admin-bootstrap.js --admin dev:<name>, run AFTER the server started, takes that name off the menu at once", async () => {
@@ -170,10 +183,43 @@ test("scripts/admin-bootstrap.js --admin dev:<name>, run AFTER the server starte
   } finally { await app.stop(); }
 });
 
+test("a name the Registry removes after start is warned about once per name, not per request; nobody left: 404 with that warn", async () => {
+  const dir = tempDir(), lines = [];
+  const app = await start({ PLENARY_DATA_DIR: dir, PORT: "0", LOG_LEVEL: "warn", PLENARY_DEV_TOKENS: JSON.stringify({ "t-bo": { name: "bo" } }) }, { write: l => lines.push(l) });
+  try {
+    expect((await get(app)).status).toBe(200);
+    await bootstrap(["--domain", "acme.test", "--admin", "dev:bo"], { PLENARY_DATA_DIR: dir }, { out() {}, err() {} });
+    for (let i = 0; i < 4; i++) expect((await get(app)).status).toBe(404);
+    expect(lines.join("").split("\n").filter(l => l.includes("bo is a tenant admin in the registry")).length).toBe(1);
+  } finally { await app.stop(); }
+});
+
+test("a slow Registry gets 503 within the bound (not a dropped connection), with one short warn and no token in it", async () => {
+  const { httpRoutes } = await import("../../server/auth/http.js");
+  const { memoryRegistry } = await import("../../server/auth/registry.js");
+  const { sessions } = await import("../../server/auth/session.js");
+  const { tenancy } = await import("../../server/auth/tenancy.js");
+  const { devAuth } = await import("../../server/auth/dev.js");
+  const registry = { ...memoryRegistry({ now: Date.now }), tenantAdminsAmong: () => new Promise(() => {}) };
+  const warns = [];
+  const handle = httpRoutes({ registry, sessions: await sessions({ key: "s".repeat(32) }), tenancy: tenancy({ registry }), dev: devAuth({ enabled: true, tokens: { "SECRET-t": { name: "ada" } } }),
+    config: { cookieKey: "k".repeat(32), postLoginUrl: "http://localhost:1/", boardUrl: "http://localhost:1/?board={board}", publicUrl: "http://localhost:1",
+      devSignIn: { board: "b-1", users: [{ name: "ada", token: "SECRET-t", role: "owner" }], hosts: ["localhost"], waitMs: 50 } },
+    log: { warn: (m, f) => warns.push([m, f]) } });
+  const t0 = Date.now();
+  const res = await handle(new Request("http://localhost:1/auth/dev", { headers: { host: "localhost:1" } }));
+  expect(res.status).toBe(503);
+  expect(Date.now() - t0).toBeLessThan(1000);
+  await handle(new Request("http://localhost:1/auth/dev", { headers: { host: "localhost:1" } }));
+  expect(warns.length).toBe(1);                                   // rate-limited
+  expect(JSON.stringify(warns)).not.toMatch(/SECRET|stack/);
+  expect(warns[0][0]).toContain("did not answer in time");
+});
+
 test("a Registry that cannot answer publishes nothing (fails closed)", async () => {
   const app = await start(env({ PLENARY_DEV_TOKENS: TOK }));
   try {
-    app.registry.isTenantAdmin = async () => { throw new Error("down"); };
+    app.registry.tenantAdminsAmong = async () => { throw new Error("down"); };
     expect((await get(app)).status).toBe(503);
   } finally { await app.stop(); }
 });

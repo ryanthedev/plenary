@@ -42,7 +42,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const id = typeof domain === "string" ? byDomain.get(domain.toLowerCase()) : undefined;
       return id ? copy(tenants.get(id)) : null;
     },
-    async isTenantAdmin(user) { return [...tenants.values()].some(t => t.admins.includes(String(user))); },
+    async tenantAdminsAmong(users) { const all = new Set([...tenants.values()].flatMap(t => t.admins)); return [...new Set(users.map(String))].filter(u => all.has(u)); },
     async addTenantAdmin(tenant, user) {
       const t = tenants.get(tenant);
       if (!t) throw new Error("registry: no such tenant");

@@ -348,6 +348,11 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
       if (!t || typeof t.name !== "string" || !t.name || privileged.has(t.name) || offered.has(t.name)) continue;
       offered.set(t.name, { name: t.name, token, role: best.get("dev:" + t.name) });
     }
+    // The same Registry filter the route runs per request (server/auth/http.js), so the count below is true at start.
+    if (offered.size) {
+      const admins = new Set(await registry.tenantAdminsAmong([...offered.keys()].map(n => "dev:" + n)));
+      for (const n of [...offered.keys()]) if (admins.has("dev:" + n)) { offered.delete(n); log.warn(`dev sign-in menu: ${n} is a tenant admin in the registry, so it is not offered`); }
+    }
     off = devMenuOff({ users: offered.size, host, google: !!oidc, gateway: roles.gateway, publicHost: publicHostOf(env.PUBLIC_URL) });
   }
   if (dev.enabled && !roles.gateway) log.warn("dev tokens are on, but the dev sign-in menu (GET /auth/dev) is OFF: " + off + " (no dev board on this node)", { host });

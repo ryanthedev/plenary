@@ -89,6 +89,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       n INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES reg_boards(id),
       email TEXT NOT NULL, role TEXT NOT NULL, expires_at INTEGER, revoked INTEGER NOT NULL, by_user TEXT,
       created_at INTEGER NOT NULL)`);
+    db.run("CREATE INDEX IF NOT EXISTS reg_tenant_admins_member ON reg_tenant_admins (member)");
     db.run("CREATE INDEX IF NOT EXISTS reg_invites_board ON reg_invites (board, email)");
     db.run(`CREATE TABLE IF NOT EXISTS reg_links (
       n INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES reg_boards(id),
@@ -106,7 +107,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     tenantExists: db.query("SELECT 1 AS x FROM reg_tenants WHERE id = ?"),
     insTenant: db.query("INSERT INTO reg_tenants (id, domain, created_at) VALUES (?, ?, ?)"),
     admins: db.query("SELECT member FROM reg_tenant_admins WHERE tenant = ? ORDER BY n"),
-    adminAny: db.query("SELECT 1 AS x FROM reg_tenant_admins WHERE member = ? LIMIT 1"),
+    adminsAmong: db.query("SELECT DISTINCT member FROM reg_tenant_admins WHERE member IN (SELECT value FROM json_each(?))"),
     adminN: db.query("SELECT coalesce(max(n), 0) + 1 AS n FROM reg_tenant_admins WHERE tenant = ?"),
     insAdmin: db.query("INSERT INTO reg_tenant_admins (tenant, member, n) VALUES (?, ?, ?) ON CONFLICT (tenant, member) DO NOTHING"),
 
@@ -213,7 +214,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       ready();
       return str(domain) && domain ? rowTenant(q.tenantByDomain.get(domain.toLowerCase())) ?? null : null;
     },
-    async isTenantAdmin(user) { ready(); return str(user) && !!q.adminAny.get(user); },
+    async tenantAdminsAmong(users) { ready(); return q.adminsAmong.all(JSON.stringify(users.filter(str))).map(r => r.member); },
     async addTenantAdmin(tenant, user) {
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");

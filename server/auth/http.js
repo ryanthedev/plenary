@@ -23,7 +23,7 @@
 //     (this server's). The first four are checked at build time; the redirect URI is the caller's duty.
 //     config.boardUrl       absolute URL template with "{board}"; where a redeemed share link lands
 //     config.publicUrl      optional absolute base URL; when set, a created link carries `url` (<publicUrl>/links/<id>)
-//     config.devSignIn      optional { board, users: [{ name, token, role }], hosts: [hostname] }: GET /auth/dev answers it, only while
+//     config.devSignIn      optional { board, users: [{ name, token, role }], hosts: [hostname], waitMs?: Registry wait, default 3000 }: GET /auth/dev answers it, only while
 //                           `dev` is on and the request's Host is one of `hosts` (else 404: a DNS-rebinding page can't read it)
 //     config.maxBody        JSON body cap in bytes (default 16384)
 //     config.maxLoginStates replay-guard size cap (default 100000); when full, callbacks get 503 (fails closed).
@@ -80,6 +80,9 @@ const CODE_TTL_SEC = 60;
 const COOKIE_ATTRS = "Path=/; Secure; HttpOnly; SameSite=Lax";
 const XCHG_ATTRS = "Path=/; Secure; HttpOnly; SameSite=Strict";
 
+/** How long GET /auth/dev waits for the Registry before it answers 503 (under Bun's 10 s idle timeout). */
+const DEV_MENU_WAIT_MS = 3000;
+const bounded = (p, ms) => new Promise((res, rej) => { const t = setTimeout(() => rej(new Error("timeout")), ms); p.then(v => { clearTimeout(t); res(v); }, e => { clearTimeout(t); rej(e); }); });
 const NO_STORE = { "cache-control": "no-store" };
 const json = (status, body, headers = {}) =>
   new Response(body === undefined ? null : JSON.stringify(body), {
@@ -350,6 +353,8 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
   // right now; otherwise there
   // is no such route (404). It publishes those dev tokens, which main.js says loudly at start.
   const devMenu = dev && dev.enabled === true && config.devSignIn ? { board: config.devSignIn.board, users: config.devSignIn.users } : null;
+  const menuWarned = new Set();
+  let lastMenuWarn = -Infinity;
   const devHosts = new Set((config.devSignIn?.hosts ?? []).map(h => String(h).toLowerCase()));
   // The Host header's name, port cut off ("[::1]:8099" -> "[::1]"). Bun builds req.url from it, but read it directly.
   const hostName = req => (req.headers.get("host") ?? "").toLowerCase().replace(/:\d*$/, "");
@@ -359,8 +364,18 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
       // Checked per request, through the Registry port: a dev name that is a tenant admin (an earlier run's admin token, or
       // scripts/admin-bootstrap.js --admin dev:<name>, even after this server started) is never offered. A Registry that
       // cannot answer fails closed: nothing is published.
-      const users = [];
-      for (const u of devMenu.users) if (!(await registry.isTenantAdmin("dev:" + u.name))) users.push(u);
+      let admins;
+      try { admins = new Set(await bounded(registry.tenantAdminsAmong(devMenu.users.map(u => "dev:" + u.name)), config.devSignIn.waitMs ?? DEV_MENU_WAIT_MS)); }
+      catch (e) {
+        // Fail closed with a hint, at most one short line per 10 s (no stack, no token).
+        if (now() - lastMenuWarn >= 10_000) { lastMenuWarn = now(); log.warn(`dev sign-in menu: ${e?.message === "timeout" ? "the Registry did not answer in time" : "the Registry failed"}; answering 503`); }
+        return err(503, "unavailable");
+      }
+      const users = devMenu.users.filter(u => !admins.has("dev:" + u.name));
+      for (const u of devMenu.users) if (admins.has("dev:" + u.name) && !menuWarned.has(u.name)) {
+        menuWarned.add(u.name);   // once per name, not per request
+        log.warn(`dev sign-in menu: ${u.name} is a tenant admin in the registry, so it is not offered`);
+      }
       return users.length ? json(200, { board: devMenu.board, users }) : err(404, "not-found");
     } }]] : []),
     ["/auth/login", { GET: () => beginLogin(null) }],

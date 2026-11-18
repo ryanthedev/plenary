@@ -77,13 +77,24 @@ export function namingDir(dir) {
 }
 
 /**
- * The afterAll timeout for cleanupAll(). bun's 5 s default hook timeout is far below the work: one stopRig per dir that
- * still has a rig.json (every test's rig stays recorded as "down" until now, ~32 dirs in cluster-rig.test.js), each
- * spawning `ps` per recorded process, then removing ~57 dirs. Measured idle: ~1.6 s; with `ps` taking 50 ms (what a busy
- * machine gives) 4.9 s of stopRig + 1.4 s of rmSync = 6.3 s, which bun reports as an unnamed hook timeout. This is a
- * backstop above cleanupAll's own bounded waits (30 s children + 60 s in-flight `up`s), not a hide.
+ * The afterAll timeout for cleanupAll(): a backstop, not the budget. The hook used to run one stopRig per dir with a
+ * rig.json (every rig stays recorded as "down" until now, ~32 dirs in cluster-rig.test.js), each spawning `ps` per
+ * recorded process; with `ps` at 50 ms that was 4.9 s, plus 1.4 s of rmSync = 6.3 s, over bun's 5 s default (reported as
+ * an unnamed hook timeout). It now makes one `ps` call and removes ~57 dirs: ~1.4 s whatever ps costs, the rest being the
+ * filesystem. The ceiling stays above cleanupAll's own bounded waits (30 s children + 60 s in-flight `up`s).
  */
 export const CLEANUP_TIMEOUT_MS = 180_000;
+/** pid -> start time (lstart, whitespace-collapsed) of every non-zombie process, from ONE ps; null when ps fails. */
+function psSnapshot() {
+  const r = Bun.spawnSync(["/bin/ps", "-axo", "pid=,stat=,lstart="], { env: PS_FIXED });
+  if (r.exitCode !== 0) return null;
+  const snap = new Map();
+  for (const l of r.stdout.toString().split("\n")) {
+    const m = /^\s*(\d+)\s+(\S+)\s+(.+?)\s*$/.exec(l);
+    if (m && !m[2].startsWith("Z")) snap.set(Number(m[1]), m[3].replace(/\s+/g, " "));
+  }
+  return snap.size ? snap : null;
+}
 let cleaning = null;
 export function cleanupAll({ graceMs = 3000 } = {}) {
   return cleaning ??= (async () => {
@@ -93,11 +104,16 @@ export function cleanupAll({ graceMs = 3000 } = {}) {
     await Promise.race([Promise.allSettled([...children].map(c => c.exited)), Bun.sleep(30_000)]);
     for (const c of children) { try { c.kill("SIGKILL"); } catch {} }
     await Promise.race([Promise.allSettled([...inflight]), Bun.sleep(60_000)]);
+    // One ps for every tracked dir (not one per recorded process per dir): a recorded process is live when the snapshot
+    // has its pid with the recorded start time and no zombie state. A dir with none is left to the rm below; a ps that
+    // fails or cannot be read treats every recorded process as live, so stopRig and killRecorded still check each one.
+    const snap = psSnapshot();
     for (const d of dirs) {
-      if (existsSync(join(d, "rig.json"))) {
-        try { await stopRig(d, { graceMs }); } catch {}
-        killRecorded(recorded(d), d);
-      }
+      if (!existsSync(join(d, "rig.json"))) continue;
+      const procs = recorded(d);
+      if (snap && !procs.some(p => snap.get(p?.pid) === p?.started)) continue;
+      try { await stopRig(d, { graceMs }); } catch {}
+      killRecorded(procs, d);
     }
     for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
     ABORT.aborted = false;   // reusable: bun may share this module between test files in one process

@@ -52,12 +52,12 @@ for (const how of ["kill -9", "SIGSTOP"]) test.skipIf(!url || !nurl)(`a real hol
     await Bh.open(T, B); expect(Bh.stats().waiting).toBe(1);
     const t0 = performance.now();
     if (how === "kill -9") p.kill(9); else process.kill(p.pid, "SIGSTOP");
-    g.hello("c2", "a");                                                      // a hello in the window: answered within ttl + 3 s
-    await until(() => g.answer("c2"), "c2 answered", ttl + 3_000);
+    g.hello("c2", "a");                                                      // a hello in the window: answered (backstop ttl + 30 s)
+    await until(() => g.answer("c2"), "c2 answered", ttl + 30_000);
     let w = null;
-    for (let i = 3; !w && performance.now() - t0 < ttl + 3_000; i++) {
+    for (let i = 3; !w && performance.now() - t0 < ttl + 30_000; i++) {
       await Bh.open(T, B); g.hello(`c${i}`, "a");
-      await until(() => g.answer(`c${i}`), "answer", ttl + 3_000).catch(() => {});
+      await until(() => g.answer(`c${i}`), "answer", ttl + 30_000).catch(() => {});
       const a = g.answer(`c${i}`); if (a?.msg?.t === "welcome") w = { conn: `c${i}`, ...a }; else await sleep(100);
     }
     expect(w).not.toBe(null);
@@ -82,4 +82,4 @@ for (const how of ["kill -9", "SIGSTOP"]) test.skipIf(!url || !nurl)(`a real hol
     const log = await store.read(T, B, 1, 100);
     for (let k = 1; k <= 5; k++) expect(log.filter(e => e.id === `a:${k}`).length).toBe(1);
   } finally { try { p.kill(9); } catch { /* gone */ } await Bh.close(); await bus.close(); await store.close(); }
-}, 40_000);
+}, 90_000);

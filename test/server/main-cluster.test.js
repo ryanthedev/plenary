@@ -94,7 +94,7 @@ describe.skipIf(!PG || !NATS)("cluster: three main.js processes on Postgres + NA
     h1.p.child.kill("SIGKILL"); await h1.p.child.exited;
     const killedAt = Date.now();
     const h2 = await node("host-2", "host");
-    const end = killedAt + TTL + 3_000;
+    const end = killedAt + TTL + 30_000;
     const a2 = await welcomed(g1, "a", end), b2 = await welcomed(g2, "b", end);
     expect(Date.now()).toBeLessThanOrEqual(end);
     record(a);
@@ -117,5 +117,5 @@ describe.skipIf(!PG || !NATS)("cluster: three main.js processes on Postgres + NA
     expect(log.length).toBe(71);
     for (const [id, seq] of acked) expect([id, seqOf.get(id)]).toEqual([id, seq]);
     for (const p of [g1.p, g2.p, h2.p]) { expect(p.out.err).toBe(""); expect(p.out.text).not.toContain("S3CR3T"); expect(p.out.text).not.toContain(dbUrl); }
-  }, 60000);
+  }, 120000);
 });

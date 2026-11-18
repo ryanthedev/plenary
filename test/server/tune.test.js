@@ -177,7 +177,8 @@ test("here: merged across two gateways on one bus (viewers summed, a user on bot
 }, 20000);
 
 test("here: bounded with many viewers: at most hereMax writers listed (counts past it), bus messages small, slower to a big board", async () => {
-  const r = await rig({ limits: { hereMs: 30, herePublishMs: 100, hereMax: 3, hereBigBoard: 8, hereBigMs: 600 } });
+  let skew = 0;                                                          // the gateway's clock: real time plus what the churn below adds
+  const r = await rig({ now: () => Date.now() + skew, limits: { hereMs: 30, herePublishMs: 100, hereMax: 3, hereBigBoard: 8, hereBigMs: 600 } });
   const onBus = [];
   r.bus.subscribe(subjects.presence(r.ids.tenant, r.ids.board).replace(/presence$/, "here"), m => onBus.push(m));
   const writers = [];
@@ -198,35 +199,35 @@ test("here: bounded with many viewers: at most hereMax writers listed (counts pa
   // 17 connections > hereBigBoard (8): while viewers come and go (each one welcomed, so counted, then closed),
   // `here` arrives at most every ~600 ms. Each churner waits for its welcome: closed earlier it is never counted
   // and the count would not change, so the test could not tell big-board pacing from small.
-  const watcher = viewers[1], before = watcher.msgs.filter(m => m.t === "here").length, t0 = Date.now();
+  // Eight churners at 80 ms of real time each (about two `here` ticks), with the gateway's clock 200 ms further on each: 2.2 s
+  // of its time in all, so a 600 ms pace allows about 4 heres and the 30 ms pace of a small board about 20.
+  const watcher = viewers[1], before = watcher.msgs.filter(m => m.t === "here").length;
   let churned = 0;
-  while (Date.now() - t0 < 1300) { const s = await r.sock(); s.send(hello(r, "viewer", { client: "churn" + churned++ })); await s.next(m => m.t === "welcome"); await sleep(40); s.close(); await sleep(40); }
-  expect(churned).toBeGreaterThanOrEqual(5);
+  while (churned < 8) { const s = await r.sock(); s.send(hello(r, "viewer", { client: "churn" + churned++ })); await s.next(m => m.t === "welcome"); skew += 100; await sleep(40); s.close(); await s.whenClosed(); skew += 100; await sleep(40); }
   const got = watcher.msgs.filter(m => m.t === "here").length - before;
   expect(got).toBeGreaterThanOrEqual(1);
-  expect(got).toBeLessThanOrEqual(4);                                    // 1,300 ms / 600 ms + slack; 1/s × 30 ms would be ~40
+  expect(got).toBeLessThanOrEqual(8);                                    // 2.2 s / 600 ms + slack; one per 30 ms would be ~20
   expect(lastList(watcher).writers.length).toBe(3);
   await r.stop();
 }, 30000);
 
 // ---- Round 2 (p2-tunev findings; each test is the verifier's repro) ----
 
-test("H1: a lookup that never settles is cut off at recheckLookupMs; the revoked editor is closed while the timed pass is stuck", async () => {
+test("H1: a lookup that never settles is cut off at recheckLookupMs; the revoked editor is closed once the stuck timed pass is cut off", async () => {
   const { r, ctl, open } = await roleRig({ recheckLookupMs: 150, recheckConcurrency: 1 });
   const [, victim] = await open(["stuck", "victim"], "editor");
   ctl.hang.add("dev:stuck");
   const timed = gw(r).recheck(r.ids.board, "timed");                    // not awaited: its first lookup never settles
   await until(() => ctl.hung >= 1, "the hung lookup");
-  const t0 = Date.now();
   await r.registry.setGrant(r.ids.board, "dev:victim", null);
   await grantsChanged(r);
-  const c = await victim.whenClosed(3000);
-  expect(c.code).toBe(1008);
-  expect(Date.now() - t0).toBeLessThan(1500);                             // ~150 ms lookup bound + one pass, not "never"
+  // The grants pass waits behind the stuck timed pass, which only the lookup bound ends: without it neither ever finishes
+  // (a counted outcome; the backstop is generous, so a loaded machine slows this and cannot fail it).
+  expect((await victim.whenClosed(30_000)).code).toBe(1008);
   await timed;
   expect(gw(r).stats().rechecks.timeouts).toBeGreaterThanOrEqual(1);
   await r.stop();
-}, 20000);
+}, 40000);
 
 test("H2: 8 users whose lookups fail are closed after their retries; 300 healthy viewers on the board stay open", async () => {
   const { r, ctl, open } = await roleRig({ recheckRetries: 1, recheckRetryMs: 20 });
@@ -244,16 +245,21 @@ test("H2: 8 users whose lookups fail are closed after their retries; 300 healthy
 test("M3: the retry backoff is per connection: a second failing user after a close-out is closed as fast as the first", async () => {
   const { r, ctl, open } = await roleRig({ recheckRetries: 3, recheckRetryMs: 20 });
   const [a, b] = await open(["a", "b"]);
-  const timeClose = async (s, user) => {
-    ctl.fail.add(user); const t0 = Date.now();
+  // The waits are read off the retry timers the gateway sets (their delays), not timed: a user's own backoff is
+  // 20, 40, 80 ms; a backoff carried over from the first user would show as 160, 320, 640 for the second.
+  const realSet = globalThis.setTimeout, delays = [];
+  globalThis.setTimeout = (fn, ms, ...rest) => { if (ms >= 15 && ms <= 700) delays.push(ms); return realSet(fn, ms, ...rest); };
+  const waitsOf = async (s, user) => {
+    delays.length = 0; ctl.fail.add(user);
     await gw(r).recheck(r.ids.board, "timed");
-    await s.whenClosed(5000); ctl.fail.delete(user);
-    return Date.now() - t0;
+    await s.whenClosed(30_000); ctl.fail.delete(user);
+    return delays.filter(ms => [20, 40, 80, 160, 320, 640].includes(ms));
   };
-  const ta = await timeClose(a, "dev:a");
-  const tb = await timeClose(b, "dev:b");                                 // no clean pass in between
-  expect(ta).toBeLessThan(600);                                           // 20 + 40 + 80 ms of waits, plus slack
-  expect(tb).toBeLessThan(600);                                           // was ~1,120 ms (160/320/640 ms waits)
+  let wa, wb;
+  try { wa = await waitsOf(a, "dev:a"); wb = await waitsOf(b, "dev:b"); } finally { globalThis.setTimeout = realSet; }   // no clean pass in between
+  expect(Math.max(...wa)).toBeLessThanOrEqual(80);                        // 20 + 40 + 80 ms of waits
+  expect(wb.length).toBeGreaterThan(0);
+  expect(Math.max(...wb)).toBeLessThanOrEqual(80);                        // was 160/320/640 ms waits
   await r.stop();
 }, 20000);
 

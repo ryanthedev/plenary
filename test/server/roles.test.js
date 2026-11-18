@@ -7,6 +7,7 @@ import { createServer } from "../../server/server.js";
 import { createLogger } from "../../server/log.js";
 import { sqliteStore } from "../../server/store/sqlite.js";
 import { memoryBus } from "../../server/bus/memory.js";
+import { remoteRooms } from "../../server/room-host.js";
 import { authPort } from "../../server/auth/port.js";
 import { devAuth } from "../../server/auth/dev.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
@@ -56,7 +57,7 @@ const hello = (s, c, name, client = name) => s.send({ t: "hello", v: 1, token: t
  * for the lease, and a watcher may answer the open first; the hello then waits on the watcher and is answered
  * 1013 when the holder's room opens (room-host MEDIUM-2). Returns the welcomed socket and how many tries it took.
  */
-async function welcomed(node, c, name, ms = TTL + 3000) {
+async function welcomed(node, c, name, ms = TTL + 30_000) {
   const end = Date.now() + ms;
   for (let tries = 1; ; tries++) {
     const s = await sock(node.server.wsUrl);
@@ -101,15 +102,13 @@ test("gateway, gateway, host: writers on the two gateways converge on one board;
   } finally { await c.stop(); }
 }, 30000);
 
-test("a gateway-only node with no host answers a writer's hello `unavailable` within ttl + 1 s", async () => {
+test("a gateway-only node with no host answers a writer's hello `unavailable` once the ttl passes without a host", async () => {
   const c = await cluster();
   try {
     const g = c.node({ gateway: true, host: false });
     const s = await sock(g.server.wsUrl);
-    const t0 = Date.now();
     hello(s, c, "ed1");
-    const closed = await s.whenClosed(TTL + 1000);
-    expect(Date.now() - t0).toBeLessThanOrEqual(TTL + 1000);
+    const closed = await s.whenClosed(30_000);   // the bound itself (the open rejects at the ttl) is counted on fake timers below
     expect(closed.code).toBe(1013);
     expect(s.msgs.filter(m => m.t === "error").map(m => m.code)).toEqual(["unavailable"]);
     expect(g.lines.map(l => JSON.parse(l)).find(l => l.msg === "hello failed")).toMatchObject({ what: "room" });
@@ -138,10 +137,10 @@ test("gateway-only plus two hosts: one welcome and one ack per op; after the hol
 
     const holder = [h1, h2].find(n => n.server.rooms.stats().rooms === 1), other = holder === h1 ? h2 : h1;
     await holder.stop();
-    await until(() => other.server.rooms.stats().rooms === 1, "the other host takes the board", TTL + 3000);
+    await until(() => other.server.rooms.stats().rooms === 1, "the other host takes the board", TTL + 30_000);
     const next = await sock(g.server.wsUrl);
     hello(next, c, "ed3");
-    const w = await next.next(m => m.t === "welcome", "a welcome from the other host", TTL + 3000);
+    const w = await next.next(m => m.t === "welcome", "a welcome from the other host", TTL + 30_000);
     expect(w.seq).toBe(16);   // everything the first holder acked is there
     next.send(op("ed3", 1));
     expect(await next.next(m => m.t === "ack")).toEqual({ t: "ack", id: "ed3:1", seq: 17 });
@@ -171,10 +170,36 @@ test("remote open: one request in flight per board per gateway; never cached (ev
 
 // ---- round 2: "held" wins at once; "watching" waits out a grace of min(1000, ttl / 4); no reply rejects at the ttl ----
 
-/** A fake host on the bus that answers every open with `state` after `ms` (it never opens anything). */
-const fakeAnswer = (c, state, ms = 0) => c.bus.subscribe("plen-hosts.open", m => {
-  setTimeout(() => c.bus.publish(`plen-hosts.opened.${m.gateway}`, { n: m.n, board: m.board, state }), ms);
+/** Timers that run only when the test advances them: the ttl and the grace are counted, never waited for. */
+function fakeTimers() {
+  let now = 0, id = 0; const q = new Map();
+  return {
+    setTimeout: (fn, ms) => { const h = ++id; q.set(h, { at: now + ms, fn }); return h; },
+    clearTimeout: h => { q.delete(h); },
+    advance(ms) {
+      const end = now + ms;
+      for (;;) {
+        const next = [...q].filter(([, t]) => t.at <= end).sort((a, b) => a[1].at - b[1].at)[0];
+        if (!next) break;
+        q.delete(next[0]); now = next[1].at; next[1].fn();
+      }
+      now = end;
+    },
+  };
+}
+/** A fake host on the bus that answers every open with `state` after `ms` of the fake clock (it never opens anything). */
+const fakeAnswer = (bus, timers, state, ms = 0) => bus.subscribe("plen-hosts.open", m => {
+  const send = () => bus.publish(`plen-hosts.opened.${m.gateway}`, { n: m.n, board: m.board, state });
+  if (ms) timers.setTimeout(send, ms); else send();
 });
+/** A gateway's remote rooms on a bus and fake timers, and a way to see whether an open has settled. */
+function remote(ttl) {
+  const bus = memoryBus(), timers = fakeTimers();
+  const rooms = remoteRooms({ bus, node: "g1", timeoutMs: ttl, timers });
+  const track = p => { const o = { state: "pending" }; p.then(v => { o.state = v; }, e => { o.state = e.code; }); return o; };
+  const flush = async () => { await bus.flush(); await bus.flush(); await Promise.resolve(); };
+  return { bus, timers, rooms, track, flush };
+}
 
 test("round 2: with two hosts on a cold board a `held` reply resolves the open well before the grace ends", async () => {
   const c = await cluster();
@@ -184,47 +209,47 @@ test("round 2: with two hosts on a cold board a `held` reply resolves the open w
     const replies = [];
     c.bus.subscribe(`plen-hosts.opened.${g.server.rooms.requester}`, m => replies.push(m.state));
     expect(g.server.rooms.graceMs).toBe(1000);
-    const t0 = performance.now();
-    expect(await g.server.rooms.open(c.tenant, c.board)).toBe("held");
-    expect(performance.now() - t0).toBeLessThan(500);
+    expect(await g.server.rooms.open(c.tenant, c.board)).toBe("held");   // (that it beats the grace is counted on fake timers below)
     await until(() => replies.length === 2, "both hosts' replies");
     expect(replies.sort()).toEqual(["held", "watching"]);   // the watcher answered too, and did not decide it
     expect(h.map(n => n.server.rooms.stats().rooms).sort()).toEqual([0, 1]);
   } finally { await c.stop(); }
 }, 10000);
 
-test("round 2: watcher-only replies resolve at about the grace, not before; a `held` during the grace resolves at once", async () => {
-  const c = await cluster();
-  try {
-    const g = c.node({ gateway: true, host: false }, "g1", { ttl: 4000 });
-    const unsub = fakeAnswer(c, "watching");
-    let t0 = performance.now();
-    expect(await g.server.rooms.open(c.tenant, c.board)).toBe("watching");
-    const took = performance.now() - t0;
-    expect(took).toBeGreaterThanOrEqual(990);
-    expect(took).toBeLessThan(1400);
-    unsub();
-    // "watching" at once, "held" 200 ms later: resolved by the held reply, long before the grace.
-    const u1 = fakeAnswer(c, "watching"), u2 = fakeAnswer(c, "held", 200);
-    t0 = performance.now();
-    expect(await g.server.rooms.open(c.tenant, c.board)).toBe("held");
-    const held = performance.now() - t0;
-    expect(held).toBeGreaterThanOrEqual(190);
-    expect(held).toBeLessThan(700);
-    u1(); u2();
-  } finally { await c.stop(); }
-}, 10000);
+test("round 2: watcher-only replies resolve at the grace, not before; a `held` during the grace resolves at once", async () => {
+  const { bus, timers, rooms, track, flush } = remote(4000);
+  const unsub = fakeAnswer(bus, timers, "watching");
+  const first = track(rooms.open("t", "b")); await flush();
+  timers.advance(rooms.graceMs - 1); await flush();
+  expect(first.state).toBe("pending");                                    // the grace has not ended
+  timers.advance(1); await flush();
+  expect(first.state).toBe("watching");
+  unsub();
+  // "watching" at once, "held" 200 ms later: resolved by the held reply, long before the grace.
+  const u1 = fakeAnswer(bus, timers, "watching"), u2 = fakeAnswer(bus, timers, "held", 200);
+  const second = track(rooms.open("t", "b")); await flush();
+  timers.advance(199); await flush();
+  expect(second.state).toBe("pending");
+  timers.advance(1); await flush();
+  expect(second.state).toBe("held");
+  u1(); u2(); await rooms.close(); await bus.close();
+});
 
-test("round 2: no reply at all rejects at about the ttl (grace min(1000, ttl / 4) never fires without a reply)", async () => {
-  const c = await cluster();
-  try {
-    const g = c.node({ gateway: true, host: false }, "g1", { ttl: 800 });
-    expect(g.server.rooms.graceMs).toBe(200);
-    const t0 = performance.now();
-    const err = await g.server.rooms.open(c.tenant, c.board).then(() => null, e => e);
-    const took = performance.now() - t0;
-    expect(err?.code).toBe("unavailable");
-    expect(took).toBeGreaterThanOrEqual(790);
-    expect(took).toBeLessThan(1300);
-  } finally { await c.stop(); }
-}, 10000);
+test("round 2: a `held` reply resolves the open with no timer run at all, not at the grace", async () => {
+  const { bus, timers, rooms, track, flush } = remote(4000);
+  fakeAnswer(bus, timers, "held");
+  const o = track(rooms.open("t", "b")); await flush();
+  expect(o.state).toBe("held");                                           // the fake clock never moved
+  await rooms.close(); await bus.close();
+});
+
+test("round 2: no reply at all rejects at the ttl (grace min(1000, ttl / 4) never fires without a reply)", async () => {
+  const { bus, timers, rooms, track, flush } = remote(800);
+  expect(rooms.graceMs).toBe(200);
+  const o = track(rooms.open("t", "b")); await flush();
+  timers.advance(799); await flush();
+  expect(o.state).toBe("pending");
+  timers.advance(1); await flush();
+  expect(o.state).toBe("unavailable");
+  await rooms.close(); await bus.close();
+});

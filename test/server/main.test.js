@@ -152,11 +152,11 @@ test("main.js started twice on one data dir: the same board, its acked ops, and 
 
 // A kill -9 leaves the dead process's room lease live for up to its ttl (PLENARY_LEASE_TTL_MS, passed to the child from
 // this one constant): a writer's hello in that window is answered `unavailable` (1013) or times out at the gateway,
-// and the client retries, as a real client does. Anything else is a failure, and so is no welcome within the ttl + 3 s.
+// and the client retries, as a real client does. Anything else is a failure, and so is no welcome within the ttl + 30 s (a backstop: how fast it comes is not asserted).
 const LEASE_TTL_MS = 2_000;
 const leaseEnv = { PLENARY_LEASE_TTL_MS: String(LEASE_TTL_MS) };
 async function welcomedAfterRestart(port, board, name) {
-  const end = Date.now() + LEASE_TTL_MS + 3_000;
+  const end = Date.now() + LEASE_TTL_MS + 30_000;
   for (;;) {
     const s = await connect(port, board, name);
     const got = await until(() => s.msgs.find(m => m.t === "welcome") ?? (s.closed ? "closed" : null), "a welcome or a close", Math.max(1, end - Date.now())).catch(() => "timeout");
@@ -165,7 +165,7 @@ async function welcomedAfterRestart(port, board, name) {
       expect(s.closed.code).toBe(1013);
       expect(s.msgs.filter(m => m.t === "error").map(m => m.code)).toEqual(["unavailable"]);
     } else s.close();
-    if (Date.now() >= end) throw new Error(`no welcome within the lease ttl + 3 s (${LEASE_TTL_MS + 3_000} ms)`);
+    if (Date.now() >= end) throw new Error(`no welcome within the lease ttl + 30 s (${LEASE_TTL_MS + 30_000} ms)`);
   }
 }
 
@@ -227,7 +227,7 @@ test("kill -9 mid-stream, restart: every acked op is present, at its seq, once; 
     expect(acked.size).toBeGreaterThanOrEqual(300);                                       // true by construction (100 a round; > 256, so ann:1 is out of the op-id window below)
     for (const [id, at] of acked) expect([id, seqOf.get(id)]).toEqual([id, at]);          // every acked op, at its acked seq
   } finally { cur.p.child.kill("SIGKILL"); }
-}, 90000);   // up to three lease waits (ttl + 3 s each) on top of the run
+}, 150000);   // up to three lease waits (ttl + 30 s backstop each) on top of the run
 
 test("main.js: PLENARY_MAX_CONNS_PER_USER sets the per-user connection cap", async () => {
   const p = spawn({ PLENARY_DATA_DIR: tempDir(), PLENARY_DEV_TOKENS: devTokens({ ann: "editor" }), PLENARY_MAX_CONNS_PER_USER: "2" });

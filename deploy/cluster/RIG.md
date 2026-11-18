@@ -81,7 +81,7 @@ Postgres is TCP-only because macOS limits Unix socket paths to 103 bytes, so a s
 
 `bun run test:cluster` starts a uniquely named services-only rig (`up --services-only`: Postgres, NATS and MinIO, no nodes and no Caddy, because the tests start their own nodes with the ids `gw-1`, `host-1`, ... on the same NATS), runs all test files gated by `DATABASE_URL`, `NATS_URL` or
 `S3_ENDPOINT`, then stops the rig. Any skipped test fails the command. Green runs remove the rig directory; failed runs
-keep it and print its path. SIGINT, SIGTERM and SIGHUP stop the child test and services. The gated files are
+keep it and print its path. SIGINT, SIGTERM and SIGHUP (also a terminal Ctrl-C, which reaches the whole foreground process group) stop the child test, then tear the services down; the rig helpers run in their own process groups, so `down` always finishes. The gated files are
 `test/server/pg-store`, `pg-registry`, `nats-bus`, `room-host-lease`, `room-host-proc`, `main-cluster`, `s3-blobs`,
 and `test/admin/tenants`.
 

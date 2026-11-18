@@ -1,11 +1,12 @@
 #!/usr/bin/env bun
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
 const RIG_CLI = join(ROOT, "scripts/cluster-rig.js");
 const BUN = Bun.which("bun") ?? process.execPath;
-const FILES = [
+const DEFAULT_FILES = [
   "test/server/pg-store.test.js",
   "test/server/pg-registry.test.js",
   "test/server/nats-bus.test.js",
@@ -15,6 +16,7 @@ const FILES = [
   "test/server/s3-blobs.test.js",
   "test/admin/tenants.test.js",
 ];
+const FILES = process.argv.length > 2 ? process.argv.slice(2) : DEFAULT_FILES;   // explicit files (relative to the repo root) only for the guard test
 
 const hash = createHash("sha256").update(`${ROOT}\0${process.pid}`).digest("hex").slice(0, 6);
 const name = `test-${process.pid}-${hash}`.slice(0, 32);
@@ -43,7 +45,7 @@ try {
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", LANG: "C",
     ...Object.fromEntries(["DATABASE_URL", "NATS_URL", "S3_ENDPOINT", "S3_BUCKET", "S3_REGION", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"].map(k => [k, rig[k]])),
   };
-  child = Bun.spawn([BUN, "--no-env-file", "test", ...FILES.map(f => join(ROOT, f))], {
+  child = Bun.spawn([BUN, "--no-env-file", "test", ...FILES.map(f => resolve(ROOT, f))], {
     cwd: dir, env, stdin: "inherit", stdout: "pipe", stderr: "pipe",
   });
   let combined = "";
@@ -74,6 +76,7 @@ try {
     child = null;
   }
   tearingDown = true;
+  console.error("[test:cluster] tearing down");   // readiness marker for the signal-storm guard test
   try {
     if (rigStarted || existsSync(join(dir, "rig.json"))) {
       const down = await runRigCli(["down", "--dir", dir, ...(code === 0 ? ["--clean"] : [])]);
@@ -90,10 +93,20 @@ try {
 if (interrupted && code === 0) code = 1;
 process.exit(code);
 
-async function runRigCli(args) {
-  const proc = Bun.spawn([BUN, "--no-env-file", RIG_CLI, ...args], { cwd: dir, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", LANG: "C" }, stdout: "pipe", stderr: "pipe" });
-  helper = proc;
-  const [stdout, stderr, exit] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
-  helper = null;
-  return { stdout, stderr, code: exit };
+/**
+ * Run a rig CLI command as a helper in its OWN process group (detached = setsid), like the services themselves: a
+ * terminal Ctrl-C goes to the foreground group, so it reaches this script (which tears down) but never the helper or
+ * the `ps` the helper runs while stopping services.
+ */
+function runRigCli(args) {
+  return new Promise((resolveRun, reject) => {
+    const proc = spawn(BUN, ["--no-env-file", RIG_CLI, ...args], { cwd: dir, detached: true, stdio: ["ignore", "pipe", "pipe"],
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", LANG: "C" } });
+    helper = proc;
+    let stdout = "", stderr = "";
+    proc.stdout.on("data", d => { stdout += d; });
+    proc.stderr.on("data", d => { stderr += d; });
+    proc.on("error", reject);
+    proc.on("close", (exit, sig) => { helper = null; resolveRun({ stdout, stderr, code: exit ?? 128 }); });
+  });
 }

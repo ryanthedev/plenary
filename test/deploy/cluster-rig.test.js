@@ -340,7 +340,7 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
   test("Leaks: a test run killed midway (SIGTERM, then SIGINT) leaves nothing of its rigs running, in-process or CLI", async () => {
     for (const sig of ["SIGTERM", "SIGINT"]) {
       const a = freshDir(), b = freshDir();
-      const run = spawnTracked([process.execPath, "test", join(ROOT, "test/deploy/fixture-killed-run.test.js")],
+      const run = spawnTracked([process.execPath, "test", join(ROOT, "test/deploy/fixture-killed-run.js")],
         { cwd: ROOT, stdout: "ignore", stderr: "ignore", env: { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR ?? "/tmp", RIG_FIXTURE_DIR_A: a, RIG_FIXTURE_DIR_B: b } });
       const seen = { [a]: [], [b]: [] };
       try {

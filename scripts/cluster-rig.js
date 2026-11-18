@@ -258,7 +258,7 @@ async function httpOk(url) {
 
 const sha256 = async value => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)))].map(b => b.toString(16).padStart(2, "0")).join("");
 const hmac = async (key, value) => new Uint8Array(await crypto.subtle.sign("HMAC", await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]), new TextEncoder().encode(value)));
-async function createMinioBucket(endpoint, bucket, MINIO_ACCESS, MINIO_SECRET) {
+async function createMinioBucket(endpoint, bucket, MINIO_ACCESS, MINIO_SECRET, timeoutMs) {
   const now = new Date().toISOString().replace(/[:-]|\.\d{3}/g, ""), date = now.slice(0, 8), region = "us-east-1";
   const url = new URL(`/${bucket}`, endpoint), payloadHash = await sha256("");
   const canonicalHeaders = `host:${url.host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${now}\n`;
@@ -269,7 +269,7 @@ async function createMinioBucket(endpoint, bucket, MINIO_ACCESS, MINIO_SECRET) {
   const kRegion = await hmac(kDate, region), kService = await hmac(kRegion, "s3"), kSigning = await hmac(kService, "aws4_request");
   const signature = [...await hmac(kSigning, stringToSign)].map(b => b.toString(16).padStart(2, "0")).join("");
   const response = await fetch(url, { method: "PUT", headers: { "x-amz-date": now, "x-amz-content-sha256": payloadHash,
-    Authorization: `AWS4-HMAC-SHA256 Credential=${MINIO_ACCESS}/${scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=${signature}` }, signal: AbortSignal.timeout(5000) });
+    Authorization: `AWS4-HMAC-SHA256 Credential=${MINIO_ACCESS}/${scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=${signature}` }, signal: AbortSignal.timeout(timeoutMs) });
   if (!response.ok && response.status !== 409) throw new Error(`minio bucket creation failed (HTTP ${response.status})`);
 }
 
@@ -493,12 +493,10 @@ export async function startRig(opts = {}) {
       { env: baseEnv({ MINIO_ROOT_USER: minioAccess, MINIO_ROOT_PASSWORD: minioSecret }), cwd: dir, log: join(logsDir, "minio.log"), abort: opts.abort });
     rig.blobs = { url: minioEndpoint, bucket, accessKey: minioAccess, secretKey: minioSecret, consolePort: minioConsolePort };
     save(rig);
-    await waitFor(() => httpOk(`${minioEndpoint}/minio/health/ready`), { what: "minio", proc: minio, deadline, abort: opts.abort });
-    // Retried: under load the first signed request can fail (5xx or timeout) right after the health probe says ready.
-    for (let attempt = 1; ; attempt++) {
-      try { await createMinioBucket(minioEndpoint, bucket, minioAccess, minioSecret); break; }
-      catch (e) { if (attempt >= 5 || opts.abort?.aborted) throw e; await sleep(300); }
-    }
+    // /health/cluster, not /health/ready: `ready` answers 200 before the object layer is initialized (a signed request
+    // then gets 503 XMinioServerNotInitialized), `cluster` stays 503 until it is. So the bucket PUT needs no retry.
+    await waitFor(() => httpOk(`${minioEndpoint}/minio/health/cluster`), { what: "minio", proc: minio, deadline, abort: opts.abort });
+    await createMinioBucket(minioEndpoint, bucket, minioAccess, minioSecret, Math.max(1000, Math.min(5000, deadline - Date.now())));
 
     // Nodes.
     const nodeCmd = opts.nodeCmd?.length ? opts.nodeCmd : [BUN, MAIN];
@@ -658,12 +656,13 @@ function printStatus(s) {
     `  lb        ${s.lb ? `${s.lb.url}   ${s.lb.wsUrl}` : "-"}   ${pid("caddy")}`,
     `  postgres  ${s.postgres ? `127.0.0.1:${s.postgres.port}   DATABASE_URL ${s.postgres.url}` : "-"}   ${pid("postgres")}`,
     `  nats      ${s.nats ? s.nats.url : "-"}   ${pid("nats")}`,
+    `  minio     ${s.blobs ? s.blobs.url : "-"}   ${pid("minio")}`,
     ...s3Env(s).filter(line => !line.startsWith("S3_SECRET_ACCESS_KEY=")).map(line => `  ${line}`),
     ...(s.blobs ? ["  S3 secret  (not printed; run `env`)"] : []),
     ...s.nodes.map(n => `  ${n.id.padEnd(9)} ${n.roles.join(",").padEnd(8)} ${n.url}   ${pid("node:" + n.id)}`),
     `  tokens    ${s.tokensFile}   (0600, PLENARY_DEV_TOKENS format; never printed)`,
     `  logs      ${s.logsDir}`,
-    `  lease     PLENARY_LEASE_TTL_MS=${s.leaseTtlMs} on every node`,
+    ...(s.nodes.length ? [`  lease     PLENARY_LEASE_TTL_MS=${s.leaseTtlMs} on every node`] : []),
   ];
   console.log(lines.join("\n"));
 }
@@ -719,6 +718,7 @@ async function cli(argv) {
   if (cmd === "down") {
     // Teardown must finish: a Ctrl-C (or the parent's forwarded signal) during down is ignored, never a half-stopped rig.
     for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => {});
+    console.error("[rig] down: stopping (signals are ignored until it finishes)");   // also the readiness signal for the guard test
     const targets = a.all ? rigDirs() : [dir];
     if (!a.all && !existsSync(join(dir, "rig.json"))) throw new Error(missingRigMessage(a.name ?? basename(dir), dir));
     for (const target of targets) {
@@ -761,6 +761,7 @@ async function cli(argv) {
 }
 
 if (import.meta.main) {
+  if (process.argv[2] === "down") for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => {});   // as early as possible; cli() repeats it
   try { process.exit(await cli(process.argv.slice(2))); }
   catch (err) { console.error(`[rig] ${err.message}`); process.exit(1); }
 }

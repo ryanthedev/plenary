@@ -228,7 +228,7 @@ ot("nats stall: a frozen server (SIGSTOP) caps what is queued, is declared stale
   try {
     await until(async () => { try { (await Bun.connect({ hostname: "127.0.0.1", port, socket: { data() {} } })).end(); return true; } catch { return false; } }, "nats-server up");
     const url = `nats://127.0.0.1:${port}`, errors = [];
-    const bus = await natsBus({ url, onError: e => errors.push([e.code, e.message]), pingIntervalMs: 500, maxPingOut: 2, maxPendingBytes: 8 * 1024 * 1024, reconnectWaitMs: 100, connectTimeoutMs: 1000 });
+    const bus = await natsBus({ url, onError: e => errors.push([e.code, e.message]), pingIntervalMs: 500, maxPingOut: 2, maxPendingBytes: 24 * 1024 * 1024, reconnectWaitMs: 100, connectTimeoutMs: 1000 });
     const listener = await natsBus({ url });
     open.push(bus, listener);
     const got = [], s = "plen.t-stall.b-1.presence";
@@ -240,12 +240,13 @@ ot("nats stall: a frozen server (SIGSTOP) caps what is queued, is declared stale
     process.kill(srv.pid, "SIGSTOP"); frozen = true;
     const big = "x".repeat(1024 * 1024);
     let accepted = 0, refused = 0;
-    for (let i = 0; i < 60; i++) {                     // 60 MB offered while frozen
+    for (let i = 0; i < 80; i++) {                     // 80 MB offered while frozen
       (await code(bus.publish(s, { k: `frozen-${i}`, big }))) === "resolved" ? accepted++ : refused++;
       if (i % 10 === 9) await sleep(20);
     }
-    expect(accepted).toBeLessThanOrEqual(8);           // the cap: at most 8 MB queued, not 60
-    expect(refused).toBe(60 - accepted);
+    expect(accepted).toBeLessThanOrEqual(24);          // the cap: at most 24 MB queued, not 80
+    expect(accepted).toBeGreaterThan(12);              // (and it did queue up to it)
+    expect(refused).toBe(80 - accepted);
     expect(bus.isUp()).toBe(false);
     expect(errors.map(e => e[0])).toEqual(["unavailable"]);           // congestion, reported once
     await until(() => errors.length === 2, "declared stale by pings", 5000);
@@ -261,10 +262,12 @@ ot("nats stall: a frozen server (SIGSTOP) caps what is queued, is declared stale
     await until(() => got.includes("after"), "after");
     await sleep(200);
     const replayed = got.filter(k => k.startsWith("frozen-")).length;
-    // Only what already sat in the frozen server's kernel receive buffer can still arrive (1 in local runs);
-    // everything queued in this process was dropped with the socket.
+    // Only what already sat in the frozen server's kernel receive buffer can still arrive (1-3 MB in local runs: how much
+    // is the kernel's, not ours); everything queued in this process was dropped with the socket. So the property is
+    // that the replays are a small part of what was accepted, not a count: at most half (the buffer would have to hold
+    // 12 MB), where replaying the queue would bring back all of it.
     expect(replayed).toBeLessThan(accepted);
-    expect(replayed).toBeLessThanOrEqual(2);
+    expect(replayed * 2).toBeLessThanOrEqual(accepted);
     expect(got).not.toContain("during");
     await bus.close(); await listener.close();
   } finally {

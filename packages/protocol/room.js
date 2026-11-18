@@ -64,6 +64,7 @@ export class Room {
     this.base = this.fold();  // the checkpoint the kept tail starts from
     this.tail = [];           // resolved entries after `base` (the log kept for catch-up)
     this.tailChars = 0;
+    this.savedSeq = 0;        // the newest checkpoint known durable: rebuilt from, or its write acknowledged (heartbeat `cp`)
   }
 
   // ---- state: load, fold, apply ----
@@ -168,7 +169,7 @@ export class Room {
       if (!room.rules[checkpoint.rv] || !e || e.seq !== S || e.id !== checkpoint.id || e.by !== checkpoint.by || e.at !== checkpoint.at)
         throw fail("bad-checkpoint", `the checkpoint at ${S} doesn't match the log`);
       room.load(checkpoint);
-      room.base = checkpoint;
+      room.base = checkpoint; room.savedSeq = S;
     }
     let next = S + 1;
     for (const e of entries) {
@@ -217,9 +218,12 @@ export class Room {
       cp = r.fold();
     }
     this.base = cp; this.tail = []; this.tailChars = 0;
+    // Announced in the heartbeat (`cp`) only once the write is acknowledged: a reader told about it can find it.
+    const saved = () => { if (cp.seq > this.savedSeq) this.savedSeq = cp.seq; };
     try {
       const put = this.log?.putCheckpoint?.(cp);
-      if (put && typeof put.then === "function") put.then(null, err => this.report("checkpoint-failed", { board: this.board, seq: cp.seq, err }));
+      if (put && typeof put.then === "function") put.then(saved, err => this.report("checkpoint-failed", { board: this.board, seq: cp.seq, err }));
+      else if (this.log?.putCheckpoint) saved();   // a synchronous log (MemoryLog): written on return
     } catch (err) { this.report("checkpoint-failed", { board: this.board, seq: cp.seq, err }); }
     return cp;
   }
@@ -237,10 +241,11 @@ export class Room {
     return c;
   }
   /**
-   * The `.entries` heartbeat (§ Bus): the resolved seq and this incarnation's epoch. A room host publishes it
-   * every 2 s; gateways use the epoch for viewers' welcomes.
+   * The `.entries` heartbeat (§ Bus): the resolved seq, this incarnation's epoch and the newest durable checkpoint
+   * (`cp`). A room host publishes it every 2 s; gateways use the epoch for viewers' welcomes and `cp` to decide
+   * when to read a checkpoint.
    */
-  heartbeat() { return { seq: this.resolved, epoch: this.epoch }; }
+  heartbeat() { return { seq: this.resolved, epoch: this.epoch, cp: this.savedSeq }; }
 
   /**
    * A read-only snapshot of where the room stands, for a host (p-audit F14: a host reads this, never the fields).

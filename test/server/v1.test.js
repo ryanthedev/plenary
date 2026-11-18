@@ -214,8 +214,8 @@ test("rule 6: a room forgets a gateway silent for 30 s (its clock), unless the g
 
 test("a board feed picks up the host's checkpoint written just after the entries that triggered it (on the next heartbeat): a joiner from 0 gets that snapshot and only the entries after it", async () => {
   // One 50 KB text rewritten 10 times: the host folds by bytes (tailFoldBytes 64 KB) only when nothing is in flight
-  // (room-host.js foldIfDue). Its checkpoint is written right after the entries are published, so the feed's look on
-  // those entries misses it; the heartbeat (2 s) brings the retry.
+  // (room-host.js foldIfDue). Its checkpoint is written right after the entries are published; the first heartbeat
+  // after the write names it (`cp`), and the feed reads it then.
   // Deterministic order (p2-tunev LOW 2): op 1, then ops 2 and 3 together (op 2's fold is skipped while 3 is in flight),
   // then 4 to 10 one at a time. Folds land on 3, 5, 7, 9 and op 10 alone is under the trigger, so the room's base
   // settles at 9, not 10. The test asserts on whatever base the room settles at, never on a fixed seq.
@@ -265,20 +265,28 @@ test("§ Pacing: frames read from a live socket faster than they are handled are
   await r.stop();
 }, 20000);
 
-test("§ Pacing: an idle viewer that answers pings survives the idle timeout; a socket that never answers is closed", async () => {
-  // idleTimeoutSec 8 (Bun's smallest useful value; it pings idle sockets itself). Bun's client answers pings; the raw
-  // socket never does (it reads frames but writes nothing after its hello).
+test("§ Pacing: an idle viewer that answers pings survives the idle timeout twice over; a socket that never answers is closed", async () => {
+  // idleTimeoutSec 8 (Bun's smallest useful value; its timer ticks every 4 s): Bun pings a socket idle for half of it and
+  // closes it at the full timeout if nothing came back. Bun's client answers pings; a raw socket never does (it reads
+  // frames but writes nothing after its hello). Nothing here asserts a duration: the idle periods are marked by events,
+  // two silent sockets' closes, one after the other.
   const r = await rig({ limits: { idleTimeoutSec: 8 } });
+  const conns = () => r.server.gateway.stats().conns;
   const v = await r.sock(); v.send(hello(r, "viewer")); await v.next(m => m.t === "welcome");
-  const raw = await rawSock(r.server.wsUrl); raw.send(hello(r, "viewer", { client: "raw" })); raw.read();
-  await until(() => r.server.gateway.stats().conns === 2, "both connected");
-  await until(() => raw.ended, "the silent socket to be closed", 25000);
-  // The viewer connected first and has been just as quiet for as long: had its pongs not counted it would have gone
-  // in the same sweep as the raw socket (and conns would be 0), so it is the pings that kept it. (The settle is for a
-  // negative: nothing more may close.)
-  await until(() => r.server.gateway.stats().conns <= 1, "the silent socket's close to reach the gateway", 5000);
-  await sleep(250);
+  const silent = async client => { const s = await rawSock(r.server.wsUrl, { frames: true }); s.send(hello(r, "viewer", { client })); s.read(); return s; };
+  const raw = await silent("raw");
+  await until(() => conns() === 2, "both connected");
+  await until(() => raw.ended, "the silent socket to be closed (one idle period)", 25000);
+  expect(raw.pings).toBeGreaterThanOrEqual(1);                            // not at once: pinged first, closed for not answering
+  // The viewer connected before it and was just as quiet: had its pongs not counted it would have gone by now. A second
+  // silent socket, opened only now, marks a second full idle period by its own close.
+  await until(() => conns() === 1, "the silent socket's close to reach the gateway", 5000);
+  const raw2 = await silent("raw2");
+  await until(() => conns() === 2, "the second silent socket connected");
+  await until(() => raw2.ended, "the second silent socket to be closed (a second idle period)", 25000);
+  expect(raw2.pings).toBeGreaterThanOrEqual(1);
+  await until(() => conns() <= 1, "its close to reach the gateway", 5000);
   expect(v.closed).toBe(null);
-  expect(r.server.gateway.stats().conns).toBe(1);
+  expect(conns()).toBe(1);
   await r.stop();
 }, 60000);

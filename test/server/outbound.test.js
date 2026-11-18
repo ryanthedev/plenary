@@ -10,7 +10,7 @@ import { createBreather } from "../../server/breather.js";
 
 afterAll(cleanup);
 const MB = 1024 * 1024;
-// A gateway feed rebases onto a fold on the room host's next heartbeat (default 2 s): tests that fold and then join wait for it.
+// A gateway feed rebases onto a fold on the room host's next heartbeat after the checkpoint is written (it names it: `cp`; default 2 s): tests that fold and then join wait for it.
 const HB = 100;
 const hello = (r, name, extra = {}) => ({ t: "hello", v: 1, token: tokenOf(name), board: r.ids.board, since: 0, client: name, ...extra });
 // A small element op whose version rises with n (v1.1: a settings op needs `appBase`, so traffic uses elements).

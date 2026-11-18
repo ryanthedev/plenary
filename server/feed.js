@@ -6,11 +6,12 @@
 //   board) and the entries after it, contiguous, each encoded once. Catch-up = the base's snapshot (when the
 //   client is older than it) + the entries after, as shared, encode-once frames of at most `chunkBytes`.
 // - Live: `.entries` messages `{ from, to, items }` are applied in seq order; duplicates are dropped by seq; a gap
-//   is read from the Store. The heartbeat `{ seq, epoch }` gives the epoch and reveals a lost last entry. After
+//   is read from the Store. The heartbeat `{ seq, epoch, cp }` gives the epoch and reveals a lost last entry. After
 //   `pollMs` with no message the Store is read from the last seq + 1, and again every `pollMs` while it is quiet,
 //   so delivery needs no room (§ Bus: "a lost last entry is repaired two ways").
-// - The tail is re-based on a newer checkpoint from the Store once it is long (the room writes one every 1,000
-//   entries or later), so a joiner's catch-up is the board's state plus a bounded tail.
+// - The tail is re-based on a newer checkpoint from the Store (the room writes one every 1,000 entries or later), so
+//   a joiner's catch-up is the board's state plus a bounded tail. The heartbeat's `cp` (the room's newest durable
+//   checkpoint) says when there is one to read: each checkpoint is read at most once (PROTOCOL.md § Bus, `cp`).
 // Never throws to its caller: Store errors are logged and retried by the next message or poll.
 
 import { snapshotOf } from "../packages/protocol/room.js";
@@ -32,7 +33,8 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
   const self = {
     tenant, board, seq: 0, epoch: 0, ready: null, closed: false, gapAt: 0,
     base: EMPTY, tail: [],   // tail: [{ seq, id, by, at, text }], seq = base.seq + 1 …
-    snap: null, chunks: [], chunksLen: 0, lastHeard: Date.now(), nextRebase: rebaseEvery, tailBytes: 0, nextRebaseBytes: rebaseBytes, missed: false,
+    snap: null, chunks: [], chunksLen: 0, lastHeard: Date.now(), nextRebase: rebaseEvery, tailBytes: 0, nextRebaseBytes: rebaseBytes,
+    cpHeard: null, lookedAt: 0, retries: 0, looks: 0,   // the checkpoint look (rebase, below)
   };
   const frameOf = list => (codec === jsonCodec ? `{"t":"entries","entries":[${list.map(x => x.text).join(",")}]}` : codec.encode({ t: "entries", entries: list.map(x => JSON.parse(x.text)) }));
 
@@ -107,25 +109,37 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
     }
   }
 
-  // Looked for after every `rebaseEvery` entries or `rebaseBytes` chars of tail since the last look. The room writes
-  // its checkpoint just AFTER it publishes the entries that triggered it, so the look those entries cause usually
-  // misses it: after a miss the feed looks again on every heartbeat (every 2 s) or Store poll, and not on entries (a
-  // burst can still be ahead of it), until the look finds the checkpoint. A heartbeat can land before the checkpoint is
-  // written, so one retry is not enough; the cost of going on is one checkpoint read per heartbeat while a miss is
-  // open, and a miss closes as soon as a checkpoint ahead of the base exists (a room that never folds is read at
-  // the heartbeat's pace, no faster).
+  // When to read the Store for a newer checkpoint (PROTOCOL.md § Bus, `cp`):
+  // - The room announces its newest durable checkpoint in every heartbeat (`cp`, only once its write is acknowledged).
+  //   A feed that has heard one looks only on a heartbeat or poll, and only when the largest `cp` heard is above its
+  //   base and above the `cp` of its last completed look: one read per checkpoint, none on an idle board or while
+  //   the room hasn't folded. A look that throws (a Store error) is not completed, so the next heartbeat tries again.
+  // - A feed whose last heartbeat had no `cp` (a host from before it), or that has had none (only Store polls), looks once its tail reaches
+  //   `rebaseEvery` entries or `rebaseBytes` chars since the last look, and after a miss (the room writes its
+  //   checkpoint just after publishing the entries that trigger it) on at most LEGACY_RETRIES later heartbeats or
+  //   polls; a look that throws keeps at least one retry.
+  const LEGACY_RETRIES = 3;
   const rebaseDue = () => self.tail.length >= self.nextRebase || self.tailBytes >= self.nextRebaseBytes;
-  async function rebase() {
-    const again = () => { self.nextRebase = self.tail.length + rebaseEvery; self.nextRebaseBytes = self.tailBytes + rebaseBytes; };
-    again(); self.missed = false;
-    const cp = await validBase();
-    if (cp.seq <= self.base.seq || cp.seq > self.seq) { self.missed = true; return; }
+  async function maybeRebase(beat) {
+    if (self.cpHeard !== null) {
+      if (beat && self.cpHeard > Math.max(self.base.seq, self.lookedAt) && self.cpHeard <= self.seq) await rebase(false);
+    } else if (rebaseDue()) await rebase(true);
+    else if (beat && self.retries > 0) await rebase(false);
+  }
+  async function rebase(due) {
+    const heard = self.cpHeard, before = self.retries;
+    if (due) { again(); self.retries = Math.max(before, 1); }
+    self.looks++;
+    const cp = await validBase();   // a Store error throws past the bookkeeping below: the look is tried again
+    if (heard !== null) self.lookedAt = Math.max(self.lookedAt, heard);
+    if (cp.seq <= self.base.seq || cp.seq > self.seq) { self.retries = due ? LEGACY_RETRIES : Math.max(0, before - 1); return; }
     const cut = self.tail.slice(0, cp.seq - self.base.seq);
     self.tail = self.tail.slice(cp.seq - self.base.seq);
     for (const x of cut) self.tailBytes -= x.text.length;
-    self.base = cp; self.snap = null; self.chunks = []; self.chunksLen = 0;
+    self.base = cp; self.snap = null; self.chunks = []; self.chunksLen = 0; self.retries = 0;
     again();
   }
+  function again() { self.nextRebase = self.tail.length + rebaseEvery; self.nextRebaseBytes = self.tailBytes + rebaseBytes; }
 
   async function onMessage(m) {
     self.lastHeard = Date.now();
@@ -136,14 +150,15 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
       apply(m.items.map((t, i) => fromBus(t, m.from + i)));
       if (m.to > self.seq) await repair(m.to);   // still short (the repair raced the room): the Store has it
     } else if (Number.isSafeInteger(m?.seq) && m.seq > self.seq) await repair(m.seq);
-    if (rebaseDue()) await rebase();
-    else if (self.missed && !Array.isArray(m?.items)) await rebase();   // a heartbeat: the retry after a miss
+    const beat = !Array.isArray(m?.items);
+    if (beat) self.cpHeard = Number.isSafeInteger(m?.cp) && m.cp >= 0 ? Math.max(self.cpHeard ?? 0, m.cp) : null;   // no cp: a host from before it
+    await maybeRebase(beat);
   }
 
   const unsub = bus.subscribe(subjects.entries(tenant, board), m => { run(() => onMessage(m)).catch(err => log.error("feed: message failed", { tenant, board, err })); });
   const poll = setInterval(() => {
     if (Date.now() - self.lastHeard < pollMs || running) return;
-    run(async () => { await repair(); if (rebaseDue()) await rebase(); else if (self.missed) await rebase(); }).catch(err => log.warn("feed: Store poll failed", { tenant, board, err }));
+    run(async () => { await repair(); await maybeRebase(true); }).catch(err => log.warn("feed: Store poll failed", { tenant, board, err }));
   }, Math.max(50, Math.floor(pollMs / 2)));
   poll.unref?.();
 

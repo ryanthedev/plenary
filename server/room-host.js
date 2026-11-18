@@ -22,7 +22,7 @@
 //     broadcasts are not sent: gateways serve catch-up from the Store and fan out from `.entries` (rules 3, 8).
 //   - Every `unavailable` the Room says ends that connection (a gap, an unknown connection, a stopped room): the
 //     gateway is told to close it, and the client reconnects and is welcomed afresh.
-//   - Timers: room.sweep() (gateway silence, by the room's clock), the `{ seq, epoch }` heartbeat every 2 s, and
+//   - Timers: room.sweep() (gateway silence, by the room's clock), the `{ seq, epoch, cp }` heartbeat every 2 s, and
 //     the lease's renew and deadline (by performance.now(), never the rooms' injected clock).
 
 import { Room } from "../packages/protocol/room.js";
@@ -520,7 +520,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     }, () => {});
   }, sweepMs);
   sweep.unref?.();
-  // § Bus: the heartbeat repairs a lost last entry and tells gateways the epoch (for viewers' welcomes).
+  // § Bus: the heartbeat repairs a lost last entry, tells gateways the epoch (for viewers' welcomes) and the newest durable checkpoint.
   const beat = setInterval(() => {
     for (const p of slots.values()) p.then(slot => {
       if (slot.dead) return;

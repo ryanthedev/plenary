@@ -470,7 +470,7 @@ rebuilt without guessing from the last entry.
   highest `seq` wins. A rebuild that wrote no checkpoint, or fell back past a bad one, would repeat an epoch.
 - **How gateways learn it.** A writer's `welcome` comes from the room, which knows its epoch. For a viewer's
   `welcome` the gateway uses the latest epoch it knows. The room puts `epoch` in its `.entries` heartbeat
-  (`{ seq, epoch }`, § Bus), and a gateway with no heartbeat for the board yet reads the lease record from the
+  (`{ seq, epoch, cp }`, § Bus), and a gateway with no heartbeat for the board yet reads the lease record from the
   Store, as it reads catch-up.
 - **What the client does.** `room.board` must equal its hello's board. If not, it closes and reconnects (a failed
   attempt, rule 12). The epoch checks below apply only to a **room-built** `welcome` (a writer's: it carries
@@ -787,12 +787,24 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   tabs (§ Presence, `here`). Small by construction (≤ 50 entries) whatever the board's size.
 - **At-most-once.** Entries carry `seq`, so a gateway that sees a gap reads the missing range from the Store and
   delivers in order; duplicates are dropped by `seq`. Presence has no repair.
-- **A lost last entry is repaired two ways.** While it runs, the room publishes a `{ seq, epoch }` **heartbeat**
-  (resolved seq, the room's epoch) on `.entries` every 2 s. And a gateway that has heard neither an entry nor a heartbeat for
+- **A lost last entry is repaired two ways.** While it runs, the room publishes a `{ seq, epoch, cp }` **heartbeat**
+  (resolved seq, the room's epoch, its latest durable checkpoint: below) on `.entries` every 2 s. And a gateway that has heard neither an entry nor a heartbeat for
   **5 s** on a board it serves reads the Store from its last delivered `seq` + 1, and again every 5 s while the
   silence lasts. The poll needs no room, so it also works after the room stopped or its host died (viewers never
   restart a room). Guaranteed: every connected client gets every resolved entry, in order, within about 5 s of
   the bus going quiet. Delivery to clients is effectively at-least-once, eventually consistent.
+- **`cp`, the latest durable checkpoint.** The heartbeat's `cp` is the `seq` of the newest checkpoint the room
+  knows is in the Store: the one it was rebuilt from, or a later one whose write the Store has acknowledged (0 =
+  none). A checkpoint is announced only after its write succeeds, never when it is taken, so `cp` never names a
+  checkpoint a reader can't find. A gateway keeps its cached tail short by re-basing it on a newer checkpoint (§
+  Recovery, Rebuild; at most every 1,000 entries or 4 MB of tail): it reads one from the Store only when the
+  largest `cp` it has heard is above both its base and the `cp` of its last completed look, so a gateway reads each
+  checkpoint at most once, and an idle board, or a room that hasn't folded, costs no reads. A look that fails (a
+  Store error) is not completed and is tried again on the next heartbeat. A gateway whose last heartbeat for the
+  board had no `cp` (its host predates `cp`), or that has had none since it began serving the board (the Store poll
+  below delivers), looks when its tail is due, and after a look that finds nothing newer, again on at most 3 later
+  heartbeats or polls, then not until the tail is due again. Mixed versions are safe both ways: an older gateway
+  ignores `cp`.
 - A gateway subscribes to the board's subjects **before** it forwards a hello or serves any catch-up, so
   nothing between catch-up and live is missed.
 - Gateway → room messages on `.inbox`: a hello or op as `{ n, conn, gateway, user, name, role, client, msg }`; a

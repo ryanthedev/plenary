@@ -1137,7 +1137,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       return { conns: conns.size, ...counts, rechecks: { ...rechecks, running: [...boards.values()].filter(b => b.rc.running).length }, owedBytes: owed, owedTracked: owedTotal, queuedBytes: queuedTotal, users: connsByUser.size, waitingJoiners: waiters.size, sharedBytes, sharedTexts: sharedText.size, boards: boards.size };
     },
     /** A board's feed as this gateway holds it (null if it serves no one there): its base checkpoint, seq and tail. */
-    feed: (tenant, board) => { const f = boards.get(`${tenant}/${board}`)?.feed; return f ? { base: f.base.seq, seq: f.seq, tail: f.tail.length, tailBytes: f.tailBytes } : null; },
+    feed: (tenant, board) => { const f = boards.get(`${tenant}/${board}`)?.feed; return f ? { base: f.base.seq, seq: f.seq, tail: f.tail.length, tailBytes: f.tailBytes, looks: f.looks } : null; },
     /** Re-check every connection's role on a board now: `grants` (what a grants message does) or `timed` (the timer). */
     recheck: async (board, kind = "grants") => { for (const b of [...boards.values()]) if (b.board === board) await requestRecheck(b, kind === "timed" ? "timed" : "grants"); },
     async close() {

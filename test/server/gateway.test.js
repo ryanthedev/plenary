@@ -276,9 +276,9 @@ test("the entries subject carries each entry once, after it is durable", async (
   expect(JSON.parse(seen[0].items[0])).toMatchObject({ seq: 1, tenant: r.ids.tenant, board: r.ids.board, id: expect.stringMatching(/:1$/) });
   // The room's heartbeat names its epoch (§ Bus); it is published as soon as the room is built.
   // The first one, of a newly built room only, says `opened` (a host waiting on the lease answers the hellos it held).
-  expect(beats[0]).toEqual({ seq: 0, epoch: 1, opened: true });
+  expect(beats[0]).toEqual({ seq: 0, epoch: 1, cp: 0, opened: true });
   await until(() => beats.length >= 2, "a later heartbeat", 2_000);
-  expect(beats.at(-1)).toEqual({ seq: 3, epoch: 1 });                     // later beats: no `opened`
+  expect(beats.at(-1)).toEqual({ seq: 3, epoch: 1, cp: 0 });                  // later beats: no `opened`
   await r.stop();
 });
 

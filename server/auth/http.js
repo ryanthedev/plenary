@@ -23,7 +23,8 @@
 //     (this server's). The first four are checked at build time; the redirect URI is the caller's duty.
 //     config.boardUrl       absolute URL template with "{board}"; where a redeemed share link lands
 //     config.publicUrl      optional absolute base URL; when set, a created link carries `url` (<publicUrl>/links/<id>)
-//     config.devSignIn      optional { board, users: [{ name, token, role }] }: GET /auth/dev answers it, only while `dev` is on
+//     config.devSignIn      optional { board, users: [{ name, token, role }], hosts: [hostname] }: GET /auth/dev answers it, only while
+//                           `dev` is on and the request's Host is one of `hosts` (else 404: a DNS-rebinding page can't read it)
 //     config.maxBody        JSON body cap in bytes (default 16384)
 //     config.maxLoginStates replay-guard size cap (default 100000); when full, callbacks get 503 (fails closed).
 //                           The used-code set of /auth/exchange has the same cap and also fails closed.
@@ -345,11 +346,14 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
   // ---- routes ----
   const admin = { registry, now };
   // GET /auth/dev: the dev sign-in menu for the served page (web/adapters/auth/devconfig.js). Exists ONLY while the dev
-  // verifier is on and the node has a dev board; otherwise there is no such route (404), so a page cannot be talked
-  // into dev sign-in. It lists each dev token: dev tokens are local-only secrets by design (main.js logs a warning).
+  // verifier is on and main.js allowed the menu (a loopback bind, no Google, a gateway, an offerable user); otherwise there
+  // is no such route (404). It publishes those dev tokens, which main.js says loudly at start.
   const devMenu = dev && dev.enabled === true && config.devSignIn ? { board: config.devSignIn.board, users: config.devSignIn.users } : null;
+  const devHosts = new Set((config.devSignIn?.hosts ?? []).map(h => String(h).toLowerCase()));
+  // The Host header's name, port cut off ("[::1]:8099" -> "[::1]"). Bun builds req.url from it, but read it directly.
+  const hostName = req => (req.headers.get("host") ?? "").toLowerCase().replace(/:\d*$/, "");
   const routes = [
-    ...(devMenu ? [["/auth/dev", { GET: () => json(200, devMenu) }]] : []),
+    ...(devMenu ? [["/auth/dev", { GET: req => (devHosts.has(hostName(req)) ? json(200, devMenu) : err(404, "not-found")) }]] : []),
     ["/auth/login", { GET: () => beginLogin(null) }],
     ["/auth/callback", { GET: (req, url) => callback(req, url) }],
     ["/auth/exchange", { POST: req => exchange(req) }],

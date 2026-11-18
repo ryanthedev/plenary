@@ -7,7 +7,7 @@ public images.
 |---|---|
 | `Dockerfile` | Single-node image on `oven/bun:1.4.4-slim`. Installs dependencies from `bun.lock` (`bun install --frozen-lockfile --production`) in their own layer, then copies the source. Runs `bun run server/main.js` as the non-root `bun` user, listens on 0.0.0.0:8080, data in `/data`, health check on `GET /health`. |
 | `compose.yml` | One `plenary` service with a named volume for SQLite and blobs, published on `127.0.0.1:8080` only, `restart: unless-stopped`. |
-| `cluster.compose.yml`, `cluster/` | Phase-4 cluster shape (not functional yet): see [Cluster](#cluster-phase-4-not-functional-yet). |
+| `cluster.compose.yml`, `cluster/` | Phase-4 cluster shape (never run on Docker): see [Cluster](#cluster-phase-4-not-run-on-docker-yet). |
 
 ```sh
 docker build -f deploy/Dockerfile -t plenary:dev .      # context is the repo root
@@ -19,8 +19,8 @@ curl -s http://127.0.0.1:8080/health                    # 200 + JSON
 
 - **Endpoints:** `GET /health`, the WebSocket at `/ws`, `POST /boards` (and the board invite and link routes), and
   Google sign-in at `/auth/*` (`server/auth/http.js`, mounted by `server/main.js`; the `/auth` routes answer 503
-  unless both `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are set). There is no web page on port 8080 yet: the
-  server does not serve `web/`.
+  unless both `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are set). The server serves the canvas page
+  at `/` (the `web/` folder), over the same port.
 - **Without dev tokens** every `hello` is refused, so no client can join. The log says so at start.
 - **With dev tokens** the server creates one dev board on its first start and logs its id each start (`dev tokens are ON`). The
   registry is SQLite in `<data>/registry.db` and the board id is kept in `<data>/dev-board.json`, so restarts reuse it.
@@ -34,7 +34,7 @@ These are the variables `server/main.js` reads; nothing else is read.
 | `PORT` | `8080` | Listen port (`0` = any free port; don't use 0 in the container, the published port is fixed). |
 | `HOST` | `0.0.0.0` | Listen address. main.js defaults to `127.0.0.1`, which a container cannot be reached on, so the image sets it. |
 | `PLENARY_DATA_DIR` | `/data` | `plenary.db` (SQLite) and `blobs/` go here. Compose mounts the `plenary-data` volume on it. |
-| `PLENARY_DEV_TOKENS` | unset | JSON: `{ "<token>": { "name": "ann", "role": "editor", "email"?, "domain"? } }`. Unset or empty = off. Invalid JSON is logged and treated as off. |
+| `PLENARY_DEV_TOKENS` | unset | JSON: `{ "<token>": { "name": "ann", "role": "editor", "email"?, "domain"? } }`. Unset, empty or `{}` = off. Invalid JSON is logged and treated as off. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Logs are structured, to stdout. |
 | `COOKIE_KEY` | unset | At least 32 bytes; signs sign-in cookies and sessions. Unset on a single node = a random key per start (every restart signs everyone out). **Required in cluster mode** (`DATABASE_URL` or `NATS_URL` set): the server refuses to start without it, and every node must have the same value. |
 | `SESSION_KEY` | unset | At least 32 bytes; signs sessions only, if you want it separate from `COOKIE_KEY` (default: `COOKIE_KEY`). Not set by either compose file. |
@@ -47,7 +47,10 @@ echo "COOKIE_KEY=$(openssl rand -hex 32)" >> deploy/.env
 ```
 
 **Dev tokens are for local use only.** Anyone holding a token is that user; there is no expiry or sign-in. Never
-set them on a server others can reach. To use them, put a value in `deploy/.env` with single quotes around the
+set them on a server others can reach. The served page's dev sign-in menu (`GET /auth/dev`, which publishes the
+tokens of users without `admin` or `domain`) is on only when the server binds a loopback `HOST`, Google sign-in is not
+configured and the node is a gateway: in the container (`HOST=0.0.0.0`) it is always off, and the log says why. The tokens
+still work for a socket or `POST /boards`. To use them, put a value in `deploy/.env` with single quotes around the
 JSON, and make up your own token strings:
 
 ```sh
@@ -55,8 +58,8 @@ JSON, and make up your own token strings:
 PLENARY_DEV_TOKENS='{"<a-long-random-token>":{"name":"ann","role":"editor"}}'
 ```
 
-`GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are commented out in `compose.yml`: main.js does not read them yet.
-When sign-in is wired they come from your shell or `deploy/.env`, never this repo.
+`GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are commented out in `compose.yml`; `server/main.js` reads them. Set
+them from your shell or `deploy/.env`, never this repo.
 
 ## Secrets and files
 
@@ -84,8 +87,8 @@ throwaway CI-only literals written in the workflow.
 
 ## Postgres roles (least privilege)
 
-Not live yet: `server/main.js` does not use the Postgres adapters (see [What is missing](#cluster-phase-4-not-functional-yet)
-below). This is how the adapters behave, for when it does.
+`server/main.js` uses the Postgres adapters when `DATABASE_URL` and `NATS_URL` are both set (see
+[What is missing](#cluster-phase-4-not-run-on-docker-yet) below). This is how the adapters behave.
 
 PROTOCOL.md § Store, "Least privilege": a Plenary node can run as a Postgres role that reads and writes the tables
 but does not own the schema. The Registry (`server/registry/postgres.js`, tables `reg_*`) and the Store
@@ -178,7 +181,7 @@ behind a stuck lock every call settles by about 1 × the lock limit, sent or not
 - **A shared pool:** the gate assumes the Registry is its pool's only user; pass `maxInFlight` below the pool's `max`
   if the pool is shared.
 
-## Cluster (phase 4, not functional yet)
+## Cluster (phase 4, not run on Docker yet)
 
 `cluster.compose.yml` is the phase-4 shape: Postgres, NATS, an S3-compatible blob store, three app nodes and a Caddy
 load balancer. It is a separate Compose project (`plenary-cluster`), so it never touches the single-node stack above,
@@ -186,7 +189,7 @@ whose `compose.yml` is unchanged.
 
 | Service | Image | Role |
 |---|---|---|
-| `postgres` | `postgres:17.11-alpine3.23` | Store (cluster adapter, not written yet). Volume `postgres-data`. |
+| `postgres` | `postgres:17.11-alpine3.23` | Store (the Postgres adapter). Volume `postgres-data`. |
 | `nats` | `nats:2.15.3-alpine` | Bus, NATS core (no JetStream). Config `cluster/nats.conf` raises `max_payload` to 2 MB, as PROTOCOL.md asks. |
 | `blobs` | `pgsty/minio:RELEASE.2026-08-04T00-00-00Z` | S3-compatible blobs. MinIO stopped publishing `minio/minio` on Docker Hub; this is a community-maintained MinIO fork. |
 | `blobs-init` | same | One shot: creates the bucket (`S3_BUCKET`, default `plenary`), then exits. |
@@ -232,12 +235,9 @@ docker compose -f deploy/cluster.compose.yml down          # add -v to delete th
 
 **What is missing:**
 
-- **Cluster adapters and roles.** `server/main.js` uses `DATABASE_URL` and `NATS_URL` only to decide it is in cluster
-  mode (and so require `COOKIE_KEY`); it reads none of `DATABASE_URL`, `NATS_URL`, `S3_*`,
-  `PLENARY_NODE_ID` or `PLENARY_ROLES` yet, so every node still runs both roles regardless of its setting. Each node runs single-node: its own SQLite in its container (lost on `down`),
-  its own in-memory bus, its own dev board. Two clients that land on different nodes do not see each other.
-- **Leases and takeover.** The phase-4 test ("kill a board's host, another takes over, no acked op lost") cannot run
-  until engine's leases exist.
+- **Blobs.** Nothing in `server/` writes blobs yet, so the S3-compatible store is not exercised by the server.
+- **Takeover on this stack.** Leases and takeover are built and tested (and run on the local rig,
+  `deploy/cluster/RIG.md`); the "kill a board's host" check has not been run on this Compose file.
 - **Run once, on Podman, not Docker (2026-11-12, p8-cookie).** With `COOKIE_KEY` set, all three app nodes start in
   cluster mode and the load balancer answers `/health` with 200. Docker Compose 5.1.3 against Podman 5.8.2's API split the
   exec-form app healthcheck at its first space and marked the nodes unhealthy (which of the two splits it is not

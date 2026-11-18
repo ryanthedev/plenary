@@ -29,9 +29,11 @@ Open one URL per user, each in its own browser tab (a tab keeps its own identity
 
 Draw in one tab and the shape appears in the other. With no `?board=` you land on the dev board; with no `?as=` the
 sign-in screen lists the dev users as buttons. `PORT=0` picks a free port instead (read it from the `server
-listening` log line). Dev sign-in exists only while `PLENARY_DEV_TOKENS` is set: without it there is no `/auth/dev`
-route, no buttons, and `?as=` is ignored. **Anyone who can reach the port can read the dev tokens**, so keep the
-default `HOST=127.0.0.1`.
+listening` log line). Dev sign-in is a local-only convenience. It exists only while **all** of these hold: `PLENARY_DEV_TOKENS` names at
+least one user (unset, empty and `{}` are off), the server binds a loopback `HOST` (the default `127.0.0.1`), Google
+sign-in is not configured, and the node is a gateway. Otherwise there is no `/auth/dev` route, no buttons, `?as=` is
+ignored, and (if dev tokens are set) the log says why. When it is on, `GET /auth/dev` publishes the dev users' tokens
+to any page on this machine's loopback names, and the log says so; tokens with `admin` or `domain` are never listed.
 
 ## Status
 
@@ -143,7 +145,8 @@ PORT=8080 PLENARY_DATA_DIR="$(mktemp -d)" OIDC_REDIRECT_URI=http://localhost:808
 
 - **Dev tokens:** a token with `"domain"` and `"admin": true` makes that domain's tenant at start and adds the user as
   its admin, for example `{"tok-ann":{"name":"ann","domain":"acme.test","admin":true}}`. Then
-  `curl -X POST -H "Authorization: Bearer tok-ann" -H "Content-Type: application/json" -d '{"title":"All hands"}' http://localhost:8099/boards` answers 201 with the board.
+  start the "Try it" server (port 8099) with that token added to `PLENARY_DEV_TOKENS`, then
+  `curl -X POST -H "Authorization: Bearer tok-ann" -H "Content-Type: application/json" -d '{"title":"All hands"}' http://localhost:8099/boards` answers 201 with the board. (An `admin` or `domain` token is never offered in the sign-in menu; use it only this way.)
 - **Operator CLI:** `bun scripts/admin-bootstrap.js --domain acme.com --admin alice@acme.com` (run with the same
   environment as the server; idempotent, additive; `--admin` takes an email on the domain, `google:<sub>` or `dev:<name>`).
 

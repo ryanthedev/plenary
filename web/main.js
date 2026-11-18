@@ -1,12 +1,12 @@
 // PRODUCTION composition root of the canvas page (index.html's entry; served by server/static.js, whose allowlist is
 // index.html + this file's import graph). The only page file that picks adapters and wires them: the browser clock,
 // session storage for the sign-in session, local storage for preferences, the HTTP auth adapter, the WebSocket net to
-// the same origin's /ws, and the DOM chrome. No dev rooms, no dev users, no ?as= here (manager decision, p6-hex fix
-// round): those live in web/dev-main.js. test/web/architecture.test.js checks this file's whole import graph.
+// the same origin's /ws, and the DOM chrome. No dev rooms and no dev user table here (manager decision, p6-hex fix
+// round): those live in web/dev-main.js. `?as=` exists here only through the server's own answer (GET /auth/dev, below). test/web/architecture.test.js checks this file's whole import graph.
 //
 // URL: ?board=<id> &theme=light|dark &as=<dev user>
 //      &as= works ONLY when the server says dev sign-in is on (GET /auth/dev, web/ports/devconfig.js: the server has
-//      PLENARY_DEV_TOKENS); otherwise it is ignored and nothing in the page offers it. With dev on, the sign-in screen lists
+//      a local server with PLENARY_DEV_TOKENS, no Google sign-in and a loopback bind); otherwise it is ignored and nothing in the page offers it. With dev on, the sign-in screen lists
 //      the dev users, and a link with no board lands on the server's dev board.
 //      #code=<single-use code> after Google sign-in (docs/m2/contracts/auth-exchange.md): dropped from the address
 //      bar at once (or, if that fails, never exchanged), then exchanged by POST /auth/exchange for the session token.
@@ -41,7 +41,8 @@ const fromCode = await takeSignIn({
 });
 
 // Dev sign-in: only when the SERVER offers it (the menu is null on a production server). Asked for when this tab has
-// no session yet or the URL has `?as=`; a signed-in tab skips the request.
+// no session yet or the URL has `?as=`. A signed-in tab with no `?board=` asks once more, to find the dev board (a
+// production server answers 404, which is null).
 const devConfig = httpDevConfig({ fetch: (...a) => globalThis.fetch(...a), timers: clock });
 let menuAsked = null;
 const devMenu = () => (menuAsked ??= devConfig.get());
@@ -64,11 +65,11 @@ if (!signIn.token) {
   // Signed out on a board's link (an expired sign-in, after a reload): the gate's sign-in comes back to that board.
   if (board) rememberBoard(tabStore, board);
   const wanted = asParam(location.search);
-  const hint = menu ? (wanted ? `There is no dev user "${wanted}" on this server. ` : "") + "Dev sign-in is on: pick a user, or sign in with Google." : null;
+  const hint = menu ? (wanted ? `There is no dev user "${wanted}" on this server. ` : "") + "Dev sign-in is on: pick a user." : null;
   showGate({
     title: "Sign in to Plenary",
     detail: signInNotice({ ...signIn, dev: null }) ?? hint ?? "Sign in with your work Google account to open this board.",
-    link: signInLink, links: menu ? devLinks(menu, board ?? menu.board) : [],
+    link: menu ? null : signInLink, links: menu ? devLinks(menu, board ?? menu.board) : [],
   });
 } else if (!board) {
   showGate({ title: "No board in this link", detail: "Open the board from the link you were sent." });

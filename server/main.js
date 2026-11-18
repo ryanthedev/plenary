@@ -253,6 +253,22 @@ export function announcingRegistry(registry, bus, log) {
   };
 }
 
+const LOOPBACK_HOSTS = ["127.0.0.1", "::1", "[::1]", "localhost"];
+
+/**
+ * Who may use the served page's dev sign-in menu (GET /auth/dev, which publishes dev tokens): only a local run. Returns the
+ * reason it must be OFF, or null when it may be on: no user to offer (a token with `admin` or a `domain` is never
+ * offered), a bind host that is not loopback, Google sign-in configured, or a node with no gateway role.
+ * @param {{ users: number, host: string, google: boolean, gateway: boolean }} o
+ */
+export function devMenuOff({ users, host, google, gateway }) {
+  if (!gateway) return "this node has no gateway role";
+  if (!users) return "no dev token is offerable (tokens with admin or a domain never are)";
+  if (!LOOPBACK_HOSTS.includes(String(host).toLowerCase())) return `HOST=${String(host).slice(0, 64)} is not a loopback address`;
+  if (google) return "Google sign-in is configured";
+  return null;
+}
+
 /** @param {Record<string, string|undefined>} env @param {{ fetch?: typeof fetch }} [deps] tests pass a stub fetch for Google */
 export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write, hostname, adapters } = {}) {
   // write: tests capture log lines; hostname: tests fix the default node id; adapters: tests replace the cluster
@@ -268,6 +284,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   if (env.PLENARY_DEV_TOKENS) {
     try { tokens = JSON.parse(env.PLENARY_DEV_TOKENS); } catch { tokens = null; }
     if (!tokens || typeof tokens !== "object" || Array.isArray(tokens)) { log.error("PLENARY_DEV_TOKENS is not a JSON object; dev tokens stay off"); tokens = null; }
+    else if (!Object.keys(tokens).length) tokens = null;   // "{}" is empty, so off (deploy/README.md: unset or empty = off)
   }
 
   // Keys. In cluster mode every node must share them, so a missing one refuses the start; on one node a random
@@ -303,7 +320,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
     : null;
   log.info("sign-in", { google: !!oidc, devTokens: dev.enabled, cluster });
 
-  let devBoard = null;
+  let devBoard = null, devMenu = null;
   if (dev.enabled && !roles.gateway) log.info("dev tokens are set but this node has no gateway: no dev board here");
   else if (dev.enabled) {
     // Reuse the dev board across restarts (the Registry has no list call to find it by).
@@ -348,6 +365,20 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
       try { const r = await bootstrapTenant({ registry, domain, admins }); log.info("dev tenant", { tenant: r.tenant.id, domain, created: r.created, added: r.added }); }
       catch (err) { if (err?.code !== "bad-request") throw err; log.error("dev token domain skipped", { domain, err }); }
     }
+    // The dev sign-in menu: each name once, with the role it is actually granted (the highest across its tokens). A token
+    // with admin or a domain is a tenant admin or a Workspace member: never published.
+    const offered = new Map();
+    for (const [token, t] of Object.entries(tokens)) {
+      if (!t || typeof t.name !== "string" || !t.name || t.admin === true || t.domain || offered.has(t.name)) continue;
+      offered.set(t.name, { name: t.name, token, role: best.get("dev:" + t.name) });
+    }
+    const host = env.HOST || "127.0.0.1";
+    const off = devMenuOff({ users: offered.size, host, google: !!oidc, gateway: roles.gateway });
+    if (off) log.warn("dev tokens are on, but the dev sign-in menu (GET /auth/dev) is OFF: " + off, { host });
+    else {
+      devMenu = { board: board.id, users: [...offered.values()], hosts: LOOPBACK_HOSTS };
+      log.warn("dev sign-in menu is ON: GET /auth/dev publishes the tokens of the dev users to anyone who can reach this server", { users: offered.size, host });
+    }
     log.warn("dev tokens are ON: not for production", { board: board.id, tenant: board.tenant, users: best.size });
   } else if (oidc) log.info("dev tokens are off: sign-in is Google only");
   else log.warn("dev tokens are off and Google sign-in is not configured (GOOGLE_CLIENT_ID/SECRET): every hello will be refused");
@@ -360,16 +391,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
     boardUrl: env.BOARD_URL || `${origin}/?board={board}`,
     publicUrl: origin,
   };
-  // The served page's dev sign-in menu (GET /auth/dev): the dev users and the dev board, only when dev tokens are on.
-  if (devBoard) {
-    const seen = new Set(), users = [];
-    for (const [token, t] of Object.entries(tokens)) {
-      if (!t || typeof t.name !== "string" || !t.name || seen.has(t.name)) continue;
-      seen.add(t.name);
-      users.push({ name: t.name, token, role: ROLES.includes(t.role) ? t.role : "editor" });
-    }
-    config.devSignIn = { board: devBoard, users };
-  }
+  if (devMenu) config.devSignIn = devMenu;
   const http = httpRoutes({ registry, sessions, oidc, tenancy, now: Date.now, config, log: log.child({ component: "auth" }), ...(dev.enabled ? { dev } : {}) });
   const server = createServer({ auth, registry, store, bus, blobs, log, limits, http, port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
     roles, node, host: { hostname: node, leaseTtlMs } });

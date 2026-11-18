@@ -2,14 +2,15 @@
 // "Old" is simulated by passing a `now` three hours ahead; processes that hold things open are our own, killed by pid.
 
 import { test, expect, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, symlinkSync, rmSync, chmodSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, existsSync, symlinkSync, rmSync, chmodSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
+import { readdirSync } from "node:fs";
 import { join } from "node:path";
-import { clean, summarize, measure, openPaths } from "../../scripts/clean.js";
+import { clean, summarize, measure, openPaths, openUnder, ROOT } from "../../scripts/clean.js";
 
 const made = [], kids = [];
-const sandbox = mkdtempSync(join(tmpdir(), "plenary-cleantest-"));
+const sandbox = realpathSync(mkdtempSync(join(tmpdir(), "plenary-cleantest-")));
 made.push(sandbox);
 afterAll(() => { for (const k of kids) try { process.kill(k.pid); } catch {} for (const d of made) rmSync(d, { recursive: true, force: true }); });
 
@@ -20,12 +21,13 @@ function world({ real = false } = {}) {
   mkdirSync(tempDir); mkdirSync(rigRoot);
   // `lsof` is the real one only where a test needs a process to hold something (real: true); a fixed answer elsewhere (the real one takes ~0.5 s)
   const lsof = join(root, "lsof-none");
-  writeFileSync(lsof, "#!/bin/sh\necho n/dev/null\n"); chmodSync(lsof, 0o755);
+  writeFileSync(lsof, "#!/bin/sh\ncase \"$*\" in *+D*) exit 1;; esac\necho n/dev/null\n"); chmodSync(lsof, 0o755);
   return { root, tempDir, rigRoot, lsof: real ? "lsof" : lsof };
 }
 const entry = (base, name, bytes = 5000) => { const d = join(base, name); mkdirSync(join(d, "sub"), { recursive: true }); writeFileSync(join(d, "sub/f"), "x".repeat(bytes)); return d; };
 /** The pid of a process that has just exited: dead now, and not reused within the test. */
 const DEAD = spawnSync("true").pid;
+const readdirSyncNames = d => readdirSync(d).sort();
 const LATER = () => Date.now() + 3 * 3_600_000;
 const byName = (r, n) => r.items.find(i => i.path.endsWith("/" + n));
 const holder = (script, cwd) => { const p = Bun.spawn(["sh", "-c", script], { cwd, stdout: "ignore", stderr: "ignore" }); kids.push(p); return p; };
@@ -34,7 +36,7 @@ const rigDir = (w, name) => { const d = join(w.rigRoot, name); mkdirSync(d); wri
 
 test("old, unused plenary entries are removed; other names and young entries stay (--yes)", () => {
   const w = world();
-  const old = entry(w.tempDir, "plenary-load-aaa"), run = entry(w.tempDir, `plen-run-${DEAD}-x`), other = entry(w.tempDir, "omniloop-life-zzz");
+  const old = entry(w.tempDir, "plenary-load-data-aaa111"), run = entry(w.tempDir, `plen-run-${DEAD}-x`), other = entry(w.tempDir, "omniloop-life-zzz");
   const young = clean({ ...w, yes: true });                       // everything is young now
   expect(young.items.map(i => i.why)).toEqual(["too young", "too young"]);
   expect(existsSync(old)).toBe(true);
@@ -47,7 +49,7 @@ test("old, unused plenary entries are removed; other names and young entries sta
 
 test("a dry run lists and sizes but deletes nothing", () => {
   const w = world();
-  const d = entry(w.tempDir, "plenary-dry-1"); rigDir(w, "stopped");
+  const d = entry(w.tempDir, "plenary-test-dry111"); rigDir(w, "stopped");
   const r = clean({ ...w, now: LATER(), rigAlive: () => false });
   expect(r.items.map(i => i.status)).toEqual(["would-remove", "would-remove"]);
   expect(existsSync(d) && existsSync(join(w.rigRoot, "stopped"))).toBe(true);
@@ -56,12 +58,12 @@ test("a dry run lists and sizes but deletes nothing", () => {
 
 test("an entry a process holds open (a file, or its cwd) is kept", () => {
   const w = world({ real: true });
-  const a = entry(w.tempDir, "plenary-held-file"), b = entry(w.tempDir, "plenary-held-cwd"), free = entry(w.tempDir, "plenary-free");
+  const a = entry(w.tempDir, "plenary-test-hfile1"), b = entry(w.tempDir, "plenary-test-hcwd11"), free = entry(w.tempDir, "plenary-test-free11");
   holder(`exec 3<${a}/sub/f; exec sleep 60`, w.root);
   holder("exec sleep 60", b);
   Bun.sleepSync(300);
   const r = clean({ ...w, now: LATER(), yes: true });
-  expect([byName(r, "plenary-held-file").why, byName(r, "plenary-held-cwd").why]).toEqual(["in use", "in use"]);
+  expect([byName(r, "plenary-test-hfile1").why, byName(r, "plenary-test-hcwd11").why]).toEqual(["in use", "in use"]);
   expect(existsSync(a) && existsSync(b)).toBe(true);
   expect(existsSync(free)).toBe(false);
 });
@@ -82,7 +84,7 @@ test("a plen-run root is kept while its owner pid lives (owner.json or the name)
 
 test("a failing or missing lsof keeps everything", () => {
   for (const code of [null, 2, 3]) {
-    const w = world(), d = entry(w.tempDir, "plenary-x");
+    const w = world(), d = entry(w.tempDir, "plenary-test-xxxxxx");
     const r = clean({ ...w, now: LATER(), yes: true, lsof: code === null ? "/nonexistent/lsof" : failingLsof(w, code) });
     expect(r.items[0].status).toBe("kept");
     expect(r.items[0].why).toMatch(/in-use check failed/);
@@ -94,12 +96,12 @@ test("a failing or missing lsof keeps everything", () => {
 test("a symlink to outside is skipped at the top level and never entered inside an entry", () => {
   const w = world();
   const outside = entry(w.root, "outside-precious");
-  symlinkSync(outside, join(w.tempDir, "plenary-link"));
-  const inner = entry(w.tempDir, "plenary-with-link");
+  symlinkSync(outside, join(w.tempDir, "plenary-test-link11"));
+  const inner = entry(w.tempDir, "plenary-test-wlink1");
   symlinkSync(outside, join(inner, "escape"));
   const r = clean({ ...w, now: LATER(), yes: true });
-  expect(byName(r, "plenary-link").why).toBe("symlink");
-  expect(existsSync(join(w.tempDir, "plenary-link"))).toBe(true);
+  expect(byName(r, "plenary-test-link11").why).toBe("symlink");
+  expect(existsSync(join(w.tempDir, "plenary-test-link11"))).toBe(true);
   expect(existsSync(inner)).toBe(false);
   expect(existsSync(join(outside, "sub/f"))).toBe(true);
 });
@@ -165,4 +167,79 @@ test("measure counts a tree without following links", () => {
   const w = world(), d = entry(w.root, "m");
   symlinkSync(w.root, join(d, "up"));   // a loop back to the parent: following it would never end
   expect(measure(d).bytes).toBeGreaterThan(0);
+});
+
+test("only exact known name patterns are candidates: unknown prefixes and bare-prefix names stay", () => {
+  const w = world();
+  const keep = ["plenary-unknown-abc123", "plenary-test-", "plenary-test-toolong1", "plen-other", "pl-reg-zzzzzz", "plen-abcdef", "omniloop-life-abc123"].map(n => entry(w.tempDir, n));
+  const known = entry(w.tempDir, "plenary-load-sig-aB3dE9");
+  const r = clean({ ...w, now: LATER(), yes: true });
+  expect(keep.map(existsSync)).toEqual(keep.map(() => true));
+  expect(existsSync(known)).toBe(false);
+  expect(r.items.map(i => i.path)).toEqual([known]);
+});
+
+test("an entry not owned by the current uid is kept", () => {
+  const w = world(), d = entry(w.tempDir, "plenary-test-other1");
+  const r = clean({ ...w, now: LATER(), yes: true, uid: process.getuid() + 1 });
+  expect(r.items[0].why).toMatch(/owned by uid/);
+  expect(existsSync(d)).toBe(true);
+});
+
+test("a dir that becomes in use after the snapshot is renamed, re-checked, put back and kept", () => {
+  const w = world({ real: true }), d = entry(w.tempDir, "plenary-test-late11"), other = entry(w.tempDir, "plenary-test-free22");
+  const r = clean({ ...w, now: LATER(), yes: true, beforeRemove: p => { if (p === d) { holder("exec sleep 60", d); Bun.sleepSync(300); } } });
+  expect(byName(r, "plenary-test-late11")).toMatchObject({ status: "kept", why: "in use (re-check)" });
+  expect(existsSync(d)).toBe(true);
+  expect(existsSync(join(w.tempDir, ".plen-deleting-plenary-test-late11"))).toBe(false);
+  expect(existsSync(other)).toBe(false);
+});
+
+test("a failing per-path re-check puts the dir back", () => {
+  const w = world(), d = entry(w.tempDir, "plenary-test-rechk1");
+  const lsof = join(w.root, "lsof-recheck-fails");   // answers the snapshot, fails the per-path call
+  writeFileSync(lsof, '#!/bin/sh\ncase "$*" in *+D*) exit 2;; esac\necho n/dev/null\n'); chmodSync(lsof, 0o755);
+  const r = clean({ ...w, lsof, now: LATER(), yes: true });
+  expect(r.items[0].why).toMatch(/re-check failed/);
+  expect(existsSync(d)).toBe(true);
+  expect(readdirSyncNames(w.tempDir)).toEqual(["plenary-test-rechk1"]);
+});
+
+test("an odd path (a newline in it): lsof -F0 output is parsed whole (escaped by lsof), the holder is seen, and the per-path check agrees", () => {
+  const w = world({ real: true }), d = entry(w.tempDir, "plenary-test-nl1111");
+  const odd = join(d, "sub", "a\nb x");
+  writeFileSync(odd, "z");
+  holder(`exec 3<"${odd}"; exec sleep 60`, w.root);
+  Bun.sleepSync(300);
+  expect(openPaths().some(p => p === odd)).toBe(false);                       // lsof escapes the newline, so the raw path never matches ...
+  expect(openPaths().some(p => p === odd.replace("\n", "\\n"))).toBe(true);    // ... but the field is kept whole, escaped, under the entry's prefix
+  const r = clean({ ...w, now: LATER(), yes: true });
+  expect(r.items[0]).toMatchObject({ status: "kept", why: "in use" });
+  expect(existsSync(odd)).toBe(true);
+  expect(openUnder(d)).toBe("in use (re-check)");
+});
+
+test("ROOT is the real path of the checkout, also with a space in it or behind a symlink", async () => {
+  const w = world(), home = join(w.root, "sp ace", "repo"), real = realpathSync(w.root) + "/sp ace/repo";
+  mkdirSync(join(home, "scripts"), { recursive: true });
+  copyFileSync(join(ROOT, "scripts/clean.js"), join(home, "scripts/clean.js"));
+  symlinkSync(join(w.root, "sp ace"), join(w.root, "link"));
+  const viaLink = await import(join(w.root, "link", "repo", "scripts", "clean.js") + `?v=${Math.random()}`);
+  expect(viaLink.ROOT).toBe(real);
+  expect(readFileSync(join(ROOT, "scripts/clean.js"), "utf8")).toContain("fileURLToPath");
+});
+
+test("the rig dir is refused like the others when it resolves to / or $HOME", () => {
+  expect(() => clean({ tempDir: join(sandbox, "none"), rigRoot: "/" })).toThrow(/refusing/);
+  expect(() => clean({ tempDir: join(sandbox, "none"), rigRoot: process.env.HOME })).toThrow(/refusing/);
+});
+
+test("--min-age under 10 minutes needs force", () => {
+  const w = world(), d = entry(w.tempDir, "plenary-test-young1");
+  expect(() => clean({ ...w, minAgeMs: 60_000 })).toThrow(/needs --force/);
+  expect(clean({ ...w, minAgeMs: 60_000, force: true, now: Date.now() + 120_000 }).items[0].status).toBe("would-remove");
+  expect(existsSync(d)).toBe(true);
+  const cli = spawnSync(process.execPath, [join(ROOT, "scripts/clean.js"), "--min-age", "5m"], { encoding: "utf8" });
+  expect(cli.status).toBe(1);
+  expect(cli.stderr).toMatch(/needs --force/);
 });

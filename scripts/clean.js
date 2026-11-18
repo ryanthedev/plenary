@@ -10,16 +10,32 @@
 //   3. --scratch <dir>: its direct children, same age and in-use rules as 1 (agents' scratch copies).
 // Never follows a symlink (a symlinked entry is skipped; links inside an entry are unlinked, not entered), never touches
 // anything outside the temp dir, this repo's .rig and the given scratch dir, and refuses a base that is / or $HOME.
+// Limits: lsof run as a normal user does not see other users' (or root's) processes, so a dir only such a process holds
+// would look unused; hence only this user's entries are candidates, the in-use check runs a second time per entry right
+// before removal (the entry is first renamed to `.plen-deleting-<name>` and put back if anything has it open or lsof fails),
+// and --min-age under 10 minutes needs --force.
 // A composition root (it shells out to lsof and the rig CLI); nothing imports it.
 
 import { spawnSync } from "node:child_process";
-import { lstatSync, readdirSync, readFileSync, realpathSync, rmSync, existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { lstatSync, readdirSync, readFileSync, realpathSync, rmSync, existsSync, renameSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 
-const ROOT = resolve(new URL("..", import.meta.url).pathname);
+export const ROOT = realpathSync(resolve(fileURLToPath(new URL("..", import.meta.url))));
 const RIG_CLI = join(ROOT, "scripts/cluster-rig.js");
-export const TEMP_PREFIXES = ["plenary-", "plen-", "pl-reg-"];
+/** Every mkdtemp prefix in test/ and scripts/ (grep mkdtemp; re-check when a new one is added). Names are `<prefix><6 chars>`. */
+export const TEMP_PREFIXES = ["pl-reg-open-", "plen-nats-", "plenary-bootstrap-", "plenary-cleantest-", "plenary-cluster-cwd-", "plenary-devadmin-",
+  "plenary-guard-", "plenary-live-google-", "plenary-load-", "plenary-load-1013-", "plenary-load-badtok-", "plenary-load-cb-", "plenary-load-cbtok-",
+  "plenary-load-cpu-", "plenary-load-cwd-", "plenary-load-data-", "plenary-load-dead-", "plenary-load-drain-", "plenary-load-drcpu-",
+  "plenary-load-g4live-", "plenary-load-kill-", "plenary-load-noack-", "plenary-load-orph-", "plenary-load-orphw-", "plenary-load-r2-",
+  "plenary-load-rig-", "plenary-load-run-", "plenary-load-sat-", "plenary-load-sig-", "plenary-load-tok-", "plenary-main-cwd-",
+  "plenary-nats-auth-", "plenary-pass-", "plenary-probe-", "plenary-reap-", "plenary-registry-", "plenary-rig-", "plenary-static-",
+  "plenary-static-bad-", "plenary-static-h1-", "plenary-storm-", "plenary-test-"];
+const DELETING = ".plen-deleting-";
+const TEMP_NAME = new RegExp(`^(?:(?:${TEMP_PREFIXES.join("|")})[A-Za-z0-9]{6}|plen-run-\\d+-[A-Za-z0-9._-]+)$`);
+const isTempName = name => TEMP_NAME.test(name.startsWith(DELETING) ? name.slice(DELETING.length) : name);
+export const MIN_SAFE_AGE_MS = 600_000;
 const HOUR = 3_600_000;
 const RIG_GRACE_MS = 60_000;   // a rig dir touched in the last minute may be an `up` still writing it
 
@@ -43,11 +59,27 @@ export function measure(p) {
  * answered: exit 0, or exit 1 with output (what lsof does when it could not inspect some process), never an empty answer.
  */
 export function openPaths(lsof = "lsof") {
-  const r = spawnSync(lsof, ["-w", "-n", "-P", "-F", "n"], { encoding: "utf8", maxBuffer: 1 << 28, timeout: 60_000 });
+  const r = spawnSync(lsof, ["-w", "-n", "-P", "-F0n"], { encoding: "utf8", maxBuffer: 1 << 28, timeout: 60_000 });
   if (r.error) throw new Error(`lsof did not run (${r.error.code ?? r.error.message})`);
   if (r.status === null) throw new Error(`lsof was killed by ${r.signal}`);
   if (r.status > 1 || !r.stdout) throw new Error(`lsof exited ${r.status} without an answer`);
-  return r.stdout.split("\n").filter(l => l.startsWith("n/")).map(l => l.slice(1));
+  return namesOf(r.stdout);
+}
+/**
+ * Path fields of lsof -F0 output (NUL ends a field, a record's NL is dropped). lsof prints a control character in a path
+ * escaped (`\n` as backslash-n), so an odd path never equals the real one here: the per-path `openUnder` re-check, which
+ * lsof answers by inode, is what covers it.
+ */
+const namesOf = out => out.split("\0").map(f => f.replace(/^\n/, "")).filter(f => f.startsWith("n/")).map(f => f.slice(1));
+
+/** Why `path` (a dir) cannot be removed by this lsof's view ("" = nothing has anything under it open). Any failure is a reason. */
+export function openUnder(path, lsof = "lsof") {
+  const r = spawnSync(lsof, ["-w", "-n", "-P", "-F0n", "+D", path], { encoding: "utf8", maxBuffer: 1 << 28, timeout: 60_000 });
+  if (r.error) return `in-use re-check failed: lsof did not run (${r.error.code ?? r.error.message})`;
+  if (r.status === null) return `in-use re-check failed: lsof was killed by ${r.signal}`;
+  if (r.status <= 1 && /(^|\0)\n?p\d/.test(r.stdout)) return "in use (re-check)";   // +D exits 1 even when it lists matches
+  if (r.status <= 1 && !r.stdout && !r.stderr) return "";
+  return `in-use re-check failed: lsof exited ${r.status}${r.stderr ? ` (${r.stderr.split("\n")[0].slice(0, 120)})` : ""}`;
 }
 
 /** True when the pid may be alive (kill -0 succeeds or is denied); false only on ESRCH. Anything else is "alive". */
@@ -72,7 +104,7 @@ function ownerPid(dir, name) {
       return Number.isSafeInteger(pid) && pid > 1 ? pid : null;
     } catch { return null; }
   }
-  const m = /^plen-run-(\d+)-/.exec(name);
+  const m = /^plen-run-(\d+)-/.exec(name.replace(DELETING, ""));
   return m ? Number(m[1]) : null;
 }
 
@@ -91,9 +123,10 @@ const refuseBase = (p, what) => {
  * scratch, minAgeMs, now, lsof (binary), rigAlive(dir) => bool, yes.
  */
 export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), scratch = null, minAgeMs = 2 * HOUR, now = Date.now(),
-  lsof = "lsof", rigAlive = rigAliveViaCli, yes = false } = {}) {
+  lsof = "lsof", rigAlive = rigAliveViaCli, yes = false, force = false, uid = process.getuid(), beforeRemove = null } = {}) {
+  if (minAgeMs < MIN_SAFE_AGE_MS && !force) throw new Error(`--min-age under ${MIN_SAFE_AGE_MS / 60_000} minutes needs --force (a younger entry may still be in use)`);
   const items = [];
-  const bases = [["temp", tempDir, e => TEMP_PREFIXES.some(p => e.startsWith(p))], ["scratch", scratch, () => true]];
+  const bases = [["temp", tempDir, isTempName], ["scratch", scratch, () => true]];
   let opens = null, opensError = null;
   try { opens = [...new Set(openPaths(lsof).flatMap(p => { try { return [p, realpathSync(p)]; } catch { return [p]; } }))]; } catch (e) { opensError = e.message; }
 
@@ -104,6 +137,7 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
     try {
       const st = lstatSync(path);
       if (st.isSymbolicLink()) { item.why = "symlink"; return; }
+      if (st.uid !== uid) { item.why = `owned by uid ${st.uid}, not ${uid}`; return; }
       const m = measure(path);
       item.bytes = m.bytes;
       const idle = now - m.newest;
@@ -115,7 +149,14 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
       }
       if (!yes) { item.status = "would-remove"; return; }
       if (now - measure(path).newest < (extra?.minIdleMs ?? minAgeMs)) { item.why = "touched while scanning"; return; }
-      rmSync(path, { recursive: true, force: true });
+      beforeRemove?.(path);   // test seam: something may take the dir between the snapshot and here
+      // Rename first so no new process can find it by its name, then look again with a per-path lsof; put it back on any doubt.
+      const parked = name.startsWith(DELETING) ? path : join(base, DELETING + name);
+      if (parked !== path) { if (existsSync(parked)) { item.why = "a parked copy already exists"; return; } renameSync(path, parked); }
+      let why;
+      try { why = openUnder(parked, lsof); } catch (e) { why = `in-use re-check failed: ${e.message}`; }
+      if (why) { if (parked !== path) renameSync(parked, path); item.why = why; return; }
+      rmSync(parked, { recursive: true, force: true });
       item.status = "removed";
     } catch (e) { item.status = "failed"; item.why = e.message; }
   };
@@ -126,13 +167,13 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
     try { real = refuseBase(dir, target === "temp" ? "the temp dir" : "the scratch dir"); } catch (e) { if (e.code === "ENOENT") continue; throw e; }
     for (const name of readdirSync(real).sort()) {
       if (!match(name)) continue;
-      consider(target, real, name, target === "temp" && name.startsWith("plen-run-")
+      consider(target, real, name, target === "temp" && name.replace(DELETING, "").startsWith("plen-run-")
         ? { check: (p, n) => { const pid = ownerPid(p, n); return pid === null ? "owner unreadable" : pidAlive(pid) ? `owner pid ${pid} alive` : ""; } } : undefined);
     }
   }
 
   if (rigRoot && existsSync(rigRoot)) {
-    const real = realpathSync(rigRoot);
+    const real = refuseBase(rigRoot, "the rig dir");
     for (const name of readdirSync(real).sort()) {
       const dir = join(real, name);
       if (!lstatSync(dir).isDirectory()) continue;
@@ -159,12 +200,12 @@ function parseDuration(s) {
 
 if (import.meta.main) {
   const a = process.argv.slice(2), opt = n => { const i = a.indexOf(n); return i < 0 ? undefined : a[i + 1]; };
-  const known = new Set(["--yes", "--verbose", "--min-age", "--scratch"]);
+  const known = new Set(["--yes", "--verbose", "--force", "--min-age", "--scratch"]);
   const bad = a.find((x, i) => x.startsWith("--") && !known.has(x) || !x.startsWith("--") && !["--min-age", "--scratch"].includes(a[i - 1]));
-  if (bad) { console.error(`unknown argument ${bad}\nusage: bun run clean [--yes] [--min-age 2h] [--scratch <dir>] [--verbose]`); process.exit(2); }
+  if (bad) { console.error(`unknown argument ${bad}\nusage: bun run clean [--yes] [--min-age 2h [--force]] [--scratch <dir>] [--verbose]`); process.exit(2); }
   const yes = a.includes("--yes");
   try {
-    const { items } = clean({ yes, minAgeMs: parseDuration(opt("--min-age") ?? "2h"), scratch: opt("--scratch") ?? null });
+    const { items } = clean({ yes, minAgeMs: parseDuration(opt("--min-age") ?? "2h"), force: a.includes("--force"), scratch: opt("--scratch") ?? null });
     const mb = b => `${(b / 1e6).toFixed(1)} MB`.padStart(9);
     const shown = items.filter(i => i.status !== "kept" || a.includes("--verbose")), all = a.includes("--verbose") || shown.length <= 25;
     for (const i of all ? shown : [...shown].sort((x, y) => y.bytes - x.bytes).slice(0, 25)) console.log(`${i.status.padEnd(12)}${mb(i.bytes)}  ${i.target.padEnd(7)} ${i.path}${i.why ? `  (${i.why})` : ""}`);

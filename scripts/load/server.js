@@ -51,17 +51,21 @@ function freePort() {
  *   onChild: called with the child process as soon as it is spawned, before the server is up (a caller that must
  *   stop it on a signal can't wait for this function to return).
  *   main: the server script (server/main.js; a test passes a stub to prove readiness comes from /health).
+ *   alsoClean: more dirs to remove with the server's own, also when it dies as an orphan (the run's own dir).
+ *   onCleanup: called with the cleanup function as soon as the dirs exist (a caller stopped by a signal during startup
+ *   must remove them; it has no server object yet).
  *   keep: leave the server's data dir (when this function made it) and its working dir on disk after stop(); by
  *   default both are removed when the server stops, and also when it exits as an orphan (see below).
  * @returns {Promise<{ pid: number, port: number, httpUrl: string, wsUrl: string, board: string, dataDir: string, cwd: string, child: any, lines: () => object[], stop: () => Promise<void> }>}
  */
-export async function startServer({ tokensPath, dataDir, env = {}, nofile = 65536, logPath, timeoutMs = 20000, keep = false, main = MAIN, onChild }) {
+export async function startServer({ tokensPath, dataDir, env = {}, nofile = 65536, logPath, timeoutMs = 20000, keep = false, main = MAIN, alsoClean = [], onChild, onCleanup }) {
   const tokens = readFileSync(tokensPath, "utf8");   // first: a bad path leaves nothing behind
   const ownData = !dataDir;
   dataDir ??= mkdtempSync(join(tmpdir(), "plenary-load-data-"));
   const cwd = mkdtempSync(join(tmpdir(), "plenary-load-cwd-"));
-  const scratch = keep ? [] : [cwd, ...(ownData ? [dataDir] : [])];
+  const scratch = keep ? [] : [cwd, ...(ownData ? [dataDir] : []), ...alsoClean];
   const cleanup = () => { for (const d of scratch) try { rmSync(d, { recursive: true, force: true }); } catch { /* gone */ } };
+  onCleanup?.(cleanup);   // before anything can fail or be signalled: the caller can clean up from here on
   const file = logPath ? createWriteStream(logPath, { mode: 0o600 }) : null;
   let lastErr;
   // The port is picked here (read back from a bound port 0), so readiness is an HTTP /health answer, not a log line.

@@ -150,7 +150,7 @@ had not reached its client, which was resyncing, when the drain ended.)
 - **Joined in time (since p8-load5 round 2):** a client welcomed more than 10 s after its first connect counts as
   joined late (`clients.lateJoined`): the run is INCOMPLETE, so a server that welcomes everyone only at the end of the run
   cannot read VALID with no op due.
-- **Rejoin grace:** a client that dropped and is reconnecting when generation ends gets up to 3 s of the drain to come
+- **Rejoin grace:** a client whose connection dropped within 3 s before the end of generation and is reconnecting gets up to 3 s after the drain to come
   back before "connected at the end" is read: a drop just before the end that recovers reads VALID, a permanent one
   still reads INCOMPLETE.
 - **Why 99% of echoes, not all:** a client resyncing at the drain's end can miss its own echo without any loss

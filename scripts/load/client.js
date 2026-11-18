@@ -35,7 +35,8 @@ const now = () => Date.now();
 export const DUE_TICKS = 1.5;
 // A client must be welcomed within this long of its first connect, or it counts as joined too late (a server that
 // answers everyone in the last seconds of a run has not served the audience); and a client that dropped and is
-// reconnecting when generation ends gets this long, in the drain, to come back before "connected at the end" is read.
+// reconnecting when generation ends (its welcomed connection was lost within this long before the end) gets this long
+// after the drain to come back before "connected at the end" is read.
 export const JOIN_CEILING_MS = 10000;
 export const REJOIN_GRACE_MS = 3000;
 /** The op rate (ticks/s) a role generates at: editors on opRate, annotators on the faster of notes and comments. */
@@ -54,7 +55,7 @@ export class LoadClient {
     this.url = url; this.board = board; this.token = token; this.role = role; this.name = name; this.cfg = cfg; this.stats = stats;
     this.replica = makeReplica(name);
     this.ws = null; this.ownClose = false; this.running = true; this.generating = false;
-    this.armed = false; this.firstWelcomeAt = null; this.firstConnectAt = null;   // armed: generation starts at the first welcome (the due clock)
+    this.armed = false; this.firstWelcomeAt = null; this.firstConnectAt = null; this.lastDropAt = null;   // lastDropAt: when a welcomed connection was last lost (not a failed reconnect attempt)   // armed: generation starts at the first welcome (the due clock)
     this.helloAt = null; this.liveFrom = Infinity; this.welcomedOnce = false; this.welcomed = false;
     this.writeAt = new Map();   // op id → { t: first write time (ms), acked, echoed }; gone once both are seen
     this.timers = new Set(); this.flushTimer = null;
@@ -84,6 +85,7 @@ export class LoadClient {
     ws.onclose = ev => {
       this.stats.closeCode(ev.code);
       if (ws !== this.ws) return;
+      if (this.welcomed) this.lastDropAt = now();
       this.ws = null; this.welcomed = false;
       if (!this.ownClose) this.replica.connectionFailed();
       this.retry();
@@ -159,7 +161,9 @@ export class LoadClient {
   }
 
   closeSocket() {
-    const ws = this.ws; this.ws = null; this.welcomed = false;
+    const ws = this.ws; this.ws = null;
+    if (this.welcomed) this.lastDropAt = now();
+    this.welcomed = false;
     if (ws) { this.ownClose = true; try { ws.close(1000, "load client"); } catch { /* closed */ } }
   }
 

@@ -17,8 +17,8 @@ async function cli(args) {
   const [stdout, stderr, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
   return { stdout, stderr, code };
 }
-const tokensFile = (dir, n) => {
-  const t = {}; for (let i = 0; i < n; i++) t[`lt-g5TOK${i}`] = { name: `g${i}`, role: "editor" };
+const tokensFile = (dir, n, role = "editor") => {
+  const t = {}; for (let i = 0; i < n; i++) t[`lt-g5TOK${i}`] = { name: `g${i}`, role };
   const p = join(dir, "t.json"); writeFileSync(p, JSON.stringify(t), { mode: 0o600 }); return p;
 };
 
@@ -106,9 +106,9 @@ function midServer({ welcomeDelay = 0, drop = null, dropAfter = 1500, refuse = "
   });
   return { url: `ws://127.0.0.1:${server.port}/ws`, stop: () => { clearTimeout(timer); server.stop(true); } };
 }
-async function liveRun(url, extra = [], { editors = 4, duration = 5, opRate = 4 } = {}) {
+async function liveRun(url, extra = [], { editors = 4, duration = 5, opRate = 4, viewers = 0 } = {}) {
   const dir = tmp("plenary-load-g5live-");
-  const r = await cli(["--url", url, "--board", "b", "--tokens", tokensFile(dir, editors), "--editors", String(editors), "--ramp", "10", "--duration", String(duration), "--drain", "1", "--op-rate", String(opRate), "--cursor-rate", "0", "--out", join(dir, "out"), ...extra]);
+  const r = await cli(["--url", url, "--board", "b", "--tokens", tokensFile(dir, viewers || editors, viewers ? "viewer" : "editor"), ...(viewers ? ["--editors", "0", "--viewers", String(viewers)] : ["--editors", String(editors)]), "--ramp", "10", "--duration", String(duration), "--drain", "1", "--op-rate", String(opRate), "--cursor-rate", "0", "--out", join(dir, "out"), ...extra]);
   return { ...r, res: JSON.parse(readFileSync(join(dir, "out", "result.json"), "utf8")) };
 }
 
@@ -157,7 +157,7 @@ test("live CLI: clients dropped at once and welcomed back late read INCOMPLETE (
   expect(r.res.ops.due).toEqual(["editor"]);
   expect(r.res.ops.skippedOffline).toBeGreaterThan(r.res.ops.made.total);
   expect([r.res.ops.present, r.res.complete, r.code]).toEqual([false, false, 1]);
-  expect(r.stdout).toContain("**INCOMPLETE (");   // "no editor op was made" or "N ops were skipped offline against M made": made before the drop varies
+  expect(r.stdout).toMatch(/\*\*INCOMPLETE \(.*skipped offline/);   // "no editor op was made though … ops skipped offline" or "N ops were skipped offline against M made": which depends on ops made before the drop
 }, 30000);
 
 // L3 (p8-load5v LOW 4): one client dropped 200 ms before generation ends and let back in at once is back within the
@@ -169,6 +169,17 @@ test("live CLI: one client dropped just before the end and let back in reads VAL
   expect(r.res.connections.rejoins).toBeGreaterThanOrEqual(1);
   expect([r.res.clients.connectedAtEnd, r.res.clients.stayed, r.res.complete, r.code]).toEqual([4, true, true, 0]);
   expect(r.stdout).toContain("**VALID**");
+}, 30000);
+
+// A long outage that happens to end inside the grace is still an outage (p8-load5v2 MEDIUM): viewers only, so nothing
+// but "connected at the end" can catch it. Dropped at 0.5 s (3.9 s before generation ends), welcomed back 4.5 s later plus
+// the reconnect wait: after generation ends (about 4.4 s), inside the 3 s after it.
+scenarios.longOutage = withServer({ drop: "all", dropAfter: 500, rejoinDelay: 4500 }, s => liveRun(s.url, [], { viewers: 4, duration: 4 }));
+test("live CLI: a long outage that ends inside the rejoin grace still reads INCOMPLETE (the grace is for a drop just before the end)", async () => {
+  const r = await scenario("longOutage");
+  expect(r.res.ops.due).toEqual([]);                                 // nothing but "stayed" can catch it
+  expect([r.res.clients.stayed, r.res.complete, r.code]).toEqual([false, false, 1]);
+  expect(r.stdout).toContain("**INCOMPLETE (only ");
 }, 30000);
 
 scenarios.permanentNearEnd = withServer({ drop: "one", dropAfter: 3200, refuse: "close" }, s => liveRun(s.url, [], { duration: 3 }));

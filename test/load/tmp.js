@@ -9,6 +9,9 @@ import { join, basename } from "node:path";
 
 // One scratch dir for the whole process, even if each test file gets its own copy of this module.
 export const SCRATCH = process.env.PLENARY_TEST_SCRATCH || mkdtempSync(join(process.env.TMPDIR || tmpdir(), "plenary-load-test-"));
+// The TMPDIR the process had before this module (kept across the module being evaluated again in a copy).
+export const ORIG_TMPDIR = process.env.PLENARY_TEST_ORIG_TMPDIR !== undefined ? (process.env.PLENARY_TEST_ORIG_TMPDIR || undefined) : process.env.TMPDIR;
+process.env.PLENARY_TEST_ORIG_TMPDIR = ORIG_TMPDIR ?? "";
 process.env.PLENARY_TEST_SCRATCH = SCRATCH;
 process.env.TMPDIR = SCRATCH;
 /** Make sure the scratch dir exists and TMPDIR names it (each file's cleanTmp removes the whole dir; the next file's beforeAll(useScratch) makes it again). */
@@ -23,6 +26,7 @@ export const strays = () => (useScratch(), readdirSync(SCRATCH)).filter(n => !ma
 export function cleanTmp() {
   const left = strays();
   rmSync(SCRATCH, { recursive: true, force: true });   // the dir too: after the last file nothing is left
+  if (ORIG_TMPDIR === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = ORIG_TMPDIR;   // not a deleted dir for the files that run after
   made.clear();
   if (left.length) throw new Error(`temp dirs left behind by the code under test: ${left.join(", ")}`);
 }

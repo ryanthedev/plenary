@@ -86,10 +86,13 @@ export async function runWorker(job, { onProgress, cpuUsage = process.cpuUsage.b
   // An op can settle by its entry before its ack arrives: wait for both (writeAt empties only when both are seen).
   while (Date.now() - drainStart < job.drainMs && (pending() > 0 || clients.some(c => c.writeAt.size > 0))) await Bun.sleep(100);
   stats.counts.drainMs = Date.now() - drainStart;
-  // A client that dropped just before the end and is reconnecting gets a short, bounded grace to come back: a
+  // A client whose connection dropped just before the end and is reconnecting gets a short, bounded grace (after the drain) to come back: a
   // transient drop that recovers reads as connected, a permanent one still does not.
-  const graceEnd = Date.now() + (job.rejoinGraceMs ?? REJOIN_GRACE_MS);
-  while (Date.now() < graceEnd && clients.some(c => c.welcomedOnce && !c.welcomed && !c.gone)) await Bun.sleep(50);
+  // Only a client whose connection was lost within the grace of the end of generation: a long outage that happens to
+  // end inside the grace is still an outage.
+  const grace = job.rejoinGraceMs ?? REJOIN_GRACE_MS, graceEnd = Date.now() + grace;
+  const recentDrop = c => c.welcomedOnce && !c.welcomed && !c.gone && c.lastDropAt !== null && c.lastDropAt >= job.genEndAt - grace;
+  while (Date.now() < graceEnd && clients.some(recentDrop)) await Bun.sleep(50);
   const ceiling = job.joinCeilingMs ?? JOIN_CEILING_MS;
   stats.counts.lateJoined = clients.filter(c => c.firstWelcomeAt !== null && c.firstWelcomeAt - c.firstConnectAt > ceiling).length;
   stats.counts.unanswered = pending();

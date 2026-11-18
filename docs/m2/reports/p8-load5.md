@@ -130,3 +130,14 @@ Nothing was weakened: every live scenario still runs a real CLI against a real o
 - **Output cap:** `hygiene.test.js` runs a stub server that logs 2 MB and then listens. The log file gets all 2 MB, the kept stdout and stderr stay under `HEAD_BYTES` plus one chunk, and `/health` readiness still works. Mutant "cap removed": killed.
 - **Live SIGHUP:** `dev-google.js` takes `DEV_GOOGLE_PORT`, which moves the listening port only (unset: 8080, and the redirect URI is unchanged). `dev-google.test.js` starts it with fake credentials on a free port, checks `/` answers, sends SIGHUP, SIGINT and SIGTERM in turn, and asserts exit 0 and the port released. Mutants "SIGHUP not handled" and "port override ignored": both killed.
 - **Full `bun test` on this branch:** 1590 pass, 155 skip, 0 fail, 1745 tests in 95 files, 251 s, 0 temp entries left in a fresh TMPDIR.
+
+### Round 2 fixes after p8-load5v2 (1 MEDIUM, 5 LOWs)
+
+1. **MEDIUM, rejoin grace turned a long outage into VALID.** Clients now record `lastDropAt` (when a welcomed connection was lost; failed reconnect attempts do not count). The grace waits only for clients whose connection was lost within 3 s before generation ended. Test: viewers only, dropped 3.9 s before the end and welcomed back after it, inside the 3 s: INCOMPLETE.
+2. **Signal during `--local` server startup** left the server's dirs. `startServer({ onCleanup })` hands the cleanup function to `run()` before anything can fail; the signal path calls it. Test: SIGTERM and SIGHUP sent as soon as the server's cwd dir appears (before `/health`): exit 2 and an empty TMPDIR.
+3. **SIGKILL without `--out`** left the run's own dir (it holds the dev tokens). `startServer({ alsoClean })` puts it in the orphaned server's `PLENARY_LOAD_CLEAN` list. The SIGKILL test now runs with and without `--out`.
+4. **`tmp.js`** left `TMPDIR` on a deleted dir: `cleanTmp` restores the original, `useScratch` sets the scratch again. Test: `hygiene.test.js` last test.
+5. **Wording:** the grace is "up to 3 s after the drain" (header, README, report). I kept the code and fixed the words: the grace has to be independent of `--drain` (`--drain 0` still needs it), and it now only applies to a recent drop, so it cannot be abused to wait.
+6. **guards5** late-rejoin headline now matches `/\*\*INCOMPLETE \(.*skipped offline/`. (A first attempt with `[^)]*` flaked: "editor(s)" holds a `)`; caught by a run and fixed.)
+
+Mutants (fresh copy `scratchpad/load5-r3-<pid>`): grace for any dropped client, startup cleanup not handed over, run dir not in the orphan list, TMPDIR not restored: 4 of 4 killed. Gate: 3 runs, 89 pass, 0 fail, 0 temp entries.

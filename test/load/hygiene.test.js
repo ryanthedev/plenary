@@ -3,7 +3,7 @@
 // dir behind, so every other file in this directory checks "leaves nothing" too.)
 
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { tmp, cleanTmp, useScratch, childEnv, scenarioGroup, SCRATCH } from "./tmp.js";
+import { tmp, cleanTmp, useScratch, childEnv, scenarioGroup, SCRATCH, ORIG_TMPDIR } from "./tmp.js";
 import { writeFileSync, readFileSync, readdirSync, existsSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { startServer, stopChild, HEAD_BYTES } from "../../scripts/load/server.js";
@@ -153,9 +153,32 @@ test("createBoard gives up on a server that never answers (and does not echo the
   } finally { hang.stop(true); }
 });
 
+test("a stop signal while the --local server is still starting leaves no temp dirs", async () => {
+  const { dir, env } = privateEnv();
+  for (const sig of ["SIGTERM", "SIGHUP"]) {
+    const p = Bun.spawn([process.execPath, RUN, "--local", "--editors", "1", "--duration", "30", "--out", join(dir, "out-" + sig)], { stdout: "ignore", stderr: "pipe", env });
+    const end = Date.now() + 15000;
+    // the server's dirs exist from the moment startServer starts; signal right then, before it can answer /health
+    while (!readdirSync(dir).some(n => n.startsWith("plenary-load-cwd-")) && Date.now() < end) await Bun.sleep(2);
+    p.kill(sig);
+    expect(await p.exited).toBe(2);
+  }
+  expect(readdirSync(dir).filter(n => !n.startsWith("out-"))).toEqual([]);
+}, 30000);
+
 test("every subprocess the load tooling runs is bounded by a timeout", () => {
   for (const f of ["run.js", "server.js", "client.js", "worker.js", "tokens.js", "stats.js"]) {
     const src = readFileSync(join(import.meta.dir, "../../scripts/load", f), "utf8").split("\n").filter(l => !l.trimStart().startsWith("//"));
     for (const l of src.filter(l => /spawnSync\(/.test(l))) expect(l).toContain("timeout");
   }
+});
+
+test("cleanTmp puts TMPDIR back (a later test file must not find it pointing at a deleted dir); useScratch sets it again", () => {
+  expect(process.env.TMPDIR).toBe(SCRATCH);
+  cleanTmp();
+  expect(process.env.TMPDIR).toBe(ORIG_TMPDIR);
+  if (ORIG_TMPDIR !== undefined) expect(existsSync(process.env.TMPDIR)).toBe(true);
+  expect(existsSync(SCRATCH)).toBe(false);
+  useScratch();
+  expect([process.env.TMPDIR, existsSync(SCRATCH)]).toEqual([SCRATCH, true]);
 });

@@ -158,11 +158,11 @@ test("an op acked twice counts one ack; a later op never acked keeps the run INC
 
 // ---- finding 2: SIGKILL to run.js: the --local server and the workers exit on their own ----
 
-test("SIGKILL to a --local run mid-load: its server and both workers exit on their own within a few seconds", async () => {
+for (const withOut of [true, false]) test(`SIGKILL to a --local run mid-load ${withOut ? "" : "(no --out: the run's own dir holds the dev tokens) "}: its server and both workers exit on their own within a few seconds, and nothing is left on disk`, async () => {
   // Killed after a progress line (the workers have their job, so their clients' timers and sockets keep them alive:
   // a worker killed before its job would end anyway, its loop empty, and prove nothing about the watch).
   const out = tmp("plenary-load-kill-");
-  const p = Bun.spawn([process.execPath, RUN, "--local", "--editors", "1", "--viewers", "2", "--procs", "2", "--ramp", "10", "--duration", "60", "--out", out], { stdout: "pipe", stderr: "pipe", env: env() });
+  const p = Bun.spawn([process.execPath, RUN, "--local", "--editors", "1", "--viewers", "2", "--procs", "2", "--ramp", "10", "--duration", "60", ...(withOut ? ["--out", out] : [])], { stdout: "pipe", stderr: "pipe", env: env() });
   let server = 0, workers = [];
   try {
     const reader = p.stdout.getReader(), dec = new TextDecoder(), end = Date.now() + 20000;

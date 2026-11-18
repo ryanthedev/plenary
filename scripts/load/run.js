@@ -19,7 +19,7 @@
 // role is due when one of its clients was welcomed at least 1.5/rate s before the generation ended (each client's
 // clock starts at its own first welcome; its first op comes within 1.5/rate s of that); a run with no role due
 // (--op-rate 0 and no annotators, viewers only) needs no ops: it is judged on its joins (and any ops made). The run
-// (a client that dropped and is reconnecting when generation ends gets up to 3 s of the drain to come back) must also have stayed: every planned client connected at the drain's end (result.clients.stayed), and, with a role
+// (a client whose connection dropped within 3 s before the end of generation and is reconnecting gets up to 3 s after the drain to come back) must also have stayed: every planned client connected at the drain's end (result.clients.stayed), and, with a role
 // due, no more ops skipped offline than made (result.ops.present): a server that drops everyone mid-run and refuses
 // their rejoins reads INCOMPLETE, not VALID. 1 = the run finished but is
 // not good (report.md's headline says INVALID or INCOMPLETE and why); 2 = bad arguments or setup, or stopped by
@@ -418,8 +418,8 @@ export async function run(o, { log = s => console.log(s), signals = false, grace
   // Every child this run starts, until it exits: stopped on the way out, whatever the way.
   const children = new Set();
   const track = c => { children.add(c); c.exited.then(() => children.delete(c)); };
-  let stopping = false, wallTimer;
-  const cleanupDirs = () => { server?.cleanup?.(); if (tempDir && !o["keep-data"]) rmSync(tempDir, { recursive: true, force: true }); };
+  let stopping = false, wallTimer, serverCleanup = null;
+  const cleanupDirs = () => { serverCleanup?.(); if (tempDir && !o["keep-data"]) rmSync(tempDir, { recursive: true, force: true }); };
   const wall = new Promise((_, reject) => {
     wallTimer = setTimeout(() => { log(`load: --max-wall ${wallS} s passed: stopping`); stopChildren(children, grace.graceMs, grace.finalMs); reject(new Error(`the run took longer than --max-wall (${wallS} s) and was stopped`)); }, wallS * 1000);
   });
@@ -436,7 +436,7 @@ export async function run(o, { log = s => console.log(s), signals = false, grace
       const dir = out ?? (tempDir = mkdtempSync(join(tmpdir(), "plenary-load-")));
       if (!tokensPath) tokensPath = writeTokens(join(dir, "tokens"), makeTokens({ editors: counts.editor, annotators: counts.annotator, viewers: counts.viewer, viewersPerUser })).jsonPath;
       else readTokensByRole(tokensPath);   // a bad tokens file stops here, before a server waits on it
-      server = await startServer({ tokensPath, env: o.serverEnv ?? {}, nofile: Math.max(fd.nofile, total + 1024), logPath: join(dir, "server.log"), keep: !!o["keep-data"], onChild: track });
+      server = await startServer({ tokensPath, env: o.serverEnv ?? {}, nofile: Math.max(fd.nofile, total + 1024), logPath: join(dir, "server.log"), keep: !!o["keep-data"], alsoClean: tempDir ? [tempDir] : [], onCleanup: c => { serverCleanup = c; }, onChild: track });
       url = server.wsUrl; if (!o["create-board"]) board ??= server.board;
       log(`local server pid ${server.pid} on port ${server.port}, board ${server.board}, log ${join(dir, "server.log")}`);
       if (o["keep-data"]) log(`--keep-data: kept ${[server.dataDir, server.cwd, tempDir].filter(Boolean).join(", ")}`);

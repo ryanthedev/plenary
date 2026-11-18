@@ -79,21 +79,25 @@ export function newHolder(hostname) {
 /**
  * @param {{ store: object, bus: object, log?: object, codec?: object, now?: () => number, appendTimeoutMs?: number,
  *   sweepMs?: number, heartbeatMs?: number, pageSize?: number, pageBytes?: number, rules?: object, maxBusBytes?: number,
- *   holder?: string, hostname?: string, leaseTtlMs?: number, watchIdleMs?: number, monotonic?: () => number }} o
+ *   holder?: string, hostname?: string, leaseTtlMs?: number, watchIdleMs?: number, monotonic?: () => number, timers?: object }} o
  *   now: the rooms' clock (entries' `at`, the 30 s gateway silence). rules: per rules version { W, H, every } (tests).
  *   holder: this instance's lease holder id (tests); default newHolder(hostname). leaseTtlMs: the Store lease's ttl
  *   (default 10 s), renewed every ttl/3. watchIdleMs: a board held elsewhere is watched (for a takeover) while some
  *   open() or inbox message for it came in this long (default 60 s). monotonic: the lease's clock (default
  *   performance.now(); tests move it to fake a stall). Never the rooms' `now`.
+ *   timers: { setTimeout, clearTimeout, setInterval, clearInterval } this host's timers (default the globals).
  */
 export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now = Date.now, appendTimeoutMs = 4_000, sweepMs = 1_000,
   heartbeatMs = 2_000, pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rules, maxBusBytes = bus.maxBytes ?? MAX_BUS_BYTES, tailFoldBytes = 8 * 1024 * 1024,
-  holder, hostname = globalThis.process?.env?.HOSTNAME, leaseTtlMs = 10_000, watchIdleMs = 60_000, monotonic = performance.now.bind(performance) }) {
+  holder, hostname = globalThis.process?.env?.HOSTNAME, leaseTtlMs = 10_000, watchIdleMs = 60_000, monotonic = performance.now.bind(performance), timers = globalThis }) {
   // tailFoldBytes: besides the Room's own rule (every 1,000 entries, once the log since the last checkpoint is half
   //   its size), the host checkpoints once that log reaches this many chars AND half the state's size, so a board
   //   rewritten in a few huge ops still gets a bounded catch-up, and a rewrite never costs more than 2× the log.
   //   (An extension of § Recovery "When": a byte trigger, asked for since the scaffold; see the p2-swap report.)
   checkLeaseTtl(leaseTtlMs);
+  // Every timer of this host runs on `timers` (tests pass fake ones and advance them, with `monotonic` and the Store's
+  // clock moved in step); the names shadow the globals for this whole function.
+  const { setTimeout, clearTimeout, setInterval, clearInterval } = timers;
   const perf = monotonic;   // the lease's clock: elapsed time on this host only (tests fake a stall with it)
   const me = holder ?? newHolder(hostname);
   const renewEvery = Math.floor(leaseTtlMs / 3);

@@ -231,14 +231,15 @@ test("a Registry that fails at start turns the menu OFF with one warn line; the 
   const lines = [];
   const adapters = {
     postgresStore: async () => sqliteStore({ path: join(tempDir(), "p.db") }),
-    postgresRegistry: async () => ({ ...sqliteRegistry({ path: join(tempDir(), "r.db") }), tenantAdminsAmong: async () => { throw new Error("relation is gone"); } }),
+    postgresRegistry: async () => ({ ...sqliteRegistry({ path: join(tempDir(), "r.db") }), tenantAdminsAmong: async () => { throw Object.assign(new Error("connect to postgres://u:SECRETPW@h failed"), { code: "ECONNREFUSED" }); } }),
     natsBus: async () => memoryBus({}),
   };
   const app = await start({ PLENARY_DATA_DIR: tempDir(), PORT: "0", LOG_LEVEL: "warn", DATABASE_URL: "postgres://x@127.0.0.1:1/p", NATS_URL: "nats://127.0.0.1:1", COOKIE_KEY: "c".repeat(32), PLENARY_DEV_TOKENS: TOK }, { adapters, write: l => lines.push(l) });
   try {
     expect((await get(app)).status).toBe(404);
     const got = lines.join("");
-    expect(got.split("\n").filter(l => l.includes("dev sign-in menu") && l.includes("OFF: the Registry could not say who is a tenant admin")).length).toBe(1);
+    expect(got.split("\n").filter(l => l.includes("dev sign-in menu") && l.includes("OFF: the Registry could not say who is a tenant admin (ECONNREFUSED)")).length).toBe(1);
+    expect(got).not.toContain("SECRETPW");
     expect(got).not.toContain("dev sign-in menu is ON");
   } finally { await app.stop(); }
 });
@@ -273,4 +274,21 @@ test("the Registry gets the bound so it can cancel its own query (timeoutMs is p
       devSignIn: { board: "b-1", users: [{ name: "ada", token: "t", role: "owner" }], hosts: ["localhost"], waitMs: 1234 } } });
   expect((await handle(new Request("http://localhost:1/auth/dev", { headers: { host: "localhost:1" } }))).status).toBe(200);
   expect(seen).toEqual({ timeoutMs: 1234 });
+});
+
+test("a fractional waitMs is rounded to whole ms before it reaches the Registry (Postgres ignores a fractional bound)", async () => {
+  const { httpRoutes } = await import("../../server/auth/http.js");
+  const { memoryRegistry } = await import("../../server/auth/registry.js");
+  const { sessions } = await import("../../server/auth/session.js");
+  const { tenancy } = await import("../../server/auth/tenancy.js");
+  const { devAuth } = await import("../../server/auth/dev.js");
+  const seen = [];
+  const registry = { ...memoryRegistry({ now: Date.now }), tenantAdminsAmong: async (u, o) => { seen.push(o.timeoutMs); return []; } };
+  for (const waitMs of [1234.6, 0.2, 2.5]) {
+    const handle = httpRoutes({ registry, sessions: await sessions({ key: "s".repeat(32) }), tenancy: tenancy({ registry }), dev: devAuth({ enabled: true, tokens: { t: { name: "ada" } } }),
+      config: { cookieKey: "k".repeat(32), postLoginUrl: "http://localhost:1/", boardUrl: "http://localhost:1/?board={board}", publicUrl: "http://localhost:1",
+        devSignIn: { board: "b-1", users: [{ name: "ada", token: "t", role: "owner" }], hosts: ["localhost"], waitMs } } });
+    await handle(new Request("http://localhost:1/auth/dev", { headers: { host: "localhost:1" } }));
+  }
+  expect(seen).toEqual([1235, 1, 3]);
 });

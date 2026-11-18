@@ -187,10 +187,10 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     return f(tx);
   });
   /** A Postgres timeout as a coded rejection; anything else unchanged. */
-  const timedOut = (name, err) => {
+  const timedOut = (name, err, stmtLimit = stmtMs) => {
     if (err?.errno === LOCK_TIMEOUT) return new PgRegistryError("lock-timeout", `postgres registry: ${name} waited over ${lockMs} ms for a lock`, { cause: err });
     // 57014 is any cancel; only statement_timeout's is ours to name (an operator's pg_cancel_backend passes through).
-    if (err?.errno === CANCELED && /statement timeout/.test(err.message)) return new PgRegistryError("statement-timeout", `postgres registry: ${name} ran past ${stmtMs} ms (statement_timeout)`, { cause: err });
+    if (err?.errno === CANCELED && /statement timeout/.test(err.message)) return new PgRegistryError("statement-timeout", `postgres registry: ${name} ran past ${stmtLimit} ms (statement_timeout)`, { cause: err });
     return err;
   };
   const one = async (q, text, params) => (await q.unsafe(text, params))[0] ?? null;
@@ -244,10 +244,13 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       const ask = q => q.unsafe(`SELECT DISTINCT member FROM ${A} WHERE member = ANY($1::text[])`, [us]);
       // With a bound, the server itself cancels the query when it runs over (statement_timeout, this transaction only), so
       // a caller that gave up does not leave it holding a pool slot until the pool's own limit.
-      const rows = Number.isSafeInteger(timeoutMs) && timeoutMs > 0
-        ? await db.begin(async tx => { await tx.unsafe("SELECT set_config('statement_timeout', $1, true)", [String(timeoutMs)]); return ask(tx); })
-        : await ask(db);
-      return rows.map(r => r.member);
+      const bound = Number.isSafeInteger(timeoutMs) && timeoutMs > 0;
+      try {
+        const rows = bound
+          ? await db.begin(async tx => { await tx.unsafe("SELECT set_config('statement_timeout', $1, true)", [String(timeoutMs)]); return ask(tx); })
+          : await ask(db);
+        return rows.map(r => r.member);
+      } catch (err) { throw timedOut("tenantAdminsAmong", err, bound ? timeoutMs : stmtMs); }
     },
     async addTenantAdmin(tenant, user) {
       ready();

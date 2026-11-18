@@ -355,7 +355,12 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
       try {
         const admins = new Set(await registry.tenantAdminsAmong([...offered.keys()].map(n => "dev:" + n), { timeoutMs: 5000 }));
         for (const n of [...offered.keys()]) if (admins.has("dev:" + n)) { offered.delete(n); log.warn(`dev sign-in menu: ${n} is a tenant admin in the registry, so it is not offered`); }
-      } catch (err) { registryDown = "the Registry could not say who is a tenant admin"; log.debug("dev sign-in menu: the admin check failed", { err }); }
+      } catch (err) {
+        // Why, in a few characters: an error code or name (never its message, which may quote a URL), so the default log level shows the cause.
+        const code = [err?.code, err?.errno, err?.name].find(c => typeof c === "string" && /^[\w.:-]{1,40}$/.test(c)) ?? "error";
+        registryDown = `the Registry could not say who is a tenant admin (${code})`;
+        log.debug("dev sign-in menu: the admin check failed", { err });
+      }
     }
     off = registryDown ?? devMenuOff({ users: offered.size, host, google: !!oidc, gateway: roles.gateway, publicHost: publicHostOf(env.PUBLIC_URL) });
   }

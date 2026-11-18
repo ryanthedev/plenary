@@ -365,7 +365,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
       // scripts/admin-bootstrap.js --admin dev:<name>, even after this server started) is never offered. A Registry that
       // cannot answer fails closed: nothing is published.
       let admins;
-      const waitMs = config.devSignIn.waitMs ?? DEV_MENU_WAIT_MS;
+      const w = Number(config.devSignIn.waitMs ?? DEV_MENU_WAIT_MS), waitMs = Number.isFinite(w) && w > 0 ? Math.max(1, Math.round(w)) : DEV_MENU_WAIT_MS;   // whole ms: the Registry ignores a fractional bound
       try { admins = new Set(await bounded(registry.tenantAdminsAmong(devMenu.users.map(u => "dev:" + u.name), { timeoutMs: waitMs }), waitMs)); }
       catch (e) {
         // Fail closed with a hint, at most one short line per 10 s (no stack, no token).

@@ -134,7 +134,7 @@ function runRigCli(args, { live = false, cwd = dir, shielded = false } = {}) {
  * Ctrl-C) kills it before it runs any code. Retrying is safe: `down` ignores SIGINT/SIGTERM/SIGHUP from its first
  * statement, and nothing else here signals it, so a signal death means it never ran; and `down` is idempotent. No JS
  * API spawns with signals blocked or with an atomic setsid (and macOS has no setsid(1)), so the race cannot be avoided,
- * only detected. In a 1 ms SIGINT storm a try dies with p = 0.08 (idle) to 0.17 (load 15) (rig-tools-v6), so 20 tries leak ~p^20.
+ * only detected. In a 1 ms SIGINT storm a try dies with p = 0.08 (idle) to 0.17 (load 15), measured in rig fix round 6, so 20 tries leak ~p^20.
  */
 async function rigDown(args, opts) {
   for (let tries = 1; ; tries++) {

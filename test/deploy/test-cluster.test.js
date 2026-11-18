@@ -21,6 +21,13 @@ test("H1: test-cluster starts the rig services-only, never a node or the LB", ()
   expect(up).not.toMatch(/--gateways|--hosts/);
 });
 
+test("M5 (v5): every `down` (the teardown's and the reaper's) goes through rigDown, which reruns one killed in the spawn window", () => {
+  expect(SCRIPT.match(/runRigCli\(\s*\[\s*"down"/g)?.length).toBe(1);   // only inside rigDown
+  const rigDown = SCRIPT.slice(SCRIPT.indexOf("async function rigDown("));
+  expect(rigDown.slice(0, rigDown.indexOf("\n}\n"))).toMatch(/runRigCli\(\["down"/);
+  expect(SCRIPT.match(/await rigDown\(\[/g)?.length).toBe(2);   // teardown and reaper
+});
+
 // Files that name the gated variables without reading the rig's cluster (they set them explicitly, assert a refusal, or
 // are rig-owned) are allowed exactly the lines in gated-allow.json: the line text (trimmed), not a count and not a line
 // number (room-host-child.js is a helper of room-host-proc only; the guard below checks its importers). A new line, an edited line (a second read appended to it), or a read swapped in for a deleted mention is

@@ -15,6 +15,8 @@ export function virtualTime({ start = 1_000_000, settle }) {
   const timers = { setTimeout: (fn, ms) => add(fn, ms), setInterval: (fn, ms) => add(fn, ms, Math.max(1, ms)), clearTimeout: clear, clearInterval: clear };
   return {
     timers, now: () => t, pending: () => q.size,
+    /** How far off each pending one-shot timer is (intervals left out). */
+    oneShots: () => [...q.values()].filter(h => !h.every).map(h => h.at - t),
     /** Run every timer due within `ms`, in order, settling after each; then the clock is `ms` later. */
     async advance(ms) {
       const end = t + ms;

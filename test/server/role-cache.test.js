@@ -16,6 +16,8 @@ function countingRegistry() {
   const raw = memoryRegistry(), n = { grant: 0, grants: 0 };
   return { n, registry: { ...raw, grant: async (b, u) => { n.grant++; return raw.grant(b, u); }, grants: async b => { n.grants++; return raw.grants(b); } } };
 }
+/** One timed pass, run now: the interval is an hour in these tests, so a pass is something the test starts, not waits for. */
+const timedPass = r => r.server.gateway.recheck(r.ids.board, "timed");
 const join = async (r, name, extra) => { const s = await r.sock(); s.send(hello(r, name, extra)); return s; };
 
 test("a second hello of a connected user is answered from the cache; a `{ board }` revoke still closes and refuses", async () => {
@@ -60,13 +62,14 @@ test("the board's cached roles go when its last socket closes (no watch, no inva
 }, 20000);
 
 test("the timed pass reads through auth.rolesFor in chunks (no per-user role calls) and closes a lost-message revoke", async () => {
-  const r = await rig({ cache: { ttlMs: 3_600_000 }, limits: { roleRecheckMs: 200, recheckBatch: 2 } });
+  const r = await rig({ cache: { ttlMs: 3_600_000 }, limits: { roleRecheckMs: 3_600_000, recheckBatch: 2 } });
   const names = ["editor0", "editor1", "editor2", "editor3", "editor4"];
   const socks = [];
   for (const nm of names) { const s = await join(r, nm); await s.next(m => m.t === "welcome"); socks.push(s); }
   const roleCalls = r.calls.role;
   await r.registry.setGrant(r.ids.board, "dev:editor3", null);       // the `grants` message was lost
-  expect((await socks[3].whenClosed(5000)).code).toBe(1008);
+  await timedPass(r);
+  expect((await socks[3].whenClosed(30_000)).code).toBe(1008);
   expect(r.calls.role).toBe(roleCalls);                              // the pass made no per-user call
   expect(r.cacheCalls.rolesFor).toBeGreaterThanOrEqual(3);           // 5 users in chunks of 2
   const again = await join(r, "editor3", { client: "back" });        // and the cache didn't keep the old role
@@ -91,29 +94,31 @@ const outcome = s => Promise.race([s.next(m => m.t === "welcome").then(() => "we
 
 test("GAP-M4: a revoke message arriving while a timed pass runs: a NEW hello in that window is refused", async () => {
   const g = gated();
-  const r = await rig({ cache: { ttlMs: 3_600_000 }, registry: g.registry, limits: { roleRecheckMs: 300 } });
+  const r = await rig({ cache: { ttlMs: 3_600_000 }, registry: g.registry, limits: { roleRecheckMs: 3_600_000 } });
   const a = await join(r, "editor"); await a.next(m => m.t === "welcome");
   const h = g.hold("grants");
+  const timed = timedPass(r);
   await h.inP;                                                     // a timed pass is inside rolesFor
   const warm = await join(r, "editor", { client: "warm" }); await warm.next(m => m.t === "welcome");   // refills the cache after the pass began
   await r.registry.setGrant(r.ids.board, "dev:editor", null);
   await publish(r, {});                                            // the grants pass queues behind the held one
   const b = await join(r, "editor", { client: "window" });
   const got = await outcome(b);
-  h.open();
+  h.open(); await timed;
   expect(got).toBe("closed 1008");
   await r.stop();
 }, 20000);
 
 test("GAP-M6 (LOW A): a cached user who left (others stay), revoke message lost: after one timed pass their new hello is refused", async () => {
-  const r = await rig({ cache: { ttlMs: 3_600_000 }, limits: { roleRecheckMs: 300 } });
+  const r = await rig({ cache: { ttlMs: 3_600_000 }, limits: { roleRecheckMs: 3_600_000 } });
   const keep = await join(r, "viewer"); await keep.next(m => m.t === "welcome");
   const x = await join(r, "editor"); await x.next(m => m.t === "welcome");
   await x.close();
   await until(async () => (await r.health()).body.gateway.conns === 1, "x gone");
   await r.registry.setGrant(r.ids.board, "dev:editor", null);      // lost
   const p0 = (await r.health()).body.gateway.rechecks.passes;
-  await until(async () => (await r.health()).body.gateway.rechecks.passes >= p0 + 1, "a pass");
+  await timedPass(r);
+  expect((await r.health()).body.gateway.rechecks.passes).toBeGreaterThanOrEqual(p0 + 1);
   const y = await join(r, "editor", { client: "back" });
   expect(await outcome(y)).toBe("closed 1008");
   await r.stop();
@@ -122,7 +127,7 @@ test("GAP-M6 (LOW A): a cached user who left (others stay), revoke message lost:
 test("M7: hellos waiting on the room when a timed pass runs (one served from the cache) ask again: a lost revoke refuses them", async () => {
   let gatedRoom = true, openRoom;
   const roomGate = new Promise(res => { openRoom = res; });
-  const r = await rig({ cache: { ttlMs: 3_600_000 }, limits: { roleRecheckMs: 300 },
+  const r = await rig({ cache: { ttlMs: 3_600_000 }, limits: { roleRecheckMs: 3_600_000 },
     wrapStore: s => ({ ...s, acquire: async (...a) => { if (gatedRoom) await roomGate; return s.acquire(...a); } }) });   // room-host opens a room by lease acquire (p4-host)
   const keep = await join(r, "viewer"); await keep.next(m => m.t === "welcome");   // keeps the board's watch (viewers open no room)
   const a = await join(r, "editor");                               // reads its role (cached), then waits on the room
@@ -131,7 +136,8 @@ test("M7: hellos waiting on the room when a timed pass runs (one served from the
   await until(() => r.calls.role >= 3, "b's role check");
   await r.registry.setGrant(r.ids.board, "dev:editor", null);      // the `grants` message is lost
   const p0 = (await r.health()).body.gateway.rechecks.passes;
-  await until(async () => (await r.health()).body.gateway.rechecks.passes >= p0 + 1, "a timed pass (a and b are not live: it can't see them)");
+  await timedPass(r);                                               // a and b are not live: it can't see them
+  expect((await r.health()).body.gateway.rechecks.passes).toBeGreaterThanOrEqual(p0 + 1);
   gatedRoom = false; openRoom();
   expect(await outcome(a)).toBe("closed 1008");
   expect(await outcome(b)).toBe("closed 1008");
@@ -141,13 +147,14 @@ test("M7: hellos waiting on the room when a timed pass runs (one served from the
 
 test("finding 1: a timed pass whose rolesFor never settles is bounded by recheckLookupMs; a revoke still closes", async () => {
   let hang = false;
-  const r = await rig({ cache: {}, limits: { roleRecheckMs: 200, recheckLookupMs: 300 }, wrapAuth: a => ({ ...a, rolesFor: (b, ids) => (hang ? new Promise(() => {}) : a.rolesFor(b, ids)) }) });
+  const r = await rig({ cache: {}, limits: { roleRecheckMs: 3_600_000, recheckLookupMs: 100 }, wrapAuth: a => ({ ...a, rolesFor: (b, ids) => (hang ? new Promise(() => {}) : a.rolesFor(b, ids)) }) });
   const s = await join(r, "editor"); await s.next(m => m.t === "welcome");
-  hang = true; await sleep(400);                                    // a timed pass is now stuck in rolesFor
+  hang = true;
+  await timedPass(r);                                               // stuck in rolesFor until the lookup bound cuts it off
   hang = false;
   await r.registry.setGrant(r.ids.board, "dev:editor", null);
   await publish(r, {});
-  expect((await s.whenClosed(4000)).code).toBe(1008);
+  expect((await s.whenClosed(30_000)).code).toBe(1008);
   expect((await r.health()).body.gateway.rechecks.timeouts).toBeGreaterThanOrEqual(1);
   await r.stop();
 }, 20000);
@@ -162,13 +169,15 @@ test("V1: a timed-out rolesFor chunk whose answer (read BEFORE a lost revoke) la
     if (hold) { hold = false; entered(); await gate; } // ...answered late
     return snap;
   } };
-  const r = await rig({ cache: { ttlMs: 3_600_000 }, registry, limits: { roleRecheckMs: 1_000, recheckLookupMs: 300 } });
+  const r = await rig({ cache: { ttlMs: 3_600_000 }, registry, limits: { roleRecheckMs: 3_600_000, recheckLookupMs: 100 } });
   const keep = await join(r, "viewer"); await keep.next(m => m.t === "welcome");
   const x = await join(r, "editor"); await x.next(m => m.t === "welcome");
   hold = true;
+  const timed = timedPass(r);
   await inP;                                                       // a timed pass read the rows (editor still granted)
   await r.registry.setGrant(r.ids.board, "dev:editor", null);      // revoke; the `grants` message is lost
-  await until(async () => (await r.health()).body.gateway.rechecks.timeouts >= 1, "the chunk timed out");
+  await timed;                                                     // the chunk times out (recheckLookupMs) and the pass ends
+  expect((await r.health()).body.gateway.rechecks.timeouts).toBeGreaterThanOrEqual(1);
   release(); await sleep(20);                                      // the stale answer lands now
   const y = await join(r, "editor", { client: "after" });
   expect(await outcome(y)).toBe("closed 1008");

@@ -132,7 +132,9 @@ const OP_ID = /^\s*\{\s*"t"\s*:\s*"op"\s*,\s*"id"\s*:\s*"([^"\\]{1,256})"/;
  *   log?: object, codec?: object, id?: string, limits?: Partial<typeof LIMITS>, now?: () => number,
  * }} o
  */
-export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed }) {
+export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed, timers = globalThis }) {
+  // Every timer of the gateway runs on `timers` (tests pass fake ones, with `now` moved in step); the names shadow the globals here.
+  const { setTimeout, clearTimeout, setInterval, clearInterval } = timers;
   const lim = { ...LIMITS, ...limits };
   const maxBusBytes = bus.maxBytes ?? MAX_BUS_BYTES;
   // § Messages, hello.tab. A connection's tab key is "t:<tab>" for a hello with `tab`, else "c:<conn id>" (a tab of

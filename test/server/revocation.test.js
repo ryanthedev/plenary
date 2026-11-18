@@ -5,6 +5,7 @@ import { rig, tokenOf } from "./rig.js";
 import { cleanup, sleep, until, deferred } from "./helpers.js";
 import { subjects } from "../../server/bus/port.js";
 import { sessions as makeSessions } from "../../server/auth/session.js";
+import { virtualTime } from "./virtual.js";
 import { makeElement } from "../../packages/core/model.js";
 import { expiryWait } from "../../server/gateway.js";
 
@@ -85,30 +86,38 @@ test("M1: a re-check whose role lookup throws fails closed: `unavailable` 1013, 
 }, 20000);
 
 test("M3: a share link passing its expiresAt closes the live connection it let in, on the timed re-check (no grants message)", async () => {
-  const r = await rig({ limits: { roleRecheckMs: 200 } });
-  const link = await r.registry.createLink({ board: r.ids.board, role: "editor", expiresAt: Date.now() + 800, by: "dev:owner" });
+  // The gateway's clock and timers are virtual (frozen until advanced): the link's 800 ms and the 200 ms re-check run out on them.
+  const V = virtualTime({ start: Date.now(), settle: () => new Promise(res => setImmediate(res)) });
+  const r = await rig({ now: V.now, timers: V.timers, limits: { roleRecheckMs: 200 } });
+  const link = await r.registry.createLink({ board: r.ids.board, role: "editor", expiresAt: V.now() + 800, by: "dev:owner" });
   await r.registry.addLinkUse(link.id, "dev:stranger");
   const s = await r.sock(); s.send(hello(r, "stranger"));
   expect(await s.next(m => m.t === "welcome")).toMatchObject({ role: "editor" });
   const owner = await r.sock(); owner.send(hello(r, "owner")); await owner.next(m => m.t === "welcome");
-  expect((await s.whenClosed(5000)).code).toBe(1008);
+  await V.advance(700);
+  expect(s.closed).toBe(null);                                            // not yet: the link still has 100 ms
+  await V.advance(400);                                                   // past 800, and a re-check (every 200) has run
+  expect((await s.whenClosed()).code).toBe(1008);
   expect(s.msgs.at(-1)).toEqual({ t: "error", code: "auth", message: "your access to this board was removed" });
-  await sleep(500);
+  await V.advance(1_000); await sleep(20);
   expect(owner.closed).toBe(null);                                        // a grant that still holds is left alone
   await r.stop();
 }, 20000);
 
 test("M2 end to end: a real session token (sessions() verify, integer exp) closes its socket when it expires", async () => {
-  const sess = await makeSessions({ key: "k".repeat(40), ttlSec: 2 });
+  // Virtual gateway clock and timers, frozen until advanced; the session token's 2 s are on the same clock.
+  const V = virtualTime({ start: Date.now(), settle: () => new Promise(res => setImmediate(res)) });
+  const sess = await makeSessions({ key: "k".repeat(40), ttlSec: 2, now: V.now });
   const token = await sess.issue({ user: "dev:editor", name: "editor" });
   expect(Number.isInteger((await sess.verify(token))?.exp)).toBe(true);
-  const r = await rig({ wrapAuth: a => ({ ...a, verify: async t => (t === token ? sess.verify(t) : a.verify(t)) }) });
+  const r = await rig({ now: V.now, timers: V.timers, wrapAuth: a => ({ ...a, verify: async t => (t === token ? sess.verify(t) : a.verify(t)) }) });
   const s = await r.sock(); s.send({ t: "hello", v: 1, token, board: r.ids.board, since: 0, client: "sx" });
   await s.next(m => m.t === "welcome");
-  expect((await s.whenClosed(5000)).code).toBe(1008);
+  await V.advance(2_001);
+  expect((await s.whenClosed()).code).toBe(1008);
   expect(s.msgs.at(-1)).toEqual({ t: "error", code: "auth", message: "your sign-in expired" });
   const late = await r.sock(); late.send({ t: "hello", v: 1, token, board: r.ids.board, since: 0, client: "late" });
-  expect((await late.whenClosed(5000)).code).toBe(1008);                 // and the token no longer opens one
+  expect((await late.whenClosed()).code).toBe(1008);                     // and the token no longer opens one
   await r.stop();
 }, 20000);
 

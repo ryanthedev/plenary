@@ -33,7 +33,7 @@ export const tokenOf = name => `${SECRET}-${name}-token`;
 
 /**
  * @param {{ verifyDelayMs?: number, cache?: object, wrapStore?: (s: object) => object, wrapAuth?: (a: object) => object,
- *   wrapRegistry?: (r: object) => object, wrapBus?: (b: object) => object, now?: () => number, limits?: object, host?: object, dir?: string, registry?: object, ids?: object }} [o]
+ *   wrapRegistry?: (r: object) => object, wrapBus?: (b: object) => object, now?: () => number, timers?: object, limits?: object, host?: object, dir?: string, registry?: object, ids?: object }} [o]
  * Pass `dir`, `registry` and `ids` from an earlier rig to restart "the same server" on the same data.
  */
 export async function rig(o = {}) {
@@ -54,7 +54,8 @@ export async function rig(o = {}) {
   const names = [...ROLES, ...Array.from({ length: 8 }, (_, i) => "editor" + i), "stranger"];
   const dev = devAuth({ enabled: true, tokens: Object.fromEntries(names.map(n => [tokenOf(n), { name: n }])) });
   // `o.cache`: roleCache options → hellos read through the role cache, as server/main.js wires it (p5-load).
-  let auth = authPort({ dev, tenancy: o.cache ? roleCache({ registry, ...o.cache }) : tenancy({ registry }) });
+  const clock = o.now ? { now: o.now } : {};   // the same clock reads links' and invites' expiry
+  let auth = authPort({ dev, tenancy: o.cache ? roleCache({ registry, ...clock, ...o.cache }) : tenancy({ registry, ...clock }) });
   const calls = { verify: 0, role: 0, board: 0 };
   const cacheCalls = { rolesFor: 0, invalidate: 0 };
   const inner = auth;
@@ -76,7 +77,7 @@ export async function rig(o = {}) {
   bus.subscribe(subjects.inbox(ids.tenant, ids.otherBoard), m => inbox.push(m));
   // Catch-up frames are the gateway's now (its board feed): the scaffold's room-host knobs map onto the feed's.
   const feed = { ...(o.host?.chunkBytes ? { chunkBytes: o.host.chunkBytes } : {}), ...(o.host?.tailFoldBytes ? { rebaseBytes: Math.max(1, Math.floor(o.host.tailFoldBytes / 4)) } : {}), ...(o.limits?.feed ?? {}) };
-  const server = createServer({ auth, registry: reg, store, bus, blobs: diskBlobs({ dir: join(dir, "blobs") }), log, port: 0, limits: { opRate: 1e6, opBurst: 1e6, ...(o.limits ?? {}), feed }, host: { heartbeatMs: HEARTBEAT_MS, ...o.host }, ...(o.now ? { now: o.now } : {}) });   // the gateway's op pace is off unless a test sets it
+  const server = createServer({ auth, registry: reg, store, bus, blobs: diskBlobs({ dir: join(dir, "blobs") }), log, port: 0, limits: { opRate: 1e6, opBurst: 1e6, ...(o.limits ?? {}), feed }, host: { heartbeatMs: HEARTBEAT_MS, ...o.host }, ...(o.now ? { now: o.now } : {}), ...(o.timers ? { timers: o.timers } : {}) });   // the gateway's op pace is off unless a test sets it
 
   const self = {
     dir, lines, log, registry, ids, store, rawStore, bus, server, inbox, calls, cacheCalls,

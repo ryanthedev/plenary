@@ -2,6 +2,7 @@
 // § Pacing (writer cap, op bucket, queue cap), revocation by token expiry, and rule 6's connection lists.
 import { test, expect, afterAll } from "bun:test";
 import { rig, client, tokenOf, settled, rawSock } from "./rig.js";
+import { virtualTime } from "./virtual.js";
 import { cleanup, sleep, until } from "./helpers.js";
 import { subjects } from "../../server/bus/port.js";
 import { splitEntries } from "../../server/room-host.js";
@@ -180,14 +181,15 @@ test("§ Pacing: over-rate ops wait in the gateway in order and are all acked; p
 });
 
 test("a connection is closed with `auth` when its token's expiry passes; an expired token is refused at hello", async () => {
-  // The expiry is stamped when verify runs (1-2 s ahead), not before the rig is built: on a loaded machine, building
-  // the rig and saying hello took over a second, the token was already expired at hello, and the welcome never came
-  // (bun's 5 s default timeout, manager t18m, 2026-11-12). `expired` switches to a past expiry for the second half.
-  // The gateway's clock runs 0.7 s ahead (`now`): the 1-2 s of the token's life left at verify is 0.3-1.3 s of waiting, and never less than the 0.3 s a hello needs.
+  // The gateway's clock and timers are virtual and start frozen: the token's life is 2 s of that clock, which the test runs
+  // out (the old version waited 1-2 real seconds, and on a loaded machine the token was gone before the hello arrived).
+  // `expired` switches to a past expiry for the second half.
+  const V = virtualTime({ start: Date.now(), settle: () => new Promise(res => setImmediate(res)) });
   let expired = false;
-  const r = await rig({ now: () => Date.now() + 700, wrapAuth: a => ({ ...a, verify: async t => { const id = await a.verify(t); return id && { ...id, exp: Math.floor(Date.now() / 1000) + (expired ? -1 : 2) }; } }) });
+  const r = await rig({ now: V.now, timers: V.timers, wrapAuth: a => ({ ...a, verify: async t => { const id = await a.verify(t); return id && { ...id, exp: Math.floor(V.now() / 1000) + (expired ? -1 : 2) }; } }) });
   const s = await r.sock(); s.send(hello(r, "editor")); await s.next(m => m.t === "welcome");
-  expect((await s.whenClosed(5_000)).code).toBe(1008);
+  await V.advance(2_001);                                              // the token's 2 s pass on the gateway's clock
+  expect((await s.whenClosed()).code).toBe(1008);
   expect(s.msgs.at(-1)).toMatchObject({ t: "error", code: "auth", message: "your sign-in expired" });
   expired = true;
   const late = await r.sock(); late.send(hello(r, "editor"));

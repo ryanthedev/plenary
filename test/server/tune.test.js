@@ -1,6 +1,7 @@
 // p2-tune: re-check passes at scale (R1-R3), the error rule (R2), a foreign entry at seq + 1 (R4) and `here`.
 // Waits are on events (the gateway's stats, messages, closes), not on time, except where pacing itself is tested.
 import { test, expect, afterAll } from "bun:test";
+import { virtualTime } from "./virtual.js";
 import { rig, tokenOf } from "./rig.js";
 import { cleanup, sleep, until, deferred } from "./helpers.js";
 import { subjects } from "../../server/bus/port.js";
@@ -16,9 +17,9 @@ const idle = r => until(() => gw(r).stats().rechecks.running === 0, "no re-check
  * A rig whose `auth.role` can be held at a gate and made to throw. `tok-<name>` tokens are distinct users
  * (`dev:<name>`); `grant(names, role)` gives them a role on the test board.
  */
-async function roleRig(limits = {}) {
+async function roleRig(limits = {}, rigOpts = {}) {
   const ctl = { gate: null, boom: false, calls: 0, during: 0, hung: 0, hang: new Set(), fail: new Set(), holdAfter: new Set() };
-  const r = await rig({ limits: { maxConnsPerUser: 100000, roleRecheckMs: 3_600_000, ...limits }, wrapAuth: a => ({
+  const r = await rig({ ...rigOpts, limits: { maxConnsPerUser: 100000, roleRecheckMs: 3_600_000, ...limits }, wrapAuth: a => ({
     // "tok-<name>" or "tok-<name>~<email>": the email lets a test give one user's tabs different identities (LOW 4).
     verify: async t => { if (!t.startsWith("tok-")) return a.verify(t); const [n, email] = t.slice(4).split("~"); return { user: "dev:" + n, name: n, ...(email ? { email } : {}) }; },
     // ctl.hang: that user's next lookup never settles. ctl.fail: that user's lookups throw. ctl.holdAfter: the lookup
@@ -243,23 +244,27 @@ test("H2: 8 users whose lookups fail are closed after their retries; 300 healthy
 }, 60000);
 
 test("M3: the retry backoff is per connection: a second failing user after a close-out is closed as fast as the first", async () => {
-  const { r, ctl, open } = await roleRig({ recheckRetries: 3, recheckRetryMs: 20 });
+  // The gateway's clock and timers are virtual and frozen between steps, so the one pending one-shot timer is the retry
+  // and its delay is exactly the backoff: a user's own is 20, 40, 80 ms; one carried over from the first user would
+  // start at 160 for the second. The test runs each retry by advancing that far.
+  const V = virtualTime({ start: Date.now(), settle: () => new Promise(res => setImmediate(res)) });
+  const { r, ctl, open } = await roleRig({ recheckRetries: 3, recheckRetryMs: 20 }, { now: V.now, timers: V.timers });
   const [a, b] = await open(["a", "b"]);
-  // The waits are read off the retry timers the gateway sets (their delays), not timed: a user's own backoff is
-  // 20, 40, 80 ms; a backoff carried over from the first user would show as 160, 320, 640 for the second.
-  const realSet = globalThis.setTimeout, delays = [];
-  globalThis.setTimeout = (fn, ms, ...rest) => { if (ms >= 15 && ms <= 700) delays.push(ms); return realSet(fn, ms, ...rest); };
   const waitsOf = async (s, user) => {
-    delays.length = 0; ctl.fail.add(user);
+    ctl.fail.add(user); const waits = [];
     await gw(r).recheck(r.ids.board, "timed");
-    await s.whenClosed(30_000); ctl.fail.delete(user);
-    return delays.filter(ms => [20, 40, 80, 160, 320, 640].includes(ms));
+    for (let i = 0; !s.closed && i < 10; i++) {
+      const due = V.oneShots(); expect(due.length).toBe(1);
+      waits.push(due[0]);
+      const passes = gw(r).stats().rechecks.passes;
+      await V.advance(due[0]);
+      await until(() => gw(r).stats().rechecks.passes > passes, "the retry pass");
+    }
+    expect((await s.whenClosed(30_000)).code).toBe(1013); ctl.fail.delete(user);
+    return waits;
   };
-  let wa, wb;
-  try { wa = await waitsOf(a, "dev:a"); wb = await waitsOf(b, "dev:b"); } finally { globalThis.setTimeout = realSet; }   // no clean pass in between
-  expect(Math.max(...wa)).toBeLessThanOrEqual(80);                        // 20 + 40 + 80 ms of waits
-  expect(wb.length).toBeGreaterThan(0);
-  expect(Math.max(...wb)).toBeLessThanOrEqual(80);                        // was 160/320/640 ms waits
+  expect(await waitsOf(a, "dev:a")).toEqual([20, 40, 80]);
+  expect(await waitsOf(b, "dev:b")).toEqual([20, 40, 80]);                // no clean pass in between: still its own, not 160 / 320 / 640
   await r.stop();
 }, 20000);
 

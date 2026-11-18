@@ -35,13 +35,15 @@ const str = v => typeof v === "string";
  * SQLite's busy handler can't run past the deadline either, and no sleep runs past it. `f` always runs at least once.
  * The caller restores its own busy_timeout afterwards.
  */
-function onBusyRetry(db, deadline, f) {
+function onBusyRetry(db, deadline, f, clock = Date.now, onAttempt) {
   for (let delay = 5; ; delay = Math.min(delay * 2, 100)) {
-    db.run(`PRAGMA busy_timeout=${Math.max(0, deadline - Date.now())}`);
+    const budget = Math.max(0, deadline - clock());
+    onAttempt?.(budget);
+    db.run(`PRAGMA busy_timeout=${budget}`);
     try { return f(); }
     catch (err) {
       const busy = typeof err?.code === "string" && (err.code.startsWith("SQLITE_BUSY") || err.code.startsWith("SQLITE_LOCKED"));
-      const left = deadline - Date.now();
+      const left = deadline - clock();
       if (!busy || left <= 0) throw err;
       Bun.sleepSync(Math.min(left, delay + Math.floor(Math.random() * delay)));
     }
@@ -49,11 +51,14 @@ function onBusyRetry(db, deadline, f) {
 }
 
 /**
- * @param {{ path: string, now?: () => number, fullfsync?: boolean, busyTimeoutMs?: number }} o
- *   `path` is a file (":memory:" for throwaway use).
+ * @param {{ path: string, now?: () => number, fullfsync?: boolean, busyTimeoutMs?: number,
+ *   busy?: { clock?: () => number, onAttempt?: (budgetMs: number) => void } }} o
+ *   `path` is a file (":memory:" for throwaway use). `busy` (tests): the clock the start-up budget is read on
+ *   (default Date.now) and a hook told the busy_timeout each start-up attempt was given.
  * @returns {import("../auth/registry-port.js").Registry & { close(): Promise<void>, pragmas(): object }}
  */
-export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTimeoutMs = 5000 }) {
+export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTimeoutMs = 5000, busy = {} }) {
+  const { clock = Date.now, onAttempt } = busy;
   const db = new Database(path, { create: true, strict: true });
   let open = true;
   const wait = Math.max(0, Math.floor(busyTimeoutMs));
@@ -64,10 +69,10 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
   // already reads WAL (it is persistent), and retry it, and the first schema transaction, with a short backoff
   // until the same busy_timeout budget runs out, in total (onBusyRetry caps each attempt's busy wait at what is
   // left). Every later statement waits through the busy handler as usual, with the full busy_timeout again.
-  const deadline = Date.now() + wait;
+  const deadline = clock() + wait;
   onBusyRetry(db, deadline, () => {
     if (db.query("PRAGMA journal_mode").get()?.journal_mode !== "wal") db.run("PRAGMA journal_mode=WAL");
-  });
+  }, clock, onAttempt);
   db.run("PRAGMA synchronous=FULL");
   db.run(`PRAGMA fullfsync=${fullfsync ? "ON" : "OFF"}`);
   db.run(`PRAGMA checkpoint_fullfsync=${fullfsync ? "ON" : "OFF"}`);
@@ -97,7 +102,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     db.run(`CREATE TABLE IF NOT EXISTS reg_link_uses (
       board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES reg_links(id), n INTEGER NOT NULL,
       PRIMARY KEY (board, member, link))`);
-  }).immediate());
+  }).immediate(), clock, onAttempt);
   db.run(`PRAGMA busy_timeout=${wait}`);                     // start-up spent part of it; runtime gets the whole budget
 
   const q = {

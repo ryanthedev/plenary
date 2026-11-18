@@ -2,10 +2,9 @@
 // (test/load/fake-server.js) for reconnects, rejoins, resent ops, catch-up and the drain; and with the worker's
 // real lag and CPU samplers for saturation. (p8-load2: findings 2-8 of the p8-loadv review.)
 
-import { test, expect, afterAll } from "bun:test";
-import { tmp, cleanTmp } from "./tmp.js";
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { test, expect, beforeAll, afterAll } from "bun:test";
+import { tmp, cleanTmp, useScratch, childEnv, scenarioGroup } from "./tmp.js";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LoadClient } from "../../scripts/load/client.js";
 import { Stats, runWorker } from "../../scripts/load/worker.js";
@@ -15,11 +14,15 @@ import { makeElement } from "../../packages/core/model.js";
 import { fakeServer, until, busyFrom } from "./fake-server.js";
 import { Hist } from "../../scripts/load/stats.js";
 
-afterAll(cleanTmp);
+beforeAll(useScratch); afterAll(cleanTmp);
+
+// The slow tests that do not measure this process's own event loop (a fake server or a real CLI each, a modelled CPU)
+// run at once, started by the first of them; the two that do (the lag sampler, a quiet worker) run alone after them.
+const group = scenarioGroup(), scenarios = group.fns, scenario = group.get;
 
 // ---- counted once: reconnect, rejoin, resend (V1, V4, V13) ----
 
-test("a dropped writer reconnects once, rejoins once, and its resent op is counted as one op sent", async () => {
+scenarios.reconnect = async () => {
   // The first copy of each op is met by a dropped connection (no ack, no entry); the resend is applied.
   const fake = fakeServer({
     tokens: { tE: { user: "dev:e", role: "editor" } },
@@ -33,6 +36,10 @@ test("a dropped writer reconnects once, rejoins once, and its resent op is count
     c.draw("board");
     await until(() => stats.counts.echoes === 1 && stats.counts.acks === 1, 8000, "echo and ack of the resent op");
   } finally { c.close(); fake.stop(); }
+  return { fake, stats };
+};
+test("a dropped writer reconnects once, rejoins once, and its resent op is counted as one op sent", async () => {
+  const { fake, stats } = await scenario("reconnect");
   // The server saw the same op id twice: the resend really happened.
   expect(fake.opsSeen.length).toBe(2);
   expect(fake.opsSeen[0]).toBe(fake.opsSeen[1]);
@@ -46,7 +53,7 @@ test("a dropped writer reconnects once, rejoins once, and its resent op is count
 
 // ---- catch-up is not delivery (V5) ----
 
-test("entries a client catches up on are not delivery samples; a live one after the welcome is", async () => {
+scenarios.catchUp = async () => {
   const fake = fakeServer({ tokens: { tV: { user: "dev:v", role: "viewer" } } });
   const stamped = (id, lt) => ({ id, stream: "board", op: { elements: [{ ...makeElement("rectangle", { id, x: 0, y: 0, width: 10, height: 10 }), customData: { lt } }] } });
   // Two ops already on the board before the viewer comes: catch-up.
@@ -61,6 +68,10 @@ test("entries a client catches up on are not delivery samples; a live one after 
     fake.entry("dev:other", stamped("live1", Date.now()));
     await until(() => c.replica.applied === 3, 5000, "live entry applied");
   } finally { c.close(); fake.stop(); }
+  return { stats };
+};
+test("entries a client catches up on are not delivery samples; a live one after the welcome is", async () => {
+  const { stats } = await scenario("catchUp");
   const d = stats.hists["delivery.viewer"];
   expect(d.n).toBe(1);
   expect(d.max).toBeLessThan(1000);   // the live one, not a 4-5 s old catch-up entry
@@ -68,7 +79,8 @@ test("entries a client catches up on are not delivery samples; a live one after 
 
 // ---- the drain waits for acks; unacked is reported (M12, V10) ----
 
-test("the drain waits out an ack held after the entry, and reports ops never acked as unacked", async () => {
+const drainMs = 1500;
+scenarios.drain = async () => {
   // The editor's acks come 800 ms after its entries; the annotator's never come. Both are echoed at once.
   const tokensPath = join(tmp("plenary-load-drain-"), "t.json");
   writeFileSync(tokensPath, JSON.stringify({ tE: { name: "w-e", role: "editor" }, tA: { name: "w-a", role: "annotator" } }), { mode: 0o600 });
@@ -79,15 +91,19 @@ test("the drain waits out an ack held after the entry, and reports ops never ack
       if (ws.data.role === "editor") setTimeout(() => ctx.ack(ws, msg.id, e.seq), 800);
     },
   });
-  const t0 = Date.now() + 200, drainMs = 2500;
+  const t0 = Date.now() + 200;
   let r;
   try {
     r = await runWorker({
-      url: fake.url, board: "b", tokensPath, t0, loadFrom: t0, genEndAt: t0 + 2500, drainMs,
+      url: fake.url, board: "b", tokensPath, t0, loadFrom: t0, genEndAt: t0 + 1200, drainMs,
       clients: [{ role: "editor", token: 0, name: "w-e0", startAt: 0 }, { role: "annotator", token: 0, name: "w-a0", startAt: 0 }],
-      cfg: { opRate: 4, noteRate: 4, commentRate: 0, cursorRate: 0, pool: 5 },
+      cfg: { opRate: 8, noteRate: 8, commentRate: 0, cursorRate: 0, pool: 5 },
     });
   } finally { fake.stop(); }
+  return r;
+};
+test("the drain waits out an ack held after the entry, and reports ops never acked as unacked", async () => {
+  const r = await scenario("drain");
   const c = r.stats.counts;
   expect(c.opsSent_editor).toBeGreaterThan(3);
   expect(c.opsSent_annotator).toBeGreaterThan(3);
@@ -96,7 +112,7 @@ test("the drain waits out an ack held after the entry, and reports ops never ack
   expect(c.acks).toBe(c.opsSent_editor);          // the held acks arrived during the drain and were counted
   expect(c.unacked).toBe(c.opsSent_annotator);    // exactly the ops never acked
   expect(c.drainMs).toBeGreaterThanOrEqual(drainMs - 50);   // it waited the whole drain for them
-  expect(c.drainMs).toBeLessThan(drainMs + 1000);           // and the drain only: from t0 it would be ~5.2 s
+  expect(c.drainMs).toBeLessThan(drainMs + 1000);           // and the drain only: from t0 it would be ~2.9 s
 }, 15000);
 
 // ---- saturation, measured by the worker's own samplers (V11, V12, finding 8) ----
@@ -117,7 +133,7 @@ function burn(from, to, chunk, gap) {
 }
 
 test("a worker whose event loop stalls is flagged by its lag sampler (not by CPU)", async () => {
-  const t0 = Date.now(), genEndAt = t0 + 2500;
+  const t0 = Date.now(), genEndAt = t0 + 1600;
   const [r] = await Promise.all([
     runWorker({ url: "ws://127.0.0.1:1/ws", board: "b", tokensPath: noTokens(), t0, loadFrom: t0, genEndAt, drainMs: 0, clients: [], cfg: {} }),
     burn(t0 + 100, genEndAt, 160, 240),   // 160 ms blocks, 40% busy
@@ -129,12 +145,16 @@ test("a worker whose event loop stalls is flagged by its lag sampler (not by CPU
   expect(res.generator.workers[0].lagMs.p99).toBeGreaterThan(LAG_P99_LIMIT_MS);
 }, 15000);
 
-test("a worker pinned during the load phase only is flagged by its CPU sampler, though its whole-run mean is low", async () => {
-  // Ramp 2 s idle, then 4 s of load with the process at 100% of a core (a modelled cpuUsage: no real burning, so the
-  // result cannot depend on how busy this machine is).
-  const t0 = Date.now(), loadFrom = t0 + 2000, genEndAt = loadFrom + 4000;
+scenarios.pinned = async () => {
+  // Ramp 1 s idle, then 3.5 s of load with the process at 100% of a core (a modelled cpuUsage: no real burning, so
+  // the result cannot depend on how busy this machine is). The 1 s samples at 1-2, 2-3 and 3-4 s are wholly inside.
+  const t0 = Date.now(), loadFrom = t0 + 1000, genEndAt = loadFrom + 3500;
   const r = await runWorker({ url: "ws://127.0.0.1:1/ws", board: "b", tokensPath: noTokens(), t0, loadFrom, genEndAt, drainMs: 0, clients: [], cfg: {} }, { cpuUsage: busyFrom(loadFrom) });
-  expect(r.cpuLoad.length).toBeGreaterThanOrEqual(1);
+  return r;
+};
+test("a worker pinned during the load phase only is flagged by its CPU sampler, though its whole-run mean is low", async () => {
+  const r = await scenario("pinned");
+  expect(r.cpuLoad.length).toBeGreaterThanOrEqual(3);   // a sampler that kept one sample would not
   r.lag = new Hist().toJSON();   // the event loop's lag is the machine's, not under test here
   const res = judge(r), w = res.generator.workers[0];
   expect(w.cpuPct.meanAllPhases).toBeLessThan(CPU_MEAN_LIMIT);   // averaged with the idle ramp it would pass
@@ -145,7 +165,7 @@ test("a worker pinned during the load phase only is flagged by its CPU sampler, 
 
 test("a quiet worker's own samplers say it is fine", async () => {
   const t0 = Date.now();
-  const r = await runWorker({ url: "ws://127.0.0.1:1/ws", board: "b", tokensPath: noTokens(), t0, loadFrom: t0, genEndAt: t0 + 1500, drainMs: 0, clients: [], cfg: {} });
+  const r = await runWorker({ url: "ws://127.0.0.1:1/ws", board: "b", tokensPath: noTokens(), t0, loadFrom: t0, genEndAt: t0 + 1200, drainMs: 0, clients: [], cfg: {} });
   const res = judge(r);
   expect(res.valid).toBe(true);
   expect(r.cpu.length).toBeGreaterThanOrEqual(1);
@@ -184,12 +204,16 @@ test("headline and exit code: VALID and 0 only when the generator was fine and e
   expect(exitCode(res)).toBe(1);
 });
 
-test("live CLI: a URL nobody answers headlines INCOMPLETE and exits 1", async () => {
+scenarios.dead = async () => {
   const dead = Bun.serve({ port: 0, fetch: () => new Response("") }); const port = dead.port; dead.stop(true);
   const dir = tmp("plenary-load-dead-"), tokens = join(dir, "t.json");
   writeFileSync(tokens, JSON.stringify({ "lt-deadTOKENxyz": { name: "d-e", role: "editor" } }), { mode: 0o600 });
-  const p = Bun.spawn([process.execPath, join(import.meta.dir, "../../scripts/load/run.js"), "--url", `ws://127.0.0.1:${port}/ws`, "--board", "b", "--tokens", tokens, "--editors", "1", "--ramp", "10", "--duration", "1", "--drain", "0"], { stdout: "pipe", stderr: "pipe", env: { PATH: process.env.PATH, HOME: process.env.HOME } });
+  const p = Bun.spawn([process.execPath, join(import.meta.dir, "../../scripts/load/run.js"), "--url", `ws://127.0.0.1:${port}/ws`, "--board", "b", "--tokens", tokens, "--editors", "1", "--ramp", "10", "--duration", "1", "--drain", "0"], { stdout: "pipe", stderr: "pipe", env: childEnv() });
   const [stdout, , code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+  return { stdout, code };
+};
+test("live CLI: a URL nobody answers headlines INCOMPLETE and exits 1", async () => {
+  const { stdout, code } = await scenario("dead");
   expect(code).toBe(1);
   expect(stdout).toContain("**INCOMPLETE (1 of 1 planned clients never joined)** · 0/1 clients joined");
   expect(stdout).not.toContain("**VALID**");

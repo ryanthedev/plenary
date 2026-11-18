@@ -172,3 +172,17 @@ test("CLI: a Registry it can't open exits 1 and never prints the URL", async () 
   expect(x.o.out).toEqual([]);
   expect(x.o.err.join("\n")).not.toContain("s3cr3t-pw");
 }, 20000);
+
+test("CLI: a database that accepts the connection and never answers fails with exit 1 after the timeout, naming no URL", async () => {
+  // A TCP server that takes the connection and says nothing: the Postgres client waits for a handshake that never comes.
+  const hang = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {}, open() {} } });
+  const x = io();
+  const t = Date.now();
+  try {
+    const code = await run(["--domain", "acme.com", "--admin", "dev:ann"], { DATABASE_URL: `postgres://u:secretpw@127.0.0.1:${hang.port}/db` }, { ...x.io, timeoutMs: 700 });
+    expect(code).toBe(1);
+  } finally { hang.stop(true); }
+  expect(Date.now() - t).toBeLessThan(5000);
+  expect(JSON.parse(x.o.err[0])).toEqual({ ok: false, error: "failed: timed out after 1 s" });
+  expect(x.o.err.join("") + x.o.out.join("")).not.toContain("secretpw");
+}, 15000);

@@ -147,6 +147,12 @@ had not reached its client, which was resyncing, when the drain ended.)
   failing the run; a role with no such client reads like "no role due".
 - **Not judged:** ops skipped for backlog (`ops.skippedBacklog`), and ops skipped offline while fewer than ops made
   (a brief outage). They are reported, not ruled on.
+- **Joined in time (since p8-load5 round 2):** a client welcomed more than 10 s after its first connect counts as
+  joined late (`clients.lateJoined`): the run is INCOMPLETE, so a server that welcomes everyone only at the end of the run
+  cannot read VALID with no op due.
+- **Rejoin grace:** a client that dropped and is reconnecting when generation ends gets up to 3 s of the drain to come
+  back before "connected at the end" is read: a drop just before the end that recovers reads VALID, a permanent one
+  still reads INCOMPLETE.
 - **Why 99% of echoes, not all:** a client resyncing at the drain's end can miss its own echo without any loss
   (`p8-load2/k125b`: 1,096 of 1,097).
 - **Arguments refused (exit 2):** an empty value for any flag (`--tokens ""` too), anything but a plain decimal
@@ -154,6 +160,12 @@ had not reached its client, which was resyncing, when the drain ended.)
   `--duration` under 1 s, and any value past its bound: counts ≤ 1,000,000, `--procs` ≤ 256, `--pool` and
   `--viewers-per-user` ≤ 10,000, `--ramp` ≤ 100,000/s, `--duration` ≤ 3,600 s, `--drain` ≤ 600 s, rates ≤ 1,000/s
   (also in `--help`), an unknown flag (`--op_rate`), a flag given as another flag's value (`--tokens --local`), and a
-  ramp (clients / `--ramp`) over 3,600 s (since p8-load5).
+  ramp (clients / `--ramp`) over 3,600 s (since p8-load5), a flag given twice, and names on `Object.prototype`
+  (`--toString`) (since round 2).
+- **Bounded (since round 2):** `--max-wall <s>` (1-86,400; default plan + 120 s) stops the whole run, setup to drain,
+  and exits 2; every `ps`/`ulimit`/`sysctl` call and every HTTP call has a timeout; stopping a child waits at most
+  SIGTERM 5 s + SIGKILL 2 s; the `--local` server is ready when `GET /health` answers. `--local` removes its temp dirs
+  (server data and working dirs, and the run's own without `--out`) at the end, also when the run is signalled or its
+  server is orphaned; `--keep-data` keeps them and logs their paths.
 - **Nothing left running:** since p8-load4 the `--local` server and the workers also exit on their own within
   about 1 s when `run.js` dies without stopping them (SIGKILL).

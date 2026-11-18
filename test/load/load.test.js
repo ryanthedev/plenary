@@ -1,10 +1,9 @@
 // The load client (scripts/load/): stats on fixed inputs, merging workers, and live runs against a real
 // single-node server/main.js (port 0, temp data dir) started by the run itself (--local).
 
-import { test, expect, afterAll } from "bun:test";
-import { tmp, cleanTmp } from "./tmp.js";
-import { mkdtempSync, readFileSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { test, expect, beforeAll, afterAll } from "bun:test";
+import { tmp, cleanTmp, useScratch, scenarioGroup, childEnv } from "./tmp.js";
+import { readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Hist } from "../../scripts/load/stats.js";
 import { mergeResults, planCounts, planClients, rigConfig, run, buildResult } from "../../scripts/load/run.js";
@@ -12,7 +11,7 @@ import { makeTokens, writeTokens, readTokensByRole } from "../../scripts/load/to
 import { writeFileSync, mkdirSync } from "node:fs";
 
 const RUN = resolve(import.meta.dir, "../../scripts/load/run.js");
-afterAll(cleanTmp);
+beforeAll(useScratch); afterAll(cleanTmp);
 
 // ---- stats ----
 
@@ -103,14 +102,17 @@ test("tokens: files are 0600; roles grouped; rig.json fields read", () => {
 // ---- live, against server/main.js ----
 
 async function cli(args) {
-  const p = Bun.spawn([process.execPath, RUN, ...args], { stdout: "pipe", stderr: "pipe", env: { PATH: process.env.PATH, HOME: process.env.HOME } });
+  const p = Bun.spawn([process.execPath, RUN, ...args], { stdout: "pipe", stderr: "pipe", env: childEnv() });
   const [stdout, stderr, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
   return { stdout, stderr, code };
 }
 
+// The two live runs are independent (own server, own processes): they run at once, started by the first test.
+const group = scenarioGroup(), scenarios = group.fns, scenario = group.get;
+const out100 = tmp("plenary-load-run-");
+scenarios.live100 = () => cli(["--local", "--editors", "5", "--annotators", "10", "--viewers", "85", "--ramp", "200", "--duration", "3", "--drain", "15", "--procs", "2", "--note-rate", "1", "--comment-rate", "1", "--out", out100]);
 test("live, 2 workers: 100 mixed clients join, every editor op is echoed, tokens never printed or saved", async () => {
-  const out = tmp("plenary-load-run-");
-  const r = await cli(["--local", "--editors", "5", "--annotators", "10", "--viewers", "85", "--ramp", "200", "--duration", "3", "--drain", "15", "--procs", "2", "--note-rate", "1", "--comment-rate", "1", "--out", out]);
+  const out = out100, r = await scenario("live100");
   expect(r.code).toBe(0);
   const res = JSON.parse(readFileSync(join(out, "result.json"), "utf8"));
   expect(res.schema).toBe("plenary.load.result/1");
@@ -142,10 +144,11 @@ test("live, 2 workers: 100 mixed clients join, every editor op is echoed, tokens
   expect(r.stdout).toContain("plan: 5 editors, 10 annotators, 85 viewers over 2 worker(s)");
 }, 60000);
 
+const out1013 = tmp("plenary-load-1013-");
+// On a board made through POST /boards (--create-board), as on a rig: the editor's grant and the viewers' memberRole work.
+scenarios.refused = () => run({ local: true, "create-board": true, editors: "1", viewers: "3", "viewers-per-user": "3", ramp: "50", duration: "2", drain: "5", procs: "1", out: out1013, serverEnv: { PLENARY_MAX_CONNS_PER_USER: "2" } }, { log: () => {} });
 test("live: a server that refuses (user connection cap 2, three viewers on one token) is counted as 1013", async () => {
-  const out = tmp("plenary-load-1013-");
-  // On a board made through POST /boards (--create-board), as on a rig: the editor's grant and the viewers' memberRole work.
-  const res = await run({ local: true, "create-board": true, editors: "1", viewers: "3", "viewers-per-user": "3", ramp: "50", duration: "2", drain: "5", procs: "1", out, serverEnv: { PLENARY_MAX_CONNS_PER_USER: "2" } }, { log: () => {} });
+  const res = await scenario("refused");
   expect(res.config.boardCreated).toBe(true);
   expect(res.ops.echoed.editor).toBe(res.ops.sent.editor);
   expect(res.ops.sent.editor).toBeGreaterThan(0);

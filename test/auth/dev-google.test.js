@@ -2,7 +2,7 @@
 // IdP stands in through the harness's injected fetch, and the /signed-in page's own script runs with stubbed browser
 // globals. Port 0; the server is stopped by handle, never by pattern.
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { startDevGoogle, ORIGIN } from "../../scripts/dev-google.js";
+import { startDevGoogle, ORIGIN, makeSafeFetch, safeFetch, FETCH_TIMEOUT_MS, STOP_SIGNALS } from "../../scripts/dev-google.js";
 import { LOGIN_COOKIE, EXCHANGE_COOKIE } from "../../server/auth/http.js";
 import { fakeIdp, CLIENT_ID } from "./fake-idp.js";
 
@@ -80,4 +80,20 @@ test("harness page: a consumer account without a Google-verified email still sig
     { redirect: "manual", headers: { cookie: cookieOf(start, LOGIN_COOKIE) } });
   const page = await runPage(cb.headers.get("location"), cookieOf(cb, EXCHANGE_COOKIE));
   expect(page.text).toBe("signed in as (no Google-verified email; user google:77)");
+});
+
+test("safeFetch times out on a Google that never answers (an error with a code, no URL), and the harness stops on SIGHUP too", async () => {
+  const hang = Bun.serve({ port: 0, fetch: () => new Promise(() => {}) });
+  const t = Date.now();
+  try {
+    const e = await makeSafeFetch(300)(`http://127.0.0.1:${hang.port}/secret-client-id`).catch(x => x);
+    expect(e.message).toBe("google unreachable: TimeoutError");
+    expect(Date.now() - t).toBeLessThan(3000);
+    // a caller's own signal wins over the default
+    const e2 = await makeSafeFetch(60000)(`http://127.0.0.1:${hang.port}/x`, { signal: AbortSignal.timeout(100) }).catch(x => x);
+    expect(e2.message).toBe("google unreachable: TimeoutError");
+  } finally { hang.stop(true); }
+  expect(FETCH_TIMEOUT_MS).toBeGreaterThan(0);
+  expect(typeof safeFetch).toBe("function");
+  expect(STOP_SIGNALS).toEqual(["SIGINT", "SIGTERM", "SIGHUP"]);
 });

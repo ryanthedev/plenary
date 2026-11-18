@@ -33,6 +33,11 @@ const now = () => Date.now();
 // A writer role is due to make ops when a client generates for rate x seconds >= this: its first op comes within
 // 1.5/rate s (ticks are jittered 0.5-1.5 x 1/rate). The clock starts at the client's first welcome (run.js dueRoles).
 export const DUE_TICKS = 1.5;
+// A client must be welcomed within this long of its first connect, or it counts as joined too late (a server that
+// answers everyone in the last seconds of a run has not served the audience); and a client that dropped and is
+// reconnecting when generation ends gets this long, in the drain, to come back before "connected at the end" is read.
+export const JOIN_CEILING_MS = 10000;
+export const REJOIN_GRACE_MS = 3000;
 /** The op rate (ticks/s) a role generates at: editors on opRate, annotators on the faster of notes and comments. */
 export function writerRate(role, cfg) {
   if (role === "editor") return cfg?.opRate ?? 0;
@@ -49,7 +54,7 @@ export class LoadClient {
     this.url = url; this.board = board; this.token = token; this.role = role; this.name = name; this.cfg = cfg; this.stats = stats;
     this.replica = makeReplica(name);
     this.ws = null; this.ownClose = false; this.running = true; this.generating = false;
-    this.armed = false; this.firstWelcomeAt = null;   // armed: generation starts at the first welcome (the due clock)
+    this.armed = false; this.firstWelcomeAt = null; this.firstConnectAt = null;   // armed: generation starts at the first welcome (the due clock)
     this.helloAt = null; this.liveFrom = Infinity; this.welcomedOnce = false; this.welcomed = false;
     this.writeAt = new Map();   // op id → { t: first write time (ms), acked, echoed }; gone once both are seen
     this.timers = new Set(); this.flushTimer = null;
@@ -63,7 +68,7 @@ export class LoadClient {
 
   connect() {
     if (!this.running) return;
-    this.ownClose = false; this.welcomed = false;
+    this.ownClose = false; this.welcomed = false; this.firstConnectAt ??= now();
     let ws;
     try { ws = new WebSocket(this.url); } catch { this.stats.count("connectThrew"); this.retry(); return; }
     this.ws = ws;

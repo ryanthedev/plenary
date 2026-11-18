@@ -4,7 +4,7 @@
 //
 // Also importable: runWorker(job, { onProgress }) runs in-process (tests use it).
 
-import { LoadClient } from "./client.js";
+import { LoadClient, JOIN_CEILING_MS, REJOIN_GRACE_MS } from "./client.js";
 import { Hist } from "./stats.js";
 import { readTokensByRole } from "./tokens.js";
 
@@ -86,6 +86,12 @@ export async function runWorker(job, { onProgress, cpuUsage = process.cpuUsage.b
   // An op can settle by its entry before its ack arrives: wait for both (writeAt empties only when both are seen).
   while (Date.now() - drainStart < job.drainMs && (pending() > 0 || clients.some(c => c.writeAt.size > 0))) await Bun.sleep(100);
   stats.counts.drainMs = Date.now() - drainStart;
+  // A client that dropped just before the end and is reconnecting gets a short, bounded grace to come back: a
+  // transient drop that recovers reads as connected, a permanent one still does not.
+  const graceEnd = Date.now() + (job.rejoinGraceMs ?? REJOIN_GRACE_MS);
+  while (Date.now() < graceEnd && clients.some(c => c.welcomedOnce && !c.welcomed && !c.gone)) await Bun.sleep(50);
+  const ceiling = job.joinCeilingMs ?? JOIN_CEILING_MS;
+  stats.counts.lateJoined = clients.filter(c => c.firstWelcomeAt !== null && c.firstWelcomeAt - c.firstConnectAt > ceiling).length;
   stats.counts.unanswered = pending();
   stats.counts.unechoed = unechoed();
   stats.counts.unacked = unacked();

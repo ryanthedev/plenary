@@ -104,20 +104,26 @@ export async function startDevGoogle({ env = process.env, port = PORT, hostname 
   return { server, oidc, sessions, url: `http://${hostname}:${server.port}`, stop: () => server.stop(true) };
 }
 
+/** Signals that stop the harness cleanly (a closed terminal sends SIGHUP). */
+export const STOP_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"];
+export const FETCH_TIMEOUT_MS = 15000;   // one request, headers and body: a Google that never answers must not hang a sign-in
+
 /**
  * `fetch` that never lets a URL escape in an error. When Bun's fetch throws (offline, DNS, TLS, refused), its error
  * carries the full URL in `path` (and sometimes the message), and test runners print it; an authorization URL holds
  * the client id. This rethrows a fresh Error with only the error code and no `cause`. (p5-googlev MEDIUM 1)
- * @type {typeof fetch}
+ * It also gives every request its own timeout (a caller's init.signal wins).
  */
-export async function safeFetch(input, init) {
-  try { return await fetch(input, init); }
+export const makeSafeFetch = (timeoutMs) => async (input, init) => {
+  try { return await fetch(input, { signal: AbortSignal.timeout(timeoutMs), ...init }); }
   catch (e) {
     const code = typeof e?.code === "string" && /^[A-Za-z0-9_]{1,40}$/.test(e.code) ? e.code
       : typeof e?.name === "string" && /^[A-Za-z]{1,40}$/.test(e.name) ? e.name : "error";
     throw new Error("google unreachable: " + code);
   }
-}
+};
+/** @type {typeof fetch} */
+export const safeFetch = makeSafeFetch(FETCH_TIMEOUT_MS);
 
 /**
  * Follow an authorization URL once, as a browser with no cookies would, and classify Google's answer. Google's
@@ -162,5 +168,5 @@ if (import.meta.main) {
   try { h = await startDevGoogle(); }
   catch (e) { console.error(String(e.message).startsWith("dev-google:") ? e.message : `dev-google: ${e.message}`); process.exit(1); }   // p5-googlev LOW 3
   console.error(`dev-google: pid ${process.pid}; open ${ORIGIN}/ (Ctrl-C or kill ${process.pid} to stop)`);
-  for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => { h.stop(); process.exit(0); });
+  for (const sig of STOP_SIGNALS) process.on(sig, () => { h.stop(); process.exit(0); });
 }

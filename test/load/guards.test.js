@@ -3,18 +3,21 @@
 // failed or was signalled (4), arguments that would plan nonsense are refused with exit 2 (5, 6, 7), and the
 // generator's CPU is judged over the load phase however short it is (8).
 
-import { test, expect, afterAll } from "bun:test";
-import { tmp, cleanTmp } from "./tmp.js";
-import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { test, expect, beforeAll, afterAll } from "bun:test";
+import { tmp, cleanTmp, useScratch, childEnv, scenarioGroup } from "./tmp.js";
+import { Hist } from "../../scripts/load/stats.js";
+import { writeFileSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { runWorker } from "../../scripts/load/worker.js";
 import { mergeResults, buildResult, createBoard, exitCode, headline, run, CPU_MEAN_LIMIT } from "../../scripts/load/run.js";
 import { fakeServer, busyFrom } from "./fake-server.js";
 
 const RUN = resolve(import.meta.dir, "../../scripts/load/run.js");
-afterAll(cleanTmp);
-const env = () => ({ PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR ?? tmpdir() });
+beforeAll(useScratch); afterAll(cleanTmp);
+// The slow tests that do not measure this process's own event loop (a fake server or a real CLI each, a modelled CPU)
+// run at once, started by the first of them.
+const group = scenarioGroup(), scenarios = group.fns, scenario = group.get;
+const env = childEnv;
 async function cli(args) {
   const p = Bun.spawn([process.execPath, RUN, ...args], { stdout: "pipe", stderr: "pipe", env: env() });
   const [stdout, stderr, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
@@ -60,14 +63,17 @@ test("answered: every op sent acked and ≥ 99% echoed, or the run is INCOMPLETE
   }
 });
 
-test("live CLI: a server that welcomes everyone and swallows every op headlines INCOMPLETE and exits 1", async () => {
+scenarios.swallow = async () => {
   const fake = fakeServer({ tokens: { "lt-swallowTOK": { user: "dev:s", role: "editor" } }, onOp() { /* no entry, no ack */ } });
   const dir = tmp("plenary-load-noack-"), tokens = join(dir, "t.json");
   writeFileSync(tokens, JSON.stringify({ "lt-swallowTOK": { name: "s", role: "editor" } }), { mode: 0o600 });
   let r;
   try { r = await cli(["--url", fake.url, "--board", "b", "--tokens", tokens, "--editors", "1", "--ramp", "10", "--duration", "2", "--drain", "1", "--op-rate", "4", "--out", join(dir, "out")]); }
   finally { fake.stop(); }
-  const res = JSON.parse(readFileSync(join(dir, "out", "result.json"), "utf8"));
+  return { r, res: JSON.parse(readFileSync(join(dir, "out", "result.json"), "utf8")) };
+};
+test("live CLI: a server that welcomes everyone and swallows every op headlines INCOMPLETE and exits 1", async () => {
+  const { r, res } = await scenario("swallow");
   expect(res.clients.complete).toBe(true);
   expect(res.ops.sent.total).toBeGreaterThan(2);
   expect([res.ops.acked, res.ops.answered, res.complete]).toEqual([0, false, false]);
@@ -79,11 +85,15 @@ test("live CLI: a server that welcomes everyone and swallows every op headlines 
 
 // ---- finding 4: nothing outlives the run ----
 
-test("a setup failure after the --local server started stops the server", async () => {
+scenarios.setupFailure = async () => {
   const dir = tmp("plenary-load-orph-"), tokens = join(dir, "t.json");
   writeFileSync(tokens, JSON.stringify({ "lt-noADMIN": { name: "e", role: "editor" } }), { mode: 0o600 });
   const lines = [];
   const e = await run({ local: true, "create-board": true, tokens, editors: "1", duration: "1", out: join(dir, "out") }, { log: s => lines.push(s) }).catch(x => x);
+  return { e, lines };
+};
+test("a setup failure after the --local server started stops the server", async () => {
+  const { e, lines } = await scenario("setupFailure");
   expect(e.message).toBe("--create-board needs a token with admin: true and a domain in the tokens file");
   const pid = Number(/local server pid (\d+)/.exec(lines.join("\n"))?.[1]);
   expect(pid).toBeGreaterThan(0);
@@ -148,38 +158,44 @@ test("exit code 2: a bad argument (parse) and a bad value (setup) both exit 2, b
 // ---- finding 8: CPU over a short load phase, and only the load phase ----
 
 const noTokens = () => { const p = join(tmp("plenary-load-cpu-"), "t.json"); writeFileSync(p, "{}", { mode: 0o600 }); return p; };
-function burn(from, to) {
-  return new Promise(done => {
-    const step = () => { if (Date.now() >= to) return done(); const e = performance.now() + 25; while (performance.now() < e) { /* busy */ } setImmediate(step); };
-    setTimeout(step, Math.max(0, from - Date.now()));
-  });
-}
-
-test("a load phase shorter than one CPU sample, burned, is still measured and flagged", async () => {
-  const t0 = Date.now(), loadFrom = t0 + 1500, genEndAt = loadFrom + 900;
-  const [r] = await Promise.all([
-    runWorker({ url: "ws://127.0.0.1:1/ws", board: "b", tokensPath: noTokens(), t0, loadFrom, genEndAt, drainMs: 0, clients: [], cfg: {} }),
-    burn(loadFrom, genEndAt),
-  ]);
+scenarios.shortPinned = async () => {
+  // The process is modelled as 100% of a core from loadFrom on (busyFrom: no real burning, so how busy this machine
+  // is cannot change the result).
+  const t0 = Date.now(), loadFrom = t0 + 1200, genEndAt = loadFrom + 800;
+  const r = await runWorker({ url: "ws://127.0.0.1:1/ws", board: "b", tokensPath: noTokens(), t0, loadFrom, genEndAt, drainMs: 0, clients: [], cfg: {} }, { cpuUsage: busyFrom(loadFrom) });
+  r.lag = new Hist().toJSON();   // the event loop's lag is the machine's, not under test here
+  return r;
+};
+test("a load phase shorter than one CPU sample, pinned, is still measured and flagged", async () => {
+  const r = await scenario("shortPinned");
   expect(r.cpuLoad.length).toBe(0);   // no whole 1 s sample fits: the old fallback judged all samples (mostly idle)
-  expect(r.cpuLoadMs).toBeGreaterThanOrEqual(800);
+  expect(r.cpuLoadMs).toBeGreaterThanOrEqual(700);
   expect(r.cpuLoadMean).toBeGreaterThan(CPU_MEAN_LIMIT);
   const res = buildResult({ merged: mergeResults([r]), config: {}, counts: { editor: 0, annotator: 0, viewer: 1 }, startedAt: 0, finishedAt: 1 });
   expect(res.valid).toBe(false);
   expect(res.invalidReasons).toEqual([`worker 0: CPU mean ${r.cpuLoadMean}% of a core > ${CPU_MEAN_LIMIT}%`]);
 }, 15000);
 
-test("CPU burned in the drain is not the load phase's; a load phase with no measurement is not VALID", async () => {
-  // An editor whose ops the server never acks keeps the drain open for its whole 3 s; this process burns in it.
+scenarios.drainCpu = async () => {
+  // An editor whose ops the server never acks keeps the drain open for its whole 2 s; this process burns in it.
   const tokensPath = join(tmp("plenary-load-drcpu-"), "t.json");
   writeFileSync(tokensPath, JSON.stringify({ tE: { name: "d-e", role: "editor" } }), { mode: 0o600 });
   const fake = fakeServer({ tokens: { tE: { user: "dev:d-e", role: "editor" } }, onOp(ctx, ws, msg) { ctx.entry(ws.data.user, msg); } });
-  const t0 = Date.now() + 200, loadFrom = t0 + 300, genEndAt = loadFrom + 1000, drainMs = 3000;
-  // CPU: idle through the load phase, 100% of a core from 800 ms into the drain (modelled, not burned).
+  const t0 = Date.now() + 200, loadFrom = t0 + 300, genEndAt = loadFrom + 1000, drainMs = 2000;
+  // CPU: idle through the load phase, 100% of a core from 300 ms into the drain (modelled, not burned): the sample
+  // from the 2nd to the 3rd second of the run is wholly busy.
   let r;
   try {
-    r = await runWorker({ url: fake.url, board: "b", tokensPath, t0, loadFrom, genEndAt, drainMs, clients: [{ role: "editor", token: 0, name: "d-e0", startAt: 0 }], cfg: { opRate: 4, noteRate: 0, commentRate: 0, cursorRate: 0, pool: 5 } }, { cpuUsage: busyFrom(genEndAt + 800) });
+    r = await runWorker({ url: fake.url, board: "b", tokensPath, t0, loadFrom, genEndAt, drainMs, clients: [{ role: "editor", token: 0, name: "d-e0", startAt: 0 }], cfg: { opRate: 4, noteRate: 0, commentRate: 0, cursorRate: 0, pool: 5 } }, { cpuUsage: busyFrom(genEndAt + 300) });
   } finally { fake.stop(); }
+  r.lag = new Hist().toJSON();   // the event loop's lag is the machine's, not under test here
+  // And the worker reports none for a load phase too short to judge.
+  const t1 = Date.now();
+  const z = await runWorker({ url: "ws://127.0.0.1:1/ws", board: "b", tokensPath: noTokens(), t0: t1, loadFrom: t1 + 300, genEndAt: t1 + 400, drainMs: 0, clients: [], cfg: {} });
+  return { r, z, drainMs };
+};
+test("CPU burned in the drain is not the load phase's; a load phase with no measurement is not VALID", async () => {
+  const { r, z, drainMs } = await scenario("drainCpu");
   expect(r.stats.counts.drainMs).toBeGreaterThanOrEqual(drainMs - 50);
   expect(r.cpuLoadMs).toBeLessThan(1700);
   expect(r.cpuLoadMean).toBeLessThan(40);                        // the drain's CPU is not the load phase's
@@ -189,8 +205,6 @@ test("CPU burned in the drain is not the load phase's; a load phase with no meas
   const res = buildResult({ merged: mergeResults([unmeasured]), config: {}, counts: { editor: 1, annotator: 0, viewer: 0 }, startedAt: 0, finishedAt: 1 });
   expect(res.valid).toBe(false);
   expect(res.invalidReasons).toContain("worker 0: CPU over the load phase not measured (0 ms of load phase)");
-  // And the worker reports none for a load phase too short to judge.
-  const t1 = Date.now();
-  const z = await runWorker({ url: "ws://127.0.0.1:1/ws", board: "b", tokensPath: noTokens(), t0: t1, loadFrom: t1 + 300, genEndAt: t1 + 400, drainMs: 0, clients: [], cfg: {} });
+  // The worker reports none for a load phase too short to judge.
   expect(z.cpuLoadMean).toBe(null);
 }, 20000);

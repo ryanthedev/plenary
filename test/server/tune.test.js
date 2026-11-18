@@ -77,13 +77,23 @@ test("R1: a user's tabs share one role answer per pass; users with a writer conn
 // ---- R2: the error rule ----
 
 test("R2: a timed pass whose Registry calls fail keeps the connections, retries with backoff, then closes after the bound", async () => {
-  const { r, ctl, open } = await roleRig({ recheckRetries: 2, recheckRetryMs: 40, recheckConcurrency: 20 });   // one batch: everyone is reached
+  // The gateway's clock and timers are virtual and frozen between steps: each retry runs when the test advances to it, so the
+  // retries are counted exactly (on a loaded real clock a timer that fired a hair before its due time skipped and re-armed).
+  const V = virtualTime({ start: Date.now(), settle: () => new Promise(res => setImmediate(res)) });
+  const { r, ctl, open } = await roleRig({ recheckRetries: 2, recheckRetryMs: 40, recheckConcurrency: 20 }, { now: V.now, timers: V.timers });   // one batch: everyone is reached
   const socks = await open(names(20));
   ctl.boom = true;
   await gw(r).recheck(r.ids.board, "timed");
   expect(socks.every(s => s.closed === null)).toBe(true);                // kept: one blip closes nobody
   // Two retries (40 ms, 80 ms), both failing, then the third failure closes them all `unavailable`.
-  const closes = await Promise.all(socks.map(s => s.whenClosed(5000)));
+  for (const wait of [40, 80]) {
+    expect(V.oneShots()).toEqual([wait]);
+    const passes = gw(r).stats().rechecks.passes;
+    await V.advance(wait);
+    await until(() => gw(r).stats().rechecks.passes > passes, "the retry pass");
+  }
+  expect(V.oneShots()).toEqual([]);
+  const closes = await Promise.all(socks.map(s => s.whenClosed(30_000)));
   expect(closes.every(c => c.code === 1013)).toBe(true);
   expect(socks[0].msgs.at(-1)).toEqual({ t: "error", code: "unavailable", message: "could not re-check your access: reconnect" });
   expect(gw(r).stats().rechecks.retries).toBe(2);
@@ -91,17 +101,21 @@ test("R2: a timed pass whose Registry calls fail keeps the connections, retries 
 }, 20000);
 
 test("R2: a Registry blip during the timed pass closes nobody; a first batch that all fails stops the pass; the retry asks only the failed", async () => {
-  const { r, ctl, open } = await roleRig({ recheckRetries: 2, recheckRetryMs: 30, recheckConcurrency: 1 });
+  const V = virtualTime({ start: Date.now(), settle: () => new Promise(res => setImmediate(res)) });
+  const { r, ctl, open } = await roleRig({ recheckRetries: 2, recheckRetryMs: 30, recheckConcurrency: 1 }, { now: V.now, timers: V.timers });
   const socks = await open(names(40));
   ctl.boom = true;
   const c0 = ctl.calls;
   await gw(r).recheck(r.ids.board, "timed");
   expect(ctl.calls - c0).toBe(1);                                        // the whole first batch (1 lookup) failed: stop, not 40 calls
   ctl.boom = false;                                                       // the blip is over before the retry
+  expect(V.oneShots()).toEqual([30]);
+  await V.advance(30);
   await until(() => gw(r).stats().rechecks.retries >= 1, "the retry");
   await idle(r);
   expect(ctl.calls - c0).toBe(2);                                        // the retry asked only the user that failed; the
-  await sleep(150);                                                       // others, never reached, are left as they were
+  await V.advance(1_000);                                                 // others, never reached, are left as they were (and nothing is re-armed)
+  expect(V.oneShots()).toEqual([]);
   expect(socks.filter(s => s.closed).length).toBe(0);
   expect(gw(r).stats().rechecks.retries).toBe(1);                        // a clean retry schedules no more
   await r.stop();

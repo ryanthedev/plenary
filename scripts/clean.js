@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 import { lstatSync, readdirSync, readFileSync, realpathSync, rmSync, existsSync, renameSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
+import { dlopen, FFIType } from "bun:ffi";
 
 export const ROOT = realpathSync(resolve(fileURLToPath(new URL("..", import.meta.url))));
 const RIG_CLI = join(ROOT, "scripts/cluster-rig.js");
@@ -43,13 +44,14 @@ const RIG_GRACE_MS = 60_000;   // a rig dir touched in the last minute may be an
 const defaultTemp = () => process.env.TMPDIR || tmpdir();
 
 /** Total disk bytes and newest mtime (ms) of the tree at `p`, by lstat only (symlinks counted, never entered). */
-export function measure(p, stat = lstatSync, rootDev = undefined) {
+export function measure(p, stat = lstatSync, rootDev = undefined, deadlineCheck = null) {
+  if (deadlineCheck?.()) throw new Error("skipped (time limit)");
   const st = stat(p);
   const device = rootDev ?? st.dev;
   if (st.isDirectory() && st.dev !== device) throw new Error(`tree contains a directory on a different device: ${p}`);
   let bytes = st.blocks * 512, newest = st.mtimeMs;
   if (st.isDirectory()) for (const e of readdirSync(p)) {
-    const m = measure(join(p, e), stat, device);
+    const m = measure(join(p, e), stat, device, deadlineCheck);
     bytes += m.bytes;
     newest = Math.max(newest, m.newest);
   }
@@ -61,6 +63,7 @@ export function measure(p, stat = lstatSync, rootDev = undefined) {
  * answered: exit 0, or exit 1 with output (what lsof does when it could not inspect some process), never an empty answer.
  */
 export function openPaths(lsof = "lsof", timeout = 60_000) {
+  if (timeout < 1) throw new Error("lsof skipped (time limit)");
   const r = spawnSync(lsof, ["-w", "-n", "-P", "-F0n"], { encoding: "utf8", maxBuffer: 1 << 28, timeout });
   if (r.error) throw new Error(`lsof did not run (${r.error.code ?? r.error.message})`);
   if (r.status === null) throw new Error(`lsof was killed by ${r.signal}`);
@@ -76,6 +79,7 @@ const namesOf = out => out.split("\0").map(f => f.replace(/^\n/, "")).filter(f =
 
 /** Why `path` (a dir) cannot be removed by this lsof's view ("" = nothing has anything under it open). Any failure is a reason. */
 export function openUnder(path, lsof = "lsof", timeout = 60_000) {
+  if (timeout < 1) return "in-use re-check failed: lsof skipped (time limit)";
   const r = spawnSync(lsof, ["-w", "-n", "-P", "-F0n", "+D", path], { encoding: "utf8", maxBuffer: 1 << 28, timeout });
   if (r.error) return `in-use re-check failed: lsof did not run (${r.error.code ?? r.error.message})`;
   if (r.status === null) return `in-use re-check failed: lsof was killed by ${r.signal}`;
@@ -90,10 +94,34 @@ export function pidAlive(pid) {
 }
 
 /** Alive-check of a rig dir through the rig's own CLI; true (alive, keep) when it cannot answer. */
-export function rigAliveViaCli(dir) {
-  const r = spawnSync(process.execPath, ["--no-env-file", RIG_CLI, "status", "--json", "--dir", dir], { encoding: "utf8", timeout: 60_000 });
+export function rigAliveViaCli(dir, timeout = 60_000, spawn = spawnSync) {
+  if (timeout < 1) return true;
+  const r = spawn(process.execPath, ["--no-env-file", RIG_CLI, "status", "--json", "--dir", dir], { encoding: "utf8", timeout });
   if (r.status !== 0) return true;
   try { return JSON.parse(r.stdout).procs.some(p => p.alive); } catch { return true; }
+}
+
+let nativeRenameExcl;
+try {
+  if (process.platform === "darwin") {
+    const lib = dlopen("libSystem.B.dylib", { renamex_np: { args: [FFIType.ptr, FFIType.ptr, FFIType.u32], returns: FFIType.i32 } });
+    nativeRenameExcl = (from, to) => lib.symbols.renamex_np(Buffer.from(from + "\0"), Buffer.from(to + "\0"), 0x4);
+  } else if (process.platform === "linux") {
+    const lib = dlopen("libc.so.6", { renameat2: { args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.u32], returns: FFIType.i32 } });
+    nativeRenameExcl = (from, to) => lib.symbols.renameat2(-100, Buffer.from(from + "\0"), -100, Buffer.from(to + "\0"), 1);
+  }
+} catch { /* use the guarded fallback when the platform symbol is unavailable */ }
+
+export function renameExcl(from, to, { forceFallback = false, stat = lstatSync } = {}) {
+  if (!forceFallback && nativeRenameExcl) {
+    if (nativeRenameExcl(from, to) === 0) return;
+    try { stat(to); const e = new Error(`target exists: ${to}`); e.code = "EEXIST"; throw e; }
+    catch (e) { if (e.code === "EEXIST") throw e; }
+    throw new Error(`exclusive rename failed: ${from} -> ${to}`);
+  }
+  try { stat(to); const e = new Error(`target exists: ${to}`); e.code = "EEXIST"; throw e; }
+  catch (e) { if (e.code !== "ENOENT") throw e; }
+  renameSync(from, to);
 }
 
 /** The owner pid of a plen-run root: owner.json's `pid`, else the one in the name; null when unreadable (keep). */
@@ -126,16 +154,20 @@ const refuseBase = (p, what) => {
  */
 export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), scratch = null, minAgeMs = 2 * HOUR, now = Date.now(),
   lsof = "lsof", rigAlive = rigAliveViaCli, yes = false, force = false, uid = process.getuid(), beforeRemove = null,
-  afterRename = null, stat = lstatSync, clock = Date.now, maxTimeMs = 5 * 60_000, openPathsFn = openPaths, openUnderFn = openUnder } = {}) {
+  afterRename = null, stat = lstatSync, clock = Date.now, maxTimeMs = 5 * 60_000, openPathsFn = openPaths, openUnderFn = openUnder,
+  renameExclFn = null, rigAliveFn = null, forceFallbackRename = false } = {}) {
   if (minAgeMs < MIN_SAFE_AGE_MS && !force) throw new Error(`--min-age under ${MIN_SAFE_AGE_MS / 60_000} minutes needs --force (a younger entry may still be in use)`);
   const items = [];
   const bases = [["temp", tempDir, isTempName], ["scratch", scratch, () => true]];
   const deadline = clock() + maxTimeMs;
   const timeLeft = () => Math.max(0, deadline - clock());
+  const safeRename = (from, to) => renameExclFn ? renameExclFn(from, to) : renameExcl(from, to, { stat, forceFallback: forceFallbackRename });
+  const deadlineCheck = () => timeLeft() <= 0;
   const existsLstat = p => { try { stat(p); return true; } catch (e) { if (e.code === "ENOENT") return false; throw e; } };
   let opens = null, opensError = null;
-  if (timeLeft() <= 0) opensError = "skipped (time limit)";
-  else try { opens = [...new Set(openPathsFn(lsof, Math.min(60_000, timeLeft())).flatMap(p => { try { return [p, realpathSync(p)]; } catch { return [p]; } }))]; } catch (e) { opensError = e.message; }
+  const initialLeft = timeLeft();
+  if (initialLeft <= 0) opensError = "skipped (time limit)";
+  else try { opens = [...new Set(openPathsFn(lsof, Math.max(1, Math.min(60_000, initialLeft))).flatMap(p => { try { return [p, realpathSync(p)]; } catch { return [p]; } }))]; } catch (e) { opensError = e.message; }
 
   const consider = (target, base, name, extra) => {
     const path = join(base, name);
@@ -146,7 +178,8 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
       const st = stat(path);
       if (st.isSymbolicLink()) { item.why = "symlink"; return; }
       if (st.uid !== uid) { item.why = `owned by uid ${st.uid}, not ${uid}`; return; }
-      const m = measure(path, stat);
+      if (st.dev !== stat(base).dev) { item.status = "failed"; item.why = "candidate is a mount point (different device from parent)"; return; }
+      const m = measure(path, stat, undefined, deadlineCheck);
       item.bytes = m.bytes;
       const idle = now - m.newest;
       if (extra?.minIdleMs !== undefined ? idle < extra.minIdleMs : idle < minAgeMs) { item.why = "too young"; return; }
@@ -156,31 +189,40 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
         if (underAny(opens, realpathSync(path)) || underAny(opens, path)) { item.why = "in use"; return; }
       }
       if (!yes) { item.status = "would-remove"; return; }
-      const scanned = measure(path, stat);
+      const scanned = measure(path, stat, undefined, deadlineCheck);
       const judged = stat(path);
       if (judged.dev !== st.dev || judged.ino !== st.ino || judged.mtimeMs !== st.mtimeMs || now - scanned.newest < (extra?.minIdleMs ?? minAgeMs)) { item.why = "touched while scanning"; return; }
       beforeRemove?.(path);   // test seam: something may take the dir between the snapshot and here
       // Rename first so no new process can find it by its name, then look again with a per-path lsof; put it back on any doubt.
       const parked = name.startsWith(DELETING) ? path : join(base, DELETING + name);
-      if (parked !== path) { if (existsLstat(parked)) { item.why = "a parked copy already exists"; return; } renameSync(path, parked); afterRename?.(parked, path); }
+      if (parked !== path) { if (existsLstat(parked)) { item.why = "a parked copy already exists"; return; } safeRename(path, parked); afterRename?.(parked, path); }
       const parkedStat = stat(parked);
-      if (parkedStat.dev !== judged.dev || parkedStat.ino !== judged.ino || parkedStat.mtimeMs !== judged.mtimeMs || now - scanned.newest < (extra?.minIdleMs ?? minAgeMs)) {
-        if (parked !== path) { if (existsLstat(path)) item.why = "changed while parking; original path exists"; else renameSync(parked, path); }
+      let after;
+      try { after = measure(parked, stat, undefined, deadlineCheck); }
+      catch (e) {
+        if (e.message !== "skipped (time limit)") throw e;
+        item.why = "skipped (time limit)";
+        if (parked !== path) { if (existsLstat(path)) item.why += "; original path exists"; else safeRename(parked, path); }
+        return;
+      }
+      if (parkedStat.dev !== judged.dev || parkedStat.ino !== judged.ino || parkedStat.mtimeMs !== judged.mtimeMs || now - after.newest < (extra?.minIdleMs ?? minAgeMs) || after.bytes !== scanned.bytes || after.newest !== scanned.newest) {
+        if (parked !== path) { if (existsLstat(path)) item.why = "changed while parking; original path exists"; else safeRename(parked, path); }
         if (!item.why) item.why = "changed while parking";
         return;
       }
-      if (timeLeft() <= 0) { item.why = "skipped (time limit)"; if (parked !== path) { if (existsLstat(path)) item.why = "skipped (time limit); original path exists"; else renameSync(parked, path); } return; }
+      const recheckLeft = timeLeft();
+      if (recheckLeft <= 0) { item.why = "skipped (time limit)"; if (parked !== path) { if (existsLstat(path)) item.why += "; original path exists"; else safeRename(parked, path); } return; }
       let why;
-      try { why = openUnderFn(parked, lsof, Math.min(60_000, timeLeft())); } catch (e) { why = `in-use re-check failed: ${e.message}`; }
+      try { why = openUnderFn(parked, lsof, Math.max(1, Math.min(60_000, recheckLeft))); } catch (e) { why = `in-use re-check failed: ${e.message}`; }
       if (timeLeft() <= 0) {
-        if (parked !== path) { if (existsLstat(path)) item.why = "skipped (time limit); original path exists"; else renameSync(parked, path); }
+        if (parked !== path) { if (existsLstat(path)) item.why = "skipped (time limit); original path exists"; else safeRename(parked, path); }
         if (!item.why) item.why = "skipped (time limit)";
         return;
       }
-      if (why) { if (parked !== path) { if (existsLstat(path)) item.why = `${why}; original path exists`; else renameSync(parked, path); } if (!item.why) item.why = why; return; }
+      if (why) { if (parked !== path) { if (existsLstat(path)) item.why = `${why}; original path exists`; else safeRename(parked, path); } if (!item.why) item.why = why; return; }
       rmSync(parked, { recursive: true, force: true });
       item.status = "removed";
-    } catch (e) { item.status = "failed"; item.why = e.message; }
+    } catch (e) { if (e.message === "skipped (time limit)") item.why = e.message; else { item.status = "failed"; item.why = e.message; } }
   };
 
   for (const [target, dir, match] of bases) {
@@ -199,7 +241,13 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
     for (const name of readdirSync(real).sort()) {
       const dir = join(real, name);
       if (!lstatSync(dir).isDirectory()) continue;
-      consider("rig", real, name, { minIdleMs: RIG_GRACE_MS, check: p => !existsSync(join(p, "rig.json")) ? "no rig.json (an up in progress or failed)" : rigAlive(p) ? "rig alive or unknown" : "" });
+      consider("rig", real, name, { minIdleMs: RIG_GRACE_MS, check: p => {
+        if (!existsSync(join(p, "rig.json"))) return "no rig.json (an up in progress or failed)";
+        const left = timeLeft();
+        if (left <= 0) return "skipped (time limit)";
+        const alive = rigAliveFn ? rigAliveFn(p, Math.max(1, Math.min(60_000, left))) : rigAlive(p, Math.max(1, Math.min(60_000, left)));
+        return alive ? "rig alive or unknown" : "";
+      } });
     }
   }
   return { items };

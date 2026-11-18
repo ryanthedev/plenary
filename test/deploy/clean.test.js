@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
-import { clean, summarize, measure, openPaths, openUnder, ROOT } from "../../scripts/clean.js";
+import { clean, summarize, measure, openPaths, openUnder, renameExcl, ROOT } from "../../scripts/clean.js";
 
 const made = [], kids = [];
 const sandbox = realpathSync(mkdtempSync(join(tmpdir(), "plenary-cleantest-")));
@@ -214,6 +214,42 @@ test("a parked entry whose identity or age changes after rename is put back and 
   expect(existsSync(d)).toBe(true);
 });
 
+test("a changed parked tree is left parked when the original name was recreated", () => {
+  const w = world(), d = entry(w.tempDir, "plenary-test-recr01");
+  const r = clean({ ...w, now: LATER(), yes: true, afterRename: parked => {
+    if (parked.endsWith("plenary-test-recr01")) { writeFileSync(join(parked, "changed"), "x"); mkdirSync(d); }
+  } });
+  expect(byName(r, "plenary-test-recr01")).toMatchObject({ status: "kept", why: "changed while parking; original path exists" });
+  expect(existsSync(d)).toBe(true);
+  expect(existsSync(join(w.tempDir, ".plen-deleting-plenary-test-recr01"))).toBe(true);
+});
+
+test("a deep file made young after parking is re-measured and restored", () => {
+  const w = world(), d = entry(w.tempDir, "plenary-test-young1"), now = LATER();
+  const youngTime = new Date(now - 1000);
+  const r = clean({ ...w, now, yes: true, afterRename: parked => {
+    if (parked.endsWith("plenary-test-young1")) utimesSync(join(parked, "sub/f"), youngTime, youngTime);
+  } });
+  expect(byName(r, "plenary-test-young1")).toMatchObject({ status: "kept", why: "changed while parking" });
+  expect(existsSync(d)).toBe(true);
+  expect(existsSync(join(w.tempDir, ".plen-deleting-plenary-test-young1"))).toBe(false);
+});
+
+test("parking never replaces an empty directory at the destination", () => {
+  const w = world(), from = join(w.root, "from"), to = join(w.root, "to");
+  mkdirSync(from); mkdirSync(to);
+  expect(() => renameExcl(from, to)).toThrow(/target exists/);
+  expect(existsSync(from) && existsSync(to)).toBe(true);
+  expect(readdirSyncNames(to)).toEqual([]);
+});
+
+test("the fallback exclusive rename seam rejects an existing empty destination", () => {
+  const w = world(), from = join(w.root, "from-fallback"), to = join(w.root, "to-fallback");
+  mkdirSync(from); mkdirSync(to);
+  expect(() => renameExcl(from, to, { forceFallback: true })).toThrow(/target exists/);
+  expect(existsSync(from) && existsSync(to)).toBe(true);
+});
+
 test("a different old directory swapped under the parked name is put back and kept", () => {
   const w = world(), d = entry(w.tempDir, "plenary-test-swp111");
   const away = join(w.tempDir, "original-parked-directory");
@@ -252,6 +288,62 @@ test("a directory tree crossing a device boundary is kept", () => {
     return p === join(d, "sub") ? new Proxy(st, { get: (target, key) => key === "dev" ? target.dev + 1 : Reflect.get(target, key, target) }) : st;
   } });
   expect(byName(r, "plenary-test-mount1")).toMatchObject({ status: "failed", why: expect.stringMatching(/different device/) });
+  expect(existsSync(d)).toBe(true);
+});
+
+test("a candidate mount point is refused relative to its parent device", () => {
+  const w = world(), d = entry(w.tempDir, "plenary-test-mnt001");
+  const rootStat = lstatSync;
+  const r = clean({ ...w, now: LATER(), yes: true, stat: p => {
+    const st = rootStat(p);
+    return p === d ? new Proxy(st, { get: (target, key) => key === "dev" ? target.dev + 1 : Reflect.get(target, key, target) }) : st;
+  } });
+  expect(byName(r, "plenary-test-mnt001")).toMatchObject({ status: "failed", why: expect.stringMatching(/mount point/) });
+  expect(existsSync(d)).toBe(true);
+});
+
+test("lsof timeout is positive when the injected clock reaches the deadline on the next read", () => {
+  const w = world(), d = entry(w.tempDir, "plenary-test-tmo001"), timeouts = [];
+  const ticks = [0, 0, 10]; let i = 0;
+  const r = clean({ ...w, now: LATER(), yes: true, maxTimeMs: 10,
+    clock: () => ticks[Math.min(i++, ticks.length - 1)],
+    openPathsFn: (_lsof, timeout) => { timeouts.push(timeout); return []; },
+    openUnderFn: (_path, _lsof, timeout) => { timeouts.push(timeout); return ""; } });
+  expect(timeouts.length).toBeGreaterThan(0);
+  expect(timeouts.every(t => t >= 1)).toBe(true);
+  expect(byName(r, "plenary-test-tmo001").why).toBe("skipped (time limit)");
+  expect(existsSync(d)).toBe(true);
+});
+
+test("a deadline expiring in one candidate restores the parked path", () => {
+  const w = world(), d = entry(w.tempDir, "plenary-test-midone"), parked = join(w.tempDir, ".plen-deleting-plenary-test-midone");
+  let expired = false;
+  const r = clean({ ...w, now: LATER(), yes: true, maxTimeMs: 10,
+    clock: () => expired ? 10 : 0,
+    afterRename: () => { expired = true; }, openPathsFn: () => [], openUnderFn: () => "" });
+  expect(byName(r, "plenary-test-midone")).toMatchObject({ status: "kept", why: "skipped (time limit)" });
+  expect(existsSync(d)).toBe(true);
+  expect(existsSync(parked)).toBe(false);
+});
+
+test("a deadline expiring in one candidate keeps the parked copy if original was recreated", () => {
+  const w = world(), d = entry(w.tempDir, "plenary-test-midtwo"), parked = join(w.tempDir, ".plen-deleting-plenary-test-midtwo");
+  let expired = false;
+  const r = clean({ ...w, now: LATER(), yes: true, maxTimeMs: 10,
+    clock: () => expired ? 10 : 0,
+    afterRename: () => { mkdirSync(d); expired = true; }, openPathsFn: () => [], openUnderFn: () => "" });
+  expect(byName(r, "plenary-test-midtwo")).toMatchObject({ status: "kept", why: "skipped (time limit); original path exists" });
+  expect(existsSync(d) && existsSync(parked)).toBe(true);
+});
+
+test("the rig liveness timeout is capped by remaining total time", () => {
+  const w = world(), d = rigDir(w, "bounded"), timeouts = [];
+  let expired = false, reads = 0;
+  const r = clean({ tempDir: join(w.root, "no-temp"), rigRoot: w.rigRoot, now: LATER(), yes: true, maxTimeMs: 20,
+    clock: () => { reads++; return expired ? 20 : 0; }, openPathsFn: () => [],
+    rigAliveFn: (_dir, timeout) => { timeouts.push(timeout); expired = true; return true; } });
+  expect(timeouts).toEqual([20]);
+  expect(byName(r, "bounded")).toMatchObject({ status: "kept", why: "rig alive or unknown" });
   expect(existsSync(d)).toBe(true);
 });
 

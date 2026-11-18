@@ -84,14 +84,24 @@ export function namingDir(dir) {
  * filesystem. The ceiling stays above cleanupAll's own bounded waits (30 s children + 60 s in-flight `up`s).
  */
 export const CLEANUP_TIMEOUT_MS = 180_000;
-/** pid -> start time (lstart, whitespace-collapsed) of every non-zombie process, from ONE ps; null when ps fails. */
+let snapshotPs = "/bin/ps";
+/** Test seam: the ps the cleanup snapshot runs (a fake one proves the fail-closed fallback); no argument restores /bin/ps. */
+export const _setSnapshotPs = p => { snapshotPs = p ?? "/bin/ps"; };
+/**
+ * pid -> start time (lstart, whitespace-collapsed) of every non-zombie process, from ONE ps. null (= "unknown": every
+ * recorded process is then checked one by one) when ps fails or cannot be spawned, prints nothing, or prints any row
+ * that is not `pid stat lstart` in the format psInfo accepts, so a format drift is never read as "not running".
+ */
 function psSnapshot() {
-  const r = Bun.spawnSync(["/bin/ps", "-axo", "pid=,stat=,lstart="], { env: PS_FIXED });
+  let r;
+  try { r = Bun.spawnSync([snapshotPs, "-axo", "pid=,stat=,lstart="], { env: PS_FIXED }); } catch { return null; }
   if (r.exitCode !== 0) return null;
   const snap = new Map();
   for (const l of r.stdout.toString().split("\n")) {
-    const m = /^\s*(\d+)\s+(\S+)\s+(.+?)\s*$/.exec(l);
-    if (m && !m[2].startsWith("Z")) snap.set(Number(m[1]), m[3].replace(/\s+/g, " "));
+    if (!l.trim()) continue;
+    const m = /^\s*(\d+)\s+(\S+)\s+(\S+ \S+ +\d+ \d\d:\d\d:\d\d \d{4})\s*$/.exec(l);
+    if (!m) return null;
+    if (!m[2].startsWith("Z")) snap.set(Number(m[1]), m[3].replace(/\s+/g, " "));
   }
   return snap.size ? snap : null;
 }
@@ -104,19 +114,22 @@ export function cleanupAll({ graceMs = 3000 } = {}) {
     await Promise.race([Promise.allSettled([...children].map(c => c.exited)), Bun.sleep(30_000)]);
     for (const c of children) { try { c.kill("SIGKILL"); } catch {} }
     await Promise.race([Promise.allSettled([...inflight]), Bun.sleep(60_000)]);
-    // One ps for every tracked dir (not one per recorded process per dir): a recorded process is live when the snapshot
-    // has its pid with the recorded start time and no zombie state. A dir with none is left to the rm below; a ps that
-    // fails or cannot be read treats every recorded process as live, so stopRig and killRecorded still check each one.
-    const snap = psSnapshot();
-    for (const d of dirs) {
-      if (!existsSync(join(d, "rig.json"))) continue;
-      const procs = recorded(d);
-      if (snap && !procs.some(p => snap.get(p?.pid) === p?.started)) continue;
-      try { await stopRig(d, { graceMs }); } catch {}
-      killRecorded(procs, d);
+    try {
+      // One ps for every tracked dir (not one per recorded process per dir): a recorded process is live when the snapshot
+      // has its pid with the recorded start time and no zombie state. A dir with none is left to the rm below; a ps that
+      // fails or cannot be read treats every recorded process as live, so stopRig and killRecorded still check each one.
+      const snap = inflight.size ? null : psSnapshot();   // an `up` still running may record a process after any snapshot
+      for (const d of dirs) {
+        if (!existsSync(join(d, "rig.json"))) continue;
+        const procs = recorded(d);
+        if (snap && !procs.some(p => snap.get(p?.pid) === p?.started)) continue;
+        try { await stopRig(d, { graceMs }); } catch {}
+        killRecorded(procs, d);
+      }
+    } finally {
+      for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+      ABORT.aborted = false;   // reusable: bun may share this module between test files in one process
     }
-    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
-    ABORT.aborted = false;   // reusable: bun may share this module between test files in one process
   })().finally(() => { cleaning = null; });
 }
 const CODES = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 };

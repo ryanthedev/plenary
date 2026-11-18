@@ -417,6 +417,32 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
     }
   }, 240_000);
 
+  // cleanupAll takes ONE ps snapshot and stops only the dirs it shows alive; these prove it still stops a leaked rig, never
+  // touches a live pid recorded with another start time, and checks every dir when the snapshot is unusable (fails, prints
+  // nothing, or prints a row that is not `pid stat lstart`). test/deploy/fixture-leaked-rig.js leaves a rig up and runs it.
+  for (const [label, psBody] of [["the snapshot ps works", null], ["the snapshot ps fails", "exit 2"], ["the snapshot ps prints nothing", "exit 0"], ["the snapshot ps prints a row in another format", "echo '  123 S+ not-a-date'"]]) {
+    test.skipIf(SKIP)(`Leaks: cleanupAll stops a rig a test left up and spares a live pid with another start time (${label})`, async () => {
+      const dir = freshDir(), out = join(freshDir(), "out.json"), fake = join(freshDir(), "fake-ps");
+      if (psBody) { writeFileSync(fake, `#!/bin/sh\n${psBody}\n`); chmodSync(fake, 0o755); }
+      const env = { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR ?? "/tmp", RIG_FIXTURE_DIR: dir, RIG_FIXTURE_OUT: out, ...(psBody ? { RIG_FIXTURE_PS: fake } : {}) };
+      const run = spawnTracked([process.execPath, "test", join(ROOT, "test/deploy/fixture-leaked-rig.js")], { cwd: ROOT, stdout: "pipe", stderr: "pipe", env });
+      let seen = null;
+      try {
+        expect(await run.exited).toBe(0);
+        seen = JSON.parse(readFileSync(out, "utf8"));
+        expect(seen.real.map(p => p.name)).toEqual(["postgres", "nats", "minio"]);
+        for (const p of seen.real) expect({ name: p.name, gone: psGone(p.pid) }).toEqual({ name: p.name, gone: true });
+        expect(namingDir(dir)).toEqual([]);
+        expect(existsSync(dir)).toBe(false);
+        expect(lstart(seen.decoy.pid)).toBe(seen.decoy.started);   // the decoy is still the same live process
+      } finally {
+        run.kill("SIGKILL");
+        if (seen) killRecorded([{ pid: seen.decoy.pid, started: seen.decoy.started }]);   // our own sleep, by pid and start time
+      }
+      expect(psGone(seen.decoy.pid)).toBe(true);
+    }, 180_000);
+  }
+
   test("CLI: keys and dev tokens never reach stdout or stderr (up, status, status --json, kill, down, a failing up); files are 0600; rig.json has none", async () => {
     const dir = freshDir();
     const outs = [];

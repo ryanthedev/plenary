@@ -43,7 +43,12 @@ async function setup({ n, feedOpts = {}, entries = i => entry(i), before = async
   const settle = async () => { await bus.flush(); await feed.atomically(() => {}); };
   const beat = async (m = {}) => { await bus.publish(subjects.entries(T, B), { seq: n, epoch, ...m }); await settle(); };
   await feed.ready;
-  return { feed, io, beat, checkpoint, failNext: () => { io.fail++; }, close: async () => { feed.close(); await raw.close(); await bus.close(); } };
+  const entries_ = async (from, to) => {   // append entries from..to and publish them as the room would
+    const list = Array.from({ length: to - from + 1 }, (_, k) => entries(from + k));
+    await raw.append(T, B, list, from - 1, epoch);
+    await bus.publish(subjects.entries(T, B), { from, to, items: list.map(e => JSON.stringify(e)) }); await settle();
+  };
+  return { feed, io, beat, entries: entries_, checkpoint, failNext: () => { io.fail++; }, close: async () => { feed.close(); await raw.close(); await bus.close(); } };
 }
 
 test("production defaults, the verifier's probe (1.42 MB checkpoint, 1,000-entry tail): no read per heartbeat; one per new checkpoint", async () => {
@@ -158,20 +163,66 @@ test("an announced checkpoint that doesn't match the log is looked at once, not 
   } finally { await s.close(); }
 });
 
-test("a Store whose checkpoint reads answer but whose entry reads fail costs a look per 2^n heartbeats, not one per heartbeat", async () => {
-  const s = await setup({ n: 3, feedOpts: { rebaseEvery: 2 } });
+// The look backoff (PROTOCOL.md § Bus): after the n-th failure in a row, k of the next heartbeats are skipped, k from
+// [ceil(b/2), b], b = min(31, 2^(n-1) - 1). `random: () => 0` takes k = b, so the look beats are exact.
+const lookBeats = async (s, beats, m) => { const at = []; for (let i = 1; i <= beats; i++) { const n = s.feed.looks; await s.beat(m); if (s.feed.looks > n) at.push(i); } return at; };
+
+test("a Store whose checkpoint reads answer but whose entry reads fail: looks back off to the cap, recover, and reset", async () => {
+  const s = await setup({ n: 5, feedOpts: { rebaseEvery: 2, random: () => 0 } });
   try {
     await s.checkpoint(3);
     s.io.failEntryReads = true;
-    const atStart = s.io.cpReads;
-    for (let i = 0; i < 20; i++) await s.beat({ cp: 3 });
-    // Failures on heartbeats 1, 2, 4, 8 and 16 (each skips the next 0, 1, 3, 7, 15).
-    expect([s.feed.looks, s.io.cpReads - atStart, s.feed.base.seq]).toEqual([5, 5, 0]);
-    s.io.failEntryReads = false;                                          // the Store recovers: found on the next look
-    for (let i = 0; i < 32 && s.feed.base.seq === 0; i++) await s.beat({ cp: 3 });
-    expect([s.feed.looks, s.feed.base.seq]).toEqual([6, 3]);
-    for (let i = 0; i < 3; i++) await s.beat({ cp: 3 });
-    expect(s.feed.looks).toBe(6);
+    // 110 heartbeats of outage: skips of 0, 1, 3, 7, 15, then the cap of 31 (not 63, 127 …).
+    expect(await lookBeats(s, 110, { cp: 3 })).toEqual([1, 2, 4, 8, 16, 32, 64, 96]);
+    expect(s.feed.base.seq).toBe(0);
+    s.io.failEntryReads = false;                                          // recovered: found within the cap
+    const after = await lookBeats(s, 32, { cp: 3 });
+    expect([after.length, s.feed.base.seq]).toEqual([1, 3]);
+    // A completed look resets the count: one new failure is retried on the very next heartbeat, not 32 later.
+    await s.checkpoint(5);
+    s.io.failEntryReads = true;
+    expect(await lookBeats(s, 1, { cp: 5 })).toEqual([1]);
+    s.io.failEntryReads = false;
+    expect(await lookBeats(s, 1, { cp: 5 })).toEqual([1]);
+    expect(s.feed.base.seq).toBe(5);
+  } finally { await s.close(); }
+});
+
+test("the look backoff is jittered into [ceil(b/2), b] heartbeats, so gateways don't look in lockstep", async () => {
+  const s = await setup({ n: 3, feedOpts: { rebaseEvery: 2, random: () => 0.999 } });   // the shortest skips: ceil(b/2)
+  try {
+    await s.checkpoint(3);
+    s.io.failEntryReads = true;
+    // Skips 0, 1, 2, 4, 8, then 16 at the cap (b 0, 1, 3, 7, 15, 31): never more often than one look per 17 heartbeats.
+    expect(await lookBeats(s, 110, { cp: 3 })).toEqual([1, 2, 4, 7, 12, 21, 38, 55, 72, 89, 106]);
+  } finally { await s.close(); }
+});
+
+test("a heartbeat naming a newer checkpoint ends the backoff: the feed looks at once", async () => {
+  const s = await setup({ n: 5, feedOpts: { rebaseEvery: 2, random: () => 0 } });
+  try {
+    await s.checkpoint(3);
+    s.io.failEntryReads = true;
+    expect(await lookBeats(s, 20, { cp: 3 })).toEqual([1, 2, 4, 8, 16]);   // now skipping 15
+    s.io.failEntryReads = false;
+    await s.checkpoint(5);
+    expect(await lookBeats(s, 1, { cp: 5 })).toEqual([1]);
+    expect(s.feed.base.seq).toBe(5);
+  } finally { await s.close(); }
+});
+
+test("while backing off, a due tail (a host without cp) makes no look either", async () => {
+  const s = await setup({ n: 3, feedOpts: { rebaseEvery: 2, random: () => 0 } });
+  try {
+    s.failNext(); s.failNext();
+    await s.beat(); await s.beat();                                       // the due look and its retry fail: skip 1
+    expect(s.feed.looks).toBe(2);
+    await s.entries(4, 5);                                                // the tail is due again (5 >= 3 + 2) ...
+    expect([s.feed.seq, s.feed.looks]).toEqual([5, 2]);                   // ... but no look while skipping
+    await s.beat();                                                       // the skipped heartbeat
+    expect(s.feed.looks).toBe(2);
+    await s.beat();                                                       // then the look
+    expect(s.feed.looks).toBe(3);
   } finally { await s.close(); }
 });
 
@@ -217,9 +268,10 @@ test("end to end on a room host: every heartbeat's cp is already in the Store, a
   const text = n => ({ id: "note", type: "text", version: n, versionNonce: n, x: 0, y: 0, width: 10, height: 10, isDeleted: false, text: String(n % 10).repeat(50_000) });
   for (let n = 1; n <= 6; n++) { w.send({ t: "op", id: `editor:${n}`, sentAt: 0, stream: "board", op: { elements: [text(n)] } }); await w.next(m => m.t === "ack" && m.id === `editor:${n}`); }
   await until(async () => (await r.room()).resolved === 6, "op 6 resolved");
-  const base = (await r.room()).base.seq;
-  expect(base).toBeGreaterThan(0);
-  await until(() => announced.includes(base) && checked === announced.length, `a heartbeat naming ${base}, checked against the Store`, 15_000);
+  // The room's last fold may land after op 6 resolves, and two writes landing between heartbeats are announced as one
+  // (cp is the newest): wait for a heartbeat naming the room's base as it is then, every heartbeat checked.
+  let base = 0;
+  await until(async () => { base = (await r.room()).base.seq; return base > 0 && announced.at(-1) === base && checked === announced.length; }, "a heartbeat naming the room's base, checked against the Store", 15_000);
   expect(lies).toEqual([]);
   const feed = () => r.server.gateway.feed(r.ids.tenant, r.ids.board);
   await until(() => feed()?.base === base, `the feed to rebase onto ${base}`, 15_000);

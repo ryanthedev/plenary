@@ -571,3 +571,23 @@ test("R2-L1: `welcomed` shrinks with `conns` (close notices, a listing, the swee
     expect(g.got.slice(before).filter(m => m.close === 1013).map(m => m.conn).sort()).toEqual([...live].sort());
   } finally { await host.close(); }
 }, 40000);
+
+// ---- e1-tests-v3 MEDIUM-1: close() after a failed build ----
+
+test("close() after a board's build failed: the lease is released once, `released` is published (cp 0), and nothing is logged as a failed release", async () => {
+  const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus(), lines = [];
+  const log = createLogger({ write: l => lines.push(JSON.parse(l)), level: "debug" });
+  // The build reads the latest checkpoint first: a Store error there fails the build before any Room exists.
+  const store = { ...raw, async getCheckpoint() { throw new Error("store down"); } };
+  const seen = [];
+  bus.subscribe(subjects.entries("t-cf", "b-cf"), m => { if (m?.released) seen.push(m); });
+  const h = roomHost({ store, bus, log, leaseTtlMs: 60_000, heartbeatMs: 60_000 });
+  try {
+    await expect(h.open("t-cf", "b-cf")).rejects.toThrow("store down");
+    await h.close();
+    await bus.flush();
+    expect(seen).toEqual([{ seq: 0, epoch: 1, cp: 0, released: true }]);
+    expect(lines.filter(l => l.level === "warn" || l.level === "error").map(l => l.msg)).toEqual(["room failed to open"]);   // the build's own error only
+    expect((await raw.lease("t-cf", "b-cf"))?.live).toBe(false);
+  } finally { await bus.close(); await raw.close(); }
+});

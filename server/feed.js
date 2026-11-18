@@ -24,17 +24,18 @@ const EMPTY = { seq: 0, id: null, by: null, at: null, streams: { board: { elemen
 
 /**
  * @param {{ tenant: string, board: string, store: object, bus: object, onLive: (e: { from: number, to: number, data: string }) => void,
- *   log?: object, codec?: object, pollMs?: number, chunkBytes?: number, pageSize?: number, pageBytes?: number, rebaseEvery?: number }} o
+ *   log?: object, codec?: object, pollMs?: number, chunkBytes?: number, pageSize?: number, pageBytes?: number, rebaseEvery?: number, rebaseBytes?: number, random?: () => number }} o
+ *   random: the backoff's jitter source, [0, 1) (tests pass a fixed one).
  *   onLive: called for every run of new resolved entries, in seq order, with the encoded `entries` frame.
  */
 export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger, codec = jsonCodec, pollMs = 5_000, chunkBytes = 1024 * 1024,
-  pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rebaseEvery = 1_000, rebaseBytes = 4 * 1024 * 1024 }) {
+  pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rebaseEvery = 1_000, rebaseBytes = 4 * 1024 * 1024, random = Math.random }) {
   const key = `${tenant}/${board}`;
   const self = {
     tenant, board, seq: 0, epoch: 0, ready: null, closed: false, gapAt: 0,
     base: EMPTY, tail: [],   // tail: [{ seq, id, by, at, text }], seq = base.seq + 1 …
     snap: null, chunks: [], chunksLen: 0, lastHeard: Date.now(), nextRebase: rebaseEvery, tailBytes: 0, nextRebaseBytes: rebaseBytes,
-    cpHeard: null, lookedAt: 0, retries: 0, looks: 0, failures: 0, skip: 0,   // the checkpoint look (rebase, below)
+    cpHeard: null, lookedAt: 0, retries: 0, looks: 0, failures: 0, skip: 0, failedFor: 0,   // the checkpoint look (rebase, below)
   };
   const frameOf = list => (codec === jsonCodec ? `{"t":"entries","entries":[${list.map(x => x.text).join(",")}]}` : codec.encode({ t: "entries", entries: list.map(x => JSON.parse(x.text)) }));
 
@@ -118,13 +119,16 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
   //   `rebaseEvery` entries or `rebaseBytes` chars since the last look, and after a miss (the room writes its
   //   checkpoint just after publishing the entries that trigger it) on at most LEGACY_RETRIES later heartbeats or
   //   polls; a look that throws keeps at least one retry.
-  // - A look that throws backs off: after the n-th failure in a row the next 2^(n-1) - 1 heartbeats or polls are
-  //   skipped (at most MAX_SKIP), so a Store that answers getCheckpoint but fails the entry check costs one full
-  //   checkpoint read per 32 heartbeats at worst, not one per heartbeat.
+  // - A look that throws backs off: after the n-th failure in a row, with b = min(MAX_SKIP, 2^(n-1) - 1), the next
+  //   k heartbeats or polls are skipped, k from [ceil(b/2), b] by `random` (jitter: gateways don't look in lockstep).
+  //   While skipping no look is made, not even a due one on entries, so a Store that answers getCheckpoint but fails
+  //   the entry check costs one full checkpoint read per 17 heartbeats at worst. A heartbeat naming a cp above the one
+  //   the failing look was for ends the skip; a look that completes resets n.
   const LEGACY_RETRIES = 3, MAX_SKIP = 31;
   const rebaseDue = () => self.tail.length >= self.nextRebase || self.tailBytes >= self.nextRebaseBytes;
   async function maybeRebase(beat) {
-    if (beat && self.skip > 0) { self.skip--; return; }
+    if (self.skip > 0 && self.cpHeard !== null && self.cpHeard > self.failedFor) self.skip = 0;   // a newer checkpoint
+    if (self.skip > 0) { if (beat) self.skip--; return; }
     if (self.cpHeard !== null) {
       if (beat && self.cpHeard > Math.max(self.base.seq, self.lookedAt) && self.cpHeard <= self.seq) await rebase(false);
     } else if (rebaseDue()) await rebase(true);
@@ -136,7 +140,12 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
     self.looks++;
     let cp;
     try { cp = await validBase(); }   // a Store error skips the bookkeeping below: the look is tried again, on a backoff
-    catch (err) { self.failures++; self.skip = Math.min(MAX_SKIP, 2 ** (self.failures - 1) - 1); throw err; }
+    catch (err) {
+      self.failures++; self.failedFor = heard ?? 0;
+      const b = Math.min(MAX_SKIP, 2 ** (self.failures - 1) - 1);
+      self.skip = b - Math.floor(random() * (Math.floor(b / 2) + 1));   // in [ceil(b/2), b]; random() < 1
+      throw err;
+    }
     self.failures = 0;
     if (heard !== null) self.lookedAt = Math.max(self.lookedAt, heard);
     if (cp.seq <= self.base.seq || cp.seq > self.seq) { self.retries = due ? LEGACY_RETRIES : Math.max(0, before - 1); return; }

@@ -50,6 +50,21 @@ test("a stale root is removed only when its owner file says this host and its pi
   expect(existsSync(self) && existsSync(other) && existsSync(noOwner) && existsSync(garbled)).toBe(true);
 });
 
+test("the sweep keeps a root whose owner file is from another pid namespace, lacks one, or names no usable pid", () => {
+  const base = mkdtempSync(join(tmpdir(), "plen-sweep-"));
+  const owned = owner => { const d = mkdtempSync(join(base, "plen-run-")); writeFileSync(join(d, "owner.json"), JSON.stringify(owner)); return d; };
+  const host = hostname(), ns = "pid:[4026531836]";
+  const dead = owned({ pid: 999_999, host, ns });                          // control: this host and namespace, dead
+  const kept = [
+    owned({ pid: 999_999, host, ns: "pid:[4026532999]" }),               // --network=host container: same hostname, other pids
+    owned({ pid: 999_999, host }),                                        // no namespace recorded: doubt
+    owned({ pid: 999_999, host, ns: null }),                              // a namespace-less host's file, seen from Linux
+    owned({ pid: "999999", host, ns }), owned({ pid: -999_999, host, ns }), owned({ pid: 0, host, ns }), owned({ pid: 1.5, host, ns }),
+  ];
+  expect(sweepStaleRoots(base, { alive: () => false, host, ns })).toEqual([dead.split("/").at(-1)]);
+  for (const d of kept) expect([d, existsSync(d)]).toEqual([d, true]);
+});
+
 test("ownerAlive: ESRCH alone means gone", () => {
   expect(ownerAlive(process.pid)).toBe(true);
   expect(ownerAlive(1)).toBe(true);                                      // EPERM: alive, someone else's

@@ -1,11 +1,13 @@
 // The per-run temp roots of test/preload.js: `<system temp>/plen-run-<pid>-XXXX`, one per `bun test` process, each
-// with an `owner.json` ({ pid, host }) written as soon as it is made.
+// with an `owner.json` ({ pid, host, ns }) written as soon as it is made.
 //
-// A pid means something only on the machine and in the pid namespace that made it: two containers sharing one temp dir
-// (a bind-mounted /tmp) each see the other's live runs as "no such process". So a root is removed only when its owner
-// file says it was made under this same hostname (a container gets its own) AND that pid is gone here. A root with no
-// readable owner file, another host's, or a live (or unknowable) pid is kept: never delete on doubt.
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+// A pid means something only in the pid namespace that made it: two containers sharing one temp dir (a bind-mounted
+// /tmp) each see the other's live runs as "no such process", and a container run with --network=host shares the
+// host's hostname but not its pids. So a root is removed only when its owner file names this hostname AND this pid
+// namespace (Linux: the /proc/self/ns/pid link; null where there is none, as on macOS) AND that pid is gone here. A
+// root with no readable owner file, any field missing or different, or a live (or unknowable) pid is kept: never
+// delete on doubt.
+import { mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 
@@ -17,15 +19,20 @@ export function ownerAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (err) { return err?.code !== "ESRCH"; }
 }
 
+/** This process's pid namespace (Linux, e.g. "pid:[4026531836]"), or null where there is no such link (macOS). */
+export function pidNamespace() {
+  try { return readlinkSync("/proc/self/ns/pid"); } catch { return null; }
+}
+
 /** Make this run's root under `base`, with its owner file. */
-export function makeRunRoot(base, { pid = process.pid, host = hostname() } = {}) {
+export function makeRunRoot(base, { pid = process.pid, host = hostname(), ns = pidNamespace() } = {}) {
   const root = mkdtempSync(join(base, `plen-run-${pid}-`));
-  writeFileSync(join(root, "owner.json"), JSON.stringify({ pid, host }));
+  writeFileSync(join(root, "owner.json"), JSON.stringify({ pid, host, ns }));
   return root;
 }
 
 /** Remove `<base>/plen-run-*` roots that this host's dead runs left (never our own, never on doubt). Returns the names removed. */
-export function sweepStaleRoots(base, { alive = ownerAlive, host = hostname() } = {}) {
+export function sweepStaleRoots(base, { alive = ownerAlive, host = hostname(), ns = pidNamespace() } = {}) {
   const gone = [];
   let names = [];
   try { names = readdirSync(base); } catch { return gone; }
@@ -33,7 +40,8 @@ export function sweepStaleRoots(base, { alive = ownerAlive, host = hostname() } 
     if (!name.startsWith("plen-run-")) continue;
     let owner;
     try { owner = JSON.parse(readFileSync(join(base, name, "owner.json"), "utf8")); } catch { continue; }
-    if (owner?.host !== host || !Number.isSafeInteger(owner?.pid) || owner.pid <= 0) continue;
+    if (owner?.host !== host || !owner || !("ns" in owner) || owner.ns !== ns) continue;   // another host or pid namespace, or unknown
+    if (!Number.isSafeInteger(owner.pid) || owner.pid <= 0) continue;   // kill(-n, 0) would ask about a process group
     if (owner.pid === process.pid || alive(owner.pid)) continue;
     try { rmSync(join(base, name), { recursive: true, force: true }); gone.push(name); } catch { /* another run got it */ }
   }

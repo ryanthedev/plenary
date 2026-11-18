@@ -22,10 +22,14 @@ p4-wire (7bf171b) runs in cluster mode on the env below (shared Postgres and NAT
 ## Needs
 
 `brew install postgresql@17 nats-server minio caddy` (it uses `initdb`, `postgres`, `nats-server`, `minio` and `caddy`
-from PATH or the standard Homebrew locations), plus Bun and `/bin/ps`. Debian/Ubuntu: `sudo apt-get install postgresql-17
-nats-server minio caddy`. Missing binaries are reported with these install hints. No npm dependencies.
+from PATH or the standard Homebrew locations), plus Bun and `/bin/ps`. Debian/Ubuntu: `postgresql-17` needs the PGDG apt repo, `nats-server` and `caddy` come from apt, and MinIO has no apt
+package (use the official binary from https://min.io/download). Missing binaries are reported with these install hints. No npm dependencies.
 
 ## Run
+
+To run the gated tests by hand: `up --name mine --services-only`, export `env --name mine`, `bun test <file>`, `down --name mine --clean`.
+Use services-only for this: a rig with nodes puts `gw-1`/`host-1` on the same NATS as the tests, and those nodes answer the
+tests' remote opens (two sequencers per board), which fails `main-cluster.test.js`.
 
 ```sh
 bun --no-env-file scripts/cluster-rig.js up                      # 2 gateways + 1 host, rig dir .rig/default/
@@ -35,11 +39,12 @@ bun --no-env-file scripts/cluster-rig.js status --json           # the same, as 
 bun --no-env-file scripts/cluster-rig.js kill host-1             # SIGKILL one node by its recorded PID
 bun --no-env-file scripts/cluster-rig.js down                    # stop everything this rig started
 bun --no-env-file scripts/cluster-rig.js ls                      # list live rigs of any name
+bun --no-env-file scripts/cluster-rig.js up --services-only      # Postgres, NATS, MinIO only: use this to run tests by hand
 bun --no-env-file scripts/cluster-rig.js env                     # print database, NATS and S3 test environment
 bun --no-env-file scripts/cluster-rig.js down --all              # stop all rigs
 bun --no-env-file scripts/cluster-rig.js down --clean            # stop and remove this rig directory
 bun --no-env-file scripts/cluster-rig.js down --all --clean      # stop and remove all rig directories
-bun --no-env-file scripts/cluster-rig.js gc                      # remove this user's unattached shared-memory segments
+bun --no-env-file scripts/cluster-rig.js gc                      # remove ANY unattached shared-memory segment of this user (not only the rig's)
 bun run test:cluster                               # run all service-gated tests on a fresh rig
 bun run test:fast                                   # run pure unit tests only
 bun run test:full                                   # run all tests (same as bun test)
@@ -74,7 +79,7 @@ is probed free at start, so none is fixed.
 
 Postgres is TCP-only because macOS limits Unix socket paths to 103 bytes, so a socket under a deep rig directory can fail.
 
-`bun run test:cluster` starts a uniquely named rig, runs all test files gated by `DATABASE_URL`, `NATS_URL` or
+`bun run test:cluster` starts a uniquely named services-only rig (`up --services-only`: Postgres, NATS and MinIO, no nodes and no Caddy, because the tests start their own nodes with the ids `gw-1`, `host-1`, ... on the same NATS), runs all test files gated by `DATABASE_URL`, `NATS_URL` or
 `S3_ENDPOINT`, then stops the rig. Any skipped test fails the command. Green runs remove the rig directory; failed runs
 keep it and print its path. SIGINT, SIGTERM and SIGHUP stop the child test and services. The gated files are
 `test/server/pg-store`, `pg-registry`, `nats-bus`, `room-host-lease`, `room-host-proc`, `main-cluster`, `s3-blobs`,
@@ -93,8 +98,8 @@ and `test/admin/tenants`.
 | `up.lock.break` | Present only for the instant an `up` clears a stale `up.lock`. If one is left (that `up` died right then), every `up` refuses and names it: remove it once no `up` runs on the dir. |
 | `pg/`, `nats.conf`, `Caddyfile`, `nodes/<id>/data/`, `caddy/` | State and generated config. |
 
-The rig never prints cookie/session keys or dev tokens. MinIO's generated local credentials are available through
-`env` for tests and are stored in rig.json; do not put production credentials in this rig.
+The rig never prints cookie/session keys or dev tokens. MinIO credentials are generated per rig (random, stored in rig.json, which is 0600), never printed by `up` or
+`status`, and available through `env` for tests; do not put production credentials in this rig.
 
 ### rig.json (version 1, stable; the load client in scripts/load/ reads it)
 

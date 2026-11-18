@@ -20,29 +20,28 @@ const hash = createHash("sha256").update(`${ROOT}\0${process.pid}`).digest("hex"
 const name = `test-${process.pid}-${hash}`.slice(0, 32);
 const dir = join(ROOT, ".rig", name);
 let child = null, helper = null, rig = null, rigStarted = false, code = 1, interrupted = false;
+let tearingDown = false;
 const signal = sig => {
   interrupted = true;
   try { child?.kill(sig); } catch {}
-  try { helper?.kill(sig); } catch {}
+  if (!tearingDown) try { helper?.kill(sig); } catch {}   // never signal the `down` helper: it must finish stopping the services
 };
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => signal(sig));
 
 try {
   mkdirSync(dir, { recursive: true });
-  const up = await runRigCli(["up", "--name", name, "--dir", dir, "--gateways", "1", "--hosts", "1", "--timeout-ms", "90000"]);
+  const up = await runRigCli(["up", "--name", name, "--dir", dir, "--services-only", "--timeout-ms", "90000"]);
   process.stdout.write(up.stdout);
   process.stderr.write(up.stderr);
   if (up.code !== 0) throw new Error(`cluster rig up failed (exit ${up.code})`);
   rigStarted = true;
-  const status = await runRigCli(["status", "--dir", dir, "--json"]);
-  if (status.code !== 0) throw new Error(`cluster rig status failed: ${status.stderr}`);
-  rig = JSON.parse(status.stdout);
+  const envOut = await runRigCli(["env", "--dir", dir]);
+  if (envOut.code !== 0) throw new Error(`cluster rig env failed: ${envOut.stderr}`);
+  rig = Object.fromEntries(envOut.stdout.split("\n").filter(l => l.includes("=")).map(l => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
   if (interrupted) throw new Error("interrupted while starting cluster");
   const env = {
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", LANG: "C",
-    DATABASE_URL: rig.postgres.url, NATS_URL: rig.nats.url,
-    S3_ENDPOINT: rig.blobs.url, S3_BUCKET: rig.blobs.bucket, S3_REGION: "us-east-1",
-    S3_ACCESS_KEY_ID: rig.blobs.accessKey, S3_SECRET_ACCESS_KEY: rig.blobs.secretKey,
+    ...Object.fromEntries(["DATABASE_URL", "NATS_URL", "S3_ENDPOINT", "S3_BUCKET", "S3_REGION", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"].map(k => [k, rig[k]])),
   };
   child = Bun.spawn([BUN, "--no-env-file", "test", ...FILES.map(f => join(ROOT, f))], {
     cwd: dir, env, stdin: "inherit", stdout: "pipe", stderr: "pipe",
@@ -74,6 +73,7 @@ try {
     await child.exited.catch(() => {});
     child = null;
   }
+  tearingDown = true;
   try {
     if (rigStarted || existsSync(join(dir, "rig.json"))) {
       const down = await runRigCli(["down", "--dir", dir, ...(code === 0 ? ["--clean"] : [])]);
@@ -85,8 +85,7 @@ try {
     console.error(`[test:cluster] cleanup failed: ${error.message}`);
     if (code === 0) code = 1;
   }
-  if (code === 0) rmSync(dir, { recursive: true, force: true });
-  else console.error(`[test:cluster] rig kept at ${dir}`);
+  if (code !== 0) console.error(`[test:cluster] rig kept at ${dir}`);
 }
 if (interrupted && code === 0) code = 1;
 process.exit(code);

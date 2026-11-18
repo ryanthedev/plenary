@@ -2,7 +2,7 @@
 // Local cluster rig for the M2 load test and the phase-4 takeover check: native Postgres 17 + NATS + N node
 // processes (gateways and room hosts split) behind one Caddy load balancer, all on this machine, all on probed ports.
 //
-//   bun scripts/cluster-rig.js up     [--name default] [--dir <path>] [--gateways 2] [--hosts 1] [--lease-ttl-ms 10000]
+//   bun scripts/cluster-rig.js up     [--name default] [--dir <path>] [--gateways 2] [--hosts 1] [--services-only] [--lease-ttl-ms 10000]
 //                                     [--max-conns-per-user 100000] [--node-cmd "<cmd> <args>"] [--timeout-ms 60000]
 //   bun scripts/cluster-rig.js status [--name|--dir] [--json]
 //   bun scripts/cluster-rig.js kill <node-id> [--name|--dir]      SIGKILL one node by its recorded PID (takeover check)
@@ -64,6 +64,7 @@ export function bins() {
     minio: find("minio", "/opt/homebrew/bin/minio"),
   };
 }
+export const INSTALL_HINT = "brew install postgresql@17 nats-server minio caddy (Debian/Ubuntu: add the PGDG apt repo for postgresql-17, apt-get install nats-server caddy, and get minio from https://min.io/download, there is no apt package)";
 /** Names of missing binaries; empty when the rig can run. */
 export function missingBins() { return Object.entries(bins()).filter(([, p]) => !p).map(([k]) => k); }
 
@@ -208,7 +209,7 @@ const fromDisk = (rig, fileDir, dir) => mapPaths(rig, p => !isAbsolute(p) ? join
 
 function save(rig) {
   const file = join(rig.dir, "rig.json");   // rig.dir is always the caller's dir (loadRig sets it), never the file's
-  writeFileSync(file + ".tmp", JSON.stringify(toDisk(rig), null, 2) + "\n");
+  writeSecret(file + ".tmp", JSON.stringify(toDisk(rig), null, 2) + "\n");   // 0600: it holds the MinIO secret
   renameSync(file + ".tmp", file);
 }
 export function readRig(dir) {
@@ -255,11 +256,9 @@ async function httpOk(url) {
   try { const r = await fetch(url, { signal: AbortSignal.timeout(1000) }); await r.arrayBuffer(); return r.ok; } catch { return false; }
 }
 
-const MINIO_ACCESS = "plenary-rig-local";
-const MINIO_SECRET = "plenary-rig-local-secret-key";
 const sha256 = async value => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)))].map(b => b.toString(16).padStart(2, "0")).join("");
 const hmac = async (key, value) => new Uint8Array(await crypto.subtle.sign("HMAC", await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]), new TextEncoder().encode(value)));
-async function createMinioBucket(endpoint, bucket) {
+async function createMinioBucket(endpoint, bucket, MINIO_ACCESS, MINIO_SECRET) {
   const now = new Date().toISOString().replace(/[:-]|\.\d{3}/g, ""), date = now.slice(0, 8), region = "us-east-1";
   const url = new URL(`/${bucket}`, endpoint), payloadHash = await sha256("");
   const canonicalHeaders = `host:${url.host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${now}\n`;
@@ -403,13 +402,14 @@ export async function startRig(opts = {}) {
   const name = opts.name ?? "default";
   if (!NAME_RE.test(name)) throw new Error("rig name: a-z, 0-9 and - only, at most 32 characters");
   const dir = resolve(opts.dir ?? defaultDir(name));
-  const gateways = opts.gateways ?? 2, hosts = opts.hosts ?? 1;
-  if (!(Number.isSafeInteger(gateways) && gateways >= 1 && Number.isSafeInteger(hosts) && hosts >= 0)) throw new Error("need at least 1 gateway and 0 or more hosts");
+  const servicesOnly = !!opts.servicesOnly || (opts.gateways === 0 && (opts.hosts ?? 0) === 0);   // Postgres, NATS, MinIO only: no nodes, no LB
+  const gateways = servicesOnly ? 0 : opts.gateways ?? 2, hosts = servicesOnly ? 0 : opts.hosts ?? 1;
+  if (!(Number.isSafeInteger(gateways) && gateways >= 0 && Number.isSafeInteger(hosts) && hosts >= 0 && (servicesOnly || gateways >= 1))) throw new Error("need at least 1 gateway and 0 or more hosts (or --services-only)");
   const leaseTtlMs = opts.leaseTtlMs ?? 10_000, maxConnsPerUser = opts.maxConnsPerUser ?? 100_000;
   const deadline = Date.now() + (opts.timeoutMs ?? 60_000);
   const step = opts.onStep ?? (() => {});
   const missing = missingBins();
-  if (missing.length) throw new Error(`missing binaries: ${missing.join(", ")}. Install with: brew install postgresql@17 nats-server minio caddy (Debian/Ubuntu: sudo apt-get install postgresql-17 nats-server minio caddy)`);
+  if (missing.length) throw new Error(`missing binaries: ${missing.join(", ")}. Install with: ${INSTALL_HINT}`);
   const B = bins();
   psCheck();   // before the dir is touched: a broken ps refuses here (p8-rig2v H2)
 
@@ -484,16 +484,21 @@ export async function startRig(opts = {}) {
 
     // S3-compatible object store. Both ports are probed and the API is loopback-only.
     step("minio: starting");
+    const minioAccess = `rig${randomBytes(6).toString("hex")}`, minioSecret = randomBytes(24).toString("base64url");   // per rig; stored 0600 in rig.json
     const minioPort = await freePort(taken), minioConsolePort = await freePort(taken);
     const minioEndpoint = `http://127.0.0.1:${minioPort}`, bucket = "plenary";
     const blobsDir = join(dir, "blobs");
     mkdirSync(blobsDir, { recursive: true });
     const minio = launch(rig, kids, "minio", [B.minio, "server", blobsDir, "--address", `127.0.0.1:${minioPort}`, "--console-address", `127.0.0.1:${minioConsolePort}`],
-      { env: baseEnv({ MINIO_ROOT_USER: MINIO_ACCESS, MINIO_ROOT_PASSWORD: MINIO_SECRET }), cwd: dir, log: join(logsDir, "minio.log"), abort: opts.abort });
-    rig.blobs = { url: minioEndpoint, bucket, accessKey: MINIO_ACCESS, secretKey: MINIO_SECRET, consolePort: minioConsolePort };
+      { env: baseEnv({ MINIO_ROOT_USER: minioAccess, MINIO_ROOT_PASSWORD: minioSecret }), cwd: dir, log: join(logsDir, "minio.log"), abort: opts.abort });
+    rig.blobs = { url: minioEndpoint, bucket, accessKey: minioAccess, secretKey: minioSecret, consolePort: minioConsolePort };
     save(rig);
     await waitFor(() => httpOk(`${minioEndpoint}/minio/health/ready`), { what: "minio", proc: minio, deadline, abort: opts.abort });
-    await createMinioBucket(minioEndpoint, bucket);
+    // Retried: under load the first signed request can fail (5xx or timeout) right after the health probe says ready.
+    for (let attempt = 1; ; attempt++) {
+      try { await createMinioBucket(minioEndpoint, bucket, minioAccess, minioSecret); break; }
+      catch (e) { if (attempt >= 5 || opts.abort?.aborted) throw e; await sleep(300); }
+    }
 
     // Nodes.
     const nodeCmd = opts.nodeCmd?.length ? opts.nodeCmd : [BUN, MAIN];
@@ -523,6 +528,8 @@ export async function startRig(opts = {}) {
       step(`node ${s.id}: waiting`);
       await waitFor(() => httpOk(`http://127.0.0.1:${s.port}/health`), { what: `node ${s.id}`, proc: s.proc, deadline, abort: opts.abort });
     }
+
+    if (servicesOnly) { rig.state = "up"; save(rig); step("up (services only)"); return rig; }
 
     // Load balancer in front of the gateways only; WebSocket upgrades pass through reverse_proxy as is.
     step("lb: starting");
@@ -637,7 +644,7 @@ export function parseArgs(argv) {
     const a = argv[i];
     if (!a.startsWith("--")) { o._.push(a); continue; }
     const [k, v] = a.slice(2).split("=", 2);
-    if (["json", "all", "clean"].includes(k)) { o[k] = true; continue; }
+    if (["json", "all", "clean", "services-only"].includes(k)) { o[k] = true; continue; }
     o[k] = v ?? argv[++i];
   }
   return o;
@@ -651,7 +658,8 @@ function printStatus(s) {
     `  lb        ${s.lb ? `${s.lb.url}   ${s.lb.wsUrl}` : "-"}   ${pid("caddy")}`,
     `  postgres  ${s.postgres ? `127.0.0.1:${s.postgres.port}   DATABASE_URL ${s.postgres.url}` : "-"}   ${pid("postgres")}`,
     `  nats      ${s.nats ? s.nats.url : "-"}   ${pid("nats")}`,
-    ...s3Env(s).map(line => `  ${line}`),
+    ...s3Env(s).filter(line => !line.startsWith("S3_SECRET_ACCESS_KEY=")).map(line => `  ${line}`),
+    ...(s.blobs ? ["  S3 secret  (not printed; run `env`)"] : []),
     ...s.nodes.map(n => `  ${n.id.padEnd(9)} ${n.roles.join(",").padEnd(8)} ${n.url}   ${pid("node:" + n.id)}`),
     `  tokens    ${s.tokensFile}   (0600, PLENARY_DEV_TOKENS format; never printed)`,
     `  logs      ${s.logsDir}`,
@@ -666,8 +674,8 @@ function rigDirs() {
   return readdirSync(root, { withFileTypes: true }).filter(e => e.isDirectory() && existsSync(join(root, e.name, "rig.json"))).map(e => join(root, e.name));
 }
 function missingRigMessage(name, dir) {
-  const others = rigDirs().filter(d => d !== dir).map(d => basename(d));
-  return `no rig named ${name}${others.length ? `; did you mean --name ${others[0]}?` : ""}`;
+  const live = rigDirs().filter(d => d !== dir && (() => { try { return rigStatus(d).procs.some(p => p.alive); } catch { return false; } })()).map(d => basename(d));
+  return `no rig named ${name}${live.length ? `; did you mean --name ${live[0]}?` : ""}`;
 }
 
 export function s3Env(s) {
@@ -687,7 +695,7 @@ async function cli(argv) {
     for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, onSig);
     const nodeCmd = a["node-cmd"] ? a["node-cmd"].split(/\s+/).filter(Boolean) : undefined;
     try {
-      await startRig({ name: a.name, dir, gateways: num(a.gateways, "gateways"), hosts: num(a.hosts, "hosts"),
+      await startRig({ name: a.name, dir, gateways: num(a.gateways, "gateways"), hosts: num(a.hosts, "hosts"), servicesOnly: !!a["services-only"],
         leaseTtlMs: num(a["lease-ttl-ms"], "lease-ttl-ms"), maxConnsPerUser: num(a["max-conns-per-user"], "max-conns-per-user"),
         timeoutMs: num(a["timeout-ms"], "timeout-ms"), nodeCmd, abort, onStep: m => console.error(`[rig] ${m}`) });
     } catch (err) { console.error(`[rig] up failed: ${err.message}`); return 1; }
@@ -697,9 +705,10 @@ async function cli(argv) {
   if (cmd === "status") {
     if (!existsSync(join(dir, "rig.json"))) throw new Error(missingRigMessage(a.name ?? basename(dir), dir));
     const s = rigStatus(dir);
-    if (a.json) console.log(JSON.stringify(s, null, 2)); else printStatus(s);
+    if (a.json) console.log(JSON.stringify({ ...s, ...(s.blobs && { blobs: { ...s.blobs, secretKey: undefined } }) }, null, 2)); else printStatus(s);
     return 0;
   }
+  if (["kill", "env"].includes(cmd) && !existsSync(join(dir, "rig.json"))) throw new Error(missingRigMessage(a.name ?? basename(dir), dir));
   if (cmd === "kill") {
     const id = a._[1];
     if (!id) throw new Error("usage: kill <node-id>");
@@ -708,6 +717,8 @@ async function cli(argv) {
     return 0;
   }
   if (cmd === "down") {
+    // Teardown must finish: a Ctrl-C (or the parent's forwarded signal) during down is ignored, never a half-stopped rig.
+    for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => {});
     const targets = a.all ? rigDirs() : [dir];
     if (!a.all && !existsSync(join(dir, "rig.json"))) throw new Error(missingRigMessage(a.name ?? basename(dir), dir));
     for (const target of targets) {

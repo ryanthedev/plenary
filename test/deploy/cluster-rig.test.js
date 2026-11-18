@@ -16,7 +16,7 @@ const STUB = join(ROOT, "test/deploy/stub-node.js");
 const stub = (...args) => [process.execPath, STUB, ...args];
 const missing = missingBins();
 const SKIP = missing.length > 0;
-if (SKIP) console.warn(`cluster-rig tests skipped: missing ${missing.join(", ")} (brew install postgresql@17 nats-server caddy)`);
+if (SKIP) console.warn(`cluster-rig tests skipped: missing ${missing.join(", ")} (brew install postgresql@17 nats-server minio caddy)`);
 
 // Stop anything a failed, timed-out or killed test left (recorded PIDs only; test/deploy/rig-guard.js), then remove only
 // the dirs this file created. Every in-process `up` here is rig-guard's rigUp (shared abort), every child is tracked.

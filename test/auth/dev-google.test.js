@@ -2,6 +2,7 @@
 // IdP stands in through the harness's injected fetch, and the /signed-in page's own script runs with stubbed browser
 // globals. Port 0; the server is stopped by handle, never by pattern.
 import { test, expect, beforeAll, afterAll } from "bun:test";
+import { join } from "node:path";
 import { startDevGoogle, ORIGIN, makeSafeFetch, safeFetch, FETCH_TIMEOUT_MS, STOP_SIGNALS } from "../../scripts/dev-google.js";
 import { LOGIN_COOKIE, EXCHANGE_COOKIE } from "../../server/auth/http.js";
 import { fakeIdp, CLIENT_ID } from "./fake-idp.js";
@@ -81,6 +82,23 @@ test("harness page: a consumer account without a Google-verified email still sig
   const page = await runPage(cb.headers.get("location"), cookieOf(cb, EXCHANGE_COOKIE));
   expect(page.text).toBe("signed in as (no Google-verified email; user google:77)");
 });
+
+test("live: scripts/dev-google.js started with fake credentials on another port stops cleanly (exit 0) on SIGHUP, SIGINT and SIGTERM", async () => {
+  for (const sig of ["SIGHUP", "SIGINT", "SIGTERM"]) {
+    const probe = Bun.serve({ port: 0, fetch: () => new Response("") }), port = probe.port; probe.stop(true);
+    const p = Bun.spawn([process.execPath, "scripts/dev-google.js"], { cwd: join(import.meta.dir, "../.."), stdout: "ignore", stderr: "pipe",
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, GOOGLE_CLIENT_ID: "fake-id", GOOGLE_CLIENT_SECRET: "fake-secret", DEV_GOOGLE_PORT: String(port) } });
+    try {
+      const reader = p.stderr.getReader(); let text = "";
+      while (!text.includes("pid")) { const { value, done } = await reader.read(); if (done) break; text += new TextDecoder().decode(value); }
+      expect(text).toContain("dev-google: pid");
+      expect((await fetch(`http://127.0.0.1:${port}/`)).status).toBe(200);   // really serving
+      p.kill(sig);
+      expect(await Promise.race([p.exited, Bun.sleep(5000).then(() => "hung")])).toBe(0);
+      await expect(fetch(`http://127.0.0.1:${port}/`)).rejects.toThrow();    // and the port is released
+    } finally { if (p.exitCode === null) p.kill("SIGKILL"); }
+  }
+}, 30000);
 
 test("safeFetch times out on a Google that never answers (an error with a code, no URL), and the harness stops on SIGHUP too", async () => {
   const hang = Bun.serve({ port: 0, fetch: () => new Promise(() => {}) });

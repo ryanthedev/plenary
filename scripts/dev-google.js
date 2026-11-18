@@ -160,12 +160,14 @@ export async function listening(host, port, timeoutMs = 1000) {
 export const portBusy = async port => (await listening("127.0.0.1", port)) || (await listening("::1", port));
 
 if (import.meta.main) {
-  if (await portBusy(PORT)) {
-    console.error(`dev-google: something already answers on port ${PORT}; stop it first (the redirect URI fixes the port)`);
+  // DEV_GOOGLE_PORT moves the listening port only (tests; the redirect URI, and so the real sign-in, stays on 8080).
+  const listenPort = process.env.DEV_GOOGLE_PORT ? Number(process.env.DEV_GOOGLE_PORT) : PORT;
+  if (await portBusy(listenPort)) {
+    console.error(`dev-google: something already answers on port ${listenPort}; stop it first (the redirect URI fixes the port)`);
     process.exit(1);
   }
   let h;
-  try { h = await startDevGoogle(); }
+  try { h = await startDevGoogle({ port: listenPort }); }
   catch (e) { console.error(String(e.message).startsWith("dev-google:") ? e.message : `dev-google: ${e.message}`); process.exit(1); }   // p5-googlev LOW 3
   console.error(`dev-google: pid ${process.pid}; open ${ORIGIN}/ (Ctrl-C or kill ${process.pid} to stop)`);
   for (const sig of STOP_SIGNALS) process.on(sig, () => { h.stop(); process.exit(0); });

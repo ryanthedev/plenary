@@ -20,7 +20,7 @@ const MAIN = resolve(import.meta.dir, "../../server/main.js");
 const SELF = import.meta.path;
 export const ORPHAN_CHECK_MS = 500;
 export const SPAWN_TIMEOUT_MS = 5000;   // every ps / sh / sysctl call this tooling makes is bounded
-const HEAD_BYTES = 256 * 1024;          // the head of the server's stdout / stderr kept in memory (the log file gets all)
+export const HEAD_BYTES = 256 * 1024;          // the head of the server's stdout / stderr kept in memory (the log file gets all)
 
 /** Resolve true if the child exits within ms, false if not (it never rejects, never waits longer than ms). */
 export function exitedWithin(c, ms) {

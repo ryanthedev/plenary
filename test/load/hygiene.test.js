@@ -4,9 +4,9 @@
 
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { tmp, cleanTmp, useScratch, childEnv, scenarioGroup, SCRATCH } from "./tmp.js";
-import { writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from "node:fs";
+import { writeFileSync, readFileSync, readdirSync, existsSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { startServer, stopChild } from "../../scripts/load/server.js";
+import { startServer, stopChild, HEAD_BYTES } from "../../scripts/load/server.js";
 import { stopChildren, parseOptions, wallLimitS, createBoard } from "../../scripts/load/run.js";
 
 const RUN = resolve(import.meta.dir, "../../scripts/load/run.js");
@@ -116,6 +116,28 @@ test("startServer is ready when /health answers, not when the log says so; a ser
   } finally { await s.stop(); }
   const e = await startServer({ tokensPath: tokensFile(), main: stub, env: { NEVER: "1" }, timeoutMs: 800 }).catch(x => x);
   expect(e.message).toBe("server: /health did not answer within 800 ms");
+});
+
+test("the server's kept output is capped (the log file gets all of it) and readiness still works", async () => {
+  // A stub that logs its dev-tokens line, then 2 MB of lines, then listens.
+  const dir = tmp("plenary-load-noisy-"), stub = join(dir, "noisy.js"), logPath = join(dir, "server.log");
+  writeFileSync(stub, `console.log(JSON.stringify({ msg: "dev tokens are ON: not for production", board: "noisyboard" }));
+    const line = JSON.stringify({ msg: "x".repeat(1000) }) + "\\n";
+    for (let i = 0; i < 2000; i++) process.stdout.write(line);
+    console.error("e".repeat(600000));
+    Bun.serve({ port: Number(process.env.PORT), hostname: "127.0.0.1", fetch: () => new Response("ok") });
+    setInterval(() => {}, 1000);`);
+  const s = await startServer({ tokensPath: tokensFile(), main: stub, logPath });
+  try {
+    expect(s.board).toBe("noisyboard");
+    const end = Date.now() + 5000;
+    while (statSync(logPath).size < 2_000_000 && Date.now() < end) await Bun.sleep(50);
+    expect(statSync(logPath).size).toBeGreaterThanOrEqual(2_000_000);   // the file got everything
+    expect(s.out.text.length).toBeLessThan(HEAD_BYTES + 200_000);       // memory kept the head only (the cap plus one chunk)
+    expect(s.out.err.length).toBeLessThan(HEAD_BYTES + 200_000);
+    expect(s.out.text.length).toBeGreaterThanOrEqual(HEAD_BYTES);
+    expect((await fetch(`${s.httpUrl}/health`)).status).toBe(200);
+  } finally { await s.stop(); }
 });
 
 test("createBoard gives up on a server that never answers (and does not echo the token)", async () => {

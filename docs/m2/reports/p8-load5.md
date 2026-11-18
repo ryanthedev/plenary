@@ -124,3 +124,9 @@ Nothing was weakened: every live scenario still runs a real CLI against a real o
 - The bounded output buffer has no test of its own (it would need a server that logs more than 256 KB).
 - `dev-google.js` SIGHUP: the signal list is asserted (`STOP_SIGNALS`), not a live SIGHUP to the real script (it needs Google credentials and a fixed port).
 - The full `bun test` was not run (known unrelated hang).
+
+### Round 2 addendum (the two "not tested" items, closed)
+
+- **Output cap:** `hygiene.test.js` runs a stub server that logs 2 MB and then listens. The log file gets all 2 MB, the kept stdout and stderr stay under `HEAD_BYTES` plus one chunk, and `/health` readiness still works. Mutant "cap removed": killed.
+- **Live SIGHUP:** `dev-google.js` takes `DEV_GOOGLE_PORT`, which moves the listening port only (unset: 8080, and the redirect URI is unchanged). `dev-google.test.js` starts it with fake credentials on a free port, checks `/` answers, sends SIGHUP, SIGINT and SIGTERM in turn, and asserts exit 0 and the port released. Mutants "SIGHUP not handled" and "port override ignored": both killed.
+- **Full `bun test` on this branch:** 1590 pass, 155 skip, 0 fail, 1745 tests in 95 files, 251 s, 0 temp entries left in a fresh TMPDIR.

@@ -76,6 +76,14 @@ export function namingDir(dir) {
   return out.split("\n").filter(l => l.includes(dir) && !l.includes("/bin/ps -axo")).map(l => l.trim());
 }
 
+/**
+ * The afterAll timeout for cleanupAll(). bun's 5 s default hook timeout is far below the work: one stopRig per dir that
+ * still has a rig.json (every test's rig stays recorded as "down" until now, ~32 dirs in cluster-rig.test.js), each
+ * spawning `ps` per recorded process, then removing ~57 dirs. Measured idle: ~1.6 s; with `ps` taking 50 ms (what a busy
+ * machine gives) 4.9 s of stopRig + 1.4 s of rmSync = 6.3 s, which bun reports as an unnamed hook timeout. This is a
+ * backstop above cleanupAll's own bounded waits (30 s children + 60 s in-flight `up`s), not a hide.
+ */
+export const CLEANUP_TIMEOUT_MS = 180_000;
 let cleaning = null;
 export function cleanupAll({ graceMs = 3000 } = {}) {
   return cleaning ??= (async () => {

@@ -8,7 +8,7 @@ import { test, expect, afterAll, describe } from "bun:test";
 import { rmSync, readFileSync, writeFileSync, existsSync, statSync, readdirSync, mkdirSync, renameSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { stopRig, rigStatus, killNode, readRig, isOurs, psInfo, TERMINAL_SIGNALS, STARTED_CLOCK, portFree, missingBins, _setPsPath, _setIpcPaths, _setLockHook, pgShmOf, removeOrphanShm, parseIpcsSegments, s3Env, parseArgs } from "../../scripts/cluster-rig.js";
-import { freshDir, track, rigUp as startRig, spawnTracked, cleanupAll, killRecorded, namingDir } from "./rig-guard.js";
+import { freshDir, track, rigUp as startRig, spawnTracked, cleanupAll, CLEANUP_TIMEOUT_MS, killRecorded, namingDir } from "./rig-guard.js";
 
 const ROOT = new URL("../..", import.meta.url).pathname;
 const RIG = join(ROOT, "scripts/cluster-rig.js");
@@ -20,7 +20,7 @@ if (SKIP) console.warn(`cluster-rig tests skipped: missing ${missing.join(", ")}
 
 // Stop anything a failed, timed-out or killed test left (recorded PIDs only; test/deploy/rig-guard.js), then remove only
 // the dirs this file created. Every in-process `up` here is rig-guard's rigUp (shared abort), every child is tracked.
-afterAll(() => cleanupAll());
+afterAll(() => cleanupAll(), CLEANUP_TIMEOUT_MS);
 
 const portsOf = rig => [rig.postgres?.port, rig.nats?.port, rig.nats?.monitorPort, Number(new URL(rig.blobs?.url ?? "http://127.0.0.1:0").port), rig.blobs?.consolePort, rig.lb?.port, ...rig.nodes.map(n => n.port)].filter(Boolean);
 // The test's own identity check, independent of the module's: lstart under a fixed TZ and locale.

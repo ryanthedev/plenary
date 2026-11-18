@@ -2,10 +2,10 @@
 // in-process and one through the CLI, both stuck waiting on nodes that never answer, and then hangs until killed.
 import { test, afterAll } from "bun:test";
 import { join } from "node:path";
-import { rigUp, track, spawnTracked, cleanupAll } from "./rig-guard.js";
+import { rigUp, track, spawnTracked, cleanupAll, CLEANUP_TIMEOUT_MS } from "./rig-guard.js";
 
 const A = process.env.RIG_FIXTURE_DIR_A, B = process.env.RIG_FIXTURE_DIR_B;
-afterAll(() => cleanupAll());
+afterAll(() => cleanupAll(), CLEANUP_TIMEOUT_MS);
 
 test.skipIf(!A || !B)("fixture: two rigs mid-up, then hang until killed", async () => {
   track(A); track(B);

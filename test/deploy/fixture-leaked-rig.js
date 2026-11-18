@@ -4,10 +4,16 @@
 import { test, afterAll } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { rigUp, track, cleanupAll, CLEANUP_TIMEOUT_MS, _setSnapshotPs, lstart } from "./rig-guard.js";
+import { rigUp, track, cleanupAll, CLEANUP_TIMEOUT_MS, _setSnapshotPs, _setInflightCapMs, _trackInflight, ABORT, lstart } from "./rig-guard.js";
 
 const DIR = process.env.RIG_FIXTURE_DIR, OUT = process.env.RIG_FIXTURE_OUT;
-afterAll(() => { if (process.env.RIG_FIXTURE_PS) _setSnapshotPs(process.env.RIG_FIXTURE_PS); return cleanupAll(); }, CLEANUP_TIMEOUT_MS);
+// RIG_FIXTURE_INFLIGHT: an `up` that never settles, with the wait for it capped at 50 ms (the snapshot must then be skipped).
+afterAll(async () => {
+  if (process.env.RIG_FIXTURE_PS) _setSnapshotPs(process.env.RIG_FIXTURE_PS);
+  if (process.env.RIG_FIXTURE_INFLIGHT) { _setInflightCapMs(50); _trackInflight(new Promise(() => {})); }
+  await cleanupAll();
+  writeFileSync(`${OUT}.after`, JSON.stringify({ aborted: ABORT.aborted }));
+}, CLEANUP_TIMEOUT_MS);
 
 test.skipIf(!DIR || !OUT)("fixture: a services-only rig left up, plus a decoy with the wrong start time", async () => {
   track(DIR);

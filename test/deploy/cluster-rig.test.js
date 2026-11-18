@@ -420,11 +420,16 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
   // cleanupAll takes ONE ps snapshot and stops only the dirs it shows alive; these prove it still stops a leaked rig, never
   // touches a live pid recorded with another start time, and checks every dir when the snapshot is unusable (fails, prints
   // nothing, or prints a row that is not `pid stat lstart`). test/deploy/fixture-leaked-rig.js leaves a rig up and runs it.
-  for (const [label, psBody] of [["the snapshot ps works", null], ["the snapshot ps fails", "exit 2"], ["the snapshot ps prints nothing", "exit 0"], ["the snapshot ps prints a row in another format", "echo '  123 S+ not-a-date'"]]) {
+  // A snapshot that parses but shows none of the rig's processes would make the filter skip (leak) a live rig: the last
+  // two cases prove the full pass runs instead when an `up` is still in flight past the wait cap (N1) and when the ps
+  // cannot even be spawned (N2: cleanup still removes the dirs and clears the shared abort flag).
+  const OTHER_ROW = "echo '    1 Ss Mon Jan  1 00:00:00 2001'";
+  for (const [label, psBody, extra = {}] of [["the snapshot ps works", null], ["the snapshot ps fails", "exit 2"], ["the snapshot ps prints nothing", "exit 0"], ["the snapshot ps prints a row in another format", "echo '  123 S+ not-a-date'"],
+                                              ["an `up` is still in flight past the wait cap", OTHER_ROW, { RIG_FIXTURE_INFLIGHT: "1" }], ["the snapshot ps cannot be spawned", null, { RIG_FIXTURE_PS: "/nonexistent/ps" }]]) {
     test.skipIf(SKIP)(`Leaks: cleanupAll stops a rig a test left up and spares a live pid with another start time (${label})`, async () => {
       const dir = freshDir(), out = join(freshDir(), "out.json"), fake = join(freshDir(), "fake-ps");
       if (psBody) { writeFileSync(fake, `#!/bin/sh\n${psBody}\n`); chmodSync(fake, 0o755); }
-      const env = { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR ?? "/tmp", RIG_FIXTURE_DIR: dir, RIG_FIXTURE_OUT: out, ...(psBody ? { RIG_FIXTURE_PS: fake } : {}) };
+      const env = { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR ?? "/tmp", RIG_FIXTURE_DIR: dir, RIG_FIXTURE_OUT: out, ...(psBody ? { RIG_FIXTURE_PS: fake } : {}), ...extra };
       const run = spawnTracked([process.execPath, "test", join(ROOT, "test/deploy/fixture-leaked-rig.js")], { cwd: ROOT, stdout: "pipe", stderr: "pipe", env });
       let seen = null;
       try {
@@ -434,11 +439,13 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
         for (const p of seen.real) expect({ name: p.name, gone: psGone(p.pid) }).toEqual({ name: p.name, gone: true });
         expect(namingDir(dir)).toEqual([]);
         expect(existsSync(dir)).toBe(false);
+        expect(JSON.parse(readFileSync(`${out}.after`, "utf8"))).toEqual({ aborted: false });
         expect(lstart(seen.decoy.pid)).toBe(seen.decoy.started);   // the decoy is still the same live process
       } finally {
         run.kill("SIGKILL");
         if (seen) killRecorded([{ pid: seen.decoy.pid, started: seen.decoy.started }]);   // our own sleep, by pid and start time
       }
+      for (let i = 0; i < 40 && !psGone(seen.decoy.pid); i++) await Bun.sleep(50);   // SIGKILL is delivered asynchronously
       expect(psGone(seen.decoy.pid)).toBe(true);
     }, 180_000);
   }

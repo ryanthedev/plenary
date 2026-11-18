@@ -84,6 +84,10 @@ export function namingDir(dir) {
  * filesystem. The ceiling stays above cleanupAll's own bounded waits (30 s children + 60 s in-flight `up`s).
  */
 export const CLEANUP_TIMEOUT_MS = 180_000;
+let inflightCapMs = 60_000;
+/** Test seams: how long cleanupAll waits for in-flight `up`s, and a promise it must treat as one still running. */
+export const _setInflightCapMs = ms => { inflightCapMs = ms ?? 60_000; };
+export const _trackInflight = p => { inflight.add(p); return p; };
 let snapshotPs = "/bin/ps";
 /** Test seam: the ps the cleanup snapshot runs (a fake one proves the fail-closed fallback); no argument restores /bin/ps. */
 export const _setSnapshotPs = p => { snapshotPs = p ?? "/bin/ps"; };
@@ -113,7 +117,7 @@ export function cleanupAll({ graceMs = 3000 } = {}) {
     for (const c of children) { try { c.kill("SIGTERM"); } catch {} }
     await Promise.race([Promise.allSettled([...children].map(c => c.exited)), Bun.sleep(30_000)]);
     for (const c of children) { try { c.kill("SIGKILL"); } catch {} }
-    await Promise.race([Promise.allSettled([...inflight]), Bun.sleep(60_000)]);
+    await Promise.race([Promise.allSettled([...inflight]), Bun.sleep(inflightCapMs)]);
     try {
       // One ps for every tracked dir (not one per recorded process per dir): a recorded process is live when the snapshot
       // has its pid with the recorded start time and no zombie state. A dir with none is left to the rm below; a ps that

@@ -7,12 +7,12 @@
 //   reaped, and every test/server/rig.js rig still running is stopped, pass or fail.
 // - Temp dirs: one root per run, `<system temp>/plen-run-<pid>-XXXX`. TMPDIR points at it, so `os.tmpdir()` in tests
 //   and in the processes they spawn lands there; it is removed after the last test. A run that is SIGKILLed can't
-//   remove its own, so each run first removes the roots of runs whose process is gone.
+//   remove its own, so each run first removes the roots of this host's runs whose process is gone (test/temp-root.js:
+//   an owner file per root; never on doubt).
 import { afterEach, afterAll } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { sweepStaleRoots } from "./temp-root.js";
+import { sweepStaleRoots, makeRunRoot } from "./temp-root.js";
 
 /** Shared with helpers.js and rig.js through globalThis: they need no import of this file, and fail loudly without it. */
 const nets = globalThis.__plenaryTestNets = { children: new Set(), rigs: new Set() };
@@ -25,7 +25,7 @@ afterEach(async () => {
 
 const base = tmpdir();
 sweepStaleRoots(base);
-const root = mkdtempSync(join(base, `plen-run-${process.pid}-`));
+const root = makeRunRoot(base);
 process.env.TMPDIR = root;
 globalThis.__plenaryTestRoot = root;
 // A preload's afterAll runs once, after every file (bun test emits no process "exit" or "beforeExit" event).

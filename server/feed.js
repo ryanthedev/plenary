@@ -34,7 +34,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
     tenant, board, seq: 0, epoch: 0, ready: null, closed: false, gapAt: 0,
     base: EMPTY, tail: [],   // tail: [{ seq, id, by, at, text }], seq = base.seq + 1 …
     snap: null, chunks: [], chunksLen: 0, lastHeard: Date.now(), nextRebase: rebaseEvery, tailBytes: 0, nextRebaseBytes: rebaseBytes,
-    cpHeard: null, lookedAt: 0, retries: 0, looks: 0,   // the checkpoint look (rebase, below)
+    cpHeard: null, lookedAt: 0, retries: 0, looks: 0, failures: 0, skip: 0,   // the checkpoint look (rebase, below)
   };
   const frameOf = list => (codec === jsonCodec ? `{"t":"entries","entries":[${list.map(x => x.text).join(",")}]}` : codec.encode({ t: "entries", entries: list.map(x => JSON.parse(x.text)) }));
 
@@ -118,9 +118,13 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
   //   `rebaseEvery` entries or `rebaseBytes` chars since the last look, and after a miss (the room writes its
   //   checkpoint just after publishing the entries that trigger it) on at most LEGACY_RETRIES later heartbeats or
   //   polls; a look that throws keeps at least one retry.
-  const LEGACY_RETRIES = 3;
+  // - A look that throws backs off: after the n-th failure in a row the next 2^(n-1) - 1 heartbeats or polls are
+  //   skipped (at most MAX_SKIP), so a Store that answers getCheckpoint but fails the entry check costs one full
+  //   checkpoint read per 32 heartbeats at worst, not one per heartbeat.
+  const LEGACY_RETRIES = 3, MAX_SKIP = 31;
   const rebaseDue = () => self.tail.length >= self.nextRebase || self.tailBytes >= self.nextRebaseBytes;
   async function maybeRebase(beat) {
+    if (beat && self.skip > 0) { self.skip--; return; }
     if (self.cpHeard !== null) {
       if (beat && self.cpHeard > Math.max(self.base.seq, self.lookedAt) && self.cpHeard <= self.seq) await rebase(false);
     } else if (rebaseDue()) await rebase(true);
@@ -130,7 +134,10 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
     const heard = self.cpHeard, before = self.retries;
     if (due) { again(); self.retries = Math.max(before, 1); }
     self.looks++;
-    const cp = await validBase();   // a Store error throws past the bookkeeping below: the look is tried again
+    let cp;
+    try { cp = await validBase(); }   // a Store error skips the bookkeeping below: the look is tried again, on a backoff
+    catch (err) { self.failures++; self.skip = Math.min(MAX_SKIP, 2 ** (self.failures - 1) - 1); throw err; }
+    self.failures = 0;
     if (heard !== null) self.lookedAt = Math.max(self.lookedAt, heard);
     if (cp.seq <= self.base.seq || cp.seq > self.seq) { self.retries = due ? LEGACY_RETRIES : Math.max(0, before - 1); return; }
     const cut = self.tail.slice(0, cp.seq - self.base.seq);
@@ -151,7 +158,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
       if (m.to > self.seq) await repair(m.to);   // still short (the repair raced the room): the Store has it
     } else if (Number.isSafeInteger(m?.seq) && m.seq > self.seq) await repair(m.seq);
     const beat = !Array.isArray(m?.items);
-    if (beat) self.cpHeard = Number.isSafeInteger(m?.cp) && m.cp >= 0 ? Math.max(self.cpHeard ?? 0, m.cp) : null;   // no cp: a host from before it
+    if (beat) self.cpHeard = Number.isSafeInteger(m?.cp) && m.cp >= 0 ? Math.max(self.cpHeard ?? 0, m.cp) : null;   // no cp: a host from before it (heartbeats and `released` carry one)
     await maybeRebase(beat);
   }
 

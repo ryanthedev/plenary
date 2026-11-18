@@ -800,11 +800,15 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   Recovery, Rebuild; at most every 1,000 entries or 4 MB of tail): it reads one from the Store only when the
   largest `cp` it has heard is above both its base and the `cp` of its last completed look, so a gateway reads each
   checkpoint at most once, and an idle board, or a room that hasn't folded, costs no reads. A look that fails (a
-  Store error) is not completed and is tried again on the next heartbeat. A gateway whose last heartbeat for the
+  Store error) is not completed and is tried again (on the backoff below). A gateway whose last heartbeat for the
   board had no `cp` (its host predates `cp`), or that has had none since it began serving the board (the Store poll
   below delivers), looks when its tail is due, and after a look that finds nothing newer, again on at most 3 later
   heartbeats or polls, then not until the tail is due again. Mixed versions are safe both ways: an older gateway
-  ignores `cp`.
+  ignores `cp`. A host that stops cleanly checkpoints, releases the lease and then publishes
+  `{ seq, epoch, cp, released: true }` on `.entries` (so a waiting host takes the board at once): it carries `cp`
+  like a heartbeat, which announces the stop checkpoint. A look that fails (a Store error) is tried again on a
+  backoff of heartbeats: after the n-th failure in a row the next 2^(n-1) - 1 heartbeats or polls are skipped (at
+  most 31), so a failing Store costs at most one look per 32 heartbeats, not one per heartbeat.
 - A gateway subscribes to the board's subjects **before** it forwards a hello or serves any catch-up, so
   nothing between catch-up and live is missed.
 - Gateway → room messages on `.inbox`: a hello or op as `{ n, conn, gateway, user, name, role, client, msg }`; a

@@ -593,7 +593,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
         try {
           await store.release(slot.tenant, slot.board, me, slot.epoch);
           // A host watching this board takes it at once (L2), not when it next asks the Store.
-          bus.publish(subjects.entries(slot.tenant, slot.board), { seq: slot.durable, epoch: slot.epoch, released: true })?.catch?.(() => {});
+          bus.publish(subjects.entries(slot.tenant, slot.board), { seq: slot.durable, epoch: slot.epoch, cp: slot.room.heartbeat().cp, released: true })?.catch?.(() => {});
         } catch (err) { log.warn("lease release failed; it lapses within its ttl", { tenant: slot.tenant, board: slot.board, err }); }
       }
       held.clear(); slots.clear();

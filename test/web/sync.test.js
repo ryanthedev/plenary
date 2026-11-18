@@ -9,6 +9,7 @@ import { localRoom } from "../../web/adapters/transport/local.js";
 import { virtualClock } from "../../web/adapters/clock/virtual.js";
 import { browserClock } from "../../web/adapters/clock/browser.js";
 import { PRESENCE_BACKLOG_BYTES } from "../../web/ports/transport.js";
+import { BACKOFF } from "../../packages/protocol/envelope.js";
 
 /** Polls (real timers) until `fn()` is truthy; a failing test stops waiting at `ms`, a passing one never waits for it. */
 async function until(fn, what, ms = 15_000) {
@@ -800,9 +801,13 @@ test("real timers (the page's clock, browserClock): a refusal resyncs after the 
   drag(v, "rectangle", { x: 100, y: 100 }, { x: 200, y: 200 });
   // The refusal's backoff runs on real timers (~0.25-0.5 s): wait for the outcome, not for a guessed time. Not on the
   // reset count: the refusal makes the viewer "connecting" at once (goDown) and the local room delivers in microtasks,
-  // so once both are live with nothing pending every resync there will be has happened, and a third one shows here.
+  // so once both are live with nothing pending every message-driven resync has happened; a timer-driven one is waited out below.
   await until(() => sv.status === "live" && sv.pending === 0 && so.pending === 0, "the refused viewer to resync and both to settle");
   expect([sv.resets, reopens]).toEqual([2, 1]);                          // the first welcome, then exactly one resync
+  // A resync a timer brings later (a backoff armed twice, say) would come within one backoff window, at most
+  // BACKOFF.baseMs × 2^1 = 1 s after a single refusal: wait out twice that (a settle only lengthens the test) and look again.
+  await new Promise(res => setTimeout(res, 2 * BACKOFF.baseMs * 2));
+  expect([sv.resets, reopens, sv.status]).toEqual([2, 1, "live"]);
   expectConverged(net, [{ editor: o, sync: so }, { editor: v, sync: sv }]);
   so.close(); sv.close();
 });

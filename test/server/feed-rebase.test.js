@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { boardFeed } from "../../server/feed.js";
 import { sqliteStore } from "../../server/store/sqlite.js";
 import { memoryBus, subjects } from "../../server/bus/memory.js";
-import { tempDir, cleanup, until } from "./helpers.js";
+import { tempDir, cleanup, until, sleep } from "./helpers.js";
 import { rig } from "./rig.js";
 
 afterAll(cleanup);
@@ -27,15 +27,16 @@ async function setup({ n, feedOpts = {}, entries = i => entry(i), before = async
   const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
   const { epoch } = await raw.acquire(T, B, "h-feed", 60_000);
   for (let i = 1; i <= n; i += 500) await raw.append(T, B, Array.from({ length: Math.min(500, n - i + 1) }, (_, k) => entries(i + k)), i - 1, epoch);
-  const io = { cpReads: 0, reads: 0, fail: 0 };
+  const io = { cpReads: 0, reads: 0, fail: 0, failEntryReads: false };
   const store = {
     ...raw,
     async getCheckpoint(...a) { io.cpReads++; if (io.fail > 0) { io.fail--; throw new Error("store down"); } return raw.getCheckpoint(...a); },
-    async read(...a) { io.reads++; return raw.read(...a); },
+    // failEntryReads: the one-entry read a look makes to check a checkpoint fails (getCheckpoint itself answers).
+    async read(...a) { io.reads++; if (io.failEntryReads && a[3] === 1) throw new Error("reads down"); return raw.read(...a); },
   };
-  const checkpoint = async (seq, board = emptyBoard()) => {
+  const checkpoint = async (seq, board = emptyBoard(), { badId = false } = {}) => {
     const [e] = await raw.read(T, B, seq, 1);
-    await raw.putCheckpoint(T, B, { seq, id: e.id, by: e.by, at: e.at, streams: { board, notes: emptyBoard() }, appSeq: { board: {}, notes: {} }, records: { threads: [] }, clients: { horizon: 0, list: [] } }, epoch);
+    await raw.putCheckpoint(T, B, { seq, id: badId ? "c:not-entry-" + seq : e.id, by: e.by, at: e.at, streams: { board, notes: emptyBoard() }, appSeq: { board: {}, notes: {} }, records: { threads: [] }, clients: { horizon: 0, list: [] } }, epoch);
   };
   await before(checkpoint);                                               // what exists before the feed starts
   const feed = boardFeed({ tenant: T, board: B, store, bus, onLive() {}, ...feedOpts });
@@ -143,16 +144,74 @@ test("a Store error during a look keeps it open: the next heartbeat looks again 
   } finally { await l.close(); }
 });
 
+test("an announced checkpoint that doesn't match the log is looked at once, not on every heartbeat", async () => {
+  // The look steps back past it (§ Recovery, Rebuild) and finds nothing above the base: only the record of what the last
+  // completed look saw (lookedAt) stops the next heartbeat, which still names it, from reading it again.
+  const s = await setup({ n: 3, feedOpts: { rebaseEvery: 2 } });
+  try {
+    await s.checkpoint(3, emptyBoard(), { badId: true });
+    for (let i = 0; i < 20; i++) await s.beat({ cp: 3 });
+    expect([s.feed.looks, s.feed.base.seq]).toEqual([1, 0]);
+    await s.checkpoint(3);                                                // a good one at the same seq: not announced anew
+    await s.beat({ cp: 3 });
+    expect(s.feed.looks).toBe(1);
+  } finally { await s.close(); }
+});
+
+test("a Store whose checkpoint reads answer but whose entry reads fail costs a look per 2^n heartbeats, not one per heartbeat", async () => {
+  const s = await setup({ n: 3, feedOpts: { rebaseEvery: 2 } });
+  try {
+    await s.checkpoint(3);
+    s.io.failEntryReads = true;
+    const atStart = s.io.cpReads;
+    for (let i = 0; i < 20; i++) await s.beat({ cp: 3 });
+    // Failures on heartbeats 1, 2, 4, 8 and 16 (each skips the next 0, 1, 3, 7, 15).
+    expect([s.feed.looks, s.io.cpReads - atStart, s.feed.base.seq]).toEqual([5, 5, 0]);
+    s.io.failEntryReads = false;                                          // the Store recovers: found on the next look
+    for (let i = 0; i < 32 && s.feed.base.seq === 0; i++) await s.beat({ cp: 3 });
+    expect([s.feed.looks, s.feed.base.seq]).toEqual([6, 3]);
+    for (let i = 0; i < 3; i++) await s.beat({ cp: 3 });
+    expect(s.feed.looks).toBe(6);
+  } finally { await s.close(); }
+});
+
+test("a host's `released` message carries cp: the feed stays on the cp rule and reads the stop checkpoint it names", async () => {
+  const s = await setup({ n: 3, feedOpts: { rebaseEvery: 2 } });
+  try {
+    await s.beat({ cp: 0 });
+    await s.checkpoint(3);
+    await s.beat({ cp: 3, released: true });
+    expect([s.feed.looks, s.feed.base.seq, s.feed.cpHeard]).toEqual([1, 3, 3]);
+  } finally { await s.close(); }
+  // And the host sends it: a clean stop checkpoints, releases, then publishes { seq, epoch, cp, released }.
+  const r = await rig();
+  const seen = [];
+  r.bus.subscribe(subjects.entries(r.ids.tenant, r.ids.board), m => { if (m?.released) seen.push(m); });
+  const w = await r.sock(); w.send({ t: "hello", v: 1, token: "S3CR3T-editor-token", board: r.ids.board, since: 0, client: "editor" });
+  await w.next(m => m.t === "welcome");
+  w.send({ t: "op", id: "editor:1", sentAt: 0, stream: "board", op: { elements: [{ id: "a", type: "rectangle", version: 1, versionNonce: 1, x: 0, y: 0, width: 1, height: 1, isDeleted: false }] } });
+  await w.next(m => m.t === "ack");
+  await r.server.stop();
+  await r.bus.flush();
+  expect(seen).toEqual([{ seq: 1, epoch: 1, cp: 1, released: true }]);
+  expect((await r.rawStore.getCheckpoint(r.ids.tenant, r.ids.board)).seq).toBe(1);
+  await r.stop();
+});
+
 test("end to end on a room host: every heartbeat's cp is already in the Store, and the gateway's feed reads each checkpoint once", async () => {
   // tailFoldBytes 64 KB: each 50 KB rewrite after the first folds (room-host.js foldIfDue), so the room writes several.
-  const r = await rig({ host: { tailFoldBytes: 64 * 1024 } });
+  // Each checkpoint write lands 500 ms after it is asked for: past the next 200 ms heartbeat, so a heartbeat that named a
+  // checkpoint as soon as the room took it would be caught here naming one the Store doesn't have yet.
+  const r = await rig({ host: { tailFoldBytes: 64 * 1024 }, wrapStore: st => ({ ...st, putCheckpoint: async (...a) => { await sleep(500); return st.putCheckpoint(...a); } }) });
   const announced = [], lies = [];
   r.bus.subscribe(subjects.entries(r.ids.tenant, r.ids.board), async m => {
     if (Array.isArray(m?.items) || !Number.isSafeInteger(m?.cp)) return;
     announced.push(m.cp);
     const inStore = (await r.rawStore.getCheckpoint(r.ids.tenant, r.ids.board))?.seq ?? 0;
     if (inStore < m.cp) lies.push({ cp: m.cp, inStore });
+    checked++;
   });
+  let checked = 0;
   const w = await r.sock(); w.send({ t: "hello", v: 1, token: `S3CR3T-editor-token`, board: r.ids.board, since: 0, client: "editor" });
   await w.next(m => m.t === "welcome");
   const text = n => ({ id: "note", type: "text", version: n, versionNonce: n, x: 0, y: 0, width: 10, height: 10, isDeleted: false, text: String(n % 10).repeat(50_000) });
@@ -160,8 +219,11 @@ test("end to end on a room host: every heartbeat's cp is already in the Store, a
   await until(async () => (await r.room()).resolved === 6, "op 6 resolved");
   const base = (await r.room()).base.seq;
   expect(base).toBeGreaterThan(0);
+  await until(() => announced.includes(base) && checked === announced.length, `a heartbeat naming ${base}, checked against the Store`, 15_000);
+  expect(lies).toEqual([]);
   const feed = () => r.server.gateway.feed(r.ids.tenant, r.ids.board);
   await until(() => feed()?.base === base, `the feed to rebase onto ${base}`, 15_000);
+  await until(() => checked === announced.length, "every heartbeat checked");
   expect(lies).toEqual([]);
   const distinct = new Set(announced.filter(cp => cp > 0)).size;
   expect(feed().looks).toBeLessThanOrEqual(distinct);                     // at most one read per announced checkpoint

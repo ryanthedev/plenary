@@ -376,6 +376,27 @@ describe.skipIf(!url)("postgres registry", () => {
     } finally { await r.close(); await drop(schema); }
   });
 
+  test("tenantAdminsAmong: right answer with a bound; a held table lock gives statement-timeout at the BOUND (not the session limit); the one-connection pool is clean after", async () => {
+    const schema = schemaName();
+    const r = await postgresRegistry({ url, schema, max: 1, lockTimeoutMs: 10_000, statementTimeoutMs: 10_000 });
+    try {
+      const t = await r.createTenant({ domain: null, admins: ["dev:a"] });
+      expect(await r.tenantAdminsAmong(["dev:a", "dev:b"], { timeoutMs: 2000 })).toEqual(["dev:a"]);
+      expect(await r.tenantAdminsAmong(["dev:b"], { timeoutMs: 2000 })).toEqual([]);
+      await whileLocked(`LOCK TABLE "${schema}".reg_tenant_admins IN ACCESS EXCLUSIVE MODE`, async () => {
+        const [err, took] = await timed(r.tenantAdminsAmong(["dev:a"], { timeoutMs: 300 }));
+        expect(err?.code).toBe("statement-timeout");
+        expect(err.message).toMatch(/^postgres registry: tenantAdminsAmong ran past 300 ms/);   // the limit that applied, not 10000
+        expect(took).toBeGreaterThan(250);
+        expect(took).toBeLessThan(2000);
+      });
+      // The bound was transaction-local: the only connection reads its session default again and still serves.
+      expect(await r.readSettings()).toEqual({ lock_timeout: "10s", statement_timeout: "10s" });
+      expect((await r.tenant(t.id))?.admins).toEqual(["dev:a"]);
+      expect(await r.tenantAdminsAmong(["dev:a"])).toEqual(["dev:a"]);                          // no bound: still works
+    } finally { await r.close(); await drop(schema); }
+  });
+
   test("a row lock held elsewhere: setGrant rejects with statement-timeout near statementTimeoutMs and changes nothing", async () => {
     const schema = schemaName();
     const r = await postgresRegistry({ url, schema, max: 2, lockTimeoutMs: 10_000, statementTimeoutMs: 400 });

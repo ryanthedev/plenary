@@ -280,3 +280,4 @@ body.stale .watching { opacity: .45; }
 .signin-gate h1 { font-size: 18px; font-weight: 600; margin: 0 0 8px; }
 .signin-gate p { color: var(--muted); margin: 0 0 16px; }
 .signin-gate a.btn { display: inline-block; text-decoration: none; }
+.signin-gate .gate-links { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 16px; }

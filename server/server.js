@@ -32,6 +32,7 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
   roles = { gateway: true, host: true }, node = "node", now, timers }) {
   if (!roles || (!roles.gateway && !roles.host)) throw new TypeError("createServer needs at least one role (gateway, host)");
   const started = Date.now();
+  const badRequest = badRequestLimiter();
   const site = web === false || !roles.gateway ? null : staticSite({ log, ...web });
   const rooms = roles.host
     ? roomHost({ store, bus, log, ...host })
@@ -43,7 +44,9 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
     port, hostname,
     async fetch(req, srv) {
       try {
-        const url = new URL(req.url);
+        let url;
+        try { url = new URL(req.url); }
+        catch { badRequest(log); return json(400, { error: "bad-request" }); }   // a malformed Host header: no stack, a short line at most
         if (url.pathname === "/health" && (req.method === "GET" || req.method === "HEAD"))
           return json(200, { ok: true, uptimeMs: Date.now() - started, roles: { gateway: !!gw, host: !!roles.host }, gateway: gw ? gw.stats() : null, ...rooms.stats() });
         if (!gw) return json(404, { error: "not-found" });   // host only: nothing but /health
@@ -74,3 +77,8 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
     async stop() { unserve(); if (gw) await gw.close(); await server.stop(true); await rooms.close(); log.info("server stopped", { port: server.port }); },
   };
 }
+
+// A malformed Host header (empty, bare ::1, userinfo, port > 65535, HTTP/1.0 without Host) is the client's mistake:
+// answer 400 and log one short debug line per second at most, so a client cannot flood the log.
+/** One limiter per server: the returned function logs the line at most once a second. */
+const badRequestLimiter = () => { let last = 0; return log => { const t = Date.now(); if (t - last >= 1000) { last = t; log.debug("bad request: the URL (Host header) did not parse"); } }; };

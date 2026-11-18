@@ -328,3 +328,40 @@ describe("dev path", () => {
     expect(devSignIn({ query: "?as=bob", allowed: ["ada", "bob"] })?.token).toBe("dev-bob");
   });
 });
+
+// ---- the served page's dev sign-in (menu from the server, web/ports/devconfig.js) ----
+import { asParam, menuSignIn, devLinks, DEV_SESSION_S } from "../../../web/core/signin.js";
+describe("menuSignIn: ?as= works only through a menu the server gave", () => {
+  const MENU = { board: "b-1", users: [{ name: "ada", token: "tok-ada", role: "owner" }, { name: "bo", token: "tok-bo", role: "editor" }] };
+  const now = 1_800_000_000_000;
+  const clock = { now: () => now };
+  const mk = () => { const m = new Map(); return { m, get: k => m.get(k) ?? null, set: (k, v) => { m.set(k, v); }, remove: k => { m.delete(k); } }; };
+
+  test("a named user in the menu signs the tab in with the menu's own token and keeps it in this tab's storage", () => {
+    const storage = mk();
+    const r = menuSignIn({ query: "?board=x&as=bo", menu: MENU, storage, clock });
+    expect(r).toEqual({ token: "tok-bo", identity: { user: "dev:bo", name: "bo", email: null, domain: null }, exp: now / 1000 + DEV_SESSION_S, outcome: "dev", link: null });
+    expect(JSON.parse(storage.get("plenary.session"))).toMatchObject({ token: "tok-bo", user: "dev:bo", exp: r.exp });
+    // A reload without ?as= restores it through the ordinary stored-session path.
+    expect(readStored({ storage, clock })?.token).toBe("tok-bo");
+  });
+  test("no menu (dev off or unreachable): ?as= is ignored and nothing is stored", () => {
+    const storage = mk();
+    expect(menuSignIn({ query: "?as=ada", menu: null, storage, clock })).toBeNull();
+    expect(storage.m.size).toBe(0);
+  });
+  test("a name not in the menu, a repeated ?as=, an odd name and no ?as= all give null", () => {
+    const storage = mk();
+    for (const query of ["?as=zed", "?as=ada&as=bo", "?as=a%20b", "?as=", "?board=x", ""]) expect(menuSignIn({ query, menu: MENU, storage, clock })).toBeNull();
+    expect(storage.m.size).toBe(0);
+  });
+  test("a storage that fails still signs in (kept in memory)", () => {
+    const storage = { get() { throw new Error("x"); }, set() { throw new Error("x"); }, remove() {} };
+    expect(menuSignIn({ query: "?as=ada", menu: MENU, storage, clock })?.token).toBe("tok-ada");
+  });
+  test("asParam and devLinks", () => {
+    expect(asParam("?as=ada")).toBe("ada");
+    expect(asParam("?as=ada&as=bo")).toBeNull();
+    expect(devLinks(MENU, "b-1")).toEqual([{ href: "?board=b-1&as=ada", text: "Continue as ada (owner)" }, { href: "?board=b-1&as=bo", text: "Continue as bo (editor)" }]);
+  });
+});

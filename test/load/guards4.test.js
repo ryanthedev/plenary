@@ -3,17 +3,17 @@
 // stopping them (2); the server's load-phase CPU is its own window (3); empty string flags (4), non-decimal numbers
 // and values past their bound (5) are refused; an ack counted twice never covers a missing one (R2).
 
-import { test, expect } from "bun:test";
-import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { test, expect, beforeAll, afterAll } from "bun:test";
+import { tmp, cleanTmp, useScratch, scenarioGroup, childEnv, strays } from "./tmp.js";
+import { writeFileSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { runWorker } from "../../scripts/load/worker.js";
 import { mergeResults, buildResult, headline, exitCode, parseOptions, serverStats, dueRoles, MAX } from "../../scripts/load/run.js";
 import { fakeServer } from "./fake-server.js";
 
 const RUN = resolve(import.meta.dir, "../../scripts/load/run.js");
-const tmp = p => mkdtempSync(join(tmpdir(), p));
-const env = () => ({ PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR ?? tmpdir() });
+beforeAll(useScratch); afterAll(cleanTmp);
+const env = childEnv;
 async function cli(args) {
   const p = Bun.spawn([process.execPath, RUN, ...args], { stdout: "pipe", stderr: "pipe", env: env() });
   const [stdout, stderr, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
@@ -28,7 +28,7 @@ const tokensFile = (dir, n = 1) => {
 // ---- finding 1: ops counted when made; a writer role due to make ops must have made some ----
 
 const worker = counts => ({ worker: 0, pid: 1, cpu: [5], cpuLoadMean: 5, cpuLoadMs: 1000, lag: { n: 0, sum: 0, counts: [] },
-  stats: { counts: { joined: 2, neverJoined: 0, clients: 2, ...counts }, closes: {}, errors: {}, hists: {}, joinsPerSec: {} } });
+  stats: { counts: { joined: 2, neverJoined: 0, clients: 2, connectedAtEnd: 2, ...counts }, closes: {}, errors: {}, hists: {}, joinsPerSec: {} } });
 const judge = (counts, config, plan = { editor: 1, annotator: 1, viewer: 0 }) =>
   buildResult({ merged: mergeResults([worker(counts)]), config: { url: "ws://x", board: "b", ...config }, counts: plan, startedAt: 0, finishedAt: 1 });
 const view = r => [r.ops.answered, r.complete, headline(r), exitCode(r)];
@@ -86,15 +86,21 @@ function badServer(mode) {
   });
   return { url: `ws://127.0.0.1:${server.port}/ws`, stop: () => server.stop(true) };
 }
-async function liveRun(url, extra = []) {
+async function liveRun(url, { opRate = 4 } = {}) {
   const dir = tmp("plenary-load-g4live-"), tokens = tokensFile(dir);
-  const r = await cli(["--url", url, "--board", "b", "--tokens", tokens, "--editors", "3", "--ramp", "10", "--duration", "2", "--drain", "1", "--op-rate", "4", "--out", join(dir, "out"), ...extra]);
+  const r = await cli(["--url", url, "--board", "b", "--tokens", tokens, "--editors", "3", "--ramp", "10", "--duration", "2", "--drain", "1", "--op-rate", String(opRate), "--out", join(dir, "out")]);
   return { ...r, res: JSON.parse(readFileSync(join(dir, "out", "result.json"), "utf8")) };
 }
 
+// Independent live runs (own server, own CLI process): started together by the first test that asks for one.
+const group = scenarioGroup(), scenarios = group.fns, scenario = group.get;
+const withServer = (make, opts) => async () => { const s = make(); try { return await liveRun(s.url, opts); } finally { s.stop(); } };
+scenarios.stall = withServer(() => badServer("stall"));
+scenarios.crash = withServer(() => badServer("crash"));
+scenarios.noOps = withServer(() => fakeServer({ tokens: { "lt-g4TOK0": { user: "dev:g0", role: "editor" } } }), { opRate: 0 });
+
 test("live CLI: a server that welcomes and then never sends catch-up headlines INCOMPLETE and exits 1", async () => {
-  const s = badServer("stall");
-  let r; try { r = await liveRun(s.url); } finally { s.stop(); }
+  const r = await scenario("stall");
   expect([r.res.clients.complete, r.res.ops.sent.total, r.res.ops.acked]).toEqual([true, 0, 0]);
   expect(r.res.ops.made.total).toBeGreaterThan(3);
   expect(r.res.ops.unanswered).toBe(r.res.ops.made.total);
@@ -105,25 +111,24 @@ test("live CLI: a server that welcomes and then never sends catch-up headlines I
 }, 20000);
 
 test("live CLI: a server that welcomes once, drops everyone and refuses rejoins headlines INCOMPLETE and exits 1", async () => {
-  const s = badServer("crash");
-  let r; try { r = await liveRun(s.url); } finally { s.stop(); }
+  const r = await scenario("crash");
   expect([r.res.clients.complete, r.res.ops.sent.total, r.res.ops.made.total, r.res.clients.connectedAtEnd]).toEqual([true, 0, 0, 0]);
   expect(r.res.ops.skippedOffline).toBeGreaterThan(3);
   expect(r.res.ops.missing).toEqual(["editor"]);
   expect([r.res.ops.answered, r.res.complete, r.code]).toEqual([false, false, 1]);
-  expect(r.stdout).toContain(`**INCOMPLETE (no editor op was made though 3 editor(s) were due to (${r.res.ops.skippedOffline} ops skipped offline,`);
+  expect(r.stdout).toContain(`**INCOMPLETE (only 0 of 3 clients were connected at the end;`);
+  expect(r.stdout).toContain(`no editor op was made though 3 editor(s) were due to (${r.res.ops.skippedOffline} ops skipped offline,`);
 }, 20000);
 
 test("live CLI: a healthy run with --op-rate 0 (no ops due) is judged on its joins: VALID, exit 0", async () => {
-  const fake = fakeServer({ tokens: { "lt-g4TOK0": { user: "dev:g0", role: "editor" } } });
-  let r; try { r = await liveRun(fake.url, ["--op-rate", "0"]); } finally { fake.stop(); }
+  const r = await scenario("noOps");
   expect([r.res.ops.made.total, r.res.ops.due, r.res.clients.complete, r.res.complete, r.code]).toEqual([0, [], true, true, 0]);
   expect(r.stdout).toContain("**VALID**");
 }, 20000);
 
 // ---- R2: an ack counted twice never makes a missing ack look answered ----
 
-test("an op acked twice counts one ack; a later op never acked keeps the run INCOMPLETE", async () => {
+scenarios.ackedTwice = async () => {
   const dir = tmp("plenary-load-r2-"), tokensPath = tokensFile(dir);
   // The first op: ack, ack again, then its entry (the duplicate lands while the op is still tracked). Every later op:
   // its entry only, never an ack.
@@ -137,23 +142,27 @@ test("an op acked twice counts one ack; a later op never acked keeps the run INC
   const t0 = Date.now() + 200, cfg = { opRate: 4, noteRate: 0, commentRate: 0, cursorRate: 0, pool: 5 };
   let w;
   try {
-    w = await runWorker({ url: fake.url, board: "b", tokensPath, t0, loadFrom: t0, genEndAt: t0 + 2000, drainMs: 800, clients: [{ role: "editor", token: 0, name: "g-e0", startAt: 0 }], cfg });
+    w = await runWorker({ url: fake.url, board: "b", tokensPath, t0, loadFrom: t0, genEndAt: t0 + 1500, drainMs: 500, clients: [{ role: "editor", token: 0, name: "g-e0", startAt: 0 }], cfg });
   } finally { fake.stop(); }
+  return { w, cfg };
+};
+test("an op acked twice counts one ack; a later op never acked keeps the run INCOMPLETE", async () => {
+  const { w, cfg } = await scenario("ackedTwice");
   const c = w.stats.counts;
   expect(c.opsSent).toBeGreaterThanOrEqual(2);
   expect(c.acks).toBe(1);
   expect(c.echoes).toBe(c.opsSent);
-  const r = buildResult({ merged: mergeResults([w]), config: { url: "ws://x", board: "b", ...cfg, duration: 2 }, counts: { editor: 1, annotator: 0, viewer: 0 }, startedAt: 0, finishedAt: 1 });
+  const r = buildResult({ merged: mergeResults([w]), config: { url: "ws://x", board: "b", ...cfg, duration: 1.5 }, counts: { editor: 1, annotator: 0, viewer: 0 }, startedAt: 0, finishedAt: 1 });
   expect([r.ops.acked, r.ops.answered, exitCode(r)]).toEqual([1, false, 1]);
 }, 15000);
 
 // ---- finding 2: SIGKILL to run.js: the --local server and the workers exit on their own ----
 
-test("SIGKILL to a --local run mid-load: its server and both workers exit on their own within a few seconds", async () => {
+for (const withOut of [true, false]) test(`SIGKILL to a --local run mid-load ${withOut ? "" : "(no --out: the run's own dir holds the dev tokens) "}: its server and both workers exit on their own within a few seconds, and nothing is left on disk`, async () => {
   // Killed after a progress line (the workers have their job, so their clients' timers and sockets keep them alive:
   // a worker killed before its job would end anyway, its loop empty, and prove nothing about the watch).
   const out = tmp("plenary-load-kill-");
-  const p = Bun.spawn([process.execPath, RUN, "--local", "--editors", "1", "--viewers", "2", "--procs", "2", "--ramp", "10", "--duration", "60", "--out", out], { stdout: "pipe", stderr: "pipe", env: env() });
+  const p = Bun.spawn([process.execPath, RUN, "--local", "--editors", "1", "--viewers", "2", "--procs", "2", "--ramp", "10", "--duration", "60", ...(withOut ? ["--out", out] : [])], { stdout: "pipe", stderr: "pipe", env: env() });
   let server = 0, workers = [];
   try {
     const reader = p.stdout.getReader(), dec = new TextDecoder(), end = Date.now() + 20000;
@@ -171,9 +180,11 @@ test("SIGKILL to a --local run mid-load: its server and both workers exit on the
     for (const pid of [server, ...workers]) expect(alive(pid)).toBe(true);
     p.kill("SIGKILL");
     expect(await p.exited).toBe(137);
-    const end2 = Date.now() + 4000;
+    const end2 = Date.now() + 3000;
     while (Date.now() < end2 && [server, ...workers].some(alive)) await Bun.sleep(50);
     expect({ server: alive(server), workers: workers.map(alive) }).toEqual({ server: false, workers: [false, false] });
+    // and the orphaned server removed its own temp dirs (its data and working dir) on the way out
+    expect(strays()).toEqual([]);
   } finally {
     for (const pid of [server, ...workers]) if (pid > 0 && alive(pid)) process.kill(pid, "SIGKILL");
     if (p.exitCode === null) p.kill("SIGKILL");
@@ -222,7 +233,7 @@ test("arguments: plain decimals only, every value bounded, no empty string flag"
   // At the bounds, and plain decimals: accepted.
   const p = parseOptions({ editors: "1000000", duration: "3600", drain: "600", ramp: "100000", procs: "256", "op-rate": ".5", "note-rate": "1000", pool: "10000", tokens: "t.json" });
   expect([p.counts.editor, p.duration, p.drain, p.ramp, p.procs, p.cfg.opRate, p.cfg.noteRate, p.cfg.pool]).toEqual([1000000, 3600, 600, 100000, 256, 0.5, 1000, 10000]);
-  expect(Object.keys(MAX).sort()).toEqual(["annotators", "clients", "comment-rate", "cursor-rate", "drain", "duration", "editors", "note-rate", "op-rate", "pool", "procs", "ramp", "viewers", "viewers-per-user"]);
+  expect(Object.keys(MAX).sort()).toEqual(["annotators", "clients", "comment-rate", "cursor-rate", "drain", "duration", "editors", "max-wall", "note-rate", "op-rate", "pool", "procs", "ramp", "viewers", "viewers-per-user"]);
 });
 
 test("exit code 2 from the CLI: --tokens \"\", --duration 1e12, --editors 0x1 and --duration past its bound", async () => {
@@ -243,10 +254,10 @@ test("exit code 2 from the CLI: --tokens \"\", --duration 1e12, --editors 0x1 an
 test("--help states the bounds and the due rule", async () => {
   const r = await cli(["--help"]);
   expect(r.code).toBe(0);
-  for (const s of ["--duration 1-3600 s", "--drain ≤ 600 s", "--procs 1-256", "≤ 1000000", "rate x duration >= 1.5", "plain decimal"]) expect(r.stdout).toContain(s);
+  for (const s of ["--duration 1-3600 s", "--drain ≤ 600 s", "--procs 1-256", "≤ 1000000", "1.5/rate s", "stayed", "Unknown flags", "≤ 3600 s", "plain decimal"]) expect(r.stdout).toContain(s);
 }, 10000);
 
-test("a worker whose parent is not the PID run.js named (it died before the worker started) exits mid-job", async () => {
+scenarios.orphanWorker = async () => {
   // The worker's own parent (this test) is alive; PLENARY_LOAD_PARENT names a process that has already exited, as
   // when run.js is SIGKILLed between spawning a worker and the worker reading its ppid.
   const dead = Bun.spawn(["true"]); await dead.exited;
@@ -260,7 +271,11 @@ test("a worker whose parent is not the PID run.js named (it died before the work
   });
   try {
     const code = await Promise.race([w.exited, Bun.sleep(5000).then(() => "still running")]);
-    expect(got).toBe(true);
-    expect(code).toBe(0);
+    return { got, code };
   } finally { if (w.exitCode === null) w.kill("SIGKILL"); }
+};
+test("a worker whose parent is not the PID run.js named (it died before the worker started) exits mid-job", async () => {
+  const { got, code } = await scenario("orphanWorker");
+  expect(got).toBe(true);
+  expect(code).toBe(0);
 }, 15000);

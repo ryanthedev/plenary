@@ -52,10 +52,10 @@ class UsageError extends Error {}
 /**
  * @param {string[]} argv   arguments after the script
  * @param {Record<string, string|undefined>} env   read only from here (never process.env), like main.js's start()
- * @param {{ out?: (s: string) => void, err?: (s: string) => void }} [io]
+ * @param {{ out?: (s: string) => void, err?: (s: string) => void, timeoutMs?: number }} [io]   timeoutMs: the registry open + bootstrap together (default 30 s); past it: exit 1
  * @returns {Promise<number>} exit code
  */
-export async function run(argv, env = {}, { out = s => console.log(s), err = s => console.error(s) } = {}) {
+export async function run(argv, env = {}, { out = s => console.log(s), err = s => console.error(s), timeoutMs = 30000 } = {}) {
   let args;
   try {   // validate before opening anything
     args = parseArgs(argv);
@@ -64,16 +64,21 @@ export async function run(argv, env = {}, { out = s => console.log(s), err = s =
   }
   catch (e) { err(`${e.message}\n${USAGE}`); return 2; }
 
-  let registry, store;
+  let registry, store, timer;
+  // A database that accepts the connection and never answers (or a host that drops packets) must not hang the CLI.
+  const deadline = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`timed out after ${Math.round(timeoutMs / 1000)} s`)), timeoutMs); });
+  deadline.catch(() => {});
   try {
-    if (env.DATABASE_URL) { registry = await postgresRegistry({ url: env.DATABASE_URL }); store = "postgres"; }
-    else {
-      const dir = args.dataDir || env.PLENARY_DATA_DIR || "./data";
-      mkdirSync(dir, { recursive: true });
-      registry = sqliteRegistry({ path: join(dir, "registry.db") });
-      store = "sqlite";
-    }
-    const { tenant, created, added } = await bootstrapTenant({ registry, domain: args.domain, admins: args.admins });
+    const { tenant, created, added } = await Promise.race([deadline, (async () => {
+      if (env.DATABASE_URL) { registry = await postgresRegistry({ url: env.DATABASE_URL }); store = "postgres"; }
+      else {
+        const dir = args.dataDir || env.PLENARY_DATA_DIR || "./data";
+        mkdirSync(dir, { recursive: true });
+        registry = sqliteRegistry({ path: join(dir, "registry.db") });
+        store = "sqlite";
+      }
+      return bootstrapTenant({ registry, domain: args.domain, admins: args.admins });
+    })()]);
     out(JSON.stringify({ ok: true, registry: store, tenant: tenant.id, domain: tenant.domain, created, added, admins: tenant.admins }));
     return 0;
   } catch (e) {
@@ -84,7 +89,8 @@ export async function run(argv, env = {}, { out = s => console.log(s), err = s =
     err(escapeUnsafe(line, { json: true }));
     return e?.code === "bad-request" ? 2 : 1;
   } finally {
-    try { await registry?.close(); } catch { /* closing is best effort */ }
+    clearTimeout(timer);
+    try { await Promise.race([registry?.close(), new Promise(r => setTimeout(r, 2000).unref?.())]); } catch { /* closing is best effort, and bounded */ }
   }
 }
 

@@ -2,20 +2,26 @@
 //
 //   bun scripts/load/run.js --url ws://host:port/ws --board <id> --tokens <dev-tokens.json> \
 //       [--editors 5] [--annotators n] [--viewers n] [--clients n] [--ramp 200] [--duration 30] [--drain 15] \
-//       [--procs 1] [--out <dir>] [--op-rate 2] [--note-rate 0.2] [--comment-rate 0.05] [--cursor-rate 5] [--pool 20]
+//       [--procs 1] [--out <dir>] [--max-wall s] [--keep-data] [--op-rate 2] [--note-rate 0.2] [--comment-rate 0.05] [--cursor-rate 5] [--pool 20]
 //   bun scripts/load/run.js --rig <rig dir> --create-board ...   URL and tokens from <rig dir>/rig.json; a fresh board
 //                                                      via POST /boards (each rig node has its own dev board)
 //   bun scripts/load/run.js --local ...                starts its own single-node server (server/main.js, port 0,
-//                                                      temp data dir, tokens made in --out), samples its CPU, stops it
+//                                                      temp data dir, tokens made in --out), samples its CPU, stops it;
+//                                                      its temp dirs (and the run's, without --out) are removed at the
+//                                                      end, or kept with --keep-data (their paths are logged)
 //
 // --clients n splits n like the NFRs: the given editors (default 5), ~2% annotators, the rest viewers.
 // Writes <out>/result.json (schema SCHEMA below) and <out>/report.md. Prints progress lines; never a token.
 // Exit code (exitCode below): 0 = a good run: the generator did not saturate (result.valid) AND the run is complete
-// (result.complete): every planned client joined at least once (result.clients.complete) and the server answered
+// (result.complete): every planned client joined at least once, and within 10 s of its first connect (result.clients.complete, lateJoined) and the server answered
 // the ops (result.ops.answered): every op made (counted when made, sent or not) was acked by the drain's end, at
 // least 99% were echoed back to their sender, and each writer role that was due to make ops made at least one. A
-// role is due when it has clients and rate x duration >= 1.5 (its first op comes within 1.5/rate s); a run with no
-// role due (--op-rate 0 and no annotators, viewers only) needs no ops: it is judged on its joins (and any ops made). 1 = the run finished but is
+// role is due when one of its clients was welcomed at least 1.5/rate s before the generation ended (each client's
+// clock starts at its own first welcome; its first op comes within 1.5/rate s of that); a run with no role due
+// (--op-rate 0 and no annotators, viewers only) needs no ops: it is judged on its joins (and any ops made). The run
+// (a client whose connection dropped within 3 s before the end of generation, or during the drain, and is reconnecting gets up to 3 s after the drain to come back) must also have stayed: every planned client connected at the drain's end (result.clients.stayed), and, with a role
+// due, no more ops skipped offline than made (result.ops.present): a server that drops everyone mid-run and refuses
+// their rejoins reads INCOMPLETE, not VALID. 1 = the run finished but is
 // not good (report.md's headline says INVALID or INCOMPLETE and why); 2 = bad arguments or setup, or stopped by
 // SIGTERM, SIGINT or SIGHUP (nothing complete was measured). On any of those, and on any setup failure, the
 // --local server and the workers this run started are stopped first; both also exit on their own within about 1 s
@@ -23,14 +29,19 @@
 // Arguments: plain decimal numbers only (no 0x1, 1e3, blanks or empty values; --url/--board/--tokens/--out/--rig
 // may not be empty). Counts are whole numbers. Bounds: --editors, --annotators, --viewers, --clients ≤ 1000000;
 // --procs 1-256; --pool 1-10000; --viewers-per-user 1-10000; --ramp 1-100000 clients/s; --duration 1-3600 s;
-// --drain ≤ 600 s; --op-rate, --note-rate, --comment-rate, --cursor-rate ≤ 1000 /s.
+// --drain ≤ 600 s; --op-rate, --note-rate, --comment-rate, --cursor-rate ≤ 1000 /s; the ramp (clients / --ramp) ≤ 3600 s.
+// Unknown flags, a flag given twice, and a flag given as another flag's value (--tokens --local), are refused (exit 2).
+// --max-wall s (1-86400): the whole run, setup to drain, is stopped after this long (exit 2, children stopped); the
+// default is the plan's ramp + duration + drain + 120 s. Every subprocess this tool runs (ps, ulimit, sysctl) and
+// every HTTP call it makes has its own timeout, and stopping a child never waits past SIGKILL + 2 s.
 
-import { mkdirSync, writeFileSync, readFileSync, existsSync, mkdtempSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { Hist, addCounts } from "./stats.js";
 import { readTokensByRole, readTokensTable, makeTokens, writeTokens } from "./tokens.js";
-import { startServer, psSample, cpuPct } from "./server.js";
+import { startServer, psSample, cpuPct, stopChild, SPAWN_TIMEOUT_MS } from "./server.js";
+import { DUE_TICKS, writerRate, JOIN_CEILING_MS } from "./client.js";
 import { MAX_WRITER_CONNS } from "../../packages/protocol/envelope.js";
 
 export const SCHEMA = "plenary.load.result/1";
@@ -47,11 +58,15 @@ export const CPU_MEAN_LIMIT = 85;
 // ops must have made some: a server that welcomes everyone and then stalls (no catch-up, so the Replica never
 // writes) or drops everyone for good (every op skipped offline) must not read VALID.
 export const ECHO_FLOOR_PCT = 99;   // integer math: 0.99 * n can round up by one
-// A writer role is due to make ops when rate x duration reaches this: each client's first op comes within 1.5/rate s.
-export const DUE_TICKS = 1.5;
-const WRITER_RATES = { editor: c => c.opRate ?? 0, annotator: c => Math.max(c.noteRate ?? 0, c.commentRate ?? 0) };
+export { DUE_TICKS };   // client.js owns it: the worker counts the clients whose window was long enough
+const WRITER_ROLES = ["editor", "annotator"];
 
 const DEFAULTS = { editors: 5, annotators: 0, viewers: 0, ramp: 200, duration: 30, drain: 15, procs: 1, "op-rate": 2, "note-rate": 0.2, "comment-rate": 0.05, "cursor-rate": 5, pool: 20 };
+
+const BOOLEAN_FLAGS = ["local", "help", "create-board", "keep-data"];
+const STRING_FLAGS = ["url", "board", "tokens", "out", "rig"];
+// Every flag the CLI knows. An unknown one (a typo like --op_rate) is refused, not ignored.
+const knownFlag = k => BOOLEAN_FLAGS.includes(k) || STRING_FLAGS.includes(k) || Object.hasOwn(MAX, k);
 
 export function parseArgs(argv) {
   const o = {};
@@ -59,8 +74,11 @@ export function parseArgs(argv) {
     const a = argv[i];
     if (!a.startsWith("--")) throw new Error(`unexpected argument ${a}`);
     const k = a.slice(2);
-    if (k === "local" || k === "help" || k === "create-board") { o[k] = true; continue; }
+    if (!knownFlag(k)) throw new Error(`unknown flag ${a} (see --help)`);
+    if (Object.hasOwn(o, k)) throw new Error(`${a} given twice`);
+    if (BOOLEAN_FLAGS.includes(k)) { o[k] = true; continue; }
     if (i + 1 >= argv.length) throw new Error(`--${k} needs a value`);
+    if (argv[i + 1].startsWith("--")) throw new Error(`--${k} needs a value, not the flag ${argv[i + 1]}`);
     o[k] = argv[++i];
   }
   return o;
@@ -98,8 +116,8 @@ export function planCounts(o) {
 // min), atLeast for the ramp (≥ 1 client/s: slower would plan a ramp of hours) and the duration (≥ 1 s: the load
 // phase must be long enough to measure the generator's CPU). Only plain decimals: Number() would also take "",
 // " ", "0x1", "1e3" and "Infinity". Every value has an upper bound (MAX), so no flag plans years.
-export const MAX = { editors: 1e6, annotators: 1e6, viewers: 1e6, clients: 1e6, procs: 256, pool: 10000, "viewers-per-user": 10000, ramp: 100000, duration: 3600, drain: 600, "op-rate": 1000, "note-rate": 1000, "comment-rate": 1000, "cursor-rate": 1000 };
-const STRING_FLAGS = ["url", "board", "tokens", "out", "rig"];
+export const MAX = { editors: 1e6, annotators: 1e6, viewers: 1e6, clients: 1e6, procs: 256, pool: 10000, "viewers-per-user": 10000, ramp: 100000, duration: 3600, drain: 600, "op-rate": 1000, "note-rate": 1000, "comment-rate": 1000, "cursor-rate": 1000, "max-wall": 86400 };
+export const MAX_RAMP_S = 3600;   // the ramp (clients / --ramp) may take at most this long
 const blank = v => typeof v === "string" && v.trim() === "";
 const plain = (v, name, re, what) => {
   if (blank(v)) throw new Error(`--${name} is empty`);
@@ -121,12 +139,20 @@ export function parseOptions(o) {
   const duration = atLeast(o.duration, DEFAULTS.duration, "duration", 1, "s"), drain = num(o.drain, DEFAULTS.drain, "drain");
   const cfg = { opRate: num(o["op-rate"], DEFAULTS["op-rate"], "op-rate"), noteRate: num(o["note-rate"], DEFAULTS["note-rate"], "note-rate"), commentRate: num(o["comment-rate"], DEFAULTS["comment-rate"], "comment-rate"), cursorRate: num(o["cursor-rate"], DEFAULTS["cursor-rate"], "cursor-rate"), pool: count(o.pool, DEFAULTS.pool, "pool", 1) };
   const viewersPerUser = count(o["viewers-per-user"], 32, "viewers-per-user", 1);
-  return { counts, procs, ramp, duration, drain, cfg, viewersPerUser };
+  const maxWall = o["max-wall"] === undefined ? null : atLeast(o["max-wall"], 0, "max-wall", 1, "s");
+  const planned = counts.editor + counts.annotator + counts.viewer;
+  if (planned / ramp > MAX_RAMP_S) throw new Error(`the ramp would take ${Math.round(planned / ramp)} s (${planned} clients at ${ramp}/s); it may take at most ${MAX_RAMP_S} s: raise --ramp or plan fewer clients`);
+  return { counts, procs, ramp, duration, drain, cfg, viewersPerUser, maxWall };
 }
 
-/** The writer roles due to make ops: clients planned and rate x duration ≥ DUE_TICKS (see the header). */
-export function dueRoles(counts, config) {
-  return Object.keys(WRITER_RATES).filter(r => (counts[r] ?? 0) > 0 && WRITER_RATES[r](config ?? {}) * (config?.duration ?? 0) >= DUE_TICKS);
+/**
+ * The writer roles due to make ops (see the header). Without `dueClients` (the plan alone): clients planned and
+ * rate x duration ≥ DUE_TICKS. With it (the workers' `dueClients_<role>` counts, the clients that had a whole due
+ * window counted from their own first welcome): a role is due when at least one such client exists, so a slow
+ * welcome on a healthy server shortens the window instead of failing the run.
+ */
+export function dueRoles(counts, config, dueClients) {
+  return WRITER_ROLES.filter(r => (counts[r] ?? 0) > 0 && (dueClients ? (dueClients[r] ?? 0) > 0 : writerRate(r, config) * (config?.duration ?? 0) >= DUE_TICKS));
 }
 
 /**
@@ -155,10 +181,12 @@ export function planClients(counts, { ramp, procs, tokensByRole }) {
  * "unlimited") and the kernel's own cap (macOS kern.maxfilesperproc, Linux fs.nr_open), or Infinity when unknown.
  */
 export function readFdLimits() {
-  const hard = Bun.spawnSync(["sh", "-c", "ulimit -Hn"]).stdout.toString().trim();
+  // Each call is bounded; one that fails or times out reads as "no limit known" (the other ceiling still applies).
+  const sh = (...argv) => Bun.spawnSync(argv, { timeout: SPAWN_TIMEOUT_MS }).stdout.toString().trim();
+  const hard = sh("sh", "-c", "ulimit -Hn") || "unlimited";
   let kernel = Infinity, kernelName = null;
   const pos = v => (Number.isFinite(v) && v > 0 ? v : Infinity);
-  if (process.platform === "darwin") { kernel = pos(Number(Bun.spawnSync(["sysctl", "-n", "kern.maxfilesperproc"]).stdout.toString().trim())); kernelName = "kern.maxfilesperproc"; }
+  if (process.platform === "darwin") { kernel = pos(Number(sh("sysctl", "-n", "kern.maxfilesperproc"))); kernelName = "kern.maxfilesperproc"; }
   else if (process.platform === "linux") { try { kernel = pos(Number(readFileSync("/proc/sys/fs/nr_open", "utf8").trim())); } catch { /* not readable */ } kernelName = "fs.nr_open"; }
   return { hard, kernel, kernelName };
 }
@@ -218,17 +246,23 @@ export function buildResult({ merged, config, counts, startedAt, finishedAt, ser
   const neverJoined = c.neverJoined ?? 0, joined = c.joined ?? 0;
   // Complete: every planned client got a welcome at least once (a run where some never joined measured a smaller
   // audience than it says, or nothing at all: a wrong URL).
-  const complete = planned > 0 && joined === planned && neverJoined === 0;
+  const lateJoined = c.lateJoined ?? 0;
+  const complete = planned > 0 && joined === planned && neverJoined === 0 && lateJoined === 0;
   const sent = c.opsSent ?? 0, acked = c.acks ?? 0, echoed = c.echoes ?? 0;
   const made = Math.max(c.opsMade ?? 0, sent);   // an op is sent only after it is made
-  const due = dueRoles(counts, config), missing = due.filter(r => !(c[`opsMade_${r}`] > 0));
+  const due = dueRoles(counts, config, c.dueClients === undefined ? null : Object.fromEntries(WRITER_ROLES.map(r => [r, c[`dueClients_${r}`] ?? 0]))), missing = due.filter(r => !(c[`opsMade_${r}`] > 0));
   const answered = missing.length === 0 && (acked >= made && echoed * 100 >= made * ECHO_FLOOR_PCT);
+  // Stayed: every planned client is connected at the end, and a due writer role was not offline more than online
+  // (ticks skipped offline <= ops made). A server that drops everyone mid-run and refuses their rejoins answers
+  // every op it saw, so only this catches it.
+  const connectedAtEnd = c.connectedAtEnd ?? 0, skippedOffline = c.skippedOffline ?? 0;
+  const stayed = connectedAtEnd >= planned, present = due.length === 0 || skippedOffline <= made;
   return {
     schema: SCHEMA,
     startedAt: new Date(startedAt).toISOString(), finishedAt: new Date(finishedAt).toISOString(),
     config,
-    valid: reasons.length === 0, invalidReasons: reasons, complete: complete && answered,
-    clients: { planned, byRole: counts, joined, neverJoined, complete, connectedAtEnd: c.connectedAtEnd ?? 0 },
+    valid: reasons.length === 0, invalidReasons: reasons, complete: complete && answered && stayed && present,
+    clients: { planned, byRole: counts, joined, neverJoined, lateJoined, complete, connectedAtEnd, stayed },
     join: {
       latencyMs: h.join?.summary() ?? new Hist().summary(),
       perSecond: secs.map(s => ({ s, n: merged.joinsPerSec[s] })),
@@ -241,7 +275,7 @@ export function buildResult({ merged, config, counts, startedAt, finishedAt, ser
       acked: c.acks ?? 0, echoed: { total: c.echoes ?? 0, editor: c.echoes_editor ?? 0, annotator: c.echoes_annotator ?? 0 },
       dropped: c.dropped ?? 0, unanswered: c.unanswered ?? 0, unechoed: c.unechoed ?? 0, unacked: c.unacked ?? 0,
       skippedOffline: c.skippedOffline ?? 0, skippedBacklog: c.skippedBacklog ?? 0, presenceSent: c.presenceSent ?? 0,
-      drainMs: c.drainMs ?? 0, answered,
+      drainMs: c.drainMs ?? 0, answered, present,
     },
     latencyMs: { ack: byRole("ack"), echo: byRole("echo"), delivery: byRole("delivery") },
     connections: {
@@ -262,9 +296,14 @@ export function exitCode(r) { return r.valid && r.complete ? 0 : 1; }
 /** The headline word: INVALID (generator saturated) beats INCOMPLETE (not everyone joined, or the ops not answered) beats VALID. */
 export function headline(r) {
   if (!r.valid) return "INVALID (the load generator saturated)";
-  if (!r.clients.complete) return `INCOMPLETE (${r.clients.planned - r.clients.joined} of ${r.clients.planned} planned clients never joined)`;
-  if (!r.ops.answered) {
+  if (!r.clients.complete) {
+    if (r.clients.joined === r.clients.planned && r.clients.lateJoined > 0) return `INCOMPLETE (${r.clients.lateJoined} of ${r.clients.planned} clients were welcomed more than ${(r.config.joinCeilingMs ?? JOIN_CEILING_MS) / 1000} s after they first connected)`;
+    return `INCOMPLETE (${r.clients.planned - r.clients.joined} of ${r.clients.planned} planned clients never joined)`;
+  }
+  if (!r.ops.answered || r.clients.stayed === false || r.ops.present === false) {
     const o = r.ops, why = [], made = o.made?.total ?? o.sent.total;
+    if (r.clients.stayed === false) why.push(`only ${r.clients.connectedAtEnd} of ${r.clients.planned} clients were connected at the end`);
+    if (r.ops.present === false && !(o.missing ?? []).length) why.push(`${o.skippedOffline} ops were skipped offline against ${made} made`);
     for (const role of o.missing ?? []) why.push(`no ${role} op was made though ${r.clients.byRole[role]} ${role}(s) were due to (${o.skippedOffline} ops skipped offline, ${o.skippedBacklog} for backlog)`);
     if (o.acked < made) why.push(`${made - o.acked} of ${made} ops made were never acked${made > o.sent.total ? ` (${made - o.sent.total} never sent)` : ""}`);
     if (o.echoed.total * 100 < made * ECHO_FLOOR_PCT) why.push(`${made - o.echoed.total} of ${made} were never echoed to their sender`);
@@ -299,6 +338,8 @@ export function renderReport(r) {
   return L.join("\n") + "\n";
 }
 
+const CREATE_BOARD_TIMEOUT_MS = 15000;   // each request
+
 /**
  * --create-board: a fresh board through the admin route (server/auth/http.js), for a rig where each node has its
  * own data dir (and so its own dev board). POST /boards as the tokens file's admin token (`admin: true` with a
@@ -306,13 +347,13 @@ export function renderReport(r) {
  * domain is then a viewer), then PUT /boards/:board/grants/dev:<name> for every other non-viewer token's role.
  * Error messages carry statuses and codes only, never a token.
  */
-export async function createBoard(wsUrl, tokensPath) {
+export async function createBoard(wsUrl, tokensPath, { timeoutMs = CREATE_BOARD_TIMEOUT_MS } = {}) {
   const base = wsUrl.replace(/^ws/, "http").replace(/\/ws\/?$/, "");
   const table = readTokensTable(tokensPath);   // never the parser's message: it can quote a token
   const admin = Object.entries(table).find(([, t]) => t?.admin === true && t.domain);
   if (!admin) throw new Error("--create-board needs a token with admin: true and a domain in the tokens file");
   const call = async (method, path, body) => {
-    const res = await fetch(base + path, { method, headers: { authorization: `Bearer ${admin[0]}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+    const res = await fetch(base + path, { method, headers: { authorization: `Bearer ${admin[0]}`, "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
     // Only a short code-shaped `error` is echoed: never free text from the server (it could hold anything).
     if (!res.ok) { let code = ""; try { const e = (await res.json()).error; if (typeof e === "string" && /^[a-z_-]{1,40}$/.test(e)) code = e; } catch { /* not JSON */ } throw new Error(`${method} ${path.replace(/grants\/.*/, "grants/…")}: ${res.status} ${code}`); }
     return res.status === 204 ? null : res.json();
@@ -344,14 +385,12 @@ function spawnWorker(job, nofile, onProgress, onChild) {
   });
 }
 
-/** Stop child processes: SIGTERM, then SIGKILL after 5 s; resolves when all have exited. */
-async function stopChildren(children) {
-  await Promise.all([...children].map(async c => {
-    if (c.exitCode !== null || c.signalCode) return;
-    try { c.kill("SIGTERM"); } catch { /* gone */ }
-    const t = setTimeout(() => { try { c.kill("SIGKILL"); } catch { /* gone */ } }, 5000);
-    await c.exited; clearTimeout(t);
-  }));
+/** The run's wall-clock deadline in seconds: --max-wall, else the plan (ramp + duration + drain) plus 120 s for setup and slack. */
+export const wallLimitS = ({ total, ramp, duration, drain }, maxWall = null) => maxWall ?? Math.ceil(total / ramp + duration + drain + 120);
+
+/** Stop child processes (stopChild: SIGTERM, SIGKILL after graceMs, a bounded wait after that); all in parallel. */
+export function stopChildren(children, graceMs, finalMs) {
+  return Promise.all([...children].map(c => stopChild(c, graceMs, finalMs)));
 }
 
 export const STOP_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"];
@@ -361,37 +400,46 @@ export const STOP_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"];
  * Every child process it starts (the --local server, the workers) is stopped before it returns or throws, and, with
  * `signals: true` (the CLI), on SIGTERM, SIGINT or SIGHUP, after which the process exits 2.
  */
-export async function run(o, { log = s => console.log(s), signals = false } = {}) {
+export async function run(o, { log = s => console.log(s), signals = false, grace = {} } = {}) {
   let server = null, serverSamples = null;
   let url = o.url, tokensPath = o.tokens, board = o.board;
+  const { counts, procs, ramp, duration, drain, cfg, viewersPerUser, maxWall } = parseOptions(o);   // first: --rig " " gets the empty-flag message
   if (o.rig) { const r = rigConfig(o.rig); url ??= r.url; tokensPath ??= r.tokens; board ??= r.board; }
-  const { counts, procs, ramp, duration, drain, cfg, viewersPerUser } = parseOptions(o);
   const total = counts.editor + counts.annotator + counts.viewer;
   if (total < 1) throw new Error("no clients planned: give --clients, --editors, --annotators or --viewers");
   const fd = fdCheck(Math.ceil(total / procs));
   if (!fd.ok) throw new Error(fd.message);
   const out = o.out ? resolve(o.out) : null;
   if (out) mkdirSync(out, { recursive: true });
+  // The wall-clock deadline for the whole run (setup, ramp, load, drain): --max-wall, else the plan + 120 s.
+  const wallS = wallLimitS({ total, ramp, duration, drain }, maxWall);
+  let tempDir = null;   // the run's own scratch dir when --local has no --out: removed at the end unless --keep-data
 
   // Every child this run starts, until it exits: stopped on the way out, whatever the way.
   const children = new Set();
   const track = c => { children.add(c); c.exited.then(() => children.delete(c)); };
-  let stopping = false;
+  let stopping = false, wallTimer, serverCleanup = null;
+  const cleanupDirs = () => { serverCleanup?.(); if (tempDir && !o["keep-data"]) rmSync(tempDir, { recursive: true, force: true }); };
+  const wall = new Promise((_, reject) => {
+    wallTimer = setTimeout(() => { log(`load: --max-wall ${wallS} s passed: stopping`); stopChildren(children, grace.graceMs, grace.finalMs); reject(new Error(`the run took longer than --max-wall (${wallS} s) and was stopped`)); }, wallS * 1000);
+  });
+  wall.catch(() => {});   // handled below; a run that finished first never rejects it
   const handlers = signals ? STOP_SIGNALS.map(sig => [sig, () => {
     if (stopping) return; stopping = true;
     log(`load: ${sig}: stopping ${children.size} child process(es)`);
     if (server?.sampler) clearInterval(server.sampler);
-    stopChildren(children).finally(() => process.exit(2));
+    stopChildren(children, grace.graceMs, grace.finalMs).finally(() => { cleanupDirs(); process.exit(2); });
   }]) : [];
   for (const [sig, h] of handlers) process.on(sig, h);
-  try {
+  const main = (async () => {
     if (o.local) {
-      const dir = out ?? mkdtempSync(join(tmpdir(), "plenary-load-"));
+      const dir = out ?? (tempDir = mkdtempSync(join(tmpdir(), "plenary-load-")));
       if (!tokensPath) tokensPath = writeTokens(join(dir, "tokens"), makeTokens({ editors: counts.editor, annotators: counts.annotator, viewers: counts.viewer, viewersPerUser })).jsonPath;
       else readTokensByRole(tokensPath);   // a bad tokens file stops here, before a server waits on it
-      server = await startServer({ tokensPath, env: o.serverEnv ?? {}, nofile: Math.max(fd.nofile, total + 1024), logPath: join(dir, "server.log"), onChild: track });
+      server = await startServer({ tokensPath, env: o.serverEnv ?? {}, nofile: Math.max(fd.nofile, total + 1024), logPath: join(dir, "server.log"), keep: !!o["keep-data"], alsoClean: tempDir ? [tempDir] : [], onCleanup: c => { serverCleanup = c; }, onChild: track });
       url = server.wsUrl; if (!o["create-board"]) board ??= server.board;
       log(`local server pid ${server.pid} on port ${server.port}, board ${server.board}, log ${join(dir, "server.log")}`);
+      if (o["keep-data"]) log(`--keep-data: kept ${[server.dataDir, server.cwd, tempDir].filter(Boolean).join(", ")}`);
     }
     let boardCreated = false;
     if (o["create-board"] && url && tokensPath) { board = await createBoard(url, tokensPath); boardCreated = true; log(`created board ${board}`); }
@@ -402,7 +450,7 @@ export async function run(o, { log = s => console.log(s), signals = false } = {}
     const rampMs = Math.ceil((total * 1000) / ramp);
     const t0 = Date.now() + 1500;   // workers get a moment to start
     const genEndAt = t0 + rampMs + duration * 1000;
-    const config = { url, board, boardCreated, procs, ramp, duration, drain, viewersPerToken, ...cfg, rampMs, nofile: fd.nofile };
+    const config = { url, board, boardCreated, procs, ramp, duration, drain, joinCeilingMs: o.joinCeilingMs ?? JOIN_CEILING_MS, viewersPerToken, ...cfg, rampMs, nofile: fd.nofile };
     log(`plan: ${counts.editor} editors, ${counts.annotator} annotators, ${counts.viewer} viewers over ${procs} worker(s); ramp ${rampMs} ms, then ${duration} s, then drain ≤ ${drain} s`);
 
     // Server CPU, sampled every second; the load phase's share (after the ramp, before the drain) is reported apart.
@@ -422,7 +470,7 @@ export async function run(o, { log = s => console.log(s), signals = false } = {}
       log(`  t+${Math.round((Date.now() - t0) / 1000)} s: ${joined}/${total} joined, ${ops} ops sent`);
     };
     const onWorker = c => { track(c); log(`worker pid ${c.pid}`); };
-    const results = await Promise.all(jobs.map((clients, worker) => spawnWorker({ url, board, tokensPath, t0, loadFrom, genEndAt, drainMs: drain * 1000, clients, cfg, worker }, fd.nofile, onProgress, onWorker)));
+    const results = await Promise.all(jobs.map((clients, worker) => spawnWorker({ url, board, tokensPath, t0, loadFrom, genEndAt, drainMs: drain * 1000, joinCeilingMs: config.joinCeilingMs, clients, cfg, worker }, fd.nofile, onProgress, onWorker)));
     const finishedAt = Date.now();
     let serverInfo = null;
     if (server) {
@@ -436,11 +484,17 @@ export async function run(o, { log = s => console.log(s), signals = false } = {}
       log(`wrote ${join(out, "result.json")} and report.md`);
     }
     return result;
+  })();
+  main.catch(() => {});   // when the deadline wins the race below, main's own error is not reported twice
+  try {
+    return await Promise.race([main, wall]);
   } finally {
+    clearTimeout(wallTimer);
     for (const [sig, h] of handlers) process.off(sig, h);
     if (server?.sampler) clearInterval(server.sampler);
+    await stopChildren(children, grace.graceMs, grace.finalMs);   // anything still running: a setup failure, a failed sibling worker, the deadline
     if (server) await server.stop();
-    await stopChildren(children);   // anything still running: a setup failure, a failed sibling worker
+    if (tempDir && !o["keep-data"]) rmSync(tempDir, { recursive: true, force: true });
   }
 }
 

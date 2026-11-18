@@ -1,9 +1,15 @@
-# CI: every gate runs as `bun test` on push and pull request.
+# CI: two jobs, no overlap. `test` runs the whole suite with no services (cluster-gated tests skip there).
+# `test-cluster-services` runs only the cluster-gated files (scripts/cluster-files.json, the list `bun run test:cluster`
+# also uses) against Postgres, NATS and MinIO. Both go through scripts/ci-test.js: JUnit report (uploaded), a rerun of
+# only the failed files once, and a job summary naming each failure FLAKY (passed on rerun) or FAILING (failed twice).
+# The job fails either way; a rerun is a diagnosis, never a pass.
 # No secrets, no registry login, no deploy step. Nothing is published from here.
+# core-source drift against upstream herdr-draw runs weekly in herdr-drift.yml, not here.
 name: ci
 
 on:
   push:
+    branches: [main, "plenary/**"]
   pull_request:
 
 permissions:
@@ -18,7 +24,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       # actions/checkout v7.0.1 (SHA read with `git ls-remote` on 2026-11-11)
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -30,46 +36,34 @@ jobs:
         with:
           bun-version: 1.4.4
 
-      # bun.lock is committed, so install always runs. --frozen-lockfile fails the job if bun.lock does not match
-      # package.json (it never rewrites it). A missing bun.lock fails here too, instead of installing unpinned.
+      # actions/cache v5.0.5 (SHA read with `git ls-remote` on 2026-11-18). Keyed on bun.lock: a changed lock misses.
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+
+      # --frozen-lockfile fails the job if bun.lock does not match package.json (it never rewrites it) or is missing.
       - name: Install (bun.lock, frozen)
-        run: |
-          set -euo pipefail
-          test -f bun.lock || { echo "bun.lock is missing; dependencies must be locked." >&2; exit 1; }
-          bun install --frozen-lockfile
+        timeout-minutes: 3
+        run: bun install --frozen-lockfile
 
-      # test/core-source.test.js compares packages/core with ../herdr-draw/core and skips that check when the
-      # directory is missing. Put herdr-draw there, at the commit packages/core/SOURCE.json names, so the check
-      # runs in CI too. Public repo, anonymous read-only clone; nothing is pushed. A full clone (not shallow),
-      # because SOURCE.json holds a short SHA and a shallow clone cannot resolve one.
-      # This proves core equals herdr-draw AT THAT COMMIT. It does not notice newer herdr-draw commits.
-      - name: Check out herdr-draw at the commit in SOURCE.json
-        run: |
-          set -euo pipefail
-          sha="$(bun -e 'const c = JSON.parse(require("node:fs").readFileSync("packages/core/SOURCE.json", "utf8")).commit; if (typeof c !== "string" || !/^[0-9a-f]{7,40}$/.test(c)) { console.error("SOURCE.json: commit is missing or is not a hex SHA"); process.exit(1); } console.log(c);')"
-          if [ -e ../herdr-draw ]; then
-            echo "../herdr-draw already exists; refusing to reuse it." >&2
-            exit 1
-          fi
-          git clone --quiet --no-tags https://github.com/ryanthedev/herdr-draw ../herdr-draw
-          # Fails, with a message, if the SHA is unknown or (for a short SHA) ambiguous.
-          full="$(git -C ../herdr-draw rev-parse --verify --quiet "${sha}^{commit}")" || {
-            echo "herdr-draw has no single commit matching '$sha' (from packages/core/SOURCE.json): unknown or ambiguous." >&2
-            exit 1
-          }
-          git -C ../herdr-draw checkout --quiet --detach "$full"
-          test -d ../herdr-draw/core
-          echo "herdr-draw at $full (SOURCE.json commit: $sha)"
+      - name: Test (whole suite, no services)
+        timeout-minutes: 7
+        run: bun scripts/ci-test.js
 
-      - name: Test
-        run: bun test
+      # actions/upload-artifact v7.0.1 (SHA read with `git ls-remote` on 2026-11-18)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: junit-test
+          path: test-results/
+          if-no-files-found: warn
 
-  # Phase 4: the same `bun test` with Postgres, NATS (2 MB max_payload) and an S3-compatible blob store beside it, so
-  # engine's cluster-adapter tests run against real services here (they skip in the `test` job, where none is set).
-  # It does not clone herdr-draw: test/core-source.test.js skips here, and the `test` job above covers it.
+  # Only the cluster-gated files, with Postgres, NATS (2 MB max_payload) and an S3-compatible blob store beside them.
+  # Any skipped test here fails the run: a gated test that skips means its service was not reachable.
   test-cluster-services:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     services:
       postgres:
         image: postgres:17.11-alpine3.23
@@ -81,131 +75,82 @@ jobs:
           POSTGRES_PASSWORD: plenary-ci-only
         ports:
           - 5432:5432
+        # GitHub waits for this health check before the first step runs.
         options: >-
           --health-cmd "pg_isready -U plenary -d plenary"
-          --health-interval 5s
+          --health-interval 2s
           --health-timeout 3s
-          --health-retries 10
-    # NATS is not a service container: PROTOCOL.md (Bus) needs max_payload 2 MB, which NATS takes only from a config
-    # file (nats-server 2.15.3 has no --max_payload flag), and service containers start before checkout, so they
-    # cannot mount one. The "Start NATS" step runs it with deploy/cluster/nats.conf, the file Compose uses.
+          --health-retries 20
+    # NATS and MinIO are `docker run` steps, not service containers: NATS takes max_payload only from a config file
+    # (deploy/cluster/nats.conf), and service containers start before checkout, so they cannot mount it.
     env:
-      # Env names confirmed by engine.
       DATABASE_URL: postgres://plenary:plenary-ci-only@127.0.0.1:5432/plenary
       NATS_URL: nats://127.0.0.1:4222
-      # S3-compatible blob store for test/server/s3-blobs.test.js, started by the "Start blob store" step below.
-      # Every S3_* value here is a THROWAWAY CI-ONLY literal: the store lives only inside this job's container, is
+      # Every S3_* value is a THROWAWAY CI-ONLY literal: the store lives only inside this job's container, is
       # published only on the runner's loopback, holds nothing, and these values are used nowhere else. Not secrets.
-      # CI-only throwaway: the runner's loopback, the port the step publishes.
       S3_ENDPOINT: http://127.0.0.1:9000
-      # CI-only throwaway: the bucket the step creates.
       S3_BUCKET: plenary-ci
-      # CI-only throwaway: MinIO accepts any region name; us-east-1 matches cluster.compose.yml.
+      # MinIO accepts any region name; us-east-1 matches cluster.compose.yml.
       S3_REGION: us-east-1
-      # CI-only throwaway: also the store's root user (MinIO wants at least 3 characters).
+      # Also the store's root user (MinIO wants at least 3 characters).
       S3_ACCESS_KEY_ID: plenary-ci-only
-      # CI-only throwaway: also the store's root password (MinIO wants at least 8 characters).
+      # Also the store's root password (MinIO wants at least 8 characters).
       S3_SECRET_ACCESS_KEY: plenary-ci-only-secret
     steps:
-      # actions/checkout v7.0.1 (SHA read with `git ls-remote` on 2026-11-11)
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
-      # oven-sh/setup-bun v2.2.0 (SHA read with `git ls-remote` on 2026-11-11)
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
           bun-version: 1.4.4
 
-      # bun.lock is committed, so install always runs. --frozen-lockfile fails the job if bun.lock does not match
-      # package.json (it never rewrites it). A missing bun.lock fails here too, instead of installing unpinned.
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+
       - name: Install (bun.lock, frozen)
-        run: |
-          set -euo pipefail
-          test -f bun.lock || { echo "bun.lock is missing; dependencies must be locked." >&2; exit 1; }
-          bun install --frozen-lockfile
+        timeout-minutes: 3
+        run: bun install --frozen-lockfile
 
-      # Plain `docker run` on the runner's own Docker: anonymous pull of a pinned public image, no registry login,
-      # no secrets. Published on the runner's loopback only. The container id is recorded and only that container
-      # is stopped. The step fails unless /varz reports max_payload 2097152 (2 MB, NATS counts MB as 1024*1024).
-      # No --rm, so `docker logs` still works if NATS exits on its own; "Stop NATS" removes it by id.
-      # Every call into the container runs under the runner's `timeout 10` (a stuck call counts as a failed try), and
-      # the wait is a 60 s deadline, not a try count, so the step ends within about 60 + 10 + 10 + 10 s.
-      - name: Start NATS (max_payload 2 MB, from deploy/cluster/nats.conf)
+      # Both containers start first, then each is waited on through Docker's own health check (the image's own
+      # health command, retried by the daemon every second), so the two start up in parallel. Plain `docker run`:
+      # anonymous pull of a pinned public image, no login, loopback only. No --rm, so `docker logs` works after a crash.
+      - name: Start NATS (max_payload 2 MB) and blob store (pgsty/minio)
+        timeout-minutes: 3
         run: |
           set -euo pipefail
-          cid="$(docker run -d \
-            -p 127.0.0.1:4222:4222 \
+          docker pull -q nats:2.15.3-alpine & docker pull -q pgsty/minio:RELEASE.2026-08-04T00-00-00Z & wait
+          docker run -d --name nats -p 127.0.0.1:4222:4222 \
             -v "$GITHUB_WORKSPACE/deploy/cluster/nats.conf:/etc/nats/plenary.conf:ro" \
-            nats:2.15.3-alpine nats-server --config /etc/nats/plenary.conf)"
-          echo "NATS_CONTAINER_ID=$cid" >> "$GITHUB_ENV"
-          ok=; deadline=$((SECONDS + 60))
-          while [ "$SECONDS" -lt "$deadline" ]; do
-            if timeout 10 docker exec "$cid" wget -q -O /dev/null http://127.0.0.1:8222/healthz; then ok=1; break; fi
-            sleep 1
+            --health-cmd "wget -q -O /dev/null http://127.0.0.1:8222/healthz" --health-interval 1s --health-timeout 3s --health-retries 60 \
+            nats:2.15.3-alpine nats-server --config /etc/nats/plenary.conf
+          # The same pinned image as deploy/cluster.compose.yml. /minio/health/cluster, not /ready: /ready answers 200
+          # before MinIO accepts bucket operations.
+          docker run -d --name blobs -p 127.0.0.1:9000:9000 \
+            -e MINIO_ROOT_USER="$S3_ACCESS_KEY_ID" -e MINIO_ROOT_PASSWORD="$S3_SECRET_ACCESS_KEY" \
+            --health-cmd "curl -fsS -o /dev/null http://127.0.0.1:9000/minio/health/cluster" --health-interval 1s --health-timeout 3s --health-retries 60 \
+            pgsty/minio:RELEASE.2026-08-04T00-00-00Z minio server /data
+          for c in nats blobs; do
+            until [ "$(docker inspect -f '{{.State.Health.Status}}' "$c")" = healthy ]; do
+              if [ "$(docker inspect -f '{{.State.Health.Status}}' "$c")" = unhealthy ] || [ "$(docker inspect -f '{{.State.Running}}' "$c")" != true ]; then
+                echo "$c did not become healthy." >&2; docker logs "$c" >&2 || true; exit 1
+              fi
+              sleep 0.5
+            done
           done
-          if [ -z "$ok" ]; then
-            echo "NATS did not become healthy in 60 s." >&2
-            timeout 10 docker logs "$cid" >&2 || true
-            exit 1
-          fi
-          # Capture first, then grep: piping into `grep -q` under pipefail can fail falsely (grep exits at the match,
-          # the writer gets SIGPIPE). A failed fetch leaves varz empty, which fails the check below.
-          varz="$(timeout 10 docker exec "$cid" wget -q -O - http://127.0.0.1:8222/varz)" || varz=""
-          if ! grep -Eq '"max_payload": *2097152\b' <<<"$varz"; then
-            echo "NATS max_payload is not 2097152." >&2
-            grep max_payload <<<"$varz" >&2 || true
-            exit 1
-          fi
-          echo "NATS up ($cid), max_payload 2097152."
+          # Capture first, then grep: piping into `grep -q` under pipefail can fail falsely (SIGPIPE).
+          varz="$(docker exec nats wget -q -O - http://127.0.0.1:8222/varz)"
+          grep -Eq '"max_payload": *2097152\b' <<<"$varz" || { echo "NATS max_payload is not 2097152." >&2; grep max_payload <<<"$varz" >&2 || true; exit 1; }
+          # mc (the image's MinIO client) runs inside the container. The cluster is healthy, so these must succeed first time.
+          docker exec blobs mc alias set ci http://127.0.0.1:9000 "$S3_ACCESS_KEY_ID" "$S3_SECRET_ACCESS_KEY" >/dev/null
+          docker exec blobs mc mb --ignore-existing "ci/$S3_BUCKET" >/dev/null
+          docker exec blobs mc stat "ci/$S3_BUCKET" >/dev/null
+          echo "NATS up (max_payload 2097152); blob store up, bucket $S3_BUCKET exists."
 
-      # The same pinned image as deploy/cluster.compose.yml (`blobs` and `blobs-init`). Plain `docker run`, like NATS:
-      # anonymous pull of a public image, no registry login. Published on the runner's loopback only. The container
-      # id is recorded and only that container is stopped and removed (no --rm, so `docker logs` still works if the
-      # store exits on its own). The image's entrypoint prepends `minio` unless the first
-      # argument is `minio`, so `minio server /data` runs as written; `docker exec` bypasses the entrypoint.
-      # The step fails unless the store answers its health check and then reports the bucket as existing.
-      # Every call into the container runs under the runner's `timeout 10` (a stuck call counts as a failed try), and
-      # each wait is a 60 s deadline, not a try count, so the step ends within about 70 + 90 + 10 s.
-      - name: Start blob store (pgsty/minio) and create the bucket
-        run: |
-          set -euo pipefail
-          cid="$(docker run -d \
-            -p 127.0.0.1:9000:9000 \
-            -e MINIO_ROOT_USER="$S3_ACCESS_KEY_ID" \
-            -e MINIO_ROOT_PASSWORD="$S3_SECRET_ACCESS_KEY" \
-            pgsty/minio:RELEASE.2026-08-04T00-00-00Z minio server /data)"
-          echo "BLOBS_CONTAINER_ID=$cid" >> "$GITHUB_ENV"
-          ok=; deadline=$((SECONDS + 60))
-          while [ "$SECONDS" -lt "$deadline" ]; do
-            if timeout 10 docker exec "$cid" curl -fsS -o /dev/null http://127.0.0.1:9000/minio/health/live; then ok=1; break; fi
-            sleep 1
-          done
-          if [ -z "$ok" ]; then
-            echo "Blob store did not become healthy in 60 s." >&2
-            timeout 10 docker logs "$cid" >&2 || true
-            exit 1
-          fi
-          # mc (the image's MinIO client) talks to the store from inside its own container, with the CI-only values.
-          # Alias, create, then wait until the store reports the bucket: the tests need it and never create it. All
-          # three retry, because `mc alias set` also contacts the store, which may not be ready the moment it is live.
-          ok=; deadline=$((SECONDS + 60))
-          while [ "$SECONDS" -lt "$deadline" ]; do
-            if timeout 10 docker exec "$cid" mc alias set ci http://127.0.0.1:9000 "$S3_ACCESS_KEY_ID" "$S3_SECRET_ACCESS_KEY" >/dev/null \
-              && timeout 10 docker exec "$cid" mc mb --ignore-existing "ci/$S3_BUCKET" >/dev/null \
-              && timeout 10 docker exec "$cid" mc stat "ci/$S3_BUCKET" >/dev/null; then ok=1; break; fi
-            sleep 1
-          done
-          if [ -z "$ok" ]; then
-            echo "Bucket $S3_BUCKET did not appear in 60 s." >&2
-            timeout 10 docker logs "$cid" >&2 || true
-            exit 1
-          fi
-          echo "Blob store up ($cid), bucket $S3_BUCKET exists."
-
-      # server/main.js refuses cluster mode (DATABASE_URL or NATS_URL set, as in this job) without COOKIE_KEY. Today no
-      # test hands process.env to start() (it reads only its argument), so this is for anything in this job that
-      # starts the server from the job's env. A fresh random key per run, masked in the log; never a literal here.
+      # server/main.js refuses cluster mode (DATABASE_URL or NATS_URL set) without COOKIE_KEY. A fresh random key per
+      # run, masked in the log; never a literal here.
       - name: Generate a throwaway COOKIE_KEY
         run: |
           set -euo pipefail
@@ -213,25 +158,17 @@ jobs:
           echo "::add-mask::$key"
           echo "COOKIE_KEY=$key" >> "$GITHUB_ENV"
 
-      # Engine's cluster-adapter tests read DATABASE_URL, NATS_URL and S3_* above (each skips when its variable is
-      # unset, so local `bun test` without services still passes).
-      - name: Test
-        run: bun test
+      - name: Test (cluster-gated files only)
+        timeout-minutes: 6
+        run: bun scripts/ci-test.js --cluster
 
-      # Stops and removes only the recorded container (started without --rm, so its logs outlive a crash).
-      - name: Stop NATS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
-        run: |
-          if [ -n "${NATS_CONTAINER_ID:-}" ]; then
-            docker stop "$NATS_CONTAINER_ID"
-            docker rm "$NATS_CONTAINER_ID"
-          fi
+        with:
+          name: junit-cluster
+          path: test-results/
+          if-no-files-found: warn
 
-      # Stops and removes only the recorded container (started without --rm, so its logs outlive a crash).
-      - name: Stop blob store
-        if: always()
-        run: |
-          if [ -n "${BLOBS_CONTAINER_ID:-}" ]; then
-            docker stop "$BLOBS_CONTAINER_ID"
-            docker rm "$BLOBS_CONTAINER_ID"
-          fi
+      - name: Service logs
+        if: failure()
+        run: for c in nats blobs; do echo "::group::$c"; docker logs "$c" 2>&1 | tail -100 || true; echo "::endgroup::"; done

@@ -19,8 +19,8 @@ test("H1: test-cluster starts the rig services-only, never a node or the LB", ()
   expect(up).not.toMatch(/--gateways|--hosts/);
 });
 
-test("L6: the gated list in test-cluster.js is exactly the test files that read DATABASE_URL, NATS_URL or S3_ENDPOINT", () => {
-  const listed = [...SCRIPT.matchAll(/"(test\/[\w./-]+\.test\.js)"/g)].map(m => m[1]).sort();
+test("L6: the gated list in scripts/cluster-files.json (used by test-cluster.js and ci-test.js) is exactly the test files that read DATABASE_URL, NATS_URL or S3_ENDPOINT", () => {
+  const listed = JSON.parse(readFileSync(join(ROOT, "scripts/cluster-files.json"), "utf8")).sort();
   const reading = walk(join(ROOT, "test"))
     .filter(f => f.endsWith(".test.js") && !relative(ROOT, f).startsWith("test/deploy/"))
     .filter(f => /process\.env\.(DATABASE_URL|NATS_URL|S3_ENDPOINT)\b|\bS3_ENDPOINT\b/.test(readFileSync(f, "utf8")))

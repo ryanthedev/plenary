@@ -1,20 +1,11 @@
 #!/usr/bin/env bun
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
 const RIG_CLI = join(ROOT, "scripts/cluster-rig.js");
 const BUN = Bun.which("bun") ?? process.execPath;
-const FILES = [
-  "test/server/pg-store.test.js",
-  "test/server/pg-registry.test.js",
-  "test/server/nats-bus.test.js",
-  "test/server/room-host-lease.test.js",
-  "test/server/room-host-proc.test.js",
-  "test/server/main-cluster.test.js",
-  "test/server/s3-blobs.test.js",
-  "test/admin/tenants.test.js",
-];
+const FILES = JSON.parse(readFileSync(join(ROOT, "scripts/cluster-files.json"), "utf8"));   // shared with scripts/ci-test.js
 
 const hash = createHash("sha256").update(`${ROOT}\0${process.pid}`).digest("hex").slice(0, 6);
 const name = `test-${process.pid}-${hash}`.slice(0, 32);

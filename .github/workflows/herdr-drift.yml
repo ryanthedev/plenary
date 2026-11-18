@@ -1,0 +1,37 @@
+# Upstream drift check for packages/core, kept out of ci.yml: test/core-source.test.js already proves packages/core
+# matches the sha256 per file in SOURCE.json on every CI run. This weekly (or manual) run additionally compares those
+# hashes with herdr-draw's current core/, so a newer herdr-draw is noticed. A failure means: re-copy and update SOURCE.json.
+name: herdr-drift
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          path: plenary
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.4
+
+      # The test looks for herdr-draw next to the repo (../../herdr-draw from test/). Public repo, anonymous clone.
+      - name: Clone herdr-draw (HEAD, depth 1)
+        run: git clone --quiet --depth 1 --no-tags https://github.com/ryanthedev/herdr-draw herdr-draw
+
+      - name: Compare packages/core with herdr-draw core/
+        timeout-minutes: 2
+        working-directory: plenary
+        run: |
+          test -d ../herdr-draw/core
+          bun test test/core-source.test.js

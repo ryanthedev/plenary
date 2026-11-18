@@ -37,3 +37,4 @@ id_ed25519*
 
 # Local cluster rig state (scripts/cluster-rig.js): Postgres data, logs, keys and dev tokens.
 .rig/
+test-results/

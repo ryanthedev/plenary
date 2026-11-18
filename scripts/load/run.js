@@ -19,7 +19,7 @@
 // role is due when one of its clients was welcomed at least 1.5/rate s before the generation ended (each client's
 // clock starts at its own first welcome; its first op comes within 1.5/rate s of that); a run with no role due
 // (--op-rate 0 and no annotators, viewers only) needs no ops: it is judged on its joins (and any ops made). The run
-// (a client whose connection dropped within 3 s before the end of generation and is reconnecting gets up to 3 s after the drain to come back) must also have stayed: every planned client connected at the drain's end (result.clients.stayed), and, with a role
+// (a client whose connection dropped within 3 s before the end of generation, or during the drain, and is reconnecting gets up to 3 s after the drain to come back) must also have stayed: every planned client connected at the drain's end (result.clients.stayed), and, with a role
 // due, no more ops skipped offline than made (result.ops.present): a server that drops everyone mid-run and refuses
 // their rejoins reads INCOMPLETE, not VALID. 1 = the run finished but is
 // not good (report.md's headline says INVALID or INCOMPLETE and why); 2 = bad arguments or setup, or stopped by

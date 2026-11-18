@@ -55,7 +55,8 @@ export class LoadClient {
     this.url = url; this.board = board; this.token = token; this.role = role; this.name = name; this.cfg = cfg; this.stats = stats;
     this.replica = makeReplica(name);
     this.ws = null; this.ownClose = false; this.running = true; this.generating = false;
-    this.armed = false; this.firstWelcomeAt = null; this.firstConnectAt = null; this.lastDropAt = null;   // lastDropAt: when a welcomed connection was last lost (not a failed reconnect attempt)   // armed: generation starts at the first welcome (the due clock)
+    this.armed = false; this.firstWelcomeAt = null; this.firstConnectAt = null; this.lastDropAt = null;
+    // armed: generation starts at the first welcome (the due clock); lastDropAt: when a welcomed connection was last lost (not a failed reconnect attempt)
     this.helloAt = null; this.liveFrom = Infinity; this.welcomedOnce = false; this.welcomed = false;
     this.writeAt = new Map();   // op id → { t: first write time (ms), acked, echoed }; gone once both are seen
     this.timers = new Set(); this.flushTimer = null;

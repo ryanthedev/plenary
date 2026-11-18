@@ -40,7 +40,9 @@ export function sweepStaleRoots(base, { alive = ownerAlive, host = hostname(), n
     if (!name.startsWith("plen-run-")) continue;
     let owner;
     try { owner = JSON.parse(readFileSync(join(base, name, "owner.json"), "utf8")); } catch { continue; }
-    if (owner?.host !== host || !owner || !("ns" in owner) || owner.ns !== ns) continue;   // another host or pid namespace, or unknown
+    // Another host or pid namespace, or unknown. A file without `ns` (written before it existed) counts as null: the
+    // same as here where there is no namespace link (macOS), so old roots of dead runs go; on Linux it is kept.
+    if (owner?.host !== host || (owner.ns ?? null) !== ns) continue;
     if (!Number.isSafeInteger(owner.pid) || owner.pid <= 0) continue;   // kill(-n, 0) would ask about a process group
     if (owner.pid === process.pid || alive(owner.pid)) continue;
     try { rmSync(join(base, name), { recursive: true, force: true }); gone.push(name); } catch { /* another run got it */ }

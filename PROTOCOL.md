@@ -810,7 +810,7 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   jittered backoff of heartbeats: after the n-th failure in a row, with b = min(31, 2^(n-1) - 1), the next k
   heartbeats or polls are skipped, k drawn from [⌈b/2⌉, b] (so gateways don't look in lockstep). While skipping, no
   look is made at all, also not one a due tail would trigger (a host without `cp`), so a persistent failure costs at
-  most one look per 17 heartbeats or polls once the backoff is at its cap. A heartbeat naming a `cp` above the one
+  most one look per 17 heartbeats or polls once the backoff is at its cap, plus one per newly announced checkpoint. A heartbeat naming a `cp` above the one
   the failing look was for ends the skip (a checkpoint was just written: look now). A successful look resets n.
 - A gateway subscribes to the board's subjects **before** it forwards a hello or serves any catch-up, so
   nothing between catch-up and live is missed.

@@ -122,7 +122,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
   // - A look that throws backs off: after the n-th failure in a row, with b = min(MAX_SKIP, 2^(n-1) - 1), the next
   //   k heartbeats or polls are skipped, k from [ceil(b/2), b] by `random` (jitter: gateways don't look in lockstep).
   //   While skipping no look is made, not even a due one on entries, so a Store that answers getCheckpoint but fails
-  //   the entry check costs one full checkpoint read per 17 heartbeats at worst. A heartbeat naming a cp above the one
+  //   the entry check costs at most one full checkpoint read per 17 heartbeats, plus one per newly announced checkpoint. A heartbeat naming a cp above the one
   //   the failing look was for ends the skip; a look that completes resets n.
   const LEGACY_RETRIES = 3, MAX_SKIP = 31;
   const rebaseDue = () => self.tail.length >= self.nextRebase || self.tailBytes >= self.nextRebaseBytes;

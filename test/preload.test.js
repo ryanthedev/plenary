@@ -65,6 +65,13 @@ test("the sweep keeps a root whose owner file is from another pid namespace, lac
   for (const d of kept) expect([d, existsSync(d)]).toEqual([d, true]);
 });
 
+test("an owner file from before `ns` existed: swept where there is no namespace (macOS), kept where there is one (Linux)", () => {
+  const base = mkdtempSync(join(tmpdir(), "plen-sweep-"));
+  const old = mkdtempSync(join(base, "plen-run-")); writeFileSync(join(old, "owner.json"), JSON.stringify({ pid: 999_999, host: hostname() }));
+  expect(sweepStaleRoots(base, { alive: () => false, ns: "pid:[4026531836]" })).toEqual([]);
+  expect(sweepStaleRoots(base, { alive: () => false, ns: null })).toEqual([old.split("/").at(-1)]);
+});
+
 test("ownerAlive: ESRCH alone means gone", () => {
   expect(ownerAlive(process.pid)).toBe(true);
   expect(ownerAlive(1)).toBe(true);                                      // EPERM: alive, someone else's

@@ -153,7 +153,7 @@ test("main.js started twice on one data dir: the same board, its acked ops, and 
 // A kill -9 leaves the dead process's room lease live for up to its ttl (PLENARY_LEASE_TTL_MS, passed to the child from
 // this one constant): a writer's hello in that window is answered `unavailable` (1013) or times out at the gateway,
 // and the client retries, as a real client does. Anything else is a failure, and so is no welcome within the ttl + 3 s.
-const LEASE_TTL_MS = 3_000;
+const LEASE_TTL_MS = 2_000;
 const leaseEnv = { PLENARY_LEASE_TTL_MS: String(LEASE_TTL_MS) };
 async function welcomedAfterRestart(port, board, name) {
   const end = Date.now() + LEASE_TTL_MS + 3_000;
@@ -177,10 +177,11 @@ test("kill -9 mid-stream, restart: every acked op is present, at its seq, once; 
   let counter = 0;
   const sent = [];
   // The gateway paces ops at 20/s (burst 100) and queues the rest, up to 500 per connection (PROTOCOL.md § Pacing):
-  // keep at most 200 unacked so the queue never overflows, and resend what a reconnecting client resends (its
+  // keep at most 30 unacked, so a reconnect's resends (the unacked ones and a sample, about 60) leave most of the fresh
+  // connection's burst for new ops and a round rarely waits on the pace; and resend what a reconnecting client resends (its
   // unacked ops) plus a sample of acked ones from inside the room's op-id window (the latest W = 256 counters per
   // client, § Op ids): each must come back with its first seq, not be logged again.
-  const MAX_UNACKED = 200, unacked = () => sent.filter(m => !acked.has(m.id));
+  const MAX_UNACKED = 30, unacked = () => sent.filter(m => !acked.has(m.id));
   const counterOf = m => Number(m.id.split(":")[1]);
   const resends = () => { const top = Math.max(0, ...sent.filter(m => acked.has(m.id)).map(counterOf)); const done = sent.filter(m => acked.has(m.id) && counterOf(m) > top - 200), step = Math.max(1, Math.floor(done.length / 30)); const sample = new Set(done.filter((_, i) => i % step === 0)); return sent.filter(m => sample.has(m) || !acked.has(m.id)); };
   const op = n => ({ t: "op", id: `ann:${n}`, sentAt: 0, stream: "board", op: { elements: [{ id: "tick", type: "rectangle", version: n, versionNonce: n, x: n % 1000, y: 0, width: 1, height: 1, isDeleted: false }] } });
@@ -189,11 +190,12 @@ test("kill -9 mid-stream, restart: every acked op is present, at its seq, once; 
       // Round 0 is a fresh boot: a plain welcome. Only after a kill does the client retry (L8).
       const s = round === 0 ? await connect(cur.port, board, "ann") : await welcomedAfterRestart(cur.port, board, "ann");
       if (round === 0) await s.next(m => m.t === "welcome");
-      const record = () => { for (const m of s.msgs) if (m.t === "ack") { if (acked.has(m.id)) expect([m.id, m.seq]).toEqual([m.id, acked.get(m.id)]); acked.set(m.id, m.seq); } };
+      let seen = 0;   // each message is looked at once: a rescan of the whole list on every tick cost half a million expects
+      const record = () => { for (; seen < s.msgs.length; seen++) { const m = s.msgs[seen]; if (m.t === "ack") { if (acked.has(m.id)) expect([m.id, m.seq]).toEqual([m.id, acked.get(m.id)]); acked.set(m.id, m.seq); } } };
       for (const m of resends()) s.send(m);
       const pump = setInterval(() => { record(); for (let k = 0; k < 5 && unacked().length < MAX_UNACKED; k++) { const m = op(++counter); sent.push(m); try { s.send(m); } catch { /* socket died with the server */ } } }, 5);
       const before = acked.size;
-      await until(() => { record(); return acked.size >= before + 150; }, "150 more acks", 15000);
+      await until(() => { record(); return acked.size >= before + 100; }, "100 more acks", 15000);
       cur.p.child.kill("SIGKILL");                // mid-stream: ops are in flight in both directions
       await cur.p.child.exited; clearInterval(pump);
       await s.whenClosed(); record();
@@ -222,7 +224,7 @@ test("kill -9 mid-stream, restart: every acked op is present, at its seq, once; 
     expect(seqOf.size).toBe(log.length);                                                  // no op logged twice
     expect(seqOf.size).toBe(sent.length);                                                 // every resend landed, once
     // No count threshold: how many acks beat each kill is timing. What must hold is durability, below.
-    expect(acked.size).toBeGreaterThanOrEqual(450);                                       // true by construction (150 a round)
+    expect(acked.size).toBeGreaterThanOrEqual(300);                                       // true by construction (100 a round; > 256, so ann:1 is out of the op-id window below)
     for (const [id, at] of acked) expect([id, seqOf.get(id)]).toEqual([id, at]);          // every acked op, at its acked seq
   } finally { cur.p.child.kill("SIGKILL"); }
 }, 90000);   // up to three lease waits (ttl + 3 s each) on top of the run

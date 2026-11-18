@@ -11,7 +11,7 @@ import { memoryBus, subjects } from "../../server/bus/memory.js";
 import { PROTOCOL_VERSION } from "../../packages/protocol/envelope.js";
 import { makeElement } from "../../packages/core/model.js";
 import { rig, tokenOf } from "./rig.js";
-import { cleanup, tempDir, sleep, until } from "./helpers.js";
+import { cleanup, tempDir, sleep, until, deferred } from "./helpers.js";
 import { code } from "./store-contract.js";
 
 afterAll(cleanup);
@@ -278,15 +278,17 @@ test("renew starts before the rebuild: a rebuild longer than the ttl keeps the l
   const { epoch } = await raw.acquire(T, B, "h-seed", 60_000);
   await raw.append(T, B, [{ seq: 1, board: B, tenant: T, stream: "board", op: { elements: [rect("x")] }, by: "u", id: "c:1", at: 0, rv: 1 }], 0, epoch);
   await raw.release(T, B, "h-seed", epoch);
-  let slow = true;
-  const store = { ...raw, read: async (...a) => { if (slow) { slow = false; await sleep(1_200); } return raw.read(...a); } };
+  // The rebuild is held until the test lets it go; the host renews every 200 ms, so four renews (counted, not timed)
+  // are 800 ms of rebuild against a ttl of 600.
+  let slow = true, renews = 0; const gate = deferred(), renewed = deferred();
+  const store = { ...raw, renew: (...a) => { if (++renews >= 4) renewed.resolve(); return raw.renew(...a); }, read: async (...a) => { if (slow) { slow = false; await gate.promise; } return raw.read(...a); } };
   const A = roomHost({ store, bus, holder: "h-a", leaseTtlMs: 600 });
   const Bh = roomHost({ store: raw, bus, holder: "h-b", leaseTtlMs: 600 });
   try {
     const opening = A.open(T, B);
-    await sleep(800);                                                      // past A's ttl, mid-rebuild
+    await renewed.promise;                                                 // four renews in, still mid-rebuild: past the whole ttl
     expect(await raw.acquire(T, B, "h-b", 600)).toBe(null);               // still A's: it renewed while building
-    await opening;
+    gate.resolve(); await opening;
     expect((await A.peek(T, B))?.durable).toBe(1);
   } finally { await A.close(); await Bh.close(); await raw.close(); await bus.close(); }
 }, 10000);
@@ -380,22 +382,23 @@ test("L2 (repro B): a clean release is taken by a watcher already in place withi
 
 test("MEDIUM-2 (repro A): a hello forwarded while the holder is still building is answered (1013), and the retry is welcomed", async () => {
   const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
-  let slow = true;
-  const slowStore = { ...raw, read: async (...a) => { if (slow) { slow = false; await sleep(1_500); } return raw.read(...a); } };
+  // The build is held by a gate the test opens once the hello is in: no guessed build time.
+  let slow = true; const gate = deferred();
+  const slowStore = { ...raw, read: async (...a) => { if (slow) { slow = false; await gate.promise; } return raw.read(...a); } };
   const A = roomHost({ store: slowStore, bus, holder: "h-a", leaseTtlMs: 10_000 });   // default heartbeat 2 s
   const Bh = roomHost({ store: raw, bus, holder: "h-b", leaseTtlMs: 10_000 });
   try {
     const opening = A.open(T, B);
-    await sleep(50);
+    await until(() => !slow, "A's build to be under way", 5_000);
     await Bh.open(T, B);
     expect(Bh.stats().waiting).toBe(1);
     const g = fakeGateway(bus);
-    const t0 = performance.now();
     g.hello("c1", "a");                                                      // mid-build: A's inbox isn't served yet
-    await opening;
-    const first = await g.answer("c1", 3_000);
+    await bus.flush();
+    expect(g.of("c1")).toEqual([]);                                          // nobody answers while the build is held
+    gate.resolve(); await opening;
+    const first = await g.answer("c1", 10_000);                              // answered by A's build finishing (1013), not left to the gateway's own 10 s
     expect(first).toMatchObject({ t: "error", code: "unavailable" });
-    expect(performance.now() - t0).toBeLessThan(2_500);                      // A's build (1.5 s), not the gateway's 10 s
     g.hello("c2", "a");
     expect(await g.welcome("c2")).toMatchObject({ seq: 0 });
     expect(g.of("c2").filter(m => m.close).length).toBe(0);
@@ -411,14 +414,13 @@ test("MEDIUM-3 (repro F): a renew that never settles is timed out and retried; a
     await A.open(T, B);
     await sleep(400);
     hang = "once"; const r0 = renews;
-    await sleep(1_500);
-    expect(renews - r0).toBeGreaterThanOrEqual(3);                          // the hung one, then fresh ones each tick
+    await until(() => renews - r0 >= 3, "the hung renew, then fresh ones each tick", 10_000);   // counted, not timed: a loaded machine runs fewer ticks a second
     expect(await A.peek(T, B)).not.toBe(null);                               // never past the deadline
     const g = fakeGateway(bus);
     g.hello("c1", "a"); await g.welcome("c1");
-    hang = "always"; const r1 = renews, t0 = performance.now();
-    await until(() => g.of("c1").some(x => x.close === 1013), "stopped at the deadline", 3_000);
-    expect(performance.now() - t0).toBeLessThan(900);
+    hang = "always"; const r1 = renews;
+    await until(() => g.of("c1").some(x => x.close === 1013), "stopped at the deadline", 10_000);
+    expect((await raw.lease(T, B)).live).toBe(true);                         // stopped by the deadline, before the Store's lease lapsed
     expect(renews - r1).toBeGreaterThanOrEqual(1);
     expect((await raw.lease(T, B)).holder).toBe("h-a");                     // not released
   } finally { await A.close(); await raw.close(); await bus.close(); }
@@ -449,13 +451,16 @@ test("L1 (repro G): the host deadline counts from the renew's send time (slow re
 }, 10000);
 
 test("L3 (repro H): an event-loop stall past the deadline stops the room; a renew after that doesn't revive it", async () => {
+  // The stall is on the lease's own clock (`monotonic` jumps `ms`, as it would over a blocked loop, without blocking
+  // this process for 2 s): the overdue renew tick finds the deadline (ttl - ttl/3 = 600 ms after the last good renew) gone.
   for (const ms of [700, 1500]) {
     const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
-    const A = roomHost({ store: raw, bus, holder: "h-a", leaseTtlMs: 900 });
+    let off = 0;
+    const A = roomHost({ store: raw, bus, holder: "h-a", leaseTtlMs: 900, monotonic: () => performance.now() + off });
     try {
       await A.open(T, B); await sleep(350);
-      const end = performance.now() + ms; while (performance.now() < end) { /* block the event loop */ }
-      await sleep(400);                                                      // the overdue ticks run
+      off += ms;
+      await until(async () => (await A.peek(T, B)) === null, "the overdue tick to stop the room", 5_000);
       expect(await A.peek(T, B)).toBe(null);
       await A.open(T, B);                                                    // only a new acquire reopens it
       expect((await A.peek(T, B))?.epoch).toBe(2);
@@ -500,7 +505,7 @@ test("L5: a build that fails for a reason other than the lease stops renewing an
 test("L7: past 1,000 held hellos on a watched board, the extra ones are answered unavailable at once", async () => {
   const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
   await raw.acquire(T, B, "h-dead", 30_000);                               // a holder that is gone: nothing heartbeats
-  const Bh = roomHost({ store: raw, bus, holder: "h-b", leaseTtlMs: 30_000, heartbeatMs: 2_000 });
+  const Bh = roomHost({ store: raw, bus, holder: "h-b", leaseTtlMs: 30_000, heartbeatMs: 200 });   // the silence rule is 2 heartbeats
   try {
     await Bh.open(T, B);
     const g = fakeGateway(bus);

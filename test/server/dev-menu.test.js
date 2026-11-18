@@ -38,6 +38,30 @@ test("a token with admin or a domain is never published; if none is left to offe
   try { expect((await get(only)).status).toBe(404); } finally { await only.stop(); }
 });
 
+test("a name with BOTH an admin/domain token and a plain token is never offered (identity is per name), nor are its tokens", async () => {
+  const both = JSON.stringify({ "SECRET-ADM": { name: "ann", domain: "acme.test", admin: true }, "SECRET-PLAIN": { name: "ann", role: "editor" }, "tok-d": { name: "dee", domain: "acme.test" }, "SECRET-D2": { name: "dee" }, "tok-a": { name: "ada", role: "owner" } });
+  const app = await start(env({ PLENARY_DEV_TOKENS: both }));
+  try {
+    const body = await (await get(app)).json();
+    expect(body.users).toEqual([{ name: "ada", token: "tok-a", role: "owner" }]);
+    expect(JSON.stringify(body)).not.toMatch(/SECRET|ann|dee/);
+  } finally { await app.stop(); }
+  const none = await start(env({ PLENARY_DEV_TOKENS: JSON.stringify({ "SECRET-ADM": { name: "ann", domain: "acme.test", admin: true }, "SECRET-PLAIN": { name: "ann" } }) }));
+  try { expect((await get(none)).status).toBe(404); } finally { await none.stop(); }
+});
+
+test("PUBLIC_URL on a loopback name keeps the menu on; Google half-configured warns but does not turn dev off", async () => {
+  const lines = [];
+  const app = await start(env({ PLENARY_DEV_TOKENS: TOK, PUBLIC_URL: "http://localhost:8099", GOOGLE_CLIENT_ID: "id", LOG_LEVEL: "warn" }), { write: l => lines.push(l) });
+  try {
+    expect((await get(app)).status).toBe(200);
+    expect(lines.join("")).toContain("Google sign-in is half configured: GOOGLE_CLIENT_SECRET is missing");
+  } finally { await app.stop(); }
+  const l2 = [];
+  const b = await start(env({ GOOGLE_CLIENT_SECRET: "s", LOG_LEVEL: "warn" }), { write: l => l2.push(l) });
+  try { expect(l2.join("")).toContain("GOOGLE_CLIENT_ID is missing"); } finally { await b.stop(); }
+});
+
 test("DNS rebinding: a Host header that is not a loopback name gets 404, loopback names (with a port) get 200", async () => {
   const app = await start(env({ PLENARY_DEV_TOKENS: TOK }));
   try {
@@ -55,7 +79,8 @@ const GOOGLE = { GOOGLE_CLIENT_ID: "id", GOOGLE_CLIENT_SECRET: "secret" };
 const cases = {
   "unset": {}, "empty string": { PLENARY_DEV_TOKENS: "" }, "empty object": { PLENARY_DEV_TOKENS: "{}" }, "not an object": { PLENARY_DEV_TOKENS: "[1,2]" },
   "Google only": { ...GOOGLE }, "Google plus dev tokens": { ...GOOGLE, PLENARY_DEV_TOKENS: TOK },
-  "HOST=0.0.0.0 plus dev tokens": { HOST: "0.0.0.0", PLENARY_DEV_TOKENS: TOK },
+  // (HOST=0.0.0.0 is proved by the devMenuOff unit test below: a test must not listen on every interface.)
+  "a public PUBLIC_URL plus dev tokens": { PUBLIC_URL: "https://plenary.example.com", PLENARY_DEV_TOKENS: TOK },
 };
 for (const [name, extra] of Object.entries(cases)) {
   test(`no /auth/dev (404) when: ${name}`, async () => {
@@ -91,6 +116,8 @@ test("devMenuOff: every reason, and null only for a local, gateway, Google-less 
   expect(devMenuOff({ ...ok, users: 0 })).toMatch(/offerable/);
   expect(devMenuOff({ ...ok, google: true })).toMatch(/Google/);
   for (const host of ["0.0.0.0", "::", "192.168.1.5", "example.com", ""]) expect(devMenuOff({ ...ok, host })).toMatch(/not a loopback/);
+  expect(devMenuOff({ ...ok, publicHost: "plenary.example.com" })).toMatch(/PUBLIC_URL/);
+  for (const publicHost of [null, "localhost", "127.0.0.1", "[::1]"]) expect(devMenuOff({ ...ok, publicHost })).toBeNull();
 });
 
 test("the served page can load the dev menu adapter and the favicon; the in-browser dev table stays denied", async () => {

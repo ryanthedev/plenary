@@ -30,8 +30,9 @@ Open one URL per user, each in its own browser tab (a tab keeps its own identity
 Draw in one tab and the shape appears in the other. With no `?board=` you land on the dev board; with no `?as=` the
 sign-in screen lists the dev users as buttons. `PORT=0` picks a free port instead (read it from the `server
 listening` log line). Dev sign-in is a local-only convenience. It exists only while **all** of these hold: `PLENARY_DEV_TOKENS` names at
-least one user (unset, empty and `{}` are off), the server binds a loopback `HOST` (the default `127.0.0.1`), Google
-sign-in is not configured, and the node is a gateway. Otherwise there is no `/auth/dev` route, no buttons, `?as=` is
+least one user (unset, empty and `{}` are off; a name with any `admin` or `domain` token is never offered), the server
+binds a loopback `HOST` (the default `127.0.0.1`) and any `PUBLIC_URL` is a loopback name, Google sign-in is not
+configured, and the node is a gateway. Behind a reverse proxy (a public `PUBLIC_URL`) the menu stays off. Otherwise there is no `/auth/dev` route, no buttons, `?as=` is
 ignored, and (if dev tokens are set) the log says why. When it is on, `GET /auth/dev` publishes the dev users' tokens
 to any page on this machine's loopback names, and the log says so; tokens with `admin` or `domain` are never listed.
 

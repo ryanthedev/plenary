@@ -48,7 +48,7 @@ echo "COOKIE_KEY=$(openssl rand -hex 32)" >> deploy/.env
 
 **Dev tokens are for local use only.** Anyone holding a token is that user; there is no expiry or sign-in. Never
 set them on a server others can reach. The served page's dev sign-in menu (`GET /auth/dev`, which publishes the
-tokens of users without `admin` or `domain`) is on only when the server binds a loopback `HOST`, Google sign-in is not
+tokens of users none of whose tokens has `admin` or `domain`) is on only when the server binds a loopback `HOST`, `PUBLIC_URL` (if set) is a loopback name, Google sign-in is not
 configured and the node is a gateway: in the container (`HOST=0.0.0.0`) it is always off, and the log says why. The tokens
 still work for a socket or `POST /boards`. To use them, put a value in `deploy/.env` with single quotes around the
 JSON, and make up your own token strings:

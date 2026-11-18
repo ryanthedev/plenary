@@ -259,15 +259,20 @@ const LOOPBACK_HOSTS = ["127.0.0.1", "::1", "[::1]", "localhost"];
  * Who may use the served page's dev sign-in menu (GET /auth/dev, which publishes dev tokens): only a local run. Returns the
  * reason it must be OFF, or null when it may be on: no user to offer (a token with `admin` or a `domain` is never
  * offered), a bind host that is not loopback, Google sign-in configured, or a node with no gateway role.
- * @param {{ users: number, host: string, google: boolean, gateway: boolean }} o
+ * `publicHost`: the hostname of PUBLIC_URL when it is set (a public name means a reverse proxy or a real deployment).
+ * @param {{ users: number, host: string, google: boolean, gateway: boolean, publicHost?: string | null }} o
  */
-export function devMenuOff({ users, host, google, gateway }) {
+export function devMenuOff({ users, host, google, gateway, publicHost = null }) {
   if (!gateway) return "this node has no gateway role";
   if (!users) return "no dev token is offerable (tokens with admin or a domain never are)";
   if (!LOOPBACK_HOSTS.includes(String(host).toLowerCase())) return `HOST=${String(host).slice(0, 64)} is not a loopback address`;
+  if (publicHost && !LOOPBACK_HOSTS.includes(publicHost.toLowerCase())) return `PUBLIC_URL (${publicHost.slice(0, 64)}) is not a loopback name`;
   if (google) return "Google sign-in is configured";
   return null;
 }
+
+/** The hostname of a PUBLIC_URL value, or null when unset or not a URL. */
+const publicHostOf = v => { try { return v ? new URL(v).hostname : null; } catch { return null; } };
 
 /** @param {Record<string, string|undefined>} env @param {{ fetch?: typeof fetch }} [deps] tests pass a stub fetch for Google */
 export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write, hostname, adapters } = {}) {
@@ -319,9 +324,11 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
     ? googleOidc({ clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET, redirectUri, fetch: fetchFn })
     : null;
   log.info("sign-in", { google: !!oidc, devTokens: dev.enabled, cluster });
+  if (!!env.GOOGLE_CLIENT_ID !== !!env.GOOGLE_CLIENT_SECRET)
+    log.warn(`Google sign-in is half configured: ${env.GOOGLE_CLIENT_ID ? "GOOGLE_CLIENT_SECRET" : "GOOGLE_CLIENT_ID"} is missing, so it stays off`);
 
   let devBoard = null, devMenu = null;
-  if (dev.enabled && !roles.gateway) log.info("dev tokens are set but this node has no gateway: no dev board here");
+  if (dev.enabled && !roles.gateway) log.warn("dev tokens are on, but the dev sign-in menu (GET /auth/dev) is OFF: " + devMenuOff({ users: 1, host: env.HOST || "127.0.0.1", google: !!oidc, gateway: false }) + " (no dev board on this node)");
   else if (dev.enabled) {
     // Reuse the dev board across restarts (the Registry has no list call to find it by).
     const devFile = join(dataDir, "dev-board.json");
@@ -366,14 +373,16 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
       catch (err) { if (err?.code !== "bad-request") throw err; log.error("dev token domain skipped", { domain, err }); }
     }
     // The dev sign-in menu: each name once, with the role it is actually granted (the highest across its tokens). A token
-    // with admin or a domain is a tenant admin or a Workspace member: never published.
+    // with admin or a domain is a tenant admin or a Workspace member. Identity is per name (dev:<name>), so a name that ANY
+    // token flags admin or gives a domain is never published, whatever its other tokens say.
+    const privileged = new Set(Object.values(tokens).filter(t => t && (t.admin === true || t.domain)).map(t => t.name));
     const offered = new Map();
     for (const [token, t] of Object.entries(tokens)) {
-      if (!t || typeof t.name !== "string" || !t.name || t.admin === true || t.domain || offered.has(t.name)) continue;
+      if (!t || typeof t.name !== "string" || !t.name || privileged.has(t.name) || offered.has(t.name)) continue;
       offered.set(t.name, { name: t.name, token, role: best.get("dev:" + t.name) });
     }
     const host = env.HOST || "127.0.0.1";
-    const off = devMenuOff({ users: offered.size, host, google: !!oidc, gateway: roles.gateway });
+    const off = devMenuOff({ users: offered.size, host, google: !!oidc, gateway: roles.gateway, publicHost: publicHostOf(env.PUBLIC_URL) });
     if (off) log.warn("dev tokens are on, but the dev sign-in menu (GET /auth/dev) is OFF: " + off, { host });
     else {
       devMenu = { board: board.id, users: [...offered.values()], hosts: LOOPBACK_HOSTS };

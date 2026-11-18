@@ -223,3 +223,54 @@ test("a Registry that cannot answer publishes nothing (fails closed)", async () 
     expect((await get(app)).status).toBe(503);
   } finally { await app.stop(); }
 });
+
+test("a Registry that fails at start turns the menu OFF with one warn line; the start does not throw (cluster fakes)", async () => {
+  const { sqliteStore } = await import("../../server/store/sqlite.js");
+  const { sqliteRegistry } = await import("../../server/registry/sqlite.js");
+  const { memoryBus } = await import("../../server/bus/memory.js");
+  const lines = [];
+  const adapters = {
+    postgresStore: async () => sqliteStore({ path: join(tempDir(), "p.db") }),
+    postgresRegistry: async () => ({ ...sqliteRegistry({ path: join(tempDir(), "r.db") }), tenantAdminsAmong: async () => { throw new Error("relation is gone"); } }),
+    natsBus: async () => memoryBus({}),
+  };
+  const app = await start({ PLENARY_DATA_DIR: tempDir(), PORT: "0", LOG_LEVEL: "warn", DATABASE_URL: "postgres://x@127.0.0.1:1/p", NATS_URL: "nats://127.0.0.1:1", COOKIE_KEY: "c".repeat(32), PLENARY_DEV_TOKENS: TOK }, { adapters, write: l => lines.push(l) });
+  try {
+    expect((await get(app)).status).toBe(404);
+    const got = lines.join("");
+    expect(got.split("\n").filter(l => l.includes("dev sign-in menu") && l.includes("OFF: the Registry could not say who is a tenant admin")).length).toBe(1);
+    expect(got).not.toContain("dev sign-in menu is ON");
+  } finally { await app.stop(); }
+});
+
+test("a Registry that throws at request time: 503 and a short 'Registry failed' warn", async () => {
+  const { httpRoutes } = await import("../../server/auth/http.js");
+  const { memoryRegistry } = await import("../../server/auth/registry.js");
+  const { sessions } = await import("../../server/auth/session.js");
+  const { tenancy } = await import("../../server/auth/tenancy.js");
+  const { devAuth } = await import("../../server/auth/dev.js");
+  const registry = { ...memoryRegistry({ now: Date.now }), tenantAdminsAmong: async () => { throw new Error("SECRET connection string"); } };
+  const warns = [];
+  const handle = httpRoutes({ registry, sessions: await sessions({ key: "s".repeat(32) }), tenancy: tenancy({ registry }), dev: devAuth({ enabled: true, tokens: { "SECRET-t": { name: "ada" } } }),
+    config: { cookieKey: "k".repeat(32), postLoginUrl: "http://localhost:1/", boardUrl: "http://localhost:1/?board={board}", publicUrl: "http://localhost:1",
+      devSignIn: { board: "b-1", users: [{ name: "ada", token: "SECRET-t", role: "owner" }], hosts: ["localhost"] } },
+    log: { warn: (m, f) => warns.push([m, f]) } });
+  expect((await handle(new Request("http://localhost:1/auth/dev", { headers: { host: "localhost:1" } }))).status).toBe(503);
+  expect(warns.map(w => w[0])).toEqual(["dev sign-in menu: the Registry failed; answering 503"]);
+  expect(JSON.stringify(warns)).not.toMatch(/SECRET|stack/);
+});
+
+test("the Registry gets the bound so it can cancel its own query (timeoutMs is passed through)", async () => {
+  const { httpRoutes } = await import("../../server/auth/http.js");
+  const { memoryRegistry } = await import("../../server/auth/registry.js");
+  const { sessions } = await import("../../server/auth/session.js");
+  const { tenancy } = await import("../../server/auth/tenancy.js");
+  const { devAuth } = await import("../../server/auth/dev.js");
+  let seen;
+  const registry = { ...memoryRegistry({ now: Date.now }), tenantAdminsAmong: async (u, o) => { seen = o; return []; } };
+  const handle = httpRoutes({ registry, sessions: await sessions({ key: "s".repeat(32) }), tenancy: tenancy({ registry }), dev: devAuth({ enabled: true, tokens: { t: { name: "ada" } } }),
+    config: { cookieKey: "k".repeat(32), postLoginUrl: "http://localhost:1/", boardUrl: "http://localhost:1/?board={board}", publicUrl: "http://localhost:1",
+      devSignIn: { board: "b-1", users: [{ name: "ada", token: "t", role: "owner" }], hosts: ["localhost"], waitMs: 1234 } } });
+  expect((await handle(new Request("http://localhost:1/auth/dev", { headers: { host: "localhost:1" } }))).status).toBe(200);
+  expect(seen).toEqual({ timeoutMs: 1234 });
+});

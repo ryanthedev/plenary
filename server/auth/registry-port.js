@@ -52,7 +52,7 @@ export const mint = {
  *   tenant(id: string): Promise<Tenant|null>,
  *   tenantByDomain(domain: string): Promise<Tenant|null>,
  *   addTenantAdmin(tenant: string, user: string): Promise<void>,
- *   tenantAdminsAmong(users: string[]): Promise<string[]>,   // those of `users` who are an admin of ANY tenant (the dev sign-in menu never offers one)
+ *   tenantAdminsAmong(users: string[], o?: { timeoutMs?: number }): Promise<string[]>,   // those of `users` who are an admin of ANY tenant (the dev sign-in menu never offers one)
  *   createBoard(o: { tenant: string, title?: string, memberRole?: Role|null }): Promise<Board>,
  *   board(id: string): Promise<Board|null>,
  *   setGrant(board: string, user: string, role: Role|null): Promise<void>,   // rejects code "last-owner" (atomic)

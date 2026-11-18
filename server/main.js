@@ -349,11 +349,15 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
       offered.set(t.name, { name: t.name, token, role: best.get("dev:" + t.name) });
     }
     // The same Registry filter the route runs per request (server/auth/http.js), so the count below is true at start.
+    // A Registry that cannot answer turns the menu OFF with one warn line; it never stops the start.
+    let registryDown = null;
     if (offered.size) {
-      const admins = new Set(await registry.tenantAdminsAmong([...offered.keys()].map(n => "dev:" + n)));
-      for (const n of [...offered.keys()]) if (admins.has("dev:" + n)) { offered.delete(n); log.warn(`dev sign-in menu: ${n} is a tenant admin in the registry, so it is not offered`); }
+      try {
+        const admins = new Set(await registry.tenantAdminsAmong([...offered.keys()].map(n => "dev:" + n), { timeoutMs: 5000 }));
+        for (const n of [...offered.keys()]) if (admins.has("dev:" + n)) { offered.delete(n); log.warn(`dev sign-in menu: ${n} is a tenant admin in the registry, so it is not offered`); }
+      } catch (err) { registryDown = "the Registry could not say who is a tenant admin"; log.debug("dev sign-in menu: the admin check failed", { err }); }
     }
-    off = devMenuOff({ users: offered.size, host, google: !!oidc, gateway: roles.gateway, publicHost: publicHostOf(env.PUBLIC_URL) });
+    off = registryDown ?? devMenuOff({ users: offered.size, host, google: !!oidc, gateway: roles.gateway, publicHost: publicHostOf(env.PUBLIC_URL) });
   }
   if (dev.enabled && !roles.gateway) log.warn("dev tokens are on, but the dev sign-in menu (GET /auth/dev) is OFF: " + off + " (no dev board on this node)", { host });
   else if (dev.enabled) {

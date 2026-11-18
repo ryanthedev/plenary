@@ -237,9 +237,16 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       const r = await one(db, `SELECT id FROM ${T} WHERE domain = $1`, [domain.toLowerCase()]);
       return r ? getTenant(db, r.id) : null;
     },
-    async tenantAdminsAmong(users) {
+    async tenantAdminsAmong(users, { timeoutMs } = {}) {
       ready();
-      const rows = await db.unsafe(`SELECT DISTINCT member FROM ${A} WHERE member IN (SELECT jsonb_array_elements_text($1::jsonb))`, [JSON.stringify(users.filter(key))]);
+      const us = users.filter(key);
+      if (!us.length) return [];
+      const ask = q => q.unsafe(`SELECT DISTINCT member FROM ${A} WHERE member = ANY($1::text[])`, [us]);
+      // With a bound, the server itself cancels the query when it runs over (statement_timeout, this transaction only), so
+      // a caller that gave up does not leave it holding a pool slot until the pool's own limit.
+      const rows = Number.isSafeInteger(timeoutMs) && timeoutMs > 0
+        ? await db.begin(async tx => { await tx.unsafe("SELECT set_config('statement_timeout', $1, true)", [String(timeoutMs)]); return ask(tx); })
+        : await ask(db);
       return rows.map(r => r.member);
     },
     async addTenantAdmin(tenant, user) {

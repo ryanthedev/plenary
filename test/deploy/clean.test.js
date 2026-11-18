@@ -258,13 +258,32 @@ test("a directory tree crossing a device boundary is kept", () => {
 test("the total time limit skips candidates after the deadline", () => {
   const w = world();
   const first = entry(w.tempDir, "plenary-test-time01");
-  entry(w.tempDir, "plenary-test-time02");
-  let clockReads = 0;
-  const r = clean({ ...w, now: LATER(), yes: true, maxTimeMs: 10, clock: () => ++clockReads <= 7 ? 0 : 11,
+  const second = entry(w.tempDir, "plenary-test-time02");
+  const parked = join(w.tempDir, ".plen-deleting-plenary-test-time01");
+  const r = clean({ ...w, now: LATER(), yes: true, maxTimeMs: 10,
+    clock: () => existsSync(first) || existsSync(parked) ? 0 : 11,
     openUnderFn: () => "" });
-  expect(r.items.map(i => [i.status, i.why])).toEqual([["removed", ""], ["kept", "skipped (time limit)"]]);
+  expect(r.items.map(i => [i.status, i.why])).toEqual([
+    ["removed", ""], ["kept", "skipped (time limit)"],
+  ]);
   expect(existsSync(first)).toBe(false);
+  expect(existsSync(second)).toBe(true);
+  expect(existsSync(parked)).toBe(false);
   expect(readdirSyncNames(w.tempDir)).toEqual(["plenary-test-time02"]);
+});
+
+test("an expired total time limit keeps every candidate without removing anything", () => {
+  const w = world();
+  const first = entry(w.tempDir, "plenary-test-time11");
+  const second = entry(w.tempDir, "plenary-test-time12");
+  const fakeTime = 0;
+  const r = clean({ ...w, now: LATER(), yes: true, maxTimeMs: 0, clock: () => fakeTime,
+    openUnderFn: () => "" });
+  expect(r.items.map(i => [i.status, i.why])).toEqual([
+    ["kept", "skipped (time limit)"], ["kept", "skipped (time limit)"],
+  ]);
+  expect(existsSync(first) && existsSync(second)).toBe(true);
+  expect(readdirSyncNames(w.tempDir)).toEqual(["plenary-test-time11", "plenary-test-time12"]);
 });
 
 test("a stale .env file inside an exact temp candidate does not prevent cleanup", () => {

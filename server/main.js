@@ -357,7 +357,8 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
         for (const n of [...offered.keys()]) if (admins.has("dev:" + n)) { offered.delete(n); log.warn(`dev sign-in menu: ${n} is a tenant admin in the registry, so it is not offered`); }
       } catch (err) {
         // Why, in a few characters: an error code or name (never its message, which may quote a URL), so the default log level shows the cause.
-        const code = [err?.code, err?.errno, err?.name].find(c => typeof c === "string" && /^[\w.:-]{1,40}$/.test(c)) ?? "error";
+        // The 5-character Postgres SQLSTATE (errno, e.g. 42P01) first, then code, then name; letters, digits and "_" only.
+        const code = [/^[0-9A-Z]{5}$/.test(err?.errno) ? err.errno : null, err?.code, err?.name].find(c => typeof c === "string" && /^[A-Za-z0-9_]{1,40}$/.test(c)) ?? "error";
         registryDown = `the Registry could not say who is a tenant admin (${code})`;
         log.debug("dev sign-in menu: the admin check failed", { err });
       }

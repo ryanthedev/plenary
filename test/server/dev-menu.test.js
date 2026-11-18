@@ -231,14 +231,14 @@ test("a Registry that fails at start turns the menu OFF with one warn line; the 
   const lines = [];
   const adapters = {
     postgresStore: async () => sqliteStore({ path: join(tempDir(), "p.db") }),
-    postgresRegistry: async () => ({ ...sqliteRegistry({ path: join(tempDir(), "r.db") }), tenantAdminsAmong: async () => { throw Object.assign(new Error("connect to postgres://u:SECRETPW@h failed"), { code: "ECONNREFUSED" }); } }),
+    postgresRegistry: async () => ({ ...sqliteRegistry({ path: join(tempDir(), "r.db") }), tenantAdminsAmong: async () => { throw Object.assign(new Error("connect to postgres://u:SECRETPW@h failed"), { code: "ERR_POSTGRES_SERVER_ERROR", errno: "42P01" }); } }),
     natsBus: async () => memoryBus({}),
   };
   const app = await start({ PLENARY_DATA_DIR: tempDir(), PORT: "0", LOG_LEVEL: "warn", DATABASE_URL: "postgres://x@127.0.0.1:1/p", NATS_URL: "nats://127.0.0.1:1", COOKIE_KEY: "c".repeat(32), PLENARY_DEV_TOKENS: TOK }, { adapters, write: l => lines.push(l) });
   try {
     expect((await get(app)).status).toBe(404);
     const got = lines.join("");
-    expect(got.split("\n").filter(l => l.includes("dev sign-in menu") && l.includes("OFF: the Registry could not say who is a tenant admin (ECONNREFUSED)")).length).toBe(1);
+    expect(got.split("\n").filter(l => l.includes("dev sign-in menu") && l.includes("OFF: the Registry could not say who is a tenant admin (42P01)")).length).toBe(1);
     expect(got).not.toContain("SECRETPW");
     expect(got).not.toContain("dev sign-in menu is ON");
   } finally { await app.stop(); }
@@ -291,4 +291,49 @@ test("a fractional waitMs is rounded to whole ms before it reaches the Registry 
     await handle(new Request("http://localhost:1/auth/dev", { headers: { host: "localhost:1" } }));
   }
   expect(seen).toEqual([1235, 1, 3]);
+});
+
+test("a huge waitMs is clamped to 2^31-1 (a bigger delay would overflow the timer and fire at once)", async () => {
+  const { httpRoutes } = await import("../../server/auth/http.js");
+  const { memoryRegistry } = await import("../../server/auth/registry.js");
+  const { sessions } = await import("../../server/auth/session.js");
+  const { tenancy } = await import("../../server/auth/tenancy.js");
+  const { devAuth } = await import("../../server/auth/dev.js");
+  const seen = [];
+  let slow = false;
+  const registry = { ...memoryRegistry({ now: Date.now }), tenantAdminsAmong: async (u, o) => { seen.push(o.timeoutMs); if (slow) await Bun.sleep(30); return []; } };
+  for (const waitMs of [2 ** 31, 2 ** 40, Infinity]) {
+    const handle = httpRoutes({ registry, sessions: await sessions({ key: "s".repeat(32) }), tenancy: tenancy({ registry }), dev: devAuth({ enabled: true, tokens: { t: { name: "ada" } } }),
+      config: { cookieKey: "k".repeat(32), postLoginUrl: "http://localhost:1/", boardUrl: "http://localhost:1/?board={board}", publicUrl: "http://localhost:1",
+        devSignIn: { board: "b-1", users: [{ name: "ada", token: "t", role: "owner" }], hosts: ["localhost"], waitMs } } });
+    slow = true;   // a 30 ms Registry must not be cut off by an overflowed timer
+    const res = await handle(new Request("http://localhost:1/auth/dev", { headers: { host: "localhost:1" } }));
+    expect(res.status).toBe(200);   // answered in time: an overflowed timer would have given 503
+  }
+  expect(seen).toEqual([2 ** 31 - 1, 2 ** 31 - 1, 3000]);
+});
+
+test("the start-up OFF warn's cause: a SQLSTATE first, then code, then name; a hand-built code with ':' or '.' (user:pw) never gets through", async () => {
+  const { sqliteStore } = await import("../../server/store/sqlite.js");
+  const { sqliteRegistry } = await import("../../server/registry/sqlite.js");
+  const { memoryBus } = await import("../../server/bus/memory.js");
+  const cases = [
+    [{ code: "ERR_POSTGRES_SERVER_ERROR" }, "(ERR_POSTGRES_SERVER_ERROR)"],
+    [{ code: "user:pw" }, "(Error)"], [{ code: "a.b" }, "(Error)"], [{ code: "ok_code", errno: "not a state" }, "(ok_code)"],
+    [{ errno: "08006", code: "x" }, "(08006)"],
+  ];
+  for (const [props, want] of cases) {
+    const lines = [];
+    const adapters = {
+      postgresStore: async () => sqliteStore({ path: join(tempDir(), "p.db") }),
+      postgresRegistry: async () => ({ ...sqliteRegistry({ path: join(tempDir(), "r.db") }), tenantAdminsAmong: async () => { throw Object.assign(new Error("boom"), props); } }),
+      natsBus: async () => memoryBus({}),
+    };
+    const app = await start({ PLENARY_DATA_DIR: tempDir(), PORT: "0", LOG_LEVEL: "warn", DATABASE_URL: "postgres://x@127.0.0.1:1/p", NATS_URL: "nats://127.0.0.1:1", COOKIE_KEY: "c".repeat(32), PLENARY_DEV_TOKENS: TOK }, { adapters, write: l => lines.push(l) });
+    try {
+      const got = lines.join("");
+      expect([JSON.stringify(props), got.includes(`tenant admin ${want}`)]).toEqual([JSON.stringify(props), true]);
+      expect(got).not.toContain("user:pw");
+    } finally { await app.stop(); }
+  }
 });

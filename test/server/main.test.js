@@ -196,7 +196,8 @@ test("kill -9 mid-stream, restart: every acked op is present, at its seq, once; 
       for (const m of resends()) s.send(m);
       const pump = setInterval(() => { record(); for (let k = 0; k < 5 && unacked().length < MAX_UNACKED; k++) { const m = op(++counter); sent.push(m); try { s.send(m); } catch { /* socket died with the server */ } } }, 5);
       const before = acked.size;
-      await until(() => { record(); return acked.size >= before + 100; }, "100 more acks", 15000);
+      // A backstop (no speed is asserted): 15 s timed out once with the machine at load average 20-40 (other loops' runs).
+      await until(() => { record(); return acked.size >= before + 100; }, "100 more acks", 60_000);
       cur.p.child.kill("SIGKILL");                // mid-stream: ops are in flight in both directions
       await cur.p.child.exited; clearInterval(pump);
       // The dead holder's lease, as it left it: its last renew set expiresAt = then + its ttl, so what remains is at most
@@ -233,7 +234,7 @@ test("kill -9 mid-stream, restart: every acked op is present, at its seq, once; 
     expect(acked.size).toBeGreaterThanOrEqual(300);                                       // true by construction (100 a round; > 256, so ann:1 is out of the op-id window below)
     for (const [id, at] of acked) expect([id, seqOf.get(id)]).toEqual([id, at]);          // every acked op, at its acked seq
   } finally { cur.p.child.kill("SIGKILL"); }
-}, 150000);   // up to three lease waits (ttl + 30 s backstop each) on top of the run
+}, 300000);   // up to three lease waits (ttl + 30 s backstop each) and three 60 s ack backstops on top of the run
 
 test("main.js: PLENARY_MAX_CONNS_PER_USER sets the per-user connection cap", async () => {
   const p = spawn({ PLENARY_DATA_DIR: tempDir(), PLENARY_DEV_TOKENS: devTokens({ ann: "editor" }), PLENARY_MAX_CONNS_PER_USER: "2" });

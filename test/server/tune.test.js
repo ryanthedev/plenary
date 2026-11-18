@@ -185,9 +185,11 @@ test("here: bounded with many viewers: at most hereMax writers listed (counts pa
   const viewers = await Promise.all(Array.from({ length: 12 }, () => r.sock()));
   viewers.forEach((s, i) => s.send(hello(r, "viewer", { client: "v" + i })));
   await until(() => viewers.every(s => s.msgs.some(m => m.t === "welcome")), "viewers welcomed");
-  await viewers[0].next(m => m.t === "here" && m.viewers === 12 && m.writerCount === 5, "the here with everyone");
-  const h = lastList(viewers[0]);                                         // later count-only `here`s keep this list
-  expect(h.writerCount).toBe(5);
+  const everyone = await viewers[0].next(m => m.t === "here" && m.viewers === 12 && m.writerCount === 5, "the here with everyone");
+  expect(everyone.writerCount).toBe(5);
+  // The list is the last message that carries one; its own count may be older (the 4th and 5th writers change the
+  // count but not the three listed, so the here with everyone is count-only: a flake when read as `h.writerCount`).
+  const h = lastList(viewers[0]);
   expect(h.writers.length).toBe(3);
   expect(h.writers[0]).toEqual({ user: "dev:owner", name: "owner", role: "owner" });   // owners and editors first
   expect(h.writers.slice(1).map(w => w.role)).toEqual(["editor", "editor"]);

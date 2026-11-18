@@ -156,12 +156,18 @@ test("§ Pacing: a ninth writer connection per (user, board) gets `limit` and is
 });
 
 test("§ Pacing: over-rate ops wait in the gateway in order and are all acked; past the queue cap the connection gets `unavailable`", async () => {
-  const r = await rig({ limits: { opRate: 50, opBurst: 5, maxOpQueue: 30 } });
+  // The gateway's clock is virtual and starts frozen: the bucket refills only when the test says so, so "paced" is
+  // counted (exactly the burst gets through, the rest waits) and never timed.
+  let clock = 1_000_000;
+  const r = await rig({ now: () => clock, limits: { opRate: 50, opBurst: 5, maxOpQueue: 30 } });
   const s = await r.sock(); s.send(hello(r, "editor")); await s.next(m => m.t === "welcome");
-  const t0 = Date.now();
   for (let i = 1; i <= 25; i++) s.send(op("editor", i, rect("p" + i)));
-  await s.next(m => m.t === "ack" && m.id === "editor:25", "the last ack", 10_000);
-  expect(Date.now() - t0).toBeGreaterThan(300);                        // 20 over the burst at 50/s: ≥ 400 ms, paced
+  await s.next(m => m.t === "ack" && m.id === "editor:5", "the burst's last ack", 10_000);
+  await r.bus.flush(); await r.idle(); await sleep(50);                // the settle for a negative: nothing more may come on a frozen clock
+  expect(s.msgs.filter(m => m.t === "ack").map(m => m.id)).toEqual(Array.from({ length: 5 }, (_, i) => `editor:${i + 1}`));
+  expect(await r.rawStore.lastSeq(r.ids.tenant, r.ids.board)).toBe(5);
+  // 20 over the burst at 50/s: the clock runs on (100 ms a poll) until the bucket has let them all through, in order.
+  await until(() => { clock += 100; return s.msgs.some(m => m.t === "ack" && m.id === "editor:25"); }, "the last ack", 10_000);
   const acks = s.msgs.filter(m => m.t === "ack");
   expect(acks.map(m => m.id)).toEqual(Array.from({ length: 25 }, (_, i) => `editor:${i + 1}`));
   expect(acks.map(m => m.seq)).toEqual(Array.from({ length: 25 }, (_, i) => i + 1));
@@ -177,8 +183,9 @@ test("a connection is closed with `auth` when its token's expiry passes; an expi
   // The expiry is stamped when verify runs (1-2 s ahead), not before the rig is built: on a loaded machine, building
   // the rig and saying hello took over a second, the token was already expired at hello, and the welcome never came
   // (bun's 5 s default timeout, manager t18m, 2026-11-12). `expired` switches to a past expiry for the second half.
+  // The gateway's clock runs 0.7 s ahead (`now`): the 1-2 s of the token's life left at verify is 0.3-1.3 s of waiting, and never less than the 0.3 s a hello needs.
   let expired = false;
-  const r = await rig({ wrapAuth: a => ({ ...a, verify: async t => { const id = await a.verify(t); return id && { ...id, exp: Math.floor(Date.now() / 1000) + (expired ? -1 : 2) }; } }) });
+  const r = await rig({ now: () => Date.now() + 700, wrapAuth: a => ({ ...a, verify: async t => { const id = await a.verify(t); return id && { ...id, exp: Math.floor(Date.now() / 1000) + (expired ? -1 : 2) }; } }) });
   const s = await r.sock(); s.send(hello(r, "editor")); await s.next(m => m.t === "welcome");
   expect((await s.whenClosed(5_000)).code).toBe(1008);
   expect(s.msgs.at(-1)).toMatchObject({ t: "error", code: "auth", message: "your sign-in expired" });
@@ -263,11 +270,12 @@ test("§ Pacing: an idle viewer that answers pings survives the idle timeout; a 
   const v = await r.sock(); v.send(hello(r, "viewer")); await v.next(m => m.t === "welcome");
   const raw = await rawSock(r.server.wsUrl); raw.send(hello(r, "viewer", { client: "raw" })); raw.read();
   await until(() => r.server.gateway.stats().conns === 2, "both connected");
-  const t0 = Date.now();
   await until(() => raw.ended, "the silent socket to be closed", 25000);
-  const after = (Date.now() - t0) / 1000;
-  expect(after).toBeGreaterThan(4);                                     // not at once: only after the idle timeout
-  await sleep(10_000);                                                  // past the timeout again for the idle viewer
+  // The viewer connected first and has been just as quiet for as long: had its pongs not counted it would have gone
+  // in the same sweep as the raw socket (and conns would be 0), so it is the pings that kept it. (The settle is for a
+  // negative: nothing more may close.)
+  await until(() => r.server.gateway.stats().conns <= 1, "the silent socket's close to reach the gateway", 5000);
+  await sleep(250);
   expect(v.closed).toBe(null);
   expect(r.server.gateway.stats().conns).toBe(1);
   await r.stop();

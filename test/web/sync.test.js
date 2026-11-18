@@ -10,6 +10,11 @@ import { virtualClock } from "../../web/adapters/clock/virtual.js";
 import { browserClock } from "../../web/adapters/clock/browser.js";
 import { PRESENCE_BACKLOG_BYTES } from "../../web/ports/transport.js";
 
+/** Polls (real timers) until `fn()` is truthy; a failing test stops waiting at `ms`, a passing one never waits for it. */
+async function until(fn, what, ms = 15_000) {
+  for (const end = Date.now() + ms; !fn(); await new Promise(r => setTimeout(r, 5))) if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+}
+
 const USERS = {
   owner: { user: "u0", role: "owner" }, ed: { user: "u1", role: "editor" }, view: { user: "u2", role: "viewer" },
   ann: { user: "u3", role: "annotator" }, ann2: { user: "u4", role: "annotator" },
@@ -787,10 +792,11 @@ test("real timers (the page's clock, browserClock): a refusal resyncs after the 
   const net = localRoom({ users: USERS, auto: true });
   const o = new Editor(), so = bindEditor(o, { transport: net.join(), token: "owner", board: "b1", clock: browserClock() });
   const v = new Editor(), sv = bindEditor(v, { transport: net.join(), token: "view", board: "b1", clock: browserClock() });
-  await new Promise(r => setTimeout(r, 50));
+  await until(() => so.status === "live" && sv.status === "live", "both bindings live");
   drag(o, "diamond", { x: 0, y: 0 }, { x: 50, y: 50 });
   drag(v, "rectangle", { x: 100, y: 100 }, { x: 200, y: 200 });
-  await new Promise(r => setTimeout(r, 1200));
+  // The refusal's backoff runs on real timers (~0.25-0.5 s): wait for the outcome, not for a guessed time.
+  await until(() => sv.resets === 2 && sv.status === "live" && sv.pending === 0 && so.pending === 0, "the refused viewer to resync and both to settle");
   expect(sv.resets).toBe(2);
   expectConverged(net, [{ editor: o, sync: so }, { editor: v, sync: sv }]);
   so.close(); sv.close();

@@ -460,17 +460,23 @@ test("H1: nestedDeeperThan counts brackets outside strings, in one pass", async 
 });
 
 test("H1: a 30,000-deep op is refused before it is parsed, nothing is stored, and joins stay fast", async () => {
+  // "Before it is parsed" and "joins stay fast" are counted, not timed: the cliff is JSON.parse on a deep 180 KB frame
+  // (about 0.6 s each on the loop that serves everyone), so no frame this size may reach JSON.parse at all.
+  const realParse = JSON.parse, bigParses = [];
+  JSON.parse = (text, ...rest) => { if (typeof text === "string" && text.length > 100_000) bigParses.push(text.length); return realParse(text, ...rest); };
+  try { await deepOpTest(); } finally { JSON.parse = realParse; }
+  expect(bigParses).toEqual([]);
+});
+async function deepOpTest() {
   const r = await rig();
   // Built as text: JSON.stringify of something this deep is the very cliff under test (about 0.6 s a go).
   const deepOp = (id, el, n) => `{"t":"op","id":"${id}","sentAt":0,"stream":"notes","op":{"elements":[{"id":"${el}","version":1,"versionNonce":1,"type":"rectangle","customData":${'{"a":'.repeat(n)}1${"}".repeat(n)}}]}}`;
   const a = await r.sock(), watcher = await r.sock();
   a.send(hello(r, "annotator", { client: "a" })); watcher.send(hello(r, "viewer", { client: "w" }));
   await a.next(m => m.t === "welcome"); await watcher.next(m => m.t === "welcome");
-  const started = performance.now();
   for (let i = 1; i <= 6; i++) a.send(deepOp(`a:${i}`, "deep" + i, 30_000));                     // 180 KB each, valid JSON
   await a.next(m => m.id === "a:6");
   expect(a.msgs.filter(m => m.t === "error").map(m => [m.id, m.code])).toEqual([1, 2, 3, 4, 5, 6].map(i => [`a:${i}`, "bad-op"]));
-  expect(performance.now() - started).toBeLessThan(1500);                // the verifier measured 8.4 s to store them
   await r.bus.flush(); await r.idle();
   expect(r.inbox.filter(m => m.msg?.t === "op")).toEqual([]);            // the room never saw one
   expect(await r.rawStore.lastSeq(r.ids.tenant, r.ids.board)).toBe(0);
@@ -481,16 +487,14 @@ test("H1: a 30,000-deep op is refused before it is parsed, nothing is stored, an
   // (The refusal comes from the gateway and the ack from the room after a durable append: either may arrive first.)
   await a.next(m => m.id === "a:8"); await a.next(m => m.t === "ack" && m.id === "a:7");
   expect(a.msgs.filter(m => m.id === "a:7" || m.id === "a:8").map(m => `${m.t} ${m.id}`).sort()).toEqual(["ack a:7", "error a:8"]);
-  // A join, and /health at the same moment, stay fast (the verifier measured 2.1 s each).
-  const t0 = performance.now();
+  // A join, and /health at the same moment, are answered with the deep ops still in flight (the verifier measured 2.1 s each).
   const [late, health] = await Promise.all([r.sock().then(async s => { s.send(hello(r, "viewer", { client: "late" })); await s.next(m => m.t === "entries"); return s; }), r.health()]);
-  expect(performance.now() - t0).toBeLessThan(500);
   expect(health.status).toBe(200);
   expect(late.msgs.filter(noHere).map(m => m.t)).toEqual(["welcome", "entries"]);
   expect(watcher.msgs.filter(m => m.t === "entries").length).toBe(1);    // only the one valid op was broadcast
   expect(a.ws.readyState).toBe(WebSocket.OPEN);
   await r.stop();
-});
+}
 
 test("H1: catch-up is right for every `since`, and the same bytes go to every joiner", async () => {
   const r = await rig();

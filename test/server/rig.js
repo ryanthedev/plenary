@@ -85,7 +85,11 @@ export async function sock(url) {
   const s = { ws, msgs: [], raw: [], closed: null, send: m => ws.send(typeof m === "string" || m instanceof Uint8Array ? m : JSON.stringify(m)) };
   ws.onmessage = e => { s.raw.push(e.data); try { s.msgs.push(JSON.parse(e.data)); } catch { s.msgs.push({ unparsable: true }); } };
   const done = new Promise(res => { ws.onclose = e => { s.closed = { code: e.code, reason: e.reason }; res(s.closed); }; });
-  s.whenClosed = (ms = 30_000) => Promise.race([done, sleep(ms).then(() => { throw new Error("socket did not close"); })]);
+  s.whenClosed = (ms = 30_000) => {
+    let t;                                                   // cleared when the socket closes first, so no 30 s timer outlives the call
+    const late = new Promise((_, rej) => { t = setTimeout(() => rej(new Error("socket did not close")), ms); });
+    return Promise.race([done, late]).finally(() => clearTimeout(t));
+  };
   // Backstops, not expectations: generous so a loaded machine (other suites running) slows a test, not fails it.
   s.next = (pred, what = "a message", ms = 30_000) => until(() => s.msgs.find(pred), what, ms);
   s.close = () => { ws.close(); return done; };

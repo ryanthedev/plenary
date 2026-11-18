@@ -7,9 +7,31 @@ is not chosen yet; see License). The goal: a few presenters draw, thousands anno
 people watch live across several regions. It grew out of [herdr-draw](https://github.com/ryanthedev/herdr-draw)
 and shares its drawing core.
 
-**That is the goal, not today's state.** The project is early. Nothing has been load-tested and nothing is
-published (no packages, no images, no hosted instance). The server and the web page both run, but **the web page
-does not talk to the server yet**. The next section says exactly what exists.
+**That is the goal, not today's state.** The project is early. Nothing is published (no packages, no images, no
+hosted instance), and nothing has been tested at the 100k target. The server serves the canvas page, and the page
+talks to it over a WebSocket. The Status section says exactly what exists.
+
+## Try it
+
+You need [Bun](https://bun.sh) 1.4.4 and `bun install --frozen-lockfile` once. Then one command (Postgres, NATS and a
+Google account are not needed):
+
+```sh
+PORT=8099 PLENARY_DATA_DIR="$(mktemp -d)" \
+PLENARY_DEV_TOKENS='{"dev-ada":{"name":"ada","role":"owner"},"dev-bo":{"name":"bo","role":"editor"}}' \
+bun server/main.js
+```
+
+Open one URL per user, each in its own browser tab (a tab keeps its own identity):
+
+- **ada (owner):** <http://localhost:8099/?as=ada>
+- **bo (editor):** <http://localhost:8099/?as=bo>
+
+Draw in one tab and the shape appears in the other. With no `?board=` you land on the dev board; with no `?as=` the
+sign-in screen lists the dev users as buttons. `PORT=0` picks a free port instead (read it from the `server
+listening` log line). Dev sign-in exists only while `PLENARY_DEV_TOKENS` is set: without it there is no `/auth/dev`
+route, no buttons, and `?as=` is ignored. **Anyone who can reach the port can read the dev tokens**, so keep the
+default `HOST=127.0.0.1`.
 
 ## Status
 
@@ -31,28 +53,20 @@ does not talk to the server yet**. The next section says exactly what exists.
 | Drawing core | The editor, model, rendering and merge rules, copied from herdr-draw. | `packages/core/` |
 | Protocol | The v1.1 spec in code: envelope and codec, a client `Replica`, a reference `Room` (one sequencer per board), recovery from checkpoints, presence (cursors, selections, laser, emotes), comment and reaction records, settings compare-and-set. Clients converge in tests. | `packages/protocol/`, `test/convergence.test.js`, `test/recovery.test.js`, `test/presence.test.js`, `test/records.test.js`, `test/v11.test.js` |
 | Single-node server | One Bun process: WebSocket gateway plus room host, SQLite op log and SQLite registry (boards and their ops survive a restart or `kill -9`), in-memory bus, local-disk blob store, structured JSON logs, `GET /health`. | `server/main.js`, `test/server/main.test.js` |
-| Sign-in | Google sign-in (OIDC) with a one-time code exchanged for a session token (`/auth/login`, `/auth/callback`, `/auth/exchange`, `/auth/logout`), mounted in the server. It is on only when `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are set; otherwise login, callback and exchange answer 503. A session token joins a board over the WebSocket and the socket closes when it expires. Optional dev tokens for local use. | `server/auth/`, `test/auth/`, `test/server/revocation.test.js` |
-| Admin API | `POST /boards`, invites, share links and grants over HTTP. Grant changes close live connections that lost their role. **See the tenant gap below.** | `server/auth/http.js`, `server/admin/boards.js`, `test/auth/http.test.js`, `test/server/main.test.js` |
-| Cluster adapters | Postgres store and registry, NATS bus, S3-compatible blobs. Each has its port's contract test, which CI's second job runs against real services. **The server does not use them yet** (see below). | `server/store/postgres.js`, `server/registry/postgres.js`, `server/bus/nats.js`, `server/blobs/s3.js`, `test/server/` |
-| Web canvas | The canvas UI from the design mock (tools, properties panel, layers, library, export, role gating, a connection pill). Boards run **inside the browser**: every tab of one browser on the same board edits together through a SharedWorker. | `web/index.html`, `web/app.js`, `test/web/` |
-| Collaboration UI | Avatars, others' cursors and selections, laser, emotes, reactions, comment threads, notes. Runs on a dev page over a fake port. | `web/collab/`, `web/collab/dev.html`, `test/web/collab/` |
-| Web edges | A WebSocket transport and the sign-in code exchange for the browser, each tested (the adapters against port contract tests). Not used by any page yet. | `web/adapters/`, `web/core/signin.js`, `test/web/adapters/`, `test/web/contracts/`, `test/web/core/signin.test.js` |
+| Sign-in | Google sign-in (OIDC) with a one-time code exchanged for a session token (`/auth/login`, `/auth/callback`, `/auth/exchange`, `/auth/logout`), mounted in the server. It is on only when `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are set; otherwise login, callback and exchange answer 503. A session token joins a board over the WebSocket and the socket closes when it expires. Dev tokens for local use (`PLENARY_DEV_TOKENS`): the served page offers them at `?as=<name>` and as buttons, and only while they are on (`GET /auth/dev`). | `server/auth/`, `test/auth/`, `test/server/revocation.test.js` |
+| Admin API | `POST /boards`, invites, share links and grants over HTTP. Grant changes close live connections that lost their role. A first tenant admin comes from "Creating a tenant" below. | `server/auth/http.js`, `server/admin/boards.js`, `test/auth/http.test.js`, `test/server/main.test.js` |
+| Cluster mode | `server/main.js` runs as a cluster node when both `DATABASE_URL` and `NATS_URL` are set: Postgres store and registry, NATS bus, one room host per board under a store lease with takeover, and `PLENARY_ROLES` to split gateway and host nodes. Blobs stay on local disk (nothing writes blobs yet); the S3 adapter is tested but not wired. Each adapter has its port's contract test, which CI's second job runs against real services. Exercised end to end only through the local rig and the tests. | `server/store/postgres.js`, `server/registry/postgres.js`, `server/bus/nats.js`, `server/blobs/s3.js`, `scripts/cluster-rig.js`, `test/server/` |
+| Web canvas | The canvas UI from the design mock (tools, properties panel, layers, library, export, role gating, a connection pill), **served by the server at `/`** and synced over `/ws`. `web/dev-main.html` is a dev-only copy whose boards run inside the browser. | `web/index.html`, `web/main.js`, `web/adapters/`, `test/web/` |
+| Collaboration UI | Avatars (people who can draw), a viewers count, others' cursors and selections, laser, emotes, reactions, comment threads, notes. In the served page over the board connection. | `web/adapters/dom/collab/`, `web/adapters/collab/sync.js`, `test/web/collab/` |
+| Web edges | The WebSocket transport, the sign-in code exchange and the dev sign-in menu, each tested (the adapters against port contract tests). All used by the served page. | `web/adapters/`, `web/core/signin.js`, `test/web/adapters/`, `test/web/contracts/`, `test/web/core/signin.test.js` |
+| Load client | `scripts/load/run.js` drives simulated editors, annotators and viewers against a board (or `--local` its own server) and writes a measured report. A local rig (`scripts/cluster-rig.js`) starts Postgres, NATS, several nodes and a load balancer. The 10k-client M2 gate has not been run. | `scripts/load/`, `scripts/cluster-rig.js`, `test/load/` |
 
 ### Not there yet (M2, planned)
 
-- **Web page to server:** the canvas page does not connect to the server, and the server does not serve `web/`
-  (`GET /` answers 404). So after a Google sign-in there is no page to land on.
-- **Collaboration in the main page:** the collaboration UI runs only on `web/collab/dev.html`, not in
-  `web/index.html`.
-- **Creating a tenant:** `POST /boards` needs a caller who is an admin of a tenant, and nothing in the running
-  server creates such a tenant yet (no HTTP route, no command). On a fresh server it answers 403 to everyone,
-  dev tokens included. The tests create the tenant directly in the registry. Planned: a first-admin bootstrap
-  (decided, not built yet).
-- **Cluster mode:** `server/main.js` composes only the SQLite, in-memory and local-disk adapters. Setting
-  `DATABASE_URL` or `NATS_URL` today only makes `COOKIE_KEY` required (and every node must use the same
-  value, because each node checks cookies and sessions signed by the others). Board leases, host takeover and the
-  gateway/host role split are not built.
-- **Load test and `/metrics`.**
+- **The 10k-client load test** (the M2 gate) and **`/metrics`**: the load client exists, no measured run is recorded
+  here and the server has no metrics endpoint.
+- **S3 blobs in the server:** `server/main.js` composes local-disk blobs in both modes.
+- **Multi-node deployment beyond the local rig:** the cluster Compose file in `deploy/` has not been built or run here.
 
 ## Repo layout
 
@@ -61,8 +75,8 @@ does not talk to the server yet**. The next section says exactly what exists.
 | `packages/core/` | herdr-draw's core, copied byte-identical. Not edited here (see below). |
 | `packages/protocol/` | The protocol as code: envelope, codec, `Replica` (client), `Room` (reference sequencer), presence, records, ports (interfaces for storage, bus, blobs and auth). |
 | `server/` | The server: gateway, room host, stores (SQLite, Postgres), buses (memory, NATS), blobs (disk, S3), registries, sign-in and admin. |
-| `web/` | The canvas page, painter, editor-to-replica sync, collaboration UI, and the browser's ports and adapters. |
-| `scripts/` | `dev-google.js`, a dev-only harness for checking Google sign-in by hand. Not the product server. |
+| `web/` | The canvas page (served by `server/`), painter, editor-to-replica sync, collaboration UI, and the browser's ports and adapters. |
+| `scripts/` | `admin-bootstrap.js` (first tenant admin), `load/` (load client), `cluster-rig.js` (local cluster), `dev-google.js` (a dev-only harness for checking Google sign-in by hand). None is the product server. |
 | `test/` | All tests (`bun test`). |
 | `deploy/` | Dockerfile and Compose files (see Docker). |
 | `docs/m2/` | The M2 plan, design mock, contracts and working reports. |
@@ -93,12 +107,13 @@ PLENARY_DEV_TOKENS='{"dev-token":{"name":"ann","role":"editor"}}' \
 bun server/main.js
 ```
 
+- **The canvas** is served at `/` (see "Try it" for dev sign-in URLs).
 - **`PORT=0`** picks a free port; the chosen port and the dev board's id are in the JSON log lines.
 - **Check it:** `GET /health` answers 200 with a small JSON body. The WebSocket is at `/ws`; the token goes in the
   first message (`hello`), never in a header or the URL. With the command above, a `hello` carrying `dev-token`
   and the dev board's id is welcomed as `dev:ann`.
-- **Dev tokens are for local use only.** Without `PLENARY_DEV_TOKENS` there is no dev board, and nothing else
-  can create a board yet (see "Creating a tenant"), so no client can join.
+- **Dev tokens are for local use only.** Without `PLENARY_DEV_TOKENS` there is no dev board and no dev sign-in; boards
+  then come from `POST /boards` by a tenant admin (see "Creating a tenant").
 - **Bun loads `.env`** from the current directory, so a `.env` with `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`
   turns Google sign-in on even in the command above. Without them, `/auth/login`, `/auth/callback` and
   `/auth/exchange` answer 503. For a working sign-in, use the next command instead, not `PORT=0`.
@@ -119,22 +134,34 @@ PORT=8080 PLENARY_DATA_DIR="$(mktemp -d)" OIDC_REDIRECT_URI=http://localhost:808
 - **Register that exact redirect URI** (`http://localhost:8080/auth/callback`) on your Google OAuth client. To use
   another port, change all three values and register the matching URI.
 - **The two values above are the defaults**; they are written out so the dependency on the port is visible.
-- **Today the browser ends on a 404** after sign-in, because the server serves no page yet (see "Web page to
-  server" above).
+- **After sign-in the browser lands on the canvas** at `/`: the server serves the page, which exchanges the one-time
+  code in the address bar for a session. Open a board as `/?board=<id>`.
 
-### Open the canvas
+### Creating a tenant
 
-The page is plain ES modules, so it needs any static file server (not `file://`). From the repo root:
+`POST /boards` needs a caller who is an admin of a tenant (a Google Workspace domain). Two ways to make the first admin:
+
+- **Dev tokens:** a token with `"domain"` and `"admin": true` makes that domain's tenant at start and adds the user as
+  its admin, for example `{"tok-ann":{"name":"ann","domain":"acme.test","admin":true}}`. Then
+  `curl -X POST -H "Authorization: Bearer tok-ann" -H "Content-Type: application/json" -d '{"title":"All hands"}' http://localhost:8099/boards` answers 201 with the board.
+- **Operator CLI:** `bun scripts/admin-bootstrap.js --domain acme.com --admin alice@acme.com` (run with the same
+  environment as the server; idempotent, additive; `--admin` takes an email on the domain, `google:<sub>` or `dev:<name>`).
+
+### Open the canvas without the server
+
+A dev page runs boards **inside the browser** (a SharedWorker; no server). It needs any static file server (not `file://`).
+From the repo root:
 
 ```sh
 python3 -m http.server 0 --bind 127.0.0.1
 ```
 
-- **Canvas:** open `/web/index.html?board=demo&as=ada` on the printed port. `as` picks a dev user (`ada` owner,
-  `bo` editor, `cy` and `di` annotators, `ed` viewer, `fi` commenter; `web/ui/dev-users.js`). Open a second tab
+- **Canvas:** open `/web/dev-main.html?board=demo&as=ada` on the printed port. `as` picks a dev user (`ada` owner,
+  `bo` editor, `cy` and `di` annotators, `ed` viewer, `fi` commenter; `web/core/dev-users.js`). Open a second tab
   on the same board to see two users edit together.
-- **Collaboration UI:** `/web/collab/dev.html`.
-- **Remember:** both run entirely in the browser; neither talks to the server.
+- **Collaboration UI on a fake port:** `/web/collab/dev.html`.
+- **The server never serves these pages** (`web/dev*.html`, the in-browser rooms and `web/core/dev-users.js` are
+  denied by `server/static.js`).
 
 ## Protocol
 
@@ -157,8 +184,9 @@ commit and a SHA-256 per file.
 and their variables.
 
 - **Never built here:** no image from `deploy/` has been built or run as part of this README's checks.
-- **Cluster Compose** defines Postgres, NATS, an S3-compatible store, three app nodes and a load balancer, but each
-  app node still runs single-node (see "Cluster mode" above).
+- **Cluster Compose** defines Postgres, NATS, an S3-compatible store, three app nodes and a load balancer. The server
+  can run as a cluster node (see "Cluster mode" above), but this Compose file has not been built or run here; the
+  local rig (`scripts/cluster-rig.js`, `deploy/cluster/RIG.md`) is what has been exercised.
 - **Nothing is published:** no registry, no public image.
 
 ## Design

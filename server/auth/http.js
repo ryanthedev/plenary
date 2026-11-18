@@ -23,6 +23,7 @@
 //     (this server's). The first four are checked at build time; the redirect URI is the caller's duty.
 //     config.boardUrl       absolute URL template with "{board}"; where a redeemed share link lands
 //     config.publicUrl      optional absolute base URL; when set, a created link carries `url` (<publicUrl>/links/<id>)
+//     config.devSignIn      optional { board, users: [{ name, token, role }] }: GET /auth/dev answers it, only while `dev` is on
 //     config.maxBody        JSON body cap in bytes (default 16384)
 //     config.maxLoginStates replay-guard size cap (default 100000); when full, callbacks get 503 (fails closed).
 //                           The used-code set of /auth/exchange has the same cap and also fails closed.
@@ -343,7 +344,12 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
 
   // ---- routes ----
   const admin = { registry, now };
+  // GET /auth/dev: the dev sign-in menu for the served page (web/adapters/auth/devconfig.js). Exists ONLY while the dev
+  // verifier is on and the node has a dev board; otherwise there is no such route (404), so a page cannot be talked
+  // into dev sign-in. It lists each dev token: dev tokens are local-only secrets by design (main.js logs a warning).
+  const devMenu = dev && dev.enabled === true && config.devSignIn ? { board: config.devSignIn.board, users: config.devSignIn.users } : null;
   const routes = [
+    ...(devMenu ? [["/auth/dev", { GET: () => json(200, devMenu) }]] : []),
     ["/auth/login", { GET: () => beginLogin(null) }],
     ["/auth/callback", { GET: (req, url) => callback(req, url) }],
     ["/auth/exchange", { POST: req => exchange(req) }],

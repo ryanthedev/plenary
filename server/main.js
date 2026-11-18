@@ -360,6 +360,16 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
     boardUrl: env.BOARD_URL || `${origin}/?board={board}`,
     publicUrl: origin,
   };
+  // The served page's dev sign-in menu (GET /auth/dev): the dev users and the dev board, only when dev tokens are on.
+  if (devBoard) {
+    const seen = new Set(), users = [];
+    for (const [token, t] of Object.entries(tokens)) {
+      if (!t || typeof t.name !== "string" || !t.name || seen.has(t.name)) continue;
+      seen.add(t.name);
+      users.push({ name: t.name, token, role: ROLES.includes(t.role) ? t.role : "editor" });
+    }
+    config.devSignIn = { board: devBoard, users };
+  }
   const http = httpRoutes({ registry, sessions, oidc, tenancy, now: Date.now, config, log: log.child({ component: "auth" }), ...(dev.enabled ? { dev } : {}) });
   const server = createServer({ auth, registry, store, bus, blobs, log, limits, http, port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
     roles, node, host: { hostname: node, leaseTtlMs } });

@@ -6,7 +6,8 @@
 //                                     [--max-conns-per-user 100000] [--node-cmd "<cmd> <args>"] [--timeout-ms 60000]
 //   bun scripts/cluster-rig.js status [--name|--dir] [--json]
 //   bun scripts/cluster-rig.js kill <node-id> [--name|--dir]      SIGKILL one node by its recorded PID (takeover check)
-//   bun scripts/cluster-rig.js down   [--name|--dir]
+//   bun scripts/cluster-rig.js down   [--name|--dir] [--all] [--clean]
+//   bun scripts/cluster-rig.js ls | gc | env [--name|--dir]
 //
 // Importable for tests: startRig(opts), stopRig(rigOrDir), readRig(dir), rigStatus(dir), killNode(dir, id), missingBins().
 // Docs: deploy/cluster/RIG.md.
@@ -49,18 +50,37 @@ const ROOT = resolve(new URL("..", import.meta.url).pathname);
 const MAIN = join(ROOT, "server/main.js");
 const NAME_RE = /^[a-z0-9-]{1,32}$/;
 const which = (cmd, fallback) => Bun.which(cmd) ?? (existsSync(fallback) ? fallback : null);
+const BUN = Bun.which("bun") ?? process.execPath;
 
 /** Absolute paths of the binaries the rig runs (null when missing). */
 export function bins() {
+  const pg17 = ["/opt/homebrew/opt/postgresql@17/bin", "/usr/local/opt/postgresql@17/bin", "/usr/lib/postgresql/17/bin"];
+  const find = (cmd, fallback, dirs = []) => Bun.which(cmd) ?? [fallback, ...dirs.map(d => join(d, cmd))].find(p => p && existsSync(p)) ?? null;
   return {
-    initdb: which("initdb", "/opt/homebrew/bin/initdb"),
-    postgres: which("postgres", "/opt/homebrew/bin/postgres"),
+    initdb: find("initdb", "/opt/homebrew/bin/initdb", pg17),
+    postgres: find("postgres", "/opt/homebrew/bin/postgres", pg17),
     nats: which("nats-server", "/opt/homebrew/bin/nats-server"),
     caddy: which("caddy", "/opt/homebrew/bin/caddy"),
+    minio: find("minio", "/opt/homebrew/bin/minio"),
   };
 }
 /** Names of missing binaries; empty when the rig can run. */
 export function missingBins() { return Object.entries(bins()).filter(([, p]) => !p).map(([k]) => k); }
+
+/** Parse ipcs -m output without performing any system changes. */
+export function parseIpcsSegments(output, owner) {
+  const lines = String(output).split(/\r?\n/);
+  const headerAt = lines.findIndex(line => /\b(?:shmid|id)\b/i.test(line) && /\bowner\b/i.test(line) && /\bnattch\b/i.test(line));
+  if (headerAt < 0) return [];
+  const headers = lines[headerAt].trim().toLowerCase().split(/\s+/);
+  const ix = { shmid: headers.indexOf("shmid") >= 0 ? headers.indexOf("shmid") : headers.indexOf("id"), owner: headers.indexOf("owner"), nattch: headers.indexOf("nattch") };
+  return lines.slice(headerAt + 1).flatMap(line => {
+    const fields = line.trim().split(/\s+/);
+    const id = Number(fields[ix.shmid]), nattch = Number(fields[ix.nattch]);
+    return fields.length > Math.max(...Object.values(ix)) && Number.isSafeInteger(id) && id >= 0 && fields[ix.owner] === owner && nattch === 0
+      ? [{ id, owner, nattch }] : [];
+  });
+}
 
 export const defaultDir = name => join(ROOT, ".rig", name);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -235,6 +255,25 @@ async function httpOk(url) {
   try { const r = await fetch(url, { signal: AbortSignal.timeout(1000) }); await r.arrayBuffer(); return r.ok; } catch { return false; }
 }
 
+const MINIO_ACCESS = "plenary-rig-local";
+const MINIO_SECRET = "plenary-rig-local-secret-key";
+const sha256 = async value => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)))].map(b => b.toString(16).padStart(2, "0")).join("");
+const hmac = async (key, value) => new Uint8Array(await crypto.subtle.sign("HMAC", await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]), new TextEncoder().encode(value)));
+async function createMinioBucket(endpoint, bucket) {
+  const now = new Date().toISOString().replace(/[:-]|\.\d{3}/g, ""), date = now.slice(0, 8), region = "us-east-1";
+  const url = new URL(`/${bucket}`, endpoint), payloadHash = await sha256("");
+  const canonicalHeaders = `host:${url.host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${now}\n`;
+  const canonical = `PUT\n${url.pathname}\n\n${canonicalHeaders}\nhost;x-amz-content-sha256;x-amz-date\n${payloadHash}`;
+  const scope = `${date}/${region}/s3/aws4_request`;
+  const stringToSign = `AWS4-HMAC-SHA256\n${now}\n${scope}\n${await sha256(canonical)}`;
+  const kDate = await hmac(new TextEncoder().encode(`AWS4${MINIO_SECRET}`), date);
+  const kRegion = await hmac(kDate, region), kService = await hmac(kRegion, "s3"), kSigning = await hmac(kService, "aws4_request");
+  const signature = [...await hmac(kSigning, stringToSign)].map(b => b.toString(16).padStart(2, "0")).join("");
+  const response = await fetch(url, { method: "PUT", headers: { "x-amz-date": now, "x-amz-content-sha256": payloadHash,
+    Authorization: `AWS4-HMAC-SHA256 Credential=${MINIO_ACCESS}/${scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=${signature}` }, signal: AbortSignal.timeout(5000) });
+  if (!response.ok && response.status !== 409) throw new Error(`minio bucket creation failed (HTTP ${response.status})`);
+}
+
 /** Poll `check` until true; fail fast if `proc` died or the rig was aborted; clear timeout error naming the log. */
 async function waitFor(check, { what, proc, deadline, abort }) {
   while (true) {
@@ -370,7 +409,7 @@ export async function startRig(opts = {}) {
   const deadline = Date.now() + (opts.timeoutMs ?? 60_000);
   const step = opts.onStep ?? (() => {});
   const missing = missingBins();
-  if (missing.length) throw new Error(`missing binaries: ${missing.join(", ")} (brew install postgresql@17 nats-server caddy)`);
+  if (missing.length) throw new Error(`missing binaries: ${missing.join(", ")}. Install with: brew install postgresql@17 nats-server minio caddy (Debian/Ubuntu: sudo apt-get install postgresql-17 nats-server minio caddy)`);
   const B = bins();
   psCheck();   // before the dir is touched: a broken ps refuses here (p8-rig2v H2)
 
@@ -443,8 +482,21 @@ export async function startRig(opts = {}) {
     save(rig);
     await waitFor(() => httpOk(`http://127.0.0.1:${natsMon}/healthz`), { what: "nats", proc: nats, deadline, abort: opts.abort });
 
+    // S3-compatible object store. Both ports are probed and the API is loopback-only.
+    step("minio: starting");
+    const minioPort = await freePort(taken), minioConsolePort = await freePort(taken);
+    const minioEndpoint = `http://127.0.0.1:${minioPort}`, bucket = "plenary";
+    const blobsDir = join(dir, "blobs");
+    mkdirSync(blobsDir, { recursive: true });
+    const minio = launch(rig, kids, "minio", [B.minio, "server", blobsDir, "--address", `127.0.0.1:${minioPort}`, "--console-address", `127.0.0.1:${minioConsolePort}`],
+      { env: baseEnv({ MINIO_ROOT_USER: MINIO_ACCESS, MINIO_ROOT_PASSWORD: MINIO_SECRET }), cwd: dir, log: join(logsDir, "minio.log"), abort: opts.abort });
+    rig.blobs = { url: minioEndpoint, bucket, accessKey: MINIO_ACCESS, secretKey: MINIO_SECRET, consolePort: minioConsolePort };
+    save(rig);
+    await waitFor(() => httpOk(`${minioEndpoint}/minio/health/ready`), { what: "minio", proc: minio, deadline, abort: opts.abort });
+    await createMinioBucket(minioEndpoint, bucket);
+
     // Nodes.
-    const nodeCmd = opts.nodeCmd?.length ? opts.nodeCmd : [process.execPath, MAIN];
+    const nodeCmd = opts.nodeCmd?.length ? opts.nodeCmd : [BUN, MAIN];
     const plan = [...Array.from({ length: gateways }, (_, i) => ({ id: `gw-${i + 1}`, roles: ["gateway"] })),
                   ...Array.from({ length: hosts }, (_, i) => ({ id: `host-${i + 1}`, roles: ["host"] }))];
     const tokensJson = JSON.stringify(tokens);
@@ -579,13 +631,13 @@ export async function killNode(dir, id) {
 
 // ---- CLI ----
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const o = { _: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (!a.startsWith("--")) { o._.push(a); continue; }
     const [k, v] = a.slice(2).split("=", 2);
-    if (k === "json") { o.json = true; continue; }
+    if (["json", "all", "clean"].includes(k)) { o[k] = true; continue; }
     o[k] = v ?? argv[++i];
   }
   return o;
@@ -599,12 +651,29 @@ function printStatus(s) {
     `  lb        ${s.lb ? `${s.lb.url}   ${s.lb.wsUrl}` : "-"}   ${pid("caddy")}`,
     `  postgres  ${s.postgres ? `127.0.0.1:${s.postgres.port}   DATABASE_URL ${s.postgres.url}` : "-"}   ${pid("postgres")}`,
     `  nats      ${s.nats ? s.nats.url : "-"}   ${pid("nats")}`,
+    ...s3Env(s).map(line => `  ${line}`),
     ...s.nodes.map(n => `  ${n.id.padEnd(9)} ${n.roles.join(",").padEnd(8)} ${n.url}   ${pid("node:" + n.id)}`),
     `  tokens    ${s.tokensFile}   (0600, PLENARY_DEV_TOKENS format; never printed)`,
     `  logs      ${s.logsDir}`,
     `  lease     PLENARY_LEASE_TTL_MS=${s.leaseTtlMs} on every node`,
   ];
   console.log(lines.join("\n"));
+}
+
+function rigDirs() {
+  const root = join(ROOT, ".rig");
+  if (!existsSync(root)) return [];
+  return readdirSync(root, { withFileTypes: true }).filter(e => e.isDirectory() && existsSync(join(root, e.name, "rig.json"))).map(e => join(root, e.name));
+}
+function missingRigMessage(name, dir) {
+  const others = rigDirs().filter(d => d !== dir).map(d => basename(d));
+  return `no rig named ${name}${others.length ? `; did you mean --name ${others[0]}?` : ""}`;
+}
+
+export function s3Env(s) {
+  if (!s.blobs) return [];
+  return [`S3_ENDPOINT=${s.blobs.url}`, `S3_BUCKET=${s.blobs.bucket}`, "S3_REGION=us-east-1",
+    `S3_ACCESS_KEY_ID=${s.blobs.accessKey}`, `S3_SECRET_ACCESS_KEY=${s.blobs.secretKey}`];
 }
 
 async function cli(argv) {
@@ -626,6 +695,7 @@ async function cli(argv) {
     return 0;
   }
   if (cmd === "status") {
+    if (!existsSync(join(dir, "rig.json"))) throw new Error(missingRigMessage(a.name ?? basename(dir), dir));
     const s = rigStatus(dir);
     if (a.json) console.log(JSON.stringify(s, null, 2)); else printStatus(s);
     return 0;
@@ -638,11 +708,44 @@ async function cli(argv) {
     return 0;
   }
   if (cmd === "down") {
-    const r = await stopRig(dir);
-    console.log(`rig down: stopped ${r.stopped.join(", ") || "nothing"}${r.forced.length ? ` (SIGKILL: ${r.forced.join(", ")})` : ""}${r.gone.length ? `; already gone: ${r.gone.join(", ")}` : ""}`);
+    const targets = a.all ? rigDirs() : [dir];
+    if (!a.all && !existsSync(join(dir, "rig.json"))) throw new Error(missingRigMessage(a.name ?? basename(dir), dir));
+    for (const target of targets) {
+      const r = await stopRig(target);
+      console.log(`rig ${basename(target)} down: stopped ${r.stopped.join(", ") || "nothing"}${r.forced.length ? ` (SIGKILL: ${r.forced.join(", ")})` : ""}${r.gone.length ? `; already gone: ${r.gone.join(", ")}` : ""}`);
+      if (a.clean) rmSync(target, { recursive: true, force: true });
+    }
     return 0;
   }
-  console.error("usage: bun scripts/cluster-rig.js up|status [--json]|kill <node-id>|down [--name n | --dir d]  (see deploy/cluster/RIG.md)");
+  if (cmd === "ls") {
+    const rows = [];
+    for (const d of rigDirs()) {
+      const s = rigStatus(d), live = s.procs.filter(p => p.alive).length;
+      if (live) rows.push(`${s.name}\t${live} process(es)\t${d}`);
+    }
+    console.log(rows.length ? rows.join("\n") : "no live rigs");
+    return 0;
+  }
+  if (cmd === "env") {
+    const s = rigStatus(dir);
+    console.log([`DATABASE_URL=${s.postgres?.url ?? ""}`, `NATS_URL=${s.nats?.url ?? ""}`, ...s3Env(s)].join("\n"));
+    return 0;
+  }
+  if (cmd === "gc") {
+    const user = spawnSync("/usr/bin/id", ["-un"], { encoding: "utf8", env: PS_ENV });
+    if (user.status !== 0 || !user.stdout.trim()) throw new Error("cannot determine current user for shared-memory cleanup");
+    const out = spawnSync(ipc.ipcs, ["-m", "-o"], { encoding: "utf8", env: PS_ENV });
+    if (out.status !== 0) throw new Error("ipcs -m -o failed; no segments were removed");
+    const segments = parseIpcsSegments(out.stdout, user.stdout.trim());
+    for (const segment of segments) {
+      const removed = spawnSync(ipc.ipcrm, ["-m", String(segment.id)], { encoding: "utf8", env: PS_ENV });
+      if (removed.status !== 0) throw new Error(`ipcrm -m ${segment.id} failed`);
+      console.log(`removed shared-memory segment ${segment.id} (owner ${segment.owner}, NATTCH 0)`);
+    }
+    if (!segments.length) console.log("no unattached shared-memory segments for current user");
+    return 0;
+  }
+  console.error("usage: bun scripts/cluster-rig.js up|status [--json]|kill <node-id>|down [--all] [--clean]|ls|env|gc  (see deploy/cluster/RIG.md)");
   return 2;
 }
 

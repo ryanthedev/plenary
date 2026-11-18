@@ -1,7 +1,7 @@
 # Local cluster rig
 
 `scripts/cluster-rig.js` runs a whole Plenary cluster natively on one Mac, with no containers: Postgres 17, NATS,
-N node processes and a Caddy load balancer. It is meant for the M2 load test (~10k clients on 3 nodes) and for the
+MinIO (an S3-compatible local object store), N node processes and a Caddy load balancer. It is meant for the M2 load test (~10k clients on 3 nodes) and for the
 phase-4 takeover check ("kill a board's host, another host takes over, no acked op is lost").
 
 **Status (2026-11-12):** the rig works and is tested, with stub nodes and with the real `server/main.js`, which since
@@ -21,24 +21,36 @@ p4-wire (7bf171b) runs in cluster mode on the env below (shared Postgres and NAT
 
 ## Needs
 
-`brew install postgresql@17 nats-server caddy` (it uses `initdb`, `postgres`, `nats-server`, `caddy` from PATH or
-/opt/homebrew/bin), plus Bun and `/bin/ps`. No npm dependencies.
+`brew install postgresql@17 nats-server minio caddy` (it uses `initdb`, `postgres`, `nats-server`, `minio` and `caddy`
+from PATH or the standard Homebrew locations), plus Bun and `/bin/ps`. Debian/Ubuntu: `sudo apt-get install postgresql-17
+nats-server minio caddy`. Missing binaries are reported with these install hints. No npm dependencies.
 
 ## Run
 
 ```sh
-bun scripts/cluster-rig.js up                      # 2 gateways + 1 host, rig dir .rig/default/
-bun scripts/cluster-rig.js up --hosts 2            # two room hosts: needed for the takeover check
-bun scripts/cluster-rig.js status                  # PIDs, ports, LB URL, tokens file path
-bun scripts/cluster-rig.js status --json           # the same, as JSON (rig.json plus `alive` flags)
-bun scripts/cluster-rig.js kill host-1             # SIGKILL one node by its recorded PID
-bun scripts/cluster-rig.js down                    # stop everything this rig started
+bun --no-env-file scripts/cluster-rig.js up                      # 2 gateways + 1 host, rig dir .rig/default/
+bun --no-env-file scripts/cluster-rig.js up --hosts 2            # two room hosts: needed for the takeover check
+bun --no-env-file scripts/cluster-rig.js status                  # PIDs, ports, LB URL, tokens file path
+bun --no-env-file scripts/cluster-rig.js status --json           # the same, as JSON (rig.json plus `alive` flags)
+bun --no-env-file scripts/cluster-rig.js kill host-1             # SIGKILL one node by its recorded PID
+bun --no-env-file scripts/cluster-rig.js down                    # stop everything this rig started
+bun --no-env-file scripts/cluster-rig.js ls                      # list live rigs of any name
+bun --no-env-file scripts/cluster-rig.js env                     # print database, NATS and S3 test environment
+bun --no-env-file scripts/cluster-rig.js down --all              # stop all rigs
+bun --no-env-file scripts/cluster-rig.js down --clean            # stop and remove this rig directory
+bun --no-env-file scripts/cluster-rig.js down --all --clean      # stop and remove all rig directories
+bun --no-env-file scripts/cluster-rig.js gc                      # remove this user's unattached shared-memory segments
+bun run test:cluster                               # run all service-gated tests on a fresh rig
+bun run test:fast                                   # run pure unit tests only
+bun run test:full                                   # run all tests (same as bun test)
 ```
 
 `up` flags: `--name <a-z0-9->` (rig dir `.rig/<name>/`), `--dir <path>`, `--gateways n` (default 2), `--hosts n`
 (default 1), `--lease-ttl-ms n` (default 10000, the same on every node), `--max-conns-per-user n` (default 100000),
 `--timeout-ms n` (default 60000, for the whole start), and `--node-cmd "<cmd> <args>"` to run something other than
-`bun server/main.js` (the tests use a stub). `status`, `kill` and `down` take `--name` or `--dir` too.
+`bun server/main.js` (the tests use a stub). `status`, `kill`, `env` and `down` take `--name` or `--dir` too. Missing rig
+names fail with a suggestion when another rig exists. `status --json` contains the S3 endpoint, bucket and credentials;
+`env` prints all S3 settings for the tests.
 
 `up` returns once every part answers: Postgres runs `select 1`, NATS `/healthz`, every node's `/health`, and `/health`
 through the LB. Then it exits; the processes keep running. If anything fails or times out, or `up` gets SIGINT
@@ -53,34 +65,45 @@ a stopped rig, so every `up` starts from an empty database.
 |---|---|---|
 | Postgres 17 | `postgres -D <rig>/pg`, TCP on 127.0.0.1 only, no Unix socket, trust auth, database `plenary`, max_connections 300 | `DATABASE_URL=postgres://postgres@127.0.0.1:<port>/plenary` |
 | NATS | `nats-server` on 127.0.0.1, `max_payload: 2MB` (as deploy/cluster/nats.conf), monitor port for `/healthz` | `NATS_URL=nats://127.0.0.1:<port>` |
+| MinIO | `minio server <rig>/blobs`, API and console on separate probed loopback ports; bucket `plenary` created with a signed S3 request | `S3_ENDPOINT`, `S3_BUCKET`, `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` |
 | Nodes | `bun server/main.js`, one per node, its cwd outside the repo (so Bun's `.env` auto-load never applies) | `PORT`, `HOST=127.0.0.1`, `PLENARY_DATA_DIR=<rig>/nodes/<id>/data`, `PLENARY_NODE_ID` (`gw-1`, `gw-2`, `host-1`, ...), `PLENARY_ROLES` (`gateway` or `host`), `PLENARY_LEASE_TTL_MS`, `COOKIE_KEY`, `SESSION_KEY`, `PLENARY_DEV_TOKENS`, `PLENARY_MAX_CONNS_PER_USER`, `LOG_LEVEL` |
 | LB | `caddy run` with a generated Caddyfile in the shape of deploy/cluster/Caddyfile: gateways only, round robin, active `/health` checks, WebSocket-safe | |
 
 The nodes get only the env above, plus PATH, HOME and LANG; nothing from your shell or the repo's `.env`. Every port
 is probed free at start, so none is fixed.
 
+Postgres is TCP-only because macOS limits Unix socket paths to 103 bytes, so a socket under a deep rig directory can fail.
+
+`bun run test:cluster` starts a uniquely named rig, runs all test files gated by `DATABASE_URL`, `NATS_URL` or
+`S3_ENDPOINT`, then stops the rig. Any skipped test fails the command. Green runs remove the rig directory; failed runs
+keep it and print its path. SIGINT, SIGTERM and SIGHUP stop the child test and services. The gated files are
+`test/server/pg-store`, `pg-registry`, `nats-bus`, `room-host-lease`, `room-host-proc`, `main-cluster`, `s3-blobs`,
+and `test/admin/tenants`.
+
 ## Files in the rig dir
 
 | File | What |
 |---|---|
-| `rig.json` | Everything the rig started and where. It is rewritten after every spawn, so `down` works even if `up` was killed. Holds no secrets. |
+| `rig.json` | Everything the rig started and where, including local MinIO credentials. It is rewritten after every spawn, so `down` works even if `up` was killed. |
 | `tokens.json` (0600) | Dev tokens, in `PLENARY_DEV_TOKENS` format: `{ "<token>": { name, role, domain, admin? } }`. One owner `rig-admin` with `admin: true`; editors `editor-1..8`, annotators `annotator-1..32`, viewers `viewer-1..64`. Every one has domain `rig.test`. |
 | `keys.json` (0600) | `COOKIE_KEY` and `SESSION_KEY`, generated per rig and shared by every node. |
-| `logs/<part>.log` | One log per process (`postgres`, `nats`, `gw-1`, ..., `caddy`). |
+| `logs/<part>.log` | One log per process (`postgres`, `nats`, `minio`, `gw-1`, ..., `caddy`). |
+| `blobs/` | MinIO object data for the local S3 bucket. |
 | `up.lock` | Present only while an `up` runs: `{ pid, started }` of that `up`. A lock whose `up` is gone is cleared by the next `up`. |
 | `up.lock.break` | Present only for the instant an `up` clears a stale `up.lock`. If one is left (that `up` died right then), every `up` refuses and names it: remove it once no `up` runs on the dir. |
 | `pg/`, `nats.conf`, `Caddyfile`, `nodes/<id>/data/`, `caddy/` | State and generated config. |
 
-The rig never prints a key or a token. Output names only the files.
+The rig never prints cookie/session keys or dev tokens. MinIO's generated local credentials are available through
+`env` for tests and are stored in rig.json; do not put production credentials in this rig.
 
 ### rig.json (version 1, stable; the load client in scripts/load/ reads it)
 
 ```
 { version: 1, name, dir, startedClock: "lstart TZ=UTC LC_ALL=C", state: "starting" | "up" | "failed" | "down", createdAt, leaseTtlMs, maxConnsPerUser,
-  lb: { url, wsUrl, port }, tokensFile, keysFile, logsDir,
+  lb: { url, wsUrl, port }, blobs: { url, bucket, accessKey, secretKey, consolePort }, tokensFile, keysFile, logsDir,
   postgres: { port, url }, nats: { port, url, monitorPort },
   nodes: [{ id, roles, port, url, dataDir, log }],
-  procs: [{ name: "postgres" | "nats" | "node:<id>" | "caddy", pid, started, log }] }
+  procs: [{ name: "postgres" | "nats" | "minio" | "node:<id>" | "caddy", pid, started, log }] }
 ```
 
 Paths inside the rig dir (`tokensFile`, `keysFile`, `logsDir`, `nodes[].dataDir`, `nodes[].log`, `procs[].log`) are
@@ -117,7 +140,7 @@ admits all of them. Raise roles with `PUT /boards/:board/grants/dev%3A<name>`.
   `kill` do not take the lock, so `down` can still stop a hung `up`'s processes.
 - **The dir you name:** `--dir`/`--name` decide which rig.json is read and written, never the `dir` inside the file.
   A copied or moved rig.json is updated where it is, so it never overwrites another rig's record.
-- **Shutdown order:** `down` goes in reverse start order (LB, nodes, NATS, Postgres). It sends SIGTERM, or SIGINT to
+- **Shutdown order:** `down` goes in reverse start order (LB, nodes, MinIO, NATS, Postgres). It sends SIGTERM, or SIGINT to
   Postgres for a fast shutdown, then SIGKILL after 10 s.
 - **No leaks from a failed or killed run:** a failed `up`, or one stopped by SIGINT, SIGTERM or SIGHUP, stops what
   it started before it exits. Only a SIGKILLed `up` leaves processes; they are in rig.json, so `down` stops them. The
@@ -149,6 +172,8 @@ admits all of them. Raise roles with `PUT /boards/:board/grants/dev%3A<name>`.
   lists that id with that key and NATTCH 0. A backend still attached when the postmaster died is waited for (up to
   5 s, re-checking id, key and NATTCH each time); a segment still attached after that is kept. Segments orphaned by anything else (a SIGKILLed `up` plus a SIGKILLed
   postmaster) are not cleaned up: check with `ipcs -m`.
+- **Manual shared-memory cleanup.** `gc` parses `ipcs -m -o` and removes only current-user segments with `NATTCH 0`;
+  attached segments and segments owned by other users are never removed.
 
 ## Tests
 

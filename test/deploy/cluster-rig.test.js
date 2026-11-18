@@ -7,7 +7,7 @@
 import { test, expect, afterAll, describe } from "bun:test";
 import { rmSync, readFileSync, writeFileSync, existsSync, statSync, readdirSync, mkdirSync, renameSync, chmodSync } from "node:fs";
 import { join } from "node:path";
-import { stopRig, rigStatus, killNode, readRig, isOurs, portFree, missingBins, _setPsPath, _setIpcPaths, _setLockHook, pgShmOf, removeOrphanShm } from "../../scripts/cluster-rig.js";
+import { stopRig, rigStatus, killNode, readRig, isOurs, portFree, missingBins, _setPsPath, _setIpcPaths, _setLockHook, pgShmOf, removeOrphanShm, parseIpcsSegments, s3Env, parseArgs } from "../../scripts/cluster-rig.js";
 import { freshDir, track, rigUp as startRig, spawnTracked, cleanupAll, killRecorded, namingDir } from "./rig-guard.js";
 
 const ROOT = new URL("../..", import.meta.url).pathname;
@@ -22,12 +22,30 @@ if (SKIP) console.warn(`cluster-rig tests skipped: missing ${missing.join(", ")}
 // the dirs this file created. Every in-process `up` here is rig-guard's rigUp (shared abort), every child is tracked.
 afterAll(() => cleanupAll());
 
-const portsOf = rig => [rig.postgres?.port, rig.nats?.port, rig.nats?.monitorPort, rig.lb?.port, ...rig.nodes.map(n => n.port)].filter(Boolean);
+const portsOf = rig => [rig.postgres?.port, rig.nats?.port, rig.nats?.monitorPort, Number(new URL(rig.blobs?.url ?? "http://127.0.0.1:0").port), rig.blobs?.consolePort, rig.lb?.port, ...rig.nodes.map(n => n.port)].filter(Boolean);
 // The test's own identity check, independent of the module's: lstart under a fixed TZ and locale.
 const PS_FIXED = { PATH: process.env.PATH, LC_ALL: "C", TZ: "UTC" };
 const lstartIn = (pid, env) => Bun.spawnSync(["/bin/ps", "-o", "lstart=", "-p", String(pid)], { env }).stdout.toString().trim().replace(/\s+/g, " ");
 const lstart = pid => lstartIn(pid, PS_FIXED);
 const CLOCK = "lstart TZ=UTC LC_ALL=C";
+
+test("gc parser only selects unattached SysV segments owned by the current user", () => {
+  const output = `------ Shared Memory Segments --------\nkey        shmid      owner      perms      bytes      nattch     status\n0x00000001 123        alice      600        4096       0\n0x00000002 124        alice      600        4096       2\n0x00000003 125        bob        600        4096       0\n`;
+  expect(parseIpcsSegments(output, "alice")).toEqual([{ id: 123, owner: "alice", nattch: 0 }]);
+  const macOutput = `T     ID     KEY        MODE       OWNER    GROUP NATTCH\nm 126 0x00000004 600 alice staff 0\nm 127 0x00000005 600 alice staff 1\n`;
+  expect(parseIpcsSegments(macOutput, "alice")).toEqual([{ id: 126, owner: "alice", nattch: 0 }]);
+});
+
+test("S3 environment output includes every setting consumed by the blob adapter", () => {
+  expect(s3Env({ blobs: { url: "http://127.0.0.1:9000", bucket: "plenary", accessKey: "local-key", secretKey: "local-secret" } })).toEqual([
+    "S3_ENDPOINT=http://127.0.0.1:9000", "S3_BUCKET=plenary", "S3_REGION=us-east-1",
+    "S3_ACCESS_KEY_ID=local-key", "S3_SECRET_ACCESS_KEY=local-secret",
+  ]);
+});
+
+test("rig CLI parses down-all and clean as independent flags", () => {
+  expect(parseArgs(["down", "--all", "--clean"])).toEqual({ _: ["down"], all: true, clean: true });
+});
 /** An in-range PID that no process has right now: a child that has exited and been reaped. */
 const reapedPid = async () => { const p = Bun.spawn(["true"]); await p.exited; return p.pid; };
 const psGone = pid => !Bun.spawnSync(["/bin/ps", "-o", "pid=", "-p", String(pid)]).stdout.toString().trim();
@@ -62,7 +80,8 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
     try {
       expect(rig.state).toBe("up");
       expect(rig.nodes.map(n => [n.id, n.roles.join(",")])).toEqual([["gw-1", "gateway"], ["gw-2", "gateway"], ["host-1", "host"]]);
-      expect(rig.procs.map(p => p.name)).toEqual(["postgres", "nats", "node:gw-1", "node:gw-2", "node:host-1", "caddy"]);
+      expect(rig.procs.map(p => p.name)).toEqual(["postgres", "nats", "minio", "node:gw-1", "node:gw-2", "node:host-1", "caddy"]);
+      expect(rig.blobs).toMatchObject({ bucket: "plenary", url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/), accessKey: expect.any(String), secretKey: expect.any(String) });
 
       // Every node got the contract env; the shared keys are the same everywhere; nothing else leaked in (.env, process.env).
       const infos = await Promise.all(rig.nodes.map(async n => (await fetch(n.url + "/info")).json()));
@@ -83,16 +102,15 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
       const varz = await (await fetch(`http://127.0.0.1:${rig.nats.monitorPort}/varz`)).json();
       expect(varz.max_payload).toBe(2 * 1024 * 1024);
 
-      // Loopback only (p8-rigv M2): every listening TCP socket of every recorded PID is on 127.0.0.1. Exactly 7 sockets
-      // (postgres 1, nats 2, nodes 3, caddy 1), so an empty or failed lsof cannot pass.
+      // Loopback only (p8-rigv M2): every listening TCP socket of every recorded PID is on 127.0.0.1.
       const listening = [];
       for (const p of rig.procs) {
         const r = Bun.spawnSync(["lsof", "-nP", "-a", "-p", String(p.pid), "-iTCP", "-sTCP:LISTEN", "-Fn"]);
         for (const line of r.stdout.toString().split("\n")) if (line.startsWith("n")) listening.push({ name: p.name, addr: line.slice(1) });
       }
-      expect(listening.length).toBe(7);
-      expect(listening.filter(l => !l.addr.startsWith("127.0.0.1:"))).toEqual([]);
-      expect(listening.map(l => l.name).sort()).toEqual(["caddy", "nats", "nats", "node:gw-1", "node:gw-2", "node:host-1", "postgres"]);
+      expect(listening.length).toBe(10);   // minio also answers its API on [::1] (still loopback)
+      expect(listening.filter(l => !l.addr.startsWith("127.0.0.1:") && !(l.name === "minio" && l.addr.startsWith("[::1]:")))).toEqual([]);
+      expect(listening.map(l => l.name).sort()).toEqual(["caddy", "minio", "minio", "minio", "nats", "nats", "node:gw-1", "node:gw-2", "node:host-1", "postgres"]);
       { const pg = new Bun.SQL({ url: rig.postgres.url, max: 1 });
         try { expect((await pg.unsafe("show listen_addresses"))[0].listen_addresses).toBe("127.0.0.1"); } finally { await pg.close(); } }
       expect(varz.host).toBe("127.0.0.1");
@@ -127,8 +145,8 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
     expect(err?.message).toMatch(/node host-1: the process exited before it was ready/);
     const rig = readRig(dir);
     expect(rig.state).toBe("failed");
-    expect(rig.procs.map(p => p.name)).toEqual(["postgres", "nats", "node:gw-1", "node:gw-2", "node:host-1"]);
-    expect(err.rig.procs.length).toBe(5);
+    expect(rig.procs.map(p => p.name)).toEqual(["postgres", "nats", "minio", "node:gw-1", "node:gw-2", "node:host-1"]);
+    expect(err.rig.procs.length).toBe(6);
     await expectAllDown(rig);
   }, 90_000);
 
@@ -226,7 +244,7 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
     const rig = readRig(dir);
     expect(rig.startedClock).toBe(CLOCK);
     try {
-      expect(rig.procs.length).toBe(6);
+      expect(rig.procs.length).toBe(7);
       // Precondition: on this machine the raw lstart text really differs between the two envs (else the test is vacuous).
       const pid = rig.procs[0].pid;
       expect(lstartIn(pid, { PATH: process.env.PATH, ...envUp })).not.toBe(lstartIn(pid, { PATH: process.env.PATH, ...envOther }));
@@ -246,7 +264,7 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
 
       const down = await cli(["down", "--dir", dir], { env: envOther });
       expect(down.code).toBe(0);
-      expect(down.out).toMatch(/stopped caddy, node:host-1, node:gw-2, node:gw-1, nats, postgres$/m);
+      expect(down.out).toMatch(/stopped caddy, node:host-1, node:gw-2, node:gw-1, minio, nats, postgres$/m);
       await expectAllDown(readRig(dir));
     } finally {
       // If the module's identity check is broken, stop the recorded PIDs here by the test's own check (never by pattern).
@@ -272,14 +290,14 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
         if (rig?.procs?.some(p => p.name === "node:host-1")) break;
         await Bun.sleep(100);
       }
-      expect(rig.procs.map(p => p.name)).toEqual(["postgres", "nats", "node:gw-1", "node:gw-2", "node:host-1"]);
+      expect(rig.procs.map(p => p.name)).toEqual(["postgres", "nats", "minio", "node:gw-1", "node:gw-2", "node:host-1"]);
       up.kill("SIGKILL");
       await up.exited;
       expect(rig.procs.every(isOurs)).toBe(true);   // orphans now, still running
     } finally { up.kill("SIGKILL"); }
     const r = await cli(["down", "--dir", dir]);
     expect(r.code).toBe(0);
-    expect(r.out).toMatch(/stopped node:host-1, node:gw-2, node:gw-1, nats, postgres/);
+    expect(r.out).toMatch(/stopped node:host-1, node:gw-2, node:gw-1, minio, nats, postgres/);
     await expectAllDown(readRig(dir));
   }, 120_000);
 
@@ -302,7 +320,7 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
     } finally { up.kill("SIGKILL"); }
     const rig = readRig(dir);
     expect(rig.state).toBe("failed");
-    expect(rig.procs.length).toBe(5);
+    expect(rig.procs.length).toBe(6);
     await expectAllDown(rig);
     expect(namingDir(dir)).toEqual([]);
   }, 120_000);
@@ -314,7 +332,7 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
     try { await startRig({ dir, nodeCmd: stub(), timeoutMs: 60_000, abort, onStep: m => { if (m === "node gw-2: starting") abort.aborted = true; } }); } catch (e) { err = e; }
     expect(err?.message).toMatch(/^aborted before starting node:gw-2/);
     const rig = readRig(dir);
-    expect(rig.procs.map(p => p.name)).toEqual(["postgres", "nats", "node:gw-1"]);
+    expect(rig.procs.map(p => p.name)).toEqual(["postgres", "nats", "minio", "node:gw-1"]);
     await expectAllDown(rig);
     expect(namingDir(dir)).toEqual([]);
   }, 90_000);
@@ -332,7 +350,7 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
           if ([a, b].every(d => seen[d].some(p => p.name === "node:host-1"))) break;
           await Bun.sleep(100);
         }
-        expect([a, b].map(d => seen[d].map(p => p.name))).toEqual([a, b].map(() => ["postgres", "nats", "node:gw-1", "node:gw-2", "node:host-1"]));
+        expect([a, b].map(d => seen[d].map(p => p.name))).toEqual([a, b].map(() => ["postgres", "nats", "minio", "node:gw-1", "node:gw-2", "node:host-1"]));
         expect([...seen[a], ...seen[b]].every(isOurs)).toBe(true);
         run.kill(sig);
         expect(await run.exited).toBe(sig === "SIGTERM" ? 143 : 130);
@@ -353,7 +371,7 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
     expect((await run(["status", "--dir", dir])).code).toBe(0);
     const json = await run(["status", "--dir", dir, "--json"]);
     const s = JSON.parse(json.out);
-    expect(Object.keys(s).sort()).toEqual(["createdAt", "dir", "keysFile", "lb", "leaseTtlMs", "logsDir", "maxConnsPerUser", "name", "nats", "nodes", "postgres", "procs", "startedClock", "state", "tokensFile", "version"]);
+    expect(Object.keys(s).sort()).toEqual(["blobs", "createdAt", "dir", "keysFile", "lb", "leaseTtlMs", "logsDir", "maxConnsPerUser", "name", "nats", "nodes", "postgres", "procs", "startedClock", "state", "tokensFile", "version"]);
     expect(s.lb.wsUrl).toMatch(/^ws:\/\/127\.0\.0\.1:\d+\/ws$/);
     expect(s.tokensFile).toBe(join(dir, "tokens.json"));                              // absolute for callers…
     expect(readRig(dir)).toMatchObject({ tokensFile: "tokens.json", keysFile: "keys.json", logsDir: "logs" });   // …relative on disk (L6)
@@ -409,14 +427,14 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
       const before = readFileSync(join(dir, "rig.json"), "utf8");
       const again = await cli(["up", "--dir", dir, "--node-cmd", `${process.execPath} ${STUB}`], { env });
       expect(again.code).toBe(1);
-      expect(again.err).toMatch(/is still running \(postgres, nats, node:gw-1, node:gw-2, node:host-1, caddy\)/);   // got past the binaries check
+      expect(again.err).toMatch(/is still running \(postgres, nats, minio, node:gw-1, node:gw-2, node:host-1, caddy\)/);   // got past the binaries check
       expect(readFileSync(join(dir, "rig.json"), "utf8")).toBe(before);
       expect(existsSync(join(dir, "pg", "PG_VERSION"))).toBe(true);
       expect(existsSync(join(dir, "up.lock"))).toBe(false);   // the refusing up released its lock
       for (const p of rig.procs) expect({ name: p.name, same: lstart(p.pid) === p.started }).toEqual({ name: p.name, same: true });
       const down = await cli(["down", "--dir", dir], { env });
       expect(down.code).toBe(0);
-      expect(down.out).toMatch(/stopped caddy, node:host-1, node:gw-2, node:gw-1, nats, postgres$/m);
+      expect(down.out).toMatch(/stopped caddy, node:host-1, node:gw-2, node:gw-1, minio, nats, postgres$/m);
       await expectAllDown(readRig(dir));
     } finally { killRecorded(rig.procs, dir); }
   }, 180_000);
@@ -446,7 +464,7 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
     const fresh = kind => { for (const f of readdirSync(stubs)) if (f.endsWith(".count") || f.endsWith(".away")) rmSync(join(stubs, f)); return lateKinds[kind]?.() ?? broken[kind]; };
     const rig = await startRig({ dir, nodeCmd: stub(), timeoutMs: 60_000 });
     try {
-      expect(rig.procs.length).toBe(6);
+      expect(rig.procs.length).toBe(7);
       const before = readFileSync(join(dir, "rig.json"), "utf8");
       for (const kind of [...Object.keys(broken), ...Object.keys(lateKinds)]) {
         try {
@@ -464,7 +482,7 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
         for (const p of rig.procs) expect({ kind, name: p.name, alive: lstart(p.pid) === p.started }).toEqual({ kind, name: p.name, alive: true });
       }
       const r = await stopRig(dir);
-      expect(r.stopped.length).toBe(6);
+      expect(r.stopped.length).toBe(7);
       await expectAllDown(readRig(dir));
     } finally { _setPsPath(); killRecorded(rig.procs, dir); }
   }, 120_000);
@@ -514,7 +532,7 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
       expect(await a.exited).toBe(0);
       const rig = readRig(dir);
       expect(rig.state).toBe("up");
-      expect(rig.procs.length).toBe(6);
+      expect(rig.procs.length).toBe(7);
       expect(rig.procs.every(isOurs)).toBe(true);
       expect(existsSync(join(dir, "pg", "PG_VERSION"))).toBe(true);
       expect(existsSync(join(dir, "up.lock"))).toBe(false);

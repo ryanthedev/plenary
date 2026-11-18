@@ -5,8 +5,8 @@ import { readFileSync, readdirSync, statSync, mkdtempSync, mkdirSync, writeFileS
 import { tmpdir } from "node:os";
 import { join, relative, dirname } from "node:path";
 import { spawn as nodeSpawn } from "node:child_process";
-import { missingBins, rigStatus, isOurs, stopRig } from "../../scripts/cluster-rig.js";
-import { freshDir, track, cleanupAll, rigUp, spawnTracked } from "./rig-guard.js";
+import { missingBins, rigStatus, isOurs, stopRig, STARTED_CLOCK } from "../../scripts/cluster-rig.js";
+import { freshDir, track, cleanupAll, rigUp, spawnTracked, lstart } from "./rig-guard.js";
 
 const ROOT = new URL("../..", import.meta.url).pathname;
 const SCRIPT = readFileSync(join(ROOT, "scripts/test-cluster.js"), "utf8");
@@ -22,19 +22,31 @@ test("H1: test-cluster starts the rig services-only, never a node or the LB", ()
 });
 
 // Files that name the gated variables without reading the rig's cluster (they set them explicitly, assert a refusal, or
-// are rig-owned): the number of lines allowed to name them. One more line in any of these is a new read and fails the
-// guard, so the allowance is per occurrence, never per file.
-const ALLOW = { "test/admin/devadmin.test.js": 3, "test/auth/google-live-server.test.js": 1, "test/server/main.test.js": 15,
-  "test/server/p4-wire2.test.js": 9, "test/deploy/cluster-rig.test.js": 5, "test/deploy/stub-node.js": 2,   // helper, rig-owned
-  "test/server/room-host-child.js": 2,   // helper of room-host-lease and room-host-proc, both listed
-  "test/deploy/test-cluster.test.js": 24 };   // this file: the fixtures below
+// are rig-owned) are allowed exactly the lines in gated-allow.json: the line text (trimmed), not a count and not a line
+// number (room-host-child.js is a helper of room-host-proc only; the guard below checks its importers). A new line, an edited line (a second read appended to it), or a read swapped in for a deleted mention is
+// not on the list and fails the guard. The JSON is not code, so the scan never reads it.
+const ALLOW = JSON.parse(readFileSync(join(ROOT, "test/deploy/gated-allow.json"), "utf8"));
 const GATED_NAME = /\b(DATABASE_URL|NATS_URL|S3_[A-Z0-9_]+)\b/;   // any form: process.env.X, ["X"], destructuring, a bare constant
+const GATED_ALL = new RegExp(GATED_NAME.source, "g");
 // Every file bun discovers as a test (.test/_test/.spec/_spec x js jsx ts tsx mjs cjs mts cts), and every helper module beside them.
 const CODE_FILE = /\.(js|jsx|ts|tsx|mjs|cjs|mts|cts)$/;
 const TEST_FILE = /[._](test|spec)\.(js|jsx|ts|tsx|mjs|cjs|mts|cts)$/;
-const namingLines = (root, f) => readFileSync(join(root, f), "utf8").split("\n").filter(l => GATED_NAME.test(l)).length;
+const namingLines = (root, f) => readFileSync(join(root, f), "utf8").split("\n").filter(l => GATED_NAME.test(l)).map(l => l.trim());
+const occurrences = (root, f) => (readFileSync(join(root, f), "utf8").match(GATED_ALL) ?? []).length;
+/** Naming lines of `f` that are not on its allowlist (each allowed line is used up once). */
+const unallowed = (root, f, allow = ALLOW) => {
+  const left = [...(allow[f] ?? [])];
+  return namingLines(root, f).filter(l => { const i = left.indexOf(l); if (i < 0) return true; left.splice(i, 1); return false; });
+};
 const gatedFiles = (root, allow = ALLOW) => walk(join(root, "test")).filter(f => CODE_FILE.test(f)).map(f => relative(root, f))
-  .filter(f => namingLines(root, f) > (allow[f] ?? 0)).sort();
+  .filter(f => unallowed(root, f, allow).length > 0).sort();
+/** Files that name an allowlisted helper but are neither listed in `script` nor allowlisted themselves (a new importer). */
+const orphans = (root, script, allow = ALLOW) => {
+  const listed = [...script.matchAll(/"(test\/[\w./-]+)"/g)].map(m => m[1]);
+  const helpers = Object.keys(allow).filter(f => !TEST_FILE.test(f)).map(h => h.split("/").pop());
+  return walk(join(root, "test")).filter(f => CODE_FILE.test(f)).map(f => relative(root, f))
+    .filter(f => !listed.includes(f) && !(f in allow) && helpers.some(h => readFileSync(join(root, f), "utf8").includes(h)));
+};
 
 test("L6: the gated list in test-cluster.js is exactly the test files (and helpers) that name DATABASE_URL, NATS_URL or an S3_* variable", () => {
   const listed = [...SCRIPT.matchAll(/"(test\/[\w./-]+)"/g)].map(m => m[1]).sort();
@@ -42,11 +54,18 @@ test("L6: the gated list in test-cluster.js is exactly the test files (and helpe
   expect(listed.every(f => TEST_FILE.test(f))).toBe(true);   // a helper is never listed: it has an allowance and a listed importer
 });
 
-test("L12: the allowances are exact (a stale one hides a later read)", () => {
-  for (const [f, n] of Object.entries(ALLOW)) expect([f, namingLines(ROOT, f)]).toEqual([f, n]);
+test("L12/L17: the allowed lines are exact (a stale one hides a later read), and each allowed line still occurs", () => {
+  for (const [f, lines] of Object.entries(ALLOW)) {
+    expect([f, namingLines(ROOT, f).sort()]).toEqual([f, [...lines].sort()]);
+    expect(occurrences(ROOT, f)).toBeGreaterThanOrEqual(lines.length);
+  }
 });
 
-test("L6b/L12: the scan catches every read form, in every test suffix, in helpers, and one new read in an allowlisted file", () => {
+test("L18: every file that names an allowlisted helper is itself listed or allowlisted", () => {
+  expect(orphans(ROOT, SCRIPT)).toEqual([]);
+});
+
+test("L6b/L12/L17/L18: the scan catches every read form, in every test suffix, in helpers, and any new, appended or swapped read in an allowlisted file", () => {
   const root = mkdtempSync(join(tmpdir(), "plenary-guard-"));
   try {
     const caught = {
@@ -67,16 +86,26 @@ test("L6b/L12: the scan catches every read form, in every test suffix, in helper
       "test/a/tsx.spec.tsx": "process.env.DATABASE_URL",
       "test/a/helper.js": "export const url = process.env.DATABASE_URL;",   // a helper a test imports
       "test/a/helper-ts.ts": "export const url = process.env.NATS_URL;",
-      "test/a/allowed-plus-one.test.js": "// DATABASE_URL named in a comment\nprocess.env.NATS_URL",   // allowance 1, two lines
+      "test/a/allowed-plus-one.test.js": "// DATABASE_URL named in a comment\nprocess.env.NATS_URL",   // one allowed line, two lines
+      "test/a/appended.test.js": "// DATABASE_URL named in a comment; const x = process.env.NATS_URL;",   // a second read appended to the allowed line
+      "test/a/swapped.test.js": "const x = process.env.NATS_URL;",   // the allowed mention deleted, a read put elsewhere: same count
     };
     const quiet = {
       "test/a/clean.test.js": "const u = process.env.HOME;",
-      "test/a/allowed.test.js": "process.env.DATABASE_URL",
+      "test/a/allowed.test.js": "  // DATABASE_URL named in a comment  ",
       "test/a/readme.md": "process.env.DATABASE_URL",
       "test/a/data.json": '{ "DATABASE_URL": 1 }',
     };
     for (const [f, body] of Object.entries({ ...caught, ...quiet })) { mkdirSync(dirname(join(root, f)), { recursive: true }); writeFileSync(join(root, f), body); }
-    expect(gatedFiles(root, { "test/a/allowed.test.js": 1, "test/a/allowed-plus-one.test.js": 1 })).toEqual(Object.keys(caught).sort());
+    const allow = { "test/a/allowed.test.js": ["// DATABASE_URL named in a comment"], "test/a/allowed-plus-one.test.js": ["// DATABASE_URL named in a comment"],
+      "test/a/appended.test.js": ["// DATABASE_URL named in a comment"], "test/a/swapped.test.js": ["// DATABASE_URL named in a comment"] };
+    expect(gatedFiles(root, allow)).toEqual(Object.keys(caught).sort());
+    expect(occurrences(root, "test/a/appended.test.js")).toBe(2);   // one line, two occurrences
+    // L18: a new importer of an allowlisted helper that names no gated variable
+    const helper = { "test/a/helper.js": ["export const url = process.env.DATABASE_URL;"] };
+    writeFileSync(join(root, "test/a/importer.test.js"), 'import "./helper.js";');
+    writeFileSync(join(root, "test/a/ok.test.js"), 'import "./helper.js";');
+    expect(orphans(root, '"test/a/ok.test.js"', helper)).toEqual(["test/a/importer.test.js"]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -178,32 +207,92 @@ test.skipIf(SKIP)("L15: `up --watch-parent` stops what it started and exits 1 wh
   } finally { try { up.kill("SIGKILL"); } catch {} try { parent.kill("SIGKILL"); } catch {} }
 }, 120_000);
 
-test.skipIf(SKIP)("L15: test-cluster reaps rigs of dead test:cluster runs at startup, and leaves live runs' and other rigs alone", async () => {
-  const dead = Bun.spawnSync(["/usr/bin/true"]).pid;   // a pid that has exited
-  const stale = join(ROOT, ".rig", `test-${dead}-aaaaaa`), live = join(ROOT, ".rig", `test-${process.pid}-bbbbbb`), other = join(ROOT, ".rig", `l15-other-${process.pid}`);
-  const emptyStale = join(ROOT, ".rig", `test-${dead}-cccccc`);
-  for (const d of [stale, live, other, emptyStale]) track(d);
-  mkdirSync(emptyStale, { recursive: true });   // a run killed before its first service started
-  await Promise.all([[stale, `test-${dead}-aaaaaa`], [live, `test-${process.pid}-bbbbbb`], [other, "l15-other"]]
-    .map(([dir, name]) => rigUp({ dir, name, servicesOnly: true, timeoutMs: 60_000 })));
-  const stalePids = rigStatus(stale).procs.map(p => p.pid), livePids = rigStatus(live).procs.map(p => p.pid);
-  const tmp = mkdtempSync(join(tmpdir(), "plenary-reap-"));
+// The reaper tests run test-cluster.js with its own rig root (PLENARY_RIG_ROOT), so no other run's rigs are involved.
+const freePid = () => { for (;;) { const pid = 90_000 + Math.floor(Math.random() * 9_900); try { process.kill(pid, 0); } catch (e) { if (e.code === "ESRCH") return pid; } } };   // known free just now
+const sleepers = [];
+afterAll(() => { for (const p of sleepers) try { p.kill("SIGKILL"); } catch {} });
+/** A rig dir whose one "service" is a `sleep`: enough for the reaper to leave alone or stop, with no real services. */
+function sleepRig(dir) {
+  const proc = nodeSpawn("/bin/sleep", ["300"], { stdio: "ignore" });
+  sleepers.push(proc);
+  const entry = { name: "sleep", pid: proc.pid, started: lstart(proc.pid) };
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "rig.json"), JSON.stringify({ version: 1, name: "sleep", dir, startedClock: STARTED_CLOCK, state: "up", procs: [entry], nodes: [] }) + "\n");
+  return { proc, entry };
+}
+const rootDir = () => track(mkdtempSync(join(tmpdir(), "plenary-reap-")));
+const passFile = () => {
+  const tmp = track(mkdtempSync(join(tmpdir(), "plenary-pass-")));
   const file = join(tmp, "pass.test.js");
   writeFileSync(file, 'import { test, expect } from "bun:test";\ntest("passes", () => expect(1).toBe(1));\n');
-  try {
-    const r = Bun.spawnSync([process.execPath, "--no-env-file", join(ROOT, "scripts/test-cluster.js"), file], { cwd: ROOT, stdout: "pipe", stderr: "pipe" });
-    const out = r.stdout.toString() + r.stderr.toString();
-    expect(r.exitCode, out).toBe(0);
-    expect(out).toContain(`reaping stale rig test-${dead}-aaaaaa`);
-    expect(existsSync(stale)).toBe(false);
-    expect(existsSync(emptyStale)).toBe(false);
-    for (const pid of stalePids) {   // this test process started them, so a dead one stays a zombie until reaped: not "Z" means running
-      const stat = Bun.spawnSync(["/bin/ps", "-o", "stat=", "-p", String(pid)], { env: { PATH: "/usr/bin:/bin" } }).stdout.toString().trim();
-      expect(stat === "" || stat.startsWith("Z")).toBe(true);
-    }
-    expect(out).not.toContain(`test-${process.pid}-bbbbbb`);
-    expect(rigStatus(live).procs.every(p => isOurs(p))).toBe(true);   // a live run's rig is untouched
-    expect(rigStatus(other).procs.every(p => isOurs(p))).toBe(true);
-    expect(livePids.length).toBe(3);
-  } finally { rmSync(tmp, { recursive: true, force: true }); }
+  return file;
+};
+const runCluster = (root, file) => {
+  const r = Bun.spawnSync([process.execPath, "--no-env-file", join(ROOT, "scripts/test-cluster.js"), file], { cwd: ROOT, stdout: "pipe", stderr: "pipe", env: { ...process.env, PLENARY_RIG_ROOT: root } });
+  return { code: r.exitCode, out: r.stdout.toString() + r.stderr.toString() };
+};
+
+test.skipIf(SKIP)("L15/L21: test-cluster reaps rigs of dead test:cluster runs at startup, and leaves live runs' and other rigs alone", async () => {
+  const root = rootDir(), dead = freePid();
+  const stale = join(root, `test-${dead}-aaaaaa`), live = join(root, `test-${process.pid}-bbbbbb`), other = join(root, "l15-other"), emptyStale = join(root, `test-${dead}-cccccc`);
+  track(stale);
+  mkdirSync(emptyStale, { recursive: true });   // a run killed before its first service started
+  writeFileSync(`${emptyStale}.owner`, "x\n");
+  const rigStale = await rigUp({ dir: stale, name: `test-${dead}-aaaaaa`, servicesOnly: true, timeoutMs: 60_000 });   // the only real services
+  const liveSleep = sleepRig(live), otherSleep = sleepRig(other);
+  writeFileSync(`${live}.owner`, lstart(process.pid) + "\n");   // this process, as test-cluster would have recorded it
+  const before = [live, other].map(d => readFileSync(join(d, "rig.json"), "utf8"));
+  const { code, out } = runCluster(root, passFile());
+  expect(code, out).toBe(0);
+  expect(out).toContain(`reaping stale rig test-${dead}-aaaaaa`);
+  expect(existsSync(stale)).toBe(false);
+  expect(existsSync(emptyStale)).toBe(false);
+  expect(existsSync(`${emptyStale}.owner`)).toBe(false);
+  for (const p of rigStale.procs) expect(isOurs(p)).toBe(false);   // stopped (a zombie child of this test counts as gone)
+  expect(out).not.toContain(`test-${process.pid}-bbbbbb`);
+  expect([live, other].map(d => readFileSync(join(d, "rig.json"), "utf8"))).toEqual(before);   // untouched, byte for byte
+  expect(isOurs(liveSleep.entry) && isOurs(otherSleep.entry)).toBe(true);
+  expect(readdirSync(root).sort()).toEqual([`test-${process.pid}-bbbbbb`, `test-${process.pid}-bbbbbb.owner`, "l15-other"].sort());   // test-cluster's own rig and owner record are gone
 }, 180_000);
+
+test.skipIf(SKIP)("M4: a SIGINT while the reaper's `down` runs does not signal it, and the run stops before starting a rig of its own", async () => {
+  const root = rootDir(), dead = freePid();
+  const stale = join(root, `test-${dead}-aaaaaa`);
+  track(stale);
+  const rigStale = await rigUp({ dir: stale, name: `test-${dead}-aaaaaa`, servicesOnly: true, timeoutMs: 60_000 });
+  const proc = nodeSpawn(process.execPath, ["--no-env-file", join(ROOT, "scripts/test-cluster.js"), passFile()],
+    { cwd: ROOT, detached: true, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PLENARY_RIG_ROOT: root } });
+  let out = "", sent = false;
+  const exited = new Promise(r => proc.on("close", r));
+  const onData = d => { out += d; if (!sent && out.includes("reaping stale rig")) { sent = true; try { process.kill(-proc.pid, "SIGINT"); } catch {} } };
+  proc.stdout.on("data", onData); proc.stderr.on("data", onData);
+  try {
+    const code = await exited;
+    expect(sent).toBe(true);
+    expect(code, out).not.toBe(0);
+    expect(out).toContain("interrupted while reaping");
+    expect(out).not.toContain("initdb");   // no rig of its own was brought up
+    for (const p of rigStale.procs) expect(isOurs(p), out).toBe(false);   // the reaper's `down` finished
+    expect(existsSync(stale)).toBe(false);
+    expect(readdirSync(root)).toEqual([]);
+  } finally { try { process.kill(-proc.pid, "SIGKILL"); } catch {} }
+}, 120_000);
+
+test.skipIf(SKIP)("L20: a rig whose owner pid is now another process (different start time) is reaped; the same pid with the recorded start time is left alone", async () => {
+  const root = rootDir();
+  const owner = nodeSpawn("/bin/sleep", ["300"], { stdio: "ignore" });   // a live process holding the "owner" pid
+  sleepers.push(owner);
+  const reused = join(root, `test-${owner.pid}-dddddd`), same = join(root, `test-${owner.pid}-eeeeee`);
+  const reusedSvc = sleepRig(reused), sameSvc = sleepRig(same);
+  writeFileSync(`${reused}.owner`, "Thu Jan  1 00:00:00 1970\n");   // recorded by a process that is not this one
+  writeFileSync(`${same}.owner`, lstart(owner.pid) + "\n");
+  const { code, out } = runCluster(root, passFile());
+  expect(code, out).toBe(0);
+  expect(out).toContain(`reaping stale rig test-${owner.pid}-dddddd`);
+  expect(out).not.toContain(`reaping stale rig test-${owner.pid}-eeeeee`);
+  expect(existsSync(reused)).toBe(false);
+  expect(existsSync(`${reused}.owner`)).toBe(false);
+  expect(isOurs(reusedSvc.entry)).toBe(false);
+  expect(isOurs(sameSvc.entry)).toBe(true);
+  expect(existsSync(same)).toBe(true);
+}, 120_000);

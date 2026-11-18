@@ -89,7 +89,7 @@ keeps its rig dir (state `down`) unless it was already green when teardown start
 
 After a `SIGKILL` of `test:cluster` itself (nothing can catch it): the `up` helper watches its parent (`up
 --watch-parent <pid>`) and stops what it started, but services of a run that was already testing are left running.
-The next `bun run test:cluster` reaps every `test-<pid>-<hash>` rig whose pid is dead (never a live run's rig, never
+The next `bun run test:cluster` reaps every `test-<pid>-<hash>` rig whose owner is gone: its pid is dead, or reused by another process (the owner's start time is recorded beside the rig dir, in `test-<pid>-<hash>.owner`) (never a live run's rig, never
 another name). To recover by hand: `bun run rig ls` lists live rigs, then `bun run rig down --name <name> --clean`.
 The gated files are
 `test/server/pg-store`, `pg-registry`, `nats-bus`, `room-host-lease`, `room-host-proc`, `main-cluster`, `s3-blobs`,

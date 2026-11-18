@@ -228,7 +228,7 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
   test("up: a part that never becomes healthy fails with the timeout error, and everything started is stopped", async () => {
     const dir = freshDir();
     let err = null;
-    try { await startRig({ dir, nodeCmd: ["sleep", "300"], timeoutMs: 8000 }); } catch (e) { err = e; }
+    try { await startRig({ dir, nodeCmd: ["sleep", "300"], timeoutMs: 5000 }); } catch (e) { err = e; }
     expect(err?.message).toMatch(/not ready after the timeout \(log: /);
     const rig = readRig(dir);
     expect(rig.state).toBe("failed");

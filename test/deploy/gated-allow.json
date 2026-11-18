@@ -1,0 +1,84 @@
+{
+  "test/admin/devadmin.test.js": [
+    "// Only these keys: start() reads its argument, never process.env (so no DATABASE_URL from a checkout's .env).",
+    "// temp dir and the env is explicit, so no checkout .env (DATABASE_URL) is loaded.",
+    "expect(await run([\"--domain\", \"acme.com\", \"--admin\", \"dev:ann\"], { DATABASE_URL: secret }, x.io)).toBe(1);"
+  ],
+  "test/auth/google-live-server.test.js": [
+    "// no PLENARY_DEV_TOKENS (dev tokens off), no DATABASE_URL / NATS_URL (single node)"
+  ],
+  "test/server/main.test.js": [
+    "await expect(start(devEnv(tempDir(), { DATABASE_URL: \"postgres://x@127.0.0.1:1/x\" }))).rejects.toThrow(/cluster/);",
+    "await expect(start(devEnv(tempDir(), { NATS_URL: \"nats://127.0.0.1:1\" }))).rejects.toThrow(/cluster/);",
+    "await refused({ DATABASE_URL: PG, ...KEY }, /^NATS_URL is required in cluster mode/);",
+    "await refused({ NATS_URL: NATS, ...KEY }, /^DATABASE_URL is required in cluster mode/);",
+    "await refused({ DATABASE_URL: PG }, /NATS_URL/);                 // before COOKIE_KEY's own refusal",
+    "const { err } = await refused({ DATABASE_URL: PG, NATS_URL: NATS, ...KEY }, /^could not open the Postgres (store|registry) \\(DATABASE_URL\\)/);",
+    "test(\"p4-wire: a NATS open failure after Postgres opened: the error names NATS_URL, both Postgres halves are closed, no URL part anywhere\", async () => {",
+    "const { err, lines } = await refusedWith({ DATABASE_URL: PG, NATS_URL: NATS, ...KEY }, { adapters }, /^could not open the NATS bus \\(NATS_URL\\): could not connect to \\*\\*\\*/);",
+    "const { err } = await refusedWith({ DATABASE_URL: PG, NATS_URL: NATS, ...KEY }, { adapters }, /^could not open the Postgres store \\(DATABASE_URL\\) \\[E_\\*\\*\\*\\]: connect failed to \\*\\*\\* \\(password \\*\\*\\*\\)$/);",
+    "expect(nodeConfig({ DATABASE_URL: PG, NATS_URL: NATS, PLENARY_ROLES: \" Gateway \" }).roles).toEqual({ gateway: true, host: false });",
+    "expect(nodeConfig({ DATABASE_URL: PG, NATS_URL: NATS, PLENARY_ROLES: \"host\" }).roles).toEqual({ gateway: false, host: true });",
+    "expect(nodeConfig({ DATABASE_URL: PG, NATS_URL: NATS, PLENARY_ROLES: \"HOST, gateway\" }).roles).toEqual({ gateway: true, host: true });",
+    "await refused({ DATABASE_URL: PG, NATS_URL: NATS, ...KEY, PLENARY_ROLES: bad }, /^PLENARY_ROLES/);",
+    "for (const env of [{ DATABASE_URL: PG, COOKIE_KEY: \"k\".repeat(32) }, { PLENARY_ROLES: \"nope\" }, { PLENARY_LEASE_TTL_MS: \"1\" }]) {",
+    "expect(p.lines().map(l => JSON.parse(l)).find(l => l.msg === \"start refused\")?.message).toMatch(/NATS_URL|PLENARY_ROLES|PLENARY_LEASE_TTL_MS/);"
+  ],
+  "test/server/p4-wire2.test.js": [
+    "//   M1 NATS credentials in NATS_URL reach the client as options; L1 redact()'s missing URL forms; L2 every log line",
+    "const { err, lines } = await refusedStart({ DATABASE_URL: PG, NATS_URL: nats, ...KEY }, { adapters });",
+    "expect(err.message).toMatch(/^could not open the NATS bus \\(NATS_URL\\)/);",
+    "const app = await start({ PLENARY_DATA_DIR: tempDir(), PORT: \"0\", LOG_LEVEL: \"debug\", DATABASE_URL: PG, NATS_URL: `nats://plen:${PW}@127.0.0.1:1`, ...KEY },",
+    "test(\"L7: DATABASE_URL or NATS_URL set but empty (or blank) refuses the start, naming the variable\", async () => {",
+    "[{ DATABASE_URL: \"\", NATS_URL: \"\" }, \"DATABASE_URL\"],",
+    "[{ DATABASE_URL: \"\" }, \"DATABASE_URL\"],",
+    "[{ NATS_URL: \" \" }, \"NATS_URL\"],",
+    "[{ DATABASE_URL: PG, NATS_URL: \"\", ...KEY }, \"NATS_URL\"],"
+  ],
+  "test/deploy/cluster-rig.test.js": [
+    "\"S3_ENDPOINT=http://127.0.0.1:9000\", \"S3_BUCKET=plenary\", \"S3_REGION=us-east-1\",",
+    "\"S3_ACCESS_KEY_ID=local-key\", \"S3_SECRET_ACCESS_KEY=local-secret\",",
+    "const allowed = [\"COOKIE_KEY\", \"DATABASE_URL\", \"HOME\", \"HOST\", \"LANG\", \"LOG_LEVEL\", \"NATS_URL\", \"PATH\", \"PLENARY_DATA_DIR\", \"PLENARY_DEV_TOKENS\",",
+    "// DATABASE_URL reaches the rig's own database; NATS is up with 2 MB payloads.",
+    "// End to end with the real server/main.js, which runs in cluster mode on the rig's env (DATABASE_URL, NATS_URL,"
+  ],
+  "test/deploy/stub-node.js": [
+    "node, roles, port: Number(env.PORT), leaseTtlMs: Number(env.PLENARY_LEASE_TTL_MS), databaseUrl: env.DATABASE_URL,",
+    "natsUrl: env.NATS_URL, dataDir: env.PLENARY_DATA_DIR, maxConnsPerUser: Number(env.PLENARY_MAX_CONNS_PER_USER),"
+  ],
+  "test/server/room-host-child.js": [
+    "const store = await postgresStore({ url: process.env.DATABASE_URL, schema, max: 3 });",
+    "const bus = await natsBus({ url: process.env.NATS_URL });"
+  ],
+  "test/deploy/test-cluster.test.js": [
+    "const GATED_NAME = /\\b(DATABASE_URL|NATS_URL|S3_[A-Z0-9_]+)\\b/;   // any form: process.env.X, [\"X\"], destructuring, a bare constant",
+    "test(\"L6: the gated list in test-cluster.js is exactly the test files (and helpers) that name DATABASE_URL, NATS_URL or an S3_* variable\", () => {",
+    "\"test/a/dot.test.js\": \"const u = process.env.DATABASE_URL;\",",
+    "\"test/a/destructure.test.js\": \"const { DATABASE_URL } = process.env;\",",
+    "\"test/a/bracket.test.js\": 'const u = process.env[\"NATS_URL\"];',",
+    "\"test/a/s3.test.js\": \"const b = process.env.S3_BUCKET;\",",
+    "\"test/a/alias.test.js\": \"const E = process.env; E.S3_ENDPOINT;\",",
+    "\"test/a/bun-env.test.js\": \"Bun.env.NATS_URL\",",
+    "\"test/deploy/gated-in-deploy.test.js\": \"process.env.DATABASE_URL\",",
+    "\"test/a/deep/er/x.test.js\": \"process.env.DATABASE_URL\",",
+    "\"test/a/spec.spec.js\": \"process.env.DATABASE_URL\",",
+    "\"test/a/under_test.js\": \"process.env.DATABASE_URL\",",
+    "\"test/a/under_spec.js\": \"process.env.DATABASE_URL\",",
+    "\"test/a/typed.test.ts\": \"process.env.DATABASE_URL\",",
+    "\"test/a/mod.test.mjs\": \"process.env.DATABASE_URL\",",
+    "\"test/a/common.test.cjs\": \"process.env.DATABASE_URL\",",
+    "\"test/a/tsx.spec.tsx\": \"process.env.DATABASE_URL\",",
+    "\"test/a/helper.js\": \"export const url = process.env.DATABASE_URL;\",   // a helper a test imports",
+    "\"test/a/helper-ts.ts\": \"export const url = process.env.NATS_URL;\",",
+    "\"test/a/allowed-plus-one.test.js\": \"// DATABASE_URL named in a comment\\nprocess.env.NATS_URL\",   // one allowed line, two lines",
+    "\"test/a/appended.test.js\": \"// DATABASE_URL named in a comment; const x = process.env.NATS_URL;\",   // a second read appended to the allowed line",
+    "\"test/a/swapped.test.js\": \"const x = process.env.NATS_URL;\",   // the allowed mention deleted, a read put elsewhere: same count",
+    "\"test/a/allowed.test.js\": \"  // DATABASE_URL named in a comment  \",",
+    "\"test/a/readme.md\": \"process.env.DATABASE_URL\",",
+    "\"test/a/data.json\": '{ \"DATABASE_URL\": 1 }',",
+    "const allow = { \"test/a/allowed.test.js\": [\"// DATABASE_URL named in a comment\"], \"test/a/allowed-plus-one.test.js\": [\"// DATABASE_URL named in a comment\"],",
+    "\"test/a/appended.test.js\": [\"// DATABASE_URL named in a comment\"], \"test/a/swapped.test.js\": [\"// DATABASE_URL named in a comment\"] };",
+    "const helper = { \"test/a/helper.js\": [\"export const url = process.env.DATABASE_URL;\"] };",
+    "expect(run([\"env\", \"--dir\", dir]).stdout.toString()).toContain(`S3_SECRET_ACCESS_KEY=${rig.blobs.secretKey}`);"
+  ]
+}

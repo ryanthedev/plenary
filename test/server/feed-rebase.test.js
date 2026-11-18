@@ -198,6 +198,21 @@ test("the look backoff is jittered into [ceil(b/2), b] heartbeats, so gateways d
   } finally { await s.close(); }
 });
 
+test("the backoff's jitter defaults to Math.random (it can't silently be off)", async () => {
+  const random = Math.random;
+  let calls = 0;
+  Math.random = () => { calls++; return 0.999; };
+  try {
+    const s = await setup({ n: 3, feedOpts: { rebaseEvery: 2 } });         // no random passed
+    try {
+      await s.checkpoint(3);
+      s.io.failEntryReads = true;
+      expect(await lookBeats(s, 21, { cp: 3 })).toEqual([1, 2, 4, 7, 12, 21]);   // the jittered sequence, as with 0.999
+      expect(calls).toBeGreaterThanOrEqual(6);
+    } finally { await s.close(); }
+  } finally { Math.random = random; }
+});
+
 test("a heartbeat naming a newer checkpoint ends the backoff: the feed looks at once", async () => {
   const s = await setup({ n: 5, feedOpts: { rebaseEvery: 2, random: () => 0 } });
   try {

@@ -22,14 +22,14 @@ const json = (status, body) => new Response(JSON.stringify(body), { status, head
  *   port?: number, hostname?: string,
  *   http?: (req: Request, url: URL) => Response | undefined | Promise<Response | undefined>,
  *   limits?: object, host?: object, static?: false | { mounts?: { url: string, dir: string }[] },
- *   roles?: { gateway: boolean, host: boolean }, node?: string,
+ *   roles?: { gateway: boolean, host: boolean }, node?: string, now?: () => number,
  * }} o — `port: 0` picks a free port. `host` options go to the room host (tests; main.js passes hostname and
  *   leaseTtlMs). `static: false` serves no web app; an object passes its `mounts` to staticSite (default: the repo's
  *   web/ and packages/, from static.js's own path). `roles`: see the header (default both). `node`: this node's id
- *   (names a gateway-only node's open requests).
+ *   (names a gateway-only node's open requests). `now`: the gateway's clock; tests inject a virtual one (default Date.now).
  */
 export function createServer({ auth, registry, store, bus, blobs = null, log = quietLogger, port = 0, hostname = "127.0.0.1", http, limits, host = {}, static: web = {},
-  roles = { gateway: true, host: true }, node = "node" }) {
+  roles = { gateway: true, host: true }, node = "node", now }) {
   if (!roles || (!roles.gateway && !roles.host)) throw new TypeError("createServer needs at least one role (gateway, host)");
   const started = Date.now();
   const site = web === false || !roles.gateway ? null : staticSite({ log, ...web });
@@ -37,7 +37,7 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
     ? roomHost({ store, bus, log, ...host })
     : remoteRooms({ bus, node, timeoutMs: host.leaseTtlMs ?? 10_000, log });
   const unserve = roles.host ? serveOpens({ bus, rooms, log }) : () => {};
-  const gw = roles.gateway ? makeGateway({ auth, registry, store, bus, rooms, log, limits }) : null;
+  const gw = roles.gateway ? makeGateway({ auth, registry, store, bus, rooms, log, limits, ...(now ? { now } : {}) }) : null;
 
   const server = Bun.serve({
     port, hostname,

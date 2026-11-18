@@ -11,7 +11,20 @@ import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy, roleCache } from "../../server/auth/tenancy.js";
 import { Replica } from "../../packages/protocol/replica.js";
 import { jsonCodec } from "../../packages/protocol/codec.js";
+import { afterEach } from "bun:test";
 import { tempDir, sleep, until } from "./helpers.js";
+
+/**
+ * The room host's heartbeat in tests (production default 2 s). Things a test waits for ride on it: the gateway's board feed
+ * rebases onto a fold and catches up on the Store on the next heartbeat, and a waiting host's silence rule is 2 of them.
+ * A test that depends on the production value passes its own `host.heartbeatMs`.
+ */
+export const HEARTBEAT_MS = 200;
+
+/** Every rig not yet stopped. A test that fails before its last line would leave a gateway and its sockets running: afterEach (below) stops them. */
+const live = new Set();
+export const stopRigs = () => Promise.all([...live].map(r => r.stop()));
+afterEach(stopRigs);   // registered once per test file that imports this module
 
 export const ROLES = ["owner", "editor", "annotator", "commenter", "viewer"];
 /** Every dev token contains this, so a test can assert no token ever reaches a log line. */
@@ -20,7 +33,7 @@ export const tokenOf = name => `${SECRET}-${name}-token`;
 
 /**
  * @param {{ verifyDelayMs?: number, cache?: object, wrapStore?: (s: object) => object, wrapAuth?: (a: object) => object,
- *   wrapRegistry?: (r: object) => object, wrapBus?: (b: object) => object, limits?: object, host?: object, dir?: string, registry?: object, ids?: object }} [o]
+ *   wrapRegistry?: (r: object) => object, wrapBus?: (b: object) => object, now?: () => number, limits?: object, host?: object, dir?: string, registry?: object, ids?: object }} [o]
  * Pass `dir`, `registry` and `ids` from an earlier rig to restart "the same server" on the same data.
  */
 export async function rig(o = {}) {
@@ -63,7 +76,7 @@ export async function rig(o = {}) {
   bus.subscribe(subjects.inbox(ids.tenant, ids.otherBoard), m => inbox.push(m));
   // Catch-up frames are the gateway's now (its board feed): the scaffold's room-host knobs map onto the feed's.
   const feed = { ...(o.host?.chunkBytes ? { chunkBytes: o.host.chunkBytes } : {}), ...(o.host?.tailFoldBytes ? { rebaseBytes: Math.max(1, Math.floor(o.host.tailFoldBytes / 4)) } : {}), ...(o.limits?.feed ?? {}) };
-  const server = createServer({ auth, registry: reg, store, bus, blobs: diskBlobs({ dir: join(dir, "blobs") }), log, port: 0, limits: { opRate: 1e6, opBurst: 1e6, ...(o.limits ?? {}), feed }, host: o.host });   // the gateway's op pace is off unless a test sets it
+  const server = createServer({ auth, registry: reg, store, bus, blobs: diskBlobs({ dir: join(dir, "blobs") }), log, port: 0, limits: { opRate: 1e6, opBurst: 1e6, ...(o.limits ?? {}), feed }, host: { heartbeatMs: HEARTBEAT_MS, ...o.host }, ...(o.now ? { now: o.now } : {}) });   // the gateway's op pace is off unless a test sets it
 
   const self = {
     dir, lines, log, registry, ids, store, rawStore, bus, server, inbox, calls, cacheCalls,
@@ -74,8 +87,13 @@ export async function rig(o = {}) {
     idle: () => server.rooms.idle(ids.tenant, ids.board),
     sock: () => sock(server.wsUrl),
     client: (name, cname) => client(self, name, cname),
-    async stop({ keepStore = false } = {}) { await server.stop(); await bus.close(); if (!keepStore) await rawStore.close(); },
+    /** Idempotent: a test that stops its rig itself and the afterEach safety net both call it. */
+    async stop({ keepStore = false } = {}) {
+      if (!live.delete(self)) return;
+      await server.stop(); await bus.close(); if (!keepStore) await rawStore.close();
+    },
   };
+  live.add(self);
   return self;
 }
 

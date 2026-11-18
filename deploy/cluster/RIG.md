@@ -52,7 +52,7 @@ bun run test:full                                   # run all tests (same as bun
 
 `up` flags: `--name <a-z0-9->` (rig dir `.rig/<name>/`), `--dir <path>`, `--gateways n` (default 2), `--hosts n`
 (default 1), `--lease-ttl-ms n` (default 10000, the same on every node), `--max-conns-per-user n` (default 100000),
-`--timeout-ms n` (default 60000, for the whole start), and `--node-cmd "<cmd> <args>"` to run something other than
+`--timeout-ms n` (default 60000, for the whole start), `--watch-parent <pid>` (abort and stop what started if that process dies), and `--node-cmd "<cmd> <args>"` to run something other than
 `bun server/main.js` (the tests use a stub). `status`, `kill`, `env` and `down` take `--name` or `--dir` too. Missing rig
 names fail with a suggestion when another rig exists. `status --json` contains the S3 endpoint, bucket and credentials;
 `env` prints all S3 settings for the tests.
@@ -81,7 +81,17 @@ Postgres is TCP-only because macOS limits Unix socket paths to 103 bytes, so a s
 
 `bun run test:cluster` starts a uniquely named services-only rig (`up --services-only`: Postgres, NATS and MinIO, no nodes and no Caddy, because the tests start their own nodes with the ids `gw-1`, `host-1`, ... on the same NATS), runs all test files gated by `DATABASE_URL`, `NATS_URL` or
 `S3_ENDPOINT`, then stops the rig. Any skipped test fails the command. Green runs remove the rig directory; failed runs
-keep it and print its path. SIGINT, SIGTERM and SIGHUP (also a terminal Ctrl-C, which reaches the whole foreground process group) stop the child test, then tear the services down; the rig helpers run in their own process groups, so `down` always finishes. The gated files are
+keep it and print its path. SIGINT, SIGTERM and SIGHUP (also a terminal Ctrl-C, which reaches the whole foreground process group) stop the child test, then tear the services down; the rig helpers run in their own process groups, so `down` always finishes. `up` and `down` print straight to your terminal (live, in order); only `env` is captured.
+
+Exit codes: a signal that arrives after the tests passed still makes the run exit 1 (an interrupted run is never green),
+and it says so: `[test:cluster] tests passed, but SIGINT arrived before the run finished: exit 1`. An interrupted run
+keeps its rig dir (state `down`) unless it was already green when teardown started.
+
+After a `SIGKILL` of `test:cluster` itself (nothing can catch it): the `up` helper watches its parent (`up
+--watch-parent <pid>`) and stops what it started, but services of a run that was already testing are left running.
+The next `bun run test:cluster` reaps every `test-<pid>-<hash>` rig whose pid is dead (never a live run's rig, never
+another name). To recover by hand: `bun run rig ls` lists live rigs, then `bun run rig down --name <name> --clean`.
+The gated files are
 `test/server/pg-store`, `pg-registry`, `nats-bus`, `room-host-lease`, `room-host-proc`, `main-cluster`, `s3-blobs`,
 and `test/admin/tenants`.
 

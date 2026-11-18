@@ -3,7 +3,7 @@
 // processes (gateways and room hosts split) behind one Caddy load balancer, all on this machine, all on probed ports.
 //
 //   bun scripts/cluster-rig.js up     [--name default] [--dir <path>] [--gateways 2] [--hosts 1] [--services-only] [--lease-ttl-ms 10000]
-//                                     [--max-conns-per-user 100000] [--node-cmd "<cmd> <args>"] [--timeout-ms 60000]
+//                                     [--max-conns-per-user 100000] [--node-cmd "<cmd> <args>"] [--timeout-ms 60000] [--watch-parent <pid>]
 //   bun scripts/cluster-rig.js status [--name|--dir] [--json]
 //   bun scripts/cluster-rig.js kill <node-id> [--name|--dir]      SIGKILL one node by its recorded PID (takeover check)
 //   bun scripts/cluster-rig.js down   [--name|--dir] [--all] [--clean]
@@ -692,12 +692,16 @@ async function cli(argv) {
     const onSig = () => { abort.aborted = true; };
     // Ctrl-C, kill, or a closed terminal: stop what started, then exit 1 (never leave it running).
     for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, onSig);
+    // --watch-parent <pid>: the caller's death (even SIGKILL, which no handler sees) aborts `up`, which then stops what it started.
+    const parent = a["watch-parent"] === undefined ? null : num(a["watch-parent"], "watch-parent");
+    const watch = parent === null ? null : setInterval(() => { try { process.kill(parent, 0); } catch (e) { if (e.code !== "EPERM") abort.aborted = true; } }, 200);
     const nodeCmd = a["node-cmd"] ? a["node-cmd"].split(/\s+/).filter(Boolean) : undefined;
     try {
       await startRig({ name: a.name, dir, gateways: num(a.gateways, "gateways"), hosts: num(a.hosts, "hosts"), servicesOnly: !!a["services-only"],
         leaseTtlMs: num(a["lease-ttl-ms"], "lease-ttl-ms"), maxConnsPerUser: num(a["max-conns-per-user"], "max-conns-per-user"),
         timeoutMs: num(a["timeout-ms"], "timeout-ms"), nodeCmd, abort, onStep: m => console.error(`[rig] ${m}`) });
     } catch (err) { console.error(`[rig] up failed: ${err.message}`); return 1; }
+    finally { clearInterval(watch); }
     printStatus(rigStatus(dir));
     return 0;
   }

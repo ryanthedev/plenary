@@ -346,14 +346,23 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
   // ---- routes ----
   const admin = { registry, now };
   // GET /auth/dev: the dev sign-in menu for the served page (web/adapters/auth/devconfig.js). Exists ONLY while the dev
-  // verifier is on and main.js allowed the menu (a loopback bind, no Google, a gateway, an offerable user); otherwise there
+  // verifier is on and main.js allowed the menu (a loopback bind, no Google, a gateway, an offerable user), and it leaves out any name that is a tenant admin in the Registry
+  // right now; otherwise there
   // is no such route (404). It publishes those dev tokens, which main.js says loudly at start.
   const devMenu = dev && dev.enabled === true && config.devSignIn ? { board: config.devSignIn.board, users: config.devSignIn.users } : null;
   const devHosts = new Set((config.devSignIn?.hosts ?? []).map(h => String(h).toLowerCase()));
   // The Host header's name, port cut off ("[::1]:8099" -> "[::1]"). Bun builds req.url from it, but read it directly.
   const hostName = req => (req.headers.get("host") ?? "").toLowerCase().replace(/:\d*$/, "");
   const routes = [
-    ...(devMenu ? [["/auth/dev", { GET: req => (devHosts.has(hostName(req)) ? json(200, devMenu) : err(404, "not-found")) }]] : []),
+    ...(devMenu ? [["/auth/dev", { GET: async req => {
+      if (!devHosts.has(hostName(req))) return err(404, "not-found");
+      // Checked per request, through the Registry port: a dev name that is a tenant admin (an earlier run's admin token, or
+      // scripts/admin-bootstrap.js --admin dev:<name>, even after this server started) is never offered. A Registry that
+      // cannot answer fails closed: nothing is published.
+      const users = [];
+      for (const u of devMenu.users) if (!(await registry.isTenantAdmin("dev:" + u.name))) users.push(u);
+      return users.length ? json(200, { board: devMenu.board, users }) : err(404, "not-found");
+    } }]] : []),
     ["/auth/login", { GET: () => beginLogin(null) }],
     ["/auth/callback", { GET: (req, url) => callback(req, url) }],
     ["/auth/exchange", { POST: req => exchange(req) }],

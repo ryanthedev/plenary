@@ -328,7 +328,29 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
     log.warn(`Google sign-in is half configured: ${env.GOOGLE_CLIENT_ID ? "GOOGLE_CLIENT_SECRET" : "GOOGLE_CLIENT_ID"} is missing, so it stays off`);
 
   let devBoard = null, devMenu = null;
-  if (dev.enabled && !roles.gateway) log.warn("dev tokens are on, but the dev sign-in menu (GET /auth/dev) is OFF: " + devMenuOff({ users: 1, host: env.HOST || "127.0.0.1", google: !!oidc, gateway: false }) + " (no dev board on this node)");
+  // Dev users from the token table (names; one grant per user), and whether the dev sign-in menu may be on at all: ONE
+  // decision (devMenuOff), used by both branches below.
+  let best = new Map(), offered = new Map(), off = null;
+  const host = env.HOST || "127.0.0.1";
+  if (dev.enabled) {
+    // Two tokens may name the same user: one grant per user, the highest role wins (ROLES is highest first), so
+    // one start never lowers a grant it has just made.
+    for (const t of Object.values(tokens)) {
+      if (!t || typeof t.name !== "string" || !t.name) continue;
+      const user = "dev:" + t.name, role = ROLES.includes(t.role) ? t.role : "editor";
+      if (!best.has(user) || ROLES.indexOf(role) < ROLES.indexOf(best.get(user))) best.set(user, role);
+    }
+    // The dev sign-in menu: each name once, with the role it is actually granted (the highest across its tokens). A token
+    // with admin or a domain is a tenant admin or a Workspace member. Identity is per name (dev:<name>), so a name that ANY
+    // token flags admin or gives a domain is never published, whatever its other tokens say.
+    const privileged = new Set(Object.values(tokens).filter(t => t && (t.admin === true || t.domain)).map(t => t.name));
+    for (const [token, t] of Object.entries(tokens)) {
+      if (!t || typeof t.name !== "string" || !t.name || privileged.has(t.name) || offered.has(t.name)) continue;
+      offered.set(t.name, { name: t.name, token, role: best.get("dev:" + t.name) });
+    }
+    off = devMenuOff({ users: offered.size, host, google: !!oidc, gateway: roles.gateway, publicHost: publicHostOf(env.PUBLIC_URL) });
+  }
+  if (dev.enabled && !roles.gateway) log.warn("dev tokens are on, but the dev sign-in menu (GET /auth/dev) is OFF: " + off + " (no dev board on this node)", { host });
   else if (dev.enabled) {
     // Reuse the dev board across restarts (the Registry has no list call to find it by).
     const devFile = join(dataDir, "dev-board.json");
@@ -342,14 +364,6 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
       // Written whole or not at all (a kill mid-write must not leave half a file that hides the board).
       writeFileSync(devFile + ".tmp", JSON.stringify({ board: board.id }));
       renameSync(devFile + ".tmp", devFile);
-    }
-    // Two tokens may name the same user: one grant per user, the highest role wins (ROLES is highest first), so
-    // one start never lowers a grant it has just made.
-    const best = new Map();
-    for (const t of Object.values(tokens)) {
-      if (!t || typeof t.name !== "string" || !t.name) continue;
-      const user = "dev:" + t.name, role = ROLES.includes(t.role) ? t.role : "editor";
-      if (!best.has(user) || ROLES.indexOf(role) < ROLES.indexOf(best.get(user))) best.set(user, role);
     }
     // Across restarts a token's role may have dropped. The Registry refuses to demote a board's last owner
     // (code "last-owner"): that grant is kept and the start goes on. Raises go first, so a new owner named in the
@@ -372,17 +386,6 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
       try { const r = await bootstrapTenant({ registry, domain, admins }); log.info("dev tenant", { tenant: r.tenant.id, domain, created: r.created, added: r.added }); }
       catch (err) { if (err?.code !== "bad-request") throw err; log.error("dev token domain skipped", { domain, err }); }
     }
-    // The dev sign-in menu: each name once, with the role it is actually granted (the highest across its tokens). A token
-    // with admin or a domain is a tenant admin or a Workspace member. Identity is per name (dev:<name>), so a name that ANY
-    // token flags admin or gives a domain is never published, whatever its other tokens say.
-    const privileged = new Set(Object.values(tokens).filter(t => t && (t.admin === true || t.domain)).map(t => t.name));
-    const offered = new Map();
-    for (const [token, t] of Object.entries(tokens)) {
-      if (!t || typeof t.name !== "string" || !t.name || privileged.has(t.name) || offered.has(t.name)) continue;
-      offered.set(t.name, { name: t.name, token, role: best.get("dev:" + t.name) });
-    }
-    const host = env.HOST || "127.0.0.1";
-    const off = devMenuOff({ users: offered.size, host, google: !!oidc, gateway: roles.gateway, publicHost: publicHostOf(env.PUBLIC_URL) });
     if (off) log.warn("dev tokens are on, but the dev sign-in menu (GET /auth/dev) is OFF: " + off, { host });
     else {
       devMenu = { board: board.id, users: [...offered.values()], hosts: LOOPBACK_HOSTS };

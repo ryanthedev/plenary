@@ -32,6 +32,7 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
   roles = { gateway: true, host: true }, node = "node" }) {
   if (!roles || (!roles.gateway && !roles.host)) throw new TypeError("createServer needs at least one role (gateway, host)");
   const started = Date.now();
+  const badRequest = badRequestLimiter();
   const site = web === false || !roles.gateway ? null : staticSite({ log, ...web });
   const rooms = roles.host
     ? roomHost({ store, bus, log, ...host })
@@ -79,8 +80,5 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
 
 // A malformed Host header (empty, bare ::1, userinfo, port > 65535, HTTP/1.0 without Host) is the client's mistake:
 // answer 400 and log one short debug line per second at most, so a client cannot flood the log.
-let lastBad = 0;
-function badRequest(log) {
-  const t = Date.now();
-  if (t - lastBad >= 1000) { lastBad = t; log.debug("bad request: the URL (Host header) did not parse"); }
-}
+/** One limiter per server: the returned function logs the line at most once a second. */
+const badRequestLimiter = () => { let last = 0; return log => { const t = Date.now(); if (t - last >= 1000) { last = t; log.debug("bad request: the URL (Host header) did not parse"); } }; };

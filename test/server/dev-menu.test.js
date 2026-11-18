@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { start, devMenuOff } from "../../server/main.js";
+import { run as bootstrap } from "../../scripts/admin-bootstrap.js";
 
 const made = [];
 const tempDir = () => { const d = mkdtempSync(join(tmpdir(), "plenary-devmenu-")); made.push(d); return d; };
@@ -128,5 +129,51 @@ test("the served page can load the dev menu adapter and the favicon; the in-brow
     expect([icon.status, icon.headers.get("content-type")]).toEqual([200, "image/svg+xml"]);
     expect((await get(app, "/core/dev-users.js")).status).toBe(404);
     expect((await get(app, "/dev-main.html")).status).toBe(404);
+  } finally { await app.stop(); }
+});
+
+test("HOST reaches the gate: HOST=127.1 binds loopback but is not on the allowed list, so the menu is OFF (404 even with a loopback Host header) and the log says why", async () => {
+  const lines = [];
+  const app = await start(env({ HOST: "127.1", PLENARY_DEV_TOKENS: TOK, LOG_LEVEL: "warn" }), { write: l => lines.push(l) });
+  try {
+    expect(app.server.url).toContain("127.1");
+    for (const host of [undefined, "localhost"]) expect((await get(app, "/auth/dev", host ? { Host: host } : {})).status).toBe(404);
+    const got = lines.join("");
+    expect(got).toContain("is OFF: HOST=127.1 is not a loopback address");
+    expect(got).not.toContain("dev sign-in menu is ON");
+  } finally { await app.stop(); }
+});
+
+test("a dev name that is a tenant admin in the persistent Registry is never offered, whichever run made it admin", async () => {
+  const dir = tempDir();
+  const e = tokens => ({ PLENARY_DATA_DIR: dir, PORT: "0", LOG_LEVEL: "error", PLENARY_DEV_TOKENS: JSON.stringify(tokens) });
+  // Run 1: an admin token makes dev:ann a tenant admin (stored in the Registry).
+  let app = await start(e({ "SECRET-ADM": { name: "ann", domain: "acme.test", admin: true } }));
+  await app.stop();
+  // Run 2: the same data dir, only a plain token for ann plus ada.
+  app = await start(e({ "tok-plain": { name: "ann", role: "editor" }, "tok-a": { name: "ada", role: "owner" } }));
+  try {
+    const body = await (await get(app)).json();
+    expect(body.users.map(u => u.name)).toEqual(["ada"]);
+    expect(JSON.stringify(body)).not.toContain("tok-plain");
+  } finally { await app.stop(); }
+});
+
+test("scripts/admin-bootstrap.js --admin dev:<name>, run AFTER the server started, takes that name off the menu at once", async () => {
+  const dir = tempDir();
+  const app = await start({ PLENARY_DATA_DIR: dir, PORT: "0", LOG_LEVEL: "error", PLENARY_DEV_TOKENS: TOK });
+  try {
+    expect((await (await get(app)).json()).users.map(u => u.name)).toEqual(["ada", "bo"]);
+    const out = [];
+    expect(await bootstrap(["--domain", "acme.test", "--admin", "dev:bo"], { PLENARY_DATA_DIR: dir }, { out: l => out.push(l), err: l => out.push(l) })).toBe(0);
+    expect((await (await get(app)).json()).users.map(u => u.name)).toEqual(["ada"]);
+  } finally { await app.stop(); }
+});
+
+test("a Registry that cannot answer publishes nothing (fails closed)", async () => {
+  const app = await start(env({ PLENARY_DEV_TOKENS: TOK }));
+  try {
+    app.registry.isTenantAdmin = async () => { throw new Error("down"); };
+    expect((await get(app)).status).toBe(503);
   } finally { await app.stop(); }
 });

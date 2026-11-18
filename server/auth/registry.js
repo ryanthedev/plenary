@@ -42,6 +42,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const id = typeof domain === "string" ? byDomain.get(domain.toLowerCase()) : undefined;
       return id ? copy(tenants.get(id)) : null;
     },
+    async isTenantAdmin(user) { return [...tenants.values()].some(t => t.admins.includes(String(user))); },
     async addTenantAdmin(tenant, user) {
       const t = tenants.get(tenant);
       if (!t) throw new Error("registry: no such tenant");

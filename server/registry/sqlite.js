@@ -106,6 +106,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     tenantExists: db.query("SELECT 1 AS x FROM reg_tenants WHERE id = ?"),
     insTenant: db.query("INSERT INTO reg_tenants (id, domain, created_at) VALUES (?, ?, ?)"),
     admins: db.query("SELECT member FROM reg_tenant_admins WHERE tenant = ? ORDER BY n"),
+    adminAny: db.query("SELECT 1 AS x FROM reg_tenant_admins WHERE member = ? LIMIT 1"),
     adminN: db.query("SELECT coalesce(max(n), 0) + 1 AS n FROM reg_tenant_admins WHERE tenant = ?"),
     insAdmin: db.query("INSERT INTO reg_tenant_admins (tenant, member, n) VALUES (?, ?, ?) ON CONFLICT (tenant, member) DO NOTHING"),
 
@@ -212,6 +213,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       ready();
       return str(domain) && domain ? rowTenant(q.tenantByDomain.get(domain.toLowerCase())) ?? null : null;
     },
+    async isTenantAdmin(user) { ready(); return str(user) && !!q.adminAny.get(user); },
     async addTenantAdmin(tenant, user) {
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");

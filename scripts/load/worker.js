@@ -34,7 +34,7 @@ export class Stats {
  *           clients: { role: string, token: number, name: string, startAt: number }[], cfg: object, worker?: number }} job
  *   t0 / loadFrom (ramp done) / genEndAt: wall-clock ms; startAt: ms after t0.
  */
-export async function runWorker(job, { onProgress } = {}) {
+export async function runWorker(job, { onProgress, cpuUsage = process.cpuUsage.bind(process) } = {}) {   // cpuUsage: injectable, so tests feed a model instead of burning CPU
   const byRole = readTokensByRole(job.tokensPath);
   const stats = new Stats(job.t0);
   const clients = [];
@@ -42,19 +42,19 @@ export async function runWorker(job, { onProgress } = {}) {
   const LAG_EVERY = 50;
   let last = performance.now();
   const lagTimer = setInterval(() => { const t = performance.now(); lag.add(Math.max(0, t - last - LAG_EVERY)); last = t; }, LAG_EVERY);
-  let cpuPrev = process.cpuUsage(), cpuAt = performance.now(), cpuWall = Date.now();
+  let cpuPrev = cpuUsage(), cpuAt = performance.now(), cpuWall = Date.now();
   const cpuTimer = setInterval(() => {
-    const u = process.cpuUsage(cpuPrev), t = performance.now();
+    const u = cpuUsage(cpuPrev), t = performance.now();
     cpu.push(Math.round(((u.user + u.system) / 1000 / (t - cpuAt)) * 1000) / 10);   // % of one core
     cpuSpans.push([cpuWall, Date.now()]); cpuWall = Date.now();
-    cpuPrev = process.cpuUsage(); cpuAt = t;
+    cpuPrev = cpuUsage(); cpuAt = t;
   }, 1000);
   // Load-phase CPU, exactly: process CPU time between a mark at the phase's start (loadFrom, or now if that is past)
   // and one at its end (right after the generation sleep), over the wall time between the two marks. A late timer
   // (a pinned loop) only moves a mark; the CPU and the wall time are both taken at the mark, so they agree.
   const loadFrom = job.loadFrom ?? job.t0;
   let loadMark = null;
-  const markLoad = () => { loadMark = { cpu: process.cpuUsage(), t: performance.now() }; };
+  const markLoad = () => { loadMark = { cpu: cpuUsage(), t: performance.now() }; };
   const loadTimer = loadFrom <= Date.now() ? (markLoad(), null) : setTimeout(markLoad, loadFrom - Date.now());
   const progress = onProgress ? setInterval(() => onProgress({ worker: job.worker ?? 0, joined: stats.counts.joined ?? 0, clients: job.clients.length, opsSent: stats.counts.opsSent ?? 0, closes: { ...stats.closes } }), 2000) : null;
 
@@ -64,18 +64,19 @@ export async function runWorker(job, { onProgress } = {}) {
     if (!token) throw new Error(`tokens file has no ${c.role} token #${c.token}: make more with scripts/load/tokens.js`);
     const client = new LoadClient({ url: job.url, board: job.board, token, role: c.role, name: c.name, cfg: job.cfg, stats });
     clients.push(client);
-    starts.push(setTimeout(() => { client.connect(); if (Date.now() < job.genEndAt) client.startGenerating(); }, Math.max(0, job.t0 + c.startAt - Date.now())));
+    starts.push(setTimeout(() => { client.connect(); if (Date.now() < job.genEndAt) client.arm(); }, Math.max(0, job.t0 + c.startAt - Date.now())));
   }
 
   await Bun.sleep(Math.max(0, job.genEndAt - Date.now()));
   clearTimeout(loadTimer);
   let cpuLoadMean = null, cpuLoadMs = 0;
   if (loadMark) {
-    const u = process.cpuUsage(loadMark.cpu); cpuLoadMs = Math.round(performance.now() - loadMark.t);
+    const u = cpuUsage(loadMark.cpu); cpuLoadMs = Math.round(performance.now() - loadMark.t);
     if (cpuLoadMs >= LOAD_CPU_MIN_MS) cpuLoadMean = Math.round(((u.user + u.system) / 1000 / cpuLoadMs) * 1000) / 10;
   }
   for (const s of starts) clearTimeout(s);
-  for (const c of clients) c.stopGenerating();
+  stats.counts.dueClients ??= 0;   // always reported: run.js reads a missing count as an older worker's (plan-based rule)
+  for (const c of clients) { if (c.wasDue(job.genEndAt)) { stats.count("dueClients"); stats.count(`dueClients_${c.role}`); } c.stopGenerating(); }
 
   // Drain: no new ops; wait for every pending op to be answered and applied (or the drain time to run out).
   const drainStart = Date.now();

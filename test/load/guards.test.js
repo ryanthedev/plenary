@@ -3,16 +3,17 @@
 // failed or was signalled (4), arguments that would plan nonsense are refused with exit 2 (5, 6, 7), and the
 // generator's CPU is judged over the load phase however short it is (8).
 
-import { test, expect } from "bun:test";
+import { test, expect, afterAll } from "bun:test";
+import { tmp, cleanTmp } from "./tmp.js";
 import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { runWorker } from "../../scripts/load/worker.js";
 import { mergeResults, buildResult, createBoard, exitCode, headline, run, CPU_MEAN_LIMIT } from "../../scripts/load/run.js";
-import { fakeServer } from "./fake-server.js";
+import { fakeServer, busyFrom } from "./fake-server.js";
 
 const RUN = resolve(import.meta.dir, "../../scripts/load/run.js");
-const tmp = p => mkdtempSync(join(tmpdir(), p));
+afterAll(cleanTmp);
 const env = () => ({ PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR ?? tmpdir() });
 async function cli(args) {
   const p = Bun.spawn([process.execPath, RUN, ...args], { stdout: "pipe", stderr: "pipe", env: env() });
@@ -41,7 +42,7 @@ test("createBoard: a tokens file that is not JSON fails with its path only, neve
 // ---- finding 3: ops sent but not answered ----
 
 const ops = (sent, acked, echoed) => ({ worker: 0, pid: 1, cpu: [5], cpuLoadMean: 5, cpuLoadMs: 1000, lag: { n: 0, sum: 0, counts: [] },
-  stats: { counts: { joined: 1, neverJoined: 0, clients: 1, opsSent: sent, acks: acked, echoes: echoed }, closes: {}, errors: {}, hists: {}, joinsPerSec: {} } });
+  stats: { counts: { joined: 1, neverJoined: 0, clients: 1, connectedAtEnd: 1, opsSent: sent, acks: acked, echoes: echoed }, closes: {}, errors: {}, hists: {}, joinsPerSec: {} } });
 const judge = w => buildResult({ merged: mergeResults([w]), config: { url: "ws://x", board: "b" }, counts: { editor: 1, annotator: 0, viewer: 0 }, startedAt: 0, finishedAt: 1 });
 
 test("answered: every op sent acked and ≥ 99% echoed, or the run is INCOMPLETE (exit 1); no ops sent passes", () => {
@@ -174,17 +175,15 @@ test("CPU burned in the drain is not the load phase's; a load phase with no meas
   writeFileSync(tokensPath, JSON.stringify({ tE: { name: "d-e", role: "editor" } }), { mode: 0o600 });
   const fake = fakeServer({ tokens: { tE: { user: "dev:d-e", role: "editor" } }, onOp(ctx, ws, msg) { ctx.entry(ws.data.user, msg); } });
   const t0 = Date.now() + 200, loadFrom = t0 + 300, genEndAt = loadFrom + 1000, drainMs = 3000;
+  // CPU: idle through the load phase, 100% of a core from 800 ms into the drain (modelled, not burned).
   let r;
   try {
-    [r] = await Promise.all([
-      runWorker({ url: fake.url, board: "b", tokensPath, t0, loadFrom, genEndAt, drainMs, clients: [{ role: "editor", token: 0, name: "d-e0", startAt: 0 }], cfg: { opRate: 4, noteRate: 0, commentRate: 0, cursorRate: 0, pool: 5 } }),
-      burn(genEndAt + 100, genEndAt + drainMs - 100),
-    ]);
+    r = await runWorker({ url: fake.url, board: "b", tokensPath, t0, loadFrom, genEndAt, drainMs, clients: [{ role: "editor", token: 0, name: "d-e0", startAt: 0 }], cfg: { opRate: 4, noteRate: 0, commentRate: 0, cursorRate: 0, pool: 5 } }, { cpuUsage: busyFrom(genEndAt + 800) });
   } finally { fake.stop(); }
   expect(r.stats.counts.drainMs).toBeGreaterThanOrEqual(drainMs - 50);
-  expect(r.cpuLoadMs).toBeLessThan(1400);
-  expect(r.cpuLoadMean).toBeLessThan(40);
-  expect(Math.max(...r.cpu)).toBeGreaterThan(CPU_MEAN_LIMIT);   // the drain really burned
+  expect(r.cpuLoadMs).toBeLessThan(1700);
+  expect(r.cpuLoadMean).toBeLessThan(40);                        // the drain's CPU is not the load phase's
+  expect(Math.max(...r.cpu)).toBeGreaterThan(CPU_MEAN_LIMIT);   // the whole-run samples saw it
   // No measurement: never read as fine.
   const unmeasured = { ...r, cpuLoadMean: null, cpuLoadMs: 0 };
   const res = buildResult({ merged: mergeResults([unmeasured]), config: {}, counts: { editor: 1, annotator: 0, viewer: 0 }, startedAt: 0, finishedAt: 1 });

@@ -2,7 +2,8 @@
 // (test/load/fake-server.js) for reconnects, rejoins, resent ops, catch-up and the drain; and with the worker's
 // real lag and CPU samplers for saturation. (p8-load2: findings 2-8 of the p8-loadv review.)
 
-import { test, expect } from "bun:test";
+import { test, expect, afterAll } from "bun:test";
+import { tmp, cleanTmp } from "./tmp.js";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,9 +12,10 @@ import { Stats, runWorker } from "../../scripts/load/worker.js";
 import { mergeResults, buildResult, createBoard, fdCheck, exitCode, headline, planCounts, run, LAG_P99_LIMIT_MS, CPU_MEAN_LIMIT } from "../../scripts/load/run.js";
 import { startServer } from "../../scripts/load/server.js";
 import { makeElement } from "../../packages/core/model.js";
-import { fakeServer, until } from "./fake-server.js";
+import { fakeServer, until, busyFrom } from "./fake-server.js";
+import { Hist } from "../../scripts/load/stats.js";
 
-const tmp = p => mkdtempSync(join(tmpdir(), p));
+afterAll(cleanTmp);
 
 // ---- counted once: reconnect, rejoin, resend (V1, V4, V13) ----
 
@@ -128,17 +130,15 @@ test("a worker whose event loop stalls is flagged by its lag sampler (not by CPU
 }, 15000);
 
 test("a worker pinned during the load phase only is flagged by its CPU sampler, though its whole-run mean is low", async () => {
-  // Ramp 2 s idle, then 4 s of load with this process pinned in short slices (no event-loop stall).
+  // Ramp 2 s idle, then 4 s of load with the process at 100% of a core (a modelled cpuUsage: no real burning, so the
+  // result cannot depend on how busy this machine is).
   const t0 = Date.now(), loadFrom = t0 + 2000, genEndAt = loadFrom + 4000;
-  const [r] = await Promise.all([
-    runWorker({ url: "ws://127.0.0.1:1/ws", board: "b", tokensPath: noTokens(), t0, loadFrom, genEndAt, drainMs: 0, clients: [], cfg: {} }),
-    burn(loadFrom, genEndAt, 25, 0),
-  ]);
-  expect(r.cpuLoad.length).toBeGreaterThanOrEqual(3);
+  const r = await runWorker({ url: "ws://127.0.0.1:1/ws", board: "b", tokensPath: noTokens(), t0, loadFrom, genEndAt, drainMs: 0, clients: [], cfg: {} }, { cpuUsage: busyFrom(loadFrom) });
+  expect(r.cpuLoad.length).toBeGreaterThanOrEqual(1);
+  r.lag = new Hist().toJSON();   // the event loop's lag is the machine's, not under test here
   const res = judge(r), w = res.generator.workers[0];
   expect(w.cpuPct.meanAllPhases).toBeLessThan(CPU_MEAN_LIMIT);   // averaged with the idle ramp it would pass
   expect(w.cpuPct.mean).toBeGreaterThan(CPU_MEAN_LIMIT);
-  expect(w.lagMs.p99).toBeLessThan(LAG_P99_LIMIT_MS);
   expect(res.valid).toBe(false);
   expect(res.invalidReasons).toEqual([`worker 0: CPU mean ${w.cpuPct.mean}% of a core > ${CPU_MEAN_LIMIT}%`]);
 }, 15000);

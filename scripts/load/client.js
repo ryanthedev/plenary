@@ -30,6 +30,16 @@ export function makeReplica(clientName) {
 
 const now = () => Date.now();
 
+// A writer role is due to make ops when a client generates for rate x seconds >= this: its first op comes within
+// 1.5/rate s (ticks are jittered 0.5-1.5 x 1/rate). The clock starts at the client's first welcome (run.js dueRoles).
+export const DUE_TICKS = 1.5;
+/** The op rate (ticks/s) a role generates at: editors on opRate, annotators on the faster of notes and comments. */
+export function writerRate(role, cfg) {
+  if (role === "editor") return cfg?.opRate ?? 0;
+  if (role === "annotator") return Math.max(cfg?.noteRate ?? 0, cfg?.commentRate ?? 0);
+  return 0;
+}
+
 export class LoadClient {
   /**
    * @param {{ url: string, board: string, token: string, role: string, name: string, cfg: object, stats: object }} o
@@ -39,6 +49,7 @@ export class LoadClient {
     this.url = url; this.board = board; this.token = token; this.role = role; this.name = name; this.cfg = cfg; this.stats = stats;
     this.replica = makeReplica(name);
     this.ws = null; this.ownClose = false; this.running = true; this.generating = false;
+    this.armed = false; this.firstWelcomeAt = null;   // armed: generation starts at the first welcome (the due clock)
     this.helloAt = null; this.liveFrom = Infinity; this.welcomedOnce = false; this.welcomed = false;
     this.writeAt = new Map();   // op id → { t: first write time (ms), acked, echoed }; gone once both are seen
     this.timers = new Set(); this.flushTimer = null;
@@ -88,6 +99,7 @@ export class LoadClient {
       this.welcomed = true;
       this.stats.join(t - this.helloAt, t, !this.welcomedOnce);
       this.welcomedOnce = true;
+      if (this.firstWelcomeAt === null) { this.firstWelcomeAt = t; if (this.armed) this.startGenerating(); }
       this.liveFrom = msg.seq;   // entries after the welcome's seq are live; before it, catch-up
     } else if (msg.t === "ack") {
       const w = this.writeAt.get(msg.id);
@@ -154,7 +166,11 @@ export class LoadClient {
     if (this.role === "editor") { loop(c.opRate, () => this.draw("board")); loop(c.cursorRate, () => this.cursor()); }
     if (this.role === "annotator") { loop(c.noteRate, () => this.draw("notes")); loop(c.commentRate, () => this.comment()); loop(c.cursorRate, () => this.cursor()); }
   }
-  stopGenerating() { this.generating = false; }
+  stopGenerating() { this.generating = false; this.armed = false; }
+  /** Generate load from this client's first welcome on (not from connect): a slow join does not eat its due window. */
+  arm() { this.armed = true; if (this.firstWelcomeAt !== null && !this.generating) this.startGenerating(); }
+  /** Whether this client had a whole due window: welcomed at least DUE_TICKS/rate s before `genEndAt`. */
+  wasDue(genEndAt) { const r = writerRate(this.role, this.cfg); return r > 0 && this.firstWelcomeAt !== null && ((genEndAt - this.firstWelcomeAt) / 1000) * r >= DUE_TICKS; }
 
   // Only while connected, and never more than 50 ops waiting: a client that can't send skips (counted), so a
   // stalled server shows as skipped ops, not as an ever-growing queue on this side.

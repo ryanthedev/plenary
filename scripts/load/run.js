@@ -14,8 +14,12 @@
 // (result.complete): every planned client joined at least once (result.clients.complete) and the server answered
 // the ops (result.ops.answered): every op made (counted when made, sent or not) was acked by the drain's end, at
 // least 99% were echoed back to their sender, and each writer role that was due to make ops made at least one. A
-// role is due when it has clients and rate x duration >= 1.5 (its first op comes within 1.5/rate s); a run with no
-// role due (--op-rate 0 and no annotators, viewers only) needs no ops: it is judged on its joins (and any ops made). 1 = the run finished but is
+// role is due when one of its clients was welcomed at least 1.5/rate s before the generation ended (each client's
+// clock starts at its own first welcome; its first op comes within 1.5/rate s of that); a run with no role due
+// (--op-rate 0 and no annotators, viewers only) needs no ops: it is judged on its joins (and any ops made). The run
+// must also have stayed: every planned client connected at the drain's end (result.clients.stayed), and, with a role
+// due, no more ops skipped offline than made (result.ops.present): a server that drops everyone mid-run and refuses
+// their rejoins reads INCOMPLETE, not VALID. 1 = the run finished but is
 // not good (report.md's headline says INVALID or INCOMPLETE and why); 2 = bad arguments or setup, or stopped by
 // SIGTERM, SIGINT or SIGHUP (nothing complete was measured). On any of those, and on any setup failure, the
 // --local server and the workers this run started are stopped first; both also exit on their own within about 1 s
@@ -23,7 +27,8 @@
 // Arguments: plain decimal numbers only (no 0x1, 1e3, blanks or empty values; --url/--board/--tokens/--out/--rig
 // may not be empty). Counts are whole numbers. Bounds: --editors, --annotators, --viewers, --clients ≤ 1000000;
 // --procs 1-256; --pool 1-10000; --viewers-per-user 1-10000; --ramp 1-100000 clients/s; --duration 1-3600 s;
-// --drain ≤ 600 s; --op-rate, --note-rate, --comment-rate, --cursor-rate ≤ 1000 /s.
+// --drain ≤ 600 s; --op-rate, --note-rate, --comment-rate, --cursor-rate ≤ 1000 /s; the ramp (clients / --ramp) ≤ 3600 s.
+// Unknown flags, and a flag given as another flag's value (--tokens --local), are refused (exit 2).
 
 import { mkdirSync, writeFileSync, readFileSync, existsSync, mkdtempSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -31,6 +36,7 @@ import { tmpdir } from "node:os";
 import { Hist, addCounts } from "./stats.js";
 import { readTokensByRole, readTokensTable, makeTokens, writeTokens } from "./tokens.js";
 import { startServer, psSample, cpuPct } from "./server.js";
+import { DUE_TICKS, writerRate } from "./client.js";
 import { MAX_WRITER_CONNS } from "../../packages/protocol/envelope.js";
 
 export const SCHEMA = "plenary.load.result/1";
@@ -47,11 +53,15 @@ export const CPU_MEAN_LIMIT = 85;
 // ops must have made some: a server that welcomes everyone and then stalls (no catch-up, so the Replica never
 // writes) or drops everyone for good (every op skipped offline) must not read VALID.
 export const ECHO_FLOOR_PCT = 99;   // integer math: 0.99 * n can round up by one
-// A writer role is due to make ops when rate x duration reaches this: each client's first op comes within 1.5/rate s.
-export const DUE_TICKS = 1.5;
-const WRITER_RATES = { editor: c => c.opRate ?? 0, annotator: c => Math.max(c.noteRate ?? 0, c.commentRate ?? 0) };
+export { DUE_TICKS };   // client.js owns it: the worker counts the clients whose window was long enough
+const WRITER_ROLES = ["editor", "annotator"];
 
 const DEFAULTS = { editors: 5, annotators: 0, viewers: 0, ramp: 200, duration: 30, drain: 15, procs: 1, "op-rate": 2, "note-rate": 0.2, "comment-rate": 0.05, "cursor-rate": 5, pool: 20 };
+
+const BOOLEAN_FLAGS = ["local", "help", "create-board"];
+const STRING_FLAGS = ["url", "board", "tokens", "out", "rig"];
+// Every flag the CLI knows. An unknown one (a typo like --op_rate) is refused, not ignored.
+const knownFlag = k => BOOLEAN_FLAGS.includes(k) || STRING_FLAGS.includes(k) || k in MAX;
 
 export function parseArgs(argv) {
   const o = {};
@@ -59,8 +69,10 @@ export function parseArgs(argv) {
     const a = argv[i];
     if (!a.startsWith("--")) throw new Error(`unexpected argument ${a}`);
     const k = a.slice(2);
-    if (k === "local" || k === "help" || k === "create-board") { o[k] = true; continue; }
+    if (!knownFlag(k)) throw new Error(`unknown flag ${a} (see --help)`);
+    if (BOOLEAN_FLAGS.includes(k)) { o[k] = true; continue; }
     if (i + 1 >= argv.length) throw new Error(`--${k} needs a value`);
+    if (argv[i + 1].startsWith("--")) throw new Error(`--${k} needs a value, not the flag ${argv[i + 1]}`);
     o[k] = argv[++i];
   }
   return o;
@@ -99,7 +111,7 @@ export function planCounts(o) {
 // phase must be long enough to measure the generator's CPU). Only plain decimals: Number() would also take "",
 // " ", "0x1", "1e3" and "Infinity". Every value has an upper bound (MAX), so no flag plans years.
 export const MAX = { editors: 1e6, annotators: 1e6, viewers: 1e6, clients: 1e6, procs: 256, pool: 10000, "viewers-per-user": 10000, ramp: 100000, duration: 3600, drain: 600, "op-rate": 1000, "note-rate": 1000, "comment-rate": 1000, "cursor-rate": 1000 };
-const STRING_FLAGS = ["url", "board", "tokens", "out", "rig"];
+export const MAX_RAMP_S = 3600;   // the ramp (clients / --ramp) may take at most this long
 const blank = v => typeof v === "string" && v.trim() === "";
 const plain = (v, name, re, what) => {
   if (blank(v)) throw new Error(`--${name} is empty`);
@@ -121,12 +133,19 @@ export function parseOptions(o) {
   const duration = atLeast(o.duration, DEFAULTS.duration, "duration", 1, "s"), drain = num(o.drain, DEFAULTS.drain, "drain");
   const cfg = { opRate: num(o["op-rate"], DEFAULTS["op-rate"], "op-rate"), noteRate: num(o["note-rate"], DEFAULTS["note-rate"], "note-rate"), commentRate: num(o["comment-rate"], DEFAULTS["comment-rate"], "comment-rate"), cursorRate: num(o["cursor-rate"], DEFAULTS["cursor-rate"], "cursor-rate"), pool: count(o.pool, DEFAULTS.pool, "pool", 1) };
   const viewersPerUser = count(o["viewers-per-user"], 32, "viewers-per-user", 1);
+  const planned = counts.editor + counts.annotator + counts.viewer;
+  if (planned / ramp > MAX_RAMP_S) throw new Error(`the ramp would take ${Math.round(planned / ramp)} s (${planned} clients at ${ramp}/s); it may take at most ${MAX_RAMP_S} s: raise --ramp or plan fewer clients`);
   return { counts, procs, ramp, duration, drain, cfg, viewersPerUser };
 }
 
-/** The writer roles due to make ops: clients planned and rate x duration ≥ DUE_TICKS (see the header). */
-export function dueRoles(counts, config) {
-  return Object.keys(WRITER_RATES).filter(r => (counts[r] ?? 0) > 0 && WRITER_RATES[r](config ?? {}) * (config?.duration ?? 0) >= DUE_TICKS);
+/**
+ * The writer roles due to make ops (see the header). Without `dueClients` (the plan alone): clients planned and
+ * rate x duration ≥ DUE_TICKS. With it (the workers' `dueClients_<role>` counts, the clients that had a whole due
+ * window counted from their own first welcome): a role is due when at least one such client exists, so a slow
+ * welcome on a healthy server shortens the window instead of failing the run.
+ */
+export function dueRoles(counts, config, dueClients) {
+  return WRITER_ROLES.filter(r => (counts[r] ?? 0) > 0 && (dueClients ? (dueClients[r] ?? 0) > 0 : writerRate(r, config) * (config?.duration ?? 0) >= DUE_TICKS));
 }
 
 /**
@@ -221,14 +240,19 @@ export function buildResult({ merged, config, counts, startedAt, finishedAt, ser
   const complete = planned > 0 && joined === planned && neverJoined === 0;
   const sent = c.opsSent ?? 0, acked = c.acks ?? 0, echoed = c.echoes ?? 0;
   const made = Math.max(c.opsMade ?? 0, sent);   // an op is sent only after it is made
-  const due = dueRoles(counts, config), missing = due.filter(r => !(c[`opsMade_${r}`] > 0));
+  const due = dueRoles(counts, config, c.dueClients === undefined ? null : Object.fromEntries(WRITER_ROLES.map(r => [r, c[`dueClients_${r}`] ?? 0]))), missing = due.filter(r => !(c[`opsMade_${r}`] > 0));
   const answered = missing.length === 0 && (acked >= made && echoed * 100 >= made * ECHO_FLOOR_PCT);
+  // Stayed: every planned client is connected at the end, and a due writer role was not offline more than online
+  // (ticks skipped offline <= ops made). A server that drops everyone mid-run and refuses their rejoins answers
+  // every op it saw, so only this catches it.
+  const connectedAtEnd = c.connectedAtEnd ?? 0, skippedOffline = c.skippedOffline ?? 0;
+  const stayed = connectedAtEnd >= planned, present = due.length === 0 || skippedOffline <= made;
   return {
     schema: SCHEMA,
     startedAt: new Date(startedAt).toISOString(), finishedAt: new Date(finishedAt).toISOString(),
     config,
-    valid: reasons.length === 0, invalidReasons: reasons, complete: complete && answered,
-    clients: { planned, byRole: counts, joined, neverJoined, complete, connectedAtEnd: c.connectedAtEnd ?? 0 },
+    valid: reasons.length === 0, invalidReasons: reasons, complete: complete && answered && stayed && present,
+    clients: { planned, byRole: counts, joined, neverJoined, complete, connectedAtEnd, stayed },
     join: {
       latencyMs: h.join?.summary() ?? new Hist().summary(),
       perSecond: secs.map(s => ({ s, n: merged.joinsPerSec[s] })),
@@ -241,7 +265,7 @@ export function buildResult({ merged, config, counts, startedAt, finishedAt, ser
       acked: c.acks ?? 0, echoed: { total: c.echoes ?? 0, editor: c.echoes_editor ?? 0, annotator: c.echoes_annotator ?? 0 },
       dropped: c.dropped ?? 0, unanswered: c.unanswered ?? 0, unechoed: c.unechoed ?? 0, unacked: c.unacked ?? 0,
       skippedOffline: c.skippedOffline ?? 0, skippedBacklog: c.skippedBacklog ?? 0, presenceSent: c.presenceSent ?? 0,
-      drainMs: c.drainMs ?? 0, answered,
+      drainMs: c.drainMs ?? 0, answered, present,
     },
     latencyMs: { ack: byRole("ack"), echo: byRole("echo"), delivery: byRole("delivery") },
     connections: {
@@ -263,8 +287,10 @@ export function exitCode(r) { return r.valid && r.complete ? 0 : 1; }
 export function headline(r) {
   if (!r.valid) return "INVALID (the load generator saturated)";
   if (!r.clients.complete) return `INCOMPLETE (${r.clients.planned - r.clients.joined} of ${r.clients.planned} planned clients never joined)`;
-  if (!r.ops.answered) {
+  if (!r.ops.answered || r.clients.stayed === false || r.ops.present === false) {
     const o = r.ops, why = [], made = o.made?.total ?? o.sent.total;
+    if (r.clients.stayed === false) why.push(`only ${r.clients.connectedAtEnd} of ${r.clients.planned} clients were connected at the end`);
+    if (r.ops.present === false && !(o.missing ?? []).length) why.push(`${o.skippedOffline} ops were skipped offline against ${made} made`);
     for (const role of o.missing ?? []) why.push(`no ${role} op was made though ${r.clients.byRole[role]} ${role}(s) were due to (${o.skippedOffline} ops skipped offline, ${o.skippedBacklog} for backlog)`);
     if (o.acked < made) why.push(`${made - o.acked} of ${made} ops made were never acked${made > o.sent.total ? ` (${made - o.sent.total} never sent)` : ""}`);
     if (o.echoed.total * 100 < made * ECHO_FLOOR_PCT) why.push(`${made - o.echoed.total} of ${made} were never echoed to their sender`);
@@ -364,8 +390,8 @@ export const STOP_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"];
 export async function run(o, { log = s => console.log(s), signals = false } = {}) {
   let server = null, serverSamples = null;
   let url = o.url, tokensPath = o.tokens, board = o.board;
+  const { counts, procs, ramp, duration, drain, cfg, viewersPerUser } = parseOptions(o);   // first: --rig " " gets the empty-flag message
   if (o.rig) { const r = rigConfig(o.rig); url ??= r.url; tokensPath ??= r.tokens; board ??= r.board; }
-  const { counts, procs, ramp, duration, drain, cfg, viewersPerUser } = parseOptions(o);
   const total = counts.editor + counts.annotator + counts.viewer;
   if (total < 1) throw new Error("no clients planned: give --clients, --editors, --annotators or --viewers");
   const fd = fdCheck(Math.ceil(total / procs));

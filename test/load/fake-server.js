@@ -54,3 +54,13 @@ export async function until(fn, ms = 8000, what = "condition") {
   const end = Date.now() + ms;
   while (!fn()) { if (Date.now() > end) throw new Error(`timed out waiting for ${what}`); await Bun.sleep(10); }
 }
+
+/**
+ * A stand-in for process.cpuUsage (runWorker's `cpuUsage` option): the process is idle until wall-clock `busyFrom`
+ * (ms), 100% of one core from then on. Cumulative like the real one, `prev` subtracts. Deterministic: the CPU
+ * "burned" depends only on the clock, never on how busy the machine is.
+ */
+export function busyFrom(busyFromMs) {
+  const total = () => Math.max(0, Date.now() - busyFromMs) * 1000;
+  return prev => ({ user: total() - (prev?.user ?? 0), system: 0 });
+}

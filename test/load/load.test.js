@@ -1,7 +1,8 @@
 // The load client (scripts/load/): stats on fixed inputs, merging workers, and live runs against a real
 // single-node server/main.js (port 0, temp data dir) started by the run itself (--local).
 
-import { test, expect } from "bun:test";
+import { test, expect, afterAll } from "bun:test";
+import { tmp, cleanTmp } from "./tmp.js";
 import { mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -11,7 +12,7 @@ import { makeTokens, writeTokens, readTokensByRole } from "../../scripts/load/to
 import { writeFileSync, mkdirSync } from "node:fs";
 
 const RUN = resolve(import.meta.dir, "../../scripts/load/run.js");
-const tmp = p => mkdtempSync(join(tmpdir(), p));
+afterAll(cleanTmp);
 
 // ---- stats ----
 

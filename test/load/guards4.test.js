@@ -3,7 +3,8 @@
 // stopping them (2); the server's load-phase CPU is its own window (3); empty string flags (4), non-decimal numbers
 // and values past their bound (5) are refused; an ack counted twice never covers a missing one (R2).
 
-import { test, expect } from "bun:test";
+import { test, expect, afterAll } from "bun:test";
+import { tmp, cleanTmp } from "./tmp.js";
 import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -12,7 +13,7 @@ import { mergeResults, buildResult, headline, exitCode, parseOptions, serverStat
 import { fakeServer } from "./fake-server.js";
 
 const RUN = resolve(import.meta.dir, "../../scripts/load/run.js");
-const tmp = p => mkdtempSync(join(tmpdir(), p));
+afterAll(cleanTmp);
 const env = () => ({ PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR ?? tmpdir() });
 async function cli(args) {
   const p = Bun.spawn([process.execPath, RUN, ...args], { stdout: "pipe", stderr: "pipe", env: env() });
@@ -28,7 +29,7 @@ const tokensFile = (dir, n = 1) => {
 // ---- finding 1: ops counted when made; a writer role due to make ops must have made some ----
 
 const worker = counts => ({ worker: 0, pid: 1, cpu: [5], cpuLoadMean: 5, cpuLoadMs: 1000, lag: { n: 0, sum: 0, counts: [] },
-  stats: { counts: { joined: 2, neverJoined: 0, clients: 2, ...counts }, closes: {}, errors: {}, hists: {}, joinsPerSec: {} } });
+  stats: { counts: { joined: 2, neverJoined: 0, clients: 2, connectedAtEnd: 2, ...counts }, closes: {}, errors: {}, hists: {}, joinsPerSec: {} } });
 const judge = (counts, config, plan = { editor: 1, annotator: 1, viewer: 0 }) =>
   buildResult({ merged: mergeResults([worker(counts)]), config: { url: "ws://x", board: "b", ...config }, counts: plan, startedAt: 0, finishedAt: 1 });
 const view = r => [r.ops.answered, r.complete, headline(r), exitCode(r)];
@@ -111,7 +112,8 @@ test("live CLI: a server that welcomes once, drops everyone and refuses rejoins 
   expect(r.res.ops.skippedOffline).toBeGreaterThan(3);
   expect(r.res.ops.missing).toEqual(["editor"]);
   expect([r.res.ops.answered, r.res.complete, r.code]).toEqual([false, false, 1]);
-  expect(r.stdout).toContain(`**INCOMPLETE (no editor op was made though 3 editor(s) were due to (${r.res.ops.skippedOffline} ops skipped offline,`);
+  expect(r.stdout).toContain(`**INCOMPLETE (only 0 of 3 clients were connected at the end;`);
+  expect(r.stdout).toContain(`no editor op was made though 3 editor(s) were due to (${r.res.ops.skippedOffline} ops skipped offline,`);
 }, 20000);
 
 test("live CLI: a healthy run with --op-rate 0 (no ops due) is judged on its joins: VALID, exit 0", async () => {
@@ -243,7 +245,7 @@ test("exit code 2 from the CLI: --tokens \"\", --duration 1e12, --editors 0x1 an
 test("--help states the bounds and the due rule", async () => {
   const r = await cli(["--help"]);
   expect(r.code).toBe(0);
-  for (const s of ["--duration 1-3600 s", "--drain ≤ 600 s", "--procs 1-256", "≤ 1000000", "rate x duration >= 1.5", "plain decimal"]) expect(r.stdout).toContain(s);
+  for (const s of ["--duration 1-3600 s", "--drain ≤ 600 s", "--procs 1-256", "≤ 1000000", "1.5/rate s", "stayed", "Unknown flags", "≤ 3600 s", "plain decimal"]) expect(r.stdout).toContain(s);
 }, 10000);
 
 test("a worker whose parent is not the PID run.js named (it died before the worker started) exits mid-job", async () => {

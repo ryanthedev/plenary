@@ -120,7 +120,7 @@ had not reached its client, which was resyncing, when the drain ended.)
 | Headline | Exit | When |
 |---|---|---|
 | **INVALID** | 1 | A generator worker saturated: event-loop lag p99 over 100 ms, or CPU over the load phase over 85% of a core (or not measured). |
-| **INCOMPLETE** | 1 | Not every planned client joined, **or the server did not answer the ops**: an op made (counted when made, sent or not) was never acked by the drain's end, fewer than 99% were echoed back to their sender, or a writer role that was due to make ops made none (since p8-load4). |
+| **INCOMPLETE** | 1 | Not every planned client joined, **or the server did not answer the ops**: an op made (counted when made, sent or not) was never acked by the drain's end, fewer than 99% were echoed back to their sender, a writer role that was due to make ops made none (since p8-load4), **a planned client was not connected at the drain's end, or a due role skipped more ops offline than it made** (since p8-load5). |
 | **VALID** | 0 | Neither of the above. |
 | (none) | 2 | Bad arguments or setup, or the run was stopped by SIGTERM, SIGINT or SIGHUP. The `--local` server and the workers are stopped first. |
 
@@ -136,14 +136,24 @@ had not reached its client, which was resyncing, when the drain ended.)
 - **No role due** (`--op-rate 0` with no annotators, a viewers-only run, or rates too low for the duration): the
   run needs no ops: it is judged on its joins (and on any ops that were made) and can read VALID with 0 ops. It measures joins and nothing else, so its
   delivery latencies are empty; a stall after the welcome is not detectable without ops.
-- **Not judged:** ops skipped while offline or for backlog after some were made, and clients still disconnected at
-  the drain's end (`ops.skippedOffline`, `ops.skippedBacklog`, `clients.connectedAtEnd` are reported, not ruled on).
+- **Staying connected (since p8-load5):** a server that answers the first ops and then drops clients and refuses
+  their rejoins used to read VALID. Now the run is INCOMPLETE when `clients.connectedAtEnd` < `clients.planned`
+  (`clients.stayed`), or, with a role due, when `ops.skippedOffline` > ops made (`ops.present`). Re-checked against
+  the 15 calibration `result.json` files: `connectedAtEnd` equals `planned` in all 15, and `skippedOffline` is at
+  most 66 (`k200`) against 931-1,482 ops made, so none flips.
+- **The due clock starts at each client's first welcome (since p8-load5)**, not at connect: a client generates
+  from its welcome on, and a role is due when some client was welcomed at least 1.5/rate s before the generation
+  ended (the worker's `dueClients_<role>` count). A slow welcome on a healthy server shortens the window instead of
+  failing the run; a role with no such client reads like "no role due".
+- **Not judged:** ops skipped for backlog (`ops.skippedBacklog`), and ops skipped offline while fewer than ops made
+  (a brief outage). They are reported, not ruled on.
 - **Why 99% of echoes, not all:** a client resyncing at the drain's end can miss its own echo without any loss
   (`p8-load2/k125b`: 1,096 of 1,097).
 - **Arguments refused (exit 2):** an empty value for any flag (`--tokens ""` too), anything but a plain decimal
   (`0x1`, `1e3`, `Infinity`, a leading blank), a fraction where a count is due, `--ramp` under 1 client/s,
   `--duration` under 1 s, and any value past its bound: counts ≤ 1,000,000, `--procs` ≤ 256, `--pool` and
   `--viewers-per-user` ≤ 10,000, `--ramp` ≤ 100,000/s, `--duration` ≤ 3,600 s, `--drain` ≤ 600 s, rates ≤ 1,000/s
-  (also in `--help`).
+  (also in `--help`), an unknown flag (`--op_rate`), a flag given as another flag's value (`--tokens --local`), and a
+  ramp (clients / `--ramp`) over 3,600 s (since p8-load5).
 - **Nothing left running:** since p8-load4 the `--local` server and the workers also exit on their own within
   about 1 s when `run.js` dies without stopping them (SIGKILL).

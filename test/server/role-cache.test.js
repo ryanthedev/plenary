@@ -6,6 +6,7 @@ import { rig, tokenOf } from "./rig.js";
 import { cleanup, sleep, until } from "./helpers.js";
 import { subjects } from "../../server/bus/port.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
+import { virtualTime } from "./virtual.js";
 
 afterAll(cleanup);
 const hello = (r, name, extra = {}) => ({ t: "hello", v: 1, token: tokenOf(name), board: r.ids.board, since: 0, client: name, ...extra });
@@ -146,16 +147,24 @@ test("M7: hellos waiting on the room when a timed pass runs (one served from the
 }, 20000);
 
 test("finding 1: a timed pass whose rolesFor never settles is bounded by recheckLookupMs; a revoke still closes", async () => {
-  let hang = false;
-  const r = await rig({ cache: {}, limits: { roleRecheckMs: 3_600_000, recheckLookupMs: 100 }, wrapAuth: a => ({ ...a, rolesFor: (b, ids) => (hang ? new Promise(() => {}) : a.rolesFor(b, ids)) }) });
+  // Virtual gateway time: the hung chunk's bound is the one pending one-shot timer, exactly the configured 100 ms.
+  const V = virtualTime({ start: Date.now(), settle: () => new Promise(res => setImmediate(res)) });
+  let hang = false, hung = 0;
+  const r = await rig({ now: V.now, timers: V.timers, cache: {}, limits: { roleRecheckMs: 3_600_000, recheckLookupMs: 100 }, wrapAuth: a => ({ ...a, rolesFor: (b, ids) => (hang ? (hung++, new Promise(() => {})) : a.rolesFor(b, ids)) }) });
   const s = await join(r, "editor"); await s.next(m => m.t === "welcome");
   hang = true;
-  await timedPass(r);                                               // stuck in rolesFor until the lookup bound cuts it off
+  const timed = timedPass(r);                                       // stuck in rolesFor until the lookup bound cuts it off
+  await until(() => hung === 1, "the hung rolesFor");
+  expect(V.oneShots()).toEqual([100]);
   hang = false;
   await r.registry.setGrant(r.ids.board, "dev:editor", null);
   await publish(r, {});
+  await V.advance(99);
+  expect(s.closed).toBe(null);
+  await V.advance(1);
   expect((await s.whenClosed(30_000)).code).toBe(1008);
-  expect((await r.health()).body.gateway.rechecks.timeouts).toBeGreaterThanOrEqual(1);
+  await timed;
+  expect((await r.health()).body.gateway.rechecks.timeouts).toBe(1);
   await r.stop();
 }, 20000);
 

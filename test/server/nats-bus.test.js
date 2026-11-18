@@ -261,13 +261,16 @@ ot("nats stall: a frozen server (SIGSTOP) caps what is queued, is declared stale
     await bus.publish(s, { k: "after" });
     await until(() => got.includes("after"), "after");
     await sleep(200);
-    const replayed = got.filter(k => k.startsWith("frozen-")).length;
-    // Only what already sat in the frozen server's kernel receive buffer can still arrive (1-3 MB in local runs: how much
-    // is the kernel's, not ours); everything queued in this process was dropped with the socket. So the property is
-    // that the replays are a small part of what was accepted, not a count: at most half (the buffer would have to hold
-    // 12 MB), where replaying the queue would bring back all of it.
-    expect(replayed).toBeLessThan(accepted);
-    expect(replayed * 2).toBeLessThanOrEqual(accepted);
+    const late = got.filter(k => k.startsWith("frozen-"));
+    // Only what had already left this process can still arrive: the bytes in the kernel's TCP buffers (this socket's send
+    // buffer and the frozen server's receive buffer), delivered in order once it resumes. Everything still queued in
+    // this process was dropped with the socket. So what arrives is exactly the first k messages published, in order,
+    // and k is bounded by the kernels' buffer maxima, not by how many were accepted: autotuned at most 4 + 4 MB on
+    // macOS (net.inet.tcp.autosndbufmax / autorcvbufmax) and 4 + 6 MB with Linux defaults (tcp_wmem / tcp_rmem), so
+    // at most 10 of these 1 MB messages, where a replay of the queue would bring back up to all 24 accepted.
+    expect(late).toEqual(late.map((_, i) => `frozen-${i}`));
+    expect(late.length).toBeLessThanOrEqual(10);
+    expect(late.length).toBeLessThan(accepted);
     expect(got).not.toContain("during");
     await bus.close(); await listener.close();
   } finally {

@@ -252,21 +252,39 @@ describe.skipIf(!url)("postgres store", () => {
 
   test("R2-L1: a lease call's lock wait is capped at half its ttl, even when leaseLockTimeoutMs is longer", async () => {
     const schema = schemaName();
-    const store = await postgresStore({ url, schema, max: 2, leaseLockTimeoutMs: 5_000 });
+    // The adapter runs on a client we own, whose transactions' statements are recorded: the bound Postgres is given is
+    // read off the `SET LOCAL lock_timeout` itself (a wall-clock window can't tell 200 ms from a too-long 2 s cap).
+    const own = new SQL({ url, max: 2 }), sets = [];
+    const lockTimeouts = () => sets.map(q => /lock_timeout = (\d+)/.exec(q)?.[1]).filter(Boolean).map(Number);
+    const spied = new Proxy(own, { get(t, k) {
+      if (k !== "begin") { const v = Reflect.get(t, k); return typeof v === "function" ? v.bind(t) : v; }
+      return f => t.begin(tx => f(new Proxy(tx, { get(x, kk) {
+        const v = Reflect.get(x, kk);
+        if (kk === "unsafe") return (q, ...a) => { sets.push(q); return v.call(x, q, ...a); };
+        return typeof v === "function" ? v.bind(x) : v;
+      } })));
+    } });
+    const store = await postgresStore({ sql: spied, schema, leaseLockTimeoutMs: 5_000 });
     const stalled = await client().reserve();
     try {
       await store.acquire(T, B, "h-a", 60_000);
       await stalled.unsafe("BEGIN");
       await stalled.unsafe(`SELECT epoch FROM "${schema}".pl_leases WHERE tenant = $1 AND board = $2 FOR SHARE`, [T, B]);
       for (const call of [() => store.renew(T, B, "h-a", 1, 400), () => store.acquire(T, B, "h-b", 400)]) {
+        sets.length = 0;
         const t0 = performance.now();
         const got = await Promise.race([code(call()), Bun.sleep(3_000).then(() => "still waiting")]);
         const took = performance.now() - t0;
         expect(got).toBe("unavailable");
-        expect(took).toBeGreaterThanOrEqual(150);                  // it did wait on the lock (ttl/2 = 200 ms) ...
+        expect(took).toBeGreaterThanOrEqual(150);                  // it did wait on the lock ...
+        expect(lockTimeouts()).toEqual([200]);                     // ... bounded at ttl/2 = 200 ms, not the 5 s setting
       }
-    } finally { await stalled.unsafe("ROLLBACK").catch(() => {}); stalled.release(); await store.close(); await drop(schema); }
-  });
+      await stalled.unsafe("ROLLBACK");
+      sets.length = 0;
+      await store.release(T, B, "h-a", 1);                         // no ttl: leaseLockTimeoutMs itself bounds it
+      expect(lockTimeouts()).toEqual([5_000]);
+    } finally { await stalled.unsafe("ROLLBACK").catch(() => {}); stalled.release(); await store.close(); await own.close(); await drop(schema); }
+  }, 20_000);
 
   test("M1: a holder paused mid-write is cut off by the server (idle_in_transaction_session_timeout), so the takeover goes through", async () => {
     const schema = schemaName();

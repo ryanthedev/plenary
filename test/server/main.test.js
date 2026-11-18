@@ -152,7 +152,8 @@ test("main.js started twice on one data dir: the same board, its acked ops, and 
 
 // A kill -9 leaves the dead process's room lease live for up to its ttl (PLENARY_LEASE_TTL_MS, passed to the child from
 // this one constant): a writer's hello in that window is answered `unavailable` (1013) or times out at the gateway,
-// and the client retries, as a real client does. Anything else is a failure, and so is no welcome within the ttl + 30 s (a backstop: how fast it comes is not asserted).
+// and the client retries, as a real client does. Anything else is a failure, and so is no welcome within the ttl + 30 s (a
+// backstop). That the window is the configured ttl is checked on the lease the dead process left (below), not by a clock.
 const LEASE_TTL_MS = 2_000;
 const leaseEnv = { PLENARY_LEASE_TTL_MS: String(LEASE_TTL_MS) };
 async function welcomedAfterRestart(port, board, name) {
@@ -198,6 +199,11 @@ test("kill -9 mid-stream, restart: every acked op is present, at its seq, once; 
       await until(() => { record(); return acked.size >= before + 100; }, "100 more acks", 15000);
       cur.p.child.kill("SIGKILL");                // mid-stream: ops are in flight in both directions
       await cur.p.child.exited; clearInterval(pump);
+      // The dead holder's lease, as it left it: its last renew set expiresAt = then + its ttl, so what remains is at most
+      // the ttl from PLENARY_LEASE_TTL_MS (a host on the 10 s default would leave more). Time only shrinks it: no flake.
+      const db = sqliteStore({ path: join(dir, "plenary.db") });
+      const left = await db.lease(cur.tenant, board); await db.close();
+      expect(left.remainingMs).toBeLessThanOrEqual(LEASE_TTL_MS);
       await s.whenClosed(); record();
       expect(sent.length).toBeGreaterThan(acked.size);                   // some ops really were cut off unacked
       cur = await boot(dir, { ann: "owner" }, leaseEnv);

@@ -791,13 +791,18 @@ test("status: a stale answer counts the op as unconfirmed", () => {
 test("real timers (the page's clock, browserClock): a refusal resyncs after the backoff and converges", async () => {
   const net = localRoom({ users: USERS, auto: true });
   const o = new Editor(), so = bindEditor(o, { transport: net.join(), token: "owner", board: "b1", clock: browserClock() });
-  const v = new Editor(), sv = bindEditor(v, { transport: net.join(), token: "view", board: "b1", clock: browserClock() });
+  const vt = net.join(), reopen = vt.reopen;
+  let reopens = 0;
+  vt.reopen = (...a) => { reopens++; return reopen.apply(vt, a); };
+  const v = new Editor(), sv = bindEditor(v, { transport: vt, token: "view", board: "b1", clock: browserClock() });
   await until(() => so.status === "live" && sv.status === "live", "both bindings live");
   drag(o, "diamond", { x: 0, y: 0 }, { x: 50, y: 50 });
   drag(v, "rectangle", { x: 100, y: 100 }, { x: 200, y: 200 });
-  // The refusal's backoff runs on real timers (~0.25-0.5 s): wait for the outcome, not for a guessed time.
-  await until(() => sv.resets === 2 && sv.status === "live" && sv.pending === 0 && so.pending === 0, "the refused viewer to resync and both to settle");
-  expect(sv.resets).toBe(2);
+  // The refusal's backoff runs on real timers (~0.25-0.5 s): wait for the outcome, not for a guessed time. Not on the
+  // reset count: the refusal makes the viewer "connecting" at once (goDown) and the local room delivers in microtasks,
+  // so once both are live with nothing pending every resync there will be has happened, and a third one shows here.
+  await until(() => sv.status === "live" && sv.pending === 0 && so.pending === 0, "the refused viewer to resync and both to settle");
+  expect([sv.resets, reopens]).toEqual([2, 1]);                          // the first welcome, then exactly one resync
   expectConverged(net, [{ editor: o, sync: so }, { editor: v, sync: sv }]);
   so.close(); sv.close();
 });

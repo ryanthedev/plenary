@@ -1,7 +1,7 @@
 // `bun server/main.js` as a cluster (p4-wire): three child processes on one Postgres and one NATS, roles gateway,
 // gateway, host, each with its own PLENARY_DATA_DIR (so no shared local state hides a gap), serve one board end to
-// end; then the host is killed -9 and a second host started: acked ops survive, writers are welcomed again within
-// ttl + 3 s. Skips without DATABASE_URL and NATS_URL. A fresh database per run (main.js has no schema setting).
+// end; then the host is killed -9 and a second host started: acked ops survive, the dead host's lease has at most the
+// configured ttl left (so writers wait at most that), and writers are welcomed again (backstop ttl + 30 s). Skips without DATABASE_URL and NATS_URL. A fresh database per run (main.js has no schema setting).
 import { test, expect, afterAll, describe } from "bun:test";
 import { SQL } from "bun";
 import { tempDir, cleanup, until, spawnTracked } from "./helpers.js";
@@ -42,7 +42,7 @@ describe.skipIf(!PG || !NATS)("cluster: three main.js processes on Postgres + NA
     return { p, id, port, url: `http://127.0.0.1:${port}`, ws: `ws://127.0.0.1:${port}/ws` };
   }
 
-  test("gateway / gateway / host serve one board end to end; kill -9 the host, start another: acked ops survive, writers welcomed within ttl + 3 s", async () => {
+  test("gateway / gateway / host serve one board end to end; kill -9 the host, start another: acked ops survive, the dead host's lease ends within its ttl, writers are welcomed again", async () => {
     admin = new SQL({ url: PG, max: 1 });
     dbName = `plen_wire_${process.pid}_${Date.now().toString(36)}`;
     await admin.unsafe(`CREATE DATABASE "${dbName}"`);
@@ -93,6 +93,10 @@ describe.skipIf(!PG || !NATS)("cluster: three main.js processes on Postgres + NA
     for (let k = 31; k <= 40; k++) a.send(op("a", k));
     h1.p.child.kill("SIGKILL"); await h1.p.child.exited;
     const killedAt = Date.now();
+    // Its last renew set expiresAt = then + its ttl (the database's clock): at most PLENARY_LEASE_TTL_MS remains, where a
+    // host on the 10 s default would leave more. Time only shrinks it: no flake.
+    const pg = await postgresStore({ url: dbUrl, max: 1 });
+    try { expect((await pg.lease(board.tenant, board.id)).remainingMs).toBeLessThanOrEqual(TTL); } finally { await pg.close(); }
     const h2 = await node("host-2", "host");
     const end = killedAt + TTL + 30_000;
     const a2 = await welcomed(g1, "a", end), b2 = await welcomed(g2, "b", end);

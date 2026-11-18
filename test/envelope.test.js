@@ -61,6 +61,19 @@ test("an op nested deeper than 62 levels is refused; a 30,000-deep one with no c
   expect(d.log.entries.length).toBe(0);
 });
 
+test("deeperThan never recurses: a value nested past this engine's own stack limit is walked to the end without throwing", () => {
+  // The stack limit is measured here, not assumed (30,000 levels proves nothing at max 62: a recursive walk would stop
+  // at level 63 too). A recursive deeperThan overflows at about this depth with a full walk (max = Infinity).
+  let limit = 0;
+  const probe = n => { limit = n; probe(n + 1); };
+  try { probe(1); } catch { /* RangeError: the stack is full */ }
+  const levels = limit * 2, deep = nested(levels);                       // rect → customData → inner … : levels + 1 objects
+  expect(() => deeperThan(deep, Infinity)).not.toThrow();
+  expect(deeperThan(deep, Infinity)).toBe(false);
+  expect(deeperThan(deep, levels + 1)).toBe(false);                       // the deepest object is at depth levels + 1
+  expect(deeperThan(deep, levels)).toBe(true);
+});
+
 test("a first write counts from version 0: no exemption from the jump cap", () => {
   const d = direct(), a = d.join("ua", "editor", "a");
   a.op(1, "board", { elements: [rect("high", { version: 1001 })] });

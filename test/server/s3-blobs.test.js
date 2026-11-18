@@ -87,9 +87,17 @@ test("s3 M1: a store that accepts the connection and never answers is aborted at
     const blobs = s3Blobs({ endpoint: `http://127.0.0.1:${srv.port}`, bucket: "b", region: "us-east-1", accessKeyId: "k", secretAccessKey: "s", getTimeoutMs: 300, putTimeoutMs: 400 });
     const bytes = fakePng(64, 2), h = sha1(bytes);
     // "Aborted at the deadline, not left hanging" is the outcome: a call that never gave up never returns, and the test's
-    // own limit fails it; how long the 300 ms deadline took on a loaded machine is not asserted.
-    expect(await code(blobs.get("t-a", h))).toBe("timeout");
-    expect(await code(blobs.put("t-a", h, bytes))).toBe("timeout");
+    // own limit fails it; how long the deadline took on a loaded machine is not asserted. Which deadline is: every
+    // AbortSignal.timeout the adapter arms is recorded, and each call's must be its configured one (the 10 s and 30 s
+    // defaults would also time out here, just later).
+    const armed = [], timeout = AbortSignal.timeout;
+    AbortSignal.timeout = ms => { armed.push(ms); return timeout.call(AbortSignal, ms); };
+    try {
+      expect(await code(blobs.get("t-a", h))).toBe("timeout");
+      expect(armed).toEqual([300]);
+      expect(await code(blobs.put("t-a", h, bytes))).toBe("timeout");
+      expect(armed).toEqual([300, 400]);
+    } finally { AbortSignal.timeout = timeout; }
     expect(opened).toBeGreaterThanOrEqual(1);
     await until(() => closed >= opened, "the aborted requests' sockets closed");   // aborted, not left open
   } finally { srv.stop(true); }

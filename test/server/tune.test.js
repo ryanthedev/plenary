@@ -91,6 +91,7 @@ test("R2: a timed pass whose Registry calls fail keeps the connections, retries 
     const passes = gw(r).stats().rechecks.passes;
     await V.advance(wait);
     await until(() => gw(r).stats().rechecks.passes > passes, "the retry pass");
+    await idle(r);                                                       // to its end: it arms the next retry last
   }
   expect(V.oneShots()).toEqual([]);
   const closes = await Promise.all(socks.map(s => s.whenClosed(30_000)));
@@ -164,8 +165,12 @@ test("here: relayed between clients (writers by user, viewers counted), updated 
   const ed = await r.sock(); ed.send(hello(r, "editor")); await ed.next(m => m.t === "welcome");
   const an = await r.sock(); an.send(hello(r, "annotator")); await an.next(m => m.t === "welcome");
   const vw = await r.sock(); vw.send(hello(r, "viewer")); await vw.next(m => m.t === "welcome");
-  const want = { t: "here", writers: [{ user: "dev:editor", name: "editor", role: "editor" }, { user: "dev:annotator", name: "annotator", role: "annotator" }], writerCount: 2, viewers: 1 };
-  for (const s of [ed, an, vw]) await s.next(m => m.t === "here" && JSON.stringify(m) === JSON.stringify(want), "the merged here");
+  const want = { writers: [{ user: "dev:editor", name: "editor", role: "editor" }, { user: "dev:annotator", name: "annotator", role: "annotator" }], writerCount: 2, viewers: 1 };
+  // What a client knows is its last full list plus its last counts: a change that leaves the list alone comes count-only
+  // (M2/LOW 5 below). Waiting for one message with both used to time out whenever the viewer joined in a later `here`
+  // tick than the annotator (a loaded machine; TECH-DEBT row 9): the editor and annotator then get the viewer's count only.
+  const merged = s => JSON.stringify(lastList(s)?.writers) === JSON.stringify(want.writers) && lastHere(s)?.writerCount === want.writerCount && lastHere(s)?.viewers === want.viewers;
+  for (const s of [ed, an, vw]) await until(() => merged(s), "the merged here", 30_000);
   await ed.close();
   await an.next(m => m.t === "here" && m.writerCount === 1 && m.writers?.[0]?.user === "dev:annotator", "here after the editor left");
   // A joiner gets the current `here` right after its catch-up.
@@ -229,18 +234,24 @@ test("here: bounded with many viewers: at most hereMax writers listed (counts pa
 // ---- Round 2 (p2-tunev findings; each test is the verifier's repro) ----
 
 test("H1: a lookup that never settles is cut off at recheckLookupMs; the revoked editor is closed once the stuck timed pass is cut off", async () => {
-  const { r, ctl, open } = await roleRig({ recheckLookupMs: 150, recheckConcurrency: 1 });
+  // The gateway's clock and timers are virtual and frozen between steps: the bound is the one-shot timer the hung lookup
+  // armed, and it must be exactly the configured 150 ms (the 2 s default would pass any timing window loosely drawn).
+  const V = virtualTime({ start: Date.now(), settle: () => new Promise(res => setImmediate(res)) });
+  const { r, ctl, open } = await roleRig({ recheckLookupMs: 150, recheckConcurrency: 1 }, { now: V.now, timers: V.timers });
   const [, victim] = await open(["stuck", "victim"], "editor");
   ctl.hang.add("dev:stuck");
   const timed = gw(r).recheck(r.ids.board, "timed");                    // not awaited: its first lookup never settles
   await until(() => ctl.hung >= 1, "the hung lookup");
+  expect(V.oneShots()).toEqual([150]);
   await r.registry.setGrant(r.ids.board, "dev:victim", null);
   await grantsChanged(r);
-  // The grants pass waits behind the stuck timed pass, which only the lookup bound ends: without it neither ever finishes
-  // (a counted outcome; the backstop is generous, so a loaded machine slows this and cannot fail it).
+  await V.advance(149);
+  expect([victim.closed, gw(r).stats().rechecks.timeouts]).toEqual([null, 0]);   // the bound has not passed: still stuck
+  // The grants pass waits behind the stuck timed pass, which only the lookup bound ends: without it neither ever finishes.
+  await V.advance(1);
   expect((await victim.whenClosed(30_000)).code).toBe(1008);
   await timed;
-  expect(gw(r).stats().rechecks.timeouts).toBeGreaterThanOrEqual(1);
+  expect(gw(r).stats().rechecks.timeouts).toBe(1);
   await r.stop();
 }, 40000);
 
@@ -267,12 +278,17 @@ test("M3: the retry backoff is per connection: a second failing user after a clo
   const waitsOf = async (s, user) => {
     ctl.fail.add(user); const waits = [];
     await gw(r).recheck(r.ids.board, "timed");
-    for (let i = 0; !s.closed && i < 10; i++) {
-      const due = V.oneShots(); expect(due.length).toBe(1);
+    // Each retry pass is waited out to its end (it counts itself at its start and arms the next retry at its end), so
+    // the pending timers are read after it: none left means the user was closed out (the client may hear it later).
+    for (let i = 0; i < 10; i++) {
+      const due = V.oneShots();
+      if (!due.length) break;
+      expect(due.length).toBe(1);
       waits.push(due[0]);
       const passes = gw(r).stats().rechecks.passes;
       await V.advance(due[0]);
       await until(() => gw(r).stats().rechecks.passes > passes, "the retry pass");
+      await idle(r);
     }
     expect((await s.whenClosed(30_000)).code).toBe(1013); ctl.fail.delete(user);
     return waits;

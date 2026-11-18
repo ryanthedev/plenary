@@ -2,11 +2,12 @@
 // Local cluster rig for the M2 load test and the phase-4 takeover check: native Postgres 17 + NATS + N node
 // processes (gateways and room hosts split) behind one Caddy load balancer, all on this machine, all on probed ports.
 //
-//   bun scripts/cluster-rig.js up     [--name default] [--dir <path>] [--gateways 2] [--hosts 1] [--lease-ttl-ms 10000]
-//                                     [--max-conns-per-user 100000] [--node-cmd "<cmd> <args>"] [--timeout-ms 60000]
+//   bun scripts/cluster-rig.js up     [--name default] [--dir <path>] [--gateways 2] [--hosts 1] [--services-only] [--lease-ttl-ms 10000]
+//                                     [--max-conns-per-user 100000] [--node-cmd "<cmd> <args>"] [--timeout-ms 60000] [--watch-parent <pid>]
 //   bun scripts/cluster-rig.js status [--name|--dir] [--json]
 //   bun scripts/cluster-rig.js kill <node-id> [--name|--dir]      SIGKILL one node by its recorded PID (takeover check)
-//   bun scripts/cluster-rig.js down   [--name|--dir]
+//   bun scripts/cluster-rig.js down   [--name|--dir] [--all] [--clean]
+//   bun scripts/cluster-rig.js ls | gc | env [--name|--dir]
 //
 // Importable for tests: startRig(opts), stopRig(rigOrDir), readRig(dir), rigStatus(dir), killNode(dir, id), missingBins().
 // Docs: deploy/cluster/RIG.md.
@@ -49,18 +50,38 @@ const ROOT = resolve(new URL("..", import.meta.url).pathname);
 const MAIN = join(ROOT, "server/main.js");
 const NAME_RE = /^[a-z0-9-]{1,32}$/;
 const which = (cmd, fallback) => Bun.which(cmd) ?? (existsSync(fallback) ? fallback : null);
+const BUN = Bun.which("bun") ?? process.execPath;
 
 /** Absolute paths of the binaries the rig runs (null when missing). */
 export function bins() {
+  const pg17 = ["/opt/homebrew/opt/postgresql@17/bin", "/usr/local/opt/postgresql@17/bin", "/usr/lib/postgresql/17/bin"];
+  const find = (cmd, fallback, dirs = []) => Bun.which(cmd) ?? [fallback, ...dirs.map(d => join(d, cmd))].find(p => p && existsSync(p)) ?? null;
   return {
-    initdb: which("initdb", "/opt/homebrew/bin/initdb"),
-    postgres: which("postgres", "/opt/homebrew/bin/postgres"),
+    initdb: find("initdb", "/opt/homebrew/bin/initdb", pg17),
+    postgres: find("postgres", "/opt/homebrew/bin/postgres", pg17),
     nats: which("nats-server", "/opt/homebrew/bin/nats-server"),
     caddy: which("caddy", "/opt/homebrew/bin/caddy"),
+    minio: find("minio", "/opt/homebrew/bin/minio"),
   };
 }
+export const INSTALL_HINT = "brew install postgresql@17 nats-server minio caddy (Debian/Ubuntu: add the PGDG apt repo for postgresql-17, apt-get install nats-server caddy, and get minio from https://min.io/download, there is no apt package)";
 /** Names of missing binaries; empty when the rig can run. */
 export function missingBins() { return Object.entries(bins()).filter(([, p]) => !p).map(([k]) => k); }
+
+/** Parse ipcs -m output without performing any system changes. */
+export function parseIpcsSegments(output, owner) {
+  const lines = String(output).split(/\r?\n/);
+  const headerAt = lines.findIndex(line => /\b(?:shmid|id)\b/i.test(line) && /\bowner\b/i.test(line) && /\bnattch\b/i.test(line));
+  if (headerAt < 0) return [];
+  const headers = lines[headerAt].trim().toLowerCase().split(/\s+/);
+  const ix = { shmid: headers.indexOf("shmid") >= 0 ? headers.indexOf("shmid") : headers.indexOf("id"), owner: headers.indexOf("owner"), nattch: headers.indexOf("nattch") };
+  return lines.slice(headerAt + 1).flatMap(line => {
+    const fields = line.trim().split(/\s+/);
+    const id = Number(fields[ix.shmid]), nattch = Number(fields[ix.nattch]);
+    return fields.length > Math.max(...Object.values(ix)) && Number.isSafeInteger(id) && id >= 0 && fields[ix.owner] === owner && nattch === 0
+      ? [{ id, owner, nattch }] : [];
+  });
+}
 
 export const defaultDir = name => join(ROOT, ".rig", name);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -73,6 +94,9 @@ export const STARTED_CLOCK = "lstart TZ=UTC LC_ALL=C";
 export const PS_ENV = Object.freeze({ PATH: "/usr/bin:/bin", LC_ALL: "C", TZ: "UTC" });
 /** `ps` by absolute path, never via the caller's PATH (p8-rig2v H2). Tests swap it through `_setPsPath` only. */
 const PS_DEFAULT = "/bin/ps";
+/** The signals a terminal (Ctrl-C, a closed terminal) or `kill` sends a whole process group; `down` ignores them. */
+export const TERMINAL_SIGNALS = Object.freeze(["SIGINT", "SIGTERM", "SIGHUP"]);
+const PS_TRIES = 5;
 let psPath = PS_DEFAULT;
 /** Test seam (in-process only): called as fn("stale", dir) once a stale up.lock has been judged stale. */
 let lockHook = null;
@@ -85,10 +109,17 @@ export function _setPsPath(p) { psPath = p ?? PS_DEFAULT; }
  * resolution). Throws when `ps` itself did not run or answered something unexpected: a failed `ps` must never read as
  * "process gone" (p8-rig2v H2). "Absent" is only exit 1 with empty stdout and empty stderr (what /bin/ps does for an
  * unused PID); anything else is a ps failure.
+ * A `ps` killed by SIGINT, SIGTERM or SIGHUP is run again (up to PS_TRIES times): it shares its caller's process group,
+ * so a terminal Ctrl-C kills it too, and `down`, which ignores those signals, must still finish (rig-tools-v5 audit).
+ * Any other death (SIGKILL, a timeout) refuses at once.
  */
-function psInfo(pid) {
+export function psInfo(pid, { tries: maxTries = PS_TRIES } = {}) {
   if (!Number.isSafeInteger(pid) || pid <= 1) return null;
-  const r = spawnSync(psPath, ["-o", "stat=", "-o", "lstart=", "-p", String(pid)], { encoding: "utf8", env: PS_ENV, timeout: 10_000 });
+  let r;
+  for (let tries = 1; ; tries++) {
+    r = spawnSync(psPath, ["-o", "stat=", "-o", "lstart=", "-p", String(pid)], { encoding: "utf8", env: PS_ENV, timeout: 10_000 });
+    if (r.error || !TERMINAL_SIGNALS.includes(r.signal) || tries >= maxTries) break;
+  }
   const out = (r.stdout || "").trim(), err = (r.stderr || "").trim();
   const fail = why => new Error(`cannot check processes: ${psPath} ${why}; refusing to guess whether this rig's processes are alive`);
   if (r.error) throw fail(`did not run (${r.error.code ?? r.error.message})`);
@@ -107,6 +138,81 @@ function psInfo(pid) {
 export function psCheck() {
   if (!psInfo(process.pid)) throw new Error(`cannot check processes: ${psPath} does not see this process (pid ${process.pid}); refusing to guess whether this rig's processes are alive`);
 }
+// ---- test:cluster owner records (scripts/test-cluster.js) ----
+// `<rig root>/test-<pid>-<hash>.owner` holds the start time of the test:cluster run that owns the rig dir beside it, so
+// the next run's reaper can tell a dead (or reused) owner pid from a live run. Both helpers follow psInfo's rule: a ps
+// that cannot answer is never read as "gone" (rig-tools-v5 H1).
+
+/** Write `pid`'s start time to `path`. Throws, writing nothing, when ps cannot answer (never an empty record). */
+export function writeOwnerRecord(path, pid = process.pid) {
+  const info = psInfo(pid);
+  if (!info) throw new Error(`cannot record the start time of pid ${pid}: ${psPath} does not see it`);
+  writeFileAtomic(path, info.started + "\n");
+}
+/**
+ * Write `text` to `path` through a temp file and a rename (rig-tools-v6 N2): a concurrent reader sees the old content
+ * or the new one, never an empty or partly written file. The temp name never matches the reaper's `.owner` pattern.
+ */
+export function writeFileAtomic(path, text) {
+  const tmp = `${path}.${process.pid}.tmp`;
+  try { writeFileSync(tmp, text); renameSync(tmp, path); }
+  catch (error) { rmSync(tmp, { force: true }); throw error; }
+}
+/**
+ * True when the owner `pid` is gone: dead, or now another process (a start time other than the one in `ownerPath`).
+ * False when it lives and there is no record (an older run: only a dead pid counts). Throws when ps cannot answer:
+ * the caller must then leave the rig alone.
+ */
+export function ownerGone(pid, ownerPath, { psTries } = {}) {
+  if (pidDead(pid)) return true;
+  if (!existsSync(ownerPath)) return false;
+  const info = psInfo(pid, { tries: psTries });
+  if (!info) { psCheck(); return true; }   // "absent" counts only from a ps that sees this very process
+  return info.started !== readFileSync(ownerPath, "utf8").trim();
+}
+const pidDead = pid => { try { process.kill(pid, 0); return false; } catch (e) { return e.code === "ESRCH"; } };
+
+/**
+ * Remove the rigs of earlier test:cluster runs under `root` that were killed (SIGKILL: nothing could tear them down).
+ * Only `test-<pid>-<hash>` dirs whose owner is gone (pid dead, or reused by another process) are touched; a live run's
+ * rig, and every other rig, is left alone. `down(target)` stops a rig's services ({ code }); `isInterrupted()` says the
+ * caller was signalled.
+ * - A ps that cannot answer leaves that rig alone (rig-tools-v5 H1).
+ * - The ps runs once, never again after a terminal signal: it is in the caller's process group, so a ps killed by
+ *   SIGINT means the user pressed Ctrl-C. After an interrupt no more ps runs at all; only rigs whose owner pid is dead
+ *   (no ps needed) are still reaped. So a hung ps costs one Ctrl-C, not 5 per rig (rig-tools-v6 N1).
+ */
+export async function reapStaleRigs(root, { down, isInterrupted = () => false, log = m => console.error(`[test:cluster] ${m}`) }) {
+  if (!existsSync(root)) return;
+  const entries = readdirSync(root, { withFileTypes: true });
+  const runs = entries.filter(e => /^test-\d+-[0-9a-f]+$/.test(e.name)).length;
+  if (runs) log(`checking ${runs} earlier run rig(s) in ${root}`);   // also the readiness marker for the reaper storm tests
+  let skipping = false;
+  const gone = async (pid, ownerPath) => {
+    await new Promise(r => setTimeout(r, 0));   // the checks are synchronous: let the caller's signal handler run between them
+    if (isInterrupted() && !pidDead(pid)) {
+      if (!skipping) log("interrupted: no more ps checks; rigs whose owner pid lives are left alone");
+      skipping = true;
+      return false;
+    }
+    try { return ownerGone(pid, ownerPath, { psTries: 1 }); } catch (error) {
+      log(`leaving ${basename(ownerPath, ".owner")} alone: ${error.message}`);
+      return false;
+    }
+  };
+  for (const e of entries) {
+    const o = /^(test-(\d+)-[0-9a-f]+)\.owner$/.exec(e.name);   // an owner record whose run died before making its dir
+    if (o && e.isFile() && !existsSync(join(root, o[1])) && await gone(Number(o[2]), join(root, e.name))) rmSync(join(root, e.name), { force: true });
+    const m = /^test-(\d+)-[0-9a-f]+$/.exec(e.name);
+    if (!e.isDirectory() || !m || !await gone(Number(m[1]), join(root, `${e.name}.owner`))) continue;
+    log(`reaping stale rig ${e.name} (its test:cluster, pid ${m[1]}, is gone)`);
+    const target = join(root, e.name);
+    if (existsSync(join(target, "rig.json")) && (await down(target)).code !== 0) continue;   // services may still run: keep the dir (and its owner record)
+    rmSync(target, { recursive: true, force: true });   // also a run that died before any service started
+    rmSync(`${target}.owner`, { force: true });
+  }
+}
+
 /** True while the recorded process is still the one this rig started (same PID and same start time). */
 export function isOurs(proc) {
   const info = psInfo(proc?.pid);
@@ -188,7 +294,7 @@ const fromDisk = (rig, fileDir, dir) => mapPaths(rig, p => !isAbsolute(p) ? join
 
 function save(rig) {
   const file = join(rig.dir, "rig.json");   // rig.dir is always the caller's dir (loadRig sets it), never the file's
-  writeFileSync(file + ".tmp", JSON.stringify(toDisk(rig), null, 2) + "\n");
+  writeSecret(file + ".tmp", JSON.stringify(toDisk(rig), null, 2) + "\n");   // 0600: it holds the MinIO secret
   renameSync(file + ".tmp", file);
 }
 export function readRig(dir) {
@@ -233,6 +339,23 @@ export function portFree(port) {
 }
 async function httpOk(url) {
   try { const r = await fetch(url, { signal: AbortSignal.timeout(1000) }); await r.arrayBuffer(); return r.ok; } catch { return false; }
+}
+
+const sha256 = async value => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)))].map(b => b.toString(16).padStart(2, "0")).join("");
+const hmac = async (key, value) => new Uint8Array(await crypto.subtle.sign("HMAC", await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]), new TextEncoder().encode(value)));
+async function createMinioBucket(endpoint, bucket, MINIO_ACCESS, MINIO_SECRET, timeoutMs) {
+  const now = new Date().toISOString().replace(/[:-]|\.\d{3}/g, ""), date = now.slice(0, 8), region = "us-east-1";
+  const url = new URL(`/${bucket}`, endpoint), payloadHash = await sha256("");
+  const canonicalHeaders = `host:${url.host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${now}\n`;
+  const canonical = `PUT\n${url.pathname}\n\n${canonicalHeaders}\nhost;x-amz-content-sha256;x-amz-date\n${payloadHash}`;
+  const scope = `${date}/${region}/s3/aws4_request`;
+  const stringToSign = `AWS4-HMAC-SHA256\n${now}\n${scope}\n${await sha256(canonical)}`;
+  const kDate = await hmac(new TextEncoder().encode(`AWS4${MINIO_SECRET}`), date);
+  const kRegion = await hmac(kDate, region), kService = await hmac(kRegion, "s3"), kSigning = await hmac(kService, "aws4_request");
+  const signature = [...await hmac(kSigning, stringToSign)].map(b => b.toString(16).padStart(2, "0")).join("");
+  const response = await fetch(url, { method: "PUT", headers: { "x-amz-date": now, "x-amz-content-sha256": payloadHash,
+    Authorization: `AWS4-HMAC-SHA256 Credential=${MINIO_ACCESS}/${scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=${signature}` }, signal: AbortSignal.timeout(timeoutMs) });
+  if (!response.ok && response.status !== 409) throw new Error(`minio bucket creation failed (HTTP ${response.status})`);
 }
 
 /** Poll `check` until true; fail fast if `proc` died or the rig was aborted; clear timeout error naming the log. */
@@ -364,13 +487,14 @@ export async function startRig(opts = {}) {
   const name = opts.name ?? "default";
   if (!NAME_RE.test(name)) throw new Error("rig name: a-z, 0-9 and - only, at most 32 characters");
   const dir = resolve(opts.dir ?? defaultDir(name));
-  const gateways = opts.gateways ?? 2, hosts = opts.hosts ?? 1;
-  if (!(Number.isSafeInteger(gateways) && gateways >= 1 && Number.isSafeInteger(hosts) && hosts >= 0)) throw new Error("need at least 1 gateway and 0 or more hosts");
+  const servicesOnly = !!opts.servicesOnly || (opts.gateways === 0 && (opts.hosts ?? 0) === 0);   // Postgres, NATS, MinIO only: no nodes, no LB
+  const gateways = servicesOnly ? 0 : opts.gateways ?? 2, hosts = servicesOnly ? 0 : opts.hosts ?? 1;
+  if (!(Number.isSafeInteger(gateways) && gateways >= 0 && Number.isSafeInteger(hosts) && hosts >= 0 && (servicesOnly || gateways >= 1))) throw new Error("need at least 1 gateway and 0 or more hosts (or --services-only)");
   const leaseTtlMs = opts.leaseTtlMs ?? 10_000, maxConnsPerUser = opts.maxConnsPerUser ?? 100_000;
   const deadline = Date.now() + (opts.timeoutMs ?? 60_000);
   const step = opts.onStep ?? (() => {});
   const missing = missingBins();
-  if (missing.length) throw new Error(`missing binaries: ${missing.join(", ")} (brew install postgresql@17 nats-server caddy)`);
+  if (missing.length) throw new Error(`missing binaries: ${missing.join(", ")}. Install with: ${INSTALL_HINT}`);
   const B = bins();
   psCheck();   // before the dir is touched: a broken ps refuses here (p8-rig2v H2)
 
@@ -443,8 +567,24 @@ export async function startRig(opts = {}) {
     save(rig);
     await waitFor(() => httpOk(`http://127.0.0.1:${natsMon}/healthz`), { what: "nats", proc: nats, deadline, abort: opts.abort });
 
+    // S3-compatible object store. Both ports are probed and the API is loopback-only.
+    step("minio: starting");
+    const minioAccess = `rig${randomBytes(6).toString("hex")}`, minioSecret = randomBytes(24).toString("base64url");   // per rig; stored 0600 in rig.json
+    const minioPort = await freePort(taken), minioConsolePort = await freePort(taken);
+    const minioEndpoint = `http://127.0.0.1:${minioPort}`, bucket = "plenary";
+    const blobsDir = join(dir, "blobs");
+    mkdirSync(blobsDir, { recursive: true });
+    const minio = launch(rig, kids, "minio", [B.minio, "server", blobsDir, "--address", `127.0.0.1:${minioPort}`, "--console-address", `127.0.0.1:${minioConsolePort}`],
+      { env: baseEnv({ MINIO_ROOT_USER: minioAccess, MINIO_ROOT_PASSWORD: minioSecret }), cwd: dir, log: join(logsDir, "minio.log"), abort: opts.abort });
+    rig.blobs = { url: minioEndpoint, bucket, accessKey: minioAccess, secretKey: minioSecret, consolePort: minioConsolePort };
+    save(rig);
+    // /health/cluster, not /health/ready: `ready` answers 200 before the object layer is initialized (a signed request
+    // then gets 503 XMinioServerNotInitialized), `cluster` stays 503 until it is. So the bucket PUT needs no retry.
+    await waitFor(() => httpOk(`${minioEndpoint}/minio/health/cluster`), { what: "minio", proc: minio, deadline, abort: opts.abort });
+    await createMinioBucket(minioEndpoint, bucket, minioAccess, minioSecret, Math.max(1000, Math.min(5000, deadline - Date.now())));
+
     // Nodes.
-    const nodeCmd = opts.nodeCmd?.length ? opts.nodeCmd : [process.execPath, MAIN];
+    const nodeCmd = opts.nodeCmd?.length ? opts.nodeCmd : [BUN, MAIN];
     const plan = [...Array.from({ length: gateways }, (_, i) => ({ id: `gw-${i + 1}`, roles: ["gateway"] })),
                   ...Array.from({ length: hosts }, (_, i) => ({ id: `host-${i + 1}`, roles: ["host"] }))];
     const tokensJson = JSON.stringify(tokens);
@@ -471,6 +611,8 @@ export async function startRig(opts = {}) {
       step(`node ${s.id}: waiting`);
       await waitFor(() => httpOk(`http://127.0.0.1:${s.port}/health`), { what: `node ${s.id}`, proc: s.proc, deadline, abort: opts.abort });
     }
+
+    if (servicesOnly) { rig.state = "up"; save(rig); step("up (services only)"); return rig; }
 
     // Load balancer in front of the gateways only; WebSocket upgrades pass through reverse_proxy as is.
     step("lb: starting");
@@ -579,13 +721,13 @@ export async function killNode(dir, id) {
 
 // ---- CLI ----
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const o = { _: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (!a.startsWith("--")) { o._.push(a); continue; }
     const [k, v] = a.slice(2).split("=", 2);
-    if (k === "json") { o.json = true; continue; }
+    if (["json", "all", "clean", "services-only"].includes(k)) { o[k] = true; continue; }
     o[k] = v ?? argv[++i];
   }
   return o;
@@ -599,12 +741,31 @@ function printStatus(s) {
     `  lb        ${s.lb ? `${s.lb.url}   ${s.lb.wsUrl}` : "-"}   ${pid("caddy")}`,
     `  postgres  ${s.postgres ? `127.0.0.1:${s.postgres.port}   DATABASE_URL ${s.postgres.url}` : "-"}   ${pid("postgres")}`,
     `  nats      ${s.nats ? s.nats.url : "-"}   ${pid("nats")}`,
+    `  minio     ${s.blobs ? s.blobs.url : "-"}   ${pid("minio")}`,
+    ...s3Env(s).filter(line => !line.startsWith("S3_SECRET_ACCESS_KEY=")).map(line => `  ${line}`),
+    ...(s.blobs ? ["  S3 secret  (not printed; run `env`)"] : []),
     ...s.nodes.map(n => `  ${n.id.padEnd(9)} ${n.roles.join(",").padEnd(8)} ${n.url}   ${pid("node:" + n.id)}`),
     `  tokens    ${s.tokensFile}   (0600, PLENARY_DEV_TOKENS format; never printed)`,
     `  logs      ${s.logsDir}`,
-    `  lease     PLENARY_LEASE_TTL_MS=${s.leaseTtlMs} on every node`,
+    ...(s.nodes.length ? [`  lease     PLENARY_LEASE_TTL_MS=${s.leaseTtlMs} on every node`] : []),
   ];
   console.log(lines.join("\n"));
+}
+
+function rigDirs() {
+  const root = join(ROOT, ".rig");
+  if (!existsSync(root)) return [];
+  return readdirSync(root, { withFileTypes: true }).filter(e => e.isDirectory() && existsSync(join(root, e.name, "rig.json"))).map(e => join(root, e.name));
+}
+function missingRigMessage(name, dir) {
+  const live = rigDirs().filter(d => d !== dir && (() => { try { return rigStatus(d).procs.some(p => p.alive); } catch { return false; } })()).map(d => basename(d));
+  return `no rig named ${name}${live.length ? `; did you mean --name ${live[0]}?` : ""}`;
+}
+
+export function s3Env(s) {
+  if (!s.blobs) return [];
+  return [`S3_ENDPOINT=${s.blobs.url}`, `S3_BUCKET=${s.blobs.bucket}`, "S3_REGION=us-east-1",
+    `S3_ACCESS_KEY_ID=${s.blobs.accessKey}`, `S3_SECRET_ACCESS_KEY=${s.blobs.secretKey}`];
 }
 
 async function cli(argv) {
@@ -615,21 +776,27 @@ async function cli(argv) {
     const abort = { aborted: false };
     const onSig = () => { abort.aborted = true; };
     // Ctrl-C, kill, or a closed terminal: stop what started, then exit 1 (never leave it running).
-    for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, onSig);
+    for (const sig of TERMINAL_SIGNALS) process.on(sig, onSig);
+    // --watch-parent <pid>: the caller's death (even SIGKILL, which no handler sees) aborts `up`, which then stops what it started.
+    const parent = a["watch-parent"] === undefined ? null : num(a["watch-parent"], "watch-parent");
+    const watch = parent === null ? null : setInterval(() => { try { process.kill(parent, 0); } catch (e) { if (e.code !== "EPERM") abort.aborted = true; } }, 200);
     const nodeCmd = a["node-cmd"] ? a["node-cmd"].split(/\s+/).filter(Boolean) : undefined;
     try {
-      await startRig({ name: a.name, dir, gateways: num(a.gateways, "gateways"), hosts: num(a.hosts, "hosts"),
+      await startRig({ name: a.name, dir, gateways: num(a.gateways, "gateways"), hosts: num(a.hosts, "hosts"), servicesOnly: !!a["services-only"],
         leaseTtlMs: num(a["lease-ttl-ms"], "lease-ttl-ms"), maxConnsPerUser: num(a["max-conns-per-user"], "max-conns-per-user"),
         timeoutMs: num(a["timeout-ms"], "timeout-ms"), nodeCmd, abort, onStep: m => console.error(`[rig] ${m}`) });
     } catch (err) { console.error(`[rig] up failed: ${err.message}`); return 1; }
+    finally { clearInterval(watch); }
     printStatus(rigStatus(dir));
     return 0;
   }
   if (cmd === "status") {
+    if (!existsSync(join(dir, "rig.json"))) throw new Error(missingRigMessage(a.name ?? basename(dir), dir));
     const s = rigStatus(dir);
-    if (a.json) console.log(JSON.stringify(s, null, 2)); else printStatus(s);
+    if (a.json) console.log(JSON.stringify({ ...s, ...(s.blobs && { blobs: { ...s.blobs, secretKey: undefined } }) }, null, 2)); else printStatus(s);
     return 0;
   }
+  if (["kill", "env"].includes(cmd) && !existsSync(join(dir, "rig.json"))) throw new Error(missingRigMessage(a.name ?? basename(dir), dir));
   if (cmd === "kill") {
     const id = a._[1];
     if (!id) throw new Error("usage: kill <node-id>");
@@ -638,15 +805,52 @@ async function cli(argv) {
     return 0;
   }
   if (cmd === "down") {
-    const r = await stopRig(dir);
-    console.log(`rig down: stopped ${r.stopped.join(", ") || "nothing"}${r.forced.length ? ` (SIGKILL: ${r.forced.join(", ")})` : ""}${r.gone.length ? `; already gone: ${r.gone.join(", ")}` : ""}`);
+    // Teardown must finish: a Ctrl-C (or the parent's forwarded signal) during down is ignored, never a half-stopped rig.
+    for (const sig of TERMINAL_SIGNALS) process.on(sig, () => {});
+    console.error("[rig] down: stopping (signals are ignored until it finishes)");   // also the readiness signal for the guard test
+    const targets = a.all ? rigDirs() : [dir];
+    if (!a.all && !existsSync(join(dir, "rig.json"))) throw new Error(missingRigMessage(a.name ?? basename(dir), dir));
+    for (const target of targets) {
+      const r = await stopRig(target);
+      console.log(`rig ${basename(target)} down: stopped ${r.stopped.join(", ") || "nothing"}${r.forced.length ? ` (SIGKILL: ${r.forced.join(", ")})` : ""}${r.gone.length ? `; already gone: ${r.gone.join(", ")}` : ""}`);
+      if (a.clean) rmSync(target, { recursive: true, force: true });
+    }
     return 0;
   }
-  console.error("usage: bun scripts/cluster-rig.js up|status [--json]|kill <node-id>|down [--name n | --dir d]  (see deploy/cluster/RIG.md)");
+  if (cmd === "ls") {
+    const rows = [];
+    for (const d of rigDirs()) {
+      const s = rigStatus(d), live = s.procs.filter(p => p.alive).length;
+      if (live) rows.push(`${s.name}\t${live} process(es)\t${d}`);
+    }
+    console.log(rows.length ? rows.join("\n") : "no live rigs");
+    return 0;
+  }
+  if (cmd === "env") {
+    const s = rigStatus(dir);
+    console.log([`DATABASE_URL=${s.postgres?.url ?? ""}`, `NATS_URL=${s.nats?.url ?? ""}`, ...s3Env(s)].join("\n"));
+    return 0;
+  }
+  if (cmd === "gc") {
+    const user = spawnSync("/usr/bin/id", ["-un"], { encoding: "utf8", env: PS_ENV });
+    if (user.status !== 0 || !user.stdout.trim()) throw new Error("cannot determine current user for shared-memory cleanup");
+    const out = spawnSync(ipc.ipcs, ["-m", "-o"], { encoding: "utf8", env: PS_ENV });
+    if (out.status !== 0) throw new Error("ipcs -m -o failed; no segments were removed");
+    const segments = parseIpcsSegments(out.stdout, user.stdout.trim());
+    for (const segment of segments) {
+      const removed = spawnSync(ipc.ipcrm, ["-m", String(segment.id)], { encoding: "utf8", env: PS_ENV });
+      if (removed.status !== 0) throw new Error(`ipcrm -m ${segment.id} failed`);
+      console.log(`removed shared-memory segment ${segment.id} (owner ${segment.owner}, NATTCH 0)`);
+    }
+    if (!segments.length) console.log("no unattached shared-memory segments for current user");
+    return 0;
+  }
+  console.error("usage: bun scripts/cluster-rig.js up|status [--json]|kill <node-id>|down [--all] [--clean]|ls|env|gc  (see deploy/cluster/RIG.md)");
   return 2;
 }
 
 if (import.meta.main) {
+  if (process.argv[2] === "down") for (const sig of TERMINAL_SIGNALS) process.on(sig, () => {});   // as early as possible; cli() repeats it
   try { process.exit(await cli(process.argv.slice(2))); }
   catch (err) { console.error(`[rig] ${err.message}`); process.exit(1); }
 }

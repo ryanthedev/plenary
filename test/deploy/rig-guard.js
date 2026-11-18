@@ -34,19 +34,30 @@ export function spawnTracked(argv, opts) {
 }
 
 const PS_FIXED = { PATH: "/usr/bin:/bin", LC_ALL: "C", TZ: "UTC" };
-export const lstart = pid => Bun.spawnSync(["/bin/ps", "-o", "lstart=", "-p", String(pid)], { env: PS_FIXED }).stdout.toString().trim().replace(/\s+/g, " ");
-/** True while `pid` runs (not a zombie) with that start time. */
+/** `pid`'s start time, "" when there is no such process; throws when ps itself fails (never a silent "" for a live pid). */
+export const lstart = pid => {
+  const r = Bun.spawnSync(["/bin/ps", "-o", "lstart=", "-p", String(pid)], { env: PS_FIXED });
+  const out = r.stdout.toString().trim(), err = r.stderr.toString().trim();
+  if (r.exitCode === 1 && !out && !err) return "";
+  if (r.exitCode !== 0 || !out) throw new Error(`/bin/ps failed for pid ${pid} (exit ${r.exitCode}, signal ${r.signalCode ?? "none"}): ${err}`);
+  return out.replace(/\s+/g, " ");
+};
+/** True while `pid` runs (not a zombie) with that start time; a ps that fails reads as "still live" (keep waiting, remove nothing). */
 const liveAs = (pid, started) => {
-  const out = Bun.spawnSync(["/bin/ps", "-o", "stat=,lstart=", "-p", String(pid)], { env: PS_FIXED }).stdout.toString().trim();
+  const r = Bun.spawnSync(["/bin/ps", "-o", "stat=,lstart=", "-p", String(pid)], { env: PS_FIXED });
+  const out = r.stdout.toString().trim();
+  if (r.exitCode === 1 && !out && !r.stderr.toString().trim()) return false;
   const m = /^(\S+)\s+(.+)$/.exec(out);
-  return !!m && !m[1].startsWith("Z") && m[2].replace(/\s+/g, " ") === started;
+  if (r.exitCode !== 0 || !m) return true;
+  return !m[1].startsWith("Z") && m[2].replace(/\s+/g, " ") === started;
 };
 /**
  * SIGKILL every recorded PID whose start time still matches (the test's own check, not the module's). With the rig
  * `dir`, a SIGKILLed postmaster's SysV segment is removed too (read before the kill; only at NATTCH 0).
  */
 export function killRecorded(procs, dir = null) {
-  for (const p of [...procs].reverse()) if (p?.started && Number.isSafeInteger(p.pid) && p.pid > 1 && lstart(p.pid) === p.started) {
+  const same = p => { try { return lstart(p.pid) === p.started; } catch { return false; } };   // a failed ps never kills
+  for (const p of [...procs].reverse()) if (p?.started && Number.isSafeInteger(p.pid) && p.pid > 1 && same(p)) {
     const shm = dir && p.name === "postgres" ? pgShmOf(join(dir, "pg"), p.pid) : null;
     try { process.kill(p.pid, "SIGKILL"); } catch {}
     if (shm) {
@@ -59,7 +70,9 @@ export function killRecorded(procs, dir = null) {
 const recorded = dir => { try { return JSON.parse(readFileSync(join(dir, "rig.json"), "utf8")).procs ?? []; } catch { return []; } };
 /** Processes whose command line names `dir` (nats.conf, postgres -D, Caddyfile, a CLI `up --dir`). */
 export function namingDir(dir) {
-  const out = Bun.spawnSync(["/bin/ps", "-axo", "pid=,command="], { env: PS_FIXED }).stdout.toString();
+  const r = Bun.spawnSync(["/bin/ps", "-axo", "pid=,command="], { env: PS_FIXED });
+  if (r.exitCode !== 0) throw new Error(`/bin/ps -axo failed (exit ${r.exitCode}, signal ${r.signalCode ?? "none"}): never read as "nothing names ${dir}"`);
+  const out = r.stdout.toString();
   return out.split("\n").filter(l => l.includes(dir) && !l.includes("/bin/ps -axo")).map(l => l.trim());
 }
 

@@ -5,7 +5,7 @@ import { readFileSync, readdirSync, statSync, mkdtempSync, mkdirSync, writeFileS
 import { tmpdir } from "node:os";
 import { join, relative, dirname } from "node:path";
 import { spawn as nodeSpawn } from "node:child_process";
-import { missingBins, rigStatus, isOurs, stopRig, STARTED_CLOCK, ownerGone, writeOwnerRecord, _setPsPath } from "../../scripts/cluster-rig.js";
+import { missingBins, rigStatus, isOurs, stopRig, STARTED_CLOCK, ownerGone, writeOwnerRecord, writeFileAtomic, reapStaleRigs, _setPsPath } from "../../scripts/cluster-rig.js";
 import { freshDir, track, cleanupAll, rigUp, spawnTracked, lstart } from "./rig-guard.js";
 
 const ROOT = new URL("../..", import.meta.url).pathname;
@@ -25,7 +25,7 @@ test("M5 (v5): every `down` (the teardown's and the reaper's) goes through rigDo
   expect(SCRIPT.match(/runRigCli\(\s*\[\s*"down"/g)?.length).toBe(1);   // only inside rigDown
   const rigDown = SCRIPT.slice(SCRIPT.indexOf("async function rigDown("));
   expect(rigDown.slice(0, rigDown.indexOf("\n}\n"))).toMatch(/runRigCli\(\["down"/);
-  expect(SCRIPT.match(/await rigDown\(\[/g)?.length).toBe(2);   // teardown and reaper
+  expect(SCRIPT.match(/rigDown\(\[/g)?.length).toBe(2);   // teardown and reaper (the definition takes `args`)
 });
 
 // Files that name the gated variables without reading the rig's cluster (they set them explicitly, assert a refusal, or
@@ -404,3 +404,56 @@ test("H1 (v5): writeOwnerRecord throws and writes nothing, and ownerGone throws 
     } finally { _setPsPath(); }
   }
 });
+
+// rig-tools-v6 N1: with a /bin/ps that hangs, one Ctrl-C must end the reaper's ps checks. The stub hangs on every run;
+// a killer process waits for it, marks "interrupted" (what test-cluster's signal handler does) and SIGINTs it. Two live
+// rigs need ps; a dead owner's rig does not and is still reaped. Without the fix: the killed ps is run again, or the
+// second live rig gets its own ps, and each hangs until psInfo's 10 s timeout.
+test("N1 (v6): one interrupt during a hung ps stops the reaper's ps checks; live rigs are left alone, a dead owner's rig is still reaped", async () => {
+  const root = rootDir(), stubs = rootDir();
+  const ps = join(stubs, "ps"), marker = join(stubs, "interrupted");
+  writeFileSync(ps, `#!/bin/sh\necho x >> "$0.count"\necho $$ > "$0.pid.tmp" && mv "$0.pid.tmp" "$0.pid"\nexec /bin/sleep 30\n`);
+  chmodSync(ps, 0o755);
+  const mine = lstart(process.pid);
+  const live = [0xa1, 0xa2].map(i => { const dir = join(root, `test-${process.pid}-${i.toString(16)}`); const rig = sleepRig(dir); writeFileSync(`${dir}.owner`, mine + "\n"); return { dir, ...rig }; });
+  const stale = join(root, `test-${deadPid()}-aaaaaa`);
+  mkdirSync(stale); deadOwner(stale);
+  const killer = Bun.spawn(["/bin/sh", "-c", `while [ ! -s '${ps}.pid' ]; do sleep 0.01; done; : > '${marker}'; kill -INT $(cat '${ps}.pid')`]);
+  const logs = [], downs = [];
+  const t0 = Date.now();
+  _setPsPath(ps);
+  try {
+    await reapStaleRigs(root, { isInterrupted: () => existsSync(marker), log: m => logs.push(m), down: async t => { downs.push(t); return { code: 0 }; } });
+  } finally { _setPsPath(); killer.kill("SIGKILL"); }
+  const ms = Date.now() - t0;
+  expect(ms, logs.join("\n")).toBeLessThan(5000);
+  expect(readFileSync(`${ps}.count`, "utf8").split("\n").filter(Boolean).length).toBe(1);   // one ps, killed once, never rerun
+  expect(logs.join("\n")).toContain("was killed by SIGINT");
+  expect(logs.join("\n")).toContain("interrupted: no more ps checks");
+  expect(downs).toEqual([]);
+  expect(existsSync(stale) || existsSync(`${stale}.owner`)).toBe(false);
+  for (const r of live) {
+    expect({ dir: r.dir, alive: isOurs(r.entry), kept: existsSync(r.dir) && existsSync(`${r.dir}.owner`) }).toEqual({ dir: r.dir, alive: true, kept: true });
+  }
+}, 60_000);
+
+// rig-tools-v6 N2: the owner record is written through a temp file and a rename, so a concurrent reaper never reads an
+// empty (truncated, not yet written) record. Another process rewrites the file 4000 times while this one reads it.
+test("N2 (v6): a concurrent reader of an atomically written owner record never sees it empty or partial", async () => {
+  const root = rootDir(), f = join(root, "test-1-aaaaaa.owner");
+  const a = "Thu Jan  1 00:00:00 1970\n", b = "Wed Nov 18 12:34:56 2026 plus some longer text to widen the write\n";
+  writeFileAtomic(f, a);
+  const writer = Bun.spawn([process.execPath, "-e", `const { writeFileAtomic } = await import(${JSON.stringify(join(ROOT, "scripts/cluster-rig.js"))});
+    for (let i = 0; i < 4000; i++) writeFileAtomic(${JSON.stringify(f)}, i % 2 ? ${JSON.stringify(a)} : ${JSON.stringify(b)});`]);
+  let reads = 0, bad = [];
+  while (writer.exitCode === null) {
+    const t = readFileSync(f, "utf8");
+    reads++;
+    if (t !== a && t !== b && bad.length < 5) bad.push(JSON.stringify(t));
+    if (reads % 200 === 0) await Bun.sleep(0);   // let the exit be noticed
+  }
+  expect(await writer.exited).toBe(0);
+  expect(reads).toBeGreaterThan(100);
+  expect(bad).toEqual([]);
+  expect(readdirSync(root)).toEqual(["test-1-aaaaaa.owner"]);   // no temp file left
+}, 60_000);

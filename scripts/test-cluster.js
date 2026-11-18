@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
-import { ownerGone, TERMINAL_SIGNALS, writeOwnerRecord } from "./cluster-rig.js";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { reapStaleRigs, TERMINAL_SIGNALS, writeOwnerRecord } from "./cluster-rig.js";
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
 const RIG_CLI = join(ROOT, "scripts/cluster-rig.js");
 const BUN = Bun.which("bun") ?? process.execPath;
@@ -37,7 +37,8 @@ const signal = sig => {
 for (const sig of TERMINAL_SIGNALS) process.on(sig, () => signal(sig));
 
 try {
-  await reapStaleRigs();
+  await reapStaleRigs(RIG_ROOT, { isInterrupted: () => interrupted,
+    down: target => rigDown(["--dir", target, "--clean"], { live: true, cwd: ROOT, shielded: true }) });   // a shielded `down` is never signalled
   await new Promise(r => setTimeout(r, 0));   // let a signal that arrived during a synchronous reap reach its handler first
   if (interrupted) throw new Error("interrupted while reaping");
   mkdirSync(RIG_ROOT, { recursive: true });
@@ -141,39 +142,5 @@ async function rigDown(args, opts) {
     const r = await runRigCli(["down", ...args], opts);
     if (!r.signal || tries >= DOWN_TRIES) return r;
     console.error(`[test:cluster] down was killed by ${r.signal} before it could start; running it again`);
-  }
-}
-
-/** ownerGone, except that a ps that cannot answer leaves the rig alone: never reap a rig that may be a live run's (rig-tools-v5 H1). */
-function ownerSurelyGone(pid, ownerPath) {
-  try { return ownerGone(pid, ownerPath); } catch (error) {
-    console.error(`[test:cluster] leaving ${basename(ownerPath, ".owner")} alone: ${error.message}`);
-    return false;
-  }
-}
-
-/**
- * Remove the rigs of earlier test:cluster runs that were killed (SIGKILL: nothing could tear them down). Only
- * `test-<pid>-<hash>` dirs whose owner is gone (pid dead, or reused by another process) are touched; a live run's rig, and every other rig, is left alone.
- */
-async function reapStaleRigs() {
-  const root = RIG_ROOT;
-  if (!existsSync(root)) return;
-  const entries = readdirSync(root, { withFileTypes: true });
-  const runs = entries.filter(e => /^test-\d+-[0-9a-f]+$/.test(e.name)).length;
-  if (runs) console.error(`[test:cluster] checking ${runs} earlier run rig(s) in ${root}`);   // also the readiness marker for the reaper storm tests
-  for (const e of entries) {
-    const o = /^(test-(\d+)-[0-9a-f]+)\.owner$/.exec(e.name);   // an owner record whose run died before making its dir
-    if (o && e.isFile() && !existsSync(join(root, o[1])) && ownerSurelyGone(Number(o[2]), join(root, e.name))) rmSync(join(root, e.name), { force: true });
-    const m = /^test-(\d+)-[0-9a-f]+$/.exec(e.name);
-    if (!e.isDirectory() || !m || !ownerSurelyGone(Number(m[1]), join(root, `${e.name}.owner`))) continue;
-    console.error(`[test:cluster] reaping stale rig ${e.name} (its test:cluster, pid ${m[1]}, is gone)`);
-    const target = join(root, e.name);
-    if (existsSync(join(target, "rig.json"))) {
-      const down = await rigDown(["--dir", target, "--clean"], { live: true, cwd: ROOT, shielded: true });
-      if (down.code !== 0) continue;   // services may still run: keep the dir (and its owner record) for the next run
-    }
-    rmSync(target, { recursive: true, force: true });   // also a run that died before any service started
-    rmSync(`${target}.owner`, { force: true });
   }
 }

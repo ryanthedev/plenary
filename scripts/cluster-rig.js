@@ -113,12 +113,12 @@ export function _setPsPath(p) { psPath = p ?? PS_DEFAULT; }
  * so a terminal Ctrl-C kills it too, and `down`, which ignores those signals, must still finish (rig-tools-v5 audit).
  * Any other death (SIGKILL, a timeout) refuses at once.
  */
-export function psInfo(pid) {
+export function psInfo(pid, { tries: maxTries = PS_TRIES } = {}) {
   if (!Number.isSafeInteger(pid) || pid <= 1) return null;
   let r;
   for (let tries = 1; ; tries++) {
     r = spawnSync(psPath, ["-o", "stat=", "-o", "lstart=", "-p", String(pid)], { encoding: "utf8", env: PS_ENV, timeout: 10_000 });
-    if (r.error || !TERMINAL_SIGNALS.includes(r.signal) || tries >= PS_TRIES) break;
+    if (r.error || !TERMINAL_SIGNALS.includes(r.signal) || tries >= maxTries) break;
   }
   const out = (r.stdout || "").trim(), err = (r.stderr || "").trim();
   const fail = why => new Error(`cannot check processes: ${psPath} ${why}; refusing to guess whether this rig's processes are alive`);
@@ -147,20 +147,72 @@ export function psCheck() {
 export function writeOwnerRecord(path, pid = process.pid) {
   const info = psInfo(pid);
   if (!info) throw new Error(`cannot record the start time of pid ${pid}: ${psPath} does not see it`);
-  writeFileSync(path, info.started + "\n");
+  writeFileAtomic(path, info.started + "\n");
+}
+/**
+ * Write `text` to `path` through a temp file and a rename (rig-tools-v6 N2): a concurrent reader sees the old content
+ * or the new one, never an empty or partly written file. The temp name never matches the reaper's `.owner` pattern.
+ */
+export function writeFileAtomic(path, text) {
+  const tmp = `${path}.${process.pid}.tmp`;
+  try { writeFileSync(tmp, text); renameSync(tmp, path); }
+  catch (error) { rmSync(tmp, { force: true }); throw error; }
 }
 /**
  * True when the owner `pid` is gone: dead, or now another process (a start time other than the one in `ownerPath`).
  * False when it lives and there is no record (an older run: only a dead pid counts). Throws when ps cannot answer:
  * the caller must then leave the rig alone.
  */
-export function ownerGone(pid, ownerPath) {
-  try { process.kill(pid, 0); } catch (e) { if (e.code === "ESRCH") return true; }
+export function ownerGone(pid, ownerPath, { psTries } = {}) {
+  if (pidDead(pid)) return true;
   if (!existsSync(ownerPath)) return false;
-  const info = psInfo(pid);
+  const info = psInfo(pid, { tries: psTries });
   if (!info) { psCheck(); return true; }   // "absent" counts only from a ps that sees this very process
   return info.started !== readFileSync(ownerPath, "utf8").trim();
 }
+const pidDead = pid => { try { process.kill(pid, 0); return false; } catch (e) { return e.code === "ESRCH"; } };
+
+/**
+ * Remove the rigs of earlier test:cluster runs under `root` that were killed (SIGKILL: nothing could tear them down).
+ * Only `test-<pid>-<hash>` dirs whose owner is gone (pid dead, or reused by another process) are touched; a live run's
+ * rig, and every other rig, is left alone. `down(target)` stops a rig's services ({ code }); `isInterrupted()` says the
+ * caller was signalled.
+ * - A ps that cannot answer leaves that rig alone (rig-tools-v5 H1).
+ * - The ps runs once, never again after a terminal signal: it is in the caller's process group, so a ps killed by
+ *   SIGINT means the user pressed Ctrl-C. After an interrupt no more ps runs at all; only rigs whose owner pid is dead
+ *   (no ps needed) are still reaped. So a hung ps costs one Ctrl-C, not 5 per rig (rig-tools-v6 N1).
+ */
+export async function reapStaleRigs(root, { down, isInterrupted = () => false, log = m => console.error(`[test:cluster] ${m}`) }) {
+  if (!existsSync(root)) return;
+  const entries = readdirSync(root, { withFileTypes: true });
+  const runs = entries.filter(e => /^test-\d+-[0-9a-f]+$/.test(e.name)).length;
+  if (runs) log(`checking ${runs} earlier run rig(s) in ${root}`);   // also the readiness marker for the reaper storm tests
+  let skipping = false;
+  const gone = async (pid, ownerPath) => {
+    await new Promise(r => setTimeout(r, 0));   // the checks are synchronous: let the caller's signal handler run between them
+    if (isInterrupted() && !pidDead(pid)) {
+      if (!skipping) log("interrupted: no more ps checks; rigs whose owner pid lives are left alone");
+      skipping = true;
+      return false;
+    }
+    try { return ownerGone(pid, ownerPath, { psTries: 1 }); } catch (error) {
+      log(`leaving ${basename(ownerPath, ".owner")} alone: ${error.message}`);
+      return false;
+    }
+  };
+  for (const e of entries) {
+    const o = /^(test-(\d+)-[0-9a-f]+)\.owner$/.exec(e.name);   // an owner record whose run died before making its dir
+    if (o && e.isFile() && !existsSync(join(root, o[1])) && await gone(Number(o[2]), join(root, e.name))) rmSync(join(root, e.name), { force: true });
+    const m = /^test-(\d+)-[0-9a-f]+$/.exec(e.name);
+    if (!e.isDirectory() || !m || !await gone(Number(m[1]), join(root, `${e.name}.owner`))) continue;
+    log(`reaping stale rig ${e.name} (its test:cluster, pid ${m[1]}, is gone)`);
+    const target = join(root, e.name);
+    if (existsSync(join(target, "rig.json")) && (await down(target)).code !== 0) continue;   // services may still run: keep the dir (and its owner record)
+    rmSync(target, { recursive: true, force: true });   // also a run that died before any service started
+    rmSync(`${target}.owner`, { force: true });
+  }
+}
+
 /** True while the recorded process is still the one this rig started (same PID and same start time). */
 export function isOurs(proc) {
   const info = psInfo(proc?.pid);

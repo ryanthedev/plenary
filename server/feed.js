@@ -109,14 +109,17 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
 
   // Looked for after every `rebaseEvery` entries or `rebaseBytes` chars of tail since the last look. The room writes
   // its checkpoint just AFTER it publishes the entries that triggered it, so the look those entries cause usually
-  // misses it: after a miss the feed looks once more on the room's next heartbeat (every 2 s) or the next Store poll,
-  // which come after the checkpoint was written, and not on entries (a burst can still be ahead of it).
+  // misses it: after a miss the feed looks again on every heartbeat (every 2 s) or Store poll, and not on entries (a
+  // burst can still be ahead of it), until the look finds the checkpoint. A heartbeat can land before the checkpoint is
+  // written, so one retry is not enough; the cost of going on is one checkpoint read per heartbeat while a miss is
+  // open, and a miss closes as soon as a checkpoint ahead of the base exists (a room that never folds is read at
+  // the heartbeat's pace, no faster).
   const rebaseDue = () => self.tail.length >= self.nextRebase || self.tailBytes >= self.nextRebaseBytes;
-  async function rebase(retry = false) {
+  async function rebase() {
     const again = () => { self.nextRebase = self.tail.length + rebaseEvery; self.nextRebaseBytes = self.tailBytes + rebaseBytes; };
     again(); self.missed = false;
     const cp = await validBase();
-    if (cp.seq <= self.base.seq || cp.seq > self.seq) { self.missed = !retry; return; }
+    if (cp.seq <= self.base.seq || cp.seq > self.seq) { self.missed = true; return; }
     const cut = self.tail.slice(0, cp.seq - self.base.seq);
     self.tail = self.tail.slice(cp.seq - self.base.seq);
     for (const x of cut) self.tailBytes -= x.text.length;
@@ -134,13 +137,13 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
       if (m.to > self.seq) await repair(m.to);   // still short (the repair raced the room): the Store has it
     } else if (Number.isSafeInteger(m?.seq) && m.seq > self.seq) await repair(m.seq);
     if (rebaseDue()) await rebase();
-    else if (self.missed && !Array.isArray(m?.items)) await rebase(true);   // a heartbeat: the retry after a miss
+    else if (self.missed && !Array.isArray(m?.items)) await rebase();   // a heartbeat: the retry after a miss
   }
 
   const unsub = bus.subscribe(subjects.entries(tenant, board), m => { run(() => onMessage(m)).catch(err => log.error("feed: message failed", { tenant, board, err })); });
   const poll = setInterval(() => {
     if (Date.now() - self.lastHeard < pollMs || running) return;
-    run(async () => { await repair(); if (rebaseDue()) await rebase(); else if (self.missed) await rebase(true); }).catch(err => log.warn("feed: Store poll failed", { tenant, board, err }));
+    run(async () => { await repair(); if (rebaseDue()) await rebase(); else if (self.missed) await rebase(); }).catch(err => log.warn("feed: Store poll failed", { tenant, board, err }));
   }, Math.max(50, Math.floor(pollMs / 2)));
   poll.unref?.();
 

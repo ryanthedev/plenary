@@ -5,7 +5,7 @@ import { test, expect, afterAll } from "bun:test";
 import { memoryBus } from "../../server/bus/memory.js";
 import { natsBus, subjects, encodeMessage, decodeMessage, MAX_BUS_BYTES } from "../../server/bus/nats.js";
 import { busContract, runTenant } from "./bus-contract.js";
-import { until, sleep } from "./helpers.js";
+import { until, sleep, spawnTracked } from "./helpers.js";
 
 const URL = process.env.NATS_URL;
 const nt = URL ? test : test.skip;
@@ -158,7 +158,7 @@ ot("nats outage: publishes are refused (unavailable) while down, reported once p
   const conf = mb => { const f = `${dir}/n${mb}.conf`; writeFileSync(f, `listen: "127.0.0.1:${port}"\nmax_payload: ${mb}MB\n`); return f; };
   const procs = [];
   const start = async mb => {
-    const p = Bun.spawn([natsBin, "--config", conf(mb)], { stdout: "ignore", stderr: "ignore" });
+    const p = spawnTracked([natsBin, "--config", conf(mb)], { stdout: "ignore", stderr: "ignore" });
     procs.push(p);
     await until(async () => { try { (await Bun.connect({ hostname: "127.0.0.1", port, socket: { data() {} } })).end(); return true; } catch { return false; } }, "nats-server up");
     return p;
@@ -223,7 +223,7 @@ ot("nats stall: a frozen server (SIGSTOP) caps what is queued, is declared stale
   const { tmpdir } = await import("node:os");
   const dir = mkdtempSync(`${tmpdir()}/plen-nats-`), port = freePort(), conf = `${dir}/n.conf`;
   writeFileSync(conf, `listen: "127.0.0.1:${port}"\nmax_payload: 2MB\n`);
-  const srv = Bun.spawn([natsBin, "--config", conf], { stdout: "ignore", stderr: "ignore" });
+  const srv = spawnTracked([natsBin, "--config", conf], { stdout: "ignore", stderr: "ignore" });
   let frozen = false;
   try {
     await until(async () => { try { (await Bun.connect({ hostname: "127.0.0.1", port, socket: { data() {} } })).end(); return true; } catch { return false; } }, "nats-server up");

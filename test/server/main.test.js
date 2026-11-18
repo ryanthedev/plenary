@@ -3,7 +3,7 @@
 import { test, expect, afterAll } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { tempDir, cleanup, until } from "./helpers.js";
+import { tempDir, cleanup, until, spawnTracked } from "./helpers.js";
 import { sock } from "./rig.js";
 import { sqliteStore } from "../../server/store/sqlite.js";
 
@@ -13,7 +13,7 @@ const TOKEN = "S3CR3T-main-token";
 
 function spawn(env) {
   // cwd: an empty temp dir, so Bun's .env auto-load finds nothing (a checkout's .env never reaches the child).
-  const child = Bun.spawn([process.execPath, MAIN], { cwd: tempDir("plenary-main-cwd-"), env: { PATH: process.env.PATH, HOME: process.env.HOME, PORT: "0", ...env }, stdout: "pipe", stderr: "pipe" });
+  const child = spawnTracked([process.execPath, MAIN], { cwd: tempDir("plenary-main-cwd-"), env: { PATH: process.env.PATH, HOME: process.env.HOME, PORT: "0", ...env }, stdout: "pipe", stderr: "pipe" });
   const out = { text: "", err: "" };
   const pump = async (stream, key) => { const dec = new TextDecoder(); for await (const chunk of stream) out[key] += dec.decode(chunk, { stream: true }); };
   pump(child.stdout, "text"); pump(child.stderr, "err");

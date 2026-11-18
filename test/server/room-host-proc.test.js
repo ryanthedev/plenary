@@ -8,7 +8,7 @@ import { postgresStore } from "../../server/store/postgres.js";
 import { natsBus, subjects } from "../../server/bus/nats.js";
 import { PROTOCOL_VERSION } from "../../packages/protocol/envelope.js";
 import { makeElement } from "../../packages/core/model.js";
-import { sleep, until } from "./helpers.js";
+import { sleep, until, spawnTracked } from "./helpers.js";
 
 const T = "t-aaa", B = "b-one", url = process.env.DATABASE_URL, nurl = process.env.NATS_URL;
 const CHILD = new URL("./room-host-child.js", import.meta.url).pathname;
@@ -33,7 +33,7 @@ function gw(bus, id) {
   };
 }
 async function child(holder, ttl, schema) {
-  const p = Bun.spawn(["bun", CHILD, holder, String(ttl), schema], { stdout: "pipe", stderr: "inherit", env: process.env });
+  const p = spawnTracked(["bun", CHILD, holder, String(ttl), schema], { stdout: "pipe", stderr: "inherit", env: process.env });
   const reader = p.stdout.getReader(); let out = "";
   while (!/OPEN/.test(out)) { const { value, done } = await reader.read(); if (done) break; out += new TextDecoder().decode(value); }
   return { p, epoch: Number(out.match(/OPEN (\d+)/)?.[1]) };

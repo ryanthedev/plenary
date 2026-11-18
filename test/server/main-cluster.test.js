@@ -4,7 +4,7 @@
 // ttl + 3 s. Skips without DATABASE_URL and NATS_URL. A fresh database per run (main.js has no schema setting).
 import { test, expect, afterAll, describe } from "bun:test";
 import { SQL } from "bun";
-import { tempDir, cleanup, until } from "./helpers.js";
+import { tempDir, cleanup, until, spawnTracked } from "./helpers.js";
 import { sock } from "./rig.js";
 import { postgresStore } from "../../server/store/postgres.js";
 
@@ -16,7 +16,7 @@ const TOKEN = "S3CR3T-cluster-token";
 const TOKENS = JSON.stringify({ [TOKEN]: { name: "ann", role: "owner", domain: "cluster.test", email: "ann@cluster.test", admin: true } });
 
 function spawn(env) {
-  const child = Bun.spawn([process.execPath, MAIN], { cwd: tempDir("plenary-cluster-cwd-"), env: { PATH: process.env.PATH, HOME: process.env.HOME, PORT: "0", ...env }, stdout: "pipe", stderr: "pipe" });
+  const child = spawnTracked([process.execPath, MAIN], { cwd: tempDir("plenary-cluster-cwd-"), env: { PATH: process.env.PATH, HOME: process.env.HOME, PORT: "0", ...env }, stdout: "pipe", stderr: "pipe" });
   const out = { text: "", err: "" };
   const pump = async (stream, key) => { const dec = new TextDecoder(); for await (const chunk of stream) out[key] += dec.decode(chunk, { stream: true }); };
   pump(child.stdout, "text"); pump(child.stderr, "err");

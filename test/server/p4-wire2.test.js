@@ -13,7 +13,7 @@ import { roomHost, remoteRooms } from "../../server/room-host.js";
 import { sqliteStore } from "../../server/store/sqlite.js";
 import { sqliteRegistry } from "../../server/registry/sqlite.js";
 import { PROTOCOL_VERSION } from "../../packages/protocol/envelope.js";
-import { cleanup, tempDir, sleep, until, deferred } from "./helpers.js";
+import { cleanup, tempDir, sleep, until, deferred, spawnTracked } from "./helpers.js";
 
 afterAll(cleanup);
 
@@ -86,7 +86,7 @@ async function authServer(auth) {
   const dir = tempDir("plenary-nats-auth-");
   const conf = join(dir, "nats.conf"), log = join(dir, "nats.log");
   writeFileSync(conf, `listen: "127.0.0.1:-1"\nmax_payload: 2MB\nauthorization { ${auth} }\n`);
-  const child = Bun.spawn([natsServer, "-c", conf, "-l", log], { stdout: "ignore", stderr: "ignore" });
+  const child = spawnTracked([natsServer, "-c", conf, "-l", log], { stdout: "ignore", stderr: "ignore" });
   let port;
   try {
     port = await until(async () => {

@@ -4,9 +4,8 @@ import { test, expect, afterAll } from "bun:test";
 import { join } from "node:path";
 import { cpSync } from "node:fs";
 import { rig, tokenOf, settled, roomState, client, rawSock, sock } from "./rig.js";
-import { cleanup, sleep, until, tempDir, deferred } from "./helpers.js";
+import { cleanup, sleep, until, tempDir, deferred, spawnTracked } from "./helpers.js";
 import { sqliteStore } from "../../server/store/sqlite.js";
-import { subjects } from "../../server/bus/port.js";
 import { createBreather } from "../../server/breather.js";
 
 afterAll(cleanup);
@@ -422,7 +421,7 @@ test.skipIf(!python)("trickle readers can't hold the budget against a joiner: th
   // socket pulls everything the kernel has.
   const tricklers = [];
   for (const account of ["editor1", "editor2"]) {
-    const child = Bun.spawn([python, new URL("./trickle.py", import.meta.url).pathname, String(r.server.port), "/ws", JSON.stringify(hello(r, account)), "32768", "0.2"], { stdout: "pipe", stderr: "ignore" });
+    const child = spawnTracked([python, new URL("./trickle.py", import.meta.url).pathname, String(r.server.port), "/ws", JSON.stringify(hello(r, account)), "32768", "0.2"], { stdout: "pipe", stderr: "ignore" });
     const t = { child, got: 0 }; tricklers.push(t);
     (async () => { const dec = new TextDecoder(); for await (const chunk of child.stdout) { const n = dec.decode(chunk).trim().split("\n").pop(); if (n) t.got = Number(n); } })();
   }
@@ -461,20 +460,16 @@ test("joiners parked across folds can't pin a board's worth of replaced text eac
   // Between arrivals the board folds, so each waiter references a DIFFERENT snapshot string (6.0, 6.3 … 7.2 MB).
   // Distinct queued catch-up text is bounded (14 MB): without the bound the five would pin 33 MB.
   const limits = { maxUserBufferedBytes: 1 * MB, maxTotalBufferedBytes: 256 * MB, maxSharedQueuedBytes: 14 * MB, stallMs: 600_000, stallGraceMs: 600_000, maxCatchUpWaitMs: 600_000, helloTimeoutMs: 600_000, sweepMs: 50 };
-  // The room's own heartbeat is an hour apart here: the feed gets one look after a miss, on the next heartbeat, and a real one
-  // landing between the op's ack and this test's checkpoint (a loaded machine) used up that look. The test sends the
-  // heartbeat itself, after the checkpoint (the order the host's own fold has).
-  const r = await rig({ limits, host: { heartbeatMs: 3_600_000, tailFoldBytes: 256 * 1024 } });
+  // (The test checkpoints after the op's ack, so on a loaded machine a real heartbeat can land before the checkpoint: the feed
+  // must keep looking on later heartbeats; test/server/feed-rebase.test.js holds that down deterministically.)
+  const r = await rig({ limits, host: { heartbeatMs: HB, tailFoldBytes: 256 * 1024 } });
   await write(r, "editor", "board", Array.from({ length: 6 }, (_, i) => big("b" + i, 1, 990_000)));   // a 6 MB board
   const stats = () => r.server.gateway.stats();
   const baseSeq = async () => (await r.server.rooms.peek(r.ids.tenant, r.ids.board)).room.base.seq;
   // v1: the host folds by bytes only while the tail is at least half the board (the 2x bound), which 300 KB of
   // growth on a 6 MB board never is: the test checkpoints through the Room itself, and the gateway's feed rebases
   // onto it (on the room's next heartbeat), so each joiner below gets a different snapshot string.
-  const fold = async seq => {
-    await r.idle(); const room = await r.room(); if (room.base.seq < seq) room.checkpoint(); expect(await baseSeq()).toBe(seq);
-    await r.bus.publish(subjects.entries(r.ids.tenant, r.ids.board), room.heartbeat());   // the heartbeat after the checkpoint
-  };
+  const fold = async seq => { await r.idle(); const room = await r.room(); if (room.base.seq < seq) room.checkpoint(); expect(await baseSeq()).toBe(seq); };
   await fold(6);
   const hog = await rawSock(r.server.wsUrl); hog.send(hello(r, "editor1"));
   await until(() => stats().owedBytes > 0 && stats().sharedTexts === 0, "the hog's snapshot to be in its socket", 60000);
@@ -532,11 +527,6 @@ async function foldAll(r) {
   const room = await r.room();
   if (room.base.seq < room.resolved) room.checkpoint();
   expect(room.base.seq).toBe(room.seq);
-  // A gateway feed that already exists looks for the checkpoint once more on the next heartbeat after a miss, and a
-  // heartbeat before this checkpoint used that look up: send one now, and wait for the feed to be on the fold.
-  await r.bus.publish(subjects.entries(r.ids.tenant, r.ids.board), room.heartbeat());
-  const feed = () => r.server.gateway.feed(r.ids.tenant, r.ids.board);
-  if (feed()) await until(() => feed().base === room.seq, "the gateway's feed to rebase onto the fold", 30_000);
 }
 
 /**

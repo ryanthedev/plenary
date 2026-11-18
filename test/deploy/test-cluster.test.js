@@ -1,11 +1,11 @@
 // Guards for scripts/test-cluster.js (the rig reviews H1, H2, L6): it starts services only, the gated-file list matches
 // the tests that read cluster env, and a SIGINT cannot stop a `down` halfway.
 import { test, expect, afterAll } from "bun:test";
-import { readFileSync, readdirSync, statSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, dirname } from "node:path";
 import { spawn as nodeSpawn } from "node:child_process";
-import { missingBins, rigStatus, isOurs, stopRig, STARTED_CLOCK } from "../../scripts/cluster-rig.js";
+import { missingBins, rigStatus, isOurs, stopRig, STARTED_CLOCK, ownerGone, writeOwnerRecord, _setPsPath } from "../../scripts/cluster-rig.js";
 import { freshDir, track, cleanupAll, rigUp, spawnTracked, lstart } from "./rig-guard.js";
 
 const ROOT = new URL("../..", import.meta.url).pathname;
@@ -40,12 +40,17 @@ const unallowed = (root, f, allow = ALLOW) => {
 };
 const gatedFiles = (root, allow = ALLOW) => walk(join(root, "test")).filter(f => CODE_FILE.test(f)).map(f => relative(root, f))
   .filter(f => unallowed(root, f, allow).length > 0).sort();
-/** Files that name an allowlisted helper but are neither listed in `script` nor allowlisted themselves (a new importer). */
+/**
+ * Files that name an allowlisted helper but are neither listed in `script` nor allowlisted themselves (a new importer).
+ * A helper is named by its basename, with or without its extension (bun resolves `./helper` too), as a whole path
+ * segment inside a string: `"./helper"`, `'../a/helper.js'`, `` `helper.ts` `` (rig-tools-v5 L24).
+ */
 const orphans = (root, script, allow = ALLOW) => {
   const listed = [...script.matchAll(/"(test\/[\w./-]+)"/g)].map(m => m[1]);
-  const helpers = Object.keys(allow).filter(f => !TEST_FILE.test(f)).map(h => h.split("/").pop());
+  const helpers = Object.keys(allow).filter(f => !TEST_FILE.test(f)).map(h => h.split("/").pop().replace(CODE_FILE, ""))
+    .map(stem => new RegExp(`[/"'\`]${stem.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\.(js|jsx|ts|tsx|mjs|cjs|mts|cts))?["'\`]`));
   return walk(join(root, "test")).filter(f => CODE_FILE.test(f)).map(f => relative(root, f))
-    .filter(f => !listed.includes(f) && !(f in allow) && helpers.some(h => readFileSync(join(root, f), "utf8").includes(h)));
+    .filter(f => !listed.includes(f) && !(f in allow) && helpers.some(h => h.test(readFileSync(join(root, f), "utf8"))));
 };
 
 test("L6: the gated list in test-cluster.js is exactly the test files (and helpers) that name DATABASE_URL, NATS_URL or an S3_* variable", () => {
@@ -104,8 +109,11 @@ test("L6b/L12/L17/L18: the scan catches every read form, in every test suffix, i
     // L18: a new importer of an allowlisted helper that names no gated variable
     const helper = { "test/a/helper.js": ["export const url = process.env.DATABASE_URL;"] };
     writeFileSync(join(root, "test/a/importer.test.js"), 'import "./helper.js";');
+    writeFileSync(join(root, "test/a/extless.test.js"), "import { url } from './helper';");   // L24: no extension
+    writeFileSync(join(root, "test/a/spawned.test.js"), "const f = join(import.meta.dir, `helper.js`);");
     writeFileSync(join(root, "test/a/ok.test.js"), 'import "./helper.js";');
-    expect(orphans(root, '"test/a/ok.test.js"', helper)).toEqual(["test/a/importer.test.js"]);
+    writeFileSync(join(root, "test/a/lookalike.test.js"), 'import "./helper-ts.ts"; import "./my-helper.js"; const helper = 1;');   // another file, and a bare word
+    expect(orphans(root, '"test/a/ok.test.js"', helper).sort()).toEqual(["test/a/extless.test.js", "test/a/importer.test.js", "test/a/spawned.test.js"]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -208,7 +216,13 @@ test.skipIf(SKIP)("L15: `up --watch-parent` stops what it started and exits 1 wh
 }, 120_000);
 
 // The reaper tests run test-cluster.js with its own rig root (PLENARY_RIG_ROOT), so no other run's rigs are involved.
-const freePid = () => { for (;;) { const pid = 90_000 + Math.floor(Math.random() * 9_900); try { process.kill(pid, 0); } catch (e) { if (e.code === "ESRCH") return pid; } } };   // known free just now
+// A pid that can never be allocated (rig-tools-v5 L22): above macOS's PID_MAX (99 999), or above Linux's pid_max. So
+// the reaper judges it dead with kill(0) alone, never by a ps (which a signal storm kills), and pid reuse cannot
+// revive it. Planted stale rigs also get an owner record with a start time no process has (deadOwner).
+const PID_CEILING = process.platform === "linux" ? Number(readFileSync("/proc/sys/kernel/pid_max", "utf8")) : 99_999;
+let deadPids = 0;
+const deadPid = () => PID_CEILING + 1 + (deadPids++) * 7 + Math.floor(Math.random() * 7);
+const deadOwner = dir => writeFileSync(`${dir}.owner`, "Thu Jan  1 00:00:00 1970\n");
 const sleepers = [];
 afterAll(() => { for (const p of sleepers) try { p.kill("SIGKILL"); } catch {} });
 /** A rig dir whose one "service" is a `sleep`: enough for the reaper to leave alone or stop, with no real services. */
@@ -233,11 +247,12 @@ const runCluster = (root, file) => {
 };
 
 test.skipIf(SKIP)("L15/L21: test-cluster reaps rigs of dead test:cluster runs at startup, and leaves live runs' and other rigs alone", async () => {
-  const root = rootDir(), dead = freePid();
+  const root = rootDir(), dead = deadPid();
   const stale = join(root, `test-${dead}-aaaaaa`), live = join(root, `test-${process.pid}-bbbbbb`), other = join(root, "l15-other"), emptyStale = join(root, `test-${dead}-cccccc`);
   track(stale);
   mkdirSync(emptyStale, { recursive: true });   // a run killed before its first service started
   writeFileSync(`${emptyStale}.owner`, "x\n");
+  deadOwner(stale);
   const rigStale = await rigUp({ dir: stale, name: `test-${dead}-aaaaaa`, servicesOnly: true, timeoutMs: 60_000 });   // the only real services
   const liveSleep = sleepRig(live), otherSleep = sleepRig(other);
   writeFileSync(`${live}.owner`, lstart(process.pid) + "\n");   // this process, as test-cluster would have recorded it
@@ -256,9 +271,10 @@ test.skipIf(SKIP)("L15/L21: test-cluster reaps rigs of dead test:cluster runs at
 }, 180_000);
 
 test.skipIf(SKIP)("M4: a SIGINT while the reaper's `down` runs does not signal it, and the run stops before starting a rig of its own", async () => {
-  const root = rootDir(), dead = freePid();
+  const root = rootDir(), dead = deadPid();
   const stale = join(root, `test-${dead}-aaaaaa`);
   track(stale);
+  deadOwner(stale);
   const rigStale = await rigUp({ dir: stale, name: `test-${dead}-aaaaaa`, servicesOnly: true, timeoutMs: 60_000 });
   const proc = nodeSpawn(process.execPath, ["--no-env-file", join(ROOT, "scripts/test-cluster.js"), passFile()],
     { cwd: ROOT, detached: true, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PLENARY_RIG_ROOT: root } });
@@ -272,6 +288,7 @@ test.skipIf(SKIP)("M4: a SIGINT while the reaper's `down` runs does not signal i
     expect(code, out).not.toBe(0);
     expect(out).toContain("interrupted while reaping");
     expect(out).not.toContain("initdb");   // no rig of its own was brought up
+    expect(out).not.toContain("rig kept at");   // L23: it never made one
     for (const p of rigStale.procs) expect(isOurs(p), out).toBe(false);   // the reaper's `down` finished
     expect(existsSync(stale)).toBe(false);
     expect(readdirSync(root)).toEqual([]);
@@ -296,3 +313,87 @@ test.skipIf(SKIP)("L20: a rig whose owner pid is now another process (different 
   expect(isOurs(sameSvc.entry)).toBe(true);
   expect(existsSync(same)).toBe(true);
 }, 120_000);
+
+/**
+ * Run test-cluster.js on rig root `root` as its own group leader (as a shell runs a foreground job); once `marker`
+ * appears in its output, SIGINT its whole group every `gap` ms (a held Ctrl-C) until it exits.
+ */
+async function stormRun(root, marker, gap = 1) {
+  const proc = nodeSpawn(process.execPath, ["--no-env-file", join(ROOT, "scripts/test-cluster.js"), passFile()],
+    { cwd: ROOT, detached: true, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PLENARY_RIG_ROOT: root } });
+  let out = "", storm = null;
+  const exited = new Promise(r => proc.on("close", r));
+  const onData = d => {
+    out += d;
+    if (!storm && out.includes(marker)) storm = setInterval(() => { try { process.kill(-proc.pid, "SIGINT"); } catch { clearInterval(storm); } }, gap);
+  };
+  proc.stdout.on("data", onData); proc.stderr.on("data", onData);
+  try { const code = await exited; return { code, out, stormed: storm !== null }; }
+  finally { clearInterval(storm); try { process.kill(-proc.pid, "SIGKILL"); } catch {} }
+}
+
+// rig-tools-v5 H1: the reaper's ownership check runs ps in test-cluster's own group, so a Ctrl-C kills that ps. A killed
+// (or failed) ps is "unknown", and an unknown owner is never reaped. 20 live rigs owned by this very process, each with
+// the right owner record and a sleep as its service; the storm starts when the reaper says it is checking them.
+test("H1 (v5): a SIGINT storm while the reaper checks live runs' owners reaps none of them", async () => {
+  const root = rootDir(), mine = lstart(process.pid);
+  const live = Array.from({ length: 20 }, (_, i) => {
+    const dir = join(root, `test-${process.pid}-${(0xa00000 + i).toString(16)}`);
+    const rig = sleepRig(dir);
+    writeFileSync(`${dir}.owner`, mine + "\n");
+    return { dir, ...rig };
+  });
+  const { code, out, stormed } = await stormRun(root, "[test:cluster] checking 20 earlier run rig(s)");
+  expect(stormed).toBe(true);
+  expect(code, out).not.toBe(0);
+  expect(out).toContain("interrupted while reaping");   // the storm hit the reap itself, not a later phase
+  expect(out).not.toContain(`reaping stale rig test-${process.pid}-`);
+  for (const r of live) {
+    expect({ dir: r.dir, alive: isOurs(r.entry) }).toEqual({ dir: r.dir, alive: true });
+    expect(existsSync(join(r.dir, "rig.json"))).toBe(true);
+    expect(existsSync(`${r.dir}.owner`)).toBe(true);
+  }
+}, 60_000);
+
+// rig-tools-v5 M5: a `detached` spawn is not atomic (bun 1.4.4, macOS), so a group signal can kill the reaper's `down`
+// before it runs. It must be run again. 8 stale rigs (dead owners, sleeps as their services) and a 1 ms SIGINT storm
+// from the first reaping line: every sleep is stopped and nothing is left in the root.
+test("M5: a 1 ms SIGINT storm from the first reaping line still stops every stale rig's services and leaves the root empty", async () => {
+  const root = rootDir();
+  const stale = Array.from({ length: 8 }, () => {
+    const dir = join(root, `test-${deadPid()}-aaaaaa`);
+    deadOwner(dir);
+    return { dir, ...sleepRig(dir) };
+  });
+  const { code, out, stormed } = await stormRun(root, "reaping stale rig");
+  expect(stormed).toBe(true);
+  expect(code, out).not.toBe(0);
+  expect(out).toContain("interrupted while reaping");
+  expect(out).not.toContain("rig kept at");   // L23: no rig of its own was made
+  for (const r of stale) expect({ dir: r.dir, alive: isOurs(r.entry) }, out).toEqual({ dir: r.dir, alive: false });
+  expect(readdirSync(root), out).toEqual([]);
+}, 60_000);
+
+// rig-tools-v5 H1, in-process: the owner-record helpers follow psInfo's rule (a ps that cannot answer is never "gone").
+test("H1 (v5): writeOwnerRecord throws and writes nothing, and ownerGone throws instead of answering, when ps cannot answer", () => {
+  const root = rootDir();
+  const stub = (name, body) => { const f = join(root, name); writeFileSync(f, `#!/bin/sh\n${body}\n`); chmodSync(f, 0o755); return f; };
+  const broken = { killed: stub("killed", "kill -9 $$"), exit2: stub("exit2", 'echo "ps: broke" >&2; exit 2'), garbage: stub("garbage", "echo hello"),
+    absent: stub("absent", "exit 1"), interrupted: stub("interrupted", "kill -INT $$") };
+  const rec = join(root, "test-1-aaaaaa.owner"), mine = join(root, "mine.owner"), other = join(root, "other.owner");
+  writeOwnerRecord(mine);
+  expect(readFileSync(mine, "utf8")).toBe(lstart(process.pid) + "\n");
+  writeFileSync(other, "Thu Jan  1 00:00:00 1970\n");
+  expect(ownerGone(process.pid, mine)).toBe(false);                   // live, same start time
+  expect(ownerGone(process.pid, other)).toBe(true);                   // live pid, another start time: reused
+  expect(ownerGone(process.pid, join(root, "none.owner"))).toBe(false);   // no record: only a dead pid counts
+  expect(ownerGone(deadPid(), other)).toBe(true);                     // dead
+  for (const [kind, ps] of Object.entries(broken)) {
+    _setPsPath(ps);
+    try {
+      expect({ kind, threw: (() => { try { writeOwnerRecord(rec); return false; } catch { return true; } })() }).toEqual({ kind, threw: true });
+      expect({ kind, written: existsSync(rec) }).toEqual({ kind, written: false });
+      expect({ kind, threw: (() => { try { ownerGone(process.pid, mine); return false; } catch (e) { return /^cannot check processes/.test(e.message); } })() }).toEqual({ kind, threw: true });
+    } finally { _setPsPath(); }
+  }
+});

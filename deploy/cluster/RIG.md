@@ -81,7 +81,7 @@ Postgres is TCP-only because macOS limits Unix socket paths to 103 bytes, so a s
 
 `bun run test:cluster` starts a uniquely named services-only rig (`up --services-only`: Postgres, NATS and MinIO, no nodes and no Caddy, because the tests start their own nodes with the ids `gw-1`, `host-1`, ... on the same NATS), runs all test files gated by `DATABASE_URL`, `NATS_URL` or
 `S3_ENDPOINT`, then stops the rig. Any skipped test fails the command. Green runs remove the rig directory; failed runs
-keep it and print its path. SIGINT, SIGTERM and SIGHUP (also a terminal Ctrl-C, which reaches the whole foreground process group) stop the child test, then tear the services down; the rig helpers run in their own process groups, so `down` always finishes. `up` and `down` print straight to your terminal (live, in order); only `env` is captured.
+keep it and print its path. SIGINT, SIGTERM and SIGHUP (also a terminal Ctrl-C, which reaches the whole foreground process group) stop the child test, then tear the services down; the rig helpers run in their own process groups, so `down` always finishes. (Starting a helper in its own group is not atomic with bun on macOS: a signal in that moment kills it before it runs. A `down` that died by a signal therefore never ran, and is run again, up to 20 times; it is idempotent.) `up` and `down` print straight to your terminal (live, in order); only `env` is captured.
 
 Exit codes: a signal that arrives after the tests passed still makes the run exit 1 (an interrupted run is never green),
 and it says so: `[test:cluster] tests passed, but SIGINT arrived before the run finished: exit 1`. An interrupted run
@@ -89,7 +89,7 @@ keeps its rig dir (state `down`) unless it was already green when teardown start
 
 After a `SIGKILL` of `test:cluster` itself (nothing can catch it): the `up` helper watches its parent (`up
 --watch-parent <pid>`) and stops what it started, but services of a run that was already testing are left running.
-The next `bun run test:cluster` reaps every `test-<pid>-<hash>` rig whose owner is gone: its pid is dead, or reused by another process (the owner's start time is recorded beside the rig dir, in `test-<pid>-<hash>.owner`) (never a live run's rig, never
+The next `bun run test:cluster` reaps every `test-<pid>-<hash>` rig whose owner is gone: its pid is dead, or reused by another process (the owner's start time is recorded beside the rig dir, in `test-<pid>-<hash>.owner`) (never a live run's rig: when `ps` cannot answer, the rig is left alone; never
 another name). To recover by hand: `bun run rig ls` lists live rigs, then `bun run rig down --name <name> --clean`.
 The gated files are
 `test/server/pg-store`, `pg-registry`, `nats-bus`, `room-host-lease`, `room-host-proc`, `main-cluster`, `s3-blobs`,
@@ -143,7 +143,9 @@ admits all of them. Raise roles with `PUT /boards/:board/grants/dev%3A<name>`.
   `LC_ALL=C TZ=UTC /bin/ps -o lstart=,command= -p <pid>`, stop the ones that are the rig's, then remove the dir.
 - **A broken `ps` refuses, never guesses:** `ps` runs as `/bin/ps`, whatever PATH says. If it cannot run, is killed,
   exits with an error or prints something unexpected, or cannot see the rig's own process, every command refuses with
-  `cannot check processes: …` before it signals or removes anything. When `up` fails for any reason, it stops what
+  `cannot check processes: …` before it signals or removes anything. The one exception is a `ps` killed by SIGINT,
+  SIGTERM or SIGHUP: it shares its caller's process group, so a terminal Ctrl-C kills it too, and it is run again (up to
+  5 times) so that `down`, which ignores those signals, still finishes. When `up` fails for any reason, it stops what
   rig.json records and then, always, every process it started through its own child handles, which need no `ps`: a
   `ps` that fails once right after a spawn and then works again leaves that process unrecorded, and only the handle
   knows it. A save of rig.json that fails (disk full, permissions) does not skip that cleanup.

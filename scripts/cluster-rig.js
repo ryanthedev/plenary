@@ -94,6 +94,9 @@ export const STARTED_CLOCK = "lstart TZ=UTC LC_ALL=C";
 export const PS_ENV = Object.freeze({ PATH: "/usr/bin:/bin", LC_ALL: "C", TZ: "UTC" });
 /** `ps` by absolute path, never via the caller's PATH (p8-rig2v H2). Tests swap it through `_setPsPath` only. */
 const PS_DEFAULT = "/bin/ps";
+/** The signals a terminal (Ctrl-C, a closed terminal) or `kill` sends a whole process group; `down` ignores them. */
+export const TERMINAL_SIGNALS = Object.freeze(["SIGINT", "SIGTERM", "SIGHUP"]);
+const PS_TRIES = 5;
 let psPath = PS_DEFAULT;
 /** Test seam (in-process only): called as fn("stale", dir) once a stale up.lock has been judged stale. */
 let lockHook = null;
@@ -106,10 +109,17 @@ export function _setPsPath(p) { psPath = p ?? PS_DEFAULT; }
  * resolution). Throws when `ps` itself did not run or answered something unexpected: a failed `ps` must never read as
  * "process gone" (p8-rig2v H2). "Absent" is only exit 1 with empty stdout and empty stderr (what /bin/ps does for an
  * unused PID); anything else is a ps failure.
+ * A `ps` killed by SIGINT, SIGTERM or SIGHUP is run again (up to PS_TRIES times): it shares its caller's process group,
+ * so a terminal Ctrl-C kills it too, and `down`, which ignores those signals, must still finish (rig-tools-v5 audit).
+ * Any other death (SIGKILL, a timeout) refuses at once.
  */
-function psInfo(pid) {
+export function psInfo(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 1) return null;
-  const r = spawnSync(psPath, ["-o", "stat=", "-o", "lstart=", "-p", String(pid)], { encoding: "utf8", env: PS_ENV, timeout: 10_000 });
+  let r;
+  for (let tries = 1; ; tries++) {
+    r = spawnSync(psPath, ["-o", "stat=", "-o", "lstart=", "-p", String(pid)], { encoding: "utf8", env: PS_ENV, timeout: 10_000 });
+    if (r.error || !TERMINAL_SIGNALS.includes(r.signal) || tries >= PS_TRIES) break;
+  }
   const out = (r.stdout || "").trim(), err = (r.stderr || "").trim();
   const fail = why => new Error(`cannot check processes: ${psPath} ${why}; refusing to guess whether this rig's processes are alive`);
   if (r.error) throw fail(`did not run (${r.error.code ?? r.error.message})`);
@@ -127,6 +137,29 @@ function psInfo(pid) {
  */
 export function psCheck() {
   if (!psInfo(process.pid)) throw new Error(`cannot check processes: ${psPath} does not see this process (pid ${process.pid}); refusing to guess whether this rig's processes are alive`);
+}
+// ---- test:cluster owner records (scripts/test-cluster.js) ----
+// `<rig root>/test-<pid>-<hash>.owner` holds the start time of the test:cluster run that owns the rig dir beside it, so
+// the next run's reaper can tell a dead (or reused) owner pid from a live run. Both helpers follow psInfo's rule: a ps
+// that cannot answer is never read as "gone" (rig-tools-v5 H1).
+
+/** Write `pid`'s start time to `path`. Throws, writing nothing, when ps cannot answer (never an empty record). */
+export function writeOwnerRecord(path, pid = process.pid) {
+  const info = psInfo(pid);
+  if (!info) throw new Error(`cannot record the start time of pid ${pid}: ${psPath} does not see it`);
+  writeFileSync(path, info.started + "\n");
+}
+/**
+ * True when the owner `pid` is gone: dead, or now another process (a start time other than the one in `ownerPath`).
+ * False when it lives and there is no record (an older run: only a dead pid counts). Throws when ps cannot answer:
+ * the caller must then leave the rig alone.
+ */
+export function ownerGone(pid, ownerPath) {
+  try { process.kill(pid, 0); } catch (e) { if (e.code === "ESRCH") return true; }
+  if (!existsSync(ownerPath)) return false;
+  const info = psInfo(pid);
+  if (!info) { psCheck(); return true; }   // "absent" counts only from a ps that sees this very process
+  return info.started !== readFileSync(ownerPath, "utf8").trim();
 }
 /** True while the recorded process is still the one this rig started (same PID and same start time). */
 export function isOurs(proc) {
@@ -691,7 +724,7 @@ async function cli(argv) {
     const abort = { aborted: false };
     const onSig = () => { abort.aborted = true; };
     // Ctrl-C, kill, or a closed terminal: stop what started, then exit 1 (never leave it running).
-    for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, onSig);
+    for (const sig of TERMINAL_SIGNALS) process.on(sig, onSig);
     // --watch-parent <pid>: the caller's death (even SIGKILL, which no handler sees) aborts `up`, which then stops what it started.
     const parent = a["watch-parent"] === undefined ? null : num(a["watch-parent"], "watch-parent");
     const watch = parent === null ? null : setInterval(() => { try { process.kill(parent, 0); } catch (e) { if (e.code !== "EPERM") abort.aborted = true; } }, 200);
@@ -721,7 +754,7 @@ async function cli(argv) {
   }
   if (cmd === "down") {
     // Teardown must finish: a Ctrl-C (or the parent's forwarded signal) during down is ignored, never a half-stopped rig.
-    for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => {});
+    for (const sig of TERMINAL_SIGNALS) process.on(sig, () => {});
     console.error("[rig] down: stopping (signals are ignored until it finishes)");   // also the readiness signal for the guard test
     const targets = a.all ? rigDirs() : [dir];
     if (!a.all && !existsSync(join(dir, "rig.json"))) throw new Error(missingRigMessage(a.name ?? basename(dir), dir));
@@ -765,7 +798,7 @@ async function cli(argv) {
 }
 
 if (import.meta.main) {
-  if (process.argv[2] === "down") for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => {});   // as early as possible; cli() repeats it
+  if (process.argv[2] === "down") for (const sig of TERMINAL_SIGNALS) process.on(sig, () => {});   // as early as possible; cli() repeats it
   try { process.exit(await cli(process.argv.slice(2))); }
   catch (err) { console.error(`[rig] ${err.message}`); process.exit(1); }
 }

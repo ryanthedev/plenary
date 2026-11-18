@@ -7,7 +7,7 @@
 import { test, expect, afterAll, describe } from "bun:test";
 import { rmSync, readFileSync, writeFileSync, existsSync, statSync, readdirSync, mkdirSync, renameSync, chmodSync } from "node:fs";
 import { join } from "node:path";
-import { stopRig, rigStatus, killNode, readRig, isOurs, portFree, missingBins, _setPsPath, _setIpcPaths, _setLockHook, pgShmOf, removeOrphanShm, parseIpcsSegments, s3Env, parseArgs } from "../../scripts/cluster-rig.js";
+import { stopRig, rigStatus, killNode, readRig, isOurs, psInfo, TERMINAL_SIGNALS, STARTED_CLOCK, portFree, missingBins, _setPsPath, _setIpcPaths, _setLockHook, pgShmOf, removeOrphanShm, parseIpcsSegments, s3Env, parseArgs } from "../../scripts/cluster-rig.js";
 import { freshDir, track, rigUp as startRig, spawnTracked, cleanupAll, killRecorded, namingDir } from "./rig-guard.js";
 
 const ROOT = new URL("../..", import.meta.url).pathname;
@@ -25,7 +25,13 @@ afterAll(() => cleanupAll());
 const portsOf = rig => [rig.postgres?.port, rig.nats?.port, rig.nats?.monitorPort, Number(new URL(rig.blobs?.url ?? "http://127.0.0.1:0").port), rig.blobs?.consolePort, rig.lb?.port, ...rig.nodes.map(n => n.port)].filter(Boolean);
 // The test's own identity check, independent of the module's: lstart under a fixed TZ and locale.
 const PS_FIXED = { PATH: process.env.PATH, LC_ALL: "C", TZ: "UTC" };
-const lstartIn = (pid, env) => Bun.spawnSync(["/bin/ps", "-o", "lstart=", "-p", String(pid)], { env }).stdout.toString().trim().replace(/\s+/g, " ");
+const lstartIn = (pid, env) => {   // "" when there is no such process; throws when ps itself fails (never a silent "")
+  const r = Bun.spawnSync(["/bin/ps", "-o", "lstart=", "-p", String(pid)], { env });
+  const out = r.stdout.toString().trim(), err = r.stderr.toString().trim();
+  if (r.exitCode === 1 && !out && !err) return "";
+  if (r.exitCode !== 0 || !out) throw new Error(`/bin/ps failed for pid ${pid} (exit ${r.exitCode}, signal ${r.signalCode ?? "none"}): ${err}`);
+  return out.replace(/\s+/g, " ");
+};
 const lstart = pid => lstartIn(pid, PS_FIXED);
 const CLOCK = "lstart TZ=UTC LC_ALL=C";
 
@@ -46,9 +52,59 @@ test("S3 environment output includes every setting consumed by the blob adapter"
 test("rig CLI parses down-all and clean as independent flags", () => {
   expect(parseArgs(["down", "--all", "--clean"])).toEqual({ _: ["down"], all: true, clean: true });
 });
+// rig-tools-v5 audit: psInfo's ps shares its caller's process group, so a terminal Ctrl-C kills it too. `down` ignores
+// those signals and must still finish, so a ps killed by SIGINT, SIGTERM or SIGHUP is run again (bounded); any other
+// failure still refuses at once. Stub ps scripts count their runs in <stub>.count.
+describe("psInfo: a ps killed by a terminal signal is run again", () => {
+  const stubs = freshDir();
+  const runs = f => existsSync(`${f}.count`) ? readFileSync(`${f}.count`, "utf8").split("\n").filter(Boolean).length : 0;
+  /** A ps that kills itself with `sig` on the runs `when` (shell test on $n, the run number) and is /bin/ps otherwise. */
+  const ps = (name, sig, when) => {
+    const f = join(stubs, name);
+    writeFileSync(f, `#!/bin/sh\necho x >> "$0.count"\nn=$(wc -l < "$0.count")\nif ${when}; then kill -${sig.replace(/^SIG/, "")} $$; fi\nexec /bin/ps "$@"\n`);
+    chmodSync(f, 0o755);
+    return f;
+  };
+  for (const sig of TERMINAL_SIGNALS) test(`${sig} on the first two runs: the third answers`, () => {
+    const f = ps(`twice-${sig}`, sig, '[ "$n" -le 2 ]');
+    try { _setPsPath(f); expect(psInfo(process.pid)).toEqual({ started: lstart(process.pid) }); } finally { _setPsPath(); }
+    expect(runs(f)).toBe(3);
+  });
+  test("SIGINT on every run: refuses with the signal after 5 runs, never reads as gone", () => {
+    const f = ps("always-int", "SIGINT", "true");
+    try { _setPsPath(f); expect(() => psInfo(process.pid)).toThrow(/^cannot check processes: .* was killed by SIGINT/); } finally { _setPsPath(); }
+    expect(runs(f)).toBe(5);
+  });
+  test("SIGKILL is not a terminal signal: refuses after one run", () => {
+    const f = ps("kill9", "SIGKILL", "true");
+    try { _setPsPath(f); expect(() => psInfo(process.pid)).toThrow(/was killed by SIGKILL/); } finally { _setPsPath(); }
+    expect(runs(f)).toBe(1);
+  });
+  test("down (stopRig) finishes when every other ps it runs is killed by SIGINT: the service is stopped", async () => {
+    const f = ps("odd-int", "SIGINT", '[ $((n % 2)) -eq 1 ]');
+    const dir = freshDir(), svc = Bun.spawn(["/bin/sleep", "300"]);
+    try {
+      writeFileSync(join(dir, "rig.json"), JSON.stringify({ version: 1, name: "sleep", dir, startedClock: STARTED_CLOCK, state: "up", nodes: [],
+        procs: [{ name: "sleep", pid: svc.pid, started: lstart(svc.pid) }] }) + "\n");
+      _setPsPath(f);
+      const r = await stopRig(dir, { graceMs: 5000 });
+      expect(r.stopped).toEqual(["sleep"]);
+      expect(r.forced).toEqual([]);
+      expect(await svc.exited).toBe(143);   // our SIGTERM
+      expect(runs(f)).toBeGreaterThanOrEqual(4);   // several checks, each killed once
+    } finally { _setPsPath(); try { svc.kill("SIGKILL"); } catch {} }
+  });
+});
+
 /** An in-range PID that no process has right now: a child that has exited and been reaped. */
 const reapedPid = async () => { const p = Bun.spawn(["true"]); await p.exited; return p.pid; };
-const psGone = pid => !Bun.spawnSync(["/bin/ps", "-o", "pid=", "-p", String(pid)]).stdout.toString().trim();
+const psGone = pid => {   // a failed ps throws: it never reads as "gone"
+  const r = Bun.spawnSync(["/bin/ps", "-o", "pid=", "-p", String(pid)]);
+  const out = r.stdout.toString().trim(), err = r.stderr.toString().trim();
+  if (r.exitCode === 1 && !out && !err) return true;
+  if (r.exitCode !== 0 || !out) throw new Error(`/bin/ps failed for pid ${pid} (exit ${r.exitCode}, signal ${r.signalCode ?? "none"}): ${err}`);
+  return false;
+};
 async function expectAllDown(rig) {
   // An in-process rig's children are this process's: a stopped one may show as a zombie until Bun reaps it (ms).
   for (const p of rig.procs) {

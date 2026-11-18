@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
+import { ownerGone, TERMINAL_SIGNALS, writeOwnerRecord } from "./cluster-rig.js";
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
 const RIG_CLI = join(ROOT, "scripts/cluster-rig.js");
 const BUN = Bun.which("bun") ?? process.execPath;
@@ -26,19 +27,21 @@ const dir = join(RIG_ROOT, name);
 const ownerFile = `${dir}.owner`;   // this process's start time, beside the rig dir (the dir itself must hold only a rig): lets the reaper tell a reused pid from this run
 let child = null, helper = null, rig = null, rigStarted = false, code = 1, interrupted = false, interruptedBy = null;
 let tearingDown = false;
+const DOWN_TRIES = 20;
 const signal = sig => {
   interrupted = true;
   interruptedBy ??= sig;
   try { child?.kill(sig); } catch {}
   if (!tearingDown) try { helper?.kill(sig); } catch {}   // never signal the `down` helper: it must finish stopping the services
 };
-for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => signal(sig));
+for (const sig of TERMINAL_SIGNALS) process.on(sig, () => signal(sig));
 
 try {
   await reapStaleRigs();
+  await new Promise(r => setTimeout(r, 0));   // let a signal that arrived during a synchronous reap reach its handler first
   if (interrupted) throw new Error("interrupted while reaping");
   mkdirSync(RIG_ROOT, { recursive: true });
-  writeFileSync(ownerFile, startedOf(process.pid) + "\n");
+  writeOwnerRecord(ownerFile);   // throws (no rig started) rather than write an empty record when ps fails
   mkdirSync(dir, { recursive: true });
   // `up` watches this process: if it dies (SIGKILL), `up` stops what it started and exits. Its output goes straight to our terminal.
   const up = await runRigCli(["up", "--name", name, "--dir", dir, "--services-only", "--timeout-ms", "90000", "--watch-parent", String(process.pid)], { live: true });
@@ -86,14 +89,14 @@ try {
   console.error("[test:cluster] tearing down");   // readiness marker for the signal-storm guard test
   try {
     if (rigStarted || existsSync(join(dir, "rig.json"))) {
-      const down = await runRigCli(["down", "--dir", dir, ...(code === 0 ? ["--clean"] : [])], { live: true });
+      const down = await rigDown(["--dir", dir, ...(code === 0 ? ["--clean"] : [])], { live: true });
       if (down.code !== 0 && code === 0) code = 1;
     }
   } catch (error) {
     console.error(`[test:cluster] cleanup failed: ${error.message}`);
     if (code === 0) code = 1;
   }
-  if (code !== 0) console.error(`[test:cluster] rig kept at ${dir}`);
+  if (code !== 0 && existsSync(dir)) console.error(`[test:cluster] rig kept at ${dir}`);
   else if (!existsSync(dir)) rmSync(ownerFile, { force: true });
 }
 failIfInterrupted();   // a signal during teardown
@@ -121,21 +124,32 @@ function runRigCli(args, { live = false, cwd = dir, shielded = false } = {}) {
     proc.stdout?.on("data", d => { stdout += d; });
     proc.stderr?.on("data", d => { stderr += d; });
     proc.on("error", reject);
-    proc.on("close", (exit, sig) => { helper = null; resolveRun({ stdout, stderr, code: exit ?? 128 }); });
+    proc.on("close", (exit, sig) => { helper = null; resolveRun({ stdout, stderr, code: exit ?? 128, signal: sig ?? null }); });
   });
 }
 
-function pidAlive(pid) { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } }
-/** A pid's start time (ps lstart, fixed TZ and locale), or "" when there is no such process. */
-function startedOf(pid) {
-  const r = Bun.spawnSync(["/bin/ps", "-o", "lstart=", "-p", String(pid)], { env: { PATH: "/usr/bin:/bin", LC_ALL: "C", TZ: "UTC" } });
-  return r.stdout.toString().trim().replace(/\s+/g, " ");
+/**
+ * `cluster-rig.js down`, run again while an attempt died by a signal (rig-tools-v5 M5). With bun 1.4.4 on macOS a
+ * `detached` spawn is not atomic: for a moment the child is still in this process group, so a group signal (a terminal
+ * Ctrl-C) kills it before it runs any code. Retrying is safe: `down` ignores SIGINT/SIGTERM/SIGHUP from its first
+ * statement, and nothing else here signals it, so a signal death means it never ran; and `down` is idempotent. No JS
+ * API spawns with signals blocked or with an atomic setsid (and macOS has no setsid(1)), so the race cannot be avoided,
+ * only detected. In a 1 ms SIGINT storm a try dies with p = 0.08 (idle) to 0.17 (load 15) (rig-tools-v6), so 20 tries leak ~p^20.
+ */
+async function rigDown(args, opts) {
+  for (let tries = 1; ; tries++) {
+    const r = await runRigCli(["down", ...args], opts);
+    if (!r.signal || tries >= DOWN_TRIES) return r;
+    console.error(`[test:cluster] down was killed by ${r.signal} before it could start; running it again`);
+  }
 }
-/** The owner is gone: its pid is dead, or now belongs to another process (a start time other than the one recorded). */
-function ownerGone(pid, ownerPath) {
-  if (!pidAlive(pid)) return true;
-  if (!existsSync(ownerPath)) return false;   // no record (an older run): only a dead pid counts
-  return startedOf(pid) !== readFileSync(ownerPath, "utf8").trim();
+
+/** ownerGone, except that a ps that cannot answer leaves the rig alone: never reap a rig that may be a live run's (rig-tools-v5 H1). */
+function ownerSurelyGone(pid, ownerPath) {
+  try { return ownerGone(pid, ownerPath); } catch (error) {
+    console.error(`[test:cluster] leaving ${basename(ownerPath, ".owner")} alone: ${error.message}`);
+    return false;
+  }
 }
 
 /**
@@ -145,15 +159,18 @@ function ownerGone(pid, ownerPath) {
 async function reapStaleRigs() {
   const root = RIG_ROOT;
   if (!existsSync(root)) return;
-  for (const e of readdirSync(root, { withFileTypes: true })) {
+  const entries = readdirSync(root, { withFileTypes: true });
+  const runs = entries.filter(e => /^test-\d+-[0-9a-f]+$/.test(e.name)).length;
+  if (runs) console.error(`[test:cluster] checking ${runs} earlier run rig(s) in ${root}`);   // also the readiness marker for the reaper storm tests
+  for (const e of entries) {
     const o = /^(test-(\d+)-[0-9a-f]+)\.owner$/.exec(e.name);   // an owner record whose run died before making its dir
-    if (o && e.isFile() && !existsSync(join(root, o[1])) && ownerGone(Number(o[2]), join(root, e.name))) rmSync(join(root, e.name), { force: true });
+    if (o && e.isFile() && !existsSync(join(root, o[1])) && ownerSurelyGone(Number(o[2]), join(root, e.name))) rmSync(join(root, e.name), { force: true });
     const m = /^test-(\d+)-[0-9a-f]+$/.exec(e.name);
-    if (!e.isDirectory() || !m || !ownerGone(Number(m[1]), join(root, `${e.name}.owner`))) continue;
+    if (!e.isDirectory() || !m || !ownerSurelyGone(Number(m[1]), join(root, `${e.name}.owner`))) continue;
     console.error(`[test:cluster] reaping stale rig ${e.name} (its test:cluster, pid ${m[1]}, is gone)`);
     const target = join(root, e.name);
     if (existsSync(join(target, "rig.json"))) {
-      const down = await runRigCli(["down", "--dir", target, "--clean"], { live: true, cwd: ROOT, shielded: true });
+      const down = await rigDown(["--dir", target, "--clean"], { live: true, cwd: ROOT, shielded: true });
       if (down.code !== 0) continue;   // services may still run: keep the dir (and its owner record) for the next run
     }
     rmSync(target, { recursive: true, force: true });   // also a run that died before any service started

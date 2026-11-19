@@ -102,10 +102,12 @@ test("the toast: announced once, not a live region itself, Undo gets focus, last
   expect(toastEl().getAttribute("role")).toBe("group");
   expect(announced()).toContain("Moved Roadmap to Design.");
   expect(focused.at(-1).getAttribute("data-fk")).toBe("move-undo");
+  clock.advance(60_000); expect(toastEl()).toBeDefined();               // focus is inside: the countdown holds
+  release();
   clock.advance(9_999); expect(toastEl()).toBeDefined();
   clock.advance(1);
   expect(globalThis.document.body.findAll(e => e.getAttribute("aria-label") === "Board moved")).toEqual([]);
-  expect(restored.length).toBe(1);
+  expect(restored.length).toBe(0);                                      // focus was already elsewhere
 });
 test("Escape dismisses the toast and returns focus; focus elsewhere is left alone", async () => {
   const { restored } = await toast();
@@ -122,6 +124,7 @@ test("Undo moves back under its own key, says so, refreshes the page and goes af
   expect(calls.filter(c => c[0] === "undo")).toEqual([["undo", { from: "s-2", to: "s-1" }, "undo-key"]]);
   expect(textOf(toastEl())).toContain("Moved Roadmap back to Mine.");
   expect(changes.length).toBe(1);
+  release();
   clock.advance(1_500); expect(toastEl()).toBeDefined();
   clock.advance(4_000); expect(globalThis.document.body.findAll(e => e.getAttribute("aria-label") === "Board moved")).toEqual([]);
 });
@@ -137,9 +140,10 @@ test("no undo offered: a plain notice with only Dismiss", async () => {
   expect(announced()).not.toContain("Undo is available");
 });
 
+const release = () => { globalThis.document.activeElement = null; toastEl()?.dispatch("focusout", { relatedTarget: null }); };   // focus lost to nowhere (a click on the page)
 const gone = () => globalThis.document.body.findAll(e => e.getAttribute("aria-label") === "Board moved").length === 0;
 test("MED-2: the 10 s countdown pauses while the pointer is over the toast and resumes with what was left", async () => {
-  await toast();
+  await toast(); release();
   clock.advance(6_000);
   toastEl().dispatch("mouseenter");
   clock.advance(60_000); expect(gone()).toBe(false);
@@ -148,7 +152,7 @@ test("MED-2: the 10 s countdown pauses while the pointer is over the toast and r
   clock.advance(1); expect(gone()).toBe(true);
 });
 test("MED-2: focus the person moves within the toast holds it; focus lost to nowhere resumes it; focus moved out dismisses it without pulling focus back", async () => {
-  const { restored } = await toast();
+  const { restored } = await toast(); release();
   clock.advance(2_000);
   toastEl().dispatch("focusin");                                          // the person Tabs to Dismiss / clicks in
   clock.advance(60_000); expect(gone()).toBe(false);
@@ -159,21 +163,43 @@ test("MED-2: focus the person moves within the toast holds it; focus lost to now
   toastEl().dispatch("focusout", { relatedTarget: null });                // a click on the page or a window switch: the countdown resumes with the 8 s left
   clock.advance(7_999); expect(gone()).toBe(false);
   clock.advance(1); expect(gone()).toBe(true);
-  expect(restored.length).toBe(1);                                         // it went by the clock while focus was inside, so focus returns to the page
+  expect(restored.length).toBe(0);
   const again = await toast(); const outside = new FakeElement("button");
   toastEl().dispatch("focusin");
   toastEl().dispatch("focusout", { relatedTarget: outside });
   expect(gone()).toBe(true); expect(again.restored.length).toBe(0);        // Tab out: dismissed, focus stays where the person put it
 });
-test("MED-2: the page's own focus on Undo does not hold the countdown (a person who does nothing still sees it go)", async () => {
+test("MED-2: the countdown holds while focus is inside the toast, the page's own focus on Undo included; leaving by Escape ends it", async () => {
   await toast();
   expect(focused.at(-1).getAttribute("data-fk")).toBe("move-undo");
-  clock.advance(10_000); expect(gone()).toBe(true);
+  clock.advance(60_000); expect(gone()).toBe(false);
+  toastEl().dispatch("keydown", { key: "Escape" }); expect(gone()).toBe(true);
+});
+test("MED-2: with no focus inside (a pointer user) the 10 s run", async () => {
+  globalThis.document.activeElement = null;
+  FakeElement.prototype.focus = function () {};                       // the page's focus() lands nowhere
+  await toast();
+  clock.advance(9_999); expect(gone()).toBe(false);
+  clock.advance(1); expect(gone()).toBe(true);
+});
+test("LOW-5: elapsed time is measured on mono(): a jump of the wall clock neither cuts nor extends the countdown", async () => {
+  FakeElement.prototype.focus = function () {};
+  const wall = { ...clock, now: () => clock.now() + (jump ?? 0), mono: clock.mono }; let jump = 0;
+  const mv = { move: async () => ({ result: RESULT }) };
+  showMoveToast({ host: globalThis.document.body, move: mv, board: "b-1", result: RESULT, clock: wall });
+  clock.advance(4_000);
+  toastEl().dispatch("mouseenter");
+  jump = 3_600_000;                                                    // the laptop woke and NTP stepped the wall clock an hour
+  clock.advance(1_000);
+  toastEl().dispatch("mouseleave");
+  clock.advance(5_999); expect(gone()).toBe(false);                    // 6 s were left on the monotonic clock
+  clock.advance(1); expect(gone()).toBe(true);
 });
 test("MED-2: a running Undo is not cut by the countdown, even while the pointer is away", async () => {
-  await toast(RESULT, { out: { result: RESULT } });
+  await toast(RESULT, { out: { result: RESULT } }); release();
   clock.advance(9_000);
   globalThis.document.body.findAll(e => e.getAttribute("data-fk") === "move-undo")[0].dispatch("click"); await settle();
+  release();
   clock.advance(3_999); expect(gone()).toBe(false);
   clock.advance(1); expect(gone()).toBe(true);
 });

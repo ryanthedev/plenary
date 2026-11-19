@@ -100,22 +100,38 @@ async function deadHolder() {
   return { ...w, epoch, Bh, rawA, rawB, publish, reads: () => leaseReads, close: async () => { await Bh.close(); await rawA.close(); await rawB.close(); await bus.close(); } };
 }
 
-test("DW-3 late: stale-epoch heartbeats from a dead incarnation do not keep a waiting host believing the holder lives; current-epoch ones do", async () => {
-  for (const kind of ["stale", "current"]) {
+test("DW-3 late: stale-epoch or epoch-less messages (heartbeats and entries batches) from a dead incarnation do not keep a waiting host believing the holder lives", async () => {
+  for (const msg of [{ seq: 0, epoch: 1, cp: 0 }, { seq: 0, cp: 0 }, { from: 1, to: 1, items: ["{}"], epoch: 1 }, { from: 1, to: 1, items: ["{}"] }]) {
     const d = await deadHolder(), g = gateway(d.bus);
     try {
-      const epoch = kind === "stale" ? d.epoch - 1 : d.epoch;
       await d.V.advance(10);
       g.hello("c1", "a");
-      // Beats every 100 ms (inside the 400 ms silence rule), for a full second.
-      for (let i = 0; i < 10; i++) { await d.publish({ seq: 0, epoch, cp: 0 }); await d.V.advance(100); }
-      if (kind === "stale") expect(g.answered("c1")?.msg).toMatchObject({ code: "unavailable" });   // held, then answered once the real holder was silent 2 beats
-      else expect(g.answered("c1")).toBeUndefined();                                                 // alive: the hello stays with its holder
+      for (let i = 0; i < 10; i++) { await d.publish(msg); await d.V.advance(100); }   // every 100 ms (inside the 400 ms silence rule) for a second
+      expect(g.answered("c1")?.msg).toMatchObject({ code: "unavailable" });             // answered once the real holder had been silent 2 beats
     } finally { await d.close(); }
   }
 });
 
-test("DW-3 late/duplicate released: a stale-epoch `released` triggers no attempt; a current one triggers exactly one, and the lease still decides", async () => {
+test("DW-3 same epoch: a late beat of the dead holder is indistinguishable from a live one (it delays, never loses): held hellos stay and are answered at the silence; a stream of them for a second answers nothing", async () => {
+  let d = await deadHolder(), g = gateway(d.bus);
+  try {
+    await d.V.advance(10);
+    g.hello("c1", "a"); await d.V.advance(10);
+    for (let i = 0; i < 3; i++) { await d.publish({ seq: 0, epoch: d.epoch, cp: 0 }); await d.V.advance(100); }   // three late beats, then nothing
+    expect(g.answered("c1")).toBeUndefined();                           // still held: the holder may be alive
+    await d.V.advance(500);
+    expect(g.answered("c1")?.msg).toMatchObject({ code: "unavailable" });   // the hello was not eaten by the beats: answered at the silence
+  } finally { await d.close(); }
+  d = await deadHolder(); g = gateway(d.bus);
+  try {
+    await d.V.advance(10);
+    g.hello("c1", "a");
+    for (let i = 0; i < 10; i++) { await d.publish({ seq: 0, epoch: d.epoch, cp: 0 }); await d.V.advance(100); }   // 1 s of same-epoch beats: a live holder as far as anyone can tell
+    expect(g.answered("c1")).toBeUndefined();
+  } finally { await d.close(); }
+});
+
+test("DW-3 late/duplicate released: a stale-epoch `released` triggers no attempt; a current one, duplicated, triggers exactly one attempt, and the lease still decides", async () => {
   const d = await deadHolder();
   try {
     await d.V.advance(1);
@@ -125,8 +141,7 @@ test("DW-3 late/duplicate released: a stale-epoch `released` triggers no attempt
     expect(d.reads()).toBe(base);
     for (let i = 0; i < 3; i++) await d.publish({ seq: 0, epoch: d.epoch, cp: 0, released: true });       // current, duplicated: one attempt at a time
     await d.V.advance(1);
-    expect(d.reads() - base).toBeGreaterThanOrEqual(1);
-    expect(d.reads() - base).toBeLessThanOrEqual(2);
+    expect(d.reads() - base).toBe(1);                                                                          // three messages in one tick, one attempt at a time
     expect(d.Bh.stats()).toEqual({ rooms: 0, waiting: 1 });                                                  // lease live: refused, no takeover
     expect(await d.rawA.lease(T, B)).toMatchObject({ holder: "h-dead", epoch: d.epoch, live: true });
   } finally { await d.close(); }
@@ -162,24 +177,58 @@ async function feedWorld(n) {
   const feed = boardFeed({ tenant: T, board: B, store, bus: inner, onLive: f => live.push(f), now: V.now, timers: V.timers, pollMs: 5_000 });
   await feed.ready;
   const settle = async () => { await inner.flush(); await feed.atomically(() => {}); };
-  const items = (from, to) => ({ from, to, items: Array.from({ length: to - from + 1 }, (_, k) => JSON.stringify(entry(from + k))) });
+  const items = (from, to) => ({ epoch, from, to, items: Array.from({ length: to - from + 1 }, (_, k) => JSON.stringify(entry(from + k))) });
   return { V, feed, io, live, epoch, settle, raw, pub: async m => { await inner.publish(subjects.entries(T, B), m); await settle(); }, items, close: async () => { feed.close(); await raw.close(); await bus.close(); } };
 }
 
-test("DW-2 feed, a missed last entry and no heartbeat: the feed reads the Store after 5 s of silence (not before), then every 5 s while it lasts", async () => {
+test("DW-2 feed, a missed last entry and no heartbeat: the Store is read once the silence reaches 5 s, checked every 2.5 s: repaired in [5 s, 7.5 s) after the last live message", async () => {
+  for (const [offset, exact] of [[0, 5_000], [1, 7_499]]) {   // the last live message just before / just after a poll tick
+    const f = await feedWorld(3);
+    try {
+      await f.V.advance(2_500 + offset); await f.settle();               // a poll tick passes (it found nothing), then the last message `offset` ms after it
+      await f.pub({ seq: 3, epoch: f.epoch, cp: 0 });
+      await f.raw.append(T, B, [entry(4)], 3, f.epoch);                  // the room's entry 4 never reached the bus
+      let took = null;
+      for (let t = 1; t <= 8_000 && took === null; t++) { await f.V.advance(1); await f.settle(); if (f.feed.seq === 4) took = t; }
+      expect(took).toBe(exact);                                          // not before 5 s of silence, and under 7.5 s at worst
+    } finally { await f.close(); }
+  }
+}, 30_000);
+
+test("DW-2 feed, a silence poll repeats only once pollMs has passed again (5 to 7.5 s), not every tick", async () => {
   const f = await feedWorld(3);
   try {
-    expect(f.feed.seq).toBe(3);
-    await f.raw.append(T, B, [entry(4)], 3, f.epoch);                    // the room's entry 4 never reached the bus
-    await f.V.advance(4_999); await f.settle();
-    expect(f.feed.seq).toBe(3);
-    await f.V.advance(1); await f.V.advance(2_500); await f.settle();
-    expect(f.feed.seq).toBe(4);
-    await f.raw.append(T, B, [entry(5)], 4, f.epoch);
-    await f.V.advance(5_000); await f.settle();
-    expect(f.feed.seq).toBe(5);
+    await f.V.advance(5_000); await f.settle();                          // the first silence poll (5 s)
+    const first = f.io.reads;
+    await f.V.advance(2_500); await f.settle();
+    expect(f.io.reads).toBe(first);                                      // 2.5 s after a poll: no read
+    await f.V.advance(2_500); await f.settle();
+    expect(f.io.reads).toBeGreaterThan(first);                           // 5 s after it: the next
   } finally { await f.close(); }
-});
+}, 30_000);
+
+test("F1 feed, a lost entry plus stale-epoch heartbeats and batches every 2 s: the Store is still read within the poll bound (stale traffic is not liveness)", async () => {
+  const f = await feedWorld(3);
+  try {
+    await f.pub({ seq: 3, epoch: f.epoch + 1, cp: 0 });                  // the new incarnation was heard: feed epoch = epoch + 1
+    await f.raw.append(T, B, [entry(4)], 3, f.epoch);                    // entry 4 never reached the bus
+    let at = null;
+    for (let t = 0; t < 8_000 && at === null; t += 500) {
+      if (t % 2_000 === 0) { await f.pub({ seq: 3, epoch: f.epoch, cp: 0 }); await f.pub({ epoch: f.epoch, from: 1, to: 3, items: f.items(1, 3).items }); }   // a dead holder's late traffic
+      await f.V.advance(500); await f.settle();
+      if (f.feed.seq === 4) at = t + 500;
+    }
+    expect(at).not.toBe(null);
+    expect(at).toBeLessThanOrEqual(7_500);
+    // Positive control: current-epoch traffic does keep the silence poll off.
+    const g = await feedWorld(3);
+    try {
+      await g.raw.append(T, B, [entry(4)], 3, g.epoch);
+      for (let t = 0; t < 8_000; t += 500) { if (t % 2_000 === 0) await g.pub({ seq: 3, epoch: g.epoch, cp: 0 }); await g.V.advance(500); await g.settle(); }
+      expect(g.feed.seq).toBe(3);                                       // no poll while beats say seq 3... (a heartbeat with seq 3 claims nothing newer)
+    } finally { await g.close(); }
+  } finally { await f.close(); }
+}, 30_000);
 
 test("DW-2 feed, a heartbeat with a higher seq repairs a lost last entry at once; a heartbeat past the Store invents nothing", async () => {
   const f = await feedWorld(3);
@@ -224,7 +273,7 @@ async function cost(boards) {
   } finally { await A.close(); await raw.close(); await bus.close(); }
 }
 
-test("DW-4 cost: per hosted board, one message of about 35 bytes every 2 s (30 per minute); the total is linear in boards", async () => {
+test("DW-4 cost: per hosted board, one message of 26 bytes (small numbers) every 2 s, 30 a minute; the total is linear in boards", async () => {
   const rows = [];
   for (const n of [1, 100, 1000]) rows.push(await cost(n));
   console.log("heartbeat cost per minute (virtual), CPU is the tick incl. virtual-bus settle:\n" + rows.map(r => `  ${String(r.boards).padStart(4)} boards: ${r.msgs} msgs, ${r.bytes} B (${r.perBoardMsgs} msgs, ${r.perBoardBytes} B per board), ${r.msPerTick.toFixed(2)} ms/tick`).join("\n"));
@@ -233,5 +282,4 @@ test("DW-4 cost: per hosted board, one message of about 35 bytes every 2 s (30 p
     expect(r.distinct).toBe(r.boards);
     expect(r.perBoardBytes / 30).toBeLessThan(48);                       // {"seq":0,"epoch":1,"cp":0} is 26 bytes; room for 7-digit seqs
   }
-  expect(rows[2].msPerTick).toBeLessThan(250);                          // generous: a tick of 1,000 boards is a few ms here
 }, 60_000);

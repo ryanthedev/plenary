@@ -44,7 +44,7 @@ const NO_CATCH_UP = Number.MAX_SAFE_INTEGER;
  * @returns {{ from: number, to: number, items: string[] }[]}
  */
 export function splitEntries(entries, items, maxBytes) {
-  const out = [], room = maxBytes - 64;   // the envelope: {"from":…,"to":…,"items":[…]}
+  const out = [], room = maxBytes - 96;   // the envelope: {"from":…,"to":…,"items":[…],"epoch":…}
   let cur = null, bytes = 0;
   for (let i = 0; i < entries.length; i++) {
     const n = utf8Length(JSON.stringify(items[i])) + 1;   // as a JSON string inside the array (escapes count)
@@ -104,8 +104,6 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   const me = holder ?? newHolder(hostname);
   const renewEvery = Math.floor(leaseTtlMs / 3);
   const renewTimeout = Math.max(1, Math.floor(renewEvery / 2)), renewRetry = Math.max(1, Math.floor(renewEvery / 4));
-  // A takeover attempt waits a whole ttl (plus a little) after it read the lease: the lease can't outlive that unless
-  // it was renewed, and this host never compares the Store's clock (`expiresAt`) with its own.
   // A takeover attempt is armed for the Store's own `remainingMs` on the lease (+ a small margin): this host never
   // compares the Store's clock (`expiresAt`) with its own. While it still loses, it tries again every ttl/3.
   const margin = Math.max(20, Math.floor(leaseTtlMs / 50));
@@ -135,7 +133,8 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   function publishEntries(slot, entries) {
     try {
       const items = entries.map(e => codec.encode(e));
-      for (const m of splitEntries(entries, items, maxBusBytes)) {
+      for (const part of splitEntries(entries, items, maxBusBytes)) {
+        const m = { ...part, epoch: slot.epoch };
         const p = bus.publish(subjects.entries(slot.tenant, slot.board), m);
         // Refused (over the cap, a bus outage): gateways repair from the Store (heartbeat gap, 5 s silence poll).
         p?.catch?.(err => log.error("entries publish refused; gateways repair from the Store", { tenant: slot.tenant, board: slot.board, from: m.from, to: m.to, err }));
@@ -367,18 +366,19 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   /**
    * The holder's `.entries`: it is alive. A heartbeat from a holder that just opened (`opened`, or an epoch above the
    * last one heard) means the hellos held here reached nobody (its room subscribed after them): answer them
-   * `unavailable` so the clients retry (MEDIUM-2). Otherwise the holder answered them: drop them. A `released` one: the
+   * `unavailable` so the clients retry (MEDIUM-2). Otherwise the holder most likely answered them: those held longer than 2 heartbeats are dropped, younger ones stay (a late beat from a dead holder must not eat a hello). A `released` one: the
    * holder let the board go; answer the held hellos and try to take it at once (L2).
    */
   function watchEntries(w, m) {
     const ep = Number.isSafeInteger(m?.epoch) ? m.epoch : null;
-    // A late message from an older incarnation (a dead holder's, delayed on the bus) proves nothing about the holder now.
-    if (ep !== null && w.epoch !== null && ep < w.epoch) return;
+    // A late message from an older incarnation (a dead holder's, delayed on the bus), or one with no epoch, proves nothing about the holder now.
+    if (ep === null || (w.epoch !== null && ep < w.epoch)) return;
     w.heardAt = perf();
-    const fresh = m?.opened === true || (ep !== null && w.epoch !== null && ep > w.epoch);
-    if (ep !== null && (w.epoch === null || ep > w.epoch)) w.epoch = ep;
+    const fresh = m?.opened === true || (w.epoch !== null && ep > w.epoch);
+    if (w.epoch === null || ep > w.epoch) w.epoch = ep;
     if (m?.released === true) { answerHeld(w); clearTimeout(w.silence); attemptNow(w); return; }
-    if (fresh) answerHeld(w); else w.pending.length = 0;
+    if (fresh) answerHeld(w);
+    else w.pending = w.pending.filter(h => w.heardAt - h.at <= silentAfter);   // older ones: the live holder had its chance to answer; younger stay until it speaks or goes silent
     armSilence(w);
   }
   /**
@@ -393,7 +393,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     w.wanted = perf();   // some gateway has writers on this board: keep watching it
     if (typeof m.conn !== "string" || m.closed || m.msg?.t !== "hello") return;
     if (perf() - w.heardAt > silentAfter || w.pending.length >= 1_000) return reply(m.gateway, m.conn, UNAVAILABLE, 1013);
-    w.pending.push({ gateway: m.gateway, conn: m.conn });
+    w.pending.push({ gateway: m.gateway, conn: m.conn, at: perf() });
   }
   /** 2 heartbeats with nothing heard: the holder is silent. Answer the held hellos and try to take the board now. */
   function armSilence(w) {

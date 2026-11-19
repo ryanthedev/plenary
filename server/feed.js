@@ -163,7 +163,8 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
   function again() { self.nextRebase = self.tail.length + rebaseEvery; self.nextRebaseBytes = self.tailBytes + rebaseBytes; }
 
   async function onMessage(m) {
-    self.lastHeard = now();
+    // Traffic from a lower epoch (a dead incarnation's, late on the bus) is not "the room is alive": the silence poll must still run.
+    if (Number.isSafeInteger(m?.epoch) && m.epoch >= self.epoch) self.lastHeard = now();
     if (Number.isSafeInteger(m?.epoch) && m.epoch > self.epoch) self.epoch = m.epoch;
     if (Array.isArray(m?.items) && Number.isSafeInteger(m.from)) {
       if (m.to <= self.seq) return;
@@ -179,6 +180,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
   const unsub = bus.subscribe(subjects.entries(tenant, board), m => { run(() => onMessage(m)).catch(err => log.error("feed: message failed", { tenant, board, err })); });
   const poll = setInterval(() => {
     if (now() - self.lastHeard < pollMs || running) return;
+    self.lastHeard = now();   // the next look is a full pollMs away
     run(async () => { await repair(); await maybeRebase(true); }).catch(err => log.warn("feed: Store poll failed", { tenant, board, err }));
   }, Math.max(50, Math.floor(pollMs / 2)));
   poll.unref?.();

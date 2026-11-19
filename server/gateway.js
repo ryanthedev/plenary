@@ -465,7 +465,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       b = { key, tenant, board, conns: new Set(), refs: 0, coalescer: presenceCoalescer(), mine: {}, sums: new Map(), unsubs: [], rc: newRecheck(),
         // `here` (§ Presence): this gateway's writer users and viewer connections, the latest `.here` per gateway, what was sent.
         hw: new Map(), hv: 0, hvTabs: new Map(), hFrom: new Map(), hChanged: false, hPubAt: 0, hText: null, hCountText: null, hKey: null, hVer: 0, hOut: false, hSentAt: 0, hSending: false };
-      b.feed = feedOf({ tenant, board, store, bus, log, codec, deflate, onLive: e => onLive(b, e), ...lim.feed });
+      b.feed = feedOf({ tenant, board, store, bus, log, codec, deflate, now, timers, onLive: e => onLive(b, e), ...lim.feed });
       b.unsubs.push(bus.subscribe(subjects.presence(tenant, board), m => {
         if (!m || typeof m.user !== "string" || typeof m.client !== "string") return;
         if (m.leave) b.coalescer.leave(m.user, m.client); else if (m.msg && typeof m.msg === "object") b.coalescer.add(m.user, m.client, m.msg);

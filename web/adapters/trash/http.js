@@ -8,8 +8,8 @@ const ms = v => (Number.isFinite(v) && v >= 0 ? v : null);
 const days = v => (Number.isSafeInteger(v) && v >= 0 && v <= 3650 ? v : null);
 const person = p => (p && typeof p === "object" && typeof p.id === "string" && p.id.length <= 200 ? { id: p.id, name: str(p.name) } : null);
 const space = s => (s && typeof s === "object" && isId(s.id) ? { id: s.id, name: str(s.name), personal: s.personal === true } : null);
-/** The personal space a restore would use; `id` is null when it does not exist yet (created on restore). */
-const into = s => (s && typeof s === "object" && s.personal === true && (s.id === null || isId(s.id)) ? { id: s.id, name: str(s.name), personal: true } : null);
+/** The personal space a restore would use; `id` and `name` are null when it does not exist yet (created on restore; the page words it). */
+const into = s => (s && typeof s === "object" && s.personal === true && (s.id === null || isId(s.id)) ? { id: s.id, name: typeof s.name === "string" ? str(s.name) : null, personal: true } : null);
 const group = g => (g && typeof g === "object" && isId(g.id) ? { id: g.id, name: typeof g.name === "string" ? str(g.name) : null } : null);
 
 /** @returns {import("../../ports/trash.js").TrashResult | null} */

@@ -74,10 +74,10 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
    * Where Restore puts an own-clock board whose Space is in Trash (J8 step 3): the caller's personal space, if their own role on the board does not rise there (#53's rule 4; a Unit admin is
    * exempt). `null` = the board's Space is live (it goes back where it was); otherwise `{ space, ok }`, `ok` false = Restore would escalate.
    */
-  async function destination(identity, d, create) {
+  async function destination(identity, d) {
     if (d.row.trashedWith != null || !d.row.space || (await registry.space(d.row.space))?.trashedAt == null) return null;
-    // A GET never writes: the personal space is only looked up, and a restore creates it (`create`). 
-    const space = create ? await registry.ensurePersonalSpace(d.unit.id, identity.user) : await registry.personalSpace(d.unit.id, identity.user);
+    // Only a lookup: nothing is written until the restore will proceed (`go` creates a missing personal space after the escalation check passed). 
+    const space = await registry.personalSpace(d.unit.id, identity.user);
     const ctx = space && await registry.accessContext({ type: "space", id: space.id }, { users: [identity.user] });
     // A personal space that does not exist yet will be created with its owner (the restorer) as its owner, so the board role it gives the restorer is "owner".
     return { space, ok: withinLadder(d.access.trashed?.ladder ?? d.access.ladder, space ? (ctx ? givenBy(ctx) : "owner") : "owner", isUnitAdmin(d.unit, identity)) };
@@ -115,14 +115,15 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
       const d = await deleter(identity, boardId);
       const go = async dest => {
         if (dest && !dest.ok) throw asAdminError({ code: "would-escalate" });
+        if (dest) dest.space ??= await registry.ensurePersonalSpace(d.unit.id, identity.user);   // created only now: a refused restore leaves nothing behind
         return registry.restoreBoard({ board: d.row.id, idem, ...(dest ? { into: dest.space.id } : {}) });
       };
-      let dest = d.row.trashedAt == null ? null : await destination(identity, d, true), out;
+      let dest = d.row.trashedAt == null ? null : await destination(identity, d), out;
       try { out = await go(dest); }
       catch (e) {
         if (e?.code !== "space-in-trash" || dest) throw e instanceof AdminError ? e : asAdminError(e);
         // The Space went to Trash between the destination being chosen and the write (a narrow race): choose again, once, with the same no-escalation check.
-        dest = await destination(identity, d, true);
+        dest = await destination(identity, d);
         try { out = await go(dest); } catch (e2) { throw e2 instanceof AdminError ? e2 : asAdminError(e2); }
       }
       const moved = !!dest && out.restored;   // the answer says where it went: the caller's own personal space, which they may name
@@ -175,8 +176,8 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
       const t = now(), withSpace = row.trashedWith != null;
       const out = { board: { id: row.id, title: row.title }, ...clockOf(access.trashed.at), daysLeft: daysLeft(access.trashed.at, t), canRestore: manage && !withSpace };
       if (out.canRestore) {
-        const dest = await destination(identity, { unit, row, access }, false);
-        if (dest) { out.canRestore = dest.ok; if (dest.ok) out.into = dest.space ? { id: dest.space.id, name: dest.space.name, personal: true } : { id: null, name: "Your personal space (created on restore)", personal: true }; }
+        const dest = await destination(identity, { unit, row, access });
+        if (dest) { out.canRestore = dest.ok; if (dest.ok) out.into = dest.space ? { id: dest.space.id, name: dest.space.name, personal: true } : { id: null, name: null, personal: true }; }
       }
       if (withSpace) {
         const [sp, sa] = await Promise.all([registry.space(row.trashedWith), tenancy.effective(identity, { type: "space", id: row.trashedWith })]);

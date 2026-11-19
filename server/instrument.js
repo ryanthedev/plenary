@@ -13,7 +13,7 @@ import { STORE_BUCKETS } from "./metrics/port.js";
  */
 export function instrumentedStore(store, metrics, clock = () => performance.now()) {
   const seconds = metrics.histogram("plenary_store_seconds", "Store call duration by operation, until it settled.", { buckets: STORE_BUCKETS, labelNames: ["op"] });
-  const errors = metrics.counter("plenary_store_errors_total", "Store calls that rejected, by operation.", ["op"]);
+  const errors = metrics.counter("plenary_store_errors_total", "Store calls that rejected, by operation.", ["op"], STORE_METHODS.filter(op => op !== "close").map(op => ({ op })));
   const wrapped = Object.create(store);
   for (const op of STORE_METHODS) {
     if (op === "close" || typeof store[op] !== "function") continue;

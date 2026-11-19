@@ -1450,11 +1450,11 @@ adapter.
 
 Prometheus text-format metrics for operators. Off by default; nothing is recorded while off.
 
-**Access.** `PLENARY_METRICS_TOKEN` (a string of at least 16 bytes; blank, or shorter, refuses the start) turns it on. Every node
+**Access.** `PLENARY_METRICS_TOKEN` (at least 16 characters, only letters, digits and `-._~+/` with optional trailing `=`: an RFC 6750 token, so no whitespace; anything else, blank included, refuses the start) turns it on. Every node
 that has it serves `GET /metrics` on its normal port, on every role (a host-only node too, which otherwise answers only
 `/health`), and it answers only a request that carries `Authorization: Bearer <token>`.
 - Unset: `/metrics` is `404 {"error":"not-found"}` on every node, same as any unknown path, and the node records nothing (the no-op Metrics adapter).
-- Set, no header or a wrong token: `401 {"error":"unauthorized"}` with `WWW-Authenticate: Bearer`. The token is compared in constant time (SHA-256 of both, `timingSafeEqual`). Never logged.
+- Set, no header or a wrong token: `401 {"error":"unauthorized"}` with `WWW-Authenticate: Bearer`. The token is compared in constant time: both sides are hashed with SHA-256 and the 32-byte digests are XOR-folded, so neither length nor content shows in the time. The `Bearer` scheme name is matched case-insensitively (RFC 7235). Never logged.
 - Set, right token, a method other than GET: `405`. GET: `200`, `content-type: text/plain; version=0.0.4; charset=utf-8`, `cache-control: no-store`.
 - A bearer token over plain HTTP is readable by anyone on the path: scrape over a private network or behind TLS, and have the
   public edge refuse `/metrics`. One token per cluster is fine; each node answers for itself, so scrape every node.
@@ -1462,11 +1462,11 @@ that has it serves `GET /metrics` on its normal port, on every role (a host-only
 
 **The Metrics port** (`server/metrics/port.js`; the domain records through it and sees no exposition format):
 ```
-counter(name, help, labelNames?)             -> { inc(n = 1, labels?) }
+counter(name, help, labelNames?, seed?)      -> { inc(n = 1, labels?) }   // seed: label sets that read 0 from the start
 gauge(name, help, read: () => number)        // sampled at scrape time; registering a name again replaces the reader
 histogram(name, help, { buckets?, labelNames? }) -> { observe(value, labels?) }
 ```
-- Every call is non-throwing and never waits: a bad value, an unknown label name or a name that is already another type is dropped (the registration then returns a no-op instrument). Metrics must never take down the hot path.
+- Every call, including a null options argument, is non-throwing and never waits: a bad value, an unknown label name or a name that is already another type is dropped (the registration then returns a no-op instrument). Metrics must never take down the hot path.
 - Registering the same counter or histogram name and type again returns the same instrument (several gateways in one process share it).
 - Labels are bounded: only the declared `labelNames`, values from a fixed set named below, at most 64 series per metric (more are dropped). No per-board, per-user, per-tenant or per-connection label, ever.
 - Adapters: `server/metrics/prometheus.js` (the text format, `render()`), and `noopMetrics` in the port module. `server/main.js` picks one.
@@ -1477,9 +1477,9 @@ histogram(name, help, { buckets?, labelNames? }) -> { observe(value, labels?) }
 |---|---|---|---|---|---|
 | `plenary_connections` | gauge | none | connections | WebSockets open on this gateway now. | gateway nodes |
 | `plenary_boards_hosted` | gauge | none | boards | Rooms this host holds or is building (one sequencer per board, under its lease). | host nodes |
-| `plenary_ops_total` | counter | none | ops | Ops this host sequenced and made durable in the Store. Ops per second = `rate(plenary_ops_total[1m])`. | host nodes |
+| `plenary_ops_total` | counter | none | ops | Ops this host sequenced and the Store made durable (counted when the append settles, even if the lease was lost meanwhile and the op is never acked). Ops per second = `rate(plenary_ops_total[1m])`. | host nodes |
 | `plenary_lease_changes_total` | counter | `event`: `acquired`, `lost`, `released` | leases | Board lease changes on this host: taken, lost (fenced, refused renew or no renew by the host deadline), given back. A rising `lost` is a flapping cluster. | host nodes |
-| `plenary_fanout_lag_seconds` | histogram | none | seconds | From the room sequencing a run of entries (the entry's `at`) to the gateway handing its frame to its viewers' queues, per frame. Spans two nodes' wall clocks, so it includes their skew (negative values are recorded as 0); also long when a gateway repairs a gap from the Store. Buckets 5 ms to 30 s. | gateway nodes |
+| `plenary_fanout_lag_seconds` | histogram | none | seconds | From the room sequencing a run of entries (the entry's `at`) to the gateway handing its frame to its viewers' queues, per frame. Spans two nodes' wall clocks, so it includes their skew (negative values are recorded as 0). Only entries that reach a gateway's feed after its first load count: from the bus, or from a repair of a gap or a silent bus (those show the delay they really suffered). A feed's first load, the catch-up of a joiner, is not observed. Buckets 5 ms to 30 s. | gateway nodes |
 | `plenary_store_seconds` | histogram | `op`: `append`, `read`, `lastSeq`, `putCheckpoint`, `getCheckpoint`, `openEpoch`, `epoch`, `acquire`, `renew`, `release`, `lease` | seconds | How long each Store call took until it settled (success or failure), as every node calls it. Buckets 1 ms to 10 s. | every node with a Store |
 | `plenary_store_errors_total` | counter | `op` as above | calls | Store calls that rejected. | every node with a Store |
 

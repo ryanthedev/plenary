@@ -72,6 +72,18 @@ test("prometheus: never throws or blocks: bad values, unknown labels, type clash
   expect(m.render().split("\n").filter(l => l.startsWith("d_total{")).length).toBe(MAX_SERIES);
 });
 
+test("prometheus: a null or odd options argument never throws; a seeded counter reads 0 from the start", () => {
+  const m = prometheusMetrics();
+  for (const o of [null, undefined, 5, "x", { buckets: null }, { buckets: "x" }, { labelNames: null }, { labelNames: 5 }]) expect(() => { m.histogram("n_seconds" + Math.random().toString(36).slice(2), "x", o).observe(1); }).not.toThrow();
+  expect(() => m.counter("n_total", "x", null, 5).inc()).not.toThrow();
+  expect(() => m.counter("n2_total", "x", ["k"], [null, { k: "a" }, { z: 1 }]).inc(1, { k: "a" })).not.toThrow();
+  const seeded = m.counter("s_total", "x", ["event"], [{ event: "a" }, { event: "b" }]);
+  expect(value(m.render(), 's_total{event="a"}')).toBe(0);
+  expect(value(m.render(), 's_total{event="b"}')).toBe(0);
+  seeded.inc(2, { event: "b" });
+  expect(value(m.render(), 's_total{event="b"}')).toBe(2);
+});
+
 test("prometheus: registering a counter or histogram again returns the same instrument's series; a gauge's reader is replaced", () => {
   const m = prometheusMetrics();
   m.counter("r_total", "x").inc(); m.counter("r_total", "x").inc(2);
@@ -98,7 +110,7 @@ test("route: only the exact bearer token gets the text; everything else is 401 w
   expect(ok.headers.get("content-type")).toBe("text/plain; version=0.0.4; charset=utf-8");
   expect(ok.headers.get("cache-control")).toBe("no-store");
   expect(await ok.text()).toBe("plenary_x 1\n");
-  for (const bad of [undefined, "", "Bearer", "Bearer ", `Bearer ${TOKEN}x`, `Bearer ${TOKEN.slice(0, -1)}`, `bearer ${TOKEN}`, `Basic ${TOKEN}`, TOKEN, "Bearer " + "x".repeat(10_000)]) {
+  for (const bad of [undefined, "", "Bearer", "Bearer ", `Bearer ${TOKEN}x`, `Bearer ${TOKEN.slice(0, -1)}`, `Bearer${TOKEN}`, `Basic ${TOKEN}`, TOKEN, "Bearer " + "x".repeat(10_000)]) {
     const res = await route.handle(req(bad));
     expect([bad, res.status, res.headers.get("www-authenticate")]).toEqual([bad, 401, "Bearer"]);
     expect(await res.text()).not.toContain("plenary_x");
@@ -107,6 +119,7 @@ test("route: only the exact bearer token gets the text; everything else is 401 w
 
 test("route: a right token with another method is 405; a failing render is a 500 without its message", async () => {
   expect((await metricsRoute({ token: TOKEN, render: () => "" }).handle(req(`Bearer ${TOKEN}`, "POST"))).status).toBe(405);
+  for (const scheme of ["bearer", "BEARER"]) expect((await metricsRoute({ token: TOKEN, render: () => "ok" }).handle(req(`${scheme} ${TOKEN}`))).status).toBe(200);   // RFC 7235: the scheme is case-insensitive
   expect((await metricsRoute({ token: TOKEN, render: () => "" }).handle(req("nope", "POST"))).status).toBe(401);   // auth first
   const res = await metricsRoute({ token: TOKEN, render: () => { throw new Error("secret detail"); } }).handle(req(`Bearer ${TOKEN}`));
   expect([res.status, await res.text()]).toEqual([500, '{"error":"internal"}']);
@@ -135,7 +148,8 @@ test("instrumentedStore: times each call on the injected clock, counts rejection
   expect(value(txt, 'plenary_store_seconds_bucket{op="read",le="1"}')).toBe(0);
   expect(value(txt, 'plenary_store_seconds_bucket{op="read",le="2.5"}')).toBe(1);       // a rejected call is still timed
   expect(value(txt, 'plenary_store_errors_total{op="read"}')).toBe(1);
-  expect(txt).not.toContain('plenary_store_errors_total{op="lastSeq"}');
+  expect(value(txt, 'plenary_store_errors_total{op="lastSeq"}')).toBe(0);   // seeded for every port method but close
+  expect(txt).not.toContain('plenary_store_errors_total{op="close"}');
 });
 
 test("instrumentedStore: a synchronous throw is counted and rethrown; close is not timed; the metric names are the port's methods only", async () => {
@@ -167,7 +181,7 @@ test("a live server records connections, boards hosted, ops, lease changes, stor
   expect(value(t, "plenary_boards_hosted")).toBe(1);
   expect(value(t, "plenary_ops_total")).toBe(3);
   expect(value(t, 'plenary_lease_changes_total{event="acquired"}')).toBe(1);
-  expect(t).not.toContain('event="lost"');
+  expect(value(t, 'plenary_lease_changes_total{event="lost"}')).toBe(0);   // seeded: shown from the start
   expect(value(t, 'plenary_store_seconds_count{op="append"}')).toBeGreaterThanOrEqual(1);
   expect(value(t, 'plenary_store_seconds_count{op="acquire"}')).toBe(1);
   expect(value(t, "plenary_fanout_lag_seconds_count")).toBeGreaterThanOrEqual(1);
@@ -196,7 +210,61 @@ test("a lease taken from under a room is counted as lost; a clean stop counts a 
   await r.stop();
   const t = m.render();
   expect(value(t, 'plenary_lease_changes_total{event="lost"}')).toBe(1);   // exactly once, never double-counted
-  expect(t).not.toContain('event="released"');                            // a lost lease is never released
+  expect(value(t, 'plenary_lease_changes_total{event="released"}')).toBe(0);   // a lost lease is never released
+});
+
+test("a build that fails for a non-lease reason releases the lease once; the stop does not release or count it again", async () => {
+  const m = prometheusMetrics();
+  let failed = false, releases = 0;
+  const r = await rig({ server: { metrics: m }, wrapStore: s => Object.assign(Object.create(s), {
+    getCheckpoint: (...a) => { if (!failed) { failed = true; return Promise.reject(new Error("db blip")); } return s.getCheckpoint(...a); },
+    release: (...a) => { releases++; return s.release(...a); } }) });
+  await expect(r.server.rooms.open(r.ids.tenant, r.ids.board)).rejects.toBeDefined();   // the build fails once
+  await until(() => value(m.render(), 'plenary_lease_changes_total{event="released"}') === 1, "the failed build's release");
+  await r.stop();
+  const t = m.render();
+  expect(value(t, 'plenary_lease_changes_total{event="acquired"}')).toBe(1);
+  expect(value(t, 'plenary_lease_changes_total{event="released"}')).toBe(1);
+  expect(releases).toBe(1);
+});
+
+test("an op made durable is counted even when the host deadline passes before the append settles and it is never acked", async () => {
+  const m = prometheusMetrics();
+  let t = 0, jump = false;
+  const r = await rig({ server: { metrics: m }, host: { monotonic: () => t },
+    wrapStore: s => Object.assign(Object.create(s), { append: async (...a) => { const res = await s.append(...a); if (jump) t = 10 * 60_000; return res; } }) });
+  const a = r.client("editor");
+  await a.connect();
+  a.send("board", { elements: [rect("one")] });
+  await settled(r, [a]);
+  expect(value(m.render(), "plenary_ops_total")).toBe(1);
+  jump = true;   // the host's lease clock passes its deadline as the next append lands: durable, but the room stops and nothing is acked
+  a.send("board", { elements: [rect("two")] });
+  await until(() => value(m.render(), 'plenary_lease_changes_total{event="lost"}') === 1, "the deadline loss");
+  expect(value(m.render(), "plenary_ops_total")).toBe(2);
+  await a.drop(); await r.stop();
+});
+
+test("a joiner's catch-up is not fan-out lag: old entries on a feed's first load leave the histogram unchanged", async () => {
+  const m = prometheusMetrics();
+  let clock = Date.now();
+  const r = await rig({ server: { metrics: m, now: () => clock } });
+  const a = r.client("editor");
+  await a.connect();
+  for (let i = 0; i < 3; i++) a.send("board", { elements: [rect("e" + i, i)] });
+  await settled(r, [a]);
+  await a.drop();
+  await until(() => r.server.gateway.stats().boards === 0, "the board's feed to close");
+  const count = () => value(m.render(), "plenary_fanout_lag_seconds_count");
+  const before = count();
+  clock += 3600_000;   // an hour passes; a viewer joins and is caught up on three old entries
+  const v = r.client("viewer");
+  await v.connect();
+  await settled(r, [v]);
+  expect(r.server.gateway.stats().boards).toBe(1);
+  expect(count()).toBe(before);
+  expect(value(m.render(), 'plenary_fanout_lag_seconds_bucket{le="30"}')).toBe(value(m.render(), 'plenary_fanout_lag_seconds_bucket{le="+Inf"}'));
+  await v.drop(); await r.stop();
 });
 
 test("a clean stop releases the lease and counts it", async () => {
@@ -237,7 +305,7 @@ test("main start: PLENARY_METRICS_TOKEN turns /metrics on; unset it is 404; a sh
   const base = { PLENARY_DATA_DIR: dir, PORT: "0", COOKIE_KEY: "k".repeat(40) };
   const off = await start({ ...base, PLENARY_DATA_DIR: tempDir() }, { write() {} });
   try { expect((await get(off.server.url, TOKEN)).status).toBe(404); } finally { await off.stop(); }
-  for (const bad of ["", "short", " ".repeat(8)]) await expect(start({ ...base, PLENARY_METRICS_TOKEN: bad }, { write() {} })).rejects.toThrow(/PLENARY_METRICS_TOKEN must be at least 16 bytes/);
+  for (const bad of ["", "short", " ".repeat(8), " ".repeat(16), " " + TOKEN, TOKEN + " ", TOKEN + "\n", "has space inside-0123456789", "quote\"d-0123456789abcdef"]) await expect(start({ ...base, PLENARY_METRICS_TOKEN: bad }, { write() {} })).rejects.toThrow(/PLENARY_METRICS_TOKEN must be at least 16 characters/);
   const on = await start({ ...base, PLENARY_METRICS_TOKEN: TOKEN }, { write() {} });
   try {
     expect((await get(on.server.url)).status).toBe(401);

@@ -21,7 +21,7 @@
 //                        ones. S3_SESSION_TOKEN (optional) goes to the client. Never logged.
 //   PLENARY_BLOBS        unset, or `local-disk` (see above); anything else refuses the start. Not with S3_ENDPOINT.
 //   PLENARY_BLOB_QUOTA_BYTES   per-tenant picture storage, default 10 GiB (a positive integer, else the start is refused)
-//   PLENARY_METRICS_TOKEN  ≥ 16 bytes; turns on GET /metrics (Bearer token, PROTOCOL.md § Metrics). Unset: 404, nothing recorded. Never logged.
+//   PLENARY_METRICS_TOKEN  ≥ 16 chars of [A-Za-z0-9-._~+/] (+ trailing =); turns on GET /metrics (Bearer token, PROTOCOL.md § Metrics). Unset: 404, nothing recorded. Never logged.
 //   LOG_LEVEL            debug | info | warn | error
 //   PLENARY_MAX_CONNS_PER_USER   open sockets one user may hold (default 64). A load test that shares a few dev
 //                        tokens between thousands of clients must raise it.
@@ -73,7 +73,7 @@ import { createLogger } from "./log.js";
 import { createServer } from "./server.js";
 import { prometheusMetrics } from "./metrics/prometheus.js";
 import { noopMetrics } from "./metrics/port.js";
-import { METRICS_TOKEN_MIN } from "./metrics-http.js";
+import { METRICS_TOKEN_MIN, METRICS_TOKEN_RE } from "./metrics-http.js";
 import { instrumentedStore } from "./instrument.js";
 import { sqliteStore } from "./store/sqlite.js";
 import { postgresStore } from "./store/postgres.js";
@@ -346,7 +346,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
 
   // /metrics is off unless a token is set; a set but short or blank one is a mistake, so it refuses the start (the value is never in the message).
   const metricsToken = env.PLENARY_METRICS_TOKEN;
-  if (metricsToken !== undefined && new TextEncoder().encode(metricsToken).length < METRICS_TOKEN_MIN) throw new Error(`PLENARY_METRICS_TOKEN must be at least ${METRICS_TOKEN_MIN} bytes (unset it to keep /metrics off)`);
+  if (metricsToken !== undefined && (metricsToken.length < METRICS_TOKEN_MIN || !METRICS_TOKEN_RE.test(metricsToken))) throw new Error(`PLENARY_METRICS_TOKEN must be at least ${METRICS_TOKEN_MIN} characters of letters, digits and -._~+/ (an RFC 6750 token, no spaces; unset it to keep /metrics off)`);
   const prom = metricsToken !== undefined ? prometheusMetrics() : null;
   const metrics = prom ?? noopMetrics;
 

@@ -16,6 +16,8 @@ async function sameSecret(a, b) {
 
 /** The shortest token the start accepts, in bytes (main.js checks it with this). */
 export const METRICS_TOKEN_MIN = 16;
+/** RFC 6750 token68 (letters, digits, -._~+/ and trailing =): what a bearer header carries unambiguously; no whitespace anywhere. */
+export const METRICS_TOKEN_RE = /^[A-Za-z0-9\-._~+/]+=*$/;
 
 /**
  * @param {{ token?: string | null, render?: () => string, log?: object } | null} [o]  no token (or no render) = disabled
@@ -26,7 +28,7 @@ export function metricsRoute(o) {
   if (!token || typeof render !== "function") return { async handle() { return json(404, { error: "not-found" }); } };
   return {
     async handle(req) {
-      const m = /^Bearer (.+)$/.exec(req.headers.get("authorization") ?? "");
+      const m = /^Bearer (.+)$/i.exec(req.headers.get("authorization") ?? "");
       if (!m || !(await sameSecret(m[1], token))) return json(401, { error: "unauthorized" }, { "www-authenticate": "Bearer" });
       if (req.method !== "GET") return json(405, { error: "method-not-allowed" }, { allow: "GET" });
       try { return text(200, render(), { "content-type": "text/plain; version=0.0.4; charset=utf-8" }); }

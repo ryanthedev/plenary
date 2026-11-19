@@ -46,9 +46,13 @@ export function prometheusMetrics() {
   };
 
   return {
-    counter(name, help, labelNames) {
-      const f = family("counter", name, help, labelNames);
-      if (!f) return noopMetrics.counter();
+    counter(name, help, labelNames, seed) {
+      let f;
+      try {
+        f = family("counter", name, help, labelNames);
+        if (!f) return noopMetrics.counter();
+        if (Array.isArray(seed)) for (const labels of seed) seriesOf(f, labels, () => ({ v: 0 }));   // fixed label values read 0 from the start
+      } catch { return noopMetrics.counter(); }
       if (!f.labelNames.length && !f.series.size) f.series.set("", { v: 0 });   // an unlabelled counter reads 0 from the start
       return { inc(n = 1, labels) {
         try { if (!(n >= 0) || !Number.isFinite(n)) return; const s = seriesOf(f, labels, () => ({ v: 0 })); if (s) s.v += n; } catch { /* never into the hot path */ }
@@ -61,11 +65,15 @@ export function prometheusMetrics() {
         if (f) f.read = read;
       } catch { /* dropped */ }
     },
-    histogram(name, help, { buckets = DEFAULT_BUCKETS, labelNames } = {}) {
-      const bs = Array.isArray(buckets) ? [...buckets].filter(Number.isFinite).sort((a, b) => a - b) : DEFAULT_BUCKETS;
-      const f = family("histogram", name, help, labelNames, { buckets: bs });
-      if (!f) return noopMetrics.histogram();
-      if (!f.labelNames.length && !f.series.size) f.series.set("", { counts: new Array(f.buckets.length).fill(0), sum: 0, count: 0 });
+    histogram(name, help, o) {
+      let f;
+      try {
+        const { buckets = DEFAULT_BUCKETS, labelNames } = o ?? {};
+        const bs = Array.isArray(buckets) ? [...buckets].filter(Number.isFinite).sort((a, b) => a - b) : DEFAULT_BUCKETS;
+        f = family("histogram", name, help, labelNames, { buckets: bs });
+        if (!f) return noopMetrics.histogram();
+        if (!f.labelNames.length && !f.series.size) f.series.set("", { counts: new Array(f.buckets.length).fill(0), sum: 0, count: 0 });
+      } catch { return noopMetrics.histogram(); }
       return { observe(value, labels) {
         try {
           if (!Number.isFinite(value)) return;

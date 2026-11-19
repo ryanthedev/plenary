@@ -122,7 +122,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   // PROTOCOL.md § Metrics. `metrics` records only; a failure inside it never reaches this code (the port never throws).
   metrics.gauge("plenary_boards_hosted", "Rooms this host holds or is building.", () => slots.size);
   const opsTotal = metrics.counter("plenary_ops_total", "Ops this host sequenced and made durable.");
-  const leaseChanges = metrics.counter("plenary_lease_changes_total", "Board lease changes on this host, by event (acquired, lost, released).", ["event"]);
+  const leaseChanges = metrics.counter("plenary_lease_changes_total", "Board lease changes on this host, by event (acquired, lost, released).", ["event"], ["acquired", "lost", "released"].map(event => ({ event })));
   /** key → an acquire (and the build it starts) under way, shared by concurrent opens and a takeover attempt */
   const claims = new Map();
   /** key → the latest slot whose lease this host acquired (close() releases them) */
@@ -179,11 +179,12 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
         // close() settles it before release (L4). The timed promise: a hung append settles at the timeout, so close() never waits forever.
         slot.writes.add(w); w.finally(() => slot.writes.delete(w)).catch(() => {});
         return w.then(() => {
+          opsTotal.inc(entries.length);   // counted once the Store has them, before any early return below
           // Durable, but past the host deadline nothing is acked or broadcast from here (HIGH-1): the room stops, the
           // entries stay unacked, and the client's resend is deduplicated by the next holder.
           if (slot.leaseLost) return;
           if (expired(slot)) return lost(slot, "the host deadline passed before an append's result");
-          slot.durable = entries[entries.length - 1].seq; opsTotal.inc(entries.length); publishEntries(slot, entries);
+          slot.durable = entries[entries.length - 1].seq; publishEntries(slot, entries);
         }, err => { fenced("append", err); throw err; });
       },
       putCheckpoint(cp) {
@@ -331,7 +332,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       // Then a host already watching the board is told (as after a clean stop), so it need not wait for its next poll.
       // `releaseP` never rejects: close() waits for it, then announces only if this did not (a failed release leaves the announcing to close()).
       if (!slot.leaseLost) slot.releaseP = withTimeout(Promise.resolve().then(() => store.release(tenant, board, me, slot.epoch)), storeTimeoutMs)   // a release that never answers: the lease lapses by its ttl
-        .then(() => { slot.announced = true; leaseChanges.inc(1, { event: "released" }); bus.publish(subjects.entries(tenant, board), { seq: 0, epoch: slot.epoch, cp: 0, released: true })?.catch?.(() => {}); })
+        .then(() => { slot.announced = true; slot.released = true; leaseChanges.inc(1, { event: "released" }); bus.publish(subjects.entries(tenant, board), { seq: 0, epoch: slot.epoch, cp: 0, released: true })?.catch?.(() => {}); })
         .catch(e => log.warn("lease release after a failed build failed", { tenant, board, err: e }));
       throw err;
     });
@@ -640,7 +641,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       for (const slot of held.values()) {
         stopLease(slot);
         await slot.releaseP;
-        if (slot.leaseLost) continue;
+        if (slot.leaseLost || slot.released) continue;   // released (and counted) already after a failed build
         try {
           await withTimeout(Promise.resolve().then(() => store.release(slot.tenant, slot.board, me, slot.epoch)), storeTimeoutMs);   // never answers: the lease lapses by its ttl (logged below)
           leaseChanges.inc(1, { event: "released" });

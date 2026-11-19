@@ -57,6 +57,8 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
   }
 
   /** New entries (parsed, with their text), applied if they continue the feed. Returns how many were applied. */
+  /** False until the first load is done: what a joiner is caught up on is old by nature, not fan-out lag (PROTOCOL.md § Metrics). */
+  let live = false;
   function apply(list) {
     const fresh = [];
     for (const x of list) {
@@ -65,7 +67,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
       if (x.seq !== self.seq + 1) break;      // a gap: the caller repairs from the Store
       self.tail.push(x); self.seq = x.seq; self.tailBytes += x.text.length; fresh.push(x);
     }
-    if (fresh.length) onLive({ from: fresh[0].seq, to: fresh[fresh.length - 1].seq, at: fresh[0].at, data: frameOf(fresh) });   // at: when the room sequenced the first one (fan-out lag, PROTOCOL.md § Metrics)
+    if (fresh.length) onLive({ from: fresh[0].seq, to: fresh[fresh.length - 1].seq, at: live ? fresh[0].at : undefined, data: frameOf(fresh) });   // at: when the room sequenced the first one (fan-out lag, PROTOCOL.md § Metrics)
     return fresh.length;
   }
   const fromStore = e => {
@@ -192,6 +194,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
     self.epoch = Math.max(self.epoch, await store.epoch(tenant, board));
     self.base = await validBase(); self.seq = self.base.seq;
     await repair();
+    live = true;
   });
 
   /** The tail as bounded `entries` frames, built once per (base, tail) and shared: only the open last one is rebuilt. */

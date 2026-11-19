@@ -1,6 +1,6 @@
 // The Metrics port (PROTOCOL.md § Metrics): how the domain records what an operator watches. Core code imports this
 // and never an adapter; the adapter (prometheus.js) owns the exposition format. THE contract:
-//   counter(name, help, labelNames?)                  -> { inc(n = 1, labels?) }
+//   counter(name, help, labelNames?, seed?)           -> { inc(n = 1, labels?) }   seed: label sets to show as 0 from the start
 //   gauge(name, help, read)                           read: () => number, sampled when the adapter is scraped
 //   histogram(name, help, { buckets?, labelNames? })  -> { observe(value, labels?) }
 // Every call is non-throwing and never waits (a metric must not take down the hot path). Labels: only the declared
@@ -8,7 +8,7 @@
 
 /** @typedef {{ inc(n?: number, labels?: Record<string, string>): void }} Counter */
 /** @typedef {{ observe(value: number, labels?: Record<string, string>): void }} Histogram */
-/** @typedef {{ counter(name: string, help: string, labelNames?: string[]): Counter,
+/** @typedef {{ counter(name: string, help: string, labelNames?: string[], seed?: Record<string, string>[]): Counter,
  *   gauge(name: string, help: string, read: () => number): void,
  *   histogram(name: string, help: string, o?: { buckets?: number[], labelNames?: string[] }): Histogram }} Metrics */
 

@@ -3,7 +3,7 @@
 import { test, expect } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { detectRuntime, skipDecision, alive, ownerString, parseOwner, ownerDead, sweep, run, TIMEOUT_CODE } from "../../scripts/test-compose.js";
+import { detectRuntime, skipDecision, alive, sameStart, machineId, ownerString, parseOwner, ownerDead, sweep, run, TIMEOUT_CODE } from "../../scripts/test-compose.js";
 
 const ROOT = join(import.meta.dir, "../..");
 const ok = (out = "") => ({ code: 0, out });
@@ -69,9 +69,25 @@ test("ownerDead: only this host's provably dead owners; never self, a live pid, 
   expect(ownerDead(parseOwner(own(7)), own(1), { ...HOST, isAlive: () => true, startOf: () => "S2" })).toBe(true);    // pid reused by another process
   expect(ownerDead(parseOwner(own(7)), own(1), { ...HOST, isAlive: () => true, startOf: () => null })).toBe(false);   // start unknown: doubt
   expect(ownerDead(parseOwner(own(7, "S1", "other")), own(1), dead(7))).toBe(false);                           // another host
-  expect(ownerDead(parseOwner(own(7, "S1", "h", "oldboot")), own(1), { ...HOST, isAlive: () => true, startOf: () => "S1" })).toBe(true);   // rebooted since
+  // A different boot id alone proves nothing (a clock step moves it while the run lives): only the pid and its start time decide.
+  expect(ownerDead(parseOwner(own(7, "S1", "h", "oldboot")), own(1), { ...HOST, isAlive: () => true, startOf: () => "S1" })).toBe(false);
+  expect(ownerDead(parseOwner(own(7, "S1", "h", "oldboot")), own(1), { ...HOST, isAlive: () => false, startOf: () => "S1" })).toBe(true);
+  expect(ownerDead(parseOwner(own(7, "S1", "h", "oldboot")), own(1), { ...HOST, isAlive: () => true, startOf: () => "S2" })).toBe(true);
+  // macOS start times are epoch seconds with a few seconds' tolerance: a small shift is the same process, a large one is not.
+  expect(ownerDead(parseOwner(own(7, "epoch:1000")), own(1), { ...HOST, isAlive: () => true, startOf: () => "epoch:1003" })).toBe(false);
+  expect(ownerDead(parseOwner(own(7, "epoch:1000")), own(1), { ...HOST, isAlive: () => true, startOf: () => "epoch:1010" })).toBe(true);
   expect(ownerDead(parseOwner(own(7)), own(7), dead(7))).toBe(false);                                           // itself
   expect(ownerDead(parseOwner(own(7, "S0")), own(7, "S1"), { ...HOST, isAlive: () => true, startOf: () => "S1" })).toBe(true);   // same pid, older start: a reused pid's leftover
+});
+
+test("sameStart: epoch times within 5 s match, anything else must be equal; the machine id is stable and not the hostname's job", () => {
+  expect(sameStart("epoch:100", "epoch:105")).toBe(true);
+  expect(sameStart("epoch:100", "epoch:106")).toBe(false);
+  expect(sameStart("linux:b:123", "linux:b:123")).toBe(true);
+  expect(sameStart("linux:b:123", "linux:b:124")).toBe(false);
+  expect(sameStart("S1", "epoch:1")).toBe(false);
+  expect(machineId()).toMatch(/^[A-Za-z0-9._-]+$/);
+  expect(machineId()).toBe(machineId());
 });
 
 /** A fake container CLI over a table of labelled objects, recording every removal. */

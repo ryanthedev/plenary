@@ -296,7 +296,7 @@ whose `compose.yml` is unchanged.
 | `blobs` | `pgsty/minio:RELEASE.2026-08-04T00-00-00Z` | S3-compatible blobs. MinIO stopped publishing `minio/minio` on Docker Hub; this is a community-maintained MinIO fork. |
 | `blobs-init` | same | One shot: creates the bucket (`S3_BUCKET`, default `plenary`), then exits. |
 | `app-1`, `app-2`, `app-3` | built from `Dockerfile` | `server/main.js`, each with roles `gateway,host` (set explicitly), so any node can take over a killed host's boards. No published ports. |
-| `lb` | `caddy:2.11.9-alpine` | Routes `/ws` (WebSocket) and `/health` to the three nodes, round robin with health checks; everything else is 404. The only published port: `127.0.0.1:8090` (`PLENARY_LB_PORT`). |
+| `lb` | `caddy:2.11.9-alpine` | Proxies every path (`/ws`, `/health`, the HTTP API, the web app) to the three nodes, round robin with health checks. The only published port: `127.0.0.1:8090` (`PLENARY_LB_PORT`). |
 
 **Roles.** `PLENARY_ROLES` is a comma list of `gateway` (holds client sockets, fans out) and `host` (sequences
 boards), default `gateway,host`. All three nodes hold both roles, so a killed host's boards have two other hosts to move to
@@ -368,14 +368,17 @@ Takes about 40 s warm.
   1. two editors on two gateways write 60 ops to one board: the Postgres log has seq 1..60, no gap, no duplicate id; a viewer
      on the third node (welcome role `viewer`, asserted) holds all 60; an op the viewer sends is refused `forbidden` and
      appends nothing;
-  2. four failure cases, each while both editors stream 30 ops/s, each ending with the invariants below:
+  2. five failure cases, each while both editors stream 30 ops/s, each ending with the invariants below:
      a. SIGKILL the board's host (it has clients); a survivor takes the lease at a higher epoch (about 3 s); the node is
         restarted afterwards and serves a new client;
      b. SIGKILL the new host and start it again at once (`restart: unless-stopped` racing the takeover): the lease epoch
         only rises and no epoch has two holders;
+     b2. SIGKILL all three nodes, start only the old host: nobody else can take the lease, so the restarted node wins it
+        back (deterministic; the whole cluster restarting on the Postgres state); then the other two are started;
      c. SIGKILL the host with no client on it (clients moved off first);
      d. SIGKILL a non-host gateway with clients: no takeover, the lease epoch and holder do not change.
-  3. invariants: the log read right after the takeover (before any resend) holds every op acked before the kill; at the
+  3. the lease is polled every 50 ms through each case: epochs only rise and no epoch has two holders;
+  4. invariants: the log read right after the takeover (before any resend) holds every op acked before the kill; at the
      end the log has no gap or duplicate, every ack ever seen is in it at its acked seq, and every client's full state
      (canonical JSON of its elements, sorted by id) equals the state folded from the log. Ops never acked and not in the
      log are counted (`neverAckedLost`; the Replica resends pending ops, so 0 is normal).
@@ -384,9 +387,10 @@ Takes about 40 s warm.
   `down -v --remove-orphans`, `rmi` of the image it built, then a check that no container, volume or network labelled with
   the project and no image tag remains; leftovers fail the run.
 - **Leftovers of a SIGKILLed run:** every container, network, volume and image carries the label
-  `plenary.c3.owner=host|boot|pid|process-start`. Every run (and `bun scripts/test-compose.js --sweep`) first removes what
-  carries that label from this host when its owner is provably dead: pid gone, or the pid now has another process start time
-  (a reused pid, image included), or the host rebooted. It never touches another host's, a live owner's, or anything on doubt.
+  `plenary.c3.owner=machine-id|boot|pid|process-start` (machine id: macOS IOPlatformUUID, Linux /etc/machine-id; so a renamed host keeps its leftovers sweepable). Every run (and `bun scripts/test-compose.js --sweep`) first removes what
+  carries that label from this machine when its owner is provably dead: pid gone, or the pid now has another process start time
+  (a reused pid, image included; Linux: boot id + /proc/<pid>/stat field 22; macOS: `ps lstart` within 5 s). A boot id or clock
+  change alone is never proof. It never touches another machine's, a live owner's, or anything on doubt.
 - **On failure** it prints the last container log lines before teardown. `--keep-image` keeps the built image.
 - **CI (not set up):** a job on a runner with docker would run `PLENARY_COMPOSE_REQUIRE=1 bun run test:compose`; GitHub's
   runners have docker and compose, and the first run pulls four images.

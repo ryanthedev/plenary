@@ -8,10 +8,11 @@
 //   1. sequencing: two editors on two gateways write one board; the Postgres log has no gap and no duplicate;
 //   2. fan-out: a viewer on the third node (role viewer, asserted) holds every op, and an op it sends is refused
 //      (`forbidden`) and appends nothing;
-//   3. four failure cases, each streaming ops from both editors while a node dies by SIGKILL:
+//   3. five failure cases, each streaming ops from both editors while a node dies by SIGKILL:
 //        a. the board's host, which has clients, restarted after a survivor took over (rejoin);
 //        b. the board's host again, restarted AT ONCE (the cluster file's `restart: unless-stopped` racing a takeover):
 //           the lease epoch only rises and no epoch ever has two holders;
+//        b2. all three nodes SIGKILLed, only the old host started: it wins the lease back (deterministic) on the Postgres state;
 //        c. the board's host with no client on it (clients moved off first);
 //        d. a non-host gateway with clients: no takeover, the lease epoch stays.
 //      Every case checks: a live lease at a higher epoch (a, b, c), every op acked before the kill is in the log read
@@ -27,9 +28,9 @@
 // Exit codes: 0 pass, 1 fail, 124 the run deadline or a command timed out, 130 interrupted by a signal.
 // Cleanup runs on every exit path (pass, fail, timeout, SIGINT/SIGTERM/SIGHUP): `down -v --remove-orphans`, then the
 // image is removed, then it checks that nothing labelled with the project, and no image, remains. Everything the run makes
-// carries the label plenary.c3.owner = host|boot|pid|process start. A run that was SIGKILLed cannot clean itself: the next
+// carries the label plenary.c3.owner = machine id|boot|pid|process start. A run that was SIGKILLed cannot clean itself: the next
 // run (or `--sweep`) removes what carries an owner label from THIS host whose owner is provably dead (pid gone, or the pid
-// now belongs to a process with another start time, or the host rebooted); it never touches anything on doubt.
+// now belongs to a process with another start time; a boot id change alone is no proof); it never touches anything on doubt.
 // Usage: bun scripts/test-compose.js [--require] [--sweep] [--keep-image]
 import { setPriority, hostname } from "node:os";
 import { existsSync, readFileSync } from "node:fs";
@@ -120,12 +121,31 @@ export function skipDecision(reason, requireRun) {
 
 const enc = s => String(s).trim().replace(/[^A-Za-z0-9._-]+/g, "_");
 export const alive = (pid, kill = process.kill.bind(process)) => { try { kill(pid, 0); return true; } catch (e) { return e?.code === "EPERM"; } };   // EPERM: it exists, it is someone else's
-/** A process's start time as ps prints it (null when unknown: never treated as "another process"). */
+/**
+ * A process's start time, comparable across calls (null when unknown: never treated as "another process"). Linux: the boot id
+ * plus /proc/<pid>/stat field 22 (clock ticks since boot), exact. Elsewhere: `ps -o lstart` as epoch seconds, compared with
+ * a few seconds' tolerance (`sameStart`), because a wall-clock step moves what ps derives from the boot time.
+ */
 export function processStart(pid) {
+  try {
+    if (process.platform === "linux") {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const ticks = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];   // field 22; the fields after the ")" of the command name start at field 3
+      return ticks ? `linux:${bootId()}:${ticks}` : null;
+    }
+  } catch { return null; }
   const r = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], { env: { PATH: process.env.PATH ?? "/bin:/usr/bin", LC_ALL: "C" }, stdout: "pipe", stderr: "ignore" });
   const s = r.exitCode === 0 ? new TextDecoder().decode(r.stdout).trim() : "";
-  return s ? enc(s) : null;
+  const t = s ? Date.parse(s) : NaN;
+  return Number.isFinite(t) ? `epoch:${Math.floor(t / 1000)}` : s ? enc(s) : null;
 }
+const START_TOLERANCE_S = 5;
+/** Two start times of one process: equal, or (epoch form) within START_TOLERANCE_S seconds. */
+export function sameStart(a, b) {
+  const x = /^epoch:(\d+)$/.exec(a ?? ""), y = /^epoch:(\d+)$/.exec(b ?? "");
+  return x && y ? Math.abs(Number(x[1]) - Number(y[1])) <= START_TOLERANCE_S : a === b;
+}
+/** The boot id: informational in the label (a boot change alone proves nothing); on Linux part of every start time. */
 export function bootId() {
   try {
     if (process.platform === "linux") return enc(readFileSync("/proc/sys/kernel/random/boot_id", "utf8"));
@@ -133,22 +153,34 @@ export function bootId() {
     return r.exitCode === 0 ? enc(new TextDecoder().decode(r.stdout)) : "unknown";
   } catch { return "unknown"; }
 }
-export const ownerString = (pid, { host = enc(hostname()), boot = bootId(), start = processStart(pid) ?? "unknown" } = {}) => `${host}|${boot}|${pid}|${start}`;
+/** A machine id that survives a hostname change: macOS IOPlatformUUID, Linux /etc/machine-id, else the hostname. */
+export function machineId() {
+  try {
+    if (process.platform === "linux") return enc(readFileSync("/etc/machine-id", "utf8"));
+    if (process.platform === "darwin") {
+      const r = Bun.spawnSync(["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"], { stdout: "pipe", stderr: "ignore" });
+      const m = /"IOPlatformUUID" = "([^"]+)"/.exec(new TextDecoder().decode(r.stdout));
+      if (m) return enc(m[1]);
+    }
+  } catch { /* fall through */ }
+  return enc(hostname());
+}
+export const ownerString = (pid, { host = machineId(), boot = bootId(), start = processStart(pid) ?? "unknown" } = {}) => `${host}|${boot}|${pid}|${start}`;
 export function parseOwner(s) {
   const m = /^([^|]+)\|([^|]+)\|(\d+)\|([^|]+)$/.exec(s ?? "");
   return m ? { host: m[1], boot: m[2], pid: Number(m[3]), start: m[4] } : null;
 }
 /**
- * True only when `owner` is from this host and provably gone: not `self`, and (the host rebooted since, or its pid is dead, or
- * the pid now runs a process with another start time). On any doubt (another host, unknown start) false.
+ * True only when `owner` is from this machine and provably gone: not `self`, and its pid is dead or now runs a process with
+ * another start time. A boot id that differs proves nothing alone (a clock step shifts it while the run lives). Doubt
+ * (another machine, an unknown start time) is false.
  */
-export function ownerDead(owner, self, { host, boot, isAlive = alive, startOf = processStart }) {
+export function ownerDead(owner, self, { host, isAlive = alive, startOf = processStart }) {
   if (!owner || owner.host !== host) return false;
   if (self && ownerString(owner.pid, owner) === self) return false;
-  if (owner.boot !== boot) return true;
   if (!isAlive(owner.pid)) return true;
   const now = startOf(owner.pid);
-  return now !== null && now !== owner.start;
+  return now !== null && !sameStart(now, owner.start);
 }
 
 const GET = k => `{{index .${k} "${OWNER_LABEL}"}}`;
@@ -166,7 +198,7 @@ const KINDS = [   // removal order: containers first, then what they used
  * @returns {Promise<string[]>} what it removed, or could not remove
  */
 export async function sweep(cli, self, deps = {}, isAborted = () => false) {
-  const d = { host: enc(hostname()), boot: bootId(), isAlive: alive, startOf: processStart, ...deps };
+  const d = { host: machineId(), isAlive: alive, startOf: processStart, ...deps };
   const byOwner = new Map();
   for (const k of KINDS) {
     const listed = await cli([...k.list, "--filter", `label=${OWNER_LABEL}`]);
@@ -279,9 +311,24 @@ class Stack {
   /** Teardown, shielded from a terminal Ctrl-C and the abort signal. Returns what is still left (empty = clean). */
   async teardown(keepImage = false) {
     const opts = { detached: true, timeoutMs: 180_000 };
-    if (this.started || (await this.leftovers()).length) await this.compose(["down", "-v", "--remove-orphans", "-t", "3"], opts);
+    let left = [], why = "";
+    if (this.started || (await this.leftovers()).length) {
+      for (let attempt = 1; attempt <= 3; attempt++) {   // `down` can stop partway when something was mid-change: run it again until nothing is left
+        const r = await this.compose(["down", "-v", "--remove-orphans", "-t", "3"], opts);
+        why = `exit ${r.code}${r.timedOut ? " (timed out)" : ""}: ${(r.err || r.out).slice(-300)}`;
+        if (!(left = await this.leftovers()).length) break;
+      }
+    }
+    if (left.length) {   // last resort: remove what carries the project label directly
+      const label = `label=com.docker.compose.project=${this.project}`;
+      for (const [list, rm] of [[["ps", "-a", "-q"], ["rm", "-f", "-v"]], [["network", "ls", "-q"], ["network", "rm"]], [["volume", "ls", "-q"], ["volume", "rm", "-f"]]]) {
+        const ids = (await this.cli([...list, "--filter", label], opts)).out.split("\n").filter(Boolean);
+        if (ids.length) await this.cli([...rm, ...ids], opts);
+      }
+    }
     if (this.built && !keepImage) await this.cli(["rmi", "-f", this.image], opts);
-    return this.leftovers();
+    left = await this.leftovers();
+    return left.length && why ? [...left, `(last down said: ${why})`] : left;
   }
 }
 
@@ -318,7 +365,6 @@ async function scenario(stack, report) {
     const readLog = async () => { const log = []; for (;;) { const page = await pg.read(board.tenant, board.id, log.length + 1, 1000); if (!page.length) break; log.push(...page); } return log; };
     const lastSeq = () => pg.lastSeq(board.tenant, board.id);
     const nodeOf = holder => NODES.find(n => holder?.startsWith(n));
-    const liveNodes = () => NODES.filter(n => nodes[n].alive);
 
     // A client prefers its home node and falls back to the next live one; `client()` reads wsUrl at every (re)connect.
     const mk = (name, home) => {
@@ -332,7 +378,13 @@ async function scenario(stack, report) {
     };
     // Keeps every client connected: one whose socket is gone and is not already reconnecting tries again.
     keepAlive = setInterval(() => {
-      for (const c of clients) if (!c.open && !c.busy && Date.now() - c.lastTry > 300) { c.lastTry = Date.now(); c.reconnect().catch(() => {}); }
+      for (const c of clients) {
+        if (c.open) continue;
+        const idle = Date.now() - c.lastTry;
+        // A connect that never settles (a socket that closed before it opened raises no error) is abandoned after 15 s.
+        if (c.busy && idle > 15_000) { c.connecting = null; c.reconnecting = null; }
+        if (!c.busy && idle > 300) { c.lastTry = Date.now(); c.reconnect().catch(() => {}); }
+      }
     }, 100);
     const ed1 = mk("ed1", "app-1"), ed2 = mk("ed2", "app-2"), view = mk("view", "app-3");
     for (const c of [ed1, ed2, view]) c.connect().catch(() => {});
@@ -402,8 +454,12 @@ async function scenario(stack, report) {
     /**
      * Stream ops from both editors, SIGKILL `victim`, and check what the case promises. `takeover`: the victim is the host, so
      * a live lease at a higher epoch must follow. `restartMode`: "after" the takeover, or "now" (right after the kill).
+     * `killAll` (with "now"): all three nodes are SIGKILLed, then only the victim is started: nobody else can take the lease, so
+     * the restarted node wins it deterministically (the whole cluster restarting on the Postgres state); the others are
+     * started once it holds the lease.
+     * A poller records every holder/epoch the lease shows (every 50 ms) for the whole case.
      */
-    const killCase = async ({ label, victim, takeover, restartMode }) => {
+    const killCase = async ({ label, victim, takeover, restartMode, killAll = false }) => {
       const L0 = await lease();
       const host0 = nodeOf(L0.holder);
       if (takeover && host0 !== victim) fail(`${label}: wanted to kill the host ${victim} but ${host0} holds the lease`);
@@ -412,6 +468,10 @@ async function scenario(stack, report) {
       say(`${label}: host ${host0} (epoch ${L0.epoch}); killing ${victim}, which has clients [${withClients.join(", ")}]`);
       startGen();
       let e1 = null;
+      const seen = [];
+      let polling = false;
+      const watch = async () => { const l = await lease(); if (l) { const last = seen.at(-1); if (!last || last.epoch !== l.epoch || last.holder !== l.holder) seen.push({ epoch: l.epoch, holder: l.holder }); } return l; };
+      const poller = setInterval(async () => { if (polling) return; polling = true; try { await watch(); } catch { /* the waits judge a dead database */ } finally { polling = false; } }, 50);
       try {
         const a0 = (harvest(), acked.size);
         await waitFor("20 more acks while streaming", () => (harvest(), acked.size >= a0 + 20), 30_000, 50);
@@ -419,17 +479,16 @@ async function scenario(stack, report) {
         harvest();
         const ackedBeforeKill = new Map(acked);
         const inflightBeforeKill = [ed1, ed2].reduce((a, c) => a + c.r.pending.size, 0);
-        must(await stack.compose(["kill", "-s", "SIGKILL", victim]), `kill ${victim}`);
+        must(await stack.compose(["kill", "-s", "SIGKILL", ...(killAll ? NODES : [victim])]), `kill ${killAll ? "every node" : victim}`);
+        if (killAll) { stopGen(); for (const n of NODES) nodes[n].alive = false; }   // the outage lasts until the restarted node is up: ops made meanwhile would only pile up in the clients
         const killedAt = Date.now();
         nodes[victim].alive = false;
         const inflightAtKill = [ed1, ed2].reduce((a, c) => a + c.r.pending.size, 0);   // sampled as the kill returns
         if (restartMode === "now") must(await stack.compose(["start", victim]), `start ${victim} at once`);   // `restart: unless-stopped` racing the takeover
-        // The lease's history while the case plays out: one holder per epoch, epochs never fall.
-        const seen = [];
-        const watch = async () => { const l = await lease(); if (l) { const last = seen.at(-1); if (!last || last.epoch !== l.epoch || last.holder !== l.holder) seen.push({ epoch: l.epoch, holder: l.holder }); } return l; };
         let takeoverMs = null;
         if (takeover) {
-          e1 = await waitFor("the board's lease to be live at a higher epoch", async () => { const l = await watch(); return l?.live && l.epoch > L0.epoch && (restartMode === "now" || nodeOf(l.holder) !== victim) ? l : null; }, 60_000, 100);
+          if (killAll) { nodes[victim].port = await stack.healthy(victim); nodes[victim].alive = true; }   // clients reconnect to it: a board is hosted once someone asks
+          e1 = await waitFor("the board's lease to be live at a higher epoch", async () => { const l = await watch(); return l?.live && l.epoch > L0.epoch && (killAll ? nodeOf(l.holder) === victim : restartMode === "now" || nodeOf(l.holder) !== victim) ? l : null; }, 90_000, 50);
           takeoverMs = Date.now() - killedAt;
           say(`${label}: ${nodeOf(e1.holder)} holds the lease at epoch ${e1.epoch}, ${takeoverMs} ms after the kill`);
           // Everything acked before the kill is durable already: it is in the log now, before any client resends anything.
@@ -437,15 +496,16 @@ async function scenario(stack, report) {
           const gone = [...ackedBeforeKill].filter(([id, seq]) => atTakeover.get(id) !== seq);
           if (gone.length) fail(`${label}: ops acked before the kill are missing from the log read at the takeover: ${JSON.stringify(gone.slice(0, 5))} (${gone.length} of ${ackedBeforeKill.size})`);
         }
-        const target = made_.size + 10;
-        await waitFor("10 more ops made after the failure", () => made_.size >= target, 20_000, 50);
+        if (killAll) { for (const n of NODES.filter(x => x !== victim)) await restart(n); emit(ed1, 5); emit(ed2, 5); }
+        else { const target = made_.size + 10; await waitFor("10 more ops made after the failure", () => made_.size >= target, 20_000, 50); }
         stopGen();
-        if (restartMode === "now") { nodes[victim].port = await stack.healthy(victim); nodes[victim].alive = true; }
+        if (restartMode === "now") { if (!nodes[victim].alive) { nodes[victim].port = await stack.healthy(victim); nodes[victim].alive = true; } }
         else await restart(victim);
         const all = clients.slice();
         const seq = await settled(all, `${label}: every client connected, nothing pending, all applied to the log's end`, 90_000);
         const log = await verify(label, all);
         const l2 = await watch();
+        clearInterval(poller);
         const holders = new Map();
         for (const s of seen) { if (holders.has(s.epoch) && holders.get(s.epoch) !== s.holder) fail(`${label}: epoch ${s.epoch} had two holders: ${holders.get(s.epoch)} and ${s.holder}`); holders.set(s.epoch, s.holder); }
         if (seen.some((s, i) => i && s.epoch < seen[i - 1].epoch)) fail(`${label}: the lease epoch fell: ${JSON.stringify(seen)}`);
@@ -454,7 +514,7 @@ async function scenario(stack, report) {
           ackedBeforeKill: ackedBeforeKill.size, inflightBeforeKill, inflightAtKill, opsMade: made_.size, acked: acked.size, inLog: log.length, neverAckedLost: [...made_.keys()].filter(id => !log.some(e => e.id === id)).length, finalSeq: seq };
         report.cases.push(c);
         say(`${label} ok: ${made_.size} ops made, ${acked.size} acked (${ackedBeforeKill.size} before the kill; in flight ${inflightBeforeKill} just before, ${inflightAtKill} as the kill returned), ${log.length} in the log, 0 acked lost, ${c.neverAckedLost} never-acked lost, lease ${host0}@${L0.epoch} -> ${nodeOf(l2.holder)}@${l2.epoch}; all clients equal the log`);
-      } finally { stopGen(); }
+      } finally { stopGen(); clearInterval(poller); }
     };
 
     const hostNow = async () => { const l = await waitFor("a live lease", async () => { const x = await lease(); return x?.live ? x : null; }, 30_000, 100); return nodeOf(l.holder); };
@@ -472,6 +532,9 @@ async function scenario(stack, report) {
 
     // b. the host again, restarted at once.
     await killCase({ label: "case b (host, restarted at once: restart racing takeover)", victim: await hostNow(), takeover: true, restartMode: "now" });
+
+    // b2. the restarted node wins the lease back: every node is killed and only the victim is started.
+    await killCase({ label: "case b2 (whole cluster killed, only the host restarted: it wins the lease back)", victim: await hostNow(), takeover: true, restartMode: "now", killAll: true });
 
     // c. the host with no client on it: move every client off it first.
     const h = await hostNow();

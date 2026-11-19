@@ -413,3 +413,15 @@ test("after a 429 the Ask button comes back by itself when the wait the server n
   expect(button.getAttribute("aria-disabled")).toBe("false");
   expect(textOf(v.el.findAll(e => e.getAttribute("data-fk") === "ask-status")[0])).toBe("");
 });
+
+test("the 409 superseded path says so in the status line too (not only the live region), keeps focus on it, and shows the current request", async () => {
+  const why = { mine: { role: { id: "viewer", name: "Viewer" }, sources: [] }, guest: false, needs: {}, owners: [], ask: { can: true, roles: [{ id: "editor", name: "Editor" }], pending: null, retryAfterMs: null } };
+  const cur = { ...why, ask: { ...why.ask, pending: { role: "editor", roleName: "Editor", at: 5 } } };
+  const v = askView({ api: { ask: async () => ({ error: "conflict", code: "superseded" }) }, type: "space", id: "s-1", why, reload: async () => cur });
+  const button = v.el.findAll(e => e.tagName === "BUTTON")[0];
+  button.focus(); button.click(); await settle();
+  const status = v.el.findAll(e => e.getAttribute("data-fk") === "ask-status")[0];
+  expect(textOf(status)).toMatch(/^Your earlier request was replaced by a newer one\. This is the one the owners see\. You asked for Editor\./);
+  expect(globalThis.document.activeElement).toBe(status);
+  expect(announced()).toContain("replaced by a newer one");
+});

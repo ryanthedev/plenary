@@ -31,7 +31,7 @@ export function askView({ api, type, id, why, newKey = null, reload = null, setT
     select.parentNode.hidden = sent || why.ask.roles.length < 2;
     button.setAttribute("aria-disabled", S.status === "busy" || wait ? "true" : "false");
     status.textContent = sent
-      ? `You asked for ${S.pending?.roleName ?? "access"}. The owners will see your request on the Access page; you will have it when one of them adds you.`
+      ? `${S.message ? S.message + " " : ""}You asked for ${S.pending?.roleName ?? "access"}. The owners will see your request on the Access page; you will have it when one of them adds you.`
       : S.status === "busy" ? "Sending…" : S.message ?? (wait ? `You asked recently and the request was closed. You can ask again ${S.retryAfterMs ? waitText(S.retryAfterMs) : "later"}.` : "");
     // Focus moves to the confirmation BEFORE the focused button is hidden: hiding it first would blur to nothing (a focusout that reads as tabbing out of a popover).
     if (sent && globalThis.document?.activeElement === button) status.focus?.();

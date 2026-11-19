@@ -463,6 +463,59 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect((await r.boardsIn({ type: "unit", id: t.id }, { limit: 0 })).ids.length).toBeGreaterThan(0);    // a non-positive limit means the default, never "all"
       });
 
+      test("spacesIn pages a Group's Spaces by id; a Space outside it, another Group, an unknown Group and a bad cursor", async () => {
+        const t = await unit();
+        const g = await r.createGroup({ tenant: t.id, name: "P" }), g2 = await r.createGroup({ tenant: t.id, name: "Q" });
+        const mine = [];
+        for (let i = 0; i < 5; i++) mine.push((await r.createSpace({ tenant: t.id, name: `S${i}`, group: g.id })).id);
+        await r.createSpace({ tenant: t.id, name: "root" });
+        const elsewhere = await r.createSpace({ tenant: t.id, name: "other", group: g2.id });
+        const all = async limit => { const out = []; let after = null, pages = 0; do { const p = await r.spacesIn(g.id, { after, limit }); out.push(...p.spaces); after = p.next; pages++; } while (after); return { out, pages }; };
+        const paged = await all(2);
+        expect(paged.pages).toBe(3);
+        expect(paged.out.map(x => x.id)).toEqual([...mine].sort());
+        expect(paged.out[0]).toMatchObject({ tenant: t.id, group: g.id, kind: "shared", generalRole: "viewer" });
+        expect((await all(1000)).pages).toBe(1);
+        expect((await r.spacesIn(g2.id)).spaces.map(x => x.id)).toEqual([elsewhere.id]);
+        expect(await r.spacesIn("g-nope00000000")).toEqual({ spaces: [], next: null });
+        for (const bad of ["", 5, "a\nb", {}]) await expect(r.spacesIn(g.id, { after: bad })).rejects.toThrow("bad cursor");
+      });
+
+      test("rename: a board's title, a Space's and a Group's name; validated like create; nothing else changes; unknown rejects", async () => {
+        const t = await unit();
+        const g = await r.createGroup({ tenant: t.id, name: "P", generalRole: "viewer" }), sp = await r.createSpace({ tenant: t.id, name: "A", group: g.id });
+        const b = await r.createBoard({ tenant: t.id, title: "old", space: sp.id, memberRole: "editor" });
+        expect(await r.rename({ type: "board", id: b.id }, "  new title ")).toEqual({ ...b, title: "new title" });
+        expect(await r.board(b.id)).toEqual({ ...b, title: "new title" });
+        expect((await r.rename({ type: "board", id: b.id }, "  ")).title).toBe("");                       // a board may be untitled
+        expect(await r.rename({ type: "space", id: sp.id }, " Renamed ")).toEqual({ ...sp, name: "Renamed" });
+        expect(await r.space(sp.id)).toEqual({ ...sp, name: "Renamed" });
+        expect(await r.rename({ type: "group", id: g.id }, "Product 2")).toEqual({ ...g, name: "Product 2" });
+        expect((await r.board(b.id)).space).toBe(sp.id);
+        for (const bad of ["", "   ", 5, null, "x".repeat(201)]) await expect(r.rename({ type: "space", id: sp.id }, bad)).rejects.toThrow("bad name");
+        await expect(r.rename({ type: "board", id: b.id }, "x".repeat(201))).rejects.toThrow("bad title");
+        await expect(r.rename({ type: "board", id: b.id }, 7)).rejects.toThrow("bad title");
+        await expect(r.rename({ type: "board", id: "b-nope000000000000" }, "x")).rejects.toThrow();
+        await expect(r.rename({ type: "space", id: "s-nope00000000" }, "x")).rejects.toThrow();
+        await expect(r.rename({ type: "group", id: "g-nope00000000" }, "x")).rejects.toThrow();
+        for (const bad of [{ type: "unit", id: t.id }, { type: "team", id: "x" }, null, { type: "space", id: "" }]) await expect(r.rename(bad, "x")).rejects.toThrow("bad scope");
+      });
+
+      test("setGeneralRole: a Space's and a Group's general access change and nothing else; null = only people added; unknown and board scope reject", async () => {
+        const t = await unit();
+        const g = await r.createGroup({ tenant: t.id, name: "P" }), sp = await r.createSpace({ tenant: t.id, name: "A", group: g.id, owner: "google:ann" });
+        expect(await r.setGeneralRole({ type: "space", id: sp.id }, "editor")).toEqual({ ...sp, generalRole: "editor" });
+        expect((await r.space(sp.id)).generalRole).toBe("editor");
+        expect((await r.setGeneralRole({ type: "space", id: sp.id }, null)).generalRole).toBeNull();
+        expect(await r.setGeneralRole({ type: "group", id: g.id }, "commenter")).toEqual({ ...g, generalRole: "commenter" });
+        expect((await r.group(g.id)).generalRole).toBe("commenter");
+        expect(await r.scopedGrants({ type: "space", id: sp.id })).toEqual([{ subject: { type: "user", id: "google:ann" }, role: "owner" }]);
+        await expect(r.setGeneralRole({ type: "space", id: sp.id }, "x".repeat(65))).rejects.toThrow("bad role");
+        await expect(r.setGeneralRole({ type: "space", id: "s-nope00000000" }, "viewer")).rejects.toThrow();
+        await expect(r.setGeneralRole({ type: "group", id: "g-nope00000000" }, "viewer")).rejects.toThrow();
+        await expect(r.setGeneralRole({ type: "board", id: "b-x" }, "viewer")).rejects.toThrow("bad scope");
+      });
+
       test("scopesOf pages the scopes a user or Team holds a grant on (to announce a Team membership change)", async () => {
         const t = await unit();
         const g = await r.createGroup({ tenant: t.id, name: "P" }), sp = await r.createSpace({ tenant: t.id, name: "A" });

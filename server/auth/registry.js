@@ -163,6 +163,25 @@ export function memoryRegistry({ now = Date.now } = {}) {
     },
     async space(id) { return copy(spaces.get(id)); },
     async spaces(tenant) { return [...spaces.values()].filter(s => s.tenant === tenant).map(copy); },
+    async spacesIn(group, { after = null, limit } = {}) {
+      after = orgDefaults.cursor(after, "id");
+      const n = pageLimit(limit), rest = [...spaces.values()].filter(s => s.group === group && (after == null || s.id > after)).sort((a, b) => (a.id < b.id ? -1 : 1));
+      return { spaces: rest.slice(0, n).map(copy), next: rest.length > n ? rest[n - 1].id : null };
+    },
+    async rename(scope, name) {
+      const { type, id } = orgDefaults.renamable(scope, ["board", "space", "group"]);
+      const row = (type === "board" ? boards : type === "space" ? spaces : groups).get(id);
+      need(row, type);
+      if (type === "board") row.title = orgDefaults.title(name); else row.name = orgDefaults.name(name);
+      return copy(row);
+    },
+    async setGeneralRole(scope, role) {
+      const { type, id } = orgDefaults.renamable(scope, ["space", "group"]);
+      const row = (type === "space" ? spaces : groups).get(id);
+      need(row, type);
+      row.generalRole = orgDefaults.grantRole(role);
+      return copy(row);
+    },
     async ensurePersonalSpace(tenant, user) {
       need(tenants.has(tenant), "tenant");
       user = String(user);

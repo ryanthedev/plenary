@@ -131,6 +131,7 @@ export const REGISTRY_INDEXES = {
   reg_invites_board: "reg_invites (board, email)",
   reg_links_board: "reg_links (board)",
   reg_spaces_tenant: "reg_spaces (tenant)",
+  reg_spaces_grp: "reg_spaces (grp, id)",
   reg_groups_tenant: "reg_groups (tenant)",
   reg_teams_tenant: "reg_teams (tenant)",
   reg_recents_member: "reg_recents (member, opened_at DESC, board DESC)",
@@ -498,6 +499,38 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     },
     async space(id) { ready(); return key(id) ? rowSpace(await one(db, `SELECT * FROM ${SP} WHERE id = $1`, [id])) : null; },
     async spaces(tenant) { ready(); return key(tenant) ? (await db.unsafe(`SELECT * FROM ${SP} WHERE tenant = $1 ORDER BY created_at, id`, [tenant])).map(rowSpace) : []; },
+    async spacesIn(group, { after = null, limit } = {}) {
+      ready();
+      const n = pageLimit(limit), cur = orgDefaults.cursor(after, "id");
+      if (!key(group)) return { spaces: [], next: null };
+      const rows = (await db.unsafe(`SELECT * FROM ${SP} WHERE grp = $1 AND ($2::text IS NULL OR id > $2) ORDER BY id LIMIT $3`, [group, cur, n + 1])).map(rowSpace);
+      return { spaces: rows.slice(0, n), next: rows.length > n ? rows[n - 1].id : null };
+    },
+    async rename(scope, name) {
+      ready();
+      const { type, id } = orgDefaults.renamable(scope, ["board", "space", "group"]);
+      const v = type === "board" ? orgDefaults.title(name) : orgDefaults.name(name);
+      if (!key(id)) throw new Error(`registry: no such ${type}`);
+      return write(async tx => {
+        const r = type === "board" ? await tx.unsafe(`UPDATE ${BD} SET title = $2 WHERE id = $1`, [id, v])
+          : await tx.unsafe(`UPDATE ${type === "space" ? SP : GR} SET name = $2 WHERE id = $1`, [id, v]);
+        if (r.count === 0) throw new Error(`registry: no such ${type}`);
+        return type === "board" ? rowBoard(await one(tx, `${BOARD_SQL} WHERE b.id = $1`, [id]))
+          : type === "space" ? rowSpace(await one(tx, `SELECT * FROM ${SP} WHERE id = $1`, [id])) : rowGroup(await one(tx, `SELECT * FROM ${GR} WHERE id = $1`, [id]));
+      });
+    },
+    async setGeneralRole(scope, role) {
+      ready();
+      const { type, id } = orgDefaults.renamable(scope, ["space", "group"]);
+      const r = nz(orgDefaults.grantRole(role));
+      if (!key(id)) throw new Error(`registry: no such ${type}`);
+      return write(async tx => {
+        const T2 = type === "space" ? SP : GR;
+        if ((await tx.unsafe(`UPDATE ${T2} SET general_role = $2 WHERE id = $1`, [id, r])).count === 0) throw new Error(`registry: no such ${type}`);
+        const row = await one(tx, `SELECT * FROM ${T2} WHERE id = $1`, [id]);
+        return type === "space" ? rowSpace(row) : rowGroup(row);
+      });
+    },
     async ensurePersonalSpace(tenant, user) {
       ready();
       if (!key(tenant)) throw new Error("registry: no such tenant");

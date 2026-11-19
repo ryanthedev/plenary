@@ -27,7 +27,7 @@ this spec changes the constants and checks named below.
 | Append timeout | 5 s | **4 s**, so two appends (an op queued behind the one in flight) finish inside the client's 10 s (§ Recovery) |
 | Bus | "nothing bigger than one op" | catch-up and snapshots never travel on the bus; `.entries` batches are split under 2 MB (§ Bus) |
 | Postgres | (unstated) | a server starts as a role that doesn't own the schema; DDL is a separate migrate step (§ Store) |
-| `POST /boards` | owner gap unstated | caller must be a tenant admin; a crash between the two calls is repaired by a tenant admin (§ Registry) |
+| `POST /boards` | owner gap unstated | (v1.1) caller must be a tenant admin; a crash between the two calls is repaired by a tenant admin (§ Registry). Since #48: `board.create` at the target Space, or the caller's personal space (§ Spaces and Groups) |
 | Store | log and checkpoints | also each board's epoch: `openEpoch`, `epoch` (§ Store) |
 | Core glue | unstated | the client's op hook turns `files` into blob PUTs and `transient` into `preview` presence (§ The element op) |
 | Spec gaps | emote set unnamed; `records.js` missing from the phase-2 list | emote set named (§ Presence); `records.js` row added |
@@ -354,7 +354,7 @@ one may still be closing.
      closed or unlisted connection, and all `n` state of a gateway it has not heard from for **30 s**.
    - **Guaranteed:** no op is accepted out of order, across restarts too; `n` state is bounded by open
      connections. **May drop:** a connection (never a pending op: the client resends after reconnecting).
-7. **Boards exist only by `POST /boards`** (Registry `createBoard`). A `hello` for an unknown board is refused with
+7. **Boards exist only by `POST /boards`** (Registry `createBoard`; who may call it: § Spaces and Groups). A `hello` for an unknown board is refused with
    `auth`, the same error as a board the token has no role on, so existence doesn't leak. A hello never creates one.
 8. **Auth before the room; viewers never reach it.** The gateway awaits Auth and the Registry (§ Auth) before
    anything is forwarded; the room never sees a token. A writer's hello goes on as `{user, name, role, client}`,
@@ -660,8 +660,8 @@ record.
   Space or Group owner grant `owner` inside it (the `transfer` permission, § Organization); that is enforced when the
   routes for it exist, and until then only a tenant admin may.
 - **`POST /boards`** takes its tenant from the caller's verified identity (their Workspace domain's tenant),
-  never from the request body, and the caller must be an **admin of that tenant** (server/admin checks it again).
-  A caller with no tenant (a gmail user, a guest) gets `forbidden`. Admin calls that name only an id
+  never from the request body, and the caller needs **`board.create`** at the target Space or uses their personal space
+  (§ Spaces and Groups; it was tenant-admin-only before #48). A caller with no tenant (a gmail user, a guest) gets `forbidden`. Admin calls that name only an id
   (`invite(id)`, `revokeInvite`, `revokeLink`, `setGrant`, …) must first check that the id's board belongs to the caller's tenant.
 - Every log entry, checkpoint, blob and bus subject is keyed by the board's tenant: Store keys
   `(tenant, board, seq)`, blobs `(tenant, sha1)`, subjects `plen.<tenant>.<board>.*` (prefixed on the wire by the cluster id, § Bus).
@@ -839,6 +839,49 @@ board's row is inert (the access filter drops it). Additive tables like the Orga
 
 Pending maintainer decisions kept as-is: a Unit admin gets no board content by being admin (a board they cannot open is not listed); unfiled boards appear under "Other boards" (above), not in a legacy Space.
 
+## Spaces and Groups (pages, pickers, create and rename, #48)
+
+Design: design/orgs/JOURNEY.md (J2, J4, §4 [space] [group] [new-board] [new-space], §5). Code: `server/auth/spaces.js` (core: every decision
+below), routes in `server/auth/http.js` (they only translate), Registry calls `rename`, `setGeneralRole`, `spacesIn` (§ Registry). Every route
+authenticates like Home (`Authorization: Bearer`), and **checks permissions, never role names**: the permission is read from the resolver's
+answer (`tenancy.effective`) at the scope the request names.
+
+**One refusal, whatever the reason.** A route that names a Space, Group or board the caller may not use answers the same for an id that does
+not exist, one in another Unit, and one that exists but is hidden: a read is `404 not-found`, a write is `403 forbidden`, same body, same
+status, same work. So no page, picker or error names or confirms a Space or Group the person cannot open. **Open** = the resolver's ladder
+role for the person is not null (the Home rule); a Unit admin does not open a private Space while `adminBoardContent` is off (pending
+maintainer decision, kept as-is), so a page or picker does not list one for them. A *write* checks the permission only: an admin who knows a
+Space's id may still `board.create` in it.
+
+| Route | Needs | Answers |
+|---|---|---|
+| `POST /boards` `{ title?, space?, memberRole? }` | a Unit (members only: a guest, or a user with no Unit, gets 403). `space` omitted or null = the caller's **personal space** (made on first use; always allowed). `space: "<id>"` needs `board.create` at that Space | 201 `{ board }` (the board record). The caller becomes its `owner`. `memberRole` absent = null: the board inherits its Space (a personal space is private); else a role below `owner` (400 otherwise). Replaces the admin-only rule |
+| `GET /spaces?can=board.create` | a Unit | `{ spaces: [{ id, name, personal, general, group: { id, name } \| null }], more }`: the Spaces the caller can open **and** holds `board.create` in (`general` = the Space's general-access role or null), their personal space first. A Group's name appears only when the caller can open the Group. The picker and `POST /boards` use one function, so what is listed is what is accepted. `more` = the bounded candidate scan left something out |
+| `GET /groups?can=space.create` | a Unit | `{ root, groups: [{ id, name }], more }`: `root` = the caller holds `space.create` at the Unit root; `groups` = the Groups they can open and hold `space.create` in |
+| `POST /spaces` `{ name, group?, general? }` | `space.create` at the Unit root (`group` omitted or null) or at the Group. `name` trimmed, 1-200. `general`: `"viewer"` (default), `"commenter"`, `"annotator"`, `"editor"` or `null` (only people added) | 201 `{ space }` (`{ id, name, personal: false, general, group }`); the caller becomes its `owner`. An unknown, other-Unit or hidden `group`: 403 |
+| `GET /spaces/:id` | open the Space | `{ space, can: { createBoard, rename, general }, boards, more }`. `boards` = Home cards (§ Home) of the boards the caller can open, by title, at most 50 (Home's bounded window: up to 3 pages), each with `can: { rename }`. `can.*` are permissions: `board.create`; `members.manage` (not for a personal space) |
+| `GET /groups/:id` | open the Group | `{ group: { id, name, general }, can: { createSpace, rename, general }, spaces: [{ id, name, general }], next }`: its Spaces, by id, 100 a page (`?after=<next>`). Every Space of a Group the caller opens is open to them (a role on a container covers what is inside), so none is filtered. Someone who can open one Space but not the Group gets 404 here (the Space shows in their Home tree) |
+| `PATCH /spaces/:id` `{ name?, general? }` | `members.manage` at the Space. A personal space: 400 (its name and privacy are the person's own) | 200 `{ space }`. At least one field, else 400 |
+| `PATCH /groups/:id` `{ name?, general? }` | `members.manage` at the Group | 200 `{ group }` |
+| `PATCH /boards/:board` `{ title }` | `board.edit` or `members.manage` on the board (a title is board content; an owner and an admin hold the second). `title` trimmed, 0-200 | 200 `{ board }` |
+
+Unknown body fields are 400 `unknown-field`, as everywhere. The 4xx/5xx codes are the existing ones (400 `bad-request`, 401, 403 `forbidden`, 404
+`not-found`, 503 `unavailable` or `owner-grant-failed`); #48 adds none.
+
+**Why `members.manage` renames a Space.** The permission list has no rename; a name is the container's management, which `members.manage` is (Space
+and Group owners hold it, editors do not). A custom role can hold it. A board's title is content, so `board.edit` also renames it.
+
+**Freshness (§ Organization).** Per route: `POST /boards` and `POST /spaces` add an owner grant on a thing that did not exist, so no live connection
+is affected and nothing is announced (the board's own `setGrant` announces as before). A rename is not access: nothing is announced. A
+**general-access change** (`PATCH` with `general`) changes what every board inside gets, so after the write it pages `boardsIn(scope)` (a Space's
+boards, or a Group's Spaces' boards) and publishes `{ board }` on each board's `.grants` subject, at most 20 pages of 500 inline; a larger scope's
+rest waits for the timed re-check (≤ 60 s) and one log line says so. A failed announcement is logged, never fails the request.
+
+**Bounds.** `GET /spaces?can=`: one page of at most 100 candidate Spaces (`spaceCandidates`, SQL), general access settled from the rows in hand, at most
+40 `effective` reads (8 at a time), the same cap as the Home tree; the rest set `more`. `GET /groups?can=`: at most 50 Group candidates, 20 reads.
+`GET /spaces/:id`: the Space's one `effective`, then Home's window (≤ 3 pages of 200 ids, one `accessMany` each: 6-7 statements and one context read
+per page). `GET /groups/:id`: one `effective`, one `spacesIn` page. Nothing loops the boards, Spaces or Groups of a Unit.
+
 ## Sign-in code exchange
 
 No long-lived token ever appears in a URL. After Google sign-in the server hands the page a single-use code, and the
@@ -932,7 +975,7 @@ method names are stable. Ids are server-minted over `[a-z0-9-]`.
 | invites | `createInvite({ board, email, role, expiresAt, by })`, `invite(id)`, `invites(board)`, `invitesFor(board, email)`, `revokeInvite(id)` |
 | share links | `createLink({ board, role, expiresAt, by })` (role per link), `link(id)`, `links(board)`, `revokeLink(id)`, `addLinkUse(link, user)`, `linkUses(board, user)` |
 | home | `markOpened(user, board)`, `recents(user, { limit })`, `setStarred(user, board, on)`, `starred(user, { limit })`, `starredAmong(user, boards)`, `sharedBoards(user, email, { limit })`, `searchBoards(tenant, { q, unfiled, after, scan })`, `spaceCandidates(tenant, { user, all, after, limit })`, `groupCandidates(tenant, { user, all, limit })`, `boardRows(boards, { user, email })` (§ Home) |
-| organization | `createGroup`, `group`, `groups`; `createSpace`, `space`, `spaces`, `ensurePersonalSpace(tenant, user)`; `createTeam`, `team`, `teams`, `setTeamMember`, `teamMembers`; `setScopedGrant({ scope, subject, role \| null })`, `scopedGrants(scope)`; `createRole`, `updateRole`, `role`, `roles`; `accessContext(scope, { users, chain })`; `boardsIn(scope, { after, limit })`, `scopesOf(subject, { after, limit })` |
+| organization | `createGroup`, `group`, `groups`; `createSpace`, `space`, `spaces`, `ensurePersonalSpace(tenant, user)`; `createTeam`, `team`, `teams`, `setTeamMember`, `teamMembers`; `setScopedGrant({ scope, subject, role \| null })`, `scopedGrants(scope)`; `createRole`, `updateRole`, `role`, `roles`; `accessContext(scope, { users, chain })`; `boardsIn(scope, { after, limit })`, `scopesOf(subject, { after, limit })`; `rename({ type: "board"\|"space"\|"group", id }, name)`, `setGeneralRole({ type: "space"\|"group", id }, role \| null)`, `spacesIn(group, { after, limit })` (§ Spaces and Groups) |
 
 Single node: SQLite; cluster: Postgres. The room never calls it; gateways and Auth do. On Postgres the server
 runs as a role that doesn't own the schema (§ Store, Least privilege).

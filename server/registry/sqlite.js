@@ -142,6 +142,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     db.run("CREATE INDEX IF NOT EXISTS reg_scope_grants_subject ON reg_scope_grants (subject_type, subject, scope_type)");
     db.run("CREATE INDEX IF NOT EXISTS reg_team_members_member ON reg_team_members (member)");
     db.run("CREATE INDEX IF NOT EXISTS reg_spaces_tenant ON reg_spaces (tenant)");
+    db.run("CREATE INDEX IF NOT EXISTS reg_spaces_grp ON reg_spaces (grp, id)");
     db.run("CREATE INDEX IF NOT EXISTS reg_groups_tenant ON reg_groups (tenant)");
     db.run("CREATE INDEX IF NOT EXISTS reg_teams_tenant ON reg_teams (tenant)");
   }).immediate(), clock, onAttempt);
@@ -174,6 +175,12 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     insGroup: db.query("INSERT INTO reg_groups (id, tenant, name, general_role, created_at) VALUES (?, ?, ?, ?, ?)"),
     space: db.query("SELECT * FROM reg_spaces WHERE id = ?"),
     spaces: db.query("SELECT * FROM reg_spaces WHERE tenant = ? ORDER BY created_at, id"),
+    spacesIn: db.query("SELECT * FROM reg_spaces WHERE grp = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?3"),
+    renameBoard: db.query("UPDATE reg_boards SET title = ?2 WHERE id = ?1"),
+    renameSpace: db.query("UPDATE reg_spaces SET name = ?2 WHERE id = ?1"),
+    renameGroup: db.query("UPDATE reg_groups SET name = ?2 WHERE id = ?1"),
+    generalSpace: db.query("UPDATE reg_spaces SET general_role = ?2 WHERE id = ?1"),
+    generalGroup: db.query("UPDATE reg_groups SET general_role = ?2 WHERE id = ?1"),
     personal: db.query("SELECT * FROM reg_spaces WHERE tenant = ? AND owner_user = ?"),
     insSpace: db.query("INSERT INTO reg_spaces (id, tenant, grp, name, kind, owner_user, general_role, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"),
     team: db.query("SELECT * FROM reg_teams WHERE id = ?"),
@@ -557,6 +564,27 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     },
     async space(id) { ready(); return str(id) ? rowSpace(q.space.get(id)) ?? null : null; },
     async spaces(tenant) { ready(); return str(tenant) ? q.spaces.all(tenant).map(rowSpace) : []; },
+    async spacesIn(group, { after = null, limit } = {}) {
+      ready();
+      const n = pageLimit(limit), cur = orgDefaults.cursor(after, "id");
+      const rows = str(group) ? q.spacesIn.all(group, cur, n + 1).map(rowSpace) : [];
+      return { spaces: rows.slice(0, n), next: rows.length > n ? rows[n - 1].id : null };
+    },
+    async rename(scope, name) {
+      ready();
+      const { type, id } = orgDefaults.renamable(scope, ["board", "space", "group"]);
+      const v = type === "board" ? orgDefaults.title(name) : orgDefaults.name(name);
+      const [up, get, row] = type === "board" ? [q.renameBoard, q.board, rowBoard] : type === "space" ? [q.renameSpace, q.space, rowSpace] : [q.renameGroup, q.group, rowGroup];
+      if (up.run(id, v).changes === 0) throw new Error(`registry: no such ${type}`);
+      return row(get.get(id));
+    },
+    async setGeneralRole(scope, role) {
+      ready();
+      const { type, id } = orgDefaults.renamable(scope, ["space", "group"]);
+      const [up, get, row] = type === "space" ? [q.generalSpace, q.space, rowSpace] : [q.generalGroup, q.group, rowGroup];
+      if (up.run(id, nz(orgDefaults.grantRole(role))).changes === 0) throw new Error(`registry: no such ${type}`);
+      return row(get.get(id));
+    },
     async ensurePersonalSpace(tenant, user) {
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");

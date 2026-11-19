@@ -114,6 +114,9 @@ export const mint = {
  *   setTeamMember(team: string, user: string, member: boolean): Promise<void>,
  *   teamMembers(team: string): Promise<string[]>,
  *   setScopedGrant(o: { scope: ScopeRef, subject: Subject, role: string|null }): Promise<void>,   // rejects a user subject on a board (use setGrant) and a Team of another tenant; Group/Space: code "last-owner"
+ *   rename(scope: { type: "board"|"space"|"group", id: string }, name: string): Promise<Board|Space|Group>,   // a board's title (trimmed, 0-200 chars) or a Space's / Group's name (trimmed, 1-200); rejects an unknown scope, nothing else changes
+ *   setGeneralRole(scope: { type: "space"|"group", id: string }, role: string|null): Promise<Space|Group>,   // the role "everyone in the Unit" gets there; null = only people added; rejects an unknown scope
+ *   spacesIn(group: string, o?: { after?: string|null, limit?: number }): Promise<{ spaces: Space[], next: string|null }>,   // a Group's Spaces, by id, one bounded page (default 500, cap 1000); an unknown Group lists none
  *   scopedGrants(scope: ScopeRef): Promise<ScopedGrant[]>,
  *   createRole(o: { tenant: string, name: string, base?: string|null, boardRole: Role, permissions?: string[] }): Promise<CustomRole>,
  *   updateRole(tenant: string, id: string, patch: { name?: string, boardRole?: Role|null, permissions?: string[] }): Promise<CustomRole>,   // id "member" (the editable Unit member role) is created on first update; rejects an unknown id
@@ -182,6 +185,17 @@ export const orgDefaults = {
     const n = typeof v === "string" ? v.trim() : "";
     if (!n || n.length > 200) fail("name");
     return n;
+  },
+  /** A board title: a string, trimmed, 0-200 chars (a board may be untitled), no NUL. */
+  title(v) {
+    const n = typeof v === "string" ? v.trim() : "";
+    if (typeof v !== "string" || n.length > 200 || n.includes("\0")) fail("title");
+    return n;
+  },
+  /** The scope a `rename` / `setGeneralRole` names: one of `types`. */
+  renamable(s, types) {
+    if (!s || !types.includes(s.type) || typeof s.id !== "string" || !s.id || s.id.includes("\0")) fail("scope");
+    return { type: s.type, id: s.id };
   },
   /** The name of a member's personal Space until they rename it. */
   personalName: user => `${String(user).replace(/^[a-z]+:/, "")}'s space`,

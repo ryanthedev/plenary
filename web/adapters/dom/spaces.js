@@ -82,15 +82,16 @@ function inlineEditor({ editing, session, text, label, onSave, onCancel }) {
     return el;
   }
   let done = false;
-  const finish = (save, el) => {
+  // `moved`: the save came from a blur whose focus went to another element (the person clicked elsewhere): the page must not pull it back.
+  const finish = (save, el, moved = false) => {
     if (done || session.el !== el) return;
     done = true;
-    Promise.resolve(save ? onSave(el.value) : onCancel()).finally(() => { done = false; });
+    Promise.resolve(save ? onSave(el.value, moved) : onCancel()).finally(() => { done = false; });
   };
   const el = h("input.field.rename", { type: "text", value: text, maxlength: "200", "aria-label": label, onkeydown: e => {
     if (e.key === "Enter") { e.preventDefault?.(); finish(true, e.currentTarget); }
     else if (e.key === "Escape") { e.preventDefault?.(); e.stopPropagation?.(); finish(false, e.currentTarget); }
-  }, onblur: e => finish(true, e.currentTarget) });
+  }, onblur: e => finish(true, e.currentTarget, !!e.relatedTarget) });
   session.el = el;
   globalThis.queueMicrotask?.(() => { el.focus?.(); el.select?.(); });
   return el;
@@ -124,7 +125,7 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null }) {
     ] });
     const focusCard = () => links.get(c.id)?.focus?.();
     const input = inlineEditor({ editing: editing?.type === "board" && editing.id === c.id, session: cardEdits.get(c.id) ?? (cardEdits.set(c.id, {}), cardEdits.get(c.id)), text: c.title, label: "Board title",
-      onSave: v => model.renameBoard(c.id, v).then(ok => { if (ok) end(focusCard); else render(); }), onCancel: () => end(focusCard) });
+      onSave: (v, moved) => model.renameBoard(c.id, v).then(ok => { if (ok) end(moved ? null : focusCard); else render(); }), onCancel: () => end(focusCard) });
     const link = input ? null : h("a.card-open", { href: hrefs.board(c.id) }, h("span.t", {}, c.title || "Untitled"), h("span.p", {}, where));
     if (link) links.set(c.id, link);
     return h("li.card", {}, input ? h("div.card-open", {}, input, h("span.p", {}, "Enter to save, Escape to cancel")) : link, h("span.card-menu", {}, menu.el));
@@ -145,7 +146,7 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null }) {
       { text: "General access…", hidden: !p.can.general, onSelect: b => dialogs.general({ opener: b, current: sp.general, onSave: r => model.setGeneral(r) }) },
     ] }) : null;
     const input = inlineEditor({ editing: editing?.type === "title", session: title, text: sp.name, label: "Space name",
-      onSave: v => model.rename(v).then(ok => { if (ok) end(focusTitle); else render(); }), onCancel: () => end(focusTitle) });
+      onSave: (v, moved) => model.rename(v).then(ok => { if (ok) end(moved ? null : focusTitle); else render(); }), onCancel: () => end(focusTitle) });
     h1 = h("h1", { id: "page-title", tabindex: "-1" }, input ?? sp.name);
     const head = h("div.sp-head", {}, h1,
       h("span.badge", {}, sp.personal ? "Personal · only you" : "Space"), h("span.spacer"), newBoard, menu?.el);
@@ -168,7 +169,7 @@ export function mountGroupPage({ root, model, dialogs, hrefs, signIn = null }) {
   let editing = false;
   const title = {}, after = afterRender();
   let h1 = null;
-  const end = () => { editing = false; after.set(() => h1?.focus?.()); render(); };
+  const end = (moved = false) => { editing = false; after.set(moved ? null : () => h1?.focus?.()); render(); };
 
   function render() {
     showNotice(status, model);
@@ -180,7 +181,7 @@ export function mountGroupPage({ root, model, dialogs, hrefs, signIn = null }) {
       { text: "General access…", hidden: !p.can.general, onSelect: b => dialogs.general({ opener: b, current: g.general, onSave: r => model.setGeneral(r) }) },
     ] }) : null;
     const input = inlineEditor({ editing, session: title, text: g.name, label: "Group name",
-      onSave: v => model.rename(v).then(ok => { if (ok) end(); else render(); }), onCancel: end });
+      onSave: (v, moved) => model.rename(v).then(ok => { if (ok) end(moved); else render(); }), onCancel: end });
     h1 = h("h1", { id: "page-title", tabindex: "-1" }, input ?? g.name);
     const head = h("div.sp-head", {}, h1, h("span.badge", {}, "Group"), h("span.spacer"), newSpace, menu?.el);
     const empty = groupEmpty(p, g.name);

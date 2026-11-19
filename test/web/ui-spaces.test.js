@@ -341,6 +341,24 @@ test("after a rename ends focus lands on the title or the card's link, never the
   expect(root.find(e => e.getAttribute("aria-label") === "Board title")).toBeUndefined();
 });
 
+test("a blur-save that moved focus elsewhere does not pull it back to the title or the card; Enter still does", async () => {
+  await spacePage();
+  const h1 = () => root.find(e => e.tagName === "H1");
+  const edit = () => { btn("Space options").click(); root.findAll(e => e.getAttribute("role") === "menuitem")[0].click(); return root.find(e => e.getAttribute("aria-label") === "Space name"); };
+  let i = edit(); i.value = "Away"; const before = focused.filter(f => f.tagName === "H1").length;
+  i.dispatch("blur", { relatedTarget: root.find(e => e.tagName === "A") }); await settle();          // the person clicked another control
+  expect(calls.at(-1)).toEqual(["updateSpace", "s-1", { name: "Away" }]);
+  expect(focused.filter(f => f.tagName === "H1").length).toBe(before);                         // focus was NOT moved to the title
+  i = edit(); i.value = "Back"; i.dispatch("blur"); await settle();                    // a blur to nowhere (the body) still lands on the title
+  expect(focused.at(-1)).toBe(h1());
+  const c = () => root.findAll(e => e.tagName === "BUTTON" && e.getAttribute("aria-label")?.startsWith("More for"))[0];
+  c().click(); root.findAll(e => e.getAttribute("role") === "menuitem").find(e => textOf(e) === "Rename").click();
+  const d = root.find(e => e.getAttribute("aria-label") === "Board title"); d.value = "Moved"; await settle(); const n = focused.length;
+  d.dispatch("blur", { relatedTarget: root.find(e => e.tagName === "A") }); await settle();
+  expect(calls.at(-1)[0]).toBe("renameBoard");
+  expect(focused.length).toBe(n);
+});
+
 test("the busy re-render keeps the typed text in the card editor (no flash of the old title)", async () => {
   await spacePage();
   let release; api.answer = (n, id, t) => (n === "renameBoard" ? new Promise(r => { release = () => r({ board: { id, title: t } }); }) : undefined);

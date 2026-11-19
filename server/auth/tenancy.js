@@ -2,13 +2,14 @@
 // revoked invite or link stops working on the next role() (i.e. the next hello). `tenancy` never caches; the
 // optional cache over it, `roleCache`, is at the end of this file (p5-load).
 //
-// A user's role on a board is the HIGHEST of:
-//   - an explicit per-board grant (the creator gets `owner`);
-//   - a live invite to the user's verified email for that board;
-//   - a live share link for that board that this user has redeemed (redeemLink);
-//   - the board's `memberRole` (default `viewer`), if the user's Workspace domain (`hd`) is the board tenant's.
-// A grant lower than memberRole does not demote a Workspace member (highest wins).
-// Nothing else counts: a user from another domain, or another tenant, gets a role only by grant, invite or link
+// The rule itself is server/auth/resolver.js (sources, order, union; PROTOCOL.md § Tenancy "Resolution"). In short, a
+// user's access to a board is the UNION of: their own grant on it; Team grants on it; grants on its Space and that
+// Space's Group (their own, and their Teams'); "everyone in the Unit" on the board (`memberRole`), its Space and
+// Group, for members of the Unit's Workspace domains; a live invite to the user's verified email; a live share link
+// they redeemed; and their Unit role (admin, member, or one granted on the Unit). The live room needs one ladder
+// role (viewer..owner): `role` is the highest ladder role any source gives; every management permission lives in
+// `access(...).permissions` and the admin layer checks those, never role names. There is no deny.
+// Nothing else counts: a user from another domain, or another tenant, gets access only by grant, invite or link
 // on that very board. An unknown board and a board with no role both give null (no existence leak).
 //
 // One rule, two ways to fetch (p5-load): `role` reads one user's rows (a hello); `rolesFor` reads a board's rows
@@ -16,7 +17,8 @@
 // ceil(users / USE_CHUNK) link-use queries (or one per user where the Registry has no `linkUsesFor`). Both feed
 // the same pure `combine`, so they can't disagree (test/auth/role-cache.test.js checks it on random registries).
 
-import { higher, capTo, normEmail, ROLES, LINK_ROLES, INVITE_ROLES } from "./util.js";
+import { normEmail } from "./util.js";
+import { resolveAccess, teamIndex } from "./resolver.js";
 
 /** @typedef {import("./registry-port.js").Registry} Registry */
 /** @typedef {import("./registry-port.js").Role} Role */
@@ -38,46 +40,52 @@ export const USE_CHUNK = 1000;
 export const identityKey = id => `${id.user}\n${id.email ?? ""}\n${id.domain ?? ""}`;
 
 const live = (x, t) => x && !x.revoked && (x.expiresAt == null || t < x.expiresAt);
+const nothing = () => ({ ladder: null, permissions: new Set(), sources: [], until: Infinity });
+const NO_TEAMS = new Set();
 const okIdentity = id => !!id && typeof id.user === "string";
 
 /**
- * The rule itself, pure. `invites`: this board's invites to the identity's email; `links`: the link records of the
- * identity's uses (any board; only this board's count). Every stored role is capped: unknown roles count for
- * nothing; invites and memberRole stay below owner; links stay within LINK_ROLES.
- * @param {{ board: Board, tenant: Tenant|null, grant: Role|null, invites: Invite[], links: (Link|null)[] }} rows
- * @param {Identity} identity @param {number} t
+ * The room-role rule, pure: `resolveAccess` (server/auth/resolver.js), reduced to the ladder role and `until`.
+ * `invites`: this board's invites to the identity's email; `links`: the link records of the identity's uses (any
+ * board; only this board's count). Every stored role is capped there: unknown roles count for nothing; invites and
+ * general access stay below owner; links stay within LINK_ROLES.
+ * @param {{ ctx: import("./registry-port.js").AccessContext, grant: Role|null, invites: Invite[], links: (Link|null)[] }} rows
+ * @param {Identity} identity @param {number} t @param {{ adminBoardContent?: boolean }} [opts]
  * @returns {Resolved}
  */
-export function combine({ board, tenant, grant, invites, links }, identity, t) {
-  let r = capTo(grant, ROLES), until = Infinity;
-  const dep = x => { if (x.expiresAt != null && x.expiresAt < until) until = x.expiresAt; };
-  for (const i of invites) if (live(i, t)) { r = higher(r, capTo(i.role, INVITE_ROLES)); dep(i); }
-  for (const l of links) if (l && l.board === board.id && live(l, t)) { r = higher(r, capTo(l.role, LINK_ROLES)); dep(l); }
-  if (identity.domain && board.memberRole && tenant?.domain && tenant.domain === identity.domain) r = higher(r, capTo(board.memberRole, INVITE_ROLES));
-  return { role: r ?? null, until };
+export function combine(rows, identity, t, opts) {
+  const a = resolveAccess(rows, identity, t, opts);
+  return { role: a.ladder ?? null, until: a.until };
 }
 
 /**
- * @param {{ registry: Registry, now?: () => number, recordUntil?: (record: object) => number }} deps
+ * @param {{ registry: Registry, now?: () => number, recordUntil?: (record: object) => number, adminBoardContent?: boolean }} deps
+ *   adminBoardContent: does a Unit admin get board content (ladder owner) on every board of the Unit? Default false,
+ *   which keeps today's rule (an admin manages every board but enters a room only with a role). See resolver.js.
  *   recordUntil: for a cache over this tenancy (roleCache): until when a link record `resolve` read may be relied on
  *   (its memo's end). `resolve`'s `until` is capped by it, so an answer never outlives the records it was built from.
  */
-export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity }) {
+export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity, adminBoardContent = false }) {
+  const opts = { adminBoardContent };
+  /** One user's access to a board: ladder role, permissions, sources. @returns {Promise<import("./resolver.js").Access>} */
+  async function accessOn(identity, boardId) {
+    if (!okIdentity(identity) || typeof boardId !== "string") return nothing();
+    const ctx = await registry.accessContext({ type: "board", id: boardId }, { users: [identity.user] });
+    if (!ctx?.board) return nothing();
+    const t = now();
+    const grant = await registry.grant(ctx.board.id, identity.user);
+    const invites = identity.email ? await registry.invitesFor(ctx.board.id, identity.email) : [];
+    const links = [];
+    for (const id of await registry.linkUses(ctx.board.id, identity.user)) links.push(await registry.link(id));
+    const a = resolveAccess({ ctx, grant, invites, links }, identity, t, opts);
+    // Links can change (revokeLink): cap by every link record read.
+    for (const l of links) if (l) a.until = Math.min(a.until, recordUntil(l));
+    return a;
+  }
   /** One user's role with the time it may change by itself. @returns {Promise<Resolved>} */
   async function resolve(identity, boardId) {
-    if (!okIdentity(identity) || typeof boardId !== "string") return { role: null, until: Infinity };
-    const board = await registry.board(boardId);
-    if (!board) return { role: null, until: Infinity };
-    const t = now();
-    const grant = await registry.grant(board.id, identity.user);
-    const invites = identity.email ? await registry.invitesFor(board.id, identity.email) : [];
-    const links = [];
-    for (const id of await registry.linkUses(board.id, identity.user)) links.push(await registry.link(id));
-    const tenant = identity.domain && board.memberRole ? await registry.tenant(board.tenant) : null;
-    const r = combine({ board, tenant, grant, invites, links }, identity, t);
-    // Board and tenant: the fields read never change. Links can (revokeLink): cap by every link record read.
-    for (const l of links) if (l) r.until = Math.min(r.until, recordUntil(l));
-    return r;
+    const a = await accessOn(identity, boardId);
+    return { role: a.ladder, until: a.until };
   }
 
   /**
@@ -92,8 +100,11 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
     const out = new Map();
     const none = () => { for (const [k, id] of ids) out.set(k, { role: null, until: Infinity, identity: id }); return out; };
     if (typeof boardId !== "string" || !ids.size) return none();
-    const board = await registry.board(boardId);
-    if (!board) return none();
+    const users = [...new Set([...ids.values()].map(id => id.user))];
+    const ctx = await registry.accessContext({ type: "board", id: boardId }, { users, fresh: true });   // a pass reads everything fresh
+    if (!ctx?.board) return none();
+    const teamsOf = teamIndex(ctx);                      // user → Teams, once per pass (never a scan per identity)
+    const board = ctx.board;
     const t = now();
     const all = [...ids.values()];
     const grants = new Map((await registry.grants(board.id)).map(g => [g.user, g.role]));
@@ -106,7 +117,7 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
     }
     /** @type {Map<string, string[]>} user → link ids used on this board */
     let uses = new Map();
-    const users = [...new Set(all.map(id => id.user))];   // link uses are per user, whatever the email or domain
+    // link uses are per user, whatever the email or domain: `users` (above) is the distinct set
     if (typeof registry.linkUsesFor === "function") {
       for (let i = 0; i < users.length; i += USE_CHUNK) {
         const chunk = users.slice(i, i + USE_CHUNK), want = new Set(chunk);
@@ -115,11 +126,10 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
     } else for (const u of users) uses.set(u, await registry.linkUses(board.id, u));
     let linkById = new Map();
     for (const ls of uses.values()) if (ls.length) { linkById = new Map((await registry.links(board.id)).map(l => [l.id, l])); break; }
-    const tenant = board.memberRole && all.some(id => id.domain) ? await registry.tenant(board.tenant) : null;
     for (const [k, id] of ids) {
       const invites = id.email ? invitesBy.get(normEmail(id.email)) ?? [] : [];
       const links = (uses.get(id.user) ?? []).map(l => linkById.get(l) ?? null);
-      out.set(k, { ...combine({ board, tenant, grant: grants.get(id.user) ?? null, invites, links }, id, t), identity: id });
+      out.set(k, { ...combine({ ctx, grant: grants.get(id.user) ?? null, invites, links, teams: teamsOf.get(id.user) ?? NO_TEAMS }, id, t, opts), identity: id });
     }
     return out;
   }
@@ -129,6 +139,18 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
     async role(identity, boardId) { return (await resolve(identity, boardId)).role; },
     resolve,
     resolveMany,
+    /**
+     * The effective access of `identity` on a scope: `{ ladder, permissions, sources, until }` (resolver.js). `scope` is a
+     * board id, or `{ type: "board"|"space"|"group"|"unit", id }`. What the admin layer asks ("may this user board.create
+     * in this Space?") and what the UI asks ("why can't I edit?"): permissions, never role names.
+     */
+    async effective(identity, scope) {
+      if (typeof scope === "string") return accessOn(identity, scope);
+      if (!okIdentity(identity) || !scope || typeof scope.id !== "string") return nothing();
+      if (scope.type === "board") return accessOn(identity, scope.id);
+      const ctx = await registry.accessContext(scope, { users: [identity.user] });
+      return ctx ? resolveAccess({ ctx }, identity, now(), opts) : nothing();
+    },
     /** @returns {Promise<Map<string, Role|null>>} identityKey(identity) → role, one entry per distinct requested identity */
     async rolesFor(boardId, identities) {
       const m = await resolveMany(boardId, identities);
@@ -154,7 +176,7 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
   };
 }
 
-const tenancyOver = (registry, now, recordUntil) => tenancy({ registry, now, recordUntil });
+const tenancyOver = (registry, now, recordUntil, adminBoardContent) => tenancy({ registry, now, recordUntil, adminBoardContent });
 
 // ---- roleCache: a role cache over `tenancy` (p5-load; p-audit F8). Depends only on the Registry port. ----
 //
@@ -165,8 +187,8 @@ const tenancyOver = (registry, now, recordUntil) => tenancy({ registry, now, rec
 //     (time-based loss sends no message); and the end of the memo of every link record it was built from (p5-load2v
 //     MEDIUM 0: a joiner of an in-flight link read counts from that read's start), so with linkTtlMs ≤ ttlMs no
 //     entry rests on link data more than ttlMs old. Bounded by `maxEntries` (oldest dropped first).
-//   - the records whose read fields can't change once written: board and tenant for 10 min (board.id, memberRole,
-//     tenant, tenant.domain have no update method; `admins` does change and is never served from here), and link
+//   - the records whose read fields can't change once written: boards for 10 min (board.id, memberRole, tenant have no
+//     update method), the board's chain (Space, Group, tenant) for ttlMs (below), and link
 //     records by id for 30 s (a link changes only by revokeLink, which announces on `grants`). `live()` is evaluated
 //     on every use, so a memoized link still expires on time. Lookups of the same record share one read, unless an
 //     invalidation came between.
@@ -183,24 +205,28 @@ const tenancyOver = (registry, now, recordUntil) => tenancy({ registry, now, rec
 // Errors are never cached: a Registry failure propagates (the gateway answers `unavailable`).
 
 /**
- * @param {{ registry: Registry, now?: () => number, ttlMs?: number, recordTtlMs?: number, linkTtlMs?: number, maxEntries?: number, maxRecords?: number }} o
+ * @param {{ registry: Registry, now?: () => number, ttlMs?: number, recordTtlMs?: number, linkTtlMs?: number, maxEntries?: number, maxRecords?: number, adminBoardContent?: boolean }} o
  *   ttlMs: a role entry's longest life, counted from when the oldest changeable data it rests on was read (default
  *     30 s; keep it ≤ the gateway's 60 s re-check, see the report). An entry built from a memoized link record ends no
  *     later than that record's memo (p5-load2v MEDIUM 0), so with linkTtlMs ≤ ttlMs a role is never served from data
  *     more than ttlMs old;
- *   recordTtlMs: board and tenant records (default 10 min, above the 60 s pass, so a pass reads them from memory). The
- *     fields the cache reads from them (board.id, board.memberRole, board.tenant, tenant.domain) never change: the
- *     port has no update or delete for either (p5-loadv finding 6). `tenant.admins` DOES change at runtime
- *     (addTenantAdmin, add-only): never serve `admins` (or any field but those four) from this memo; admin checks
- *     read the Registry (server/admin/boards.js). IF a future port adds one (setMemberRole,
- *     deleteBoard, a tenant domain change), that write must announce `{ board }` (every board of the tenant, for a
- *     tenant change) and `invalidate(board)` must then also drop the board and tenant records: today it drops roles
- *     and links only;
+ *   recordTtlMs: board records (default 10 min, above the 60 s pass, so a pass reads them from memory). The fields the
+ *     cache reads from them (board.id, board.memberRole, board.tenant) never change: the port has no update or delete
+ *     for either (p5-loadv finding 6). IF a future port adds one (setMemberRole, deleteBoard), that write must announce
+ *     `{ board }` and `invalidate(board)` must then also drop the board record: today it drops roles, links and the chain;
+ *   the CHAIN of a board (its Space, Group and tenant records, `registry.accessContext`'s `chain`): kept for `ttlMs` per
+ *     board, so a hello after the first reads only the volatile parts (grants, roles, Team members) in the one
+ *     statement. `invalidate(board)` drops it, and a read in flight across an invalidation never fills it. What it holds
+ *     can change (a Space moved, a general access edited, a domain or admin added): such a write must announce every
+ *     board it reaches (PROTOCOL.md § Organization, "Freshness"), and the timed pass reads the chain fresh (`fresh`)
+ *     anyway, so it is never older than ttlMs. A tenant's `admins` and `domains` only ever grow, so a stale chain can only
+ *     delay a gain, never hide a revoke;
+ *   adminBoardContent: pass-through to `tenancy` (does a Unit admin get board content everywhere? default false);
  *   linkTtlMs: link records (default 30 s; a link changes by revokeLink, which announces `{ board }` and drops them).
  */
 const STAMP_MAX = 10_000;
 
-export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlMs = 600_000, linkTtlMs = 30_000, maxEntries = 200_000, maxRecords = 100_000 }) {
+export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlMs = 600_000, linkTtlMs = 30_000, maxEntries = 200_000, maxRecords = 100_000, adminBoardContent = false }) {
   if (!registry) throw new Error("roleCache: registry is required");
   const stats = { hits: 0, misses: 0, fills: 0, discarded: 0, recordHits: 0, recordMisses: 0 };
 
@@ -212,7 +238,7 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
   const stale = (board, user, c0) => (boardStamp.get(board) ?? 0) > c0 || (userStamp.get(ukey(board, user)) ?? 0) > c0;
   const endRead = () => { if (--reading === 0) { boardStamp.clear(); userStamp.clear(); } };   // no read in flight: stamps can't matter
 
-  // ---- records: board, tenant, link (by id) ----
+  // ---- records: board, link (by id) ----
   /** @type {Map<string, { value: any, until: number, board: string|null }>} */ const records = new Map();
   /** @type {Map<string, { p: Promise<any>, c0: number }>} in-flight record reads, with the clock they began at */ const recordReads = new Map();
   /** @type {Map<string, Set<string>>} board → its memoized link keys */ const linksOf = new Map();
@@ -250,8 +276,25 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
   const linkUntil = new WeakMap();
   const mark = (kind, v, until) => { if (kind === "link") linkUntil.set(v, until); return v; };
   const board = memo("board", id => registry.board(id));
-  const view = { ...registry, board, tenant: memo("tenant", id => registry.tenant(id)), link: memo("link", id => registry.link(id)) };
-  const tenancy = tenancyOver(view, now, l => linkUntil.get(l) ?? Infinity);
+  // ---- chains: a board's Space, Group and tenant records, handed back to the Registry so a hello reads only the volatile rows ----
+  /** @type {Map<string, { chain: import("./registry-port.js").Chain, until: number }>} oldest first */ const chains = new Map();
+  async function accessContext(scope, o = {}) {
+    if (scope?.type !== "board" || typeof scope.id !== "string") return registry.accessContext(scope, o);
+    const k = scope.id, t = now(), hit = chains.get(k), c0 = clock;
+    const held = !o.fresh && hit && hit.until > t ? hit.chain : undefined;
+    reading++;
+    try {
+      const ctx = await registry.accessContext(scope, { users: o.users, ...(held ? { chain: held } : {}) });
+      if (ctx?.board && !held && (boardStamp.get(k) ?? 0) <= c0) {
+        chains.delete(k);
+        if (chains.size >= maxRecords) chains.delete(chains.keys().next().value);
+        chains.set(k, { chain: { tenant: ctx.tenant, board: ctx.board, space: ctx.space, group: ctx.group }, until: t + ttlMs });
+      }
+      return ctx;
+    } finally { endRead(); }
+  }
+  const view = { ...registry, board, link: memo("link", id => registry.link(id)), accessContext };
+  const tenancy = tenancyOver(view, now, l => linkUntil.get(l) ?? Infinity, adminBoardContent);
 
   // ---- roles ----
   // Entries are keyed by board + identityKey (user, email, domain), as the gateway groups connections, so two
@@ -331,7 +374,7 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
       return new Map([...m].map(([k, r]) => [k, r.role]));
     },
 
-    /** Drop a board's cached roles and link records, or one user's role. Synchronous; call it before re-reading. */
+    /** Drop a board's cached roles, link records and chain, or one user's role. Synchronous; call it before re-reading. */
     invalidate(boardId, user) {
       if (typeof boardId !== "string") return;
       if (typeof user === "string") {
@@ -343,7 +386,7 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
         else clock++;
         return;
       }
-      dropBoard(boardId); dropLinks(boardId);
+      dropBoard(boardId); dropLinks(boardId); chains.delete(boardId);
       if (reading) boardStamp.set(boardId, ++clock); else clock++;   // clock moves either way: no read joins across it
     },
 

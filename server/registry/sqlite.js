@@ -1,4 +1,6 @@
-// The Registry port on SQLite (PROTOCOL.md § Registry): tenants, boards, grants, invites, share links, link uses.
+// The Registry port on SQLite (PROTOCOL.md § Registry): tenants (Units), boards, grants, invites, share links, link uses, and
+// the board organization (Groups, Spaces, Teams, scoped grants, roles, `accessContext`). Start-up only ever ADDS tables
+// (CREATE TABLE IF NOT EXISTS), so opening a database from before the organization is the whole migration, and re-running it is a no-op.
 // Same contract and semantics as platform's in-memory adapter (server/auth/registry.js); method names are stable.
 //
 // Durable = WAL + synchronous=FULL (+ fullfsync on macOS), like server/store/sqlite.js: a resolved write survives a
@@ -15,7 +17,7 @@
 // `user`; insertion order is an explicit `n` column (Postgres: BIGSERIAL / identity), upserts use ON CONFLICT.
 
 import { Database } from "bun:sqlite";
-import { mint } from "../auth/registry-port.js";
+import { mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 
 /** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code`. */
@@ -103,12 +105,39 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     db.run(`CREATE TABLE IF NOT EXISTS reg_link_uses (
       board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES reg_links(id), n INTEGER NOT NULL,
       PRIMARY KEY (board, member, link))`);
+    // Board organization (additive: new tables only, so a database from before it opens unchanged; every statement is
+    // IF NOT EXISTS, so re-running start-up is a no-op). Existing boards stay unfiled (no reg_board_spaces row), existing
+    // tenants read as kind "company" with their one domain, and nothing about anyone's access changes.
+    db.run("CREATE TABLE IF NOT EXISTS reg_tenant_meta (tenant TEXT PRIMARY KEY REFERENCES reg_tenants(id), kind TEXT NOT NULL)");
+    db.run(`CREATE TABLE IF NOT EXISTS reg_tenant_domains (
+      domain TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), n INTEGER NOT NULL)`);
+    db.run(`CREATE TABLE IF NOT EXISTS reg_groups (
+      id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), name TEXT NOT NULL, general_role TEXT, created_at INTEGER NOT NULL)`);
+    db.run(`CREATE TABLE IF NOT EXISTS reg_spaces (
+      id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), grp TEXT REFERENCES reg_groups(id), name TEXT NOT NULL,
+      kind TEXT NOT NULL, owner_user TEXT, general_role TEXT, created_at INTEGER NOT NULL, UNIQUE (tenant, owner_user))`);
+    db.run(`CREATE TABLE IF NOT EXISTS reg_board_spaces (
+      board TEXT PRIMARY KEY REFERENCES reg_boards(id), space TEXT NOT NULL REFERENCES reg_spaces(id))`);
+    db.run(`CREATE TABLE IF NOT EXISTS reg_teams (
+      id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), name TEXT NOT NULL, created_at INTEGER NOT NULL)`);
+    db.run(`CREATE TABLE IF NOT EXISTS reg_team_members (
+      team TEXT NOT NULL REFERENCES reg_teams(id), member TEXT NOT NULL, PRIMARY KEY (team, member))`);
+    db.run(`CREATE TABLE IF NOT EXISTS reg_scope_grants (
+      scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject TEXT NOT NULL, role TEXT NOT NULL, n INTEGER NOT NULL,
+      PRIMARY KEY (scope_type, scope_id, subject_type, subject))`);
+    db.run(`CREATE TABLE IF NOT EXISTS reg_roles (
+      tenant TEXT NOT NULL REFERENCES reg_tenants(id), id TEXT NOT NULL, name TEXT NOT NULL, base TEXT, board_role TEXT,
+      permissions TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (tenant, id))`);
+    db.run("CREATE INDEX IF NOT EXISTS reg_spaces_tenant ON reg_spaces (tenant)");
+    db.run("CREATE INDEX IF NOT EXISTS reg_groups_tenant ON reg_groups (tenant)");
+    db.run("CREATE INDEX IF NOT EXISTS reg_teams_tenant ON reg_teams (tenant)");
   }).immediate(), clock, onAttempt);
   db.run(`PRAGMA busy_timeout=${wait}`);                     // start-up spent part of it; runtime gets the whole budget
 
   const q = {
     tenant: db.query("SELECT id, domain, created_at FROM reg_tenants WHERE id = ?"),
-    tenantByDomain: db.query("SELECT id, domain, created_at FROM reg_tenants WHERE domain = ?"),
+    tenantByDomain: db.query(`SELECT id, domain, created_at FROM reg_tenants WHERE domain = ?1
+      UNION ALL SELECT t.id, t.domain, t.created_at FROM reg_tenant_domains d JOIN reg_tenants t ON t.id = d.tenant WHERE d.domain = ?1`),
     tenantExists: db.query("SELECT 1 AS x FROM reg_tenants WHERE id = ?"),
     insTenant: db.query("INSERT INTO reg_tenants (id, domain, created_at) VALUES (?, ?, ?)"),
     admins: db.query("SELECT member FROM reg_tenant_admins WHERE tenant = ? ORDER BY n"),
@@ -116,7 +145,52 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     adminN: db.query("SELECT coalesce(max(n), 0) + 1 AS n FROM reg_tenant_admins WHERE tenant = ?"),
     insAdmin: db.query("INSERT INTO reg_tenant_admins (tenant, member, n) VALUES (?, ?, ?) ON CONFLICT (tenant, member) DO NOTHING"),
 
-    board: db.query("SELECT id, tenant, title, member_role, created_at FROM reg_boards WHERE id = ?"),
+    tenantKind: db.query("SELECT kind FROM reg_tenant_meta WHERE tenant = ?"),
+    insKind: db.query("INSERT INTO reg_tenant_meta (tenant, kind) VALUES (?, ?)"),
+    extraDomains: db.query("SELECT domain FROM reg_tenant_domains WHERE tenant = ? ORDER BY n"),
+    extraDomainOwner: db.query("SELECT tenant FROM reg_tenant_domains WHERE domain = ?"),
+    extraDomainN: db.query("SELECT coalesce(max(n), 0) + 1 AS n FROM reg_tenant_domains WHERE tenant = ?"),
+    insDomain: db.query("INSERT INTO reg_tenant_domains (domain, tenant, n) VALUES (?, ?, ?)"),
+    setPrimary: db.query("UPDATE reg_tenants SET domain = ? WHERE id = ? AND domain IS NULL"),
+
+    board: db.query("SELECT id, tenant, title, member_role, created_at, (SELECT space FROM reg_board_spaces WHERE board = reg_boards.id) AS space FROM reg_boards WHERE id = ?"),
+    insBoardSpace: db.query("INSERT INTO reg_board_spaces (board, space) VALUES (?, ?)"),
+
+    group: db.query("SELECT * FROM reg_groups WHERE id = ?"),
+    groups: db.query("SELECT * FROM reg_groups WHERE tenant = ? ORDER BY created_at, id"),
+    insGroup: db.query("INSERT INTO reg_groups (id, tenant, name, general_role, created_at) VALUES (?, ?, ?, ?, ?)"),
+    space: db.query("SELECT * FROM reg_spaces WHERE id = ?"),
+    spaces: db.query("SELECT * FROM reg_spaces WHERE tenant = ? ORDER BY created_at, id"),
+    personal: db.query("SELECT * FROM reg_spaces WHERE tenant = ? AND owner_user = ?"),
+    insSpace: db.query("INSERT INTO reg_spaces (id, tenant, grp, name, kind, owner_user, general_role, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"),
+    team: db.query("SELECT * FROM reg_teams WHERE id = ?"),
+    teams: db.query("SELECT * FROM reg_teams WHERE tenant = ? ORDER BY created_at, id"),
+    insTeam: db.query("INSERT INTO reg_teams (id, tenant, name, created_at) VALUES (?, ?, ?, ?)"),
+    insMember: db.query("INSERT INTO reg_team_members (team, member) VALUES (?, ?) ON CONFLICT (team, member) DO NOTHING"),
+    delMember: db.query("DELETE FROM reg_team_members WHERE team = ? AND member = ?"),
+    members: db.query("SELECT member FROM reg_team_members WHERE team = ? ORDER BY member"),
+    membersOf: db.query("SELECT team, member FROM reg_team_members WHERE team IN (SELECT value FROM json_each(?1)) AND (?2 IS NULL OR member IN (SELECT value FROM json_each(?2))) ORDER BY team, member"),
+    sgrants: db.query("SELECT subject_type, subject, role FROM reg_scope_grants WHERE scope_type = ? AND scope_id = ? ORDER BY n"),
+    sgrant: db.query("SELECT role FROM reg_scope_grants WHERE scope_type = ? AND scope_id = ? AND subject_type = ? AND subject = ?"),
+    // Owners that guard a Group or Space: a user's, or a Team's while the Team has a member.
+    sowners: db.query(`SELECT subject_type, subject FROM reg_scope_grants g WHERE scope_type = ? AND scope_id = ? AND role = 'owner'
+      AND (subject_type = 'user' OR EXISTS (SELECT 1 FROM reg_team_members m WHERE m.team = g.subject))`),
+    teamOwned: db.query("SELECT scope_type, scope_id FROM reg_scope_grants WHERE subject_type = 'team' AND subject = ? AND role = 'owner' AND scope_type IN ('group', 'space')"),
+    teamSize: db.query("SELECT count(*) AS c FROM reg_team_members WHERE team = ?"),
+    teamHas: db.query("SELECT 1 AS x FROM reg_team_members WHERE team = ? AND member = ?"),
+    boardsInUnit: db.query("SELECT id FROM reg_boards WHERE tenant = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?3"),
+    boardsInSpace: db.query("SELECT board AS id FROM reg_board_spaces WHERE space = ?1 AND (?2 IS NULL OR board > ?2) ORDER BY board LIMIT ?3"),
+    boardsInGroup: db.query("SELECT bs.board AS id FROM reg_board_spaces bs JOIN reg_spaces s ON s.id = bs.space WHERE s.grp = ?1 AND (?2 IS NULL OR bs.board > ?2) ORDER BY bs.board LIMIT ?3"),
+    scopesOf: db.query(`SELECT scope_type, scope_id, role FROM reg_scope_grants WHERE subject_type = ?1 AND subject = ?2
+      AND (?3 IS NULL OR (scope_type || char(10) || scope_id) > ?3) ORDER BY scope_type, scope_id LIMIT ?4`),
+    sgrantN: db.query("SELECT coalesce(max(n), 0) + 1 AS n FROM reg_scope_grants WHERE scope_type = ? AND scope_id = ?"),
+    upSgrant: db.query(`INSERT INTO reg_scope_grants (scope_type, scope_id, subject_type, subject, role, n) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT (scope_type, scope_id, subject_type, subject) DO UPDATE SET role = excluded.role`),
+    delSgrant: db.query("DELETE FROM reg_scope_grants WHERE scope_type = ? AND scope_id = ? AND subject_type = ? AND subject = ?"),
+    role: db.query("SELECT * FROM reg_roles WHERE tenant = ? AND id = ?"),
+    roles: db.query("SELECT * FROM reg_roles WHERE tenant = ? ORDER BY created_at, id"),
+    insRole: db.query("INSERT INTO reg_roles (tenant, id, name, base, board_role, permissions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"),
+    upRole: db.query("UPDATE reg_roles SET name = ?, board_role = ?, permissions = ? WHERE tenant = ? AND id = ?"),
     boardExists: db.query("SELECT 1 AS x FROM reg_boards WHERE id = ?"),
     insBoard: db.query("INSERT INTO reg_boards (id, tenant, title, member_role, created_at) VALUES (?, ?, ?, ?, ?)"),
 
@@ -151,19 +225,37 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
   /** A fresh server-minted id: retried on the (astronomically rare) collision. */
   const fresh = (f, exists) => { let id; do id = f(); while (exists(id)); return id; };
 
-  const rowTenant = r => r && { id: r.id, domain: r.domain, admins: q.admins.all(r.id).map(a => a.member), createdAt: r.created_at };
-  const rowBoard = r => r && { id: r.id, tenant: r.tenant, title: r.title, memberRole: r.member_role, createdAt: r.created_at };
+  const rowTenant = r => r && {
+    id: r.id, domain: r.domain, domains: [...(r.domain ? [r.domain] : []), ...q.extraDomains.all(r.id).map(d => d.domain)],
+    kind: q.tenantKind.get(r.id)?.kind ?? "company", admins: q.admins.all(r.id).map(a => a.member), createdAt: r.created_at };
+  const rowBoard = r => r && { id: r.id, tenant: r.tenant, title: r.title, memberRole: r.member_role, space: r.space ?? null, createdAt: r.created_at };
+  const rowGroup = r => r && { id: r.id, tenant: r.tenant, name: r.name, generalRole: r.general_role, createdAt: r.created_at };
+  const rowSpace = r => r && { id: r.id, tenant: r.tenant, group: r.grp, name: r.name, kind: r.kind, owner: r.owner_user, generalRole: r.general_role, createdAt: r.created_at };
+  const rowTeam = r => r && { id: r.id, tenant: r.tenant, name: r.name, createdAt: r.created_at };
+  const rowRole = r => r && { id: r.id, tenant: r.tenant, name: r.name, base: r.base, boardRole: r.board_role, permissions: JSON.parse(r.permissions), createdAt: r.created_at };
+  const rowSg = r => ({ subject: { type: r.subject_type, id: r.subject }, role: r.role });
   const rowInvite = r => r && { id: r.id, board: r.board, email: r.email, role: r.role, expiresAt: r.expires_at, revoked: !!r.revoked, by: r.by_user, createdAt: r.created_at };
   const rowLink = r => r && { id: r.id, board: r.board, role: r.role, expiresAt: r.expires_at, revoked: !!r.revoked, by: r.by_user, createdAt: r.created_at };
   // undefined → null (bun:sqlite refuses undefined bindings); everything else as given.
   const nz = v => (v === undefined ? null : v);
 
-  const createTenantTx = db.transaction((domain, admins, createdAt) => {
-    if (domain && q.tenantByDomain.get(domain)) throw new Error("registry: domain already has a tenant");
+  /** The tenant that owns `domain` (primary or extra), or undefined. */
+  const domainOwner = d => q.tenantByDomain.get(d)?.id;
+  const createTenantTx = db.transaction((ds, kind, admins, createdAt) => {
+    if (ds.some(domainOwner)) throw new Error("registry: domain already has a tenant");
     const id = fresh(mint.tenant, i => !!q.tenantExists.get(i));
-    q.insTenant.run(id, domain, createdAt);
+    q.insTenant.run(id, ds[0] ?? null, createdAt);
+    q.insKind.run(id, kind);
+    ds.slice(1).forEach(d => q.insDomain.run(d, id, q.extraDomainN.get(id).n));
     for (const a of admins) q.insAdmin.run(id, a, q.adminN.get(id).n);
     return rowTenant(q.tenant.get(id));
+  });
+  const addDomainTx = db.transaction((tenant, d) => {
+    if (!q.tenantExists.get(tenant)) throw new Error("registry: no such tenant");
+    const owner = domainOwner(d);
+    if (owner && owner !== tenant) throw new Error("registry: domain already has a tenant");
+    if (owner) return;
+    if (q.setPrimary.run(d, tenant).changes === 0) q.insDomain.run(d, tenant, q.extraDomainN.get(tenant).n);
   });
 
   const addAdminTx = db.transaction((tenant, user) => {
@@ -171,10 +263,12 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     q.insAdmin.run(tenant, user, q.adminN.get(tenant).n);
   });
 
-  const createBoardTx = db.transaction((tenant, title, memberRole, createdAt) => {
+  const createBoardTx = db.transaction((tenant, title, memberRole, space, createdAt) => {
     if (!q.tenantExists.get(tenant)) throw new Error("registry: no such tenant");
+    if (space != null && q.space.get(space)?.tenant !== tenant) throw new Error("registry: no such space");
     const id = fresh(mint.board, i => !!q.boardExists.get(i));
-    q.insBoard.run(id, tenant, title, memberRole, createdAt);
+    q.insBoard.run(id, tenant, title, memberRole === undefined ? (space != null ? null : "viewer") : memberRole, createdAt);
+    if (space != null) q.insBoardSpace.run(id, space);
     return rowBoard(q.board.get(id));
   });
 
@@ -208,16 +302,118 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     q.insUse.run(l.board, user, link, q.useN.get(l.board, user).n);
   });
 
+  // ---- organization ----
+  const needRow = (ok, what) => { if (!ok) throw new Error(`registry: no such ${what}`); };
+  const putSg = (type, id, st, sid, role) => {
+    if (role == null) q.delSgrant.run(type, id, st, sid);
+    else q.upSgrant.run(type, id, st, sid, role, q.sgrantN.get(type, id).n);
+  };
+  const scopeTenant = (type, id) => (type === "unit" ? q.tenantExists.get(id) && id : type === "group" ? q.group.get(id)?.tenant
+    : type === "space" ? q.space.get(id)?.tenant : q.board.get(id)?.tenant);
+  const createGroupTx = db.transaction((tenant, name, generalRole, owner, createdAt) => {
+    needRow(q.tenantExists.get(tenant), "tenant");
+    const id = fresh(mint.group, i => !!q.group.get(i));
+    q.insGroup.run(id, tenant, name, generalRole, createdAt);
+    if (owner != null) putSg("group", id, "user", owner, "owner");
+    return rowGroup(q.group.get(id));
+  });
+  const createSpaceTx = db.transaction((tenant, name, group, generalRole, owner, createdAt) => {
+    needRow(q.tenantExists.get(tenant), "tenant");
+    if (group != null) needRow(q.group.get(group)?.tenant === tenant, "group");
+    const id = fresh(mint.space, i => !!q.space.get(i));
+    q.insSpace.run(id, tenant, group, name, "shared", null, generalRole, createdAt);
+    if (owner != null) putSg("space", id, "user", owner, "owner");
+    return rowSpace(q.space.get(id));
+  });
+  const personalTx = db.transaction((tenant, user, createdAt) => {
+    needRow(q.tenantExists.get(tenant), "tenant");
+    const have = q.personal.get(tenant, user);
+    if (have) return rowSpace(have);
+    const id = fresh(mint.space, i => !!q.space.get(i));
+    q.insSpace.run(id, tenant, null, orgDefaults.personalName(user), "personal", user, null, createdAt);
+    putSg("space", id, "user", user, "owner");
+    return rowSpace(q.space.get(id));
+  });
+  const createTeamTx = db.transaction((tenant, name, createdAt) => {
+    needRow(q.tenantExists.get(tenant), "tenant");
+    const id = fresh(mint.team, i => !!q.team.get(i));
+    q.insTeam.run(id, tenant, name, createdAt);
+    return rowTeam(q.team.get(id));
+  });
+  const setMemberTx = db.transaction((team, user, member) => {
+    needRow(q.team.get(team), "team");
+    if (!member && q.teamSize.get(team).c === 1 && q.teamHas.get(team, user)) {
+      // Removing the last member of a Team that is the only counted owner of a Group or Space would leave it ownerless.
+      for (const o of q.teamOwned.all(team)) if (q.sowners.all(o.scope_type, o.scope_id).length <= 1)
+        throw new SqlRegistryError("last-owner", `a ${o.scope_type} keeps at least one owner`);
+    }
+    (member ? q.insMember : q.delMember).run(team, user);
+  });
+  const setSgrantTx = db.transaction((type, id, st, sid, role) => {
+    const tenant = scopeTenant(type, id);
+    needRow(tenant, "scope");
+    if (st === "team") needRow(q.team.get(sid)?.tenant === tenant, "team");
+    if (type === "board" && st === "user") throw new Error("registry: a user's grant on a board is setGrant");
+    const cur = q.sgrant.get(type, id, st, sid)?.role ?? null;
+    if ((type === "group" || type === "space") && cur === "owner" && role !== "owner") {
+      const counted = q.sowners.all(type, id);
+      if (counted.some(o => o.subject_type === st && o.subject === sid) && counted.length <= 1)
+        throw new SqlRegistryError("last-owner", `a ${type} keeps at least one owner`);
+    }
+    putSg(type, id, st, sid, role);
+  });
+  const createRoleTx = db.transaction((tenant, name, base, boardRole, perms, createdAt) => {
+    needRow(q.tenantExists.get(tenant), "tenant");
+    const id = fresh(mint.role, i => !!q.role.get(tenant, i));
+    q.insRole.run(tenant, id, name, base, boardRole, JSON.stringify(perms), createdAt);
+    return rowRole(q.role.get(tenant, id));
+  });
+  const updateRoleTx = db.transaction((tenant, id, patch, createdAt) => {
+    needRow(q.tenantExists.get(tenant), "tenant");
+    let r = q.role.get(tenant, id);
+    if (!r) {
+      needRow(id === MEMBER_ROLE_ID, "role");
+      q.insRole.run(tenant, id, "Unit member", null, null, JSON.stringify(DEFAULT_MEMBER_PERMS), createdAt);
+      r = q.role.get(tenant, id);
+    }
+    q.upRole.run(patch.name !== undefined ? orgDefaults.name(patch.name) : r.name, patch.boardRole !== undefined ? patch.boardRole : r.board_role,
+      JSON.stringify(patch.permissions !== undefined ? patch.permissions : JSON.parse(r.permissions)), tenant, id);
+    return rowRole(q.role.get(tenant, id));
+  });
+  // One snapshot read of a scope's whole chain: a fixed number of statements however many grants, Teams or members.
+  // `chain` (already read by the caller) skips the chain statements; `users` limits Team members to those users.
+  const contextTx = db.transaction((type, id, users, held) => {
+    const board = held ? held.board : type === "board" ? rowBoard(q.board.get(id)) : null;
+    const space = held ? held.space : type === "space" ? rowSpace(q.space.get(id)) : board?.space ? rowSpace(q.space.get(board.space)) : null;
+    const group = held ? held.group : type === "group" ? rowGroup(q.group.get(id)) : space?.group ? rowGroup(q.group.get(space.group)) : null;
+    const owner = board ?? space ?? group;
+    const tenant = held ? held.tenant : rowTenant(q.tenant.get(type === "unit" ? id : owner?.tenant));
+    if (!tenant || (type !== "unit" && !owner)) return null;
+    const sg = (t, i) => (i == null ? [] : q.sgrants.all(t, i).map(rowSg));
+    const scoped = { unit: sg("unit", tenant.id), group: sg("group", group?.id), space: sg("space", space?.id), board: sg("board", board?.id) };
+    const teamIds = [...new Set(Object.values(scoped).flat().filter(g => g.subject.type === "team").map(g => g.subject.id))];
+    const teams = Object.fromEntries(teamIds.map(t => [t, []]));
+    if (teamIds.length) for (const m of q.membersOf.all(JSON.stringify(teamIds), users ? JSON.stringify(users) : null)) teams[m.team].push(m.member);
+    return { tenant, board, space, group, scoped, roles: q.roles.all(tenant.id).map(rowRole), teams };
+  });
+
   return {
-    async createTenant({ domain, admins = [] }) {
+    async createTenant({ domain, domains = [], kind = "company", admins = [] }) {
       ready();
-      const d = domain ? String(domain).toLowerCase() : null;
-      return createTenantTx.immediate(d, [...admins].map(String), now());
+      if (!KINDS.includes(kind)) throw new Error("registry: bad unit kind");
+      return createTenantTx.immediate(domainList(domain, domains), kind, [...admins].map(String), now());
+    },
+    async addTenantDomain(tenant, domain) {
+      ready();
+      const d = domainList(domain)[0];
+      if (!str(tenant)) throw new Error("registry: no such tenant");
+      if (!d) throw new Error("registry: bad domain");
+      addDomainTx.immediate(tenant, d);
     },
     async tenant(id) { ready(); return str(id) ? rowTenant(q.tenant.get(id)) ?? null : null; },
     async tenantByDomain(domain) {
       ready();
-      return str(domain) && domain ? rowTenant(q.tenantByDomain.get(domain.toLowerCase())) ?? null : null;
+      return str(domain) && domain ? rowTenant(q.tenantByDomain.get(domain.toLowerCase())) ?? null : null;   // the UNION ALL yields ≤ 1 row: a domain has one tenant
     },
     async tenantAdminsAmong(users) { ready(); return q.adminsAmong.all(JSON.stringify(users.filter(str))).map(r => r.member); },
     async addTenantAdmin(tenant, user) {
@@ -226,10 +422,11 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       addAdminTx.immediate(tenant, String(user));
     },
 
-    async createBoard({ tenant, title = "", memberRole = "viewer" }) {
+    async createBoard({ tenant, title = "", memberRole, space }) {
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");
-      return createBoardTx.immediate(tenant, String(title), nz(memberRole), now());
+      if (space != null && !str(space)) throw new Error("registry: no such space");
+      return createBoardTx.immediate(tenant, String(title), memberRole === undefined ? undefined : nz(memberRole), nz(space), now());
     },
     async board(id) { ready(); return str(id) ? rowBoard(q.board.get(id)) ?? null : null; },
 
@@ -287,6 +484,82 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       if (!str(board) || !us.length) return out;
       for (const r of q.usesFor.all(board, JSON.stringify(us))) { if (!out.has(r.member)) out.set(r.member, []); out.get(r.member).push(r.link); }
       return out;
+    },
+
+    // ---- organization (PROTOCOL.md § Registry, "Organization") ----
+    async createGroup({ tenant, name, generalRole = null, owner }) {
+      ready();
+      if (!str(tenant)) throw new Error("registry: no such tenant");
+      return createGroupTx.immediate(tenant, orgDefaults.name(name), nz(generalRole), owner == null ? null : String(owner), now());
+    },
+    async group(id) { ready(); return str(id) ? rowGroup(q.group.get(id)) ?? null : null; },
+    async groups(tenant) { ready(); return str(tenant) ? q.groups.all(tenant).map(rowGroup) : []; },
+    async createSpace({ tenant, name, group = null, generalRole = "viewer", owner }) {
+      ready();
+      if (!str(tenant)) throw new Error("registry: no such tenant");
+      if (group != null && !str(group)) throw new Error("registry: no such group");
+      return createSpaceTx.immediate(tenant, orgDefaults.name(name), nz(group), nz(generalRole), owner == null ? null : String(owner), now());
+    },
+    async space(id) { ready(); return str(id) ? rowSpace(q.space.get(id)) ?? null : null; },
+    async spaces(tenant) { ready(); return str(tenant) ? q.spaces.all(tenant).map(rowSpace) : []; },
+    async ensurePersonalSpace(tenant, user) {
+      ready();
+      if (!str(tenant)) throw new Error("registry: no such tenant");
+      return personalTx.immediate(tenant, String(user), now());
+    },
+    async createTeam({ tenant, name }) {
+      ready();
+      if (!str(tenant)) throw new Error("registry: no such tenant");
+      return createTeamTx.immediate(tenant, orgDefaults.name(name), now());
+    },
+    async team(id) { ready(); return str(id) ? rowTeam(q.team.get(id)) ?? null : null; },
+    async teams(tenant) { ready(); return str(tenant) ? q.teams.all(tenant).map(rowTeam) : []; },
+    async setTeamMember(team, user, member) {
+      ready();
+      if (!str(team)) throw new Error("registry: no such team");
+      setMemberTx.immediate(team, String(user), !!member);
+    },
+    async teamMembers(team) { ready(); return str(team) ? q.members.all(team).map(r => r.member) : []; },
+    async setScopedGrant({ scope, subject, role }) {
+      ready();
+      const { type, id } = orgDefaults.scope(scope), sub = orgDefaults.subject(subject);
+      setSgrantTx.immediate(type, id, sub.type, sub.id, orgDefaults.grantRole(role));
+    },
+    async scopedGrants(scope) {
+      ready();
+      const { type, id } = orgDefaults.scope(scope);
+      return q.sgrants.all(type, id).map(rowSg);
+    },
+    async createRole({ tenant, name, base = null, boardRole, permissions = [] }) {
+      ready();
+      if (!str(tenant)) throw new Error("registry: no such tenant");
+      return createRoleTx.immediate(tenant, orgDefaults.name(name), nz(base), nz(boardRole), [...permissions], now());
+    },
+    async updateRole(tenant, id, patch) {
+      ready();
+      if (!str(tenant) || !str(id)) throw new Error("registry: no such role");
+      return updateRoleTx.immediate(tenant, id, patch ?? {}, now());
+    },
+    async role(tenant, id) { ready(); return str(tenant) && str(id) ? rowRole(q.role.get(tenant, id)) ?? null : null; },
+    async roles(tenant) { ready(); return str(tenant) ? q.roles.all(tenant).map(rowRole) : []; },
+    async accessContext(scope, { users, chain } = {}) {
+      ready();
+      const { type, id } = orgDefaults.scope(scope);
+      return contextTx(type, id, users ? users.filter(str) : null, chain ?? null);
+    },
+    async boardsIn(scope, { after = null, limit } = {}) {
+      ready();
+      const { type, id } = orgDefaults.scope(scope), n = pageLimit(limit), cur = orgDefaults.cursor(after, "id");
+      const q1 = type === "unit" ? q.boardsInUnit : type === "group" ? q.boardsInGroup : type === "space" ? q.boardsInSpace : null;
+      const ids = q1 ? q1.all(id, cur, n + 1).map(r => r.id) : [];
+      return { ids: ids.slice(0, n), next: ids.length > n ? ids[n - 1] : null };
+    },
+    async scopesOf(subject, { after = null, limit } = {}) {
+      ready();
+      const sub = orgDefaults.subject(subject), n = pageLimit(limit);
+      const rows = q.scopesOf.all(sub.type, sub.id, orgDefaults.cursor(after, "scope"), n + 1).map(r => ({ type: r.scope_type, id: r.scope_id, role: r.role }));
+      const scopes = rows.slice(0, n);
+      return { scopes, next: rows.length > n ? scopes[n - 1].type + "\n" + scopes[n - 1].id : null };
     },
 
     /** What the registry was opened with, read back from SQLite (for /health and tests). */

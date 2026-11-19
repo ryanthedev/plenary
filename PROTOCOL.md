@@ -1075,17 +1075,24 @@ submit**. Without the header a create behaves as before.
 | Same key, per signed-in user | Answer |
 |---|---|
 | first use | runs the create; the answer is stored under the key |
-| again, after the first finished | **the first answer, replayed**: same status and body (a 201 with the object, or a stored `503 owner-grant-failed` with the board id), plus the header `Idempotent-Replayed: true`. Nothing is created |
+| again, after the first finished | **the answer, rebuilt** for the caller as they are now (rule below): the same status, the object read fresh (a 201 with it, or `503 owner-grant-failed` with the board id), plus the header `Idempotent-Replayed: true`. Nothing is created |
 | again, while the first is still running (a call cut by the deadline keeps running) | `409 {error:"in-progress"}` with `Retry-After: 1`; the client retries until it gets the stored answer |
 | again, with a different route, path parameter or body | `422 {error:"idempotency-key-reused"}`; nothing runs |
 
 - **The deadline does not lose the answer.** The create keeps running after the 503, and its outcome is stored when it finishes, so a later retry gets the
   real result: the board id, or `owner-grant-failed` with the id of the board that has no owner yet (a Unit admin repairs it, § Registry).
+- **A replay is authorized again (security).** What is stored under a key is `{ status, ref: { id } }`, **never a response body** (a link's `url`, an
+  invite's address and the object's other fields are not in it). A repeat re-runs the create's own authorization for the caller as they are now,
+  then reads the object fresh: `POST /boards` needs `board.create` at the board's Space (and a personal Space is its owner's alone), `POST /spaces`
+  `space.create` at its Group or the Unit, `POST /groups` `group.create`, invites and links the board-manager check of the invites and links routes
+  (`readInvite`, `readLink`). A caller who lost that access since gets the route's ordinary `403 forbidden`, never the stored answer and no token. A
+  stored `owner-grant-failed` is authorized like the board create. A link's `id` is itself its capability; it is the same id `reg_links` holds in the
+  same store, and it is returned only after the manager check.
 - **Not stored:** a refusal made before anything was written (400, 403, 404 from the use case) or a failure with no outcome: the claim is dropped and the
   retry runs again.
-- **Scope and retention.** A key belongs to its user (ids are globally unique, so the Unit adds nothing). A finished answer is kept **24 h**; a claim whose
+- **Scope and retention.** A key belongs to its user (ids are globally unique, so the Unit adds nothing): another user's request under the same key is a separate key and never sees or collides with this user's answer. A finished answer is kept **24 h**; a claim whose
   create never reported (a crash) can be taken over after **60 s**. The store is bounded by age: expired rows are deleted in small batches as keys arrive.
-  The body is stored as a SHA-256 fingerprint plus the answer; the request body is not.
+  The request body is stored only as a SHA-256 fingerprint.
 - **Port** (§ Registry, `idemClaim`, `idemFinish`, `idemRelease`): the store is behind the Registry port; memory, SQLite (`reg_idempotency`) and Postgres
   (`reg_idempotency`, one atomic upsert-claim) implement it, and `registry-contract.js` pins the three.
 

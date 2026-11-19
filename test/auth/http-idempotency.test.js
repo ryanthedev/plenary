@@ -22,10 +22,10 @@ function virtualTimers() {
 let mem, reg, routes, vt, acme, hooks;
 /** `hooks.before[method]` may return a promise a registry call waits on (a slow call), or throw (a failing one). */
 beforeEach(async () => {
-  hooks = { before: {}, created: [] };
+  hooks = { before: {}, created: [], stored: [] };
   vt = virtualTimers();
   mem = memoryRegistry();
-  reg = new Proxy(mem, { get(o, k) { const v = o[k]; return typeof v === "function" ? async (...a) => { await hooks.before[k]?.(...a); const out = await v.apply(o, a); if (k === "createBoard") hooks.created.push(out.id); return out; } : v; } });
+  reg = new Proxy(mem, { get(o, k) { const v = o[k]; return typeof v === "function" ? async (...a) => { await hooks.before[k]?.(...a); const out = await v.apply(o, a); if (k === "createBoard") hooks.created.push(out.id); if (k === "idemFinish") hooks.stored.push(a[3]); return out; } : v; } });
   const tenancy = makeTenancy({ registry: reg });
   const dev = devAuth({ enabled: true, tokens: { ada: { name: "ada", domain: "acme.com", email: "ada@acme.com" }, bo: { name: "bo", domain: "acme.com", email: "bo@acme.com" } } });
   acme = await mem.createTenant({ domain: "acme.com", admins: ["dev:ada"] });
@@ -141,4 +141,81 @@ test("spaces, groups, invites and links replay the same object under one key", a
   // the board id is part of the request: the same key on another board is a changed request
   const other = (await (await post("/boards", { title: "C" })).json()).board.id;
   expect((await post(`/boards/${other}/links`, { role: "viewer" }, { key: "key-link-001" })).status).toBe(422);
+});
+
+// ---- the replay is authorized again (security review): a stored answer is a reference, never a body, and never outlives the caller's access ----
+
+const owned = async () => {   // a board ada owns, with bo as a second owner
+  const board = (await (await post("/boards", { title: "Shared" })).json()).board.id;
+  await mem.setGrant(board, "dev:bo", "owner");
+  return board;
+};
+
+test("SEC a link made by an owner who then loses the board: replaying the key is 403 forbidden with no token anywhere in the body, and only a reference was stored", async () => {
+  const board = await owned();
+  const first = await post(`/boards/${board}/links`, { role: "viewer" }, { tok: "bo", key: K });
+  const made = await first.json();
+  expect(first.status).toBe(201);
+  // what is stored is a reference only ({ status, ref: { id } }): no body, no url. (A link's id is the id reg_links already holds in the same store.)
+  expect(hooks.stored.map(t => Object.keys(JSON.parse(t)).sort())).toEqual([["ref", "status"]]);
+  expect(hooks.stored.join("")).not.toContain(made.url);
+  expect(hooks.stored.join("")).not.toContain("viewer");
+  expect(await post(`/boards/${board}/links`, { role: "viewer" }, { tok: "bo", key: K }).then(r => r.status)).toBe(201);   // still allowed: replayed
+  await mem.setGrant(board, "dev:bo", "viewer");   // bo is no longer a manager
+  const replay = await post(`/boards/${board}/links`, { role: "viewer" }, { tok: "bo", key: K });
+  expect(replay.status).toBe(403);
+  const text = await replay.text();
+  expect(text).not.toContain(made.link.id);
+  expect(text).not.toContain("link");
+  expect(replay.headers.get("idempotent-replayed")).toBeNull();
+});
+
+test("SEC the same for an invite, and the replay reads the link fresh (a revoked link shows as revoked)", async () => {
+  const board = await owned();
+  const inv = await (await post(`/boards/${board}/invites`, { email: "x@y.com", role: "viewer" }, { tok: "bo", key: "key-inv-sec01" })).json();
+  const lk = await (await post(`/boards/${board}/links`, { role: "viewer" }, { tok: "bo", key: "key-lnk-sec01" })).json();
+  expect(hooks.stored.join("")).not.toContain("x@y.com");   // the invited address is not in the key store
+  await mem.revokeLink(lk.link.id);
+  const stillLink = await post(`/boards/${board}/links`, { role: "viewer" }, { tok: "bo", key: "key-lnk-sec01" });
+  expect(stillLink.status).toBe(201);   // revoked links are still readable by their managers (they list as revoked); the body is fresh
+  expect((await stillLink.json()).link.revoked).toBe(true);
+  await mem.setGrant(board, "dev:bo", "viewer");
+  const r = await post(`/boards/${board}/invites`, { email: "x@y.com", role: "viewer" }, { tok: "bo", key: "key-inv-sec01" });
+  expect(r.status).toBe(403);
+  expect(await r.text()).not.toContain(inv.invite.id);
+});
+
+test("SEC a board made in a Space by an editor who then loses board.create there: the replay is 403; a Space or Group made under a key likewise", async () => {
+  const sp = (await (await post("/spaces", { name: "Shared" })).json()).space.id;
+  await mem.setScopedGrant({ scope: { type: "space", id: sp }, subject: { type: "user", id: "dev:bo" }, role: "editor" });
+  const made = await (await post("/boards", { title: "Mine", space: sp }, { tok: "bo", key: K })).json();
+  expect((await post("/boards", { title: "Mine", space: sp }, { tok: "bo", key: K })).status).toBe(201);
+  await mem.setScopedGrant({ scope: { type: "space", id: sp }, subject: { type: "user", id: "dev:bo" }, role: null });
+  await mem.setScopedGrant({ scope: { type: "space", id: sp }, subject: { type: "user", id: "dev:bo" }, role: "viewer" });
+  const r = await post("/boards", { title: "Mine", space: sp }, { tok: "bo", key: K });
+  expect(r.status).toBe(403);
+  expect(await r.text()).not.toContain(made.board.id);
+  // a Space under a Group: bo is a Group editor, then not
+  const g = (await (await post("/groups", { name: "Team" })).json()).group.id;
+  await mem.setScopedGrant({ scope: { type: "group", id: g }, subject: { type: "user", id: "dev:bo" }, role: "editor" });
+  const s2 = await (await post("/spaces", { name: "Under", group: g }, { tok: "bo", key: "key-sp-sec01" })).json();
+  expect(s2.space.id).toBeTruthy();
+  await mem.setScopedGrant({ scope: { type: "group", id: g }, subject: { type: "user", id: "dev:bo" }, role: null });
+  const r2 = await post("/spaces", { name: "Under", group: g }, { tok: "bo", key: "key-sp-sec01" });
+  expect(r2.status).toBe(403);
+  expect(await r2.text()).not.toContain(s2.space.id);
+  // a Group is replayed by its creator while they still hold group.create (the unit admin here), and answers as the create did
+  const gr = await (await post("/groups", { name: "Again" }, { key: "key-gr-sec01" })).json();
+  const grAgain = await post("/groups", { name: "Again" }, { key: "key-gr-sec01" });
+  expect([grAgain.status, (await grAgain.json()).group.id]).toEqual([201, gr.group.id]);
+});
+
+test("SEC another user replaying the same key never sees the first user's result (keys are per user): they get their own object, not a replay", async () => {
+  const board = await owned();
+  const a = await (await post(`/boards/${board}/links`, { role: "viewer" }, { key: K })).json();
+  const b = await post(`/boards/${board}/links`, { role: "viewer" }, { tok: "bo", key: K });
+  expect(b.headers.get("idempotent-replayed")).toBeNull();
+  const bb = await b.json();
+  expect(bb.link.id).not.toBe(a.link.id);
+  expect(JSON.stringify(bb)).not.toContain(a.link.id);
 });

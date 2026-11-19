@@ -197,7 +197,50 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
     return { root: may(unitAccess, "space.create"), groups: out.map(g => ({ id: g.id, name: g.name })), more: cand.length > LIMITS.groups };
   }
 
+  /** The `space.create` check of POST /spaces, at the Group or the Unit root: `{ g, access }` or `forbidden`. Shared with the replay of a keyed create. */
+  async function spaceCreateAccess(identity, unit, group) {
+    let g = null, access;
+    if (group === null) access = await tenancy.effective(identity, { type: "unit", id: unit.id });
+    else {
+      const sc = await scopeOf(identity, unit, "group", group);
+      if (!sc) throw refused();
+      ({ row: g, access } = sc);
+    }
+    if (!may(access, "space.create")) throw refused();
+    return { g, access };
+  }
+  /** The `board.create` check of POST /boards at a Space (personal ones are their owner's alone). Shared with the replay of a keyed create. */
+  const boardCreateAccess = async (identity, unit, space) => {
+    const sc = await scopeOf(identity, unit, "space", space);
+    if (!sc || !createsBoards(sc.access) || (sc.row.kind === "personal" && sc.row.owner !== identity.user)) throw refused();
+    return sc;
+  };
+
   return {
+    /**
+     * Replays of keyed creates (PROTOCOL.md "Idempotent creates"): the key's stored answer is only a reference, and a repeat is
+     * authorized AGAIN, as the create was, for the caller as they are now; then the object is read fresh. A revoked caller gets the
+     * ordinary `forbidden`, never the stored answer.
+     * @param {Identity} identity @param {string} id
+     */
+    async replayBoard(identity, id) {
+      const unit = await unitOf(identity), b = unit && idOf(id) ? await registry.board(id) : null;
+      if (!unit || !b || b.tenant !== unit.id || !b.space) throw refused();
+      await boardCreateAccess(identity, unit, b.space);
+      return b;
+    },
+    async replaySpace(identity, id) {
+      const unit = await unitOf(identity), s = unit && idOf(id) ? await registry.space(id) : null;
+      if (!unit || !s || s.tenant !== unit.id) throw refused();
+      const { g, access } = await spaceCreateAccess(identity, unit, s.group ?? null);
+      return spaceView(s, g && opens(access) ? g : null);
+    },
+    async replayGroup(identity, id) {
+      const unit = await unitOf(identity), g = unit && idOf(id) ? await registry.group(id) : null;
+      if (!unit || !g || g.tenant !== unit.id || !may(await tenancy.effective(identity, { type: "unit", id: unit.id }), "group.create")) throw refused();
+      return { id: g.id, name: g.name, general: g.generalRole ?? null };
+    },
+
     /**
      * POST /boards: a board in `space` (needs `board.create` there) or, with none, in the caller's personal space (always allowed).
      * The caller becomes its owner. `memberRole` absent = inherit the Space (null).
@@ -212,10 +255,8 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
       let target;
       if (space === null) target = (await registry.ensurePersonalSpace(unit.id, identity.user)).id;
       else {
-        const sc = await scopeOf(identity, unit, "space", space);
         // Nobody writes into another member's personal space, an admin included (it is private until its owner shares from it).
-        if (!sc || !createsBoards(sc.access) || (sc.row.kind === "personal" && sc.row.owner !== identity.user)) throw refused();
-        target = sc.row.id;
+        target = (await boardCreateAccess(identity, unit, space)).row.id;
       }
       const board = await registry.createBoard({ tenant: unit.id, title: t, space: target, ...(memberRole !== undefined ? { memberRole } : {}) });
       // createBoard takes no creator: the owner grant is a second call. Retry once; if it still fails, report the failure WITH the board id.
@@ -251,14 +292,7 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
       generalOf(gen);
       const unit = await unitOf(identity);
       if (!unit) throw refused();
-      let g = null, access;
-      if (group === null) access = await tenancy.effective(identity, { type: "unit", id: unit.id });
-      else {
-        const sc = await scopeOf(identity, unit, "group", group);
-        if (!sc) throw refused();
-        ({ row: g, access } = sc);
-      }
-      if (!may(access, "space.create")) throw refused();
+      const { g, access } = await spaceCreateAccess(identity, unit, group);
       const s = await registry.createSpace({ tenant: unit.id, name: n, group: g?.id ?? null, generalRole: gen, owner: identity.user });
       return spaceView(s, g && opens(access) ? g : null);
     },

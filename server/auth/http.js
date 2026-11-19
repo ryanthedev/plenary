@@ -81,7 +81,7 @@
 
 import { b64url, unb64url, utf8, fromUtf8 } from "./util.js";
 import { spaceService } from "./spaces.js";
-import { AdminError, createInvite, listInvites, revokeInvite, createLink, listLinks, revokeLink, setGrant } from "../admin/boards.js";
+import { AdminError, createInvite, listInvites, readInvite, revokeInvite, createLink, listLinks, readLink, revokeLink, setGrant } from "../admin/boards.js";
 
 export const LOGIN_COOKIE = "__Host-plen_login";
 export const EXCHANGE_COOKIE = "__Host-plen_xchg";
@@ -370,11 +370,14 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
   }
   /**
    * A create route's body of work, made idempotent by the `Idempotency-Key` header (PROTOCOL.md "Idempotent creates"). `run()` resolves
-   * `{ status, body }`. Without a key it just runs. With one the key is claimed in the Registry first; a repeat gets the stored answer,
-   * a repeat while the first runs gets 409, a changed request 422. `run` is NOT cancelled by the request deadline: its outcome is
-   * stored when it finishes (even after the client got a 503), which is what lets a retry find the board a cut-off call created.
+   * `{ status, body, ref }`: `ref` names what was made (`{ id, ownerless? }`) and is ALL that is stored, never the body (a link or an invite
+   * carries its secret). `rebuild(ref)` answers a repeat: it authorizes the caller AGAIN, as the create did, and reads the object fresh
+   * (throws `forbidden` for a caller who lost access since). Without a key `run` just runs. With one the key is claimed in the Registry
+   * first; a repeat gets the rebuilt answer, a repeat while the first runs gets 409, a changed request 422. `run` is NOT cancelled by the
+   * request deadline: its outcome is stored when it finishes (even after the client got a 503), which is what lets a retry find the
+   * board a cut-off call created.
    */
-  async function keyed(req, who, route, params, b, run) {
+  async function keyed(req, who, route, params, b, run, rebuild) {
     const k = req.headers.get("idempotency-key");
     if (k === null) { const r = await run(); return json(r.status, r.body); }
     if (!IDEM_KEY.test(k)) throw refuse(400, "bad-idempotency-key");
@@ -385,18 +388,19 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
     if (c.state === "in-progress") return err(409, "in-progress", {}, { "retry-after": "1" });
     if (c.state === "done") {
       let r; try { r = JSON.parse(c.result); } catch { r = null; }
-      if (r && Number.isInteger(r.status)) return json(r.status, r.body, { "idempotent-replayed": "true" });
-      throw refuse(503, "unavailable");
+      if (!r || !Number.isInteger(r.status) || typeof r.ref?.id !== "string") throw refuse(503, "unavailable");
+      const out = await rebuild(r.ref, r.status);   // re-authorized for the caller as they are NOW; a refusal propagates as the route's own
+      return json(out.status, out.body, { "idempotent-replayed": "true" });
     }
     let out;
     try { out = await run(); }
     catch (e) {
       // The create ran and left a board with no owner: that IS its outcome, with the board's id (a retry gets it back).
-      if (e instanceof AdminError && e.code === "owner-grant-failed") out = { status: 503, body: { error: "owner-grant-failed", board: e.board } };
+      if (e instanceof AdminError && e.code === "owner-grant-failed") out = { status: 503, body: { error: "owner-grant-failed", board: e.board }, ref: { id: e.board, ownerless: true } };
       else { await registry.idemRelease(user, k, fp).catch(() => {}); throw e; }   // refused or failed with no outcome: the retry runs again
     }
     // If this write fails the claim expires (60 s) and a retry runs again: the same "may have applied" a keyless create has.
-    await registry.idemFinish(user, k, fp, JSON.stringify(out)).catch(() => {});
+    await registry.idemFinish(user, k, fp, JSON.stringify({ status: out.status, ref: out.ref })).catch(() => {});
     return json(out.status, out.body);
   }
 
@@ -441,7 +445,8 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
     ["/boards", { POST: async req => {
       const who = await caller(req);
       const b = defined(await body(req, ["title", "memberRole", "space"]));
-      return keyed(req, who, "POST /boards", {}, b, async () => ({ status: 201, body: { board: await spaces.createBoard(who, b) } }));
+      return keyed(req, who, "POST /boards", {}, b, async () => { const board = await spaces.createBoard(who, b); return { status: 201, body: { board }, ref: { id: board.id } }; },
+        async ref => { const board = await spaces.replayBoard(who, ref.id); return ref.ownerless ? { status: 503, body: { error: "owner-grant-failed", board: board.id } } : { status: 201, body: { board } }; });
     } }],
     ["/boards/:board", { PATCH: async (req, p) => {
       const who = await caller(req);
@@ -458,14 +463,16 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       POST: async req => {
         const who = await caller(req);
         const b = defined(await body(req, ["name", "group", "general"]));
-        return keyed(req, who, "POST /spaces", {}, b, async () => ({ status: 201, body: { space: await spaces.createSpace(who, b) } }));
+        return keyed(req, who, "POST /spaces", {}, b, async () => { const space = await spaces.createSpace(who, b); return { status: 201, body: { space }, ref: { id: space.id } }; },
+        async ref => ({ status: 201, body: { space: await spaces.replaySpace(who, ref.id) } }));
       },
     }],
     ["/groups", {
       POST: async (req) => {
         const who = await caller(req);
         const b = defined(await body(req, ["name", "general"]));
-        return keyed(req, who, "POST /groups", {}, b, async () => ({ status: 201, body: { group: await spaces.createGroup(who, b) } }));
+        return keyed(req, who, "POST /groups", {}, b, async () => { const group = await spaces.createGroup(who, b); return { status: 201, body: { group }, ref: { id: group.id } }; },
+        async ref => ({ status: 201, body: { group: await spaces.replayGroup(who, ref.id) } }));
       },
       GET: async (req, url) => {
       const who = await caller(req);
@@ -485,7 +492,10 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       POST: async (req, p) => {
         const who = await caller(req);
         const b = await body(req, ["email", "role", "expiresAt"]);
-        return keyed(req, who, "POST /boards/:board/invites", p, b, async () => ({ status: 201, body: { invite: await createInvite({ caller: who, board: p.board, email: b.email, role: b.role, expiresAt: b.expiresAt ?? null }, admin) } }));
+        return keyed(req, who, "POST /boards/:board/invites", p, b, async () => {
+          const invite = await createInvite({ caller: who, board: p.board, email: b.email, role: b.role, expiresAt: b.expiresAt ?? null }, admin);
+          return { status: 201, body: { invite }, ref: { id: invite.id } };
+        }, async ref => ({ status: 201, body: { invite: await readInvite({ caller: who, board: p.board, invite: ref.id }, admin) } }));
       },
     }],
     ["/boards/:board/invites/:id", { DELETE: async (req, p) => {
@@ -497,10 +507,11 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       POST: async (req, p) => {
         const who = await caller(req);
         const b = await body(req, ["role", "expiresAt"]);
+        const linkBody = link => ({ link, ...(publicUrl ? { url: `${publicUrl}/links/${encodeURIComponent(link.id)}` } : {}) });
         return keyed(req, who, "POST /boards/:board/links", p, b, async () => {
           const link = await createLink({ caller: who, board: p.board, role: b.role, expiresAt: b.expiresAt ?? null }, admin);
-          return { status: 201, body: { link, ...(publicUrl ? { url: `${publicUrl}/links/${encodeURIComponent(link.id)}` } : {}) } };
-        });
+          return { status: 201, body: linkBody(link), ref: { id: link.id } };
+        }, async ref => ({ status: 201, body: linkBody(await readLink({ caller: who, board: p.board, link: ref.id }, admin)) }));
       },
     }],
     ["/boards/:board/links/:id", { DELETE: async (req, p) => {

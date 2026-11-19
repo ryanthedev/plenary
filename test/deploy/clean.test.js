@@ -3,10 +3,10 @@
 
 import { test, expect, afterAll } from "bun:test";
 import { appendFileSync, mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, existsSync, symlinkSync, rmSync, chmodSync, realpathSync, lstatSync, statSync, renameSync, utimesSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { clean, summarize, measure, openPaths, openUnder, resolveOpens, resolveNoOpen, renameExcl, loadNativeRename, resetNativeRenameWarning, ROOT } from "../../scripts/clean.js";
 
 const made = [], kids = [];
@@ -118,9 +118,10 @@ test("a symlink to outside is skipped at the top level and never entered inside 
 });
 
 test("refuses a base that is / or $HOME (or a parent of the repo or home)", () => {
+  // the parent of $HOME is /Users on macOS and /home on Linux: a literal "/Users" is no directory on a Linux runner, and an absent base is skipped, not refused
   expect(() => clean({ tempDir: "/", rigRoot: null, openPathsFn: () => [] })).toThrow(/refusing/);
   expect(() => clean({ tempDir: process.env.HOME, rigRoot: null, openPathsFn: () => [] })).toThrow(/refusing/);
-  expect(() => clean({ tempDir: tmpdir(), scratch: "/Users", rigRoot: null, openPathsFn: () => [] })).toThrow(/refusing/);
+  expect(() => clean({ tempDir: tmpdir(), scratch: dirname(homedir()), rigRoot: null, openPathsFn: () => [] })).toThrow(/refusing/);
   expect(() => clean({ tempDir: join(sandbox, "missing"), rigRoot: null, openPathsFn: () => [] }).items).not.toThrow();
 });
 
@@ -128,7 +129,7 @@ test("a refused base throws before lsof is run (no system-wide scan for a reques
   let scans = 0;
   const spy = () => { scans++; return []; };
   expect(() => clean({ tempDir: "/", rigRoot: null, openPathsFn: spy })).toThrow(/refusing/);
-  expect(() => clean({ tempDir: tmpdir(), scratch: "/Users", rigRoot: null, openPathsFn: spy })).toThrow(/refusing/);
+  expect(() => clean({ tempDir: tmpdir(), scratch: dirname(homedir()), rigRoot: null, openPathsFn: spy })).toThrow(/refusing/);
   expect(() => clean({ tempDir: join(sandbox, "none"), rigRoot: "/", openPathsFn: spy })).toThrow(/refusing/);
   // a symlink to / or $HOME, and a relative path that resolves to one, are refused the same way (as temp, scratch and rig)
   const w = world(), toRoot = join(w.root, "to-root"), toHome = join(w.root, "to-home");

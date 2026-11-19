@@ -1079,7 +1079,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       if (put) await store.blobPend(c.tenant, c.board, msg.sha1, BLOB_PENDING_MS);
       url = await blobUrl(c.tenant, c.board, msg.sha1, put ? "PUT" : "GET", c.user);
     }
-    catch (err) { log.error("blob url failed", { conn: c.id, err }); return no("unavailable", "try again shortly"); }
+    catch (err) { log[err?.code === "unavailable" ? "info" : "error"]("blob url failed", { conn: c.id, err }); return no("unavailable", "try again shortly"); }   // "unavailable" is the Store saying ask again (a hash being deleted): expected, not an error
     push(ws, codec.encode({ t: "blob", sha1: msg.sha1, url }));
   }
 

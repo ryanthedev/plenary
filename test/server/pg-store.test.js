@@ -513,21 +513,23 @@ describe.skipIf(!url)("postgres store", () => {
     } finally { if (app) await app.close(); await drop(schema); await client().unsafe(`DROP ROLE IF EXISTS "${role}"`); }
   });
 
-  test("upgrade: a schema made before checkpoint parts gets pl_checkpoint_parts on the owner's next start and still reads its one-row checkpoints", async () => {
+  test("#92 no back-compat: a pre-#92 schema (the Store's older tables, with entries in it) is an old-format store: refused, nothing created; its indexes exist on a fresh one", async () => {
     const schema = schemaName();
     try {
-      await (await postgresStore({ sql: client(), schema })).close?.();
-      await client().unsafe(`DROP TABLE "${schema}".pl_checkpoint_parts`);                  // the schema as the old release left it
-      const cp = { seq: 4, pad: "😀".repeat(500) };
-      await client().unsafe(`INSERT INTO "${schema}".pl_checkpoints (tenant, board, seq, data) VALUES ($1, $2, 4, $3)`, [T, B, JSON.stringify(cp)]);
-      const store = await postgresStore({ sql: client(), schema, partChars: 300 });        // migrate creates the missing table
-      expect(await store.getCheckpoint(T, B)).toEqual(cp);
-      const e = await store.openEpoch(T, B);
-      await store.putCheckpoint(T, B, { ...cp, seq: 5 }, e);
-      expect((await store.getCheckpoint(T, B)).seq).toBe(5);
-      expect((await client().unsafe(`SELECT count(*)::int AS c FROM "${schema}".pl_checkpoint_parts`))[0].c).toBeGreaterThan(1);
-      await store.close();
+      await (await postgresStore({ sql: client(), schema })).close();
+      for (const t of ["pl_blob_refs", "pl_blob_pending", "pl_blob_condemned"]) await client().unsafe(`DROP TABLE "${schema}".${t}`);
+      await client().unsafe(`INSERT INTO "${schema}".pl_entries (tenant, board, seq, data) VALUES ($1, $2, 1, $3)`, [T, B, JSON.stringify(entry(1))]);
+      const err = await postgresStore({ sql: client(), schema }).then(() => null, e => e);
+      expect(err?.code).toBe("old-format");
+      expect(err.message).toMatch(/pl_blob_refs/);
+      expect((await client().unsafe(`SELECT count(*)::int AS c FROM pg_tables WHERE schemaname = $1 AND tablename LIKE 'pl_blob_%'`, [schema]))[0].c).toBe(0);   // nothing was added
     } finally { await drop(schema); }
+    const fresh = schemaName();
+    try {
+      await (await postgresStore({ sql: client(), schema: fresh })).close();
+      const names = (await client().unsafe(`SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND indexname LIKE 'pl_blob_%' AND indexname NOT LIKE '%pkey' ORDER BY indexname`, [fresh])).map(r => r.indexname);
+      expect(names).toEqual(["pl_blob_pending_board", "pl_blob_pending_until", "pl_blob_refs_board"]);
+    } finally { await drop(fresh); }
   });
 
   // ---- The checkpoint lock (a header's commit vs a sweep's delete) ----

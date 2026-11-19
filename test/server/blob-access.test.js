@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { blobAccess, URL_TTL_MS } from "../../server/blob-access.js";
 import { diskBlobs } from "../../server/blobs/disk.js";
 import { PortError } from "../../server/ids.js";
-import { tempDir, cleanup, fakePng, sha1 } from "./helpers.js";
+import { tempDir, cleanup, fakePng, sha1, deferred } from "./helpers.js";
 
 afterAll(cleanup);
 const KEY = new Uint8Array(32).fill(7);
@@ -15,7 +15,7 @@ function make(o = {}) {
   const inner = o.blobs ?? diskBlobs({ dir: join(tempDir(), "blobs") });
   const calls = { usage: 0, put: 0 };
   const blobs = { put: (...a) => { calls.put++; return inner.put(...a); }, get: (...a) => inner.get(...a), usage: (...a) => { calls.usage++; return inner.usage(...a); }, ...(o.wrap ?? {}) };
-  const access = blobAccess({ blobs, key: o.key ?? KEY, origin: "http://h.test", now: () => clock.t, ...(o.quotaBytes !== undefined ? { quotaBytes: o.quotaBytes } : {}) });
+  const access = blobAccess({ blobs, key: o.key ?? KEY, origin: "http://h.test", now: () => clock.t, ...(o.quotaBytes !== undefined ? { quotaBytes: o.quotaBytes } : {}), ...(o.usageTtlMs ? { usageTtlMs: o.usageTtlMs } : {}) });
   return { access, clock, calls, inner };
 }
 const putUrl = (a, tenant, bytes, board = "b1") => a.url(tenant, board, sha1(bytes), "PUT").then(tokenOf);
@@ -147,4 +147,35 @@ test("construction checks its inputs", () => {
   expect(() => blobAccess({ ...base, blobs: { put() {}, get() {} } })).toThrow(TypeError);
   expect(() => blobAccess({ ...base, origin: 5 })).toThrow(TypeError);
   expect(() => blobAccess({ ...base, quotaBytes: -1 })).toThrow(TypeError);
+});
+
+test("#92 MED-4: the cached usage is read again once it is older than usageTtlMs (other nodes' puts and the reaper's deletes change what the tenant stores)", async () => {
+  const { access, clock, calls, inner } = make({ usageTtlMs: 1000 });
+  const a = fakePng(100, 51), b = fakePng(100, 52), c = fakePng(100, 53);
+  expect((await access.put(await putUrl(access, "t1", a), a)).ok).toBe(true);
+  clock.t += 999;
+  await access.put(await putUrl(access, "t1", b), b);
+  expect(calls.usage).toBe(1);                                   // still fresh
+  await inner.delete("t1", sha1(a));                             // another node's reaper removed one
+  clock.t += 1;
+  await access.put(await putUrl(access, "t1", c), c);
+  expect(calls.usage).toBe(2);                                   // stale: read again (and SET, so the deleted bytes no longer count)
+  clock.t += 5000;
+  await access.put(await putUrl(access, "t1", c), c);
+  expect(calls.usage).toBe(3);
+});
+
+test("#92 MED-4: a usage read SETS the count, and a put that began before it adds nothing afterwards (it is in the read, or the next one)", async () => {
+  const gate = deferred();
+  let held = true;
+  const { access, inner } = make({ quotaBytes: 320, wrap: { put: async (...a) => { const r = await inner.put(...a); if (held) { held = false; await gate.promise; } return r; } } });
+  const a = fakePng(100, 54), b = fakePng(100, 55);
+  const first = access.put(await putUrl(access, "t1", a), a);   // stored on disk, its answer held
+  while ((await inner.usage("t1")) === 0) await new Promise(r => setTimeout(r, 1));
+  access.recount("t1");                                          // a reseed lands now: it reads the 100 bytes of a
+  expect((await access.put(await putUrl(access, "t1", b), b)).ok).toBe(true);   // read: 100, + b = 200
+  gate.resolve();
+  expect(await first).toMatchObject({ ok: true, created: true });             // a's `+= 100` is ignored: it is already in the read
+  const c = fakePng(40, 56);
+  expect((await access.put(await putUrl(access, "t1", c), c)).ok).toBe(true);  // 200 + 40 <= 320 (a double count would say 340: quota)
 });

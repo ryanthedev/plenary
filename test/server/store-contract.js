@@ -750,8 +750,12 @@ export function storeContract(name, make) {
         await expire();
         expect(await condemned(store, { graceMs: SHORT })).toEqual([`${T}/${H1}`]);  // the claim lapsed (a node died mid-delete): back on the list
         expect(await store.blobClaim(T, H1, { graceMs: SHORT, claimMs: LONG })).toBe(true);
-        expect(await store.blobReaped(T, H1)).toBe(true);
-        expect(await store.blobReaped(T, H1)).toBe(false);                           // already done
+        expect(await store.blobReaped(T, H1)).toBe(true);                            // the verdict: nothing references it, delete the bytes ...
+        expect(await store.blobReaped(T, H1)).toBe(true);                            // ... and the row stays until that is done (a failed delete is retried), so asking again says the same
+        expect(await condemned(store)).toEqual([]);                                  // still claimed
+        expect(await store.blobReaped(T, H1, { deleted: true })).toBe(true);         // the delete is done: the row goes
+        expect(await store.blobReaped(T, H1)).toBe(false);                           // nothing left to settle
+        expect(await store.blobReaped(T, H1, { deleted: true })).toBe(true);         // a missing row after a delete is clean (another node finished)
         expect(await condemned(store)).toEqual([]);
         expect(await store.blobClaim(T, H1, { graceMs: 0, claimMs: SHORT })).toBe(false);       // gone
         for (const bad of [{ graceMs: 0, claimMs: 0 }, { graceMs: -1, claimMs: 1 }, {}]) expect(await code(store.blobClaim(T, H1, bad))).toBe("bad-entry");
@@ -772,24 +776,71 @@ export function storeContract(name, make) {
         expect(await store.blobClaim(T, H2, { graceMs: 0, claimMs: SHORT })).toBe(true);
       });
 
-      test("a hash a reaper holds a live claim on cannot be pended (unavailable: ask again); after the delete or the lapse it can", async () => {
+      test("a hash a reaper holds a live claim on cannot be pended (unavailable: ask again); once the claim lapses a pend marks it revived, and the reaper that settles it puts the bytes back", async () => {
         const { store, expire } = await fresh();
         await put(store, B, [H1]); await store.purgeBoard(T, B);
         expect(await store.blobClaim(T, H1, { graceMs: 0, claimMs: SHORT })).toBe(true);
         expect(await code(store.blobPend(T, B2, H1, SHORT))).toBe("unavailable");
         await expire();
-        await store.blobPend(T, B2, H1, SHORT);                                      // the claim lapsed: the pend wins, the condemnation is gone
+        await store.blobPend(T, B2, H1, LONG);                                       // the claim lapsed (its node died, the bytes may be quarantined): the row stays, revived
+        expect(await condemned(store, { graceMs: SHORT })).toEqual([`${T}/${H1}`]);  // and is offered again, so a reaper settles it
+        expect(await store.blobClaim(T, H1, { graceMs: SHORT, claimMs: LONG })).toBe(true);   // claimable although an upload is pending: it was claimed before
+        expect(await store.blobReaped(T, H1)).toBe(false);                           // keep: put the bytes back
         expect(await condemned(store)).toEqual([]);
-        expect(await store.blobReaped(T, H1)).toBe(false);                           // a node that finishes late learns it raced
       });
 
-      test("a reference that lands during a delete cancels the condemnation: blobReaped answers false", async () => {
+      test("REVIVE: claim, then another board's append names the hash, then a pend: the pend is unavailable until the reaper settles, and the settle says keep", async () => {
         const { store } = await fresh();
         await put(store, B, [H1]); await store.purgeBoard(T, B);
         expect(await store.blobClaim(T, H1, { graceMs: 0, claimMs: LONG })).toBe(true);
-        await put(store, B2, [H1]);                                                  // an op names the picture now
+        await put(store, B2, [H1]);                                                  // an op names the picture now: the row is NOT deleted
+        expect(await code(store.blobPend(T, B3, H1, SHORT))).toBe("unavailable");    // a deleted row would let this through (and the PUT then find the old bytes)
+        expect(await store.blobClaim(T, H1, { graceMs: 0, claimMs: LONG })).toBe(false);   // still held
+        expect(await store.blobReaped(T, H1)).toBe(false);                           // revived: put the bytes back (and the row is dropped)
+        await store.blobPend(T, B3, H1, SHORT);                                      // settled: asks go through again
+        expect(await store.blobReaped(T, H1)).toBe(false);                           // nothing left to settle
+      });
+
+      test("the settle (blobReaped) says delete only when nothing references the hash: no revive mark, no reference, no live pending upload", async () => {
+        const { store, raw } = await fresh();
+        await put(store, B, [H1, H2, H3]); await store.purgeBoard(T, B);
+        for (const h of [H1, H2, H3]) expect(await store.blobClaim(T, h, { graceMs: 0, claimMs: LONG })).toBe(true);
+        if (raw) await raw.putRefRow(T, B2, H2);                                     // a reference that got in without the revive mark
+        expect(await store.blobReaped(T, H1)).toBe(true);
+        expect(await store.blobReaped(T, H2)).toBe(false);                           // the settle looks again
+        expect(await store.blobReaped(T, H3)).toBe(true);
+        expect(await store.blobReaped(T, H1, { deleted: true })).toBe(true);
+        expect(await store.blobReaped(T, H1)).toBe(false);                           // settled: not ours any more
+        expect(await store.blobReaped(T, H2, { deleted: true })).toBe(true);         // the row was dropped with the verdict
+      });
+
+      test("a reference that lands during a delete keeps the condemnation row under its claim (revived), never ends it", async () => {
+        const { store } = await fresh();
+        await put(store, B, [H1]); await store.purgeBoard(T, B);
+        expect(await store.blobClaim(T, H1, { graceMs: 0, claimMs: LONG })).toBe(true);
+        await put(store, B2, [H1]);
         expect(await store.blobReaped(T, H1)).toBe(false);
       });
+
+      test("a reference that lands between the verdict and the end of the delete is reported: blobReaped({ deleted: true }) answers false (the client's re-upload heals it)", async () => {
+        const { store } = await fresh();
+        await put(store, B, [H1]); await store.purgeBoard(T, B);
+        expect(await store.blobClaim(T, H1, { graceMs: 0, claimMs: LONG })).toBe(true);
+        expect(await store.blobReaped(T, H1)).toBe(true);
+        await put(store, B2, [H1]);
+        expect(await store.blobReaped(T, H1, { deleted: true })).toBe(false);
+        expect(await condemned(store)).toEqual([]);
+      });
+
+      test("an append is never refused over the NUMBER of its references: tens of thousands are written (in chunks) and a purge condemns each", async () => {
+        const { store } = await fresh();
+        const refs = Array.from({ length: 25_000 }, (_, i) => i.toString(16).padStart(40, "0"));
+        await put(store, B, refs);
+        await store.purgeBoard(T, B);
+        let n = 0, after = null;
+        for (;;) { const page = await store.blobCondemned({ graceMs: 0, after, limit: 1000 }); n += page.length; if (page.length < 1000) break; after = page.at(-1); }
+        expect(n).toBe(25_000);
+      }, 60_000);
 
       test("blobPrune deletes only expired pending references, at most `limit`, and a pending row of a purged board goes with it", async () => {
         const { store, expire, raw } = await fresh();

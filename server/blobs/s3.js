@@ -2,7 +2,8 @@
 //   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB, a hash mismatch, and anything that isn't a PNG/JPEG/GIF/WebP;
 //                              true when it stored the blob, false when the tenant already had it
 //   get(tenant, sha1)          bytes, or null when there is no such blob (every other failure throws)
-//   delete(tenant, sha1)       removes the object (S3's DELETE answers 204 for an absent key too: idempotent)
+//   quarantine / restore / delete   move the object to `.quarantine/<tenant>/<sha1>` (copy through this process, then delete the original: the
+//                              copy exists before the original goes) and back, or remove both keys (S3's DELETE answers 204 for an absent key: idempotent)
 //   usage(tenant)              the bytes the tenant's objects take (a paged ListObjectsV2 of `<tenant>/`)
 // A blob is the object `<tenant>/<sha1>` in one bucket. Both ids are validated before they reach a key, so one
 // tenant can't name another's object. An S3 PUT is atomic (readers see the whole object or none) and durable once
@@ -27,7 +28,7 @@
 // The per-tenant quota is enforced above the port (server/blob-access.js), from usage() and put()'s answer.
 
 import { needId, isSha1, PortError } from "../ids.js";
-import { checkBlob, imageKind, MAX_BLOB_BYTES } from "./port.js";
+import { checkBlob, imageKind, MAX_BLOB_BYTES, QUARANTINE } from "./port.js";
 
 export { MAX_BLOB_BYTES };
 
@@ -78,7 +79,34 @@ export function s3Blobs({ endpoint, bucket, region, accessKeyId, secretAccessKey
     }
   };
 
+  const qkey = (tenant, sha1) => `${QUARANTINE}/${key(tenant, sha1)}`;
+  /** One object's bytes, or null when the key is missing (a missing bucket or any other failure throws). */
+  const readKey = async (signal, k) => {
+    const res = await call(signal, getTimeoutMs, "get", s3.presign(k, { expiresIn: SIGNED_FOR }));
+    if (res.ok) return new Uint8Array(await res.arrayBuffer());
+    if (res.status === 404) {
+      const c = await s3Code(res);
+      if (c === "NoSuchKey") return null;          // only a missing key is "no blob"; a missing bucket is an error
+      throw new PortError("unavailable", `S3 get failed: 404 ${c ?? ""}`.trim());
+    }
+    throw await failed("get", res);
+  };
+  const writeKey = async (signal, k, bytes) => {
+    const res = await call(signal, putTimeoutMs, "put", s3.presign(k, { method: "PUT", expiresIn: SIGNED_FOR }), { method: "PUT", body: bytes, headers: { "content-type": TYPES[imageKind(bytes)] ?? "application/octet-stream" } });
+    if (!res.ok) throw await failed("put", res);
+    await res.arrayBuffer();
+  };
+  const deleteKey = async (signal, k) => {
+    const res = await call(signal, putTimeoutMs, "delete", s3.presign(k, { method: "DELETE", expiresIn: SIGNED_FOR }), { method: "DELETE" });
+    if (res.status === 404 && (await s3Code(res)) === "NoSuchKey") return;   // a missing bucket is an error, a missing key is done
+    if (!res.ok) throw await failed("delete", res);
+    await res.arrayBuffer();                       // drain, so the connection is reusable
+  };
+  /** The longest the reaper's calls (quarantine: a get, a put and a delete under one deadline) may take. */
+  const deadlineMs = Math.max(putTimeoutMs, getTimeoutMs);
+
   return {
+    deadlineMs,
     async put(tenant, sha1, bytes) {
       const k = key(tenant, sha1);
       const b = checkBlob(sha1, bytes);
@@ -110,30 +138,39 @@ export function s3Blobs({ endpoint, bucket, region, accessKeyId, secretAccessKey
       });
     },
 
-    /** Removes the object; idempotent. @returns {Promise<void>} */
-    async delete(tenant, sha1) {
-      const k = key(tenant, sha1);
-      return within(putTimeoutMs, "delete", async signal => {
-        const res = await call(signal, putTimeoutMs, "delete", s3.presign(k, { method: "DELETE", expiresIn: SIGNED_FOR }), { method: "DELETE" });
-        if (res.status === 404 && (await s3Code(res)) === "NoSuchKey") return;   // a missing bucket is an error, a missing key is done
-        if (!res.ok) throw await failed("delete", res);
-        await res.arrayBuffer();                    // drain, so the connection is reusable
+    /** Moves the object out of reach: the bytes are copied to the quarantine key first, then the original is deleted; idempotent. @returns {Promise<void>} */
+    async quarantine(tenant, sha1) {
+      const k = key(tenant, sha1), q = qkey(tenant, sha1);
+      return within(deadlineMs, "quarantine", async signal => {
+        const bytes = await readKey(signal, k);
+        if (!bytes) return;                         // nothing live (already quarantined or deleted)
+        await writeKey(signal, q, bytes);
+        await deleteKey(signal, k);
       });
+    },
+
+    /** Puts a quarantined object back unless the tenant has it again; idempotent. @returns {Promise<void>} */
+    async restore(tenant, sha1) {
+      const k = key(tenant, sha1), q = qkey(tenant, sha1);
+      return within(deadlineMs, "restore", async signal => {
+        const bytes = await readKey(signal, q);
+        if (!bytes) return;
+        const head = await call(signal, deadlineMs, "restore (HEAD)", s3.presign(k, { method: "HEAD", expiresIn: SIGNED_FOR }), { method: "HEAD" });
+        if (!head.ok) { if (head.status !== 404) throw await failed("restore (HEAD)", head); await writeKey(signal, k, bytes); }
+        await deleteKey(signal, q);
+      });
+    },
+
+    /** Removes the object and its quarantined copy; idempotent. @returns {Promise<void>} */
+    async delete(tenant, sha1) {
+      const k = key(tenant, sha1), q = qkey(tenant, sha1);
+      return within(deadlineMs, "delete", async signal => { await deleteKey(signal, q); await deleteKey(signal, k); });
     },
 
     /** @returns {Promise<Uint8Array | null>} */
     async get(tenant, sha1) {
       const k = key(tenant, sha1);
-      return within(getTimeoutMs, "get", async signal => {
-        const res = await call(signal, getTimeoutMs, "get", s3.presign(k, { expiresIn: SIGNED_FOR }));
-        if (res.ok) return new Uint8Array(await res.arrayBuffer());
-        if (res.status === 404) {
-          const c = await s3Code(res);
-          if (c === "NoSuchKey") return null;        // only a missing key is "no blob"; a missing bucket is an error
-          throw new PortError("unavailable", `S3 get failed: 404 ${c ?? ""}`.trim());
-        }
-        throw await failed("get", res);
-      });
+      return within(getTimeoutMs, "get", signal => readKey(signal, k));
     },
   };
 }

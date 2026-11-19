@@ -2,6 +2,7 @@
 // (p7-chrome): the chrome is rebuilt only when what a part shows changes (C-2, C-8), the zoom % and pill update in
 // place, `online` / a long-hidden tab reconnects (C-4), the collab UI gets the clock port (C-6), a refused or
 // expiring sign-in offers "Sign in again" (C-9), and the cap's countdown reads the clock port (C-17).
+import { BLOB_PENDING_MS } from "../../packages/protocol/envelope.js";
 import { test, expect, beforeEach, afterAll } from "bun:test";
 import { localRoom } from "../../web/adapters/transport/local.js";
 import { createSession } from "../../web/core/session.js";
@@ -1104,10 +1105,10 @@ test("a picture this client placed itself, and a deleted one, are never asked fo
   expect(S.missingFiles()).toEqual([]);
 });
 
-test("#92: a picture that arrives with pasted elements (its bytes never travel in ops) is uploaded once, by the frame loop; pictures this client fetched or placed are not", () => {
+test("#92: a picture placed by this client's own op without being uploaded (a pasted selection) is uploaded by the frame loop; one put or fetched within BLOB_PENDING_MS is not offered again, an older one is", () => {
   const spy = spyNet();
   rig = setup({ appNet: spy.net });
-  const { S, bo, step } = rig;
+  const { S, bo, step, net } = rig;
   const OTHER = { ...PIC, id: "e".repeat(40) };
   bo.addPicture(OTHER); step(3);
   const ed = bo.eds.board;
@@ -1117,11 +1118,14 @@ test("#92: a picture that arrives with pasted elements (its bytes never travel i
   S.paste(text); step(4);
   expect(spy.puts).toEqual([OTHER.id]);                                   // the frame loop put it
   S.paste(text); step(4);
-  expect(spy.puts).toEqual([OTHER.id]);                                   // once per session, not once per paste or frame
+  expect(spy.puts).toEqual([OTHER.id]);                                   // just put: not again for BLOB_PENDING_MS
+  net.advance(BLOB_PENDING_MS + 1000); step(2);
+  S.paste(text); step(4);
+  expect(spy.puts).toEqual([OTHER.id, OTHER.id]);                         // the server may have deleted it since: offered again with the op that places it
   S.addPicture(PIC); step(3);
   spy.files[0]({ id: "f".repeat(40), mimeType: PIC.mimeType, dataURL: PIC.dataURL });   // fetched from the server
   step(3);
-  expect(spy.puts).toEqual([OTHER.id]);                                   // placed by the app (which uploads it itself) or fetched: never offered here
+  expect(spy.puts).toEqual([OTHER.id, OTHER.id]);                         // placed through addPicture (the app uploads it itself) or fetched: never offered here
 });
 
 test("L1/L2: S.missing() is memoised on the documents' revisions (no scan per frame) and its stamp changes when an element showing the picture does", () => {

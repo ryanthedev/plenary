@@ -46,8 +46,8 @@ export const MAX_READ = 10_000;
 export const DEFAULT_READ_LIMIT = 1000;
 /** The longest lease (ms): a holder that dies with a longer one would block its board for that long. */
 export const MAX_LEASE_TTL_MS = 10 * 60_000;
-/** The most blob references one append may carry (PROTOCOL.md § Blobs, "References and purge"). */
-export const MAX_BLOB_REFS = 100_000;
+/** How many blob references one statement writes (an append of more is written in chunks, never refused: PROTOCOL.md § Blobs, "References and purge"). */
+export const BLOB_REF_CHUNK = 10_000;
 /** The longest a pending blob reference may last. */
 export const MAX_PENDING_MS = 24 * 3_600_000;
 /** `blobCondemned`'s page cap. */
@@ -66,9 +66,10 @@ export const STORE_METHODS = Object.freeze(["append", "read", "lastSeq", "putChe
  *   append(tenant: string, board: string, entries: object[], expectSeq: number, epoch: number, opts?: { blobRefs?: string[] }): Promise<void>,
  *     // Writes every entry or none. entries[i].seq must be expectSeq + 1 + i and entries[i].tenant / .board must match. At
  *     // least one entry. epoch: REQUIRED positive integer, the lease epoch the writer holds. Errors: bad-id, bad-entry,
- *     // fenced, conflict. Resolves once durable. `opts.blobRefs`: the SHA-1 fileIds the entries' image elements name (at most
-     //   MAX_BLOB_REFS, each 40 lowercase hex, else bad-entry). They are written as the board's blob references in the SAME
-     //   transaction as the entries; each also replaces the board's pending reference for it and cancels the hash's condemnation.
+ *     // fenced, conflict. Resolves once durable. `opts.blobRefs`: the SHA-1 fileIds the entries' image elements name (any
+ *     //   number, each 40 lowercase hex, else bad-entry; never refused over their count). They are written as the board's blob references in the SAME
+ *     //   transaction as the entries (in chunks of BLOB_REF_CHUNK); each also replaces the board's pending reference for it, and cancels the hash's
+ *     //   condemnation, or, when a reaper has claimed it, marks it revived (the reaper then puts the bytes back).
  *   read(tenant: string, board: string, fromSeq?: number, limit?: number, maxBytes?: number): Promise<EntryPage>,
  *     // Entries with seq >= fromSeq (default 1), ascending, at most min(limit, MAX_READ) (default DEFAULT_READ_LIMIT). With
  *     // maxBytes the page also stops once it holds about that much stored text, and always holds >= 1 entry if any
@@ -95,12 +96,13 @@ export const STORE_METHODS = Object.freeze(["append", "read", "lastSeq", "putChe
  *   lease(tenant: string, board: string): Promise<null | LeaseRecord>,   // null = no room was ever built
  *   purgeBoard(tenant: string, board: string): Promise<void>,   // PROTOCOL.md § Trash and restore, "Purge": deletes the board's entries, checkpoints, checkpoint parts, lease record, blob references and pending references, and condemns each hash left with no reference and no live pending one, in ONE transaction; idempotent (nothing there is not an error); a stale host's later write is "fenced" (no lease row). The caller (the trash sweeper) has already made the board unreachable
  *   blobPend(tenant: string, board: string, sha1: string, ttlMs: number): Promise<void>,
- *     // A pending reference until the Store's clock + ttlMs (positive integer <= MAX_PENDING_MS; a second call extends it) and cancels the hash's condemnation. Rejects "unavailable" while a reaper's claim on the hash is live.
+ *     // A pending reference until the Store's clock + ttlMs (positive integer <= MAX_PENDING_MS; a second call extends it) and cancels the hash's condemnation (a claimed one is marked revived instead). Rejects "unavailable" while a reaper's claim on the hash is live.
  *   blobCondemned(o: { graceMs: number, after?: { tenant: string, sha1: string } | null, limit: number }): Promise<{ tenant: string, sha1: string }[]>,
  *     // Hashes condemned at least graceMs (integer >= 0) ago on the Store's clock and not under a live claim, ascending by (tenant, sha1) after `after`, at most limit (1..MAX_CONDEMNED_PAGE).
  *   blobClaim(tenant: string, sha1: string, o: { graceMs: number, claimMs: number }): Promise<boolean>,
- *     // The reaper's conditional claim (claimMs: positive integer): true only if the hash is condemned for graceMs, not claimed, STILL UNREFERENCED and with no live pending reference. A hash that has a reference loses its condemnation.
- *   blobReaped(tenant: string, sha1: string): Promise<boolean>,   // after the delete: drops the claimed condemnation; false = a new reference cancelled it while the delete ran
+ *     // The reaper's conditional claim (claimMs: positive integer): true only if the hash is condemned for graceMs, not under a live claim, and either STILL UNREFERENCED with no live pending reference, or claimed before (a reaper died mid-way: it must put the bytes back or finish). An unclaimed hash that has a reference loses its condemnation.
+ *   blobReaped(tenant: string, sha1: string, o?: { deleted?: boolean }): Promise<boolean>,
+ *     // The settle, after the bytes were quarantined. Without `deleted`: true = nothing references the hash (no revive mark, reference or live pending upload): delete the bytes (the claimed row stays, so a failed delete is retried); false = put them back (the row is dropped). With `deleted: true` (after the delete): drops the row; false = a reference arrived since the verdict; a missing row is true.
  *   blobPrune(limit: number): Promise<number>,   // deletes at most limit (positive integer) expired pending references; returns how many
  *   close(): Promise<void>,   // idempotent; every later call rejects "closed"
  * }} Store
@@ -169,7 +171,7 @@ export function checkBeforeSeq(beforeSeq) {
 export function checkBlobRefs(opts) {
   const refs = opts?.blobRefs;
   if (refs === undefined) return [];
-  if (!Array.isArray(refs) || refs.length > MAX_BLOB_REFS || !refs.every(isSha1)) throw bad(`blobRefs must be an array of at most ${MAX_BLOB_REFS} lowercase SHA-1 hashes`);
+  if (!Array.isArray(refs) || !refs.every(isSha1)) throw bad("blobRefs must be an array of lowercase SHA-1 hashes");   // never a cap: an append is never refused over its references
   return [...new Set(refs)].sort();   // a fixed order, so two appends never lock overlapping hashes in opposite orders
 }
 

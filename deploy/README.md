@@ -250,7 +250,7 @@ right they use at start-up, so a role with `USAGE` but missing grants is refused
 - **Registry:** `SELECT, INSERT, UPDATE, DELETE` on every `reg_*` table.
 - **Store:** `SELECT, INSERT, DELETE` on `pl_entries` (DELETE: the Trash purge); `SELECT, INSERT, DELETE` on `pl_checkpoints` and on `pl_checkpoint_parts`; `SELECT, INSERT, UPDATE, DELETE`
   on `pl_leases` (the epoch fence's `FOR SHARE` needs `UPDATE`; the Trash purge `DELETE`); `SELECT, INSERT, DELETE` on `pl_blob_refs` (DELETE: the Trash purge);
-  `SELECT, INSERT, UPDATE, DELETE` on `pl_blob_pending` (UPDATE: a second upload request extends the pending reference) and on `pl_blob_condemned` (UPDATE: the blob reaper's claim). Blob references and the reaper: PROTOCOL.md § Blobs, "References and purge".
+  `SELECT, INSERT, UPDATE, DELETE` on `pl_blob_pending` (UPDATE: a second upload request extends the pending reference) and on `pl_blob_condemned` (UPDATE: the blob reaper's claim). Blob references and the reaper: PROTOCOL.md § Blobs, "References and purge". Its three indexes (`pl_blob_refs_board`, `pl_blob_pending_board`, `pl_blob_pending_until`) are created, like the tables, by the owner role's migrate step only when missing.
 
 Step 3's grants cover both.
 

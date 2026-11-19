@@ -61,6 +61,9 @@ export const CHECKPOINT_EVERY = 1000;    // § Recovery, "When": entries since t
 export const CHECKPOINT_BYTES = 64 * 1024; // § Recovery, "When": op bytes since the last checkpoint (the join tail)
 export const CHECKPOINT_STATE_RATIO = 4;   // § Recovery, "When": and not before that tail is 1/4 of the state's size (a rewrite costs at most ~4x the log)
 
+/** How long a pending blob reference protects an upload (§ Blobs, "References and purge"): its signed URL lives 5 minutes, and the op that references it follows. A client re-offers a picture it has not put or fetched for this long when it sends an op that places it. */
+export const BLOB_PENDING_MS = 10 * 60_000;
+
 /** A blob's key and an image's `fileId`: a SHA-1 as exactly 40 lowercase hex characters (§ Blobs). */
 export const isSha1 = v => typeof v === "string" && /^[0-9a-f]{40}$/.test(v);
 

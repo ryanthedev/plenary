@@ -50,8 +50,8 @@ import { SQL } from "bun";
 import { needId, PortError, mintClusterId } from "../ids.js";
 import { encodeSliced } from "../encode/sliced.js";
 import { PART_CHARS, splitParts, headerOf, parseHeader, orphanGroups, headerLike } from "../encode/cp-parts.js";
-import { needSchema, migrate, assertShapes } from "../pg/schema.js";
-import { DEFAULT_READ_LIMIT, needBoard, needLeaseEpoch, needTtl, checkAppend, checkRead, fitBytes, checkCheckpoint, checkBeforeSeq, checkBlobRefs, checkPend, checkReap } from "./port.js";
+import { needSchema, migrate, assertShapes, missing } from "../pg/schema.js";
+import { DEFAULT_READ_LIMIT, needBoard, needLeaseEpoch, needTtl, checkAppend, checkRead, fitBytes, checkCheckpoint, checkBeforeSeq, checkBlobRefs, checkPend, checkReap, BLOB_REF_CHUNK } from "./port.js";
 
 /** Postgres SQLSTATE for a unique violation. Bun's PostgresError carries it as `errno`. */
 const UNIQUE = "23505";
@@ -73,9 +73,15 @@ export const STORE_TABLES = Object.freeze({
   // hashes no board uses any more (condemned_at, database clock; claimed_until: a reaper's claim).
   pl_blob_refs: "tenant TEXT NOT NULL, sha1 TEXT NOT NULL, board TEXT NOT NULL, PRIMARY KEY (tenant, sha1, board)",
   pl_blob_pending: "tenant TEXT NOT NULL, sha1 TEXT NOT NULL, board TEXT NOT NULL, until_at BIGINT NOT NULL, PRIMARY KEY (tenant, sha1, board)",
-  pl_blob_condemned: "tenant TEXT NOT NULL, sha1 TEXT NOT NULL, condemned_at BIGINT NOT NULL, claimed_until BIGINT, PRIMARY KEY (tenant, sha1)",
+  pl_blob_condemned: "tenant TEXT NOT NULL, sha1 TEXT NOT NULL, condemned_at BIGINT NOT NULL, claimed_until BIGINT, revived BOOLEAN NOT NULL DEFAULT false, PRIMARY KEY (tenant, sha1)",
   // The cluster id (§ Bus, Cluster id): at most one row, minted by the first node that asks; `singleton` is the key, so a second row can't exist.
   pl_cluster: "id TEXT NOT NULL, singleton BOOLEAN NOT NULL DEFAULT true PRIMARY KEY CHECK (singleton)",
+});
+/** Index name → "table (columns)": created after the tables, only if missing (to_regclass), like the Registry's (REGISTRY_INDEXES). The purge looks references up by board, the prune by expiry. */
+export const STORE_INDEXES = Object.freeze({
+  pl_blob_refs_board: "pl_blob_refs (tenant, board)",
+  pl_blob_pending_board: "pl_blob_pending (tenant, board)",
+  pl_blob_pending_until: "pl_blob_pending (until_at)",
 });
 /** SQLSTATEs: insufficient_privilege; lock_not_available (lock_timeout fired); idle_in_transaction_session_timeout. */
 const DENIED = "42501", LOCK_TIMEOUT = "55P03", IDLE_CUT = "25P03";
@@ -121,6 +127,8 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
       await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-schema:${s}`]);
       await assertShapes(tx, s, STORE_TABLES);   // the old-format rule (a pl_leases from before the lease columns, any other changed table), before anything is created
       await migrate(tx, s, STORE_TABLES);
+      const noIndex = await missing(tx, s, Object.keys(STORE_INDEXES));
+      if (noIndex.length) await tx.unsafe(noIndex.map(name => `CREATE INDEX ${name} ON "${s}".${STORE_INDEXES[name]}`).join(";\n"));
       // L3: every privilege the Store's statements use, checked now (a misgrant would otherwise surface at the first
       // fenced write, as a raw 42501). Thrown as Postgres's own 42501, so it is reported like any refusal below.
       const lacking = [];
@@ -222,10 +230,14 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
           if (last !== expectSeq) throw new PortError("conflict", `board is at seq ${last}, not ${expectSeq}`);
           await tx.unsafe(`INSERT INTO ${E} (tenant, board, seq, data)
             SELECT $1, $2, u.seq, u.data FROM unnest($3::int8[], $4::text[]) AS u(seq, data)`, [tenant, board, seqs, datas]);
-          if (refs.length) {   // in the entries' transaction: an acknowledged op always has its references; each replaces the board's pending one and cancels a condemnation
-            await tx.unsafe(`INSERT INTO ${BR} (tenant, sha1, board) SELECT $1, h, $2 FROM unnest($3::text[]) AS h ON CONFLICT DO NOTHING`, [tenant, board, refs]);
-            await tx.unsafe(`DELETE FROM ${BP} WHERE tenant = $1 AND board = $2 AND sha1 = ANY($3::text[])`, [tenant, board, refs]);
-            await tx.unsafe(`DELETE FROM ${BC} WHERE tenant = $1 AND sha1 = ANY($2::text[])`, [tenant, refs]);
+          // In the entries' transaction (an acknowledged op always has its references), in chunks (an append is never refused over their number):
+          // each reference replaces the board's pending one, ends an unclaimed condemnation, and marks a claimed one revived (the reaper puts the bytes back).
+          for (let i = 0; i < refs.length; i += BLOB_REF_CHUNK) {
+            const part = refs.slice(i, i + BLOB_REF_CHUNK);
+            await tx.unsafe(`INSERT INTO ${BR} (tenant, sha1, board) SELECT $1, h, $2 FROM unnest($3::text[]) AS h ON CONFLICT DO NOTHING`, [tenant, board, part]);
+            await tx.unsafe(`DELETE FROM ${BP} WHERE tenant = $1 AND board = $2 AND sha1 = ANY($3::text[])`, [tenant, board, part]);
+            await tx.unsafe(`DELETE FROM ${BC} WHERE tenant = $1 AND sha1 = ANY($2::text[]) AND claimed_until IS NULL`, [tenant, part]);
+            await tx.unsafe(`UPDATE ${BC} SET revived = true WHERE tenant = $1 AND sha1 = ANY($2::text[]) AND claimed_until IS NOT NULL`, [tenant, part]);
           }
         });
       } catch (err) {
@@ -400,9 +412,10 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
         // Separate statements: each sees the one before, so "no other reference" is judged after this board's own are gone.
         const gone = [...await tx.unsafe(`DELETE FROM ${BR} WHERE tenant = $1 AND board = $2 RETURNING sha1`, [tenant, board]),
           ...await tx.unsafe(`DELETE FROM ${BP} WHERE tenant = $1 AND board = $2 RETURNING sha1`, [tenant, board])].map(r => r.sha1);
-        if (gone.length) await tx.unsafe(`INSERT INTO ${BC} (tenant, sha1, condemned_at) SELECT $1, h, ${DB_NOW} FROM unnest($2::text[]) AS h
+        const hashes = [...new Set(gone)].sort();
+        for (let i = 0; i < hashes.length; i += BLOB_REF_CHUNK) await tx.unsafe(`INSERT INTO ${BC} (tenant, sha1, condemned_at) SELECT $1, h, ${DB_NOW} FROM unnest($2::text[]) AS h
           WHERE NOT EXISTS (SELECT 1 FROM ${BR} r WHERE r.tenant = $1 AND r.sha1 = h)
-            AND NOT EXISTS (SELECT 1 FROM ${BP} p WHERE p.tenant = $1 AND p.sha1 = h AND p.until_at > ${DB_NOW}) ON CONFLICT DO NOTHING`, [tenant, [...new Set(gone)].sort()]);
+            AND NOT EXISTS (SELECT 1 FROM ${BP} p WHERE p.tenant = $1 AND p.sha1 = h AND p.until_at > ${DB_NOW}) ON CONFLICT DO NOTHING`, [tenant, hashes.slice(i, i + BLOB_REF_CHUNK)]);
       });
     },
 
@@ -413,7 +426,9 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
         // Locks the condemnation (waits for a claim in flight to commit), then looks: a live claim means the delete may be running.
         const [row] = await tx.unsafe(`SELECT claimed_until > ${DB_NOW} AS live FROM ${BC} WHERE tenant = $1 AND sha1 = $2 FOR UPDATE`, [tenant, sha1]);
         if (row?.live) throw new PortError("unavailable", "the blob is being deleted: ask again shortly");
-        if (row) await tx.unsafe(`DELETE FROM ${BC} WHERE tenant = $1 AND sha1 = $2`, [tenant, sha1]);
+        // Unclaimed: the condemnation ends. Claimed but lapsed (a reaper died mid-way, the bytes may be quarantined): revived, for the reaper to settle.
+        if (row) await tx.unsafe(`UPDATE ${BC} SET revived = true WHERE tenant = $1 AND sha1 = $2 AND claimed_until IS NOT NULL`, [tenant, sha1]);
+        if (row) await tx.unsafe(`DELETE FROM ${BC} WHERE tenant = $1 AND sha1 = $2 AND claimed_until IS NULL`, [tenant, sha1]);
         await tx.unsafe(`INSERT INTO ${BP} (tenant, sha1, board, until_at) VALUES ($1, $2, $3, ${DB_NOW} + $4)
           ON CONFLICT (tenant, sha1, board) DO UPDATE SET until_at = greatest(${BP}.until_at, excluded.until_at)`, [tenant, sha1, board, ttlMs]);
       }, leaseLockTimeoutMs);
@@ -435,21 +450,37 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
       return write(async tx => {
         const got = await tx.unsafe(`UPDATE ${BC} SET claimed_until = ${DB_NOW} + $4 WHERE tenant = $1 AND sha1 = $2 AND condemned_at <= ${DB_NOW} - $3
           AND (claimed_until IS NULL OR claimed_until <= ${DB_NOW})
-          AND NOT EXISTS (SELECT 1 FROM ${BR} r WHERE r.tenant = $1 AND r.sha1 = $2)
-          AND NOT EXISTS (SELECT 1 FROM ${BP} p WHERE p.tenant = $1 AND p.sha1 = $2 AND p.until_at > ${DB_NOW}) RETURNING 1 AS x`, [tenant, sha1, graceMs, claimMs]);
+          AND (claimed_until IS NOT NULL OR (NOT EXISTS (SELECT 1 FROM ${BR} r WHERE r.tenant = $1 AND r.sha1 = $2)
+            AND NOT EXISTS (SELECT 1 FROM ${BP} p WHERE p.tenant = $1 AND p.sha1 = $2 AND p.until_at > ${DB_NOW}))) RETURNING 1 AS x`, [tenant, sha1, graceMs, claimMs]);
         if (got.length) return true;
         // A hash a board references is not condemned (a purge raced a new reference).
-        await tx.unsafe(`DELETE FROM ${BC} WHERE tenant = $1 AND sha1 = $2 AND (claimed_until IS NULL OR claimed_until <= ${DB_NOW})
+        await tx.unsafe(`DELETE FROM ${BC} WHERE tenant = $1 AND sha1 = $2 AND claimed_until IS NULL
           AND EXISTS (SELECT 1 FROM ${BR} r WHERE r.tenant = $1 AND r.sha1 = $2)`, [tenant, sha1]);
         return false;
       }, leaseLockTimeoutMs);
     },
 
-    /** The delete is done: drops the claimed condemnation. false = a new reference cancelled it meanwhile. */
-    async blobReaped(tenant, sha1) {
+    /**
+     * The reaper's two settle calls (PROTOCOL.md § Blobs, "References and purge"). Without `deleted`, after the bytes were quarantined: is anything
+     * referencing the hash (a revived mark, a reference, a live pending upload)? Yes: the condemnation is dropped and false says put the bytes back.
+     * No: true says delete them, and the claimed row STAYS, so a delete that fails is retried by the next claim. With `{ deleted: true }`, after the
+     * delete: drops the row; false = a reference arrived since the verdict (the bytes are gone: the client's re-upload heals it); a missing row is true.
+     */
+    async blobReaped(tenant, sha1, { deleted = false } = {}) {
       needId(tenant, "tenant"); checkPend(sha1, 1);
       if (!open) throw new PortError("closed", "the store is closed");
-      return (await write(tx => tx.unsafe(`DELETE FROM ${BC} WHERE tenant = $1 AND sha1 = $2 AND claimed_until IS NOT NULL RETURNING 1 AS x`, [tenant, sha1]))).length > 0;
+      const keep = `revived OR EXISTS (SELECT 1 FROM ${BR} r WHERE r.tenant = $1 AND r.sha1 = $2)
+        OR EXISTS (SELECT 1 FROM ${BP} p WHERE p.tenant = $1 AND p.sha1 = $2 AND p.until_at > ${DB_NOW})`;
+      return write(async tx => {
+        if (deleted) {
+          const rows = await tx.unsafe(`DELETE FROM ${BC} WHERE tenant = $1 AND sha1 = $2 AND claimed_until IS NOT NULL RETURNING ${keep} AS keep`, [tenant, sha1]);
+          return !rows.length || rows[0].keep === false;
+        }
+        const rows = await tx.unsafe(`SELECT ${keep} AS keep FROM ${BC} WHERE tenant = $1 AND sha1 = $2 AND claimed_until IS NOT NULL FOR UPDATE`, [tenant, sha1]);
+        if (!rows.length) return false;
+        if (rows[0].keep) { await tx.unsafe(`DELETE FROM ${BC} WHERE tenant = $1 AND sha1 = $2`, [tenant, sha1]); return false; }
+        return true;
+      });
     },
 
     /** Deletes at most `limit` expired pending references. */

@@ -352,7 +352,7 @@ test("start(env): PLENARY_BLOB_REAP_MS must be an integer from 1000 to 86400000 
   for (const good of [undefined, "1000", "86400000"]) {
     const app = await start(devEnv(tempDir(), good === undefined ? {} : { PLENARY_BLOB_REAP_MS: good }));
     expect(typeof app.reaper.sweep).toBe("function");
-    expect(await app.reaper.sweep()).toEqual({ deleted: 0, failed: 0, raced: 0, more: false });
+    expect(await app.reaper.sweep()).toEqual({ deleted: 0, revived: 0, raced: 0, failed: 0, more: false });
     await app.stop();
   }
 });

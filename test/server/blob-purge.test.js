@@ -121,7 +121,7 @@ test("the purge never touches the bytes itself: the Store's purge only condemns,
   await fill(b1, p);
   await reg.trashBoard({ board: b1.id, from: sp.id, by: U });
   clock.t += TRASH.ttlMs;
-  const broken = blobReaper({ store, blobs: { delete: async () => { throw new Error("S3 is down"); } }, clock: { now: () => clock.t } });
+  const broken = blobReaper({ store, blobs: { ...blobs, delete: async () => { throw new Error("S3 is down"); } }, clock: { now: () => clock.t } });
   expect(await sweeper.sweep()).toMatchObject({ boards: 1, failed: 0 });      // the board is gone
   clock.t += BLOB_GRACE_MS;
   expect(await broken.sweep()).toMatchObject({ deleted: 0, failed: 1 });

@@ -35,19 +35,20 @@ const CODES = { "too-large": "too-large", "hash-mismatch": "hash-mismatch", "not
 
 /**
  * @param {{ blobs: { put: Function, get: Function, usage: Function }, key: Uint8Array, origin?: string,
- *           now?: () => number, quotaBytes?: number, ttlMs?: number, log?: object }} o
+ *           now?: () => number, quotaBytes?: number, ttlMs?: number, usageTtlMs?: number, log?: object }} o
+ *   usageTtlMs: a tenant's cached usage is read again when it is older than this (other nodes' puts and the reaper's deletes change it; default never, main.js passes the reap interval)
  *   key: ≥ 32 bytes (derive it from the shared key; never the key itself). origin: where browsers reach this server
  *   (PUBLIC_URL, no trailing slash); "" (the default) makes every URL the path /blobs/<token>, which the client resolves
  *   against the origin it connected to.
  */
-export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes = DEFAULT_QUOTA_BYTES, ttlMs = URL_TTL_MS, log = quietLogger }) {
+export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes = DEFAULT_QUOTA_BYTES, ttlMs = URL_TTL_MS, usageTtlMs = Infinity, log = quietLogger }) {
   if (!blobs || typeof blobs.put !== "function" || typeof blobs.get !== "function" || typeof blobs.usage !== "function") throw new TypeError("blobAccess needs a Blobs port (put, get, usage)");
   if (!(key instanceof Uint8Array) || key.length < 32) throw new TypeError("blobAccess: key must be at least 32 bytes");
   if (typeof origin !== "string") throw new TypeError("blobAccess: origin must be a string");
   if (!Number.isFinite(quotaBytes) || quotaBytes < 0) throw new TypeError("blobAccess: quotaBytes must be a number ≥ 0");
   const mac = crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
 
-  /** @type {Map<string, { used: number, reserved: number, ready: Promise<void> | null }>} */
+  /** @type {Map<string, { used: number, reserved: number, ready: Promise<void> | null, gen: number, at: number }>} gen counts reads of usage; at: when the last one answered */
   const tenants = new Map();
 
   /** The signed claims of a token for `verb`, or { ok: false, code }. */
@@ -74,8 +75,10 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
   /** Read the tenant's usage once (concurrent first puts share one read); a failed read is tried again by the next put. */
   function seed(tenant) {
     let st = tenants.get(tenant);
-    if (!st) tenants.set(tenant, st = { used: 0, reserved: 0, ready: null });
-    st.ready ??= Promise.resolve(blobs.usage(tenant)).then(n => { st.used = n; }, err => { st.ready = null; throw err; });
+    if (!st) tenants.set(tenant, st = { used: 0, reserved: 0, ready: null, gen: 0, at: 0 });
+    if (st.ready && st.at && now() - st.at >= usageTtlMs) st.ready = null;     // stale: another node (or the reaper) changed what the tenant stores
+    // A read SETS the count (never adds to it) and starts a new generation: a put that began before it is already in what it read (or was not yet), so its own `+= n` is ignored.
+    st.ready ??= Promise.resolve(blobs.usage(tenant)).then(n => { st.used = n; st.gen++; st.at = now(); }, err => { st.ready = null; throw err; });
     return st.ready.then(() => st);
   }
 
@@ -111,9 +114,10 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
         return { ok: false, code: "quota" };
       }
       st.reserved += n;
+      const gen = st.gen;
       try {
         const created = await blobs.put(v.tenant, v.sha1, bytes);
-        if (created) st.used += n;
+        if (created && st.gen === gen) st.used += n;
         return { ok: true, created: created !== false };
       } catch (err) {
         return CODES[err?.code] ? { ok: false, code: CODES[err.code] } : unavailable("put", v.tenant, err);

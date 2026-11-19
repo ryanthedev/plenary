@@ -89,4 +89,9 @@ export async function assertShapes(tx, schema, tables) {
       throw Object.assign(new Error(`postgres: table "${s}".${t} has columns (${have.get(t)}) but this version needs (${need}): it is from an older version. `
         + `Reset the store: drop the schema "${s}" (every table in it, never one), and the next start-up recreates it`), { code: "old-format" });
   }
+  // Never half-migrated: some of this adapter's tables and not all is a schema from another version (we never ALTER or add tables to a used schema).
+  const names = Object.keys(tables);
+  if (have.size && have.size < names.length)
+    throw Object.assign(new Error(`postgres: schema "${s}" has tables (${[...have.keys()].join(", ")}) but not (${names.filter(n => !have.has(n)).join(", ")}): it is from an older version. `
+      + `Reset the store: drop the schema "${s}" (every table in it, never one), and the next start-up recreates it`), { code: "old-format" });
 }

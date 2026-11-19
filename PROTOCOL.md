@@ -1278,7 +1278,7 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   near-identical shapes reach 30×), but a board near the caps is still tens of MB after it. M4's load test sets the
   real cap.
 - **A checkpoint blocks the room host's event loop while it copies the state** (`Room.fold()` clones every element:
-  about 3 ms per MB of state; with unresolved entries it also replays the tail into a fresh Room, which costs more than the copy (about 4.6 ms per MB, measured at load ~40); 83 to 93 ms measured at 27 MB, about 150 ms or more extrapolated at 50 MB), and the
+  about 3 ms per MB of state (4.6 ms per MB measured at load ~40); with unresolved entries it also replays the tail into a fresh Room, which costs more (not measured); 83 to 93 ms measured at 27 MB, about 150 ms or more extrapolated at 50 MB), and the
   quarter-state rule (§ Recovery, "When") makes folds about twice as frequent as before. During the copy no op, ack or
   heartbeat for any board on that host is handled. The copy is taken synchronously on purpose (the checkpoint is the
   state at one `seq`, and the fence and write order depend on it); taking it incrementally (a copy-on-write

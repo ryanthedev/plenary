@@ -35,7 +35,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
   pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rebaseEvery = 1_000, rebaseBytes = 4 * 1024 * 1024, zSlack = 16 * 1024, random = Math.random }) {
   const key = `${tenant}/${board}`;
   const self = {
-    tenant, board, seq: 0, epoch: 0, ready: null, closed: false, gapAt: 0,
+    tenant, board, seq: 0, epoch: 0, ready: /** @type {Promise<void> | null} */ (null), close: /** @type {() => void} */ (() => {}), closed: false, gapAt: 0,
     base: EMPTY, tail: [],   // tail: [{ seq, id, by, at, text }], seq = base.seq + 1 …
     snap: null, zTails: new Map(), chunks: [], chunksLen: 0, lastHeard: Date.now(), nextRebase: rebaseEvery, tailBytes: 0, nextRebaseBytes: rebaseBytes,
     cpHeard: null, lookedAt: 0, retries: 0, looks: 0, failures: 0, skip: 0, failedFor: 0,   // the checkpoint look (rebase, below)
@@ -272,7 +272,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
   self.prepare = async since => {
     if (!deflate) return;
     await self.ready;
-    await Promise.all(parts(since).filter(p => p.part).map(({ part }) => part.from === undefined ? squeeze(part) : part.closed ? squeeze(part) : squeezeTail(part)));
+    await Promise.all(parts(since).filter(p => p.part).map(({ part }) => part.from === undefined ? squeeze(part) : part.closed ? squeeze(part).then(() => { if (part.z) self.zTails.delete(part.from); }) : squeezeTail(part)));   // a closed chunk with its whole compressed form needs no prefix
   };
   /** Make sure the feed has every entry up to `seq` (a writer's welcome may name entries the bus hasn't brought yet). */
   self.reach = seq => (seq > self.seq ? run(() => repair(seq)) : Promise.resolve());

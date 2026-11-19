@@ -7,7 +7,7 @@ import { boardFeed } from "../../server/feed.js";
 import { sqliteStore } from "../../server/store/sqlite.js";
 import { memoryBus, subjects } from "../../server/bus/memory.js";
 import { zlibDeflate } from "../../server/compress/zlib.js";
-import { tempDir, cleanup } from "./helpers.js";
+import { tempDir, cleanup, until } from "./helpers.js";
 
 afterAll(cleanup);
 const T = "t-z", B = "b-z";
@@ -163,9 +163,9 @@ async function held({ n }) {
   const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
   const { epoch } = await raw.acquire(T, B, "h-zh", 60_000);
   await raw.append(T, B, Array.from({ length: n }, (_, k) => entry(k + 1)), 0, epoch);
-  const real = zlibDeflate(), holds = []; let hold = () => null;
+  const real = zlibDeflate(), holds = [], manual = []; let hold = () => null, nHeld = 0;
   const feed = boardFeed({ tenant: T, board: B, store: raw, bus, onLive() {}, chunkBytes: 32 * 1024, zSlack: 2048,
-    deflate: async d => { const h = hold(d); if (h) await h; return real(d); } });
+    deflate: async d => { const h = hold(d); if (h) { nHeld++; await h; } return real(d); } });
   await feed.ready;
   let seq = n;
   const add = async k => {
@@ -175,7 +175,8 @@ async function held({ n }) {
     await bus.flush(); await feed.atomically(() => {});
   };
   const gate = pred => { let open; const g = new Promise(r => { open = r; }); hold = d => (pred(d) ? g : null); holds.push(open); return open; };
-  return { feed, add, gate, free: () => { hold = () => null; for (const o of holds) o(); }, seq: () => seq,
+  const manualGate = () => { hold = () => new Promise(r => manual.push(r)); };
+  return { feed, add, gate, manualGate, manual, held: () => nHeld, free: () => { hold = () => null; for (const o of holds) o(); }, seq: () => seq,
     close: async () => { feed.close(); await raw.close(); await bus.close(); } };
 }
 const upTo = (frames, n) => expect(seqs(frames)).toEqual(Array.from({ length: n }, (_, k) => k + 1));
@@ -186,7 +187,7 @@ test("F1 re-review, probe 1: A's settled open prefix survives B's newer, unsettl
   await s.add(40);                                                          // chunk 1 closes; a new one opens
   const closedOpen = s.gate(d => d.includes('"seq":1,'));                   // only the closed chunk's deflate is held
   const a = s.feed.prepare(0);                                              // A: closed chunk (held), open chunk's prefix settles
-  await new Promise(r => setTimeout(r, 50));
+  await until(() => s.held() >= 1 && s.feed.catchUp(0, true).filter(f => f.z).length >= 2, "the closed chunk held, the open prefix settled", 5000);
   await s.add(10);                                                          // over zSlack of new entries
   s.gate(() => true);                                                       // B: every new deflate held
   void s.feed.prepare(0);
@@ -195,6 +196,8 @@ test("F1 re-review, probe 1: A's settled open prefix survives B's newer, unsettl
   upTo(frames, s.seq());
   expect(frames.slice(0, -1).every(f => f.z)).toBe(true);                   // every big frame compressed
   expect(frames.at(-1).z).toBeUndefined();                                  // only the small plain cut is not
+  expect(frames.length).toBe(3);                                            // closed chunk, open prefix, cut
+  expect(seqs([frames.at(-1)])).toEqual(Array.from({ length: 10 }, (_, k) => 91 + k));   // exactly the entries after the prefix
   expect(frames.at(-1).bytes).toBeLessThan(plain.at(-1).bytes / 2);        // far less than the whole open chunk
   s.free(); await s.close();
 });
@@ -206,11 +209,41 @@ test("F1 re-review, probe 2: a settled prefix of X survives X closing and B's de
   await s.add(40);                                                          // X closes at ~70, Y opens
   s.gate(() => true);                                                       // B's X-whole and Y-prefix deflates are held
   void s.feed.prepare(0);
-  await new Promise(r => setTimeout(r, 50));
+  await until(() => s.held() >= 2, "X-whole and Y-prefix held", 5000);
   const frames = s.feed.catchUp(0, true);                                   // A sends now
   upTo(frames, s.seq());
   expect(frames[0].z).toBe(true);                                           // X's settled prefix
+  expect(frames[0].shared).toMatch(/\.1-50\/z$/);
+  expect(seqs([frames[1]])).toEqual(Array.from({ length: 19 }, (_, k) => 51 + k));   // the rest of X: 51..69
   expect(frames.slice(1).filter(f => !f.z).reduce((n, f) => n + f.bytes, 0)).toBeLessThanOrEqual(plainX);   // nothing but the new entries is plain
   expect(frames[1].z).toBeUndefined(); expect(frames[1].bytes).toBeLessThan(s.feed.catchUp(0)[0].bytes / 2);   // the rest of X: a small plain cut, not X whole
   s.free(); await s.close();
+});
+
+test("F1 re-review: a late-settling older attempt never replaces a newer settled prefix; a closed chunk's whole form frees its prefix entry", async () => {
+  const s = await held({ n: 50 });
+  s.manualGate();
+  const p1 = s.feed.prepare(0);                                             // attempt 1: prefix to 50, held
+  await until(() => s.held() >= 1, "attempt 1 held", 5000);
+  await s.add(10);                                                          // over the slack
+  const p2 = s.feed.prepare(0);                                             // attempt 2: prefix to 60, held
+  await until(() => s.held() >= 2, "attempt 2 held", 5000);
+  s.manual[1](); await p2;                                                  // the newer settles first
+  s.manual[0](); await p1;                                                  // then the older, last
+  await s.add(5);
+  const frames = s.feed.catchUp(0, true);
+  expect(frames[0].z).toBe(true);
+  expect(frames[0].shared).toMatch(/\.1-60\/z$/);                           // still attempt 2's prefix
+  expect(seqs([frames[1]])).toEqual([61, 62, 63, 64, 65]);                  // the plain cut starts right after it
+  upTo(frames, 65);
+  // The chunk closes and is compressed whole: its prefix entry is freed, the whole form is used.
+  expect(s.feed.zTails.has(1)).toBe(true);
+  await s.add(40);
+  s.free(); s.manualGate = null;
+  await s.feed.prepare(0);
+  expect(s.feed.zTails.has(1)).toBe(false);
+  const after = s.feed.catchUp(0, true);
+  upTo(after, s.seq());
+  expect(after.slice(0, 1).every(f => f.z && f.shared.endsWith("/z"))).toBe(true);
+  await s.close();
 });

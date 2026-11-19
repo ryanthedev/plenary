@@ -6,7 +6,9 @@
 //   read(tenant, board, fromSeq, limit, maxBytes?)   entries with seq >= fromSeq, ascending, at most `limit`
 //                                               (and, if maxBytes is given, about that much text: always >= 1 entry)
 //   lastSeq(tenant, board)                      the board's last seq (0 = empty)
-//   putCheckpoint(tenant, board, cp, epoch)     kept by cp.seq; the newest few per board are kept; fenced like append
+//   putCheckpoint(tenant, board, cp, epoch)     kept by cp.seq; the newest few per board are kept; fenced like append.
+//                                               A big one is stored as parts, each committed and fenced apart (§ Recovery,
+//                                               "Checkpoint parts"), so no one SQLite call holds the event loop for long
 //   getCheckpoint(tenant, board, beforeSeq?)    the highest seq (below beforeSeq, if given), never the last write
 //   openEpoch(tenant, board)                    durable atomic increment of the board's epoch (1 on the first call)
 //   epoch(tenant, board)                        the board's epoch, 0 if no room was ever built
@@ -27,17 +29,24 @@
 import { Database } from "bun:sqlite";
 import { needId, PortError } from "../ids.js";
 import { encodeSliced } from "../encode/sliced.js";
+import { PART_CHARS, splitParts, headerOf, parseHeader, orphanGroups, headerLike } from "../encode/cp-parts.js";
 
 const MAX_READ = 10_000;
 /** The longest lease (ms): a holder that dies with a longer one would block its board for that long. */
 const MAX_TTL = 10 * 60_000;
+/** Part rows deleted per statement. */
+const DROP_STEP = 1;
 const posInt = v => Number.isSafeInteger(v) && v > 0;
 
 /**
- * @param {{ path: string, fullfsync?: boolean, busyTimeoutMs?: number, keepCheckpoints?: number, now?: () => number }} o
+ * @param {{ path: string, fullfsync?: boolean, busyTimeoutMs?: number, keepCheckpoints?: number, now?: () => number,
+ *   partChars?: number, onPart?: (step: string) => void | Promise<void>, onSkip?: (s: { tenant: string, board: string, seq: number }) => void }} o
  *   `path` is a file (":memory:" for throwaway use). `now`: the lease clock in ms (default Date.now; tests inject one).
+ *   `partChars`: the most chars in one checkpoint part (default 1 Mi). `onPart`: test hook, awaited before each part
+ *   ("part:<n>"), before the header ("header") and before each orphan group's delete ("sweep"); a throw aborts the write there (a sweep never fails a write). `onSkip`: called once for each checkpoint getCheckpoint skips because its parts are missing (the server logs it).
  */
-export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3, now = Date.now }) {
+export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3, now = Date.now,
+  partChars = PART_CHARS, onPart, onSkip }) {
   const db = new Database(path, { create: true, strict: true });
   let open = true;
   db.run(`PRAGMA busy_timeout=${Math.max(0, Math.floor(busyTimeoutMs))}`);
@@ -51,6 +60,11 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
   db.run(`CREATE TABLE IF NOT EXISTS checkpoints (
     tenant TEXT NOT NULL, board TEXT NOT NULL, seq INTEGER NOT NULL, data TEXT NOT NULL,
     PRIMARY KEY (tenant, board, seq)) WITHOUT ROWID`);
+  // Parts of a checkpoint too big for one row (server/encode/cp-parts.js). `wid` = one write attempt; a part is
+  // readable only when a header row in `checkpoints` names its (seq, wid).
+  db.run(`CREATE TABLE IF NOT EXISTS checkpoint_parts (
+    tenant TEXT NOT NULL, board TEXT NOT NULL, seq INTEGER NOT NULL, wid TEXT NOT NULL, n INTEGER NOT NULL, data TEXT NOT NULL,
+    PRIMARY KEY (tenant, board, seq, wid, n))`);   // a rowid table on purpose: the key lives in a narrow index, so counting a write's parts never walks megabytes of row text
 
   // The lease record: holder NULL = nobody holds it (released, or a single-node openEpoch, which takes no lease).
   db.run(`CREATE TABLE IF NOT EXISTS leases (
@@ -84,7 +98,7 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
   const qPutCp = db.query("INSERT OR IGNORE INTO checkpoints (tenant, board, seq, data) VALUES (?, ?, ?, ?)");
   const qPruneCp = db.query(`DELETE FROM checkpoints WHERE tenant = ?1 AND board = ?2 AND seq NOT IN
     (SELECT seq FROM checkpoints WHERE tenant = ?1 AND board = ?2 ORDER BY seq DESC LIMIT ?3)`);
-  const qGetCp = db.query("SELECT data FROM checkpoints WHERE tenant = ? AND board = ? AND seq < ? ORDER BY seq DESC LIMIT 1");
+  const qGetCp = db.query("SELECT seq, data FROM checkpoints WHERE tenant = ? AND board = ? AND seq < ? ORDER BY seq DESC LIMIT 1");
   /** The epoch fence: inside the write transaction, so no takeover lands between the check and the write. */
   const fence = (tenant, board, epoch) => {
     const cur = qEpoch.get(tenant, board)?.epoch ?? 0;
@@ -94,6 +108,37 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
     fence(tenant, board, epoch);
     qPutCp.run(tenant, board, seq, data); qPruneCp.run(tenant, board, keepCheckpoints);
   });
+  const qPutPart = db.query("INSERT INTO checkpoint_parts (tenant, board, seq, wid, n, data) VALUES (?, ?, ?, ?, ?, ?)");
+  const qCountParts = db.query("SELECT count(*) AS c FROM checkpoint_parts WHERE tenant = ? AND board = ? AND seq = ? AND wid = ?");
+  const qGetParts = db.query("SELECT data FROM checkpoint_parts WHERE tenant = ? AND board = ? AND seq = ? AND wid = ? AND n = ?");
+  const qHeaders = db.query("SELECT seq, data FROM checkpoints WHERE tenant = ? AND board = ?");
+  const qGroups = db.query("SELECT DISTINCT seq, wid FROM checkpoint_parts WHERE tenant = ? AND board = ?");
+  // Conditional in the same statement: a part is deleted only while no header names its write, so a header that lands
+  // while a sweep is yielding (a slow write finishing) keeps its parts (?6 = headerLike(wid)).
+  const qDelParts = db.query(`DELETE FROM checkpoint_parts WHERE tenant = ?1 AND board = ?2 AND seq = ?3 AND wid = ?4 AND n IN
+    (SELECT n FROM checkpoint_parts WHERE tenant = ?1 AND board = ?2 AND seq = ?3 AND wid = ?4 ORDER BY n LIMIT ?5)
+    AND NOT EXISTS (SELECT 1 FROM checkpoints WHERE tenant = ?1 AND board = ?2 AND seq = ?3 AND data LIKE ?6)`);
+  /** One part, in its own transaction, fenced: a takeover between two parts stops the write at the next one. */
+  const putPartTx = db.transaction((tenant, board, seq, wid, n, data, epoch) => { fence(tenant, board, epoch); qPutPart.run(tenant, board, seq, wid, n, data); });
+  /** The header makes the checkpoint visible: fenced, and only if every part is there (a cleanup can't have taken one). */
+  const putHeaderTx = db.transaction((tenant, board, seq, wid, parts, header, epoch) => {
+    fence(tenant, board, epoch);
+    if (qCountParts.get(tenant, board, seq, wid).c !== parts) throw new PortError("unavailable", "a checkpoint part is missing: try again");
+    qPutCp.run(tenant, board, seq, header); qPruneCp.run(tenant, board, keepCheckpoints);
+  });
+  const yieldNow = () => new Promise(r => setImmediate(r));
+  /** Deletes part groups in steps of a few rows (freeing big rows is a synchronous cost too), the loop breathing between. */
+  const dropGroup = async (tenant, board, { seq, wid }) => {
+    while (qDelParts.run(tenant, board, seq, wid, DROP_STEP, headerLike(wid)).changes > 0) await yieldNow();
+  };
+  /** Removes part rows no header names (aborted, fenced, pruned or crashed writes), older than the newest header. Never throws. */
+  const sweepParts = async (tenant, board, mine) => {
+    try {
+      const gone = orphanGroups(qHeaders.all(tenant, board), qGroups.all(tenant, board));
+      if (mine && !gone.some(g => g.wid === mine.wid)) gone.push(mine);   // an aborted write's own, whatever the newest header
+      for (const g of gone) { await onPart?.("sweep"); await dropGroup(tenant, board, g); }
+    } catch { /* best effort: the next checkpoint's sweep takes what is left */ }
+  };
 
   // BEGIN IMMEDIATE: the write lock is taken before the read, so two handles (two processes) can't both see the
   // same last seq and both insert. The primary key is the second fence.
@@ -177,16 +222,50 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
     async putCheckpoint(tenant, board, cp, epoch) {
       ready(tenant, board); needWriteEpoch(epoch);
       if (!cp || typeof cp !== "object" || !Number.isSafeInteger(cp.seq) || cp.seq < 0) throw new PortError("bad-entry", "a checkpoint needs a seq");
-      // Encoded in slices (the event loop breathes between them); the fence is checked in the transaction below, after.
-      putCpTx.immediate(tenant, board, cp.seq, await encodeSliced(cp), epoch);
+      // Encoded in slices (the event loop breathes between them); the fence is checked in each transaction below.
+      const text = await encodeSliced(cp);
+      if (text.length <= partChars) return void putCpTx.immediate(tenant, board, cp.seq, text, epoch);
+      // Parts: each in its own fenced transaction, the loop breathing between; the header row makes them visible
+      // (§ Recovery, "Checkpoint parts"). A crash or abort before it leaves the previous checkpoint the newest.
+      const parts = splitParts(text, partChars), wid = crypto.randomUUID(), mine = { seq: cp.seq, wid };
+      try {
+        for (let n = 0; n < parts.length; n++) {
+          await onPart?.(`part:${n}`);
+          putPartTx.immediate(tenant, board, cp.seq, wid, n, parts[n], epoch); await yieldNow();
+        }
+        await onPart?.("header");
+        putHeaderTx.immediate(tenant, board, cp.seq, wid, parts.length, headerOf(wid, parts.length, text.length), epoch);
+      } catch (err) { await sweepParts(tenant, board, mine); throw err; }
+      await sweepParts(tenant, board);   // the first write of a seq stays: a second one's parts are orphans now, as are the pruned ones
     },
 
     /** The checkpoint with the highest seq; with `beforeSeq`, the highest below it (to step back past a bad one). */
     async getCheckpoint(tenant, board, beforeSeq) {
       ready(tenant, board);
       if (beforeSeq !== undefined && (!Number.isSafeInteger(beforeSeq) || beforeSeq < 0)) throw new PortError("bad-entry", "beforeSeq must be a non-negative integer");
-      const row = qGetCp.get(tenant, board, beforeSeq ?? Number.MAX_SAFE_INTEGER);
-      return row ? JSON.parse(row.data) : null;
+      // A header may name parts a newer checkpoint's prune has just removed: look again (it then finds a newer header).
+      // A header whose parts stay missing is a bad checkpoint: skipped, so the caller gets the next one below it.
+      for (let below = beforeSeq ?? Number.MAX_SAFE_INTEGER; ;) {
+        let text = null, row;
+        for (let attempt = 0; attempt < 3 && text === null; attempt++) {
+          row = qGetCp.get(tenant, board, below);
+          if (!row) return null;
+          const head = parseHeader(row.data);
+          if (!head) return JSON.parse(row.data);
+          const chunks = [];
+          for (let n = 0; n < head.parts; n++) {
+            const part = qGetParts.get(tenant, board, row.seq, head.wid, n);
+            if (!part) break;
+            chunks.push(part.data); await yieldNow();
+          }
+          if (chunks.length !== head.parts) continue;
+          text = chunks.join("");
+          if (text.length !== head.chars) throw new PortError("corrupt", `checkpoint ${row.seq}'s parts hold ${text.length} chars, not ${head.chars}`);
+        }
+        if (text !== null) return JSON.parse(text);
+        try { onSkip?.({ tenant, board, seq: row.seq }); } catch { /* a logger must not fail a read */ }
+        below = row.seq;
+      }
     },
 
     /**

@@ -7,8 +7,12 @@
 //   store            the store under test
 //   another()        opens a second handle on the SAME data (a reopen after close, or a second host)
 //   cleanup()        optional; runs after the test (drop the schema, remove the file)
+//   raw              { putCheckpointRow(t, b, seq, data), putPartRow(t, b, seq, wid, n, data), partRows(t, b) }: the adapter's tables
+//                    written and counted directly (old-format rows, the orphans a crash leaves)
 //   advance(ms)      optional; moves the store's lease clock forward (an adapter with an injected clock, shared by
 //                    `another()`). Without it, the lease cases wait out a short real ttl on the database's clock.
+// `make(opts)` gets `{ partChars, onPart }` and must pass them to the adapter (checkpoint parts: the size of one part, and a
+// hook awaited before each part "part:<n>" and before the header "header"; a throw aborts the write there).
 // The adapter is expected to keep the newest 3 checkpoints per board (the adapters' default `keepCheckpoints`).
 // Refusals are matched by `err.code` (PortError codes: conflict, fenced, bad-entry, bad-id, closed).
 // Optional, cluster adapters only: `clusterId(): Promise<string>` (PROTOCOL.md § Bus, Cluster id: "c-" + 16 of [a-z0-9],
@@ -28,20 +32,20 @@ export const code = async p => { try { await p; return "resolved"; } catch (e) {
 
 /**
  * @param {string} name
- * @param {() => Promise<{ store: any, another: () => Promise<any>, cleanup?: () => Promise<void>|void }>} make
+ * @param {(opts?: { partChars?: number, onPart?: (step: string) => any }) => Promise<{ store: any, another: () => Promise<any>, cleanup?: () => Promise<void>|void, raw?: any }>} make
  */
 export function storeContract(name, make) {
   describe(`Store contract: ${name}`, () => {
     const handles = [];
     let cleanups = [];
-    const fresh = async () => {
-      const h = await make();
+    const fresh = async opts => {
+      const h = await make(opts);
       handles.push(h.store);
       if (h.cleanup) cleanups.push(h.cleanup);
       const another = async () => { const s = await h.another(); handles.push(s); return s; };
       // Let a lease taken with SHORT lapse: on the injected clock, or by waiting on the database's.
       const expire = async () => { if (h.advance) h.advance(SHORT + 1); else await Bun.sleep(SHORT + 150); };
-      return { store: h.store, another, expire };
+      return { store: h.store, another, expire, raw: h.raw };
     };
     afterEach(async () => {
       for (const s of handles.splice(0)) await s.close();
@@ -208,6 +212,166 @@ export function storeContract(name, make) {
       await store.putCheckpoint(T, "b-two", { seq: 7 }, e2);                            // another board is untouched by pruning
       expect((await store.getCheckpoint(T, "b-two")).seq).toBe(7);
       expect((await store.getCheckpoint(T, B)).seq).toBe(4000);
+    });
+
+    // ---- Checkpoint parts (PROTOCOL.md § Recovery, "Checkpoint parts"): a big checkpoint is several fenced rows made visible by a header.
+    const PART = 4000;
+    /** A checkpoint of about `n` parts of text; `tag` tells two apart. Emoji straddle the part edges on purpose. */
+    const big = (seq, tag, n = 5) => ({ seq, tag, streams: { board: { elements: Array.from({ length: n * 25 }, (_, i) => ({ id: `e${i}`, text: "é😀\"\\".repeat(18) + tag })) } } });
+    const parts = cp => Math.ceil(JSON.stringify(cp).length / PART);
+
+    test("parts: a multi-part checkpoint reads back exactly (surrogates, quotes), one row per part, and small ones stay single-row", async () => {
+      const { store, raw } = await fresh({ partChars: PART });
+      const e = await own(store);
+      const cp = big(40, "x");
+      expect(JSON.stringify(cp).length).toBeGreaterThan(PART * 4);
+      await store.putCheckpoint(T, B, cp, e);
+      expect(await store.getCheckpoint(T, B)).toEqual(JSON.parse(JSON.stringify(cp)));
+      const n = await raw.partRows(T, B);
+      expect(n).toBeGreaterThanOrEqual(5);
+      expect(n).toBeLessThanOrEqual(parts(cp) + 1);
+      await store.putCheckpoint(T, B, { seq: 50, small: true }, e);                       // fits one part: no part rows
+      expect(await raw.partRows(T, B)).toBe(n);
+      expect(await store.getCheckpoint(T, B)).toEqual({ seq: 50, small: true });
+      expect((await store.getCheckpoint(T, B, 50)).tag).toBe("x");
+    });
+
+    test("parts: the checkpoint is invisible until the header lands; an abort between parts leaves the previous one and no orphan", async () => {
+      const seen = [];
+      let abortAt = null, store;
+      const { store: s, raw } = await fresh({ partChars: PART, onPart: async step => {
+        if (abortAt === null || step === "sweep") return;
+        seen.push([step, (await store.getCheckpoint(T, B))?.seq]);
+        if (step === abortAt) throw new Error("simulated crash");
+      } });
+      store = s;
+      const e = await own(store);
+      await store.putCheckpoint(T, B, big(10, "old"), e);
+      const before = await raw.partRows(T, B);
+      abortAt = "part:3";
+      await expect(store.putCheckpoint(T, B, big(20, "new"), e)).rejects.toThrow("simulated crash");
+      expect(seen.map(x => x[0])).toEqual(["part:0", "part:1", "part:2", "part:3"]);
+      expect(seen.every(x => x[1] === 10)).toBe(true);                                    // the old one the whole time
+      expect((await store.getCheckpoint(T, B)).tag).toBe("old");
+      expect(await raw.partRows(T, B)).toBe(before);                                      // the aborted write cleaned up after itself
+      abortAt = "header"; seen.length = 0;                                                // every part written, header not
+      await expect(store.putCheckpoint(T, B, big(20, "new"), e)).rejects.toThrow("simulated crash");
+      expect(seen.at(-1)).toEqual(["header", 10]);
+      expect((await store.getCheckpoint(T, B)).tag).toBe("old");
+      expect(await raw.partRows(T, B)).toBe(before);
+      abortAt = null;
+      await store.putCheckpoint(T, B, big(20, "new"), e);                                 // and a retry works
+      expect((await store.getCheckpoint(T, B)).tag).toBe("new");
+    });
+
+    test("parts: the fence is checked on every part and on the header; a takeover mid-write is fenced, nothing becomes visible, nothing is left", async () => {
+      for (const at of ["part:0", "part:2", "header"]) {
+        let takeover = null;
+        const steps = [];
+        const { store, raw } = await fresh({ partChars: PART, onPart: async step => { if (step === "sweep") return; if (takeover) steps.push(step); if (step === at && takeover) await takeover(); } });
+        const e = await own(store);
+        await store.putCheckpoint(T, B, big(10, "old"), e);
+        const before = await raw.partRows(T, B);
+        takeover = () => store.openEpoch(T, B);
+        expect(await code(store.putCheckpoint(T, B, big(20, "new"), e))).toBe("fenced");
+        expect(steps.at(-1)).toBe(at);                                                      // it stopped at the part the takeover hit: no later part was tried
+        expect((await store.getCheckpoint(T, B)).tag).toBe("old");
+        expect(await raw.partRows(T, B)).toBe(before);
+        // The new holder writes the same seq: it is not blocked by the fenced one's leftovers.
+        const e2 = await own(store);
+        takeover = null;
+        await store.putCheckpoint(T, B, big(20, "new2"), e2);
+        expect((await store.getCheckpoint(T, B)).tag).toBe("new2");
+      }
+    });
+
+    test("parts: orphans (a crash's parts, a pruned checkpoint's) are swept by the next checkpoint; the newest 3 keep their parts", async () => {
+      const { store, raw } = await fresh({ partChars: PART });
+      const e = await own(store);
+      for (const seq of [10, 20, 30]) await store.putCheckpoint(T, B, big(seq, `c${seq}`), e);
+      const three = await raw.partRows(T, B);
+      // What a crash between parts leaves: parts of a write that never got its header, below the newest seq.
+      await raw.putPartRow(T, B, 25, "crashed-wid", 0, "x".repeat(100)); await raw.putPartRow(T, B, 25, "crashed-wid", 1, "y");
+      await raw.putPartRow(T, B, 5, "other-wid", 0, "z");
+      expect(await raw.partRows(T, B)).toBe(three + 3);
+      expect((await store.getCheckpoint(T, B)).seq).toBe(30);                              // never readable
+      await store.putCheckpoint(T, B, big(40, "c40"), e);                                  // the 4th: seq 10 is pruned, its parts go too
+      expect(await store.getCheckpoint(T, B, 20)).toBe(null);
+      expect(await raw.partRows(T, B)).toBe(three);                                        // three checkpoints' worth, no more
+      expect((await store.getCheckpoint(T, B)).tag).toBe("c40");
+      expect((await store.getCheckpoint(T, B, 40)).tag).toBe("c30");
+      expect((await store.getCheckpoint(T, B, 30)).tag).toBe("c20");
+    });
+
+    test("parts: a stale write's header landing while a sweep is yielding keeps its parts; the checkpoint under the newest reads complete", async () => {
+      let gateA = null, holdA = false, swept = false, slowDone = null;
+      const { store, raw } = await fresh({ partChars: PART, onPart: async step => {
+        if (holdA && step === "header") { holdA = false; await gateA.promise; return; }
+        if (step === "sweep" && slowDone && !swept) { swept = true; gateA.resolve(); await slowDone; }   // seq 25's header commits between the sweep's steps
+      } });
+      const e = await own(store);
+      await raw.putPartRow(T, B, 5, "crashed-wid", 0, "x");                              // a second orphan group, so the sweep has steps
+      gateA = Promise.withResolvers(); holdA = true;
+      slowDone = store.putCheckpoint(T, B, big(25, "late"), e);                          // every part written, header held back
+      await Bun.sleep(30);
+      await store.putCheckpoint(T, B, big(30, "newest"), e);                             // lands, and sweeps seq 25's group as an orphan
+      expect(swept).toBe(true);
+      await slowDone;                                                                    // its header is in
+      expect((await store.getCheckpoint(T, B)).tag).toBe("newest");
+      expect((await store.getCheckpoint(T, B, 30)).tag).toBe("late");                    // complete, never "unavailable"
+      expect(await raw.partRows(T, B)).toBeGreaterThanOrEqual(parts(big(25, "late")) + parts(big(30, "newest")));
+    });
+
+    test("parts: a header whose parts are gone is skipped as a bad checkpoint, once, reported through onSkip, and the next one below is returned", async () => {
+      const skipped = [];
+      const { store, raw } = await fresh({ partChars: PART, onSkip: s => skipped.push(s) });
+      const e = await own(store);
+      await store.putCheckpoint(T, B, big(10, "ok"), e);
+      await raw.putCheckpointRow(T, B, 20, "\u0001cp-parts 1 no-such-wid 3 9999");        // names parts that don't exist
+      const got = await store.getCheckpoint(T, B);
+      expect(got.tag).toBe("ok");
+      expect(skipped).toEqual([{ tenant: T, board: B, seq: 20 }]);
+      expect((await store.getCheckpoint(T, B, 20)).tag).toBe("ok");                       // a read that starts below it never sees it
+      expect(skipped.length).toBe(1);
+    });
+
+    test("parts: a checkpoint in the old format (one big row of JSON, no header) still reads, alone and beside parts", async () => {
+      const { store, raw } = await fresh({ partChars: PART });
+      const e = await own(store);
+      const old = big(10, "legacy");
+      await raw.putCheckpointRow(T, B, 10, JSON.stringify(old));
+      expect(await store.getCheckpoint(T, B)).toEqual(JSON.parse(JSON.stringify(old)));
+      await store.putCheckpoint(T, B, big(20, "parts"), e);
+      expect((await store.getCheckpoint(T, B)).tag).toBe("parts");
+      expect((await store.getCheckpoint(T, B, 20)).tag).toBe("legacy");
+      for (const seq of [30, 40]) await store.putCheckpoint(T, B, big(seq, `p${seq}`), e);   // the old row is pruned like any other
+      expect(await store.getCheckpoint(T, B, 20)).toBe(null);
+    });
+
+    test("parts: a late write never hides a newer checkpoint; one overtaken mid-write may be refused as unavailable, and leaves nothing", async () => {
+      let gate = null, hold = false;
+      const { store, raw } = await fresh({ partChars: PART, onPart: async step => { if (hold && step === "part:1") { hold = false; await gate.promise; } } });
+      const e = await own(store);
+      // A slow write of seq 10 is still between its parts while seq 20 lands (and sweeps the parts nobody names).
+      gate = Promise.withResolvers(); hold = true;
+      const slow = code(store.putCheckpoint(T, B, big(10, "slow"), e));
+      await Bun.sleep(30);
+      await store.putCheckpoint(T, B, big(20, "fast"), e);
+      const fastRows = await raw.partRows(T, B);
+      gate.resolve();
+      expect(await slow).toBe("unavailable");                                             // its first part was swept: the header's part count refuses it
+      expect((await store.getCheckpoint(T, B)).tag).toBe("fast");
+      for (const below of [21, 20, 11]) { const got = await store.getCheckpoint(T, B, below); expect(got === null || got.tag === (below > 20 ? "fast" : "slow")).toBe(true); }
+      expect(await raw.partRows(T, B)).toBeLessThanOrEqual(fastRows + parts(big(10, "slow")) + 1);
+      // The same seq twice, the first one slow: the first header wins and the loser leaves no part rows.
+      gate = Promise.withResolvers(); hold = true;
+      const a = code(store.putCheckpoint(T, B, big(30, "a"), e));
+      await Bun.sleep(30);
+      await store.putCheckpoint(T, B, big(30, "b"), e);
+      gate.resolve();
+      expect(["resolved", "unavailable"]).toContain(await a);
+      expect((await store.getCheckpoint(T, B)).tag).toBe("b");
+      expect(await raw.partRows(T, B)).toBeLessThanOrEqual(3 * (parts(big(30, "b")) + 1));
     });
 
     test("data survives close and reopen; a closed store throws closed", async () => {

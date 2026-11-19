@@ -330,7 +330,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   const blobKey = new Uint8Array(await crypto.subtle.sign("HMAC", await crypto.subtle.importKey("raw", new TextEncoder().encode(cookieKey), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]), new TextEncoder().encode("plenary/blob-url/v1")));
   log.info("node", { node, roles, cluster, leaseTtlMs });
   const { store, bus, rawRegistry, clusterId } = cluster ? await openCluster(env, node, log, adapters) : {
-    store: sqliteStore({ path: join(dataDir, "plenary.db") }),
+    store: sqliteStore({ path: join(dataDir, "plenary.db"), onSkip: skipped => log.error("checkpoint unreadable: parts missing; stepped back", skipped) }),
     bus: memoryBus({ onError: (err, subject) => log.error("bus subscriber failed", { subject, err }) }),
     rawRegistry: sqliteRegistry({ path: join(dataDir, "registry.db") }),
   };
@@ -493,7 +493,7 @@ async function openCluster(env, node, log, adapters = {}) {
       throw new Error(`could not open the ${what} (${name})${code}: ${redact(err?.message ?? String(err), urls).slice(0, 500)}`);
     }
   };
-  const store = await open("Postgres store", "DATABASE_URL", () => make.postgresStore({ url: env.DATABASE_URL }));
+  const store = await open("Postgres store", "DATABASE_URL", () => make.postgresStore({ url: env.DATABASE_URL, onSkip: skipped => log.error("checkpoint unreadable: parts missing; stepped back", skipped) }));
   const rawRegistry = await open("Postgres registry", "DATABASE_URL", () => make.postgresRegistry({ url: env.DATABASE_URL }));
   // The cluster id lives in the Store: two nodes on one database are one cluster. It enters the Bus through the
   // adapter's `cluster` option, so every subject on the wire carries it and a foreign cluster on the same NATS can't

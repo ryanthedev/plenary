@@ -49,18 +49,30 @@ for (const mb of sizes) {
     const text = await encodeSliced(made, { yieldNow: async () => { worst = Math.max(worst, ms(last)); await new Promise(r => setImmediate(r)); last = performance.now(); } });
     worst = Math.max(worst, ms(last)); out.encodeMaxBlockMs = +worst.toFixed(2); out.encodedMB = +(text.length / 1048576).toFixed(1);
   } else { const t0 = performance.now(); const text = JSON.stringify(made); out.encodeMaxBlockMs = +ms(t0).toFixed(2); out.encodedMB = +(text.length / 1048576).toFixed(1); }
-  // End to end: the longest the loop stalled while the SQLite Store took the checkpoint (encode + the synchronous write).
+  // End to end: the longest the loop stalled while a Store took the checkpoint (encode + its writes): SQLite always, Postgres when DATABASE_URL is set.
+  const stall = async put => {
+    let last = performance.now(), worst = 0, run = true;
+    const tick = () => { const t = performance.now(); worst = Math.max(worst, t - last); last = t; if (run) setImmediate(tick); };
+    setImmediate(tick); last = performance.now();
+    await put();
+    run = false; await new Promise(r => setImmediate(r));
+    return +worst.toFixed(2);
+  };
+  if (process.env.DATABASE_URL) {
+    const { postgresStore } = await import(`${root}/server/store/postgres.js`), { SQL } = await import("bun");
+    const sql = new SQL({ url: process.env.DATABASE_URL, max: 2 }), schema = `fold_bench_${process.pid}`;
+    try {
+      const store = await postgresStore({ sql, schema });
+      const epoch = await store.openEpoch("t-aaa", "b-one");
+      out.pgPutMaxStallMs = await stall(() => store.putCheckpoint("t-aaa", "b-one", made, epoch));
+    } finally { await sql.unsafe(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); await sql.close(); }
+  }
   const dir = mkdtempSync(join(tmpdir(), "fold-bench-"));
   try {
     const { sqliteStore } = await import(`${root}/server/store/sqlite.js`);
     const store = sqliteStore({ path: join(dir, "p.db") });
     const epoch = await store.openEpoch("t-aaa", "b-one");
-    let last = performance.now(), worst = 0, run = true;
-    const tick = () => { const t = performance.now(); worst = Math.max(worst, t - last); last = t; if (run) setImmediate(tick); };
-    setImmediate(tick); last = performance.now();
-    await store.putCheckpoint("t-aaa", "b-one", made, epoch);
-    run = false; await new Promise(r => setImmediate(r));
-    out.sqlitePutMaxStallMs = +worst.toFixed(2);
+    out.sqlitePutMaxStallMs = await stall(() => store.putCheckpoint("t-aaa", "b-one", made, epoch));
     await store.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
   console.log(JSON.stringify(out));

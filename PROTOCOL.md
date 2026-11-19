@@ -1211,7 +1211,7 @@ Unit **member** role is editable in its **management permissions only** (its nam
   count and asks; **Save anyway** sends the same patch with `confirm: true`. A rename never needs it.
 - **Delete is refused while the role is in use** (decision: refuse, never reassign: reassigning would silently change what people can do). The check and the delete are ONE atomic Registry step
   (`deleteRole`: only grants of the same Unit count, so another Unit can never block a delete), so on SQLite and in memory a grant cannot slip in between; on Postgres a grant that commits in the same instant is not seen (READ COMMITTED), and a grant held by a deleted role is inert (the resolver ignores an unknown role) and any manager may clear it.
-  `member` and the built-ins are never deleted (400).
+  The `member` role is never deleted (400); a built-in id is "not a role" and answers like an unknown one (403).
 - **Leaks.** An id that is unknown, belongs to another Unit, or is not a role (`admin`, a ladder name) gets the SAME answer and the same Registry work as a hidden one: a write is 403 `forbidden`,
   identical to a caller without `roles.manage`; `GET /roles` is 404 `not-found`. No error names a scope or a person; the usage count is a number only. A role deleted between the check and the write is the
   same 403, never a 503.

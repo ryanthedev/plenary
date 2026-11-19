@@ -61,6 +61,9 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   });
   if (!ui.drawer && me.role === "annotator") ui.drawer = "notes";
   net.onFile(file => { S.receiveFiles({ [file.id]: file }); });
+  // A picture that could not be saved for everyone (PROTOCOL.md § Blobs): it shows here, but nobody else will see it.
+  const WHY = { quota: "the storage quota is full", forbidden: "you can't upload here", "too-large": "it is over 10 MB", "not-image": "it is not a PNG, JPEG, GIF or WebP", "gave-up": "the server could not be reached" };
+  net.onFail?.(({ code }) => toast(`The picture was not saved for others: ${WHY[code] ?? code}`, 6000));
 
   const isPhone = () => matchMedia("(max-width: 640px)").matches;
   const canvas = $("#board"), ink = $("#ink"), ctx = canvas.getContext("2d");
@@ -103,11 +106,13 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   function draw() {
     const theme = THEMES[ui.theme];
     const items = S.displayList(theme);
-    // A picture whose bytes haven't arrived (or never will: v0 sends no files) shows as a dashed box.
+    // A picture whose bytes haven't arrived yet shows as a dashed box, and its bytes are asked for (the net dedupes and
+    // paces; a picture the server doesn't have, or can't reach, stays a dashed box).
     const files = allFiles();
     for (let i = 0; i < items.length; i++) {
       const it = items[i];
       if (it.t === "image" && !files[it.fileId]) {
+        net.want?.(it.fileId);
         const { x, y, w, h: hh } = it;
         items.splice(i, 1, { t: "path", cmds: [["M", x, y], ["L", x + w, y], ["L", x + w, y + hh], ["L", x, y + hh], ["L", x, y]], stroke: theme.dim, width: 1, dash: [5, 4] },
           { t: "text", x: x + 8, y: y + 6, text: "picture (bytes not here yet)", size: 11, color: theme.dim, align: "left", lineHeight: 1.2 });
@@ -237,7 +242,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const img = await new Promise(res => { const i = new Image(); i.onload = () => res(i); i.onerror = () => res(null); i.src = dataURL; });
     if (!img) return toast("That picture couldn't be read");
     const f = { id, mimeType: file.type, dataURL, width: img.naturalWidth, height: img.naturalHeight };
-    if (S.addPicture(f, at)) net.put(f);          // SEAM(v1 Blobs): signed upload; today the tab relay
+    if (S.addPicture(f, at)) net.put(f);          // upload through a signed URL (wsNet), or the dev tab relay
     chromeDirty = true;
   }
   async function addLibraryFile(file) {

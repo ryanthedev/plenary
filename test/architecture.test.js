@@ -16,7 +16,7 @@
 //             by default, the strict side), plus the DRIVING adapters and SUPPORT_DIRS.
 //             Driven adapters import only ports, SHARED, SUPPORT_DIRS, their own group and bare packages
 //             ("adapter->core" otherwise; manager decision on p-archv question 3).
-//             DRIVING adapters (HTTP/WebSocket calling into the core: server.js, static.js, auth/http.js) may also
+//             DRIVING adapters (HTTP/WebSocket calling into the core: server.js, static.js, blob-http.js, auth/http.js) may also
 //             import core.
 //   adapter-only support: SUPPORT_DIRS (server/pg/) holds code several adapters share (Postgres start-up). It counts
 //             as an adapter (core may not import it, it may not import other adapters) that any adapter may import.
@@ -33,13 +33,14 @@ import { ROOT, listFiles, importsOf, checkBoundaries } from "./arch-scan.js";
 
 const SCAN = ["packages", "server", "scripts", "deploy"];   // every non-test code folder but web/ (client's)
 const CORE_DIRS = ["packages/protocol/", "packages/core/", "server/admin/"];
-const CORE_FILES = ["server/gateway.js", "server/room-host.js", "server/feed.js", "server/breather.js", "server/ids.js", "server/log.js"];
+const CORE_FILES = ["server/gateway.js", "server/room-host.js", "server/feed.js", "server/breather.js", "server/ids.js", "server/log.js", "server/blob-access.js"];
 const ADAPTER_DIRS = ["server/store/", "server/registry/", "server/bus/", "server/blobs/", "server/auth/"];
 const SUPPORT_DIRS = ["server/pg/"];
 /** Driving adapters, each with its group: server.js serves HTTP/WebSocket (Bun.serve) and mounts static.js. */
 const DRIVING = {
   "server/server.js": "server/http",
   "server/static.js": "server/http",
+  "server/blob-http.js": "server/http",
   "server/auth/http.js": "server/auth/http",
 };
 const COMPOSITION_ROOTS = [

@@ -8,11 +8,15 @@
 //   GET /ws       the WebSocket (the token goes in the first message, never in a header or the URL)
 // Everything else goes to `http` (the platform track's routes: POST /boards, sign-in), then to the web app (static.js:
 // GET/HEAD of the page and its module graph, an allowlist built at start-up), else 404.
+//   GET|PUT /blobs/<token>   signed blob URLs (blob-http.js); only when `blobs` is given. Without it the gateway
+//                            answers a socket's `blob` request `unavailable`.
 
 import { gateway as makeGateway } from "./gateway.js";
 import { roomHost, serveOpens, remoteRooms } from "./room-host.js";
 import { quietLogger } from "./log.js";
 import { staticSite } from "./static.js";
+import { blobAccess } from "./blob-access.js";
+import { blobRoutes } from "./blob-http.js";
 
 const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
 
@@ -21,6 +25,7 @@ const json = (status, body) => new Response(JSON.stringify(body), { status, head
  *   auth: object, registry: object, store: object, bus: object, blobs?: object, log?: object,
  *   port?: number, hostname?: string,
  *   http?: (req: Request, url: URL) => Response | undefined | Promise<Response | undefined>,
+ *   blobKey?: Uint8Array, quotaBytes?: number, publicUrl?: string,   // blobs: ≥ 32-byte signing key (default: random per process), tenant quota, the origin signed URLs name (default none: a path)
  *   limits?: object, host?: object, static?: false | { mounts?: { url: string, dir: string }[] },
  *   roles?: { gateway: boolean, host: boolean }, node?: string, now?: () => number, timers?: object,
  * }} o — `port: 0` picks a free port. `host` options go to the room host (tests; main.js passes hostname and
@@ -29,7 +34,7 @@ const json = (status, body) => new Response(JSON.stringify(body), { status, head
  *   (names a gateway-only node's open requests). `now`, `timers`: the gateway's clock and timers; tests inject virtual ones (default Date.now and the globals).
  */
 export function createServer({ auth, registry, store, bus, blobs = null, log = quietLogger, port = 0, hostname = "127.0.0.1", http, limits, host = {}, static: web = {},
-  roles = { gateway: true, host: true }, node = "node", now, timers }) {
+  roles = { gateway: true, host: true }, node = "node", now, timers, blobKey, quotaBytes, publicUrl }) {
   if (!roles || (!roles.gateway && !roles.host)) throw new TypeError("createServer needs at least one role (gateway, host)");
   const started = Date.now();
   const badRequest = badRequestLimiter();
@@ -38,7 +43,10 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
     ? roomHost({ store, bus, log, ...host })
     : remoteRooms({ bus, node, timeoutMs: host.leaseTtlMs ?? 10_000, log });
   const unserve = roles.host ? serveOpens({ bus, rooms, log }) : () => {};
-  const gw = roles.gateway ? makeGateway({ auth, registry, store, bus, rooms, log, limits, ...(now ? { now } : {}), ...(timers ? { timers } : {}) }) : null;
+  let origin = publicUrl?.replace(/\/+$/, "") ?? "";   // "": signed URLs are the path /blobs/<token>, which the client resolves against the origin it connected to
+  const access = blobs && roles.gateway ? blobAccess({ blobs, key: blobKey ?? crypto.getRandomValues(new Uint8Array(32)), origin: () => origin, log, ...(now ? { now } : {}), ...(quotaBytes !== undefined ? { quotaBytes } : {}) }) : null;
+  const blobHttp = access ? blobRoutes({ access }) : null;
+  const gw = roles.gateway ? makeGateway({ auth, registry, store, bus, rooms, log, limits, ...(access ? { blobUrl: access.url } : {}), ...(now ? { now } : {}), ...(timers ? { timers } : {}) }) : null;
 
   const server = Bun.serve({
     port, hostname,
@@ -54,6 +62,7 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
           if (srv.upgrade(req, { data: {} })) return undefined;
           return json(426, { error: "upgrade", message: "this is a WebSocket endpoint" });
         }
+        if (blobHttp) { const res = await blobHttp.handle(req, url); if (res) return res; }
         if (http) { const res = await http(req, url); if (res) return res; }
         if (site) { const res = await site.handle(req, url); if (res) return res; }
         return json(404, { error: "not-found" });

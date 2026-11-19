@@ -10,5 +10,6 @@ export const DEFAULT_FILES = [
   "test/server/cluster-id.test.js",
   "test/server/cluster-isolation.test.js",
   "test/server/s3-blobs.test.js",
+  "test/server/blobs-s3-e2e.test.js",
   "test/admin/tenants.test.js",
 ];

@@ -1,8 +1,9 @@
 // Entry point (single node or one cluster node): `bun server/main.js`.
 //   Single node (neither DATABASE_URL nor NATS_URL): SQLite store and registry, in-memory bus, both roles.
 //   Cluster node (both set): Postgres store and registry, NATS bus, the roles PLENARY_ROLES names.
-//   Blobs are local disk (PLENARY_DATA_DIR) in both modes. Nothing in server/ reads or writes blobs today (only
-//   createServer passes them through), so per-node disk is no gap yet; S3-compatible blobs are a later job.
+//   Blobs (picture bytes; PROTOCOL.md § Blobs): S3-compatible when S3_ENDPOINT is set, else local disk
+//   (PLENARY_DATA_DIR/blobs). A cluster node without S3_* still starts, on its own disk, with a loud warning: a
+//   picture put through one node is then unreadable through another, so a real cluster sets S3_*.
 //
 // Environment (no secrets in the repo; none of these values is ever logged):
 //   PORT                 default 8080 (0 = any free port)
@@ -14,6 +15,10 @@
 //                        tenant if missing and adds those users as its admins (server/admin/tenants.js), so they can
 //                        POST /boards. Domains with no admin token get no tenant from here.
 //                        Additive: dropping `admin` later removes nobody (the operator CLI is scripts/admin-bootstrap.js).
+//   S3_ENDPOINT, S3_BUCKET, S3_REGION, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY   S3-compatible blobs (the bucket must
+//                        exist). S3_ENDPOINT set → all five are required, else the start is refused naming the missing
+//                        ones. S3_SESSION_TOKEN (optional) goes to the client. Never logged.
+//   PLENARY_BLOB_QUOTA_BYTES   per-tenant picture storage, default 10 GiB (a positive integer, else the start is refused)
 //   LOG_LEVEL            debug | info | warn | error
 //   PLENARY_MAX_CONNS_PER_USER   open sockets one user may hold (default 64). A load test that shares a few dev
 //                        tokens between thousands of clients must raise it.
@@ -70,6 +75,7 @@ import { natsBus } from "./bus/nats.js";
 import { postgresRegistry } from "./registry/postgres.js";
 import { checkLeaseTtl } from "./room-host.js";
 import { diskBlobs } from "./blobs/disk.js";
+import { s3Blobs } from "./blobs/s3.js";
 import { authPort } from "./auth/port.js";
 import { devAuth } from "./auth/dev.js";
 import { sqliteRegistry } from "./registry/sqlite.js";
@@ -309,13 +315,19 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   const redirectUri = env.OIDC_REDIRECT_URI || "http://localhost:8080/auth/callback";
   const origin = env.PUBLIC_URL ? new URL(env.PUBLIC_URL).origin : new URL(redirectUri).origin;
 
+  // Blob settings are checked before anything opens, so a bad one refuses the start with nothing to close.
+  const blobs = openBlobs(env, dataDir, cluster, log);
+  const quotaRaw = env.PLENARY_BLOB_QUOTA_BYTES;
+  if (quotaRaw !== undefined && !/^[1-9]\d{0,15}$/.test(quotaRaw)) throw new Error("PLENARY_BLOB_QUOTA_BYTES must be a positive integer");
+  // Signed blob URLs: a subkey of the shared cookie key, so every node verifies every other node's URLs and the key
+  // itself never signs two kinds of thing.
+  const blobKey = new Uint8Array(await crypto.subtle.sign("HMAC", await crypto.subtle.importKey("raw", new TextEncoder().encode(cookieKey), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]), new TextEncoder().encode("plenary/blob-url/v1")));
   log.info("node", { node, roles, cluster, leaseTtlMs });
   const { store, bus, rawRegistry, clusterId } = cluster ? await openCluster(env, node, log, adapters) : {
     store: sqliteStore({ path: join(dataDir, "plenary.db") }),
     bus: memoryBus({ onError: (err, subject) => log.error("bus subscriber failed", { subject, err }) }),
     rawRegistry: sqliteRegistry({ path: join(dataDir, "registry.db") }),
   };
-  const blobs = diskBlobs({ dir: join(dataDir, "blobs") });
   const registry = announcingRegistry(rawRegistry, bus, log);
   const dev = devAuth(tokens ? { enabled: true, tokens } : undefined);
   const sessions = await makeSessions({ key: sessionKey });
@@ -423,10 +435,23 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   };
   if (devMenu) config.devSignIn = devMenu;
   const http = httpRoutes({ registry, sessions, oidc, tenancy, now: Date.now, config, log: log.child({ component: "auth" }), ...(dev.enabled ? { dev } : {}) });
-  const server = createServer({ auth, registry, store, bus, blobs, log, limits, http, port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
+  const server = createServer({ auth, registry, store, bus, blobs, blobKey, ...(env.PUBLIC_URL ? { publicUrl: origin } : {}), ...(quotaRaw ? { quotaBytes: Number(quotaRaw) } : {}), log, limits, http, port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
     roles, node, host: { hostname: node, leaseTtlMs } });
   return { server, store, bus, registry, log, devBoard, oidc, node, roles, cluster, clusterId, leaseTtlMs,
     async stop() { await server.stop(); await bus.close(); await store.close(); await rawRegistry.close(); } };
+}
+
+/** S3 when S3_ENDPOINT is set (all five settings, or the start is refused), else this node's disk. */
+function openBlobs(env, dataDir, cluster, log) {
+  if (!env.S3_ENDPOINT) {
+    if (cluster) log.warn("S3_ENDPOINT is not set: pictures are stored on this node's disk, and another node cannot read them");
+    return diskBlobs({ dir: join(dataDir, "blobs") });
+  }
+  const names = ["S3_BUCKET", "S3_REGION", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"], missing = names.filter(n => !env[n]);
+  if (missing.length) throw new Error(`S3_ENDPOINT is set, so ${missing.join(", ")} must be set too`);
+  log.info("blobs: S3-compatible", { bucket: env.S3_BUCKET });
+  return s3Blobs({ endpoint: env.S3_ENDPOINT, bucket: env.S3_BUCKET, region: env.S3_REGION, accessKeyId: env.S3_ACCESS_KEY_ID, secretAccessKey: env.S3_SECRET_ACCESS_KEY,
+    ...(env.S3_SESSION_TOKEN ? { sessionToken: env.S3_SESSION_TOKEN } : {}) });
 }
 
 /**

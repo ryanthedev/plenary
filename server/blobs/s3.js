@@ -1,6 +1,8 @@
 // The Blobs port on S3-compatible storage (PROTOCOL.md § Blobs), for a cluster. Same contract as disk.js:
-//   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB, a hash mismatch, and anything that isn't a PNG/JPEG/GIF/WebP
+//   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB, a hash mismatch, and anything that isn't a PNG/JPEG/GIF/WebP;
+//                              true when it stored the blob, false when the tenant already had it
 //   get(tenant, sha1)          bytes, or null when there is no such blob (every other failure throws)
+//   usage(tenant)              the bytes the tenant's objects take (a paged ListObjectsV2 of `<tenant>/`)
 // A blob is the object `<tenant>/<sha1>` in one bucket. Both ids are validated before they reach a key, so one
 // tenant can't name another's object. An S3 PUT is atomic (readers see the whole object or none) and durable once
 // it returns, so there is no temp-file dance.
@@ -21,7 +23,7 @@
 // explicit non-empty `sessionToken` from the caller does override it. So: pass `sessionToken` when the store needs
 // one; without it, s3Blobs inspects what Bun would actually sign with and refuses to start (PortError
 // "bad-config") if a session token would come from the environment.
-// SEAM(p3): the per-tenant quota (§ Limits) is not enforced here, as in disk.js.
+// The per-tenant quota is enforced above the port (server/blob-access.js), from usage() and put()'s answer.
 
 import { needId, isSha1, PortError } from "../ids.js";
 import { checkBlob, imageKind, MAX_BLOB_BYTES } from "./port.js";
@@ -33,13 +35,13 @@ const SIGNED_FOR = 300;    // seconds a presigned request stays valid; each is u
 
 /**
  * @param {{ endpoint: string, bucket: string, region: string, accessKeyId: string, secretAccessKey: string,
- *           sessionToken?: string, putTimeoutMs?: number, getTimeoutMs?: number }} o
+ *           sessionToken?: string, putTimeoutMs?: number, getTimeoutMs?: number, usageTimeoutMs?: number }} o
  */
-export function s3Blobs({ endpoint, bucket, region, accessKeyId, secretAccessKey, sessionToken, putTimeoutMs = 30_000, getTimeoutMs = 10_000 } = {}) {
+export function s3Blobs({ endpoint, bucket, region, accessKeyId, secretAccessKey, sessionToken, putTimeoutMs = 30_000, getTimeoutMs = 10_000, usageTimeoutMs = 60_000 } = {}) {
   for (const [k, v] of Object.entries({ endpoint, bucket, region, accessKeyId, secretAccessKey }))
     if (typeof v !== "string" || !v) throw new TypeError(`s3Blobs needs ${k}`);
   if (sessionToken !== undefined && (typeof sessionToken !== "string" || !sessionToken)) throw new TypeError("s3Blobs sessionToken must be a non-empty string when given");
-  for (const [k, v] of Object.entries({ putTimeoutMs, getTimeoutMs }))
+  for (const [k, v] of Object.entries({ putTimeoutMs, getTimeoutMs, usageTimeoutMs }))
     if (!Number.isFinite(v) || v <= 0) throw new TypeError(`s3Blobs ${k} must be a positive number`);
 
   const s3 = new Bun.S3Client({ endpoint, bucket, region, accessKeyId, secretAccessKey, ...(sessionToken ? { sessionToken } : {}) });
@@ -79,14 +81,31 @@ export function s3Blobs({ endpoint, bucket, region, accessKeyId, secretAccessKey
     async put(tenant, sha1, bytes) {
       const k = key(tenant, sha1);
       const b = checkBlob(sha1, bytes);
-      await within(putTimeoutMs, "put", async signal => {
+      return within(putTimeoutMs, "put", async signal => {
         const head = await call(signal, putTimeoutMs, "put (HEAD)", s3.presign(k, { method: "HEAD", expiresIn: SIGNED_FOR }), { method: "HEAD" });
-        if (head.ok) return;                        // same hash = same bytes: nothing to do
+        if (head.ok) return false;                  // same hash = same bytes: nothing to do
         if (head.status !== 404) throw await failed("put (HEAD)", head);
         const res = await call(signal, putTimeoutMs, "put", s3.presign(k, { method: "PUT", expiresIn: SIGNED_FOR }),
           { method: "PUT", body: b, headers: { "content-type": TYPES[imageKind(b)] } });
         if (!res.ok) throw await failed("put", res);
         await res.arrayBuffer();                    // drain, so the connection is reusable
+        return true;
+      });
+    },
+
+    /** @returns {Promise<number>} the summed size of the tenant's objects. List calls can't be aborted (Bun's S3Client), so the deadline abandons one rather than cancels it. */
+    async usage(tenant) {
+      needId(tenant, "tenant");
+      return within(usageTimeoutMs, "usage", async signal => {
+        const abandon = p => new Promise((res, rej) => { signal.addEventListener("abort", () => rej(signal.reason), { once: true }); p.then(res, rej); });
+        let total = 0, startAfter;
+        for (;;) {
+          const page = await abandon(s3.list({ prefix: `${tenant}/`, maxKeys: 1000, ...(startAfter ? { startAfter } : {}) }));
+          const keys = page.contents ?? [];
+          for (const o of keys) total += Number(o.size) || 0;
+          if (!page.isTruncated || !keys.length) return total;
+          startAfter = keys[keys.length - 1].key;
+        }
       });
     },
 

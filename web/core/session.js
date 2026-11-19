@@ -303,7 +303,7 @@ export function createSession({ join, token, board, client = "web", tab = null, 
     s.act(stream, ed => { id = ed.addImage(file, at); });
     return id;
   };
-  /** Picture bytes from elsewhere (the blob relay): shown in both Editors, never sent as an op. */
+  /** Picture bytes fetched for a placeholder (net.want → onFile; PROTOCOL.md § Blobs): shown in both Editors, never sent as an op. */
   s.receiveFiles = files => { for (const ed of Object.values(eds)) { ed.doc.apply({ files }); ed.changed(); } };
 
   // ── keys ──

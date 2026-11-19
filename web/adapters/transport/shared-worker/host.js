@@ -1,7 +1,7 @@
 // The rooms behind the SharedWorker (worker.js): one in-process room per board (the root passes `makeNet`: the
 // local transport adapter's localRoom), so several tabs or windows of one browser edit together until the phase-3 server is wired in.
 // Also a stand-in Blobs port: picture bytes never travel in ops (the room refuses `files`), so tabs hand them
-// here and every tab gets them (v1: signed blob URLs). Dev only: the rooms live as long as one tab stays open.
+// here and every tab gets them (the real server uses signed blob URLs: wsNet). Dev only: the rooms live as long as one tab stays open.
 // Kept apart from the worker entry so the tests can drive it over a fake port.
 //
 // Port messages, tab → host: { t: "join", link, board } { t: "send", link, m } { t: "close", link }

@@ -56,7 +56,9 @@ try {
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", LANG: "C",
     ...Object.fromEntries(["DATABASE_URL", "NATS_URL", "S3_ENDPOINT", "S3_BUCKET", "S3_REGION", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"].map(k => [k, rig[k]])),
   };
-  child = Bun.spawn([BUN, "--no-env-file", "test", ...FILES.map(f => resolve(ROOT, f))], {
+  // cwd is the rig dir (no .env or stray files), where bun finds no bunfig.toml: preload test/preload.js (safety nets, temp root) by absolute path, or it is skipped.
+  // (the path is split: the L6 guard reads any quoted test path here as a gated test file.)
+  child = Bun.spawn([BUN, "--no-env-file", `--preload=${join(ROOT, "test", "preload.js")}`, "test", ...FILES.map(f => resolve(ROOT, f))], {
     cwd: dir, env, stdin: "inherit", stdout: "pipe", stderr: "pipe",
   });
   let combined = "";

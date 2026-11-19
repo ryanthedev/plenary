@@ -9,6 +9,7 @@ import { sqliteRegistry } from "../../server/registry/sqlite.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { registryContract } from "../auth/registry-contract.js";
 import { legacyEquivalence } from "../auth/legacy-migration.js";
+import { accessEquivalence } from "../auth/access-equivalence.js";
 import { Database } from "bun:sqlite";
 
 const dir = mkdtempSync(join(tmpdir(), "plenary-registry-"));
@@ -18,6 +19,7 @@ const file = () => join(dir, `r${++n}.db`);
 
 // Platform's contract, on a fresh file per test (a file, not :memory:, so WAL and fsync are in play).
 registryContract("sqlite", async ({ now }) => sqliteRegistry({ path: file(), now, fullfsync: false }), { cleanup: r => r.close(), batch: true });
+accessEquivalence("sqlite", async ({ now }) => sqliteRegistry({ path: ":memory:", now, fullfsync: false }), { cleanup: r => r.close() });
 
 // A database from before board organization: the seven original tables (their DDL as of 1d0bcbe), filled with a legacy state.
 const LEGACY_DDL = [

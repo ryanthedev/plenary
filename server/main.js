@@ -86,6 +86,7 @@ import { tenancy as makeTenancy, roleCache } from "./auth/tenancy.js";
 import { sessions as makeSessions } from "./auth/session.js";
 import { googleOidc } from "./auth/oidc.js";
 import { httpRoutes } from "./auth/http.js";
+import { homeService, recentRecorder } from "./auth/home.js";
 import { bootstrapTenant } from "./admin/tenants.js";
 import { subjects } from "./bus/port.js";
 import { isClusterId } from "./ids.js";
@@ -440,8 +441,9 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
     publicUrl: origin,
   };
   if (devMenu) config.devSignIn = devMenu;
-  const http = httpRoutes({ registry, sessions, oidc, tenancy, now: Date.now, config, log: log.child({ component: "auth" }), ...(dev.enabled ? { dev } : {}) });
-  const server = createServer({ auth, registry, store, bus, blobs, blobKey, ...(env.PUBLIC_URL ? { publicUrl: origin } : {}), ...(quotaRaw ? { quotaBytes: Number(quotaRaw) } : {}), log, limits, http, deflate: zlibDeflate(), port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
+  const home = homeService({ registry, tenancy });
+  const http = httpRoutes({ registry, sessions, oidc, tenancy, home, now: Date.now, config, log: log.child({ component: "auth" }), ...(dev.enabled ? { dev } : {}) });
+  const server = createServer({ auth, registry, store, bus, blobs, blobKey, ...(env.PUBLIC_URL ? { publicUrl: origin } : {}), ...(quotaRaw ? { quotaBytes: Number(quotaRaw) } : {}), log, limits, http, deflate: zlibDeflate(), onWelcomed: recentRecorder({ registry, log: log.child({ component: "home" }) }), port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
     roles, node, host: { hostname: node, leaseTtlMs } });
   return { server, store, bus, registry, log, devBoard, oidc, node, roles, cluster, clusterId, leaseTtlMs,
     async stop() { await server.stop(); await bus.close(); await store.close(); await rawRegistry.close(); } };

@@ -9,6 +9,7 @@ import { SQL } from "bun";
 import { postgresRegistry, registryTables, REGISTRY_INDEXES } from "../../server/registry/postgres.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { registryContract } from "../auth/registry-contract.js";
+import { accessEquivalence } from "../auth/access-equivalence.js";
 import { tenancy } from "../../server/auth/tenancy.js";
 import { legacyEquivalence } from "../auth/legacy-migration.js";
 import { migrate } from "../../server/pg/schema.js";
@@ -41,6 +42,32 @@ describe.skipIf(!url)("postgres registry", () => {
     schemas.set(r, schema);
     return r;
   }, { cleanup: async r => { await r.close(); await drop(schemas.get(r)); schemas.delete(r); }, batch: true });
+
+  // Recent keeps the newest 50 rows per member, atomically: concurrent writes each prune a snapshot that misses the others' rows, so
+  // without the per-member advisory lock the table grows past 50 (measured in review: 20 concurrent writes left 68). `recents()` caps its
+  // answer at 50, so the row count is read from the table.
+  test("markOpened: 60 concurrent writes onto a full list leave exactly 50 rows (per-member advisory lock)", async () => {
+    const schema = schemaName();
+    const wide = new SQL({ url, max: 8 });                                     // enough connections for the writes to really overlap
+    const r = await postgresRegistry({ sql: wide, schema });
+    try {
+      const t = await r.createTenant({ domain: "recent.com" });
+      const ids = [];
+      for (let i = 0; i < 110; i++) ids.push((await r.createBoard({ tenant: t.id, title: `c${i}` })).id);
+      for (const id of ids.slice(0, 50)) await r.markOpened("dev:cc", id);
+      await Promise.all(ids.slice(50).map(id => r.markOpened("dev:cc", id)));
+      const [{ n }] = await client().unsafe(`SELECT count(*)::int AS n FROM "${schema}".reg_recents WHERE member = 'dev:cc'`);
+      expect(n).toBe(50);
+    } finally { await r.close(); await wide.close(); await drop(schema); }
+  });
+
+  // The batch access check against the single-board resolver, on Postgres (one seed: each run is a few hundred statements).
+  accessEquivalence("postgres", async ({ now }) => {
+    const schema = schemaName();
+    const r = await postgresRegistry({ sql: client(), schema, now });
+    schemas.set(r, schema);
+    return r;
+  }, { seeds: [7], cleanup: async r => { await r.close(); await drop(schemas.get(r)); schemas.delete(r); } });
 
   // The same contract as a runtime role: USAGE on the schema and row rights on tables an owner created, nothing more
   // (PROTOCOL.md § Store, "Least privilege"). One role for the file; each test's schema is migrated by the owner
@@ -130,6 +157,11 @@ describe.skipIf(!url)("postgres registry", () => {
     } finally { await r.close(); await drop(schema); }
   });
 
+  // Multi-round races on real Postgres connections (TECH-DEBT row 34). ROUNDS is what kills the mutants reliably (a missing lock
+  // or check fails in round 0 or 1 in practice); RACE_CEILING is a failure-only ceiling for a loaded machine (a round is a few
+  // ms alone, tens of ms under load average ~20): the assertions are invariants, never elapsed time.
+  const ROUNDS = 12, RACE_CEILING = 30_000;
+
   test("two connections racing to demote a Space's only two owners (and a Group's): exactly one wins, every round", async () => {
     const schema = schemaName();
     const a = await postgresRegistry({ url, schema, max: 2 });
@@ -137,7 +169,7 @@ describe.skipIf(!url)("postgres registry", () => {
     try {
       const t = await a.createTenant({ domain: null });
       const g = await a.createGroup({ tenant: t.id, name: "P" }), sp = await a.createSpace({ tenant: t.id, name: "D" });
-      for (const scope of [{ type: "space", id: sp.id }, { type: "group", id: g.id }]) for (let round = 0; round < 25; round++) {
+      for (const scope of [{ type: "space", id: sp.id }, { type: "group", id: g.id }]) for (let round = 0; round < ROUNDS; round++) {
         await a.setScopedGrant({ scope, subject: { type: "user", id: "x" }, role: "owner" });
         await b.setScopedGrant({ scope, subject: { type: "user", id: "y" }, role: "owner" });
         const res = await Promise.allSettled([a.setScopedGrant({ scope, subject: { type: "user", id: "x" }, role: null }), b.setScopedGrant({ scope, subject: { type: "user", id: "y" }, role: round % 2 ? "viewer" : null })]);
@@ -148,7 +180,7 @@ describe.skipIf(!url)("postgres registry", () => {
         await a.setScopedGrant({ scope, subject: { type: "user", id: "y" }, role: null }).catch(() => {});
       }
     } finally { await a.close(); await b.close(); await drop(schema); }
-  });
+  }, RACE_CEILING);
 
   test("a Team's last member leaving races an owner demotion: the container never ends with no counted owner", async () => {
     const schema = schemaName();
@@ -158,7 +190,7 @@ describe.skipIf(!url)("postgres registry", () => {
       const t = await a.createTenant({ domain: null });
       const sp = await a.createSpace({ tenant: t.id, name: "D", owner: "u" }), tm = await a.createTeam({ tenant: t.id, name: "T" });
       const scope = { type: "space", id: sp.id };
-      for (let round = 0; round < 25; round++) {
+      for (let round = 0; round < ROUNDS; round++) {
         await a.setTeamMember(tm.id, "m", true);
         await a.setScopedGrant({ scope, subject: { type: "team", id: tm.id }, role: "owner" });
         const res = await Promise.allSettled([a.setScopedGrant({ scope, subject: { type: "user", id: "u" }, role: null }), b.setTeamMember(tm.id, "m", false)]);
@@ -171,7 +203,7 @@ describe.skipIf(!url)("postgres registry", () => {
         await a.setScopedGrant({ scope, subject: { type: "team", id: tm.id }, role: null });
       }
     } finally { await a.close(); await b.close(); await drop(schema); }
-  });
+  }, RACE_CEILING);
 
   test("a write transaction runs with synchronous_commit=on", async () => {
     const schema = schemaName();
@@ -199,7 +231,7 @@ describe.skipIf(!url)("postgres registry", () => {
     try {
       const t = await a.createTenant({ domain: null });
       const board = await a.createBoard({ tenant: t.id });
-      for (let round = 0; round < 40; round++) {
+      for (let round = 0; round < ROUNDS; round++) {
         await a.setGrant(board.id, "x", "owner");
         await b.setGrant(board.id, "y", "owner");
         const res = await Promise.allSettled([a.setGrant(board.id, "x", null), b.setGrant(board.id, "y", round % 2 ? "viewer" : null)]);
@@ -208,7 +240,7 @@ describe.skipIf(!url)("postgres registry", () => {
         for (const h of [a, b]) expect((await h.grants(board.id)).filter(g => g.role === "owner").length).toBe(1);
       }
     } finally { await a.close(); await b.close(); await drop(schema); }
-  });
+  }, RACE_CEILING);
 
   test("a setGrant waits on another connection's board lock, then sees its commit (last-owner)", async () => {
     const schema = schemaName();

@@ -568,5 +568,232 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect((await r.tenant(t.id)).domains).toEqual(["acme.com"]);
       });
     });
+
+    // ---- Home: Recent, Starred, Shared with me, search, boardRows (PROTOCOL.md § Home) ----
+    describe("home", () => {
+      const mk = async () => {
+        const t = await r.createTenant({ domain: "acme.com", admins: ["dev:root"] });
+        const sp = await r.createSpace({ tenant: t.id, name: "Design Studio" });
+        const a = await r.createBoard({ tenant: t.id, title: "Roadmap", space: sp.id });
+        const b = await r.createBoard({ tenant: t.id, title: "Offsite 100%_ideas" });
+        const c = await r.createBoard({ tenant: t.id, title: "Other roadmap thing" });
+        return { t, sp, a, b, c };
+      };
+
+      test("markOpened / recents: newest first, one row per board, limit, unknown board rejects", async () => {
+        const { a, b, c } = await mk();
+        for (const x of [a, b, c]) { await r.markOpened("dev:ada", x.id); clock.t += 1000; }
+        clock.t += 1000;
+        await r.markOpened("dev:ada", a.id);      // reopen: moves to the front, no duplicate
+        const rec = await r.recents("dev:ada");
+        expect(rec.map(x => x.board)).toEqual([a.id, c.id, b.id]);
+        expect(rec[0].at).toBe(clock.t);
+        expect((await r.recents("dev:ada", { limit: 2 })).map(x => x.board)).toEqual([a.id, c.id]);
+        expect(await r.recents("dev:bob")).toEqual([]);
+        await expect(r.markOpened("dev:ada", "b-nope000000000000")).rejects.toThrow();
+      });
+
+      test("markOpened keeps only the newest 50 rows per user (other users untouched)", async () => {
+        const { t } = await mk();
+        const ids = [];
+        for (let i = 0; i < 55; i++) { ids.push((await r.createBoard({ tenant: t.id, title: `b${i}` })).id); }
+        for (const id of ids) { await r.markOpened("dev:ada", id); clock.t += 1; }
+        await r.markOpened("dev:bob", ids[0]);
+        const rec = await r.recents("dev:ada", { limit: 1000 });
+        expect(rec.length).toBe(50);
+        expect(rec[0].board).toBe(ids[54]);
+        expect(rec.map(x => x.board)).not.toContain(ids[0]);
+        expect((await r.recents("dev:bob")).map(x => x.board)).toEqual([ids[0]]);
+      });
+
+      test("setStarred / starred / starredAmong: idempotent, newest star first, un-star never rejects", async () => {
+        const { a, b } = await mk();
+        await r.setStarred("dev:ada", a.id, true);
+        clock.t += 1000;
+        await r.setStarred("dev:ada", b.id, true);
+        clock.t += 1000;
+        await r.setStarred("dev:ada", a.id, true);        // already starred: the star keeps its place
+        expect((await r.starred("dev:ada")).map(x => x.board)).toEqual([b.id, a.id]);
+        expect((await r.starredAmong("dev:ada", [a.id, "b-nope000000000000"])).sort()).toEqual([a.id]);
+        expect(await r.starredAmong("dev:bob", [a.id, b.id])).toEqual([]);
+        await r.setStarred("dev:ada", a.id, false);
+        await r.setStarred("dev:ada", a.id, false);
+        await r.setStarred("dev:ada", "b-nope000000000000", false);
+        expect((await r.starred("dev:ada")).map(x => x.board)).toEqual([b.id]);
+        await expect(r.setStarred("dev:ada", "b-nope000000000000", true)).rejects.toThrow();
+        expect(await r.starredAmong("dev:ada", [])).toEqual([]);
+      });
+
+      test("sharedBoards: every source on the board itself (grants incl. owner, a Team's, non-revoked invites, redeemed links)", async () => {
+        const { t, a, b, c } = await mk();
+        const d = await r.createBoard({ tenant: t.id, title: "D" });
+        const e = await r.createBoard({ tenant: t.id, title: "E" });
+        const f = await r.createBoard({ tenant: t.id, title: "F" });
+        const g = await r.createBoard({ tenant: t.id, title: "G" });
+        await r.setGrant(a.id, "google:ann", "editor");
+        await r.setGrant(b.id, "google:ann", "owner");                                  // ownership counts: Home labels it "Your boards" for a guest
+        await r.createInvite({ board: c.id, email: "Ann@Example.com", role: "viewer", by: "dev:root" });
+        const dead = await r.createInvite({ board: e.id, email: "ann@example.com", role: "viewer", by: "dev:root" });
+        await r.revokeInvite(dead.id);
+        const l = await r.createLink({ board: d.id, role: "viewer", by: "dev:root" });
+        await r.addLinkUse(l.id, "google:ann");
+        const team = await r.createTeam({ tenant: t.id, name: "Infra" }), other = await r.createTeam({ tenant: t.id, name: "Other" });
+        await r.setTeamMember(team.id, "google:ann", true);
+        await r.setScopedGrant({ scope: { type: "board", id: f.id }, subject: { type: "team", id: team.id }, role: "viewer" });
+        await r.setScopedGrant({ scope: { type: "board", id: g.id }, subject: { type: "team", id: other.id }, role: "viewer" });   // a Team she is not in
+        expect((await r.sharedBoards("google:ann", "ann@example.com")).sort()).toEqual([a.id, b.id, c.id, d.id, f.id].sort());
+        expect((await r.sharedBoards("google:ann", null)).sort()).toEqual([a.id, b.id, d.id, f.id].sort());
+        expect(await r.sharedBoards("google:nobody", "nobody@example.com")).toEqual([]);
+        expect((await r.sharedBoards("google:ann", "ann@example.com", { limit: 1 })).length).toBe(1);
+        await r.setTeamMember(team.id, "google:ann", false);
+        expect(await r.sharedBoards("google:ann", null)).not.toContain(f.id);
+      });
+
+      test("searchBoards: title or Space name, case-insensitive, LIKE characters literal, tenant-scoped, paged, unfiled", async () => {
+        const { t, a, b, c } = await mk();
+        const other = await r.createTenant({ domain: "globex.com" });
+        await r.createBoard({ tenant: other.id, title: "Roadmap" });
+        expect((await r.searchBoards(t.id, { q: "ROADMAP" })).ids.sort()).toEqual([a.id, c.id].sort());
+        expect((await r.searchBoards(t.id, { q: "design studio" })).ids).toEqual([a.id]);     // a Space name finds its boards
+        expect((await r.searchBoards(t.id, { q: "100%_" })).ids).toEqual([b.id]);
+        expect((await r.searchBoards(t.id, { q: "%" })).ids).toEqual([b.id]);                // not a wildcard
+        expect((await r.searchBoards(t.id, { q: "_" })).ids).toEqual([b.id]);
+        expect((await r.searchBoards(t.id, { q: "\\" })).ids).toEqual([]);
+        expect((await r.searchBoards(t.id, { q: "zzz" })).ids).toEqual([]);
+        expect((await r.searchBoards(t.id, { unfiled: true })).ids.sort()).toEqual([b.id, c.id].sort());
+        expect((await r.searchBoards(t.id, { unfiled: true, q: "design studio" })).ids).toEqual([]);   // unfiled: titles only
+        // Paging is by the scan window, never by the number of matches: both matches come back together, and `next` stays null.
+        const both = await r.searchBoards(t.id, { q: "roadmap" });
+        expect(both.ids.sort()).toEqual([a.id, c.id].sort());
+        expect(both.next).toBe(null);
+        const w1 = await r.searchBoards(t.id, { q: "roadmap", scan: 1 });
+        expect(w1.next).toBe([a.id, b.id, c.id].sort()[0]);                  // examined one board; the Unit goes on
+        const w2 = await r.searchBoards(t.id, { q: "roadmap", scan: 1, after: w1.next });
+        expect(w2.next).toBe([a.id, b.id, c.id].sort()[1]);
+        await expect(r.searchBoards(t.id, { q: "   " })).rejects.toThrow();
+        await expect(r.searchBoards(t.id, { q: "x".repeat(101) })).rejects.toThrow();
+        await expect(r.searchBoards(t.id, { q: "a", after: "x\ny" })).rejects.toThrow("bad cursor");
+        expect((await r.searchBoards("t-nope00000000", { q: "a" })).ids).toEqual([]);
+      });
+
+      test("searchBoards: ASCII case-folding only (a non-ASCII capital is not folded)", async () => {
+        const t = await r.createTenant({ domain: "fold.com" });
+        const a = await r.createBoard({ tenant: t.id, title: "Caf\u00c9 menu" }), b = await r.createBoard({ tenant: t.id, title: "CAF\u00e9 plan" });
+        expect((await r.searchBoards(t.id, { q: "caf\u00c9" })).ids).toEqual([a.id]);
+        expect((await r.searchBoards(t.id, { q: "caf\u00e9" })).ids).toEqual([b.id]);
+        expect((await r.searchBoards(t.id, { q: "CAF" })).ids.sort()).toEqual([a.id, b.id].sort());
+      });
+
+      test("searchBoards: `next` depends only on the scan window, never on how many boards matched", async () => {
+        const t = await r.createTenant({ domain: "many.com" });
+        for (let i = 0; i < 30; i++) await r.createBoard({ tenant: t.id, title: `falcon ${i}` });
+        const some = await r.searchBoards(t.id, { q: "falcon", scan: 100 }), none = await r.searchBoards(t.id, { q: "qqqq", scan: 100 });
+        expect([some.ids.length, some.next, none.ids.length, none.next]).toEqual([30, null, 0, null]);   // 30 matches in one window: all returned, nothing "more"
+        const cut = await r.searchBoards(t.id, { q: "falcon", scan: 10 }), cutNone = await r.searchBoards(t.id, { q: "qqqq", scan: 10 });
+        expect(cut.ids.length).toBe(10);
+        expect(cut.next).toBe(cutNone.next);                                 // the same cursor whether or not anything matched
+        expect(cut.next).not.toBe(null);
+      });
+
+      test("searchBoards is work-bounded: a page examines at most `scan` boards and `next` says where it stopped, even with no match", async () => {
+        const t = await r.createTenant({ domain: "scan.com" });
+        const made = [];
+        for (let i = 0; i < 25; i++) made.push((await r.createBoard({ tenant: t.id, title: i === 22 ? "needle" : `hay ${i}` })).id);
+        made.sort();
+        const found = [];
+        let after = null, pages = 0;
+        do { const p = await r.searchBoards(t.id, { q: "needle", after, scan: 10 }); found.push(...p.ids); after = p.next; pages++; } while (after && pages < 10);
+        expect(pages).toBe(3);                                                   // 25 boards, 10 examined per page: 10 + 10 + 5
+        const need = (await r.searchBoards(t.id, { q: "needle" })).ids;
+        expect(found).toEqual(need);
+        expect(need.length).toBe(1);
+        const first = await r.searchBoards(t.id, { q: "zzzzzz", scan: 10 });
+        expect(first.ids).toEqual([]);
+        expect(first.next).toBe(made[9]);                                        // examined ten, none matched, the Unit goes on
+        expect((await r.searchBoards(t.id, { q: "zzzzzz", scan: 25 })).next).toBe(null);   // examined everything: done
+      });
+
+      test("spaceCandidates / groupCandidates: Spaces and Groups a member COULD open, in SQL pages; their Groups come along", async () => {
+        const t = await r.createTenant({ domain: "cand.com" });
+        const open = await r.createGroup({ tenant: t.id, name: "Open", generalRole: "viewer" });
+        const shut = await r.createGroup({ tenant: t.id, name: "Shut", generalRole: null });
+        const granted = await r.createGroup({ tenant: t.id, name: "Granted", generalRole: null });
+        const team = await r.createTeam({ tenant: t.id, name: "Infra" });
+        await r.setTeamMember(team.id, "dev:ann", true);
+        await r.setScopedGrant({ scope: { type: "group", id: granted.id }, subject: { type: "user", id: "dev:ann" }, role: "viewer" });
+        const sp = {};
+        sp.general = await r.createSpace({ tenant: t.id, name: "General" });
+        sp.closed = await r.createSpace({ tenant: t.id, name: "Closed", generalRole: null });
+        sp.mine = await r.ensurePersonalSpace(t.id, "dev:ann");
+        sp.theirs = await r.ensurePersonalSpace(t.id, "dev:bob");
+        sp.byUser = await r.createSpace({ tenant: t.id, name: "ByUser", generalRole: null });
+        sp.byTeam = await r.createSpace({ tenant: t.id, name: "ByTeam", generalRole: null });
+        sp.inOpen = await r.createSpace({ tenant: t.id, name: "InOpen", generalRole: null, group: open.id });
+        sp.inShut = await r.createSpace({ tenant: t.id, name: "InShut", generalRole: null, group: shut.id });
+        sp.inGranted = await r.createSpace({ tenant: t.id, name: "InGranted", generalRole: null, group: granted.id });
+        await r.setScopedGrant({ scope: { type: "space", id: sp.byUser.id }, subject: { type: "user", id: "dev:ann" }, role: "editor" });
+        await r.setScopedGrant({ scope: { type: "space", id: sp.byTeam.id }, subject: { type: "team", id: team.id }, role: "editor" });
+        const other = await r.createTenant({ domain: "elsewhere.com" });
+        await r.createSpace({ tenant: other.id, name: "Elsewhere" });
+        const names = async o => (await r.spaceCandidates(t.id, { user: "dev:ann", ...o })).spaces.map(x => x.name).sort();
+        expect(await names()).toEqual(["ByTeam", "ByUser", "General", "InGranted", "InOpen", "ann's space"].sort());
+        expect((await names({ all: true })).length).toBe(9);                       // a Unit-level role: every Space of the Unit, nothing of another Unit
+        const first = await r.spaceCandidates(t.id, { user: "dev:ann", all: true, limit: 4 });
+        expect(first.spaces.length).toBe(4);
+        expect(first.next).toBe(first.spaces[3].id);
+        const rest = await r.spaceCandidates(t.id, { user: "dev:ann", all: true, limit: 200, after: first.next });
+        expect(rest.next).toBe(null);
+        expect([...first.spaces, ...rest.spaces].map(x => x.id)).toEqual([...first.spaces, ...rest.spaces].map(x => x.id).sort());
+        const withGroups = await r.spaceCandidates(t.id, { user: "dev:ann" });
+        expect(withGroups.groups.map(g => g.name).sort()).toEqual(["Granted", "Open"]);   // the Groups of the returned Spaces (Shut's Space isn't one)
+        expect((await r.groupCandidates(t.id, { user: "dev:ann" })).map(g => g.name).sort()).toEqual(["Granted", "Open"]);
+        expect((await r.groupCandidates(t.id, { user: "dev:ann", all: true })).length).toBe(3);
+        expect((await r.groupCandidates(t.id, { user: "dev:ann", all: true, limit: 2 })).length).toBe(2);
+        expect((await r.spaceCandidates("t-nope00000000", { user: "dev:ann" })).spaces).toEqual([]);
+        await expect(r.spaceCandidates(t.id, { user: "dev:ann", after: "x\ny" })).rejects.toThrow("bad cursor");
+      });
+
+      test("markOpened under concurrency keeps at most the newest 50 rows per user (a full list, then 24 writes at once)", async () => {
+        const { t } = await mk();
+        const ids = [];
+        for (let i = 0; i < 76; i++) ids.push((await r.createBoard({ tenant: t.id, title: `c${i}` })).id);
+        for (const id of ids.slice(0, 50)) { await r.markOpened("dev:cc", id); clock.t += 1; }   // the list is full
+        clock.t += 1000;
+        await Promise.all(ids.slice(50).map(id => r.markOpened("dev:cc", id)));                   // concurrent writes each prune a snapshot that misses the others
+        const rec = await r.recents("dev:cc", { limit: 1000 });
+        expect(rec.length).toBe(50);
+        expect(rec.map(x => x.board)).toEqual(expect.arrayContaining(ids.slice(50)));            // every new one is kept, the 24 oldest are gone
+        expect(rec.map(x => x.board)).not.toContain(ids[0]);
+      });
+
+      test("boardRows: the board-scope rows for one user over a batch; unknown ids absent", async () => {
+        const { t, sp, a, b } = await mk();
+        const team = await r.createTeam({ tenant: t.id, name: "Infra" });
+        const other = await r.createTeam({ tenant: t.id, name: "Other" });
+        await r.setTeamMember(team.id, "google:ann", true);
+        await r.setScopedGrant({ scope: { type: "board", id: a.id }, subject: { type: "team", id: team.id }, role: "editor" });
+        await r.setScopedGrant({ scope: { type: "board", id: a.id }, subject: { type: "team", id: other.id }, role: "viewer" });
+        await r.setGrant(a.id, "google:ann", "annotator");
+        await r.createInvite({ board: a.id, email: "ann@example.com", role: "viewer", by: "dev:root" });
+        await r.createInvite({ board: a.id, email: "someone@example.com", role: "viewer", by: "dev:root" });
+        const l = await r.createLink({ board: b.id, role: "viewer", by: "dev:root" });
+        await r.addLinkUse(l.id, "google:ann");
+        const m = await r.boardRows([a.id, b.id, "b-nope000000000000", a.id], { user: "google:ann", email: "ann@example.com" });
+        expect([...m.keys()].sort()).toEqual([a.id, b.id].sort());
+        const ra = m.get(a.id);
+        expect(ra.board).toMatchObject({ id: a.id, tenant: t.id, title: "Roadmap", space: sp.id });
+        expect(ra.grant).toBe("annotator");
+        expect(ra.teamGrants).toEqual([{ subject: { type: "team", id: team.id }, role: "editor" }, { subject: { type: "team", id: other.id }, role: "viewer" }]);
+        expect(ra.myTeams).toEqual([team.id]);
+        expect(ra.invites.map(i => i.email)).toEqual(["ann@example.com"]);
+        expect(ra.links).toEqual([]);
+        const rb = m.get(b.id);
+        expect(rb).toMatchObject({ grant: null, teamGrants: [], myTeams: [], invites: [] });
+        expect(rb.board.space).toBe(null);
+        expect(rb.links.map(x => x.id)).toEqual([l.id]);
+        expect((await r.boardRows([a.id], { user: "google:bob" })).get(a.id)).toMatchObject({ grant: null, myTeams: [], invites: [], links: [] });
+        expect((await r.boardRows([], { user: "google:ann" })).size).toBe(0);
+      });
+    });
   });
 }

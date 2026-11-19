@@ -9,6 +9,7 @@ import { SQL } from "bun";
 import { postgresRegistry, registryTables, REGISTRY_INDEXES } from "../../server/registry/postgres.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { registryContract } from "../auth/registry-contract.js";
+import { accessEquivalence } from "../auth/access-equivalence.js";
 import { tenancy } from "../../server/auth/tenancy.js";
 import { legacyEquivalence } from "../auth/legacy-migration.js";
 import { migrate } from "../../server/pg/schema.js";
@@ -41,6 +42,14 @@ describe.skipIf(!url)("postgres registry", () => {
     schemas.set(r, schema);
     return r;
   }, { cleanup: async r => { await r.close(); await drop(schemas.get(r)); schemas.delete(r); }, batch: true });
+
+  // The batch access check against the single-board resolver, on Postgres (one seed: each run is a few hundred statements).
+  accessEquivalence("postgres", async ({ now }) => {
+    const schema = schemaName();
+    const r = await postgresRegistry({ sql: client(), schema, now });
+    schemas.set(r, schema);
+    return r;
+  }, { seeds: [7], cleanup: async r => { await r.close(); await drop(schemas.get(r)); schemas.delete(r); } });
 
   // The same contract as a runtime role: USAGE on the schema and row rights on tables an owner created, nothing more
   // (PROTOCOL.md § Store, "Least privilege"). One role for the file; each test's schema is migrated by the owner

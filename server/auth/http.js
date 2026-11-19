@@ -45,9 +45,10 @@
 //   POST   /boards/:board/links                { role, expiresAt? } → 201 { link, url? }
 //   DELETE /boards/:board/links/:link          → 204
 //   PUT    /boards/:board/grants/:user         { role | null } → 204   (user ids are URL-encoded, e.g. google%3A123)
-//   GET    /home                               → { guest, user, unit, recent, starred, shared, tree, limits }   (needs `home`; PROTOCOL.md § Home)
+//   GET    /home                               → { guest, user, unit, recent, starred, owned, shared, tree, limits }   (needs `home`; PROTOCOL.md § Home)
 //   GET    /home/search?q=                     → { q, results, more }   (q: 1-100 chars, else 400)
-//   PUT    /home/stars/:board                  → 204 (403 `forbidden` without a role on the board)
+//   GET    /home/search?space=<id>             → { space, results, more }   (the Space's boards the person can open; `space` null unless they can open the Space)
+//   PUT    /home/stars/:board                  → 204 (403 `forbidden` for a guest, or without a role on the board)
 //   DELETE /home/stars/:board                  → 204
 //   GET    /links/:link                        redeem: Bearer → 200 { board, url }; no Bearer → sign in first,
 //                                              the link rides in the login cookie, the callback redeems it
@@ -432,6 +433,11 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       ["/home", { GET: async req => json(200, await home.home(await caller(req))) }],
       ["/home/search", { GET: async (req, url) => {
         const who = await caller(req);
+        const space = url.searchParams.get("space");
+        if (space !== null) {
+          if (!/^[\w-]{1,64}$/.test(space) || url.searchParams.has("q")) throw refuse(400, "bad-request");
+          return json(200, await home.spaceBoards(who, space));
+        }
         const q = (url.searchParams.get("q") ?? "").trim();
         if (!q || q.length > 100 || q.includes("\0")) throw refuse(400, "bad-request");
         return json(200, await home.search(who, q));

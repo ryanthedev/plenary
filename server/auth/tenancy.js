@@ -154,9 +154,12 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
     },
     /**
      * One user's access to many boards (PROTOCOL.md § Home, "Boards I can open"): `registry.boardRows` reads every board-scope
-     * row for the whole batch in a fixed number of statements, plus ONE `accessContext` per distinct Space (or Unit, for unfiled
-     * boards) among them, then the same pure `resolveAccess` as `effective`, so it can't disagree with it. At most HOME.batch
-     * ids. Unknown boards are absent. @returns {Promise<Map<string, { access: import("./resolver.js").Access, board: Board, space: object|null, group: object|null }>>}
+     * row for the whole batch (a fixed number of statements), plus ONE `accessContext` per distinct Space (or Unit, for unfiled
+     * boards) among them, then the same pure `resolveAccess` as `effective`, so it can't disagree with it. From the context it
+     * already holds, each distinct Space's and Group's OWN access is resolved too (no further reads), so a caller can tell a board it
+     * may open apart from the Space and Group above it that it may not (their names must not leak). At most HOME.batch ids; unknown
+     * boards are absent. `spaceOpen` / `groupOpen`: may the identity open boards in that Space / Group (false when there is none).
+     * @returns {Promise<Map<string, { access: import("./resolver.js").Access, grant: Role|null, board: Board, space: object|null, group: object|null, spaceOpen: boolean, groupOpen: boolean }>>}
      */
     async accessMany(identity, boardIds) {
       const out = new Map();
@@ -170,15 +173,18 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
       for (let i = 0; i < todo.length; i += 8)
         await Promise.all(todo.slice(i, i + 8).map(async ([k, sc]) => ctxs.set(k, await registry.accessContext(sc, { users: [identity.user] }))));
       const t = now();
+      const own = new Map();   // "space:<id>" / "group:<id>" → may the identity open boards there (from the context already read)
+      const opens = (k, ctx) => { if (!own.has(k)) own.set(k, resolveAccess({ ctx }, identity, t, opts).ladder != null); return own.get(k); };
       for (const [id, r] of rows) {
         const base = ctxs.get(keyOf(scopeOf(r.board)));
         if (!base) continue;
         const teams = { ...base.teams };
         for (const g of r.teamGrants) if (g.subject.type === "team" && !(g.subject.id in teams)) teams[g.subject.id] = r.myTeams.includes(g.subject.id) ? [identity.user] : [];
         const ctx = { ...base, board: r.board, scoped: { ...base.scoped, board: r.teamGrants }, teams };
-        const links = r.links.map(l => l);
-        const access = resolveAccess({ ctx, grant: r.grant, invites: r.invites, links }, identity, t, opts);
-        out.set(id, { access, board: r.board, space: base.space, group: base.group });
+        const access = resolveAccess({ ctx, grant: r.grant, invites: r.invites, links: r.links }, identity, t, opts);
+        const spaceOpen = !!base.space && opens("space\n" + base.space.id, { ...base, board: null });
+        const groupOpen = !!base.group && opens("group\n" + base.group.id, { ...base, board: null, space: null });
+        out.set(id, { access, grant: r.grant, board: r.board, space: base.space, group: base.group, spaceOpen, groupOpen });
       }
       return out;
     },

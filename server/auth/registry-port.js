@@ -143,18 +143,22 @@ export const mint = {
  *   setStarred(user: string, board: string, on: boolean): Promise<void>,   // idempotent; rejects an unknown board when starring; un-starring never rejects
  *   starred(user: string, o?: { limit?: number }): Promise<{ board: string, at: number }[]>,   // newest star first; limit default 50, at most STAR_SCAN
  *   starredAmong(user: string, boards: string[]): Promise<string[]>,   // those of `boards` (at most BATCH) the user starred
- *   sharedBoards(user: string, email: string|null, o?: { limit?: number }): Promise<string[]>,   // boards with a board-scope source other than ownership: a non-owner grant, a non-revoked invite to `email`, a redeemed link; by id, at most SHARED_SCAN
- *   searchBoards(tenant: string, o?: { q?: string, unfiled?: boolean, after?: string|null, limit?: number }): Promise<{ ids: string[], next: string|null }>,   // board ids in a Unit whose title or Space's name contains q (case-insensitive, literal); `unfiled`: boards in no Space (q then matches the title); by id, one bounded page (default 100, at most 200)
+ *   sharedBoards(user: string, email: string|null, o?: { limit?: number }): Promise<string[]>,   // boards the user reaches through a source on the board itself (owner grants included): a direct grant, a grant to a Team the user is in, a non-revoked invite to `email`, a redeemed link; by id, at most SHARED_SCAN. Whether the board's Space is openable is the caller's business (Home)
+ *   searchBoards(tenant: string, o?: { q?: string, unfiled?: boolean, after?: string|null, limit?: number, scan?: number }): Promise<{ ids: string[], next: string|null }>,   // board ids in a Unit whose title or Space's name contains q (ASCII case-folding only, LIKE characters literal; `unfiled`: boards in no Space, q then matches the title). By id; one page examines at most `scan` boards (default 2000, at most 5000) and returns at most `limit` (default 100, at most 200). `next` is set whenever the page stopped before the end of the Unit (after `limit` matches, or after `scan` boards examined), so a caller pages on until null
+ *   spaceCandidates(tenant: string, o: { user: string, all?: boolean, after?: string|null, limit?: number }): Promise<{ spaces: Space[], groups: Group[], next: string|null }>,   // the Unit's Spaces the user COULD open, by id (a superset; the resolver decides): general access set, the user's personal space, a grant to the user or one of their Teams on the Space or its Group, a Group with general access; `all` = every Space (the user holds a Unit-level role). `groups`: the Groups of the returned Spaces. Limit default 100, at most 200
+ *   groupCandidates(tenant: string, o: { user: string, all?: boolean, limit?: number }): Promise<Group[]>,   // Groups the user could open, by id, at most `limit` (default 50, at most 100): general access set, or a grant to the user or a Team of theirs, or `all`
  *   boardRows(boards: string[], o: { user: string, email?: string|null }): Promise<Map<string, BoardRows>>,   // the board-scope rows the resolver reads for one user over at most BATCH boards, in a fixed number of statements; unknown ids are absent
  * }} Registry
  */
 
 /** Home (PROTOCOL.md § Home): rows kept per user in Recent, rows a starred / shared read may return, and the most boards one `boardRows` / `starredAmong` call takes. */
-export const HOME = { recentKeep: 50, starScan: 200, sharedScan: 200, batch: 200, searchPage: { default: 100, max: 200 } };
+export const HOME = { recentKeep: 50, starScan: 200, sharedScan: 200, batch: 200, searchPage: { default: 100, max: 200 }, searchScan: { default: 2000, max: 5000 }, candidates: { spaces: { default: 100, max: 200 }, groups: { default: 50, max: 100 } } };
 /** A page limit for `searchBoards`. */
 export const searchLimit = n => Math.min(HOME.searchPage.max, Math.max(1, Math.floor(Number(n) || HOME.searchPage.default)));
 /** A small read's limit: default `d`, at least 1, at most `max`. */
 export const smallLimit = (n, d, max) => Math.min(max, Math.max(1, Math.floor(Number(n) || d)));
+/** ASCII case folding, the only folding search does (every adapter agrees: PROTOCOL.md § Home). */
+export const asciiFold = t => String(t).replace(/[A-Z]/g, c => c.toLowerCase());
 /** The `q` of `searchBoards`: a string, trimmed, 1-100 chars; else "registry: bad query". */
 export const searchQuery = q => { const t = typeof q === "string" ? q.trim() : ""; if (!t || t.length > 100 || t.includes("\0")) throw new Error("registry: bad query"); return t; };
 

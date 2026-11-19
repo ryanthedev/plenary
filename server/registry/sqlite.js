@@ -17,7 +17,7 @@
 // `user`; insertion order is an explicit `n` column (Postgres: BIGSERIAL / identity), upserts use ON CONFLICT.
 
 import { Database } from "bun:sqlite";
-import { mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, searchLimit, smallLimit, searchQuery } from "../auth/registry-port.js";
+import { mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, searchLimit, smallLimit, searchQuery, asciiFold } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 
 /** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code`. */
@@ -137,6 +137,10 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     db.run("CREATE INDEX IF NOT EXISTS reg_stars_member ON reg_stars (member, at DESC, board DESC)");
     db.run("CREATE INDEX IF NOT EXISTS reg_grants_member ON reg_grants (member)");
     db.run("CREATE INDEX IF NOT EXISTS reg_boards_tenant ON reg_boards (tenant, id)");
+    db.run("CREATE INDEX IF NOT EXISTS reg_invites_email ON reg_invites (email)");
+    db.run("CREATE INDEX IF NOT EXISTS reg_link_uses_member ON reg_link_uses (member, board)");
+    db.run("CREATE INDEX IF NOT EXISTS reg_scope_grants_subject ON reg_scope_grants (subject_type, subject, scope_type)");
+    db.run("CREATE INDEX IF NOT EXISTS reg_team_members_member ON reg_team_members (member)");
     db.run("CREATE INDEX IF NOT EXISTS reg_spaces_tenant ON reg_spaces (tenant)");
     db.run("CREATE INDEX IF NOT EXISTS reg_groups_tenant ON reg_groups (tenant)");
     db.run("CREATE INDEX IF NOT EXISTS reg_teams_tenant ON reg_teams (tenant)");
@@ -210,15 +214,28 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     stars: db.query("SELECT board, at FROM reg_stars WHERE member = ? ORDER BY at DESC, board DESC LIMIT ?"),
     starsAmong: db.query("SELECT board FROM reg_stars WHERE member = ? AND board IN (SELECT value FROM json_each(?))"),
     shared: db.query(`SELECT board FROM (
-        SELECT board FROM reg_grants WHERE member = ?1 AND role <> 'owner'
+        SELECT board FROM reg_grants WHERE member = ?1
+        UNION SELECT g.scope_id AS board FROM reg_scope_grants g JOIN reg_team_members m ON m.team = g.subject
+          WHERE g.scope_type = 'board' AND g.subject_type = 'team' AND m.member = ?1
         UNION SELECT board FROM reg_invites WHERE ?2 IS NOT NULL AND email = ?2 AND revoked = 0
         UNION SELECT board FROM reg_link_uses WHERE member = ?1) ORDER BY board LIMIT ?3`),
-    search: db.query(`SELECT b.id FROM reg_boards b LEFT JOIN reg_board_spaces bs ON bs.board = b.id LEFT JOIN reg_spaces s ON s.id = bs.space
-      WHERE b.tenant = ?1 AND (?2 IS NULL OR b.id > ?2)
-        AND (?3 IS NULL OR b.title LIKE ?3 ESCAPE '\\' OR s.name LIKE ?3 ESCAPE '\\') AND (?4 = 0 OR bs.board IS NULL)
-      ORDER BY b.id LIMIT ?5`),
-    searchUnfiled: db.query(`SELECT b.id FROM reg_boards b LEFT JOIN reg_board_spaces bs ON bs.board = b.id
-      WHERE b.tenant = ?1 AND (?2 IS NULL OR b.id > ?2) AND (?3 IS NULL OR b.title LIKE ?3 ESCAPE '\\') AND bs.board IS NULL ORDER BY b.id LIMIT ?4`),
+    search: db.query(`SELECT w.id FROM (SELECT id, title FROM reg_boards WHERE tenant = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?5) w
+      LEFT JOIN reg_board_spaces bs ON bs.board = w.id LEFT JOIN reg_spaces s ON s.id = bs.space
+      WHERE (?3 IS NULL OR w.title LIKE ?3 ESCAPE '\\' OR (?4 = 0 AND s.name LIKE ?3 ESCAPE '\\')) AND (?4 = 0 OR bs.board IS NULL)
+      ORDER BY w.id LIMIT ?6`),
+    searchEdge: db.query("SELECT id FROM reg_boards WHERE tenant = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT 2 OFFSET ?3"),
+    spaceCand: db.query(`SELECT s.* FROM reg_spaces s WHERE s.tenant = ?1 AND (?2 IS NULL OR s.id > ?2) AND (?4 = 1
+        OR s.general_role IS NOT NULL OR s.owner_user = ?3
+        OR EXISTS (SELECT 1 FROM reg_scope_grants g WHERE g.scope_type = 'space' AND g.scope_id = s.id AND ((g.subject_type = 'user' AND g.subject = ?3)
+          OR (g.subject_type = 'team' AND g.subject IN (SELECT team FROM reg_team_members WHERE member = ?3))))
+        OR s.grp IN (SELECT id FROM reg_groups WHERE tenant = ?1 AND general_role IS NOT NULL)
+        OR EXISTS (SELECT 1 FROM reg_scope_grants g WHERE g.scope_type = 'group' AND g.scope_id = s.grp AND ((g.subject_type = 'user' AND g.subject = ?3)
+          OR (g.subject_type = 'team' AND g.subject IN (SELECT team FROM reg_team_members WHERE member = ?3)))))
+      ORDER BY s.id LIMIT ?5`),
+    groupsByIds: db.query("SELECT * FROM reg_groups WHERE id IN (SELECT value FROM json_each(?))"),
+    groupCand: db.query(`SELECT gr.* FROM reg_groups gr WHERE gr.tenant = ?1 AND (?3 = 1 OR gr.general_role IS NOT NULL
+        OR EXISTS (SELECT 1 FROM reg_scope_grants g WHERE g.scope_type = 'group' AND g.scope_id = gr.id AND ((g.subject_type = 'user' AND g.subject = ?2)
+          OR (g.subject_type = 'team' AND g.subject IN (SELECT team FROM reg_team_members WHERE member = ?2))))) ORDER BY gr.id LIMIT ?4`),
     rowsBoards: db.query(`SELECT id, tenant, title, member_role, created_at, (SELECT space FROM reg_board_spaces WHERE board = reg_boards.id) AS space
       FROM reg_boards WHERE id IN (SELECT value FROM json_each(?))`),
     rowsGrants: db.query("SELECT board, role FROM reg_grants WHERE member = ? AND board IN (SELECT value FROM json_each(?))"),
@@ -614,13 +631,27 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       ready();
       return str(user) ? q.shared.all(user, email ? normEmail(email) : null, smallLimit(limit, HOME.sharedScan, HOME.sharedScan)).map(r => r.board) : [];
     },
-    async searchBoards(tenant, { q: term, unfiled = false, after = null, limit } = {}) {
+    async searchBoards(tenant, { q: term, unfiled = false, after = null, limit, scan } = {}) {
       ready();
-      const cur = orgDefaults.cursor(after, "id"), n = searchLimit(limit);
-      const like = term == null ? null : "%" + searchQuery(term).replace(/[\\%_]/g, "\\$&") + "%";
-      const rows = !str(tenant) ? [] : unfiled ? q.searchUnfiled.all(tenant, cur, like, n + 1) : q.search.all(tenant, cur, like, 0, n + 1);
-      const ids = rows.map(r => r.id);
-      return { ids: ids.slice(0, n), next: ids.length > n ? ids[n - 1] : null };
+      const cur = orgDefaults.cursor(after, "id"), n = searchLimit(limit), cap = smallLimit(scan, HOME.searchScan.default, HOME.searchScan.max);
+      const like = term == null ? null : "%" + asciiFold(searchQuery(term)).replace(/[\\%_]/g, "\\$&") + "%";
+      if (!str(tenant)) return { ids: [], next: null };
+      const ids = q.search.all(tenant, cur, like, unfiled ? 1 : 0, cap, n + 1).map(r => r.id);
+      if (ids.length > n) return { ids: ids.slice(0, n), next: ids[n - 1] };
+      const edge = q.searchEdge.all(tenant, cur, cap - 1);          // [last board examined, one more] when the Unit goes on past `cap`
+      return { ids, next: edge.length === 2 ? edge[0].id : null };
+    },
+    async spaceCandidates(tenant, { user, all = false, after = null, limit } = {}) {
+      ready();
+      const cur = orgDefaults.cursor(after, "id"), n = smallLimit(limit, HOME.candidates.spaces.default, HOME.candidates.spaces.max);
+      if (!str(tenant) || !str(user)) return { spaces: [], groups: [], next: null };
+      const rows = q.spaceCand.all(tenant, cur, user, all ? 1 : 0, n + 1), page = rows.slice(0, n);
+      const gids = [...new Set(page.map(r => r.grp).filter(Boolean))];
+      return { spaces: page.map(rowSpace), groups: gids.length ? q.groupsByIds.all(JSON.stringify(gids)).map(rowGroup) : [], next: rows.length > n ? page[n - 1].id : null };
+    },
+    async groupCandidates(tenant, { user, all = false, limit } = {}) {
+      ready();
+      return str(tenant) && str(user) ? q.groupCand.all(tenant, user, all ? 1 : 0, smallLimit(limit, HOME.candidates.groups.default, HOME.candidates.groups.max)).map(rowGroup) : [];
     },
     async boardRows(ids, { user, email = null } = {}) {
       ready();

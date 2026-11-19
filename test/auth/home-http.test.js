@@ -81,3 +81,31 @@ test("without a `home` dependency there are no Home routes", async () => {
   const r = httpRoutes({ registry, sessions: await makeSessions({ key: "s".repeat(32) }), tenancy, config });
   expect(await r(new Request(ORIGIN + "/home"))).toBe(null);
 });
+
+test("GET /home/search?space=<id>: the Space's boards by id; a bad id or q together with space is 400; a guest gets nothing", async () => {
+  const spaceId = open.space;
+  const res = await (await call(`/home/search?space=${spaceId}`, { headers: as("ada") })).json();
+  expect(res.space).toMatchObject({ id: spaceId, name: "Design" });
+  expect(res.results.map(c => c.id)).toEqual([open.id]);
+  expect((await call("/home/search?space=a%20b", { headers: as("ada") })).status).toBe(400);
+  expect((await call(`/home/search?space=${spaceId}&q=x`, { headers: as("ada") })).status).toBe(400);
+  expect((await call(`/home/search?space=${spaceId}`)).status).toBe(401);
+  expect(await (await call(`/home/search?space=${spaceId}`, { headers: as("kim") })).json()).toEqual({ space: null, results: [], more: false });
+});
+
+test("a guest may not star (403), and sees no Starred", async () => {
+  await registry.setGrant(open.id, "dev:kim", "viewer");
+  expect((await call(`/home/stars/${open.id}`, { method: "PUT", headers: as("kim") })).status).toBe(403);
+  expect(await registry.starred("dev:kim")).toEqual([]);
+  expect((await call(`/home/stars/${open.id}`, { method: "DELETE", headers: as("kim") })).status).toBe(204);
+});
+
+test("a guest's Home has Your boards (owned) apart from Shared with me, and Recent", async () => {
+  const mine = await registry.createBoard({ tenant: acme.id, title: "Kim's own", memberRole: null });
+  await registry.setGrant(mine.id, "dev:kim", "owner");
+  await registry.markOpened("dev:kim", mine.id);
+  const h = await (await call("/home", { headers: as("kim") })).json();
+  expect(h.owned.map(c => c.id)).toEqual([mine.id]);
+  expect(h.recent.map(c => c.id)).toEqual([mine.id]);
+  expect(h.shared).toEqual([]);
+});

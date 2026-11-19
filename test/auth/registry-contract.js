@@ -624,21 +624,29 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect(await r.starredAmong("dev:ada", [])).toEqual([]);
       });
 
-      test("sharedBoards: non-owner grants, non-revoked invites to the email, redeemed links; never ownership", async () => {
+      test("sharedBoards: every source on the board itself (grants incl. owner, a Team's, non-revoked invites, redeemed links)", async () => {
         const { t, a, b, c } = await mk();
         const d = await r.createBoard({ tenant: t.id, title: "D" });
         const e = await r.createBoard({ tenant: t.id, title: "E" });
+        const f = await r.createBoard({ tenant: t.id, title: "F" });
+        const g = await r.createBoard({ tenant: t.id, title: "G" });
         await r.setGrant(a.id, "google:ann", "editor");
-        await r.setGrant(b.id, "google:ann", "owner");
+        await r.setGrant(b.id, "google:ann", "owner");                                  // ownership counts: Home labels it "Your boards" for a guest
         await r.createInvite({ board: c.id, email: "Ann@Example.com", role: "viewer", by: "dev:root" });
         const dead = await r.createInvite({ board: e.id, email: "ann@example.com", role: "viewer", by: "dev:root" });
         await r.revokeInvite(dead.id);
         const l = await r.createLink({ board: d.id, role: "viewer", by: "dev:root" });
         await r.addLinkUse(l.id, "google:ann");
-        expect((await r.sharedBoards("google:ann", "ann@example.com")).sort()).toEqual([a.id, c.id, d.id].sort());
-        expect((await r.sharedBoards("google:ann", null)).sort()).toEqual([a.id, d.id].sort());
+        const team = await r.createTeam({ tenant: t.id, name: "Infra" }), other = await r.createTeam({ tenant: t.id, name: "Other" });
+        await r.setTeamMember(team.id, "google:ann", true);
+        await r.setScopedGrant({ scope: { type: "board", id: f.id }, subject: { type: "team", id: team.id }, role: "viewer" });
+        await r.setScopedGrant({ scope: { type: "board", id: g.id }, subject: { type: "team", id: other.id }, role: "viewer" });   // a Team she is not in
+        expect((await r.sharedBoards("google:ann", "ann@example.com")).sort()).toEqual([a.id, b.id, c.id, d.id, f.id].sort());
+        expect((await r.sharedBoards("google:ann", null)).sort()).toEqual([a.id, b.id, d.id, f.id].sort());
         expect(await r.sharedBoards("google:nobody", "nobody@example.com")).toEqual([]);
         expect((await r.sharedBoards("google:ann", "ann@example.com", { limit: 1 })).length).toBe(1);
+        await r.setTeamMember(team.id, "google:ann", false);
+        expect(await r.sharedBoards("google:ann", null)).not.toContain(f.id);
       });
 
       test("searchBoards: title or Space name, case-insensitive, LIKE characters literal, tenant-scoped, paged, unfiled", async () => {
@@ -664,6 +672,81 @@ export function registryContract(name, makeRegistry, opts = {}) {
         await expect(r.searchBoards(t.id, { q: "x".repeat(101) })).rejects.toThrow();
         await expect(r.searchBoards(t.id, { q: "a", after: "x\ny" })).rejects.toThrow("bad cursor");
         expect((await r.searchBoards("t-nope00000000", { q: "a" })).ids).toEqual([]);
+      });
+
+      test("searchBoards: ASCII case-folding only (a non-ASCII capital is not folded)", async () => {
+        const t = await r.createTenant({ domain: "fold.com" });
+        const a = await r.createBoard({ tenant: t.id, title: "Caf\u00c9 menu" }), b = await r.createBoard({ tenant: t.id, title: "CAF\u00e9 plan" });
+        expect((await r.searchBoards(t.id, { q: "caf\u00c9" })).ids).toEqual([a.id]);
+        expect((await r.searchBoards(t.id, { q: "caf\u00e9" })).ids).toEqual([b.id]);
+        expect((await r.searchBoards(t.id, { q: "CAF" })).ids.sort()).toEqual([a.id, b.id].sort());
+      });
+
+      test("searchBoards is work-bounded: a page examines at most `scan` boards and `next` says where it stopped, even with no match", async () => {
+        const t = await r.createTenant({ domain: "scan.com" });
+        const made = [];
+        for (let i = 0; i < 25; i++) made.push((await r.createBoard({ tenant: t.id, title: i === 22 ? "needle" : `hay ${i}` })).id);
+        made.sort();
+        const found = [];
+        let after = null, pages = 0;
+        do { const p = await r.searchBoards(t.id, { q: "needle", after, scan: 10 }); found.push(...p.ids); after = p.next; pages++; } while (after && pages < 10);
+        expect(pages).toBe(3);                                                   // 25 boards, 10 examined per page: 10 + 10 + 5
+        const need = (await r.searchBoards(t.id, { q: "needle" })).ids;
+        expect(found).toEqual(need);
+        expect(need.length).toBe(1);
+        const first = await r.searchBoards(t.id, { q: "zzzzzz", scan: 10 });
+        expect(first.ids).toEqual([]);
+        expect(first.next).toBe(made[9]);                                        // examined ten, none matched, the Unit goes on
+        expect((await r.searchBoards(t.id, { q: "zzzzzz", scan: 25 })).next).toBe(null);   // examined everything: done
+      });
+
+      test("spaceCandidates / groupCandidates: Spaces and Groups a member COULD open, in SQL pages; their Groups come along", async () => {
+        const t = await r.createTenant({ domain: "cand.com" });
+        const open = await r.createGroup({ tenant: t.id, name: "Open", generalRole: "viewer" });
+        const shut = await r.createGroup({ tenant: t.id, name: "Shut", generalRole: null });
+        const granted = await r.createGroup({ tenant: t.id, name: "Granted", generalRole: null });
+        const team = await r.createTeam({ tenant: t.id, name: "Infra" });
+        await r.setTeamMember(team.id, "dev:ann", true);
+        await r.setScopedGrant({ scope: { type: "group", id: granted.id }, subject: { type: "user", id: "dev:ann" }, role: "viewer" });
+        const sp = {};
+        sp.general = await r.createSpace({ tenant: t.id, name: "General" });
+        sp.closed = await r.createSpace({ tenant: t.id, name: "Closed", generalRole: null });
+        sp.mine = await r.ensurePersonalSpace(t.id, "dev:ann");
+        sp.theirs = await r.ensurePersonalSpace(t.id, "dev:bob");
+        sp.byUser = await r.createSpace({ tenant: t.id, name: "ByUser", generalRole: null });
+        sp.byTeam = await r.createSpace({ tenant: t.id, name: "ByTeam", generalRole: null });
+        sp.inOpen = await r.createSpace({ tenant: t.id, name: "InOpen", generalRole: null, group: open.id });
+        sp.inShut = await r.createSpace({ tenant: t.id, name: "InShut", generalRole: null, group: shut.id });
+        sp.inGranted = await r.createSpace({ tenant: t.id, name: "InGranted", generalRole: null, group: granted.id });
+        await r.setScopedGrant({ scope: { type: "space", id: sp.byUser.id }, subject: { type: "user", id: "dev:ann" }, role: "editor" });
+        await r.setScopedGrant({ scope: { type: "space", id: sp.byTeam.id }, subject: { type: "team", id: team.id }, role: "editor" });
+        const other = await r.createTenant({ domain: "elsewhere.com" });
+        await r.createSpace({ tenant: other.id, name: "Elsewhere" });
+        const names = async o => (await r.spaceCandidates(t.id, { user: "dev:ann", ...o })).spaces.map(x => x.name).sort();
+        expect(await names()).toEqual(["ByTeam", "ByUser", "General", "InGranted", "InOpen", "ann's space"].sort());
+        expect((await names({ all: true })).length).toBe(9);                       // a Unit-level role: every Space of the Unit, nothing of another Unit
+        const first = await r.spaceCandidates(t.id, { user: "dev:ann", all: true, limit: 4 });
+        expect(first.spaces.length).toBe(4);
+        expect(first.next).toBe(first.spaces[3].id);
+        const rest = await r.spaceCandidates(t.id, { user: "dev:ann", all: true, limit: 200, after: first.next });
+        expect(rest.next).toBe(null);
+        expect([...first.spaces, ...rest.spaces].map(x => x.id)).toEqual([...first.spaces, ...rest.spaces].map(x => x.id).sort());
+        const withGroups = await r.spaceCandidates(t.id, { user: "dev:ann" });
+        expect(withGroups.groups.map(g => g.name).sort()).toEqual(["Granted", "Open"]);   // the Groups of the returned Spaces (Shut's Space isn't one)
+        expect((await r.groupCandidates(t.id, { user: "dev:ann" })).map(g => g.name).sort()).toEqual(["Granted", "Open"]);
+        expect((await r.groupCandidates(t.id, { user: "dev:ann", all: true })).length).toBe(3);
+        expect((await r.groupCandidates(t.id, { user: "dev:ann", all: true, limit: 2 })).length).toBe(2);
+        expect((await r.spaceCandidates("t-nope00000000", { user: "dev:ann" })).spaces).toEqual([]);
+        await expect(r.spaceCandidates(t.id, { user: "dev:ann", after: "x\ny" })).rejects.toThrow("bad cursor");
+      });
+
+      test("markOpened under concurrency keeps at most the newest 50 rows per user", async () => {
+        const { t } = await mk();
+        const ids = [];
+        for (let i = 0; i < 70; i++) ids.push((await r.createBoard({ tenant: t.id, title: `c${i}` })).id);
+        for (let round = 0; round < 3; round++) await Promise.all(ids.slice(round * 20, round * 20 + 20).map(id => r.markOpened("dev:cc", id)));
+        await Promise.all(ids.slice(60).map(id => r.markOpened("dev:cc", id)));
+        expect((await r.recents("dev:cc", { limit: 1000 })).length).toBeLessThanOrEqual(50);
       });
 
       test("boardRows: the board-scope rows for one user over a batch; unknown ids absent", async () => {

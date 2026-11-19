@@ -4,7 +4,8 @@
 import { test, expect, beforeEach, describe } from "bun:test";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy } from "../../server/auth/tenancy.js";
-import { homeService, recentRecorder, LIMITS, OTHER } from "../../server/auth/home.js";
+import { accessEquivalence } from "./access-equivalence.js";
+import { homeService, recentRecorder, LIMITS, OTHER, SHARED_PART } from "../../server/auth/home.js";
 
 let clock, r, ten, home, acme;
 const now = () => clock;
@@ -77,7 +78,7 @@ describe("access leak: a board the person can't open never appears, however it g
 
 describe("Recent, Starred, Shared", () => {
   test("recent: newest first, capped at 12, each with its path and role", async () => {
-    const g = await r.createGroup({ tenant: acme.id, name: "Product" });
+    const g = await r.createGroup({ tenant: acme.id, name: "Product", generalRole: "viewer" });
     const sp = await r.createSpace({ tenant: acme.id, name: "Design", group: g.id });
     const made = [];
     for (let i = 0; i < 15; i++) { const b = await mk(sp.id, `b${i}`); made.push(b); await r.markOpened(ada.user, b.id); clock += 10; }
@@ -106,7 +107,7 @@ describe("Recent, Starred, Shared", () => {
     expect((await home.home(ada)).starred).toEqual([]);
   });
 
-  test("shared: direct grants, invites, links across Units, by title; owned boards are not 'shared'", async () => {
+  test("shared: direct grants, invites, links across Units, by title", async () => {
     const globex = await r.createTenant({ domain: "globex.com" });
     const sp = await r.createSpace({ tenant: acme.id, name: "Closed", generalRole: null });
     const g1 = await mk(sp.id, "Zeta", { memberRole: null }), g2 = await mk(sp.id, "alpha", { memberRole: null }), mine = await mk(sp.id, "Mine", { memberRole: null });
@@ -114,8 +115,8 @@ describe("Recent, Starred, Shared", () => {
     const foreign = await r.createBoard({ tenant: globex.id, title: "Foreign", memberRole: null });
     const l = await r.createLink({ board: foreign.id, role: "annotator", by: "x" }); await r.addLinkUse(l.id, ada.user);
     const h = await home.home(ada);
-    expect(h.shared.map(c => c.title)).toEqual(["alpha", "Foreign", "Zeta"]);
-    expect(h.shared.find(c => c.title === "Foreign")).toMatchObject({ role: "annotator", path: [OTHER] });
+    expect(h.shared.map(c => c.title)).toEqual(["alpha", "Foreign", "Mine", "Zeta"]);     // Mine: owned, but in a Space she can't open, so nowhere else
+    expect(h.shared.find(c => c.title === "Foreign")).toMatchObject({ role: "annotator", path: [SHARED_PART] });   // another Unit's board: no "Other boards" claim
   });
 
   test("a team grant on the Space and on the board itself both count", async () => {
@@ -135,7 +136,7 @@ describe("Recent, Starred, Shared", () => {
 
 describe("the tree", () => {
   test("only Groups and Spaces the person can open in; personal spaces are private; unfiled boards under Other boards", async () => {
-    const g = await r.createGroup({ tenant: acme.id, name: "Product" });
+    const g = await r.createGroup({ tenant: acme.id, name: "Product", generalRole: "viewer" });
     const hiddenGroup = await r.createGroup({ tenant: acme.id, name: "Board only", generalRole: null });
     await r.createSpace({ tenant: acme.id, name: "Design", group: g.id });
     await r.createSpace({ tenant: acme.id, name: "Tucked", group: hiddenGroup.id, generalRole: null });
@@ -146,6 +147,7 @@ describe("the tree", () => {
     const t = (await home.home(ada)).tree;
     expect(t.groups.map(x => [x.name, x.spaces.map(s => s.name)])).toEqual([["Product", ["Design"]]]);
     expect(t.spaces.map(s => [s.name, s.personal]).sort()).toEqual([["Social", false], ["ada's space", true]]);
+    expect(JSON.stringify(t)).not.toMatch(/Board only|Tucked|Locked/);
     expect(t.other).toEqual({ boards: [{ id: open.id, title: "Old board" }], more: false });
   });
 
@@ -158,7 +160,7 @@ describe("the tree", () => {
 
 describe("search", () => {
   test("title or Space name, with each result's path; scoped to the person's Unit; capped at 20", async () => {
-    const g = await r.createGroup({ tenant: acme.id, name: "Product" });
+    const g = await r.createGroup({ tenant: acme.id, name: "Product", generalRole: "viewer" });
     const sp = await r.createSpace({ tenant: acme.id, name: "Design Lab", group: g.id });
     const a = await mk(sp.id, "Roadmap"), b = await mk(undefined, "Design review");
     const globex = await r.createTenant({ domain: "globex.com" });
@@ -221,44 +223,6 @@ describe("the batch access check", () => {
     expect(found.size).toBe(100);
     expect(calls).toEqual({ boardRows: 1, accessContext: 4 });                  // 3 Spaces + the Unit, however many boards
   });
-
-  test("accessMany agrees with tenancy.effective on a random registry (ladder, permissions, sources)", async () => {
-    let seed = 7;
-    const rnd = n => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
-    const pick = a => a[rnd(a.length)];
-    const roles = ["viewer", "commenter", "annotator", "editor", "owner"], generals = [null, "viewer", "annotator", "editor"];
-    const people = [ada, ident("bob"), ident("cy", "acme.io"), kim, ident("dee", null), { user: "google:root", email: "root@acme.com", domain: "acme.com" }];
-    await r.addTenantDomain(acme.id, "acme.io");
-    const teams = [];
-    for (let i = 0; i < 3; i++) { const t = await r.createTeam({ tenant: acme.id, name: `t${i}` }); teams.push(t); for (const p of people) if (rnd(2)) await r.setTeamMember(t.id, p.user, true); }
-    const groups = [await r.createGroup({ tenant: acme.id, name: "g", generalRole: pick(generals) })];
-    const spaces = [null];
-    for (let i = 0; i < 4; i++) spaces.push((await r.createSpace({ tenant: acme.id, name: `s${i}`, group: rnd(2) ? groups[0].id : null, generalRole: pick(generals) })).id);
-    for (const s of spaces.slice(1)) for (const p of people) if (rnd(4) === 0) await r.setScopedGrant({ scope: { type: "space", id: s }, subject: { type: "user", id: p.user }, role: pick(roles.slice(0, 4)) });
-    await r.setScopedGrant({ scope: { type: "group", id: groups[0].id }, subject: { type: "team", id: teams[0].id }, role: "viewer" });
-    const boards = [];
-    for (let i = 0; i < 40; i++) {
-      const b = await mk(pick(spaces) ?? undefined, `b${i}`, { memberRole: pick(generals) });
-      boards.push(b);
-      for (const p of people) {
-        if (rnd(6) === 0) await r.setGrant(b.id, p.user, pick(roles));
-        if (rnd(8) === 0) await r.createInvite({ board: b.id, email: p.email, role: pick(["viewer", "editor"]), expiresAt: rnd(2) ? clock + 5000 : null, by: "x" });
-        if (rnd(8) === 0) { const l = await r.createLink({ board: b.id, role: pick(["viewer", "annotator"]), by: "x" }); await r.addLinkUse(l.id, p.user); if (rnd(3) === 0) await r.revokeLink(l.id); }
-      }
-      if (rnd(5) === 0) await r.setScopedGrant({ scope: { type: "board", id: b.id }, subject: { type: "team", id: pick(teams).id }, role: pick(["viewer", "editor"]) });
-    }
-    clock += 6000;                                                               // some invites have expired now
-    let someOpen = 0;
-    for (const p of people) {
-      const batch = await ten.accessMany(p, boards.map(b => b.id));
-      for (const b of boards) {
-        const one = await ten.effective(p, b.id), many = batch.get(b.id).access;
-        if (one.ladder) someOpen++;
-        expect([b.id, p.user, many.ladder, [...many.permissions].sort(), many.sources]).toEqual([b.id, p.user, one.ladder, [...one.permissions].sort(), one.sources]);
-      }
-    }
-    expect(someOpen).toBeGreaterThan(20);                                        // the scenario isn't vacuous
-  });
 });
 
 describe("recentRecorder", () => {
@@ -284,3 +248,188 @@ describe("recentRecorder", () => {
     for (let i = 0; i < 10; i++) rec("w", "x" + i);                              // the dedupe map stays bounded (max 3): no throw
   });
 });
+
+describe("names are access too: path redaction and Space-name search (member and guest)", () => {
+  const setup = async () => {
+    const hiddenGroup = await r.createGroup({ tenant: acme.id, name: "Hidden Group" });
+    const secret = await r.createSpace({ tenant: acme.id, name: "Secret Plans", group: hiddenGroup.id, generalRole: null });
+    const planB = await mk(secret.id, "Plan B", { memberRole: null });
+    await r.setGrant(planB.id, ada.user, "editor");                                    // a direct grant on one board inside a private Space
+    return { hiddenGroup, secret, planB };
+  };
+
+  test("a member with a direct grant sees the board, with 'Shared with you' for the Space and Group above it, in every list", async () => {
+    const { planB } = await setup();
+    await r.markOpened(ada.user, planB.id); await r.setStarred(ada.user, planB.id, true);
+    const h = await home.home(ada);
+    for (const list of [h.recent, h.starred, h.shared]) expect(list.map(c => [c.id, c.path])).toEqual([[planB.id, [SHARED_PART]]]);
+    expect((await home.search(ada, "plan b")).results.map(c => c.path)).toEqual([[SHARED_PART]]);
+    expect(JSON.stringify(h)).not.toMatch(/Secret Plans|Hidden Group/);
+    expect(JSON.stringify(h.tree)).not.toMatch(/Secret Plans|Hidden Group/);
+  });
+
+  test("a Space-name search can't probe a hidden Space: its name finds nothing, its boards still answer to their own titles", async () => {
+    await setup();
+    for (const q of ["secret", "SECRET plans", "hidden group", "plans"]) {
+      const res = await home.search(ada, q);
+      expect(res.results.map(c => c.title)).toEqual(q === "plans" ? [] : []);
+    }
+    expect((await home.search(ada, "Plan B")).results).toHaveLength(1);
+  });
+
+  test("an openable Space's name is both shown and searchable", async () => {
+    const g = await r.createGroup({ tenant: acme.id, name: "Visible Group", generalRole: "viewer" });
+    const sp = await r.createSpace({ tenant: acme.id, name: "Quarterly", group: g.id });
+    const b = await mk(sp.id, "Untitled-1");
+    const res = await home.search(ada, "quarterly");
+    expect(res.results.map(c => [c.id, c.path.map(p => p.name)])).toEqual([[b.id, ["Visible Group", "Quarterly"]]]);
+  });
+
+  test("a Group the person can't open is dropped from the path of a board in a Space they can", async () => {
+    const g = await r.createGroup({ tenant: acme.id, name: "Closed Group" });                     // general access none
+    const sp = await r.createSpace({ tenant: acme.id, name: "Open Space", group: g.id });          // viewer for everyone
+    const b = await mk(sp.id, "In open");
+    await r.markOpened(ada.user, b.id);
+    const h = await home.home(ada);
+    expect(h.recent[0].path.map(p => p.name)).toEqual(["Open Space"]);
+    expect(JSON.stringify(h)).not.toContain("Closed Group");
+    expect(h.tree.groups).toEqual([]);                                                            // and not in the tree either
+    expect(h.tree.spaces.map(x => x.name)).toEqual(["Open Space"]);
+  });
+
+  test("a guest never sees another Unit's Group or Space names, on any list or in search", async () => {
+    const { secret, planB } = await setup();
+    const open = await r.createSpace({ tenant: acme.id, name: "Public Space", generalRole: "viewer" });
+    const pub = await mk(open.id, "Public board", { memberRole: null });
+    for (const b of [planB, pub]) await r.createInvite({ board: b.id, email: kim.email, role: "viewer", by: "x" });
+    await r.markOpened(kim.user, planB.id);
+    const h = await home.home(kim);
+    expect(h.shared.map(c => c.path)).toEqual([[SHARED_PART], [SHARED_PART]]);
+    expect(h.recent.map(c => c.path)).toEqual([[SHARED_PART]]);
+    expect(JSON.stringify(h)).not.toMatch(/Secret Plans|Hidden Group|Public Space/);
+    for (const q of ["secret", "public space", "plan b"]) expect(JSON.stringify(await home.search(kim, q))).not.toMatch(/Secret Plans|Hidden Group|Public Space/);
+    expect((await home.search(kim, "secret")).results).toEqual([]);
+    expect(await home.spaceBoards(kim, secret.id)).toEqual({ space: null, results: [], more: false });   // a guest has no Unit to browse
+  });
+});
+
+describe("Your boards, Shared with me, and guests", () => {
+  test("a guest's owned boards are 'Your boards' (owned), the rest Shared; they also get Recent but no Starred", async () => {
+    const mineB = await mk(undefined, "Mine", { memberRole: null }), theirs = await mk(undefined, "Theirs", { memberRole: null });
+    await r.setGrant(mineB.id, kim.user, "owner"); await r.setGrant(theirs.id, kim.user, "editor");
+    await r.markOpened(kim.user, theirs.id);
+    const h = await home.home(kim);
+    expect(h.owned.map(c => c.title)).toEqual(["Mine"]);
+    expect(h.shared.map(c => c.title)).toEqual(["Theirs"]);
+    expect(h.recent.map(c => c.title)).toEqual(["Theirs"]);
+    expect(h).toMatchObject({ guest: true, starred: [], tree: null });
+    expect(await home.star(kim, theirs.id, true)).toBe(false);                    // no Starred for guests
+    expect(await r.starred(kim.user)).toEqual([]);
+    expect((await home.search(kim, "mine")).results.map(c => c.title)).toEqual(["Mine"]);
+  });
+
+  test("a member's owned boards are not duplicated in Shared when the tree shows them; an owned board in a closed Space still is", async () => {
+    const open = await r.createSpace({ tenant: acme.id, name: "Open" }), closed = await r.createSpace({ tenant: acme.id, name: "Closed", generalRole: null });
+    const a = await mk(open.id, "Owned open"), b = await mk(closed.id, "Owned closed", { memberRole: null }), c = await mk(undefined, "Owned unfiled");
+    for (const x of [a, b, c]) await r.setGrant(x.id, ada.user, "owner");
+    const h = await home.home(ada);
+    expect(h.owned).toEqual([]);
+    expect(h.shared.map(x => x.title)).toEqual(["Owned closed"]);                   // not in Open (tree) and not unfiled (Other boards)
+    expect(h.tree.other.boards.map(x => x.title)).toEqual(["Owned unfiled"]);
+  });
+
+  test("Shared means a source on the board itself whose Space they can't open: a Team grant counts, a board in an openable Space doesn't", async () => {
+    const infra = await r.createTeam({ tenant: acme.id, name: "Infra" }); await r.setTeamMember(infra.id, ada.user, true);
+    const open = await r.createSpace({ tenant: acme.id, name: "Open" }), closed = await r.createSpace({ tenant: acme.id, name: "Closed", generalRole: null });
+    const viaTeam = await mk(closed.id, "Via team", { memberRole: null }), inOpen = await mk(open.id, "In open space"), viaGrant = await mk(closed.id, "Via grant", { memberRole: null });
+    await r.setScopedGrant({ scope: { type: "board", id: viaTeam.id }, subject: { type: "team", id: infra.id }, role: "viewer" });
+    await r.setGrant(inOpen.id, ada.user, "editor"); await r.setGrant(viaGrant.id, ada.user, "viewer");
+    const h = await home.home(ada);
+    expect(h.shared.map(c => c.title)).toEqual(["Via grant", "Via team"]);
+  });
+
+  test("a member may star; a guest may not (home.star false), and an un-star is always allowed", async () => {
+    const b = await mk(undefined, "B");
+    expect(await home.star(ada, b.id, true)).toBe(true);
+    expect(await home.star(kim, b.id, false)).toBe(true);
+  });
+});
+
+describe("one Space's boards (the tree's click)", () => {
+  test("lists the Space's openable boards by id and names the Space only when it can be opened", async () => {
+    const open = await r.createSpace({ tenant: acme.id, name: "Design" }), closed = await r.createSpace({ tenant: acme.id, name: "Closed", generalRole: null });
+    const other = await r.createSpace({ tenant: acme.id, name: "Design 2" });
+    const a = await mk(open.id, "A"), b = await mk(open.id, "B"); await mk(other.id, "Elsewhere");
+    const hidden = await mk(closed.id, "Hidden", { memberRole: null }), reach = await mk(closed.id, "Reached", { memberRole: null });
+    await r.setGrant(reach.id, ada.user, "viewer");
+    const res = await home.spaceBoards(ada, open.id);
+    expect(res.space).toEqual({ id: open.id, name: "Design" });
+    expect(ids(res.results)).toEqual([a.id, b.id]);                                   // "Design 2"'s board is not here: it is by id, not by text
+    const sealed = await home.spaceBoards(ada, closed.id);
+    expect(sealed.space).toBe(null);
+    expect(ids(sealed.results)).toEqual([reach.id]);
+    expect(JSON.stringify(sealed)).not.toMatch(/Closed|Hidden/);
+    expect(ids(sealed.results)).not.toContain(hidden.id);
+    expect(await home.spaceBoards(ada, "s-nope")).toEqual({ space: null, results: [], more: false });
+    const globex = await r.createTenant({ domain: "globex.com" }), gs = await r.createSpace({ tenant: globex.id, name: "G" });
+    expect(await home.spaceBoards(ada, gs.id)).toEqual({ space: null, results: [], more: false });   // another Unit's Space
+  });
+});
+
+describe("bounds", () => {
+  const spy = reg => { const calls = {}; return { calls, reg: new Proxy(reg, { get: (t, k) => (typeof t[k] === "function" ? (...a) => { calls[k] = (calls[k] ?? 0) + 1; return t[k](...a); } : t[k]) }) }; };
+
+  test("the tree reads a page of Space candidates, never the whole Unit, and flags what it left out", async () => {
+    for (let i = 0; i < 130; i++) await r.createSpace({ tenant: acme.id, name: `s${String(i).padStart(3, "0")}` });
+    const { calls, reg } = spy(r);
+    const h = await homeService({ registry: reg, tenancy: tenancy({ registry: reg, now }) }).home(ada);
+    expect(h.tree.spaces.length).toBe(LIMITS.spaces);
+    expect(h.tree.more).toBe(true);
+    expect(calls.spaces).toBeUndefined();                                              // Registry.spaces(tenant) (the whole Unit) is never called
+    expect(calls.groups).toBeUndefined();
+    expect(calls.spaceCandidates).toBe(1);
+    expect(calls.accessContext ?? 0).toBeLessThanOrEqual(3);                           // general access resolved from the rows in hand: no per-Space reads
+  });
+
+  test("Spaces that need the resolver's full answer (grants) are checked at most a fixed number of times; the rest set `more`", async () => {
+    for (let i = 0; i < 60; i++) { const s = await r.createSpace({ tenant: acme.id, name: `g${i}`, generalRole: null }); await r.setScopedGrant({ scope: { type: "space", id: s.id }, subject: { type: "user", id: ada.user }, role: "viewer" }); }
+    const { calls, reg } = spy(r);
+    const h = await homeService({ registry: reg, tenancy: tenancy({ registry: reg, now }) }).home(ada);
+    expect(h.tree.spaces.length).toBe(40);
+    expect(h.tree.more).toBe(true);
+    expect(calls.accessContext).toBeLessThanOrEqual(45);
+  });
+
+  test("search is work-bounded: when the Unit goes on past what it scanned it says `more`", async () => {
+    const sp = await r.createSpace({ tenant: acme.id, name: "Many" });
+    for (let i = 0; i < 6; i++) await mk(sp.id, `hay ${i}`);
+    const { calls, reg } = spy(r);
+    const small = new Proxy(reg, { get: (t, k) => (k === "searchBoards" ? (tenant, o) => t.searchBoards(tenant, { ...o, scan: 2, limit: 100 }) : t[k]) });
+    const res = await homeService({ registry: small, tenancy: tenancy({ registry: small, now }) }).search(ada, "hay");
+    expect(calls.searchBoards).toBe(2);                                                  // two pages, then it stops
+    expect(res.results.length).toBe(4);
+    expect(res.more).toBe(true);
+  });
+});
+
+describe("recentRecorder under a join storm", () => {
+  test("10,000 welcomes with a slow Registry: at most maxInFlight writes run at once, the rest are dropped and counted, never queued", async () => {
+    let t = 0, running = 0, peak = 0, started = 0; const waiting = [];
+    const reg = { markOpened: () => new Promise(res => { started++; running++; peak = Math.max(peak, running); waiting.push(() => { running--; res(); }); }) };
+    const warns = [];
+    const rec = recentRecorder({ registry: reg, now: () => t, maxInFlight: 16, windowMs: 60_000, log: { warn: m => warns.push(m) } });
+    for (let i = 0; i < 10_000; i++) { rec("u" + (i % 2000), "b" + i); if (i % 1000 === 0) t += 1; }
+    await Promise.resolve(); await Promise.resolve();
+    expect(started).toBe(16);
+    expect(peak).toBe(16);
+    expect(rec.stats()).toMatchObject({ inFlight: 16, dropped: 9_984 });
+    expect(warns.length).toBe(1);                                                        // one line per window, not one per drop
+    while (waiting.length) { waiting.shift()(); await new Promise(res => setTimeout(res, 0)); }
+    expect(rec.stats()).toMatchObject({ written: 16, inFlight: 0 });
+    rec("u0", "b-dropped-earlier");                                                      // a dropped welcome wasn't remembered: the next one writes
+    await Promise.resolve(); await Promise.resolve();
+    expect(started).toBe(17);
+  });
+});
+
+accessEquivalence("memory", async ({ now }) => memoryRegistry({ now }));

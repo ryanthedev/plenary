@@ -71,7 +71,7 @@
 // owns that pool) or `sql` (a Bun SQL client you own). `schema` names the Postgres schema. Never reads env.
 
 import { SQL } from "bun";
-import { mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, searchLimit, smallLimit, searchQuery } from "../auth/registry-port.js";
+import { mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, searchLimit, smallLimit, searchQuery, asciiFold } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 import { needSchema, migrate, missing as absent } from "../pg/schema.js";
 
@@ -137,6 +137,10 @@ export const REGISTRY_INDEXES = {
   reg_stars_member: "reg_stars (member, at DESC, board DESC)",
   reg_grants_member: "reg_grants (member)",
   reg_boards_tenant: "reg_boards (tenant, id)",
+  reg_invites_email: "reg_invites (email)",
+  reg_link_uses_member: "reg_link_uses (member, board)",
+  reg_scope_grants_subject: "reg_scope_grants (subject_type, subject, scope_type)",
+  reg_team_members_member: "reg_team_members (member)",
 };
 /** The tables' column definitions for one schema (foreign keys name it), as `migrate` takes them. */
 export const registryTables = schema => {
@@ -683,6 +687,9 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       ready();
       if (!key(user) || !key(board)) throw new Error("registry: no such board");
       await write(async tx => {
+        // One writer per member at a time: without it, concurrent writes each prune a snapshot that misses the others' rows and the
+        // member ends with more than recentKeep (measured: 20 concurrent writes left 68 rows).
+        await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-recent:${s}:${user}`]);
         if (!(await tx.unsafe(`SELECT 1 FROM ${BD} WHERE id = $1`, [board])).length) throw new Error("registry: no such board");
         await tx.unsafe(`INSERT INTO ${RC} (member, board, opened_at) VALUES ($1, $2, $3) ON CONFLICT (member, board) DO UPDATE SET opened_at = excluded.opened_at`, [user, board, now()]);
         await tx.unsafe(`DELETE FROM ${RC} WHERE member = $1 AND board IN (SELECT board FROM ${RC} WHERE member = $1 ORDER BY opened_at DESC, board DESC OFFSET $2)`, [user, HOME.recentKeep]);
@@ -717,23 +724,52 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       ready();
       if (!key(user)) return [];
       return (await db.unsafe(`SELECT board FROM (
-          SELECT board FROM ${G} WHERE member = $1 AND role <> 'owner'
+          SELECT board FROM ${G} WHERE member = $1
+          UNION SELECT g.scope_id AS board FROM ${SG} g JOIN ${TU} m ON m.team = g.subject
+            WHERE g.scope_type = 'board' AND g.subject_type = 'team' AND m.member = $1
           UNION SELECT board FROM ${I} WHERE $2::text IS NOT NULL AND email = $2 AND NOT revoked
           UNION SELECT board FROM ${U} WHERE member = $1) x ORDER BY board LIMIT $3`,
       [user, email && key(email) ? normEmail(email) : null, smallLimit(limit, HOME.sharedScan, HOME.sharedScan)])).map(r => r.board);
     },
-    async searchBoards(tenant, { q: term, unfiled = false, after = null, limit } = {}) {
+    async searchBoards(tenant, { q: term, unfiled = false, after = null, limit, scan } = {}) {
       ready();
-      const cur = orgDefaults.cursor(after, "id"), n = searchLimit(limit);
-      const like = term == null ? null : "%" + searchQuery(term).replace(/[\\%_]/g, "\\$&") + "%";
+      const cur = orgDefaults.cursor(after, "id"), n = searchLimit(limit), cap = smallLimit(scan, HOME.searchScan.default, HOME.searchScan.max);
+      // ASCII case-folding only (PROTOCOL.md § Home): translate() instead of ILIKE, whose folding follows the database's locale.
+      const like = term == null ? null : "%" + asciiFold(searchQuery(term)).replace(/[\\%_]/g, "\\$&") + "%";
       if (!key(tenant)) return { ids: [], next: null };
-      const rows = await db.unsafe(`SELECT b.id FROM ${BD} b LEFT JOIN ${BS} bs ON bs.board = b.id LEFT JOIN ${SP} s ON s.id = bs.space
-        WHERE b.tenant = $1 AND ($2::text IS NULL OR b.id > $2)
-          AND ($3::text IS NULL OR b.title ILIKE $3 ESCAPE '\\' OR ($5::boolean = false AND s.name ILIKE $3 ESCAPE '\\'))
-          AND ($5::boolean = false OR bs.board IS NULL)
-        ORDER BY b.id LIMIT $4`, [tenant, cur, like, n + 1, !!unfiled]);
-      const ids = rows.map(r => r.id);
-      return { ids: ids.slice(0, n), next: ids.length > n ? ids[n - 1] : null };
+      const fold = c => `translate(${c}, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')`;
+      const ids = (await db.unsafe(`SELECT w.id FROM (SELECT id, title FROM ${BD} WHERE tenant = $1 AND ($2::text IS NULL OR id > $2) ORDER BY id LIMIT $5) w
+        LEFT JOIN ${BS} bs ON bs.board = w.id LEFT JOIN ${SP} s ON s.id = bs.space
+        WHERE ($3::text IS NULL OR ${fold("w.title")} LIKE $3 ESCAPE '\\' OR ($4::boolean = false AND ${fold("s.name")} LIKE $3 ESCAPE '\\'))
+          AND ($4::boolean = false OR bs.board IS NULL)
+        ORDER BY w.id LIMIT $6`, [tenant, cur, like, !!unfiled, cap, n + 1])).map(r => r.id);
+      if (ids.length > n) return { ids: ids.slice(0, n), next: ids[n - 1] };
+      const edge = await db.unsafe(`SELECT id FROM ${BD} WHERE tenant = $1 AND ($2::text IS NULL OR id > $2) ORDER BY id LIMIT 2 OFFSET $3`, [tenant, cur, cap - 1]);
+      return { ids, next: edge.length === 2 ? edge[0].id : null };
+    },
+    async spaceCandidates(tenant, { user, all = false, after = null, limit } = {}) {
+      ready();
+      const cur = orgDefaults.cursor(after, "id"), n = smallLimit(limit, HOME.candidates.spaces.default, HOME.candidates.spaces.max);
+      if (!key(tenant) || !key(user)) return { spaces: [], groups: [], next: null };
+      const rows = await db.unsafe(`SELECT s.* FROM ${SP} s WHERE s.tenant = $1 AND ($2::text IS NULL OR s.id > $2) AND ($4::boolean
+          OR s.general_role IS NOT NULL OR s.owner_user = $3
+          OR EXISTS (SELECT 1 FROM ${SG} g WHERE g.scope_type = 'space' AND g.scope_id = s.id AND ((g.subject_type = 'user' AND g.subject = $3)
+            OR (g.subject_type = 'team' AND g.subject IN (SELECT team FROM ${TU} WHERE member = $3))))
+          OR s.grp IN (SELECT id FROM ${GR} WHERE tenant = $1 AND general_role IS NOT NULL)
+          OR EXISTS (SELECT 1 FROM ${SG} g WHERE g.scope_type = 'group' AND g.scope_id = s.grp AND ((g.subject_type = 'user' AND g.subject = $3)
+            OR (g.subject_type = 'team' AND g.subject IN (SELECT team FROM ${TU} WHERE member = $3)))))
+        ORDER BY s.id LIMIT $5`, [tenant, cur, user, !!all, n + 1]);
+      const page = rows.slice(0, n), gids = [...new Set(page.map(r => r.grp).filter(Boolean))];
+      const groups = gids.length ? await db.unsafe(`SELECT * FROM ${GR} WHERE id IN (SELECT jsonb_array_elements_text($1::text::jsonb))`, [JSON.stringify(gids)]) : [];
+      return { spaces: page.map(rowSpace), groups: groups.map(rowGroup), next: rows.length > n ? page[n - 1].id : null };
+    },
+    async groupCandidates(tenant, { user, all = false, limit } = {}) {
+      ready();
+      if (!key(tenant) || !key(user)) return [];
+      return (await db.unsafe(`SELECT gr.* FROM ${GR} gr WHERE gr.tenant = $1 AND ($3::boolean OR gr.general_role IS NOT NULL
+          OR EXISTS (SELECT 1 FROM ${SG} g WHERE g.scope_type = 'group' AND g.scope_id = gr.id AND ((g.subject_type = 'user' AND g.subject = $2)
+            OR (g.subject_type = 'team' AND g.subject IN (SELECT team FROM ${TU} WHERE member = $2))))) ORDER BY gr.id LIMIT $4`,
+      [tenant, user, !!all, smallLimit(limit, HOME.candidates.groups.default, HOME.candidates.groups.max)])).map(rowGroup);
     },
     async boardRows(ids, { user, email = null } = {}) {
       ready();

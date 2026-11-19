@@ -339,16 +339,19 @@ describe("POST /groups: group.create at the Unit root", () => {
   test("a Unit admin creates a Group and owns it; a member, a guest and a name-less call do not", async () => {
     const g = await svc.createGroup(root, { name: "  Platform org " });
     expect(g).toEqual({ id: expect.any(String), name: "Platform org", general: null });
-    expect(await ten.role(root, (await r.createBoard({ tenant: acme.id, space: (await r.createSpace({ tenant: acme.id, name: "in g", group: g.id, owner: "google:root" })).id })).id)).not.toBe(undefined);
+    expect(await r.scopedGrants({ type: "group", id: g.id })).toEqual([expect.objectContaining({ role: "owner", subject: { type: "user", id: "google:root" } })]);   // the creator owns it
     expect(await code(svc.createGroup(max, { name: "x" }))).toBe("forbidden");
     expect(await code(svc.createGroup(kim, { name: "x" }))).toBe("forbidden");
     expect(await code(svc.createGroup(root, { name: "" }))).toBe("bad-request");
     expect(await code(svc.createGroup(root, { name: "x", general: "owner" }))).toBe("bad-request");
     expect((await svc.createGroup(root, { name: "Open", general: "viewer" })).general).toBe("viewer");
   });
-  test("a member holding a custom role with group.create at the Unit may create (checked by permission, not role name)", async () => {
-    expect((await ten.effective(root, { type: "unit", id: acme.id })).permissions.has("group.create")).toBe(true);
-    expect((await ten.effective(max, { type: "unit", id: acme.id })).permissions.has("group.create")).toBe(false);
+  test("a custom Unit role with group.create lets its holder create a Group: checked by permission, not role name", async () => {
+    expect(await code(svc.createGroup(max, { name: "x" }))).toBe("forbidden");
+    const role = await r.createRole({ tenant: acme.id, name: "Org builder", base: "viewer", boardRole: "viewer", permissions: ["group.create"] });
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: "google:max" }, role: role.id });
+    expect((await svc.createGroup(max, { name: "Mine" })).name).toBe("Mine");
+    expect((await ten.effective(max, { type: "group", id: product.id })).permissions.has("group.create")).toBe(false);   // clipped: Unit only
   });
 });
 

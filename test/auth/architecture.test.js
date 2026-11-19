@@ -163,7 +163,7 @@ test("checker: an extensionless or unknown in-scope target is a violation", () =
 });
 
 // ---- #48: adapters only translate; the Space/Group rules live in the core service ----
-const WRITES = /\bregistry\s*\.\s*(createBoard|createSpace|createGroup|rename|setGeneralRole|setScopedGrant|ensurePersonalSpace)\b/;
+const WRITES = /\bregistry\s*\.\s*(createBoard|createSpace|createGroup|rename|updateScope|setGeneralRole|setScopedGrant|ensurePersonalSpace)\b/;
 const writesOrgDirectly = src => WRITES.test(src);
 
 test("the HTTP adapter calls no Space, Group or board write on the Registry: the core service owns them", () => {

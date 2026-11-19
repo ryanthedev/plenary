@@ -1043,6 +1043,24 @@ role) waits in its own queue, drained before the ordinary one and first-in first
 `GET /spaces/:id`: the Space's one `effective`, then Home's window (≤ 3 pages of 200 ids, one `accessMany` each: 6-7 statements and one context read
 per page). `GET /groups/:id`: one `effective`, one `spacesIn` page. Nothing loops the boards, Spaces or Groups of a Unit.
 
+## HTTP request deadline (#73, TECH-DEBT row 16)
+
+Every route `httpRoutes` (server/auth/http.js) serves answers within a **request deadline**, default **8000 ms** (`config.requestDeadlineMs`, a positive
+integer), or answers `503 {error:"unavailable"}` (the same body and code as any Registry or verifier outage). One wrapper in the dispatcher covers the whole
+route table, the body read, the bearer check and the handler, so a route added later is covered with no per-route code. The deadline sits under every
+proxy and idle cut in front of the server (Bun's default is 10 s without a byte, and Postgres statement/lock limits reach 15 s); the client sees a status,
+never a dropped connection. `GET /auth/dev` keeps its own tighter 3 s wait on the Registry. Blob PUT/GET (`blob-http.js`) has its own body deadline and is
+not under this one.
+
+**What a 503 means on a write.** The work is not cancelled (the Registry port has no cancel; a statement already sent to the database runs to its
+own limit). So a 503 from a write route (`POST /boards`, `/spaces`, `/groups`, `PATCH` of a board, Space or Group, invites, links, `PUT` grants, `DELETE`
+invite/link, stars) says **"may or may not have applied; retry is safe"**. The retry is safe because each write is idempotent or detectable: grants,
+stars, revokes, renames and `updateScope` set a value (repeating them changes nothing); a retried `POST` of a create may leave the first, committed
+object behind next to the second (a duplicate board, Space, Group, invite or link, never a lost or corrupt one), which the caller lists and deletes or
+ignores. After the 503 is sent the late result is **discarded**: the response is built once, the late handler's return value or rejection is dropped (handled,
+never an unhandled rejection), and nothing it finishes is sent to the client. A multi-step create (`POST /boards` = create, then the owner grant) that
+the deadline cuts between its steps ends as its own `owner-grant-failed` case does today.
+
 ## Sign-in code exchange
 
 No long-lived token ever appears in a URL. After Google sign-in the server hands the page a single-use code, and the

@@ -25,6 +25,7 @@
 //     config.publicUrl      optional absolute base URL; when set, a created link carries `url` (<publicUrl>/links/<id>)
 //     config.devSignIn      optional { board, users: [{ name, token, role }], hosts: [hostname], waitMs?: Registry wait, default 3000 }: GET /auth/dev answers it, only while
 //                           `dev` is on and the request's Host is one of `hosts` (else 404: a DNS-rebinding page can't read it)
+//     config.requestDeadlineMs  every route answers within this many ms (default 8000) or 503 `unavailable`; deps.timers { set, clear } runs it (tests pass a virtual one)
 //     config.maxBody        JSON body cap in bytes (default 16384)
 //     config.maxLoginStates replay-guard size cap (default 100000); when full, callbacks get 503 (fails closed).
 //                           The used-code set of /auth/exchange has the same cap and also fails closed.
@@ -92,6 +93,8 @@ const XCHG_ATTRS = "Path=/; Secure; HttpOnly; SameSite=Strict";
 /** How long GET /auth/dev waits for the Registry before it answers 503 (under Bun's 10 s idle timeout). */
 const DEV_MENU_WAIT_MS = 3000;
 const bounded = (p, ms) => new Promise((res, rej) => { const t = setTimeout(() => rej(new Error("timeout")), ms); p.then(v => { clearTimeout(t); res(v); }, e => { clearTimeout(t); rej(e); }); });
+/** The default request deadline (PROTOCOL.md "HTTP request deadline"): under Bun's 10 s idle cut and the Postgres 15 s limits. */
+const REQUEST_DEADLINE_MS = 8000;
 const NO_STORE = { "cache-control": "no-store" };
 const json = (status, body, headers = {}) =>
   new Response(body === undefined ? null : JSON.stringify(body), {
@@ -124,8 +127,10 @@ const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
  *   now?: () => number, config: object, dev?: { enabled?: boolean, verify(t: string): Promise<object|null> } | null,
  *   testHooks?: { pruned?(p: { visited: number, expired: number, live: number }): void } | null }} deps   (tests only, not an API)
  */
-export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, spaces = spaceService({ registry, tenancy, home, now }), config = {}, dev = null, log = stdoutLog, testHooks = null }) {
+export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, spaces = spaceService({ registry, tenancy, home, now }), config = {}, dev = null, log = stdoutLog, testHooks = null, timers = { set: (f, ms) => setTimeout(f, ms), clear: h => clearTimeout(h) } }) {
   if (!registry || !sessions || !tenancy) throw new Error("http: registry, sessions and tenancy are required");
+  const deadlineMs = config.requestDeadlineMs ?? REQUEST_DEADLINE_MS;
+  if (!Number.isInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 2 ** 31 - 1) throw new Error("http: config.requestDeadlineMs must be a positive integer (ms)");
   const postLoginUrl = absUrl(config.postLoginUrl, "postLoginUrl");
   const postLogoutUrl = config.postLogoutUrl ? absUrl(config.postLogoutUrl, "postLogoutUrl") : postLoginUrl;
   if (typeof config.boardUrl !== "string" || !config.boardUrl.includes("{board}")) throw new Error("http: config.boardUrl must contain {board}");
@@ -495,10 +500,23 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
   ].map(([pattern, methods]) => {
     const names = [];
     const re = new RegExp("^" + pattern.replace(/:(\w+)/g, (_, n) => { names.push(n); return "([^/]+)"; }) + "$");
-    return { re, names, methods };
+    return { re, names, methods, pattern };
   });
 
-  return async function handle(req, url) {
+  // One deadline for the whole route table (PROTOCOL.md "HTTP request deadline"). The work is not cancellable (the Registry port has no
+  // cancel), so on expiry the 503 wins and the late settlement is dropped here: handled, never an unhandled rejection, never sent.
+  let lastDeadlineWarn = -Infinity;
+  const withDeadline = (run, what) => new Promise((resolve, reject) => {
+    let over = false;
+    const t = timers.set(() => {
+      over = true;
+      if (now() - lastDeadlineWarn >= 10_000) { lastDeadlineWarn = now(); log.warn(`request deadline (${deadlineMs} ms) passed on ${what}; answering 503`); }
+      resolve(err(503, "unavailable"));
+    }, deadlineMs);
+    (async () => run())().then(v => { if (!over) { timers.clear(t); resolve(v); } }, e => { if (!over) { timers.clear(t); reject(e); } });
+  });
+
+  async function handle(req, url) {
     try {
       url = url ?? new URL(req.url);
       for (const r of routes) {
@@ -509,8 +527,8 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
         const params = {};
         try { r.names.forEach((n, i) => { params[n] = decodeURIComponent(m[i + 1]); }); }
         catch { return err(400, "bad-request"); }
-        if (r.names.length) return await fn(req, params, url);
-        return await fn(req, url);
+        const what = `${req.method} ${r.pattern}`;
+        return await withDeadline(() => r.names.length ? fn(req, params, url) : fn(req, url), what);
       }
       return null;
     } catch (e) {
@@ -524,7 +542,10 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       }
       return err(503, "unavailable");
     }
-  };
+  }
+  /** The route table, for the guard test: every entry is dispatched through withDeadline. */
+  handle.routes = routes.map(r => ({ pattern: r.pattern, methods: Object.keys(r.methods), names: r.names }));
+  return handle;
 }
 
 /**

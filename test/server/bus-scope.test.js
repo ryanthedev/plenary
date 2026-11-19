@@ -37,7 +37,7 @@ test("DW-iso: the wire subject is <cluster>.<subject>, for publish and subscribe
 test("DW-iso: two clusters on one bus never hear each other, on any subject the cores use (entries, inbox, remote open, replies)", async () => {
   const raw = memoryBus(), a = scopeBus(raw, A), b = scopeBus(raw, B);
   const heard = { a: [], b: [], old: [] };
-  const names = [S, subjects.inbox("t-1", "b-1"), subjects.presence("t-1", "b-1"), subjects.grants("t-1", "b-1"), subjects.gateway("gw-1"), subjects.open, subjects.opened("gw-1")];
+  const names = [S, subjects.inbox("t-1", "b-1"), subjects.presence("t-1", "b-1"), subjects.here("t-1", "b-1"), subjects.grants("t-1", "b-1"), subjects.gateway("gw-1"), subjects.open, subjects.opened("gw-1")];
   for (const n of names) {
     a.subscribe(n, m => heard.a.push([n, m]));
     b.subscribe(n, m => heard.b.push([n, m]));

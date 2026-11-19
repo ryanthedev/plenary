@@ -77,6 +77,7 @@ import { natsBus } from "./bus/nats.js";
 import { postgresRegistry } from "./registry/postgres.js";
 import { checkLeaseTtl } from "./room-host.js";
 import { diskBlobs } from "./blobs/disk.js";
+import { zlibDeflate } from "./compress/zlib.js";
 import { s3Blobs } from "./blobs/s3.js";
 import { authPort } from "./auth/port.js";
 import { devAuth } from "./auth/dev.js";
@@ -445,7 +446,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   // A general-access change on a Space or Group tells every board it reaches to re-check roles (PROTOCOL.md § Organization, Freshness).
   const spaces = spaceService({ registry, tenancy, home, announce: (tenant, board) => bus.publish(subjects.grants(tenant, board), { board }), log: log.child({ component: "spaces" }) });
   const http = httpRoutes({ registry, sessions, oidc, tenancy, home, spaces, now: Date.now, config, log: log.child({ component: "auth" }), ...(dev.enabled ? { dev } : {}) });
-  const server = createServer({ auth, registry, store, bus, blobs, blobKey, ...(env.PUBLIC_URL ? { publicUrl: origin } : {}), ...(quotaRaw ? { quotaBytes: Number(quotaRaw) } : {}), log, limits, http, onWelcomed: recentRecorder({ registry, log: log.child({ component: "home" }) }), port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
+  const server = createServer({ auth, registry, store, bus, blobs, blobKey, ...(env.PUBLIC_URL ? { publicUrl: origin } : {}), ...(quotaRaw ? { quotaBytes: Number(quotaRaw) } : {}), log, limits, http, deflate: zlibDeflate(), onWelcomed: recentRecorder({ registry, log: log.child({ component: "home" }) }), port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
     roles, node, host: { hostname: node, leaseTtlMs } });
   return { server, store, bus, registry, log, devBoard, oidc, node, roles, cluster, clusterId, leaseTtlMs,
     async stop() { await server.stop(); await Promise.race([spaces.settled(), new Promise(r => setTimeout(r, 2000).unref?.())]);   // let grants announcements finish (bounded)

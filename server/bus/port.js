@@ -34,6 +34,8 @@ export const subjects = {
   entries: (tenant, board) => `plen.${needId(tenant, "tenant")}.${needId(board, "board")}.entries`,
   /** Gateway → gateways: { gateway, user, client, msg } presence, or { gateway, user, client, leave: true }. Never saved. */
   presence: (tenant, board) => `plen.${needId(tenant, "tenant")}.${needId(board, "board")}.presence`,
+  /** Gateway → gateways: { gateway, … } who is on the board through that gateway (PROTOCOL.md § Presence, `here`). Never saved. */
+  here: (tenant, board) => `plen.${needId(tenant, "tenant")}.${needId(board, "board")}.here`,
   /** Gateway → gateways: { gateway, window, counts } viewers' emotes per 500 ms window. Never saved. */
   emotes: (tenant, board) => `plen.${needId(tenant, "tenant")}.${needId(board, "board")}.emotes`,
   /** Gateway → room: { n, conn, gateway, user, name, role, client, msg }, { n, conn, gateway, closed: true }, or { gateway, conns }. */

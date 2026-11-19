@@ -132,11 +132,11 @@ const OP_ID = /^\s*\{\s*"t"\s*:\s*"op"\s*,\s*"id"\s*:\s*"([^"\\]{1,256})"/;
  *   bus: object,
  *   rooms: { open(tenant: string, board: string): Promise<void> },
  *   onWelcomed?: (user: string, board: string) => void,   // called after a connection is welcomed (Recent, PROTOCOL.md § Home); must not throw or block
- *   log?: object, codec?: object, id?: string, limits?: Partial<typeof LIMITS>, now?: () => number,
+ *   log?: object, codec?: object, deflate?: (data: string | Uint8Array) => Promise<Uint8Array | null>, id?: string, limits?: Partial<typeof LIMITS>, now?: () => number,
  *   blobUrl?: (tenant: string, board: string, sha1: string, verb: "GET" | "PUT", user: string) => Promise<string>,   // signs a blob URL (blob-access.js); absent: `blob` requests get `unavailable`
  * }} o
  */
-export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed, timers = globalThis, blobUrl = null, onWelcomed = null }) {
+export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed, timers = globalThis, deflate = null, blobUrl = null, onWelcomed = null }) {
   // Every timer of the gateway runs on `timers` (tests pass fake ones, with `now` moved in step); the names shadow the globals here.
   const { setTimeout, clearTimeout, setInterval, clearInterval } = timers;
   const lim = { ...LIMITS, ...limits };
@@ -465,7 +465,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       b = { key, tenant, board, conns: new Set(), refs: 0, coalescer: presenceCoalescer(), mine: {}, sums: new Map(), unsubs: [], rc: newRecheck(),
         // `here` (§ Presence): this gateway's writer users and viewer connections, the latest `.here` per gateway, what was sent.
         hw: new Map(), hv: 0, hvTabs: new Map(), hFrom: new Map(), hChanged: false, hPubAt: 0, hText: null, hCountText: null, hKey: null, hVer: 0, hOut: false, hSentAt: 0, hSending: false };
-      b.feed = feedOf({ tenant, board, store, bus, log, codec, onLive: e => onLive(b, e), ...lim.feed });
+      b.feed = feedOf({ tenant, board, store, bus, log, codec, deflate, onLive: e => onLive(b, e), ...lim.feed });
       b.unsubs.push(bus.subscribe(subjects.presence(tenant, board), m => {
         if (!m || typeof m.user !== "string" || typeof m.client !== "string") return;
         if (m.leave) b.coalescer.leave(m.user, m.client); else if (m.msg && typeof m.msg === "object") b.coalescer.add(m.user, m.client, m.msg);
@@ -476,7 +476,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
         for (const e of EMOTES) if (Number.isSafeInteger(m.counts[e]) && m.counts[e] > 0) sum[e] = (sum[e] ?? 0) + m.counts[e];
         b.sums.set(m.window, sum);
       }));
-      b.unsubs.push(bus.subscribe(hereSubject(tenant, board), m => {
+      b.unsubs.push(bus.subscribe(subjects.here(tenant, board), m => {
         const msg = hereCheck(m);
         if (msg && msg.gateway !== id) b.hFrom.set(msg.gateway, { msg, at: now() });   // our own is kept locally
       }));
@@ -704,12 +704,14 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     // socket before it; `welcoming` stops a second welcome being taken meanwhile.
     c.welcoming = true; c.answered = true; clearTimeout(c.timer);
     const b = c.b, since = c.since;
-    b.feed.reach(upTo).then(() => b.feed.atomically(() => {
-      if (c.state !== "live") return;
+    // A client that asked for deflate (`?z=deflate` on /ws) gets the catch-up texts compressed once and shared (§ Joining): they
+    // are made ready outside the feed's queue (a big snapshot's deflate must not hold up live entries). Entries landing
+    // meanwhile cannot make them stale: the open last chunk is sent as a compressed prefix plus a plain cut, so there is no retry.
+    const send = () => {
       push(ws, typeof welcomeData === "function" ? welcomeData() : welcomeData);
       c.welcomed = true;
       try { onWelcomed?.(c.user, c.board); } catch (err) { log.warn("onWelcomed failed", { err }); }
-      for (const f of b.feed.catchUp(since)) pushShared(ws, f);
+      for (const f of b.feed.catchUp(since, c.z)) pushShared(ws, f);
       c.next = b.feed.seq + 1;
       // Who's here, right after the catch-up: the full list. A board this gateway hasn't published for yet gets its
       // own entry now (else the first joiner's list is empty until the next tick); otherwise the cached list, at most
@@ -717,15 +719,17 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       if (!b.hFrom.has(id)) { const t = now(); b.hFrom.set(id, { msg: hereMine(b), at: t }); hereRefresh(b, t); }
       else if (!b.hText) hereRefresh(b, now());
       push(ws, b.hText); c.hVer = b.hVer;
-    })).catch(err => { log.error("catch-up failed", { conn: c.id, err }); if (c.state === "live") refuse(ws, "unavailable", "try again shortly", 1013, "unavailable"); });
+    };
+    const attempt = async () => {
+      if (c.z && c.state === "live") await b.feed.prepare(since);
+      await b.feed.atomically(() => { if (c.state === "live") send(); });
+    };
+    b.feed.reach(upTo).then(attempt).catch(err => { log.error("catch-up failed", { conn: c.id, err }); if (c.state === "live") refuse(ws, "unavailable", "try again shortly", 1013, "unavailable"); });
   }
 
   // ---- `here` (PROTOCOL.md § Presence, `here`; § Bus `.here`): never logged, bounded per board ----
   const RANK = { owner: 0, editor: 1, annotator: 2, commenter: 3 };
   const WRITER_ROLES = Object.keys(RANK);
-  // § Bus names `.here` beside `.presence`; built from the port's checked presence subject (ids validated there).
-  // SEAM(bus): server/bus/port.js could name it (`subjects.here`); this file doesn't own the port.
-  const hereSubject = (tenant, board) => subjects.presence(tenant, board).slice(0, -".presence".length) + ".here";
   /** A `.here` message from the bus, checked and cut to its fields, or null. */
   function hereCheck(m) {
     if (!isObj(m) || !isId(m.gateway) || !Array.isArray(m.writers) || m.writers.length > lim.hereMax) return null;
@@ -819,7 +823,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
         if ((b.hChanged && t - b.hPubAt >= lim.hereMs) || t - b.hPubAt >= lim.herePublishMs) {
           const mine = hereMine(b);
           b.hChanged = false; b.hPubAt = t; b.hFrom.set(id, { msg: mine, at: t });
-          bus.publish(hereSubject(b.tenant, b.board), mine)?.catch?.(() => {});
+          bus.publish(subjects.here(b.tenant, b.board), mine)?.catch?.(() => {});
         }
         if (hereRefresh(b, t)) b.hOut = true;
         const every = b.conns.size > lim.hereBigBoard ? lim.hereBigMs : lim.hereMs;

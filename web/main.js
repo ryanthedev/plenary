@@ -17,7 +17,7 @@ import { sessionStore } from "./adapters/storage/session.js";
 import { localStore } from "./adapters/storage/local.js";
 import { httpAuth } from "./adapters/auth/http.js";
 import { httpDevConfig } from "./adapters/auth/devconfig.js";
-import { wsNet, sameOriginWsUrl } from "./adapters/transport/ws.js";
+import { wsNet, sameOriginWsUrl, browserInflate } from "./adapters/transport/ws.js";
 import { mountApp } from "./adapters/dom/app.js";
 import { syncCollabPort } from "./adapters/collab/sync.js";
 import { showGate, hideGate } from "./adapters/dom/gate.js";
@@ -107,7 +107,7 @@ if (!signIn.token) {
   // Display only (p6-landv L5): the room decides the real user and role on every hello (the note lock uses welcome.user).
   const id = signIn.identity;
   const me = { role: null, user: id?.user ?? "me", name: id?.name ?? id?.email ?? "You" };
-  const net = wsNet({ url: sameOriginWsUrl(location), WebSocket: globalThis.WebSocket, clock });
+  const net = wsNet({ url: sameOriginWsUrl(location), WebSocket: globalThis.WebSocket, clock, inflate: browserInflate() });
   const app = mountApp({
     startSession: ({ mine, onChange }) => createSession({
       join: () => net.join(), token: signIn.token, board, client: "web", user: me.user, mine, onChange, clock,

@@ -10,7 +10,7 @@
 import { Doc, wins } from "../core/doc.js";
 import { emptyScene, clone } from "../core/model.js";
 import {
-  ELEMENT_STREAMS, ROLES, RULES, RULES_VERSION, PROTOCOL_VERSION, CAPS, CHECKPOINT_EVERY, MAX_VERSION_JUMP, MAX_CLIENT_CHARS,
+  ELEMENT_STREAMS, ROLES, RULES, RULES_VERSION, PROTOCOL_VERSION, CAPS, CHECKPOINT_EVERY, CHECKPOINT_BYTES, CHECKPOINT_STATE_RATIO, MAX_VERSION_JUMP, MAX_CLIENT_CHARS,
   MAX_NAME_CHARS, APPEND_TIMEOUT_MS, GATEWAY_SILENCE_MS,
   canWrite, canModerate, opProblem, parseOpId, mergeAppState,
 } from "./envelope.js";
@@ -43,16 +43,16 @@ export class Room {
   /**
    * A new, empty room. To bring a board back, use Room.rebuild or Room.fromLog.
    * @param {{ board: string, tenant: string, log: import("./ports.js").Log, now?: () => number, epoch?: number,
-   *           rules?: object, auto?: boolean, report?: (what: string, detail: object) => void }} o
+   *           rules?: object, auto?: boolean, foldBytes?: number, report?: (what: string, detail: object) => void }} o
    *   `now`: the room's clock in ms (entries carry it as `at`). `epoch`: this incarnation's number from
    *   Store.openEpoch, which the host calls before building the room (§ Recovery, Room identity); every
    *   welcome carries it. Omitted: the log's openEpoch() if it has one, else 1. `rules`: per rules version { W, H, every }; only tests pass it. `auto`: checkpoint
-   *   by itself (§ Recovery, "When"). `report`: errors worth logging.
+   *   by itself (§ Recovery, "When"); `foldBytes`: its byte trigger (default CHECKPOINT_BYTES). `report`: errors worth logging.
    */
-  constructor({ board, tenant, log, now = Date.now, epoch, rules = RULES, auto = true, report = () => {} }) {
+  constructor({ board, tenant, log, now = Date.now, epoch, rules = RULES, auto = true, foldBytes = CHECKPOINT_BYTES, report = () => {} }) {
     // A host passes the epoch it opened; without one, open the log's next (so two builds never share one), else 1.
     if (epoch === undefined) epoch = typeof log?.openEpoch === "function" ? log.openEpoch() : 1;
-    Object.assign(this, { board, tenant, log, now, epoch, rules, auto, report });
+    Object.assign(this, { board, tenant, log, now, epoch, rules, auto, foldBytes, report });
     this.conns = new Set();
     this.queue = [];          // accepted, not yet handed to an append: [{ entry, c, key, counter, horizon }]
     this.inflight = null;     // the batch in the one append in flight
@@ -431,9 +431,18 @@ export class Room {
       const held = this.held; this.held = [];
       for (const h of held) this.answer(h.c, h.m, h.until);
     }
-    // § Recovery, "When": every 1,000 entries, but not before the log since the last checkpoint is half its size.
-    if (this.auto && this.resolved - this.base.seq >= CHECKPOINT_EVERY && this.tailChars * 2 >= this.chars.board + this.chars.notes + this.records.chars) this.checkpoint();
+    if (this.auto && this.checkpointDue()) this.checkpoint();
     this.pump();
+  }
+
+  /**
+   * § Recovery, "When": the kept tail is long enough to fold (CHECKPOINT_EVERY entries, or `foldBytes` of ops: a join
+   * is the snapshot plus this tail), but not before it is a quarter of the state's size, so a checkpoint's write
+   * (about the state) costs at most about four times the log however often it is taken.
+   */
+  checkpointDue() {
+    const longEnough = this.resolved - this.base.seq >= CHECKPOINT_EVERY || this.tailChars >= this.foldBytes;
+    return longEnough && this.tailChars * CHECKPOINT_STATE_RATIO >= this.chars.board + this.chars.notes + this.records.chars;
   }
 
   /**

@@ -26,6 +26,7 @@
 //     the lease's renew and deadline (by performance.now(), never the rooms' injected clock).
 
 import { Room } from "../packages/protocol/room.js";
+import { CHECKPOINT_BYTES } from "../packages/protocol/envelope.js";
 import { jsonCodec } from "../packages/protocol/codec.js";
 import { subjects, MAX_BUS_BYTES, utf8Length } from "./bus/port.js";
 import { quietLogger } from "./log.js";
@@ -88,12 +89,10 @@ export function newHolder(hostname) {
  *   timers: { setTimeout, clearTimeout, setInterval, clearInterval } this host's timers (default the globals).
  */
 export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now = Date.now, appendTimeoutMs = 4_000, sweepMs = 1_000,
-  heartbeatMs = 2_000, pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rules, maxBusBytes = bus.maxBytes ?? MAX_BUS_BYTES, tailFoldBytes = 8 * 1024 * 1024,
+  heartbeatMs = 2_000, pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rules, maxBusBytes = bus.maxBytes ?? MAX_BUS_BYTES, tailFoldBytes = CHECKPOINT_BYTES,
   holder, hostname = globalThis.process?.env?.HOSTNAME, leaseTtlMs = 10_000, watchIdleMs = 60_000, monotonic = performance.now.bind(performance), timers = globalThis }) {
-  // tailFoldBytes: besides the Room's own rule (every 1,000 entries, once the log since the last checkpoint is half
-  //   its size), the host checkpoints once that log reaches this many chars AND half the state's size, so a board
-  //   rewritten in a few huge ops still gets a bounded catch-up, and a rewrite never costs more than 2× the log.
-  //   (An extension of § Recovery "When": a byte trigger, asked for since the scaffold; see the p2-swap report.)
+  // tailFoldBytes: the Room's byte trigger for a checkpoint (§ Recovery, "When"): the log since the last one reaches this
+  //   many chars and a quarter of the state's size (so a rewrite never costs more than ~4x the log). Default CHECKPOINT_BYTES.
   checkLeaseTtl(leaseTtlMs);
   // Every timer of this host runs on `timers` (tests pass fake ones and advance them, with `monotonic` and the Store's
   // clock moved in step); the names shadow the globals for this whole function.
@@ -161,7 +160,6 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
           if (slot.leaseLost) return;
           if (expired(slot)) return lost(slot, "the host deadline passed before an append's result");
           slot.durable = entries[entries.length - 1].seq; publishEntries(slot, entries);
-          setTimeout(() => foldIfDue(slot), 0);   // after the Room has moved these entries to resolved
         }, err => { fenced("append", err); throw err; });
       },
       putCheckpoint(cp) {
@@ -171,15 +169,6 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
         return p;
       },
     };
-  }
-
-  /** The byte trigger (tailFoldBytes, above). Only when nothing is unresolved, so the fold is of resolved state. */
-  function foldIfDue(slot) {
-    if (slot.dead) return;
-    const st = slot.room.status();
-    if (st.stopped || st.inflight || st.queued || st.seq !== st.resolved) return;
-    if (st.tailChars < tailFoldBytes || st.tailChars * 2 < st.stateChars) return;
-    try { slot.room.checkpoint(); } catch (err) { log.error("checkpoint failed", { board: slot.board, err }); }
   }
 
   /** Read every entry from `from` to the log's end, in bounded pages. */
@@ -311,7 +300,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       else log.error(`room: ${what}`, { tenant, board, ...detail });
     };
     // § Recovery, Room identity: the epoch is the lease's (acquire bumps it durably), so two builds never share one.
-    const opts = { board, tenant, log: logOf(slot), now, epoch: slot.epoch, report, ...(rules ? { rules } : {}) };
+    const opts = { board, tenant, log: logOf(slot), now, epoch: slot.epoch, report, foldBytes: tailFoldBytes, ...(rules ? { rules } : {}) };
     for (let before; ;) {
       const cp = await store.getCheckpoint(tenant, board, before);
       const entries = await readFrom(tenant, board, cp && cp.seq > 0 ? cp.seq : 1);

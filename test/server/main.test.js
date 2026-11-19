@@ -3,6 +3,7 @@
 import { test, expect, afterAll } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { inflateSync } from "node:zlib";
 import { tempDir, cleanup, until, spawnTracked } from "./helpers.js";
 import { sock } from "./rig.js";
 import { sqliteStore } from "../../server/store/sqlite.js";
@@ -276,6 +277,36 @@ test("start(env): POST /boards with a dev Bearer token makes a board a socket ca
     await app.stop();
     for (const [k, v] of [["GOOGLE_CLIENT_ID", saved.id], ["GOOGLE_CLIENT_SECRET", saved.secret]]) if (v === undefined) delete process.env[k]; else process.env[k] = v;
   }
+});
+
+test("start(env): the product wires compressed catch-up: /ws?z=deflate gets the big snapshot as one binary zlib frame, /ws plain text (PROTOCOL.md § Joining)", async () => {
+  const app = await start(devEnv(tempDir()));
+  try {
+    await app.registry.createTenant({ domain: "acme.test", admins: ["dev:ann"] });
+    const { board } = await (await fetch(app.server.url + "/boards", { method: "POST", headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" }, body: JSON.stringify({ title: "big" }) })).json();
+    const a = await sock(app.server.wsUrl);
+    a.send({ t: "hello", v: 1, token: TOKEN, board: board.id, since: 0, client: "ann" });
+    await a.next(m => m.t === "welcome");
+    a.send({ t: "op", id: "ann:1", sentAt: 0, stream: "board", op: { elements: Array.from({ length: 60 }, (_, i) => ({ id: "e" + i, type: "rectangle", version: 1, versionNonce: i, x: i, y: 0, width: 1, height: 1, isDeleted: false, customData: { pad: "abc".repeat(40) } })) } });
+    await a.next(m => m.t === "ack");
+    await a.close();
+    const join = async z => {
+      const ws = new WebSocket(app.server.wsUrl + (z ? "?z=deflate" : "")); ws.binaryType = "arraybuffer";
+      const got = []; ws.onmessage = e => got.push(e.data);
+      await new Promise(res => { ws.onopen = res; });
+      ws.send(JSON.stringify({ t: "hello", v: 1, token: TOKEN, board: board.id, since: 0, client: "v" + z }));
+      await until(() => got.some(d => typeof d === "string" && JSON.parse(d).t === "here"), "here");
+      ws.close();
+      return got;
+    };
+    const plain = await join(false), zed = await join(true);
+    expect(plain.every(d => typeof d === "string")).toBe(true);
+    const bin = zed.filter(d => typeof d !== "string");
+    expect(bin.length).toBe(1);                                              // the entries frame (> 4 KiB): one binary frame
+    const entries = JSON.parse(inflateSync(Buffer.from(bin[0])).toString("utf8"));
+    expect(entries).toEqual(JSON.parse(plain.find(d => JSON.parse(d).t === "entries")));
+    expect(bin[0].byteLength).toBeLessThan(plain.find(d => JSON.parse(d).t === "entries").length / 3);
+  } finally { await app.stop(); }
 });
 
 test("start(env): fake Google client vars build the OIDC adapter (stub fetch, never the real client); /auth/login no longer 503", async () => {

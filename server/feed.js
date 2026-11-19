@@ -180,13 +180,14 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
     const beat = !Array.isArray(m?.items);
     if (beat && Number.isSafeInteger(m?.cp) && m.cp >= 0) self.cpHeard = Math.max(self.cpHeard ?? 0, m.cp);   // every heartbeat and `released` carries `cp`
     await maybeRebase(beat);
+    live = true;   // a feed whose first load failed is live again once a later step succeeds (what that step applied was catch-up, not observed)
   }
 
   const unsub = bus.subscribe(subjects.entries(tenant, board), m => { run(() => onMessage(m)).catch(err => log.error("feed: message failed", { tenant, board, err })); });
   const poll = setInterval(() => {
     if (now() - self.lastHeard < pollMs || running) return;
     self.lastHeard = now();   // the next look is a full pollMs away
-    run(async () => { await repair(); await maybeRebase(true); }).catch(err => log.warn("feed: Store poll failed", { tenant, board, err }));
+    run(async () => { await repair(); await maybeRebase(true); live = true; }).catch(err => log.warn("feed: Store poll failed", { tenant, board, err }));
   }, Math.max(50, Math.floor(pollMs / 2)));
   poll.unref?.();
 

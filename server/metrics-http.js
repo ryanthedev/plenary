@@ -14,7 +14,7 @@ async function sameSecret(a, b) {
   return d === 0;
 }
 
-/** The shortest token the start accepts, in bytes (main.js checks it with this). */
+/** The shortest token the start accepts, in characters (main.js checks it with this). */
 export const METRICS_TOKEN_MIN = 16;
 /** RFC 6750 token68 (letters, digits, -._~+/ and trailing =): what a bearer header carries unambiguously; no whitespace anywhere. */
 export const METRICS_TOKEN_RE = /^[A-Za-z0-9\-._~+/]+=*$/;

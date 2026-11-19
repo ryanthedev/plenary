@@ -5,6 +5,10 @@ import { readFileSync } from "node:fs";
 import { prometheusMetrics, MAX_SERIES } from "../../server/metrics/prometheus.js";
 import { noopMetrics } from "../../server/metrics/port.js";
 import { metricsRoute } from "../../server/metrics-http.js";
+import { boardFeed } from "../../server/feed.js";
+import { memoryBus, subjects } from "../../server/bus/memory.js";
+import { sqliteStore } from "../../server/store/sqlite.js";
+import { join } from "node:path";
 import { instrumentedStore } from "../../server/instrument.js";
 import { STORE_METHODS } from "../../server/store/port.js";
 import { start } from "../../server/main.js";
@@ -82,6 +86,16 @@ test("prometheus: a null or odd options argument never throws; a seeded counter 
   expect(value(m.render(), 's_total{event="b"}')).toBe(0);
   seeded.inc(2, { event: "b" });
   expect(value(m.render(), 's_total{event="b"}')).toBe(2);
+});
+
+test("prometheus: label and seed values are coerced with String(): a number and its string are one series", () => {
+  const m = prometheusMetrics();
+  const c = m.counter("c_total", "x", ["k"], [{ k: 1 }]);
+  expect(value(m.render(), 'c_total{k="1"}')).toBe(0);
+  c.inc(1, { k: 1 }); c.inc(1, { k: "1" });
+  const t = m.render();
+  expect(value(t, 'c_total{k="1"}')).toBe(2);
+  expect(t.split("\n").filter(l => l.startsWith("c_total{")).length).toBe(1);
 });
 
 test("prometheus: registering a counter or histogram again returns the same instrument's series; a gauge's reader is replaced", () => {
@@ -265,6 +279,23 @@ test("a joiner's catch-up is not fan-out lag: old entries on a feed's first load
   expect(count()).toBe(before);
   expect(value(m.render(), 'plenary_fanout_lag_seconds_bucket{le="30"}')).toBe(value(m.render(), 'plenary_fanout_lag_seconds_bucket{le="+Inf"}'));
   await v.drop(); await r.stop();
+});
+
+test("a feed whose first load failed reports fan-out lag again once a later step succeeds (and not for what that step catches up)", async () => {
+  const T = "t-aaa", B = "b-one";
+  const raw = sqliteStore({ path: join(tempDir(), "plenary.db") });
+  let failed = false;
+  const store = Object.assign(Object.create(raw), { epoch: (...a) => { if (!failed) { failed = true; return Promise.reject(new Error("db blip")); } return raw.epoch(...a); } });
+  const bus = memoryBus();
+  const lives = [];
+  const feed = boardFeed({ tenant: T, board: B, store, bus, onLive: e => lives.push(e), pollMs: 3_600_000 });
+  await expect(feed.ready).rejects.toThrow("db blip");
+  const entry = n => ({ seq: n, board: B, tenant: T, stream: "board", op: { appState: { grid: n }, appBase: { grid: 0 } }, by: "dev:a", id: "a:" + n, at: 1000 + n, rv: 1 });
+  const pub = async n => { await bus.publish(subjects.entries(T, B), { epoch: 1, from: n, to: n, items: [JSON.stringify(entry(n))] }); await bus.flush(); await feed.atomically(() => {}); };
+  await pub(1);
+  await pub(2);
+  expect(lives.map(l => [l.from, l.at])).toEqual([[1, undefined], [2, 1002]]);   // the first step after the failure is catch-up; the next is live
+  feed.close(); await raw.close(); await bus.close();
 });
 
 test("a clean stop releases the lease and counts it", async () => {

@@ -1468,7 +1468,7 @@ histogram(name, help, { buckets?, labelNames? }) -> { observe(value, labels?) }
 ```
 - Every call, including a null options argument, is non-throwing and never waits: a bad value, an unknown label name or a name that is already another type is dropped (the registration then returns a no-op instrument). Metrics must never take down the hot path.
 - Registering the same counter or histogram name and type again returns the same instrument (several gateways in one process share it).
-- Labels are bounded: only the declared `labelNames`, values from a fixed set named below, at most 64 series per metric (more are dropped). No per-board, per-user, per-tenant or per-connection label, ever.
+- Label values are rendered with `String()` (the number 1 and the string "1" are one series). Labels are bounded: only the declared `labelNames`, values from a fixed set named below, at most 64 series per metric (more are dropped). No per-board, per-user, per-tenant or per-connection label, ever.
 - Adapters: `server/metrics/prometheus.js` (the text format, `render()`), and `noopMetrics` in the port module. `server/main.js` picks one.
 
 **Metrics.** All names start `plenary_`. Counters are cumulative since process start (use `rate()`); durations are seconds.

@@ -19,6 +19,7 @@ export function prometheusMetrics() {
   /** @type {Map<string, { type: string, help: string, labelNames: string[], series: Map<string, any>, buckets?: number[], read?: () => number }>} */
   const families = new Map();
 
+  /** Label values are rendered with String(), so a seed or an inc with the number 1 and one with "1" are the same series. */
   /** The label set as an exposition string ("" for none); null when a label is unknown or the set is too big. */
   const keyOf = (f, labels) => {
     if (!f.labelNames.length) return "";

@@ -185,7 +185,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-schema:${s}`]);
       // A schema from before the organization (boards, no Spaces) is an old-format store: refused, never half-filled in.
       if (!(await missing(tx, s, ["reg_boards"])).length && (await missing(tx, s, ["reg_spaces"])).length)
-        throw Object.assign(new Error(`postgres registry: schema "${s}" has reg_boards but no reg_spaces: it is from an older version. Reset the store (drop the schema's reg_* tables); the next start-up recreates them`), { code: "old-format" });
+        throw Object.assign(new Error(`postgres registry: schema "${s}" has reg_boards but no reg_spaces: it is from an older version. Reset the store: drop the schema "${s}" (every table in it, never one), and the next start-up recreates it`), { code: "old-format" });
       await assertShapes(tx, s, registryTables(s));   // the old-format rule, before anything is created
       await migrate(tx, s, registryTables(s));
       const noIndex = await missing(tx, s, Object.keys(REGISTRY_INDEXES));

@@ -12,7 +12,8 @@ import { registryContract } from "../auth/registry-contract.js";
 import { accessRace } from "../auth/access-race.js";
 import { accessEquivalence } from "../auth/access-equivalence.js";
 import { tenancy } from "../../server/auth/tenancy.js";
-import { migrate } from "../../server/pg/schema.js";
+import { migrate, ddlColumns } from "../../server/pg/schema.js";
+import { STORE_TABLES } from "../../server/store/postgres.js";
 
 const url = process.env.DATABASE_URL;
 // Every test here does real Postgres work (schema creation, pools, lock waits). Bun's 5 s default fails them under machine load (TECH-DEBT
@@ -622,6 +623,12 @@ describe.skipIf(!url)("postgres registry", () => {
     try {
       await (await postgresRegistry({ url, schema, max: 2 })).close();
       await (await postgresRegistry({ url, schema, max: 2 })).close();                       // a reopen: nothing refused
+      const app = await runtime();                                                           // the runtime role (no CREATE) reads the catalog too: no false-fire
+      if (app) {
+        await client().unsafe(`GRANT USAGE ON SCHEMA "${schema}" TO "${priv.role}"`);
+        await client().unsafe(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO "${priv.role}"`);
+        await (await postgresRegistry({ sql: app, schema })).close();
+      }
       for (const [table, col] of [["reg_teams", "created_at"], ["reg_members", "email"], ["reg_scope_grants", "role"]]) {
         await client().unsafe(`ALTER TABLE "${schema}".${table} DROP COLUMN ${col}`);
         const err = await postgresRegistry({ url, schema, max: 2 }).then(() => null, e => e);
@@ -629,6 +636,18 @@ describe.skipIf(!url)("postgres registry", () => {
         expect(err.message).toContain(table);
         expect(err.message).toContain(`drop the schema "${schema}"`);                      // never advises dropping one table
         await client().unsafe(`ALTER TABLE "${schema}".${table} ADD COLUMN ${col} TEXT`);   // (the names match again; the types no longer matter to the rule)
+      }
+    } finally { await drop(schema); }
+  }, 30_000);
+
+  test("ddlColumns equals the catalog: for every table of the Registry and the Store, the columns parsed from the DDL are the columns Postgres made", async () => {
+    const schema = schemaName();
+    const tables = { ...registryTables(schema), ...STORE_TABLES };
+    try {
+      await client().begin(tx => migrate(tx, schema, tables));
+      for (const [t, defs] of Object.entries(tables)) {
+        const got = (await client().unsafe(`SELECT a.attname FROM pg_attribute a WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped`, [`"${schema}".${t}`])).map(r => r.attname).sort();
+        expect([t, ddlColumns(defs).sort()]).toEqual([t, got]);
       }
     } finally { await drop(schema); }
   }, 30_000);

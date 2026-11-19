@@ -14,12 +14,10 @@
  */
 
 /**
- * Auth, the one server port a room-adjacent package names. The server's other ports are async and live next to their
- * adapters, one module each: Store server/store/port.js, Registry server/auth/registry-port.js, Bus server/bus/port.js,
+ * The server's ports are async and live next to their adapters, one module each, and those modules are the contracts:
+ * Auth server/auth/port.js, Store server/store/port.js, Registry server/auth/registry-port.js, Bus server/bus/port.js,
  * Blobs server/blobs/port.js (PROTOCOL.md § Ports). A room is handed none of them: the server gives it a per-board Log
- * (above) made from the Store, and the verified identity with each hello.
- * @typedef {{ verify(token: string): Promise<null | { user: string, name: string, email: string, domain: string }>,
- *             role(identity: object, board: string): Promise<null | string> }} Auth  null = refused; a throw = unavailable
+ * (above) made from the Store, and the verified identity with each hello. This package names only the Log.
  */
 
 const copy = v => JSON.parse(JSON.stringify(v));

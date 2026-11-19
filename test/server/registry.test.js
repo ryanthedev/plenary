@@ -2,7 +2,7 @@
 // has: same answers as the in-memory one on edge cases, close/reopen, two handles on one file, and a real
 // cross-process race on the last owner.
 import { test, expect, afterAll, describe } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { sqliteRegistry } from "../../server/registry/sqlite.js";
@@ -171,8 +171,10 @@ describe("sqlite registry", () => {
       good.close();
       db.run(`CREATE TABLE ${table} (${cols.map(c => `${c} TEXT`).join(", ")})`);
       db.close();
-      let err; try { sqliteRegistry({ path, fullfsync: false }); } catch (e) { err = e; }
+      let err; const fds = readdirSync("/dev/fd").length;
+      try { sqliteRegistry({ path, fullfsync: false }); } catch (e) { err = e; }
       expect([table, err?.code]).toEqual([table, "old-format"]);
+      expect(readdirSync("/dev/fd").length).toBe(fds);                                                                      // the refused open left no handle (an rmSync would pass either way)
       expect(err.message).toContain(table);
       const after = new Database(path, { readonly: true });
       expect(after.query("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(t => t.name)).toEqual([table]);   // nothing was created

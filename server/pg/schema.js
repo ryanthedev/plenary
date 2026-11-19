@@ -54,15 +54,17 @@ export async function migrate(tx, schema, tables) {
   if (todo.length) await tx.unsafe(todo.map(name => `CREATE TABLE "${s}".${name} (${tables[name]})`).join(";\n"));
 }
 
-/** The column names a table's DDL (`tables` entries: "col defs, constraints") declares: its depth-0 comma parts, minus table constraints. */
+/** The column names a table's DDL (the cluster test `ddlColumns equals the catalog` checks it against Postgres for every table of the Store and the Registry) (`tables` entries: "col defs, constraints") declares: its depth-0 comma parts, minus table constraints. */
 export function ddlColumns(defs) {
   const parts = []; let depth = 0, cur = "";
+  let quoted = false;   // inside "…" (an identifier may hold a comma or a parenthesis)
   for (const ch of defs) {
-    if (ch === "(") depth++; else if (ch === ")") depth--;
-    if (ch === "," && depth === 0) { parts.push(cur); cur = ""; } else cur += ch;
+    if (ch === '"') quoted = !quoted;
+    else if (!quoted) { if (ch === "(") depth++; else if (ch === ")") depth--; }
+    if (ch === "," && depth === 0 && !quoted) { parts.push(cur); cur = ""; } else cur += ch;
   }
   parts.push(cur);
-  return parts.map(p => p.trim()).filter(p => p && !/^(PRIMARY|UNIQUE|CHECK|FOREIGN|CONSTRAINT)\b/i.test(p)).map(p => p.split(/\s+/)[0].replace(/"/g, ""));
+  return parts.map(p => p.trim()).filter(p => p && !/^(PRIMARY|UNIQUE|CHECK|FOREIGN|CONSTRAINT|EXCLUDE|LIKE)\b/i.test(p)).map(p => p.split(/\s+/)[0].replace(/"/g, ""));
 }
 
 /**

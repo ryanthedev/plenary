@@ -84,7 +84,7 @@ export const REGISTRY_METHODS = Object.freeze([
 
 /**
  * The one error class every Registry adapter throws for a refused call; match on `err.code`, never the class.
- * Codes: "last-owner" (setGrant, setScopedGrant, setTeamMember), "no-role", "limit", "in-use" (custom roles), "idem-replay" /
+ * Codes: "last-owner" (setGrant, setScopedGrant, setTeamMember), "no-role", "limit", "in-use" (custom roles), "corrupt" (a stored row breaks an invariant, e.g. a tenant with no kind row), "idem-replay" /
  * "idem-mismatch" (see `idemErr`), "rate-limited" (requestAccess); the Postgres adapter adds "lock-timeout", "statement-timeout",
  * "overloaded", "queue-timeout", "client-timeout" (a timeout REJECTS, never resolves to null).
  */

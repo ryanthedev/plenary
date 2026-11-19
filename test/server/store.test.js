@@ -3,7 +3,7 @@
 import { test, expect, afterAll } from "bun:test";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { rmSync } from "node:fs";
+import { rmSync, readdirSync } from "node:fs";
 import { sqliteStore } from "../../server/store/sqlite.js";
 import { storeContract, entry, code } from "./store-contract.js";
 import { tempDir, cleanup } from "./helpers.js";
@@ -54,8 +54,10 @@ test("a file made before the lease (epoch-only leases table) is an old-format st
   old.run("INSERT INTO leases (tenant, board, epoch) VALUES (?, ?, 5)", [T, B]);
   old.close();
   let err;
+  const fds = readdirSync("/dev/fd").length;
   try { sqliteStore({ path }); } catch (e) { err = e; }
   expect(err?.code).toBe("old-format");
+  expect(readdirSync("/dev/fd").length).toBe(fds);                                                                      // the refused open left no handle (an rmSync would pass either way)
   expect(err.message).toMatch(/Reset the store/);
   const after = new Database(path, { readonly: true });
   expect(after.query("PRAGMA table_info(leases)").all().map(c => c.name)).toEqual(["tenant", "board", "epoch"]);   // never ALTERed

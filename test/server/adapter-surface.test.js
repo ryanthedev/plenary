@@ -36,7 +36,7 @@ const dropSchema = async schema => { const sql = new SQL({ url: E.DATABASE_URL, 
 const STORE_EXTRAS = ["pragmas", "settings", "clusterId"];
 /** Bus extras: `subscriberCount` (both), `isUp` (NATS connection state, tests). */
 const BUS_EXTRAS = ["subscriberCount", "isUp"];
-/** Registry extras (`linkUsesFor` is the optional batch read; `idemSize` a test helper every adapter has): diagnostics and a housekeeping call and the client-side gate's state (`gate()`, read by main.js), adapter-only (the memory adapter is the reference list). */
+/** Registry extras (`linkUsesFor` is the optional batch read; `idemSize` a test helper every adapter has): diagnostics, a housekeeping call and the client-side gate's state (`gate()`, read by main.js): adapter-only, never called by core. */
 const REGISTRY_EXTRAS = ["pragmas", "settings", "readSettings", "idemPrune", "gate", "idemSize", "linkUsesFor"];
 
 test("Store: sqlite has exactly the port's methods", async () => {
@@ -55,7 +55,7 @@ test("Registry: memory and sqlite have exactly the port's methods", async () => 
   surface(r, REGISTRY_METHODS, REGISTRY_EXTRAS);
   await r.close();
 });
-test.skipIf(!E.DATABASE_URL)("Registry: postgres has the exactly the port's methods", async () => {
+test.skipIf(!E.DATABASE_URL)("Registry: postgres has exactly the port's methods", async () => {
   const schema = `pl_surface_${process.pid}_registry`, r = await postgresRegistry({ url: E.DATABASE_URL, schema, max: 2 });
   try { surface(r, REGISTRY_METHODS, REGISTRY_EXTRAS); } finally { await r.close(); await dropSchema(schema); }
 });

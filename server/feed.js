@@ -24,7 +24,7 @@ import { breathe } from "./breather.js";
 const EMPTY = { seq: 0, id: null, by: null, at: null, streams: { board: { elements: [], appState: {} }, notes: { elements: [], appState: {} } }, appSeq: { board: {}, notes: {} }, records: { threads: [] }, noteAuthor: [] };
 
 /**
- * @param {{ tenant: string, board: string, store: object, bus: object, onLive: (e: { from: number, to: number, data: string }) => void,
+ * @param {{ tenant: string, board: string, store: object, bus: object, onLive: (e: { from: number, to: number, at?: number, data: string }) => void,
  *   log?: object, codec?: object, deflate?: (data: string | Uint8Array) => Promise<Uint8Array | null>, pollMs?: number, chunkBytes?: number, pageSize?: number, pageBytes?: number, rebaseEvery?: number, rebaseBytes?: number, zSlack?: number, random?: () => number }} o
  *   deflate: compresses one catch-up text once (PROTOCOL.md § Joining); absent, or answering null for a frame, joiners get it plain.
  *   zSlack: bytes of new entries after which the open last chunk's compressed prefix is made again (default 16 KiB).
@@ -57,6 +57,8 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
   }
 
   /** New entries (parsed, with their text), applied if they continue the feed. Returns how many were applied. */
+  /** False until the first load is done: what a joiner is caught up on is old by nature, not fan-out lag (PROTOCOL.md § Metrics). */
+  let live = false;
   function apply(list) {
     const fresh = [];
     for (const x of list) {
@@ -65,7 +67,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
       if (x.seq !== self.seq + 1) break;      // a gap: the caller repairs from the Store
       self.tail.push(x); self.seq = x.seq; self.tailBytes += x.text.length; fresh.push(x);
     }
-    if (fresh.length) onLive({ from: fresh[0].seq, to: fresh[fresh.length - 1].seq, data: frameOf(fresh) });
+    if (fresh.length) onLive({ from: fresh[0].seq, to: fresh[fresh.length - 1].seq, at: live ? fresh[0].at : undefined, data: frameOf(fresh) });   // at: when the room sequenced the first one (fan-out lag, PROTOCOL.md § Metrics)
     return fresh.length;
   }
   const fromStore = e => {
@@ -178,13 +180,14 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
     const beat = !Array.isArray(m?.items);
     if (beat && Number.isSafeInteger(m?.cp) && m.cp >= 0) self.cpHeard = Math.max(self.cpHeard ?? 0, m.cp);   // every heartbeat and `released` carries `cp`
     await maybeRebase(beat);
+    live = true;   // a feed whose first load failed is live again once a later step succeeds (what that step applied was catch-up, not observed)
   }
 
   const unsub = bus.subscribe(subjects.entries(tenant, board), m => { run(() => onMessage(m)).catch(err => log.error("feed: message failed", { tenant, board, err })); });
   const poll = setInterval(() => {
     if (now() - self.lastHeard < pollMs || running) return;
     self.lastHeard = now();   // the next look is a full pollMs away
-    run(async () => { await repair(); await maybeRebase(true); }).catch(err => log.warn("feed: Store poll failed", { tenant, board, err }));
+    run(async () => { await repair(); await maybeRebase(true); live = true; }).catch(err => log.warn("feed: Store poll failed", { tenant, board, err }));
   }, Math.max(50, Math.floor(pollMs / 2)));
   poll.unref?.();
 
@@ -192,6 +195,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
     self.epoch = Math.max(self.epoch, await store.epoch(tenant, board));
     self.base = await validBase(); self.seq = self.base.seq;
     await repair();
+    live = true;
   });
 
   /** The tail as bounded `entries` frames, built once per (base, tail) and shared: only the open last one is rebuilt. */

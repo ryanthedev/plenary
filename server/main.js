@@ -22,6 +22,7 @@
 //   PLENARY_BLOBS        unset, or `local-disk` (see above); anything else refuses the start. Not with S3_ENDPOINT.
 //   PLENARY_TRASH_SWEEP_MS   how often this node purges boards past their 30 days in Trash (PROTOCOL.md § Trash and restore), integer ms from 1000 to 86400000, default 600000 (10 min). Every node sweeps; a sweep is idempotent and safe beside another node's.
 //   PLENARY_BLOB_QUOTA_BYTES   per-tenant picture storage, default 10 GiB (a positive integer, else the start is refused)
+//   PLENARY_METRICS_TOKEN  ≥ 16 chars of [A-Za-z0-9-._~+/] (+ trailing =); turns on GET /metrics (Bearer token, PROTOCOL.md § Metrics). Unset: 404, nothing recorded. Never logged.
 //   LOG_LEVEL            debug | info | warn | error
 //   PLENARY_MAX_CONNS_PER_USER   open sockets one user may hold (default 64). A load test that shares a few dev
 //                        tokens between thousands of clients must raise it.
@@ -71,6 +72,10 @@ import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "
 import { join } from "node:path";
 import { createLogger } from "./log.js";
 import { createServer } from "./server.js";
+import { prometheusMetrics } from "./metrics/prometheus.js";
+import { noopMetrics } from "./metrics/port.js";
+import { METRICS_TOKEN_MIN, METRICS_TOKEN_RE } from "./metrics-http.js";
+import { instrumentedStore } from "./instrument.js";
 import { sqliteStore } from "./store/sqlite.js";
 import { postgresStore } from "./store/postgres.js";
 import { memoryBus } from "./bus/memory.js";
@@ -345,6 +350,12 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   const redirectUri = env.OIDC_REDIRECT_URI || "http://localhost:8080/auth/callback";
   const origin = env.PUBLIC_URL ? new URL(env.PUBLIC_URL).origin : new URL(redirectUri).origin;
 
+  // /metrics is off unless a token is set; a set but short or blank one is a mistake, so it refuses the start (the value is never in the message).
+  const metricsToken = env.PLENARY_METRICS_TOKEN;
+  if (metricsToken !== undefined && (metricsToken.length < METRICS_TOKEN_MIN || !METRICS_TOKEN_RE.test(metricsToken))) throw new Error(`PLENARY_METRICS_TOKEN must be at least ${METRICS_TOKEN_MIN} characters of letters, digits and -._~+/ (an RFC 6750 token, no spaces; unset it to keep /metrics off)`);
+  const prom = metricsToken !== undefined ? prometheusMetrics() : null;
+  const metrics = prom ?? noopMetrics;
+
   // Blob settings are checked before anything opens, so a bad one refuses the start with nothing to close.
   const blobs = openBlobs(env, dataDir, cluster, log);
   const quotaRaw = env.PLENARY_BLOB_QUOTA_BYTES;
@@ -353,11 +364,12 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   // itself never signs two kinds of thing.
   const blobKey = new Uint8Array(await crypto.subtle.sign("HMAC", await crypto.subtle.importKey("raw", new TextEncoder().encode(cookieKey), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]), new TextEncoder().encode("plenary/blob-url/v1")));
   log.info("node", { node, roles, cluster, leaseTtlMs });
-  const { store, bus, rawRegistry, clusterId } = cluster ? await openCluster(env, node, log, adapters, requestDeadlineMs) : {
+  const { store: rawStore, bus, rawRegistry, clusterId } = cluster ? await openCluster(env, node, log, adapters, requestDeadlineMs) : {
     store: sqliteStore({ path: join(dataDir, "plenary.db"), onSkip: skipped => log.error("checkpoint unreadable: parts missing; stepped back", skipped) }),
     bus: memoryBus({ onError: (err, subject) => log.error("bus subscriber failed", { subject, err }) }),
     rawRegistry: sqliteRegistry({ path: join(dataDir, "registry.db"), busyTimeoutMs: SQLITE_BUSY_MS }),
   };
+  const store = prom ? instrumentedStore(rawStore, metrics) : rawStore;   // store latency (PROTOCOL.md § Metrics)
   const registry = announcingRegistry(rawRegistry, bus, log);
   const dev = devAuth(tokens ? { enabled: true, tokens } : undefined);
   const sessions = await makeSessions({ key: sessionKey });
@@ -488,7 +500,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   const access = accessService({ registry, tenancy, announce: spaces.announceChange, backlog: spaces.backlog, settled: spaces.settled, log: log.child({ component: "access" }) });
   const http = httpRoutes({ registry, sessions, oidc, tenancy, home, spaces, access, now: Date.now, config, log: log.child({ component: "auth" }), ...(dev.enabled ? { dev } : {}) });
   const server = createServer({ auth, registry, store, bus, blobs, blobKey, ...(env.PUBLIC_URL ? { publicUrl: origin } : {}), ...(quotaRaw ? { quotaBytes: Number(quotaRaw) } : {}), log, limits, http, deflate: zlibDeflate(), onWelcomed: recentRecorder({ registry, log: log.child({ component: "home" }) }), port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
-    roles, node, host: { hostname: node, leaseTtlMs } });
+    roles, node, host: { hostname: node, leaseTtlMs }, metrics, ...(prom ? { metricsEndpoint: { token: metricsToken, render: prom.render } } : {}) });
   // The purge of Trash: every node sweeps on a timer (the claim is a conditional write and every delete a no-op the second time, so two nodes are safe). The timer is the only wall-clock wait; tests drive `sweep()` on an injected clock.
   const sweeper = trashSweeper({ registry: rawRegistry, store, clock: { now: Date.now }, log: log.child({ component: "trash" }) });
   const sweepTimer = setInterval(() => { sweeper.sweep().then(r => { if (r.boards || r.spaces || r.failed) log.info("trash sweep", r); }); }, Number(sweepRaw ?? 600_000));
@@ -496,7 +508,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   return { server, store, bus, registry, log, devBoard, sweeper, oidc, node, roles, cluster, clusterId, leaseTtlMs,
     async stop() { clearInterval(sweepTimer); await server.stop(); await Promise.race([access.settled().then(() => spaces.settled()), new Promise(r => setTimeout(r, 2000).unref?.())]);   // let grants announcements finish (bounded)
       spaces.close();                                   // nothing more starts against the buses and stores closed below
-      await bus.close(); await store.close(); await rawRegistry.close(); } };
+      await bus.close(); await rawStore.close(); await rawRegistry.close(); } };
 }
 
 /**

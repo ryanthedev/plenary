@@ -17,7 +17,7 @@ curl -s http://127.0.0.1:8080/health                    # 200 + JSON
 
 ## What runs today
 
-- **Endpoints:** `GET /health`, the WebSocket at `/ws`, `POST /boards` (and the board invite and link routes), and
+- **Endpoints:** `GET /health`, `GET /metrics` (404 unless `PLENARY_METRICS_TOKEN` is set), the WebSocket at `/ws`, `POST /boards` (and the board invite and link routes), and
   Google sign-in at `/auth/*` (`server/auth/http.js`, mounted by `server/main.js`; the `/auth` routes answer 503
   unless both `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are set). The server serves the canvas page
   at `/` (the `web/` folder), over the same port.
@@ -36,6 +36,7 @@ These are the variables `server/main.js` reads; nothing else is read.
 | `PLENARY_DATA_DIR` | `/data` | `plenary.db` (SQLite) and `blobs/` go here. Compose mounts the `plenary-data` volume on it. |
 | `PLENARY_DEV_TOKENS` | unset | JSON: `{ "<token>": { "name": "ann", "role": "editor", "email"?, "domain"? } }`. Unset, empty or `{}` = off. Invalid JSON is logged and treated as off. |
 | `PLENARY_REQUEST_DEADLINE_MS` | `8000` | Every HTTP route answers within this many ms or with 503 `unavailable` (PROTOCOL.md "HTTP request deadline"). A positive integer. Start-up refuses when the Registry's statement/lock limits (5000 ms in a cluster) or Google's timeout (3500 ms) are not below it, so lower it only with those in mind. |
+| `PLENARY_METRICS_TOKEN` | unset | At least 16 bytes. Unset = `/metrics` is a 404 and nothing is recorded. Set = `GET /metrics` (every role) answers Prometheus text to `Authorization: Bearer <token>` only, 401 otherwise. Generate with `openssl rand -hex 32`; scrape over a private network. Metric names: PROTOCOL.md "Metrics". Not set by either compose file. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Logs are structured, to stdout. |
 | `COOKIE_KEY` | unset | At least 32 bytes; signs sign-in cookies and sessions. Unset on a single node = a random key per start (every restart signs everyone out). **Required in cluster mode** (`DATABASE_URL` or `NATS_URL` set): the server refuses to start without it, and every node must have the same value. |
 | `SESSION_KEY` | unset | At least 32 bytes; signs sessions only, if you want it separate from `COOKIE_KEY` (default: `COOKIE_KEY`). Not set by either compose file. |

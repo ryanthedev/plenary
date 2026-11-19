@@ -20,7 +20,7 @@ const url = process.env.DATABASE_URL;
 // (a lower bound on a lock wait is fine: load only makes the wait longer).
 setDefaultTimeout(30_000);
 // Deadline for a wait on observable state (a lock wait showing up, a gate state): failure-only, like the ceiling above.
-const HUNG_MS = 15_000;
+const HUNG_MS = 10_000;
 
 describe.skipIf(!url)("postgres registry", () => {
   /** @type {SQL} */ let sql;
@@ -308,7 +308,7 @@ describe.skipIf(!url)("postgres registry", () => {
       expect(await r.teamMembers(team.id)).toEqual([]);
       expect((await r.scopedGrants(S2)).map(g => g.subject.id).sort()).toEqual(["ann", team.id].sort());
     } finally { await other.unsafe("ROLLBACK").catch(() => {}); other.release(); await r.close(); await r2.close(); await drop(schema); }
-  }, 30_000);
+  }, 45_000);   // above 2 x HUNG_MS of waits
 
   test("two Teams losing their last members at once, one of them granted onto the other's container meanwhile: one removal is refused, every round", async () => {
     const schema = schemaName();
@@ -349,17 +349,20 @@ describe.skipIf(!url)("postgres registry", () => {
         expect([await counted(S1), await counted(S2)].every(n => n >= 1)).toBe(true);
       }
     } finally { await other.unsafe("ROLLBACK").catch(() => {}); other.release(); await a.close(); await b.close(); await drop(schema); }
-  }, 30_000);
+  }, 45_000);   // above 2 x HUNG_MS of waits
 
   test("invariant under a stalled interleaving: after removal A, a grant of A's Team onto S2 and removal B (each queued wherever it waits), every Group and Space keeps a counted owner", async () => {
     const schema = schemaName();
     const a = await postgresRegistry({ url, schema, max: 4 }), b = await postgresRegistry({ url, schema, max: 4 });
+    const ROUND_MS = 40_000, testEnd = Date.now() + ROUND_MS;   // one deadline for all 10 rounds' waits; the test ceiling (60 s) exceeds it
     // Never assumes WHERE anything waits: any backend of this schema blocked on a lock (a row, or the tenant's owners lock) counts.
     const blockedCount = async () => (await client().unsafe(`SELECT count(*)::int AS c FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND (query LIKE $1 OR query LIKE '%pg_advisory_xact_lock%')`, [`%${schema}%`]))[0].c;
     const blocked = async n => {
       let c = 0;
-      for (const end = Date.now() + HUNG_MS; (c = await blockedCount()) < n; await Bun.sleep(10))
-        if (Date.now() > end) throw new Error(`timed out after ${HUNG_MS} ms: ${c}/${n} backends lock-waiting in this schema`);
+      while ((c = await blockedCount()) < n) {
+        if (Date.now() > testEnd) throw new Error(`timed out (whole-test deadline of ${ROUND_MS} ms): ${c}/${n} backends lock-waiting in this schema`);
+        await Bun.sleep(10);
+      }
     };
     const hold = async space => { const c = await client().reserve(); await c.unsafe("BEGIN"); await c.unsafe(`SELECT id FROM "${schema}".reg_spaces WHERE id = $1 FOR UPDATE`, [space]); return c; };
     const verdict = x => x.then(() => "ok", e => e.code ?? e.message);
@@ -382,8 +385,10 @@ describe.skipIf(!url)("postgres registry", () => {
         await blocked(1);
         let gDone = false;
         const G = verdict(b.setScopedGrant({ scope: S2, subject: { type: "team", id: t1.id }, role: "owner" })).then(v => { gDone = true; return v; });
-        for (const end = Date.now() + HUNG_MS; !gDone && (await blockedCount()) < 2; await Bun.sleep(10))   // finished (no tenant lock) or queued behind A's, each a state, not a delay
-          if (Date.now() > end) throw new Error(`timed out after ${HUNG_MS} ms (round ${round}): the grant neither finished nor queued behind the team removal`);
+        while (!gDone && (await blockedCount()) < 2) {   // finished (no tenant lock) or queued behind A's, each a state, not a delay
+          if (Date.now() > testEnd) throw new Error(`timed out (whole-test deadline of ${ROUND_MS} ms, round ${round}): the grant neither finished nor queued behind the team removal`);
+          await Bun.sleep(10);
+        }
         const x2 = await hold(s2.id).catch(() => null);
         const B = verdict(b.setTeamMember(t2.id, "b", false));
         await blocked(2);
@@ -887,5 +892,5 @@ describe.skipIf(!url)("postgres registry", () => {
       expect(await r.grant(b.id, "late")).toBe(null);                   // never sent, so never committed
       await until(() => r.gate().running === 0 && r.gate().waiting === 0, "the gate to drain");   // no slot leaked
     } finally { holder.release(); await r.close(); await drop(schema); }
-  });
+  }, 45_000);   // above its 2 x HUNG_MS of waits
 });

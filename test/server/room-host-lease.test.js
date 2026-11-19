@@ -1,7 +1,7 @@
 // The room host on the Store lease (p4-host): one path for a single node and a cluster. acquire/renew/release, the
 // holder-only inbox, the takeover, the dead-holder window, the host deadline and the clean release.
 // Postgres cases run when DATABASE_URL is set; the rest use SQLite files.
-import { test, expect, afterAll, describe } from "bun:test";
+import { test, expect, afterAll, describe, jest } from "bun:test";
 import { join } from "node:path";
 import { SQL } from "bun";
 import { roomHost, newHolder } from "../../server/room-host.js";
@@ -361,6 +361,9 @@ test("HIGH-1: a holder woken from a stall past its deadline serves nothing that 
     frozen = true; sa.renew = "hang"; off += 40_000;
     await Bh.open(T, B);                                                     // the lease lapsed: B takes the board
     expect((await Bh.peek(T, B))?.epoch).toBe(2);
+    // The first message A will see on waking is an op from a connection it never welcomed: only the inbox deadline check (onInbox) keeps A from
+    // answering it (the Room would reply unavailable + 1013 to it); the reply-time check and the welcomed guard come too late for it.
+    g.op("z9", "z", 1);
     g.hello("c2", "a"); expect(await g.welcome("c2")).toMatchObject({ seq: 3, room: { epoch: 2 } });
     g.hello("x1", "x"); await g.welcome("x1");
     g.op("x1", "x", 1); await g.ack("x1", "x:1");
@@ -369,11 +372,12 @@ test("HIGH-1: a holder woken from a stall past its deadline serves nothing that 
     // A wakes: what queued is delivered before any of its timers run.
     frozen = false;
     for (const f of queued.splice(0)) f();
-    // Positive control, then drain: A does answer its own welcomed connection (1013), and only then is "nothing else" asserted.
+    // Positive control, then drain: A does answer its own welcomed connection (1013), and only then is "nothing else" asserted. (A.idle is a no-op
+    // once A's slot is gone, so the c1 reply is the real barrier: a stray reply would be sent before or with it, in the same delivery.)
     await until(() => fromA.slice(before).some(m => m.conn === "c1" && m.close === 1013), "A telling its own c1 1013 once it woke");
     await A.idle(T, B); await Bh.idle(T, B); await bus.flush();
     const late = fromA.slice(before);
-    expect(late.filter(m => m.conn === "c2" || m.conn === "x1")).toEqual([]);   // no welcome, ack or 1013 from the dead epoch
+    expect(late.filter(m => m.conn === "c2" || m.conn === "x1" || m.conn === "z9")).toEqual([]);   // no welcome, ack or 1013 from the dead epoch
     expect(late.every(m => m.conn === "c1" && m.close === 1013)).toBe(true);    // only its own welcomed connection is told
     expect(await A.peek(T, B)).toBe(null);
     expect((await Bh.peek(T, B))?.conns).toBe(2);                                // B still serves c2 and x1
@@ -382,6 +386,25 @@ test("HIGH-1: a holder woken from a stall past its deadline serves nothing that 
     expect((await raw.read(T, B, 1, 100)).map(e => e.id)).toEqual(["a:1", "a:2", "a:3", "x:1", "a:4"]);
   } finally { await A.close(); await Bh.close(); await raw.close(); await bus.close(); }
 }, 15000);
+
+test("HIGH-1 guard: a hello the host deadline catches between its inbox check and its welcome leaves a dead slot that tells only its welcomed connections 1013", async () => {
+  // The lease clock is read once by the inbox check and once before the welcome is sent: it is made to jump past the deadline between those two reads,
+  // so c2 is a connection the slot holds but never welcomed. fail() must tell c1 (welcomed) and leave c2 to the new holder.
+  const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
+  let calls = 0, tripAt = Infinity;
+  const A = roomHost({ store: raw, bus, holder: "h-a", leaseTtlMs: 30_000, monotonic: () => { calls++; return performance.now() + (calls >= tripAt ? 60_000 : 0); } });
+  try {
+    await A.open(T, B);
+    const g = fakeGateway(bus);
+    g.hello("c1", "a"); await g.welcome("c1");
+    tripAt = calls + 2;                                                      // the next hello: its inbox check reads clean, its welcome reads past the deadline
+    g.hello("c2", "b");
+    await until(() => g.of("c1").some(x => x.close === 1013), "the dead slot telling its welcomed c1 1013");
+    await bus.flush();
+    expect(g.of("c2")).toEqual([]);                                          // not welcomed, not told: the new holder (or a watcher) answers it
+    expect(await A.peek(T, B)).toBe(null);
+  } finally { await A.close(); await raw.close(); await bus.close(); }
+}, 10000);
 
 test("MEDIUM-1 (repro C): the holder dies right after a renew; a watcher takes over within ttl + ttl/3 + 500 ms, not 2 ttl", async () => {
   const { V, raw, host, bus } = vworld();
@@ -527,12 +550,19 @@ test("L4: close() settles an append in flight before it releases the lease", asy
     let open; gate = new Promise(r => { open = r; });
     g.op("c1", "a", 1); await bus.flush();
     await until(() => inAppend, "the op's append to be in flight");
-    const closing = A.close();
-    // close() has stopped listening (unsub, then dead = true, then it waits on the writes): a state, not a delay. Everything it would do next
-    // without the wait runs on microtasks, so one macrotask turn is enough for a close() that skipped the wait to have released by now.
-    await until(() => bus.subscriberCount(subjects.inbox(T, B)) === 0, "close() to reach its wait on the append");
-    await sleep(0);
-    expect(order).toEqual([]);                                               // still waiting on the append
+    // close() is suspended at its wait on the append once it has stopped listening (unsub, then dead = true, then it waits on the writes): a state,
+    // not a delay. Fake timers make "no timer cuts the wait short" checkable: a close() that skipped the wait, or gave up after any timeout
+    // (30 ms, a minute), has released by the time a day of timers has run. Bun.sleep(0) hangs under fake timers, so the polls use microtasks.
+    let closing;
+    jest.useFakeTimers();
+    try {
+      closing = A.close();
+      for (let i = 0; i < 10_000 && bus.subscriberCount(subjects.inbox(T, B)) !== 0; i++) await null;
+      expect(bus.subscriberCount(subjects.inbox(T, B))).toBe(0);               // close() reached its wait
+      jest.advanceTimersByTime(24 * 3_600_000);
+      for (let i = 0; i < 100; i++) await null;
+      expect(order).toEqual([]);                                               // still waiting on the append
+    } finally { jest.useRealTimers(); }
     open();
     await until(() => order.includes("release"), "the release after the append settled");
     await closing;

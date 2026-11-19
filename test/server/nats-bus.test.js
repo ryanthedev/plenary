@@ -113,18 +113,23 @@ nt("nats: a 2 MB message (encoded) travels; one byte more is refused before the 
 });
 
 nt("nats: a refused publish nobody awaits goes to onError, not to an unhandled rejection", async () => {
-  const errors = [], bus = await make({ onError: e => errors.push(e.code) });
-  let unhandled = 0; const onUnhandled = () => { unhandled++; };
-  process.on("unhandledRejection", onUnhandled);
-  try {
-    bus.publish(subjects.inbox(tenant, "b-ff"), { data: "x".repeat(MAX_BUS_BYTES + 1) });   // not awaited
-    bus.publish("plen.*.b", 1);                                                            // not awaited
-    bus.publish(subjects.inbox(tenant, "b-ff"), { deep: { b: new Uint8Array(1) } });       // not awaited
-    await until(() => errors.length === 3, "the three refusals reaching onError");
-    await sleep(20);   // a few macrotask turns: bun reports a rejection nobody handled on a later turn, to the listener installed above (not at once)
-  } finally { process.off("unhandledRejection", onUnhandled); }
-  expect(errors).toEqual(["too-large", "bad-id", "bad-entry"]);
-  expect(unhandled).toBe(0);
+  // Under `bun test` an unhandled rejection fails the running test at once and never reaches a process listener, so the count is taken in a child
+  // bun process that has its own listener and prints what it saw.
+  const script = `
+    import { natsBus, subjects, MAX_BUS_BYTES } from ${JSON.stringify(`${import.meta.dir}/../../server/bus/nats.js`)};
+    let unhandled = 0; process.on("unhandledRejection", () => { unhandled++; });
+    const errors = [];
+    const bus = await natsBus({ url: process.env.NATS_URL, cluster: null, onError: e => errors.push(e.code) });
+    bus.publish(subjects.inbox("t-unh", "b-ff"), { data: "x".repeat(MAX_BUS_BYTES + 1) });   // not awaited
+    bus.publish("plen.*.b", 1);                                                              // not awaited
+    bus.publish(subjects.inbox("t-unh", "b-ff"), { deep: { b: new Uint8Array(1) } });        // not awaited
+    await new Promise(r => setTimeout(r, 0));   // one macrotask: an unhandled rejection is reported by now
+    await bus.close();
+    console.log(JSON.stringify({ errors, unhandled }));`;
+  const child = spawnTracked([process.execPath, "--no-env-file", "-e", script], { stdout: "pipe", stderr: "pipe", env: { ...process.env, NATS_URL: URL } });
+  const [out, err] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+  let seen; try { seen = JSON.parse(out.trim().split("\n").at(-1)); } catch { seen = { unparsable: out, stderr: err }; }
+  expect(seen).toEqual({ errors: ["too-large", "bad-id", "bad-entry"], unhandled: 0 });
 });
 
 nt("nats: wildcards and malformed subjects are refused on publish and subscribe", async () => {
@@ -233,8 +238,9 @@ test("nats wire: a foreign header can't name __proto__ (or other prototype keys)
 ot("nats stall: a frozen server (SIGSTOP) caps what is queued, is declared stale by pings, and what was queued is dropped, not replayed", async () => {
   const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
-  const dir = mkdtempSync(`${tmpdir()}/plen-nats-`), port = freePort(), conf = `${dir}/n.conf`;
-  writeFileSync(conf, `listen: "127.0.0.1:${port}"\nmax_payload: 2MB\n`);
+  const dir = mkdtempSync(`${tmpdir()}/plen-nats-`), port = freePort(), mport = freePort(), conf = `${dir}/n.conf`;
+  writeFileSync(conf, `listen: "127.0.0.1:${port}"\nhttp: "127.0.0.1:${mport}"\nmax_payload: 2MB\n`);
+  const connz = async q => (await fetch(`http://127.0.0.1:${mport}/connz?${q}`)).json();   // the server's own monitor: what it received per connection
   const srv = spawnTracked([natsBin, "--config", conf], { stdout: "ignore", stderr: "ignore" });
   let frozen = false;
   try {
@@ -249,6 +255,9 @@ ot("nats stall: a frozen server (SIGSTOP) caps what is queued, is declared stale
     await bus.publish(s, { k: "before" });
     await until(() => got.includes("before"), "before");
 
+    // The publisher is the one connection with no subscription (the listener holds the only one); the server counts what it read from it.
+    const pub = (await connz("subs=1")).connections.find(c => !c.num_subscriptions);
+    expect(pub?.cid).toBeGreaterThan(0);
     process.kill(srv.pid, "SIGSTOP"); frozen = true;
     const big = "x".repeat(1024 * 1024);
     let accepted = 0, refused = 0;
@@ -272,7 +281,11 @@ ot("nats stall: a frozen server (SIGSTOP) caps what is queued, is declared stale
     await listener.flush();
     await bus.publish(s, { k: "after" });
     await until(() => got.includes("after"), "after");
-    await sleep(200);
+    // Barrier: the server read the old connection's buffered bytes in order and then saw it close; once it lists that connection as closed, every
+    // message it took from it was already routed ahead of anything published after. A sentinel on the new connection then proves they all arrived.
+    const closed = await until(async () => (await connz(`state=closed&cid=${pub.cid}`)).connections[0], "the server to close the old publisher connection", 10000);
+    await bus.publish(s, { k: "sentinel" });
+    await until(() => got.includes("sentinel"), "the sentinel");
     const late = got.filter(k => k.startsWith("frozen-"));
     // Only what had already left this process can still arrive: the bytes in the kernel's TCP buffers (this socket's send
     // buffer and the frozen server's receive buffer), delivered in order once it resumes. Everything still queued in
@@ -283,6 +296,7 @@ ot("nats stall: a frozen server (SIGSTOP) caps what is queued, is declared stale
     expect(late).toEqual(late.map((_, i) => `frozen-${i}`));
     expect(late.length).toBeLessThanOrEqual(10);
     expect(late.length).toBeLessThan(accepted);
+    expect(late.length).toBe(closed.in_msgs - 1);      // exactly what the server took from the old connection ("before" was the first), none lost on the way, none replayed
     expect(got).not.toContain("during");
     await bus.close(); await listener.close();
   } finally {

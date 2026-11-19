@@ -98,7 +98,8 @@ test("DW-iso mixed version: a node without the id (unscoped) and one with it exc
   // Barrier: each listener's own sentinel, published from the other side's wire, queues behind everything above (one FIFO wire), so a leaked
   // message would sit ahead of it in the list. The sentinel is the only thing a listener may then hold besides its own side's messages.
   for (const n of names) { await wire.publish(n, "sentinel-old"); await wire.publish(`${ID}.${n}`, "sentinel-new"); }
-  await until(() => got.scoped.length === 2 * names.length && got.old.length === 2 * names.length, "both sentinels on every subject");
+  const sentinels = (list, v) => list.filter(m => m === v).length;   // wait for the sentinels themselves, so a stray message shows as a diff below, not a timeout
+  await until(() => sentinels(got.scoped, "sentinel-new") === names.length && sentinels(got.old, "sentinel-old") === names.length, "both sentinels on every subject");
   expect(got.scoped).toEqual([...names.map(() => "from-new"), ...names.map(() => "sentinel-new")]);
   expect(got.old).toEqual([...names.map(() => "from-old"), ...names.map(() => "sentinel-old")]);
 });

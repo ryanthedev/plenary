@@ -46,7 +46,7 @@ async function setup({ n, feedOpts = {}, entries = i => entry(i), before = async
   const entries_ = async (from, to) => {   // append entries from..to and publish them as the room would
     const list = Array.from({ length: to - from + 1 }, (_, k) => entries(from + k));
     await raw.append(T, B, list, from - 1, epoch);
-    await bus.publish(subjects.entries(T, B), { from, to, items: list.map(e => JSON.stringify(e)) }); await settle();
+    await bus.publish(subjects.entries(T, B), { epoch, from, to, items: list.map(e => JSON.stringify(e)) }); await settle();
   };
   return { feed, io, beat, entries: entries_, checkpoint, failNext: () => { io.fail++; }, close: async () => { feed.close(); await raw.close(); await bus.close(); } };
 }

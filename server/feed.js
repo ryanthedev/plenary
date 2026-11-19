@@ -29,15 +29,17 @@ const EMPTY = { seq: 0, id: null, by: null, at: null, streams: { board: { elemen
  *   deflate: compresses one catch-up text once (PROTOCOL.md § Joining); absent, or answering null for a frame, joiners get it plain.
  *   zSlack: bytes of new entries after which the open last chunk's compressed prefix is made again (default 16 KiB).
  *   random: the backoff's jitter source, [0, 1) (tests pass a fixed one).
+ *   now, timers: the clock and the `setInterval`/`clearInterval` of the silence poll (tests pass a virtual clock).
  *   onLive: called for every run of new resolved entries, in seq order, with the encoded `entries` frame.
  */
 export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger, codec = jsonCodec, deflate = null, pollMs = 5_000, chunkBytes = 1024 * 1024,
-  pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rebaseEvery = 1_000, rebaseBytes = 4 * 1024 * 1024, zSlack = 16 * 1024, random = Math.random }) {
+  pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rebaseEvery = 1_000, rebaseBytes = 4 * 1024 * 1024, zSlack = 16 * 1024, random = Math.random, now = Date.now, timers = globalThis }) {
+  const { setInterval, clearInterval } = timers;
   const key = `${tenant}/${board}`;
   const self = {
     tenant, board, seq: 0, epoch: 0, ready: /** @type {Promise<void> | null} */ (null), close: /** @type {() => void} */ (() => {}), closed: false, gapAt: 0,
     base: EMPTY, tail: [],   // tail: [{ seq, id, by, at, text }], seq = base.seq + 1 …
-    snap: null, zTails: new Map(), chunks: [], chunksLen: 0, lastHeard: Date.now(), nextRebase: rebaseEvery, tailBytes: 0, nextRebaseBytes: rebaseBytes,
+    snap: null, zTails: new Map(), chunks: [], chunksLen: 0, lastHeard: now(), nextRebase: rebaseEvery, tailBytes: 0, nextRebaseBytes: rebaseBytes,
     cpHeard: null, lookedAt: 0, retries: 0, looks: 0, failures: 0, skip: 0, failedFor: 0,   // the checkpoint look (rebase, below)
   };
   const frameOf = list => (codec === jsonCodec ? `{"t":"entries","entries":[${list.map(x => x.text).join(",")}]}` : codec.encode({ t: "entries", entries: list.map(x => JSON.parse(x.text)) }));
@@ -161,7 +163,8 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
   function again() { self.nextRebase = self.tail.length + rebaseEvery; self.nextRebaseBytes = self.tailBytes + rebaseBytes; }
 
   async function onMessage(m) {
-    self.lastHeard = Date.now();
+    // Traffic from a lower epoch (a dead incarnation's, late on the bus) is not "the room is alive": the silence poll must still run.
+    if (Number.isSafeInteger(m?.epoch) && m.epoch >= self.epoch) self.lastHeard = now();
     if (Number.isSafeInteger(m?.epoch) && m.epoch > self.epoch) self.epoch = m.epoch;
     if (Array.isArray(m?.items) && Number.isSafeInteger(m.from)) {
       if (m.to <= self.seq) return;
@@ -176,7 +179,8 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
 
   const unsub = bus.subscribe(subjects.entries(tenant, board), m => { run(() => onMessage(m)).catch(err => log.error("feed: message failed", { tenant, board, err })); });
   const poll = setInterval(() => {
-    if (Date.now() - self.lastHeard < pollMs || running) return;
+    if (now() - self.lastHeard < pollMs || running) return;
+    self.lastHeard = now();   // the next look is a full pollMs away
     run(async () => { await repair(); await maybeRebase(true); }).catch(err => log.warn("feed: Store poll failed", { tenant, board, err }));
   }, Math.max(50, Math.floor(pollMs / 2)));
   poll.unref?.();

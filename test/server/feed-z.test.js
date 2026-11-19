@@ -156,3 +156,61 @@ test("F1: a chunk that closes after its prefix was compressed still goes as pref
   expect(seqs(feed.catchUp(0, true))).toEqual(Array.from({ length: 60 }, (_, k) => k + 1));
   feed.close(); await raw.close(); await bus.close();
 });
+
+// Re-review of F1: a newer attempt in flight must never hide the settled prefix a waiting join counted on (a join A that
+// awaited a settled prefix, then B replaced it with an unsettled one, used to send the whole open chunk plain).
+async function held({ n }) {
+  const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
+  const { epoch } = await raw.acquire(T, B, "h-zh", 60_000);
+  await raw.append(T, B, Array.from({ length: n }, (_, k) => entry(k + 1)), 0, epoch);
+  const real = zlibDeflate(), holds = []; let hold = () => null;
+  const feed = boardFeed({ tenant: T, board: B, store: raw, bus, onLive() {}, chunkBytes: 32 * 1024, zSlack: 2048,
+    deflate: async d => { const h = hold(d); if (h) await h; return real(d); } });
+  await feed.ready;
+  let seq = n;
+  const add = async k => {
+    const items = Array.from({ length: k }, (_, i) => entry(seq + 1 + i)), from = seq + 1; seq += k;
+    await raw.append(T, B, items, from - 1, epoch);
+    await bus.publish(subjects.entries(T, B), { from, to: seq, items: items.map(x => JSON.stringify(x)) });
+    await bus.flush(); await feed.atomically(() => {});
+  };
+  const gate = pred => { let open; const g = new Promise(r => { open = r; }); hold = d => (pred(d) ? g : null); holds.push(open); return open; };
+  return { feed, add, gate, free: () => { hold = () => null; for (const o of holds) o(); }, seq: () => seq,
+    close: async () => { feed.close(); await raw.close(); await bus.close(); } };
+}
+const upTo = (frames, n) => expect(seqs(frames)).toEqual(Array.from({ length: n }, (_, k) => k + 1));
+
+test("F1 re-review, probe 1: A's settled open prefix survives B's newer, unsettled one; A still sends compressed", async () => {
+  const s = await held({ n: 50 });
+  await s.feed.prepare(0);                                                  // a settled prefix of 1-50
+  await s.add(40);                                                          // chunk 1 closes; a new one opens
+  const closedOpen = s.gate(d => d.includes('"seq":1,'));                   // only the closed chunk's deflate is held
+  const a = s.feed.prepare(0);                                              // A: closed chunk (held), open chunk's prefix settles
+  await new Promise(r => setTimeout(r, 50));
+  await s.add(10);                                                          // over zSlack of new entries
+  s.gate(() => true);                                                       // B: every new deflate held
+  void s.feed.prepare(0);
+  closedOpen(); await a;                                                    // A is released
+  const frames = s.feed.catchUp(0, true), plain = s.feed.catchUp(0);
+  upTo(frames, s.seq());
+  expect(frames.slice(0, -1).every(f => f.z)).toBe(true);                   // every big frame compressed
+  expect(frames.at(-1).z).toBeUndefined();                                  // only the small plain cut is not
+  expect(frames.at(-1).bytes).toBeLessThan(plain.at(-1).bytes / 2);        // far less than the whole open chunk
+  s.free(); await s.close();
+});
+
+test("F1 re-review, probe 2: a settled prefix of X survives X closing and B's deflates being held: prefix + small cut, not X whole", async () => {
+  const s = await held({ n: 50 });
+  await s.feed.prepare(0);
+  const plainX = s.feed.catchUp(0)[0].bytes;                                // X while it is still the whole open chunk
+  await s.add(40);                                                          // X closes at ~70, Y opens
+  s.gate(() => true);                                                       // B's X-whole and Y-prefix deflates are held
+  void s.feed.prepare(0);
+  await new Promise(r => setTimeout(r, 50));
+  const frames = s.feed.catchUp(0, true);                                   // A sends now
+  upTo(frames, s.seq());
+  expect(frames[0].z).toBe(true);                                           // X's settled prefix
+  expect(frames.slice(1).filter(f => !f.z).reduce((n, f) => n + f.bytes, 0)).toBeLessThanOrEqual(plainX);   // nothing but the new entries is plain
+  expect(frames[1].z).toBeUndefined(); expect(frames[1].bytes).toBeLessThan(s.feed.catchUp(0)[0].bytes / 2);   // the rest of X: a small plain cut, not X whole
+  s.free(); await s.close();
+});

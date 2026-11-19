@@ -324,15 +324,17 @@ after it** (a client already past the checkpoint gets entries only). Two things 
 
 1. **The tail is short.** The room folds a checkpoint by bytes as well as entries (§ Recovery, "When"), and a gateway
    re-bases its cached tail on it as soon as the heartbeat names it (§ Bus, `cp`). So a join is the snapshot, plus a
-   tail of at most the larger of 64 KiB and about a third of the snapshot (the fold waits for a quarter of the *current* state, which includes the tail; observed 31%), plus a few more entries until the next heartbeat.
+   tail of at most the larger of 64 KiB and about a third of the snapshot (the fold waits for a quarter of the *current* state, which includes the tail; test/server/join-size.test.js checks the bound), plus a few more entries until the next heartbeat.
    `entries` frames hold at most 1 MiB each, so a long tail is several frames.
 2. **Compressed catch-up (optional, per connection).** A client that can inflate zlib connects to `/ws?z=deflate`.
    The gateway then sends each **shared** catch-up text (the snapshot, and every `entries` frame holding at least 4 KiB
    that is not a client-specific cut) as one **binary** WebSocket frame holding a **zlib (RFC 1950) stream** of exactly
    the bytes the text frame would have had: the client inflates it, reads the result as UTF-8 JSON, and handles it as it
    would that text frame. Everything else (`welcome`, `here`, live `entries`, `ack`, presence, a small or incompressible
-   text, a client's own cut of a chunk, a text whose compressed form is not ready when the join is sent, which happens
-   only when a checkpoint re-bases the feed during the join's own deflate) stays a text frame. The gateway compresses a
+   text, a client's own cut of a chunk, a text with no settled compressed form when the join is sent) stays a text frame.
+   That is: a text the compressor declined, failed on, or found too small; and a snapshot or chunk whose compression had
+   not settled because a checkpoint re-based the feed during the join's own wait (the join then sends the new base's texts
+   plain, once, until a join compresses them). The gateway compresses a
    text **once** and every joiner of that checkpoint shares the result, on a thread-pool thread, never the event loop.
    **Frames stay in order:** a client delivers a text frame that arrives behind a binary one only after the binary one
    is inflated and handled.
@@ -344,7 +346,9 @@ after it** (a client already past the checkpoint gets entries only). Two things 
    cut; no retry and no stale text. The prefix is made again only after 16 KiB (`zSlack`) of newer entries, so a busy
    board costs one deflate per 16 KiB of ops (never one per entry or per join), and a chunk that closes meanwhile is
    sent as its prefix plus the plain rest until the next join compresses it whole. The plain cut is therefore at most
-   about 16 KiB of entries plus what landed during one deflate.
+   `zSlack` plus the entries that landed while the join waited (its snapshot deflate and the feed's queue); a chunk that
+   closed meanwhile with no settled prefix sends its rest plain, up to `chunkBytes`. The newest *settled* prefix of each
+   chunk is kept (per chunk start), so a newer deflate still in flight never hides it from a join that waited for it.
 
    - **Negotiation is the query, nothing else.** `z=deflate` is a capability, not a credential (the token still goes
      only in `hello`). No `z`, or any other value, means every frame is text: Herdr's mods (QuickJS has no zlib), drawh
@@ -499,7 +503,7 @@ older version of a deleted element would bring it back on that client only.
   snapshot plus what the tail changed, so for an insert-only board the tail reaches a third of the previous snapshot,
   `tail >= (snapshot + tail) / 4`). The last bound is
   what a rewrite costs: a checkpoint is about the size of the state, so a fold per quarter-state of log writes at
-  most about **4×** the log's bytes in checkpoints (measured 1.6× to 2.7× on boards built by many ops, M2 join test),
+  most about **4×** the log's bytes in checkpoints (measured about 2× to 3× on boards built by many ops; the join test asserts under 5×),
   however often the board changes; and a small board (state under 256 KiB) is rewritten at most once per 64 KiB of
   log, never per op. The consequence for the tail: it is about the larger of 64 KiB and a third of the snapshot
   (in op bytes; the entries' envelopes add about a quarter), plus what was logged while the fold was being written and
@@ -1274,7 +1278,7 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   near-identical shapes reach 30×), but a board near the caps is still tens of MB after it. M4's load test sets the
   real cap.
 - **A checkpoint blocks the room host's event loop while it copies the state** (`Room.fold()` clones every element:
-  about 3 ms per MB of state; 83 to 93 ms measured at 27 MB, about 150 ms or more extrapolated at 50 MB), and the
+  about 3 ms per MB of state; with unresolved entries it also replays the tail into a fresh Room, which costs more than the copy (about 4.6 ms per MB, measured at load ~40); 83 to 93 ms measured at 27 MB, about 150 ms or more extrapolated at 50 MB), and the
   quarter-state rule (§ Recovery, "When") makes folds about twice as frequent as before. During the copy no op, ack or
   heartbeat for any board on that host is handled. The copy is taken synchronously on purpose (the checkpoint is the
   state at one `seq`, and the fence and write order depend on it); taking it incrementally (a copy-on-write

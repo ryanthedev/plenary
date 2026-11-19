@@ -175,7 +175,7 @@ for (const [freehand, min, max] of [[0, 5, 12], [0.3, 2.5, 6]]) test(`a varied b
   report(label + " plain", plain); report(label + " compressed", z);
   if (process.env.JOIN_REPORT) console.log(`  ratio ${(plain.bytes / z.bytes).toFixed(1)}x`);
   expect(z.msgs).toEqual(plain.msgs);
-  expect(plain.bytes / z.bytes).toBeGreaterThan(min);                      // measured 7.0x and 3.7x: freehand coordinates barely compress
+  expect(plain.bytes / z.bytes).toBeGreaterThan(min);                      // freehand coordinates barely compress (JOIN_REPORT=1 prints the ratios)
   expect(plain.bytes / z.bytes).toBeLessThan(max);                         // and not the 30x of identical shapes
   sameDoc(z.replica, r);
   plain.close(); z.close(); await r.stop();

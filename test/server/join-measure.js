@@ -7,7 +7,7 @@ import { Replica } from "../../packages/protocol/replica.js";
 import { zlibDeflate } from "../../server/compress/zlib.js";
 import { inflateSync } from "node:zlib";
 
-/** A deterministic shape with every field a real one carries (~460 bytes of JSON). */
+/** A deterministic shape with every field a real one carries (about 430 bytes of JSON). */
 export const shape = (i, version = 1) => makeElement("rectangle", {
   id: "s" + i, x: (i % 100) * 24, y: Math.floor(i / 100) * 24, width: 20, height: 20, seed: 1000 + i, versionNonce: 7000 + version * 31 + i, version, updated: 1_700_000_000_000,
 });

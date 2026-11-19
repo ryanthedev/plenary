@@ -37,7 +37,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
   const self = {
     tenant, board, seq: 0, epoch: 0, ready: null, closed: false, gapAt: 0,
     base: EMPTY, tail: [],   // tail: [{ seq, id, by, at, text }], seq = base.seq + 1 …
-    snap: null, zTail: null, chunks: [], chunksLen: 0, lastHeard: Date.now(), nextRebase: rebaseEvery, tailBytes: 0, nextRebaseBytes: rebaseBytes,
+    snap: null, zTails: new Map(), chunks: [], chunksLen: 0, lastHeard: Date.now(), nextRebase: rebaseEvery, tailBytes: 0, nextRebaseBytes: rebaseBytes,
     cpHeard: null, lookedAt: 0, retries: 0, looks: 0, failures: 0, skip: 0, failedFor: 0,   // the checkpoint look (rebase, below)
   };
   const frameOf = list => (codec === jsonCodec ? `{"t":"entries","entries":[${list.map(x => x.text).join(",")}]}` : codec.encode({ t: "entries", entries: list.map(x => JSON.parse(x.text)) }));
@@ -155,7 +155,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
     const cut = self.tail.slice(0, cp.seq - self.base.seq);
     self.tail = self.tail.slice(cp.seq - self.base.seq);
     for (const x of cut) self.tailBytes -= x.text.length;
-    self.base = cp; self.snap = null; self.zTail = null; self.chunks = []; self.chunksLen = 0; self.retries = 0;
+    self.base = cp; self.snap = null; self.zTails = new Map(); self.chunks = []; self.chunksLen = 0; self.retries = 0;
     again();
   }
   function again() { self.nextRebase = self.tail.length + rebaseEvery; self.nextRebaseBytes = self.tailBytes + rebaseBytes; }
@@ -226,16 +226,21 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
   const squeeze = part => (part.zp ??= Promise.resolve(deflate(part.data)).then(z => { part.z = z ?? null; }, err => { part.z = null; log.warn("feed: compression failed; joiners get plain text", { tenant, board, err }); }));
 
   // The tail's last chunk grows with every entry, so its text is never the same twice: compressing "the chunk" would go stale
-  // before it could be sent. Instead its compressed form is a PREFIX (`self.zTail`: the chunk's entries up to seq `to`, fixed
-  // when the deflate started) and a join sends it followed by the few entries after `to` as a small plain cut of its own. Always
-  // valid, however many entries land during the deflate; re-made only after `zSlack` bytes of new entries (bounded work).
-  const zTailOf = ch => { const z = self.zTail; return z && z.base === self.base.seq && z.from === ch.from && z.to <= ch.to ? z : null; };
-  const slackBytes = (ch, z) => { let n = 0; for (let i = z.to - self.base.seq; i < ch.to - self.base.seq; i++) n += self.tail[i].text.length; return n; };
+  // before it could be sent. Instead its compressed form is a PREFIX (the chunk's entries up to seq `to`, fixed when the
+  // deflate started) and a join sends it followed by the entries after `to` as a plain cut of its own. Always valid, however
+  // many entries land during the deflate; re-made only after `zSlack` bytes of new entries (bounded work). Kept per chunk start
+  // (`self.zTails`: from -> { good: newest SETTLED prefix { to, z }, tried: `to` of the newest attempt, p: its promise }), so a
+  // newer attempt in flight never hides the settled one a waiting join counted on, and a chunk that closes keeps its prefix.
+  const zTailOf = ch => { const g = self.zTails.get(ch.from)?.good; return g && g.to <= ch.to ? g : null; };
+  const slackBytes = (to, ch) => { let n = 0; for (let i = to - self.base.seq; i < ch.to - self.base.seq; i++) n += self.tail[i].text.length; return n; };
   function squeezeTail(ch) {
-    let z = zTailOf(ch);
-    if (z && (!z.settled || slackBytes(ch, z) < zSlack)) return z.p;
-    z = self.zTail = { base: self.base.seq, from: ch.from, to: ch.to, z: null, settled: false };
-    return z.p = Promise.resolve(deflate(ch.data)).then(r => { z.z = r ?? null; z.settled = true; }, err => { z.settled = true; log.warn("feed: compression failed; joiners get plain text", { tenant, board, err }); });
+    let e = self.zTails.get(ch.from);
+    if (!e) self.zTails.set(ch.from, e = { good: null, tried: -1, p: null });
+    if (e.p && slackBytes(e.tried, ch) < zSlack) return e.p;
+    const to = ch.to;
+    e.tried = to;
+    return e.p = Promise.resolve(deflate(ch.data)).then(z => { if (z && (!e.good || to > e.good.to)) e.good = { to, z }; },
+      err => log.warn("feed: compression failed; joiners get plain text", { tenant, board, err }));
   }
 
   /**
@@ -249,8 +254,8 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
     if (own !== undefined) return [{ data: own, bytes: utf8Length(own), shared: false }];
     if (z && part.z) return [{ data: part.z, bytes: part.z.byteLength, shared: shared + "/z", z: true }];
     const pre = z && part.from !== undefined && !part.z ? zTailOf(part) : null;
-    if (pre?.z) {
-      const out = [{ data: pre.z, bytes: pre.z.byteLength, shared: `${key}/c${pre.base}.${pre.from}-${pre.to}/z`, z: true }];
+    if (pre) {
+      const out = [{ data: pre.z, bytes: pre.z.byteLength, shared: `${key}/c${self.base.seq}.${part.from}-${pre.to}/z`, z: true }];
       if (part.to > pre.to) {
         const cut = frameOf(self.tail.slice(pre.to - self.base.seq, part.to - self.base.seq));
         out.push({ data: cut, bytes: utf8Length(cut), shared: false });

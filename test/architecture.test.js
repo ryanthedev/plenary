@@ -112,7 +112,7 @@ test("every allowlist entry says why", () => {
 test("the classes are what they must be (no vacuous pass)", () => {
   for (const p of ["packages/protocol/room.js", "packages/protocol/replica.js", "packages/core/doc.js", "server/gateway.js",
     "server/room-host.js", "server/feed.js", "server/ids.js", "server/log.js", "server/admin/boards.js", "server/auth/tenancy.js",
-    "server/bus/port.js", "server/blobs/port.js", "server/auth/port.js", "server/auth/idp-port.js", "server/auth/registry-port.js",
+    "server/bus/port.js", "server/blobs/port.js", "server/store/port.js", "server/auth/port.js", "server/auth/idp-port.js", "server/auth/registry-port.js",
     "server/auth/util.js", "server/auth/resolver.js", "server/auth/permissions.js"]) expect([p, isCore(p), isAdapter(p)]).toEqual([p, true, false]);
   for (const p of ["server/store/sqlite.js", "server/store/postgres.js", "server/registry/postgres.js", "server/bus/nats.js",
     "server/bus/memory.js", "server/blobs/s3.js", "server/blobs/disk.js", "server/auth/oidc.js", "server/auth/dev.js",
@@ -134,6 +134,16 @@ test("shared code goes through ports and support modules, not through another ad
   expect(importsOf("server/store/postgres.js").map(i => i.to)).toContain("server/pg/schema.js");
   expect(importsOf("server/pg/schema.js")).toEqual([]);   // a leaf
   for (const f of ["server/blobs/s3.js", "server/blobs/disk.js"]) expect(importsOf(f).map(i => i.to)).toContain("server/blobs/port.js");
+});
+
+test("every adapter imports its port module (one documented interface per port)", () => {
+  const PORT_OF = {
+    "server/store/sqlite.js": "server/store/port.js", "server/store/postgres.js": "server/store/port.js",
+    "server/registry/sqlite.js": "server/auth/registry-port.js", "server/registry/postgres.js": "server/auth/registry-port.js", "server/auth/registry.js": "server/auth/registry-port.js",
+    "server/bus/memory.js": "server/bus/port.js", "server/bus/nats.js": "server/bus/port.js",
+    "server/blobs/disk.js": "server/blobs/port.js", "server/blobs/s3.js": "server/blobs/port.js",
+  };
+  for (const [adapter, port] of Object.entries(PORT_OF)) expect([adapter, importsOf(adapter).map(i => i.to).includes(port)]).toEqual([adapter, true]);
 });
 
 // ---- the rules themselves, on planted sources: a violation of each kind fails ----

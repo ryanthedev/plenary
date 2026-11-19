@@ -28,15 +28,12 @@
 
 import { Database } from "bun:sqlite";
 import { needId, PortError } from "../ids.js";
+import { DEFAULT_READ_LIMIT, needBoard, needLeaseEpoch, needTtl, checkAppend, checkRead, fitBytes, checkCheckpoint, checkBeforeSeq } from "./port.js";
 import { encodeSliced } from "../encode/sliced.js";
 import { PART_CHARS, splitParts, headerOf, parseHeader, orphanGroups, headerLike } from "../encode/cp-parts.js";
 
-const MAX_READ = 10_000;
-/** The longest lease (ms): a holder that dies with a longer one would block its board for that long. */
-const MAX_TTL = 10 * 60_000;
 /** Part rows deleted per statement. */
 const DROP_STEP = 1;
-const posInt = v => Number.isSafeInteger(v) && v > 0;
 
 /**
  * @param {{ path: string, fullfsync?: boolean, busyTimeoutMs?: number, keepCheckpoints?: number, now?: () => number,
@@ -70,9 +67,10 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
   db.run(`CREATE TABLE IF NOT EXISTS leases (
     tenant TEXT NOT NULL, board TEXT NOT NULL, epoch INTEGER NOT NULL, holder TEXT, expires_at INTEGER,
     PRIMARY KEY (tenant, board)) WITHOUT ROWID`);
-  // A file made before the lease columns existed (epoch only): add them; its rows read as unheld.
-  const cols = new Set(db.query("PRAGMA table_info(leases)").all().map(c => c.name));
-  for (const [col, type] of [["holder", "TEXT"], ["expires_at", "INTEGER"]]) if (!cols.has(col)) db.run(`ALTER TABLE leases ADD COLUMN ${col} ${type}`);
+  // Never ALTERed: a leases table from before the lease columns is an old-format store, refused (reset it).
+  const leaseCols = db.query("PRAGMA table_info(leases)").all().map(c => c.name).sort().join(",");
+  if (leaseCols !== "board,epoch,expires_at,holder,tenant")
+    throw new PortError("old-format", `sqlite store: table leases has columns (${leaseCols}) but this version needs (board,epoch,expires_at,holder,tenant): the file is from an older version. Reset the store (delete the file)`);
 
   const qOpenEpoch = db.query(`INSERT INTO leases (tenant, board, epoch) VALUES (?, ?, 1)
     ON CONFLICT (tenant, board) DO UPDATE SET epoch = epoch + 1, holder = NULL, expires_at = NULL RETURNING epoch`);
@@ -151,12 +149,8 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
 
   const ready = (tenant, board) => {
     if (!open) throw new PortError("closed", "the store is closed");
-    needId(tenant, "tenant"); needId(board, "board");
+    needBoard(tenant, board);
   };
-  const needEpoch = epoch => { if (epoch !== undefined && !posInt(epoch)) throw new PortError("bad-entry", "epoch must be a positive integer"); };
-  /** Every write is fenced (p4-host, L5): append and putCheckpoint without the writer's lease epoch are refused. */
-  const needWriteEpoch = epoch => { if (!posInt(epoch)) throw new PortError("bad-entry", "a write needs the board's lease epoch (a positive integer)"); };
-  const needTtl = ttlMs => { if (!posInt(ttlMs) || ttlMs > MAX_TTL) throw new PortError("bad-entry", `ttlMs must be a positive integer up to ${MAX_TTL}`); };
   const clock = () => { const t = now(); if (!Number.isSafeInteger(t)) throw new PortError("bad-clock", "the store's clock gave a non-integer"); return t; };
   const granted = row => row ? { epoch: row.epoch, expiresAt: row.expires_at } : null;
 
@@ -166,18 +160,10 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
      * the board's lease epoch (else PortError "fenced"; no epoch at all is "bad-entry": every write is fenced). Resolves once durable.
      */
     async append(tenant, board, entries, expectSeq, epoch) {
-      ready(tenant, board); needWriteEpoch(epoch);
-      if (!Number.isSafeInteger(expectSeq) || expectSeq < 0) throw new PortError("bad-entry", "expectSeq must be a non-negative integer");
-      if (!Array.isArray(entries) || !entries.length) throw new PortError("bad-entry", "append needs at least one entry");
+      ready(tenant, board);
       // Everything is checked and serialised before the transaction starts: a bad entry writes nothing.
-      const rows = entries.map((e, i) => {
-        if (!e || typeof e !== "object" || e.seq !== expectSeq + 1 + i) throw new PortError("bad-entry", `entry ${i} must have seq ${expectSeq + 1 + i}`);
-        if (e.tenant !== tenant || e.board !== board) throw new PortError("bad-entry", `entry ${i} belongs to another board`);
-        let data;
-        try { data = JSON.stringify(e); } catch { data = undefined; }
-        if (typeof data !== "string") throw new PortError("bad-entry", `entry ${i} can't be serialised`);
-        return [e.seq, data];
-      });
+      const { seqs, datas } = checkAppend(tenant, board, entries, expectSeq, epoch);
+      const rows = seqs.map((seq, i) => [seq, datas[i]]);
       try { appendTx.immediate(tenant, board, rows, expectSeq, epoch); }
       catch (err) {
         if (err instanceof PortError) throw err;
@@ -194,16 +180,12 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
      * The returned array carries `bytes` (each entry's stored length, same order), so a caller can budget memory
      * without encoding the entries again. `bytes` is a plain extra property: a copy of the array won't have it.
      */
-    async read(tenant, board, fromSeq = 1, limit = 1000, maxBytes) {
+    async read(tenant, board, fromSeq = 1, limit = DEFAULT_READ_LIMIT, maxBytes) {
       ready(tenant, board);
-      if (!Number.isSafeInteger(fromSeq) || fromSeq < 0) throw new PortError("bad-entry", "fromSeq must be a non-negative integer");
-      if (!posInt(limit)) throw new PortError("bad-entry", "limit must be a positive integer");
-      if (maxBytes !== undefined && !posInt(maxBytes)) throw new PortError("bad-entry", "maxBytes must be a positive integer");
-      let n = Math.min(limit, MAX_READ);
+      let n = checkRead(fromSeq, limit, maxBytes);
       if (maxBytes !== undefined) {
         // Sizes first (no row text is read), then only as many rows as fit.
-        let sum = 0, fit = 0;
-        for (const r of qSizes.iterate(tenant, board, fromSeq, n)) { if (fit && sum + r.n > maxBytes) break; sum += r.n; fit++; }
+        const fit = fitBytes([...qSizes.iterate(tenant, board, fromSeq, n)].map(r => r.n), maxBytes);
         if (!fit) return Object.assign([], { bytes: [] });
         n = fit;
       }
@@ -220,8 +202,7 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
 
     /** Stores `cp` under its seq (`cp.seq` is required; the rest is the room's). An older one never hides a newer one. */
     async putCheckpoint(tenant, board, cp, epoch) {
-      ready(tenant, board); needWriteEpoch(epoch);
-      if (!cp || typeof cp !== "object" || !Number.isSafeInteger(cp.seq) || cp.seq < 0) throw new PortError("bad-entry", "a checkpoint needs a seq");
+      ready(tenant, board); checkCheckpoint(cp, epoch);
       // Encoded in slices (the event loop breathes between them); the fence is checked in each transaction below.
       const text = await encodeSliced(cp);
       if (text.length <= partChars) return void putCpTx.immediate(tenant, board, cp.seq, text, epoch);
@@ -242,7 +223,7 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
     /** The checkpoint with the highest seq; with `beforeSeq`, the highest below it (to step back past a bad one). */
     async getCheckpoint(tenant, board, beforeSeq) {
       ready(tenant, board);
-      if (beforeSeq !== undefined && (!Number.isSafeInteger(beforeSeq) || beforeSeq < 0)) throw new PortError("bad-entry", "beforeSeq must be a non-negative integer");
+      checkBeforeSeq(beforeSeq);
       // A header may name parts a newer checkpoint's prune has just removed: look again (it then finds a newer header).
       // A header whose parts stay missing is a bad checkpoint: skipped, so the caller gets the next one below it.
       for (let below = beforeSeq ?? Number.MAX_SAFE_INTEGER; ;) {
@@ -295,15 +276,13 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
 
     /** Extends the lease to now + ttlMs, only for its holder at that epoch (even if it lapsed and nobody took it). */
     async renew(tenant, board, holder, epoch, ttlMs) {
-      ready(tenant, board); needId(holder, "holder"); needEpoch(epoch); needTtl(ttlMs);
-      if (epoch === undefined) throw new PortError("bad-entry", "renew needs the lease's epoch");
+      ready(tenant, board); needId(holder, "holder"); needLeaseEpoch(epoch); needTtl(ttlMs);
       return db.transaction(() => granted(qRenew.get(tenant, board, holder, epoch, clock() + ttlMs))).immediate();
     },
 
     /** Gives the lease up if `holder` holds it at `epoch`; otherwise does nothing. The epoch is kept. */
     async release(tenant, board, holder, epoch) {
-      ready(tenant, board); needId(holder, "holder"); needEpoch(epoch);
-      if (epoch === undefined) throw new PortError("bad-entry", "release needs the lease's epoch");
+      ready(tenant, board); needId(holder, "holder"); needLeaseEpoch(epoch);
       db.transaction(() => qRelease.run(tenant, board, holder, epoch)).immediate();
     },
 

@@ -29,7 +29,7 @@
 //
 // Least privilege: start-up creates only missing tables (migrate() in server/pg/schema.js, to_regclass first), so
 // the server may run as a role that reads and writes the tables without owning the schema. It never ALTERs: a
-// pl_leases from before the lease is refused with the owner's one-off fix (LEASE_UPGRADE_SQL). Start-up waits at most
+// pl_leases from before the lease is an old-format store, refused with code "old-format" (reset it). Start-up waits at most
 // `lockTimeoutMs` for the schema's start-up lock, and a missing privilege is reported as such.
 //
 // Durable = the write's transaction commits with `SET LOCAL synchronous_commit = on` (the WAL record is flushed on
@@ -50,10 +50,9 @@ import { SQL } from "bun";
 import { needId, PortError, mintClusterId } from "../ids.js";
 import { encodeSliced } from "../encode/sliced.js";
 import { PART_CHARS, splitParts, headerOf, parseHeader, orphanGroups, headerLike } from "../encode/cp-parts.js";
-import { needSchema, migrate } from "../pg/schema.js";
+import { needSchema, migrate, assertColumns } from "../pg/schema.js";
+import { DEFAULT_READ_LIMIT, needBoard, needLeaseEpoch, needTtl, checkAppend, checkRead, fitBytes, checkCheckpoint, checkBeforeSeq } from "./port.js";
 
-const MAX_READ = 10_000;
-const posInt = v => Number.isSafeInteger(v) && v > 0;
 /** Postgres SQLSTATE for a unique violation. Bun's PostgresError carries it as `errno`. */
 const UNIQUE = "23505";
 
@@ -73,14 +72,6 @@ export const STORE_TABLES = Object.freeze({
   // The cluster id (§ Bus, Cluster id): at most one row, minted by the first node that asks; `singleton` is the key, so a second row can't exist.
   pl_cluster: "id TEXT NOT NULL, singleton BOOLEAN NOT NULL DEFAULT true PRIMARY KEY CHECK (singleton)",
 });
-/** Columns a pl_leases made before the lease (epoch only) lacks. Start-up checks for them and never adds them. */
-const LEASE_COLUMNS = Object.freeze({ holder: "TEXT", expires_at: "BIGINT" });
-/**
- * The operator's one-off upgrade of a pre-lease schema, run as the schema owner (deploy/README.md). Idempotent.
- * @param {string} schema
- */
-export const LEASE_UPGRADE_SQL = schema =>
-  `ALTER TABLE "${needSchema(schema)}".pl_leases ADD COLUMN IF NOT EXISTS holder TEXT, ADD COLUMN IF NOT EXISTS expires_at BIGINT;`;
 /** SQLSTATEs: insufficient_privilege; lock_not_available (lock_timeout fired); idle_in_transaction_session_timeout. */
 const DENIED = "42501", LOCK_TIMEOUT = "55P03", IDLE_CUT = "25P03";
 /** What the Store's statements need on each table (L3: probed at start-up, so a misgrant fails at open). */
@@ -93,7 +84,6 @@ const NEEDS = Object.freeze({
 });
 /** The database's clock, ms since 1970. */
 const DB_NOW = "(extract(epoch FROM clock_timestamp()) * 1000)::bigint";
-const MAX_TTL = 10 * 60_000;
 
 /**
  * @param {{ url?: string, sql?: import("bun").SQL, max?: number, schema?: string, keepCheckpoints?: number, lockTimeoutMs?: number }} o
@@ -121,12 +111,8 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
       await tx.unsafe(`SET LOCAL lock_timeout = ${Math.max(1, Math.floor(lockTimeoutMs))}`);
       await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-schema:${s}`]);
       await migrate(tx, s, STORE_TABLES);
-      // Start-up never ALTERs (least privilege): a pl_leases from before the lease is refused with the operator's fix.
-      const have = new Set((await tx.unsafe(`SELECT attname FROM pg_attribute
-        WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped`, [L])).map(r => r.attname));
-      const missing = Object.keys(LEASE_COLUMNS).filter(c => !have.has(c));
-      if (missing.length) throw Object.assign(new Error(`postgres store: ${L} predates the lease (missing ${missing.join(", ")}). `
-        + `Run as the schema owner: ${LEASE_UPGRADE_SQL(s)}`), { code: "needs-migration" });
+      // Start-up never ALTERs: a pl_leases from before the lease columns is an old-format store, refused (reset it).
+      await assertColumns(tx, s, "pl_leases", ["tenant", "board", "epoch", "holder", "expires_at"]);
       // L3: every privilege the Store's statements use, checked now (a misgrant would otherwise surface at the first
       // fenced write, as a raw 42501). Thrown as Postgres's own 42501, so it is reported like any refusal below.
       const lacking = [];
@@ -152,7 +138,7 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
 
   const ready = (tenant, board) => {
     if (!open) throw new PortError("closed", "the store is closed");
-    needId(tenant, "tenant"); needId(board, "board");
+    needBoard(tenant, board);
   };
   const ms = v => Math.max(1, Math.floor(v));
   /**
@@ -176,10 +162,6 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
   };
   /** A lease call's lock bound: leaseLockTimeoutMs, and at most half its ttl. */
   const leaseLock = ttlMs => Math.min(leaseLockTimeoutMs, ttlMs === undefined ? leaseLockTimeoutMs : ttlMs / 2);
-  const needEpoch = epoch => { if (epoch !== undefined && !posInt(epoch)) throw new PortError("bad-entry", "epoch must be a positive integer"); };
-  /** Every write is fenced (p4-host, L5): append and putCheckpoint without the writer's lease epoch are refused. */
-  const needWriteEpoch = epoch => { if (!posInt(epoch)) throw new PortError("bad-entry", "a write needs the board's lease epoch (a positive integer)"); };
-  const needTtl = ttlMs => { if (!posInt(ttlMs) || ttlMs > MAX_TTL) throw new PortError("bad-entry", `ttlMs must be a positive integer up to ${MAX_TTL}`); };
   const granted = rows => rows.length ? { epoch: Number(rows[0].epoch), expiresAt: Number(rows[0].expires_at) } : null;
   /** The epoch fence, inside a write transaction: FOR SHARE holds off a takeover until this transaction ends. */
   const fence = async (tx, tenant, board, epoch) => {
@@ -221,19 +203,9 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
      * the board's lease epoch (else PortError "fenced"; no epoch at all is "bad-entry": every write is fenced). Resolves once durable.
      */
     async append(tenant, board, entries, expectSeq, epoch) {
-      ready(tenant, board); needWriteEpoch(epoch);
-      if (!Number.isSafeInteger(expectSeq) || expectSeq < 0) throw new PortError("bad-entry", "expectSeq must be a non-negative integer");
-      if (!Array.isArray(entries) || !entries.length) throw new PortError("bad-entry", "append needs at least one entry");
+      ready(tenant, board);
       // Everything is checked and serialised before the transaction starts: a bad entry writes nothing.
-      const seqs = [], datas = [];
-      entries.forEach((e, i) => {
-        if (!e || typeof e !== "object" || e.seq !== expectSeq + 1 + i) throw new PortError("bad-entry", `entry ${i} must have seq ${expectSeq + 1 + i}`);
-        if (e.tenant !== tenant || e.board !== board) throw new PortError("bad-entry", `entry ${i} belongs to another board`);
-        let data;
-        try { data = JSON.stringify(e); } catch { data = undefined; }
-        if (typeof data !== "string") throw new PortError("bad-entry", `entry ${i} can't be serialised`);
-        seqs.push(e.seq); datas.push(data);
-      });
+      const { seqs, datas } = checkAppend(tenant, board, entries, expectSeq, epoch);
       try {
         await write(async tx => {
           await fence(tx, tenant, board, epoch);   // first: a fenced host hears "fenced" (stop), not "conflict" (rebuild)
@@ -255,18 +227,14 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
      * page also stops once it holds about that much stored text (always >= 1 entry); the array carries `bytes`
      * (each entry's stored length, same order). Same extension as the SQLite adapter.
      */
-    async read(tenant, board, fromSeq = 1, limit = 1000, maxBytes) {
+    async read(tenant, board, fromSeq = 1, limit = DEFAULT_READ_LIMIT, maxBytes) {
       ready(tenant, board);
-      if (!Number.isSafeInteger(fromSeq) || fromSeq < 0) throw new PortError("bad-entry", "fromSeq must be a non-negative integer");
-      if (!posInt(limit)) throw new PortError("bad-entry", "limit must be a positive integer");
-      if (maxBytes !== undefined && !posInt(maxBytes)) throw new PortError("bad-entry", "maxBytes must be a positive integer");
-      let n = Math.min(limit, MAX_READ);
+      let n = checkRead(fromSeq, limit, maxBytes);
       if (maxBytes !== undefined) {
         // Sizes first (no row text is sent), then only as many rows as fit.
         const sizes = await db.unsafe(`SELECT length(data) AS n FROM ${E} WHERE tenant = $1 AND board = $2 AND seq >= $3
           ORDER BY seq ASC LIMIT $4`, [tenant, board, fromSeq, n]);
-        let sum = 0, fit = 0;
-        for (const r of sizes) { const k = Number(r.n); if (fit && sum + k > maxBytes) break; sum += k; fit++; }
+        const fit = fitBytes(sizes.map(r => Number(r.n)), maxBytes);
         if (!fit) return Object.assign([], { bytes: [] });
         n = fit;
       }
@@ -288,8 +256,7 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
      * `keepCheckpoints` per board are pruned in the same transaction. An older one never hides a newer one.
      */
     async putCheckpoint(tenant, board, cp, epoch) {
-      ready(tenant, board); needWriteEpoch(epoch);
-      if (!cp || typeof cp !== "object" || !Number.isSafeInteger(cp.seq) || cp.seq < 0) throw new PortError("bad-entry", "a checkpoint needs a seq");
+      ready(tenant, board); checkCheckpoint(cp, epoch);
       const text = await encodeSliced(cp);   // in slices: the event loop breathes between them
       // Bounded lock wait (the fence's FOR SHARE on the lease row): a stuck write is "unavailable", never forever.
       const put = (tx, data) => tx.unsafe(`INSERT INTO ${C} (tenant, board, seq, data) VALUES ($1, $2, $3, $4)
@@ -326,7 +293,7 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
     /** The checkpoint with the highest seq; with `beforeSeq`, the highest below it (to step back past a bad one). */
     async getCheckpoint(tenant, board, beforeSeq) {
       ready(tenant, board);
-      if (beforeSeq !== undefined && (!Number.isSafeInteger(beforeSeq) || beforeSeq < 0)) throw new PortError("bad-entry", "beforeSeq must be a non-negative integer");
+      checkBeforeSeq(beforeSeq);
       // A header may name parts a newer checkpoint's prune has just removed: look again (it then finds a newer header).
       // A header whose parts stay missing is a bad checkpoint: skipped, so the caller gets the next one below it.
       for (let below = beforeSeq ?? Number.MAX_SAFE_INTEGER; ;) {
@@ -384,16 +351,14 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
 
     /** Extends the lease to now + ttlMs (database clock), only for its holder at that epoch; else null. */
     async renew(tenant, board, holder, epoch, ttlMs) {
-      ready(tenant, board); needId(holder, "holder"); needEpoch(epoch); needTtl(ttlMs);
-      if (epoch === undefined) throw new PortError("bad-entry", "renew needs the lease's epoch");
+      ready(tenant, board); needId(holder, "holder"); needLeaseEpoch(epoch); needTtl(ttlMs);
       return granted(await write(tx => tx.unsafe(`UPDATE ${L} SET expires_at = ${DB_NOW} + $5
         WHERE tenant = $1 AND board = $2 AND holder = $3 AND epoch = $4 RETURNING epoch, expires_at`, [tenant, board, holder, epoch, ttlMs]), leaseLock(ttlMs)));
     },
 
     /** Gives the lease up if `holder` holds it at `epoch`; otherwise does nothing. The epoch is kept. */
     async release(tenant, board, holder, epoch) {
-      ready(tenant, board); needId(holder, "holder"); needEpoch(epoch);
-      if (epoch === undefined) throw new PortError("bad-entry", "release needs the lease's epoch");
+      ready(tenant, board); needId(holder, "holder"); needLeaseEpoch(epoch);
       await write(tx => tx.unsafe(`UPDATE ${L} SET holder = NULL, expires_at = NULL
         WHERE tenant = $1 AND board = $2 AND holder = $3 AND epoch = $4`, [tenant, board, holder, epoch]), leaseLock());
     },

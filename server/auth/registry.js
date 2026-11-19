@@ -73,6 +73,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
   const scopeTenant = (type, id) => (type === "unit" ? tenants.get(id) : type === "group" ? groups.get(id) : type === "space" ? spaces.get(id) : boards.get(id))?.[type === "unit" ? "id" : "tenant"];
 
   return {
+    async close() {},
     async createTenant({ domain, domains = [], kind = "company", admins = [] }) {
       const ds = domainList(domain, domains);
       if (!KINDS.includes(kind)) throw new Error("registry: bad unit kind");

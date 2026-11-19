@@ -1,6 +1,7 @@
 // The Postgres/NATS/S3-gated test files `bun run test:cluster` runs. A data module, so the guard (test/deploy/test-cluster.test.js)
 // imports the list instead of scraping scripts/test-cluster.js (importing that script runs it).
 export const DEFAULT_FILES = [
+  "test/server/adapter-surface.test.js",   // every adapter has the port's methods; its Postgres, NATS and S3 cases are gated
   "test/server/pg-store.test.js",
   "test/server/pg-registry.test.js",
   "test/server/nats-bus.test.js",

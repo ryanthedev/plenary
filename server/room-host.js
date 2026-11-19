@@ -126,6 +126,16 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   /** The host deadline has passed: this slot can't know it still holds the lease (HIGH-1). By performance.now(). */
   const expired = slot => perf() >= slot.okAt + leaseTtlMs - renewEvery;
   const watches = new Map();
+  /** key → perf() time until which this host does not claim the board: it just stopped it stuck (#65), and its own lease is still live. */
+  const cooling = new Map();
+  const coolOff = key => cooling.set(key, perf() + leaseTtlMs + margin);
+  const isCooling = key => {
+    const until = cooling.get(key);
+    if (until === undefined) return false;
+    if (perf() < until) return true;
+    cooling.delete(key);
+    return false;
+  };
   let closed = false;
   const closedError = () => new PortError("closed", "the room host is closed");
 
@@ -160,9 +170,10 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     const fenced = (what, err) => { if (err?.code === "fenced") lost(slot, `${what} fenced: another host took the board`, err); };
     return {
       append(entries, expectSeq) {
-        const w = Promise.resolve().then(() => store.append(tenant, board, entries, expectSeq, slot.epoch));
-        slot.writes.add(w); w.finally(() => slot.writes.delete(w)).catch(() => {});   // close() settles it before release (L4)
-        return withTimeout(w).then(() => {
+        const w = withTimeout(Promise.resolve().then(() => store.append(tenant, board, entries, expectSeq, slot.epoch)));
+        // close() settles it before release (L4). The timed promise: a hung append settles at the timeout, so close() never waits forever.
+        slot.writes.add(w); w.finally(() => slot.writes.delete(w)).catch(() => {});
+        return w.then(() => {
           // Durable, but past the host deadline nothing is acked or broadcast from here (HIGH-1): the room stops, the
           // entries stay unacked, and the client's resend is deduplicated by the next holder.
           if (slot.leaseLost) return;
@@ -272,6 +283,11 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
    * attempt does).
    */
   async function claim(tenant, board, key) {
+    if (isCooling(key)) {   // a stuck stop's cooldown: never re-acquire our own live lease (acquire would grant it, epoch + 1); watch it instead
+      const info = await withTimeout(store.lease(tenant, board), storeTimeoutMs);
+      if (closed) throw closedError();
+      return { held: info };
+    }
     for (let tries = 0; tries < 3; tries++) {
       const sent = perf();
       const l = await withTimeout(store.acquire(tenant, board, me, leaseTtlMs), storeTimeoutMs);
@@ -303,9 +319,13 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     held.set(key, slot);
     const p = build(slot).catch(err => {
       stopLease(slot); unwatch(key, true);
+      if (err?.code === "timeout") coolOff(key);
       // L5: a build that failed for a reason other than the lease gives the board back at once, so another host
       // (or this one's next open) needn't wait out the ttl. A lost lease is never released.
-      if (!slot.leaseLost) Promise.resolve().then(() => store.release(tenant, board, me, slot.epoch)).catch(e => log.warn("lease release after a failed build failed", { tenant, board, err: e }));
+      // Then a host already watching the board is told (as after a clean stop), so it need not wait for its next poll.
+      if (!slot.leaseLost) Promise.resolve().then(() => store.release(tenant, board, me, slot.epoch))
+        .then(() => bus.publish(subjects.entries(tenant, board), { seq: 0, epoch: slot.epoch, cp: 0, released: true })?.catch?.(() => {}))
+        .catch(e => log.warn("lease release after a failed build failed", { tenant, board, err: e }));
       throw err;
     });
     slot.promise = p;
@@ -317,7 +337,11 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   async function build(slot) {
     const { tenant, board } = slot;
     const report = (what, detail) => {
-      if (what === "stopped") { log.error("room stopped", { tenant, board, seq: detail?.seq, err: detail?.err }); fail(slot); }
+      if (what === "stopped") {
+        log.error("room stopped", { tenant, board, seq: detail?.seq, err: detail?.err });
+        if (detail?.err?.code === "timeout") coolOff(slot.key);   // an append that never answered: stuck (§ Recovery, "Stuck host")
+        fail(slot);
+      }
       else log.error(`room: ${what}`, { tenant, board, ...detail });
     };
     // § Recovery, Room identity: the epoch is the lease's (acquire bumps it durably), so two builds never share one.
@@ -337,6 +361,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     if (closed) throw closedError();
     if (slot.dead) throw new PortError("unavailable", "the board's lease was lost while its room was being built");
     slot.durable = slot.room.status().resolved;
+    slot.progress = { seq: slot.durable, at: perf() };   // the watchdog's clock starts when the room starts, not at the acquire (a slow build is not a stall)
     // Gateways (and any host watching this board) learn the new epoch now, before the inbox is served. `opened`: a
     // watcher answers the hellos it held, which this room never saw (MEDIUM-2).
     bus.publish(subjects.entries(tenant, board), { ...slot.room.heartbeat(), opened: true })?.catch?.(() => {});
@@ -540,7 +565,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     for (const p of slots.values()) p.then(slot => {
       if (slot.dead) return;
       if (expired(slot)) return lost(slot, "no lease renew succeeded by the host deadline");
-      if (stalled(slot)) return lost(slot, `no progress: ops waiting and the resolved seq unmoved for ${stuckMs} ms`);
+      if (stalled(slot)) { coolOff(slot.key); return lost(slot, `no progress: ops waiting and the resolved seq unmoved for ${stuckMs} ms`); }
       bus.publish(subjects.entries(slot.tenant, slot.board), slot.room.heartbeat())?.catch?.(() => {});
     }, () => {});
   }, heartbeatMs);

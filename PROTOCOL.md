@@ -658,9 +658,9 @@ exactly"). Defaults: `leaseTtlMs` 10,000, `appendTimeoutMs` 4,000, `storeTimeout
 
 | # | What is stuck | Before #65 | Now | Room stopped within | A waiting host holds the lease within |
 |---|---|---|---|---|---|
-| a | the whole process (event loop blocked, SIGSTOP) | renews and timers cannot run; the lease lapses by its ttl; on waking the host sees `expired` at its first timer or inbox message and stops without answering | unchanged | on waking (the lease is already gone) | last renew + ttl + margin (about 10.2 s); a waiter also tries at its own silence (2 heartbeats = 4 s) but is refused until the lapse |
+| a | the whole process (event loop blocked, SIGSTOP) | renews and timers cannot run; the lease lapses by its ttl; on waking the host sees `expired` at its first timer or inbox message and stops without answering | unchanged. A block of about `stuckMs` (6 s or more, with ops waiting) can also trip the watchdog on waking, before the deadline check: the writers then hear `unavailable` (1013) and reconnect, the same outcome | on waking (the lease is already gone) | last renew + ttl + margin (about 10.2 s); a waiter also tries at its own silence (2 heartbeats = 4 s) but is refused until the lapse |
 | b1 | one board's `append` never answers | `withTimeout` 4 s failed the room | unchanged | `appendTimeoutMs` (4 s) | the stop + at most 10 s (renewing stops with the room; the lease lapses ttl after the last renew, which was before the stop) |
-| b2 | a Store call of the **build** (`getCheckpoint`, a `read` page) or of `acquire`/`lease` never answers | **unbounded**: renew kept succeeding, the lease was held forever by a room that never opened, `open` never settled | each call is bounded by `storeTimeoutMs`; a build that times out stops renewing and **releases** (a failed build, not a lost lease), so a waiter takes the board at once | `storeTimeoutMs` (10 s) per call | at once after the stop (release), else + ttl |
+| b2 | a Store call of the **build** (`getCheckpoint`, a `read` page) or of `acquire`/`lease` never answers | **unbounded**: renew kept succeeding, the lease was held forever by a room that never opened, `open` never settled | each call is bounded by `storeTimeoutMs`; a build that times out stops renewing and **releases** (a failed build, not a lost lease) and then publishes `{ seq: 0, epoch, cp: 0, released: true }` on `.entries`, so a host already watching the board tries the lease at once (no wait for its next poll) | `storeTimeoutMs` (10 s) per call | the stop + one Store round trip (release, then the `released` message); if the release fails: + ttl |
 | c | sequencing stalled: ops are waiting (`inflight` + `queued` + `held` > 0) and the resolved `seq` has not moved | only the append and checkpoint timeouts, which a skewed wall clock or a Store call that never reaches the room could defeat | **progress watchdog**: each heartbeat tick compares the resolved `seq`; no movement for `stuckMs` while work waits stops the room (`lost`: never `release`, an append may be in flight) | `stuckMs` + `heartbeatMs` = 10 s at most | + ttl |
 
 - **The progress watchdog** runs on the host's `monotonic` clock and `timers` (never the rooms' `now`), on the heartbeat
@@ -669,7 +669,17 @@ exactly"). Defaults: `leaseTtlMs` 10,000, `appendTimeoutMs` 4,000, `storeTimeout
   `stuckMs` should exceed `appendTimeoutMs`; if it does not, a slow but live Store is cut early (safe, only noisy).
 - **What stopping does.** `lost`: the room fails, every connection it welcomed hears `unavailable` (close 1013) and
   reconnects, renewing and the deadline timer stop, and nothing is released (a release could hang with the Store, and the
-  lapse is enough). The host's next `open` for the board acquires again (a new, higher epoch) if no other host did.
+  lapse is enough).
+- **Cooldown: a stuck host never retakes its own board at once.** `acquire` grants a lease to the holder that already
+  holds it, and gateways call `open` on every writer hello, so without a rule the stuck host would re-acquire its own
+  still-live lease (epoch + 1), hang again, and the waiting host would never get the board. After a **stuck stop** (the
+  progress watchdog, an append timeout, a build timeout) the host puts the board in a **cooldown of `leaseTtlMs` + margin**
+  (margin = max(20, ttl / 50) ms) on its monotonic clock, counted from the stop. During it `open` does not claim: it reads
+  the lease (bounded by `storeTimeoutMs`), watches the board and resolves "watching", and a waiting host's own attempt also
+  does not claim; the hello is answered `unavailable` once the heartbeat is silent. The stop came after the last renew, so
+  the lease has lapsed when the cooldown ends. Another host that holds the board is untouched by it; if none does, this host
+  takes the board when the cooldown ends. A lost lease for any other reason (renew refused, fenced, host deadline) has no
+  cooldown: the board is already someone else's or free.
 - **No acknowledged op is lost.** An op is acked only after its append resolved *and* the lease was still within its host
   deadline (§ Recovery, append). A stuck host that wakes has two defences: its own deadline check (`expired`) and the
   Store's epoch fence. Every write the host makes carries the lease epoch and is checked **in the write's own transaction**:
@@ -1492,8 +1502,10 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   a burst of N publishes, no jitter). Payload `{ seq, epoch, cp }`: `seq` = the resolved seq (never the speculative
   one), `epoch` = the room's epoch (the lease's, § Recovery, Room identity), `cp` = newest durable checkpoint (below).
   Two variants share the shape: `{ seq, epoch, cp, opened: true }` once at room build, before the inbox is served, and
-  `{ seq, epoch, cp, released: true }` after a clean stop. A host whose lease renew deadline has passed publishes
-  nothing and stops the room instead. Consumers and what each does with it:
+  `{ seq, epoch, cp, released: true }` after a clean stop, and `{ seq: 0, epoch, cp: 0, released: true }` after it
+  released the lease of a build that failed (a timed-out Store call, § Recovery "Stuck host"). A host whose lease renew
+  deadline has passed, or whose progress watchdog fired (ops waiting, resolved `seq` unmoved for `stuckMs`), publishes
+  nothing and stops the room instead; it keeps no lease and no cooldown-time claim (§ Recovery). Consumers and what each does with it:
   (1) **gateway feed** (`server/feed.js`): a heartbeat or an entries batch whose `epoch` is at least the feed's (a
   missing or non-integer `epoch` counts as lower) resets its silence timer; one from a lower epoch (a dead incarnation's,
   delayed on the bus) does not, so stale traffic cannot hold off the Store poll. It reads the Store when `seq` is above its own

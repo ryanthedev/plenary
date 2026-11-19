@@ -44,15 +44,19 @@ function fakeGateway(bus, id = "g-1") {
 }
 
 /** A store whose lease and writes a test can stall: renew "ok" | "hang" | "null"; append "ok" | "hold" (kept in `held`). */
-function stallable(store) {
-  const s = { renew: "ok", append: "ok", held: [], renews: 0, build: "ok", acquire: "ok" };   // build: getCheckpoint and read; acquire: "hang" never answers
+function stallable(store, timers) {
+  // build: "hang" stalls getCheckpoint and read; reads: "hang" stalls read only; acquire and lease: "hang" never answer (acquires counts calls);
+  // cpDelay and appendDelay (virtual ms, need `timers`) make getCheckpoint / append answer late.
+  const s = { renew: "ok", append: "ok", held: [], renews: 0, build: "ok", reads: "ok", acquire: "ok", acquires: 0, lease: "ok", cpDelay: 0, appendDelay: 0 };
+  const late = (ms, f) => new Promise(r => timers.setTimeout(r, ms)).then(f);
   s.store = {
     ...store,
-    getCheckpoint: (...a) => (s.build === "hang" ? never() : store.getCheckpoint(...a)),
-    read: (...a) => (s.build === "hang" ? never() : store.read(...a)),
-    acquire: (...a) => (s.acquire === "hang" ? never() : store.acquire(...a)),
+    getCheckpoint: (...a) => (s.build === "hang" ? never() : s.cpDelay ? late(s.cpDelay, () => store.getCheckpoint(...a)) : store.getCheckpoint(...a)),
+    read: (...a) => (s.build === "hang" || s.reads === "hang" ? never() : store.read(...a)),
+    acquire: (...a) => { s.acquires++; return s.acquire === "hang" ? never() : store.acquire(...a); },
+    lease: (...a) => (s.lease === "hang" ? never() : store.lease(...a)),
     renew: (...a) => { s.renews++; return s.renew === "hang" ? never() : s.renew === "null" ? Promise.resolve(null) : store.renew(...a); },
-    append: (...a) => { if (s.append !== "hold") return store.append(...a); s.held.push(a); return never(); },
+    append: (...a) => { if (s.append === "hold") { s.held.push(a); return never(); } return s.appendDelay ? late(s.appendDelay, () => store.append(...a)) : store.append(...a); },
   };
   return s;
 }
@@ -750,6 +754,145 @@ describe("stuck host (#65)", () => {
       sa.acquire = "ok";
       const p = A.open(T, B); await V.advance(10);
       expect(await p).toBe("held");
+    } finally { await A.close(); await raw.close(); await bus.close(); }
+  }, 20000);
+
+  test("H1 a stuck host does not retake its own board: A reopens on every writer hello during the cooldown and never re-acquires; B holds the lease within the bound at epoch + 1", async () => {
+    const { bus, V, raw, store, host, lostWhy } = vworld(), rawB = store();
+    const sa = stallable(raw, V.timers);
+    const ttl = 3_000, margin = 60, renewEvery = 1_000;
+    const A = host({ store: sa.store, holder: "h-a", leaseTtlMs: ttl, heartbeatMs: 200, appendTimeoutMs: 600_000, stuckMs: 3_000, now: () => 5 });
+    const Bh = host({ store: rawB, holder: "h-b", leaseTtlMs: ttl, heartbeatMs: 200 });
+    try {
+      await A.open(T, B); await Bh.open(T, B);
+      const g = fakeGateway(bus);
+      g.hello("c1", "a"); await g.welcome("c1");
+      g.op("c1", "a", 1); await g.ack("c1", "a:1");
+      const epochA = (await rawB.lease(T, B)).epoch;
+      sa.append = "hold"; g.op("c1", "a", 2); await bus.flush();
+      expect(await V.until(() => lostWhy().length > 0, 10_000, 50)).not.toBe(null);
+      const stopAt = V.now(), acquires = sa.acquires;
+      let took = null;
+      for (; V.now() - stopAt <= ttl + margin + renewEvery + 100 && took === null; await V.advance(100)) {
+        expect(await A.open(T, B)).toBe("watching");                              // the gateway's open on a writer's reconnect
+        expect(sa.acquires).toBe(acquires);                                      // never a claim: not even once the lease lapsed
+        if ((await rawB.lease(T, B)).holder === "h-b") took = V.now() - stopAt;
+      }
+      expect(took).not.toBe(null);
+      expect(took).toBeLessThanOrEqual(ttl + margin + renewEvery);               // the documented bound
+      expect((await rawB.lease(T, B)).epoch).toBe(epochA + 1);                  // one takeover, no ping-pong
+      await V.advance(200);
+      expect(await A.open(T, B)).toBe("watching");
+      expect(sa.acquires).toBe(acquires);
+      expect(await Bh.peek(T, B)).not.toBe(null);
+    } finally { await A.close(); await Bh.close(); await raw.close(); await rawB.close(); await bus.close(); }
+  }, 20000);
+
+  test("H1 an append timeout starts the same cooldown (the pre-existing b1 path)", async () => {
+    const { bus, V, raw, host } = vworld();
+    const sa = stallable(raw, V.timers);
+    const A = host({ store: sa.store, holder: "h-a", leaseTtlMs: 3_000, heartbeatMs: 200, appendTimeoutMs: 500 });
+    try {
+      await A.open(T, B);
+      const g = fakeGateway(bus);
+      g.hello("c1", "a"); await g.welcome("c1");
+      sa.append = "hold"; g.op("c1", "a", 1); await bus.flush();
+      await V.advance(600);
+      const acquires = sa.acquires;
+      expect(await A.open(T, B)).toBe("watching");
+      expect(sa.acquires).toBe(acquires);
+      sa.append = "ok";
+      await V.advance(3_100);                                                    // the cooldown (ttl + margin) is over: the lease lapsed and nobody took it
+      await V.advance(1_000);
+      expect(await A.open(T, B)).toBe("held");
+    } finally { await A.close(); await raw.close(); await bus.close(); }
+  }, 20000);
+
+  test("M1 a failed build publishes released: a host already watching takes the board at once, not at its next poll", async () => {
+    const { bus, V, raw, store, host } = vworld(), rawB = store();
+    const sa = stallable(raw, V.timers);
+    sa.build = "hang";
+    const A = host({ store: sa.store, holder: "h-a", leaseTtlMs: 3_000, storeTimeoutMs: 1_500, heartbeatMs: 400 });
+    const Bh = host({ store: rawB, holder: "h-b", leaseTtlMs: 3_000, heartbeatMs: 400 });
+    try {
+      const wait = opened(V, A.open(T, B));
+      await wait(0);
+      expect(await Bh.open(T, B)).toBe("watching");                              // B watches A's live lease; its polls are at 1,000 and 2,000
+      const t0 = V.now();
+      const took = await V.until(async () => (await rawB.lease(T, B)).holder === "h-b", 3_000, 10);
+      expect(took).not.toBe(null);
+      expect(took).toBeLessThanOrEqual(1_500 + 100);                             // the build's bound + a Store round trip, not the 2,000 poll
+      expect(V.now() - t0).toBeLessThan(2_000);
+    } finally { await A.close(); await Bh.close(); await raw.close(); await rawB.close(); await bus.close(); }
+  }, 20000);
+
+  test("M2 close() settles while an append hangs (the timed promise is tracked), then releases", async () => {
+    const { bus, V, raw, host } = vworld();
+    const sa = stallable(raw, V.timers);
+    const A = host({ store: sa.store, holder: "h-a", leaseTtlMs: 3_000, appendTimeoutMs: 1_000 });
+    try {
+      await A.open(T, B);
+      const g = fakeGateway(bus);
+      g.hello("c1", "a"); await g.welcome("c1");
+      sa.append = "hold"; g.op("c1", "a", 1); await bus.flush();
+      let done = false; const c = A.close().then(() => { done = true; });
+      await V.advance(500); expect(done).toBe(false);                            // still waiting on the write, within its bound
+      expect(await V.until(() => done, 3_000, 100)).not.toBe(null);
+      await c;
+    } finally { await raw.close(); await bus.close(); }
+  }, 20000);
+
+  test("L1 a read page that never answers (the checkpoint answered) fails the open within storeTimeoutMs", async () => {
+    const { bus, V, raw, host } = vworld();
+    const sa = stallable(raw, V.timers);
+    sa.reads = "hang";
+    const A = host({ store: sa.store, holder: "h-a", leaseTtlMs: 3_000, storeTimeoutMs: 1_000 });
+    try {
+      const wait = opened(V, A.open(T, B));
+      await wait(0);
+      expect(await wait(900)).toBeUndefined();
+      expect((await wait(200)).e?.code).toBe("timeout");
+    } finally { await A.close(); await raw.close(); await bus.close(); }
+  }, 20000);
+
+  test("L1 a lease read that never answers fails the claim within storeTimeoutMs, and a waiting host's attempt retries after it", async () => {
+    const { bus, V, raw, store, host } = vworld(), rawX = store();
+    const sa = stallable(raw, V.timers);
+    await rawX.acquire(T, B, "h-x", 3_000);                                       // someone else's live lease: A's acquire is refused and it reads the lease
+    sa.lease = "hang";
+    const A = host({ store: sa.store, holder: "h-a", leaseTtlMs: 3_000, storeTimeoutMs: 500 });
+    try {
+      const wait = opened(V, A.open(T, B));
+      await wait(0);
+      expect(await wait(400)).toBeUndefined();
+      expect((await wait(200)).e?.code).toBe("timeout");
+      sa.lease = "ok";
+      expect(await A.open(T, B)).toBe("watching");                               // now it watches h-x's lease
+      sa.lease = "hang";                                                          // the watch's attempt (at the lease's end) reads and hangs
+      await V.advance(3_300);
+      sa.lease = "ok";                                                            // h-x never renewed: the lease lapsed; the next attempt takes the board
+      expect(await V.until(() => A.stats().rooms === 1, 3_000, 50)).not.toBe(null);
+    } finally { await A.close(); await raw.close(); await rawX.close(); await bus.close(); }
+  }, 20000);
+
+  test("L3 an op in flight right after a slow build is not a stall: the watchdog's clock starts when the room does", async () => {
+    const { bus, V, raw, host, lostWhy } = vworld();
+    const sa = stallable(raw, V.timers);
+    sa.cpDelay = 3_000;                                                           // an empty board whose build takes 3 x stuckMs
+    const A = host({ store: sa.store, holder: "h-a", leaseTtlMs: 3_000, heartbeatMs: 200, stuckMs: 1_000 });
+    try {
+      const wait = opened(V, A.open(T, B));
+      await wait(0);
+      for (let i = 0; i < 40 && !(await wait(100)); i++);
+      expect((await wait(0)).v).toBe("held");
+      sa.cpDelay = 0;
+      const g = fakeGateway(bus);
+      g.hello("c1", "a"); await g.welcome("c1");
+      sa.appendDelay = 300;                                                      // slower than a beat, faster than stuckMs
+      g.op("c1", "a", 1); await bus.flush();
+      await V.advance(1_000);
+      await g.ack("c1", "a:1");
+      expect(lostWhy()).toEqual([]);
     } finally { await A.close(); await raw.close(); await bus.close(); }
   }, 20000);
 

@@ -247,7 +247,7 @@ export function storeContract(name, make) {
       } });
       store = s;
       const e = await own(store);
-      console.error("DBG put old"); await store.putCheckpoint(T, B, big(10, "old"), e); console.error("DBG put old done");
+      console.error("DBG ps", require("node:child_process").spawnSync("sh",["-c","uptime; ps -eo pid,ppid,pcpu,etime,args --sort=-pcpu | head -15 | cut -c1-200"]).stdout.toString(), process.getActiveResourcesInfo?.().join(",")); await store.putCheckpoint(T, B, big(10, "old"), e); console.error("DBG put old done");
       const before = await raw.partRows(T, B);
       abortAt = "part:3"; console.error("DBG before", before);
       await expect(store.putCheckpoint(T, B, big(20, "new"), e)).rejects.toThrow("simulated crash");

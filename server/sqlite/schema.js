@@ -40,3 +40,27 @@ export function assertShapes(db, build, label) {
     })();
   } finally { scratch.close(); }
 }
+
+/**
+ * Runs `f`, retrying while SQLite reports BUSY/LOCKED, with a short growing backoff (5 ms doubling, at most 100 ms,
+ * plus jitter), until `deadline` (ms since epoch); then throws the last error. Only for start-up statements that
+ * SQLite may refuse without consulting the busy handler. Blocks (start-up is synchronous).
+ *
+ * A hard cap: before each attempt `busy_timeout` is set to what is left of the budget, so a statement that waits in
+ * SQLite's busy handler can't run past the deadline either, and no sleep runs past it. `f` always runs at least once.
+ * The caller restores its own busy_timeout afterwards.
+ */
+export function onBusyRetry(db, deadline, f, clock = Date.now, onAttempt) {
+  for (let delay = 5; ; delay = Math.min(delay * 2, 100)) {
+    const budget = Math.max(0, deadline - clock());
+    onAttempt?.(budget);
+    db.run(`PRAGMA busy_timeout=${budget}`);
+    try { return f(); }
+    catch (err) {
+      const busy = typeof err?.code === "string" && (err.code.startsWith("SQLITE_BUSY") || err.code.startsWith("SQLITE_LOCKED"));
+      const left = deadline - clock();
+      if (!busy || left <= 0) throw err;
+      Bun.sleepSync(Math.min(left, delay + Math.floor(Math.random() * delay)));
+    }
+  }
+}

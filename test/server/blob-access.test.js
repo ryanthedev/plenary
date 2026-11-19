@@ -229,3 +229,25 @@ test("#92 MED-4: two overlapping usage reads with a put during each, resolving i
     expect([x, y]).toEqual([{ ok: false, code: "quota" }, { ok: false, code: "quota" }]);   // 300 + 100 > 350 for both: a count below 300 lets one in
   }
 });
+
+test("#92 follow-up: a put waiting on a usage read that was superseded and then fails follows the current read instead of answering unavailable", async () => {
+  const gate = deferred();
+  let calls = 0;
+  const { access, inner } = make({ quotaBytes: 1000, wrap: { usage: async (...a) => { if (++calls === 1) { await gate.promise; throw new Error("walk failed"); } return inner.usage(...a); } } });
+  const a = fakePng(100, 71), b = fakePng(100, 72);
+  const first = access.put(await putUrl(access, "t1", a), a);                    // attaches to read 1 (held, will fail)
+  await new Promise(r => setTimeout(r, 5));
+  access.recount("t1");                                                          // supersedes read 1
+  const second = access.put(await putUrl(access, "t1", b), b);                   // starts read 2 (succeeds)
+  await new Promise(r => setTimeout(r, 5));
+  gate.resolve();
+  expect((await first).ok).toBe(true);
+  expect((await second).ok).toBe(true);
+  expect(await inner.usage("t1")).toBe(200);
+});
+
+test("#92 follow-up: a failing current read still fails the put closed (unavailable)", async () => {
+  const { access } = make({ quotaBytes: 1000, wrap: { usage: async () => { throw new Error("walk failed"); } } });
+  const a = fakePng(100, 73);
+  expect(await access.put(await putUrl(access, "t1", a), a)).toEqual({ ok: false, code: "unavailable" });
+});

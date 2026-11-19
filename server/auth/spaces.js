@@ -146,6 +146,7 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
   async function announceScope(unit, scope) {
     let after = null, pages = 0, sent = 0;
     try {
+      if (scope.type === "board") { await announce(unit.id, scope.id); return; }    // a board scope is that one board (boardsIn lists none for it)
       do {
         if (closing) break;
         const p = await registry.boardsIn(scope, { after, limit: ANNOUNCE.page });
@@ -330,6 +331,9 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
 
     /** Shutdown: stop starting announcements and forget the queued ones (the gateways' timed re-check covers them). Running passes finish. */
     close() { closing = true; queue.length = 0; revQueue.length = 0; idle(); },
+
+    /** Scopes running or waiting to be announced (a caller that feeds many scopes waits while this is high). */
+    backlog: () => running.size + queue.length + revQueue.length,
 
     /** Announce a change to what everyone in a scope gets (update() does this itself; exposed for the composition root and tests). */
     announceChange: (unit, scope, o) => announceLater(unit, scope, o),

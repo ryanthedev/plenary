@@ -40,6 +40,8 @@
 //   POST   /boards                             { title?, space?, memberRole? } → 201 { board }; board.create at `space`, else the personal space
 //   PATCH  /boards/:board                      { title } → 200 { board };  GET /spaces?can=board.create, GET /groups?can=space.create,
 //   POST /spaces, GET|PATCH /spaces/:id, GET|PATCH /groups/:id: PROTOCOL.md § Spaces and Groups (server/auth/spaces.js)
+//   GET|POST /teams, GET|PATCH|DELETE /teams/:id, PUT|DELETE /teams/:id/members/:user, GET /directory,
+//   GET /access/:type/:id, PUT|DELETE /access/:type/:id/grants/:subjectType/:subject: PROTOCOL.md § Teams and access (server/auth/access.js)
 //   (tenant of POST /boards = the caller's
 //   GET    /boards/:board/invites              → { invites }
 //   POST   /boards/:board/invites              { email, role, expiresAt? } → 201 { invite }
@@ -80,6 +82,7 @@
 
 import { b64url, unb64url, utf8, fromUtf8 } from "./util.js";
 import { spaceService } from "./spaces.js";
+import { accessService } from "./access.js";
 import { AdminError, createInvite, listInvites, revokeInvite, createLink, listLinks, revokeLink, setGrant } from "../admin/boards.js";
 
 export const LOGIN_COOKIE = "__Host-plen_login";
@@ -124,7 +127,7 @@ const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
  *   now?: () => number, config: object, dev?: { enabled?: boolean, verify(t: string): Promise<object|null> } | null,
  *   testHooks?: { pruned?(p: { visited: number, expired: number, live: number }): void } | null }} deps   (tests only, not an API)
  */
-export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, spaces = spaceService({ registry, tenancy, home, now }), config = {}, dev = null, log = stdoutLog, testHooks = null }) {
+export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, spaces = spaceService({ registry, tenancy, home, now }), access = accessService({ registry, tenancy, announce: spaces.announceChange, backlog: spaces.backlog, settled: spaces.settled }), config = {}, dev = null, log = stdoutLog, testHooks = null }) {
   if (!registry || !sessions || !tenancy) throw new Error("http: registry, sessions and tenancy are required");
   const postLoginUrl = absUrl(config.postLoginUrl, "postLoginUrl");
   const postLogoutUrl = config.postLogoutUrl ? absUrl(config.postLogoutUrl, "postLogoutUrl") : postLoginUrl;
@@ -435,6 +438,30 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       GET: async (req, p, url) => json(200, await spaces.groupPage(await caller(req), p.id, url.searchParams.get("after"))),
       PATCH: async (req, p) => { const who = await caller(req); return json(200, { group: await spaces.update(who, "group", p.id, await body(req, ["name", "general"])) }); },
     }],
+    ["/teams", {
+      GET: async (req, url) => json(200, await access.listTeams(await caller(req), { after: url.searchParams.get("after"), q: url.searchParams.get("q") })),
+      POST: async req => { const who = await caller(req); const b = await body(req, ["name"]); return json(201, { team: await access.createTeam(who, b) }); },
+    }],
+    ["/teams/:id", {
+      GET: async (req, p, url) => json(200, await access.teamPage(await caller(req), p.id, url.searchParams.get("after"))),
+      PATCH: async (req, p) => { const who = await caller(req); const b = await body(req, ["name"]); return json(200, { team: await access.renameTeam(who, p.id, b.name) }); },
+      DELETE: async (req, p) => { await access.deleteTeam(await caller(req), p.id); return json(204); },
+    }],
+    ["/teams/:id/members/:user", {
+      PUT: async (req, p) => { await access.setMember(await caller(req), p.id, p.user, true); return json(204); },
+      DELETE: async (req, p) => { await access.setMember(await caller(req), p.id, p.user, false); return json(204); },
+    }],
+    ["/directory", { GET: async (req, url) => json(200, await access.directory(await caller(req), { q: url.searchParams.get("q") })) }],
+    ["/access/:type/:id", { GET: async (req, p, url) => json(200, await access.accessPage(await caller(req), p.type, p.id, url.searchParams.get("after"))) }],
+    ["/access/:type/:id/grants/:subjectType/:subject", {
+      PUT: async (req, p) => {
+        const who = await caller(req);
+        const b = await body(req, ["role"]);
+        if (typeof b.role !== "string") throw refuse(400, "bad-request");
+        return json(200, { row: await access.setGrant(who, p.type, p.id, p.subjectType, p.subject, b.role) });
+      },
+      DELETE: async (req, p) => { await access.setGrant(await caller(req), p.type, p.id, p.subjectType, p.subject, null); return json(204); },
+    }],
     ["/boards/:board/invites", {
       GET: async (req, p) => json(200, { invites: await listInvites({ caller: await caller(req), board: p.board }, admin) }),
       POST: async (req, p) => {
@@ -520,6 +547,8 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
         if (e.code === "not-found") return err(404, "not-found");
         if (e.code === "bad-request") return err(400, "bad-request", { message: String(e.message).slice(0, 200) });
         if (e.code === "last-owner") return err(409, "last-owner");
+        if (e.code === "too-large") return err(409, "too-large");
+        if (e.code === "unknown-person" || e.code === "bad-role") return err(400, e.code);
         if (e.code === "owner-grant-failed") return err(503, "owner-grant-failed", { board: e.board });
       }
       return err(503, "unavailable");

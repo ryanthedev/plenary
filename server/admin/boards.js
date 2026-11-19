@@ -17,7 +17,7 @@ import { isUnitAdmin } from "../auth/resolver.js";
 
 export class AdminError extends Error {
   /**
-   * @param {"forbidden"|"bad-request"|"not-found"|"last-owner"|"owner-grant-failed"} code
+   * @param {"forbidden"|"bad-request"|"not-found"|"last-owner"|"owner-grant-failed"|"unknown-person"|"bad-role"|"too-large"} code
    * @param {string} [message]
    * @param {{ board?: string, cause?: unknown }} [extra]  `board`: the id of a board created without its owner grant
    */

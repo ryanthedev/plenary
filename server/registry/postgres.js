@@ -71,7 +71,7 @@
 // owns that pool) or `sql` (a Bun SQL client you own). `schema` names the Postgres schema. Never reads env.
 
 import { SQL } from "bun";
-import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, smallLimit, searchQuery, asciiFold } from "../auth/registry-port.js";
+import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 import { needSchema, migrate, missing as absent } from "../pg/schema.js";
 
@@ -119,6 +119,7 @@ const REGISTRY_TABLE_DDL = {
   reg_board_spaces: "board TEXT PRIMARY KEY REFERENCES $S.reg_boards(id), space TEXT NOT NULL REFERENCES $S.reg_spaces(id)",
   reg_teams: "id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), name TEXT NOT NULL, created_at BIGINT NOT NULL",
   reg_team_members: "team TEXT NOT NULL REFERENCES $S.reg_teams(id), member TEXT NOT NULL, PRIMARY KEY (team, member)",
+  reg_members: "tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), member TEXT NOT NULL, name TEXT, email TEXT, PRIMARY KEY (tenant, member)",
   reg_scope_grants: "scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject TEXT NOT NULL, role TEXT NOT NULL, n BIGINT GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (scope_type, scope_id, subject_type, subject)",
   // Home (PROTOCOL.md § Home): Recent and Starred. Additive, like the organization tables.
   reg_recents: "member TEXT NOT NULL, board TEXT NOT NULL REFERENCES $S.reg_boards(id), opened_at BIGINT NOT NULL, PRIMARY KEY (member, board)",
@@ -174,7 +175,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
   const T = `"${s}".reg_tenants`, A = `"${s}".reg_tenant_admins`, BD = `"${s}".reg_boards`, G = `"${s}".reg_grants`,
     I = `"${s}".reg_invites`, L = `"${s}".reg_links`, U = `"${s}".reg_link_uses`,
     TM = `"${s}".reg_tenant_meta`, TD = `"${s}".reg_tenant_domains`, GR = `"${s}".reg_groups`, SP = `"${s}".reg_spaces`, BS = `"${s}".reg_board_spaces`,
-    TE = `"${s}".reg_teams`, TU = `"${s}".reg_team_members`, SG = `"${s}".reg_scope_grants`, RO = `"${s}".reg_roles`,
+    TE = `"${s}".reg_teams`, TU = `"${s}".reg_team_members`, SG = `"${s}".reg_scope_grants`, RO = `"${s}".reg_roles`, MB = `"${s}".reg_members`,
     RC = `"${s}".reg_recents`, ST = `"${s}".reg_stars`;
 
   try {
@@ -596,6 +597,96 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     async teamMembers(team) {
       ready();
       return key(team) ? (await db.unsafe(`SELECT member FROM ${TU} WHERE team = $1 ORDER BY member`, [team])).map(r => r.member) : [];
+    },
+    async renameTeam(team, name) {
+      ready();
+      const n = orgDefaults.name(name);
+      const r = key(team) ? await one(db, `UPDATE ${TE} SET name = $2 WHERE id = $1 RETURNING *`, [team, n]) : null;
+      if (!r) throw new Error("registry: no such team");
+      return rowTeam(r);
+    },
+    async deleteTeam(team) {
+      ready();
+      if (!key(team)) throw new Error("registry: no such team");
+      await write(async tx => {
+        const tm = await one(tx, `SELECT tenant FROM ${TE} WHERE id = $1`, [team]);
+        if (!tm) throw new Error("registry: no such team");
+        // The same lock order as setTeamMember: the tenant's owners lock, the containers the Team owns, then its member rows.
+        await lockOwners(tx, tm.tenant);
+        for (const o of await ownedBy(tx, team)) await tx.unsafe(`SELECT id FROM ${o.scope_type === "group" ? GR : SP} WHERE id = $1 FOR UPDATE`, [o.scope_id]);
+        await tx.unsafe(`SELECT 1 FROM ${TU} WHERE team = $1 ORDER BY member FOR UPDATE`, [team]);
+        // An empty Team guards nothing, so only a Team with members can be the last counted owner.
+        if (Number((await one(tx, `SELECT count(*) AS c FROM ${TU} WHERE team = $1`, [team])).c) > 0)
+          for (const o of await ownedBy(tx, team))
+            if ((await countedOwners(tx, o.scope_type, o.scope_id)).length <= 1) throw new PgRegistryError("last-owner", `a ${o.scope_type} keeps at least one owner`);
+        await tx.unsafe(`DELETE FROM ${SG} WHERE subject_type = 'team' AND subject = $1`, [team]);
+        await tx.unsafe(`DELETE FROM ${TU} WHERE team = $1`, [team]);
+        await tx.unsafe(`DELETE FROM ${TE} WHERE id = $1`, [team]);
+      });
+    },
+    async teamsPage(tenant, { after = null, limit, q: term = null } = {}) {
+      ready();
+      const cur = orgDefaults.cursor(after, "id"), n = smallLimit(limit, TEAMS.page.default, TEAMS.page.max), like = likeOf(term);
+      if (!key(tenant)) return { teams: [], next: null };
+      const fold = c => `translate(${c}, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')`;
+      const rows = await db.unsafe(`SELECT t.*, (SELECT count(*) FROM (SELECT 1 FROM ${TU} m WHERE m.team = t.id LIMIT ${TEAMS.sizeCap + 1}) c) AS size
+        FROM ${TE} t WHERE t.tenant = $1 AND ($2::text IS NULL OR t.id COLLATE "C" > $2) AND ($3::text IS NULL OR ${fold("t.name")} LIKE $3 ESCAPE '\\')
+        ORDER BY t.id COLLATE "C" LIMIT $4`, [tenant, cur, like, n + 1]);
+      const page = rows.slice(0, n);
+      return { teams: page.map(r => ({ ...rowTeam(r), size: Number(r.size) })), next: rows.length > n ? page[n - 1].id : null };
+    },
+    async teamsAmong(tenant, ids) {
+      ready();
+      const is = [...new Set((ids ?? []).filter(key))].slice(0, TEAMS.among);
+      if (!key(tenant) || !is.length) return [];
+      return (await db.unsafe(`SELECT t.*, (SELECT count(*) FROM (SELECT 1 FROM ${TU} m WHERE m.team = t.id LIMIT ${TEAMS.sizeCap + 1}) c) AS size
+        FROM ${TE} t WHERE t.tenant = $1 AND t.id = ANY($2::text[]) ORDER BY t.id COLLATE "C"`, [tenant, is])).map(r => ({ ...rowTeam(r), size: Number(r.size) }));
+    },
+    async teamMembersPage(team, { after = null, limit } = {}) {
+      ready();
+      const cur = orgDefaults.cursor(after, "id"), n = smallLimit(limit, TEAMS.page.default, TEAMS.page.max);
+      if (!key(team)) return { users: [], next: null };
+      const rows = (await db.unsafe(`SELECT member FROM ${TU} WHERE team = $1 AND ($2::text IS NULL OR member COLLATE "C" > $2) ORDER BY member COLLATE "C" LIMIT $3`, [team, cur, n + 1])).map(r => r.member);
+      const page = rows.slice(0, n);
+      return { users: page, next: rows.length > n ? page[n - 1] : null };
+    },
+    async scopedGrant(scope, subject) {
+      ready();
+      const { type, id } = orgDefaults.scope(scope), sub = orgDefaults.subject(subject);
+      return key(id) && key(sub.id) ? (await one(db, `SELECT role FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 AND subject_type = $3 AND subject = $4`, [type, id, sub.type, sub.id]))?.role ?? null : null;
+    },
+    async scopedGrantsPage(scope, { after = null, limit } = {}) {
+      ready();
+      const { type, id } = orgDefaults.scope(scope), cur = orgDefaults.cursor(after, "subject"), n = smallLimit(limit, TEAMS.page.default, TEAMS.page.max);
+      if (!key(id)) return { grants: [], next: null };
+      const rows = await db.unsafe(`SELECT subject_type, subject, role FROM ${SG} WHERE scope_type = $1 AND scope_id = $2
+        AND ($3::text IS NULL OR (subject_type || E'\\n' || subject) COLLATE "C" > $3) ORDER BY subject_type COLLATE "C", subject COLLATE "C" LIMIT $4`, [type, id, cur, n + 1]);
+      const page = rows.slice(0, n);
+      return { grants: page.map(rowSg), next: rows.length > n ? page[n - 1].subject_type + "\n" + page[n - 1].subject : null };
+    },
+    async touchMember(tenant, { user, name = null, email = null }) {
+      ready();
+      if (!key(tenant) || !key(user) || !user) throw new Error("registry: bad member");
+      const nm = profileText(name, 200), em = profileText(email, 320);
+      // One conditional statement: no write (and no row lock) unless the row is new or changed.
+      if (!(await db.unsafe(`INSERT INTO ${MB} (tenant, member, name, email) SELECT $1, $2, $3, $4 WHERE EXISTS (SELECT 1 FROM ${T} WHERE id = $1)
+        ON CONFLICT (tenant, member) DO UPDATE SET name = excluded.name, email = excluded.email WHERE ${MB}.name IS DISTINCT FROM excluded.name OR ${MB}.email IS DISTINCT FROM excluded.email
+        RETURNING member`, [tenant, user, nm, em])).length) {
+        if (!(await one(db, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
+      }
+    },
+    async membersAmong(tenant, users) {
+      ready();
+      const us = [...new Set((users ?? []).filter(key))].slice(0, TEAMS.among);
+      return key(tenant) && us.length ? (await db.unsafe(`SELECT member AS "user", name, email FROM ${MB} WHERE tenant = $1 AND member = ANY($2::text[])`, [tenant, us])) : [];
+    },
+    async findMembers(tenant, { q: term = null, limit } = {}) {
+      ready();
+      const like = likeOf(term), n = smallLimit(limit, TEAMS.find.default, TEAMS.find.max);
+      if (!key(tenant)) return [];
+      const fold = c => `translate(${c}, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')`;
+      return await db.unsafe(`SELECT member AS "user", name, email FROM ${MB} WHERE tenant = $1 AND ($2::text IS NULL OR ${fold("coalesce(name, '')")} LIKE $2 ESCAPE '\\'
+        OR ${fold("coalesce(email, '')")} LIKE $2 ESCAPE '\\' OR ${fold("member")} LIKE $2 ESCAPE '\\') ORDER BY coalesce(name, member) COLLATE "C", member COLLATE "C" LIMIT $3`, [tenant, like, n]);
     },
     async setScopedGrant({ scope, subject, role }) {
       ready();

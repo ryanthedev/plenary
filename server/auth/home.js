@@ -126,12 +126,15 @@ export function homeService({ registry, tenancy, now = Date.now }) {
     };
   }
 
+  /** Record the caller in the Unit's member directory (the people pickers' source). Best effort: Home never fails because of it. */
+  const touch = async (unit, identity) => { try { await registry.touchMember(unit.id, { user: identity.user, name: identity.name, email: identity.email }); } catch {} };
+
   return {
     /** GET /home. @param {Identity} identity */
     async home(identity) {
       const unit = await tenancy.tenantOf(identity);
       const base = { guest: !unit, user: { user: identity.user, name: identity.name ?? identity.email ?? identity.user }, unit: unit ? { id: unit.id, kind: unit.kind } : null, limits: LIMITS };
-      if (unit) await registry.ensurePersonalSpace(unit.id, identity.user);        // a member always has a place to put a board (JOURNEY J1)
+      if (unit) { await registry.ensurePersonalSpace(unit.id, identity.user); await touch(unit, identity); }        // a member always has a place to put a board (JOURNEY J1)
       const [rec, star, { owned, shared }, theTree, unitAccess] = await Promise.all([
         registry.recents(identity.user, { limit: SCAN.recent }),
         unit ? registry.starred(identity.user, { limit: SCAN.starred }) : [],

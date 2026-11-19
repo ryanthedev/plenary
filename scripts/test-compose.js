@@ -483,8 +483,9 @@ async function scenario(stack, report) {
 
     // d. a non-host gateway that has clients.
     const h2 = await hostNow();
-    const gw = clients.find(c => c.open && c.at() !== h2)?.at();
-    if (!gw) fail("case d: no client on a non-host node");
+    const gw = NODES.find(n => n !== h2 && nodes[n].alive);
+    for (const c of [ed1, view]) { c.homeNode = gw; if (c.at() !== gw) await c.reconnect().catch(() => {}); }   // explicit: a plain gateway that has clients
+    await waitFor(`ed1 and view on ${gw}`, () => [ed1, view].every(c => c.open && c.at() === gw), 30_000, 100);
     await killCase({ label: "case d (non-host gateway with clients)", victim: gw, takeover: false, restartMode: "after" });
   } finally {
     clearInterval(keepAlive); clearInterval(ticker);

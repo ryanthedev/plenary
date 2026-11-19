@@ -224,6 +224,65 @@ test("focus survives a drawer rebuild: a focused thread row is found again after
   } finally { Object.getPrototypeOf(d).focus = orig; collab.destroy(); }
 });
 
+// Focus is restored by the control's own key (note id + action), never by its label or position.
+function focusRig() {
+  const doc = globalThis.document, body = {}; doc.body = body; doc.activeElement = body;
+  const proto = Object.getPrototypeOf(dom.root), orig = proto.focus;
+  proto.focus = function () { doc.activeElement = this; };
+  return { doc, restore: () => { proto.focus = orig; } };
+}
+const note = (id, updated) => ({ id, type: "rectangle", x: 0, y: 0, width: 10, height: 10, backgroundColor: "#ffec99", updated });
+
+test("notes drawer: a note arriving above the focused one keeps focus on THAT note's delete", () => {
+  const { port, collab } = setup("annotator", { notes: [note("n1", 1), note("n2", 2), note("n3", 3)], noteAuthors: { n1: "me", n2: "me", n3: "me" } });
+  port.editNote = () => {}; port.deleteNote = () => {};
+  const d = collab.parts.drawer, f = focusRig();
+  try {
+    collab.showDrawer("notes");
+    const dels = () => d.all().filter(e => e.tagName === "BUTTON" && /^note:.+:delete$/.test(e.getAttribute("data-fk") ?? ""));
+    const target = dels()[1], key = target.getAttribute("data-fk");
+    f.doc.activeElement = target;
+    port.setElement("notes", "n0", note("n0", 100)); port.setNoteAuthor("n0", "me");        // a new note arrives (it sorts above the others)
+    port.setElement("notes", "n4", note("n4", 0)); port.setNoteAuthor("n4", "me");
+    port.remote({ do: "thread", id: "tx", anchor: { point: { x: 1, y: 1 } }, text: "tick" }, "pri", "Priya");   // any change refreshes the drawer
+    expect(dels().length).toBe(5);
+    expect(f.doc.activeElement).not.toBe(target);                                             // the row was rebuilt ...
+    expect(f.doc.activeElement.getAttribute("data-fk")).toBe(key);                            // ... and focus is on the same note's delete
+    expect(dels().includes(f.doc.activeElement)).toBe(true);
+  } finally { f.restore(); collab.destroy(); }
+});
+
+test("comments drawer: threads that start with identical text keep their own focus", () => {
+  const { port, collab } = setup("annotator");
+  port.here({ writers: [{ user: "pri", name: "Priya", role: "annotator" }], writerCount: 1, viewers: 0 });
+  for (const id of ["t1", "t2", "t3"]) port.remote({ do: "thread", id, anchor: { point: { x: 1, y: 1 } }, text: "same words" }, "pri", "Priya");
+  const d = collab.parts.drawer, f = focusRig();
+  try {
+    collab.showDrawer("comments");
+    const rows = () => byClass(d, "thread-row");
+    const target = rows().find(r => r.getAttribute("data-thread") === "t2");
+    f.doc.activeElement = target;
+    port.remote({ do: "thread", id: "t0", anchor: { point: { x: 3, y: 3 } }, text: "same words" }, "pri", "Priya");   // another identical thread joins
+    expect(rows().length).toBe(4);
+    expect(f.doc.activeElement).not.toBe(target);
+    expect(f.doc.activeElement.getAttribute("data-thread")).toBe("t2");                       // by id, not by the text they share
+  } finally { f.restore(); collab.destroy(); }
+});
+
+test("a deleted note's focus falls to the next delete, then the previous, never to another kind of control", () => {
+  const { port, collab } = setup("annotator", { notes: [note("n1", 1), note("n2", 2)], noteAuthors: { n1: "me", n2: "me" } });
+  port.editNote = () => {}; port.deleteNote = () => {};
+  const d = collab.parts.drawer, f = focusRig();
+  try {
+    collab.showDrawer("notes");
+    const del = id => d.all().find(e => e.getAttribute("data-fk") === `note:${id}:delete`);
+    f.doc.activeElement = del("n2");
+    port.setElement("notes", "n2", null);
+    port.remote({ do: "thread", id: "tx", anchor: { point: { x: 1, y: 1 } }, text: "tick" }, "pri", "Priya");
+    expect(f.doc.activeElement.getAttribute("data-fk")).toBe("note:n1:delete");
+  } finally { f.restore(); collab.destroy(); }
+});
+
 test("presence in: cursors are drawn on the overlay with names; going offline clears them", () => {
   const { port, collab, clock } = setup("viewer");
   port.here({ writers: [{ user: "maya", name: "Maya", role: "owner" }, { user: "pri", name: "Priya", role: "annotator" }], writerCount: 2, viewers: 1 });

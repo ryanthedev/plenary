@@ -39,7 +39,9 @@ export function keeper() {
 const kids = el => [...(el.children ?? [])];
 const walk = root => { const out = []; const visit = e => { for (const c of kids(e)) { out.push(c); visit(c); } }; visit(root); return out; };
 const keyOf = el => el.getAttribute?.("data-fk") ?? null;
-const kindOf = k => String(k).split(":")[0];
+/** The kind of control a key names, for the fallback when its row is gone: `thread:<id>` -> "thread", `note:<id>:delete` -> "note:delete". Anything else has no kind (no fallback). */
+const ACTIONS = new Set(["delete", "edit", "jump", "lock", "visible"]);
+const kindOf = k => { const p = String(k).split(":"); return p.length === 2 ? p[0] : p.length === 3 && ACTIONS.has(p[2]) ? `${p[0]}:${p[2]}` : null; };
 const CONTROL = /^(BUTTON|A|INPUT|SELECT|TEXTAREA)$/;
 const sayText = el => (el.textContent ?? "").trim().slice(0, 40);
 
@@ -82,7 +84,7 @@ export function restoreFocus(held) {
   const keyed = walk(held.root).filter(e => keyOf(e) !== null), byKey = k => keyed.find(e => keyOf(e) === k);
   let to = byKey(held.key);
   if (!to && !held.key.startsWith("auto:")) {
-    const i = held.order.indexOf(held.key), same = held.order.map((k, j) => [k, j]).filter(([k]) => kindOf(k) === kindOf(held.key));
+    const kind = kindOf(held.key), i = held.order.indexOf(held.key), same = kind === null ? [] : held.order.map((k, j) => [k, j]).filter(([k]) => kindOf(k) === kind);
     to = [...same.filter(([, j]) => j > i), ...same.filter(([, j]) => j < i).reverse()].map(([k]) => byKey(k)).find(Boolean) ?? byKey("heading");
   }
   to?.focus?.();

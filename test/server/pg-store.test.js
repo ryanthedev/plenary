@@ -496,12 +496,13 @@ describe.skipIf(!url)("postgres store", () => {
     return { release: async () => { release(); await tx; } };
   };
 
-  /** The window after seq 25 counted its parts: wait (on a condition, not a guess at how long) until the sweep's delete is either blocked on the checkpoint lock (an advisory lock request not yet granted: the code under test) or has already deleted seq 25's parts (what a missing lock allows). Fails by deadline, naming itself. */
+  /** The window after seq 25 counted its parts: wait (on a condition, not a guess at how long) until the sweep's delete is either blocked on the checkpoint lock (a not-yet-granted request for this board's advisory lock: the code under test) or has already deleted seq 25's parts (what a missing lock allows). Fails by deadline, naming itself. */
   const sweepSettled = async (schema, ms = 10_000) => {
     const end = Date.now() + ms;
     for (;;) {
-      const [{ waiting, parts }] = await client().unsafe(`SELECT (SELECT count(*)::int FROM pg_locks WHERE locktype = 'advisory' AND NOT granted) AS waiting,
-        (SELECT count(*)::int FROM "${schema}".pl_checkpoint_parts WHERE seq = 25) AS parts`);
+      const [{ waiting, parts }] = await client().unsafe(`SELECT (SELECT count(*)::int FROM pg_locks WHERE locktype = 'advisory' AND NOT granted
+          AND objid = (hashtext($1)::bigint & 4294967295)::oid) AS waiting,   -- this board's checkpoint lock only (the key's low 32 bits), not any waiter in the database
+        (SELECT count(*)::int FROM "${schema}".pl_checkpoint_parts WHERE seq = 25) AS parts`, [lockKey(schema)]);
       if (waiting > 0 || parts === 0) return;
       if (Date.now() > end) throw new Error("timed out waiting for the sweep to queue on the checkpoint lock or delete seq 25's parts");
       await Bun.sleep(10);

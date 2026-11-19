@@ -23,7 +23,7 @@ export function fakeIdpAdapter({ authorizeUrl = "https://idp.invalid/authorize" 
       const state = randomId(32), nonce = randomId(32), verifier = randomId(43);
       return { url: `${authorizeUrl}?state=${state}`, state, nonce, verifier };
     },
-    /** The person signs in at the IdP for the flow `begun`; returns the code the IdP redirects back with. */
+    /** The user signs in at the IdP for the flow `begun`; returns the code the IdP redirects back with. */
     authorize(begun, identity = FAKE_IDENTITY) {
       const code = "c-" + randomId(24);
       codes.set(code, { nonce: begun.nonce, verifier: begun.verifier, identity: { ...identity } });

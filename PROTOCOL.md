@@ -678,14 +678,16 @@ page trades it for a session token.
 2. **Client.** Read `#code`, drop the fragment at once (`history.replaceState`), then `POST /auth/exchange` from the
    same origin with `credentials: "same-origin"`, `Content-Type: application/json` and body `{"code":"<code>"}`.
    The server accepts only the post-login URL's origin, so the auth routes and the page share one origin.
-3. **Answers** (JSON, `no-store` on success):
+3. **Answers** (JSON, always `Cache-Control: no-store`):
    - `200 {token, user, name, email, domain, exp}`; the exchange cookie is cleared.
    - `400 {error:"invalid-code"}`: unknown, expired (> 60 s), already used, or not this browser's. One answer for all,
      so there is no oracle.
    - `403 {error:"bad-origin"}`: the `Origin` header is not the post-login origin.
    - `503 {error:"unavailable"}`: the server can't issue a session right now; the code is not spent, so one jittered
      retry is reasonable. Sign-in not configured at all answers `503 {error:"sign-in-unavailable"}`.
-   - A non-JSON body is refused with 415 and an oversized one with 413.
+   - A body that is not JSON (by content type) is refused with 415, an oversized one with 413, and a JSON content type
+     with a body that can't be read, isn't an object, or has a field other than `code` with `400 {error:"bad-request"}`
+     (`"unknown-field"` for the extra field), and with a body that doesn't parse as JSON with `400 {error:"bad-json"}`.
    - `{error:"network"}` is client-only: no answer at all. The server never sends it.
 4. The token then goes in `hello` (kept in memory and sessionStorage, never localStorage or a URL).
 

@@ -41,7 +41,7 @@ test("bodies are normalised: unknown fields dropped, bad rows dropped, lists and
 
 test("every failure is a value from ACCESS_ERRORS (conflict and invalid carry the server's code), never a throw", async () => {
   const bad = [[answer(400, { error: "unknown-person" }), "invalid", "unknown-person"], [answer(400, { error: "bad-role" }), "invalid", "bad-role"], [answer(400, {}), "invalid"],
-    [answer(401, {}), "auth"], [answer(403, {}), "forbidden"], [answer(404, {}), "notfound"], [answer(409, { error: "last-owner" }), "conflict", "last-owner"], [answer(409, { error: "too-large" }), "conflict", "too-large"],
+    [answer(401, {}), "auth"], [answer(403, {}), "forbidden"], [answer(404, {}), "notfound"], [answer(409, { error: "last-owner" }), "conflict", "last-owner"], [answer(409, { error: "too-large" }), "conflict", "too-large"], [answer(409, { error: "superseded" }), "conflict", "superseded"],
     [answer(409, "<html>"), "conflict"], [answer(503, {}), "unavailable"], [answer(200, "<html>"), "unavailable"], [answer(200, { nope: 1 }), "unavailable", undefined, true], [async () => { throw new Error("offline"); }, "network"], [async () => null, "unavailable"]];
   const calls = [a => a.teams(), a => a.team("tm-1"), a => a.createTeam("x"), a => a.renameTeam("tm-1", "x"), a => a.deleteTeam("tm-1"), a => a.setMember("tm-1", "u", true), a => a.directory("x"),
     a => a.access("space", "s-1"), a => a.setGrant("space", "s-1", { type: "user", id: "u" }, "viewer"), a => a.removeGrant("space", "s-1", { type: "user", id: "u" })];

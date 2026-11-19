@@ -56,7 +56,7 @@ export function httpAccess({ fetch, token, base = "", timeoutMs = 10_000, timers
   const set = timers ? timers.set : (fn, ms) => setTimeout(fn, ms);
   const clear = timers ? timers.clear : h => clearTimeout(h);
   const STATUS = { 400: "invalid", 401: "auth", 403: "forbidden", 404: "notfound", 409: "conflict", 422: "invalid", 429: "limited" };
-  const CODES = ["unknown-person", "bad-role", "last-owner", "too-large", "rate-limited"];
+  const CODES = ["unknown-person", "bad-role", "last-owner", "too-large", "rate-limited", "superseded"];
 
   /** One request: `{ body }` (a parsed 200/201 body, or null for a 204), or `{ error, code? }`. Never throws. */
   async function ask(path, method = "GET", json, key = null) {

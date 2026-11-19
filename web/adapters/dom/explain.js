@@ -9,10 +9,10 @@ import { createAskModel, whyLines, pillLine, sourceText, ownersText, waitText, n
 
 /**
  * Ask for access at a scope: a role to ask for (when the server offers more than one), the button, and the outcome. Built once, repainted in place on every change.
- * @param {{ api: { ask(type: string, id: string, role: string, key?: string|null): Promise<any> }, type: string, id: string, why: import("../../core/explain.js").Explain, newKey?: (() => string)|null, setTimer?: Function, clearTimer?: Function }} o
+ * @param {{ api: { ask(type: string, id: string, role: string, key?: string|null): Promise<any> }, type: string, id: string, why: import("../../core/explain.js").Explain, newKey?: (() => string)|null, reload?: (() => Promise<import("../../core/explain.js").Explain|null>)|null, setTimer?: Function, clearTimer?: Function }} o
  */
-export function askView({ api, type, id, why, newKey = null, setTimer = setTimeout, clearTimer = clearTimeout }) {
-  const model = createAskModel({ api, type, id, why, newKey, onChange: () => paint() });
+export function askView({ api, type, id, why, newKey = null, reload = null, setTimer = setTimeout, clearTimer = clearTimeout }) {
+  const model = createAskModel({ api, type, id, why, newKey, reload, onChange: () => paint() });
   const S = model.state;
   const select = h("select.field", { "aria-label": "Role to ask for", onchange: e => model.choose(e.target.value) },
     why.ask.roles.map(r => h("option", { value: r.id, selected: r.id === S.role }, r.name)));
@@ -97,7 +97,7 @@ export function pillPopover({ pill, explain, board, access = null, newKey = null
     if (mine !== token || !pop) return;
     if (!res.why) { replace(body, h("p", { role: "status" }, "Could not look that up right now. Try again in a moment.")); return; }
     const w = res.why;
-    const card = access && (w.ask.can || w.ask.pending) ? askView({ api: access, type: "board", id: board, why: w, newKey }) : null;
+    const card = access && (w.ask.can || w.ask.pending) ? askView({ api: access, type: "board", id: board, why: w, newKey, reload: async () => (await explain())?.why ?? null }) : null;
     replace(body, h("p", {}, pillLine(w.mine) + "."),
       w.mine.sources.length ? h("ul.rows", { "aria-label": "Where your access comes from" }, w.mine.sources.map(s => { const x = sourceRow(s, here); return h("li.row", {}, x.text, x.strongest ? h("span.badge", {}, "grants the most") : null); })) : null,
       w.needs["board.edit"] ? h("p", {}, `${needText(w.needs["board.edit"], "Editing", w.mine)} ${ownersText(w.owners, w.guest)}`) : h("p", {}, ownersText(w.owners, w.guest)),

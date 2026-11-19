@@ -97,7 +97,7 @@ export function whyLines(why, here, what, permission, hereName = null) {
 
 const ASK_MSG = {
   limited: "You've asked too many times.", forbidden: "You can't ask for access here.", notfound: "That is not available to you.", auth: "You are signed out. Sign in again.",
-  network: "No answer from the server. Try again.", unavailable: "The server did not answer. Trying again is safe.", invalid: "That role can't be asked for here.",
+  conflict: "That request changed since you sent it.", network: "No answer from the server. Try again.", unavailable: "The server did not answer. Trying again is safe.", invalid: "That role can't be asked for here.",
 };
 /** "in 3 hours", "in 20 minutes": when a refused ask may be repeated. */
 export function waitText(ms) {
@@ -111,7 +111,7 @@ export function waitText(ms) {
  * result as state. `api.ask(type, id, role, key)` resolves `{ request }` or `{ error, retryAfter? }` (web/ports/access.js). `said` is the sentence for screen readers.
  * @param {{ api: { ask(type: string, id: string, role: string, key?: string|null): Promise<any> }, type: string, id: string, why: Explain, newKey?: (() => string)|null, onChange?: () => void }} o
  */
-export function createAskModel({ api, type, id, why, newKey = null, onChange = () => {} }) {
+export function createAskModel({ api, type, id, why, newKey = null, onChange = () => {}, reload = null }) {
   const state = { status: why.ask.pending ? "sent" : "idle", role: why.ask.roles.at(-1)?.id ?? why.ask.roles[0]?.id ?? null, message: null, said: null, pending: why.ask.pending, retryAfterMs: why.ask.retryAfterMs };
   let key = null;
   const done = () => onChange(state);
@@ -127,6 +127,17 @@ export function createAskModel({ api, type, id, why, newKey = null, onChange = (
       let k = null;
       try { k = newKey ? (key ??= newKey()) : null; } catch { k = null; }
       const r = await api.ask(type, id, state.role, k);
+      if (r.error === "conflict" && r.code === "superseded") {
+        // A later ask replaced the request this key made: the key can only ever answer 409 again, so drop it and show what is open now (when the page can reload it).
+        key = null;
+        let fresh = null;
+        try { fresh = reload ? await reload() : null; } catch { fresh = null; }
+        const p = fresh?.ask?.pending;
+        if (p) { state.status = "sent"; state.pending = p; state.said = state.message = "Your earlier request was replaced by a newer one. This is the one the owners see."; }
+        else { state.status = "idle"; state.said = state.message = "Your earlier request was replaced by a newer one. Ask again to see where it stands."; }
+        done();
+        return state.status === "sent";
+      }
       if (r.error) {
         state.status = r.error === "limited" ? "limited" : "error";
         state.retryAfterMs = r.error === "limited" && Number.isFinite(r.retryAfter) ? r.retryAfter * 1000 : state.retryAfterMs;

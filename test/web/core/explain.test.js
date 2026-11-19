@@ -107,3 +107,22 @@ test("Ask model: clearLimit re-opens a limited button (and never a sent or busy 
   sent.clearLimit();
   expect(sent.state.status).toBe("sent");
 });
+
+test("Ask model: a 409 superseded drops the key and shows the current request (or says to ask again) instead of looping on the same key", async () => {
+  const conflict = { error: "conflict", code: "superseded" };
+  const keys = [];
+  const api = { ask: async (...a) => { keys.push(a[3]); return a[3] === "key-1" ? conflict : { request: { role: "editor", roleName: "Editor", at: 9, state: "pending" } }; } };
+  let n = 0;
+  const cur = { ...WHY(), ask: { ...WHY().ask, pending: { role: "editor", roleName: "Editor", at: 5 } } };
+  const m = createAskModel({ api, type: "space", id: "s-1", why: WHY(), newKey: () => `key-${++n}`, reload: async () => cur });
+  expect(await m.submit()).toBe(true);                              // the open request is shown
+  expect(m.state).toMatchObject({ status: "sent", pending: { role: "editor", at: 5 } });
+  expect(m.state.message).toMatch(/replaced by a newer one/);
+  const m2 = createAskModel({ api, type: "space", id: "s-1", why: WHY(), newKey: () => `key-${++n}` });   // no reload on this page
+  n = 0; keys.length = 0;
+  expect(await m2.submit()).toBe(false);
+  expect(m2.state).toMatchObject({ status: "idle" });
+  expect(m2.state.message).toMatch(/Ask again/);
+  expect(await m2.submit()).toBe(true);                             // a NEW key: no loop
+  expect(keys).toEqual(["key-1", "key-2"]);
+});

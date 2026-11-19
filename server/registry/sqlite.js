@@ -688,7 +688,9 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       ready();
       if (!str(tenant) || !q.tenantExists.get(tenant)) throw new Error("registry: no such tenant");
       if (!str(user) || !user) throw new Error("registry: bad user");
-      touchTx.immediate(tenant, user, profileText(name, 200), profileText(email, 320));
+      const nm = profileText(name, 200), em = profileText(email, 320), cur = q.dirGet.get(tenant, user);
+      // Read first: Home calls this on every load, and the write lock (BEGIN IMMEDIATE) is taken only when the row is new or changed.
+      if (!cur || cur.name !== nm || cur.email !== em) touchTx.immediate(tenant, user, nm, em);
     },
     async membersAmong(tenant, users) {
       ready();

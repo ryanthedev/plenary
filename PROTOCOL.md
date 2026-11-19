@@ -795,8 +795,7 @@ record.
 ### Organization (Units, Groups, Spaces, Teams)
 
 Boards are organized as **Unit > Group > Space > Board**. Design: design/orgs/JOURNEY.md (§ 1, 2). The Registry stores it
-(§ Registry, "Organization"); the resolver below turns it into access. Nothing here adds an HTTP route or UI: those are
-the later board-organization issues.
+(§ Registry, "Organization"); the resolver below turns it into access. The routes and pages are § Home, § Spaces and Groups and § Teams and access.
 
 - **Unit** = today's tenant, plus a `kind` label (`company` | `enterprise`) and **one or more Workspace domains**
   (`tenant.domains`; `tenant.domain` stays the first). A domain belongs to at most one tenant. Units don't nest, so the
@@ -1171,7 +1170,7 @@ method names are stable. Ids are server-minted over `[a-z0-9-]`.
 | invites | `createInvite({ board, email, role, expiresAt, by })`, `invite(id)`, `invites(board)`, `invitesFor(board, email)`, `revokeInvite(id)` |
 | share links | `createLink({ board, role, expiresAt, by })` (role per link), `link(id)`, `links(board)`, `revokeLink(id)`, `addLinkUse(link, user)`, `linkUses(board, user)` |
 | home | `markOpened(user, board)`, `recents(user, { limit })`, `setStarred(user, board, on)`, `starred(user, { limit })`, `starredAmong(user, boards)`, `sharedBoards(user, email, { limit })`, `searchBoards(tenant, { q, unfiled, after, scan })`, `spaceCandidates(tenant, { user, all, after, limit })`, `groupCandidates(tenant, { user, all, limit })`, `boardRows(boards, { user, email })` (§ Home) |
-| organization | `createGroup`, `group`, `groups`; `createSpace`, `space`, `spaces`, `ensurePersonalSpace(tenant, user)`; `createTeam`, `team`, `teams`, `setTeamMember`, `teamMembers`; `setScopedGrant({ scope, subject, role \| null })`, `scopedGrants(scope)`; `createRole`, `updateRole`, `role`, `roles`; `accessContext(scope, { users, chain })`; `boardsIn(scope, { after, limit })`, `scopesOf(subject, { after, limit })`; `accessContexts(scopes, { users })` (the batch of `accessContext`, one statement on Postgres), `rename({ type: "board"\|"space"\|"group", id }, name)`, `updateScope({ type: "space"\|"group", id }, { name?, generalRole? })` (atomic; returns the row), `spacesIn(group, { after, limit })` (§ Spaces and Groups) |
+| organization | `createGroup`, `group`, `groups`; `createSpace`, `space`, `spaces`, `ensurePersonalSpace(tenant, user)`; `createTeam`, `team`, `teams`, `setTeamMember`, `teamMembers`; `setScopedGrant({ scope, subject, role \| null })`, `scopedGrants(scope)`; `createRole`, `updateRole`, `role`, `roles`; `accessContext(scope, { users, chain })`; `boardsIn(scope, { after, limit })`, `scopesOf(subject, { after, limit })`; `accessContexts(scopes, { users })` (the batch of `accessContext`, one statement on Postgres), `rename({ type: "board"\|"space"\|"group", id }, name)`, `updateScope({ type: "space"\|"group", id }, { name?, generalRole? })` (atomic; returns the row), `spacesIn(group, { after, limit })` (§ Spaces and Groups); Teams and access (§ Teams and access): `renameTeam`, `deleteTeam` (atomic, `last-owner`), `teamsPage(tenant, { after, limit, q })`, `teamsAmong(tenant, ids)`, `teamMembersPage(team, { after, limit })`, `scopedGrant(scope, subject)`, `scopedGrantsPage(scope, { after, limit })`, and the member directory `touchMember(tenant, { user, name, email })`, `membersAmong(tenant, users)`, `findMembers(tenant, { q, limit })` (table `reg_members`) |
 
 Single node: SQLite; cluster: Postgres. The room never calls it; gateways and Auth do. On Postgres the server
 runs as a role that doesn't own the schema (§ Store, Least privilege).

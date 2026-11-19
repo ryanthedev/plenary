@@ -59,7 +59,7 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
     const t = d.tree;
     const orgLinks = d.guest ? [] : [teamsHref ? mark(h("a.nav", { href: teamsHref }, "Teams"), "link:teams") : null,
       unitAccessHref && d.unit && d.can?.manageAccess ? mark(h("a.nav", { href: unitAccessHref(d.unit.id) }, "Organization access"), "link:unit-access") : null];
-    replace(side, d.guest ? null : newBoard(), d.guest ? null : newSpace(), newGroup(), navBtn("home", "Home"), d.guest ? null : navBtn("starred", "Starred", d.starred.length), navBtn("shared", "Shared with me", d.shared.length),
+    replace(side, d.guest ? null : newBoard(), d.guest ? null : newSpace(), newGroup(), navBtn("home", "Home"), d.guest ? null : navBtn("starred", "Starred", d.starred.length), navBtn("shared", "Shared with me", d.shared.length), orgLinks,
       t && h("div.tree", { role: "group", "aria-label": "Groups and Spaces" },
         t.groups.map(g => h("div.grp", {}, h("h4", {}, mark(h("a", { href: groupHref(g.id) }, g.name), `group:${g.id}`)), g.spaces.map(node))),
         t.spaces.length ? h("div.grp", {}, h("h4", {}, "Not in a group"), t.spaces.map(node)) : null,

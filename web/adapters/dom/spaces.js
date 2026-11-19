@@ -111,10 +111,11 @@ function keeper() {
     keep(key, make) { let v = kept.get(key); if (!v) kept.set(key, v = make()); used.add(key); return v; },
     mark(el, key) { el.setAttribute("data-fk", key); marks.set(key, el); return el; },
     around(fn) {
-      const had = fk(); used = new Set(); marks.clear();
+      const had = fk(), prev = globalThis.document?.activeElement ?? null; used = new Set(); marks.clear();
       fn();
       for (const k of [...kept.keys()]) if (!used.has(k)) kept.delete(k);
-      if (had) marks.get(had)?.focus?.();     // a no-op when it still holds focus; the caller's own end-of-edit focus runs after this
+      if (had) marks.get(had)?.focus?.();
+      else if (prev?.isConnected && globalThis.document?.activeElement !== prev) prev.focus?.();       // an unmarked element that was moved (an open menu's item)     // a no-op when it still holds focus; the caller's own end-of-edit focus runs after this
     },
   };
 }

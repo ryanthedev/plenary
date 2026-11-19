@@ -48,7 +48,7 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
   if (!Number.isFinite(quotaBytes) || quotaBytes < 0) throw new TypeError("blobAccess: quotaBytes must be a number ≥ 0");
   const mac = crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
 
-  /** @type {Map<string, { used: number, reserved: number, ready: Promise<void> | null, gen: number, at: number }>} gen counts reads of usage; at: when the last one answered */
+  /** @type {Map<string, { used: number, reserved: number, ready: Promise<void> | null, at: number }>} at: when the last read of usage answered */
   const tenants = new Map();
 
   /** The signed claims of a token for `verb`, or { ok: false, code }. */
@@ -75,10 +75,10 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
   /** Read the tenant's usage once (concurrent first puts share one read); a failed read is tried again by the next put. */
   function seed(tenant) {
     let st = tenants.get(tenant);
-    if (!st) tenants.set(tenant, st = { used: 0, reserved: 0, ready: null, gen: 0, at: 0 });
+    if (!st) tenants.set(tenant, st = { used: 0, reserved: 0, ready: null, at: 0 });
     if (st.ready && st.at && now() - st.at >= usageTtlMs) st.ready = null;     // stale: another node (or the reaper) changed what the tenant stores
-    // A read SETS the count (never adds to it) and starts a new generation: a put that began before it is already in what it read (or was not yet), so its own `+= n` is ignored.
-    st.ready ??= Promise.resolve(blobs.usage(tenant)).then(n => { st.used = n; st.gen++; st.at = now(); }, err => { st.ready = null; throw err; });
+    // A read SETS the count. A put finishing around it still adds its bytes afterwards, so the count may briefly double-count them (fail closed) but never misses them.
+    st.ready ??= Promise.resolve(blobs.usage(tenant)).then(n => { st.used = n; st.at = now(); }, err => { st.ready = null; throw err; });
     return st.ready.then(() => st);
   }
 
@@ -114,10 +114,9 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
         return { ok: false, code: "quota" };
       }
       st.reserved += n;
-      const gen = st.gen;
       try {
         const created = await blobs.put(v.tenant, v.sha1, bytes);
-        if (created && st.gen === gen) st.used += n;
+        if (created) st.used += n;   // always: a read that started before this write finished may not include it, and a count may over-state (until the next read) but never under-state
         return { ok: true, created: created !== false };
       } catch (err) {
         return CODES[err?.code] ? { ok: false, code: CODES[err.code] } : unavailable("put", v.tenant, err);

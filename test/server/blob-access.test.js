@@ -165,17 +165,26 @@ test("#92 MED-4: the cached usage is read again once it is older than usageTtlMs
   expect(calls.usage).toBe(3);
 });
 
-test("#92 MED-4: a usage read SETS the count, and a put that began before it adds nothing afterwards (it is in the read, or the next one)", async () => {
+test("#92 MED-4: a reseed that interleaves with an in-flight put never makes the count under-state (a quota bypass); it may over-state until the next read", async () => {
   const gate = deferred();
   let held = true;
-  const { access, inner } = make({ quotaBytes: 320, wrap: { put: async (...a) => { const r = await inner.put(...a); if (held) { held = false; await gate.promise; } return r; } } });
+  // The put's bytes land only after the reseed's walk: the read cannot have included them.
+  const { access, inner } = make({ quotaBytes: 320, wrap: { put: async (...a) => { if (held) { held = false; await gate.promise; } return inner.put(...a); } } });
   const a = fakePng(100, 54), b = fakePng(100, 55);
-  const first = access.put(await putUrl(access, "t1", a), a);   // stored on disk, its answer held
-  while ((await inner.usage("t1")) === 0) await new Promise(r => setTimeout(r, 1));
-  access.recount("t1");                                          // a reseed lands now: it reads the 100 bytes of a
-  expect((await access.put(await putUrl(access, "t1", b), b)).ok).toBe(true);   // read: 100, + b = 200
+  const first = access.put(await putUrl(access, "t1", a), a);   // reserved, not yet stored
+  await new Promise(r => setTimeout(r, 5));
+  access.recount("t1");                                          // the reseed reads 0 bytes
+  expect((await access.put(await putUrl(access, "t1", b), b)).ok).toBe(true);   // read 0, b stored: 100
   gate.resolve();
-  expect(await first).toMatchObject({ ok: true, created: true });             // a's `+= 100` is ignored: it is already in the read
-  const c = fakePng(40, 56);
-  expect((await access.put(await putUrl(access, "t1", c), c)).ok).toBe(true);  // 200 + 40 <= 320 (a double count would say 340: quota)
+  expect(await first).toMatchObject({ ok: true, created: true });             // a lands after the read: its 100 must be counted: 200
+  const c = fakePng(150, 56);
+  expect(await access.put(await putUrl(access, "t1", c), c)).toEqual({ ok: false, code: "quota" });   // 200 + 150 > 320; dropping a's add would accept it (and 350 bytes would be stored)
+  // And a put that finished BEFORE the read is counted twice at worst (over-state), never zero times.
+  const { access: acc2, inner: in2 } = make({ quotaBytes: 150 });
+  const d = fakePng(100, 57);
+  await acc2.put(await putUrl(acc2, "t2", d), d);
+  acc2.recount("t2");
+  const e = fakePng(60, 58);
+  expect(await acc2.put(await putUrl(acc2, "t2", e), e)).toEqual({ ok: false, code: "quota" });   // 100 + 60 > 150
+  expect(await in2.usage("t2")).toBe(100);
 });

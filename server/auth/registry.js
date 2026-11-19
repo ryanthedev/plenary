@@ -351,6 +351,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
       if (v.generalRole !== undefined) row.generalRole = v.generalRole;
       return copy(row);
     },
+    async personalSpace(tenant, user) { const sp = [...spaces.values()].find(s => s.tenant === tenant && s.owner === String(user)); return sp ? copy(sp) : null; },
     async ensurePersonalSpace(tenant, user) {
       need(tenants.has(tenant), "tenant");
       user = String(user);

@@ -8,6 +8,8 @@ const ms = v => (Number.isFinite(v) && v >= 0 ? v : null);
 const days = v => (Number.isSafeInteger(v) && v >= 0 && v <= 3650 ? v : null);
 const person = p => (p && typeof p === "object" && typeof p.id === "string" && p.id.length <= 200 ? { id: p.id, name: str(p.name) } : null);
 const space = s => (s && typeof s === "object" && isId(s.id) ? { id: s.id, name: str(s.name), personal: s.personal === true } : null);
+/** The personal space a restore would use; `id` is null when it does not exist yet (created on restore). */
+const into = s => (s && typeof s === "object" && s.personal === true && (s.id === null || isId(s.id)) ? { id: s.id, name: str(s.name), personal: true } : null);
 const group = g => (g && typeof g === "object" && isId(g.id) ? { id: g.id, name: typeof g.name === "string" ? str(g.name) : null } : null);
 
 /** @returns {import("../../ports/trash.js").TrashResult | null} */
@@ -34,7 +36,7 @@ export function normalizeNotice(b) {
   const from = b.from && typeof b.from === "object" ? { space: space(b.from.space), group: group(b.from.group) } : null;
   const via = b.via && typeof b.via === "object" ? { space: group(b.via.space), canRestore: b.via.canRestore === true } : null;
   return { board: { id: b.board.id, title: str(b.board.title) }, trashedAt: ms(b.trashedAt), expiresAt: ms(b.expiresAt), daysLeft: b.daysLeft, canRestore: b.canRestore,
-    ...(space(b.into) ? { into: space(b.into) } : {}), ...(person(b.by) ? { by: person(b.by) } : {}), ...(from ? { from } : {}), ...(via ? { via } : {}) };
+    ...(into(b.into) ? { into: into(b.into) } : {}), ...(person(b.by) ? { by: person(b.by) } : {}), ...(from ? { from } : {}), ...(via ? { via } : {}) };
 }
 const item = i => {
   if (!i || typeof i !== "object" || days(i.daysLeft) === null || !isId(i.id)) return null;

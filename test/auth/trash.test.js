@@ -201,6 +201,46 @@ describe("trash, undo and restore", () => {
     expect((await r.board(other.id)).trashedAt).toBe(null);
     expect((await r.board(other.id)).space).toBe(design.id);
   });
+  test("a GET never writes: the notice looks the personal space up (none yet: `into` says it is created on restore); only the POST restore creates it", async () => {
+    const calls = [];
+    const spy = { ...r, ensurePersonalSpace: (...a) => { calls.push(a); return r.ensurePersonalSpace(...a); } };
+    const t2 = trashService({ registry: spy, tenancy: ten, spaces, now: () => clock.t });
+    await r.touchMember(acme.id, { user: "google:newbie", name: "newbie", email: "newbie@acme.com" });
+    const newbie = ident("newbie");
+    await r.setScopedGrant({ scope: { type: "space", id: design.id }, subject: { type: "user", id: newbie.user }, role: "owner" });
+    await t2.trashBoard(ada, board.id, { from: design.id });
+    await t2.trashSpace(ada, design.id);
+    expect(await r.personalSpace(acme.id, newbie.user)).toBe(null);
+    const n = await t2.notice(newbie, board.id);
+    expect(n).toMatchObject({ canRestore: true, into: { id: null, personal: true } });
+    expect(n.into.name).toMatch(/created on restore/);
+    expect(await t2.list(newbie)).toBeTruthy();
+    expect(calls.filter(c => c[1] === newbie.user)).toEqual([]);                      // nothing was created by reading
+    expect(await r.personalSpace(acme.id, newbie.user)).toBe(null);
+    const out = await t2.restoreBoard(newbie, board.id);
+    expect(out).toMatchObject({ restored: true, movedTo: { personal: true } });
+    expect((await r.personalSpace(acme.id, newbie.user)).id).toBe(out.movedTo.id);   // the POST created it
+  });
+  test("the Space going to Trash between choosing the destination and the write: restore chooses again once (never answers space-in-trash) and still applies the no-escalation check", async () => {
+    await tr.trashBoard(ada, board.id, { from: design.id });
+    let hide = 1;
+    const racy = { ...r, space: async id => { const sp = await r.space(id); return id === design.id && hide-- > 0 ? { ...sp, trashedAt: null } : sp; } };
+    await r.trashSpace({ space: design.id, by: ada.user });
+    const t2 = trashService({ registry: racy, tenancy: ten, spaces, now: () => clock.t });
+    const out = await t2.restoreBoard(ada, board.id);
+    expect(out).toMatchObject({ restored: true, movedTo: { id: adasSpace.id } });
+    // the retry applies the same check: an editor-level deleter is refused, not let through
+    const janitor = await r.createRole({ tenant: acme.id, name: "Janitor2", boardRole: "editor", permissions: ["delete"] });
+    await r.setScopedGrant({ scope: { type: "space", id: platform.id }, subject: { type: "user", id: "google:max" }, role: janitor.id });
+    const b2 = await r.createBoard({ tenant: acme.id, title: "P2", space: platform.id, owner: "google:root" });
+    await r.trashBoard({ board: b2.id, from: platform.id, by: "google:root" });
+    await r.trashSpace({ space: platform.id, by: "google:root" });
+    hide = 1;
+    const racy2 = { ...r, space: async id => { const sp = await r.space(id); return id === platform.id && hide-- > 0 ? { ...sp, trashedAt: null } : sp; } };
+    const t3 = trashService({ registry: racy2, tenancy: ten, spaces, now: () => clock.t });
+    expect(await code(t3.restoreBoard(max, b2.id))).toBe("would-escalate");
+    expect((await r.board(b2.id)).trashedAt).not.toBe(null);
+  });
   test("restoring into the personal space may not raise the restorer's own role: an editor-level deleter is refused (would-escalate, and canRestore says so); a Unit admin is exempt", async () => {
     const janitor = await r.createRole({ tenant: acme.id, name: "Janitor", boardRole: "editor", permissions: ["delete"] });
     await r.setScopedGrant({ scope: { type: "space", id: design.id }, subject: { type: "user", id: "google:max" }, role: janitor.id });

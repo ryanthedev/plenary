@@ -924,6 +924,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       if (up.run(id, v.name !== undefined ? 1 : 0, v.name ?? null, v.generalRole !== undefined ? 1 : 0, v.generalRole ?? null).changes === 0) throw new Error(`registry: no such ${type}`);
       return row(get.get(id));
     },
+    async personalSpace(tenant, user) { ready(); return str(tenant) ? rowSpace(q.personal.get(tenant, String(user))) ?? null : null; },
     async ensurePersonalSpace(tenant, user) {
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");

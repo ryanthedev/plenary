@@ -1743,6 +1743,14 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect((await r.trashDue({ before: clock.t, claimed: true, after: { board: all.sort().at(-1) } })).boards).toEqual([]);
         expect((await r.trashDue({ before: clock.t, claimed: true })).spaces.map(x => x.id)).toEqual([a.id]);
       });
+      test("personalSpace is a pure read: null until ensurePersonalSpace creates it, then the same Space", async () => {
+        const { t } = await mk();
+        expect(await r.personalSpace(t.id, "dev:newcomer")).toBe(null);
+        expect(await r.personalSpace(t.id, "dev:newcomer")).toBe(null);          // reading again still creates nothing
+        const made = await r.ensurePersonalSpace(t.id, "dev:newcomer");
+        expect(await r.personalSpace(t.id, "dev:newcomer")).toMatchObject({ id: made.id, kind: "personal", owner: "dev:newcomer" });
+        expect(await r.personalSpace("t-nope00000000", "dev:newcomer")).toBe(null);
+      });
       test("keyed Space calls store their board count in the ref", async () => {
         const { a } = await mk();
         await r.trashSpace({ space: a.id, by: U, idem: idemOf("key-space-tr-1") });

@@ -42,6 +42,13 @@ describe.skipIf(!url)("postgres registry", () => {
   const schemaName = () => `pl_test_reg_${process.pid}_${Date.now().toString(36)}_${++n}`;
   const drop = s => client().unsafe(`DROP SCHEMA IF EXISTS "${s}" CASCADE`);
   const schemas = new Map();
+  /** For the trash races: waits until the call under test is blocked on ANY lock in this schema, or has already settled (then the caller's assertions on the outcome decide: a missing lock shows as a settled call, never as a timeout). */
+  const blockedOrSettled = async (f, schema) => {
+    for (const end = Date.now() + HUNG_MS; !f.done; await Bun.sleep(20)) {
+      if ((await client().unsafe(`SELECT count(*)::int AS c FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE $1`, [`%${schema}%`]))[0].c >= 1) return;
+      if (Date.now() > end) throw new Error(`timed out after ${HUNG_MS} ms: the call neither blocked nor settled`);
+    }
+  };
   /** Waits (until a real HUNG_MS deadline) until at least `n` backends are blocked on a lock in a statement matching `like`; fails with a named message after it, so a loaded machine fails cleanly. */
   const waitBlocked = async (like, n = 1) => {
     let c = 0;
@@ -318,7 +325,7 @@ describe.skipIf(!url)("postgres registry", () => {
         await trashing(sp.id);
         const p = r.createBoard({ tenant: t.id, title: "late", space: sp.id, owner: "u" }).then(() => "created", e => e.message);
         const f = settledFlag(p);
-        await waitBlocked(`%${schema}%reg_spaces%FOR SHARE%`);
+        await blockedOrSettled(f, schema);
         expect(f.done).toBe(false);
         await other.unsafe("COMMIT");
         expect(await p).toMatch(/no such space/);
@@ -333,11 +340,27 @@ describe.skipIf(!url)("postgres registry", () => {
         await trashing(dst.id);
         const p = r.moveBoard({ board: b.id, from: sp.id, to: dst.id }).then(() => "moved", e => e.message);
         const f = settledFlag(p);
-        await waitBlocked(`%${schema}%reg_spaces%FOR SHARE%`);
+        await blockedOrSettled(f, schema);
         expect(f.done).toBe(false);
         await other.unsafe("COMMIT");
         expect(await p).toMatch(/no such space/);
         expect(await r.board(b.id)).toMatchObject({ space: sp.id, trashedAt: null });
+      } finally { await other.unsafe("ROLLBACK").catch(() => {}); other.release(); await r.close(); await drop(schema); }
+    }, RACE_CEILING);
+
+    test("moveBoard OUT of a Space being trashed waits for it, then finds the board trashed (in-trash): it never lands live in the target while trashed with the source", async () => {
+      const { schema, r, other, t, sp, dst, trashing } = await setup();
+      try {
+        const b = await r.createBoard({ tenant: t.id, title: "o", space: sp.id, owner: "u" });
+        await trashing(sp.id);
+        await other.unsafe(`UPDATE "${schema}".reg_boards SET trashed_at = 5, trashed_by = 'u', trashed_with = $1 WHERE id = $2`, [sp.id, b.id]);   // what trashSpace does to its boards
+        const p = r.moveBoard({ board: b.id, from: sp.id, to: dst.id }).then(() => "moved", e => e.code ?? e.message);
+        const f = settledFlag(p);
+        await blockedOrSettled(f, schema);
+        expect(f.done).toBe(false);
+        await other.unsafe("COMMIT");
+        expect(await p).toBe("in-trash");
+        expect(await r.board(b.id)).toMatchObject({ space: sp.id, trashedWith: sp.id });
       } finally { await other.unsafe("ROLLBACK").catch(() => {}); other.release(); await r.close(); await drop(schema); }
     }, RACE_CEILING);
 
@@ -349,7 +372,7 @@ describe.skipIf(!url)("postgres registry", () => {
         await trashing(sp.id);
         const p = r.restoreBoard({ board: b.id }).then(() => "restored", e => e.code);
         const f = settledFlag(p);
-        await waitBlocked(`%${schema}%reg_spaces%FOR SHARE%`);
+        await blockedOrSettled(f, schema);
         expect(f.done).toBe(false);
         await other.unsafe("COMMIT");
         expect(await p).toBe("space-in-trash");
@@ -367,7 +390,7 @@ describe.skipIf(!url)("postgres registry", () => {
         await other.unsafe(`UPDATE "${schema}".reg_boards SET trashed_at = 5, trashed_by = 'u' WHERE id = $1`, [b.id]);
         const p = r.addLinkUse(lk.id, "guest").then(() => "used", e => e.code);
         const f = settledFlag(p);
-        await waitBlocked(`%${schema}%reg_boards%FOR SHARE%`);
+        await blockedOrSettled(f, schema);
         expect(f.done).toBe(false);
         await other.unsafe("COMMIT");
         expect(await p).toBe("in-trash");

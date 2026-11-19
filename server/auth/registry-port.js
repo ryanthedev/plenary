@@ -69,7 +69,7 @@ import { randomId } from "./util.js";
 export const REGISTRY_METHODS = Object.freeze([
   "createTenant", "addTenantDomain", "tenant", "tenantByDomain", "addTenantAdmin", "tenantAdminsAmong",
   "createBoard", "createGroup", "group", "groups", "createSpace", "space",
-  "spaces", "ensurePersonalSpace", "createTeam", "renameTeam", "deleteTeam", "teamsPage",
+  "spaces", "ensurePersonalSpace", "personalSpace", "createTeam", "renameTeam", "deleteTeam", "teamsPage",
   "teamsAmong", "teamMembersPage", "scopedGrant", "scopedGrantsPage", "touchMember", "membersAmong",
   "findMembers", "team", "teams", "setTeamMember", "teamMembers", "setScopedGrant",
   "rename", "updateScope", "spacesIn", "scopedGrants", "createRole", "deleteRole",
@@ -152,6 +152,7 @@ export const mint = {
  *   createSpace(o: { tenant: string, name: string, group?: string|null, generalRole?: Role|null, owner?: string, idem?: Idem }): Promise<Space>,   // generalRole default "viewer"; null = only people added
  *   space(id: string): Promise<Space|null>,
  *   spaces(tenant: string): Promise<Space[]>,
+ *   personalSpace(tenant: string, user: string): Promise<Space|null>,   // the user's personal space, or null when it does not exist yet: a pure read (a GET never creates it; ensurePersonalSpace does)
  *   ensurePersonalSpace(tenant: string, user: string): Promise<Space>,   // idempotent, one per (tenant, user); private (generalRole null), the user is its owner
  *   createTeam(o: { tenant: string, name: string, idem?: Idem }): Promise<Team>,
  *   renameTeam(team: string, name: string): Promise<Team>,   // trimmed 1-200; rejects an unknown Team

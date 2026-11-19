@@ -411,14 +411,18 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       if (!key(from) || !key(to)) throw new Error("registry: no such space");
       const k = idemStart(idem), at = now();
       return write(async tx => {
-        // Lock order is Space, then board (trashSpace's order, so the two cannot deadlock). The target Space is held FOR SHARE: a concurrent trashSpace waits, so the board is never left live in a Space that went to Trash.
-        const sp = await one(tx, `SELECT tenant, trashed_at FROM ${SP} WHERE id = $1 FOR SHARE`, [to]);
+        // Lock order is Space, then board (trashSpace's order, so the two cannot deadlock). BOTH Spaces (the board's current one and the target) are held FOR SHARE, in id order: a concurrent
+        // trashSpace of either waits, so the board is never left live in a Space that went to Trash, nor moved out of one that is being trashed (and purged with it).
+        const cur0 = (await one(tx, `SELECT space FROM ${BS} WHERE board = $1`, [board]))?.space;
+        let sp = null;
+        for (const id of [...new Set([cur0, to].filter(Boolean))].sort()) { const row = await one(tx, `SELECT tenant, trashed_at FROM ${SP} WHERE id = $1 FOR SHARE`, [id]); if (id === to) sp = row; }
         // The board row lock serialises every move of this board (and a grant change); the compare-and-set reads after it is held.
         const b = await one(tx, `SELECT id, tenant, trashed_at FROM ${BD} WHERE id = $1 FOR UPDATE`, [board]);
         if (!b) throw new Error("registry: no such board");
         if (sp?.tenant !== b.tenant || sp.trashed_at != null) throw new Error("registry: no such space");
         if (b.trashed_at != null) throw new RegistryError("in-trash", "the board is in Trash");
         const cur = (await one(tx, `SELECT space FROM ${BS} WHERE board = $1`, [board]))?.space;
+        if (cur !== cur0 && cur !== to) throw new RegistryError("moved", "the board is no longer in that Space");   // moved by another call since the Space was locked: the lock does not cover where it is now
         const moved = cur !== to;
         await idemPut(tx, k, board + (moved ? ":moved" : ":noop"), at);      // the key first (it rejects a replay before the compare-and-set can); its answer says whether the move happened
         if (moved) {
@@ -769,6 +773,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         return type === "space" ? rowSpace(row) : rowGroup(row);
       });
     },
+    async personalSpace(tenant, user) { ready(); return key(tenant) ? rowSpace(await one(db, `SELECT * FROM ${SP} WHERE tenant = $1 AND owner_user = $2`, [tenant, String(user)])) ?? null : null; },
     async ensurePersonalSpace(tenant, user) {
       ready();
       if (!key(tenant)) throw new Error("registry: no such tenant");

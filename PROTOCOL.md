@@ -1498,10 +1498,41 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   delivers in order; duplicates are dropped by `seq`. Presence has no repair.
 - **A lost last entry is repaired two ways.** While it runs, the room publishes a `{ seq, epoch, cp }` **heartbeat**
   (resolved seq, the room's epoch, its latest durable checkpoint: below) on `.entries` every 2 s. And a gateway that has heard neither an entry nor a heartbeat for
-  **5 s** on a board it serves reads the Store from its last delivered `seq` + 1, and again every 5 s while the
-  silence lasts. The poll needs no room, so it also works after the room stopped or its host died (viewers never
-  restart a room). Guaranteed: every connected client gets every resolved entry, in order, within about 5 s of
+  **5 s** on a board it serves reads the Store from its last delivered `seq` + 1 (checked every 2.5 s, so 5 to 7.5 s
+  after the last live message), and again 5 to 7.5 s later while the silence lasts. The poll needs no room, so it also works after the room stopped or its host died (viewers never
+  restart a room). Guaranteed: every connected client gets every resolved entry, in order, within 7.5 s of
   the bus going quiet. Delivery to clients is effectively at-least-once, eventually consistent.
+- **The heartbeat, exactly.** Publisher: the room host (`server/room-host.js`), one message per board it holds a live
+  room for, on `.entries`, every `heartbeatMs` (2,000 ms) from one timer of the host (all boards beat on the same tick:
+  a burst of N publishes, no jitter). Payload `{ seq, epoch, cp }`: `seq` = the resolved seq (never the speculative
+  one), `epoch` = the room's epoch (the lease's, § Recovery, Room identity), `cp` = newest durable checkpoint (below).
+  Two variants share the shape: `{ seq, epoch, cp, opened: true }` once at room build, before the inbox is served, and
+  `{ seq, epoch, cp, released: true }` after a clean stop. A host whose lease renew deadline has passed publishes
+  nothing and stops the room instead. Consumers and what each does with it:
+  (1) **gateway feed** (`server/feed.js`): a heartbeat or an entries batch whose `epoch` is at least the feed's (a
+  missing or non-integer `epoch` counts as lower) resets its silence timer; one from a lower epoch (a dead incarnation's,
+  delayed on the bus) does not, so stale traffic cannot hold off the Store poll. It reads the Store when `seq` is above its own
+  (a lost last entry); raises its epoch (never lowers: a late or duplicate beat with a lower `epoch`, `seq` or `cp` changes
+  nothing); records `cp` (max) to decide a re-base. (2) **waiting host** (a host that found another host's live lease,
+  `watchEntries`): a message (heartbeat or entries batch) with an integer `epoch` at least the highest it knows (seeded
+  from the lease it read) counts as "the holder is alive" and re-arms its silence timer (2 x `heartbeatMs`); one with
+  a lower or missing `epoch` is a late one from a dead incarnation and counts for nothing, `released` included. A late
+  message of the **same** epoch is indistinguishable from a live holder's and does count; it delays the takeover by
+  at most 2 beats after the last such message. Hellos held while waiting are never dropped without an answer: a
+  later message from the holder drops only those held longer than 2 beats (a live holder had its chance to answer);
+  younger ones stay, and the silence, a new holder or the `unavailable` answer resolves them. `opened`, or an epoch above
+  the last one heard, answers the held hellos `unavailable`; `released` (current epoch) makes it try the lease at once.
+  **A heartbeat never grants or moves the lease**: it only decides *when* a waiting host asks. The Store's
+  `acquire` is the sole arbiter (live lease: refused; otherwise a new, higher epoch, and the old holder is fenced on its
+  next write or renew). So a missed, late, duplicate or forged heartbeat can cause an early *attempt* (one Store read,
+  refused while the lease is live, then the next try at the lease's remaining time + a margin, at least every ttl/3)
+  and never a wrong takeover. Missing beats: a gateway polls the Store once its silence reaches 5 s, checked every 2.5 s, so a lost
+  last entry is repaired 5 to 7.5 s after the last live message (then again 5 to 7.5 s later while the silence lasts); a waiting host attempts after 2 beats of silence. Cost: 1 message per hosted board per 2 s (30 per
+  minute, 26 bytes each as JSON with small numbers, 780 B per board per minute, payload bytes only (no subject or
+  NATS framing); test/server/heartbeat.test.js counts them on virtual time: 1, 100 and 1,000 boards give exactly 30,
+  3,000 and 30,000 messages a minute. Indicative CPU, publisher side only, in-memory bus (consumers not measured):
+  a whole beat tick about 0.01, 0.14 and 0.35 ms); the beat loop does no Store work. Batching across boards is not done: subjects are per board and a gateway subscribes per board, so a batch
+  would have to be fanned out again on every gateway.
 - **`cp`, the latest durable checkpoint.** The heartbeat's `cp` is the `seq` of the newest checkpoint the room
   knows is in the Store: the one it was rebuilt from, or a later one whose write the Store has acknowledged (0 =
   none). A checkpoint is announced only after its write succeeds, never when it is taken, so `cp` never names a
@@ -1540,8 +1571,8 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
     sends them straight to the client (rules 3, 8). A room never publishes catch-up frames on `.gw.<gateway>`.
   - **`.inbox`:** one hello or op plus its envelope. An op is ≤ 1 MB (§ Limits), so it always fits. A gateway
     that still can't publish one answers `too-large` with the op's `id`.
-  - **`.entries`:** a group commit's entries are published as one or more messages, each under 2 MB, in `seq`
-    order. A single entry always fits (one op plus its fields). Gateways deliver by `seq`, so a split batch is
+  - **`.entries`:** a group commit's entries are published as one or more messages `{ from, to, items, epoch }`
+    (`epoch` = the room's, as in the heartbeat), each under 2 MB, in `seq` order. A single entry always fits (one op plus its fields). Gateways deliver by `seq`, so a split batch is
     the same as several appends.
   - **`.gw.<gateway>`:** `welcome`, `ack`, `error` only (small).
   - Guaranteed: no message the protocol needs is over the cap. A publish refused anyway (misconfigured bus) is

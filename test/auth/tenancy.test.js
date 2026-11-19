@@ -242,3 +242,16 @@ test("p5-fix 3 (p5-authv R1): two concurrent demotions of the only two owners le
   await Promise.allSettled(owners.map(user => setGrant({ caller: admin, board: board.id, user, role: null }, { registry })));
   expect((await registry.grants(board.id)).filter(g => g.role === "owner").length).toBe(1);
 });
+
+test("a Unit with a second domain: members of either get memberRole, an email admin on either domain may create boards, other domains still can't", async () => {
+  await registry.addTenantDomain(acme.id, "acme.io");
+  await registry.addTenantAdmin(acme.id, "email:pat@acme.io");
+  const lee = id("google:lee", "acme.io", "lee@acme.io");
+  expect(await model.role(lee, board.id)).toBe("viewer");
+  const pat = id("google:pat", "acme.io", "pat@acme.io");
+  const made = await createBoard({ caller: pat, tenant: acme.id, title: "Second domain" }, { registry });
+  expect(await model.role(pat, made.id)).toBe("owner");
+  const evil = id("google:pat", "evil.com", "pat@acme.io");
+  await expect(createBoard({ caller: evil, tenant: acme.id }, { registry })).rejects.toMatchObject({ code: "forbidden" });
+  expect(await model.role(id("google:zed", "globex.com", "z@globex.com"), board.id)).toBe(null);
+});

@@ -367,7 +367,7 @@ test("rolesFor: unknown board → every user null; users deduplicated; chunks of
   expect(m.get(identityKey(people[0]))).toBe("viewer");
   const none = await ten.rolesFor("b-nope", people.slice(0, 2));
   expect([...none.values()]).toEqual([null, null]);
-  expect(combine({ board, tenant: acme, grant: null, invites: [], links: [] }, id("google:z"), T0)).toEqual({ role: "viewer", until: Infinity });
+  expect(combine({ ctx: await raw.accessContext({ type: "board", id: board.id }), grant: null, invites: [], links: [] }, id("google:z"), T0)).toEqual({ role: "viewer", until: Infinity });
 });
 
 // ---- F4: share-link redemption no longer announces ----
@@ -443,9 +443,9 @@ test("query counts: hello cold/warm and a timed pass over 1,000 users on one boa
   await measure("after: timed pass, 1000 users (no linkUsesFor: SQLite/Postgres today)", r => roleCache({ registry: r, now }).rolesFor(board.id, users), { drop: ["linkUsesFor"] });
 
   console.log("p5-load query counts\n" + Object.entries(n).map(([k, v]) => `  ${k}: ${v}`).join("\n"));
-  expect(n["before: hello (link guest)"]).toBe(5);                   // board, grant, invitesFor, linkUses, link
+  expect(n["before: hello (link guest)"]).toBe(5);                   // accessContext, grant, invitesFor, linkUses, link
   expect(n["before: timed pass, 1000 users"]).toBeGreaterThanOrEqual(4000);
-  expect(n["after: hello cold, board warm (another link guest)"]).toBe(3);  // grant, invitesFor, linkUses
+  expect(n["after: hello cold, board warm (another link guest)"]).toBe(4);  // accessContext (the board's whole scope chain, one call, never cached), grant, invitesFor, linkUses
   expect(n["after: hello warm (same user again)"]).toBe(0);
   expect(n["after: timed pass, 1000 users (linkUsesFor)"]).toBeLessThanOrEqual(7);
   expect(n["after: timed pass, 1000 users (no linkUsesFor: SQLite/Postgres today)"]).toBeLessThanOrEqual(1006);

@@ -1,4 +1,6 @@
-// The Registry port on Postgres (PROTOCOL.md § Registry): tenants, boards, grants, invites, share links, link uses.
+// The Registry port on Postgres (PROTOCOL.md § Registry): tenants (Units), boards, grants, invites, share links, link uses, and
+// the board organization (Groups, Spaces, Teams, scoped grants, roles, `accessContext`). The organization tables are created
+// like the rest (only if missing, to_regclass), and the seven original tables are never altered: that is the migration.
 // Same contract and semantics as server/auth/registry.js (memory) and server/registry/sqlite.js; method names are
 // stable. Tested by test/auth/registry-contract.js.
 //
@@ -69,7 +71,7 @@
 // owns that pool) or `sql` (a Bun SQL client you own). `schema` names the Postgres schema. Never reads env.
 
 import { SQL } from "bun";
-import { mint } from "../auth/registry-port.js";
+import { mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 import { needSchema, migrate } from "../pg/schema.js";
 
@@ -107,12 +109,27 @@ const REGISTRY_TABLE_DDL = {
   reg_invites: "n BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES $S.reg_boards(id), email TEXT NOT NULL, role TEXT NOT NULL, expires_at BIGINT, revoked BOOLEAN NOT NULL, by_user TEXT, created_at BIGINT NOT NULL",
   reg_links: "n BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES $S.reg_boards(id), role TEXT NOT NULL, expires_at BIGINT, revoked BOOLEAN NOT NULL, by_user TEXT, created_at BIGINT NOT NULL",
   reg_link_uses: "board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES $S.reg_links(id), n BIGINT GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (board, member, link)",
+  // Board organization (PROTOCOL.md § Registry, "Organization"). Additive: only new tables, never an ALTER of the seven above,
+  // so a schema from before it (or one an owner role migrated with only those) just gains these at the next start-up, and
+  // a board with no reg_board_spaces row is unfiled, a tenant with no reg_tenant_meta row is kind "company".
+  reg_tenant_meta: "tenant TEXT PRIMARY KEY REFERENCES $S.reg_tenants(id), kind TEXT NOT NULL",
+  reg_tenant_domains: "domain TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), n BIGINT GENERATED ALWAYS AS IDENTITY",
+  reg_groups: "id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), name TEXT NOT NULL, general_role TEXT, created_at BIGINT NOT NULL",
+  reg_spaces: "id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), grp TEXT REFERENCES $S.reg_groups(id), name TEXT NOT NULL, kind TEXT NOT NULL, owner_user TEXT, general_role TEXT, created_at BIGINT NOT NULL, UNIQUE (tenant, owner_user)",
+  reg_board_spaces: "board TEXT PRIMARY KEY REFERENCES $S.reg_boards(id), space TEXT NOT NULL REFERENCES $S.reg_spaces(id)",
+  reg_teams: "id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), name TEXT NOT NULL, created_at BIGINT NOT NULL",
+  reg_team_members: "team TEXT NOT NULL REFERENCES $S.reg_teams(id), member TEXT NOT NULL, PRIMARY KEY (team, member)",
+  reg_scope_grants: "scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject TEXT NOT NULL, role TEXT NOT NULL, n BIGINT GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (scope_type, scope_id, subject_type, subject)",
+  reg_roles: "tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), id TEXT NOT NULL, name TEXT NOT NULL, base TEXT, board_role TEXT, permissions TEXT NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY (tenant, id)",
 };
 /** Index name → "table (columns)"; created after the tables, only if missing (to_regclass), like the tables. */
 export const REGISTRY_INDEXES = {
   reg_tenant_admins_member: "reg_tenant_admins (member)",
   reg_invites_board: "reg_invites (board, email)",
   reg_links_board: "reg_links (board)",
+  reg_spaces_tenant: "reg_spaces (tenant)",
+  reg_groups_tenant: "reg_groups (tenant)",
+  reg_teams_tenant: "reg_teams (tenant)",
 };
 /** The tables' column definitions for one schema (foreign keys name it), as `migrate` takes them. */
 export const registryTables = schema => {
@@ -143,7 +160,9 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     connection: { lock_timeout: String(lockMs), statement_timeout: String(stmtMs) } });
   let open = true;
   const T = `"${s}".reg_tenants`, A = `"${s}".reg_tenant_admins`, BD = `"${s}".reg_boards`, G = `"${s}".reg_grants`,
-    I = `"${s}".reg_invites`, L = `"${s}".reg_links`, U = `"${s}".reg_link_uses`;
+    I = `"${s}".reg_invites`, L = `"${s}".reg_links`, U = `"${s}".reg_link_uses`,
+    TM = `"${s}".reg_tenant_meta`, TD = `"${s}".reg_tenant_domains`, GR = `"${s}".reg_groups`, SP = `"${s}".reg_spaces`, BS = `"${s}".reg_board_spaces`,
+    TE = `"${s}".reg_teams`, TU = `"${s}".reg_team_members`, SG = `"${s}".reg_scope_grants`, RO = `"${s}".reg_roles`;
 
   try {
     await db.begin(async tx => {
@@ -199,28 +218,57 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     for (;;) { const id = f(); if (!(await one(q, `SELECT 1 AS x FROM ${table} WHERE id = $1`, [id]))) return id; }
   };
 
+  /** One statement: the tenant with its kind, extra domains and admins (JSON built server-side, ordered by `n`). */
   const getTenant = async (q, id) => {
-    const r = await one(q, `SELECT id, domain, created_at FROM ${T} WHERE id = $1`, [id]);
+    const r = await one(q, `SELECT t.id, t.domain, t.created_at,
+      (SELECT kind FROM ${TM} WHERE tenant = t.id) AS kind,
+      (SELECT coalesce(json_agg(domain ORDER BY n), '[]') FROM ${TD} WHERE tenant = t.id)::text AS extra,
+      (SELECT coalesce(json_agg(member ORDER BY n), '[]') FROM ${A} WHERE tenant = t.id)::text AS admins
+      FROM ${T} t WHERE t.id = $1`, [id]);
     if (!r) return null;
-    const admins = (await q.unsafe(`SELECT member FROM ${A} WHERE tenant = $1 ORDER BY n`, [id])).map(a => a.member);
-    return { id: r.id, domain: r.domain, admins, createdAt: num(r.created_at) };
+    return { id: r.id, domain: r.domain, domains: [...(r.domain ? [r.domain] : []), ...JSON.parse(r.extra)], kind: r.kind ?? "company",
+      admins: JSON.parse(r.admins), createdAt: num(r.created_at) };
   };
-  const rowBoard = r => r && { id: r.id, tenant: r.tenant, title: r.title, memberRole: r.member_role, createdAt: num(r.created_at) };
+  const BOARD_SQL = `SELECT b.*, (SELECT space FROM ${BS} WHERE board = b.id) AS space FROM ${BD} b`;
+  const rowBoard = r => r && { id: r.id, tenant: r.tenant, title: r.title, memberRole: r.member_role, space: r.space ?? null, createdAt: num(r.created_at) };
+  const rowGroup = r => r && { id: r.id, tenant: r.tenant, name: r.name, generalRole: r.general_role, createdAt: num(r.created_at) };
+  const rowSpace = r => r && { id: r.id, tenant: r.tenant, group: r.grp, name: r.name, kind: r.kind, owner: r.owner_user, generalRole: r.general_role, createdAt: num(r.created_at) };
+  const rowTeam = r => r && { id: r.id, tenant: r.tenant, name: r.name, createdAt: num(r.created_at) };
+  const rowRole = r => r && { id: r.id, tenant: r.tenant, name: r.name, base: r.base, boardRole: r.board_role, permissions: JSON.parse(r.permissions), createdAt: num(r.created_at) };
+  const rowSg = r => ({ subject: { type: r.subject_type, id: r.subject }, role: r.role });
+  const grantsOn = (q, type, id) => q.unsafe(`SELECT subject_type, subject, role FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 ORDER BY n`, [type, id]);
+  const putSg = async (tx, type, id, st, sid, role) => {
+    if (role == null) await tx.unsafe(`DELETE FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 AND subject_type = $3 AND subject = $4`, [type, id, st, sid]);
+    else await tx.unsafe(`INSERT INTO ${SG} (scope_type, scope_id, subject_type, subject, role) VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (scope_type, scope_id, subject_type, subject) DO UPDATE SET role = excluded.role`, [type, id, st, sid, role]);
+  };
+  /** A domain has one tenant across the primary column and the extras table: serialised per domain, then checked. */
+  const claimDomain = async (tx, d, tenant) => {
+    await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-domain:${s}:${d}`]);
+    const owner = (await one(tx, `SELECT id FROM ${T} WHERE domain = $1 UNION ALL SELECT tenant FROM ${TD} WHERE domain = $1`, [d]))?.id;
+    if (owner && owner !== tenant) throw new Error("registry: domain already has a tenant");
+    return !!owner;
+  };
+  const tenantOfScope = async (q, type, id) => (type === "unit" ? (await one(q, `SELECT id AS t FROM ${T} WHERE id = $1`, [id]))
+    : await one(q, `SELECT tenant AS t FROM ${type === "group" ? GR : type === "space" ? SP : BD} WHERE id = $1`, [id]))?.t ?? null;
   const rowInvite = r => r && { id: r.id, board: r.board, email: r.email, role: r.role, expiresAt: num(r.expires_at), revoked: !!r.revoked, by: r.by_user, createdAt: num(r.created_at) };
   const rowLink = r => r && { id: r.id, board: r.board, role: r.role, expiresAt: num(r.expires_at), revoked: !!r.revoked, by: r.by_user, createdAt: num(r.created_at) };
   const boardExists = async (q, id) => key(id) && !!(await one(q, `SELECT 1 AS x FROM ${BD} WHERE id = $1`, [id]));
 
   const api = {
-    async createTenant({ domain, admins = [] }) {
+    async createTenant({ domain, domains = [], kind = "company", admins = [] }) {
       ready();
-      const d = domain ? String(domain).toLowerCase() : null;
+      if (!KINDS.includes(kind)) throw new Error("registry: bad unit kind");
+      const ds = domainList(domain, domains), d = ds[0] ?? null;
       const list = [...admins].map(String);
       const createdAt = now();
       try {
         return await write(async tx => {
-          if (d && (await one(tx, `SELECT 1 AS x FROM ${T} WHERE domain = $1`, [d]))) throw new Error("registry: domain already has a tenant");
+          for (const x of [...ds].sort()) await claimDomain(tx, x, null);   // sorted: two creates with overlapping domains can't deadlock
           const id = await fresh(tx, mint.tenant, T);
           await tx.unsafe(`INSERT INTO ${T} (id, domain, created_at) VALUES ($1, $2, $3)`, [id, d, createdAt]);
+          await tx.unsafe(`INSERT INTO ${TM} (tenant, kind) VALUES ($1, $2)`, [id, kind]);
+          for (const x of ds.slice(1)) await tx.unsafe(`INSERT INTO ${TD} (domain, tenant) VALUES ($1, $2)`, [x, id]);
           for (const a of list) await tx.unsafe(`INSERT INTO ${A} (tenant, member) VALUES ($1, $2) ON CONFLICT (tenant, member) DO NOTHING`, [id, a]);
           return getTenant(tx, id);
         });
@@ -234,8 +282,20 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     async tenantByDomain(domain) {
       ready();
       if (!key(domain) || !domain) return null;
-      const r = await one(db, `SELECT id FROM ${T} WHERE domain = $1`, [domain.toLowerCase()]);
+      const r = await one(db, `SELECT id FROM ${T} WHERE domain = $1 UNION ALL SELECT tenant FROM ${TD} WHERE domain = $1`, [domain.toLowerCase()]);
       return r ? getTenant(db, r.id) : null;
+    },
+    async addTenantDomain(tenant, domain) {
+      ready();
+      const d = domainList(domain)[0];
+      if (!key(tenant)) throw new Error("registry: no such tenant");
+      if (!d) throw new Error("registry: bad domain");
+      await write(async tx => {
+        if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
+        if (await claimDomain(tx, d, tenant)) return;
+        if ((await tx.unsafe(`UPDATE ${T} SET domain = $1 WHERE id = $2 AND domain IS NULL`, [d, tenant])).count === 0)
+          await tx.unsafe(`INSERT INTO ${TD} (domain, tenant) VALUES ($1, $2)`, [d, tenant]);
+      });
     },
     async tenantAdminsAmong(users, { timeoutMs } = {}) {
       ready();
@@ -261,20 +321,23 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       });
     },
 
-    async createBoard({ tenant, title = "", memberRole = "viewer" }) {
+    async createBoard({ tenant, title = "", memberRole, space }) {
       ready();
       if (!key(tenant)) throw new Error("registry: no such tenant");
+      if (space != null && !key(space)) throw new Error("registry: no such space");
       const createdAt = now();
       return write(async tx => {
         // Nothing deletes tenants today; the foreign key is the fence if that changes.
         if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
+        if (space != null && (await one(tx, `SELECT tenant FROM ${SP} WHERE id = $1`, [space]))?.tenant !== tenant) throw new Error("registry: no such space");
         const id = await fresh(tx, mint.board, BD);
         await tx.unsafe(`INSERT INTO ${BD} (id, tenant, title, member_role, created_at) VALUES ($1, $2, $3, $4, $5)`,
-          [id, tenant, String(title), nz(memberRole), createdAt]);
-        return rowBoard(await one(tx, `SELECT * FROM ${BD} WHERE id = $1`, [id]));
+          [id, tenant, String(title), memberRole === undefined ? (space != null ? null : "viewer") : nz(memberRole), createdAt]);
+        if (space != null) await tx.unsafe(`INSERT INTO ${BS} (board, space) VALUES ($1, $2)`, [id, space]);
+        return rowBoard(await one(tx, `${BOARD_SQL} WHERE b.id = $1`, [id]));
       });
     },
-    async board(id) { ready(); return key(id) ? rowBoard(await one(db, `SELECT * FROM ${BD} WHERE id = $1`, [id])) : null; },
+    async board(id) { ready(); return key(id) ? rowBoard(await one(db, `${BOARD_SQL} WHERE b.id = $1`, [id])) : null; },
 
     async setGrant(board, user, role) {
       ready();
@@ -381,6 +444,169 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         AND member IN (SELECT jsonb_array_elements_text($2::text::jsonb)) ORDER BY member, n`, [board, JSON.stringify(us)]);
       for (const r of rows) { if (!out.has(r.member)) out.set(r.member, []); out.get(r.member).push(r.link); }
       return out;
+    },
+
+    // ---- organization (PROTOCOL.md § Registry, "Organization") ----
+    async createGroup({ tenant, name, generalRole = null, owner }) {
+      ready();
+      if (!key(tenant)) throw new Error("registry: no such tenant");
+      const n = orgDefaults.name(name), createdAt = now();
+      return write(async tx => {
+        if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
+        const id = await fresh(tx, mint.group, GR);
+        await tx.unsafe(`INSERT INTO ${GR} (id, tenant, name, general_role, created_at) VALUES ($1, $2, $3, $4, $5)`, [id, tenant, n, nz(generalRole), createdAt]);
+        if (owner != null) await putSg(tx, "group", id, "user", String(owner), "owner");
+        return rowGroup(await one(tx, `SELECT * FROM ${GR} WHERE id = $1`, [id]));
+      });
+    },
+    async group(id) { ready(); return key(id) ? rowGroup(await one(db, `SELECT * FROM ${GR} WHERE id = $1`, [id])) : null; },
+    async groups(tenant) { ready(); return key(tenant) ? (await db.unsafe(`SELECT * FROM ${GR} WHERE tenant = $1 ORDER BY created_at, id`, [tenant])).map(rowGroup) : []; },
+    async createSpace({ tenant, name, group = null, generalRole = "viewer", owner }) {
+      ready();
+      if (!key(tenant)) throw new Error("registry: no such tenant");
+      if (group != null && !key(group)) throw new Error("registry: no such group");
+      const n = orgDefaults.name(name), createdAt = now();
+      return write(async tx => {
+        if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
+        if (group != null && (await one(tx, `SELECT tenant FROM ${GR} WHERE id = $1`, [group]))?.tenant !== tenant) throw new Error("registry: no such group");
+        const id = await fresh(tx, mint.space, SP);
+        await tx.unsafe(`INSERT INTO ${SP} (id, tenant, grp, name, kind, owner_user, general_role, created_at) VALUES ($1, $2, $3, $4, 'shared', NULL, $5, $6)`,
+          [id, tenant, group, n, nz(generalRole), createdAt]);
+        if (owner != null) await putSg(tx, "space", id, "user", String(owner), "owner");
+        return rowSpace(await one(tx, `SELECT * FROM ${SP} WHERE id = $1`, [id]));
+      });
+    },
+    async space(id) { ready(); return key(id) ? rowSpace(await one(db, `SELECT * FROM ${SP} WHERE id = $1`, [id])) : null; },
+    async spaces(tenant) { ready(); return key(tenant) ? (await db.unsafe(`SELECT * FROM ${SP} WHERE tenant = $1 ORDER BY created_at, id`, [tenant])).map(rowSpace) : []; },
+    async ensurePersonalSpace(tenant, user) {
+      ready();
+      if (!key(tenant)) throw new Error("registry: no such tenant");
+      const u = String(user), createdAt = now();
+      return write(async tx => {
+        if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
+        // One per (tenant, user): the unique key settles two racing first sign-ins; the loser reads the winner's row.
+        const id = await fresh(tx, mint.space, SP);
+        const made = await one(tx, `INSERT INTO ${SP} (id, tenant, grp, name, kind, owner_user, general_role, created_at)
+          VALUES ($1, $2, NULL, $3, 'personal', $4, NULL, $5) ON CONFLICT (tenant, owner_user) DO NOTHING RETURNING id`,
+          [id, tenant, orgDefaults.personalName(u), u, createdAt]);
+        if (made) await putSg(tx, "space", id, "user", u, "owner");
+        return rowSpace(await one(tx, `SELECT * FROM ${SP} WHERE tenant = $1 AND owner_user = $2`, [tenant, u]));
+      });
+    },
+    async createTeam({ tenant, name }) {
+      ready();
+      if (!key(tenant)) throw new Error("registry: no such tenant");
+      const n = orgDefaults.name(name), createdAt = now();
+      return write(async tx => {
+        if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
+        const id = await fresh(tx, mint.team, TE);
+        await tx.unsafe(`INSERT INTO ${TE} (id, tenant, name, created_at) VALUES ($1, $2, $3, $4)`, [id, tenant, n, createdAt]);
+        return rowTeam(await one(tx, `SELECT * FROM ${TE} WHERE id = $1`, [id]));
+      });
+    },
+    async team(id) { ready(); return key(id) ? rowTeam(await one(db, `SELECT * FROM ${TE} WHERE id = $1`, [id])) : null; },
+    async teams(tenant) { ready(); return key(tenant) ? (await db.unsafe(`SELECT * FROM ${TE} WHERE tenant = $1 ORDER BY created_at, id`, [tenant])).map(rowTeam) : []; },
+    async setTeamMember(team, user, member) {
+      ready();
+      if (!key(team)) throw new Error("registry: no such team");
+      const u = String(user);
+      await write(async tx => {
+        if (!(await one(tx, `SELECT 1 AS x FROM ${TE} WHERE id = $1`, [team]))) throw new Error("registry: no such team");
+        if (member) await tx.unsafe(`INSERT INTO ${TU} (team, member) VALUES ($1, $2) ON CONFLICT (team, member) DO NOTHING`, [team, u]);
+        else await tx.unsafe(`DELETE FROM ${TU} WHERE team = $1 AND member = $2`, [team, u]);
+      });
+    },
+    async teamMembers(team) {
+      ready();
+      return key(team) ? (await db.unsafe(`SELECT member FROM ${TU} WHERE team = $1 ORDER BY member`, [team])).map(r => r.member) : [];
+    },
+    async setScopedGrant({ scope, subject, role }) {
+      ready();
+      const { type, id } = orgDefaults.scope(scope), sub = orgDefaults.subject(subject), r = orgDefaults.grantRole(role);
+      await write(async tx => {
+        const tenant = await tenantOfScope(tx, type, id);
+        if (!tenant) throw new Error("registry: no such scope");
+        if (sub.type === "team" && (await one(tx, `SELECT tenant FROM ${TE} WHERE id = $1`, [sub.id]))?.tenant !== tenant) throw new Error("registry: no such team");
+        if (type === "board" && sub.type === "user") throw new Error("registry: a user's grant on a board is setGrant");
+        if (type === "group" || type === "space") {
+          // Same fence as setGrant: the container's row lock serialises its grant changes; the reads below run after it.
+          await tx.unsafe(`SELECT id FROM ${type === "group" ? GR : SP} WHERE id = $1 FOR UPDATE`, [id]);
+          const cur = (await one(tx, `SELECT role FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 AND subject_type = $3 AND subject = $4`, [type, id, sub.type, sub.id]))?.role;
+          if (cur === "owner" && r !== "owner") {
+            const c = Number((await one(tx, `SELECT count(*) AS c FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 AND role = 'owner'`, [type, id])).c);
+            if (c <= 1) throw new PgRegistryError("last-owner", `a ${type} keeps at least one owner`);
+          }
+        }
+        await putSg(tx, type, id, sub.type, sub.id, r);
+      });
+    },
+    async scopedGrants(scope) {
+      ready();
+      const { type, id } = orgDefaults.scope(scope);
+      return key(id) ? (await grantsOn(db, type, id)).map(rowSg) : [];
+    },
+    async createRole({ tenant, name, base = null, boardRole, permissions = [] }) {
+      ready();
+      if (!key(tenant)) throw new Error("registry: no such tenant");
+      const n = orgDefaults.name(name), createdAt = now(), perms = JSON.stringify([...permissions]);
+      return write(async tx => {
+        if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
+        let id;
+        for (;;) { id = mint.role(); if (!(await one(tx, `SELECT 1 AS x FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id]))) break; }
+        await tx.unsafe(`INSERT INTO ${RO} (tenant, id, name, base, board_role, permissions, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [tenant, id, n, nz(base), nz(boardRole), perms, createdAt]);
+        return rowRole(await one(tx, `SELECT * FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id]));
+      });
+    },
+    async updateRole(tenant, id, patch = {}) {
+      ready();
+      if (!key(tenant) || !key(id)) throw new Error("registry: no such role");
+      const createdAt = now();
+      return write(async tx => {
+        if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
+        // Serialise the first creation of the "member" role; later updates just take the row lock.
+        await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-role:${s}:${tenant}:${id}`]);
+        let r = await one(tx, `SELECT * FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id]);
+        if (!r) {
+          if (id !== MEMBER_ROLE_ID) throw new Error("registry: no such role");
+          await tx.unsafe(`INSERT INTO ${RO} (tenant, id, name, base, board_role, permissions, created_at) VALUES ($1, $2, 'Unit member', NULL, NULL, $3, $4)`,
+            [tenant, id, JSON.stringify(DEFAULT_MEMBER_PERMS), createdAt]);
+          r = await one(tx, `SELECT * FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id]);
+        }
+        await tx.unsafe(`UPDATE ${RO} SET name = $3, board_role = $4, permissions = $5 WHERE tenant = $1 AND id = $2`, [tenant, id,
+          patch.name !== undefined ? orgDefaults.name(patch.name) : r.name, patch.boardRole !== undefined ? nz(patch.boardRole) : r.board_role,
+          patch.permissions !== undefined ? JSON.stringify([...patch.permissions]) : r.permissions]);
+        return rowRole(await one(tx, `SELECT * FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id]));
+      });
+    },
+    async role(tenant, id) { ready(); return key(tenant) && key(id) ? rowRole(await one(db, `SELECT * FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id])) : null; },
+    async roles(tenant) { ready(); return key(tenant) ? (await db.unsafe(`SELECT * FROM ${RO} WHERE tenant = $1 ORDER BY created_at, id`, [tenant])).map(rowRole) : []; },
+    // The resolver's one read: a fixed number of statements (board, Space, Group, Unit, the chain's grants, the Teams'
+    // members, the roles) however many grants, Teams or members there are. Every statement is bounded by the gate and timeouts.
+    async accessContext(scope) {
+      ready();
+      const { type, id } = orgDefaults.scope(scope);
+      if (!key(id)) return null;
+      const board = type === "board" ? rowBoard(await one(db, `${BOARD_SQL} WHERE b.id = $1`, [id])) : null;
+      const spaceId = type === "space" ? id : board?.space;
+      const space = spaceId ? rowSpace(await one(db, `SELECT * FROM ${SP} WHERE id = $1`, [spaceId])) : null;
+      const groupId = type === "group" ? id : space?.group;
+      const group = groupId ? rowGroup(await one(db, `SELECT * FROM ${GR} WHERE id = $1`, [groupId])) : null;
+      const owner = board ?? space ?? group;
+      if (type !== "unit" && !owner) return null;
+      const tenant = await getTenant(db, type === "unit" ? id : owner.tenant);
+      if (!tenant) return null;
+      const refs = [["unit", tenant.id], group && ["group", group.id], space && ["space", space.id], board && ["board", board.id]].filter(Boolean);
+      const rows = await db.unsafe(`SELECT scope_type, scope_id, subject_type, subject, role FROM ${SG}
+        WHERE (scope_type, scope_id) IN (SELECT t, i FROM jsonb_to_recordset($1::text::jsonb) AS x(t text, i text)) ORDER BY n`,
+        [JSON.stringify(refs.map(([t, i]) => ({ t, i })))]);
+      const scoped = { unit: [], group: [], space: [], board: [] };
+      for (const r of rows) scoped[r.scope_type].push(rowSg(r));
+      const teamIds = [...new Set(Object.values(scoped).flat().filter(g => g.subject.type === "team").map(g => g.subject.id))];
+      const teams = Object.fromEntries(teamIds.map(t => [t, []]));
+      if (teamIds.length) for (const m of await db.unsafe(`SELECT team, member FROM ${TU} WHERE team = ANY($1::text[]) ORDER BY team, member`, [teamIds])) teams[m.team].push(m.member);
+      const roles = (await db.unsafe(`SELECT * FROM ${RO} WHERE tenant = $1 ORDER BY created_at, id`, [tenant.id])).map(rowRole);
+      return { tenant, board, space, group, scoped, roles, teams };
     },
 
     /** What a write transaction runs with, read back from Postgres (for /health and tests). */

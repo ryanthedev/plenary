@@ -322,9 +322,9 @@ async function bundlerGraph() {
     if (rel.startsWith("packages/core/") || rel.startsWith("packages/protocol/")) return "/" + rel;
     return null;
   };
-  // index.html's own stylesheets, read with a plain regex here (not static.js's scanHtml), so the crawl stays independent.
+  // index.html's own stylesheets and icon, read with a plain regex here (not static.js's scanHtml), so the crawl stays independent.
   const html = await Bun.file(join(repo, "web/index.html")).text();
-  const sheets = [...html.matchAll(/<link\s+rel="stylesheet"\s+href="([^"]+)"/g)].map(m => "/" + m[1]);
+  const sheets = [...html.matchAll(/<link\s+rel="(?:stylesheet|icon)"(?:\s+type="[^"]+")?\s+href="([^"]+)"/g)].map(m => "/" + m[1]);
   const served = new Set(["/index.html", ...sheets.filter(u => !denied(u))]), seen = new Set(), q = [join(repo, "web/main.js")];
   while (q.length) {
     const f = q.shift();

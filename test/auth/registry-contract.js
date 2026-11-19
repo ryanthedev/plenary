@@ -60,6 +60,16 @@ export function registryContract(name, makeRegistry, opts = {}) {
       expect(await r.tenantByDomain("globex.com")).toBe(null);
     });
 
+    test("tenantAdminsAmong: exactly those of the given users who are an admin of any tenant; unknown, empty and odd input give none", async () => {
+      await r.createTenant({ domain: "acme.com", admins: ["dev:root"] });
+      const u = await r.createTenant({ domain: "globex.com" });
+      expect(await r.tenantAdminsAmong(["dev:root", "dev:ann"])).toEqual(["dev:root"]);
+      await r.addTenantAdmin(u.id, "dev:ann");
+      expect((await r.tenantAdminsAmong(["dev:ann", "dev:root", "dev:an", "dev:ann"])).sort()).toEqual(["dev:ann", "dev:root"]);
+      expect(await r.tenantAdminsAmong([])).toEqual([]);
+      expect(await r.tenantAdminsAmong(["", "x\0y", "dev:an"])).toEqual([]);
+    });
+
     test("addTenantAdmin: adds once (idempotent); unknown tenant rejects", async () => {
       const t = await r.createTenant({ domain: "acme.com", admins: ["google:root"] });
       await r.addTenantAdmin(t.id, "google:ann");

@@ -110,6 +110,7 @@ const REGISTRY_TABLE_DDL = {
 };
 /** Index name → "table (columns)"; created after the tables, only if missing (to_regclass), like the tables. */
 export const REGISTRY_INDEXES = {
+  reg_tenant_admins_member: "reg_tenant_admins (member)",
   reg_invites_board: "reg_invites (board, email)",
   reg_links_board: "reg_links (board)",
 };
@@ -186,10 +187,10 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     return f(tx);
   });
   /** A Postgres timeout as a coded rejection; anything else unchanged. */
-  const timedOut = (name, err) => {
+  const timedOut = (name, err, stmtLimit = stmtMs) => {
     if (err?.errno === LOCK_TIMEOUT) return new PgRegistryError("lock-timeout", `postgres registry: ${name} waited over ${lockMs} ms for a lock`, { cause: err });
     // 57014 is any cancel; only statement_timeout's is ours to name (an operator's pg_cancel_backend passes through).
-    if (err?.errno === CANCELED && /statement timeout/.test(err.message)) return new PgRegistryError("statement-timeout", `postgres registry: ${name} ran past ${stmtMs} ms (statement_timeout)`, { cause: err });
+    if (err?.errno === CANCELED && /statement timeout/.test(err.message)) return new PgRegistryError("statement-timeout", `postgres registry: ${name} ran past ${stmtLimit} ms (statement_timeout)`, { cause: err });
     return err;
   };
   const one = async (q, text, params) => (await q.unsafe(text, params))[0] ?? null;
@@ -235,6 +236,21 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       if (!key(domain) || !domain) return null;
       const r = await one(db, `SELECT id FROM ${T} WHERE domain = $1`, [domain.toLowerCase()]);
       return r ? getTenant(db, r.id) : null;
+    },
+    async tenantAdminsAmong(users, { timeoutMs } = {}) {
+      ready();
+      const us = users.filter(key);
+      if (!us.length) return [];
+      const ask = q => q.unsafe(`SELECT DISTINCT member FROM ${A} WHERE member = ANY($1::text[])`, [us]);
+      // With a bound, the server itself cancels the query when it runs over (statement_timeout, this transaction only), so
+      // a caller that gave up does not leave it holding a pool slot until the pool's own limit.
+      const bound = Number.isSafeInteger(timeoutMs) && timeoutMs > 0;
+      try {
+        const rows = bound
+          ? await db.begin(async tx => { await tx.unsafe("SELECT set_config('statement_timeout', $1, true)", [String(timeoutMs)]); return ask(tx); })
+          : await ask(db);
+        return rows.map(r => r.member);
+      } catch (err) { throw timedOut("tenantAdminsAmong", err, bound ? timeoutMs : stmtMs); }
     },
     async addTenantAdmin(tenant, user) {
       ready();

@@ -253,6 +253,27 @@ export function announcingRegistry(registry, bus, log) {
   };
 }
 
+const LOOPBACK_HOSTS = ["127.0.0.1", "::1", "[::1]", "localhost"];
+
+/**
+ * Who may use the served page's dev sign-in menu (GET /auth/dev, which publishes dev tokens): only a local run. Returns the
+ * reason it must be OFF, or null when it may be on: no user to offer (a token with `admin` or a `domain` is never
+ * offered), a bind host that is not loopback, Google sign-in configured, or a node with no gateway role.
+ * `publicHost`: the hostname of PUBLIC_URL when it is set (a public name means a reverse proxy or a real deployment).
+ * @param {{ users: number, host: string, google: boolean, gateway: boolean, publicHost?: string | null }} o
+ */
+export function devMenuOff({ users, host, google, gateway, publicHost = null }) {
+  if (!gateway) return "this node has no gateway role";
+  if (!users) return "no dev token is offerable (tokens with admin or a domain never are)";
+  if (!LOOPBACK_HOSTS.includes(String(host).toLowerCase())) return `HOST=${String(host).slice(0, 64)} is not a loopback address`;
+  if (publicHost && !LOOPBACK_HOSTS.includes(publicHost.toLowerCase())) return `PUBLIC_URL (${publicHost.slice(0, 64)}) is not a loopback name`;
+  if (google) return "Google sign-in is configured";
+  return null;
+}
+
+/** The hostname of a PUBLIC_URL value, or null when unset or not a URL. */
+const publicHostOf = v => { try { return v ? new URL(v).hostname : null; } catch { return null; } };
+
 /** @param {Record<string, string|undefined>} env @param {{ fetch?: typeof fetch }} [deps] tests pass a stub fetch for Google */
 export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write, hostname, adapters } = {}) {
   // write: tests capture log lines; hostname: tests fix the default node id; adapters: tests replace the cluster
@@ -268,6 +289,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   if (env.PLENARY_DEV_TOKENS) {
     try { tokens = JSON.parse(env.PLENARY_DEV_TOKENS); } catch { tokens = null; }
     if (!tokens || typeof tokens !== "object" || Array.isArray(tokens)) { log.error("PLENARY_DEV_TOKENS is not a JSON object; dev tokens stay off"); tokens = null; }
+    else if (!Object.keys(tokens).length) tokens = null;   // "{}" is empty, so off (deploy/README.md: unset or empty = off)
   }
 
   // Keys. In cluster mode every node must share them, so a missing one refuses the start; on one node a random
@@ -302,9 +324,48 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
     ? googleOidc({ clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET, redirectUri, fetch: fetchFn })
     : null;
   log.info("sign-in", { google: !!oidc, devTokens: dev.enabled, cluster });
+  if (!!env.GOOGLE_CLIENT_ID !== !!env.GOOGLE_CLIENT_SECRET)
+    log.warn(`Google sign-in is half configured: ${env.GOOGLE_CLIENT_ID ? "GOOGLE_CLIENT_SECRET" : "GOOGLE_CLIENT_ID"} is missing, so it stays off`);
 
-  let devBoard = null;
-  if (dev.enabled && !roles.gateway) log.info("dev tokens are set but this node has no gateway: no dev board here");
+  let devBoard = null, devMenu = null;
+  // Dev users from the token table (names; one grant per user), and whether the dev sign-in menu may be on at all: ONE
+  // decision (devMenuOff), used by both branches below.
+  let best = new Map(), offered = new Map(), off = null;
+  const host = env.HOST || "127.0.0.1";
+  if (dev.enabled) {
+    // Two tokens may name the same user: one grant per user, the highest role wins (ROLES is highest first), so
+    // one start never lowers a grant it has just made.
+    for (const t of Object.values(tokens)) {
+      if (!t || typeof t.name !== "string" || !t.name) continue;
+      const user = "dev:" + t.name, role = ROLES.includes(t.role) ? t.role : "editor";
+      if (!best.has(user) || ROLES.indexOf(role) < ROLES.indexOf(best.get(user))) best.set(user, role);
+    }
+    // The dev sign-in menu: each name once, with the role it is actually granted (the highest across its tokens). A token
+    // with admin or a domain is a tenant admin or a Workspace member. Identity is per name (dev:<name>), so a name that ANY
+    // token flags admin or gives a domain is never published, whatever its other tokens say.
+    const privileged = new Set(Object.values(tokens).filter(t => t && (t.admin === true || t.domain)).map(t => t.name));
+    for (const [token, t] of Object.entries(tokens)) {
+      if (!t || typeof t.name !== "string" || !t.name || privileged.has(t.name) || offered.has(t.name)) continue;
+      offered.set(t.name, { name: t.name, token, role: best.get("dev:" + t.name) });
+    }
+    // The same Registry filter the route runs per request (server/auth/http.js), so the count below is true at start.
+    // A Registry that cannot answer turns the menu OFF with one warn line; it never stops the start.
+    let registryDown = null;
+    if (offered.size) {
+      try {
+        const admins = new Set(await registry.tenantAdminsAmong([...offered.keys()].map(n => "dev:" + n), { timeoutMs: 5000 }));
+        for (const n of [...offered.keys()]) if (admins.has("dev:" + n)) { offered.delete(n); log.warn(`dev sign-in menu: ${n} is a tenant admin in the registry, so it is not offered`); }
+      } catch (err) {
+        // Why, in a few characters: an error code or name (never its message, which may quote a URL), so the default log level shows the cause.
+        // The 5-character Postgres SQLSTATE (errno, e.g. 42P01) first, then code, then name; letters, digits and "_" only.
+        const code = [/^[0-9A-Z]{5}$/.test(err?.errno) ? err.errno : null, err?.code, err?.name].find(c => typeof c === "string" && /^[A-Za-z0-9_]{1,40}$/.test(c)) ?? "error";
+        registryDown = `the Registry could not say who is a tenant admin (${code})`;
+        log.debug("dev sign-in menu: the admin check failed", { err });
+      }
+    }
+    off = registryDown ?? devMenuOff({ users: offered.size, host, google: !!oidc, gateway: roles.gateway, publicHost: publicHostOf(env.PUBLIC_URL) });
+  }
+  if (dev.enabled && !roles.gateway) log.warn("dev tokens are on, but the dev sign-in menu (GET /auth/dev) is OFF: " + off + " (no dev board on this node)", { host });
   else if (dev.enabled) {
     // Reuse the dev board across restarts (the Registry has no list call to find it by).
     const devFile = join(dataDir, "dev-board.json");
@@ -318,14 +379,6 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
       // Written whole or not at all (a kill mid-write must not leave half a file that hides the board).
       writeFileSync(devFile + ".tmp", JSON.stringify({ board: board.id }));
       renameSync(devFile + ".tmp", devFile);
-    }
-    // Two tokens may name the same user: one grant per user, the highest role wins (ROLES is highest first), so
-    // one start never lowers a grant it has just made.
-    const best = new Map();
-    for (const t of Object.values(tokens)) {
-      if (!t || typeof t.name !== "string" || !t.name) continue;
-      const user = "dev:" + t.name, role = ROLES.includes(t.role) ? t.role : "editor";
-      if (!best.has(user) || ROLES.indexOf(role) < ROLES.indexOf(best.get(user))) best.set(user, role);
     }
     // Across restarts a token's role may have dropped. The Registry refuses to demote a board's last owner
     // (code "last-owner"): that grant is kept and the start goes on. Raises go first, so a new owner named in the
@@ -348,6 +401,11 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
       try { const r = await bootstrapTenant({ registry, domain, admins }); log.info("dev tenant", { tenant: r.tenant.id, domain, created: r.created, added: r.added }); }
       catch (err) { if (err?.code !== "bad-request") throw err; log.error("dev token domain skipped", { domain, err }); }
     }
+    if (off) log.warn("dev tokens are on, but the dev sign-in menu (GET /auth/dev) is OFF: " + off, { host });
+    else {
+      devMenu = { board: board.id, users: [...offered.values()], hosts: LOOPBACK_HOSTS };
+      log.warn("dev sign-in menu is ON: GET /auth/dev publishes the tokens of the dev users to anyone who can reach this server", { users: offered.size, host });
+    }
     log.warn("dev tokens are ON: not for production", { board: board.id, tenant: board.tenant, users: best.size });
   } else if (oidc) log.info("dev tokens are off: sign-in is Google only");
   else log.warn("dev tokens are off and Google sign-in is not configured (GOOGLE_CLIENT_ID/SECRET): every hello will be refused");
@@ -360,6 +418,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
     boardUrl: env.BOARD_URL || `${origin}/?board={board}`,
     publicUrl: origin,
   };
+  if (devMenu) config.devSignIn = devMenu;
   const http = httpRoutes({ registry, sessions, oidc, tenancy, now: Date.now, config, log: log.child({ component: "auth" }), ...(dev.enabled ? { dev } : {}) });
   const server = createServer({ auth, registry, store, bus, blobs, log, limits, http, port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
     roles, node, host: { hostname: node, leaseTtlMs } });

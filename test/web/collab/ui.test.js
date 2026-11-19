@@ -42,13 +42,25 @@ test("hostile names, comment text and note text never reach the DOM as HTML", ()
   collab.destroy();
 });
 
-test("avatar row: ≤ 5 avatars, +N for the rest, viewers watching; stale when not live", () => {
+test("the count beside the avatars is VIEWERS only: two writers and no viewers read 0 viewers, one reads 1 viewer", () => {
+  const { port, collab } = setup();
+  const two = [{ user: "dev:ada", name: "ada", role: "owner" }, { user: "dev:bo", name: "bo", role: "editor" }];
+  port.here({ writers: two, writerCount: 2, viewers: 0 });
+  const w = () => byClass(collab.parts.avatars, "watching")[0];
+  expect(w().textContent).toBe("👁 0 viewers");
+  expect(byClass(collab.parts.avatars, "av").length).toBe(2);
+  port.here({ writers: two, writerCount: 2, viewers: 1 });
+  expect(w().textContent).toBe("👁 1 viewer");
+  collab.destroy();
+});
+
+test("avatar row: ≤ 5 avatars, +N for the rest, viewers counted; stale when not live", () => {
   const { port, collab } = setup();
   port.here({ writers: [...Array(12).keys()].map(i => ({ user: `u${i}`, name: `User ${i}`, role: i < 2 ? "editor" : "annotator" })), writerCount: 42, viewers: 12408 });
   const a = collab.parts.avatars;
   expect(byClass(a, "av").filter(e => !e.hasClass("more")).length).toBe(5);
   expect(byClass(a, "more")[0].textContent).toBe("+37");
-  expect(byClass(a, "watching")[0].textContent).toBe("👁 12,408 watching");
+  expect(byClass(a, "watching")[0].textContent).toBe("👁 12,408 viewers");
   port.setStatus("connecting");
   expect(a.hasClass("stale")).toBe(true);
   collab.destroy();

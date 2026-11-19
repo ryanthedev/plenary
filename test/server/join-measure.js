@@ -95,7 +95,11 @@ export async function measureJoin(r, { name = "viewer", z = false, replica = new
   ws.send(JSON.stringify(replica.connectMessages(tokenOf("viewer"), r.ids.board)[0]));
   await until(() => msgs.some(m => m.t === "here") || closed, "the join to finish (here)", 60_000);
   if (closed) throw new Error("closed during the join: " + JSON.stringify(closed));
-  return { bytes: kinds.reduce((a, k) => a + k.bytes, 0), frames: kinds.length, kinds, msgs, replica, close: () => ws.close() };
+  // The join is what came before its first `here`. Presence goes on after it and may repeat (another viewer joining or
+  // leaving changes the count, so this socket gets another `here`): freeze kinds/msgs now, not live, or a later `here`
+  // lands in the join's frame list (TECH-DEBT row 51). The replica keeps receiving.
+  const joinKinds = kinds.slice(), joinMsgs = msgs.slice();
+  return { bytes: joinKinds.reduce((a, k) => a + k.bytes, 0), frames: joinKinds.length, kinds: joinKinds, msgs: joinMsgs, replica, close: () => ws.close() };
 }
 
 export const kb = n => (n / 1024).toFixed(1) + " KB";

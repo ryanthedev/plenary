@@ -21,7 +21,7 @@ folder, org, tenant or company as a noun.
 | **Space** | A place that holds boards. It sits in one Group or directly in the Unit, has members and teams, and its access flows down to its boards. | repo |
 | **Personal space** | The Space every Unit member gets, named after them. It is private until they share a board from it. | your user's repos |
 | **Board** | One canvas. It lives in exactly one Space, so no board is ever homeless. | a file in the repo |
-| **Team** | A named set of Unit members ("Design", "Infra"). A team gets a role on the Unit, a Group, a Space or a board. | GitHub team |
+| **Team** | A named set of Unit members ("Design", "Infra"). A team gets a role on the Unit, a Group, a Space or a board. **Only Unit admins create and manage Teams** (`team.manage`, held by the built-in Unit admin and by a custom role that carries it); no ordinary member does. A Unit admin can later sync Teams from Microsoft Entra ID groups (future, #87). | GitHub team |
 | **Guest** | Someone from outside the Unit. They see only the boards they were invited to or got a link for. | outside collaborator |
 
 **Decision: a Unit does not nest. It carries a kind label (Company or Enterprise), and an enterprise with several
@@ -50,10 +50,10 @@ not be in a Group, so a small Unit never has to make Groups at all. Nesting can 
 The board ladder from today stays as the set of built-in roles at every scope:
 `viewer < commenter < annotator < editor < owner`. Two built-in roles exist at Unit scope only:
 
-- **Unit admin**: everything, everywhere.
+- **Unit admin**: everything, everywhere. Today this is one flat role. **Admin levels will be tiered as RBAC permissions** (future, #88): the permissions an admin holds are what the server checks, so tiers need no new mechanism.
 - **Unit member**: what everyone in the Unit gets.
 
-Built-in roles cannot be edited, except **Unit member**, which an admin can change. That is the default
+Built-in roles cannot be edited, except **Unit member**, which only a **Unit admin** can change (`roles.manage` at the Unit is not enough on its own: editing the member role changes what every person in the Unit gets). That is the default
 everyone gets. **Custom roles are proposed for v1.** An admin makes one by duplicating a built-in role and
 ticking or unticking permissions, and can then assign it at any scope. A custom role has two parts:
 
@@ -79,7 +79,7 @@ Built-in roles × permission, by scope:
 | Scope | Role | create board | create space | manage members | move | delete | transfer |
 |---|---|---|---|---|---|---|---|
 | Unit | admin | anywhere | anywhere | everything, plus Teams and Roles | anywhere | anywhere | anywhere |
-| Unit | member | in own personal space | **yes, at the Unit root** (editable) | Teams they made | own boards | own boards | own boards |
+| Unit | member | in own personal space | **yes, at the Unit root** (editable) | no (Teams are managed by Unit admins only) | own boards | own boards | own boards |
 | Group | owner | in all its Spaces | in this Group | Group and its Spaces | out of the Group | its Spaces and boards | yes |
 | Group | editor | in all its Spaces | in this Group | no | no | no | no |
 | Group | viewer…annotator | no | no | no | no | no | no |
@@ -250,13 +250,13 @@ Trash is free on every plan, with no paywall.
 ### J10. Member sees why they can or can't do something
 1. **[space] (Platform):** Dev, a member of the Infra team, sees **New board** disabled. Hovering over it shows
    "You're a **Viewer** in Platform, via the **Infra** team. Creating boards needs Editor. Owners: Priya, Tom."
-   with an **Ask for access** link that messages the owners.
+   with an **Ask for access** button. There is no email: asking stores a request that the owners (everyone who can manage access there, and Unit admins) see as a list on the Space's Access tab, where they add the person or dismiss it. A dismissed request blocks asking again for 24 hours, and a person may make 20 requests a day.
 2. **[access]** (the Space's **Access** tab): Dev opens **Your access**, which lists every source and what it
    grants. He gets everything any of them grants, and the source that grants the most is marked:
    - Viewer · via the Infra team · on Space Platform (**grants the most**)
    - Viewer · via Everyone in Acme · on Group Engineering
-3. **[access]:** below it, **Who has access** (visible to all members) groups people by source: direct, by team,
-   inherited from the Group, General access. Each row reads *name · role · from where*. Owners also get "Remove"
+3. **[access]:** below it, **Who has access** groups people by source: direct, by team,
+   inherited from the Group or the organization, General access, organization admins. It is visible to every Unit member who can open the Space; a guest never sees it (a guest sees only their own sources, on the canvas pill), and a person who cannot open the Space gets the same "not available" page as for an id that does not exist. Each row reads *name · role · from where*. Owners also get "Remove"
    and "Change role" on the rows set at this scope. Inherited rows link to where they are set.
 4. **Canvas, read-only pill:** a viewer clicking the pill gets the same one-line explanation ("Viewer via Space
    Platform · Infra team").

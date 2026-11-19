@@ -34,7 +34,7 @@ test("every failure is a value from HOME_ERRORS, never a throw: 401, 403, 5xx, b
 
 test("normalizeHome drops what the page must not render: bad ids, odd types, oversize lists and strings", () => {
   const n = normalizeHome({ ...GOOD, recent: [{ id: "../x", title: "t" }, null, "s", { id: "ok", title: "x".repeat(500), path: [{ type: "evil", name: "n" }, { type: "group", name: "G" }], starred: "yes" }, ...Array.from({ length: 80 }, (_, i) => ({ id: "c" + i }))] });
-  expect(n.recent.length).toBe(50);
+  expect(n.recent.length).toBe(47);   // the first 50 entries, minus the 3 bad ones
   expect(n.recent[0]).toEqual({ id: "ok", title: "x".repeat(200), role: "", path: [{ type: "group", name: "G" }], starred: false });
   expect(normalizeHome({ guest: "no" })).toBe(null);
   expect(normalizeHome(null)).toBe(null);

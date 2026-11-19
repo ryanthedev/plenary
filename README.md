@@ -104,6 +104,12 @@ bun test
   bytes (a dry run); `bun run clean --yes` removes it. It keeps anything young (`--min-age`, default 2h; under 10m needs `--force`) or in use,
   and never touches a live rig; see `deploy/cluster/RIG.md` ("Cleaning up").
 - **CI** runs `bun test` on every push and pull request.
+- **`bun run test:compose`** (#71): the three-node cluster test on a container runtime. Not part of `bun test` or
+  `bun run test:cluster`. Builds the image, starts Postgres, NATS, MinIO and three nodes as Compose project
+  `plenary-c3-<pid>`, checks sequencing, viewer fan-out, SIGKILL takeover of the board's host (acked ops all survive,
+  higher epoch) and a node rejoin, then removes everything and verifies nothing is left. About 25 s warm. Uses docker, else
+  podman (`CONTAINER_CLI` overrides). Without a runtime it prints a loud SKIPPED banner and exits 0 (`--require`
+  exits 1). Details: `deploy/README.md` "Cluster test on containers".
 - **Plain JS + JSDoc, no build step.** `packages/protocol` must also load in runtimes without browser or Node
   globals, so it imports only two core files and its own. `test/purity.test.js` checks this statically.
 - **Protocol changes** start in `PROTOCOL.md`, then code, then a convergence test.

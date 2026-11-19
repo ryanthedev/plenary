@@ -343,10 +343,38 @@ docker compose -f deploy/cluster.compose.yml down          # add -v to delete th
 **What is missing:**
 
 - **Blobs.** Nothing in `server/` writes blobs yet, so the S3-compatible store is not exercised by the server.
-- **Takeover on this stack.** Leases and takeover are built and tested (and run on the local rig,
-  `deploy/cluster/RIG.md`); the "kill a board's host" check has not been run on this Compose file.
+- **Takeover on this stack:** run by `bun run test:compose` (below), on Podman; not yet on Docker.
 - **Run once, on Podman, not Docker (2026-11-12, p8-cookie).** With `COOKIE_KEY` set, all three app nodes start in
   cluster mode and the load balancer answers `/health` with 200. Docker Compose 5.1.3 against Podman 5.8.2's API split the
   exec-form app healthcheck at its first space and marked the nodes unhealthy (which of the two splits it is not
   isolated), so that run used a local override with a `CMD-SHELL` healthcheck.
   Not yet run on Docker itself.
+
+### Cluster test on containers (`bun run test:compose`, #71)
+
+For agents. `scripts/test-compose.js` runs the cluster file plus `deploy/cluster.compose.test.yml` (override) and checks
+the real protocol end to end. Never part of `bun test` or `bun run test:cluster` (heavy: builds an image, nine containers).
+
+- **Runtime:** `docker` (with `docker compose`) else `podman`; `CONTAINER_CLI=docker|podman|<path>` forces one. For podman
+  it runs `docker-compose` (else `podman compose`) with `DOCKER_HOST` set to podman's API socket (macOS: from
+  `podman machine inspect`; Linux: `podman info`), unless `DOCKER_HOST` is already set. No runtime or no Compose: a loud
+  `SKIPPED test:compose` banner on stderr and exit 0; `--require` or `PLENARY_COMPOSE_REQUIRE=1` makes that exit 1.
+- **Isolation:** project `plenary-c3-<pid>`, image `plenary-c3-<pid>:test`, secrets random per run, host ports random on
+  127.0.0.1 (read with `compose port`; never 8099 or any fixed port). The override gives every node `gateway,host` (a
+  takeover needs a second host), `PLENARY_LEASE_TTL_MS=3000`, `restart: "no"`, and CPU/memory limits; the `lb` service is not
+  started (clients connect to the nodes directly). It also renices itself (19).
+- **What it checks, with bounded waits only (health, lease epoch read from Postgres, op counts; no fixed sleeps):**
+  1. two editors on two gateways write 60 ops to one board: the Postgres log has seq 1..60, no gap, no duplicate id;
+     a viewer on the third node holds all 60 and the three clients are identical;
+  2. SIGKILL the node holding the board's lease while both editors stream 30 ops/s each: a survivor takes the lease at a
+     higher epoch (about 3 s); clients reconnect to survivors; every ack ever seen (including all acked before the kill)
+     is in the log at its acked seq; the log has no gap; all clients converge on it. Ops never acked and not in the log
+     are counted in the report (`neverAckedLost`; the Replica resends pending ops, so 0 is normal);
+  3. the killed node is started again, serves a new client, and everyone converges.
+- **Teardown on every exit path** (pass, fail, deadline of 8 min, SIGINT/SIGTERM/SIGHUP; the `down` runs detached so a
+  terminal Ctrl-C cannot cut it): `down -v --remove-orphans`, `rmi` of the image it built, then a check that no container,
+  volume or network labelled with the project and no image tag remains; leftovers fail the run. A SIGKILLed run cannot clean
+  itself: every run first removes stacks of dead pids (`plenary-c3-<n>` networks, images), also `bun scripts/test-compose.js --sweep`.
+- **On failure** it prints the last container log lines before teardown. `--keep-image` keeps the built image.
+- **CI (not set up):** a job with docker would run `bun run test:compose --require`-style (`PLENARY_COMPOSE_REQUIRE=1 bun run test:compose`);
+  the GitHub runners have docker and compose, and the first run pulls four images.

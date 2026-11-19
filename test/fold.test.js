@@ -67,8 +67,9 @@ test("DW: ops resolved while the fold is mid-copy are not in it, are in the tail
   const cp = d.log.checkpoints[0];
   expect(cp.seq).toBeLessThan(d.room.resolved);             // taken at the seq it began at, not at the end
   expect(cp.streams.board.elements.map(e => e.id)).not.toContain("late");
-  expect(d.room.base.seq).toBe(cp.seq);
-  expect(d.room.tail.map(e => e.seq)).toEqual(Array.from({ length: d.room.resolved - cp.seq }, (_, i) => cp.seq + 1 + i));
+  const base = d.room.base;                                 // later folds chain, so the base has moved on: it still has exactly the tail after it
+  expect(base.seq).toBeGreaterThanOrEqual(cp.seq);
+  expect(d.room.tail.map(e => e.seq)).toEqual(Array.from({ length: d.room.resolved - base.seq }, (_, i) => base.seq + 1 + i));
   expect(d.room.tailChars).toBe(d.room.tail.reduce((n, e) => n + JSON.stringify(e.op).length, 0));
   expect(begunAt).toBeGreaterThan(0);
 });
@@ -213,4 +214,15 @@ test("a fold carries records, note authors, the op-id table and appState, across
   expect(d.room.base).toEqual(second);   // the log keeps a copy
   expect(d.room.tail).toEqual([]);
   expect(d.room.tailChars).toBe(0);
+});
+
+test("ops that resolve while a fold runs make the next fold due the moment it ends: folds chain without waiting for another op", () => {
+  const m = manual(), d = direct(undefined, { foldBytes: 1, foldUnits: 4, schedule: m.schedule });
+  const a = d.join("ua", "editor", "a");
+  for (let i = 1; i <= 12; i++) a.op(i, "board", { elements: [rect(`e${i}`)] });
+  m.drain();                                                 // no further op: the end of one fold starts the next
+  expect(d.room.base.seq).toBe(12);
+  expect(d.log.checkpoints.length).toBeGreaterThan(1);
+  expect(d.room.folder.active).toBe(false);
+  expect(m.q.length).toBe(0);
 });

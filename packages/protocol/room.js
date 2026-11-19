@@ -241,10 +241,13 @@ export class Room {
       let cp;
       try { cp = this.folder.step(this.foldUnits); }
       catch (err) { this.report("checkpoint-failed", { board: this.board, seq: this.resolved, err }); return; }
-      if (cp) this.adoptCheckpoint(cp); else this.schedule(turn);
+      if (cp) { this.adoptCheckpoint(cp); this.refold(); } else this.schedule(turn);
     };
     this.schedule(turn);
   }
+
+  /** A job or a write just ended: ops resolved meanwhile may already make the next fold due (nothing else would look until the next op). */
+  refold() { if (this.auto && !this.stopped && this.checkpointDue()) this.startCheckpoint(); }
 
   /** A fold finished at cp.seq: it is the new base (the tail it covers goes), and the Store keeps it. */
   adoptCheckpoint(cp) {
@@ -259,7 +262,7 @@ export class Room {
       const put = this.log?.putCheckpoint?.(cp);
       if (put && typeof put.then === "function") {
         this.writing++;
-        put.then(saved, failed).finally(() => { this.writing--; });
+        put.then(saved, failed).finally(() => { this.writing--; this.refold(); });
       } else if (this.log?.putCheckpoint) saved();   // a synchronous log (MemoryLog): written on return
     } catch (err) { failed(err); }
   }

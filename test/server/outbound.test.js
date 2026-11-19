@@ -95,11 +95,16 @@ for (const shape of ["a snapshot bigger than the share", "a tail bigger than the
   for (const phase of ["before the restart", "after the restart"]) {
     await r.server.rooms.open(r.ids.tenant, r.ids.board);
     const peek = await r.server.rooms.peek(r.ids.tenant, r.ids.board);
-    // The host folds when the tail passes `fold` AND is at least half the state (the 2x bound), so with 1 MB the last
-    // fold is at seq 8 (a tail of 2 x 990 KB is under half of 10 MB). A clean stop checkpoints (§ Recovery, "When"),
-    // so after the restart both shapes join from a snapshot of the whole board.
+    // The host folds when the tail passes `fold` AND is a quarter of the state, in steps (§ Recovery, "Incremental fold"),
+    // one at a time: which seq the last fold lands on depends on how many entries resolved while the one before ran, so
+    // with 1 MB we wait for the folds to settle and expect one short of the end (a tail of 1 to 2 x 990 KB is under a
+    // quarter of 10 MB's fold trigger). A clean stop checkpoints (§ Recovery, "When"), so after the restart both shapes
+    // join from a snapshot of the whole board.
     if (phase === "after the restart") expect(peek.room.base.seq).toBe(10);
-    else if (fold === 1 * MB) expect(peek.room.base.seq).toBe(8); else expect(peek.room.tail.length).toBe(10);
+    else if (fold === 1 * MB) {
+      await until(() => !peek.room.folder.active && !peek.room.writing, "the folds to settle");
+      expect(peek.room.base.seq).toBeGreaterThan(0); expect(peek.room.base.seq).toBeLessThan(10);
+    } else expect(peek.room.tail.length).toBe(10);
     // The owner, and three tabs of one viewer, all at the same moment, all from scratch.
     const names = ["owner", "viewer", "viewer", "viewer"];
     const joiners = await Promise.all(names.map(async (n, i) => { const s = await r.sock(); s.send(hello(r, n, { client: "tab" + i })); return s; }));
@@ -469,7 +474,7 @@ test("joiners parked across folds can't pin a board's worth of replaced text eac
   // v1: the host folds by bytes only while the tail is at least half the board (the 2x bound), which 300 KB of
   // growth on a 6 MB board never is: the test checkpoints through the Room itself, and the gateway's feed rebases
   // onto it (on the room's next heartbeat), so each joiner below gets a different snapshot string.
-  const fold = async seq => { await r.idle(); const room = await r.room(); if (room.base.seq < seq) room.checkpoint(); expect(await baseSeq()).toBe(seq); };
+  const fold = async seq => { await r.idle(); const room = await r.room(); if (room.base.seq < seq) room.checkpoint(); await durable(room); expect(await baseSeq()).toBe(seq); };
   await fold(6);
   const hog = await rawSock(r.server.wsUrl); hog.send(hello(r, "editor1"));
   await until(() => stats().owedBytes > 0 && stats().sharedTexts === 0, "the hog's snapshot to be in its socket", 60000);
@@ -526,8 +531,11 @@ async function foldAll(r) {
   await r.idle();
   const room = await r.room();
   if (room.base.seq < room.resolved) room.checkpoint();
+  await durable(room);
   expect(room.base.seq).toBe(room.seq);
 }
+/** The room's checkpoint is written and acknowledged (so the next heartbeat names it) and no fold of its own still runs. */
+const durable = room => until(() => !room.folder.active && !room.writing && room.savedSeq === room.base.seq, "the checkpoint to be durable");
 
 /**
  * The 24 x 990 KB board that five tests need, folded into one snapshot: written once per file, then each test gets a

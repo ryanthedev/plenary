@@ -55,6 +55,12 @@
 .thread-row .av { margin: 0; flex-shrink: 0; }
 
 .collab-avatars .phone-more { display: none; }
+@media (max-width: 1279px) {
+  .collab-avatars .desk-more { display: none; }
+  .collab-avatars .phone-more { display: grid; }
+  .collab-avatars .stack .av:nth-child(n+3):not(.more) { display: none; }
+  .collab-avatars .wtxt { display: none; }
+}
 @media (max-width: 640px) {
   .collab-avatars .desk-more { display: none; }
   .collab-avatars .phone-more { display: grid; }

@@ -230,9 +230,11 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
   }
   function place(pop, world) {
     const p = screen(world), w = root.clientWidth || 1200, hgt = root.clientHeight || 800;
-    let left = p.x + 20, top = p.y - 30;
-    if (left + 310 > w) left = Math.max(8, p.x - 316);
-    top = Math.max(8, Math.min(top, hgt - 340));
+    const width = Math.max(0, Math.min(300, w - 16));
+    let left = Math.max(8, Math.min(p.x + 20, w - width - 8)), top = p.y - 30;
+    if (w < 316) pop.style.setProperty("width", `${width}px`);
+    const height = Math.min(pop.offsetHeight || 340, hgt - 16);
+    top = Math.max(8, Math.min(top, hgt - height - 8));
     pop.style.setProperty("left", `${left}px`); pop.style.setProperty("top", `${top}px`);
   }
   const mount = el => { if (el.parentNode !== popHost) replace(popHost, el); };

@@ -62,7 +62,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   if (!ui.drawer && me.role === "annotator") ui.drawer = "notes";
   net.onFile(file => { S.receiveFiles({ [file.id]: file }); });
 
-  const isPhone = () => matchMedia("(max-width: 640px)").matches;
+  const isPhone = () => matchMedia("(max-width: 1279px)").matches;
   const canvas = $("#board"), ink = $("#ink"), ctx = canvas.getContext("2d");
   const allFiles = () => ({ ...S.eds.notes.doc.files, ...S.eds.board.doc.files });
 
@@ -664,7 +664,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     // Either clock: mono may not advance through a laptop's sleep on every platform; a false positive costs one reconnect.
     if (was && since(was) > RESUME_PROBE_MS && !(heard && since(heard) <= HEARD_MS)) probe();
   });
-  matchMedia("(max-width: 640px)").addEventListener("change", () => { chromeDirty = true; });
+  matchMedia("(max-width: 1279px)").addEventListener("change", () => { chromeDirty = true; });
   setTheme(ui.theme);
   let savedMine = 0, fitted = false, mineUser = me.user;
   function saveMine() {
@@ -679,7 +679,13 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (S.mine.size !== savedMine) { savedMine = S.mine.size; put(mineKeyOf(mineUser), JSON.stringify([...S.mine].slice(-5000))); }
   }
   // First catch-up done: show everything once.
-  function fitOnce() { if (fitted || S.status !== "live") return; fitted = true; if (S.eds.board.doc.live().length || S.eds.notes.doc.live().length) S.fit(); }
+  function fitOnce() {
+    if (fitted || S.status !== "live") return;
+    const hasContent = S.eds.board.doc.live().length || S.eds.notes.doc.live().length;
+    if (!hasContent || !S.eds.board.size.w || !S.eds.board.size.h) return;
+    fitted = true;
+    S.fit();
+  }
   (function frame() {
     const live = S.eds.board.needsTick() || S.eds.notes.needsTick();
     if (dirty || live || seen !== S.version()) { dirty = false; draw(); seen = S.version(); }

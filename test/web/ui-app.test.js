@@ -118,6 +118,7 @@ test("C-2/C-8: 60 frames of wheel panning and 100 incoming ops rebuild topbar, p
   rig = setup();
   const { S, bo, step, app, net } = rig;
   expect(S.role).toBe("presenter");
+  expect(page.byId.topbar.all().filter(e => e.tagName === "BUTTON" && /\btb\b/.test(e.className)).every(e => e.attrs["aria-label"] && e.attrs.title)).toBe(true);
   // A busy board: the other presenter has shapes; the notes drawer is open.
   drawRect(bo, 100, 100); step(2);
   app.ui.drawer = "notes"; app.setPanel({ type: "noop" }); step(2);
@@ -165,6 +166,15 @@ test("C-2/C-8: 60 frames of wheel panning and 100 incoming ops rebuild topbar, p
   drawRect(bo, 500, 500); step(20);                                         // a new shape: the layer count in the panel
   expect(delta(c0, counts()).panel).toBe(1);
   void net;
+});
+
+test("joining an empty board and receiving its content later fits the board", () => {
+  rig = setup();
+  const { S, bo, step } = rig;
+  expect(S.eds.board.view.scale).toBe(1);
+  drawRect(bo, 3000, 3000); step(20);
+  expect(S.eds.board.doc.live().length).toBe(1);
+  expect(S.eds.board.view.x).toBeLessThan(-2000);
 });
 
 test("C-2: a local change that only bumps the Editor (undo, a panel style chip) still refreshes the part that shows it", () => {

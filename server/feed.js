@@ -4,13 +4,14 @@
 // - Subscribes to `.entries` BEFORE it reads anything, so nothing between catch-up and live is missed.
 // - Holds a base (the latest checkpoint that matches the log, checked as § Recovery, Rebuild says; or the empty
 //   board) and the entries after it, contiguous, each encoded once. Catch-up = the base's snapshot (when the
-//   client is older than it) + the entries after, as shared, encode-once frames of at most `chunkBytes`.
+//   client is older than it) + the entries after, as shared, encode-once frames of at most `chunkBytes`. A client that
+//   asked for deflate gets each shared text as its compressed form, made once on first need and shared (§ Joining).
 // - Live: `.entries` messages `{ from, to, items }` are applied in seq order; duplicates are dropped by seq; a gap
 //   is read from the Store. The heartbeat `{ seq, epoch, cp }` gives the epoch and reveals a lost last entry. After
 //   `pollMs` with no message the Store is read from the last seq + 1, and again every `pollMs` while it is quiet,
 //   so delivery needs no room (§ Bus: "a lost last entry is repaired two ways").
-// - The tail is re-based on a newer checkpoint from the Store (the room writes one every 1,000 entries or later), so
-//   a joiner's catch-up is the board's state plus a bounded tail. The heartbeat's `cp` (the room's newest durable
+// - The tail is re-based on a newer checkpoint from the Store (the room writes one every 1,000 entries or 64 KiB of ops, and
+//   not before the tail is a quarter of the state: § Recovery, "When"), so a joiner's catch-up is the board's state plus a short tail. The heartbeat's `cp` (the room's newest durable
 //   checkpoint) says when there is one to read: each checkpoint is read at most once (PROTOCOL.md § Bus, `cp`).
 // Never throws to its caller: Store errors are logged and retried by the next message or poll.
 
@@ -24,11 +25,12 @@ const EMPTY = { seq: 0, id: null, by: null, at: null, streams: { board: { elemen
 
 /**
  * @param {{ tenant: string, board: string, store: object, bus: object, onLive: (e: { from: number, to: number, data: string }) => void,
- *   log?: object, codec?: object, pollMs?: number, chunkBytes?: number, pageSize?: number, pageBytes?: number, rebaseEvery?: number, rebaseBytes?: number, random?: () => number }} o
+ *   log?: object, codec?: object, deflate?: (data: string | Uint8Array) => Promise<Uint8Array | null>, pollMs?: number, chunkBytes?: number, pageSize?: number, pageBytes?: number, rebaseEvery?: number, rebaseBytes?: number, random?: () => number }} o
+ *   deflate: compresses one catch-up text once (PROTOCOL.md § Joining); absent, or answering null for a frame, joiners get it plain.
  *   random: the backoff's jitter source, [0, 1) (tests pass a fixed one).
  *   onLive: called for every run of new resolved entries, in seq order, with the encoded `entries` frame.
  */
-export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger, codec = jsonCodec, pollMs = 5_000, chunkBytes = 1024 * 1024,
+export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger, codec = jsonCodec, deflate = null, pollMs = 5_000, chunkBytes = 1024 * 1024,
   pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rebaseEvery = 1_000, rebaseBytes = 4 * 1024 * 1024, random = Math.random }) {
   const key = `${tenant}/${board}`;
   const self = {
@@ -202,24 +204,45 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
     return chunks;
   }
 
-  /**
-   * Rule 3: the frames that bring a client at `since` up to the feed's seq, as `{ data, bytes, shared }` (`shared`
-   * names encode-once text many joiners hold; a client starting inside a chunk gets its own cut of it).
-   */
-  self.catchUp = since => {
-    const frames = [];
+  /** The shared catch-up texts that bring a client at `since` up to the feed's seq, in order: { part, key, own? }. A client
+   *  starting inside a chunk gets its own cut of it (`own`: not shared, never compressed). */
+  function parts(since) {
+    const out = [];
     if (since < self.base.seq) {
-      if (!self.snap) { const data = codec.encode(snapshotOf(self.base)); self.snap = { data, bytes: utf8Length(data), shared: `${key}/s${self.base.seq}` }; }
-      frames.push(self.snap);
+      self.snap ??= (() => { const data = codec.encode(snapshotOf(self.base)); return { data, bytes: utf8Length(data), shared: `${key}/s${self.base.seq}` }; })();
+      out.push({ part: self.snap, key: self.snap.shared });
       since = self.base.seq;
     }
     for (const ch of tailChunks()) {
       if (ch.to <= since) continue;
-      if (ch.from > since) frames.push({ data: ch.data, bytes: ch.bytes, shared: ch.key });
-      else { const data = frameOf(self.tail.slice(since - self.base.seq, ch.to - self.base.seq)); frames.push({ data, bytes: utf8Length(data), shared: false }); }
+      if (ch.from > since) out.push({ part: ch, key: ch.key });
+      else out.push({ own: frameOf(self.tail.slice(since - self.base.seq, ch.to - self.base.seq)) });
     }
-    return frames;
-  };
+    return out;
+  }
+
+  /** Compress a text once; every joiner who wants it shares the result (`z`: the bytes, or null = not worth it). */
+  const squeeze = part => (part.zp ??= Promise.resolve(deflate(part.data)).then(z => { part.z = z ?? null; }, err => { part.z = null; log.warn("feed: compression failed; joiners get plain text", { tenant, board, err }); }));
+
+  /**
+   * Rule 3: the frames that bring a client at `since` up to the feed's seq, as `{ data, bytes, shared }` (`shared`
+   * names encode-once text many joiners hold; a client starting inside a chunk gets its own cut of it). With `z`
+   * (the client asked for deflate, § Joining) a text whose compressed form is ready goes as that form (binary, shared
+   * under its own name); one that isn't ready, or isn't worth compressing, goes plain: `prepare(since)` first makes them ready.
+   */
+  self.catchUp = (since, z = false) => parts(since).map(({ part, key: shared, own }) => {
+    if (own !== undefined) return { data: own, bytes: utf8Length(own), shared: false };
+    if (z && part.z) return { data: part.z, bytes: part.z.byteLength, shared: shared + "/z", z: true };
+    return { data: part.data, bytes: part.bytes, shared };
+  });
+  /**
+   * Have the compressed form of every text a join at `since` would send, so catchUp(since, true) can use it. Waits for the
+   * feed's start (a join may ask before it has read the Store). One deflate per text: the tail's last, still-growing frame
+   * is a new text each time an entry lands, so it is compressed again (the tail is short: § Recovery, "When").
+   */
+  self.prepare = async since => { if (deflate) { await self.ready; await Promise.all(parts(since).filter(p => p.part).map(p => squeeze(p.part))); } };
+  /** Whether every shared text a join at `since` would send has its compressed form settled (made, or declined) right now. */
+  self.prepared = since => !deflate || parts(since).every(p => p.own !== undefined || p.part.z !== undefined);
   /** Make sure the feed has every entry up to `seq` (a writer's welcome may name entries the bus hasn't brought yet). */
   self.reach = seq => (seq > self.seq ? run(() => repair(seq)) : Promise.resolve());
   /** Run `f` when no feed step is running, so what it reads (seq, tail) and what is delivered next agree. */

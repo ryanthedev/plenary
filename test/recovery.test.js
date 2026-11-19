@@ -321,7 +321,7 @@ test("a refusal that read an unresolved entry waits for it, then is sent", async
 });
 
 test("checkpoints by itself every 1,000 entries, and a late joiner then gets a snapshot with records and note authors", () => {
-  const d = direct();
+  const d = direct(undefined, { foldBytes: Infinity });   // the entry-count rule alone (the byte rule has its own tests below)
   const a = d.join("ua", "editor", "a");
   a.op(1, "records", { do: "thread", id: "t1", anchor: point, text: "kept" });
   a.op(2, "notes", { elements: [rect("n1")] });
@@ -338,6 +338,58 @@ test("checkpoints by itself every 1,000 entries, and a late joiner then gets a s
   expect(snap.records.threads[0].comments[0].text).toBe("kept");
   expect(snap.noteAuthor).toEqual([["n1", "ua"]]);
   expect(d.join("uc", "viewer", "c", 1000).inbox.map(m => m.t)).toEqual(["welcome", "entries"]);
+});
+
+// § Recovery, "When": a join is the snapshot plus the tail, so the tail is bounded in bytes too, not only in entries.
+const fat = (id, version, pad) => rect(id, { version, customData: { pad: "x".repeat(pad) } });
+const sizeOf = room => room.chars.board + room.chars.notes + room.records.chars;
+
+test("DW-1: a board folds once the tail holds foldBytes of ops, far short of 1,000 entries", () => {
+  const d = direct(undefined, { foldBytes: 4_000 });
+  const a = d.join("ua", "editor", "a");
+  let i = 0;
+  while (d.room.base.seq === 0 && i < 100) a.op(++i, "board", { elements: [fat("e0", i, 300)] }, i - 1);   // one shape rewritten (state ~400 chars)
+  expect(d.room.base.seq).toBeGreaterThan(0);
+  expect(d.room.base.seq).toBeLessThan(40);
+  expect(d.log.getCheckpoint().seq).toBe(d.room.base.seq);
+  expect(d.room.heartbeat().cp).toBe(d.room.base.seq);                    // announced once written
+});
+
+test("a fold is never taken before the tail is a quarter of the state's size, so its writes cost at most about 4x the log", () => {
+  const d = direct(undefined, { foldBytes: 1_000 });
+  const a = d.join("ua", "editor", "a");
+  for (let i = 1; i <= 30; i++) a.op(i, "board", { elements: [fat("big" + i, 1, 2_000)] }, i - 1);   // 30 inserts: folds along the way
+  const folds = d.log.checkpoints.length;
+  expect(folds).toBeGreaterThan(2);
+  for (const cp of d.log.checkpoints) expect(cp.seq).toBeGreaterThan(0);
+  // Between two folds the tail was at least a quarter of the state of the later fold: total checkpoint bytes <= ~4x the log.
+  const logBytes = d.log.entries.reduce((n, e) => n + JSON.stringify(e.op).length, 0);
+  const cpBytes = d.log.checkpoints.reduce((n, cp) => n + JSON.stringify(cp).length, 0);
+  expect(cpBytes).toBeLessThanOrEqual(5 * logBytes);
+  expect(sizeOf(d.room)).toBeGreaterThan(50_000);
+});
+
+test("a tail under foldBytes does not fold, whatever its entry count (small boards are not rewritten per op)", () => {
+  const d = direct(undefined, { foldBytes: 1_000_000 });
+  const a = d.join("ua", "editor", "a");
+  for (let i = 1; i <= 200; i++) a.op(i, "board", { elements: [rect("e0", { version: i })] }, i - 1);
+  expect(d.room.base.seq).toBe(0);
+  expect(d.log.getCheckpoint()).toBeNull();
+});
+
+test("a byte fold taken while later ops are still unresolved holds only resolved state; a rebuild from it equals the room", async () => {
+  const slow = slowLog(), d = direct(slow, { foldBytes: 1_500 });
+  const a = d.join("ua", "editor", "a");
+  for (let i = 1; i <= 8; i++) a.op(i, "board", { elements: [fat("e" + i, 1, 400)] });   // 1 in flight, 7 queued
+  slow.waiting.shift().land(); await tick();                           // 1 resolves; 2..8 go out as one append
+  a.op(9, "board", { elements: [fat("e9", 1, 400)] }); a.op(10, "board", { elements: [fat("e10", 1, 400)] });   // queued behind it
+  slow.waiting.shift().land(); await tick();                           // 2..8 resolve: ~3,200 chars of tail, due; 9 and 10 are unresolved
+  expect(d.room.seq).toBe(10);
+  expect(d.room.base.seq).toBe(8);                                     // folded at the resolved seq, not at 10
+  expect(slow.log.getCheckpoint().seq).toBe(8);
+  expect(slow.log.getCheckpoint().streams.board.elements.map(e => e.id).sort()).toEqual(["e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8"].sort());
+  while (slow.waiting.length) { slow.waiting.shift().land(); await tick(); }
+  expect(clone(Room.fromLog({ board: "b1", tenant: "t1", log: slow.log }).state())).toEqual(clone(d.room.state()));
 });
 
 test("after a rebuild, an old connection's op is refused unavailable, and its later resend of an earlier op is not stale", () => {

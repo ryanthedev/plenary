@@ -28,13 +28,14 @@ const json = (status, body) => new Response(JSON.stringify(body), { status, head
  *   blobKey?: Uint8Array, quotaBytes?: number, publicUrl?: string, maxBlobPuts?: number, blobHttp?: object, idleTimeoutSec?: number,   // blobHttp: more blobRoutes options (maxPutsPerUser, bodyDeadlineMs, timers). blobs: ≥ 32-byte signing key (default: random per process), tenant quota, the origin signed URLs name (default none: a path)
  *   limits?: object, host?: object, static?: false | { mounts?: { url: string, dir: string }[] },
  *   roles?: { gateway: boolean, host: boolean }, node?: string, now?: () => number, timers?: object,
+ *   deflate?: (data: string | Uint8Array) => Promise<Uint8Array | null>,   // compresses a shared catch-up text once, for clients that ask (PROTOCOL.md § Joining); absent: everyone gets plain text
  * }} o — `port: 0` picks a free port. `host` options go to the room host (tests; main.js passes hostname and
  *   leaseTtlMs). `static: false` serves no web app; an object passes its `mounts` to staticSite (default: the repo's
  *   web/ and packages/, from static.js's own path). `roles`: see the header (default both). `node`: this node's id
  *   (names a gateway-only node's open requests). `now`, `timers`: the gateway's clock and timers; tests inject virtual ones (default Date.now and the globals).
  */
 export function createServer({ auth, registry, store, bus, blobs = null, log = quietLogger, port = 0, hostname = "127.0.0.1", http, limits, host = {}, static: web = {},
-  roles = { gateway: true, host: true }, node = "node", now, timers, blobKey, quotaBytes, publicUrl, maxBlobPuts, blobHttp: blobHttpOpts, idleTimeoutSec = 30 }) {
+  roles = { gateway: true, host: true }, node = "node", now, timers, deflate, blobKey, quotaBytes, publicUrl, maxBlobPuts, blobHttp: blobHttpOpts, idleTimeoutSec = 30 }) {
   if (!roles || (!roles.gateway && !roles.host)) throw new TypeError("createServer needs at least one role (gateway, host)");
   const started = Date.now();
   const badRequest = badRequestLimiter();
@@ -46,7 +47,7 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
   const origin = publicUrl?.replace(/\/+$/, "") ?? "";   // "": signed URLs are the path /blobs/<token>, which the client resolves against the origin it connected to
   const access = blobs && roles.gateway ? blobAccess({ blobs, key: blobKey ?? crypto.getRandomValues(new Uint8Array(32)), origin, log, ...(now ? { now } : {}), ...(quotaBytes !== undefined ? { quotaBytes } : {}) }) : null;
   const blobHttp = access ? blobRoutes({ access, ...(maxBlobPuts ? { maxPuts: maxBlobPuts } : {}), ...(blobHttpOpts ?? {}) }) : null;
-  const gw = roles.gateway ? makeGateway({ auth, registry, store, bus, rooms, log, limits, ...(access ? { blobUrl: access.url } : {}), ...(now ? { now } : {}), ...(timers ? { timers } : {}) }) : null;
+  const gw = roles.gateway ? makeGateway({ auth, registry, store, bus, rooms, log, limits, ...(deflate ? { deflate } : {}), ...(access ? { blobUrl: access.url } : {}), ...(now ? { now } : {}), ...(timers ? { timers } : {}) }) : null;
 
   const server = Bun.serve({
     port, hostname,
@@ -62,7 +63,7 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
           return json(200, { ok: true, uptimeMs: Date.now() - started, roles: { gateway: !!gw, host: !!roles.host }, gateway: gw ? gw.stats() : null, ...rooms.stats() });
         if (!gw) return json(404, { error: "not-found" });   // host only: nothing but /health
         if (url.pathname === "/ws") {
-          if (srv.upgrade(req, { data: {} })) return undefined;
+          if (srv.upgrade(req, { data: { z: url.searchParams.get("z") === "deflate" } })) return undefined;   // § Joining: the client can inflate catch-up
           return json(426, { error: "upgrade", message: "this is a WebSocket endpoint" });
         }
         if (blobHttp) { const res = await blobHttp.handle(req, url); if (res) return res; }

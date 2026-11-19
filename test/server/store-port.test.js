@@ -34,7 +34,7 @@ test("checkCheckpoint, needTtl, needLeaseEpoch", () => {
   for (const ep of [undefined, 0, -1, 1.5, "1"]) expect(code(() => needLeaseEpoch(ep))).toBe("bad-entry");
 });
 
-test("STORE_METHODS names the twelve port methods", () => expect(STORE_METHODS.length).toBe(12));
+test("STORE_METHODS names the thirteen port methods (purgeBoard: #54)", () => expect(STORE_METHODS.length).toBe(13));
 
 import { ddlColumns } from "../../server/pg/schema.js";
 test("ddlColumns: the columns of a Postgres DDL string, minus table constraints, with nested parentheses", () => {

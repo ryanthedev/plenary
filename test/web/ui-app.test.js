@@ -524,7 +524,8 @@ test("K2 app.js: no setTimeout/setInterval/performance.now/Date.now in the sourc
 test("K3 main.js: the token goes only into createSession; sign-in leaves for the fixed href; the return board only via takeReturnBoard", async () => {
   const src = await Bun.file(new URL("../../web/main.js", import.meta.url)).text();
   const code = src.replace(/\/\/.*$/gm, "");
-  expect(code.match(/signIn\.token/g).length).toBe(2);                         // the gate check and createSession's token
+  expect(code.match(/signIn\.token/g).length).toBe(3);                         // the gate check, createSession's token, and the Home port's (its Bearer header)
+  expect(code).toMatch(/httpHome\(\{[^}]*token: signIn\.token,/);
   expect(code).toMatch(/if \(!signIn\.token\)/);
   expect(code).toMatch(/createSession\(\{[^}]*token: signIn\.token,/);
   expect(code.match(/location\.assign\(([^)]*)\)/g)).toEqual(["location.assign(signInLink.href)"]);

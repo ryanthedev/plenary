@@ -28,7 +28,7 @@ import { hitTest } from "../../../packages/core/geometry.js";
  *           prefs: import("../../ports/storage.js").Storage, theme?: string | null, notice?: string | null,
  *           collab?: (S: object, o: { jumpTo(p: { x: number, y: number, scale?: number }): void }) => object,
  *           clock: import("../../ports/clock.js").Clock, expAt?: number | null,
- *           relogin?: { href: string, go(): void } | null }} o
+ *           relogin?: { href: string, go(): void } | null, homeHref?: string | null }} o
  *   collab: the root's collab port factory (web/ports/collab.js; production and dev: web/adapters/collab/sync.js over
  *   the session). The collaboration UI (./collab/ui.js) mounts over it: avatars, emotes, cursors, selections, laser,
  *   previews, comment threads. Without it the page has none of that.
@@ -37,9 +37,10 @@ import { hitTest } from "../../../packages/core/geometry.js";
  *   clock: the root's clock port (banner countdowns, the hidden-tab timer, the collab UI). expAt: when the sign-in
  *   ends (ms on the clock's now() scale), null when unknown: the page warns EXPIRY_WARN_MS before it. relogin: where
  *   a refused or expiring page signs in again (href shown, go() remembers the board and leaves); null = no link (dev).
+ *   homeHref: where the top bar's Home link goes (the Home screen); null = no link (dev rooms).
  * @returns {{ S: object, ui: object, net: object, setTheme(t: string): void, openDialog(d: string): void, setPanel(op: object): void }}
  */
-export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null }) {
+export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null, homeHref = null }) {
   if (!clock || typeof clock.now !== "function" || typeof clock.mono !== "function") throw new Error("mountApp: the clock port is required");
   const get = k => { try { return prefs.get(k); } catch { return null; } };
   const put = (k, v) => { try { prefs.set(k, v); } catch {} };
@@ -330,6 +331,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
           h("button.tb" + (S.toolLock() ? ".on" : ""), { title: "Keep the tool after drawing (Q)", disabled: !may, onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, S.toolLock() ? "🔒" : "🔓"), h("span.k", {}, "Q")),
           h("button.tb", { title: "Undo (⌘Z)", disabled: !may, onclick: () => { S.act(S.active, e => e.undo()); } }, h("span.ic", {}, "↶")),
           h("button.tb", { title: "Redo (⌘⇧Z)", disabled: !may, onclick: () => { S.act(S.active, e => e.redo()); } }, h("span.ic", {}, "↷"))] : null),
+      homeHref ? h("a.btn.ghost", { href: homeHref, title: "Home", "aria-label": "Home" }, "⌂") : null,
       h("span.board-name", {}, board, net.kind === "ws" ? null : [" ", h("small", {}, "· dev room")]),
       h("span.spacer"),
       role === "presenter" ? [

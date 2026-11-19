@@ -7,7 +7,7 @@
 // URL: ?board=<id> &theme=light|dark &as=<dev user>
 //      &as= works ONLY when the server says dev sign-in is on (GET /auth/dev, web/ports/devconfig.js: the server has
 //      a local server with PLENARY_DEV_TOKENS, no Google sign-in and a loopback bind); otherwise it is ignored and nothing in the page offers it. With dev on, the sign-in screen lists
-//      the dev users, and a link with no board lands on the server's dev board.
+//      the dev users, and a link with no board lands on Home.
 //      #code=<single-use code> after Google sign-in: dropped from the address
 //      bar at once (or, if that fails, never exchanged), then exchanged by POST /auth/exchange for the session token.
 // The token travels only in the first message on the socket (`hello`), never in the URL or a header (ws.js).
@@ -21,6 +21,9 @@ import { wsNet, sameOriginWsUrl } from "./adapters/transport/ws.js";
 import { mountApp } from "./adapters/dom/app.js";
 import { syncCollabPort } from "./adapters/collab/sync.js";
 import { showGate, hideGate } from "./adapters/dom/gate.js";
+import { httpHome } from "./adapters/home/http.js";
+import { mountHome } from "./adapters/dom/home.js";
+import { createHomeModel } from "./core/home.js";
 import { takeSignIn, signInNotice, asParam, menuSignIn, devLinks } from "./core/signin.js";
 import { createSession } from "./core/session.js";
 import { rememberBoard, takeReturnBoard } from "./core/roles.js";
@@ -41,8 +44,7 @@ const fromCode = await takeSignIn({
 });
 
 // Dev sign-in: only when the SERVER offers it (the menu is null on a production server). Asked for when this tab has
-// no session yet or the URL has `?as=`. A signed-in tab with no `?board=` asks once more, to find the dev board (a
-// production server answers 404, which is null).
+// no session yet or the URL has `?as=` (a production server answers 404, which is null).
 const devConfig = httpDevConfig({ fetch: (...a) => globalThis.fetch(...a), timers: clock });
 let menuAsked = null;
 const devMenu = () => (menuAsked ??= devConfig.get());
@@ -51,14 +53,14 @@ const picked = menuSignIn({ query: location.search, menu, storage: tabStore, clo
 const signIn = picked ?? fromCode;
 
 const q = new URLSearchParams(location.search);
+const theme0 = q.get("theme");
 const asked = /^[\w-]{1,64}$/.test(q.get("board") ?? "") ? q.get("board") : null;
 // Back from "Sign in again" (C-9): the server's login lands on its fixed page, so the board this tab left comes from
 // session storage (the board id only, once, after a fresh sign-in), and goes back into the address bar.
 const back = takeReturnBoard(tabStore, { outcome: signIn.outcome, board: asked });
 if (back) { q.set("board", back); history.replaceState(history.state, "", `${location.pathname}?${q}`); }
-// A dev user's link with no board lands on the server's dev board (its id comes from the same menu).
-const devBoard = async () => { const t = (picked ?? fromCode).token, m = t ? await devMenu() : null; return m?.users.some(u => u.token === t) ? m.board : null; };
-const board = asked ?? back ?? (await devBoard());
+// A link with no board lands on Home (everyone, a dev user included): Recent, Starred, Shared with me, the Space tree, search.
+const board = asked ?? back;
 const signInLink = { href: "/auth/login", text: "Sign in with Google" };
 
 if (!signIn.token) {
@@ -72,7 +74,16 @@ if (!signIn.token) {
     link: menu ? null : signInLink, links: menu ? devLinks(menu, board ?? menu.board) : [],
   });
 } else if (!board) {
-  showGate({ title: "No board in this link", detail: "Open the board from the link you were sent." });
+  // Signed in with no board in the link: Home (PROTOCOL.md § Home). Its sign-in expiry shows as "signed out" with a link back in.
+  document.querySelector(".app")?.remove();
+  const root = document.createElement("div");
+  document.body.append(root);
+  const theme = theme0;
+  const model = createHomeModel({ api: httpHome({ fetch: (...a) => globalThis.fetch(...a), token: signIn.token, timers: clock }), clock });
+  mountHome({ root, model, clock, signIn: signInLink, homeHref: location.pathname,
+    boardHref: id => `?${new URLSearchParams({ board: id, ...(theme ? { theme } : {}) })}` });
+  hideGate();
+  model.load();
 } else {
   // Display only (p6-landv L5): the room decides the real user and role on every hello (the note lock uses welcome.user).
   const id = signIn.identity;
@@ -90,6 +101,7 @@ if (!signIn.token) {
     // exp: seconds (the sign-in contract); the page warns before it on the clock's ms scale.
     expAt: Number.isFinite(signIn.exp) ? signIn.exp * 1000 : null,
     relogin: { href: signInLink.href, go: () => { rememberBoard(tabStore, board); location.assign(signInLink.href); } },
+    homeHref: `${location.pathname}${theme0 ? `?theme=${encodeURIComponent(theme0)}` : ""}`,
   });
   hideGate();
   globalThis.plenary = app;

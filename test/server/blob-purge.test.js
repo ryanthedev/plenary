@@ -125,7 +125,7 @@ test("the purge never touches the bytes itself: the Store's purge only condemns,
   expect(await sweeper.sweep()).toMatchObject({ boards: 1, failed: 0 });      // the board is gone
   clock.t += BLOB_GRACE_MS;
   expect(await broken.sweep()).toMatchObject({ deleted: 0, failed: 1 });
-  expect(await has(p)).toBe(true);
+  expect(await has(p)).toBe(false);                                            // quarantined (out of reach), not yet destroyed: the row stays claimed
   clock.t += 3 * MIN;
   expect(await reaper.sweep()).toMatchObject({ deleted: 1 });                  // the adapter is back: the claim lapsed and the next sweep finishes it
   expect(await has(p)).toBe(false);

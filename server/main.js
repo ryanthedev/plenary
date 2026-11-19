@@ -30,6 +30,8 @@
 //                        start (a Postgres store with an in-memory bus would split-brain across nodes). Set but
 //                        empty (or blank) refuses the start too. Their values carry passwords: never logged, never in
 //                        an error (only the names are); every log line of the node is redacted (redactingLogger).
+//                        Clusters may share one NATS server: every subject is prefixed with the cluster id kept in the
+//                        Postgres store (PROTOCOL.md § Bus, Cluster id), so there is nothing to configure.
 //                        NATS_URL may be a comma list; its credentials (user:pass@ or token@, one set for all
 //                        servers) go to the NATS client as options (bus/nats.js natsConnectOptions).
 //   PLENARY_NODE_ID      this node's id: [a-z0-9-], 1-32 chars, a letter or digit at both ends, else the start is
@@ -77,6 +79,7 @@ import { googleOidc } from "./auth/oidc.js";
 import { httpRoutes } from "./auth/http.js";
 import { bootstrapTenant } from "./admin/tenants.js";
 import { subjects } from "./bus/port.js";
+import { isClusterId } from "./ids.js";
 import { ROLES } from "../packages/protocol/envelope.js";
 
 const KEY_MIN = 32;
@@ -307,7 +310,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   const origin = env.PUBLIC_URL ? new URL(env.PUBLIC_URL).origin : new URL(redirectUri).origin;
 
   log.info("node", { node, roles, cluster, leaseTtlMs });
-  const { store, bus, rawRegistry } = cluster ? await openCluster(env, node, log, adapters) : {
+  const { store, bus, rawRegistry, clusterId } = cluster ? await openCluster(env, node, log, adapters) : {
     store: sqliteStore({ path: join(dataDir, "plenary.db") }),
     bus: memoryBus({ onError: (err, subject) => log.error("bus subscriber failed", { subject, err }) }),
     rawRegistry: sqliteRegistry({ path: join(dataDir, "registry.db") }),
@@ -422,7 +425,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   const http = httpRoutes({ registry, sessions, oidc, tenancy, now: Date.now, config, log: log.child({ component: "auth" }), ...(dev.enabled ? { dev } : {}) });
   const server = createServer({ auth, registry, store, bus, blobs, log, limits, http, port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
     roles, node, host: { hostname: node, leaseTtlMs } });
-  return { server, store, bus, registry, log, devBoard, oidc, node, roles, cluster, leaseTtlMs,
+  return { server, store, bus, registry, log, devBoard, oidc, node, roles, cluster, clusterId, leaseTtlMs,
     async stop() { await server.stop(); await bus.close(); await store.close(); await rawRegistry.close(); } };
 }
 
@@ -444,11 +447,24 @@ async function openCluster(env, node, log, adapters = {}) {
   };
   const store = await open("Postgres store", "DATABASE_URL", () => make.postgresStore({ url: env.DATABASE_URL }));
   const rawRegistry = await open("Postgres registry", "DATABASE_URL", () => make.postgresRegistry({ url: env.DATABASE_URL }));
-  const bus = await open("NATS bus", "NATS_URL", () => make.natsBus({ url: env.NATS_URL, name: node,
+  // The cluster id lives in the Store: two nodes on one database are one cluster. It enters the Bus through the
+  // adapter's `cluster` option, so every subject on the wire carries it and a foreign cluster on the same NATS can't
+  // answer a remote open, take a lease or ack an op (PROTOCOL.md § Bus, Cluster id). A missing or malformed id
+  // refuses the start (fail closed; the entry point logs "start refused").
+  let clusterId;
+  try {
+    if (typeof store.clusterId !== "function") throw new Error("the store has no clusterId()");
+    clusterId = await store.clusterId();
+    if (!isClusterId(clusterId)) throw new Error("the store returned a malformed cluster id");
+  } catch (err) {
+    for (const x of [rawRegistry, store]) await Promise.resolve().then(() => x.close()).catch(() => {});
+    throw new Error(`could not read the cluster id (DATABASE_URL): ${redact(err?.message ?? String(err), urls).slice(0, 500)}`);
+  }
+  const bus = await open("NATS bus", "NATS_URL", () => make.natsBus({ url: env.NATS_URL, name: node, cluster: clusterId,
     // `log` is the redacting logger: the error's message, code and stack are redacted there.
     onError: (err, subject) => log.error("bus error", { subject, err }) }));
-  log.info("cluster adapters open", { store: "postgres", registry: "postgres", bus: "nats" });
-  return { store, bus, rawRegistry };
+  log.info("cluster adapters open", { store: "postgres", registry: "postgres", bus: "nats", cluster: clusterId });
+  return { store, bus, rawRegistry, clusterId };
 }
 
 if (import.meta.main) {

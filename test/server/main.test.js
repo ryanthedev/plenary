@@ -364,7 +364,7 @@ function leakyAdapters({ failPg = false } = {}) {
   return {
     closed,
     adapters: {
-      async postgresStore({ url }) { if (failPg) throw Object.assign(new Error(`connect failed to ${url} (password ${PW})`), { code: `E_${PW}` }); return fake("store"); },
+      async postgresStore({ url }) { if (failPg) throw Object.assign(new Error(`connect failed to ${url} (password ${PW})`), { code: `E_${PW}` }); return { ...fake("store"), clusterId: async () => "c-aaaaaaaaaaaaaaaa" }; },
       async postgresRegistry() { return fake("registry"); },
       async natsBus({ url, onError }) {
         onError(new Error(`stale connection to ${url}`), "");   // a bus error line, logged before the open fails

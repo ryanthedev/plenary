@@ -24,6 +24,32 @@ describe.skipIf(!url)("postgres store", () => {
     return { store: await open(), another: open, cleanup: () => drop(schema) };
   });
 
+  test("DW-iso: clusterId is c-+16, stable across calls and reopen, one id for a racing start, a different one per database", async () => {
+    const a = schemaName(), b = schemaName();
+    const stores = [];
+    try {
+      // Eight nodes asking at once on a fresh schema: one id wins, all of them return it.
+      const nodes = await Promise.all(Array.from({ length: 8 }, () => postgresStore({ sql: client(), schema: a })));
+      stores.push(...nodes);
+      const ids = await Promise.all(nodes.map(n => n.clusterId()));
+      expect(ids[0]).toMatch(/^c-[a-z0-9]{16}$/);
+      expect(new Set(ids).size).toBe(1);
+      expect(await nodes[0].clusterId()).toBe(ids[0]);
+      expect((await client().unsafe(`SELECT count(*)::int AS n FROM "${a}".pl_cluster`))[0].n).toBe(1);
+      const again = await postgresStore({ sql: client(), schema: a }); stores.push(again);
+      expect(await again.clusterId()).toBe(ids[0]);               // a restarted node on the same database
+      const other = await postgresStore({ sql: client(), schema: b }); stores.push(other);
+      expect(await other.clusterId()).not.toBe(ids[0]);           // another database is another cluster
+      await expect(client().unsafe(`INSERT INTO "${a}".pl_cluster (id) VALUES ('c-bbbbbbbbbbbbbbbb')`)).rejects.toThrow();   // never a second row
+    } finally { for (const x of stores) await x.close(); await drop(a); await drop(b); }
+  });
+
+  test("clusterId on a closed store is refused", async () => {
+    const schema = schemaName();
+    const store = await postgresStore({ sql: client(), schema });
+    try { await store.close(); await expect(store.clusterId()).rejects.toMatchObject({ code: "closed" }); } finally { await drop(schema); }
+  });
+
   test("a write transaction runs with synchronous_commit=on and fsync on", async () => {
     const schema = schemaName();
     const store = await postgresStore({ sql: client(), schema });

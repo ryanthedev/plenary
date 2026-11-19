@@ -176,6 +176,12 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO plenary_a
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO plenary_app;
 ```
 
+**Upgrading to a version with the cluster id** (PROTOCOL.md § Bus, Cluster id) adds the table `pl_cluster`: run step 2
+as the owner before starting a runtime-role node (the default privileges already cover its grants). The id changes
+every bus subject, so old and new nodes do not talk over NATS: replace a cluster's nodes together (hosts first), not
+one by one. A database copied for staging or a restore test keeps the original's id; run `DELETE FROM pl_cluster;` on
+the copy (all its nodes stopped) before it shares a NATS server with the original.
+
 **If start-up is refused**, a runtime-role node stops with `postgres registry: start-up in schema "…" was refused for
 lack of a privilege (permission denied …)` (the Store's reads `postgres store: …` the same way), code `denied`.
 Either a table is missing (run step 2) or the role lacks its grants (run step 3). Both adapters check every table

@@ -6,7 +6,7 @@
 // Messages are passed by reference here; a network bus serialises them, so publish only plain data and never
 // change a message after publishing it.
 
-import { subjects, busBytes, MAX_BUS_BYTES } from "./port.js";
+import { subjects, busBytes, MAX_BUS_BYTES, scopeBus } from "./port.js";
 import { PortError } from "../ids.js";
 
 export { subjects };
@@ -15,8 +15,14 @@ export { subjects };
  * @param {{ onError?: (err: unknown, subject: string) => void, maxBytes?: number }} [o]
  *   maxBytes: the message cap (§ Bus, 2 MB by default, as NATS); a bigger publish is refused like NATS refuses it
  *   (the promise rejects with PortError "too-large", and onError hears of it). Tests pass a small one.
+ *   cluster: scope every subject to a cluster id, as the NATS adapter does (PROTOCOL.md § Bus, Cluster id).
  */
-export function memoryBus({ onError = () => {}, maxBytes = MAX_BUS_BYTES } = {}) {
+export function memoryBus({ onError = () => {}, maxBytes = MAX_BUS_BYTES, cluster } = {}) {
+  const bus = memoryBusUnscoped({ onError, maxBytes });
+  return cluster === undefined ? bus : scopeBus(bus, cluster);   // same wire naming as the NATS adapter (§ Bus, Cluster id)
+}
+
+function memoryBusUnscoped({ onError, maxBytes }) {
   /** @type {Map<string, Set<Function>>} */
   const subs = new Map();
   let queue = [], draining = false, closed = false;

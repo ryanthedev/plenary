@@ -67,7 +67,7 @@ test("M1 through start(): the credentials reach the NATS client's options; the r
   for (const nats of [`nats://plen:${PW}@127.0.0.1:1`, `nats://${TOK}@127.0.0.1:1`]) {
     const seen = [];
     const adapters = {
-      postgresStore: async () => sqliteStore({ path: join(tempDir(), "p.db") }),
+      postgresStore: async () => ({ ...sqliteStore({ path: join(tempDir(), "p.db") }), clusterId: async () => "c-aaaaaaaaaaaaaaaa" }),
       postgresRegistry: async () => sqliteRegistry({ path: join(tempDir(), "r.db") }),
       natsBus: o => natsBus({ ...o, connect: refusingConnect(seen) }),
     };
@@ -149,9 +149,9 @@ test("L1: whatever natsConnectOptions sends as pass or token, urlSecrets names (
 function leakyAdapters(state) {
   const leak = () => { const e = new Error(`acquire failed on ${PG} (${PW})`); e.code = `CODE_${PW}`; e.cause = new Error(`cause ${PW}`); return e; };
   return {
-    postgresStore: async () => { const s = sqliteStore({ path: join(tempDir(), "p.db") }); return { ...s, acquire: async () => { throw leak(); } }; },
+    postgresStore: async () => { const s = sqliteStore({ path: join(tempDir(), "p.db") }); return { ...s, clusterId: async () => "c-aaaaaaaaaaaaaaaa", acquire: async () => { throw leak(); } }; },
     postgresRegistry: async () => sqliteRegistry({ path: join(tempDir(), "r.db") }),
-    natsBus: async o => { state.onError = o.onError; state.bus = memoryBus({ onError: o.onError }); return state.bus; },
+    natsBus: async o => { state.onError = o.onError; state.bus = memoryBus({ onError: o.onError, cluster: o.cluster }); return state.bus; },
     leak,
   };
 }

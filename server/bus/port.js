@@ -7,7 +7,7 @@
 // to subscribers, NATS does its round trip, an adapter with nothing to wait for resolves at once) and `maxBytes`
 // (its message cap). Core code calls flush() unconditionally (p-audit F15).
 
-import { needId } from "../ids.js";
+import { needId, isClusterId, PortError } from "../ids.js";
 
 /** § Bus: no message the protocol needs is over 2 MB (NATS: max_payload, headers included). */
 export const MAX_BUS_BYTES = 2 * 1024 * 1024;
@@ -47,3 +47,26 @@ export const subjects = {
   /** Room host → the requester that asked: { n, board, state: "held" | "watching" }, after its local open settled. */
   opened: requester => `plen-hosts.opened.${needId(requester, "requester")}`,
 };
+
+/**
+ * Scopes a bus to one cluster (PROTOCOL.md § Bus, Cluster id): every subject this process publishes or subscribes
+ * on the wire is `<cluster>.<subject>`, so two clusters on one NATS server never hear each other. The core keeps
+ * building subjects with `subjects` above and never sees the prefix; handlers get the subject without it. A cluster
+ * id is "c-" + 16 of [a-z0-9]: it can't equal the first token of an unscoped subject (`plen`, `plen-gw`,
+ * `plen-hosts`), so an old node's traffic and a scoped node's never share a subject either.
+ * Every other adapter member (flush, close, maxBytes, subscriberCount, isUp, ...) is the underlying bus's own.
+ * @template {{ publish: Function, subscribe: Function }} B
+ * @param {B} bus
+ * @param {string} cluster
+ * @returns {B}
+ */
+export function scopeBus(bus, cluster) {
+  if (!isClusterId(cluster)) throw new PortError("bad-id", "bad cluster id");
+  const prefix = cluster + ".";
+  return {
+    ...bus,
+    publish: (subject, msg) => bus.publish(prefix + subject, msg),
+    subscribe: (subject, fn) => bus.subscribe(prefix + subject, (msg, wire) => fn(msg, typeof wire === "string" ? wire.slice(prefix.length) : wire)),
+    ...(bus.subscriberCount ? { subscriberCount: subject => bus.subscriberCount(prefix + subject) } : {}),
+  };
+}

@@ -661,7 +661,7 @@ record.
   A caller with no tenant (a gmail user, a guest) gets `forbidden`. Admin calls that name only an id
   (`invite(id)`, `revokeInvite`, `revokeLink`, `setGrant`, …) must first check that the id's board belongs to the caller's tenant.
 - Every log entry, checkpoint, blob and bus subject is keyed by the board's tenant: Store keys
-  `(tenant, board, seq)`, blobs `(tenant, sha1)`, subjects `plen.<tenant>.<board>.*`.
+  `(tenant, board, seq)`, blobs `(tenant, sha1)`, subjects `plen.<tenant>.<board>.*` (prefixed on the wire by the cluster id, § Bus).
 - Nothing a client sends can reach another tenant: `hello` names a board (the server finds its tenant), record
   anchors and element ids are board-local, and a blob URL is minted only for a board the requester has a role on,
   in that board's tenant.
@@ -812,6 +812,36 @@ The log, checkpoints and each board's epoch (boards live in the Registry).
 
 - Tenant and board ids are server-minted (`[a-z0-9-]`, no `.`, `*`, `>`), never a domain name, so subjects can't
   collide or wildcard across tenants.
+- **Cluster id (isolation on a shared bus).** Two clusters may share one NATS server, so every subject on the wire
+  starts with the cluster id: `<cluster>.<subject>`, e.g. `c-k3j9x0a1b2c3d4e5.plen.<tenant>.<board>.entries` and
+  `c-….plen-hosts.open`. Every subject named below is written without it; the Bus adapters take the id as their
+  `cluster` option (`natsBus`, `memoryBus`; both apply `scopeBus` from server/bus/port.js), which adds it on publish
+  and subscribe and strips it from what handlers see, so no gateway, room host or feed knows about it, and only the
+  adapters build wire subjects. An adapter refuses a malformed id (anything but `c-` + 16 of `[a-z0-9]`) before it
+  connects; the composition root (server/main.js) reads the id from the Store and passes it in. A node never publishes or subscribes outside its own cluster's prefix.
+  - **Where the id comes from: the Store.** The id is `c-` + 16 of `[a-z0-9]`, minted once by the first node that asks
+    and kept in the Postgres Store (table `pl_cluster`, at most one row), so **two nodes on one Postgres database
+    are one cluster by definition and two clusters never share an id**, with nothing for an operator to configure or
+    mistype. `store.clusterId()` returns it (Postgres adapter only; a single node uses the in-memory bus, which no
+    other process can reach, and has no id). The id is durable before it is returned. A node whose Store has no id, returns a
+    malformed one or fails to read it **refuses to start** (fail closed: it never joins the bus unscoped; the adapters
+    it opened are closed and the entry point logs `start refused`).
+  - **Why this isolates.** The lease and the log live in the Store, so a board's sequencer is unique per Store. A
+    host answering a remote open (or reading a board's `.inbox`) from another cluster is what splits the brain: it
+    would lease and ack the board into its own Store, and the gateway's client would hold an ack the board's real
+    Store never saw. With the id in the subject a foreign host cannot see the request, the board's inbox or its
+    heartbeats, so a gateway whose cluster has no host answers `unavailable` rather than being served by a stranger.
+  - **A restored or cloned database keeps its id.** A copy of a production database (staging, a restore test) that
+    shares a NATS server with the original is, by this rule, the same cluster. Give the copy its own id before it
+    joins a shared bus: with every node of the copy stopped, `DELETE FROM pl_cluster;` (the next start mints a new one).
+  - **Rolling upgrade.** The id changes the wire subjects, so a node from before this rule (unscoped `plen.…`
+    subjects) and a node with it never exchange a message: an old gateway's remote open does not reach a new host,
+    and an old and a new gateway do not see each other's presence or entries. They also cannot split-brain, because
+    leases are in the Store. The Store's conditional, epoch-fenced append stays the last line of defence inside one cluster: a host that lost its lease can't write (§ Store). Upgrade a cluster as a whole: stop the old nodes and start the new ones (hosts first),
+    or expect writers on a not-yet-upgraded gateway to get `unavailable` until its host side is upgraded. Readers on
+    a gateway whose board feed lost the bus keep working from the Store poll (≤ 5 s behind, see below). The schema
+    gains table `pl_cluster`: a node running as a role that may not create tables starts only after the owner has
+    migrated (`deploy/README.md`).
 - Subjects per board: `plen.<tenant>.<board>.entries` (the room, after an append resolves), `.presence`, `.emotes`
   and `.here` (gateways), `.inbox` (gateway → room, numbered per connection: rule 6), `.gw.<gateway>` (room →
   that one gateway: `welcome`, `ack`, `error`, each addressed to a `conn`), and `.grants` (whoever changes the
@@ -856,7 +886,7 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   close notice as `{ n, conn, gateway, closed: true }`; and, every 5 s, `{ gateway, conns: [conn…] }` listing that
   gateway's open writer connections on the board (rule 6). A lost close notice is repaired by the next list; a
   lost reply by rule 2's or rule 12's timeout.
-- **Remote open** (a gateway-only node; no tenant or board in the subject): `plen-hosts.open` carries
+- **Remote open** (a gateway-only node; no tenant or board in the subject, and, like every subject, the cluster id in front of it: only this cluster's hosts hear it): `plen-hosts.open` carries
   `{ tenant, board, gateway, n }` to every room host, which opens the board itself (takes the lease or watches the
   holder) and only then answers `{ n, board, state: "held" | "watching" }` on `plen-hosts.opened.<requester>`. The
   gateway forwards the writer's hello on the first `held`; a `watching` answer starts a grace of

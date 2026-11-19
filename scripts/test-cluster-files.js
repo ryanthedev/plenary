@@ -7,6 +7,8 @@ export const DEFAULT_FILES = [
   "test/server/room-host-lease.test.js",
   "test/server/room-host-proc.test.js",
   "test/server/main-cluster.test.js",
+  "test/server/cluster-id.test.js",
+  "test/server/cluster-isolation.test.js",
   "test/server/s3-blobs.test.js",
   "test/admin/tenants.test.js",
 ];

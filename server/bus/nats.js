@@ -17,11 +17,11 @@
 // The client library is loaded on first use (dynamic import), so a process that never builds a NATS bus never
 // needs node_modules.
 
-import { PortError } from "../ids.js";
+import { PortError, isClusterId } from "../ids.js";
 export { subjects } from "./port.js";
 
 /** § Bus: a deployment's bus must carry 2 MB messages. Bigger publishes are refused (PortError "too-large"). */
-import { MAX_BUS_BYTES } from "./port.js";
+import { MAX_BUS_BYTES, scopeBus } from "./port.js";
 export { MAX_BUS_BYTES };
 
 const SUBJECT = /^[a-z0-9-]+(\.[a-z0-9-]+)*$/;
@@ -143,11 +143,14 @@ export function natsConnectOptions(url) {
  * that, the bus still goes down and refuses, but drops nothing queued until the client's own stale handling ends.
  * @param {{ url: string | string[], name?: string, onError?: (err: unknown, subject: string) => void,
  *           connectTimeoutMs?: number, reconnectWaitMs?: number, pingIntervalMs?: number, maxPingOut?: number,
- *           maxPendingBytes?: number, ackEveryMs?: number, connect?: Function }} o — `url` from the caller (NATS_URL
+ *           maxPendingBytes?: number, ackEveryMs?: number, connect?: Function, cluster?: string }} o — `url` from the caller (NATS_URL
  *           in deploy); nothing is read from env here. connect: the client's connect (tests pass a fake).
  */
 export async function natsBus({ url, name = "plenary", onError = () => {}, connectTimeoutMs = 5000, reconnectWaitMs = 2000,
-  pingIntervalMs = 5000, maxPingOut = 2, maxPendingBytes = 32 * 1024 * 1024, ackEveryMs = 250, connect: connectFn } = {}) {
+  pingIntervalMs = 5000, maxPingOut = 2, maxPendingBytes = 32 * 1024 * 1024, ackEveryMs = 250, connect: connectFn, cluster } = {}) {
+  // `cluster`: every subject on the wire gets `<cluster>.` in front (PROTOCOL.md § Bus, Cluster id; scopeBus in port.js).
+  // Checked before anything connects. Omitted = unscoped: only for tests and tools that speak raw subjects.
+  if (cluster !== undefined && !isClusterId(cluster)) throw new PortError("bad-id", "bad cluster id");
   if (!url || (typeof url !== "string" && !Array.isArray(url))) throw new TypeError("natsBus needs a url");
   const target = natsConnectOptions(url);
   const lib = await import("@nats-io/transport-node");
@@ -229,7 +232,7 @@ export async function natsBus({ url, name = "plenary", onError = () => {}, conne
     const p = Promise.reject(err); p.catch(() => {}); return p;
   };
 
-  return {
+  const bus = {
     maxBytes: MAX_BUS_BYTES,
     /** Resolves once the message is handed to the client (not once it is delivered: there is no delivery receipt). */
     publish(subject, msg) {
@@ -312,4 +315,5 @@ export async function natsBus({ url, name = "plenary", onError = () => {}, conne
       if (gaveUp) try { nc.protocol?.transport?.socket?.destroy(); } catch { /* best effort */ }
     },
   };
+  return cluster === undefined ? bus : scopeBus(bus, cluster);
 }

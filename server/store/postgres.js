@@ -48,6 +48,7 @@
 import { SQL } from "bun";
 import { needId, PortError } from "../ids.js";
 import { needSchema, migrate } from "../pg/schema.js";
+import { randomId } from "../auth/util.js";
 
 const MAX_READ = 10_000;
 const posInt = v => Number.isSafeInteger(v) && v > 0;
@@ -65,6 +66,8 @@ export const STORE_TABLES = Object.freeze({
   // The board's lease record (§ Recovery, Room identity): holder NULL = unheld (released, or a single-node openEpoch).
   // expires_at: ms on the database's clock.
   pl_leases: "tenant TEXT NOT NULL, board TEXT NOT NULL, epoch BIGINT NOT NULL, holder TEXT, expires_at BIGINT, PRIMARY KEY (tenant, board)",
+  // The cluster id (§ Bus, Cluster id): at most one row, minted by the first node that asks; `singleton` is the key, so a second row can't exist.
+  pl_cluster: "id TEXT NOT NULL, singleton BOOLEAN NOT NULL DEFAULT true PRIMARY KEY CHECK (singleton)",
 });
 /** Columns a pl_leases made before the lease (epoch only) lacks. Start-up checks for them and never adds them. */
 const LEASE_COLUMNS = Object.freeze({ holder: "TEXT", expires_at: "BIGINT" });
@@ -81,6 +84,7 @@ const NEEDS = Object.freeze({
   pl_entries: ["SELECT", "INSERT"],
   pl_checkpoints: ["SELECT", "INSERT", "DELETE"],
   pl_leases: ["SELECT", "INSERT", "UPDATE"],   // UPDATE: the lease calls, and FOR SHARE in a fenced write
+  pl_cluster: ["SELECT", "INSERT"],
 });
 /** The database's clock, ms since 1970. */
 const DB_NOW = "(extract(epoch FROM clock_timestamp()) * 1000)::bigint";
@@ -93,7 +97,7 @@ const MAX_TTL = 10 * 60_000;
  *   leaseLockTimeoutMs: the longest a lease call waits on a row lock (default 2 s, at most half its ttl), then "unavailable".
  * @returns {Promise<{ append: Function, read: Function, lastSeq: Function, putCheckpoint: Function,
  *   getCheckpoint: Function, openEpoch: Function, epoch: Function, acquire: Function, renew: Function,
- *   release: Function, lease: Function, settings(): Promise<object>, close(): Promise<void> }>}
+ *   release: Function, lease: Function, settings(): Promise<object>, clusterId(): Promise<string>, close(): Promise<void> }>}
  */
 export async function postgresStore({ url, sql, max, schema = "public", keepCheckpoints = 3, lockTimeoutMs = 15_000,
   txIdleTimeoutMs = 5_000, leaseLockTimeoutMs = 2_000 }) {
@@ -102,7 +106,7 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
   const owned = !sql;
   const db = sql ?? new SQL(max ? { url, max } : url);
   let open = true;
-  const E = `"${s}".pl_entries`, C = `"${s}".pl_checkpoints`, L = `"${s}".pl_leases`;
+  const K = `"${s}".pl_cluster`, E = `"${s}".pl_entries`, C = `"${s}".pl_checkpoints`, L = `"${s}".pl_leases`;
 
   try {
     await db.begin(async tx => {
@@ -335,6 +339,20 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
       const r = rows[0], live = r.live === true;
       return { holder: r.holder, epoch: Number(r.epoch), expiresAt: r.expires_at === null ? null : Number(r.expires_at), live,
         remainingMs: live ? Number(r.expires_at) - Number(r.now) : 0 };
+    },
+
+    /**
+     * This database's cluster id (§ Bus, Cluster id): "c-" + 16 of [a-z0-9], minted by the first caller and the same
+     * for every node and every later call, so two clusters on different databases never share an id and nodes on one
+     * database always do. Durable before it is returned (a lost id would give nodes different ones).
+     */
+    async clusterId() {
+      if (!open) throw new PortError("closed", "the store is closed");
+      const read = async () => (await db.unsafe(`SELECT id FROM ${K}`))[0]?.id;
+      const have = await read();
+      if (have) return have;
+      await write(tx => tx.unsafe(`INSERT INTO ${K} (id) VALUES ($1) ON CONFLICT DO NOTHING`, ["c-" + randomId(16)]));
+      return read();   // the winner's row, whoever's it is
     },
 
     /** What a write transaction runs with, read back from Postgres (for /health and tests). */

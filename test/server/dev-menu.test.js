@@ -230,7 +230,7 @@ test("a Registry that fails at start turns the menu OFF with one warn line; the 
   const { memoryBus } = await import("../../server/bus/memory.js");
   const lines = [];
   const adapters = {
-    postgresStore: async () => sqliteStore({ path: join(tempDir(), "p.db") }),
+    postgresStore: async () => ({ ...sqliteStore({ path: join(tempDir(), "p.db") }), clusterId: async () => "c-aaaaaaaaaaaaaaaa" }),
     postgresRegistry: async () => ({ ...sqliteRegistry({ path: join(tempDir(), "r.db") }), tenantAdminsAmong: async () => { throw Object.assign(new Error("connect to postgres://u:SECRETPW@h failed"), { code: "ERR_POSTGRES_SERVER_ERROR", errno: "42P01" }); } }),
     natsBus: async () => memoryBus({}),
   };
@@ -325,7 +325,7 @@ test("the start-up OFF warn's cause: a SQLSTATE first, then code, then name; a h
   for (const [props, want] of cases) {
     const lines = [];
     const adapters = {
-      postgresStore: async () => sqliteStore({ path: join(tempDir(), "p.db") }),
+      postgresStore: async () => ({ ...sqliteStore({ path: join(tempDir(), "p.db") }), clusterId: async () => "c-aaaaaaaaaaaaaaaa" }),
       postgresRegistry: async () => ({ ...sqliteRegistry({ path: join(tempDir(), "r.db") }), tenantAdminsAmong: async () => { throw Object.assign(new Error("boom"), props); } }),
       natsBus: async () => memoryBus({}),
     };

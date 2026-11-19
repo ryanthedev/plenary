@@ -17,7 +17,7 @@
 // `user`; insertion order is an explicit `n` column (Postgres: BIGSERIAL / identity), upserts use ON CONFLICT.
 
 import { Database } from "bun:sqlite";
-import { mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, searchLimit, smallLimit, searchQuery, asciiFold } from "../auth/registry-port.js";
+import { mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, smallLimit, searchQuery, asciiFold } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 
 /** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code`. */
@@ -222,7 +222,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     search: db.query(`SELECT w.id FROM (SELECT id, title FROM reg_boards WHERE tenant = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?5) w
       LEFT JOIN reg_board_spaces bs ON bs.board = w.id LEFT JOIN reg_spaces s ON s.id = bs.space
       WHERE (?3 IS NULL OR w.title LIKE ?3 ESCAPE '\\' OR (?4 = 0 AND s.name LIKE ?3 ESCAPE '\\')) AND (?4 = 0 OR bs.board IS NULL)
-      ORDER BY w.id LIMIT ?6`),
+      ORDER BY w.id`),
     searchEdge: db.query("SELECT id FROM reg_boards WHERE tenant = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT 2 OFFSET ?3"),
     spaceCand: db.query(`SELECT s.* FROM reg_spaces s WHERE s.tenant = ?1 AND (?2 IS NULL OR s.id > ?2) AND (?4 = 1
         OR s.general_role IS NOT NULL OR s.owner_user = ?3
@@ -631,14 +631,13 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       ready();
       return str(user) ? q.shared.all(user, email ? normEmail(email) : null, smallLimit(limit, HOME.sharedScan, HOME.sharedScan)).map(r => r.board) : [];
     },
-    async searchBoards(tenant, { q: term, unfiled = false, after = null, limit, scan } = {}) {
+    async searchBoards(tenant, { q: term, unfiled = false, after = null, scan } = {}) {
       ready();
-      const cur = orgDefaults.cursor(after, "id"), n = searchLimit(limit), cap = smallLimit(scan, HOME.searchScan.default, HOME.searchScan.max);
+      const cur = orgDefaults.cursor(after, "id"), cap = smallLimit(scan, HOME.searchScan.default, HOME.searchScan.max);
       const like = term == null ? null : "%" + asciiFold(searchQuery(term)).replace(/[\\%_]/g, "\\$&") + "%";
       if (!str(tenant)) return { ids: [], next: null };
-      const ids = q.search.all(tenant, cur, like, unfiled ? 1 : 0, cap, n + 1).map(r => r.id);
-      if (ids.length > n) return { ids: ids.slice(0, n), next: ids[n - 1] };
-      const edge = q.searchEdge.all(tenant, cur, cap - 1);          // [last board examined, one more] when the Unit goes on past `cap`
+      const ids = q.search.all(tenant, cur, like, unfiled ? 1 : 0, cap).map(r => r.id);
+      const edge = q.searchEdge.all(tenant, cur, cap - 1);          // [last board examined, one more] when the Unit goes on past the window
       return { ids, next: edge.length === 2 ? edge[0].id : null };
     },
     async spaceCandidates(tenant, { user, all = false, after = null, limit } = {}) {

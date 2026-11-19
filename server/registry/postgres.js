@@ -71,7 +71,7 @@
 // owns that pool) or `sql` (a Bun SQL client you own). `schema` names the Postgres schema. Never reads env.
 
 import { SQL } from "bun";
-import { mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, searchLimit, smallLimit, searchQuery, asciiFold } from "../auth/registry-port.js";
+import { mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, smallLimit, searchQuery, asciiFold } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 import { needSchema, migrate, missing as absent } from "../pg/schema.js";
 
@@ -731,9 +731,9 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
           UNION SELECT board FROM ${U} WHERE member = $1) x ORDER BY board LIMIT $3`,
       [user, email && key(email) ? normEmail(email) : null, smallLimit(limit, HOME.sharedScan, HOME.sharedScan)])).map(r => r.board);
     },
-    async searchBoards(tenant, { q: term, unfiled = false, after = null, limit, scan } = {}) {
+    async searchBoards(tenant, { q: term, unfiled = false, after = null, scan } = {}) {
       ready();
-      const cur = orgDefaults.cursor(after, "id"), n = searchLimit(limit), cap = smallLimit(scan, HOME.searchScan.default, HOME.searchScan.max);
+      const cur = orgDefaults.cursor(after, "id"), cap = smallLimit(scan, HOME.searchScan.default, HOME.searchScan.max);
       // ASCII case-folding only (PROTOCOL.md § Home): translate() instead of ILIKE, whose folding follows the database's locale.
       const like = term == null ? null : "%" + asciiFold(searchQuery(term)).replace(/[\\%_]/g, "\\$&") + "%";
       if (!key(tenant)) return { ids: [], next: null };
@@ -742,8 +742,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         LEFT JOIN ${BS} bs ON bs.board = w.id LEFT JOIN ${SP} s ON s.id = bs.space
         WHERE ($3::text IS NULL OR ${fold("w.title")} LIKE $3 ESCAPE '\\' OR ($4::boolean = false AND ${fold("s.name")} LIKE $3 ESCAPE '\\'))
           AND ($4::boolean = false OR bs.board IS NULL)
-        ORDER BY w.id LIMIT $6`, [tenant, cur, like, !!unfiled, cap, n + 1])).map(r => r.id);
-      if (ids.length > n) return { ids: ids.slice(0, n), next: ids[n - 1] };
+        ORDER BY w.id`, [tenant, cur, like, !!unfiled, cap])).map(r => r.id);
       const edge = await db.unsafe(`SELECT id FROM ${BD} WHERE tenant = $1 AND ($2::text IS NULL OR id > $2) ORDER BY id LIMIT 2 OFFSET $3`, [tenant, cur, cap - 1]);
       return { ids, next: edge.length === 2 ? edge[0].id : null };
     },

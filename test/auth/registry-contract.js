@@ -662,12 +662,14 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect((await r.searchBoards(t.id, { q: "zzz" })).ids).toEqual([]);
         expect((await r.searchBoards(t.id, { unfiled: true })).ids.sort()).toEqual([b.id, c.id].sort());
         expect((await r.searchBoards(t.id, { unfiled: true, q: "design studio" })).ids).toEqual([]);   // unfiled: titles only
-        const p1 = await r.searchBoards(t.id, { q: "roadmap", limit: 1 });
-        expect(p1.ids.length).toBe(1);
-        expect(p1.next).toBe(p1.ids[0]);
-        const p2 = await r.searchBoards(t.id, { q: "roadmap", limit: 1, after: p1.next });
-        expect([...p1.ids, ...p2.ids].sort()).toEqual([a.id, c.id].sort());
-        expect(p2.next).toBe(null);
+        // Paging is by the scan window, never by the number of matches: both matches come back together, and `next` stays null.
+        const both = await r.searchBoards(t.id, { q: "roadmap" });
+        expect(both.ids.sort()).toEqual([a.id, c.id].sort());
+        expect(both.next).toBe(null);
+        const w1 = await r.searchBoards(t.id, { q: "roadmap", scan: 1 });
+        expect(w1.next).toBe([a.id, b.id, c.id].sort()[0]);                  // examined one board; the Unit goes on
+        const w2 = await r.searchBoards(t.id, { q: "roadmap", scan: 1, after: w1.next });
+        expect(w2.next).toBe([a.id, b.id, c.id].sort()[1]);
         await expect(r.searchBoards(t.id, { q: "   " })).rejects.toThrow();
         await expect(r.searchBoards(t.id, { q: "x".repeat(101) })).rejects.toThrow();
         await expect(r.searchBoards(t.id, { q: "a", after: "x\ny" })).rejects.toThrow("bad cursor");
@@ -680,6 +682,17 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect((await r.searchBoards(t.id, { q: "caf\u00c9" })).ids).toEqual([a.id]);
         expect((await r.searchBoards(t.id, { q: "caf\u00e9" })).ids).toEqual([b.id]);
         expect((await r.searchBoards(t.id, { q: "CAF" })).ids.sort()).toEqual([a.id, b.id].sort());
+      });
+
+      test("searchBoards: `next` depends only on the scan window, never on how many boards matched", async () => {
+        const t = await r.createTenant({ domain: "many.com" });
+        for (let i = 0; i < 30; i++) await r.createBoard({ tenant: t.id, title: `falcon ${i}` });
+        const some = await r.searchBoards(t.id, { q: "falcon", scan: 100 }), none = await r.searchBoards(t.id, { q: "qqqq", scan: 100 });
+        expect([some.ids.length, some.next, none.ids.length, none.next]).toEqual([30, null, 0, null]);   // 30 matches in one window: all returned, nothing "more"
+        const cut = await r.searchBoards(t.id, { q: "falcon", scan: 10 }), cutNone = await r.searchBoards(t.id, { q: "qqqq", scan: 10 });
+        expect(cut.ids.length).toBe(10);
+        expect(cut.next).toBe(cutNone.next);                                 // the same cursor whether or not anything matched
+        expect(cut.next).not.toBe(null);
       });
 
       test("searchBoards is work-bounded: a page examines at most `scan` boards and `next` says where it stopped, even with no match", async () => {

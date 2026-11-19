@@ -9,7 +9,7 @@
 // board they reach some other way shows as "Shared with you" (SHARED_PART), and a Space-name search match counts only
 // for a Space they can open.
 
-import { asciiFold } from "./registry-port.js";
+import { asciiFold, HOME } from "./registry-port.js";
 import { resolveAccess } from "./resolver.js";
 
 /** @typedef {import("./idp-port.js").Identity} Identity */
@@ -19,7 +19,7 @@ import { resolveAccess } from "./resolver.js";
 /** What one Home read shows at most (also sent to the page as `limits`). */
 export const LIMITS = Object.freeze({ recent: 12, starred: 50, shared: 50, owned: 50, search: 20, spaces: 100, other: 20, space: 50 });
 /** How many candidate rows each list reads before the access filter (a few may be dropped: unopenable, or a stale row). */
-const SCAN = Object.freeze({ recent: 30, starred: 60, shared: 60, searchPages: 2, searchPage: 100, grantChecks: 40, groupChecks: 20, groupCandidates: 50 });
+const SCAN = Object.freeze({ recent: 30, starred: 60, shared: 60, searchPages: 2, spacePages: 3, grantChecks: 40, groupChecks: 20, groupCandidates: 50 });
 /**
  * The pseudo-group for boards filed in no Space (every board made before Spaces). One place to change when a later migration
  * moves them into a legacy Space: drop this and `other` in the tree (PROTOCOL.md § Home).
@@ -42,11 +42,17 @@ export function homeService({ registry, tenancy, now = Date.now }) {
       f.spaceOpen ? { type: "space", id: f.space.id, name: f.space.name } : SHARED_PART];
   };
   const openable = f => !!f && f.access.ladder != null;
+  /** `accessMany` over any number of ids, HOME.batch at a time. */
+  const accessAll = async (identity, ids) => {
+    const out = new Map();
+    for (let i = 0; i < ids.length; i += HOME.batch) for (const [k, v] of await tenancy.accessMany(identity, ids.slice(i, i + HOME.batch))) out.set(k, v);
+    return out;
+  };
   const card = (f, unit, extra = {}) => ({ id: f.board.id, title: f.board.title, role: f.access.ladder, path: pathOf(f, unit), starred: false, ...extra });
 
   /** Cards for `entries` ({ id, at? }) in order, dropping what the person can't open; star flags in one query. `keep(found)` filters further. */
   async function cards(identity, unit, entries, { found: given, keep } = {}) {
-    const found = given ?? await tenancy.accessMany(identity, [...new Set(entries.map(e => e.id))]);
+    const found = given ?? await accessAll(identity, [...new Set(entries.map(e => e.id))]);
     const out = entries.filter(e => openable(found.get(e.id)) && (!keep || keep(found.get(e.id)))).map(e => card(found.get(e.id), unit, e.at != null ? { at: e.at } : {}));
     if (out.length) {
       const stars = new Set(await registry.starredAmong(identity.user, out.map(c => c.id)));
@@ -62,11 +68,12 @@ export function homeService({ registry, tenancy, now = Date.now }) {
    */
   async function reached(identity, unit) {
     const ids = await registry.sharedBoards(identity.user, identity.email ?? null, { limit: SCAN.shared });
-    const found = await tenancy.accessMany(identity, ids);
+    const found = await accessAll(identity, ids);
     const inTree = f => !!unit && (f.spaceOpen || (!f.space && f.board.tenant === unit.id));
     const mine = f => f.grant === "owner";
     const list = (keep) => cards(identity, unit, ids.map(id => ({ id })), { found, keep });
-    const owned = unit ? [] : (await list(mine)).sort(byTitle);
+    // "Your boards" cards carry no path: a guest's own board is not "shared with" them, and what is above it is not theirs to name.
+    const owned = unit ? [] : (await list(mine)).map(c => ({ ...c, path: [] })).sort(byTitle);
     const shared = (await list(f => !inTree(f) && (!!unit || !mine(f)))).sort(byTitle);
     return { owned, shared };
   }
@@ -97,14 +104,16 @@ export function homeService({ registry, tenancy, now = Date.now }) {
     const shown = new Map();
     let gChecks = 0;
     const seenGroups = new Map(cand.groups.map(g => [g.id, g]));
-    for (const g of await registry.groupCandidates(unit.id, { user: identity.user, all, limit: SCAN.groupCandidates })) if (!seenGroups.has(g.id)) seenGroups.set(g.id, g);
+    const gc = await registry.groupCandidates(unit.id, { user: identity.user, all, limit: SCAN.groupCandidates + 1 });
+    if (gc.length > SCAN.groupCandidates) more = true;                                 // asked for one more than the cap: the Groups were cut
+    for (const g of gc.slice(0, SCAN.groupCandidates)) if (!seenGroups.has(g.id)) seenGroups.set(g.id, g);
     for (const g of seenGroups.values()) {
       if (all || general(null, g)) shown.set(g.id, g);
       else if (gChecks++ < SCAN.groupChecks) { if ((await tenancy.effective(identity, { type: "group", id: g.id })).ladder != null) shown.set(g.id, g); }
       else more = true;
     }
-    const page = await registry.searchBoards(unit.id, { unfiled: true, limit: SCAN.searchPage });
-    const found = await tenancy.accessMany(identity, page.ids);
+    const page = await registry.searchBoards(unit.id, { unfiled: true });
+    const found = await accessAll(identity, page.ids);
     const other = page.ids.filter(id => openable(found.get(id))).map(id => ({ id, title: found.get(id).board.title })).sort(byTitle);
     return {
       groups: [...shown.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : a.id < b.id ? -1 : 1))
@@ -146,10 +155,15 @@ export function homeService({ registry, tenancy, now = Date.now }) {
       const add = c => { if (seen.has(c.id)) return; if (results.length >= LIMITS.search) { more = true; return; } seen.add(c.id); results.push(c); };
       if (unit) {
         let after = null;
-        for (let page = 0; page < SCAN.searchPages; page++) {
-          const r = await registry.searchBoards(unit.id, { q, after, limit: SCAN.searchPage });
-          // A Space-name match counts only when the person can open that Space: an unopenable Space's name is not a search key.
-          for (const c of await cards(identity, unit, r.ids.map(id => ({ id })), { keep: f => asciiFold(f.board.title).includes(needle) || f.spaceOpen })) add(c);
+        // `more` comes from two things only: a 21st OPENABLE match, or the scan window ending before the Unit does. Never from how many
+        // matches the person can't open (a hidden Space's name must not change the answer), so every match in a window is looked at.
+        pages: for (let page = 0; page < SCAN.searchPages; page++) {
+          const r = await registry.searchBoards(unit.id, { q, after });
+          for (let i = 0; i < r.ids.length; i += HOME.batch) {
+            // A Space-name match counts only when the person can open that Space: an unopenable Space's name is not a search key.
+            for (const c of await cards(identity, unit, r.ids.slice(i, i + HOME.batch).map(id => ({ id })), { keep: f => asciiFold(f.board.title).includes(needle) || f.spaceOpen })) add(c);
+            if (more) break pages;
+          }
           after = r.next;
           if (after == null) break;
         }
@@ -168,11 +182,18 @@ export function homeService({ registry, tenancy, now = Date.now }) {
       const unit = await tenancy.tenantOf(identity);
       const sp = unit ? await registry.space(spaceId) : null;
       if (!sp || sp.tenant !== unit.id) return { space: null, results: [], more: false };
-      const page = await registry.boardsIn({ type: "space", id: sp.id }, { limit: 200 });
-      const found = await tenancy.accessMany(identity, page.ids);
-      const results = (await cards(identity, unit, page.ids.map(id => ({ id })), { found })).sort(byTitle);
-      const named = [...found.values()].some(f => f.spaceOpen);
-      return { space: named ? { id: sp.id, name: sp.name } : null, results: results.slice(0, LIMITS.space), more: page.next != null || results.length > LIMITS.space };
+      let after = null, named = false;
+      const found = new Map(), ids = [];
+      for (let page = 0; page < SCAN.spacePages; page++) {
+        const p = await registry.boardsIn({ type: "space", id: sp.id }, { after, limit: HOME.batch });
+        for (const [k, v] of await tenancy.accessMany(identity, p.ids)) { found.set(k, v); if (v.spaceOpen) named = true; }
+        ids.push(...p.ids);
+        after = p.next;
+        if (after == null) break;
+      }
+      const results = (await cards(identity, unit, ids.map(id => ({ id })), { found })).sort(byTitle);
+      // As in search: `more` never reflects boards the person can't open. For a Space they can't open it is only the 50-card overflow.
+      return { space: named ? { id: sp.id, name: sp.name } : null, results: results.slice(0, LIMITS.space), more: results.length > LIMITS.space || (named && after != null) };
     },
 
     /** PUT /home/stars/:board. Guests have no Starred. @returns {Promise<boolean>} false = refused (guest, no role, or no such board): nothing was written */

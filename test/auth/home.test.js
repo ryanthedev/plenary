@@ -404,11 +404,79 @@ describe("bounds", () => {
     const sp = await r.createSpace({ tenant: acme.id, name: "Many" });
     for (let i = 0; i < 6; i++) await mk(sp.id, `hay ${i}`);
     const { calls, reg } = spy(r);
-    const small = new Proxy(reg, { get: (t, k) => (k === "searchBoards" ? (tenant, o) => t.searchBoards(tenant, { ...o, scan: 2, limit: 100 }) : t[k]) });
+    const small = new Proxy(reg, { get: (t, k) => (k === "searchBoards" ? (tenant, o) => t.searchBoards(tenant, { ...o, scan: 2 }) : t[k]) });
     const res = await homeService({ registry: small, tenancy: tenancy({ registry: small, now }) }).search(ada, "hay");
     expect(calls.searchBoards).toBe(2);                                                  // two pages, then it stops
     expect(res.results.length).toBe(4);
     expect(res.more).toBe(true);
+  });
+});
+
+describe("what is hidden must not change what is said (search `more`, Space route)", () => {
+  const hiddenSpace = async (n, name = "Project Falcon acquisition") => {
+    const sp = await r.createSpace({ tenant: acme.id, name, generalRole: null });
+    for (let i = 0; i < n; i++) await mk(sp.id, `board ${i}`, { memberRole: null });
+    return sp;
+  };
+
+  test("search: 230 boards in a hidden Space whose name matches give the same answer as a query that matches nothing", async () => {
+    await hiddenSpace(230);
+    const byName = await home.search(ada, "falcon"), nothing = await home.search(ada, "qqqq");
+    expect([byName.results, byName.more]).toEqual([[], false]);
+    expect([nothing.results, nothing.more]).toEqual([[], false]);
+    expect(JSON.stringify(byName).replace("falcon", "X")).toBe(JSON.stringify(nothing).replace("qqqq", "X"));
+  });
+
+  test("search: visible matches are not crowded out by hidden ones in the same window, and more means only visible overflow or the window's end", async () => {
+    await hiddenSpace(230);
+    const open = await r.createSpace({ tenant: acme.id, name: "Open" });
+    const vis = await mk(open.id, "Falcon notes");
+    expect(ids((await home.search(ada, "falcon")).results)).toEqual([vis.id]);
+    for (let i = 0; i < 25; i++) await mk(open.id, `falcon ${i}`);
+    const many = await home.search(ada, "falcon");
+    expect(many.results.length).toBe(LIMITS.search);
+    expect(many.more).toBe(true);                                   // a 21st openable match
+  });
+
+  test("search: `more` when the window ends before the Unit does (and it doesn't depend on matches)", async () => {
+    for (let i = 0; i < 5; i++) await mk(undefined, `plain ${i}`);
+    const tiny = new Proxy(r, { get: (t, k) => (k === "searchBoards" ? (tenant, o) => t.searchBoards(tenant, { ...o, scan: 2 }) : t[k]) });
+    const svc = homeService({ registry: tiny, tenancy: tenancy({ registry: tiny, now }) });
+    expect((await svc.search(ada, "plain")).more).toBe(true);
+    expect((await svc.search(ada, "qqqq")).more).toBe(true);
+  });
+
+  test("space route: a hidden Space with 650 boards (more than the 3 pages it reads) answers exactly like an unknown id", async () => {
+    const sp = await hiddenSpace(650, "Hidden Nine");
+    const hidden = await home.spaceBoards(ada, sp.id), unknown = await home.spaceBoards(ada, "s-nope");
+    expect(hidden).toEqual(unknown);
+    expect(hidden).toEqual({ space: null, results: [], more: false });
+  });
+
+  test("space route: an open Space pages past 200 boards and says more only when the pages ran out; its overflow past 50 cards says more", async () => {
+    const sp = await r.createSpace({ tenant: acme.id, name: "Big" });
+    for (let i = 0; i < 60; i++) await mk(sp.id, `x${i}`);
+    const res = await home.spaceBoards(ada, sp.id);
+    expect([res.space.name, res.results.length, res.more]).toEqual(["Big", LIMITS.space, true]);
+  });
+});
+
+describe("tree.more on Group overflow, and owned cards", () => {
+  test("60 Groups the person can open: the tree shows 50 and says more", async () => {
+    for (let i = 0; i < 60; i++) await r.createGroup({ tenant: acme.id, name: `grp ${String(i).padStart(2, "0")}`, generalRole: "viewer" });
+    const t = (await home.home(ada)).tree;
+    expect(t.groups.length).toBe(50);
+    expect(t.more).toBe(true);
+    const fewer = await (async () => { const reg2 = memoryRegistry({ now }); const u = await reg2.createTenant({ domain: "acme.com" }); for (let i = 0; i < 50; i++) await reg2.createGroup({ tenant: u.id, name: `g${i}`, generalRole: "viewer" });
+      const t2 = tenancy({ registry: reg2, now }); return (await homeService({ registry: reg2, tenancy: t2, now }).home(ada)).tree; })();
+    expect([fewer.groups.length, fewer.more]).toEqual([50, false]);                      // exactly the cap is not an overflow
+  });
+
+  test("a guest's owned card has no path (not 'Shared with you')", async () => {
+    const b = await mk(undefined, "Mine", { memberRole: null });
+    await r.setGrant(b.id, kim.user, "owner");
+    const h = await home.home(kim);
+    expect(h.owned.map(c => [c.title, c.path])).toEqual([["Mine", []]]);
   });
 });
 

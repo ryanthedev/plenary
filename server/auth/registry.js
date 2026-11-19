@@ -2,7 +2,7 @@
 // last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
 import { normEmail } from "./util.js";
-import { mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, searchLimit, smallLimit, searchQuery, asciiFold } from "./registry-port.js";
+import { mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, smallLimit, searchQuery, asciiFold } from "./registry-port.js";
 
 /**
  * @typedef {import("./registry-port.js").Registry} Registry
@@ -283,20 +283,13 @@ export function memoryRegistry({ now = Date.now } = {}) {
       for (const [k, ls] of uses) if (k.endsWith("\n" + user) && ls.size) out.add(k.slice(0, k.length - user.length - 1));
       return [...out].filter(b => boards.has(b)).sort().slice(0, smallLimit(limit, HOME.sharedScan, HOME.sharedScan));
     },
-    async searchBoards(tenant, { q, unfiled = false, after = null, limit, scan } = {}) {
+    async searchBoards(tenant, { q, unfiled = false, after = null, scan } = {}) {
       after = orgDefaults.cursor(after, "id");
-      const term = q == null ? null : asciiFold(searchQuery(q)), n = searchLimit(limit), cap = smallLimit(scan, HOME.searchScan.default, HOME.searchScan.max);
+      const term = q == null ? null : asciiFold(searchQuery(q)), cap = smallLimit(scan, HOME.searchScan.default, HOME.searchScan.max);
       const hit = b => (unfiled ? !b.space : true) && (term == null || asciiFold(b.title).includes(term) || (!unfiled && b.space && asciiFold(spaces.get(b.space)?.name ?? "").includes(term)));
       const window = [...boards.values()].filter(b => b.tenant === tenant && (after == null || b.id > after)).map(b => b.id).sort().slice(0, cap + 1);
-      const scanned = window.slice(0, cap), ids = [];
-      let next = null;
-      for (const id of scanned) {
-        if (!hit(boards.get(id))) continue;
-        if (ids.length === n) { next = ids[n - 1]; break; }            // the (n+1)th match: more to come
-        ids.push(id);
-      }
-      if (next == null && window.length > cap) next = scanned[cap - 1];  // examined `cap` boards and the Unit goes on
-      return { ids, next };
+      const scanned = window.slice(0, cap);
+      return { ids: scanned.filter(id => hit(boards.get(id))), next: window.length > cap ? scanned[cap - 1] : null };   // `next`: the Unit goes on past the window, whatever matched
     },
     async spaceCandidates(tenant, { user, all = false, after = null, limit } = {}) {
       after = orgDefaults.cursor(after, "id");

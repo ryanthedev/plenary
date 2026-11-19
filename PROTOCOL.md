@@ -787,7 +787,7 @@ Registry calls below. All routes authenticate like every other route in http.js:
   - `recent`: the last 12 boards the person opened (newest first). `starred`: up to 50, newest star first (members only). Each is a list of
     **cards**: `{ id, title, role, path, starred, at? }`. `role` = the ladder role the person holds now. `at` = when it was opened (recent) or
     starred (starred).
-  - `owned` ("Your boards", guests only; `[]` for a member): up to 50 boards the guest holds a direct **owner** grant on, by title. A member's
+  - `owned` ("Your boards", guests only; `[]` for a member): up to 50 boards the guest holds a direct **owner** grant on, by title, with an empty `path`. A member's
     owned boards are already in their Spaces and the tree. `shared` ("Shared with me"): up to 50, by title. **Shared means** boards the person
     reaches through a source on the board itself (a direct grant, a grant to a Team they are in, a live invite to their email, a link they redeemed;
     `Registry.sharedBoards`) and, for a member, whose place the tree doesn't already show: boards in a Space they can open, and boards in
@@ -800,16 +800,19 @@ Registry calls below. All routes authenticate like every other route in http.js:
     The check is the resolver's own answer for the Space / Group (`accessMany`, below), not a stored flag.
   - `tree` (members): `{ groups: [{ id, name, spaces: [{ id, name, personal }] }], spaces: [...Spaces in no Group, or in a Group they can't open], other: { boards: [{ id, title }], more }, more }`.
     Only Spaces and Groups the person can open boards in appear. `other`: the unfiled boards they can open (up to 20; `more` true if more exist or the scan stopped).
-    `tree.more`: true when the page of Space candidates (100) or the grant checks (40 Spaces, 20 Groups) left something out. "Other boards" is a pseudo-group for the boards made before
+    `tree.more`: true when the page of Space candidates (100), the Group candidates (50; one more is asked for to tell), or the grant checks (40 Spaces, 20 Groups) left something out. "Other boards" is a pseudo-group for the boards made before
     Spaces existed: one constant (`OTHER` in home.js), so a later migration into a legacy Space removes it in one place.
   - `limits`: the caps in force, so the page needs no copy of them.
 - `GET /home/search?q=<text>` → `{ q, results, more }`. `q` trimmed, 1-100 chars (else 400). Members: boards of the person's Unit whose **title** contains `q`,
   or whose Space name contains `q` **and the person can open that Space** (an unopenable Space's name is no search key), plus matching titles among `owned` and `shared`.
   Matching is **ASCII case-folding only** (`A-Z`; other letters compare as written; `%`, `_` and `\` literal) on every adapter. At most 20 results. Work is bounded: up to 2
-  pages of 100 matches, each page examining at most 2000 boards (`searchBoards`' `scan`); `more` is true if the search stopped before the end of the Unit or hit the 20.
+  windows, each examining the next 1000 boards of the Unit (`searchBoards`' `scan`) and returning EVERY match in it (checked 200 at a time). **`more` is true only when a 21st
+  openable match exists or the window ended before the Unit did**: never because of how many matches the person can't open, so a hidden Space's name (or a pile of hidden boards)
+  gives the same answer as a query that matches nothing. `searchBoards`' `next` likewise depends only on the window, never on the match count.
   A board the person cannot open is never returned, whatever it is called. Guests: matching titles among `owned` and `shared`.
 - `GET /home/search?space=<id>` → `{ space, results, more }`: one Space's boards the person can open (by id, up to 50), for the tree's click. `space` is `{ id, name }` only when the
-  person can open the Space itself, else null (a board reached another way still lists, under "Shared with you"). A Space of another Unit, an unknown one, or a guest's: `{ space: null, results: [], more: false }`. `space` with `q` is 400.
+  person can open the Space itself, else null (a board reached another way still lists, under "Shared with you"). It reads at most 3 pages of 200 boards. `more` is true on a 51st openable card, or, for a Space they can open, when
+  the pages ran out; for a Space they can't open it is only the card overflow, so a hidden Space (any size) answers exactly like an unknown id or another Unit's Space: `{ space: null, results: [], more: false }`. `space` with `q` is 400.
 - `PUT /home/stars/:board` / `DELETE /home/stars/:board` → 204. Starring needs a Unit and a role on the board (a guest, a board with no role and an unknown board all get the same 403 `forbidden`);
   unstarring is always allowed and idempotent.
 - **Recent is written by the server**, not the page: when a gateway welcomes a connection it calls `markOpened(user, board)` (debounced per user and board for 60 s per gateway, best
@@ -817,7 +820,7 @@ Registry calls below. All routes authenticate like every other route in http.js:
   row per (user, board); only the newest 50 per user are kept, **atomically** (Postgres serialises one member's writes with a transaction advisory lock).
 
 **"Boards I can open", efficiently.** The listing never asks the resolver once per board in the Unit. Every list is built from a *candidate* query that is bounded in SQL (recents ≤ 30
-rows, starred ≤ 60, shared ≤ 60, a search page ≤ 100 matches over ≤ 2000 examined boards, ≤ 2 pages) and the candidates then go through ONE batch, `tenancy.accessMany(identity, ids)`:
+rows, starred ≤ 60, shared ≤ 60, a search window of ≤ 1000 examined boards, ≤ 2 windows) and the candidates then go through ONE batch, `tenancy.accessMany(identity, ids)`:
 `Registry.boardRows(ids, { user, email })` (SQLite 7 statements, Postgres 6, for the whole batch, however many boards: boards, the user's grants, Team grants on the boards, the user's Teams among
 them, invites to their email, link uses, the links) plus **one `accessContext` per distinct Space (or Unit, for unfiled boards)** among the candidates, then the pure `resolveAccess` per board, and
 once per distinct Space and Group from the context already in hand (no more reads) for `spaceOpen` / `groupOpen`, which the path rule above needs. So a page of N candidates costs 6-7 batch statements plus one per distinct
@@ -928,7 +931,7 @@ method names are stable. Ids are server-minted over `[a-z0-9-]`.
 | grants | `setGrant(board, user, role \| null)`, `grant(board, user) → role \| null`, `grants(board)` |
 | invites | `createInvite({ board, email, role, expiresAt, by })`, `invite(id)`, `invites(board)`, `invitesFor(board, email)`, `revokeInvite(id)` |
 | share links | `createLink({ board, role, expiresAt, by })` (role per link), `link(id)`, `links(board)`, `revokeLink(id)`, `addLinkUse(link, user)`, `linkUses(board, user)` |
-| home | `markOpened(user, board)`, `recents(user, { limit })`, `setStarred(user, board, on)`, `starred(user, { limit })`, `starredAmong(user, boards)`, `sharedBoards(user, email, { limit })`, `searchBoards(tenant, { q, unfiled, after, limit, scan })`, `spaceCandidates(tenant, { user, all, after, limit })`, `groupCandidates(tenant, { user, all, limit })`, `boardRows(boards, { user, email })` (§ Home) |
+| home | `markOpened(user, board)`, `recents(user, { limit })`, `setStarred(user, board, on)`, `starred(user, { limit })`, `starredAmong(user, boards)`, `sharedBoards(user, email, { limit })`, `searchBoards(tenant, { q, unfiled, after, scan })`, `spaceCandidates(tenant, { user, all, after, limit })`, `groupCandidates(tenant, { user, all, limit })`, `boardRows(boards, { user, email })` (§ Home) |
 | organization | `createGroup`, `group`, `groups`; `createSpace`, `space`, `spaces`, `ensurePersonalSpace(tenant, user)`; `createTeam`, `team`, `teams`, `setTeamMember`, `teamMembers`; `setScopedGrant({ scope, subject, role \| null })`, `scopedGrants(scope)`; `createRole`, `updateRole`, `role`, `roles`; `accessContext(scope, { users, chain })`; `boardsIn(scope, { after, limit })`, `scopesOf(subject, { after, limit })` |
 
 Single node: SQLite; cluster: Postgres. The room never calls it; gateways and Auth do. On Postgres the server

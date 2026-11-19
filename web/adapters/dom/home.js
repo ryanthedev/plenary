@@ -9,7 +9,7 @@ import { pathText, whenText } from "../../core/home.js";
 /**
  * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/home.js").createHomeModel>, clock: import("../../ports/clock.js").Clock,
  *   boardHref: (id: string) => string, spaceHref: (id: string) => string, groupHref: (id: string) => string,
- *   dialogs: Pick<ReturnType<typeof import("./dialogs.js").createDialogs>, "newBoard"|"newSpace">, homeHref?: string, signIn?: { href: string, text?: string } | null }} o
+ *   dialogs: Pick<ReturnType<typeof import("./dialogs.js").createDialogs>, "newBoard"|"newSpace"|"newGroup">, homeHref?: string, signIn?: { href: string, text?: string } | null }} o
  * @returns {{ destroy(): void }}
  */
 export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref, dialogs, homeHref = "./", signIn = null }) {
@@ -31,6 +31,7 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
   const guest = () => !!S.data?.guest;
   const newBoard = () => h("button.btn.primary", { type: "button", onclick: e => dialogs.newBoard({ opener: e.currentTarget }) }, "＋ New board");
   const newSpace = () => h("button.btn", { type: "button", onclick: e => dialogs.newSpace({ opener: e.currentTarget }) }, "＋ New space");
+  const newGroup = () => (S.data?.can?.createGroup ? h("button.btn", { type: "button", onclick: e => dialogs.newGroup({ opener: e.currentTarget }) }, "＋ New group") : null);
   const navBtn = (view, label, count) => h("button.nav", { type: "button", "aria-current": S.view === view && !S.query.trim() ? "page" : null,
     onclick: () => { search.value = ""; model.setQuery(""); model.setView(view); } }, label, count != null ? h("span.n", {}, String(count)) : null);
 
@@ -54,7 +55,7 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
     // A Space opens its own page (?space=<id>), a Group its (?group=<id>).
     const node = s => h("a.nav.sub", { href: spaceHref(s.id), title: `Open ${s.name}`, "aria-label": `Open ${s.name}` }, s.personal ? "◐ " : "▢ ", s.name);
     const t = d.tree;
-    replace(side, d.guest ? null : newBoard(), d.guest ? null : newSpace(), navBtn("home", "Home"), d.guest ? null : navBtn("starred", "Starred", d.starred.length), navBtn("shared", "Shared with me", d.shared.length),
+    replace(side, d.guest ? null : newBoard(), d.guest ? null : newSpace(), newGroup(), navBtn("home", "Home"), d.guest ? null : navBtn("starred", "Starred", d.starred.length), navBtn("shared", "Shared with me", d.shared.length),
       t && h("div.tree", { role: "group", "aria-label": "Groups and Spaces" },
         t.groups.map(g => h("div.grp", {}, h("h4", {}, h("a", { href: groupHref(g.id) }, g.name)), g.spaces.map(node))),
         t.spaces.length ? h("div.grp", {}, h("h4", {}, "Not in a group"), t.spaces.map(node)) : null,

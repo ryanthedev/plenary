@@ -26,11 +26,13 @@ test("pickers, create, update and rename: the routes, methods and bodies of PROT
   await a.boardSpaces(); await a.spaceGroups();
   await a.createBoard({ title: "Offsite", space: "s-1" }); await a.createBoard({ title: "Mine" });
   await a.createSpace({ name: "Q4", group: "g-1", general: null }); await a.createSpace({ name: "Q5" });
+  await a.createGroup({ name: "Org", general: "viewer" }); await a.createGroup({ name: "Org2" });
   await a.updateSpace("s-1", { name: "N" }); await a.updateGroup("g-1", { general: "viewer" }); await a.renameBoard("b-9", "T");
   expect(s.calls.map(([u, i]) => [i.method, u, i.body ? JSON.parse(i.body) : undefined])).toEqual([
     ["GET", "/spaces?can=board.create", undefined], ["GET", "/groups?can=space.create", undefined],
     ["POST", "/boards", { title: "Offsite", space: "s-1" }], ["POST", "/boards", { title: "Mine" }],
     ["POST", "/spaces", { name: "Q4", group: "g-1", general: null }], ["POST", "/spaces", { name: "Q5" }],
+    ["POST", "/groups", { name: "Org", general: "viewer" }], ["POST", "/groups", { name: "Org2" }],
     ["PATCH", "/spaces/s-1", { name: "N" }], ["PATCH", "/groups/g-1", { general: "viewer" }], ["PATCH", "/boards/b-9", { title: "T" }]]);
   expect(s.calls[2][1].headers["content-type"]).toBe("application/json");
 });

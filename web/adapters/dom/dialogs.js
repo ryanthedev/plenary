@@ -3,7 +3,7 @@
 // it, and focus goes back to whatever opened it. Text goes in through textContent only (names are other people's words).
 
 import { h, replace } from "./dom.js";
-import { createNewBoardModel, createNewSpaceModel, GENERAL_CHOICES } from "../../core/spaces.js";
+import { createNewBoardModel, createNewSpaceModel, createNewGroupModel, GENERAL_CHOICES } from "../../core/spaces.js";
 
 const FOCUSABLE = "button, input, select, textarea, a[href]";
 const focusables = el => (typeof el.querySelectorAll === "function" ? [...el.querySelectorAll(FOCUSABLE)] : el.all().filter(e => /^(BUTTON|INPUT|SELECT|TEXTAREA|A)$/.test(e.tagName)))
@@ -44,7 +44,7 @@ const field = (label, hint, control) => h("label.l", {}, label, hint ? h("span.h
 const errorLine = () => h("p.sp-error", { role: "alert" });
 
 /**
- * @param {{ host: HTMLElement, api: import("../../ports/spaces.js").SpacesPort, hrefs: { board(id: string): string, space(id: string): string }, go(href: string): void }} o
+ * @param {{ host: HTMLElement, api: import("../../ports/spaces.js").SpacesPort, hrefs: { board(id: string): string, space(id: string): string, group(id: string): string }, go(href: string): void }} o
  */
 export function createDialogs({ host, api, hrefs, go }) {
   return {
@@ -114,6 +114,23 @@ export function createDialogs({ host, api, hrefs, go }) {
       model.subscribe(render);
       model.load();
       render();
+      return d;
+    },
+
+    /** New group (offered only to people who may create one): a name and who in the organization can open it. */
+    newGroup({ opener = null } = {}) {
+      const model = createNewGroupModel({ api });
+      const S = model.state;
+      const name = h("input.field", { type: "text", maxlength: "200", autocomplete: "off", "aria-label": "Name", oninput: e => model.setName(e.target.value) });
+      const sel = h("select.field", { "aria-label": "General access", onchange: e => model.setGeneral(e.target.value) },
+        GENERAL_CHOICES.map(([v, label]) => h("option", { value: v ?? "none", selected: v === null }, label)));
+      const err = errorLine();
+      const create = h("button.btn.primary", { type: "submit" }, "Create group");
+      const d = openDialog({ host, title: "New group", opener, onSubmit: () => model.submit(),
+        body: [field("Name", null, name), field("General access", "Applies to the Spaces inside it. People added by name keep their own access.", sel), h("p.from", {}, "You'll be its owner."), err],
+        footer: [h("button.btn", { type: "button", onclick: () => d.close() }, "Cancel"), create] });
+      name.focus?.();
+      model.subscribe(() => { err.textContent = S.error ?? ""; create.disabled = S.busy; if (S.created) { d.close(); go(hrefs.group(S.created.id)); } });
       return d;
     },
 

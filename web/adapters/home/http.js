@@ -27,7 +27,7 @@ export function normalizeHome(b) {
   return {
     guest: b.guest, user: { user: str(b.user?.user, 80), name: str(b.user?.name, 80) },
     unit: b.unit && typeof b.unit === "object" ? { id: str(b.unit.id, 64), kind: str(b.unit.kind, 20) } : null,
-    recent: list(b.recent, 50, card), starred: list(b.starred, 50, card), owned: list(b.owned, 50, card), shared: list(b.shared, 50, card), tree: tree(b.tree), limits,
+    recent: list(b.recent, 50, card), starred: list(b.starred, 50, card), owned: list(b.owned, 50, card), shared: list(b.shared, 50, card), tree: tree(b.tree), limits, can: { createGroup: b.can?.createGroup === true },
   };
 }
 

@@ -20,7 +20,7 @@ const mount = async (data = DATA, extra = {}) => {
   api = { stars: [], searches: [], load: async () => ({ home: structuredClone(data) }), search: async q => { api.searches.push(q); return { q, results: [card("r1", { title: "Result one" })], more: false }; },
     star: async (id, on) => { api.stars.push([id, on]); return { ok: true }; } };
   model = createHomeModel({ api, clock });
-  dialogCalls = []; dialogs = { newBoard: o => dialogCalls.push(["board", o.opener]), newSpace: o => dialogCalls.push(["space", o.opener]) };
+  dialogCalls = []; dialogs = { newBoard: o => dialogCalls.push(["board", o.opener]), newSpace: o => dialogCalls.push(["space", o.opener]), newGroup: o => dialogCalls.push(["group", o.opener]) };
   h = mountHome({ root, model, clock, dialogs, boardHref: id => `?board=${id}`, spaceHref: id => `?space=${id}`, groupHref: id => `?group=${id}`, signIn: { href: "/auth/login", text: "Sign in" }, ...extra });
   await model.load();
 };
@@ -43,6 +43,15 @@ test("Home: Recent then Starred cards link to the board, with path, role and age
   // Spaces and Groups are links to their own pages (?space= / ?group=), not search buttons
   expect(side.findAll(e => e.tagName === "A").map(e => [e.getAttribute("href"), textOf(e)])).toEqual([["?group=g", "Product"], ["?space=s1", "▢ Design"], ["?space=s2", "◐ ada's space"], ["?board=o1", "Old board"]]);
   expect(side.find(e => e.getAttribute("aria-current") === "page").textContent).toBe("Home");
+});
+
+test("New group is offered only when the server says can.createGroup, and opens its dialog from the clicked button", async () => {
+  await mount();
+  expect(buttons().find(b => textOf(b) === "＋ New group")).toBeUndefined();
+  await mount({ ...DATA, can: { createGroup: true } });
+  const ng = buttons().find(b => textOf(b) === "＋ New group");
+  ng.click();
+  expect(dialogCalls).toEqual([["group", ng]]);
 });
 
 test("star buttons are labelled and pressed-state is exposed; clicking toggles through the port", async () => {

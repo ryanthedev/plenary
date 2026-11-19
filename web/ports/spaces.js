@@ -15,6 +15,7 @@
 //   spaceGroups()           → { root, groups: { id, name }[], more }   GET /groups?can=space.create
 //   createBoard({ title, space? })          → { board: { id } }
 //   createSpace({ name, group?, general? }) → { space: { id, name } }
+//   createGroup({ name, general? })         → { group: { id, name } }     POST /groups
 //   updateSpace(id, { name?, general? })    → { space }     updateGroup(id, patch) → { group }
 //   renameBoard(id, title)                  → { board: { id, title } }
 //   Card = { id, title, role, path, starred, can?: { rename } } (as Home's);  `general`: a role name or null (only people added)
@@ -35,6 +36,7 @@ export const SPACES_ERRORS = Object.freeze(["auth", "forbidden", "notfound", "in
  * @property {() => Promise<{ root: boolean, groups: { id: string, name: string }[], more: boolean } | { error: string }>} spaceGroups
  * @property {(o: { title: string, space?: string|null }) => Promise<{ board: { id: string } } | { error: string }>} createBoard
  * @property {(o: { name: string, group?: string|null, general?: string|null }) => Promise<{ space: SpaceInfo } | { error: string }>} createSpace
+ * @property {(o: { name: string, general?: string|null }) => Promise<{ group: { id: string, name: string } } | { error: string }>} createGroup
  * @property {(id: string, patch: { name?: string, general?: string|null }) => Promise<{ space: SpaceInfo } | { error: string }>} updateSpace
  * @property {(id: string, patch: { name?: string, general?: string|null }) => Promise<{ group: { id: string, name: string, general: string|null } } | { error: string }>} updateGroup
  * @property {(id: string, title: string) => Promise<{ board: { id: string, title: string } } | { error: string }>} renameBoard

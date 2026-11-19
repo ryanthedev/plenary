@@ -143,6 +143,34 @@ export function createNewBoardModel({ api, space = null }) {
 }
 
 /**
+ * The New group dialog (a Unit-level permission, decided by the server: Home only offers it when `can.createGroup`): a name and general access.
+ * @param {{ api: SpacesPort }} o
+ */
+export function createNewGroupModel({ api }) {
+  const state = { name: "", general: null, busy: false, error: null, created: null };
+  const subs = new Set();
+  const emit = () => { for (const f of [...subs]) f(state); };
+  return {
+    state,
+    subscribe(f) { subs.add(f); return () => subs.delete(f); },
+    setName(n) { state.name = String(n ?? ""); state.error = null; emit(); },
+    setGeneral(g) { state.general = g === "none" || g == null ? null : g; emit(); },
+    async submit() {
+      if (state.busy) return false;
+      const name = state.name.trim();
+      if (!name) { state.error = "Give the Group a name."; emit(); return false; }
+      if (name.length > NAME_MAX) { state.error = `Names are at most ${NAME_MAX} characters.`; emit(); return false; }
+      state.busy = true; state.error = null; emit();
+      const r = await api.createGroup({ name, general: state.general });
+      state.busy = false;
+      if (r.error) state.error = errorText(r.error); else state.created = r.group;
+      emit();
+      return !r.error;
+    },
+  };
+}
+
+/**
  * The New space dialog: a name, a Group (only where the person is an editor, or none), and general access.
  * @param {{ api: SpacesPort, group?: string|null }} o
  */

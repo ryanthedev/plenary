@@ -30,7 +30,7 @@ beforeEach(() => {
     renameBoard: (id, t) => ({ board: { id, title: t } }),
     boardSpaces: () => ({ spaces: [{ id: "s-me", name: "ada's space", personal: true, general: null, group: null }, { id: "s-1", name: "Design", personal: false, general: "viewer", group: { id: "g-1", name: "Product" } }], more: false }),
     spaceGroups: () => ({ root: true, groups: [{ id: "g-1", name: "Product" }], more: false }),
-    createBoard: () => ({ board: { id: "b-new" } }), createSpace: () => ({ space: { id: "s-new", name: "Q4", personal: false, general: "viewer", group: null } }),
+    createGroup: () => ({ group: { id: "g-new", name: "Org" } }), createBoard: () => ({ board: { id: "b-new" } }), createSpace: () => ({ space: { id: "s-new", name: "Q4", personal: false, general: "viewer", group: null } }),
   })[name]?.(...a);
 });
 afterEach(() => { delete globalThis.document; delete globalThis.Node; });
@@ -216,6 +216,20 @@ test("Group page: Spaces as links, New space opens the dialog preset to this Gro
   expect(calls.some(c => c[0] === "group" && c[2] === "s-2")).toBe(true);
   btn("Group options").click(); root.findAll(e => e.getAttribute("role") === "menuitem")[0].click();
   expect(root.find(e => e.getAttribute("aria-label") === "Group name").value).toBe("Product");
+});
+
+test("New group dialog: name and general access, creates and goes to the Group page; refusal shown, dialog stays", async () => {
+  const d = dialogsFor().newGroup({ opener: null });
+  const dlg = root.find(e => e.getAttribute("role") === "dialog");
+  expect(textOf(dlg.find(e => e.tagName === "H2"))).toBe("New group");
+  dlg.find(e => e.tagName === "FORM").dispatch("submit"); await settle();
+  expect(textOf(dlg.find(e => e.getAttribute("role") === "alert"))).toBe("Give the Group a name.");
+  dlg.find(e => e.getAttribute("aria-label") === "Name").dispatch("input", { target: { value: "Org" } });
+  dlg.find(e => e.tagName === "FORM").dispatch("submit"); await settle();
+  expect(calls.find(c => c[0] === "createGroup")).toEqual(["createGroup", { name: "Org", general: null }]);
+  expect(closes).toEqual(["?group=g-new"]);
+  expect(root.find(e => e.getAttribute("role") === "dialog")).toBeUndefined();
+  expect(d.close).toBeTypeOf("function");
 });
 
 test("a Group with no Spaces: the JOURNEY copy; no New space for someone who can't add one", async () => {

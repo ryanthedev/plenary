@@ -105,6 +105,12 @@ export function httpSpaces({ fetch, token, base = "", timeoutMs = 10_000, timers
       const s = info(r.body?.space);
       return s ? { space: s } : bad();
     },
+    async createGroup({ name, general }) {
+      const r = await ask("/groups", "POST", { name, ...(general !== undefined ? { general } : {}) });
+      if (r.error) return r;
+      const g = grp(r.body?.group);
+      return g ? { group: g } : bad();
+    },
     updateSpace: (id, p) => patch("space", id, p),
     updateGroup: (id, p) => patch("group", id, p),
     async renameBoard(id, title) {

@@ -1,6 +1,6 @@
 // web/core/spaces.js: the Space / Group page model and the New board / New space dialog models, on a fake Spaces port.
 import { test, expect } from "bun:test";
-import { createPageModel, createNewBoardModel, createNewSpaceModel, spaceEmpty, groupEmpty, generalText, errorText, GENERAL_CHOICES } from "../../../web/core/spaces.js";
+import { createPageModel, createNewBoardModel, createNewSpaceModel, createNewGroupModel, spaceEmpty, groupEmpty, generalText, errorText, GENERAL_CHOICES } from "../../../web/core/spaces.js";
 
 const page = (o = {}) => ({ space: { id: "s-1", name: "Design", personal: false, general: "viewer", group: null }, can: { createBoard: true, rename: true, general: true },
   boards: [{ id: "b-1", title: "Roadmap", role: "editor", path: [], starred: false, can: { rename: true } }], more: false, ...o });
@@ -103,6 +103,20 @@ test("New board: a failed load shows an error and cannot submit; a refusal shows
   const [a, b] = await Promise.all([m.submit(), m.submit()]);
   expect([a, b, n]).toEqual([false, false, 1]);
   expect(m.state.error).toBe("You can't do that here.");
+});
+
+test("New group: name validation, general access, one submit at a time, server refusal text", async () => {
+  const { api, calls } = mk({ createGroup: () => ({ group: { id: "g-new", name: "Org" } }) });
+  const m = createNewGroupModel({ api });
+  expect(await m.submit()).toBe(false); expect(m.state.error).toBe("Give the Group a name.");
+  m.setName("x".repeat(201)); expect(await m.submit()).toBe(false); expect(m.state.error).toMatch(/at most/); expect(calls.length).toBe(0);
+  m.setName("  Org "); m.setGeneral("viewer");
+  const [a, b] = await Promise.all([m.submit(), m.submit()]);
+  expect([a, b, calls.length]).toEqual([true, false, 1]);
+  expect(calls[0]).toEqual(["createGroup", { name: "Org", general: "viewer" }]);
+  expect(m.state.created.id).toBe("g-new");
+  const bad = createNewGroupModel({ api: mk({ createGroup: () => ({ error: "forbidden" }) }).api }); bad.setName("x");
+  expect(await bad.submit()).toBe(false); expect(bad.state.error).toBe("You can't do that here.");
 });
 
 test("New space: Group choices, root vs Group-only people, general access, name validation", async () => {

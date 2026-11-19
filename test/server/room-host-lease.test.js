@@ -369,7 +369,9 @@ test("HIGH-1: a holder woken from a stall past its deadline serves nothing that 
     // A wakes: what queued is delivered before any of its timers run.
     frozen = false;
     for (const f of queued.splice(0)) f();
-    await bus.flush(); await sleep(100); await bus.flush();
+    // Positive control, then drain: A does answer its own welcomed connection (1013), and only then is "nothing else" asserted.
+    await until(() => fromA.slice(before).some(m => m.conn === "c1" && m.close === 1013), "A telling its own c1 1013 once it woke");
+    await A.idle(T, B); await Bh.idle(T, B); await bus.flush();
     const late = fromA.slice(before);
     expect(late.filter(m => m.conn === "c2" || m.conn === "x1")).toEqual([]);   // no welcome, ack or 1013 from the dead epoch
     expect(late.every(m => m.conn === "c1" && m.close === 1013)).toBe(true);    // only its own welcomed connection is told
@@ -526,9 +528,14 @@ test("L4: close() settles an append in flight before it releases the lease", asy
     g.op("c1", "a", 1); await bus.flush();
     await until(() => inAppend, "the op's append to be in flight");
     const closing = A.close();
-    await sleep(200);
+    // close() has stopped listening (unsub, then dead = true, then it waits on the writes): a state, not a delay. Everything it would do next
+    // without the wait runs on microtasks, so one macrotask turn is enough for a close() that skipped the wait to have released by now.
+    await until(() => bus.subscriberCount(subjects.inbox(T, B)) === 0, "close() to reach its wait on the append");
+    await sleep(0);
     expect(order).toEqual([]);                                               // still waiting on the append
-    open(); await closing;
+    open();
+    await until(() => order.includes("release"), "the release after the append settled");
+    await closing;
     expect(order).toEqual(["append landed", "release"]);
     expect((await raw.read(T, B, 1, 10)).map(e => e.id)).toEqual(["a:1"]);
   } finally { await A.close(); await raw.close(); await bus.close(); }
@@ -560,7 +567,7 @@ test("L7: past 1,000 held hellos on a watched board, the extra ones are answered
     const order = g.got.filter(m => m.close === 1013).map(m => m.conn);
     expect(order.slice(0, 5)).toEqual(["c1000", "c1001", "c1002", "c1003", "c1004"]);
   } finally { await Bh.close(); await raw.close(); await bus.close(); }
-}, 15000);
+}, 30000);   // exceeds the inner waits (15 s) so the named failure surfaces, not bun's generic timeout
 
 test("R2-L1: `welcomed` shrinks with `conns` (close notices, a listing, the sweep); a lost lease still tells only welcomed live connections", async () => {
   const bus = memoryBus(), st = stallable(sqliteStore({ path: join(tempDir(), "plenary.db") }));
@@ -583,10 +590,10 @@ test("R2-L1: `welcomed` shrinks with `conns` (close notices, a listing, the swee
     const before = g.got.length;
     st.renew = "null";
     await until(() => g.got.slice(before).filter(m => m.close === 1013).length >= 500, "the 1013s", 5000);
-    await sleep(100);
+    await host.idle(T, B); await bus.flush();   // everything the lost lease sends is delivered before the exact-set check
     expect(g.got.slice(before).filter(m => m.close === 1013).map(m => m.conn).sort()).toEqual([...live].sort());
   } finally { await host.close(); }
-}, 40000);
+}, 60000);   // exceeds the inner waits (20 s + 15 s + 5 s) so the named failure surfaces, not bun's generic timeout
 
 // ---- e1-tests-v3 MEDIUM-1: close() after a failed build ----
 

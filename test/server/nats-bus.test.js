@@ -105,8 +105,11 @@ nt("nats: a 2 MB message (encoded) travels; one byte more is refused before the 
   await until(() => got.length === 2, "the binary message");
   expect(got[1].data.byteLength).toBe(binFits.data.byteLength);
   expect(Buffer.isBuffer(got[1].data)).toBe(false);
-  await a.flush(); await b.flush(); await sleep(50);
-  expect(got.length).toBe(2);
+  // Nothing else arrives: the refused publishes never reached the wire. A sentinel from the same publisher is the barrier (per-publisher order),
+  // so a stray 2 MB+ message sent before it would sit ahead of it in `got`.
+  await a.publish(s, { data: "sentinel" });
+  await until(() => got.some(m => m.data === "sentinel"), "the sentinel after the refused publishes");
+  expect(got.map(m => m.data.length)).toEqual([edge.data.length, binFits.data.byteLength, "sentinel".length]);
 });
 
 nt("nats: a refused publish nobody awaits goes to onError, not to an unhandled rejection", async () => {
@@ -118,7 +121,7 @@ nt("nats: a refused publish nobody awaits goes to onError, not to an unhandled r
     bus.publish("plen.*.b", 1);                                                            // not awaited
     bus.publish(subjects.inbox(tenant, "b-ff"), { deep: { b: new Uint8Array(1) } });       // not awaited
     await until(() => errors.length === 3, "the three refusals reaching onError");
-    await sleep(0);   // one more turn: an unhandled rejection would be reported by now
+    await sleep(20);   // a few macrotask turns: bun reports a rejection nobody handled on a later turn, to the listener installed above (not at once)
   } finally { process.off("unhandledRejection", onUnhandled); }
   expect(errors).toEqual(["too-large", "bad-id", "bad-entry"]);
   expect(unhandled).toBe(0);
@@ -140,8 +143,10 @@ nt("nats: a wildcard listener elsewhere would hear us, but our subscribe can't b
   bus.subscribe(subjects.entries(`${tenant}-b`, "b-1"), m => got.push(m));
   await bus.flush();
   await bus.publish(subjects.entries(`${tenant}-a`, "b-1"), "for a");
-  await bus.flush(); await sleep(50);
-  expect(got).toEqual([]);
+  // Barrier: a sentinel on the same connection, to the listener's own subject. Anything forwarded from tenant A's subject would precede it.
+  await bus.publish(subjects.entries(`${tenant}-b`, "b-1"), "sentinel");
+  await until(() => got.includes("sentinel"), "the sentinel on tenant b's subject");
+  expect(got).toEqual(["sentinel"]);
 });
 
 nt("nats: an unreachable server rejects natsBus (callers decide; nothing hangs)", async () => {
@@ -197,8 +202,7 @@ ot("nats outage: publishes are refused (unavailable) while down, reported once p
     await listener.flush();
     await bus.publish(s, "after");
     await until(() => got.includes("after"), "after");
-    await bus.flush(); await sleep(100);
-    expect(got).toEqual(["before", "after"]);                                                  // nothing from the outage replays
+    expect(got).toEqual(["before", "after"]);   // nothing from the outage replays: it would sit ahead of "after" (one publisher, one connection, in order)
 
     await stop(srv);                                                                            // a second outage is reported again
     await until(() => errors.length === 2, "second outage reported");

@@ -14,6 +14,8 @@ const T = "t-aaa", B = "b-one";
 setDefaultTimeout(30_000);
 // How long a call that must settle (as "unavailable", a conflict ...) may take before the test calls it hung. Failure-only, like the ceiling above.
 const HUNG_MS = 20_000;
+/** `p`'s outcome, or "still waiting" after HUNG_MS; the timer is cleared once `p` settles so a passing run leaves none pending. */
+const orHung = async p => { let timer; try { return await Promise.race([p, new Promise(r => { timer = setTimeout(r, HUNG_MS, "still waiting"); })]); } finally { clearTimeout(timer); } };
 
 describe.skipIf(!url)("postgres store", () => {
   /** @type {SQL} */ let sql;
@@ -284,8 +286,7 @@ describe.skipIf(!url)("postgres store", () => {
       await stalled.unsafe(`SELECT epoch FROM "${schema}".pl_leases WHERE tenant = $1 AND board = $2 FOR SHARE`, [T, B]);
       await Bun.sleep(300);
       expect((await store.lease(T, B)).live).toBe(false);
-      const t0 = performance.now();
-      const got = await Promise.race([code(store.acquire(T, B, "h-b", 60_000)), Bun.sleep(HUNG_MS).then(() => "still waiting")]);
+      const got = await orHung(code(store.acquire(T, B, "h-b", 60_000)));
       expect(got).toBe("unavailable");                             // a PortError the caller retries, not a hang
       expect(await code(store.renew(T, B, "h-a", 1, 60_000))).toBe("unavailable");   // renew and release are bounded too
       expect(await code(store.release(T, B, "h-a", 1))).toBe("unavailable");
@@ -317,7 +318,7 @@ describe.skipIf(!url)("postgres store", () => {
       for (const call of [() => store.renew(T, B, "h-a", 1, 400), () => store.acquire(T, B, "h-b", 400)]) {
         sets.length = 0;
         const t0 = performance.now();
-        const got = await Promise.race([code(call()), Bun.sleep(HUNG_MS).then(() => "still waiting")]);
+        const got = await orHung(code(call()));
         const took = performance.now() - t0;
         expect(got).toBe("unavailable");
         expect(took).toBeGreaterThanOrEqual(150);                  // it did wait on the lock ...
@@ -348,7 +349,6 @@ describe.skipIf(!url)("postgres store", () => {
       const p = code(holder.append(T, B, [entry(1)], 0, epoch));
       await atFence;                                                // paused, its FOR SHARE held
       await Bun.sleep(150);                                         // the lease lapses
-      const t0 = performance.now();
       const took = await other.acquire(T, B, "h-b", 60_000);        // waits only until the server ends the paused transaction
       expect(took?.epoch).toBe(epoch + 1);
       resume();

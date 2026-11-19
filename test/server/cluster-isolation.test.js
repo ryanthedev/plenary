@@ -2,7 +2,7 @@
 // own Postgres database, share ONE NATS server. A foreign cluster's host must never answer a board-open, take a
 // lease, or acknowledge an op into its own Store. Real Postgres and NATS; skips without DATABASE_URL and NATS_URL.
 // Nodes run in this process through start() (the same wiring main.js uses). TTL 3 s is the lowest the server accepts.
-import { test, expect, afterAll, describe } from "bun:test";
+import { test, expect, afterAll, describe, setDefaultTimeout } from "bun:test";
 import { SQL } from "bun";
 import { start } from "../../server/main.js";
 import { postgresStore } from "../../server/store/postgres.js";
@@ -11,6 +11,8 @@ import { subjects } from "../../server/bus/port.js";
 import { tempDir, cleanup, until } from "./helpers.js";
 import { sock } from "./rig.js";
 
+// Failure-only ceiling for tests (and hooks registered after it) doing real Postgres/NATS work: bun's 5 s default fails them under machine load (TECH-DEBT rows 36, 38).
+setDefaultTimeout(30_000);
 afterAll(cleanup);
 // The rig's S3 (the cluster's picture storage): a cluster node refuses to start without it. Many nodes share it, which the single-gateway local-disk opt-in could not serve.
 const S3_ENV = () => Object.fromEntries(["S3_ENDPOINT", "S3_BUCKET", "S3_REGION", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"].filter(k => process.env[k]).map(k => [k, process.env[k]]));

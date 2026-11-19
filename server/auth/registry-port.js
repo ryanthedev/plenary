@@ -69,12 +69,12 @@ import { randomId } from "./util.js";
 export const REGISTRY_METHODS = Object.freeze([
   "createTenant", "addTenantDomain", "tenant", "tenantByDomain", "addTenantAdmin", "tenantAdminsAmong",
   "createBoard", "createGroup", "group", "groups", "createSpace", "space",
-  "spaces", "ensurePersonalSpace", "createTeam", "renameTeam", "deleteTeam", "teamsPage",
+  "spaces", "ensurePersonalSpace", "personalSpace", "createTeam", "renameTeam", "deleteTeam", "teamsPage",
   "teamsAmong", "teamMembersPage", "scopedGrant", "scopedGrantsPage", "touchMember", "membersAmong",
   "findMembers", "team", "teams", "setTeamMember", "teamMembers", "setScopedGrant",
   "rename", "updateScope", "spacesIn", "scopedGrants", "createRole", "deleteRole",
   "roleUsage", "memberCount", "updateRole", "role", "roles", "accessContexts",
-  "accessContext", "boardsIn", "scopesOf", "board", "moveBoard", "setGrant", "grant",
+  "accessContext", "boardsIn", "scopesOf", "board", "moveBoard", "trashBoard", "restoreBoard", "trashSpace", "restoreSpace", "trashedBoards", "trashedSpaces", "trashDue", "purgeClaim", "purgeBoard", "purgeSpace", "setGrant", "grant",
   "grants", "createInvite", "invite", "invites", "invitesFor", "revokeInvite",
   "createLink", "link", "links", "revokeLink", "addLinkUse", "linkUses",
   "idemGet", "markOpened", "recents", "setStarred", "starred", "starredAmong",
@@ -84,7 +84,7 @@ export const REGISTRY_METHODS = Object.freeze([
 
 /**
  * The one error class every Registry adapter throws for a refused call; match on `err.code`, never the class.
- * Codes: "last-owner" (setGrant, setScopedGrant, setTeamMember), "no-role", "limit", "in-use" (custom roles), "moved" (moveBoard: the board is in neither `from` nor `to`), "corrupt" (a stored row breaks an invariant, e.g. a tenant with no kind row), "idem-replay" /
+ * Codes: "last-owner" (setGrant, setScopedGrant, setTeamMember), "no-role", "limit", "in-use" (custom roles), "moved" (moveBoard: the board is in neither `from` nor `to`; trashBoard: it is not in `from`), "with-space" (restoreBoard of a board that went to Trash with its Space), "space-in-trash" (restoreBoard of an own-clock board whose Space is in Trash, when no `into` is given), "purged" (restoreBoard, or restoreSpace, of a row, or of a Space with a board, claimed for purge), "in-trash" (addLinkUse and moveBoard of a trashed board), "personal" (trashSpace of a personal Space), "corrupt" (a stored row breaks an invariant, e.g. a tenant with no kind row), "idem-replay" /
  * "idem-mismatch" (see `idemErr`), "rate-limited" (requestAccess); the Postgres adapter adds "lock-timeout", "statement-timeout",
  * "overloaded", "queue-timeout", "client-timeout" (a timeout REJECTS, never resolves to null).
  */
@@ -110,9 +110,9 @@ export const mint = {
  * @typedef {"owner"|"editor"|"annotator"|"commenter"|"viewer"} Role
  * @typedef {"company"|"enterprise"} UnitKind
  * @typedef {{ id: string, domain: string|null, domains: string[], kind: UnitKind, admins: string[], createdAt: number }} Tenant   `domain`: the first domain (null if none); `domains`: every domain the Unit owns, `domain` first
- * @typedef {{ id: string, tenant: string, title: string, memberRole: Role|null, space: string|null, createdAt: number }} Board
+ * @typedef {{ id: string, tenant: string, title: string, memberRole: Role|null, space: string|null, createdAt: number, trashedAt: number|null, trashedBy: string|null, trashedWith: string|null }} Board   `trashedAt` (ms) set = in Trash (PROTOCOL.md § Trash and restore); `trashedWith`: the Space whose trashing took it (null: trashed on its own)
  * @typedef {{ id: string, tenant: string, name: string, generalRole: Role|null, createdAt: number }} Group
- * @typedef {{ id: string, tenant: string, group: string|null, name: string, kind: "shared"|"personal", owner: string|null, generalRole: Role|null, createdAt: number }} Space
+ * @typedef {{ id: string, tenant: string, group: string|null, name: string, kind: "shared"|"personal", owner: string|null, generalRole: Role|null, createdAt: number, trashedAt: number|null, trashedBy: string|null }} Space   `trashedAt` set = the Space and its boards are in Trash
  * @typedef {{ id: string, tenant: string, name: string, createdAt: number }} Team
  * @typedef {{ id: string, tenant: string, name: string, base: string|null, boardRole: Role|null, permissions: string[], createdAt: number }} CustomRole
  * @typedef {{ type: "unit"|"group"|"space"|"board", id: string }} ScopeRef   a Unit's id is its tenant id
@@ -137,11 +137,22 @@ export const mint = {
  *   createBoard(o: { tenant: string, title?: string, memberRole?: Role|null, space: string, owner?: string, idem?: Idem }): Promise<Board>,   // `owner` gets an owner grant in the same step; `space` is REQUIRED and of the same tenant (no unfiled boards; else a plain Error "registry: no such space"); memberRole default null = inherit the Space
  *   createGroup(o: { tenant: string, name: string, generalRole?: Role|null, owner?: string, idem?: Idem }): Promise<Group>,   // generalRole default null; `owner` gets an owner grant in the same step
  *   moveBoard(o: { board: string, from: string, to: string, idem?: Idem }): Promise<{ board: Board, moved: boolean }>,   // ONE atomic compare-and-set of the board's Space (PROTOCOL.md § Move board): in `from` (a Space id, required) -> set, moved true; already in `to` -> no change, moved false; anywhere else rejects code "moved"; the key row is written in the same step
+ *   trashBoard(o: { board: string, from: string, by: string, idem?: Idem }): Promise<{ board: Board, trashed: boolean }>,   // ONE atomic compare-and-set (PROTOCOL.md § Trash and restore): live and in `from` -> in Trash (`trashedBy` = by, `trashedWith` null), trashed true; already in Trash -> no change, trashed false; live in another Space -> code "moved"; the key row in the same step; its stored ref is `<board>:trashed` or `<board>:noop`
+ *   restoreBoard(o: { board: string, idem?: Idem, into?: string|null }): Promise<{ board: Board, restored: boolean }>,   // ONE atomic step: in Trash on its own -> live (and its purge claim cleared); not in Trash -> no change, restored false; trashedWith set -> code "with-space"; its Space in Trash -> code "space-in-trash", unless `into` (a live Space of the same Unit) is given: then the board moves there as it is restored; claimed for purge -> code "purged"; ref `<board>:restored` or `<board>:noop`
+ *   trashSpace(o: { space: string, by: string, idem?: Idem }): Promise<{ space: Space, trashed: boolean, boards: number }>,   // ONE atomic step: the Space and every LIVE board in it go to Trash (each board `trashedWith` = the Space, the same `trashedAt`), trashed true, `boards` = how many; already in Trash -> no change; a personal Space -> code "personal"; ref `<space>:trashed:<boards>` or `<space>:noop`
+ *   restoreSpace(o: { space: string, idem?: Idem }): Promise<{ space: Space, restored: boolean, boards: number }>,   // ONE atomic step: the Space and exactly the boards with `trashedWith` = it come back; claimed, or any of its boards claimed -> code "purged"; every restored board's claim cleared; ref `<space>:restored:<boards>` or `<space>:noop`
+ *   trashedBoards(tenant: string, o?: { after?: string|null, limit?: number }): Promise<{ boards: Board[], next: string|null }>,   // the Unit's boards in Trash on their own (not those taken by their Space, not those claimed for purge), by id, one bounded page (default 50, cap 200)
+ *   trashedSpaces(tenant: string, o?: { after?: string|null, limit?: number }): Promise<{ spaces: (Space & { boards: number })[], next: string|null }>,   // the Unit's Spaces in Trash (not claimed), by id; `boards` = how many boards went with each, counted to TRASH.sizeCap + 1
+ *   trashDue(o: { before: number, limit?: number, claimed?: boolean, after?: { board?: string|null, space?: string|null } }): Promise<{ boards: Board[], spaces: Space[] }>,   // `claimed: false`: due and not yet claimed (own-clock boards and Spaces; a board that went with its Space follows its Space's claim), oldest first; `claimed: true`: claimed rows, by id after the cursor `after` (the sweeper's resume read, so a stuck row cannot hold the head of the line); omitted: both, oldest first. Without `claimed`:   // rows in Trash since `before` or earlier, plus every claimed row (a partial purge resumes), oldest first, at most `limit` of each (default 100, cap 500). The sweeper's read
+ *   purgeClaim(o: { type: "board"|"space", id: string, before: number }): Promise<boolean>,   // ONE conditional write: in Trash since `before` or earlier (or already claimed) -> claimed (restore is refused from now on; a Space also claims the boards that went with it), true; else false. A board that went to Trash with its Space is claimed ONLY with its Space (false alone, unless already claimed by it). Idempotent
+ *   purgeBoard(board: string): Promise<boolean>,   // deletes a CLAIMED board's rows (grants, scoped grants, invites, links, uses, recents, stars, access requests, the board) in one transaction; true when done or already gone, false when it exists and is not claimed or is not in Trash
+ *   purgeSpace(space: string): Promise<boolean>,   // deletes a CLAIMED Space's rows (its scoped grants, access requests, the Space); true when done or gone; false when not claimed or a board still references it
  *   group(id: string): Promise<Group|null>,
  *   groups(tenant: string): Promise<Group[]>,
  *   createSpace(o: { tenant: string, name: string, group?: string|null, generalRole?: Role|null, owner?: string, idem?: Idem }): Promise<Space>,   // generalRole default "viewer"; null = only people added
  *   space(id: string): Promise<Space|null>,
  *   spaces(tenant: string): Promise<Space[]>,
+ *   personalSpace(tenant: string, user: string): Promise<Space|null>,   // the user's personal space, or null when it does not exist yet: a pure read (a GET never creates it; ensurePersonalSpace does)
  *   ensurePersonalSpace(tenant: string, user: string): Promise<Space>,   // idempotent, one per (tenant, user); private (generalRole null), the user is its owner
  *   createTeam(o: { tenant: string, name: string, idem?: Idem }): Promise<Team>,
  *   renameTeam(team: string, name: string): Promise<Team>,   // trimmed 1-200; rejects an unknown Team
@@ -172,7 +183,7 @@ export const mint = {
  *   roles(tenant: string): Promise<CustomRole[]>,
  *   accessContexts(scopes: ScopeRef[], o?: { users?: string[] }): Promise<Map<string, AccessContext|null>>,   // `accessContext` for many Unit, Group or Space scopes (at most HOME.batch, else rejects) in ONE step; keys are `type + "\n" + id`, null for an unknown scope
  *   accessContext(scope: ScopeRef, o?: { users?: string[], chain?: Chain }): Promise<AccessContext|null>,   // null for an unknown scope; see "accessContext" below
- *   boardsIn(scope: ScopeRef, o?: { after?: string|null, limit?: number }): Promise<{ ids: string[], next: string|null }>,   // board ids in a Unit, Group or Space, by id, one bounded page
+ *   boardsIn(scope: ScopeRef, o?: { after?: string|null, limit?: number, withTrashed?: boolean }): Promise<{ ids: string[], next: string|null }>,   // board ids in a Unit, Group or Space, by id, one bounded page; boards in Trash are left out unless `withTrashed` (an announcement reaches them too)
  *   scopesOf(subject: Subject, o?: { after?: string|null, limit?: number }): Promise<{ scopes: (ScopeRef & { role: string })[], next: string|null }>,   // the scopes a user or Team holds a grant on (not boards: a board's own user grants are `grants`)
  *   board(id: string): Promise<Board|null>,
  *   setGrant(board: string, user: string, role: Role|null): Promise<void>,   // rejects code "last-owner" (atomic)
@@ -187,7 +198,7 @@ export const mint = {
  *   link(id: string): Promise<Link|null>,
  *   links(board: string): Promise<Link[]>,
  *   revokeLink(id: string): Promise<boolean>,
- *   addLinkUse(link: string, user: string): Promise<void>,
+ *   addLinkUse(link: string, user: string): Promise<void>,   // a board in Trash rejects code "in-trash", recording nothing (PROTOCOL.md § Trash and restore)
  *   linkUses(board: string, user: string): Promise<string[]>,
  *   linkUsesFor?(board: string, users: string[]): Promise<Map<string, string[]>>,   // OPTIONAL batch (below)
  *   idemGet(idem: Idem): Promise<{ state: "none" } | { state: "done", ref: string } | { state: "mismatch" }>,   // read-only: is there a live row for (user, key), and for this fingerprint
@@ -237,6 +248,8 @@ export const askLimits = o => {
 };
 
 /** Home (PROTOCOL.md § Home): rows kept per user in Recent, rows a starred / shared read may return, and the most boards one `boardRows` / `starredAmong` call takes. */
+/** Trash (PROTOCOL.md § Trash and restore): how long a trashed board stays restorable, the page of the Trash reads, the most a sweep handles, and the cap a Space's board count is taken to. */
+export const TRASH = Object.freeze({ ttlMs: 30 * 24 * 3600_000, page: { default: 50, max: 200 }, due: { default: 100, max: 500 }, sizeCap: 1000 });
 /** Idempotent creates (PROTOCOL.md): a key row is kept `ttlMs`; expired rows are pruned `prune` at a time, every `every`-th keyed create. */
 export const IDEM = Object.freeze({ ttlMs: 24 * 3600_000, prune: 500, every: 64 });
 /** @typedef {{ user: string, key: string, fp: string }} Idem  The Idempotency-Key of a create: its user, the key, the SHA-256 fingerprint of the request. */

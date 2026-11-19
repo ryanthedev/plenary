@@ -561,3 +561,49 @@ test("#53 without a move port the page offers no Move even when can.move is true
   root.findAll(e => e.tagName === "BUTTON" && /^More for/.test(e.getAttribute("aria-label") ?? ""))[0].click();
   expect(root.findAll(e => e.getAttribute("role") === "menuitem").map(textOf)).toEqual(["Open", "Rename"]);
 });
+
+test("#54 Move to Trash is in a card's menu only where the server says can.trash and the page has a trash port; choosing it asks the server with the Space it is in, then shows the Undo toast", async () => {
+  globalThis.document.body = new FakeElement("body");
+  const calls2 = [];
+  const result = { board: { id: "b-1", title: "Roadmap", space: { id: "s-1", name: "Design" } }, trashed: true, trashedAt: 1, expiresAt: 2, undo: { restore: true } };
+  const trash = { api: { trash: async (b, o, k) => { calls2.push([b, o, k]); return { result }; } }, clock: { now: () => 0, mono: () => 0, set: () => 1, clear() {} }, newKey: () => "trash-key" };
+  const page = SP(); page.boards[0].can = { rename: true, trash: true };
+  await spacePage(page, { trash });
+  const menu = i => root.findAll(e => e.tagName === "BUTTON" && /^More for/.test(e.getAttribute("aria-label") ?? ""))[i];
+  menu(1).click();
+  expect(root.findAll(e => e.getAttribute("role") === "menuitem").map(textOf)).toEqual(["Open"]);                  // Locked: no can.trash
+  menu(1).click(); menu(0).click();
+  const items = root.findAll(e => e.getAttribute("role") === "menuitem");
+  expect(items.map(textOf)).toEqual(["Open", "Rename", "Move to Trash"]);
+  items[2].click(); await settle(); await settle();
+  expect(calls2).toEqual([["b-1", { from: "s-1" }, "trash-key"]]);
+  expect(globalThis.document.body.findAll(e => e.getAttribute("aria-label") === "Board moved to Trash").length).toBe(1);
+  expect(announced()).toContain("Moved Roadmap to Trash.");
+});
+test("#54 without a trash port the page offers no Move to Trash even when can.trash is true; a refusal says so and shows no toast", async () => {
+  globalThis.document.body = new FakeElement("body");
+  const page = SP(); page.boards[0].can = { rename: true, trash: true };
+  await spacePage(page);
+  root.findAll(e => e.tagName === "BUTTON" && /^More for/.test(e.getAttribute("aria-label") ?? ""))[0].click();
+  expect(root.findAll(e => e.getAttribute("role") === "menuitem").map(textOf)).toEqual(["Open", "Rename"]);
+  root.replaceChildren();
+  const trash = { api: { trash: async () => ({ error: "forbidden" }) }, clock: { now: () => 0, mono: () => 0, set: () => 1, clear() {} }, newKey: () => "k" };
+  await spacePage(page, { trash });
+  root.findAll(e => e.tagName === "BUTTON" && /^More for/.test(e.getAttribute("aria-label") ?? ""))[0].click();
+  root.findAll(e => e.getAttribute("role") === "menuitem")[2].click(); await settle(); await settle();
+  expect(textOf(root.find(e => e.hasClass("home-status")))).toContain("You can't move this board to Trash.");
+  expect(globalThis.document.body.findAll(e => e.getAttribute("aria-label") === "Board moved to Trash")).toEqual([]);
+});
+test("#54 the Space's own menu offers Move to Trash for can.trash (and shows the menu for it alone); choosing it trashes the Space and shows the Undo toast", async () => {
+  globalThis.document.body = new FakeElement("body");
+  const calls2 = [];
+  const trash = { api: { trashSpace: async (id, k) => { calls2.push([id, k]); return { result: { space: { id, name: "Design" }, trashed: true, boards: 2, undo: { restore: true } } }; } }, clock: { now: () => 0, mono: () => 0, set: () => 1, clear() {} }, newKey: () => "k9" };
+  await spacePage(SP({ can: { createBoard: true, rename: false, general: false, trash: true } }), { trash });
+  btn("Space options").click();
+  const items = root.findAll(e => e.getAttribute("role") === "menuitem");
+  expect(items.map(textOf)).toEqual(["Move to Trash"]);
+  items[0].click(); await settle(); await settle();
+  expect(calls2).toEqual([["s-1", "k9"]]);
+  expect(globalThis.document.body.findAll(e => e.getAttribute("aria-label") === "Space moved to Trash").length).toBe(1);
+  expect(announced()).toContain("Moved Design to Trash with 2 boards.");
+});

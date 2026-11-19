@@ -330,6 +330,19 @@ test("start(env): COOKIE_KEY: refused when short; required in cluster mode; rand
   await app.stop();
 });
 
+test("start(env): PLENARY_TRASH_SWEEP_MS must be an integer from 1000 to 86400000 (checked before anything opens); unset and the bounds start a node with a sweeper", async () => {
+  for (const bad of ["999", "86400001", "1.5e3", "abc", "1000.5", "-1000", "", "0", " 2000", "00001000000"]) {
+    const dir = tempDir();
+    await expect(start(devEnv(dir, { PLENARY_TRASH_SWEEP_MS: bad }))).rejects.toThrow(/PLENARY_TRASH_SWEEP_MS/);
+    expect(existsSync(join(dir, "registry.db"))).toBe(false);   // refused before the data dir's databases are created
+  }
+  for (const good of [undefined, "1000", "86400000", "600000"]) {
+    const app = await start(devEnv(tempDir(), good === undefined ? {} : { PLENARY_TRASH_SWEEP_MS: good }));
+    expect(typeof app.sweeper.sweep).toBe("function");
+    await app.stop();
+  }
+});
+
 test("revocation: a grant change through the Registry closes a connection that lost its role", async () => {
   const app = await start(devEnv(tempDir()));
   try {

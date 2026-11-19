@@ -2,7 +2,7 @@
 // last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
 import { normEmail } from "./util.js";
-import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "./registry-port.js";
+import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, TRASH, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "./registry-port.js";
 
 /**
  * @typedef {import("./registry-port.js").Registry} Registry
@@ -40,6 +40,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
   /** @type {Map<string, Map<string, number>>} user → board → starred at */ const stars = new Map();
   /** @type {Map<string, { fp: string, ref: string, at: number }>} user + "\n" + key → fingerprint and the id it made (Idempotent creates) */ const idem = new Map();
   /** @type {Map<string, import("./registry-port.js").AccessRequest>} "type\nid\nuser" → the person's one request at a scope (Access requests, #51) */ const requests = new Map();
+  /** @type {Set<string>} "b\nid" / "s\nid": rows claimed for purge (restore is refused from then on) */ const claimed = new Set();
   let idemCalls = 0;
   const idemLive = (e, t) => e && t - e.at < IDEM.ttlMs;
   /** A keyed create's first step: rejects (nothing written yet) when a live row holds the key. Returns the validated key, or null. */
@@ -104,9 +105,9 @@ export function memoryRegistry({ now = Date.now } = {}) {
 
     async createBoard({ tenant, title = "", memberRole, space, owner, idem: key }) {
       if (!tenants.has(tenant)) throw new Error("registry: no such tenant");
-      if (spaces.get(space)?.tenant !== tenant) throw new Error("registry: no such space");
+      if (spaces.get(space)?.tenant !== tenant || spaces.get(space).trashedAt != null) throw new Error("registry: no such space");
       const k = idemEnter(key);
-      const b = { id: fresh(boards, mint.board), tenant, title: String(title), memberRole: memberRole === undefined ? null : memberRole, space, createdAt: now() };
+      const b = { id: fresh(boards, mint.board), tenant, title: String(title), memberRole: memberRole === undefined ? null : memberRole, space, createdAt: now(), trashedAt: null, trashedBy: null, trashedWith: null };
       boards.set(b.id, b);
       if (owner != null) grants.set(b.id, new Map([[String(owner), "owner"]]));
       idemPut(k, b.id);
@@ -117,7 +118,8 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const b = boards.get(board);
       if (!b) throw new Error("registry: no such board");
       if (typeof from !== "string") throw new Error("registry: no such space");   // `from` names the board's current Space (no unfiled boards)
-      if (spaces.get(to)?.tenant !== b.tenant) throw new Error("registry: no such space");
+      if (spaces.get(to)?.tenant !== b.tenant || spaces.get(to).trashedAt != null) throw new Error("registry: no such space");
+      if (b.trashedAt != null) throw new RegistryError("in-trash", "the board is in Trash");
       const k = idemEnter(key);
       const moved = b.space !== to;
       if (moved) {
@@ -126,6 +128,127 @@ export function memoryRegistry({ now = Date.now } = {}) {
       }
       idemPut(k, b.id + (moved ? ":moved" : ":noop"));
       return { board: copy(b), moved };
+    },
+
+    // ---- Trash (PROTOCOL.md § Trash and restore): every step is synchronous after its key check, so one atomic step in a JS process ----
+    async trashBoard({ board, from, by, idem: key }) {
+      const b = boards.get(board);
+      if (!b) throw new Error("registry: no such board");
+      if (typeof from !== "string" || !from) throw new Error("registry: no such space");
+      if (typeof by !== "string" || !by) throw new Error("registry: bad user");
+      const k = idemEnter(key);
+      const trashed = b.trashedAt == null;
+      if (trashed) {
+        if (b.space !== from) throw new RegistryError("moved", "the board is no longer in that Space");
+        Object.assign(b, { trashedAt: now(), trashedBy: by, trashedWith: null });
+      }
+      idemPut(k, b.id + (trashed ? ":trashed" : ":noop"));
+      return { board: copy(b), trashed };
+    },
+    async restoreBoard({ board, idem: key, into = null }) {
+      const b = boards.get(board);
+      if (!b) throw new Error("registry: no such board");
+      const k = idemEnter(key), restored = b.trashedAt != null;
+      if (restored) {
+        if (claimed.has("b\n" + b.id)) throw new RegistryError("purged", "the board is being deleted for good");
+        if (b.trashedWith != null) throw new RegistryError("with-space", "the board went to Trash with its Space: restore the Space");
+        if (spaces.get(b.space)?.trashedAt != null) {
+          if (into == null) throw new RegistryError("space-in-trash", "the board's Space is in Trash: restore the Space first");
+          const sp = spaces.get(into);
+          if (sp?.tenant !== b.tenant || sp.trashedAt != null) throw new Error("registry: no such space");
+          b.space = into;
+        }
+        Object.assign(b, { trashedAt: null, trashedBy: null, trashedWith: null });
+      }
+      idemPut(k, b.id + (restored ? ":restored" : ":noop"));
+      return { board: copy(b), restored };
+    },
+    async trashSpace({ space, by, idem: key }) {
+      const s = spaces.get(space);
+      if (!s) throw new Error("registry: no such space");
+      if (typeof by !== "string" || !by) throw new Error("registry: bad user");
+      if (s.kind === "personal") throw new RegistryError("personal", "a personal space is never trashed");
+      const k = idemEnter(key), trashed = s.trashedAt == null;
+      let n = 0;
+      if (trashed) {
+        const at = now();
+        Object.assign(s, { trashedAt: at, trashedBy: by });
+        for (const b of boards.values()) if (b.space === s.id && b.trashedAt == null) { Object.assign(b, { trashedAt: at, trashedBy: by, trashedWith: s.id }); n++; }
+      }
+      idemPut(k, s.id + (trashed ? ":trashed:" + n : ":noop"));
+      return { space: copy(s), trashed, boards: n };
+    },
+    async restoreSpace({ space, idem: key }) {
+      const s = spaces.get(space);
+      if (!s) throw new Error("registry: no such space");
+      const k = idemEnter(key), restored = s.trashedAt != null;
+      let n = 0;
+      if (restored) {
+        if (claimed.has("s\n" + s.id) || [...boards.values()].some(b => b.trashedWith === s.id && claimed.has("b\n" + b.id))) throw new RegistryError("purged", "the Space is being deleted for good");
+        Object.assign(s, { trashedAt: null, trashedBy: null });
+        for (const b of boards.values()) if (b.trashedWith === s.id) { Object.assign(b, { trashedAt: null, trashedBy: null, trashedWith: null }); n++; }
+      }
+      idemPut(k, s.id + (restored ? ":restored:" + n : ":noop"));
+      return { space: copy(s), restored, boards: n };
+    },
+    async trashedBoards(tenant, { after = null, limit } = {}) {
+      after = orgDefaults.cursor(after, "id");
+      const n = smallLimit(limit, TRASH.page.default, TRASH.page.max);
+      const rest = [...boards.values()].filter(b => b.tenant === tenant && b.trashedAt != null && b.trashedWith == null && !claimed.has("b\n" + b.id) && (after == null || b.id > after)).sort((a, b) => (a.id < b.id ? -1 : 1));
+      return { boards: rest.slice(0, n).map(copy), next: rest.length > n ? rest[n - 1].id : null };
+    },
+    async trashedSpaces(tenant, { after = null, limit } = {}) {
+      after = orgDefaults.cursor(after, "id");
+      const n = smallLimit(limit, TRASH.page.default, TRASH.page.max);
+      const rest = [...spaces.values()].filter(s => s.tenant === tenant && s.trashedAt != null && !claimed.has("s\n" + s.id) && (after == null || s.id > after)).sort((a, b) => (a.id < b.id ? -1 : 1));
+      const size = id => Math.min([...boards.values()].filter(b => b.trashedWith === id).length, TRASH.sizeCap + 1);
+      return { spaces: rest.slice(0, n).map(s => ({ ...copy(s), boards: size(s.id) })), next: rest.length > n ? rest[n - 1].id : null };
+    },
+    async trashDue({ before, limit, claimed: want, after } = {}) {
+      if (!Number.isFinite(before)) throw new Error("registry: bad time");
+      const n = smallLimit(limit, TRASH.due.default, TRASH.due.max);
+      const byId = (a, b) => (a.id < b.id ? -1 : 1), oldest = (a, b) => a.trashedAt - b.trashedAt || byId(a, b);
+      if (want === false) {   // due and unclaimed; a board that went with its Space follows its Space's claim
+        const pick = (m, c) => [...m.values()].filter(x => x.trashedAt != null && x.trashedAt <= before && x.trashedWith == null && !claimed.has(c + "\n" + x.id)).sort(oldest).slice(0, n).map(copy);
+        return { boards: pick(boards, "b"), spaces: pick(spaces, "s") };
+      }
+      if (want === true) {   // claimed, by id after the cursor: a stuck row cannot hold the head of the line
+        const pick = (m, c, cur) => [...m.values()].filter(x => x.trashedAt != null && claimed.has(c + "\n" + x.id) && (cur == null || x.id > cur)).sort(byId).slice(0, n).map(copy);
+        return { boards: pick(boards, "b", after?.board), spaces: pick(spaces, "s", after?.space) };
+      }
+      const due = (row, c) => row.trashedAt != null && (row.trashedAt <= before || claimed.has(c + "\n" + row.id));
+      return { boards: [...boards.values()].filter(b => due(b, "b")).sort(oldest).slice(0, n).map(copy), spaces: [...spaces.values()].filter(s => due(s, "s")).sort(oldest).slice(0, n).map(copy) };
+    },
+    async purgeClaim({ type, id, before }) {
+      if ((type !== "board" && type !== "space") || !Number.isFinite(before)) throw new Error("registry: bad purge");
+      const row = (type === "board" ? boards : spaces).get(id), c = type === "board" ? "b" : "s";
+      if (!row || row.trashedAt == null || !(row.trashedAt <= before || claimed.has(c + "\n" + id))) return false;
+      if (type === "board" && row.trashedWith != null && !claimed.has("b\n" + id)) return false;   // a board that went with its Space is claimed only with it
+      claimed.add(c + "\n" + id);
+      if (type === "space") for (const b of boards.values()) if (b.trashedWith === id) claimed.add("b\n" + b.id);
+      return true;
+    },
+    async purgeBoard(board) {
+      const b = boards.get(board);
+      if (!b) return true;
+      if (!claimed.has("b\n" + board) || b.trashedAt == null) return false;
+      grants.delete(board); scoped.delete(sk("board", board));
+      for (const [id, i] of invites) if (i.board === board) invites.delete(id);
+      for (const [id, l] of links) if (l.board === board) links.delete(id);
+      for (const k of [...uses.keys()]) if (k.startsWith(board + "\n")) uses.delete(k);
+      for (const m of [recent, stars]) for (const x of m.values()) x.delete(board);
+      for (const k of [...requests.keys()]) if (k.startsWith("board\n" + board + "\n")) requests.delete(k);
+      boards.delete(board); claimed.delete("b\n" + board);
+      return true;
+    },
+    async purgeSpace(space) {
+      const s = spaces.get(space);
+      if (!s) return true;
+      if (!claimed.has("s\n" + space) || [...boards.values()].some(b => b.space === space)) return false;
+      scoped.delete(sk("space", space));
+      for (const k of [...requests.keys()]) if (k.startsWith("space\n" + space + "\n")) requests.delete(k);
+      spaces.delete(space); claimed.delete("s\n" + space);
+      return true;
     },
 
     async setGrant(board, user, role) {
@@ -171,6 +294,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
     async addLinkUse(link, user) {
       const l = links.get(link);
       if (!l) throw new Error("registry: no such link");
+      if (boards.get(l.board)?.trashedAt != null) throw new RegistryError("in-trash", "the board is in Trash");
       const k = l.board + "\n" + user;
       if (!uses.has(k)) uses.set(k, new Set());
       uses.get(k).add(link);
@@ -199,17 +323,17 @@ export function memoryRegistry({ now = Date.now } = {}) {
       need(tenants.has(tenant), "tenant");
       if (group != null) need(groups.get(group)?.tenant === tenant, "group");
       const k = idemEnter(key);
-      const sp = { id: fresh(spaces, mint.space), tenant, group, name: orgDefaults.name(name), kind: "shared", owner: null, generalRole, createdAt: now() };
+      const sp = { id: fresh(spaces, mint.space), tenant, group, name: orgDefaults.name(name), kind: "shared", owner: null, generalRole, createdAt: now(), trashedAt: null, trashedBy: null };
       spaces.set(sp.id, sp);
       if (owner != null) putScoped("space", sp.id, "user", String(owner), "owner");
       idemPut(k, sp.id);
       return copy(sp);
     },
     async space(id) { return copy(spaces.get(id)); },
-    async spaces(tenant) { return [...spaces.values()].filter(s => s.tenant === tenant).map(copy); },
+    async spaces(tenant) { return [...spaces.values()].filter(s => s.tenant === tenant && s.trashedAt == null).map(copy); },
     async spacesIn(group, { after = null, limit } = {}) {
       after = orgDefaults.cursor(after, "id");
-      const n = pageLimit(limit), rest = [...spaces.values()].filter(s => s.group === group && (after == null || s.id > after)).sort((a, b) => (a.id < b.id ? -1 : 1));
+      const n = pageLimit(limit), rest = [...spaces.values()].filter(s => s.group === group && s.trashedAt == null && (after == null || s.id > after)).sort((a, b) => (a.id < b.id ? -1 : 1));
       return { spaces: rest.slice(0, n).map(copy), next: rest.length > n ? rest[n - 1].id : null };
     },
     async rename(scope, name) {
@@ -227,12 +351,13 @@ export function memoryRegistry({ now = Date.now } = {}) {
       if (v.generalRole !== undefined) row.generalRole = v.generalRole;
       return copy(row);
     },
+    async personalSpace(tenant, user) { const sp = [...spaces.values()].find(s => s.tenant === tenant && s.owner === String(user)); return sp ? copy(sp) : null; },
     async ensurePersonalSpace(tenant, user) {
       need(tenants.has(tenant), "tenant");
       user = String(user);
       let sp = [...spaces.values()].find(s => s.tenant === tenant && s.owner === user);
       if (!sp) {
-        sp = { id: fresh(spaces, mint.space), tenant, group: null, name: orgDefaults.personalName(user), kind: "personal", owner: user, generalRole: null, createdAt: now() };
+        sp = { id: fresh(spaces, mint.space), tenant, group: null, name: orgDefaults.personalName(user), kind: "personal", owner: user, generalRole: null, createdAt: now(), trashedAt: null, trashedBy: null };
         spaces.set(sp.id, sp);
         putScoped("space", sp.id, "user", user, "owner");
       }
@@ -489,13 +614,13 @@ export function memoryRegistry({ now = Date.now } = {}) {
       for (const [k, g] of scoped) if (k.startsWith("board\n") && myTeams.some(t => g.has(t))) out.add(k.slice(6));
       for (const i of invites.values()) if (e && i.email === e && !i.revoked) out.add(i.board);
       for (const [k, ls] of uses) if (k.endsWith("\n" + user) && ls.size) out.add(k.slice(0, k.length - user.length - 1));
-      return [...out].filter(b => boards.has(b)).sort().slice(0, smallLimit(limit, HOME.sharedScan, HOME.sharedScan));
+      return [...out].filter(b => boards.has(b) && boards.get(b).trashedAt == null).sort().slice(0, smallLimit(limit, HOME.sharedScan, HOME.sharedScan));
     },
     async searchBoards(tenant, { q, after = null, scan } = {}) {
       after = orgDefaults.cursor(after, "id");
       const term = q == null ? null : asciiFold(searchQuery(q)), cap = smallLimit(scan, HOME.searchScan.default, HOME.searchScan.max);
       const hit = b => term == null || asciiFold(b.title).includes(term) || asciiFold(spaces.get(b.space)?.name ?? "").includes(term);
-      const window = [...boards.values()].filter(b => b.tenant === tenant && (after == null || b.id > after)).map(b => b.id).sort().slice(0, cap + 1);
+      const window = [...boards.values()].filter(b => b.tenant === tenant && b.trashedAt == null && (after == null || b.id > after)).map(b => b.id).sort().slice(0, cap + 1);
       const scanned = window.slice(0, cap);
       return { ids: scanned.filter(id => hit(boards.get(id))), next: window.length > cap ? scanned[cap - 1] : null };   // `next`: the Unit goes on past the window, whatever matched
     },
@@ -504,7 +629,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const n = smallLimit(limit, HOME.candidates.spaces.default, HOME.candidates.spaces.max);
       const mine = [sk("user", user), ...[...members].filter(([, m]) => m.has(user)).map(([t]) => sk("team", t))];
       const granted = (type, id) => { const g = scoped.get(sk(type, id)); return !!g && mine.some(k => g.has(k)); };
-      const rows = [...spaces.values()].filter(sp => sp.tenant === tenant && (after == null || sp.id > after)
+      const rows = [...spaces.values()].filter(sp => sp.tenant === tenant && sp.trashedAt == null && (after == null || sp.id > after)
         && (all || sp.generalRole != null || sp.owner === user || granted("space", sp.id)
           || (sp.group != null && (groups.get(sp.group)?.generalRole != null || granted("group", sp.group))))).sort((a, b) => (a.id < b.id ? -1 : 1));
       const page = rows.slice(0, n), gs = [...new Set(page.map(sp => sp.group).filter(Boolean))].map(g => groups.get(g)).filter(Boolean);
@@ -531,12 +656,12 @@ export function memoryRegistry({ now = Date.now } = {}) {
       return out;
     },
 
-    async boardsIn(scope, { after = null, limit } = {}) {
+    async boardsIn(scope, { after = null, limit, withTrashed = false } = {}) {
       const { type, id } = orgDefaults.scope(scope);
       after = orgDefaults.cursor(after, "id");
       if (type === "board") return { ids: [], next: null };
       const spaceIds = new Set([...spaces.values()].filter(sp => (type === "space" ? sp.id === id : type === "group" ? sp.group === id : false)).map(sp => sp.id));
-      const all = [...boards.values()].filter(b => (type === "unit" ? b.tenant === id : spaceIds.has(b.space))).map(b => b.id).sort();
+      const all = [...boards.values()].filter(b => (withTrashed || b.trashedAt == null) && (type === "unit" ? b.tenant === id : spaceIds.has(b.space))).map(b => b.id).sort();
       const n = pageLimit(limit), rest = after == null ? all : all.filter(x => x > after), ids = rest.slice(0, n);
       return { ids, next: rest.length > n ? ids[n - 1] : null };
     },

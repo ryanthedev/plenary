@@ -91,6 +91,7 @@ function build(db, { fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3
     RETURNING epoch, expires_at`);
   const qRelease = db.query("UPDATE leases SET holder = NULL, expires_at = NULL WHERE tenant = ? AND board = ? AND holder = ? AND epoch = ?");
   const qLease = db.query("SELECT holder, epoch, expires_at FROM leases WHERE tenant = ? AND board = ?");
+  const qPurge = ["entries", "checkpoints", "checkpoint_parts", "leases"].map(tb => db.query(`DELETE FROM ${tb} WHERE tenant = ? AND board = ?`));
   const qLast = db.query("SELECT max(seq) AS m FROM entries WHERE tenant = ? AND board = ?");
   const qInsert = db.query("INSERT INTO entries (tenant, board, seq, data) VALUES (?, ?, ?, ?)");
   const qRead = db.query("SELECT data FROM entries WHERE tenant = ? AND board = ? AND seq >= ? ORDER BY seq ASC LIMIT ?");
@@ -305,6 +306,12 @@ function build(db, { fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3
       const t = clock();
       const live = row.holder !== null && row.expires_at !== null && row.expires_at > t;
       return { holder: row.holder, epoch: row.epoch, expiresAt: row.expires_at, live, remainingMs: live ? row.expires_at - t : 0 };
+    },
+
+    /** Deletes everything the store holds for one board, in one transaction (PROTOCOL.md § Trash and restore, "Purge"). Idempotent. */
+    async purgeBoard(tenant, board) {
+      ready(tenant, board);
+      db.transaction(() => { for (const q of qPurge) q.run(tenant, board); }).immediate();
     },
 
     /** What the store was opened with, read back from SQLite (for /health and tests). */

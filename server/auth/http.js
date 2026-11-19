@@ -90,6 +90,7 @@ import { accessService } from "./access.js";
 import { explainService } from "./explain.js";
 import { rolesService } from "./roles.js";
 import { moveService } from "./move.js";
+import { trashService } from "./trash.js";
 import { AdminError, createInvite, listInvites, readInvite, revokeInvite, createLink, listLinks, readLink, revokeLink, setGrant, shareView } from "../admin/boards.js";
 
 export const LOGIN_COOKIE = "__Host-plen_login";
@@ -137,7 +138,7 @@ const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
  *   now?: () => number, config: object, dev?: { enabled?: boolean, verify(t: string): Promise<object|null> } | null,
  *   testHooks?: { pruned?(p: { visited: number, expired: number, live: number }): void, routes?(table: { pattern: string, methods: string[], names: string[] }[]): void } | null }} deps   (tests only, not an API)
  */
-export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, explainer = explainService({ registry, now }), spaces = spaceService({ registry, tenancy, home, now, explainer }), moves = moveService({ registry, tenancy, spaces, now }), access = accessService({ registry, tenancy, now, explainer, announce: spaces.announceChange, backlog: spaces.backlog, settled: spaces.settled }), roles = rolesService({ registry, tenancy, announce: spaces.announceChange }), config = {}, dev = null, log = stdoutLog, testHooks = null, timers = { set: (f, ms) => setTimeout(f, ms), clear: h => clearTimeout(h) } }) {
+export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, explainer = explainService({ registry, now }), spaces = spaceService({ registry, tenancy, home, now, explainer }), moves = moveService({ registry, tenancy, spaces, now }), trash = trashService({ registry, tenancy, spaces, now }), access = accessService({ registry, tenancy, now, explainer, announce: spaces.announceChange, backlog: spaces.backlog, settled: spaces.settled }), roles = rolesService({ registry, tenancy, announce: spaces.announceChange }), config = {}, dev = null, log = stdoutLog, testHooks = null, timers = { set: (f, ms) => setTimeout(f, ms), clear: h => clearTimeout(h) } }) {
   if (!registry || !sessions || !tenancy) throw new Error("http: registry, sessions and tenancy are required");
   /** `p`, or a rejection with message "timeout" after `ms` on the injected timers. */
   const bounded = (p, ms) => new Promise((res, rej) => { const t = timers.set(() => rej(new Error("timeout")), ms); p.then(v => { timers.clear(t); res(v); }, e => { timers.clear(t); rej(e); }); });
@@ -572,6 +573,30 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       if (to === null || [...url.searchParams.keys()].length !== 1) throw refuse(400, "bad-request");
       return json(200, await moves.preview(who, p.board, to));
     } }],
+    ["/boards/:board/trash", {
+      GET: async (req, p) => json(200, await trash.notice(await caller(req), p.board)),
+      POST: async (req, p) => {
+        const who = await caller(req);
+        const b = await body(req, ["from"]);
+        return keyed(req, who, "POST /boards/:board/trash", p, b, async idem => trash.trashBoard(who, p.board, b, idem), async ref => trash.replayTrash(who, p.board, b, ref), 200);
+      },
+    }],
+    ["/boards/:board/restore", { POST: async (req, p) => {
+      const who = await caller(req);
+      const b = await body(req, []);
+      return keyed(req, who, "POST /boards/:board/restore", p, b, async idem => trash.restoreBoard(who, p.board, idem), async ref => trash.replayRestore(who, p.board, ref), 200);
+    } }],
+    ["/spaces/:space/trash", { POST: async (req, p) => {
+      const who = await caller(req);
+      const b = await body(req, []);
+      return keyed(req, who, "POST /spaces/:space/trash", p, b, async idem => trash.trashSpace(who, p.space, idem), async ref => trash.replayTrashSpace(who, p.space, ref), 200);
+    } }],
+    ["/spaces/:space/restore", { POST: async (req, p) => {
+      const who = await caller(req);
+      const b = await body(req, []);
+      return keyed(req, who, "POST /spaces/:space/restore", p, b, async idem => trash.restoreSpace(who, p.space, idem), async ref => trash.replayRestoreSpace(who, p.space, ref), 200);
+    } }],
+    ["/trash", { GET: async req => json(200, await trash.list(await caller(req))) }],
     ["/boards/:board/share", { GET: async (req, p) => {
       const v = await shareView({ caller: await caller(req), board: p.board }, admin);
       return json(200, publicUrl ? { ...v, links: v.links.map(l => ({ ...l, url: `${publicUrl}/links/${encodeURIComponent(l.id)}` })) } : v);
@@ -691,6 +716,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
         if (e.code === "in-use" || e.code === "confirm-required") return err(409, e.code, e.data ?? {});
         if (e.code === "superseded") return err(409, "superseded");
         if (e.code === "moved") return err(409, "moved");
+        if (e.code === "with-space" || e.code === "space-in-trash" || e.code === "purged" || e.code === "would-escalate") return err(409, e.code);
         if (e.code === "unknown-person" || e.code === "bad-role") return err(400, e.code);
         if (e.code === "rate-limited") { const s = e.data?.retryAfter ?? null; return err(429, "rate-limited", { retryAfter: s }, s == null ? undefined : { "retry-after": String(s) }); }
       }

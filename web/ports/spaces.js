@@ -27,7 +27,7 @@ export const SPACES_ERRORS = Object.freeze(["auth", "forbidden", "notfound", "in
 
 /**
  * @typedef {{ id: string, name: string, personal: boolean, general: string|null, group: { id: string, name: string }|null }} SpaceInfo
- * @typedef {{ space: SpaceInfo, can: { createBoard: boolean, rename: boolean, general: boolean }, boards: object[], more: boolean }} SpacePage
+ * @typedef {{ space: SpaceInfo, can: { createBoard: boolean, rename: boolean, general: boolean, trash: boolean }, boards: object[], more: boolean }} SpacePage
  * @typedef {{ group: { id: string, name: string, general: string|null }, can: { createSpace: boolean, rename: boolean, general: boolean },
  *   spaces: { id: string, name: string, general: string|null }[], next: string|null }} GroupPage
  * @typedef {SpaceInfo} PickSpace

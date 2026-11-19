@@ -1,7 +1,7 @@
 // The room host on the Store lease (p4-host): one path for a single node and a cluster. acquire/renew/release, the
 // holder-only inbox, the takeover, the dead-holder window, the host deadline and the clean release.
 // Postgres cases run when DATABASE_URL is set; the rest use SQLite files.
-import { test, expect, afterAll, describe } from "bun:test";
+import { test, expect, afterAll, describe, jest } from "bun:test";
 import { join } from "node:path";
 import { SQL } from "bun";
 import { roomHost, newHolder } from "../../server/room-host.js";
@@ -138,8 +138,10 @@ for (const [name, maker] of [["sqlite", sqliteMaker], ["postgres", pgMaker]]) de
   test("holder A stops renewing (no release); B takes over after expiry; A's late append is fenced; every op A acked is in the log", async () => {
     const m = maker(), raw = await m.open(), rawB = await m.open(), bus = memoryBus();
     const sa = stallable(raw);
-    const A = roomHost({ store: sa.store, bus, holder: "h-a", leaseTtlMs: 600, heartbeatMs: 100, appendTimeoutMs: 300 });
-    const Bh = roomHost({ store: rawB, bus, holder: "h-b", leaseTtlMs: 600, heartbeatMs: 100 });
+    // A's ttl (3 s) only sets how long B waits for the takeover; B's (30 s) keeps B's room alive through an event-loop stall (a host drops its room when
+    // a stall outlasts 2/3 of its ttl), so a loaded machine can't take B's room away between its takeover and the c2 checks.
+    const A = roomHost({ store: sa.store, bus, holder: "h-a", leaseTtlMs: 3_000, heartbeatMs: 100, appendTimeoutMs: 300 });
+    const Bh = roomHost({ store: rawB, bus, holder: "h-b", leaseTtlMs: 30_000, heartbeatMs: 100 });
     try {
       await A.open(T, B);
       const eA = (await A.peek(T, B)).epoch;
@@ -319,20 +321,20 @@ test("renew starts before the rebuild: a rebuild longer than the ttl keeps the l
   const { epoch } = await raw.acquire(T, B, "h-seed", 60_000);
   await raw.append(T, B, [{ seq: 1, board: B, tenant: T, stream: "board", op: { elements: [rect("x")] }, by: "u", id: "c:1", at: 0, rv: 1 }], 0, epoch);
   await raw.release(T, B, "h-seed", epoch);
-  // The rebuild is held until the test lets it go; the host renews every 200 ms, so four renews (counted, not timed)
-  // are 800 ms of rebuild against a ttl of 600.
+  // The rebuild is held until the test lets it go; the host renews every ttl/3 (500 ms), so four renews (counted, not timed)
+  // are 2 s of rebuild against a ttl of 1.5 s.
   let slow = true, renews = 0; const gate = deferred(), renewed = deferred();
   const store = { ...raw, renew: (...a) => { if (++renews >= 4) renewed.resolve(); return raw.renew(...a); }, read: async (...a) => { if (slow) { slow = false; await gate.promise; } return raw.read(...a); } };
-  const A = roomHost({ store, bus, holder: "h-a", leaseTtlMs: 600 });
-  const Bh = roomHost({ store: raw, bus, holder: "h-b", leaseTtlMs: 600 });
+  const A = roomHost({ store, bus, holder: "h-a", leaseTtlMs: 1_500 });   // renews every 500 ms; tolerates a 1 s event-loop stall
+  const Bh = roomHost({ store: raw, bus, holder: "h-b", leaseTtlMs: 1_500 });
   try {
     const opening = A.open(T, B);
-    await renewed.promise;                                                 // four renews in, still mid-rebuild: past the whole ttl
+    await withCeiling(renewed.promise, "four renews during the rebuild");                                                 // four renews in, still mid-rebuild: past the whole ttl
     expect(await raw.acquire(T, B, "h-b", 600)).toBe(null);               // still A's: it renewed while building
     gate.resolve(); await opening;
     expect((await A.peek(T, B))?.durable).toBe(1);
   } finally { await A.close(); await Bh.close(); await raw.close(); await bus.close(); }
-}, 10000);
+}, 45000);   // above the 30 s CEILING_MS wait for the renews
 
 // ---- Round 2 (p4-hostv): each verifier repro as a test ----
 
@@ -361,6 +363,9 @@ test("HIGH-1: a holder woken from a stall past its deadline serves nothing that 
     frozen = true; sa.renew = "hang"; off += 40_000;
     await Bh.open(T, B);                                                     // the lease lapsed: B takes the board
     expect((await Bh.peek(T, B))?.epoch).toBe(2);
+    // The first message A will see on waking is an op from a connection it never welcomed: only the inbox deadline check (onInbox) keeps A from
+    // answering it (the Room would reply unavailable + 1013 to it); the reply-time check and the welcomed guard come too late for it.
+    g.op("z9", "z", 1);
     g.hello("c2", "a"); expect(await g.welcome("c2")).toMatchObject({ seq: 3, room: { epoch: 2 } });
     g.hello("x1", "x"); await g.welcome("x1");
     g.op("x1", "x", 1); await g.ack("x1", "x:1");
@@ -369,9 +374,12 @@ test("HIGH-1: a holder woken from a stall past its deadline serves nothing that 
     // A wakes: what queued is delivered before any of its timers run.
     frozen = false;
     for (const f of queued.splice(0)) f();
-    await bus.flush(); await sleep(100); await bus.flush();
+    // Positive control, then drain: A does answer its own welcomed connection (1013), and only then is "nothing else" asserted. (A.idle is a no-op
+    // once A's slot is gone, so the c1 reply is the real barrier: a stray reply would be sent before or with it, in the same delivery.)
+    await until(() => fromA.slice(before).some(m => m.conn === "c1" && m.close === 1013), "A telling its own c1 1013 once it woke");
+    await A.idle(T, B); await Bh.idle(T, B); await bus.flush();
     const late = fromA.slice(before);
-    expect(late.filter(m => m.conn === "c2" || m.conn === "x1")).toEqual([]);   // no welcome, ack or 1013 from the dead epoch
+    expect(late.filter(m => m.conn === "c2" || m.conn === "x1" || m.conn === "z9")).toEqual([]);   // no welcome, ack or 1013 from the dead epoch
     expect(late.every(m => m.conn === "c1" && m.close === 1013)).toBe(true);    // only its own welcomed connection is told
     expect(await A.peek(T, B)).toBe(null);
     expect((await Bh.peek(T, B))?.conns).toBe(2);                                // B still serves c2 and x1
@@ -380,6 +388,30 @@ test("HIGH-1: a holder woken from a stall past its deadline serves nothing that 
     expect((await raw.read(T, B, 1, 100)).map(e => e.id)).toEqual(["a:1", "a:2", "a:3", "x:1", "a:4"]);
   } finally { await A.close(); await Bh.close(); await raw.close(); await bus.close(); }
 }, 15000);
+
+test("HIGH-1 guard: a hello the host deadline catches between its inbox check and its welcome leaves a dead slot that tells only its welcomed connections 1013", async () => {
+  // The lease clock is read once by the inbox check and once before the welcome is sent: it is made to jump past the deadline between those two reads,
+  // so c2 is a connection the slot holds but never welcomed. fail() must tell c1 (welcomed) and leave c2 to the new holder.
+  const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
+  let calls = 0, tripAt = Infinity;
+  const lines = [], log = createLogger({ write: l => lines.push(l), level: "debug" });
+  const A = roomHost({ store: raw, bus, log, holder: "h-a", leaseTtlMs: 30_000, monotonic: () => { calls++; return performance.now() + (calls >= tripAt ? 60_000 : 0); } });
+  try {
+    await A.open(T, B);
+    const g = fakeGateway(bus);
+    g.hello("c1", "a"); await g.welcome("c1");
+    tripAt = calls + 2;                                 // the next hello: its inbox check reads clean, its welcome reads past the deadline
+    g.hello("c2", "b");
+    await until(() => g.of("c1").some(x => x.close === 1013), "the dead slot telling its welcomed c1 1013");
+    await bus.flush();
+    // The jump must have landed on the reply-time read, not on the inbox check (which would drop the hello before c2 is ever held, leaving the
+    // welcomed guard unexercised): a refactor that adds or removes a clock read between the two fails here, loudly, instead of silently dropping coverage.
+    expect(lines.map(l => JSON.parse(l)).filter(l => l.msg === "room stopped: lease lost").map(l => l.why)).toEqual(["the host deadline passed before a reply"]);
+    expect(g.of("c1").filter(x => x.close === 1013).length).toBe(1);
+    expect(g.of("c2")).toEqual([]);                                          // not welcomed, not told: the new holder (or a watcher) answers it
+    expect(await A.peek(T, B)).toBe(null);
+  } finally { await A.close(); await raw.close(); await bus.close(); }
+}, 10000);
 
 test("MEDIUM-1 (repro C): the holder dies right after a renew; a watcher takes over within ttl + ttl/3 + 500 ms, not 2 ttl", async () => {
   const { V, raw, host, bus } = vworld();
@@ -513,9 +545,9 @@ test("L3 (repro H): an event-loop stall past the deadline stops the room; a rene
 
 test("L4: close() settles an append in flight before it releases the lease", async () => {
   const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
-  let gate = null, order = [];
+  let gate = null, order = [], inAppend = false;
   const store = { ...raw,
-    append: async (...a) => { if (gate) await gate; const r = await raw.append(...a); order.push("append landed"); return r; },
+    append: async (...a) => { if (gate) { inAppend = true; await gate; } const r = await raw.append(...a); order.push("append landed"); return r; },
     release: async (...a) => { order.push("release"); return raw.release(...a); } };
   const A = roomHost({ store, bus, holder: "h-a", leaseTtlMs: 30_000 });
   try {
@@ -523,11 +555,24 @@ test("L4: close() settles an append in flight before it releases the lease", asy
     const g = fakeGateway(bus);
     g.hello("c1", "a"); await g.welcome("c1");
     let open; gate = new Promise(r => { open = r; });
-    g.op("c1", "a", 1); await bus.flush(); await sleep(20);
-    const closing = A.close();
-    await sleep(200);
-    expect(order).toEqual([]);                                               // still waiting on the append
-    open(); await closing;
+    g.op("c1", "a", 1); await bus.flush();
+    await until(() => inAppend, "the op's append to be in flight");
+    // close() is suspended at its wait on the append once it has stopped listening (unsub, then dead = true, then it waits on the writes): a state,
+    // not a delay. Fake timers make "no timer cuts the wait short" checkable: a close() that skipped the wait, or gave up after any timeout
+    // (30 ms, a minute), has released by the time a day of timers has run. Bun.sleep(0) hangs under fake timers, so the polls use microtasks.
+    let closing;
+    jest.useFakeTimers();
+    try {
+      closing = A.close();
+      for (let i = 0; i < 10_000 && bus.subscriberCount(subjects.inbox(T, B)) !== 0; i++) await null;
+      expect(bus.subscriberCount(subjects.inbox(T, B))).toBe(0);               // close() reached its wait
+      jest.advanceTimersByTime(24 * 3_600_000);
+      for (let i = 0; i < 100; i++) await null;
+      expect(order).toEqual([]);                                               // still waiting on the append
+    } finally { jest.useRealTimers(); }
+    open();
+    await until(() => order.includes("release"), "the release after the append settled");
+    await closing;
     expect(order).toEqual(["append landed", "release"]);
     expect((await raw.read(T, B, 1, 10)).map(e => e.id)).toEqual(["a:1"]);
   } finally { await A.close(); await raw.close(); await bus.close(); }
@@ -553,16 +598,17 @@ test("L7: past 1,000 held hellos on a watched board, the extra ones are answered
     await Bh.open(T, B);
     const g = fakeGateway(bus);
     for (let i = 0; i < 1_005; i++) g.hello(`c${i}`, `x${i}`);
-    await bus.flush(); await sleep(50);
-    const answered = new Set(g.got.filter(m => m.close === 1013).map(m => m.conn));
-    expect([...answered].sort()).toEqual(["c1000", "c1001", "c1002", "c1003", "c1004"]);
-    await until(() => g.got.filter(m => m.close === 1013).length === 1_005, "the held ones at the silence", 6_000);
+    await bus.flush();
+    await until(() => g.got.filter(m => m.close === 1013).length === 1_005, "the held ones at the silence", 15_000);
+    // The five over the cap are answered at once, the held ones only at the silence: so they come first, in the order sent (an order, not a delay).
+    const order = g.got.filter(m => m.close === 1013).map(m => m.conn);
+    expect(order.slice(0, 5)).toEqual(["c1000", "c1001", "c1002", "c1003", "c1004"]);
   } finally { await Bh.close(); await raw.close(); await bus.close(); }
-}, 15000);
+}, 30000);   // exceeds the inner waits (15 s) so the named failure surfaces, not bun's generic timeout
 
 test("R2-L1: `welcomed` shrinks with `conns` (close notices, a listing, the sweep); a lost lease still tells only welcomed live connections", async () => {
   const bus = memoryBus(), st = stallable(sqliteStore({ path: join(tempDir(), "plenary.db") }));
-  const host = roomHost({ store: st.store, bus, leaseTtlMs: 900, sweepMs: 50 });
+  const host = roomHost({ store: st.store, bus, leaseTtlMs: 6_000, sweepMs: 50 });   // renews every 2 s, deadline 4 s: the 2,000-hello loops can't stall it out
   const g = fakeGateway(bus);
   try {
     await host.open(T, B);
@@ -574,17 +620,17 @@ test("R2-L1: `welcomed` shrinks with `conns` (close notices, a listing, the swee
     const live = conns.slice(1000, 1500);
     await bus.publish(subjects.inbox(T, B), { gateway: "g-1", conns: live });
     await host.idle(T, B);
-    await sleep(120);   // a sweep or two
+    await until(async () => { const p = await host.peek(T, B); return p.conns === 500 && p.welcomed === 500; }, "the sweep to drop the closed connections", 15_000);
     const p = await host.peek(T, B);
     expect([p.conns, p.welcomed]).toEqual([500, 500]);
     // The lease is lost: 1013 goes to exactly the 500 welcomed live connections, nobody else.
     const before = g.got.length;
     st.renew = "null";
-    await until(() => g.got.slice(before).filter(m => m.close === 1013).length >= 500, "the 1013s", 5000);
-    await sleep(100);
+    await until(() => g.got.slice(before).filter(m => m.close === 1013).length >= 500, "the 1013s", 10_000);   // the next renew tick (<= 2 s) finds the null renew
+    await host.idle(T, B); await bus.flush();   // everything the lost lease sends is delivered before the exact-set check
     expect(g.got.slice(before).filter(m => m.close === 1013).map(m => m.conn).sort()).toEqual([...live].sort());
   } finally { await host.close(); }
-}, 40000);
+}, 60000);   // exceeds the inner waits (20 s + 15 s + 5 s) so the named failure surfaces, not bun's generic timeout
 
 // ---- e1-tests-v3 MEDIUM-1: close() after a failed build ----
 

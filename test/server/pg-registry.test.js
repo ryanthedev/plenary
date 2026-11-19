@@ -4,7 +4,7 @@
 // § Store, "Least privilege") and concurrent start-up on an empty schema; timeouts (a held lock makes a call reject
 // near its limit, and the pool works after), the bounded start-up lock and the start-up privilege probe.
 // Skips unless DATABASE_URL is set. Each test gets its own schema, dropped after.
-import { describe, test, expect, afterAll } from "bun:test";
+import { describe, test, expect, afterAll, setDefaultTimeout } from "bun:test";
 import { SQL } from "bun";
 import { postgresRegistry, registryTables, REGISTRY_INDEXES } from "../../server/registry/postgres.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
@@ -15,6 +15,12 @@ import { legacyEquivalence } from "../auth/legacy-migration.js";
 import { migrate } from "../../server/pg/schema.js";
 
 const url = process.env.DATABASE_URL;
+// Every test here does real Postgres work (schema creation, pools, lock waits). Bun's 5 s default fails them under machine load (TECH-DEBT
+// row 36), so this is a failure-only ceiling: it fires only when a call never returns. Assertions are on outcomes, never on how long a test took
+// (a lower bound on a lock wait is fine: load only makes the wait longer).
+setDefaultTimeout(30_000);
+// Deadline for a wait on observable state (a lock wait showing up, a gate state): failure-only, like the ceiling above.
+const HUNG_MS = 10_000;
 
 describe.skipIf(!url)("postgres registry", () => {
   /** @type {SQL} */ let sql;
@@ -34,6 +40,16 @@ describe.skipIf(!url)("postgres registry", () => {
   const schemaName = () => `pl_test_reg_${process.pid}_${Date.now().toString(36)}_${++n}`;
   const drop = s => client().unsafe(`DROP SCHEMA IF EXISTS "${s}" CASCADE`);
   const schemas = new Map();
+  /** Waits (until a real HUNG_MS deadline) until at least `n` backends are blocked on a lock in a statement matching `like`; fails with a named message after it, so a loaded machine fails cleanly. */
+  const waitBlocked = async (like, n = 1) => {
+    let c = 0;
+    for (const end = Date.now() + HUNG_MS; c < n; await Bun.sleep(20)) {
+      c = (await client().unsafe(`SELECT count(*)::int AS c FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE $1`, [like]))[0].c;
+      if (c >= n) return;
+      if (Date.now() > end) throw new Error(`timed out after ${HUNG_MS} ms: ${c}/${n} backends lock-waiting in a statement like ${like}`);
+    }
+  };
+
 
   // Platform's contract. The pool runs concurrent calls on separate connections, so its concurrency cases are real.
   registryContract("postgres", async ({ now }) => {
@@ -59,7 +75,7 @@ describe.skipIf(!url)("postgres registry", () => {
       const [{ n }] = await client().unsafe(`SELECT count(*)::int AS n FROM "${schema}".reg_recents WHERE member = 'dev:cc'`);
       expect(n).toBe(50);
     } finally { await r.close(); await wide.close(); await drop(schema); }
-  });
+  }, 60_000);   // ~270 sequential round trips to seed, then 60 racing writes: sized for a loaded machine (TECH-DEBT row 38); failure-only
 
   // The batch access check against the single-board resolver, on Postgres (one seed: each run is a few hundred statements).
   accessEquivalence("postgres", async ({ now }) => {
@@ -257,23 +273,13 @@ describe.skipIf(!url)("postgres registry", () => {
       await other.unsafe(`DELETE FROM "${schema}".reg_grants WHERE board = $1 AND member = 'x'`, [board.id]);
       let settled = false;
       const p = r.setGrant(board.id, "y", "editor").then(() => "ok", e => e.code).finally(() => { settled = true; });
-      await Bun.sleep(200);
-      expect(settled).toBe(false);                                // queued on the row lock
+      await waitBlocked(`%"${schema}".reg_boards%FOR UPDATE%`);   // the call is now queued on the row lock (else the COMMIT could come first and prove nothing)
+      expect(settled).toBe(false);
       await other.unsafe("COMMIT");
       expect(await p).toBe("last-owner");
       expect(await r.grants(board.id)).toEqual([{ user: "y", role: "owner" }]);
     } finally { other.release(); await r.close(); await drop(schema); }
   });
-
-  /** Waits (up to 10 s) until at least `n` backends are blocked on a lock in a statement matching `like`; asserts they are, so a loaded machine fails cleanly. */
-  const waitBlocked = async (like, n = 1) => {
-    let c = 0;
-    for (let i = 0; i < 500 && c < n; i++) {
-      c = (await client().unsafe(`SELECT count(*)::int AS c FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE $1`, [like]))[0].c;
-      if (c < n) await Bun.sleep(20);
-    }
-    expect(c).toBeGreaterThanOrEqual(n);
-  };
 
   test("a Team's last member leaving, stalled on a container's lock, and a grant to the same Team on another container: serialised per tenant, nothing orphaned", async () => {
     const schema = schemaName();
@@ -302,7 +308,7 @@ describe.skipIf(!url)("postgres registry", () => {
       expect(await r.teamMembers(team.id)).toEqual([]);
       expect((await r.scopedGrants(S2)).map(g => g.subject.id).sort()).toEqual(["ann", team.id].sort());
     } finally { await other.unsafe("ROLLBACK").catch(() => {}); other.release(); await r.close(); await r2.close(); await drop(schema); }
-  }, 30_000);
+  }, 45_000);   // above 2 x HUNG_MS of waits
 
   test("two Teams losing their last members at once, one of them granted onto the other's container meanwhile: one removal is refused, every round", async () => {
     const schema = schemaName();
@@ -343,19 +349,20 @@ describe.skipIf(!url)("postgres registry", () => {
         expect([await counted(S1), await counted(S2)].every(n => n >= 1)).toBe(true);
       }
     } finally { await other.unsafe("ROLLBACK").catch(() => {}); other.release(); await a.close(); await b.close(); await drop(schema); }
-  }, 30_000);
+  }, 45_000);   // above 2 x HUNG_MS of waits
 
   test("invariant under a stalled interleaving: after removal A, a grant of A's Team onto S2 and removal B (each queued wherever it waits), every Group and Space keeps a counted owner", async () => {
     const schema = schemaName();
     const a = await postgresRegistry({ url, schema, max: 4 }), b = await postgresRegistry({ url, schema, max: 4 });
+    const ROUND_MS = 40_000, testEnd = Date.now() + ROUND_MS;   // one deadline for all 10 rounds' waits; the test ceiling (60 s) exceeds it
     // Never assumes WHERE anything waits: any backend of this schema blocked on a lock (a row, or the tenant's owners lock) counts.
+    const blockedCount = async () => (await client().unsafe(`SELECT count(*)::int AS c FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND (query LIKE $1 OR query LIKE '%pg_advisory_xact_lock%')`, [`%${schema}%`]))[0].c;
     const blocked = async n => {
       let c = 0;
-      for (let i = 0; i < 500 && c < n; i++) {
-        c = (await client().unsafe(`SELECT count(*)::int AS c FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND (query LIKE $1 OR query LIKE '%pg_advisory_xact_lock%')`, [`%${schema}%`]))[0].c;
-        if (c < n) await Bun.sleep(10);
+      while ((c = await blockedCount()) < n) {
+        if (Date.now() > testEnd) throw new Error(`timed out (whole-test deadline of ${ROUND_MS} ms): ${c}/${n} backends lock-waiting in this schema`);
+        await Bun.sleep(10);
       }
-      expect(c).toBeGreaterThanOrEqual(n);
     };
     const hold = async space => { const c = await client().reserve(); await c.unsafe("BEGIN"); await c.unsafe(`SELECT id FROM "${schema}".reg_spaces WHERE id = $1 FOR UPDATE`, [space]); return c; };
     const verdict = x => x.then(() => "ok", e => e.code ?? e.message);
@@ -376,8 +383,12 @@ describe.skipIf(!url)("postgres registry", () => {
         const x1 = await hold(s1.id);
         const A = verdict(a.setTeamMember(t1.id, "a", false));
         await blocked(1);
-        const G = verdict(b.setScopedGrant({ scope: S2, subject: { type: "team", id: t1.id }, role: "owner" }));
-        await Promise.race([G, Bun.sleep(300)]);                          // finished (no tenant lock) or queued behind A's
+        let gDone = false;
+        const G = verdict(b.setScopedGrant({ scope: S2, subject: { type: "team", id: t1.id }, role: "owner" })).then(v => { gDone = true; return v; });
+        while (!gDone && (await blockedCount()) < 2) {   // finished (no tenant lock) or queued behind A's, each a state, not a delay
+          if (Date.now() > testEnd) throw new Error(`timed out (whole-test deadline of ${ROUND_MS} ms, round ${round}): the grant neither finished nor queued behind the team removal`);
+          await Bun.sleep(10);
+        }
         const x2 = await hold(s2.id).catch(() => null);
         const B = verdict(b.setTeamMember(t2.id, "b", false));
         await blocked(2);
@@ -606,8 +617,8 @@ describe.skipIf(!url)("postgres registry", () => {
     try { await other.unsafe("BEGIN"); await other.unsafe(lock); return await f(); }
     finally { await other.unsafe("ROLLBACK").catch(() => {}); other.release(); }
   };
-  /** Waits until `f()` is true (polls every 10 ms, at most 5 s). */
-  const until = async f => { for (let i = 0; i < 500 && !f(); i++) await Bun.sleep(10); expect(f()).toBe(true); };
+  /** Waits until `f()` is true (polls every 10 ms, until a HUNG_MS deadline); fails naming `what`. */
+  const until = async (f, what) => { for (const end = Date.now() + HUNG_MS; !f(); await Bun.sleep(10)) if (Date.now() > end) throw new Error(`timed out after ${HUNG_MS} ms waiting for ${what}`); };
   /** Settles `p`, returning [error or null, elapsed ms]. */
   const timed = async p => { const t0 = performance.now(); const e = await p.then(() => null, x => x); return [e, performance.now() - t0]; };
 
@@ -649,8 +660,7 @@ describe.skipIf(!url)("postgres registry", () => {
         const [err, took] = await timed(r.tenantAdminsAmong(["dev:a"], { timeoutMs: 300 }));
         expect(err?.code).toBe("statement-timeout");
         expect(err.message).toMatch(/^postgres registry: tenantAdminsAmong ran past 300 ms/);   // the limit that applied, not 10000
-        expect(took).toBeGreaterThan(250);
-        expect(took).toBeLessThan(2000);
+        expect(took).toBeGreaterThan(250);                          // waited the bound; no upper limit (a loaded machine only makes it later)
       });
       // The bound was transaction-local: the only connection reads its session default again and still serves.
       expect(await r.readSettings()).toEqual({ lock_timeout: "10s", statement_timeout: "10s" });
@@ -771,7 +781,7 @@ describe.skipIf(!url)("postgres registry", () => {
           for (const c of codes) expect([sentCode, "queue-timeout"]).toContain(c);
           expect(codes.filter(c => c === sentCode).length).toBe(max);                // the sent ones, one per connection
         });
-        await until(() => r.gate().running === 0);
+        await until(() => r.gate().running === 0, "the gate to go idle");
         expect(await r.grant(b.id, "u")).toBe("editor");                            // usable again
       } finally { await r.close(); await drop(schema); }
     }, 30_000);   // failure-only ceiling (TECH-DEBT row 31): the 800 ms lock wait is the server's own clock, but a fresh schema, a cold pool and a drop around it are not; ~1.5 s alone
@@ -835,7 +845,7 @@ describe.skipIf(!url)("postgres registry", () => {
         expect(took).toBeGreaterThan(lim + 900);
         expect(r.gate().running).toBe(1);                             // its connection is still busy, and counted
       });
-      await until(() => r.gate().running === 0);                      // the lock cleared: the stray read finished
+      await until(() => r.gate().running === 0, "the stray read to finish");  // the lock cleared: the stray read finished
     } finally { await r.close(); await drop(schema); }
   });
 
@@ -873,14 +883,14 @@ describe.skipIf(!url)("postgres registry", () => {
       const released = holder.unsafe("SELECT pg_sleep(0.2); COMMIT").simple().then(() => "released");
       const a = r.grant(b.id, "u").then(() => "ok", e => e.code);      // sent: waits on the lock
       const bCall = r.setGrant(b.id, "late", "editor").then(() => "ok", e => e.code);   // queued (one connection)
-      await Bun.sleep(10);
+      await until(() => r.gate().running === 1 && r.gate().waiting === 1, "one call running and one queued");   // a state, not a delay: one sent, one queued
       expect(r.gate()).toMatchObject({ running: 1, waiting: 1 });
       Bun.sleepSync(600);                                               // the stall: past B's 250 ms deadline
       expect(await a).toBe("ok");                                       // the lock cleared during the stall
       expect(await bCall).toBe("queue-timeout");
       expect(await released).toBe("released");
       expect(await r.grant(b.id, "late")).toBe(null);                   // never sent, so never committed
-      await until(() => r.gate().running === 0 && r.gate().waiting === 0);   // no slot leaked
+      await until(() => r.gate().running === 0 && r.gate().waiting === 0, "the gate to drain");   // no slot leaked
     } finally { holder.release(); await r.close(); await drop(schema); }
-  });
+  }, 45_000);   // above its 2 x HUNG_MS of waits
 });

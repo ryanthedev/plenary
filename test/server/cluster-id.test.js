@@ -2,7 +2,7 @@
 // a missing or malformed id from the Store refuses the start (fail closed) and closes what opened; the id reaches
 // the Bus adapter only through its `cluster` option; a bad one is refused before anything connects; a node from
 // before the id (unscoped subjects) and a scoped one never exchange a message.
-import { test, expect, afterAll } from "bun:test";
+import { test, expect, afterAll, setDefaultTimeout } from "bun:test";
 import { join } from "node:path";
 import { start } from "../../server/main.js";
 import { sqliteStore } from "../../server/store/sqlite.js";
@@ -10,8 +10,11 @@ import { sqliteRegistry } from "../../server/registry/sqlite.js";
 import { memoryBus } from "../../server/bus/memory.js";
 import { natsBus } from "../../server/bus/nats.js";
 import { subjects } from "../../server/bus/port.js";
-import { tempDir, cleanup, sleep } from "./helpers.js";
+import { tempDir, cleanup, until } from "./helpers.js";
 
+// Failure-only ceiling for tests doing real NATS and start-up work: bun's 5 s default fails them under machine load (TECH-DEBT row 36). It fires only when
+// something never completes; nothing asserts on how long a test took. Before the hooks: bun applies it only to hooks registered after it.
+setDefaultTimeout(30_000);
 afterAll(cleanup);
 
 const ID = "c-0123456789abcdef";
@@ -92,7 +95,11 @@ test("DW-iso mixed version: a node without the id (unscoped) and one with it exc
   const names = [subjects.open, subjects.opened("gw-1"), subjects.inbox("t-1", "b-1"), subjects.entries("t-1", "b-1")];
   for (const n of names) { scoped.subscribe(n, m => got.scoped.push(m)); wire.subscribe(n, m => got.old.push(m)); }
   for (const n of names) { await wire.publish(n, "from-old"); await scoped.publish(n, "from-new"); }
-  await wire.flush(); await sleep(20); await wire.flush();
-  expect(got.scoped).toEqual(names.map(() => "from-new"));
-  expect(got.old).toEqual(names.map(() => "from-old"));
+  // Barrier: each listener's own sentinel, published from the other side's wire, queues behind everything above (one FIFO wire), so a leaked
+  // message would sit ahead of it in the list. The sentinel is the only thing a listener may then hold besides its own side's messages.
+  for (const n of names) { await wire.publish(n, "sentinel-old"); await wire.publish(`${ID}.${n}`, "sentinel-new"); }
+  const sentinels = (list, v) => list.filter(m => m === v).length;   // wait for the sentinels themselves, so a stray message shows as a diff below, not a timeout
+  await until(() => sentinels(got.scoped, "sentinel-new") === names.length && sentinels(got.old, "sentinel-old") === names.length, "both sentinels on every subject");
+  expect(got.scoped).toEqual([...names.map(() => "from-new"), ...names.map(() => "sentinel-new")]);
+  expect(got.old).toEqual([...names.map(() => "from-old"), ...names.map(() => "sentinel-old")]);
 });

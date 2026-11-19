@@ -1,7 +1,7 @@
 // bootstrapTenant (server/admin/tenants.js) over every Registry adapter: memory, SQLite, Postgres (when
 // DATABASE_URL is set, a fresh schema per test as test/server/pg-registry.test.js does). Plus the email-named admin
 // match in server/admin/boards.js.
-import { describe, test, expect, afterAll } from "bun:test";
+import { describe, test, expect, afterAll, setDefaultTimeout } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +12,8 @@ import { memoryRegistry } from "../../server/auth/registry.js";
 import { sqliteRegistry } from "../../server/registry/sqlite.js";
 import { postgresRegistry } from "../../server/registry/postgres.js";
 
+// Failure-only ceiling: the Postgres adapter creates a schema per test, which bun's 5 s default fails under machine load (TECH-DEBT row 36).
+setDefaultTimeout(30_000);
 const dir = mkdtempSync(join(tmpdir(), "plenary-bootstrap-"));
 let n = 0;
 const url = process.env.DATABASE_URL;

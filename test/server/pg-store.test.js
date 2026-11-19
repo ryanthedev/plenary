@@ -2,19 +2,36 @@
 // (synchronous_commit, a real row-level race on one seq, concurrent schema creation, pool ownership).
 // Skips unless DATABASE_URL is set (CI's test-cluster-services job sets it). Each test gets its own schema,
 // dropped after; one client is shared by the file.
-import { describe, test, expect, afterAll } from "bun:test";
+import { describe, test, expect, afterAll, setDefaultTimeout } from "bun:test";
 import { SQL } from "bun";
 import { postgresStore, LEASE_UPGRADE_SQL } from "../../server/store/postgres.js";
 import { storeContract, entry, code, own } from "./store-contract.js";
 
 const url = process.env.DATABASE_URL;
 const T = "t-aaa", B = "b-one";
+// Every test here does real Postgres work (schema creation, pools, lock waits). Bun's 5 s default fails them under machine load (TECH-DEBT
+// row 36), so this is a failure-only ceiling: it fires only when a call never returns. Nothing asserts on how long a test took.
+setDefaultTimeout(30_000);
+// How long a call that must settle (as "unavailable", a conflict ...) may take before the test calls it hung. Failure-only, like the ceiling above.
+const HUNG_MS = 20_000;
+/** `p`'s outcome, or "still waiting" after HUNG_MS; the timer is cleared once `p` settles so a passing run leaves none pending. */
+const orHung = async p => { let timer; try { return await Promise.race([p, new Promise(r => { timer = setTimeout(r, HUNG_MS, "still waiting"); })]); } finally { clearTimeout(timer); } };
 
 describe.skipIf(!url)("postgres store", () => {
   /** @type {SQL} */ let sql;
   const client = () => (sql ??= new SQL({ url, max: 4 }));
   afterAll(async () => { if (sql) await sql.close(); });
   let n = 0;
+  /** Poll pg_stat_activity until `n` backends are waiting on a lock in a statement matching `like`; a clear failure after HUNG_MS. */
+  const waitBlocked = async (like, what, { n = 1, done = () => false } = {}) => {
+    let c = 0;
+    for (const end = Date.now() + HUNG_MS; Date.now() < end; await Bun.sleep(10)) {
+      c = (await client().unsafe(`SELECT count(*)::int AS c FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE $1`, [like]))[0].c;
+      if (c >= n) return;
+      if (done()) throw new Error(`${what} finished instead of waiting`);
+    }
+    throw new Error(`timed out after ${HUNG_MS} ms: ${what} never showed as lock-waiting in pg_stat_activity (${c}/${n})`);
+  };
   const schemaName = () => `pl_test_store_${process.pid}_${Date.now().toString(36)}_${++n}`;
   const drop = s => client().unsafe(`DROP SCHEMA IF EXISTS "${s}" CASCADE`);
 
@@ -69,7 +86,7 @@ describe.skipIf(!url)("postgres store", () => {
       await other.unsafe(`INSERT INTO "${schema}".pl_entries (tenant, board, seq, data) VALUES ($1, $2, 2, $3)`, [T, B, JSON.stringify(entry(2, { by: "other" }))]);
       let settled = false;
       const p = code(store.append(T, B, [entry(2)], 1, e)).finally(() => { settled = true; });
-      await Bun.sleep(200);
+      await waitBlocked(`%INSERT INTO "${schema}".pl_entries%`, "the append's insert, parked behind the other connection's row", { done: () => settled });
       expect(settled).toBe(false);                                // blocked on the unique key, not decided yet
       await other.unsafe("COMMIT");
       expect(await p).toBe("conflict");
@@ -91,7 +108,7 @@ describe.skipIf(!url)("postgres store", () => {
       await other.unsafe("BEGIN");
       await other.unsafe(`INSERT INTO "${schema}".pl_entries (tenant, board, seq, data) VALUES ($1, $2, 2, 'x')`, [T, B]);
       const p = code(store.append(T, B, [entry(2)], 1, e));
-      await Bun.sleep(100);
+      await waitBlocked(`%INSERT INTO "${schema}".pl_entries%`, "the append's insert, parked behind the other connection's row");   // else the ROLLBACK could come first and prove nothing
       await other.unsafe("ROLLBACK");
       expect(await p).toBe("resolved");
       expect(await store.read(T, B, 1, 10)).toEqual([entry(1), entry(2)]);
@@ -115,7 +132,7 @@ describe.skipIf(!url)("postgres store", () => {
         await other.unsafe(`UPDATE "${schema}".pl_leases SET epoch = epoch + 1, holder = 'h-b' WHERE tenant = $1 AND board = $2`, [T, B]);
         let settled = false;
         const p = code(store.append(T, B, [entry(at + 1)], at, cur)).finally(() => { settled = true; });
-        await Bun.sleep(200);
+        await waitBlocked(`%"${schema}".pl_leases%FOR SHARE%`, "the append's fence (FOR SHARE), parked behind the takeover", { done: () => settled });
         expect(settled).toBe(false);                              // FOR SHARE waits for the takeover to decide
         await other.unsafe(end);
         expect(await p).toBe(want);
@@ -128,7 +145,7 @@ describe.skipIf(!url)("postgres store", () => {
       await other.unsafe(`SELECT epoch FROM "${schema}".pl_leases WHERE tenant = $1 AND board = $2 FOR SHARE`, [T, B]);   // an append's lock
       let taken = false;
       const take = store.renew(T, B, "h-a", cur, 60_000).finally(() => { taken = true; });   // a lease write: waits (within its lock bound)
-      await Bun.sleep(200);
+      await waitBlocked(`%UPDATE "${schema}".pl_leases%`, "the lease write, parked behind the append's FOR SHARE", { done: () => taken });
       expect(taken).toBe(false);
       await other.unsafe("COMMIT");
       expect((await take).epoch).toBe(cur);
@@ -192,17 +209,6 @@ describe.skipIf(!url)("postgres store", () => {
 
   // ---- Round 2 (p4-store-leasev H1, M1, L3) ----
 
-  /** Poll pg_stat_activity until `n` backends are waiting on a lock in a statement matching `like`; a clear failure after 10 s. */
-  const waitBlocked = async (like, what, { n = 1, done = () => false } = {}) => {
-    let c = 0;
-    for (const end = Date.now() + 10_000; Date.now() < end; await Bun.sleep(10)) {
-      c = (await client().unsafe(`SELECT count(*)::int AS c FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE $1`, [like]))[0].c;
-      if (c >= n) return;
-      if (done()) throw new Error(`${what} finished instead of waiting`);
-    }
-    throw new Error(`timed out after 10 s: ${what} never showed as lock-waiting in pg_stat_activity (${c}/${n})`);
-  };
-
   const DBMS = "SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint AS t";
 
   for (const what of ["append", "checkpoint"]) test(`H1 window: a takeover can't commit while a fenced ${what} is past its fence check`, async () => {
@@ -261,7 +267,8 @@ describe.skipIf(!url)("postgres store", () => {
       await blocker.unsafe("BEGIN");
       await blocker.unsafe(`SELECT 1 FROM "${schema}".pl_leases WHERE tenant = $1 AND board = $2 FOR UPDATE`, [T, B]);
       const p = store.acquire(T, B, "h-b", 5_000);
-      await Bun.sleep(800);
+      await waitBlocked(`%INSERT INTO "${schema}".pl_leases%`, "acquire's lease lock, parked behind the blocker");   // it is now waiting, so its clock reading is still to come
+      await Bun.sleep(50);   // margin only: lets the wait span more than the clock's 1 ms, so a now()-stamped expiry reads clearly early. Never a sync point.
       const tr = Number((await blocker.unsafe(DBMS))[0].t);
       await blocker.unsafe("COMMIT");
       expect((await p).expiresAt).toBeGreaterThanOrEqual(tr + 5_000);   // judged after the wait, not at its start
@@ -279,8 +286,7 @@ describe.skipIf(!url)("postgres store", () => {
       await stalled.unsafe(`SELECT epoch FROM "${schema}".pl_leases WHERE tenant = $1 AND board = $2 FOR SHARE`, [T, B]);
       await Bun.sleep(300);
       expect((await store.lease(T, B)).live).toBe(false);
-      const t0 = performance.now();
-      const got = await Promise.race([code(store.acquire(T, B, "h-b", 60_000)), Bun.sleep(3_000).then(() => "still waiting")]);
+      const got = await orHung(code(store.acquire(T, B, "h-b", 60_000)));
       expect(got).toBe("unavailable");                             // a PortError the caller retries, not a hang
       expect(await code(store.renew(T, B, "h-a", 1, 60_000))).toBe("unavailable");   // renew and release are bounded too
       expect(await code(store.release(T, B, "h-a", 1))).toBe("unavailable");
@@ -312,7 +318,7 @@ describe.skipIf(!url)("postgres store", () => {
       for (const call of [() => store.renew(T, B, "h-a", 1, 400), () => store.acquire(T, B, "h-b", 400)]) {
         sets.length = 0;
         const t0 = performance.now();
-        const got = await Promise.race([code(call()), Bun.sleep(3_000).then(() => "still waiting")]);
+        const got = await orHung(code(call()));
         const took = performance.now() - t0;
         expect(got).toBe("unavailable");
         expect(took).toBeGreaterThanOrEqual(150);                  // it did wait on the lock ...
@@ -323,7 +329,7 @@ describe.skipIf(!url)("postgres store", () => {
       await store.release(T, B, "h-a", 1);                         // no ttl: leaseLockTimeoutMs itself bounds it
       expect(lockTimeouts()).toEqual([5_000]);
     } finally { await stalled.unsafe("ROLLBACK").catch(() => {}); stalled.release(); await store.close(); await own.close(); await drop(schema); }
-  }, 20_000);
+  }, 60_000);   // two calls, each may wait HUNG_MS before the test calls it hung
 
   test("M1: a holder paused mid-write is cut off by the server (idle_in_transaction_session_timeout), so the takeover goes through", async () => {
     const schema = schemaName();
@@ -343,7 +349,6 @@ describe.skipIf(!url)("postgres store", () => {
       const p = code(holder.append(T, B, [entry(1)], 0, epoch));
       await atFence;                                                // paused, its FOR SHARE held
       await Bun.sleep(150);                                         // the lease lapses
-      const t0 = performance.now();
       const took = await other.acquire(T, B, "h-b", 60_000);        // waits only until the server ends the paused transaction
       expect(took?.epoch).toBe(epoch + 1);
       resume();

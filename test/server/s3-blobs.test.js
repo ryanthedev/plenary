@@ -111,7 +111,7 @@ test("s3 M1: a refused connection is unavailable, fast; deadlines must be positi
   expect(await code(blobs.put("t-a", sha1(bytes), bytes))).toBe("unavailable");
   const full = { endpoint: "http://127.0.0.1:1", bucket: "b", region: "r", accessKeyId: "k", secretAccessKey: "s" };
   for (const bad of [0, -1, NaN, "5"]) { expect(() => s3Blobs({ ...full, getTimeoutMs: bad })).toThrow(); expect(() => s3Blobs({ ...full, putTimeoutMs: bad })).toThrow(); }
-});
+}, 30_000);   // two refused connections; failure-only ceiling for a loaded machine (TECH-DEBT row 36)
 
 st("s3: a caller-given session token is what gets signed (the store rejects a wrong one)", async () => {
   const png = fakePng(64, 5), h = sha1(png);

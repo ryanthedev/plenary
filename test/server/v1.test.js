@@ -113,7 +113,7 @@ test("the bus cap: `.entries` batches are split under it in seq order, and an op
   const items = entries.map((e, i) => JSON.stringify({ seq: e.seq, text: '"'.repeat(300 + i) }));
   const parts = splitEntries(entries, items, 1500);
   expect(parts.flatMap(p => p.items)).toEqual(items);
-  expect(parts.every(p => JSON.stringify(p).length <= 1500)).toBe(true);
+  expect(parts.every(p => JSON.stringify({ ...p, epoch: Number.MAX_SAFE_INTEGER }).length <= 1500)).toBe(true);
   expect(parts.length).toBeGreaterThan(1);
   expect(parts.map(p => [p.from, p.to])).toEqual(parts.map(p => [JSON.parse(p.items[0]).seq, JSON.parse(p.items.at(-1)).seq]));
 

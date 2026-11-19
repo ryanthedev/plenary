@@ -87,7 +87,7 @@ async function busy({ n = 40, deflate: wrap, zSlack }) {
   const real = zlibDeflate(), land = async () => {
     const e = entry(++seq);
     await raw.append(T, B, [e], seq - 1, epoch);
-    await bus.publish(subjects.entries(T, B), { from: seq, to: seq, items: [JSON.stringify(e)] });
+    await bus.publish(subjects.entries(T, B), { epoch, from: seq, to: seq, items: [JSON.stringify(e)] });
     await bus.flush();
   };
   const feed = boardFeed({ tenant: T, board: B, store: raw, bus, onLive() {}, ...(zSlack ? { zSlack } : {}),
@@ -143,7 +143,7 @@ test("F1: a chunk that closes after its prefix was compressed still goes as pref
   const add = async (from, to) => {
     const items = Array.from({ length: to - from + 1 }, (_, k) => entry(from + k));
     await raw.append(T, B, items, from - 1, epoch);
-    await bus.publish(subjects.entries(T, B), { from, to, items: items.map(x => JSON.stringify(x)) });
+    await bus.publish(subjects.entries(T, B), { epoch, from, to, items: items.map(x => JSON.stringify(x)) });
     await bus.flush(); await feed.atomically(() => {});
   };
   await add(21, 60);                                                        // the first chunk closes; later ones open
@@ -171,7 +171,7 @@ async function held({ n }) {
   const add = async k => {
     const items = Array.from({ length: k }, (_, i) => entry(seq + 1 + i)), from = seq + 1; seq += k;
     await raw.append(T, B, items, from - 1, epoch);
-    await bus.publish(subjects.entries(T, B), { from, to: seq, items: items.map(x => JSON.stringify(x)) });
+    await bus.publish(subjects.entries(T, B), { epoch, from, to: seq, items: items.map(x => JSON.stringify(x)) });
     await bus.flush(); await feed.atomically(() => {});
   };
   const gate = pred => { let open; const g = new Promise(r => { open = r; }); hold = d => (pred(d) ? g : null); holds.push(open); return open; };

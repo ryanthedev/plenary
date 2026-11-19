@@ -136,7 +136,7 @@ up (`to_regclass`) and create only what is missing. They never ALTER, DROP or GR
 
 | Role | Rights | Used by |
 |---|---|---|
-| owner (`plenary_owner`) | owns the database, so its `public` schema (Postgres 15+); creates the tables | the migrate step, once per schema and after an upgrade that adds a table |
+| owner (`plenary_owner`) | owns the database, so its `public` schema (Postgres 15+); creates the tables | the migrate step, once per schema and after any upgrade that adds a table or an index (see the upgrade note below) |
 | runtime (`plenary_app`) | `USAGE` on the schema; `SELECT, INSERT, UPDATE, DELETE` on its tables; no `CREATE` | every node's `DATABASE_URL` |
 
 Dev, CI and `cluster.compose.yml` use one owner role for both, which also works: the first node to start creates
@@ -166,6 +166,11 @@ await (await postgresRegistry({ url, schema })).close();
 await (await postgresStore({ url, schema })).close();
 console.log("migrated", schema);'
 ```
+
+**Upgrading.** Run step 2 again, as the owner, **before** starting upgraded nodes under the runtime role: start-up as a role without
+`CREATE` on the schema cannot add a table or an index, and refuses with the privilege error naming this step. What adds objects:
+the #48 release (Spaces and Groups pages) adds the index `reg_spaces_grp` on `reg_spaces (grp, id)`, which pages a Group's Spaces
+and finds a Space's Group. Nothing is altered or dropped; a one-owner database needs no extra step (the first node creates it).
 
 **3. Grant the runtime role, as the owner** (`psql` on database `plenary`). Identity columns need no sequence grant.
 The `DEFAULT PRIVILEGES` line covers tables the owner creates later, so a migrate that adds a table needs no new grant:

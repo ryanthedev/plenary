@@ -16,7 +16,7 @@
 // text) resolves to null / [] / false (PROTOCOL.md § Auth: null = `auth`, a throw = `unavailable`).
 //
 // Least privilege (PROTOCOL.md § Store, "Least privilege"; the Registry too): start-up creates only what is missing
-// (migrate() in server/pg/schema.js for the tables, the same to_regclass look-up here for the two indexes), so the
+// (migrate() in server/pg/schema.js for the tables, the same to_regclass look-up here for the indexes of REGISTRY_INDEXES), so the
 // server may run as a role with USAGE on the schema and SELECT/INSERT/UPDATE/DELETE on these tables, against a schema
 // an owner role created ahead of time. Nothing here ever ALTERs, DROPs or GRANTs. A start-up refused for lack of a
 // privilege (a missing table with no CREATE right, or no USAGE) throws "postgres registry: start-up in schema … was
@@ -203,7 +203,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     }
     if (err?.errno === DENIED) {
       throw Object.assign(new Error(`postgres registry: start-up in schema "${s}" was refused for lack of a privilege (${err.message}). `
-        + "If tables are missing, run the migrate step as the schema owner; otherwise grant this role USAGE on the schema "
+        + "If tables or indexes are missing, run the migrate step as the schema owner; otherwise grant this role USAGE on the schema "
         + "and SELECT, INSERT, UPDATE, DELETE on its tables (deploy/README.md, Postgres roles)", { cause: err }), { code: "denied" });
     }
     throw err;

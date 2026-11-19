@@ -2,16 +2,22 @@
 # for real use. Layered on top of the cluster file: `-f deploy/cluster.compose.yml -f deploy/cluster.compose.test.yml`.
 #
 # What it changes, and why:
-#  - Every app node has BOTH roles (gateway,host). The takeover check needs a second host to take over a killed one, and
-#    the three-node shape of the cluster file has one host (app-3). The test connects clients to the nodes directly, so
-#    the `lb` service is not started (the script names the services it starts).
-#  - restart: "no". A SIGKILLed node must stay dead until the test restarts it; the runtime must not do it first.
 #  - Each app node and the Postgres service publish a random free port on 127.0.0.1 (the script reads them with
-#    `compose port`), so no fixed host port can collide with anything.
+#    `compose port`), so no fixed host port can collide with anything. The test connects clients to the nodes directly, so
+#    the `lb` service is not started (the script names the services it starts).
+#  - restart: "no" on the app nodes. The test kills a node with SIGKILL and decides itself when it comes back (the cluster
+#    file's `unless-stopped` would race it); one case restarts a node at once to model that race.
 #  - PLENARY_LEASE_TTL_MS 3000 (the cluster file's default is 10000): a killed host's lease lapses in at most 3 s, so
 #    takeover is fast. The ttl must be identical on every node (set once, on all three, here).
 #  - CPU and memory limits, so the stack cannot starve a busy machine.
-# PLENARY_DEV_TOKENS comes from the script's environment (dev tokens that exist only for this run).
+#  - An owner label on every container, the network and the volumes (and the script puts the same on the image):
+#    host, boot id, pid and process start time of the run that made them, so a later run removes only what a provably
+#    dead run of this host left behind.
+# PLENARY_DEV_TOKENS and C3_OWNER come from the script's environment (they exist only for this run).
+# The roles are NOT overridden: the cluster file already runs every node as gateway,host.
+
+x-owner: &owner
+  plenary.c3.owner: ${C3_OWNER:?set by scripts/test-compose.js}
 
 x-test-app: &test-app
   restart: "no"
@@ -19,9 +25,9 @@ x-test-app: &test-app
     - "127.0.0.1::8080"
   cpus: 0.75
   mem_limit: 384m
+  labels: *owner
 
 x-test-env: &test-env
-  PLENARY_ROLES: gateway,host
   PLENARY_LEASE_TTL_MS: "3000"
 
 services:
@@ -30,12 +36,19 @@ services:
       - "127.0.0.1::5432"
     cpus: 1.0
     mem_limit: 512m
+    labels: *owner
   nats:
     cpus: 0.5
     mem_limit: 128m
+    labels: *owner
   blobs:
     cpus: 0.5
     mem_limit: 256m
+    labels: *owner
+  blobs-init:
+    labels: *owner
+  image-build:
+    labels: *owner
   app-1:
     <<: *test-app
     environment: *test-env
@@ -45,3 +58,13 @@ services:
   app-3:
     <<: *test-app
     environment: *test-env
+
+networks:
+  default:
+    labels: *owner
+
+volumes:
+  postgres-data:
+    labels: *owner
+  blobs-data:
+    labels: *owner

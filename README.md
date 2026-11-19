@@ -106,8 +106,8 @@ bun test
 - **CI** runs `bun test` on every push and pull request.
 - **`bun run test:compose`** (#71): the three-node cluster test on a container runtime. Not part of `bun test` or
   `bun run test:cluster`. Builds the image, starts Postgres, NATS, MinIO and three nodes as Compose project
-  `plenary-c3-<pid>`, checks sequencing, viewer fan-out, SIGKILL takeover of the board's host (acked ops all survive,
-  higher epoch) and a node rejoin, then removes everything and verifies nothing is left. About 25 s warm. Uses docker, else
+  `plenary-c3-<pid>`, checks sequencing, viewer fan-out (and a viewer's op refused), four SIGKILL cases (the board's host, the host restarted
+  at once, a host with no client, a plain gateway; acked ops all survive, lease epoch rises) and a node rejoin, then removes everything and verifies nothing is left. About 100 s warm. Uses docker, else
   podman (`CONTAINER_CLI` overrides). Without a runtime it prints a loud SKIPPED banner and exits 0 (`--require`
   exits 1). Details: `deploy/README.md` "Cluster test on containers".
 - **Plain JS + JSDoc, no build step.** `packages/protocol` must also load in runtimes without browser or Node

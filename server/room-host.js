@@ -343,7 +343,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   function watch(tenant, board, key, lease) {
     if (closed || watches.has(key)) return;
     const t = perf();
-    const w = { key, tenant, board, heardAt: t, wanted: t, epoch: null, timer: null, silence: null, attempting: false, pending: [],
+    const w = { key, tenant, board, heardAt: t, wanted: t, epoch: Number.isSafeInteger(lease?.epoch) ? lease.epoch : null, timer: null, silence: null, attempting: false, pending: [],
       unsubEntries: () => {}, unsubInbox: () => {} };
     watches.set(key, w);
     w.unsubEntries = bus.subscribe(subjects.entries(tenant, board), m => {
@@ -371,8 +371,10 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
    * holder let the board go; answer the held hellos and try to take it at once (L2).
    */
   function watchEntries(w, m) {
-    w.heardAt = perf();
     const ep = Number.isSafeInteger(m?.epoch) ? m.epoch : null;
+    // A late message from an older incarnation (a dead holder's, delayed on the bus) proves nothing about the holder now.
+    if (ep !== null && w.epoch !== null && ep < w.epoch) return;
+    w.heardAt = perf();
     const fresh = m?.opened === true || (ep !== null && w.epoch !== null && ep > w.epoch);
     if (ep !== null && (w.epoch === null || ep > w.epoch)) w.epoch = ep;
     if (m?.released === true) { answerHeld(w); clearTimeout(w.silence); attemptNow(w); return; }

@@ -1400,6 +1400,31 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   silence lasts. The poll needs no room, so it also works after the room stopped or its host died (viewers never
   restart a room). Guaranteed: every connected client gets every resolved entry, in order, within about 5 s of
   the bus going quiet. Delivery to clients is effectively at-least-once, eventually consistent.
+- **The heartbeat, exactly.** Publisher: the room host (`server/room-host.js`), one message per board it holds a live
+  room for, on `.entries`, every `heartbeatMs` (2,000 ms) from one timer of the host (all boards beat on the same tick:
+  a burst of N publishes, no jitter). Payload `{ seq, epoch, cp }`: `seq` = the resolved seq (never the speculative
+  one), `epoch` = the room's epoch (the lease's, § Recovery, Room identity), `cp` = newest durable checkpoint (below).
+  Two variants share the shape: `{ seq, epoch, cp, opened: true }` once at room build, before the inbox is served, and
+  `{ seq, epoch, cp, released: true }` after a clean stop. A host whose lease renew deadline has passed publishes
+  nothing and stops the room instead. Consumers and what each does with it:
+  (1) **gateway feed** (`server/feed.js`): resets its 5 s silence timer; reads the Store when `seq` is above its own
+  (a lost last entry); raises its epoch (never lowers: a late or duplicate beat with a lower `epoch`, `seq` or `cp` changes
+  nothing); records `cp` (max) to decide a re-base. (2) **waiting host** (a host that found another host's live lease,
+  `watchEntries`): any message from the current or a newer epoch counts as "the holder is alive" and re-arms its
+  silence timer (2 x `heartbeatMs`); a message with an epoch **below** the highest it knows (seeded from the lease it
+  read) is a late one from a dead incarnation and counts for nothing, `released` included. `opened`, or an epoch above
+  the last one heard, answers the held hellos `unavailable`; `released` (current epoch) makes it try the lease at once.
+  **A heartbeat never grants or moves the lease**: it only decides *when* a waiting host asks. The Store's
+  `acquire` is the sole arbiter (live lease: refused; otherwise a new, higher epoch, and the old holder is fenced on its
+  next write or renew). So a missed, late, duplicate or forged heartbeat can cause an early *attempt* (one Store read,
+  refused while the lease is live, then the next try at the lease's remaining time + a margin, at least every ttl/3)
+  and never a wrong takeover. Missing beats: a gateway polls the Store after 5 s of silence (feed stays correct, at most
+  ~5 s late); a waiting host attempts after 2 beats of silence. Cost: 1 message per hosted board per 2 s (30 per
+  minute, 26 bytes each as JSON with small numbers, 780 B per board per minute; measured on virtual time by
+  test/server/heartbeat.test.js: 1, 100 and 1,000 boards give exactly 30, 3,000 and 30,000 messages a minute, and a
+  whole beat tick costs about 0.01, 0.14 and 0.35 ms of CPU with the in-memory bus); the beat loop does no Store
+  work. Batching across boards is not done: subjects are per board and a gateway subscribes per board, so a batch
+  would have to be fanned out again on every gateway.
 - **`cp`, the latest durable checkpoint.** The heartbeat's `cp` is the `seq` of the newest checkpoint the room
   knows is in the Store: the one it was rebuilt from, or a later one whose write the Store has acknowledged (0 =
   none). A checkpoint is announced only after its write succeeds, never when it is taken, so `cp` never names a

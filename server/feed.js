@@ -164,8 +164,11 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
 
   async function onMessage(m) {
     // Traffic from a lower epoch (a dead incarnation's, late on the bus) is not "the room is alive": the silence poll must still run.
-    if (Number.isSafeInteger(m?.epoch) && m.epoch >= self.epoch) self.lastHeard = now();
-    if (Number.isSafeInteger(m?.epoch) && m.epoch > self.epoch) self.epoch = m.epoch;
+    // `released` is a host leaving (a clean stop, or a build that failed and gave the board back): no room is alive behind it, and a
+    // failed build's epoch belongs to a room that never served. It neither counts as liveness nor raises the epoch (it still carries a `cp`).
+    const left = m?.released === true;
+    if (!left && Number.isSafeInteger(m?.epoch) && m.epoch >= self.epoch) self.lastHeard = now();
+    if (!left && Number.isSafeInteger(m?.epoch) && m.epoch > self.epoch) self.epoch = m.epoch;
     if (Array.isArray(m?.items) && Number.isSafeInteger(m.from)) {
       if (m.to <= self.seq) return;
       if (m.from > self.seq + 1) await repair(m.from - 1);

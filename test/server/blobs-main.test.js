@@ -68,4 +68,4 @@ test("main.js refuses a half-set S3 config and a bad quota, naming the variables
     expect(p.out.err + p.out.text).not.toContain("hush-secret");
     expect(p.out.err + p.out.text).not.toContain("hush-pw");
   }
-});
+}, 60_000);   // seven `bun server/main.js` start-ups in a row: failure-only ceiling for a loaded machine (TECH-DEBT row 36)

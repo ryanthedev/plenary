@@ -72,6 +72,6 @@ export function accessEquivalence(name, makeRegistry, { seeds = [7, 19, 101], cl
         }
         expect(open).toBeGreaterThan(40);                                        // the scenario isn't vacuous
       } finally { await cleanup?.(r); }
-    });
+    }, 60_000);          // Postgres runs a few hundred statements per case; the 5 s default is for in-process adapters
   }
 }

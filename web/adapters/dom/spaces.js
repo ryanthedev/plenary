@@ -41,6 +41,9 @@ export function overflowMenu({ label, items }) {
   return { el: wrap, button, close: () => close(false) };
 }
 
+/** Focus an input and select its text once it is in the page (so typing replaces the old title). */
+const focusSelect = el => { globalThis.queueMicrotask?.(() => { el.focus?.(); el.select?.(); }); return el; };
+
 /** The page chrome shared by both pages. */
 function shell(root, hrefs) {
   const status = h("div.home-status", { role: "status", "aria-live": "polite", hidden: true });
@@ -64,17 +67,24 @@ const gate = (S, main, retry, signIn) => {
   return false;
 };
 
-/** A title that turns into an input on demand (rename in place). */
-function titleEditor({ text, canRename, editing, onStart, onSave, onCancel, label }) {
-  if (!editing) return h("h1", { id: "page-title", tabindex: "-1" }, text);
-  let done = false;
-  const finish = (save, el) => { if (done) return; done = true; if (save) onSave(el.value); else onCancel(); };
-  const input = h("input.field.rename", { type: "text", value: text, maxlength: "200", "aria-label": label, onkeydown: e => {
-    if (e.key === "Enter") { e.preventDefault?.(); finish(true, e.currentTarget); }
-    else if (e.key === "Escape") { e.preventDefault?.(); e.stopPropagation?.(); finish(false, e.currentTarget); }
-  }, onblur: e => finish(true, e.currentTarget) });
-  globalThis.queueMicrotask?.(() => { input.focus?.(); input.select?.(); });
-  return h("h1", {}, input);
+/**
+ * A title that turns into an input on demand (rename in place). The input lives in `session.el` for the whole edit: a re-render while the
+ * save is in flight (the model announces `busy`) must not rebuild it, or the old input's removal fires a blur that would save the OLD text
+ * over the new name. The blur only saves while the input is still the session's.
+ */
+function titleEditor({ text, editing, session, onSave, onCancel, label }) {
+  if (!editing) { session.el = null; return h("h1", { id: "page-title", tabindex: "-1" }, text); }
+  if (!session.el) {
+    let done = false;
+    const finish = (save, el) => { if (done || session.el !== el) return; done = true; Promise.resolve(save ? onSave(el.value) : onCancel()).finally(() => { done = false; }); };
+    session.el = h("input.field.rename", { type: "text", value: text, maxlength: "200", "aria-label": label, onkeydown: e => {
+      if (e.key === "Enter") { e.preventDefault?.(); finish(true, e.currentTarget); }
+      else if (e.key === "Escape") { e.preventDefault?.(); e.stopPropagation?.(); finish(false, e.currentTarget); }
+    }, onblur: e => finish(true, e.currentTarget) });
+    const el = session.el;
+    globalThis.queueMicrotask?.(() => { el.focus?.(); el.select?.(); });
+  }
+  return h("h1", {}, session.el);
 }
 
 /**
@@ -88,6 +98,7 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null }) {
   const { status, main } = shell(root, hrefs);
   /** @type {null | { type: "title" } | { type: "board", id: string }} */
   let editing = null;
+  const title = {};
   const stop = () => { editing = null; render(); };
 
   function card(c, can) {
@@ -98,10 +109,10 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null }) {
       { text: "Rename", hidden: !c.can?.rename, onSelect: () => { editing = { type: "board", id: c.id }; render(); } },
     ] });
     return h("li.card", {},
-      rename ? h("div.card-open", {}, h("input.field.rename", { type: "text", value: c.title, maxlength: "200", "aria-label": "Board title", onkeydown: e => {
+      rename ? h("div.card-open", {}, (() => { const i = focusSelect(h("input.field.rename", { type: "text", value: c.title, maxlength: "200", "aria-label": "Board title", onkeydown: e => {
         if (e.key === "Enter") { e.preventDefault?.(); const el = e.currentTarget; model.renameBoard(c.id, el.value).then(stop); }
         else if (e.key === "Escape") { e.preventDefault?.(); stop(); }
-      } }), h("span.p", {}, "Enter to save, Escape to cancel"))
+      } })); return i; })(), h("span.p", {}, "Enter to save, Escape to cancel"))
         : h("a.card-open", { href: hrefs.board(c.id) }, h("span.t", {}, c.title || "Untitled"), h("span.p", {}, where)),
       h("span.card-menu", {}, menu.el));
   }
@@ -119,7 +130,7 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null }) {
       { text: "General access…", hidden: !p.can.general, onSelect: b => dialogs.general({ opener: b, current: sp.general, onSave: r => model.setGeneral(r) }) },
     ] }) : null;
     const head = h("div.sp-head", {},
-      titleEditor({ text: sp.name, editing: editing?.type === "title", label: "Space name",
+      titleEditor({ text: sp.name, editing: editing?.type === "title", session: title, label: "Space name",
         onSave: v => model.rename(v).then(ok => { editing = ok ? null : editing; render(); if (ok) globalThis.document?.getElementById?.("page-title")?.focus?.(); }), onCancel: stop }),
       h("span.badge", {}, sp.personal ? "Personal · only you" : "Space"), h("span.spacer"), newBoard, menu?.el);
     const sub = h("p.sub-h", {}, sp.personal ? "Only you can see what's here until you share it." : generalText(sp.general));
@@ -138,6 +149,7 @@ export function mountGroupPage({ root, model, dialogs, hrefs, signIn = null }) {
   const S = model.state;
   const { status, main } = shell(root, hrefs);
   let editing = false;
+  const title = {};
 
   function render() {
     showNotice(status, model);
@@ -149,7 +161,7 @@ export function mountGroupPage({ root, model, dialogs, hrefs, signIn = null }) {
       { text: "General access…", hidden: !p.can.general, onSelect: b => dialogs.general({ opener: b, current: g.general, onSave: r => model.setGeneral(r) }) },
     ] }) : null;
     const head = h("div.sp-head", {},
-      titleEditor({ text: g.name, editing, label: "Group name",
+      titleEditor({ text: g.name, editing, session: title, label: "Group name",
         onSave: v => model.rename(v).then(ok => { editing = ok ? false : editing; render(); }), onCancel: () => { editing = false; render(); } }),
       h("span.badge", {}, "Group"), h("span.spacer"), newSpace, menu?.el);
     const empty = groupEmpty(p, g.name);

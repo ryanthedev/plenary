@@ -120,7 +120,7 @@ either file's source is in those lists and the other way round, and that this ta
 The exchange step can fail separately: the page says "sign-in failed (invalid-code)". That is the 60 s exchange
 window or a dropped exchange cookie. Sign in again.
 
-If `POST /boards` gives **403 `forbidden`**, the admin match failed. Admin by email needs Google to vouch for the
+If `POST /boards` gives **403 `forbidden`**, the caller has no tenant (a user whose domain has no Unit is a guest and makes no boards), or names a Space they can't create in. For a tenant that does not exist yet, the first admin must match. Admin by email needs Google to vouch for the
 email: the account's Workspace domain (`hd`) must equal the email's domain. A Workspace account whose address is on a
 secondary domain gets no email from the server, so it can't match an email admin.
 

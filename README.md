@@ -60,7 +60,8 @@ to any page on this machine's loopback names, and the log says so; tokens with `
 | Protocol | The v1.1 spec in code: envelope and codec, a client `Replica`, a reference `Room` (one sequencer per board), recovery from checkpoints, presence (cursors, selections, laser, emotes), comment and reaction records, settings compare-and-set. Clients converge in tests. | `packages/protocol/`, `test/convergence.test.js`, `test/recovery.test.js`, `test/presence.test.js`, `test/records.test.js`, `test/v11.test.js` |
 | Single-node server | One Bun process: WebSocket gateway plus room host, SQLite op log and SQLite registry (boards and their ops survive a restart or `kill -9`), in-memory bus, local-disk blob store, structured JSON logs, `GET /health`. | `server/main.js`, `test/server/main.test.js` |
 | Sign-in | Google sign-in (OIDC) with a one-time code exchanged for a session token (`/auth/login`, `/auth/callback`, `/auth/exchange`, `/auth/logout`), mounted in the server. It is on only when `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are set; otherwise login, callback and exchange answer 503. A session token joins a board over the WebSocket and the socket closes when it expires. Dev tokens for local use (`PLENARY_DEV_TOKENS`): the served page offers them at `?as=<name>` and as buttons, and only while they are on (`GET /auth/dev`). | `server/auth/`, `test/auth/`, `test/server/revocation.test.js` |
-| Admin API | `POST /boards`, invites, share links and grants over HTTP. Grant changes close live connections that lost their role. A first tenant admin comes from "Creating a tenant" below. | `server/auth/http.js`, `server/admin/boards.js`, `test/auth/http.test.js`, `test/server/main.test.js` |
+| Boards, Spaces and Groups | `POST /boards` (a Unit member makes boards in their personal space, or in a Space where they hold `board.create`), `POST /spaces`, Space and Group pages, New board and New space pickers, rename, general access (PROTOCOL.md § Spaces and Groups). | `server/auth/spaces.js`, `web/adapters/dom/spaces.js`, `test/auth/spaces.test.js` |
+| Admin API | invites, share links and grants over HTTP. Grant changes close live connections that lost their role. A first tenant admin comes from "Creating a tenant" below. | `server/auth/http.js`, `server/admin/boards.js`, `test/auth/http.test.js`, `test/server/main.test.js` |
 | Cluster mode | `server/main.js` runs as a cluster node when both `DATABASE_URL` and `NATS_URL` are set: Postgres store and registry, NATS bus, one room host per board under a store lease with takeover, and `PLENARY_ROLES` to split gateway and host nodes. Blobs stay on local disk (nothing writes blobs yet); the S3 adapter is tested but not wired. Each adapter has its port's contract test, which CI's second job runs against real services. Exercised end to end only through the local rig and the tests. | `server/store/postgres.js`, `server/registry/postgres.js`, `server/bus/nats.js`, `server/blobs/s3.js`, `scripts/cluster-rig.js`, `test/server/` |
 | Web canvas | The canvas UI from the design mock (tools, properties panel, layers, library, export, role gating, a connection pill), **served by the server at `/`** and synced over `/ws`. `web/dev-main.html` is a dev-only copy whose boards run inside the browser. | `web/index.html`, `web/main.js`, `web/adapters/`, `test/web/` |
 | Collaboration UI | Avatars (people who can draw), a viewers count, others' cursors and selections, laser, emotes, reactions, comment threads, notes. In the served page over the board connection. | `web/adapters/dom/collab/`, `web/adapters/collab/sync.js`, `test/web/collab/` |
@@ -121,7 +122,7 @@ bun server/main.js
   first message (`hello`), never in a header or the URL. With the command above, a `hello` carrying `dev-token`
   and the dev board's id is welcomed as `dev:ann`.
 - **Dev tokens are for local use only.** Without `PLENARY_DEV_TOKENS` there is no dev board and no dev sign-in; boards
-  then come from `POST /boards` by a tenant admin (see "Creating a tenant").
+  then come from `POST /boards` by a member of a Unit (see "Creating a tenant").
 - **Bun loads `.env`** from the current directory, so a `.env` with `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`
   turns Google sign-in on even in the command above. Without them, `/auth/login`, `/auth/callback` and
   `/auth/exchange` answer 503. For a working sign-in, use the next command instead, not `PORT=0`.
@@ -147,7 +148,7 @@ PORT=8080 PLENARY_DATA_DIR="$(mktemp -d)" OIDC_REDIRECT_URI=http://localhost:808
 
 ### Creating a tenant
 
-`POST /boards` needs a caller who is an admin of a tenant (a Google Workspace domain). Two ways to make the first admin:
+`POST /boards` needs a caller who belongs to a tenant (a Google Workspace domain): any member makes boards in their personal space, and in Spaces where they hold `board.create`. A tenant needs at least one admin to exist; two ways to make the first one:
 
 - **Dev tokens:** a token with `"domain"` and `"admin": true` makes that domain's tenant at start and adds the user as
   its admin, for example `{"tok-ann":{"name":"ann","domain":"acme.test","admin":true}}`. Then

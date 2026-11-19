@@ -109,6 +109,28 @@ test("rename in place: the title becomes an input; Enter saves through the port;
   expect(textOf(root.find(e => e.tagName === "H1"))).toBe("Brand");
 });
 
+test("the blur of the removed input never saves the old name over the new one; a refused save can be retried with Enter", async () => {
+  await spacePage();
+  btn("Space options").click(); root.findAll(e => e.getAttribute("role") === "menuitem")[0].click();
+  const i = root.find(e => e.getAttribute("aria-label") === "Space name");
+  i.value = "Brand"; key(i, "Enter");
+  expect(root.find(e => e.getAttribute("aria-label") === "Space name")).toBe(i);     // the same input survives the busy re-render
+  await settle();
+  i.dispatch("blur");                                                                 // what the browser fires when the input leaves the page
+  await settle();
+  expect(calls.filter(c => c[0] === "updateSpace")).toEqual([["updateSpace", "s-1", { name: "Brand" }]]);
+  expect(textOf(root.find(e => e.tagName === "H1"))).toBe("Brand");
+  // refused, then retried
+  let refuse = true;
+  api.answer = (n, id, p) => (n === "updateSpace" ? (refuse ? { error: "unavailable" } : { space: { id, name: p.name, personal: false, general: "viewer", group: null } }) : undefined);
+  btn("Space options").click(); root.findAll(e => e.getAttribute("role") === "menuitem")[0].click();
+  const j = root.find(e => e.getAttribute("aria-label") === "Space name");
+  j.value = "Again"; key(j, "Enter"); await settle();
+  expect(root.find(e => e.getAttribute("aria-label") === "Space name")).toBe(j);
+  refuse = false; key(j, "Enter"); await settle();
+  expect(textOf(root.find(e => e.tagName === "H1"))).toBe("Again");
+});
+
 test("a refused rename keeps editing open and shows why", async () => {
   await spacePage();
   api.answer = (n) => (n === "updateSpace" ? { error: "forbidden" } : undefined);

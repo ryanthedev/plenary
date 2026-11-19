@@ -30,7 +30,7 @@ nothing is registered or published yet. Do not create GitHub repos, orgs, npm pa
   **Postgres + NATS**, S3-compatible blobs. Logs go to the terminal (structured).
 - **Sign-in:** dev tokens, then Google (OIDC) with the OAuth client in the maintainer's Google Cloud
   project; client id/secret from env only. **Tenant = Google Workspace domain; anyone else by invite or
-  share link.** Boards are created by an admin endpoint (`POST /boards`), never by a hello.
+  share link.** Boards are created by `POST /boards` (a Unit member, by `board.create` at a Space or in their personal space), never by a hello.
 - **Full canvas UI** over core's Editor (design mock approved before building) and **full collaboration**:
   annotations, cursors, avatars, selections, laser, draw, highlighter, emotes, reactions, comment threads,
   a connection status pill.

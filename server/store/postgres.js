@@ -49,7 +49,7 @@
 import { SQL } from "bun";
 import { needId, PortError, mintClusterId } from "../ids.js";
 import { encodeSliced } from "../encode/sliced.js";
-import { PART_CHARS, splitParts, headerOf, parseHeader, orphanGroups } from "../encode/cp-parts.js";
+import { PART_CHARS, splitParts, headerOf, parseHeader, orphanGroups, headerLike } from "../encode/cp-parts.js";
 import { needSchema, migrate } from "../pg/schema.js";
 
 const MAX_READ = 10_000;
@@ -101,7 +101,7 @@ const MAX_TTL = 10 * 60_000;
  *   txIdleTimeoutMs: a write transaction idle this long (its client paused mid-write) is ended by the server (default 5 s).
  *   leaseLockTimeoutMs: the longest a lease call waits on a row lock (default 2 s, at most half its ttl), then "unavailable".
  *   partChars: the most chars in one checkpoint part (default 1 Mi). onPart: test hook, awaited before each part
- *   ("part:<n>") and before the header ("header"); a throw aborts the write there.
+ *   ("part:<n>"), before the header ("header") and before each orphan group's delete ("sweep"); a throw aborts the write there (a sweep never fails a write).
  * @returns {Promise<{ append: Function, read: Function, lastSeq: Function, putCheckpoint: Function,
  *   getCheckpoint: Function, openEpoch: Function, epoch: Function, acquire: Function, renew: Function,
  *   release: Function, lease: Function, settings(): Promise<object>, clusterId(): Promise<string>, close(): Promise<void> }>}
@@ -196,7 +196,13 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
       const gone = orphanGroups(await db.unsafe(`SELECT seq, data FROM ${C} WHERE tenant = $1 AND board = $2`, [tenant, board]),
         await db.unsafe(`SELECT DISTINCT seq, wid FROM ${CP} WHERE tenant = $1 AND board = $2`, [tenant, board]));
       if (mine && !gone.some(g => g.wid === mine.wid)) gone.push(mine);   // an aborted write's own, whatever the newest header
-      for (const g of gone) await db.unsafe(`DELETE FROM ${CP} WHERE tenant = $1 AND board = $2 AND seq = $3 AND wid = $4`, [tenant, board, g.seq, g.wid]);
+      // Under the board's checkpoint lock (the header's transaction takes it too) and only while no header names the write: a
+      // header that lands while the sweep runs (a slow write finishing) keeps its parts.
+      for (const g of gone) { await onPart?.("sweep"); await db.begin(async tx => {
+        await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-cp:${s}:${tenant}:${board}`]);
+        await tx.unsafe(`DELETE FROM ${CP} WHERE tenant = $1 AND board = $2 AND seq = $3 AND wid = $4
+          AND NOT EXISTS (SELECT 1 FROM ${C} WHERE tenant = $1 AND board = $2 AND seq = $3 AND data LIKE $5)`, [tenant, board, g.seq, g.wid, headerLike(g.wid)]);
+      }); }
     } catch { /* best effort: the next checkpoint's sweep takes what is left */ }
   };
 
@@ -298,6 +304,7 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
         await onPart?.("header");
         await write(async tx => {
           await fence(tx, tenant, board, epoch);
+          await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-cp:${s}:${tenant}:${board}`]);   // vs a sweep's delete
           const [{ c }] = await tx.unsafe(`SELECT count(*)::int AS c FROM ${CP} WHERE tenant = $1 AND board = $2 AND seq = $3 AND wid = $4`, [tenant, board, cp.seq, wid]);
           if (c !== parts.length) throw new PortError("unavailable", "a checkpoint part is missing: try again");
           await put(tx, headerOf(wid, parts.length, text.length)); await prune(tx);
@@ -311,20 +318,24 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
       ready(tenant, board);
       if (beforeSeq !== undefined && (!Number.isSafeInteger(beforeSeq) || beforeSeq < 0)) throw new PortError("bad-entry", "beforeSeq must be a non-negative integer");
       // A header may name parts a newer checkpoint's prune has just removed: look again (it then finds a newer header).
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const rows = await db.unsafe(`SELECT seq, data FROM ${C} WHERE tenant = $1 AND board = $2 AND seq < $3
-          ORDER BY seq DESC LIMIT 1`, [tenant, board, beforeSeq ?? Number.MAX_SAFE_INTEGER]);
-        if (!rows.length) return null;
-        const head = parseHeader(rows[0].data);
-        if (!head) return JSON.parse(rows[0].data);
-        const seq = Number(rows[0].seq);
-        const got = await db.unsafe(`SELECT data FROM ${CP} WHERE tenant = $1 AND board = $2 AND seq = $3 AND wid = $4 ORDER BY n`, [tenant, board, seq, head.wid]);
-        if (got.length !== head.parts) continue;
-        const text = got.map(r => r.data).join("");
-        if (text.length !== head.chars) throw new PortError("corrupt", `checkpoint ${seq}'s parts hold ${text.length} chars, not ${head.chars}`);
-        return JSON.parse(text);
+      // A header whose parts stay missing is a bad checkpoint: skipped, so the caller gets the next one below it.
+      for (let below = beforeSeq ?? Number.MAX_SAFE_INTEGER; ;) {
+        let text = null, seq;
+        for (let attempt = 0; attempt < 3 && text === null; attempt++) {
+          const rows = await db.unsafe(`SELECT seq, data FROM ${C} WHERE tenant = $1 AND board = $2 AND seq < $3
+            ORDER BY seq DESC LIMIT 1`, [tenant, board, below]);
+          if (!rows.length) return null;
+          const head = parseHeader(rows[0].data);
+          if (!head) return JSON.parse(rows[0].data);
+          seq = Number(rows[0].seq);
+          const got = await db.unsafe(`SELECT data FROM ${CP} WHERE tenant = $1 AND board = $2 AND seq = $3 AND wid = $4 ORDER BY n`, [tenant, board, seq, head.wid]);
+          if (got.length !== head.parts) continue;
+          text = got.map(r => r.data).join("");
+          if (text.length !== head.chars) throw new PortError("corrupt", `checkpoint ${seq}'s parts hold ${text.length} chars, not ${head.chars}`);
+        }
+        if (text !== null) return JSON.parse(text);
+        below = seq;
       }
-      throw new PortError("unavailable", "a checkpoint's parts kept changing under the read: try again");
     },
 
     /**

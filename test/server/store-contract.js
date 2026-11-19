@@ -240,7 +240,7 @@ export function storeContract(name, make) {
       const seen = [];
       let abortAt = null, store;
       const { store: s, raw } = await fresh({ partChars: PART, onPart: async step => {
-        if (abortAt === null) return;
+        if (abortAt === null || step === "sweep") return;
         seen.push([step, (await store.getCheckpoint(T, B))?.seq]);
         if (step === abortAt) throw new Error("simulated crash");
       } });
@@ -268,7 +268,7 @@ export function storeContract(name, make) {
       for (const at of ["part:0", "part:2", "header"]) {
         let takeover = null;
         const steps = [];
-        const { store, raw } = await fresh({ partChars: PART, onPart: async step => { if (takeover) steps.push(step); if (step === at && takeover) await takeover(); } });
+        const { store, raw } = await fresh({ partChars: PART, onPart: async step => { if (step === "sweep") return; if (takeover) steps.push(step); if (step === at && takeover) await takeover(); } });
         const e = await own(store);
         await store.putCheckpoint(T, B, big(10, "old"), e);
         const before = await raw.partRows(T, B);
@@ -303,6 +303,25 @@ export function storeContract(name, make) {
       expect((await store.getCheckpoint(T, B, 30)).tag).toBe("c20");
     });
 
+    test("parts: a stale write's header landing while a sweep is yielding keeps its parts; the checkpoint under the newest reads complete", async () => {
+      let gateA = null, holdA = false, swept = false, slowDone = null;
+      const { store, raw } = await fresh({ partChars: PART, onPart: async step => {
+        if (holdA && step === "header") { holdA = false; await gateA.promise; return; }
+        if (step === "sweep" && slowDone && !swept) { swept = true; gateA.resolve(); await slowDone; }   // seq 25's header commits between the sweep's steps
+      } });
+      const e = await own(store);
+      await raw.putPartRow(T, B, 5, "crashed-wid", 0, "x");                              // a second orphan group, so the sweep has steps
+      gateA = Promise.withResolvers(); holdA = true;
+      slowDone = store.putCheckpoint(T, B, big(25, "late"), e);                          // every part written, header held back
+      await Bun.sleep(30);
+      await store.putCheckpoint(T, B, big(30, "newest"), e);                             // lands, and sweeps seq 25's group as an orphan
+      expect(swept).toBe(true);
+      await slowDone;                                                                    // its header is in
+      expect((await store.getCheckpoint(T, B)).tag).toBe("newest");
+      expect((await store.getCheckpoint(T, B, 30)).tag).toBe("late");                    // complete, never "unavailable"
+      expect(await raw.partRows(T, B)).toBeGreaterThanOrEqual(parts(big(25, "late")) + parts(big(30, "newest")));
+    });
+
     test("parts: a checkpoint in the old format (one big row of JSON, no header) still reads, alone and beside parts", async () => {
       const { store, raw } = await fresh({ partChars: PART });
       const e = await own(store);
@@ -327,8 +346,9 @@ export function storeContract(name, make) {
       await store.putCheckpoint(T, B, big(20, "fast"), e);
       const fastRows = await raw.partRows(T, B);
       gate.resolve();
-      expect(["resolved", "unavailable"]).toContain(await slow);
+      expect(await slow).toBe("unavailable");                                             // its first part was swept: the header's part count refuses it
       expect((await store.getCheckpoint(T, B)).tag).toBe("fast");
+      for (const below of [21, 20, 11]) { const got = await store.getCheckpoint(T, B, below); expect(got === null || got.tag === (below > 20 ? "fast" : "slow")).toBe(true); }
       expect(await raw.partRows(T, B)).toBeLessThanOrEqual(fastRows + parts(big(10, "slow")) + 1);
       // The same seq twice, the first one slow: the first header wins and the loser leaves no part rows.
       gate = Promise.withResolvers(); hold = true;

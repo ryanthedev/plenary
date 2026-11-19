@@ -582,9 +582,9 @@ older version of a deleted element would bring it back on that client only.
     parts of checkpoints pruned just now), by a writer that aborts or is fenced (its own parts, no fence needed to delete them), and by the
     next checkpoint's sweep for a crash's (the sweep is `orphanGroups`: unnamed groups not newer than the newest header; a newer
     group may be a write in flight). A write overtaken by a newer checkpoint may find its parts swept and fail `unavailable`: it was
-    stale anyway. SQLite deletes a part per statement with the loop handed back between.
+    stale anyway. **A delete never races a header:** every delete is conditional in its own statement on no header naming the write (SQLite: `NOT EXISTS` on the header row, one statement is atomic; Postgres: the same, run in a transaction that holds a per-board advisory lock, which the header's transaction takes too, so a header that commits while a sweep is yielding keeps its parts and a sweep that wins first makes the header's part count refuse). SQLite deletes a part per statement with the loop handed back between.
   - **Read.** The header names the parts; they are read one by one and joined (SQLite hands the loop back between parts), the
-    total length checked against the header (`corrupt` if not). A part a concurrent prune removed makes the read look again (up to 3 times), then `unavailable`.
+    total length checked against the header (`corrupt` if not). A part a concurrent prune removed makes the read look again (up to 3 times); a header whose parts stay missing is a bad checkpoint and is skipped, so the caller gets the next one below it (rebuild and the feed step back the same way).
     Decoding the JSON itself is still one call (rebuild and gateway feeds only; § Known limits).
   - **Why SQLite's parts table has a rowid.** Counting a write's parts on a `WITHOUT ROWID` table walks every row's text (15 ms for 50 x 1 MB);
     with a rowid the key lives in a narrow index and the count is free.
@@ -1408,7 +1408,7 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
 - **A big checkpoint's write is in parts** (§ Recovery, "Checkpoint parts"; `scripts/fold-bench.js` prints `sqlitePutMaxStallMs`
   and, with `DATABASE_URL`, `pgPutMaxStallMs`). What still holds the loop in one call: one part's insert (about 3 to 15 ms at 1 MiB,
   fsync-bound, plus a WAL checkpoint every few parts), `JSON.parse` of a whole checkpoint when a room rebuilds or a gateway feeds one,
-  and `Buffer.from(text)` before the catch-up deflate (about 10 to 20 ms per 18 MB text, once per text).
+  and `Buffer.from(text)` before the catch-up deflate (about 10 to 20 ms per 18 MB text, once per text). The independent review measured about 20 ms worst case at 50 MB and judged it acceptable: it is fsync-bound (plus the WAL's automatic checkpoint), so smaller parts do not help.
 - **Compressed catch-up is for clients that can inflate.** A runtime with no zlib (Herdr's QuickJS) joins as before:
   plain text, the full size.
 - **The op rate is per gateway:** a user connected through G gateways can write up to G × 8 connections × 20

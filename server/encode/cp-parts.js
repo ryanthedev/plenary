@@ -31,6 +31,9 @@ export function splitParts(text, size = PART_CHARS) {
 /** The header text for a checkpoint written as `parts` parts (`chars` chars in all) under write id `wid`. */
 export const headerOf = (wid, parts, chars) => `${MARK}${wid} ${parts} ${chars}`;
 
+/** A LIKE pattern matching the header of write `wid` (a uuid: no wildcard characters in it). */
+export const headerLike = wid => `${MARK}${wid} %`;
+
 /** @returns {null | { wid: string, parts: number, chars: number }} null: `data` is a plain (single-row) checkpoint */
 export function parseHeader(data) {
   if (typeof data !== "string" || !data.startsWith(MARK)) return null;

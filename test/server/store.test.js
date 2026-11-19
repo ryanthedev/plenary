@@ -88,7 +88,11 @@ test("a header whose parts hold the wrong number of chars is refused as corrupt,
   const raw = new Database(path);
   raw.run("UPDATE checkpoint_parts SET data = substr(data, 2) WHERE n = 1");        // a part lost a char
   expect(await code(store.getCheckpoint(T, B))).toBe("corrupt");
-  raw.run("DELETE FROM checkpoint_parts WHERE n = 2");                                // a part is gone: the read gives up, not hangs
-  expect(await code(store.getCheckpoint(T, B))).toBe("unavailable");
+  raw.run("UPDATE checkpoint_parts SET data = '' || data || substr('x', 1, 1) WHERE n = 1");   // restore its length: fine again
+  expect((await store.getCheckpoint(T, B)).seq).toBe(3);
+  raw.run("DELETE FROM checkpoint_parts WHERE n = 2");                                // a part is gone: a bad checkpoint, skipped like one (no older: null)
+  expect(await store.getCheckpoint(T, B)).toBe(null);
+  await store.putCheckpoint(T, B, { seq: 2, small: true }, epoch);                   // an older, readable one is what a caller steps back to
+  expect(await store.getCheckpoint(T, B)).toEqual({ seq: 2, small: true });
   raw.close(); await store.close();
 });

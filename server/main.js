@@ -450,6 +450,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
     roles, node, host: { hostname: node, leaseTtlMs } });
   return { server, store, bus, registry, log, devBoard, oidc, node, roles, cluster, clusterId, leaseTtlMs,
     async stop() { await server.stop(); await Promise.race([spaces.settled(), new Promise(r => setTimeout(r, 2000).unref?.())]);   // let grants announcements finish (bounded)
+      spaces.close();                                   // nothing more starts against the buses and stores closed below
       await bus.close(); await store.close(); await rawRegistry.close(); } };
 }
 

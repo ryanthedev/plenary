@@ -11,13 +11,14 @@ import { generalText, spaceEmpty, groupEmpty } from "../../core/spaces.js";
  * button, a click elsewhere closes. @returns {{ el: HTMLElement, button: HTMLElement }}
  */
 export function overflowMenu({ label, items }) {
+  const cfg = { label, items };                 // read at open time, so a re-render can update them without a new button
   const button = h("button.btn.ghost.more", { type: "button", "aria-label": label, "aria-haspopup": "menu", "aria-expanded": "false", onclick: () => (menu ? close(true) : open()) }, "⋯");
   const wrap = h("span.menu-wrap", {}, button);
   let menu = null;
   const buttons = () => [...menu.children];   // an HTMLCollection has no indexOf
   const onDoc = e => { if (menu && !wrap.contains?.(e.target)) close(false); };
   function open() {
-    menu = h("div.menu", { role: "menu", "aria-label": label, onkeydown: e => {
+    menu = h("div.menu", { role: "menu", "aria-label": cfg.label, onkeydown: e => {
       const list = buttons(), i = list.indexOf(globalThis.document?.activeElement);
       if (e.key === "Escape") { e.preventDefault?.(); close(true); }
       else if (e.key === "ArrowDown") { e.preventDefault?.(); list[(i + 1) % list.length].focus(); }
@@ -25,7 +26,7 @@ export function overflowMenu({ label, items }) {
       else if (e.key === "Home") { e.preventDefault?.(); list[0].focus(); }
       else if (e.key === "End") { e.preventDefault?.(); list.at(-1).focus(); }
       else if (e.key === "Tab") close(false);
-    } }, items.filter(i => i && !i.hidden).map(i => (i.href ? h("a", { role: "menuitem", href: i.href, tabindex: "-1" }, i.text) : h("button", { type: "button", role: "menuitem", onclick: () => { close(false); i.onSelect(button); } }, i.text))));
+    } }, cfg.items.filter(i => i && !i.hidden).map(i => (i.href ? h("a", { role: "menuitem", href: i.href, tabindex: "-1" }, i.text) : h("button", { type: "button", role: "menuitem", onclick: () => { close(false); i.onSelect(button); } }, i.text))));
     wrap.append(menu);
     button.setAttribute("aria-expanded", "true");
     globalThis.document?.addEventListener?.("click", onDoc);
@@ -38,7 +39,7 @@ export function overflowMenu({ label, items }) {
     globalThis.document?.removeEventListener?.("click", onDoc);
     if (refocus) button.focus?.();
   }
-  return { el: wrap, button, close: () => close(false) };
+  return { el: wrap, button, close: () => close(false), update: n => { cfg.label = n.label; cfg.items = n.items; button.setAttribute("aria-label", n.label); } };
 }
 
 /** Focus an input and select its text once it is in the page (so typing replaces the old title). */
@@ -97,6 +98,27 @@ function inlineEditor({ editing, session, text, label, onSave, onCancel }) {
   return el;
 }
 
+/**
+ * Keeps controls alive across renders and focus where it was. `keep(key, make)` hands back the same element every render (so a click that
+ * began on it before a re-render still lands, and an open menu stays open); `mark(el, key)` labels what may hold focus. `around(fn)` runs a
+ * render and puts focus back on the marked element that had it (a rebuilt link or the moved button), so a Tab-out of a rename that saved
+ * never drops focus to the body.
+ */
+function keeper() {
+  const kept = new Map(), marks = new Map(); let used = new Set();
+  const fk = () => globalThis.document?.activeElement?.getAttribute?.("data-fk") ?? null;
+  return {
+    keep(key, make) { let v = kept.get(key); if (!v) kept.set(key, v = make()); used.add(key); return v; },
+    mark(el, key) { el.setAttribute("data-fk", key); marks.set(key, el); return el; },
+    around(fn) {
+      const had = fk(); used = new Set(); marks.clear();
+      fn();
+      for (const k of [...kept.keys()]) if (!used.has(k)) kept.delete(k);
+      if (had) marks.get(had)?.focus?.();     // a no-op when it still holds focus; the caller's own end-of-edit focus runs after this
+    },
+  };
+}
+
 /** What to focus once the next render is in the page (a rename ended: the title, or the card's link). */
 const afterRender = () => { let fn = null; return { set: f => { fn = f; }, run: () => { const f = fn; fn = null; f?.(); } }; };
 
@@ -111,40 +133,55 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null }) {
   const { status, main } = shell(root, hrefs);
   /** @type {null | { type: "title" } | { type: "board", id: string }} */
   let editing = null;
-  const title = {}, cardEdits = new Map(), after = afterRender(), links = new Map();
-  let h1 = null;
+  const title = {}, cardEdits = new Map(), after = afterRender(), links = new Map(), keys = keeper();
+  let h1 = null, shown = null, spaceId = null;
   /** End an edit and put focus somewhere sensible: the title, or the card's own link. */
   const end = (to) => { editing = null; after.set(to); render(); };
   const focusTitle = () => h1?.focus?.();
 
   function card(c) {
     const where = [c.role].filter(Boolean).join(" · ");
-    const menu = overflowMenu({ label: `More for ${c.title || "Untitled"}`, items: [
+    const menuCfg = { label: `More for ${c.title || "Untitled"}`, items: [
       { text: "Open", href: hrefs.board(c.id) },
       { text: "Rename", hidden: !c.can?.rename, onSelect: () => { editing = { type: "board", id: c.id }; render(); } },
-    ] });
+    ] };
+    const menu = keys.keep(`card-menu:${c.id}`, () => overflowMenu(menuCfg));
+    menu.update(menuCfg);
+    keys.mark(menu.button, `card-menu:${c.id}`);
     const focusCard = () => links.get(c.id)?.focus?.();
     const input = inlineEditor({ editing: editing?.type === "board" && editing.id === c.id, session: cardEdits.get(c.id) ?? (cardEdits.set(c.id, {}), cardEdits.get(c.id)), text: c.title, label: "Board title",
       onSave: (v, moved) => model.renameBoard(c.id, v).then(ok => { if (ok) end(moved ? null : focusCard); else render(); }), onCancel: () => end(focusCard) });
     const link = input ? null : h("a.card-open", { href: hrefs.board(c.id) }, h("span.t", {}, c.title || "Untitled"), h("span.p", {}, where));
-    if (link) links.set(c.id, link);
+    if (link) { links.set(c.id, link); keys.mark(link, `card-link:${c.id}`); }
     return h("li.card", {}, input ? h("div.card-open", {}, input, h("span.p", {}, "Enter to save, Escape to cancel")) : link, h("span.card-menu", {}, menu.el));
   }
 
   function render() {
     showNotice(status, model);
     if (gate(S, main, () => model.load(), signIn)) return;
+    // Only the in-flight flag changed (a rename is saving): nothing to rebuild, so a control the person just moved to keeps focus and
+    // a click that began on it still lands.
+    const sig = editing ? `${editing.type}:${editing.id ?? ""}` : "";
+    if (S.busy && shown && shown.page === S.page && shown.sig === sig) return;
+    shown = { page: S.page, sig };
+    keys.around(draw);
+    after.run();
+  }
+  function draw() {
     links.clear();
     for (const id of [...cardEdits.keys()]) if (editing?.type !== "board" || editing.id !== id) cardEdits.delete(id);   // one edit session per card, only while that card is being edited
     const p = S.page, sp = p.space;
     const crumbs = h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " / ",
       sp.group ? [h("a", { href: hrefs.group(sp.group.id) }, sp.group.name), " / "] : null);
-    const newBoard = h("button.btn.primary", { type: "button", disabled: !p.can.createBoard, "aria-disabled": p.can.createBoard ? null : "true",
-      title: p.can.createBoard ? null : "You can't add boards here", onclick: e => dialogs.newBoard({ opener: e.currentTarget, space: sp.id }) }, "＋ New board");
-    const menu = p.can.rename || p.can.general ? overflowMenu({ label: "Space options", items: [
+    spaceId = sp.id;
+    const newBoard = keys.mark(keys.keep(`new-board:${p.can.createBoard}`, () => h("button.btn.primary", { type: "button", disabled: !p.can.createBoard, "aria-disabled": p.can.createBoard ? null : "true",
+      title: p.can.createBoard ? null : "You can't add boards here", onclick: e => dialogs.newBoard({ opener: e.currentTarget, space: spaceId }) }, "＋ New board")), "new-board");
+    const menuCfg = { label: "Space options", items: [
       { text: "Rename", hidden: !p.can.rename, onSelect: () => { editing = { type: "title" }; render(); } },
       { text: "General access…", hidden: !p.can.general, onSelect: b => dialogs.general({ opener: b, current: sp.general, onSave: r => model.setGeneral(r) }) },
-    ] }) : null;
+    ] };
+    const menu = p.can.rename || p.can.general ? keys.keep("space-options", () => overflowMenu(menuCfg)) : null;
+    if (menu) { menu.update(menuCfg); keys.mark(menu.button, "space-options"); }
     const input = inlineEditor({ editing: editing?.type === "title", session: title, text: sp.name, label: "Space name",
       onSave: (v, moved) => model.rename(v).then(ok => { if (ok) end(moved ? null : focusTitle); else render(); }), onCancel: () => end(focusTitle) });
     h1 = h("h1", { id: "page-title", tabindex: "-1" }, input ?? sp.name);
@@ -155,7 +192,6 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null }) {
     replace(main, crumbs, head, sub,
       p.boards.length ? h("ul.cards", { "aria-label": `Boards in ${sp.name}` }, p.boards.map(c => card(c))) : message(empty.title, empty.detail),
       p.more ? h("p.muted", {}, "More boards are in this Space. Use search on Home to find them.") : null);
-    after.run();
   }
   const unsub = model.subscribe(render);
   render();
@@ -167,19 +203,29 @@ export function mountGroupPage({ root, model, dialogs, hrefs, signIn = null }) {
   const S = model.state;
   const { status, main } = shell(root, hrefs);
   let editing = false;
-  const title = {}, after = afterRender();
-  let h1 = null;
+  const title = {}, after = afterRender(), keys = keeper();
+  let h1 = null, shown = null, groupId = null, moreBtn = null;
   const end = (moved = false) => { editing = false; after.set(moved ? null : () => h1?.focus?.()); render(); };
 
   function render() {
     showNotice(status, model);
     if (gate(S, main, () => model.load(), signIn)) return;
+    // Only the in-flight flag changed: update the one control that shows it, rebuild nothing (focus and clicks stay where they are).
+    if (S.busy && shown && shown.page === S.page && shown.editing === editing) { if (moreBtn) moreBtn.disabled = true; return; }
+    shown = { page: S.page, editing };
+    keys.around(draw);
+    after.run();
+  }
+  function draw() {
     const p = S.page, g = p.group;
-    const newSpace = p.can.createSpace ? h("button.btn.primary", { type: "button", onclick: e => dialogs.newSpace({ opener: e.currentTarget, group: g.id }) }, "＋ New space") : null;
-    const menu = p.can.rename || p.can.general ? overflowMenu({ label: "Group options", items: [
+    groupId = g.id;
+    const newSpace = p.can.createSpace ? keys.mark(keys.keep("new-space", () => h("button.btn.primary", { type: "button", onclick: e => dialogs.newSpace({ opener: e.currentTarget, group: groupId }) }, "＋ New space")), "new-space") : null;
+    const menuCfg = { label: "Group options", items: [
       { text: "Rename", hidden: !p.can.rename, onSelect: () => { editing = true; render(); } },
       { text: "General access…", hidden: !p.can.general, onSelect: b => dialogs.general({ opener: b, current: g.general, onSave: r => model.setGeneral(r) }) },
-    ] }) : null;
+    ] };
+    const menu = p.can.rename || p.can.general ? keys.keep("group-options", () => overflowMenu(menuCfg)) : null;
+    if (menu) { menu.update(menuCfg); keys.mark(menu.button, "group-options"); }
     const input = inlineEditor({ editing, session: title, text: g.name, label: "Group name",
       onSave: (v, moved) => model.rename(v).then(ok => { if (ok) end(moved); else render(); }), onCancel: end });
     h1 = h("h1", { id: "page-title", tabindex: "-1" }, input ?? g.name);
@@ -189,8 +235,7 @@ export function mountGroupPage({ root, model, dialogs, hrefs, signIn = null }) {
       p.spaces.length ? h("ul.cards", { "aria-label": `Spaces in ${g.name}` }, p.spaces.map(s => h("li.card", {},
         h("a.card-open", { href: hrefs.space(s.id) }, h("span.t", {}, s.name), h("span.p", {}, generalText(s.general))))))
         : message(empty.title, empty.detail),
-      p.next ? h("button.btn", { type: "button", disabled: S.busy, onclick: () => model.loadMore() }, "Show more Spaces") : null);
-    after.run();
+      (moreBtn = p.next ? keys.mark(h("button.btn", { type: "button", disabled: S.busy, onclick: () => model.loadMore() }, "Show more Spaces"), "show-more") : null));
   }
   const unsub = model.subscribe(render);
   render();

@@ -447,6 +447,39 @@ describe("announcements: coalesced per scope, capped overall, the final state al
     opens.forEach(f => f()); await s.settled();
     expect(new Set(g.starts)).toEqual(new Set([...a.map(x => x.id), b.id]));                       // and none of A's was dropped
   });
+  test("revocations are FIFO among themselves: an old one starts at the first free slot while newer ones keep arriving", async () => {
+    const g = gated(), n = ANNOUNCE.perTenant * 2, sp = await newSpaces(n + 1 + 10);
+    const full = sp.slice(0, n), [old, ...newer] = sp.slice(n);
+    const opens = full.map(x => g.hold(x.id));
+    const s = spaceService({ registry: g.reg, tenancy: makeTenancy({ registry: g.reg }), announce: () => {} });
+    const revoke = x => s.update(ada, "space", x.id, { general: null });
+    for (const x of full) await revoke(x);
+    await tick();
+    expect(g.live.size).toBe(n);                                                                     // the Unit's revocation budget is full
+    await revoke(old);
+    for (const x of newer) await revoke(x);                                                          // newer revocations stream in behind it
+    opens[0](); await tick();                                                                        // ONE slot frees
+    const next = g.starts.slice(n);
+    expect(next[0]).toBe(old.id);                                                                    // the oldest waiting revocation takes it, not the newest
+    opens.forEach(f => f()); await s.settled();
+    expect(g.starts.slice(n)).toEqual([old, ...newer].map(x => x.id));                               // and the rest follow in arrival order
+  });
+  test("close(): the queue is forgotten, nothing starts afterwards, and later changes are no-ops", async () => {
+    const g = gated(), sp = await newSpaces(ANNOUNCE.perTenant + 5);
+    let published = 0;
+    await Promise.all(sp.map(x => r.createBoard({ tenant: acme.id, space: x.id })));
+    const opens = sp.map(x => g.hold(x.id));
+    const s = spaceService({ registry: g.reg, tenancy: makeTenancy({ registry: g.reg }), announce: () => { published++; } });
+    for (const x of sp) await s.update(ada, "space", x.id, { general: "editor" });
+    await tick();
+    expect(g.starts.length).toBe(ANNOUNCE.perTenant);                                                // the rest wait in the queue
+    s.close();
+    opens.forEach(f => f()); await s.settled(); await tick();
+    expect(g.starts.length).toBe(ANNOUNCE.perTenant);                                                // none of the queued scopes ever started
+    expect(published).toBe(0);                                                                       // and the running passes stop before publishing on a closed bus
+    s.announceChange({ id: acme.id }, { type: "space", id: sp[0].id }, { revoke: true }); await s.settled();
+    expect(g.starts.length).toBe(ANNOUNCE.perTenant);
+  });
   test("revocation priority does not carry over to an ordinary re-pass", async () => {
     const g = gated(), sp = await newSpaces(ANNOUNCE.perTenant + 2), [x, ...rest] = sp, normal = rest.slice(0, ANNOUNCE.perTenant), y = rest.at(-1);
     const un = { id: acme.id };

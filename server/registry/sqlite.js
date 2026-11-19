@@ -444,19 +444,24 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
   });
   // One snapshot read of a scope's whole chain: a fixed number of statements however many grants, Teams or members.
   // `chain` (already read by the caller) skips the chain statements; `users` limits Team members to those users.
+  /** `rowTenant`, but its three look-ups run even when the row is missing (no-match id), so the statement count doesn't depend on existence. */
+  const uniformTenant = r => { const t = rowTenant(r ?? { id: "", domain: null, created_at: 0 }); return r ? t : null; };
+  // The SAME statements run whether or not the scope exists (no-match parameters stand in for a missing row), so a refusal's cost can't
+  // tell an unknown id from a hidden one (PROTOCOL.md § Spaces and Groups, "the same Registry work").
   const contextTx = db.transaction((type, id, users, held) => {
     const board = held ? held.board : type === "board" ? rowBoard(q.board.get(id)) : null;
-    const space = held ? held.space : type === "space" ? rowSpace(q.space.get(id)) : board?.space ? rowSpace(q.space.get(board.space)) : null;
-    const group = held ? held.group : type === "group" ? rowGroup(q.group.get(id)) : space?.group ? rowGroup(q.group.get(space.group)) : null;
+    const space = held ? held.space : rowSpace(q.space.get(type === "space" ? id : board?.space ?? ""));
+    const group = held ? held.group : type === "group" ? rowGroup(q.group.get(id)) : rowGroup(q.group.get(space?.group ?? ""));
     const owner = board ?? space ?? group;
-    const tenant = held ? held.tenant : rowTenant(q.tenant.get(type === "unit" ? id : owner?.tenant));
-    if (!tenant || (type !== "unit" && !owner)) return null;
-    const sg = (t, i) => (i == null ? [] : q.sgrants.all(t, i).map(rowSg));
-    const scoped = { unit: sg("unit", tenant.id), group: sg("group", group?.id), space: sg("space", space?.id), board: sg("board", board?.id) };
+    const tenant = held ? held.tenant : uniformTenant(q.tenant.get(type === "unit" ? id : owner?.tenant ?? ""));
+    const sg = (t, i) => q.sgrants.all(t, i ?? "").map(rowSg);
+    const scoped = { unit: sg("unit", tenant?.id), group: sg("group", group?.id), space: sg("space", space?.id), board: sg("board", board?.id) };
     const teamIds = [...new Set(Object.values(scoped).flat().filter(g => g.subject.type === "team").map(g => g.subject.id))];
     const teams = Object.fromEntries(teamIds.map(t => [t, []]));
-    if (teamIds.length) for (const m of q.membersOf.all(JSON.stringify(teamIds), users ? JSON.stringify(users) : null)) teams[m.team].push(m.member);
-    return { tenant, board, space, group, scoped, roles: q.roles.all(tenant.id).map(rowRole), teams };
+    for (const m of q.membersOf.all(JSON.stringify(teamIds), users ? JSON.stringify(users) : null)) teams[m.team].push(m.member);
+    const roles = q.roles.all(tenant?.id ?? "").map(rowRole);
+    if (!tenant || (type !== "unit" && !owner)) return null;
+    return { tenant, board, space, group, scoped, roles, teams };
   });
 
   /** `accessContexts`: every scope's context from ONE transaction (one snapshot). */

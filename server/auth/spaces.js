@@ -88,19 +88,22 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
    *    the pass that follows the change only.
    */
   const running = new Map();                      // scope key -> entry (a pass is in progress)
-  const queue = [];                               // entries waiting for a slot, front first
+  const queue = [];                               // ordinary entries waiting for a slot, oldest first
+  const revQueue = [];                            // revocations waiting for a slot, oldest first (drained before `queue`)
+  let closing = false;
   const perTenant = new Map();                    // Unit id -> running count of ordinary scopes
   const perTenantRev = new Map();                 // Unit id -> running count of scopes that took a revocation slot
   let waiters = [];
-  const idle = () => { if (!running.size && !queue.length) { const w = waiters; waiters = []; for (const f of w) f(); } };
+  const idle = () => { if (!running.size && !queue.length && !revQueue.length) { const w = waiters; waiters = []; for (const f of w) f(); } };
   const canStart = e => (e.revoke ? running.size < ANNOUNCE.inflight * 2 && (perTenantRev.get(e.unit.id) ?? 0) < ANNOUNCE.perTenant * 2
     : running.size < ANNOUNCE.inflight && (perTenant.get(e.unit.id) ?? 0) < ANNOUNCE.perTenant);
   const bump = (m, id, d) => { const n = (m.get(id) ?? 0) + d; if (n > 0) m.set(id, n); else m.delete(id); };
   function pump() {
-    for (;;) {
-      const i = queue.findIndex(canStart);
+    while (!closing) {
+      let q = revQueue, i = q.findIndex(canStart);
+      if (i < 0) { q = queue; i = q.findIndex(canStart); }
       if (i < 0) break;
-      const [e] = queue.splice(i, 1);
+      const [e] = q.splice(i, 1);
       running.set(e.key, e);
       e.slotRev = e.revoke;                       // the slot's class is fixed when it starts
       bump(e.slotRev ? perTenantRev : perTenant, e.unit.id, 1);
@@ -118,23 +121,25 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
       // Same continuation as the last `e.dirty` read: nothing can set it between the check and the removal.
       running.delete(e.key);
       bump(e.slotRev ? perTenantRev : perTenant, e.unit.id, -1);
-      if (e.dirty) { e.dirty = false; if (e.revoke) queue.unshift(e); else queue.push(e); }       // it used its passes: back of the queue (front if a revocation arrived meanwhile)
+      if (e.dirty && !closing) { e.dirty = false; (e.revoke ? revQueue : queue).push(e); }       // it used its passes: back of its queue
       pump();
     }
   }
   /** @param {{ id: string }} unit @param {{ type: string, id: string }} scope @param {{ revoke?: boolean }} [o] revoke: the change reduces access */
   function announceLater(unit, scope, { revoke = false } = {}) {
+    if (closing) return;
     const key = `${scope.type}\n${scope.id}`, cur = running.get(key);
     if (cur) { cur.dirty = true; cur.revoke ||= revoke; return; }
     const at = queue.findIndex(e => e.key === key);
     if (at >= 0) {
       const e = queue[at];
-      if (revoke && !e.revoke) { e.revoke = true; queue.splice(at, 1); queue.unshift(e); pump(); }
+      if (revoke) { e.revoke = true; queue.splice(at, 1); revQueue.push(e); pump(); }     // joins the revocations, behind the older ones
       return;
     }
+    if (revQueue.some(e => e.key === key)) return;
     if (!revoke && queue.length >= ANNOUNCE.queue) { try { log.warn("grants announcement queue is full; the timed re-check covers it", { scope: scope.type }); } catch {} return; }
     const e = { key, unit, scope, dirty: false, revoke };
-    if (revoke) queue.unshift(e); else queue.push(e);
+    (revoke ? revQueue : queue).push(e);
     pump();
   }
   /** The announcement itself (never rejects). */
@@ -142,8 +147,9 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
     let after = null, pages = 0, sent = 0;
     try {
       do {
+        if (closing) break;
         const p = await registry.boardsIn(scope, { after, limit: ANNOUNCE.page });
-        for (let i = 0; i < p.ids.length; i += ANNOUNCE.par) await Promise.all(p.ids.slice(i, i + ANNOUNCE.par).map(async b => { try { await announce(unit.id, b); sent++; } catch (err) { try { log.warn("grants announcement failed", { board: b, err }); } catch {} } }));
+        for (let i = 0; i < p.ids.length && !closing; i += ANNOUNCE.par) await Promise.all(p.ids.slice(i, i + ANNOUNCE.par).map(async b => { try { await announce(unit.id, b); sent++; } catch (err) { try { log.warn("grants announcement failed", { board: b, err }); } catch {} } }));
         after = p.next;
         if (after != null && ++pages >= ANNOUNCE.pages) { log.warn("grants announcement stopped at its bound; the timed re-check covers the rest", { scope: scope.type, sent }); break; }
       } while (after != null);
@@ -320,7 +326,10 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
     },
 
     /** Wait for the announcements started by earlier changes (tests; a shutdown). */
-    settled: () => (running.size || queue.length ? new Promise(res => { waiters.push(res); }) : Promise.resolve()),
+    settled: () => (running.size || queue.length || revQueue.length ? new Promise(res => { waiters.push(res); }) : Promise.resolve()),
+
+    /** Shutdown: stop starting announcements and forget the queued ones (the gateways' timed re-check covers them). Running passes finish. */
+    close() { closing = true; queue.length = 0; revQueue.length = 0; idle(); },
 
     /** Announce a change to what everyone in a scope gets (update() does this itself; exposed for the composition root and tests). */
     announceChange: (unit, scope, o) => announceLater(unit, scope, o),

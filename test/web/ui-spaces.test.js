@@ -359,6 +359,46 @@ test("a blur-save that moved focus elsewhere does not pull it back to the title 
   expect(focused.length).toBe(n);
 });
 
+test("Tab out of a rename: the save does not rebuild the control focus moved to, and focus is on it (not the body) after the save", async () => {
+  await spacePage();
+  const document = globalThis.document, body = {}; document.body = body; document.activeElement = body;
+  const nb = () => root.findAll(e => e.tagName === "BUTTON" && e.getAttribute("data-fk") === "new-board")[0];
+  btn("Space options").click(); root.findAll(e => e.getAttribute("role") === "menuitem")[0].click(); await settle();
+  const input = root.find(e => e.getAttribute("aria-label") === "Space name"); input.value = "Tabbed"; document.activeElement = input;
+  const target = nb();
+  document.activeElement = body; input.dispatch("blur", { relatedTarget: target });                    // the browser fires blur first (focus is nowhere yet) ...
+  document.activeElement = target;                                                                      // ... then focus lands on the next control
+  expect(nb()).toBe(target);                                                                            // the busy re-render rebuilt nothing: the same element is still there
+  await settle();                                                                                       // the save resolved and the page redrew
+  expect(textOf(root.find(e => e.tagName === "H1"))).toBe("Tabbed");
+  expect(nb()).toBe(target);                                                                            // the very same button, moved not recreated
+  expect(focused.at(-1)).toBe(target);                                                                  // and focus was put back on it
+});
+
+test("card rename: Tab to that card's ⋯ keeps the button; a mousedown on ⋯ after a title edit still opens its menu", async () => {
+  await spacePage();
+  const document = globalThis.document, body = {}; document.body = body; document.activeElement = body;
+  const more = id => root.findAll(e => e.tagName === "BUTTON" && e.getAttribute("data-fk") === `card-menu:${id}`)[0];
+  const first = more("b-1");
+  first.click(); root.findAll(e => e.getAttribute("role") === "menuitem").find(e => textOf(e) === "Rename").click(); await settle();
+  const c = root.find(e => e.getAttribute("aria-label") === "Board title"); c.value = "Tabbed card";
+  document.activeElement = body; c.dispatch("blur", { relatedTarget: first }); document.activeElement = first;
+  await settle();
+  expect(more("b-1")).toBe(first);
+  expect(focused.at(-1)).toBe(first);
+  // mouse: title edit, then mousedown on the Space's ⋯ (blur saves) and the click lands on the same button
+  btn("Space options").click(); root.findAll(e => e.getAttribute("role") === "menuitem")[0].click(); await settle();
+  const i = root.find(e => e.getAttribute("aria-label") === "Space name"); i.value = "Mouse";
+  const opts = btn("Space options");
+  document.activeElement = body; i.dispatch("blur", { relatedTarget: opts });                           // mousedown blurs the input and starts the save
+  opts.click();                                                                                          // the click lands before the save finishes ...
+  expect(root.findAll(e => e.getAttribute("role") === "menu").length).toBe(1);
+  await settle();                                                                                        // ... and the redraw after the save neither loses it nor closes the menu
+  expect(btn("Space options")).toBe(opts);
+  expect(root.findAll(e => e.getAttribute("role") === "menu").length).toBe(1);
+  expect(textOf(root.find(e => e.tagName === "H1"))).toBe("Mouse");
+});
+
 test("the busy re-render keeps the typed text in the card editor (no flash of the old title)", async () => {
   await spacePage();
   let release; api.answer = (n, id, t) => (n === "renameBoard" ? new Promise(r => { release = () => r({ board: { id, title: t } }); }) : undefined);

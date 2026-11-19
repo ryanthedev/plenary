@@ -87,7 +87,7 @@ export function mountRolesPage({ root, model, hrefs, signIn = null }) {
       h("div.pick-row", {}, h("label.l", {}, "Name", nameIn), h("label.l", {}, "Board access", ladderSel)),
       matrixView(model.rows(), editable),
       S.confirm ? h("div.banner", { role: "alert" }, keys.mark(h("p", { tabindex: "-1" }, impactText(r ?? { kind: "custom" }, S.confirm.impact), " Saving changes what they can do within about a minute."), "confirm-text"),
-        keys.mark(act({}, "Save anyway", () => model.confirmSave(), () => S.busy), "confirm-save"), keys.mark(act({}, "Cancel", () => { after = () => keys.focusKey("save"); model.cancelConfirm(); }, () => S.busy), "confirm-cancel")) : null,
+        keys.mark(act({}, "Save anyway", () => { after = () => keys.focusKey("save"); model.confirmSave(); }, () => S.busy), "confirm-save"), keys.mark(act({}, "Cancel", () => { after = () => keys.focusKey("save"); model.cancelConfirm(); }, () => S.busy), "confirm-cancel")) : null,
       h("div.pick-row", {}, saveBtn, discardBtn, r ? keys.mark(act({}, "Duplicate", () => { after = () => keys.focusKey("heading-detail"); model.duplicate(r.id); }, () => S.busy), "duplicate") : null),
       r?.kind === "custom" && !d?.isNew ? h("section.danger", { "aria-label": "Delete role" }, deleting
         ? [h("p", {}, `Delete ${r.name}? A role that is in use cannot be deleted.`),

@@ -19,7 +19,7 @@ curl -s http://127.0.0.1:8080/health                    # 200 + JSON
 
 Image name: `ghcr.io/ryanthedev/plenary`. **Nothing is published until the owner says so.** CI builds and smoke-tests
 the image (job `image`, `scripts/image-smoke.sh`) but never pushes and holds no registry credentials. Size: about
-217 MB by podman's measure (`image inspect .Size`, arm64), nearly all of it the Bun base image; docker's figure for the amd64 image is DOCKER_SIZE (the `image size:` line in the `image` job's log).
+217 MB by podman's measure (`image inspect .Size`, arm64), nearly all of it the Bun base image; docker's figure for the amd64 image on the CI runner is about 85 MB (84,827,381 bytes; the `image size:` line in the `image` job's log). The two tools measure differently (podman counts the uncompressed layers), so compare sizes only within one tool.
 
 **Tags:** every release gets `X.Y.Z` and `sha-<7 chars of the git commit>`. Only a **stable** release (no `-rc.1` style suffix) also moves `X.Y`, `X` and `latest`; a pre-release never does. Never move an `X.Y.Z` tag.
 

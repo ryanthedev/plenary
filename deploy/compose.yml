@@ -11,7 +11,9 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    image: plenary:dev
+    # One image name for both compose files. Default = the local build. To run a released image instead, set
+    # PLENARY_IMAGE=ghcr.io/ryanthedev/plenary:<version> and run `up` without --build (deploy/README.md "Release").
+    image: ${PLENARY_IMAGE:-plenary:dev}
     # Published on the host's loopback only. Inside the container the server listens on 0.0.0.0 (HOST in the
     # Dockerfile).
     ports:

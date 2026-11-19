@@ -38,7 +38,8 @@ x-app: &app
   build:
     context: ..
     dockerfile: deploy/Dockerfile
-  image: plenary:cluster-dev
+  # Same image name as compose.yml: one local build serves both stacks, and PLENARY_IMAGE selects a released image.
+  image: ${PLENARY_IMAGE:-plenary:dev}
   # No published ports: the load balancer is the only way in.
   # Same GET /health check as deploy/Dockerfile, polled every 5 s instead of 30 s so the load balancer (which waits
   # for `service_healthy`) starts sooner and a killed node shows as unhealthy sooner.

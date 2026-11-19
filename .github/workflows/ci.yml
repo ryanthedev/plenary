@@ -16,6 +16,19 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Builds deploy/Dockerfile and smoke-tests the container (healthy, non-root, clean SIGTERM stop). Builds only: nothing is
+  # pushed, no registry login. Publishing is a manual step (deploy/README.md "Release").
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # actions/checkout v7.0.1 (SHA read with `git ls-remote` on 2026-11-11)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Build and smoke-test the image
+        run: scripts/image-smoke.sh plenary-ci-${{ github.run_id }}
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15

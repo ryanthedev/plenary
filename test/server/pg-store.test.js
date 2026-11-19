@@ -496,19 +496,31 @@ describe.skipIf(!url)("postgres store", () => {
     return { release: async () => { release(); await tx; } };
   };
 
+  /** The window after seq 25 counted its parts: wait (on a condition, not a guess at how long) until the sweep's delete is either blocked on the checkpoint lock (an advisory lock request not yet granted: the code under test) or has already deleted seq 25's parts (what a missing lock allows). Fails by deadline, naming itself. */
+  const sweepSettled = async (schema, ms = 10_000) => {
+    const end = Date.now() + ms;
+    for (;;) {
+      const [{ waiting, parts }] = await client().unsafe(`SELECT (SELECT count(*)::int FROM pg_locks WHERE locktype = 'advisory' AND NOT granted) AS waiting,
+        (SELECT count(*)::int FROM "${schema}".pl_checkpoint_parts WHERE seq = 25) AS parts`);
+      if (waiting > 0 || parts === 0) return;
+      if (Date.now() > end) throw new Error("timed out waiting for the sweep to queue on the checkpoint lock or delete seq 25's parts");
+      await Bun.sleep(10);
+    }
+  };
+
   test("the header's transaction takes the checkpoint lock: a sweep released into the window between its part count and its commit waits, and the checkpoint stays readable", async () => {
     const schema = schemaName();
-    const gateA = Promise.withResolvers(), gateB = Promise.withResolvers(), bReady = Promise.withResolvers();
+    const gateA = Promise.withResolvers(), gateB = Promise.withResolvers(), bReady = Promise.withResolvers(), aAtHeader = Promise.withResolvers();
     let holdA = true, holdB = true, counted = false;
     const store = await postgresStore({ sql: client(), schema, partChars: PART, onPart: async step => {
-      if (step === "header" && holdA) { holdA = false; await gateA.promise; }                 // seq 25: every part in, header held back
+      if (step === "header" && holdA) { holdA = false; aAtHeader.resolve(); await gateA.promise; }                 // seq 25: every part in, header held back
       else if (step === "sweep" && holdB) { holdB = false; bReady.resolve(); await gateB.promise; }   // seq 30: header landed, its sweep paused
-      else if (step === "header-counted" && counted) { counted = false; gateB.resolve(); await Bun.sleep(150); }   // 25 has counted its parts: the sweep's delete runs now
+      else if (step === "header-counted" && counted) { counted = false; gateB.resolve(); await sweepSettled(schema); }   // 25 has counted its parts: the sweep's delete runs now, and this waits until it has either queued on the lock or deleted 25's parts
     } });
     try {
       const e = await own(store);
       const late = store.putCheckpoint(T, B, big(25, "late"), e);
-      await Bun.sleep(30);
+      await aAtHeader.promise;                                                                  // seq 25 is at its header (an event, not a guess at how long its parts take)
       const newest = store.putCheckpoint(T, B, big(30, "newest"), e);
       await bReady.promise;
       counted = true; gateA.resolve();

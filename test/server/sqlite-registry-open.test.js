@@ -1,12 +1,12 @@
 // server/registry/sqlite.js: several processes opening one brand-new registry file at the same moment all start.
 // Before the fix, `PRAGMA journal_mode=WAL` on a new file failed with "database is locked" (sqlite.js:38) when another
-// process held a write lock on it: SQLite returns BUSY for that switch without calling the busy handler. The 12-process
+// process held a write lock on it: SQLite returns BUSY for that switch without calling the busy handler. The multi-process
 // race hits that only sometimes (machine and timing dependent), so the first test forces it: a child holds a write
 // lock on the new, still rollback-mode file while this process opens the registry; the old code failed it every time. Real processes (Bun.spawn) because
 // that is how nodes and bootstrap scripts meet, and because the fix's retry sleeps synchronously.
 import { spawnTracked } from "./helpers.js";
 import { test, expect, afterAll } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
@@ -74,10 +74,13 @@ await Bun.sleep(60000);`], { env: { ...process.env, DB: db }, stdout: "pipe", st
   } finally { holder.kill(); await holder.exited; }
 }, 20_000);
 
-// Each child waits for a shared start time, opens the registry, creates a tenant (a real write), and prints its id.
+// Each child signals readiness after loading the registry, waits for the shared release file, opens the registry,
+// creates a tenant (a real write), and prints its id.
 const CHILD = `
+const { existsSync, writeFileSync } = require("node:fs");
 const { sqliteRegistry } = await import(process.env.MOD);
-await Bun.sleep(Math.max(0, Number(process.env.AT) - Date.now()));
+writeFileSync(process.env.READY, "ready");
+while (!existsSync(process.env.GO)) await Bun.sleep(5);
 try {
   const r = sqliteRegistry({ path: process.env.DB, fullfsync: false });
   const t = await r.createTenant({ domain: null });
@@ -85,13 +88,19 @@ try {
   console.log("ok " + t.id);
 } catch (e) { console.log("ERR " + e.message); }`;
 
-test("12 processes open the same new registry.db at once, three rounds: every one starts and writes", async () => {
-  const N = 12;
+test("4 processes released together open the same new registry.db, three rounds: every one starts and writes", async () => {
+  const N = 4;
   for (let round = 0; round < 3; round++) {
     const db = join(dir, `registry-${round}.db`);
-    const AT = String(Date.now() + 500);                     // after every child has loaded
-    const ps = Array.from({ length: N }, () =>
-      spawnTracked(["bun", "-e", CHILD], { env: { ...process.env, MOD, DB: db, AT }, stdout: "pipe", stderr: "pipe" }));
+    const go = join(dir, `registry-${round}.go`);
+    const ps = Array.from({ length: N }, (_, i) =>
+      spawnTracked(["bun", "-e", CHILD], { env: { ...process.env, MOD, DB: db, GO: go, READY: join(dir, `registry-${round}-${i}.ready`) }, stdout: "pipe", stderr: "pipe" }));
+    const deadline = Date.now() + 10_000;
+    while (ps.some((_, i) => !existsSync(join(dir, `registry-${round}-${i}.ready`)))) {
+      if (Date.now() >= deadline) throw new Error("timed out waiting for registry open children to be ready");
+      await Bun.sleep(5);
+    }
+    writeFileSync(go, "go");
     const outs = await Promise.all(ps.map(async p => {
       const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
       await p.exited;

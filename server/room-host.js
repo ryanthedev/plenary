@@ -18,6 +18,9 @@
 //     in flight). When an append resolves, its entries are published on `.entries` (split under the bus cap)
 //     before the Room acks them.
 //   - Append timeout (4 s): the append's promise rejects, and the Room fails itself (nothing unresolved is acked).
+//   - Stuck host (#65, PROTOCOL.md § Recovery): every other Store call (build reads, acquire, lease) is bounded by
+//     `storeTimeoutMs`, and a progress watchdog stops a room whose waiting ops have not moved `seq` for `stuckMs`.
+//     Stopping = stop renewing; the Store lease lapses and a waiting host takes it. No second arbiter.
 //   - Only `welcome`, `ack` and `error` go back to a gateway (`.gw.<gateway>`). The Room's own catch-up and live
 //     broadcasts are not sent: gateways serve catch-up from the Store and fan out from `.entries` (rules 3, 8).
 //   - Every `unavailable` the Room says ends that connection (a gap, an unknown connection, a stopped room): the
@@ -80,22 +83,25 @@ export function newHolder(hostname) {
 /**
  * @param {{ store: object, bus: object, log?: object, codec?: object, now?: () => number, appendTimeoutMs?: number,
  *   sweepMs?: number, heartbeatMs?: number, pageSize?: number, pageBytes?: number, rules?: object, maxBusBytes?: number,
- *   holder?: string, hostname?: string, leaseTtlMs?: number, watchIdleMs?: number, monotonic?: () => number, timers?: object }} o
+ *   holder?: string, hostname?: string, leaseTtlMs?: number, watchIdleMs?: number, storeTimeoutMs?: number, stuckMs?: number, monotonic?: () => number, timers?: object }} o
  *   now: the rooms' clock (entries' `at`, the 30 s gateway silence). rules: per rules version { W, H, every } (tests).
  *   holder: this instance's lease holder id (tests); default newHolder(hostname). leaseTtlMs: the Store lease's ttl
  *   (default 10 s), renewed every ttl/3. watchIdleMs: a board held elsewhere is watched (for a takeover) while some
  *   open() or inbox message for it came in this long (default 60 s). monotonic: the lease's clock (default
- *   performance.now(); tests move it to fake a stall). Never the rooms' `now`.
+ *   performance.now(); tests move it to fake a stall). Never the rooms' `now`. storeTimeoutMs: bound on a Store call of a
+ *   build, acquire or lease read (default 10 s). stuckMs: a room with ops waiting whose resolved seq has not moved this
+ *   long is stopped (default 2 x appendTimeoutMs; checked every heartbeatMs).
  *   timers: { setTimeout, clearTimeout, setInterval, clearInterval } this host's timers (default the globals).
  */
 export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now = Date.now, appendTimeoutMs = 4_000, sweepMs = 1_000,
   heartbeatMs = 2_000, pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rules, maxBusBytes = bus.maxBytes ?? MAX_BUS_BYTES, tailFoldBytes = CHECKPOINT_BYTES, foldUnits, schedule, checkpointTimeoutMs = 30_000,
-  holder, hostname = globalThis.process?.env?.HOSTNAME, leaseTtlMs = 10_000, watchIdleMs = 60_000, monotonic = performance.now.bind(performance), timers = globalThis }) {
+  holder, hostname = globalThis.process?.env?.HOSTNAME, leaseTtlMs = 10_000, watchIdleMs = 60_000, storeTimeoutMs = 10_000, stuckMs = 2 * appendTimeoutMs, monotonic = performance.now.bind(performance), timers = globalThis }) {
   // tailFoldBytes: the Room's byte trigger for a checkpoint (§ Recovery, "When"): the log since the last one reaches this
   //   many chars and a quarter of the state's size (so a rewrite never costs more than ~4x the log). Default CHECKPOINT_BYTES.
   // foldUnits: work per step of an incremental checkpoint (fold.js; default FOLD_STEP_UNITS). Each step is its own
   //   `schedule(fn)` turn (default the injected timers' setImmediate, else the global; tests pass a queue they drain). checkpointTimeoutMs: a checkpoint write unanswered this long is failed (reported; the room's next fold may start), so a checkpoint never holds the loop for more than one step (§ Recovery, "Incremental fold").
   checkLeaseTtl(leaseTtlMs);
+  for (const [k, v] of Object.entries({ storeTimeoutMs, stuckMs })) if (!Number.isSafeInteger(v) || v < 1) throw new RangeError(`${k} must be a positive integer`);
   const sched = schedule ?? (fn => (timers.setImmediate ?? globalThis.setImmediate)(fn));   // the injected timers' turn, else the global one
   // Every timer of this host runs on `timers` (tests pass fake ones and advance them, with `monotonic` and the Store's
   // clock moved in step); the names shadow the globals for this whole function.
@@ -180,7 +186,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   async function readFrom(tenant, board, from) {
     const all = [];
     for (let next = from; ;) {
-      const page = await store.read(tenant, board, next, pageSize, pageBytes);
+      const page = await withTimeout(store.read(tenant, board, next, pageSize, pageBytes), storeTimeoutMs);
       if (!page.length) break;
       for (const e of page) all.push(e);
       next = page[page.length - 1].seq + 1;
@@ -242,6 +248,16 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       slot.retryTimer.unref?.();
     });
   }
+  /**
+   * The progress watchdog (#65): ops are waiting (an append in flight, queued or held) and the resolved seq has not
+   * moved for `stuckMs` (monotonic). An idle room, or one whose appends land, is never stuck. The record resets
+   * whenever nothing waits or the seq moved, so it is at most one heartbeat stale when work first arrives.
+   */
+  function stalled(slot) {
+    const st = slot.room.status(), t = perf();
+    if (st.inflight + st.queued + st.held === 0 || st.resolved !== slot.progress.seq) { slot.progress = { seq: st.resolved, at: t }; return false; }
+    return t - slot.progress.at >= stuckMs;
+  }
   /** The lease is gone (or may be): stop the room. Never `release` (someone else may hold the board now). */
   function lost(slot, why, err) {
     if (slot.dead) return;
@@ -258,13 +274,13 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   async function claim(tenant, board, key) {
     for (let tries = 0; tries < 3; tries++) {
       const sent = perf();
-      const l = await store.acquire(tenant, board, me, leaseTtlMs);
+      const l = await withTimeout(store.acquire(tenant, board, me, leaseTtlMs), storeTimeoutMs);
       if (closed) {
         if (l) await Promise.resolve(store.release(tenant, board, me, l.epoch)).catch(() => {});
         throw closedError();
       }
       if (l) return start(tenant, board, key, l, sent);
-      const info = await store.lease(tenant, board);
+      const info = await withTimeout(store.lease(tenant, board), storeTimeoutMs);
       if (closed) throw closedError();
       if (info?.live) return { held: info };
     }
@@ -282,7 +298,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   /** The lease is ours: renew at once (a long rebuild may outlast the ttl), then build. */
   function start(tenant, board, key, lease, sentAt) {
     const slot = { key, tenant, board, room: null, epoch: lease.epoch, dead: false, leaseLost: false, unsub: () => {}, conns: new Map(),
-      writes: new Set(), durable: 0, okAt: 0, renewTimer: null, deadlineTimer: null, renewing: false, promise: null, welcomed: new Set() };
+      writes: new Set(), durable: 0, progress: { seq: 0, at: sentAt }, okAt: 0, renewTimer: null, deadlineTimer: null, renewing: false, promise: null, welcomed: new Set() };
     startLease(slot, sentAt);
     held.set(key, slot);
     const p = build(slot).catch(err => {
@@ -309,7 +325,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       // A step runs only while this slot lives: a lost lease or a stopped host abandons a fold in progress, writing nothing.
       schedule: fn => sched(() => { if (!slot.dead) fn(); }), ...(rules ? { rules } : {}) };
     for (let before; ;) {
-      const cp = await store.getCheckpoint(tenant, board, before);
+      const cp = await withTimeout(store.getCheckpoint(tenant, board, before), storeTimeoutMs);
       const entries = await readFrom(tenant, board, cp && cp.seq > 0 ? cp.seq : 1);
       try { slot.room = Room.rebuild({ ...opts, checkpoint: cp, entries }); break; }
       catch (err) {
@@ -427,7 +443,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     if (perf() - w.wanted > watchIdleMs) { unwatch(w.key, true); log.info("stopped watching an idle board", { tenant: w.tenant, board: w.board }); return; }
     const again = info => { if (mine()) arm(w, Math.min(renewEvery, info?.live ? info.remainingMs + margin : renewEvery)); };
     let info;
-    try { info = await store.lease(w.tenant, w.board); }
+    try { info = await withTimeout(store.lease(w.tenant, w.board), storeTimeoutMs); }
     catch (err) { log.warn("lease read failed; trying again later", { tenant: w.tenant, board: w.board, err }); return again(null); }
     if (!mine()) return;
     if (info?.live && info.holder !== me) return again(info);
@@ -524,6 +540,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     for (const p of slots.values()) p.then(slot => {
       if (slot.dead) return;
       if (expired(slot)) return lost(slot, "no lease renew succeeded by the host deadline");
+      if (stalled(slot)) return lost(slot, `no progress: ops waiting and the resolved seq unmoved for ${stuckMs} ms`);
       bus.publish(subjects.entries(slot.tenant, slot.board), slot.room.heartbeat())?.catch?.(() => {});
     }, () => {});
   }, heartbeatMs);

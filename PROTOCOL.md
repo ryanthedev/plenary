@@ -650,6 +650,41 @@ rebuilt without guessing from the last entry.
   rule 6), a viewer only on its next reconnect. Nothing durable depends on the epoch: it is information for the
   client, and the fence is still the conditional append (§ Store).
 
+**Stuck host (#65): a host that is alive but not progressing is replaced through the lease, never by a second arbiter.**
+The Store lease stays the only authority. The room host (`server/room-host.js`) stops *renewing* a board it cannot
+serve; the lease then lapses by its own ttl and a waiting host takes it by the ordinary `acquire` (§ Bus, "The heartbeat,
+exactly"). Defaults: `leaseTtlMs` 10,000, `appendTimeoutMs` 4,000, `storeTimeoutMs` 10,000, `stuckMs` 8,000 (2 x
+`appendTimeoutMs`), `heartbeatMs` 2,000, renew every ttl/3 (3,333 ms).
+
+| # | What is stuck | Before #65 | Now | Room stopped within | A waiting host holds the lease within |
+|---|---|---|---|---|---|
+| a | the whole process (event loop blocked, SIGSTOP) | renews and timers cannot run; the lease lapses by its ttl; on waking the host sees `expired` at its first timer or inbox message and stops without answering | unchanged | on waking (the lease is already gone) | last renew + ttl + margin (about 10.2 s); a waiter also tries at its own silence (2 heartbeats = 4 s) but is refused until the lapse |
+| b1 | one board's `append` never answers | `withTimeout` 4 s failed the room | unchanged | `appendTimeoutMs` (4 s) | the stop + at most 10 s (renewing stops with the room; the lease lapses ttl after the last renew, which was before the stop) |
+| b2 | a Store call of the **build** (`getCheckpoint`, a `read` page) or of `acquire`/`lease` never answers | **unbounded**: renew kept succeeding, the lease was held forever by a room that never opened, `open` never settled | each call is bounded by `storeTimeoutMs`; a build that times out stops renewing and **releases** (a failed build, not a lost lease), so a waiter takes the board at once | `storeTimeoutMs` (10 s) per call | at once after the stop (release), else + ttl |
+| c | sequencing stalled: ops are waiting (`inflight` + `queued` + `held` > 0) and the resolved `seq` has not moved | only the append and checkpoint timeouts, which a skewed wall clock or a Store call that never reaches the room could defeat | **progress watchdog**: each heartbeat tick compares the resolved `seq`; no movement for `stuckMs` while work waits stops the room (`lost`: never `release`, an append may be in flight) | `stuckMs` + `heartbeatMs` = 10 s at most | + ttl |
+
+- **The progress watchdog** runs on the host's `monotonic` clock and `timers` (never the rooms' `now`), on the heartbeat
+  tick (`heartbeatMs`). It records `{ seq, at }` per room; the record resets whenever nothing waits or `seq` moved. An idle
+  room is never stuck: it cannot trip the watchdog. A slow Store is not stuck either: any append that lands moves `seq`.
+  `stuckMs` should exceed `appendTimeoutMs`; if it does not, a slow but live Store is cut early (safe, only noisy).
+- **What stopping does.** `lost`: the room fails, every connection it welcomed hears `unavailable` (close 1013) and
+  reconnects, renewing and the deadline timer stop, and nothing is released (a release could hang with the Store, and the
+  lapse is enough). The host's next `open` for the board acquires again (a new, higher epoch) if no other host did.
+- **No acknowledged op is lost.** An op is acked only after its append resolved *and* the lease was still within its host
+  deadline (§ Recovery, append). A stuck host that wakes has two defences: its own deadline check (`expired`) and the
+  Store's epoch fence. Every write the host makes carries the lease epoch and is checked **in the write's own transaction**:
+  `append`, `putCheckpoint` (small, each part, and the header; SQLite reads the lease epoch in the write transaction,
+  Postgres takes `FOR SHARE` on the lease row), so after a takeover (`acquire` raises the epoch) the old host's write is
+  `fenced` and writes nothing. `renew` and `release` are conditional on holder **and** epoch and are no-ops against a
+  newer holder. The host has no other Store write. An entry the old host made durable but never acked stays in the log;
+  the client resends it unacked and the new holder deduplicates it by op id (§ Op ids).
+- **What clients see.** A stuck room's writers get `unavailable` and reconnect (rule 12); their pending ops are resent
+  and deduplicated. Viewers lose nothing: gateways repair from the Store (§ Bus). A `hello` while no host serves the board
+  is answered `unavailable` by a waiting host once the heartbeat is silent for 2 heartbeats.
+- **A timed-out `acquire`.** The Store may still have applied it: the lease then sits held by this host with no renew and
+  lapses by its ttl; the next `acquire` by the same holder raises the epoch again. The host never trusts an answer that
+  arrived after its timeout.
+
 ## Op ids
 
 Op ids are `client:counter`. The room keeps, per (user, client): `high` (highest accepted counter), `last`

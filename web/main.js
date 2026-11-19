@@ -8,7 +8,7 @@
 //      &as= works ONLY when the server says dev sign-in is on (GET /auth/dev, web/ports/devconfig.js: the server has
 //      a local server with PLENARY_DEV_TOKENS, no Google sign-in and a loopback bind); otherwise it is ignored and nothing in the page offers it. With dev on, the sign-in screen lists
 //      the dev users, and a link with no board lands on the server's dev board.
-//      #code=<single-use code> after Google sign-in (docs/m2/contracts/auth-exchange.md): dropped from the address
+//      #code=<single-use code> after Google sign-in: dropped from the address
 //      bar at once (or, if that fails, never exchanged), then exchanged by POST /auth/exchange for the session token.
 // The token travels only in the first message on the socket (`hello`), never in the URL or a header (ws.js).
 

@@ -83,7 +83,6 @@ to any page on this machine's loopback names, and the log says so; tokens with `
 | `scripts/` | `admin-bootstrap.js` (first tenant admin), `load/` (load client), `cluster-rig.js` (local cluster), `dev-google.js` (a dev-only harness for checking Google sign-in by hand). None is the product server. |
 | `test/` | All tests (`bun test`). |
 | `deploy/` | Dockerfile and Compose files (see Docker). |
-| `docs/m2/` | The M2 plan, design mock, contracts and working reports. |
 | `PROTOCOL.md` | The protocol v1.1 spec. |
 
 ## Dev loop
@@ -200,10 +199,7 @@ and their variables.
 ## Design
 
 - [`PROTOCOL.md`](PROTOCOL.md): the wire protocol and the ports (store, bus, blobs, auth, registry).
-- [`docs/m2/PLAN.md`](docs/m2/PLAN.md): the M2 phases and what "done" means for each.
-- [`docs/m2/design/`](docs/m2/design/): the static UI mock the canvas was built from.
-- [`docs/m2/contracts/auth-exchange.md`](docs/m2/contracts/auth-exchange.md): the sign-in code exchange.
 
 ## License
 
-Not yet chosen. Until a LICENSE file is added, no license is granted.
+Apache-2.0, see [`LICENSE`](LICENSE).

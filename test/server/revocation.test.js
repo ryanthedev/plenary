@@ -1,5 +1,5 @@
 // Revocation and time-based loss of access (fix round 1 of p2-swap; verifier report p2-swapv H1, M1, M2, M3, L2, L6).
-// Shapes from the verifier's attack tests (docs/m2/reports/p2-swapv.attack.js.txt).
+// Shapes from the verifier's attack tests.
 import { test, expect, afterAll } from "bun:test";
 import { rig, tokenOf } from "./rig.js";
 import { cleanup, sleep, until, deferred } from "./helpers.js";

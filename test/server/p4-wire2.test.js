@@ -1,4 +1,4 @@
-// p4-wire2: the p4-wire verifier's findings (docs/m2/reports/p4-wirev.md), one block each.
+// p4-wire2: the p4-wire verifier's findings, one block each.
 //   M1 NATS credentials in NATS_URL reach the client as options; L1 redact()'s missing URL forms; L2 every log line
 //   after the start is redacted; L3 the sweep keeps `welcomed` equal to live welcomed conns; L4 a late `watching`
 //   resolves at the grace's end; L5 a stale publish rejection leaves a newer open alone; L6 node ids; L7 empty URLs.

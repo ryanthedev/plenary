@@ -1,4 +1,4 @@
-// The Auth contract (web/ports/auth.js; wire shape and field types in docs/m2/contracts/auth-exchange.md), as
+// The Auth contract (web/ports/auth.js), as
 // reusable bun tests. Every auth adapter runs it:
 //
 //   authContract("fake", () => { const a = fakeAuth(); return { auth: a, mint: async f => a.mint(f), force: k => a.setFail(k) }; });

@@ -168,7 +168,7 @@ test("finding 1: a timed pass whose rolesFor never settles is bounded by recheck
   await r.stop();
 }, 20000);
 
-// V1 and V2 adopted from the p5-load3v verifier (docs/m2/reports/p5-load3v.adv.test.js.txt).
+// V1 and V2 adopted from the p5-load3v verifier.
 test("V1: a timed-out rolesFor chunk whose answer (read BEFORE a lost revoke) lands late never fills the cache: the next hello is refused", async () => {
   const raw = memoryRegistry();
   let hold = false, entered, release;

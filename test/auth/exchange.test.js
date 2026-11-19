@@ -1,4 +1,4 @@
-// Sign-in code exchange (brief p5-code; docs/m2/contracts/auth-exchange.md): the callback puts a one-time code in the
+// Sign-in code exchange (brief p5-code): the callback puts a one-time code in the
 // URL fragment and an HttpOnly exchange cookie in the browser; POST /auth/exchange turns the pair into the session
 // token. No long-lived token in any URL.
 import { test, expect, beforeAll, beforeEach } from "bun:test";

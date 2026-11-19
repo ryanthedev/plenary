@@ -1,4 +1,4 @@
-// The hexagonal import rule for server/auth and server/admin (docs/m2/OFFICE.md "Architecture"; brief p5-hex).
+// The hexagonal import rule for server/auth and server/admin.
 // Engine owns the repo-wide test/architecture.test.js; this one covers platform's folders only.
 //
 //   port      a port module: typedefs, shared port pieces (mint, RegistryError), no adapter code

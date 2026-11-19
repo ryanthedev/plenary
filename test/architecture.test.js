@@ -1,4 +1,4 @@
-// The hexagonal boundary test for packages/, server/ and scripts/ (docs/m2/OFFICE.md "Architecture"; briefs p-arch
+// The hexagonal boundary test for packages/, server/ and scripts/ (briefs p-arch
 // and its follow-up after p-archv). Static: test/arch-scan.js parses import specifiers (static, re-exports, import(),
 // require(), JSDoc import("…") types, `new URL(…, import.meta.url)`); nothing is executed. client's
 // test/web/architecture.test.js reuses the scanner for web/.
@@ -31,7 +31,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { ROOT, listFiles, importsOf, checkBoundaries } from "./arch-scan.js";
 
-const SCAN = ["packages", "server", "scripts", "deploy"];   // every non-test code folder but web/ (client's) and docs/
+const SCAN = ["packages", "server", "scripts", "deploy"];   // every non-test code folder but web/ (client's)
 const CORE_DIRS = ["packages/protocol/", "packages/core/", "server/admin/"];
 const CORE_FILES = ["server/gateway.js", "server/room-host.js", "server/feed.js", "server/breather.js", "server/ids.js", "server/log.js"];
 const ADAPTER_DIRS = ["server/store/", "server/registry/", "server/bus/", "server/blobs/", "server/auth/"];

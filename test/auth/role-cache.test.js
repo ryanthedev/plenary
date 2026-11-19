@@ -408,7 +408,7 @@ test("redemption cost: a share-link use costs 2 Registry queries (link, addLinkU
   expect(c.calls).toEqual({ link: 1, addLinkUse: 1 });
 });
 
-// ---- F8: Registry queries, before and after (numbers go in docs/m2/reports/p5-load.md) ----
+// ---- F8: Registry queries, before and after ----
 
 test("query counts: hello cold/warm and a timed pass over 1,000 users on one board", async () => {
   // 1,000 users: 500 Workspace members (memberRole), 250 guests by invite, 250 guests by one shared link; 50 grants.

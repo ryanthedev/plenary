@@ -1,4 +1,4 @@
-// Sign-in core: who this tab is and the token its hello carries (docs/m2/contracts/auth-exchange.md). Core code:
+// Sign-in core: who this tab is and the token its hello carries. Core code:
 // it imports only ports (the auth port's error list) and touches no globals; the composition root passes the
 // fragment, a function that drops it from the address bar (history.replaceState), the session-storage adapter
 // (never localStorage), the auth adapter and the clock. Replaces web/ui/token.js's job (p6-hex wires it).

@@ -1,7 +1,7 @@
 // The Blobs port (PROTOCOL.md § Blobs): what every Blobs adapter (disk.js, s3.js) checks before storing.
 //   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB, a hash mismatch, and anything that isn't a PNG/JPEG/GIF/WebP
 //   get(tenant, sha1)          bytes, or null
-// Shared port pieces, no adapter code: adapters never import each other (docs/m2/OFFICE.md "Architecture").
+// Shared port pieces, no adapter code: adapters never import each other.
 
 import { isSha1, PortError } from "../ids.js";
 

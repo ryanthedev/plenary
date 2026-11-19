@@ -1,5 +1,5 @@
 // Auth port: trade the single-use sign-in code from the post-login fragment for a session token
-// (docs/m2/contracts/auth-exchange.md: POST /auth/exchange). Imports nothing.
+//. Imports nothing.
 // Contract test: test/web/contracts/auth-contract.js (authContract).
 //
 // Contract:

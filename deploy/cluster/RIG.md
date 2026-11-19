@@ -7,7 +7,7 @@ phase-4 takeover check ("kill a board's host, another host takes over, no acked 
 **Status (2026-11-12):** the rig works and is tested, with stub nodes and with the real `server/main.js`, which since
 p4-wire (7bf171b) runs in cluster mode on the env below (shared Postgres and NATS).
 
-**Env rules the rig keeps (main.js since 7bf171b, with p4-wire2's checks; docs/m2/reports/p4-wire2.md):**
+**Env rules the rig keeps:**
 - **Every node sets `PLENARY_ROLES` explicitly** (`gateway` or `host`) and both URLs. main.js refuses to start, before
   it opens or listens on anything, when:
   - `DATABASE_URL` or `NATS_URL` is set but empty;

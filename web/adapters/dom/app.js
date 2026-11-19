@@ -1,5 +1,5 @@
 // The canvas page's chrome: a driving adapter over the DOM (it calls into the core; it implements no port). Draws the verified
-// mock (docs/m2/design), paints through ./paint.js, feeds input to the core session (web/core/session.js), and
+// mock, paints through ./paint.js, feeds input to the core session (web/core/session.js), and
 // keeps UI preferences in the storage port it is given. Every write goes through session.act/setTool/key; nothing
 // here touches the protocol, a transport or sign-in (web/main.js, the composition root, wires those).
 

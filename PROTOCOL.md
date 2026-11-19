@@ -915,10 +915,10 @@ pacer take an **injected clock** (`tick(now)` or a `now` argument).
 | `presence.js` (new) | `presenceProblem`, rate limiter and coalescer (pure, clock injected); unit-tested in phase 2, relayed by gateways in phase 3 (the room never sees presence). Ships the emote set `EMOTES` = 👍 ❤️ 😂 🎉 👏 😮 🙏 🔥 |
 | `records.js` (new) | the `records` state (`Records`): threads, comments, reactions, tombstones; `check` against the speculative state before logging, `apply` on live entries and replay alike (no-ops for dead targets), snapshot shape `toJSON()`; pure, shared by the room and the replica |
 
-The v1.1 changes (§ What changed in v1.1) land after phase 2, as their own code job; its file-by-file list is in
-docs/m2/reports/p1-v11.md.
+The v1.1 changes (§ What changed in v1.1) land after phase 2, as their own code job; its file-by-file list is in the
+commit that landed it.
 
-Tests (PLAN.md phase 2 done-when, plus what this spec adds):
+Tests (phase 2 done-when, plus what this spec adds):
 
 | Test | Proves |
 |---|---|
@@ -965,7 +965,7 @@ Tests that change:
   connection.
 - `convergence.test.js` calls `compact()`: becomes `checkpoint()`.
 
-## Open questions for the CEO
+## Open questions
 
 1. **Durable reactions by viewers?** v1 says no: viewers send emotes (live, summed, not saved); comments and
    reactions need commenter or above, keeping 100k viewers off the sequencer. Yes would need a per-board cap.

@@ -1,6 +1,6 @@
 // The page's sign-in choice (web/core/signin.js pageSignIn, signInNotice) and how main.js wires it. Replaces
 // test/web/ui-token.test.js (web/ui/token.js is gone: the post-login fragment now carries a single-use #code, not the
-// token). Each of that file's guarantees is kept here; the map is in docs/m2/reports/p6-hex.md.
+// token). Each of that file's guarantees is kept here.
 import { test, expect, beforeEach } from "bun:test";
 import { pageSignIn, signInNotice, SESSION_KEY } from "../../../web/core/signin.js";
 import { fakeAuth } from "../../../web/adapters/auth/fake.js";

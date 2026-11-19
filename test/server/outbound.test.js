@@ -1,4 +1,4 @@
-// Fix round 2 (docs/m2/reports/p3-scaffoldv2.md): catch-up is streamed in bounded frames and paced by the socket,
+// Fix round 2: catch-up is streamed in bounded frames and paced by the socket,
 // the kept tail is folded by bytes, what the process owes its readers is budgeted, and a burst yields the loop.
 import { test, expect, afterAll } from "bun:test";
 import { join } from "node:path";

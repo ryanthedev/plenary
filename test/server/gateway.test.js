@@ -445,7 +445,7 @@ test("a log with a gap or a foreign entry is corruption: the room refuses to sta
   await r2.stop();
 });
 
-// ---- fix round (docs/m2/reports/p3-scaffoldv.md) ----
+// ---- fix round ----
 
 test("H1: nestedDeeperThan counts brackets outside strings, in one pass", async () => {
   const { nestedDeeperThan } = await import("../../server/gateway.js");

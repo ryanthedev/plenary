@@ -1,5 +1,5 @@
 // The HTTP auth adapter (web/adapters/auth/http.js): the auth contract over a fake fetch that plays the server of
-// docs/m2/contracts/auth-exchange.md, its own mapping rules, and one run against platform's real route in-process
+// the sign-in code exchange, its own mapping rules, and one run against platform's real route in-process
 // (server/auth/http.js, set up as test/auth/exchange.test.js does).
 import { describe, test, expect, beforeAll } from "bun:test";
 import { authContract } from "../contracts/auth-contract.js";

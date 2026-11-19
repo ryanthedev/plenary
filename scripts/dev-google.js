@@ -1,5 +1,5 @@
 // DEV HARNESS, NOT THE PRODUCT SERVER (brief p5-google). A composition root for one local check: real Google
-// sign-in against the Omniping OAuth client, before the engine's server mounts httpRoutes (p2-swap). Nothing here
+// sign-in against your own OAuth client, before the engine's server mounts httpRoutes (p2-swap). Nothing here
 // is used by server/main.js; delete it once a rerun against the real server replaces it.
 //
 //   bun scripts/dev-google.js   serve on http://localhost:8080 (bound to 127.0.0.1); Ctrl-C stops it

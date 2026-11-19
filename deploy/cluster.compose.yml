@@ -4,7 +4,7 @@
 # For local load tests and the takeover check without containers, use the native rig instead (deploy/cluster/RIG.md,
 # scripts/cluster-rig.js); it uses the same env names, the same role split, NATS max_payload 2 MB and Caddy.
 #
-# Cluster env (p4-wire, 7bf171b; docs/m2/reports/p4-wirev.md): server/main.js reads DATABASE_URL (Postgres store and
+# Cluster env: server/main.js reads DATABASE_URL (Postgres store and
 # registry), NATS_URL (NATS bus), PLENARY_NODE_ID (lease holder prefix; start and end it with a letter or digit),
 # PLENARY_ROLES (gateway/host split) and PLENARY_LEASE_TTL_MS, plus COOKIE_KEY, which cluster mode requires. Set
 # PLENARY_ROLES on every app node: an empty DATABASE_URL and NATS_URL (e.g. an unset interpolation) mean single node

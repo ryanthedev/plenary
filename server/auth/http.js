@@ -33,7 +33,7 @@
 // Routes (anything else, including /health, /ws, /blobs/*, /metrics, gives null):
 //   GET    /auth/login                         302 to Google; login state in a signed short-lived cookie
 //   GET    /auth/callback                      302 to postLoginUrl (or the board of a pending share link) #code=…,
-//                                              sets the exchange cookie (docs/m2/contracts/auth-exchange.md)
+//                                              sets the exchange cookie
 //   POST   /auth/exchange                      { code } + exchange cookie + Origin → 200 { token, user, name, email,
 //                                              domain, exp }; 400 invalid-code; 403 bad-origin; 503 unavailable
 //   GET    /auth/logout                        clears the login cookie, 302 to postLogoutUrl
@@ -208,7 +208,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
     const code = b64url(crypto.getRandomValues(new Uint8Array(32)));
     const h = b64url(await crypto.subtle.digest("SHA-256", utf8(code)));
     const exp = Math.floor(now() / 1000) + CODE_TTL_SEC;
-    // Field types per docs/m2/contracts/auth-exchange.md: name/email/domain string or null (empty name → null).
+    // Field types: name/email/domain string or null (empty name → null).
     const str = (v, max = 320) => (typeof v === "string" && v ? v.slice(0, max) : null);
     const payload = b64url(utf8(JSON.stringify({ h, u: identity.user, n: str(identity.name, 200), e: str(identity.email), d: str(identity.domain, 253), exp })));
     const mac = b64url(await crypto.subtle.sign("HMAC", await macKey, utf8("x1." + payload)));

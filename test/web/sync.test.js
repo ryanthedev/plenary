@@ -1,5 +1,5 @@
 // Editor ⇄ Replica binding over the in-process reference room (web/sync.js).
-// PLAN.md phase-6 gate: a refused op + resync leaves Editor == Replica. "==" here is strict: every byId
+// Phase-6 gate: a refused op + resync leaves Editor == Replica. "==" here is strict: every byId
 // entry (tombstones, version, versionNonce, content) and appState.herdr, in the Editor, the Replica and
 // the room. Every network run is seeded (localRoom's `seed`, or an explicit rng).
 import { test, expect } from "bun:test";

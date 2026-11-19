@@ -1,4 +1,4 @@
-// Import-graph scanner for the hexagonal boundary tests (docs/m2/OFFICE.md "Architecture"; brief p-arch).
+// Import-graph scanner for the hexagonal boundary tests.
 // Static: it parses source text with Bun's parser (brief p-scan); it never executes a scanned file. Not a test file
 // itself (no `.test.js`), so `bun test` only runs it through the tests that import it.
 //

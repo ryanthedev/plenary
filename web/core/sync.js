@@ -1,7 +1,7 @@
 // Editor ⇄ Replica binding: one link (transport + Replica + hello) per board, and on it one core Editor per element
 // stream, each kept in step with its stream (PROTOCOL.md v1; p8-one-link: one connection per tab).
 //
-// The seam (docs/m2/briefs/p6-base.md): Replica, Room and the codec belong to the engine track, so every
+// The seam: Replica, Room and the codec belong to the engine track, so every
 // call into them lives in this file and nowhere else in web/. The page and the tests use only what this
 // file exports; the returned handle never hands out the Replica itself.
 //

@@ -33,14 +33,15 @@ import { ROOT, listFiles, importsOf, checkBoundaries } from "./arch-scan.js";
 
 const SCAN = ["packages", "server", "scripts", "deploy"];   // every non-test code folder but web/ (client's)
 const CORE_DIRS = ["packages/protocol/", "packages/core/", "server/admin/"];
-const CORE_FILES = ["server/gateway.js", "server/room-host.js", "server/feed.js", "server/breather.js", "server/ids.js", "server/log.js", "server/blob-access.js"];
-const ADAPTER_DIRS = ["server/store/", "server/registry/", "server/bus/", "server/blobs/", "server/auth/", "server/compress/"];
+const CORE_FILES = ["server/gateway.js", "server/room-host.js", "server/feed.js", "server/breather.js", "server/ids.js", "server/log.js", "server/blob-access.js", "server/instrument.js"];
+const ADAPTER_DIRS = ["server/store/", "server/registry/", "server/bus/", "server/blobs/", "server/auth/", "server/compress/", "server/metrics/"];
 const SUPPORT_DIRS = ["server/pg/", "server/sqlite/", "server/encode/"];
 /** Driving adapters, each with its group: server.js serves HTTP/WebSocket (Bun.serve) and mounts static.js. */
 const DRIVING = {
   "server/server.js": "server/http",
   "server/static.js": "server/http",
   "server/blob-http.js": "server/http",
+  "server/metrics-http.js": "server/http",
   "server/auth/http.js": "server/auth/http",
 };
 const COMPOSITION_ROOTS = [
@@ -113,11 +114,11 @@ test("every allowlist entry says why", () => {
 test("the classes are what they must be (no vacuous pass)", () => {
   for (const p of ["packages/protocol/room.js", "packages/protocol/replica.js", "packages/core/doc.js", "server/gateway.js",
     "server/room-host.js", "server/feed.js", "server/ids.js", "server/log.js", "server/admin/boards.js", "server/auth/tenancy.js",
-    "server/bus/port.js", "server/blobs/port.js", "server/store/port.js", "server/auth/port.js", "server/auth/idp-port.js", "server/auth/registry-port.js",
+    "server/bus/port.js", "server/blobs/port.js", "server/metrics/port.js", "server/instrument.js", "server/store/port.js", "server/auth/port.js", "server/auth/idp-port.js", "server/auth/registry-port.js",
     "server/auth/util.js", "server/auth/resolver.js", "server/auth/permissions.js"]) expect([p, isCore(p), isAdapter(p)]).toEqual([p, true, false]);
   for (const p of ["server/store/sqlite.js", "server/store/postgres.js", "server/registry/postgres.js", "server/bus/nats.js",
     "server/bus/memory.js", "server/blobs/s3.js", "server/blobs/disk.js", "server/auth/oidc.js", "server/auth/dev.js",
-    "server/auth/http.js", "server/server.js", "server/pg/schema.js", "server/sqlite/schema.js"]) expect([p, isAdapter(p), isCore(p)]).toEqual([p, true, false]);
+    "server/auth/http.js", "server/server.js", "server/metrics/prometheus.js", "server/metrics-http.js", "server/pg/schema.js", "server/sqlite/schema.js"]) expect([p, isAdapter(p), isCore(p)]).toEqual([p, true, false]);
   for (const p of ["packages/natsbus/bus.js", "server/redis-cache.js", "scripts/seed.js"]) expect([p, isCore(p) || isAdapter(p)]).toEqual([p, false]);
   expect(adapterGroup("server/static.js")).toBe(adapterGroup("server/server.js"));
   expect(adapterGroup("server/blobs/s3.js")).not.toBe(adapterGroup("server/blobs/disk.js"));
@@ -145,6 +146,7 @@ test("every adapter imports its port module (one documented interface per port)"
     "server/registry/sqlite.js": "server/auth/registry-port.js", "server/registry/postgres.js": "server/auth/registry-port.js", "server/auth/registry.js": "server/auth/registry-port.js",
     "server/bus/memory.js": "server/bus/port.js", "server/bus/nats.js": "server/bus/port.js",
     "server/blobs/disk.js": "server/blobs/port.js", "server/blobs/s3.js": "server/blobs/port.js",
+    "server/metrics/prometheus.js": "server/metrics/port.js",
   };
   for (const [adapter, port] of Object.entries(PORT_OF)) expect([adapter, importsOf(adapter).map(i => i.to).includes(port)]).toEqual([adapter, true]);
 });

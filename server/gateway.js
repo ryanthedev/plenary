@@ -30,6 +30,7 @@ import { boardFeed } from "./feed.js";
 import { isId, isSha1 } from "./ids.js";
 import { quietLogger } from "./log.js";
 import { breathe } from "./breather.js";
+import { noopMetrics, FANOUT_BUCKETS } from "./metrics/port.js";
 import { identityKey } from "./auth/tenancy.js";   // the one spelling of the re-check grouping key (p5-load)
 
 export const LIMITS = {
@@ -134,9 +135,10 @@ const OP_ID = /^\s*\{\s*"t"\s*:\s*"op"\s*,\s*"id"\s*:\s*"([^"\\]{1,256})"/;
  *   onWelcomed?: (user: string, board: string) => void,   // called after a connection is welcomed (Recent, PROTOCOL.md § Home); must not throw or block
  *   log?: object, codec?: object, deflate?: (data: string | Uint8Array) => Promise<Uint8Array | null>, id?: string, limits?: Partial<typeof LIMITS>, now?: () => number,
  *   blobUrl?: (tenant: string, board: string, sha1: string, verb: "GET" | "PUT", user: string) => Promise<string>,   // signs a blob URL (blob-access.js); absent: `blob` requests get `unavailable`
+ *   metrics?: import("./metrics/port.js").Metrics,   // PROTOCOL.md § Metrics: plenary_connections, plenary_fanout_lag_seconds (default: records nothing)
  * }} o
  */
-export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed, timers = globalThis, deflate = null, blobUrl = null, onWelcomed = null }) {
+export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed, timers = globalThis, deflate = null, blobUrl = null, onWelcomed = null, metrics = noopMetrics }) {
   // Every timer of the gateway runs on `timers` (tests pass fake ones, with `now` moved in step); the names shadow the globals here.
   const { setTimeout, clearTimeout, setInterval, clearInterval } = timers;
   const lim = { ...LIMITS, ...limits };
@@ -162,6 +164,8 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
   /** @type {Map<string, number>} */ const socketByUser = new Map();
   /** @type {Map<string, number>} */ const owedByUser = new Map();
   /** @type {Map<string, number>} */ const connsByUser = new Map();
+  metrics.gauge("plenary_connections", "WebSockets open on this gateway now.", () => conns.size);
+  const fanoutLag = metrics.histogram("plenary_fanout_lag_seconds", "Seconds from the room sequencing entries to this gateway handing their frame to its viewers' queues (includes clock skew between nodes).", { buckets: FANOUT_BUCKETS });
   const bump = (map, key, by) => { const v = (map.get(key) ?? 0) + by; if (v > 0) map.set(key, v); else map.delete(key); };
   /** Re-read one socket's buffer and bring the totals up to date. Returns what it is owed now. */
   const observe = ws => {
@@ -450,7 +454,8 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
   const boards = new Map();
   const welcomedOn = b => [...b.conns].filter(ws => ws.data.state === "live" && ws.data.welcomed);
 
-  function onLive(b, { from, to, data }) {
+  function onLive(b, { from, to, at, data }) {
+    if (Number.isFinite(at)) fanoutLag.observe(Math.max(0, now() - at) / 1000);
     const len = bytesOf(data);   // once for the frame, not once per viewer
     for (const ws of b.conns) {
       const c = ws.data;

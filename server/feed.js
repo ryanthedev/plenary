@@ -24,7 +24,7 @@ import { breathe } from "./breather.js";
 const EMPTY = { seq: 0, id: null, by: null, at: null, streams: { board: { elements: [], appState: {} }, notes: { elements: [], appState: {} } }, appSeq: { board: {}, notes: {} }, records: { threads: [] }, noteAuthor: [] };
 
 /**
- * @param {{ tenant: string, board: string, store: object, bus: object, onLive: (e: { from: number, to: number, data: string }) => void,
+ * @param {{ tenant: string, board: string, store: object, bus: object, onLive: (e: { from: number, to: number, at?: number, data: string }) => void,
  *   log?: object, codec?: object, deflate?: (data: string | Uint8Array) => Promise<Uint8Array | null>, pollMs?: number, chunkBytes?: number, pageSize?: number, pageBytes?: number, rebaseEvery?: number, rebaseBytes?: number, zSlack?: number, random?: () => number }} o
  *   deflate: compresses one catch-up text once (PROTOCOL.md § Joining); absent, or answering null for a frame, joiners get it plain.
  *   zSlack: bytes of new entries after which the open last chunk's compressed prefix is made again (default 16 KiB).
@@ -65,7 +65,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
       if (x.seq !== self.seq + 1) break;      // a gap: the caller repairs from the Store
       self.tail.push(x); self.seq = x.seq; self.tailBytes += x.text.length; fresh.push(x);
     }
-    if (fresh.length) onLive({ from: fresh[0].seq, to: fresh[fresh.length - 1].seq, data: frameOf(fresh) });
+    if (fresh.length) onLive({ from: fresh[0].seq, to: fresh[fresh.length - 1].seq, at: fresh[0].at, data: frameOf(fresh) });   // at: when the room sequenced the first one (fan-out lag, PROTOCOL.md § Metrics)
     return fresh.length;
   }
   const fromStore = e => {

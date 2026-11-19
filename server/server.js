@@ -8,6 +8,7 @@
 //   GET /ws       the WebSocket (the token goes in the first message, never in a header or the URL)
 // Everything else goes to `http` (the platform track's routes: POST /boards, sign-in), then to the web app (static.js:
 // GET/HEAD of the page and its module graph, an allowlist built at start-up), else 404.
+//   GET /metrics  Prometheus text, on every role, only with `metricsEndpoint` (a bearer token) and else a 404 (metrics-http.js; PROTOCOL.md § Metrics)
 //   GET|PUT /blobs/<token>   signed blob URLs (blob-http.js); only when `blobs` is given. Without it the gateway
 //                            answers a socket's `blob` request `unavailable`.
 
@@ -17,6 +18,8 @@ import { quietLogger } from "./log.js";
 import { staticSite } from "./static.js";
 import { blobAccess } from "./blob-access.js";
 import { blobRoutes } from "./blob-http.js";
+import { metricsRoute } from "./metrics-http.js";
+import { noopMetrics } from "./metrics/port.js";
 
 const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
 
@@ -26,6 +29,7 @@ const json = (status, body) => new Response(JSON.stringify(body), { status, head
  *   port?: number, hostname?: string,
  *   http?: (req: Request, url: URL) => Response | undefined | Promise<Response | undefined>,
  *   blobKey?: Uint8Array, quotaBytes?: number, publicUrl?: string, maxBlobPuts?: number, blobHttp?: object, idleTimeoutSec?: number,   // blobHttp: more blobRoutes options (maxPutsPerUser, bodyDeadlineMs, timers). blobs: ≥ 32-byte signing key (default: random per process), tenant quota, the origin signed URLs name (default none: a path)
+ *   metrics?: object, metricsEndpoint?: { token: string, render: () => string },   // metrics: the Metrics port given to the gateway and the room host (default: records nothing); metricsEndpoint: turns /metrics on
  *   limits?: object, host?: object, static?: false | { mounts?: { url: string, dir: string }[] },
  *   roles?: { gateway: boolean, host: boolean }, node?: string, now?: () => number, timers?: object,
  *   deflate?: (data: string | Uint8Array) => Promise<Uint8Array | null>,   // compresses a shared catch-up text once, for clients that ask (PROTOCOL.md § Joining); absent: everyone gets plain text
@@ -34,21 +38,22 @@ const json = (status, body) => new Response(JSON.stringify(body), { status, head
  *   web/ and packages/, from static.js's own path). `roles`: see the header (default both). `node`: this node's id
  *   (names a gateway-only node's open requests). `onWelcomed(user, board)`: told when a connection is welcomed (Recent). `now`, `timers`: the gateway's clock and timers; tests inject virtual ones (default Date.now and the globals).
  */
-export function createServer({ auth, registry, store, bus, blobs = null, log = quietLogger, port = 0, hostname = "127.0.0.1", http, limits, host = {}, static: web = {},
+export function createServer({ auth, registry, store, bus, blobs = null, log = quietLogger, port = 0, hostname = "127.0.0.1", http, limits, metrics = noopMetrics, metricsEndpoint, host = {}, static: web = {},
   roles = { gateway: true, host: true }, node = "node", now, timers, deflate, blobKey, quotaBytes, publicUrl, maxBlobPuts, blobHttp: blobHttpOpts, onWelcomed, idleTimeoutSec = 30 }) {
   if (!roles || (!roles.gateway && !roles.host)) throw new TypeError("createServer needs at least one role (gateway, host)");
   const started = Date.now();
   const badRequest = badRequestLimiter();
   const site = web === false || !roles.gateway ? null : staticSite({ log, ...web });
   const rooms = roles.host
-    ? roomHost({ store, bus, log, ...host })
+    ? roomHost({ store, bus, log, metrics, ...host })
     : remoteRooms({ bus, node, timeoutMs: host.leaseTtlMs ?? 10_000, log });
   const unserve = roles.host ? serveOpens({ bus, rooms, log }) : () => {};
   const origin = publicUrl?.replace(/\/+$/, "") ?? "";   // "": signed URLs are the path /blobs/<token>, which the client resolves against the origin it connected to
   const access = blobs && roles.gateway ? blobAccess({ blobs, key: blobKey ?? crypto.getRandomValues(new Uint8Array(32)), origin, log, ...(now ? { now } : {}), ...(quotaBytes !== undefined ? { quotaBytes } : {}) }) : null;
   const blobHttp = access ? blobRoutes({ access, ...(maxBlobPuts ? { maxPuts: maxBlobPuts } : {}), ...(blobHttpOpts ?? {}) }) : null;
-  const gw = roles.gateway ? makeGateway({ auth, registry, store, bus, rooms, log, limits, ...(deflate ? { deflate } : {}), ...(access ? { blobUrl: access.url } : {}), ...(now ? { now } : {}), ...(timers ? { timers } : {}), ...(onWelcomed ? { onWelcomed } : {}) }) : null;
+  const gw = roles.gateway ? makeGateway({ auth, registry, store, bus, rooms, log, limits, metrics, ...(deflate ? { deflate } : {}), ...(access ? { blobUrl: access.url } : {}), ...(now ? { now } : {}), ...(timers ? { timers } : {}), ...(onWelcomed ? { onWelcomed } : {}) }) : null;
 
+  const metricsHttp = metricsRoute({ ...metricsEndpoint, log });
   const server = Bun.serve({
     port, hostname,
     // Bun's default is 10 s without a byte either way, which would cut a slow upload of a 10 MB picture mid-body (WebSockets have their
@@ -61,6 +66,7 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
         catch { badRequest(log); return json(400, { error: "bad-request" }); }   // a malformed Host header: no stack, a short line at most
         if (url.pathname === "/health" && (req.method === "GET" || req.method === "HEAD"))
           return json(200, { ok: true, uptimeMs: Date.now() - started, roles: { gateway: !!gw, host: !!roles.host }, gateway: gw ? gw.stats() : null, ...(http?.stats ? { http: http.stats() } : {}), ...rooms.stats() });
+        if (url.pathname === "/metrics") return await metricsHttp.handle(req);   // before the host-only 404: a host node is the one with the leases
         if (!gw) return json(404, { error: "not-found" });   // host only: nothing but /health
         if (url.pathname === "/ws") {
           if (srv.upgrade(req, { data: { z: url.searchParams.get("z") === "deflate" } })) return undefined;   // § Joining: the client can inflate catch-up

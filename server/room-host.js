@@ -35,6 +35,7 @@ import { subjects, MAX_BUS_BYTES, utf8Length } from "./bus/port.js";
 import { quietLogger } from "./log.js";
 import { PortError } from "./ids.js";
 import { breathe } from "./breather.js";
+import { noopMetrics } from "./metrics/port.js";
 
 const REPLIES = new Set(["welcome", "ack", "error"]);
 // A hello's catch-up is the gateway's (rule 8): the Room is told the client is at the end of time, so it builds none.
@@ -83,7 +84,8 @@ export function newHolder(hostname) {
 /**
  * @param {{ store: object, bus: object, log?: object, codec?: object, now?: () => number, appendTimeoutMs?: number,
  *   sweepMs?: number, heartbeatMs?: number, pageSize?: number, pageBytes?: number, rules?: object, maxBusBytes?: number,
- *   holder?: string, hostname?: string, leaseTtlMs?: number, watchIdleMs?: number, storeTimeoutMs?: number, stuckMs?: number, monotonic?: () => number, timers?: object }} o
+ *   holder?: string, hostname?: string, leaseTtlMs?: number, watchIdleMs?: number, storeTimeoutMs?: number, stuckMs?: number, monotonic?: () => number, timers?: object,
+ *   metrics?: import("./metrics/port.js").Metrics }} o   metrics: plenary_boards_hosted, plenary_ops_total, plenary_lease_changes_total (PROTOCOL.md § Metrics; default records nothing)
  *   now: the rooms' clock (entries' `at`, the 30 s gateway silence). rules: per rules version { W, H, every } (tests).
  *   holder: this instance's lease holder id (tests); default newHolder(hostname). leaseTtlMs: the Store lease's ttl
  *   (default 10 s), renewed every ttl/3. watchIdleMs: a board held elsewhere is watched (for a takeover) while some
@@ -95,7 +97,7 @@ export function newHolder(hostname) {
  */
 export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now = Date.now, appendTimeoutMs = 4_000, sweepMs = 1_000,
   heartbeatMs = 2_000, pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rules, maxBusBytes = bus.maxBytes ?? MAX_BUS_BYTES, tailFoldBytes = CHECKPOINT_BYTES, foldUnits, schedule, checkpointTimeoutMs = 30_000,
-  holder, hostname = globalThis.process?.env?.HOSTNAME, leaseTtlMs = 10_000, watchIdleMs = 60_000, storeTimeoutMs = 10_000, stuckMs = 2 * appendTimeoutMs, monotonic = performance.now.bind(performance), timers = globalThis }) {
+  holder, hostname = globalThis.process?.env?.HOSTNAME, leaseTtlMs = 10_000, watchIdleMs = 60_000, storeTimeoutMs = 10_000, stuckMs = 2 * appendTimeoutMs, monotonic = performance.now.bind(performance), timers = globalThis, metrics = noopMetrics }) {
   // tailFoldBytes: the Room's byte trigger for a checkpoint (§ Recovery, "When"): the log since the last one reaches this
   //   many chars and a quarter of the state's size (so a rewrite never costs more than ~4x the log). Default CHECKPOINT_BYTES.
   // foldUnits: work per step of an incremental checkpoint (fold.js; default FOLD_STEP_UNITS). Each step is its own
@@ -117,6 +119,10 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   const silentAfter = 2 * heartbeatMs;
   /** @type {Map<string, Promise<object>>} key "tenant/board" → the slot, once built */
   const slots = new Map();
+  // PROTOCOL.md § Metrics. `metrics` records only; a failure inside it never reaches this code (the port never throws).
+  metrics.gauge("plenary_boards_hosted", "Rooms this host holds or is building.", () => slots.size);
+  const opsTotal = metrics.counter("plenary_ops_total", "Ops this host sequenced and made durable.");
+  const leaseChanges = metrics.counter("plenary_lease_changes_total", "Board lease changes on this host, by event (acquired, lost, released).", ["event"]);
   /** key → an acquire (and the build it starts) under way, shared by concurrent opens and a takeover attempt */
   const claims = new Map();
   /** key → the latest slot whose lease this host acquired (close() releases them) */
@@ -177,7 +183,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
           // entries stay unacked, and the client's resend is deduplicated by the next holder.
           if (slot.leaseLost) return;
           if (expired(slot)) return lost(slot, "the host deadline passed before an append's result");
-          slot.durable = entries[entries.length - 1].seq; publishEntries(slot, entries);
+          slot.durable = entries[entries.length - 1].seq; opsTotal.inc(entries.length); publishEntries(slot, entries);
         }, err => { fenced("append", err); throw err; });
       },
       putCheckpoint(cp) {
@@ -271,7 +277,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   /** The lease is gone (or may be): stop the room. Never `release` (someone else may hold the board now). */
   function lost(slot, why, err) {
     if (slot.dead) return;
-    slot.leaseLost = true;
+    slot.leaseLost = true; leaseChanges.inc(1, { event: "lost" });
     log.error("room stopped: lease lost", { tenant: slot.tenant, board: slot.board, epoch: slot.epoch, why, err });
     fail(slot);
   }
@@ -315,7 +321,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   function start(tenant, board, key, lease, sentAt) {
     const slot = { key, tenant, board, room: null, epoch: lease.epoch, dead: false, leaseLost: false, unsub: () => {}, conns: new Map(),
       writes: new Set(), durable: 0, progress: { seq: 0, at: sentAt }, okAt: 0, renewTimer: null, deadlineTimer: null, renewing: false, promise: null, welcomed: new Set() };
-    startLease(slot, sentAt);
+    startLease(slot, sentAt); leaseChanges.inc(1, { event: "acquired" });
     held.set(key, slot);
     const p = build(slot).catch(err => {
       stopLease(slot); unwatch(key, true);
@@ -325,7 +331,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       // Then a host already watching the board is told (as after a clean stop), so it need not wait for its next poll.
       // `releaseP` never rejects: close() waits for it, then announces only if this did not (a failed release leaves the announcing to close()).
       if (!slot.leaseLost) slot.releaseP = withTimeout(Promise.resolve().then(() => store.release(tenant, board, me, slot.epoch)), storeTimeoutMs)   // a release that never answers: the lease lapses by its ttl
-        .then(() => { slot.announced = true; bus.publish(subjects.entries(tenant, board), { seq: 0, epoch: slot.epoch, cp: 0, released: true })?.catch?.(() => {}); })
+        .then(() => { slot.announced = true; leaseChanges.inc(1, { event: "released" }); bus.publish(subjects.entries(tenant, board), { seq: 0, epoch: slot.epoch, cp: 0, released: true })?.catch?.(() => {}); })
         .catch(e => log.warn("lease release after a failed build failed", { tenant, board, err: e }));
       throw err;
     });
@@ -637,6 +643,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
         if (slot.leaseLost) continue;
         try {
           await withTimeout(Promise.resolve().then(() => store.release(slot.tenant, slot.board, me, slot.epoch)), storeTimeoutMs);   // never answers: the lease lapses by its ttl (logged below)
+          leaseChanges.inc(1, { event: "released" });
           // A host watching this board takes it at once (L2), not when it next asks the Store.
           if (!slot.announced) bus.publish(subjects.entries(slot.tenant, slot.board), { seq: slot.durable, epoch: slot.epoch, cp: slot.room?.heartbeat().cp ?? 0, released: true })?.catch?.(() => {});
         } catch (err) { log.warn("lease release failed; it lapses within its ttl", { tenant: slot.tenant, board: slot.board, err }); }

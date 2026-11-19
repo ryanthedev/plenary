@@ -185,13 +185,13 @@ function fakeRun(objects, { imageOwner = null } = {}) {
   return { run, calls };
 }
 const RT = { cli: "/x/docker", cliName: "docker", compose: ["/x/docker", "compose"], env: {} };
-const PROJECT = "plenary-c3-77";
+const PROJECT = "plenary-c3-77-aaaaaa";
 const lbl = owner => ({ "com.docker.compose.project": PROJECT, "plenary.c3.owner": owner });
 
 test("a project that already has resources is not claimed, and teardown then runs nothing at all", async () => {
   const objs = [{ id: "theirs", kind: "container", labels: lbl(own(77, "OTHER")) }];
   const f = fakeRun(objs);
-  const stack = new Stack(RT, 77, own(77, "MINE"), f.run);
+  const stack = new Stack(RT, 77, own(77, "MINE"), f.run, "aaaaaa");
   await expect(stack.claim()).rejects.toThrow(/already has resources/);
   expect(stack.owned).toBe(false);
   const calls = f.calls.length;
@@ -207,7 +207,7 @@ test("teardown removes this run's resources and never a same-named project's oth
     { id: "c-theirs", kind: "container", labels: lbl(own(77, "OTHER")) }, { id: "n-theirs", kind: "network", labels: lbl(own(77, "OTHER")) },
   ];
   const f = fakeRun(objs);
-  const stack = new Stack(RT, 77, mine, f.run);
+  const stack = new Stack(RT, 77, mine, f.run, "aaaaaa");
   await stack.claim().catch(() => {});                // the project is not empty (theirs), so this is not claimed...
   expect(stack.owned).toBe(false);
   stack.owned = true;                                 // ...force it, as a run that did create things would be
@@ -218,8 +218,8 @@ test("teardown removes this run's resources and never a same-named project's oth
 
 test("leftovers reports the image only when it carries this run's owner label", async () => {
   const mine = own(77, "MINE");
-  expect(await new Stack(RT, 77, mine, fakeRun([], { imageOwner: own(77, "OTHER") }).run).leftovers()).toEqual([]);
-  expect(await new Stack(RT, 77, mine, fakeRun([], { imageOwner: mine }).run).leftovers()).toEqual(["image plenary-c3-77:test"]);
+  expect(await new Stack(RT, 77, mine, fakeRun([], { imageOwner: own(77, "OTHER") }).run, "aaaaaa").leftovers()).toEqual([]);
+  expect(await new Stack(RT, 77, mine, fakeRun([], { imageOwner: mine }).run, "aaaaaa").leftovers()).toEqual(["image plenary-c3-77-aaaaaa:test"]);
 });
 
 /** A fake protocol client with the parts keepAlive touches. */
@@ -251,4 +251,13 @@ test("keep-alive: a manual reconnect() is timed from when it started, a joining 
   tickClients([c], 5_000 + ABANDON_MS - 1); expect(c.reconnecting).not.toBeNull();
   const open = Object.assign(fakeClient(), { open: true });
   tickClients([open], 99_999_999); expect(open.calls).toBe(0);
+});
+
+test("two runs with the same pid get different project names and image tags (and the sweep never relies on the name)", () => {
+  const a = new Stack(RT, 4242), b = new Stack(RT, 4242);
+  expect(a.project).not.toBe(b.project);
+  expect(a.image).not.toBe(b.image);
+  expect(a.project).toMatch(/^plenary-c3-4242-[0-9a-f]{6}$/);
+  expect(a.image).toBe(`${a.project}:test`);
+  expect(readFileSync(join(ROOT, "scripts/test-compose.js"), "utf8")).not.toMatch(/PROJECT_RE|projectsOf|pidOf/);   // leftovers are found by the owner label, not a name format
 });

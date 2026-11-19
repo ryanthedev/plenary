@@ -360,7 +360,7 @@ Takes about 40 s warm.
   to podman's API socket (macOS: from `podman machine inspect`; Linux: `podman info`), unless `DOCKER_HOST` is already set.
   No runtime or no Compose: a loud `SKIPPED test:compose` banner on stderr and exit 0; `--require` or
   `PLENARY_COMPOSE_REQUIRE=1` makes that exit 1. Exit codes: 0 pass, 1 fail, 124 a deadline or command timed out, 130 interrupted.
-- **Isolation:** project `plenary-c3-<pid>`, image `plenary-c3-<pid>:test`, random secrets per run, host ports random on
+- **Isolation:** project `plenary-c3-<pid>-<6 random hex>` and the same name as image tag (unique per run, so two runs with one pid on a shared daemon never collide; nothing parses the name, leftovers are found by the owner label), random secrets per run, host ports random on
   127.0.0.1 (read with `compose port`; never 8099 or any fixed port). The cluster file itself runs all three nodes as
   `gateway,host`; the override adds only the random ports, `PLENARY_LEASE_TTL_MS=3000`, `restart: "no"` (the test decides when
   a node returns), CPU/memory limits and owner labels. The `lb` service is not started (clients connect to the nodes

@@ -2,9 +2,9 @@
 // `bun run test:compose`: the three-node cluster test on a container runtime (issue #71). NOT part of `bun test` or
 // `bun run test:cluster`: it builds an image and starts nine containers, so it runs only when asked.
 //
-// It builds deploy/Dockerfile as plenary-c3-<pid>:test, starts deploy/cluster.compose.yml plus the test override
+// It builds deploy/Dockerfile as plenary-c3-<pid>-<nonce>:test, starts deploy/cluster.compose.yml plus the test override
 // deploy/cluster.compose.test.yml (random loopback ports, short lease, limits, owner labels) as the Compose project
-// plenary-c3-<pid>, and checks, with the real protocol client (test/server/rig.js `client`, packages/protocol Replica):
+// plenary-c3-<pid>-<nonce> (nonce: 6 random hex per run), and checks, with the real protocol client (test/server/rig.js `client`, packages/protocol Replica):
 //   1. sequencing: two editors on two gateways write one board; the Postgres log has no gap and no duplicate;
 //   2. fan-out: a viewer on the third node (role viewer, asserted) holds every op, and an op it sends is refused
 //      (`forbidden`) and appends nothing;
@@ -254,10 +254,11 @@ function must(r, what) {
 }
 
 export class Stack {
-  constructor(rt, pid, owner = ownerString(pid), runFn = run) {
+  constructor(rt, pid, owner = ownerString(pid), runFn = run, nonce = randomBytes(3).toString("hex")) {
     this.rt = rt; this.pid = pid; this.owner = owner; this.runFn = runFn;
     this.owned = false;   // true only once this run has checked the project is empty and is about to create things in it: teardown touches nothing before
-    this.project = `plenary-c3-${pid}`; this.image = `plenary-c3-${pid}:test`;
+    // Unique per run, not per pid: two runs sharing a daemon with the same pid (two machines, CI namespaces) never share a project or image.
+    this.project = `plenary-c3-${pid}-${nonce}`; this.image = `plenary-c3-${pid}-${nonce}:test`;
     this.built = false; this.started = false; this.ports = {};
     this.pw = randomBytes(9).toString("hex");
     this.env = { ...process.env, ...rt.env, C3_OWNER: owner, POSTGRES_PASSWORD: this.pw, MINIO_ROOT_USER: "c3" + randomBytes(4).toString("hex"), MINIO_ROOT_PASSWORD: randomBytes(12).toString("hex"),

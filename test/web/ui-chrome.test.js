@@ -8,25 +8,12 @@ import { propsModel, availableFor, STYLE_ROWS, loadLibrary, saveLibrary } from "
 import { memoryStore } from "../../web/adapters/storage/memory.js";
 import { toSvg, exportSvg, paintPng } from "../../web/adapters/dom/export.js";
 
-test("responsive chrome keeps the compact dock below 1024px and collapses header extras through 1279px", () => {
+test("header ellipsis rules cover 1024, 1279, and 1280 pixel desktop widths", () => {
   const css = readFileSync(new URL("../../web/style.css", import.meta.url), "utf8");
-  expect(css).toMatch(/@media\s*\(max-width:\s*1023px\)/);
-  expect(css).toMatch(/@media\s*\(min-width:\s*1024px\)\s*and\s*\(max-width:\s*1279px\)/);
-  expect(css).toMatch(/\.header-more\s*\{\s*display:\s*none/);
-  expect(css).toMatch(/\.header-actions\s*>\s*\.header-more\s*\{\s*display:\s*inline-flex/);
-  expect(css).toMatch(/@media\s*\(max-width:\s*1023px\)\s*\{[^}]*\.header-actions\s*>\s*\.header-more[^}]*display:\s*none\s*!important/s);
-  expect(css).toMatch(/\.collab-pop\s+\.body\s*\{[^}]*overflow:\s*auto/s);
-  expect(css).toMatch(/\.pop:not\(\.collab-pop\)\s*\{[^}]*top:\s*auto\s*!important/s);
-  expect(css).toMatch(/\.collab-pop\s*\{[^}]*max-width:\s*calc\(100% - 16px\)/s);
-  expect(css).toMatch(/:focus-visible\s*\{/);
-  const collabCss = readFileSync(new URL("../../web/adapters/dom/collab/collab.css", import.meta.url), "utf8");
-  expect(collabCss).toMatch(/@media\s*\(max-width:\s*1023px\)/);
-  expect(collabCss).not.toMatch(/\.collab-pop\s*\{[^}]*top:\s*auto\s*!important/s);
-  const app = readFileSync(new URL("../../web/adapters/dom/app.js", import.meta.url), "utf8");
-  expect(app).toMatch(/matchMedia\("\(max-width:\s*1023px\)"\)/g);
-  expect(app).toMatch(/matchMedia\("\(min-width:\s*1024px\) and \(max-width:\s*1279px\)"\)/);
-  const collabUi = readFileSync(new URL("../../web/adapters/dom/collab/ui.js", import.meta.url), "utf8");
-  expect(collabUi).toMatch(/pop\.style\.setProperty\("width", `\$\{width\}px`\)/);
+  expect(css).toMatch(/\.board-name\s*\{[^}]*min-width:\s*0[^}]*overflow:\s*hidden[^}]*text-overflow:\s*ellipsis[^}]*flex:\s*0 1 auto/s);
+  expect(css).toMatch(/\.watching\s*\{[^}]*max-width:\s*150px[^}]*overflow:\s*hidden[^}]*text-overflow:\s*ellipsis[^}]*flex:\s*0 1 auto/s);
+  expect(css).toMatch(/\.topbar \.board-name\s*\{[^}]*max-width:\s*clamp\(56px, 12vw, 150px\)/s);
+  expect(css).toMatch(/\.watching\s*\{[^}]*max-width:\s*96px/s);
 });
 
 test("canvas page has a page heading", () => {

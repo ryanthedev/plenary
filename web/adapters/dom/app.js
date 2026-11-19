@@ -330,31 +330,51 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const toggleTheme = () => setTheme(ui.theme === "dark" ? "light" : "dark");
     const togglePanel = () => setPanel({ type: "open" });
     const toggleExport = () => openDialog("export");
-    const extraAction = (label, action) => h("button.header-extra.btn.ghost", { "aria-label": label, title: label, onclick: () => { setMore(false); action(); } }, label);
+    const extraAction = (label, action, disabled = false) => h("button.header-extra.btn.ghost", { role: "menuitem", "aria-label": label, title: label, disabled, onclick: () => { setMore(false, true); action(); } }, label);
     const moreOpen = !!ui.moreOpen;
     let menu;
+    const menuItems = () => {
+      const items = [];
+      const visit = node => { for (const child of node?.children ?? []) { if (child.getAttribute("role") === "menuitem") items.push(child); else visit(child); } };
+      visit(menu);
+      return items;
+    };
     const setMore = (open, focus = false) => {
       ui.moreOpen = open; more.setAttribute("aria-expanded", String(open)); menu.hidden = !open;
       if (focus) more.focus?.();
+      else if (open) menuItems()[0]?.focus?.();
     };
     const more = h("button.tb.header-more", { "aria-label": "More", "aria-haspopup": "menu", "aria-expanded": String(moreOpen), onclick: () => {
       setMore(!ui.moreOpen);
+    }, onkeydown: e => {
+      if (e.key === "ArrowDown" && !ui.moreOpen) { e.preventDefault(); setMore(true); }
+      else if (e.key === "Escape" && ui.moreOpen) { e.preventDefault(); setMore(false, true); }
     } }, "More");
     menu = h("div.header-more-menu", { role: "menu", hidden: !moreOpen, onkeydown: e => {
       if (e.key === "Escape") { e.preventDefault(); setMore(false, true); }
+      else if (e.key === "Tab") setMore(false);
+      else {
+        const items = menuItems(), i = items.indexOf(document.activeElement);
+        let next = null;
+        if (e.key === "ArrowDown") next = items[(i + 1) % items.length];
+        else if (e.key === "ArrowUp") next = items[(i - 1 + items.length) % items.length];
+        else if (e.key === "Home") next = items[0];
+        else if (e.key === "End") next = items.at(-1);
+        if (next) { e.preventDefault(); next.focus?.(); }
+      }
     } }, [
       collab ? extraAction("Comments", () => toggleDrawer("comments")) : null,
       extraAction("Notes", () => toggleDrawer("notes")),
-      role === "presenter" ? extraAction("Mermaid", () => openDialog("mermaid")) : null,
+      role === "presenter" ? extraAction("Mermaid", () => openDialog("mermaid"), !may) : null,
       role === "presenter" ? extraAction("Export", toggleExport) : null,
       role !== "viewer" ? extraAction("Side panel", togglePanel) : null,
       extraAction("Light / dark", toggleTheme),
     ]);
     const actions = h("div.header-actions", {},
         role === "presenter" ? [
-          h("button.btn.ghost.desk-only.header-extra", { title: "Insert a Mermaid flowchart", disabled: !may, onclick: () => openDialog("mermaid") }, "◇→"),
+          h("button.btn.ghost.desk-only.header-extra", { title: "Insert a Mermaid flowchart", "aria-label": "Insert Mermaid flowchart", disabled: !may, onclick: () => openDialog("mermaid") }, "◇→"),
           h("button.btn.ghost.desk-only.header-extra", { title: "Export SVG / PNG (⌘⇧E)", "aria-label": "Export", onclick: toggleExport }, "⤓")] : null,
-        h("button.btn.ghost.desk-only.header-extra", { "aria-label": "Notes", title: "Notes", onclick: () => toggleDrawer("notes") }, "❏ Notes ", h("span.dim", {}, String(notesCount()))),
+        h("button.btn.ghost.desk-only.header-extra", { "aria-label": "Notes", title: "Notes", onclick: () => { ui.drawer = ui.drawer ? null : "notes"; chromeDirty = true; } }, "❏ Notes ", h("span.dim", {}, String(notesCount()))),
         collab ? h("button.btn.ghost.desk-only.header-extra", { "aria-label": "Comments", title: "Comments (or right-click the board)", onclick: () => toggleDrawer("comments") }, "💬") : null,
         collab ? collab.parts.avatars : h("div.avatars", {},
           h("span.stack", {}, h("span.av.live", { style: { background: "var(--u-me)" }, title: `${me.name} (you)` }, me.name.slice(0, 2).toUpperCase()))),
@@ -446,11 +466,11 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const T = id => toolsFor("presenter").find(t => t.id === id);
   function dock() {
     const may = S.may(), role = S.role;
-    const btn = (ic, label, on, onclick, disabled = false) => h("button.tb" + (on ? ".on" : ""), { onclick, disabled }, h("span.ic", {}, ic), label);
+    const btn = (ic, label, on, onclick, disabled = false, ariaLabel = label) => h("button.tb" + (on ? ".on" : ""), { onclick, disabled, "aria-label": ariaLabel }, h("span.ic", {}, ic), label);
     const sheet = id => () => { ui.sheet = ui.sheet === id ? null : id; chromeDirty = true; };
     const tool = id => btn(T(id).icon, T(id).name, S.tool === id, () => { if (id === "image") openPicker(); S.setTool(id); chromeDirty = true; }, !may);
     let items;
-    if (role === "presenter") items = [...["select", "freedraw", "rectangle", "text"].map(tool), btn("⋯", "More", ui.sheet === "tools", sheet("tools")), btn("◧", "Style", ui.sheet === "panel", sheet("panel")), btn("❏", "Notes", ui.sheet === "notes", sheet("notes")), btn("💬", "Comments", ui.sheet === "comments", sheet("comments"))];
+    if (role === "presenter") items = [...["select", "freedraw", "rectangle", "text"].map(id => id === "rectangle" ? btn(T(id).icon, "Rect", S.tool === id, () => S.setTool(id), !may, T(id).name) : tool(id)), btn("⋯", "More", ui.sheet === "tools", sheet("tools")), btn("◧", "Style", ui.sheet === "panel", sheet("panel")), btn("❏", "Notes", ui.sheet === "notes", sheet("notes")), btn("💬", "Chat", ui.sheet === "comments", sheet("comments"), false, "Comments")];
     else if (role === "annotator") items = [...["select", "note", "highlighter", "freedraw"].map(tool), btn("⋯", "More", ui.sheet === "tools", sheet("tools")), btn("◧", "Style", ui.sheet === "panel", sheet("panel")), btn("❏", "Notes", ui.sheet === "notes", sheet("notes"))];
     else items = [btn("‹", "Prev", false, () => S.stepFrame(-1)), btn("⤢", "Fit", false, () => S.fit()), btn("›", "Next", false, () => S.stepFrame(1)), btn("❏", "Notes", ui.sheet === "notes", sheet("notes")), btn("💬", "Comments", ui.sheet === "comments", sheet("comments"))];
     replace($("#dock"), items);
@@ -724,7 +744,9 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   function fitOnce() {
     if (fitted || S.status !== "live") return;
     const hasContent = S.eds.board.doc.live().length || S.eds.notes.doc.live().length;
-    if (!hasContent || !S.eds.board.size.w || !S.eds.board.size.h) return;
+    if (!S.eds.board.size.w || !S.eds.board.size.h) return;
+    if (!hasContent) { fitted = true; return; }
+    if (S.gesture) return;
     fitted = true;
     S.fit();
   }

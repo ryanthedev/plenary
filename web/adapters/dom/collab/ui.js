@@ -25,6 +25,7 @@
 //                  follow with one transform on their layer while the view stays inside the placed region at the
 //                  same zoom; otherwise only the pins in the viewport plus a margin are re-placed (p7-perf C-1)
 //   collab.setTheme(theme) · collab.destroy()
+//   collab.setBottomInset(px)  reserve the visible bottom-sheet / dock area when positioning comment popovers
 
 import { h, replace } from "./dom.js";
 import { EMOTES, PRESENCE, canWrite } from "../../../core/collab/limits.js";
@@ -134,7 +135,8 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
   const one = h("button.tb", { title: "Emotes", "aria-label": "Emotes", onclick: togglePicker }, "👏");   // phones: one button opens the picker
   parts.emotes.append(...bar.map(b => b.btn), h("span.sep"), more);
   parts.emoteButton.append(one);
-  const pickerEl = h("div.emote-picker.collab-picker", { role: "menu", hidden: true }, EMOTES.map(e => h("button", { title: e, onclick: () => sendEmote(e) }, e)));
+  const pickerLabels = ["React with thumbs up", "React with heart", "React with laughing", "React with party popper", "React with clapping hands", "React with surprised face", "React with folded hands", "React with fire"];
+  const pickerEl = h("div.emote-picker.collab-picker", { role: "menu", hidden: true }, EMOTES.map((e, i) => h("button", { title: e, "aria-label": pickerLabels[i], onclick: () => sendEmote(e) }, e)));
   pickHost.append(pickerEl);
   function renderEmotes() {
     const counts = presence.view().counts, on = live() && mayPresence(port.role, "emote"), cool = on && cooling();

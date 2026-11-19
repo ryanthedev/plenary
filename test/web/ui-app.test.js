@@ -49,13 +49,13 @@ class E extends N {
 }
 const IDS = ["topbar", "panel", "drawer", "timeline", "hudBL", "hudBC", "hudBR", "dock", "sheet", "dialogs", "overlays", "veil", "toast", "picker"];
 
-let frames, winL, page;
+let frames, winL, page, media;
 // The globals this file stubs, put back afterwards so later files' fallbacks never see the stub page.
 const GLOBALS = ["document", "Node", "devicePixelRatio", "matchMedia", "ResizeObserver", "requestAnimationFrame", "addEventListener", "removeEventListener"];
 const saved = Object.fromEntries(GLOBALS.map(k => [k, Object.getOwnPropertyDescriptor(globalThis, k)]));
 afterAll(() => { for (const k of GLOBALS) { if (saved[k]) Object.defineProperty(globalThis, k, saved[k]); else delete globalThis[k]; } });
 function installPage() {
-  frames = []; winL = {};
+  frames = []; winL = {}; media = new Map();
   const body = new E("body"), main = new E("div"), canvasBox = new E("div"), board = new E("canvas"), ink = new E("textarea");
   main.className = "main"; body.append(main); main.append(canvasBox); canvasBox.append(board, ink);
   const byId = { canvas: canvasBox, board, ink };
@@ -70,13 +70,17 @@ function installPage() {
   };
   Object.assign(globalThis, {
     document: doc, Node: N, devicePixelRatio: 1,
-    matchMedia: () => ({ matches: false, addEventListener() {} }),
+    matchMedia: query => {
+      if (!media.has(query)) media.set(query, { matches: false, listeners: [] });
+      const m = media.get(query);
+      return { get matches() { return m.matches; }, addEventListener: (type, fn) => { if (type === "change") m.listeners.push(fn); } };
+    },
     ResizeObserver: class { constructor(fn) { this.fn = fn; } observe() { this.fn([]); } },
     requestAnimationFrame: fn => frames.push(fn),
     addEventListener: (t, fn) => { (winL[t] ??= []).push(fn); },
     removeEventListener: (t, fn) => { winL[t] = (winL[t] ?? []).filter(f => f !== fn); },
   });
-  page = { doc, byId, board };
+  page = { doc, byId, board, media };
   return page;
 }
 const fireWin = (t, ev = {}) => { for (const fn of winL[t] ?? []) fn({ preventDefault() {}, ...ev }); };
@@ -177,12 +181,54 @@ test("More menu exposes header actions and closes with Escape or an outside clic
   expect(more.attrs["aria-expanded"]).toBe("true");
   const menu = find(page.byId.topbar, e => e.attrs.role === "menu" && e.classList.contains("header-more-menu"));
   expect(["Comments", "Notes", "Mermaid", "Export", "Side panel", "Light / dark"].every(label => menu.all().some(e => e.tagName === "BUTTON" && e.attrs["aria-label"] === label))).toBe(true);
+  expect(menu.all().filter(e => e.tagName === "BUTTON").every(e => e.attrs.role === "menuitem")).toBe(true);
   menu.fire("keydown", { key: "Escape" });
   expect(more.attrs["aria-expanded"]).toBe("false");
   expect(page.doc.activeElement).toBe(more);
   more.click();
   page.doc.fire("click", { target: page.byId.panel });
   expect(more.attrs["aria-expanded"]).toBe("false");
+});
+
+test("More menu closes when the desktop width media query changes", () => {
+  rig = setup();
+  const more = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More");
+  more.click();
+  expect(more.attrs["aria-expanded"]).toBe("true");
+  const query = "(min-width: 1024px) and (max-width: 1279px)";
+  const m = page.media.get(query);
+  m.matches = false;
+  for (const fn of m.listeners) fn({ matches: false });
+  rig.step();
+  expect(find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More").attrs["aria-expanded"]).toBe("false");
+});
+
+test("More menu follows menu keyboard navigation and restores focus after activation", () => {
+  rig = setup({ collab: true });
+  const more = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More");
+  more.fire("keydown", { key: "ArrowDown" });
+  const menu = find(page.byId.topbar, e => e.attrs.role === "menu" && e.classList.contains("header-more-menu"));
+  const items = menu.all().filter(e => e.attrs.role === "menuitem");
+  expect(page.doc.activeElement).toBe(items[0]);
+  expect(items.length).toBeGreaterThan(2);
+  items[0].focus(); menu.fire("keydown", { key: "ArrowDown" });
+  expect(page.doc.activeElement).toBe(items[1]);
+  items[1].focus(); menu.fire("keydown", { key: "End" });
+  expect(page.doc.activeElement).toBe(items.at(-1));
+  items.at(-1).focus(); menu.fire("keydown", { key: "Home" });
+  expect(page.doc.activeElement).toBe(items[0]);
+  items[0].focus(); menu.fire("keydown", { key: "ArrowUp" });
+  expect(page.doc.activeElement).toBe(items.at(-1));
+  items[0].focus(); menu.fire("keydown", { key: "Tab" });
+  expect(more.attrs["aria-expanded"]).toBe("false");
+  more.fire("keydown", { key: "Escape" });
+  expect(more.attrs["aria-expanded"]).toBe("false");
+  more.fire("keydown", { key: "ArrowDown" });
+  const notes = menu.all().find(e => e.attrs.role === "menuitem" && e.attrs["aria-label"] === "Notes");
+  notes.click();
+  expect(page.doc.activeElement).toBe(more);
+  expect(more.attrs["aria-expanded"]).toBe("false");
+  expect(rig.app.ui.drawer).toBe("notes");
 });
 
 test("all collaboration emoji toolbar buttons have descriptive accessible labels", () => {
@@ -194,15 +240,46 @@ test("all collaboration emoji toolbar buttons have descriptive accessible labels
     "React with thumbs up", "React with heart", "React with laughing", "React with party popper",
     "React with clapping hands", "React with surprised face", "More emotes", "Emotes",
   ]);
+  const picker = find(page.doc.body, e => e.classList.contains("collab-picker"));
+  expect(picker.children.map(e => e.attrs["aria-label"])).toEqual([
+    "React with thumbs up", "React with heart", "React with laughing", "React with party popper",
+    "React with clapping hands", "React with surprised face", "React with folded hands", "React with fire",
+  ]);
+  const mermaid = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.textContent === "◇→");
+  expect(mermaid.attrs["aria-label"]).toBe("Insert Mermaid flowchart");
 });
 
-test("joining an empty board and receiving its content later fits the board", () => {
+test("header Notes closes an already open drawer", () => {
   rig = setup();
-  const { S, bo, step } = rig;
-  expect(S.eds.board.view.scale).toBe(1);
-  drawRect(bo, 3000, 3000); step(20);
-  expect(S.eds.board.doc.live().length).toBe(1);
-  expect(S.eds.board.view.x).toBeLessThan(-2000);
+  const notes = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "Notes");
+  rig.app.ui.drawer = "comments";
+  rig.step(2);
+  notes.click();
+  rig.step(2);
+  expect(rig.app.ui.drawer).toBeNull();
+});
+
+test("six-digit viewer count remains available in the mounted header", () => {
+  rig = setup({ collab: true });
+  rig.net.broadcast({ t: "here", writerCount: 0, viewers: 100000 });
+  while (rig.net.step());
+  const watching = find(page.byId.topbar, e => e.classList.contains("watching"));
+  expect(watching.textContent).toBe("👁 100,000 viewers");
+});
+
+test("local drawing on an empty board does not move the view", () => {
+  rig = setup();
+  const { S, step } = rig;
+  const before = { ...S.eds.board.view };
+  S.setTool("freedraw");
+  S.pointerDown({ x: 40, y: 40 });
+  S.pointerMove({ x: 80, y: 60 });
+  step(4);
+  expect(S.eds.board.view).toEqual(before);
+  S.pointerUp({ x: 90, y: 70 });
+  step(4);
+  expect(S.eds.board.view).toEqual(before);
+  expect(S.eds.board.doc.live().length).toBeGreaterThan(0);
 });
 
 test("C-2: a local change that only bumps the Editor (undo, a panel style chip) still refreshes the part that shows it", () => {

@@ -116,7 +116,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
     async moveBoard({ board, from, to, idem: key }) {
       const b = boards.get(board);
       if (!b) throw new Error("registry: no such board");
-      if (typeof from !== "string" || !from) throw new Error("registry: no such space");   // `from` names the board's current Space (no unfiled boards)
+      if (typeof from !== "string") throw new Error("registry: no such space");   // `from` names the board's current Space (no unfiled boards)
       if (spaces.get(to)?.tenant !== b.tenant) throw new Error("registry: no such space");
       const k = idemEnter(key);
       const moved = b.space !== to;

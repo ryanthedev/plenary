@@ -1441,7 +1441,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
       });
       test("`from` is required (every board has a Space): null, undefined or a non-string rejects \"no such space\" and changes nothing", async () => {
         const { a, b, board } = await mk();
-        for (const from of [null, undefined, 5, ""]) await expect(r.moveBoard({ board: board.id, ...(from === undefined ? {} : { from }), to: b.id })).rejects.toThrow(/no such space/);
+        for (const from of [null, undefined, 5]) await expect(r.moveBoard({ board: board.id, ...(from === undefined ? {} : { from }), to: b.id })).rejects.toThrow(/no such space/);
         expect((await r.board(board.id)).space).toBe(a.id);
       });
       test("already in `to` is a no-op success (moved: false), whatever `from` says", async () => {

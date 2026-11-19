@@ -358,13 +358,20 @@ async function createMinioBucket(endpoint, bucket, MINIO_ACCESS, MINIO_SECRET, t
   if (!response.ok && response.status !== 409) throw new Error(`minio bucket creation failed (HTTP ${response.status})`);
 }
 
-/** Poll `check` until true; fail fast if `proc` died or the rig was aborted; clear timeout error naming the log. */
-async function waitFor(check, { what, proc, deadline, abort }) {
+/** The last bytes of a service's log, as an error suffix: `down --clean` removes the log, so the cause must travel with the error. */
+const logTail = (path, n = 400) => {
+  let text = "";
+  try { text = readFileSync(path, "utf8").trim().slice(-n); } catch { /* no log yet */ }
+  return text ? `\n${basename(path)} ends: ${text}` : "";
+};
+
+/** Poll `check` until true; fail fast if `proc` died or the rig was aborted; clear timeout error naming the log and ending with its tail. */
+export async function waitFor(check, { what, proc, deadline, abort }) {
   while (true) {
     if (abort?.aborted) throw new Error(`aborted while waiting for ${what}`);
     if (await check()) return;
-    if (proc && !isOurs(proc)) throw new Error(`${what}: the process exited before it was ready (log: ${proc.log})`);
-    if (Date.now() > deadline) throw new Error(`${what}: not ready after the timeout (log: ${proc?.log ?? "n/a"})`);
+    if (proc && !isOurs(proc)) throw new Error(`${what}: the process exited before it was ready (log: ${proc.log})${logTail(proc.log)}`);
+    if (Date.now() > deadline) throw new Error(`${what}: not ready after the timeout (log: ${proc?.log ?? "n/a"})${proc ? logTail(proc.log) : ""}`);
     await sleep(100);
   }
 }

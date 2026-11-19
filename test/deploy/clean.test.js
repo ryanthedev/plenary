@@ -6,7 +6,7 @@ import { appendFileSync, mkdtempSync, mkdirSync, copyFileSync, readFileSync, wri
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { clean, summarize, measure, openPaths, openUnder, renameExcl, loadNativeRename, resetNativeRenameWarning, ROOT } from "../../scripts/clean.js";
 
 const made = [], kids = [];
@@ -39,7 +39,7 @@ const byName = (r, n) => r.items.find(i => i.path.endsWith("/" + n));
 const holder = (script, cwd, w) => { const p = Bun.spawn(["sh", "-c", script], { cwd, stdout: "ignore", stderr: "ignore" }); kids.push(p); if (w) appendFileSync(join(w.root, "holders"), p.pid + "\n"); return p; };
 /** Blocks until the real lsof (scoped to this world's holders) reports a path under `dir`: replaces a fixed sleep that load can outrun. */
 function waitHeld(w, dir, ms = 30_000) {
-  for (const end = Date.now() + ms; Date.now() < end; Bun.sleepSync(10)) if (openPaths(w.lsof).some(p => p.startsWith(dir))) return;
+  for (const end = Date.now() + ms; Date.now() < end; Bun.sleepSync(40)) if (openPaths(w.lsof).some(p => p.startsWith(dir))) return;
   throw new Error(`no process holding ${dir} after ${ms} ms`);
 }
 const failingLsof = (w, code) => { const f = join(w.root, `lsof-${code}`); writeFileSync(f, `#!/bin/sh\nexit ${code}\n`); chmodSync(f, 0o755); return f; };
@@ -130,7 +130,42 @@ test("a refused base throws before lsof is run (no system-wide scan for a reques
   expect(() => clean({ tempDir: "/", rigRoot: null, openPathsFn: spy })).toThrow(/refusing/);
   expect(() => clean({ tempDir: tmpdir(), scratch: "/Users", rigRoot: null, openPathsFn: spy })).toThrow(/refusing/);
   expect(() => clean({ tempDir: join(sandbox, "none"), rigRoot: "/", openPathsFn: spy })).toThrow(/refusing/);
+  // a symlink to / or $HOME, and a relative path that resolves to one, are refused the same way (as temp, scratch and rig)
+  const w = world(), toRoot = join(w.root, "to-root"), toHome = join(w.root, "to-home");
+  symlinkSync("/", toRoot); symlinkSync(process.env.HOME, toHome);
+  const relRoot = relative(process.cwd(), "/"), relHome = relative(process.cwd(), process.env.HOME);
+  for (const bad of [toRoot, toHome, relRoot, relHome]) {
+    expect(() => clean({ tempDir: bad, rigRoot: null, openPathsFn: spy })).toThrow(/refusing/);
+    expect(() => clean({ tempDir: w.tempDir, scratch: bad, rigRoot: null, openPathsFn: spy })).toThrow(/refusing/);
+    expect(() => clean({ tempDir: join(sandbox, "none"), rigRoot: bad, openPathsFn: spy })).toThrow(/refusing/);
+  }
   expect(scans).toBe(0);
+});
+
+// The production lsof path (clean() with no openPathsFn, an unscoped binary): what real lsof does that the scoped wrapper hides.
+const fakeLsof = (w, body) => { const f = join(w.root, "lsof-fake"); writeFileSync(f, `#!/bin/sh\n${body}\n`); chmodSync(f, 0o755); return f; };
+
+test("lsof exiting 1 with output (what it does when it could not inspect some process) still answers; exit 1 without output does not", () => {
+  const w = world(), d = entry(w.tempDir, "plenary-test-ex1111"), free = entry(w.tempDir, "plenary-test-ex2222");
+  const lsof = fakeLsof(w, `case "$*" in *+D*) exit 1;; esac\nprintf 'p1\\0n${d}/sub/f\\0\\n'\nexit 1`);
+  expect(openPaths(lsof)).toContain(`${d}/sub/f`);
+  const r = clean({ ...w, lsof, now: LATER(), yes: true });
+  expect(byName(r, "plenary-test-ex1111")).toMatchObject({ status: "kept", why: "in use" });
+  expect(byName(r, "plenary-test-ex2222").status).toBe("removed");
+  expect(existsSync(d) && !existsSync(free)).toBe(true);
+  expect(() => openPaths(fakeLsof(w, "exit 1"))).toThrow(/without an answer/);
+});
+
+test("a large lsof answer (50,000 open files, several MB) is read whole, and the entry named at its very end is seen", () => {
+  const w = world(), d = entry(w.tempDir, "plenary-test-big111");
+  const out = Array.from({ length: 50_000 }, (_, i) => `p${i}\0n/nowhere/some/long/path/to/an/open/file/${i}\0\n`).join("") + `p1\0n${d}/sub/f\0\n`;
+  writeFileSync(join(w.root, "big.out"), out);
+  const lsof = fakeLsof(w, `case "$*" in *+D*) exit 1;; esac\ncat "${w.root}/big.out"\nexit 1`);
+  const paths = openPaths(lsof);
+  expect(paths.length).toBe(50_001);
+  expect(paths.at(-1)).toBe(`${d}/sub/f`);
+  expect(byName(clean({ ...w, lsof, now: LATER(), yes: true }), "plenary-test-big111")).toMatchObject({ status: "kept", why: "in use" });
+  expect(existsSync(d)).toBe(true);
 });
 
 test("stopped rigs are removed, live or unknown ones kept (the rig's own liveness verdict decides)", () => {

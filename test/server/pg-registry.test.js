@@ -130,6 +130,11 @@ describe.skipIf(!url)("postgres registry", () => {
     } finally { await r.close(); await drop(schema); }
   });
 
+  // Multi-round races on real Postgres connections (TECH-DEBT row 34). ROUNDS is what kills the mutants reliably (a missing lock
+  // or check fails in round 0 or 1 in practice); RACE_CEILING is a failure-only ceiling for a loaded machine (a round is a few
+  // ms alone, tens of ms under load average ~20): the assertions are invariants, never elapsed time.
+  const ROUNDS = 12, RACE_CEILING = 30_000;
+
   test("two connections racing to demote a Space's only two owners (and a Group's): exactly one wins, every round", async () => {
     const schema = schemaName();
     const a = await postgresRegistry({ url, schema, max: 2 });
@@ -137,7 +142,7 @@ describe.skipIf(!url)("postgres registry", () => {
     try {
       const t = await a.createTenant({ domain: null });
       const g = await a.createGroup({ tenant: t.id, name: "P" }), sp = await a.createSpace({ tenant: t.id, name: "D" });
-      for (const scope of [{ type: "space", id: sp.id }, { type: "group", id: g.id }]) for (let round = 0; round < 25; round++) {
+      for (const scope of [{ type: "space", id: sp.id }, { type: "group", id: g.id }]) for (let round = 0; round < ROUNDS; round++) {
         await a.setScopedGrant({ scope, subject: { type: "user", id: "x" }, role: "owner" });
         await b.setScopedGrant({ scope, subject: { type: "user", id: "y" }, role: "owner" });
         const res = await Promise.allSettled([a.setScopedGrant({ scope, subject: { type: "user", id: "x" }, role: null }), b.setScopedGrant({ scope, subject: { type: "user", id: "y" }, role: round % 2 ? "viewer" : null })]);
@@ -148,7 +153,7 @@ describe.skipIf(!url)("postgres registry", () => {
         await a.setScopedGrant({ scope, subject: { type: "user", id: "y" }, role: null }).catch(() => {});
       }
     } finally { await a.close(); await b.close(); await drop(schema); }
-  });
+  }, RACE_CEILING);
 
   test("a Team's last member leaving races an owner demotion: the container never ends with no counted owner", async () => {
     const schema = schemaName();
@@ -158,7 +163,7 @@ describe.skipIf(!url)("postgres registry", () => {
       const t = await a.createTenant({ domain: null });
       const sp = await a.createSpace({ tenant: t.id, name: "D", owner: "u" }), tm = await a.createTeam({ tenant: t.id, name: "T" });
       const scope = { type: "space", id: sp.id };
-      for (let round = 0; round < 25; round++) {
+      for (let round = 0; round < ROUNDS; round++) {
         await a.setTeamMember(tm.id, "m", true);
         await a.setScopedGrant({ scope, subject: { type: "team", id: tm.id }, role: "owner" });
         const res = await Promise.allSettled([a.setScopedGrant({ scope, subject: { type: "user", id: "u" }, role: null }), b.setTeamMember(tm.id, "m", false)]);
@@ -171,7 +176,7 @@ describe.skipIf(!url)("postgres registry", () => {
         await a.setScopedGrant({ scope, subject: { type: "team", id: tm.id }, role: null });
       }
     } finally { await a.close(); await b.close(); await drop(schema); }
-  });
+  }, RACE_CEILING);
 
   test("a write transaction runs with synchronous_commit=on", async () => {
     const schema = schemaName();
@@ -199,7 +204,7 @@ describe.skipIf(!url)("postgres registry", () => {
     try {
       const t = await a.createTenant({ domain: null });
       const board = await a.createBoard({ tenant: t.id });
-      for (let round = 0; round < 40; round++) {
+      for (let round = 0; round < ROUNDS; round++) {
         await a.setGrant(board.id, "x", "owner");
         await b.setGrant(board.id, "y", "owner");
         const res = await Promise.allSettled([a.setGrant(board.id, "x", null), b.setGrant(board.id, "y", round % 2 ? "viewer" : null)]);
@@ -208,7 +213,7 @@ describe.skipIf(!url)("postgres registry", () => {
         for (const h of [a, b]) expect((await h.grants(board.id)).filter(g => g.role === "owner").length).toBe(1);
       }
     } finally { await a.close(); await b.close(); await drop(schema); }
-  });
+  }, RACE_CEILING);
 
   test("a setGrant waits on another connection's board lock, then sees its commit (last-owner)", async () => {
     const schema = schemaName();

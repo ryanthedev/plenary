@@ -1,10 +1,20 @@
-// Gateway fan-out micro-benchmark (#66): what one live frame costs the gateway for N viewers. In-process, deterministic, no sockets:
-// N fake viewer sockets (a sink that counts frames and bytes), a stub Store, the in-memory Bus. A frame is published on the board's
-// `.entries` subject exactly as a room host does; the clock runs from the publish until the last viewer's socket has received it.
-//   nice -n 19 timeout 60 bun scripts/fanout-bench.js [--root <repo>] [--n 1,100,1000,10000] [--frames 20] [--entry 300] [--json]
+// Gateway fan-out micro-benchmark (#66): what one live frame costs the gateway for N viewers.
+// Default modes are in-process and deterministic, with no sockets: N fake viewer sockets (a sink that counts frames and bytes), a stub
+// Store, the in-memory Bus. A frame is published on the board's `.entries` subject exactly as a room host does; the clock runs from the
+// publish until the last viewer's socket has received it.
+//   nice -n 19 timeout 60 bun scripts/fanout-bench.js [--root <repo>] [--n 1,100,1000,10000] [--frames 20] [--entry 300] [--presence] [--json]
+//   nice -n 19 timeout 60 bun scripts/fanout-bench.js --real-sockets [--sockets <=100]      (opens loopback sockets on 127.0.0.1 only)
 // --root measures another checkout (e.g. `git archive <sha> packages server | tar -x -C <dir>`) to compare before and after.
 // A report, not a gate. Reports per frame: wall ms (publish -> every viewer has it), CPU ms (user+system of the process), CPU µs per viewer,
-// bytes sent per viewer, heap growth per frame. Presence fan-out (the 50 ms batch) is measured the same way with --presence.
+// bytes sent per viewer, heap growth per frame.
+// --presence: instead of an `entries` frame, one cursor goes through the presence batch. Only the synchronous work of the gateway's 50 ms timer
+// is timed: the timer is captured and called by hand, so there is no timer wait, and the Bus hop that brings the cursor in is NOT included
+// (every viewer but the sender gets the one shared text). `here` and emote totals are not benchmarked: they share the push() path
+// (their length handling is covered by test/server/fanout.test.js).
+// --real-sockets: the NATIVE cost the stub sockets leave out. At most 100 loopback WebSockets of a real Bun.serve (hostname 127.0.0.1) in this
+// process; times the server-side loop of ws.send(string) per socket and the time until every client has it, for three frame sizes, and
+// server.publish(topic, text) (uWS pub/sub), which the gateway does not use (it would bypass the per-connection queue and budgets).
+// A client that errors or a trial that takes over 5 s fails the run at once.
 import { resolve } from "node:path";
 
 const arg = (k, d) => { const i = process.argv.indexOf(k); return i > 0 ? process.argv[i + 1] : d; };
@@ -14,13 +24,13 @@ const presence = process.argv.includes("--presence"), prefix = presence ? '{"t":
 if (process.argv.includes("--real-sockets")) {
   const N = Math.min(100, +arg("--sockets", 100)), socks = [];
   let recv = 0, want = 0, wake = null;
-  const server = Bun.serve({ port: 0, fetch(req, srv) { return srv.upgrade(req) ? undefined : new Response("x"); }, websocket: { open(ws) { socks.push(ws); ws.subscribe("b"); }, message() {} } });
-  const clients = await Promise.all(Array.from({ length: N }, () => new Promise(r => { const c = new WebSocket(`ws://127.0.0.1:${server.port}`); c.onopen = () => r(c); c.onmessage = () => { if (++recv >= want && wake) wake(); }; })));
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(req, srv) { return srv.upgrade(req) ? undefined : new Response("x"); }, websocket: { open(ws) { socks.push(ws); ws.subscribe("b"); }, message() {} } });
+  const clients = await Promise.all(Array.from({ length: N }, () => new Promise((r, rej) => { const c = new WebSocket(`ws://127.0.0.1:${server.port}`); c.onopen = () => r(c); c.onerror = () => rej(new Error("a loopback client failed to connect")); c.onmessage = () => { if (++recv >= want && wake) wake(); }; })));
   await new Promise(r => setTimeout(r, 50));
   const med = a => [...a].sort((x, y) => x - y)[a.length >> 1];
   const trial = async (label, size, fn) => {
     const loop = [], all = [];
-    for (let i = 0; i < 25; i++) { recv = 0; want = N; const p = new Promise(r => { wake = r; }); const t0 = performance.now(); fn(); loop.push(performance.now() - t0); await p; all.push(performance.now() - t0); }
+    for (let i = 0; i < 25; i++) { recv = 0; want = N; const p = Promise.race([new Promise(r => { wake = r; }), new Promise((_, rej) => setTimeout(() => rej(new Error(`${label} ${size}: not every client got the frame in 5 s (${recv}/${want})`)), 5000).unref())]); const t0 = performance.now(); fn(); loop.push(performance.now() - t0); await p; all.push(performance.now() - t0); }
     console.log(JSON.stringify({ sockets: N, chars: size, mode: label, sendLoopUsPerSocket: +(med(loop.slice(5)) * 1000 / N).toFixed(2), untilAllReceivedUsPerSocket: +(med(all.slice(5)) * 1000 / N).toFixed(2) }));
   };
   for (const size of [300, 8000, 100000]) {

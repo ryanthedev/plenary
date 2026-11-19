@@ -105,18 +105,17 @@ test("DW-66: the presence batch's length is counted once and in UTF-8 bytes", as
 });
 
 /** Publish a `.here` from another gateway, run the `here` tick, and say what each viewer was queued (the sockets never drain until `drained`). */
-async function hereTick(writers, viewers = 5) {
-  const v = await viewers_(2);
+async function hereTick(writers, viewerCount = 5) {
+  const v = await viewers(2, { blockAll: true });
   await settle();
   const before = owedAbove(v);
   v.clock.t += 60_000;
-  v.bus.publish(subjects.here(TENANT, BOARD), { gateway: "g-other00000000000", writers, writerCount: writers.length, viewers });
+  v.bus.publish(subjects.here(TENANT, BOARD), { gateway: "g-other00000000000", writers, writerCount: writers.length, viewers: viewerCount });
   await settle();
   v.ticks.here();
   await settle();
   return { v, queued: owedAbove(v) - before, frames: () => drained(v, '{"t":"here"').map(f => f.at(-1)) };
 }
-const viewers_ = n => viewers(n, { blockAll: true });
 
 test("DW-66: `here` with a changed list (the full message) is counted in UTF-8 bytes", async () => {
   const { v, queued, frames } = await hereTick([{ user: "writer1", name: "✓".repeat(150), role: "editor", active: 1 }]);

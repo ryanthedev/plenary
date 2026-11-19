@@ -84,7 +84,7 @@ test("emote bar: viewers send but never float; writers float; disabled when not 
   expect(byClass(w.collab.layer, "collab-float")).toEqual([]);
   // ✨ opens the full fixed set
   button(w.collab.parts.emotes, "✨").click();
-  expect(byClass(w.collab.layer, "collab-picker")[0].children.map(b => b.textContent)).toEqual(["👍", "❤️", "😂", "🎉", "👏", "😮", "🙏", "🔥"]);
+  expect([...byClass(w.collab.layer, "collab-picker")[0].children].map(b => b.textContent)).toEqual(["👍", "❤️", "😂", "🎉", "👏", "😮", "🙏", "🔥"]);
   w.collab.destroy();
 });
 

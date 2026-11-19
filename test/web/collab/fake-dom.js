@@ -26,9 +26,14 @@ export class FakeElement extends FakeNode {
   dispatch(type, ev = {}) { const e = { currentTarget: this, target: this, preventDefault() {}, stopPropagation() {}, ...ev }; for (const fn of this.listeners[type] ?? []) fn(e); }
   click() { if (!this.disabled) this.dispatch("click"); }
   focus() {}
-  get children() { return this.childNodes.filter(n => n.nodeType === 1); }
+  /** Like the real HTMLCollection: indexable, `length`, `item`, iterable, and NO array methods (so `children.indexOf` fails here as it does in Chrome). */
+  get children() {
+    const els = this.childNodes.filter(n => n.nodeType === 1), c = { length: els.length, item: i => els[i] ?? null, [Symbol.iterator]: () => els[Symbol.iterator]() };
+    els.forEach((e, i) => { c[i] = e; });
+    return c;
+  }
   /** Every element under (and including) this one. */
-  all() { return [this, ...this.children.flatMap(c => c.all())]; }
+  all() { return [this, ...this.childNodes.filter(n => n.nodeType === 1).flatMap(c => c.all())]; }
   find(pred) { return this.all().find(pred); }
   findAll(pred) { return this.all().filter(pred); }
   hasClass(c) { return this.classList.contains(c); }

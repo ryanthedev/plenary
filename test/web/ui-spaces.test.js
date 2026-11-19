@@ -297,3 +297,53 @@ test("overflowMenu alone: items with `hidden` are left out; Tab closes it", () =
   key(root.find(e => e.getAttribute("role") === "menu"), "Tab");
   expect(root.find(e => e.getAttribute("role") === "menu")).toBeUndefined();
 });
+
+test("after a rename ends focus lands on the title or the card's link, never the page body; blur on a card editor saves", async () => {
+  await spacePage();
+  const h1 = () => root.find(e => e.tagName === "H1");
+  // title: Escape
+  btn("Space options").click(); root.findAll(e => e.getAttribute("role") === "menuitem")[0].click(); await settle();
+  expect(focused.at(-1).getAttribute("aria-label")).toBe("Space name");                           // the editor takes focus
+  key(root.find(e => e.getAttribute("aria-label") === "Space name"), "Escape");
+  expect(focused.at(-1)).toBe(h1());
+  // title: Enter
+  btn("Space options").click(); root.findAll(e => e.getAttribute("role") === "menuitem")[0].click();
+  const i = root.find(e => e.getAttribute("aria-label") === "Space name"); i.value = "Brand"; key(i, "Enter"); await settle();
+  expect(focused.at(-1)).toBe(h1());
+  // card: Escape, Enter, blur
+  const cardMenu = () => root.findAll(e => e.tagName === "BUTTON" && e.getAttribute("aria-label") === "More for Roadmap")[0];
+  const open = () => { cardMenu().click(); root.findAll(e => e.getAttribute("role") === "menuitem").find(e => textOf(e) === "Rename").click(); return root.find(e => e.getAttribute("aria-label") === "Board title"); };
+  const link = t => root.findAll(e => e.hasClass("card-open") && e.tagName === "A").find(e => textOf(e).startsWith(t));
+  let c = open(); key(c, "Escape");
+  expect(focused.at(-1)).toBe(link("Roadmap"));
+  c = open(); c.value = "Plan"; key(c, "Enter"); await settle();
+  expect(calls.at(-1)).toEqual(["renameBoard", "b-1", "Plan"]);
+  expect(focused.at(-1)).toBe(link("Plan"));
+  expect(root.find(e => e.getAttribute("aria-label") === "Board title")).toBeUndefined();
+  const m2 = root.findAll(e => e.tagName === "BUTTON" && e.getAttribute("aria-label") === "More for Plan")[0];
+  m2.click(); root.findAll(e => e.getAttribute("role") === "menuitem").find(e => textOf(e) === "Rename").click();
+  const d = root.find(e => e.getAttribute("aria-label") === "Board title"); d.value = "Plan B"; d.dispatch("blur"); await settle();      // clicking away saves
+  expect(calls.at(-1)).toEqual(["renameBoard", "b-1", "Plan B"]);
+  expect(root.find(e => e.getAttribute("aria-label") === "Board title")).toBeUndefined();
+});
+
+test("the busy re-render keeps the typed text in the card editor (no flash of the old title)", async () => {
+  await spacePage();
+  let release; api.answer = (n, id, t) => (n === "renameBoard" ? new Promise(r => { release = () => r({ board: { id, title: t } }); }) : undefined);
+  root.findAll(e => e.getAttribute("aria-label") === "More for Roadmap")[0].click();
+  root.findAll(e => e.getAttribute("role") === "menuitem").find(e => textOf(e) === "Rename").click();
+  const i = root.find(e => e.getAttribute("aria-label") === "Board title"); i.value = "Typed"; key(i, "Enter"); await settle();
+  const now = root.find(e => e.getAttribute("aria-label") === "Board title");
+  expect([now, now.value]).toEqual([i, "Typed"]);
+  release(); await settle();
+  expect(textOf(root.findAll(e => e.hasClass("card-open"))[0])).toMatch(/^Typed/);
+});
+
+test("Group page: a saved rename puts focus on the title", async () => {
+  const model = createPageModel({ api, kind: "group", id: "g-1" });
+  mountGroupPage({ root, model, dialogs: dialogsFor(), hrefs }); await model.load();
+  btn("Group options").click(); root.findAll(e => e.getAttribute("role") === "menuitem")[0].click();
+  const i = root.find(e => e.getAttribute("aria-label") === "Group name"); i.value = "Product 2"; key(i, "Enter"); await settle();
+  expect(calls.at(-1)).toEqual(["updateGroup", "g-1", { name: "Product 2" }]);
+  expect(focused.at(-1)).toBe(root.find(e => e.tagName === "H1"));
+});

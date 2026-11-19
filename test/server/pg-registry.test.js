@@ -9,6 +9,7 @@ import { SQL } from "bun";
 import { postgresRegistry, registryTables, REGISTRY_INDEXES } from "../../server/registry/postgres.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { registryContract } from "../auth/registry-contract.js";
+import { tenancy } from "../../server/auth/tenancy.js";
 import { legacyEquivalence } from "../auth/legacy-migration.js";
 import { migrate } from "../../server/pg/schema.js";
 
@@ -93,6 +94,85 @@ describe.skipIf(!url)("postgres registry", () => {
       return { boards: await c("reg_boards"), grants: await c("reg_grants"), invites: await c("reg_invites"), links: await c("reg_links") };
     },
   });
+  test("accessContext is ONE statement (one snapshot), cold or with a held chain; a cold hello is a handful", async () => {
+    const schema = schemaName();
+    let reads = 0;
+    const counted = new Proxy(client(), { get: (t, p) => (p === "unsafe" ? (...a) => { reads++; return t.unsafe(...a); } : typeof t[p] === "function" ? t[p].bind(t) : t[p]) });
+    const r = await postgresRegistry({ sql: counted, schema });
+    try {
+      const t = await r.createTenant({ domain: "acme.com", admins: ["google:root"] });
+      const g = await r.createGroup({ tenant: t.id, name: "P" }), sp = await r.createSpace({ tenant: t.id, name: "D", group: g.id });
+      const tm = await r.createTeam({ tenant: t.id, name: "T" });
+      for (const u of ["google:a", "google:b"]) await r.setTeamMember(tm.id, u, true);
+      await r.setScopedGrant({ scope: { type: "group", id: g.id }, subject: { type: "team", id: tm.id }, role: "editor" });
+      await r.setScopedGrant({ scope: { type: "unit", id: t.id }, subject: { type: "user", id: "google:a" }, role: "member" });
+      const b = await r.createBoard({ tenant: t.id, space: sp.id });
+      const scope = { type: "board", id: b.id };
+      reads = 0;
+      const cold = await r.accessContext(scope, { users: ["google:a"] });
+      expect(reads).toBe(1);
+      expect(cold.teams).toEqual({ [tm.id]: ["google:a"] });
+      expect([cold.board.id, cold.space.id, cold.group.id, cold.tenant.id]).toEqual([b.id, sp.id, g.id, t.id]);
+      reads = 0;
+      const warm = await r.accessContext(scope, { users: ["google:b"], chain: { tenant: cold.tenant, board: cold.board, space: cold.space, group: cold.group } });
+      expect(reads).toBe(1);
+      expect(warm.teams).toEqual({ [tm.id]: ["google:b"] });
+      expect(warm.scoped).toEqual(cold.scoped);
+      for (const type of ["space", "group", "unit"]) { reads = 0; expect(await r.accessContext({ type, id: { space: sp.id, group: g.id, unit: t.id }[type] })).not.toBe(null); expect(reads).toBe(1); }
+      reads = 0;
+      expect(await r.accessContext({ type: "board", id: "b-nope00000000" })).toBe(null);
+      expect(reads).toBe(1);
+      // a whole cold hello through tenancy: accessContext + grant + invitesFor + linkUses
+      reads = 0;
+      const ten = tenancy({ registry: r });
+      expect(await ten.role({ user: "google:a", email: "a@acme.com", domain: "acme.com" }, b.id)).toBe("editor");
+      expect(reads).toBe(4);
+    } finally { await r.close(); await drop(schema); }
+  });
+
+  test("two connections racing to demote a Space's only two owners (and a Group's): exactly one wins, every round", async () => {
+    const schema = schemaName();
+    const a = await postgresRegistry({ url, schema, max: 2 });
+    const b = await postgresRegistry({ url, schema, max: 2 });
+    try {
+      const t = await a.createTenant({ domain: null });
+      const g = await a.createGroup({ tenant: t.id, name: "P" }), sp = await a.createSpace({ tenant: t.id, name: "D" });
+      for (const scope of [{ type: "space", id: sp.id }, { type: "group", id: g.id }]) for (let round = 0; round < 25; round++) {
+        await a.setScopedGrant({ scope, subject: { type: "user", id: "x" }, role: "owner" });
+        await b.setScopedGrant({ scope, subject: { type: "user", id: "y" }, role: "owner" });
+        const res = await Promise.allSettled([a.setScopedGrant({ scope, subject: { type: "user", id: "x" }, role: null }), b.setScopedGrant({ scope, subject: { type: "user", id: "y" }, role: round % 2 ? "viewer" : null })]);
+        expect(res.filter(x => x.status === "fulfilled").length).toBe(1);
+        expect(res.find(x => x.status === "rejected").reason.code).toBe("last-owner");
+        for (const h of [a, b]) expect((await h.scopedGrants(scope)).filter(x => x.role === "owner").length).toBe(1);
+        await a.setScopedGrant({ scope, subject: { type: "user", id: "x" }, role: "owner" });   // reset: x owner again, y whatever remains
+        await a.setScopedGrant({ scope, subject: { type: "user", id: "y" }, role: null }).catch(() => {});
+      }
+    } finally { await a.close(); await b.close(); await drop(schema); }
+  });
+
+  test("a Team's last member leaving races an owner demotion: the container never ends with no counted owner", async () => {
+    const schema = schemaName();
+    const a = await postgresRegistry({ url, schema, max: 2 });
+    const b = await postgresRegistry({ url, schema, max: 2 });
+    try {
+      const t = await a.createTenant({ domain: null });
+      const sp = await a.createSpace({ tenant: t.id, name: "D", owner: "u" }), tm = await a.createTeam({ tenant: t.id, name: "T" });
+      const scope = { type: "space", id: sp.id };
+      for (let round = 0; round < 25; round++) {
+        await a.setTeamMember(tm.id, "m", true);
+        await a.setScopedGrant({ scope, subject: { type: "team", id: tm.id }, role: "owner" });
+        const res = await Promise.allSettled([a.setScopedGrant({ scope, subject: { type: "user", id: "u" }, role: null }), b.setTeamMember(tm.id, "m", false)]);
+        expect(res.filter(x => x.status === "fulfilled").length).toBe(1);
+        const counted = (await a.scopedGrants(scope)).filter(g => g.role === "owner" && (g.subject.type === "user" || g.subject.id === tm.id));
+        const has = (await a.teamMembers(tm.id)).length > 0;
+        expect(counted.some(g => g.subject.type === "user") || (has && counted.some(g => g.subject.type === "team"))).toBe(true);
+        await a.setTeamMember(tm.id, "m", true);
+        await a.setScopedGrant({ scope, subject: { type: "user", id: "u" }, role: "owner" });
+        await a.setScopedGrant({ scope, subject: { type: "team", id: tm.id }, role: null });
+      }
+    } finally { await a.close(); await b.close(); await drop(schema); }
+  });
+
   test("a write transaction runs with synchronous_commit=on", async () => {
     const schema = schemaName();
     const r = await postgresRegistry({ sql: client(), schema });
@@ -360,7 +440,7 @@ describe.skipIf(!url)("postgres registry", () => {
       await expect(r.setGrant(b.id, "google:root", null)).rejects.toMatchObject({ code: "last-owner" });
       await expect(r.createTenant({ domain: "ACME.com" })).rejects.toThrow("domain already has a tenant");
     } finally { await r.close(); await drop(schema); }
-  });
+  }, 30_000);   // two cold start-ups on fresh pools (TECH-DEBT row 23): sized for a loaded machine, not for the 80 ms it takes alone
   // --- Timeouts (server/auth/registry-port.js: a timeout REJECTS; p2-tunev HIGH 1: a held lock kept grant() pending
   // past 15 s). Each case holds a real lock from another connection, and uses unequal limits so one code is certain.
 

@@ -707,14 +707,32 @@ content only; Unit `admin` = every management permission (and board content only
 
 **Resolution** (`server/auth/resolver.js`, pure). An identity's access to a board (or to a Space, Group or the Unit) is
 the **union** of what every source grants; for the ladder that is the highest. There are **no deny rules**, so a board
-is never more private than its Space. Sources, in this order, each reported with where it came from:
+is never more private than its Space. Sources, each reported with where it came from, in this order (the order only orders
+the report: a union has no precedence). The code is the truth; this list is read from it:
 
-1. **direct**: the user's own grant on the board (`grants`), then on its Space, then on that Space's Group, then on the Unit.
-2. **team**: a Team the user is in, granted on the same scopes (reports the Team).
+1. **direct** and 2. **team**, scope by scope from the target outward (board, then its Space, then its Group): the user's
+   own grant on that scope, then a grant to a Team the user is in (the source names the Team). A user's own grant on a
+   board is the `grants` table; every other scope's are scoped grants.
 3. **general**: "everyone in the Unit" on the board (`memberRole`), the Space and the Group, for Unit members only.
 4. **invite**: a live invite to the user's authoritative email (board scope; role capped below `owner`).
 5. **link**: a live share link the user redeemed (board scope; within viewer, annotator, editor).
-6. **unit**: Unit admin (the tenant's `admins`), then the Unit member role for members. A role stored on the Unit.
+6. **unit**: Unit admin (the tenant's `admins`), then grants on the Unit (the user's, then their Teams'), then the Unit
+   member role for members.
+
+**Who is on a Space, Group, the Unit or a Team.** A **member** is an identity whose `hd` is one of the Unit's domains; only
+members get general access and the Unit member role. **Inside** = a member, or a Unit admin named by user id (the
+operator vouches for them; it is what lets a Unit with no domain, such as a dev tenant, have a Space owner). Only the
+inside hold Space, Group and Unit grants and Team grants: for anyone else the resolver skips every one of them, so **a guest
+holds only board-scope sources**: a direct grant on the board, an invite or a link, whatever rows the Registry holds. The
+Registry cannot tell a guest (membership comes from `hd` at sign-in and is not stored), so this read-time rule is the
+enforcement, and a scoped grant or Team membership written for a guest is inert, not an error. `admin` and `member` are not
+grantable: a scoped grant of either is ignored (admin comes only from `admins` and its guards, member only from membership).
+
+**Permissions are clipped where they are asked.** A role held at a scope covers what is inside it, but a permission means
+something only at some targets, so every source's permissions are cut to the target asked about: a Unit admin asked
+about a board has no `roles.manage`, and a plain member asked about a Group or Space has no `space.create`. The Unit member
+role's management permissions apply only when the target is the Unit itself; creating a Space in a Group needs a role on
+that Group (JOURNEY J4).
 
 The answer is `{ ladder, permissions, sources, until }`: `ladder` is the one role the room gets (null = none = `auth`),
 `permissions` the union, each `source` is `{ kind, scope: { type, id }, role, team?, permissions, ladder }` (the UI's
@@ -722,7 +740,8 @@ The answer is `{ ladder, permissions, sources, until }`: `ladder` is the one rol
 without a message). Stored roles are never trusted: an unknown role, a role not valid at its scope, an `owner` through
 general access, invite or link counts for nothing or is capped. **Unit admin and rooms:** today an admin manages every
 board of the Unit but enters a room only through a role. The resolver keeps that (admin's board-content permissions and
-ladder `owner` are off unless the deployment sets `adminBoardContent`), so no one's access changes by upgrading.
+ladder `owner` are off unless the deployment sets `adminBoardContent`: `PLENARY_ADMIN_BOARD_CONTENT=1`, read by
+server/main.js and given to `tenancy` and `roleCache`), so no one's access changes by upgrading.
 
 **Defaults.** A personal space is private (`generalRole` null) and its owner owns it. A new Space gives `viewer` (its
 creator may pick none). A new board in a Space has `memberRole` null, so it **inherits** the Space; a board made without
@@ -732,11 +751,26 @@ a Space keeps today's `memberRole` default (`viewer`).
 "Organization"); existing tenants read as `company` with their one domain, existing boards stay unfiled with their
 `memberRole`, grants, invites and links untouched, and no Space, Group, Team, scoped grant or role exists until someone
 creates it. So the resolver's answer for every identity on every pre-existing board is the old rule's. Re-running
-start-up is a no-op. test/auth/legacy-migration.js proves it on SQLite and Postgres.
+start-up is a no-op. test/auth/legacy-migration.js proves it on SQLite and Postgres. Unfiled boards are a state, not a
+rule: a later backfill may file them into one per-Unit legacy Space (`generalRole` null, no grants), which adds no source,
+so access stays the same (test/auth/org-access.test.js checks that equivalence).
 
-**Freshness.** The resolver reads live. A scoped-grant or Team change is not yet announced on `.grants` (that message is
-per board, § Bus): live connections pick it up on the next timed re-check (≤ 60 s), a cached hello role within the cache's
-30 s. The routes that make such changes (later issues) announce a change for every board in the scope.
+**Freshness.** The resolver reads live; `.grants` (§ Bus) is per board. A change to anything the resolver reads above a
+board (a scoped grant on a Space, Group or the Unit; a Team's grants or membership; a Space's or Group's general access or
+its Group; a custom or member role; a Unit's domains or admins) therefore reaches live connections only if it is announced
+for **every board it reaches**, or else on the next timed re-check (≤ 60 s; a cached hello role within the cache's 30 s).
+The Registry lists what is needed, in bounded pages, so no route has to guess:
+
+- `boardsIn(scope)`: the board ids in a Space, a Group (its Spaces') or a Unit, by id, `{ ids, next }` per page (default
+  500, at most 1000).
+- `scopesOf(subject)`: the scopes (with the role) a user or Team holds a grant on, paged the same way.
+
+How the routes of #47 and later announce: after the write succeeds, a change **on a scope** pages `boardsIn(scope)` (a
+board scope is that one board) and publishes `{ board }` on each board's `.grants` subject; a **Team membership change**
+(`setTeamMember`) pages `scopesOf({ type: "team", id })` and announces each scope's boards the same way; a **role edit** announces `boardsIn` of the Unit (which scopes use a role is not indexed); a change to the **Unit**
+(domain, admin, Unit grant, member role) does the same. Each announcement is a plain `.grants` message, so the gateway's existing one-pass-at-a-time rule bounds the work;
+announcing is best-effort like every bus message, and the timed pass repairs a lost one. The gateway's role cache holds a
+board's chain (its Space, Group and tenant records) for at most its `ttlMs` and drops it on `.grants`.
 
 ## Sign-in code exchange
 
@@ -830,7 +864,7 @@ method names are stable. Ids are server-minted over `[a-z0-9-]`.
 | grants | `setGrant(board, user, role \| null)`, `grant(board, user) → role \| null`, `grants(board)` |
 | invites | `createInvite({ board, email, role, expiresAt, by })`, `invite(id)`, `invites(board)`, `invitesFor(board, email)`, `revokeInvite(id)` |
 | share links | `createLink({ board, role, expiresAt, by })` (role per link), `link(id)`, `links(board)`, `revokeLink(id)`, `addLinkUse(link, user)`, `linkUses(board, user)` |
-| organization | `createGroup`, `group`, `groups`; `createSpace`, `space`, `spaces`, `ensurePersonalSpace(tenant, user)`; `createTeam`, `team`, `teams`, `setTeamMember`, `teamMembers`; `setScopedGrant({ scope, subject, role \| null })`, `scopedGrants(scope)`; `createRole`, `updateRole`, `role`, `roles`; `accessContext(scope)` |
+| organization | `createGroup`, `group`, `groups`; `createSpace`, `space`, `spaces`, `ensurePersonalSpace(tenant, user)`; `createTeam`, `team`, `teams`, `setTeamMember`, `teamMembers`; `setScopedGrant({ scope, subject, role \| null })`, `scopedGrants(scope)`; `createRole`, `updateRole`, `role`, `roles`; `accessContext(scope, { users, chain })`; `boardsIn(scope, { after, limit })`, `scopesOf(subject, { after, limit })` |
 
 Single node: SQLite; cluster: Postgres. The room never calls it; gateways and Auth do. On Postgres the server
 runs as a role that doesn't own the schema (§ Store, Least privilege).
@@ -849,15 +883,22 @@ runs as a role that doesn't own the schema (§ Store, Least privilege).
   `owner` anyway. A tenant admin repairs it with `setGrant(board, user, "owner")` (they manage every board of
   their tenant). Guaranteed: no ownerless board is reported as created. May happen: an ownerless board until an
   admin repairs it.
-- **Organization** (§ Tenancy, "Organization"). `accessContext({ type: "board"|"space"|"group"|"unit", id })` is the
-  resolver's one read: the tenant, the scope's board / Space / Group, the grants on each scope of the chain, the Unit's
-  roles, and the members of every Team named in those grants, as one consistent answer (null for an unknown scope). Its
-  cost is a **fixed number of statements** however many grants, Teams or members exist, and it never takes a list of
-  boards: the resolver makes no per-row follow-up queries. Who owns what: the Registry owns every row; the resolver owns
-  no state (it is a function of what it is handed); `tenancy` owns no state beyond `roleCache`'s bounded entries.
-  Adapters validate shape (names, scope and subject types, same tenant) and store role strings as given; whether a role
-  is valid where it is held is `server/auth/permissions.js`'s rule, applied by the admin layer on write and by the
+- **Organization** (§ Tenancy, "Organization"). `accessContext({ type: "board"|"space"|"group"|"unit", id }, { users, chain })`
+  is the resolver's one read: the tenant, the scope's board / Space / Group, the grants on each scope of the chain, the
+  Unit's roles, and the members of every Team named in those grants, as one consistent answer (null for an unknown
+  scope). `users` limits the Team members returned to those users (a hello passes its user, a re-check pass its users),
+  so a Team of 100k costs nothing; `chain` hands back the stable records a cache already holds, and the adapter then
+  reads only the volatile rows. Its cost is **one statement on Postgres** (a single snapshot) and a fixed number in a
+  SQLite transaction, however many grants, Teams or members exist, and it never takes a list of boards: the resolver makes
+  no per-row follow-up queries and builds one user→Teams index per pass. Who owns what: the Registry owns every row; the
+  resolver owns no state (a function of what it is handed); `tenancy` owns none beyond `roleCache`'s bounded entries
+  and chains. Adapters validate shape (names, scope and subject types, same tenant) and store role strings as given; whether
+  a role is valid where it is held is `server/auth/permissions.js`'s rule, applied by the admin layer on write and by the
   resolver on read.
+- **Last owner for Groups and Spaces.** `setScopedGrant` refuses to remove or demote the last *counted* `owner` of a Group
+  or Space, atomically. A user owner always counts; a Team owner counts only while the Team has at least one member (an
+  empty Team guards nothing). `setTeamMember` refuses to remove the last member of a Team that is the only counted owner
+  of a Group or Space. Both are `last-owner`; Postgres takes the container's row lock first, like `setGrant`.
 - **Postgres tables** (all created only if missing, like the first seven; nothing is ever altered): `reg_tenant_meta` (kind),
   `reg_tenant_domains` (a Unit's domains after its first, which stays in `reg_tenants.domain`; a domain is unique across both,
   serialised by an advisory lock), `reg_groups`, `reg_spaces` (unique `(tenant, owner_user)`: one personal space per member),

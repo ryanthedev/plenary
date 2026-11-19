@@ -399,28 +399,86 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect(await r.scopedGrants({ type: "space", id: "s-nope00000000" })).toEqual([]);
       });
 
-      test("a Group or Space keeps one owner: removing or demoting the last owner (a user's or a Team's) is refused, atomically", async () => {
+      test("a Group or Space keeps one owner: removing or demoting the last counted owner is refused; a Team counts only while it has a member", async () => {
         const t = await unit();
         const g = await r.createGroup({ tenant: t.id, name: "Product", owner: "google:ann" });
         const sp = await r.createSpace({ tenant: t.id, name: "Design", owner: "google:ann" });
         const tm = await r.createTeam({ tenant: t.id, name: "Leads" });
         for (const scope of [{ type: "group", id: g.id }, { type: "space", id: sp.id }]) {
-          const ann = { type: "user", id: "google:ann" };
-          for (const role of [null, "editor"]) {
-            const err = await r.setScopedGrant({ scope, subject: ann, role }).catch(e => e);
-            expect(err.code).toBe("last-owner");
-          }
+          const ann = { type: "user", id: "google:ann" }, team = { type: "team", id: tm.id };
+          for (const role of [null, "editor"]) expect((await r.setScopedGrant({ scope, subject: ann, role }).catch(e => e)).code).toBe("last-owner");
           expect(await r.scopedGrants(scope)).toEqual([{ subject: ann, role: "owner" }]);
-          await r.setScopedGrant({ scope, subject: { type: "team", id: tm.id }, role: "owner" });
-          await r.setScopedGrant({ scope, subject: ann, role: null });          // a second owner (the Team) exists now
-          expect(await r.scopedGrants(scope)).toEqual([{ subject: { type: "team", id: tm.id }, role: "owner" }]);
-          const race = await Promise.allSettled([
-            r.setScopedGrant({ scope, subject: { type: "user", id: "google:bob" }, role: "owner" }),
-            r.setScopedGrant({ scope, subject: { type: "team", id: tm.id }, role: null })]);
-          expect(race.filter(x => x.status === "rejected").every(x => x.reason.code === "last-owner")).toBe(true);
-          const owners = (await r.scopedGrants(scope)).filter(x => x.role === "owner");
-          expect(owners.length).toBeGreaterThanOrEqual(1);
+          // an EMPTY Team that owns guards nothing: ann is still the only counted owner
+          await r.setScopedGrant({ scope, subject: team, role: "owner" });
+          expect((await r.setScopedGrant({ scope, subject: ann, role: null }).catch(e => e)).code).toBe("last-owner");
+          await r.setTeamMember(tm.id, "google:lee", true);
+          await r.setScopedGrant({ scope, subject: ann, role: null });          // the Team has a member now: a second counted owner
+          expect(await r.scopedGrants(scope)).toEqual([{ subject: team, role: "owner" }]);
+          // removing the Team's last member would leave no counted owner: refused, nothing changes
+          expect((await r.setTeamMember(tm.id, "google:lee", false).catch(e => e)).code).toBe("last-owner");
+          expect(await r.teamMembers(tm.id)).toEqual(["google:lee"]);
+          await r.setTeamMember(tm.id, "google:kay", true);
+          await r.setTeamMember(tm.id, "google:lee", false);                      // another member remains: fine
+          expect((await r.setScopedGrant({ scope, subject: team, role: "viewer" }).catch(e => e)).code).toBe("last-owner");
+          await r.setScopedGrant({ scope, subject: ann, role: "owner" });
+          await r.setScopedGrant({ scope, subject: team, role: null });
+          await r.setTeamMember(tm.id, "google:kay", false);                      // the Team owns nothing now: no guard
+          await r.setScopedGrant({ scope, subject: ann, role: "viewer" }).then(() => { throw new Error("ann is the last owner"); }, e => expect(e.code).toBe("last-owner"));
         }
+      });
+
+      test("last owner under concurrency: two racing demotions of the only two owners leave one", async () => {
+        const t = await unit();
+        const sp = await r.createSpace({ tenant: t.id, name: "Design", owner: "google:ann" });
+        await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "user", id: "google:bob" }, role: "owner" });
+        const res = await Promise.allSettled(["google:ann", "google:bob"].map(u => r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "user", id: u }, role: null })));
+        expect(res.filter(x => x.status === "fulfilled")).toHaveLength(1);
+        expect(res.find(x => x.status === "rejected").reason.code).toBe("last-owner");
+        expect((await r.scopedGrants({ type: "space", id: sp.id })).filter(g => g.role === "owner")).toHaveLength(1);
+      });
+
+      test("boardsIn pages the board ids of a Space, a Group and a Unit by id; a board and an unknown scope have none", async () => {
+        const t = await unit(), other = await r.createTenant({ domain: "globex.com" });
+        const g = await r.createGroup({ tenant: t.id, name: "P" });
+        const s1 = await r.createSpace({ tenant: t.id, name: "A", group: g.id }), s2 = await r.createSpace({ tenant: t.id, name: "B", group: g.id }), s3 = await r.createSpace({ tenant: t.id, name: "C" });
+        const ids = { s1: [], s2: [], s3: [], none: [] };
+        for (let i = 0; i < 7; i++) {
+          ids.s1.push((await r.createBoard({ tenant: t.id, space: s1.id })).id);
+          if (i < 3) ids.s2.push((await r.createBoard({ tenant: t.id, space: s2.id })).id);
+          if (i < 2) ids.s3.push((await r.createBoard({ tenant: t.id, space: s3.id })).id);
+          if (i < 1) ids.none.push((await r.createBoard({ tenant: t.id })).id);
+        }
+        await r.createBoard({ tenant: other.id });
+        const all = async (scope, limit) => { const out = []; let after = null, pages = 0; do { const p = await r.boardsIn(scope, { after, limit }); out.push(...p.ids); after = p.next; pages++; } while (after); return { out, pages }; };
+        expect((await all({ type: "space", id: s1.id }, 3))).toEqual({ out: [...ids.s1].sort(), pages: 3 });
+        expect((await all({ type: "space", id: s2.id })).out).toEqual([...ids.s2].sort());
+        expect((await all({ type: "group", id: g.id }, 4)).out).toEqual([...ids.s1, ...ids.s2].sort());
+        expect((await all({ type: "unit", id: t.id }, 5)).out).toEqual([...ids.s1, ...ids.s2, ...ids.s3, ...ids.none].sort());
+        expect((await r.boardsIn({ type: "unit", id: t.id }, { limit: 2 })).ids).toHaveLength(2);
+        expect((await r.boardsIn({ type: "unit", id: t.id }, { limit: 10_000 })).ids).toHaveLength(13);
+        expect(await r.boardsIn({ type: "board", id: ids.s1[0] })).toEqual({ ids: [], next: null });
+        expect(await r.boardsIn({ type: "space", id: "s-nope00000000" })).toEqual({ ids: [], next: null });
+        expect((await r.boardsIn({ type: "unit", id: t.id }, { limit: 0 })).ids.length).toBeGreaterThan(0);    // a non-positive limit means the default, never "all"
+      });
+
+      test("scopesOf pages the scopes a user or Team holds a grant on (to announce a Team membership change)", async () => {
+        const t = await unit();
+        const g = await r.createGroup({ tenant: t.id, name: "P" }), sp = await r.createSpace({ tenant: t.id, name: "A" });
+        const tm = await r.createTeam({ tenant: t.id, name: "Infra" });
+        const b = await r.createBoard({ tenant: t.id, space: sp.id });
+        const subject = { type: "team", id: tm.id };
+        for (const [type, id, role] of [["unit", t.id, "member"], ["group", g.id, "editor"], ["space", sp.id, "viewer"], ["board", b.id, "editor"]])
+          await r.setScopedGrant({ scope: { type, id }, subject, role });
+        await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "user", id: "google:ann" }, role: "owner" });
+        const one = await r.scopesOf(subject);
+        expect(one.next).toBe(null);
+        expect(one.scopes.map(s => `${s.type}:${s.role}`).sort()).toEqual(["board:editor", "group:editor", "space:viewer", "unit:member"]);
+        const seen = []; let after = null;
+        do { const p = await r.scopesOf(subject, { after, limit: 3 }); seen.push(...p.scopes); after = p.next; } while (after);
+        expect(seen).toEqual(one.scopes);
+        expect((await r.scopesOf({ type: "user", id: "google:ann" })).scopes).toEqual([{ type: "space", id: sp.id, role: "owner" }]);
+        expect(await r.scopesOf({ type: "user", id: "google:nobody" })).toEqual({ scopes: [], next: null });
+        await expect(r.scopesOf({ type: "robot", id: "x" })).rejects.toThrow();
       });
 
       test("roles: create (minted id, cap fields kept), update, the editable member role is created on first update, list is per tenant", async () => {
@@ -475,6 +533,27 @@ export function registryContract(name, makeRegistry, opts = {}) {
         for (const bad of [{ type: "board", id: "b-nope00000000" }, { type: "space", id: "nope" }, { type: "group", id: "g-x" }, { type: "unit", id: "t-nope00000000" }])
           expect(await r.accessContext(bad)).toBe(null);
         await expect(r.accessContext({ type: "planet", id: "x" })).rejects.toThrow();
+      });
+
+      test("accessContext(users): Team members are limited to the users asked about; (chain): the held chain is used as given and only volatile rows are read", async () => {
+        const t = await unit();
+        const sp = await r.createSpace({ tenant: t.id, name: "Design" });
+        const tm = await r.createTeam({ tenant: t.id, name: "Infra" });
+        for (const u of ["google:ann", "google:bob", "google:cy"]) await r.setTeamMember(tm.id, u, true);
+        const b = await r.createBoard({ tenant: t.id, space: sp.id });
+        await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "team", id: tm.id }, role: "editor" });
+        const scope = { type: "board", id: b.id };
+        expect((await r.accessContext(scope)).teams[tm.id].sort()).toEqual(["google:ann", "google:bob", "google:cy"]);
+        expect((await r.accessContext(scope, { users: ["google:bob", "google:zed"] })).teams).toEqual({ [tm.id]: ["google:bob"] });
+        expect((await r.accessContext(scope, { users: [] })).teams).toEqual({ [tm.id]: [] });
+        const full = await r.accessContext(scope);
+        const held = { tenant: full.tenant, board: full.board, space: full.space, group: full.group };
+        await r.setScopedGrant({ scope: { type: "board", id: b.id }, subject: { type: "team", id: tm.id }, role: "viewer" });   // volatile: seen through a held chain
+        const viaChain = await r.accessContext(scope, { users: ["google:ann"], chain: held });
+        expect([viaChain.tenant, viaChain.board, viaChain.space, viaChain.group]).toEqual([held.tenant, held.board, held.space, held.group]);
+        expect(viaChain.scoped.board).toEqual([{ subject: { type: "team", id: tm.id }, role: "viewer" }]);
+        expect(viaChain.teams).toEqual({ [tm.id]: ["google:ann"] });
+        expect(viaChain.roles).toEqual(full.roles);
       });
 
       test("accessContext is a snapshot copy: mutating it changes nothing stored", async () => {

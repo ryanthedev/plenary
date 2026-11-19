@@ -90,7 +90,7 @@ test("custom roles: a role on a Space gives its board role to the room and its m
   await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "user", id: "google:fay" }, role: fac.id });
   const b = await board(sp.id);
   expect(await ten.role(id("fay"), b.id)).toBe("annotator");
-  const a = await ten.effective(id("fay", null), { type: "space", id: sp.id });
+  const a = await ten.effective(id("fay"), { type: "space", id: sp.id });   // a Unit member: the member role adds nothing asked of a Space
   expect([...a.permissions].sort()).toEqual(["board.annotate", "board.comment", "board.create", "board.view", "members.manage"]);   // roles.manage is Unit-only
   await r.updateRole(acme.id, fac.id, { boardRole: "editor" });
   expect(await ten.role(id("fay"), b.id)).toBe("editor");                        // edits take effect on the next read
@@ -135,4 +135,110 @@ test("a stale-proof read: scoped grant changes show on the very next uncached ro
   expect(await ten.role(who, b.id)).toBe("viewer");
   await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "user", id: "google:bob" }, role: null });
   expect(await ten.role(who, b.id)).toBe(null);
+});
+
+// ---- cost: how many Registry calls a hello and a re-check pass make (counts, never wall-clock) ----
+
+/** Wraps a Registry so every method call is counted, and accessContext's arguments are kept. */
+function counting(reg) {
+  const calls = {}, ctxArgs = [];
+  const out = {};
+  for (const [k, v] of Object.entries(reg)) {
+    if (typeof v !== "function") continue;
+    out[k] = (...a) => { calls[k] = (calls[k] ?? 0) + 1; if (k === "accessContext") ctxArgs.push(a[1]); return v(...a); };
+  }
+  return { reg: out, calls, ctxArgs, total: () => Object.values(calls).reduce((x, y) => x + y, 0), reset() { for (const k in calls) delete calls[k]; ctxArgs.length = 0; } };
+}
+
+test("a cold hello is 5 Registry calls and a warm one 4 (one accessContext for the whole chain); the chain is held, never re-read", async () => {
+  const g = await r.createGroup({ tenant: acme.id, name: "P" });
+  const sp = await r.createSpace({ tenant: acme.id, name: "D", group: g.id });
+  const tm = await r.createTeam({ tenant: acme.id, name: "T" });
+  for (let i = 0; i < 50; i++) await r.setTeamMember(tm.id, `google:t${i}`, true);
+  await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "team", id: tm.id }, role: "editor" });
+  const b = await board(sp.id);
+  const link = await r.createLink({ board: b.id, role: "viewer", by: "google:x" });
+  await r.addLinkUse(link.id, "google:t1");
+  const c = counting(r);
+  const cache = roleCache({ registry: c.reg, now });
+  expect(await cache.role(id("t1"), b.id)).toBe("editor");
+  expect(c.total()).toBe(5);                              // accessContext, grant, invitesFor, linkUses, link
+  expect(c.ctxArgs[0]).toEqual({ users: ["google:t1"] });  // one user's Team memberships, never the whole Team
+  c.reset();
+  expect(await cache.role(id("t2"), b.id)).toBe("editor");
+  expect(c.total()).toBe(3 + 1);                          // accessContext, grant, invitesFor, linkUses (no link use)
+  expect(Object.keys(c.ctxArgs[0])).toEqual(["users", "chain"]);   // the held chain went back: only volatile rows are read
+  expect(c.ctxArgs[0].chain.space.id).toBe(sp.id);
+  c.reset();
+  expect(await cache.role(id("t2"), b.id)).toBe("editor");
+  expect(c.total()).toBe(0);                              // warm: the role itself
+  cache.invalidate(b.id);                                 // a `.grants` message drops roles AND the chain
+  await cache.role(id("t3"), b.id);
+  expect(c.ctxArgs[0]).toEqual({ users: ["google:t3"] });
+});
+
+test("a re-check pass reads the chain fresh and costs a fixed number of calls however many users; 10k identities never scan a Team per identity", async () => {
+  const sp = await r.createSpace({ tenant: acme.id, name: "D" });
+  const tm = await r.createTeam({ tenant: acme.id, name: "Everyone" });
+  const N = 10_000, people = [];
+  for (let i = 0; i < N; i++) { people.push(id(`p${i}`)); if (i % 2 === 0) await r.setTeamMember(tm.id, `google:p${i}`, true); }
+  await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "team", id: tm.id }, role: "annotator" });
+  const b = await board(sp.id);
+  const c = counting(r);
+  // the Team's member list is watched: `includes` (a scan per identity) must never run
+  let scans = 0;
+  const watched = {};
+  Object.assign(watched, c.reg, { accessContext: async (...a) => {
+    const ctx = await c.reg.accessContext(...a);
+    for (const k of Object.keys(ctx.teams)) ctx.teams[k] = new Proxy(ctx.teams[k], { get: (t, p) => { if (p === "includes" || p === "indexOf" || p === "find" || p === "some") scans++; return Reflect.get(t, p); } });
+    return ctx;
+  } });
+  const cache = roleCache({ registry: watched, now });
+  cache.invalidate(b.id);
+  const m = await cache.rolesFor(b.id, people);
+  expect(m.size).toBe(N);
+  expect(scans).toBe(0);
+  expect(c.calls.accessContext).toBe(1);
+  expect(c.ctxArgs[0].users).toHaveLength(N);
+  expect(c.ctxArgs[0].chain).toBeUndefined();            // a pass is always fresh
+  expect(c.calls.linkUsesFor).toBe(Math.ceil(N / 1000));
+  expect(c.total()).toBeLessThanOrEqual(5 + Math.ceil(N / 1000));   // accessContext, grants, invites (none asked: no email), links, + linkUsesFor per chunk
+  const role = i => m.get(`google:p${i}\np${i}@acme.com\nacme.com`);
+  expect([role(0), role(1), role(9998), role(9999)]).toEqual(["annotator", "viewer", "annotator", "viewer"]);   // the Space's general access (viewer) for the rest
+});
+
+test("adminBoardContent is reachable through roleCache (and tenancy): a Unit admin enters every room as owner when the deployment says so", async () => {
+  const sp = await r.createSpace({ tenant: acme.id, name: "Closed", generalRole: null });
+  const b = await board(sp.id);
+  const root = { user: "google:root", email: "root@acme.com", domain: "acme.com" };
+  expect(await roleCache({ registry: r, now }).role(root, b.id)).toBe(null);
+  expect(await roleCache({ registry: r, now, adminBoardContent: true }).role(root, b.id)).toBe("owner");
+  expect((await roleCache({ registry: r, now, adminBoardContent: true }).rolesFor(b.id, [root])).get(`${root.user}\n${root.email}\n${root.domain}`)).toBe("owner");
+});
+
+test("a guest named in Space, Group, Unit and Team grants still has only board scope (end to end through tenancy)", async () => {
+  const g = await r.createGroup({ tenant: acme.id, name: "P", owner: "google:kim" });
+  const sp = await r.createSpace({ tenant: acme.id, name: "D", group: g.id, generalRole: null, owner: "google:kim" });
+  const tm = await r.createTeam({ tenant: acme.id, name: "T" });
+  await r.setTeamMember(tm.id, "google:kim", true);
+  for (const scope of [{ type: "unit", id: acme.id }, { type: "group", id: g.id }, { type: "space", id: sp.id }])
+    await r.setScopedGrant({ scope, subject: { type: "team", id: tm.id }, role: "viewer" });
+  const b = await board(sp.id);
+  await r.setScopedGrant({ scope: { type: "board", id: b.id }, subject: { type: "team", id: tm.id }, role: "editor" });
+  const kim = id("kim", "partner.io");
+  expect(await ten.role(kim, b.id)).toBe(null);
+  expect((await ten.effective(kim, { type: "space", id: sp.id })).sources).toEqual([]);
+  expect((await ten.rolesFor(b.id, [kim])).get(`google:kim\nkim@partner.io\npartner.io`)).toBe(null);
+  expect(await ten.role(id("kim", "acme.com"), b.id)).toBe("owner");           // the same rows count once she is a Unit member
+  await r.setGrant(b.id, "google:kim", "viewer");                              // board scope is what a guest can hold
+  expect(await ten.role(kim, b.id)).toBe("viewer");
+});
+
+test("filing a legacy board into a Space with no general access and no grants changes nobody's role (the shape of a later backfill)", async () => {
+  const legacy = await r.createSpace({ tenant: acme.id, name: "Legacy", generalRole: null });
+  const link = async b => { const l = await r.createLink({ board: b.id, role: "annotator", by: "google:x" }); await r.addLinkUse(l.id, "google:lou"); };
+  const plain = await r.createBoard({ tenant: acme.id, memberRole: "commenter" }), filed = await r.createBoard({ tenant: acme.id, memberRole: "commenter", space: legacy.id });
+  for (const b of [plain, filed]) { await r.setGrant(b.id, "google:gina", "owner"); await r.createInvite({ board: b.id, email: "ivy@partner.io", role: "editor", by: "google:gina" }); await link(b); }
+  const people = [id("gina"), id("bob"), id("lou", null), id("ivy", "partner.io"), id("zed", "globex.com"), id("root")];
+  for (const p of people) expect(await ten.role(p, filed.id)).toBe(await ten.role(p, plain.id));
 });

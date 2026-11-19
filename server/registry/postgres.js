@@ -71,9 +71,9 @@
 // owns that pool) or `sql` (a Bun SQL client you own). `schema` names the Postgres schema. Never reads env.
 
 import { SQL } from "bun";
-import { mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS } from "../auth/registry-port.js";
+import { mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
-import { needSchema, migrate } from "../pg/schema.js";
+import { needSchema, migrate, missing as absent } from "../pg/schema.js";
 
 /**
  * Thrown by `setGrant` when the change would leave a board with no owner ("last-owner"), by a call that ran out of time
@@ -171,10 +171,8 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       await tx.unsafe("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', '0', true)", [String(lockMs)]);
       await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-schema:${s}`]);
       await migrate(tx, s, registryTables(s));
-      for (const [name, def] of Object.entries(REGISTRY_INDEXES)) {
-        const [{ r }] = await tx.unsafe("SELECT to_regclass($1) AS r", [`"${s}".${name}`]);
-        if (r === null) await tx.unsafe(`CREATE INDEX ${name} ON "${s}".${def}`);
-      }
+      const noIndex = await absent(tx, s, Object.keys(REGISTRY_INDEXES));
+      if (noIndex.length) await tx.unsafe(noIndex.map(name => `CREATE INDEX ${name} ON "${s}".${REGISTRY_INDEXES[name]}`).join(";\n"));
       // Every right on every table, each on its own (the names are constants and `s` passed needSchema).
       const pairs = Object.keys(REGISTRY_TABLE_DDL).flatMap(t => RIGHTS.map(p => `('${t}', '${p}')`)).join(", ");
       const missing = await tx.unsafe(`SELECT t, p FROM (VALUES ${pairs}) AS v(t, p)
@@ -237,6 +235,9 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
   const rowRole = r => r && { id: r.id, tenant: r.tenant, name: r.name, base: r.base, boardRole: r.board_role, permissions: JSON.parse(r.permissions), createdAt: num(r.created_at) };
   const rowSg = r => ({ subject: { type: r.subject_type, id: r.subject }, role: r.role });
   const grantsOn = (q, type, id) => q.unsafe(`SELECT subject_type, subject, role FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 ORDER BY n`, [type, id]);
+  /** Owner grants that guard a Group or Space: a user's, or a Team's while the Team has a member. */
+  const countedOwners = (q, type, id) => q.unsafe(`SELECT subject_type, subject FROM ${SG} g WHERE scope_type = $1 AND scope_id = $2 AND role = 'owner'
+    AND (subject_type = 'user' OR EXISTS (SELECT 1 FROM ${TU} m WHERE m.team = g.subject))`, [type, id]);
   const putSg = async (tx, type, id, st, sid, role) => {
     if (role == null) await tx.unsafe(`DELETE FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 AND subject_type = $3 AND subject = $4`, [type, id, st, sid]);
     else await tx.unsafe(`INSERT INTO ${SG} (scope_type, scope_id, subject_type, subject, role) VALUES ($1, $2, $3, $4, $5)
@@ -512,8 +513,16 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       const u = String(user);
       await write(async tx => {
         if (!(await one(tx, `SELECT 1 AS x FROM ${TE} WHERE id = $1`, [team]))) throw new Error("registry: no such team");
-        if (member) await tx.unsafe(`INSERT INTO ${TU} (team, member) VALUES ($1, $2) ON CONFLICT (team, member) DO NOTHING`, [team, u]);
-        else await tx.unsafe(`DELETE FROM ${TU} WHERE team = $1 AND member = $2`, [team, u]);
+        if (member) { await tx.unsafe(`INSERT INTO ${TU} (team, member) VALUES ($1, $2) ON CONFLICT (team, member) DO NOTHING`, [team, u]); return; }
+        // Removing the last member of a Team that is the only counted owner of a Group or Space would leave it ownerless.
+        // Lock those containers first (in id order, like setScopedGrant's single lock, so two callers can't deadlock), then count.
+        const owned = await tx.unsafe(`SELECT scope_type, scope_id FROM ${SG} WHERE subject_type = 'team' AND subject = $1 AND role = 'owner'
+          AND scope_type IN ('group', 'space') ORDER BY scope_type, scope_id`, [team]);
+        for (const o of owned) await tx.unsafe(`SELECT id FROM ${o.scope_type === "group" ? GR : SP} WHERE id = $1 FOR UPDATE`, [o.scope_id]);
+        const left = Number((await one(tx, `SELECT count(*) AS c FROM ${TU} WHERE team = $1 AND member <> $2`, [team, u])).c);
+        if (!left) for (const o of owned)
+          if ((await countedOwners(tx, o.scope_type, o.scope_id)).length <= 1) throw new PgRegistryError("last-owner", `a ${o.scope_type} keeps at least one owner`);
+        await tx.unsafe(`DELETE FROM ${TU} WHERE team = $1 AND member = $2`, [team, u]);
       });
     },
     async teamMembers(team) {
@@ -533,8 +542,9 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
           await tx.unsafe(`SELECT id FROM ${type === "group" ? GR : SP} WHERE id = $1 FOR UPDATE`, [id]);
           const cur = (await one(tx, `SELECT role FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 AND subject_type = $3 AND subject = $4`, [type, id, sub.type, sub.id]))?.role;
           if (cur === "owner" && r !== "owner") {
-            const c = Number((await one(tx, `SELECT count(*) AS c FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 AND role = 'owner'`, [type, id])).c);
-            if (c <= 1) throw new PgRegistryError("last-owner", `a ${type} keeps at least one owner`);
+            const counted = await countedOwners(tx, type, id);
+            if (counted.some(o => o.subject_type === sub.type && o.subject === sub.id) && counted.length <= 1)
+              throw new PgRegistryError("last-owner", `a ${type} keeps at least one owner`);
           }
         }
         await putSg(tx, type, id, sub.type, sub.id, r);
@@ -581,32 +591,80 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     },
     async role(tenant, id) { ready(); return key(tenant) && key(id) ? rowRole(await one(db, `SELECT * FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id])) : null; },
     async roles(tenant) { ready(); return key(tenant) ? (await db.unsafe(`SELECT * FROM ${RO} WHERE tenant = $1 ORDER BY created_at, id`, [tenant])).map(rowRole) : []; },
-    // The resolver's one read: a fixed number of statements (board, Space, Group, Unit, the chain's grants, the Teams'
-    // members, the roles) however many grants, Teams or members there are. Every statement is bounded by the gate and timeouts.
-    async accessContext(scope) {
+    // The resolver's one read: ONE statement (so one consistent snapshot) however many grants, Teams or members exist:
+    // the chain and tenant (or the caller's `chain`), the chain's grants, the Unit's roles, and the members of the Teams
+    // those grants name (only `users`, when given), as JSON rows tagged by kind. Bounded by the gate and the timeouts.
+    async accessContext(scope, { users, chain } = {}) {
       ready();
       const { type, id } = orgDefaults.scope(scope);
       if (!key(id)) return null;
-      const board = type === "board" ? rowBoard(await one(db, `${BOARD_SQL} WHERE b.id = $1`, [id])) : null;
-      const spaceId = type === "space" ? id : board?.space;
-      const space = spaceId ? rowSpace(await one(db, `SELECT * FROM ${SP} WHERE id = $1`, [spaceId])) : null;
-      const groupId = type === "group" ? id : space?.group;
-      const group = groupId ? rowGroup(await one(db, `SELECT * FROM ${GR} WHERE id = $1`, [groupId])) : null;
-      const owner = board ?? space ?? group;
-      if (type !== "unit" && !owner) return null;
-      const tenant = await getTenant(db, type === "unit" ? id : owner.tenant);
-      if (!tenant) return null;
-      const refs = [["unit", tenant.id], group && ["group", group.id], space && ["space", space.id], board && ["board", board.id]].filter(Boolean);
-      const rows = await db.unsafe(`SELECT scope_type, scope_id, subject_type, subject, role FROM ${SG}
-        WHERE (scope_type, scope_id) IN (SELECT t, i FROM jsonb_to_recordset($1::text::jsonb) AS x(t text, i text)) ORDER BY n`,
-        [JSON.stringify(refs.map(([t, i]) => ({ t, i })))]);
+      const us = users ? users.filter(key) : null;
+      // c: the ids of the chain, from the scope (one lookup by type) or from the caller's chain (no lookup).
+      const FIND = {
+        board: `SELECT b.tenant, s.grp AS gid, s.id AS sid, b.id AS bid FROM ${BD} b LEFT JOIN ${BS} bs ON bs.board = b.id LEFT JOIN ${SP} s ON s.id = bs.space WHERE b.id = $1`,
+        space: `SELECT s.tenant, s.grp AS gid, s.id AS sid, NULL::text AS bid FROM ${SP} s WHERE s.id = $1`,
+        group: `SELECT g.tenant, g.id AS gid, NULL::text AS sid, NULL::text AS bid FROM ${GR} g WHERE g.id = $1`,
+        unit: `SELECT t.id AS tenant, NULL::text AS gid, NULL::text AS sid, NULL::text AS bid FROM ${T} t WHERE t.id = $1`,
+      };
+      const params = chain ? [chain.tenant.id, chain.group?.id ?? null, chain.space?.id ?? null, chain.board?.id ?? null, us] : [id, us];
+      const U = chain ? "$5" : "$2";
+      const c = chain ? "SELECT $1::text AS tenant, $2::text AS gid, $3::text AS sid, $4::text AS bid" : FIND[type];
+      const rows = await db.unsafe(`WITH c AS (${c}),
+        sg AS (SELECT * FROM ${SG} WHERE (scope_type, scope_id) IN (
+          SELECT 'unit', tenant FROM c UNION ALL SELECT 'group', gid FROM c WHERE gid IS NOT NULL
+          UNION ALL SELECT 'space', sid FROM c WHERE sid IS NOT NULL UNION ALL SELECT 'board', bid FROM c WHERE bid IS NOT NULL))
+        SELECT 'c' AS k, row_to_json(c)::text AS j FROM c
+        ${chain ? "" : `UNION ALL SELECT 'T', json_build_object('id', t.id, 'domain', t.domain, 'created_at', t.created_at,
+          'kind', (SELECT kind FROM ${TM} WHERE tenant = t.id),
+          'extra', (SELECT coalesce(json_agg(domain ORDER BY n), '[]'::json) FROM ${TD} WHERE tenant = t.id),
+          'admins', (SELECT coalesce(json_agg(member ORDER BY n), '[]'::json) FROM ${A} WHERE tenant = t.id))::text FROM ${T} t JOIN c ON t.id = c.tenant
+        UNION ALL SELECT 'B', row_to_json(x)::text FROM (SELECT b.*, (SELECT space FROM ${BS} WHERE board = b.id) AS space FROM ${BD} b JOIN c ON b.id = c.bid) x
+        UNION ALL SELECT 'S', row_to_json(s)::text FROM ${SP} s JOIN c ON s.id = c.sid
+        UNION ALL SELECT 'G', row_to_json(g)::text FROM ${GR} g JOIN c ON g.id = c.gid`}
+        UNION ALL SELECT 'g', row_to_json(sg)::text FROM sg
+        UNION ALL SELECT 'R', row_to_json(r)::text FROM ${RO} r JOIN c ON r.tenant = c.tenant
+        UNION ALL SELECT 'm', json_build_object('team', m.team, 'member', m.member)::text FROM ${TU} m
+          WHERE m.team IN (SELECT subject FROM sg WHERE subject_type = 'team') AND (${U}::text[] IS NULL OR m.member = ANY(${U}::text[]))`, params);
+      const by = k => rows.filter(r => r.k === k).map(r => JSON.parse(r.j));
+      const ids = by("c")[0];
+      if (!ids) return null;
+      let out;
+      if (chain) out = { tenant: chain.tenant, board: chain.board ?? null, space: chain.space ?? null, group: chain.group ?? null };
+      else {
+        const t = by("T")[0];
+        out = {
+          tenant: { id: t.id, domain: t.domain, domains: [...(t.domain ? [t.domain] : []), ...t.extra], kind: t.kind ?? "company", admins: t.admins, createdAt: num(t.created_at) },
+          board: rowBoard(by("B")[0]), space: rowSpace(by("S")[0]), group: rowGroup(by("G")[0]),
+        };
+        out.board ??= null; out.space ??= null; out.group ??= null;
+      }
       const scoped = { unit: [], group: [], space: [], board: [] };
-      for (const r of rows) scoped[r.scope_type].push(rowSg(r));
-      const teamIds = [...new Set(Object.values(scoped).flat().filter(g => g.subject.type === "team").map(g => g.subject.id))];
-      const teams = Object.fromEntries(teamIds.map(t => [t, []]));
-      if (teamIds.length) for (const m of await db.unsafe(`SELECT team, member FROM ${TU} WHERE team = ANY($1::text[]) ORDER BY team, member`, [teamIds])) teams[m.team].push(m.member);
-      const roles = (await db.unsafe(`SELECT * FROM ${RO} WHERE tenant = $1 ORDER BY created_at, id`, [tenant.id])).map(rowRole);
-      return { tenant, board, space, group, scoped, roles, teams };
+      for (const g of by("g").sort((x, y) => x.n - y.n)) scoped[g.scope_type].push(rowSg(g));
+      const teams = {};
+      for (const g of Object.values(scoped).flat()) if (g.subject.type === "team") teams[g.subject.id] = [];
+      for (const m of by("m").sort((x, y) => (x.member < y.member ? -1 : 1))) teams[m.team].push(m.member);
+      return { ...out, scoped, roles: by("R").map(rowRole).sort((x, y) => x.createdAt - y.createdAt || (x.id < y.id ? -1 : 1)), teams };
+    },
+    async boardsIn(scope, { after = null, limit } = {}) {
+      ready();
+      const { type, id } = orgDefaults.scope(scope), n = pageLimit(limit);
+      if (!key(id) || type === "board") return { ids: [], next: null };
+      const cur = key(after) ? after : null;
+      const text = type === "unit" ? `SELECT id FROM ${BD} WHERE tenant = $1 AND ($2::text IS NULL OR id > $2) ORDER BY id LIMIT $3`
+        : type === "space" ? `SELECT board AS id FROM ${BS} WHERE space = $1 AND ($2::text IS NULL OR board > $2) ORDER BY board LIMIT $3`
+        : `SELECT bs.board AS id FROM ${BS} bs JOIN ${SP} s ON s.id = bs.space WHERE s.grp = $1 AND ($2::text IS NULL OR bs.board > $2) ORDER BY bs.board LIMIT $3`;
+      const ids = (await db.unsafe(text, [id, cur, n + 1])).map(r => r.id);
+      return { ids: ids.slice(0, n), next: ids.length > n ? ids[n - 1] : null };
+    },
+    async scopesOf(subject, { after = null, limit } = {}) {
+      ready();
+      const sub = orgDefaults.subject(subject), n = pageLimit(limit);
+      if (!key(sub.id)) return { scopes: [], next: null };
+      const rows = (await db.unsafe(`SELECT scope_type, scope_id, role FROM ${SG} WHERE subject_type = $1 AND subject = $2
+        AND ($3::text IS NULL OR (scope_type, scope_id) > ($3, $4)) ORDER BY scope_type, scope_id LIMIT $5`,
+        [sub.type, sub.id, ...(key(after) && after.includes("\n") ? [after.slice(0, after.indexOf("\n")), after.slice(after.indexOf("\n") + 1)] : [null, null]), n + 1])).map(r => ({ type: r.scope_type, id: r.scope_id, role: r.role }));
+      const scopes = rows.slice(0, n);
+      return { scopes, next: rows.length > n ? scopes[n - 1].type + "\n" + scopes[n - 1].id : null };
     },
 
     /** What a write transaction runs with, read back from Postgres (for /health and tests). */

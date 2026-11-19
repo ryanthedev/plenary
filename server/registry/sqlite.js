@@ -17,7 +17,7 @@
 // `user`; insertion order is an explicit `n` column (Postgres: BIGSERIAL / identity), upserts use ON CONFLICT.
 
 import { Database } from "bun:sqlite";
-import { mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS } from "../auth/registry-port.js";
+import { mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 
 /** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code`. */
@@ -169,10 +169,20 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     insMember: db.query("INSERT INTO reg_team_members (team, member) VALUES (?, ?) ON CONFLICT (team, member) DO NOTHING"),
     delMember: db.query("DELETE FROM reg_team_members WHERE team = ? AND member = ?"),
     members: db.query("SELECT member FROM reg_team_members WHERE team = ? ORDER BY member"),
-    membersOf: db.query("SELECT team, member FROM reg_team_members WHERE team IN (SELECT value FROM json_each(?)) ORDER BY team, member"),
+    membersOf: db.query("SELECT team, member FROM reg_team_members WHERE team IN (SELECT value FROM json_each(?1)) AND (?2 IS NULL OR member IN (SELECT value FROM json_each(?2))) ORDER BY team, member"),
     sgrants: db.query("SELECT subject_type, subject, role FROM reg_scope_grants WHERE scope_type = ? AND scope_id = ? ORDER BY n"),
     sgrant: db.query("SELECT role FROM reg_scope_grants WHERE scope_type = ? AND scope_id = ? AND subject_type = ? AND subject = ?"),
-    sowners: db.query("SELECT count(*) AS c FROM reg_scope_grants WHERE scope_type = ? AND scope_id = ? AND role = 'owner'"),
+    // Owners that guard a Group or Space: a user's, or a Team's while the Team has a member.
+    sowners: db.query(`SELECT subject_type, subject FROM reg_scope_grants g WHERE scope_type = ? AND scope_id = ? AND role = 'owner'
+      AND (subject_type = 'user' OR EXISTS (SELECT 1 FROM reg_team_members m WHERE m.team = g.subject))`),
+    teamOwned: db.query("SELECT scope_type, scope_id FROM reg_scope_grants WHERE subject_type = 'team' AND subject = ? AND role = 'owner' AND scope_type IN ('group', 'space')"),
+    teamSize: db.query("SELECT count(*) AS c FROM reg_team_members WHERE team = ?"),
+    teamHas: db.query("SELECT 1 AS x FROM reg_team_members WHERE team = ? AND member = ?"),
+    boardsInUnit: db.query("SELECT id FROM reg_boards WHERE tenant = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?3"),
+    boardsInSpace: db.query("SELECT board AS id FROM reg_board_spaces WHERE space = ?1 AND (?2 IS NULL OR board > ?2) ORDER BY board LIMIT ?3"),
+    boardsInGroup: db.query("SELECT bs.board AS id FROM reg_board_spaces bs JOIN reg_spaces s ON s.id = bs.space WHERE s.grp = ?1 AND (?2 IS NULL OR bs.board > ?2) ORDER BY bs.board LIMIT ?3"),
+    scopesOf: db.query(`SELECT scope_type, scope_id, role FROM reg_scope_grants WHERE subject_type = ?1 AND subject = ?2
+      AND (?3 IS NULL OR (scope_type || char(10) || scope_id) > ?3) ORDER BY scope_type, scope_id LIMIT ?4`),
     sgrantN: db.query("SELECT coalesce(max(n), 0) + 1 AS n FROM reg_scope_grants WHERE scope_type = ? AND scope_id = ?"),
     upSgrant: db.query(`INSERT INTO reg_scope_grants (scope_type, scope_id, subject_type, subject, role, n) VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT (scope_type, scope_id, subject_type, subject) DO UPDATE SET role = excluded.role`),
@@ -332,6 +342,11 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
   });
   const setMemberTx = db.transaction((team, user, member) => {
     needRow(q.team.get(team), "team");
+    if (!member && q.teamSize.get(team).c === 1 && q.teamHas.get(team, user)) {
+      // Removing the last member of a Team that is the only counted owner of a Group or Space would leave it ownerless.
+      for (const o of q.teamOwned.all(team)) if (q.sowners.all(o.scope_type, o.scope_id).length <= 1)
+        throw new SqlRegistryError("last-owner", `a ${o.scope_type} keeps at least one owner`);
+    }
     (member ? q.insMember : q.delMember).run(team, user);
   });
   const setSgrantTx = db.transaction((type, id, st, sid, role) => {
@@ -340,8 +355,11 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     if (st === "team") needRow(q.team.get(sid)?.tenant === tenant, "team");
     if (type === "board" && st === "user") throw new Error("registry: a user's grant on a board is setGrant");
     const cur = q.sgrant.get(type, id, st, sid)?.role ?? null;
-    if ((type === "group" || type === "space") && cur === "owner" && role !== "owner" && q.sowners.get(type, id).c <= 1)
-      throw new SqlRegistryError("last-owner", `a ${type} keeps at least one owner`);
+    if ((type === "group" || type === "space") && cur === "owner" && role !== "owner") {
+      const counted = q.sowners.all(type, id);
+      if (counted.some(o => o.subject_type === st && o.subject === sid) && counted.length <= 1)
+        throw new SqlRegistryError("last-owner", `a ${type} keeps at least one owner`);
+    }
     putSg(type, id, st, sid, role);
   });
   const createRoleTx = db.transaction((tenant, name, base, boardRole, perms, createdAt) => {
@@ -363,18 +381,19 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     return rowRole(q.role.get(tenant, id));
   });
   // One snapshot read of a scope's whole chain: a fixed number of statements however many grants, Teams or members.
-  const contextTx = db.transaction((type, id) => {
-    const board = type === "board" ? rowBoard(q.board.get(id)) : null;
-    const space = type === "space" ? rowSpace(q.space.get(id)) : board?.space ? rowSpace(q.space.get(board.space)) : null;
-    const group = type === "group" ? rowGroup(q.group.get(id)) : space?.group ? rowGroup(q.group.get(space.group)) : null;
+  // `chain` (already read by the caller) skips the chain statements; `users` limits Team members to those users.
+  const contextTx = db.transaction((type, id, users, held) => {
+    const board = held ? held.board : type === "board" ? rowBoard(q.board.get(id)) : null;
+    const space = held ? held.space : type === "space" ? rowSpace(q.space.get(id)) : board?.space ? rowSpace(q.space.get(board.space)) : null;
+    const group = held ? held.group : type === "group" ? rowGroup(q.group.get(id)) : space?.group ? rowGroup(q.group.get(space.group)) : null;
     const owner = board ?? space ?? group;
-    const tenant = rowTenant(q.tenant.get(type === "unit" ? id : owner?.tenant));
+    const tenant = held ? held.tenant : rowTenant(q.tenant.get(type === "unit" ? id : owner?.tenant));
     if (!tenant || (type !== "unit" && !owner)) return null;
     const sg = (t, i) => (i == null ? [] : q.sgrants.all(t, i).map(rowSg));
     const scoped = { unit: sg("unit", tenant.id), group: sg("group", group?.id), space: sg("space", space?.id), board: sg("board", board?.id) };
     const teamIds = [...new Set(Object.values(scoped).flat().filter(g => g.subject.type === "team").map(g => g.subject.id))];
     const teams = Object.fromEntries(teamIds.map(t => [t, []]));
-    if (teamIds.length) for (const m of q.membersOf.all(JSON.stringify(teamIds))) teams[m.team].push(m.member);
+    if (teamIds.length) for (const m of q.membersOf.all(JSON.stringify(teamIds), users ? JSON.stringify(users) : null)) teams[m.team].push(m.member);
     return { tenant, board, space, group, scoped, roles: q.roles.all(tenant.id).map(rowRole), teams };
   });
 
@@ -523,10 +542,24 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     },
     async role(tenant, id) { ready(); return str(tenant) && str(id) ? rowRole(q.role.get(tenant, id)) ?? null : null; },
     async roles(tenant) { ready(); return str(tenant) ? q.roles.all(tenant).map(rowRole) : []; },
-    async accessContext(scope) {
+    async accessContext(scope, { users, chain } = {}) {
       ready();
       const { type, id } = orgDefaults.scope(scope);
-      return contextTx(type, id);
+      return contextTx(type, id, users ? users.filter(str) : null, chain ?? null);
+    },
+    async boardsIn(scope, { after = null, limit } = {}) {
+      ready();
+      const { type, id } = orgDefaults.scope(scope), n = pageLimit(limit);
+      const q1 = type === "unit" ? q.boardsInUnit : type === "group" ? q.boardsInGroup : type === "space" ? q.boardsInSpace : null;
+      const ids = q1 ? q1.all(id, str(after) ? after : null, n + 1).map(r => r.id) : [];
+      return { ids: ids.slice(0, n), next: ids.length > n ? ids[n - 1] : null };
+    },
+    async scopesOf(subject, { after = null, limit } = {}) {
+      ready();
+      const sub = orgDefaults.subject(subject), n = pageLimit(limit);
+      const rows = q.scopesOf.all(sub.type, sub.id, str(after) ? after : null, n + 1).map(r => ({ type: r.scope_type, id: r.scope_id, role: r.role }));
+      const scopes = rows.slice(0, n);
+      return { scopes, next: rows.length > n ? scopes[n - 1].type + "\n" + scopes[n - 1].id : null };
     },
 
     /** What the registry was opened with, read back from SQLite (for /health and tests). */

@@ -2,7 +2,7 @@
 // last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
 import { normEmail } from "./util.js";
-import { mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS } from "./registry-port.js";
+import { mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit } from "./registry-port.js";
 
 /**
  * @typedef {import("./registry-port.js").Registry} Registry
@@ -38,6 +38,9 @@ export function memoryRegistry({ now = Date.now } = {}) {
   const copy = x => (x ? structuredClone(x) : null);
   const fresh = (map, f) => { let id; do id = f(); while (map.has(id)); return id; };
 
+  /** Owner grants on a Group or Space that guard it: a user's, or a Team's while the Team has a member. @returns {string[]} subject keys */
+  const countedOwners = (type, id) => [...(scoped.get(sk(type, id)) ?? [])]
+    .filter(([k, role]) => role === "owner" && (k.startsWith("user\n") || (members.get(k.slice(5))?.size ?? 0) > 0)).map(([k]) => k);
   const need = (ok, what) => { if (!ok) throw new Error(`registry: no such ${what}`); };
   const sk = (a, b) => a + "\n" + b;
   const putScoped = (type, id, st, sid, role) => {
@@ -179,7 +182,17 @@ export function memoryRegistry({ now = Date.now } = {}) {
     async teams(tenant) { return [...teams.values()].filter(t => t.tenant === tenant).map(copy); },
     async setTeamMember(team, user, member) {
       need(teams.has(team), "team");
-      if (member) members.get(team).add(String(user)); else members.get(team).delete(String(user));
+      const set = members.get(team), u = String(user);
+      if (member) { set.add(u); return; }
+      // Removing the last member of a Team that is the only counted owner of a Group or Space would leave it ownerless.
+      if (set.size === 1 && set.has(u)) for (const [k, g] of scoped) {
+        const [type, ...id] = k.split("\n");
+        if ((type === "group" || type === "space") && g.get(sk("team", team)) === "owner") {
+          const counted = countedOwners(type, id.join("\n"));
+          if (counted.length <= 1) throw new RegistryError("last-owner", `a ${type} keeps at least one owner`);
+        }
+      }
+      set.delete(u);
     },
     async teamMembers(team) { return [...(members.get(team) ?? [])]; },
 
@@ -190,8 +203,10 @@ export function memoryRegistry({ now = Date.now } = {}) {
       if (type === "board" && sub.type === "user") throw new Error("registry: a user's grant on a board is setGrant");
       const g = scoped.get(sk(type, id));
       // Check and write with no await in between: atomic in one JS process.
-      if ((type === "group" || type === "space") && g?.get(sk(sub.type, sub.id)) === "owner" && r !== "owner" && [...g.values()].filter(x => x === "owner").length <= 1)
-        throw new RegistryError("last-owner", `a ${type} keeps at least one owner`);
+      if ((type === "group" || type === "space") && g?.get(sk(sub.type, sub.id)) === "owner" && r !== "owner") {
+        const counted = countedOwners(type, id), me = sk(sub.type, sub.id);
+        if (counted.includes(me) && counted.length <= 1) throw new RegistryError("last-owner", `a ${type} keeps at least one owner`);
+      }
       putScoped(type, id, sub.type, sub.id, r);
     },
     async scopedGrants(scope) {
@@ -223,18 +238,36 @@ export function memoryRegistry({ now = Date.now } = {}) {
     async role(tenant, id) { return copy(roles.get(tenant)?.get(id)); },
     async roles(tenant) { return [...(roles.get(tenant)?.values() ?? [])].map(copy); },
 
-    async accessContext(scope) {
+    async accessContext(scope, { users, chain } = {}) {
       const { type, id } = orgDefaults.scope(scope);
-      const board = type === "board" ? boards.get(id) : null;
-      const space = type === "space" ? spaces.get(id) : board?.space ? spaces.get(board.space) : null;
-      const group = type === "group" ? groups.get(id) : space?.group ? groups.get(space.group) : null;
-      const tenant = tenants.get(type === "unit" ? id : (board ?? space ?? group)?.tenant);
+      const board = chain ? chain.board : type === "board" ? boards.get(id) : null;
+      const space = chain ? chain.space : type === "space" ? spaces.get(id) : board?.space ? spaces.get(board.space) : null;
+      const group = chain ? chain.group : type === "group" ? groups.get(id) : space?.group ? groups.get(space.group) : null;
+      const tenant = chain ? chain.tenant : tenants.get(type === "unit" ? id : (board ?? space ?? group)?.tenant);
       if (!tenant || (type !== "unit" && !(board ?? space ?? group))) return null;
       const list = (t, i) => (i == null ? [] : [...(scoped.get(sk(t, i)) ?? [])].map(([k, role]) => { const [st, ...si] = k.split("\n"); return { subject: { type: st, id: si.join("\n") }, role }; }));
       const sc = { unit: list("unit", tenant.id), group: list("group", group?.id), space: list("space", space?.id), board: list("board", board?.id) };
       const teamIds = new Set(Object.values(sc).flat().filter(g => g.subject.type === "team").map(g => g.subject.id));
+      const want = users ? new Set(users) : null;
+      const inTeam = t => [...(members.get(t) ?? [])].filter(u => !want || want.has(u));
       return copy({ tenant, board: board ?? null, space: space ?? null, group: group ?? null, scoped: sc,
-        roles: [...(roles.get(tenant.id)?.values() ?? [])], teams: Object.fromEntries([...teamIds].map(t => [t, [...(members.get(t) ?? [])]])) });
+        roles: [...(roles.get(tenant.id)?.values() ?? [])], teams: Object.fromEntries([...teamIds].map(t => [t, inTeam(t)])) });
+    },
+
+    async boardsIn(scope, { after = null, limit } = {}) {
+      const { type, id } = orgDefaults.scope(scope);
+      if (type === "board") return { ids: [], next: null };
+      const spaceIds = new Set([...spaces.values()].filter(sp => (type === "space" ? sp.id === id : type === "group" ? sp.group === id : false)).map(sp => sp.id));
+      const all = [...boards.values()].filter(b => (type === "unit" ? b.tenant === id : spaceIds.has(b.space))).map(b => b.id).sort();
+      const n = pageLimit(limit), rest = after == null ? all : all.filter(x => x > after), ids = rest.slice(0, n);
+      return { ids, next: rest.length > n ? ids[n - 1] : null };
+    },
+    async scopesOf(subject, { after = null, limit } = {}) {
+      const sub = orgDefaults.subject(subject), me = sk(sub.type, sub.id);
+      const all = [...scoped].filter(([, g]) => g.has(me)).map(([k, g]) => { const [type, ...i] = k.split("\n"); return { type, id: i.join("\n"), role: g.get(me) }; })
+        .sort((x, y) => (x.type + "\n" + x.id < y.type + "\n" + y.id ? -1 : 1));
+      const cur = s => s.type + "\n" + s.id, n = pageLimit(limit), rest = after == null ? all : all.filter(x => cur(x) > after), page = rest.slice(0, n);
+      return { scopes: page, next: rest.length > n ? cur(page[n - 1]) : null };
     },
   };
 }

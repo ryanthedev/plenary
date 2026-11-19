@@ -33,6 +33,21 @@
 // are not counted. Role strings are stored as given (the admin layer validates them with server/auth/permissions.js;
 // the resolver ignores a role that is not valid where it is held).
 //
+// accessContext(scope, { users, chain }): `users` (user ids, at most a few thousand) limits `teams` to those users'
+// memberships, so a hello reads one user's and a re-check pass reads its own users', never a whole Team. `chain` is a
+// Chain the caller already holds for this scope (a cache's); the adapter then skips reading it (and returns it as given),
+// reading only the volatile parts (grants, roles, Team memberships). One call, a fixed number of statements, one
+// consistent snapshot (Postgres: one statement).
+//
+// boardsIn / scopesOf exist so that a change to a Space's, Group's or Unit's grants (or to a Team's membership) can be
+// announced for every board it reaches, which the port otherwise couldn't list (PROTOCOL.md § Organization, "Freshness").
+// Both page by an opaque cursor (`after` = the last id / scope of the previous page, `next` = null at the end), `limit`
+// defaults to 500 and is capped at 1000, and each page is one bounded statement.
+//
+// Last owner for Groups and Spaces counts a Team owner only while the Team has at least one member (an empty Team
+// guards nothing), and `setTeamMember` refuses to remove the last member of a Team that is the only counted owner of
+// a Group or Space (code "last-owner").
+//
 // Every method is async. Ids are server-minted over [a-z0-9-] (no ".", "*", ">"), never a domain name, so they
 // are safe in bus subjects (PROTOCOL.md § Bus). Mint them with `mint` below, so every adapter shares the format.
 
@@ -68,9 +83,10 @@ export const mint = {
  * @typedef {{ type: "unit"|"group"|"space"|"board", id: string }} ScopeRef   a Unit's id is its tenant id
  * @typedef {{ type: "user"|"team", id: string }} Subject
  * @typedef {{ subject: Subject, role: string }} ScopedGrant
+ * @typedef {{ tenant: Tenant, board: Board|null, space: Space|null, group: Group|null }} Chain   the scope's stable records (a roleCache may keep them for a while and hand them back)
  * @typedef {{ tenant: Tenant, board: Board|null, space: Space|null, group: Group|null,
  *   scoped: { unit: ScopedGrant[], group: ScopedGrant[], space: ScopedGrant[], board: ScopedGrant[] },
- *   roles: CustomRole[], teams: Record<string, string[]> }} AccessContext   `scoped`: the grants on each scope of the chain (a board's are Team grants only; user grants on a board are `grants`); `roles`: the Unit's stored roles; `teams`: members of each Team that appears in `scoped`
+ *   roles: CustomRole[], teams: Record<string, string[]> }} AccessContext   `scoped`: the grants on each scope of the chain (a board's are Team grants only; user grants on a board are `grants`); `roles`: the Unit's stored roles; `teams`: for each Team that appears in `scoped`, its members (only those named in `users`, when given)
  * @typedef {{ id: string, board: string, email: string, role: Role, expiresAt: number|null, revoked: boolean, by: string, createdAt: number }} Invite
  * @typedef {{ id: string, board: string, role: Role, expiresAt: number|null, revoked: boolean, by: string, createdAt: number }} Link
  *
@@ -100,7 +116,9 @@ export const mint = {
  *   updateRole(tenant: string, id: string, patch: { name?: string, boardRole?: Role|null, permissions?: string[] }): Promise<CustomRole>,   // id "member" (the editable Unit member role) is created on first update; rejects an unknown id
  *   role(tenant: string, id: string): Promise<CustomRole|null>,
  *   roles(tenant: string): Promise<CustomRole[]>,
- *   accessContext(scope: ScopeRef): Promise<AccessContext|null>,   // null for an unknown scope
+ *   accessContext(scope: ScopeRef, o?: { users?: string[], chain?: Chain }): Promise<AccessContext|null>,   // null for an unknown scope; see "accessContext" below
+ *   boardsIn(scope: ScopeRef, o?: { after?: string|null, limit?: number }): Promise<{ ids: string[], next: string|null }>,   // board ids in a Unit, Group or Space, by id, one bounded page
+ *   scopesOf(subject: Subject, o?: { after?: string|null, limit?: number }): Promise<{ scopes: (ScopeRef & { role: string })[], next: string|null }>,   // the scopes a user or Team holds a grant on (not boards: a board's own user grants are `grants`)
  *   board(id: string): Promise<Board|null>,
  *   setGrant(board: string, user: string, role: Role|null): Promise<void>,   // rejects code "last-owner" (atomic)
  *   grant(board: string, user: string): Promise<Role|null>,
@@ -119,6 +137,11 @@ export const mint = {
  *   linkUsesFor?(board: string, users: string[]): Promise<Map<string, string[]>>,   // OPTIONAL batch (below)
  * }} Registry
  */
+
+/** Page size for `boardsIn` / `scopesOf`: default and cap. */
+export const PAGE = { default: 500, max: 1000 };
+/** A page limit as the adapters apply it. */
+export const pageLimit = n => Math.min(PAGE.max, Math.max(1, Math.floor(Number(n) || PAGE.default)));
 
 /** The kinds a Unit may carry (a label; Units never nest). */
 export const KINDS = ["company", "enterprise"];

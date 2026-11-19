@@ -65,6 +65,10 @@ export function identities() {
   for (let i = 0; i < 10; i++) for (const [domain, mail] of [["acme.com", `u${i}@acme.com`], ["globex.com", `u${i}@globex.com`], [null, `u${i}@partner.io`], [null, null]])
     out.push({ user: `google:u${i}`, domain, email: mail });
   out.push({ user: "google:root", domain: "acme.com", email: "boss@acme.com" }, { user: "dev:ops", domain: null, email: null });
+  // the cases a role reads in odd combinations: an email at the Unit's domain with no `hd`, a gmail user with no domain, an
+  // upper-case `hd` (never equal to the stored lower-case domain), and an `hd` with a foreign email
+  for (const i of [0, 1, 2]) out.push({ user: `google:u${i}`, domain: null, email: `u${i}@acme.com` }, { user: `google:u${i}`, domain: null, email: `u${i}@gmail.com` },
+    { user: `google:u${i}`, domain: "ACME.COM", email: `u${i}@acme.com` }, { user: `google:u${i}`, domain: "acme.com", email: `u${i}@evil.example` });
   for (const e of ["U1@Acme.com", "u2@acme.com", "u3@globex.com", "u4@partner.io", "u5@gmail.com"]) out.push({ user: "google:u1", domain: "acme.com", email: e });
   return out;
 }

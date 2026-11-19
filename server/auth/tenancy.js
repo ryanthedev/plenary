@@ -18,7 +18,7 @@
 // the same pure `combine`, so they can't disagree (test/auth/role-cache.test.js checks it on random registries).
 
 import { normEmail } from "./util.js";
-import { resolveAccess } from "./resolver.js";
+import { resolveAccess, teamIndex } from "./resolver.js";
 
 /** @typedef {import("./registry-port.js").Registry} Registry */
 /** @typedef {import("./registry-port.js").Role} Role */
@@ -41,6 +41,7 @@ export const identityKey = id => `${id.user}\n${id.email ?? ""}\n${id.domain ?? 
 
 const live = (x, t) => x && !x.revoked && (x.expiresAt == null || t < x.expiresAt);
 const nothing = () => ({ ladder: null, permissions: new Set(), sources: [], until: Infinity });
+const NO_TEAMS = new Set();
 const okIdentity = id => !!id && typeof id.user === "string";
 
 /**
@@ -69,7 +70,7 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
   /** One user's access to a board: ladder role, permissions, sources. @returns {Promise<import("./resolver.js").Access>} */
   async function accessOn(identity, boardId) {
     if (!okIdentity(identity) || typeof boardId !== "string") return nothing();
-    const ctx = await registry.accessContext({ type: "board", id: boardId });
+    const ctx = await registry.accessContext({ type: "board", id: boardId }, { users: [identity.user] });
     if (!ctx?.board) return nothing();
     const t = now();
     const grant = await registry.grant(ctx.board.id, identity.user);
@@ -99,8 +100,10 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
     const out = new Map();
     const none = () => { for (const [k, id] of ids) out.set(k, { role: null, until: Infinity, identity: id }); return out; };
     if (typeof boardId !== "string" || !ids.size) return none();
-    const ctx = await registry.accessContext({ type: "board", id: boardId });
+    const users = [...new Set([...ids.values()].map(id => id.user))];
+    const ctx = await registry.accessContext({ type: "board", id: boardId }, { users, fresh: true });   // a pass reads everything fresh
     if (!ctx?.board) return none();
+    const teamsOf = teamIndex(ctx);                      // user → Teams, once per pass (never a scan per identity)
     const board = ctx.board;
     const t = now();
     const all = [...ids.values()];
@@ -114,7 +117,7 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
     }
     /** @type {Map<string, string[]>} user → link ids used on this board */
     let uses = new Map();
-    const users = [...new Set(all.map(id => id.user))];   // link uses are per user, whatever the email or domain
+    // link uses are per user, whatever the email or domain: `users` (above) is the distinct set
     if (typeof registry.linkUsesFor === "function") {
       for (let i = 0; i < users.length; i += USE_CHUNK) {
         const chunk = users.slice(i, i + USE_CHUNK), want = new Set(chunk);
@@ -126,7 +129,7 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
     for (const [k, id] of ids) {
       const invites = id.email ? invitesBy.get(normEmail(id.email)) ?? [] : [];
       const links = (uses.get(id.user) ?? []).map(l => linkById.get(l) ?? null);
-      out.set(k, { ...combine({ ctx, grant: grants.get(id.user) ?? null, invites, links }, id, t, opts), identity: id });
+      out.set(k, { ...combine({ ctx, grant: grants.get(id.user) ?? null, invites, links, teams: teamsOf.get(id.user) ?? NO_TEAMS }, id, t, opts), identity: id });
     }
     return out;
   }
@@ -145,7 +148,7 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
       if (typeof scope === "string") return accessOn(identity, scope);
       if (!okIdentity(identity) || !scope || typeof scope.id !== "string") return nothing();
       if (scope.type === "board") return accessOn(identity, scope.id);
-      const ctx = await registry.accessContext(scope);
+      const ctx = await registry.accessContext(scope, { users: [identity.user] });
       return ctx ? resolveAccess({ ctx }, identity, now(), opts) : nothing();
     },
     /** @returns {Promise<Map<string, Role|null>>} identityKey(identity) → role, one entry per distinct requested identity */
@@ -173,7 +176,7 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
   };
 }
 
-const tenancyOver = (registry, now, recordUntil) => tenancy({ registry, now, recordUntil });
+const tenancyOver = (registry, now, recordUntil, adminBoardContent) => tenancy({ registry, now, recordUntil, adminBoardContent });
 
 // ---- roleCache: a role cache over `tenancy` (p5-load; p-audit F8). Depends only on the Registry port. ----
 //
@@ -184,8 +187,8 @@ const tenancyOver = (registry, now, recordUntil) => tenancy({ registry, now, rec
 //     (time-based loss sends no message); and the end of the memo of every link record it was built from (p5-load2v
 //     MEDIUM 0: a joiner of an in-flight link read counts from that read's start), so with linkTtlMs ≤ ttlMs no
 //     entry rests on link data more than ttlMs old. Bounded by `maxEntries` (oldest dropped first).
-//   - the records whose read fields can't change once written: board and tenant for 10 min (board.id, memberRole,
-//     tenant, tenant.domain have no update method; `admins` does change and is never served from here), and link
+//   - the records whose read fields can't change once written: boards for 10 min (board.id, memberRole, tenant have no
+//     update method), the board's chain (Space, Group, tenant) for ttlMs (below), and link
 //     records by id for 30 s (a link changes only by revokeLink, which announces on `grants`). `live()` is evaluated
 //     on every use, so a memoized link still expires on time. Lookups of the same record share one read, unless an
 //     invalidation came between.
@@ -202,24 +205,28 @@ const tenancyOver = (registry, now, recordUntil) => tenancy({ registry, now, rec
 // Errors are never cached: a Registry failure propagates (the gateway answers `unavailable`).
 
 /**
- * @param {{ registry: Registry, now?: () => number, ttlMs?: number, recordTtlMs?: number, linkTtlMs?: number, maxEntries?: number, maxRecords?: number }} o
+ * @param {{ registry: Registry, now?: () => number, ttlMs?: number, recordTtlMs?: number, linkTtlMs?: number, maxEntries?: number, maxRecords?: number, adminBoardContent?: boolean }} o
  *   ttlMs: a role entry's longest life, counted from when the oldest changeable data it rests on was read (default
  *     30 s; keep it ≤ the gateway's 60 s re-check, see the report). An entry built from a memoized link record ends no
  *     later than that record's memo (p5-load2v MEDIUM 0), so with linkTtlMs ≤ ttlMs a role is never served from data
  *     more than ttlMs old;
- *   recordTtlMs: board and tenant records (default 10 min, above the 60 s pass, so a pass reads them from memory). The
- *     fields the cache reads from them (board.id, board.memberRole, board.tenant, tenant.domain) never change: the
- *     port has no update or delete for either (p5-loadv finding 6). `tenant.admins` DOES change at runtime
- *     (addTenantAdmin, add-only): never serve `admins` (or any field but those four) from this memo; admin checks
- *     read the Registry (server/admin/boards.js). IF a future port adds one (setMemberRole,
- *     deleteBoard, a tenant domain change), that write must announce `{ board }` (every board of the tenant, for a
- *     tenant change) and `invalidate(board)` must then also drop the board and tenant records: today it drops roles
- *     and links only;
+ *   recordTtlMs: board records (default 10 min, above the 60 s pass, so a pass reads them from memory). The fields the
+ *     cache reads from them (board.id, board.memberRole, board.tenant) never change: the port has no update or delete
+ *     for either (p5-loadv finding 6). IF a future port adds one (setMemberRole, deleteBoard), that write must announce
+ *     `{ board }` and `invalidate(board)` must then also drop the board record: today it drops roles, links and the chain;
+ *   the CHAIN of a board (its Space, Group and tenant records, `registry.accessContext`'s `chain`): kept for `ttlMs` per
+ *     board, so a hello after the first reads only the volatile parts (grants, roles, Team members) in the one
+ *     statement. `invalidate(board)` drops it, and a read in flight across an invalidation never fills it. What it holds
+ *     can change (a Space moved, a general access edited, a domain or admin added): such a write must announce every
+ *     board it reaches (PROTOCOL.md § Organization, "Freshness"), and the timed pass reads the chain fresh (`fresh`)
+ *     anyway, so it is never older than ttlMs. A tenant's `admins` and `domains` only ever grow, so a stale chain can only
+ *     delay a gain, never hide a revoke;
+ *   adminBoardContent: pass-through to `tenancy` (does a Unit admin get board content everywhere? default false);
  *   linkTtlMs: link records (default 30 s; a link changes by revokeLink, which announces `{ board }` and drops them).
  */
 const STAMP_MAX = 10_000;
 
-export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlMs = 600_000, linkTtlMs = 30_000, maxEntries = 200_000, maxRecords = 100_000 }) {
+export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlMs = 600_000, linkTtlMs = 30_000, maxEntries = 200_000, maxRecords = 100_000, adminBoardContent = false }) {
   if (!registry) throw new Error("roleCache: registry is required");
   const stats = { hits: 0, misses: 0, fills: 0, discarded: 0, recordHits: 0, recordMisses: 0 };
 
@@ -231,7 +238,7 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
   const stale = (board, user, c0) => (boardStamp.get(board) ?? 0) > c0 || (userStamp.get(ukey(board, user)) ?? 0) > c0;
   const endRead = () => { if (--reading === 0) { boardStamp.clear(); userStamp.clear(); } };   // no read in flight: stamps can't matter
 
-  // ---- records: board, tenant, link (by id) ----
+  // ---- records: board, link (by id) ----
   /** @type {Map<string, { value: any, until: number, board: string|null }>} */ const records = new Map();
   /** @type {Map<string, { p: Promise<any>, c0: number }>} in-flight record reads, with the clock they began at */ const recordReads = new Map();
   /** @type {Map<string, Set<string>>} board → its memoized link keys */ const linksOf = new Map();
@@ -269,8 +276,25 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
   const linkUntil = new WeakMap();
   const mark = (kind, v, until) => { if (kind === "link") linkUntil.set(v, until); return v; };
   const board = memo("board", id => registry.board(id));
-  const view = { ...registry, board, tenant: memo("tenant", id => registry.tenant(id)), link: memo("link", id => registry.link(id)) };
-  const tenancy = tenancyOver(view, now, l => linkUntil.get(l) ?? Infinity);
+  // ---- chains: a board's Space, Group and tenant records, handed back to the Registry so a hello reads only the volatile rows ----
+  /** @type {Map<string, { chain: import("./registry-port.js").Chain, until: number }>} oldest first */ const chains = new Map();
+  async function accessContext(scope, o = {}) {
+    if (scope?.type !== "board" || typeof scope.id !== "string") return registry.accessContext(scope, o);
+    const k = scope.id, t = now(), hit = chains.get(k), c0 = clock;
+    const held = !o.fresh && hit && hit.until > t ? hit.chain : undefined;
+    reading++;
+    try {
+      const ctx = await registry.accessContext(scope, { users: o.users, ...(held ? { chain: held } : {}) });
+      if (ctx?.board && !held && (boardStamp.get(k) ?? 0) <= c0) {
+        chains.delete(k);
+        if (chains.size >= maxRecords) chains.delete(chains.keys().next().value);
+        chains.set(k, { chain: { tenant: ctx.tenant, board: ctx.board, space: ctx.space, group: ctx.group }, until: t + ttlMs });
+      }
+      return ctx;
+    } finally { endRead(); }
+  }
+  const view = { ...registry, board, link: memo("link", id => registry.link(id)), accessContext };
+  const tenancy = tenancyOver(view, now, l => linkUntil.get(l) ?? Infinity, adminBoardContent);
 
   // ---- roles ----
   // Entries are keyed by board + identityKey (user, email, domain), as the gateway groups connections, so two
@@ -350,7 +374,7 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
       return new Map([...m].map(([k, r]) => [k, r.role]));
     },
 
-    /** Drop a board's cached roles and link records, or one user's role. Synchronous; call it before re-reading. */
+    /** Drop a board's cached roles, link records and chain, or one user's role. Synchronous; call it before re-reading. */
     invalidate(boardId, user) {
       if (typeof boardId !== "string") return;
       if (typeof user === "string") {
@@ -362,7 +386,7 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
         else clock++;
         return;
       }
-      dropBoard(boardId); dropLinks(boardId);
+      dropBoard(boardId); dropLinks(boardId); chains.delete(boardId);
       if (reading) boardStamp.set(boardId, ++clock); else clock++;   // clock moves either way: no read joins across it
     },
 

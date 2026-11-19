@@ -24,8 +24,10 @@ describe("sources and the ladder role", () => {
     expect([a.ladder, [...a.permissions], a.sources]).toEqual([null, [], []]);
     const m = resolveAccess({ ctx: ctx() }, me, T);
     expect(m.ladder).toBe(null);
-    expect([...m.permissions]).toEqual(["space.create"]);
+    expect([...m.permissions]).toEqual([]);                      // asked about a board: the member role's space.create is the Unit's own
     expect(m.sources).toMatchObject([{ kind: "unit", scope: { type: "unit", id: "t-acme" }, role: "member" }]);
+    const atUnit = resolveAccess({ ctx: { tenant, board: null, space: null, group: null, scoped: {}, roles: [], teams: {} } }, me, T);
+    expect([...atUnit.permissions]).toEqual(["space.create"]);   // asked about the Unit itself: every member may create a Space at the root
   });
 
   test("direct grant on the board", () => {
@@ -41,11 +43,11 @@ describe("sources and the ladder role", () => {
 
   test("team grant on the board names the team; a team the user is not in counts for nothing", () => {
     const c = ctx({ scoped: { unit: [], group: [], space: [], board: [sg(TM("tm-a"), "editor"), sg(TM("tm-b"), "owner")] }, teams: { "tm-a": ["google:me"], "tm-b": ["google:other"] } });
-    const a = resolveAccess({ ctx: c }, guest, T);
+    const a = resolveAccess({ ctx: c }, { ...me, user: "google:nobody" }, T);
     expect(a.ladder).toBe(null);
-    const b = resolveAccess({ ctx: c }, { ...guest, user: "google:me" }, T);
+    const b = resolveAccess({ ctx: c }, me, T);
     expect(b.ladder).toBe("editor");
-    expect(b.sources).toMatchObject([{ kind: "team", team: "tm-a", scope: { type: "board" }, role: "editor" }]);
+    expect(b.sources[0]).toMatchObject({ kind: "team", team: "tm-a", scope: { type: "board" }, role: "editor" });
   });
 
   test("Space grants (user and team) reach the board; so do Group grants", () => {
@@ -110,12 +112,34 @@ describe("sources and the ladder role", () => {
   });
 });
 
+/** A context whose target is the Unit, a Group, a Space or a board (the innermost record present is the target). */
+const at = (target, o = {}) => ({
+  tenant, board: target === "board" ? board : null, space: target === "board" || target === "space" ? space : null,
+  group: target !== "unit" ? group : null, scoped: { unit: [], group: [], space: [], board: [] }, roles: [], teams: {}, ...o,
+});
+const scopedOn = (scope, ...grants) => ({ unit: [], group: [], space: [], board: [], [scope]: grants });
+const unitAdmin = { user: "google:root", domain: "acme.com" };
+
 describe("the Unit", () => {
-  test("a Unit admin has every management permission and, by default, no board content", () => {
-    const a = resolveAccess({ ctx: ctx() }, { user: "google:root", domain: "acme.com" }, T);
+  test("a Unit admin has every management permission asked of the Unit, and by default no board content", () => {
+    const a = resolveAccess({ ctx: at("unit") }, unitAdmin, T);
     expect(a.ladder).toBe(null);
     expect([...a.permissions].sort()).toEqual([...MGMT_PERMS].sort());
-    expect(resolveAccess({ ctx: ctx() }, { user: "google:root", domain: "acme.com" }, T, { adminBoardContent: true }).ladder).toBe("owner");
+    expect(resolveAccess({ ctx: at("unit") }, unitAdmin, T, { adminBoardContent: true }).ladder).toBe("owner");
+  });
+
+  test("permissions are clipped to the target asked about: an admin asked about a board or Space has no roles.manage", () => {
+    expect(perms({ ctx: at("board") }, unitAdmin)).toEqual(["delete", "members.manage", "move", "transfer"]);
+    expect(perms({ ctx: at("space") }, unitAdmin)).toEqual(["board.create", "delete", "members.manage", "move", "transfer"]);
+    expect(perms({ ctx: at("group") }, unitAdmin)).toEqual(["board.create", "delete", "members.manage", "move", "space.create", "transfer"]);
+    for (const sc of resolveAccess({ ctx: at("board") }, unitAdmin, T).sources) expect(sc.permissions).not.toContain("roles.manage");
+  });
+
+  test("the member role's space.create is the Unit's own: not reported for a Group, a Space or a board", () => {
+    expect(perms({ ctx: at("unit") })).toEqual(["space.create"]);
+    for (const t of ["group", "space", "board"]) expect(perms({ ctx: at(t) })).toEqual([]);
+    // creating a Space in a Group needs a role on that Group
+    expect(perms({ ctx: at("group", { scoped: scopedOn("group", sg(U("google:me"), "editor")) }) })).toContain("space.create");
   });
 
   test("admins by user id or by email: the email entry needs a Google user, a verified-domain member, and that email", () => {
@@ -127,52 +151,90 @@ describe("the Unit", () => {
     expect(isUnitAdmin(null, { user: "google:root" })).toBe(false);
   });
 
-  test("a role granted on the Unit reaches every board in it (a custom role at Unit scope)", () => {
+  test("a role granted on the Unit reaches every board in it, clipped to the target (a custom role at Unit scope)", () => {
     const role = { id: "r-1", tenant: "t-acme", name: "Auditor", base: "viewer", boardRole: "viewer", permissions: ["roles.manage", "delete"], createdAt: 0 };
-    const c = ctx({ roles: [role], scoped: { unit: [sg(U("google:kim"), "r-1")], group: [], space: [], board: [] } });
-    const a = resolveAccess({ ctx: c }, guest, T);
+    const c = k => at(k, { roles: [role], scoped: scopedOn("unit", sg(U("google:me"), "r-1")) });
+    const a = resolveAccess({ ctx: c("board") }, me, T);
     expect(a.ladder).toBe("viewer");
-    expect([...a.permissions].sort()).toEqual(["board.view", "delete", "roles.manage"]);
+    expect([...a.permissions].sort()).toEqual(["board.view", "delete"]);                       // roles.manage means nothing on a board
+    expect([...resolveAccess({ ctx: c("unit") }, me, T).permissions].sort()).toEqual(["board.view", "delete", "roles.manage", "space.create"]);
   });
 
   test("the Unit member role can be edited: removing space.create, or giving board content to every member", () => {
-    const edit = p => ctx({ roles: [{ id: "member", tenant: "t-acme", name: "Unit member", base: null, boardRole: p.boardRole, permissions: p.permissions, createdAt: 0 }] });
+    const edit = p => at("unit", { roles: [{ id: "member", tenant: "t-acme", name: "Unit member", base: null, boardRole: p.boardRole, permissions: p.permissions, createdAt: 0 }] });
     expect(perms({ ctx: edit({ boardRole: null, permissions: [] }) })).toEqual([]);
     const v = resolveAccess({ ctx: edit({ boardRole: "viewer", permissions: ["board.create"] }) }, me, T);
     expect(v.ladder).toBe("viewer");
     expect([...v.permissions].sort()).toEqual(["board.create", "board.view"]);
     expect(resolveAccess({ ctx: edit({ boardRole: "viewer", permissions: [] }) }, guest, T).ladder).toBe(null);   // members only
   });
+
+  test("admin and member are not grantable roles: a scoped grant of either is ignored, so effective() and the admin layer agree", () => {
+    const c = at("unit", { scoped: scopedOn("unit", sg(U("google:me"), "admin"), sg(TM("tm-a"), "admin")), teams: { "tm-a": ["google:me"] } });
+    expect([...resolveAccess({ ctx: c }, me, T).permissions]).toEqual(["space.create"]);      // the member role only
+    const asMember = at("unit", { scoped: scopedOn("unit", sg(U("google:me"), "member")), roles: [{ id: "member", tenant: "t-acme", name: "m", base: null, boardRole: null, permissions: [], createdAt: 0 }] });
+    expect(resolveAccess({ ctx: asMember }, me, T).sources.filter(x => x.kind === "direct")).toEqual([]);
+    // a guest granted member on the Unit gets nothing
+    const g = at("board", { scoped: scopedOn("unit", sg(U("google:kim"), "member"), sg(U("google:kim"), "admin")) });
+    expect(resolveAccess({ ctx: g }, guest, T).sources).toEqual([]);
+  });
+});
+
+describe("guests reach no Space, Group, Team or Unit source, whatever the Registry's rows say", () => {
+  const role = { id: "r-1", tenant: "t-acme", name: "R", base: "editor", boardRole: "editor", permissions: ["board.create", "members.manage"], createdAt: 0 };
+  const everything = target => at(target, {
+    roles: [role], teams: { "tm-a": ["google:kim"] },
+    scoped: { unit: [sg(U("google:kim"), "r-1"), sg(TM("tm-a"), "r-1")], group: [sg(U("google:kim"), "owner"), sg(TM("tm-a"), "owner")],
+      space: [sg(U("google:kim"), "owner"), sg(TM("tm-a"), "editor")], board: [sg(TM("tm-a"), "editor")] },
+  });
+  for (const target of ["board", "space", "group", "unit"]) test(`target ${target}: no ladder role, no permissions, no sources`, () => {
+    const a = resolveAccess({ ctx: everything(target) }, guest, T);
+    expect([a.ladder, [...a.permissions], a.sources]).toEqual([null, [], []]);
+  });
+  test("the same rows do count for a Unit member (so the guard, not the data, is what refuses the guest)", () => {
+    const a = resolveAccess({ ctx: everything("board") }, { ...guest, user: "google:kim", domain: "acme.com" }, T);
+    expect(a.ladder).toBe("owner");
+    expect(a.sources.length).toBeGreaterThan(3);
+  });
+  test("a guest keeps exactly the board-scope sources: a direct board grant, a live invite, a live link", () => {
+    const rows = { ctx: everything("board"), grant: "viewer", invites: [{ role: "annotator", expiresAt: null, revoked: false }], links: [{ board: "b-1", role: "editor", expiresAt: null, revoked: false }] };
+    const a = resolveAccess(rows, guest, T);
+    expect(a.sources.map(x => x.kind)).toEqual(["direct", "invite", "link"]);
+    expect(a.ladder).toBe("editor");
+  });
+  test("a Unit with no domain: its admin (by user id) is inside and may hold Space grants; any other user is not", () => {
+    const dev = { ...tenant, id: "t-dev", domain: null, domains: [], admins: ["dev:ops"] };
+    const c = { tenant: dev, board: null, space: { ...space, tenant: "t-dev" }, group: null, scoped: scopedOn("space", sg(U("dev:ops"), "owner"), sg(U("dev:bob"), "owner")), roles: [], teams: {} };
+    expect(perms({ ctx: c }, { user: "dev:ops", domain: null })).toContain("board.create");
+    expect(resolveAccess({ ctx: c }, { user: "dev:bob", domain: null }, T).sources).toEqual([]);
+    expect(isUnitMember(dev, { user: "dev:ops", domain: null })).toBe(false);      // inside is not membership: no general access for an admin by id alone
+    expect(resolveAccess({ ctx: { ...c, board, space: { ...c.space, generalRole: "viewer" } } }, { user: "dev:ops", domain: null }, T).sources.map(x => x.kind)).toEqual(["direct", "unit"]);   // never "general"
+  });
 });
 
 describe("containers: permissions asked of a Space, a Group, the Unit", () => {
-  const spaceCtx = (o = {}) => ({ tenant, board: null, space, group, scoped: { unit: [], group: [], space: [], board: [] }, roles: [], teams: {}, ...o });
-  test("Space owner may create boards, manage members, move and delete; not create Spaces or manage roles (a member gets space.create from the member role)", () => {
-    const c = spaceCtx({ scoped: { unit: [], group: [], space: [sg(U("google:me"), "owner"), sg(U("google:kim"), "owner")], board: [] } });
-    // space.create is the Unit member role's (every member may create a Space at the root), not the Space owner's
-    expect(perms({ ctx: c }, guest)).toEqual([...CONTENT_PERMS, "board.create", "delete", "members.manage", "move", "transfer"].sort());
-    expect(perms({ ctx: c })).toEqual([...CONTENT_PERMS, "board.create", "delete", "members.manage", "move", "space.create", "transfer"].sort());
+  test("Space owner may create boards, manage members, move and delete; not create Spaces or manage roles", () => {
+    const c = at("space", { scoped: scopedOn("space", sg(U("google:me"), "owner")) });
+    expect(perms({ ctx: c })).toEqual([...CONTENT_PERMS, "board.create", "delete", "members.manage", "move", "transfer"].sort());
   });
   test("Space editor creates boards but does not manage members; Space viewer creates nothing", () => {
-    const e = perms({ ctx: spaceCtx({ scoped: { unit: [], group: [], space: [sg(U("google:me"), "editor")], board: [] } }) });
+    const e = perms({ ctx: at("space", { scoped: scopedOn("space", sg(U("google:me"), "editor")) }) });
     expect(e).toContain("board.create"); expect(e).not.toContain("members.manage");
-    const v = perms({ ctx: spaceCtx({ scoped: { unit: [], group: [], space: [sg(U("google:me"), "viewer")], board: [] } }) });
-    expect(v).not.toContain("board.create");
+    expect(perms({ ctx: at("space", { scoped: scopedOn("space", sg(U("google:me"), "viewer")) }) })).not.toContain("board.create");
   });
   test("a Group editor can create Spaces in the Group and boards in all its Spaces", () => {
-    const c = spaceCtx({ space: null, scoped: { unit: [], group: [sg(U("google:me"), "editor")], space: [], board: [] } });
-    const p = perms({ ctx: c });
+    const p = perms({ ctx: at("group", { scoped: scopedOn("group", sg(U("google:me"), "editor")) }) });
     expect(p).toContain("space.create"); expect(p).toContain("board.create"); expect(p).not.toContain("members.manage");
+    expect(perms({ ctx: at("space", { scoped: scopedOn("group", sg(U("google:me"), "editor")) }) })).not.toContain("space.create");   // a Space can't hold a Space
   });
   test("a Space's own chain is Space, Group, Unit: a Group owner holds members.manage over the Space", () => {
-    expect(perms({ ctx: spaceCtx({ scoped: { unit: [], group: [sg(U("google:me"), "owner")], space: [], board: [] } }) })).toContain("members.manage");
+    expect(perms({ ctx: at("space", { scoped: scopedOn("group", sg(U("google:me"), "owner")) }) })).toContain("members.manage");
   });
   test("the personal-space owner can create boards there and nowhere else", () => {
     const personal = { ...space, id: "s-me", kind: "personal", owner: "google:me", group: null };
-    const mine = spaceCtx({ space: personal, group: null, scoped: { unit: [], group: [], space: [sg(U("google:me"), "owner")], board: [] } });
+    const mine = { tenant, board: null, space: personal, group: null, scoped: scopedOn("space", sg(U("google:me"), "owner")), roles: [], teams: {} };
     expect(perms({ ctx: mine })).toContain("board.create");
-    const theirs = spaceCtx({ space: { ...personal, id: "s-other", owner: "google:z" }, group: null });
-    expect(perms({ ctx: theirs })).not.toContain("board.create");
+    expect(perms({ ctx: { ...mine, space: { ...personal, id: "s-other", owner: "google:z" }, scoped: scopedOn("space") } })).not.toContain("board.create");
   });
   test("an unknown tenant context grants nothing", () => {
     const a = resolveAccess({ ctx: { tenant: null } }, me, T);

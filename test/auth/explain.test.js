@@ -10,6 +10,7 @@ import { httpRoutes } from "../../server/auth/http.js";
 import { sessions as makeSessions } from "../../server/auth/session.js";
 import { devAuth } from "../../server/auth/dev.js";
 import { ASK } from "../../server/auth/registry-port.js";
+import { askRolesFor } from "../../server/auth/explain.js";
 
 const ident = (n, domain = "acme.com") => ({ user: `google:${n}`, name: n, email: `${n}@${domain}`, domain });
 const dev = ident("dev"), pat = ident("pat"), tom = ident("tom"), root = ident("root"), kim = ident("kim", "partner.io"), eve = ident("eve");
@@ -72,12 +73,12 @@ describe("mine: the resolver's sources, the strongest marked", () => {
     }
   });
   test("needs comes from roleDef: Editor creates boards in a Space and Spaces in a Group, edits a board; none at the Unit", async () => {
-    expect(needsOf("space", new Map())).toEqual({ "board.create": { role: "editor", roleName: "Editor" } });
-    expect(needsOf("group", new Map())).toEqual({ "space.create": { role: "editor", roleName: "Editor" } });
-    expect(needsOf("board", new Map())).toEqual({ "board.edit": { role: "editor", roleName: "Editor" } });
+    expect(needsOf("space", new Map())).toEqual({ "board.create": { role: "editor", roleName: "Editor", held: false } });
+    expect(needsOf("group", new Map())).toEqual({ "space.create": { role: "editor", roleName: "Editor", held: false } });
+    expect(needsOf("board", new Map())).toEqual({ "board.edit": { role: "editor", roleName: "Editor", held: false } });
     expect(needsOf("unit", new Map())).toEqual({});
     const p = await svc.accessPage(dev, "space", platform.id);
-    expect(p.needs).toEqual({ "board.create": { role: "editor", roleName: "Editor" } });
+    expect(p.needs).toEqual({ "board.create": { role: "editor", roleName: "Editor", held: false } });
   });
   test("mineOf with no names leaves them out", () => {
     const m = mineOf({ ladder: "viewer", sources: [{ kind: "general", scope: { type: "space", id: "s" }, role: "viewer", permissions: [], ladder: "viewer" }] }, { roles: new Map() });
@@ -305,5 +306,70 @@ describe("over HTTP", () => {
     expect((await call("kim", `/boards/b-nope000000000000/explain`)).status).toBe(404);
     expect((await call("dev", `/spaces/${space.id}`)).body.why.ask.can).toBe(true);
     expect((await call("pat", `/spaces/${space.id}`)).body.why).toBeUndefined();
+  });
+});
+
+describe("the explanation never contradicts enforcement when the caller's ladder role already equals what is needed", () => {
+  test("A: the Unit member role with board role editor: an Editor who cannot create boards is told so, and may ask for the role that can", async () => {
+    await r.updateRole(acme.id, "member", { boardRole: "editor", permissions: [] });
+    const open = await r.createSpace({ tenant: acme.id, name: "Open", generalRole: null, owner: "google:pat" });
+    await r.setScopedGrant({ scope: { type: "space", id: open.id }, subject: U(eve.user), role: "viewer" });
+    const page = await spaces.spacePage(eve, open.id);
+    expect(page.can.createBoard).toBe(false);                                  // enforcement: member role has no board.create
+    expect(page.why.mine.role.id).toBe("editor");
+    expect(page.why.needs["board.create"]).toEqual({ role: "editor", roleName: "Editor", held: true });
+    expect(page.why.ask).toMatchObject({ can: true, roles: [{ id: "editor", name: "Editor" }] });
+    expect((await svc.requestAccess(eve, "space", open.id, "editor")).state).toBe("pending");   // the route agrees with the explanation
+  });
+  test("B: a custom role with board editor and no management permissions on the Space: the same", async () => {
+    const role = await r.createRole({ tenant: acme.id, name: "Content", boardRole: "editor", permissions: [] });
+    const open = await r.createSpace({ tenant: acme.id, name: "Open", generalRole: null, owner: "google:pat" });
+    await r.setScopedGrant({ scope: { type: "space", id: open.id }, subject: U(eve.user), role: role.id });
+    const page = await spaces.spacePage(eve, open.id);
+    expect(page.can.createBoard).toBe(false);
+    expect(page.why.needs["board.create"].held).toBe(true);
+    expect(page.why.ask.roles).toEqual([{ id: "editor", name: "Editor" }]);
+    expect((await svc.requestAccess(eve, "space", open.id, "editor")).state).toBe("pending");
+  });
+  test("askRolesFor: above the caller's rank, plus the needed role only while the permission is missing; never owner", () => {
+    const acc = (ladder, perms) => ({ ladder, permissions: new Set(perms), sources: [] });
+    const ids = a => askRolesFor(a, "space", new Map()).map(x => x.id);
+    expect(ids(acc("viewer", []))).toEqual(["commenter", "annotator", "editor"]);
+    expect(ids(acc("editor", []))).toEqual(["editor"]);
+    expect(ids(acc("editor", ["board.create"]))).toEqual([]);
+    expect(askRolesFor(acc("editor", []), "unit", new Map())).toEqual([]);
+  });
+});
+
+describe("a guest from another Unit on a link learns nothing of this Unit", () => {
+  test("owners [], ask.can false, guest true; asking is the ordinary 403", async () => {
+    const beta = await r.createTenant({ domain: "beta.com" });
+    await r.touchMember(beta.id, { user: "google:bea", name: "bea", email: "bea@beta.com" });
+    const bea = ident("bea", "beta.com");
+    const link = await r.createLink({ board: board.id, role: "viewer", by: pat.user });
+    await r.addLinkUse(link.id, bea.user);
+    const ex = await svc.boardExplain(bea, board.id);
+    expect(ex.mine.role.id).toBe("viewer");
+    expect(ex.owners).toEqual([]);
+    expect(ex.ask).toEqual({ can: false, roles: [], pending: null, retryAfterMs: null });
+    expect(ex.guest).toBe(true);
+    expect(JSON.stringify(ex)).not.toMatch(/pat|tom|Platform|Engineering/);
+    expect(await code(svc.requestAccess(bea, "board", board.id, "editor"))).toBe("forbidden");
+    expect(await code(svc.accessPage(bea, "board", board.id))).toBe("not-found");
+    expect((await svc.boardExplain(dev, board.id)).guest).toBe(false);
+  });
+});
+
+describe("requests of people who already reach the role are not shown", () => {
+  test("a Team grant or a Group grant that reaches the asked role closes the request on read; a lower one leaves it", async () => {
+    await svc.requestAccess(dev, "space", platform.id, "editor");
+    await svc.requestAccess(eve, "space", platform.id, "annotator");
+    const ids = async () => (await svc.accessPage(pat, "space", platform.id)).requests.map(x => x.user.id).sort();
+    expect(await ids()).toEqual([dev.user, eve.user].sort());
+    await r.setScopedGrant({ scope: { type: "space", id: platform.id }, subject: { type: "team", id: infra.id }, role: "annotator" });
+    expect(await ids()).toEqual([dev.user, eve.user].sort());                       // dev is annotator now (Team), asked editor: still waiting
+    await r.setScopedGrant({ scope: { type: "group", id: eng.id }, subject: U(dev.user), role: "editor" });
+    expect(await ids()).toEqual([eve.user]);
+    expect(await r.accessRequest({ type: "space", id: platform.id }, dev.user)).toBeNull();                  // closed as granted
   });
 });

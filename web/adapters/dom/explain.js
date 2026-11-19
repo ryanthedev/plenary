@@ -5,13 +5,13 @@
 
 import { h, replace } from "./dom.js";
 import { announce } from "./focus.js";
-import { createAskModel, whyLines, pillLine, sourceText, ownersText, waitText } from "../../core/explain.js";
+import { createAskModel, whyLines, pillLine, sourceText, ownersText, waitText, needText } from "../../core/explain.js";
 
 /**
  * Ask for access at a scope: a role to ask for (when the server offers more than one), the button, and the outcome. Built once, repainted in place on every change.
- * @param {{ api: { ask(type: string, id: string, role: string, key?: string|null): Promise<any> }, type: string, id: string, why: import("../../core/explain.js").Explain, newKey?: (() => string)|null }} o
+ * @param {{ api: { ask(type: string, id: string, role: string, key?: string|null): Promise<any> }, type: string, id: string, why: import("../../core/explain.js").Explain, newKey?: (() => string)|null, setTimer?: Function, clearTimer?: Function }} o
  */
-export function askView({ api, type, id, why, newKey = null }) {
+export function askView({ api, type, id, why, newKey = null, setTimer = setTimeout, clearTimer = clearTimeout }) {
   const model = createAskModel({ api, type, id, why, newKey, onChange: () => paint() });
   const S = model.state;
   const select = h("select.field", { "aria-label": "Role to ask for", onchange: e => model.choose(e.target.value) },
@@ -24,7 +24,9 @@ export function askView({ api, type, id, why, newKey = null }) {
   } }, "Ask for access");
   const status = h("p.muted", { role: "status", tabindex: "-1", "data-fk": "ask-status" });
   const el = h("div.ask", {}, h("label.l", {}, "Role", select), button, status);
+  let timer = null;
   function paint() {
+    if (timer != null) { clearTimer(timer); timer = null; }
     const sent = S.status === "sent", wait = S.status === "limited" || (S.retryAfterMs != null && S.retryAfterMs > 0 && !sent);
     button.hidden = sent; select.parentNode.hidden = sent || why.ask.roles.length < 2;
     button.setAttribute("aria-disabled", S.status === "busy" || wait ? "true" : "false");
@@ -32,6 +34,8 @@ export function askView({ api, type, id, why, newKey = null }) {
       ? `You asked for ${S.pending?.roleName ?? "access"}. The owners will see your request on the Access page; you will have it when one of them adds you.`
       : S.status === "busy" ? "Sending…" : S.message ?? (wait ? `You asked recently and the request was closed. You can ask again ${S.retryAfterMs ? waitText(S.retryAfterMs) : "later"}.` : "");
     if (sent) { button.setAttribute("aria-hidden", "true"); }
+    // The wait was told to us: when it elapses the button works again without a reload (a 2^31 ms cap keeps setTimeout sane).
+    else if (wait && S.retryAfterMs > 0) timer = setTimer(() => { timer = null; model.clearLimit(); }, Math.min(S.retryAfterMs, 2 ** 31 - 1));
   }
   paint();
   return { el, model, focus: () => (S.status === "sent" ? status : button).focus?.() };
@@ -68,6 +72,8 @@ export function pillPopover({ pill, explain, board, access = null, newKey = null
     if (refocus) pill.focus?.();
   };
   const onKey = e => { if (e.key === "Escape") { e.stopPropagation(); close(); } };
+  // Tabbing out of the popover (it is non-modal) closes it, as a click outside does; focus going nowhere (window blur) leaves it open.
+  const onOut = e => { const to = e.relatedTarget; if (pop && to && !pop.contains(to) && !pill.contains(to)) close(false); };
   const onDown = e => { if (pop && !pop.contains(e.target) && !pill.contains(e.target)) close(false); };
   async function open() {
     if (pop || !explain) return;
@@ -75,6 +81,7 @@ export function pillPopover({ pill, explain, board, access = null, newKey = null
     pop = h("div.pill-pop", { role: "dialog", "aria-label": "Why this board is view only", "aria-describedby": "pill-pop-body" });
     const body = h("div", { id: "pill-pop-body" }, h("p", { role: "status" }, "Looking up why…"));
     pop.append(body, h("button.btn", { type: "button", onclick: () => close() }, "Close"));
+    pop.addEventListener("focusout", onOut);
     document.body.append(pop);
     const r = pill.getBoundingClientRect?.();
     if (r) Object.assign(pop.style, { top: `${Math.round(r.bottom + 6)}px`, right: "12px" });
@@ -88,7 +95,7 @@ export function pillPopover({ pill, explain, board, access = null, newKey = null
     const card = access && (w.ask.can || w.ask.pending) ? askView({ api: access, type: "board", id: board, why: w, newKey }) : null;
     replace(body, h("p", {}, pillLine(w.mine) + "."),
       w.mine.sources.length ? h("ul.rows", { "aria-label": "Where your access comes from" }, w.mine.sources.map(s => { const x = sourceRow(s, here); return h("li.row", {}, x.text, x.strongest ? h("span.badge", {}, "grants the most") : null); })) : null,
-      w.needs["board.edit"] ? h("p", {}, `Editing needs ${w.needs["board.edit"].roleName}. ${ownersText(w.owners, w.ask.can || w.ask.pending != null)}`) : h("p", {}, ownersText(w.owners, w.ask.can || w.ask.pending != null)),
+      w.needs["board.edit"] ? h("p", {}, `${needText(w.needs["board.edit"], "Editing", w.mine.role?.name)} ${ownersText(w.owners, w.guest)}`) : h("p", {}, ownersText(w.owners, w.guest)),
       card?.el);
     (card ? pop.querySelector?.("[data-fk=ask]") : pop.querySelector?.("button"))?.focus?.();
   }

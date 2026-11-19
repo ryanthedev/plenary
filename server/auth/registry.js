@@ -2,7 +2,7 @@
 // last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
 import { normEmail } from "./util.js";
-import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive } from "./registry-port.js";
+import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "./registry-port.js";
 
 /**
  * @typedef {import("./registry-port.js").Registry} Registry
@@ -397,24 +397,25 @@ export function memoryRegistry({ now = Date.now } = {}) {
     },
 
     // ---- Access requests (PROTOCOL.md § Access explanation and requests) ----
-    async requestAccess({ tenant, scope, user, role, idem: key }) {
+    async requestAccess({ tenant, scope, user, role, idem: key, limits }) {
+      const lim = askLimits(limits);
       const sc = askScope(scope), r = askRole(role);
       need(typeof user === "string" && user && !user.includes("\0"), "member");
       const i = idemEnter(key);                      // the key first: a retried success replays even when a limit has since been reached
       need(typeof tenant === "string" && scopeTenant(sc.type, sc.id) === tenant, "scope");
       const t = now(), k = sk(sc.type, sk(sc.id, user));
       let pruned = 0;
-      for (const [x, v] of requests) if (t - v.at >= ASK.ttlMs && pruned++ < ASK.prune) requests.delete(x);
+      for (const [x, v] of requests) if (t - (v.closedAt ?? v.at) >= ASK.ttlMs && pruned++ < ASK.prune) requests.delete(x);
       const cur = askLive(requests.get(k), t);
       if (cur?.state === "pending") { idemPut(i, cur.id); return copy(cur); }
-      if (cur) throw askLimited(cur.at + ASK.cooldownMs - t);
-      const mine = [...requests.values()].filter(v => v.user === user && v.tenant === tenant && t - v.at < ASK.windowMs);
-      if (mine.length >= ASK.perUser) throw askLimited(Math.min(...mine.map(v => v.at)) + ASK.windowMs - t);
-      if ([...requests.values()].filter(v => v.scope.type === sc.type && v.scope.id === sc.id && v.state === "pending").length >= ASK.scopePending) throw askLimited(null);
+      if (cur) throw askLimited(askWait(cur, t));
+      const mine = [...requests.values()].filter(v => v.user === user && v.tenant === tenant && t - v.at < ASK.windowMs && !(v.scope.type === sc.type && v.scope.id === sc.id));   // the row being replaced counts once, as the new ask
+      if (mine.length >= lim.perUser) throw askLimited(Math.min(...mine.map(v => v.at)) + ASK.windowMs - t);
+      if ([...requests.values()].filter(v => v.scope.type === sc.type && v.scope.id === sc.id && v.state === "pending").length >= lim.scopePending) throw askLimited(null);
       const ids = new Set([...requests.values()].map(v => v.id));
       let id = requests.get(k)?.id;
       while (!id || (ids.has(id) && id !== requests.get(k)?.id)) id = mint.request();
-      const row = { id, tenant, scope: sc, user, role: r, state: "pending", at: t };
+      const row = { id, tenant, scope: sc, user, role: r, state: "pending", at: t, closedAt: null };
       requests.set(k, row);
       idemPut(i, row.id);
       return copy(row);
@@ -429,8 +430,8 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const sc = askScope(scope), k = sk(sc.type, sk(sc.id, user)), v = requests.get(k);
       if (state !== "dismissed" && state !== "granted") throw new Error("registry: bad state");
       if (!v) return false;
-      const was = v.state === "pending" && now() - v.at < ASK.ttlMs;
-      if (state === "granted") requests.delete(k); else if (was) v.state = "dismissed";
+      const t = now(), was = v.state === "pending" && t - v.at < ASK.ttlMs;
+      if (state === "granted") { v.state = "granted"; v.closedAt = t; } else if (was) { v.state = "dismissed"; v.closedAt = t; }
       return was;
     },
     async grantHolders(scope, rolesIn, { limit } = {}) {

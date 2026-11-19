@@ -14,12 +14,20 @@ export const roleLabel = (role, roles) => LADDER_NAMES[role] ?? roles.get(role)?
 
 /** The permission whose absence a disabled control explains, per scope type: New board in a Space, New space in a Group, editing a board. */
 export const KEY_PERMISSION = { space: "board.create", group: "space.create", board: "board.edit" };
-/** What would be needed: `{ [permission]: { role, roleName } | null }` for the scope's key permission; the lowest BUILT-IN ladder role that holds it there (null: none does). */
-export function needsOf(type, roles) {
+/** The lowest BUILT-IN ladder role that holds the scope's key permission there, or null (none does; a custom role may). */
+const needRole = (type, roles) => { const p = KEY_PERMISSION[type]; return p ? ROLES.find(r => roleDef(r, type, roles)?.permissions.has(p)) ?? null : null; };
+/**
+ * What would be needed, against what the caller HAS: `{ [permission]: { role, roleName, held } | null }`. `held` is true when the caller's ladder role is already at or above `role`
+ * yet their `access.permissions` lack the key permission (their role gives board content but not this: the Unit member role with board role editor, a custom role with no
+ * management permissions), so the sentence must not say "needs Editor" to someone who is an Editor.
+ * @param {import("./resolver.js").Access} [access] omitted: what the permission needs, whoever asks
+ */
+export function needsOf(type, roles, access = null) {
   const p = KEY_PERMISSION[type];
   if (!p) return {};
-  const role = ROLES.find(r => roleDef(r, type, roles)?.permissions.has(p));
-  return { [p]: role ? { role, roleName: LADDER_NAMES[role] } : null };
+  const role = needRole(type, roles);
+  if (!role) return { [p]: null };
+  return { [p]: { role, roleName: LADDER_NAMES[role], held: !!access && !access.permissions.has(p) && rank(access.ladder) >= rank(role) } };
 }
 
 /**
@@ -41,8 +49,16 @@ export function mineOf(access, { roles, scopeName = () => undefined, teamName = 
   };
 }
 
-/** The roles a person may ask for: the built-in ones above their own, up to `editor` (never `owner`). */
-export const askRolesFor = access => ROLES.slice(rank(access.ladder) + 1, ROLES.indexOf("owner")).map(id => ({ id, name: LADDER_NAMES[id] }));
+/**
+ * The roles a person may ask for: the built-in ones above their own up to `editor` (never `owner`), plus the role the key permission needs when they lack that permission
+ * though their ladder role is at or above it (`needs.held`). ONE function for the explanation's `ask.roles` and the route's check, so they cannot differ.
+ */
+export function askRolesFor(access, type, roles) {
+  const out = new Set(ROLES.slice(rank(access.ladder) + 1, ROLES.indexOf("owner")));
+  const p = KEY_PERMISSION[type], need = needRole(type, roles);
+  if (p && need && need !== "owner" && !access.permissions.has(p)) out.add(need);
+  return ROLES.filter(r => out.has(r)).map(id => ({ id, name: LADDER_NAMES[id] }));
+}
 
 /**
  * @param {{ registry: import("./registry-port.js").Registry, now?: () => number }} deps
@@ -95,8 +111,8 @@ export function explainService({ registry, now = Date.now }) {
       ]);
       const teams = teamIds.length ? new Map((await registry.teamsAmong(tenant, teamIds)).map(t => [t.id, t.name])) : new Map();
       const mine = mineOf(access, { roles, scopeName: s => scopeNames.get(s.type + "\n" + s.id), teamName: id => teams.get(id) });
-      const needs = needsOf(type, roles);
-      const askRoles = unit && !personal && !manage && access.ladder != null && (type === "space" || type === "group" || type === "board") ? askRolesFor(access) : [];
+      const needs = needsOf(type, roles, access);
+      const askRoles = unit && !personal && !manage && access.ladder != null && (type === "space" || type === "group" || type === "board") ? askRolesFor(access, type, roles) : [];
       const ask = { can: askRoles.length > 0, roles: askRoles, pending: null, retryAfterMs: null };
       let owners = [];
       if (unit && !personal) {
@@ -105,7 +121,7 @@ export function explainService({ registry, now = Date.now }) {
         if (req?.state === "pending") ask.pending = { role: req.role, roleName: roleLabel(req.role, roles), at: req.at };
         else if (req) ask.retryAfterMs = Math.max(0, req.at + ASK.cooldownMs - now());
       }
-      return { mine, needs, owners, ask };
+      return { mine, needs, owners, ask, guest: !unit };
     },
   };
 }

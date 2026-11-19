@@ -157,6 +157,20 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
       return ctx ? resolveAccess({ ctx }, identity, now(), opts) : nothing();
     },
     /**
+     * The effective access of MANY identities at one scope: one `accessContext` for a Unit, Group or Space (at most 50 identities), one `accessOn` each for a board. A Map user → Access.
+     * The same pure `resolveAccess` as `effective`.
+     * @param {{ type: "unit"|"group"|"space"|"board", id: string }} scope @param {Identity[]} identities
+     */
+    async effectiveAmong(scope, identities) {
+      const out = new Map(), ids = (identities ?? []).filter(okIdentity).slice(0, 50);
+      if (!ids.length || !scope || typeof scope.id !== "string") return out;
+      if (scope.type === "board") { for (const id of ids) out.set(id.user, await accessOn(id, scope.id)); return out; }
+      const ctx = await registry.accessContext(scope, { users: ids.map(i => i.user) });
+      const t = now(), teams = ctx ? teamIndex(ctx) : null;
+      for (const id of ids) out.set(id.user, ctx ? resolveAccess({ ctx, teams: teams.get(id.user) ?? NO_TEAMS }, id, t, opts) : nothing());
+      return out;
+    },
+    /**
      * `effective` for many Unit, Group or Space scopes from ONE batch read (`registry.accessContexts`), at most HOME.batch.
      * @param {{ type: "unit"|"group"|"space", id: string }[]} scopes @returns {Promise<Map<string, import("./resolver.js").Access>>} keyed `type + "\n" + id`; an unknown scope answers `nothing`
      */

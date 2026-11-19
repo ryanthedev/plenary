@@ -71,7 +71,7 @@
 // owns that pool) or `sql` (a Bun SQL client you own). `schema` names the Postgres schema. Never reads env.
 
 import { SQL } from "bun";
-import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive } from "../auth/registry-port.js";
+import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 import { needSchema, migrate, assertColumns, missing as absent } from "../pg/schema.js";
 
@@ -127,7 +127,7 @@ const REGISTRY_TABLE_DDL = {
   reg_recents: "member TEXT NOT NULL, board TEXT NOT NULL REFERENCES $S.reg_boards(id), opened_at BIGINT NOT NULL, PRIMARY KEY (member, board)",
   reg_stars: "member TEXT NOT NULL, board TEXT NOT NULL REFERENCES $S.reg_boards(id), at BIGINT NOT NULL, PRIMARY KEY (member, board)",
   // Access requests (PROTOCOL.md § Access explanation and requests): one row per (scope, member); a dismissed row stays until its cooldown ends.
-  reg_access_requests: "id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, member TEXT NOT NULL, role TEXT NOT NULL, state TEXT NOT NULL, at BIGINT NOT NULL, UNIQUE (scope_type, scope_id, member)",
+  reg_access_requests: "id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, member TEXT NOT NULL, role TEXT NOT NULL, state TEXT NOT NULL, at BIGINT NOT NULL, closed_at BIGINT, UNIQUE (scope_type, scope_id, member)",
   // Idempotent creates (PROTOCOL.md): one row per (member, key), written in the create's own transaction; `ref` is the id it made.
   reg_idempotency: "member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, ref TEXT NOT NULL, at BIGINT NOT NULL, PRIMARY KEY (member, k)",
   reg_roles: "tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), id TEXT NOT NULL, name TEXT NOT NULL, base TEXT, board_role TEXT, permissions TEXT NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY (tenant, id)",
@@ -291,7 +291,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
   const rowTeam = r => r && { id: r.id, tenant: r.tenant, name: r.name, createdAt: num(r.created_at) };
   const rowRole = r => r && { id: r.id, tenant: r.tenant, name: r.name, base: r.base, boardRole: r.board_role, permissions: JSON.parse(r.permissions), createdAt: num(r.created_at) };
   const rowSg = r => ({ subject: { type: r.subject_type, id: r.subject }, role: r.role });
-  const rowAsk = r => r && { id: r.id, tenant: r.tenant, scope: { type: r.scope_type, id: r.scope_id }, user: r.member, role: r.role, state: r.state, at: num(r.at) };
+  const rowAsk = r => r && { id: r.id, tenant: r.tenant, scope: { type: r.scope_type, id: r.scope_id }, user: r.member, role: r.role, state: r.state, at: num(r.at), closedAt: num(r.closed_at) };
   const grantsOn = (q, type, id) => q.unsafe(`SELECT subject_type, subject, role FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 ORDER BY n`, [type, id]);
   /** Owner grants that guard a Group or Space: a user's, or a Team's while the Team has a member. */
   const countedOwners = (q, type, id) => q.unsafe(`SELECT subject_type, subject FROM ${SG} g WHERE scope_type = $1 AND scope_id = $2 AND role = 'owner'
@@ -934,28 +934,30 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     },
     // ---- Idempotent creates (PROTOCOL.md) ----
     // ---- Access requests (PROTOCOL.md § Access explanation and requests) ----
-    async requestAccess({ tenant, scope, user, role, idem }) {
+    async requestAccess({ tenant, scope, user, role, idem, limits }) {
       ready();
-      const sc = askScope(scope), r = askRole(role), k = idemStart(idem);
+      const sc = askScope(scope), r = askRole(role), k = idemStart(idem), lim = askLimits(limits);
       if (!key(tenant) || !key(user) || !user) throw new Error("registry: no such scope");
       return write(async tx => {
-        // One writer per person at a time: the per-person count and the one row per scope are read and written under it (and the key's unique index serialises a retry).
+        // Two locks, always in this order: the scope's (its pending count is read and written under it, so concurrent asks by different people cannot pass
+        // scopePending under READ COMMITTED), then the person's (their 24 h count and their one row per scope). The key's unique index serialises a retry.
+        await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-ask-scope:${s}:${sc.type}:${sc.id}`]);
         await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-ask:${s}:${tenant}:${user}`]);
         const t = now();
         await idemEnterPg(tx, k, t);
         if ((await tenantOfScope(tx, sc.type, sc.id)) !== tenant) throw new Error("registry: no such scope");
-        await tx.unsafe(`DELETE FROM ${AR} WHERE id IN (SELECT id FROM ${AR} WHERE scope_type = $1 AND scope_id = $2 AND at <= $3 LIMIT $4)`, [sc.type, sc.id, t - ASK.ttlMs, ASK.prune]);
+        await tx.unsafe(`DELETE FROM ${AR} WHERE id IN (SELECT id FROM ${AR} WHERE scope_type = $1 AND scope_id = $2 AND COALESCE(closed_at, at) <= $3 LIMIT $4)`, [sc.type, sc.id, t - ASK.ttlMs, ASK.prune]);
         const row = await one(tx, `SELECT * FROM ${AR} WHERE scope_type = $1 AND scope_id = $2 AND member = $3`, [sc.type, sc.id, user]);
         const cur = askLive(rowAsk(row), t);
         if (cur?.state === "pending") { await idemPut(tx, k, cur.id, t); return cur; }
-        if (cur) throw askLimited(cur.at + ASK.cooldownMs - t);
-        const mine = await one(tx, `SELECT count(*) AS n, min(at) AS first FROM ${AR} WHERE tenant = $1 AND member = $2 AND at > $3`, [tenant, user, t - ASK.windowMs]);
-        if (Number(mine.n) >= ASK.perUser) throw askLimited(Number(mine.first) + ASK.windowMs - t);
-        if (Number((await one(tx, `SELECT count(*) AS n FROM ${AR} WHERE scope_type = $1 AND scope_id = $2 AND state = 'pending' AND at > $3`, [sc.type, sc.id, t - ASK.ttlMs])).n) >= ASK.scopePending) throw askLimited(null);
+        if (cur) throw askLimited(askWait(cur, t));
+        const mine = await one(tx, `SELECT count(*) AS n, min(at) AS first FROM ${AR} WHERE tenant = $1 AND member = $2 AND at > $3 AND NOT (scope_type = $4 AND scope_id = $5)`, [tenant, user, t - ASK.windowMs, sc.type, sc.id]);
+        if (Number(mine.n) >= lim.perUser) throw askLimited(Number(mine.first) + ASK.windowMs - t);
+        if (Number((await one(tx, `SELECT count(*) AS n FROM ${AR} WHERE scope_type = $1 AND scope_id = $2 AND state = 'pending' AND at > $3`, [sc.type, sc.id, t - ASK.ttlMs])).n) >= lim.scopePending) throw askLimited(null);
         const id = row?.id ?? await fresh(tx, mint.request, AR);
         await idemPut(tx, k, id, t);
         await tx.unsafe(`INSERT INTO ${AR} (id, tenant, scope_type, scope_id, member, role, state, at) VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
-          ON CONFLICT (scope_type, scope_id, member) DO UPDATE SET role = excluded.role, state = 'pending', at = excluded.at`, [id, tenant, sc.type, sc.id, user, r, t]);
+          ON CONFLICT (scope_type, scope_id, member) DO UPDATE SET role = excluded.role, state = 'pending', at = excluded.at, closed_at = NULL`, [id, tenant, sc.type, sc.id, user, r, t]);
         return rowAsk(await one(tx, `SELECT * FROM ${AR} WHERE id = $1`, [id]));
       });
     },
@@ -979,8 +981,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       return write(async tx => {
         const row = await one(tx, `SELECT * FROM ${AR} WHERE scope_type = $1 AND scope_id = $2 AND member = $3 FOR UPDATE`, [sc.type, sc.id, user]);
         const was = askLive(rowAsk(row), now())?.state === "pending";
-        if (state === "granted") { if (row) await tx.unsafe(`DELETE FROM ${AR} WHERE id = $1`, [row.id]); }
-        else if (was) await tx.unsafe(`UPDATE ${AR} SET state = 'dismissed' WHERE id = $1`, [row.id]);
+        if (row && (state === "granted" || was)) await tx.unsafe(`UPDATE ${AR} SET state = $2, closed_at = $3 WHERE id = $1`, [row.id, state, now()]);
         return was;
       });
     },

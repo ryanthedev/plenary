@@ -19,19 +19,20 @@ const source = s => {
 const roleOpt = o => (o && typeof o === "object" && typeof o.id === "string" && o.id.length <= 64 ? { id: o.id, name: str(o.name, 64) } : null);
 
 /** @typedef {{ role: { id: string, name: string }|null, sources: { kind: string, scope: { type: string, id: string, name?: string }, role: string, roleName: string, ladder: string|null, strongest: boolean, team?: { id: string, name?: string } }[] }} Mine */
-/** @typedef {{ mine: Mine, needs: Record<string, { role: string, roleName: string }|null>, owners: { type: string, id: string, name: string }[], ask: { can: boolean, roles: { id: string, name: string }[], pending: { role: string, roleName: string, at: number }|null, retryAfterMs: number|null } }} Explain */
+/** @typedef {{ mine: Mine, guest: boolean, needs: Record<string, { role: string, roleName: string, held: boolean }|null>, owners: { type: string, id: string, name: string }[], ask: { can: boolean, roles: { id: string, name: string }[], pending: { role: string, roleName: string, at: number }|null, retryAfterMs: number|null } }} Explain */
 
 /** The `{ mine, needs, owners, ask }` of a page or of GET /boards/:board/explain, checked and capped; null when it is not that shape. @returns {Explain|null} */
 export function normalizeExplain(b) {
   if (!b || typeof b !== "object" || !b.mine || typeof b.mine !== "object" || !Array.isArray(b.mine.sources)) return null;
   const role = b.mine.role && typeof b.mine.role.id === "string" ? { id: str(b.mine.role.id, 32), name: str(b.mine.role.name, 64) } : null;
   const needs = {};
-  for (const [k, v] of Object.entries(b.needs && typeof b.needs === "object" ? b.needs : {}).slice(0, 8)) needs[str(k, 32)] = v && typeof v.role === "string" ? { role: str(v.role, 32), roleName: str(v.roleName, 64) } : null;
+  for (const [k, v] of Object.entries(b.needs && typeof b.needs === "object" ? b.needs : {}).slice(0, 8)) needs[str(k, 32)] = v && typeof v.role === "string" ? { role: str(v.role, 32), roleName: str(v.roleName, 64), held: v.held === true } : null;
   const a = b.ask && typeof b.ask === "object" ? b.ask : {};
   const pending = a.pending && typeof a.pending.role === "string" && Number.isFinite(a.pending.at) ? { role: str(a.pending.role, 64), roleName: str(a.pending.roleName, 64), at: a.pending.at } : null;
   return {
     mine: { role, sources: list(b.mine.sources, 20, source) }, needs,
     owners: list(b.owners, 10, o => (o && (o.type === "user" || o.type === "team") && typeof o.id === "string" && o.id.length <= 200 ? { type: o.type, id: o.id, name: str(o.name) } : null)),
+    guest: b.guest === true,
     ask: { can: a.can === true, roles: list(a.roles, 6, roleOpt), pending, retryAfterMs: Number.isFinite(a.retryAfterMs) ? Math.max(0, a.retryAfterMs) : null },
   };
 }
@@ -67,8 +68,15 @@ export function pillLine(mine) {
   return via.length ? `${mine.role.name} via ${via.join(" and ")}` : mine.role.name;
 }
 
-/** "Owners: Priya, Tom."; with none named: an organization admin (a member) or whoever shared the board (a guest has no organization to ask: `askable` false). */
-export const ownersText = (owners, askable = true) => (owners.length ? `Owners: ${owners.map(o => o.name).join(", ")}.` : askable ? "Ask an organization admin." : "Ask whoever shared this with you.");
+/** "a Viewer", "an Editor". */
+export const withArticle = name => `${/^[AEIOU]/i.test(name) ? "an" : "a"} ${name}`;
+/** "Owners: Priya, Tom."; with none named: an organization admin (a member), or whoever shared the board (a guest has no organization to ask). */
+export const ownersText = (owners, guest = false) => (owners.length ? `Owners: ${owners.map(o => o.name).join(", ")}.` : guest ? "Ask whoever shared this with you." : "Ask an organization admin.");
+/**
+ * What the control needs, against what the caller has: "Creating boards needs Editor." or, when their role is already that high, why it is not enough.
+ * @param {{ role: string, roleName: string, held: boolean }} need
+ */
+export const needText = (need, what, roleName) => (need.held ? `${what} needs the built-in ${need.roleName} role. Your ${roleName ?? need.roleName} access comes from a role that does not include it.` : `${what} needs ${need.roleName}.`);
 /**
  * The why-card of a disabled control: [headline, what is needed, who to ask]. `what`: the thing the control does ("Creating boards"), `permission`: the key the server listed in `needs`.
  * @param {Explain} why @param {{ type: string, id: string }} here @param {string} what @param {string} permission @param {string|null} [hereName] the scope's name, for "in Platform"
@@ -78,10 +86,10 @@ export function whyLines(why, here, what, permission, hereName = null) {
   const name = m.role?.name ?? "member";
   const strong = strongestOf(m);
   const where = hereName ? `in ${hereName}` : "here";
-  const lines = [m.role ? `You're ${/^[AEIOU]/.test(name) ? "an" : "a"} ${name} ${where}${strong.length ? ", " + strong.map(s => sourceText(s, here)).join(" and ") : ""}.` : `You have no board access of your own ${where}.`];
+  const lines = [m.role ? `You're ${withArticle(name)} ${where}${strong.length ? ", " + strong.map(s => sourceText(s, here)).join(" and ") : ""}.` : `You have no board access of your own ${where}.`];
   const need = why.needs[permission];
-  if (need) lines.push(`${what} needs ${need.roleName}.`);
-  lines.push(ownersText(why.owners, why.ask.can || why.ask.pending != null));
+  if (need) lines.push(needText(need, what, m.role?.name));
+  lines.push(ownersText(why.owners, why.guest));
   return lines;
 }
 
@@ -107,6 +115,8 @@ export function createAskModel({ api, type, id, why, newKey = null, onChange = (
   const done = () => onChange(state);
   return {
     state,
+    /** The wait the server named has passed: the button may be used again. */
+    clearLimit() { if (state.status === "sent" || state.status === "busy") return; state.status = "idle"; state.retryAfterMs = null; state.message = null; state.said = null; done(); },
     choose(role) { if (role !== state.role) { state.role = role; key = null; } },
     /** @returns {Promise<boolean>} */
     async submit() {

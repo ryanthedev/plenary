@@ -1,10 +1,10 @@
 // web/core/explain.js: the checker for what the server explains, the sentences, and the Ask for access model (#51).
 import { test, expect } from "bun:test";
-import { normalizeExplain, normalizeRequest, sourceText, pillLine, whyLines, ownersText, waitText, createAskModel } from "../../../web/core/explain.js";
+import { normalizeExplain, normalizeRequest, sourceText, pillLine, whyLines, ownersText, waitText, createAskModel, withArticle } from "../../../web/core/explain.js";
 
 const SRC = (o = {}) => ({ kind: "team", scope: { type: "space", id: "s-1", name: "Platform" }, role: "viewer", roleName: "Viewer", ladder: "viewer", strongest: true, team: { id: "tm-1", name: "Infra" }, ...o });
 const WHY = (o = {}) => ({ mine: { role: { id: "viewer", name: "Viewer" }, sources: [SRC(), SRC({ kind: "general", scope: { type: "group", id: "g-1", name: "Engineering" }, strongest: false, team: undefined })] },
-  needs: { "board.create": { role: "editor", roleName: "Editor" } }, owners: [{ type: "user", id: "google:pri", name: "Priya" }, { type: "user", id: "google:tom", name: "Tom" }],
+  guest: false, needs: { "board.create": { role: "editor", roleName: "Editor", held: false } }, owners: [{ type: "user", id: "google:pri", name: "Priya" }, { type: "user", id: "google:tom", name: "Tom" }],
   ask: { can: true, roles: [{ id: "annotator", name: "Annotator" }, { id: "editor", name: "Editor" }], pending: null, retryAfterMs: null }, ...o });
 const here = { type: "space", id: "s-1" };
 
@@ -42,8 +42,16 @@ test("JOURNEY J10 copy: the why lines and the pill line", () => {
   expect(pillLine({ role: null, sources: [] })).toBe("No board access of your own");
   expect(pillLine({ role: { id: "viewer", name: "Viewer" }, sources: [SRC({ kind: "link", strongest: true })] })).toBe("Viewer via share link");
   expect(ownersText([])).toBe("Ask an organization admin.");
-  expect(ownersText([], false)).toBe("Ask whoever shared this with you.");   // a guest has no organization to ask
-  expect(whyLines(WHY({ owners: [], ask: { can: false, roles: [], pending: null, retryAfterMs: null } }), here, "Editing", "board.create").at(-1)).toBe("Ask whoever shared this with you.");
+  expect(ownersText([], true)).toBe("Ask whoever shared this with you.");   // only a real guest has no organization to ask
+  const noAsk = { can: false, roles: [], pending: null, retryAfterMs: null };
+  expect(whyLines(WHY({ owners: [], ask: noAsk }), here, "Editing", "board.create").at(-1)).toBe("Ask an organization admin.");   // a member whose Space has no named owners
+  expect(whyLines(WHY({ owners: [], guest: true, ask: noAsk }), here, "Editing", "board.create").at(-1)).toBe("Ask whoever shared this with you.");
+  expect(normalizeExplain({ ...WHY(), guest: "yes" }).guest).toBe(false);   // only a literal true is a guest
+  expect(withArticle("Editor")).toBe("an Editor");
+  expect(withArticle("Viewer")).toBe("a Viewer");
+  // held: their role already ranks as high as the control asks, so "needs Editor" would be false; say why it is not enough
+  const held = WHY({ mine: { role: { id: "editor", name: "Editor" }, sources: [] }, needs: { "board.create": { role: "editor", roleName: "Editor", held: true } } });
+  expect(whyLines(held, here, "Creating boards", "board.create")[1]).toBe("Creating boards needs the built-in Editor role. Your Editor access comes from a role that does not include it.");
   expect(waitText(30 * 60_000)).toBe("in 30 minutes");
   expect(waitText(24 * 3600_000)).toBe("in 24 hours");
   expect(waitText(0)).toBe("");
@@ -82,4 +90,16 @@ test("Ask model: limited says when to try again; a pending request starts as sen
   await nokey.submit();
   expect(api.calls[0][3]).toBeNull();
   expect(nokey.state.message).toBe("You can't ask for access here.");
+});
+
+test("Ask model: clearLimit re-opens a limited button (and never a sent or busy one)", async () => {
+  const api = fakeApi([{ error: "limited", retryAfter: 60 }]);
+  const m = createAskModel({ api, type: "space", id: "s-1", why: WHY() });
+  await m.submit();
+  expect(m.state).toMatchObject({ status: "limited", retryAfterMs: 60_000 });
+  m.clearLimit();
+  expect(m.state).toMatchObject({ status: "idle", retryAfterMs: null, message: null });
+  const sent = createAskModel({ api, type: "space", id: "s-1", why: WHY({ ask: { ...WHY().ask, pending: { role: "editor", roleName: "Editor", at: 1 } } }) });
+  sent.clearLimit();
+  expect(sent.state.status).toBe("sent");
 });

@@ -190,14 +190,27 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
   const isPersonal = sc => sc.type === "space" && sc.row.kind === "personal";
   const manages = sc => !isPersonal(sc) && may(sc.access, "members.manage");
 
-  /** The pending requests at a scope, with the requesters named (only a `members.manage` holder is ever handed these). */
+  /**
+   * The pending requests at a scope, requesters named (only a `members.manage` holder is ever handed these). A request whose person already REACHES the role asked for (a Team
+   * they are in, a grant at a containing Group) is hidden and closed as granted: one batch of access reads for the page's at most LIMITS.rows requesters.
+   */
   async function requestsOf(unit, scope, roles) {
     const list = await registry.accessRequests(scope, { limit: LIMITS.rows });
+    if (!list.length) return [];
     const label = await named(unit, list.map(r => ({ type: "user", id: r.user })));
-    return list.map(r => ({ user: label({ type: "user", id: r.user }), role: r.role, roleName: roleLabel(r.role, roles), at: r.at }));
+    // Every directory row is a Unit member (only members are recorded), so they stand as members of the Unit's first domain.
+    const ids = list.map(r => ({ user: r.user, email: label({ type: "user", id: r.user }).email, domain: unit.domains?.[0] ?? null }));
+    const got = await tenancy.effectiveAmong(scope, ids);
+    const out = [];
+    for (const r of list) {
+      const a = got.get(r.user), want = roleDef(r.role, scope.type, roles);
+      if (a && want && [...want.permissions].every(p => a.permissions.has(p))) { await registry.closeAccessRequest(scope, r.user, "granted").catch(err => warn("could not close an access request", { err })); continue; }
+      out.push({ user: label({ type: "user", id: r.user }), role: r.role, roleName: roleLabel(r.role, roles), at: r.at });
+    }
+    return out;
   }
   /** The roles the caller may ask for at a scope (none: they may not ask: personal space, the Unit, nothing to open, already a manager). */
-  const askable = sc => (sc.type !== "unit" && opens(sc.access) && !manages(sc) && !isPersonal(sc) ? askRolesFor(sc.access) : []);
+  const askable = (sc, roles) => (sc.type !== "unit" && opens(sc.access) && !manages(sc) && !isPersonal(sc) ? askRolesFor(sc.access, sc.type, roles) : []);
   const requestRow = (r, roleList) => ({ role: r.role, roleName: labelOf(r.role, new Map(roleList.map(x => [x.id, x]))), at: r.at, state: r.state });
 
   return {
@@ -439,7 +452,8 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
       if (typeof role !== "string" || !role || role.length > 64) throw bad("bad role");
       const unit = await unitOf(identity);
       const sc = await scopeOf(identity, unit, type, id);
-      const may_ = sc ? askable(sc) : [];
+      const roleList = unit ? await registry.roles(unit.id) : [];      // read whatever the answer, so a refusal costs what a success does
+      const may_ = sc ? askable(sc, new Map(roleList.map(r => [r.id, r]))) : [];
       if (!may_.length) throw refused();
       if (!may_.some(r => r.id === role)) throw new AdminError("bad-role", "that role cannot be asked for here");
       let r;

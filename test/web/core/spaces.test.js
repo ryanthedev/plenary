@@ -16,6 +16,10 @@ test("copy: general access, empty states (JOURNEY §5), errors", () => {
   expect(GENERAL_CHOICES.at(-1)).toEqual([null, "Only people added"]);
   expect(spaceEmpty(page()).title).toBe("No boards yet.");
   expect(spaceEmpty(page({ can: { createBoard: false } })).detail).toMatch(/ask an owner/);
+  const why = (role, held) => ({ mine: { role: { id: role.toLowerCase(), name: role }, sources: [] }, guest: false, owners: [], needs: { "board.create": { role: "editor", roleName: "Editor", held } } });
+  expect(spaceEmpty(page({ can: { createBoard: false }, why: why("Editor", false) })).detail).toBe("You're an Editor here; owners can add you as an Editor.");   // "an", not "a Editor"
+  expect(spaceEmpty(page({ can: { createBoard: false }, why: why("Viewer", false) })).detail).toBe("You're a Viewer here; owners can add you as an Editor.");
+  expect(spaceEmpty(page({ can: { createBoard: false }, why: why("Editor", true) })).detail).toBe("You're an Editor here, but that role cannot create boards. Owners can add you as an Editor.");
   expect(spaceEmpty(page({ space: { personal: true }, can: { createBoard: true } })).title).toBe("Only you can see what's here until you share it.");
   expect(groupEmpty({ can: { createSpace: true } }, "Product").title).toBe("No Spaces in Product yet.");
   expect(groupEmpty({ can: { createSpace: false } }, "Product").detail).toMatch(/Group editors/);

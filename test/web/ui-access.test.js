@@ -4,6 +4,7 @@ import { test, expect, beforeEach, afterEach } from "bun:test";
 import { FakeElement, installDom, textOf } from "./collab/fake-dom.js";
 import { mountTeamsPage, mountTeamPage, mountAccessPage } from "../../web/adapters/dom/access.js";
 import { createTeamsModel, createTeamModel, createAccessModel, failText, sizeText, viaText } from "../../web/core/access.js";
+import { askView } from "../../web/adapters/dom/explain.js";
 import { announced } from "../../web/adapters/dom/focus.js";
 
 const hrefs = { home: "./", team: id => `?team=${id}`, teams: "?teams=1", space: id => `?space=${id}`, group: id => `?group=${id}`, board: id => `?board=${id}`, access: (t, id) => `?access=${t}:${id}` };
@@ -397,4 +398,18 @@ test("a closed request in its cooldown starts with the button off and says when 
   await accessPage();
   expect(btn("Ask for access").getAttribute("aria-disabled")).toBe("true");
   expect(textOf(root.find(e => e.getAttribute("data-fk") === "ask-status"))).toBe("You asked recently and the request was closed. You can ask again in 3 hours.");
+});
+
+test("after a 429 the Ask button comes back by itself when the wait the server named has elapsed (no reload)", async () => {
+  const timers = [];
+  const api = { ask: async () => ({ error: "limited", retryAfter: 90 }) };
+  const why = { mine: { role: { id: "viewer", name: "Viewer" }, sources: [] }, guest: false, needs: {}, owners: [], ask: { can: true, roles: [{ id: "editor", name: "Editor" }], pending: null, retryAfterMs: null } };
+  const v = askView({ api, type: "space", id: "s-1", why, setTimer: (f, ms) => { timers.push({ f, ms }); return timers.length; }, clearTimer: n => { timers[n - 1].cleared = true; } });
+  const button = v.el.findAll(e => e.tagName === "BUTTON")[0];
+  button.click(); await settle();
+  expect(button.getAttribute("aria-disabled")).toBe("true");
+  expect(timers.filter(x => !x.cleared).map(x => x.ms)).toEqual([90_000]);
+  timers.at(-1).f();                                              // the wait elapses
+  expect(button.getAttribute("aria-disabled")).toBe("false");
+  expect(textOf(v.el.findAll(e => e.getAttribute("data-fk") === "ask-status")[0])).toBe("");
 });

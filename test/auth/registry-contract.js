@@ -1278,14 +1278,44 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect(again).toMatchObject({ state: "pending", at: clock.t });
         expect((await r.accessRequests(S)).length).toBe(1);
       });
-      test("granting closes (deletes) the request, and the cooldown does not apply afterwards", async () => {
+      test("granting closes the request: it is no longer returned, asking again is allowed, and the row still counts toward the person's quota", async () => {
         const { t, S } = await mk();
         await ask(t, S);
         expect(await r.closeAccessRequest(S, U, "granted")).toBe(true);
         expect(await r.accessRequest(S, U)).toBeNull();
+        expect(await r.accessRequests(S)).toEqual([]);
         expect(await r.closeAccessRequest(S, U, "granted")).toBe(false);
         expect((await ask(t, S)).state).toBe("pending");
         await expect(r.closeAccessRequest(S, U, "bogus")).rejects.toThrow();
+      });
+      test("a grant does not return quota: perUser counts granted rows too", async () => {
+        const { t } = await mk();
+        for (let i = 0; i < 3; i++) { const sp = await r.createSpace({ tenant: t.id, name: "S" + i, owner: "google:own" }); const S = { type: "space", id: sp.id }; await r.requestAccess({ tenant: t.id, scope: S, user: U, role: "editor", limits: { perUser: 3 } }); await r.closeAccessRequest(S, U, "granted"); }
+        const sp = await r.createSpace({ tenant: t.id, name: "S9", owner: "google:own" });
+        await expect(r.requestAccess({ tenant: t.id, scope: { type: "space", id: sp.id }, user: U, role: "editor", limits: { perUser: 3 } })).rejects.toMatchObject({ code: "rate-limited" });
+      });
+      test("the cooldown runs from the dismissal, not from the ask: dismissing a day-old request still holds 24 h", async () => {
+        const { t, S } = await mk();
+        await ask(t, S);
+        clock.t += ASK.cooldownMs + 5000;                 // asked long ago; dismissed now
+        expect(await r.closeAccessRequest(S, U, "dismissed")).toBe(true);
+        expect(await r.accessRequest(S, U)).toMatchObject({ state: "dismissed", closedAt: clock.t });
+        await expect(ask(t, S)).rejects.toMatchObject({ code: "rate-limited", retryAfterMs: ASK.cooldownMs });
+        clock.t += ASK.cooldownMs - 1;
+        await expect(ask(t, S)).rejects.toMatchObject({ code: "rate-limited", retryAfterMs: 1 });
+        clock.t += 1;
+        expect((await ask(t, S)).state).toBe("pending");
+      });
+      test("concurrent asks by different people on one scope never pass the scope limit (injectable lower limit)", async () => {
+        const { t, S } = await mk();
+        for (let round = 0; round < 3; round++) {
+          const sp = await r.createSpace({ tenant: t.id, name: "R" + round, owner: "google:own" }), SC = { type: "space", id: sp.id };
+          const out = await Promise.allSettled(Array.from({ length: 12 }, (_, i) => r.requestAccess({ tenant: t.id, scope: SC, user: "google:c" + i, role: "viewer", limits: { scopePending: 4 } })));
+          expect(out.filter(o => o.status === "fulfilled").length).toBe(4);
+          for (const o of out.filter(o => o.status === "rejected")) expect(o.reason).toMatchObject({ code: "rate-limited", retryAfterMs: null });
+          expect((await r.accessRequests(SC)).length).toBe(4);
+        }
+        expect(S.id).toBeTruthy();
       });
       test("one person may make ASK.perUser requests in the window across scopes; the next is rate-limited until the oldest leaves it", async () => {
         const { t } = await mk();

@@ -1177,3 +1177,20 @@ test("#51 the pill of an editor, and a viewer page with no access port, stays a 
   pillOf().click(); await settleP();
   expect(find(page.doc.body, e => /pill-pop/.test(e.className)).textContent).toContain("Could not look that up");
 });
+
+test("#51 the non-modal pill popover closes when focus tabs out of it, but not when focus moves inside it or to the pill", async () => {
+  rig = setup({ token: "t-vi", access: accessStub() });
+  const pill = pillOf();
+  pill.click(); await settleP();
+  const pop = () => find(page.doc.body, e => /pill-pop/.test(e.className));
+  const inside = find(pop(), e => e.tagName === "BUTTON");
+  pop().fire("focusout", { relatedTarget: inside });             // within the popover
+  expect(pop()).toBeTruthy();
+  pop().fire("focusout", { relatedTarget: pill });               // back to the pill
+  expect(pop()).toBeTruthy();
+  pop().fire("focusout", { relatedTarget: null });               // the window lost focus: stays
+  expect(pop()).toBeTruthy();
+  pop().fire("focusout", { relatedTarget: page.byId.topbar });   // somewhere else on the page
+  expect(pop()).toBeUndefined();
+  expect(pill.getAttribute("aria-expanded")).toBe("false");
+});

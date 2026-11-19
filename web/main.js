@@ -28,6 +28,7 @@ import { httpSpaces } from "./adapters/spaces/http.js";
 import { mountSpacePage, mountGroupPage } from "./adapters/dom/spaces.js";
 import { createDialogs, randomKey } from "./adapters/dom/dialogs.js";
 import { httpAccess } from "./adapters/access/http.js";
+import { httpShare } from "./adapters/share/http.js";
 import { httpRoles } from "./adapters/roles/http.js";
 import { mountRolesPage } from "./adapters/dom/roles.js";
 import { createRolesModel } from "./core/role-admin.js";
@@ -133,6 +134,8 @@ if (!signIn.token) {
     net, board, me, prefs: localStore(), theme: q.get("theme"),
     // Why the pill says "View only" (PROTOCOL.md § Access explanation and requests): looked up when the pill is opened, with Ask for access.
     access: httpAccess({ fetch: (...a) => globalThis.fetch(...a), token: signIn.token, timers: clock }), newKey: () => randomKey(),
+    // The Share dialog's calls (PROTOCOL.md § Share dialog).
+    share: httpShare({ fetch: (...a) => globalThis.fetch(...a), token: signIn.token, timers: clock }),
     // The collaboration UI over this session (presence and records ride the board connection; web/adapters/collab/sync.js).
     collab: (S, o) => syncCollabPort(S, { name: me.name, ...o }),
     notice: signInNotice({ ...signIn, dev: null }, me.name),

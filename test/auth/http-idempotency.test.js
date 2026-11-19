@@ -293,7 +293,7 @@ test("L7 readLink / readInvite: a revoked or expired one is not-found, a live on
   const caller = { user: "dev:ada", name: null, email: null, domain: null };
   const l = await mem.createLink({ board, role: "viewer", expiresAt: 5000, by: "dev:ada" });
   const i = await mem.createInvite({ board, email: "x@y.com", role: "viewer", expiresAt: 5000, by: "dev:ada" });
-  const at = t => ({ registry: mem, now: () => t });
+  const at = t => ({ registry: mem, tenancy: makeTenancy({ registry: mem }), now: () => t });
   expect((await readLink({ caller, board, link: l.id }, at(4999))).id).toBe(l.id);
   expect((await readInvite({ caller, board, invite: i.id }, at(4999))).id).toBe(i.id);
   await expect(readLink({ caller, board, link: l.id }, at(5000))).rejects.toMatchObject({ code: "not-found" });

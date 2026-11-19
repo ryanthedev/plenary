@@ -72,6 +72,14 @@ export function roleDef(role, scope, roles = new Map(), { adminBoardContent = fa
   return { permissions: new Set([...contentPerms(ladder), ...clip(c.permissions.filter(p => MGMT_PERMS.includes(p)))]), ladder };
 }
 
+/**
+ * No board-ladder escalation (PROTOCOL.md § Share dialog, "Nobody gives more than they hold"): may someone whose own effective board role at a scope is `own` hand out
+ * a role that gives board role `given`? At most their own (`given` null gives no board content: always fine). A Unit admin is exempt: the caller passes `admin`, the
+ * Unit-wide permission check (`isUnitAdmin`), never a role name. One helper for the grant route, invites and links.
+ * @param {string|null} own @param {string|null} given @param {boolean} [admin]
+ */
+export const withinLadder = (own, given, admin = false) => admin || given == null || rank(given) <= rank(own);
+
 /** A custom role's board-content role: one of viewer..editor (never owner), else null. */
 const ladderOf = r => (INVITE_ROLES.includes(r) ? r : null);
 

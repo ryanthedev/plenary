@@ -2,7 +2,8 @@
 // server/auth/spaces.js (`board.create` at a Space, or the personal space). A hello never creates a board.
 //
 // Who may do what:
-//   invites and links:      the board's owner (grant) or an admin of the board's tenant.
+//   invites and links:      whoever holds the `members.manage` PERMISSION on the board (its owner, a Unit admin, a custom role that carries it;
+//                           never a role name: PROTOCOL.md § Share dialog). They need `tenancy` in the deps.
 //   grants:                 a tenant admin sets any role, owner included. A board owner sets roles up to editor,
 //                           and may change an owner's grant only if it is their own. Nobody removes or demotes a
 //                           board's last owner (code `last-owner`; the Registry enforces it atomically too).
@@ -11,6 +12,7 @@
 
 import { ROLES, LINK_ROLES, INVITE_ROLES, normEmail } from "../auth/util.js";
 import { isUnitAdmin } from "../auth/resolver.js";
+import { withinLadder } from "../auth/permissions.js";
 
 /** @typedef {import("../auth/registry-port.js").Registry} Registry */
 /** @typedef {import("../auth/idp-port.js").Identity} Identity */
@@ -61,9 +63,34 @@ export async function knownOnBoard(registry, board, user) {
   return (await registry.linkUses(board.id, user)).length > 0;
 }
 
+/**
+ * The board, the caller's access to it and whether they are a Unit admin, if the caller holds `members.manage` on it (read from `tenancy.effective`, the answer every other
+ * route reads: no second rule); else `forbidden`. An unknown board, another Unit's board and a caller with no say are one answer, after the same reads.
+ */
+async function sharer({ registry, tenancy }, caller, boardId) {
+  if (!caller || typeof caller.user !== "string" || typeof boardId !== "string") throw forbidden();
+  const [b, access] = await Promise.all([registry.board(boardId), tenancy.effective(caller, boardId, { uniform: true })]);
+  if (!b || !access.permissions.has("members.manage")) throw forbidden();
+  const unit = await registry.tenant(b.tenant);
+  return { b, access, unit, admin: isUnitAdmin(unit, caller) };
+}
+/** Nobody gives more board role than they hold (a Unit admin may): `forbidden` otherwise. */
+const mayGive = (s, role) => { if (!withinLadder(s.access.ladder, role, s.admin)) throw forbidden(); };
+
+/** An invite's life when the request names none (JOURNEY J6); `null`, sent on purpose, is "never". */
+export const INVITE_TTL_MS = 30 * 86_400_000;
+/** Is `email` outside the Unit (none of its domains)? Such a person is a guest: they hold this board only, and never `owner` (INVITE_ROLES stops at editor). */
+export const isGuestEmail = (email, unit) => !(unit?.domains ?? []).some(d => email.endsWith("@" + String(d).toLowerCase()));
+
+/** An invite with its `guest` tag (the same answer the share read gives), so a create's answer needs no second read. */
+const tagged = async (registry, board, invite) => ({ ...invite, guest: isGuestEmail(invite.email, await registry.tenant(board.tenant)) });
+
+/** How far ahead an invite or link may expire: ten years. The same check for every adapter (a fraction or 1e300 would be stored differently, or not at all). */
+export const MAX_EXPIRY_MS = 10 * 365 * 86_400_000;
 const expiry = (v, now) => {
   if (v == null) return null;
-  if (!Number.isFinite(v) || v <= now) throw bad("expiresAt must be a future time (ms)");
+  if (!Number.isSafeInteger(v) || v <= now) throw bad("expiresAt must be a future time (ms)");
+  if (v > now + MAX_EXPIRY_MS) throw bad("expiresAt may be at most 10 years ahead");
   return v;
 };
 
@@ -95,51 +122,89 @@ export async function setGrant({ caller, board, user, role }, { registry }) {
 }
 
 /** Invite an email to a board. Works across domains. */
-export async function createInvite({ caller, board, email, role, expiresAt = null, idem }, { registry, now = Date.now }) {
-  const b = await managed(registry, caller, board);
+export async function createInvite({ caller, board, email, role, expiresAt, idem }, deps) {
+  const { registry, now = Date.now } = deps;
+  const s = await sharer(deps, caller, board), b = s.b;
   const e = normEmail(email);
   if (!e || !/^[^@\s]+@[^@\s]+$/.test(e) || e.length > 320) throw bad("bad email");
   if (!INVITE_ROLES.includes(role)) throw bad("bad role");
-  return registry.createInvite({ board: b.id, email: e, role, expiresAt: expiry(expiresAt, now()), by: caller.user, idem });
+  mayGive(s, role);
+  return tagged(registry, b, await registry.createInvite({ board: b.id, email: e, role, expiresAt: expiresAt === undefined ? now() + INVITE_TTL_MS : expiry(expiresAt, now()), by: caller.user, idem }));
 }
 /** One live invite of a board the caller manages (the replay of a keyed create: PROTOCOL.md "Idempotent creates"); else `forbidden`, or `not-found` for a missing, revoked or expired one. */
-export async function readInvite({ caller, board, invite }, { registry, now = Date.now }) {
-  const b = await managed(registry, caller, board);
+export async function readInvite({ caller, board, invite }, deps) {
+  const { registry, now = Date.now } = deps;
+  const s = await sharer(deps, caller, board), b = s.b;
   const i = await registry.invite(invite);
   if (!i || i.board !== b.id || i.revoked || (i.expiresAt != null && i.expiresAt <= now())) throw new AdminError("not-found", "not found");   // a revoked or expired one is gone: 404, not a 201
-  return i;
+  return tagged(registry, b, i);
 }
-export async function listInvites({ caller, board }, { registry }) {
-  const b = await managed(registry, caller, board);
-  return registry.invites(b.id);
+export async function listInvites({ caller, board }, deps) {
+  const s = await sharer(deps, caller, board), b = s.b;
+  return deps.registry.invites(b.id);
 }
-export async function revokeInvite({ caller, board, invite }, { registry }) {
-  const b = await managed(registry, caller, board);
+/** Revoke is idempotent: a revoked, expired or repeated one answers as the first did. Another board's invite and an unknown one are `forbidden`. */
+export async function revokeInvite({ caller, board, invite }, deps) {
+  const { registry } = deps;
+  const s = await sharer(deps, caller, board), b = s.b;
   const i = await registry.invite(invite);
   if (!i || i.board !== b.id) throw forbidden();
   await registry.revokeInvite(i.id);
 }
 
 /** Make a share link: an unguessable id, a role (editor, annotator or viewer), optional expiry. */
-export async function createLink({ caller, board, role, expiresAt = null, idem }, { registry, now = Date.now }) {
-  const b = await managed(registry, caller, board);
+export async function createLink({ caller, board, role, expiresAt = null, idem }, deps) {
+  const { registry, now = Date.now } = deps;
+  const s = await sharer(deps, caller, board), b = s.b;
   if (!LINK_ROLES.includes(role)) throw bad("links carry only editor, annotator or viewer");
+  mayGive(s, role);
   return registry.createLink({ board: b.id, role, expiresAt: expiry(expiresAt, now()), by: caller.user, idem });
 }
 /** One live link of a board the caller manages (the replay of a keyed create); else `forbidden`, or `not-found` for a missing, revoked or expired one. */
-export async function readLink({ caller, board, link }, { registry, now = Date.now }) {
-  const b = await managed(registry, caller, board);
+export async function readLink({ caller, board, link }, deps) {
+  const { registry, now = Date.now } = deps;
+  const s = await sharer(deps, caller, board), b = s.b;
   const l = await registry.link(link);
   if (!l || l.board !== b.id || l.revoked || (l.expiresAt != null && l.expiresAt <= now())) throw new AdminError("not-found", "not found");   // a revoked or expired one is gone: 404, not a 201
   return l;
 }
-export async function listLinks({ caller, board }, { registry }) {
-  const b = await managed(registry, caller, board);
-  return registry.links(b.id);
+export async function listLinks({ caller, board }, deps) {
+  const s = await sharer(deps, caller, board), b = s.b;
+  return deps.registry.links(b.id);
 }
-export async function revokeLink({ caller, board, link }, { registry }) {
-  const b = await managed(registry, caller, board);
+/** Idempotent like revokeInvite. */
+export async function revokeLink({ caller, board, link }, deps) {
+  const { registry } = deps;
+  const s = await sharer(deps, caller, board), b = s.b;
   const l = await registry.link(link);
   if (!l || l.board !== b.id) throw forbidden();
   await registry.revokeLink(l.id);
+}
+
+/** What one Share read lists at most of each kind (newest first); `more` says there are more. */
+export const SHARE_LIST_MAX = 200;
+/**
+ * GET /boards/:board/share: everything the Share dialog edits, in one permission-gated read: the board's live invites (each tagged `guest` when the address is outside
+ * the Unit) and share links, the Unit's domains (so the form can tag a guest before sending; `unit` is null for a caller outside the Unit, who is told per invite),
+ * and the roles (no higher than the caller's own, unless a Unit admin) and default life an invite or link may take. Only a
+ * `members.manage` holder gets it (an invite is an address, a link is a capability): anyone else is the one `forbidden`. Revoked and expired ones are not listed.
+ */
+export async function shareView({ caller, board }, deps) {
+  const { registry, now = Date.now } = deps;
+  const s = await sharer(deps, caller, board), b = s.b;
+  const [invites, links] = await Promise.all([registry.invites(b.id), registry.links(b.id)]);
+  const unit = s.unit, inside = (await deps.tenancy.tenantOf(caller))?.id === b.tenant;
+  const may = role => withinLadder(s.access.ladder, role, s.admin);
+  const t = now();
+  const live = x => !x.revoked && (x.expiresAt == null || x.expiresAt > t);
+  const newest = list => list.filter(live).sort((x, y) => y.createdAt - x.createdAt || (x.id < y.id ? -1 : 1));
+  const inv = newest(invites), lnk = newest(links);
+  return {
+    board: { id: b.id, title: b.title },
+    unit: inside ? { domains: unit?.domains ?? [] } : null,
+    limits: { inviteRoles: INVITE_ROLES.filter(may), linkRoles: LINK_ROLES.filter(may), inviteTtlMs: INVITE_TTL_MS },
+    invites: inv.slice(0, SHARE_LIST_MAX).map(i => ({ id: i.id, email: i.email, role: i.role, expiresAt: i.expiresAt, createdAt: i.createdAt, guest: isGuestEmail(i.email, unit) })),
+    links: lnk.slice(0, SHARE_LIST_MAX).map(l => ({ id: l.id, role: l.role, expiresAt: l.expiresAt, createdAt: l.createdAt })),
+    more: inv.length > SHARE_LIST_MAX || lnk.length > SHARE_LIST_MAX,
+  };
 }

@@ -316,11 +316,11 @@ describe("access page: who has access, through what, and the picker", () => {
     const spaceOwner = await svc.accessPage(ada, "space", design.id);
     expect(spaceOwner.roles.map(x => x.name)).toEqual(["Viewer", "Commenter", "Annotator", "Editor", "Owner", "Facilitator", "Wide"]);
     expect(spaceOwner.roles.find(x => x.id === fac.id)).toMatchObject({ custom: true, ladder: "annotator", people: true });
-    // a facilitator (members.manage + board.create only) can give neither Owner nor Wide: no escalation
+    // a facilitator (members.manage + board.create only, board role annotator) can give neither Owner nor Wide, and no board role above its own (Editor): no escalation
     await r.setScopedGrant({ scope: { type: "space", id: platform.id }, subject: U(lee.user), role: fac.id });
     const asLee = await svc.accessPage(lee, "space", platform.id);
     expect(asLee.can.manage).toBe(true);
-    expect(asLee.roles.map(x => x.name)).toEqual(["Viewer", "Commenter", "Annotator", "Editor", "Facilitator"]);
+    expect(asLee.roles.map(x => x.name)).toEqual(["Viewer", "Commenter", "Annotator", "Facilitator"]);
     expect(await code(svc.setGrant(lee, "space", platform.id, "user", max.user, "owner"))).toBe("forbidden");
     expect(await code(svc.setGrant(lee, "space", platform.id, "user", max.user, wide.id))).toBe("forbidden");
     expect(await svc.setGrant(lee, "space", platform.id, "user", max.user, fac.id)).toMatchObject({ role: fac.id, roleName: "Facilitator" });

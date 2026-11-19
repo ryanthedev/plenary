@@ -89,6 +89,7 @@ const ROUTES = {
   "PATCH /spaces/:id": { path: "/spaces/sp1", body: { name: "n" } },
   "GET /groups/:id": { path: "/groups/g1" },
   "PATCH /groups/:id": { path: "/groups/g1", body: { name: "n" } },
+  "GET /boards/:board/share": { path: `/boards/${B}/share` },
   "GET /boards/:board/invites": { path: `/boards/${B}/invites` },
   "POST /boards/:board/invites": { path: `/boards/${B}/invites`, body: { email: "x@y.com", role: "viewer" } },
   "DELETE /boards/:board/invites/:id": { path: `/boards/${B}/invites/i1` },

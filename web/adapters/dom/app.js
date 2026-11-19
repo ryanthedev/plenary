@@ -19,6 +19,8 @@ import { renderPanel, loadLibrary, saveLibrary, addToLibrary, propsModel } from 
 import { exportSvg, paintPng, loadPictures } from "./export.js";
 import { h, $, replace } from "./dom.js";
 import { pillPopover } from "./explain.js";
+import { openShare } from "./share.js";
+import { createShareModel } from "../../core/share.js";
 import { mountCollab } from "./collab/ui.js";
 import { collabFrame } from "./collab/frame.js";
 import { hitTest } from "../../../packages/core/geometry.js";
@@ -42,7 +44,7 @@ import { hitTest } from "../../../packages/core/geometry.js";
  *   homeHref: where the top bar's Home link goes (the Home screen); null = no link (dev rooms).
  * @returns {{ S: object, ui: object, net: object, setTheme(t: string): void, openDialog(d: string): void, setPanel(op: object): void }}
  */
-export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null, homeHref = null, access = null, newKey = null }) {
+export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null, homeHref = null, access = null, newKey = null, share = null }) {
   if (!clock || typeof clock.now !== "function" || typeof clock.mono !== "function") throw new Error("mountApp: the clock port is required");
   const get = k => { try { return prefs.get(k); } catch { return null; } };
   const put = (k, v) => { try { prefs.set(k, v); } catch {} };
@@ -329,6 +331,15 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     h("span.ic", {}, t.icon), t.keys?.[0] ? h("span.k", {}, t.keys[0].toUpperCase()) : null);
   }
 
+  // Share (PROTOCOL.md § Share dialog): offered to every connected role (nothing is fetched until it is pressed); the server answers 403 to anyone without `members.manage`, and the dialog says so.
+  // The chrome is rebuilt while the dialog is open, so focus goes back to whichever of the Share button and the More button is shown now, not to the element that opened it.
+  const shareOpener = { focus() { const c = [document.querySelector("[data-share-open]"), document.querySelector(".header-more")]; (c.find(e => e && e.offsetParent !== null) ?? c.find(Boolean))?.focus?.(); } };
+  function openShareDialog() {
+    const loc = globalThis.location, origin = loc?.origin ?? "", boardUrl = `${origin}${loc?.pathname ?? "/"}?board=${encodeURIComponent(board)}`;
+    const model = createShareModel({ share, access, board, newKey, now: () => clock.now(), urls: { board: boardUrl, link: id => `${origin}/links/${encodeURIComponent(id)}` } });
+    openShare({ host: document.body, model, opener: shareOpener, accessHref: `${loc?.pathname ?? "/"}?access=board:${encodeURIComponent(board)}`, now: () => clock.now() });
+  }
+
   function topbar() {
     const role = S.role, tools = toolsFor(role), may = S.may();
     const core = tools.filter(t => !["image", "note", "highlighter"].includes(t.id)), extras = tools.filter(t => ["image", "note", "highlighter"].includes(t.id));
@@ -374,6 +385,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       extraAction("Notes", toggleNotes),
       role === "presenter" ? extraAction("Mermaid", () => openDialog("mermaid"), !may) : null,
       role === "presenter" ? extraAction("Export", toggleExport) : null,
+      share ? extraAction("Share", () => openShareDialog()) : null,
       role !== "viewer" ? extraAction("Side panel", togglePanel) : null,
       extraAction("Light / dark", toggleTheme),
     ]);
@@ -385,6 +397,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         collab ? h("button.btn.ghost.desk-only.header-extra", { "aria-label": "Comments", title: "Comments (or right-click the board)", onclick: () => toggleDrawer("comments") }, "💬") : null,
         collab ? collab.parts.avatars : h("div.avatars", {},
           h("span.stack", {}, h("span.av.live", { style: { background: "var(--u-me)" }, title: `${me.name} (you)` }, me.name.slice(0, 2).toUpperCase()))),
+        share ? h("button.btn.desk-only.header-extra", { "aria-haspopup": "dialog", "data-share-open": "1", title: "Share this board", onclick: () => openShareDialog() }, "Share") : null,
         pillEl,
         role !== "viewer" ? h("button.tb.desk-only.header-extra" + (ui.panel.open ? ".on" : ""), { title: "Side panel (I)", onclick: togglePanel }, h("span.ic", {}, "◧"), h("span.k", {}, "I")) : null,
         h("button.tb.header-extra" + (role === "viewer" ? "" : ".theme-btn"), { title: "Light / dark", onclick: toggleTheme }, h("span.ic", {}, ui.theme === "dark" ? "☀" : "☾")),

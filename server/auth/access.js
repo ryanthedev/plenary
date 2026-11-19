@@ -9,7 +9,7 @@
 import { AdminError, knownOnBoard } from "../admin/boards.js";
 import { isUnitAdmin } from "./resolver.js";
 import { ROLES } from "./util.js";
-import { roleDef, MGMT_PERMS, UNIT_ROLES } from "./permissions.js";
+import { roleDef, MGMT_PERMS, UNIT_ROLES, withinLadder } from "./permissions.js";
 import { TEAMS } from "./registry-port.js";
 import { LADDER_NAMES, roleLabel as labelOf, explainService, askRolesFor } from "./explain.js";
 
@@ -154,12 +154,12 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
   // ---- who may grant what ----
   /**
    * The definition of `role` at `type` if the caller may hand it out there, else null. Valid there (roleDef), never `admin` or `member`, its management
-   * permissions a subset of the caller's own at that scope (no escalation), and, at a board, `owner` only for a Unit admin (today's rule).
+   * permissions a subset of the caller's own at that scope and its board role no higher than the caller's own (no escalation, `withinLadder`), and, at a board, `owner` only for a Unit admin (today's rule).
    */
   function grantable(access, role, type, roles, admin) {
     if (role === "admin" || role === "member") return null;
     const def = roleDef(role, type, roles);
-    if (!def || !mgmtOf(def).every(p => access.permissions.has(p))) return null;
+    if (!def || !mgmtOf(def).every(p => access.permissions.has(p)) || !withinLadder(access.ladder, def.ladder, admin)) return null;   // management permissions a subset of the caller's, and no more board role than they hold (a Unit admin is exempt)
     if (type === "board" && role === "owner" && !admin) return null;
     return def;
   }

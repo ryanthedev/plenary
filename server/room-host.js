@@ -29,7 +29,7 @@
 //     the lease's renew and deadline (by performance.now(), never the rooms' injected clock).
 
 import { Room } from "../packages/protocol/room.js";
-import { CHECKPOINT_BYTES } from "../packages/protocol/envelope.js";
+import { CHECKPOINT_BYTES, blobRefsOf } from "../packages/protocol/envelope.js";
 import { jsonCodec } from "../packages/protocol/codec.js";
 import { subjects, MAX_BUS_BYTES, utf8Length } from "./bus/port.js";
 import { quietLogger } from "./log.js";
@@ -175,7 +175,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     const fenced = (what, err) => { if (err?.code === "fenced") lost(slot, `${what} fenced: another host took the board`, err); };
     return {
       append(entries, expectSeq) {
-        const w = withTimeout(Promise.resolve().then(() => store.append(tenant, board, entries, expectSeq, slot.epoch)));
+        const w = withTimeout(Promise.resolve().then(() => store.append(tenant, board, entries, expectSeq, slot.epoch, { blobRefs: blobRefsOf(entries) })));   // the pictures the entries name become this board's references, in the same transaction (§ Blobs)
         // close() settles it before release (L4). The timed promise: a hung append settles at the timeout, so close() never waits forever.
         slot.writes.add(w); w.finally(() => slot.writes.delete(w)).catch(() => {});
         return w.then(() => {

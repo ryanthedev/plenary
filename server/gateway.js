@@ -31,6 +31,7 @@ import { isId, isSha1 } from "./ids.js";
 import { quietLogger } from "./log.js";
 import { breathe } from "./breather.js";
 import { noopMetrics, FANOUT_BUCKETS } from "./metrics/port.js";
+import { BLOB_PENDING_MS } from "./blobs/port.js";
 import { identityKey } from "./auth/tenancy.js";   // the one spelling of the re-check grouping key (p5-load)
 
 export const LIMITS = {
@@ -129,7 +130,7 @@ const OP_ID = /^\s*\{\s*"t"\s*:\s*"op"\s*,\s*"id"\s*:\s*"([^"\\]{1,256})"/;
  * @param {{
  *   auth: { verify(token: string): Promise<object|null>, role(identity: object, board: string): Promise<string|null> },
  *   registry: { board(id: string): Promise<{ id: string, tenant: string }|null> },
- *   store: { read: Function, getCheckpoint: Function, epoch: Function },
+ *   store: { read: Function, getCheckpoint: Function, epoch: Function, blobPend: Function },
  *   bus: object,
  *   rooms: { open(tenant: string, board: string): Promise<void> },
  *   onWelcomed?: (user: string, board: string) => void,   // called after a connection is welcomed (Recent, PROTOCOL.md § Home); must not throw or block
@@ -1073,8 +1074,12 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     if (put && !putAllowed(`${c.tenant}/${c.board}/${c.user}`)) return no("limit", "too many uploads: ask again later");
     if (!blobUrl) return no("unavailable", "this server stores no pictures");
     let url;
-    try { url = await blobUrl(c.tenant, c.board, msg.sha1, put ? "PUT" : "GET", c.user); }
-    catch (err) { log.error("blob url failed", { conn: c.id, err }); return no("unavailable", "try again shortly"); }
+    try {
+      // A pending reference first (§ Blobs, "References and purge"): an upload that lands before its op is never condemned, and a hash being deleted is refused here, so the client asks again.
+      if (put) await store.blobPend(c.tenant, c.board, msg.sha1, BLOB_PENDING_MS);
+      url = await blobUrl(c.tenant, c.board, msg.sha1, put ? "PUT" : "GET", c.user);
+    }
+    catch (err) { log[err?.code === "unavailable" ? "info" : "error"]("blob url failed", { conn: c.id, err }); return no("unavailable", "try again shortly"); }   // "unavailable" is the Store saying ask again (a hash being deleted): expected, not an error
     push(ws, codec.encode({ t: "blob", sha1: msg.sha1, url }));
   }
 

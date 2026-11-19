@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { blobAccess, URL_TTL_MS } from "../../server/blob-access.js";
 import { diskBlobs } from "../../server/blobs/disk.js";
 import { PortError } from "../../server/ids.js";
-import { tempDir, cleanup, fakePng, sha1 } from "./helpers.js";
+import { tempDir, cleanup, fakePng, sha1, deferred } from "./helpers.js";
 
 afterAll(cleanup);
 const KEY = new Uint8Array(32).fill(7);
@@ -15,7 +15,7 @@ function make(o = {}) {
   const inner = o.blobs ?? diskBlobs({ dir: join(tempDir(), "blobs") });
   const calls = { usage: 0, put: 0 };
   const blobs = { put: (...a) => { calls.put++; return inner.put(...a); }, get: (...a) => inner.get(...a), usage: (...a) => { calls.usage++; return inner.usage(...a); }, ...(o.wrap ?? {}) };
-  const access = blobAccess({ blobs, key: o.key ?? KEY, origin: "http://h.test", now: () => clock.t, ...(o.quotaBytes !== undefined ? { quotaBytes: o.quotaBytes } : {}) });
+  const access = blobAccess({ blobs, key: o.key ?? KEY, origin: "http://h.test", now: () => clock.t, ...(o.quotaBytes !== undefined ? { quotaBytes: o.quotaBytes } : {}), ...(o.usageTtlMs ? { usageTtlMs: o.usageTtlMs } : {}) });
   return { access, clock, calls, inner };
 }
 const putUrl = (a, tenant, bytes, board = "b1") => a.url(tenant, board, sha1(bytes), "PUT").then(tokenOf);
@@ -147,4 +147,107 @@ test("construction checks its inputs", () => {
   expect(() => blobAccess({ ...base, blobs: { put() {}, get() {} } })).toThrow(TypeError);
   expect(() => blobAccess({ ...base, origin: 5 })).toThrow(TypeError);
   expect(() => blobAccess({ ...base, quotaBytes: -1 })).toThrow(TypeError);
+});
+
+test("#92 MED-4: the cached usage is read again once it is older than usageTtlMs (other nodes' puts and the reaper's deletes change what the tenant stores)", async () => {
+  const { access, clock, calls, inner } = make({ usageTtlMs: 1000 });
+  const a = fakePng(100, 51), b = fakePng(100, 52), c = fakePng(100, 53);
+  expect((await access.put(await putUrl(access, "t1", a), a)).ok).toBe(true);
+  clock.t += 999;
+  await access.put(await putUrl(access, "t1", b), b);
+  expect(calls.usage).toBe(1);                                   // still fresh
+  await inner.delete("t1", sha1(a));                             // another node's reaper removed one
+  clock.t += 1;
+  await access.put(await putUrl(access, "t1", c), c);
+  expect(calls.usage).toBe(2);                                   // stale: read again (and SET, so the deleted bytes no longer count)
+  clock.t += 5000;
+  await access.put(await putUrl(access, "t1", c), c);
+  expect(calls.usage).toBe(3);
+});
+
+test("#92 MED-4: a put that finishes while a usage read is in flight, which the read then misses, is still counted when the read answers (usage never under-counts the true bytes)", async () => {
+  const putGate = deferred(), readGate = deferred();
+  let holdPut = true, holdRead = false;
+  const { access, inner } = make({ quotaBytes: 320, wrap: {
+    put: async (...a) => { if (holdPut) { holdPut = false; await putGate.promise; } return inner.put(...a); },
+    usage: async (...a) => { const n = await inner.usage(...a); if (holdRead) { holdRead = false; await readGate.promise; } return n; },   // the walk's answer is fixed first, delivered later
+  } });
+  const a = fakePng(100, 54), b = fakePng(100, 55), c = fakePng(150, 56);
+  const first = access.put(await putUrl(access, "t1", a), a);                    // seeds (reads 0), then waits before storing
+  await new Promise(r => setTimeout(r, 5));
+  holdRead = true; access.recount("t1");
+  const second = access.put(await putUrl(access, "t1", b), b);                   // starts a new read: it sees 0 bytes, and is held
+  await new Promise(r => setTimeout(r, 5));
+  putGate.resolve();
+  expect(await first).toMatchObject({ ok: true, created: true });               // a lands DURING the read, which missed it
+  readGate.resolve();                                                            // the read answers 0: the count must still include a
+  expect((await second).ok).toBe(true);                                          // b: 100 (a) + 100 <= 320
+  expect(await inner.usage("t1")).toBe(200);
+  expect(await access.put(await putUrl(access, "t1", c), c)).toEqual({ ok: false, code: "quota" });   // 200 true bytes + 150 > 320 (a count of 100 would store a third picture)
+});
+
+test("#92 MED-4: a superseded usage read is ignored when it answers", async () => {
+  const gate = deferred();
+  let first = true;
+  const { access, inner } = make({ quotaBytes: 150, wrap: { usage: async (...a) => { const n = await inner.usage(...a); if (first) { first = false; await gate.promise; } return n; } } });
+  const a = fakePng(100, 57), b = fakePng(100, 58);
+  await inner.put("t1", sha1(a), a);                                             // 100 bytes already stored
+  const stale = access.put(await putUrl(access, "t1", b), b);                    // read 1 (held, will answer 100)
+  await new Promise(r => setTimeout(r, 5));
+  access.recount("t1");                                                          // supersedes it
+  gate.resolve();
+  expect(await stale).toEqual({ ok: false, code: "quota" });                     // 100 + 100 > 150 either way
+  expect(await inner.usage("t1")).toBe(100);
+});
+
+test("#92 MED-4: two overlapping usage reads with a put during each, resolving in either order and the late put landing before or after: no quota check ever sees a count below the true stored bytes", async () => {
+  for (const order of [[1, 2], [2, 1]]) for (const lateFirst of [true, false]) {
+    const holdPuts = new Map(); let holdReads = [];            // puts are held by picture (their arrival order at the adapter varies), reads by call order
+    const { access, inner } = make({ quotaBytes: 350, wrap: {
+      put: async (...a) => { const g = holdPuts.get(a[1]); if (g) await g.promise; return inner.put(...a); },
+      usage: async (...a) => { const n = await inner.usage(...a); const g = holdReads.shift(); if (g) await g.promise; return n; },   // the answer is fixed when asked, delivered when released
+    } });
+    const pic = k => fakePng(100, 60 + k), put = async k => access.put(await putUrl(access, "t1", pic(k)), pic(k));
+    const tick = () => new Promise(r => setTimeout(r, 4));
+    expect((await put(0)).ok).toBe(true);                       // S: 100 stored (the first read, unheld)
+    const g1 = deferred(), g1b = deferred(), r1 = deferred(), r2 = deferred();
+    holdPuts.set(sha1(pic(1)), g1); holdPuts.set(sha1(pic(2)), g1b);
+    const p1 = put(1), p1b = put(2);                            // both past the seed, held before their bytes are stored
+    await tick();
+    holdReads = [r1, r2];
+    access.recount("t1");
+    const p2 = put(3); await tick();                            // read 1 starts (sees 100)
+    g1.resolve(); await p1;                                     // a put finishes during read 1: true 200
+    access.recount("t1");
+    const p3 = put(4); await tick();                            // read 2 starts (sees 200), read 1 superseded
+    if (lateFirst) { g1b.resolve(); await p1b; }                // another put finishes during read 2: true 300
+    const rs = { 1: r1, 2: r2 };
+    rs[order[0]].resolve(); await tick(); rs[order[1]].resolve();
+    if (!lateFirst) { g1b.resolve(); await p1b; }
+    const [x, y] = await Promise.all([p2, p3]);
+    expect(await inner.usage("t1")).toBe(300);                  // the true bytes: nothing else was stored
+    expect([x, y]).toEqual([{ ok: false, code: "quota" }, { ok: false, code: "quota" }]);   // 300 + 100 > 350 for both: a count below 300 lets one in
+  }
+});
+
+test("#92 follow-up: a put waiting on a usage read that was superseded and then fails follows the current read instead of answering unavailable", async () => {
+  const gate = deferred();
+  let calls = 0;
+  const { access, inner } = make({ quotaBytes: 1000, wrap: { usage: async (...a) => { if (++calls === 1) { await gate.promise; throw new Error("walk failed"); } return inner.usage(...a); } } });
+  const a = fakePng(100, 71), b = fakePng(100, 72);
+  const first = access.put(await putUrl(access, "t1", a), a);                    // attaches to read 1 (held, will fail)
+  await new Promise(r => setTimeout(r, 5));
+  access.recount("t1");                                                          // supersedes read 1
+  const second = access.put(await putUrl(access, "t1", b), b);                   // starts read 2 (succeeds)
+  await new Promise(r => setTimeout(r, 5));
+  gate.resolve();
+  expect((await first).ok).toBe(true);
+  expect((await second).ok).toBe(true);
+  expect(await inner.usage("t1")).toBe(200);
+});
+
+test("#92 follow-up: a failing current read still fails the put closed (unavailable)", async () => {
+  const { access } = make({ quotaBytes: 1000, wrap: { usage: async () => { throw new Error("walk failed"); } } });
+  const a = fakePng(100, 73);
+  expect(await access.put(await putUrl(access, "t1", a), a)).toEqual({ ok: false, code: "unavailable" });
 });

@@ -2,18 +2,19 @@
 //   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB, a hash mismatch, and anything that isn't a PNG/JPEG/GIF/WebP;
 //                              true when it stored the blob, false when the tenant already had it
 //   get(tenant, sha1)          bytes, or null
-//   usage(tenant)              the bytes the tenant's blobs take (a walk of its folder; the quota's starting point)
+//   quarantine / restore / delete   rename the file to <dir>/.quarantine/<tenant>/<sha1> and back (one atomic rename each), or unlink it and its quarantined copy
+//   usage(tenant)              the bytes the tenant's blobs take, quarantined ones included (a walk of its folders; the quota's starting point)
 // A blob lives at <dir>/<tenant>/<first 2 hex>/<sha1>. Both ids are validated before they touch a path, so there is
 // no traversal and one tenant can't name another's file. Writes go to a temp file, are fsynced, then hard-linked
 // under the blob's name (which never replaces: the first bytes for a hash are kept), and the folder is fsynced:
 // a crash never leaves a half-written file under a blob's name, and a put that resolved survives power loss.
 // The per-tenant quota is enforced above the port (server/blob-access.js), from usage() and put()'s answer.
 
-import { mkdir, open, link, unlink, readFile, stat, readdir } from "node:fs/promises";
+import { mkdir, open, link, unlink, rename, readFile, stat, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { needId, isSha1, PortError } from "../ids.js";
 
-import { checkBlob } from "./port.js";
+import { checkBlob, QUARANTINE } from "./port.js";
 
 // The port's shared checks live in ./port.js; re-exported for callers that import them from here (tests).
 export { MAX_BLOB_BYTES, imageKind, checkBlob } from "./port.js";
@@ -28,6 +29,8 @@ export function diskBlobs({ dir }) {
     const folder = join(dir, tenant, sha1.slice(0, 2));
     return { folder, file: join(folder, sha1) };
   };
+  const held = (tenant, sha1) => { place(tenant, sha1); const qfolder = join(dir, QUARANTINE, tenant); return { qfolder, qfile: join(qfolder, sha1) }; };
+  const gone = err => err?.code === "ENOENT" || err?.code === "ENOTDIR";
   // fsync the directory, so the new name itself is on disk (best effort where a platform can't open a directory).
   const syncDir = async folder => { let dh; try { dh = await open(folder, "r"); await dh.sync(); } catch { /* not supported here */ } finally { await dh?.close().catch(() => {}); } };
   const exists = async file => { try { return (await stat(file)).isFile(); } catch { return false; } };
@@ -64,7 +67,36 @@ export function diskBlobs({ dir }) {
       for (const shard of await list(join(dir, tenant)))
         if (shard.isDirectory()) for (const f of await list(join(dir, tenant, shard.name)))
           if (f.isFile() && isSha1(f.name)) total += (await stat(join(dir, tenant, shard.name, f.name)).catch(() => null))?.size ?? 0;
+      // Quarantined blobs still take the space (and may come back): a count taken mid-reap must not miss them.
+      for (const f of await list(join(dir, QUARANTINE, tenant)))
+        if (f.isFile() && isSha1(f.name)) total += (await stat(join(dir, QUARANTINE, tenant, f.name)).catch(() => null))?.size ?? 0;
       return total;
+    },
+
+    /** Moves the blob out of reach (one rename: never half there); idempotent. @returns {Promise<void>} */
+    async quarantine(tenant, sha1) {
+      const { folder, file } = place(tenant, sha1), { qfolder, qfile } = held(tenant, sha1);
+      await mkdir(qfolder, { recursive: true });
+      try { await rename(file, qfile); } catch (err) { if (gone(err)) return; throw err; }
+      await syncDir(folder); await syncDir(qfolder);
+    },
+
+    /** Puts a quarantined blob back unless the tenant has it again; idempotent. @returns {Promise<void>} */
+    async restore(tenant, sha1) {
+      const { folder, file } = place(tenant, sha1), { qfolder, qfile } = held(tenant, sha1);
+      if (!(await exists(qfile))) return;
+      await mkdir(folder, { recursive: true });
+      try { await link(qfile, file); } catch (err) { if (err?.code !== "EEXIST") { if (gone(err)) return; throw err; } }   // link never replaces: a new put of the same hash stays
+      await syncDir(folder);
+      await unlink(qfile).catch(err => { if (!gone(err)) throw err; });
+      await syncDir(qfolder);
+    },
+
+    /** Removes the blob and its quarantined copy for good; idempotent. @returns {Promise<void>} */
+    async delete(tenant, sha1) {
+      const { folder, file } = place(tenant, sha1), { qfolder, qfile } = held(tenant, sha1);
+      for (const [f, d] of [[qfile, qfolder], [file, folder]])
+        try { await unlink(f); await syncDir(d); } catch (err) { if (!gone(err)) throw err; }
     },
 
     /** @returns {Promise<Uint8Array | null>} */

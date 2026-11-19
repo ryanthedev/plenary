@@ -72,7 +72,7 @@ test.skipIf(!E.NATS_URL)("Bus: nats has exactly the port's members", async () =>
 
 test("Blobs: disk has exactly the port's methods", () => surface(diskBlobs({ dir: tempDir() }), BLOBS_METHODS, []));
 test.skipIf(!E.S3_ENDPOINT)("Blobs: s3 has exactly the port's methods", () =>
-  surface(s3Blobs({ endpoint: E.S3_ENDPOINT, bucket: E.S3_BUCKET, region: E.S3_REGION ?? "us-east-1", accessKeyId: E.S3_ACCESS_KEY_ID, secretAccessKey: E.S3_SECRET_ACCESS_KEY }), BLOBS_METHODS, []));
+  surface(s3Blobs({ endpoint: E.S3_ENDPOINT, bucket: E.S3_BUCKET, region: E.S3_REGION ?? "us-east-1", accessKeyId: E.S3_ACCESS_KEY_ID, secretAccessKey: E.S3_SECRET_ACCESS_KEY }), BLOBS_METHODS, ["deadlineMs"]));   // deadlineMs: the longest one reaper call takes (an adapter that can hang bounds its calls)
 
 test("no adapter-only member leaks into core: only adapters, composition roots and tests name them", () => {
   const used = [...new Set([...STORE_EXTRAS, ...REGISTRY_EXTRAS].filter(m => m !== "settings" && m !== "linkUsesFor"))];   // `settings` is too common a word, and `linkUsesFor` is the port's optional batch read that core feature-detects; the others are distinctive

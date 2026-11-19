@@ -9,6 +9,8 @@
 //   cleanup()        optional; runs after the test (drop the schema, remove the file)
 //   raw              { putCheckpointRow(t, b, seq, data), putPartRow(t, b, seq, wid, n, data), partRows(t, b) }: the adapter's tables
 //                    written and counted directly (old-format rows, the orphans a crash leaves)
+//                    (blob references, #92) also putRefRow(t, b, sha1) (a reference written past append's cancel step: the race a purge loses to a
+//                    new reference), refRows(t, b), pendingRows(t, b): counts. Contract cases that use them skip without `raw`.
 //   advance(ms)      optional; moves the store's lease clock forward (an adapter with an injected clock, shared by
 //                    `another()`). Without it, the lease cases wait out a short real ttl on the database's clock.
 // `make(opts)` gets `{ partChars, onPart }` and must pass them to the adapter (checkpoint parts: the size of one part, and a
@@ -633,6 +635,271 @@ export function storeContract(name, make) {
       await store.purgeBoard(T, B);
       expect(await store.getCheckpoint(T, B)).toBe(null);
       if (raw) expect(await raw.partRows(T, B)).toBe(0);
+    });
+
+    // ---- Blob references (PROTOCOL.md § Blobs, "References and purge", #92) ----
+    describe("blob references", () => {
+      const H1 = "1".repeat(40), H2 = "2".repeat(40), H3 = "3".repeat(40), B2 = "b-two", B3 = "b-three", T2 = "t-bbb";
+      const GRACE = { graceMs: 0, limit: 100 };
+      /** One board with its lease, and an append carrying `refs`. */
+      const put = async (store, board, refs, tenant = T, seq = 1) => {
+        const epoch = await own(store, tenant, board);
+        await store.append(tenant, board, [entry(seq, { board, tenant })], seq - 1, epoch, { blobRefs: refs });
+        return epoch;
+      };
+      const condemned = async (store, o = {}) => (await store.blobCondemned({ ...GRACE, ...o })).map(r => `${r.tenant}/${r.sha1}`);
+
+      test("a purge condemns the hashes only that board used; a hash another board uses is kept, and goes with the last board", async () => {
+        const { store } = await fresh();
+        await put(store, B, [H1, H2]); await put(store, B2, [H2, H3]);
+        await store.purgeBoard(T, B);
+        expect(await condemned(store)).toEqual([`${T}/${H1}`]);                      // H2 is still B2's
+        await store.purgeBoard(T, B2);
+        expect(await condemned(store)).toEqual([`${T}/${H1}`, `${T}/${H2}`, `${T}/${H3}`]);
+        await store.purgeBoard(T, B2);                                               // idempotent: nothing new, nothing lost
+        expect((await condemned(store)).length).toBe(3);
+      });
+
+      test("references are per tenant, and nothing is condemned until a purge (a board in Trash keeps its references)", async () => {
+        const { store } = await fresh();
+        await put(store, B, [H1]); await put(store, B, [H1], T2);
+        expect(await condemned(store)).toEqual([]);                                  // referenced, never purged
+        await store.purgeBoard(T, B);
+        expect(await condemned(store)).toEqual([`${T}/${H1}`]);                      // the other tenant's copy is its own
+      });
+
+      test("blobRefs are written in the entries' transaction: a refused append (conflict, fenced, bad entry, bad refs) leaves no reference", async () => {
+        const { store } = await fresh();
+        const e = await own(store);
+        await store.append(T, B, [entry(1)], 0, e);
+        expect(await code(store.append(T, B, [entry(1)], 0, e, { blobRefs: [H1] }))).toBe("conflict");
+        expect(await code(store.append(T, B, [entry(2)], 1, e + 1, { blobRefs: [H1] }))).toBe("fenced");
+        expect(await code(store.append(T, B, [entry(2)], 1, e, { blobRefs: [H1, "nope"] }))).toBe("bad-entry");
+        expect(await code(store.append(T, B, [entry(2)], 1, e, { blobRefs: "x" }))).toBe("bad-entry");
+        expect(await code(store.append(T, B, [entry(2)], 1, e, { blobRefs: ["A".repeat(40)] }))).toBe("bad-entry");
+        expect(await store.lastSeq(T, B)).toBe(1);
+        await put(store, B2, [H1]);                                                  // B2 is the only user of H1 if none of those left a reference
+        await store.purgeBoard(T, B2);
+        expect(await condemned(store)).toEqual([`${T}/${H1}`]);
+      });
+
+      test("an append with no blobRefs (or an empty list) works as before; duplicates in one list are one reference", async () => {
+        const { store } = await fresh();
+        const e = await own(store);
+        await store.append(T, B, [entry(1)], 0, e);
+        await store.append(T, B, [entry(2)], 1, e, {});
+        await store.append(T, B, [entry(3)], 2, e, { blobRefs: [] });
+        await store.append(T, B, [entry(4)], 3, e, { blobRefs: [H1, H1, H1] });
+        await store.purgeBoard(T, B);
+        expect(await condemned(store)).toEqual([`${T}/${H1}`]);
+      });
+
+      test("a new reference (append or pend) cancels a condemnation", async () => {
+        const { store } = await fresh();
+        await put(store, B, [H1, H2]); await store.purgeBoard(T, B);
+        expect((await condemned(store)).length).toBe(2);
+        await put(store, B2, [H1]);                                                  // H1 used again
+        expect(await condemned(store)).toEqual([`${T}/${H2}`]);
+        await store.blobPend(T, B3, H2, 60_000);                                     // H2 about to be uploaded again
+        expect(await condemned(store)).toEqual([]);
+      });
+
+      test("a pending reference keeps a purge from condemning its hash; the append that follows replaces it", async () => {
+        const { store, expire } = await fresh();
+        await put(store, B, [H1]);
+        await store.blobPend(T, B2, H1, SHORT);                                      // B2 is about to upload H1
+        await store.purgeBoard(T, B);
+        expect(await condemned(store)).toEqual([]);                                  // pending counts as a use
+        await expire();
+        await put(store, B2, [H1]);                                                  // its op lands (even after the pending lapsed)
+        await store.purgeBoard(T, B2);
+        expect(await condemned(store)).toEqual([`${T}/${H1}`]);
+      });
+
+      test("a purge condemns a hash that only the purged board's pending reference held; a longer pend never shortens an earlier one", async () => {
+        const { store, expire } = await fresh();
+        await store.blobPend(T, B, H1, LONG); await store.blobPend(T, B, H1, 1);      // the longer stays
+        await store.blobPend(T, B2, H2, SHORT);
+        await expire();
+        await store.purgeBoard(T, B); await store.purgeBoard(T, B2);
+        expect(await condemned(store)).toEqual([`${T}/${H1}`, `${T}/${H2}`]);
+      });
+
+      test("blobCondemned: only after the grace, oldest-key-first pages after a cursor, tenant by tenant, bad arguments refused", async () => {
+        const { store, expire } = await fresh();
+        await put(store, B, [H3, H1]); await put(store, B, [H2], T2, 1);
+        await store.purgeBoard(T, B); await store.purgeBoard(T2, B);
+        expect(await condemned(store, { graceMs: SHORT })).toEqual([]);              // not yet
+        await expire();
+        const all = await store.blobCondemned({ graceMs: SHORT, limit: 100 });
+        expect(all).toEqual([{ tenant: T, sha1: H1 }, { tenant: T, sha1: H3 }, { tenant: T2, sha1: H2 }]);
+        const p1 = await store.blobCondemned({ graceMs: SHORT, limit: 2 });
+        expect(p1).toEqual(all.slice(0, 2));
+        expect(await store.blobCondemned({ graceMs: SHORT, limit: 2, after: p1.at(-1) })).toEqual(all.slice(2));
+        expect(await store.blobCondemned({ graceMs: SHORT, limit: 2, after: all.at(-1) })).toEqual([]);
+        for (const bad of [{ graceMs: -1, limit: 1 }, { graceMs: 1.5, limit: 1 }, { graceMs: 0, limit: 0 }, { graceMs: 0, limit: 1001 }, { graceMs: 0 }]) expect(await code(store.blobCondemned(bad))).toBe("bad-entry");
+        expect(await code(store.blobCondemned({ graceMs: 0, limit: 1, after: { tenant: "a.b", sha1: H1 } }))).toBe("bad-id");
+      });
+
+      test("blobClaim is conditional: once, not before the grace, not while claimed, again after the claim lapses; blobReaped ends it", async () => {
+        const { store, expire } = await fresh();
+        await put(store, B, [H1]); await store.purgeBoard(T, B);
+        expect(await store.blobClaim(T, H1, { graceMs: SHORT, claimMs: SHORT })).toBe(false);   // too young
+        await expire();
+        expect(await store.blobClaim(T, H1, { graceMs: SHORT, claimMs: SHORT })).toBe(true);
+        expect(await store.blobClaim(T, H1, { graceMs: SHORT, claimMs: SHORT })).toBe(false);   // held
+        expect(await condemned(store, { graceMs: SHORT })).toEqual([]);              // a claimed hash is not offered
+        await expire();
+        expect(await condemned(store, { graceMs: SHORT })).toEqual([`${T}/${H1}`]);  // the claim lapsed (a node died mid-delete): back on the list
+        expect(await store.blobClaim(T, H1, { graceMs: SHORT, claimMs: LONG })).toBe(true);
+        expect(await store.blobReaped(T, H1)).toBe(true);                            // the verdict: nothing references it, delete the bytes ...
+        expect(await store.blobReaped(T, H1)).toBe(true);                            // ... and the row stays until that is done (a failed delete is retried), so asking again says the same
+        expect(await condemned(store)).toEqual([]);                                  // still claimed
+        expect(await store.blobReaped(T, H1, { deleted: true })).toBe(true);         // the delete is done: the row goes
+        expect(await store.blobReaped(T, H1)).toBe(false);                           // nothing left to settle
+        expect(await store.blobReaped(T, H1, { deleted: true })).toBe(true);         // a missing row after a delete is clean (another node finished)
+        expect(await condemned(store)).toEqual([]);
+        expect(await store.blobClaim(T, H1, { graceMs: 0, claimMs: SHORT })).toBe(false);       // gone
+        for (const bad of [{ graceMs: 0, claimMs: 0 }, { graceMs: -1, claimMs: 1 }, {}]) expect(await code(store.blobClaim(T, H1, bad))).toBe("bad-entry");
+        expect(await code(store.blobClaim(T, "nope", { graceMs: 0, claimMs: 1 }))).toBe("bad-id");
+        expect(await code(store.blobReaped("a.b", H1))).toBe("bad-id");
+      });
+
+      test("blobClaim refuses a hash that is referenced or pending again, and drops a condemnation a reference outlived", async () => {
+        const { store, raw } = await fresh();
+        await put(store, B, [H1, H2, H3]); await store.purgeBoard(T, B);
+        if (raw) {
+          await raw.putRefRow(T, B2, H1);                                            // a purge raced a new reference: both rows exist
+          expect(await store.blobClaim(T, H1, { graceMs: 0, claimMs: SHORT })).toBe(false);   // STILL UNREFERENCED guard
+          expect(await condemned(store)).toEqual([`${T}/${H2}`, `${T}/${H3}`]);       // and the stale condemnation is gone
+        }
+        await store.blobPend(T, B3, H3, LONG);                                       // pend cancels it as well
+        expect(await store.blobClaim(T, H3, { graceMs: 0, claimMs: SHORT })).toBe(false);
+        expect(await store.blobClaim(T, H2, { graceMs: 0, claimMs: SHORT })).toBe(true);
+      });
+
+      test("a hash a reaper holds a live claim on cannot be pended (unavailable: ask again); once the claim lapses a pend marks it revived, and the reaper that settles it puts the bytes back", async () => {
+        const { store, expire } = await fresh();
+        await put(store, B, [H1]); await store.purgeBoard(T, B);
+        expect(await store.blobClaim(T, H1, { graceMs: 0, claimMs: SHORT })).toBe(true);
+        expect(await code(store.blobPend(T, B2, H1, SHORT))).toBe("unavailable");
+        await expire();
+        await store.blobPend(T, B2, H1, LONG);                                       // the claim lapsed (its node died, the bytes may be quarantined): the row stays, revived
+        expect(await condemned(store, { graceMs: SHORT })).toEqual([`${T}/${H1}`]);  // and is offered again, so a reaper settles it
+        expect(await store.blobClaim(T, H1, { graceMs: SHORT, claimMs: LONG })).toBe(true);   // claimable although an upload is pending: it was claimed before
+        expect(await store.blobReaped(T, H1)).toBe(false);                           // keep: put the bytes back (the row stays, revived, until the restore is done)
+        expect(await store.blobReaped(T, H1, { restored: true })).toBe(true);
+        expect(await condemned(store)).toEqual([]);
+      });
+
+      test("REVIVE: claim, then another board's append names the hash, then a pend: the pend is unavailable until the reaper settles, and the settle says keep", async () => {
+        const { store } = await fresh();
+        await put(store, B, [H1]); await store.purgeBoard(T, B);
+        expect(await store.blobClaim(T, H1, { graceMs: 0, claimMs: LONG })).toBe(true);
+        await put(store, B2, [H1]);                                                  // an op names the picture now: the row is NOT deleted
+        expect(await code(store.blobPend(T, B3, H1, SHORT))).toBe("unavailable");    // a deleted row would let this through (and the PUT then find the old bytes)
+        expect(await store.blobClaim(T, H1, { graceMs: 0, claimMs: LONG })).toBe(false);   // still held
+        expect(await store.blobReaped(T, H1)).toBe(false);                           // revived: put the bytes back
+        expect(await code(store.blobPend(T, B3, H1, SHORT))).toBe("unavailable");    // the row (and the claim) stays until the restore is done
+        expect(await store.blobReaped(T, H1, { restored: true })).toBe(true);
+        await store.blobPend(T, B3, H1, SHORT);                                      // settled: asks go through again
+        expect(await store.blobReaped(T, H1)).toBe(false);                           // nothing left to settle
+      });
+
+      test("the settle (blobReaped) says delete only when nothing references the hash: no revive mark, no reference, no live pending upload", async () => {
+        const { store, raw } = await fresh();
+        await put(store, B, [H1, H2, H3]); await store.purgeBoard(T, B);
+        for (const h of [H1, H2, H3]) expect(await store.blobClaim(T, h, { graceMs: 0, claimMs: LONG })).toBe(true);
+        if (raw) await raw.putRefRow(T, B2, H2);                                     // a reference that got in without the revive mark
+        expect(await store.blobReaped(T, H1)).toBe(true);
+        expect(await store.blobReaped(T, H2)).toBe(false);                           // the settle looks again
+        expect(await store.blobReaped(T, H3)).toBe(true);
+        expect(await store.blobReaped(T, H1, { deleted: true })).toBe(true);
+        expect(await store.blobReaped(T, H1)).toBe(false);                           // settled: not ours any more
+        expect(await store.blobReaped(T, H2, { restored: true })).toBe(true);
+        expect(await store.blobReaped(T, H2)).toBe(false);                           // dropped by the restored step
+      });
+
+      test("HIGH-A: a keep verdict leaves the row claimed and revived until the restore is done, so a restore that failed is retried: the next claim says keep again", async () => {
+        const { store, expire } = await fresh();
+        await put(store, B, [H1]); await store.purgeBoard(T, B);
+        expect(await store.blobClaim(T, H1, { graceMs: SHORT, claimMs: SHORT })).toBe(false);   // too young
+        await expire();
+        expect(await store.blobClaim(T, H1, { graceMs: SHORT, claimMs: SHORT })).toBe(true);
+        await put(store, B2, [H1]);                                                  // a reference under the claim
+        expect(await store.blobReaped(T, H1)).toBe(false);                           // keep ... and the process dies before the restore
+        await expire();                                                              // the claim lapses
+        expect(await condemned(store, { graceMs: SHORT })).toEqual([`${T}/${H1}`]);  // the row is still there: offered again
+        expect(await store.blobClaim(T, H1, { graceMs: SHORT, claimMs: LONG })).toBe(true);
+        expect(await store.blobReaped(T, H1)).toBe(false);                           // keep again: restore is retried
+        expect(await store.blobReaped(T, H1, { restored: true })).toBe(true);
+        expect(await condemned(store, { graceMs: 0 })).toEqual([]);
+        expect(await store.blobClaim(T, H1, { graceMs: 0, claimMs: LONG })).toBe(false);   // done
+      });
+
+      test("a reference that lands during a delete keeps the condemnation row under its claim (revived), never ends it", async () => {
+        const { store } = await fresh();
+        await put(store, B, [H1]); await store.purgeBoard(T, B);
+        expect(await store.blobClaim(T, H1, { graceMs: 0, claimMs: LONG })).toBe(true);
+        await put(store, B2, [H1]);
+        expect(await store.blobReaped(T, H1)).toBe(false);
+      });
+
+      test("a reference that lands between the verdict and the end of the delete is reported: blobReaped({ deleted: true }) answers false (the client's re-upload heals it)", async () => {
+        const { store } = await fresh();
+        await put(store, B, [H1]); await store.purgeBoard(T, B);
+        expect(await store.blobClaim(T, H1, { graceMs: 0, claimMs: LONG })).toBe(true);
+        expect(await store.blobReaped(T, H1)).toBe(true);
+        await put(store, B2, [H1]);
+        expect(await store.blobReaped(T, H1, { deleted: true })).toBe(false);
+        expect(await condemned(store)).toEqual([]);
+      });
+
+      test("an append is never refused over the NUMBER of its references: tens of thousands are written (in chunks) and a purge condemns each", async () => {
+        const { store } = await fresh();
+        const refs = Array.from({ length: 25_000 }, (_, i) => i.toString(16).padStart(40, "0"));
+        await put(store, B, refs);
+        await store.purgeBoard(T, B);
+        let n = 0, after = null;
+        for (;;) { const page = await store.blobCondemned({ graceMs: 0, after, limit: 1000 }); n += page.length; if (page.length < 1000) break; after = page.at(-1); }
+        expect(n).toBe(25_000);
+      }, 60_000);
+
+      test("blobPrune deletes only expired pending references, at most `limit`, and a pending row of a purged board goes with it", async () => {
+        const { store, expire, raw } = await fresh();
+        await store.blobPend(T, B, H1, SHORT); await store.blobPend(T, B, H2, SHORT); await store.blobPend(T, B, H3, LONG);
+        expect(await store.blobPrune(10)).toBe(0);                                    // none expired
+        await expire();
+        expect(await store.blobPrune(1)).toBe(1);
+        expect(await store.blobPrune(10)).toBe(1);
+        expect(await store.blobPrune(10)).toBe(0);
+        if (raw) expect(await raw.pendingRows(T, B)).toBe(1);                         // H3's
+        await store.purgeBoard(T, B);
+        if (raw) expect(await raw.pendingRows(T, B)).toBe(0);
+        for (const bad of [0, -1, 1.5, "x", undefined]) expect(await code(store.blobPrune(bad))).toBe("bad-entry");
+      });
+
+      test("blobPend's arguments are checked, and a closed store refuses every blob call", async () => {
+        const { store } = await fresh();
+        expect(await code(store.blobPend(T, B, "nope", 1000))).toBe("bad-id");
+        expect(await code(store.blobPend("a.b", B, H1, 1000))).toBe("bad-id");
+        for (const ttl of [0, -5, 1.5, 24 * 3_600_000 + 1, "5", undefined]) expect(await code(store.blobPend(T, B, H1, ttl))).toBe("bad-entry");
+        await store.close();
+        for (const f of [() => store.blobPend(T, B, H1, 1000), () => store.blobCondemned(GRACE), () => store.blobClaim(T, H1, { graceMs: 0, claimMs: 1 }), () => store.blobReaped(T, H1), () => store.blobPrune(1)])
+          expect(await code(f())).toBe("closed");
+      });
+
+      test("purge, pend and a new reference racing on one hash never leave a condemned hash that is referenced AND claimable", async () => {
+        const { store, raw } = await fresh();
+        for (let i = 0; i < 8; i++) {
+          const h = String(i).repeat(40);
+          await put(store, `b-p${i}`, [h]);
+          await Promise.all([store.purgeBoard(T, `b-p${i}`), put(store, `b-q${i}`, [h]), store.blobPend(T, `b-r${i}`, h, LONG).catch(() => {})]);
+          // the new reference or pend won or lost the race; either way the reaper's claim must refuse a hash that is in use
+          expect(await store.blobClaim(T, h, { graceMs: 0, claimMs: SHORT })).toBe(false);
+        }
+        expect(raw ? await raw.refRows(T, "b-q0") : 1).toBe(1);
+      });
     });
   });
 }

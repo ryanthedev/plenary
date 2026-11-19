@@ -14,6 +14,7 @@
 //                missing at the header, or the database ended an idle write transaction. Nothing of the call is visible.
 //   corrupt      getCheckpoint: a header's parts hold the wrong number of chars. Not retried.
 //   closed       any call after close().
+//   unavailable  (also) blobPend: a reaper holds a live claim on the hash; ask again shortly.
 //   bad-clock    the injected clock (SQLite `now`) gave a non-integer: a lease call grants nothing.
 //   old-format   OPEN, at start-up: a table's columns differ from this version's DDL. The store is refused, never read or ALTERed;
 //                the operator resets it (SQLite: delete the file; Postgres: drop the schema).
@@ -37,7 +38,7 @@
 // OPTIONAL capability: `clusterId()` (the Postgres adapter; a single node has no cluster). main.js asks for it only in
 // cluster mode and refuses a cluster store without it.
 
-import { needId, PortError } from "../ids.js";
+import { needId, isSha1, PortError } from "../ids.js";
 
 /** The most entries one `read` returns, whatever `limit` asks. */
 export const MAX_READ = 10_000;
@@ -45,8 +46,14 @@ export const MAX_READ = 10_000;
 export const DEFAULT_READ_LIMIT = 1000;
 /** The longest lease (ms): a holder that dies with a longer one would block its board for that long. */
 export const MAX_LEASE_TTL_MS = 10 * 60_000;
+/** How many blob references one statement writes (an append of more is written in chunks, never refused: PROTOCOL.md § Blobs, "References and purge"). */
+export const BLOB_REF_CHUNK = 10_000;
+/** The longest a pending blob reference may last. */
+export const MAX_PENDING_MS = 24 * 3_600_000;
+/** `blobCondemned`'s page cap. */
+export const MAX_CONDEMNED_PAGE = 1000;
 /** The method names of the Store port, in declaration order (test/server/adapter-surface.test.js checks every adapter has exactly these, plus the adapter-only ones). */
-export const STORE_METHODS = Object.freeze(["append", "read", "lastSeq", "putCheckpoint", "getCheckpoint", "openEpoch", "epoch", "acquire", "renew", "release", "lease", "purgeBoard", "close"]);
+export const STORE_METHODS = Object.freeze(["append", "read", "lastSeq", "putCheckpoint", "getCheckpoint", "openEpoch", "epoch", "acquire", "renew", "release", "lease", "purgeBoard", "blobPend", "blobCondemned", "blobClaim", "blobReaped", "blobPrune", "close"]);
 
 /**
  * @typedef {{ epoch: number, expiresAt: number }} StoreLease  what acquire / renew grant; `expiresAt` is on the Store's clock
@@ -56,10 +63,13 @@ export const STORE_METHODS = Object.freeze(["append", "read", "lastSeq", "putChe
  * @typedef {object[] & { bytes: number[] }} EntryPage  entries ascending by seq; `bytes[i]` = entry i's stored length in chars
  *
  * @typedef {{
- *   append(tenant: string, board: string, entries: object[], expectSeq: number, epoch: number): Promise<void>,
+ *   append(tenant: string, board: string, entries: object[], expectSeq: number, epoch: number, opts?: { blobRefs?: string[] }): Promise<void>,
  *     // Writes every entry or none. entries[i].seq must be expectSeq + 1 + i and entries[i].tenant / .board must match. At
  *     // least one entry. epoch: REQUIRED positive integer, the lease epoch the writer holds. Errors: bad-id, bad-entry,
- *     // fenced, conflict. Resolves once durable.
+ *     // fenced, conflict. Resolves once durable. `opts.blobRefs`: the SHA-1 fileIds the entries' image elements name (any
+ *     //   number, each 40 lowercase hex, else bad-entry; never refused over their count). They are written as the board's blob references in the SAME
+ *     //   transaction as the entries (in chunks of BLOB_REF_CHUNK); each also replaces the board's pending reference for it, and cancels the hash's
+ *     //   condemnation, or, when a reaper has claimed it, marks it revived (the reaper then puts the bytes back).
  *   read(tenant: string, board: string, fromSeq?: number, limit?: number, maxBytes?: number): Promise<EntryPage>,
  *     // Entries with seq >= fromSeq (default 1), ascending, at most min(limit, MAX_READ) (default DEFAULT_READ_LIMIT). With
  *     // maxBytes the page also stops once it holds about that much stored text, and always holds >= 1 entry if any
@@ -84,7 +94,16 @@ export const STORE_METHODS = Object.freeze(["append", "read", "lastSeq", "putChe
  *     // Extends to now + ttlMs, only as `holder` at `epoch` (even if it lapsed and nobody took it); else null. epoch required.
  *   release(tenant: string, board: string, holder: string, epoch: number): Promise<void>,   // as `holder` at `epoch` only, else a no-op; the epoch stays
  *   lease(tenant: string, board: string): Promise<null | LeaseRecord>,   // null = no room was ever built
- *   purgeBoard(tenant: string, board: string): Promise<void>,   // PROTOCOL.md § Trash and restore, "Purge": deletes the board's entries, checkpoints, checkpoint parts and lease record in ONE transaction; idempotent (nothing there is not an error); a stale host's later write is "fenced" (no lease row). The caller (the trash sweeper) has already made the board unreachable
+ *   purgeBoard(tenant: string, board: string): Promise<void>,   // PROTOCOL.md § Trash and restore, "Purge": deletes the board's entries, checkpoints, checkpoint parts, lease record, blob references and pending references, and condemns each hash left with no reference and no live pending one, in ONE transaction; idempotent (nothing there is not an error); a stale host's later write is "fenced" (no lease row). The caller (the trash sweeper) has already made the board unreachable
+ *   blobPend(tenant: string, board: string, sha1: string, ttlMs: number): Promise<void>,
+ *     // A pending reference until the Store's clock + ttlMs (positive integer <= MAX_PENDING_MS; a second call extends it) and cancels the hash's condemnation (a claimed one is marked revived instead). Rejects "unavailable" while a reaper's claim on the hash is live.
+ *   blobCondemned(o: { graceMs: number, after?: { tenant: string, sha1: string } | null, limit: number }): Promise<{ tenant: string, sha1: string }[]>,
+ *     // Hashes condemned at least graceMs (integer >= 0) ago on the Store's clock and not under a live claim, ascending by (tenant, sha1) after `after`, at most limit (1..MAX_CONDEMNED_PAGE).
+ *   blobClaim(tenant: string, sha1: string, o: { graceMs: number, claimMs: number }): Promise<boolean>,
+ *     // The reaper's conditional claim (claimMs: positive integer): true only if the hash is condemned for graceMs, not under a live claim, and either STILL UNREFERENCED with no live pending reference, or claimed before (a reaper died mid-way: it must put the bytes back or finish). An unclaimed hash that has a reference loses its condemnation.
+ *   blobReaped(tenant: string, sha1: string, o?: { deleted?: boolean, restored?: boolean }): Promise<boolean>,
+ *     // The settle, after the bytes were quarantined. Without `deleted`: true = nothing references the hash (no revive mark, reference or live pending upload): delete the bytes (the claimed row stays, so a failed delete is retried); false = put them back (the row stays, marked revived, so a failed restore is retried). With `restored: true` (after the restore) or `deleted: true` (after the delete): drops the row; false = a reference arrived since the verdict; a missing row is true.
+ *   blobPrune(limit: number): Promise<number>,   // deletes at most limit (positive integer) expired pending references; returns how many
  *   close(): Promise<void>,   // idempotent; every later call rejects "closed"
  * }} Store
  */
@@ -146,4 +165,26 @@ export function checkCheckpoint(cp, epoch) {
 /** `getCheckpoint`'s optional beforeSeq. */
 export function checkBeforeSeq(beforeSeq) {
   if (beforeSeq !== undefined && (!Number.isSafeInteger(beforeSeq) || beforeSeq < 0)) throw bad("beforeSeq must be a non-negative integer");
+}
+
+/** `append`'s optional blob references. @returns {string[]} the distinct hashes ([] when none) */
+export function checkBlobRefs(opts) {
+  const refs = opts?.blobRefs;
+  if (refs === undefined) return [];
+  if (!Array.isArray(refs) || !refs.every(isSha1)) throw bad("blobRefs must be an array of lowercase SHA-1 hashes");   // never a cap: an append is never refused over its references
+  return [...new Set(refs)].sort();   // a fixed order, so two appends never lock overlapping hashes in opposite orders
+}
+
+/** `blobPend`'s hash and ttl. */
+export function checkPend(sha1, ttlMs) {
+  if (!isSha1(sha1)) throw new PortError("bad-id", "a blob id is a lowercase hex SHA-1");
+  if (!posInt(ttlMs) || ttlMs > MAX_PENDING_MS) throw bad(`ttlMs must be a positive integer up to ${MAX_PENDING_MS}`);
+}
+
+/** `blobCondemned`'s and `blobClaim`'s numbers and cursor. */
+export function checkReap({ graceMs, claimMs, limit, after } = {}, { claim = false } = {}) {
+  if (!Number.isSafeInteger(graceMs) || graceMs < 0) throw bad("graceMs must be a non-negative integer");
+  if (claim) { if (!posInt(claimMs)) throw bad("claimMs must be a positive integer"); return; }
+  if (!posInt(limit) || limit > MAX_CONDEMNED_PAGE) throw bad(`limit must be an integer from 1 to ${MAX_CONDEMNED_PAGE}`);
+  if (after != null) { needId(after.tenant, "tenant"); if (!isSha1(after.sha1)) throw new PortError("bad-id", "a blob id is a lowercase hex SHA-1"); }
 }

@@ -44,6 +44,9 @@ describe.skipIf(!url)("postgres store", () => {
       putCheckpointRow: (t, b, seq, data) => q(`INSERT INTO "${schema}".pl_checkpoints (tenant, board, seq, data) VALUES ($1, $2, $3, $4)`, t, b, seq, data),
       putPartRow: (t, b, seq, wid, n, data) => q(`INSERT INTO "${schema}".pl_checkpoint_parts (tenant, board, seq, wid, n, data) VALUES ($1, $2, $3, $4, $5, $6)`, t, b, seq, wid, n, data),
       partRows: async (t, b) => (await q(`SELECT count(*)::int AS c FROM "${schema}".pl_checkpoint_parts WHERE tenant = $1 AND board = $2`, t, b))[0].c,
+      putRefRow: (t, b, sha1) => q(`INSERT INTO "${schema}".pl_blob_refs (tenant, sha1, board) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, t, sha1, b),
+      refRows: async (t, b) => (await q(`SELECT count(*)::int AS c FROM "${schema}".pl_blob_refs WHERE tenant = $1 AND board = $2`, t, b))[0].c,
+      pendingRows: async (t, b) => (await q(`SELECT count(*)::int AS c FROM "${schema}".pl_blob_pending WHERE tenant = $1 AND board = $2`, t, b))[0].c,
     } };
   });
 
@@ -450,7 +453,13 @@ describe.skipIf(!url)("postgres store", () => {
       await store.putCheckpoint(T, B, { seq: 1, id: "c:1", by: "u1", at: 1 }, l.epoch);
       await store.release(T, B, "h-a", l.epoch);
       expect((await store.getCheckpoint(T, B))?.seq).toBe(1);
-      await store.purgeBoard(T, B);                                              // the Trash purge: DELETE on pl_entries, pl_checkpoints(+parts) and pl_leases
+      await store.blobPend(T, B, "c".repeat(40), 60_000);                          // INSERT/UPDATE on pl_blob_pending
+      await store.append(T, B, [entry(3)], 2, l.epoch, { blobRefs: ["d".repeat(40)] });   // INSERT on pl_blob_refs, DELETE on pl_blob_pending and pl_blob_condemned
+      await store.purgeBoard(T, B);                                              // the Trash purge: DELETE on pl_entries, pl_checkpoints(+parts), pl_leases and the blob tables; INSERT into pl_blob_condemned
+      expect((await store.blobCondemned({ graceMs: 0, limit: 10 })).map(r => r.sha1)).toEqual(["c".repeat(40), "d".repeat(40)]);
+      expect(await store.blobClaim(T, "c".repeat(40), { graceMs: 0, claimMs: 60_000 })).toBe(true);   // UPDATE on pl_blob_condemned
+      expect(await store.blobReaped(T, "c".repeat(40))).toBe(true);
+      expect(await store.blobPrune(10)).toBe(0);
       expect(await store.read(T, B, 1, 10)).toEqual([]);
       expect(await store.getCheckpoint(T, B)).toBe(null);
       await store.close();
@@ -466,21 +475,61 @@ describe.skipIf(!url)("postgres store", () => {
     }
   });
 
-  test("upgrade: a schema made before checkpoint parts gets pl_checkpoint_parts on the owner's next start and still reads its one-row checkpoints", async () => {
+  test("#92 no backfill: a blob table with other columns than this version's is an old-format store, refused with code old-format and left as found", async () => {
+    for (const table of ["pl_blob_refs", "pl_blob_pending", "pl_blob_condemned"]) {
+      const schema = schemaName();
+      try {
+        await (await postgresStore({ sql: client(), schema })).close();
+        await client().unsafe(`DROP TABLE "${schema}".${table}`);
+        await client().unsafe(`CREATE TABLE "${schema}".${table} (tenant TEXT NOT NULL, sha1 TEXT NOT NULL)`);
+        const err = await postgresStore({ sql: client(), schema }).then(() => null, e => e);
+        expect(err?.code).toBe("old-format");
+        expect(err.message).toContain(table);
+        expect((await client().unsafe(`SELECT count(*)::int AS c FROM pg_attribute WHERE attrelid = $1::regclass AND attnum > 0`, [`"${schema}".${table}`]))[0].c).toBe(2);
+      } finally { await drop(schema); }
+    }
+  });
+
+  test("start-up probe (#92): a role short of one right on a blob table is refused with code denied, naming the table and the right", async () => {
+    const [{ ok }] = await client().unsafe("SELECT rolsuper OR rolcreaterole AS ok FROM pg_roles WHERE rolname = current_user");
+    if (!ok) { console.warn("pg-store: skipping the blob grants probe (the DATABASE_URL role can't create roles)"); return; }
+    const schema = schemaName(), role = `pl_test_blobprobe_${process.pid}_${++n}`, pass = "pl-test-" + Date.now().toString(36);
+    let app = null;
+    try {
+      await (await postgresStore({ sql: client(), schema })).close();
+      await client().unsafe(`CREATE ROLE "${role}" LOGIN PASSWORD '${pass}'`);
+      await client().unsafe(`GRANT USAGE ON SCHEMA "${schema}" TO "${role}"`);
+      await client().unsafe(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO "${role}"`);
+      const u = new URL(url); u.username = role; u.password = pass;
+      app = new SQL({ url: u.toString(), max: 1 });
+      for (const [table, right] of [["pl_blob_refs", "DELETE"], ["pl_blob_refs", "INSERT"], ["pl_blob_pending", "UPDATE"], ["pl_blob_pending", "DELETE"], ["pl_blob_condemned", "UPDATE"], ["pl_blob_condemned", "DELETE"], ["pl_blob_condemned", "INSERT"]]) {
+        await client().unsafe(`REVOKE ${right} ON "${schema}".${table} FROM "${role}"`);
+        const err = await postgresStore({ sql: app, schema }).then(() => null, e => e);
+        expect(err?.code).toBe("denied");
+        expect(err.message).toContain(`lacks ${right} on ${table})`);
+        await client().unsafe(`GRANT ${right} ON "${schema}".${table} TO "${role}"`);
+      }
+      await (await postgresStore({ sql: app, schema })).close?.();                  // every right: it starts
+    } finally { if (app) await app.close(); await drop(schema); await client().unsafe(`DROP ROLE IF EXISTS "${role}"`); }
+  });
+
+  test("#92 no back-compat: a pre-#92 schema (the Store's older tables, with entries in it) is an old-format store: refused, nothing created; its indexes exist on a fresh one", async () => {
     const schema = schemaName();
     try {
-      await (await postgresStore({ sql: client(), schema })).close?.();
-      await client().unsafe(`DROP TABLE "${schema}".pl_checkpoint_parts`);                  // the schema as the old release left it
-      const cp = { seq: 4, pad: "😀".repeat(500) };
-      await client().unsafe(`INSERT INTO "${schema}".pl_checkpoints (tenant, board, seq, data) VALUES ($1, $2, 4, $3)`, [T, B, JSON.stringify(cp)]);
-      const store = await postgresStore({ sql: client(), schema, partChars: 300 });        // migrate creates the missing table
-      expect(await store.getCheckpoint(T, B)).toEqual(cp);
-      const e = await store.openEpoch(T, B);
-      await store.putCheckpoint(T, B, { ...cp, seq: 5 }, e);
-      expect((await store.getCheckpoint(T, B)).seq).toBe(5);
-      expect((await client().unsafe(`SELECT count(*)::int AS c FROM "${schema}".pl_checkpoint_parts`))[0].c).toBeGreaterThan(1);
-      await store.close();
+      await (await postgresStore({ sql: client(), schema })).close();
+      for (const t of ["pl_blob_refs", "pl_blob_pending", "pl_blob_condemned"]) await client().unsafe(`DROP TABLE "${schema}".${t}`);
+      await client().unsafe(`INSERT INTO "${schema}".pl_entries (tenant, board, seq, data) VALUES ($1, $2, 1, $3)`, [T, B, JSON.stringify(entry(1))]);
+      const err = await postgresStore({ sql: client(), schema }).then(() => null, e => e);
+      expect(err?.code).toBe("old-format");
+      expect(err.message).toMatch(/pl_blob_refs/);
+      expect((await client().unsafe(`SELECT count(*)::int AS c FROM pg_tables WHERE schemaname = $1 AND tablename LIKE 'pl_blob_%'`, [schema]))[0].c).toBe(0);   // nothing was added
     } finally { await drop(schema); }
+    const fresh = schemaName();
+    try {
+      await (await postgresStore({ sql: client(), schema: fresh })).close();
+      const names = (await client().unsafe(`SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND indexname LIKE 'pl_blob_%' AND indexname NOT LIKE '%pkey' ORDER BY indexname`, [fresh])).map(r => r.indexname);
+      expect(names).toEqual(["pl_blob_pending_board", "pl_blob_pending_until", "pl_blob_refs_board"]);
+    } finally { await drop(fresh); }
   });
 
   // ---- The checkpoint lock (a header's commit vs a sweep's delete) ----

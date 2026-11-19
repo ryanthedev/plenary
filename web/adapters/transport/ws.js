@@ -414,7 +414,9 @@ function blobClient({ fetch: fetchFn, clock, base }) {
     },
     put(file) {
       if (!SHA1.test(file?.id) || typeof file.dataURL !== "string") return;
-      const k = `PUT:${file.id}`, old = tasks.get(k);
+      const k = `PUT:${file.id}`;
+      if (tasks.get(k)?.state === "done") tasks.delete(k);   // the session offers a picture again only when its last put is old (the server may have deleted it since): a finished upload is no reason to skip it
+      const old = tasks.get(k);
       if (old) { if (old.state === "rest") { Object.assign(old, { file, tries: 0, limits: 0, busies: 0, toldLimit: false, toldGaveUp: false, toldBusy: false, until: 0 }); enqueue(old); } return; }   // the same picture again: only a rested (failed) upload is tried again
       const t = { ...fresh("PUT", file.id), file };
       tasks.set(k, t); enqueue(t);

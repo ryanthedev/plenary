@@ -113,4 +113,71 @@ export function blobsContract(label, makeBlobs, { skip = false } = {}) {
     expect(await blobs.usage(tb)).toBe(77);
     for (const bad of ["..", "a/b", "", null]) expect(await code(blobs.usage(bad))).toBe("bad-id");
   });
+
+  t(`${label}: delete removes the blob and its bytes from usage, is idempotent, and touches nothing else (another hash, another tenant)`, async () => {
+    const blobs = await makeBlobs(), ta = freshTenant(), tb = freshTenant();
+    const a = fakePng(200, 21), b = fakePng(300, 22), ha = sha1(a), hb = sha1(b);
+    await blobs.put(ta, ha, a); await blobs.put(ta, hb, b); await blobs.put(tb, ha, a);
+    expect(await blobs.delete(ta, ha)).toBeUndefined();
+    expect(await blobs.get(ta, ha)).toBe(null);
+    expect(await blobs.usage(ta)).toBe(300);
+    expect(await blobs.get(ta, hb)).toEqual(b);                 // the neighbour hash
+    expect(await blobs.get(tb, ha)).toEqual(a);                 // the same hash in another tenant
+    await blobs.delete(ta, ha);                                 // again: nothing there is not an error
+    await blobs.delete(ta, sha1(fakePng(50, 23)));              // never stored
+    expect(await blobs.put(ta, ha, a)).toBe(true);              // and it can be stored again
+    expect(await blobs.get(ta, ha)).toEqual(a);
+  });
+
+  t(`${label}: delete checks its ids like put and get`, async () => {
+    const blobs = await makeBlobs(), ta = freshTenant(), h = sha1(fakePng(80, 24));
+    for (const bad of ["..", "../x", "a/b", "", null, "T-A"]) expect(await code(blobs.delete(bad, h))).toBe("bad-id");
+    for (const s of ["../outside", "..", "", h.toUpperCase(), h.slice(1), `${ta}/${h}`, null]) expect(await code(blobs.delete(ta, s))).toBe("bad-id");
+  });
+
+  t(`${label}: quarantine takes the blob out of reach and out of usage without destroying it; restore puts it back byte for byte; both are idempotent`, async () => {
+    const blobs = await makeBlobs(), ta = freshTenant(), tb = freshTenant();
+    const a = fakePng(200, 41), b = fakePng(300, 42), ha = sha1(a), hb = sha1(b);
+    await blobs.put(ta, ha, a); await blobs.put(ta, hb, b); await blobs.put(tb, ha, a);
+    await blobs.quarantine(ta, ha);
+    expect(await blobs.get(ta, ha)).toBe(null);
+    expect(await blobs.usage(ta)).toBe(500);                   // still counted: the bytes are kept (and a usage read mid-reap must not miss them)
+    expect(await blobs.usage(tb)).toBe(200);                   // another tenant's folder is its own
+    expect(await blobs.get(ta, hb)).toEqual(b); expect(await blobs.get(tb, ha)).toEqual(a);   // neighbours untouched
+    await blobs.quarantine(ta, ha);                            // again: nothing live to move is not an error
+    await blobs.quarantine(ta, sha1(fakePng(50, 43)));         // never stored
+    expect(await blobs.usage(ta)).toBe(500);
+    await blobs.delete(ta, ha); await blobs.put(ta, ha, a); await blobs.quarantine(ta, ha);   // gone for good, then stored and quarantined afresh
+    await blobs.restore(ta, ha);
+    expect(await blobs.get(ta, ha)).toEqual(a);
+    expect(await blobs.usage(ta)).toBe(500);
+    await blobs.restore(ta, ha);                               // again: nothing quarantined
+    await blobs.restore(ta, sha1(fakePng(50, 44)));
+    expect(await blobs.get(ta, ha)).toEqual(a);
+  });
+
+  t(`${label}: a blob stored again while quarantined is the live one: restore keeps it and drops the quarantined copy; delete removes both for good`, async () => {
+    const blobs = await makeBlobs(), ta = freshTenant();
+    const a = fakePng(210, 45), ha = sha1(a);
+    await blobs.put(ta, ha, a);
+    await blobs.quarantine(ta, ha);
+    expect(await blobs.put(ta, ha, a)).toBe(true);             // stored afresh: the quarantine is not "had it"
+    await blobs.restore(ta, ha);
+    expect(await blobs.get(ta, ha)).toEqual(a);
+    expect(await blobs.usage(ta)).toBe(210);                   // one copy
+    await blobs.restore(ta, ha);                               // the quarantined copy is gone: still one
+    await blobs.quarantine(ta, ha);
+    await blobs.delete(ta, ha);                                // for good, the quarantined copy too
+    await blobs.restore(ta, ha);
+    expect(await blobs.get(ta, ha)).toBe(null);
+    expect(await blobs.usage(ta)).toBe(0);
+  });
+
+  t(`${label}: quarantine and restore check their ids like put and get`, async () => {
+    const blobs = await makeBlobs(), ta = freshTenant(), h = sha1(fakePng(80, 46));
+    for (const f of ["quarantine", "restore"]) {
+      for (const bad of ["..", "a/b", "", null, "T-A", ".quarantine"]) expect(await code(blobs[f](bad, h))).toBe("bad-id");
+      for (const x of ["../outside", "", h.toUpperCase(), `${ta}/${h}`, null]) expect(await code(blobs[f](ta, x))).toBe("bad-id");
+    }
+  });
 }

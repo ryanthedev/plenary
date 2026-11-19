@@ -53,6 +53,7 @@ const COMPOSITION_ROOTS = [
   "scripts/fanout-bench.js",      // platform: reports what a live frame costs a gateway for N viewers (imports whatever checkout --root names; #66)
   "scripts/clean.js",             // platform: safe cleanup CLI for test temp dirs, stopped rigs and scratch copies; shells out to lsof and the rig CLI
   "scripts/test-cluster.js",      // test harness: starts and tears down an isolated local services rig
+  "scripts/test-compose.js",      // test harness (#71): three-node cluster test on a container runtime (`bun run test:compose`); never part of `bun test`
   "scripts/test-cluster-files.js", // test harness data: the gated test files test-cluster.js runs, also imported by its guard
   "scripts/load/run.js", "scripts/load/worker.js", "scripts/load/tokens.js", "scripts/load/client.js", "scripts/load/server.js",
   "scripts/load/stats.js",        // platform (p8-load): load client; run.js and worker.js are entry points, the rest their modules

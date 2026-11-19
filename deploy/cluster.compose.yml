@@ -1,4 +1,4 @@
-# Plenary cluster stack, phase-4 shape (not yet run as containers): Postgres, NATS, S3-compatible blobs, 3 app nodes and a
+# Plenary cluster stack: Postgres, NATS, S3-compatible blobs, 3 app nodes and a
 # load balancer. Run from the repo root:
 #   docker compose -f deploy/cluster.compose.yml up --build
 # For local load tests and the takeover check without containers, use the native rig instead (deploy/cluster/RIG.md,
@@ -13,11 +13,10 @@
 # blobs in the MinIO `blobs` service below through S3_ENDPOINT, S3_BUCKET, S3_REGION, S3_ACCESS_KEY_ID and
 # S3_SECRET_ACCESS_KEY (a cluster node with no S3_ENDPOINT refuses to start).
 #
-# Roles (PLENARY_ROLES, comma list of `gateway` and `host`, default `gateway,host`), the same split as the rig's default:
-#   app-1  gateway    app-2  gateway    app-3  host
-# The LB routes only to the gateways. For the takeover check ("kill a board's host, another takes over") add a second
-# host: copy app-3 as app-4 with PLENARY_NODE_ID: app-4 (the rig: --hosts 2). This file has not been run as containers
-# yet (header); the native rig has run this split with the same env (deploy/cluster/RIG.md).
+# Roles (PLENARY_ROLES, comma list of `gateway` and `host`, default `gateway,host`): all three nodes are
+# `gateway,host`, set explicitly, so any node can take over a board whose host died (lease + takeover; the failover check
+# is `bun run test:compose`, deploy/README.md). The LB spreads client sockets over all three. To split the roles instead
+# (gateways only behind the LB, hosts behind none), see the native rig's --hosts option (deploy/cluster/RIG.md).
 #
 # A separate file (not Compose profiles in compose.yml) so this stack has its own project name, port and volumes and
 # never touches the single-node `plenary` service. Also (expected, not tested): Compose interpolates a whole file
@@ -69,9 +68,9 @@ x-app-env: &app-env
   # corrupt it). Nothing here survives `down`; the cluster's durable state will be Postgres and the blob store.
   PLENARY_DATA_DIR: /data
   LOG_LEVEL: ${LOG_LEVEL:-info}
-  # Local use only. Each gateway node (app-1, app-2; not the host-only app-3) creates its own dev board on its first
+  # Local use only. Each gateway node (every node has the gateway role) creates its own dev board on its first
   # start and keeps that id in its own /data. The registry is the shared Postgres, so every node knows every board, but
-  # the two gateways' dev boards are two different boards.
+  # the three nodes' dev boards are three different boards.
   PLENARY_DEV_TOKENS: ${PLENARY_DEV_TOKENS:-}
   # Open sockets one user may hold (main.js default 64). A load test sharing a few dev tokens must raise it.
   PLENARY_MAX_CONNS_PER_USER: ${PLENARY_MAX_CONNS_PER_USER:-64}
@@ -171,22 +170,21 @@ services:
       <<: *app-env
       # Unique per node and stable across its restarts: a fixed literal per service.
       PLENARY_NODE_ID: app-1
-      PLENARY_ROLES: gateway
+      PLENARY_ROLES: gateway,host
 
   app-2:
     <<: *app
     environment:
       <<: *app-env
       PLENARY_NODE_ID: app-2
-      PLENARY_ROLES: gateway
+      PLENARY_ROLES: gateway,host
 
   app-3:
     <<: *app
     environment:
       <<: *app-env
       PLENARY_NODE_ID: app-3
-      # Host only: not behind the LB. Still serves /health for the Compose healthcheck (engine: keep that).
-      PLENARY_ROLES: host
+      PLENARY_ROLES: gateway,host
 
   lb:
     image: caddy:2.11.9-alpine
@@ -195,13 +193,15 @@ services:
       - "127.0.0.1:${PLENARY_LB_PORT:-8090}:8080"
     volumes:
       - ./cluster/Caddyfile:/etc/caddy/Caddyfile:ro
-    # Waits for the gateway nodes only; app-3 is host-only and never receives client traffic.
+    # Waits for the three nodes.
     depends_on:
       app-1:
         condition: service_healthy
       app-2:
         condition: service_healthy
-    # Healthy while at least one gateway node answers /health through Caddy.
+      app-3:
+        condition: service_healthy
+    # Healthy while at least one node answers /health through Caddy.
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
       interval: 5s

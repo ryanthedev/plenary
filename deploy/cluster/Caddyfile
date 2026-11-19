@@ -8,11 +8,11 @@
 }
 
 :8080 {
-	# Every path goes to the gateways: /ws, /health, the HTTP API (/boards, /auth, /links, ...) and the web app, all
+	# Every path goes to the nodes: /ws, /health, the HTTP API (/boards, /auth, /links, ...) and the web app, all
 	# served by server/main.js. Caddy's reverse_proxy passes WebSocket upgrades as is.
-	# Upstreams are the nodes with the `gateway` role only (PLENARY_ROLES in cluster.compose.yml): app-1 and app-2.
-	# app-3 is host-only and must never get client traffic.
-	reverse_proxy app-1:8080 app-2:8080 {
+	# Upstreams are all three nodes: each is `gateway,host` (PLENARY_ROLES in cluster.compose.yml), so any can hold
+	# sockets and any can take over a board.
+	reverse_proxy app-1:8080 app-2:8080 app-3:8080 {
 		# A WebSocket stays on the node it first reached; new connections are spread round robin.
 		lb_policy round_robin
 		# Retry another node for a request that could not connect (a killed node), for up to 5 s.

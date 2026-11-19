@@ -10,6 +10,7 @@
     "test:full": "bun test",
     "test:cluster": "bun --no-env-file scripts/test-cluster.js",
     "clean": "bun scripts/clean.js",
+    "test:compose": "bun --no-env-file scripts/test-compose.js",
     "rig": "bun --no-env-file scripts/cluster-rig.js"
   },
   "dependencies": {

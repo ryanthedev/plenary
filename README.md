@@ -112,6 +112,12 @@ bun test
 - **Hunting a flake:** run the file in a loop with `bun test <file> --reporter=junit --reporter-outfile=<scratch dir>/j.xml`; the XML names every failing test and each test's time, which the plain output hides.
 - **Testing: no bound that guesses an OS or load.** Test what the code guarantees (a byte cap, an ordering, an
   event) and wait on events, not sleeps. Kernel read sizes, pipe chunks and lsof runtimes vary with OS and load.
+- **`bun run test:compose`** (#71): the three-node cluster test on a container runtime. Not part of `bun test` or
+  `bun run test:cluster`. Builds the image, starts Postgres, NATS, MinIO and three nodes as Compose project
+  `plenary-c3-<pid>-<nonce>`, checks sequencing, viewer fan-out (and a viewer's op refused), five SIGKILL cases (the board's host, the host restarted
+  at once, the restarted host winning the lease back, a host with no client, a plain gateway; acked ops all survive, lease epoch rises) and a node rejoin, then removes everything and verifies nothing is left. About 40 s warm. Uses docker, else
+  podman (`CONTAINER_CLI` overrides). Without a runtime it prints a loud SKIPPED banner and exits 0 (`--require`
+  exits 1). Details: `deploy/README.md` "Cluster test on containers".
 - **Plain JS + JSDoc, no build step.** `packages/protocol` must also load in runtimes without browser or Node
   globals, so it imports only two core files and its own. `test/purity.test.js` checks this statically.
 - **Protocol changes** start in `PROTOCOL.md`, then code, then a convergence test.

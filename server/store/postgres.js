@@ -47,6 +47,7 @@
 
 import { SQL } from "bun";
 import { needId, PortError, mintClusterId } from "../ids.js";
+import { encodeSliced } from "../encode/sliced.js";
 import { needSchema, migrate } from "../pg/schema.js";
 
 const MAX_READ = 10_000;
@@ -257,7 +258,7 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
     async putCheckpoint(tenant, board, cp, epoch) {
       ready(tenant, board); needWriteEpoch(epoch);
       if (!cp || typeof cp !== "object" || !Number.isSafeInteger(cp.seq) || cp.seq < 0) throw new PortError("bad-entry", "a checkpoint needs a seq");
-      const data = JSON.stringify(cp);
+      const data = await encodeSliced(cp);   // in slices: the event loop breathes between them
       await write(async tx => {
         await fence(tx, tenant, board, epoch);
         await tx.unsafe(`INSERT INTO ${C} (tenant, board, seq, data) VALUES ($1, $2, $3, $4)

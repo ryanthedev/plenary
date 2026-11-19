@@ -25,26 +25,30 @@ export class Records {
     this.comments = new Map();   // comment id → { thread, comment }; a thread's first comment has the thread's id
     this.chars = 0;
     this.rev = (this.rev ?? 0) + 1;
-    for (const raw of data?.threads ?? []) {
-      const t = { id: raw.id, anchor: copy(raw.anchor), by: raw.by, name: raw.name ?? null, at: raw.at, ...(raw.resolved ? { resolved: copy(raw.resolved) } : {}), comments: [] };
-      this.threads.set(t.id, t); this.chars += threadChars(t);
-      for (const rc of raw.comments ?? []) {
-        const c = { id: rc.id, by: rc.by, name: rc.name ?? null, at: rc.at, text: rc.text, ...(rc.edited !== undefined ? { edited: rc.edited } : {}), ...(rc.deleted !== undefined ? { deleted: rc.deleted } : {}), reactions: new Map() };
-        for (const [emoji, users] of Object.entries(rc.reactions ?? {})) { c.reactions.set(emoji, [...users]); for (const u of users) this.chars += reactionChars(emoji, u); }
-        t.comments.push(c); this.comments.set(c.id, { thread: t, comment: c }); this.chars += COMMENT_CHARS + c.text.length;
-      }
+    for (const raw of data?.threads ?? []) this.addRaw(raw);
+  }
+
+  /** Load one thread in the snapshot shape (`load` is this per thread; the incremental fold calls it a slice at a time). */
+  addRaw(raw) {
+    const t = { id: raw.id, anchor: copy(raw.anchor), by: raw.by, name: raw.name ?? null, at: raw.at, ...(raw.resolved ? { resolved: copy(raw.resolved) } : {}), comments: [] };
+    this.threads.set(t.id, t); this.chars += threadChars(t);
+    for (const rc of raw.comments ?? []) {
+      const c = { id: rc.id, by: rc.by, name: rc.name ?? null, at: rc.at, text: rc.text, ...(rc.edited !== undefined ? { edited: rc.edited } : {}), ...(rc.deleted !== undefined ? { deleted: rc.deleted } : {}), reactions: new Map() };
+      for (const [emoji, users] of Object.entries(rc.reactions ?? {})) { c.reactions.set(emoji, [...users]); for (const u of users) this.chars += reactionChars(emoji, u); }
+      t.comments.push(c); this.comments.set(c.id, { thread: t, comment: c }); this.chars += COMMENT_CHARS + c.text.length;
     }
   }
 
   /** The snapshot shape: plain data, tombstones included. */
-  toJSON() {
-    const threads = [];
-    for (const t of this.threads.values()) threads.push({
+  toJSON() { return { threads: [...this.threads.values()].map(Records.threadJSON) }; }
+
+  /** One thread in the snapshot shape (a copy; the incremental fold calls it a slice of threads at a time). */
+  static threadJSON(t) {
+    return {
       id: t.id, anchor: copy(t.anchor), by: t.by, name: t.name, at: t.at, ...(t.resolved ? { resolved: { ...t.resolved } } : {}),
       // fromEntries defines own keys, so an emoji named like a prototype key stays plain data.
       comments: t.comments.map(c => ({ id: c.id, by: c.by, name: c.name, at: c.at, text: c.text, ...(c.edited !== undefined ? { edited: c.edited } : {}), ...(c.deleted !== undefined ? { deleted: c.deleted } : {}), reactions: Object.fromEntries([...c.reactions].map(([e, us]) => [e, [...us]])) })),
-    });
-    return { threads };
+    };
   }
 
   static hidden(t) { return t.comments[0].deleted !== undefined; }

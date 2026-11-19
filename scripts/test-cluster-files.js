@@ -5,6 +5,7 @@ export const DEFAULT_FILES = [
   "test/server/pg-registry.test.js",
   "test/server/nats-bus.test.js",
   "test/server/room-host-lease.test.js",
+  "test/server/fold-host.test.js",
   "test/server/room-host-proc.test.js",
   "test/server/main-cluster.test.js",
   "test/server/cluster-id.test.js",

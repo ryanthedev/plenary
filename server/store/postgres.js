@@ -50,7 +50,7 @@ import { SQL } from "bun";
 import { needId, PortError, mintClusterId } from "../ids.js";
 import { encodeSliced } from "../encode/sliced.js";
 import { PART_CHARS, splitParts, headerOf, parseHeader, orphanGroups, headerLike } from "../encode/cp-parts.js";
-import { needSchema, migrate, assertColumns } from "../pg/schema.js";
+import { needSchema, migrate, assertShapes } from "../pg/schema.js";
 import { DEFAULT_READ_LIMIT, needBoard, needLeaseEpoch, needTtl, checkAppend, checkRead, fitBytes, checkCheckpoint, checkBeforeSeq } from "./port.js";
 
 /** Postgres SQLSTATE for a unique violation. Bun's PostgresError carries it as `errno`. */
@@ -110,9 +110,8 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
       // A wedged migrator or a hung node holding the schema lock must not block every start-up forever.
       await tx.unsafe(`SET LOCAL lock_timeout = ${Math.max(1, Math.floor(lockTimeoutMs))}`);
       await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-schema:${s}`]);
+      await assertShapes(tx, s, STORE_TABLES);   // the old-format rule (a pl_leases from before the lease columns, any other changed table), before anything is created
       await migrate(tx, s, STORE_TABLES);
-      // Start-up never ALTERs: a pl_leases from before the lease columns is an old-format store, refused (reset it).
-      await assertColumns(tx, s, "pl_leases", ["tenant", "board", "epoch", "holder", "expires_at"]);
       // L3: every privilege the Store's statements use, checked now (a misgrant would otherwise surface at the first
       // fenced write, as a raw 42501). Thrown as Postgres's own 42501, so it is reported like any refusal below.
       const lacking = [];

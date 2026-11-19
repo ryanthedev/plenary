@@ -3,6 +3,7 @@
 import { test, expect, afterAll } from "bun:test";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
+import { rmSync } from "node:fs";
 import { sqliteStore } from "../../server/store/sqlite.js";
 import { storeContract, entry, code } from "./store-contract.js";
 import { tempDir, cleanup } from "./helpers.js";
@@ -58,7 +59,22 @@ test("a file made before the lease (epoch-only leases table) is an old-format st
   expect(err.message).toMatch(/Reset the store/);
   const after = new Database(path, { readonly: true });
   expect(after.query("PRAGMA table_info(leases)").all().map(c => c.name)).toEqual(["tenant", "board", "epoch"]);   // never ALTERed
+  expect(after.query("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(t => t.name)).toEqual(["leases"]);   // no entries/checkpoints/parts were created
+  expect(after.query("PRAGMA journal_mode").get().journal_mode).toBe("delete");                                         // the WAL switch never happened
   after.close();
+  rmSync(path);                                                                                                         // no handle was left open: the file can go
+});
+
+test("the old-format rule is general: a changed column set in any Store table refuses the file; a reopen of a good file does not", async () => {
+  const good = join(tempDir(), "plenary.db"), s = sqliteStore({ path: good }); await s.close();
+  sqliteStore({ path: good }).close();
+  for (const table of ["entries", "checkpoints", "checkpoint_parts"]) {
+    const path = join(tempDir(), "plenary.db"), db = new Database(path);
+    db.run(`CREATE TABLE ${table} (tenant TEXT NOT NULL, board TEXT NOT NULL, seq INTEGER NOT NULL)`);   // `data` missing
+    db.close();
+    let err; try { sqliteStore({ path }); } catch (e) { err = e; }
+    expect([table, err?.code]).toEqual([table, "old-format"]);
+  }
 });
 
 test("a checkpoint stored as one plain JSON row (no header, no parts: what a small checkpoint is) reads, and parts sit beside it", async () => {

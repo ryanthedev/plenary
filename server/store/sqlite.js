@@ -28,6 +28,7 @@
 
 import { Database } from "bun:sqlite";
 import { needId, PortError } from "../ids.js";
+import { assertShapes } from "../sqlite/schema.js";
 import { DEFAULT_READ_LIMIT, needBoard, needLeaseEpoch, needTtl, checkAppend, checkRead, fitBytes, checkCheckpoint, checkBeforeSeq } from "./port.js";
 import { encodeSliced } from "../encode/sliced.js";
 import { PART_CHARS, splitParts, headerOf, parseHeader, orphanGroups, headerLike } from "../encode/cp-parts.js";
@@ -42,35 +43,41 @@ const DROP_STEP = 1;
  *   `partChars`: the most chars in one checkpoint part (default 1 Mi). `onPart`: test hook, awaited before each part
  *   ("part:<n>"), before the header ("header") and before each orphan group's delete ("sweep"); a throw aborts the write there (a sweep never fails a write). `onSkip`: called once for each checkpoint getCheckpoint skips because its parts are missing (the server logs it).
  */
-export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3, now = Date.now,
-  partChars = PART_CHARS, onPart, onSkip }) {
-  const db = new Database(path, { create: true, strict: true });
-  let open = true;
-  db.run(`PRAGMA busy_timeout=${Math.max(0, Math.floor(busyTimeoutMs))}`);
-  db.run("PRAGMA journal_mode=WAL");
-  db.run("PRAGMA synchronous=FULL");
-  db.run(`PRAGMA fullfsync=${fullfsync ? "ON" : "OFF"}`);
-  db.run(`PRAGMA checkpoint_fullfsync=${fullfsync ? "ON" : "OFF"}`);
-  db.run(`CREATE TABLE IF NOT EXISTS entries (
+export function sqliteStore(opts) {
+  const db = new Database(opts.path, { create: true, strict: true });
+  try { return build(db, opts); }
+  catch (err) { try { db.close(); } catch {} throw err; }   // a failed start-up (a busy file, an old-format file) never leaks the handle
+}
+
+/** The Store's tables. Run on the file (CREATE IF NOT EXISTS) and on a scratch database, whose shapes the file's must match. */
+const createTables = d => {
+  d.run(`CREATE TABLE IF NOT EXISTS entries (
     tenant TEXT NOT NULL, board TEXT NOT NULL, seq INTEGER NOT NULL, data TEXT NOT NULL,
     PRIMARY KEY (tenant, board, seq)) WITHOUT ROWID`);
-  db.run(`CREATE TABLE IF NOT EXISTS checkpoints (
+  d.run(`CREATE TABLE IF NOT EXISTS checkpoints (
     tenant TEXT NOT NULL, board TEXT NOT NULL, seq INTEGER NOT NULL, data TEXT NOT NULL,
     PRIMARY KEY (tenant, board, seq)) WITHOUT ROWID`);
   // Parts of a checkpoint too big for one row (server/encode/cp-parts.js). `wid` = one write attempt; a part is
   // readable only when a header row in `checkpoints` names its (seq, wid).
-  db.run(`CREATE TABLE IF NOT EXISTS checkpoint_parts (
+  d.run(`CREATE TABLE IF NOT EXISTS checkpoint_parts (
     tenant TEXT NOT NULL, board TEXT NOT NULL, seq INTEGER NOT NULL, wid TEXT NOT NULL, n INTEGER NOT NULL, data TEXT NOT NULL,
     PRIMARY KEY (tenant, board, seq, wid, n))`);   // a rowid table on purpose: the key lives in a narrow index, so counting a write's parts never walks megabytes of row text
-
   // The lease record: holder NULL = nobody holds it (released, or a single-node openEpoch, which takes no lease).
-  db.run(`CREATE TABLE IF NOT EXISTS leases (
+  d.run(`CREATE TABLE IF NOT EXISTS leases (
     tenant TEXT NOT NULL, board TEXT NOT NULL, epoch INTEGER NOT NULL, holder TEXT, expires_at INTEGER,
     PRIMARY KEY (tenant, board)) WITHOUT ROWID`);
-  // Never ALTERed: a leases table from before the lease columns is an old-format store, refused (reset it).
-  const leaseCols = db.query("PRAGMA table_info(leases)").all().map(c => c.name).sort().join(",");
-  if (leaseCols !== "board,epoch,expires_at,holder,tenant")
-    throw new PortError("old-format", `sqlite store: table leases has columns (${leaseCols}) but this version needs (board,epoch,expires_at,holder,tenant): the file is from an older version. Reset the store (delete the file)`);
+};
+
+function build(db, { fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3, now = Date.now, partChars = PART_CHARS, onPart, onSkip }) {
+  let open = true;
+  db.run(`PRAGMA busy_timeout=${Math.max(0, Math.floor(busyTimeoutMs))}`);
+  // Before any write to the file (no WAL switch, no CREATE): an old-format file is refused as it was found.
+  assertShapes(db, createTables, "sqlite store");
+  db.run("PRAGMA journal_mode=WAL");
+  db.run("PRAGMA synchronous=FULL");
+  db.run(`PRAGMA fullfsync=${fullfsync ? "ON" : "OFF"}`);
+  db.run(`PRAGMA checkpoint_fullfsync=${fullfsync ? "ON" : "OFF"}`);
+  createTables(db);
 
   const qOpenEpoch = db.query(`INSERT INTO leases (tenant, board, epoch) VALUES (?, ?, 1)
     ON CONFLICT (tenant, board) DO UPDATE SET epoch = epoch + 1, holder = NULL, expires_at = NULL RETURNING epoch`);
@@ -185,7 +192,7 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
       let n = checkRead(fromSeq, limit, maxBytes);
       if (maxBytes !== undefined) {
         // Sizes first (no row text is read), then only as many rows as fit.
-        const fit = fitBytes([...qSizes.iterate(tenant, board, fromSeq, n)].map(r => r.n), maxBytes);
+        const fit = fitBytes((function* () { for (const r of qSizes.iterate(tenant, board, fromSeq, n)) yield r.n; })(), maxBytes);
         if (!fit) return Object.assign([], { bytes: [] });
         n = fit;
       }

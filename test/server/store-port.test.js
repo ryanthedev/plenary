@@ -35,3 +35,11 @@ test("checkCheckpoint, needTtl, needLeaseEpoch", () => {
 });
 
 test("STORE_METHODS names the twelve port methods", () => expect(STORE_METHODS.length).toBe(12));
+
+import { ddlColumns } from "../../server/pg/schema.js";
+test("ddlColumns: the columns of a Postgres DDL string, minus table constraints, with nested parentheses", () => {
+  expect(ddlColumns("tenant TEXT NOT NULL, board TEXT NOT NULL, seq BIGINT NOT NULL, PRIMARY KEY (tenant, board, seq)")).toEqual(["tenant", "board", "seq"]);
+  expect(ddlColumns("id TEXT NOT NULL, singleton BOOLEAN NOT NULL DEFAULT true PRIMARY KEY CHECK (singleton)")).toEqual(["id", "singleton"]);
+  expect(ddlColumns(`tenant TEXT NOT NULL REFERENCES "s".reg_tenants(id), grp TEXT REFERENCES "s".reg_groups(id), UNIQUE (tenant, owner_user)`)).toEqual(["tenant", "grp"]);
+  expect(ddlColumns("n BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE")).toEqual(["n", "id"]);
+});

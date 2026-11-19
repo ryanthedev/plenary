@@ -120,7 +120,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
   //   A feed that has heard one looks only on a heartbeat or poll, and only when the largest `cp` heard is above its
   //   base and above the `cp` of its last completed look: one read per checkpoint, none on an idle board or while
   //   the room hasn't folded. A look that throws (a Store error) is not completed, so the next heartbeat tries again.
-  // - A feed whose last heartbeat had no `cp` (a host that has not announced one yet), or that has had none (only Store polls), looks once its tail reaches
+  // - A feed that has heard no `cp` yet (it joined between heartbeats, or only Store polls reached it) looks once its tail reaches
   //   `rebaseEvery` entries or `rebaseBytes` chars since the last look, and after a miss (the room writes its
   //   checkpoint just after publishing the entries that trigger it) on at most MISS_RETRIES later heartbeats or
   //   polls; a look that throws keeps at least one retry.
@@ -176,7 +176,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
       if (m.to > self.seq) await repair(m.to);   // still short (the repair raced the room): the Store has it
     } else if (Number.isSafeInteger(m?.seq) && m.seq > self.seq) await repair(m.seq);
     const beat = !Array.isArray(m?.items);
-    if (beat) self.cpHeard = Number.isSafeInteger(m?.cp) && m.cp >= 0 ? Math.max(self.cpHeard ?? 0, m.cp) : null;   // no cp: a host from before it (heartbeats and `released` carry one)
+    if (beat && Number.isSafeInteger(m?.cp) && m.cp >= 0) self.cpHeard = Math.max(self.cpHeard ?? 0, m.cp);   // every heartbeat and `released` carries `cp`
     await maybeRebase(beat);
   }
 

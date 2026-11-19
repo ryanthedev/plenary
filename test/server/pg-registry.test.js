@@ -603,7 +603,7 @@ describe.skipIf(!url)("postgres registry", () => {
     try {
       await client().unsafe(`DROP TABLE "${schema}".reg_idempotency`);
       await client().unsafe(`CREATE TABLE "${schema}".reg_idempotency (member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, claim TEXT NOT NULL, result TEXT, at BIGINT NOT NULL, PRIMARY KEY (member, k))`);
-      await expect(postgresRegistry({ url, schema, max: 2 })).rejects.toThrow(/reg_idempotency.*older version.*DROP TABLE/);
+      await expect(postgresRegistry({ url, schema, max: 2 })).rejects.toThrow(/reg_idempotency.*older version.*Reset the store/);
     } finally { await drop(schema); }
   }, 30_000);
 
@@ -613,7 +613,23 @@ describe.skipIf(!url)("postgres registry", () => {
     await r.close();
     try {
       await client().unsafe(`ALTER TABLE "${schema}".reg_access_requests DROP COLUMN closed_at`);
-      await expect(postgresRegistry({ url, schema, max: 2 })).rejects.toThrow(/reg_access_requests.*older version.*DROP TABLE/);
+      await expect(postgresRegistry({ url, schema, max: 2 })).rejects.toThrow(/reg_access_requests.*older version.*Reset the store/);
+    } finally { await drop(schema); }
+  }, 30_000);
+
+  test("the old-format rule is general: a column missing from ANY table refuses the schema (and a reopen of a good one, and the runtime role, do not false-fire)", async () => {
+    const schema = schemaName();
+    try {
+      await (await postgresRegistry({ url, schema, max: 2 })).close();
+      await (await postgresRegistry({ url, schema, max: 2 })).close();                       // a reopen: nothing refused
+      for (const [table, col] of [["reg_teams", "created_at"], ["reg_members", "email"], ["reg_scope_grants", "role"]]) {
+        await client().unsafe(`ALTER TABLE "${schema}".${table} DROP COLUMN ${col}`);
+        const err = await postgresRegistry({ url, schema, max: 2 }).then(() => null, e => e);
+        expect([table, err?.code]).toEqual([table, "old-format"]);
+        expect(err.message).toContain(table);
+        expect(err.message).toContain(`drop the schema "${schema}"`);                      // never advises dropping one table
+        await client().unsafe(`ALTER TABLE "${schema}".${table} ADD COLUMN ${col} TEXT`);   // (the names match again; the types no longer matter to the rule)
+      }
     } finally { await drop(schema); }
   }, 30_000);
 

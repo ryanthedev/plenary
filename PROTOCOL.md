@@ -949,7 +949,7 @@ server/main.js and given to `tenancy` and `roleCache`), so no one's access chang
 creator may pick none). A new board in a Space has `memberRole` null, so it **inherits** the Space; a board made without
 a Space keeps today's `memberRole` default (`viewer`).
 
-**No migration.** Plenary has no data to carry over: a store from before the organization (a `reg_boards` with no `reg_spaces`, or a table whose columns differ from the current ones) is **refused at start-up** with code `old-format` ("Reset the store"); it is never read silently and never ALTERed. Unfiled boards (`space` null: the dev board, a board a script made without a Space) are a state, not a rule: they show under "Other boards" and add no source of access.
+**No migration.** Plenary has no data to carry over: a store from before the organization (a `reg_boards` with no `reg_spaces`), or in which ANY table's columns differ from its current DDL (one helper per engine checks every table: `server/sqlite/schema.js`, `server/pg/schema.js`; the expected columns are the adapter's own CREATE statements), is **refused at start-up** with code `old-format` ("Reset the store"); it is never read silently and never ALTERed. The advice is always to reset the whole store (SQLite: delete the file; Postgres: drop the schema), never one table: the Store's lease table holds every board's epoch. Unfiled boards (`space` null: the dev board, a board a script made without a Space) are a state, not a rule: they show under "Other boards" and add no source of access.
 
 **Freshness.** The resolver reads live; `.grants` (§ Bus) is per board. A change to anything the resolver reads above a
 board (a scoped grant on a Space, Group or the Unit; a Team's grants or membership; a Space's or Group's general access or
@@ -1029,7 +1029,7 @@ person COULD open: general access set, their personal space, a grant to them or 
 
 **Where Recent and Starred live.** Two Registry tables, `reg_recents (member, board, opened_at)` and `reg_stars (member, board, at)`, keyed `(member, board)` and indexed `(member, time DESC, board DESC)`.
 Not a separate port: they are per-user rows over the Registry's own board ids with the same durability, and they must be read with the access check. They hold no board data, so an unreadable
-board's row is inert (the access filter drops it). Additive tables like the Organization ones, with these indexes added for Home's reads: `reg_invites (email)`, `reg_link_uses (member, board)`,
+board's row is inert (the access filter drops it). Home's tables are created like the Organization ones (if missing); its reads use these indexes: `reg_invites (email)`, `reg_link_uses (member, board)`,
 `reg_scope_grants (subject_type, subject, scope_type)`, `reg_team_members (member)`, `reg_grants (member)`, `reg_boards (tenant, id)`.
 
 Pending maintainer decisions kept as-is: a Unit admin gets no board content by being admin (a board they cannot open is not listed); unfiled boards appear under "Other boards" (above).

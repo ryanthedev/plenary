@@ -54,17 +54,36 @@ export async function migrate(tx, schema, tables) {
   if (todo.length) await tx.unsafe(todo.map(name => `CREATE TABLE "${s}".${name} (${tables[name]})`).join(";\n"));
 }
 
+/** The column names a table's DDL (`tables` entries: "col defs, constraints") declares: its depth-0 comma parts, minus table constraints. */
+export function ddlColumns(defs) {
+  const parts = []; let depth = 0, cur = "";
+  for (const ch of defs) {
+    if (ch === "(") depth++; else if (ch === ")") depth--;
+    if (ch === "," && depth === 0) { parts.push(cur); cur = ""; } else cur += ch;
+  }
+  parts.push(cur);
+  return parts.map(p => p.trim()).filter(p => p && !/^(PRIMARY|UNIQUE|CHECK|FOREIGN|CONSTRAINT)\b/i.test(p)).map(p => p.split(/\s+/)[0].replace(/"/g, ""));
+}
+
 /**
- * Refuses to start on a table whose columns are not exactly `columns` (a store from before a schema change: the adapters never ALTER).
- * Without it the server starts and every call that touches the table fails later with an obscure 42703. Call inside the start-up transaction.
- * @param {*} tx @param {string} schema @param {string} table @param {string[]} columns the expected column names
+ * The old-format rule: refuses to start when any table of `tables` ({ name: "column definitions" }, as `migrate` takes them)
+ * already exists with other columns than its DDL declares (the adapters never ALTER). Without it the server starts and every call that touches
+ * the table fails later with an obscure 42703. One catalog query for all tables. Call inside the start-up transaction, BEFORE
+ * `migrate`. The advice is always to reset the whole store: dropping one table is unsafe (the Store's `pl_leases` holds every
+ * board's epoch, which would restart at 1 and un-fence old holders), so no table is ever advised on its own.
+ * @param {*} tx @param {string} schema @param {Record<string, string>} tables
  */
-export async function assertColumns(tx, schema, table, columns) {
+export async function assertShapes(tx, schema, tables) {
   const s = needSchema(schema);
   // pg_catalog, not information_schema.columns: that view shows only columns the role holds a privilege on, so a limited role would see none.
-  const have = (await tx.unsafe(`SELECT a.attname AS column_name FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attname`, [s, table])).map(r => r.column_name);
-  if (have.length && JSON.stringify(have) !== JSON.stringify([...columns].sort()))
-    throw Object.assign(new Error(`postgres: table "${s}".${table} has columns (${have.join(", ")}) but this version needs (${[...columns].sort().join(", ")}): it is from an older version. `
-      + `Reset the store, or have the schema owner run DROP TABLE "${s}".${table} (the runtime role cannot); the next start-up recreates it`), { code: "old-format" });
+  const rows = await tx.unsafe(`SELECT c.relname AS t, string_agg(a.attname, ',' ORDER BY a.attname) AS cols FROM pg_attribute a
+    JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = $1 AND c.relname = ANY($2::text[]) AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped GROUP BY c.relname`, [s, Object.keys(tables)]);
+  const have = new Map(rows.map(r => [r.t, r.cols]));
+  for (const [t, defs] of Object.entries(tables)) {
+    const need = ddlColumns(defs).sort().join(",");
+    if (have.has(t) && have.get(t) !== need)
+      throw Object.assign(new Error(`postgres: table "${s}".${t} has columns (${have.get(t)}) but this version needs (${need}): it is from an older version. `
+        + `Reset the store: drop the schema "${s}" (every table in it, never one), and the next start-up recreates it`), { code: "old-format" });
+  }
 }

@@ -186,6 +186,7 @@ describe.skipIf(!url)("postgres store", () => {
       const err = await postgresStore({ sql: client(), schema }).then(() => null, e => e);
       expect(err?.code).toBe("old-format");
       expect(err.message).toContain("Reset the store");
+      expect(err.message).toContain(`drop the schema "${schema}"`);                  // never advises dropping the one table: the epochs would restart at 1
       expect(await cols()).toEqual(["tenant", "board", "epoch"]);                  // start-up changed nothing
     } finally { await drop(schema); }
   });

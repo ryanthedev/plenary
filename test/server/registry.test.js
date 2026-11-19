@@ -149,14 +149,37 @@ describe("sqlite registry", () => {
     const path = file(), old = new Database(path);
     old.run("CREATE TABLE reg_idempotency (member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, claim TEXT NOT NULL, result TEXT, at INTEGER NOT NULL, PRIMARY KEY (member, k))");
     old.close();
-    expect(() => sqliteRegistry({ path, fullfsync: false })).toThrow(/reg_idempotency.*older version.*drop the table/i);
+    expect(() => sqliteRegistry({ path, fullfsync: false })).toThrow(/reg_idempotency.*older version.*Reset the store/i);
   });
 
   test("a store whose reg_access_requests lacks closed_at refuses to start with a clear error naming the table", () => {
     const path = file(), old = new Database(path);
     old.run("CREATE TABLE reg_access_requests (id TEXT PRIMARY KEY, tenant TEXT NOT NULL, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, member TEXT NOT NULL, role TEXT NOT NULL, state TEXT NOT NULL, at INTEGER NOT NULL, UNIQUE (scope_type, scope_id, member))");
     old.close();
-    expect(() => sqliteRegistry({ path, fullfsync: false })).toThrow(/reg_access_requests.*older version.*drop the table/i);
+    expect(() => sqliteRegistry({ path, fullfsync: false })).toThrow(/reg_access_requests.*older version.*Reset the store/i);
+  });
+
+  test("the old-format rule is general: a column missing from ANY table refuses the file, which is left untouched and deletable; a fresh file and a reopen do not false-fire", async () => {
+    const fresh = file(); const r = sqliteRegistry({ path: fresh, fullfsync: false }); await r.close();
+    const again = sqliteRegistry({ path: fresh, fullfsync: false }); await again.close();   // a reopen: nothing refused
+    for (const [table, drop] of [["reg_teams", "created_at"], ["reg_members", "email"], ["reg_scope_grants", "n"], ["reg_tenants", "created_at"]]) {
+      const path = file(), db = new Database(path);
+      db.run("PRAGMA journal_mode=DELETE");
+      sqliteRegistry({ path: fresh, fullfsync: false }).close();      // (shape source) a good file
+      const good = new Database(fresh, { readonly: true });
+      const cols = good.query(`PRAGMA table_info(${table})`).all().map(c => c.name).filter(c => c !== drop);
+      good.close();
+      db.run(`CREATE TABLE ${table} (${cols.map(c => `${c} TEXT`).join(", ")})`);
+      db.close();
+      let err; try { sqliteRegistry({ path, fullfsync: false }); } catch (e) { err = e; }
+      expect([table, err?.code]).toEqual([table, "old-format"]);
+      expect(err.message).toContain(table);
+      const after = new Database(path, { readonly: true });
+      expect(after.query("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(t => t.name)).toEqual([table]);   // nothing was created
+      expect(after.query("PRAGMA journal_mode").get().journal_mode).toBe("delete");                                         // the WAL switch never happened
+      after.close();
+      rmSync(path);                                                                                                         // the handle was released: the file can go
+    }
   });
 
   test("durable keyed create: the key survives close and reopen (a crash after the commit), so the retry gets the first object, not a second", async () => {

@@ -14,6 +14,9 @@
 //                missing at the header, or the database ended an idle write transaction. Nothing of the call is visible.
 //   corrupt      getCheckpoint: a header's parts hold the wrong number of chars. Not retried.
 //   closed       any call after close().
+//   bad-clock    the injected clock (SQLite `now`) gave a non-integer: a lease call grants nothing.
+//   old-format   OPEN, at start-up: a table's columns differ from this version's DDL. The store is refused, never read or ALTERed;
+//                the operator resets it (SQLite: delete the file; Postgres: drop the schema).
 // An infrastructure failure (database down, timeout) REJECTS with whatever error the driver gave; it never resolves to
 // null or [] (a room treats a rejection as "the Store is unavailable" and rebuilds).
 //
@@ -126,7 +129,7 @@ export function checkRead(fromSeq, limit, maxBytes) {
   return Math.min(limit, MAX_READ);
 }
 
-/** How many of the next rows (sizes in chars, ascending) fit `maxBytes`: always at least one if there is one. */
+/** How many of the next rows (`sizes`: any iterable of chars, ascending; read lazily, stops at the first row that doesn't fit) fit `maxBytes`: always at least one if there is one. */
 export function fitBytes(sizes, maxBytes) {
   let sum = 0, fit = 0;
   for (const k of sizes) { if (fit && sum + k > maxBytes) break; sum += k; fit++; }

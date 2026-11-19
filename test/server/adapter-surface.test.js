@@ -9,6 +9,8 @@ import { sqliteStore } from "../../server/store/sqlite.js";
 import { postgresStore } from "../../server/store/postgres.js";
 import { STORE_METHODS } from "../../server/store/port.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
+import { REGISTRY_METHODS } from "../../server/auth/registry-port.js";
+import { SQL } from "bun";
 import { sqliteRegistry } from "../../server/registry/sqlite.js";
 import { postgresRegistry } from "../../server/registry/postgres.js";
 import { memoryBus } from "../../server/bus/memory.js";
@@ -29,12 +31,13 @@ const surface = (adapter, port, extras) => {
   expect(names(adapter).filter(m => !port.includes(m) && !extras.includes(m))).toEqual([]);                     // nothing undocumented
 };
 
+/** The schema a Postgres case made. */
+const dropSchema = async schema => { const sql = new SQL({ url: E.DATABASE_URL, max: 1 }); try { await sql.unsafe(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); } finally { await sql.close(); } };
 const STORE_EXTRAS = ["pragmas", "settings", "clusterId"];
 /** Bus extras: `subscriberCount` (both), `isUp` (NATS connection state, tests). */
 const BUS_EXTRAS = ["subscriberCount", "isUp"];
-/** Registry extras: diagnostics and a housekeeping call and the client-side gate's state (`gate()`, read by main.js), adapter-only (the memory adapter is the reference list). */
-const REGISTRY_EXTRAS = ["pragmas", "settings", "readSettings", "idemPrune", "gate"];
-const registryPort = names(memoryRegistry());
+/** Registry extras (`linkUsesFor` is the optional batch read; `idemSize` a test helper every adapter has): diagnostics and a housekeeping call and the client-side gate's state (`gate()`, read by main.js), adapter-only (the memory adapter is the reference list). */
+const REGISTRY_EXTRAS = ["pragmas", "settings", "readSettings", "idemPrune", "gate", "idemSize", "linkUsesFor"];
 
 test("Store: sqlite has exactly the port's methods", async () => {
   const s = sqliteStore({ path: ":memory:" });
@@ -42,19 +45,19 @@ test("Store: sqlite has exactly the port's methods", async () => {
   await s.close();
 });
 test.skipIf(!E.DATABASE_URL)("Store: postgres has exactly the port's methods", async () => {
-  const s = await postgresStore({ url: E.DATABASE_URL, schema: `pl_surface_${process.pid}`, max: 2 });
-  try { surface(s, STORE_METHODS, STORE_EXTRAS); } finally { await s.close(); }
+  const schema = `pl_surface_${process.pid}_store`, s = await postgresStore({ url: E.DATABASE_URL, schema, max: 2 });
+  try { surface(s, STORE_METHODS, STORE_EXTRAS); } finally { await s.close(); await dropSchema(schema); }
 });
 
-test("Registry: memory is the reference; sqlite has the same methods", async () => {
+test("Registry: memory and sqlite have exactly the port's methods", async () => {
+  surface(memoryRegistry(), REGISTRY_METHODS, REGISTRY_EXTRAS);
   const r = sqliteRegistry({ path: ":memory:" });
-  surface(r, registryPort, REGISTRY_EXTRAS);
+  surface(r, REGISTRY_METHODS, REGISTRY_EXTRAS);
   await r.close();
-  expect(registryPort).toContain("close");
 });
-test.skipIf(!E.DATABASE_URL)("Registry: postgres has the same methods as memory", async () => {
-  const r = await postgresRegistry({ url: E.DATABASE_URL, schema: `pl_surface_${process.pid}`, max: 2 });
-  try { surface(r, registryPort, REGISTRY_EXTRAS); } finally { await r.close(); }
+test.skipIf(!E.DATABASE_URL)("Registry: postgres has the exactly the port's methods", async () => {
+  const schema = `pl_surface_${process.pid}_registry`, r = await postgresRegistry({ url: E.DATABASE_URL, schema, max: 2 });
+  try { surface(r, REGISTRY_METHODS, REGISTRY_EXTRAS); } finally { await r.close(); await dropSchema(schema); }
 });
 
 test("Bus: memory has exactly the port's members", async () => {
@@ -72,7 +75,7 @@ test.skipIf(!E.S3_ENDPOINT)("Blobs: s3 has exactly the port's methods", () =>
   surface(s3Blobs({ endpoint: E.S3_ENDPOINT, bucket: E.S3_BUCKET, region: E.S3_REGION ?? "us-east-1", accessKeyId: E.S3_ACCESS_KEY_ID, secretAccessKey: E.S3_SECRET_ACCESS_KEY }), BLOBS_METHODS, []));
 
 test("no adapter-only member leaks into core: only adapters, composition roots and tests name them", () => {
-  const used = [...new Set([...STORE_EXTRAS, ...REGISTRY_EXTRAS].filter(m => m !== "settings"))];   // `settings` is too common a word; the others are distinctive
+  const used = [...new Set([...STORE_EXTRAS, ...REGISTRY_EXTRAS].filter(m => m !== "settings" && m !== "linkUsesFor"))];   // `settings` is too common a word, and `linkUsesFor` is the port's optional batch read that core feature-detects; the others are distinctive
   const hits = [], files = listFiles(["server", "packages"]);
   expect(files.length).toBeGreaterThan(20);
   for (const f of files) {

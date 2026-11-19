@@ -73,7 +73,7 @@
 import { SQL } from "bun";
 import { RegistryError, batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
-import { needSchema, migrate, assertColumns, missing } from "../pg/schema.js";
+import { needSchema, migrate, assertShapes, missing } from "../pg/schema.js";
 
 const UNIQUE = "23505";
 /** SQLSTATEs: insufficient_privilege; lock_not_available (lock_timeout fired); query_canceled (statement_timeout). */
@@ -145,6 +145,8 @@ export const registryTables = schema => {
   const q = `"${needSchema(schema)}"`;
   return Object.fromEntries(Object.entries(REGISTRY_TABLE_DDL).map(([k, v]) => [k, v.replaceAll("$S", q)]));
 };
+/** A tenant row always has its kind row (createTenant writes both in one step): a missing one is a corrupt store, never a silent default. */
+const needKind = (kind, id) => { if (typeof kind !== "string") throw new RegistryError("corrupt", `tenant ${id} has no kind row`); return kind; };
 /** A string Postgres will take as text (no NUL). */
 const key = v => typeof v === "string" && !v.includes("\0");
 const num = v => (v == null ? null : Number(v));
@@ -184,9 +186,8 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       // A schema from before the organization (boards, no Spaces) is an old-format store: refused, never half-filled in.
       if (!(await missing(tx, s, ["reg_boards"])).length && (await missing(tx, s, ["reg_spaces"])).length)
         throw Object.assign(new Error(`postgres registry: schema "${s}" has reg_boards but no reg_spaces: it is from an older version. Reset the store (drop the schema's reg_* tables); the next start-up recreates them`), { code: "old-format" });
+      await assertShapes(tx, s, registryTables(s));   // the old-format rule, before anything is created
       await migrate(tx, s, registryTables(s));
-      await assertColumns(tx, s, "reg_access_requests", ["id", "tenant", "scope_type", "scope_id", "member", "role", "state", "at", "closed_at"]);   // never altered: an older shape is reset
-      await assertColumns(tx, s, "reg_idempotency", ["member", "k", "fp", "ref", "at"]);   // holds only 24 h of keys; an older shape is reset, never altered
       const noIndex = await missing(tx, s, Object.keys(REGISTRY_INDEXES));
       if (noIndex.length) await tx.unsafe(noIndex.map(name => `CREATE INDEX ${name} ON "${s}".${REGISTRY_INDEXES[name]}`).join(";\n"));
       // Every right on every table, each on its own (the names are constants and `s` passed needSchema).
@@ -271,7 +272,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       (SELECT coalesce(json_agg(member ORDER BY n), '[]') FROM ${A} WHERE tenant = t.id)::text AS admins
       FROM ${T} t WHERE t.id = $1`, [id]);
     if (!r) return null;
-    return { id: r.id, domain: r.domain, domains: [...(r.domain ? [r.domain] : []), ...JSON.parse(r.extra)], kind: r.kind ?? "company",
+    return { id: r.id, domain: r.domain, domains: [...(r.domain ? [r.domain] : []), ...JSON.parse(r.extra)], kind: needKind(r.kind, r.id),
       admins: JSON.parse(r.admins), createdAt: num(r.created_at) };
   };
   const BOARD_SQL = `SELECT b.*, (SELECT space FROM ${BS} WHERE board = b.id) AS space FROM ${BD} b`;
@@ -865,7 +866,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       else {
         const t = by("T")[0];
         out = {
-          tenant: { id: t.id, domain: t.domain, domains: [...(t.domain ? [t.domain] : []), ...t.extra], kind: t.kind ?? "company", admins: t.admins, createdAt: num(t.created_at) },
+          tenant: { id: t.id, domain: t.domain, domains: [...(t.domain ? [t.domain] : []), ...t.extra], kind: needKind(t.kind, t.id), admins: t.admins, createdAt: num(t.created_at) },
           board: rowBoard(by("B")[0]), space: rowSpace(by("S")[0]), group: rowGroup(by("G")[0]),
         };
         out.board ??= null; out.space ??= null; out.group ??= null;
@@ -905,7 +906,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
           WHERE m.team IN (SELECT subject FROM sg WHERE subject_type = 'team') AND ($3::text[] IS NULL OR m.member = ANY($3::text[]))`,
       [list.map(sc => sc.type), list.map(sc => sc.id), us]);
       const by = k => rows.filter(r => r.k === k).map(r => JSON.parse(r.j));
-      const tenants = new Map(by("T").map(t => [t.id, { id: t.id, domain: t.domain, domains: [...(t.domain ? [t.domain] : []), ...t.extra], kind: t.kind ?? "company", admins: t.admins, createdAt: num(t.created_at) }]));
+      const tenants = new Map(by("T").map(t => [t.id, { id: t.id, domain: t.domain, domains: [...(t.domain ? [t.domain] : []), ...t.extra], kind: needKind(t.kind, t.id), admins: t.admins, createdAt: num(t.created_at) }]));
       const spaces = new Map(by("S").map(x => [x.id, rowSpace(x)])), groups = new Map(by("G").map(x => [x.id, rowGroup(x)]));
       const roles = new Map();
       for (const r of by("R")) { if (!roles.has(r.tenant)) roles.set(r.tenant, []); roles.get(r.tenant).push(rowRole(r)); }

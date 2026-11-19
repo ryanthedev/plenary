@@ -265,10 +265,10 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
     if (typeof registry.touchMember !== "function") return;
     if (touching.size >= TOUCH_MAX || touching.has(identity.user)) { if (!touching.has(identity.user)) touchWarn("dropped (too many in flight)"); return; }
     touching.add(identity.user);
-    const timer = setTimeout(() => touchWarn("is slow"), TOUCH_MS);
+    const timer = timers.set(() => touchWarn("is slow"), TOUCH_MS);
     (async () => { const unit = await tenancy.tenantOf(identity); if (unit) await registry.touchMember(unit.id, identity); })()
       .catch(() => touchWarn("failed"))
-      .finally(() => { clearTimeout(timer); touching.delete(identity.user); });
+      .finally(() => { timers.clear(timer); touching.delete(identity.user); });
   }
 
   async function exchange(req) {

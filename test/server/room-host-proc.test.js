@@ -32,8 +32,8 @@ function gw(bus, id) {
     answer: c => got.find(m => m.conn === c && (m.msg?.t === "welcome" || m.close)),
   };
 }
-async function child(holder, ttl, schema) {
-  const p = spawnTracked(["bun", CHILD, holder, String(ttl), schema], { stdout: "pipe", stderr: "pipe", env: process.env });
+async function child(holder, ttl, schema, gatewayId) {
+  const p = spawnTracked(["bun", CHILD, holder, String(ttl), schema, ...(gatewayId ? [gatewayId] : [])], { stdout: "pipe", stderr: "pipe", env: process.env });
   // The child's log lines (stderr) are echoed and kept, so a test can wait for one as a barrier.
   const errLines = [];
   (async () => { let buf = ""; for await (const chunk of p.stderr) { const t = new TextDecoder().decode(chunk); process.stderr.write(t); buf += t; const parts = buf.split("\n"); buf = parts.pop(); errLines.push(...parts); } })().catch(() => {});
@@ -45,10 +45,11 @@ async function child(holder, ttl, schema) {
 for (const how of ["kill -9", "SIGSTOP"]) test.skipIf(!url || !nurl)(`a real holder process on Postgres + NATS: ${how}`, async () => {
   const schema = `pl_test_hostproc_${process.pid}_${how === "kill -9" ? "k" : "s"}_${Date.now().toString(36)}`; schemas.push(schema);
   const ttl = 3_000;   // the child tolerates a 2 s event-loop stall (its host drops the room after 2/3 of the ttl)
-  const { p, errLines, epoch: eA } = await child("h-child", ttl, schema);
+  const gwId = `g-${how === "kill -9" ? "k" : "s"}${process.pid}`;
+  const { p, errLines, epoch: eA } = await child("h-child", ttl, schema, gwId);
   const store = await postgresStore({ url, schema, max: 3 }), bus = await natsBus({ url: nurl, cluster: null });
   const Bh = roomHost({ store, bus, holder: "h-b", leaseTtlMs: 30_000, heartbeatMs: 200 });   // only the child ttl sets the takeover wait; the long one keeps B room alive through an event-loop stall
-  const g = gw(bus, `g-${how === "kill -9" ? "k" : "s"}${process.pid}`);
+  const g = gw(bus, gwId);
   try {
     g.hello("c1", "a"); await until(() => g.answer("c1")?.msg?.t === "welcome", "welcome from the child", 5000);
     for (let k = 1; k <= 5; k++) { g.op("c1", "a", k); await until(() => g.got.some(m => m.msg?.t === "ack" && m.msg.id === `a:${k}`), `ack ${k}`, 5000); }
@@ -72,9 +73,10 @@ for (const how of ["kill -9", "SIGSTOP"]) test.skipIf(!url || !nurl)(`a real hol
       await until(() => g.got.some(m => m.msg?.id === "a:6") && g.got.some(m => m.msg?.id === "x:1"), "x:1 and a:6 acked", 5000);
       const seen = g.got.length;
       process.kill(p.pid, "SIGCONT");
-      // Barrier, not a delay: the woken host finds its deadline gone and stops the room (it logs that), and a sentinel op on the new holder is then acked.
-      // Anything the woken host sent before or with that stop is on the bus ahead of the ack (the sentinel goes through B, whose reply comes after).
+      // Barrier, not a delay: the woken host finds its deadline gone and stops the room (it logs that); two macrotask turns later it publishes a sentinel on
+      // this gateway's subject over its own connection, so anything it sent to this gateway before then is already in `got` (same publisher, in order).
       await until(() => errLines.some(l => /room stopped: lease lost/.test(l)), "the woken host to stop its room", 15_000);
+      await until(() => g.got.some(m => m.conn === "__sentinel"), "the woken host's sentinel on its own connection", 15_000);
       g.op(w.conn, "a", 7);
       await until(() => g.got.slice(seen).some(m => m.msg?.t === "ack" && m.msg.id === "a:7"), "the sentinel ack from the new holder", 10_000);
       // Nothing from the woken host reaches the new holder's connections: no welcome, no 1013 (the only acks are B's own: a:7).

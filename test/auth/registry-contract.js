@@ -77,8 +77,9 @@ export function registryContract(name, makeRegistry, opts = {}) {
       });
       test("a create that FAILS leaves no key behind (the key row rolls back with it), so the retry runs fresh", async () => {
         const { t } = await tenantWithBoard();
+        const sp = await r.createSpace({ tenant: t.id, name: "S" });
         await expect(r.createSpace({ tenant: t.id, name: "S", group: "g-nonexistent", idem: idem() })).rejects.toThrow();
-        await expect(mkBoard(r, { tenant: "t-nonexistent", idem: idem() })).rejects.toThrow();
+        await expect(r.createBoard({ tenant: "t-nonexistent", space: sp.id, idem: idem() })).rejects.toThrow(/no such tenant/);   // reaches createBoard itself
         expect(await r.idemGet(idem())).toEqual({ state: "none" });
         expect(await r.idemSize()).toBe(0);
         expect((await mkBoard(r, { tenant: t.id, idem: idem() })).id).toBeTruthy();
@@ -197,7 +198,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
     // ---- boards ----
 
     test("createBoard: minted id b- + 16, defaults title '' and memberRole viewer; board(id) reads it back", async () => {
-      const { t, b } = await tenantWithBoard();
+      const { t, b } = await tenantWithBoard({ memberRole: "viewer" });   // mkBoard's own default, passed explicitly
       expect(b.id).toMatch(/^b-[a-z0-9]{16}$/);
       expect(b).toMatchObject({ tenant: t.id, title: "", memberRole: "viewer", createdAt: T0 });
       expect(await r.board(b.id)).toEqual(b);
@@ -208,7 +209,8 @@ export function registryContract(name, makeRegistry, opts = {}) {
     });
 
     test("createBoard: unknown tenant rejects", async () => {
-      await expect(mkBoard(r, { tenant: "t-nope00000000" })).rejects.toThrow();
+      const sp = await r.createSpace({ tenant: (await r.createTenant({ domain: "real.com" })).id, name: "S" });
+      await expect(r.createBoard({ tenant: "t-nope00000000", space: sp.id })).rejects.toThrow(/no such tenant/);
     });
 
     test("reads return copies: mutating a result doesn't change the registry", async () => {
@@ -428,14 +430,21 @@ export function registryContract(name, makeRegistry, opts = {}) {
         const sp = await r.createSpace({ tenant: t.id, name: "Design" });
         const b = await r.createBoard({ tenant: t.id, space: sp.id });
         const c = await r.createBoard({ tenant: t.id, space: sp.id, memberRole: "editor" });
-        for (const space of [undefined, null, "", "s-nope00000000"]) await expect(r.createBoard({ tenant: t.id, owner: "google:own", ...(space === undefined ? {} : { space }) })).rejects.toThrow(/no such space/);
-        expect((await r.searchBoards(t.id)).ids.sort()).toEqual([b.id, c.id].sort());   // only the two filed boards exist
         expect([b.memberRole, b.space]).toEqual([null, sp.id]);
         expect([c.memberRole, c.space]).toEqual(["editor", sp.id]);
         expect(await r.board(b.id)).toEqual(b);
         const other = await r.createTenant({ domain: "globex.com" });
-        await expect(r.createBoard({ tenant: other.id, space: sp.id })).rejects.toThrow();
-        await expect(r.createBoard({ tenant: t.id, space: "s-nope00000000" })).rejects.toThrow();
+        const ok = await r.createBoard({ tenant: other.id, space: (await r.createSpace({ tenant: other.id, name: "O" })).id });
+        // Every refusal says "no such space" and leaves nothing behind: no board in either Unit, no owner grant, no idempotency key.
+        const attempts = [[t.id, undefined], [t.id, null], [t.id, ""], [t.id, "s-nope00000000"], [other.id, sp.id]];
+        for (const [tenant, space] of attempts) {
+          await expect(r.createBoard({ tenant, owner: "google:own", idem: { user: "google:own", key: "key-0001-refused", fp: "f".repeat(64) }, ...(space === undefined ? {} : { space }) })).rejects.toThrow(/no such space/);
+        }
+        expect(await r.idemGet({ user: "google:own", key: "key-0001-refused", fp: "f".repeat(64) })).toEqual({ state: "none" });
+        expect(await r.idemSize()).toBe(0);
+        expect(await r.sharedBoards("google:own", null)).toEqual([]);   // no owner grant was written
+        expect((await r.searchBoards(t.id)).ids.sort()).toEqual([b.id, c.id].sort());   // only the two filed boards exist,
+        expect((await r.searchBoards(other.id)).ids).toEqual([ok.id]);                   // and the other Unit has only its own
       });
 
       test("Group and Space: minted ids, defaults (Group none, Space viewer), owner grant in the same step, one tenant", async () => {

@@ -17,6 +17,7 @@ test("load: GET /home with the Bearer token, no cookies, never cached; the body 
   expect(r.home.recent[0]).toEqual(GOOD.recent[0]);
   expect(r.home.tree.groups[0].spaces[0]).toEqual({ id: "s-1", name: "Design", personal: false });
   expect(r.home.limits).toEqual({ recent: 12 });
+  expect(r.home.tree).toEqual({ groups: expect.any(Array), spaces: [], more: false });   // a stale `tree.other` from the server is dropped: there are no "Other boards"
 });
 
 test("every failure is a value from HOME_ERRORS, never a throw: 401, 403, 5xx, bad JSON, wrong shape, offline, silence", async () => {

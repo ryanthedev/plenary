@@ -30,8 +30,8 @@
 // Board organization (PROTOCOL.md § Tenancy, "Organization"): a tenant is a Unit (a `kind` and one or more domains);
 // it holds Groups, Spaces (in a Group or at the root; a member's personal Space is a Space with an `owner`), Teams
 // (named sets of members), custom roles, and scoped grants (a role for a user or Team on a Unit, Group, Space or board;
-// a user's own grant on a board stays in `grants`). A board lives in at most one Space (`board.space`; null = filed
-// nowhere: the dev board, or one a script made without a Space). `accessContext` is the one read the resolver needs for
+// a user's own grant on a board stays in `grants`). Every board lives in exactly one Space (`board.space`, never
+// null; `createBoard` requires one). `accessContext` is the one read the resolver needs for
 // a scope's whole chain (board, Space, Group, Unit) so a hello costs one call, not one per table.
 //
 // Last owner, again: `setScopedGrant` on a Group or Space refuses to remove or demote its last `owner` grant (a user's

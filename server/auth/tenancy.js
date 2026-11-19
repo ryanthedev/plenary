@@ -186,8 +186,8 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
     },
     /**
      * One user's access to many boards (PROTOCOL.md § Home, "Boards I can open"): `registry.boardRows` reads every board-scope
-     * row for the whole batch (a fixed number of statements), plus ONE `accessContext` per distinct Space among them, then the same pure `resolveAccess` as `effective`, so it can't disagree with it. From the context it
-     * already holds, each distinct Space's and Group's OWN access is resolved too (no further reads), so a caller can tell a board it
+     * row for the whole batch (a fixed number of statements), plus ONE `accessContext` per distinct Space among them (every board has one), then the same pure `resolveAccess` as `effective`, so it can't
+     * disagree with it. From the context it already holds, each distinct Space's and Group's OWN access is resolved too (no further reads), so a caller can tell a board it
      * may open apart from the Space and Group above it that it may not (their names must not leak). At most HOME.batch ids; unknown
      * boards are absent. `spaceOpen` / `groupOpen`: may the identity open boards in that Space / Group (false when there is none).
      * @returns {Promise<Map<string, { access: import("./resolver.js").Access, grant: Role|null, board: Board, space: object|null, group: object|null, spaceOpen: boolean, groupOpen: boolean }>>}

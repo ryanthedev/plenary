@@ -86,6 +86,8 @@ describe("access leak: a board the person can't open never appears, however it g
     await r.markOpened(root.user, b.id);
     const h = await home.home({ ...root, user: "google:root" });
     expect(h.recent).toEqual([]);
+    expect(h.shared).toEqual([]);
+    expect((await home.search(root, "Private")).results).toEqual([]);
   });
 });
 

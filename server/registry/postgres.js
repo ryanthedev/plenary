@@ -279,7 +279,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       admins: JSON.parse(r.admins), createdAt: num(r.created_at) };
   };
   const BOARD_SQL = `SELECT b.*, (SELECT space FROM ${BS} WHERE board = b.id) AS space FROM ${BD} b`;
-  const rowBoard = r => r && { id: r.id, tenant: r.tenant, title: r.title, memberRole: r.member_role, space: r.space ?? null, createdAt: num(r.created_at) };
+  const rowBoard = r => r && { id: r.id, tenant: r.tenant, title: r.title, memberRole: r.member_role, space: r.space, createdAt: num(r.created_at) };
   const rowGroup = r => r && { id: r.id, tenant: r.tenant, name: r.name, generalRole: r.general_role, createdAt: num(r.created_at) };
   const rowSpace = r => r && { id: r.id, tenant: r.tenant, group: r.grp, name: r.name, kind: r.kind, owner: r.owner_user, generalRole: r.general_role, createdAt: num(r.created_at) };
   const rowTeam = r => r && { id: r.id, tenant: r.tenant, name: r.name, createdAt: num(r.created_at) };
@@ -837,7 +837,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       const us = users ? users.filter(key) : null;
       // c: the ids of the chain, from the scope (one lookup by type) or from the caller's chain (no lookup).
       const FIND = {
-        board: `SELECT b.tenant, s.grp AS gid, s.id AS sid, b.id AS bid FROM ${BD} b LEFT JOIN ${BS} bs ON bs.board = b.id LEFT JOIN ${SP} s ON s.id = bs.space WHERE b.id = $1`,
+        board: `SELECT b.tenant, s.grp AS gid, s.id AS sid, b.id AS bid FROM ${BD} b JOIN ${BS} bs ON bs.board = b.id JOIN ${SP} s ON s.id = bs.space WHERE b.id = $1`,
         space: `SELECT s.tenant, s.grp AS gid, s.id AS sid, NULL::text AS bid FROM ${SP} s WHERE s.id = $1`,
         group: `SELECT g.tenant, g.id AS gid, NULL::text AS sid, NULL::text AS bid FROM ${GR} g WHERE g.id = $1`,
         unit: `SELECT t.id AS tenant, NULL::text AS gid, NULL::text AS sid, NULL::text AS bid FROM ${T} t WHERE t.id = $1`,
@@ -1059,7 +1059,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       if (!key(tenant)) return { ids: [], next: null };
       const fold = c => `translate(${c}, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')`;
       const ids = (await db.unsafe(`SELECT w.id FROM (SELECT id, title FROM ${BD} WHERE tenant = $1 AND ($2::text IS NULL OR id > $2) ORDER BY id LIMIT $4) w
-        LEFT JOIN ${BS} bs ON bs.board = w.id LEFT JOIN ${SP} s ON s.id = bs.space
+        JOIN ${BS} bs ON bs.board = w.id JOIN ${SP} s ON s.id = bs.space
         WHERE ($3::text IS NULL OR ${fold("w.title")} LIKE $3 ESCAPE '\\' OR ${fold("s.name")} LIKE $3 ESCAPE '\\')
         ORDER BY w.id`, [tenant, cur, like, cap])).map(r => r.id);
       const edge = await db.unsafe(`SELECT id FROM ${BD} WHERE tenant = $1 AND ($2::text IS NULL OR id > $2) ORDER BY id LIMIT 2 OFFSET $3`, [tenant, cur, cap - 1]);

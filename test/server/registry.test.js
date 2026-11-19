@@ -102,7 +102,8 @@ describe("sqlite registry", () => {
       await rec("tenant", () => r.tenant(t.id));
       await rec("tenant null domain", () => r.tenant(t2.id));
       await rec("dup domain", () => r.createTenant({ domain: "ACME.COM" }));
-      await rec("no tenant board", () => mkBoard(r, { tenant: "t-nope" }));
+      await rec("no tenant board", () => r.createBoard({ tenant: "t-nope", space: sp.id }));
+      await rec("no space board", () => r.createBoard({ tenant: t.id }));
       await rec("addAdmin unknown", () => r.addTenantAdmin("t-nope", "x"));
       await r.addTenantAdmin(t.id, "google:c");
       await r.addTenantAdmin(t.id, "google:a");

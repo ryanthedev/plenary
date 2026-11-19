@@ -296,7 +296,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
         UNION SELECT board FROM reg_invites WHERE ?2 IS NOT NULL AND email = ?2 AND revoked = 0
         UNION SELECT board FROM reg_link_uses WHERE member = ?1) ORDER BY board LIMIT ?3`),
     search: db.query(`SELECT w.id FROM (SELECT id, title FROM reg_boards WHERE tenant = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?4) w
-      LEFT JOIN reg_board_spaces bs ON bs.board = w.id LEFT JOIN reg_spaces s ON s.id = bs.space
+      JOIN reg_board_spaces bs ON bs.board = w.id JOIN reg_spaces s ON s.id = bs.space
       WHERE ?3 IS NULL OR w.title LIKE ?3 ESCAPE '\\' OR s.name LIKE ?3 ESCAPE '\\'
       ORDER BY w.id`),
     searchEdge: db.query("SELECT id FROM reg_boards WHERE tenant = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT 2 OFFSET ?3"),
@@ -360,7 +360,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     id: r.id, domain: r.domain, domains: [...(r.domain ? [r.domain] : []), ...q.extraDomains.all(r.id).map(d => d.domain)],
     kind: needKind(q.tenantKind.get(r.id)?.kind, r.id, absent),   // the look-up always runs (uniform statement count); `absent` = uniformTenant's placeholder row, never returned
     admins: q.admins.all(r.id).map(a => a.member), createdAt: r.created_at };
-  const rowBoard = r => r && { id: r.id, tenant: r.tenant, title: r.title, memberRole: r.member_role, space: r.space ?? null, createdAt: r.created_at };
+  const rowBoard = r => r && { id: r.id, tenant: r.tenant, title: r.title, memberRole: r.member_role, space: r.space, createdAt: r.created_at };
   const rowGroup = r => r && { id: r.id, tenant: r.tenant, name: r.name, generalRole: r.general_role, createdAt: r.created_at };
   const rowSpace = r => r && { id: r.id, tenant: r.tenant, group: r.grp, name: r.name, kind: r.kind, owner: r.owner_user, generalRole: r.general_role, createdAt: r.created_at };
   const rowTeam = r => r && { id: r.id, tenant: r.tenant, name: r.name, createdAt: r.created_at };

@@ -1,7 +1,9 @@
 import { test, expect, beforeEach } from "bun:test";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy } from "../../server/auth/tenancy.js";
-import { createBoard, createInvite, createLink, revokeInvite, revokeLink, listInvites, listLinks, setGrant, AdminError } from "../../server/admin/boards.js";
+import { createBoard } from "./fixtures.js";
+import { isUnitAdmin } from "../../server/auth/resolver.js";
+import { createInvite, createLink, revokeInvite, revokeLink, listInvites, listLinks, setGrant, AdminError } from "../../server/admin/boards.js";
 
 let clock, registry, model, acme, globex, admin, board;
 const now = () => clock.t;
@@ -127,16 +129,11 @@ test("cross-tenant: nothing in tenant A resolves a role on tenant B's board", as
   expect(await model.role(ann, gb.id)).toBe("annotator");
 });
 
-test("admin: createBoard by tenant admin works; non-admin, other tenant's admin, member refused", async () => {
+test("fixtures createBoard: an unfiled board with its owner grant (board creation by permission: test/auth/spaces.test.js)", async () => {
   const b = await createBoard({ caller: admin, tenant: acme.id, title: "Q4" }, { registry });
   expect(b.id).toMatch(/^[a-z0-9-]+$/);
-  expect(b.tenant).toBe(acme.id);
-  expect(await registry.board(b.id)).toMatchObject({ id: b.id, tenant: acme.id, title: "Q4", memberRole: "viewer" });
-  for (const caller of [ann, bob, id("google:gadmin", "globex.com"), null, {}])
-    await expect(createBoard({ caller, tenant: acme.id }, { registry })).rejects.toMatchObject({ code: "forbidden" });
-  await expect(createBoard({ caller: admin, tenant: "t-nope" }, { registry })).rejects.toMatchObject({ code: "forbidden" });
-  await expect(createBoard({ caller: admin, tenant: acme.id, memberRole: "owner" }, { registry })).rejects.toMatchObject({ code: "bad-request" });
-  await expect(createBoard({ caller: admin, tenant: acme.id, memberRole: "god" }, { registry })).rejects.toMatchObject({ code: "bad-request" });
+  expect(await registry.board(b.id)).toMatchObject({ id: b.id, tenant: acme.id, title: "Q4", memberRole: "viewer", space: null });
+  expect(await registry.grant(b.id, admin.user)).toBe("owner");
 });
 
 test("admin: a board owner (not tenant admin) manages invites and links; a member can't", async () => {
@@ -243,15 +240,14 @@ test("p5-fix 3 (p5-authv R1): two concurrent demotions of the only two owners le
   expect((await registry.grants(board.id)).filter(g => g.role === "owner").length).toBe(1);
 });
 
-test("a Unit with a second domain: members of either get memberRole, an email admin on either domain may create boards, other domains still can't", async () => {
+test("a Unit with a second domain: members of either get memberRole; an email admin on either domain is an admin, other domains are not", async () => {
   await registry.addTenantDomain(acme.id, "acme.io");
   await registry.addTenantAdmin(acme.id, "email:pat@acme.io");
   const lee = id("google:lee", "acme.io", "lee@acme.io");
   expect(await model.role(lee, board.id)).toBe("viewer");
   const pat = id("google:pat", "acme.io", "pat@acme.io");
-  const made = await createBoard({ caller: pat, tenant: acme.id, title: "Second domain" }, { registry });
-  expect(await model.role(pat, made.id)).toBe("owner");
-  const evil = id("google:pat", "evil.com", "pat@acme.io");
-  await expect(createBoard({ caller: evil, tenant: acme.id }, { registry })).rejects.toMatchObject({ code: "forbidden" });
+  const t = await registry.tenant(acme.id);
+  expect(isUnitAdmin(t, pat)).toBe(true);
+  expect(isUnitAdmin(t, id("google:pat", "evil.com", "pat@acme.io"))).toBe(false);
   expect(await model.role(id("google:zed", "globex.com", "z@globex.com"), board.id)).toBe(null);
 });

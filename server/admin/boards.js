@@ -1,8 +1,7 @@
-// Admin functions: POST /boards and invite / share-link management, as plain functions (HTTP wiring: server/auth/http.js).
-// A hello never creates a board; only createBoard does.
+// Admin functions: invite / share-link / grant management, as plain functions (HTTP wiring: server/auth/http.js). Board creation is
+// server/auth/spaces.js (`board.create` at a Space, or the personal space). A hello never creates a board.
 //
 // Who may do what:
-//   createBoard:            an admin of the named tenant (by user id, or by email: isTenantAdmin below).
 //   invites and links:      the board's owner (grant) or an admin of the board's tenant.
 //   grants:                 a tenant admin sets any role, owner included. A board owner sets roles up to editor,
 //                           and may change an owner's grant only if it is their own. Nobody removes or demotes a
@@ -18,7 +17,7 @@ import { isUnitAdmin } from "../auth/resolver.js";
 
 export class AdminError extends Error {
   /**
-   * @param {"forbidden"|"bad-request"|"last-owner"|"owner-grant-failed"} code
+   * @param {"forbidden"|"bad-request"|"not-found"|"last-owner"|"owner-grant-failed"} code
    * @param {string} [message]
    * @param {{ board?: string, cause?: unknown }} [extra]  `board`: the id of a board created without its owner grant
    */
@@ -53,28 +52,6 @@ const expiry = (v, now) => {
   if (!Number.isFinite(v) || v <= now) throw bad("expiresAt must be a future time (ms)");
   return v;
 };
-
-/**
- * POST /boards. The caller must be an admin of `tenant`. Mints the board id, writes the registry, makes the
- * caller owner. `memberRole` = what Workspace members of the tenant get (default `viewer`; null = nothing).
- * @param {{ caller: Identity, tenant: string, title?: string, memberRole?: string|null }} req
- * @param {{ registry: Registry }} deps
- */
-export async function createBoard({ caller, tenant, title = "", memberRole = "viewer" }, { registry }) {
-  if (!(await isTenantAdmin(registry, caller, tenant))) throw forbidden();
-  if (memberRole !== null && (!ROLES.includes(memberRole) || memberRole === "owner")) throw bad("bad memberRole");
-  if (typeof title !== "string" || title.length > 200) throw bad("bad title");
-  const board = await registry.createBoard({ tenant, title, memberRole });
-  // PROTOCOL.md § Registry: createBoard takes no creator, so the owner grant is a second call. Retry it once; if it
-  // still fails, report the failure WITH the board id (never success for an ownerless board). A tenant admin can
-  // still fix that board: they manage every board of their tenant, owner grants included.
-  let last;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try { await registry.setGrant(board.id, caller.user, "owner"); return board; }
-    catch (err) { last = err; }
-  }
-  throw new AdminError("owner-grant-failed", `board ${board.id} was created but its owner grant failed`, { board: board.id, cause: last });
-}
 
 /** Give a user an explicit role on a board (or remove it with null). See the rules at the top. */
 export async function setGrant({ caller, board, user, role }, { registry }) {

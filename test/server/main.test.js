@@ -302,9 +302,10 @@ test("start(env): COOKIE_KEY: refused when short; required in cluster mode; rand
 test("revocation: a grant change through the Registry closes a connection that lost its role", async () => {
   const app = await start(devEnv(tempDir()));
   try {
-    await app.registry.createTenant({ domain: "acme.test", admins: ["dev:ann"] });
-    const res = await fetch(app.server.url + "/boards", { method: "POST", headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" }, body: JSON.stringify({ memberRole: null }) });
-    const { board } = await res.json();
+    // An unfiled board with no general access (a board made by POST /boards would sit in ann's personal space, which she owns: no revocation by grant).
+    const t = await app.registry.createTenant({ domain: "acme.test", admins: ["dev:ann"] });
+    const board = await app.registry.createBoard({ tenant: t.id, memberRole: null });
+    await app.registry.setGrant(board.id, "dev:ann", "owner");
     await app.registry.setGrant(board.id, "dev:bob", "owner");          // a second owner, so ann may be removed
     const s = await sock(app.server.wsUrl);
     s.send({ t: "hello", v: 1, token: TOKEN, board: board.id, since: 0, client: "ann" });

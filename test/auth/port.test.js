@@ -4,7 +4,7 @@ import { sessions } from "../../server/auth/session.js";
 import { authPort } from "../../server/auth/port.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy } from "../../server/auth/tenancy.js";
-import { createBoard } from "../../server/admin/boards.js";
+import { createBoard } from "./fixtures.js";
 import { fakeIdp } from "./fake-idp.js";
 import { fakeStore, gatewayHello } from "./fake-store.js";
 

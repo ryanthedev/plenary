@@ -5,7 +5,7 @@ import { googleOidc } from "../../server/auth/oidc.js";
 import { sessions as makeSessions } from "../../server/auth/session.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { createBoard } from "../../server/admin/boards.js";
+import { createBoard } from "./fixtures.js";
 import { devAuth } from "../../server/auth/dev.js";
 import { fakeIdp, CLIENT_ID } from "./fake-idp.js";
 
@@ -298,16 +298,19 @@ test("Bearer missing, malformed, forged or expired → 401 auth; cookies never a
 
 // ---- admin rules ----
 
-test("POST /boards: non-admin and tenantless callers get 403; a tenant field is refused and creates nothing", async () => {
+test("POST /boards: tenantless callers get 403; a Unit member makes a board in their personal space; a tenant field is refused and creates nothing", async () => {
   let creates = 0;
   const counting = { ...registry, createBoard: async o => { creates++; return registry.createBoard(o); } };
   routes = build({ registry: counting });
   const member = await tokenFor(MEMBER), guest = await tokenFor(GUEST), admin = await tokenFor(ADMIN);
-  for (const t of [member, guest]) {
-    const r = await api("/boards", t, "POST", { title: "x" });
-    expect(r.status).toBe(403);
-    expect(await r.json()).toEqual({ error: "forbidden" });
-  }
+  const r0 = await api("/boards", guest, "POST", { title: "x" });
+  expect(r0.status).toBe(403);
+  expect(await r0.json()).toEqual({ error: "forbidden" });
+  expect(creates).toBe(0);
+  const mine = await api("/boards", member, "POST", { title: "x" });
+  expect(mine.status).toBe(201);
+  expect(creates).toBe(1);
+  creates = 0;
   const other = await registry.createTenant({ domain: "globex.com", admins: ["google:1001"] });
   const r = await api("/boards", admin, "POST", { tenant: other.id });
   expect(r.status).toBe(400);
@@ -414,24 +417,24 @@ test("createBoard: an owner grant that fails twice reports the board id (503); o
   expect(body.board).toMatch(/^b-[a-z0-9]{16}$/);
   expect(await registry.board(body.board)).toMatchObject({ title: "orphan" });
   expect(await registry.grant(body.board, "google:1001")).toBe(null);
+  expect((await registry.board(body.board)).space).toMatch(/^s-/);   // it sits in the caller's personal space
   fails = 1;
   const ok = await api("/boards", admin, "POST", { title: "retried" });
   expect(ok.status).toBe(201);
   expect(await registry.grant((await ok.json()).board.id, "google:1001")).toBe("owner");
   // Directly against the admin layer as well.
   fails = 5;
-  await expect(createBoard({ caller: { user: "google:1001" }, tenant: acme.id }, { registry: flaky }))
-    .rejects.toMatchObject({ code: "owner-grant-failed", board: expect.stringMatching(/^b-/) });
 });
 
 // ---- mounting ----
 
 test("not my route: /health, /ws, /blobs/*, /metrics and unknown paths give null; wrong method 405", async () => {
-  for (const p of ["/health", "/ws", "/blobs/abc", "/blobs/t/x/y", "/metrics", "/", "/auth", "/auth/other", "/boards/x", "/boards/x/y", "/links", "/links/a/b", "/varz"])
+  for (const p of ["/health", "/ws", "/blobs/abc", "/blobs/t/x/y", "/metrics", "/", "/auth", "/auth/other", "/boards/x/y", "/links", "/links/a/b", "/varz"])
     for (const m of ["GET", "POST", "PUT", "DELETE"]) expect(await call(p, { method: m })).toBe(null);
   const r = await call("/boards", { method: "GET" });
   expect(r.status).toBe(405);
   expect(r.headers.get("allow")).toBe("POST");
+  expect((await call("/boards/x", { method: "GET" })).headers.get("allow")).toBe("PATCH");
   // The engine passes the parsed URL as the second argument; it is used if given.
   expect(await routes(new Request(ORIGIN + "/boards", { method: "GET" }), new URL(ORIGIN + "/health"))).toBe(null);
 });

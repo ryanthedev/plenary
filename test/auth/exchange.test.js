@@ -7,7 +7,8 @@ import { googleOidc } from "../../server/auth/oidc.js";
 import { sessions as makeSessions } from "../../server/auth/session.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { createBoard, createLink } from "../../server/admin/boards.js";
+import { createLink } from "../../server/admin/boards.js";
+import { createBoard } from "./fixtures.js";
 import { fakeIdp, CLIENT_ID } from "./fake-idp.js";
 
 const ORIGIN = "https://app.plenary.test";

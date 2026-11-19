@@ -564,13 +564,12 @@ older version of a deleted element would bring it back on that client only.
   4 ms per MB (mostly the fsync under `synchronous=FULL`), which held the loop 87 ms at 10 MB, 138 ms at 27 MB and 226 ms at 50 MB (`scripts/fold-bench.js`, `sqlitePutMaxStallMs`, load ~16). With parts the longest stall is
   13.5 to 16 ms at 10, 27 and 50 MB, 15.8 to 19.6 at the worst of two runs, measured at load ~43 (one part's fsync plus the WAL's automatic checkpoint every few parts; `wal_autocheckpoint` 64 to 1000 made no clear difference). The Store
   port is unchanged; the adapters store a checkpoint whose JSON text is longer than one part (`PART_CHARS` = 1 Mi chars,
-  option `partChars`) as parts. A checkpoint that fits one part is still one row of plain JSON, as before.
+  option `partChars`) as parts. A checkpoint that fits one part is one row of plain JSON.
   - **Format.** Part rows in their own table (SQLite `checkpoint_parts`, Postgres `pl_checkpoint_parts`): `(tenant, board, seq,
     wid, n, data)`, `wid` a random id of one write attempt (two writers of one `seq` never share rows), `n` from 0. The
     checkpoint **exists only when its header row** is in the checkpoints table under its `seq`: the text
     `\u0001cp-parts 1 <wid> <parts> <chars>`. No JSON text can start with `\u0001`, and a one-row checkpoint starts with `{`, so a
-    reader tells them apart with no migration. Old databases read as before; only the new table is created (SQLite at open,
-    Postgres by `migrate`, deploy/README.md). A binary from before parts cannot read a header (its `getCheckpoint` throws on it and the board won't open), so a rollback past this change first deletes the header rows (SQLite: `DELETE FROM checkpoints WHERE data LIKE char(1) || 'cp-parts%'`; Postgres: the same with `E'\x01cp-parts%'`); the log has everything, so the boards rebuild from older one-row checkpoints or from 0.
+    reader tells them apart. The part table is created at open (SQLite) or by `migrate` (Postgres, deploy/README.md).
   - **Write.** Encode in slices (above), cut into parts (never between the halves of a surrogate pair), then one transaction per
     part, **each fenced** (SQLite: the lease epoch read in the write transaction; Postgres: `FOR SHARE` on the lease row), the
     loop handed back between parts; then **the header's transaction**: fenced again, it checks that all `<parts>` rows of
@@ -950,13 +949,7 @@ server/main.js and given to `tenancy` and `roleCache`), so no one's access chang
 creator may pick none). A new board in a Space has `memberRole` null, so it **inherits** the Space; a board made without
 a Space keeps today's `memberRole` default (`viewer`).
 
-**Migration.** Adding the organization changes no one's access. The Registry only *adds* tables (§ Registry,
-"Organization"); existing tenants read as `company` with their one domain, existing boards stay unfiled with their
-`memberRole`, grants, invites and links untouched, and no Space, Group, Team, scoped grant or role exists until someone
-creates it. So the resolver's answer for every identity on every pre-existing board is the old rule's. Re-running
-start-up is a no-op. test/auth/legacy-migration.js proves it on SQLite and Postgres. Unfiled boards are a state, not a
-rule: a later backfill may file them into one per-Unit legacy Space (`generalRole` null, no grants), which adds no source,
-so access stays the same (test/auth/org-access.test.js checks that equivalence).
+**No migration.** Plenary has no data to carry over: a store from before the organization (a `reg_boards` with no `reg_spaces`, or a table whose columns differ from the current ones) is **refused at start-up** with code `old-format` ("Reset the store"); it is never read silently and never ALTERed. Unfiled boards (`space` null: the dev board, a board a script made without a Space) are a state, not a rule: they show under "Other boards" and add no source of access.
 
 **Freshness.** The resolver reads live; `.grants` (§ Bus) is per board. A change to anything the resolver reads above a
 board (a scoped grant on a Space, Group or the Unit; a Team's grants or membership; a Space's or Group's general access or
@@ -1003,8 +996,7 @@ Registry calls below. All routes authenticate like every other route in http.js:
     The check is the resolver's own answer for the Space / Group (`accessMany`, below), not a stored flag.
   - `tree` (members): `{ groups: [{ id, name, spaces: [{ id, name, personal }] }], spaces: [...Spaces in no Group, or in a Group they can't open], other: { boards: [{ id, title }], more }, more }`.
     Only Spaces and Groups the person can open boards in appear. `other`: the unfiled boards they can open (up to 20; `more` true if more exist or the scan stopped).
-    `tree.more`: true when the page of Space candidates (100), the Group candidates (50; one more is asked for to tell), or the grant checks (40 Spaces, 20 Groups) left something out. "Other boards" is a pseudo-group for the boards made before
-    Spaces existed: one constant (`OTHER` in home.js), so a later migration into a legacy Space removes it in one place.
+    `tree.more`: true when the page of Space candidates (100), the Group candidates (50; one more is asked for to tell), or the grant checks (40 Spaces, 20 Groups) left something out. "Other boards" is a pseudo-group for the boards filed in no Space: one constant (`OTHER` in home.js).
   - `limits`: the caps in force, so the page needs no copy of them.
 - `GET /home/search?q=<text>` → `{ q, results, more }`. `q` trimmed, 1-100 chars (else 400). Members: boards of the person's Unit whose **title** contains `q`,
   or whose Space name contains `q` **and the person can open that Space** (an unopenable Space's name is no search key), plus matching titles among `owned` and `shared`.
@@ -1040,7 +1032,7 @@ Not a separate port: they are per-user rows over the Registry's own board ids wi
 board's row is inert (the access filter drops it). Additive tables like the Organization ones, with these indexes added for Home's reads: `reg_invites (email)`, `reg_link_uses (member, board)`,
 `reg_scope_grants (subject_type, subject, scope_type)`, `reg_team_members (member)`, `reg_grants (member)`, `reg_boards (tenant, id)`.
 
-Pending maintainer decisions kept as-is: a Unit admin gets no board content by being admin (a board they cannot open is not listed); unfiled boards appear under "Other boards" (above), not in a legacy Space.
+Pending maintainer decisions kept as-is: a Unit admin gets no board content by being admin (a board they cannot open is not listed); unfiled boards appear under "Other boards" (above).
 
 ## Spaces and Groups (pages, pickers, create and rename, #48)
 
@@ -1461,15 +1453,20 @@ runs as a role that doesn't own the schema (§ Store, Least privilege).
 
 ### Store
 
-The log, checkpoints and each board's epoch (boards live in the Registry).
+The log, checkpoints, each board's epoch and its lease (boards live in the Registry). **The contract is `server/store/port.js`**
+(every method, argument rule, error code, bound and guarantee); `test/server/store-contract.js` runs it against SQLite and
+Postgres. In short:
 
 | Call | Contract |
 |---|---|
-| `append(tenant, board, entries, expectSeq)` | atomic: writes every entry or none, only if the board's last `seq` is `expectSeq`; else throws `conflict` |
-| `read(tenant, board, fromSeq, limit) → entries` | ascending `seq` |
-| `putCheckpoint(tenant, board, cp)`, `getCheckpoint(tenant, board, beforeSeq?) → cp \| null` | the highest `seq` wins, never the last write; `beforeSeq` finds the one before a bad checkpoint |
-| `openEpoch(tenant, board) → epoch` | durable atomic increment of the board's epoch in its lease record (1 on first call); every room build calls it before its first `welcome` (§ Recovery, Room identity). Phase 4's lease acquire does the same increment in the same step |
+| `append(tenant, board, entries, expectSeq, epoch)` | atomic: writes every entry or none, only if `epoch` is the board's lease epoch (else `fenced`, checked first) and the board's last `seq` is `expectSeq` (else `conflict`); no epoch is `bad-entry` |
+| `read(tenant, board, fromSeq, limit, maxBytes?) → entries` | ascending `seq`, at most `limit` (capped at 10,000); `maxBytes` stops the page near that much text; the array carries `bytes` |
+| `lastSeq(tenant, board)` | the board's last `seq`, 0 = empty |
+| `putCheckpoint(tenant, board, cp, epoch)`, `getCheckpoint(tenant, board, beforeSeq?) → cp \| null` | the highest `seq` wins, never the last write; fenced like `append`; `beforeSeq` finds the one before a bad checkpoint |
+| `openEpoch(tenant, board) → epoch` | durable atomic increment of the board's epoch in its lease record (1 on first call); every room build calls it before its first `welcome` (§ Recovery, Room identity); it takes the board without a lease |
 | `epoch(tenant, board) → epoch \| 0` | reads it (gateways, for a viewer's `welcome`); 0 = no room was ever built, sent as `room.epoch: 0` |
+| `acquire` / `renew` / `release` / `lease` | the board's lease on the Store's own clock (§ Recovery, host lease); every `acquire` bumps the epoch |
+| `clusterId()` | optional (Postgres): this database's cluster id (§ Bus) |
 
 - **Durable** = resolves only once the write survives a process crash and power loss on its node (SQLite
   `synchronous=FULL`; Postgres commit with `synchronous_commit=on`).
@@ -1519,16 +1516,10 @@ The log, checkpoints and each board's epoch (boards live in the Registry).
   - **A restored or cloned database keeps its id.** A copy of a production database (staging, a restore test) that
     shares a NATS server with the original is, by this rule, the same cluster. Give the copy its own id before it
     joins a shared bus: with every node of the copy stopped, `DELETE FROM pl_cluster;` (the next start mints a new one).
-  - **Rolling upgrade.** The id changes the wire subjects, so a node from before this rule (unscoped `plen.…`
-    subjects) and a node with it never exchange a message: an old gateway's remote open does not reach a new host,
-    and an old and a new gateway do not see each other's presence or entries. They also cannot split-brain, because
-    leases are in the Store. The Store's conditional, epoch-fenced append stays the last line of defence inside one cluster: a host that lost its lease can't write (§ Store). Upgrade a cluster as a whole: stop the old nodes and start the new ones (hosts first),
-    or expect writers on a not-yet-upgraded gateway to get `unavailable` until its host side is upgraded. The other
-    direction fails the same way: a writer on an upgraded gateway gets `unavailable` while an old host still holds the
-    board's lease, until that host stops (its lease lapses or is released) and an upgraded host takes the board. Readers on
-    a gateway whose board feed lost the bus keep working from the Store poll (≤ 5 s behind, see below). The schema
-    gains table `pl_cluster`: a node running as a role that may not create tables starts only after the owner has
-    migrated (`deploy/README.md`).
+  - **Replace a cluster's nodes together.** The id is part of every wire subject, so nodes built before it (unscoped `plen.…`
+    subjects) never exchange a message with nodes that have it. They cannot split-brain either: leases are in the Store, and
+    its conditional, epoch-fenced append stays the last line of defence (§ Store). The schema's table `pl_cluster` is created
+    by `migrate` (`deploy/README.md`).
 - Subjects per board: `plen.<tenant>.<board>.entries` (the room, after an append resolves), `.presence`, `.emotes`
   and `.here` (gateways), `.inbox` (gateway → room, numbered per connection: rule 6), `.gw.<gateway>` (room →
   that one gateway: `welcome`, `ack`, `error`, each addressed to a `conn`), and `.grants` (whoever changes the

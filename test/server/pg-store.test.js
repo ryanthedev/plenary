@@ -4,7 +4,7 @@
 // dropped after; one client is shared by the file.
 import { describe, test, expect, afterAll, setDefaultTimeout } from "bun:test";
 import { SQL } from "bun";
-import { postgresStore, LEASE_UPGRADE_SQL } from "../../server/store/postgres.js";
+import { postgresStore } from "../../server/store/postgres.js";
 import { storeContract, entry, code, own } from "./store-contract.js";
 
 const url = process.env.DATABASE_URL;
@@ -175,7 +175,7 @@ describe.skipIf(!url)("postgres store", () => {
     } finally { await store.close(); await drop(schema); }
   });
 
-  test("a pl_leases made before the lease (epoch only) is refused at start-up, never ALTERed; after the owner's upgrade it starts and keeps its epochs", async () => {
+  test("a pl_leases made before the lease (epoch only) is an old-format store: start-up refuses it with code old-format and changes nothing", async () => {
     const schema = schemaName();
     await client().unsafe(`CREATE SCHEMA "${schema}"`);
     await client().unsafe(`CREATE TABLE "${schema}".pl_leases (tenant TEXT NOT NULL, board TEXT NOT NULL, epoch BIGINT NOT NULL, PRIMARY KEY (tenant, board))`);
@@ -184,16 +184,9 @@ describe.skipIf(!url)("postgres store", () => {
       [`"${schema}".pl_leases`])).map(r => r.attname);
     try {
       const err = await postgresStore({ sql: client(), schema }).then(() => null, e => e);
-      expect(err?.code).toBe("needs-migration");
-      expect(err.message).toContain(LEASE_UPGRADE_SQL(schema));
+      expect(err?.code).toBe("old-format");
+      expect(err.message).toContain("Reset the store");
       expect(await cols()).toEqual(["tenant", "board", "epoch"]);                  // start-up changed nothing
-      await client().unsafe(LEASE_UPGRADE_SQL(schema));                            // the operator's step, as the owner
-      await client().unsafe(LEASE_UPGRADE_SQL(schema));                            // idempotent
-      const store = await postgresStore({ sql: client(), schema });
-      expect(await store.lease(T, B)).toEqual({ holder: null, epoch: 5, expiresAt: null, live: false, remainingMs: 0 });
-      expect((await store.acquire(T, B, "h-a", 60_000)).epoch).toBe(6);
-      await store.append(T, B, [entry(1)], 0, 6);
-      await store.close();
     } finally { await drop(schema); }
   });
 

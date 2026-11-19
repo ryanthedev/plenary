@@ -8,7 +8,6 @@ import { join, resolve } from "node:path";
 import { sqliteRegistry } from "../../server/registry/sqlite.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { registryContract } from "../auth/registry-contract.js";
-import { legacyEquivalence } from "../auth/legacy-migration.js";
 import { accessEquivalence } from "../auth/access-equivalence.js";
 import { Database } from "bun:sqlite";
 import { accessRace } from "../auth/access-race.js";
@@ -23,7 +22,7 @@ registryContract("sqlite", async ({ now }) => sqliteRegistry({ path: file(), now
 accessRace("sqlite", async () => { const path = file(), a = sqliteRegistry({ path, fullfsync: false }), b = sqliteRegistry({ path, fullfsync: false }); return { a, b, close: async () => { await a.close(); await b.close(); } }; });
 accessEquivalence("sqlite", async ({ now }) => sqliteRegistry({ path: ":memory:", now, fullfsync: false }), { cleanup: r => r.close() });
 
-// A database from before board organization: the seven original tables (their DDL as of 1d0bcbe), filled with a legacy state.
+// An old-format file: the seven tables from before board organization.
 const LEGACY_DDL = [
   "CREATE TABLE reg_tenants (id TEXT PRIMARY KEY, domain TEXT UNIQUE, created_at INTEGER NOT NULL)",
   "CREATE TABLE reg_tenant_admins (tenant TEXT NOT NULL REFERENCES reg_tenants(id), member TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (tenant, member))",
@@ -35,27 +34,18 @@ const LEGACY_DDL = [
     revoked INTEGER NOT NULL, by_user TEXT, created_at INTEGER NOT NULL)`,
   "CREATE TABLE reg_link_uses (board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES reg_links(id), n INTEGER NOT NULL, PRIMARY KEY (board, member, link))",
 ];
-let legacyFile;
-legacyEquivalence("sqlite", {
-  async install(st) {
-    legacyFile = file();
-    const db = new Database(legacyFile, { create: true, strict: true });
-    db.run("PRAGMA journal_mode=WAL");
-    for (const sql of LEGACY_DDL) db.run(sql);
-    st.tenants.forEach(t => { db.run("INSERT INTO reg_tenants VALUES (?, ?, 1)", [t.id, t.domain]); t.admins.forEach((a, n) => db.run("INSERT INTO reg_tenant_admins VALUES (?, ?, ?)", [t.id, a, n + 1])); });
-    st.boards.forEach(b => db.run("INSERT INTO reg_boards VALUES (?, ?, ?, ?, 1)", [b.id, b.tenant, b.title, b.memberRole]));
-    st.grants.forEach((g, n) => db.run("INSERT INTO reg_grants VALUES (?, ?, ?, ?)", [g.board, g.user, g.role, n + 1]));
-    st.invites.forEach(i => db.run("INSERT INTO reg_invites (id, board, email, role, expires_at, revoked, by_user, created_at) VALUES (?, ?, ?, ?, ?, ?, 'x', 1)", [i.id, i.board, i.email, i.role, i.expiresAt, i.revoked ? 1 : 0]));
-    st.links.forEach(l => db.run("INSERT INTO reg_links (id, board, role, expires_at, revoked, by_user, created_at) VALUES (?, ?, ?, ?, ?, 'x', 1)", [l.id, l.board, l.role, l.expiresAt, l.revoked ? 1 : 0]));
-    st.uses.forEach((u, n) => db.run("INSERT INTO reg_link_uses VALUES (?, ?, ?, ?)", [u.board, u.user, u.link, n + 1]));
-    db.close();
-  },
-  async open() { const registry = sqliteRegistry({ path: legacyFile, now: () => 5_000_000, fullfsync: false }); return { registry, close: () => registry.close() }; },
-  async count() {
-    const db = new Database(legacyFile, { readonly: true });
-    try { const c = t => db.query(`SELECT count(*) AS c FROM ${t}`).get().c; return { boards: c("reg_boards"), grants: c("reg_grants"), invites: c("reg_invites"), links: c("reg_links") }; }
-    finally { db.close(); }
-  },
+test("a file from before the organization (boards, no Spaces) is an old-format store: refused with code old-format, and left as it was", () => {
+  const path = file();
+  const db = new Database(path, { create: true, strict: true });
+  for (const sql of LEGACY_DDL) db.run(sql);
+  db.close();
+  let err;
+  try { sqliteRegistry({ path, fullfsync: false }); } catch (e) { err = e; }
+  expect(err?.code).toBe("old-format");
+  expect(err.message).toMatch(/Reset the store/);
+  const after = new Database(path, { readonly: true });
+  expect(after.query("SELECT name FROM sqlite_master WHERE name = 'reg_spaces'").get()).toBe(null);   // nothing was added
+  after.close();
 });
 
 describe("sqlite registry", () => {

@@ -21,8 +21,7 @@ export const LIMITS = Object.freeze({ recent: 12, starred: 50, shared: 50, owned
 /** How many candidate rows each list reads before the access filter (a few may be dropped: unopenable, or a stale row). */
 const SCAN = Object.freeze({ recent: 30, starred: 60, shared: 60, searchPages: 2, spacePages: 3, grantChecks: 40, groupChecks: 20, groupCandidates: 50 });
 /**
- * The pseudo-group for boards filed in no Space (every board made before Spaces). One place to change when a later migration
- * moves them into a legacy Space: drop this and `other` in the tree (PROTOCOL.md § Home).
+ * The pseudo-group for boards filed in no Space (the dev board, a board a script made without one). PROTOCOL.md § Home.
  */
 export const OTHER = Object.freeze({ type: "other", name: "Other boards" });
 /** What stands in for a Space or Group name the person may not see. */

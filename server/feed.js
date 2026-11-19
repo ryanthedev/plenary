@@ -120,16 +120,16 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
   //   A feed that has heard one looks only on a heartbeat or poll, and only when the largest `cp` heard is above its
   //   base and above the `cp` of its last completed look: one read per checkpoint, none on an idle board or while
   //   the room hasn't folded. A look that throws (a Store error) is not completed, so the next heartbeat tries again.
-  // - A feed whose last heartbeat had no `cp` (a host from before it), or that has had none (only Store polls), looks once its tail reaches
+  // - A feed whose last heartbeat had no `cp` (a host that has not announced one yet), or that has had none (only Store polls), looks once its tail reaches
   //   `rebaseEvery` entries or `rebaseBytes` chars since the last look, and after a miss (the room writes its
-  //   checkpoint just after publishing the entries that trigger it) on at most LEGACY_RETRIES later heartbeats or
+  //   checkpoint just after publishing the entries that trigger it) on at most MISS_RETRIES later heartbeats or
   //   polls; a look that throws keeps at least one retry.
   // - A look that throws backs off: after the n-th failure in a row, with b = min(MAX_SKIP, 2^(n-1) - 1), the next
   //   k heartbeats or polls are skipped, k from [ceil(b/2), b] by `random` (jitter: gateways don't look in lockstep).
   //   While skipping no look is made, not even a due one on entries, so a Store that answers getCheckpoint but fails
   //   the entry check costs at most one full checkpoint read per 17 heartbeats, plus one per newly announced checkpoint. A heartbeat naming a cp above the one
   //   the failing look was for ends the skip; a look that completes resets n.
-  const LEGACY_RETRIES = 3, MAX_SKIP = 31;
+  const MISS_RETRIES = 3, MAX_SKIP = 31;
   const rebaseDue = () => self.tail.length >= self.nextRebase || self.tailBytes >= self.nextRebaseBytes;
   async function maybeRebase(beat) {
     if (self.skip > 0 && self.cpHeard !== null && self.cpHeard > self.failedFor) self.skip = 0;   // a newer checkpoint
@@ -153,7 +153,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
     }
     self.failures = 0;
     if (heard !== null) self.lookedAt = Math.max(self.lookedAt, heard);
-    if (cp.seq <= self.base.seq || cp.seq > self.seq) { self.retries = due ? LEGACY_RETRIES : Math.max(0, before - 1); return; }
+    if (cp.seq <= self.base.seq || cp.seq > self.seq) { self.retries = due ? MISS_RETRIES : Math.max(0, before - 1); return; }
     const cut = self.tail.slice(0, cp.seq - self.base.seq);
     self.tail = self.tail.slice(cp.seq - self.base.seq);
     for (const x of cut) self.tailBytes -= x.text.length;

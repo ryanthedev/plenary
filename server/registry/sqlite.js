@@ -1,6 +1,6 @@
 // The Registry port on SQLite (PROTOCOL.md § Registry): tenants (Units), boards, grants, invites, share links, link uses, and
 // the board organization (Groups, Spaces, Teams, scoped grants, roles, `accessContext`). Start-up only ever ADDS tables
-// (CREATE TABLE IF NOT EXISTS), so opening a database from before the organization is the whole migration, and re-running it is a no-op.
+// (CREATE TABLE IF NOT EXISTS); a file from an older shape is refused (code "old-format"), never migrated.
 // Same contract and semantics as platform's in-memory adapter (server/auth/registry.js); method names are stable.
 //
 // Durable = WAL + synchronous=FULL (+ fullfsync on macOS), like server/store/sqlite.js: a resolved write survives a
@@ -17,15 +17,11 @@
 // `user`; insertion order is an explicit `n` column (Postgres: BIGSERIAL / identity), upserts use ON CONFLICT.
 
 import { Database } from "bun:sqlite";
-import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
+import { RegistryError, batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 
-/** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code`. */
-export class SqlRegistryError extends Error {
-  /** @param {"last-owner"} code */
-  constructor(code, message) { super(message); this.name = "RegistryError"; this.code = code; }
-}
-
+/** An old-format store is refused at start-up (never read silently, never ALTERed). */
+const oldFormat = msg => Object.assign(new Error(msg), { code: "old-format" });
 const str = v => typeof v === "string";
 
 /**
@@ -86,6 +82,10 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   db.run("PRAGMA foreign_keys=ON");
 
   onBusyRetry(db, deadline, () => db.transaction(() => {
+    // A file from before the organization (boards, no Spaces) is an old-format store: refused, never half-filled in.
+    const has = t => !!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(t);
+    if (has("reg_boards") && !has("reg_spaces"))
+      throw oldFormat("sqlite registry: the file has reg_boards but no reg_spaces: it is from an older version. Reset the store (delete the file)");
     db.run(`CREATE TABLE IF NOT EXISTS reg_tenants (
       id TEXT PRIMARY KEY, domain TEXT UNIQUE, created_at INTEGER NOT NULL)`);
     db.run(`CREATE TABLE IF NOT EXISTS reg_tenant_admins (
@@ -110,9 +110,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     db.run(`CREATE TABLE IF NOT EXISTS reg_link_uses (
       board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES reg_links(id), n INTEGER NOT NULL,
       PRIMARY KEY (board, member, link))`);
-    // Board organization (additive: new tables only, so a database from before it opens unchanged; every statement is
-    // IF NOT EXISTS, so re-running start-up is a no-op). Existing boards stay unfiled (no reg_board_spaces row), existing
-    // tenants read as kind "company" with their one domain, and nothing about anyone's access changes.
+    // Board organization (a board with no reg_board_spaces row is unfiled; every statement is IF NOT EXISTS, so re-running start-up is a no-op).
     db.run("CREATE TABLE IF NOT EXISTS reg_tenant_meta (tenant TEXT PRIMARY KEY REFERENCES reg_tenants(id), kind TEXT NOT NULL)");
     db.run(`CREATE TABLE IF NOT EXISTS reg_tenant_domains (
       domain TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), n INTEGER NOT NULL)`);
@@ -140,11 +138,11 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, member TEXT NOT NULL,
       role TEXT NOT NULL, state TEXT NOT NULL, at INTEGER NOT NULL, closed_at INTEGER, UNIQUE (scope_type, scope_id, member))`);
     const askCols = db.query("PRAGMA table_info(reg_access_requests)").all().map(c => c.name).sort().join(",");
-    if (askCols !== "at,closed_at,id,member,role,scope_id,scope_type,state,tenant")   // never ALTERed: an older shape is reset, not migrated
-      throw new Error(`sqlite registry: table reg_access_requests has columns (${askCols}) but this version needs (at,closed_at,id,member,role,scope_id,scope_type,state,tenant): it is from an older version. Reset the store or drop the table (DROP TABLE reg_access_requests); the next start-up recreates it`);
+    if (askCols !== "at,closed_at,id,member,role,scope_id,scope_type,state,tenant")   // never ALTERed: an older shape is reset, not migrated; code old-format
+      throw oldFormat(`sqlite registry: table reg_access_requests has columns (${askCols}) but this version needs (at,closed_at,id,member,role,scope_id,scope_type,state,tenant): it is from an older version. Reset the store or drop the table (DROP TABLE reg_access_requests); the next start-up recreates it`);
     db.run("CREATE INDEX IF NOT EXISTS reg_access_requests_member ON reg_access_requests (tenant, member, at)");
     db.run("CREATE INDEX IF NOT EXISTS reg_access_requests_scope ON reg_access_requests (scope_type, scope_id, state, at DESC)");
-    // Home (PROTOCOL.md § Home): Recent and Starred, one row per (member, board). Additive like the rest.
+    // Home (PROTOCOL.md § Home): Recent and Starred, one row per (member, board).
     db.run(`CREATE TABLE IF NOT EXISTS reg_recents (
       member TEXT NOT NULL, board TEXT NOT NULL REFERENCES reg_boards(id), opened_at INTEGER NOT NULL, PRIMARY KEY (member, board))`);
     db.run(`CREATE TABLE IF NOT EXISTS reg_stars (
@@ -154,7 +152,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, ref TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (member, k))`);
     const idemCols = db.query("PRAGMA table_info(reg_idempotency)").all().map(c => c.name).sort().join(",");
     if (idemCols !== "at,fp,k,member,ref")   // the adapters never ALTER: an older shape is reset, not migrated
-      throw new Error(`sqlite registry: table reg_idempotency has columns (${idemCols}) but this version needs (at,fp,k,member,ref): it is from an older version. Reset the store or drop the table (DROP TABLE reg_idempotency); the next start-up recreates it`);
+      throw oldFormat(`sqlite registry: table reg_idempotency has columns (${idemCols}) but this version needs (at,fp,k,member,ref): it is from an older version. Reset the store or drop the table (DROP TABLE reg_idempotency); the next start-up recreates it`);
     db.run("CREATE INDEX IF NOT EXISTS reg_idempotency_at ON reg_idempotency (at)");
     db.run("CREATE INDEX IF NOT EXISTS reg_recents_member ON reg_recents (member, opened_at DESC, board DESC)");
     db.run("CREATE INDEX IF NOT EXISTS reg_stars_member ON reg_stars (member, at DESC, board DESC)");
@@ -441,7 +439,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     if (!q.boardExists.get(board)) throw new Error("registry: no such board");
     const cur = q.grant.get(board, user)?.role ?? null;
     if (cur === "owner" && role !== "owner" && q.owners.get(board).c <= 1)
-      throw new SqlRegistryError("last-owner", "a board keeps at least one owner");
+      throw new RegistryError("last-owner", "a board keeps at least one owner");
     if (role == null) q.delGrant.run(board, user);
     else q.upGrant.run(board, user, role, q.grantN.get(board).n);
   });
@@ -519,7 +517,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     if (!member && q.teamSize.get(team).c === 1 && q.teamHas.get(team, user)) {
       // Removing the last member of a Team that is the only counted owner of a Group or Space would leave it ownerless.
       for (const o of q.teamOwned.all(team)) if (q.sowners.all(o.scope_type, o.scope_id).length <= 1)
-        throw new SqlRegistryError("last-owner", `a ${o.scope_type} keeps at least one owner`);
+        throw new RegistryError("last-owner", `a ${o.scope_type} keeps at least one owner`);
     }
     (member ? q.insMember : q.delMember).run(team, user);
   });
@@ -527,7 +525,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     needRow(q.team.get(team), "team");
     // An empty Team guards nothing (it is not counted), so only a Team with members can be the last counted owner.
     if (q.teamSize.get(team).c > 0) for (const o of q.teamOwned.all(team)) if (q.sowners.all(o.scope_type, o.scope_id).length <= 1)
-      throw new SqlRegistryError("last-owner", `a ${o.scope_type} keeps at least one owner`);
+      throw new RegistryError("last-owner", `a ${o.scope_type} keeps at least one owner`);
     q.delTeamGrants.run(team); q.delTeamMembers.run(team); q.delTeam.run(team);
   });
   const touchTx = db.transaction((tenant, user, name, email) => {
@@ -537,21 +535,21 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   const setSgrantTx = db.transaction((type, id, st, sid, role) => {
     const tenant = scopeTenant(type, id);
     needRow(tenant, "scope");
-    if (isCustomRoleId(role) && !q.role.get(tenant, role)) throw new SqlRegistryError("no-role", "no such custom role in this Unit");
+    if (isCustomRoleId(role) && !q.role.get(tenant, role)) throw new RegistryError("no-role", "no such custom role in this Unit");
     if (st === "team") needRow(q.team.get(sid)?.tenant === tenant, "team");
     if (type === "board" && st === "user") throw new Error("registry: a user's grant on a board is setGrant");
     const cur = q.sgrant.get(type, id, st, sid)?.role ?? null;
     if ((type === "group" || type === "space") && cur === "owner" && role !== "owner") {
       const counted = q.sowners.all(type, id);
       if (counted.some(o => o.subject_type === st && o.subject === sid) && counted.length <= 1)
-        throw new SqlRegistryError("last-owner", `a ${type} keeps at least one owner`);
+        throw new RegistryError("last-owner", `a ${type} keeps at least one owner`);
     }
     putSg(type, id, st, sid, role);
   });
   const createRoleTx = db.transaction((tenant, name, base, boardRole, perms, createdAt, max, idem) => {
     needRow(q.tenantExists.get(tenant), "tenant");
     idemEnter(idem, createdAt);
-    if (max !== undefined && q.roleCount.get(tenant).n >= max) throw new SqlRegistryError("limit", "the Unit has the most custom roles it can");
+    if (max !== undefined && q.roleCount.get(tenant).n >= max) throw new RegistryError("limit", "the Unit has the most custom roles it can");
     const id = fresh(mint.role, i => !!q.role.get(tenant, i));
     q.insRole.run(tenant, id, name, base, boardRole, JSON.stringify(perms), createdAt);
     idemPut(idem, id, createdAt);
@@ -559,7 +557,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   });
   const deleteRoleTx = db.transaction((tenant, id) => {
     needRow(q.role.get(tenant, id), "role");
-    if (q.roleHeld.get(id, 1, tenant)) throw new SqlRegistryError("in-use", "a grant still holds this role");
+    if (q.roleHeld.get(id, 1, tenant)) throw new RegistryError("in-use", "a grant still holds this role");
     q.delRole.run(tenant, id);
   });
   const updateRoleTx = db.transaction((tenant, id, patch, createdAt) => {

@@ -1,6 +1,6 @@
 // The Registry port on Postgres (PROTOCOL.md § Registry): tenants (Units), boards, grants, invites, share links, link uses, and
 // the board organization (Groups, Spaces, Teams, scoped grants, roles, `accessContext`). The organization tables are created
-// like the rest (only if missing, to_regclass), and the seven original tables are never altered: that is the migration.
+// like the rest (only if missing, to_regclass); nothing is ever altered, and a store from an older shape is refused (code "old-format").
 // Same contract and semantics as server/auth/registry.js (memory) and server/registry/sqlite.js; method names are
 // stable. Tested by test/auth/registry-contract.js.
 //
@@ -34,7 +34,7 @@
 //     are bounded on a caller's `sql` too. Reads on a caller's `sql` use that client's session settings (pass
 //     `connection: { lock_timeout, statement_timeout }` when you build it); without them only the client-side
 //     backstop below bounds them for the caller, and the connection stays busy until the lock clears.
-//   - A call that runs out on the server rejects with a PgRegistryError: code "lock-timeout" (55P03, waited
+//   - A call that runs out on the server rejects with a RegistryError: code "lock-timeout" (55P03, waited
 //     lockTimeoutMs for a lock) or "statement-timeout" (57014 with Postgres's statement-timeout message, ran past
 //     statementTimeoutMs; with equal limits this one fires first on a lock wait too). The connection is usable again
 //     at once: Postgres cancels the statement, not the session. Any other cancel passes through unchanged.
@@ -71,21 +71,9 @@
 // owns that pool) or `sql` (a Bun SQL client you own). `schema` names the Postgres schema. Never reads env.
 
 import { SQL } from "bun";
-import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
+import { RegistryError, batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
-import { needSchema, migrate, assertColumns, missing as absent } from "../pg/schema.js";
-
-/**
- * Thrown by `setGrant` when the change would leave a board with no owner ("last-owner"), by a call that ran out of time
- * on the server ("lock-timeout", "statement-timeout"), and by the client-side gate ("overloaded" and "queue-timeout":
- * never sent; "client-timeout": sent, no answer). Match on `err.code`.
- */
-export class PgRegistryError extends Error {
-  /** @param {"last-owner" | "limit" | "in-use" | "lock-timeout" | "statement-timeout" | "overloaded" | "queue-timeout" | "client-timeout"} code */
-  constructor(code, message, options) {
-    super(message, options); this.name = "RegistryError"; this.code = code;
-  }
-}
+import { needSchema, migrate, assertColumns, missing } from "../pg/schema.js";
 
 const UNIQUE = "23505";
 /** SQLSTATEs: insufficient_privilege; lock_not_available (lock_timeout fired); query_canceled (statement_timeout). */
@@ -111,9 +99,7 @@ const REGISTRY_TABLE_DDL = {
   reg_invites: "n BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES $S.reg_boards(id), email TEXT NOT NULL, role TEXT NOT NULL, expires_at BIGINT, revoked BOOLEAN NOT NULL, by_user TEXT, created_at BIGINT NOT NULL",
   reg_links: "n BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES $S.reg_boards(id), role TEXT NOT NULL, expires_at BIGINT, revoked BOOLEAN NOT NULL, by_user TEXT, created_at BIGINT NOT NULL",
   reg_link_uses: "board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES $S.reg_links(id), n BIGINT GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (board, member, link)",
-  // Board organization (PROTOCOL.md § Registry, "Organization"). Additive: only new tables, never an ALTER of the seven above,
-  // so a schema from before it (or one an owner role migrated with only those) just gains these at the next start-up, and
-  // a board with no reg_board_spaces row is unfiled, a tenant with no reg_tenant_meta row is kind "company".
+  // Board organization (PROTOCOL.md § Registry, "Organization"). A board with no reg_board_spaces row is unfiled.
   reg_tenant_meta: "tenant TEXT PRIMARY KEY REFERENCES $S.reg_tenants(id), kind TEXT NOT NULL",
   reg_tenant_domains: "domain TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), n BIGINT GENERATED ALWAYS AS IDENTITY",
   reg_groups: "id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), name TEXT NOT NULL, general_role TEXT, created_at BIGINT NOT NULL",
@@ -123,7 +109,7 @@ const REGISTRY_TABLE_DDL = {
   reg_team_members: "team TEXT NOT NULL REFERENCES $S.reg_teams(id), member TEXT NOT NULL, PRIMARY KEY (team, member)",
   reg_members: "tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), member TEXT NOT NULL, name TEXT, email TEXT, PRIMARY KEY (tenant, member)",
   reg_scope_grants: "scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject TEXT NOT NULL, role TEXT NOT NULL, n BIGINT GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (scope_type, scope_id, subject_type, subject)",
-  // Home (PROTOCOL.md § Home): Recent and Starred. Additive, like the organization tables.
+  // Home (PROTOCOL.md § Home): Recent and Starred.
   reg_recents: "member TEXT NOT NULL, board TEXT NOT NULL REFERENCES $S.reg_boards(id), opened_at BIGINT NOT NULL, PRIMARY KEY (member, board)",
   reg_stars: "member TEXT NOT NULL, board TEXT NOT NULL REFERENCES $S.reg_boards(id), at BIGINT NOT NULL, PRIMARY KEY (member, board)",
   // Access requests (PROTOCOL.md § Access explanation and requests): one row per (scope, member); a dismissed row stays until its cooldown ends.
@@ -195,24 +181,27 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       // lock with equal limits, and DDL itself only ever waits on locks), so a stuck holder reads as "lock-timeout".
       await tx.unsafe("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', '0', true)", [String(lockMs)]);
       await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-schema:${s}`]);
+      // A schema from before the organization (boards, no Spaces) is an old-format store: refused, never half-filled in.
+      if (!(await missing(tx, s, ["reg_boards"])).length && (await missing(tx, s, ["reg_spaces"])).length)
+        throw Object.assign(new Error(`postgres registry: schema "${s}" has reg_boards but no reg_spaces: it is from an older version. Reset the store (drop the schema's reg_* tables); the next start-up recreates them`), { code: "old-format" });
       await migrate(tx, s, registryTables(s));
       await assertColumns(tx, s, "reg_access_requests", ["id", "tenant", "scope_type", "scope_id", "member", "role", "state", "at", "closed_at"]);   // never altered: an older shape is reset
       await assertColumns(tx, s, "reg_idempotency", ["member", "k", "fp", "ref", "at"]);   // holds only 24 h of keys; an older shape is reset, never altered
-      const noIndex = await absent(tx, s, Object.keys(REGISTRY_INDEXES));
+      const noIndex = await missing(tx, s, Object.keys(REGISTRY_INDEXES));
       if (noIndex.length) await tx.unsafe(noIndex.map(name => `CREATE INDEX ${name} ON "${s}".${REGISTRY_INDEXES[name]}`).join(";\n"));
       // Every right on every table, each on its own (the names are constants and `s` passed needSchema).
       const pairs = Object.keys(REGISTRY_TABLE_DDL).flatMap(t => RIGHTS.map(p => `('${t}', '${p}')`)).join(", ");
-      const missing = await tx.unsafe(`SELECT t, p FROM (VALUES ${pairs}) AS v(t, p)
+      const noRight = await tx.unsafe(`SELECT t, p FROM (VALUES ${pairs}) AS v(t, p)
         WHERE NOT has_table_privilege(format('%I.%I', $1::text, t), p)`, [s]);
-      if (missing.length) {
-        const lack = missing.map(m => `${m.p} on ${m.t}`).join(", ");
+      if (noRight.length) {
+        const lack = noRight.map(m => `${m.p} on ${m.t}`).join(", ");
         throw Object.assign(new Error(`permission denied: this role lacks ${lack}`), { errno: DENIED });
       }
     });
   } catch (err) {
     if (owned) await db.close();
     if (err?.errno === LOCK_TIMEOUT) {
-      throw new PgRegistryError("lock-timeout", `postgres registry: start-up waited ${lockMs} ms for schema "${s}"'s start-up lock, `
+      throw new RegistryError("lock-timeout", `postgres registry: start-up waited ${lockMs} ms for schema "${s}"'s start-up lock, `
         + "held by another session (a migrate or a node starting); try again, or end that session", { cause: err });
     }
     if (err?.errno === DENIED) {
@@ -237,9 +226,9 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
   });
   /** A Postgres timeout as a coded rejection; anything else unchanged. */
   const timedOut = (name, err, stmtLimit = stmtMs) => {
-    if (err?.errno === LOCK_TIMEOUT) return new PgRegistryError("lock-timeout", `postgres registry: ${name} waited over ${lockMs} ms for a lock`, { cause: err });
+    if (err?.errno === LOCK_TIMEOUT) return new RegistryError("lock-timeout", `postgres registry: ${name} waited over ${lockMs} ms for a lock`, { cause: err });
     // 57014 is any cancel; only statement_timeout's is ours to name (an operator's pg_cancel_backend passes through).
-    if (err?.errno === CANCELED && /statement timeout/.test(err.message)) return new PgRegistryError("statement-timeout", `postgres registry: ${name} ran past ${stmtLimit} ms (statement_timeout)`, { cause: err });
+    if (err?.errno === CANCELED && /statement timeout/.test(err.message)) return new RegistryError("statement-timeout", `postgres registry: ${name} ran past ${stmtLimit} ms (statement_timeout)`, { cause: err });
     return err;
   };
   const one = async (q, text, params) => (await q.unsafe(text, params))[0] ?? null;
@@ -416,7 +405,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         const cur = (await one(tx, `SELECT role FROM ${G} WHERE board = $1 AND member = $2`, [board, u]))?.role ?? null;
         if (cur === "owner" && r !== "owner") {
           const c = Number((await one(tx, `SELECT count(*) AS c FROM ${G} WHERE board = $1 AND role = 'owner'`, [board])).c);
-          if (c <= 1) throw new PgRegistryError("last-owner", "a board keeps at least one owner");
+          if (c <= 1) throw new RegistryError("last-owner", "a board keeps at least one owner");
         }
         if (r == null) await tx.unsafe(`DELETE FROM ${G} WHERE board = $1 AND member = $2`, [board, u]);
         else await tx.unsafe(`INSERT INTO ${G} (board, member, role) VALUES ($1, $2, $3)
@@ -641,7 +630,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         await tx.unsafe(`DELETE FROM ${TU} WHERE team = $1 AND member = $2`, [team, u]);
         if (Number((await one(tx, `SELECT count(*) AS c FROM ${TU} WHERE team = $1`, [team])).c) === 0)
           for (const o of await ownedBy(tx, team))
-            if (!(await countedOwners(tx, o.scope_type, o.scope_id)).length) throw new PgRegistryError("last-owner", `a ${o.scope_type} keeps at least one owner`);
+            if (!(await countedOwners(tx, o.scope_type, o.scope_id)).length) throw new RegistryError("last-owner", `a ${o.scope_type} keeps at least one owner`);
       });
     },
     async teamMembers(team) {
@@ -668,7 +657,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         // An empty Team guards nothing, so only a Team with members can be the last counted owner.
         if (Number((await one(tx, `SELECT count(*) AS c FROM ${TU} WHERE team = $1`, [team])).c) > 0)
           for (const o of await ownedBy(tx, team))
-            if ((await countedOwners(tx, o.scope_type, o.scope_id)).length <= 1) throw new PgRegistryError("last-owner", `a ${o.scope_type} keeps at least one owner`);
+            if ((await countedOwners(tx, o.scope_type, o.scope_id)).length <= 1) throw new RegistryError("last-owner", `a ${o.scope_type} keeps at least one owner`);
         await tx.unsafe(`DELETE FROM ${SG} WHERE subject_type = 'team' AND subject = $1`, [team]);
         await tx.unsafe(`DELETE FROM ${TU} WHERE team = $1`, [team]);
         await tx.unsafe(`DELETE FROM ${TE} WHERE id = $1`, [team]);
@@ -745,7 +734,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         const tenant = await tenantOfScope(tx, type, id);
         if (!tenant) throw new Error("registry: no such scope");
         // FOR KEY SHARE conflicts with deleteRole's FOR UPDATE: the delete either waits for this grant (then sees it: in-use) or has committed (no row: refused).
-        if (isCustomRoleId(r) && !(await one(tx, `SELECT 1 AS x FROM ${RO} WHERE tenant = $1 AND id = $2 FOR KEY SHARE`, [tenant, r]))) throw new PgRegistryError("no-role", "no such custom role in this Unit");
+        if (isCustomRoleId(r) && !(await one(tx, `SELECT 1 AS x FROM ${RO} WHERE tenant = $1 AND id = $2 FOR KEY SHARE`, [tenant, r]))) throw new RegistryError("no-role", "no such custom role in this Unit");
         if (sub.type === "team" && (await one(tx, `SELECT tenant FROM ${TE} WHERE id = $1`, [sub.id]))?.tenant !== tenant) throw new Error("registry: no such team");
         if (type === "board" && sub.type === "user") throw new Error("registry: a user's grant on a board is setGrant");
         if (type === "group" || type === "space") {
@@ -760,7 +749,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
               ORDER BY team, member FOR SHARE`, [type, id]);
             const counted = await countedOwners(tx, type, id);
             if (counted.some(o => o.subject_type === sub.type && o.subject === sub.id) && counted.length <= 1)
-              throw new PgRegistryError("last-owner", `a ${type} keeps at least one owner`);
+              throw new RegistryError("last-owner", `a ${type} keeps at least one owner`);
           }
         }
         await putSg(tx, type, id, sub.type, sub.id, r);
@@ -780,7 +769,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         let id;
         for (;;) { id = mint.role(); if (!(await one(tx, `SELECT 1 AS x FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id]))) break; }
         await idemPut(tx, k, id, createdAt);          // before the cap: a replay of a role that fit is a replay even when the Unit is full now
-        if (max !== undefined && (await one(tx, `SELECT count(*)::int AS n FROM ${RO} WHERE tenant = $1 AND id <> $2`, [tenant, MEMBER_ROLE_ID])).n >= max) throw new PgRegistryError("limit", "the Unit has the most custom roles it can");
+        if (max !== undefined && (await one(tx, `SELECT count(*)::int AS n FROM ${RO} WHERE tenant = $1 AND id <> $2`, [tenant, MEMBER_ROLE_ID])).n >= max) throw new RegistryError("limit", "the Unit has the most custom roles it can");
         await tx.unsafe(`INSERT INTO ${RO} (tenant, id, name, base, board_role, permissions, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
           [tenant, id, n, nz(base), nz(boardRole), perms, createdAt]);
         return rowRole(await one(tx, `SELECT * FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id]));
@@ -813,7 +802,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       if (!key(tenant) || !key(id)) throw new Error("registry: no such role");
       return write(async tx => {
         if (!(await one(tx, `SELECT 1 AS x FROM ${RO} WHERE tenant = $1 AND id = $2 FOR UPDATE`, [tenant, id]))) throw new Error("registry: no such role");
-        if (await one(tx, `SELECT 1 AS x FROM ${SG} g WHERE g.role = $1 AND ${ownGrant("$2")} LIMIT 1`, [id, tenant])) throw new PgRegistryError("in-use", "a grant still holds this role");
+        if (await one(tx, `SELECT 1 AS x FROM ${SG} g WHERE g.role = $1 AND ${ownGrant("$2")} LIMIT 1`, [id, tenant])) throw new RegistryError("in-use", "a grant still holds this role");
         await tx.unsafe(`DELETE FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id]);
       });
     },
@@ -1184,7 +1173,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     const send = () => {
       clearTimeout(timer);
       running++;
-      timer = setTimeout(() => settle(reject, new PgRegistryError("client-timeout",
+      timer = setTimeout(() => settle(reject, new RegistryError("client-timeout",
         `postgres registry: ${name} was sent but had no answer after ${limit + BACKSTOP_MS} ms (it may still have taken effect)`)), limit + BACKSTOP_MS);
       // The slot is held until the call really settles, even after the backstop answered the caller.
       Promise.resolve().then(() => f(...args)).then(v => settle(resolve, v), err => settle(reject, timedOut(name, err)))
@@ -1192,11 +1181,11 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     };
     if (running < slots) return send();
     if (waiting.length >= room) {
-      return settle(reject, new PgRegistryError("overloaded",
+      return settle(reject, new RegistryError("overloaded",
         `postgres registry: ${name} refused: ${running} calls running and ${waiting.length} waiting (nothing sent)`));
     }
     /** Rejects without sending and without taking a slot (the queue timer, or pump finding the deadline passed). */
-    const expire = () => settle(reject, new PgRegistryError("queue-timeout",
+    const expire = () => settle(reject, new RegistryError("queue-timeout",
       `postgres registry: ${name} waited ${queueMs} ms for a free connection and was not sent`));
     const entry = { send, expire, deadline: performance.now() + queueMs, fail: err => settle(reject, err) };
     waiting.push(entry);

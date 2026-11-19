@@ -335,16 +335,16 @@ export function storeContract(name, make) {
       expect(skipped.length).toBe(1);
     });
 
-    test("parts: a checkpoint in the old format (one big row of JSON, no header) still reads, alone and beside parts", async () => {
+    test("parts: a checkpoint stored as one plain row of JSON (no header) reads, alone and beside parts", async () => {
       const { store, raw } = await fresh({ partChars: PART });
       const e = await own(store);
-      const old = big(10, "legacy");
-      await raw.putCheckpointRow(T, B, 10, JSON.stringify(old));
-      expect(await store.getCheckpoint(T, B)).toEqual(JSON.parse(JSON.stringify(old)));
+      const plain = big(10, "plain");
+      await raw.putCheckpointRow(T, B, 10, JSON.stringify(plain));
+      expect(await store.getCheckpoint(T, B)).toEqual(JSON.parse(JSON.stringify(plain)));
       await store.putCheckpoint(T, B, big(20, "parts"), e);
       expect((await store.getCheckpoint(T, B)).tag).toBe("parts");
-      expect((await store.getCheckpoint(T, B, 20)).tag).toBe("legacy");
-      for (const seq of [30, 40]) await store.putCheckpoint(T, B, big(seq, `p${seq}`), e);   // the old row is pruned like any other
+      expect((await store.getCheckpoint(T, B, 20)).tag).toBe("plain");
+      for (const seq of [30, 40]) await store.putCheckpoint(T, B, big(seq, `p${seq}`), e);   // the plain row is pruned like any other
       expect(await store.getCheckpoint(T, B, 20)).toBe(null);
     });
 

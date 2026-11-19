@@ -65,6 +65,6 @@ export async function assertColumns(tx, schema, table, columns) {
   const have = (await tx.unsafe(`SELECT a.attname AS column_name FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attname`, [s, table])).map(r => r.column_name);
   if (have.length && JSON.stringify(have) !== JSON.stringify([...columns].sort()))
-    throw new Error(`postgres: table "${s}".${table} has columns (${have.join(", ")}) but this version needs (${[...columns].sort().join(", ")}): it is from an older version. `
-      + `Reset the store, or have the schema owner run DROP TABLE "${s}".${table} (the runtime role cannot); the next start-up recreates it`);
+    throw Object.assign(new Error(`postgres: table "${s}".${table} has columns (${have.join(", ")}) but this version needs (${[...columns].sort().join(", ")}): it is from an older version. `
+      + `Reset the store, or have the schema owner run DROP TABLE "${s}".${table} (the runtime role cannot); the next start-up recreates it`), { code: "old-format" });
 }

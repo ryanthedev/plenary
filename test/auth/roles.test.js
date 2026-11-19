@@ -473,7 +473,7 @@ describe("over HTTP", () => {
     expect([above.status, above.body]).toEqual([403, { error: "forbidden" }]);
     await r.updateRole(acme.id, mgr.id, { permissions: ["roles.manage", "move"] });
     expect((await api("max", "/roles", "POST", body, h)).headers.get("idempotent-replayed")).toBe("true");
-    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: U("dev:max"), role: null });   // lost roles.manage
+    await r.updateRole(acme.id, mgr.id, { permissions: ["move"] });                              // keeps `move` (the role is still within their rights) but loses roles.manage
     const lost = await api("max", "/roles", "POST", body, h);
     expect([lost.status, lost.body]).toEqual([403, { error: "forbidden" }]);
   });

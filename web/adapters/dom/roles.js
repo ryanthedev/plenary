@@ -92,7 +92,7 @@ export function mountRolesPage({ root, model, hrefs, signIn = null }) {
       S.confirm ? h("div.banner", { role: "alert" }, h("p", {}, impactText(r ?? { kind: "custom" }, S.confirm.impact), " Saving changes what they can do within about a minute."),
         keys.mark(act({}, "Save anyway", () => { after = () => "save"; model.confirmSave(); }, () => S.busy), "confirm-save"), keys.mark(act({}, "Cancel", () => { after = () => "save"; model.cancelConfirm(); }, () => S.busy), "confirm-cancel")) : null,
       h("div.pick-row", {}, saveBtn, discardBtn, r ? keys.mark(act({}, "Duplicate", () => { after = () => "heading-detail"; model.duplicate(r.id); }, () => S.busy), "duplicate") : null),
-      r?.kind === "custom" && !d?.isNew ? h("section.danger", { "aria-label": "Delete role" }, deleting
+      r?.kind === "custom" && r.editable && !d?.isNew ? h("section.danger", { "aria-label": "Delete role" }, deleting
         ? [h("p", {}, `Delete ${r.name}? A role that is in use cannot be deleted.`),
           keys.mark(act({}, "Delete role", () => { deleting = false; after = () => model.roleOf(r.id) ? "delete-role" : "heading"; model.remove(); }, () => S.busy), "confirm-delete"),
           keys.mark(act({}, "Cancel", () => { deleting = false; after = () => "delete-role"; render(); }, () => S.busy), "cancel-delete")]

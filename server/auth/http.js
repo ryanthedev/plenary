@@ -244,6 +244,18 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
     } catch { return null; }
   }
 
+  // The member directory write after a sign-in: best effort and bounded. At most TOUCH_MAX in flight and one per user at a time; the excess is
+  // dropped (Home records the person later). A failure logs one rate-limited line, never a name, id or error text.
+  const TOUCH_MAX = 16, touching = new Set();
+  let lastTouchWarn = -Infinity;
+  function recordMember(identity) {
+    if (typeof registry.touchMember !== "function" || touching.size >= TOUCH_MAX || touching.has(identity.user)) return;
+    touching.add(identity.user);
+    (async () => { const unit = await tenancy.tenantOf(identity); if (unit) await registry.touchMember(unit.id, identity); })()
+      .catch(() => { if (now() - lastTouchWarn >= 60_000) { lastTouchWarn = now(); try { log?.warn?.("member directory write failed; Home records the person later"); } catch {} } })
+      .finally(() => touching.delete(identity.user));
+  }
+
   async function exchange(req) {
     if (!oidc) return err(503, "sign-in-unavailable");
     // Origin first: a refusal here spends nothing (the contract's fake does the same).
@@ -263,7 +275,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
     try { exp = (await sessions.verify(token))?.exp; } catch { exp = null; }
     if (!Number.isInteger(exp)) { usedCodes.release(x.h); return err(503, "unavailable"); }
     // The member directory (PROTOCOL.md § Teams and access): a Unit member who signs in is findable by the pickers. Best effort, off the request path.
-    void (async () => { const unit = await tenancy.tenantOf(x.identity); if (unit && typeof registry.touchMember === "function") await registry.touchMember(unit.id, x.identity); })().catch(() => {});
+    recordMember(x.identity);
     return withCookie(json(200, { token, ...x.identity, exp }), clearXchg);
   }
 

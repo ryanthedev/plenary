@@ -6,7 +6,7 @@
 // behind its one role picker, the people/Team search the picker uses, and the announcements each change owes the gateways (handed to the
 // scheduler in spaces.js through `announce`; it never holds a queue of its own).
 
-import { AdminError } from "../admin/boards.js";
+import { AdminError, knownOnBoard } from "../admin/boards.js";
 import { isUnitAdmin } from "./resolver.js";
 import { ROLES } from "./util.js";
 import { roleDef, MGMT_PERMS } from "./permissions.js";
@@ -360,8 +360,8 @@ export function accessService({ registry, tenancy, announce = () => {}, backlog 
         if (!def) throw refused();
         if (cur === role) return { ...(await rowOf(unit, sub, role, roles, type, access, admin, identity)) };
         if (cur != null && !touch(cur)) throw refused();
-        // A change to an existing grant, and any person's grant on a board (guests hold board scope), need no directory row; a NEW grant above a board does.
-        if (subjectType === "user") { if (cur == null && type !== "board" && !(await isKnownPerson(unit, sid))) throw new AdminError("unknown-person", "that person is not a member of this Unit"); }
+        // A change to an existing grant needs no directory row. A NEW person grant above a board needs one; on a board, the shared rule of the old route (guests hold board scope).
+        if (subjectType === "user") { if (cur == null && !(await (personBoard ? knownOnBoard(registry, row, sid) : isKnownPerson(unit, sid)))) throw new AdminError("unknown-person", "that person is not a member of this Unit"); }
         else if (!(await registry.teamsAmong(unit.id, [sid])).length) throw refused();
       }
       try {

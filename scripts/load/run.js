@@ -352,8 +352,8 @@ export async function createBoard(wsUrl, tokensPath, { timeoutMs = CREATE_BOARD_
   const table = readTokensTable(tokensPath);   // never the parser's message: it can quote a token
   const admin = Object.entries(table).find(([, t]) => t?.admin === true && t.domain);
   if (!admin) throw new Error("--create-board needs a token with admin: true and a domain in the tokens file");
-  const call = async (method, path, body) => {
-    const res = await fetch(base + path, { method, headers: { authorization: `Bearer ${admin[0]}`, "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+  const call = async (method, path, body, token = admin[0]) => {
+    const res = await fetch(base + path, { method, headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
     // Only a short code-shaped `error` is echoed: never free text from the server (it could hold anything).
     if (!res.ok) { let code = ""; try { const e = (await res.json()).error; if (typeof e === "string" && /^[a-z_-]{1,40}$/.test(e)) code = e; } catch { /* not JSON */ } throw new Error(`${method} ${path.replace(/grants\/.*/, "grants/…")}: ${res.status} ${code}`); }
     return res.status === 204 ? null : res.json();
@@ -362,6 +362,7 @@ export async function createBoard(wsUrl, tokensPath, { timeoutMs = CREATE_BOARD_
   const id = typeof board === "string" ? board : board.id;
   for (const [tok, t] of Object.entries(table)) {
     if (tok === admin[0] || !t?.name || (t.role ?? "editor") === "viewer") continue;
+    await call("GET", "/home", undefined, tok);   // the server records a person at their first Home: a grant to an unseen person is refused (unknown-person)
     await call("PUT", `/boards/${encodeURIComponent(id)}/grants/${encodeURIComponent("dev:" + t.name)}`, { role: t.role ?? "editor" });
   }
   return id;

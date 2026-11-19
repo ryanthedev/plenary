@@ -400,6 +400,10 @@ describe("grant writes: add, change, remove, idempotency, announcements", () => 
     expect(row).toMatchObject({ role: "editor", can: { change: true, remove: true } });
     expect(await svc.setGrant(ada, "board", board.id, "user", kim.user, "viewer")).toMatchObject({ role: "viewer" });
     expect(await r.grant(board.id, kim.user)).toBe("viewer");
+    // a new guest: accepted once they redeemed a link of this board
+    const lk = await r.createLink({ board: board.id, role: "viewer", by: ada.user });
+    expect(await code(svc.setGrant(ada, "board", board.id, "user", "google:newguest", "commenter"))).toBe("unknown-person");
+    await r.addLinkUse(lk.id, "google:newguest");
     expect(await svc.setGrant(ada, "board", board.id, "user", "google:newguest", "commenter")).toMatchObject({ role: "commenter" });
     await svc.setGrant(ada, "board", board.id, "user", kim.user, null);
     expect(await r.grant(board.id, kim.user)).toBe(null);
@@ -409,6 +413,17 @@ describe("grant writes: add, change, remove, idempotency, announcements", () => 
     const stale = (await svc.accessPage(ada, "space", design.id)).rows.find(x => x.subject.id === kim.user);
     expect(stale.can.change).toBe(true);
     expect(await svc.setGrant(ada, "space", design.id, "user", kim.user, "viewer")).toMatchObject({ role: "viewer" });
+  });
+  test("a NEW person grant on a board needs a person the server knows: directory, link use or an existing grant; email:, garbage, another Unit's member and never-seen ids are refused", async () => {
+    const globex = await r.createTenant({ domain: "globex.com" });
+    await r.touchMember(globex.id, { user: "google:gina", name: "Gina" });
+    await r.addTenantAdmin(acme.id, "email:zed@acme.com");
+    for (const u of ["email:zed@acme.com", "email:", "google:nobody", "google:gina", "dev:ADA", "x".repeat(201), "a\0b"]) {
+      expect([u.slice(0, 12), await code(svc.setGrant(ada, "board", board.id, "user", u, "viewer"))]).toEqual([u.slice(0, 12), u.includes("\0") || u.length > 200 ? "bad-request" : "unknown-person"]);
+      expect(await r.grant(board.id, u)).toBe(null);
+    }
+    expect(await svc.setGrant(ada, "board", board.id, "user", max.user, "viewer")).toMatchObject({ role: "viewer" });          // in the directory
+    expect(await svc.setGrant(root, "board", board.id, "user", "google:root", "viewer").catch(e => e.code)).not.toBe("unknown-person");   // an admin named by id
   });
   test("an `email:` admin entry (not yet seen) is not a person: it cannot be added to a Team", async () => {
     await r.addTenantAdmin(acme.id, "email:zed@acme.com");

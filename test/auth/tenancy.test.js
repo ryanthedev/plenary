@@ -21,6 +21,7 @@ beforeEach(async () => {
   acme = await registry.createTenant({ domain: "acme.com", admins: [admin.user] });
   globex = await registry.createTenant({ domain: "globex.com", admins: ["google:gadmin"] });
   board = await createBoard({ caller: admin, tenant: acme.id, title: "All hands" }, { registry });
+  for (const p of [ann, bob]) await registry.touchMember(acme.id, { user: p.user });     // the directory (a new person grant on a board needs a known person); it adds no access
 });
 
 test("tenant and board ids are server-minted [a-z0-9-], never a domain, never a dot", async () => {
@@ -250,4 +251,26 @@ test("a Unit with a second domain: members of either get memberRole; an email ad
   expect(isUnitAdmin(t, pat)).toBe(true);
   expect(isUnitAdmin(t, id("google:pat", "evil.com", "pat@acme.io"))).toBe(false);
   expect(await model.role(id("google:zed", "globex.com", "z@globex.com"), board.id)).toBe(null);
+});
+
+test("setGrant (the old route) names only people the server knows on the board: directory, existing grant, link use; email:, garbage, another Unit's member and never-seen ids are unknown-person", async () => {
+  await registry.touchMember(globex.id, { user: "google:gina" });
+  await registry.addTenantAdmin(acme.id, "email:zed@acme.com");
+  for (const user of ["email:zed@acme.com", "email:", "google:nobody", "google:gina", "dev:ANN", "not a user"]) {
+    await expect(setGrant({ caller: admin, board: board.id, user, role: "viewer" }, { registry })).rejects.toMatchObject({ code: "unknown-person" });
+    expect(await registry.grant(board.id, user)).toBe(null);
+  }
+  await expect(setGrant({ caller: admin, board: board.id, user: "google:nobody", role: null }, { registry })).resolves.toBeUndefined();   // removing nothing is never refused
+  // a directory member and a guest who redeemed a link of this board
+  await setGrant({ caller: admin, board: board.id, user: ann.user, role: "editor" }, { registry });
+  const l = await registry.createLink({ board: board.id, role: "viewer", by: admin.user });
+  await expect(setGrant({ caller: admin, board: board.id, user: gus.user, role: "viewer" }, { registry })).rejects.toMatchObject({ code: "unknown-person" });
+  await registry.addLinkUse(l.id, gus.user);
+  await setGrant({ caller: admin, board: board.id, user: gus.user, role: "viewer" }, { registry });
+  // an existing grant can be changed whatever happens to the person's other records
+  await registry.setGrant(board.id, "google:old", "viewer");
+  await setGrant({ caller: admin, board: board.id, user: "google:old", role: "editor" }, { registry });
+  expect(await registry.grant(board.id, "google:old")).toBe("editor");
+  await setGrant({ caller: admin, board: board.id, user: "google:old", role: null }, { registry });
+  expect(await registry.grant(board.id, "google:old")).toBe(null);
 });

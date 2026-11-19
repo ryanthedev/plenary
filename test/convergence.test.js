@@ -24,8 +24,11 @@ function edit(w, c) {
   w.send(c, stream, { elements: [touch(el)] });
 }
 
-for (const seed of [1, 2, 3, 4, 5, 6, 7, 8]) test(`replicas converge under shuffled, duplicated delivery, reconnects and room restarts (seed ${seed})`, () => {
-  const w = world(["owner", "editor", "editor", "annotator", "viewer"], seed);
+// `fold`: a small byte trigger, so the room checkpoints many times (§ Recovery, "When") and clients that come back
+// join from a snapshot of some earlier fold plus a short tail: joiners at every point must still end in one state.
+const runs = [...[1, 2, 3, 4, 5, 6, 7, 8].map(seed => [seed, undefined]), ...[11, 12, 13, 14].map(seed => [seed, 1_200])];
+for (const [seed, fold] of runs) test(`replicas converge under shuffled, duplicated delivery, reconnects and room restarts (seed ${seed}${fold ? `, a checkpoint every ${fold} bytes` : ""})`, () => {
+  const w = world(["owner", "editor", "editor", "annotator", "viewer"], seed, fold ? { foldBytes: fold } : {});
   for (let round = 0; round < 400; round++) {
     const c = w.clients[Math.floor(w.rng() * w.clients.length)];
     if (w.rng() < 0.6) edit(w, c);
@@ -50,6 +53,7 @@ for (const seed of [1, 2, 3, 4, 5, 6, 7, 8]) test(`replicas converge under shuff
   expect(w.log.entries.map(e => e.seq)).toEqual(w.log.entries.map((_, i) => i + 1));
   expect(new Set(w.log.entries.map(e => `${e.by}|${e.id}`)).size).toBe(w.log.entries.length);   // no op logged twice
   expect(w.rebuild({ keep: true }).state()).toEqual(want2);
+  if (fold) expect(w.log.checkpoints.length).toBeGreaterThan(3);   // it did join from folds of many ages
 });
 
 test("two editors change the same element at the same version: every copy keeps the same winner", () => {

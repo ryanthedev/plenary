@@ -24,6 +24,11 @@
 //   - close() is final: the socket is closed, nothing more is delivered, send/reopen do nothing.
 //   - No token here at all: the URL is used exactly as given and no subprotocol is passed (Sec-WebSocket-Protocol
 //     is a header). The token travels only in the `hello` the core sends (PROTOCOL.md, Herdr refuses credential headers).
+//   - Compressed catch-up (PROTOCOL.md § Joining): where the runtime can inflate (`inflate`: the root passes the browser's
+//     DecompressionStream), the URL asks for it (`?z=deflate`; a capability, never a credential) and the
+//     server then sends big catch-up texts as binary frames holding one zlib stream. Such a frame is inflated and
+//     decoded like the text frame it stands for; frames are delivered in arrival order, so a text frame behind a
+//     binary one waits for it. A frame that does not inflate is a bad frame: the socket drops, as for any the codec rejects.
 //   - Never throws for a network reason; a frame it cannot decode never throws out of the socket's event handler (only
 //     the core's own onMessage handler can, which is the core's bug to see). Retry and backoff live in
 //     the core (Replica.reconnectWait), never here.
@@ -49,6 +54,19 @@ export function frameBytes(data) {
   return data?.byteLength ?? data?.size ?? 0;
 }
 
+/** The browser's inflate (zlib stream → bytes), or null where there is no DecompressionStream (then the URL asks for nothing). */
+export function browserInflate() {
+  if (typeof globalThis.DecompressionStream !== "function" || typeof globalThis.Response !== "function") return null;
+  return async bytes => new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(new globalThis.DecompressionStream("deflate"))).arrayBuffer());
+}
+
+/** `url` with `z=deflate` (§ Joining): this client can inflate catch-up. */
+export function withDeflate(url) {
+  const u = new URL(url);
+  u.searchParams.set("z", "deflate");
+  return u.toString();
+}
+
 /** The clock when the root passes none: the browser's timers (an adapter may touch globals). */
 const globalClock = {
   mono: () => (globalThis.performance?.now?.() ?? Date.now()),
@@ -60,16 +78,21 @@ const globalClock = {
  * @param {{ url: string, WebSocket: new (url: string) => any,
  *           codec?: import("../../../packages/protocol/codec.js").Codec, maxQueued?: number, maxQueuedBytes?: number,
  *           clock?: Pick<import("../../ports/clock.js").Clock, "mono" | "set" | "clear">,
+ *           inflate?: ((bytes: Uint8Array) => Promise<Uint8Array>) | null,
  *           watermark?: number, hardCapBytes?: number, hardCapMs?: number, sampleMs?: number }} o
  *   url: the gateway's ws(s)://…/ws URL (the composition root derives it from the page's origin).
  *   WebSocket: the constructor (the root passes globalThis.WebSocket; tests pass a fake). codec: default JSON.
  *   clock: the clock port (the root passes it; without one, the global timers). The limits default to the port's.
+ *   inflate: how to inflate a compressed catch-up frame (the root passes browserInflate()); default none: the URL asks for no compression.
+ *   Used with the JSON codec only (a binary codec's frames are its own).
  * @returns {import("../../ports/transport.js").Transport}
  */
 export function wsTransport({ url, WebSocket: WS, codec = jsonCodec, maxQueued = 1024, maxQueuedBytes = HARD_CAP_BYTES,
   clock = globalClock, watermark = CONGESTED_BYTES, hardCapBytes = HARD_CAP_BYTES, hardCapMs = HARD_CAP_MS,
-  sampleMs = HARD_CAP_SAMPLE_MS }) {
+  sampleMs = HARD_CAP_SAMPLE_MS, inflate = null }) {
   if (typeof WS !== "function") throw new TypeError("wsTransport: WebSocket constructor is required");
+  if (codec !== jsonCodec) inflate = null;
+  const target = inflate ? withDeflate(url) : url;
   let done = false;
   let onMsg = () => {};
   /** @type {(() => void) | null} */
@@ -137,9 +160,9 @@ export function wsTransport({ url, WebSocket: WS, codec = jsonCodec, maxQueued =
     retire(cur);
     cur = null;
     if (done) return;
-    const c = { ws: null, queue: [], queueBytes: 0, dropped: false, overSince: null, timer: null, lastBacklog: 0, added: 0 };
+    const c = { ws: null, queue: [], queueBytes: 0, dropped: false, overSince: null, timer: null, lastBacklog: 0, added: 0, order: Promise.resolve(), behind: 0 };
     cur = c;
-    try { c.ws = new WS(url); } catch {
+    try { c.ws = new WS(target); } catch {
       Promise.resolve().then(() => fail(c));            // a bad URL: a drop like any other, never a throw
       return;
     }
@@ -155,11 +178,28 @@ export function wsTransport({ url, WebSocket: WS, codec = jsonCodec, maxQueued =
       }
       watchCap(c);
     };
-    ws.onmessage = e => {
+    const deliver = data => {
       if (c !== cur || c.dropped || done) return;
       let msg;
-      try { msg = codec.decode(e.data); } catch { fail(c); return; }
+      try { msg = codec.decode(data); } catch { fail(c); return; }
       onMsg(msg);
+    };
+    ws.onmessage = e => {
+      if (c !== cur || c.dropped || done) return;
+      if (!inflate || (typeof e.data === "string" && c.behind === 0)) { deliver(e.data); return; }
+      // Behind a frame still inflating, or itself compressed: in arrival order, through the chain.
+      c.behind++;
+      c.order = c.order.then(async () => {
+        let data = e.data;
+        try {   // only the inflate step is a "bad frame"; what deliver (the core's handler) throws is a bug, never a reconnect
+          if (typeof data !== "string") {
+            const bytes = data instanceof Blob ? new Uint8Array(await data.arrayBuffer()) : new Uint8Array(data.buffer ?? data, data.byteOffset ?? 0, data.byteLength);
+            data = new TextDecoder().decode(await inflate(bytes));
+          }
+        } catch { c.behind--; fail(c); return; }
+        c.behind--;
+        try { deliver(data); } catch (err) { queueMicrotask(() => { throw err; }); }   // surfaces like the text path's throw; the chain lives on
+      });
     };
     ws.onerror = () => fail(c);
     ws.onclose = () => fail(c);
@@ -399,13 +439,14 @@ function blobClient({ fetch: fetchFn, clock, base }) {
  * The net (web/ports/net.js) over WebSockets: one wsTransport per join() to the same gateway URL, and the picture path
  * (blobClient above: put, want, onFile, onFail).
  * @param {{ url: string, WebSocket: new (url: string) => any, fetch?: typeof fetch,
- *           clock?: Pick<import("../../ports/clock.js").Clock, "mono" | "set" | "clear"> }} o
+ *           clock?: Pick<import("../../ports/clock.js").Clock, "mono" | "set" | "clear">,
+ *           inflate?: ((bytes: Uint8Array) => Promise<Uint8Array>) | null }} o
  * @returns {import("../../ports/net.js").Net}
  */
-export function wsNet({ url, WebSocket: WS, fetch: fetchFn = globalThis.fetch?.bind(globalThis), clock }) {
+export function wsNet({ url, WebSocket: WS, fetch: fetchFn = globalThis.fetch?.bind(globalThis), clock, inflate }) {
   if (typeof url !== "string" || !/^wss?:\/\//.test(url)) throw new TypeError("wsNet: a ws:// or wss:// url is required");
   const blobs = blobClient({ fetch: (...a) => fetchFn(...a), clock: clock ?? globalClock, base: url.replace(/^ws/, "http") });
-  return { kind: "ws", join: () => blobs.attach(wsTransport({ url, WebSocket: WS, ...(clock ? { clock } : {}) })),
+  return { kind: "ws", join: () => blobs.attach(wsTransport({ url, WebSocket: WS, ...(clock ? { clock } : {}), ...(inflate ? { inflate } : {}) })),
     put: f => blobs.put(f), want: (id, stamp) => blobs.want(id, stamp), onFile: fn => blobs.onFile(fn), onFail: fn => blobs.onFail(fn) };
 }
 

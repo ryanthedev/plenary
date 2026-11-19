@@ -4,13 +4,14 @@
 // - Subscribes to `.entries` BEFORE it reads anything, so nothing between catch-up and live is missed.
 // - Holds a base (the latest checkpoint that matches the log, checked as § Recovery, Rebuild says; or the empty
 //   board) and the entries after it, contiguous, each encoded once. Catch-up = the base's snapshot (when the
-//   client is older than it) + the entries after, as shared, encode-once frames of at most `chunkBytes`.
+//   client is older than it) + the entries after, as shared, encode-once frames of at most `chunkBytes`. A client that
+//   asked for deflate gets each shared text as its compressed form, made once on first need and shared (§ Joining).
 // - Live: `.entries` messages `{ from, to, items }` are applied in seq order; duplicates are dropped by seq; a gap
 //   is read from the Store. The heartbeat `{ seq, epoch, cp }` gives the epoch and reveals a lost last entry. After
 //   `pollMs` with no message the Store is read from the last seq + 1, and again every `pollMs` while it is quiet,
 //   so delivery needs no room (§ Bus: "a lost last entry is repaired two ways").
-// - The tail is re-based on a newer checkpoint from the Store (the room writes one every 1,000 entries or later), so
-//   a joiner's catch-up is the board's state plus a bounded tail. The heartbeat's `cp` (the room's newest durable
+// - The tail is re-based on a newer checkpoint from the Store (the room writes one every 1,000 entries or 64 KiB of ops, and
+//   not before the tail is a quarter of the state: § Recovery, "When"), so a joiner's catch-up is the board's state plus a short tail. The heartbeat's `cp` (the room's newest durable
 //   checkpoint) says when there is one to read: each checkpoint is read at most once (PROTOCOL.md § Bus, `cp`).
 // Never throws to its caller: Store errors are logged and retried by the next message or poll.
 
@@ -24,17 +25,19 @@ const EMPTY = { seq: 0, id: null, by: null, at: null, streams: { board: { elemen
 
 /**
  * @param {{ tenant: string, board: string, store: object, bus: object, onLive: (e: { from: number, to: number, data: string }) => void,
- *   log?: object, codec?: object, pollMs?: number, chunkBytes?: number, pageSize?: number, pageBytes?: number, rebaseEvery?: number, rebaseBytes?: number, random?: () => number }} o
+ *   log?: object, codec?: object, deflate?: (data: string | Uint8Array) => Promise<Uint8Array | null>, pollMs?: number, chunkBytes?: number, pageSize?: number, pageBytes?: number, rebaseEvery?: number, rebaseBytes?: number, zSlack?: number, random?: () => number }} o
+ *   deflate: compresses one catch-up text once (PROTOCOL.md § Joining); absent, or answering null for a frame, joiners get it plain.
+ *   zSlack: bytes of new entries after which the open last chunk's compressed prefix is made again (default 16 KiB).
  *   random: the backoff's jitter source, [0, 1) (tests pass a fixed one).
  *   onLive: called for every run of new resolved entries, in seq order, with the encoded `entries` frame.
  */
-export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger, codec = jsonCodec, pollMs = 5_000, chunkBytes = 1024 * 1024,
-  pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rebaseEvery = 1_000, rebaseBytes = 4 * 1024 * 1024, random = Math.random }) {
+export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger, codec = jsonCodec, deflate = null, pollMs = 5_000, chunkBytes = 1024 * 1024,
+  pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rebaseEvery = 1_000, rebaseBytes = 4 * 1024 * 1024, zSlack = 16 * 1024, random = Math.random }) {
   const key = `${tenant}/${board}`;
   const self = {
-    tenant, board, seq: 0, epoch: 0, ready: null, closed: false, gapAt: 0,
+    tenant, board, seq: 0, epoch: 0, ready: /** @type {Promise<void> | null} */ (null), close: /** @type {() => void} */ (() => {}), closed: false, gapAt: 0,
     base: EMPTY, tail: [],   // tail: [{ seq, id, by, at, text }], seq = base.seq + 1 …
-    snap: null, chunks: [], chunksLen: 0, lastHeard: Date.now(), nextRebase: rebaseEvery, tailBytes: 0, nextRebaseBytes: rebaseBytes,
+    snap: null, zTails: new Map(), chunks: [], chunksLen: 0, lastHeard: Date.now(), nextRebase: rebaseEvery, tailBytes: 0, nextRebaseBytes: rebaseBytes,
     cpHeard: null, lookedAt: 0, retries: 0, looks: 0, failures: 0, skip: 0, failedFor: 0,   // the checkpoint look (rebase, below)
   };
   const frameOf = list => (codec === jsonCodec ? `{"t":"entries","entries":[${list.map(x => x.text).join(",")}]}` : codec.encode({ t: "entries", entries: list.map(x => JSON.parse(x.text)) }));
@@ -152,7 +155,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
     const cut = self.tail.slice(0, cp.seq - self.base.seq);
     self.tail = self.tail.slice(cp.seq - self.base.seq);
     for (const x of cut) self.tailBytes -= x.text.length;
-    self.base = cp; self.snap = null; self.chunks = []; self.chunksLen = 0; self.retries = 0;
+    self.base = cp; self.snap = null; self.zTails = new Map(); self.chunks = []; self.chunksLen = 0; self.retries = 0;
     again();
   }
   function again() { self.nextRebase = self.tail.length + rebaseEvery; self.nextRebaseBytes = self.tailBytes + rebaseBytes; }
@@ -202,23 +205,74 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
     return chunks;
   }
 
-  /**
-   * Rule 3: the frames that bring a client at `since` up to the feed's seq, as `{ data, bytes, shared }` (`shared`
-   * names encode-once text many joiners hold; a client starting inside a chunk gets its own cut of it).
-   */
-  self.catchUp = since => {
-    const frames = [];
+  /** The shared catch-up texts that bring a client at `since` up to the feed's seq, in order: { part, key, own? }. A client
+   *  starting inside a chunk gets its own cut of it (`own`: not shared, never compressed). */
+  function parts(since) {
+    const out = [];
     if (since < self.base.seq) {
-      if (!self.snap) { const data = codec.encode(snapshotOf(self.base)); self.snap = { data, bytes: utf8Length(data), shared: `${key}/s${self.base.seq}` }; }
-      frames.push(self.snap);
+      self.snap ??= (() => { const data = codec.encode(snapshotOf(self.base)); return { data, bytes: utf8Length(data), shared: `${key}/s${self.base.seq}` }; })();
+      out.push({ part: self.snap, key: self.snap.shared });
       since = self.base.seq;
     }
     for (const ch of tailChunks()) {
       if (ch.to <= since) continue;
-      if (ch.from > since) frames.push({ data: ch.data, bytes: ch.bytes, shared: ch.key });
-      else { const data = frameOf(self.tail.slice(since - self.base.seq, ch.to - self.base.seq)); frames.push({ data, bytes: utf8Length(data), shared: false }); }
+      if (ch.from > since) out.push({ part: ch, key: ch.key });
+      else out.push({ own: frameOf(self.tail.slice(since - self.base.seq, ch.to - self.base.seq)) });
     }
-    return frames;
+    return out;
+  }
+
+  /** Compress a text once; every joiner who wants it shares the result (`z`: the bytes, or null = not worth it). */
+  const squeeze = part => (part.zp ??= Promise.resolve(deflate(part.data)).then(z => { part.z = z ?? null; }, err => { part.z = null; log.warn("feed: compression failed; joiners get plain text", { tenant, board, err }); }));
+
+  // The tail's last chunk grows with every entry, so its text is never the same twice: compressing "the chunk" would go stale
+  // before it could be sent. Instead its compressed form is a PREFIX (the chunk's entries up to seq `to`, fixed when the
+  // deflate started) and a join sends it followed by the entries after `to` as a plain cut of its own. Always valid, however
+  // many entries land during the deflate; re-made only after `zSlack` bytes of new entries (bounded work). Kept per chunk start
+  // (`self.zTails`: from -> { good: newest SETTLED prefix { to, z }, tried: `to` of the newest attempt, p: its promise }), so a
+  // newer attempt in flight never hides the settled one a waiting join counted on, and a chunk that closes keeps its prefix.
+  const zTailOf = ch => { const g = self.zTails.get(ch.from)?.good; return g && g.to <= ch.to ? g : null; };
+  const slackBytes = (to, ch) => { let n = 0; for (let i = to - self.base.seq; i < ch.to - self.base.seq; i++) n += self.tail[i].text.length; return n; };
+  function squeezeTail(ch) {
+    let e = self.zTails.get(ch.from);
+    if (!e) self.zTails.set(ch.from, e = { good: null, tried: -1, p: null });
+    if (e.p && slackBytes(e.tried, ch) < zSlack) return e.p;
+    const to = ch.to;
+    e.tried = to;
+    return e.p = Promise.resolve(deflate(ch.data)).then(z => { if (z && (!e.good || to > e.good.to)) e.good = { to, z }; },
+      err => log.warn("feed: compression failed; joiners get plain text", { tenant, board, err }));
+  }
+
+  /**
+   * Rule 3: the frames that bring a client at `since` up to the feed's seq, as `{ data, bytes, shared }` (`shared`
+   * names encode-once text many joiners hold; a client starting inside a chunk gets its own cut of it). With `z`
+   * (the client asked for deflate, § Joining) a text whose compressed form is ready goes as that form (binary, shared
+   * under its own name); one that isn't ready, or isn't worth compressing, goes plain: `prepare(since)` first makes them ready.
+   * A chunk with only a compressed prefix goes as that prefix, then its newer entries as a plain cut: same entries, same order.
+   */
+  self.catchUp = (since, z = false) => parts(since).flatMap(({ part, key: shared, own }) => {
+    if (own !== undefined) return [{ data: own, bytes: utf8Length(own), shared: false }];
+    if (z && part.z) return [{ data: part.z, bytes: part.z.byteLength, shared: shared + "/z", z: true }];
+    const pre = z && part.from !== undefined && !part.z ? zTailOf(part) : null;
+    if (pre) {
+      const out = [{ data: pre.z, bytes: pre.z.byteLength, shared: `${key}/c${self.base.seq}.${part.from}-${pre.to}/z`, z: true }];
+      if (part.to > pre.to) {
+        const cut = frameOf(self.tail.slice(pre.to - self.base.seq, part.to - self.base.seq));
+        out.push({ data: cut, bytes: utf8Length(cut), shared: false });
+      }
+      return out;
+    }
+    return [{ data: part.data, bytes: part.bytes, shared }];
+  });
+  /**
+   * Have the compressed form of every text a join at `since` would send, so catchUp(since, true) can use it. Waits for the
+   * feed's start (a join may ask before it has read the Store). One deflate per text; the open last chunk gets a prefix form
+   * (above), re-made only after `zSlack` bytes of new entries. Entries landing while this runs never make the result stale.
+   */
+  self.prepare = async since => {
+    if (!deflate) return;
+    await self.ready;
+    await Promise.all(parts(since).filter(p => p.part).map(({ part }) => part.from === undefined ? squeeze(part) : part.closed ? squeeze(part).then(() => { if (part.z) self.zTails.delete(part.from); }) : squeezeTail(part)));   // a closed chunk with its whole compressed form needs no prefix
   };
   /** Make sure the feed has every entry up to `seq` (a writer's welcome may name entries the bus hasn't brought yet). */
   self.reach = seq => (seq > self.seq ? run(() => repair(seq)) : Promise.resolve());

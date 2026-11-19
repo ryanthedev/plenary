@@ -519,7 +519,7 @@ test("joiners parked across folds can't pin a board's worth of replaced text eac
  */
 /**
  * Fold the whole board into one checkpoint, so a joiner from 0 gets it as one snapshot. The scaffold's host folded
- * whenever its tail passed `tailFoldBytes`; the v1 host also needs the tail to be at least half the board (the 2x
+ * whenever its tail passed `tailFoldBytes`; the v1 host also needs the tail to be at least a quarter of the board (the 4x
  * bound), which a board written as distinct elements rarely meets. Tests about one big snapshot say so here.
  */
 async function foldAll(r) {

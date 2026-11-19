@@ -40,8 +40,8 @@ const pgMaker = () => {
 
 for (const [name, maker] of [["sqlite", sqliteMaker], ["postgres", pgMaker]]) describe.skipIf(name === "postgres" && !pgUrl)(`incremental fold on the host (${name})`, () => {
   /** A host whose fold steps wait in `q` for the test, a board with 6 acked ops, and one fold begun but not run. */
-  async function started() {
-    const m = maker(), store = await m.open(), bus = memoryBus(), q = [], lines = [];
+  async function started(wrap = s => s) {
+    const m = maker(), store = wrap(await m.open()), bus = memoryBus(), q = [], lines = [];
     const log = createLogger({ write: l => lines.push(JSON.parse(l)), level: "debug" });
     const host = roomHost({ store, bus, log, holder: "h-a", leaseTtlMs: 30_000, tailFoldBytes: 1, foldUnits: 4, schedule: fn => q.push(fn) });
     await host.open(T, B);
@@ -49,7 +49,7 @@ for (const [name, maker] of [["sqlite", sqliteMaker], ["postgres", pgMaker]]) de
     await g.hello(); await g.welcome();
     for (let k = 1; k <= 6; k++) { await g.op(k); await g.ack(k); }
     expect(q.length).toBe(1);                                    // one fold begun at the first resolve; the rest found it running
-    const done = async () => { await host.close(); await store.close(); await bus.close(); await m.drop(); };
+    const done = async () => { await host.close(); await store.close?.(); await bus.close(); await m.drop(); };
     return { store, host, q, lines, g, done };
   }
   const drain = q => { while (q.length) q.shift()(); };
@@ -75,6 +75,24 @@ for (const [name, maker] of [["sqlite", sqliteMaker], ["postgres", pgMaker]]) de
       await g.op(7);                                             // the old holder's append is fenced: its room stops
       await until(async () => (await host.peek(T, B)) === null, "the room stopped", 10_000);
       drain(q);                                                  // the abandoned fold's steps find a dead slot and do nothing
+      expect(await store.getCheckpoint(T, B)).toBe(null);
+    } finally { await done(); }
+  }, 30_000);
+
+  test("the host closes with an append in flight (so no final checkpoint): the fold's remaining steps find a dead slot and write nothing", async () => {
+    let hold = null, puts = 0;
+    const { store, host, q, g, done } = await started(real => ({ ...real, putCheckpoint: (...a) => { puts++; return real.putCheckpoint(...a); },
+      append: (...a) => (hold ? hold.then(() => real.append(...a)) : real.append(...a)) }));
+    try {
+      expect(q.length).toBe(1);                                  // a fold is begun and its step waits
+      let release; hold = new Promise(r => { release = r; });
+      await g.op(7);                                             // accepted, its append held: inflight
+      const closing = host.close();                              // dead slot, no checkpoint (an append is in flight), waiting on its writes
+      await new Promise(r => setImmediate(r));                   // a macrotask boundary: close() has run through every settled await up to its write wait
+      drain(q);                                                  // the fold's steps run on the dead slot
+      release();
+      await closing;
+      expect(puts).toBe(0);                                      // counted at the call: no write was even attempted
       expect(await store.getCheckpoint(T, B)).toBe(null);
     } finally { await done(); }
   }, 30_000);

@@ -245,15 +245,20 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
   }
 
   // The member directory write after a sign-in: best effort and bounded. At most TOUCH_MAX in flight and one per user at a time; the excess is
-  // dropped (Home records the person later). A failure logs one rate-limited line, never a name, id or error text.
-  const TOUCH_MAX = 16, touching = new Set();
+  // dropped (the person's next Home records them). Each write is cut off after config.touchTimeoutMs (default 5 s) so a hung Registry cannot hold
+  // the slots; the slot frees then (the adapter's own limits end the call). A failure or a drop logs one rate-limited line that identifies no one.
+  const TOUCH_MAX = 16, touching = new Set(), TOUCH_MS = config.touchTimeoutMs ?? 5000;
   let lastTouchWarn = -Infinity;
+  const touchWarn = why => { if (now() - lastTouchWarn < 60_000) return; lastTouchWarn = now(); try { log?.warn?.(`member directory write ${why}; Home records the person later`); } catch {} };
   function recordMember(identity) {
-    if (typeof registry.touchMember !== "function" || touching.size >= TOUCH_MAX || touching.has(identity.user)) return;
+    if (typeof registry.touchMember !== "function") return;
+    if (touching.size >= TOUCH_MAX || touching.has(identity.user)) { if (!touching.has(identity.user)) touchWarn("dropped (too many in flight)"); return; }
     touching.add(identity.user);
-    (async () => { const unit = await tenancy.tenantOf(identity); if (unit) await registry.touchMember(unit.id, identity); })()
-      .catch(() => { if (now() - lastTouchWarn >= 60_000) { lastTouchWarn = now(); try { log?.warn?.("member directory write failed; Home records the person later"); } catch {} } })
-      .finally(() => touching.delete(identity.user));
+    let timer;
+    const cutoff = new Promise((_, no) => { timer = setTimeout(() => no(new Error("timeout")), TOUCH_MS); });
+    Promise.race([(async () => { const unit = await tenancy.tenantOf(identity); if (unit) await registry.touchMember(unit.id, identity); })(), cutoff])
+      .catch(() => touchWarn("failed"))
+      .finally(() => { clearTimeout(timer); touching.delete(identity.user); });
   }
 
   async function exchange(req) {

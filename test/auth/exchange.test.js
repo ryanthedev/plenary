@@ -322,3 +322,23 @@ test("the directory write after sign-in is bounded: 16 in flight, one per user, 
   const s = await signIn({ ...ADMIN, sub: "409", email: "d9@acme.com" }, { via: v3 }); await exchange(s.code, { cookie: s.cookie, via: v3 }); await new Promise(r => setTimeout(r, 0));
   expect(warns).toHaveLength(2);
 });
+
+test("a hung directory write frees its slot after the timeout, and drops are logged anonymously", async () => {
+  const hang = new Proxy(registry, { get: (t, k) => (k === "touchMember" ? () => new Promise(() => {}) : t[k]) });
+  const warns = [];
+  const via = node({ registry: hang, log: { warn: (m, f) => warns.push([m, f]) }, config: { ...config, touchTimeoutMs: 30 } });
+  for (let i = 0; i < 18; i++) {
+    const s = await signIn({ ...ADMIN, sub: `50${String(i).padStart(2, "0")}`, email: `h${i}@acme.com` }, { via });
+    expect((await exchange(s.code, { cookie: s.cookie, via })).status).toBe(200);
+  }
+  await new Promise(r => setTimeout(r, 0));
+  expect(warns.map(w => w[0])).toEqual(["member directory write dropped (too many in flight); Home records the person later"]);
+  expect(JSON.stringify(warns)).not.toMatch(/google:|acme|50\d\d/);
+  await new Promise(r => setTimeout(r, 80));                    // the 16 hung writes are cut off: slots are free again
+  clock.t += 61_000;
+  const s = await signIn({ ...ADMIN, sub: "5999", email: "h99@acme.com" }, { via });
+  await exchange(s.code, { cookie: s.cookie, via });
+  await new Promise(r => setTimeout(r, 80));
+  expect(warns).toHaveLength(2);                                // the new write was accepted (slots freed), then timed out: one "failed" after the window
+  expect(warns[1][0]).toContain("failed");
+});

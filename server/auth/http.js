@@ -46,8 +46,9 @@
 //   POST /access/:type/:id/requests, DELETE /access/:type/:id/requests/:user, GET /boards/:board/explain: PROTOCOL.md § Access explanation and requests
 //   GET|POST /roles, PATCH|DELETE /roles/:id: PROTOCOL.md § Roles (server/auth/roles.js)
 //   (tenant of POST /boards = the caller's
+//   GET    /boards/:board/share                → { board, unit: { domains }, limits, invites: [{ …, guest }], links: [{ …, url? }], more } (the Share dialog's one read; `members.manage`)
 //   GET    /boards/:board/invites              → { invites }
-//   POST   /boards/:board/invites              { email, role, expiresAt? } → 201 { invite }
+//   POST   /boards/:board/invites              { email, role, expiresAt? (default now + 30 days; null = never) } → 201 { invite: { …, guest } }
 //   DELETE /boards/:board/invites/:invite      → 204
 //   GET    /boards/:board/links                → { links }
 //   POST   /boards/:board/links                { role, expiresAt? } → 201 { link, url? }
@@ -88,7 +89,7 @@ import { spaceService } from "./spaces.js";
 import { accessService } from "./access.js";
 import { explainService } from "./explain.js";
 import { rolesService } from "./roles.js";
-import { AdminError, createInvite, listInvites, readInvite, revokeInvite, createLink, listLinks, readLink, revokeLink, setGrant } from "../admin/boards.js";
+import { AdminError, createInvite, listInvites, readInvite, revokeInvite, createLink, listLinks, readLink, revokeLink, setGrant, shareView } from "../admin/boards.js";
 
 export const LOGIN_COOKIE = "__Host-plen_login";
 export const EXCHANGE_COOKIE = "__Host-plen_xchg";
@@ -423,7 +424,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
   }
 
   // ---- routes ----
-  const admin = { registry, now };
+  const admin = { registry, tenancy, now };
   // GET /auth/dev: the dev sign-in menu for the served page (web/adapters/auth/devconfig.js). Exists ONLY while the dev
   // verifier is on and main.js allowed the menu (a loopback bind, no Google, a gateway, an offerable user), and it leaves out any name that is a tenant admin in the Registry
   // right now; otherwise there
@@ -557,13 +558,17 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       },
       DELETE: async (req, p) => { await access.setGrant(await caller(req), p.type, p.id, p.subjectType, p.subject, null); return json(204); },
     }],
+    ["/boards/:board/share", { GET: async (req, p) => {
+      const v = await shareView({ caller: await caller(req), board: p.board }, admin);
+      return json(200, publicUrl ? { ...v, links: v.links.map(l => ({ ...l, url: `${publicUrl}/links/${encodeURIComponent(l.id)}` })) } : v);
+    } }],
     ["/boards/:board/invites", {
       GET: async (req, p) => json(200, { invites: await listInvites({ caller: await caller(req), board: p.board }, admin) }),
       POST: async (req, p) => {
         const who = await caller(req);
         const b = await body(req, ["email", "role", "expiresAt"]);
         return keyed(req, who, "POST /boards/:board/invites", p, b,
-          async idem => ({ invite: await createInvite({ caller: who, board: p.board, email: b.email, role: b.role, expiresAt: b.expiresAt ?? null, idem }, admin) }),
+          async idem => ({ invite: await createInvite({ caller: who, board: p.board, email: b.email, role: b.role, expiresAt: b.expiresAt, idem }, admin) }),
           async id => ({ invite: await readInvite({ caller: who, board: p.board, invite: id }, admin) }));
       },
     }],

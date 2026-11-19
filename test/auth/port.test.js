@@ -104,8 +104,8 @@ test("M1 end to end: a no-hd Google token with a third-party email can't claim a
   const admin = { user: "google:root", name: "Root", email: null, domain: "acme.com" };
   const acme = await registry.createTenant({ domain: "acme.com", admins: [admin.user] });
   const b = await createBoard({ caller: admin, tenant: acme.id, memberRole: null }, { registry });
-  await createInvite({ caller: admin, board: b.id, email: "cfo@partner.example", role: "editor" }, { registry });
-  await createInvite({ caller: admin, board: b.id, email: "gus@gmail.com", role: "annotator" }, { registry });
+  await createInvite({ caller: admin, board: b.id, email: "cfo@partner.example", role: "editor" }, { registry, tenancy: tenancy({ registry }) });
+  await createInvite({ caller: admin, board: b.id, email: "gus@gmail.com", role: "annotator" }, { registry, tenancy: tenancy({ registry }) });
   const s = await sessions({ key: KEY });
   const auth = authPort({ sessions: s, tenancy: tenancy({ registry }) });
   const signIn = async claims => {

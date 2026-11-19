@@ -9,7 +9,7 @@
 import { h, replace } from "./dom.js";
 import { keeper, announce, announced } from "./focus.js";
 import { shell, showNotice, gate, message } from "./spaces.js";
-import { createPickerModel, sizeText, viaText, generalLine, SCOPE_NOUN } from "../../core/access.js";
+import { createPickerModel, sizeText, viaText, generalLine, SCOPE_NOUN, HIDDEN_ABOVE } from "../../core/access.js";
 import { ownersText } from "../../core/explain.js";
 import { askView, sourceRow } from "./explain.js";
 
@@ -232,6 +232,7 @@ export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker
       group("Through teams", `Teams with access to this ${noun}`, teams.map(rowView)),
       [...inheritedBy].map(([k, list]) => { const s = list[0].scope; const from = s?.type === "unit" ? "your organization" : `${SCOPE_NOUN[s?.type] ?? "container"} ${s?.name ?? ""}`.trim();
         return group(`Inherited from ${from}`, `Access inherited from ${from}`, list.map(inheritedRow)); }),
+      p.hiddenAbove ? h("p.muted", { "data-fk": "hidden-above" }, HIDDEN_ABOVE) : null,
       group("Everyone in the organization", "General access", general),
       group("Organization admins", "Organization admins", orgAdmins.map(a => h("li.row", { "aria-label": a.name }, h("span.who", {}, a.name))), p.organization?.more ? "They manage access in every Space. The list shows the first few." : "They manage access in every Space; they see boards only where they are added."),
       p.next ? keys.mark(act({}, "Show more", () => model.loadMore()), "show-more") : null,

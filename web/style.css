@@ -383,7 +383,7 @@ body.stale .watching { opacity: .45; }
 .card .card-menu .more { height: 30px; }
 .card > .card-open { padding-right: 44px; }
 .sp-veil { position: fixed; z-index: 40; }
-.sp-dialog { max-width: 520px; }
+.sp-dialog { max-width: 520px; max-height: 92vh; overflow-y: auto; }
 .sp-dialog form { margin: 0; }
 .dialog .l { display: grid; gap: 4px; font-weight: 600; }
 .dialog .l .h, .dialog .from { font-weight: 400; color: var(--muted); font-size: 12px; margin: 0; }
@@ -446,3 +446,19 @@ body.stale .watching { opacity: .45; }
 .pill[role="button"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .pill-pop { position: fixed; z-index: 50; max-width: min(420px, calc(100vw - 24px)); padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); color: var(--fg); box-shadow: 0 8px 24px rgba(0, 0, 0, .25); font-size: 13px; }
 .pill-pop p { margin: 0 0 8px; overflow-wrap: anywhere; }
+/* Share dialog (web/adapters/dom/share.js) */
+.share-body { display: grid; gap: 16px; }
+.share-body h3 { margin: 0; font-size: 13px; }
+.share-body .row { flex-wrap: wrap; gap: 8px; }
+.share-body .row .field { width: auto; flex: 1 1 140px; }
+.share-body ul.rows { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; font-weight: 400; }
+.share-body li.row { justify-content: space-between; margin: 0; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; }
+.share-body li.row .who { font-weight: 600; word-break: break-all; }
+.share-body li.row .from { flex: 1 1 100%; }
+.share-body .share-url { font-size: 12px; min-width: 0; flex: 1 1 180px; }
+.share-sent { display: grid; gap: 6px; padding: 8px; border: 1px solid var(--border); border-radius: 6px; font-weight: 400; }
+.share-sent[hidden], .share-body[hidden] { display: none; }
+.badge.guest, .from.guest { color: var(--fg); }
+.badge.guest { margin-left: 6px; }
+.share-status { margin: 0; min-height: 1.4em; font-size: 13px; }
+.share-status:focus { outline: 2px solid var(--accent, currentColor); outline-offset: 2px; }

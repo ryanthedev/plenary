@@ -34,6 +34,8 @@ test("bodies are normalised: unknown fields dropped, bad rows dropped, lists and
   expect("extra" in junk).toBe(false);
   expect(normalizeAccessPage({ scope: { type: "planet", id: "x" }, rows: [] })).toBe(null);
   expect(normalizeAccessPage({ scope: { type: "space", id: "s-1" } })).toBe(null);
+  expect(normalizeAccessPage({ ...ACCESS, hiddenAbove: true }).hiddenAbove).toBe(true);
+  expect("hiddenAbove" in normalizeAccessPage({ ...ACCESS, hiddenAbove: "yes" })).toBe(false);          // only exactly true
   expect(normalizeTeamPage(TEAM)).toEqual(TEAM);
   expect(normalizeTeamPage({ ...TEAM, members: [{ user: "" }, { user: "u", name: "n".repeat(500) }] }).members).toEqual([{ user: "u", name: "n".repeat(200), email: null }]);
   expect(normalizeTeamPage({ team: { id: "bad id" }, members: [] })).toBe(null);

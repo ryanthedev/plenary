@@ -57,11 +57,13 @@ test("H1: a role changed while a hello waits → `unavailable` 1012 (reconnect);
 
 test("H1: grants removed DURING the role lookup (it answered from the old grants) → refused: the watch opens before the check", async () => {
   let r, first = true;
-  r = await rig({ wrapAuth: a => ({ ...a, role: async (id, b) => {
-    const role = await a.role(id, b);
+  const stale = async (a, id, b) => {
+    const got = await a.access(id, b);
     if (first) { first = false; await r.registry.setGrant(r.ids.board, "dev:editor", null); await grantsChanged(r); await sleep(20); }
-    return role;                                                          // the stale answer: still "editor"
-  } }) });
+    return got;                                                           // the stale answer: still "editor"
+  };
+  // a hello reads `access` ({ role, share }); a lookup that overrides one overrides both (the gateway uses `access` when the port has it)
+  r = await rig({ wrapAuth: a => ({ ...a, access: (id, b) => stale(a, id, b), role: async (id, b) => (await stale(a, id, b)).role }) });
   const s = await r.sock(); s.send(hello(r, "editor"));
   expect((await s.whenClosed(5000)).code).toBe(1008);
   expect(s.msgs).toEqual([{ t: "error", code: "auth", message: "not allowed" }]);

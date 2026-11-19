@@ -425,3 +425,13 @@ test("the 409 superseded path says so in the status line too (not only the live 
   expect(globalThis.document.activeElement).toBe(status);
   expect(announced()).toContain("replaced by a newer one");
 });
+
+test("DW-52.10 the access page shows the one line 'Some access comes from places you can't open.' only when the server's hiddenAbove is true", async () => {
+  state.access = AP({ hiddenAbove: true });
+  await accessPage("board");
+  expect(textOf(root)).toContain("Some access comes from places you can't open.");
+  root.replaceChildren();
+  state.access = AP();
+  await accessPage("board");
+  expect(textOf(root)).not.toContain("places you can't open");
+});

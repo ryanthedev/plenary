@@ -18,6 +18,8 @@ export const failText = r => MSG[r?.code] ?? baseError(r?.error);
 /** "Team of 12", "1000+ members": a Team's size as the list shows it (1001 = more than 1000). */
 export const sizeText = n => (n > 1000 ? "1000+ members" : n === 1 ? "1 member" : `${n} members`);
 /** What a scope is called in sentences. */
+/** The one line shown when access also comes from a Space or Group the person cannot open (the server says only that, no name and no count). */
+export const HIDDEN_ABOVE = "Some access comes from places you can't open.";
 export const SCOPE_NOUN = { unit: "organization", group: "Group", space: "Space", board: "board" };
 /** A grant row's "from where" line (JOURNEY J10: name · role · from where). */
 export const viaText = row => (row.via === "team" ? "Team" : row.via === "inherited" ? `via ${SCOPE_NOUN[row.scope?.type] ?? "container"} ${row.scope?.name ?? ""}`.trim() : "Added directly");

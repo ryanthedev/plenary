@@ -33,7 +33,7 @@ export function normalizeAccessPage(b) {
   const sc = scopeRef(b?.scope);
   if (!sc || !Array.isArray(b.rows)) return null;
   return {
-    scope: { ...sc, ...(b.scope.personal === true ? { personal: true } : {}) }, can: { manage: b.can?.manage === true },
+    scope: { ...sc, ...(b.scope.personal === true ? { personal: true } : {}) }, can: { manage: b.can?.manage === true }, ...(b.hiddenAbove === true ? { hiddenAbove: true } : {}),
     general: list(b.general, 6, g => (g && typeof g.role === "string" && scopeRef(g.scope) ? { scope: scopeRef(g.scope), role: str(g.role, 32) } : null)),
     ...(Array.isArray(b.admins) ? { admins: list(b.admins, 100, person) } : {}),
     rows: list(b.rows, 250, row), next: typeof b.next === "string" && b.next.length <= 600 ? b.next : null, inherited: list(b.inherited, 80, row), roles: list(b.roles, 100, option),

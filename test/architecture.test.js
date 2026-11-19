@@ -49,6 +49,7 @@ const COMPOSITION_ROOTS = [
   "scripts/cluster-rig.js",       // platform (p8-rig): local cluster rig CLI; spawns processes, imports no project module
   "scripts/clean.js",             // platform: safe cleanup CLI for test temp dirs, stopped rigs and scratch copies; shells out to lsof and the rig CLI
   "scripts/test-cluster.js",      // test harness: starts and tears down an isolated local services rig
+  "scripts/test-cluster-files.js", // test harness data: the gated test files test-cluster.js runs, also imported by its guard
   "scripts/load/run.js", "scripts/load/worker.js", "scripts/load/tokens.js", "scripts/load/client.js", "scripts/load/server.js",
   "scripts/load/stats.js",        // platform (p8-load): load client; run.js and worker.js are entry points, the rest their modules
 ];

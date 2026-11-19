@@ -200,6 +200,24 @@ describe("no escalation (non-admin editors)", () => {
     expect(await code(svc.create(lee, { name: "spaces", boardRole: "viewer", permissions: ["space.create"] }))).toBe("forbidden");
     expect((await svc.list(lee)).can.admin).toBe(false);
   });
+  test("the Unit member role changes what EVERY member may do: a non-admin roles.manage holder (with a board step and the member permissions) is refused; a Unit admin edits it", async () => {
+    const mgr = await r.createRole({ tenant: acme.id, name: "Mgr", boardRole: "editor", permissions: ["roles.manage", "space.create"] });
+    await holdAtUnit(lee.user, mgr.id);
+    expect(await code(svc.update(lee, "member", { permissions: [] }))).toBe("forbidden");                 // would strip space.create from every member
+    expect(await code(svc.update(lee, "member", { permissions: ["space.create"] }))).toBe("forbidden");   // even a no-op: one answer
+    expect(await r.role(acme.id, "member")).toBe(null);
+    expect(ann).toEqual([]);
+    expect((await svc.update(lee, mgr.id, { permissions: ["roles.manage"] })).permissions).toEqual(["roles.manage"]);   // a custom role it holds in full is still editable
+    expect((await svc.update(root, "member", { permissions: [] })).permissions).toEqual([]);
+  });
+  test("a grant of a role deleted between the access read and the write is refused 400 bad-role and stores nothing (the Registry checks the role in the write)", async () => {
+    const c = await r.createRole({ tenant: acme.id, name: "Soon gone", boardRole: "viewer" });
+    const sp = await r.createSpace({ tenant: acme.id, name: "S", owner: "google:root" });
+    const racing = { ...r, setScopedGrant: async o => { await r.deleteRole(acme.id, c.id); return r.setScopedGrant(o); } };
+    const access = accessService({ registry: racing, tenancy: makeTenancy({ registry: racing }) });
+    expect(await code(access.setGrant(root, "space", sp.id, "user", ada.user, c.id))).toBe("bad-role");
+    expect(await r.scopedGrants({ type: "space", id: sp.id })).toEqual([{ subject: U("google:root"), role: "owner" }]);
+  });
   test("the team.manage back door: after a role gains a permission, a team.manage holder who lacks it can no longer change the Team that holds it", async () => {
     const tm = await r.createRole({ tenant: acme.id, name: "Team keeper", boardRole: "viewer", permissions: ["team.manage"] });
     await holdAtUnit(lee.user, tm.id);
@@ -278,7 +296,7 @@ describe("leaks: hidden, unknown and other-Unit role ids answer alike and cost t
   test("another Unit's grant of the same role string neither counts nor blocks a delete", async () => {
     const c = await r.createRole({ tenant: acme.id, name: "A", boardRole: "viewer" });
     const gs = await r.createSpace({ tenant: globex.id, name: "G" });
-    await r.setScopedGrant({ scope: { type: "space", id: gs.id }, subject: U("google:gia"), role: c.id });
+    expect((await r.setScopedGrant({ scope: { type: "space", id: gs.id }, subject: U("google:gia"), role: c.id }).catch(e => e)).code).toBe("no-role");     // the Registry refuses it
     expect(byId(await svc.list(root), c.id).used).toEqual({ places: 0, capped: false });
     await svc.remove(root, c.id);
   });
@@ -290,7 +308,7 @@ describe("the many-people confirmation", () => {
     const c = await svc.create(root, { name: "A", boardRole: "viewer", permissions: ["board.create"] });
     for (const sp of await spaces(11)) await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: U(max.user), role: c.id });
     const e = await svc.update(root, c.id, { permissions: [] }).catch(x => x);
-    expect([e.code, e.data]).toEqual(["confirm-required", { impact: { places: 11, people: 11, capped: false } }]);
+    expect([e.code, e.data]).toEqual(["confirm-required", { impact: { places: 11, people: 1, capped: false } }]);
     expect((await r.role(acme.id, c.id)).permissions).toEqual(["board.create"]);     // nothing changed
     expect(ann).toEqual([]);
     expect(await svc.update(root, c.id, { name: "Renamed" })).toMatchObject({ name: "Renamed" });
@@ -311,10 +329,16 @@ describe("the many-people confirmation", () => {
     const e = await svc.update(root, d.id, { permissions: [] }).catch(x => x);
     expect([e.code, e.data.impact]).toEqual(["confirm-required", { places: 1, people: 51, capped: false }]);
   });
+  test("people are distinct: one person in 51 places is one person, so it asks for the places and says 1", async () => {
+    const c = await svc.create(root, { name: "Solo", boardRole: "viewer", permissions: ["board.create"] });
+    for (const sp of await spaces(51)) await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: U(max.user), role: c.id });
+    const e = await svc.update(root, c.id, { permissions: [] }).catch(x => x);
+    expect([e.code, e.data.impact]).toEqual(["confirm-required", { places: 51, people: 1, capped: false }]);
+  });
   test("the member role asks once the Unit has more than 50 members, with their count", async () => {
     for (let i = 0; i < 49; i++) await r.touchMember(acme.id, { user: `google:m${i}`, name: `M${i}` });        // 4 + 49 = 53
     const e = await svc.update(root, "member", { permissions: [] }).catch(x => x);
-    expect([e.code, e.data.impact]).toEqual(["confirm-required", { places: 0, people: 51, capped: true }]);
+    expect([e.code, e.data.impact]).toEqual(["confirm-required", { places: 0, people: 50, capped: true }]);
     expect((await r.role(acme.id, "member"))).toBe(null);
     expect((await svc.update(root, "member", { permissions: [], confirm: true })).permissions).toEqual([]);
   });
@@ -420,7 +444,11 @@ describe("over HTTP", () => {
     await r.createRole({ tenant: acme.id, name: "X", boardRole: "viewer" });
     const c = await api("root", "/roles", "POST", { name: "Third", boardRole: "viewer", permissions: [] }, { "idempotency-key": "role-key-0002" });
     expect(c.status).toBe(201);
-    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: U("dev:max"), role: "member" });
-    expect((await api("max", "/roles", "POST", { name: "Third", boardRole: "viewer", permissions: [] }, { "idempotency-key": "role-key-0002" })).status).toBe(403);   // another user's key is its own
+    // another user's key is its own: a second manager (a custom role carrying roles.manage and a board step) gets a new role, not the first one's replay
+    const mgr = await r.createRole({ tenant: acme.id, name: "Mgr", boardRole: "editor", permissions: ["roles.manage"] });
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: U("dev:max"), role: mgr.id });
+    const d = await api("max", "/roles", "POST", { name: "Third", boardRole: "viewer", permissions: [] }, { "idempotency-key": "role-key-0002" });
+    expect([d.status, d.headers.get("idempotent-replayed")]).toEqual([201, null]);
+    expect(d.body.role.id).not.toBe(c.body.role.id);
   });
 });

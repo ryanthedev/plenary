@@ -369,6 +369,7 @@ export function accessService({ registry, tenancy, announce = () => {}, backlog 
         else await registry.setScopedGrant({ scope, subject: sub, role });
       } catch (err) {
         if (err?.code === "last-owner") throw new AdminError("last-owner", `a ${type} keeps at least one owner`);
+        if (err?.code === "no-role") throw new AdminError("bad-role", "that role does not apply here");   // deleted since it was read
         throw err;
       }
       // A change that reduces access is a revocation: anything but a pure widening (the new role holds every permission the old one did).

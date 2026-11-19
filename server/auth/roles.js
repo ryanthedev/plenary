@@ -47,6 +47,8 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
   const memberOf = roles => roles.get(MEMBER_ROLE_ID) ?? { id: MEMBER_ROLE_ID, name: "Unit member", base: null, boardRole: null, permissions: [...DEFAULT_MEMBER_PERMS] };
   /** The permissions `role` gives AT THE UNIT (ladder content plus management), the measure of "may the caller hold this". */
   const unitPerms = (role, roles) => roleDef(role, "unit", roles)?.permissions ?? new Set();
+  /** The Unit-wide admin capability: editing the Unit member role changes what EVERY member may do, so it is held to it (the one place tiered admin levels, #88, map to). */
+  const unitWide = st => st.admin;
   const within = (st, perms) => st.admin || [...perms].every(p => st.access.permissions.has(p));
   const scopesOf = (id, roles) => Object.fromEntries(SCOPES.map(t => [t, [...(roleDef(id, t, roles)?.permissions ?? [])]]));
   const allMgmt = id => mgmtOf({ permissions: new Set(SCOPES.flatMap(t => [...(roleDef(id, t, new Map())?.permissions ?? [])])) });
@@ -60,7 +62,8 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
       return { id: MEMBER_ROLE_ID, name: "Unit member", kind: "member", editable: true, summary: "What everyone in the Unit gets", ladder: null, permissions: m.permissions.filter(p => MGMT_PERMS.includes(p)), scopes: scopesOf(MEMBER_ROLE_ID, roles), used };
     }
     const c = roles.get(role);
-    return { id: c.id, name: c.name, kind: "custom", editable: true, ...(c.base ? { base: c.base } : {}), ladder: c.boardRole, permissions: c.permissions.filter(p => MGMT_PERMS.includes(p)), scopes: scopesOf(c.id, roles), used };
+    const mgmt = c.permissions.filter(p => MGMT_PERMS.includes(p)).length;
+    return { id: c.id, name: c.name, kind: "custom", editable: true, summary: `${LADDER_NAMES[c.boardRole] ?? "No"} board access${mgmt ? `, plus ${mgmt} management permission${mgmt === 1 ? "" : "s"}` : ""}`, ...(c.base ? { base: c.base } : {}), ladder: c.boardRole, permissions: c.permissions.filter(p => MGMT_PERMS.includes(p)), scopes: scopesOf(c.id, roles), used };
   }
   const placesUsed = u => ({ places: Math.min(u.places, ROLE_LIMITS.usageCap), capped: u.places > ROLE_LIMITS.usageCap });
   const membersUsed = n => ({ members: Math.min(n, ROLE_LIMITS.memberCap), capped: n > ROLE_LIMITS.memberCap });
@@ -80,13 +83,14 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
   /** How many places and people hold a custom role / how many people the member role reaches. Bounded: PROTOCOL.md § Roles. */
   async function impactOf(unit, id) {
     const cap = ROLE_LIMITS.usageCap;
-    if (id === MEMBER_ROLE_ID) { const n = await registry.memberCount(unit.id, { cap: ROLE_LIMITS.memberCap }); return { places: 0, people: n, capped: n > ROLE_LIMITS.memberCap }; }
+    if (id === MEMBER_ROLE_ID) { const n = await registry.memberCount(unit.id, { cap: ROLE_LIMITS.memberCap }); return { places: 0, people: Math.min(n, ROLE_LIMITS.memberCap), capped: n > ROLE_LIMITS.memberCap }; }
     const u = (await registry.roleUsage(unit.id, [id], { cap })).get(id) ?? { places: 0, users: 0, teams: [] };
     const sizes = u.teams.length ? await registry.teamsAmong(unit.id, u.teams) : [];
     const people = Math.min(u.users, cap) + sizes.reduce((n, t) => n + t.size, 0);
     return { places: Math.min(u.places, cap), people, capped: u.places > cap || u.users > cap || u.teams.length >= ROLE_LIMITS.teamIds };
   }
-  const isMany = i => i.places > LIMITS.many.places || i.people > LIMITS.many.people;
+  /** Many: past either limit; a capped people count that reached the limit (the member role's "50+", counted to 50) is past it. */
+  const isMany = i => i.places > LIMITS.many.places || i.people > LIMITS.many.people || (i.capped && i.people >= LIMITS.many.people);
 
   /** A write's target: the stored custom role (or the member role) with the same Registry reads whatever the id. */
   async function target(unit, id) {
@@ -166,7 +170,7 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
     async update(identity, id, b) {
       const st = await gate(identity), { unit } = st;
       const t = await target(unit, id);
-      if (!t.row) throw refused();                                          // unknown, another Unit's, a built-in: one answer
+      if (!t.row || (t.member && !unitWide(st))) throw refused();            // unknown, another Unit's, a built-in, or the member role without the Unit-wide capability: one answer
       const patch = fields(b, t.member);
       const cand = { ...t.row, ...patch };
       const why = roleProblem(cand, { member: t.member });

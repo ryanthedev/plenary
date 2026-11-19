@@ -21,6 +21,11 @@ const MSG = {
   "in-use": () => "That role is still in use. Remove it from those places first.",
   "confirm-required": () => "This change reaches many people. Confirm it to save.",
 };
+/** Where a role means anything: "Organization to Board", "Board", or null (a role with no permission at any scope). */
+export function rangeText(role) {
+  const at = Object.keys(SCOPE_LABEL).filter(s => (role.scopes?.[s] ?? []).length > 0);
+  return !at.length ? null : at.length === 1 ? SCOPE_LABEL[at[0]] : `${SCOPE_LABEL[at[0]]} to ${SCOPE_LABEL[at.at(-1)]}`;
+}
 /** "Used in 4 places", "Used in 100+ places", "Not used yet", or the member role's reach; null for a built-in. */
 export function usedText(role) {
   const u = role.used;
@@ -80,9 +85,11 @@ export function createRolesModel({ api, newKey = null }) {
   const commit = role => {
     const i = S.page.roles.findIndex(x => x.id === role.id);
     if (i >= 0) S.page.roles[i] = role; else S.page.roles.push(role);
-    S.page.roles.sort((a, b) => order(a) - order(b) || (a.name.toLowerCase() < b.name.toLowerCase() ? -1 : a.name.toLowerCase() > b.name.toLowerCase() ? 1 : a.id < b.id ? -1 : 1));
+    // Built-ins and the member role keep the server's order; only the custom roles are sorted (by name, as the server lists them).
+    const key = r => [r.name.toLowerCase(), r.id];
+    const cmp = (a, b) => { const [x, y] = [key(a), key(b)]; return x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : x[1] < y[1] ? -1 : 1; };
+    S.page.roles = [...S.page.roles.filter(r => r.kind !== "custom"), ...S.page.roles.filter(r => r.kind === "custom").sort(cmp)];
   };
-  const order = r => (r.kind === "custom" ? 2 : r.kind === "member" ? 1 : 0);
 
   return {
     state, emit, subscribe(f) { subs.add(f); return () => subs.delete(f); }, dismissNotice() { S.notice = null; emit(); },

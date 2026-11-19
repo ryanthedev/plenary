@@ -131,14 +131,14 @@ export const mint = {
  *   teams(tenant: string): Promise<Team[]>,
  *   setTeamMember(team: string, user: string, member: boolean): Promise<void>,
  *   teamMembers(team: string): Promise<string[]>,
- *   setScopedGrant(o: { scope: ScopeRef, subject: Subject, role: string|null }): Promise<void>,   // rejects a user subject on a board (use setGrant) and a Team of another tenant; Group/Space: code "last-owner"
+ *   setScopedGrant(o: { scope: ScopeRef, subject: Subject, role: string|null }): Promise<void>,   // rejects a user subject on a board (use setGrant) and a Team of another tenant; Group/Space: code "last-owner"; a role shaped like a custom role id ("r-…") must exist in the scope's Unit, checked inside the write that stores it (code "no-role"), so a grant cannot land on a role deleted a moment before and a delete cannot pass while such a write is in flight
  *   rename(scope: { type: "board"|"space"|"group", id: string }, name: string): Promise<Board|Space|Group>,   // a board's title (trimmed, 0-200 chars) or a Space's / Group's name (trimmed, 1-200); rejects an unknown scope, nothing else changes
  *   updateScope(scope: { type: "space"|"group", id: string }, patch: { name?: string, generalRole?: string|null }): Promise<Space|Group>,   // rename and/or change general access in ONE atomic step (null = only people added); at least one field; rejects an unknown scope; nothing else changes
  *   spacesIn(group: string, o?: { after?: string|null, limit?: number }): Promise<{ spaces: Space[], next: string|null }>,   // a Group's Spaces, by id, one bounded page (default 500, cap 1000); an unknown Group lists none
  *   scopedGrants(scope: ScopeRef): Promise<ScopedGrant[]>,
  *   createRole(o: { tenant: string, name: string, base?: string|null, boardRole: Role, permissions?: string[], max?: number }): Promise<CustomRole>,   // `max`: rejects code "limit" (atomically) when the Unit already has `max` custom roles (the "member" override is not counted)
  *   deleteRole(tenant: string, id: string): Promise<void>,   // ONE atomic step: rejects code "in-use" while any scoped grant OF THIS UNIT holds the role; never the "member" role (rejects "registry: bad role"); an unknown id rejects "registry: no such role"
- *   roleUsage(tenant: string, ids: string[], o?: { cap?: number }): Promise<Map<string, { places: number, users: number, teams: string[] }>>,   // per id (at most ROLE_LIMITS.custom + 1), THIS Unit's grants only (a scoped grant has no tenant column: its scope's row, a Unit, Group, Space or board of the tenant, says whose it is; another Unit's grant holding the same role string never counts): scoped-grant rows holding it counted to cap + 1, those whose subject is a user counted to cap + 1, and up to ROLE_LIMITS.teamIds Team ids (by id); an index probe each, never a scan; the "member" id is refused ("registry: bad role"): it is not grantable and its id is shared by every Unit
+ *   roleUsage(tenant: string, ids: string[], o?: { cap?: number }): Promise<Map<string, { places: number, users: number, teams: string[] }>>,   // per id (at most ROLE_LIMITS.custom + 1), THIS Unit's grants only (a scoped grant has no tenant column: its scope's row, a Unit, Group, Space or board of the tenant, says whose it is; another Unit's grant holding the same role string never counts): scoped-grant rows holding it counted to cap + 1, DISTINCT user subjects counted to cap + 1 (one person holding the role in twelve places is one), and up to ROLE_LIMITS.teamIds Team ids (by id); an index probe each, never a scan; the "member" id is refused ("registry: bad role"): it is not grantable and its id is shared by every Unit
  *   memberCount(tenant: string, o?: { cap?: number }): Promise<number>,   // the Unit's directory rows, counted to cap + 1 (default cap ROLE_LIMITS.memberCap)
  *   updateRole(tenant: string, id: string, patch: { name?: string, boardRole?: Role|null, permissions?: string[] }): Promise<CustomRole>,   // id "member" (the editable Unit member role) is created on first update; rejects an unknown id
  *   role(tenant: string, id: string): Promise<CustomRole|null>,
@@ -220,6 +220,8 @@ export const pageLimit = n => Math.min(PAGE.max, Math.max(1, Math.floor(Number(n
 
 /** Roles (PROTOCOL.md § Roles): custom roles per Unit, the cap usage is counted to, the Team ids `roleUsage` returns, the cap of `memberCount`. */
 export const ROLE_LIMITS = { custom: 50, usageCap: 100, teamIds: 50, memberCap: 50 };
+/** A role string shaped like a custom role id (`mint.role`): a scoped grant holding one needs that role to exist in the scope's Unit (`setScopedGrant`, code "no-role"). */
+export const isCustomRoleId = r => typeof r === "string" && r.startsWith("r-");
 /** A usage / count cap: a whole number from 1 to 1000, default `d`. */
 export const capOf = (n, d) => Math.min(1000, Math.max(1, Math.floor(Number(n) || d)));
 

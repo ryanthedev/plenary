@@ -42,8 +42,8 @@
 //   PATCH  /boards/:board                      { title } → 200 { board };  GET /spaces?can=board.create, GET /groups?can=space.create,
 //   POST /spaces, GET|PATCH /spaces/:id, GET|PATCH /groups/:id: PROTOCOL.md § Spaces and Groups (server/auth/spaces.js)
 //   GET|POST /teams, GET|PATCH|DELETE /teams/:id, PUT|DELETE /teams/:id/members/:user, GET /directory,
-//   GET|POST /roles, PATCH|DELETE /roles/:id: PROTOCOL.md § Roles (server/auth/roles.js)
 //   GET /access/:type/:id, PUT|DELETE /access/:type/:id/grants/:subjectType/:subject: PROTOCOL.md § Teams and access (server/auth/access.js)
+//   GET|POST /roles, PATCH|DELETE /roles/:id: PROTOCOL.md § Roles (server/auth/roles.js)
 //   (tenant of POST /boards = the caller's
 //   GET    /boards/:board/invites              → { invites }
 //   POST   /boards/:board/invites              { email, role, expiresAt? } → 201 { invite }

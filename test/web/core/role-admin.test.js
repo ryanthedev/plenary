@@ -190,3 +190,14 @@ test("copy helpers", () => {
   expect(permLabel("roles.manage")).toBe("Manage roles");
   expect(permLabel("x.y")).toBe("x.y");
 });
+
+test("after a save the built-ins and the member role keep the server's order; only custom roles sort by name", async () => {
+  await ready();
+  const order = () => model.state.page.roles.map(r => r.id);
+  const before = order();
+  expect(before).toEqual(["viewer", "owner", "admin", "member", "r-fac", "r-ops"]);
+  model.toggle("move"); await model.save();
+  expect(order()).toEqual(before);
+  model.select("r-ops"); model.setName("Aardvark"); await model.save();
+  expect(order()).toEqual(["viewer", "owner", "admin", "member", "r-ops", "r-fac"]);          // Aardvark before Facilitator; the built-ins did not move
+});

@@ -470,8 +470,9 @@ export function registryContract(name, makeRegistry, opts = {}) {
         await r.setScopedGrant({ scope, subject: { type: "team", id: tm.id }, role: null });
         expect(await r.scopedGrants(scope)).toHaveLength(1);
         await r.setScopedGrant({ scope: { type: "board", id: b.id }, subject: { type: "team", id: tm.id }, role: "editor" });
-        await r.setScopedGrant({ scope: { type: "unit", id: t.id }, subject: { type: "team", id: tm.id }, role: "r-whatever" });
-        expect((await r.scopedGrants({ type: "unit", id: t.id }))[0].role).toBe("r-whatever");
+        const cr = await r.createRole({ tenant: t.id, name: "Cr", boardRole: "viewer" });
+        await r.setScopedGrant({ scope: { type: "unit", id: t.id }, subject: { type: "team", id: tm.id }, role: cr.id });
+        expect((await r.scopedGrants({ type: "unit", id: t.id }))[0].role).toBe(cr.id);
         await expect(r.setScopedGrant({ scope: { type: "board", id: b.id }, subject: { type: "user", id: "google:ann" }, role: "editor" })).rejects.toThrow();
         await expect(r.setScopedGrant({ scope, subject: { type: "team", id: foreign.id }, role: "viewer" })).rejects.toThrow();
         await expect(r.setScopedGrant({ scope: { type: "space", id: "s-nope00000000" }, subject: { type: "user", id: "x" }, role: "viewer" })).rejects.toThrow();
@@ -849,25 +850,40 @@ export function registryContract(name, makeRegistry, opts = {}) {
         await r.createRole({ tenant: t.id, name: "C", boardRole: "viewer", max: 2 });  // a slot is free again
       });
 
-      test("roles (#50): usage and delete count THIS Unit's grants only, never another Unit's grant of the same role string (two Units)", async () => {
+      test("roles (#50): a custom role id is grantable only in its own Unit (code no-role, every scope kind, both subject kinds); usage counts this Unit's grants", async () => {
         const t = await unit(), u = await r.createTenant({ domain: "globex.com" });
         const a = await r.createRole({ tenant: t.id, name: "A", boardRole: "viewer" });
         const ts = await r.createSpace({ tenant: t.id, name: "TS" }), us = await r.createSpace({ tenant: u.id, name: "US" });
         const ug = await r.createGroup({ tenant: u.id, name: "UG" }), ub = await r.createBoard({ tenant: u.id, space: us.id });
         const uteam = await r.createTeam({ tenant: u.id, name: "UT" });
-        // Another Unit holds grants of the very same role string on every kind of scope (an adapter stores a role string as given).
-        await r.setScopedGrant({ scope: { type: "space", id: us.id }, subject: { type: "user", id: "google:o1" }, role: a.id });
-        await r.setScopedGrant({ scope: { type: "group", id: ug.id }, subject: { type: "team", id: uteam.id }, role: a.id });
-        await r.setScopedGrant({ scope: { type: "unit", id: u.id }, subject: { type: "user", id: "google:o2" }, role: a.id });
-        await r.setScopedGrant({ scope: { type: "board", id: ub.id }, subject: { type: "team", id: uteam.id }, role: a.id });
-        expect((await r.roleUsage(t.id, [a.id])).get(a.id)).toEqual({ places: 0, users: 0, teams: [] });
-        expect((await r.roleUsage(u.id, [a.id])).get(a.id)).toEqual({ places: 4, users: 2, teams: [uteam.id] });
-        await r.setScopedGrant({ scope: { type: "space", id: ts.id }, subject: { type: "user", id: "google:t1" }, role: a.id });
+        const user = id => ({ type: "user", id }), team = { type: "team", id: uteam.id };
+        for (const [scope, subject] of [[{ type: "space", id: us.id }, user("google:o1")], [{ type: "group", id: ug.id }, team], [{ type: "unit", id: u.id }, user("google:o2")], [{ type: "board", id: ub.id }, team]])
+          expect((await r.setScopedGrant({ scope, subject, role: a.id }).catch(e => e)).code).toBe("no-role");     // another Unit's role id
+        expect((await r.setScopedGrant({ scope: { type: "space", id: ts.id }, subject: user("google:t1"), role: "r-nosuchrole1" }).catch(e => e)).code).toBe("no-role");
+        expect(await r.scopedGrants({ type: "space", id: us.id })).toEqual([]);
+        expect((await r.roleUsage(u.id, [a.id])).get(a.id)).toEqual({ places: 0, users: 0, teams: [] });
+        await r.setScopedGrant({ scope: { type: "space", id: ts.id }, subject: user("google:t1"), role: a.id });
         expect((await r.roleUsage(t.id, [a.id])).get(a.id)).toEqual({ places: 1, users: 1, teams: [] });
-        await r.setScopedGrant({ scope: { type: "space", id: ts.id }, subject: { type: "user", id: "google:t1" }, role: null });
-        await r.deleteRole(t.id, a.id);                                                     // the other Unit's grants do not block it
+        await r.setScopedGrant({ scope: { type: "space", id: ts.id }, subject: user("google:t1"), role: null });
+        await r.deleteRole(t.id, a.id);
+        expect((await r.setScopedGrant({ scope: { type: "space", id: ts.id }, subject: user("google:t1"), role: a.id }).catch(e => e)).code).toBe("no-role");   // a grant cannot land on the role just deleted
+        expect(await r.scopedGrants({ type: "space", id: ts.id })).toEqual([]);
         await expect(r.roleUsage(t.id, ["member"])).rejects.toThrow("bad role");
         await expect(r.roleUsage(t.id, [a.id, "member"])).rejects.toThrow("bad role");
+      });
+
+      test("roles (#50): roleUsage counts DISTINCT users (one person in many places is one), Teams by id, places as rows", async () => {
+        const t = await unit();
+        const a = await r.createRole({ tenant: t.id, name: "A", boardRole: "viewer" });
+        const sps = [];
+        for (let i = 0; i < 4; i++) sps.push(await r.createSpace({ tenant: t.id, name: `S${i}` }));
+        const tm = await r.createTeam({ tenant: t.id, name: "T" });
+        for (const sp of sps) await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "user", id: "google:one" }, role: a.id });
+        await r.setScopedGrant({ scope: { type: "space", id: sps[0].id }, subject: { type: "user", id: "google:two" }, role: a.id });
+        await r.setScopedGrant({ scope: { type: "space", id: sps[1].id }, subject: { type: "team", id: tm.id }, role: a.id });
+        await r.setScopedGrant({ scope: { type: "space", id: sps[2].id }, subject: { type: "team", id: tm.id }, role: a.id });
+        expect((await r.roleUsage(t.id, [a.id])).get(a.id)).toEqual({ places: 7, users: 2, teams: [tm.id] });
+        expect((await r.roleUsage(t.id, [a.id], { cap: 1 })).get(a.id)).toMatchObject({ places: 2, users: 2 });     // counted to cap + 1
       });
 
       test("memberCount counts the directory to cap + 1, per Unit", async () => {

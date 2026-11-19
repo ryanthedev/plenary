@@ -71,7 +71,7 @@
 // owns that pool) or `sql` (a Bun SQL client you own). `schema` names the Postgres schema. Never reads env.
 
 import { SQL } from "bun";
-import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf } from "../auth/registry-port.js";
+import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 import { needSchema, migrate, missing as absent } from "../pg/schema.js";
 
@@ -707,6 +707,8 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       await write(async tx => {
         const tenant = await tenantOfScope(tx, type, id);
         if (!tenant) throw new Error("registry: no such scope");
+        // FOR KEY SHARE conflicts with deleteRole's FOR UPDATE: the delete either waits for this grant (then sees it: in-use) or has committed (no row: refused).
+        if (isCustomRoleId(r) && !(await one(tx, `SELECT 1 AS x FROM ${RO} WHERE tenant = $1 AND id = $2 FOR KEY SHARE`, [tenant, r]))) throw new PgRegistryError("no-role", "no such custom role in this Unit");
         if (sub.type === "team" && (await one(tx, `SELECT tenant FROM ${TE} WHERE id = $1`, [sub.id]))?.tenant !== tenant) throw new Error("registry: no such team");
         if (type === "board" && sub.type === "user") throw new Error("registry: a user's grant on a board is setGrant");
         if (type === "group" || type === "space") {
@@ -782,9 +784,12 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       if (!key(tenant) || (ids ?? []).includes(MEMBER_ROLE_ID)) throw new Error("registry: bad role");
       const c = capOf(cap, ROLE_LIMITS.usageCap), out = new Map();
       for (const id of [...new Set((ids ?? []).filter(key))].slice(0, ROLE_LIMITS.custom + 1)) {
-        const n = async extra => (await one(db, `SELECT count(*)::int AS n FROM (SELECT 1 FROM ${SG} g WHERE g.role = $1${extra} AND ${ownGrant("$3")} LIMIT $2) x`, [id, c + 1, tenant])).n;
-        out.set(id, { places: await n(""), users: await n(" AND g.subject_type = 'user'"),
-          teams: (await db.unsafe(`SELECT DISTINCT g.subject FROM ${SG} g WHERE g.role = $1 AND g.subject_type = 'team' AND ${ownGrant("$3")} ORDER BY g.subject LIMIT $2`, [id, ROLE_LIMITS.teamIds, tenant])).map(r => r.subject) });
+        const own = ownGrant("$3");
+        const u = await one(db, `SELECT (SELECT count(*)::int FROM (SELECT 1 FROM ${SG} g WHERE g.role = $1 AND ${own} LIMIT $2) a) AS places,
+          (SELECT count(*)::int FROM (SELECT DISTINCT g.subject FROM ${SG} g WHERE g.role = $1 AND g.subject_type = 'user' AND ${own} LIMIT $2) b) AS users,
+          (SELECT coalesce(string_agg(subject, ',' ORDER BY subject), '') FROM (SELECT DISTINCT g.subject FROM ${SG} g WHERE g.role = $1 AND g.subject_type = 'team' AND ${own} ORDER BY g.subject LIMIT $4) c) AS teams`,
+          [id, c + 1, tenant, ROLE_LIMITS.teamIds]);
+        out.set(id, { places: u.places, users: u.users, teams: u.teams ? u.teams.split(",") : [] });
       }
       return out;
     },

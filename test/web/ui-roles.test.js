@@ -5,7 +5,7 @@ import { test, expect, beforeEach, afterEach } from "bun:test";
 import { FakeElement, installDom, textOf } from "./collab/fake-dom.js";
 import { mountRolesPage } from "../../web/adapters/dom/roles.js";
 import { createRolesModel } from "../../web/core/role-admin.js";
-import { announced, keeper } from "../../web/adapters/dom/focus.js";
+import { announce, announced, keeper } from "../../web/adapters/dom/focus.js";
 
 const SC = ["unit", "group", "space", "board"];
 const MATRIX = { scopes: SC, permissions: [
@@ -33,6 +33,7 @@ beforeEach(() => {
   globalThis.Node = Object.getPrototypeOf(FakeElement);
   globalThis.document.addEventListener = () => {}; globalThis.document.removeEventListener = () => {};
   globalThis.document.body = new FakeElement("body");
+  announce("");                                                 // the live region outlives a test: start each from silence
   calls = []; focused = []; page = PAGE(); answers = {};
   FakeElement.prototype.focus = function () { focused.push(this); globalThis.document.activeElement = this; };
   api = {
@@ -209,4 +210,65 @@ test("focus: a vanished checkbox falls back to a neutral role name (never to ano
   keys.around(() => { keys.mark(el(), "heading"); rp1 = keys.mark(el(), "rolepick:a"); rp2 = keys.mark(el(), "rolepick:b"); del = keys.mark(el(), "delete-role"); });
   expect(globalThis.document.activeElement.getAttribute("data-fk")).toBe("rolepick:b");
   expect(announced()).toBe("That permission is no longer here; moved to the previous one.");
+});
+
+// Keyboard users focus a button, then activate it. The button leaves the DOM when the screen redraws, so focus moves on purpose (to a named key)
+// and nothing may announce "That item is no longer here".
+const focusThenClick = async text => { const b = btn(text); b.focus(); b.click(); await settle(); await settle(); };
+const noStale = () => expect(announced()).not.toContain("no longer here");
+
+test("keyboard: Delete role… then its Cancel and Delete role move focus on purpose, with no false 'no longer here' announcement", async () => {
+  await mount();
+  await focusThenClick("Delete role…");
+  expect(globalThis.document.activeElement.getAttribute("data-fk")).toBe("confirm-delete"); noStale();
+  await focusThenClick("Cancel");
+  expect(globalThis.document.activeElement.getAttribute("data-fk")).toBe("delete-role"); noStale();
+  await focusThenClick("Delete role…");
+  await focusThenClick("Delete role");
+  expect(announced()).toContain("Deleted role Facilitator"); noStale();
+  expect(globalThis.document.activeElement.getAttribute("data-fk")).toBe("heading");
+});
+
+test("keyboard: the many-people Cancel and Save anyway put focus on Save and the live text is exactly the save result", async () => {
+  await mount();
+  answers.updateRole = (id, p) => (p.confirm ? undefined : { error: "conflict", code: "confirm-required", impact: { places: 11, people: 60, capped: false } });
+  byKey("perm:move").click(); await settle();
+  await focusThenClick("Save role");
+  await focusThenClick("Cancel");
+  expect(globalThis.document.activeElement.getAttribute("data-fk")).toBe("save"); noStale();
+  await focusThenClick("Save role");
+  await focusThenClick("Save anyway");
+  expect(globalThis.document.activeElement.getAttribute("data-fk")).toBe("save");
+  expect(announced()).toBe("Saved Facilitator");
+  expect(all(e => e.getAttribute("data-fk") === "confirm-text")).toEqual([]);   // the alert announces itself; nothing is marked to focus
+});
+
+test("keyboard: Cancel copy, Duplicate and picking a role land on the detail heading without a stale announcement", async () => {
+  await mount();
+  await focusThenClick("Duplicate");
+  expect(globalThis.document.activeElement.getAttribute("data-fk")).toBe("heading-detail");
+  await focusThenClick("Cancel copy");
+  expect(globalThis.document.activeElement.getAttribute("data-fk")).toBe("heading-detail"); noStale();
+  await focusThenClick("Ops");
+  expect(globalThis.document.activeElement.getAttribute("data-fk")).toBe("heading-detail"); noStale();
+});
+
+test("keeper.around with an intended target: a vanished control goes there silently; without it the old fallback still announces", () => {
+  const keys = keeper();
+  const el = () => globalThis.document.createElement("button");
+  keys.around(() => { keys.mark(el(), "heading"); keys.mark(el(), "delete-role").focus(); });
+  keys.around(() => { keys.mark(el(), "heading"); keys.mark(el(), "confirm-delete"); }, { to: "confirm-delete" });
+  expect(globalThis.document.activeElement.getAttribute("data-fk")).toBe("confirm-delete");
+  expect(announced()).not.toContain("no longer here");
+  keys.around(() => { keys.mark(el(), "heading"); });
+  expect(announced()).toContain("no longer here");
+});
+
+test("a row says what the role is: one-line summary, where it applies, use; a saved custom role shows what it was copied from", async () => {
+  page.roles[3] = role("r-fac", "Facilitator", "custom", { ladder: "annotator", summary: "Annotator board access, plus 1 management permission", base: "owner", permissions: ["board.create"],
+    scopes: { unit: ["board.create"], group: ["board.create"], space: ["board.create"], board: ["board.view"] }, used: { places: 4, capped: false } });
+  await mount();
+  expect(items("Roles")[3].getAttribute("aria-label")).toBe("Facilitator, Custom, Annotator board access, plus 1 management permission, Organization to Board, Used in 4 places");
+  expect(textOf(items("Roles")[3])).toContain("Annotator board access, plus 1 management permission");
+  expect(textOf(root)).toContain("Like Owner");
 });

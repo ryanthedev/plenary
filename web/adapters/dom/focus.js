@@ -2,7 +2,7 @@
 // <body> whenever the person Tabs, clicks or activates something that redraws. Two tools:
 //   keeper()            for pages that mark their controls with stable keys (Home, Space, Group): `keep` hands back the same element every
 //                       render, `mark` labels what may hold focus, `around(fn)` runs a render and puts focus back on the marked element that
-//                       had it. If that element is gone (its card left the list), focus goes to the next marked element of the same kind, then
+//                       had it (`around(fn, { to })`: when it is gone and the caller names where focus goes next, there, with no announcement). If that element is gone (its card left the list), focus goes to the next marked element of the same kind, then
 //                       the previous one, then the element marked "heading".
 //   captureFocus/restoreFocus   for chrome that is rebuilt wholesale (the board's panels, dock, timeline, dialogs): remember where focus was by
 //                       what the control says (aria-label, title, text, position) and find its twin in the rebuilt root.
@@ -49,13 +49,15 @@ export function keeper() {
     mark(el, key) { el.setAttribute("data-fk", key); marks.set(key, el); return el; },
     /** Focus the marked element with this key (after a render). */
     focusKey(key) { marks.get(key)?.focus?.(); },
-    around(fn) {
+    /** `to`: the key focus is about to be given on purpose (the caller's own follow-up); when the focused control is gone, focus goes there silently instead of to a neighbour with a "no longer here" announcement. */
+    around(fn, { to: intended = null } = {}) {
       const had = fk(), prev = doc()?.activeElement ?? null, before = [...marks.keys()];
       used = new Set(); marks = new Map();
       fn();
       for (const k of [...kept.keys()]) if (!used.has(k)) kept.delete(k);
       if (!had) { if (prev?.isConnected && doc()?.activeElement !== prev) prev.focus?.(); return; }   // an unmarked element that was moved (an open menu's item)
       let to = marks.get(had), toKey = had;
+      if (!to && intended && marks.get(intended)) { marks.get(intended).focus?.(); return; }
       if (!to) {
         // Only to a neutral control (a card's link, a Space link), never to a star or another row's action: a star on a neighbour is one Enter from acting on it.
         const parts = had.split(":"), sameKind = parts[0] === "star" ? k => k.startsWith(`card:${parts[1]}:`) : TO_ROW[parts[0]] ? k => kind(k) === TO_ROW[parts[0]] : k => kind(k) === kind(had);

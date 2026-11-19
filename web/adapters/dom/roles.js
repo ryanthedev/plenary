@@ -11,7 +11,7 @@ import { h, replace } from "./dom.js";
 import { keeper } from "./focus.js";
 import { shell, showNotice, gate, message } from "./spaces.js";
 import { act, setOff, speak, quiet } from "./access.js";
-import { SCOPE_LABEL, LADDER_LABEL, usedText, impactText } from "../../core/role-admin.js";
+import { SCOPE_LABEL, LADDER_LABEL, usedText, impactText, rangeText } from "../../core/role-admin.js";
 
 const KIND = { builtin: "Built-in, read-only", member: "Built-in, permissions editable", custom: "Custom" };
 const CELL = { yes: ["✓", "applies"], no: ["", "not granted"], na: ["–", "not at this scope"] };
@@ -35,15 +35,17 @@ export function mountRolesPage({ root, model, hrefs, signIn = null }) {
     showNotice(status, model);
     if (gate(S, main, () => model.load(), signIn)) { quiet(S); return; }
     if (S.busy && S.page) { for (const c of controls) c.setAttribute("aria-disabled", "true"); return; }
-    speak(S, () => keys.around(draw));
-    const f = after; after = null; f?.();
+    const f = after; after = null;
+    const to = f?.() ?? null;                                  // where focus goes on purpose: named before the redraw, so a vanished control is not announced as "no longer here"
+    speak(S, () => keys.around(draw, { to }));
+    if (to) keys.focusKey(to);
   }
 
   const listItem = r => {
-    const used = usedText(r);
-    return h("li.row", { "aria-label": [r.name, KIND[r.kind], used].filter(Boolean).join(", ") },
-      keys.mark(h("button.btn.ghost.who", { type: "button", "aria-current": r.id === S.selected && !S.draft?.isNew ? "true" : "false", onclick: () => { deleting = false; after = () => keys.focusKey("heading-detail"); model.select(r.id); } }, r.name), `rolepick:${r.id}`),
-      h("span.p", {}, KIND[r.kind]), used ? h("small", {}, used) : null);
+    const used = usedText(r), range = rangeText(r);
+    return h("li.row", { "aria-label": [r.name, KIND[r.kind], r.summary, range, used].filter(Boolean).join(", ") },
+      keys.mark(h("button.btn.ghost.who", { type: "button", "aria-current": r.id === S.selected && !S.draft?.isNew ? "true" : "false", onclick: () => { deleting = false; after = () => "heading-detail"; model.select(r.id); } }, r.name), `rolepick:${r.id}`),
+      h("span.p", {}, KIND[r.kind]), r.summary ? h("small", {}, r.summary) : null, range ? h("small", {}, range) : null, used ? h("small", {}, used) : null);
   };
 
   function matrixView(rows, editable) {
@@ -75,25 +77,26 @@ export function mountRolesPage({ root, model, hrefs, signIn = null }) {
       member || !editable ? h("option", { value: shown.ladder ?? "", selected: true }, shown.ladder ? (LADDER_LABEL[shown.ladder] ?? shown.ladder) : "None") : null,
       editable && !member ? [...new Set([...ladders, ...(shown.ladder && !ladders.includes(shown.ladder) ? [shown.ladder] : [])])].map(l => h("option", { value: l, selected: l === shown.ladder }, LADDER_LABEL[l] ?? l)) : null)), "ladder");
     saveBtn = editable ? keys.mark(act({}, d.isNew ? "Create role" : "Save role", () => { if (dirtyNow() || d.isNew) model.save(); }, () => S.busy), "save") : null;
-    discardBtn = editable ? keys.mark(act({}, d.isNew ? "Cancel copy" : "Discard changes", () => { after = () => keys.focusKey("heading-detail"); model.discard(); }, () => S.busy), "discard") : null;
+    discardBtn = editable ? keys.mark(act({}, d.isNew ? "Cancel copy" : "Discard changes", () => { after = () => "heading-detail"; model.discard(); }, () => S.busy), "discard") : null;
     sync();
     if (saveBtn && d.isNew) setOff(saveBtn, S.busy);
     const used = r ? usedText(r) : null;
     return h("section.role-detail", { "aria-label": "Role details" },
       h("div.sp-head", {}, keys.mark(h("h2", { id: "role-title", tabindex: "-1" }, d?.isNew ? "New role" : r.name), "heading-detail"), h("span.badge", {}, d?.isNew ? "Custom, unsaved" : KIND[r.kind]),
-        d?.isNew ? h("span.badge", {}, `Copy of ${S.page.roles.find(x => x.id === d.base)?.name ?? "a role"}`) : null),
+        d?.isNew ? h("span.badge", {}, `Copy of ${S.page.roles.find(x => x.id === d.base)?.name ?? "a role"}`) : null,
+        !d?.isNew && r?.kind === "custom" && r.base ? h("span.badge", {}, `Like ${S.page.roles.find(x => x.id === r.base)?.name ?? "another role"}`) : null),
       used ? h("p", {}, used) : null,
       !editable ? h("p.muted", {}, "Built-in roles are read-only. Duplicate one to make your own.") : member ? h("p.muted", {}, "Everyone in the organization has this role. You can change its permissions, not its name or board access.") : null,
       h("div.pick-row", {}, h("label.l", {}, "Name", nameIn), h("label.l", {}, "Board access", ladderSel)),
       matrixView(model.rows(), editable),
-      S.confirm ? h("div.banner", { role: "alert" }, keys.mark(h("p", { tabindex: "-1" }, impactText(r ?? { kind: "custom" }, S.confirm.impact), " Saving changes what they can do within about a minute."), "confirm-text"),
-        keys.mark(act({}, "Save anyway", () => { after = () => keys.focusKey("save"); model.confirmSave(); }, () => S.busy), "confirm-save"), keys.mark(act({}, "Cancel", () => { after = () => keys.focusKey("save"); model.cancelConfirm(); }, () => S.busy), "confirm-cancel")) : null,
-      h("div.pick-row", {}, saveBtn, discardBtn, r ? keys.mark(act({}, "Duplicate", () => { after = () => keys.focusKey("heading-detail"); model.duplicate(r.id); }, () => S.busy), "duplicate") : null),
+      S.confirm ? h("div.banner", { role: "alert" }, h("p", {}, impactText(r ?? { kind: "custom" }, S.confirm.impact), " Saving changes what they can do within about a minute."),
+        keys.mark(act({}, "Save anyway", () => { after = () => "save"; model.confirmSave(); }, () => S.busy), "confirm-save"), keys.mark(act({}, "Cancel", () => { after = () => "save"; model.cancelConfirm(); }, () => S.busy), "confirm-cancel")) : null,
+      h("div.pick-row", {}, saveBtn, discardBtn, r ? keys.mark(act({}, "Duplicate", () => { after = () => "heading-detail"; model.duplicate(r.id); }, () => S.busy), "duplicate") : null),
       r?.kind === "custom" && !d?.isNew ? h("section.danger", { "aria-label": "Delete role" }, deleting
         ? [h("p", {}, `Delete ${r.name}? A role that is in use cannot be deleted.`),
-          keys.mark(act({}, "Delete role", () => { deleting = false; after = () => keys.focusKey(model.roleOf(r.id) ? "delete-role" : "heading"); model.remove(); }, () => S.busy), "confirm-delete"),
-          keys.mark(act({}, "Cancel", () => { deleting = false; after = () => keys.focusKey("delete-role"); render(); }, () => S.busy), "cancel-delete")]
-        : keys.mark(act({}, "Delete role…", () => { deleting = true; after = () => keys.focusKey("confirm-delete"); render(); }), "delete-role")) : null);
+          keys.mark(act({}, "Delete role", () => { deleting = false; after = () => model.roleOf(r.id) ? "delete-role" : "heading"; model.remove(); }, () => S.busy), "confirm-delete"),
+          keys.mark(act({}, "Cancel", () => { deleting = false; after = () => "delete-role"; render(); }, () => S.busy), "cancel-delete")]
+        : keys.mark(act({}, "Delete role…", () => { deleting = true; after = () => "confirm-delete"; render(); }), "delete-role")) : null);
   }
 
   function draw() {

@@ -65,8 +65,8 @@ test("a restore into the personal space carries movedTo; a notice carries `into`
 });
 
 test("a notice's `into` may have no id yet (the personal space is created on restore); a bad one is dropped", async () => {
-  const ok = await api(answer(200, { ...NOTICE, into: { id: null, name: "Your personal space (created on restore)", personal: true } })).notice("b-1");
-  expect(ok.notice.into).toEqual({ id: null, name: "Your personal space (created on restore)", personal: true });
+  const ok = await api(answer(200, { ...NOTICE, into: { id: null, name: null, personal: true } })).notice("b-1");
+  expect(ok.notice.into).toEqual({ id: null, name: null, personal: true });
   expect((await api(answer(200, { ...NOTICE, into: { id: "bad id", name: "x", personal: true } })).notice("b-1")).notice.into).toBeUndefined();
   expect((await api(answer(200, { ...NOTICE, into: { id: "s-1", name: "x", personal: false } })).notice("b-1")).notice.into).toBeUndefined();
 });

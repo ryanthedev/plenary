@@ -212,14 +212,26 @@ describe("trash, undo and restore", () => {
     await t2.trashSpace(ada, design.id);
     expect(await r.personalSpace(acme.id, newbie.user)).toBe(null);
     const n = await t2.notice(newbie, board.id);
-    expect(n).toMatchObject({ canRestore: true, into: { id: null, personal: true } });
-    expect(n.into.name).toMatch(/created on restore/);
+    expect(n).toMatchObject({ canRestore: true, into: { id: null, name: null, personal: true } });
+    expect(n.into.name).toBe(null);                                                      // the client words it
     expect(await t2.list(newbie)).toBeTruthy();
     expect(calls.filter(c => c[1] === newbie.user)).toEqual([]);                      // nothing was created by reading
     expect(await r.personalSpace(acme.id, newbie.user)).toBe(null);
     const out = await t2.restoreBoard(newbie, board.id);
     expect(out).toMatchObject({ restored: true, movedTo: { personal: true } });
     expect((await r.personalSpace(acme.id, newbie.user)).id).toBe(out.movedTo.id);   // the POST created it
+  });
+  test("a refused restore (would-escalate) creates no personal space; the retry after an admin restore of the Space is unaffected", async () => {
+    const janitor = await r.createRole({ tenant: acme.id, name: "Janitor3", boardRole: "editor", permissions: ["delete"] });
+    const kit = ident("kit");
+    await r.touchMember(acme.id, { user: kit.user, name: "kit", email: kit.email });
+    await r.setScopedGrant({ scope: { type: "space", id: design.id }, subject: { type: "user", id: kit.user }, role: janitor.id });
+    await tr.trashBoard(ada, board.id, { from: design.id });
+    await tr.trashSpace(ada, design.id);
+    expect(await r.personalSpace(acme.id, kit.user)).toBe(null);
+    expect(await code(tr.restoreBoard(kit, board.id))).toBe("would-escalate");
+    expect(await r.personalSpace(acme.id, kit.user)).toBe(null);                      // nothing left behind
+    expect((await r.board(board.id)).trashedAt).not.toBe(null);
   });
   test("the Space going to Trash between choosing the destination and the write: restore chooses again once (never answers space-in-trash) and still applies the no-escalation check", async () => {
     await tr.trashBoard(ada, board.id, { from: design.id });

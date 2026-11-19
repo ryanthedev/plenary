@@ -370,7 +370,7 @@ test("dev board: it lives in a private Dev Space whose grants mirror the token r
       expect([user, await first.registry.grant(board.id, user), await first.registry.scopedGrant({ type: "space", id: space.id }, { type: "user", id: user })]).toEqual([user, role, role]);
     }
   } finally { await first.stop(); }
-  // A crash after the tenant and Space exist but before the board was written: the file holds only those two ids.
+  // A crash after createBoard but before the file recorded the board: the file holds only the tenant and Space ids.
   const file = join(dir, "dev-board.json");
   expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ tenant, space: space.id, board: board.id });
   writeFileSync(file, JSON.stringify({ tenant, space: space.id }));
@@ -378,7 +378,7 @@ test("dev board: it lives in a private Dev Space whose grants mirror the token r
   try {
     const again = await second.registry.board(second.devBoard);
     expect([again.tenant, again.space]).toEqual([tenant, space.id]);   // no second tenant or Space
-    expect(again.id).not.toBe(board.id);                                  // the unrecorded board is not found again: a new one in the same Space
+    expect(again.id).toBe(board.id);                                      // the kill landed after createBoard: its idempotency key replays, so the same board comes back (no stray board)
     expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ tenant, space: space.id, board: again.id });
   } finally { await second.stop(); }
 });

@@ -200,7 +200,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
 
     board: db.query("SELECT id, tenant, title, member_role, created_at, (SELECT space FROM reg_board_spaces WHERE board = reg_boards.id) AS space FROM reg_boards WHERE id = ?"),
     insBoardSpace: db.query("INSERT INTO reg_board_spaces (board, space) VALUES (?, ?)"),
-    putBoardSpace: db.query("INSERT INTO reg_board_spaces (board, space) VALUES (?, ?) ON CONFLICT (board) DO UPDATE SET space = excluded.space"),
+    putBoardSpace: db.query("UPDATE reg_board_spaces SET space = ?2 WHERE board = ?1"),
 
     group: db.query("SELECT * FROM reg_groups WHERE id = ?"),
     groups: db.query("SELECT * FROM reg_groups WHERE tenant = ? ORDER BY created_at, id"),

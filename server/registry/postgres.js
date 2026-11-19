@@ -413,7 +413,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         await idemPut(tx, k, board + (moved ? ":moved" : ":noop"), at);      // the key first (it rejects a replay before the compare-and-set can); its answer says whether the move happened
         if (moved) {
           if (cur !== from) throw new RegistryError("moved", "the board is no longer in that Space");
-          await tx.unsafe(`INSERT INTO ${BS} (board, space) VALUES ($1, $2) ON CONFLICT (board) DO UPDATE SET space = excluded.space`, [board, to]);
+          await tx.unsafe(`UPDATE ${BS} SET space = $2 WHERE board = $1`, [board, to]);   // every board has its row (createBoard writes it)
         }
         return { board: rowBoard(await one(tx, `${BOARD_SQL} WHERE b.id = $1`, [board])), moved };
       });

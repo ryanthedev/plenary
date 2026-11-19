@@ -410,8 +410,8 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   if (dev.enabled && !roles.gateway) log.warn("dev tokens are on, but the dev sign-in menu (GET /auth/dev) is OFF: " + off + " (no dev board on this node)", { host });
   else if (dev.enabled) {
     // Reuse the dev tenant, Space and board across restarts (the Registry has no list call to find them by). Each step is written to
-    // the file as soon as it exists, so a crash between steps resumes instead of minting a second tenant or Space (at worst one
-    // stray board in the private Dev Space, when the kill lands between createBoard and the write).
+    // the file as soon as it exists, so a crash between steps resumes instead of minting a second tenant or Space (a kill between
+    // createBoard and the write is a replay of the board's idempotency key).
     const devFile = join(dataDir, "dev-board.json");
     let saved = {};
     if (existsSync(devFile)) { try { saved = JSON.parse(readFileSync(devFile, "utf8")) ?? {}; } catch { saved = {}; } }
@@ -428,7 +428,9 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
         space = await registry.createSpace({ tenant: tenant.id, name: "Dev", generalRole: null });   // every board lives in a Space; only the dev tokens' grants open it
         saved = { tenant: tenant.id, space: space.id }; save();
       }
-      board = await registry.createBoard({ tenant: tenant.id, title: "dev board", memberRole: null, space: space.id });
+      // A fixed idempotency key per Space: a kill between createBoard and the file write makes the next start's create a replay, which reuses the board.
+      try { board = await registry.createBoard({ tenant: tenant.id, title: "dev board", memberRole: null, space: space.id, idem: { user: "dev:seed", key: `dev-board-${space.id}`, fp: "dev-board" } }); }
+      catch (err) { if (err?.code !== "idem-replay") throw err; board = await rawRegistry.board(err.ref); }
       saved = { tenant: tenant.id, space: space.id, board: board.id }; save();
     } else space = await rawRegistry.space(board.space);
     // Across restarts a token's role may have dropped. The Registry refuses to demote a board's (or Space's) last owner

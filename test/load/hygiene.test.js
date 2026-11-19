@@ -130,12 +130,18 @@ test("the server's kept output is capped (the log file gets all of it) and readi
   const s = await startServer({ tokensPath: tokensFile(), main: stub, logPath });
   try {
     expect(s.board).toBe("noisyboard");
-    const end = Date.now() + 5000;
-    while (statSync(logPath).size < 2_000_000 && Date.now() < end) await Bun.sleep(50);
+    const waitFor = async (cond, what, ms = 10_000) => {          // its own deadline and a named failure
+      const end = Date.now() + ms;
+      while (!cond()) { if (Date.now() > end) throw new Error(`timed out waiting for ${what}`); await Bun.sleep(20); }
+    };
+    await waitFor(() => statSync(logPath).size >= 2_000_000, "the log file to reach 2 MB (stdout + stderr)");
+    await waitFor(() => s.out.text.length >= HEAD_BYTES, "stdout's kept head to fill");
+    await waitFor(() => s.out.err.length >= HEAD_BYTES, "stderr's kept head to fill (the file reaching 2 MB does not say stderr has been read)");
     expect(statSync(logPath).size).toBeGreaterThanOrEqual(2_000_000);   // the file got everything
-    expect(s.out.text.length).toBeLessThan(HEAD_BYTES + 200_000);       // memory kept the head only (the cap plus one chunk)
-    expect(s.out.err.length).toBeLessThan(HEAD_BYTES + 200_000);
-    expect(s.out.text.length).toBeGreaterThanOrEqual(HEAD_BYTES);
+    expect(s.out.text.length).toBeLessThanOrEqual(HEAD_BYTES);          // memory kept the head only, cut at the cap exactly (whatever size the pipe's chunks were)
+    expect(s.out.err.length).toBeLessThanOrEqual(HEAD_BYTES);
+    expect(s.out.text.length).toBe(HEAD_BYTES);
+    expect(s.out.err.length).toBe(HEAD_BYTES);
     expect((await fetch(`${s.httpUrl}/health`)).status).toBe(200);
   } finally { await s.stop(); }
 });

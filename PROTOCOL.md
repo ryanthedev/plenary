@@ -1070,7 +1070,7 @@ built once, and the late handler's return value or rejection is dropped (handled
 
 ## Idempotent creates (`Idempotency-Key`, #73)
 
-`POST /boards`, `POST /spaces`, `POST /groups`, `POST /boards/:board/invites` and `POST /boards/:board/links` accept an `Idempotency-Key` header: 8-64 of
+`POST /boards`, `POST /spaces`, `POST /groups`, `POST /roles`, `POST /boards/:board/invites` and `POST /boards/:board/links` accept an `Idempotency-Key` header: 8-64 of
 `[A-Za-z0-9_-]` (anything else is 400 `bad-idempotency-key`); a client makes one per submit (a random UUID is fine) and **reuses it for every retry of that
 submit**. Without the header a create behaves as before.
 
@@ -1086,7 +1086,7 @@ submit**. Without the header a create behaves as before.
 - **A replay is authorized again (security).** What is stored under a key is `{ status, ref: { id } }`, **never a response body** (a link's `url`, an
   invite's address and the object's other fields are not in it). A repeat re-runs the create's own authorization for the caller as they are now,
   then reads the object fresh: `POST /boards` needs `board.create` at the board's Space (and a personal Space is its owner's alone), `POST /spaces`
-  `space.create` at its Group or the Unit, `POST /groups` `group.create`, invites and links the board-manager check of the invites and links routes
+  `space.create` at its Group or the Unit, `POST /groups` `group.create`, `POST /roles` `roles.manage` (§ Roles; a replay of a role since deleted is `404 not-found`), invites and links the board-manager check of the invites and links routes
   (`readInvite`, `readLink`). A caller who lost that access since gets the route's ordinary `403 forbidden`, never the stored answer and no token. A
   stored `owner-grant-failed` is authorized like the board create. A link's `id` is itself its capability; it is the same id `reg_links` holds in the
   same store, and it is returned only after the manager check.
@@ -1171,6 +1171,57 @@ removal, a lower role, a Team member removed, a Team deleted) is a revocation: i
 **Bounds.** `GET /teams`: one statement (size counted to 1001 per Team). `GET /teams/:id`: the Team row, one `effective` at the Unit, one member page, one `membersAmong`. `GET /access/..`: the scope row and its one `effective`
 (both whatever the id), then one grants page, one `membersAmong` and one `teamsAmong` over that page, the Unit's roles, and, for a Space or board, the container rows and their `effective`. `GET /directory`:
 one `findMembers` and one `teamsPage`. Nothing loops a Unit's members, boards or Spaces.
+
+## Roles (#50)
+
+Design: design/orgs/JOURNEY.md (J9, §4 [roles]). Code: `server/auth/roles.js` (every decision below), routes in `server/auth/http.js` (they only translate), Registry calls `createRole`
+(with `max`), `updateRole`, `deleteRole`, `roleUsage`, `memberCount` (§ Registry), the one definition of what a role grants in `server/auth/permissions.js` (`roleDef`, `roleProblem`, `ALLOWED_AT`).
+Every route authenticates like Home (`Authorization: Bearer`) and **checks the permission `roles.manage` at the Unit root** (Unit scope only: clipped away below; the built-in Unit `admin` holds
+it; a custom role may carry it), never a role name. The Roles screen is `?roles=1`; Home links to it when `can.manageRoles` (= `roles.manage` at the Unit) is true.
+
+**What is a role.** One **board-content ladder step** (`viewer`, `commenter`, `annotator` or `editor`; never `owner`, so a role edit can never create a path to owner or board owner) plus a set of
+**management permissions** (`board.create`, `space.create`, `group.create`, `members.manage`, `move`, `delete`, `transfer`, `roles.manage`, `team.manage`). The model is ONE set, not a set per scope: where a
+permission means something is derived (`ALLOWED_AT`), so the screen cannot offer an impossible permission-at-scope pair. Built-in roles are read-only (ladder `viewer`..`owner`, Unit `admin`); the
+Unit **member** role is editable in its **management permissions only** (its name and its board content, none, are fixed: no edit can hand every member board content). Custom roles are per Unit,
+**at most 50** (409 `too-large`; the cap is checked atomically in the Registry write, so concurrent creates cannot pass it).
+
+| Route | Needs | Answers |
+|---|---|---|
+| `GET /roles` | `roles.manage` at the Unit (else the one 404 `not-found`; a guest or a caller with no Unit too) | `{ roles: RoleView[], matrix, can: { admin }, limits }` |
+| `POST /roles` `{ name, boardRole, permissions, base? }` | `roles.manage`; no escalation (below); accepts `Idempotency-Key` (§ Idempotent creates) | 201 `{ role }`; `base` = the id of the role this one was duplicated from (a built-in, `member` or a custom id; display only, `like Editor`) |
+| `PATCH /roles/:id` `{ name?, boardRole?, permissions?, confirm? }` | `roles.manage`; no escalation; a custom role or `member` | 200 `{ role }`. 409 `confirm-required` (below) |
+| `DELETE /roles/:id` | `roles.manage`; no escalation; a custom role | 204. **409 `in-use`** `{ places }` while any grant holds it |
+
+- `RoleView`: `{ id, name, kind: "builtin"|"member"|"custom", editable, base?, ladder, permissions, scopes: { unit|group|space|board: string[] }, used: { places, capped } | null }`. `permissions` are the
+  management permissions it was given; `scopes[type]` is what `roleDef(role, type)` gives there (content permissions included), so the screen's matrix is the server's. `used` is `null` for a built-in (not counted); `member` carries `{ members, capped }` (the directory's size, counted to 51) instead of `places`.
+  `places` = the grants (a person's or a Team's, on any scope) that hold the role, **counted to 100** (`capped: true` = 100 or more; the cost is one index probe of at most 101 rows per role).
+- `matrix`: `{ scopes: ["unit","group","space","board"], permissions: [{ id, group: "content"|"management", scopes }], ladders }` where `scopes` is where the permission means anything (from
+  `ALLOWED_AT`; content at all four), `ladders` the ladder steps the CALLER may give (`viewer`..up to what they hold themselves; all four for a Unit admin). `can.admin` is the caller's Unit-admin flag.
+  The permissions the caller may tick are those they hold themselves (the same rule the server enforces), listed as `matrix.tickable` (a Unit admin: every management permission).
+- **No escalation.** Unless the caller is a Unit admin, a write needs the role's definition **at the Unit** (`roleDef(role, "unit")`: ladder content permissions plus management permissions, ladder step
+  included) to be a **subset of the caller's own permissions at the Unit** (what the resolver gives them there, member role's included), both for the role as it is now (so a role cannot be edited, or
+  deleted, by someone who could not hold it) and as it would become. A permission the caller lacks cannot be put in a role, and a role above the caller cannot be touched. The `team.manage`
+  back door (§ Teams and access) still holds with no change: a Team's grants are re-read live, so a role edit that adds a permission to a role a Team holds is checked at the next Team change against
+  the caller's own rights there.
+- **Validation** (`roleProblem`, then names): name trimmed 1-200, no NUL; `boardRole` one of the four steps for a custom role; `permissions` distinct management permissions; `member` takes
+  `permissions` only (a `name` or `boardRole` in the patch is 400). Body fields outside the list are refused.
+- **The many-people warning.** An edit that changes `permissions` or `boardRole` of a role is **many** when it is used in **more than 10 places** or by **more than 50 people** (a person's grants plus the
+  sizes of the Teams that hold it, read for up to 50 Teams, each size counted to 1001; the Unit `member` role: the directory's member count, counted to 51), or when `member` is edited. A many edit
+  without `confirm: true` changes **nothing** and answers `409 { error: "confirm-required", impact: { places, people, capped } }` (counts only, capped at 100 / 1001 / 51; no name). The screen shows the
+  count and asks; **Save anyway** sends the same patch with `confirm: true`. A rename never needs it.
+- **Delete is refused while the role is in use** (decision: refuse, never reassign: reassigning would silently change what people can do). The check and the delete are ONE atomic Registry step
+  (`deleteRole`), so a grant cannot slip in between; a grant written to a role that is deleted a moment later is inert (the resolver ignores an unknown role) and any manager may clear it.
+  `member` and the built-ins are never deleted (400).
+- **Leaks.** An id that is unknown, belongs to another Unit, or is not a role (`admin`, a ladder name) gets the SAME answer and the same Registry work as a hidden one: a write is 403 `forbidden`,
+  identical to a caller without `roles.manage`; `GET /roles` is 404 `not-found`. No error names a scope or a person; the usage count is a number only. A role deleted between the check and the write is the
+  same 403, never a 503.
+- **Freshness.** Role definitions are read live by every access answer. An edit that changes `permissions` or `boardRole` announces `{ type: "unit" }` through the one bounded, fair scheduler
+  (`announceChange`, § Spaces and Groups): as a **revocation** (priority queue, never dropped) unless it is a pure widening (the new role holds everything the old did and no lower ladder step);
+  a rename announces nothing; an edit of a role no grant holds (`used.places` 0, read in the same request) announces nothing (nothing to re-check; the timed pass covers a grant that races in).
+  So a removed permission or a lowered ladder step reaches an open board's sockets within one pass (the next `.grants` handling, else the timed re-check ≤ 60 s), and the next HTTP call.
+  Create and delete of an unused role announce nothing.
+- **Bounds.** `GET /roles`: one `effective` at the Unit, one `roles(tenant)` (≤ 51 rows), one `roleUsage` over those ids (≤ 51 probes of ≤ 101 rows), one `memberCount` (≤ 51 rows).
+  `PATCH`: the same reads plus, only for a many-check on a Team-held role, one `teamsAmong` over ≤ 50 ids. Nothing loops grants, members or boards.
 
 ## Sign-in code exchange
 
@@ -1266,7 +1317,7 @@ method names are stable. Ids are server-minted over `[a-z0-9-]`.
 | share links | `createLink({ board, role, expiresAt, by })` (role per link), `link(id)`, `links(board)`, `revokeLink(id)`, `addLinkUse(link, user)`, `linkUses(board, user)` |
 | idempotency | `idemClaim(user, key, fp) → { state: "new" \| "done" \| "in-progress" \| "mismatch", result? }`, `idemFinish(user, key, claim, result)`, `idemRelease(user, key, claim)` (§ Idempotent creates; `idemClaim` returns the `claim` on `new`) |
 | home | `markOpened(user, board)`, `recents(user, { limit })`, `setStarred(user, board, on)`, `starred(user, { limit })`, `starredAmong(user, boards)`, `sharedBoards(user, email, { limit })`, `searchBoards(tenant, { q, unfiled, after, scan })`, `spaceCandidates(tenant, { user, all, after, limit })`, `groupCandidates(tenant, { user, all, limit })`, `boardRows(boards, { user, email })` (§ Home) |
-| organization | `createGroup`, `group`, `groups`; `createSpace`, `space`, `spaces`, `ensurePersonalSpace(tenant, user)`; `createTeam`, `team`, `teams`, `setTeamMember`, `teamMembers`; `setScopedGrant({ scope, subject, role \| null })`, `scopedGrants(scope)`; `createRole`, `updateRole`, `role`, `roles`; `accessContext(scope, { users, chain })`; `boardsIn(scope, { after, limit })`, `scopesOf(subject, { after, limit })`; `accessContexts(scopes, { users })` (the batch of `accessContext`, one statement on Postgres), `rename({ type: "board"\|"space"\|"group", id }, name)`, `updateScope({ type: "space"\|"group", id }, { name?, generalRole? })` (atomic; returns the row), `spacesIn(group, { after, limit })` (§ Spaces and Groups); Teams and access (§ Teams and access): `renameTeam`, `deleteTeam` (atomic, `last-owner`), `teamsPage(tenant, { after, limit, q })`, `teamsAmong(tenant, ids)`, `teamMembersPage(team, { after, limit })`, `scopedGrant(scope, subject)`, `scopedGrantsPage(scope, { after, limit })`, and the member directory `touchMember(tenant, { user, name, email })`, `membersAmong(tenant, users)`, `findMembers(tenant, { q, limit })` (table `reg_members`) |
+| organization | `createGroup`, `group`, `groups`; `createSpace`, `space`, `spaces`, `ensurePersonalSpace(tenant, user)`; `createTeam`, `team`, `teams`, `setTeamMember`, `teamMembers`; `setScopedGrant({ scope, subject, role \| null })`, `scopedGrants(scope)`; `createRole({ tenant, name, base, boardRole, permissions, max? })` (`max`: rejects code `limit` when the Unit already has `max` custom roles, atomically), `updateRole`, `role`, `roles`; Roles (§ Roles): `deleteRole(tenant, id)` (ONE atomic step: rejects code `in-use` while any scoped grant holds the role, `member` is never deleted, an unknown id rejects `registry: no such role`), `roleUsage(ids, { cap })` (per id: `{ places, users, teams }` = grant rows holding it counted to `cap + 1`, user-subject rows counted to `cap + 1`, and up to 50 Team ids; index on `reg_scope_grants (role)`), `memberCount(tenant, { cap })` (directory rows, counted to `cap + 1`); `accessContext(scope, { users, chain })`; `boardsIn(scope, { after, limit })`, `scopesOf(subject, { after, limit })`; `accessContexts(scopes, { users })` (the batch of `accessContext`, one statement on Postgres), `rename({ type: "board"\|"space"\|"group", id }, name)`, `updateScope({ type: "space"\|"group", id }, { name?, generalRole? })` (atomic; returns the row), `spacesIn(group, { after, limit })` (§ Spaces and Groups); Teams and access (§ Teams and access): `renameTeam`, `deleteTeam` (atomic, `last-owner`), `teamsPage(tenant, { after, limit, q })`, `teamsAmong(tenant, ids)`, `teamMembersPage(team, { after, limit })`, `scopedGrant(scope, subject)`, `scopedGrantsPage(scope, { after, limit })`, and the member directory `touchMember(tenant, { user, name, email })`, `membersAmong(tenant, users)`, `findMembers(tenant, { q, limit })` (table `reg_members`) |
 
 Single node: SQLite; cluster: Postgres. The room never calls it; gateways and Auth do. On Postgres the server
 runs as a role that doesn't own the schema (§ Store, Least privilege).

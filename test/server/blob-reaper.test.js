@@ -169,6 +169,17 @@ test("DW-92.3 residual race: a reference that lands during the delete is not los
   expect(await store.blobCondemned({ graceMs: 0, limit: 10 })).toEqual([{ tenant: T, sha1: p.id }]);
 });
 
+test("a reaped picture can be stored again by an ordinary PUT (the client's re-upload after the residual race): created, readable, usage back", async () => {
+  const p = png(30);
+  await place("b-one", p); await store.purgeBoard(T, "b-one"); t.now += BLOB_GRACE_MS;
+  await reaper.sweep();
+  expect(await has(p)).toBe(false);
+  const access = blobAccess({ blobs, key: new Uint8Array(32).fill(5), now: () => t.now });
+  const put = access.url(T, "b-two", p.id, "PUT").then(u => access.put(u.slice(u.lastIndexOf("/") + 1), p.bytes));
+  expect(await put).toEqual({ ok: true, created: true });
+  expect(await blobs.get(T, p.id)).toEqual(p.bytes);
+});
+
 test("a PUT URL for a hash being deleted is refused (the gateway answers unavailable), and a quota recount after deletes frees the space for the next put", async () => {
   const a = png(18), b = png(19);
   await place("b-one", a); await store.purgeBoard(T, "b-one"); t.now += BLOB_GRACE_MS;

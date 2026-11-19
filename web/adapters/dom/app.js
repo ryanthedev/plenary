@@ -116,6 +116,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     // A picture whose bytes haven't arrived is drawn by core as a dashed box (render.js); its bytes are asked for here
     // (the net dedupes, paces and rests; a picture the server doesn't have stays a dashed box).
     for (const [id, stamp] of S.missing()) net.want?.(id, stamp);
+    // Pictures that came in with pasted elements or a library item hold their bytes here only (files never travel in ops): put them on the server too.
+    for (const f of S.unsavedFiles()) net.put?.(f);
     const { w, h: hh } = S.eds.board.size;
     paint(ctx, items, { width: w, height: hh, dpr: canvas.width / Math.max(1, w), background: theme.bg, image });
     canvas.style.cursor = S.may() || S.tool === "hand" ? S.ed.cursor() ?? "default" : "grab";

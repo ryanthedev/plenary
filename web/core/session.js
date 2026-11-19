@@ -301,7 +301,28 @@ export function createSession({ join, token, board, client = "web", tab = null, 
     const stream = s.role === "presenter" ? "board" : "notes";
     let id = null;
     s.act(stream, ed => { id = ed.addImage(file, at); });
+    if (id) stored.add(file.id);                                         // the caller uploads it
     return id;
+  };
+  /** Pictures the server has (this client uploaded or fetched them, or is about to): never offered again by `unsavedFiles`. */
+  const stored = new Set();
+  /**
+   * Pictures a live image element shows that this client holds the bytes of but has neither uploaded nor fetched: they came in with a
+   * pasted selection or a library item, whose files never travel in ops. The app uploads them (PROTOCOL.md § Blobs, "References and purge":
+   * a picture whose last board was purged is deleted, so a reference needs its bytes put again). Each is offered once; the app asks every frame.
+   * @returns {object[]} files as `net.put` takes them
+   */
+  let unsavedKey = null;
+  s.unsavedFiles = () => {
+    const key = Object.values(eds).map(ed => ed.doc.rev ?? 0).join("|");   // memoised like `missing`: a frame that changed nothing costs one comparison
+    if (key === unsavedKey) return [];
+    unsavedKey = key;
+    const out = [];
+    for (const ed of Object.values(eds)) for (const el of ed.doc.byId.values()) {
+      const f = el.type === "image" && !el.isDeleted && typeof el.fileId === "string" ? ed.doc.files?.[el.fileId] : null;
+      if (f && !stored.has(el.fileId)) { stored.add(el.fileId); out.push(f); }
+    }
+    return out;
   };
   /**
    * Live image elements, in either Editor, whose bytes neither Editor holds: Map fileId → stamp. The stamp names what the
@@ -323,7 +344,7 @@ export function createSession({ join, token, board, client = "web", tab = null, 
   /** The `fileId`s of s.missing(). */
   s.missingFiles = () => [...s.missing().keys()];
   /** Picture bytes fetched for a placeholder (net.want → onFile; PROTOCOL.md § Blobs): shown in both Editors, never sent as an op. */
-  s.receiveFiles = files => { for (const ed of Object.values(eds)) { ed.doc.apply({ files }); ed.changed(); } };
+  s.receiveFiles = files => { for (const id of Object.keys(files)) stored.add(id); for (const ed of Object.values(eds)) { ed.doc.apply({ files }); ed.changed(); } };
 
   // ── keys ──
   s.key = (key, m = {}) => {

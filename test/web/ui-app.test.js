@@ -1074,7 +1074,7 @@ const PIC = { id: "c".repeat(40), mimeType: "image/png", dataURL: "data:image/pn
 // A picture with bytes is painted through `new Image()`: a stub that never loads.
 beforeEach(() => { globalThis.Image = class { set src(v) { this._src = v; } }; });
 afterAll(() => { delete globalThis.Image; });
-const spyNet = () => { const wants = [], files = [], stamps = []; return { wants, files, net: { kind: "local", put() {}, onFile: fn => { files.push(fn); }, want: (id, stamp) => { wants.push(id); stamps.push(stamp); } }, stamps }; };
+const spyNet = () => { const wants = [], files = [], stamps = [], puts = []; return { wants, files, puts, net: { kind: "local", put: f => { puts.push(f.id); }, onFile: fn => { files.push(fn); }, want: (id, stamp) => { wants.push(id); stamps.push(stamp); } }, stamps }; };
 
 test("DW-42.3: a picture on the board whose bytes this client lacks is asked for through net.want, and not asked for once it has them", () => {
   const spy = spyNet();
@@ -1102,6 +1102,26 @@ test("a picture this client placed itself, and a deleted one, are never asked fo
   const id = [...bo.eds.board.doc.byId.values()].find(e => e.fileId === "d".repeat(40)).id;
   bo.eds.board.select([id]); bo.eds.board.key("Delete"); step(4);
   expect(S.missingFiles()).toEqual([]);
+});
+
+test("#92: a picture that arrives with pasted elements (its bytes never travel in ops) is uploaded once, by the frame loop; pictures this client fetched or placed are not", () => {
+  const spy = spyNet();
+  rig = setup({ appNet: spy.net });
+  const { S, bo, step } = rig;
+  const OTHER = { ...PIC, id: "e".repeat(40) };
+  bo.addPicture(OTHER); step(3);
+  const ed = bo.eds.board;
+  ed.select([[...ed.doc.byId.values()].find(e => e.fileId === OTHER.id).id]);
+  const text = ed.copy();                                                 // a clipboard that carries the element and its bytes
+  expect(text).toContain(OTHER.id);
+  S.paste(text); step(4);
+  expect(spy.puts).toEqual([OTHER.id]);                                   // the frame loop put it
+  S.paste(text); step(4);
+  expect(spy.puts).toEqual([OTHER.id]);                                   // once per session, not once per paste or frame
+  S.addPicture(PIC); step(3);
+  spy.files[0]({ id: "f".repeat(40), mimeType: PIC.mimeType, dataURL: PIC.dataURL });   // fetched from the server
+  step(3);
+  expect(spy.puts).toEqual([OTHER.id]);                                   // placed by the app (which uploads it itself) or fetched: never offered here
 });
 
 test("L1/L2: S.missing() is memoised on the documents' revisions (no scan per frame) and its stamp changes when an element showing the picture does", () => {

@@ -64,8 +64,7 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
       t && h("div.tree", { role: "group", "aria-label": "Groups and Spaces" },
         t.groups.map(g => h("div.grp", {}, h("h4", {}, mark(h("a", { href: groupHref(g.id) }, g.name), `group:${g.id}`)), g.spaces.map(node))),
         t.spaces.length ? h("div.grp", {}, h("h4", {}, "Not in a group"), t.spaces.map(node)) : null,
-        t.other.boards.length ? h("div.grp", {}, h("h4", {}, "Other boards"), t.other.boards.map(b => mark(h("a.nav.sub", { href: boardHref(b.id) }, b.title || "Untitled"), `other:${b.id}`))) : null,
-        t.more || t.other.more ? h("p.muted", {}, "Some Spaces or boards are not listed. Use search.") : null));
+        t.more ? h("p.muted", {}, "Some Spaces or boards are not listed. Use search.") : null));
   }
 
   function renderMain() {

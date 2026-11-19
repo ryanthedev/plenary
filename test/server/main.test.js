@@ -333,9 +333,9 @@ test("start(env): COOKIE_KEY: refused when short; required in cluster mode; rand
 test("revocation: a grant change through the Registry closes a connection that lost its role", async () => {
   const app = await start(devEnv(tempDir()));
   try {
-    // An unfiled board with no general access (a board made by POST /boards would sit in ann's personal space, which she owns: no revocation by grant).
+    // A board with no general access (a board made by POST /boards would sit in ann's personal space, which she owns: no revocation by grant).
     const t = await app.registry.createTenant({ domain: "acme.test", admins: ["dev:ann"] });
-    const board = await app.registry.createBoard({ tenant: t.id, memberRole: null });
+    const board = await mkBoard(app.registry, { tenant: t.id, memberRole: null });
     await app.registry.setGrant(board.id, "dev:ann", "owner");
     await app.registry.setGrant(board.id, "dev:bob", "owner");          // a second owner, so ann may be removed
     const s = await sock(app.server.wsUrl);
@@ -357,6 +357,7 @@ test("revocation: a grant change through the Registry closes a connection that l
 
 // ---- p4-wire: the cluster env (no Postgres or NATS needed: every case here is refused or single node) ----
 import { nodeConfig, defaultNodeId, redact } from "../../server/main.js";
+import { mkBoard } from "../auth/fixtures.js";
 
 const PW = "hunter2-FAKE-pw";
 const PG = `postgres://plen:${PW}@127.0.0.1:1/plenary`, NATS = `nats://plen:${PW}@127.0.0.1:1`;

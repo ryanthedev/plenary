@@ -5,13 +5,14 @@ import { test, expect, beforeEach, describe } from "bun:test";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy } from "../../server/auth/tenancy.js";
 import { accessEquivalence } from "./access-equivalence.js";
-import { homeService, recentRecorder, LIMITS, OTHER, SHARED_PART } from "../../server/auth/home.js";
+import { homeService, recentRecorder, LIMITS, SHARED_PART } from "../../server/auth/home.js";
+import { mkBoard } from "./fixtures.js";
 
 let clock, r, ten, home, acme;
 const now = () => clock;
 const ident = (n, domain = "acme.com") => ({ user: `google:${n}`, name: n, email: `${n}@${domain ?? "x.org"}`, domain });
 const ada = ident("ada"), kim = ident("kim", "partner.io");
-const mk = (space, title, o = {}) => r.createBoard({ tenant: acme.id, space, title, ...o });
+const mk = (space, title, o = {}) => mkBoard(r, { tenant: acme.id, space, title, ...o });   // no `space`: the fixture Space (no general access)
 const ids = cards => cards.map(c => c.id);
 
 beforeEach(async () => {
@@ -41,7 +42,7 @@ describe("access leak: a board the person can't open never appears, however it g
     const closed = await r.createSpace({ tenant: acme.id, name: "Closed secrets", generalRole: null });
     const ok = await mk(open.id, "Roadmap ok");
     const secret = await mk(closed.id, "Roadmap secret", { memberRole: null });
-    const hidden = await mk(undefined, "Roadmap hidden", { memberRole: null });          // unfiled, members get nothing
+    const hidden = await mk(undefined, "Roadmap hidden", { memberRole: null });          // in the fixture Space, members get nothing
     for (const b of [ok, secret, hidden]) { await r.markOpened(ada.user, b.id); clock += 10; }
     for (const b of [ok, secret, hidden]) await r.setStarred(ada.user, b.id, true);       // rows exist (the Registry can't know)
     await r.setGrant(secret.id, ada.user, "viewer"); await r.setGrant(secret.id, ada.user, null);   // a past grant, now gone
@@ -85,7 +86,6 @@ describe("access leak: a board the person can't open never appears, however it g
     await r.markOpened(root.user, b.id);
     const h = await home.home({ ...root, user: "google:root" });
     expect(h.recent).toEqual([]);
-    expect(h.tree.other.boards).toEqual([]);
   });
 });
 
@@ -125,11 +125,11 @@ describe("Recent, Starred, Shared", () => {
     const sp = await r.createSpace({ tenant: acme.id, name: "Closed", generalRole: null });
     const g1 = await mk(sp.id, "Zeta", { memberRole: null }), g2 = await mk(sp.id, "alpha", { memberRole: null }), mine = await mk(sp.id, "Mine", { memberRole: null });
     await r.setGrant(g1.id, ada.user, "editor"); await r.setGrant(g2.id, ada.user, "viewer"); await r.setGrant(mine.id, ada.user, "owner");
-    const foreign = await r.createBoard({ tenant: globex.id, title: "Foreign", memberRole: null });
+    const foreign = await mkBoard(r, { tenant: globex.id, title: "Foreign", memberRole: null });
     const l = await r.createLink({ board: foreign.id, role: "annotator", by: "x" }); await r.addLinkUse(l.id, ada.user);
     const h = await home.home(ada);
     expect(h.shared.map(c => c.title)).toEqual(["alpha", "Foreign", "Mine", "Zeta"]);     // Mine: owned, but in a Space she can't open, so nowhere else
-    expect(h.shared.find(c => c.title === "Foreign")).toMatchObject({ role: "annotator", path: [SHARED_PART] });   // another Unit's board: no "Other boards" claim
+    expect(h.shared.find(c => c.title === "Foreign")).toMatchObject({ role: "annotator", path: [SHARED_PART] });   // another Unit's board: never a name from this Unit
   });
 
   test("a team grant on the Space and on the board itself both count", async () => {
@@ -148,7 +148,7 @@ describe("Recent, Starred, Shared", () => {
 });
 
 describe("the tree", () => {
-  test("only Groups and Spaces the person can open in; personal spaces are private; unfiled boards under Other boards", async () => {
+  test("only Groups and Spaces the person can open in; personal spaces are private", async () => {
     const g = await r.createGroup({ tenant: acme.id, name: "Product", generalRole: "viewer" });
     const hiddenGroup = await r.createGroup({ tenant: acme.id, name: "Board only", generalRole: null });
     await r.createSpace({ tenant: acme.id, name: "Design", group: g.id });
@@ -156,12 +156,11 @@ describe("the tree", () => {
     await r.createSpace({ tenant: acme.id, name: "Social" });
     await r.createSpace({ tenant: acme.id, name: "Locked", generalRole: null });
     await r.ensurePersonalSpace(acme.id, ada.user); await r.ensurePersonalSpace(acme.id, "google:bob");
-    const open = await mk(undefined, "Old board"); await mk(undefined, "Old private", { memberRole: null });
     const t = (await home.home(ada)).tree;
     expect(t.groups.map(x => [x.name, x.spaces.map(s => s.name)])).toEqual([["Product", ["Design"]]]);
     expect(t.spaces.map(s => [s.name, s.personal]).sort()).toEqual([["Social", false], ["ada's space", true]]);
     expect(JSON.stringify(t)).not.toMatch(/Board only|Tucked|Locked/);
-    expect(t.other).toEqual({ boards: [{ id: open.id, title: "Old board" }], more: false });
+    expect(t.other).toBeUndefined();   // no "Other boards": every board is in a Space
   });
 
   test("a Group the person can open shows even with no open Space", async () => {
@@ -177,9 +176,9 @@ describe("search", () => {
     const sp = await r.createSpace({ tenant: acme.id, name: "Design Lab", group: g.id });
     const a = await mk(sp.id, "Roadmap"), b = await mk(undefined, "Design review");
     const globex = await r.createTenant({ domain: "globex.com" });
-    await r.createBoard({ tenant: globex.id, title: "Design globex" });
+    await mkBoard(r, { tenant: globex.id, title: "Design globex" });
     const res = await home.search(ada, "design");
-    expect(res.results.map(c => [c.title, c.path.map(p => p.name)]).sort()).toEqual([["Design review", ["Other boards"]], ["Roadmap", ["Product", "Design Lab"]]]);
+    expect(res.results.map(c => [c.title, c.path.map(p => p.name)]).sort()).toEqual([["Design review", ["Shared with you"]], ["Roadmap", ["Product", "Design Lab"]]]);
     expect(res.more).toBe(false);
     expect(new Set(ids(res.results))).toEqual(new Set([a.id, b.id]));
     for (let i = 0; i < 30; i++) await mk(sp.id, `design ${i}`);
@@ -343,12 +342,11 @@ describe("Your boards, Shared with me, and guests", () => {
 
   test("a member's owned boards are not duplicated in Shared when the tree shows them; an owned board in a closed Space still is", async () => {
     const open = await r.createSpace({ tenant: acme.id, name: "Open" }), closed = await r.createSpace({ tenant: acme.id, name: "Closed", generalRole: null });
-    const a = await mk(open.id, "Owned open"), b = await mk(closed.id, "Owned closed", { memberRole: null }), c = await mk(undefined, "Owned unfiled");
-    for (const x of [a, b, c]) await r.setGrant(x.id, ada.user, "owner");
+    const a = await mk(open.id, "Owned open"), b = await mk(closed.id, "Owned closed", { memberRole: null });
+    for (const x of [a, b]) await r.setGrant(x.id, ada.user, "owner");
     const h = await home.home(ada);
     expect(h.owned).toEqual([]);
-    expect(h.shared.map(x => x.title)).toEqual(["Owned closed"]);                   // not in Open (tree) and not unfiled (Other boards)
-    expect(h.tree.other.boards.map(x => x.title)).toEqual(["Owned unfiled"]);
+    expect(h.shared.map(x => x.title)).toEqual(["Owned closed"]);                   // not in Open (the tree shows that one)
   });
 
   test("Shared means a source on the board itself whose Space they can't open: a Team grant counts, a board in an openable Space doesn't", async () => {

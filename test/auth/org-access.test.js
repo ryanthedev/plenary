@@ -4,6 +4,7 @@
 import { test, expect, beforeEach } from "bun:test";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy, roleCache } from "../../server/auth/tenancy.js";
+import { mkBoard } from "./fixtures.js";
 
 let r, ten, acme, now = () => 1_000;
 const id = (n, domain = "acme.com") => ({ user: `google:${n}`, email: `${n}@${domain ?? "x.org"}`, domain });
@@ -237,7 +238,7 @@ test("a guest named in Space, Group, Unit and Team grants still has only board s
 test("filing a legacy board into a Space with no general access and no grants changes nobody's role (the shape of a later backfill)", async () => {
   const legacy = await r.createSpace({ tenant: acme.id, name: "Legacy", generalRole: null });
   const link = async b => { const l = await r.createLink({ board: b.id, role: "annotator", by: "google:x" }); await r.addLinkUse(l.id, "google:lou"); };
-  const plain = await r.createBoard({ tenant: acme.id, memberRole: "commenter" }), filed = await r.createBoard({ tenant: acme.id, memberRole: "commenter", space: legacy.id });
+  const plain = await mkBoard(r, { tenant: acme.id, memberRole: "commenter" }), filed = await r.createBoard({ tenant: acme.id, memberRole: "commenter", space: legacy.id });
   for (const b of [plain, filed]) { await r.setGrant(b.id, "google:gina", "owner"); await r.createInvite({ board: b.id, email: "ivy@partner.io", role: "editor", by: "google:gina" }); await link(b); }
   const people = [id("gina"), id("bob"), id("lou", null), id("ivy", "partner.io"), id("zed", "globex.com"), id("root")];
   for (const p of people) expect(await ten.role(p, filed.id)).toBe(await ten.role(p, plain.id));

@@ -104,9 +104,9 @@ export function memoryRegistry({ now = Date.now } = {}) {
 
     async createBoard({ tenant, title = "", memberRole, space, owner, idem: key }) {
       if (!tenants.has(tenant)) throw new Error("registry: no such tenant");
-      if (space != null && spaces.get(space)?.tenant !== tenant) throw new Error("registry: no such space");
+      if (spaces.get(space)?.tenant !== tenant) throw new Error("registry: no such space");
       const k = idemEnter(key);
-      const b = { id: fresh(boards, mint.board), tenant, title: String(title), memberRole: memberRole === undefined ? (space != null ? null : "viewer") : memberRole, space: space ?? null, createdAt: now() };
+      const b = { id: fresh(boards, mint.board), tenant, title: String(title), memberRole: memberRole === undefined ? null : memberRole, space, createdAt: now() };
       boards.set(b.id, b);
       if (owner != null) grants.set(b.id, new Map([[String(owner), "owner"]]));
       idemPut(k, b.id);
@@ -477,10 +477,10 @@ export function memoryRegistry({ now = Date.now } = {}) {
       for (const [k, ls] of uses) if (k.endsWith("\n" + user) && ls.size) out.add(k.slice(0, k.length - user.length - 1));
       return [...out].filter(b => boards.has(b)).sort().slice(0, smallLimit(limit, HOME.sharedScan, HOME.sharedScan));
     },
-    async searchBoards(tenant, { q, unfiled = false, after = null, scan } = {}) {
+    async searchBoards(tenant, { q, after = null, scan } = {}) {
       after = orgDefaults.cursor(after, "id");
       const term = q == null ? null : asciiFold(searchQuery(q)), cap = smallLimit(scan, HOME.searchScan.default, HOME.searchScan.max);
-      const hit = b => (unfiled ? !b.space : true) && (term == null || asciiFold(b.title).includes(term) || (!unfiled && b.space && asciiFold(spaces.get(b.space)?.name ?? "").includes(term)));
+      const hit = b => term == null || asciiFold(b.title).includes(term) || asciiFold(spaces.get(b.space)?.name ?? "").includes(term);
       const window = [...boards.values()].filter(b => b.tenant === tenant && (after == null || b.id > after)).map(b => b.id).sort().slice(0, cap + 1);
       const scanned = window.slice(0, cap);
       return { ids: scanned.filter(id => hit(boards.get(id))), next: window.length > cap ? scanned[cap - 1] : null };   // `next`: the Unit goes on past the window, whatever matched

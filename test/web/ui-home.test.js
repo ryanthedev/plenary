@@ -11,7 +11,7 @@ const card = (id, o = {}) => ({ id, title: id.toUpperCase(), role: "editor", pat
 const DATA = { guest: false, user: { user: "dev:ada", name: "ada" }, unit: { id: "t", kind: "company" }, limits: {},
   recent: [card("a", { at: 1_000_000 - 600_000 }), card("b")], starred: [card("b", { starred: true })], owned: [], shared: [card("c")],
   tree: { groups: [{ id: "g", name: "Product", spaces: [{ id: "s1", name: "Design", personal: false }] }], spaces: [{ id: "s2", name: "ada's space", personal: true }],
-    other: { boards: [{ id: "o1", title: "Old board" }], more: false }, more: false } };
+    more: false } };
 let root, clock, api, model, listeners, h, dialogs, dialogCalls;
 const mount = async (data = DATA, extra = {}) => {
   const dom = installDom(); root = dom.root;
@@ -30,19 +30,18 @@ const links = () => root.findAll(e => e.tagName === "A").map(e => [e.getAttribut
 const buttons = () => root.findAll(e => e.tagName === "BUTTON");
 const settle = () => new Promise(r => setTimeout(r, 0));
 
-test("Home: Recent then Starred cards link to the board, with path, role and age; the sidebar shows views, Groups, Spaces and Other boards", async () => {
+test("Home: Recent then Starred cards link to the board, with path, role and age; the sidebar shows views, Groups and Spaces", async () => {
   await mount();
   expect(textOf(root.find(e => e.tagName === "H1"))).toBe("Home");
   expect(root.findAll(e => e.tagName === "H2").map(textOf)).toEqual(["Recent", "Starred"]);
   const first = byClass(root, "card-open")[0];
   expect(first.getAttribute("href")).toBe("?board=a");
   expect(textOf(first)).toBe("AProduct / Design · editor · 10 min ago");
-  expect(links().filter(([h]) => h === "?board=o1")).toEqual([["?board=o1", "Old board"]]);
   const side = root.find(e => e.hasClass("home-side"));
-  expect(side.findAll(e => e.tagName === "H4").map(textOf)).toEqual(["Product", "Not in a group", "Other boards"]);
+  expect(side.findAll(e => e.tagName === "H4").map(textOf)).toEqual(["Product", "Not in a group"]);
   expect(side.findAll(e => e.tagName === "BUTTON").map(textOf)).toEqual(["＋ New board", "＋ New space", "Home", "Starred1", "Shared with me1"]);
   // Spaces and Groups are links to their own pages (?space= / ?group=), not search buttons
-  expect(side.findAll(e => e.tagName === "A").map(e => [e.getAttribute("href"), textOf(e)])).toEqual([["?group=g", "Product"], ["?space=s1", "▢ Design"], ["?space=s2", "◐ ada's space"], ["?board=o1", "Old board"]]);
+  expect(side.findAll(e => e.tagName === "A").map(e => [e.getAttribute("href"), textOf(e)])).toEqual([["?group=g", "Product"], ["?space=s1", "▢ Design"], ["?space=s2", "◐ ada's space"]]);
   expect(side.find(e => e.getAttribute("aria-current") === "page").textContent).toBe("Home");
 });
 
@@ -165,7 +164,7 @@ test("a guest sees Shared with me only, with the empty copy when there is nothin
 });
 
 test("first run: the welcome empty state; New board and New space open their dialogs from the clicked button", async () => {
-  await mount({ ...DATA, recent: [], starred: [], shared: [], tree: { groups: [], spaces: [], other: { boards: [], more: false }, more: false } });
+  await mount({ ...DATA, recent: [], starred: [], shared: [], tree: { groups: [], spaces: [], more: false } });
   expect(textOf(root.find(e => e.hasClass("home-empty")))).toBe("Welcome to Plenary.Start a board, or join a Space your team already uses.");
   const nb = buttons().find(b => textOf(b) === "＋ New board"), ns = buttons().find(b => textOf(b) === "＋ New space");
   nb.click(); ns.click();

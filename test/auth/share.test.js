@@ -8,6 +8,7 @@ import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
 import { devAuth } from "../../server/auth/dev.js";
 import { INVITE_TTL_MS } from "../../server/admin/boards.js";
+import { mkBoard } from "./fixtures.js";
 
 const ORIGIN = "https://plenary.test";
 const config = { cookieKey: "k".repeat(32), postLoginUrl: ORIGIN + "/", boardUrl: ORIGIN + "/b/{board}", publicUrl: ORIGIN };
@@ -212,7 +213,7 @@ test("DW-52.2c the same expiry rule on the durable SQLite Registry: refused valu
   const reg = sqliteRegistry({ path: join(dir, "r.db"), fullfsync: false });
   try {
     const t = await reg.createTenant({ domain: "acme.com", admins: ["dev:ada"] });
-    const b = (await reg.createBoard({ tenant: t.id, title: "B", owner: "dev:ada" })).id;
+    const b = (await mkBoard(reg, { tenant: t.id, title: "B", owner: "dev:ada" })).id;
     const r = httpRoutes({ registry: reg, sessions: await makeSessions({ key: "s".repeat(32) }), tenancy: makeTenancy({ registry: reg, now }), now, config, dev: devAuth({ enabled: true, tokens }), log: { warn() {} } });
     const go = body => r(new Request(`${ORIGIN}/boards/${b}/links`, { method: "POST", headers: { authorization: "Bearer ada", "content-type": "application/json" }, body: JSON.stringify(body) }));
     for (const expiresAt of [1e300, T0 + 0.5, T0 + 11 * 365 * DAY]) expect((await go({ role: "viewer", expiresAt })).status).toBe(400);

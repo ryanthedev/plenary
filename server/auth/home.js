@@ -17,13 +17,9 @@ import { resolveAccess } from "./resolver.js";
 /** @typedef {{ id: string, title: string, role: string, path: PathPart[], starred: boolean, at?: number }} Card */
 
 /** What one Home read shows at most (also sent to the page as `limits`). */
-export const LIMITS = Object.freeze({ recent: 12, starred: 50, shared: 50, owned: 50, search: 20, spaces: 100, other: 20, space: 50 });
+export const LIMITS = Object.freeze({ recent: 12, starred: 50, shared: 50, owned: 50, search: 20, spaces: 100, space: 50 });
 /** How many candidate rows each list reads before the access filter (a few may be dropped: unopenable, or a stale row). */
 const SCAN = Object.freeze({ recent: 30, starred: 60, shared: 60, searchPages: 2, spacePages: 3, grantChecks: 40, groupChecks: 20, groupCandidates: 50 });
-/**
- * The pseudo-group for boards filed in no Space (the dev board, a board a script made without one). PROTOCOL.md § Home.
- */
-export const OTHER = Object.freeze({ type: "other", name: "Other boards" });
 /** What stands in for a Space or Group name the person may not see. */
 export const SHARED_PART = Object.freeze({ type: "shared", name: "Shared with you" });
 const BATCH_PAR = 8;
@@ -35,11 +31,8 @@ const byTitle = (a, b) => (a.title.toLowerCase() < b.title.toLowerCase() ? -1 : 
  */
 export function homeService({ registry, tenancy, now = Date.now }) {
   /** The path a card shows: only what the person can open is named (module comment). */
-  const pathOf = (f, unit) => {
-    if (!f.space) return unit && f.board.tenant === unit.id ? [OTHER] : [SHARED_PART];
-    return [...(f.group && f.groupOpen ? [{ type: "group", id: f.group.id, name: f.group.name }] : []),
-      f.spaceOpen ? { type: "space", id: f.space.id, name: f.space.name } : SHARED_PART];
-  };
+  const pathOf = f => [...(f.group && f.groupOpen ? [{ type: "group", id: f.group.id, name: f.group.name }] : []),
+    f.spaceOpen ? { type: "space", id: f.space.id, name: f.space.name } : SHARED_PART];
   const openable = f => !!f && f.access.ladder != null;
   /** `accessMany` over any number of ids, HOME.batch at a time. */
   const accessAll = async (identity, ids) => {
@@ -47,14 +40,14 @@ export function homeService({ registry, tenancy, now = Date.now }) {
     for (let i = 0; i < ids.length; i += HOME.batch) for (const [k, v] of await tenancy.accessMany(identity, ids.slice(i, i + HOME.batch))) out.set(k, v);
     return out;
   };
-  const card = (f, unit, extra = {}) => ({ id: f.board.id, title: f.board.title, role: f.access.ladder, path: pathOf(f, unit), starred: false, ...extra });
+  const card = (f, extra = {}) => ({ id: f.board.id, title: f.board.title, role: f.access.ladder, path: pathOf(f), starred: false, ...extra });
 
   /** Cards for `entries` ({ id, at? }) in order, dropping what the person can't open; star flags in one query. `keep(found)` filters further. */
   async function cards(identity, unit, entries, { found: given, keep, can = false } = {}) {
     const found = given ?? await accessAll(identity, [...new Set(entries.map(e => e.id))]);
     // `can` (the Space page): what the person may do to the board, as permissions the resolver already computed (never a role name).
     const extra = f => (can ? { can: { rename: f.access.permissions.has("board.edit") || f.access.permissions.has("members.manage") } } : {});
-    const out = entries.filter(e => openable(found.get(e.id)) && (!keep || keep(found.get(e.id)))).map(e => card(found.get(e.id), unit, { ...(e.at != null ? { at: e.at } : {}), ...extra(found.get(e.id)) }));
+    const out = entries.filter(e => openable(found.get(e.id)) && (!keep || keep(found.get(e.id)))).map(e => card(found.get(e.id), { ...(e.at != null ? { at: e.at } : {}), ...extra(found.get(e.id)) }));
     if (out.length) {
       const stars = new Set(await registry.starredAmong(identity.user, out.map(c => c.id)));
       for (const c of out) c.starred = stars.has(c.id);
@@ -65,12 +58,12 @@ export function homeService({ registry, tenancy, now = Date.now }) {
   /**
    * Boards the person reaches through a source on the board itself (a direct, Team, invite or link grant; Registry.sharedBoards).
    * `owned`: those they hold an owner grant on. `shared`: the rest, except (members) boards the tree already shows: boards in a
-   * Space they can open, and boards filed in no Space in their own Unit ("Other boards").
+   * Space they can open.
    */
   async function reached(identity, unit) {
     const ids = await registry.sharedBoards(identity.user, identity.email ?? null, { limit: SCAN.shared });
     const found = await accessAll(identity, ids);
-    const inTree = f => !!unit && (f.spaceOpen || (!f.space && f.board.tenant === unit.id));
+    const inTree = f => !!unit && f.spaceOpen;
     const mine = f => f.grant === "owner";
     const list = (keep) => cards(identity, unit, ids.map(id => ({ id })), { found, keep });
     // "Your boards" cards carry no path: a guest's own board is not "shared with" them, and what is above it is not theirs to name.
@@ -81,7 +74,7 @@ export function homeService({ registry, tenancy, now = Date.now }) {
 
   const asNode = s => ({ id: s.id, name: s.name, personal: s.kind === "personal" });
 
-  /** The tree: the Spaces and Groups the person can open boards in, and the unfiled boards they can open. Every step is bounded (module header, PROTOCOL.md § Home). */
+  /** The tree: the Spaces and Groups the person can open boards in. Every step is bounded (module header, PROTOCOL.md § Home). */
   async function tree(identity, unit) {
     const all = (await tenancy.effective(identity, { type: "unit", id: unit.id })).ladder != null;   // a Unit-level role covers everything inside
     const cand = await registry.spaceCandidates(unit.id, { user: identity.user, all, limit: LIMITS.spaces });
@@ -113,14 +106,10 @@ export function homeService({ registry, tenancy, now = Date.now }) {
       else if (gChecks++ < SCAN.groupChecks) { if ((await tenancy.effective(identity, { type: "group", id: g.id })).ladder != null) shown.set(g.id, g); }
       else more = true;
     }
-    const page = await registry.searchBoards(unit.id, { unfiled: true });
-    const found = await accessAll(identity, page.ids);
-    const other = page.ids.filter(id => openable(found.get(id))).map(id => ({ id, title: found.get(id).board.title })).sort(byTitle);
     return {
       groups: [...shown.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : a.id < b.id ? -1 : 1))
         .map(g => ({ id: g.id, name: g.name, spaces: visible.filter(s => s.group === g.id).map(asNode) })),
       spaces: visible.filter(s => !s.group || !shown.has(s.group)).map(asNode),
-      other: { boards: other.slice(0, LIMITS.other), more: other.length > LIMITS.other || page.next != null },
       more,
     };
   }

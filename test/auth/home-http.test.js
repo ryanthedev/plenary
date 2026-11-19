@@ -6,6 +6,7 @@ import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
 import { homeService } from "../../server/auth/home.js";
 import { devAuth } from "../../server/auth/dev.js";
+import { mkBoard } from "./fixtures.js";
 
 const ORIGIN = "https://plenary.test";
 const config = { cookieKey: "k".repeat(32), postLoginUrl: ORIGIN + "/", boardUrl: ORIGIN + "/b/{board}", publicUrl: ORIGIN };
@@ -101,7 +102,7 @@ test("a guest may not star (403), and sees no Starred", async () => {
 });
 
 test("a guest's Home has Your boards (owned) apart from Shared with me, and Recent", async () => {
-  const mine = await registry.createBoard({ tenant: acme.id, title: "Kim's own", memberRole: null });
+  const mine = await mkBoard(registry, { tenant: acme.id, title: "Kim's own", memberRole: null });
   await registry.setGrant(mine.id, "dev:kim", "owner");
   await registry.markOpened("dev:kim", mine.id);
   const h = await (await call("/home", { headers: as("kim") })).json();

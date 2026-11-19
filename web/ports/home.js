@@ -13,17 +13,17 @@
 //   search(q)       → { q, results: Card[], more }   q is 1-100 chars (the caller checks)
 //   star(board, on) → { ok: true }   (a guest's star is refused: "forbidden")
 //   Card = { id, title, role, path: [{ type, id?, name }], starred, at? }; Tree = { groups: [{ id, name, spaces: [{ id, name, personal }] }],
-//          spaces: [{ id, name, personal }], other: { boards: [{ id, title }], more }, more }
+//          spaces: [{ id, name, personal }], more }
 // The token is a secret: the adapter sends it as `Authorization: Bearer` only and never logs it.
 
 /** Every `error` value a call can resolve with. */
 export const HOME_ERRORS = Object.freeze(["auth", "forbidden", "unavailable", "network"]);
 
 /**
- * @typedef {{ type: "group"|"space"|"other"|"shared", id?: string, name: string }} PathPart   "shared": "Shared with you", what stands for a Space or Group the person can't open
+ * @typedef {{ type: "group"|"space"|"shared", id?: string, name: string }} PathPart   "shared": "Shared with you", what stands for a Space or Group the person can't open
  * @typedef {{ id: string, title: string, role: string, path: PathPart[], starred: boolean, at?: number }} Card
  * @typedef {{ id: string, name: string, personal: boolean }} SpaceNode
- * @typedef {{ groups: { id: string, name: string, spaces: SpaceNode[] }[], spaces: SpaceNode[], other: { boards: { id: string, title: string }[], more: boolean }, more: boolean }} Tree
+ * @typedef {{ groups: { id: string, name: string, spaces: SpaceNode[] }[], spaces: SpaceNode[], more: boolean }} Tree
  * @typedef {{ guest: boolean, user: { user: string, name: string }, unit: { id: string, kind: string } | null,
  *   recent: Card[], starred: Card[], owned: Card[], shared: Card[], tree: Tree | null, limits: Record<string, number>, can: { createGroup: boolean, manageAccess: boolean, manageRoles: boolean } }} HomeData
  * @typedef {object} HomePort

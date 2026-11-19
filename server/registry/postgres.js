@@ -99,7 +99,7 @@ const REGISTRY_TABLE_DDL = {
   reg_invites: "n BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES $S.reg_boards(id), email TEXT NOT NULL, role TEXT NOT NULL, expires_at BIGINT, revoked BOOLEAN NOT NULL, by_user TEXT, created_at BIGINT NOT NULL",
   reg_links: "n BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES $S.reg_boards(id), role TEXT NOT NULL, expires_at BIGINT, revoked BOOLEAN NOT NULL, by_user TEXT, created_at BIGINT NOT NULL",
   reg_link_uses: "board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES $S.reg_links(id), n BIGINT GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (board, member, link)",
-  // Board organization (PROTOCOL.md § Registry, "Organization"). A board with no reg_board_spaces row is unfiled.
+  // Board organization (PROTOCOL.md § Registry, "Organization"). Every board has exactly one reg_board_spaces row.
   reg_tenant_meta: "tenant TEXT PRIMARY KEY REFERENCES $S.reg_tenants(id), kind TEXT NOT NULL",
   reg_tenant_domains: "domain TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), n BIGINT GENERATED ALWAYS AS IDENTITY",
   reg_groups: "id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), name TEXT NOT NULL, general_role TEXT, created_at BIGINT NOT NULL",
@@ -187,6 +187,10 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       if (!(await missing(tx, s, ["reg_boards"])).length && (await missing(tx, s, ["reg_spaces"])).length)
         throw Object.assign(new Error(`postgres registry: schema "${s}" has reg_boards but no reg_spaces: it is from an older version. Reset the store: drop the schema "${s}" (every table in it, never one), and the next start-up recreates it`), { code: "old-format" });
       await assertShapes(tx, s, registryTables(s));   // the old-format rule, before anything is created
+      // A board in no Space (pre-#90) is old-format too.
+      if (!(await missing(tx, s, ["reg_boards"])).length && ((await missing(tx, s, ["reg_board_spaces"])).length
+        || (await tx.unsafe(`SELECT 1 FROM "${s}".reg_boards b WHERE NOT EXISTS (SELECT 1 FROM "${s}".reg_board_spaces x WHERE x.board = b.id) LIMIT 1`)).length))
+        throw Object.assign(new Error(`postgres registry: schema "${s}" holds a board that is in no Space: it is from an older version. Reset the store: drop the schema "${s}" (every table in it, never one), and the next start-up recreates it`), { code: "old-format" });
       await migrate(tx, s, registryTables(s));
       const noIndex = await missing(tx, s, Object.keys(REGISTRY_INDEXES));
       if (noIndex.length) await tx.unsafe(noIndex.map(name => `CREATE INDEX ${name} ON "${s}".${REGISTRY_INDEXES[name]}`).join(";\n"));
@@ -379,17 +383,17 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     async createBoard({ tenant, title = "", memberRole, space, owner, idem }) {
       ready();
       if (!key(tenant)) throw new Error("registry: no such tenant");
-      if (space != null && !key(space)) throw new Error("registry: no such space");
+      if (!key(space)) throw new Error("registry: no such space");
       const k = idemStart(idem), createdAt = now();
       return write(async tx => {
         // Nothing deletes tenants today; the foreign key is the fence if that changes.
         if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
-        if (space != null && (await one(tx, `SELECT tenant FROM ${SP} WHERE id = $1`, [space]))?.tenant !== tenant) throw new Error("registry: no such space");
+        if ((await one(tx, `SELECT tenant FROM ${SP} WHERE id = $1`, [space]))?.tenant !== tenant) throw new Error("registry: no such space");
         const id = await fresh(tx, mint.board, BD);
         await idemPut(tx, k, id, createdAt);
         await tx.unsafe(`INSERT INTO ${BD} (id, tenant, title, member_role, created_at) VALUES ($1, $2, $3, $4, $5)`,
-          [id, tenant, String(title), memberRole === undefined ? (space != null ? null : "viewer") : nz(memberRole), createdAt]);
-        if (space != null) await tx.unsafe(`INSERT INTO ${BS} (board, space) VALUES ($1, $2)`, [id, space]);
+          [id, tenant, String(title), memberRole === undefined ? null : nz(memberRole), createdAt]);
+        await tx.unsafe(`INSERT INTO ${BS} (board, space) VALUES ($1, $2)`, [id, space]);
         if (owner != null) await tx.unsafe(`INSERT INTO ${G} (board, member, role) VALUES ($1, $2, 'owner')`, [id, String(owner)]);
         return rowBoard(await one(tx, `${BOARD_SQL} WHERE b.id = $1`, [id]));
       });
@@ -1048,18 +1052,17 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
           UNION SELECT board FROM ${U} WHERE member = $1) x ORDER BY board LIMIT $3`,
       [user, email && key(email) ? normEmail(email) : null, smallLimit(limit, HOME.sharedScan, HOME.sharedScan)])).map(r => r.board);
     },
-    async searchBoards(tenant, { q: term, unfiled = false, after = null, scan } = {}) {
+    async searchBoards(tenant, { q: term, after = null, scan } = {}) {
       ready();
       const cur = orgDefaults.cursor(after, "id"), cap = smallLimit(scan, HOME.searchScan.default, HOME.searchScan.max);
       // ASCII case-folding only (PROTOCOL.md § Home): translate() instead of ILIKE, whose folding follows the database's locale.
       const like = term == null ? null : "%" + asciiFold(searchQuery(term)).replace(/[\\%_]/g, "\\$&") + "%";
       if (!key(tenant)) return { ids: [], next: null };
       const fold = c => `translate(${c}, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')`;
-      const ids = (await db.unsafe(`SELECT w.id FROM (SELECT id, title FROM ${BD} WHERE tenant = $1 AND ($2::text IS NULL OR id > $2) ORDER BY id LIMIT $5) w
+      const ids = (await db.unsafe(`SELECT w.id FROM (SELECT id, title FROM ${BD} WHERE tenant = $1 AND ($2::text IS NULL OR id > $2) ORDER BY id LIMIT $4) w
         LEFT JOIN ${BS} bs ON bs.board = w.id LEFT JOIN ${SP} s ON s.id = bs.space
-        WHERE ($3::text IS NULL OR ${fold("w.title")} LIKE $3 ESCAPE '\\' OR ($4::boolean = false AND ${fold("s.name")} LIKE $3 ESCAPE '\\'))
-          AND ($4::boolean = false OR bs.board IS NULL)
-        ORDER BY w.id`, [tenant, cur, like, !!unfiled, cap])).map(r => r.id);
+        WHERE ($3::text IS NULL OR ${fold("w.title")} LIKE $3 ESCAPE '\\' OR ${fold("s.name")} LIKE $3 ESCAPE '\\')
+        ORDER BY w.id`, [tenant, cur, like, cap])).map(r => r.id);
       const edge = await db.unsafe(`SELECT id FROM ${BD} WHERE tenant = $1 AND ($2::text IS NULL OR id > $2) ORDER BY id LIMIT 2 OFFSET $3`, [tenant, cur, cap - 1]);
       return { ids, next: edge.length === 2 ? edge[0].id : null };
     },

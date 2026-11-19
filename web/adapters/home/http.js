@@ -8,14 +8,13 @@ const ID = { test: v => typeof v === "string" && ID_RE.test(v) };
 const str = (v, max = 200) => (typeof v === "string" ? v.slice(0, max) : "");
 const list = (v, max, f) => (Array.isArray(v) ? v.slice(0, max).map(f).filter(Boolean) : []);
 
-const part = p => (p && typeof p === "object" && ["group", "space", "other", "shared"].includes(p.type) ? { type: p.type, ...(ID.test(p.id) ? { id: p.id } : {}), name: str(p.name) } : null);
+const part = p => (p && typeof p === "object" && ["group", "space", "shared"].includes(p.type) ? { type: p.type, ...(ID.test(p.id) ? { id: p.id } : {}), name: str(p.name) } : null);
 const card = c => (c && typeof c === "object" && ID.test(c.id)
   ? { id: c.id, title: str(c.title), role: str(c.role, 32), path: list(c.path, 4, part), starred: c.starred === true, ...(Number.isFinite(c.at) ? { at: c.at } : {}) } : null);
 const node = s => (s && typeof s === "object" && ID.test(s.id) ? { id: s.id, name: str(s.name), personal: s.personal === true } : null);
 const tree = t => (t && typeof t === "object" ? {
   groups: list(t.groups, 200, g => (g && ID.test(g.id) ? { id: g.id, name: str(g.name), spaces: list(g.spaces, 200, node) } : null)),
   spaces: list(t.spaces, 200, node),
-  other: { boards: list(t.other?.boards, 50, b => (b && ID.test(b.id) ? { id: b.id, title: str(b.title) } : null)), more: t.other?.more === true },
   more: t.more === true,
 } : null);
 

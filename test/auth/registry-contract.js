@@ -11,6 +11,7 @@
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { IDEM, ASK } from "../../server/auth/registry-port.js";
+import { mkBoard, spaceOf } from "./fixtures.js";
 
 /**
  * @param {string} name
@@ -27,7 +28,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
 
     const tenantWithBoard = async (o = {}) => {
       const t = await r.createTenant({ domain: "acme.com", admins: ["google:root"] });
-      const b = await r.createBoard({ tenant: t.id, ...o });
+      const b = await mkBoard(r, { tenant: t.id, ...o });
       return { t, b };
     };
     const sorted = async b => (await r.grants(b)).sort((x, y) => x.user.localeCompare(y.user));
@@ -43,7 +44,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
         const { t, b } = await tenantWithBoard();
         const n = { v: 0 };
         return {
-          board: i => r.createBoard({ tenant: t.id, title: "T", owner: U, idem: i }),
+          board: i => mkBoard(r, { tenant: t.id, title: "T", owner: U, idem: i }),
           group: i => r.createGroup({ tenant: t.id, name: "G", owner: U, idem: i }),
           space: i => r.createSpace({ tenant: t.id, name: "S", owner: U, idem: i }),
           team: i => r.createTeam({ tenant: t.id, name: "Tm", idem: i }),
@@ -77,10 +78,10 @@ export function registryContract(name, makeRegistry, opts = {}) {
       test("a create that FAILS leaves no key behind (the key row rolls back with it), so the retry runs fresh", async () => {
         const { t } = await tenantWithBoard();
         await expect(r.createSpace({ tenant: t.id, name: "S", group: "g-nonexistent", idem: idem() })).rejects.toThrow();
-        await expect(r.createBoard({ tenant: "t-nonexistent", idem: idem() })).rejects.toThrow();
+        await expect(mkBoard(r, { tenant: "t-nonexistent", idem: idem() })).rejects.toThrow();
         expect(await r.idemGet(idem())).toEqual({ state: "none" });
         expect(await r.idemSize()).toBe(0);
-        expect((await r.createBoard({ tenant: t.id, idem: idem() })).id).toBeTruthy();
+        expect((await mkBoard(r, { tenant: t.id, idem: idem() })).id).toBeTruthy();
       });
       test("role: a create refused by the cap leaves no key; a replay of a role that fit is a replay even when the Unit is full now; concurrent same key makes one role", async () => {
         const { t } = await tenantWithBoard();
@@ -138,10 +139,10 @@ export function registryContract(name, makeRegistry, opts = {}) {
       });
       test("a create without a key is unaffected; a bad user, key or fingerprint rejects before anything is made", async () => {
         const { t } = await tenantWithBoard();
-        await r.createBoard({ tenant: t.id }); await r.createBoard({ tenant: t.id });
+        await mkBoard(r, { tenant: t.id }); await mkBoard(r, { tenant: t.id });
         expect(await r.idemSize()).toBe(0);
         for (const bad of [idem({ user: 5 }), idem({ key: "" }), idem({ fp: undefined })]) {
-          await expect(r.createBoard({ tenant: t.id, idem: bad })).rejects.toThrow();
+          await expect(mkBoard(r, { tenant: t.id, idem: bad })).rejects.toThrow();
           await expect(r.idemGet(bad)).rejects.toThrow();
         }
       });
@@ -200,14 +201,14 @@ export function registryContract(name, makeRegistry, opts = {}) {
       expect(b.id).toMatch(/^b-[a-z0-9]{16}$/);
       expect(b).toMatchObject({ tenant: t.id, title: "", memberRole: "viewer", createdAt: T0 });
       expect(await r.board(b.id)).toEqual(b);
-      const c = await r.createBoard({ tenant: t.id, title: "All hands", memberRole: null });
+      const c = await mkBoard(r, { tenant: t.id, title: "All hands", memberRole: null });
       expect(c).toMatchObject({ title: "All hands", memberRole: null });
       expect(c.id).not.toBe(b.id);
       expect(await r.board("b-nope000000000000")).toBe(null);
     });
 
     test("createBoard: unknown tenant rejects", async () => {
-      await expect(r.createBoard({ tenant: "t-nope00000000" })).rejects.toThrow();
+      await expect(mkBoard(r, { tenant: "t-nope00000000" })).rejects.toThrow();
     });
 
     test("reads return copies: mutating a result doesn't change the registry", async () => {
@@ -238,7 +239,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
 
     test("setGrant: unknown board rejects; grants are per board", async () => {
       const { t, b } = await tenantWithBoard();
-      const c = await r.createBoard({ tenant: t.id });
+      const c = await mkBoard(r, { tenant: t.id });
       await expect(r.setGrant("b-nope000000000000", "google:ann", "viewer")).rejects.toThrow();
       await r.setGrant(b.id, "google:ann", "editor");
       expect(await r.grant(c.id, "google:ann")).toBe(null);
@@ -305,7 +306,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
 
     test("invites(board) / invitesFor(board, email): per board; email match is case-insensitive", async () => {
       const { t, b } = await tenantWithBoard();
-      const c = await r.createBoard({ tenant: t.id });
+      const c = await mkBoard(r, { tenant: t.id });
       const i1 = await r.createInvite({ board: b.id, email: "ann@acme.com", role: "editor", by: "google:root" });
       const i2 = await r.createInvite({ board: b.id, email: "bob@acme.com", role: "viewer", by: "google:root" });
       await r.createInvite({ board: c.id, email: "ann@acme.com", role: "viewer", by: "google:root" });
@@ -328,7 +329,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
 
     test("createLink: minted 26-char [a-z0-9] id, role per link, defaults; link(id) / links(board)", async () => {
       const { t, b } = await tenantWithBoard();
-      const c = await r.createBoard({ tenant: t.id });
+      const c = await mkBoard(r, { tenant: t.id });
       const l = await r.createLink({ board: b.id, role: "annotator", by: "google:root" });
       expect(l.id).toMatch(/^[a-z0-9]{26}$/);
       expect(l).toMatchObject({ board: b.id, role: "annotator", expiresAt: null, revoked: false, by: "google:root", createdAt: T0 });
@@ -351,7 +352,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
 
     test("addLinkUse / linkUses: per board and user, idempotent; unknown link rejects", async () => {
       const { t, b } = await tenantWithBoard();
-      const c = await r.createBoard({ tenant: t.id });
+      const c = await mkBoard(r, { tenant: t.id });
       const l1 = await r.createLink({ board: b.id, role: "viewer", by: "google:root" });
       const l2 = await r.createLink({ board: b.id, role: "editor", by: "google:root" });
       const l3 = await r.createLink({ board: c.id, role: "viewer", by: "google:root" });
@@ -367,7 +368,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
 
     if (opts.batch) test("linkUsesFor (optional batch): equals linkUses per user; users with no use are absent", async () => {
       const { t, b } = await tenantWithBoard();
-      const c = await r.createBoard({ tenant: t.id });
+      const c = await mkBoard(r, { tenant: t.id });
       const l1 = await r.createLink({ board: b.id, role: "viewer", by: "google:root" });
       const l2 = await r.createLink({ board: b.id, role: "editor", by: "google:root" });
       const l3 = await r.createLink({ board: c.id, role: "viewer", by: "google:root" });
@@ -422,13 +423,13 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect(u.domains).toEqual(["globex.com", "globex.io"]);
       });
 
-      test("createBoard: unfiled boards keep memberRole viewer; a board in a Space defaults to null (inherit) and records the Space", async () => {
+      test("createBoard: a board in a Space defaults to null (inherit) and records the Space; with no Space (or another Unit's, or an unknown one) it is refused and nothing is written", async () => {
         const t = await unit();
         const sp = await r.createSpace({ tenant: t.id, name: "Design" });
-        const a = await r.createBoard({ tenant: t.id });
         const b = await r.createBoard({ tenant: t.id, space: sp.id });
         const c = await r.createBoard({ tenant: t.id, space: sp.id, memberRole: "editor" });
-        expect([a.memberRole, a.space]).toEqual(["viewer", null]);
+        for (const space of [undefined, null, "", "s-nope00000000"]) await expect(r.createBoard({ tenant: t.id, owner: "google:own", ...(space === undefined ? {} : { space }) })).rejects.toThrow(/no such space/);
+        expect((await r.searchBoards(t.id)).ids.sort()).toEqual([b.id, c.id].sort());   // only the two filed boards exist
         expect([b.memberRole, b.space]).toEqual([null, sp.id]);
         expect([c.memberRole, c.space]).toEqual(["editor", sp.id]);
         expect(await r.board(b.id)).toEqual(b);
@@ -707,9 +708,9 @@ export function registryContract(name, makeRegistry, opts = {}) {
           ids.s1.push((await r.createBoard({ tenant: t.id, space: s1.id })).id);
           if (i < 3) ids.s2.push((await r.createBoard({ tenant: t.id, space: s2.id })).id);
           if (i < 2) ids.s3.push((await r.createBoard({ tenant: t.id, space: s3.id })).id);
-          if (i < 1) ids.none.push((await r.createBoard({ tenant: t.id })).id);
+          if (i < 1) ids.none.push((await mkBoard(r, { tenant: t.id })).id);
         }
-        await r.createBoard({ tenant: other.id });
+        await mkBoard(r, { tenant: other.id });
         const all = async (scope, limit) => { const out = []; let after = null, pages = 0; do { const p = await r.boardsIn(scope, { after, limit }); out.push(...p.ids); after = p.next; pages++; } while (after); return { out, pages }; };
         expect((await all({ type: "space", id: s1.id }, 3))).toEqual({ out: [...ids.s1].sort(), pages: 3 });
         expect((await all({ type: "space", id: s2.id })).out).toEqual([...ids.s2].sort());
@@ -957,8 +958,8 @@ export function registryContract(name, makeRegistry, opts = {}) {
         const un = await r.accessContext({ type: "unit", id: t.id });
         expect([un.board, un.space, un.group]).toEqual([null, null, null]);
         expect(un.scoped.space).toEqual([]);
-        const legacy = await r.createBoard({ tenant: t.id });
-        expect([(await r.accessContext({ type: "board", id: legacy.id })).space]).toEqual([null]);
+        const filed = await mkBoard(r, { tenant: t.id });
+        expect((await r.accessContext({ type: "board", id: filed.id })).space.id).toBe(filed.space);   // a board's chain always has its Space
         for (const bad of [{ type: "board", id: "b-nope00000000" }, { type: "space", id: "nope" }, { type: "group", id: "g-x" }, { type: "unit", id: "t-nope00000000" }])
           expect(await r.accessContext(bad)).toBe(null);
         await expect(r.accessContext({ type: "planet", id: "x" })).rejects.toThrow();
@@ -1001,8 +1002,8 @@ export function registryContract(name, makeRegistry, opts = {}) {
         const t = await r.createTenant({ domain: "acme.com", admins: ["dev:root"] });
         const sp = await r.createSpace({ tenant: t.id, name: "Design Studio" });
         const a = await r.createBoard({ tenant: t.id, title: "Roadmap", space: sp.id });
-        const b = await r.createBoard({ tenant: t.id, title: "Offsite 100%_ideas" });
-        const c = await r.createBoard({ tenant: t.id, title: "Other roadmap thing" });
+        const b = await mkBoard(r, { tenant: t.id, title: "Offsite 100%_ideas" });
+        const c = await mkBoard(r, { tenant: t.id, title: "Other roadmap thing" });
         return { t, sp, a, b, c };
       };
 
@@ -1022,7 +1023,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
       test("markOpened keeps only the newest 50 rows per user (other users untouched)", async () => {
         const { t } = await mk();
         const ids = [];
-        for (let i = 0; i < 55; i++) { ids.push((await r.createBoard({ tenant: t.id, title: `b${i}` })).id); }
+        for (let i = 0; i < 55; i++) { ids.push((await mkBoard(r, { tenant: t.id, title: `b${i}` })).id); }
         for (const id of ids) { await r.markOpened("dev:ada", id); clock.t += 1; }
         await r.markOpened("dev:bob", ids[0]);
         const rec = await r.recents("dev:ada", { limit: 1000 });
@@ -1052,10 +1053,10 @@ export function registryContract(name, makeRegistry, opts = {}) {
 
       test("sharedBoards: every source on the board itself (grants incl. owner, a Team's, non-revoked invites, redeemed links)", async () => {
         const { t, a, b, c } = await mk();
-        const d = await r.createBoard({ tenant: t.id, title: "D" });
-        const e = await r.createBoard({ tenant: t.id, title: "E" });
-        const f = await r.createBoard({ tenant: t.id, title: "F" });
-        const g = await r.createBoard({ tenant: t.id, title: "G" });
+        const d = await mkBoard(r, { tenant: t.id, title: "D" });
+        const e = await mkBoard(r, { tenant: t.id, title: "E" });
+        const f = await mkBoard(r, { tenant: t.id, title: "F" });
+        const g = await mkBoard(r, { tenant: t.id, title: "G" });
         await r.setGrant(a.id, "google:ann", "editor");
         await r.setGrant(b.id, "google:ann", "owner");                                  // ownership counts: Home labels it "Your boards" for a guest
         await r.createInvite({ board: c.id, email: "Ann@Example.com", role: "viewer", by: "dev:root" });
@@ -1075,10 +1076,10 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect(await r.sharedBoards("google:ann", null)).not.toContain(f.id);
       });
 
-      test("searchBoards: title or Space name, case-insensitive, LIKE characters literal, tenant-scoped, paged, unfiled", async () => {
+      test("searchBoards: title or Space name, case-insensitive, LIKE characters literal, tenant-scoped, paged", async () => {
         const { t, a, b, c } = await mk();
         const other = await r.createTenant({ domain: "globex.com" });
-        await r.createBoard({ tenant: other.id, title: "Roadmap" });
+        await mkBoard(r, { tenant: other.id, title: "Roadmap" });
         expect((await r.searchBoards(t.id, { q: "ROADMAP" })).ids.sort()).toEqual([a.id, c.id].sort());
         expect((await r.searchBoards(t.id, { q: "design studio" })).ids).toEqual([a.id]);     // a Space name finds its boards
         expect((await r.searchBoards(t.id, { q: "100%_" })).ids).toEqual([b.id]);
@@ -1086,8 +1087,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect((await r.searchBoards(t.id, { q: "_" })).ids).toEqual([b.id]);
         expect((await r.searchBoards(t.id, { q: "\\" })).ids).toEqual([]);
         expect((await r.searchBoards(t.id, { q: "zzz" })).ids).toEqual([]);
-        expect((await r.searchBoards(t.id, { unfiled: true })).ids.sort()).toEqual([b.id, c.id].sort());
-        expect((await r.searchBoards(t.id, { unfiled: true, q: "design studio" })).ids).toEqual([]);   // unfiled: titles only
+        expect((await r.searchBoards(t.id)).ids.sort()).toEqual([a.id, b.id, c.id].sort());   // no q: every board, each in a Space
         // Paging is by the scan window, never by the number of matches: both matches come back together, and `next` stays null.
         const both = await r.searchBoards(t.id, { q: "roadmap" });
         expect(both.ids.sort()).toEqual([a.id, c.id].sort());
@@ -1104,7 +1104,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
 
       test("searchBoards: ASCII case-folding only (a non-ASCII capital is not folded)", async () => {
         const t = await r.createTenant({ domain: "fold.com" });
-        const a = await r.createBoard({ tenant: t.id, title: "Caf\u00c9 menu" }), b = await r.createBoard({ tenant: t.id, title: "CAF\u00e9 plan" });
+        const a = await mkBoard(r, { tenant: t.id, title: "Caf\u00c9 menu" }), b = await mkBoard(r, { tenant: t.id, title: "CAF\u00e9 plan" });
         expect((await r.searchBoards(t.id, { q: "caf\u00c9" })).ids).toEqual([a.id]);
         expect((await r.searchBoards(t.id, { q: "caf\u00e9" })).ids).toEqual([b.id]);
         expect((await r.searchBoards(t.id, { q: "CAF" })).ids.sort()).toEqual([a.id, b.id].sort());
@@ -1112,7 +1112,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
 
       test("searchBoards: `next` depends only on the scan window, never on how many boards matched", async () => {
         const t = await r.createTenant({ domain: "many.com" });
-        for (let i = 0; i < 30; i++) await r.createBoard({ tenant: t.id, title: `falcon ${i}` });
+        for (let i = 0; i < 30; i++) await mkBoard(r, { tenant: t.id, title: `falcon ${i}` });
         const some = await r.searchBoards(t.id, { q: "falcon", scan: 100 }), none = await r.searchBoards(t.id, { q: "qqqq", scan: 100 });
         expect([some.ids.length, some.next, none.ids.length, none.next]).toEqual([30, null, 0, null]);   // 30 matches in one window: all returned, nothing "more"
         const cut = await r.searchBoards(t.id, { q: "falcon", scan: 10 }), cutNone = await r.searchBoards(t.id, { q: "qqqq", scan: 10 });
@@ -1124,7 +1124,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
       test("searchBoards is work-bounded: a page examines at most `scan` boards and `next` says where it stopped, even with no match", async () => {
         const t = await r.createTenant({ domain: "scan.com" });
         const made = [];
-        for (let i = 0; i < 25; i++) made.push((await r.createBoard({ tenant: t.id, title: i === 22 ? "needle" : `hay ${i}` })).id);
+        for (let i = 0; i < 25; i++) made.push((await mkBoard(r, { tenant: t.id, title: i === 22 ? "needle" : `hay ${i}` })).id);
         made.sort();
         const found = [];
         let after = null, pages = 0;
@@ -1182,7 +1182,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
       test("markOpened under concurrency keeps at most the newest 50 rows per user (a full list, then 24 writes at once)", async () => {
         const { t } = await mk();
         const ids = [];
-        for (let i = 0; i < 76; i++) ids.push((await r.createBoard({ tenant: t.id, title: `c${i}` })).id);
+        for (let i = 0; i < 76; i++) ids.push((await mkBoard(r, { tenant: t.id, title: `c${i}` })).id);
         for (const id of ids.slice(0, 50)) { await r.markOpened("dev:cc", id); clock.t += 1; }   // the list is full
         clock.t += 1000;
         await Promise.all(ids.slice(50).map(id => r.markOpened("dev:cc", id)));                   // concurrent writes each prune a snapshot that misses the others
@@ -1215,7 +1215,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect(ra.links).toEqual([]);
         const rb = m.get(b.id);
         expect(rb).toMatchObject({ grant: null, teamGrants: [], myTeams: [], invites: [] });
-        expect(rb.board.space).toBe(null);
+        expect(rb.board.space).toBe(await spaceOf(r, t.id));
         expect(rb.links.map(x => x.id)).toEqual([l.id]);
         expect((await r.boardRows([a.id], { user: "google:bob" })).get(a.id)).toMatchObject({ grant: null, myTeams: [], invites: [], links: [] });
         expect((await r.boardRows([], { user: "google:ann" })).size).toBe(0);

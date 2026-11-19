@@ -7,6 +7,7 @@ import { accessService, LIMITS } from "../../server/auth/access.js";
 import { httpRoutes } from "../../server/auth/http.js";
 import { sessions as makeSessions } from "../../server/auth/session.js";
 import { devAuth } from "../../server/auth/dev.js";
+import { mkBoard } from "./fixtures.js";
 
 let r, ten, svc, acme, ann;
 const ident = (n, domain = "acme.com") => ({ user: `google:${n}`, name: n, email: `${n}@${domain}`, domain });
@@ -242,7 +243,7 @@ describe("Teams: freshness (every change announces, revocations never dropped)",
     expect(ann).toEqual([]);
   });
   test("a walk over many scopes pages through all of them, and waits (never drops) while the scheduler's backlog is high", async () => {
-    for (let i = 0; i < 1200; i++) { const b = await r.createBoard({ tenant: acme.id }); await r.setScopedGrant({ scope: { type: "board", id: b.id }, subject: T(infra.id), role: "viewer" }); }
+    for (let i = 0; i < 1200; i++) { const b = await mkBoard(r, { tenant: acme.id }); await r.setScopedGrant({ scope: { type: "board", id: b.id }, subject: T(infra.id), role: "viewer" }); }
     let backlog = LIMITS.backlog + 1, waited = 0;
     const slow = mk(r, { backlog: () => backlog, settled: async () => { waited++; backlog = 0; } });
     await slow.setMember(root, infra.id, max.user, false);

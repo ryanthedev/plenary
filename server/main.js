@@ -416,7 +416,8 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
     let board = typeof saved === "string" ? await rawRegistry.board(saved) : null;
     if (!board) {
       const tenant = await registry.createTenant({ domain: null });
-      board = await registry.createBoard({ tenant: tenant.id, title: "dev board", memberRole: null });
+      const space = await registry.createSpace({ tenant: tenant.id, name: "Dev", generalRole: null });   // every board lives in a Space; only the dev tokens' grants open it
+      board = await registry.createBoard({ tenant: tenant.id, title: "dev board", memberRole: null, space: space.id });
       // Written whole or not at all (a kill mid-write must not leave half a file that hides the board).
       writeFileSync(devFile + ".tmp", JSON.stringify({ board: board.id }));
       renameSync(devFile + ".tmp", devFile);

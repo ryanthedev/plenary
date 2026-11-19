@@ -13,7 +13,7 @@ import { pathText, whenText } from "../../core/home.js";
  *   dialogs: Pick<ReturnType<typeof import("./dialogs.js").createDialogs>, "newBoard"|"newSpace"|"newGroup">, homeHref?: string, signIn?: { href: string, text?: string } | null }} o
  * @returns {{ destroy(): void }}
  */
-export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref, dialogs, homeHref = "./", signIn = null }) {
+export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref, teamsHref = null, unitAccessHref = null, dialogs, homeHref = "./", signIn = null }) {
   const S = model.state, keys = keeper(), mark = keys.mark;
   const status = h("div.home-status", { role: "status", "aria-live": "polite" });
   const search = h("input.home-search", { type: "search", placeholder: "Search boards and Spaces", "aria-label": "Search boards and Spaces", autocomplete: "off", maxlength: "100", spellcheck: "false",
@@ -57,6 +57,8 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
     // A Space opens its own page (?space=<id>), a Group its (?group=<id>).
     const node = s => mark(h("a.nav.sub", { href: spaceHref(s.id), title: `Open ${s.name}`, "aria-label": `Open ${s.name}` }, s.personal ? "◐ " : "▢ ", s.name), `space:${s.id}`);
     const t = d.tree;
+    const orgLinks = d.guest ? [] : [teamsHref ? mark(h("a.nav", { href: teamsHref }, "Teams"), "link:teams") : null,
+      unitAccessHref && d.unit && d.can?.manageAccess ? mark(h("a.nav", { href: unitAccessHref(d.unit.id) }, "Organization access"), "link:unit-access") : null];
     replace(side, d.guest ? null : newBoard(), d.guest ? null : newSpace(), newGroup(), navBtn("home", "Home"), d.guest ? null : navBtn("starred", "Starred", d.starred.length), navBtn("shared", "Shared with me", d.shared.length),
       t && h("div.tree", { role: "group", "aria-label": "Groups and Spaces" },
         t.groups.map(g => h("div.grp", {}, h("h4", {}, mark(h("a", { href: groupHref(g.id) }, g.name), `group:${g.id}`)), g.spaces.map(node))),

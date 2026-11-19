@@ -47,21 +47,21 @@ export function overflowMenu({ label, items }) {
 const focusSelect = el => { globalThis.queueMicrotask?.(() => { el.focus?.(); el.select?.(); }); return el; };
 
 /** The page chrome shared by both pages. */
-function shell(root, hrefs) {
+export function shell(root, hrefs) {
   const status = h("div.home-status", { role: "status", "aria-live": "polite", hidden: true });
   const main = h("main.home-main.sp-main", { id: "home-main", tabindex: "-1" });
   root.replaceChildren(h("div.home.sp-page", {},
     h("header.home-top", {}, h("a.logo", { href: hrefs.home, "aria-label": "Plenary home" }, "Plenary"), h("span.spacer")), status, main));
   return { status, main };
 }
-function showNotice(status, model) {
+export function showNotice(status, model) {
   const S = model.state;
   status.textContent = S.notice ?? "";
   status.hidden = !S.notice;
   if (S.notice) status.append(" ", h("button.btn.ghost", { type: "button", onclick: () => model.dismissNotice() }, "Dismiss"));
 }
-const message = (title, detail) => h("div.home-empty", {}, h("h2", {}, title), detail ? h("p", {}, detail) : null);
-const gate = (S, main, retry, signIn) => {
+export const message = (title, detail) => h("div.home-empty", {}, h("h2", {}, title), detail ? h("p", {}, detail) : null);
+export const gate = (S, main, retry, signIn) => {
   if (S.status === "loading" && !S.page) { replace(main, h("p.muted", {}, "Loading…")); return true; }
   if (S.status === "notfound") { replace(main, message("This page is not available.", "It may not exist, or you may not have access to it."), h("a.btn", { href: "./" }, "Back to Home")); return true; }
   if (S.status === "signed-out") { replace(main, message("You are signed out.", "Sign in again to see this page."), signIn ? h("a.btn.primary", { href: signIn.href }, signIn.text ?? "Sign in") : null); return true; }
@@ -123,6 +123,7 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null }) {
     const where = [c.role].filter(Boolean).join(" · ");
     const menuCfg = { label: `More for ${c.title || "Untitled"}`, items: [
       { text: "Open", href: hrefs.board(c.id) },
+      { text: "Who has access", href: hrefs.access?.("board", c.id), hidden: !hrefs.access },
       { text: "Rename", hidden: !c.can?.rename, onSelect: () => { editing = { type: "board", id: c.id }; render(); } },
     ] };
     const menu = keys.keep(`card-menu:${c.id}`, () => overflowMenu(menuCfg));
@@ -166,7 +167,8 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null }) {
       onSave: (v, moved) => model.rename(v).then(ok => { if (ok) end(moved ? null : focusTitle); else render(); }), onCancel: () => end(focusTitle) });
     h1 = keys.mark(h("h1", { id: "page-title", tabindex: "-1" }, input ?? sp.name), "heading");
     const head = h("div.sp-head", {}, h1,
-      h("span.badge", {}, sp.personal ? "Personal · only you" : "Space"), h("span.spacer"), newBoard, menu?.el);
+      h("span.badge", {}, sp.personal ? "Personal · only you" : "Space"), h("span.spacer"),
+      hrefs.access && !sp.personal ? keys.mark(h("a.btn", { href: hrefs.access("space", sp.id) }, "Members"), "members") : null, newBoard, menu?.el);
     const sub = h("p.sub-h", {}, sp.personal ? "Only you can see what's here until you share it." : generalText(sp.general));
     const empty = spaceEmpty(p);
     replace(main, crumbs, head, sub,
@@ -220,7 +222,8 @@ export function mountGroupPage({ root, model, dialogs, hrefs, signIn = null }) {
     const input = inlineEditor({ editing, session: title, text: g.name, label: "Group name",
       onSave: (v, moved) => model.rename(v).then(ok => { if (ok) end(moved); else render(); }), onCancel: end });
     h1 = keys.mark(h("h1", { id: "page-title", tabindex: "-1" }, input ?? g.name), "heading");
-    const head = h("div.sp-head", {}, h1, h("span.badge", {}, "Group"), h("span.spacer"), newSpace, menu?.el);
+    const head = h("div.sp-head", {}, h1, h("span.badge", {}, "Group"), h("span.spacer"),
+      hrefs.access ? keys.mark(h("a.btn", { href: hrefs.access("group", g.id) }, "Members"), "members") : null, newSpace, menu?.el);
     const empty = groupEmpty(p, g.name);
     replace(main, h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " /"), head, h("p.sub-h", {}, generalText(g.general)),
       p.spaces.length ? h("ul.cards", { "aria-label": `Spaces in ${g.name}` }, p.spaces.map(s => h("li.card", {},

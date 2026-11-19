@@ -808,6 +808,22 @@ describe("stuck host (#65)", () => {
     } finally { await A.close(); await raw.close(); await bus.close(); }
   }, 20000);
 
+  test("H1 a build that timed out starts the cooldown too: the next open watches instead of claiming", async () => {
+    const { bus, V, raw, host } = vworld();
+    const sa = stallable(raw, V.timers);
+    sa.build = "hang";
+    const A = host({ store: sa.store, holder: "h-a", leaseTtlMs: 3_000, storeTimeoutMs: 500 });
+    try {
+      const wait = opened(V, A.open(T, B));
+      await wait(0);
+      expect((await wait(600)).e?.code).toBe("timeout");
+      sa.build = "ok";
+      const acquires = sa.acquires;
+      expect(await A.open(T, B)).toBe("watching");
+      expect(sa.acquires).toBe(acquires);
+    } finally { await A.close(); await raw.close(); await bus.close(); }
+  }, 20000);
+
   test("M1 a failed build publishes released: a host already watching takes the board at once, not at its next poll", async () => {
     const { bus, V, raw, store, host } = vworld(), rawB = store();
     const sa = stallable(raw, V.timers);
@@ -878,13 +894,13 @@ describe("stuck host (#65)", () => {
   test("L3 an op in flight right after a slow build is not a stall: the watchdog's clock starts when the room does", async () => {
     const { bus, V, raw, host, lostWhy } = vworld();
     const sa = stallable(raw, V.timers);
-    sa.cpDelay = 3_000;                                                           // an empty board whose build takes 3 x stuckMs
+    sa.cpDelay = 3_050;                                                           // an empty board whose build takes 3 x stuckMs, ending between two beats (every 200 ms)
     const A = host({ store: sa.store, holder: "h-a", leaseTtlMs: 3_000, heartbeatMs: 200, stuckMs: 1_000 });
     try {
       const wait = opened(V, A.open(T, B));
       await wait(0);
-      for (let i = 0; i < 40 && !(await wait(100)); i++);
-      expect((await wait(0)).v).toBe("held");
+      let r; for (let i = 0; i < 400 && !r; i++) r = await wait(10);                 // 10 ms steps: stop right when the open resolves, before the next beat
+      expect(r.v).toBe("held");
       sa.cpDelay = 0;
       const g = fakeGateway(bus);
       g.hello("c1", "a"); await g.welcome("c1");

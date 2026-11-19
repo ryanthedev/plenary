@@ -128,6 +128,8 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   const watches = new Map();
   /** key → perf() time until which this host does not claim the board: it just stopped it stuck (#65), and its own lease is still live. */
   const cooling = new Map();
+  /** Slots whose room is built and alive: what the heartbeat tick walks. */
+  const running = new Set();
   const coolOff = key => cooling.set(key, perf() + leaseTtlMs + margin);
   const isCooling = key => {
     const until = cooling.get(key);
@@ -324,7 +326,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       // (or this one's next open) needn't wait out the ttl. A lost lease is never released.
       // Then a host already watching the board is told (as after a clean stop), so it need not wait for its next poll.
       if (!slot.leaseLost) Promise.resolve().then(() => store.release(tenant, board, me, slot.epoch))
-        .then(() => bus.publish(subjects.entries(tenant, board), { seq: 0, epoch: slot.epoch, cp: 0, released: true })?.catch?.(() => {}))
+        .then(() => { slot.announced = true; bus.publish(subjects.entries(tenant, board), { seq: 0, epoch: slot.epoch, cp: 0, released: true })?.catch?.(() => {}); })
         .catch(e => log.warn("lease release after a failed build failed", { tenant, board, err: e }));
       throw err;
     });
@@ -361,6 +363,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     if (closed) throw closedError();
     if (slot.dead) throw new PortError("unavailable", "the board's lease was lost while its room was being built");
     slot.durable = slot.room.status().resolved;
+    running.add(slot);
     slot.progress = { seq: slot.durable, at: perf() };   // the watchdog's clock starts when the room starts, not at the acquire (a slow build is not a stall)
     // Gateways (and any host watching this board) learn the new epoch now, before the inbox is served. `opened`: a
     // watcher answers the hellos it held, which this room never saw (MEDIUM-2).
@@ -481,7 +484,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   /** Throw the room away: its connections are told `unavailable` and closed; the next open builds a new one. No release. */
   function fail(slot) {
     if (slot.dead) return;
-    slot.dead = true; slot.unsub(); stopLease(slot);
+    slot.dead = true; slot.unsub(); stopLease(slot); running.delete(slot);
     if (slots.get(slot.key) === slot.promise) slots.delete(slot.key);
     try { slot.room?.fail(new PortError("stopped", "the room host stopped this room")); } catch { /* already stopped */ }
     // A lost lease tells only the connections this slot welcomed (HIGH-1): any other hello on the board is the new
@@ -562,12 +565,12 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   sweep.unref?.();
   // § Bus: the heartbeat repairs a lost last entry, tells gateways the epoch (for viewers' welcomes) and the newest durable checkpoint.
   const beat = setInterval(() => {
-    for (const p of slots.values()) p.then(slot => {
-      if (slot.dead) return;
-      if (expired(slot)) return lost(slot, "no lease renew succeeded by the host deadline");
-      if (stalled(slot)) { coolOff(slot.key); return lost(slot, `no progress: ops waiting and the resolved seq unmoved for ${stuckMs} ms`); }
+    for (const slot of [...running]) {   // rooms built and alive: a board still building has no beat to give (and no backlog of beats to run when it ends)
+      if (slot.dead) { running.delete(slot); continue; }
+      if (expired(slot)) { lost(slot, "no lease renew succeeded by the host deadline"); continue; }
+      if (stalled(slot)) { coolOff(slot.key); lost(slot, `no progress: ops waiting and the resolved seq unmoved for ${stuckMs} ms`); continue; }
       bus.publish(subjects.entries(slot.tenant, slot.board), slot.room.heartbeat())?.catch?.(() => {});
-    }, () => {});
+    }
   }, heartbeatMs);
   beat.unref?.();
 
@@ -634,10 +637,10 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
         try {
           await store.release(slot.tenant, slot.board, me, slot.epoch);
           // A host watching this board takes it at once (L2), not when it next asks the Store.
-          bus.publish(subjects.entries(slot.tenant, slot.board), { seq: slot.durable, epoch: slot.epoch, cp: slot.room?.heartbeat().cp ?? 0, released: true })?.catch?.(() => {});
+          if (!slot.announced) bus.publish(subjects.entries(slot.tenant, slot.board), { seq: slot.durable, epoch: slot.epoch, cp: slot.room?.heartbeat().cp ?? 0, released: true })?.catch?.(() => {});
         } catch (err) { log.warn("lease release failed; it lapses within its ttl", { tenant: slot.tenant, board: slot.board, err }); }
       }
-      held.clear(); slots.clear();
+      held.clear(); slots.clear(); running.clear();
     },
   };
 }

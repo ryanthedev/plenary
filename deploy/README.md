@@ -352,7 +352,7 @@ docker compose -f deploy/cluster.compose.yml down          # add -v to delete th
 
 For agents. `scripts/test-compose.js` runs the cluster file plus `deploy/cluster.compose.test.yml` (override) and checks
 the real protocol end to end. Never part of `bun test` or `bun run test:cluster` (heavy: builds an image, nine containers).
-Takes about 100 s warm.
+Takes about 40 s warm.
 
 - **Runtime:** `docker` (with `docker compose`) else `podman`; `CONTAINER_CLI=docker|podman|<path>` forces one (a path that
   does not exist is reported as not found). For podman it runs `docker-compose` (else `podman compose`) with `DOCKER_HOST` set

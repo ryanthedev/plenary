@@ -74,7 +74,7 @@ export const REGISTRY_METHODS = Object.freeze([
   "findMembers", "team", "teams", "setTeamMember", "teamMembers", "setScopedGrant",
   "rename", "updateScope", "spacesIn", "scopedGrants", "createRole", "deleteRole",
   "roleUsage", "memberCount", "updateRole", "role", "roles", "accessContexts",
-  "accessContext", "boardsIn", "scopesOf", "board", "setGrant", "grant",
+  "accessContext", "boardsIn", "scopesOf", "board", "moveBoard", "setGrant", "grant",
   "grants", "createInvite", "invite", "invites", "invitesFor", "revokeInvite",
   "createLink", "link", "links", "revokeLink", "addLinkUse", "linkUses",
   "idemGet", "markOpened", "recents", "setStarred", "starred", "starredAmong",
@@ -84,7 +84,7 @@ export const REGISTRY_METHODS = Object.freeze([
 
 /**
  * The one error class every Registry adapter throws for a refused call; match on `err.code`, never the class.
- * Codes: "last-owner" (setGrant, setScopedGrant, setTeamMember), "no-role", "limit", "in-use" (custom roles), "corrupt" (a stored row breaks an invariant, e.g. a tenant with no kind row), "idem-replay" /
+ * Codes: "last-owner" (setGrant, setScopedGrant, setTeamMember), "no-role", "limit", "in-use" (custom roles), "moved" (moveBoard: the board is in neither `from` nor `to`), "corrupt" (a stored row breaks an invariant, e.g. a tenant with no kind row), "idem-replay" /
  * "idem-mismatch" (see `idemErr`), "rate-limited" (requestAccess); the Postgres adapter adds "lock-timeout", "statement-timeout",
  * "overloaded", "queue-timeout", "client-timeout" (a timeout REJECTS, never resolves to null).
  */
@@ -136,6 +136,7 @@ export const mint = {
  *   tenantAdminsAmong(users: string[], o?: { timeoutMs?: number }): Promise<string[]>,   // those of `users` who are an admin of ANY tenant (the dev sign-in menu never offers one)
  *   createBoard(o: { tenant: string, title?: string, memberRole?: Role|null, space: string, owner?: string, idem?: Idem }): Promise<Board>,   // `owner` gets an owner grant in the same step; `space` is REQUIRED and of the same tenant (no unfiled boards; else a plain Error "registry: no such space"); memberRole default null = inherit the Space
  *   createGroup(o: { tenant: string, name: string, generalRole?: Role|null, owner?: string, idem?: Idem }): Promise<Group>,   // generalRole default null; `owner` gets an owner grant in the same step
+ *   moveBoard(o: { board: string, from: string, to: string, idem?: Idem }): Promise<{ board: Board, moved: boolean }>,   // ONE atomic compare-and-set of the board's Space (PROTOCOL.md § Move board): in `from` (a Space id, required) -> set, moved true; already in `to` -> no change, moved false; anywhere else rejects code "moved"; the key row is written in the same step
  *   group(id: string): Promise<Group|null>,
  *   groups(tenant: string): Promise<Group[]>,
  *   createSpace(o: { tenant: string, name: string, group?: string|null, generalRole?: Role|null, owner?: string, idem?: Idem }): Promise<Space>,   // generalRole default "viewer"; null = only people added

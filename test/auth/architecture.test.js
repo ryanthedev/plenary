@@ -37,6 +37,7 @@ export const CLASSES = {
   "server/auth/explain.js": "core",         // the access explanation: sources, needs, owners, Ask state (PROTOCOL.md § Access explanation and requests)
   "server/auth/roles.js": "core",           // Roles: custom roles and the permission matrix (PROTOCOL.md § Roles)
   "server/auth/spaces.js": "core",           // Spaces and Groups: pages, pickers, create, rename, general access (PROTOCOL.md § Spaces and Groups)
+  "server/auth/move.js": "core",             // move a board: options, the access diff, the compare-and-set move (PROTOCOL.md § Move board)
   "server/auth/home.js": "core",             // the Home screen's read side over the Registry port + tenancy (PROTOCOL.md § Home)
   "server/admin/boards.js": "core",          // admin use cases over the Registry port
   "server/admin/tenants.js": "core",         // bootstrapTenant over the Registry port (its CLI root: scripts/admin-bootstrap.js)

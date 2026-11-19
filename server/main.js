@@ -270,6 +270,7 @@ export function announcingRegistry(registry, bus, log) {
   return {
     ...registry,
     setGrant: after("setGrant", board => board),
+    moveBoard: after("moveBoard", o => o?.board),     // a move changes who reaches the board (PROTOCOL.md § Move board)
     createInvite: after("createInvite", o => o?.board),
     revokeInvite: after("revokeInvite", async id => (await registry.invite(id).catch(() => null))?.board),
     createLink: after("createLink", o => o?.board),

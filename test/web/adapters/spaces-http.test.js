@@ -5,7 +5,7 @@ import { SPACES_ERRORS } from "../../../web/ports/spaces.js";
 
 const answer = (status, body) => async () => ({ status, text: async () => (typeof body === "string" ? body : JSON.stringify(body)) });
 const SPACE = { space: { id: "s-1", name: "Design", personal: false, general: "viewer", group: { id: "g-1", name: "Product" } }, can: { createBoard: true, rename: true, general: false },
-  boards: [{ id: "b-1", title: "Roadmap", role: "editor", path: [{ type: "space", id: "s-1", name: "Design" }], starred: false, can: { rename: true } }], more: false };
+  boards: [{ id: "b-1", title: "Roadmap", role: "editor", path: [{ type: "space", id: "s-1", name: "Design" }], starred: false, can: { rename: true, move: false } }], more: false };
 const GROUP = { group: { id: "g-1", name: "Product", general: null }, can: { createSpace: true, rename: false, general: false }, spaces: [{ id: "s-1", name: "Design", general: "viewer" }], next: null };
 const api = (fetch, o = {}) => httpSpaces({ fetch, token: "tok", ...o });
 const seen = () => { const calls = []; return { calls, fetch: async (url, init) => { calls.push([url, init]); return answer(200, { board: { id: "b-9", title: "T" }, space: SPACE.space, group: GROUP.group, spaces: [], groups: [], root: true })(); } }; };

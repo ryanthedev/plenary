@@ -398,6 +398,26 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       });
     },
     async board(id) { ready(); return key(id) ? rowBoard(await one(db, `${BOARD_SQL} WHERE b.id = $1`, [id])) : null; },
+    async moveBoard({ board, from, to, idem }) {
+      ready();
+      if (!key(board)) throw new Error("registry: no such board");
+      if (!key(from) || !key(to)) throw new Error("registry: no such space");
+      const k = idemStart(idem), at = now();
+      return write(async tx => {
+        // The board row lock serialises every move of this board (and a grant change); the compare-and-set reads after it is held.
+        const b = await one(tx, `SELECT id, tenant FROM ${BD} WHERE id = $1 FOR UPDATE`, [board]);
+        if (!b) throw new Error("registry: no such board");
+        if ((await one(tx, `SELECT tenant FROM ${SP} WHERE id = $1`, [to]))?.tenant !== b.tenant) throw new Error("registry: no such space");
+        const cur = (await one(tx, `SELECT space FROM ${BS} WHERE board = $1`, [board]))?.space;
+        const moved = cur !== to;
+        await idemPut(tx, k, board + (moved ? ":moved" : ":noop"), at);      // the key first (it rejects a replay before the compare-and-set can); its answer says whether the move happened
+        if (moved) {
+          if (cur !== from) throw new RegistryError("moved", "the board is no longer in that Space");
+          await tx.unsafe(`INSERT INTO ${BS} (board, space) VALUES ($1, $2) ON CONFLICT (board) DO UPDATE SET space = excluded.space`, [board, to]);
+        }
+        return { board: rowBoard(await one(tx, `${BOARD_SQL} WHERE b.id = $1`, [board])), moved };
+      });
+    },
 
     async setGrant(board, user, role) {
       ready();

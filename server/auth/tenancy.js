@@ -18,7 +18,7 @@
 // the same pure `combine`, so they can't disagree (test/auth/role-cache.test.js checks it on random registries).
 
 import { normEmail } from "./util.js";
-import { resolveAccess, teamIndex } from "./resolver.js";
+import { resolveAccess, teamIndex, movedContext } from "./resolver.js";
 import { HOME } from "./registry-port.js";
 
 /** @typedef {import("./registry-port.js").Registry} Registry */
@@ -96,19 +96,21 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
   /**
    * Many identities' roles on one board, from the board's rows read once. Keyed by `identityKey` (user, email,
    * domain: what a role reads), so two identities of one user (tabs signed in with different emails or domains) get
-   * their own answers (p5-loadv finding 2). @returns {Promise<Map<string, Resolved & { identity: Identity }>>}
+   * their own answers (p5-loadv finding 2). `ctx`: the board's context when the caller already read it; `target` (a move's dry run): the destination Space's context, and
+   * each entry then also carries the full `before` and `after` Access of the same rows with the board in that Space. @returns {Promise<Map<string, Resolved & { identity: Identity }>>}
    * one entry per distinct requested identity key
    */
-  async function resolveMany(boardId, identities) {
+  async function resolveMany(boardId, identities, { ctx: given = null, target = null } = {}) {
     const ids = new Map();
     for (const id of identities ?? []) if (okIdentity(id)) { const k = identityKey(id); if (!ids.has(k)) ids.set(k, id); }
     const out = new Map();
     const none = () => { for (const [k, id] of ids) out.set(k, { role: null, share: false, until: Infinity, identity: id }); return out; };
     if (typeof boardId !== "string" || !ids.size) return none();
     const users = [...new Set([...ids.values()].map(id => id.user))];
-    const ctx = await registry.accessContext({ type: "board", id: boardId }, { users, fresh: true });   // a pass reads everything fresh
+    const ctx = given ?? await registry.accessContext({ type: "board", id: boardId }, { users, fresh: true });   // a pass reads everything fresh
     if (!ctx?.board) return none();
-    const teamsOf = teamIndex(ctx);                      // user → Teams, once per pass (never a scan per identity)
+    const shaped = target ? movedContext(ctx, target) : null;   // a move's dry run: the same rows under the destination's Space (`target`: the destination Space's context, PROTOCOL.md § Move board)
+    const teamsOf = teamIndex(ctx), teamsAfter = shaped ? teamIndex(shaped) : null;   // user → Teams, once per pass (never a scan per identity)
     const board = ctx.board;
     const t = now();
     const all = [...ids.values()];
@@ -134,7 +136,9 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
     for (const [k, id] of ids) {
       const invites = id.email ? invitesBy.get(normEmail(id.email)) ?? [] : [];
       const links = (uses.get(id.user) ?? []).map(l => linkById.get(l) ?? null);
-      out.set(k, { ...combine({ ctx, grant: grants.get(id.user) ?? null, invites, links, teams: teamsOf.get(id.user) ?? NO_TEAMS }, id, t, opts), identity: id });
+      const rows = { ctx, grant: grants.get(id.user) ?? null, invites, links, teams: teamsOf.get(id.user) ?? NO_TEAMS };
+      out.set(k, { ...combine(rows, id, t, opts), identity: id,
+        ...(shaped ? { before: resolveAccess(rows, id, t, opts), after: resolveAccess({ ...rows, ctx: shaped, teams: teamsAfter.get(id.user) ?? NO_TEAMS }, id, t, opts) } : {}) });
     }
     return out;
   }
@@ -280,8 +284,8 @@ const tenancyOver = (registry, now, recordUntil, adminBoardContent) => tenancy({
  *     more than ttlMs old;
  *   recordTtlMs: board records (default 10 min, above the 60 s pass, so a pass reads them from memory). The fields the
  *     cache reads from them (board.id, board.memberRole, board.tenant) never change: the port has no update or delete
- *     for either (p5-loadv finding 6). IF a future port adds one (setMemberRole, deleteBoard), that write must announce
- *     `{ board }` and `invalidate(board)` must then also drop the board record: today it drops roles, links and the chain;
+ *     for either (p5-loadv finding 6). `moveBoard` (#53) changes `board.space`: it announces `{ board }` and `invalidate(board)` drops the board record
+ *     with the roles, links and the chain. IF a future port adds another update (setMemberRole, deleteBoard), it must announce the same way;
  *   the CHAIN of a board (its Space, Group and tenant records, `registry.accessContext`'s `chain`): kept for `ttlMs` per
  *     board, so a hello after the first reads only the volatile parts (grants, roles, Team members) in the one
  *     statement. `invalidate(board)` drops it, and a read in flight across an invalidation never fills it. What it holds
@@ -456,7 +460,7 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
         else clock++;
         return;
       }
-      dropBoard(boardId); dropLinks(boardId); chains.delete(boardId);
+      dropBoard(boardId); dropLinks(boardId); chains.delete(boardId); records.delete("board:" + boardId);   // a move changes the board's Space (PROTOCOL.md § Move board)
       if (reading) boardStamp.set(boardId, ++clock); else clock++;   // clock moves either way: no read joins across it
     },
 

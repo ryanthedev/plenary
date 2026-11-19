@@ -66,6 +66,7 @@ const NOT_ADAPTERS = {
   "server/auth/explain.js": "core: the access explanation (sources, what is needed, who to ask) built from the resolver's own Access over the Registry port (PROTOCOL.md § Access explanation and requests)",
   "server/auth/roles.js": "core: the Roles screen's reads and writes (custom roles, the no-escalation rule, delete, the many-people confirmation) over the Registry port and tenancy (PROTOCOL.md § Roles)",
   "server/auth/spaces.js": "core: Space and Group pages, pickers, create and rename over the Registry port, tenancy and Home (PROTOCOL.md § Spaces and Groups)",
+  "server/auth/move.js": "core: move a board between Spaces: options, the access diff, the compare-and-set move (PROTOCOL.md § Move board)",
   "server/auth/home.js": "core: the Home screen's lists, tree and search over the Registry port and tenancy (PROTOCOL.md § Home)",
 };
 /** Non-port modules a driven adapter may import. */

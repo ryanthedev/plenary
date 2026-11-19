@@ -8,7 +8,10 @@
 //   2. stopped rigs: <repo>/.rig/<name> dirs whose processes are all gone, as `cluster-rig.js status` decides it (it
 //      applies the rig's psInfo rule: a ps that fails reads as "alive", so the rig stays). A live rig is never touched.
 //   3. --scratch <dir>: its direct children, same age and in-use rules as 1 (agents' scratch copies).
-// Never follows a symlink (a symlinked entry is skipped; links inside an entry are unlinked, not entered), never touches
+// Paths are resolved by resolveNoOpen (lstat + readlink, never open), so no race can make this open a device. Accepted limit: a
+// hung network or autofs path in lsof output can still block the lstat itself.
+// Never opens anything that is not a plain file or directory (a FIFO, socket or device is kept, never resolved: opening a
+// pty slave or a named pipe can block forever), never follows a symlink (a symlinked entry is skipped; links inside an entry are unlinked, not entered), never touches
 // anything outside the temp dir, this repo's .rig and the given scratch dir, and refuses a base that is / or $HOME.
 // Limits: lsof run as a normal user does not see other users' (or root's) processes, so a dir only such a process holds
 // would look unused; hence only this user's entries are candidates, the in-use check runs a second time per entry right
@@ -19,9 +22,9 @@
 
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { lstatSync, readdirSync, readFileSync, realpathSync, rmSync, existsSync, renameSync } from "node:fs";
+import { lstatSync, statSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, existsSync, renameSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { dlopen, FFIType, read } from "bun:ffi";
 
 export const ROOT = realpathSync(resolve(fileURLToPath(new URL("..", import.meta.url))));
@@ -87,6 +90,58 @@ export function openUnder(path, lsof = "lsof", timeout = 60_000) {
   if (r.status <= 1 && /(^|\0)\n?p\d/.test(r.stdout)) return "in use (re-check)";   // +D exits 1 even when it lists matches
   if (r.status <= 1 && !r.stdout && !r.stderr) return "";
   return `in-use re-check failed: lsof exited ${r.status}${r.stderr ? ` (${r.stderr.split("\n")[0].slice(0, 120)})` : ""}`;
+}
+
+/**
+ * realpath that never opens anything: walks the components with lstat and readlink only (as Node's JS realpath does), so a
+ * device, FIFO or socket met on the way is never opened and there is no lstat-then-open race. Throws the lstat error
+ * (ENOENT, ENOTDIR) for a missing component, and ELOOP past 40 links.
+ */
+export function resolveNoOpen(p, stat = lstatSync, readlink = readlinkSync, cache = new Map(), readdir = readdirSync) {
+  let cur = sep, links = 0;
+  const names = dir => { if (!cache.has(dir)) { let l; try { l = readdir(dir); } catch { l = []; } cache.set(dir, l); } return cache.get(dir); };   // enterable but unlistable: keep the given spelling
+  const todo = (p.startsWith(sep) ? p : process.cwd() + sep + p).split(sep).filter(Boolean).reverse();
+  // macOS firmlink: /System/Volumes/Data/<x> is /<x> (what lsof prints). Drop the prefix only where both are provably the same directory.
+  if (todo.length > 3 && todo.at(-1) === "System" && todo.at(-2) === "Volumes" && todo.at(-3) === "Data") {
+    try {
+      const x = todo.at(-4), a = statSync(`/System/Volumes/Data/${x}`), b = statSync(`/${x}`);
+      if (a.dev === b.dev && a.ino === b.ino) todo.length -= 3;
+    } catch { /* not a firmlinked system: keep the spelling */ }
+  }
+  while (todo.length) {
+    let c = todo.pop();
+    if (c === ".") continue;
+    if (c === "..") { cur = dirname(cur); continue; }
+    const st = stat(join(cur, c));   // throws ENOENT/ENOTDIR for a missing component
+    // Restore the stored spelling (a case-insensitive volume answers /USERS/R for /Users/r): the exact name, else the case-insensitive match.
+    const all = names(cur);
+    if (!all.includes(c)) c = all.find(e => e.toLowerCase() === c.toLowerCase()) ?? c;
+    const next = join(cur, c);
+    if (!st.isSymbolicLink()) { cur = next; continue; }
+    if (++links > 40) throw Object.assign(new Error(`too many symbolic links: ${p}`), { code: "ELOOP" });
+    const target = readlink(next);
+    if (target.startsWith(sep)) cur = sep;
+    todo.push(...target.split(sep).filter(Boolean).reverse());
+  }
+  if (p.endsWith(sep) && !stat(cur).isDirectory()) throw Object.assign(new Error(`not a directory: ${p}`), { code: "ENOTDIR" });
+  return cur;
+}
+
+/**
+ * The paths a lsof answer is matched against: each as lsof printed it, plus its resolved form for a regular file or a
+ * directory only. lsof also lists devices (a pty slave under /dev), named pipes and sockets, and resolving one of those
+ * means opening it, which can block for good (a pty slave with no peer hangs open(2) in the kernel, uninterruptibly),
+ * so a path is lstat'd first and anything that is not a plain file or directory is never resolved or opened.
+ */
+export function resolveOpens(paths, stat = lstatSync, realpath = null) {
+  const out = new Set(), cache = new Map();
+  realpath ??= p => resolveNoOpen(p, lstatSync, readlinkSync, cache);
+  for (const p of paths) {
+    out.add(p);
+    if (p.startsWith("/dev/")) continue;
+    try { const st = stat(p); if (st.isFile() || st.isDirectory()) out.add(realpath(p)); } catch { /* gone, or not ours to resolve */ }
+  }
+  return [...out];
 }
 
 /** True when the pid may be alive (kill -0 succeeds or is denied); false only on ESRCH. Anything else is "alive". */
@@ -171,10 +226,19 @@ function ownerPid(dir, name) {
 
 const underAny = (opens, p) => opens.some(o => o === p || o.startsWith(p + sep));
 const refuseBase = (p, what) => {
-  const real = realpathSync(p);
-  const home = realpathSync(homedir());
-  if (real === sep || real === home || home.startsWith(real + sep) || ROOT === real || ROOT.startsWith(real + sep))
-    throw new Error(`refusing to clean ${what} ${p}: it resolves to ${real} (/, $HOME, the repo or one of their parents)`);
+  if (!statSync(p).isDirectory()) throw new Error(`refusing to clean ${what} ${p}: not a directory (never opened)`);   // stat does not open; realpath does
+  const real = resolveNoOpen(p);
+  const home = resolveNoOpen(homedir());
+  // By identity (dev+ino; stat opens nothing; the only check): a case-insensitive volume answers /USERS/R or /users for $HOME or its parents, and no
+  // string compare of spellings can be trusted there.
+  const key = q => { const st = statSync(q); return `${st.dev}:${st.ino}`; };
+  const protectedKeys = new Set();
+  const add = q => { try { protectedKeys.add(key(q)); } catch { /* absent here (no firmlink off macOS) */ } };
+  const DATA = "/System/Volumes/Data";   // macOS firmlink: the same directories again, under their physical parent
+  add(DATA);
+  for (const start of [home, ROOT]) for (let d = start; ; d = dirname(d)) { add(d); if (d !== sep) add(DATA + d); if (d === sep) break; }
+  if (protectedKeys.has(key(p)))
+    throw new Error(`refusing to clean ${what} ${p}: it is /, $HOME, the repo or one of their parents (same directory by identity)`);
   return real;
 };
 
@@ -213,7 +277,7 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
   let opens = null, opensError = null;
   const initialLeft = timeLeft();
   if (initialLeft <= 0) opensError = "skipped (time limit)";
-  else try { opens = [...new Set(openPathsFn(lsof, Math.max(1, Math.min(60_000, initialLeft))).flatMap(p => { try { return [p, realpathSync(p)]; } catch { return [p]; } }))]; } catch (e) { opensError = e.message; }
+  else try { opens = resolveOpens(openPathsFn(lsof, Math.max(1, Math.min(60_000, initialLeft))), stat); } catch (e) { opensError = e.message; }
 
   const consider = (target, base, name, extra) => {
     const path = join(base, name);
@@ -223,6 +287,7 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
       if (timeLeft() <= 0) { item.why = "skipped (time limit)"; return; }
       const st = stat(path);
       if (st.isSymbolicLink()) { item.why = "symlink"; return; }
+      if (!st.isDirectory() && !st.isFile()) { item.why = "not a regular file or directory"; return; }   // never open a pipe, socket or device
       if (st.uid !== uid) { item.why = `owned by uid ${st.uid}, not ${uid}`; return; }
       if (yes && (platform === "darwin" || platform === "linux") && !nativeRenameAvailable && !allowRacyRename) { item.why = "exclusive rename unavailable; --allow-racy-rename required to remove"; return; }
       if (st.dev !== stat(base).dev) { item.status = "failed"; item.why = "candidate is a mount point (different device from parent)"; return; }
@@ -233,7 +298,7 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
       if (extra?.check) { const why = extra.check(path, name); if (why) { item.why = why; return; } }
       if (extra?.skipOpen !== true) {
         if (opensError) { item.why = `in-use check failed: ${opensError}`; return; }
-        if (underAny(opens, realpathSync(path)) || underAny(opens, path)) { item.why = "in use"; return; }
+        if (underAny(opens, resolveNoOpen(path)) || underAny(opens, path)) { item.why = "in use"; return; }
       }
       if (!yes) { item.status = "would-remove"; return; }
       const scanned = measure(path, stat, undefined, deadlineCheck);
@@ -293,7 +358,9 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
       const dir = join(real, name);
       if (!lstatSync(dir).isDirectory()) continue;
       consider("rig", real, name, { minIdleMs: RIG_GRACE_MS, check: p => {
-        if (!existsSync(join(p, "rig.json"))) return "no rig.json (an up in progress or failed)";
+        let regular = false;
+        try { regular = lstatSync(join(p, "rig.json")).isFile(); } catch { /* missing */ }
+        if (!regular) return "no rig.json (an up in progress or failed)";
         const left = timeLeft();
         if (left <= 0) return "skipped (time limit)";
         const alive = rigAlive(p, Math.max(1, Math.min(60_000, left)));

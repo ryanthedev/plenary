@@ -7,7 +7,7 @@
 // namespace (Linux: the /proc/self/ns/pid link; null where there is none, as on macOS) AND that pid is gone here. A
 // root with no readable owner file, any field missing or different, or a live (or unknowable) pid is kept: never
 // delete on doubt.
-import { mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 
@@ -39,7 +39,8 @@ export function sweepStaleRoots(base, { alive = ownerAlive, host = hostname(), n
   for (const name of names) {
     if (!name.startsWith("plen-run-")) continue;
     let owner;
-    try { owner = JSON.parse(readFileSync(join(base, name, "owner.json"), "utf8")); } catch { continue; }
+    // lstat first: reading a FIFO or device named owner.json would block the whole run (it is opened before anything else).
+    try { const f = join(base, name, "owner.json"); if (!lstatSync(f).isFile()) continue; owner = JSON.parse(readFileSync(f, "utf8")); } catch { continue; }
     // Another host or pid namespace, or unknown. A file without `ns` (written before it existed) counts as null: the
     // same as here where there is no namespace link (macOS), so old roots of dead runs go; on Linux it is kept.
     if (owner?.host !== host || (owner.ns ?? null) !== ns) continue;

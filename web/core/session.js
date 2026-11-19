@@ -303,12 +303,25 @@ export function createSession({ join, token, board, client = "web", tab = null, 
     s.act(stream, ed => { id = ed.addImage(file, at); });
     return id;
   };
-  /** The `fileId`s of live image elements, in either Editor, whose bytes neither Editor holds (what a net should fetch). */
-  s.missingFiles = () => {
-    const have = id => Object.values(eds).some(ed => ed.doc.files?.[id]), out = new Set();
-    for (const ed of Object.values(eds)) for (const el of ed.doc.byId.values()) if (el.type === "image" && !el.isDeleted && typeof el.fileId === "string" && !have(el.fileId)) out.add(el.fileId);
-    return [...out];
+  /**
+   * Live image elements, in either Editor, whose bytes neither Editor holds: Map fileId → stamp. The stamp names what the
+   * documents say about that file (its elements and their versions), so a net can tell "a change touched this picture"
+   * from "nothing new". Memoised on the two documents' revisions: a frame that changed nothing costs two comparisons,
+   * not a scan of every element.
+   * @returns {Map<string, string>}
+   */
+  let missingKey = null, missingMap = new Map();
+  s.missing = () => {
+    const key = Object.values(eds).map(ed => ed.doc.rev ?? 0).join("|");
+    if (key === missingKey) return missingMap;
+    const have = id => Object.values(eds).some(ed => ed.doc.files?.[id]), out = new Map();
+    for (const ed of Object.values(eds)) for (const el of ed.doc.byId.values())
+      if (el.type === "image" && !el.isDeleted && typeof el.fileId === "string" && !have(el.fileId)) out.set(el.fileId, `${out.get(el.fileId) ?? ""}${el.id}:${el.version ?? 0};`);
+    missingKey = key; missingMap = out;
+    return out;
   };
+  /** The `fileId`s of s.missing(). */
+  s.missingFiles = () => [...s.missing().keys()];
   /** Picture bytes fetched for a placeholder (net.want → onFile; PROTOCOL.md § Blobs): shown in both Editors, never sent as an op. */
   s.receiveFiles = files => { for (const ed of Object.values(eds)) { ed.doc.apply({ files }); ed.changed(); } };
 

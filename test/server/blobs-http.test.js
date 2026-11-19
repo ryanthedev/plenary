@@ -240,3 +240,16 @@ test("an upload that stops sending is cut by the idle timeout the server sets (n
   const stalled = await stalledPut(r, tok((await ask(s, h, true)).url), 1000, 10);
   await until(() => stalled.closed(), "the stalled upload closed by the idle timeout", 6000);
 });
+
+test("single-flight can't be dodged by respelling the token (its non-canonical spellings are refused outright)", async () => {
+  const r = await rig({ server: { blobHttp: { maxPutsPerUser: 8 } } }), s = await as(r, "editor"), bytes = fakePng(300, 9), h = sha1(bytes);
+  const t = tok((await ask(s, h, true)).url), first = await stalledPut(r, t, 300, 10);
+  const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  await until(async () => (await fetch(r.server.url + "/blobs/" + t, { method: "PUT", body: bytes })).status === 409, "the token marked in flight");
+  for (const c of A) {
+    if (c === t.at(-1)) continue;
+    const st = (await fetch(r.server.url + "/blobs/" + t.slice(0, -1) + c, { method: "PUT", body: bytes })).status;
+    expect(st).toBe(401);                                          // never a second PUT in flight under another spelling
+  }
+  first.end();
+});

@@ -964,7 +964,11 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   well-formed ids (40 lowercase hex) are asked for. A failure that can pass (no welcome yet, a dropped connection,
   `unavailable`, 408, 429, 5xx, a network error, a timeout) is asked again with backoff on a fresh URL, up to 6 tries;
   a GET `404` the same way (not yet). A `limit` is not a failed try: it backs off (2 s doubling to 30 s, up to 20
-  times) and the user is told once. After the tries, a download rests 30 s (asked again by the next `want`), an upload
+  times) and the user is told once. A PUT answered `503 busy` or `409 in-flight` was reachable, not failed: the client waits
+  the `Retry-After` and sends the same URL again while it is fresh (4 minutes), without a new ask or a counted try, and says
+  "the server is busy" once. At most 2 PUTs (the server's per-account cap) and 4 GETs run at once; a PUT may take up to
+  150 s (the server's body deadline is 120 s). After the tries, a download rests 30 s, doubling each round up to 10 min (asked again by the next `want` after the rest, at once when a
+  document change touching that picture arrives, and after a reconnect), an upload
   wakes itself after 30 s and tries again, so a picture someone placed always goes up once the server takes it. `quota`,
   `too-large`, `not-image`, `hash-mismatch`, `forbidden` and `bad-op` are final and shown to the user. Requests wait
   for `welcome` and are asked again after every reconnect.

@@ -810,7 +810,7 @@ const PIC = { id: "c".repeat(40), mimeType: "image/png", dataURL: "data:image/pn
 // A picture with bytes is painted through `new Image()`: a stub that never loads.
 beforeEach(() => { globalThis.Image = class { set src(v) { this._src = v; } }; });
 afterAll(() => { delete globalThis.Image; });
-const spyNet = () => { const wants = [], files = []; return { wants, files, net: { kind: "local", put() {}, onFile: fn => { files.push(fn); }, want: id => wants.push(id) } }; };
+const spyNet = () => { const wants = [], files = [], stamps = []; return { wants, files, net: { kind: "local", put() {}, onFile: fn => { files.push(fn); }, want: (id, stamp) => { wants.push(id); stamps.push(stamp); } }, stamps }; };
 
 test("DW-42.3: a picture on the board whose bytes this client lacks is asked for through net.want, and not asked for once it has them", () => {
   const spy = spyNet();
@@ -838,4 +838,21 @@ test("a picture this client placed itself, and a deleted one, are never asked fo
   const id = [...bo.eds.board.doc.byId.values()].find(e => e.fileId === "d".repeat(40)).id;
   bo.eds.board.select([id]); bo.eds.board.key("Delete"); step(4);
   expect(S.missingFiles()).toEqual([]);
+});
+
+test("L1/L2: S.missing() is memoised on the documents' revisions (no scan per frame) and its stamp changes when an element showing the picture does", () => {
+  const spy = spyNet();
+  rig = setup({ appNet: spy.net });
+  const { S, bo, step } = rig;
+  bo.addPicture(PIC); step(4);
+  const first = S.missing();
+  expect([...first.keys()]).toEqual([PIC.id]);
+  expect(S.missing()).toBe(first);                              // same Map: nothing changed, nothing rescanned
+  step(3);
+  expect(S.missing()).toBe(first);                              // frames alone don't invalidate it
+  expect(spy.stamps.at(-1)).toBe(first.get(PIC.id));            // the app passes the stamp to the net
+  const el = [...bo.eds.board.doc.byId.values()].find(e => e.fileId === PIC.id);
+  bo.act("board", ed => { ed.select([el.id]); ed.nudge(10, 0); }); step(4);   // a change touching that picture
+  expect(S.missing()).not.toBe(first);
+  expect(S.missing().get(PIC.id)).not.toBe(first.get(PIC.id));
 });

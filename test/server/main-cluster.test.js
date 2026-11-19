@@ -9,6 +9,8 @@ import { sock } from "./rig.js";
 import { postgresStore } from "../../server/store/postgres.js";
 
 afterAll(cleanup);
+// The rig's S3 (the cluster's picture storage): a cluster node refuses to start without it. Many nodes share it, which the single-gateway local-disk opt-in could not serve.
+const S3_ENV = () => Object.fromEntries(["S3_ENDPOINT", "S3_BUCKET", "S3_REGION", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"].filter(k => process.env[k]).map(k => [k, process.env[k]]));
 const MAIN = new URL("../../server/main.js", import.meta.url).pathname;
 const PG = process.env.DATABASE_URL, NATS = process.env.NATS_URL;
 const TTL = 3_000;
@@ -34,7 +36,7 @@ describe.skipIf(!PG || !NATS)("cluster: three main.js processes on Postgres + NA
   });
 
   async function node(id, roles) {
-    const p = spawn({ DATABASE_URL: dbUrl, NATS_URL: NATS, COOKIE_KEY: "c".repeat(40), PLENARY_BLOBS: "local-disk", PLENARY_DEV_TOKENS: TOKENS, LOG_LEVEL: "info",
+    const p = spawn({ DATABASE_URL: dbUrl, NATS_URL: NATS, COOKIE_KEY: "c".repeat(40), ...S3_ENV(), PLENARY_DEV_TOKENS: TOKENS, LOG_LEVEL: "info",
       PLENARY_NODE_ID: id, PLENARY_ROLES: roles, PLENARY_LEASE_TTL_MS: String(TTL), PLENARY_DATA_DIR: tempDir(`plenary-cluster-${id}-`) });
     procs.push(p);
     const { port } = await p.line("server listening");

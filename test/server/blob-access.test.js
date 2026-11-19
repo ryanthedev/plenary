@@ -56,6 +56,14 @@ test("forged, tampered, foreign-key and malformed tokens are bad-token", async (
   expect(await access.get(`${swapped}.${mac}`)).toEqual({ ok: false, code: "bad-token" });
 });
 
+test("a token has exactly one spelling: the variants of its last base64 character (unused bits) are refused", async () => {
+  const { access } = make(), bytes = fakePng(100, 3), tok = await putUrl(access, "t1", bytes);
+  const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_", last = tok.at(-1);
+  let verifying = 0;
+  for (const c of A) if ((await access.verify(tok.slice(0, -1) + c, "PUT")).ok) { verifying++; expect(c).toBe(last); }
+  expect(verifying).toBe(1);                                       // before the fix, 4 spellings verified (the 4 low bits' worth)
+});
+
 test("a token works for its own verb only", async () => {
   const { access } = make(), bytes = fakePng(100, 2);
   expect(await access.put(await getUrl(access, "t1", sha1(bytes)), bytes)).toEqual({ ok: false, code: "wrong-verb" });

@@ -250,4 +250,89 @@ describe("wsNet blobs", () => {
     s.clock.advance(120_000); await tick();
     expect(s.ws().asks).toHaveLength(7);                               // and it is done: nothing more asked
   });
+
+  /** A server stand-in on the virtual clock: asks always granted (a unique URL each), PUTs take `ms` and obey the server's real per-account cap. */
+  async function farm({ cap = 2, ms = 8000, get404 = false } = {}) {
+    const h = {}; let active = 0, maxActive = 0, busy503 = 0, conflicts = 0, n = 0;
+    const flying = new Set(), stored = new Set(), puts = [];
+    const s = await setup((url, init) => new Promise(res => {
+      const r = (status, body, headers = {}) => res(new Response(JSON.stringify(body ?? {}), { status, headers }));
+      if (init.method !== "PUT") return get404 ? r(404, { error: "not-found" }) : res(ok());
+      puts.push(url);
+      if (flying.has(url)) { conflicts++; return r(409, { error: "in-flight" }); }
+      if (active >= cap) { busy503++; return r(503, { error: "busy" }, { "retry-after": "2" }); }
+      active++; maxActive = Math.max(maxActive, active); flying.add(url);
+      h.clock.set(() => { active--; flying.delete(url); stored.add(url.split("/").pop().split("-")[0]); r(201); }, ms);
+    }));
+    h.clock = s.clock;
+    const orig = s.ws().send.bind(s.ws());
+    s.ws().send = d => { orig(d); const m = JSON.parse(d); if (m.t === "blob") queueMicrotask(() => s.ws().say({ t: "blob", sha1: m.sha1, url: `http://x.test/blobs/${m.sha1}-${++n}` })); };
+    await s.welcome();
+    return { s, stats: () => ({ maxActive, busy503, conflicts, stored, puts, asks: s.ws().asks.length }) };
+  }
+  const run = async (s, until, steps = 800, ms = 500) => { for (let i = 0; i < steps && !until(); i++) { s.clock.advance(ms); await tick(2); } };
+  const idsOf = n => Array.from({ length: n }, (_, i) => (i + 1).toString(16).padStart(40, "0"));
+
+  test("B2: 12 uploads of ~8 s each against the server's real caps (2 PUTs per account) all store, never need busy, and ask once each", async () => {
+    const { s, stats } = await farm();
+    for (const id of idsOf(12)) s.net.put({ id, mimeType: "image/png", dataURL });
+    await run(s, () => stats().stored.size === 12);
+    expect(stats().stored.size).toBe(12);
+    expect(stats().maxActive).toBeLessThanOrEqual(2);
+    expect(stats().busy503).toBe(0);                                   // the client's PUT slots match the server's cap
+    expect(stats().conflicts).toBe(0);
+    expect(stats().asks).toBe(12);
+    expect(s.fails).toEqual([]);                                       // no toast at all
+    s.clock.advance(600_000); await tick();
+    expect(stats().asks).toBe(12);                                     // finished: nothing more asked, ever
+  });
+
+  test("B2: a server with FEWER slots than the client (1) answers 503 busy: honoured via Retry-After, same URL reused (no new ask), not a failed try, and its own toast", async () => {
+    const { s, stats } = await farm({ cap: 1 });
+    for (const id of idsOf(6)) s.net.put({ id, mimeType: "image/png", dataURL });
+    await run(s, () => stats().stored.size === 6, 1200);
+    expect(stats().stored.size).toBe(6);
+    expect(stats().busy503).toBeGreaterThan(0);
+    expect(stats().asks).toBe(6);                                      // busy retries sent the same URL: no extra asks
+    expect(s.fails.length).toBeGreaterThan(0);
+    expect(s.fails.every(f => f.code === "busy" && f.retrying)).toBe(true);   // never "gave-up" or "could not be reached"
+  });
+
+  test("B2: a PUT may take longer than 30 s (the server allows its body 120 s)", async () => {
+    const { s, stats } = await farm({ ms: 100_000 });
+    s.net.put({ id: idsOf(1)[0], mimeType: "image/png", dataURL });
+    await run(s, () => stats().stored.size === 1, 600, 1000);
+    expect(stats().stored.size).toBe(1);
+    expect(stats().puts).toHaveLength(1);                              // not aborted and retried at 30 s
+  });
+
+  test("B1: an upload that rested, was revived by a reconnect and succeeded never asks again (a stale wake-up must not re-queue it)", async () => {
+    let up = false;
+    const s = await setup(() => new Response("{}", { status: up ? 201 : 503 }));
+    await s.welcome();
+    s.net.put({ id: ID, mimeType: "image/png", dataURL });
+    const answer = async () => { s.ws().say({ t: "blob", sha1: ID, url: "http://x.test/blobs/u" }); await tick(); };
+    for (let i = 0; i < 6; i++) { await answer(); if (i < 5) for (const n = s.ws().asks.length; s.ws().asks.length === n;) { s.clock.advance(500); await tick(); } }
+    expect(s.fails.map(f => f.code)).toEqual(["gave-up"]);            // resting, the 30 s wake-up armed
+    up = true;
+    s.tr.reopen(); await tick(); await s.welcome(); s.clock.advance(200); await tick();   // the reconnect revives it before the wake-up
+    await answer();
+    const asked = s.ws().asks.length;
+    s.clock.advance(300_000); await tick(10);
+    expect(s.ws().asks).toHaveLength(asked);
+    expect(s.calls.filter(c => c.method === "PUT")).toHaveLength(7);
+  });
+
+  test("L2: a picture the server never has is asked for less and less (30 s, 60 s … up to 10 min rests), not every 30-90 s forever; a document change touching it asks again at once", async () => {
+    const { s, stats } = await farm({ get404: true });
+    const id = idsOf(1)[0];
+    for (let t = 0; t < 3600; t += 5) { s.net.want(id, "e1:1;"); s.clock.advance(5000); await tick(2); }
+    const after1h = stats().asks;
+    expect(after1h).toBeLessThan(80);                                  // ~54 with the doubling rests; a flat 30 s rest was ~360
+    expect(after1h).toBeGreaterThan(10);
+    s.net.want(id, "e1:1;"); await tick();
+    expect(stats().asks).toBe(after1h);                                // same stamp: still resting
+    s.net.want(id, "e1:2;"); s.clock.advance(200); await tick(4);       // an element showing it changed (200 ms: the ask pace)
+    expect(stats().asks).toBe(after1h + 1);
+  });
 });

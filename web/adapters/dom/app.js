@@ -62,7 +62,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   if (!ui.drawer && me.role === "annotator") ui.drawer = "notes";
   net.onFile(file => { S.receiveFiles({ [file.id]: file }); });
   // A picture that could not be saved for everyone (PROTOCOL.md § Blobs): it shows here, but nobody else will see it.
-  const WHY = { quota: "the storage quota is full", forbidden: "you can't upload here", "too-large": "it is over 10 MB", "not-image": "it is not a PNG, JPEG, GIF or WebP", "gave-up": "the server could not be reached (still trying)", limit: "too many uploads at once (still trying)" };
+  const WHY = { quota: "the storage quota is full", forbidden: "you can't upload here", "too-large": "it is over 10 MB", "not-image": "it is not a PNG, JPEG, GIF or WebP", "gave-up": "the server could not be reached (still trying)", busy: "the server is busy (still trying)", limit: "too many uploads at once (still trying)" };
   net.onFail?.(({ code, retrying }) => toast(`The picture ${retrying ? "is not saved for others yet" : "was not saved for others"}: ${WHY[code] ?? code}`, 6000));
 
   const isPhone = () => matchMedia("(max-width: 640px)").matches;
@@ -108,7 +108,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const items = S.displayList(theme);
     // A picture whose bytes haven't arrived is drawn by core as a dashed box (render.js); its bytes are asked for here
     // (the net dedupes, paces and rests; a picture the server doesn't have stays a dashed box).
-    for (const id of S.missingFiles()) net.want?.(id);
+    for (const [id, stamp] of S.missing()) net.want?.(id, stamp);
     const { w, h: hh } = S.eds.board.size;
     paint(ctx, items, { width: w, height: hh, dpr: canvas.width / Math.max(1, w), background: theme.bg, image });
     canvas.style.cursor = S.may() || S.tool === "hand" ? S.ed.cursor() ?? "default" : "grab";

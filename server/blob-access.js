@@ -56,8 +56,12 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
     if (parts.length !== 2) return { ok: false, code: "bad-token" };
     let claims;
     try {
-      if (!(await crypto.subtle.verify("HMAC", await mac, unb64url(parts[1]), utf8("b1." + parts[0])))) return { ok: false, code: "bad-token" };
-      claims = JSON.parse(fromUtf8(unb64url(parts[0])));
+      const sig = unb64url(parts[1]), body = unb64url(parts[0]);
+      // One spelling per token: the last base64 character carries unused bits that atob() ignores, so a token has several
+      // spellings that all verify. Refuse all but the canonical one (the HTTP adapter's single-flight keys on the string).
+      if (b64url(sig) !== parts[1] || b64url(body) !== parts[0]) return { ok: false, code: "bad-token" };
+      if (!(await crypto.subtle.verify("HMAC", await mac, sig, utf8("b1." + parts[0])))) return { ok: false, code: "bad-token" };
+      claims = JSON.parse(fromUtf8(body));
     } catch { return { ok: false, code: "bad-token" }; }
     const { tenant, board, sha1, exp } = claims ?? {};
     if (!isId(tenant) || !isId(board) || !isSha1(sha1) || !VERBS.includes(claims.verb) || !Number.isFinite(exp) || exp <= now()) return { ok: false, code: "bad-token" };

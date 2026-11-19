@@ -740,13 +740,17 @@ export function registryContract(name, makeRegistry, opts = {}) {
         await expect(r.spaceCandidates(t.id, { user: "dev:ann", after: "x\ny" })).rejects.toThrow("bad cursor");
       });
 
-      test("markOpened under concurrency keeps at most the newest 50 rows per user", async () => {
+      test("markOpened under concurrency keeps at most the newest 50 rows per user (a full list, then 24 writes at once)", async () => {
         const { t } = await mk();
         const ids = [];
-        for (let i = 0; i < 70; i++) ids.push((await r.createBoard({ tenant: t.id, title: `c${i}` })).id);
-        for (let round = 0; round < 3; round++) await Promise.all(ids.slice(round * 20, round * 20 + 20).map(id => r.markOpened("dev:cc", id)));
-        await Promise.all(ids.slice(60).map(id => r.markOpened("dev:cc", id)));
-        expect((await r.recents("dev:cc", { limit: 1000 })).length).toBeLessThanOrEqual(50);
+        for (let i = 0; i < 76; i++) ids.push((await r.createBoard({ tenant: t.id, title: `c${i}` })).id);
+        for (const id of ids.slice(0, 50)) { await r.markOpened("dev:cc", id); clock.t += 1; }   // the list is full
+        clock.t += 1000;
+        await Promise.all(ids.slice(50).map(id => r.markOpened("dev:cc", id)));                   // concurrent writes each prune a snapshot that misses the others
+        const rec = await r.recents("dev:cc", { limit: 1000 });
+        expect(rec.length).toBe(50);
+        expect(rec.map(x => x.board)).toEqual(expect.arrayContaining(ids.slice(50)));            // every new one is kept, the 24 oldest are gone
+        expect(rec.map(x => x.board)).not.toContain(ids[0]);
       });
 
       test("boardRows: the board-scope rows for one user over a batch; unknown ids absent", async () => {

@@ -43,6 +43,24 @@ describe.skipIf(!url)("postgres registry", () => {
     return r;
   }, { cleanup: async r => { await r.close(); await drop(schemas.get(r)); schemas.delete(r); }, batch: true });
 
+  // Recent keeps the newest 50 rows per member, atomically: concurrent writes each prune a snapshot that misses the others' rows, so
+  // without the per-member advisory lock the table grows past 50 (measured in review: 20 concurrent writes left 68). `recents()` caps its
+  // answer at 50, so the row count is read from the table.
+  test("markOpened: 60 concurrent writes onto a full list leave exactly 50 rows (per-member advisory lock)", async () => {
+    const schema = schemaName();
+    const wide = new SQL({ url, max: 8 });                                     // enough connections for the writes to really overlap
+    const r = await postgresRegistry({ sql: wide, schema });
+    try {
+      const t = await r.createTenant({ domain: "recent.com" });
+      const ids = [];
+      for (let i = 0; i < 110; i++) ids.push((await r.createBoard({ tenant: t.id, title: `c${i}` })).id);
+      for (const id of ids.slice(0, 50)) await r.markOpened("dev:cc", id);
+      await Promise.all(ids.slice(50).map(id => r.markOpened("dev:cc", id)));
+      const [{ n }] = await client().unsafe(`SELECT count(*)::int AS n FROM "${schema}".reg_recents WHERE member = 'dev:cc'`);
+      expect(n).toBe(50);
+    } finally { await r.close(); await wide.close(); await drop(schema); }
+  });
+
   // The batch access check against the single-board resolver, on Postgres (one seed: each run is a few hundred statements).
   accessEquivalence("postgres", async ({ now }) => {
     const schema = schemaName();

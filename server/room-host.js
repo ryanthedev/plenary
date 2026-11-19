@@ -101,8 +101,8 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   // foldUnits: work per step of an incremental checkpoint (fold.js; default FOLD_STEP_UNITS). Each step is its own
   //   `schedule(fn)` turn (default the injected timers' setImmediate, else the global; tests pass a queue they drain). checkpointTimeoutMs: a checkpoint write unanswered this long is failed (reported; the room's next fold may start), so a checkpoint never holds the loop for more than one step (§ Recovery, "Incremental fold").
   checkLeaseTtl(leaseTtlMs);
-  log.info("room host: stuck-host bounds", { stuckMs, appendTimeoutMs, storeTimeoutMs, leaseTtlMs });   // stuckMs defaults to 2 x appendTimeoutMs
   for (const [k, v] of Object.entries({ storeTimeoutMs, stuckMs })) if (!Number.isSafeInteger(v) || v < 1) throw new RangeError(`${k} must be a positive integer`);
+  log.info("room host: stuck-host bounds", { stuckMs, appendTimeoutMs, storeTimeoutMs, leaseTtlMs });   // stuckMs defaults to 2 x appendTimeoutMs
   const sched = schedule ?? (fn => (timers.setImmediate ?? globalThis.setImmediate)(fn));   // the injected timers' turn, else the global one
   // Every timer of this host runs on `timers` (tests pass fake ones and advance them, with `monotonic` and the Store's
   // clock moved in step); the names shadow the globals for this whole function.
@@ -323,9 +323,10 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       // L5: a build that failed for a reason other than the lease gives the board back at once, so another host
       // (or this one's next open) needn't wait out the ttl. A lost lease is never released.
       // Then a host already watching the board is told (as after a clean stop), so it need not wait for its next poll.
-      if (!slot.leaseLost) { slot.announced = true; Promise.resolve().then(() => store.release(tenant, board, me, slot.epoch))   // flagged before the release, so close() never announces it twice
-        .then(() => { bus.publish(subjects.entries(tenant, board), { seq: 0, epoch: slot.epoch, cp: 0, released: true })?.catch?.(() => {}); })
-        .catch(e => log.warn("lease release after a failed build failed", { tenant, board, err: e })); }
+      // `releaseP` never rejects: close() waits for it, then announces only if this did not (a failed release leaves the announcing to close()).
+      if (!slot.leaseLost) slot.releaseP = Promise.resolve().then(() => store.release(tenant, board, me, slot.epoch))
+        .then(() => { slot.announced = true; bus.publish(subjects.entries(tenant, board), { seq: 0, epoch: slot.epoch, cp: 0, released: true })?.catch?.(() => {}); })
+        .catch(e => log.warn("lease release after a failed build failed", { tenant, board, err: e }));
       throw err;
     });
     slot.promise = p;
@@ -457,7 +458,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     if (w.attempting || closed || watches.get(w.key) !== w) return;
     clearTimeout(w.timer);
     w.attempting = true;
-    attempt(w).catch(err => log.error("takeover attempt failed", { tenant: w.tenant, board: w.board, err })).finally(() => { w.attempting = false; });
+    attempt(w).catch(err => log.error("takeover attempt failed", { tenant: w.tenant, board: w.board, err })).finally(() => { w.attempting = false; if (w.rerun) { w.rerun = false; attemptNow(w); } });   // an open found the cooldown over mid-attempt: once more, now
   }
   /**
    * One takeover attempt: ask the Store whether the lease is still live; if not, acquire it and build the room. Still
@@ -589,7 +590,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       const p = slots.get(key);
       if (p) { await p; return "held"; }
       const w = watches.get(key);
-      if (w) { w.wanted = perf(); if (cooling.has(key) && !isCooling(key)) { cooling.delete(key); attemptNow(w); } return "watching"; }   // the cooldown is over: this open is the retake, not the watch's next poll
+      if (w) { w.wanted = perf(); if (cooling.has(key) && !isCooling(key)) { cooling.delete(key); if (w.attempting) w.rerun = true; else attemptNow(w); } return "watching"; }   // the cooldown is over: this open is the retake, not the watch's next poll
       const r = await claimOnce(tenant, board, key);
       if (r?.held === undefined) return "held";
       watch(tenant, board, key, r.held);
@@ -632,6 +633,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       }
       for (const slot of held.values()) {
         stopLease(slot);
+        await slot.releaseP;
         if (slot.leaseLost) continue;
         try {
           await store.release(slot.tenant, slot.board, me, slot.epoch);

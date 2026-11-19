@@ -47,14 +47,14 @@ function fakeGateway(bus, id = "g-1") {
 function stallable(store, timers) {
   // build: "hang" stalls getCheckpoint and read; reads: "hang" stalls read only; acquire and lease: "hang" never answer (acquires counts calls);
   // cpDelay and appendDelay (virtual ms, need `timers`) make getCheckpoint / append answer late.
-  const s = { renew: "ok", append: "ok", held: [], renews: 0, build: "ok", reads: "ok", acquire: "ok", acquires: 0, lease: "ok", cpDelay: 0, appendDelay: 0 };
+  const s = { renew: "ok", append: "ok", held: [], renews: 0, build: "ok", reads: "ok", acquire: "ok", acquires: 0, lease: "ok", cpDelay: 0, appendDelay: 0, leaseDelay: 0 };
   const late = (ms, f) => new Promise(r => timers.setTimeout(r, ms)).then(f);
   s.store = {
     ...store,
     getCheckpoint: (...a) => (s.build === "hang" ? never() : s.cpDelay ? late(s.cpDelay, () => store.getCheckpoint(...a)) : store.getCheckpoint(...a)),
     read: (...a) => (s.build === "hang" || s.reads === "hang" ? never() : store.read(...a)),
     acquire: (...a) => { s.acquires++; return s.acquire === "hang" ? never() : store.acquire(...a); },
-    lease: (...a) => (s.lease === "hang" ? never() : store.lease(...a)),
+    lease: (...a) => (s.lease === "hang" ? never() : s.leaseDelay ? late(s.leaseDelay, () => store.lease(...a)) : store.lease(...a)),
     renew: (...a) => { s.renews++; return s.renew === "hang" ? never() : s.renew === "null" ? Promise.resolve(null) : store.renew(...a); },
     append: (...a) => { if (s.append === "hold") { s.held.push(a); return never(); } return s.appendDelay ? late(s.appendDelay, () => store.append(...a)) : store.append(...a); },
   };
@@ -656,6 +656,23 @@ test("N1 close() while a failed build's release is still in flight announces `re
   } finally { await bus.close(); await raw.close(); }
 });
 
+test("N1b a failed build whose release itself failed: close() releases again and announces `released` once", async () => {
+  const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus(), seen = [];
+  let releases = 0;
+  const store = { ...raw, async getCheckpoint() { throw new Error("store down"); }, release: async (...a) => { if (releases++ === 0) throw new Error("release down"); return raw.release(...a); } };
+  bus.subscribe(subjects.entries("t-cf", "b-cf"), m => { if (m?.released) seen.push(m); });
+  const h = roomHost({ store, bus, leaseTtlMs: 60_000, heartbeatMs: 60_000 });
+  try {
+    await expect(h.open("t-cf", "b-cf")).rejects.toThrow("store down");     // its own release fails: nothing announced yet
+    await bus.flush();
+    expect(seen).toEqual([]);
+    await h.close(); await bus.flush();
+    expect(releases).toBe(2);
+    expect(seen).toEqual([{ seq: 0, epoch: 1, cp: 0, released: true }]);
+    expect((await raw.lease("t-cf", "b-cf"))?.live).toBe(false);
+  } finally { await bus.close(); await raw.close(); }
+});
+
 test("close() after a board's build failed: the lease is released once, `released` is published (cp 0), and nothing is logged as a failed release", async () => {
   const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus(), lines = [];
   const log = createLogger({ write: l => lines.push(JSON.parse(l)), level: "debug" });
@@ -924,6 +941,31 @@ describe("stuck host (#65)", () => {
       await V.advance(1_000);
       await g.ack("c1", "a:1");
       expect(lostWhy()).toEqual([]);
+    } finally { await A.close(); await raw.close(); await bus.close(); }
+  }, 20000);
+
+  test("a cooldown that ends while the watch's own attempt is running: that attempt reruns once when it finishes, so the retake is not left to the ttl/3 poll", async () => {
+    const { bus, V, raw, host, lostWhy } = vworld();
+    const sa = stallable(raw, V.timers);
+    const ttl = 9_000;
+    const A = host({ store: sa.store, holder: "h-a", leaseTtlMs: ttl, heartbeatMs: 200, appendTimeoutMs: 600_000, stuckMs: 3_000, now: () => 5 });
+    try {
+      await A.open(T, B);
+      const g = fakeGateway(bus);
+      g.hello("c0", "a"); await g.welcome("c0");
+      sa.append = "hold"; g.op("c0", "a", 1); await bus.flush();
+      expect(await V.until(() => lostWhy().length > 0, 10_000, 50)).not.toBe(null);
+      sa.append = "ok";
+      const stopAt = V.now(), epoch = (await raw.lease(T, B)).epoch;
+      expect(await A.open(T, B)).toBe("watching");                               // the cooldown (9,180 ms) is on: a watch starts
+      await V.advance(9_100 - (V.now() - stopAt));
+      sa.leaseDelay = 400;                                                        // the next attempt's lease read is slow: it is still running when the cooldown ends
+      await bus.publish(subjects.entries(T, B), { seq: 0, epoch: epoch + 1, cp: 0, released: true });   // wakes the watch's attempt (the Store still decides)
+      await V.advance(100);                                                       // 9,200 ms: the cooldown is over, the attempt is mid-read
+      expect(A.stats().rooms).toBe(0);
+      expect(await A.open(T, B)).toBe("watching");                                // finds the cooldown over and the attempt running: marks a rerun
+      sa.leaseDelay = 0;
+      expect(await V.until(() => A.stats().rooms === 1, 1_000, 50)).not.toBe(null);   // well inside the ttl/3 (3,000 ms) poll
     } finally { await A.close(); await raw.close(); await bus.close(); }
   }, 20000);
 

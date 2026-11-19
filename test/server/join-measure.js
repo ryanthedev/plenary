@@ -66,7 +66,7 @@ export async function buildBoard(r, { shapes, perOp = 100, edits = 0, make = nul
   await until(() => {
     const f = r.server.gateway.feed(r.ids.tenant, r.ids.board);
     // Folds are taken in steps and chain: wait until none runs or is due (the checkpoint is as new as the policy makes it), then for the feed.
-    return room.resolved === n && !room.folder.active && !room.writing && !room.checkpointDue() && f && f.seq === n && f.base === room.savedSeq;
+    return room.resolved === n && !room.status().folding && !room.status().writing && !room.checkpointDue() && f && f.seq === n && f.base === room.savedSeq;
   }, "the folds to settle and the feed to catch up with the room's newest checkpoint", 30_000);
   const feed = r.server.gateway.feed(r.ids.tenant, r.ids.board);
   await w.close();

@@ -89,7 +89,7 @@ test("DW: a fold begun while entries are still unresolved holds only resolved st
 });
 
 test("backpressure: no second fold starts while one runs or its write is unsettled", async () => {
-  const m = manual(); let release; const writes = [];
+  const m = manual(); const writes = [];
   const log = new MemoryLog(); log.putCheckpoint = cp => new Promise(r => writes.push({ cp, r }));
   const d = direct(log, { foldBytes: 1, foldUnits: 1e9, schedule: m.schedule });
   const a = d.join("ua", "editor", "a");
@@ -105,7 +105,6 @@ test("backpressure: no second fold starts while one runs or its write is unsettl
   expect(d.room.heartbeat().cp).toBe(writes[0].cp.seq);
   a.op(5, "board", { elements: [rect("e")] });
   expect(m.q.length).toBe(1);                                // settled: the next fold may begin
-  release = null; expect(release).toBe(null);
 });
 
 test("DW: a fold in progress when the room stops is abandoned: no checkpoint is written and no step runs it", () => {
@@ -133,12 +132,13 @@ test("checkpoint() finishes a fold in progress, then folds to the room's current
   expect(d.room.folder.active).toBe(false);
 });
 
-test("a fold that throws is reported, dropped, and the next one rebuilds its shadow from the checkpoint", () => {
+test("a fold that throws is reported, dropped with its shadow, and the next one starts from the checkpoint", () => {
   const m = manual(), reports = [], d = direct(undefined, { auto: false, foldUnits: 4, schedule: m.schedule, report: (w, x) => reports.push(w) });
   const a = d.join("ua", "editor", "a");
   for (let i = 1; i <= 5; i++) a.op(i, "board", { elements: [rect(`e${i}`)] });
-  expect(d.room.folder.shadow).toBe(null);   // the shadow is built by the first job's first step
+  expect(d.room.folder.shadow).toBe(null);
   d.room.startCheckpoint(); m.run();
+  expect(d.room.folder.shadow).not.toBe(null);   // alive while its job runs
   d.room.folder.shadow.applyEntry = () => { throw new Error("boom"); };
   m.drain();
   expect(reports).toContain("checkpoint-failed");
@@ -185,7 +185,7 @@ for (const mb of [10, 30]) test(`DW: a ${mb} MB board's fold takes bounded steps
   console.log(`fold of ${mb} MB (${elements} elements): ${steps} steps, max step ${worst.toFixed(2)} ms wall (cap ${FOLD_STEP_UNITS} units)`);
 });
 
-test("a fold carries records, note authors, the op-id table and appState, across two jobs (the shadow advances, never restarts)", () => {
+test("a fold carries records, note authors, the op-id table and appState, across two jobs (each job's shadow is built from the last checkpoint)", () => {
   const m = manual(), d = direct(undefined, { auto: false, foldUnits: 3, schedule: m.schedule });
   const opts = { board: "b1", tenant: "t1" };
   const a = d.join("ua", "editor", "a"), n = d.join("ub", "annotator", "b");
@@ -200,14 +200,13 @@ test("a fold carries records, note authors, the op-id table and appState, across
   expect(first.records.threads.map(t => t.id)).toEqual(["t1"]);
   expect(first.noteAuthor).toEqual([["note1", "ub"]]);
   expect(fromCp(d.log, first, opts)).toEqual(stateAt(d.log, 4, opts));
-  const shadow = d.room.folder.shadow;
   a.op(4, "records", { do: "reply", id: "c2", thread: "t1", text: "again" });
   a.op(5, "records", { do: "react", id: "c2", emoji: "+1", on: true });
   a.op(6, "board", { elements: [rect("r1", { version: 9, x: 5 })] });
   n.op(2, "notes", { elements: [rect("note2")] });
   d.room.startCheckpoint(); m.drain();
   const second = d.log.checkpoints.at(-1);
-  expect(d.room.folder.shadow).toBe(shadow);                  // advanced by the tail, not rebuilt
+  expect(d.room.folder.shadow).toBe(null);                    // the shadow lives for one job: nothing resident between folds
   expect(second.seq).toBe(8);
   expect(second.records.threads[0].comments.map(c => c.id)).toEqual(["t1", "c2"]);
   expect(fromCp(d.log, second, opts)).toEqual(stateAt(d.log, 8, opts));
@@ -225,4 +224,71 @@ test("ops that resolve while a fold runs make the next fold due the moment it en
   expect(d.log.checkpoints.length).toBeGreaterThan(1);
   expect(d.room.folder.active).toBe(false);
   expect(m.q.length).toBe(0);
+});
+
+test("a checkpoint() call mid-job leaves a stale scheduled step: it does nothing, and only one chain ever steps a job", () => {
+  const m = manual(), d = direct(undefined, { auto: false, foldUnits: 4, schedule: m.schedule });
+  const a = d.join("ua", "editor", "a");
+  for (let i = 1; i <= 6; i++) a.op(i, "board", { elements: [rect(`e${i}`)] });
+  d.room.startCheckpoint(); m.run();
+  expect(m.q.length).toBe(1);
+  const stale = m.q[0];
+  d.room.checkpoint();                                        // takes the job over and finishes it
+  const steps = d.room.folder.steps;
+  m.q.length = 0; stale();
+  expect(d.room.folder.steps).toBe(steps);                    // the stale turn neither stepped nor rescheduled
+  expect(m.q.length).toBe(0);
+  d.room.startCheckpoint();                                   // a new job: its chain is the only one
+  expect(m.q.length).toBe(1);
+  stale();
+  expect(m.q.length).toBe(1);
+});
+
+test("an abort mid-adopt drops the shadow: the next job adopts the checkpoint afresh and is exact", () => {
+  const m = manual(), d = direct(undefined, { auto: false, foldUnits: 2, schedule: m.schedule });
+  const a = d.join("ua", "editor", "a");
+  for (let i = 1; i <= 8; i++) a.op(i, "board", { elements: [rect(`e${i}`)] });
+  d.room.checkpoint();
+  for (let i = 9; i <= 12; i++) a.op(i, "board", { elements: [rect(`e${i}`)] });
+  d.room.startCheckpoint(); m.run();                           // mid-adopt (budget 2 units): half a shadow
+  d.room.folder.abort();
+  expect(d.room.folder.shadow).toBe(null);
+  d.room.startCheckpoint(); m.drain();
+  expect(d.room.base.seq).toBe(12);
+  expect(fromCp(d.log, d.log.checkpoints.at(-1), { board: "b1", tenant: "t1" })).toEqual(stateAt(d.log, 12, { board: "b1", tenant: "t1" }));
+});
+
+test("DW: the step cap holds in BYTES: big-element entries (600 KB strokes) and a thousand clients' op-id table each stay under the cap", () => {
+  const m = manual(), d = direct(undefined, { auto: false, schedule: m.schedule });
+  const pad = "s".repeat(600_000);
+  const a = d.join("ua", "editor", "a");
+  for (let i = 1; i <= 20; i++) a.op(i, "board", { elements: [rect(`stroke${i}`, { text: pad })] });
+  for (let c = 0; c < 1000; c++) { const j = d.join("u" + c, "editor", "k" + c); j.op(1, "board", { elements: [rect(`k${c}`)] }); }
+  d.room.checkpoint();                                         // a base with 1,020 op-id records ...
+  for (let i = 21; i <= 40; i++) a.op(i, "board", { elements: [rect(`stroke${i}`, { text: pad })] });   // ... and a tail of 12 MB
+  d.room.startCheckpoint(); m.drain();
+  const cap = FOLD_STEP_UNITS + 16 + 600_000 / 32;             // one entry past the budget is the most a step can overshoot by
+  expect(d.room.folder.maxUnits).toBeLessThanOrEqual(cap);
+  expect(d.room.folder.maxUnits).toBeGreaterThan(FOLD_STEP_UNITS);   // (a 600 KB entry alone is over a step: it is a step of its own)
+  expect(d.room.folder.steps).toBeGreaterThan(20);             // 12 MB of tail was spread over many steps, not one
+  expect(fromCp(d.log, d.log.checkpoints.at(-1), { board: "b1", tenant: "t1" })).toEqual(stateAt(d.log, 1040, { board: "b1", tenant: "t1" }));
+});
+
+test("a write that never answers: `writing` stays up (no fold starts), then the host's timeout fails it and folds resume", async () => {
+  const m = manual(), log = new MemoryLog(); let hang = true; const writes = [];
+  log.putCheckpoint = cp => (hang ? new Promise((_, rej) => writes.push(rej)) : MemoryLog.prototype.putCheckpoint.call(log, cp));
+  const reports = [];
+  const d = direct(log, { foldBytes: 1, foldUnits: 1e9, schedule: m.schedule, report: w => reports.push(w) });
+  const a = d.join("ua", "editor", "a");
+  a.op(1, "board", { elements: [rect("a")] }); m.drain();
+  for (let i = 2; i <= 6; i++) a.op(i, "board", { elements: [rect("b" + i)] });
+  expect(d.room.status().writing).toBe(1);
+  expect(m.q.length).toBe(0);                                  // while the write hangs no fold is scheduled
+  hang = false; writes[0](new Error("the store did not answer in time"));   // what the host's timeout does
+  await new Promise(r => setImmediate(r));
+  expect(reports).toContain("checkpoint-failed");
+  expect(d.room.status().writing).toBe(0);
+  expect(m.q.length).toBe(1);                                  // the failure cleared the backpressure: the due fold started
+  m.drain();
+  expect(d.room.base.seq).toBe(6);
 });

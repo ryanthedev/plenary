@@ -30,3 +30,12 @@ test("encodeSliced yields between slices of a big checkpoint-shaped value, and e
   expect(yields).toBe(Math.floor(text.length / (64 * 1024)));   // one yield per sliceChars (a deterministic step count)
   expect(yields).toBeGreaterThan(5);
 });
+
+test("encodeSliced cuts a thread of many big comments into pieces (records are walked deeper than elements)", async () => {
+  const comments = Array.from({ length: 400 }, (_, i) => ({ id: "c" + i, by: "u", text: "t".repeat(10_000), reactions: {} }));
+  const cp = { seq: 1, records: { threads: [{ id: "t1", anchor: { x: 1 }, comments }] } };
+  let yields = 0;
+  const text = await encodeSliced(cp, { yieldNow: async () => { yields++; }, sliceChars: 256 * 1024 });
+  expect(text).toBe(JSON.stringify(cp));
+  expect(yields).toBeGreaterThanOrEqual(12);                   // 4 MB in one piece would have been 1 yield at most
+});

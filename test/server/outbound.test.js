@@ -102,8 +102,8 @@ for (const shape of ["a snapshot bigger than the share", "a tail bigger than the
     // join from a snapshot of the whole board.
     if (phase === "after the restart") expect(peek.room.base.seq).toBe(10);
     else if (fold === 1 * MB) {
-      await until(() => !peek.room.folder.active && !peek.room.writing, "the folds to settle");
-      expect(peek.room.base.seq).toBeGreaterThan(0); expect(peek.room.base.seq).toBeLessThan(10);
+      await until(() => !peek.room.status().folding && !peek.room.status().writing, "the folds to settle");
+      expect(peek.room.base.seq).toBeGreaterThanOrEqual(5); expect(peek.room.base.seq).toBeLessThanOrEqual(10);   // a snapshot of at least half the board
     } else expect(peek.room.tail.length).toBe(10);
     // The owner, and three tabs of one viewer, all at the same moment, all from scratch.
     const names = ["owner", "viewer", "viewer", "viewer"];
@@ -535,7 +535,7 @@ async function foldAll(r) {
   expect(room.base.seq).toBe(room.seq);
 }
 /** The room's checkpoint is written and acknowledged (so the next heartbeat names it) and no fold of its own still runs. */
-const durable = room => until(() => !room.folder.active && !room.writing && room.savedSeq === room.base.seq, "the checkpoint to be durable");
+const durable = room => until(() => !room.status().folding && !room.status().writing && room.savedSeq === room.base.seq, "the checkpoint to be durable");
 
 /**
  * The 24 x 990 KB board that five tests need, folded into one snapshot: written once per file, then each test gets a

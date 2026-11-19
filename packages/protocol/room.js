@@ -49,12 +49,12 @@ export class Room {
    *   welcome carries it. Omitted: the log's openEpoch() if it has one, else 1. `rules`: per rules version { W, H, every }; only tests pass it. `auto`: checkpoint
    *   by itself (§ Recovery, "When"); `foldBytes`: its byte trigger (default CHECKPOINT_BYTES). `schedule(fn)`: runs `fn` on a later turn of
    *   the host's event loop (a port the host injects; this package has no timers): an automatic checkpoint is then taken in
-   *   steps of about `foldUnits` work each (§ Recovery, "Incremental fold"). Omitted: it is taken whole, in one call. `report`: errors worth logging.
+   *   steps of about `foldUnits` work each (§ Recovery, "Incremental fold"). Omitted: it is taken whole, in one call. `measure` (default true): keep the size bookkeeping (§ Limits); the fold's shadow turns it off. `report`: errors worth logging.
    */
-  constructor({ board, tenant, log, now = Date.now, epoch, rules = RULES, auto = true, foldBytes = CHECKPOINT_BYTES, schedule = null, foldUnits = FOLD_STEP_UNITS, report = () => {} }) {
+  constructor({ board, tenant, log, now = Date.now, epoch, rules = RULES, auto = true, foldBytes = CHECKPOINT_BYTES, schedule = null, foldUnits = FOLD_STEP_UNITS, measure = true, report = () => {} }) {
     // A host passes the epoch it opened; without one, open the log's next (so two builds never share one), else 1.
     if (epoch === undefined) epoch = typeof log?.openEpoch === "function" ? log.openEpoch() : 1;
-    Object.assign(this, { board, tenant, log, now, epoch, rules, auto, foldBytes, schedule, foldUnits, report });
+    Object.assign(this, { board, tenant, log, now, epoch, rules, auto, foldBytes, schedule, foldUnits, measure, report });
     this.conns = new Set();
     this.queue = [];          // accepted, not yet handed to an append: [{ entry, c, key, counter, horizon }]
     this.inflight = null;     // the batch in the one append in flight
@@ -68,10 +68,11 @@ export class Room {
     this.tailSizes = [];      // chars of each tail entry's op, parallel to `tail`
     this.tailChars = 0;
     this.savedSeq = 0;        // the newest checkpoint known durable: rebuilt from, or its write acknowledged (heartbeat `cp`)
+    this.turnId = 0;          // the scheduled chain that owns the fold job; checkpoint() bumps it
     this.writing = 0;         // checkpoint writes not yet settled: no new fold starts while one is (backpressure)
     // The incremental fold (fold.js) and its shadow room. State ownership: the shadow and the job belong to the Folder;
     // the room reads only the finished checkpoint it returns.
-    this.folder = new Folder({ blank: () => new Room({ board, tenant, log: null, now, epoch, rules, auto: false }), base: () => this.base, tail: () => this.tail });
+    this.folder = new Folder({ blank: () => new Room({ board, tenant, log: null, now, epoch, rules, auto: false, measure: false }), base: () => this.base, tail: () => this.tail, sizes: () => this.tailSizes });
   }
 
   // ---- state: load, fold, apply ----
@@ -120,7 +121,7 @@ export class Room {
       if (!doc) throw fail("corrupt-log", `entry ${e.seq} names an unknown stream`);
       for (const el of e.op.elements ?? []) {
         const cur = doc.getAny(el.id);
-        if (wins(el, cur)) { this.chars[e.stream] += chars(el) - (cur ? chars(cur) : 0); doc.apply({ elements: [el] }); }
+        if (wins(el, cur)) { if (this.measure) this.chars[e.stream] += chars(el) - (cur ? chars(cur) : 0); doc.apply({ elements: [el] }); }
         // An author outlives its note's tombstone, so no one can revive and claim another's note.
         if (e.stream === "notes" && !this.noteAuthor.has(el.id)) this.noteAuthor.set(el.id, e.by);
       }
@@ -219,6 +220,7 @@ export class Room {
    */
   checkpoint() {
     if (this.stopped) return null;
+    this.turnId++;                      // a step scheduled for a job this call finishes is stale
     this.folder.begin(this.resolved);   // a no-op if a job runs; its seq is the one it began at
     const cp = this.folder.step(Infinity);
     this.adoptCheckpoint(cp);
@@ -233,10 +235,14 @@ export class Room {
    */
   startCheckpoint() {
     if (this.stopped || this.folder.active) return;
-    if (!this.schedule) { this.checkpoint(); return; }
+    if (!this.schedule) {
+      try { this.checkpoint(); } catch (err) { this.report("checkpoint-failed", { board: this.board, seq: this.resolved, err }); }
+      return;
+    }
     this.folder.begin(this.resolved);
+    const id = ++this.turnId;
     const turn = () => {
-      if (!this.folder.active) return;   // a checkpoint() finished it
+      if (id !== this.turnId || !this.folder.active) return;   // a checkpoint() took the job over: this chain is stale
       if (this.stopped) { this.folder.abort(); return; }   // abandoned: a failed or taken-over room writes nothing more
       let cp;
       try { cp = this.folder.step(this.foldUnits); }
@@ -247,7 +253,7 @@ export class Room {
   }
 
   /** A job or a write just ended: ops resolved meanwhile may already make the next fold due (nothing else would look until the next op). */
-  refold() { if (this.auto && !this.stopped && this.checkpointDue()) this.startCheckpoint(); }
+  refold() { if (this.auto && !this.stopped && this.checkpointDue()) this.startCheckpoint(); }   // never throws: startCheckpoint reports
 
   /** A fold finished at cp.seq: it is the new base (the tail it covers goes), and the Store keeps it. */
   adoptCheckpoint(cp) {
@@ -290,7 +296,8 @@ export class Room {
    * A read-only snapshot of where the room stands, for a host (p-audit F14: a host reads this, never the fields).
    * inflight: entries in the append in flight (0 = none); queued: accepted, not yet handed to an append;
    * unresolvedCount: entries accepted and not yet durable; tailChars / stateChars: the kept log's size and the
-   * state's (board + notes + records, as the checkpoint rule weighs them); held: answers waiting on unresolved entries.
+   * state's (board + notes + records, as the checkpoint rule weighs them); held: answers waiting on unresolved entries;
+   * folding: a checkpoint job is running; writing: checkpoint writes not yet settled.
    */
   status() {
     let unresolvedCount = 0;
@@ -298,7 +305,7 @@ export class Room {
     return {
       inflight: this.inflight ? this.inflight.length : 0, queued: this.queue.length, unresolvedCount,
       tailChars: this.tailChars, stateChars: this.chars.board + this.chars.notes + this.records.chars,
-      resolved: this.resolved, seq: this.seq, baseSeq: this.base.seq, held: this.held.length, stopped: this.stopped,
+      resolved: this.resolved, seq: this.seq, baseSeq: this.base.seq, held: this.held.length, stopped: this.stopped, folding: this.folder.active, writing: this.writing,
     };
   }
 

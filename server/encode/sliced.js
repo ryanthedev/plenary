@@ -4,8 +4,10 @@
 // adapter's business. Shared adapter support (server/encode/ is in the architecture test's SUPPORT_DIRS), so the Store adapters
 // use it without importing each other or the core. Only data JSON.stringify would treat plainly is expected (no toJSON, no cycles): a checkpoint.
 
-/** Containers below this depth are walked; deeper ones are leaves, stringified whole (cp > streams > board > elements > one element). */
-const WALK_DEPTH = 4;
+/** Containers below this depth are walked; deeper ones are leaves, stringified whole (cp > streams > board > elements > one element).
+ *  Under a `records` key the limit is RECORDS_EXTRA deeper: a thread (cp > records > threads > thread) holds up to 500 comments,
+ *  which would be one piece of several MB; walked, each comment is its own piece. */
+const WALK_DEPTH = 4, RECORDS_EXTRA = 2;
 /** Chars encoded between two chances to yield (about a millisecond of stringify). */
 const SLICE_CHARS = 256 * 1024;
 
@@ -17,13 +19,13 @@ const SLICE_CHARS = 256 * 1024;
 export async function encodeSliced(value, { yieldNow = () => new Promise(r => setImmediate(r)), sliceChars = SLICE_CHARS } = {}) {
   let out = "", pending = 0;
   const emit = async text => { out += text; pending += text.length; if (pending >= sliceChars) { pending = 0; await yieldNow(); } };
-  const container = (v, depth) => v !== null && typeof v === "object" && typeof v.toJSON !== "function" && depth < WALK_DEPTH;
-  const walk = async (v, depth) => {   // v is a container (see above)
+  const container = (v, depth, limit) => v !== null && typeof v === "object" && typeof v.toJSON !== "function" && depth < limit;
+  const walk = async (v, depth, limit) => {   // v is a container (see above)
     if (Array.isArray(v)) {
       await emit("[");
       for (let i = 0; i < v.length; i++) {
         if (i) await emit(",");
-        if (container(v[i], depth + 1)) await walk(v[i], depth + 1); else await emit(JSON.stringify(v[i]) ?? "null");
+        if (container(v[i], depth + 1, limit)) await walk(v[i], depth + 1, limit); else await emit(JSON.stringify(v[i]) ?? "null");
       }
       return emit("]");
     }
@@ -31,13 +33,14 @@ export async function encodeSliced(value, { yieldNow = () => new Promise(r => se
     let first = true;
     for (const k of Object.keys(v)) {
       const x = v[k], key = (first ? "" : ",") + JSON.stringify(k) + ":";
-      if (container(x, depth + 1)) { await emit(key); await walk(x, depth + 1); }
+      const lim = limit + (depth === 0 && k === "records" ? RECORDS_EXTRA : 0);
+      if (container(x, depth + 1, lim)) { await emit(key); await walk(x, depth + 1, lim); }
       else { const s = JSON.stringify(x); if (s === undefined) continue; await emit(key + s); }   // undefined, functions and symbols leave no trace
       first = false;
     }
     return emit("}");
   };
-  if (!container(value, 0)) return JSON.stringify(value);
-  await walk(value, 0);
+  if (!container(value, 0, WALK_DEPTH)) return JSON.stringify(value);
+  await walk(value, 0, WALK_DEPTH);
   return out;
 }

@@ -265,7 +265,7 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
           ON CONFLICT (tenant, board, seq) DO NOTHING`, [tenant, board, cp.seq, data]);
         await tx.unsafe(`DELETE FROM ${C} WHERE tenant = $1 AND board = $2 AND seq NOT IN
           (SELECT seq FROM ${C} WHERE tenant = $1 AND board = $2 ORDER BY seq DESC LIMIT $3)`, [tenant, board, keepCheckpoints]);
-      });
+      }, leaseLockTimeoutMs);   // bounded lock wait (the fence's FOR SHARE on the lease row): a stuck write is "unavailable", never forever
     },
 
     /** The checkpoint with the highest seq; with `beforeSeq`, the highest below it (to step back past a bad one). */

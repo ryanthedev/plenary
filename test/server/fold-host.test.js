@@ -40,10 +40,10 @@ const pgMaker = () => {
 
 for (const [name, maker] of [["sqlite", sqliteMaker], ["postgres", pgMaker]]) describe.skipIf(name === "postgres" && !pgUrl)(`incremental fold on the host (${name})`, () => {
   /** A host whose fold steps wait in `q` for the test, a board with 6 acked ops, and one fold begun but not run. */
-  async function started(wrap = s => s) {
+  async function started(wrap = s => s, hostOpts = {}) {
     const m = maker(), store = wrap(await m.open()), bus = memoryBus(), q = [], lines = [];
     const log = createLogger({ write: l => lines.push(JSON.parse(l)), level: "debug" });
-    const host = roomHost({ store, bus, log, holder: "h-a", leaseTtlMs: 30_000, tailFoldBytes: 1, foldUnits: 4, schedule: fn => q.push(fn) });
+    const host = roomHost({ store, bus, log, holder: "h-a", leaseTtlMs: 30_000, tailFoldBytes: 1, foldUnits: 4, schedule: fn => q.push(fn), ...hostOpts });
     await host.open(T, B);
     const g = gateway(bus);
     await g.hello(); await g.welcome();
@@ -94,6 +94,20 @@ for (const [name, maker] of [["sqlite", sqliteMaker], ["postgres", pgMaker]]) de
       await closing;
       expect(puts).toBe(0);                                      // counted at the call: no write was even attempted
       expect(await store.getCheckpoint(T, B)).toBe(null);
+    } finally { await done(); }
+  }, 30_000);
+
+  test("a checkpoint write that never answers is failed by the host's timeout, reported, and the next fold goes ahead", async () => {
+    let hang = true;
+    const { store, host, q, g, lines, done } = await started(real => ({ ...real, putCheckpoint: (...a) => (hang ? new Promise(() => {}) : real.putCheckpoint(...a)) }), { checkpointTimeoutMs: 150 });
+    try {
+      drain(q);                                                  // the fold ends in a write the Store never answers
+      expect((await host.peek(T, B)).room.status().writing).toBe(1);
+      await until(() => lines.some(l => /checkpoint-failed/.test(l.msg)), "the hung write to be failed and reported", 10_000);
+      expect((await host.peek(T, B)).room.status().writing).toBe(0);
+      hang = false;
+      await g.op(7); await g.ack(7);
+      await until(async () => { drain(q); return (await store.getCheckpoint(T, B)) !== null; }, "a later fold to be written", 10_000);
     } finally { await done(); }
   }, 30_000);
 

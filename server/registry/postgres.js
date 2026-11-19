@@ -187,10 +187,6 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       if (!(await missing(tx, s, ["reg_boards"])).length && (await missing(tx, s, ["reg_spaces"])).length)
         throw Object.assign(new Error(`postgres registry: schema "${s}" has reg_boards but no reg_spaces: it is from an older version. Reset the store: drop the schema "${s}" (every table in it, never one), and the next start-up recreates it`), { code: "old-format" });
       await assertShapes(tx, s, registryTables(s));   // the old-format rule, before anything is created
-      // A board in no Space (pre-#90) is old-format too.
-      if (!(await missing(tx, s, ["reg_boards"])).length && ((await missing(tx, s, ["reg_board_spaces"])).length
-        || (await tx.unsafe(`SELECT 1 FROM "${s}".reg_boards b WHERE NOT EXISTS (SELECT 1 FROM "${s}".reg_board_spaces x WHERE x.board = b.id) LIMIT 1`)).length))
-        throw Object.assign(new Error(`postgres registry: schema "${s}" holds a board that is in no Space: it is from an older version. Reset the store: drop the schema "${s}" (every table in it, never one), and the next start-up recreates it`), { code: "old-format" });
       await migrate(tx, s, registryTables(s));
       const noIndex = await missing(tx, s, Object.keys(REGISTRY_INDEXES));
       if (noIndex.length) await tx.unsafe(noIndex.map(name => `CREATE INDEX ${name} ON "${s}".${REGISTRY_INDEXES[name]}`).join(";\n"));
@@ -202,6 +198,9 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         const lack = noRight.map(m => `${m.p} on ${m.t}`).join(", ");
         throw Object.assign(new Error(`permission denied: this role lacks ${lack}`), { errno: DENIED });
       }
+      // A board in no Space (pre-#90) is old-format too. After the rights probe (a role without SELECT must read "denied"); the transaction rolls back any DDL above.
+      if ((await tx.unsafe(`SELECT 1 FROM "${s}".reg_boards b WHERE NOT EXISTS (SELECT 1 FROM "${s}".reg_board_spaces x WHERE x.board = b.id) LIMIT 1`)).length)
+        throw Object.assign(new Error(`postgres registry: schema "${s}" holds a board that is in no Space: it is from an older version. Reset the store: drop the schema "${s}" (every table in it, never one), and the next start-up recreates it`), { code: "old-format" });
     });
   } catch (err) {
     if (owned) await db.close();

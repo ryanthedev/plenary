@@ -37,7 +37,7 @@ class E extends N {
   removeEventListener(t, fn) { this.listeners[t] = (this.listeners[t] ?? []).filter(f => f !== fn); }
   fire(t, ev = {}) { const e = { target: this, currentTarget: this, button: 0, preventDefault() { this.defaultPrevented = true; }, stopPropagation() {}, ...ev }; for (const fn of this.listeners[t] ?? []) fn(e); return e; }
   click() { if (!this.disabled) this.fire("click"); }
-  focus() {} blur() {} setPointerCapture() {} setSelectionRange() {} select() {}
+  focus() { if (globalThis.document) globalThis.document.activeElement = this; } blur() {} setPointerCapture() {} setSelectionRange() {} select() {}
   after(n) { const p = this.parentNode; p.append(n); }
   contains(n) { for (let x = n; x; x = x.parentNode) if (x === this) return true; return false; }
   closest() { return null; }
@@ -49,13 +49,13 @@ class E extends N {
 }
 const IDS = ["topbar", "panel", "drawer", "timeline", "hudBL", "hudBC", "hudBR", "dock", "sheet", "dialogs", "overlays", "veil", "toast", "picker"];
 
-let frames, winL, page;
+let frames, winL, page, media, resizeCallbacks;
 // The globals this file stubs, put back afterwards so later files' fallbacks never see the stub page.
 const GLOBALS = ["document", "Node", "devicePixelRatio", "matchMedia", "ResizeObserver", "requestAnimationFrame", "addEventListener", "removeEventListener"];
 const saved = Object.fromEntries(GLOBALS.map(k => [k, Object.getOwnPropertyDescriptor(globalThis, k)]));
 afterAll(() => { for (const k of GLOBALS) { if (saved[k]) Object.defineProperty(globalThis, k, saved[k]); else delete globalThis[k]; } });
 function installPage() {
-  frames = []; winL = {};
+  frames = []; winL = {}; media = new Map(); resizeCallbacks = [];
   const body = new E("body"), main = new E("div"), canvasBox = new E("div"), board = new E("canvas"), ink = new E("textarea");
   main.className = "main"; body.append(main); main.append(canvasBox); canvasBox.append(board, ink);
   const byId = { canvas: canvasBox, board, ink };
@@ -70,13 +70,17 @@ function installPage() {
   };
   Object.assign(globalThis, {
     document: doc, Node: N, devicePixelRatio: 1,
-    matchMedia: () => ({ matches: false, addEventListener() {} }),
-    ResizeObserver: class { constructor(fn) { this.fn = fn; } observe() { this.fn([]); } },
+    matchMedia: query => {
+      if (!media.has(query)) media.set(query, { matches: false, listeners: [] });
+      const m = media.get(query);
+      return { get matches() { return m.matches; }, addEventListener: (type, fn) => { if (type === "change") m.listeners.push(fn); } };
+    },
+    ResizeObserver: class { constructor(fn) { this.fn = fn; resizeCallbacks.push(fn); } observe() { this.fn([]); } },
     requestAnimationFrame: fn => frames.push(fn),
     addEventListener: (t, fn) => { (winL[t] ??= []).push(fn); },
     removeEventListener: (t, fn) => { winL[t] = (winL[t] ?? []).filter(f => f !== fn); },
   });
-  page = { doc, byId, board };
+  page = { doc, byId, board, media };
   return page;
 }
 const fireWin = (t, ev = {}) => { for (const fn of winL[t] ?? []) fn({ preventDefault() {}, ...ev }); };
@@ -118,6 +122,7 @@ test("C-2/C-8: 60 frames of wheel panning and 100 incoming ops rebuild topbar, p
   rig = setup();
   const { S, bo, step, app, net } = rig;
   expect(S.role).toBe("presenter");
+  expect(page.byId.topbar.all().filter(e => e.tagName === "BUTTON" && /\btb\b/.test(e.className)).every(e => e.attrs["aria-label"] && e.attrs.title)).toBe(true);
   // A busy board: the other presenter has shapes; the notes drawer is open.
   drawRect(bo, 100, 100); step(2);
   app.ui.drawer = "notes"; app.setPanel({ type: "noop" }); step(2);
@@ -165,6 +170,172 @@ test("C-2/C-8: 60 frames of wheel panning and 100 incoming ops rebuild topbar, p
   drawRect(bo, 500, 500); step(20);                                         // a new shape: the layer count in the panel
   expect(delta(c0, counts()).panel).toBe(1);
   void net;
+});
+
+test("More menu exposes header actions and closes with Escape or an outside click", () => {
+  rig = setup({ collab: true });
+  const more = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More");
+  expect(more?.attrs["aria-haspopup"]).toBe("menu");
+  expect(more?.attrs["aria-expanded"]).toBe("false");
+  more.click();
+  expect(more.attrs["aria-expanded"]).toBe("true");
+  const menu = find(page.byId.topbar, e => e.attrs.role === "menu" && e.classList.contains("header-more-menu"));
+  expect(["Comments", "Notes", "Mermaid", "Export", "Side panel", "Light / dark"].every(label => menu.all().some(e => e.tagName === "BUTTON" && e.attrs["aria-label"] === label))).toBe(true);
+  expect(menu.all().filter(e => e.tagName === "BUTTON").every(e => e.attrs.role === "menuitem")).toBe(true);
+  menu.fire("keydown", { key: "Escape" });
+  expect(more.attrs["aria-expanded"]).toBe("false");
+  expect(page.doc.activeElement).toBe(more);
+  more.click();
+  page.doc.fire("click", { target: page.byId.panel });
+  expect(more.attrs["aria-expanded"]).toBe("false");
+});
+
+test("More menu closes when the desktop width media query changes", () => {
+  rig = setup();
+  const more = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More");
+  more.click();
+  expect(more.attrs["aria-expanded"]).toBe("true");
+  const query = "(min-width: 1024px) and (max-width: 1279px)";
+  const m = page.media.get(query);
+  m.matches = false;
+  for (const fn of m.listeners) fn({ matches: false });
+  rig.step();
+  expect(find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More").attrs["aria-expanded"]).toBe("false");
+});
+
+test("More menu follows menu keyboard navigation and restores focus after activation", () => {
+  rig = setup({ collab: true });
+  const more = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More");
+  more.fire("keydown", { key: "ArrowDown" });
+  const menu = find(page.byId.topbar, e => e.attrs.role === "menu" && e.classList.contains("header-more-menu"));
+  const items = menu.all().filter(e => e.attrs.role === "menuitem");
+  expect(page.doc.activeElement).toBe(items[0]);
+  expect(items.length).toBeGreaterThan(2);
+  items[0].focus(); menu.fire("keydown", { key: "ArrowDown" });
+  expect(page.doc.activeElement).toBe(items[1]);
+  items[1].focus(); menu.fire("keydown", { key: "End" });
+  expect(page.doc.activeElement).toBe(items.at(-1));
+  items.at(-1).focus(); menu.fire("keydown", { key: "Home" });
+  expect(page.doc.activeElement).toBe(items[0]);
+  items[0].focus(); menu.fire("keydown", { key: "ArrowUp" });
+  expect(page.doc.activeElement).toBe(items.at(-1));
+  items[0].focus(); menu.fire("keydown", { key: "Tab" });
+  expect(more.attrs["aria-expanded"]).toBe("false");
+  more.fire("keydown", { key: "Escape" });
+  expect(more.attrs["aria-expanded"]).toBe("false");
+  more.fire("keydown", { key: "ArrowDown" });
+  const notes = menu.all().find(e => e.attrs.role === "menuitem" && e.attrs["aria-label"] === "Notes");
+  notes.click();
+  rig.step(2);
+  const rebuiltMore = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More");
+  expect(rebuiltMore).not.toBe(more);
+  expect(page.doc.activeElement).toBe(rebuiltMore);
+  expect(more.attrs["aria-expanded"]).toBe("false");
+  expect(rig.app.ui.drawer).toBe("notes");
+});
+
+test("More menu carries focus across resize-driven topbar rebuilds after keyboard activation", () => {
+  rig = setup({ collab: true });
+  let more = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More");
+  more.focus();
+  more.fire("keydown", { key: "Enter" });
+  more.click(); // native button Enter activation
+  const comments = find(page.byId.topbar, e => e.attrs.role === "menuitem" && e.attrs["aria-label"] === "Comments");
+  comments.focus(); comments.click();
+  expect(rig.app.ui.drawer).toBe("comments");
+  rig.step(1); // rebuild after drawer activation, before the observer's second dirty pass
+  resizeCallbacks[0]([]);
+  rig.step(2);
+  more = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More");
+  expect(page.doc.activeElement).toBe(more);
+});
+
+test("topbar rebuild does not steal focus from the canvas", () => {
+  rig = setup({ collab: true });
+  page.board.focus();
+  rig.app.ui.drawer = "comments";
+  rig.step(2);
+  expect(page.doc.activeElement).toBe(page.board);
+});
+
+test("all collaboration emoji toolbar buttons have descriptive accessible labels", () => {
+  rig = setup({ collab: true });
+  const toolbarButtons = page.doc.body.all().filter(e => e.tagName === "BUTTON" && e.classList.contains("tb"));
+  expect(toolbarButtons.every(e => e.attrs["aria-label"])).toBe(true);
+  const emojiButtons = page.byId.hudBC.all().concat(page.byId.hudBR.all()).filter(e => e.tagName === "BUTTON" && e.classList.contains("tb"));
+  expect(emojiButtons.map(e => e.attrs["aria-label"])).toEqual([
+    "React with thumbs up", "React with heart", "React with laughing", "React with party popper",
+    "React with clapping hands", "React with surprised face", "More emotes", "Emotes",
+  ]);
+  const picker = find(page.doc.body, e => e.classList.contains("collab-picker"));
+  expect(picker.children.map(e => e.attrs["aria-label"])).toEqual([
+    "React with thumbs up", "React with heart", "React with laughing", "React with party popper",
+    "React with clapping hands", "React with surprised face", "React with folded hands", "React with fire",
+  ]);
+  const mermaid = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.textContent === "◇→");
+  expect(mermaid.attrs["aria-label"]).toBe("Insert Mermaid flowchart");
+});
+
+test("header Notes closes an already open drawer", () => {
+  rig = setup();
+  let notes = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "Notes");
+  rig.app.ui.drawer = "comments";
+  rig.step(2);
+  notes = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "Notes");
+  notes.click();
+  rig.step(2);
+  expect(rig.app.ui.drawer).toBeNull();
+  notes = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "Notes");
+  notes.click(); rig.step(2);
+  expect(rig.app.ui.drawer).toBe("notes");
+  notes = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "Notes");
+  notes.click(); rig.step(2);
+  expect(rig.app.ui.drawer).toBeNull();
+});
+
+test("six-digit viewer count remains available in the mounted header", () => {
+  rig = setup({ collab: true });
+  rig.net.broadcast({ t: "here", writerCount: 0, viewers: 100000 });
+  while (rig.net.step());
+  const watching = find(page.byId.topbar, e => e.classList.contains("watching"));
+  expect(watching.textContent).toBe("👁 100,000 viewers");
+  expect(page.byId.topbar.all().filter(e => e.classList.contains("av")).length).toBeGreaterThanOrEqual(2);
+});
+
+test("1280px header keeps its board name rule with a six-digit viewer count and three writers", () => {
+  rig = setup({ collab: true });
+  const cy = createSession({ join: () => rig.net.join(), token: "t-cy", board: "b1", client: "cy", user: "cy", clock: rig.net.clock });
+  cy.setSize(1200, 800);
+  rig.step(4);
+  rig.net.broadcast({ t: "here", writerCount: 3, viewers: 999999 });
+  while (rig.net.step());
+  rig.step(2);
+  const watching = find(page.byId.topbar, e => e.classList.contains("watching"));
+  expect(watching.textContent).toBe("👁 999,999 viewers");
+  expect(page.byId.topbar.all().filter(e => e.classList.contains("av")).length).toBeGreaterThanOrEqual(3);
+});
+
+test("phone dock uses visible Comments text in its accessible name", () => {
+  rig = setup({ collab: true });
+  const comments = find(page.byId.dock, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "Comments");
+  expect(comments.textContent).toBe("💬Comments");
+  expect(comments.attrs.title).toBe("Comments");
+  expect(page.byId.dock.all().filter(e => e.tagName === "BUTTON").every(e => e.attrs["aria-label"] && e.attrs.title === e.attrs["aria-label"])).toBe(true);
+});
+
+test("local drawing on an empty board does not move the view", () => {
+  rig = setup();
+  const { S, step } = rig;
+  const before = { ...S.eds.board.view };
+  S.setTool("freedraw");
+  S.pointerDown({ x: 40, y: 40 });
+  S.pointerMove({ x: 80, y: 60 });
+  step(4);
+  expect(S.eds.board.view).toEqual(before);
+  S.pointerUp({ x: 90, y: 70 });
+  step(4);
+  expect(S.eds.board.view).toEqual(before);
+  expect(S.eds.board.doc.live().length).toBeGreaterThan(0);
 });
 
 test("C-2: a local change that only bumps the Editor (undo, a panel style chip) still refreshes the part that shows it", () => {

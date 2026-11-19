@@ -1,11 +1,36 @@
 // Pure parts of the canvas chrome: role tables, key gating, pill text, panel model, export writers.
 import { test, expect } from "bun:test";
+import { readFileSync } from "node:fs";
 import { Editor, TOOLS } from "../../packages/core/editor.js";
 import { defaultPanel, applyPanel, panelSections } from "../../packages/core/panel.js";
 import { uiRole, toolsFor, mayUseTool, streamFor, viewKey, clipboardKey, pillFor } from "../../web/core/roles.js";
 import { propsModel, availableFor, STYLE_ROWS, loadLibrary, saveLibrary } from "../../web/adapters/dom/panel.js";
 import { memoryStore } from "../../web/adapters/storage/memory.js";
 import { toSvg, exportSvg, paintPng } from "../../web/adapters/dom/export.js";
+
+test("header ellipsis rules cover 1024, 1279, and 1280 pixel desktop widths", () => {
+  const css = readFileSync(new URL("../../web/style.css", import.meta.url), "utf8");
+  expect(css).toMatch(/\.board-name\s*\{[^}]*min-width:\s*56px[^}]*overflow:\s*hidden[^}]*text-overflow:\s*ellipsis[^}]*flex:\s*0 1 auto/s);
+  expect(css).toMatch(/\.watching\s*\{[^}]*max-width:\s*150px[^}]*overflow:\s*hidden[^}]*text-overflow:\s*ellipsis[^}]*flex:\s*0 1 auto/s);
+  expect(css).toMatch(/\.topbar \.board-name\s*\{[^}]*max-width:\s*clamp\(56px, 12vw, 150px\)/s);
+  expect(css).toMatch(/\.watching\s*\{[^}]*max-width:\s*96px/s);
+  expect(css).toMatch(/\.header-actions\s*\{[^}]*flex-shrink:\s*0/s);
+  expect(css).toMatch(/\.watching\s*\{[^}]*min-width:\s*0[^}]*overflow:\s*hidden[^}]*text-overflow:\s*ellipsis[^}]*flex:\s*0 1 auto/s);
+  expect(css).toMatch(/\.collab-pop\s*\{[^}]*overflow-y:\s*auto/s);
+  expect(css).toMatch(/\.collab-pop > header, \.collab-pop > \.reply\s*\{[^}]*flex-shrink:\s*0/s);
+  expect(css).toMatch(/\.collab-pop \.body\s*\{[^}]*flex:\s*0 0 auto[^}]*min-height:\s*3\.5em[^}]*overflow:\s*visible/s);
+  expect(css).toMatch(/\.collab-pop\s*\{\s*background:[^}]*radial-gradient[^}]*rgba\(0,\s*0,\s*0[^}]*var\(--raised\)/s);
+  expect(css).toMatch(/@media\s*\(max-width:\s*360px\)[\s\S]*?\.dock \.tb\s*\{[^}]*font-size:\s*0/s);
+  expect(css).toMatch(/@media\s*\(max-width:\s*360px\)[\s\S]*?\.dock \.tb \.ic\s*\{[^}]*font-size:\s*18px/s);
+  expect(css).not.toMatch(/font-size:\s*7\.5px|letter-spacing:\s*-\.03em/);
+  expect(css).toMatch(/\.dock \.tb\s*\{[^}]*font-size:\s*8\.75px/s);
+  expect(css).toMatch(/@media\s*\(min-width:\s*600px\)\s*and\s*\(max-width:\s*1023px\)[\s\S]*?\.dock \.tb\s*\{[^}]*font-size:\s*10px/s);
+});
+
+test("canvas page has a page heading", () => {
+  const html = readFileSync(new URL("../../web/index.html", import.meta.url), "utf8");
+  expect(html).toMatch(/<h1\b[^>]*>\s*Plenary\s*<\/h1>/);
+});
 
 test("role → chrome, and the tools each gets", () => {
   expect(["owner", "editor", "annotator", "commenter", "viewer", null, "root"].map(uiRole)).toEqual(["presenter", "presenter", "annotator", "viewer", "viewer", "viewer", "viewer"]);

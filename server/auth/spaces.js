@@ -83,22 +83,27 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
    *  - At most ANNOUNCE.inflight scopes run at once and ANNOUNCE.perTenant of one Unit, so one Unit's burst never starves another's.
    *  - Scopes over the cap WAIT in a queue (deduped by scope) and start as slots free; none is dropped (past ANNOUNCE.queue a non-revocation is
    *    logged and left to the gateways' timed re-check, 60 s at most).
-   *  - A change that reduces access (a revocation) goes to the front of the queue and may use up to twice the global cap, never waiting on
-   *    a tenant's limit: a revoked viewer must lose live access promptly.
+   *  - A change that reduces access (a revocation) goes to the front of the queue and has its own budget: up to twice the global cap and
+   *    twice the per-Unit limit, so one Unit's flood of revocations can't starve another Unit's. It is never dropped. Its priority lasts for
+   *    the pass that follows the change only.
    */
   const running = new Map();                      // scope key -> entry (a pass is in progress)
   const queue = [];                               // entries waiting for a slot, front first
-  const perTenant = new Map();                    // Unit id -> running count
+  const perTenant = new Map();                    // Unit id -> running count of ordinary scopes
+  const perTenantRev = new Map();                 // Unit id -> running count of scopes that took a revocation slot
   let waiters = [];
   const idle = () => { if (!running.size && !queue.length) { const w = waiters; waiters = []; for (const f of w) f(); } };
-  const canStart = e => (e.revoke ? running.size < ANNOUNCE.inflight * 2 : running.size < ANNOUNCE.inflight && (perTenant.get(e.unit.id) ?? 0) < ANNOUNCE.perTenant);
+  const canStart = e => (e.revoke ? running.size < ANNOUNCE.inflight * 2 && (perTenantRev.get(e.unit.id) ?? 0) < ANNOUNCE.perTenant * 2
+    : running.size < ANNOUNCE.inflight && (perTenant.get(e.unit.id) ?? 0) < ANNOUNCE.perTenant);
+  const bump = (m, id, d) => { const n = (m.get(id) ?? 0) + d; if (n > 0) m.set(id, n); else m.delete(id); };
   function pump() {
     for (;;) {
       const i = queue.findIndex(canStart);
       if (i < 0) break;
       const [e] = queue.splice(i, 1);
       running.set(e.key, e);
-      perTenant.set(e.unit.id, (perTenant.get(e.unit.id) ?? 0) + 1);
+      e.slotRev = e.revoke;                       // the slot's class is fixed when it starts
+      bump(e.slotRev ? perTenantRev : perTenant, e.unit.id, 1);
       run(e);
     }
     idle();
@@ -106,13 +111,14 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
   async function run(e) {
     try {
       let n = 0;
-      do { e.dirty = false; await announceScope(e.unit, e.scope); } while (e.dirty && ++n < ANNOUNCE.repasses);
+      // `revoke` is cleared as each pass starts: a revoking change that lands DURING the pass sets it again (its re-pass keeps priority),
+      // while an ordinary change after a revoking pass does not inherit it.
+      do { e.dirty = false; e.revoke = false; await announceScope(e.unit, e.scope); } while (e.dirty && ++n < ANNOUNCE.repasses);
     } finally {
       // Same continuation as the last `e.dirty` read: nothing can set it between the check and the removal.
       running.delete(e.key);
-      const left = (perTenant.get(e.unit.id) ?? 1) - 1;
-      if (left > 0) perTenant.set(e.unit.id, left); else perTenant.delete(e.unit.id);
-      if (e.dirty) { e.dirty = false; queue.push(e); }       // it used its passes: back of the queue
+      bump(e.slotRev ? perTenantRev : perTenant, e.unit.id, -1);
+      if (e.dirty) { e.dirty = false; if (e.revoke) queue.unshift(e); else queue.push(e); }       // it used its passes: back of the queue (front if a revocation arrived meanwhile)
       pump();
     }
   }

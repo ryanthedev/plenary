@@ -433,6 +433,58 @@ describe("announcements: coalesced per scope, capped overall, the final state al
     opens.forEach(f => f()); await s.settled();
     expect(new Set(g.starts)).toEqual(new Set(sp.map(x => x.id)));
   });
+  test("revocations have a per-Unit budget: Unit A's flood of revocations does not delay Unit B's revocation", async () => {
+    const g = gated(), globex = await r.createTenant({ domain: "globex.com" });
+    const a = await newSpaces(ANNOUNCE.perTenant * 2 + 4), b = await r.createSpace({ tenant: globex.id, name: "B", generalRole: "viewer", owner: "google:gita" });
+    const opens = a.map(x => g.hold(x.id));
+    const s = spaceService({ registry: g.reg, tenancy: makeTenancy({ registry: g.reg }), announce: () => {} });
+    for (const x of a) await s.update(ada, "space", x.id, { general: null });                      // viewer -> only people added: revocations
+    await tick();
+    expect(g.live.size).toBe(ANNOUNCE.perTenant * 2);                                              // A is held to its revocation budget
+    await s.update(ident("gita", "globex.com"), "space", b.id, { general: null });
+    await tick();
+    expect(g.starts).toContain(b.id);                                                              // B's revocation started at once
+    opens.forEach(f => f()); await s.settled();
+    expect(new Set(g.starts)).toEqual(new Set([...a.map(x => x.id), b.id]));                       // and none of A's was dropped
+  });
+  test("revocation priority does not carry over to an ordinary re-pass", async () => {
+    const g = gated(), sp = await newSpaces(ANNOUNCE.perTenant + 2), [x, ...rest] = sp, normal = rest.slice(0, ANNOUNCE.perTenant), y = rest.at(-1);
+    const un = { id: acme.id };
+    let passes = 0;
+    const reg = new Proxy(g.reg, { get: (t, k) => (k === "boardsIn" ? async (scope, ...a2) => { const out = await t.boardsIn(scope, ...a2); if (scope.id === x.id && ++passes <= ANNOUNCE.repasses) s.announceChange(un, { type: "space", id: x.id }); return out; } : t[k]) });
+    const s = spaceService({ registry: reg, tenancy: makeTenancy({ registry: reg }), announce: () => {} });
+    const opens = normal.map(n => g.hold(n.id));
+    for (const n of normal) s.announceChange(un, { type: "space", id: n.id });                     // the Unit's ordinary slots are now full
+    await tick();
+    s.announceChange(un, { type: "space", id: y.id });                                             // waits behind them
+    s.announceChange(un, { type: "space", id: x.id }, { revoke: true });                           // a revocation: runs in the revocation budget
+    await tick();
+    expect(g.starts.filter(id => id === x.id).length).toBe(ANNOUNCE.repasses);                     // x used its passes, each re-pass an ordinary change
+    await tick();
+    expect(g.starts.filter(id => id === x.id).length).toBe(ANNOUNCE.repasses);                     // and did NOT restart ahead of the full ordinary slots
+    opens[0](); await tick();
+    expect(g.starts.indexOf(y.id)).toBeGreaterThan(-1);
+    expect(g.starts.indexOf(y.id)).toBeLessThan(g.starts.lastIndexOf(x.id));                       // y (queued first) runs before x's next pass
+    opens.forEach(f => f()); await s.settled();
+  });
+  test("a revocation that arrives during a pass keeps its priority for the next one", async () => {
+    const g = gated(), sp = await newSpaces(ANNOUNCE.perTenant + 1), [x, ...rest] = sp, waiting = rest.at(-1), busy = rest.slice(0, -1);
+    const un = { id: acme.id };
+    let passes = 0;
+    const reg = new Proxy(g.reg, { get: (t, k) => (k === "boardsIn" ? async (scope, ...a2) => { const out = await t.boardsIn(scope, ...a2); if (scope.id === x.id && ++passes <= ANNOUNCE.repasses) s.announceChange(un, { type: "space", id: x.id }, { revoke: true }); return out; } : t[k]) });
+    const s = spaceService({ registry: reg, tenancy: makeTenancy({ registry: reg }), announce: () => {} });
+    const openX = g.hold(x.id), opens = busy.map(n => g.hold(n.id));
+    s.announceChange(un, { type: "space", id: x.id });                                              // x runs as an ordinary scope (held)
+    for (const n of busy) s.announceChange(un, { type: "space", id: n.id });
+    s.announceChange(un, { type: "space", id: waiting.id });                                        // the Unit's ordinary slots are full; this one waits
+    await tick();
+    expect(g.starts.includes(waiting.id)).toBe(false);
+    openX(); await tick();                                                                          // x finishes 3 passes, each followed by a revocation, then yields
+    const xs = g.starts.map((id, i) => [id, i]).filter(([id]) => id === x.id);
+    expect(xs.length).toBe(ANNOUNCE.repasses + 1);                                                  // it came back at once for a 4th pass: the revocation kept its priority
+    expect(xs.at(-1)[1]).toBeLessThan(g.starts.indexOf(waiting.id));                                // ahead of the scope that had been waiting
+    opens.forEach(f => f()); await s.settled();
+  });
   test("a scope that keeps changing yields its slot after ANNOUNCE.repasses passes, to the back of the queue", async () => {
     const g = gated(), [x, y] = await newSpaces(2);
     let n = 0;

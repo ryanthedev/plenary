@@ -956,7 +956,7 @@ rest waits for the timed re-check (≤ 60 s) and one log line says so. A failed 
 **Scheduling** (`server/auth/spaces.js`): one pass per scope at a time; a change during a pass marks the scope dirty and earns exactly one more pass (the check and the
 release of the scope happen in one synchronous step, so no change is lost); a scope yields its slot after 3 passes in a row (back of the queue). At most 8 scopes run at
 once and 4 of one Unit; scopes over the cap wait in a queue deduped by scope (none is dropped). A change that **reduces access** (general set to null or to a lower
-role) goes to the front of the queue and may use up to 16 slots, ignoring the Unit limit, so a revoked viewer loses live access promptly.
+role) goes to the front of the queue and has its own budget (16 slots overall, 8 per Unit), so a revoked viewer loses live access promptly and one Unit's flood of revocations can't starve another's. It is never dropped, and its priority lasts for the pass that follows the change only (an ordinary change after it queues normally).
 
 **Bounds.** `GET /spaces?can=`: one page of at most 100 candidate Spaces (`spaceCandidates`, SQL), general access settled from the rows in hand, at most
 40 `effective` reads (8 at a time), the same cap as the Home tree; the rest set `more`. `GET /groups?can=`: at most 50 Group candidates, 20 reads.

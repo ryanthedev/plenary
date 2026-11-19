@@ -2,7 +2,7 @@
 // "Old" is simulated by passing a `now` three hours ahead; processes that hold things open are our own, killed by pid.
 
 import { test, expect, afterAll } from "bun:test";
-import { appendFileSync, mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, existsSync, symlinkSync, rmSync, chmodSync, realpathSync, lstatSync, renameSync, utimesSync } from "node:fs";
+import { appendFileSync, mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, existsSync, symlinkSync, rmSync, chmodSync, realpathSync, lstatSync, statSync, renameSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
@@ -719,9 +719,15 @@ test("resolveNoOpen keeps the given spelling under a directory that can be enter
 });
 
 test("resolveNoOpen firmlink prefix: dots ignored, a nested firmlink dropped, a directory that only looks alike kept", () => {
-  const data = "/System/Volumes/Data", same = (a, b) => { try { const x = statSync(a), y = statSync(b); return x.dev === y.dev && x.ino === y.ino; } catch { return false; } };
+  const data = "/System/Volumes/Data", same = (a, b) => { try { const x = statSync(a, { bigint: true }), y = statSync(b, { bigint: true }); return x.dev === y.dev && x.ino === y.ino; } catch (e) { if (e.code === "ENOENT") return false; throw e; } };
   if (!existsSync(join(data, "Users"))) return;                    // not a firmlinked system
   expect(resolveNoOpen(data + "/./Users/./")).toBe(resolveNoOpen("/Users"));
   if (same(data + "/usr/local", "/usr/local")) expect(resolveNoOpen(data + "/usr/local")).toBe("/usr/local");   // nested: /usr itself is not one
   if (existsSync(join(data, "usr")) && !same(data + "/usr", "/usr")) expect(resolveNoOpen(data + "/usr")).toBe(data + "/usr");   // not the same dir: spelling kept
+});
+
+test("resolveNoOpen follows the kernel for a .. under the firmlink prefix (Data/Users/../usr is /usr, since a firmlinked dir's parent is /), compared by bigint dev:ino", () => {
+  const data = "/System/Volumes/Data", input = data + "/Users/../usr", id = q => { const st = statSync(q, { bigint: true }); return `${st.dev}:${st.ino}`; };
+  if (!existsSync(join(data, "Users")) || !existsSync(join(data, "usr"))) return;   // not a firmlinked system
+  expect(id(resolveNoOpen(input))).toBe(id(input));
 });

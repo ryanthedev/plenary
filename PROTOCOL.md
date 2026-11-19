@@ -666,7 +666,7 @@ exactly"). Defaults: `leaseTtlMs` 10,000, `appendTimeoutMs` 4,000, `storeTimeout
 - **The progress watchdog** runs on the host's `monotonic` clock and `timers` (never the rooms' `now`), on the heartbeat
   tick (`heartbeatMs`). It records `{ seq, at }` per room; the record resets whenever nothing waits or `seq` moved. An idle
   room is never stuck: it cannot trip the watchdog. A slow Store is not stuck either: any append that lands moves `seq`.
-  `stuckMs` should exceed `appendTimeoutMs`; if it does not, a slow but live Store is cut early (safe, only noisy).
+  `stuckMs` should exceed `appendTimeoutMs`; if it does not, a slow but live Store is cut early (safe, only noisy). It defaults to 2 x `appendTimeoutMs`, so raising `appendTimeoutMs` raises it too; the host logs the effective `stuckMs`, `appendTimeoutMs`, `storeTimeoutMs` and `leaseTtlMs` once at start (`room host: stuck-host bounds`).
 - **What stopping does.** `lost`: the room fails, every connection it welcomed hears `unavailable` (close 1013) and
   reconnects, renewing and the deadline timer stop, and nothing is released (a release could hang with the Store, and the
   lapse is enough).
@@ -679,7 +679,7 @@ exactly"). Defaults: `leaseTtlMs` 10,000, `appendTimeoutMs` 4,000, `storeTimeout
   does not claim; the hello is answered `unavailable` once the heartbeat is silent. The stop came after the last renew, so
   the lease has lapsed when the cooldown ends. Another host that holds the board is untouched by it; if none does, this host
   takes the board when the cooldown ends. A lost lease for any other reason (renew refused, fenced, host deadline) has no
-  cooldown: the board is already someone else's or free. Cost: a single node (no other host) is also unavailable for the cooldown (10,200 ms at the defaults) after a stuck stop, then rebuilds; its writers keep getting `unavailable` and reconnect meanwhile.
+  cooldown: the board is already someone else's or free. Cost: a single node (no other host) is also unavailable for the cooldown (10,200 ms at the defaults) after a stuck stop. The first `open` after it starts the retake at once (an `open` that finds the watch calls the attempt; the watch's own poll, every ttl/3, is only the fallback), and the writer's next reconnect is served: 10,200 ms + two reconnect intervals. Its writers get `unavailable` and reconnect meanwhile.
 - **No acknowledged op is lost.** An op is acked only after its append resolved *and* the lease was still within its host
   deadline (§ Recovery, append). A stuck host that wakes has two defences: its own deadline check (`expired`) and the
   Store's epoch fence. Every write the host makes carries the lease epoch and is checked **in the write's own transaction**:
@@ -1508,7 +1508,7 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   nothing and stops the room instead; it keeps no lease and no cooldown-time claim (§ Recovery). Consumers and what each does with it:
   (1) **gateway feed** (`server/feed.js`): a heartbeat or an entries batch whose `epoch` is at least the feed's (a
   missing or non-integer `epoch` counts as lower) resets its silence timer; one from a lower epoch (a dead incarnation's,
-  delayed on the bus) does not, so stale traffic cannot hold off the Store poll. It reads the Store when `seq` is above its own
+  delayed on the bus) does not, so stale traffic cannot hold off the Store poll. A `released` message is a host leaving: it neither resets the silence timer nor raises the feed's epoch (a failed build's release carries the epoch of a room that never served), though its `cp` is still read. It reads the Store when `seq` is above its own
   (a lost last entry); raises its epoch (never lowers: a late or duplicate beat with a lower `epoch`, `seq` or `cp` changes
   nothing); records `cp` (max) to decide a re-base. (2) **waiting host** (a host that found another host's live lease,
   `watchEntries`): a message (heartbeat or entries batch) with an integer `epoch` at least the highest it knows (seeded

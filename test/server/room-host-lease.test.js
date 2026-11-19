@@ -641,6 +641,21 @@ test("R2-L1: `welcomed` shrinks with `conns` (close notices, a listing, the swee
 
 // ---- e1-tests-v3 MEDIUM-1: close() after a failed build ----
 
+test("N1 close() while a failed build's release is still in flight announces `released` once", async () => {
+  const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
+  const gate = deferred(), seen = [];
+  const store = { ...raw, async getCheckpoint() { throw new Error("store down"); }, release: async (...a) => { await gate.promise; return raw.release(...a); } };
+  bus.subscribe(subjects.entries("t-cf", "b-cf"), m => { if (m?.released) seen.push(m); });
+  const h = roomHost({ store, bus, leaseTtlMs: 60_000, heartbeatMs: 60_000 });
+  try {
+    await expect(h.open("t-cf", "b-cf")).rejects.toThrow("store down");     // its release is parked on the gate
+    const closing = h.close();
+    gate.resolve();
+    await closing; await bus.flush();
+    expect(seen).toEqual([{ seq: 0, epoch: 1, cp: 0, released: true }]);
+  } finally { await bus.close(); await raw.close(); }
+});
+
 test("close() after a board's build failed: the lease is released once, `released` is published (cp 0), and nothing is logged as a failed release", async () => {
   const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus(), lines = [];
   const log = createLogger({ write: l => lines.push(JSON.parse(l)), level: "debug" });
@@ -909,6 +924,33 @@ describe("stuck host (#65)", () => {
       await V.advance(1_000);
       await g.ack("c1", "a:1");
       expect(lostWhy()).toEqual([]);
+    } finally { await A.close(); await raw.close(); await bus.close(); }
+  }, 20000);
+
+  for (const how of ["the progress watchdog", "an append timeout"]) test(`L1 single node, ${how} stops the room: a writer's hello every 500 ms is served within the cooldown (ttl + margin) + two hello intervals`, async () => {
+    const { bus, V, raw, host, lostWhy } = vworld();
+    const sa = stallable(raw, V.timers);
+    const ttl = 3_000, margin = 60, watchdog = how === "the progress watchdog";
+    const A = host({ store: sa.store, holder: "h-a", leaseTtlMs: ttl, heartbeatMs: 200, ...(watchdog ? { appendTimeoutMs: 600_000, stuckMs: 3_000, now: () => 5 } : { appendTimeoutMs: 500 }) });
+    try {
+      await A.open(T, B);
+      const g = fakeGateway(bus);
+      g.hello("c0", "a"); await g.welcome("c0");
+      g.op("c0", "a", 1); await g.ack("c0", "a:1");
+      sa.append = "hold"; g.op("c0", "a", 2); await bus.flush();
+      expect(await V.until(() => (watchdog ? lostWhy().length > 0 : A.stats().rooms === 0), 10_000, 50)).not.toBe(null);
+      sa.append = "ok";
+      const stopAt = V.now();
+      let served = null;
+      for (let i = 1; served === null && V.now() - stopAt < 20_000; i++) {   // the gateway: open, then the hello, on each writer reconnect
+        const sentAt = V.now() - stopAt;
+        await A.open(T, B); g.hello(`r${i}`, "a");
+        await V.advance(500);
+        if (g.of(`r${i}`).some(m => m.msg?.t === "welcome")) served = sentAt;
+      }
+      expect(served).not.toBe(null);
+      expect(served).toBeGreaterThanOrEqual(ttl + margin);                     // never during the cooldown
+      expect(served).toBeLessThanOrEqual(ttl + margin + 2 * 500);              // the first open after the cooldown starts the retake; the next hello is served (not up to renewEvery later)
     } finally { await A.close(); await raw.close(); await bus.close(); }
   }, 20000);
 

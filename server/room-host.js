@@ -101,6 +101,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   // foldUnits: work per step of an incremental checkpoint (fold.js; default FOLD_STEP_UNITS). Each step is its own
   //   `schedule(fn)` turn (default the injected timers' setImmediate, else the global; tests pass a queue they drain). checkpointTimeoutMs: a checkpoint write unanswered this long is failed (reported; the room's next fold may start), so a checkpoint never holds the loop for more than one step (§ Recovery, "Incremental fold").
   checkLeaseTtl(leaseTtlMs);
+  log.info("room host: stuck-host bounds", { stuckMs, appendTimeoutMs, storeTimeoutMs, leaseTtlMs });   // stuckMs defaults to 2 x appendTimeoutMs
   for (const [k, v] of Object.entries({ storeTimeoutMs, stuckMs })) if (!Number.isSafeInteger(v) || v < 1) throw new RangeError(`${k} must be a positive integer`);
   const sched = schedule ?? (fn => (timers.setImmediate ?? globalThis.setImmediate)(fn));   // the injected timers' turn, else the global one
   // Every timer of this host runs on `timers` (tests pass fake ones and advance them, with `monotonic` and the Store's
@@ -131,13 +132,9 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   /** Slots whose room is built and alive: what the heartbeat tick walks. */
   const running = new Set();
   const coolOff = key => cooling.set(key, perf() + leaseTtlMs + margin);
-  const isCooling = key => {
-    const until = cooling.get(key);
-    if (until === undefined) return false;
-    if (perf() < until) return true;
-    cooling.delete(key);
-    return false;
-  };
+  const isCooling = key => perf() < (cooling.get(key) ?? 0);
+  /** Cooldowns that ended long ago belong to boards nobody reopened (their watch is idle-dropped by then): forget them. */
+  const pruneCooling = () => { for (const [key, until] of cooling) if (perf() >= until + watchIdleMs) cooling.delete(key); };
   let closed = false;
   const closedError = () => new PortError("closed", "the room host is closed");
 
@@ -285,7 +282,8 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
    * attempt does).
    */
   async function claim(tenant, board, key) {
-    if (isCooling(key)) {   // a stuck stop's cooldown: never re-acquire our own live lease (acquire would grant it, epoch + 1); watch it instead
+    if (!isCooling(key)) cooling.delete(key);
+    else {   // a stuck stop's cooldown: never re-acquire our own live lease (acquire would grant it, epoch + 1); watch it instead
       const info = await withTimeout(store.lease(tenant, board), storeTimeoutMs);
       if (closed) throw closedError();
       return { held: info };
@@ -325,9 +323,9 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       // L5: a build that failed for a reason other than the lease gives the board back at once, so another host
       // (or this one's next open) needn't wait out the ttl. A lost lease is never released.
       // Then a host already watching the board is told (as after a clean stop), so it need not wait for its next poll.
-      if (!slot.leaseLost) Promise.resolve().then(() => store.release(tenant, board, me, slot.epoch))
-        .then(() => { slot.announced = true; bus.publish(subjects.entries(tenant, board), { seq: 0, epoch: slot.epoch, cp: 0, released: true })?.catch?.(() => {}); })
-        .catch(e => log.warn("lease release after a failed build failed", { tenant, board, err: e }));
+      if (!slot.leaseLost) { slot.announced = true; Promise.resolve().then(() => store.release(tenant, board, me, slot.epoch))   // flagged before the release, so close() never announces it twice
+        .then(() => { bus.publish(subjects.entries(tenant, board), { seq: 0, epoch: slot.epoch, cp: 0, released: true })?.catch?.(() => {}); })
+        .catch(e => log.warn("lease release after a failed build failed", { tenant, board, err: e })); }
       throw err;
     });
     slot.promise = p;
@@ -565,6 +563,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   sweep.unref?.();
   // § Bus: the heartbeat repairs a lost last entry, tells gateways the epoch (for viewers' welcomes) and the newest durable checkpoint.
   const beat = setInterval(() => {
+    pruneCooling();
     for (const slot of [...running]) {   // rooms built and alive: a board still building has no beat to give (and no backlog of beats to run when it ends)
       if (slot.dead) { running.delete(slot); continue; }
       if (expired(slot)) { lost(slot, "no lease renew succeeded by the host deadline"); continue; }
@@ -590,7 +589,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       const p = slots.get(key);
       if (p) { await p; return "held"; }
       const w = watches.get(key);
-      if (w) { w.wanted = perf(); return "watching"; }
+      if (w) { w.wanted = perf(); if (cooling.has(key) && !isCooling(key)) { cooling.delete(key); attemptNow(w); } return "watching"; }   // the cooldown is over: this open is the retake, not the watch's next poll
       const r = await claimOnce(tenant, board, key);
       if (r?.held === undefined) return "held";
       watch(tenant, board, key, r.held);

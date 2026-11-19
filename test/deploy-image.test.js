@@ -34,6 +34,7 @@ test("source is copied root-owned: no COPY --chown, only /data is chowned", () =
   const chowns = docker.filter((l) => /\bchown\b/.test(l));
   expect(chowns.length).toBe(1);
   expect(chowns[0]).toMatch(/chown \S+ \/data$/);
+  expect(docker.filter((l) => /\bchmod\b/.test(l))).toEqual([]); // no `chmod -R a+w /app` either
 });
 
 test("HEALTHCHECK is exec form (no shell)", () => {

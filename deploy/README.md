@@ -35,7 +35,7 @@ IMAGE=ghcr.io/ryanthedev/plenary
 # 1. Local check, single platform, nothing pushed (docker buildx; podman is not covered for releases):
 docker buildx build -f deploy/Dockerfile --load -t "$IMAGE:check" \
   --build-arg VERSION="$VERSION" --build-arg REVISION="$REVISION" .
-IMAGE="$IMAGE:check" scripts/image-smoke.sh        # tests the existing image, keeps it; then: docker rmi "$IMAGE:check"
+SMOKE_IMAGE="$IMAGE:check" scripts/image-smoke.sh        # tests the existing image, keeps it; then: docker rmi "$IMAGE:check"
 
 # 2. Publish (MANUAL; needs the owner's go and a token with write:packages:
 #    `echo "$GHCR_TOKEN" | docker login ghcr.io -u ryanthedev --password-stdin`). This is the only publish path:

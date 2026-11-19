@@ -4,7 +4,7 @@
 # Usage:
 #   scripts/image-smoke.sh [tag]           build deploy/Dockerfile as <tag> (default plenary-smoke-$$), test it, remove
 #                                          the image. Refuses a tag that already exists.
-#   IMAGE=<ref> scripts/image-smoke.sh     test an existing image (no build); the image is kept.
+#   SMOKE_IMAGE=<ref> scripts/image-smoke.sh   test an existing image (no build); the image is kept.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 cli="${CONTAINER_CLI:-docker}"; cliname="$(basename "$cli")"
@@ -14,8 +14,9 @@ cleanup() { "$cli" rm -f "$name" >/dev/null 2>&1 || true; [ -z "$built" ] || "$c
 trap cleanup EXIT
 
 revision="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
-if [ -n "${IMAGE:-}" ]; then
-  tag="$IMAGE"; check_rev=
+if [ -n "${SMOKE_IMAGE:-}" ]; then
+  [ $# -eq 0 ] || { echo "give either SMOKE_IMAGE or a tag argument, not both" >&2; exit 1; }
+  tag="$SMOKE_IMAGE"; check_rev=
 else
   tag="${1:-plenary-smoke-$$}"; check_rev=1
   if "$cli" image inspect "$tag" >/dev/null 2>&1; then echo "image '$tag' already exists; refusing to overwrite and delete it" >&2; exit 1; fi

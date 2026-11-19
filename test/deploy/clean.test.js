@@ -77,7 +77,7 @@ test("an entry a process holds open (a file, or its cwd) is kept", () => {
   expect([byName(r, "plenary-test-hfile1").why, byName(r, "plenary-test-hcwd11").why]).toEqual(["in use", "in use"]);
   expect(existsSync(a) && existsSync(b)).toBe(true);
   expect(existsSync(free)).toBe(false);
-});
+}, 30_000);   // a real system-wide lsof (a few of them): its cost grows with the processes on the machine, not with this test
 
 test("a plen-run root is kept while its owner pid lives (owner.json or the name), removed once it is gone", () => {
   const w = world();
@@ -217,7 +217,7 @@ test("--scratch: direct children, old and unused, are removed; held ones stay; s
   expect(existsSync(join(scratch, "lnk"))).toBe(true);
   expect(existsSync(w.root)).toBe(true);
   expect(summarize(r.items, true)).toMatch(/^removed 1 entries.*scratch: 1/);
-});
+}, 30_000);   // a real system-wide lsof (a few of them): its cost grows with the processes on the machine, not with this test
 
 test("measure counts a tree without following links", () => {
   const w = world(), d = entry(w.root, "m");
@@ -249,7 +249,7 @@ test("a dir that becomes in use after the snapshot is renamed, re-checked, put b
   expect(existsSync(d)).toBe(true);
   expect(existsSync(join(w.tempDir, ".plen-deleting-plenary-test-late11"))).toBe(false);
   expect(existsSync(other)).toBe(false);
-});
+}, 30_000);   // a real system-wide lsof (a few of them): its cost grows with the processes on the machine, not with this test
 
 test("a failing per-path re-check puts the dir back", () => {
   const w = world(), d = entry(w.tempDir, "plenary-test-rechk1");
@@ -583,13 +583,14 @@ test("an odd path (a newline in it): lsof -F0 output is parsed whole (escaped by
   writeFileSync(odd, "z");
   holder(`exec 3<"${odd}"; exec sleep 60`, w.root, w);
   waitHeld(w, d);
-  expect(openPaths(w.lsof).some(p => p === odd)).toBe(false);                       // lsof escapes the newline, so the raw path never matches ...
-  expect(openPaths(w.lsof).some(p => p === odd.replace("\n", "\\n"))).toBe(true);    // ... but the field is kept whole, escaped, under the entry's prefix
+  const held = openPaths(w.lsof);                                                    // one system-wide lsof for both checks
+  expect(held.some(p => p === odd)).toBe(false);                                     // lsof escapes the newline, so the raw path never matches ...
+  expect(held.some(p => p === odd.replace("\n", "\\n"))).toBe(true);                // ... but the field is kept whole, escaped, under the entry's prefix
   const r = clean({ ...w, now: LATER(), yes: true });
   expect(r.items[0]).toMatchObject({ status: "kept", why: "in use" });
   expect(existsSync(odd)).toBe(true);
   expect(openUnder(d, w.lsof)).toBe("in use (re-check)");
-});
+}, 30_000);   // a real system-wide lsof (a few of them): its cost grows with the processes on the machine, not with this test
 
 test("ROOT is the real path of the checkout, also with a space in it or behind a symlink", async () => {
   const w = world(), home = join(w.root, "sp ace", "repo"), real = realpathSync(w.root) + "/sp ace/repo";

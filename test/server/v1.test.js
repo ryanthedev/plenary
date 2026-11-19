@@ -249,7 +249,7 @@ test("a board feed picks up the host's checkpoint written just after the entries
 
 test("§ Pacing: frames read from a live socket faster than they are handled are capped in bytes: past maxLiveQueuedBytes, `unavailable` and close", async () => {
   // One TCP write of 300 frames of ~1 KB: Bun hands them to the gateway back to back, before its pump handles one.
-  const r = await rig({ limits: { maxLiveQueuedBytes: 32 * 1024 } });
+  const r = await rig({ limits: { maxLiveQueuedBytes: 4 * 1024 } });   // far below one read (macOS loopback hands over ~16 KB at a time, Linux 64 KB), so a burst overflows however the kernel chunks it
   const s = await rawSock(r.server.wsUrl, { frames: true }); s.send(hello(r, "editor"));
   s.read();
   await until(() => s.texts.some(t => t.includes('"welcome"')), "the welcome");

@@ -13,7 +13,8 @@
 // Limits: lsof run as a normal user does not see other users' (or root's) processes, so a dir only such a process holds
 // would look unused; hence only this user's entries are candidates, the in-use check runs a second time per entry right
 // before removal (the entry is first renamed to `.plen-deleting-<name>` and put back if anything has it open or lsof fails),
-// and --min-age under 10 minutes needs --force.
+// and --min-age under 10 minutes needs --force. If exclusive rename is unavailable on darwin or linux, removal is refused
+// unless --allow-racy-rename explicitly permits the check-then-rename fallback; --force does not permit that fallback.
 // A composition root (it shells out to lsof and the rig CLI); nothing imports it.
 
 import { spawnSync } from "node:child_process";
@@ -102,7 +103,8 @@ export function rigAliveViaCli(dir, timeout = 60_000, spawn = spawnSync) {
 }
 
 let nativeRenameExcl = null, nativeRenameErrno = null, warnedNativeFallback = false;
-export function loadNativeRename(loader = dlopen, platform = process.platform, warn = message => console.error(message), install = true) {
+export function resetNativeRenameWarning() { warnedNativeFallback = false; }
+export function loadNativeRename(loader = dlopen, platform = process.platform, warn = message => console.error(message), install = true, allowRacyRename = false) {
   let rename = null, errnoReader = null;
   try {
     if (platform === "darwin") {
@@ -128,12 +130,12 @@ export function loadNativeRename(loader = dlopen, platform = process.platform, w
   }
   if ((platform === "darwin" || platform === "linux") && !rename && !warnedNativeFallback) {
     warnedNativeFallback = true;
-    warn("exclusive rename unavailable; using check-then-rename");
+    warn(allowRacyRename ? "exclusive rename unavailable; using check-then-rename" : "exclusive rename unavailable; refusing to remove (pass --allow-racy-rename to use check-then-rename)");
   }
   if (install) { nativeRenameExcl = rename; nativeRenameErrno = errnoReader; }
   return rename;
 }
-loadNativeRename();
+loadNativeRename(dlopen, process.platform, message => console.error(message), true, process.argv.includes("--allow-racy-rename"));
 
 export function renameExcl(from, to, { forceFallback = false, stat = lstatSync } = {}) {
   if (!forceFallback && nativeRenameExcl) {
@@ -144,9 +146,10 @@ export function renameExcl(from, to, { forceFallback = false, stat = lstatSync }
     const error = new Error(errnoNames[errno] === "EEXIST" ? `target exists: ${to} (EEXIST)` : `exclusive rename failed: ${name}`);
     error.code = errnoNames[errno] ?? String(errno);
     error.errno = errno;
+    error.fromRename = true;
     throw error;
   }
-  try { stat(to); const e = new Error(`target exists: ${to}`); e.code = "EEXIST"; throw e; }
+  try { stat(to); const e = new Error(`target exists: ${to}`); e.code = "EEXIST"; e.fromRename = true; throw e; }
   catch (e) { if (e.code !== "ENOENT") throw e; }
   renameSync(from, to);
 }
@@ -177,10 +180,10 @@ const refuseBase = (p, what) => {
 /**
  * Scan the three targets and (with yes) remove what is safe. Returns { items: [{ target, path, bytes, status, why }] }
  * where status is "removed" | "would-remove" | "kept" | "failed". Options (all injectable for tests): tempDir, rigRoot,
- * scratch, minAgeMs, now, lsof (binary), rigAlive(dir) => bool, yes.
+ * scratch, minAgeMs, now, lsof (binary), rigAlive(dir) => bool, yes, allowRacyRename.
  */
 export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), scratch = null, minAgeMs = 2 * HOUR, now = Date.now(),
-  lsof = "lsof", rigAlive = rigAliveViaCli, yes = false, force = false, uid = process.getuid(), beforeRemove = null,
+  lsof = "lsof", rigAlive = rigAliveViaCli, yes = false, force = false, allowRacyRename = false, uid = process.getuid(), beforeRemove = null,
   afterRename = null, stat = lstatSync, clock = Date.now, maxTimeMs = 5 * 60_000, openPathsFn = openPaths, openUnderFn = openUnder,
   renameExclFn = null, platform = process.platform, nativeRenameAvailable = !!nativeRenameExcl } = {}) {
   if (minAgeMs < MIN_SAFE_AGE_MS && !force) throw new Error(`--min-age under ${MIN_SAFE_AGE_MS / 60_000} minutes needs --force (a younger entry may still be in use)`);
@@ -188,7 +191,11 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
   const bases = [["temp", tempDir, isTempName], ["scratch", scratch, () => true]];
   const deadline = clock() + maxTimeMs;
   const timeLeft = () => Math.max(0, deadline - clock());
-  const safeRename = (from, to) => renameExclFn ? renameExclFn(from, to) : renameExcl(from, to, { stat });
+  const safeRename = (from, to) => {
+    if (!renameExclFn) return renameExcl(from, to, { stat });
+    try { return renameExclFn(from, to); }
+    catch (e) { if (e.code === "EEXIST") e.fromRename = true; throw e; }
+  };
   const deadlineCheck = () => timeLeft() <= 0;
   const existsLstat = p => { try { stat(p); return true; } catch (e) { if (e.code === "ENOENT") return false; throw e; } };
   let opens = null, opensError = null;
@@ -205,7 +212,7 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
       const st = stat(path);
       if (st.isSymbolicLink()) { item.why = "symlink"; return; }
       if (st.uid !== uid) { item.why = `owned by uid ${st.uid}, not ${uid}`; return; }
-      if (yes && platform === "darwin" && !nativeRenameAvailable && !force) { item.why = "exclusive rename unavailable; --force required to remove"; return; }
+      if (yes && (platform === "darwin" || platform === "linux") && !nativeRenameAvailable && !allowRacyRename) { item.why = "exclusive rename unavailable; --allow-racy-rename required to remove"; return; }
       if (st.dev !== stat(base).dev) { item.status = "failed"; item.why = "candidate is a mount point (different device from parent)"; return; }
       const m = measure(path, stat, undefined, deadlineCheck);
       item.bytes = m.bytes;
@@ -254,7 +261,7 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
       if (why) { if (parked !== path) { if (existsLstat(path)) item.why = `${why}; original path exists`; else safeRename(parked, path); } if (!item.why) item.why = why; return; }
       rmSync(parked, { recursive: true, force: true });
       item.status = "removed";
-    } catch (e) { if (e.message === "skipped (time limit)") item.why = e.message; else if (e.code === "EEXIST") { item.why = `target/original path exists${e.message ? `: ${e.message}` : ""}`; } else { item.status = "failed"; item.why = e.message; } }
+    } catch (e) { if (e.message === "skipped (time limit)") item.why = e.message; else if (e.code === "EEXIST" && e.fromRename) { item.why = `target/original path exists${e.message ? `: ${e.message}` : ""}`; } else { item.status = "failed"; item.why = e.message; } }
   };
 
   for (const [target, dir, match] of bases) {
@@ -291,7 +298,8 @@ export function summarize(items, yes) {
   const mb = b => `${(b / 1e6).toFixed(1)} MB`;
   const parts = ["temp", "rig", "scratch"].map(t => { const s = sel.filter(i => i.target === t); return `${t}: ${s.length} (${mb(s.reduce((a, i) => a + i.bytes, 0))})`; });
   const failed = items.filter(i => i.status === "failed").length;
-  return `${yes ? "removed" : "would remove"} ${sel.length} entries, ${mb(sel.reduce((a, i) => a + i.bytes, 0))} [${parts.join(", ")}]; kept ${items.filter(i => i.status === "kept").length}${failed ? `; ${failed} failed` : ""}${yes ? "" : "; dry run, pass --yes to remove"}`;
+  const refused = items.filter(i => i.status === "kept" && /exclusive rename unavailable/.test(String(i.why))).length;
+  return `${yes ? "removed" : "would remove"} ${sel.length} entries, ${mb(sel.reduce((a, i) => a + i.bytes, 0))} [${parts.join(", ")}]; kept ${items.filter(i => i.status === "kept").length}${refused ? `; ${refused} refused (exclusive rename unavailable)` : ""}${failed ? `; ${failed} failed` : ""}${yes ? "" : "; dry run, pass --yes to remove"}`;
 }
 
 function parseDuration(s) {
@@ -302,12 +310,12 @@ function parseDuration(s) {
 
 if (import.meta.main) {
   const a = process.argv.slice(2), opt = n => { const i = a.indexOf(n); return i < 0 ? undefined : a[i + 1]; };
-  const known = new Set(["--yes", "--verbose", "--force", "--min-age", "--scratch", "--max-time"]);
+  const known = new Set(["--yes", "--verbose", "--force", "--allow-racy-rename", "--min-age", "--scratch", "--max-time"]);
   const bad = a.find((x, i) => x.startsWith("--") && !known.has(x) || !x.startsWith("--") && !["--min-age", "--scratch", "--max-time"].includes(a[i - 1]));
-  if (bad) { console.error(`unknown argument ${bad}\nusage: bun run clean [--yes] [--min-age 2h [--force]] [--max-time 5m] [--scratch <dir>] [--verbose]`); process.exit(2); }
+  if (bad) { console.error(`unknown argument ${bad}\nusage: bun run clean [--yes] [--min-age 2h [--force]] [--allow-racy-rename] [--max-time 5m] [--scratch <dir>] [--verbose]`); process.exit(2); }
   const yes = a.includes("--yes");
   try {
-    const { items } = clean({ yes, minAgeMs: parseDuration(opt("--min-age") ?? "2h"), maxTimeMs: parseDuration(opt("--max-time") ?? "5m"), force: a.includes("--force"), scratch: opt("--scratch") ?? null });
+    const { items } = clean({ yes, minAgeMs: parseDuration(opt("--min-age") ?? "2h"), maxTimeMs: parseDuration(opt("--max-time") ?? "5m"), force: a.includes("--force"), allowRacyRename: a.includes("--allow-racy-rename"), scratch: opt("--scratch") ?? null });
     const mb = b => `${(b / 1e6).toFixed(1)} MB`.padStart(9);
     const shown = items.filter(i => i.status !== "kept" || a.includes("--verbose")), all = a.includes("--verbose") || shown.length <= 25;
     for (const i of all ? shown : [...shown].sort((x, y) => y.bytes - x.bytes).slice(0, 25)) console.log(`${i.status.padEnd(12)}${mb(i.bytes)}  ${i.target.padEnd(7)} ${i.path}${i.why ? `  (${i.why})` : ""}`);

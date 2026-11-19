@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
-import { clean, summarize, measure, openPaths, openUnder, renameExcl, loadNativeRename, ROOT } from "../../scripts/clean.js";
+import { clean, summarize, measure, openPaths, openUnder, renameExcl, loadNativeRename, resetNativeRenameWarning, ROOT } from "../../scripts/clean.js";
 
 const made = [], kids = [];
 const sandbox = realpathSync(mkdtempSync(join(tmpdir(), "plenary-cleantest-")));
@@ -348,25 +348,54 @@ test("exclusive rename EEXIST is reported as kept with the target collision", ()
   expect(existsSync(d)).toBe(true);
 });
 
-test("a failed darwin native loader warns once and --yes refuses without force", () => {
+test("a failed darwin native loader warns once and --yes refuses without racy rename consent", () => {
   const warnings = [], w = world(), d = entry(w.tempDir, "plenary-test-loadr1");
+  resetNativeRenameWarning();
   loadNativeRename(() => { throw new Error("missing library"); }, "darwin", message => warnings.push(message), false);
   const r = clean({ ...w, now: LATER(), yes: true, platform: "darwin", nativeRenameAvailable: false });
-  expect(warnings).toEqual(["exclusive rename unavailable; using check-then-rename"]);
+  expect(warnings).toEqual(["exclusive rename unavailable; refusing to remove (pass --allow-racy-rename to use check-then-rename)"]);
   expect(byName(r, "plenary-test-loadr1")).toMatchObject({ status: "kept", why: expect.stringMatching(/exclusive rename unavailable/) });
+  expect(summarize([{ target: "temp", status: "kept", bytes: 0, why: "exclusive rename unavailable; --allow-racy-rename required to remove" }], true)).toContain("1 refused");
   expect(existsSync(d)).toBe(true);
+  const allowed = clean({ ...w, now: LATER(), yes: true, platform: "darwin", nativeRenameAvailable: false, allowRacyRename: true });
+  expect(byName(allowed, "plenary-test-loadr1").status).toBe("removed");
 });
 
-test.skipIf(process.platform !== "darwin")("native exclusive rename refuses a recreated target after a post-park stat error", () => {
+test("linux native-loader failure refuses unless check-then-rename is explicitly allowed", () => {
+  const warnings = [], w = world(), d = entry(w.tempDir, "plenary-test-loadr2");
+  resetNativeRenameWarning();
+  loadNativeRename(() => { throw new Error("missing library"); }, "linux", message => warnings.push(message), false);
+  const refused = clean({ ...w, now: LATER(), yes: true, platform: "linux", nativeRenameAvailable: false });
+  expect(warnings).toEqual(["exclusive rename unavailable; refusing to remove (pass --allow-racy-rename to use check-then-rename)"]);
+  expect(byName(refused, "plenary-test-loadr2").status).toBe("kept");
+  const allowed = clean({ ...w, now: LATER(), yes: true, platform: "linux", nativeRenameAvailable: false, allowRacyRename: true });
+  expect(byName(allowed, "plenary-test-loadr2").status).toBe("removed");
+  expect(existsSync(d)).toBe(false);
+});
+
+test.skipIf(process.platform !== "darwin")("native exclusive rename refuses a recreated target with EEXIST", () => {
   const w = world(), d = entry(w.tempDir, "plenary-test-nativ1"), parked = join(w.tempDir, ".plen-deleting-plenary-test-nativ1");
-  let deleted = false;
+  let recreated = false;
   const r = clean({ ...w, now: LATER(), yes: true, stat: p => {
-    if (!deleted && p === join(parked, "sub/f")) { deleted = true; rmSync(p); }
+    if (!recreated && p === parked) {
+      recreated = true;
+      try { return lstatSync(p); } catch (e) { mkdirSync(parked); throw e; }
+    }
     return lstatSync(p);
   } });
-  expect(byName(r, "plenary-test-nativ1")).toMatchObject({ status: "kept", why: "changed while parking" });
+  expect(byName(r, "plenary-test-nativ1")).toMatchObject({ status: "kept", why: expect.stringMatching(/target.*exists.*EEXIST/i) });
   expect(existsSync(d)).toBe(true);
-  expect(existsSync(parked)).toBe(false);
+  expect(existsSync(parked)).toBe(true);
+});
+
+test("non-rename EEXIST failures are reported as failed", () => {
+  const w = world(), d = entry(w.tempDir, "plenary-test-exist2"), rootStat = lstatSync;
+  const r = clean({ ...w, now: LATER(), yes: true, stat: p => {
+    if (p === d) { const e = new Error("injected collision"); e.code = "EEXIST"; throw e; }
+    return rootStat(p);
+  } });
+  expect(byName(r, "plenary-test-exist2")).toMatchObject({ status: "failed", why: "injected collision" });
+  expect(existsSync(d)).toBe(true);
 });
 
 test("a candidate mount point is refused relative to its parent device", () => {

@@ -5,7 +5,7 @@
 
 import { h, replace } from "./dom.js";
 import { announce } from "./focus.js";
-import { createAskModel, whyLines, pillLine, sourceText, ownersText } from "../../core/explain.js";
+import { createAskModel, whyLines, pillLine, sourceText, ownersText, waitText } from "../../core/explain.js";
 
 /**
  * Ask for access at a scope: a role to ask for (when the server offers more than one), the button, and the outcome. Built once, repainted in place on every change.
@@ -30,7 +30,7 @@ export function askView({ api, type, id, why, newKey = null }) {
     button.setAttribute("aria-disabled", S.status === "busy" || wait ? "true" : "false");
     status.textContent = sent
       ? `You asked for ${S.pending?.roleName ?? "access"}. The owners will see your request on the Access page; you will have it when one of them adds you.`
-      : S.status === "busy" ? "Sending…" : S.message ?? (wait ? `You can ask again later.` : "");
+      : S.status === "busy" ? "Sending…" : S.message ?? (wait ? `You asked recently and the request was closed. You can ask again ${S.retryAfterMs ? waitText(S.retryAfterMs) : "later"}.` : "");
     if (sent) { button.setAttribute("aria-hidden", "true"); }
   }
   paint();
@@ -88,7 +88,7 @@ export function pillPopover({ pill, explain, board, access = null, newKey = null
     const card = access && (w.ask.can || w.ask.pending) ? askView({ api: access, type: "board", id: board, why: w, newKey }) : null;
     replace(body, h("p", {}, pillLine(w.mine) + "."),
       w.mine.sources.length ? h("ul.rows", { "aria-label": "Where your access comes from" }, w.mine.sources.map(s => { const x = sourceRow(s, here); return h("li.row", {}, x.text, x.strongest ? h("span.badge", {}, "grants the most") : null); })) : null,
-      w.needs["board.edit"] ? h("p", {}, `Editing needs ${w.needs["board.edit"].roleName}. ${ownersText(w.owners)}`) : h("p", {}, ownersText(w.owners)),
+      w.needs["board.edit"] ? h("p", {}, `Editing needs ${w.needs["board.edit"].roleName}. ${ownersText(w.owners, w.ask.can || w.ask.pending != null)}`) : h("p", {}, ownersText(w.owners, w.ask.can || w.ask.pending != null)),
       card?.el);
     (card ? pop.querySelector?.("[data-fk=ask]") : pop.querySelector?.("button"))?.focus?.();
   }

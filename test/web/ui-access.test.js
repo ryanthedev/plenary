@@ -391,3 +391,10 @@ test("owners see the requests: named, with Dismiss (focus falls back to a neighb
   await model.set({ type: "user", id: "google:kim", name: "kim" }, "annotator");
   expect(model.state.page.requests.map(r => r.user.id)).toEqual(["google:dev"]);
 });
+
+test("a closed request in its cooldown starts with the button off and says when the owner may be asked again", async () => {
+  state.access = VIEWER({ why: WHY({ ask: { can: true, roles: [{ id: "editor", name: "Editor" }], pending: null, retryAfterMs: 3 * 3600_000 } }) });
+  await accessPage();
+  expect(btn("Ask for access").getAttribute("aria-disabled")).toBe("true");
+  expect(textOf(root.find(e => e.getAttribute("data-fk") === "ask-status"))).toBe("You asked recently and the request was closed. You can ask again in 3 hours.");
+});

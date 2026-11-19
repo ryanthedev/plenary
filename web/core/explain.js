@@ -67,8 +67,8 @@ export function pillLine(mine) {
   return via.length ? `${mine.role.name} via ${via.join(" and ")}` : mine.role.name;
 }
 
-/** "Owners: Priya, Tom." or the fallback when only the organization's admins can grant. */
-export const ownersText = owners => (owners.length ? `Owners: ${owners.map(o => o.name).join(", ")}.` : "Ask an organization admin.");
+/** "Owners: Priya, Tom."; with none named: an organization admin (a member) or whoever shared the board (a guest has no organization to ask: `askable` false). */
+export const ownersText = (owners, askable = true) => (owners.length ? `Owners: ${owners.map(o => o.name).join(", ")}.` : askable ? "Ask an organization admin." : "Ask whoever shared this with you.");
 /**
  * The why-card of a disabled control: [headline, what is needed, who to ask]. `what`: the thing the control does ("Creating boards"), `permission`: the key the server listed in `needs`.
  * @param {Explain} why @param {{ type: string, id: string }} here @param {string} what @param {string} permission @param {string|null} [hereName] the scope's name, for "in Platform"
@@ -81,7 +81,7 @@ export function whyLines(why, here, what, permission, hereName = null) {
   const lines = [m.role ? `You're ${/^[AEIOU]/.test(name) ? "an" : "a"} ${name} ${where}${strong.length ? ", " + strong.map(s => sourceText(s, here)).join(" and ") : ""}.` : `You have no board access of your own ${where}.`];
   const need = why.needs[permission];
   if (need) lines.push(`${what} needs ${need.roleName}.`);
-  lines.push(ownersText(why.owners));
+  lines.push(ownersText(why.owners, why.ask.can || why.ask.pending != null));
   return lines;
 }
 

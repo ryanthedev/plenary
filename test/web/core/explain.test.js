@@ -42,6 +42,8 @@ test("JOURNEY J10 copy: the why lines and the pill line", () => {
   expect(pillLine({ role: null, sources: [] })).toBe("No board access of your own");
   expect(pillLine({ role: { id: "viewer", name: "Viewer" }, sources: [SRC({ kind: "link", strongest: true })] })).toBe("Viewer via share link");
   expect(ownersText([])).toBe("Ask an organization admin.");
+  expect(ownersText([], false)).toBe("Ask whoever shared this with you.");   // a guest has no organization to ask
+  expect(whyLines(WHY({ owners: [], ask: { can: false, roles: [], pending: null, retryAfterMs: null } }), here, "Editing", "board.create").at(-1)).toBe("Ask whoever shared this with you.");
   expect(waitText(30 * 60_000)).toBe("in 30 minutes");
   expect(waitText(24 * 3600_000)).toBe("in 24 hours");
   expect(waitText(0)).toBe("");

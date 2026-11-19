@@ -209,7 +209,7 @@ export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker
     const mineSection = w ? h("section", { "aria-label": "Your access" }, h("h2", {}, "Your access"),
       h("p", {}, w.mine.role ? `You have ${w.mine.role.name} access to this ${noun}. You get everything any of these gives you; the one that gives the most is marked.` : `You have no board access of your own to this ${noun}.`),
       w.mine.sources.length ? h("ul.rows", { "aria-label": "Where your access comes from" }, w.mine.sources.map(s => { const x = sourceRow(s, here); return h("li.row", { "aria-label": x.text + (x.strongest ? ", grants the most" : "") }, h("span.who", {}, x.text), x.strongest ? h("span.badge", {}, "Grants the most") : null); })) : null,
-      w.ask.can || w.ask.pending ? h("p", {}, ownersText(w.owners)) : null, ask?.el) : null;
+      w.ask.can || w.ask.pending ? h("p", {}, ownersText(w.owners, true)) : null, ask?.el) : null;
     const requests = p.requests?.length ? h("section", { "aria-label": "Access requests" }, h("h2", {}, "Access requests"),
       h("p.muted", {}, "These people asked for more access. Add them below to grant it, or dismiss the request."),
       h("ul.rows", { "aria-label": "Access requests" }, p.requests.map(r => h("li.row", { "aria-label": `${r.user.name} asked for ${r.roleName}` },

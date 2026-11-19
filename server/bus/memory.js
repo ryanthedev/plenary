@@ -61,9 +61,11 @@ function memoryBusUnscoped({ onError, maxBytes }) {
     /** @returns {() => void} unsubscribe */
     subscribe(subject, fn) {
       if (typeof subject !== "string" || typeof fn !== "function") throw new TypeError("subscribe(subject, fn)");
-      if (!subs.has(subject)) subs.set(subject, new Set());
-      subs.get(subject).add(fn);
-      return () => { const set = subs.get(subject); if (!set) return; set.delete(fn); if (!set.size) subs.delete(subject); };
+      let set = subs.get(subject);
+      if (!set) subs.set(subject, set = new Set());
+      set.add(fn);
+      const mine = set;   // the set of THIS subscription: an old unsubscribe called again never removes a later subscribe of the same handler (as natsBus)
+      return () => { if (!mine.delete(fn)) return; if (!mine.size && subs.get(subject) === mine) subs.delete(subject); };
     },
     /** Resolves when everything published so far has been handed to subscribers (tests, clean shutdown). */
     flush() { return queue.length || draining ? new Promise(res => idle.push(res)) : Promise.resolve(); },

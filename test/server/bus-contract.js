@@ -86,6 +86,25 @@ export function busContract(label, makeBus, { skip = false } = {}) {
     off3();
   });
 
+  t(`${label}: a stale unsubscribe is a no-op: it never removes a later subscribe of the same handler`, async () => {
+    const bus = await make(), got = [], s = subjects.grants(tenant, "b-stale"), h = m => got.push(m);
+    const off = bus.subscribe(s, h);
+    off();
+    bus.subscribe(s, h);
+    off();                                                      // the first subscription's unsubscribe, again
+    await bus.flush();
+    expect(bus.subscriberCount(s)).toBe(1);
+    await bus.publish(s, 1);
+    await until(() => got.length === 1, "delivery to the second subscription");
+  });
+
+  t(`${label}: subscribe refuses a non-string subject or a non-function handler`, async () => {
+    const bus = await make();
+    expect(() => bus.subscribe(undefined, () => {})).toThrow(TypeError);
+    expect(() => bus.subscribe(subjects.entries(tenant, "b-args"), undefined)).toThrow(TypeError);
+    expect(() => bus.subscribe(7, () => {})).toThrow(TypeError);
+  });
+
   t(`${label}: a subscriber that throws or rejects doesn't stop the others or later messages`, async () => {
     const errors = [], bus = await make({ onError: (e, s) => errors.push([e.message, s]) }), got = [], s = subjects.entries(tenant, "b-throw");
     bus.subscribe(s, m => { if (m === 1) throw new Error("boom"); got.push(["x", m]); });

@@ -71,6 +71,7 @@ export function scopeBus(bus, cluster) {
     ...bus,
     publish: (subject, msg) => bus.publish(prefix + subject, msg),
     subscribe(subject, fn) {
+      if (typeof subject !== "string" || typeof fn !== "function") throw new TypeError("subscribe(subject, fn)");   // as the adapters do
       let byFn = wrappers.get(subject);
       if (!byFn) wrappers.set(subject, byFn = new Map());
       let w = byFn.get(fn);

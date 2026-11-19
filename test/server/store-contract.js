@@ -240,15 +240,16 @@ export function storeContract(name, make) {
       const seen = [];
       let abortAt = null, store;
       const { store: s, raw } = await fresh({ partChars: PART, onPart: async step => {
+        console.error("DBG hook", step, abortAt, Date.now() % 100000);
         if (abortAt === null || step === "sweep") return;
-        seen.push([step, (await store.getCheckpoint(T, B))?.seq]);
+        seen.push([step, (await store.getCheckpoint(T, B))?.seq]); console.error("DBG got", step, Date.now() % 100000);
         if (step === abortAt) throw new Error("simulated crash");
       } });
       store = s;
       const e = await own(store);
-      await store.putCheckpoint(T, B, big(10, "old"), e);
+      console.error("DBG put old"); await store.putCheckpoint(T, B, big(10, "old"), e); console.error("DBG put old done");
       const before = await raw.partRows(T, B);
-      abortAt = "part:3";
+      abortAt = "part:3"; console.error("DBG before", before);
       await expect(store.putCheckpoint(T, B, big(20, "new"), e)).rejects.toThrow("simulated crash");
       expect(seen.map(x => x[0])).toEqual(["part:0", "part:1", "part:2", "part:3"]);
       expect(seen.every(x => x[1] === 10)).toBe(true);                                    // the old one the whole time

@@ -97,20 +97,26 @@ export function openUnder(path, lsof = "lsof", timeout = 60_000) {
  * device, FIFO or socket met on the way is never opened and there is no lstat-then-open race. Throws the lstat error
  * (ENOENT, ENOTDIR) for a missing component, and ELOOP past 40 links.
  */
-export function resolveNoOpen(p, stat = lstatSync, readlink = readlinkSync) {
+export function resolveNoOpen(p, stat = lstatSync, readlink = readlinkSync, cache = new Map(), readdir = readdirSync) {
   let cur = sep, links = 0;
+  const names = dir => { if (!cache.has(dir)) cache.set(dir, readdir(dir)); return cache.get(dir); };
   const todo = (p.startsWith(sep) ? p : process.cwd() + sep + p).split(sep).filter(Boolean).reverse();
   while (todo.length) {
-    const c = todo.pop();
+    let c = todo.pop();
     if (c === ".") continue;
     if (c === "..") { cur = dirname(cur); continue; }
+    const st = stat(join(cur, c));   // throws ENOENT/ENOTDIR for a missing component
+    // Restore the stored spelling (a case-insensitive volume answers /USERS/R for /Users/r): the exact name, else the case-insensitive match.
+    const all = names(cur);
+    if (!all.includes(c)) c = all.find(e => e.toLowerCase() === c.toLowerCase()) ?? c;
     const next = join(cur, c);
-    if (!stat(next).isSymbolicLink()) { cur = next; continue; }
+    if (!st.isSymbolicLink()) { cur = next; continue; }
     if (++links > 40) throw Object.assign(new Error(`too many symbolic links: ${p}`), { code: "ELOOP" });
     const target = readlink(next);
     if (target.startsWith(sep)) cur = sep;
     todo.push(...target.split(sep).filter(Boolean).reverse());
   }
+  if (p.endsWith(sep) && !stat(cur).isDirectory()) throw Object.assign(new Error(`not a directory: ${p}`), { code: "ENOTDIR" });
   return cur;
 }
 
@@ -120,8 +126,9 @@ export function resolveNoOpen(p, stat = lstatSync, readlink = readlinkSync) {
  * means opening it, which can block for good (a pty slave with no peer hangs open(2) in the kernel, uninterruptibly),
  * so a path is lstat'd first and anything that is not a plain file or directory is never resolved or opened.
  */
-export function resolveOpens(paths, stat = lstatSync, realpath = resolveNoOpen) {
-  const out = new Set();
+export function resolveOpens(paths, stat = lstatSync, realpath = null) {
+  const out = new Set(), cache = new Map();
+  realpath ??= p => resolveNoOpen(p, lstatSync, readlinkSync, cache);
   for (const p of paths) {
     out.add(p);
     if (p.startsWith("/dev/")) continue;
@@ -215,8 +222,13 @@ const refuseBase = (p, what) => {
   if (!statSync(p).isDirectory()) throw new Error(`refusing to clean ${what} ${p}: not a directory (never opened)`);   // stat does not open; realpath does
   const real = resolveNoOpen(p);
   const home = resolveNoOpen(homedir());
-  if (real === sep || real === home || home.startsWith(real + sep) || ROOT === real || ROOT.startsWith(real + sep))
-    throw new Error(`refusing to clean ${what} ${p}: it resolves to ${real} (/, $HOME, the repo or one of their parents)`);
+  // By identity (dev+ino; stat opens nothing; the only check): a case-insensitive volume answers /USERS/R or /users for $HOME or its parents, and no
+  // string compare of spellings can be trusted there.
+  const key = q => { const st = statSync(q); return `${st.dev}:${st.ino}`; };
+  const protectedKeys = new Set();
+  for (const start of [home, ROOT]) for (let d = start; ; d = dirname(d)) { protectedKeys.add(key(d)); if (d === sep) break; }
+  if (protectedKeys.has(key(p)))
+    throw new Error(`refusing to clean ${what} ${p}: it is /, $HOME, the repo or one of their parents (same directory by identity)`);
   return real;
 };
 

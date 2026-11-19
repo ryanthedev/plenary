@@ -675,3 +675,29 @@ test("resolveNoOpen: symlink chains, relative links, .. after a link, missing pa
   const fifo = at("pipe"); expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
   expect(resolveNoOpen(fifo)).toBe(join(r, "pipe"));                 // a FIFO resolves without being opened
 });
+
+// Case-insensitive volumes (default APFS): /USERS/R and /users are $HOME and its parent, and string compares of spellings miss them.
+test("a base that is $HOME or a parent of it is refused under any letter case (by identity)", () => {
+  const home = process.env.HOME, up = home.toUpperCase();
+  const refuse = dir => expect(() => clean({ tempDir: join(sandbox, "none"), scratch: dir, rigRoot: null, maxTimeMs: 0, openPathsFn: () => [] })).toThrow(/refusing/);
+  if (existsSync(up)) refuse(up);                                  // only where the volume folds case
+  if (existsSync("/users")) refuse("/users");
+  if (existsSync(home.toLowerCase())) refuse(home.toLowerCase());
+  refuse(home);
+});
+
+test("resolveNoOpen restores the stored spelling, so a lsof path matches a differently-cased base", () => {
+  const w = world(), d = entry(w.tempDir, "plenary-test-case11"), swapped = join(w.root.toUpperCase(), "temp");
+  if (!existsSync(swapped)) return;                                // a case-sensitive volume: nothing to fold
+  expect(resolveNoOpen(join(swapped, "plenary-test-case11"))).toBe(d);
+  const lsof = fakeLsof(w, `case "$*" in *+D*) exit 1;; esac\nprintf 'p1\\0n${d}/sub/f\\0\\n'\nexit 1`);
+  expect(byName(clean({ ...w, tempDir: swapped, lsof, now: LATER(), yes: true }), "plenary-test-case11")).toMatchObject({ status: "kept", why: "in use" });
+});
+
+test("resolveNoOpen: a trailing slash on a non-directory is ENOTDIR", () => {
+  const w = world(), f = join(w.root, "plain");
+  writeFileSync(f, "x");
+  expect(resolveNoOpen(f)).toBe(join(realpathSync(w.root), "plain"));
+  expect(() => resolveNoOpen(f + "/")).toThrow(expect.objectContaining({ code: "ENOTDIR" }));
+  expect(resolveNoOpen(w.root + "/")).toBe(realpathSync(w.root));
+});

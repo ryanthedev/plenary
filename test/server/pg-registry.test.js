@@ -9,6 +9,7 @@ import { SQL } from "bun";
 import { postgresRegistry, registryTables, REGISTRY_INDEXES } from "../../server/registry/postgres.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { registryContract } from "../auth/registry-contract.js";
+import { accessRace } from "../auth/access-race.js";
 import { accessEquivalence } from "../auth/access-equivalence.js";
 import { tenancy } from "../../server/auth/tenancy.js";
 import { legacyEquivalence } from "../auth/legacy-migration.js";
@@ -177,6 +178,12 @@ describe.skipIf(!url)("postgres registry", () => {
   // or check fails in round 0 or 1 in practice); RACE_CEILING is a failure-only ceiling for a loaded machine (a round is a few
   // ms alone, tens of ms under load average ~20): the assertions are invariants, never elapsed time.
   const ROUNDS = 12, RACE_CEILING = 30_000;
+
+  accessRace("postgres", async () => {
+    const schema = schemaName();
+    const a = await postgresRegistry({ url, schema, max: 2 }), b = await postgresRegistry({ url, schema, max: 2 });
+    return { a, b, close: async () => { await a.close(); await b.close(); await drop(schema); } };
+  }, { rounds: 12 });
 
   test("two connections racing to demote a Space's only two owners (and a Group's): exactly one wins, every round", async () => {
     const schema = schemaName();

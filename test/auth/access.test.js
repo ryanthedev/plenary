@@ -118,6 +118,83 @@ describe("Team members are Unit members; guests are inert", () => {
   });
 });
 
+describe("a Team's grants are the caller's to give: adding or removing a member is granting or revoking each of them", () => {
+  const custom = async () => (await r.createRole({ tenant: acme.id, name: "TeamAdmin", boardRole: "viewer", permissions: ["team.manage"] })).id;
+  /** max holds team.manage at the Unit, and manages `mine` (owner) but not `theirs`; Infra owns `theirs` and has a member (so it counts) */
+  async function setup() {
+    const mine = await r.createSpace({ tenant: acme.id, name: "X", owner: "google:ada" }), theirs = await r.createSpace({ tenant: acme.id, name: "Y secret", generalRole: null, owner: "google:ada" });
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: U(max.user), role: await custom() });
+    await r.setScopedGrant({ scope: { type: "space", id: mine.id }, subject: U(max.user), role: "owner" });
+    await r.setScopedGrant({ scope: { type: "space", id: mine.id }, subject: T(infra.id), role: "viewer" });
+    await r.setScopedGrant({ scope: { type: "space", id: theirs.id }, subject: T(infra.id), role: "owner" });
+    await r.setTeamMember(infra.id, lee.user, true);
+    return { mine, theirs };
+  }
+  test("a manager of Space X only cannot add themselves (or anyone) to a Team that owns Space Y: the ordinary refusal, nothing about Y", async () => {
+    const { theirs } = await setup();
+    const hidden = await svc.setMember(max, infra.id, max.user, true).then(() => null, e => e);
+    expect(hidden.code).toBe("forbidden");
+    expect(hidden.message).toBe("not allowed");
+    expect(JSON.stringify(hidden)).not.toMatch(/Y secret|owner/);
+    expect(JSON.stringify(hidden)).not.toContain(theirs.id);
+    expect(await r.teamMembers(infra.id)).toEqual([lee.user]);
+    expect(await code(svc.setMember(max, infra.id, lee.user, false))).toBe("forbidden");             // removing is revoking Y's owner: the same check
+    expect(await code(svc.deleteTeam(max, infra.id))).toBe("forbidden");
+    expect(await r.team(infra.id)).not.toBe(null);
+  });
+  test("the refusal is the same whether the Team's other scope exists, is hidden, or is another's: same body as any 403", async () => {
+    await setup();
+    const a = await svc.setMember(max, infra.id, max.user, true).catch(e => e);
+    const b = await svc.setMember(max, "tm-nope00000000", max.user, true).catch(e => e);
+    expect([a.code, a.message]).toEqual([b.code, b.message]);
+  });
+  test("a Unit admin can; so can someone who manages every scope the Team holds", async () => {
+    const { theirs } = await setup();
+    await svc.setMember(root, infra.id, max.user, true);
+    expect(await r.teamMembers(infra.id)).toEqual([lee.user, max.user].sort());
+    await svc.setMember(root, infra.id, max.user, false);
+    await r.setScopedGrant({ scope: { type: "space", id: theirs.id }, subject: U(max.user), role: "owner" });
+    await svc.setMember(max, infra.id, max.user, true);
+    expect(await r.teamMembers(infra.id)).toContain(max.user);
+    await svc.setMember(max, infra.id, max.user, false);
+    expect(await r.teamMembers(infra.id)).toEqual([lee.user]);
+  });
+  test("a board owner role is not the caller's to give either: a Team with owner on a board needs a Unit admin", async () => {
+    await setup();
+    await r.setScopedGrant({ scope: { type: "board", id: board.id }, subject: T(infra.id), role: "owner" });
+    const ada2 = { ...ada }, fac = await custom();
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: U(ada.user), role: fac });
+    expect(await code(svc.setMember(ada2, infra.id, ada.user, true))).toBe("forbidden");
+  });
+  test("stale roles on a Team's scopes are ignored; an empty Team is open to a team manager", async () => {
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: U(max.user), role: await custom() });
+    const t2 = await r.createTeam({ tenant: acme.id, name: "Stale" });
+    await r.setScopedGrant({ scope: { type: "space", id: platform.id }, subject: T(t2.id), role: "wizard" });
+    await svc.setMember(max, t2.id, lee.user, true);
+    await svc.setMember(max, infra.id, lee.user, true);
+  });
+  test("bounded: a Team with more scopes than the cap is refused to a non-admin without reading them all", async () => {
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: U(max.user), role: await custom() });
+    let seen = 0;
+    const many = new Proxy(r, { get: (t, k) => (k === "scopesOf" ? async (_s, o) => { seen = o.limit; return { scopes: Array.from({ length: o.limit }, (_, i) => ({ type: "board", id: `b${i}`, role: "viewer" })), next: "x" }; } : t[k]) });
+    expect(await code(mk(many).setMember(max, infra.id, lee.user, true))).toBe("forbidden");
+    expect(seen).toBe(LIMITS.teamScopes + 1);
+    expect(await code(mk(many).setMember(root, infra.id, lee.user, true))).toBe(null);          // a Unit admin is not subject to it
+  });
+  test("granting a Team a role fails exactly as it would for a person", async () => {
+    const { mine } = await setup();
+    const fac = await r.createRole({ tenant: acme.id, name: "Wide", boardRole: "editor", permissions: ["delete"] });
+    await r.setScopedGrant({ scope: { type: "space", id: mine.id }, subject: U(lee.user), role: "editor" });
+    for (const [t, who] of [["user", kim.user], ["team", infra.id]]) {
+      // bad roles, escalation and non-managers answer alike for either subject kind
+      expect(await code(svc.setGrant(max, "space", mine.id, t, who === kim.user ? max.user : who, "god"))).toBe("bad-role");
+      expect(await code(svc.setGrant(lee, "space", mine.id, t, t === "user" ? max.user : who, "viewer"))).toBe("forbidden");
+    }
+    await r.setScopedGrant({ scope: { type: "space", id: platform.id }, subject: U(max.user), role: (await r.createRole({ tenant: acme.id, name: "Fac", boardRole: "viewer", permissions: ["members.manage"] })).id });
+    for (const [t, id] of [["user", ada.user], ["team", infra.id]]) expect(await code(svc.setGrant(max, "space", platform.id, t, id, fac.id))).toBe("forbidden");
+  });
+});
+
 describe("directory: the picker's search is the caller's own Unit", () => {
   test("people and Teams by substring, at most 8 each; a guest is refused; another Unit is never searched", async () => {
     const globex = await r.createTenant({ domain: "globex.com" });

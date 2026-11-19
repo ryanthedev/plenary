@@ -809,6 +809,8 @@ the later board-organization issues.
   Spaces existed).
 - **Personal space**: a Space with an `owner` (one per member per Unit, made by `ensurePersonalSpace`), private
   (`generalRole` null), the member its owner. **Team**: a named set of Unit members.
+- **A Team's membership is a grant.** Adding someone to a Team gives them each role the Team holds, so changing membership (and deleting the Team) needs the caller to be able to grant
+  or revoke each of those roles at each of those scopes, unless they are a Unit admin (§ Teams and access). No `team.manage` holder can reach a role through a Team they could not grant directly.
 - **Scoped grants**: a role for a user or a Team on a Unit, Group, Space or board (`setScopedGrant`). A user's own grant on
   a board stays in `grants` (`setGrant`), so the room's path and the last-owner rule are unchanged. A Group or Space keeps
   at least one `owner` grant (a user's or a Team's), atomically, like a board (the Unit's admins are the backstop and aren't counted).
@@ -1038,6 +1040,12 @@ or emptied while it is the only one. Any Unit member may read the Team list and 
 | `DELETE /teams/:id` | `team.manage` | 204. Removes the Team, its members and every grant it holds in one atomic step. **409 `last-owner`** (nothing changes) if it is the only counted owner of a Group or Space. **409 `too-large`** if it holds grants on more than 5000 scopes (remove some first) |
 | `PUT /teams/:id/members/:user` | `team.manage`; `:user` in the directory | 204, idempotent. A guest or unknown person: 400 `unknown-person` |
 | `DELETE /teams/:id/members/:user` | `team.manage` | 204, idempotent. **409 `last-owner`** if it would empty the only counted owner of a Group or Space |
+
+**A Team's grants are the caller's to give.** Adding a person to a Team gives them every grant the Team holds, and removing one (or deleting the Team) takes those away, so `team.manage`
+alone is not enough: unless the caller is a Unit admin, they must be able to do each of those as a direct grant, that is `members.manage` at each scope the Team holds a grant on and
+the role grantable by them there (the rule of § Access at a scope below, `owner` on a board only for a Unit admin). The check runs at write time over `scopesOf({ type: "team" })`, at most 50
+scopes (51 are read to tell); a Team holding more, or any scope the caller falls short on, is the ordinary 403 `forbidden`, the same body whatever the reason (it names no scope). A role stored on a
+Team that means nothing at its scope is ignored. Granting a Team a role (`PUT /access/.../grants/team/...`) is checked exactly as for a person.
 
 A Team's members are Unit members only; a Team membership or grant written for a guest is inert (§ Organization), which is why the write is refused rather than stored.
 

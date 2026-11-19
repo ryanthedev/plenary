@@ -13,7 +13,7 @@ import { roleDef, MGMT_PERMS } from "./permissions.js";
 import { TEAMS } from "./registry-port.js";
 
 /** What one read shows at most, and the work each does (PROTOCOL.md § Teams and access, Bounds). */
-export const LIMITS = Object.freeze({ teams: TEAMS.page.default, rows: 50, inherited: 20, boardPeople: 200, search: 8, admins: 100, scopes: 5000, scopePage: 500, backlog: 2000, addPages: 20, retries: 3 });
+export const LIMITS = Object.freeze({ teams: TEAMS.page.default, rows: 50, inherited: 20, boardPeople: 200, search: 8, admins: 100, scopes: 5000, teamScopes: 50, scopePage: 500, backlog: 2000, addPages: 20, retries: 3 });
 const TYPES = ["unit", "group", "space", "board"];
 const LADDER_NAMES = { viewer: "Viewer", commenter: "Commenter", annotator: "Annotator", editor: "Editor", owner: "Owner" };
 const LADDER_SUMMARY = {
@@ -101,6 +101,29 @@ export function accessService({ registry, tenancy, announce = () => {}, backlog 
       after = p.next;
     } while (after != null);
     return out;
+  }
+
+  /**
+   * Adding a person to a Team grants them every grant the Team holds, and removing one revokes them (so does deleting the Team): the caller must be able
+   * to do each of those as a direct grant (`members.manage` at the scope and the role grantable by them there, the same `touchable` rule), or `team.manage`
+   * would be a back door to roles the caller cannot give. A Unit admin passes. Bounded: at most LIMITS.teamScopes scopes are read and checked; a Team that
+   * holds more, or any scope the caller falls short on, is the ordinary refusal for a non-admin.
+   */
+  async function mayChangeTeam(identity, unit, team) {
+    if (isUnitAdmin(unit, identity)) return true;
+    const p = await registry.scopesOf({ type: "team", id: team }, { limit: LIMITS.teamScopes + 1 });
+    if (p.scopes.length > LIMITS.teamScopes) return false;
+    if (!p.scopes.length) return true;
+    const roles = new Map((await registry.roles(unit.id)).map(r => [r.id, r]));
+    const containers = p.scopes.filter(s => s.type !== "board");
+    const got = containers.length ? await tenancy.effectiveMany(identity, containers.map(s => ({ type: s.type, id: s.id }))) : new Map();
+    const subject = { type: "team", id: team };
+    for (const sc of p.scopes) {
+      if (!validAt(sc.role, sc.type, roles)) continue;                          // a stale role counts for nothing: nothing to give or take
+      const access = sc.type === "board" ? await tenancy.effective(identity, sc.id, { uniform: true }) : got.get(sc.type + "\n" + sc.id);
+      if (!access || !may(access, "members.manage") || !touchable(access, sc.role, sc.type, roles, false, subject, identity)) return false;
+    }
+    return true;
   }
 
   /** Is `user` a person the Unit knows: in its directory, or one of its admins named by id (the operator vouches for them)? */
@@ -206,6 +229,7 @@ export function accessService({ registry, tenancy, announce = () => {}, backlog 
     /** DELETE /teams/:id: collects the scopes it holds, deletes atomically, then announces each as a revocation. */
     async deleteTeam(identity, id) {
       const { unit, team } = await managedTeam(identity, id);
+      if (!(await mayChangeTeam(identity, unit, team.id))) throw refused();
       const scopes = await scopesOfTeam(team.id);
       if (!scopes) throw new AdminError("too-large", "the team holds grants on too many scopes; remove some first");
       try { await registry.deleteTeam(team.id); }
@@ -224,6 +248,7 @@ export function accessService({ registry, tenancy, announce = () => {}, backlog 
       const u = userIdOf(user);
       if (!u) throw bad("bad user");
       const { unit, team } = await managedTeam(identity, id);
+      if (!(await mayChangeTeam(identity, unit, team.id))) throw refused();
       if (member && !(await isKnownPerson(unit, u))) throw new AdminError("unknown-person", "that person is not a member of this Unit");
       try { await registry.setTeamMember(team.id, u, member); }
       catch (err) {

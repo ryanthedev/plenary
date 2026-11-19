@@ -8,6 +8,8 @@
 //   2. stopped rigs: <repo>/.rig/<name> dirs whose processes are all gone, as `cluster-rig.js status` decides it (it
 //      applies the rig's psInfo rule: a ps that fails reads as "alive", so the rig stays). A live rig is never touched.
 //   3. --scratch <dir>: its direct children, same age and in-use rules as 1 (agents' scratch copies).
+// Accepted limits: a path is lstat'd and then resolved, so something swapped for a device in between could still be opened
+// (a race only a process of this user can win); and a hung network or autofs path in lsof output can still block the lstat itself.
 // Never opens anything that is not a plain file or directory (a FIFO, socket or device is kept, never resolved: opening a
 // pty slave or a named pipe can block forever), never follows a symlink (a symlinked entry is skipped; links inside an entry are unlinked, not entered), never touches
 // anything outside the temp dir, this repo's .rig and the given scratch dir, and refuses a base that is / or $HOME.
@@ -20,7 +22,7 @@
 
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { lstatSync, readdirSync, readFileSync, realpathSync, rmSync, existsSync, renameSync } from "node:fs";
+import { lstatSync, statSync, readdirSync, readFileSync, realpathSync, rmSync, existsSync, renameSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { dlopen, FFIType, read } from "bun:ffi";
@@ -188,6 +190,7 @@ function ownerPid(dir, name) {
 
 const underAny = (opens, p) => opens.some(o => o === p || o.startsWith(p + sep));
 const refuseBase = (p, what) => {
+  if (!statSync(p).isDirectory()) throw new Error(`refusing to clean ${what} ${p}: not a directory (never opened)`);   // stat does not open; realpath does
   const real = realpathSync(p);
   const home = realpathSync(homedir());
   if (real === sep || real === home || home.startsWith(real + sep) || ROOT === real || ROOT.startsWith(real + sep))
@@ -311,7 +314,9 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
       const dir = join(real, name);
       if (!lstatSync(dir).isDirectory()) continue;
       consider("rig", real, name, { minIdleMs: RIG_GRACE_MS, check: p => {
-        if (!existsSync(join(p, "rig.json"))) return "no rig.json (an up in progress or failed)";
+        let regular = false;
+        try { regular = lstatSync(join(p, "rig.json")).isFile(); } catch { /* missing */ }
+        if (!regular) return "no rig.json (an up in progress or failed)";
         const left = timeLeft();
         if (left <= 0) return "skipped (time limit)";
         const alive = rigAlive(p, Math.max(1, Math.min(60_000, left)));

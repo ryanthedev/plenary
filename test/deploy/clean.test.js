@@ -616,26 +616,43 @@ test("--min-age under 10 minutes needs force", () => {
 });
 
 // A hang found 2026-11-19: clean() resolved every path lsof listed with realpathSync, which opens it; a pty slave under /dev
-// (/dev/ttys116) blocked open(2) in the kernel for good (uninterruptible), freezing every `bun test` run on that machine.
-test("resolveOpens never resolves (opens) a device, FIFO or socket, only plain files and directories", () => {
+// blocked open(2) in the kernel for good (uninterruptible), freezing every `bun test` run. Tests never touch a real device:
+// they use a /dev path that does not exist, and a spy that records what the code stats and resolves.
+test("resolveOpens never stats or resolves anything under /dev, and resolves only plain files and directories", () => {
   const w = world(), file = join(w.root, "plain"), fifo = join(w.root, "pipe");
   writeFileSync(file, "x");
   expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
-  const resolved = [], realpath = p => (resolved.push(p), p);
-  const out = resolveOpens(["/dev/ttys116", "/dev/ptmx", fifo, file, w.root, join(w.root, "gone")], lstatSync, realpath);
-  expect(resolved).toEqual([file, w.root]);                      // the fifo is lstat'd (not opened) and skipped; /dev never even lstat'd
-  expect(out).toEqual(expect.arrayContaining(["/dev/ttys116", fifo, file, w.root]));   // still reported as lsof printed them
+  const resolved = [], statted = [], realpath = p => (resolved.push(p), p), stat = p => (statted.push(p), lstatSync(p));
+  const out = resolveOpens(["/dev/plenary-no-such-device", "/dev/plenary-no-such-pty", fifo, file, w.root, join(w.root, "gone")], stat, realpath);
+  expect(resolved).toEqual([file, w.root]);
+  expect(statted.some(p => p.startsWith("/dev/"))).toBe(false);
+  expect(out).toEqual(expect.arrayContaining(["/dev/plenary-no-such-device", fifo, file, w.root]));   // still reported as lsof printed them
 });
 
-test("a FIFO in the temp dir (listed open by lsof) is kept and never opened; the run ends in time", () => {
-  const w = world(), fifo = join(w.tempDir, "plenary-test-fifo11");
+test("a FIFO candidate in the temp dir is kept and never opened; a FIFO or missing path as a base is refused or absent without opening", async () => {
+  const w = world(), fifo = join(w.tempDir, "plenary-test-fifo11"), pipeBase = join(w.root, "pipe-base");
   expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
-  // run in a subprocess so a regression (a blocked open) fails at the timeout instead of hanging the whole run
+  expect(spawnSync("mkfifo", [pipeBase]).status).toBe(0);
+  // A subprocess with a timer that does not wait after the kill: a regression ends this test at the timer, never the run.
   const script = `import { clean } from ${JSON.stringify(join(ROOT, "scripts/clean.js"))};
-    const r = clean({ tempDir: ${JSON.stringify(w.tempDir)}, rigRoot: null, now: Date.now() + 3 * 3_600_000, yes: true, openPathsFn: () => [${JSON.stringify(fifo)}, "/dev/ttys116"] });
-    console.log(JSON.stringify(r.items.map(i => [i.status, i.why])));`;
-  const r = spawnSync(process.execPath, ["--no-env-file", "-e", script], { encoding: "utf8", timeout: 20_000, killSignal: "SIGKILL" });
-  expect(r.error).toBeUndefined();
-  expect(JSON.parse(r.stdout)).toEqual([["kept", "not a regular file or directory"]]);
+    const r = clean({ tempDir: ${JSON.stringify(w.tempDir)}, rigRoot: null, now: Date.now() + 3 * 3_600_000, yes: true, openPathsFn: () => [${JSON.stringify(fifo)}, "/dev/plenary-no-such-device"] });
+    let refused = ""; try { clean({ tempDir: ${JSON.stringify(pipeBase)}, rigRoot: null, openPathsFn: () => [] }); } catch (e) { refused = e.message; }
+    console.log(JSON.stringify({ items: r.items.map(i => [i.status, i.why]), refused }));`;
+  const p = Bun.spawn([process.execPath, "--no-env-file", "-e", script], { stdout: "pipe", stderr: "ignore" });
+  kids.push(p);
+  const out = await Promise.race([new Response(p.stdout).text(), Bun.sleep(15_000).then(() => { p.kill("SIGKILL"); return null; })]);
+  expect(out).not.toBeNull();
+  const got = JSON.parse(out);
+  expect(got.items).toEqual([["kept", "not a regular file or directory"]]);
+  expect(got.refused).toMatch(/not a directory/);
   expect(lstatSync(fifo).isFIFO()).toBe(true);
+});
+
+test("a rig.json that is not a regular file keeps the rig (never handed to the status child)", () => {
+  const w = world(), d = join(w.rigRoot, "odd");
+  mkdirSync(d); expect(spawnSync("mkfifo", [join(d, "rig.json")]).status).toBe(0);
+  let asked = 0;
+  const r = clean({ ...w, now: LATER(), yes: true, openPathsFn: () => [], rigAlive: () => (asked++, false) });
+  expect(asked).toBe(0);
+  expect(byName(r, "odd").why).toMatch(/no rig.json/);
 });

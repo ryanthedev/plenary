@@ -359,11 +359,14 @@ async function createMinioBucket(endpoint, bucket, MINIO_ACCESS, MINIO_SECRET, t
 }
 
 /** Poll `check` until true; fail fast if `proc` died or the rig was aborted; clear timeout error naming the log. */
+/** The last bytes of a service's log, for an error message: `down --clean` removes the log, so the cause must travel with the error. */
+const logTail = (path, n = 400) => { try { return readFileSync(path, "utf8").trim().slice(-n); } catch { return ""; } };
+
 async function waitFor(check, { what, proc, deadline, abort }) {
   while (true) {
     if (abort?.aborted) throw new Error(`aborted while waiting for ${what}`);
     if (await check()) return;
-    if (proc && !isOurs(proc)) throw new Error(`${what}: the process exited before it was ready (log: ${proc.log})`);
+    if (proc && !isOurs(proc)) throw new Error(`${what}: the process exited before it was ready (log: ${proc.log})${logTail(proc.log) ? `\n${what} said: ${logTail(proc.log)}` : ""}`);
     if (Date.now() > deadline) throw new Error(`${what}: not ready after the timeout (log: ${proc?.log ?? "n/a"})`);
     await sleep(100);
   }

@@ -28,7 +28,7 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 
 /* ── top bar ── */
 .topbar { height: 46px; display: flex; align-items: center; gap: 6px; padding: 0 10px; background: var(--chrome); border-bottom: 1px solid var(--border); flex-shrink: 0; }
-.header-actions { display: flex; align-items: center; gap: 6px; position: relative; min-width: 0; }
+.header-actions { display: flex; align-items: center; gap: 6px; position: relative; min-width: 0; flex-shrink: 0; }
 .header-actions > .header-more { display: none; }
 .header-more-menu { display: none; position: absolute; right: 0; top: calc(100% + 6px); z-index: 30; min-width: 168px; padding: 4px; background: var(--raised); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow); }
 .header-more-menu button { display: flex; width: 100%; align-items: center; padding: 7px 9px; border-radius: 5px; text-align: left; white-space: nowrap; }
@@ -286,9 +286,13 @@ body .phone-only { display: none !important; }
   .banner { top: 8px; font-size: 11px; white-space: normal; width: calc(100% - 16px); }
 }
 
-.collab-pop { max-width: calc(100% - 16px); max-height: calc(100% - 16px); display: flex; flex-direction: column; }
-.collab-pop > header, .collab-pop > .reply { flex-shrink: 0; }
-.collab-pop .body { min-height: 0; flex: 1 1 auto; overflow: auto; }
+@media (max-width: 360px) {
+  .dock .tb { font-size: 7.5px; letter-spacing: -.03em; padding: 0; }
+}
+
+.collab-pop { max-width: calc(100% - 16px); max-height: calc(100% - 16px); display: flex; flex-direction: column; overflow-y: auto; }
+.collab-pop > header, .collab-pop > .body, .collab-pop > .reply { flex-shrink: 0; }
+.collab-pop .body { flex: 0 0 auto; max-height: none; overflow: visible; }
 
 svg text { font-family: var(--font); }
 [hidden] { display: none !important; }

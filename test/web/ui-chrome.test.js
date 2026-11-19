@@ -14,6 +14,11 @@ test("header ellipsis rules cover 1024, 1279, and 1280 pixel desktop widths", ()
   expect(css).toMatch(/\.watching\s*\{[^}]*max-width:\s*150px[^}]*overflow:\s*hidden[^}]*text-overflow:\s*ellipsis[^}]*flex:\s*0 1 auto/s);
   expect(css).toMatch(/\.topbar \.board-name\s*\{[^}]*max-width:\s*clamp\(56px, 12vw, 150px\)/s);
   expect(css).toMatch(/\.watching\s*\{[^}]*max-width:\s*96px/s);
+  expect(css).toMatch(/\.header-actions\s*\{[^}]*flex-shrink:\s*0/s);
+  expect(css).toMatch(/\.watching\s*\{[^}]*min-width:\s*0[^}]*overflow:\s*hidden[^}]*text-overflow:\s*ellipsis[^}]*flex:\s*0 1 auto/s);
+  expect(css).toMatch(/\.collab-pop\s*\{[^}]*overflow-y:\s*auto/s);
+  expect(css).toMatch(/\.collab-pop > header, \.collab-pop > \.body, \.collab-pop > \.reply\s*\{[^}]*flex-shrink:\s*0/s);
+  expect(css).toMatch(/@media\s*\(max-width:\s*360px\)[\s\S]*?\.dock \.tb[^}]*font-size:[^}]*letter-spacing:[^}]*padding:/s);
 });
 
 test("canvas page has a page heading", () => {

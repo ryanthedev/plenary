@@ -138,13 +138,13 @@ test("viewers read threads but get no reply box, no resolve, no reactions, and c
 });
 
 test("phone popovers clamp above the bottom sheet inset", () => {
-  dom.root.clientHeight = 700;
+  dom.root.clientHeight = 469;
   const { port, collab } = setup();
   port.remote({ do: "thread", id: "t", anchor: { point: { x: 600, y: 650 } }, text: "hello" }, "maya", "Maya");
   collab.openThread("t");
-  collab.setBottomInset(200);
+  collab.setBottomInset(260);
   const pop = byClass(dom.root, "collab-pop")[0];
-  expect(byClass(dom.root, "collab-pophost")[0].style.getPropertyValue("bottom")).toBe("200px");
+  expect(byClass(dom.root, "collab-pophost")[0].style.getPropertyValue("bottom")).toBe("260px");
   expect(Number.parseFloat(pop.style.getPropertyValue("top"))).toBeLessThanOrEqual(152);
   collab.setBottomInset(0);
   expect(byClass(dom.root, "collab-pophost")[0].style.getPropertyValue("bottom")).toBe("0px");

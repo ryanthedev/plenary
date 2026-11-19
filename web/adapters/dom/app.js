@@ -323,14 +323,16 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     h("span.ic", {}, t.icon), t.keys?.[0] ? h("span.k", {}, t.keys[0].toUpperCase()) : null);
   }
 
+  let moreButton = null;
   function topbar() {
     const role = S.role, tools = toolsFor(role), may = S.may();
     const core = tools.filter(t => !["image", "note", "highlighter"].includes(t.id)), extras = tools.filter(t => ["image", "note", "highlighter"].includes(t.id));
     const toggleDrawer = type => { ui.drawer = ui.drawer === type ? null : type; chromeDirty = true; };
+    const toggleNotes = () => { ui.drawer = ui.drawer ? null : "notes"; chromeDirty = true; };
     const toggleTheme = () => setTheme(ui.theme === "dark" ? "light" : "dark");
     const togglePanel = () => setPanel({ type: "open" });
     const toggleExport = () => openDialog("export");
-    const extraAction = (label, action, disabled = false) => h("button.header-extra.btn.ghost", { role: "menuitem", "aria-label": label, title: label, disabled, onclick: () => { setMore(false, true); action(); } }, label);
+    const extraAction = (label, action, disabled = false) => h("button.header-extra.btn.ghost", { role: "menuitem", "aria-label": label, title: label, disabled, onclick: () => { refocusMore = true; setMore(false); action(); } }, label);
     const moreOpen = !!ui.moreOpen;
     let menu;
     const menuItems = () => {
@@ -350,6 +352,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       if (e.key === "ArrowDown" && !ui.moreOpen) { e.preventDefault(); setMore(true); }
       else if (e.key === "Escape" && ui.moreOpen) { e.preventDefault(); setMore(false, true); }
     } }, "More");
+    moreButton = more;
     menu = h("div.header-more-menu", { role: "menu", hidden: !moreOpen, onkeydown: e => {
       if (e.key === "Escape") { e.preventDefault(); setMore(false, true); }
       else if (e.key === "Tab") setMore(false);
@@ -364,7 +367,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       }
     } }, [
       collab ? extraAction("Comments", () => toggleDrawer("comments")) : null,
-      extraAction("Notes", () => toggleDrawer("notes")),
+      extraAction("Notes", toggleNotes),
       role === "presenter" ? extraAction("Mermaid", () => openDialog("mermaid"), !may) : null,
       role === "presenter" ? extraAction("Export", toggleExport) : null,
       role !== "viewer" ? extraAction("Side panel", togglePanel) : null,
@@ -374,7 +377,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         role === "presenter" ? [
           h("button.btn.ghost.desk-only.header-extra", { title: "Insert a Mermaid flowchart", "aria-label": "Insert Mermaid flowchart", disabled: !may, onclick: () => openDialog("mermaid") }, "◇→"),
           h("button.btn.ghost.desk-only.header-extra", { title: "Export SVG / PNG (⌘⇧E)", "aria-label": "Export", onclick: toggleExport }, "⤓")] : null,
-        h("button.btn.ghost.desk-only.header-extra", { "aria-label": "Notes", title: "Notes", onclick: () => { ui.drawer = ui.drawer ? null : "notes"; chromeDirty = true; } }, "❏ Notes ", h("span.dim", {}, String(notesCount()))),
+        h("button.btn.ghost.desk-only.header-extra", { "aria-label": "Notes", title: "Notes", onclick: toggleNotes }, "❏ Notes ", h("span.dim", {}, String(notesCount()))),
         collab ? h("button.btn.ghost.desk-only.header-extra", { "aria-label": "Comments", title: "Comments (or right-click the board)", onclick: () => toggleDrawer("comments") }, "💬") : null,
         collab ? collab.parts.avatars : h("div.avatars", {},
           h("span.stack", {}, h("span.av.live", { style: { background: "var(--u-me)" }, title: `${me.name} (you)` }, me.name.slice(0, 2).toUpperCase()))),
@@ -470,7 +473,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const sheet = id => () => { ui.sheet = ui.sheet === id ? null : id; chromeDirty = true; };
     const tool = id => btn(T(id).icon, T(id).name, S.tool === id, () => { if (id === "image") openPicker(); S.setTool(id); chromeDirty = true; }, !may);
     let items;
-    if (role === "presenter") items = [...["select", "freedraw", "rectangle", "text"].map(id => id === "rectangle" ? btn(T(id).icon, "Rect", S.tool === id, () => S.setTool(id), !may, T(id).name) : tool(id)), btn("⋯", "More", ui.sheet === "tools", sheet("tools")), btn("◧", "Style", ui.sheet === "panel", sheet("panel")), btn("❏", "Notes", ui.sheet === "notes", sheet("notes")), btn("💬", "Chat", ui.sheet === "comments", sheet("comments"), false, "Comments")];
+    if (role === "presenter") items = [...["select", "freedraw", "rectangle", "text"].map(id => id === "rectangle" ? btn(T(id).icon, "Rect", S.tool === id, () => S.setTool(id), !may, T(id).name) : tool(id)), btn("⋯", "More", ui.sheet === "tools", sheet("tools")), btn("◧", "Style", ui.sheet === "panel", sheet("panel")), btn("❏", "Notes", ui.sheet === "notes", sheet("notes")), btn("💬", "Comments", ui.sheet === "comments", sheet("comments"))];
     else if (role === "annotator") items = [...["select", "note", "highlighter", "freedraw"].map(tool), btn("⋯", "More", ui.sheet === "tools", sheet("tools")), btn("◧", "Style", ui.sheet === "panel", sheet("panel")), btn("❏", "Notes", ui.sheet === "notes", sheet("notes"))];
     else items = [btn("‹", "Prev", false, () => S.stepFrame(-1)), btn("⤢", "Fit", false, () => S.fit()), btn("›", "Next", false, () => S.stepFrame(1)), btn("❏", "Notes", ui.sheet === "notes", sheet("notes")), btn("💬", "Comments", ui.sheet === "comments", sheet("comments"))];
     replace($("#dock"), items);
@@ -584,6 +587,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   //                connection): incoming ops, a pan or a zoom leave every key alone, so nothing rebuilds.
   // Keys read per-revision memos (notesInfo, boardInfo), never a scan per frame. ui.rebuilds counts rebuilds per part.
   const CHROME_MS = 250;
+  let refocusMore = false;
   const rebuilds = ui.rebuilds = { topbar: 0, panel: 0, drawer: 0, timeline: 0, hud: 0, overlays: 0, dock: 0, sheet: 0, dialogs: 0 };
   let chromeAt = -Infinity, gateKey = "", chromeHeld = false;
   document.addEventListener("pointerdown", e => { if (e.target !== canvas) chromeHeld = true; }, true);
@@ -659,6 +663,10 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       if (!force && k === keys[name]) continue;
       if (part.build() === false) { keys[name] = undefined; continue; }   // busy: try again later
       keys[name] = k; rebuilds[name]++;
+    }
+    if (refocusMore) {
+      refocusMore = false;
+      moreButton?.focus?.();
     }
     if (collab && isPhone()) {
       const canvasRect = canvas.getBoundingClientRect();

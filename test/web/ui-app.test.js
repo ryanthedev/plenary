@@ -226,7 +226,10 @@ test("More menu follows menu keyboard navigation and restores focus after activa
   more.fire("keydown", { key: "ArrowDown" });
   const notes = menu.all().find(e => e.attrs.role === "menuitem" && e.attrs["aria-label"] === "Notes");
   notes.click();
-  expect(page.doc.activeElement).toBe(more);
+  rig.step(2);
+  const rebuiltMore = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More");
+  expect(rebuiltMore).not.toBe(more);
+  expect(page.doc.activeElement).toBe(rebuiltMore);
   expect(more.attrs["aria-expanded"]).toBe("false");
   expect(rig.app.ui.drawer).toBe("notes");
 });
@@ -251,11 +254,18 @@ test("all collaboration emoji toolbar buttons have descriptive accessible labels
 
 test("header Notes closes an already open drawer", () => {
   rig = setup();
-  const notes = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "Notes");
+  let notes = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "Notes");
   rig.app.ui.drawer = "comments";
   rig.step(2);
+  notes = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "Notes");
   notes.click();
   rig.step(2);
+  expect(rig.app.ui.drawer).toBeNull();
+  notes = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "Notes");
+  notes.click(); rig.step(2);
+  expect(rig.app.ui.drawer).toBe("notes");
+  notes = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "Notes");
+  notes.click(); rig.step(2);
   expect(rig.app.ui.drawer).toBeNull();
 });
 
@@ -265,6 +275,13 @@ test("six-digit viewer count remains available in the mounted header", () => {
   while (rig.net.step());
   const watching = find(page.byId.topbar, e => e.classList.contains("watching"));
   expect(watching.textContent).toBe("👁 100,000 viewers");
+  expect(page.byId.topbar.all().filter(e => e.classList.contains("av")).length).toBeGreaterThanOrEqual(2);
+});
+
+test("phone dock uses visible Comments text in its accessible name", () => {
+  rig = setup({ collab: true });
+  const comments = find(page.byId.dock, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "Comments");
+  expect(comments.textContent).toBe("💬Comments");
 });
 
 test("local drawing on an empty board does not move the view", () => {

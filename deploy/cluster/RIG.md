@@ -91,6 +91,33 @@ After a `SIGKILL` of `test:cluster` itself (nothing can catch it): the `up` help
 --watch-parent <pid>`) and stops what it started, but services of a run that was already testing are left running.
 The next `bun run test:cluster` reaps every `test-<pid>-<hash>` rig whose owner is gone: its pid is dead, or reused by another process (the owner's start time is recorded beside the rig dir, in `test-<pid>-<hash>.owner`) (never a live run's rig: when `ps` cannot answer, the rig is left alone, and after a Ctrl-C during the reap no more `ps` runs, so only rigs whose owner pid is dead are still reaped; the owner record is written by temp file and rename, never seen empty; never
 another name). To recover by hand: `bun run rig ls` lists live rigs, then `bun run rig down --name <name> --clean`.
+
+### Cleaning up
+
+`bun run clean` (a dry run: it lists what it would remove and the bytes, then a one-line total) and `bun run clean --yes`
+(removes it) clear what test, load and rig runs leave behind, so the disk does not fill. Options: `--min-age 2h` (the default;
+`90m`, `1d`), `--scratch <dir>` (also clear that dir's direct children, e.g. an agent's scratch copies), `--verbose`
+(list kept entries and why). Three targets, each removed only when provably not in use, and kept on any doubt:
+
+- the temp dir's entries whose names match exactly what the tests and scripts create (`<known prefix><6 mkdtemp characters>`, from the
+  `TEMP_PREFIXES` list in `scripts/clean.js`, or `plen-run-<pid>-*`; there is no bare-prefix match, so add a new mkdtemp prefix to that list),
+  owned by the current user (anything else is skipped), idle for `--min-age` (the newest mtime in the tree) with no process holding a file or
+  its cwd inside (one `lsof`; an `lsof` that fails keeps everything). `plen-run-<pid>-*` roots also need a dead owner: `owner.json`'s `pid`,
+  else the pid in the name;
+- stopped rigs: this repo's `.rig/<name>` dirs whose processes are all gone, by this CLI's own `status` (a `ps` that fails reads as alive,
+  so the rig stays); a dir touched in the last minute or without a `rig.json` is skipped. Other worktrees' `.rig` dirs are not touched:
+  run it there;
+- `--scratch <dir>`: the same age, owner and in-use rules, for any name.
+
+`lsof` run as a normal user does not see other users' or root's processes, and a snapshot goes stale. So right before each removal the
+entry is renamed to `.plen-deleting-<name>` (same dir), checked again with `lsof +D <path>`, and removed only if that finds nothing and
+works; otherwise it is renamed back and kept. A crash in between leaves a `.plen-deleting-<name>` that the next run treats like any other
+candidate. `lsof` prints control characters in a path escaped, so an odd path is judged by that per-path check (by inode), not by name.
+
+`--min-age` below 10 minutes is refused unless `--force` is also given. Symlinks are never followed (a symlinked entry is skipped), nothing
+outside those three places is touched, and a base (temp dir, `.rig`, scratch) that resolves to `/`, `$HOME` or a parent of the repo is
+refused.
+
 The gated files are
 `test/server/pg-store`, `pg-registry`, `nats-bus`, `room-host-lease`, `room-host-proc`, `main-cluster`, `s3-blobs`,
 and `test/admin/tenants`.

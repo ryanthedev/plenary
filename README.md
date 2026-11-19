@@ -98,6 +98,9 @@ bun test
 - **One dependency:** the NATS client, pinned in `bun.lock`.
 - **Skipped tests are expected.** The Postgres, NATS and S3 tests run only when `DATABASE_URL`, `NATS_URL` and
   the `S3_*` variables are set. CI has a second job that starts those services and runs them.
+- **Disk cleanup.** Test, load and rig runs leave dirs behind. `bun run clean` lists what it would remove and the
+  bytes (a dry run); `bun run clean --yes` removes it. It keeps anything young (`--min-age`, default 2h; under 10m needs `--force`) or in use,
+  and never touches a live rig; see `deploy/cluster/RIG.md` ("Cleaning up").
 - **CI** runs `bun test` on every push and pull request.
 - **Plain JS + JSDoc, no build step.** `packages/protocol` must also load in runtimes without browser or Node
   globals, so it imports only two core files and its own. `test/purity.test.js` checks this statically.

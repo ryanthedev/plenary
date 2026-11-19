@@ -199,3 +199,33 @@ test("#92 MED-4: a superseded usage read is ignored when it answers", async () =
   expect(await stale).toEqual({ ok: false, code: "quota" });                     // 100 + 100 > 150 either way
   expect(await inner.usage("t1")).toBe(100);
 });
+
+test("#92 MED-4: two overlapping usage reads with a put during each, resolving in either order and the late put landing before or after: no quota check ever sees a count below the true stored bytes", async () => {
+  for (const order of [[1, 2], [2, 1]]) for (const lateFirst of [true, false]) {
+    let holdPuts = [], holdReads = [];
+    const { access, inner } = make({ quotaBytes: 350, wrap: {
+      put: async (...a) => { const g = holdPuts.shift(); if (g) await g.promise; return inner.put(...a); },
+      usage: async (...a) => { const n = await inner.usage(...a); const g = holdReads.shift(); if (g) await g.promise; return n; },   // the answer is fixed when asked, delivered when released
+    } });
+    const pic = k => fakePng(100, 60 + k), put = async k => access.put(await putUrl(access, "t1", pic(k)), pic(k));
+    const tick = () => new Promise(r => setTimeout(r, 4));
+    expect((await put(0)).ok).toBe(true);                       // S: 100 stored (the first read, unheld)
+    const g1 = deferred(), g1b = deferred(), r1 = deferred(), r2 = deferred();
+    holdPuts = [g1, g1b];
+    const p1 = put(1), p1b = put(2);                            // both past the seed, held before their bytes are stored
+    await tick();
+    holdReads = [r1, r2];
+    access.recount("t1");
+    const p2 = put(3); await tick();                            // read 1 starts (sees 100)
+    g1.resolve(); await p1;                                     // a put finishes during read 1: true 200
+    access.recount("t1");
+    const p3 = put(4); await tick();                            // read 2 starts (sees 200), read 1 superseded
+    if (lateFirst) { g1b.resolve(); await p1b; }                // another put finishes during read 2: true 300
+    const rs = { 1: r1, 2: r2 };
+    rs[order[0]].resolve(); await tick(); rs[order[1]].resolve();
+    if (!lateFirst) { g1b.resolve(); await p1b; }
+    const [x, y] = await Promise.all([p2, p3]);
+    expect(await inner.usage("t1")).toBe(300);                  // the true bytes: nothing else was stored
+    expect([x, y]).toEqual([{ ok: false, code: "quota" }, { ok: false, code: "quota" }]);   // 300 + 100 > 350 for both: a count below 300 lets one in
+  }
+});

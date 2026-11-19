@@ -48,7 +48,7 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
   if (!Number.isFinite(quotaBytes) || quotaBytes < 0) throw new TypeError("blobAccess: quotaBytes must be a number ≥ 0");
   const mac = crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
 
-  /** @type {Map<string, { used: number, reserved: number, ready: Promise<void> | null, at: number, seq: number, sinceRead: number }>} at: when the last read of usage answered; seq: the newest read's number; sinceRead: bytes put while it was in flight */
+  /** @type {Map<string, { used: number, reserved: number, ready: Promise<void> | null, at: number, seq: number, sinceRead: number, reading: boolean }>} at: when the last read of usage answered; seq: the newest read's number; sinceRead: bytes put while it was in flight */
   const tenants = new Map();
 
   /** The signed claims of a token for `verb`, or { ok: false, code }. */
@@ -72,18 +72,29 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
     return { ok: true, tenant, board, sha1, user: claims.user ?? null };
   }
 
-  /** Read the tenant's usage once (concurrent first puts share one read); a failed read is tried again by the next put. */
-  function seed(tenant) {
+  /**
+   * Read the tenant's usage once (concurrent first puts share one read); a failed read is tried again by the next put. Resolves only when the read
+   * it waited on is still the newest (a recount may have started another meanwhile: the loop waits for that one), so no put is checked against a
+   * count a newer read is about to replace.
+   */
+  async function seed(tenant) {
     let st = tenants.get(tenant);
-    if (!st) tenants.set(tenant, st = { used: 0, reserved: 0, ready: null, at: 0, seq: 0, sinceRead: 0 });
-    if (st.ready && st.at && now() - st.at >= usageTtlMs) st.ready = null;     // stale: another node (or the reaper) changed what the tenant stores
-    // A read SETS the count to what it saw PLUS every byte put while it was in flight (its walk may have missed those): the count may double-count
-    // them (fail closed) but never misses them. Each read has a number; a read that was superseded (recount) is ignored when it answers.
-    if (!st.ready) {
-      const seq = ++st.seq; st.sinceRead = 0;
-      st.ready = Promise.resolve(blobs.usage(tenant)).then(n => { if (seq === st.seq) { st.used = n + st.sinceRead; st.at = now(); } }, err => { if (seq === st.seq) st.ready = null; throw err; });
+    if (!st) tenants.set(tenant, st = { used: 0, reserved: 0, ready: null, at: 0, seq: 0, sinceRead: 0, reading: false });
+    for (;;) {
+      if (st.ready && !st.reading && st.at && now() - st.at >= usageTtlMs) st.ready = null;   // stale: another node (or the reaper) changed what the tenant stores
+      // A read SETS the count to what it saw PLUS every byte put while it was in flight (its walk may have missed those): the count may double-count
+      // them (fail closed) but never misses them. Each read has a number; a superseded read (recount) never LOWERS the count when it answers.
+      if (!st.ready) {
+        const seq = ++st.seq; st.sinceRead = 0; st.reading = true;
+        st.ready = Promise.resolve(blobs.usage(tenant)).then(n => {
+          if (seq === st.seq) { st.used = n + st.sinceRead; st.at = now(); st.reading = false; }
+          else st.used = Math.max(st.used, n);
+        }, err => { if (seq === st.seq) { st.ready = null; st.reading = false; } throw err; });
+      }
+      const p = st.ready;
+      await p;
+      if (p === st.ready) return st;
     }
-    return st.ready.then(() => st);
   }
 
   const unavailable = (what, tenant, err) => { log.error(`blob ${what} failed`, { tenant, code: err?.code, err }); return { ok: false, code: "unavailable" }; };

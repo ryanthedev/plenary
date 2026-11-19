@@ -448,7 +448,8 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   const server = createServer({ auth, registry, store, bus, blobs, blobKey, ...(env.PUBLIC_URL ? { publicUrl: origin } : {}), ...(quotaRaw ? { quotaBytes: Number(quotaRaw) } : {}), log, limits, http, onWelcomed: recentRecorder({ registry, log: log.child({ component: "home" }) }), port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
     roles, node, host: { hostname: node, leaseTtlMs } });
   return { server, store, bus, registry, log, devBoard, oidc, node, roles, cluster, clusterId, leaseTtlMs,
-    async stop() { await server.stop(); await bus.close(); await store.close(); await rawRegistry.close(); } };
+    async stop() { await server.stop(); await Promise.race([spaces.settled(), new Promise(r => setTimeout(r, 2000).unref?.())]);   // let grants announcements finish (bounded)
+      await bus.close(); await store.close(); await rawRegistry.close(); } };
 }
 
 /**

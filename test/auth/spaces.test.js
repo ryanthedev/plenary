@@ -231,8 +231,11 @@ describe("rename and general access", () => {
   test("a personal space cannot be renamed or opened up; validation; at least one field", async () => {
     await svc.createBoard(max, {});
     const mine = (await svc.boardPicker(max)).spaces[0];
-    expect(await code(svc.update(max, "space", mine.id, { name: "x" }))).toBe("bad-request");
-    expect(await code(svc.update(max, "space", mine.id, { general: "viewer" }))).toBe("bad-request");
+    for (const who of [max, root]) {                       // the owner and a Unit admin get the ordinary 403: nothing says which Space is personal
+      expect(await code(svc.update(who, "space", mine.id, { name: "x" }))).toBe("forbidden");
+      expect(await code(svc.update(who, "space", mine.id, { general: "viewer" }))).toBe("forbidden");
+    }
+    expect(await code(svc.update(max, "space", "s-nope00000000", { name: "x" }))).toBe("forbidden");
     expect((await r.space(mine.id)).generalRole).toBe(null);
     for (const patch of [{}, { name: "" }, { name: 3 }, { general: "owner" }, { general: "x" }])
       expect(await code(svc.update(ada, "space", design.id, patch))).toBe("bad-request");
@@ -284,12 +287,21 @@ describe("rename and general access", () => {
 
 describe("uniform work and no-name answers (PROTOCOL.md § Spaces and Groups)", () => {
   // Wrap the Registry so every call is counted by method; a refusal must do the same Registry work whatever the id was.
-  const counted = () => {
+  // ONE call log is shared by `run`, which resets it: callers must run cases one after another, never under Promise.all.
+  const counted = (wrap = x => x) => {
     const calls = [];
     const reg = new Proxy(r, { get: (t, k) => (typeof t[k] === "function" ? (...a) => { calls.push(String(k)); return t[k](...a); } : t[k]) });
-    const s = spaceService({ registry: reg, tenancy: makeTenancy({ registry: reg }), announce: () => {} });
+    const s = spaceService({ registry: reg, tenancy: wrap(makeTenancy({ registry: reg })), announce: () => {} });
     return { s, run: async f => { calls.length = 0; await f(s).catch(() => {}); return [...calls].sort().join(","); } };
   };
+  test("harness self-check: the counter tells a non-uniform service from a uniform one", async () => {
+    // A tenancy that answers an unknown id without reading anything (the early-return bug): its cost must differ from a real id's.
+    const early = ten => ({ ...ten, effective: (who, scope, o) => (scope.id === "s-nope00000000" ? Promise.resolve({ ladder: null, permissions: new Set(), sources: [], until: null }) : ten.effective(who, scope, o)) });
+    const bug = counted(early), good = counted();
+    const cost = async (h, id) => h.run(s => s.update(max, "space", id, { name: "x" }));
+    expect(await cost(good, secret.id)).toBe(await cost(good, "s-nope00000000"));
+    expect(await cost(bug, secret.id)).not.toBe(await cost(bug, "s-nope00000000"));
+  });
   test("DW-3: hidden, unknown, other-Unit and malformed ids cost the same Registry calls, for every route", async () => {
     const globex = await r.createTenant({ domain: "globex.com" });
     const foreign = await r.createSpace({ tenant: globex.id, name: "Theirs" }), foreignGroup = await r.createGroup({ tenant: globex.id, name: "TheirG", generalRole: "viewer" });
@@ -303,7 +315,8 @@ describe("uniform work and no-name answers (PROTOCOL.md § Spaces and Groups)", 
       "POST board": (id) => s => s.createBoard(max, { space: id }),
     };
     for (const [name, mk] of Object.entries(cases)) {
-      const costs = new Set(await Promise.all(spaceIds.map(id => run(mk(id)))));
+      const costs = new Set();
+      for (const id of spaceIds) costs.add(await run(mk(id)));       // serial: one shared call log
       expect([name, costs.size]).toEqual([name, 1]);
     }
     const gcases = { "GET group": id => s => s.groupPage(max, id), "PATCH group": id => s => s.update(max, "group", id, { name: "x" }), "POST space in group": id => s => s.createSpace(max, { name: "n", group: id }) };
@@ -332,6 +345,63 @@ describe("uniform work and no-name answers (PROTOCOL.md § Spaces and Groups)", 
     expect(await code(svc.createBoard(root, { space: mine.space }))).toBe("forbidden");
     expect(await r.boardsIn({ type: "space", id: mine.space })).toEqual({ ids: [mine.id], next: null });
     expect((await svc.createBoard(max, { space: mine.space })).space).toBe(mine.space);       // its owner still can
+  });
+});
+
+describe("announcements: coalesced per scope, capped overall, the final state always announced", () => {
+  const mkBoards = n => Promise.all(Array.from({ length: n }, () => r.createBoard({ tenant: acme.id, space: design.id })));
+  const counting = (extra = {}) => {
+    let pagers = 0, published = 0;
+    const reg = new Proxy(r, { get: (t, k) => (k === "boardsIn" ? (...a) => { pagers++; return t.boardsIn(...a); } : t[k]) });
+    const s = spaceService({ registry: reg, tenancy: makeTenancy({ registry: reg }), announce: () => { published++; }, ...extra });
+    return { s, stats: () => ({ pagers, published }) };
+  };
+  test("a burst of 200 PATCHes on one Space runs at most 2 pagers, and the last pass starts after the last write", async () => {
+    await mkBoards(20);
+    const { s, stats } = counting();
+    const roles = ["viewer", "commenter", "annotator", "editor"];
+    await Promise.all(Array.from({ length: 200 }, (_, i) => s.update(ada, "space", design.id, { general: roles[i % 4] })));
+    await s.settled();
+    expect(stats().pagers).toBeLessThanOrEqual(2);
+    expect(stats().published).toBeLessThanOrEqual(40);
+    expect(stats().published).toBeGreaterThanOrEqual(20);
+  });
+  test("a change during a running pass gets one more pass after it (and not before the write)", async () => {
+    await mkBoards(3);
+    let gate, seen = [];
+    const hold = new Promise(res => { gate = res; });
+    let first = true;
+    const reg = new Proxy(r, { get: (t, k) => (k === "boardsIn" ? async (...a) => { const p = await t.boardsIn(...a); seen.push((await t.space(design.id)).generalRole); if (first) { first = false; await hold; } return p; } : t[k]) });
+    const s = spaceService({ registry: reg, tenancy: makeTenancy({ registry: reg }), announce: () => {} });
+    await s.update(ada, "space", design.id, { general: "commenter" });
+    await new Promise(res => setTimeout(res, 5));
+    await s.update(ada, "space", design.id, { general: "editor" });            // arrives while pass 1 is held
+    gate();
+    await s.settled();
+    expect(seen.length).toBe(2);
+    expect(seen.at(-1)).toBe("editor");                                          // pass 2 ran after the last write
+  });
+  test("the cap on scopes in flight holds: beyond it a change is logged and skipped, never queued", async () => {
+    const warns = [];
+    const spaces = await Promise.all(Array.from({ length: ANNOUNCE.inflight + 4 }, (_, i) => r.createSpace({ tenant: acme.id, name: "S" + i, generalRole: "viewer", owner: "google:ada" })));
+    let maxLive = 0, live = 0;
+    const reg = new Proxy(r, { get: (t, k) => (k === "boardsIn" ? async (...a) => { live++; maxLive = Math.max(maxLive, live); await new Promise(res => setTimeout(res, 10)); live--; return t.boardsIn(...a); } : t[k]) });
+    const s = spaceService({ registry: reg, tenancy: makeTenancy({ registry: reg }), announce: () => {}, log: { warn: m => warns.push(m) } });
+    await Promise.all(spaces.map(sp => s.update(ada, "space", sp.id, { general: "editor" })));
+    await s.settled();
+    expect(maxLive).toBeLessThanOrEqual(ANNOUNCE.inflight);
+    expect(warns.filter(m => /too many in flight/.test(m)).length).toBeGreaterThan(0);
+    for (const sp of spaces) expect((await r.space(sp.id)).generalRole).toBe("editor");      // the change itself is never skipped
+  });
+  test("a log.warn that throws inside the announcement is not an unhandled rejection", async () => {
+    await mkBoards(2);
+    const bad = new Proxy(r, { get: (t, k) => (k === "boardsIn" ? async () => { throw new Error("db down"); } : t[k]) });
+    const s = spaceService({ registry: bad, tenancy: makeTenancy({ registry: bad }), announce: () => {}, log: { warn: () => { throw new Error("log down"); } } });
+    let unhandled = 0; const on = () => { unhandled++; }; process.on("unhandledRejection", on);
+    await s.update(ada, "space", design.id, { general: "editor" });
+    await s.settled(); await new Promise(res => setTimeout(res, 10));
+    process.off("unhandledRejection", on);
+    expect(unhandled).toBe(0);
   });
 });
 

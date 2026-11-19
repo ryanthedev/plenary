@@ -591,7 +591,9 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     async ensurePersonalSpace(tenant, user) {
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");
-      return personalTx.immediate(tenant, String(user), now());
+      // Read first: Home calls this on every load, and the write lock (BEGIN IMMEDIATE) is taken only when the row is missing.
+      const had = rowSpace(q.personal.get(tenant, String(user)));
+      return had ?? personalTx.immediate(tenant, String(user), now());
     },
     async createTeam({ tenant, name }) {
       ready();

@@ -15,7 +15,7 @@ import { homeService } from "./home.js";
 /** What one read shows at most, and the work each does (PROTOCOL.md § Spaces and Groups, Bounds). */
 export const LIMITS = Object.freeze({ spaces: 100, groups: 50, groupSpaces: 100 });
 /** Freshness fan-out: pages of `boardsIn` announced inline; a larger scope's rest waits for the timed re-check (≤ 60 s). */
-export const ANNOUNCE = Object.freeze({ pages: 20, page: 500, par: 50 });
+export const ANNOUNCE = Object.freeze({ pages: 20, page: 500, par: 50, inflight: 8 });
 /** The general-access roles a Space or Group may carry: the ladder below `owner` (null = only people added). */
 export const GENERAL_ROLES = Object.freeze(ROLES.filter(r => r !== "owner"));
 
@@ -73,12 +73,20 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
   const createsBoards = a => may(a, "board.create");
   const opens = a => a.ladder != null;
 
-  /** Announcements in flight (they run after the response; `settled()` waits for them). */
-  const inflight = new Set();
-  /** After a change to what everyone in a scope gets: tell every board it reaches, off the request path (bounded; the rest waits for the timed re-check). */
+  /**
+   * Announcements (they run after the response; `settled()` waits for them). One pass per scope at a time: a change that arrives while a pass
+   * runs only marks the scope dirty and gets exactly ONE more pass after it (a burst of N changes costs at most 2 passes, and the last pass
+   * starts after the last write, so the final state is always announced). At most ANNOUNCE.inflight scopes run at once; beyond that the
+   * change is logged and left to the gateways' timed re-check (60 s at most).
+   */
+  const running = new Map();                      // scope key -> { dirty, done }
   function announceLater(unit, scope) {
-    const p = announceScope(unit, scope).finally(() => inflight.delete(p));
-    inflight.add(p);
+    const key = `${scope.type}\n${scope.id}`, cur = running.get(key);
+    if (cur) { cur.dirty = true; return; }
+    if (running.size >= ANNOUNCE.inflight) { try { log.warn("grants announcement skipped: too many in flight; the timed re-check covers it", { scope: scope.type }); } catch {} return; }
+    const st = { dirty: false, done: null };
+    st.done = (async () => { do { st.dirty = false; await announceScope(unit, scope); } while (st.dirty); })().catch(() => {}).finally(() => running.delete(key));
+    running.set(key, st);
   }
   /** The announcement itself (never rejects). */
   async function announceScope(unit, scope) {
@@ -86,11 +94,11 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
     try {
       do {
         const p = await registry.boardsIn(scope, { after, limit: ANNOUNCE.page });
-        for (let i = 0; i < p.ids.length; i += ANNOUNCE.par) await Promise.all(p.ids.slice(i, i + ANNOUNCE.par).map(async b => { try { await announce(unit.id, b); sent++; } catch (err) { log.warn("grants announcement failed", { board: b, err }); } }));
+        for (let i = 0; i < p.ids.length; i += ANNOUNCE.par) await Promise.all(p.ids.slice(i, i + ANNOUNCE.par).map(async b => { try { await announce(unit.id, b); sent++; } catch (err) { try { log.warn("grants announcement failed", { board: b, err }); } catch {} } }));
         after = p.next;
         if (after != null && ++pages >= ANNOUNCE.pages) { log.warn("grants announcement stopped at its bound; the timed re-check covers the rest", { scope: scope.type, sent }); break; }
       } while (after != null);
-    } catch (err) { log.warn("grants announcement failed", { scope: scope.type, err }); }
+    } catch (err) { try { log.warn("grants announcement failed", { scope: scope.type, err }); } catch {} }
   }
 
   /** The Spaces the person can open and `board.create` in (their personal space first), for the picker. One batch read settles every candidate. */
@@ -238,7 +246,7 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
       const unit = await unitOf(identity);
       const sc = await scopeOf(identity, unit, type, id);
       if (!sc || !may(sc.access, "members.manage")) throw refused();
-      if (sc.row.kind === "personal") throw bad("a personal space keeps its name and stays private");
+      if (sc.row.kind === "personal") throw refused();      // its name and privacy are its owner's own; the same 403 as any refusal, so nothing says which Space is personal
       const out = await registry.updateScope({ type, id: sc.row.id }, { ...(name !== undefined ? { name } : {}), ...(gen !== undefined ? { generalRole: gen } : {}) });
       if (gen !== undefined) announceLater(unit, { type, id: sc.row.id });
       // Names are access: someone who may manage a scope without opening it (a Unit admin, while admin board content is off) learns only what they
@@ -263,7 +271,7 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
     },
 
     /** Wait for the announcements started by earlier changes (tests; a shutdown). */
-    settled: () => Promise.all([...inflight]).then(() => {}),
+    settled: () => Promise.all([...running.values()].map(s => s.done)).then(() => {}),
 
     /** PATCH /boards/:board: a new title; needs `board.edit` or `members.manage` on the board. Not access, so nothing is announced. */
     async renameBoard(identity, id, title) {

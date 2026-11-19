@@ -535,6 +535,9 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       ready();
       if (!key(tenant)) throw new Error("registry: no such tenant");
       const u = String(user), createdAt = now();
+      // Read first: Home calls this on every load; the primary write happens only when the row is missing.
+      const had = rowSpace(await one(db, `SELECT * FROM ${SP} WHERE tenant = $1 AND owner_user = $2`, [tenant, u]));
+      if (had) return had;
       return write(async tx => {
         if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
         // One per (tenant, user): the unique key settles two racing first sign-ins; the loser reads the winner's row.

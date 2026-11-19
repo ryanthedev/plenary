@@ -165,26 +165,37 @@ test("#92 MED-4: the cached usage is read again once it is older than usageTtlMs
   expect(calls.usage).toBe(3);
 });
 
-test("#92 MED-4: a reseed that interleaves with an in-flight put never makes the count under-state (a quota bypass); it may over-state until the next read", async () => {
-  const gate = deferred();
-  let held = true;
-  // The put's bytes land only after the reseed's walk: the read cannot have included them.
-  const { access, inner } = make({ quotaBytes: 320, wrap: { put: async (...a) => { if (held) { held = false; await gate.promise; } return inner.put(...a); } } });
-  const a = fakePng(100, 54), b = fakePng(100, 55);
-  const first = access.put(await putUrl(access, "t1", a), a);   // reserved, not yet stored
+test("#92 MED-4: a put that finishes while a usage read is in flight, which the read then misses, is still counted when the read answers (usage never under-counts the true bytes)", async () => {
+  const putGate = deferred(), readGate = deferred();
+  let holdPut = true, holdRead = false;
+  const { access, inner } = make({ quotaBytes: 320, wrap: {
+    put: async (...a) => { if (holdPut) { holdPut = false; await putGate.promise; } return inner.put(...a); },
+    usage: async (...a) => { const n = await inner.usage(...a); if (holdRead) { holdRead = false; await readGate.promise; } return n; },   // the walk's answer is fixed first, delivered later
+  } });
+  const a = fakePng(100, 54), b = fakePng(100, 55), c = fakePng(150, 56);
+  const first = access.put(await putUrl(access, "t1", a), a);                    // seeds (reads 0), then waits before storing
   await new Promise(r => setTimeout(r, 5));
-  access.recount("t1");                                          // the reseed reads 0 bytes
-  expect((await access.put(await putUrl(access, "t1", b), b)).ok).toBe(true);   // read 0, b stored: 100
+  holdRead = true; access.recount("t1");
+  const second = access.put(await putUrl(access, "t1", b), b);                   // starts a new read: it sees 0 bytes, and is held
+  await new Promise(r => setTimeout(r, 5));
+  putGate.resolve();
+  expect(await first).toMatchObject({ ok: true, created: true });               // a lands DURING the read, which missed it
+  readGate.resolve();                                                            // the read answers 0: the count must still include a
+  expect((await second).ok).toBe(true);                                          // b: 100 (a) + 100 <= 320
+  expect(await inner.usage("t1")).toBe(200);
+  expect(await access.put(await putUrl(access, "t1", c), c)).toEqual({ ok: false, code: "quota" });   // 200 true bytes + 150 > 320 (a count of 100 would store a third picture)
+});
+
+test("#92 MED-4: a superseded usage read is ignored when it answers", async () => {
+  const gate = deferred();
+  let first = true;
+  const { access, inner } = make({ quotaBytes: 150, wrap: { usage: async (...a) => { const n = await inner.usage(...a); if (first) { first = false; await gate.promise; } return n; } } });
+  const a = fakePng(100, 57), b = fakePng(100, 58);
+  await inner.put("t1", sha1(a), a);                                             // 100 bytes already stored
+  const stale = access.put(await putUrl(access, "t1", b), b);                    // read 1 (held, will answer 100)
+  await new Promise(r => setTimeout(r, 5));
+  access.recount("t1");                                                          // supersedes it
   gate.resolve();
-  expect(await first).toMatchObject({ ok: true, created: true });             // a lands after the read: its 100 must be counted: 200
-  const c = fakePng(150, 56);
-  expect(await access.put(await putUrl(access, "t1", c), c)).toEqual({ ok: false, code: "quota" });   // 200 + 150 > 320; dropping a's add would accept it (and 350 bytes would be stored)
-  // And a put that finished BEFORE the read is counted twice at worst (over-state), never zero times.
-  const { access: acc2, inner: in2 } = make({ quotaBytes: 150 });
-  const d = fakePng(100, 57);
-  await acc2.put(await putUrl(acc2, "t2", d), d);
-  acc2.recount("t2");
-  const e = fakePng(60, 58);
-  expect(await acc2.put(await putUrl(acc2, "t2", e), e)).toEqual({ ok: false, code: "quota" });   // 100 + 60 > 150
-  expect(await in2.usage("t2")).toBe(100);
+  expect(await stale).toEqual({ ok: false, code: "quota" });                     // 100 + 100 > 150 either way
+  expect(await inner.usage("t1")).toBe(100);
 });

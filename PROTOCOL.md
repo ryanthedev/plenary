@@ -947,7 +947,7 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   PNG, JPEG, GIF or WebP (SVG refused), then reserves quota and stores. The first bytes for a hash are kept: a put
   of a stored blob succeeds without storing. `201` stored now, `200` already stored, `400 bad-length` (no or
   zero length), `413 too-large`, `415 not-image`, `422 hash-mismatch`, `507 quota`, `503 unavailable`
-  (the store failed or took too long; safe to retry), `503 busy` (a node reads at most 8 PUT bodies at once and one user, per board, at most 2; retry), `409 in-flight` (a second PUT on a token already being read), `408 timeout` (the whole body must arrive within 120 s however slowly it drips; retryable), `401`.
+  (the store failed or took too long; safe to retry), `503 busy` (a node reads at most 8 PUT bodies at once and one account (per tenant, across its boards) at most 2; retry), `409 in-flight` (a second PUT on a token already being read), `408 timeout` (the whole body must arrive within 120 s however slowly it drips; retryable), `401`.
   The body is read as it arrives (memory follows the bytes sent, not the `Content-Length` claimed). Bodies are JSON `{ "error": code }`.
 - **`GET /blobs/<token>`** (a get URL): `200` with the bytes, `Content-Type` of the sniffed kind, `X-Content-Type-Options:
   nosniff`, `Cache-Control: no-store`, and a `Content-Security-Policy: default-src 'none'; sandbox`; `404 not-found`

@@ -197,6 +197,19 @@ test("one user's stalled uploads can't take the node's slots: the per-user cap r
   x1.end(); x2.end();
 });
 
+test("the per-user cap is per account, not per board: uploads spread over several boards still hit it", async () => {
+  const r = await rig({ server: { maxBlobPuts: 8, blobHttp: { maxPutsPerUser: 2 } } });
+  const boards = [r.ids.board, r.ids.otherBoard];
+  await r.registry.setGrant(r.ids.otherBoard, "dev:editor", "editor");
+  const bytes = fakePng(300, 8), h = sha1(bytes), socks = [];
+  for (const board of boards) { const s = await r.sock(); s.send({ t: "hello", v: 1, token: tokenOf("editor"), board, since: 0, client: "e" + socks.length }); await s.next(m => m.t === "welcome"); let seen = 0; s.ask = async m => { s.send(m); const x = await until(() => s.msgs.slice(seen).find(y => y.t === "blob" || y.t === "error"), "answer"); seen = s.msgs.indexOf(x) + 1; return x; }; socks.push(s); }
+  const url = async s => tok((await ask(s, h, true)).url);
+  const x1 = await stalledPut(r, await url(socks[0]), 300, 10), x2 = await stalledPut(r, await url(socks[1]), 300, 10);   // one on each board
+  const third = await url(socks[1]);
+  await until(async () => (await fetch(r.server.url + "/blobs/" + third, { method: "PUT", body: bytes })).status === 503, "the same account's third PUT refused on a third board slot");
+  x1.end(); x2.end();
+});
+
 test("a second PUT on a token already being read is refused 409, and the token works again once the first is gone", async () => {
   const r = await rig({ server: { blobHttp: { maxPutsPerUser: 8 } } }), s = await as(r, "editor"), bytes = fakePng(300, 6), h = sha1(bytes);
   const t = tok((await ask(s, h, true)).url);

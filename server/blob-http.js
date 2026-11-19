@@ -46,7 +46,7 @@ const busy = () => json(503, { error: "busy" }, { "retry-after": "2" });
  * @param {{ access: ReturnType<typeof import("./blob-access.js").blobAccess>, maxPuts?: number, maxPutsPerUser?: number,
  *           bodyDeadlineMs?: number, timers?: { set(fn: () => void, ms: number): any, clear(h: any): void } }} o
  *   maxPuts: PUT bodies being read or stored at once on this node (each can hold 10 MB); maxPutsPerUser: the same for one
- *   (tenant, board, user) from the verified token, so one account's slow uploads can't take every slot. Past either, 503
+ *   account (tenant and user from the verified token, across all its boards), so one account's slow uploads can't take every slot. Past either, 503
  *   `busy` (a client retries). One token has one PUT in flight: a second gets 409 `in-flight`. bodyDeadlineMs: the whole
  *   body must arrive within it, however slowly it drips (408 `timeout`, retryable); the idle timeout can't see a drip.
  *   timers: where the deadline runs (default the globals; tests pass a virtual one).
@@ -73,9 +73,10 @@ export function blobRoutes({ access, maxPuts = MAX_CONCURRENT_PUTS, maxPutsPerUs
         const len = Number(raw);
         if (!len) return fail("bad-length");
         if (len > MAX_BLOB_BYTES) return fail("too-large");
-        const who = `${v.tenant}/${v.board}/${v.user ?? ""}`;
+        // One account, however many boards it spreads over; a token with no user (not minted by a gateway today) shares one tight bucket per tenant.
+        const who = v.user === null ? `${v.tenant}/` : `${v.tenant}/${v.user}`, cap = v.user === null ? 1 : maxPutsPerUser;
         if (tokens.has(token)) return json(409, { error: "in-flight" });
-        if (puts >= maxPuts || (byUser.get(who) ?? 0) >= maxPutsPerUser) return busy();
+        if (puts >= maxPuts || (byUser.get(who) ?? 0) >= cap) return busy();
         puts++; byUser.set(who, (byUser.get(who) ?? 0) + 1); tokens.add(token);
         const ctl = new AbortController(), timer = timers.set(() => ctl.abort(), bodyDeadlineMs);
         try {

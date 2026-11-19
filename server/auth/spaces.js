@@ -245,9 +245,9 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
     /**
      * POST /boards: a board in `space` (needs `board.create` there) or, with none, in the caller's personal space (always allowed).
      * The caller becomes its owner. `memberRole` absent = inherit the Space (null).
-     * @param {Identity} identity @param {{ title?: string, space?: string|null, memberRole?: string|null }} o
+     * @param {Identity} identity @param {{ title?: string, space?: string|null, memberRole?: string|null }} o @param {import("./registry-port.js").Idem} [idem] the Idempotency-Key of a keyed create
      */
-    async createBoard(identity, { title = "", space = null, memberRole } = {}) {
+    async createBoard(identity, { title = "", space = null, memberRole } = {}, idem) {
       const t = titleOf(title);
       if (memberRole !== undefined && memberRole !== null && (!ROLES.includes(memberRole) || memberRole === "owner")) throw bad("bad memberRole");
       if (space !== null && !idOf(space)) throw bad("bad space");
@@ -259,14 +259,8 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
         // Nobody writes into another member's personal space, an admin included (it is private until its owner shares from it).
         target = (await boardCreateAccess(identity, unit, space)).row.id;
       }
-      const board = await registry.createBoard({ tenant: unit.id, title: t, space: target, ...(memberRole !== undefined ? { memberRole } : {}) });
-      // createBoard takes no creator: the owner grant is a second call. Retry once; if it still fails, report the failure WITH the board id.
-      let last;
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try { await registry.setGrant(board.id, identity.user, "owner"); return board; }
-        catch (err) { last = err; }
-      }
-      throw new AdminError("owner-grant-failed", `board ${board.id} was created but its owner grant failed`, { board: board.id, cause: last });
+      // The board, its owner grant and the idempotency key (if any) are one Registry step: no ownerless board, no key without its board.
+      return registry.createBoard({ tenant: unit.id, title: t, space: target, owner: identity.user, idem, ...(memberRole !== undefined ? { memberRole } : {}) });
     },
 
     /** GET /spaces?can=board.create. @param {Identity} identity */
@@ -287,14 +281,14 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
      * POST /spaces: a Space at the Unit root (`space.create` there) or in a Group (`space.create` at the Group). The caller becomes its owner.
      * @param {Identity} identity @param {{ name: string, group?: string|null, general?: string|null }} o
      */
-    async createSpace(identity, { name, group = null, general: gen = "viewer" } = {}) {
+    async createSpace(identity, { name, group = null, general: gen = "viewer" } = {}, idem) {
       const n = nameOf(name);
       if (group !== null && !idOf(group)) throw bad("bad group");
       generalOf(gen);
       const unit = await unitOf(identity);
       if (!unit) throw refused();
       const { g, access } = await spaceCreateAccess(identity, unit, group);
-      const s = await registry.createSpace({ tenant: unit.id, name: n, group: g?.id ?? null, generalRole: gen, owner: identity.user });
+      const s = await registry.createSpace({ tenant: unit.id, name: n, group: g?.id ?? null, generalRole: gen, owner: identity.user, idem });
       return spaceView(s, g && opens(access) ? g : null);
     },
 
@@ -351,12 +345,12 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
      * POST /groups: a Group at the Unit root; needs `group.create` there. The creator becomes its owner. General access defaults to none.
      * @param {Identity} identity @param {{ name: string, general?: string|null }} o
      */
-    async createGroup(identity, { name, general: gen = null } = {}) {
+    async createGroup(identity, { name, general: gen = null } = {}, idem) {
       const n = nameOf(name);
       generalOf(gen);
       const unit = await unitOf(identity);
       if (!unit || !may(await tenancy.effective(identity, { type: "unit", id: unit.id }), "group.create")) throw refused();
-      const g = await registry.createGroup({ tenant: unit.id, name: n, generalRole: gen, owner: identity.user });
+      const g = await registry.createGroup({ tenant: unit.id, name: n, generalRole: gen, owner: identity.user, idem });
       return { id: g.id, name: g.name, general: g.generalRole ?? null };
     },
 

@@ -8,9 +8,10 @@
 // write are one atomic step (in one JS process: no await between them; in SQL: one transaction or a conditional
 // write), and a refused call changes nothing. Caller rules (who may grant what) live in server/admin/boards.js.
 //
-// `rolledBack`: an adapter sets `err.rolledBack = true` on a rejection that GUARANTEES the call wrote nothing (a busy or locked database, a
-// refused queue slot, a lock or statement limit that rolled the transaction back). Any other rejection (a timeout with no answer, a dropped
-// connection) may have committed. http.js frees an idempotency key only for `rolledBack` errors (PROTOCOL.md "Idempotent creates").
+// Idempotent creates (PROTOCOL.md "Idempotent creates"): `createBoard`, `createGroup`, `createSpace`, `createTeam`, `createInvite` and `createLink` take an
+// optional `idem: { user, key, fp }` and write the key's row in the SAME atomic step as the object (one transaction), so a key and its object exist
+// together or not at all. A live row (younger than IDEM.ttlMs) makes the create reject, changing nothing: `idemErr.replay(ref)` (code "idem-replay", `ref` =
+// the stored object id) for the same `fp`, `idemErr.mismatch()` (code "idem-mismatch") for another. `idemGet(idem)` is the read-only form.
 //
 // Failure semantics (what a second adapter must honour): a lookup of something absent resolves to null / [] /
 // false; a write against a missing tenant / board / link rejects; an infrastructure failure (database down,
@@ -108,15 +109,15 @@ export const mint = {
  *   tenantByDomain(domain: string): Promise<Tenant|null>,
  *   addTenantAdmin(tenant: string, user: string): Promise<void>,
  *   tenantAdminsAmong(users: string[], o?: { timeoutMs?: number }): Promise<string[]>,   // those of `users` who are an admin of ANY tenant (the dev sign-in menu never offers one)
- *   createBoard(o: { tenant: string, title?: string, memberRole?: Role|null, space?: string }): Promise<Board>,   // without `space`: unfiled, memberRole default "viewer" (as always); with `space` (same tenant): memberRole default null = inherit the Space
- *   createGroup(o: { tenant: string, name: string, generalRole?: Role|null, owner?: string }): Promise<Group>,   // generalRole default null; `owner` gets an owner grant in the same step
+ *   createBoard(o: { tenant: string, title?: string, memberRole?: Role|null, space?: string, owner?: string, idem?: Idem }): Promise<Board>,   // `owner` gets an owner grant in the same step; without `space`: unfiled, memberRole default "viewer" (as always); with `space` (same tenant): memberRole default null = inherit the Space
+ *   createGroup(o: { tenant: string, name: string, generalRole?: Role|null, owner?: string, idem?: Idem }): Promise<Group>,   // generalRole default null; `owner` gets an owner grant in the same step
  *   group(id: string): Promise<Group|null>,
  *   groups(tenant: string): Promise<Group[]>,
- *   createSpace(o: { tenant: string, name: string, group?: string|null, generalRole?: Role|null, owner?: string }): Promise<Space>,   // generalRole default "viewer"; null = only people added
+ *   createSpace(o: { tenant: string, name: string, group?: string|null, generalRole?: Role|null, owner?: string, idem?: Idem }): Promise<Space>,   // generalRole default "viewer"; null = only people added
  *   space(id: string): Promise<Space|null>,
  *   spaces(tenant: string): Promise<Space[]>,
  *   ensurePersonalSpace(tenant: string, user: string): Promise<Space>,   // idempotent, one per (tenant, user); private (generalRole null), the user is its owner
- *   createTeam(o: { tenant: string, name: string }): Promise<Team>,
+ *   createTeam(o: { tenant: string, name: string, idem?: Idem }): Promise<Team>,
  *   renameTeam(team: string, name: string): Promise<Team>,   // trimmed 1-200; rejects an unknown Team
  *   deleteTeam(team: string): Promise<void>,   // removes the Team, its members and EVERY grant it holds, atomically; code "last-owner" (nothing changes) when it is the only counted owner of a Group or Space; rejects an unknown Team
  *   teamsPage(tenant: string, o?: { after?: string|null, limit?: number, q?: string|null }): Promise<{ teams: (Team & { size: number })[], next: string|null }>,   // by id, one bounded page (default 50, cap 200); `q`: ASCII-folded substring of the name; `size` = members, counted to at most TEAM_SIZE_CAP + 1 (a Team of 100k costs one index probe of 1001 rows)
@@ -148,21 +149,19 @@ export const mint = {
  *   setGrant(board: string, user: string, role: Role|null): Promise<void>,   // rejects code "last-owner" (atomic)
  *   grant(board: string, user: string): Promise<Role|null>,
  *   grants(board: string): Promise<{ user: string, role: Role }[]>,
- *   createInvite(o: { board: string, email: string, role: Role, expiresAt?: number|null, by: string }): Promise<Invite>,
+ *   createInvite(o: { board: string, email: string, role: Role, expiresAt?: number|null, by: string, idem?: Idem }): Promise<Invite>,
  *   invite(id: string): Promise<Invite|null>,
  *   invites(board: string): Promise<Invite[]>,
  *   invitesFor(board: string, email: string): Promise<Invite[]>,
  *   revokeInvite(id: string): Promise<boolean>,
- *   createLink(o: { board: string, role: Role, expiresAt?: number|null, by: string }): Promise<Link>,
+ *   createLink(o: { board: string, role: Role, expiresAt?: number|null, by: string, idem?: Idem }): Promise<Link>,
  *   link(id: string): Promise<Link|null>,
  *   links(board: string): Promise<Link[]>,
  *   revokeLink(id: string): Promise<boolean>,
  *   addLinkUse(link: string, user: string): Promise<void>,
  *   linkUses(board: string, user: string): Promise<string[]>,
  *   linkUsesFor?(board: string, users: string[]): Promise<Map<string, string[]>>,   // OPTIONAL batch (below)
- *   idemClaim(user: string, key: string, fp: string): Promise<{ state: "new", claim: string } | { state: "done", result: string } | { state: "in-progress" } | { state: "mismatch" }>,   // Idempotent creates (PROTOCOL.md): one atomic step; "new" = the caller now owns the key and holds `claim`, an unguessable token naming THIS claim; a finished row older than IDEM.ttlMs and an unfinished one older than IDEM.claimMs count as absent (a takeover mints a new token)
- *   idemFinish(user: string, key: string, claim: string, result: string): Promise<void>,   // stores the answer, only while the row is still `claim`'s (a run that was taken over changes nothing)
- *   idemRelease(user: string, key: string, claim: string): Promise<void>,   // drops an UNFINISHED row, only while it is still `claim`'s (the create wrote nothing); a finished row, or another claim's, stays
+ *   idemGet(idem: Idem): Promise<{ state: "none" } | { state: "done", ref: string } | { state: "mismatch" }>,   // read-only: is there a live row for (user, key), and for this fingerprint
  *   markOpened(user: string, board: string): Promise<void>,   // Home (PROTOCOL.md § Home): Recent. Upserts (user, board) at now(); keeps the user's newest RECENT_KEEP rows; rejects an unknown board
  *   recents(user: string, o?: { limit?: number }): Promise<{ board: string, at: number }[]>,   // newest first; limit default 12, at most RECENT_KEEP
  *   setStarred(user: string, board: string, on: boolean): Promise<void>,   // idempotent; rejects an unknown board when starring; un-starring never rejects
@@ -177,8 +176,21 @@ export const mint = {
  */
 
 /** Home (PROTOCOL.md § Home): rows kept per user in Recent, rows a starred / shared read may return, and the most boards one `boardRows` / `starredAmong` call takes. */
-/** Idempotent creates (PROTOCOL.md): a finished answer is kept `ttlMs`; an unfinished claim can be taken over after `claimMs` (well above the longest chain of calls one create makes; main.js checks); expired rows are pruned `prune` at a time, every `every`-th claim. */
-export const IDEM = Object.freeze({ ttlMs: 24 * 3600_000, claimMs: 300_000, prune: 500, every: 64 });
+/** Idempotent creates (PROTOCOL.md): a key row is kept `ttlMs`; expired rows are pruned `prune` at a time, every `every`-th keyed create. */
+export const IDEM = Object.freeze({ ttlMs: 24 * 3600_000, prune: 500, every: 64 });
+/** @typedef {{ user: string, key: string, fp: string }} Idem  The Idempotency-Key of a create: its user, the key, the SHA-256 fingerprint of the request. */
+/** The two rejections of a keyed create that met a live row. Match on `code`, not the class. */
+export const idemErr = {
+  replay: ref => Object.assign(new Error("registry: idempotent replay"), { name: "RegistryError", code: "idem-replay", ref }),
+  mismatch: () => Object.assign(new Error("registry: idempotency key reused"), { name: "RegistryError", code: "idem-mismatch" }),
+};
+/** `idem` as the adapters take it: absent = null; else three non-empty strings, or "registry: bad idempotency key". */
+export const idemOf = idem => {
+  if (idem == null) return null;
+  const { user, key, fp } = idem;
+  for (const v of [user, key, fp]) if (typeof v !== "string" || !v || v.includes(" ")) throw new Error("registry: bad idempotency key");
+  return { user, key, fp };
+};
 export const HOME = { recentKeep: 50, starScan: 200, sharedScan: 200, batch: 200, searchScan: { default: 1000, max: 5000 }, candidates: { spaces: { default: 100, max: 200 }, groups: { default: 50, max: 100 } } };
 /** The scopes of `accessContexts`: distinct Unit, Group or Space refs, at most HOME.batch. @returns {{ type: string, id: string }[]} */
 export function batchScopes(scopes) {

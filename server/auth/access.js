@@ -201,11 +201,21 @@ export function accessService({ registry, tenancy, announce = () => {}, backlog 
       return { teams: page.teams.map(teamView), next: page.next, can: { create: may(access, "team.manage") } };
     },
 
-    async createTeam(identity, { name }) {
+    /** @param {import("./idp-port.js").Identity} identity @param {{ name: string }} o @param {import("./registry-port.js").Idem} [idem] the Idempotency-Key of a keyed create */
+    async createTeam(identity, { name }, idem) {
       const n = nameOf(name);
       const unit = await unitOf(identity);
       if (!unit || !may(await tenancy.effective(identity, { type: "unit", id: unit.id }), "team.manage")) throw refused();
-      return teamView(await registry.createTeam({ tenant: unit.id, name: n }));
+      return teamView(await registry.createTeam({ tenant: unit.id, name: n, idem }));
+    },
+
+    /** The replay of a keyed `POST /teams` (PROTOCOL.md "Idempotent creates"): authorized AGAIN as the create was, then the Team read fresh. */
+    async replayTeam(identity, id) {
+      const unit = await unitOf(identity);
+      if (!unit || !may(await tenancy.effective(identity, { type: "unit", id: unit.id }), "team.manage")) throw refused();
+      const t = typeof id === "string" ? await registry.team(id) : null;
+      if (!t || t.tenant !== unit.id) throw refused();
+      return teamView({ ...t, size: (await registry.teamsAmong(unit.id, [id]))[0]?.size ?? 0 });
     },
 
     /** GET /teams/:id: the Team and one page of its members. */

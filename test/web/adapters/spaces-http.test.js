@@ -67,7 +67,7 @@ test("bad ids make no request; ids and strings are checked and capped", async ()
   expect(normalizeGroupPage({ ...GROUP, spaces: [{ id: "x y", name: "n" }, GROUP.spaces[0]] }).spaces).toEqual(GROUP.spaces);
 });
 
-test("a create sends its Idempotency-Key header when given one, and none otherwise; 422 is refused input, 409 in-progress is unavailable", async () => {
+test("a create sends its Idempotency-Key header when given one, and none otherwise; 422 is refused input", async () => {
   const s = seen(), a = api(s.fetch);
   await a.createBoard({ title: "T", key: "key-0001-abcd" }); await a.createSpace({ name: "S", key: "key-0002-abcd" }); await a.createGroup({ name: "G", key: "key-0003-abcd" });
   await a.createBoard({ title: "T" });
@@ -75,20 +75,13 @@ test("a create sends its Idempotency-Key header when given one, and none otherwi
   expect(await api(answer(422, { error: "idempotency-key-reused" })).createBoard({ title: "T", key: "key-0001-abcd" })).toEqual({ error: "invalid" });
 });
 
-test("L4 a 409 in-progress on a create is retried with the SAME key after Retry-After (bounded), then succeeds or ends as in-progress", async () => {
-  const waits = [], timers = { set: (f, ms) => { if (ms === 10_000) return 0; waits.push(ms); f(); return 0; }, clear() {} };   // the 10 s request timeout never fires; a retry wait fires at once
+test("a create retried with the same key is just another POST: the server answers the first object, so nothing waits and a 409 is no longer special", async () => {
   const seenKeys = []; let n = 0;
-  const later = after => async (u, i) => { seenKeys.push(i.headers["idempotency-key"]); n++; return n <= after ? { status: 409, headers: new Headers({ "retry-after": "2" }), text: async () => "{\"error\":\"in-progress\"}" } : answer(201, { board: { id: "b-9" } })(); };
-  expect(await api(later(2), { timers }).createBoard({ title: "T", key: "key-0001-abcd" })).toEqual({ board: { id: "b-9" } });
-  expect(seenKeys).toEqual(["key-0001-abcd", "key-0001-abcd", "key-0001-abcd"]);
-  expect(waits).toEqual([2000, 2000]);
-  // never answers: 1 try + 5 retries, then in-progress; the wait is clamped (Retry-After 99 s -> 5 s; none -> 1 s)
-  waits.length = 0; n = 0; seenKeys.length = 0;
-  const forever = async (u, i) => { n++; return { status: 409, headers: new Headers({ "retry-after": "99" }), text: async () => "{}" }; };
-  expect(await api(forever, { timers }).createSpace({ name: "S", key: "key-0002-abcd" })).toEqual({ error: "in-progress" });
-  expect([n, waits]).toEqual([6, [5000, 5000, 5000, 5000, 5000]]);
-  waits.length = 0;
-  await api(async () => ({ status: 409, text: async () => "{}" }), { timers }).createGroup({ name: "G", key: "key-0003-abcd" });
-  expect(waits[0]).toBe(1000);
-  expect(SPACES_ERRORS).toContain("in-progress");
+  const f = async (u, i) => { seenKeys.push(i.headers["idempotency-key"]); n++; return answer(201, { board: { id: "b-9" } })(); };
+  const a = api(f);
+  expect(await a.createBoard({ title: "T", key: "key-0001-abcd" })).toEqual({ board: { id: "b-9" } });
+  expect(await a.createBoard({ title: "T", key: "key-0001-abcd" })).toEqual({ board: { id: "b-9" } });
+  expect(seenKeys).toEqual(["key-0001-abcd", "key-0001-abcd"]);
+  expect(SPACES_ERRORS).not.toContain("in-progress");
+  expect(await api(answer(409, { error: "x" })).createSpace({ name: "S", key: "key-0002-abcd" })).toEqual({ error: "unavailable" });   // an unexpected status
 });

@@ -155,6 +155,20 @@ describe("sqlite registry", () => {
     expect(sql.length).toBe(mem.length);
   });
 
+  test("durable keyed create: the key survives close and reopen (a crash after the commit), so the retry gets the first object, not a second", async () => {
+    const path = file(), idem = { user: "google:root", key: "key-0001-aaaa", fp: "f".repeat(64) };
+    let r = sqliteRegistry({ path, fullfsync: false });
+    const t = await r.createTenant({ domain: "acme.com", admins: ["google:root"] });
+    const b = await r.createBoard({ tenant: t.id, title: "Once", owner: "google:root", idem });
+    await r.close();   // the process dies after the commit, before any answer was stored anywhere else
+    r = sqliteRegistry({ path, fullfsync: false });
+    expect(await r.idemGet(idem)).toEqual({ state: "done", ref: b.id });
+    await expect(r.createBoard({ tenant: t.id, title: "Once", owner: "google:root", idem })).rejects.toMatchObject({ code: "idem-replay", ref: b.id });
+    expect((await r.boardsIn({ type: "unit", id: t.id })).ids).toEqual([b.id]);
+    expect(await r.grants(b.id)).toEqual([{ user: "google:root", role: "owner" }]);
+    await r.close();
+  });
+
   test("durable: everything survives close and reopen", async () => {
     const path = file();
     let r = sqliteRegistry({ path, now: () => 7, fullfsync: false });

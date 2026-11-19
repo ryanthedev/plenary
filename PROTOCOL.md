@@ -1025,7 +1025,7 @@ Space's id may still `board.create` in it, **except in another member's personal
 | `PATCH /boards/:board` `{ title }` | `board.edit` or `members.manage` on the board (a title is board content; an owner and an admin hold the second). `title` trimmed, 0-200 | 200 `{ board }` |
 
 Unknown body fields are 400 `unknown-field`, as everywhere. The 4xx/5xx codes are the existing ones (400 `bad-request`, 401, 403 `forbidden`, 404
-`not-found`, 503 `unavailable` or `owner-grant-failed`); #48 adds none.
+`not-found`, 503 `unavailable`); #48 adds none.
 
 **Why `members.manage` renames a Space.** The permission list has no rename; a name is the container's management, which `members.manage` is (Space
 and Group owners hold it, editors do not). A custom role can hold it. A board's title is content, so `board.edit` also renames it.
@@ -1056,54 +1056,56 @@ connection. `GET /auth/dev` keeps its own tighter 3 s wait. Blob PUT/GET (`blob-
 **Inner limits stay under the deadline.** A call that runs past the deadline still works on after the 503, so every single-call limit below it is kept
 shorter: main.js starts the Postgres Registry with `statementTimeoutMs` and `lockTimeoutMs` of **5000** (a single node's SQLite busy timeout is 5000 too) and
 Google's `timeoutMs` of **3500**, and **refuses to start** (a loud error naming the setting) when one of them is not below the deadline. For Postgres the
-check uses the adapter's longest call as `gate()` reports it: its wait for a connection plus the limit plus a 1 s backstop (7050 ms by default). Several calls in a row (create then owner grant) can still add up
+check uses the adapter's longest call as `gate()` reports it: its wait for a connection plus the limit plus a 1 s backstop (7050 ms by default). Several calls in a row (scope reads, then the create) can still add up
 past it; that case is the next paragraph's.
 
 **What a 503 means on a write.** The work is not cancelled (the Registry port has no cancel; a statement already sent to the database runs to its own
 limit). So a 503 from a write route says **"may or may not have applied"**, and after the 503 is sent the late result is **discarded**: the response is
 built once, and the late handler's return value or rejection is dropped (handled, never an unhandled rejection) and counted (`stats().late`) and logged
 (at most one line per 10 s, with the route and whether it applied or failed).
-- **Safe to retry as is:** grants, stars, revokes, renames and `updateScope` set a value; repeating them changes nothing.
-- **Retry with the same `Idempotency-Key`:** a create (`POST /boards`, `/spaces`, `/groups`, `/boards/:board/invites`, `/boards/:board/links`) makes a new
+- **Safe to retry as is:** grants, stars, revokes, renames and `updateScope` set a value; repeating them changes nothing. So do the Teams routes that are not creates (`PATCH /teams/:id`, `DELETE /teams/:id`, `PUT` / `DELETE /teams/:id/members/:user`) and the access routes (`PUT` / `DELETE /access/:type/:id/grants/:subjectType/:subject`).
+- **Retry with the same `Idempotency-Key`:** a create (`POST /boards`, `/spaces`, `/groups`, `/teams`, `/boards/:board/invites`, `/boards/:board/links`) makes a new
   object on every call, so without the key a retry can leave the first, committed object next to the second (and no route deletes a board, Space or
-  Group). Send the header and a retry returns the first call's answer. See the next section.
+  Group). Send the header and a retry returns the first call's object, exactly once, whether or not the first committed. See the next section.
 
-## Idempotent creates (`Idempotency-Key`, #73)
+## Idempotent creates (`Idempotency-Key`, #73, exactly-once #86)
 
-`POST /boards`, `POST /spaces`, `POST /groups`, `POST /boards/:board/invites` and `POST /boards/:board/links` accept an `Idempotency-Key` header: 8-64 of
+`POST /boards`, `POST /spaces`, `POST /groups`, `POST /teams`, `POST /boards/:board/invites` and `POST /boards/:board/links` accept an `Idempotency-Key` header: 8-64 of
 `[A-Za-z0-9_-]` (anything else is 400 `bad-idempotency-key`); a client makes one per submit (a random UUID is fine) and **reuses it for every retry of that
-submit**. Without the header a create behaves as before.
+submit**. Without the header a create behaves as before. (Roles' create, when it gets a route, takes the same header the same way: § Port.)
+
+**The key is written in the create's own transaction.** The Registry call that creates the object also inserts the key's row `(user, key) → fingerprint, id`
+in the **same atomic step** (one SQLite transaction, one Postgres transaction, one synchronous memory step). So the object and its key commit together or
+not at all: there is no state in which the object exists and the key does not, or the reverse. Nothing is "claimed" before the work and nothing is
+"finished" after it, so a client timeout, a dropped connection, a deadline 503 or a crash at any point leaves exactly one of two states, and a retry with
+the same key is correct in both.
 
 | Same key, per signed-in user | Answer |
 |---|---|
-| first use | runs the create; the answer is stored under the key |
-| again, after the first finished | **the answer, rebuilt** for the caller as they are now (rule below): the same status, the object read fresh (a 201 with it, or `503 owner-grant-failed` with the board id), plus the header `Idempotent-Replayed: true`. Nothing is created |
-| again, while the first is still running (a call cut by the deadline keeps running) | `409 {error:"in-progress"}` with `Retry-After: 1`; the client retries until it gets the stored answer (the web adapter retries up to 5 times with the same key, waiting `Retry-After` clamped to 0.25-5 s, then shows "still being created") |
+| first use | runs the create; the object and the key commit together; **201** |
+| again, after the first committed (whatever happened to the first call's response) | **the first object, rebuilt** for the caller as they are now (rule below): **201** with it read fresh, plus the header `Idempotent-Replayed: true`. Nothing is created |
+| again, while the first is still running (a call cut by the deadline keeps running) | the retry's create waits on the same row, then finds the first's: the same 201 replay. **There is no `in-progress` answer** (and no 409) |
+| again, after the first failed before committing (a refusal, a rolled-back transaction) | the key left no trace: the retry runs as a first use |
 | again, with a different route, path parameter or body | `422 {error:"idempotency-key-reused"}`; nothing runs |
 
-- **The deadline does not lose the answer.** The create keeps running after the 503, and its outcome is stored when it finishes, so a later retry gets the
-  real result: the board id, or `owner-grant-failed` with the id of the board that has no owner yet (a Unit admin repairs it, § Registry).
-- **A replay is authorized again (security).** What is stored under a key is `{ status, ref: { id } }`, **never a response body** (a link's `url`, an
+- **A board is created with its owner in one step.** `createBoard` takes the `owner` (like `createSpace` and `createGroup` always did): the board, its owner
+  grant and the key are one transaction. There is no board without its owner and no `owner-grant-failed` outcome.
+- **The deadline does not lose the answer.** A create cut off by the deadline keeps running and either commits (object + key) or rolls back (neither). A
+  retry gets the board id in the first case and a fresh run in the second.
+- **A replay is authorized again (security).** What is stored under a key is the object's **id**, **never a response body** (a link's `url`, an
   invite's address and the object's other fields are not in it). A repeat re-runs the create's own authorization for the caller as they are now,
   then reads the object fresh: `POST /boards` needs `board.create` at the board's Space (and a personal Space is its owner's alone), `POST /spaces`
-  `space.create` at its Group or the Unit, `POST /groups` `group.create`, invites and links the board-manager check of the invites and links routes
-  (`readInvite`, `readLink`). A caller who lost that access since gets the route's ordinary `403 forbidden`, never the stored answer and no token. A
-  stored `owner-grant-failed` is authorized like the board create. A link's `id` is itself its capability; it is the same id `reg_links` holds in the
+  `space.create` at its Group or the Unit, `POST /groups` `group.create`, `POST /teams` `team.manage`, invites and links the board-manager check of the invites and links routes
+  (`readInvite`, `readLink`). A caller who lost that access since gets the route's ordinary `403 forbidden`, never the stored answer and no token. A link's `id` is itself its capability; it is the same id `reg_links` holds in the
   same store, and it is returned only after the manager check.
-- **Which failures free the key (B1).** Only an error that **proves nothing was written**: a refusal from the use case (`forbidden`, `not-found`,
-  `bad-request`) or a Registry call whose rejection carries `rolledBack` (§ Registry port: Postgres `queue-timeout`, `overloaded`, `lock-timeout`, `statement-timeout`; SQLite `SQLITE_BUSY*`, `SQLITE_LOCKED*`), so http.js knows no adapter's codes. The claim
-  is then dropped and the retry runs again. **Any other failure keeps the key** (a `client-timeout`, a dropped connection, a bug): the create may have
-  committed, so the retry is `409 in-progress` until the claim expires (5 min), and only then runs again. The same holds for a crash between the
-  create and its stored answer. After an unclear failure, wait or look at what was created before retrying with a new key.
-- **Fencing (B2).** `idemClaim` returns a `claim` token, and `idemFinish` and `idemRelease` only act on the row while it still holds that token. A run
-  that was taken over (its claim passed **5 min**, `IDEM.claimMs`) can neither free nor overwrite the newer run's claim or answer. main.js refuses to start
-  when the claim window is under 10 of the Registry's longest single calls.
 - **A replay of a revoked or expired invite or link** answers `404 not-found`, not a 201 with its url.
-- **Scope and retention.** A key belongs to its user (ids are globally unique, so the Unit adds nothing): another user's request under the same key is a separate key and never sees or collides with this user's answer. A finished answer is kept **24 h**; a claim whose
-  create never reported (a crash) can be taken over after **5 min**. The store is bounded by age: expired rows are deleted in small batches as keys arrive.
+- **Scope and retention.** A key belongs to its user (ids are globally unique, so the Unit adds nothing): another user's request under the same key is a separate key and never sees or collides with this user's answer. A key row is kept **24 h** (`IDEM.ttlMs`); a row older than that counts as absent, and the next create under the key replaces it. The store is bounded by age: expired rows are deleted in small batches (`IDEM.prune`) as keyed creates arrive.
   The request body is stored only as a SHA-256 fingerprint.
-- **Port** (§ Registry, `idemClaim`, `idemFinish`, `idemRelease`): the store is behind the Registry port; memory, SQLite (`reg_idempotency`) and Postgres
-  (`reg_idempotency`, one atomic upsert-claim) implement it, and `registry-contract.js` pins the three.
+- **Port** (§ Registry): each keyed create takes an optional `idem: { user, key, fp }` and writes the row inside its own atomic step. When a live row exists it
+  rejects, changing nothing, with `code: "idem-replay"` (and `ref`: the stored id) for the same fingerprint or `code: "idem-mismatch"` for another. `idemGet({ user, key, fp })`
+  is the read-only form of the same check, which http.js asks first so a replay skips the create's work. Memory, SQLite (`reg_idempotency`) and Postgres
+  (`reg_idempotency`, the row inserted before the object, a unique conflict waits for the first writer) implement it, and `registry-contract.js` pins the three.
+  Adding the header to another create is: take `idem` in its Registry call, call the adapter's one in-transaction step, and wrap the route in `keyed` with a rebuild that re-authorizes and reads the object.
 
 ## Teams and access (#49)
 
@@ -1128,7 +1130,7 @@ or emptied while it is the only one. Any Unit member may read the Team list and 
 | Route | Needs | Answers |
 |---|---|---|
 | `GET /teams?after=&q=` | a Unit | `{ teams: [{ id, name, size }], next, can: { create } }`: by id, 50 a page (`next` is the cursor); `q` = ASCII-folded name substring (1-100 chars); `size` counts to 1001 (1001 = more than 1000); `can.create` = `team.manage` at the Unit |
-| `POST /teams` `{ name }` | `team.manage` | 201 `{ team: { id, name, size: 0 } }`; name trimmed, 1-200 |
+| `POST /teams` `{ name }` (optional `Idempotency-Key`, § Idempotent creates) | `team.manage` | 201 `{ team: { id, name, size: 0 } }`; name trimmed, 1-200 |
 | `GET /teams/:id?after=` | a Unit; the Team in the caller's Unit | `{ team: { id, name, size }, can: { manage }, members: [{ user, name, email }], next }`: members by user id, 50 a page |
 | `PATCH /teams/:id` `{ name }` | `team.manage` | 200 `{ team }` |
 | `DELETE /teams/:id` | `team.manage` | 204. Removes the Team, its members and every grant it holds in one atomic step. **409 `last-owner`** (nothing changes) if it is the only counted owner of a Group or Space. **409 `too-large`** if it holds grants on more than 5000 scopes (remove some first) |
@@ -1260,11 +1262,11 @@ method names are stable. Ids are server-minted over `[a-z0-9-]`.
 | Area | Calls |
 |---|---|
 | tenants | `createTenant({ domain, domains, kind, admins })` (`kind` default `company`), `tenant(id) → { id, domain, domains, kind, admins, createdAt }`, `tenantByDomain(domain)` (any of the Unit's domains → tenant), `addTenantAdmin(tenant, user)`, `addTenantDomain(tenant, domain)` |
-| boards | `createBoard({ tenant, title, memberRole, space }) → { id, tenant, title, memberRole, space, createdAt }`, `board(id) → { tenant, title, memberRole, space, … } \| null` (`space` null = unfiled) |
+| boards | `createBoard({ tenant, title, memberRole, space, owner?, idem? }) → { id, tenant, title, memberRole, space, createdAt }`, `board(id) → { tenant, title, memberRole, space, … } \| null` (`space` null = unfiled) |
 | grants | `setGrant(board, user, role \| null)`, `grant(board, user) → role \| null`, `grants(board)` |
-| invites | `createInvite({ board, email, role, expiresAt, by })`, `invite(id)`, `invites(board)`, `invitesFor(board, email)`, `revokeInvite(id)` |
-| share links | `createLink({ board, role, expiresAt, by })` (role per link), `link(id)`, `links(board)`, `revokeLink(id)`, `addLinkUse(link, user)`, `linkUses(board, user)` |
-| idempotency | `idemClaim(user, key, fp) → { state: "new" \| "done" \| "in-progress" \| "mismatch", result? }`, `idemFinish(user, key, claim, result)`, `idemRelease(user, key, claim)` (§ Idempotent creates; `idemClaim` returns the `claim` on `new`) |
+| invites | `createInvite({ board, email, role, expiresAt, by, idem? })`, `invite(id)`, `invites(board)`, `invitesFor(board, email)`, `revokeInvite(id)` |
+| share links | `createLink({ board, role, expiresAt, by, idem? })` (role per link), `link(id)`, `links(board)`, `revokeLink(id)`, `addLinkUse(link, user)`, `linkUses(board, user)` |
+| idempotency | the optional `idem: { user, key, fp }` of `createBoard`, `createGroup`, `createSpace`, `createTeam`, `createInvite`, `createLink` (the key row is written in the create's own atomic step; a live one rejects with `code` `idem-replay` + `ref`, or `idem-mismatch`), and `idemGet({ user, key, fp }) → { state: "none" \| "done" \| "mismatch", ref? }` (§ Idempotent creates) |
 | home | `markOpened(user, board)`, `recents(user, { limit })`, `setStarred(user, board, on)`, `starred(user, { limit })`, `starredAmong(user, boards)`, `sharedBoards(user, email, { limit })`, `searchBoards(tenant, { q, unfiled, after, scan })`, `spaceCandidates(tenant, { user, all, after, limit })`, `groupCandidates(tenant, { user, all, limit })`, `boardRows(boards, { user, email })` (§ Home) |
 | organization | `createGroup`, `group`, `groups`; `createSpace`, `space`, `spaces`, `ensurePersonalSpace(tenant, user)`; `createTeam`, `team`, `teams`, `setTeamMember`, `teamMembers`; `setScopedGrant({ scope, subject, role \| null })`, `scopedGrants(scope)`; `createRole`, `updateRole`, `role`, `roles`; `accessContext(scope, { users, chain })`; `boardsIn(scope, { after, limit })`, `scopesOf(subject, { after, limit })`; `accessContexts(scopes, { users })` (the batch of `accessContext`, one statement on Postgres), `rename({ type: "board"\|"space"\|"group", id }, name)`, `updateScope({ type: "space"\|"group", id }, { name?, generalRole? })` (atomic; returns the row), `spacesIn(group, { after, limit })` (§ Spaces and Groups); Teams and access (§ Teams and access): `renameTeam`, `deleteTeam` (atomic, `last-owner`), `teamsPage(tenant, { after, limit, q })`, `teamsAmong(tenant, ids)`, `teamMembersPage(team, { after, limit })`, `scopedGrant(scope, subject)`, `scopedGrantsPage(scope, { after, limit })`, and the member directory `touchMember(tenant, { user, name, email })`, `membersAmong(tenant, users)`, `findMembers(tenant, { q, limit })` (table `reg_members`) |
 
@@ -1277,14 +1279,8 @@ runs as a role that doesn't own the schema (§ Store, Least privilege).
   **one atomic step** (one transaction, or a conditional delete/update), so two concurrent removals can't both
   pass. The call that would remove the last owner fails and changes nothing. Every durable adapter (phase 3/4)
   must honour this.
-- **`createBoard` takes no creator**, so `POST /boards` is `createBoard` then `setGrant(board, creator, "owner")`:
-  two calls. If the second fails, the endpoint must retry it or report the failure with the board id; it must not
-  report success for a board with no owner.
-- **A crash between the two calls** leaves a board with no owner, and nothing retries it. That board is still
-  safe and usable: roles come from `memberRole`, invites and links as usual, and only a tenant admin could grant
-  `owner` anyway. A tenant admin repairs it with `setGrant(board, user, "owner")` (they manage every board of
-  their tenant). Guaranteed: no ownerless board is reported as created. May happen: an ownerless board until an
-  admin repairs it.
+- **`createBoard` takes the creator as `owner`**, so `POST /boards` is one call: the board, its `owner` grant and (with a key) the idempotency row are one atomic
+  step. There is no state with an ownerless created board. (`setGrant(board, user, "owner")` remains the admin's repair for a board made without `owner`, e.g. by a script.)
 - **Organization** (§ Tenancy, "Organization"). `accessContext({ type: "board"|"space"|"group"|"unit", id }, { users, chain })`
   is the resolver's one read: the tenant, the scope's board / Space / Group, the grants on each scope of the chain, the
   Unit's roles, and the members of every Team named in those grants, as one consistent answer (null for an unknown

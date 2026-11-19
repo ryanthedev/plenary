@@ -194,5 +194,5 @@ test("L6 a key that cannot be made leaves no stuck dialog (busy stays false, an 
   const rej = createNewGroupModel({ api: { createGroup: async () => { throw new Error("port bug"); } }, newKey: () => "k-0000-aaaa" }); rej.setName("G");
   await expect(rej.submit()).rejects.toThrow("port bug");
   expect(rej.state.busy).toBe(false);
-  expect(errorText("in-progress")).toMatch(/still being created/i);
+  expect(errorText("in-progress")).toBe(errorText("unavailable"));   // the server has no such answer any more
 });

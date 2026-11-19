@@ -2,7 +2,7 @@
 // that must stay under it (checked at start-up), what main.js hands the adapters, and the deadline stats on /health.
 import { test, expect, afterAll, setDefaultTimeout } from "bun:test";
 import { join } from "node:path";
-import { start, checkInnerLimits, checkClaimWindow, nodeConfig, REGISTRY_LIMIT_MS, OIDC_TIMEOUT_MS, SQLITE_BUSY_MS } from "../../server/main.js";
+import { start, checkInnerLimits, nodeConfig, REGISTRY_LIMIT_MS, OIDC_TIMEOUT_MS, SQLITE_BUSY_MS } from "../../server/main.js";
 import { sqliteStore } from "../../server/store/sqlite.js";
 import { sqliteRegistry } from "../../server/registry/sqlite.js";
 import { memoryBus } from "../../server/bus/memory.js";
@@ -66,9 +66,4 @@ test("L1: a cluster start refuses when the Registry's longest call (queue wait +
   expect(closed.sort()).toEqual(["registry", "store"]);
   const ok = await start({ ...cluster(), PLENARY_REQUEST_DEADLINE_MS: "8000" }, { adapters: mk(1050), write: () => {} });   // the adapter's own default: 7050
   await ok.stop();
-});
-
-test("the idempotency claim window must cover a chain of 10 Registry calls: 300000 ms holds for the real limits and refuses a slower adapter", () => {
-  expect(() => checkClaimWindow(7050)).not.toThrow();
-  expect(() => checkClaimWindow(30_001)).toThrow(/claim window \(300000 ms\) must be at least 10 Registry calls of 30001 ms/);
 });

@@ -1,5 +1,6 @@
-// Idempotent creates over HTTP (PROTOCOL.md "Idempotent creates", #73): the Idempotency-Key header on POST /boards, /spaces, /groups,
-// invites and links. A retry returns the first answer, a changed request is refused, a cut-off create keeps its outcome.
+// Idempotent creates over HTTP (PROTOCOL.md "Idempotent creates", #73, exactly-once #86): the Idempotency-Key header on POST /boards, /spaces,
+// /groups, /teams, invites and links. A retry returns the first object (never a 409, never a second one), a changed request is refused, and a create
+// that committed and then failed unclearly (or a crash before the answer) is answered the same way.
 import { test, expect, beforeEach } from "bun:test";
 import { httpRoutes } from "../../server/auth/http.js";
 import { sessions as makeSessions } from "../../server/auth/session.js";
@@ -23,10 +24,10 @@ function virtualTimers() {
 let mem, reg, routes, vt, acme, hooks;
 /** `hooks.before[method]` may return a promise a registry call waits on (a slow call), or throw (a failing one). */
 beforeEach(async () => {
-  hooks = { before: {}, after: {}, created: [], stored: [] };
+  hooks = { before: {}, after: {}, fake: {}, reads: [], created: [] };
   vt = virtualTimers();
   mem = memoryRegistry();
-  reg = new Proxy(mem, { get(o, k) { const v = o[k]; return typeof v === "function" ? async (...a) => { await hooks.before[k]?.(...a); const out = await v.apply(o, a); if (k === "createBoard") hooks.created.push(out.id); if (k === "idemFinish") hooks.stored.push(a[3]); await hooks.after[k]?.(out); return out; } : v; } });
+  reg = new Proxy(mem, { get(o, k) { const v = o[k]; return typeof v === "function" ? async (...a) => { if (hooks.fake[k]) return hooks.fake[k](...a); await hooks.before[k]?.(...a); const out = await v.apply(o, a); if (k === "createBoard") hooks.created.push(out.id); if (k === "idemGet") hooks.reads.push(out); await hooks.after[k]?.(out); return out; } : v; } });
   const tenancy = makeTenancy({ registry: reg });
   const dev = devAuth({ enabled: true, tokens: { ada: { name: "ada", domain: "acme.com", email: "ada@acme.com" }, bo: { name: "bo", domain: "acme.com", email: "bo@acme.com" } } });
   acme = await mem.createTenant({ domain: "acme.com", admins: ["dev:ada"] });
@@ -78,46 +79,30 @@ test("a malformed key is 400 bad-idempotency-key", async () => {
   expect(await boards()).toHaveLength(0);
 });
 
-test("a retry while the first is still running is 409 in-progress with Retry-After; once it finishes the retry gets its answer", async () => {
-  let release; hooks.before.createBoard = () => new Promise(r => { release = r; });
-  const first = post("/boards", { title: "Slow" }, { key: K });
-  await flush(); await flush();
-  const mid = await post("/boards", { title: "Slow" }, { key: K });
-  expect(mid.status).toBe(409);
-  expect(mid.headers.get("retry-after")).toBe("1");
-  expect(await mid.json()).toEqual({ error: "in-progress" });
-  release(); const done = await (await first).json();
-  const again = await post("/boards", { title: "Slow" }, { key: K });
-  expect((await again.json()).board.id).toBe(done.board.id);
-});
-
-test("DW-F2 a deadline cut between create and the owner grant keeps its outcome: the retry returns owner-grant-failed WITH the board id", async () => {
-  let calls = 0;   // the first owner grant hangs, then fails when freed; its retry fails at once
-  hooks.before.setGrant = () => (calls++ === 0 ? new Promise((_, rej) => { hooks.freeGrant = () => rej(new Error("db down")); }) : Promise.reject(new Error("db down")));
+test("DW-86a a create that COMMITS and whose response is then lost (deadline 503): the retry returns the first board at once, no 409, no second board", async () => {
+  let release; hooks.after.createBoard = () => new Promise(r => { release = r; });   // committed; the handler is still running when the deadline hits
   const first = post("/boards", { title: "Cut" }, { key: K });
   await flush(); await flush(); await flush();
+  expect(await boards()).toHaveLength(1);
+  const mid = await post("/boards", { title: "Cut" }, { key: K });   // a retry while the first is still running: answered from the committed key, immediately
+  expect(mid.status).toBe(201);
+  expect(mid.headers.get("idempotent-replayed")).toBe("true");
   vt.advance(DEADLINE);
-  expect((await first).status).toBe(503);   // the client sees a bare unavailable
-  hooks.freeGrant();                        // the cut-off call goes on: its owner grant fails, is retried once, fails again
-  await flush(); await flush(); await flush(); await flush();
+  expect((await first).status).toBe(503);
+  release(); await flush(); await flush();
   const retry = await post("/boards", { title: "Cut" }, { key: K });
-  expect(retry.status).toBe(503);
-  const body = await retry.json();
-  expect(body.error).toBe("owner-grant-failed");
-  expect(typeof body.board).toBe("string");
-  expect(await boards()).toEqual([body.board]);   // the one board, named in the answer
-  expect(retry.headers.get("idempotent-replayed")).toBe("true");
+  expect(retry.status).toBe(201);
+  expect((await retry.json()).board.id).toBe((await boards())[0]);
+  expect(await boards()).toHaveLength(1);
 });
 
-test("an owner-grant failure with no deadline is stored too: a retry replays it without creating a second board", async () => {
-  hooks.before.setGrant = () => { throw new Error("db down"); };
-  const a = await post("/boards", { title: "NoOwner" }, { key: K });
-  const first = await a.json();
-  expect([a.status, first.error]).toEqual([503, "owner-grant-failed"]);
-  hooks.before.setGrant = undefined;
-  const b = await post("/boards", { title: "NoOwner" }, { key: K });
-  expect(await b.json()).toEqual(first);
-  expect(await boards()).toEqual([first.board]);
+test("a board made under a key is made with its owner in the same step (nothing to repair, no owner-grant-failed)", async () => {
+  const made = await (await post("/boards", { title: "Mine" }, { key: K })).json();
+  expect(await mem.grants(made.board.id)).toEqual([{ user: "dev:ada", role: "owner" }]);
+  hooks.before.setGrant = () => { throw new Error("db down"); };   // a failing grant call is not part of a create any more
+  const b = await post("/boards", { title: "Other" }, { key: "key-bbbb-0002" });
+  expect(b.status).toBe(201);
+  expect(await mem.grants((await b.json()).board.id)).toEqual([{ user: "dev:ada", role: "owner" }]);
 });
 
 test("a refusal made before anything was written is not stored: the claim is dropped", async () => {
@@ -157,11 +142,9 @@ test("SEC a link made by an owner who then loses the board: replaying the key is
   const first = await post(`/boards/${board}/links`, { role: "viewer" }, { tok: "bo", key: K });
   const made = await first.json();
   expect(first.status).toBe(201);
-  // what is stored is a reference only ({ status, ref: { id } }): no body, no url. (A link's id is the id reg_links already holds in the same store.)
-  expect(hooks.stored.map(t => Object.keys(JSON.parse(t)).sort())).toEqual([["ref", "status"]]);
-  expect(hooks.stored.join("")).not.toContain(made.url);
-  expect(hooks.stored.join("")).not.toContain("viewer");
+  // what is stored under a key is the object's id only: no body, no url. (A link's id is the id reg_links already holds in the same store.)
   expect(await post(`/boards/${board}/links`, { role: "viewer" }, { tok: "bo", key: K }).then(r => r.status)).toBe(201);   // still allowed: replayed
+  expect(hooks.reads.at(-1)).toEqual({ state: "done", ref: made.link.id });
   await mem.setGrant(board, "dev:bo", "viewer");   // bo is no longer a manager
   const replay = await post(`/boards/${board}/links`, { role: "viewer" }, { tok: "bo", key: K });
   expect(replay.status).toBe(403);
@@ -175,7 +158,6 @@ test("SEC the same for an invite, and a replay of a revoked link is 404", async 
   const board = await owned();
   const inv = await (await post(`/boards/${board}/invites`, { email: "x@y.com", role: "viewer" }, { tok: "bo", key: "key-inv-sec01" })).json();
   const lk = await (await post(`/boards/${board}/links`, { role: "viewer" }, { tok: "bo", key: "key-lnk-sec01" })).json();
-  expect(hooks.stored.join("")).not.toContain("x@y.com");   // the invited address is not in the key store
   await mem.revokeLink(lk.link.id);
   const stillLink = await post(`/boards/${board}/links`, { role: "viewer" }, { tok: "bo", key: "key-lnk-sec01" });
   expect(stillLink.status).toBe(404);   // L7: a revoked link is gone, not a 201 with its url
@@ -223,32 +205,71 @@ test("SEC another user replaying the same key never sees the first user's result
 
 // ---- B1: only an error that proves nothing was written frees the key ----
 
-test("B1 a create that COMMITS and then fails unclearly (client-timeout) keeps the key: the retry is 409 in-progress, never a second board", async () => {
+test("DW-86b a create that COMMITS and then fails unclearly (client-timeout) or crashes before its answer: the retry returns the first board immediately, never 409 and never a second board", async () => {
   hooks.after.createBoard = () => { throw Object.assign(new Error("no answer"), { code: "client-timeout" }); };
   const first = await post("/boards", { title: "Maybe" }, { key: K });
   expect(first.status).toBe(503);
   expect(await boards()).toHaveLength(1);                    // it did commit
   hooks.after.createBoard = undefined;
   const retry = await post("/boards", { title: "Maybe" }, { key: K });
-  expect(retry.status).toBe(409);
-  expect(await retry.json()).toEqual({ error: "in-progress" });
+  expect(retry.status).toBe(201);
+  expect(retry.headers.get("idempotent-replayed")).toBe("true");
+  expect((await retry.json()).board.id).toBe((await boards())[0]);
   expect(await boards()).toHaveLength(1);                    // still exactly one
   expect(mem.idemSize()).toBe(1);
 });
 
-test("B1 an error that proves nothing was written (queue-timeout, a refusal) frees the key: the retry creates once", async () => {
+test("a create that fails BEFORE committing leaves no key: the retry runs as a first use and creates once", async () => {
   let n = 0;
-  hooks.before.createBoard = () => { if (n++ === 0) throw Object.assign(new Error("queue"), { rolledBack: true }); };
+  hooks.before.createBoard = () => { if (n++ === 0) throw new Error("queue-timeout"); };
   expect((await post("/boards", { title: "Again" }, { key: K })).status).toBe(503);
   expect(await boards()).toHaveLength(0);
+  expect(mem.idemSize()).toBe(0);
   const retry = await post("/boards", { title: "Again" }, { key: K });
   expect(retry.status).toBe(201);
+  expect(retry.headers.get("idempotent-replayed")).toBeNull();
   expect(await boards()).toHaveLength(1);
-  for (const code of ["a", "b", "c"]) {   // any adapter's rolled-back error frees its key
-    hooks.before.createBoard = () => { throw Object.assign(new Error(code), { rolledBack: true }); };
-    await post("/boards", { title: code }, { key: "key-" + code });
-    expect(mem.idemSize()).toBe(1);                          // each released its own claim: only the finished one is left
-  }
+});
+
+test("a create that races the first one (its pre-read said none) is answered by the create's own idem-replay, not a second object; a changed body is 422", async () => {
+  const first = await (await post("/boards", { title: "Roadmap" }, { key: K })).json();
+  hooks.fake.idemGet = async () => ({ state: "none" });   // the pre-read ran before the first committed
+  const raced = await post("/boards", { title: "Roadmap" }, { key: K });
+  expect([raced.status, raced.headers.get("idempotent-replayed")]).toEqual([201, "true"]);
+  expect((await raced.json()).board.id).toBe(first.board.id);
+  const changed = await post("/boards", { title: "Different" }, { key: K });
+  expect([changed.status, (await changed.json()).error]).toEqual([422, "idempotency-key-reused"]);
+  expect(await boards()).toEqual([first.board.id]);
+});
+
+test("POST /teams with a key: the retry returns the first Team (replay header), a changed body is 422, a keyless create is new each time", async () => {
+  const a = await post("/teams", { name: "Platform" }, { key: K });
+  expect(a.status).toBe(201);
+  expect(a.headers.get("idempotent-replayed")).toBeNull();
+  const first = (await a.json()).team;
+  const b = await post("/teams", { name: "Platform" }, { key: K });
+  expect([b.status, b.headers.get("idempotent-replayed")]).toEqual([201, "true"]);
+  expect((await b.json()).team).toEqual(first);
+  expect(await mem.teams(acme.id)).toHaveLength(1);
+  const c = await post("/teams", { name: "Other" }, { key: K });
+  expect(c.status).toBe(422);
+  expect(await c.json()).toEqual({ error: "idempotency-key-reused" });
+  expect((await post("/teams", { name: "Platform" })).status).toBe(201);
+  expect(await mem.teams(acme.id)).toHaveLength(2);
+});
+
+test("POST /teams replay is authorized again, and a Team created after a lost response is not duplicated", async () => {
+  hooks.after.createTeam = () => { throw Object.assign(new Error("no answer"), { code: "client-timeout" }); };
+  expect((await post("/teams", { name: "Lost" }, { key: K })).status).toBe(503);
+  hooks.after.createTeam = undefined;
+  expect(await mem.teams(acme.id)).toHaveLength(1);
+  const retry = await post("/teams", { name: "Lost" }, { key: K });
+  expect([retry.status, retry.headers.get("idempotent-replayed")]).toEqual([201, "true"]);
+  expect(await mem.teams(acme.id)).toHaveLength(1);
+  // bo holds no team.manage: never made one under this key, and gets the route's 403 (no key row is written for a refusal)
+  const refused = await post("/teams", { name: "Lost" }, { tok: "bo", key: K });
+  expect(refused.status).toBe(403);
+  expect(mem.idemSize()).toBe(1);
 });
 
 // ---- L7 ----

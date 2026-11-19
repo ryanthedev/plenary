@@ -17,14 +17,13 @@ import { isUnitAdmin } from "../auth/resolver.js";
 
 export class AdminError extends Error {
   /**
-   * @param {"forbidden"|"bad-request"|"not-found"|"last-owner"|"owner-grant-failed"|"unknown-person"|"bad-role"|"too-large"} code
+   * @param {"forbidden"|"bad-request"|"not-found"|"last-owner"|"unknown-person"|"bad-role"|"too-large"} code
    * @param {string} [message]
-   * @param {{ board?: string, cause?: unknown }} [extra]  `board`: the id of a board created without its owner grant
+   * @param {{ cause?: unknown }} [extra]
    */
   constructor(code, message, extra = {}) {
     super(message);
     this.code = code;
-    if (extra.board) this.board = extra.board;
     if (extra.cause !== undefined) this.cause = extra.cause;
   }
 }
@@ -93,12 +92,12 @@ export async function setGrant({ caller, board, user, role }, { registry }) {
 }
 
 /** Invite an email to a board. Works across domains. */
-export async function createInvite({ caller, board, email, role, expiresAt = null }, { registry, now = Date.now }) {
+export async function createInvite({ caller, board, email, role, expiresAt = null, idem }, { registry, now = Date.now }) {
   const b = await managed(registry, caller, board);
   const e = normEmail(email);
   if (!e || !/^[^@\s]+@[^@\s]+$/.test(e) || e.length > 320) throw bad("bad email");
   if (!INVITE_ROLES.includes(role)) throw bad("bad role");
-  return registry.createInvite({ board: b.id, email: e, role, expiresAt: expiry(expiresAt, now()), by: caller.user });
+  return registry.createInvite({ board: b.id, email: e, role, expiresAt: expiry(expiresAt, now()), by: caller.user, idem });
 }
 /** One live invite of a board the caller manages (the replay of a keyed create: PROTOCOL.md "Idempotent creates"); else `forbidden`, or `not-found` for a missing, revoked or expired one. */
 export async function readInvite({ caller, board, invite }, { registry, now = Date.now }) {
@@ -119,10 +118,10 @@ export async function revokeInvite({ caller, board, invite }, { registry }) {
 }
 
 /** Make a share link: an unguessable id, a role (editor, annotator or viewer), optional expiry. */
-export async function createLink({ caller, board, role, expiresAt = null }, { registry, now = Date.now }) {
+export async function createLink({ caller, board, role, expiresAt = null, idem }, { registry, now = Date.now }) {
   const b = await managed(registry, caller, board);
   if (!LINK_ROLES.includes(role)) throw bad("links carry only editor, annotator or viewer");
-  return registry.createLink({ board: b.id, role, expiresAt: expiry(expiresAt, now()), by: caller.user });
+  return registry.createLink({ board: b.id, role, expiresAt: expiry(expiresAt, now()), by: caller.user, idem });
 }
 /** One live link of a board the caller manages (the replay of a keyed create); else `forbidden`, or `not-found` for a missing, revoked or expired one. */
 export async function readLink({ caller, board, link }, { registry, now = Date.now }) {

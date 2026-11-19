@@ -586,6 +586,21 @@ describe.skipIf(!url)("postgres registry", () => {
     } finally { for (const h of hs) await h.close(); await drop(schema); }
   });
 
+  test("durable keyed create: the key survives close and reopen (a crash after the commit), so the retry gets the first object, not a second", async () => {
+    const schema = schemaName(), idem = { user: "google:root", key: "key-0001-aaaa", fp: "f".repeat(64) };
+    let r = await postgresRegistry({ url, schema, max: 2 });
+    try {
+      const t = await r.createTenant({ domain: "acme.com", admins: ["google:root"] });
+      const b = await r.createBoard({ tenant: t.id, title: "Once", owner: "google:root", idem });
+      await r.close();
+      r = await postgresRegistry({ url, schema, max: 2 });
+      expect(await r.idemGet(idem)).toEqual({ state: "done", ref: b.id });
+      await expect(r.createBoard({ tenant: t.id, title: "Once", owner: "google:root", idem })).rejects.toMatchObject({ code: "idem-replay", ref: b.id });
+      expect((await r.boardsIn({ type: "unit", id: t.id })).ids).toEqual([b.id]);
+      expect(await r.grants(b.id)).toEqual([{ user: "google:root", role: "owner" }]);
+    } finally { await r.close(); await drop(schema); }
+  }, 30_000);
+
   test("durable: everything survives close and reopen (a fresh pool)", async () => {
     const schema = schemaName();
     let r = await postgresRegistry({ url, schema, max: 2, now: () => 7 });

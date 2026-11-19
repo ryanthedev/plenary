@@ -292,7 +292,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       const sent = perf();
       const l = await withTimeout(store.acquire(tenant, board, me, leaseTtlMs), storeTimeoutMs);
       if (closed) {
-        if (l) await Promise.resolve(store.release(tenant, board, me, l.epoch)).catch(() => {});
+        if (l) await withTimeout(Promise.resolve().then(() => store.release(tenant, board, me, l.epoch)), storeTimeoutMs).catch(() => {});
         throw closedError();
       }
       if (l) return start(tenant, board, key, l, sent);
@@ -324,7 +324,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       // (or this one's next open) needn't wait out the ttl. A lost lease is never released.
       // Then a host already watching the board is told (as after a clean stop), so it need not wait for its next poll.
       // `releaseP` never rejects: close() waits for it, then announces only if this did not (a failed release leaves the announcing to close()).
-      if (!slot.leaseLost) slot.releaseP = Promise.resolve().then(() => store.release(tenant, board, me, slot.epoch))
+      if (!slot.leaseLost) slot.releaseP = withTimeout(Promise.resolve().then(() => store.release(tenant, board, me, slot.epoch)), storeTimeoutMs)   // a release that never answers: the lease lapses by its ttl
         .then(() => { slot.announced = true; bus.publish(subjects.entries(tenant, board), { seq: 0, epoch: slot.epoch, cp: 0, released: true })?.catch?.(() => {}); })
         .catch(e => log.warn("lease release after a failed build failed", { tenant, board, err: e }));
       throw err;
@@ -636,7 +636,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
         await slot.releaseP;
         if (slot.leaseLost) continue;
         try {
-          await store.release(slot.tenant, slot.board, me, slot.epoch);
+          await withTimeout(Promise.resolve().then(() => store.release(slot.tenant, slot.board, me, slot.epoch)), storeTimeoutMs);   // never answers: the lease lapses by its ttl (logged below)
           // A host watching this board takes it at once (L2), not when it next asks the Store.
           if (!slot.announced) bus.publish(subjects.entries(slot.tenant, slot.board), { seq: slot.durable, epoch: slot.epoch, cp: slot.room?.heartbeat().cp ?? 0, released: true })?.catch?.(() => {});
         } catch (err) { log.warn("lease release failed; it lapses within its ttl", { tenant: slot.tenant, board: slot.board, err }); }

@@ -999,6 +999,27 @@ describe("stuck host (#65)", () => {
     } finally { await A.close(); await raw.close(); await bus.close(); }
   }, 20000);
 
+  test("close() settles within storeTimeoutMs when release never answers: after a failed build, and for a held room", async () => {
+    for (const failBuild of [true, false]) {
+      const { bus, V, raw, host } = vworld();
+      const sa = stallable(raw, V.timers);
+      let hang = false;
+      const store = { ...sa.store, release: (...a) => (hang ? never() : raw.release(...a)) };
+      if (failBuild) sa.build = "hang";
+      const A = host({ store, holder: "h-a", leaseTtlMs: 3_000, storeTimeoutMs: 500 });
+      try {
+        hang = true;
+        const wait = opened(V, A.open(T, B));
+        await wait(0);
+        if (failBuild) expect((await wait(600)).e?.code).toBe("timeout");        // the build fails; its release is parked
+        let done = false; const closing = A.close().then(() => { done = true; });
+        await V.advance(100); expect(done).toBe(false);                            // waiting on the release, within its bound
+        expect(await V.until(() => done, 1_200, 50)).not.toBe(null);               // storeTimeoutMs (500) per release, not forever
+        await closing;
+      } finally { await raw.close(); await bus.close(); }
+    }
+  }, 20000);
+
   test("stuckMs and storeTimeoutMs must be positive integers", () => {
     const bus = memoryBus();
     for (const o of [{ stuckMs: 0 }, { stuckMs: 1.5 }, { storeTimeoutMs: -1 }, { storeTimeoutMs: "x" }]) expect(() => roomHost({ store: {}, bus, ...o })).toThrow(RangeError);

@@ -11,11 +11,17 @@ afterAll(cleanup);
 const T = "t-aaa", B = "b-one";
 
 // Every handle on one file shares one injected clock, as two processes on one machine share the machine's.
-storeContract("sqlite", async () => {
+storeContract("sqlite", async opts => {
   const path = join(tempDir(), "plenary.db");
   let t = 1_000_000;
   const now = () => t;
-  return { store: sqliteStore({ path, now }), another: async () => sqliteStore({ path, now }), advance: ms => { t += ms; } };
+  const raw = new Database(path, { create: true }), one = (sql, ...a) => raw.query(sql).run(...a);
+  return { store: sqliteStore({ path, now, ...opts }), another: async () => sqliteStore({ path, now, ...opts }), advance: ms => { t += ms; },
+    raw: {
+      putCheckpointRow: async (t, b, seq, data) => one("INSERT INTO checkpoints (tenant, board, seq, data) VALUES (?, ?, ?, ?)", t, b, seq, data),
+      putPartRow: async (t, b, seq, wid, n, data) => one("INSERT INTO checkpoint_parts (tenant, board, seq, wid, n, data) VALUES (?, ?, ?, ?, ?, ?)", t, b, seq, wid, n, data),
+      partRows: async (t, b) => raw.query("SELECT count(*) AS c FROM checkpoint_parts WHERE tenant = ? AND board = ?").get(t, b).c,
+    } };
 });
 
 test("opened with WAL, synchronous=FULL and fullfsync", async () => {
@@ -56,4 +62,33 @@ test("a file made before the lease (epoch-only leases table) is upgraded in plac
   const again = sqliteStore({ path });                                            // a second open: no ALTER runs twice
   expect(await again.epoch(T, B)).toBe(7);
   await again.close();
+});
+
+test("a file made before checkpoint parts (no checkpoint_parts table, one big JSON row) opens, reads it, and takes parts beside it", async () => {
+  const path = join(tempDir(), "plenary.db");
+  const old = new Database(path, { create: true });
+  old.run("CREATE TABLE checkpoints (tenant TEXT NOT NULL, board TEXT NOT NULL, seq INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq)) WITHOUT ROWID");
+  const cp = { seq: 7, streams: { board: { elements: Array.from({ length: 300 }, (_, i) => ({ id: `e${i}`, text: "😀".repeat(20) })) } } };
+  old.run("INSERT INTO checkpoints (tenant, board, seq, data) VALUES (?, ?, 7, ?)", [T, B, JSON.stringify(cp)]);
+  old.close();
+  const store = sqliteStore({ path, partChars: 1000 });
+  expect(await store.getCheckpoint(T, B)).toEqual(cp);
+  const epoch = await store.openEpoch(T, B);
+  await store.putCheckpoint(T, B, { ...cp, seq: 8 }, epoch);
+  expect((await store.getCheckpoint(T, B)).seq).toBe(8);
+  expect(await store.getCheckpoint(T, B, 8)).toEqual(cp);
+  await store.close();
+});
+
+test("a header whose parts hold the wrong number of chars is refused as corrupt, never parsed", async () => {
+  const path = join(tempDir(), "plenary.db");
+  const store = sqliteStore({ path, partChars: 100 });
+  const epoch = await store.openEpoch(T, B);
+  await store.putCheckpoint(T, B, { seq: 3, pad: "x".repeat(450) }, epoch);
+  const raw = new Database(path);
+  raw.run("UPDATE checkpoint_parts SET data = substr(data, 2) WHERE n = 1");        // a part lost a char
+  expect(await code(store.getCheckpoint(T, B))).toBe("corrupt");
+  raw.run("DELETE FROM checkpoint_parts WHERE n = 2");                                // a part is gone: the read gives up, not hangs
+  expect(await code(store.getCheckpoint(T, B))).toBe("unavailable");
+  raw.close(); await store.close();
 });

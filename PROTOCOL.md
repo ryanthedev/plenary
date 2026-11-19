@@ -559,6 +559,40 @@ older version of a deleted element would bring it back on that client only.
   - **Order of a checkpoint's elements** is now the shadow's insertion order, not paint order. Readers still sort by layer
     and z (`Doc.live()`), but it breaks z ties by array position, so for equal z the paint order of a client loaded
     from a snapshot follows this insertion order (it did follow paint order before).
+- **Checkpoint parts** (decided 2026-11-19, TECH-DEBT row 40; `server/encode/cp-parts.js`, the two Store adapters). The fold and
+  the encoding are bounded, so the Store's own write must be too: `bun:sqlite` inserts a row in one synchronous call, about
+  4 ms per MB (mostly the fsync under `synchronous=FULL`), which held the loop 87 ms at 10 MB, 138 ms at 27 MB and 226 ms at 50 MB (`scripts/fold-bench.js`, `sqlitePutMaxStallMs`, load ~16). With parts the longest stall is
+  13.5 to 16 ms at 10, 27 and 50 MB, 15.8 to 19.6 at the worst of two runs, measured at load ~43 (one part's fsync plus the WAL's automatic checkpoint every few parts; `wal_autocheckpoint` 64 to 1000 made no clear difference). The Store
+  port is unchanged; the adapters store a checkpoint whose JSON text is longer than one part (`PART_CHARS` = 1 Mi chars,
+  option `partChars`) as parts. A checkpoint that fits one part is still one row of plain JSON, as before.
+  - **Format.** Part rows in their own table (SQLite `checkpoint_parts`, Postgres `pl_checkpoint_parts`): `(tenant, board, seq,
+    wid, n, data)`, `wid` a random id of one write attempt (two writers of one `seq` never share rows), `n` from 0. The
+    checkpoint **exists only when its header row** is in the checkpoints table under its `seq`: the text
+    `\u0001cp-parts 1 <wid> <parts> <chars>`. No JSON text can start with `\u0001`, and a one-row checkpoint starts with `{`, so a
+    reader tells them apart with no migration. Old databases read as before; only the new table is created (SQLite at open,
+    Postgres by `migrate`, deploy/README.md). A binary from before parts cannot read a header (its `getCheckpoint` throws on it and the board won't open), so a rollback past this change first deletes the header rows (SQLite: `DELETE FROM checkpoints WHERE data LIKE char(1) || 'cp-parts%'`; Postgres: the same with `E'\x01cp-parts%'`); the log has everything, so the boards rebuild from older one-row checkpoints or from 0.
+  - **Write.** Encode in slices (above), cut into parts (never between the halves of a surrogate pair), then one transaction per
+    part, **each fenced** (SQLite: the lease epoch read in the write transaction; Postgres: `FOR SHARE` on the lease row), the
+    loop handed back between parts; then **the header's transaction**: fenced again, it checks that all `<parts>` rows of
+    `(seq, wid)` exist (else `unavailable`: a sweep took one), inserts the header (the first write of a `seq` is kept, as before), and prunes
+    to the newest `keepCheckpoints`. So a fenced holder stops at its next part and can never make a checkpoint visible after a
+    takeover; a crash or abort before the header leaves the previous checkpoint the newest, readable, untouched; a timed-out write
+    that still runs only ever adds a checkpoint at its own `seq`, so it can't hide a newer one (the highest `seq` wins).
+  - **Orphans.** Parts no header names are swept: by the writer after its header (the loser of a same-`seq` race, and the
+    parts of checkpoints pruned just now), by a writer that aborts or is fenced (its own parts, no fence needed to delete them), and by the
+    next checkpoint's sweep for a crash's (the sweep is `orphanGroups`: unnamed groups not newer than the newest header; a newer
+    group may be a write in flight). A write overtaken by a newer checkpoint may find its parts swept and fail `unavailable`: it was
+    stale anyway. SQLite deletes a part per statement with the loop handed back between.
+  - **Read.** The header names the parts; they are read one by one and joined (SQLite hands the loop back between parts), the
+    total length checked against the header (`corrupt` if not). A part a concurrent prune removed makes the read look again (up to 3 times), then `unavailable`.
+    Decoding the JSON itself is still one call (rebuild and gateway feeds only; § Known limits).
+  - **Why SQLite's parts table has a rowid.** Counting a write's parts on a `WITHOUT ROWID` table walks every row's text (15 ms for 50 x 1 MB);
+    with a rowid the key lives in a narrow index and the count is free.
+  - **Options weighed.** (a) *Incremental blob I/O on one row* (`sqlite3_blob_write`): one atomic row, but `bun:sqlite` has no blob handle and one
+    commit would still fsync the whole file. (b) *Smaller `synchronous` for checkpoints*: breaks "an acknowledged op is never lost" for their data and
+    the one-row visibility guarantee. (c) *Write the checkpoint to a file and store its name*: a second durability domain, no atomicity with the lease fence, and
+    it doesn't exist for Postgres. (d) *Parts + header row* (chosen): per-part fence, atomic visibility, one format for both adapters, old rows still readable.
+    Postgres's own stall (the driver turns the whole text into bytes in one call: 11 ms at 27 MB, 20.5 at 50 MB, measured) fell to 5.5 and 7.7 ms with parts.
 - **A checkpoint may lag the live `seq`.** Between a fold and the gateways learning of it (the write's
   acknowledgement, then the next heartbeat's `cp`, ≤ 2 s) a join is served from the older checkpoint with a longer
   tail: slower, never wrong. A checkpoint that can't be read, or doesn't match the log (see Rebuild), is skipped for
@@ -1324,13 +1358,10 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   Compressed catch-up (§ Joining) takes a varied 2,000-element board from 1.1 to 2.2 MB down to 0.15 to 0.6 MB (4× to 7×;
   near-identical shapes reach 30×), but a board near the caps is still tens of MB after it. M4's load test sets the
   real cap.
-- **The Store's own write of a big checkpoint still holds the loop** (SQLite): the room's copy and the adapters' encoding
-  are in bounded steps (§ Recovery, "Incremental fold"; under 3 ms each at 50 MB), but `bun:sqlite` inserts the whole
-  text in one synchronous call: about 4 ms per MB (measured: 55 ms at 10 MB, 124 ms at 27 MB, 232 ms at 50 MB, once per
-  fold, at load ~10), mostly the fsync. Postgres writes over a socket, off the loop; its driver converts the text to bytes
-  in one call (measured stall: 11 ms at 27 MB, 21.5 ms at 50 MB). Fixing it means storing a checkpoint as several rows committed apart and linked by a final one (a storage
-  format change; TECH-DEBT). The catch-up deflate itself is off the loop, but `Buffer.from(text)` before it is not (about 10 to 20 ms per
-  18 MB text, once per text).
+- **A big checkpoint's write is in parts** (§ Recovery, "Checkpoint parts"; `scripts/fold-bench.js` prints `sqlitePutMaxStallMs`
+  and, with `DATABASE_URL`, `pgPutMaxStallMs`). What still holds the loop in one call: one part's insert (about 3 to 15 ms at 1 MiB,
+  fsync-bound, plus a WAL checkpoint every few parts), `JSON.parse` of a whole checkpoint when a room rebuilds or a gateway feeds one,
+  and `Buffer.from(text)` before the catch-up deflate (about 10 to 20 ms per 18 MB text, once per text).
 - **Compressed catch-up is for clients that can inflate.** A runtime with no zlib (Herdr's QuickJS) joins as before:
   plain text, the full size.
 - **The op rate is per gateway:** a user connected through G gateways can write up to G × 8 connections × 20

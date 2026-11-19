@@ -5,7 +5,8 @@
 //                                               "conflict"; an `epoch` not the lease's throws "fenced"; none: "bad-entry"
 //   read(tenant, board, fromSeq, limit, maxBytes?)   entries with seq >= fromSeq, ascending, at most `limit`
 //   lastSeq(tenant, board)                      the board's last seq (0 = empty)
-//   putCheckpoint(tenant, board, cp, epoch)     kept by cp.seq; the newest few per board are kept; fenced like append
+//   putCheckpoint(tenant, board, cp, epoch)     kept by cp.seq; the newest few per board are kept; fenced like append.
+//                                               A big one is stored as parts, each committed and fenced apart (§ Recovery, "Checkpoint parts")
 //   getCheckpoint(tenant, board, beforeSeq?)    the highest seq (below beforeSeq, if given), never the last write
 //   openEpoch(tenant, board), epoch(tenant, board)   the board's epoch in its lease record (pl_leases)
 //   acquire / renew / release / lease           the board's lease (holder, epoch, expires_at), as in sqlite.js
@@ -48,6 +49,7 @@
 import { SQL } from "bun";
 import { needId, PortError, mintClusterId } from "../ids.js";
 import { encodeSliced } from "../encode/sliced.js";
+import { PART_CHARS, splitParts, headerOf, parseHeader, orphanGroups } from "../encode/cp-parts.js";
 import { needSchema, migrate } from "../pg/schema.js";
 
 const MAX_READ = 10_000;
@@ -63,6 +65,8 @@ const UNIQUE = "23505";
 export const STORE_TABLES = Object.freeze({
   pl_entries: "tenant TEXT NOT NULL, board TEXT NOT NULL, seq BIGINT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq)",
   pl_checkpoints: "tenant TEXT NOT NULL, board TEXT NOT NULL, seq BIGINT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq)",
+  // Parts of a checkpoint too big for one row (server/encode/cp-parts.js); readable only when a pl_checkpoints header names (seq, wid).
+  pl_checkpoint_parts: "tenant TEXT NOT NULL, board TEXT NOT NULL, seq BIGINT NOT NULL, wid TEXT NOT NULL, n INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq, wid, n)",
   // The board's lease record (§ Recovery, Room identity): holder NULL = unheld (released, or a single-node openEpoch).
   // expires_at: ms on the database's clock.
   pl_leases: "tenant TEXT NOT NULL, board TEXT NOT NULL, epoch BIGINT NOT NULL, holder TEXT, expires_at BIGINT, PRIMARY KEY (tenant, board)",
@@ -83,6 +87,7 @@ const DENIED = "42501", LOCK_TIMEOUT = "55P03", IDLE_CUT = "25P03";
 const NEEDS = Object.freeze({
   pl_entries: ["SELECT", "INSERT"],
   pl_checkpoints: ["SELECT", "INSERT", "DELETE"],
+  pl_checkpoint_parts: ["SELECT", "INSERT", "DELETE"],
   pl_leases: ["SELECT", "INSERT", "UPDATE"],   // UPDATE: the lease calls, and FOR SHARE in a fenced write
   pl_cluster: ["SELECT", "INSERT"],
 });
@@ -95,18 +100,20 @@ const MAX_TTL = 10 * 60_000;
  *   lockTimeoutMs: how long start-up waits for the schema's start-up lock (default 15 s), then fails with code "lock-timeout".
  *   txIdleTimeoutMs: a write transaction idle this long (its client paused mid-write) is ended by the server (default 5 s).
  *   leaseLockTimeoutMs: the longest a lease call waits on a row lock (default 2 s, at most half its ttl), then "unavailable".
+ *   partChars: the most chars in one checkpoint part (default 1 Mi). onPart: test hook, awaited before each part
+ *   ("part:<n>") and before the header ("header"); a throw aborts the write there.
  * @returns {Promise<{ append: Function, read: Function, lastSeq: Function, putCheckpoint: Function,
  *   getCheckpoint: Function, openEpoch: Function, epoch: Function, acquire: Function, renew: Function,
  *   release: Function, lease: Function, settings(): Promise<object>, clusterId(): Promise<string>, close(): Promise<void> }>}
  */
 export async function postgresStore({ url, sql, max, schema = "public", keepCheckpoints = 3, lockTimeoutMs = 15_000,
-  txIdleTimeoutMs = 5_000, leaseLockTimeoutMs = 2_000 }) {
+  txIdleTimeoutMs = 5_000, leaseLockTimeoutMs = 2_000, partChars = PART_CHARS, onPart }) {
   if (!sql && !url) throw new Error("postgres store: pass url or sql");
   const s = needSchema(schema);
   const owned = !sql;
   const db = sql ?? new SQL(max ? { url, max } : url);
   let open = true;
-  const K = `"${s}".pl_cluster`, E = `"${s}".pl_entries`, C = `"${s}".pl_checkpoints`, L = `"${s}".pl_leases`;
+  const K = `"${s}".pl_cluster`, E = `"${s}".pl_entries`, C = `"${s}".pl_checkpoints`, CP = `"${s}".pl_checkpoint_parts`, L = `"${s}".pl_leases`;
 
   try {
     await db.begin(async tx => {
@@ -183,6 +190,16 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
   const lastOf = async (q, tenant, board) =>
     Number((await q.unsafe(`SELECT coalesce(max(seq), 0) AS m FROM ${E} WHERE tenant = $1 AND board = $2`, [tenant, board]))[0].m);
 
+  /** Removes part rows no header names (aborted, fenced, pruned or crashed writes), older than the newest header. Never throws. */
+  const sweepParts = async (tenant, board, mine) => {
+    try {
+      const gone = orphanGroups(await db.unsafe(`SELECT seq, data FROM ${C} WHERE tenant = $1 AND board = $2`, [tenant, board]),
+        await db.unsafe(`SELECT DISTINCT seq, wid FROM ${CP} WHERE tenant = $1 AND board = $2`, [tenant, board]));
+      if (mine && !gone.some(g => g.wid === mine.wid)) gone.push(mine);   // an aborted write's own, whatever the newest header
+      for (const g of gone) await db.unsafe(`DELETE FROM ${CP} WHERE tenant = $1 AND board = $2 AND seq = $3 AND wid = $4`, [tenant, board, g.seq, g.wid]);
+    } catch { /* best effort: the next checkpoint's sweep takes what is left */ }
+  };
+
   return {
     /**
      * Writes every entry or none, only if the board's last seq is `expectSeq` and only if `epoch` is
@@ -258,23 +275,56 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
     async putCheckpoint(tenant, board, cp, epoch) {
       ready(tenant, board); needWriteEpoch(epoch);
       if (!cp || typeof cp !== "object" || !Number.isSafeInteger(cp.seq) || cp.seq < 0) throw new PortError("bad-entry", "a checkpoint needs a seq");
-      const data = await encodeSliced(cp);   // in slices: the event loop breathes between them
-      await write(async tx => {
-        await fence(tx, tenant, board, epoch);
-        await tx.unsafe(`INSERT INTO ${C} (tenant, board, seq, data) VALUES ($1, $2, $3, $4)
-          ON CONFLICT (tenant, board, seq) DO NOTHING`, [tenant, board, cp.seq, data]);
-        await tx.unsafe(`DELETE FROM ${C} WHERE tenant = $1 AND board = $2 AND seq NOT IN
-          (SELECT seq FROM ${C} WHERE tenant = $1 AND board = $2 ORDER BY seq DESC LIMIT $3)`, [tenant, board, keepCheckpoints]);
-      }, leaseLockTimeoutMs);   // bounded lock wait (the fence's FOR SHARE on the lease row): a stuck write is "unavailable", never forever
+      const text = await encodeSliced(cp);   // in slices: the event loop breathes between them
+      // Bounded lock wait (the fence's FOR SHARE on the lease row): a stuck write is "unavailable", never forever.
+      const put = (tx, data) => tx.unsafe(`INSERT INTO ${C} (tenant, board, seq, data) VALUES ($1, $2, $3, $4)
+        ON CONFLICT (tenant, board, seq) DO NOTHING`, [tenant, board, cp.seq, data]);
+      const prune = tx => tx.unsafe(`DELETE FROM ${C} WHERE tenant = $1 AND board = $2 AND seq NOT IN
+        (SELECT seq FROM ${C} WHERE tenant = $1 AND board = $2 ORDER BY seq DESC LIMIT $3)`, [tenant, board, keepCheckpoints]);
+      if (text.length <= partChars) {
+        return void await write(async tx => { await fence(tx, tenant, board, epoch); await put(tx, text); await prune(tx); }, leaseLockTimeoutMs);
+      }
+      // Parts: each in its own fenced transaction; the header row makes them visible (§ Recovery, "Checkpoint parts").
+      // A crash or abort before it leaves the previous checkpoint the newest.
+      const parts = splitParts(text, partChars), wid = crypto.randomUUID();
+      try {
+        for (let n = 0; n < parts.length; n++) {
+          await onPart?.(`part:${n}`);
+          await write(async tx => {
+            await fence(tx, tenant, board, epoch);
+            await tx.unsafe(`INSERT INTO ${CP} (tenant, board, seq, wid, n, data) VALUES ($1, $2, $3, $4, $5, $6)`, [tenant, board, cp.seq, wid, n, parts[n]]);
+          }, leaseLockTimeoutMs);
+        }
+        await onPart?.("header");
+        await write(async tx => {
+          await fence(tx, tenant, board, epoch);
+          const [{ c }] = await tx.unsafe(`SELECT count(*)::int AS c FROM ${CP} WHERE tenant = $1 AND board = $2 AND seq = $3 AND wid = $4`, [tenant, board, cp.seq, wid]);
+          if (c !== parts.length) throw new PortError("unavailable", "a checkpoint part is missing: try again");
+          await put(tx, headerOf(wid, parts.length, text.length)); await prune(tx);
+        }, leaseLockTimeoutMs);
+      } catch (err) { await sweepParts(tenant, board, { seq: cp.seq, wid }); throw err; }
+      await sweepParts(tenant, board);   // the first write of a seq stays: a second one's parts are orphans now, as are the pruned ones
     },
 
     /** The checkpoint with the highest seq; with `beforeSeq`, the highest below it (to step back past a bad one). */
     async getCheckpoint(tenant, board, beforeSeq) {
       ready(tenant, board);
       if (beforeSeq !== undefined && (!Number.isSafeInteger(beforeSeq) || beforeSeq < 0)) throw new PortError("bad-entry", "beforeSeq must be a non-negative integer");
-      const rows = await db.unsafe(`SELECT data FROM ${C} WHERE tenant = $1 AND board = $2 AND seq < $3
-        ORDER BY seq DESC LIMIT 1`, [tenant, board, beforeSeq ?? Number.MAX_SAFE_INTEGER]);
-      return rows.length ? JSON.parse(rows[0].data) : null;
+      // A header may name parts a newer checkpoint's prune has just removed: look again (it then finds a newer header).
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const rows = await db.unsafe(`SELECT seq, data FROM ${C} WHERE tenant = $1 AND board = $2 AND seq < $3
+          ORDER BY seq DESC LIMIT 1`, [tenant, board, beforeSeq ?? Number.MAX_SAFE_INTEGER]);
+        if (!rows.length) return null;
+        const head = parseHeader(rows[0].data);
+        if (!head) return JSON.parse(rows[0].data);
+        const seq = Number(rows[0].seq);
+        const got = await db.unsafe(`SELECT data FROM ${CP} WHERE tenant = $1 AND board = $2 AND seq = $3 AND wid = $4 ORDER BY n`, [tenant, board, seq, head.wid]);
+        if (got.length !== head.parts) continue;
+        const text = got.map(r => r.data).join("");
+        if (text.length !== head.chars) throw new PortError("corrupt", `checkpoint ${seq}'s parts hold ${text.length} chars, not ${head.chars}`);
+        return JSON.parse(text);
+      }
+      throw new PortError("unavailable", "a checkpoint's parts kept changing under the read: try again");
     },
 
     /**

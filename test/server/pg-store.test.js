@@ -35,10 +35,16 @@ describe.skipIf(!url)("postgres store", () => {
   const schemaName = () => `pl_test_store_${process.pid}_${Date.now().toString(36)}_${++n}`;
   const drop = s => client().unsafe(`DROP SCHEMA IF EXISTS "${s}" CASCADE`);
 
-  storeContract("postgres", async () => {
+  storeContract("postgres", async opts => {
     const schema = schemaName();
-    const open = () => postgresStore({ sql: client(), schema });
-    return { store: await open(), another: open, cleanup: () => drop(schema) };
+    const open = () => postgresStore({ sql: client(), schema, ...opts });
+    const q = (sqlText, ...a) => client().unsafe(sqlText, a);
+    const store = await open();
+    return { store, another: open, cleanup: () => drop(schema), raw: {
+      putCheckpointRow: (t, b, seq, data) => q(`INSERT INTO "${schema}".pl_checkpoints (tenant, board, seq, data) VALUES ($1, $2, $3, $4)`, t, b, seq, data),
+      putPartRow: (t, b, seq, wid, n, data) => q(`INSERT INTO "${schema}".pl_checkpoint_parts (tenant, board, seq, wid, n, data) VALUES ($1, $2, $3, $4, $5, $6)`, t, b, seq, wid, n, data),
+      partRows: async (t, b) => (await q(`SELECT count(*)::int AS c FROM "${schema}".pl_checkpoint_parts WHERE tenant = $1 AND board = $2`, t, b))[0].c,
+    } };
   });
 
   test("DW-iso: clusterId is c-+16, stable across calls and reopen, one id for a racing start, a different one per database", async () => {
@@ -459,6 +465,23 @@ describe.skipIf(!url)("postgres store", () => {
       await drop(schema); await drop(bare);
       await client().unsafe(`DROP ROLE IF EXISTS "${role}"`);
     }
+  });
+
+  test("upgrade: a schema made before checkpoint parts gets pl_checkpoint_parts on the owner's next start and still reads its one-row checkpoints", async () => {
+    const schema = schemaName();
+    try {
+      await (await postgresStore({ sql: client(), schema })).close?.();
+      await client().unsafe(`DROP TABLE "${schema}".pl_checkpoint_parts`);                  // the schema as the old release left it
+      const cp = { seq: 4, pad: "😀".repeat(500) };
+      await client().unsafe(`INSERT INTO "${schema}".pl_checkpoints (tenant, board, seq, data) VALUES ($1, $2, 4, $3)`, [T, B, JSON.stringify(cp)]);
+      const store = await postgresStore({ sql: client(), schema, partChars: 300 });        // migrate creates the missing table
+      expect(await store.getCheckpoint(T, B)).toEqual(cp);
+      const e = await store.openEpoch(T, B);
+      await store.putCheckpoint(T, B, { ...cp, seq: 5 }, e);
+      expect((await store.getCheckpoint(T, B)).seq).toBe(5);
+      expect((await client().unsafe(`SELECT count(*)::int AS c FROM "${schema}".pl_checkpoint_parts`))[0].c).toBeGreaterThan(1);
+      await store.close();
+    } finally { await drop(schema); }
   });
 
   test("bad schema names and missing connection are refused", async () => {

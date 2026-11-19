@@ -176,6 +176,12 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO plenary_a
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO plenary_app;
 ```
 
+**Upgrading to a version with checkpoint parts** (PROTOCOL.md § Recovery, "Checkpoint parts") adds the table `pl_checkpoint_parts`:
+run step 2 as the owner before starting a runtime-role node (the default privileges cover its grants; without that line, grant it
+`SELECT, INSERT, DELETE`). A runtime role that starts first is refused at start-up (code `denied`, below). Nodes of the old and the new
+version can share a database until the first checkpoint over 1 Mi chars is written; after that an old node can't read it (rolling
+back: PROTOCOL.md, same section). A single-node SQLite file needs nothing: the table is created when it opens.
+
 **Upgrading to a version with the cluster id** (PROTOCOL.md § Bus, Cluster id) adds the table `pl_cluster`: run step 2
 as the owner before starting a runtime-role node (the default privileges already cover its grants). The id changes
 every bus subject, so old and new nodes do not talk over NATS: replace a cluster's nodes together (hosts first), not
@@ -191,7 +197,7 @@ right they use at start-up, so a role with `USAGE` but missing grants is refused
 `lacks DELETE on reg_link_uses`), not on its first request:
 
 - **Registry:** `SELECT, INSERT, UPDATE, DELETE` on every `reg_*` table.
-- **Store:** `SELECT, INSERT` on `pl_entries`; `SELECT, INSERT, DELETE` on `pl_checkpoints`; `SELECT, INSERT, UPDATE`
+- **Store:** `SELECT, INSERT` on `pl_entries`; `SELECT, INSERT, DELETE` on `pl_checkpoints` and on `pl_checkpoint_parts`; `SELECT, INSERT, UPDATE`
   on `pl_leases` (the epoch fence's `FOR SHARE` needs `UPDATE`).
 
 Step 3's grants cover both.

@@ -1,6 +1,8 @@
-// Access adapter over fetch: implements web/ports/access.js against the routes of PROTOCOL.md § Teams and access. Imports nothing (fetch and timers
+// Access adapter over fetch: implements web/ports/access.js against the routes of PROTOCOL.md § Teams and access. Imports only core's explanation checker (fetch and timers
 // are injected). Bodies are checked here because the pages render them and put ids in links: ids are 1-64 of [A-Za-z0-9_-] (user ids are opaque
 // strings, up to 200 chars), strings and lists are capped, anything else is dropped.
+
+import { normalizeExplain, normalizeRequest } from "../../core/explain.js";
 
 const ID_RE = /^[\w-]{1,64}$/;
 const ID = { test: v => typeof v === "string" && ID_RE.test(v) };
@@ -32,9 +34,13 @@ export function normalizeAccessPage(b) {
   if (!sc || !Array.isArray(b.rows)) return null;
   return {
     scope: { ...sc, ...(b.scope.personal === true ? { personal: true } : {}) }, can: { manage: b.can?.manage === true },
-    general: list(b.general, 3, g => (g && typeof g.role === "string" && scopeRef(g.scope) ? { scope: scopeRef(g.scope), role: str(g.role, 32) } : null)),
+    general: list(b.general, 6, g => (g && typeof g.role === "string" && scopeRef(g.scope) ? { scope: scopeRef(g.scope), role: str(g.role, 32) } : null)),
     ...(Array.isArray(b.admins) ? { admins: list(b.admins, 100, person) } : {}),
-    rows: list(b.rows, 250, row), next: typeof b.next === "string" && b.next.length <= 600 ? b.next : null, inherited: list(b.inherited, 40, row), roles: list(b.roles, 100, option),
+    rows: list(b.rows, 250, row), next: typeof b.next === "string" && b.next.length <= 600 ? b.next : null, inherited: list(b.inherited, 80, row), roles: list(b.roles, 100, option),
+    ...(b.organization && typeof b.organization === "object" ? { organization: { admins: list(b.organization.admins, 20, p => (p && typeof p.user === "string" && p.user.length <= 200 ? { user: p.user, name: str(p.name) } : null)), more: b.organization.more === true,
+      memberRole: typeof b.organization.memberRole === "string" ? str(b.organization.memberRole, 32) : null } } : {}),
+    ...(Array.isArray(b.requests) ? { requests: list(b.requests, 50, normalizeRequest) } : {}),
+    ...(normalizeExplain(b) ? { why: normalizeExplain(b) } : {}),
   };
 }
 /** @returns {import("../../ports/access.js").TeamPage | null} */
@@ -49,24 +55,24 @@ export function httpAccess({ fetch, token, base = "", timeoutMs = 10_000, timers
   if (typeof fetch !== "function") throw new TypeError("httpAccess: fetch is required");
   const set = timers ? timers.set : (fn, ms) => setTimeout(fn, ms);
   const clear = timers ? timers.clear : h => clearTimeout(h);
-  const STATUS = { 400: "invalid", 401: "auth", 403: "forbidden", 404: "notfound", 409: "conflict" };
-  const CODES = ["unknown-person", "bad-role", "last-owner", "too-large"];
+  const STATUS = { 400: "invalid", 401: "auth", 403: "forbidden", 404: "notfound", 409: "conflict", 422: "invalid", 429: "limited" };
+  const CODES = ["unknown-person", "bad-role", "last-owner", "too-large", "rate-limited"];
 
   /** One request: `{ body }` (a parsed 200/201 body, or null for a 204), or `{ error, code? }`. Never throws. */
-  async function ask(path, method = "GET", json) {
+  async function ask(path, method = "GET", json, key = null) {
     const ctl = typeof AbortController === "function" ? new AbortController() : null;
     let timer = null;
     const timeout = new Promise(resolve => { timer = set(() => { try { ctl?.abort(); } catch {} resolve({ error: "unavailable" }); }, timeoutMs); });
     const run = (async () => {
       let res;
       try {
-        res = await fetch(base + path, { method, headers: { authorization: `Bearer ${token}`, ...(json !== undefined ? { "content-type": "application/json" } : {}) },
+        res = await fetch(base + path, { method, headers: { authorization: `Bearer ${token}`, ...(json !== undefined ? { "content-type": "application/json" } : {}), ...(typeof key === "string" && key ? { "idempotency-key": key } : {}) },
           ...(json !== undefined ? { body: JSON.stringify(json) } : {}), credentials: "omit", cache: "no-store", redirect: "error", signal: ctl?.signal });
       } catch { return { error: "network" }; }
       if (STATUS[res?.status]) {
-        let code;
-        try { const b = JSON.parse(await res.text()); if (CODES.includes(b?.error)) code = b.error; } catch {}
-        return { error: STATUS[res.status], ...(code ? { code } : {}) };
+        let code, retryAfter;
+        try { const b = JSON.parse(await res.text()); if (CODES.includes(b?.error)) code = b.error; if (Number.isFinite(b?.retryAfter)) retryAfter = b.retryAfter; } catch {}
+        return { error: STATUS[res.status], ...(code ? { code } : {}), ...(retryAfter !== undefined ? { retryAfter } : {}) };
       }
       if (res?.status === 204) return { body: null };
       if (res?.status !== 200 && res?.status !== 201) return { error: "unavailable" };
@@ -133,6 +139,25 @@ export function httpAccess({ fetch, token, base = "", timeoutMs = 10_000, timers
       if (r.error) return r;
       const x = row(r.body?.row);
       return x ? { row: x } : bad();
+    },
+    async ask(type, id, role, key = null) {
+      if (!["group", "space", "board"].includes(type) || !ID.test(id) || typeof role !== "string") return { error: "forbidden" };
+      const r = await ask(`/access/${type}/${q(id)}/requests`, "POST", { role }, key);
+      if (r.error) return r;
+      const x = r.body?.request;
+      return x && typeof x.role === "string" && Number.isFinite(x.at) ? { request: { role: str(x.role, 64), roleName: str(x.roleName, 64), at: x.at, state: x.state === "dismissed" ? "dismissed" : "pending" } } : bad();
+    },
+    async dismissRequest(type, id, user) {
+      if (!["group", "space", "board"].includes(type) || !ID.test(id) || !UID.test(user)) return { error: "forbidden" };
+      const r = await ask(`/access/${type}/${q(id)}/requests/${q(user)}`, "DELETE");
+      return r.error ? r : {};
+    },
+    async explainBoard(id) {
+      if (!ID.test(id)) return { error: "notfound" };
+      const r = await ask(`/boards/${q(id)}/explain`);
+      if (r.error) return r;
+      const why = normalizeExplain(r.body);
+      return why ? { why } : bad();
     },
     async removeGrant(type, id, subject) {
       if (!TYPES.includes(type) || !ID.test(id) || !subj(subject)) return { error: "forbidden" };

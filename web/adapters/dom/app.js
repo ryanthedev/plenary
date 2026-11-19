@@ -18,6 +18,7 @@ export const probeJitterMs = role => (role === "presenter" ? PROBE_JITTER_MS.pre
 import { renderPanel, loadLibrary, saveLibrary, addToLibrary, propsModel } from "./panel.js";
 import { exportSvg, paintPng, loadPictures } from "./export.js";
 import { h, $, replace } from "./dom.js";
+import { pillPopover } from "./explain.js";
 import { mountCollab } from "./collab/ui.js";
 import { collabFrame } from "./collab/frame.js";
 import { hitTest } from "../../../packages/core/geometry.js";
@@ -41,7 +42,7 @@ import { hitTest } from "../../../packages/core/geometry.js";
  *   homeHref: where the top bar's Home link goes (the Home screen); null = no link (dev rooms).
  * @returns {{ S: object, ui: object, net: object, setTheme(t: string): void, openDialog(d: string): void, setPanel(op: object): void }}
  */
-export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null, homeHref = null }) {
+export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null, homeHref = null, access = null, newKey = null }) {
   if (!clock || typeof clock.now !== "function" || typeof clock.mono !== "function") throw new Error("mountApp: the clock port is required");
   const get = k => { try { return prefs.get(k); } catch { return null; } };
   const put = (k, v) => { try { prefs.set(k, v); } catch {} };
@@ -288,17 +289,25 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     tl.text.textContent = `${(t / 1000).toFixed(1)}s / ${(dur / 1000).toFixed(1)}s`;
   }
   // The pill: a click while not live reconnects now (the user's own click skips the resume jitter, C-4 / p8-tidy).
-  const pillEl = h("span.pill", { onclick: () => { if (S.status !== "live" && shouldProbe({ status: S.status, gesture: S.gesture })) reconnectNow(); } });
+  // A view-only pill is a button: it opens the explanation of the role (PROTOCOL.md § Access explanation and requests): focusable, Enter and Space, Escape closes and returns focus.
+  const pillEl = h("span.pill", { onclick: () => { if (explainable()) { why.toggle(); return; } if (S.status !== "live" && shouldProbe({ status: S.status, gesture: S.gesture })) reconnectNow(); },
+    onkeydown: e => { if (explainable() && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); why.toggle(); } } });
+  const explainable = () => !!access && pillEl.classList.contains("readonly");
+  const why = pillPopover({ pill: pillEl, board, access, newKey, explain: access ? async () => { const r = await access.explainBoard(board); return r.why ? { why: r.why } : { error: r.error }; } : null });
   let pillSig = "";
   function inPlace() {
     timelineInPlace();
     const z = `${Math.round(S.eds.board.view.scale * 100)}%`;
     if (zoomPct.textContent !== z) zoomPct.textContent = z;
     const pill = pillFor({ status: S.status, online: S.online, pending: S.pending, role: S.effective, readOnly: S.readOnly, congested: S.congested });
-    const sig = JSON.stringify([pill, pillTitle(pill.cls)]);
+    const can = !!access && pill.cls === "readonly";
+    const title = pillTitle(pill.cls) + (can ? " Press to see why." : "");
+    const sig = JSON.stringify([pill, title]);
     if (sig === pillSig) return;
     pillSig = sig;
-    pillEl.className = `pill ${pill.cls}`; pillEl.title = pillTitle(pill.cls);
+    pillEl.className = `pill ${pill.cls}`; pillEl.title = title;
+    if (can) { pillEl.setAttribute("role", "button"); pillEl.setAttribute("tabindex", "0"); pillEl.setAttribute("aria-haspopup", "dialog"); if (!pillEl.hasAttribute("aria-expanded")) pillEl.setAttribute("aria-expanded", "false"); }
+    else { for (const a of ["role", "tabindex", "aria-haspopup", "aria-expanded"]) pillEl.removeAttribute(a); if (why.isOpen()) why.close(false); }
     replace(pillEl, h("span.dot"), pill.text, pill.sub ? h("span.sub", {}, ` · ${pill.sub}`) : null);
   }
   let toastTimer = null;

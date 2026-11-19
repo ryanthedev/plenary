@@ -26,7 +26,10 @@ const keyer = newKey => { let key = null; return { reset() { key = null; }, get(
 /** Empty-state copy for a Space page (JOURNEY §5). */
 export function spaceEmpty(page) {
   if (page.space.personal) return { title: "Only you can see what's here until you share it.", detail: page.can.createBoard ? "Start a board to fill it." : "" };
-  return page.can.createBoard ? { title: "No boards yet.", detail: "" } : { title: "No boards yet.", detail: "You can't add boards here; ask an owner to add you as an editor." };
+  if (page.can.createBoard) return { title: "No boards yet.", detail: "" };
+  // The server says who you are here and what adding boards needs (page.why), so the sentence is never a guess.
+  const w = page.why, need = w?.needs?.["board.create"];
+  return { title: "No boards yet.", detail: w?.mine?.role && need ? `You're a ${w.mine.role.name} here; owners can add you as ${/^[AEIOU]/.test(need.roleName) ? "an" : "a"} ${need.roleName}.` : "You can't add boards here; ask an owner to add you as an editor." };
 }
 export const groupEmpty = (page, name) => ({ title: `No Spaces in ${name} yet.`, detail: page.can.createSpace ? "" : "Group editors can add Spaces here." });
 

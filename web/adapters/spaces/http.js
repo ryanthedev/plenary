@@ -1,6 +1,8 @@
-// Spaces adapter over fetch: implements web/ports/spaces.js against the routes of PROTOCOL.md § Spaces and Groups. Imports nothing (fetch and
+// Spaces adapter over fetch: implements web/ports/spaces.js against the routes of PROTOCOL.md § Spaces and Groups. Imports only core's explanation checker (fetch and
 // timers are injected). Bodies are checked here because the page renders them and puts ids in links: ids are 1-64 of [A-Za-z0-9_-], strings
 // and lists are capped, anything else is dropped.
+
+import { normalizeExplain } from "../../core/explain.js";
 
 const ID_RE = /^[\w-]{1,64}$/;
 /** A valid id: a string (a missing field is not the id "undefined"). */
@@ -19,7 +21,7 @@ const info = s => (s && typeof s === "object" && ID.test(s.id) ? { id: s.id, nam
 export function normalizeSpacePage(b) {
   const space = info(b?.space);
   if (!space || !Array.isArray(b.boards)) return null;
-  return { space, can: { createBoard: b.can?.createBoard === true, rename: b.can?.rename === true, general: b.can?.general === true }, boards: list(b.boards, 50, card), more: b.more === true };
+  return { space, can: { createBoard: b.can?.createBoard === true, rename: b.can?.rename === true, general: b.can?.general === true }, boards: list(b.boards, 50, card), more: b.more === true, ...(b.why && normalizeExplain(b.why) ? { why: normalizeExplain(b.why) } : {}) };
 }
 /** @param {object} b @returns {import("../../ports/spaces.js").GroupPage | null} */
 export function normalizeGroupPage(b) {

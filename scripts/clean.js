@@ -8,7 +8,8 @@
 //   2. stopped rigs: <repo>/.rig/<name> dirs whose processes are all gone, as `cluster-rig.js status` decides it (it
 //      applies the rig's psInfo rule: a ps that fails reads as "alive", so the rig stays). A live rig is never touched.
 //   3. --scratch <dir>: its direct children, same age and in-use rules as 1 (agents' scratch copies).
-// Never follows a symlink (a symlinked entry is skipped; links inside an entry are unlinked, not entered), never touches
+// Never opens anything that is not a plain file or directory (a FIFO, socket or device is kept, never resolved: opening a
+// pty slave or a named pipe can block forever), never follows a symlink (a symlinked entry is skipped; links inside an entry are unlinked, not entered), never touches
 // anything outside the temp dir, this repo's .rig and the given scratch dir, and refuses a base that is / or $HOME.
 // Limits: lsof run as a normal user does not see other users' (or root's) processes, so a dir only such a process holds
 // would look unused; hence only this user's entries are candidates, the in-use check runs a second time per entry right
@@ -87,6 +88,22 @@ export function openUnder(path, lsof = "lsof", timeout = 60_000) {
   if (r.status <= 1 && /(^|\0)\n?p\d/.test(r.stdout)) return "in use (re-check)";   // +D exits 1 even when it lists matches
   if (r.status <= 1 && !r.stdout && !r.stderr) return "";
   return `in-use re-check failed: lsof exited ${r.status}${r.stderr ? ` (${r.stderr.split("\n")[0].slice(0, 120)})` : ""}`;
+}
+
+/**
+ * The paths a lsof answer is matched against: each as lsof printed it, plus its resolved form for a regular file or a
+ * directory only. lsof also lists devices (a pty slave under /dev), named pipes and sockets, and resolving one of those
+ * means opening it, which can block for good (a pty slave with no peer hangs open(2) in the kernel, uninterruptibly),
+ * so a path is lstat'd first and anything that is not a plain file or directory is never resolved or opened.
+ */
+export function resolveOpens(paths, stat = lstatSync, realpath = realpathSync) {
+  const out = new Set();
+  for (const p of paths) {
+    out.add(p);
+    if (p.startsWith("/dev/")) continue;
+    try { const st = stat(p); if (st.isFile() || st.isDirectory()) out.add(realpath(p)); } catch { /* gone, or not ours to resolve */ }
+  }
+  return [...out];
 }
 
 /** True when the pid may be alive (kill -0 succeeds or is denied); false only on ESRCH. Anything else is "alive". */
@@ -213,7 +230,7 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
   let opens = null, opensError = null;
   const initialLeft = timeLeft();
   if (initialLeft <= 0) opensError = "skipped (time limit)";
-  else try { opens = [...new Set(openPathsFn(lsof, Math.max(1, Math.min(60_000, initialLeft))).flatMap(p => { try { return [p, realpathSync(p)]; } catch { return [p]; } }))]; } catch (e) { opensError = e.message; }
+  else try { opens = resolveOpens(openPathsFn(lsof, Math.max(1, Math.min(60_000, initialLeft))), stat); } catch (e) { opensError = e.message; }
 
   const consider = (target, base, name, extra) => {
     const path = join(base, name);
@@ -223,6 +240,7 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
       if (timeLeft() <= 0) { item.why = "skipped (time limit)"; return; }
       const st = stat(path);
       if (st.isSymbolicLink()) { item.why = "symlink"; return; }
+      if (!st.isDirectory() && !st.isFile()) { item.why = "not a regular file or directory"; return; }   // never open a pipe, socket or device
       if (st.uid !== uid) { item.why = `owned by uid ${st.uid}, not ${uid}`; return; }
       if (yes && (platform === "darwin" || platform === "linux") && !nativeRenameAvailable && !allowRacyRename) { item.why = "exclusive rename unavailable; --allow-racy-rename required to remove"; return; }
       if (st.dev !== stat(base).dev) { item.status = "failed"; item.why = "candidate is a mount point (different device from parent)"; return; }

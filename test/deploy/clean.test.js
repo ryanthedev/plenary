@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { join, relative } from "node:path";
-import { clean, summarize, measure, openPaths, openUnder, renameExcl, loadNativeRename, resetNativeRenameWarning, ROOT } from "../../scripts/clean.js";
+import { clean, summarize, measure, openPaths, openUnder, resolveOpens, renameExcl, loadNativeRename, resetNativeRenameWarning, ROOT } from "../../scripts/clean.js";
 
 const made = [], kids = [];
 const sandbox = realpathSync(mkdtempSync(join(tmpdir(), "plenary-cleantest-")));
@@ -121,7 +121,7 @@ test("refuses a base that is / or $HOME (or a parent of the repo or home)", () =
   expect(() => clean({ tempDir: "/", rigRoot: null })).toThrow(/refusing/);
   expect(() => clean({ tempDir: process.env.HOME, rigRoot: null })).toThrow(/refusing/);
   expect(() => clean({ tempDir: tmpdir(), scratch: "/Users", rigRoot: null })).toThrow(/refusing/);
-  expect(() => clean({ tempDir: join(sandbox, "missing"), rigRoot: null }).items).not.toThrow();
+  expect(() => clean({ tempDir: join(sandbox, "missing"), rigRoot: null, openPathsFn: () => [] }).items).not.toThrow();
 });
 
 test("a refused base throws before lsof is run (no system-wide scan for a request that is refused anyway)", () => {
@@ -613,4 +613,29 @@ test("--min-age under 10 minutes needs force", () => {
   const cli = spawnSync(process.execPath, [join(ROOT, "scripts/clean.js"), "--min-age", "5m"], { encoding: "utf8" });
   expect(cli.status).toBe(1);
   expect(cli.stderr).toMatch(/needs --force/);
+});
+
+// A hang found 2026-11-19: clean() resolved every path lsof listed with realpathSync, which opens it; a pty slave under /dev
+// (/dev/ttys116) blocked open(2) in the kernel for good (uninterruptible), freezing every `bun test` run on that machine.
+test("resolveOpens never resolves (opens) a device, FIFO or socket, only plain files and directories", () => {
+  const w = world(), file = join(w.root, "plain"), fifo = join(w.root, "pipe");
+  writeFileSync(file, "x");
+  expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+  const resolved = [], realpath = p => (resolved.push(p), p);
+  const out = resolveOpens(["/dev/ttys116", "/dev/ptmx", fifo, file, w.root, join(w.root, "gone")], lstatSync, realpath);
+  expect(resolved).toEqual([file, w.root]);                      // the fifo is lstat'd (not opened) and skipped; /dev never even lstat'd
+  expect(out).toEqual(expect.arrayContaining(["/dev/ttys116", fifo, file, w.root]));   // still reported as lsof printed them
+});
+
+test("a FIFO in the temp dir (listed open by lsof) is kept and never opened; the run ends in time", () => {
+  const w = world(), fifo = join(w.tempDir, "plenary-test-fifo11");
+  expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+  // run in a subprocess so a regression (a blocked open) fails at the timeout instead of hanging the whole run
+  const script = `import { clean } from ${JSON.stringify(join(ROOT, "scripts/clean.js"))};
+    const r = clean({ tempDir: ${JSON.stringify(w.tempDir)}, rigRoot: null, now: Date.now() + 3 * 3_600_000, yes: true, openPathsFn: () => [${JSON.stringify(fifo)}, "/dev/ttys116"] });
+    console.log(JSON.stringify(r.items.map(i => [i.status, i.why])));`;
+  const r = spawnSync(process.execPath, ["--no-env-file", "-e", script], { encoding: "utf8", timeout: 20_000, killSignal: "SIGKILL" });
+  expect(r.error).toBeUndefined();
+  expect(JSON.parse(r.stdout)).toEqual([["kept", "not a regular file or directory"]]);
+  expect(lstatSync(fifo).isFIFO()).toBe(true);
 });

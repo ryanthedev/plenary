@@ -44,7 +44,7 @@ for (const how of ["kill -9", "SIGSTOP"]) test.skipIf(!url || !nurl)(`a real hol
   const ttl = 2_000;
   const { p, epoch: eA } = await child("h-child", ttl, schema);
   const store = await postgresStore({ url, schema, max: 3 }), bus = await natsBus({ url: nurl, cluster: null });
-  const Bh = roomHost({ store, bus, holder: "h-b", leaseTtlMs: ttl, heartbeatMs: 200 });
+  const Bh = roomHost({ store, bus, holder: "h-b", leaseTtlMs: 30_000, heartbeatMs: 200 });   // only the child ttl sets the takeover wait; the long one keeps B room alive through an event-loop stall
   const g = gw(bus, `g-${how === "kill -9" ? "k" : "s"}${process.pid}`);
   try {
     g.hello("c1", "a"); await until(() => g.answer("c1")?.msg?.t === "welcome", "welcome from the child", 5000);

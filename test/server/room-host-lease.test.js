@@ -138,8 +138,10 @@ for (const [name, maker] of [["sqlite", sqliteMaker], ["postgres", pgMaker]]) de
   test("holder A stops renewing (no release); B takes over after expiry; A's late append is fenced; every op A acked is in the log", async () => {
     const m = maker(), raw = await m.open(), rawB = await m.open(), bus = memoryBus();
     const sa = stallable(raw);
-    const A = roomHost({ store: sa.store, bus, holder: "h-a", leaseTtlMs: 600, heartbeatMs: 100, appendTimeoutMs: 300 });
-    const Bh = roomHost({ store: rawB, bus, holder: "h-b", leaseTtlMs: 600, heartbeatMs: 100 });
+    // A's ttl (3 s) only sets how long B waits for the takeover; B's (30 s) keeps B's room alive through an event-loop stall (a host drops its room when
+    // a stall outlasts 2/3 of its ttl), so a loaded machine can't take B's room away between its takeover and the c2 checks.
+    const A = roomHost({ store: sa.store, bus, holder: "h-a", leaseTtlMs: 3_000, heartbeatMs: 100, appendTimeoutMs: 300 });
+    const Bh = roomHost({ store: rawB, bus, holder: "h-b", leaseTtlMs: 30_000, heartbeatMs: 100 });
     try {
       await A.open(T, B);
       const eA = (await A.peek(T, B)).epoch;
@@ -319,12 +321,12 @@ test("renew starts before the rebuild: a rebuild longer than the ttl keeps the l
   const { epoch } = await raw.acquire(T, B, "h-seed", 60_000);
   await raw.append(T, B, [{ seq: 1, board: B, tenant: T, stream: "board", op: { elements: [rect("x")] }, by: "u", id: "c:1", at: 0, rv: 1 }], 0, epoch);
   await raw.release(T, B, "h-seed", epoch);
-  // The rebuild is held until the test lets it go; the host renews every 200 ms, so four renews (counted, not timed)
-  // are 800 ms of rebuild against a ttl of 600.
+  // The rebuild is held until the test lets it go; the host renews every ttl/3 (500 ms), so four renews (counted, not timed)
+  // are 2 s of rebuild against a ttl of 1.5 s.
   let slow = true, renews = 0; const gate = deferred(), renewed = deferred();
   const store = { ...raw, renew: (...a) => { if (++renews >= 4) renewed.resolve(); return raw.renew(...a); }, read: async (...a) => { if (slow) { slow = false; await gate.promise; } return raw.read(...a); } };
-  const A = roomHost({ store, bus, holder: "h-a", leaseTtlMs: 600 });
-  const Bh = roomHost({ store: raw, bus, holder: "h-b", leaseTtlMs: 600 });
+  const A = roomHost({ store, bus, holder: "h-a", leaseTtlMs: 1_500 });   // renews every 500 ms; tolerates a 1 s event-loop stall
+  const Bh = roomHost({ store: raw, bus, holder: "h-b", leaseTtlMs: 1_500 });
   try {
     const opening = A.open(T, B);
     await renewed.promise;                                                 // four renews in, still mid-rebuild: past the whole ttl
@@ -392,15 +394,20 @@ test("HIGH-1 guard: a hello the host deadline catches between its inbox check an
   // so c2 is a connection the slot holds but never welcomed. fail() must tell c1 (welcomed) and leave c2 to the new holder.
   const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
   let calls = 0, tripAt = Infinity;
-  const A = roomHost({ store: raw, bus, holder: "h-a", leaseTtlMs: 30_000, monotonic: () => { calls++; return performance.now() + (calls >= tripAt ? 60_000 : 0); } });
+  const lines = [], log = createLogger({ write: l => lines.push(l), level: "debug" });
+  const A = roomHost({ store: raw, bus, log, holder: "h-a", leaseTtlMs: 30_000, monotonic: () => { calls++; return performance.now() + (calls >= tripAt ? 60_000 : 0); } });
   try {
     await A.open(T, B);
     const g = fakeGateway(bus);
     g.hello("c1", "a"); await g.welcome("c1");
-    tripAt = calls + 2;                                                      // the next hello: its inbox check reads clean, its welcome reads past the deadline
+    tripAt = calls + 2;                                 // the next hello: its inbox check reads clean, its welcome reads past the deadline
     g.hello("c2", "b");
     await until(() => g.of("c1").some(x => x.close === 1013), "the dead slot telling its welcomed c1 1013");
     await bus.flush();
+    // The jump must have landed on the reply-time read, not on the inbox check (which would drop the hello before c2 is ever held, leaving the
+    // welcomed guard unexercised): a refactor that adds or removes a clock read between the two fails here, loudly, instead of silently dropping coverage.
+    expect(lines.map(l => JSON.parse(l)).filter(l => l.msg === "room stopped: lease lost").map(l => l.why)).toEqual(["the host deadline passed before a reply"]);
+    expect(g.of("c1").filter(x => x.close === 1013).length).toBe(1);
     expect(g.of("c2")).toEqual([]);                                          // not welcomed, not told: the new holder (or a watcher) answers it
     expect(await A.peek(T, B)).toBe(null);
   } finally { await A.close(); await raw.close(); await bus.close(); }
@@ -601,7 +608,7 @@ test("L7: past 1,000 held hellos on a watched board, the extra ones are answered
 
 test("R2-L1: `welcomed` shrinks with `conns` (close notices, a listing, the sweep); a lost lease still tells only welcomed live connections", async () => {
   const bus = memoryBus(), st = stallable(sqliteStore({ path: join(tempDir(), "plenary.db") }));
-  const host = roomHost({ store: st.store, bus, leaseTtlMs: 900, sweepMs: 50 });
+  const host = roomHost({ store: st.store, bus, leaseTtlMs: 6_000, sweepMs: 50 });   // renews every 2 s, deadline 4 s: the 2,000-hello loops can't stall it out
   const g = fakeGateway(bus);
   try {
     await host.open(T, B);
@@ -619,7 +626,7 @@ test("R2-L1: `welcomed` shrinks with `conns` (close notices, a listing, the swee
     // The lease is lost: 1013 goes to exactly the 500 welcomed live connections, nobody else.
     const before = g.got.length;
     st.renew = "null";
-    await until(() => g.got.slice(before).filter(m => m.close === 1013).length >= 500, "the 1013s", 5000);
+    await until(() => g.got.slice(before).filter(m => m.close === 1013).length >= 500, "the 1013s", 10_000);   // the next renew tick (<= 2 s) finds the null renew
     await host.idle(T, B); await bus.flush();   // everything the lost lease sends is delivered before the exact-set check
     expect(g.got.slice(before).filter(m => m.close === 1013).map(m => m.conn).sort()).toEqual([...live].sort());
   } finally { await host.close(); }

@@ -61,8 +61,10 @@ export async function migrate(tx, schema, tables) {
  */
 export async function assertColumns(tx, schema, table, columns) {
   const s = needSchema(schema);
-  const have = (await tx.unsafe("SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 ORDER BY column_name", [s, table])).map(r => r.column_name);
+  // pg_catalog, not information_schema.columns: that view shows only columns the role holds a privilege on, so a limited role would see none.
+  const have = (await tx.unsafe(`SELECT a.attname AS column_name FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attname`, [s, table])).map(r => r.column_name);
   if (have.length && JSON.stringify(have) !== JSON.stringify([...columns].sort()))
     throw new Error(`postgres: table "${s}".${table} has columns (${have.join(", ")}) but this version needs (${[...columns].sort().join(", ")}): it is from an older version. `
-      + `Reset the store or drop the table (DROP TABLE "${s}".${table}); the next start-up recreates it`);
+      + `Reset the store, or have the schema owner run DROP TABLE "${s}".${table} (the runtime role cannot); the next start-up recreates it`);
 }

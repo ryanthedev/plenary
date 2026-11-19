@@ -59,9 +59,14 @@ function onBusyRetry(db, deadline, f, clock = Date.now, onAttempt) {
  *   (default Date.now) and a hook told the busy_timeout each start-up attempt was given.
  * @returns {import("../auth/registry-port.js").Registry & { close(): Promise<void>, pragmas(): object }}
  */
-export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTimeoutMs = 5000, busy = {} }) {
+export function sqliteRegistry(opts) {
+  const db = new Database(opts.path, { create: true, strict: true });
+  try { return build(db, opts); }
+  catch (err) { try { db.close(); } catch {} throw err; }   // a failed start-up (a busy file, an old-format table) never leaks the handle
+}
+
+function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 5000, busy = {} }) {
   const { clock = Date.now, onAttempt } = busy;
-  const db = new Database(path, { create: true, strict: true });
   let open = true;
   const wait = Math.max(0, Math.floor(busyTimeoutMs));
   db.run(`PRAGMA busy_timeout=${wait}`);

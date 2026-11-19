@@ -241,6 +241,8 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
   /** The Groups and Spaces a Team is an owner of, in lock order. */
   const ownedBy = (q, team) => q.unsafe(`SELECT scope_type, scope_id FROM ${SG} WHERE subject_type = 'team' AND subject = $1 AND role = 'owner'
     AND scope_type IN ('group', 'space') ORDER BY scope_type, scope_id`, [team]);
+  /** One lock per tenant for every write that can lower a Group's or Space's counted owners (see setTeamMember). Always taken FIRST. */
+  const lockOwners = (tx, tenant) => tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-owners:${s}:${tenant}`]);
   const putSg = async (tx, type, id, st, sid, role) => {
     if (role == null) await tx.unsafe(`DELETE FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 AND subject_type = $3 AND subject = $4`, [type, id, st, sid]);
     else await tx.unsafe(`INSERT INTO ${SG} (scope_type, scope_id, subject_type, subject, role) VALUES ($1, $2, $3, $4, $5)
@@ -515,16 +517,23 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       if (!key(team)) throw new Error("registry: no such team");
       const u = String(user);
       await write(async tx => {
-        if (!(await one(tx, `SELECT 1 AS x FROM ${TE} WHERE id = $1`, [team]))) throw new Error("registry: no such team");
+        const tm = await one(tx, `SELECT tenant FROM ${TE} WHERE id = $1`, [team]);
+        if (!tm) throw new Error("registry: no such team");
         if (member) { await tx.unsafe(`INSERT INTO ${TU} (team, member) VALUES ($1, $2) ON CONFLICT (team, member) DO NOTHING`, [team, u]); return; }
         // Removing the last member of a Team that is the only counted owner of a Group or Space would leave it ownerless.
-        // Lock order, here and in setScopedGrant, is container first, then the Team's member rows (never the Team row):
+        // Lock order, here and in setScopedGrant, is: the tenant's owners lock, then container, then the Team's member rows
+        // (never the Team row). The tenant lock (rare admin writes, so serialising them per tenant is cheap) is what makes
+        // the count below trustworthy: no other call that can lower a Group's or Space's counted owners runs at the same
+        // time, in particular a removal from ANOTHER Team, whose member rows this one reads unlocked. The row locks stay
+        // as the fence against everything that doesn't take it.
+        //   0. lock the tenant's owners lock;
         //   1. lock the Group and Space rows the Team owns now (in id order);
-        //   2. lock all of the Team's member rows (two removals of one Team serialise here), and delete ours;
+        //   2. lock all of the Team's member rows, and delete ours;
         //   3. only if the Team is now empty, read its owned containers AGAIN (grants made while we waited are visible) and
         //      refuse if any has no counted owner left (the Team no longer counts: our delete is visible to us).
         // A demotion that counts this Team as an owner takes FOR SHARE on these member rows first, so it either waits for
         // our commit and then sees an empty Team, or holds them and makes our delete wait and re-read.
+        await lockOwners(tx, tm.tenant);
         const owned = await ownedBy(tx, team);
         for (const o of owned) await tx.unsafe(`SELECT id FROM ${o.scope_type === "group" ? GR : SP} WHERE id = $1 FOR UPDATE`, [o.scope_id]);
         await tx.unsafe(`SELECT 1 FROM ${TU} WHERE team = $1 ORDER BY member FOR UPDATE`, [team]);
@@ -547,7 +556,8 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         if (sub.type === "team" && (await one(tx, `SELECT tenant FROM ${TE} WHERE id = $1`, [sub.id]))?.tenant !== tenant) throw new Error("registry: no such team");
         if (type === "board" && sub.type === "user") throw new Error("registry: a user's grant on a board is setGrant");
         if (type === "group" || type === "space") {
-          // Same fence as setGrant: the container's row lock serialises its grant changes; the reads below run after it.
+          // The tenant's owners lock first (see setTeamMember), then, like setGrant, the container's row lock; the reads run after both.
+          await lockOwners(tx, tenant);
           await tx.unsafe(`SELECT id FROM ${type === "group" ? GR : SP} WHERE id = $1 FOR UPDATE`, [id]);
           const cur = (await one(tx, `SELECT role FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 AND subject_type = $3 AND subject = $4`, [type, id, sub.type, sub.id]))?.role;
           if (cur === "owner" && r !== "owner") {

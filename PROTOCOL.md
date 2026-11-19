@@ -901,8 +901,11 @@ runs as a role that doesn't own the schema (§ Store, Least privilege).
 - **Last owner for Groups and Spaces.** `setScopedGrant` refuses to remove or demote the last *counted* `owner` of a Group
   or Space, atomically. A user owner always counts; a Team owner counts only while the Team has at least one member (an
   empty Team guards nothing). `setTeamMember` refuses to remove the last member of a Team that is the only counted owner
-  of a Group or Space. Both are `last-owner`. Postgres lock order, in both calls: the container's row (Group or Space) first,
-  then the Team's member rows, never the Team row. A demotion that counts a Team owner share-locks the Team's member rows
+  of a Group or Space. Both are `last-owner`. Postgres lock order, in both calls: the tenant's owners lock (a
+  transaction advisory lock, `plenary-owners:<schema>:<tenant>`, taken by every write that can lower a Group's or Space's
+  counted owners: a Group or Space grant change and a Team member's removal, all rare admin writes) first, then the
+  container's row (Group or Space), then the Team's member rows, never the Team row. The tenant lock is what keeps the count
+  honest when two Teams lose their last members at once. A demotion that counts a Team owner share-locks the Team's member rows
   before counting; a member's removal locks them all, deletes its own, and, if the Team is now empty, re-reads the
   containers the Team owns (grants made while it waited are visible) and refuses if any has no counted owner.
 - **Postgres tables** (all created only if missing, like the first seven; nothing is ever altered): `reg_tenant_meta` (kind),

@@ -233,7 +233,17 @@ describe.skipIf(!url)("postgres registry", () => {
     } finally { other.release(); await r.close(); await drop(schema); }
   });
 
-  test("a Team's last member leaving, stalled on one container's lock, cannot orphan a container that gained the Team as owner meanwhile", async () => {
+  /** Waits (up to 10 s) until at least `n` backends are blocked on a lock in a statement matching `like`; asserts they are, so a loaded machine fails cleanly. */
+  const waitBlocked = async (like, n = 1) => {
+    let c = 0;
+    for (let i = 0; i < 500 && c < n; i++) {
+      c = (await client().unsafe(`SELECT count(*)::int AS c FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE $1`, [like]))[0].c;
+      if (c < n) await Bun.sleep(20);
+    }
+    expect(c).toBeGreaterThanOrEqual(n);
+  };
+
+  test("a Team's last member leaving, stalled on a container's lock, and a grant to the same Team on another container: serialised per tenant, nothing orphaned", async () => {
     const schema = schemaName();
     const r = await postgresRegistry({ url, schema, max: 2 }), r2 = await postgresRegistry({ url, schema, max: 2 });
     const other = await client().reserve();
@@ -242,29 +252,66 @@ describe.skipIf(!url)("postgres registry", () => {
       const s1 = await r.createSpace({ tenant: t.id, name: "S1", owner: "ann" }), s2 = await r.createSpace({ tenant: t.id, name: "S2", owner: "ann" });
       const team = await r.createTeam({ tenant: t.id, name: "T" });
       await r.setTeamMember(team.id, "m", true);
-      const T = { type: "team", id: team.id }, ann = { type: "user", id: "ann" };
-      await r.setScopedGrant({ scope: { type: "space", id: s1.id }, subject: T, role: "owner" });          // T (one member) co-owns S1
-      // Another connection holds S1's row lock: the removal reads the Team's owned containers {S1}, then stalls on that lock.
+      const T = { type: "team", id: team.id }, ann = { type: "user", id: "ann" }, S2 = { type: "space", id: s2.id };
+      await r.setScopedGrant({ scope: { type: "space", id: s1.id }, subject: T, role: "owner" });          // T (one member) co-owns S1 with ann
+      await other.unsafe("BEGIN");
+      await other.unsafe(`SELECT id FROM "${schema}".reg_spaces WHERE id = $1 FOR UPDATE`, [s1.id]);       // S1's row lock is held elsewhere
+      const removal = r.setTeamMember(team.id, "m", false).then(() => "ok", e => e.code ?? e.message);
+      await waitBlocked(`%"${schema}".reg_spaces%FOR UPDATE%`);                                             // the removal holds the tenant lock and waits on S1
+      // T becomes an owner of S2 and ann is demoted there: both calls queue behind the removal's tenant lock (they used to slip past it)
+      let granted = false;
+      const grant = r2.setScopedGrant({ scope: S2, subject: T, role: "owner" }).then(() => { granted = true; });
+      await waitBlocked("%pg_advisory_xact_lock%");
+      expect(granted).toBe(false);
+      await other.unsafe("COMMIT");
+      expect(await removal).toBe("ok");                                                                      // S1 still has ann
+      await grant;
+      expect((await r2.setScopedGrant({ scope: S2, subject: ann, role: null }).catch(e => e)).code).toBe("last-owner");   // T is empty now: ann is S2's only counted owner
+      expect(await r.teamMembers(team.id)).toEqual([]);
+      expect((await r.scopedGrants(S2)).map(g => g.subject.id).sort()).toEqual(["ann", team.id].sort());
+    } finally { await other.unsafe("ROLLBACK").catch(() => {}); other.release(); await r.close(); await r2.close(); await drop(schema); }
+  }, 30_000);
+
+  test("two Teams losing their last members at once, one of them granted onto the other's container meanwhile: one removal is refused, every round", async () => {
+    const schema = schemaName();
+    const a = await postgresRegistry({ url, schema, max: 2 }), b = await postgresRegistry({ url, schema, max: 2 });
+    const other = await client().reserve();
+    try {
+      const t = await a.createTenant({ domain: null });
+      const s1 = await a.createSpace({ tenant: t.id, name: "S1", owner: "ann" }), s2 = await a.createSpace({ tenant: t.id, name: "S2" });
+      const t1 = await a.createTeam({ tenant: t.id, name: "T1" }), t2 = await a.createTeam({ tenant: t.id, name: "T2" });
+      const S1 = { type: "space", id: s1.id }, S2 = { type: "space", id: s2.id }, T1 = { type: "team", id: t1.id }, T2 = { type: "team", id: t2.id };
+      const counted = async scope => {
+        let n = 0;
+        for (const g of (await a.scopedGrants(scope)).filter(g => g.role === "owner")) n += g.subject.type === "user" || (await a.teamMembers(g.subject.id)).length ? 1 : 0;
+        return n;
+      };
+      await a.setScopedGrant({ scope: S1, subject: T1, role: "owner" });
+      // 1. the exact interleaving, with S1's row lock held so removal A stalls after reading T1's containers {S1}
+      await a.setTeamMember(t1.id, "m1", true); await a.setTeamMember(t2.id, "m2", true);
+      await a.setScopedGrant({ scope: S2, subject: T2, role: "owner" });                                    // S2's only owner is T2 (one member)
       await other.unsafe("BEGIN");
       await other.unsafe(`SELECT id FROM "${schema}".reg_spaces WHERE id = $1 FOR UPDATE`, [s1.id]);
-      let settled = false;
-      const removal = r.setTeamMember(team.id, "m", false).then(() => "ok", e => e.code ?? e.message).finally(() => { settled = true; });
-      for (let i = 0; i < 100; i++) {                                                                       // wait until it is really queued on the lock
-        const [{ c }] = await client().unsafe(`SELECT count(*)::int AS c FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE $1`, [`%"${schema}".reg_spaces%FOR UPDATE%`]);
-        if (c) break;
-        await Bun.sleep(20);
+      const A = a.setTeamMember(t1.id, "m1", false).then(() => "ok", e => e.code ?? e.message);
+      await waitBlocked(`%"${schema}".reg_spaces%FOR UPDATE%`);
+      const grant = b.setScopedGrant({ scope: S2, subject: T1, role: "owner" }).then(() => "ok", e => e.code ?? e.message);   // T1 onto S2
+      const B = b.setTeamMember(t2.id, "m2", false).then(() => "ok", e => e.code ?? e.message);
+      await waitBlocked("%pg_advisory_xact_lock%", 2);
+      await other.unsafe("COMMIT");
+      const res = await Promise.all([A, grant, B]);
+      expect(res.filter(x => x === "last-owner").length).toBeLessThanOrEqual(1);
+      expect([await counted(S1), await counted(S2)].every(n => n >= 1)).toBe(true);
+      // 2. then unstalled rounds of the same race (it failed 21 of 25 rounds before the tenant lock)
+      for (let round = 0; round < 25; round++) {
+        for (const [tm, m] of [[t1, "m1"], [t2, "m2"]]) await a.setTeamMember(tm.id, m, true);
+        await a.setScopedGrant({ scope: S2, subject: T2, role: "owner" });
+        await a.setScopedGrant({ scope: S2, subject: T1, role: null });
+        const race = await Promise.all([a.setTeamMember(t1.id, "m1", false).then(() => "ok", e => e.code), b.setScopedGrant({ scope: S2, subject: T1, role: "owner" }).then(() => "ok", e => e.code), b.setTeamMember(t2.id, "m2", false).then(() => "ok", e => e.code)]);
+        expect(race.some(x => x && x !== "ok" && x !== "last-owner")).toBe(false);
+        expect([await counted(S1), await counted(S2)].every(n => n >= 1)).toBe(true);
       }
-      expect(settled).toBe(false);
-      // Meanwhile T becomes an owner of S2 and S2's other owner is demoted: allowed, because T still has its member.
-      await r2.setScopedGrant({ scope: { type: "space", id: s2.id }, subject: T, role: "owner" });
-      await r2.setScopedGrant({ scope: { type: "space", id: s2.id }, subject: ann, role: null });
-      expect(settled).toBe(false);
-      await other.unsafe("COMMIT");                                                                          // release S1
-      expect(await removal).toBe("last-owner");                                                              // S2 would have no counted owner
-      expect(await r.teamMembers(team.id)).toEqual(["m"]);
-      expect(await r.scopedGrants({ type: "space", id: s2.id })).toEqual([{ subject: T, role: "owner" }]);
-    } finally { await other.unsafe("ROLLBACK").catch(() => {}); other.release(); await r.close(); await r2.close(); await drop(schema); }
-  });
+    } finally { await other.unsafe("ROLLBACK").catch(() => {}); other.release(); await a.close(); await b.close(); await drop(schema); }
+  }, 30_000);
 
   test("two connections creating a tenant for one domain at once: one wins, the other gets the usual error", async () => {
     const schema = schemaName();

@@ -269,3 +269,17 @@ test("LOW-D: the quota hook hears each tenant once per sweep, not once per reape
   expect(await reaper.sweep()).toMatchObject({ deleted: 3 });
   expect(deleted).toEqual([T]);
 });
+
+test("#92 follow-up: a sweep that only restores (a reference landed under the claim) still tells the quota hook, so the node recounts the restored bytes", async () => {
+  const p = png(34);
+  await place("b-one", p); await store.purgeBoard(T, "b-one"); t.now += BLOB_GRACE_MS;
+  const gate = deferred(), mid = deferred();
+  const held = { ...blobs, quarantine: async (...a) => { mid.resolve(); await gate.promise; return blobs.quarantine(...a); } };
+  const run = make({ blobs: held }).sweep();
+  await mid.promise;
+  await refer("b-two", p);
+  gate.resolve();
+  expect(await run).toMatchObject({ deleted: 0, revived: 1, failed: 0 });
+  expect(await has(p)).toBe(true);
+  expect(deleted).toEqual([T]);
+});

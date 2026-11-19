@@ -19,37 +19,13 @@
 import { Database } from "bun:sqlite";
 import { RegistryError, batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, TRASH, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
-import { assertShapes } from "../sqlite/schema.js";
+import { assertShapes, onBusyRetry } from "../sqlite/schema.js";
 
 /** An old-format store is refused at start-up (never read silently, never ALTERed). */
 const oldFormat = msg => Object.assign(new Error(msg), { code: "old-format" });
 /** A tenant row always has its kind row (createTenant writes both in one step): a missing one is a corrupt store, never a silent default. */
 const needKind = (kind, id, absent = false) => { if (!absent && typeof kind !== "string") throw new RegistryError("corrupt", `tenant ${id} has no kind row`); return kind ?? null; };
 const str = v => typeof v === "string";
-
-/**
- * Runs `f`, retrying while SQLite reports BUSY/LOCKED, with a short growing backoff (5 ms doubling, at most 100 ms,
- * plus jitter), until `deadline` (ms since epoch); then throws the last error. Only for start-up statements that
- * SQLite may refuse without consulting the busy handler. Blocks (start-up is synchronous).
- *
- * A hard cap: before each attempt `busy_timeout` is set to what is left of the budget, so a statement that waits in
- * SQLite's busy handler can't run past the deadline either, and no sleep runs past it. `f` always runs at least once.
- * The caller restores its own busy_timeout afterwards.
- */
-function onBusyRetry(db, deadline, f, clock = Date.now, onAttempt) {
-  for (let delay = 5; ; delay = Math.min(delay * 2, 100)) {
-    const budget = Math.max(0, deadline - clock());
-    onAttempt?.(budget);
-    db.run(`PRAGMA busy_timeout=${budget}`);
-    try { return f(); }
-    catch (err) {
-      const busy = typeof err?.code === "string" && (err.code.startsWith("SQLITE_BUSY") || err.code.startsWith("SQLITE_LOCKED"));
-      const left = deadline - clock();
-      if (!busy || left <= 0) throw err;
-      Bun.sleepSync(Math.min(left, delay + Math.floor(Math.random() * delay)));
-    }
-  }
-}
 
 /**
  * @param {{ path: string, now?: () => number, fullfsync?: boolean, busyTimeoutMs?: number,

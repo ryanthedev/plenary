@@ -28,7 +28,7 @@
 
 import { Database } from "bun:sqlite";
 import { needId, PortError } from "../ids.js";
-import { assertShapes } from "../sqlite/schema.js";
+import { assertShapes, onBusyRetry } from "../sqlite/schema.js";
 import { DEFAULT_READ_LIMIT, needBoard, needLeaseEpoch, needTtl, checkAppend, checkRead, fitBytes, checkCheckpoint, checkBeforeSeq, checkBlobRefs, checkPend, checkReap } from "./port.js";
 import { encodeSliced } from "../encode/sliced.js";
 import { PART_CHARS, splitParts, headerOf, parseHeader, orphanGroups, headerLike } from "../encode/cp-parts.js";
@@ -85,11 +85,16 @@ function build(db, { fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3
   db.run(`PRAGMA busy_timeout=${Math.max(0, Math.floor(busyTimeoutMs))}`);
   // Before any write to the file (no WAL switch, no CREATE): an old-format file is refused as it was found.
   assertShapes(db, createTables, "sqlite store");
-  db.run("PRAGMA journal_mode=WAL");
+  // Several processes opening one brand-new file at once: the switch to WAL needs an exclusive lock and SQLite answers BUSY for it without
+  // consulting the busy handler (TECH-DEBT row 64), so skip it once the file reads WAL (it is persistent) and retry it, and the first schema
+  // transaction, with a short backoff within the busy_timeout budget.
+  const deadline = Date.now() + Math.max(0, Math.floor(busyTimeoutMs));
+  onBusyRetry(db, deadline, () => { if (db.query("PRAGMA journal_mode").get()?.journal_mode !== "wal") db.run("PRAGMA journal_mode=WAL"); });
   db.run("PRAGMA synchronous=FULL");
   db.run(`PRAGMA fullfsync=${fullfsync ? "ON" : "OFF"}`);
   db.run(`PRAGMA checkpoint_fullfsync=${fullfsync ? "ON" : "OFF"}`);
-  db.transaction(() => createTables(db))();   // all or none: a half-made file would be refused as old-format at the next start
+  onBusyRetry(db, deadline, () => db.transaction(() => createTables(db)).immediate());   // all or none: a half-made file would be refused as old-format at the next start
+  db.run(`PRAGMA busy_timeout=${Math.max(0, Math.floor(busyTimeoutMs))}`);                // start-up spent part of it; runtime gets the whole budget
 
   const qOpenEpoch = db.query(`INSERT INTO leases (tenant, board, epoch) VALUES (?, ?, 1)
     ON CONFLICT (tenant, board) DO UPDATE SET epoch = epoch + 1, holder = NULL, expires_at = NULL RETURNING epoch`);

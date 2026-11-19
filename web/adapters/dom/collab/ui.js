@@ -128,9 +128,10 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     if (port.role !== "viewer") { presence.float(e, port.me.user); renderFloats(); }
     return true;
   }
-  const bar = BAR.map(e => { const n = h("b"); return { e, n, btn: h("button.tb", { onclick: () => sendEmote(e) }, e, n) }; });
-  const more = h("button.tb", { title: "More emotes", onclick: togglePicker }, "✨");
-  const one = h("button.tb", { onclick: togglePicker }, "👏");   // phones: one button opens the picker
+  const reactionLabels = ["React with thumbs up", "React with heart", "React with laughing", "React with party popper", "React with clapping hands", "React with surprised face"];
+  const bar = BAR.map((e, i) => { const n = h("b"); return { e, n, btn: h("button.tb", { "aria-label": reactionLabels[i], onclick: () => sendEmote(e) }, e, n) }; });
+  const more = h("button.tb", { title: "More emotes", "aria-label": "More emotes", onclick: togglePicker }, "✨");
+  const one = h("button.tb", { title: "Emotes", "aria-label": "Emotes", onclick: togglePicker }, "👏");   // phones: one button opens the picker
   parts.emotes.append(...bar.map(b => b.btn), h("span.sep"), more);
   parts.emoteButton.append(one);
   const pickerEl = h("div.emote-picker.collab-picker", { role: "menu", hidden: true }, EMOTES.map(e => h("button", { title: e, onclick: () => sendEmote(e) }, e)));
@@ -228,12 +229,13 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     }
     for (const [key, rec] of clusterEls) if (!keepC.has(key)) { rec.el.remove(); clusterEls.delete(key); }
   }
+  let bottomInset = 0;
   function place(pop, world) {
-    const p = screen(world), w = root.clientWidth || 1200, hgt = root.clientHeight || 800;
+    const p = screen(world), w = root.clientWidth || 1200, hgt = Math.max(0, (root.clientHeight || 800) - bottomInset);
     const width = Math.max(0, Math.min(300, w - 16));
     let left = Math.max(8, Math.min(p.x + 20, w - width - 8)), top = p.y - 30;
-    if (w < 316) pop.style.setProperty("width", `${width}px`);
-    const height = Math.min(pop.offsetHeight || 340, hgt - 16);
+    pop.style.setProperty("width", `${width}px`);
+    const height = Math.min(pop.offsetHeight || 340, Math.max(0, hgt - 16));
     top = Math.max(8, Math.min(top, hgt - height - 8));
     pop.style.setProperty("left", `${left}px`); pop.style.setProperty("top", `${top}px`);
   }
@@ -448,6 +450,13 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
       openCompose({ x: at.x, y: at.y, on: b ? on : null }); renderAll(); return true;
     },
     openThread, showDrawer,
+    setBottomInset(value) {
+      const inset = Number.isFinite(value) ? Math.max(0, value) : 0;
+      if (inset === bottomInset) return;
+      bottomInset = inset;
+      popHost.style.setProperty("bottom", `${inset}px`);
+      renderPopover();
+    },
     layout({ board = true } = {}) { const rv = records({ reanchor: board }); renderPins(rv); renderPopover(rv); paint(); },
     draw,
     setTheme(t) { S.theme = t === "dark" ? "dark" : "light"; paint(); },

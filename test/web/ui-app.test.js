@@ -37,7 +37,7 @@ class E extends N {
   removeEventListener(t, fn) { this.listeners[t] = (this.listeners[t] ?? []).filter(f => f !== fn); }
   fire(t, ev = {}) { const e = { target: this, currentTarget: this, button: 0, preventDefault() { this.defaultPrevented = true; }, stopPropagation() {}, ...ev }; for (const fn of this.listeners[t] ?? []) fn(e); return e; }
   click() { if (!this.disabled) this.fire("click"); }
-  focus() {} blur() {} setPointerCapture() {} setSelectionRange() {} select() {}
+  focus() { if (globalThis.document) globalThis.document.activeElement = this; } blur() {} setPointerCapture() {} setSelectionRange() {} select() {}
   after(n) { const p = this.parentNode; p.append(n); }
   contains(n) { for (let x = n; x; x = x.parentNode) if (x === this) return true; return false; }
   closest() { return null; }
@@ -166,6 +166,34 @@ test("C-2/C-8: 60 frames of wheel panning and 100 incoming ops rebuild topbar, p
   drawRect(bo, 500, 500); step(20);                                         // a new shape: the layer count in the panel
   expect(delta(c0, counts()).panel).toBe(1);
   void net;
+});
+
+test("More menu exposes header actions and closes with Escape or an outside click", () => {
+  rig = setup({ collab: true });
+  const more = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More");
+  expect(more?.attrs["aria-haspopup"]).toBe("menu");
+  expect(more?.attrs["aria-expanded"]).toBe("false");
+  more.click();
+  expect(more.attrs["aria-expanded"]).toBe("true");
+  const menu = find(page.byId.topbar, e => e.attrs.role === "menu" && e.classList.contains("header-more-menu"));
+  expect(["Comments", "Notes", "Mermaid", "Export", "Side panel", "Light / dark"].every(label => menu.all().some(e => e.tagName === "BUTTON" && e.attrs["aria-label"] === label))).toBe(true);
+  menu.fire("keydown", { key: "Escape" });
+  expect(more.attrs["aria-expanded"]).toBe("false");
+  expect(page.doc.activeElement).toBe(more);
+  more.click();
+  page.doc.fire("click", { target: page.byId.panel });
+  expect(more.attrs["aria-expanded"]).toBe("false");
+});
+
+test("all collaboration emoji toolbar buttons have descriptive accessible labels", () => {
+  rig = setup({ collab: true });
+  const toolbarButtons = page.doc.body.all().filter(e => e.tagName === "BUTTON" && e.classList.contains("tb"));
+  expect(toolbarButtons.every(e => e.attrs["aria-label"])).toBe(true);
+  const emojiButtons = page.byId.hudBC.all().concat(page.byId.hudBR.all()).filter(e => e.tagName === "BUTTON" && e.classList.contains("tb"));
+  expect(emojiButtons.map(e => e.attrs["aria-label"])).toEqual([
+    "React with thumbs up", "React with heart", "React with laughing", "React with party popper",
+    "React with clapping hands", "React with surprised face", "More emotes", "Emotes",
+  ]);
 });
 
 test("joining an empty board and receiving its content later fits the board", () => {

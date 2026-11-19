@@ -55,7 +55,7 @@
 .thread-row .av { margin: 0; flex-shrink: 0; }
 
 .collab-avatars .phone-more { display: none; }
-@media (max-width: 1279px) {
+@media (max-width: 1023px) {
   .collab-avatars .desk-more { display: none; }
   .collab-avatars .phone-more { display: grid; }
   .collab-avatars .stack .av:nth-child(n+3):not(.more) { display: none; }
@@ -67,7 +67,6 @@
   .collab-picker { bottom: 130px; }
   .collab-avatars .stack .av:nth-child(n+3):not(.more) { display: none; }
   .collab-avatars .eye, .collab-avatars .wtxt { display: none; }
-  .collab-pop { left: 8px !important; right: 8px; width: auto; top: auto !important; bottom: 76px; }
   .collab-emotes .tb:nth-child(n+4):not(:last-child) { display: none; }
   .collab-emotes .sep { display: none; }
 }

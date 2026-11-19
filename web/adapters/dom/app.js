@@ -62,7 +62,9 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   if (!ui.drawer && me.role === "annotator") ui.drawer = "notes";
   net.onFile(file => { S.receiveFiles({ [file.id]: file }); });
 
-  const isPhone = () => matchMedia("(max-width: 1279px)").matches;
+  const isPhone = () => matchMedia("(max-width: 1023px)").matches;
+  let closeMoreMenu = null;
+  document.addEventListener("click", e => closeMoreMenu?.(e));
   const canvas = $("#board"), ink = $("#ink"), ctx = canvas.getContext("2d");
   const allFiles = () => ({ ...S.eds.notes.doc.files, ...S.eds.board.doc.files });
 
@@ -324,6 +326,43 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   function topbar() {
     const role = S.role, tools = toolsFor(role), may = S.may();
     const core = tools.filter(t => !["image", "note", "highlighter"].includes(t.id)), extras = tools.filter(t => ["image", "note", "highlighter"].includes(t.id));
+    const toggleDrawer = type => { ui.drawer = ui.drawer === type ? null : type; chromeDirty = true; };
+    const toggleTheme = () => setTheme(ui.theme === "dark" ? "light" : "dark");
+    const togglePanel = () => setPanel({ type: "open" });
+    const toggleExport = () => openDialog("export");
+    const extraAction = (label, action) => h("button.header-extra.btn.ghost", { "aria-label": label, title: label, onclick: () => { setMore(false); action(); } }, label);
+    const moreOpen = !!ui.moreOpen;
+    let menu;
+    const setMore = (open, focus = false) => {
+      ui.moreOpen = open; more.setAttribute("aria-expanded", String(open)); menu.hidden = !open;
+      if (focus) more.focus?.();
+    };
+    const more = h("button.tb.header-more", { "aria-label": "More", "aria-haspopup": "menu", "aria-expanded": String(moreOpen), onclick: () => {
+      setMore(!ui.moreOpen);
+    } }, "More");
+    menu = h("div.header-more-menu", { role: "menu", hidden: !moreOpen, onkeydown: e => {
+      if (e.key === "Escape") { e.preventDefault(); setMore(false, true); }
+    } }, [
+      collab ? extraAction("Comments", () => toggleDrawer("comments")) : null,
+      extraAction("Notes", () => toggleDrawer("notes")),
+      role === "presenter" ? extraAction("Mermaid", () => openDialog("mermaid")) : null,
+      role === "presenter" ? extraAction("Export", toggleExport) : null,
+      role !== "viewer" ? extraAction("Side panel", togglePanel) : null,
+      extraAction("Light / dark", toggleTheme),
+    ]);
+    const actions = h("div.header-actions", {},
+        role === "presenter" ? [
+          h("button.btn.ghost.desk-only.header-extra", { title: "Insert a Mermaid flowchart", disabled: !may, onclick: () => openDialog("mermaid") }, "◇→"),
+          h("button.btn.ghost.desk-only.header-extra", { title: "Export SVG / PNG (⌘⇧E)", "aria-label": "Export", onclick: toggleExport }, "⤓")] : null,
+        h("button.btn.ghost.desk-only.header-extra", { "aria-label": "Notes", title: "Notes", onclick: () => toggleDrawer("notes") }, "❏ Notes ", h("span.dim", {}, String(notesCount()))),
+        collab ? h("button.btn.ghost.desk-only.header-extra", { "aria-label": "Comments", title: "Comments (or right-click the board)", onclick: () => toggleDrawer("comments") }, "💬") : null,
+        collab ? collab.parts.avatars : h("div.avatars", {},
+          h("span.stack", {}, h("span.av.live", { style: { background: "var(--u-me)" }, title: `${me.name} (you)` }, me.name.slice(0, 2).toUpperCase()))),
+        pillEl,
+        role !== "viewer" ? h("button.tb.desk-only.header-extra" + (ui.panel.open ? ".on" : ""), { title: "Side panel (I)", onclick: togglePanel }, h("span.ic", {}, "◧"), h("span.k", {}, "I")) : null,
+        h("button.tb.header-extra" + (role === "viewer" ? "" : ".theme-btn"), { title: "Light / dark", onclick: toggleTheme }, h("span.ic", {}, ui.theme === "dark" ? "☀" : "☾")),
+        more, menu);
+    closeMoreMenu = e => { if (ui.moreOpen && !actions.contains(e.target)) setMore(false); };
     return [
       h("div.tools.desk-only", {}, core.map(t => toolButton(t)), extras.length ? h("span.sep") : null, extras.map(t => toolButton(t, ".new")),
         role !== "viewer" ? [h("span.sep"),
@@ -332,17 +371,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
           h("button.tb", { title: "Redo (⌘⇧Z)", disabled: !may, onclick: () => { S.act(S.active, e => e.redo()); } }, h("span.ic", {}, "↷"))] : null),
       h("span.board-name", {}, board, net.kind === "ws" ? null : [" ", h("small", {}, "· dev room")]),
       h("span.spacer"),
-      role === "presenter" ? [
-        h("button.btn.ghost.desk-only", { title: "Insert a Mermaid flowchart", disabled: !may, onclick: () => openDialog("mermaid") }, "◇→"),
-        h("button.btn.ghost.desk-only", { title: "Export SVG / PNG (⌘⇧E)", onclick: () => openDialog("export") }, "⤓")] : null,
-      h("button.btn.ghost.desk-only", { title: "Notes", onclick: () => { ui.drawer = ui.drawer ? null : "notes"; chromeDirty = true; } }, "❏ Notes ", h("span.dim", {}, String(notesCount()))),
-      collab ? h("button.btn.ghost.desk-only", { title: "Comments (or right-click the board)", onclick: () => { ui.drawer = ui.drawer === "comments" ? null : "comments"; chromeDirty = true; } }, "💬") : null,
-      // Who's here (`here`): the collab UI's live avatar row, kept across rebuilds (a node, moved, never rebuilt here).
-      collab ? collab.parts.avatars : h("div.avatars", {},
-        h("span.stack", {}, h("span.av.live", { style: { background: "var(--u-me)" }, title: `${me.name} (you)` }, me.name.slice(0, 2).toUpperCase()))),
-      pillEl,                                                   // the pill: one node, updated in place (inPlace)
-      role !== "viewer" ? h("button.tb.desk-only" + (ui.panel.open ? ".on" : ""), { title: "Side panel (I)", onclick: () => setPanel({ type: "open" }) }, h("span.ic", {}, "◧"), h("span.k", {}, "I")) : null,
-      h("button.tb" + (role === "viewer" ? "" : ".theme-btn"), { title: "Light / dark", onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, ui.theme === "dark" ? "☀" : "☾")),
+      actions,
     ];
   }
   const pillTitle = cls => pillTitleFor({ cls, status: S.status, viewer: S.effective === "viewer", readOnly: S.readOnly });
@@ -611,6 +640,16 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       if (part.build() === false) { keys[name] = undefined; continue; }   // busy: try again later
       keys[name] = k; rebuilds[name]++;
     }
+    if (collab && isPhone()) {
+      const canvasRect = canvas.getBoundingClientRect();
+      const overlays = [$("#sheet"), $("#dock")];
+      const inset = overlays.reduce((max, el) => {
+        const rect = el.getBoundingClientRect();
+        return rect.height > 0 && rect.bottom > canvasRect.top && rect.top < canvasRect.bottom
+          ? Math.max(max, canvasRect.bottom - rect.top) : max;
+      }, 0);
+      collab.setBottomInset(inset);
+    } else collab?.setBottomInset(0);
   }
 
   // ── loop ──
@@ -664,7 +703,10 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     // Either clock: mono may not advance through a laptop's sleep on every platform; a false positive costs one reconnect.
     if (was && since(was) > RESUME_PROBE_MS && !(heard && since(heard) <= HEARD_MS)) probe();
   });
-  matchMedia("(max-width: 1279px)").addEventListener("change", () => { chromeDirty = true; });
+  matchMedia("(max-width: 1023px)").addEventListener("change", () => { chromeDirty = true; });
+  matchMedia("(min-width: 1024px) and (max-width: 1279px)").addEventListener("change", e => {
+    if (!e.matches && ui.moreOpen) { ui.moreOpen = false; chromeDirty = true; }
+  });
   setTheme(ui.theme);
   let savedMine = 0, fitted = false, mineUser = me.user;
   function saveMine() {

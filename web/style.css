@@ -28,6 +28,11 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 
 /* ── top bar ── */
 .topbar { height: 46px; display: flex; align-items: center; gap: 6px; padding: 0 10px; background: var(--chrome); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.header-actions { display: flex; align-items: center; gap: 6px; position: relative; min-width: 0; }
+.header-actions > .header-more { display: none; }
+.header-more-menu { display: none; position: absolute; right: 0; top: calc(100% + 6px); z-index: 30; min-width: 168px; padding: 4px; background: var(--raised); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow); }
+.header-more-menu button { display: flex; width: 100%; align-items: center; padding: 7px 9px; border-radius: 5px; text-align: left; white-space: nowrap; }
+.header-more-menu button:hover, .header-more-menu button:focus-visible { background: var(--hover); }
 .tools { display: flex; align-items: center; gap: 2px; }
 .sep { width: 1px; height: 22px; background: var(--border); margin: 0 4px; }
 .tb { height: 30px; min-width: 28px; padding: 0 4px; display: inline-flex; align-items: center; gap: 3px; border-radius: 6px; position: relative; }
@@ -227,7 +232,19 @@ textarea.field, input.field { color: var(--fg); font: 12px var(--font); resize: 
 body .phone-only { display: none !important; }
 
 /* ── touch layout (phone, ~390 px) ── */
-@media (max-width: 1279px) {
+@media (min-width: 1024px) and (max-width: 1279px) {
+  .header-actions > .header-extra { display: none !important; }
+  .header-actions > .header-more { display: inline-flex; }
+  .header-actions > .header-more-menu[hidden] { display: none; }
+  .header-actions > .header-more-menu:not([hidden]) { display: block; }
+  .topbar { overflow: visible; }
+  .topbar > .tools { flex-shrink: 0; }
+  .topbar .board-name { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .topbar > .spacer { min-width: 0; }
+}
+
+@media (max-width: 1023px) {
+  .header-actions > .header-more, .header-actions > .header-more-menu { display: none !important; }
   .desk-only { display: none !important; }
   body .hud .grp.phone-only { display: inline-flex !important; }
   .topbar { height: 48px; gap: 6px; padding: 0 8px; }
@@ -262,7 +279,7 @@ body .phone-only { display: none !important; }
   .sheet .tool-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; padding: 10px; }
   .sheet .tool-grid .tb { height: 62px; flex-direction: column; border: 1px solid var(--border); border-radius: 10px; }
   .sheet .tool-grid .tb .ic { font-size: 20px; }
-  .pop { left: 8px !important; right: 8px; width: auto; top: auto !important; bottom: 76px; }
+  .pop:not(.collab-pop) { left: 8px !important; right: 8px; width: auto; top: auto !important; bottom: 76px; }
   .dialog-veil { place-items: end stretch; padding: 0; }
   .dialog { width: 100%; border-radius: 16px 16px 0 0; }
   .cols { grid-template-columns: 1fr; }
@@ -270,7 +287,8 @@ body .phone-only { display: none !important; }
 }
 
 .collab-pop { max-width: calc(100% - 16px); max-height: calc(100% - 16px); display: flex; flex-direction: column; }
-.collab-pop .body { min-height: 0; }
+.collab-pop > header, .collab-pop > .reply { flex-shrink: 0; }
+.collab-pop .body { min-height: 0; flex: 1 1 auto; overflow: auto; }
 
 svg text { font-family: var(--font); }
 [hidden] { display: none !important; }

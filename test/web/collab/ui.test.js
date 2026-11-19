@@ -137,6 +137,20 @@ test("viewers read threads but get no reply box, no resolve, no reactions, and c
   collab.destroy();
 });
 
+test("phone popovers clamp above the bottom sheet inset", () => {
+  dom.root.clientHeight = 700;
+  const { port, collab } = setup();
+  port.remote({ do: "thread", id: "t", anchor: { point: { x: 600, y: 650 } }, text: "hello" }, "maya", "Maya");
+  collab.openThread("t");
+  collab.setBottomInset(200);
+  const pop = byClass(dom.root, "collab-pop")[0];
+  expect(byClass(dom.root, "collab-pophost")[0].style.getPropertyValue("bottom")).toBe("200px");
+  expect(Number.parseFloat(pop.style.getPropertyValue("top"))).toBeLessThanOrEqual(152);
+  collab.setBottomInset(0);
+  expect(byClass(dom.root, "collab-pophost")[0].style.getPropertyValue("bottom")).toBe("0px");
+  collab.destroy();
+});
+
 test("a refused comment leaves the overlay and says why; an empty one is never sent", () => {
   const { port, collab } = setup("annotator");
   collab.startComment({ x: 5, y: 5 });

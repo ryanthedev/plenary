@@ -154,11 +154,20 @@ test("DW-43.F1: an entry lands during EVERY deflate: the big frame still goes co
   let n = 0;
   op = els => { w.send({ t: "op", id: `live:${++n}`, sentAt: 0, stream: "board", op: { elements: els } }); return until(() => w.msgs.filter(m => m.t === "ack").length === n, "ack", 30_000); };
   for (let i = 0; i < 300; i += 50) await op(Array.from({ length: 50 }, (_, k) => shape(i + k)));
+  // The room folds on its own schedule (here after 64 KiB of ops) and the feed re-bases when a heartbeat names the checkpoint:
+  // settle that first, or it lands in the middle of the joins (a slow machine made it do so) and changes which texts are
+  // deflated. Then add a tail that is big enough to compress and too small to fold again.
+  const room0 = await r.room(), feed = () => r.server.gateway.feed(r.ids.tenant, r.ids.board);
+  await until(() => room0.savedSeq > 0 && feed()?.base === room0.savedSeq && feed().seq === room0.resolved, "the feed to re-base on the room's checkpoint", 30_000);
+  const baseSeq = room0.savedSeq;
+  for (let i = 300; i < 400; i += 50) await op(Array.from({ length: 50 }, (_, k) => shape(i + k)));
+  await until(() => feed().seq === room0.resolved, "the feed to hold every op", 30_000);
+  expect(room0.savedSeq).toBe(baseSeq);                                   // no second fold: the open chunk is the whole tail
   landing = true;
   const joins = [];
   for (let i = 0; i < 4; i++) joins.push(await measureJoin(r, { z: true, name: "mid" + i }));
   const j = joins[0];
-  expect(calls).toBe(1);                                                  // one deflate for the open chunk, however many joins and landed ops
+  expect(calls).toBe(2);                                                  // the snapshot, and one for the open chunk, however many joins and landed ops
   expect(j.kinds.filter(k => k.t === "entries").map(k => k.binary)).toEqual([true, false]);   // the chunk as of the deflate, then a small plain cut
   expect(j.kinds.find(k => k.binary).bytes).toBeGreaterThan(j.kinds.find(k => k.t === "entries" && !k.binary).bytes);
   r.room0 = await r.room();

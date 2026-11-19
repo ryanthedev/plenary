@@ -135,7 +135,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       member TEXT NOT NULL, board TEXT NOT NULL REFERENCES reg_boards(id), at INTEGER NOT NULL, PRIMARY KEY (member, board))`);
     // Idempotent creates (PROTOCOL.md): one row per (member, key); `result` NULL while the create runs. Additive.
     db.run(`CREATE TABLE IF NOT EXISTS reg_idempotency (
-      member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, result TEXT, at INTEGER NOT NULL, PRIMARY KEY (member, k))`);
+      member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, claim TEXT NOT NULL, result TEXT, at INTEGER NOT NULL, PRIMARY KEY (member, k))`);
     db.run("CREATE INDEX IF NOT EXISTS reg_idempotency_at ON reg_idempotency (at)");
     db.run("CREATE INDEX IF NOT EXISTS reg_recents_member ON reg_recents (member, opened_at DESC, board DESC)");
     db.run("CREATE INDEX IF NOT EXISTS reg_stars_member ON reg_stars (member, at DESC, board DESC)");
@@ -223,9 +223,9 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     recents: db.query("SELECT board, opened_at AS at FROM reg_recents WHERE member = ? ORDER BY opened_at DESC, board DESC LIMIT ?"),
     idemGet: db.query("SELECT fp, result, at FROM reg_idempotency WHERE member = ? AND k = ?"),
     idemCount: db.query("SELECT count(*) AS n FROM reg_idempotency"),
-    idemPut: db.query("INSERT OR REPLACE INTO reg_idempotency (member, k, fp, result, at) VALUES (?, ?, ?, NULL, ?)"),
-    idemFin: db.query("UPDATE reg_idempotency SET result = ?, at = ? WHERE member = ? AND k = ? AND fp = ?"),
-    idemDel: db.query("DELETE FROM reg_idempotency WHERE member = ? AND k = ? AND fp = ? AND result IS NULL"),
+    idemPut: db.query("INSERT OR REPLACE INTO reg_idempotency (member, k, fp, claim, result, at) VALUES (?, ?, ?, ?, NULL, ?)"),
+    idemFin: db.query("UPDATE reg_idempotency SET result = ?, at = ? WHERE member = ? AND k = ? AND claim = ?"),
+    idemDel: db.query("DELETE FROM reg_idempotency WHERE member = ? AND k = ? AND claim = ? AND result IS NULL"),
     idemPrune: db.query("DELETE FROM reg_idempotency WHERE rowid IN (SELECT rowid FROM reg_idempotency WHERE (result IS NULL AND at <= ?1) OR (result IS NOT NULL AND at <= ?2) LIMIT ?3)"),
     upStar: db.query("INSERT INTO reg_stars (member, board, at) VALUES (?, ?, ?) ON CONFLICT (member, board) DO NOTHING"),
     delStar: db.query("DELETE FROM reg_stars WHERE member = ? AND board = ?"),
@@ -665,12 +665,13 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       return db.transaction(() => {
         const e = q.idemGet.get(user, key);
         if (e && t - e.at < (e.result === null ? IDEM.claimMs : IDEM.ttlMs)) return e.fp !== fp ? { state: "mismatch" } : e.result === null ? { state: "in-progress" } : { state: "done", result: e.result };
-        q.idemPut.run(user, key, fp, t);
-        return { state: "new" };
+        const claim = crypto.randomUUID();
+        q.idemPut.run(user, key, fp, claim, t);
+        return { state: "new", claim };
       }).immediate();
     },
-    async idemFinish(user, key, fp, result) { ready(); if (str(user) && str(key) && str(fp)) q.idemFin.run(String(result), now(), user, key, fp); },
-    async idemRelease(user, key, fp) { ready(); if (str(user) && str(key) && str(fp)) q.idemDel.run(user, key, fp); },
+    async idemFinish(user, key, claim, result) { ready(); if (str(user) && str(key) && str(claim)) q.idemFin.run(String(result), now(), user, key, claim); },
+    async idemRelease(user, key, claim) { ready(); if (str(user) && str(key) && str(claim)) q.idemDel.run(user, key, claim); },
     /** The stored rows (tests). */ idemSize: () => q.idemCount.get().n,
 
     // ---- Home (PROTOCOL.md § Home) ----

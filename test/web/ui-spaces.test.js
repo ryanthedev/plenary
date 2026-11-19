@@ -481,3 +481,12 @@ test("Group page: a saved rename puts focus on the title", async () => {
   expect(calls.at(-1)).toEqual(["updateGroup", "g-1", { name: "Product 2" }]);
   expect(focused.at(-1)).toBe(root.find(e => e.tagName === "H1"));
 });
+
+test("L6 randomKey: crypto.randomUUID when it exists, else getRandomValues (plain-http pages have no randomUUID)", async () => {
+  const { randomKey } = await import("../../web/adapters/dom/dialogs.js");
+  expect(randomKey({ randomUUID: () => "uuid-1" })).toBe("uuid-1");
+  const k = randomKey({ getRandomValues: a => a.fill(171) });
+  expect(k).toBe("ab".repeat(16));
+  expect(k).toMatch(/^[A-Za-z0-9_-]{8,64}$/);          // a valid Idempotency-Key
+  expect(randomKey()).toMatch(/^[A-Za-z0-9_-]{8,64}$/);
+});

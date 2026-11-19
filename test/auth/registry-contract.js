@@ -10,6 +10,7 @@
 // The suite uses only the public Registry methods, and refusals are matched by `err.code`, never by class.
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { IDEM } from "../../server/auth/registry-port.js";
 
 /**
  * @param {string} name
@@ -35,49 +36,71 @@ export function registryContract(name, makeRegistry, opts = {}) {
     // ---- idempotent creates (PROTOCOL.md "Idempotent creates") ----
 
     describe("idempotency keys", () => {
-      const U = "dev:ada", K = "key-0001-aaaa", FP = "f".repeat(64);
-      test("claim: new, then in-progress (same fp), mismatch (other fp); another user or key is independent", async () => {
-        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "new" });
+      const U = "dev:ada", K = "key-0001-aaaa", FP = "f".repeat(64), FP2 = "0".repeat(64), MIN = 60_000;
+      test("claim: new (with a claim token), then in-progress (same fp), mismatch (other fp); another user or key is independent", async () => {
+        const c = await r.idemClaim(U, K, FP);
+        expect(c).toMatchObject({ state: "new" });
+        expect(typeof c.claim).toBe("string");
+        expect(c.claim.length).toBeGreaterThan(15);
         expect(await r.idemClaim(U, K, FP)).toEqual({ state: "in-progress" });
-        expect(await r.idemClaim(U, K, "0".repeat(64))).toEqual({ state: "mismatch" });
-        expect(await r.idemClaim("dev:bob", K, FP)).toEqual({ state: "new" });
-        expect(await r.idemClaim(U, "key-0002-bbbb", FP)).toEqual({ state: "new" });
+        expect(await r.idemClaim(U, K, FP2)).toEqual({ state: "mismatch" });
+        expect((await r.idemClaim("dev:bob", K, FP)).state).toBe("new");
+        const other = await r.idemClaim(U, "key-0002-bbbb", FP);
+        expect(other.state).toBe("new");
+        expect(other.claim).not.toBe(c.claim);
       });
-      test("finish: a repeat gets the stored answer; a wrong fp neither finishes nor reads it", async () => {
-        await r.idemClaim(U, K, FP);
-        await r.idemFinish(U, K, "0".repeat(64), "{\"no\":1}");
+      test("finish: a repeat gets the stored answer; a wrong claim neither finishes nor reads it", async () => {
+        const { claim } = await r.idemClaim(U, K, FP);
+        await r.idemFinish(U, K, "not-the-claim", "{\"no\":1}");
         expect(await r.idemClaim(U, K, FP)).toEqual({ state: "in-progress" });
-        await r.idemFinish(U, K, FP, "{\"status\":201}");
+        await r.idemFinish(U, K, claim, "{\"status\":201}");
         expect(await r.idemClaim(U, K, FP)).toEqual({ state: "done", result: "{\"status\":201}" });
-        expect(await r.idemClaim(U, K, "0".repeat(64))).toEqual({ state: "mismatch" });
+        expect(await r.idemClaim(U, K, FP2)).toEqual({ state: "mismatch" });
       });
-      test("release drops an unfinished claim only", async () => {
-        await r.idemClaim(U, K, FP);
-        await r.idemRelease(U, K, "0".repeat(64));
-        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "in-progress" });   // another fp cannot release it
-        await r.idemRelease(U, K, FP);
-        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "new" });
-        await r.idemFinish(U, K, FP, "x");
-        await r.idemRelease(U, K, FP);
-        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "done", result: "x" });
+      test("release drops an unfinished row of that claim only", async () => {
+        const { claim } = await r.idemClaim(U, K, FP);
+        await r.idemRelease(U, K, "not-the-claim");
+        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "in-progress" });   // another claim cannot release it
+        await r.idemRelease(U, K, claim);
+        const again = await r.idemClaim(U, K, FP);
+        expect(again.state).toBe("new");
+        await r.idemFinish(U, K, again.claim, "x");
+        await r.idemRelease(U, K, again.claim);
+        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "done", result: "x" });   // a finished row stays
       });
-      test("an unfinished claim is taken over after 60 s; a finished answer lives 24 h", async () => {
+      test("an unfinished claim is taken over after IDEM.claimMs (5 min); a finished answer lives 24 h", async () => {
         await r.idemClaim(U, K, FP);
-        clock.t += 59_999;
+        clock.t += IDEM.claimMs - 1;
         expect((await r.idemClaim(U, K, FP)).state).toBe("in-progress");
         clock.t += 1;
-        expect(await r.idemClaim(U, K, "0".repeat(64))).toEqual({ state: "new" });   // free again, even for another body
-        await r.idemFinish(U, K, "0".repeat(64), "y");
-        clock.t += 24 * 3600_000 - 1;
-        expect(await r.idemClaim(U, K, "0".repeat(64))).toEqual({ state: "done", result: "y" });
+        const b = await r.idemClaim(U, K, FP2);   // free again, even for another body
+        expect(b.state).toBe("new");
+        await r.idemFinish(U, K, b.claim, "y");
+        clock.t += IDEM.ttlMs - 1;
+        expect(await r.idemClaim(U, K, FP2)).toEqual({ state: "done", result: "y" });
         clock.t += 1;
-        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "new" });
+        expect((await r.idemClaim(U, K, FP)).state).toBe("new");
+      });
+      test("FENCING: after a takeover the stale run's finish and release change nothing of the new claim", async () => {
+        const a = await r.idemClaim(U, K, FP);
+        clock.t += IDEM.claimMs + MIN;                 // A is still running, past the claim window
+        const b = await r.idemClaim(U, K, FP);         // B takes the key over
+        expect(b.state).toBe("new");
+        expect(b.claim).not.toBe(a.claim);
+        await r.idemRelease(U, K, a.claim);            // A gives up: must not free B's claim
+        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "in-progress" });
+        await r.idemFinish(U, K, a.claim, "from-A");   // A finishes late: must not write B's answer
+        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "in-progress" });
+        await r.idemFinish(U, K, b.claim, "from-B");
+        await r.idemFinish(U, K, a.claim, "A-again");  // and cannot overwrite it afterwards either
+        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "done", result: "from-B" });
       });
       test("expired rows are pruned by age as claims arrive (bounded storage)", async () => {
-        for (let i = 0; i < 100; i++) { await r.idemClaim(U, `old-key-${String(i).padStart(4, "0")}`, FP); await r.idemFinish(U, `old-key-${String(i).padStart(4, "0")}`, FP, "z"); }
+        for (let i = 0; i < 100; i++) { const k = `old-key-${String(i).padStart(4, "0")}`; const c = await r.idemClaim(U, k, FP); await r.idemFinish(U, k, c.claim, "z"); }
         expect(await r.idemSize()).toBe(100);
-        clock.t += 24 * 3600_000 + 1;
+        clock.t += IDEM.ttlMs + 1;
         for (let i = 0; i < 64; i++) await r.idemClaim(U, `new-key-${String(i).padStart(4, "0")}`, FP);
+        await new Promise(res => setTimeout(res, 300));   // the prune is a separate, un-awaited call on Postgres
         expect(await r.idemSize()).toBeLessThan(100);   // the 64th claim pruned the expired ones
       });
       test("concurrent claims of one key: exactly one is new", async () => {

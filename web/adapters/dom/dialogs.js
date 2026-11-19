@@ -10,6 +10,12 @@ const focusables = el => (typeof el.querySelectorAll === "function" ? [...el.que
   .filter(e => !e.disabled && !e.hidden);
 let seq = 0;
 
+/** A random Idempotency-Key. `crypto.randomUUID` exists only in secure contexts (plain http to a LAN or 0.0.0.0 has none), so fall back to getRandomValues. */
+export function randomKey(c = globalThis.crypto) {
+  if (typeof c?.randomUUID === "function") return c.randomUUID();
+  return [...c.getRandomValues(new Uint8Array(16))].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
 /**
  * One modal. `body` and `footer` are built by the caller; returns `{ close, el }`.
  * @param {{ host: HTMLElement, title: string, body: Node[], footer: Node[], opener?: { focus?: () => void } | null, onClose?: () => void, form?: boolean, onSubmit?: () => void }} o
@@ -46,7 +52,7 @@ const errorLine = () => h("p.sp-error", { role: "alert" });
 /**
  * @param {{ host: HTMLElement, api: import("../../ports/spaces.js").SpacesPort, hrefs: { board(id: string): string, space(id: string): string, group(id: string): string }, go(href: string): void, newKey?: () => string }} o   `newKey`: the Idempotency-Key maker (default crypto.randomUUID)
  */
-export function createDialogs({ host, api, hrefs, go, newKey = () => globalThis.crypto.randomUUID() }) {
+export function createDialogs({ host, api, hrefs, go, newKey = randomKey }) {
   return {
     /** New board: title + Location (only Spaces where the person can create, their personal space first). */
     newBoard({ opener = null, space = null } = {}) {

@@ -1053,8 +1053,9 @@ dispatcher covers the whole route table, the body read, the bearer check and the
 connection. `GET /auth/dev` keeps its own tighter 3 s wait. Blob PUT/GET (`blob-http.js`) has its own body deadline and is not under this one.
 
 **Inner limits stay under the deadline.** A call that runs past the deadline still works on after the 503, so every single-call limit below it is kept
-shorter: main.js starts the Postgres Registry with `statementTimeoutMs` and `lockTimeoutMs` of **5000** and Google's `timeoutMs` of **3500**, and **refuses to
-start** (a loud error naming the setting) when one of them is not below the deadline. Several calls in a row (create then owner grant) can still add up
+shorter: main.js starts the Postgres Registry with `statementTimeoutMs` and `lockTimeoutMs` of **5000** (a single node's SQLite busy timeout is 5000 too) and
+Google's `timeoutMs` of **3500**, and **refuses to start** (a loud error naming the setting) when one of them is not below the deadline. For Postgres the
+check uses the adapter's longest call as `gate()` reports it: its wait for a connection plus the limit plus a 1 s backstop (7050 ms by default). Several calls in a row (create then owner grant) can still add up
 past it; that case is the next paragraph's.
 
 **What a 503 means on a write.** The work is not cancelled (the Registry port has no cancel; a statement already sent to the database runs to its own
@@ -1076,7 +1077,7 @@ submit**. Without the header a create behaves as before.
 |---|---|
 | first use | runs the create; the answer is stored under the key |
 | again, after the first finished | **the answer, rebuilt** for the caller as they are now (rule below): the same status, the object read fresh (a 201 with it, or `503 owner-grant-failed` with the board id), plus the header `Idempotent-Replayed: true`. Nothing is created |
-| again, while the first is still running (a call cut by the deadline keeps running) | `409 {error:"in-progress"}` with `Retry-After: 1`; the client retries until it gets the stored answer |
+| again, while the first is still running (a call cut by the deadline keeps running) | `409 {error:"in-progress"}` with `Retry-After: 1`; the client retries until it gets the stored answer (the web adapter retries up to 5 times with the same key, waiting `Retry-After` clamped to 0.25-5 s, then shows "still being created") |
 | again, with a different route, path parameter or body | `422 {error:"idempotency-key-reused"}`; nothing runs |
 
 - **The deadline does not lose the answer.** The create keeps running after the 503, and its outcome is stored when it finishes, so a later retry gets the
@@ -1088,10 +1089,17 @@ submit**. Without the header a create behaves as before.
   (`readInvite`, `readLink`). A caller who lost that access since gets the route's ordinary `403 forbidden`, never the stored answer and no token. A
   stored `owner-grant-failed` is authorized like the board create. A link's `id` is itself its capability; it is the same id `reg_links` holds in the
   same store, and it is returned only after the manager check.
-- **Not stored:** a refusal made before anything was written (400, 403, 404 from the use case) or a failure with no outcome: the claim is dropped and the
-  retry runs again.
+- **Which failures free the key (B1).** Only an error that **proves nothing was written**: a refusal from the use case (`forbidden`, `not-found`,
+  `bad-request`) or a Registry call that rolled back before it began (`queue-timeout`, `overloaded`, `lock-timeout`, `statement-timeout`). The claim
+  is then dropped and the retry runs again. **Any other failure keeps the key** (a `client-timeout`, a dropped connection, a bug): the create may have
+  committed, so the retry is `409 in-progress` until the claim expires (5 min), and only then runs again. The same holds for a crash between the
+  create and its stored answer. After an unclear failure, wait or look at what was created before retrying with a new key.
+- **Fencing (B2).** `idemClaim` returns a `claim` token, and `idemFinish` and `idemRelease` only act on the row while it still holds that token. A run
+  that was taken over (its claim passed **5 min**, `IDEM.claimMs`) can neither free nor overwrite the newer run's claim or answer. main.js refuses to start
+  when the claim window is under 10 of the Registry's longest single calls.
+- **A replay of a revoked or expired invite or link** answers `404 not-found`, not a 201 with its url.
 - **Scope and retention.** A key belongs to its user (ids are globally unique, so the Unit adds nothing): another user's request under the same key is a separate key and never sees or collides with this user's answer. A finished answer is kept **24 h**; a claim whose
-  create never reported (a crash) can be taken over after **60 s**. The store is bounded by age: expired rows are deleted in small batches as keys arrive.
+  create never reported (a crash) can be taken over after **5 min**. The store is bounded by age: expired rows are deleted in small batches as keys arrive.
   The request body is stored only as a SHA-256 fingerprint.
 - **Port** (§ Registry, `idemClaim`, `idemFinish`, `idemRelease`): the store is behind the Registry port; memory, SQLite (`reg_idempotency`) and Postgres
   (`reg_idempotency`, one atomic upsert-claim) implement it, and `registry-contract.js` pins the three.
@@ -1188,7 +1196,7 @@ method names are stable. Ids are server-minted over `[a-z0-9-]`.
 | grants | `setGrant(board, user, role \| null)`, `grant(board, user) → role \| null`, `grants(board)` |
 | invites | `createInvite({ board, email, role, expiresAt, by })`, `invite(id)`, `invites(board)`, `invitesFor(board, email)`, `revokeInvite(id)` |
 | share links | `createLink({ board, role, expiresAt, by })` (role per link), `link(id)`, `links(board)`, `revokeLink(id)`, `addLinkUse(link, user)`, `linkUses(board, user)` |
-| idempotency | `idemClaim(user, key, fp) → { state: "new" \| "done" \| "in-progress" \| "mismatch", result? }`, `idemFinish(user, key, fp, result)`, `idemRelease(user, key, fp)` (§ Idempotent creates) |
+| idempotency | `idemClaim(user, key, fp) → { state: "new" \| "done" \| "in-progress" \| "mismatch", result? }`, `idemFinish(user, key, claim, result)`, `idemRelease(user, key, claim)` (§ Idempotent creates; `idemClaim` returns the `claim` on `new`) |
 | home | `markOpened(user, board)`, `recents(user, { limit })`, `setStarred(user, board, on)`, `starred(user, { limit })`, `starredAmong(user, boards)`, `sharedBoards(user, email, { limit })`, `searchBoards(tenant, { q, unfiled, after, scan })`, `spaceCandidates(tenant, { user, all, after, limit })`, `groupCandidates(tenant, { user, all, limit })`, `boardRows(boards, { user, email })` (§ Home) |
 | organization | `createGroup`, `group`, `groups`; `createSpace`, `space`, `spaces`, `ensurePersonalSpace(tenant, user)`; `createTeam`, `team`, `teams`, `setTeamMember`, `teamMembers`; `setScopedGrant({ scope, subject, role \| null })`, `scopedGrants(scope)`; `createRole`, `updateRole`, `role`, `roles`; `accessContext(scope, { users, chain })`; `boardsIn(scope, { after, limit })`, `scopesOf(subject, { after, limit })`; `accessContexts(scopes, { users })` (the batch of `accessContext`, one statement on Postgres), `rename({ type: "board"\|"space"\|"group", id }, name)`, `updateScope({ type: "space"\|"group", id }, { name?, generalRole? })` (atomic; returns the row), `spacesIn(group, { after, limit })` (§ Spaces and Groups) |
 

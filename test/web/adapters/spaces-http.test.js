@@ -73,5 +73,22 @@ test("a create sends its Idempotency-Key header when given one, and none otherwi
   await a.createBoard({ title: "T" });
   expect(s.calls.map(c => c[1].headers["idempotency-key"])).toEqual(["key-0001-abcd", "key-0002-abcd", "key-0003-abcd", undefined]);
   expect(await api(answer(422, { error: "idempotency-key-reused" })).createBoard({ title: "T", key: "key-0001-abcd" })).toEqual({ error: "invalid" });
-  expect(await api(answer(409, { error: "in-progress" })).createBoard({ title: "T", key: "key-0001-abcd" })).toEqual({ error: "unavailable" });
+});
+
+test("L4 a 409 in-progress on a create is retried with the SAME key after Retry-After (bounded), then succeeds or ends as in-progress", async () => {
+  const waits = [], timers = { set: (f, ms) => { if (ms === 10_000) return 0; waits.push(ms); f(); return 0; }, clear() {} };   // the 10 s request timeout never fires; a retry wait fires at once
+  const seenKeys = []; let n = 0;
+  const later = after => async (u, i) => { seenKeys.push(i.headers["idempotency-key"]); n++; return n <= after ? { status: 409, headers: new Headers({ "retry-after": "2" }), text: async () => "{\"error\":\"in-progress\"}" } : answer(201, { board: { id: "b-9" } })(); };
+  expect(await api(later(2), { timers }).createBoard({ title: "T", key: "key-0001-abcd" })).toEqual({ board: { id: "b-9" } });
+  expect(seenKeys).toEqual(["key-0001-abcd", "key-0001-abcd", "key-0001-abcd"]);
+  expect(waits).toEqual([2000, 2000]);
+  // never answers: 1 try + 5 retries, then in-progress; the wait is clamped (Retry-After 99 s -> 5 s; none -> 1 s)
+  waits.length = 0; n = 0; seenKeys.length = 0;
+  const forever = async (u, i) => { n++; return { status: 409, headers: new Headers({ "retry-after": "99" }), text: async () => "{}" }; };
+  expect(await api(forever, { timers }).createSpace({ name: "S", key: "key-0002-abcd" })).toEqual({ error: "in-progress" });
+  expect([n, waits]).toEqual([6, [5000, 5000, 5000, 5000, 5000]]);
+  waits.length = 0;
+  await api(async () => ({ status: 409, text: async () => "{}" }), { timers }).createGroup({ name: "G", key: "key-0003-abcd" });
+  expect(waits[0]).toBe(1000);
+  expect(SPACES_ERRORS).toContain("in-progress");
 });

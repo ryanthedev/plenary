@@ -7,6 +7,7 @@ import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
 import { homeService } from "../../server/auth/home.js";
 import { devAuth } from "../../server/auth/dev.js";
+import { readLink, readInvite } from "../../server/admin/boards.js";
 
 const ORIGIN = "https://plenary.test";
 const config = { cookieKey: "k".repeat(32), postLoginUrl: ORIGIN + "/", boardUrl: ORIGIN + "/b/{board}", publicUrl: ORIGIN };
@@ -22,10 +23,10 @@ function virtualTimers() {
 let mem, reg, routes, vt, acme, hooks;
 /** `hooks.before[method]` may return a promise a registry call waits on (a slow call), or throw (a failing one). */
 beforeEach(async () => {
-  hooks = { before: {}, created: [], stored: [] };
+  hooks = { before: {}, after: {}, created: [], stored: [] };
   vt = virtualTimers();
   mem = memoryRegistry();
-  reg = new Proxy(mem, { get(o, k) { const v = o[k]; return typeof v === "function" ? async (...a) => { await hooks.before[k]?.(...a); const out = await v.apply(o, a); if (k === "createBoard") hooks.created.push(out.id); if (k === "idemFinish") hooks.stored.push(a[3]); return out; } : v; } });
+  reg = new Proxy(mem, { get(o, k) { const v = o[k]; return typeof v === "function" ? async (...a) => { await hooks.before[k]?.(...a); const out = await v.apply(o, a); if (k === "createBoard") hooks.created.push(out.id); if (k === "idemFinish") hooks.stored.push(a[3]); await hooks.after[k]?.(out); return out; } : v; } });
   const tenancy = makeTenancy({ registry: reg });
   const dev = devAuth({ enabled: true, tokens: { ada: { name: "ada", domain: "acme.com", email: "ada@acme.com" }, bo: { name: "bo", domain: "acme.com", email: "bo@acme.com" } } });
   acme = await mem.createTenant({ domain: "acme.com", admins: ["dev:ada"] });
@@ -170,15 +171,15 @@ test("SEC a link made by an owner who then loses the board: replaying the key is
   expect(replay.headers.get("idempotent-replayed")).toBeNull();
 });
 
-test("SEC the same for an invite, and the replay reads the link fresh (a revoked link shows as revoked)", async () => {
+test("SEC the same for an invite, and a replay of a revoked link is 404", async () => {
   const board = await owned();
   const inv = await (await post(`/boards/${board}/invites`, { email: "x@y.com", role: "viewer" }, { tok: "bo", key: "key-inv-sec01" })).json();
   const lk = await (await post(`/boards/${board}/links`, { role: "viewer" }, { tok: "bo", key: "key-lnk-sec01" })).json();
   expect(hooks.stored.join("")).not.toContain("x@y.com");   // the invited address is not in the key store
   await mem.revokeLink(lk.link.id);
   const stillLink = await post(`/boards/${board}/links`, { role: "viewer" }, { tok: "bo", key: "key-lnk-sec01" });
-  expect(stillLink.status).toBe(201);   // revoked links are still readable by their managers (they list as revoked); the body is fresh
-  expect((await stillLink.json()).link.revoked).toBe(true);
+  expect(stillLink.status).toBe(404);   // L7: a revoked link is gone, not a 201 with its url
+  expect(await stillLink.json()).toEqual({ error: "not-found" });
   await mem.setGrant(board, "dev:bo", "viewer");
   const r = await post(`/boards/${board}/invites`, { email: "x@y.com", role: "viewer" }, { tok: "bo", key: "key-inv-sec01" });
   expect(r.status).toBe(403);
@@ -218,4 +219,50 @@ test("SEC another user replaying the same key never sees the first user's result
   const bb = await b.json();
   expect(bb.link.id).not.toBe(a.link.id);
   expect(JSON.stringify(bb)).not.toContain(a.link.id);
+});
+
+// ---- B1: only an error that proves nothing was written frees the key ----
+
+test("B1 a create that COMMITS and then fails unclearly (client-timeout) keeps the key: the retry is 409 in-progress, never a second board", async () => {
+  hooks.after.createBoard = () => { throw Object.assign(new Error("no answer"), { code: "client-timeout" }); };
+  const first = await post("/boards", { title: "Maybe" }, { key: K });
+  expect(first.status).toBe(503);
+  expect(await boards()).toHaveLength(1);                    // it did commit
+  hooks.after.createBoard = undefined;
+  const retry = await post("/boards", { title: "Maybe" }, { key: K });
+  expect(retry.status).toBe(409);
+  expect(await retry.json()).toEqual({ error: "in-progress" });
+  expect(await boards()).toHaveLength(1);                    // still exactly one
+  expect(mem.idemSize()).toBe(1);
+});
+
+test("B1 an error that proves nothing was written (queue-timeout, a refusal) frees the key: the retry creates once", async () => {
+  let n = 0;
+  hooks.before.createBoard = () => { if (n++ === 0) throw Object.assign(new Error("queue"), { code: "queue-timeout" }); };
+  expect((await post("/boards", { title: "Again" }, { key: K })).status).toBe(503);
+  expect(await boards()).toHaveLength(0);
+  const retry = await post("/boards", { title: "Again" }, { key: K });
+  expect(retry.status).toBe(201);
+  expect(await boards()).toHaveLength(1);
+  for (const code of ["overloaded", "lock-timeout", "statement-timeout"]) {
+    hooks.before.createBoard = () => { throw Object.assign(new Error(code), { code }); };
+    await post("/boards", { title: code }, { key: "key-" + code });
+    expect(mem.idemSize()).toBe(1);                          // each released its own claim: only the finished one is left
+  }
+});
+
+// ---- L7 ----
+
+test("L7 readLink / readInvite: a revoked or expired one is not-found, a live one is returned", async () => {
+  const board = (await (await post("/boards", { title: "B" })).json()).board.id;
+  const caller = { user: "dev:ada", name: null, email: null, domain: null };
+  const l = await mem.createLink({ board, role: "viewer", expiresAt: 5000, by: "dev:ada" });
+  const i = await mem.createInvite({ board, email: "x@y.com", role: "viewer", expiresAt: 5000, by: "dev:ada" });
+  const at = t => ({ registry: mem, now: () => t });
+  expect((await readLink({ caller, board, link: l.id }, at(4999))).id).toBe(l.id);
+  expect((await readInvite({ caller, board, invite: i.id }, at(4999))).id).toBe(i.id);
+  await expect(readLink({ caller, board, link: l.id }, at(5000))).rejects.toMatchObject({ code: "not-found" });
+  await expect(readInvite({ caller, board, invite: i.id }, at(5000))).rejects.toMatchObject({ code: "not-found" });
+  await mem.revokeInvite(i.id);
+  await expect(readInvite({ caller, board, invite: i.id }, at(1))).rejects.toMatchObject({ code: "not-found" });
 });

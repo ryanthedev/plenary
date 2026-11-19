@@ -84,11 +84,11 @@ export async function createInvite({ caller, board, email, role, expiresAt = nul
   if (!INVITE_ROLES.includes(role)) throw bad("bad role");
   return registry.createInvite({ board: b.id, email: e, role, expiresAt: expiry(expiresAt, now()), by: caller.user });
 }
-/** One invite of a board the caller manages (the replay of a keyed create: PROTOCOL.md "Idempotent creates"); else `forbidden` / `not-found`. */
-export async function readInvite({ caller, board, invite }, { registry }) {
+/** One live invite of a board the caller manages (the replay of a keyed create: PROTOCOL.md "Idempotent creates"); else `forbidden`, or `not-found` for a missing, revoked or expired one. */
+export async function readInvite({ caller, board, invite }, { registry, now = Date.now }) {
   const b = await managed(registry, caller, board);
   const i = await registry.invite(invite);
-  if (!i || i.board !== b.id) throw new AdminError("not-found", "not found");
+  if (!i || i.board !== b.id || i.revoked || (i.expiresAt != null && i.expiresAt <= now())) throw new AdminError("not-found", "not found");   // a revoked or expired one is gone: 404, not a 201
   return i;
 }
 export async function listInvites({ caller, board }, { registry }) {
@@ -108,11 +108,11 @@ export async function createLink({ caller, board, role, expiresAt = null }, { re
   if (!LINK_ROLES.includes(role)) throw bad("links carry only editor, annotator or viewer");
   return registry.createLink({ board: b.id, role, expiresAt: expiry(expiresAt, now()), by: caller.user });
 }
-/** One link of a board the caller manages (the replay of a keyed create); else `forbidden` / `not-found`. */
-export async function readLink({ caller, board, link }, { registry }) {
+/** One live link of a board the caller manages (the replay of a keyed create); else `forbidden`, or `not-found` for a missing, revoked or expired one. */
+export async function readLink({ caller, board, link }, { registry, now = Date.now }) {
   const b = await managed(registry, caller, board);
   const l = await registry.link(link);
-  if (!l || l.board !== b.id) throw new AdminError("not-found", "not found");
+  if (!l || l.board !== b.id || l.revoked || (l.expiresAt != null && l.expiresAt <= now())) throw new AdminError("not-found", "not found");   // a revoked or expired one is gone: 404, not a 201
   return l;
 }
 export async function listLinks({ caller, board }, { registry }) {

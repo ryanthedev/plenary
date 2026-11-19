@@ -161,10 +161,10 @@ test("a create keeps ONE Idempotency-Key across retries of a submit, and takes a
   expect(s.state.created).toEqual({ id: "s1", name: "S" });
   const g = createNewGroupModel({ api, newKey }); g.setName("G");
   await g.submit(); await g.submit(); await g.submit();
-  expect(new Set(sent.slice(7)).size).toBeLessThanOrEqual(2);
+  expect(sent.slice(7)).toEqual(["key-5-0000", "key-5-0000", "key-5-0000"]);   // one key for the three tries of the group's submit
   // a success ends the key: the next submit is a new one
-  const before = sent.length; g.setName("H"); await g.submit();
-  expect(sent[before]).not.toBe(sent[before - 1]);
+  g.setName("H"); await g.submit();
+  expect(sent.at(-1)).toBe("key-6-0000");
 });
 
 test("a create with no key maker sends no key; an unclear failure of a create says it may have been created and that trying again is safe", async () => {
@@ -172,8 +172,27 @@ test("a create with no key maker sends no key; an unclear failure of a create sa
   const m = createNewBoardModel({ api }); await m.load(); await m.submit();
   expect(calls.at(-1)).toEqual(["createBoard", { title: "" }]);
   expect(m.state.error).toMatch(/may have been created/i);
-  expect(m.state.error).toMatch(/trying again is safe/i);
+  expect(m.state.error).toMatch(/trying again unchanged is safe/i);
   expect(createErrorText("network")).toMatch(/may have been created/i);
   expect(createErrorText("forbidden")).toBe(errorText("forbidden"));   // a clear refusal keeps its own text
   expect(errorText("unavailable")).not.toMatch(/may have been created/i);   // reads and renames are not creates
+});
+
+test("L6 a key that cannot be made leaves no stuck dialog (busy stays false, an error shows, nothing is sent); a rejecting port clears busy too", async () => {
+  const { api, calls } = mk({ boardSpaces: () => ({ spaces: [{ id: "s-me", name: "me", personal: true, general: null, group: null }], more: false }), spaceGroups: () => ({ root: true, groups: [], more: false }) });
+  const boom = () => { throw new Error("crypto.randomUUID is not a function"); };
+  const b = createNewBoardModel({ api, newKey: boom }); await b.load();
+  expect(await b.submit()).toBe(false);
+  expect(b.state.busy).toBe(false);
+  expect(b.state.error).toMatch(/could not start/i);
+  const g = createNewGroupModel({ api, newKey: boom }); g.setName("G");
+  expect(await g.submit()).toBe(false);
+  const s = createNewSpaceModel({ api, newKey: boom }); await s.load(); s.setName("S");
+  expect(await s.submit()).toBe(false);
+  expect([g.state.busy, s.state.busy]).toEqual([false, false]);
+  expect(calls.some(c => c[0].startsWith("create"))).toBe(false);
+  const rej = createNewGroupModel({ api: { createGroup: async () => { throw new Error("port bug"); } }, newKey: () => "k-0000-aaaa" }); rej.setName("G");
+  await expect(rej.submit()).rejects.toThrow("port bug");
+  expect(rej.state.busy).toBe(false);
+  expect(errorText("in-progress")).toMatch(/still being created/i);
 });

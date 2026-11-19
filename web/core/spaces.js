@@ -11,14 +11,17 @@ export const GENERAL_CHOICES = Object.freeze([["viewer", "Everyone can view"], [
 export const generalText = g => (GENERAL_CHOICES.find(([v]) => v === (g ?? null)) ?? GENERAL_CHOICES[4])[1];
 
 const ERR = {
+  "in-progress": "It is still being created. Give it a moment, then try again.",
   forbidden: "You can't do that here.", notfound: "That is not available to you.", invalid: "The server did not accept that.",
   auth: "You are signed out. Sign in again.", network: "No answer from the server. Try again.", unavailable: "The server could not do that. Try again in a moment.",
 };
 export const errorText = e => ERR[e] ?? ERR.unavailable;
 /** A create that got no clear answer may have been made: say so, and that trying again is safe (the retry carries the same Idempotency-Key). */
-const MAYBE = " It may have been created. Trying again is safe.";
+const MAYBE = " It may have been created. Trying again unchanged is safe.";
 export const createErrorText = e => (e === "unavailable" ? "The server did not answer in time." + MAYBE : e === "network" ? "No answer from the server." + MAYBE : errorText(e));
 // One Idempotency-Key per submit, reused by every retry of it (PROTOCOL.md "Idempotent creates"); a changed input starts a new one. The
+/** The key of one submit: made on first use, kept for its retries, forgotten on a change or a success. `get` may throw (no random source). */
+const keyer = newKey => { let key = null; return { reset() { key = null; }, get() { return newKey ? (key ??= newKey()) : null; } }; };
 // maker (`newKey`) comes from the root through the dialogs (core reads no global); with none, a create is sent without a key.
 
 /** Empty-state copy for a Space page (JOURNEY §5). */
@@ -111,7 +114,9 @@ export function createPageModel({ api, kind, id }) {
  * @param {{ api: SpacesPort, space?: string|null, newKey?: () => string }} o   `newKey`: the Idempotency-Key maker (one per submit, reused on retry); `space`: the Space to preselect (when opened from a Space page)
  */
 export function createNewBoardModel({ api, space = null, newKey = null }) {
-  let key = null;
+  const kk = keyer(newKey);
+  /** The submit's key made BEFORE the dialog goes busy; `undefined` (with the error shown) when none can be made. */
+  const keyFor = () => { try { return kk.get(); } catch { state.error = "Could not start that. Reload the page and try again."; emit(); return undefined; } };
   const state = { status: "loading", spaces: [], more: false, title: "", space: null, busy: false, error: null, created: null };
   const subs = new Set();
   const emit = () => { for (const f of [...subs]) f(state); };
@@ -124,8 +129,8 @@ export function createNewBoardModel({ api, space = null, newKey = null }) {
       else { state.spaces = r.spaces; state.more = r.more; state.status = "ready"; state.space = r.spaces.some(s => s.id === space) ? space : (r.spaces[0]?.id ?? null); }
       emit();
     },
-    setTitle(t) { key = null; state.title = String(t ?? ""); state.error = null; emit(); },
-    choose(id) { if (state.spaces.some(s => s.id === id)) { key = null; state.space = id; emit(); } },
+    setTitle(t) { kk.reset(); state.title = String(t ?? ""); state.error = null; emit(); },
+    choose(id) { if (state.spaces.some(s => s.id === id)) { kk.reset(); state.space = id; emit(); } },
     /** Hint under the list: what the new board will inherit. */
     hint() {
       const s = state.spaces.find(x => x.id === state.space);
@@ -137,11 +142,12 @@ export function createNewBoardModel({ api, space = null, newKey = null }) {
       if (state.busy || state.status !== "ready" || !state.space) return false;
       const title = state.title.trim();
       if (title.length > TITLE_MAX) { state.error = `Titles are at most ${TITLE_MAX} characters.`; emit(); return false; }
-      state.busy = true; state.error = null; emit();
+      const k = keyFor(); if (k === undefined) return false;
       const s = state.spaces.find(x => x.id === state.space);
-      const r = await api.createBoard({ title, ...(s.personal ? {} : { space: s.id }), ...(newKey ? { key: (key ??= newKey()) } : {}) });
-      state.busy = false;
-      if (r.error) state.error = createErrorText(r.error); else { state.created = r.board; key = null; }
+      state.busy = true; state.error = null; emit();
+      let r;
+      try { r = await api.createBoard({ title, ...(s.personal ? {} : { space: s.id }), ...(k ? { key: k } : {}) }); } finally { state.busy = false; }
+      if (r.error) state.error = createErrorText(r.error); else { state.created = r.board; kk.reset(); }
       emit();
       return !r.error;
     },
@@ -153,24 +159,27 @@ export function createNewBoardModel({ api, space = null, newKey = null }) {
  * @param {{ api: SpacesPort }} o
  */
 export function createNewGroupModel({ api, newKey = null }) {
-  let key = null;
+  const kk = keyer(newKey);
+  /** The submit's key made BEFORE the dialog goes busy; `undefined` (with the error shown) when none can be made. */
+  const keyFor = () => { try { return kk.get(); } catch { state.error = "Could not start that. Reload the page and try again."; emit(); return undefined; } };
   const state = { name: "", general: null, busy: false, error: null, created: null };
   const subs = new Set();
   const emit = () => { for (const f of [...subs]) f(state); };
   return {
     state,
     subscribe(f) { subs.add(f); return () => subs.delete(f); },
-    setName(n) { key = null; state.name = String(n ?? ""); state.error = null; emit(); },
-    setGeneral(g) { key = null; state.general = g === "none" || g == null ? null : g; emit(); },
+    setName(n) { kk.reset(); state.name = String(n ?? ""); state.error = null; emit(); },
+    setGeneral(g) { kk.reset(); state.general = g === "none" || g == null ? null : g; emit(); },
     async submit() {
       if (state.busy) return false;
       const name = state.name.trim();
       if (!name) { state.error = "Give the Group a name."; emit(); return false; }
       if (name.length > NAME_MAX) { state.error = `Names are at most ${NAME_MAX} characters.`; emit(); return false; }
+      const k = keyFor(); if (k === undefined) return false;
       state.busy = true; state.error = null; emit();
-      const r = await api.createGroup({ name, general: state.general, ...(newKey ? { key: (key ??= newKey()) } : {}) });
-      state.busy = false;
-      if (r.error) state.error = createErrorText(r.error); else { state.created = r.group; key = null; }
+      let r;
+      try { r = await api.createGroup({ name, general: state.general, ...(k ? { key: k } : {}) }); } finally { state.busy = false; }
+      if (r.error) state.error = createErrorText(r.error); else { state.created = r.group; kk.reset(); }
       emit();
       return !r.error;
     },
@@ -182,7 +191,9 @@ export function createNewGroupModel({ api, newKey = null }) {
  * @param {{ api: SpacesPort, group?: string|null }} o
  */
 export function createNewSpaceModel({ api, group = null, newKey = null }) {
-  let key = null;
+  const kk = keyer(newKey);
+  /** The submit's key made BEFORE the dialog goes busy; `undefined` (with the error shown) when none can be made. */
+  const keyFor = () => { try { return kk.get(); } catch { state.error = "Could not start that. Reload the page and try again."; emit(); return undefined; } };
   const state = { status: "loading", root: false, groups: [], more: false, name: "", group: null, general: "viewer", busy: false, error: null, created: null };
   const subs = new Set();
   const emit = () => { for (const f of [...subs]) f(state); };
@@ -200,19 +211,20 @@ export function createNewSpaceModel({ api, group = null, newKey = null }) {
     },
     /** Can this person make a Space anywhere at all? */
     canCreate() { return state.root || state.groups.length > 0; },
-    setName(n) { key = null; state.name = String(n ?? ""); state.error = null; emit(); },
-    setGroup(id) { key = null; state.group = id || null; emit(); },
-    setGeneral(g) { key = null; state.general = g === "none" || g == null ? null : g; emit(); },
+    setName(n) { kk.reset(); state.name = String(n ?? ""); state.error = null; emit(); },
+    setGroup(id) { kk.reset(); state.group = id || null; emit(); },
+    setGeneral(g) { kk.reset(); state.general = g === "none" || g == null ? null : g; emit(); },
     async submit() {
       if (state.busy || state.status !== "ready") return false;
       const name = state.name.trim();
       if (!name) { state.error = "Give the Space a name."; emit(); return false; }
       if (name.length > NAME_MAX) { state.error = `Names are at most ${NAME_MAX} characters.`; emit(); return false; }
       if (state.group === null && !state.root) { state.error = "Pick a Group: you can't add Spaces outside one."; emit(); return false; }
+      const k = keyFor(); if (k === undefined) return false;
       state.busy = true; state.error = null; emit();
-      const r = await api.createSpace({ name, group: state.group, general: state.general, ...(newKey ? { key: (key ??= newKey()) } : {}) });
-      state.busy = false;
-      if (r.error) state.error = createErrorText(r.error); else { state.created = r.space; key = null; }
+      let r;
+      try { r = await api.createSpace({ name, group: state.group, general: state.general, ...(k ? { key: k } : {}) }); } finally { state.busy = false; }
+      if (r.error) state.error = createErrorText(r.error); else { state.created = r.space; kk.reset(); }
       emit();
       return !r.error;
     },

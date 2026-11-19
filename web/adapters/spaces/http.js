@@ -38,7 +38,10 @@ export function httpSpaces({ fetch, token, base = "", timeoutMs = 10_000, timers
   if (typeof fetch !== "function") throw new TypeError("httpSpaces: fetch is required");
   const set = timers ? timers.set : (fn, ms) => setTimeout(fn, ms);
   const clear = timers ? timers.clear : h => clearTimeout(h);
-  const STATUS = { 400: "invalid", 401: "auth", 403: "forbidden", 404: "notfound", 422: "invalid" };   // 409 in-progress and any 5xx: "unavailable"
+  const STATUS = { 400: "invalid", 401: "auth", 403: "forbidden", 404: "notfound", 409: "in-progress", 422: "invalid" };   // any 5xx: "unavailable"
+  /** A 409 in-progress (PROTOCOL.md "Idempotent creates"): the same key is still being worked on. Retried, bounded, after Retry-After. */
+  const RETRIES = 5, WAIT_MIN = 250, WAIT_MAX = 5000;
+  const retryAfter = res => { const n = Number(res.headers?.get?.("retry-after")); return Math.min(WAIT_MAX, Math.max(WAIT_MIN, Number.isFinite(n) && n > 0 ? n * 1000 : 1000)); };
 
   /** One request: `{ body }` (a parsed 200/201 body), or `{ error }`. Never throws. */
   async function ask(path, method = "GET", json, key = null) {
@@ -51,11 +54,19 @@ export function httpSpaces({ fetch, token, base = "", timeoutMs = 10_000, timers
         res = await fetch(base + path, { method, headers: { authorization: `Bearer ${token}`, ...(json !== undefined ? { "content-type": "application/json" } : {}), ...(typeof key === "string" && key ? { "idempotency-key": key } : {}) },
           ...(json !== undefined ? { body: JSON.stringify(json) } : {}), credentials: "omit", cache: "no-store", redirect: "error", signal: ctl?.signal });
       } catch { return { error: "network" }; }
-      if (STATUS[res?.status]) return { error: STATUS[res.status] };
+      if (STATUS[res?.status]) return { error: STATUS[res.status], ...(res.status === 409 ? { waitMs: retryAfter(res) } : {}) };
       if (res?.status !== 200 && res?.status !== 201) return { error: "unavailable" };
       try { return { body: JSON.parse(await res.text()) }; } catch { return { error: "unavailable" }; }
     })().catch(() => ({ error: "unavailable" }));
     try { return await Promise.race([run, timeout]); } finally { clear(timer); }
+  }
+  /** A create: `ask` with its key, retried (same key) while the server says in-progress, at most RETRIES times. */
+  async function create(path, body, key) {
+    for (let i = 0; ; i++) {
+      const r = await ask(path, "POST", body, key);
+      if (r.error !== "in-progress" || i >= RETRIES) return r.error ? { error: r.error } : r;
+      await new Promise(resolve => set(resolve, r.waitMs));
+    }
   }
   const bad = () => ({ error: "unavailable" });
   const idOk = id => ID.test(id);
@@ -95,18 +106,18 @@ export function httpSpaces({ fetch, token, base = "", timeoutMs = 10_000, timers
       return Array.isArray(r.body?.groups) ? { root: r.body.root === true, groups: list(r.body.groups, 50, grp), more: r.body.more === true } : bad();
     },
     async createBoard({ title, space = null, key }) {
-      const r = await ask("/boards", "POST", { title, ...(space ? { space } : {}) }, key);
+      const r = await create("/boards", { title, ...(space ? { space } : {}) }, key);
       if (r.error) return r;
       return ID.test(r.body?.board?.id) ? { board: { id: r.body.board.id } } : bad();
     },
     async createSpace({ name, group = null, general, key }) {
-      const r = await ask("/spaces", "POST", { name, ...(group ? { group } : {}), ...(general !== undefined ? { general } : {}) }, key);
+      const r = await create("/spaces", { name, ...(group ? { group } : {}), ...(general !== undefined ? { general } : {}) }, key);
       if (r.error) return r;
       const s = info(r.body?.space);
       return s ? { space: s } : bad();
     },
     async createGroup({ name, general, key }) {
-      const r = await ask("/groups", "POST", { name, ...(general !== undefined ? { general } : {}) }, key);
+      const r = await create("/groups", { name, ...(general !== undefined ? { general } : {}) }, key);
       if (r.error) return r;
       const g = grp(r.body?.group);
       return g ? { group: g } : bad();

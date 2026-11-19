@@ -94,6 +94,9 @@ const XCHG_ATTRS = "Path=/; Secure; HttpOnly; SameSite=Strict";
 const DEV_MENU_WAIT_MS = 3000;
 /** The default request deadline (PROTOCOL.md "HTTP request deadline"): under the idle cut (server.js sets 30 s; Bun's own default is 10 s) and the inner limits main.js sets. */
 export const REQUEST_DEADLINE_MS = 8000;
+/** Registry-adapter codes of a call that rolled back before writing (Postgres gate and timeouts); an AdminError is a refusal made before any write. */
+const NO_WRITE = new Set(["queue-timeout", "overloaded", "lock-timeout", "statement-timeout"]);
+const wroteNothing = e => e instanceof AdminError || NO_WRITE.has(e?.code);
 /** `Idempotency-Key`: 8-64 of [A-Za-z0-9_-] (PROTOCOL.md "Idempotent creates"). */
 const IDEM_KEY = /^[A-Za-z0-9_-]{8,64}$/;
 const NO_STORE = { "cache-control": "no-store" };
@@ -397,10 +400,16 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
     catch (e) {
       // The create ran and left a board with no owner: that IS its outcome, with the board's id (a retry gets it back).
       if (e instanceof AdminError && e.code === "owner-grant-failed") out = { status: 503, body: { error: "owner-grant-failed", board: e.board }, ref: { id: e.board, ownerless: true } };
-      else { await registry.idemRelease(user, k, fp).catch(() => {}); throw e; }   // refused or failed with no outcome: the retry runs again
+      else {
+        // Only an error that PROVES nothing was written frees the key (a refusal, or a Postgres call that rolled back before it began). Anything
+        // else (a client-timeout, a dropped connection, a bug) may have committed: the claim stays, so a retry is 409 in-progress until it
+        // expires (PROTOCOL.md "Idempotent creates") instead of making a second object.
+        if (wroteNothing(e)) await registry.idemRelease(user, k, c.claim).catch(() => {});
+        throw e;
+      }
     }
     // If this write fails the claim expires (60 s) and a retry runs again: the same "may have applied" a keyless create has.
-    await registry.idemFinish(user, k, fp, JSON.stringify({ status: out.status, ref: out.ref })).catch(() => {});
+    await registry.idemFinish(user, k, c.claim, JSON.stringify({ status: out.status, ref: out.ref })).catch(() => {});
     return json(out.status, out.body);
   }
 

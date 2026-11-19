@@ -37,7 +37,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
   /** @type {Map<string, Map<string, CustomRole>>} tenant → id → role */ const roles = new Map();
   /** @type {Map<string, Map<string, number>>} user → board → opened at (Recent) */ const recent = new Map();
   /** @type {Map<string, Map<string, number>>} user → board → starred at */ const stars = new Map();
-  /** @type {Map<string, { fp: string, result: string|null, at: number }>} user + "\n" + key → claim or answer (Idempotent creates) */ const idem = new Map();
+  /** @type {Map<string, { fp: string, claim: string, result: string|null, at: number }>} user + "\n" + key → claim or answer (Idempotent creates) */ const idem = new Map();
   let idemCalls = 0;
   const idemLive = (e, t) => e && t - e.at < (e.result === null ? IDEM.claimMs : IDEM.ttlMs);
   const newest = m => [...(m ?? [])].map(([board, at]) => ({ board, at })).sort((a, b) => b.at - a.at || (a.board < b.board ? 1 : -1));
@@ -292,11 +292,12 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const k = user + "\n" + key, t = now(), e = idem.get(k);
       if (++idemCalls % IDEM.every === 0) { let n = 0; for (const [x, v] of idem) if (!idemLive(v, t) && n++ < IDEM.prune) idem.delete(x); }
       if (idemLive(e, t)) return e.fp !== fp ? { state: "mismatch" } : e.result === null ? { state: "in-progress" } : { state: "done", result: e.result };
-      idem.set(k, { fp, result: null, at: t });
-      return { state: "new" };
+      const claim = crypto.randomUUID();
+      idem.set(k, { fp, claim, result: null, at: t });
+      return { state: "new", claim };
     },
-    async idemFinish(user, key, fp, result) { const e = idem.get(user + "\n" + key); if (e && e.fp === fp) { e.result = String(result); e.at = now(); } },
-    async idemRelease(user, key, fp) { const k = user + "\n" + key, e = idem.get(k); if (e && e.fp === fp && e.result === null) idem.delete(k); },
+    async idemFinish(user, key, claim, result) { const e = idem.get(user + "\n" + key); if (e && e.claim === claim) { e.result = String(result); e.at = now(); } },
+    async idemRelease(user, key, claim) { const k = user + "\n" + key, e = idem.get(k); if (e && e.claim === claim && e.result === null) idem.delete(k); },
     /** The stored rows (tests). */ idemSize: () => idem.size,
 
     // ---- Home (PROTOCOL.md § Home) ----

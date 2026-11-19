@@ -146,9 +146,9 @@ export const mint = {
  *   addLinkUse(link: string, user: string): Promise<void>,
  *   linkUses(board: string, user: string): Promise<string[]>,
  *   linkUsesFor?(board: string, users: string[]): Promise<Map<string, string[]>>,   // OPTIONAL batch (below)
- *   idemClaim(user: string, key: string, fp: string): Promise<{ state: "new" } | { state: "done", result: string } | { state: "in-progress" } | { state: "mismatch" }>,   // Idempotent creates (PROTOCOL.md): one atomic step; "new" = the caller now owns the key; a finished row older than IDEM.ttlMs and an unfinished one older than IDEM.claimMs count as absent
- *   idemFinish(user: string, key: string, fp: string, result: string): Promise<void>,   // stores the answer under a claimed key (only while the row is this claim's `fp`)
- *   idemRelease(user: string, key: string, fp: string): Promise<void>,   // drops an UNFINISHED claim of this `fp` (the create wrote nothing); a finished row stays
+ *   idemClaim(user: string, key: string, fp: string): Promise<{ state: "new", claim: string } | { state: "done", result: string } | { state: "in-progress" } | { state: "mismatch" }>,   // Idempotent creates (PROTOCOL.md): one atomic step; "new" = the caller now owns the key and holds `claim`, an unguessable token naming THIS claim; a finished row older than IDEM.ttlMs and an unfinished one older than IDEM.claimMs count as absent (a takeover mints a new token)
+ *   idemFinish(user: string, key: string, claim: string, result: string): Promise<void>,   // stores the answer, only while the row is still `claim`'s (a run that was taken over changes nothing)
+ *   idemRelease(user: string, key: string, claim: string): Promise<void>,   // drops an UNFINISHED row, only while it is still `claim`'s (the create wrote nothing); a finished row, or another claim's, stays
  *   markOpened(user: string, board: string): Promise<void>,   // Home (PROTOCOL.md § Home): Recent. Upserts (user, board) at now(); keeps the user's newest RECENT_KEEP rows; rejects an unknown board
  *   recents(user: string, o?: { limit?: number }): Promise<{ board: string, at: number }[]>,   // newest first; limit default 12, at most RECENT_KEEP
  *   setStarred(user: string, board: string, on: boolean): Promise<void>,   // idempotent; rejects an unknown board when starring; un-starring never rejects
@@ -163,8 +163,8 @@ export const mint = {
  */
 
 /** Home (PROTOCOL.md § Home): rows kept per user in Recent, rows a starred / shared read may return, and the most boards one `boardRows` / `starredAmong` call takes. */
-/** Idempotent creates (PROTOCOL.md): a finished answer is kept `ttlMs`; an unfinished claim can be taken over after `claimMs`; expired rows are pruned `prune` at a time, every `every`-th claim. */
-export const IDEM = Object.freeze({ ttlMs: 24 * 3600_000, claimMs: 60_000, prune: 500, every: 64 });
+/** Idempotent creates (PROTOCOL.md): a finished answer is kept `ttlMs`; an unfinished claim can be taken over after `claimMs` (well above the longest chain of calls one create makes; main.js checks); expired rows are pruned `prune` at a time, every `every`-th claim. */
+export const IDEM = Object.freeze({ ttlMs: 24 * 3600_000, claimMs: 300_000, prune: 500, every: 64 });
 export const HOME = { recentKeep: 50, starScan: 200, sharedScan: 200, batch: 200, searchScan: { default: 1000, max: 5000 }, candidates: { spaces: { default: 100, max: 200 }, groups: { default: 50, max: 100 } } };
 /** The scopes of `accessContexts`: distinct Unit, Group or Space refs, at most HOME.batch. @returns {{ type: string, id: string }[]} */
 export function batchScopes(scopes) {

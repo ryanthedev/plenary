@@ -75,6 +75,7 @@ import { postgresStore } from "./store/postgres.js";
 import { memoryBus } from "./bus/memory.js";
 import { natsBus } from "./bus/nats.js";
 import { postgresRegistry } from "./registry/postgres.js";
+import { IDEM } from "./auth/registry-port.js";
 import { checkLeaseTtl } from "./room-host.js";
 import { diskBlobs } from "./blobs/disk.js";
 import { zlibDeflate } from "./compress/zlib.js";
@@ -145,13 +146,25 @@ export function nodeConfig(env, host = osHostname()) {
     requestDeadlineMs = /^\d{1,10}$/.test(raw) ? Number(raw) : NaN;
     if (!(requestDeadlineMs >= 1 && requestDeadlineMs <= 2 ** 31 - 1)) throw new Error("PLENARY_REQUEST_DEADLINE_MS must be a whole number of milliseconds, at least 1");
   }
-  checkInnerLimits(requestDeadlineMs, { ...(cluster ? { "the Postgres Registry's statement and lock limits": REGISTRY_LIMIT_MS } : {}),
+  checkInnerLimits(requestDeadlineMs, { ...(cluster ? { "the Postgres Registry's statement and lock limits": REGISTRY_LIMIT_MS } : { "the SQLite Registry's busy timeout": SQLITE_BUSY_MS }),
     ...(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET ? { "Google's request timeout": OIDC_TIMEOUT_MS } : {}) });
+  if (!cluster) checkClaimWindow(SQLITE_BUSY_MS);
   return { cluster, node, roles, leaseTtlMs, requestDeadlineMs };
 }
 
 /** The limits main.js gives the adapters a request waits on; each must stay under the request deadline or its 503 would come before the call gives up. */
-export const REGISTRY_LIMIT_MS = 5000, OIDC_TIMEOUT_MS = 3500;
+export const REGISTRY_LIMIT_MS = 5000, OIDC_TIMEOUT_MS = 3500, SQLITE_BUSY_MS = 5000;
+/** The longest chain of Registry calls one keyed create makes (claim, scope reads, create, two owner grants, finish), with room to spare. */
+const CREATE_CHAIN_CALLS = 10;
+/**
+ * Fencing needs a claim to outlive the create that holds it (PROTOCOL.md "Idempotent creates"): refuses to start when IDEM.claimMs is under
+ * CREATE_CHAIN_CALLS of the Registry's longest single call, which is what a stale run could still be doing when a takeover happens.
+ * @param {number} perCallMs
+ */
+export function checkClaimWindow(perCallMs) {
+  if (!(IDEM.claimMs >= CREATE_CHAIN_CALLS * perCallMs))
+    throw new Error(`the idempotency claim window (${IDEM.claimMs} ms) must be at least ${CREATE_CHAIN_CALLS} Registry calls of ${perCallMs} ms: a stale create could outlive its claim`);
+}
 /** Refuses to start when any inner single-call limit is not below the deadline. @param {number} deadlineMs @param {Record<string, number>} limits */
 export function checkInnerLimits(deadlineMs, limits) {
   for (const [what, ms] of Object.entries(limits))
@@ -345,10 +358,10 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   // itself never signs two kinds of thing.
   const blobKey = new Uint8Array(await crypto.subtle.sign("HMAC", await crypto.subtle.importKey("raw", new TextEncoder().encode(cookieKey), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]), new TextEncoder().encode("plenary/blob-url/v1")));
   log.info("node", { node, roles, cluster, leaseTtlMs });
-  const { store, bus, rawRegistry, clusterId } = cluster ? await openCluster(env, node, log, adapters) : {
+  const { store, bus, rawRegistry, clusterId } = cluster ? await openCluster(env, node, log, adapters, requestDeadlineMs) : {
     store: sqliteStore({ path: join(dataDir, "plenary.db"), onSkip: skipped => log.error("checkpoint unreadable: parts missing; stepped back", skipped) }),
     bus: memoryBus({ onError: (err, subject) => log.error("bus subscriber failed", { subject, err }) }),
-    rawRegistry: sqliteRegistry({ path: join(dataDir, "registry.db") }),
+    rawRegistry: sqliteRegistry({ path: join(dataDir, "registry.db"), busyTimeoutMs: SQLITE_BUSY_MS }),
   };
   const registry = announcingRegistry(rawRegistry, bus, log);
   const dev = devAuth(tokens ? { enabled: true, tokens } : undefined);
@@ -497,7 +510,7 @@ function openBlobs(env, dataDir, cluster, log) {
  * The cluster adapters: Postgres store and registry (DATABASE_URL), NATS bus (NATS_URL, named after the node).
  * A failure closes what already opened and throws an Error naming the variable, with every URL part redacted.
  */
-async function openCluster(env, node, log, adapters = {}) {
+async function openCluster(env, node, log, adapters = {}, requestDeadlineMs = REQUEST_DEADLINE_MS) {
   const make = { postgresStore, postgresRegistry, natsBus, ...adapters };
   const urls = [env.DATABASE_URL, env.NATS_URL];
   const opened = [];
@@ -510,7 +523,19 @@ async function openCluster(env, node, log, adapters = {}) {
     }
   };
   const store = await open("Postgres store", "DATABASE_URL", () => make.postgresStore({ url: env.DATABASE_URL, onSkip: skipped => log.error("checkpoint unreadable: parts missing; stepped back", skipped) }));
-  const rawRegistry = await open("Postgres registry", "DATABASE_URL", () => make.postgresRegistry({ url: env.DATABASE_URL, statementTimeoutMs: REGISTRY_LIMIT_MS, lockTimeoutMs: REGISTRY_LIMIT_MS }));
+  const rawRegistry = await open("Postgres registry", "DATABASE_URL", async () => {
+    const r = await make.postgresRegistry({ url: env.DATABASE_URL, statementTimeoutMs: REGISTRY_LIMIT_MS, lockTimeoutMs: REGISTRY_LIMIT_MS });
+    try {
+      // The longest one call can take, as the adapter's gate reports it: its wait for a connection, then the limit, then the backstop.
+      const g = r.gate?.();
+      if (g) {
+        const call = g.queueTimeoutMs + REGISTRY_LIMIT_MS + 1000;
+        checkInnerLimits(requestDeadlineMs, { "the Postgres Registry's longest call (queue wait + limit + 1 s backstop)": call });
+        checkClaimWindow(call);
+      }
+    } catch (err) { await Promise.resolve().then(() => r.close()).catch(() => {}); throw err; }
+    return r;
+  });
   // The cluster id lives in the Store: two nodes on one database are one cluster. It enters the Bus through the
   // adapter's `cluster` option, so every subject on the wire carries it and a foreign cluster on the same NATS can't
   // answer a remote open, take a lease or ack an op (PROTOCOL.md § Bus, Cluster id). A missing or malformed id

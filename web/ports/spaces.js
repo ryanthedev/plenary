@@ -6,6 +6,7 @@
 //   "forbidden"    403: the person may not do that (an unknown or hidden id answers the same)
 //   "notfound"     404: a page read of a Space or Group the person can't open (or that is not there)
 //   "invalid"      400: the server refused the input (the page checks it first, so this is rare)
+//   "in-progress"  409 on a create: its Idempotency-Key is still being worked on (the adapter already retried a few times after Retry-After)
 //   "unavailable"  a 5xx, bad JSON, a body of the wrong shape, or no answer in time
 //   "network"      no answer at all
 //
@@ -23,7 +24,7 @@
 //   Card = { id, title, role, path, starred, can?: { rename } } (as Home's);  `general`: a role name or null (only people added)
 
 /** Every `error` value a call can resolve with. */
-export const SPACES_ERRORS = Object.freeze(["auth", "forbidden", "notfound", "invalid", "unavailable", "network"]);
+export const SPACES_ERRORS = Object.freeze(["auth", "forbidden", "notfound", "invalid", "in-progress", "unavailable", "network"]);
 
 /**
  * @typedef {{ id: string, name: string, personal: boolean, general: string|null, group: { id: string, name: string }|null }} SpaceInfo

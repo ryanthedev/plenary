@@ -2,7 +2,7 @@
 // that must stay under it (checked at start-up), what main.js hands the adapters, and the deadline stats on /health.
 import { test, expect, afterAll, setDefaultTimeout } from "bun:test";
 import { join } from "node:path";
-import { start, checkInnerLimits, nodeConfig, REGISTRY_LIMIT_MS, OIDC_TIMEOUT_MS } from "../../server/main.js";
+import { start, checkInnerLimits, checkClaimWindow, nodeConfig, REGISTRY_LIMIT_MS, OIDC_TIMEOUT_MS, SQLITE_BUSY_MS } from "../../server/main.js";
 import { sqliteStore } from "../../server/store/sqlite.js";
 import { sqliteRegistry } from "../../server/registry/sqlite.js";
 import { memoryBus } from "../../server/bus/memory.js";
@@ -28,8 +28,13 @@ test("PLENARY_REQUEST_DEADLINE_MS: a whole number of ms, at least 1; anything el
 test("start-up refuses a deadline that is not above an inner limit, naming the setting and the limit", () => {
   expect(() => nodeConfig({ ...cluster(), PLENARY_REQUEST_DEADLINE_MS: "5000" })).toThrow(/PLENARY_REQUEST_DEADLINE_MS \(5000 ms\) must be above the Postgres Registry's statement and lock limits \(5000 ms\)/);
   expect(() => nodeConfig({ ...cluster(), PLENARY_REQUEST_DEADLINE_MS: "5001" })).not.toThrow();
-  expect(() => nodeConfig({ ...base(), GOOGLE_CLIENT_ID: "i", GOOGLE_CLIENT_SECRET: "s", PLENARY_REQUEST_DEADLINE_MS: "3500" })).toThrow(/Google's request timeout \(3500 ms\)/);
-  expect(() => nodeConfig({ ...base(), PLENARY_REQUEST_DEADLINE_MS: "100" })).not.toThrow();   // single node, no Google: no inner limit applies
+  expect(() => nodeConfig({ ...base(), GOOGLE_CLIENT_ID: "i", GOOGLE_CLIENT_SECRET: "s", PLENARY_REQUEST_DEADLINE_MS: "3500" })).toThrow(/the SQLite Registry's busy timeout \(5000 ms\)|Google's request timeout \(3500 ms\)/);   // both name a limit not under 3500
+  expect(() => nodeConfig({ ...base(), GOOGLE_CLIENT_ID: "i", GOOGLE_CLIENT_SECRET: "s", PLENARY_REQUEST_DEADLINE_MS: "5001" })).not.toThrow();
+  // L2: a single node's SQLite registry waits up to 5000 ms for a lock, so it is held to the deadline too
+  expect(SQLITE_BUSY_MS).toBe(5000);
+  expect(() => nodeConfig({ ...base(), PLENARY_REQUEST_DEADLINE_MS: "5000" })).toThrow(/the SQLite Registry's busy timeout \(5000 ms\)/);
+  expect(() => nodeConfig({ ...base(), PLENARY_REQUEST_DEADLINE_MS: "5001" })).not.toThrow();
+  expect(() => checkInnerLimits(3500, { "Google's request timeout": OIDC_TIMEOUT_MS })).toThrow(/Google's request timeout \(3500 ms\)/);
   expect(() => checkInnerLimits(10, { a: 9, b: 10 })).toThrow(/\(10 ms\) must be above b \(10 ms\)/);
 });
 
@@ -47,4 +52,23 @@ test("a cluster start passes 5000 ms statement and lock limits to the Postgres R
     const h = await (await fetch(app.server.url + "/health")).json();
     expect(h.http).toEqual({ deadlineMs: 7000, deadline: {}, late: { applied: 0, failed: 0 } });
   } finally { await app?.stop?.(); }
+});
+
+test("L1: a cluster start refuses when the Registry's longest call (queue wait + limit + 1 s backstop, from gate()) is not under the deadline, and closes what opened", async () => {
+  const closed = [];
+  const mk = queueTimeoutMs => ({
+    postgresStore: async () => { const st = sqliteStore({ path: join(tempDir(), "p.db") }); return { ...st, clusterId: async () => "c-0123456789abcdef", close: async () => { closed.push("store"); await st.close(); } }; },
+    postgresRegistry: async () => { const r = sqliteRegistry({ path: join(tempDir(), "r.db") }); return { ...r, gate: () => ({ queueTimeoutMs }), close: async () => { closed.push("registry"); await r.close(); } }; },
+    natsBus: async o => memoryBus({ onError: o.onError, cluster: o.cluster }),
+  });
+  const err = await start({ ...cluster(), PLENARY_REQUEST_DEADLINE_MS: "8000" }, { adapters: mk(3050), write: () => {} }).catch(e => e);   // 3050 + 5000 + 1000 = 9050
+  expect(err.message).toMatch(/PLENARY_REQUEST_DEADLINE_MS \(8000 ms\) must be above the Postgres Registry's longest call .* \(9050 ms\)/);
+  expect(closed.sort()).toEqual(["registry", "store"]);
+  const ok = await start({ ...cluster(), PLENARY_REQUEST_DEADLINE_MS: "8000" }, { adapters: mk(1050), write: () => {} });   // the adapter's own default: 7050
+  await ok.stop();
+});
+
+test("the idempotency claim window must cover a chain of 10 Registry calls: 300000 ms holds for the real limits and refuses a slower adapter", () => {
+  expect(() => checkClaimWindow(7050)).not.toThrow();
+  expect(() => checkClaimWindow(30_001)).toThrow(/claim window \(300000 ms\) must be at least 10 Registry calls of 30001 ms/);
 });

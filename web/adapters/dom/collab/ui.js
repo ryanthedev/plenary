@@ -285,7 +285,7 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
       replace(pop.head,
         t.resolved ? [h("span", {}, "✓"), h("b", {}, `Resolved by ${t.resolved.name ?? "someone"}`)] : h("span.anchor", {}, anchorText(t)),
         h("span.spacer"),
-        t.canResolve ? h("button.btn", { "data-fk": `thread:${t.id}:resolve`, disabled: t.statePending, onclick: () => recordOp(t.resolved ? "reopen" : "resolve", { do: t.resolved ? "reopen" : "resolve", id: t.id }) }, t.resolved ? "Reopen" : "✓ Resolve") : null,
+        t.canResolve ? h("button.btn", { "data-fk": `thread:${t.id}:resolve`, "aria-disabled": t.statePending ? "true" : null, onclick: () => !t.statePending && recordOp(t.resolved ? "reopen" : "resolve", { do: t.resolved ? "reopen" : "resolve", id: t.id }) }, t.resolved ? "Reopen" : "✓ Resolve") : null,
         h("button.tb", { title: "Close", onclick: () => openThread(null) }, "✕"));
       replace(pop.body, t.resolved || t.detached ? h("div.anchor.muted", {}, anchorText(t)) : null, t.comments.map(c => message(t, c)));
       restoreFocus(held);

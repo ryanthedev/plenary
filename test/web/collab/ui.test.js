@@ -298,6 +298,13 @@ test("Resolve / Reopen is one control with one key: it keeps focus when its labe
     f.doc.activeElement = resolve(); resolve().click();
     expect(resolve().textContent).toContain("Reopen");                                        // the label flipped and the head was rebuilt ...
     expect(f.doc.activeElement).toBe(resolve());                                              // ... focus is on the new button, same key
+    expect(resolve().disabled).toBeFalsy();                                                   // while the change is pending it is aria-disabled, never `disabled` (that would blur it)
+    expect(resolve().getAttribute("aria-disabled")).toBe("true");
+    const n = port.log.length; resolve().click();
+    expect(port.log.length).toBe(n);                                                          // and a second press is ignored
+    port.ackAll();
+    expect(resolve().getAttribute("aria-disabled")).toBe(null);
+    expect(f.doc.activeElement).toBe(resolve());
   } finally { f.restore(); collab.destroy(); }
 });
 

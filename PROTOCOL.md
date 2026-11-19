@@ -639,7 +639,8 @@ record.
   creates one; a user whose domain has no tenant is a guest everywhere.
 - **Everyone signs in with Google.** A share-link guest signs in first, then redeems the link: there are no
   anonymous guests, so every connection has a verified `user`.
-- **Roles** (computed by Auth from the Registry): the highest of an explicit grant on that board (the creator gets
+- **Roles** (computed by Auth from the Registry; § Organization, after this list, widens the sources to Spaces, Groups, Teams and the
+  Unit, and is the rule today): the highest of an explicit grant on that board (the creator gets
   `owner`), a live invite to the user's **authoritative email**, a live share link the user redeemed, and — for a
   member of the tenant's Workspace domain (the `hd` claim, never the email) — the board's **`memberRole`**, set at
   `POST /boards`, default `viewer` (a reversible choice; `null` = members get nothing by membership). A user from
@@ -655,7 +656,9 @@ record.
   address is never authoritative (it has no `hd`), so that user needs a grant or a share link.
 - **`owner`:** the board's creator gets it at `POST /boards`. After that, **only a tenant admin may grant
   `owner`**; invites, share links and `memberRole` never give it. This is enforced by the admin layer
-  (server/admin), not by the Registry. A board always keeps at least one owner (§ Registry).
+  (server/admin), not by the Registry. A board always keeps at least one owner (§ Registry). The design also lets a
+  Space or Group owner grant `owner` inside it (the `transfer` permission, § Organization); that is enforced when the
+  routes for it exist, and until then only a tenant admin may.
 - **`POST /boards`** takes its tenant from the caller's verified identity (their Workspace domain's tenant),
   never from the request body, and the caller must be an **admin of that tenant** (server/admin checks it again).
   A caller with no tenant (a gmail user, a guest) gets `forbidden`. Admin calls that name only an id
@@ -665,6 +668,75 @@ record.
 - Nothing a client sends can reach another tenant: `hello` names a board (the server finds its tenant), record
   anchors and element ids are board-local, and a blob URL is minted only for a board the requester has a role on,
   in that board's tenant.
+
+### Organization (Units, Groups, Spaces, Teams)
+
+Boards are organized as **Unit > Group > Space > Board**. Design: design/orgs/JOURNEY.md (§ 1, 2). The Registry stores it
+(§ Registry, "Organization"); the resolver below turns it into access. Nothing here adds an HTTP route or UI: those are
+the later board-organization issues.
+
+- **Unit** = today's tenant, plus a `kind` label (`company` | `enterprise`) and **one or more Workspace domains**
+  (`tenant.domains`; `tenant.domain` stays the first). A domain belongs to at most one tenant. Units don't nest, so the
+  tenant wall (store keys, blob keys, bus subjects) is unchanged. A Unit **member** is an identity whose `hd` is one of
+  its domains.
+- **Group**: a named shelf of Spaces (one level: Groups don't nest). **Space**: holds boards; it sits in one Group or at
+  the Unit root. Both carry **general access**: `generalRole`, the role "everyone in the Unit" gets (members only, never
+  `owner`; null = only people added). A board keeps its own general access in `memberRole` (§ Tenancy above): the same
+  meaning, widened. A board lives in at most one Space (`board.space`; null = *unfiled*, which is every board made before
+  Spaces existed).
+- **Personal space**: a Space with an `owner` (one per member per Unit, made by `ensurePersonalSpace`), private
+  (`generalRole` null), the member its owner. **Team**: a named set of Unit members.
+- **Scoped grants**: a role for a user or a Team on a Unit, Group, Space or board (`setScopedGrant`). A user's own grant on
+  a board stays in `grants` (`setGrant`), so the room's path and the last-owner rule are unchanged. A Group or Space keeps
+  at least one `owner` grant (a user's or a Team's), atomically, like a board (the Unit's admins are the backstop and aren't counted).
+- **Roles are named sets of permissions; the server checks permissions, never role names.** Built-in, fixed: the ladder
+  `viewer < commenter < annotator < editor < owner` at Group, Space and board scope, and at the Unit **admin** and
+  **member** (member is editable). A **custom role** (per Unit) carries exactly **one board-content ladder role**
+  (viewer..editor) plus management permissions; it is made by duplicating a built-in role and can be granted at any
+  scope. Only the ladder role reaches a room: **a connection gets one ladder role**, as before.
+
+**Permissions** (`server/auth/permissions.js`): `board.view`, `board.comment`, `board.annotate`, `board.edit` (board content:
+cumulative up the ladder) and the management permissions `board.create`, `space.create`, `members.manage`, `move`, `delete`,
+`transfer`, `roles.manage`. A role held at a scope gives its permissions *within that scope* (a role on a container
+covers everything inside it), clipped to what exists there: `roles.manage` only at the Unit; `space.create` at the Unit
+and Groups; `board.create` at the Unit, Groups and Spaces; a board has only the ladder plus `members.manage`, `move`, `delete`
+and `transfer`. Built-ins: `owner` = the four content permissions plus `board.create`, `space.create`, `members.manage`,
+`move`, `delete`, `transfer`; `editor` = content plus `board.create`, `space.create`; `annotator`, `commenter`, `viewer` =
+content only; Unit `admin` = every management permission (and board content only where the deployment sets
+`adminBoardContent`, below); Unit `member` = `space.create` until an admin edits it.
+
+**Resolution** (`server/auth/resolver.js`, pure). An identity's access to a board (or to a Space, Group or the Unit) is
+the **union** of what every source grants; for the ladder that is the highest. There are **no deny rules**, so a board
+is never more private than its Space. Sources, in this order, each reported with where it came from:
+
+1. **direct**: the user's own grant on the board (`grants`), then on its Space, then on that Space's Group, then on the Unit.
+2. **team**: a Team the user is in, granted on the same scopes (reports the Team).
+3. **general**: "everyone in the Unit" on the board (`memberRole`), the Space and the Group, for Unit members only.
+4. **invite**: a live invite to the user's authoritative email (board scope; role capped below `owner`).
+5. **link**: a live share link the user redeemed (board scope; within viewer, annotator, editor).
+6. **unit**: Unit admin (the tenant's `admins`), then the Unit member role for members. A role stored on the Unit.
+
+The answer is `{ ladder, permissions, sources, until }`: `ladder` is the one role the room gets (null = none = `auth`),
+`permissions` the union, each `source` is `{ kind, scope: { type, id }, role, team?, permissions, ladder }` (the UI's
+"Viewer via Infra team on Space Platform"), `until` the soonest invite or link expiry (the answer can change then
+without a message). Stored roles are never trusted: an unknown role, a role not valid at its scope, an `owner` through
+general access, invite or link counts for nothing or is capped. **Unit admin and rooms:** today an admin manages every
+board of the Unit but enters a room only through a role. The resolver keeps that (admin's board-content permissions and
+ladder `owner` are off unless the deployment sets `adminBoardContent`), so no one's access changes by upgrading.
+
+**Defaults.** A personal space is private (`generalRole` null) and its owner owns it. A new Space gives `viewer` (its
+creator may pick none). A new board in a Space has `memberRole` null, so it **inherits** the Space; a board made without
+a Space keeps today's `memberRole` default (`viewer`).
+
+**Migration.** Adding the organization changes no one's access. The Registry only *adds* tables (§ Registry,
+"Organization"); existing tenants read as `company` with their one domain, existing boards stay unfiled with their
+`memberRole`, grants, invites and links untouched, and no Space, Group, Team, scoped grant or role exists until someone
+creates it. So the resolver's answer for every identity on every pre-existing board is the old rule's. Re-running
+start-up is a no-op. test/auth/legacy-migration.js proves it on SQLite and Postgres.
+
+**Freshness.** The resolver reads live. A scoped-grant or Team change is not yet announced on `.grants` (that message is
+per board, § Bus): live connections pick it up on the next timed re-check (≤ 60 s), a cached hello role within the cache's
+30 s. The routes that make such changes (later issues) announce a change for every board in the scope.
 
 ## Sign-in code exchange
 
@@ -753,11 +825,12 @@ method names are stable. Ids are server-minted over `[a-z0-9-]`.
 
 | Area | Calls |
 |---|---|
-| tenants | `createTenant({ domain, admins })`, `tenant(id)`, `tenantByDomain(domain)` (Workspace domain → tenant), `addTenantAdmin(tenant, user)` |
-| boards | `createBoard({ tenant, title, memberRole }) → { id, tenant, title, memberRole, createdAt }`, `board(id) → { tenant, title, memberRole, … } \| null` |
+| tenants | `createTenant({ domain, domains, kind, admins })` (`kind` default `company`), `tenant(id) → { id, domain, domains, kind, admins, createdAt }`, `tenantByDomain(domain)` (any of the Unit's domains → tenant), `addTenantAdmin(tenant, user)`, `addTenantDomain(tenant, domain)` |
+| boards | `createBoard({ tenant, title, memberRole, space }) → { id, tenant, title, memberRole, space, createdAt }`, `board(id) → { tenant, title, memberRole, space, … } \| null` (`space` null = unfiled) |
 | grants | `setGrant(board, user, role \| null)`, `grant(board, user) → role \| null`, `grants(board)` |
 | invites | `createInvite({ board, email, role, expiresAt, by })`, `invite(id)`, `invites(board)`, `invitesFor(board, email)`, `revokeInvite(id)` |
 | share links | `createLink({ board, role, expiresAt, by })` (role per link), `link(id)`, `links(board)`, `revokeLink(id)`, `addLinkUse(link, user)`, `linkUses(board, user)` |
+| organization | `createGroup`, `group`, `groups`; `createSpace`, `space`, `spaces`, `ensurePersonalSpace(tenant, user)`; `createTeam`, `team`, `teams`, `setTeamMember`, `teamMembers`; `setScopedGrant({ scope, subject, role \| null })`, `scopedGrants(scope)`; `createRole`, `updateRole`, `role`, `roles`; `accessContext(scope)` |
 
 Single node: SQLite; cluster: Postgres. The room never calls it; gateways and Auth do. On Postgres the server
 runs as a role that doesn't own the schema (§ Store, Least privilege).
@@ -776,6 +849,20 @@ runs as a role that doesn't own the schema (§ Store, Least privilege).
   `owner` anyway. A tenant admin repairs it with `setGrant(board, user, "owner")` (they manage every board of
   their tenant). Guaranteed: no ownerless board is reported as created. May happen: an ownerless board until an
   admin repairs it.
+- **Organization** (§ Tenancy, "Organization"). `accessContext({ type: "board"|"space"|"group"|"unit", id })` is the
+  resolver's one read: the tenant, the scope's board / Space / Group, the grants on each scope of the chain, the Unit's
+  roles, and the members of every Team named in those grants, as one consistent answer (null for an unknown scope). Its
+  cost is a **fixed number of statements** however many grants, Teams or members exist, and it never takes a list of
+  boards: the resolver makes no per-row follow-up queries. Who owns what: the Registry owns every row; the resolver owns
+  no state (it is a function of what it is handed); `tenancy` owns no state beyond `roleCache`'s bounded entries.
+  Adapters validate shape (names, scope and subject types, same tenant) and store role strings as given; whether a role
+  is valid where it is held is `server/auth/permissions.js`'s rule, applied by the admin layer on write and by the
+  resolver on read.
+- **Postgres tables** (all created only if missing, like the first seven; nothing is ever altered): `reg_tenant_meta` (kind),
+  `reg_tenant_domains` (a Unit's domains after its first, which stays in `reg_tenants.domain`; a domain is unique across both,
+  serialised by an advisory lock), `reg_groups`, `reg_spaces` (unique `(tenant, owner_user)`: one personal space per member),
+  `reg_board_spaces` (a board's Space; no row = unfiled), `reg_teams`, `reg_team_members`, `reg_scope_grants` (scope, subject,
+  role), `reg_roles` (custom roles and the Unit's `member` override). SQLite has the same tables with the same names.
 - `memberRole` may be `null` (§ Tenancy). Calls keyed by an id alone carry no tenant: the admin API checks it
   (§ Tenancy).
 

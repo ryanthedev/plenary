@@ -72,8 +72,13 @@ export function pillPopover({ pill, explain, board, access = null, newKey = null
     if (refocus) pill.focus?.();
   };
   const onKey = e => { if (e.key === "Escape") { e.stopPropagation(); close(); } };
-  // Tabbing out of the popover (it is non-modal) closes it, as a click outside does; focus going nowhere (window blur) leaves it open.
-  const onOut = e => { const to = e.relatedTarget; if (pop && to && !pop.contains(to) && !pill.contains(to)) close(false); };
+  // Tabbing out of the popover (it is non-modal) closes it, as a click outside does. Tabbing past its last control lands on nothing (relatedTarget null), which only
+  // counts as leaving while the page still has focus; a window blur (the document lost focus) leaves it open so coming back finds it.
+  const onOut = e => {
+    const to = e.relatedTarget;
+    if (!pop || (to && (pop.contains(to) || pill.contains(to)))) return;
+    if (to || document.hasFocus?.() !== false) close(false);
+  };
   const onDown = e => { if (pop && !pop.contains(e.target) && !pill.contains(e.target)) close(false); };
   async function open() {
     if (pop || !explain) return;

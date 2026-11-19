@@ -1188,8 +1188,14 @@ test("#51 the non-modal pill popover closes when focus tabs out of it, but not w
   expect(pop()).toBeTruthy();
   pop().fire("focusout", { relatedTarget: pill });               // back to the pill
   expect(pop()).toBeTruthy();
+  const hasFocus = page.doc.hasFocus; page.doc.hasFocus = () => false;
   pop().fire("focusout", { relatedTarget: null });               // the window lost focus: stays
   expect(pop()).toBeTruthy();
+  page.doc.hasFocus = () => true;
+  pop().fire("focusout", { relatedTarget: null });               // tabbed past the last control onto nothing, page still focused: closes
+  expect(pop()).toBeUndefined();
+  page.doc.hasFocus = hasFocus;
+  pill.click(); await settleP();
   pop().fire("focusout", { relatedTarget: page.byId.topbar });   // somewhere else on the page
   expect(pop()).toBeUndefined();
   expect(pill.getAttribute("aria-expanded")).toBe("false");

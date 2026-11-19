@@ -12,13 +12,13 @@ import { shell, showNotice, gate, message } from "./spaces.js";
 import { createPickerModel, sizeText, viaText, generalLine, SCOPE_NOUN } from "../../core/access.js";
 
 /** A button that is "disabled" without leaving the tab order: clicks are ignored while it says so. */
-const act = (attrs, text, on, isOff) => h("button.btn", { type: "button", ...attrs, onclick: e => { if (e.currentTarget.getAttribute("aria-disabled") === "true" || isOff?.()) { e.preventDefault?.(); return; } on(e); } }, text);
-const setOff = (el, off) => el.setAttribute("aria-disabled", off ? "true" : "false");
+export const act = (attrs, text, on, isOff) => h("button.btn", { type: "button", ...attrs, onclick: e => { if (e.currentTarget.getAttribute("aria-disabled") === "true" || isOff?.()) { e.preventDefault?.(); return; } on(e); } }, text);
+export const setOff = (el, off) => el.setAttribute("aria-disabled", off ? "true" : "false");
 /**
  * Run a render and say what a change did. The keeper may also announce a focus fallback ("That person is no longer here; moved to the next one."): both
  * are said as ONE sentence pair, so the fallback does not overwrite the confirmation.
  */
-const speak = (S, draw) => {
+export const speak = (S, draw) => {
   const say = S.said; S.said = null;
   if (!say) { draw(); return; }
   announce("");
@@ -26,7 +26,7 @@ const speak = (S, draw) => {
   const fb = announced();
   announce(fb ? `${say}. ${fb}` : say);
 };
-const quiet = S => { if (S.said) { announce(S.said); S.said = null; } };
+export const quiet = S => { if (S.said) { announce(S.said); S.said = null; } };
 const subjectKey = s => `${s.type}:${s.id}`;
 const who = (s, keys, extra = "") => keys.mark(h("span.who", { tabindex: "-1" }, s.name, extra ? h("small", {}, ` ${extra}`) : null), `who:${subjectKey(s)}`);
 

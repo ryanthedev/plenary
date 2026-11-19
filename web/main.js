@@ -26,8 +26,11 @@ import { mountHome } from "./adapters/dom/home.js";
 import { createHomeModel } from "./core/home.js";
 import { httpSpaces } from "./adapters/spaces/http.js";
 import { mountSpacePage, mountGroupPage } from "./adapters/dom/spaces.js";
-import { createDialogs } from "./adapters/dom/dialogs.js";
+import { createDialogs, randomKey } from "./adapters/dom/dialogs.js";
 import { httpAccess } from "./adapters/access/http.js";
+import { httpRoles } from "./adapters/roles/http.js";
+import { mountRolesPage } from "./adapters/dom/roles.js";
+import { createRolesModel } from "./core/role-admin.js";
 import { mountTeamsPage, mountTeamPage, mountAccessPage } from "./adapters/dom/access.js";
 import { createTeamsModel, createTeamModel, createAccessModel } from "./core/access.js";
 import { createPageModel } from "./core/spaces.js";
@@ -69,7 +72,7 @@ if (back) { q.set("board", back); history.replaceState(history.state, "", `${loc
 // A link with no board lands on Home (everyone, a dev user included): Recent, Starred, Shared with me, the Space tree, search.
 const board = asked ?? back;
 const idParam = name => (/^[\w-]{1,64}$/.test(q.get(name) ?? "") ? q.get(name) : null);
-const spaceId = idParam("space"), groupId = idParam("group"), teamId = idParam("team"), teamsPage = q.has("teams");
+const spaceId = idParam("space"), groupId = idParam("group"), teamId = idParam("team"), teamsPage = q.has("teams"), rolesPage = q.has("roles");
 const accessArg = /^(unit|group|space|board):([\w-]{1,64})$/.exec(q.get("access") ?? "");
 /** A link to another page of this app, keeping the theme. */
 const hrefTo = params => `?${new URLSearchParams({ ...params, ...(theme0 ? { theme: theme0 } : {}) })}`;
@@ -93,9 +96,13 @@ if (!signIn.token) {
   const fetchNow = (...a) => globalThis.fetch(...a);
   const spacesApi = httpSpaces({ fetch: fetchNow, token: signIn.token, timers: clock });
   const hrefs = { home: location.pathname, board: id => hrefTo({ board: id }), space: id => hrefTo({ space: id }), group: id => hrefTo({ group: id }),
-    team: id => hrefTo({ team: id }), teams: hrefTo({ teams: "1" }), access: (type, id) => hrefTo({ access: `${type}:${id}` }) };
+    team: id => hrefTo({ team: id }), teams: hrefTo({ teams: "1" }), roles: hrefTo({ roles: "1" }), access: (type, id) => hrefTo({ access: `${type}:${id}` }) };
   const dialogs = createDialogs({ host: root, api: spacesApi, hrefs, go: href => location.assign(href) });
-  if (teamId || teamsPage || accessArg) {
+  if (rolesPage) {
+    // The Roles screen (PROTOCOL.md § Roles): the server answers 404 to a caller without roles.manage, which shows the same "not available" page.
+    const model = createRolesModel({ api: httpRoles({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey() });
+    mountRolesPage({ root, model, hrefs, signIn: signInLink }); hideGate(); model.load();
+  } else if (teamId || teamsPage || accessArg) {
     // Teams, a Team, or the access page of a scope (PROTOCOL.md § Teams and access). An id the person can't open shows the same "not available" page as one that does not exist.
     const api = httpAccess({ fetch: fetchNow, token: signIn.token, timers: clock });
     if (teamsPage) { const model = createTeamsModel({ api }); mountTeamsPage({ root, model, hrefs, signIn: signInLink }); hideGate(); model.load(); }
@@ -110,7 +117,7 @@ if (!signIn.token) {
   } else {
     const model = createHomeModel({ api: httpHome({ fetch: fetchNow, token: signIn.token, timers: clock }), clock });
     mountHome({ root, model, clock, signIn: signInLink, homeHref: location.pathname, dialogs,
-      boardHref: hrefs.board, spaceHref: hrefs.space, groupHref: hrefs.group, teamsHref: hrefs.teams, unitAccessHref: id => hrefs.access("unit", id) });
+      boardHref: hrefs.board, spaceHref: hrefs.space, groupHref: hrefs.group, teamsHref: hrefs.teams, rolesHref: hrefs.roles, unitAccessHref: id => hrefs.access("unit", id) });
     hideGate();
     model.load();
   }

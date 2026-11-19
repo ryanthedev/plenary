@@ -47,11 +47,12 @@ export function registryContract(name, makeRegistry, opts = {}) {
           group: i => r.createGroup({ tenant: t.id, name: "G", owner: U, idem: i }),
           space: i => r.createSpace({ tenant: t.id, name: "S", owner: U, idem: i }),
           team: i => r.createTeam({ tenant: t.id, name: "Tm", idem: i }),
+          role: i => r.createRole({ tenant: t.id, name: "Rl", boardRole: "viewer", permissions: ["move"], idem: i }),
           invite: i => r.createInvite({ board: b.id, email: "x@y.com", role: "viewer", by: U, idem: i }),
           link: i => r.createLink({ board: b.id, role: "viewer", by: U, idem: i }),
         };
       };
-      const KINDS_ = ["board", "group", "space", "team", "invite", "link"];
+      const KINDS_ = ["board", "group", "space", "team", "role", "invite", "link"];
 
       for (const kind of KINDS_) {
         test(`${kind}: the first create stores the key with its id; a repeat rejects idem-replay naming that id and creates nothing; another fingerprint is idem-mismatch`, async () => {
@@ -80,6 +81,20 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect(await r.idemGet(idem())).toEqual({ state: "none" });
         expect(await r.idemSize()).toBe(0);
         expect((await r.createBoard({ tenant: t.id, idem: idem() })).id).toBeTruthy();
+      });
+      test("role: a create refused by the cap leaves no key; a replay of a role that fit is a replay even when the Unit is full now; concurrent same key makes one role", async () => {
+        const { t } = await tenantWithBoard();
+        await r.createRole({ tenant: t.id, name: "A", boardRole: "viewer", max: 1 });
+        await expect(r.createRole({ tenant: t.id, name: "B", boardRole: "viewer", max: 1, idem: idem() })).rejects.toMatchObject({ code: "limit" });
+        expect(await r.idemGet(idem())).toEqual({ state: "none" });
+        expect(await r.idemSize()).toBe(0);
+        const made = await r.createRole({ tenant: t.id, name: "B", boardRole: "viewer", max: 2, idem: idem() });
+        await expect(r.createRole({ tenant: t.id, name: "B", boardRole: "viewer", max: 2, idem: idem() })).rejects.toMatchObject({ code: "idem-replay", ref: made.id });   // full now: still a replay
+        await expect(r.createRole({ tenant: t.id, name: "B", boardRole: "viewer", max: 2, idem: idem({ fp: FP2 }) })).rejects.toMatchObject({ code: "idem-mismatch" });
+        const out = await Promise.allSettled(Array.from({ length: 6 }, () => r.createRole({ tenant: t.id, name: "C", boardRole: "viewer", idem: idem({ key: "key-0009-cccc" }) })));
+        expect(out.filter(o => o.status === "fulfilled")).toHaveLength(1);
+        for (const l of out.filter(o => o.status === "rejected")) expect(l.reason).toMatchObject({ code: "idem-replay" });
+        expect((await r.roles(t.id)).map(x => x.name).sort()).toEqual(["A", "B", "C"]);
       });
       test("keys are per user and per key: another user, or another key, is independent", async () => {
         const c = await creates();
@@ -488,8 +503,9 @@ export function registryContract(name, makeRegistry, opts = {}) {
         await r.setScopedGrant({ scope, subject: { type: "team", id: tm.id }, role: null });
         expect(await r.scopedGrants(scope)).toHaveLength(1);
         await r.setScopedGrant({ scope: { type: "board", id: b.id }, subject: { type: "team", id: tm.id }, role: "editor" });
-        await r.setScopedGrant({ scope: { type: "unit", id: t.id }, subject: { type: "team", id: tm.id }, role: "r-whatever" });
-        expect((await r.scopedGrants({ type: "unit", id: t.id }))[0].role).toBe("r-whatever");
+        const cr = await r.createRole({ tenant: t.id, name: "Cr", boardRole: "viewer" });
+        await r.setScopedGrant({ scope: { type: "unit", id: t.id }, subject: { type: "team", id: tm.id }, role: cr.id });
+        expect((await r.scopedGrants({ type: "unit", id: t.id }))[0].role).toBe(cr.id);
         await expect(r.setScopedGrant({ scope: { type: "board", id: b.id }, subject: { type: "user", id: "google:ann" }, role: "editor" })).rejects.toThrow();
         await expect(r.setScopedGrant({ scope, subject: { type: "team", id: foreign.id }, role: "viewer" })).rejects.toThrow();
         await expect(r.setScopedGrant({ scope: { type: "space", id: "s-nope00000000" }, subject: { type: "user", id: "x" }, role: "viewer" })).rejects.toThrow();
@@ -832,6 +848,86 @@ export function registryContract(name, makeRegistry, opts = {}) {
         await expect(r.updateRole(t.id, "r-nope00000000", { name: "x" })).rejects.toThrow();
         await expect(r.updateRole("t-nope00000000", "member", {})).rejects.toThrow();
         await expect(r.createRole({ tenant: t.id, name: "", boardRole: "viewer" })).rejects.toThrow();
+      });
+
+      test("roles (#50): createRole max is exact and ignores the member override; deleteRole is refused while any grant holds the role, never the member role; roleUsage counts to cap + 1", async () => {
+        const t = await unit(), u = await r.createTenant({ domain: "globex.com" });
+        await r.updateRole(t.id, "member", { permissions: [] });                       // the override does not count against max
+        const a = await r.createRole({ tenant: t.id, name: "A", boardRole: "viewer", max: 2 });
+        await r.createRole({ tenant: t.id, name: "B", boardRole: "viewer", max: 2 });
+        await expect(r.createRole({ tenant: t.id, name: "C", boardRole: "viewer", max: 2 })).rejects.toMatchObject({ code: "limit" });
+        expect((await r.roles(t.id)).length).toBe(3);
+        await r.createRole({ tenant: u.id, name: "A2", boardRole: "viewer", max: 2 });  // another Unit's roles are not counted
+        const sp = await r.createSpace({ tenant: t.id, name: "S" }), sp2 = await r.createSpace({ tenant: t.id, name: "S2" });
+        const team = await r.createTeam({ tenant: t.id, name: "T" });
+        const grant = (scope, subject, role) => r.setScopedGrant({ scope, subject, role });
+        await grant({ type: "space", id: sp.id }, { type: "user", id: "google:x" }, a.id);
+        await grant({ type: "space", id: sp2.id }, { type: "team", id: team.id }, a.id);
+        await grant({ type: "unit", id: t.id }, { type: "user", id: "google:y" }, a.id);
+        const use = await r.roleUsage(t.id, [a.id, "r-none00000000"]);
+        expect(use.get(a.id)).toEqual({ places: 3, users: 2, teams: [team.id] });
+        expect(use.get("r-none00000000")).toEqual({ places: 0, users: 0, teams: [] });
+        expect((await r.roleUsage(t.id, [a.id], { cap: 2 })).get(a.id)).toMatchObject({ places: 3, users: 2 });   // cap + 1: "more than 2"
+        expect((await r.roleUsage(t.id, [a.id], { cap: 1 })).get(a.id)).toMatchObject({ places: 2, users: 2 });
+        await expect(r.deleteRole(t.id, a.id)).rejects.toMatchObject({ code: "in-use" });
+        expect(await r.role(t.id, a.id)).toMatchObject({ id: a.id });                 // nothing changed
+        await grant({ type: "space", id: sp.id }, { type: "user", id: "google:x" }, null);
+        await grant({ type: "space", id: sp2.id }, { type: "team", id: team.id }, null);
+        await expect(r.deleteRole(t.id, a.id)).rejects.toMatchObject({ code: "in-use" });   // the Unit grant still holds it
+        await grant({ type: "unit", id: t.id }, { type: "user", id: "google:y" }, null);
+        await expect(r.deleteRole(u.id, a.id)).rejects.toThrow("no such role");        // another Unit's id is no role
+        await r.deleteRole(t.id, a.id);
+        expect(await r.role(t.id, a.id)).toBe(null);
+        await expect(r.deleteRole(t.id, a.id)).rejects.toThrow("no such role");
+        await expect(r.deleteRole(t.id, "member")).rejects.toThrow("bad role");
+        await r.createRole({ tenant: t.id, name: "C", boardRole: "viewer", max: 2 });  // a slot is free again
+      });
+
+      test("roles (#50): a custom role id is grantable only in its own Unit (code no-role, every scope kind, both subject kinds); usage counts this Unit's grants", async () => {
+        const t = await unit(), u = await r.createTenant({ domain: "globex.com" });
+        const a = await r.createRole({ tenant: t.id, name: "A", boardRole: "viewer" });
+        const ts = await r.createSpace({ tenant: t.id, name: "TS" }), us = await r.createSpace({ tenant: u.id, name: "US" });
+        const ug = await r.createGroup({ tenant: u.id, name: "UG" }), ub = await r.createBoard({ tenant: u.id, space: us.id });
+        const uteam = await r.createTeam({ tenant: u.id, name: "UT" });
+        const user = id => ({ type: "user", id }), team = { type: "team", id: uteam.id };
+        for (const [scope, subject] of [[{ type: "space", id: us.id }, user("google:o1")], [{ type: "group", id: ug.id }, team], [{ type: "unit", id: u.id }, user("google:o2")], [{ type: "board", id: ub.id }, team]])
+          expect((await r.setScopedGrant({ scope, subject, role: a.id }).catch(e => e)).code).toBe("no-role");     // another Unit's role id
+        expect((await r.setScopedGrant({ scope: { type: "space", id: ts.id }, subject: user("google:t1"), role: "r-nosuchrole1" }).catch(e => e)).code).toBe("no-role");
+        expect(await r.scopedGrants({ type: "space", id: us.id })).toEqual([]);
+        expect((await r.roleUsage(u.id, [a.id])).get(a.id)).toEqual({ places: 0, users: 0, teams: [] });
+        await r.setScopedGrant({ scope: { type: "space", id: ts.id }, subject: user("google:t1"), role: a.id });
+        expect((await r.roleUsage(t.id, [a.id])).get(a.id)).toEqual({ places: 1, users: 1, teams: [] });
+        await r.setScopedGrant({ scope: { type: "space", id: ts.id }, subject: user("google:t1"), role: null });
+        await r.deleteRole(t.id, a.id);
+        expect((await r.setScopedGrant({ scope: { type: "space", id: ts.id }, subject: user("google:t1"), role: a.id }).catch(e => e)).code).toBe("no-role");   // a grant cannot land on the role just deleted
+        expect(await r.scopedGrants({ type: "space", id: ts.id })).toEqual([]);
+        await expect(r.roleUsage(t.id, ["member"])).rejects.toThrow("bad role");
+        await expect(r.roleUsage(t.id, [a.id, "member"])).rejects.toThrow("bad role");
+      });
+
+      test("roles (#50): roleUsage counts DISTINCT users (one person in many places is one), Teams by id, places as rows", async () => {
+        const t = await unit();
+        const a = await r.createRole({ tenant: t.id, name: "A", boardRole: "viewer" });
+        const sps = [];
+        for (let i = 0; i < 4; i++) sps.push(await r.createSpace({ tenant: t.id, name: `S${i}` }));
+        const tm = await r.createTeam({ tenant: t.id, name: "T" });
+        for (const sp of sps) await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "user", id: "google:one" }, role: a.id });
+        await r.setScopedGrant({ scope: { type: "space", id: sps[0].id }, subject: { type: "user", id: "google:two" }, role: a.id });
+        await r.setScopedGrant({ scope: { type: "space", id: sps[1].id }, subject: { type: "team", id: tm.id }, role: a.id });
+        await r.setScopedGrant({ scope: { type: "space", id: sps[2].id }, subject: { type: "team", id: tm.id }, role: a.id });
+        expect((await r.roleUsage(t.id, [a.id])).get(a.id)).toEqual({ places: 7, users: 2, teams: [tm.id] });
+        expect((await r.roleUsage(t.id, [a.id], { cap: 1 })).get(a.id)).toMatchObject({ places: 2, users: 2 });     // counted to cap + 1
+      });
+
+      test("memberCount counts the directory to cap + 1, per Unit", async () => {
+        const t = await unit(), u = await r.createTenant({ domain: "globex.com" });
+        expect(await r.memberCount(t.id)).toBe(0);
+        for (let i = 0; i < 5; i++) await r.touchMember(t.id, { user: `google:m${i}`, name: `M${i}` });
+        await r.touchMember(u.id, { user: "google:o", name: "O" });
+        expect(await r.memberCount(t.id)).toBe(5);
+        expect(await r.memberCount(t.id, { cap: 3 })).toBe(4);
+        expect(await r.memberCount(u.id)).toBe(1);
+        expect(await r.memberCount("t-nope00000000")).toBe(0);
       });
 
       test("accessContext: the whole chain in one answer; unknown scope is null; a Unit and a Space scope work too", async () => {

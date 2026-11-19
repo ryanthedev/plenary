@@ -2,7 +2,7 @@
 // last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
 import { normEmail } from "./util.js";
-import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText } from "./registry-port.js";
+import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId } from "./registry-port.js";
 
 /**
  * @typedef {import("./registry-port.js").Registry} Registry
@@ -61,6 +61,8 @@ export function memoryRegistry({ now = Date.now } = {}) {
     .filter(([k, role]) => role === "owner" && (k.startsWith("user\n") || (members.get(k.slice(5))?.size ?? 0) > 0)).map(([k]) => k);
   const need = (ok, what) => { if (!ok) throw new Error(`registry: no such ${what}`); };
   const sk = (a, b) => a + "\n" + b;
+  /** Is the scope key ("type\nid") one of this Unit's? A scoped grant carries no tenant: its scope says whose it is. */
+  const ownScope = (k, tenant) => { const i = k.indexOf("\n"); return scopeTenant(k.slice(0, i), k.slice(i + 1)) === tenant; };
   const putScoped = (type, id, st, sid, role) => {
     const k = sk(type, id);
     if (!scoped.has(k)) scoped.set(k, new Map());
@@ -309,6 +311,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
     async setScopedGrant({ scope, subject, role }) {
       const { type, id } = orgDefaults.scope(scope), sub = orgDefaults.subject(subject), r = orgDefaults.grantRole(role);
       need(scopeTenant(type, id) != null, "scope");
+      if (isCustomRoleId(r) && !roles.get(scopeTenant(type, id))?.has(r)) throw new RegistryError("no-role", "no such custom role in this Unit");
       if (sub.type === "team") need(teams.get(sub.id)?.tenant === scopeTenant(type, id), "team");
       if (type === "board" && sub.type === "user") throw new Error("registry: a user's grant on a board is setGrant");
       const g = scoped.get(sk(type, id));
@@ -324,11 +327,14 @@ export function memoryRegistry({ now = Date.now } = {}) {
       return [...(scoped.get(sk(type, id)) ?? [])].map(([k, role]) => { const [t, ...i] = k.split("\n"); return { subject: { type: t, id: i.join("\n") }, role }; });
     },
 
-    async createRole({ tenant, name, base = null, boardRole, permissions = [] }) {
+    async createRole({ tenant, name, base = null, boardRole, permissions = [], max, idem: key }) {
       need(tenants.has(tenant), "tenant");
       const m = roles.get(tenant) ?? new Map(); roles.set(tenant, m);
+      const k = idemEnter(key);
+      if (max !== undefined && [...m.keys()].filter(i => i !== MEMBER_ROLE_ID).length >= max) throw new RegistryError("limit", "the Unit has the most custom roles it can");
       const r = { id: fresh(m, mint.role), tenant, name: orgDefaults.name(name), base, boardRole, permissions: [...permissions], createdAt: now() };
       m.set(r.id, r);
+      idemPut(k, r.id);
       return copy(r);
     },
     async updateRole(tenant, id, patch) {
@@ -345,6 +351,25 @@ export function memoryRegistry({ now = Date.now } = {}) {
       if (patch.permissions !== undefined) r.permissions = [...patch.permissions];
       return copy(r);
     },
+    async deleteRole(tenant, id) {
+      if (id === MEMBER_ROLE_ID) throw new Error("registry: bad role");
+      need(roles.get(tenant)?.has(id), "role");
+      for (const [sc, g] of scoped) for (const role of g.values()) if (role === id && ownScope(sc, tenant)) throw new RegistryError("in-use", "a grant still holds this role");
+      roles.get(tenant).delete(id);
+    },
+    async roleUsage(tenant, ids, { cap } = {}) {
+      if (typeof tenant !== "string" || (ids ?? []).includes(MEMBER_ROLE_ID)) throw new Error("registry: bad role");
+      const c = capOf(cap, ROLE_LIMITS.usageCap), want = new Map([...new Set(ids ?? [])].slice(0, ROLE_LIMITS.custom + 1).map(i => [i, { places: 0, users: 0, teams: [] }])), seen = new Map([...want.keys()].map(i => [i, new Set()]));
+      for (const [sc, g] of scoped) for (const [k, role] of g) {
+        const u = want.get(role);
+        if (!u || !ownScope(sc, tenant)) continue;
+        if (u.places <= c) u.places++;
+        if (k.startsWith("user\n")) { if (u.users <= c && !seen.get(role).has(k)) { seen.get(role).add(k); u.users++; } } else if (u.teams.length < ROLE_LIMITS.teamIds && !u.teams.includes(k.slice(5))) u.teams.push(k.slice(5));
+      }
+      for (const u of want.values()) u.teams.sort();
+      return want;
+    },
+    async memberCount(tenant, { cap } = {}) { return Math.min(directory.get(tenant)?.size ?? 0, capOf(cap, ROLE_LIMITS.memberCap) + 1); },
     async role(tenant, id) { return copy(roles.get(tenant)?.get(id)); },
     async roles(tenant) { return [...(roles.get(tenant)?.values() ?? [])].map(copy); },
 

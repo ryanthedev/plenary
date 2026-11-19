@@ -147,7 +147,7 @@ export function homeService({ registry, tenancy, now = Date.now }) {
       const pick = rows => rows.filter(r => byId.has(r.board)).map(r => ({ ...byId.get(r.board), at: r.at }));
       return { ...base, recent: pick(rec).slice(0, LIMITS.recent), starred: pick(star).slice(0, LIMITS.starred),
         owned: owned.slice(0, LIMITS.owned), shared: shared.slice(0, LIMITS.shared), tree: theTree,
-        can: { createGroup: !!unitAccess?.permissions.has("group.create"), manageAccess: !!unitAccess?.permissions.has("members.manage") } };
+        can: { createGroup: !!unitAccess?.permissions.has("group.create"), manageAccess: !!unitAccess?.permissions.has("members.manage"), manageRoles: !!unitAccess?.permissions.has("roles.manage") } };
     },
 
     /**

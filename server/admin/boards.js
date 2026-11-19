@@ -17,14 +17,15 @@ import { isUnitAdmin } from "../auth/resolver.js";
 
 export class AdminError extends Error {
   /**
-   * @param {"forbidden"|"bad-request"|"not-found"|"last-owner"|"unknown-person"|"bad-role"|"too-large"} code
+   * @param {"forbidden"|"bad-request"|"not-found"|"last-owner"|"unknown-person"|"bad-role"|"too-large"|"in-use"|"confirm-required"} code
    * @param {string} [message]
-   * @param {{ cause?: unknown }} [extra]
+   * @param {{ cause?: unknown, data?: object }} [extra]  `data`: fields the HTTP answer adds (`in-use`, `confirm-required`)
    */
   constructor(code, message, extra = {}) {
     super(message);
     this.code = code;
     if (extra.cause !== undefined) this.cause = extra.cause;
+    if (extra.data !== undefined) this.data = extra.data;
   }
 }
 const forbidden = () => new AdminError("forbidden", "not allowed");

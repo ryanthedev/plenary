@@ -59,3 +59,20 @@ test("star: PUT to star, DELETE to unstar, 204 is ok, 403 forbidden; a bad id ma
   expect(await home(f(204)).star("../x", true)).toEqual({ error: "forbidden" });
   expect(seen.length).toBe(3);
 });
+
+test("space: GET /home/search?space=<id>; the Space is named only when the server names it; bad id makes no request", async () => {
+  let url;
+  const r = await home(async u => { url = u; return answer(200, { space: { id: "s-1", name: "Design" }, results: [GOOD.recent[0]], more: false })(); }).space("s-1");
+  expect(url).toBe("/home/search?space=s-1");
+  expect(r).toEqual({ space: { id: "s-1", name: "Design" }, results: [GOOD.recent[0]], more: false });
+  expect((await home(answer(200, { space: null, results: [], more: false })).space("s-1")).space).toBe(null);
+  expect(await home(answer(200, {})).space("s-1")).toEqual({ error: "unavailable" });
+  expect(await home(answer(401, {})).space("s-1")).toEqual({ error: "auth" });
+  expect(await home(answer(200, {})).space("../x")).toEqual({ error: "forbidden" });
+});
+
+test("owned and the 'shared' path part survive normalisation", () => {
+  const n = normalizeHome({ ...GOOD, owned: [{ id: "o1", title: "Mine", role: "owner", path: [{ type: "shared", name: "Shared with you" }], starred: false }] });
+  expect(n.owned).toEqual([{ id: "o1", title: "Mine", role: "owner", path: [{ type: "shared", name: "Shared with you" }], starred: false }]);
+  expect(normalizeHome({ ...GOOD, owned: undefined }).owned).toEqual([]);
+});

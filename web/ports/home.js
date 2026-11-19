@@ -8,9 +8,11 @@
 //   "network"      no answer at all
 //
 //   load()          → { home }   the shape of GET /home, normalised: { guest, user: { user, name }, unit: { id, kind } | null,
-//                                  recent, starred, shared: Card[], tree: Tree | null, limits }
+//                                  recent, starred, owned, shared: Card[], tree: Tree | null, limits }. A guest (no Unit) has no
+//                                  starred and no tree; `owned` ("Your boards") is a guest's owner-granted boards, [] for a member
 //   search(q)       → { q, results: Card[], more }   q is 1-100 chars (the caller checks)
-//   star(board, on) → { ok: true }
+//   space(id)       → { space: { id, name } | null, results: Card[], more }   one Space's boards the person can open (GET /home/search?space=)
+//   star(board, on) → { ok: true }   (a guest's star is refused: "forbidden")
 //   Card = { id, title, role, path: [{ type, id?, name }], starred, at? }; Tree = { groups: [{ id, name, spaces: [{ id, name, personal }] }],
 //          spaces: [{ id, name, personal }], other: { boards: [{ id, title }], more }, more }
 // The token is a secret: the adapter sends it as `Authorization: Bearer` only and never logs it.
@@ -19,15 +21,16 @@
 export const HOME_ERRORS = Object.freeze(["auth", "forbidden", "unavailable", "network"]);
 
 /**
- * @typedef {{ type: "group"|"space"|"other", id?: string, name: string }} PathPart
+ * @typedef {{ type: "group"|"space"|"other"|"shared", id?: string, name: string }} PathPart   "shared": "Shared with you", what stands for a Space or Group the person can't open
  * @typedef {{ id: string, title: string, role: string, path: PathPart[], starred: boolean, at?: number }} Card
  * @typedef {{ id: string, name: string, personal: boolean }} SpaceNode
  * @typedef {{ groups: { id: string, name: string, spaces: SpaceNode[] }[], spaces: SpaceNode[], other: { boards: { id: string, title: string }[], more: boolean }, more: boolean }} Tree
  * @typedef {{ guest: boolean, user: { user: string, name: string }, unit: { id: string, kind: string } | null,
- *   recent: Card[], starred: Card[], shared: Card[], tree: Tree | null, limits: Record<string, number> }} HomeData
+ *   recent: Card[], starred: Card[], owned: Card[], shared: Card[], tree: Tree | null, limits: Record<string, number> }} HomeData
  * @typedef {object} HomePort
  * @property {() => Promise<{ home: HomeData } | { error: string }>} load
  * @property {(q: string) => Promise<{ q: string, results: Card[], more: boolean } | { error: string }>} search
+ * @property {(id: string) => Promise<{ space: { id: string, name: string } | null, results: Card[], more: boolean } | { error: string }>} space
  * @property {(board: string, on: boolean) => Promise<{ ok: true } | { error: string }>} star
  */
 export {};

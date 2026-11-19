@@ -8,7 +8,7 @@ import { virtualClock } from "../../web/adapters/clock/virtual.js";
 
 const card = (id, o = {}) => ({ id, title: id.toUpperCase(), role: "editor", path: [{ type: "group", name: "Product" }, { type: "space", name: "Design" }], starred: false, ...o });
 const DATA = { guest: false, user: { user: "dev:ada", name: "ada" }, unit: { id: "t", kind: "company" }, limits: {},
-  recent: [card("a", { at: 1_000_000 - 600_000 }), card("b")], starred: [card("b", { starred: true })], shared: [card("c")],
+  recent: [card("a", { at: 1_000_000 - 600_000 }), card("b")], starred: [card("b", { starred: true })], owned: [], shared: [card("c")],
   tree: { groups: [{ id: "g", name: "Product", spaces: [{ id: "s1", name: "Design", personal: false }] }], spaces: [{ id: "s2", name: "ada's space", personal: true }],
     other: { boards: [{ id: "o1", title: "Old board" }], more: false }, more: false } };
 let root, clock, api, model, listeners, h;
@@ -17,7 +17,7 @@ const mount = async (data = DATA, extra = {}) => {
   listeners = {}; globalThis.document.addEventListener = (t, f) => { listeners[t] = f; }; globalThis.document.removeEventListener = () => {};
   globalThis.Node = Object.getPrototypeOf(FakeElement);
   clock = virtualClock({ t0: 1_000_000 });
-  api = { stars: [], searches: [], load: async () => ({ home: structuredClone(data) }), search: async q => { api.searches.push(q); return { q, results: [card("r1", { title: "Result one" })], more: false }; },
+  api = { stars: [], searches: [], spaces: [], space: async id => { api.spaces.push(id); return { space: { id, name: "Design" }, results: [card("sp1", { title: "In design" })], more: false }; }, load: async () => ({ home: structuredClone(data) }), search: async q => { api.searches.push(q); return { q, results: [card("r1", { title: "Result one" })], more: false }; },
     star: async (id, on) => { api.stars.push([id, on]); return { ok: true }; } };
   model = createHomeModel({ api, clock });
   h = mountHome({ root, model, clock, boardHref: id => `?board=${id}`, signIn: { href: "/auth/login", text: "Sign in" }, ...extra });
@@ -70,8 +70,11 @@ test("search: typing shows results after the debounce; each result has its path;
   expect(textOf(byClass(root, "card-open")[0])).toBe("Result oneProduct / Design · editor");
   input.dispatch("keydown", { key: "Escape" });
   expect(input.value).toBe(""); expect(textOf(root.find(e => e.tagName === "H1"))).toBe("Home");
-  buttons().find(b => b.getAttribute("aria-label") === "Find boards in Design").click(); clock.advance(300); await settle();
-  expect(api.searches.at(-1)).toBe("Design"); expect(input.value).toBe("Design");
+  buttons().find(b => b.getAttribute("aria-label") === "Boards in Design").click(); await settle();
+  expect(api.spaces).toEqual(["s1"]);                                          // by id, not a text search
+  expect(api.searches.length).toBe(1);
+  expect(textOf(root.find(e => e.tagName === "H1"))).toBe("Design");
+  expect(textOf(byClass(root, "card-open")[0])).toMatch(/^In design/);
 });
 
 test("'/' focuses search unless typing in a field", async () => {
@@ -82,14 +85,19 @@ test("'/' focuses search unless typing in a field", async () => {
   listeners.keydown({ key: "/", target: { tagName: "BODY" }, preventDefault: () => prevented++ });
   listeners.keydown({ key: "/", target: { tagName: "INPUT" }, preventDefault: () => prevented++ });
   listeners.keydown({ key: "/", ctrlKey: true, target: { tagName: "BODY" }, preventDefault: () => prevented++ });
-  expect([focused, prevented]).toEqual([1, 1]);
+  listeners.keydown({ key: "k", metaKey: true, target: { tagName: "INPUT" }, preventDefault: () => prevented++ });   // ⌘K works even from a field
+  listeners.keydown({ key: "K", ctrlKey: true, target: { tagName: "BODY" }, preventDefault: () => prevented++ });
+  listeners.keydown({ key: "k", target: { tagName: "BODY" }, preventDefault: () => prevented++ });                 // a bare k is just a letter
+  expect([focused, prevented]).toEqual([3, 3]);
 });
 
 test("a guest sees Shared with me only, with the empty copy when there is nothing", async () => {
-  await mount({ ...DATA, guest: true, unit: null, recent: [], starred: [], tree: null });
-  expect(root.findAll(e => e.tagName === "H2").map(textOf)).toEqual(["Shared with me"]);
-  expect(buttons().map(textOf)).not.toContain("Starred1");
-  await mount({ ...DATA, guest: true, unit: null, recent: [], starred: [], shared: [], tree: null });
+  await mount({ ...DATA, guest: true, unit: null, recent: [card("r")], starred: [], owned: [card("o")], tree: null });
+  expect(root.findAll(e => e.tagName === "H2").map(textOf)).toEqual(["Recent", "Your boards", "Shared with me"]);
+  expect(buttons().map(textOf).filter(t => /Starred|New board/.test(t))).toEqual([]);              // no Starred, no New board for a guest
+  expect(buttons().filter(b => b.hasClass("star"))).toEqual([]);                                   // and no star buttons
+  expect(root.findAll(e => e.hasClass("tree"))).toEqual([]);
+  await mount({ ...DATA, guest: true, unit: null, recent: [], starred: [], owned: [], shared: [], tree: null });
   expect(textOf(root.find(e => e.hasClass("home-empty")))).toBe("Nothing is shared with you yet.Open the link you were sent.");
 });
 

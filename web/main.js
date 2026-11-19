@@ -78,10 +78,9 @@ if (!signIn.token) {
   document.querySelector(".app")?.remove();
   const root = document.createElement("div");
   document.body.append(root);
-  const theme = theme0;
   const model = createHomeModel({ api: httpHome({ fetch: (...a) => globalThis.fetch(...a), token: signIn.token, timers: clock }), clock });
   mountHome({ root, model, clock, signIn: signInLink, homeHref: location.pathname,
-    boardHref: id => `?${new URLSearchParams({ board: id, ...(theme ? { theme } : {}) })}` });
+    boardHref: id => `?${new URLSearchParams({ board: id, ...(theme0 ? { theme: theme0 } : {}) })}` });
   hideGate();
   model.load();
 } else {

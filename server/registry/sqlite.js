@@ -215,8 +215,8 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     starsAmong: db.query("SELECT board FROM reg_stars WHERE member = ? AND board IN (SELECT value FROM json_each(?))"),
     shared: db.query(`SELECT board FROM (
         SELECT board FROM reg_grants WHERE member = ?1
-        UNION SELECT g.scope_id AS board FROM reg_scope_grants g JOIN reg_team_members m ON m.team = g.subject
-          WHERE g.scope_type = 'board' AND g.subject_type = 'team' AND m.member = ?1
+        UNION SELECT g.scope_id AS board FROM reg_team_members m CROSS JOIN reg_scope_grants g INDEXED BY reg_scope_grants_subject ON g.subject_type = 'team' AND g.subject = m.team AND g.scope_type = 'board'
+          WHERE m.member = ?1
         UNION SELECT board FROM reg_invites WHERE ?2 IS NOT NULL AND email = ?2 AND revoked = 0
         UNION SELECT board FROM reg_link_uses WHERE member = ?1) ORDER BY board LIMIT ?3`),
     search: db.query(`SELECT w.id FROM (SELECT id, title FROM reg_boards WHERE tenant = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?5) w

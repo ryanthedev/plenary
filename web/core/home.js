@@ -36,8 +36,8 @@ export const cleanQuery = q => { const t = typeof q === "string" ? q.trim() : ""
  */
 export function emptyText(data, view) {
   if (data.guest) return { title: "Nothing is shared with you yet.", detail: "Open the link you were sent." };
-  if (view === "starred") return { title: "No starred boards yet.", detail: "Star a board with ☆ to keep it here." };
-  if (view === "shared") return { title: "Nothing is shared with you directly.", detail: "Boards given to you by grant, invite or link show up here." };
+  if (view === "starred") return { title: "Star a board (☆) to keep it here.", detail: "" };
+  if (view === "shared") return { title: "Boards people share with you directly show up here.", detail: "" };
   return { title: "Welcome to Plenary.", detail: "Start a board, or join a Space your team already uses." };
 }
 
@@ -46,13 +46,14 @@ export function emptyText(data, view) {
  */
 export function createHomeModel({ api, clock, debounceMs = SEARCH_DEBOUNCE_MS }) {
   /** @type {{ status: "loading"|"ready"|"error"|"signed-out", error: string|null, data: HomeData|null, view: string,
-   *   query: string, search: { status: "idle"|"loading"|"ready"|"error", q: string, results: Card[], more: boolean }, notice: string|null }} */
-  const state = { status: "loading", error: null, data: null, view: "home", query: "", search: { status: "idle", q: "", results: [], more: false }, notice: null };
+   *   query: string, search: { status: "idle"|"loading"|"ready"|"error", q: string, results: Card[], more: boolean },
+   *   space: { status: "loading"|"ready"|"error", id: string, name: string, results: Card[], more: boolean } | null, notice: string|null }} */
+  const state = { status: "loading", error: null, data: null, view: "home", query: "", search: { status: "idle", q: "", results: [], more: false }, space: null, notice: null };
   const subs = new Set();
   const emit = () => { for (const f of [...subs]) f(state); };
   let seq = 0, timer = null;
 
-  const lists = () => [state.data?.recent, state.data?.starred, state.data?.shared, state.search.results].filter(Boolean);
+  const lists = () => [state.data?.recent, state.data?.starred, state.data?.owned, state.data?.shared, state.search.results, state.space?.results].filter(Boolean);
   const cards = id => lists().flat().filter(c => c.id === id);
 
   async function load() {
@@ -81,10 +82,24 @@ export function createHomeModel({ api, clock, debounceMs = SEARCH_DEBOUNCE_MS })
     subscribe(f) { subs.add(f); return () => subs.delete(f); },
     load,
     /** Which list the main area shows. */
-    setView(view) { if (VIEWS.includes(view)) { state.view = view; emit(); } },
+    setView(view) { if (VIEWS.includes(view)) { state.view = view; state.space = null; emit(); } },
+    /** Show one Space's boards (by id, not by text). A newer choice, a search or a view change supersedes an answer still in flight. */
+    showSpace(id, name) {
+      const mine = ++seq;
+      clock.clear(timer); timer = null; state.query = ""; state.search = { status: "idle", q: "", results: [], more: false };
+      state.space = { status: "loading", id, name, results: [], more: false }; emit();
+      api.space(id).then(r => {
+        if (mine !== seq || state.space?.id !== id) return;
+        if ("results" in r) state.space = { status: "ready", id, name: r.space?.name ?? name, results: r.results, more: r.more };
+        else if (r.error === "auth") { state.status = "signed-out"; state.error = "auth"; state.space = null; }
+        else state.space = { status: "error", id, name, results: [], more: false };
+        emit();
+      });
+    },
     /** The search box's text: debounced; an empty or too-long text clears the search at once. */
     setQuery(text) {
       state.query = String(text ?? "");
+      state.space = null;
       clock.clear(timer); timer = null;
       const q = cleanQuery(state.query);
       if (q === null) { seq++; state.search = { status: "idle", q: "", results: [], more: false }; emit(); return; }
@@ -93,6 +108,7 @@ export function createHomeModel({ api, clock, debounceMs = SEARCH_DEBOUNCE_MS })
     },
     /** Star or un-star a board now (optimistic), and put it back if the server says no. @returns {Promise<boolean>} */
     async toggleStar(id) {
+      if (state.data?.guest) return false;                            // guests have no Starred (the server refuses too)
       const was = cards(id).some(c => c.starred) || !!state.data?.starred.some(c => c.id === id), on = !was;
       const set = v => { for (const c of cards(id)) c.starred = v; };
       set(on);
@@ -116,14 +132,19 @@ export function createHomeModel({ api, clock, debounceMs = SEARCH_DEBOUNCE_MS })
     main() {
       const d = state.data;
       if (!d) return null;
+      if (state.space) {
+        const sp = state.space;
+        return { kind: "space", title: sp.name, status: sp.status, cards: sp.results, more: sp.more, empty: { title: "No boards you can open here.", detail: "" } };
+      }
       if (cleanQuery(state.query) !== null) {
         const s = state.search;
         return { kind: "search", title: `Results for “${cleanQuery(state.query)}”`, status: s.status, cards: s.results, more: s.more,
-          empty: { title: "No boards match.", detail: "Search covers board titles and Space names among the boards you can open." } };
+          empty: { title: `No boards or Spaces match "${cleanQuery(state.query)}".`, detail: "You only see what you can open." } };
       }
       if (state.view === "starred") return { kind: "view", title: "Starred", cards: d.starred, more: false, empty: emptyText(d, "starred") };
       if (state.view === "shared") return { kind: "view", title: "Shared with me", cards: d.shared, more: false, empty: emptyText(d, "shared") };
-      return { kind: "view", title: "Home", sections: d.guest ? [{ title: "Shared with me", cards: d.shared }] : [{ title: "Recent", cards: d.recent }, { title: "Starred", cards: d.starred }],
+      return { kind: "view", title: "Home", sections: d.guest ? [{ title: "Recent", cards: d.recent }, { title: "Your boards", cards: d.owned }, { title: "Shared with me", cards: d.shared }]
+          : [{ title: "Recent", cards: d.recent }, { title: "Starred", cards: d.starred }],
         cards: [], more: false, empty: emptyText(d, "home") };
     },
   };

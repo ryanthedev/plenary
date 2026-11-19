@@ -27,7 +27,9 @@ Open one URL per user, each in its own browser tab (a tab keeps its own identity
 - **ada (owner):** <http://localhost:8099/?as=ada>
 - **bo (editor):** <http://localhost:8099/?as=bo>
 
-Draw in one tab and the shape appears in the other. With no `?board=` you land on the dev board; with no `?as=` the
+With no `?board=` you land on **Home**: the dev board is under *Your boards* for ada (owner) and *Shared with me* for bo (dev
+users have no Unit, so they are guests: Recent, Your boards and Shared with me, no Starred). Click the board, draw in one tab and
+the shape appears in the other; the ⌂ in the top bar goes back to Home, where the board is now in Recent. With no `?as=` the
 sign-in screen lists the dev users as buttons. `PORT=0` picks a free port instead (read it from the `server
 listening` log line). Dev sign-in is a local-only convenience. It exists only while **all** of these hold: `PLENARY_DEV_TOKENS` names at
 least one user (unset, empty and `{}` are off; a name with any `admin` or `domain` token, or that is a tenant admin in the registry (an earlier run, or
@@ -113,7 +115,7 @@ PLENARY_DEV_TOKENS='{"dev-token":{"name":"ann","role":"editor"}}' \
 bun server/main.js
 ```
 
-- **The canvas** is served at `/` (see "Try it" for dev sign-in URLs).
+- **The canvas** is served at `/`: Home with no `?board=`, a board with `?board=<id>` (see "Try it" for dev sign-in URLs).
 - **`PORT=0`** picks a free port; the chosen port and the dev board's id are in the JSON log lines.
 - **Check it:** `GET /health` answers 200 with a small JSON body. The WebSocket is at `/ws`; the token goes in the
   first message (`hello`), never in a header or the URL. With the command above, a `hello` carrying `dev-token`

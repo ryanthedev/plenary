@@ -4,14 +4,15 @@ import { createHomeModel, pathText, whenText, cleanQuery, emptyText, SEARCH_DEBO
 import { virtualClock } from "../../../web/adapters/clock/virtual.js";
 
 const card = (id, o = {}) => ({ id, title: id.toUpperCase(), role: "editor", path: [{ type: "space", id: "s1", name: "Design" }], starred: false, ...o });
-const data = (o = {}) => ({ guest: false, user: { user: "dev:ada", name: "ada" }, unit: { id: "t1", kind: "company" }, recent: [card("a"), card("b")], starred: [card("b", { starred: true })], shared: [card("c")],
+const data = (o = {}) => ({ guest: false, user: { user: "dev:ada", name: "ada" }, unit: { id: "t1", kind: "company" }, recent: [card("a"), card("b")], starred: [card("b", { starred: true })], owned: [], shared: [card("c")],
   tree: { groups: [], spaces: [], other: { boards: [], more: false }, more: false }, limits: { recent: 12 }, ...o });
 function fakeApi(over = {}) {
-  const calls = { load: 0, search: [], star: [] }, pending = [];
+  const calls = { load: 0, search: [], space: [], star: [] }, pending = [];
   return {
     calls, pending,
     load: async () => { calls.load++; return over.load ? over.load() : { home: structuredClone(data()) }; },
     search: q => { calls.search.push(q); return new Promise(res => pending.push({ q, res })); },
+    space: id => { calls.space.push(id); return new Promise(res => pending.push({ space: id, res })); },
     star: async (id, on) => { calls.star.push([id, on]); return over.star ? over.star(id, on) : { ok: true }; },
   };
 }
@@ -56,10 +57,14 @@ test("main(): Home shows Recent and Starred, a guest only Shared with me, other 
   m.setView("starred"); expect(m.main()).toMatchObject({ title: "Starred", cards: [{ id: "b" }] });
   m.setView("shared"); expect(m.main()).toMatchObject({ title: "Shared with me", cards: [{ id: "c" }] });
   m.setView("nope"); expect(m.state.view).toBe("shared");
-  const g = setup({ load: () => ({ home: data({ guest: true, unit: null, recent: [], starred: [], tree: null }) }) });
+  const g = setup({ load: () => ({ home: data({ guest: true, unit: null, recent: [card("r")], starred: [], owned: [card("o")], tree: null }) }) });
   await g.m.load();
-  expect(g.m.main().sections.map(s => s.title)).toEqual(["Shared with me"]);
+  expect(g.m.main().sections.map(s => s.title)).toEqual(["Recent", "Your boards", "Shared with me"]);
+  expect(await g.m.toggleStar("r")).toBe(false);                    // guests have no Starred: nothing is asked of the server
+  expect(g.api.calls.star).toEqual([]);
   expect(g.m.main().empty.title).toBe("Nothing is shared with you yet.");
+  expect(emptyText({ guest: false }, "starred").title).toBe("Star a board (☆) to keep it here.");
+  expect(emptyText({ guest: false }, "shared").title).toBe("Boards people share with you directly show up here.");
 });
 
 test("search: debounced, one request for a burst of typing, trimmed; clearing cancels the pending request and ignores a late answer", async () => {
@@ -127,4 +132,29 @@ test("notices can be set and dismissed", async () => {
   const { m } = setup(); await m.load();
   m.notify("hi"); expect(m.state.notice).toBe("hi");
   m.dismissNotice(); expect(m.state.notice).toBe(null);
+});
+
+test("a Space opens by id: its own list, newest choice wins, a search or view change supersedes it, an error shows", async () => {
+  const { m, api, clock } = setup();
+  await m.load();
+  m.showSpace("s1", "Design"); m.showSpace("s2", "Ops");
+  expect(api.calls.space).toEqual(["s1", "s2"]);
+  api.pending[0].res({ space: { id: "s1", name: "Design" }, results: [card("x")], more: false }); await tick();
+  expect(m.state.space).toMatchObject({ id: "s2", status: "loading" });            // the stale answer for s1 was ignored
+  api.pending[1].res({ space: { id: "s2", name: "Ops" }, results: [card("y")], more: true }); await tick();
+  expect(m.main()).toMatchObject({ kind: "space", title: "Ops", status: "ready", more: true, cards: [{ id: "y" }] });
+  m.setQuery("zz"); expect(m.state.space).toBe(null);                            // searching leaves the Space
+  m.showSpace("s3", "Gone"); api.pending.at(-1).res({ error: "unavailable" }); await tick();
+  expect(m.main()).toMatchObject({ kind: "space", status: "error", cards: [] });
+  m.setView("shared"); expect(m.state.space).toBe(null);
+  m.showSpace("s4", "Locked"); api.pending.at(-1).res({ space: null, results: [card("z")], more: false }); await tick();
+  expect(m.state.space.name).toBe("Locked");                                       // an unnamed Space keeps the name it was clicked with
+  void clock;
+});
+
+test("search with no hits uses the JOURNEY copy", async () => {
+  const { m, api, clock } = setup();
+  await m.load(); m.setQuery("zzz"); clock.advance(SEARCH_DEBOUNCE_MS);
+  api.pending[0].res({ q: "zzz", results: [], more: false }); await tick();
+  expect(m.main().empty).toEqual({ title: 'No boards or Spaces match "zzz".', detail: "You only see what you can open." });
 });

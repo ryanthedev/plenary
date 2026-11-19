@@ -6,7 +6,7 @@ const ID = /^[\w-]{1,64}$/;
 const str = (v, max = 200) => (typeof v === "string" ? v.slice(0, max) : "");
 const list = (v, max, f) => (Array.isArray(v) ? v.slice(0, max).map(f).filter(Boolean) : []);
 
-const part = p => (p && typeof p === "object" && ["group", "space", "other"].includes(p.type) ? { type: p.type, ...(ID.test(p.id) ? { id: p.id } : {}), name: str(p.name) } : null);
+const part = p => (p && typeof p === "object" && ["group", "space", "other", "shared"].includes(p.type) ? { type: p.type, ...(ID.test(p.id) ? { id: p.id } : {}), name: str(p.name) } : null);
 const card = c => (c && typeof c === "object" && ID.test(c.id)
   ? { id: c.id, title: str(c.title), role: str(c.role, 32), path: list(c.path, 4, part), starred: c.starred === true, ...(Number.isFinite(c.at) ? { at: c.at } : {}) } : null);
 const node = s => (s && typeof s === "object" && ID.test(s.id) ? { id: s.id, name: str(s.name), personal: s.personal === true } : null);
@@ -25,7 +25,7 @@ export function normalizeHome(b) {
   return {
     guest: b.guest, user: { user: str(b.user?.user, 80), name: str(b.user?.name, 80) },
     unit: b.unit && typeof b.unit === "object" ? { id: str(b.unit.id, 64), kind: str(b.unit.kind, 20) } : null,
-    recent: list(b.recent, 50, card), starred: list(b.starred, 50, card), shared: list(b.shared, 50, card), tree: tree(b.tree), limits,
+    recent: list(b.recent, 50, card), starred: list(b.starred, 50, card), owned: list(b.owned, 50, card), shared: list(b.shared, 50, card), tree: tree(b.tree), limits,
   };
 }
 
@@ -69,6 +69,14 @@ export function httpHome({ fetch, token, base = "", timeoutMs = 10_000, timers =
       if (r.error) return r;
       const b = r.body;
       return b && Array.isArray(b.results) ? { q: str(b.q, 100), results: list(b.results, 50, card), more: b.more === true } : { error: "unavailable" };
+    },
+    async space(id) {
+      if (!ID.test(id)) return { error: "forbidden" };
+      const r = await ask(`/home/search?space=${encodeURIComponent(id)}`, "GET");
+      if (r.error) return r;
+      const b = r.body;
+      if (!b || !Array.isArray(b.results)) return { error: "unavailable" };
+      return { space: b.space && ID.test(b.space.id) ? { id: b.space.id, name: str(b.space.name) } : null, results: list(b.results, 50, card), more: b.more === true };
     },
     async star(board, on) {
       if (!ID.test(board)) return { error: "forbidden" };

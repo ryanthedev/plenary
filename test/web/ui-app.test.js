@@ -549,6 +549,17 @@ test("focus follows the control's own key, not its label: pressing Lock on any o
   }
 });
 
+test("dialog chips: activating a format chip rebuilds the dialog and focus stays on that same chip", () => {
+  rig = setup(); const { step, app } = rig;
+  app.ui.dialog = "export"; app.setPanel({ type: "noop" }); step(20);
+  const chip = text => find(page.byId.dialogs, e => e.tagName === "BUTTON" && e.textContent === text);
+  const before = chip("2×"); before.focus(); before.click(); step(20);
+  const now = chip("2×");
+  expect(now).not.toBe(before);                                          // rebuilt
+  expect(now.className).toContain("on");
+  expect(page.doc.activeElement).toBe(now);                              // focus on the same chip, not the body and not another chip
+});
+
 test("V6 remote layer add / rename and a shape on it: panel layers", () => {
   rig = setup(); const { bo, step, app } = rig;
   app.setPanel({ type: "noop" }); step(20);

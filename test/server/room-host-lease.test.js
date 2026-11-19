@@ -4,6 +4,7 @@
 import { test, expect, afterAll, describe } from "bun:test";
 import { join } from "node:path";
 import { SQL } from "bun";
+import { quietLogger } from "../../server/log.js";
 import { roomHost, newHolder } from "../../server/room-host.js";
 import { sqliteStore } from "../../server/store/sqlite.js";
 import { postgresStore } from "../../server/store/postgres.js";
@@ -19,6 +20,7 @@ afterAll(cleanup);
 const T = "t-aaa", B = "b-one";
 const rect = (id, x = 0) => makeElement("rectangle", { id, x, y: 0, width: 10, height: 10 });
 const never = () => new Promise(() => {});
+const TAKEOVER_CEILING_MS = 30_000;   // fires only when a takeover never happens; the real wait is ~0.3 s
 
 /** A gateway as the room host sees it over the bus: inbox messages out, `{ conn, data, close }` replies in. */
 function fakeGateway(bus, id = "g-1") {
@@ -132,7 +134,11 @@ for (const [name, maker] of [["sqlite", sqliteMaker], ["postgres", pgMaker]]) de
     const m = maker(), raw = await m.open(), rawB = await m.open(), bus = memoryBus();
     const sa = stallable(raw);
     const A = roomHost({ store: sa.store, bus, holder: "h-a", leaseTtlMs: 600, heartbeatMs: 100, appendTimeoutMs: 300 });
-    const Bh = roomHost({ store: rawB, bus, holder: "h-b", leaseTtlMs: 600, heartbeatMs: 100 });
+    // B's takeover is awaited as an event (its "room opened" log line), not polled against a 5 s budget: the lease expires on
+    // the store's real clock (~0.3 s after A's last renew, measured), so only a ceiling that fires when it never happens is
+    // needed, and it is far above anything a loaded machine adds.
+    const bOpened = deferred(), bLog = { ...quietLogger, info: (msg, f) => { if (msg === "room opened") bOpened.resolve(f); } };
+    const Bh = roomHost({ store: rawB, bus, holder: "h-b", leaseTtlMs: 600, heartbeatMs: 100, log: bLog });
     try {
       await A.open(T, B);
       const eA = (await A.peek(T, B)).epoch;
@@ -147,7 +153,8 @@ for (const [name, maker] of [["sqlite", sqliteMaker], ["postgres", pgMaker]]) de
       sa.renew = "hang"; sa.append = "hold";
       g.op("c1", "a", 4);
       await until(() => g.of("c1").some(x => x.close === 1013), "c1 told unavailable", 3000);
-      await until(async () => (await Bh.peek(T, B)) !== null, "B's takeover", 5000);
+      await Promise.race([bOpened.promise, sleep(TAKEOVER_CEILING_MS).then(() => { throw new Error("timed out waiting for B's takeover"); })]);
+      expect(await Bh.peek(T, B)).not.toBe(null);
       const eB = (await Bh.peek(T, B)).epoch;
       expect(eB).toBeGreaterThan(eA);
       expect(await A.peek(T, B)).toBe(null);                                 // A stopped its room
@@ -164,7 +171,7 @@ for (const [name, maker] of [["sqlite", sqliteMaker], ["postgres", pgMaker]]) de
       expect(await g.ack("c2", "a:4")).toEqual({ t: "ack", id: "a:4", seq: 4 });
       expect(g.got.filter(x => x.msg?.t === "welcome").length).toBe(2);     // one per hello, never one from each host
     } finally { await A.close(); await Bh.close(); await raw.close(); await rawB.close(); await bus.close(); await m.drop(); }
-  }, 20000);
+  }, 45000);
 
   test("clean restart: close checkpoints, settles its writes, releases; a new host opens the board with no wait", async () => {
     const m = maker(), raw = await m.open(), bus = memoryBus();

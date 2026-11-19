@@ -2,7 +2,7 @@
 // "Old" is simulated by passing a `now` three hours ahead; processes that hold things open are our own, killed by pid.
 
 import { test, expect, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, existsSync, symlinkSync, rmSync, chmodSync, realpathSync, lstatSync, renameSync, utimesSync } from "node:fs";
+import { appendFileSync, mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, existsSync, symlinkSync, rmSync, chmodSync, realpathSync, lstatSync, renameSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
@@ -19,10 +19,16 @@ function world({ real = false } = {}) {
   const root = mkdtempSync(join(sandbox, "w-"));
   const tempDir = join(root, "temp"), rigRoot = join(root, ".rig");
   mkdirSync(tempDir); mkdirSync(rigRoot);
-  // `lsof` is the real one only where a test needs a process to hold something (real: true); a fixed answer elsewhere (the real one takes ~0.5 s)
+  // `lsof` is a real one only where a test needs a process to hold something (real: true); a fixed answer elsewhere
   const lsof = join(root, "lsof-none");
   writeFileSync(lsof, "#!/bin/sh\ncase \"$*\" in *+D*) exit 1;; esac\necho n/dev/null\n"); chmodSync(lsof, 0o755);
-  return { root, tempDir, rigRoot, lsof: real ? "lsof" : lsof };
+  // real: the real lsof, but asked only about the processes a test started with holder(..., w), not every process on the machine
+  // (a system-wide scan takes seconds on a loaded one). Same -F0n output, same +D semantics, same exit codes.
+  if (real) {
+    writeFileSync(join(root, "holders"), "");
+    writeFileSync(lsof, `#!/bin/sh\npids=$(paste -sd, "${root}/holders")\nexec lsof -a -p "\${pids:-$$}" "$@"\n`); chmodSync(lsof, 0o755);
+  }
+  return { root, tempDir, rigRoot, lsof };
 }
 const entry = (base, name, bytes = 5000) => { const d = join(base, name); mkdirSync(join(d, "sub"), { recursive: true }); writeFileSync(join(d, "sub/f"), "x".repeat(bytes)); return d; };
 /** The pid of a process that has just exited: dead now, and not reused within the test. */
@@ -30,7 +36,12 @@ const DEAD = spawnSync("true").pid;
 const readdirSyncNames = d => readdirSync(d).sort();
 const LATER = () => Date.now() + 3 * 3_600_000;
 const byName = (r, n) => r.items.find(i => i.path.endsWith("/" + n));
-const holder = (script, cwd) => { const p = Bun.spawn(["sh", "-c", script], { cwd, stdout: "ignore", stderr: "ignore" }); kids.push(p); return p; };
+const holder = (script, cwd, w) => { const p = Bun.spawn(["sh", "-c", script], { cwd, stdout: "ignore", stderr: "ignore" }); kids.push(p); if (w) appendFileSync(join(w.root, "holders"), p.pid + "\n"); return p; };
+/** Blocks until the real lsof (scoped to this world's holders) reports a path under `dir`: replaces a fixed sleep that load can outrun. */
+function waitHeld(w, dir, ms = 30_000) {
+  for (const end = Date.now() + ms; Date.now() < end; Bun.sleepSync(10)) if (openPaths(w.lsof).some(p => p.startsWith(dir))) return;
+  throw new Error(`no process holding ${dir} after ${ms} ms`);
+}
 const failingLsof = (w, code) => { const f = join(w.root, `lsof-${code}`); writeFileSync(f, `#!/bin/sh\nexit ${code}\n`); chmodSync(f, 0o755); return f; };
 const rigDir = (w, name) => { const d = join(w.rigRoot, name); mkdirSync(d); writeFileSync(join(d, "rig.json"), "{}"); writeFileSync(join(d, "blob"), "y".repeat(3000)); return d; };
 
@@ -59,9 +70,9 @@ test("a dry run lists and sizes but deletes nothing", () => {
 test("an entry a process holds open (a file, or its cwd) is kept", () => {
   const w = world({ real: true });
   const a = entry(w.tempDir, "plenary-test-hfile1"), b = entry(w.tempDir, "plenary-test-hcwd11"), free = entry(w.tempDir, "plenary-test-free11");
-  holder(`exec 3<${a}/sub/f; exec sleep 60`, w.root);
-  holder("exec sleep 60", b);
-  Bun.sleepSync(300);
+  holder(`exec 3<${a}/sub/f; exec sleep 60`, w.root, w);
+  holder("exec sleep 60", b, w);
+  waitHeld(w, a); waitHeld(w, b);
   const r = clean({ ...w, now: LATER(), yes: true });
   expect([byName(r, "plenary-test-hfile1").why, byName(r, "plenary-test-hcwd11").why]).toEqual(["in use", "in use"]);
   expect(existsSync(a) && existsSync(b)).toBe(true);
@@ -113,6 +124,15 @@ test("refuses a base that is / or $HOME (or a parent of the repo or home)", () =
   expect(() => clean({ tempDir: join(sandbox, "missing"), rigRoot: null }).items).not.toThrow();
 });
 
+test("a refused base throws before lsof is run (no system-wide scan for a request that is refused anyway)", () => {
+  let scans = 0;
+  const spy = () => { scans++; return []; };
+  expect(() => clean({ tempDir: "/", rigRoot: null, openPathsFn: spy })).toThrow(/refusing/);
+  expect(() => clean({ tempDir: tmpdir(), scratch: "/Users", rigRoot: null, openPathsFn: spy })).toThrow(/refusing/);
+  expect(() => clean({ tempDir: join(sandbox, "none"), rigRoot: "/", openPathsFn: spy })).toThrow(/refusing/);
+  expect(scans).toBe(0);
+});
+
 test("stopped rigs are removed, live or unknown ones kept (the rig's own liveness verdict decides)", () => {
   const w = world();
   const stopped = rigDir(w, "stopped"), live = rigDir(w, "live"), fresh = rigDir(w, "fresh");
@@ -153,8 +173,8 @@ test("--scratch: direct children, old and unused, are removed; held ones stay; s
   const scratch = join(w.root, "scratch"); mkdirSync(scratch);
   const old = entry(scratch, "copy-1"), held = entry(scratch, "copy-2");
   symlinkSync(w.root, join(scratch, "lnk"));
-  holder("exec sleep 60", held);
-  Bun.sleepSync(300);
+  holder("exec sleep 60", held, w);
+  waitHeld(w, held);
   const r = clean({ ...w, scratch, now: LATER(), yes: true });
   expect(existsSync(old)).toBe(false);
   expect(existsSync(held)).toBe(true);
@@ -188,7 +208,7 @@ test("an entry not owned by the current uid is kept", () => {
 
 test("a dir that becomes in use after the snapshot is renamed, re-checked, put back and kept", () => {
   const w = world({ real: true }), d = entry(w.tempDir, "plenary-test-late11"), other = entry(w.tempDir, "plenary-test-free22");
-  const r = clean({ ...w, now: LATER(), yes: true, beforeRemove: p => { if (p === d) { holder("exec sleep 60", d); Bun.sleepSync(300); } } });
+  const r = clean({ ...w, now: LATER(), yes: true, beforeRemove: p => { if (p === d) { holder("exec sleep 60", d, w); waitHeld(w, d); } } });
   expect(byName(r, "plenary-test-late11")).toMatchObject({ status: "kept", why: "in use (re-check)" });
   expect(existsSync(d)).toBe(true);
   expect(existsSync(join(w.tempDir, ".plen-deleting-plenary-test-late11"))).toBe(false);
@@ -489,7 +509,7 @@ test("the total time limit skips candidates after the deadline", () => {
   const parked = join(w.tempDir, ".plen-deleting-plenary-test-time01");
   const r = clean({ ...w, now: LATER(), yes: true, maxTimeMs: 10,
     clock: () => existsSync(first) || existsSync(parked) ? 0 : 11,
-    openUnderFn: () => "" });
+    openPathsFn: () => [], openUnderFn: () => "" });   // no lsof: its timeout comes from this fake clock (10 ms), which a real subprocess cannot meet under load
   expect(r.items.map(i => [i.status, i.why])).toEqual([
     ["removed", ""], ["kept", "skipped (time limit)"],
   ]);
@@ -505,7 +525,7 @@ test("an expired total time limit keeps every candidate without removing anythin
   const second = entry(w.tempDir, "plenary-test-time12");
   const fakeTime = 0;
   const r = clean({ ...w, now: LATER(), yes: true, maxTimeMs: 0, clock: () => fakeTime,
-    openUnderFn: () => "" });
+    openPathsFn: () => [], openUnderFn: () => "" });
   expect(r.items.map(i => [i.status, i.why])).toEqual([
     ["kept", "skipped (time limit)"], ["kept", "skipped (time limit)"],
   ]);
@@ -525,14 +545,14 @@ test("an odd path (a newline in it): lsof -F0 output is parsed whole (escaped by
   const w = world({ real: true }), d = entry(w.tempDir, "plenary-test-nl1111");
   const odd = join(d, "sub", "a\nb x");
   writeFileSync(odd, "z");
-  holder(`exec 3<"${odd}"; exec sleep 60`, w.root);
-  Bun.sleepSync(300);
-  expect(openPaths().some(p => p === odd)).toBe(false);                       // lsof escapes the newline, so the raw path never matches ...
-  expect(openPaths().some(p => p === odd.replace("\n", "\\n"))).toBe(true);    // ... but the field is kept whole, escaped, under the entry's prefix
+  holder(`exec 3<"${odd}"; exec sleep 60`, w.root, w);
+  waitHeld(w, d);
+  expect(openPaths(w.lsof).some(p => p === odd)).toBe(false);                       // lsof escapes the newline, so the raw path never matches ...
+  expect(openPaths(w.lsof).some(p => p === odd.replace("\n", "\\n"))).toBe(true);    // ... but the field is kept whole, escaped, under the entry's prefix
   const r = clean({ ...w, now: LATER(), yes: true });
   expect(r.items[0]).toMatchObject({ status: "kept", why: "in use" });
   expect(existsSync(odd)).toBe(true);
-  expect(openUnder(d)).toBe("in use (re-check)");
+  expect(openUnder(d, w.lsof)).toBe("in use (re-check)");
 });
 
 test("ROOT is the real path of the checkout, also with a space in it or behind a symlink", async () => {

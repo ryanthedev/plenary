@@ -205,6 +205,9 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
   };
   const deadlineCheck = () => timeLeft() <= 0;
   const existsLstat = p => { try { stat(p); return true; } catch (e) { if (e.code === "ENOENT") return false; throw e; } };
+  // A base that is refused throws before anything shells out (the system-wide lsof below is the slow part).
+  for (const [target, dir] of bases) if (dir) try { refuseBase(dir, target === "temp" ? "the temp dir" : "the scratch dir"); } catch (e) { if (e.code !== "ENOENT") throw e; }
+  if (rigRoot && existsSync(rigRoot)) refuseBase(rigRoot, "the rig dir");
   let opens = null, opensError = null;
   const initialLeft = timeLeft();
   if (initialLeft <= 0) opensError = "skipped (time limit)";

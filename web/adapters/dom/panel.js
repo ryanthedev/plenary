@@ -135,7 +135,7 @@ export function renderPanel(root, ctx) {
       const ls = [...B.doc.layers].reverse(), count = id => B.doc.live().filter(e => layerOf(e) === id && !isLabel(e)).length;
       const lact = fn => S.act("board", fn, { settings: true });
       return [
-        ...ls.map(l => h("div.list-row" + (B.activeLayer === l.id ? ".on" : ""), { "data-fk": `layer:${l.id}:row`, tabindex: "-1", onclick: () => { B.activeLayer = l.id; B.changed(); ctx.onChange(); } },
+        h("div", { role: "list", "aria-label": "Layers" }, ls.map(l => h("div.list-row" + (B.activeLayer === l.id ? ".on" : ""), { role: "listitem", "aria-label": `Layer: ${l.name || "Layer"}`, "data-fk": `layer:${l.id}:row`, tabindex: "-1", onclick: () => { B.activeLayer = l.id; B.changed(); ctx.onChange(); } },
           h("button", { title: l.visible ? "Hide" : "Show", disabled: dis, "data-fk": `layer:${l.id}:visible`, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { visible: !l.visible })); } }, l.visible ? "◉" : "○"),
           h("button", { title: l.locked ? "Unlock" : "Lock", disabled: dis, "data-fk": `layer:${l.id}:lock`, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { locked: !l.locked })); } }, l.locked ? "🔒" : "·"),
           h("span", { title: "Double-click to rename", ondblclick: ev => {
@@ -144,7 +144,7 @@ export function renderPanel(root, ctx) {
               onblur: () => { const n = input.value.trim(); if (n && n !== l.name) lact(e => e.updateLayer(l.id, { name: n })); ctx.onChange(); } });
             ev.currentTarget.replaceWith(input); input.focus(); input.select();
           } }, l.name || "Layer"),
-          h("span.n", {}, String(count(l.id))))),
+          h("span.n", {}, String(count(l.id)))))),
         h("div.row", { style: { marginTop: "6px" } }, h("span.opts", {},
           chip("+", false, () => lact(e => e.addLayer()), "New layer"),
           chip("↑", false, () => lact(e => e.moveLayer(B.activeLayer, 1)), "Move up"),

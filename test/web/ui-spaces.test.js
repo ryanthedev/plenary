@@ -1,5 +1,6 @@
 // The Space page, the Group page and the New board / New space / General access dialogs (web/adapters/dom/spaces.js, dialogs.js) over the
 // collab tests' small fake DOM: what renders, keyboard paths (menu, rename in place, dialog focus), text safety, and refusals.
+import { announced } from "../../web/adapters/dom/focus.js";
 import { test, expect, beforeEach, afterEach } from "bun:test";
 import { FakeElement, installDom, textOf, byClass } from "./collab/fake-dom.js";
 import { mountSpacePage, mountGroupPage, overflowMenu } from "../../web/adapters/dom/spaces.js";
@@ -399,7 +400,7 @@ test("card rename: Tab to that card's ⋯ keeps the button; a mousedown on ⋯ a
   expect(textOf(root.find(e => e.tagName === "H1"))).toBe("Mouse");
 });
 
-const trackFocus = () => { const doc = globalThis.document, body = {}; doc.body = body; doc.activeElement = body; FakeElement.prototype.focus = function () { focused.push(this); doc.activeElement = this; }; return doc; };
+const trackFocus = () => { const doc = globalThis.document, body = doc.createElement("body"); doc.body = body; doc.activeElement = body; FakeElement.prototype.focus = function () { focused.push(this); doc.activeElement = this; }; return doc; };
 const fk = el => el?.getAttribute("data-fk");
 
 let nextPage = "s-9";
@@ -452,10 +453,12 @@ test("when the focused card disappears on reload, focus goes to the next card, t
   const key = id => root.findAll(e => fk(e) === `card-link:${id}`)[0];
   doc.activeElement = key("b-2"); api.pages.space = mk(["b-1", "b-3"]); await model.load();
   expect(fk(doc.activeElement)).toBe("card-link:b-3");                                               // the next card
+  expect(announced()).toBe("That board is no longer here; moved to the next one.");                  // and it is said, politely
   doc.activeElement = key("b-3"); api.pages.space = mk(["b-1"]); await model.load();
   expect(fk(doc.activeElement)).toBe("card-link:b-1");                                               // no next: the previous
   doc.activeElement = key("b-1"); api.pages.space = mk([]); await model.load();
   expect(fk(doc.activeElement)).toBe("heading");                                                     // no cards: the page title
+  expect(announced()).toBe("That board is no longer here; moved to the top of the list.");
 });
 
 test("the busy re-render keeps the typed text in the card editor (no flash of the old title)", async () => {

@@ -3,6 +3,7 @@ import { test, expect, beforeEach } from "bun:test";
 import { installDom, byClass, button } from "./fake-dom.js";
 import { mountCollab } from "../../../web/adapters/dom/collab/ui.js";
 import { createFakePort } from "../../../web/adapters/collab/fake.js";
+import { announced } from "../../../web/adapters/dom/focus.js";
 import { fakeClock } from "./clock.js";
 
 const EVIL = `<img src=x onerror="alert(1)">`, EVIL2 = `</p><script>alert(2)</script>`;
@@ -226,7 +227,7 @@ test("focus survives a drawer rebuild: a focused thread row is found again after
 
 // Focus is restored by the control's own key (note id + action), never by its label or position.
 function focusRig() {
-  const doc = globalThis.document, body = {}; doc.body = body; doc.activeElement = body;
+  const doc = globalThis.document, body = doc.createElement("body"); doc.body = body; doc.activeElement = body;
   const proto = Object.getPrototypeOf(dom.root), orig = proto.focus;
   proto.focus = function () { doc.activeElement = this; };
   return { doc, restore: () => { proto.focus = orig; } };
@@ -305,6 +306,25 @@ test("Resolve / Reopen is one control with one key: it keeps focus when its labe
     port.ackAll();
     expect(resolve().getAttribute("aria-disabled")).toBe(null);
     expect(f.doc.activeElement).toBe(resolve());
+  } finally { f.restore(); collab.destroy(); }
+});
+
+test("notes drawer a11y: a role=list of listitems named \"Note: <text>, by <author>\"; a note lost under focus is announced", () => {
+  const { port, collab } = setup("annotator", { notes: [note("n1", 1), note("n2", 2)], noteAuthors: { n1: "me", n2: "me" } });
+  port.editNote = () => {}; port.deleteNote = () => {};
+  const d = collab.parts.drawer, f = focusRig();
+  try {
+    collab.showDrawer("notes");
+    const list = d.all().find(e => e.getAttribute?.("role") === "list");
+    expect(list.getAttribute("aria-label")).toBe("Notes");
+    const rows = d.all().filter(e => e.getAttribute?.("role") === "listitem");
+    expect(rows.length).toBe(2);
+    for (const r of rows) expect(r.getAttribute("aria-label")).toMatch(/^Note: .*, by You$/);
+    expect(rows.every(r => list.all().includes(r))).toBe(true);
+    f.doc.activeElement = d.all().find(e => e.getAttribute?.("data-fk") === "note:n2:delete");
+    port.setElement("notes", "n2", null);
+    port.remote({ do: "thread", id: "tx", anchor: { point: { x: 1, y: 1 } }, text: "tick" }, "pri", "Priya");
+    expect(announced()).toMatch(/^That note is no longer here; moved to (the next|the previous) one\.$/);
   } finally { f.restore(); collab.destroy(); }
 });
 

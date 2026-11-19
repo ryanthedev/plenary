@@ -357,8 +357,9 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     if (only) { const text = `${only.length} ${only.length === 1 ? "thread" : "threads"} here`; if (onlyText.textContent !== text) replace(onlyText, text); }
     if (S.drawer === "notes") {
       sigs.drawerRev = null;     // the comments rows must be rebuilt on the way back
+      scroller.setAttribute("role", "list"); scroller.setAttribute("aria-label", "Notes");
       if (!changed("drawer", JSON.stringify(["notes", nv]))) return;
-      swapRows(nv.rows.length ? nv.rows.map(n => h("div.note-row", { "data-note": n.id, "data-fk": `note:${n.id}:row`, tabindex: "-1" },
+      swapRows(nv.rows.length ? nv.rows.map(n => h("div.note-row", { "data-note": n.id, role: "listitem", "aria-label": `Note: ${n.text}, by ${n.author}`, "data-fk": `note:${n.id}:row`, tabindex: "-1" },
         h("span.sw", { style: { background: safeColor(n.color), width: "10px", height: "10px" } }),
         h("div.txt", {}, h("div", {}, n.text),
           h("div.meta", {}, h("span.author", { style: { color: n.by ? colorOf(n.by) : "var(--muted)" } }, n.author), n.kind === "highlight" ? h("span", {}, "highlight") : null),
@@ -373,6 +374,7 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
       const which = only ? `only:${[...S.only].join(",")}` : S.list;
       // Keyed on what the rows show, so a reaction or a here doesn't rebuild every row; built only when the
       // records view changed (rvRev), else the last key stands.
+      scroller.setAttribute("role", "group"); scroller.setAttribute("aria-label", "Comments");
       if (sigs.drawerRev === `${which}|${S.open}|${rvRev}`) return;
       sigs.drawerRev = `${which}|${S.open}|${rvRev}`;
       if (!changed("drawer", JSON.stringify(["comments", which, S.open, list.map(t => [t.id, t.name, t.count, t.pending, t.detached, t.point, t.comments.find(c => !c.deleted)?.text])]))) return;

@@ -7,6 +7,7 @@ import { localRoom } from "../../web/adapters/transport/local.js";
 import { createSession } from "../../web/core/session.js";
 import { memoryStore } from "../../web/adapters/storage/memory.js";
 import { syncCollabPort } from "../../web/adapters/collab/sync.js";
+import { announced } from "../../web/adapters/dom/focus.js";
 import { mountApp } from "../../web/adapters/dom/app.js";
 import { expiryNotice, shouldProbe, takeReturnBoard, rememberBoard, connectionBanner, RETURN_KEY, EXPIRY_WARN_MS } from "../../web/core/roles.js";
 
@@ -590,6 +591,34 @@ test("notes drawer: notes added from the compose box show in the list while the 
   expect(page.byId.drawer.textContent).not.toContain("No notes yet.");
   ta.value = "half-typed"; step(20);
   expect(ta.value).toBe("half-typed");
+});
+
+test("layers: the list is role=list, each row a listitem named \"Layer: <name>\"; a layer removed under focus is announced", () => {
+  rig = setup(); const { bo, step, app } = rig;
+  app.setPanel({ type: "noop" }); step(20);
+  bo.act("board", e => e.addLayer("Two"), { settings: true }); bo.act("board", e => e.addLayer("Three"), { settings: true }); step(20);
+  const list = find(page.byId.panel, e => e.attrs?.role === "list");
+  expect(list.attrs["aria-label"]).toBe("Layers");
+  const items = page.byId.panel.all().filter(e => e.attrs?.role === "listitem");
+  expect(items.map(e => e.attrs["aria-label"]).sort()).toEqual(["Layer: Layer 1", "Layer: Three", "Layer: Two"].sort());
+  expect(items.every(e => list.all().includes(e))).toBe(true);
+  const locks = () => page.byId.panel.all().filter(e => e.tagName === "BUTTON" && /^layer:.+:lock$/.test(e.attrs["data-fk"] ?? ""));
+  const mid = locks()[1], midId = mid.attrs["data-fk"].split(":")[1];
+  mid.focus();
+  bo.act("board", e => e.deleteLayer(midId), { settings: true }); step(20);
+  expect(announced()).toMatch(/^That layer is no longer here; moved to the (next|previous) one\.$/);
+});
+
+test("notes drawer: rows are listitems named \"Note: <text>, by <author>\" inside a role=list", () => {
+  rig = setup(); const { step, app } = rig;
+  app.ui.drawer = "notes"; app.setPanel({ type: "noop" }); step(20);
+  const ta = find(page.byId.drawer, e => e.tagName === "TEXTAREA"); ta.focus();
+  ta.value = "alpha note"; ta.fire("keydown", { key: "Enter" }); step(20);
+  const list = find(page.byId.drawer, e => e.attrs?.role === "list");
+  expect(list.attrs["aria-label"]).toBe("Notes");
+  const rows = page.byId.drawer.all().filter(e => e.attrs?.role === "listitem");
+  expect(rows.map(e => e.attrs["aria-label"])).toEqual(["Note: alpha note, by you"]);
+  expect(list.all().includes(rows[0])).toBe(true);
 });
 
 test("V6 remote layer add / rename and a shape on it: panel layers", () => {

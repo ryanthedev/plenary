@@ -2,6 +2,7 @@
 // text safety, and that a board card is a plain link to the board.
 import { test, expect, beforeEach, afterEach } from "bun:test";
 import { FakeElement, installDom, textOf, byClass } from "./collab/fake-dom.js";
+import { announced } from "../../web/adapters/dom/focus.js";
 import { mountHome } from "../../web/adapters/dom/home.js";
 import { createHomeModel } from "../../web/core/home.js";
 import { virtualClock } from "../../web/adapters/clock/virtual.js";
@@ -61,7 +62,7 @@ function describe_focus() {
   const fk = el => el?.getAttribute("data-fk");
   const withFocus = async fn => {
     await mount();
-    doc = globalThis.document; body = {}; doc.body = body; doc.activeElement = body; focused = [];
+    doc = globalThis.document; body = doc.createElement("body"); doc.body = body; doc.activeElement = body; focused = [];
     const orig = FakeElement.prototype.focus;
     FakeElement.prototype.focus = function () { focused.push(this); doc.activeElement = this; };
     try { await fn(); } finally { FakeElement.prototype.focus = orig; }
@@ -91,6 +92,15 @@ function describe_focus() {
     model.setQuery("r1"); await settle(); await settle();
     const now = fk(focused.at(-1));
     expect(now === "heading" || now.startsWith("card:")).toBe(true);
+  }));
+  test("a starred card that leaves the list: focus goes to a neighbouring card's LINK (never another star) and is announced", () => withFocus(async () => {
+    const star = byKey("star:Recent:a"); doc.activeElement = star;
+    api.load = async () => ({ home: structuredClone({ ...DATA, recent: [card("b")] }) });
+    await model.load(); await settle();
+    const now = fk(focused.at(-1));
+    expect(now.startsWith("card:Recent:")).toBe(true);
+    expect(now.startsWith("star:")).toBe(false);
+    expect(announced()).toMatch(/^That board is no longer here; moved to (the next|the previous) one\.$/);
   }));
   test("a control that was never marked is not refocused (an input keeps its own focus)", () => withFocus(async () => {
     const input = root.find(e => e.tagName === "INPUT"); doc.activeElement = input; const n = focused.length;

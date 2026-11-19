@@ -64,6 +64,7 @@ export async function rig(o = {}) {
   auth = {
     async verify(t) { calls.verify++; if (o.verifyDelayMs) await sleep(o.verifyDelayMs); return inner.verify(t); },
     async role(id, b) { calls.role++; return inner.role(id, b); },
+    async access(id, b) { calls.role++; return inner.access(id, b); },
     ...(inner.rolesFor ? { async rolesFor(b, ids) { cacheCalls.rolesFor++; return inner.rolesFor(b, ids); } } : {}),
     ...(inner.invalidate ? { invalidate(b, u) { cacheCalls.invalidate++; return inner.invalidate(b, u); } } : {}),
   };

@@ -70,7 +70,7 @@ export function createSession({ join, token, board, client = "web", tab = null, 
   const binds = {};
   const draw = random ?? clock?.random;
   const s = {
-    eds, binds, active: "board", tool: "hand", roleSeen: null, chrome: null, blocked: 0, sent: 0,
+    eds, binds, active: "board", tool: "hand", roleSeen: null, canShare: false, chrome: null, blocked: 0, sent: 0,
     penStyle: null, online: true, gesture: null, flash: null,
     tab: tab ?? (typeof draw === "function" ? mintTab(draw) : null),
   };
@@ -142,7 +142,7 @@ export function createSession({ join, token, board, client = "web", tab = null, 
   s.refreshRole = () => {
     const r = C.lastRole;
     if (!r) return;
-    s.roleSeen = r;
+    s.roleSeen = r; s.canShare = C.canShare === true;
     const ui = uiRole(r);
     if (!s.chrome) { s.chrome = ui; s.tool = ui === "viewer" ? "hand" : "select"; applyTool(); }
   };

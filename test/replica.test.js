@@ -481,3 +481,11 @@ test("hello.tab: `new Replica({ tab })` puts it in every hello; without `tab` th
   d.room.receive(c, wire(h1), { n: 1, user: "u", role: "editor" });
   expect(got[0]).toMatchObject({ t: "welcome", user: "u" });
 });
+
+test("welcome.can.share is kept as canShare: true only when the welcome says so, false when absent or not exactly true", () => {
+  const mk = can => { const r = new Replica({ client: "c" }); r.receive({ t: "welcome", seq: 0, role: "annotator", user: "u", horizon: 0, rv: 1, ...(can ? { can } : {}) }); return r; };
+  expect(mk({ share: true }).canShare).toBe(true);
+  expect(mk({ share: "yes" }).canShare).toBe(false);
+  expect(mk(null).canShare).toBe(false);
+  expect(new Replica({ client: "c" }).canShare).toBe(false);
+});

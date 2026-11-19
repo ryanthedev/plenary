@@ -20,7 +20,7 @@ const USERS = { "t-ada": { user: "ada", role: "owner" }, "t-bo": { user: "bo", r
   "t-di": { user: "di", role: "annotator" }, "t-vi": { user: "vi", role: "viewer" } };
 
 /** ada's page over a room with bo (a second presenter, headless) on the same virtual clock. */
-function setup({ expAt = null, relogin = null, collab = false, role = null, token = "t-ada", prefs = memoryStore(), wrap = null, appNet = null, access = null } = {}) {
+function setup({ expAt = null, relogin = null, collab = false, role = null, token = "t-ada", prefs = memoryStore(), wrap = null, appNet = null, access = null, share = null } = {}) {
   installPage();
   const net = localRoom({ users: USERS, clock: true });
   const joins = [], hooks = {};
@@ -29,7 +29,7 @@ function setup({ expAt = null, relogin = null, collab = false, role = null, toke
   const app = mountApp({
     startSession: ({ mine, onChange }) => createSession({ join: () => { const t = net.join(); joins.push(t); return wrap ? wrap(t) : t; }, token, board: "b1", client: USERS[token].user, user: USERS[token].user, mine, onChange, clock: net.clock }),
     net: appNet ?? { kind: "local", put() {}, onFile() {} }, board: "b1", me: { user: USERS[token].user, name: "Ada", role }, prefs, theme: "light",
-    clock: net.clock, expAt, relogin, access, newKey: () => "key-pill-0001",
+    clock: net.clock, expAt, relogin, access, share, newKey: () => "key-pill-0001",
     collab: collab ? (S, o) => { hooks.jumpTo = o.jumpTo; return syncCollabPort(S, { name: "Ada", frame: fn => net.clock.set(fn, 16), ...o }); } : null,
   });
   /** n animation frames, 16 ms of virtual time each, the room settled in between. */
@@ -1219,4 +1219,20 @@ test("#51 a successful Ask from the pill keeps the popover open and puts focus o
   expect(ask.hidden).toBe(true);
   pop().fire("focusout", { relatedTarget: page.byId.topbar });     // a real Tab-out still closes it
   expect(pop()).toBeUndefined();
+});
+
+test("DW-52.3e the Share button shows only when the welcome says can.share: a custom-role manager at an annotator step sees it, an owner whose welcome has no can.share and a viewer do not; no share port, no button", async () => {
+  const said = can => t => ({ ...t, onMessage: fn => t.onMessage(m => fn(m?.t === "welcome" && can ? { ...m, can: { share: true } } : m)) });
+  const shareStub = { view: async () => ({ error: "forbidden" }) };
+  const button = () => find(page.byId.topbar, e => e.getAttribute?.("data-share-open") === "1");
+  rig = setup({ token: "t-cy", share: shareStub, wrap: said(true) });
+  expect(rig.S.effective).toBe("annotator");
+  expect(button()).toBeTruthy();
+  expect(find(page.byId.topbar, e => e.tagName === "BUTTON" && e.getAttribute("title") === "Share this board")).toBeTruthy();
+  rig = setup({ token: "t-ada", share: shareStub, wrap: said(false) });                // an owner by the room, but this welcome did not say it
+  expect(button()).toBeUndefined();
+  rig = setup({ token: "t-vi", share: shareStub, wrap: said(false) });
+  expect(button()).toBeUndefined();
+  rig = setup({ token: "t-cy", wrap: said(true) });                                    // no share port wired: no button either
+  expect(button()).toBeUndefined();
 });

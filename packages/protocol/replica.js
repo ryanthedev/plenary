@@ -39,7 +39,7 @@ export class Replica {
     this.pending = new Map();   // op id → { stream, op, msg, ackSeq?, wrote, answered, resend }: kept across resets and connections
     this.tokens = OP_RATE.burst; this.tokensAt = now();   // the send pace: a bucket of OP_RATE
     this.unconfirmed = 0;       // ops dropped without knowing whether they landed (the UI says so after the resync)
-    this.user = null; this.role = null;
+    this.user = null; this.role = null; this.canShare = false;
     this.stopped = null; this.needAuth = false; this.resync = false;
     this.welcomed = false; this.target = null; this.horizon = 0; this.staleSeen = false;
     this.board = null;          // the board of the current hello (welcome.room.board must match)
@@ -424,7 +424,7 @@ export class Replica {
       for (const id of [...this.pending.keys()]) { this.pending.delete(id); did.dropped.push(id); }
       this.gates = [];   // held changes are dropped and reported by forgetSettings() below
     }
-    this.welcomed = true; this.role = msg.role; this.user = msg.user; this.target = msg.seq; this.horizon = msg.horizon ?? 0;
+    this.welcomed = true; this.role = msg.role; this.canShare = msg.can?.share === true; this.user = msg.user; this.target = msg.seq; this.horizon = msg.horizon ?? 0;
     this.progressAt = this.now();
     if (this.applied >= this.target) this.goodAt = this.now();
     if (other) { if (did.dropped.length) { this.discarded = (this.discarded ?? 0) + did.dropped.length; this.discard(did); } this.forgetSettings(did, "user-changed"); return; }

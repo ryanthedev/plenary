@@ -393,7 +393,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     if (!c.welcomed && !c.welcoming && m.data !== undefined) {
       let msg = null;
       try { msg = codec.decode(m.data); } catch { msg = null; }
-      if (msg?.t === "welcome") { welcomed(ws, m.data, Number.isSafeInteger(msg.seq) ? msg.seq : 0); if (m.close) end(ws, m.close, "closed by the room"); return; }
+      if (msg?.t === "welcome") { welcomed(ws, c.share ? codec.encode({ ...msg, can: { share: true } }) : m.data, Number.isSafeInteger(msg.seq) ? msg.seq : 0); if (m.close) end(ws, m.close, "closed by the room"); return; }
     }
     if (m.close) {
       // The room is sending this connection away: what was queued for it is dropped, not delivered first.
@@ -920,7 +920,8 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     if (!board || board.id !== msg.board || !isId(board.id) || !isId(board.tenant)) return deny("board");
     const watch = watchGrants(c, board.tenant, board.id);   // before the role check (released when the socket closes)
     let gen = watch.gen;
-    try { role = await auth.role(identity, board.id); } catch (err) { return down("role", err); }
+    let share = false;
+    try { if (typeof auth.access === "function") ({ role, share } = await auth.access(identity, board.id)); else role = await auth.role(identity, board.id); } catch (err) { return down("role", err); }
     if (c.state !== "auth") return;
     if (!ROLES.includes(role)) return deny("role");
     const writer = role !== "viewer", wkey = `${identity.user}|${board.id}`;
@@ -958,7 +959,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     if ((connsByUser.get(identity.user) ?? 0) >= lim.maxConnsPerUser) { log.warn("hello refused: too many connections for one user", { conn: c.id, user: identity.user }); return refuse(ws, "unavailable", "too many connections for this user", 1013, "user connection cap"); }
     if (tooMany()) return;
 
-    Object.assign(c, { state: "live", tenant: board.tenant, board: board.id, user: identity.user, identity, name: typeof identity.name === "string" ? identity.name.slice(0, 200) : null, role, client: msg.client,
+    Object.assign(c, { state: "live", tenant: board.tenant, board: board.id, user: identity.user, identity, name: typeof identity.name === "string" ? identity.name.slice(0, 200) : null, role, share: share === true, client: msg.client,
       since: msg.since ?? 0, welcomed: false, next: undefined, wkey: writer ? wkey : null, tkey: writer ? tkey : null, tabKey,
       out: [], outBytes: 0, buffered: 0, owed: 0, blocked: false, flushing: false, waitSince: 0, progressAt: now(), winStart: now(), winDrained: 0,
       opq: [], opqBytes: 0, tokens: lim.opBurst, tokenAt: now(), opTimer: null, limiter: presenceLimiter(now) });
@@ -979,7 +980,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     log.info("hello accepted", { conn: c.id, tenant: c.tenant, board: c.board, user: c.user, role });
     if (!writer) {
       // Rule 8: a viewer's hello never leaves the gateway. Its welcome carries the feed's seq and latest known epoch.
-      return welcomed(ws, () => codec.encode({ t: "welcome", seq: c.b.feed.seq, role, user: c.user, horizon: 0, rv: RULES_VERSION, room: { board: c.board, epoch: c.b.feed.epoch } }), 0);
+      return welcomed(ws, () => codec.encode({ t: "welcome", seq: c.b.feed.seq, role, user: c.user, horizon: 0, rv: RULES_VERSION, room: { board: c.board, epoch: c.b.feed.epoch }, ...(c.share ? { can: { share: true } } : {}) }), 0);
     }
     // The hello timer keeps running until the room's welcome arrives (the bus may drop a hello).
     c.forwarded = true;

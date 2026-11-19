@@ -331,7 +331,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     h("span.ic", {}, t.icon), t.keys?.[0] ? h("span.k", {}, t.keys[0].toUpperCase()) : null);
   }
 
-  // Share (PROTOCOL.md § Share dialog): offered to every connected role (nothing is fetched until it is pressed); the server answers 403 to anyone without `members.manage`, and the dialog says so.
+  // Share (PROTOCOL.md § Share dialog): offered only when the welcome said `can.share` (members.manage on the board); if that changed mid-session the server answers 403 and the dialog says so.
   // The chrome is rebuilt while the dialog is open, so focus goes back to whichever of the Share button and the More button is shown now, not to the element that opened it.
   const shareOpener = { focus() { const c = [document.querySelector("[data-share-open]"), document.querySelector(".header-more")]; (c.find(e => e && e.offsetParent !== null) ?? c.find(Boolean))?.focus?.(); } };
   function openShareDialog() {
@@ -385,7 +385,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       extraAction("Notes", toggleNotes),
       role === "presenter" ? extraAction("Mermaid", () => openDialog("mermaid"), !may) : null,
       role === "presenter" ? extraAction("Export", toggleExport) : null,
-      share ? extraAction("Share", () => openShareDialog()) : null,
+      share && S.canShare ? extraAction("Share", () => openShareDialog()) : null,
       role !== "viewer" ? extraAction("Side panel", togglePanel) : null,
       extraAction("Light / dark", toggleTheme),
     ]);
@@ -397,7 +397,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         collab ? h("button.btn.ghost.desk-only.header-extra", { "aria-label": "Comments", title: "Comments (or right-click the board)", onclick: () => toggleDrawer("comments") }, "💬") : null,
         collab ? collab.parts.avatars : h("div.avatars", {},
           h("span.stack", {}, h("span.av.live", { style: { background: "var(--u-me)" }, title: `${me.name} (you)` }, me.name.slice(0, 2).toUpperCase()))),
-        share ? h("button.btn.desk-only.header-extra", { "aria-haspopup": "dialog", "data-share-open": "1", title: "Share this board", onclick: () => openShareDialog() }, "Share") : null,
+        share && S.canShare ? h("button.btn.desk-only.header-extra", { "aria-haspopup": "dialog", "data-share-open": "1", title: "Share this board", onclick: () => openShareDialog() }, "Share") : null,
         pillEl,
         role !== "viewer" ? h("button.tb.desk-only.header-extra" + (ui.panel.open ? ".on" : ""), { title: "Side panel (I)", onclick: togglePanel }, h("span.ic", {}, "◧"), h("span.k", {}, "I")) : null,
         h("button.tb.header-extra" + (role === "viewer" ? "" : ".theme-btn"), { title: "Light / dark", onclick: toggleTheme }, h("span.ic", {}, ui.theme === "dark" ? "☀" : "☾")),
@@ -654,7 +654,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     return root;
   };
   const parts = {
-    topbar: { key: () => notesCount(), build: buildTopbar },
+    topbar: { key: () => `${notesCount()}${S.canShare ? ":share" : ""}`, build: buildTopbar },
     panel: { key: () => (S.role === "viewer" || !ui.panel.open ? "" : panelKey()), build: buildPanel },
     drawer: { key: () => (ui.drawer === "notes" ? notesRowsKey() : ""), build: buildDrawer },
     timeline: { key: () => { const B = S.eds.board, bi = boardInfo(B.doc), t = B.time(); return S.role !== "presenter" ? "" : JSON.stringify([bi.marks, bi.dur, !!B.play, B.play ? null : t]); }, build: timeline },

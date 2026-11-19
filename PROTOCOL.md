@@ -679,7 +679,7 @@ exactly"). Defaults: `leaseTtlMs` 10,000, `appendTimeoutMs` 4,000, `storeTimeout
   does not claim; the hello is answered `unavailable` once the heartbeat is silent. The stop came after the last renew, so
   the lease has lapsed when the cooldown ends. Another host that holds the board is untouched by it; if none does, this host
   takes the board when the cooldown ends. A lost lease for any other reason (renew refused, fenced, host deadline) has no
-  cooldown: the board is already someone else's or free.
+  cooldown: the board is already someone else's or free. Cost: a single node (no other host) is also unavailable for the cooldown (10,200 ms at the defaults) after a stuck stop, then rebuilds; its writers keep getting `unavailable` and reconnect meanwhile.
 - **No acknowledged op is lost.** An op is acked only after its append resolved *and* the lease was still within its host
   deadline (§ Recovery, append). A stuck host that wakes has two defences: its own deadline check (`expired`) and the
   Store's epoch fence. Every write the host makes carries the lease epoch and is checked **in the write's own transaction**:

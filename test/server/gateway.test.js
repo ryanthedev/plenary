@@ -283,9 +283,10 @@ test("the entries subject carries each entry once, after it is durable", async (
 });
 
 for (const mode of ["rejects", "conflicts", "times out", "times out and then lands late"]) test(`when the append ${mode}: no ack ever, everyone gets \`unavailable\`, and the room rebuilds from the Store`, async () => {
-  let fail = false, late = null; const never = deferred(), landNow = deferred();
+  let fail = false, late = null, skew = 0; const never = deferred(), landNow = deferred();
   const r = await rig({
-    host: mode.startsWith("times out") ? { appendTimeoutMs: 400 } : {},
+    // A timed-out append is a stuck stop: the host will not retake the board for ttl + margin (§ Recovery, "Stuck host"). `skew` moves its lease clock past that.
+    host: mode.startsWith("times out") ? { appendTimeoutMs: 400, monotonic: () => performance.now() + skew } : {},
     wrapStore: s => ({ ...s, append: async (tenant, board, entries, expectSeq, ...rest) => {
       if (!fail) return s.append(tenant, board, entries, expectSeq, ...rest);
       if (mode === "rejects") throw new Error("disk full");
@@ -318,6 +319,7 @@ for (const mode of ["rejects", "conflicts", "times out", "times out and then lan
   expect(b.msgs.some(m => m.t === "entries" && m.entries.some(e => e.id !== "a:1"))).toBe(false);
   expect(r.server.rooms.stats().rooms).toBe(0);
   fail = false;
+  if (mode.startsWith("times out")) skew += 60_000;   // the cooldown is over
 
   // Reconnect: the room is rebuilt from what the Store really holds, and sequencing carries on without a gap.
   const stored = mode === "conflicts" ? 2 : 1;

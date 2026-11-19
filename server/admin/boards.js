@@ -11,6 +11,7 @@
 // same `forbidden` error, so existence doesn't leak.
 
 import { ROLES, LINK_ROLES, INVITE_ROLES, normEmail } from "../auth/util.js";
+import { isUnitAdmin } from "../auth/resolver.js";
 
 /** @typedef {import("../auth/registry-port.js").Registry} Registry */
 /** @typedef {import("../auth/idp-port.js").Identity} Identity */
@@ -31,22 +32,10 @@ export class AdminError extends Error {
 const forbidden = () => new AdminError("forbidden", "not allowed");
 const bad = m => new AdminError("bad-request", m);
 
-/**
- * A tenant admin is named by user id (google:<sub>, dev:<name>) or, before their first sign-in, by email
- * (`email:<addr>`, server/admin/tenants.js). An email entry matches only a Google caller (user google:<sub>: the
- * only verifier whose email is IdP-vouched; a dev token's email is whatever the operator typed) whose email is
- * that address AND whose Workspace domain is the tenant's, so a guest from another domain holding that address
- * elsewhere never becomes admin. An `email:` entry is never matched as a user id (no verifier mints such an id;
- * defense in depth).
- */
+/** Is the caller an admin of the tenant? The rule is the resolver's (server/auth/resolver.js, isUnitAdmin). */
 async function isTenantAdmin(registry, caller, tenantId) {
   if (!caller || typeof caller.user !== "string" || typeof tenantId !== "string") return false;
-  const t = await registry.tenant(tenantId);
-  if (!t) return false;
-  if (!caller.user.startsWith("email:") && t.admins.includes(caller.user)) return true;
-  if (!caller.user.startsWith("google:")) return false;
-  const email = normEmail(caller.email);
-  return !!email && !!t.domain && caller.domain === t.domain && t.admins.includes("email:" + email);
+  return isUnitAdmin(await registry.tenant(tenantId), caller);
 }
 
 /** The board, if the caller may manage it; else throws `forbidden` (unknown board included). */

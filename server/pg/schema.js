@@ -26,8 +26,22 @@ export async function ensureSchema(tx, schema) {
 }
 
 /**
- * Creates the schema and each missing table of `tables` ({ name: "column definitions" }), looking each one up first
- * (to_regclass). Call inside a transaction, after the advisory lock. The caller owns its tables' DDL (the Store's
+ * Which of `names` (tables or indexes in `schema`) don't exist yet, in the order given: ONE lookup (to_regclass per
+ * name, server-side) however many names, so a cold start-up of N objects costs 2 round trips, not N+1.
+ * @returns {Promise<string[]>}
+ */
+export async function missing(tx, schema, names) {
+  const s = needSchema(schema);
+  if (!names.length) return [];
+  const rows = await tx.unsafe(`SELECT t FROM unnest($1::text[]) WITH ORDINALITY AS u(t, i)
+    WHERE to_regclass(format('%I.%I', $2::text, t)) IS NULL ORDER BY i`, [names, s]);
+  return rows.map(r => r.t);
+}
+
+/**
+ * Creates the schema and each missing table of `tables` ({ name: "column definitions" }), looking them up first
+ * (to_regclass, one query: `missing`) and creating only what is missing, in the order given (so foreign keys resolve),
+ * in one round trip. Call inside a transaction, after the advisory lock. The caller owns its tables' DDL (the Store's
  * is STORE_TABLES in server/store/postgres.js); an operator may run this as the owner role ahead of time.
  * @param {*} tx  a Bun SQL transaction
  * @param {string} schema
@@ -36,8 +50,6 @@ export async function ensureSchema(tx, schema) {
 export async function migrate(tx, schema, tables) {
   const s = needSchema(schema);
   await ensureSchema(tx, s);
-  for (const [name, cols] of Object.entries(tables)) {
-    const [{ r }] = await tx.unsafe("SELECT to_regclass($1) AS r", [`"${s}".${name}`]);
-    if (r === null) await tx.unsafe(`CREATE TABLE "${s}".${name} (${cols})`);
-  }
+  const todo = await missing(tx, s, Object.keys(tables));
+  if (todo.length) await tx.unsafe(todo.map(name => `CREATE TABLE "${s}".${name} (${tables[name]})`).join(";\n"));
 }

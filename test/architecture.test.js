@@ -58,6 +58,8 @@ const COMPOSITION_ROOTS = [
 const NOT_ADAPTERS = {
   "server/auth/util.js": "shared pure helpers (roles, base64url, ids); imported by core, ports and adapters",
   "server/auth/tenancy.js": "core: role resolution over the Registry port (platform's CLASSES calls it core)",
+  "server/auth/resolver.js": "core: the pure permission resolver (domain logic; reads only rows handed to it)",
+  "server/auth/permissions.js": "core: permissions, built-in roles and their clipping per scope (pure domain data)",
 };
 /** Non-port modules a driven adapter may import. */
 const SHARED = ["server/ids.js", "server/auth/util.js"];
@@ -104,7 +106,7 @@ test("the classes are what they must be (no vacuous pass)", () => {
   for (const p of ["packages/protocol/room.js", "packages/protocol/replica.js", "packages/core/doc.js", "server/gateway.js",
     "server/room-host.js", "server/feed.js", "server/ids.js", "server/log.js", "server/admin/boards.js", "server/auth/tenancy.js",
     "server/bus/port.js", "server/blobs/port.js", "server/auth/port.js", "server/auth/idp-port.js", "server/auth/registry-port.js",
-    "server/auth/util.js"]) expect([p, isCore(p), isAdapter(p)]).toEqual([p, true, false]);
+    "server/auth/util.js", "server/auth/resolver.js", "server/auth/permissions.js"]) expect([p, isCore(p), isAdapter(p)]).toEqual([p, true, false]);
   for (const p of ["server/store/sqlite.js", "server/store/postgres.js", "server/registry/postgres.js", "server/bus/nats.js",
     "server/bus/memory.js", "server/blobs/s3.js", "server/blobs/disk.js", "server/auth/oidc.js", "server/auth/dev.js",
     "server/auth/http.js", "server/server.js", "server/pg/schema.js"]) expect([p, isAdapter(p), isCore(p)]).toEqual([p, true, false]);

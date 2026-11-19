@@ -19,6 +19,13 @@ afterAll(cleanup);
 const T = "t-aaa", B = "b-one";
 const rect = (id, x = 0) => makeElement("rectangle", { id, x, y: 0, width: 10, height: 10 });
 const never = () => new Promise(() => {});
+const CEILING_MS = 30_000;   // fires only when an awaited event never comes; the real waits are ~0.3 s
+/** `p`, or a rejection after CEILING_MS; the timer is cleared either way. */
+async function withCeiling(p, what) {
+  let timer;
+  try { return await Promise.race([p, new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(`timed out waiting for ${what}`)), CEILING_MS); })]); }
+  finally { clearTimeout(timer); }
+}
 
 /** A gateway as the room host sees it over the bus: inbox messages out, `{ conn, data, close }` replies in. */
 function fakeGateway(bus, id = "g-1") {
@@ -136,6 +143,11 @@ for (const [name, maker] of [["sqlite", sqliteMaker], ["postgres", pgMaker]]) de
     try {
       await A.open(T, B);
       const eA = (await A.peek(T, B)).epoch;
+      // B's takeover is awaited as an event, not polled against a budget: the room's build() publishes `{ ...heartbeat, opened: true }`
+      // on the board's entries subject, so the first one with an epoch above A's is B's. The lease expires on the store's real clock
+      // (~0.3 s after A's last renew, measured), so the ceilings only fire when the event never comes.
+      const bOpened = deferred();
+      const unsubOpened = bus.subscribe(subjects.entries(T, B), m => { if (m.opened && m.epoch > eA) bOpened.resolve(m); });
       await Bh.open(T, B);                                                   // held live by A: no room here
       expect(await Bh.peek(T, B)).toBe(null);
       expect(Bh.stats()).toEqual({ rooms: 0, waiting: 1 });
@@ -146,8 +158,10 @@ for (const [name, maker] of [["sqlite", sqliteMaker], ["postgres", pgMaker]]) de
       // A stalls: its renews hang and its next append is held (past the 4 s-style timeout, here 300 ms).
       sa.renew = "hang"; sa.append = "hold";
       g.op("c1", "a", 4);
-      await until(() => g.of("c1").some(x => x.close === 1013), "c1 told unavailable", 3000);
-      await until(async () => (await Bh.peek(T, B)) !== null, "B's takeover", 5000);
+      await until(() => g.of("c1").some(x => x.close === 1013), "c1 told unavailable", CEILING_MS);
+      await withCeiling(bOpened.promise, "B's takeover");
+      unsubOpened?.();
+      expect(await Bh.peek(T, B)).not.toBe(null);
       const eB = (await Bh.peek(T, B)).epoch;
       expect(eB).toBeGreaterThan(eA);
       expect(await A.peek(T, B)).toBe(null);                                 // A stopped its room
@@ -164,7 +178,7 @@ for (const [name, maker] of [["sqlite", sqliteMaker], ["postgres", pgMaker]]) de
       expect(await g.ack("c2", "a:4")).toEqual({ t: "ack", id: "a:4", seq: 4 });
       expect(g.got.filter(x => x.msg?.t === "welcome").length).toBe(2);     // one per hello, never one from each host
     } finally { await A.close(); await Bh.close(); await raw.close(); await rawB.close(); await bus.close(); await m.drop(); }
-  }, 20000);
+  }, 45000);
 
   test("clean restart: close checkpoints, settles its writes, releases; a new host opens the board with no wait", async () => {
     const m = maker(), raw = await m.open(), bus = memoryBus();

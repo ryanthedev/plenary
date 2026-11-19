@@ -333,9 +333,12 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   const registry = announcingRegistry(rawRegistry, bus, log);
   const dev = devAuth(tokens ? { enabled: true, tokens } : undefined);
   const sessions = await makeSessions({ key: sessionKey });
-  const tenancy = makeTenancy({ registry });
+  // PLENARY_ADMIN_BOARD_CONTENT=1: a Unit admin enters every room of the Unit as owner (default off: an admin manages
+  // every board but needs a role to enter one, as before Spaces; PROTOCOL.md § Organization).
+  const adminBoardContent = ["1", "true"].includes(String(env.PLENARY_ADMIN_BOARD_CONTENT ?? "").trim().toLowerCase());
+  const tenancy = makeTenancy({ registry, adminBoardContent });
   // Hellos read roles through a per-process cache; the gateway invalidates it on `grants` and its timed pass reads fresh (p5-load).
-  const auth = authPort({ sessions, dev, tenancy: roleCache({ registry, now: Date.now }) });
+  const auth = authPort({ sessions, dev, tenancy: roleCache({ registry, now: Date.now, adminBoardContent }) });
   // Google sign-in only when both halves of the OAuth client are there; otherwise /auth answers 503.
   const oidc = env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET
     ? googleOidc({ clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET, redirectUri, fetch: fetchFn })

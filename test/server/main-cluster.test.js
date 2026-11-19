@@ -30,10 +30,13 @@ function spawn(env) {
 describe.skipIf(!PG || !NATS)("cluster: three main.js processes on Postgres + NATS", () => {
   let dbUrl, dbName, admin;
   const procs = [];
+  // Teardown does real process and database work (kill the children, then a forced DROP DATABASE that Postgres must finish
+  // under whatever load the machine has: 30 ms to 0.8 s measured on a busy one), so it gets an explicit budget rather than
+  // the 5 s default. The children are signalled together, then awaited together, so their exits overlap.
   afterAll(async () => {
-    for (const p of procs) { try { p.child.kill("SIGKILL"); await p.child.exited; } catch { /* gone */ } }
+    await Promise.all(procs.map(async p => { try { p.child.kill("SIGKILL"); await p.child.exited; } catch { /* gone */ } }));
     if (admin) { await admin.unsafe(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`).catch(() => {}); await admin.close(); }
-  });
+  }, 60_000);
 
   async function node(id, roles) {
     const p = spawn({ DATABASE_URL: dbUrl, NATS_URL: NATS, COOKIE_KEY: "c".repeat(40), ...S3_ENV(), PLENARY_DEV_TOKENS: TOKENS, LOG_LEVEL: "info",

@@ -8,6 +8,8 @@ import { join, resolve } from "node:path";
 import { sqliteRegistry } from "../../server/registry/sqlite.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { registryContract } from "../auth/registry-contract.js";
+import { legacyEquivalence } from "../auth/legacy-migration.js";
+import { Database } from "bun:sqlite";
 
 const dir = mkdtempSync(join(tmpdir(), "plenary-registry-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -16,6 +18,41 @@ const file = () => join(dir, `r${++n}.db`);
 
 // Platform's contract, on a fresh file per test (a file, not :memory:, so WAL and fsync are in play).
 registryContract("sqlite", async ({ now }) => sqliteRegistry({ path: file(), now, fullfsync: false }), { cleanup: r => r.close(), batch: true });
+
+// A database from before board organization: the seven original tables (their DDL as of 1d0bcbe), filled with a legacy state.
+const LEGACY_DDL = [
+  "CREATE TABLE reg_tenants (id TEXT PRIMARY KEY, domain TEXT UNIQUE, created_at INTEGER NOT NULL)",
+  "CREATE TABLE reg_tenant_admins (tenant TEXT NOT NULL REFERENCES reg_tenants(id), member TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (tenant, member))",
+  "CREATE TABLE reg_boards (id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), title TEXT NOT NULL, member_role TEXT, created_at INTEGER NOT NULL)",
+  "CREATE TABLE reg_grants (board TEXT NOT NULL REFERENCES reg_boards(id), member TEXT NOT NULL, role TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (board, member))",
+  `CREATE TABLE reg_invites (n INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES reg_boards(id), email TEXT NOT NULL, role TEXT NOT NULL,
+    expires_at INTEGER, revoked INTEGER NOT NULL, by_user TEXT, created_at INTEGER NOT NULL)`,
+  `CREATE TABLE reg_links (n INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES reg_boards(id), role TEXT NOT NULL, expires_at INTEGER,
+    revoked INTEGER NOT NULL, by_user TEXT, created_at INTEGER NOT NULL)`,
+  "CREATE TABLE reg_link_uses (board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES reg_links(id), n INTEGER NOT NULL, PRIMARY KEY (board, member, link))",
+];
+let legacyFile;
+legacyEquivalence("sqlite", {
+  async install(st) {
+    legacyFile = file();
+    const db = new Database(legacyFile, { create: true, strict: true });
+    db.run("PRAGMA journal_mode=WAL");
+    for (const sql of LEGACY_DDL) db.run(sql);
+    st.tenants.forEach(t => { db.run("INSERT INTO reg_tenants VALUES (?, ?, 1)", [t.id, t.domain]); t.admins.forEach((a, n) => db.run("INSERT INTO reg_tenant_admins VALUES (?, ?, ?)", [t.id, a, n + 1])); });
+    st.boards.forEach(b => db.run("INSERT INTO reg_boards VALUES (?, ?, ?, ?, 1)", [b.id, b.tenant, b.title, b.memberRole]));
+    st.grants.forEach((g, n) => db.run("INSERT INTO reg_grants VALUES (?, ?, ?, ?)", [g.board, g.user, g.role, n + 1]));
+    st.invites.forEach(i => db.run("INSERT INTO reg_invites (id, board, email, role, expires_at, revoked, by_user, created_at) VALUES (?, ?, ?, ?, ?, ?, 'x', 1)", [i.id, i.board, i.email, i.role, i.expiresAt, i.revoked ? 1 : 0]));
+    st.links.forEach(l => db.run("INSERT INTO reg_links (id, board, role, expires_at, revoked, by_user, created_at) VALUES (?, ?, ?, ?, ?, 'x', 1)", [l.id, l.board, l.role, l.expiresAt, l.revoked ? 1 : 0]));
+    st.uses.forEach((u, n) => db.run("INSERT INTO reg_link_uses VALUES (?, ?, ?, ?)", [u.board, u.user, u.link, n + 1]));
+    db.close();
+  },
+  async open() { const registry = sqliteRegistry({ path: legacyFile, now: () => 5_000_000, fullfsync: false }); return { registry, close: () => registry.close() }; },
+  async count() {
+    const db = new Database(legacyFile, { readonly: true });
+    try { const c = t => db.query(`SELECT count(*) AS c FROM ${t}`).get().c; return { boards: c("reg_boards"), grants: c("reg_grants"), invites: c("reg_invites"), links: c("reg_links") }; }
+    finally { db.close(); }
+  },
+});
 
 describe("sqlite registry", () => {
   test("pragmas: WAL, synchronous=FULL, fullfsync on by default; start-up leaves the whole busy_timeout", async () => {

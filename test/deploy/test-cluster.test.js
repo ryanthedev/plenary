@@ -6,12 +6,12 @@ import { tmpdir } from "node:os";
 import { join, relative, dirname } from "node:path";
 import { spawn as nodeSpawn } from "node:child_process";
 import { missingBins, rigStatus, isOurs, stopRig, STARTED_CLOCK, ownerGone, writeOwnerRecord, writeFileAtomic, reapStaleRigs, _setPsPath } from "../../scripts/cluster-rig.js";
-import { freshDir, track, cleanupAll, rigUp, spawnTracked, lstart } from "./rig-guard.js";
+import { freshDir, track, cleanupAll, CLEANUP_TIMEOUT_MS, rigUp, spawnTracked, lstart } from "./rig-guard.js";
 
 const ROOT = new URL("../..", import.meta.url).pathname;
 const SCRIPT = readFileSync(join(ROOT, "scripts/test-cluster.js"), "utf8");
 const SKIP = missingBins().length > 0;
-afterAll(() => cleanupAll());
+afterAll(() => cleanupAll(), CLEANUP_TIMEOUT_MS);
 
 const walk = d => readdirSync(d).flatMap(f => { const p = join(d, f); return statSync(p).isDirectory() ? walk(p) : [p]; });
 

@@ -8,7 +8,7 @@ import { test, expect, afterAll, describe } from "bun:test";
 import { rmSync, readFileSync, writeFileSync, existsSync, statSync, readdirSync, mkdirSync, renameSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { stopRig, rigStatus, killNode, readRig, isOurs, psInfo, TERMINAL_SIGNALS, STARTED_CLOCK, portFree, missingBins, _setPsPath, _setIpcPaths, _setLockHook, pgShmOf, removeOrphanShm, parseIpcsSegments, s3Env, parseArgs } from "../../scripts/cluster-rig.js";
-import { freshDir, track, rigUp as startRig, spawnTracked, cleanupAll, killRecorded, namingDir } from "./rig-guard.js";
+import { freshDir, track, rigUp as startRig, spawnTracked, cleanupAll, CLEANUP_TIMEOUT_MS, killRecorded, namingDir } from "./rig-guard.js";
 
 const ROOT = new URL("../..", import.meta.url).pathname;
 const RIG = join(ROOT, "scripts/cluster-rig.js");
@@ -20,7 +20,7 @@ if (SKIP) console.warn(`cluster-rig tests skipped: missing ${missing.join(", ")}
 
 // Stop anything a failed, timed-out or killed test left (recorded PIDs only; test/deploy/rig-guard.js), then remove only
 // the dirs this file created. Every in-process `up` here is rig-guard's rigUp (shared abort), every child is tracked.
-afterAll(() => cleanupAll());
+afterAll(() => cleanupAll(), CLEANUP_TIMEOUT_MS);
 
 const portsOf = rig => [rig.postgres?.port, rig.nats?.port, rig.nats?.monitorPort, Number(new URL(rig.blobs?.url ?? "http://127.0.0.1:0").port), rig.blobs?.consolePort, rig.lb?.port, ...rig.nodes.map(n => n.port)].filter(Boolean);
 // The test's own identity check, independent of the module's: lstart under a fixed TZ and locale.
@@ -416,6 +416,39 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
       killRecorded(seen[a], a); killRecorded(seen[b], b);   // with the dir: a SIGKILLed postmaster's segment goes too
     }
   }, 240_000);
+
+  // cleanupAll takes ONE ps snapshot and stops only the dirs it shows alive; these prove it still stops a leaked rig, never
+  // touches a live pid recorded with another start time, and checks every dir when the snapshot is unusable (fails, prints
+  // nothing, or prints a row that is not `pid stat lstart`). test/deploy/fixture-leaked-rig.js leaves a rig up and runs it.
+  // A snapshot that parses but shows none of the rig's processes would make the filter skip (leak) a live rig: the last
+  // two cases prove the full pass runs instead when an `up` is still in flight past the wait cap (N1) and when the ps
+  // cannot even be spawned (N2: cleanup still removes the dirs and clears the shared abort flag).
+  const OTHER_ROW = "echo '    1 Ss Mon Jan  1 00:00:00 2001'";
+  for (const [label, psBody, extra = {}] of [["the snapshot ps works", null], ["the snapshot ps fails", "exit 2"], ["the snapshot ps prints nothing", "exit 0"], ["the snapshot ps prints a valid row and a row in another format", "echo '    1 Ss Mon Jan  1 00:00:00 2001'; echo '  123 S+ not-a-date'"],
+                                              ["an `up` is still in flight past the wait cap", OTHER_ROW, { RIG_FIXTURE_INFLIGHT: "1" }], ["the snapshot ps cannot be spawned", null, { RIG_FIXTURE_PS: "/nonexistent/ps" }]]) {
+    test.skipIf(SKIP)(`Leaks: cleanupAll stops a rig a test left up and spares a live pid with another start time (${label})`, async () => {
+      const dir = freshDir(), out = join(freshDir(), "out.json"), fake = join(freshDir(), "fake-ps");
+      if (psBody) { writeFileSync(fake, `#!/bin/sh\n${psBody}\n`); chmodSync(fake, 0o755); }
+      const env = { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR ?? "/tmp", RIG_FIXTURE_DIR: dir, RIG_FIXTURE_OUT: out, ...(psBody ? { RIG_FIXTURE_PS: fake } : {}), ...extra };
+      const run = spawnTracked([process.execPath, "test", join(ROOT, "test/deploy/fixture-leaked-rig.js")], { cwd: ROOT, stdout: "pipe", stderr: "pipe", env });
+      let seen = null;
+      try {
+        expect(await run.exited).toBe(0);
+        seen = JSON.parse(readFileSync(out, "utf8"));
+        expect(seen.real.map(p => p.name)).toEqual(["postgres", "nats", "minio"]);
+        for (const p of seen.real) expect({ name: p.name, gone: psGone(p.pid) }).toEqual({ name: p.name, gone: true });
+        expect(namingDir(dir)).toEqual([]);
+        expect(existsSync(dir)).toBe(false);
+        expect(JSON.parse(readFileSync(`${out}.after`, "utf8"))).toEqual({ aborted: false });
+        expect(psInfo(seen.decoy.pid)?.started).toBe(seen.decoy.started);   // still the same live process (psInfo: null for a zombie)
+      } finally {
+        run.kill("SIGKILL");
+        if (seen) killRecorded([{ pid: seen.decoy.pid, started: seen.decoy.started }]);   // our own sleep, by pid and start time
+      }
+      for (let i = 0; i < 40 && !psGone(seen.decoy.pid); i++) await Bun.sleep(50);   // SIGKILL is delivered asynchronously
+      expect(psGone(seen.decoy.pid)).toBe(true);
+    }, 180_000);
+  }
 
   test("CLI: keys and dev tokens never reach stdout or stderr (up, status, status --json, kill, down, a failing up); files are 0600; rig.json has none", async () => {
     const dir = freshDir();

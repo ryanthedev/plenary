@@ -253,9 +253,10 @@ function must(r, what) {
   return r;
 }
 
-class Stack {
-  constructor(rt, pid, owner = ownerString(pid)) {
-    this.rt = rt; this.pid = pid; this.owner = owner;
+export class Stack {
+  constructor(rt, pid, owner = ownerString(pid), runFn = run) {
+    this.rt = rt; this.pid = pid; this.owner = owner; this.runFn = runFn;
+    this.owned = false;   // true only once this run has checked the project is empty and is about to create things in it: teardown touches nothing before
     this.project = `plenary-c3-${pid}`; this.image = `plenary-c3-${pid}:test`;
     this.built = false; this.started = false; this.ports = {};
     this.pw = randomBytes(9).toString("hex");
@@ -265,9 +266,15 @@ class Stack {
     delete this.env.DATABASE_URL; delete this.env.NATS_URL;   // never inherit another stack's
   }
   // Teardown passes `detached` (shielded from Ctrl-C, and from the abort signal); everything else is killed when the run aborts.
-  compose(args, o = {}) { return run([...this.rt.compose, "-p", this.project, ...FILES.flatMap(f => ["-f", f]), ...args], { env: this.env, ...(o.detached ? {} : { signal: ac.signal }), ...o }); }
-  cli(args, o = {}) { return run([this.rt.cli, ...args], { env: this.env, ...(o.detached ? {} : { signal: ac.signal }), ...o }); }
+  compose(args, o = {}) { return this.runFn([...this.rt.compose, "-p", this.project, ...FILES.flatMap(f => ["-f", f]), ...args], { env: this.env, ...(o.detached ? {} : { signal: ac.signal }), ...o }); }
+  cli(args, o = {}) { return this.runFn([this.rt.cli, ...args], { env: this.env, ...(o.detached ? {} : { signal: ac.signal }), ...o }); }
 
+  /** Refuses (and leaves everything alone) when the project already has resources; otherwise this run owns the project from here. */
+  async claim() {
+    const stale = await this.projectResources();
+    if (stale.length) fail(`project ${this.project} already has resources an owner that may be alive made: ${stale.join(", ")}`);
+    this.owned = true;
+  }
   async build() {
     if ((await this.cli(["image", "inspect", this.image])).code === 0) fail(`image ${this.image} already exists; refusing to overwrite and delete it`);
     this.built = true;
@@ -296,20 +303,24 @@ class Stack {
     const r = await this.compose(["logs", "--no-color", "--tail", String(tail)], { timeoutMs: 60_000, detached: true });
     return r.out || r.err;
   }
-  /** What is left of this run: Compose containers, volumes, networks (by project label) and the image. */
-  async leftovers() {
-    const label = `label=com.docker.compose.project=${this.project}`;
-    const found = [];
-    for (const [kind, args] of [["container", ["ps", "-a", "-q", "--filter", label]], ["volume", ["volume", "ls", "-q", "--filter", label]], ["network", ["network", "ls", "-q", "--filter", label]]]) {
+  /** Everything labelled with this project, whoever made it (the check before a run starts: it must be empty). */
+  async projectResources() { return this.#find([`label=com.docker.compose.project=${this.project}`], false); }
+  /** What is left of THIS run: the project's containers, volumes and networks that also carry this run's owner label, and the image if it does. */
+  async leftovers() { return this.#find([`label=com.docker.compose.project=${this.project}`, `label=${OWNER_LABEL}=${this.owner}`], true); }
+  async #find(filters, ownedOnly) {
+    const found = [], f = filters.flatMap(x => ["--filter", x]);
+    for (const [kind, args] of [["container", ["ps", "-a", "-q", ...f]], ["volume", ["volume", "ls", "-q", ...f]], ["network", ["network", "ls", "-q", ...f]]]) {
       const r = await this.cli(args, { detached: true });
       if (r.code !== 0) found.push(`${kind}: could not list (${r.err.slice(0, 100)})`);
       else for (const l of r.out.split("\n").filter(Boolean)) found.push(`${kind} ${l}`);
     }
-    if ((await this.cli(["image", "inspect", this.image], { detached: true })).code === 0) found.push(`image ${this.image}`);
+    const img = await this.cli(["image", "inspect", "--format", `{{index .Config.Labels "${OWNER_LABEL}"}}`, this.image], { detached: true });
+    if (img.code === 0 && (!ownedOnly || img.out.trim() === this.owner)) found.push(`image ${this.image}`);
     return found;
   }
   /** Teardown, shielded from a terminal Ctrl-C and the abort signal. Returns what is still left (empty = clean). */
   async teardown(keepImage = false) {
+    if (!this.owned) return [];   // never created anything here (the project was not ours to touch): nothing to remove
     const opts = { detached: true, timeoutMs: 180_000 };
     let left = [], why = "";
     if (this.started || (await this.leftovers()).length) {
@@ -320,15 +331,36 @@ class Stack {
       }
     }
     if (left.length) {   // last resort: remove what carries the project label directly
-      const label = `label=com.docker.compose.project=${this.project}`;
+      const f = ["--filter", `label=com.docker.compose.project=${this.project}`, "--filter", `label=${OWNER_LABEL}=${this.owner}`];   // both: another run's same-named project is never ours
       for (const [list, rm] of [[["ps", "-a", "-q"], ["rm", "-f", "-v"]], [["network", "ls", "-q"], ["network", "rm"]], [["volume", "ls", "-q"], ["volume", "rm", "-f"]]]) {
-        const ids = (await this.cli([...list, "--filter", label], opts)).out.split("\n").filter(Boolean);
+        const ids = (await this.cli([...list, ...f], opts)).out.split("\n").filter(Boolean);
         if (ids.length) await this.cli([...rm, ...ids], opts);
       }
     }
-    if (this.built && !keepImage) await this.cli(["rmi", "-f", this.image], opts);
+    if (this.built && !keepImage) await this.cli(["rmi", "-f", this.image], opts);   // `built` is set only after build() saw the tag free: it is our image
     left = await this.leftovers();
     return left.length && why ? [...left, `(last down said: ${why})`] : left;
+  }
+}
+
+// ---- keeping clients connected ---------------------------------------------------------------------------------------
+
+export const ABANDON_MS = 15_000;
+/** Stamp `busySince` whenever a client's connect or reconnect starts, from any caller (the script, the client's own resync, keepAlive). */
+export function trackBusy(c, clock = Date.now) {
+  for (const m of ["connect", "reconnect"]) { const f = c[m].bind(c); c[m] = (...a) => { if (!c.busy) c.busySince = clock(); return f(...a); }; }   // a call that joins one already in flight does not restart its clock
+  return c;
+}
+/**
+ * One keep-alive pass over the clients: a closed one that is not already (re)connecting reconnects, at most every 300 ms; one
+ * whose connect has been pending for ABANDON_MS since it STARTED is abandoned (a socket that closed before it opened raises no
+ * error, so the promise never settles) and tried again.
+ */
+export function tickClients(clients, now = Date.now(), abandonMs = ABANDON_MS) {
+  for (const c of clients) {
+    if (c.open) continue;
+    if (c.busy && now - (c.busySince ?? now) > abandonMs) { c.connecting = null; c.reconnecting = null; }
+    if (!c.busy && now - (c.lastTry ?? 0) > 300) { c.lastTry = now; c.reconnect().catch(() => {}); }
   }
 }
 
@@ -373,19 +405,12 @@ async function scenario(stack, report) {
       const c = client(fake, name, name, { board: board.id, maxWaitMs: 250 });
       c.homeNode = home; c.lastNode = null; c.lastTry = 0;
       c.at = () => (c.open ? c.lastNode : null);
+      trackBusy(c);
       clients.push(c);
       return c;
     };
     // Keeps every client connected: one whose socket is gone and is not already reconnecting tries again.
-    keepAlive = setInterval(() => {
-      for (const c of clients) {
-        if (c.open) continue;
-        const idle = Date.now() - c.lastTry;
-        // A connect that never settles (a socket that closed before it opened raises no error) is abandoned after 15 s.
-        if (c.busy && idle > 15_000) { c.connecting = null; c.reconnecting = null; }
-        if (!c.busy && idle > 300) { c.lastTry = Date.now(); c.reconnect().catch(() => {}); }
-      }
-    }, 100);
+    keepAlive = setInterval(() => tickClients(clients), 100);
     const ed1 = mk("ed1", "app-1"), ed2 = mk("ed2", "app-2"), view = mk("view", "app-3");
     for (const c of [ed1, ed2, view]) c.connect().catch(() => {});
     await waitFor("three clients welcomed", () => [ed1, ed2, view].every(c => c.open && c.r.welcomed), 60_000);
@@ -582,8 +607,7 @@ async function main() {
   const deadline = setTimeout(() => abortRun("the run deadline"), RUN_DEADLINE_MS);
   const t0 = Date.now();
   try {
-    const stale = await stack.leftovers();
-    if (stale.length) fail(`project ${stack.project} already has resources an owner that may be alive made: ${stale.join(", ")}`);
+    await stack.claim();
     await stack.build();
     report.buildSeconds = Math.round((Date.now() - t0) / 100) / 10;
     await stack.up();

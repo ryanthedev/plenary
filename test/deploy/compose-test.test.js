@@ -3,7 +3,7 @@
 import { test, expect } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { detectRuntime, skipDecision, alive, sameStart, machineId, ownerString, parseOwner, ownerDead, sweep, run, TIMEOUT_CODE } from "../../scripts/test-compose.js";
+import { detectRuntime, skipDecision, alive, sameStart, machineId, ownerString, parseOwner, ownerDead, sweep, run, TIMEOUT_CODE, Stack, trackBusy, tickClients, ABANDON_MS } from "../../scripts/test-compose.js";
 
 const ROOT = join(import.meta.dir, "../..");
 const ok = (out = "") => ({ code: 0, out });
@@ -167,4 +167,88 @@ test("the test override: short lease, no restart, random loopback ports, limits,
   const script = readFileSync(join(ROOT, "scripts/test-compose.js"), "utf8");
   expect(script).toContain('"down", "-v", "--remove-orphans"');
   expect(script.indexOf('process.on(sig, () => abortRun(sig))')).toBeLessThan(script.indexOf("await sweep("));   // signal handlers before the sweep
+});
+
+/** A fake `run` over labelled containers/networks/volumes: understands `--filter label=k[=v]` (all must match) and records every command. */
+function fakeRun(objects, { imageOwner = null } = {}) {
+  const calls = [];
+  const run = async (cmd, o = {}) => {
+    const a = cmd.slice(1); calls.push(a);
+    const filters = a.flatMap((x, i) => (x === "--filter" ? [a[i + 1].replace(/^label=/, "")] : []));
+    const match = ob => filters.every(f => { const [k, v] = f.split(/=(.*)/s); return v === undefined ? k in ob.labels : ob.labels[k] === v; });
+    const kind = a[0] === "ps" ? "container" : a[0] === "network" && a[1] === "ls" ? "network" : a[0] === "volume" && a[1] === "ls" ? "volume" : null;
+    if (kind) return { code: 0, out: objects.filter(x => x.kind === kind && match(x)).map(x => x.id).join("\n"), err: "" };
+    if (a[0] === "image" && a[1] === "inspect") return imageOwner === null ? { code: 1, out: "", err: "none" } : { code: 0, out: imageOwner, err: "" };
+    if (a[0] === "rm" || a[1] === "rm" || a[0] === "rmi") { const ids = a.slice(a.indexOf("-v") >= 0 ? a.indexOf("-v") + 1 : a[0] === "rmi" ? 2 : a[1] === "rm" ? 2 : 2); for (const id of ids) { const i = objects.findIndex(x => x.id === id); if (i >= 0) objects.splice(i, 1); } return { code: 0, out: "", err: "" }; }
+    return { code: 0, out: "", err: "" };   // compose down and the rest: succeeds and removes nothing, so the direct removal has to
+  };
+  return { run, calls };
+}
+const RT = { cli: "/x/docker", cliName: "docker", compose: ["/x/docker", "compose"], env: {} };
+const PROJECT = "plenary-c3-77";
+const lbl = owner => ({ "com.docker.compose.project": PROJECT, "plenary.c3.owner": owner });
+
+test("a project that already has resources is not claimed, and teardown then runs nothing at all", async () => {
+  const objs = [{ id: "theirs", kind: "container", labels: lbl(own(77, "OTHER")) }];
+  const f = fakeRun(objs);
+  const stack = new Stack(RT, 77, own(77, "MINE"), f.run);
+  await expect(stack.claim()).rejects.toThrow(/already has resources/);
+  expect(stack.owned).toBe(false);
+  const calls = f.calls.length;
+  expect(await stack.teardown()).toEqual([]);
+  expect(f.calls.length).toBe(calls);                 // not one more command: no down, no rm, no rmi
+  expect(objs).toHaveLength(1);
+});
+
+test("teardown removes this run's resources and never a same-named project's other owner's", async () => {
+  const mine = own(77, "MINE");
+  const objs = [
+    { id: "c-mine", kind: "container", labels: lbl(mine) }, { id: "n-mine", kind: "network", labels: lbl(mine) }, { id: "v-mine", kind: "volume", labels: lbl(mine) },
+    { id: "c-theirs", kind: "container", labels: lbl(own(77, "OTHER")) }, { id: "n-theirs", kind: "network", labels: lbl(own(77, "OTHER")) },
+  ];
+  const f = fakeRun(objs);
+  const stack = new Stack(RT, 77, mine, f.run);
+  await stack.claim().catch(() => {});                // the project is not empty (theirs), so this is not claimed...
+  expect(stack.owned).toBe(false);
+  stack.owned = true;                                 // ...force it, as a run that did create things would be
+  const left = await stack.teardown();
+  expect(left).toEqual([]);                           // nothing of ours remains
+  expect(objs.map(x => x.id).sort()).toEqual(["c-theirs", "n-theirs"]);   // theirs untouched
+});
+
+test("leftovers reports the image only when it carries this run's owner label", async () => {
+  const mine = own(77, "MINE");
+  expect(await new Stack(RT, 77, mine, fakeRun([], { imageOwner: own(77, "OTHER") }).run).leftovers()).toEqual([]);
+  expect(await new Stack(RT, 77, mine, fakeRun([], { imageOwner: mine }).run).leftovers()).toEqual(["image plenary-c3-77:test"]);
+});
+
+/** A fake protocol client with the parts keepAlive touches. */
+function fakeClient() {
+  const c = { open: false, connecting: null, reconnecting: null, lastTry: 0, calls: 0,
+    get busy() { return !!(c.connecting || c.reconnecting); },
+    connect() { c.connecting = new Promise(() => {}); return c.connecting; },    // never settles: a socket that closed before it opened
+    reconnect() { c.calls++; c.reconnecting = new Promise(() => {}); return c.reconnecting; } };
+  return c;
+}
+
+test("keep-alive: a connect started now is not abandoned at once; one pending longer than ABANDON_MS is, and is retried", () => {
+  const c = trackBusy(fakeClient(), () => 1_000_000);
+  c.connect();                                        // started by the script, never by keepAlive: lastTry is still 0
+  expect(c.busySince).toBe(1_000_000);
+  tickClients([c], 1_000_100);                        // 100 ms later: busy, young
+  expect(c.connecting).not.toBeNull();
+  expect(c.calls).toBe(0);
+  tickClients([c], 1_000_000 + ABANDON_MS + 1);       // pending too long: abandoned, then reconnected in the same pass
+  expect(c.calls).toBe(1);
+  expect(c.connecting).toBeNull();
+});
+
+test("keep-alive: a manual reconnect() is timed from when it started, a joining call does not restart the clock, an open client is left alone", () => {
+  let now = 5_000;
+  const c = trackBusy(fakeClient(), () => now);
+  c.reconnect(); expect(c.busySince).toBe(5_000);
+  now = 9_000; c.reconnect(); expect(c.busySince).toBe(5_000);
+  tickClients([c], 5_000 + ABANDON_MS - 1); expect(c.reconnecting).not.toBeNull();
+  const open = Object.assign(fakeClient(), { open: true });
+  tickClients([open], 99_999_999); expect(open.calls).toBe(0);
 });

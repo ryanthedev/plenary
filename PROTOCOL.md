@@ -1090,7 +1090,7 @@ submit**. Without the header a create behaves as before.
   stored `owner-grant-failed` is authorized like the board create. A link's `id` is itself its capability; it is the same id `reg_links` holds in the
   same store, and it is returned only after the manager check.
 - **Which failures free the key (B1).** Only an error that **proves nothing was written**: a refusal from the use case (`forbidden`, `not-found`,
-  `bad-request`) or a Registry call that rolled back before it began (`queue-timeout`, `overloaded`, `lock-timeout`, `statement-timeout`). The claim
+  `bad-request`) or a Registry call whose rejection carries `rolledBack` (§ Registry port: Postgres `queue-timeout`, `overloaded`, `lock-timeout`, `statement-timeout`; SQLite `SQLITE_BUSY*`, `SQLITE_LOCKED*`), so http.js knows no adapter's codes. The claim
   is then dropped and the retry runs again. **Any other failure keeps the key** (a `client-timeout`, a dropped connection, a bug): the create may have
   committed, so the retry is `409 in-progress` until the claim expires (5 min), and only then runs again. The same holds for a crash between the
   create and its stored answer. After an unclear failure, wait or look at what was created before retrying with a new key.

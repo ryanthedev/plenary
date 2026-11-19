@@ -238,14 +238,14 @@ test("B1 a create that COMMITS and then fails unclearly (client-timeout) keeps t
 
 test("B1 an error that proves nothing was written (queue-timeout, a refusal) frees the key: the retry creates once", async () => {
   let n = 0;
-  hooks.before.createBoard = () => { if (n++ === 0) throw Object.assign(new Error("queue"), { code: "queue-timeout" }); };
+  hooks.before.createBoard = () => { if (n++ === 0) throw Object.assign(new Error("queue"), { rolledBack: true }); };
   expect((await post("/boards", { title: "Again" }, { key: K })).status).toBe(503);
   expect(await boards()).toHaveLength(0);
   const retry = await post("/boards", { title: "Again" }, { key: K });
   expect(retry.status).toBe(201);
   expect(await boards()).toHaveLength(1);
-  for (const code of ["overloaded", "lock-timeout", "statement-timeout"]) {
-    hooks.before.createBoard = () => { throw Object.assign(new Error(code), { code }); };
+  for (const code of ["a", "b", "c"]) {   // any adapter's rolled-back error frees its key
+    hooks.before.createBoard = () => { throw Object.assign(new Error(code), { rolledBack: true }); };
     await post("/boards", { title: code }, { key: "key-" + code });
     expect(mem.idemSize()).toBe(1);                          // each released its own claim: only the finished one is left
   }

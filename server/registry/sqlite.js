@@ -133,7 +133,8 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       member TEXT NOT NULL, board TEXT NOT NULL REFERENCES reg_boards(id), opened_at INTEGER NOT NULL, PRIMARY KEY (member, board))`);
     db.run(`CREATE TABLE IF NOT EXISTS reg_stars (
       member TEXT NOT NULL, board TEXT NOT NULL REFERENCES reg_boards(id), at INTEGER NOT NULL, PRIMARY KEY (member, board))`);
-    // Idempotent creates (PROTOCOL.md): one row per (member, key); `result` NULL while the create runs. Additive.
+    // Idempotent creates (PROTOCOL.md): one row per (member, key); `result` NULL while the create runs. Additive. No migration for `claim`:
+    // the table never shipped without it (it first appears in this branch).
     db.run(`CREATE TABLE IF NOT EXISTS reg_idempotency (
       member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, claim TEXT NOT NULL, result TEXT, at INTEGER NOT NULL, PRIMARY KEY (member, k))`);
     db.run("CREATE INDEX IF NOT EXISTS reg_idempotency_at ON reg_idempotency (at)");
@@ -478,7 +479,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
   /** `accessContexts`: every scope's context from ONE transaction (one snapshot). */
   const contextsTx = db.transaction((list, users) => list.map(sc => [sc.type + "\n" + sc.id, contextTx(sc.type, sc.id, users, null)]));
 
-  return {
+  const api = {
     async createTenant({ domain, domains = [], kind = "company", admins = [] }) {
       ready();
       if (!KINDS.includes(kind)) throw new Error("registry: bad unit kind");
@@ -770,6 +771,16 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
 
     async close() { if (!open) return; open = false; db.close(); },
   };
+  // A busy or locked database rolled the call back before it wrote anything: say so on the error (`rolledBack`, registry-port.js), so a caller
+  // that must know whether a write may have happened (the idempotency key's release, http.js) needs no knowledge of SQLite's codes.
+  for (const [name, f] of Object.entries(api)) {
+    if (f.constructor.name !== "AsyncFunction") continue;
+    api[name] = async function (...args) {
+      try { return await f.apply(this, args); }
+      catch (err) { if (typeof err?.code === "string" && (err.code.startsWith("SQLITE_BUSY") || err.code.startsWith("SQLITE_LOCKED"))) err.rolledBack = true; throw err; }
+    };
+  }
+  return api;
 }
 
 /** The name the p3-registry brief used. */

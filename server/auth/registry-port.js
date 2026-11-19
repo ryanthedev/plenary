@@ -8,6 +8,10 @@
 // write are one atomic step (in one JS process: no await between them; in SQL: one transaction or a conditional
 // write), and a refused call changes nothing. Caller rules (who may grant what) live in server/admin/boards.js.
 //
+// `rolledBack`: an adapter sets `err.rolledBack = true` on a rejection that GUARANTEES the call wrote nothing (a busy or locked database, a
+// refused queue slot, a lock or statement limit that rolled the transaction back). Any other rejection (a timeout with no answer, a dropped
+// connection) may have committed. http.js frees an idempotency key only for `rolledBack` errors (PROTOCOL.md "Idempotent creates").
+//
 // Failure semantics (what a second adapter must honour): a lookup of something absent resolves to null / [] /
 // false; a write against a missing tenant / board / link rejects; an infrastructure failure (database down,
 // timeout) REJECTS, never resolves to null, because callers turn null into a refusal ("no role") and a rejection

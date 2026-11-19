@@ -94,9 +94,8 @@ const XCHG_ATTRS = "Path=/; Secure; HttpOnly; SameSite=Strict";
 const DEV_MENU_WAIT_MS = 3000;
 /** The default request deadline (PROTOCOL.md "HTTP request deadline"): under the idle cut (server.js sets 30 s; Bun's own default is 10 s) and the inner limits main.js sets. */
 export const REQUEST_DEADLINE_MS = 8000;
-/** Registry-adapter codes of a call that rolled back before writing (Postgres gate and timeouts); an AdminError is a refusal made before any write. */
-const NO_WRITE = new Set(["queue-timeout", "overloaded", "lock-timeout", "statement-timeout"]);
-const wroteNothing = e => e instanceof AdminError || NO_WRITE.has(e?.code);
+/** Did this failure write nothing? An AdminError is a refusal made before any write; an adapter marks a rolled-back call `rolledBack` (registry-port.js). */
+const wroteNothing = e => e instanceof AdminError || e?.rolledBack === true;
 /** `Idempotency-Key`: 8-64 of [A-Za-z0-9_-] (PROTOCOL.md "Idempotent creates"). */
 const IDEM_KEY = /^[A-Za-z0-9_-]{8,64}$/;
 const NO_STORE = { "cache-control": "no-store" };
@@ -408,7 +407,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
         throw e;
       }
     }
-    // If this write fails the claim expires (60 s) and a retry runs again: the same "may have applied" a keyless create has.
+    // If this write fails the claim expires (IDEM.claimMs, 5 min) and a retry runs again: the same "may have applied" a keyless create has.
     await registry.idemFinish(user, k, c.claim, JSON.stringify({ status: out.status, ref: out.ref })).catch(() => {});
     return json(out.status, out.body);
   }

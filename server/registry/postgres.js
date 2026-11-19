@@ -82,7 +82,11 @@ import { needSchema, migrate, missing as absent } from "../pg/schema.js";
  */
 export class PgRegistryError extends Error {
   /** @param {"last-owner" | "lock-timeout" | "statement-timeout" | "overloaded" | "queue-timeout" | "client-timeout"} code */
-  constructor(code, message, options) { super(message, options); this.name = "RegistryError"; this.code = code; }
+  constructor(code, message, options) {
+    super(message, options); this.name = "RegistryError"; this.code = code;
+    // The call never began or was rolled back (registry-port.js, `rolledBack`): a queue refusal, or a lock or statement limit inside a transaction.
+    if (["queue-timeout", "overloaded", "lock-timeout", "statement-timeout"].includes(code)) this.rolledBack = true;
+  }
 }
 
 const UNIQUE = "23505";
@@ -123,7 +127,8 @@ const REGISTRY_TABLE_DDL = {
   // Home (PROTOCOL.md § Home): Recent and Starred. Additive, like the organization tables.
   reg_recents: "member TEXT NOT NULL, board TEXT NOT NULL REFERENCES $S.reg_boards(id), opened_at BIGINT NOT NULL, PRIMARY KEY (member, board)",
   reg_stars: "member TEXT NOT NULL, board TEXT NOT NULL REFERENCES $S.reg_boards(id), at BIGINT NOT NULL, PRIMARY KEY (member, board)",
-  // Idempotent creates (PROTOCOL.md): one row per (member, key); `result` NULL while the create runs. Additive.
+  // Idempotent creates (PROTOCOL.md): one row per (member, key); `result` NULL while the create runs. Additive. No migration for `claim`:
+  // the table never shipped without it (it first appears in this branch).
   reg_idempotency: "member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, claim TEXT NOT NULL, result TEXT, at BIGINT NOT NULL, PRIMARY KEY (member, k)",
   reg_roles: "tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), id TEXT NOT NULL, name TEXT NOT NULL, base TEXT, board_role TEXT, permissions TEXT NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY (tenant, id)",
 };

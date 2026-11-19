@@ -238,6 +238,9 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
   /** Owner grants that guard a Group or Space: a user's, or a Team's while the Team has a member. */
   const countedOwners = (q, type, id) => q.unsafe(`SELECT subject_type, subject FROM ${SG} g WHERE scope_type = $1 AND scope_id = $2 AND role = 'owner'
     AND (subject_type = 'user' OR EXISTS (SELECT 1 FROM ${TU} m WHERE m.team = g.subject))`, [type, id]);
+  /** The Groups and Spaces a Team is an owner of, in lock order. */
+  const ownedBy = (q, team) => q.unsafe(`SELECT scope_type, scope_id FROM ${SG} WHERE subject_type = 'team' AND subject = $1 AND role = 'owner'
+    AND scope_type IN ('group', 'space') ORDER BY scope_type, scope_id`, [team]);
   const putSg = async (tx, type, id, st, sid, role) => {
     if (role == null) await tx.unsafe(`DELETE FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 AND subject_type = $3 AND subject = $4`, [type, id, st, sid]);
     else await tx.unsafe(`INSERT INTO ${SG} (scope_type, scope_id, subject_type, subject, role) VALUES ($1, $2, $3, $4, $5)
@@ -515,14 +518,20 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         if (!(await one(tx, `SELECT 1 AS x FROM ${TE} WHERE id = $1`, [team]))) throw new Error("registry: no such team");
         if (member) { await tx.unsafe(`INSERT INTO ${TU} (team, member) VALUES ($1, $2) ON CONFLICT (team, member) DO NOTHING`, [team, u]); return; }
         // Removing the last member of a Team that is the only counted owner of a Group or Space would leave it ownerless.
-        // Lock those containers first (in id order, like setScopedGrant's single lock, so two callers can't deadlock), then count.
-        const owned = await tx.unsafe(`SELECT scope_type, scope_id FROM ${SG} WHERE subject_type = 'team' AND subject = $1 AND role = 'owner'
-          AND scope_type IN ('group', 'space') ORDER BY scope_type, scope_id`, [team]);
+        // Lock order, here and in setScopedGrant, is container first, then the Team's member rows (never the Team row):
+        //   1. lock the Group and Space rows the Team owns now (in id order);
+        //   2. lock all of the Team's member rows (two removals of one Team serialise here), and delete ours;
+        //   3. only if the Team is now empty, read its owned containers AGAIN (grants made while we waited are visible) and
+        //      refuse if any has no counted owner left (the Team no longer counts: our delete is visible to us).
+        // A demotion that counts this Team as an owner takes FOR SHARE on these member rows first, so it either waits for
+        // our commit and then sees an empty Team, or holds them and makes our delete wait and re-read.
+        const owned = await ownedBy(tx, team);
         for (const o of owned) await tx.unsafe(`SELECT id FROM ${o.scope_type === "group" ? GR : SP} WHERE id = $1 FOR UPDATE`, [o.scope_id]);
-        const left = Number((await one(tx, `SELECT count(*) AS c FROM ${TU} WHERE team = $1 AND member <> $2`, [team, u])).c);
-        if (!left) for (const o of owned)
-          if ((await countedOwners(tx, o.scope_type, o.scope_id)).length <= 1) throw new PgRegistryError("last-owner", `a ${o.scope_type} keeps at least one owner`);
+        await tx.unsafe(`SELECT 1 FROM ${TU} WHERE team = $1 ORDER BY member FOR UPDATE`, [team]);
         await tx.unsafe(`DELETE FROM ${TU} WHERE team = $1 AND member = $2`, [team, u]);
+        if (Number((await one(tx, `SELECT count(*) AS c FROM ${TU} WHERE team = $1`, [team])).c) === 0)
+          for (const o of await ownedBy(tx, team))
+            if (!(await countedOwners(tx, o.scope_type, o.scope_id)).length) throw new PgRegistryError("last-owner", `a ${o.scope_type} keeps at least one owner`);
       });
     },
     async teamMembers(team) {
@@ -542,6 +551,10 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
           await tx.unsafe(`SELECT id FROM ${type === "group" ? GR : SP} WHERE id = $1 FOR UPDATE`, [id]);
           const cur = (await one(tx, `SELECT role FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 AND subject_type = $3 AND subject = $4`, [type, id, sub.type, sub.id]))?.role;
           if (cur === "owner" && r !== "owner") {
+            // Counting a Team owner reads its member rows: share-lock them first, so a member leaving at this moment is
+            // either already committed (we see an empty Team) or waits for us, then re-reads our change (container, then members).
+            await tx.unsafe(`SELECT 1 FROM ${TU} WHERE team IN (SELECT subject FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 AND subject_type = 'team' AND role = 'owner')
+              ORDER BY team, member FOR SHARE`, [type, id]);
             const counted = await countedOwners(tx, type, id);
             if (counted.some(o => o.subject_type === sub.type && o.subject === sub.id) && counted.length <= 1)
               throw new PgRegistryError("last-owner", `a ${type} keeps at least one owner`);
@@ -647,9 +660,8 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     },
     async boardsIn(scope, { after = null, limit } = {}) {
       ready();
-      const { type, id } = orgDefaults.scope(scope), n = pageLimit(limit);
+      const { type, id } = orgDefaults.scope(scope), n = pageLimit(limit), cur = orgDefaults.cursor(after, "id");
       if (!key(id) || type === "board") return { ids: [], next: null };
-      const cur = key(after) ? after : null;
       const text = type === "unit" ? `SELECT id FROM ${BD} WHERE tenant = $1 AND ($2::text IS NULL OR id > $2) ORDER BY id LIMIT $3`
         : type === "space" ? `SELECT board AS id FROM ${BS} WHERE space = $1 AND ($2::text IS NULL OR board > $2) ORDER BY board LIMIT $3`
         : `SELECT bs.board AS id FROM ${BS} bs JOIN ${SP} s ON s.id = bs.space WHERE s.grp = $1 AND ($2::text IS NULL OR bs.board > $2) ORDER BY bs.board LIMIT $3`;
@@ -658,11 +670,11 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     },
     async scopesOf(subject, { after = null, limit } = {}) {
       ready();
-      const sub = orgDefaults.subject(subject), n = pageLimit(limit);
+      const sub = orgDefaults.subject(subject), n = pageLimit(limit), cur = orgDefaults.cursor(after, "scope");
       if (!key(sub.id)) return { scopes: [], next: null };
       const rows = (await db.unsafe(`SELECT scope_type, scope_id, role FROM ${SG} WHERE subject_type = $1 AND subject = $2
         AND ($3::text IS NULL OR (scope_type, scope_id) > ($3, $4)) ORDER BY scope_type, scope_id LIMIT $5`,
-        [sub.type, sub.id, ...(key(after) && after.includes("\n") ? [after.slice(0, after.indexOf("\n")), after.slice(after.indexOf("\n") + 1)] : [null, null]), n + 1])).map(r => ({ type: r.scope_type, id: r.scope_id, role: r.role }));
+        [sub.type, sub.id, ...(cur ? [cur.slice(0, cur.indexOf("\n")), cur.slice(cur.indexOf("\n") + 1)] : [null, null]), n + 1])).map(r => ({ type: r.scope_type, id: r.scope_id, role: r.role }));
       const scopes = rows.slice(0, n);
       return { scopes, next: rows.length > n ? scopes[n - 1].type + "\n" + scopes[n - 1].id : null };
     },

@@ -458,6 +458,8 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect((await r.boardsIn({ type: "unit", id: t.id }, { limit: 10_000 })).ids).toHaveLength(13);
         expect(await r.boardsIn({ type: "board", id: ids.s1[0] })).toEqual({ ids: [], next: null });
         expect(await r.boardsIn({ type: "space", id: "s-nope00000000" })).toEqual({ ids: [], next: null });
+        for (const bad of ["", 5, "a\nb", {}]) await expect(r.boardsIn({ type: "unit", id: t.id }, { after: bad })).rejects.toThrow("bad cursor");   // never a silent restart
+        expect((await r.boardsIn({ type: "unit", id: t.id }, { after: "b-zzzzzzzzzzzzzzzz" })).ids).toEqual([]);                              // unknown but well formed: a position
         expect((await r.boardsIn({ type: "unit", id: t.id }, { limit: 0 })).ids.length).toBeGreaterThan(0);    // a non-positive limit means the default, never "all"
       });
 
@@ -479,6 +481,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect((await r.scopesOf({ type: "user", id: "google:ann" })).scopes).toEqual([{ type: "space", id: sp.id, role: "owner" }]);
         expect(await r.scopesOf({ type: "user", id: "google:nobody" })).toEqual({ scopes: [], next: null });
         await expect(r.scopesOf({ type: "robot", id: "x" })).rejects.toThrow();
+        for (const bad of ["", "space", "planet\nx", "space\n", 7]) await expect(r.scopesOf(subject, { after: bad })).rejects.toThrow("bad cursor");
       });
 
       test("roles: create (minted id, cap fields kept), update, the editable member role is created on first update, list is per tenant", async () => {

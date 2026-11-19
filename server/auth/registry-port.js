@@ -41,8 +41,10 @@
 //
 // boardsIn / scopesOf exist so that a change to a Space's, Group's or Unit's grants (or to a Team's membership) can be
 // announced for every board it reaches, which the port otherwise couldn't list (PROTOCOL.md § Organization, "Freshness").
-// Both page by an opaque cursor (`after` = the last id / scope of the previous page, `next` = null at the end), `limit`
-// defaults to 500 and is capped at 1000, and each page is one bounded statement.
+// Both page by an opaque cursor (`after` = the previous page's `next`, `next` = null at the end), `limit` defaults to 500
+// and is capped at 1000, and each page is one bounded statement. A MALFORMED cursor (not a string a page returned, so
+// not an id for boardsIn nor "<type>\n<id>" for scopesOf) is refused: the call rejects with "registry: bad cursor".
+// An unknown but well-formed one is just a position; it never restarts the listing.
 //
 // Last owner for Groups and Spaces counts a Team owner only while the Team has at least one member (an empty Team
 // guards nothing), and `setTeamMember` refuses to remove the last member of a Team that is the only counted owner of
@@ -172,6 +174,20 @@ export const orgDefaults = {
   subject(s) {
     if (!s || (s.type !== "user" && s.type !== "team") || typeof s.id !== "string" || !s.id || s.id.includes("\0")) fail("subject");
     return { type: s.type, id: s.id };
+  },
+  /**
+   * A page cursor (`after` of boardsIn / scopesOf) as an adapter applies it: null/undefined = the first page; otherwise it
+   * must be what a previous page's `next` was (boardsIn: a board id; scopesOf: "<type>\n<id>"), else it is REFUSED with
+   * "registry: bad cursor" rather than silently restarting from the beginning (a caller looping on `next` would never end).
+   * An unknown but well-formed cursor is just a position.
+   * @param {"id"|"scope"} kind
+   */
+  cursor(after, kind) {
+    if (after == null) return null;
+    const ok = typeof after === "string" && after.length > 0 && after.length <= 600 && !after.includes("\0")
+      && (kind === "id" ? !after.includes("\n") : /^(unit|group|space|board)\n./.test(after));
+    if (!ok) fail("cursor");
+    return after;
   },
   /** A role string for a scoped grant (validity at the scope is the admin layer's and the resolver's business), or null to remove. */
   grantRole(r) {

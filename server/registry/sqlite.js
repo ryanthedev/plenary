@@ -549,15 +549,15 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     },
     async boardsIn(scope, { after = null, limit } = {}) {
       ready();
-      const { type, id } = orgDefaults.scope(scope), n = pageLimit(limit);
+      const { type, id } = orgDefaults.scope(scope), n = pageLimit(limit), cur = orgDefaults.cursor(after, "id");
       const q1 = type === "unit" ? q.boardsInUnit : type === "group" ? q.boardsInGroup : type === "space" ? q.boardsInSpace : null;
-      const ids = q1 ? q1.all(id, str(after) ? after : null, n + 1).map(r => r.id) : [];
+      const ids = q1 ? q1.all(id, cur, n + 1).map(r => r.id) : [];
       return { ids: ids.slice(0, n), next: ids.length > n ? ids[n - 1] : null };
     },
     async scopesOf(subject, { after = null, limit } = {}) {
       ready();
       const sub = orgDefaults.subject(subject), n = pageLimit(limit);
-      const rows = q.scopesOf.all(sub.type, sub.id, str(after) ? after : null, n + 1).map(r => ({ type: r.scope_type, id: r.scope_id, role: r.role }));
+      const rows = q.scopesOf.all(sub.type, sub.id, orgDefaults.cursor(after, "scope"), n + 1).map(r => ({ type: r.scope_type, id: r.scope_id, role: r.role }));
       const scopes = rows.slice(0, n);
       return { scopes, next: rows.length > n ? scopes[n - 1].type + "\n" + scopes[n - 1].id : null };
     },

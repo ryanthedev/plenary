@@ -764,6 +764,9 @@ The Registry lists what is needed, in bounded pages, so no route has to guess:
 - `boardsIn(scope)`: the board ids in a Space, a Group (its Spaces') or a Unit, by id, `{ ids, next }` per page (default
   500, at most 1000).
 - `scopesOf(subject)`: the scopes (with the role) a user or Team holds a grant on, paged the same way.
+- A cursor (`after`) must be a previous page's `next` (a board id; or `<type>\n<id>`). A **malformed cursor is refused**
+  (the call rejects with "registry: bad cursor"), never read as "start over", so a caller looping on `next` can't spin
+  forever; an unknown but well-formed one is just a position.
 
 How the routes of #47 and later announce: after the write succeeds, a change **on a scope** pages `boardsIn(scope)` (a
 board scope is that one board) and publishes `{ board }` on each board's `.grants` subject; a **Team membership change**
@@ -898,7 +901,10 @@ runs as a role that doesn't own the schema (§ Store, Least privilege).
 - **Last owner for Groups and Spaces.** `setScopedGrant` refuses to remove or demote the last *counted* `owner` of a Group
   or Space, atomically. A user owner always counts; a Team owner counts only while the Team has at least one member (an
   empty Team guards nothing). `setTeamMember` refuses to remove the last member of a Team that is the only counted owner
-  of a Group or Space. Both are `last-owner`; Postgres takes the container's row lock first, like `setGrant`.
+  of a Group or Space. Both are `last-owner`. Postgres lock order, in both calls: the container's row (Group or Space) first,
+  then the Team's member rows, never the Team row. A demotion that counts a Team owner share-locks the Team's member rows
+  before counting; a member's removal locks them all, deletes its own, and, if the Team is now empty, re-reads the
+  containers the Team owns (grants made while it waited are visible) and refuses if any has no counted owner.
 - **Postgres tables** (all created only if missing, like the first seven; nothing is ever altered): `reg_tenant_meta` (kind),
   `reg_tenant_domains` (a Unit's domains after its first, which stays in `reg_tenants.domain`; a domain is unique across both,
   serialised by an advisory lock), `reg_groups`, `reg_spaces` (unique `(tenant, owner_user)`: one personal space per member),

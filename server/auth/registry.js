@@ -256,6 +256,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
 
     async boardsIn(scope, { after = null, limit } = {}) {
       const { type, id } = orgDefaults.scope(scope);
+      after = orgDefaults.cursor(after, "id");
       if (type === "board") return { ids: [], next: null };
       const spaceIds = new Set([...spaces.values()].filter(sp => (type === "space" ? sp.id === id : type === "group" ? sp.group === id : false)).map(sp => sp.id));
       const all = [...boards.values()].filter(b => (type === "unit" ? b.tenant === id : spaceIds.has(b.space))).map(b => b.id).sort();
@@ -264,6 +265,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
     },
     async scopesOf(subject, { after = null, limit } = {}) {
       const sub = orgDefaults.subject(subject), me = sk(sub.type, sub.id);
+      after = orgDefaults.cursor(after, "scope");
       const all = [...scoped].filter(([, g]) => g.has(me)).map(([k, g]) => { const [type, ...i] = k.split("\n"); return { type, id: i.join("\n"), role: g.get(me) }; })
         .sort((x, y) => (x.type + "\n" + x.id < y.type + "\n" + y.id ? -1 : 1));
       const cur = s => s.type + "\n" + s.id, n = pageLimit(limit), rest = after == null ? all : all.filter(x => cur(x) > after), page = rest.slice(0, n);

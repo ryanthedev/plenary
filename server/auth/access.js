@@ -327,13 +327,17 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
 
       // The containers above, for the inherited rows and the general-access rows: only the ones the caller can open (names are access).
       const above = [];
+      let hiddenAbove = false;      // access comes from a container the caller can't open: a boolean only (no name, no count)
       if (type === "board" || type === "space") {
         const space = type === "board" ? (row.space ? await registry.space(row.space) : null) : row;
         const group = type === "space" ? (row.group ? await registry.group(row.group) : null) : space?.group ? await registry.group(space.group) : null;
         const cands = type === "board" ? [space && { type: "space", row: space }, group && { type: "group", row: group }] : [group && { type: "group", row: group }];
         const list = cands.filter(Boolean);
         const got = await tenancy.effectiveMany(identity, list.map(c => ({ type: c.type, id: c.row.id })));
-        for (const c of list) if (opens(got.get(c.type + "\n" + c.row.id) ?? { ladder: null })) above.push(c);
+        const closed = [];
+        for (const c of list) { if (opens(got.get(c.type + "\n" + c.row.id) ?? { ladder: null })) above.push(c); else closed.push(c); }
+        // The same containers that were left out above: does one of them hold access (a grant, or general access) that therefore does not show?
+        for (const c of closed) if (c.row.generalRole || (await registry.scopedGrantsPage({ type: c.type, id: c.row.id }, { limit: 1 })).grants.length) { hiddenAbove = true; break; }
       }
       const inheritedPages = await Promise.all(above.map(c => registry.scopedGrantsPage({ type: c.type, id: c.row.id }, { limit: LIMITS.inherited })));
 
@@ -371,6 +375,7 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
       return {
         scope: { type, id: row.id, ...(canSee && name !== undefined ? { name } : {}), ...(isPersonal(sc) ? { personal: true } : {}) },
         can: { manage },
+        ...(hiddenAbove ? { hiddenAbove: true } : {}),
         general,
         ...(type === "unit" ? { admins: adminList.map(a => { const v = nameOfSubject(a); return { user: v.id, name: v.name, email: v.email }; }) } : {}),
         ...(type !== "unit" ? { organization: { admins: orgAdmins.slice(0, LIMITS.inherited).map(a => { const v = nameOfSubject({ type: "user", id: a }); return { user: v.id, name: v.name }; }), more: orgAdmins.length > LIMITS.inherited || unitPage.next != null, memberRole: memberLadder } } : {}),

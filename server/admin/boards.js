@@ -89,7 +89,7 @@ const tagged = async (registry, board, invite) => ({ ...invite, guest: isGuestEm
 export const MAX_EXPIRY_MS = 10 * 365 * 86_400_000;
 const expiry = (v, now) => {
   if (v == null) return null;
-  if (!Number.isSafeInteger(v) || v <= now) throw bad("expiresAt must be a future time (ms)");
+  if (!Number.isSafeInteger(v) || v <= now) throw bad("expiresAt must be a whole number of ms in the future, at most 10 years ahead");
   if (v > now + MAX_EXPIRY_MS) throw bad("expiresAt may be at most 10 years ahead");
   return v;
 };

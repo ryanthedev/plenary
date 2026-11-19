@@ -35,7 +35,7 @@ export const ACCESS_ERRORS = Object.freeze(["auth", "forbidden", "notfound", "in
  * @typedef {{ subject: Subject, role: string, roleName: string, via: "direct"|"team"|"inherited", can?: { change: boolean, remove: boolean }, scope?: { type: string, id: string, name?: string } }} Row
  * @typedef {{ id: string, name: string, custom: boolean, summary: string, ladder: string|null, people: boolean }} RoleOption
  * @typedef {{ team: TeamRow, can: { manage: boolean }, members: Person[], next: string|null }} TeamPage
- * @typedef {{ scope: { type: string, id: string, name?: string, personal?: boolean }, can: { manage: boolean }, general: { scope: { type: string, id: string, name?: string }, role: string }[],
+ * @typedef {{ scope: { type: string, id: string, name?: string, personal?: boolean }, can: { manage: boolean }, hiddenAbove?: true, general: { scope: { type: string, id: string, name?: string }, role: string }[],
  *   admins?: Person[], rows: Row[], next: string|null, inherited: Row[], roles: RoleOption[], organization?: { admins: { user: string, name: string }[], more: boolean, memberRole: string|null },
  *   requests?: { user: { id: string, name: string, email: string|null }, role: string, roleName: string, at: number }[], why?: import("../core/explain.js").Explain }} AccessPage
  * @typedef {object} AccessPort

@@ -9,6 +9,7 @@ import { h, replace } from "./dom.js";
 import { announce } from "./focus.js";
 import { openDialog } from "./dialogs.js";
 import { INVITE_EXPIRY, LINK_EXPIRY, roleName, expiryText } from "../../core/share.js";
+import { HIDDEN_ABOVE } from "../../core/access.js";
 
 let seq = 0;
 const NOTES = {
@@ -115,6 +116,7 @@ export function openShare({ host, model, opener = null, accessHref = null, copy 
     accessNote.replaceChildren(...(S.pageStatus === "ok"
       ? [accessHref ? h("a", { href: accessHref }, "Change who has access on the Access page") : "Change who has access on the Access page", " (people and teams are managed there)."]
       : ["The list of everyone with access is not available to you, because you are outside this organization. Invites and links above still work."]));
+    if (S.page?.hiddenAbove) accessNote.append(" ", HIDDEN_ABOVE);
     if (V.more) accessNote.append(" Only the newest 200 invites and links are listed.");
   }
 

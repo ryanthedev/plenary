@@ -186,3 +186,14 @@ test("a manager whose role gives no board content (nothing to give) sees why and
   type(byLabel("INPUT", "Email address"), "k@p.io"); all(e => e.tagName === "FORM")[0].dispatch("submit"); await settle();
   expect(calls).toEqual([]); expect(announced()).toContain("can't give that role");
 });
+
+test("DW-52.10 the dialog says once that some access comes from places the person can't open, when the server says so, and not otherwise", async () => {
+  state.access = { page: { ...PAGE, hiddenAbove: true } };
+  await open();
+  expect(textOf(root).split("Some access comes from places you can't open.").length - 1).toBe(1);
+});
+
+test("no hiddenAbove, no line", async () => {
+  await open();
+  expect(textOf(root)).not.toContain("places you can't open");
+});

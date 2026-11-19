@@ -221,3 +221,34 @@ test("DW-52.2c the same expiry rule on the durable SQLite Registry: refused valu
     expect((await reg.link((await made.json()).link.id)).expiresAt).toBe(edge);
   } finally { await reg.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("DW-52.10 hiddenAbove: a boolean, only when access also comes from a Space or Group the caller cannot open (no names, no counts); computed where the rows are hidden", async () => {
+  const page = async (tok, id = board) => (await call("GET", `/access/board/${id}`, { tok })).json();
+  // edi holds the board directly and cannot open the Space (general access off, no grant there), which holds an owner grant: some access is out of sight
+  const edi = await page("edi");
+  expect(edi.hiddenAbove).toBe(true);
+  expect(JSON.stringify(edi)).not.toContain("Design");                                   // the hidden Space's name is never sent
+  expect(edi.inherited).toEqual([]);
+  expect(await page("fac")).not.toHaveProperty("hiddenAbove");                           // fac can open the Space: its rows show instead
+  expect(await page("ada")).not.toHaveProperty("hiddenAbove");                           // a Unit admin opens everything
+  // a closed Space that holds nothing hides nothing
+  const empty = await mem.createSpace({ tenant: acme.id, name: "Empty", generalRole: null });
+  const b2 = (await mem.createBoard({ tenant: acme.id, title: "Two", space: empty.id, owner: "dev:own" })).id;
+  expect(await page("own", b2)).not.toHaveProperty("hiddenAbove");
+  // an open Space (general access) is not hidden from a member who can open it
+  const open = await mem.createSpace({ tenant: acme.id, name: "Open", generalRole: "viewer", owner: "dev:ada" });
+  const b3 = (await mem.createBoard({ tenant: acme.id, title: "Three", space: open.id, owner: "dev:own" })).id;
+  expect(await page("own", b3)).not.toHaveProperty("hiddenAbove");
+  // a person who cannot open the board at all gets the ordinary 404, nothing about the Space
+  expect((await call("GET", `/access/board/${board}`, { tok: "vie" })).status).toBe(404);
+});
+
+test("expiresAt refusals say what is wanted: a whole number of ms in the future, at most 10 years ahead (the AdminError message, for logs and API callers)", async () => {
+  const { createLink, AdminError } = await import("../../server/admin/boards.js");
+  const ada = { user: "dev:ada", name: "ada", email: "ada@acme.com", domain: "acme.com" };
+  for (const expiresAt of [1e300, T0 + 0.5, T0 - 1]) {
+    const e = await createLink({ caller: ada, board, role: "viewer", expiresAt }, { registry: mem, tenancy: makeTenancy({ registry: mem, now }), now }).catch(x => x);
+    expect(e).toBeInstanceOf(AdminError); expect(e.code).toBe("bad-request");
+    expect(e.message).toBe("expiresAt must be a whole number of ms in the future, at most 10 years ahead");
+  }
+});

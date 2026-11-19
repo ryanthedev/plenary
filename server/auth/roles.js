@@ -71,6 +71,7 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
     return {
       scopes: SCOPES,
       permissions: [...CONTENT_PERMS.map(id => ({ id, group: "content", scopes: SCOPES })), ...MGMT_PERMS.map(id => ({ id, group: "management", scopes: SCOPES.filter(s => ALLOWED_AT[s].includes(id)) }))],
+      content: Object.fromEntries(INVITE_ROLES.map(l => [l, contentPerms(l)])),   // what each board step includes, so the screen needs no ladder rule of its own
       ladders: INVITE_ROLES.filter(l => st.admin || contentPerms(l).every(p => own.has(p))),
       tickable: st.admin ? [...MGMT_PERMS] : MGMT_PERMS.filter(p => own.has(p)),
     };

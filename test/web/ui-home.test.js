@@ -205,3 +205,14 @@ test("Home links to Teams for a member, and to the organization's access only wh
   await mount({ ...DATA, guest: true, unit: null, tree: null, can: { createGroup: false, manageAccess: false } }, at);
   expect(side().map(x => x[1])).not.toContain("Teams");
 });
+
+test("Home links to Roles only when the server says the caller may manage roles (roles.manage), never for a guest", async () => {
+  const at = { teamsHref: "?teams=1", rolesHref: "?roles=1" };
+  const side = () => root.find(e => e.hasClass("home-side")).findAll(e => e.tagName === "A").map(e => [e.getAttribute("href"), textOf(e)]);
+  await mount({ ...DATA, can: { createGroup: false, manageAccess: true, manageRoles: false } }, at);
+  expect(side().map(x => x[1])).not.toContain("Roles");
+  await mount({ ...DATA, can: { createGroup: false, manageAccess: false, manageRoles: true } }, at);
+  expect(side()).toContainEqual(["?roles=1", "Roles"]);
+  await mount({ ...DATA, guest: true, unit: null, tree: null, can: { createGroup: false, manageAccess: false, manageRoles: true } }, at);
+  expect(side().map(x => x[1])).not.toContain("Roles");
+});

@@ -74,6 +74,7 @@ describe("the list and the matrix", () => {
     expect(l.matrix.permissions.find(p => p.id === "roles.manage").scopes).toEqual(["unit"]);
     expect(l.matrix.tickable).toEqual(MGMT_PERMS);
     expect(l.matrix.ladders).toEqual(["viewer", "commenter", "annotator", "editor"]);
+    expect(l.matrix.content).toEqual({ viewer: ["board.view"], commenter: ["board.view", "board.comment"], annotator: ["board.view", "board.comment", "board.annotate"], editor: ["board.view", "board.comment", "board.annotate", "board.edit"] });
   });
   test("usage is a bounded count: 100+ is shown capped; the member role shows the directory size, capped at 50", async () => {
     const c = await r.createRole({ tenant: acme.id, name: "Many", boardRole: "viewer" });

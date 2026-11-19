@@ -10,7 +10,7 @@
 const doc = () => globalThis.document ?? null;
 
 // ── announcements: when focus is moved because its row went away, say so (a polite live region) ──
-const NOUN = { note: "note", layer: "layer", thread: "thread", msg: "comment", frame: "frame", "card-link": "board", card: "board", star: "board", "space-link": "Space", who: "person or team", role: "person or team", remove: "person or team" };
+const NOUN = { note: "note", layer: "layer", thread: "thread", msg: "comment", frame: "frame", "card-link": "board", card: "board", star: "board", "space-link": "Space", rolepick: "role", perm: "permission", who: "person or team", role: "person or team", remove: "person or team" };
 let live = null;
 /** Say `text` politely to screen readers (a visually hidden status region at the end of <body>). Returns the text that is now announced. */
 export function announce(text) {
@@ -35,9 +35,9 @@ export function fellBackText(key, toKey, order) {
   const where = toKey === "heading" ? "the top of the list" : j < 0 || i < 0 ? "a nearby one" : j > i ? "the next one" : "the previous one";
   return `That ${noun} is no longer here; moved to ${where}.`;
 }
-const CALM_KINDS = new Set(["card-link", "space-link", "card", "space", "group", "other", "who"]);
+const CALM_KINDS = new Set(["card-link", "space-link", "card", "space", "group", "other", "who", "rolepick"]);
 // A row's action (its role select, its remove button) falls back to a NEIGHBOURING row's neutral name ("who:"), never to the same action on another row.
-const TO_ROW = { role: "who", remove: "who", "team-link": "who" };
+const TO_ROW = { role: "who", remove: "who", "team-link": "who", perm: "rolepick" };
 const lost = () => { const a = doc()?.activeElement; return !a || a === doc().body || a.isConnected === false; };
 
 export function keeper() {

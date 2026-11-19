@@ -100,13 +100,18 @@ export function openUnder(path, lsof = "lsof", timeout = 60_000) {
 export function resolveNoOpen(p, stat = lstatSync, readlink = readlinkSync, cache = new Map(), readdir = readdirSync) {
   let cur = sep, links = 0;
   const names = dir => { if (!cache.has(dir)) { let l; try { l = readdir(dir); } catch { l = []; } cache.set(dir, l); } return cache.get(dir); };   // enterable but unlistable: keep the given spelling
-  const todo = (p.startsWith(sep) ? p : process.cwd() + sep + p).split(sep).filter(Boolean).reverse();
-  // macOS firmlink: /System/Volumes/Data/<x> is /<x> (what lsof prints). Drop the prefix only where both are provably the same directory.
+  const todo = (p.startsWith(sep) ? p : process.cwd() + sep + p).split(sep).filter(c => c && c !== ".").reverse();
+  // macOS firmlink: /System/Volumes/Data/<x> is /<x> (what lsof prints). Drop the prefix where some leading <x> (one level, or a nested
+  // firmlink such as usr/local while /usr itself is not one) is provably the same directory under both; otherwise keep the spelling.
   if (todo.length > 3 && todo.at(-1) === "System" && todo.at(-2) === "Volumes" && todo.at(-3) === "Data") {
+    const rest = todo.slice(0, -3).reverse(), lead = [];
+    for (const c of rest) { if (c === "..") break; lead.push(c); }
     try {
-      const x = todo.at(-4), a = statSync(`/System/Volumes/Data/${x}`), b = statSync(`/${x}`);
-      if (a.dev === b.dev && a.ino === b.ino) todo.length -= 3;
-    } catch { /* not a firmlinked system: keep the spelling */ }
+      for (let k = 1; k <= Math.min(lead.length, 4); k++) {
+        const tail = lead.slice(0, k).join(sep), a = statSync(`/System/Volumes/Data/${tail}`), b = statSync(`/${tail}`);
+        if (a.dev === b.dev && a.ino === b.ino) { todo.length -= 3; break; }
+      }
+    } catch { /* not a firmlinked system, or a missing part: keep the spelling */ }
   }
   while (todo.length) {
     let c = todo.pop();

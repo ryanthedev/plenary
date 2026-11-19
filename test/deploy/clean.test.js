@@ -719,7 +719,7 @@ test("resolveNoOpen keeps the given spelling under a directory that can be enter
 });
 
 test("resolveNoOpen firmlink prefix: dots ignored, a nested firmlink dropped, a directory that only looks alike kept", () => {
-  const data = "/System/Volumes/Data", same = (a, b) => { try { const x = statSync(a), y = statSync(b); return x.dev === y.dev && x.ino === y.ino; } catch { return false; } };
+  const data = "/System/Volumes/Data", same = (a, b) => { try { const x = statSync(a, { bigint: true }), y = statSync(b, { bigint: true }); return x.dev === y.dev && x.ino === y.ino; } catch (e) { if (e.code === "ENOENT") return false; throw e; } };
   if (!existsSync(join(data, "Users"))) return;                    // not a firmlinked system
   expect(resolveNoOpen(data + "/./Users/./")).toBe(resolveNoOpen("/Users"));
   if (same(data + "/usr/local", "/usr/local")) expect(resolveNoOpen(data + "/usr/local")).toBe("/usr/local");   // nested: /usr itself is not one

@@ -38,30 +38,53 @@ export function keeper() {
 
 const kids = el => [...(el.children ?? [])];
 const walk = root => { const out = []; const visit = e => { for (const c of kids(e)) { out.push(c); visit(c); } }; visit(root); return out; };
-const attr = (el, k) => el.getAttribute?.(k) ?? null;
+const keyOf = el => el.getAttribute?.("data-fk") ?? null;
+const kindOf = k => String(k).split(":")[0];
+const CONTROL = /^(BUTTON|A|INPUT|SELECT|TEXTAREA)$/;
 const sayText = el => (el.textContent ?? "").trim().slice(0, 40);
 
-/** Where focus is, if inside one of `roots`: what the control says, and its position among same-tag controls. */
+/**
+ * Give an unmarked control a key from what it says (`auto:<tag>:<label>`), but only when that label is unique in its root: the key must name ONE
+ * control. A control whose label repeats (a Lock button on every layer, a delete on every note) gets no automatic key; the page must mark it with
+ * a key made of its own ids (`layer:<id>:lock`), or focus is simply not restored for it. Automatic keys are exact-match only (never a fallback).
+ */
+function autoKey(root) {
+  const all = walk(root).filter(e => CONTROL.test(e.tagName) && keyOf(e) === null);
+  const label = e => e.getAttribute?.("aria-label") || e.getAttribute?.("title") || sayText(e);
+  const count = new Map();
+  for (const e of all) { const k = `${e.tagName}\n${label(e)}`; count.set(k, (count.get(k) ?? 0) + 1); }
+  for (const e of all) { const l = label(e), k = `${e.tagName}\n${l}`; if (l && count.get(k) === 1) e.setAttribute("data-fk", `auto:${e.tagName}:${l}`); }
+}
+
+/** Where focus is, if on a keyed control inside one of `roots`: its key, and the keys of its root in order (for the fallback). */
 export function captureFocus(roots) {
   const a = doc()?.activeElement;
   if (!a || a === doc().body) return null;
   const root = roots.find(r => r?.contains?.(a));
   if (!root) return null;
-  const same = walk(root).filter(e => e.tagName === a.tagName);
-  return { root, el: a, tag: a.tagName, aria: attr(a, "aria-label"), title: attr(a, "title"), role: attr(a, "role"), text: sayText(a), nth: same.indexOf(a) };
+  autoKey(root);
+  const key = keyOf(a);
+  if (key === null) return null;
+  return { root, el: a, key, order: walk(root).map(keyOf).filter(k => k !== null) };
 }
 
-/** Put focus back on the twin of a captured control in its (rebuilt) root, unless focus is already somewhere sensible. */
+/**
+ * Put focus back on the control with the SAME KEY in the rebuilt root (exact match only; never by label, text or position). If that key is gone
+ * (its row was deleted), go to the next control of the same kind that still exists, then the previous one, then the root's "heading". Automatic
+ * keys have no neighbours: a control that only had a label has nothing to fall back to.
+ */
 export function restoreFocus(held) {
   if (!held) return false;
-  const all = walk(held.root), a = doc()?.activeElement;
+  const a = doc()?.activeElement, now = walk(held.root);
   // Nothing to do if focus moved somewhere on purpose, or the very element still sits in its root (it was not rebuilt).
-  if (a && a !== doc().body && a.isConnected !== false && (a !== held.el || all.includes(a))) return false;
-  const tagged = all.filter(e => e.tagName === held.tag);
-  const hit = (held.aria && all.find(e => attr(e, "aria-label") === held.aria))
-    || (held.title && all.find(e => attr(e, "title") === held.title))
-    || (held.text && tagged.find(e => sayText(e) === held.text))
-    || tagged[held.nth] || null;
-  hit?.focus?.();
-  return !!hit;
+  if (a && a !== doc().body && a.isConnected !== false && (a !== held.el || now.includes(a))) return false;
+  autoKey(held.root);
+  const keyed = walk(held.root).filter(e => keyOf(e) !== null), byKey = k => keyed.find(e => keyOf(e) === k);
+  let to = byKey(held.key);
+  if (!to && !held.key.startsWith("auto:")) {
+    const i = held.order.indexOf(held.key), same = held.order.map((k, j) => [k, j]).filter(([k]) => kindOf(k) === kindOf(held.key));
+    to = [...same.filter(([, j]) => j > i), ...same.filter(([, j]) => j < i).reverse()].map(([k]) => byKey(k)).find(Boolean) ?? byKey("heading");
+  }
+  to?.focus?.();
+  return !!to;
 }

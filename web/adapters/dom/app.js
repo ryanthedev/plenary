@@ -438,10 +438,10 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       return h("div.note-row", {}, h("span.sw", { style: { background: safeColor(e.backgroundColor !== "transparent" ? e.backgroundColor : e.strokeColor), width: "10px", height: "10px" } }),
         h("div.txt", {}, h("div", {}, label(e)),
           h("div.meta", {}, h("span", { style: { fontWeight: 600 } }, S.mine.has(e.id) ? "You" : "—"), e.type === "freedraw" ? h("span", {}, "highlight") : null),
-          h("div.acts", {}, h("button", { onclick: jump }, "jump to"),
+          h("div.acts", {}, h("button", { "data-fk": `note:${e.id}:jump`, onclick: jump }, "jump to"),
             may && S.effective !== "viewer" ? (canChange ? [
-              h("button", { onclick: () => { jump(); S.act("notes", n => { n.select([e.id]); n.beginText(e, { x: e.x, y: e.y }); }); } }, "edit"),
-              h("button", { onclick: () => S.act("notes", n => n.deleteIds([e.id])) }, "delete")] : h("span.lock", {}, "🔒 someone else's")) : null)));
+              h("button", { "data-fk": `note:${e.id}:edit`, onclick: () => { jump(); S.act("notes", n => { n.select([e.id]); n.beginText(e, { x: e.x, y: e.y }); }); } }, "edit"),
+              h("button", { "data-fk": `note:${e.id}:delete`, onclick: () => S.act("notes", n => n.deleteIds([e.id])) }, "delete")] : h("span.lock", {}, "🔒 someone else's")) : null)));
     });
     const compose = !may || S.effective === "viewer"
       ? h("div.hint.compose", {}, S.role === "viewer" ? "Viewers read notes; only annotators and presenters add them." : "Read-only: you can't add or change notes.")
@@ -458,8 +458,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   }
   function drawerTabs(key) {
     const which = ui[key] || "notes";
-    return h("span.seg", {}, h("button" + (which === "notes" ? ".on" : ""), { onclick: () => { ui[key] = "notes"; chromeDirty = true; } }, "Notes"),
-      h("button" + (which === "comments" ? ".on" : ""), { onclick: () => { ui[key] = "comments"; chromeDirty = true; } }, "Comments"));
+    return h("span.seg", {}, h("button" + (which === "notes" ? ".on" : ""), { "data-fk": `drawer-tab:${key}:notes`, onclick: () => { ui[key] = "notes"; chromeDirty = true; } }, "Notes"),
+      h("button" + (which === "comments" ? ".on" : ""), { "data-fk": `drawer-tab:${key}:comments`, onclick: () => { ui[key] = "comments"; chromeDirty = true; } }, "Comments"));
   }
 
   const T = id => toolsFor("presenter").find(t => t.id === id);

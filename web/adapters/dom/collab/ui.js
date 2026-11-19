@@ -249,14 +249,14 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     const rv = c.reactions, canReact = c.canReact;
     const chips = (rv.length || canReact) && !c.deleted ? h("div.react-chips.collab-chips", {},
       rv.map(r => h(`button.chip-r${r.mine ? ".mine" : ""}${r.pending ? ".pending" : ""}`, {
-        disabled: !c.canReact, title: c.canReact ? (r.mine ? `Remove your ${r.emoji}` : `React ${r.emoji}`) : `${r.n} reacted ${r.emoji}`,
+        "data-fk": `msg:${c.id}:react:${r.emoji}`, disabled: !c.canReact, title: c.canReact ? (r.mine ? `Remove your ${r.emoji}` : `React ${r.emoji}`) : `${r.n} reacted ${r.emoji}`,
         onclick: () => recordOp(r.mine ? "unreact" : "react", { do: "react", id: c.id, emoji: r.emoji, on: !r.mine }) }, `${r.emoji} `, h("b", {}, String(r.n)))),
-      c.canReact ? h("button.chip-r.add", { title: "React", onclick: () => { S.reactFor = S.reactFor === c.id ? null : c.id; renderPopover(); } }, "＋") : null) : null;
-    const reactRow = S.reactFor === c.id && c.canReact ? h("div.collab-reactrow", {}, EMOTES.map(e => h("button", { title: e, onclick: () => { S.reactFor = null; const has = rv.find(r => r.emoji === e)?.mine; recordOp(has ? "unreact" : "react", { do: "react", id: c.id, emoji: e, on: !has }); } }, e))) : null;
+      c.canReact ? h("button.chip-r.add", { "data-fk": `msg:${c.id}:react-add`, title: "React", onclick: () => { S.reactFor = S.reactFor === c.id ? null : c.id; renderPopover(); } }, "＋") : null) : null;
+    const reactRow = S.reactFor === c.id && c.canReact ? h("div.collab-reactrow", {}, EMOTES.map(e => h("button", { "data-fk": `msg:${c.id}:pick:${e}`, title: e, onclick: () => { S.reactFor = null; const has = rv.find(r => r.emoji === e)?.mine; recordOp(has ? "unreact" : "react", { do: "react", id: c.id, emoji: e, on: !has }); } }, e))) : null;
     return h(`div.msg${c.pending ? ".pending" : ""}`, {}, av(c.by, c.name),
       h("div.mbody", {},
         h("div.who", {}, c.name, h("span", {}, ago(c.at, C.now())), c.edited ? h("span", {}, "edited") : null, c.pending ? h("span.sending", {}, "sending…") : null,
-          c.canDelete ? h("button.del", { title: "Delete this comment", onclick: () => recordOp("deleteComment", { do: "delete", id: c.id }) }, "delete") : null),
+          c.canDelete ? h("button.del", { "data-fk": `msg:${c.id}:delete`, title: "Delete this comment", onclick: () => recordOp("deleteComment", { do: "delete", id: c.id }) }, "delete") : null),
         c.deleted ? h("p.deleted", {}, "Comment deleted") : h("p", {}, c.text), chips, reactRow));
   }
 
@@ -363,9 +363,9 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
         h("div.txt", {}, h("div", {}, n.text),
           h("div.meta", {}, h("span.author", { style: { color: n.by ? colorOf(n.by) : "var(--muted)" } }, n.author), n.kind === "highlight" ? h("span", {}, "highlight") : null),
           h("div.acts", {},
-            port.jumpTo ? h("button", { onclick: () => port.jumpTo(n.at) }, "jump to") : null,
-            n.canEdit ? h("button", { onclick: () => port.editNote(n.id) }, "edit") : null,
-            n.canDelete ? h("button", { onclick: () => port.deleteNote(n.id) }, "delete") : null,
+            port.jumpTo ? h("button", { "data-fk": `note:${n.id}:jump`, onclick: () => port.jumpTo(n.at) }, "jump to") : null,
+            n.canEdit ? h("button", { "data-fk": `note:${n.id}:edit`, onclick: () => port.editNote(n.id) }, "edit") : null,
+            n.canDelete ? h("button", { "data-fk": `note:${n.id}:delete`, onclick: () => port.deleteNote(n.id) }, "delete") : null,
             n.locked ? h("span.lock", {}, `🔒 ${n.author}'s`) : null)))) : h("div.hint", {}, "No notes yet."),
         nv.more ? h("div.hint", {}, `${fmt(nv.more)} more`) : null);
     } else {
@@ -379,7 +379,7 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
       swapRows(list.length ? list.map(t => {
         const first = t.comments.find(c => !c.deleted);
         const go = () => { openThread(t.id); port.jumpTo?.({ x: t.x, y: t.y }); };
-        return h(`div.note-row.thread-row${t.resolved ? ".done" : ""}${S.open === t.id ? ".on" : ""}`, { "data-thread": t.id, role: "button", tabindex: "0",
+        return h(`div.note-row.thread-row${t.resolved ? ".done" : ""}${S.open === t.id ? ".on" : ""}`, { "data-thread": t.id, "data-fk": `thread:${t.id}`, role: "button", tabindex: "0",
           onclick: go, onkeydown: e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } } },
           av(t.by, t.name), h("div.txt", {}, h("div", {}, first?.text ?? ""),
             h("div.meta", {}, h("span", {}, t.name ?? "Someone"), h("span", {}, anchorText(t))),

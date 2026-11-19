@@ -534,6 +534,21 @@ test("focus survives a chrome rebuild: a panel chip keeps focus after it is acti
   expect(page.doc.activeElement).toBe(chip());                           // and focus is on the new chip, not lost
 });
 
+test("focus follows the control's own key, not its label: pressing Lock on any of three layers keeps focus on THAT layer's Lock", () => {
+  rig = setup(); const { bo, step, app } = rig;
+  app.setPanel({ type: "noop" }); step(20);
+  bo.act("board", e => e.addLayer("Two"), { settings: true }); bo.act("board", e => e.addLayer("Three"), { settings: true }); step(20);
+  const lockBtns = () => page.byId.panel.all().filter(e => e.tagName === "BUTTON" && /^layer:.+:lock$/.test(e.attrs["data-fk"] ?? ""));
+  expect(lockBtns().length).toBe(3);
+  for (const which of [lockBtns().length - 1, 0, 1]) {
+    const target = lockBtns()[which], key = target.attrs["data-fk"], title = target.attrs.title;
+    target.focus(); target.click(); step(20);
+    const now = lockBtns().find(e => e.attrs["data-fk"] === key);
+    expect(now.attrs.title).not.toBe(title);                                // the layer's state flipped (Lock <-> Unlock) and its title changed ...
+    expect(page.doc.activeElement).toBe(now);                               // ... and focus is on that same layer's toggle, not another layer's "Lock"
+  }
+});
+
 test("V6 remote layer add / rename and a shape on it: panel layers", () => {
   rig = setup(); const { bo, step, app } = rig;
   app.setPanel({ type: "noop" }); step(20);

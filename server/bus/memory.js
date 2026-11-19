@@ -6,8 +6,8 @@
 // Messages are passed by reference here; a network bus serialises them, so publish only plain data and never
 // change a message after publishing it.
 
-import { subjects, busBytes, MAX_BUS_BYTES, scopeBus } from "./port.js";
-import { PortError } from "../ids.js";
+import { subjects, busBytes, MAX_BUS_BYTES, scopeBus, scopeOnError } from "./port.js";
+import { PortError, isClusterId } from "../ids.js";
 
 export { subjects };
 
@@ -18,8 +18,10 @@ export { subjects };
  *   cluster: scope every subject to a cluster id, as the NATS adapter does (PROTOCOL.md § Bus, Cluster id).
  */
 export function memoryBus({ onError = () => {}, maxBytes = MAX_BUS_BYTES, cluster } = {}) {
-  const bus = memoryBusUnscoped({ onError, maxBytes });
-  return cluster === undefined ? bus : scopeBus(bus, cluster);   // same wire naming as the NATS adapter (§ Bus, Cluster id)
+  // In-process, so no other cluster can share it: scoping is optional here (single node, tests), unlike natsBus.
+  if (cluster == null) return memoryBusUnscoped({ onError, maxBytes });
+  if (!isClusterId(cluster)) throw new PortError("bad-id", "bad cluster id");
+  return scopeBus(memoryBusUnscoped({ onError: scopeOnError(onError, cluster), maxBytes }), cluster);   // same wire naming as the NATS adapter (§ Bus, Cluster id)
 }
 
 function memoryBusUnscoped({ onError, maxBytes }) {

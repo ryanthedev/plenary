@@ -8,7 +8,7 @@ import { start } from "../../server/main.js";
 import { postgresStore } from "../../server/store/postgres.js";
 import { natsBus } from "../../server/bus/nats.js";
 import { subjects } from "../../server/bus/port.js";
-import { tempDir, cleanup, until, sleep } from "./helpers.js";
+import { tempDir, cleanup, until } from "./helpers.js";
 import { sock } from "./rig.js";
 
 afterAll(cleanup);
@@ -101,14 +101,20 @@ describe.skipIf(!PG || !NATS)("two clusters on one NATS", () => {
     expect(hostA.app.clusterId).toBe(gwA.app.clusterId);                                      // one database = one cluster id
 
     // 4. A node from before the cluster id (unscoped subjects) asks every host to open B's board and A's: nobody answers.
-    const old = await natsBus({ url: NATS, name: "iso-old-node" });
+    const old = await natsBus({ url: NATS, name: "iso-old-node", cluster: null });
     try {
-      const replies = [];
-      old.subscribe(subjects.opened("old-gw"), m => replies.push(m));
+      const replies = [], probe = [];
+      old.subscribe(subjects.opened("old-gw"), m => replies.push(m));                       // where an old node's answer would come
+      old.subscribe(`${gwA.app.clusterId}.${subjects.opened("old-gw")}`, m => probe.push(m));   // where cluster A's answer comes
       await old.flush();
       await old.publish(subjects.open, { tenant: boardA.tenant, board: boardA.id, gateway: "old-gw", n: 1 });
       await old.publish(subjects.open, { tenant: boardB.tenant, board: boardB.id, gateway: "old-gw", n: 2 });
-      await old.flush(); await sleep(300); await old.flush();
+      // Positive control after the two unscoped opens, on the same connection: a scoped open that A's host answers.
+      // Once its reply is in, the earlier unscoped opens have been through every host, so "no reply" is final.
+      await old.publish(`${gwA.app.clusterId}.${subjects.open}`, { tenant: boardA.tenant, board: boardA.id, gateway: "old-gw", n: 3 });
+      await until(() => probe.length === 1, "the scoped probe's answer", 10_000);
+      await old.flush();
+      expect(probe[0]).toMatchObject({ n: 3, board: boardA.id });
       expect(replies).toEqual([]);
       expect((await inStore(urlA, boardA)).lease.epoch).toBe(1);   // no takeover happened
       expect((await inStore(urlB, boardB)).lease.epoch).toBe(1);

@@ -8,7 +8,7 @@ import { createLogger } from "../../server/log.js";
 const log = createLogger({ write: l => { if (/stopped|lost|fenced|opened/.test(l)) console.error("CHILD", l.slice(0, 200)); } });
 const [holder, ttl, schema] = process.argv.slice(2);
 const store = await postgresStore({ url: process.env.DATABASE_URL, schema, max: 3 });
-const bus = await natsBus({ url: process.env.NATS_URL });
+const bus = await natsBus({ url: process.env.NATS_URL, cluster: null });
 const h = roomHost({ store, bus, holder, log, leaseTtlMs: Number(ttl), heartbeatMs: 200 });
 await h.open("t-aaa", "b-one");
 const p = await h.peek("t-aaa", "b-one");

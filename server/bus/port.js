@@ -51,9 +51,11 @@ export const subjects = {
 /**
  * Scopes a bus to one cluster (PROTOCOL.md § Bus, Cluster id): every subject this process publishes or subscribes
  * on the wire is `<cluster>.<subject>`, so two clusters on one NATS server never hear each other. The core keeps
- * building subjects with `subjects` above and never sees the prefix; handlers get the subject without it. A cluster
- * id is "c-" + 16 of [a-z0-9]: it can't equal the first token of an unscoped subject (`plen`, `plen-gw`,
- * `plen-hosts`), so an old node's traffic and a scoped node's never share a subject either.
+ * building subjects with `subjects` above and never sees the prefix; handlers get the subject without it (and so
+ * does `onError`: build it with `scopeOnError`). A cluster id is "c-" + 16 of [a-z0-9]: it can't equal the first
+ * token of an unscoped subject (`plen`, `plen-gw`, `plen-hosts`), so an old node's traffic and a scoped node's
+ * never share a subject either. A handler subscribed twice to one subject is still one subscription (the adapters
+ * keep handlers in a Set), so this keeps one wrapper per (subject, handler).
  * Every other adapter member (flush, close, maxBytes, subscriberCount, isUp, ...) is the underlying bus's own.
  * @template {{ publish: Function, subscribe: Function }} B
  * @param {B} bus
@@ -63,10 +65,28 @@ export const subjects = {
 export function scopeBus(bus, cluster) {
   if (!isClusterId(cluster)) throw new PortError("bad-id", "bad cluster id");
   const prefix = cluster + ".";
+  /** @type {Map<string, Map<Function, Function>>} subject → handler → its wrapper */
+  const wrappers = new Map();
   return {
     ...bus,
     publish: (subject, msg) => bus.publish(prefix + subject, msg),
-    subscribe: (subject, fn) => bus.subscribe(prefix + subject, (msg, wire) => fn(msg, typeof wire === "string" ? wire.slice(prefix.length) : wire)),
+    subscribe(subject, fn) {
+      let byFn = wrappers.get(subject);
+      if (!byFn) wrappers.set(subject, byFn = new Map());
+      let w = byFn.get(fn);
+      if (!w) byFn.set(fn, w = (msg, wire) => fn(msg, typeof wire === "string" ? wire.slice(prefix.length) : wire));
+      const off = bus.subscribe(prefix + subject, w);
+      return () => {
+        off();
+        if (byFn.get(fn) === w) { byFn.delete(fn); if (!byFn.size && wrappers.get(subject) === byFn) wrappers.delete(subject); }
+      };
+    },
     ...(bus.subscriberCount ? { subscriberCount: subject => bus.subscriberCount(prefix + subject) } : {}),
   };
 }
+
+/** An adapter's `onError` for a scoped bus: it hears the subject without the cluster prefix, like a handler does. */
+export const scopeOnError = (onError, cluster) => {
+  const prefix = cluster + ".";
+  return (err, subject) => onError(err, typeof subject === "string" && subject.startsWith(prefix) ? subject.slice(prefix.length) : subject);
+};

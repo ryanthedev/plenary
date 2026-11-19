@@ -180,7 +180,9 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE O
 as the owner before starting a runtime-role node (the default privileges already cover its grants). The id changes
 every bus subject, so old and new nodes do not talk over NATS: replace a cluster's nodes together (hosts first), not
 one by one. A database copied for staging or a restore test keeps the original's id; run `DELETE FROM pl_cluster;` on
-the copy (all its nodes stopped) before it shares a NATS server with the original.
+the copy (all its nodes stopped) before it shares a NATS server with the original. The id prefix keeps honest clusters
+apart; it is not access control: for real separation give each cluster its own NATS account or user limited to
+`<id>.>`. The id is on the `cluster adapters open` log line and in `SELECT id FROM pl_cluster`.
 
 **If start-up is refused**, a runtime-role node stops with `postgres registry: start-up in schema "…" was refused for
 lack of a privilege (permission denied …)` (the Store's reads `postgres store: …` the same way), code `denied`.

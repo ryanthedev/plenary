@@ -831,6 +831,11 @@ The log, checkpoints and each board's epoch (boards live in the Registry).
     would lease and ack the board into its own Store, and the gateway's client would hold an ack the board's real
     Store never saw. With the id in the subject a foreign host cannot see the request, the board's inbox or its
     heartbeats, so a gateway whose cluster has no host answers `unavailable` rather than being served by a stranger.
+  - **Not a security boundary.** The prefix keeps honest clusters apart; any client that can connect to the NATS
+    server can still subscribe to another cluster's subjects. For real separation give each cluster its own NATS
+    account or user, limited to publish and subscribe on `<id>.>` (and the inbox prefix it uses).
+  - **Finding the id.** It is on the `cluster adapters open` log line (`cluster`) and in
+    `SELECT id FROM pl_cluster`; it is minted at the first node's first start and never changes.
   - **A restored or cloned database keeps its id.** A copy of a production database (staging, a restore test) that
     shares a NATS server with the original is, by this rule, the same cluster. Give the copy its own id before it
     joins a shared bus: with every node of the copy stopped, `DELETE FROM pl_cluster;` (the next start mints a new one).
@@ -838,7 +843,9 @@ The log, checkpoints and each board's epoch (boards live in the Registry).
     subjects) and a node with it never exchange a message: an old gateway's remote open does not reach a new host,
     and an old and a new gateway do not see each other's presence or entries. They also cannot split-brain, because
     leases are in the Store. The Store's conditional, epoch-fenced append stays the last line of defence inside one cluster: a host that lost its lease can't write (§ Store). Upgrade a cluster as a whole: stop the old nodes and start the new ones (hosts first),
-    or expect writers on a not-yet-upgraded gateway to get `unavailable` until its host side is upgraded. Readers on
+    or expect writers on a not-yet-upgraded gateway to get `unavailable` until its host side is upgraded. The other
+    direction fails the same way: a writer on an upgraded gateway gets `unavailable` while an old host still holds the
+    board's lease, until that host stops (its lease lapses or is released) and an upgraded host takes the board. Readers on
     a gateway whose board feed lost the bus keep working from the Store poll (≤ 5 s behind, see below). The schema
     gains table `pl_cluster`: a node running as a role that may not create tables starts only after the owner has
     migrated (`deploy/README.md`).

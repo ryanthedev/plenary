@@ -2,7 +2,7 @@
 // a missing or malformed id from the Store refuses the start (fail closed) and closes what opened; the id reaches
 // the Bus adapter only through its `cluster` option; a bad one is refused before anything connects; a node from
 // before the id (unscoped subjects) and a scoped one never exchange a message.
-import { test, expect } from "bun:test";
+import { test, expect, afterAll } from "bun:test";
 import { join } from "node:path";
 import { start } from "../../server/main.js";
 import { sqliteStore } from "../../server/store/sqlite.js";
@@ -10,7 +10,9 @@ import { sqliteRegistry } from "../../server/registry/sqlite.js";
 import { memoryBus } from "../../server/bus/memory.js";
 import { natsBus } from "../../server/bus/nats.js";
 import { subjects } from "../../server/bus/port.js";
-import { tempDir, sleep } from "./helpers.js";
+import { tempDir, cleanup, sleep } from "./helpers.js";
+
+afterAll(cleanup);
 
 const ID = "c-0123456789abcdef";
 const env = () => ({ PLENARY_DATA_DIR: tempDir(), PORT: "0", LOG_LEVEL: "info", DATABASE_URL: "postgres://u:pw@127.0.0.1:1/p", NATS_URL: "nats://127.0.0.1:1", COOKIE_KEY: "k".repeat(32) });
@@ -62,14 +64,24 @@ test("DW-iso: the id reaches the Bus adapter through its `cluster` option, is lo
   } finally { await app.stop(); }
 });
 
-test("DW-iso: natsBus and memoryBus refuse a bad cluster id before connecting", async () => {
+test("DW-iso: natsBus and memoryBus refuse a bad cluster id before connecting; natsBus also refuses to be unscoped by omission", async () => {
   let connects = 0;
   const connect = async () => { connects++; throw new Error("should not connect"); };
-  for (const bad of ["plen", "c-x", "", null, "c-0123456789abcde>"]) {
+  for (const bad of ["plen", "c-x", "", "c-0123456789abcde>", 7]) {
     await expect(natsBus({ url: "nats://127.0.0.1:1", cluster: bad, connect })).rejects.toMatchObject({ code: "bad-id" });
     expect(() => memoryBus({ cluster: bad })).toThrow(/bad cluster id/);
   }
+  await expect(natsBus({ url: "nats://127.0.0.1:1", connect })).rejects.toThrow(/needs `cluster`/);   // omitted: not unscoped by default
   expect(connects).toBe(0);
+  await expect(natsBus({ url: "nats://127.0.0.1:1", cluster: null, connect })).rejects.toThrow("should not connect");   // null is the explicit unscoped bus: it connects
+  expect(connects).toBe(1);
+});
+
+test("DW-iso: onError of a scoped bus hears the subject without the cluster prefix, like a handler does", async () => {
+  const heard = [];
+  const bus = memoryBus({ cluster: ID, maxBytes: 10, onError: (err, subject) => heard.push(subject) });
+  await bus.publish(subjects.entries("t-1", "b-1"), "x".repeat(50)).catch(() => {});
+  expect(heard).toEqual([subjects.entries("t-1", "b-1")]);
 });
 
 test("DW-iso mixed version: a node without the id (unscoped) and one with it exchange nothing, in either direction, on any open or inbox subject", async () => {

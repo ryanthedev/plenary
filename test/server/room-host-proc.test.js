@@ -43,7 +43,7 @@ for (const how of ["kill -9", "SIGSTOP"]) test.skipIf(!url || !nurl)(`a real hol
   const schema = `pl_test_hostproc_${process.pid}_${how === "kill -9" ? "k" : "s"}_${Date.now().toString(36)}`; schemas.push(schema);
   const ttl = 2_000;
   const { p, epoch: eA } = await child("h-child", ttl, schema);
-  const store = await postgresStore({ url, schema, max: 3 }), bus = await natsBus({ url: nurl });
+  const store = await postgresStore({ url, schema, max: 3 }), bus = await natsBus({ url: nurl, cluster: null });
   const Bh = roomHost({ store, bus, holder: "h-b", leaseTtlMs: ttl, heartbeatMs: 200 });
   const g = gw(bus, `g-${how === "kill -9" ? "k" : "s"}${process.pid}`);
   try {

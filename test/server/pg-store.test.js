@@ -26,10 +26,11 @@ describe.skipIf(!url)("postgres store", () => {
 
   test("DW-iso: clusterId is c-+16, stable across calls and reopen, one id for a racing start, a different one per database", async () => {
     const a = schemaName(), b = schemaName();
-    const stores = [];
+    const stores = [], pools = [];
     try {
       // Eight nodes asking at once on a fresh schema: one id wins, all of them return it.
-      const nodes = await Promise.all(Array.from({ length: 8 }, () => postgresStore({ sql: client(), schema: a })));
+      // each node has its own connection, as separate processes do (not one shared pool)
+      const nodes = await Promise.all(Array.from({ length: 8 }, async () => { const own = new SQL({ url, max: 1 }); pools.push(own); return postgresStore({ sql: own, schema: a }); }));
       stores.push(...nodes);
       const ids = await Promise.all(nodes.map(n => n.clusterId()));
       expect(ids[0]).toMatch(/^c-[a-z0-9]{16}$/);
@@ -41,7 +42,7 @@ describe.skipIf(!url)("postgres store", () => {
       const other = await postgresStore({ sql: client(), schema: b }); stores.push(other);
       expect(await other.clusterId()).not.toBe(ids[0]);           // another database is another cluster
       await expect(client().unsafe(`INSERT INTO "${a}".pl_cluster (id) VALUES ('c-bbbbbbbbbbbbbbbb')`)).rejects.toThrow();   // never a second row
-    } finally { for (const x of stores) await x.close(); await drop(a); await drop(b); }
+    } finally { for (const x of stores) await x.close(); for (const p of pools) await p.close(); await drop(a); await drop(b); }
   });
 
   test("clusterId on a closed store is refused", async () => {

@@ -57,7 +57,7 @@ const refusingConnect = seen => async opts => { seen.push(opts); const e = new E
 test("M1: natsBus hands the client user/pass (or token) as options, never inside `servers`", async () => {
   for (const [url, want] of [[`nats://plen:${PW}@127.0.0.1:1`, { user: "plen", pass: PW }], [`nats://${TOK}@127.0.0.1:1`, { token: TOK }]]) {
     const seen = [];
-    await expect(natsBus({ url, name: "n-1", connect: refusingConnect(seen) })).rejects.toThrow("Authorization Violation");
+    await expect(natsBus({ url, name: "n-1", cluster: null, connect: refusingConnect(seen) })).rejects.toThrow("Authorization Violation");
     expect(seen[0]).toMatchObject({ ...want, servers: ["nats://127.0.0.1:1"], name: "n-1" });
     leakFree([JSON.stringify(seen[0].servers)], [PW, TOK]);
   }
@@ -103,7 +103,7 @@ liveNats("M1 live: a NATS with user/password and one with a token both accept th
   ]) {
     const srv = await authServer(auth);
     try {
-      const bus = await natsBus({ url: good(srv.port), connectTimeoutMs: 2000 });
+      const bus = await natsBus({ url: good(srv.port), cluster: null, connectTimeoutMs: 2000 });
       const got = [];
       bus.subscribe("plen.t-a.b-1.entries", m => got.push(m));
       await bus.flush();
@@ -111,7 +111,7 @@ liveNats("M1 live: a NATS with user/password and one with a token both accept th
       await until(() => got.length === 1, "the message back");
       await bus.close();
       let err = null;
-      try { const b = await natsBus({ url: bad(srv.port), connectTimeoutMs: 2000 }); await b.close(); } catch (e) { err = e; }
+      try { const b = await natsBus({ url: bad(srv.port), cluster: null, connectTimeoutMs: 2000 }); await b.close(); } catch (e) { err = e; }
       expect(err).not.toBe(null);
       leakFree([String(err?.message), String(err?.stack)], [PW, TOK]);
     } finally { await srv.stop(); }

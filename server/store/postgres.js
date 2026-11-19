@@ -46,9 +46,8 @@
 // per test). The adapter never reads the environment.
 
 import { SQL } from "bun";
-import { needId, PortError } from "../ids.js";
+import { needId, PortError, mintClusterId } from "../ids.js";
 import { needSchema, migrate } from "../pg/schema.js";
-import { randomId } from "../auth/util.js";
 
 const MAX_READ = 10_000;
 const posInt = v => Number.isSafeInteger(v) && v > 0;
@@ -351,7 +350,7 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
       const read = async () => (await db.unsafe(`SELECT id FROM ${K}`))[0]?.id;
       const have = await read();
       if (have) return have;
-      await write(tx => tx.unsafe(`INSERT INTO ${K} (id) VALUES ($1) ON CONFLICT DO NOTHING`, ["c-" + randomId(16)]));
+      await write(tx => tx.unsafe(`INSERT INTO ${K} (id) VALUES ($1) ON CONFLICT DO NOTHING`, [mintClusterId()]));
       return read();   // the winner's row, whoever's it is
     },
 

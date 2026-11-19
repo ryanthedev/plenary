@@ -12,7 +12,11 @@ const nt = URL ? test : test.skip;
 const code = async p => { try { await p; return "resolved"; } catch (e) { return e.code ?? `threw ${e.message}`; } };
 
 busContract("memory bus", o => memoryBus(o));
-busContract("nats bus", o => natsBus({ url: URL, ...o }), { skip: !URL });
+busContract("nats bus", o => natsBus({ url: URL, cluster: null, ...o }), { skip: !URL });
+// The same contract on a bus scoped to a cluster: handlers, onError and subscriberCount all speak unprefixed subjects.
+const SCOPE = "c-0123456789abcdef";
+busContract("memory bus (scoped)", o => memoryBus({ cluster: SCOPE, ...o }));
+busContract("nats bus (scoped)", o => natsBus({ url: URL, cluster: SCOPE, ...o }), { skip: !URL });
 
 // ---- the wire format (no server needed) ----
 
@@ -44,7 +48,7 @@ test("nats wire: nested bytes, bare bytes and bigints are refused, not mangled",
 // ---- NATS only ----
 
 const open = [];
-const make = async o => { const b = await natsBus({ url: URL, ...o }); open.push(b); return b; };
+const make = async o => { const b = await natsBus({ url: URL, cluster: null, ...o }); open.push(b); return b; };
 afterAll(async () => { for (const b of open.splice(0)) await b.close().catch(() => {}); });
 const tenant = runTenant();
 
@@ -138,7 +142,7 @@ nt("nats: a wildcard listener elsewhere would hear us, but our subscribe can't b
 
 nt("nats: an unreachable server rejects natsBus (callers decide; nothing hangs)", async () => {
   // (A connect that never gave up never returns, and the test's own limit fails it.)
-  expect(await code(natsBus({ url: "nats://127.0.0.1:1", connectTimeoutMs: 1000 }))).not.toBe("resolved");
+  expect(await code(natsBus({ url: "nats://127.0.0.1:1", cluster: null, connectTimeoutMs: 1000 }))).not.toBe("resolved");
 }, 30_000);
 
 test("nats: natsBus needs a url (never reads env itself)", async () => {
@@ -167,8 +171,8 @@ ot("nats outage: publishes are refused (unavailable) while down, reported once p
   try {
     let srv = await start(2);
     const errors = [], url = `nats://127.0.0.1:${port}`;
-    const bus = await natsBus({ url, onError: e => errors.push(e.code), reconnectWaitMs: 100 });
-    const listener = await natsBus({ url, reconnectWaitMs: 100 });
+    const bus = await natsBus({ url, cluster: null, onError: e => errors.push(e.code), reconnectWaitMs: 100 });
+    const listener = await natsBus({ url, cluster: null, reconnectWaitMs: 100 });
     open.push(bus, listener);
     const got = [], s = "plen.t-out.b-1.presence";
     listener.subscribe(s, m => got.push(m));
@@ -228,8 +232,8 @@ ot("nats stall: a frozen server (SIGSTOP) caps what is queued, is declared stale
   try {
     await until(async () => { try { (await Bun.connect({ hostname: "127.0.0.1", port, socket: { data() {} } })).end(); return true; } catch { return false; } }, "nats-server up");
     const url = `nats://127.0.0.1:${port}`, errors = [];
-    const bus = await natsBus({ url, onError: e => errors.push([e.code, e.message]), pingIntervalMs: 500, maxPingOut: 2, maxPendingBytes: 24 * 1024 * 1024, reconnectWaitMs: 100, connectTimeoutMs: 1000 });
-    const listener = await natsBus({ url });
+    const bus = await natsBus({ url, cluster: null, onError: e => errors.push([e.code, e.message]), pingIntervalMs: 500, maxPingOut: 2, maxPendingBytes: 24 * 1024 * 1024, reconnectWaitMs: 100, connectTimeoutMs: 1000 });
+    const listener = await natsBus({ url, cluster: null });
     open.push(bus, listener);
     const got = [], s = "plen.t-stall.b-1.presence";
     listener.subscribe(s, m => got.push(m.k));
@@ -282,5 +286,5 @@ ot("nats stall: a frozen server (SIGSTOP) caps what is queued, is declared stale
 
 test("nats: stall settings must be sane", async () => {
   for (const o of [{ pingIntervalMs: 0 }, { maxPingOut: -1 }, { maxPendingBytes: 1024 }, { ackEveryMs: NaN }])
-    expect(await code(natsBus({ url: "nats://127.0.0.1:1", ...o }))).toMatch(/^threw natsBus/);
+    expect(await code(natsBus({ url: "nats://127.0.0.1:1", cluster: null, ...o }))).toMatch(/^threw natsBus/);
 });

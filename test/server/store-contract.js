@@ -11,6 +11,9 @@
 //                    `another()`). Without it, the lease cases wait out a short real ttl on the database's clock.
 // The adapter is expected to keep the newest 3 checkpoints per board (the adapters' default `keepCheckpoints`).
 // Refusals are matched by `err.code` (PortError codes: conflict, fenced, bad-entry, bad-id, closed).
+// Optional, cluster adapters only: `clusterId(): Promise<string>` (PROTOCOL.md § Bus, Cluster id: "c-" + 16 of [a-z0-9],
+// minted by the first caller, durable, the same for every handle on the same data). A single-node Store (SQLite)
+// has none: its bus is in-process, so no other cluster can share it. The cases below run for an adapter that has it.
 // Adapter-specific checks (pragmas, settings) stay in the adapter's own test file.
 
 import { describe, test, expect, afterEach } from "bun:test";
@@ -43,6 +46,18 @@ export function storeContract(name, make) {
     afterEach(async () => {
       for (const s of handles.splice(0)) await s.close();
       for (const c of cleanups.splice(0)) await c();
+    });
+
+    test("clusterId (adapters that have it): c-+16, stable, the same through another handle, never changes, refused on a closed store", async () => {
+      const { store, another } = await fresh();
+      if (typeof store.clusterId !== "function") return;                    // single-node adapters declare none
+      const id = await store.clusterId();
+      expect(id).toMatch(/^c-[a-z0-9]{16}$/);
+      expect(await store.clusterId()).toBe(id);
+      const other = await another();
+      expect(await other.clusterId()).toBe(id);
+      expect(await code(other.close().then(() => other.clusterId()))).toBe("closed");
+      expect(await store.clusterId()).toBe(id);                               // a closed sibling changes nothing
     });
 
     test("append is conditional on expectSeq; a stale one throws conflict and writes nothing", async () => {

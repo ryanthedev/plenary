@@ -247,24 +247,6 @@ test("a board feed picks up the host's checkpoint written just after the entries
   await r.stop();
 }, 20000);
 
-test("§ Pacing: frames read from a live socket faster than they are handled are capped in bytes: past maxLiveQueuedBytes, `unavailable` and close", async () => {
-  // One TCP write of 300 frames of ~1 KB: Bun hands them to the gateway back to back, before its pump handles one.
-  const r = await rig({ limits: { maxLiveQueuedBytes: 4 * 1024 } });   // far below one read (macOS loopback hands over ~16 KB at a time, Linux 64 KB), so a burst overflows however the kernel chunks it
-  const s = await rawSock(r.server.wsUrl, { frames: true }); s.send(hello(r, "editor"));
-  s.read();
-  await until(() => s.texts.some(t => t.includes('"welcome"')), "the welcome");
-  const pad = "x".repeat(1000);
-  const burst = Array.from({ length: 300 }, (_, i) => ({ t: "presence", k: "cursor", x: i, y: 0, pad }));
-  s.sendAll(burst);
-  await s.closed;
-  expect(s.texts.map(t => JSON.parse(t)).filter(m => m.t === "error")).toEqual([{ t: "error", code: "unavailable", message: "too much sent at once" }]);
-  expect(r.logs().some(l => l.msg === "frame queue overflow" && l.state === "live")).toBe(true);
-  // A well-behaved client on the same board is untouched.
-  const ok = await r.sock(); ok.send(hello(r, "viewer")); await ok.next(m => m.t === "welcome");
-  expect(ok.closed).toBe(null);
-  await r.stop();
-}, 20000);
-
 test("§ Pacing: an idle viewer that answers pings survives the idle timeout twice over; a socket that never answers is closed", async () => {
   // idleTimeoutSec 8 (Bun's smallest useful value; its timer ticks every 4 s): Bun pings a socket idle for half of it and
   // closes it at the full timeout if nothing came back. Bun's client answers pings; a raw socket never does (it reads

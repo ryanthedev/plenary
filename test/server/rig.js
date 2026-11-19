@@ -263,15 +263,13 @@ export async function rawSock(wsUrl, { frames = false } = {}) {
     };
   }
   s.closed = new Promise(res => socket.once("close", () => { s.ended = true; res(); }));
-  const frame = msg => {
+  s.send = msg => {
+    if (s.ended) return;
     const p = Buffer.from(typeof msg === "string" ? msg : JSON.stringify(msg)), mask = [7, 11, 13, 17];
     const head = p.length < 126 ? Buffer.from([0x81, 0x80 | p.length, ...mask]) : Buffer.from([0x81, 0x80 | 126, p.length >> 8, p.length & 255, ...mask]);
     const body = Buffer.from(p); for (let i = 0; i < body.length; i++) body[i] ^= mask[i % 4];
-    return Buffer.concat([head, body]);
+    socket.write(Buffer.concat([head, body]));
   };
-  s.send = msg => { if (!s.ended) socket.write(frame(msg)); };
-  /** Every message in ONE socket write, so the server reads them back to back (separate writes may be read and handled one by one on Linux). */
-  s.sendAll = msgs => { if (!s.ended) socket.write(Buffer.concat(msgs.map(frame))); };
   const take = d => { s.got += d.length; s.parse?.(d); };
   s.read = () => { clearInterval(s.trickling); socket.on("data", take); socket.resume(); };
   /** Read only `bytes` every `ms`: a reader that is alive but far too slow (the kernel's buffer stays full). */

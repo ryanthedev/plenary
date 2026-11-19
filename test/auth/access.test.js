@@ -394,6 +394,28 @@ describe("grant writes: add, change, remove, idempotency, announcements", () => 
     await svc.setGrant(ada, "space", design.id, "user", "google:old", null);
     expect(await grants("space", design.id)).toEqual(["user:google:ada:owner"]);
   });
+  test("a guest at board scope: an existing guest's role can be changed or cleared by the owner (can.change agrees), and a guest can be given a board role; above a board a guest still cannot be added", async () => {
+    await r.setGrant(board.id, kim.user, "editor");
+    const row = (await svc.accessPage(ada, "board", board.id)).rows.find(x => x.subject.id === kim.user);
+    expect(row).toMatchObject({ role: "editor", can: { change: true, remove: true } });
+    expect(await svc.setGrant(ada, "board", board.id, "user", kim.user, "viewer")).toMatchObject({ role: "viewer" });
+    expect(await r.grant(board.id, kim.user)).toBe("viewer");
+    expect(await svc.setGrant(ada, "board", board.id, "user", "google:newguest", "commenter")).toMatchObject({ role: "commenter" });
+    await svc.setGrant(ada, "board", board.id, "user", kim.user, null);
+    expect(await r.grant(board.id, kim.user)).toBe(null);
+    expect(await code(svc.setGrant(ada, "space", design.id, "user", kim.user, "viewer"))).toBe("unknown-person");
+    // a stale guest row above a board can still be changed or cleared: no directory row is needed for an existing grant
+    await r.setScopedGrant({ scope: { type: "space", id: design.id }, subject: U(kim.user), role: "editor" });
+    const stale = (await svc.accessPage(ada, "space", design.id)).rows.find(x => x.subject.id === kim.user);
+    expect(stale.can.change).toBe(true);
+    expect(await svc.setGrant(ada, "space", design.id, "user", kim.user, "viewer")).toMatchObject({ role: "viewer" });
+  });
+  test("an `email:` admin entry (not yet seen) is not a person: it cannot be added to a Team", async () => {
+    await r.addTenantAdmin(acme.id, "email:zed@acme.com");
+    expect(await code(svc.setMember(root, infra.id, "email:zed@acme.com", true))).toBe("unknown-person");
+    expect(await code(svc.setGrant(ada, "space", design.id, "user", "email:zed@acme.com", "viewer"))).toBe("unknown-person");
+    expect(await r.teamMembers(infra.id)).toEqual([]);
+  });
   test("validation: roles, subject types, ids", async () => {
     expect(await code(svc.setGrant(ada, "space", design.id, "user", max.user, "god"))).toBe("bad-role");
     expect(await code(svc.setGrant(ada, "space", design.id, "user", max.user, ""))).toBe("bad-request");

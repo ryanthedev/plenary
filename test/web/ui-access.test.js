@@ -194,7 +194,7 @@ test("changing a role asks the port, shows the server's row, and says it; a Team
 test("the server's refusals are said in words: the last owner, an unknown person, a bad role", async () => {
   await accessPage();
   const real = api.answer;
-  for (const [r, text] of [[{ error: "conflict", code: "last-owner" }, "at least one owner"], [{ error: "invalid", code: "unknown-person" }, "has not opened Plenary"], [{ error: "invalid", code: "bad-role" }, "does not apply"], [{ error: "forbidden" }, "can't do that"]]) {
+  for (const [r, text] of [[{ error: "conflict", code: "last-owner" }, "at least one owner"], [{ error: "invalid", code: "unknown-person" }, "has not signed in"], [{ error: "invalid", code: "bad-role" }, "does not apply"], [{ error: "forbidden" }, "can't do that"]]) {
     api.answer = (n, ...a) => (n === "removeGrant" || n === "setGrant" ? r : real(n, ...a));
     btn("Remove max").click(); await settle();
     expect(textOf(root.find(e => e.hasClass("home-status")))).toContain(text);
@@ -255,4 +255,61 @@ test("core copy: failText, sizeText, viaText", () => {
   expect(failText({ error: "network" })).toContain("No answer");
   expect([sizeText(0), sizeText(1), sizeText(7), sizeText(1001)]).toEqual(["0 members", "1 member", "7 members", "1000+ members"]);
   expect([viaText({ via: "direct" }), viaText({ via: "team" }), viaText({ via: "inherited", scope: { type: "group", name: "Product" } })]).toEqual(["Added directly", "Team", "via Group Product"]);
+});
+
+test("pressing a match in the picker keeps focus on it (the list is rebuilt around it), on the Access page and the Team page", async () => {
+  for (const mount of [accessPage, teamPage]) {
+    root.replaceChildren(); focused.length = 0;
+    await mount();
+    const input = all(e => e.tagName === "INPUT" && /^Search/.test(e.getAttribute("aria-label") ?? ""))[0];
+    input.dispatch("input", { target: { value: "" } }); await settle();
+    const pick = all(e => e.getAttribute("data-fk") === "pick:user:google:lee")[0];
+    pick.focus();
+    pick.dispatch("click"); await settle();
+    const now = globalThis.document.activeElement;
+    expect(now.getAttribute("data-fk")).toBe("pick:user:google:lee");
+    expect(now).not.toBe(pick);                                          // the list was rebuilt, and focus came back to the rebuilt button
+    expect(now.getAttribute("aria-pressed")).toBe("true");
+  }
+});
+
+test("after a Team is deleted, focus goes to the way out, not to nothing", async () => {
+  await teamPage();
+  btn("Delete team…").click();
+  btn("Delete team").click(); await settle();
+  expect(textOf(root.find(e => e.hasClass("home-empty")))).toContain("Team deleted.");
+  const f = focused.at(-1);
+  expect([f.tagName, f.getAttribute("href")]).toEqual(["A", "?teams=1"]);
+});
+
+test("while a change is in flight every row control is aria-disabled (and works again after)", async () => {
+  await accessPage();
+  const gate = hold(); const real = api.answer;
+  api.answer = (n, ...a) => (n === "removeGrant" ? gate.p.then(() => real(n, ...a)) : real(n, ...a));
+  btn("Remove max").click(); await settle();
+  expect([btn("Remove max"), btn("Remove Infra"), byLabel("SELECT", "Role of max"), byLabel("SELECT", "Role of Infra")].map(e => e.getAttribute("aria-disabled"))).toEqual(["true", "true", "true", "true"]);
+  expect(btn("Remove Infra").disabled).toBe(false);
+  btn("Remove Infra").click(); await settle();
+  expect(calls.filter(c => c[0] === "removeGrant")).toHaveLength(1);       // a second click while pending does nothing
+  gate.release(); await settle(); await settle();
+  expect(btn("Remove Infra").getAttribute("aria-disabled")).not.toBe("true");
+  // the same on a Team page
+  root.replaceChildren(); await teamPage();
+  const g2 = hold(); const r2 = api.answer;
+  api.answer = (n, ...a) => (n === "setMember" ? g2.p.then(() => r2(n, ...a)) : r2(n, ...a));
+  btn("Remove ada").click(); await settle();
+  expect(btn("Remove max").getAttribute("aria-disabled")).toBe("true");
+  g2.release(); await settle(); await settle();
+});
+
+test("the confirmation and the focus fallback are said together, not one over the other", async () => {
+  await accessPage();
+  const rm = btn("Remove max");
+  globalThis.document.activeElement = rm; rm.setAttribute("data-fk", "remove:user:google:max");
+  rm.click(); await settle(); await settle();
+  expect(announced()).toMatch(/^Removed max\. That person or team is no longer here; moved to the (next|previous) one\.$/);
+  // no fallback (focus was elsewhere): just the confirmation
+  globalThis.document.activeElement = null;
+  btn("Remove Infra").click(); await settle(); await settle();
+  expect(announced()).toBe("Removed Infra");
 });

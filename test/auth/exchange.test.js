@@ -270,3 +270,20 @@ test("exp comes from the sessions adapter's verify(), not the token's format; no
     expect((await exchange(s.code, { cookie: s.cookie })).status).toBe(200);
   }
 });
+
+test("a Unit member's sign-in is recorded in the member directory (best effort); a guest's is not", async () => {
+  const unit = (await registry.tenantByDomain("acme.com"));
+  const a = await signIn(ADMIN);
+  expect((await exchange(a.code, { cookie: a.cookie })).status).toBe(200);
+  await new Promise(r => setTimeout(r, 0));
+  expect(await registry.membersAmong(unit.id, ["google:1001"])).toEqual([{ user: "google:1001", name: "Ann", email: "ann@acme.com" }]);
+  const g = await signIn(GUEST);
+  expect((await exchange(g.code, { cookie: g.cookie })).status).toBe(200);
+  await new Promise(r => setTimeout(r, 0));
+  expect(await registry.membersAmong(unit.id, ["google:2001"])).toEqual([]);
+  // a Registry that cannot record never fails the sign-in
+  const broken = new Proxy(registry, { get: (t, k) => (k === "touchMember" ? async () => { throw new Error("down"); } : t[k]) });
+  const via = node({ registry: broken });
+  const b = await signIn({ ...ADMIN, sub: "1002", email: "bo@acme.com" }, { via });
+  expect((await exchange(b.code, { cookie: b.cookie, via })).status).toBe(200);
+});

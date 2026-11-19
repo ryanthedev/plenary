@@ -128,7 +128,7 @@ export function accessService({ registry, tenancy, announce = () => {}, backlog 
 
   /** Is `user` a person the Unit knows: in its directory, or one of its admins named by id (the operator vouches for them)? */
   async function isKnownPerson(unit, user) {
-    if (unit.admins?.includes(user)) return true;
+    if (unit.admins?.includes(user) && !user.startsWith("email:")) return true;     // an `email:` entry is an admin not yet seen: not a person with an id
     return (await registry.membersAmong(unit.id, [user])).length > 0;
   }
 
@@ -360,7 +360,8 @@ export function accessService({ registry, tenancy, announce = () => {}, backlog 
         if (!def) throw refused();
         if (cur === role) return { ...(await rowOf(unit, sub, role, roles, type, access, admin, identity)) };
         if (cur != null && !touch(cur)) throw refused();
-        if (subjectType === "user") { if (!(await isKnownPerson(unit, sid))) throw new AdminError("unknown-person", "that person is not a member of this Unit"); }
+        // A change to an existing grant, and any person's grant on a board (guests hold board scope), need no directory row; a NEW grant above a board does.
+        if (subjectType === "user") { if (cur == null && type !== "board" && !(await isKnownPerson(unit, sid))) throw new AdminError("unknown-person", "that person is not a member of this Unit"); }
         else if (!(await registry.teamsAmong(unit.id, [sid])).length) throw refused();
       }
       try {

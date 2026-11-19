@@ -9,7 +9,7 @@ import { errorText as baseError, NAME_MAX } from "./spaces.js";
 const MSG = {
   "last-owner": "It must keep at least one owner. Make someone else an owner first.",
   "too-large": "This team has access in too many places to delete at once. Remove some of its access first.",
-  "unknown-person": "That person has not opened Plenary yet, so they cannot be added.",
+  "unknown-person": "That person has not signed in to Plenary yet, so they cannot be added.",
   "bad-role": "That role does not apply here.",
 };
 /** The sentence for a failed call `{ error, code? }`. */

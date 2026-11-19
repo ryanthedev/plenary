@@ -120,7 +120,7 @@ export const mint = {
  *   teamMembersPage(team: string, o?: { after?: string|null, limit?: number }): Promise<{ users: string[], next: string|null }>,   // by user id (default 50, cap 200)
  *   scopedGrant(scope: ScopeRef, subject: Subject): Promise<string|null>,   // one grant's role (null = none): the single-row read a grant change compares against
  *   scopedGrantsPage(scope: ScopeRef, o?: { after?: string|null, limit?: number }): Promise<{ grants: ScopedGrant[], next: string|null }>,   // by subject ("user"/"team" then id; cursor "<type>\n<id>"), default 50, cap 200
- *   touchMember(tenant: string, o: { user: string, name?: string|null, email?: string|null }): Promise<void>,   // the member directory: records a Unit member seen at sign-in/Home; writes only when the row is new or its name/email changed
+ *   touchMember(tenant: string, o: { user: string, name?: string|null, email?: string|null }): Promise<void>,   // the member directory: records a Unit member seen at sign-in (the code exchange) or on Home; writes only when the row is new or its name/email changed
  *   membersAmong(tenant: string, users: string[]): Promise<{ user: string, name: string|null, email: string|null }[]>,   // those of `users` (at most 200) in the Unit's directory
  *   findMembers(tenant: string, o?: { q?: string|null, limit?: number }): Promise<{ user: string, name: string|null, email: string|null }[]>,   // directory search by ASCII-folded substring of name, email or user id; by name then id; default 20, cap 50
  *   team(id: string): Promise<Team|null>,

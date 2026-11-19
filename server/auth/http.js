@@ -262,6 +262,8 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
     let exp;
     try { exp = (await sessions.verify(token))?.exp; } catch { exp = null; }
     if (!Number.isInteger(exp)) { usedCodes.release(x.h); return err(503, "unavailable"); }
+    // The member directory (PROTOCOL.md § Teams and access): a Unit member who signs in is findable by the pickers. Best effort, off the request path.
+    void (async () => { const unit = await tenancy.tenantOf(x.identity); if (unit && typeof registry.touchMember === "function") await registry.touchMember(unit.id, x.identity); })().catch(() => {});
     return withCookie(json(200, { token, ...x.identity, exp }), clearXchg);
   }
 

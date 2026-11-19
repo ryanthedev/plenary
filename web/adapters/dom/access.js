@@ -7,14 +7,26 @@
 // said in the polite live region (announce()); one column that works at 390 px.
 
 import { h, replace } from "./dom.js";
-import { keeper, announce } from "./focus.js";
+import { keeper, announce, announced } from "./focus.js";
 import { shell, showNotice, gate, message } from "./spaces.js";
 import { createPickerModel, sizeText, viaText, generalLine, SCOPE_NOUN } from "../../core/access.js";
 
 /** A button that is "disabled" without leaving the tab order: clicks are ignored while it says so. */
 const act = (attrs, text, on, isOff) => h("button.btn", { type: "button", ...attrs, onclick: e => { if (e.currentTarget.getAttribute("aria-disabled") === "true" || isOff?.()) { e.preventDefault?.(); return; } on(e); } }, text);
 const setOff = (el, off) => el.setAttribute("aria-disabled", off ? "true" : "false");
-const said = (S) => { if (S.said) { announce(S.said); S.said = null; } };
+/**
+ * Run a render and say what a change did. The keeper may also announce a focus fallback ("That person is no longer here; moved to the next one."): both
+ * are said as ONE sentence pair, so the fallback does not overwrite the confirmation.
+ */
+const speak = (S, draw) => {
+  const say = S.said; S.said = null;
+  if (!say) { draw(); return; }
+  announce("");
+  draw();
+  const fb = announced();
+  announce(fb ? `${say}. ${fb}` : say);
+};
+const quiet = S => { if (S.said) { announce(S.said); S.said = null; } };
 const subjectKey = s => `${s.type}:${s.id}`;
 const who = (s, keys, extra = "") => keys.mark(h("span.who", { tabindex: "-1" }, s.name, extra ? h("small", {}, ` ${extra}`) : null), `who:${subjectKey(s)}`);
 
@@ -42,12 +54,14 @@ export function pickerView({ api, teams, rolesFor = null, onAdd, label, setTimer
   const status = h("p.muted", { role: "status" });
   const el = h("div.picker", {}, h("div.pick-row", {}, input), status, list, rolesFor ? h("label.l", {}, "Role", roleSel) : null, add);
   function paint() {
+    const hadKey = list.contains?.(globalThis.document?.activeElement) ? globalThis.document.activeElement.getAttribute("data-fk") : null;
     replace(list, [...S.people, ...S.teams].map(s => {
       const on = S.chosen && S.chosen.type === s.type && S.chosen.id === s.id;
       return h("li", { "aria-label": `${s.name}${s.type === "team" ? ", team" : ""}` }, h("button.btn.ghost", { type: "button", "aria-pressed": on ? "true" : "false", "data-fk": `pick:${subjectKey(s)}`, onclick: () => model.choose(s) },
         s.name, h("small", {}, s.type === "team" ? ` · team of ${s.size}` : s.email ? ` · ${s.email}` : "")));
     }));
-    status.textContent = S.status === "error" ? S.error : S.status === "loading" ? "Searching…" : S.searched && !S.people.length && !S.teams.length ? "No one matches. People appear here once they have opened Plenary." : "";
+    if (hadKey) [...list.querySelectorAll?.("button") ?? list.findAll(e => e.tagName === "BUTTON")].find(b => b.getAttribute("data-fk") === hadKey)?.focus?.();   // pressing a match rebuilds the list: focus stays on it
+    status.textContent = S.status === "error" ? S.error : S.status === "loading" ? "Searching…" : S.searched && !S.people.length && !S.teams.length ? "No one matches. People appear here once they have signed in to Plenary." : "";
     if (rolesFor) {
       const opts = S.chosen ? rolesFor(S.chosen.type) : [];
       if (!opts.some(o => o.id === role)) role = opts[0]?.id ?? null;
@@ -74,10 +88,9 @@ export function mountTeamsPage({ root, model, hrefs, signIn = null }) {
   const name = h("input.field", { type: "text", "aria-label": "New team name", maxlength: "200", placeholder: "New team name" });
   function render() {
     showNotice(status, model);
-    said(S);
-    if (gate(S, main, () => model.load(), signIn)) return;
+    if (gate(S, main, () => model.load(), signIn)) { quiet(S); return; }
     if (S.busy && S.teams) { moreBtn && setOff(moreBtn, true); createBtn && setOff(createBtn, true); return; }
-    keys.around(draw);
+    speak(S, () => keys.around(draw));
     const f = after; after = null; f?.();
   }
   function draw() {
@@ -104,19 +117,27 @@ export function mountTeamPage({ root, model, api, hrefs, signIn = null, picker =
   const S = model.state;
   const { status, main } = shell(root, hrefs);
   const keys = keeper();
-  let confirming = false, after = null, view = null;
+  let confirming = false, after = null, view = null, controls = [];
+  const pend = () => { for (const c of controls) c.setAttribute("aria-disabled", "true"); };      // a change is in flight: its row controls stay in the tab order but do nothing
   const nameIn = h("input.field", { type: "text", "aria-label": "Team name", maxlength: "200" });
   function render() {
     showNotice(status, model);
-    said(S);
-    if (S.deleted) { replace(main, message("Team deleted.", ""), h("a.btn", { href: hrefs.teams }, "Back to teams")); return; }
-    if (gate(S, main, () => model.load(), signIn)) return;
-    if (S.busy && S.page && view) { view.refresh(); return; }
-    keys.around(draw);
+    if (S.deleted) {
+      quiet(S);
+      const back = h("a.btn", { href: hrefs.teams }, "Back to teams");
+      replace(main, h("div.home-empty", {}, h("h2", { id: "page-title", tabindex: "-1" }, "Team deleted."), back), back);
+      back.focus?.();                                                    // the focused Delete button is gone: put focus on the way out
+      return;
+    }
+    if (gate(S, main, () => model.load(), signIn)) { quiet(S); return; }
+    if (S.busy && S.page && view) { view.refresh(); pend(); return; }
+    speak(S, () => keys.around(draw));
     const f = after; after = null; f?.();
   }
   function draw() {
     const p = S.page, can = p.can.manage;
+    controls = [];
+    const ctl = el => { controls.push(el); return el; };
     nameIn.value = p.team.name;
     view ??= pickerView({ api, teams: false, onAdd: async person => model.addMember({ user: person.id, name: person.name, email: person.email }), label: "Add a member", ...picker });
     const rows = sortRows(p.members.map(m => ({ subject: { type: "user", id: m.user, name: m.name }, email: m.email })));
@@ -126,7 +147,7 @@ export function mountTeamPage({ root, model, api, hrefs, signIn = null, picker =
       h("h2", {}, "Members"),
       rows.length ? h("ul.rows", { "aria-label": "Members" }, rows.map(r => h("li.row", { "aria-label": r.subject.name },
         who(r.subject, keys, r.email ?? ""),
-        can ? keys.mark(act({ "aria-label": `Remove ${r.subject.name}` }, "Remove", () => model.removeMember(r.subject.id), () => S.busy), `remove:user:${r.subject.id}`) : null)))
+        can ? keys.mark(ctl(act({ "aria-label": `Remove ${r.subject.name}` }, "Remove", () => model.removeMember(r.subject.id), () => S.busy)), `remove:user:${r.subject.id}`) : null)))
         : message("No members yet.", can ? "Add people below." : ""),
       p.next ? keys.mark(act({}, "Show more members", () => model.loadMore()), "show-more") : null,
       can ? h("section", { "aria-label": "Add a member" }, h("h2", {}, "Add a member"), view.el) : null,
@@ -149,28 +170,29 @@ export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker
   const S = model.state;
   const { status, main } = shell(root, hrefs);
   const keys = keeper();
-  let view = null, after = null;
+  let view = null, after = null, controls = [];
   function render() {
     showNotice(status, model);
-    said(S);
-    if (gate(S, main, () => model.load(), signIn)) return;
-    if (S.busy && S.page && view) { view.refresh(); main.querySelectorAll?.("[data-pending]").forEach?.(e => e.setAttribute("aria-disabled", "true")); return; }
-    keys.around(draw);
+    if (gate(S, main, () => model.load(), signIn)) { quiet(S); return; }
+    if (S.busy && S.page && view) { view.refresh(); for (const c of controls) c.setAttribute("aria-disabled", "true"); return; }
+    speak(S, () => keys.around(draw));
     const f = after; after = null; f?.();
   }
+  const ctl = el => { controls.push(el); return el; };
   const rowView = r => {
     const s = r.subject, k = subjectKey(s);
     const options = model.rolesFor(s.type);
     const opts = options.some(o => o.id === r.role) ? options : [{ id: r.role, name: r.roleName || r.role }, ...options];
     const select = r.can?.change && options.length
-      ? keys.mark(h("select.field", { "aria-label": `Role of ${s.name}`, onchange: e => { if (S.busy) { e.target.value = r.role; return; } model.set(s, e.target.value).then(ok => { if (!ok) render(); }); } },
-        opts.map(o => h("option", { value: o.id, selected: o.id === r.role }, o.name))), `role:${k}`)
+      ? keys.mark(ctl(h("select.field", { "aria-label": `Role of ${s.name}`, onchange: e => { if (S.busy) { e.target.value = r.role; return; } model.set(s, e.target.value).then(ok => { if (!ok) render(); }); } },
+        opts.map(o => h("option", { value: o.id, selected: o.id === r.role }, o.name)))), `role:${k}`)
       : h("span.p", {}, r.roleName || r.role);
     return h("li.row", { "aria-label": `${s.name}, ${r.roleName || r.role}, ${viaText(r)}` },
       who(s, keys, s.type === "team" ? `team of ${s.size ?? 0}` : s.email ?? ""), select, h("span.p", {}, viaText(r)),
-      r.can?.remove ? keys.mark(act({ "aria-label": `Remove ${s.name}` }, "Remove", () => model.remove(s), () => S.busy), `remove:${k}`) : null);
+      r.can?.remove ? keys.mark(ctl(act({ "aria-label": `Remove ${s.name}` }, "Remove", () => model.remove(s), () => S.busy)), `remove:${k}`) : null);
   };
   function draw() {
+    controls = [];
     const p = S.page, sc = p.scope, noun = SCOPE_NOUN[sc.type] ?? sc.type;
     view ??= pickerView({ api, teams: true, rolesFor: t => model.rolesFor(t), onAdd: (subject, role) => model.set(subject, role), label: "Add people or teams", ...picker });
     view.refresh();

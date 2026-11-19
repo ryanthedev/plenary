@@ -1053,9 +1053,9 @@ Names are access, exactly as in § Spaces and Groups: an id the caller may not u
 `403 forbidden`, same body) and the same Registry work; a caller with no Unit (a guest) gets 403 everywhere.
 
 **The member directory.** A Unit's membership comes from `hd` at sign-in and is not stored, so a person can be added to a Team, Space, Group or the Unit only after the
-server has seen them: `GET /home` records the caller in `reg_members (tenant, member, name, email)` (`touchMember`: one read, a write only when the row is new or the name
-or email changed). A person who has never opened Plenary is not in the directory and cannot be added (400 `unknown-person`, the same answer for an id that is a guest, in
-another Unit or never seen). A Unit admin named by user id (`tenant.admins`) counts as in the directory. Searching is `findMembers`: ASCII-folded substring of name, email or
+server has seen them: `GET /home` and the sign-in code exchange (best effort) record the caller in `reg_members (tenant, member, name, email)` (`touchMember`: one read, a write only when the row is new or the name
+or email changed). A person who has never signed in is not in the directory and cannot be added to a Team, Group, Space or the Unit (400 `unknown-person`, the same answer for an id that is a guest, in
+another Unit or never seen). A change to a grant that already exists, and a person's grant on a board (guests hold board scope), need no directory row. A Unit admin named by user id (`tenant.admins`, an `email:` entry excluded) counts as in the directory. Searching is `findMembers`: ASCII-folded substring of name, email or
 user id, at most 50 results, by name then id; it scans one Unit's rows, never another's. A row with no directory entry (a grant older than the directory) is shown with
 the name derived from its id (the part after `google:` / `dev:`).
 

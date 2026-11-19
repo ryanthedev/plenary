@@ -306,6 +306,24 @@ function sourceLabels(text, calls) {
   return [...out];
 }
 
+// The operator guide's cause table (deploy/README.md, "Sign-in failures") lists exactly what can be logged.
+test("the operator cause table lists every label the server can log, and nothing else", async () => {
+  const doc = await Bun.file(new URL("../../deploy/README.md", import.meta.url)).text();
+  const from = doc.indexOf("## Sign-in failures");
+  expect(from).toBeGreaterThan(-1);
+  const rows = doc.slice(from).split("\n").filter(Boolean).slice(1);
+  const start = rows.findIndex(r => r.startsWith("| `cause` |"));
+  expect(start).toBeGreaterThan(-1);
+  const rest = rows.slice(start);
+  const table = rest.slice(0, rest.findIndex(r => !r.startsWith("|")));
+  const listed = table.slice(2).flatMap(r => [...r.split("|")[1].matchAll(/`([^`]+)`/g)].map(m => norm(m[1])));
+  const known = [...new Set([...CAUSES, ...SIGN_IN_CAUSES].map(norm))];
+  for (const c of known) expect(listed, `${c} missing from the table`).toContain(c);
+  // A concrete example of a pattern row (`idp_error:server_error`, `token_http_502`) is fine; anything else isn't.
+  const instance = l => known.filter(k => k.endsWith("<>")).some(k => l.startsWith(k.slice(0, -2)) && /^[a-z0-9_]+$/.test(l.slice(k.length - 2)));
+  for (const l of listed) expect(known.includes(l) || instance(l), `${l} is in the table but never logged`).toBe(true);
+});
+
 test("restart mid-login / a second gateway: same COOKIE_KEY finishes the login; a different key logs bad_login_cookie", async () => {
   // Two httpRoutes over one Registry stand for one server before and after a restart, or two gateways behind a load
   // balancer: the login cookie is the only login state, so only the key matters.

@@ -82,7 +82,7 @@ test("an unavailable store: the exchange still signs in (memory only), the fragm
   expect(replaced).toBe(1);
 });
 
-// p6-edgev LOW-4 / LOW-5: the notice never blames the person, and says when the tab is still someone else.
+// p6-edgev LOW-4 / LOW-5: the notice never blames the user, and says when the tab is still someone else.
 test("signInNotice: share links, failures that don't blame, and 'still signed in as'", async () => {
   expect(signInNotice({ outcome: "signed-in", link: null, dev: null, token: "t" })).toBeNull();
   expect(signInNotice({ outcome: "dev", link: "invalid", dev: "bo", token: "dev-bo" })).toMatch(/share link is not valid/);

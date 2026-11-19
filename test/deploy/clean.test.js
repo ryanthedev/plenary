@@ -36,7 +36,7 @@ const rigDir = (w, name) => { const d = join(w.rigRoot, name); mkdirSync(d); wri
 
 test("old, unused plenary entries are removed; other names and young entries stay (--yes)", () => {
   const w = world();
-  const old = entry(w.tempDir, "plenary-load-data-aaa111"), run = entry(w.tempDir, `plen-run-${DEAD}-x`), other = entry(w.tempDir, "omniloop-life-zzz");
+  const old = entry(w.tempDir, "plenary-load-data-aaa111"), run = entry(w.tempDir, `plen-run-${DEAD}-x`), other = entry(w.tempDir, "other-life-zzz");
   const young = clean({ ...w, yes: true });                       // everything is young now
   expect(young.items.map(i => i.why)).toEqual(["too young", "too young"]);
   expect(existsSync(old)).toBe(true);
@@ -171,7 +171,7 @@ test("measure counts a tree without following links", () => {
 
 test("only exact known name patterns are candidates: unknown prefixes and bare-prefix names stay", () => {
   const w = world();
-  const keep = ["plenary-unknown-abc123", "plenary-test-", "plenary-test-toolong1", "plen-other", "pl-reg-zzzzzz", "plen-abcdef", "omniloop-life-abc123"].map(n => entry(w.tempDir, n));
+  const keep = ["plenary-unknown-abc123", "plenary-test-", "plenary-test-toolong1", "plen-other", "pl-reg-zzzzzz", "plen-abcdef", "other-life-abc123"].map(n => entry(w.tempDir, n));
   const known = entry(w.tempDir, "plenary-load-sig-aB3dE9");
   const r = clean({ ...w, now: LATER(), yes: true });
   expect(keep.map(existsSync)).toEqual(keep.map(() => true));

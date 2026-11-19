@@ -4,7 +4,7 @@
 //
 //   const idp = fakeIdpAdapter();
 //   const begun = await idp.begin();
-//   const code = idp.authorize(begun, { user: "fake:ann", ... });   // the person signs in at the "IdP"
+//   const code = idp.authorize(begun, { user: "fake:ann", ... });   // the user signs in at the "IdP"
 //   await idp.finish({ code, state: begun.state, expected: begun });  // → that Identity
 //   idp.down = true;   // unreachable: finish resolves null, begin rejects
 

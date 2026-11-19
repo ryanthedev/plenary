@@ -175,7 +175,7 @@ export function createSession({ join, token, board, client = "web", tab = null, 
   s.may = may;
   s.canWriteStream = stream => may() && streamOk(stream);
 
-  // Is this note element one the person may change? Presenters moderate every note.
+  // Is this note element one the user may change? Presenters moderate every note.
   s.isMine = id => {
     if (s.effective === "presenter") return true;
     const a = C.noteAuthor(id) ?? noteAuthor(id);

@@ -540,7 +540,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   document.addEventListener("pointerdown", e => { if (e.target !== canvas) chromeHeld = true; }, true);
   addEventListener("pointerup", () => { chromeHeld = false; }, true);
   addEventListener("pointercancel", () => { chromeHeld = false; }, true);
-  // Don't rebuild a panel or drawer the person is typing in.
+  // Don't rebuild a panel or drawer the user is typing in.
   const busy = el => el.contains(document.activeElement) && /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName);
   // What every part depends on from the page and the session (a change rebuilds them all, as chromeDirty does).
   const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.library.length].join("|");

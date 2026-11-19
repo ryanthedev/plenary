@@ -1,5 +1,5 @@
 // Auth adapters (web/adapters/auth/*) against the auth contract, plus the fake's own rules
-//.
+// (single use, 60 s, one error for all bad codes; 403; 503; no answer).
 import { describe, test, expect } from "bun:test";
 import { authContract, expectAuthResult } from "../contracts/auth-contract.js";
 import { fakeAuth } from "../../../web/adapters/auth/fake.js";

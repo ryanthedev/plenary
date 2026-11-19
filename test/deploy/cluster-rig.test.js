@@ -1,7 +1,7 @@
 // scripts/cluster-rig.js against real Postgres 17, NATS and Caddy, with stub nodes (test/deploy/stub-node.js) in
 // place of server/main.js. Each guard has a test that fails without it:
-// only-ours teardown, crash-midway cleanup (in-process and a SIGKILLed CLI `up`), secrets never printed; and from p8-rig2
-//: identity independent of TZ/locale, a copied rig.json written in place, loopback binding,
+// only-ours teardown, crash-midway cleanup (in-process and a SIGKILLed CLI `up`), secrets never printed; and from p8-rig2:
+// identity independent of TZ/locale, a copied rig.json written in place, loopback binding,
 // SIGKILL escalation, the health-wait timeout, secrets absent from logs/; and from p8-rig3:
 // a failing ps refuses instead of reading as "gone", one `up` per dir (lock), a moved rig's paths, the real main.js e2e.
 import { test, expect, afterAll, describe } from "bun:test";

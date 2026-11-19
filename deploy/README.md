@@ -68,7 +68,7 @@ them from your shell or `deploy/.env`, never this repo.
 - **Git:** `.env` and `.env.*` are git-ignored everywhere in the repo; only `.env.example` (a template with no
   values) may be committed.
 - **Image:** the Dockerfile copies five named paths (`package.json`, `bun.lock`, `packages/`, `server/`, `web/`), and
-  the root `.dockerignore` also keeps `.env*`, databases, `.git`, `docs/`, `test/`, all of `deploy/` and every host
+  the root `.dockerignore` also keeps `.env*`, databases, `.git`, `docs/` (kept as a guard: any docs added later stay out of the image), `test/`, all of `deploy/` and every host
   `node_modules` out of the image. `node_modules` in the image comes only from the frozen install.
 
 The Compose project is named `plenary` (`name:` in `compose.yml`), so the data volume is `plenary_plenary-data`.
@@ -84,6 +84,45 @@ a config file and service containers start before checkout; the step fails unles
 The blob store is the same `pgsty/minio` image and tag as `cluster.compose.yml`, started with `docker run` on the
 runner's loopback; the step creates the bucket and fails unless the store reports it. Its `S3_*` values are
 throwaway CI-only literals written in the workflow.
+
+## Sign-in failures (operator guide)
+
+When a Google sign-in fails, the server logs one line, `{"level":"warn","msg":"sign-in failed","cause":"..."}`,
+and the browser gets `{"error":"login-failed"}` at `/auth/callback`. The label is fixed text, never a code, state,
+token or cookie value.
+
+| `cause` | What it means | What to do |
+|---|---|---|
+| `no_login_cookie` | The browser didn't send the login cookie back (a different host name than the one that started sign-in, or cookies blocked) | Open the server by the same address on every step, then sign in again. |
+| `bad_login_cookie` | The cookie was signed with another key or is older than 10 min (for example, the server restarted with no `COOKIE_KEY`) | Sign in again. |
+| *(no line at all; Google shows its own error page, e.g. "Access blocked")* | Google refused before calling us back: usually the account isn't allowed on the OAuth client (a test user while the app is in testing), or the redirect URI doesn't match | Fix the OAuth client's audience or redirect URI in your Google Cloud project. |
+| `idp_error:access_denied` | The user pressed Cancel on Google's consent screen | Sign in again. |
+| `idp_error:<other name>` (e.g. `idp_error:server_error`, `idp_error:temporarily_unavailable`, `idp_error:login_required`) | Google sent the user back with a standard error instead of a sign-in | Wait a minute and sign in again. If it repeats, report the cause. |
+| `idp_error` (no name) | Google sent the user back with an error whose name we don't recognise, so we don't print it | Sign in again. If it repeats, report it. |
+| `state_mismatch`, `no_code`, `state_used` | The callback URL was altered, or reused (back button, double submit) | Sign in again. |
+| `invalid_grant` | Google refused the code: too old or already used | Sign in again, without lingering. |
+| `invalid_client` | The client id or secret in the server's environment is wrong | Check the environment (don't paste secrets anywhere). |
+| `invalid_request`, `unauthorized_client`, `unsupported_grant_type`, `invalid_scope` | Google refused how our server asked for the token (a bug on our side or an OAuth client setting) | Shouldn't happen. Report the cause. |
+| `idp_timeout`, `idp_unreachable`, `token_http_<n>` | Google couldn't be reached in time, the connection dropped before its whole answer arrived, or Google answered the token request with error status `<n>` and no standard error name | Check the network and retry. |
+| `bad_token_response` | Google's token answer arrived whole but wasn't JSON, whatever its status, an empty answer included (a proxy or captive portal in the way, or a Google outage page) | Retry. If it repeats, check for a proxy, then report. |
+| `bad_token`, `bad_alg`, `bad_aud`, `bad_iss`, `bad_nonce`, `bad_sig`, `bad_sub`, `expired`, `bad_time`, `stale` | Google's ID token was missing, malformed, or failed a check | Shouldn't happen. Report the cause. |
+| `unknown_kid` | Google's ID token was signed with a key we don't have, or Google's key endpoint couldn't be reached to fetch its keys (the server reads a failed key fetch as an unknown key) | Wait a minute and retry. If it repeats, report the cause. |
+| `bad_config`, `bad_expected` | The server's own sign-in setup, or the login state in the cookie, was incomplete | Shouldn't happen. Report the cause. |
+| `idp_refused`, `idp_threw` | The sign-in adapter refused without giving a reason, or crashed | Shouldn't happen with Google. Report the cause. |
+| `replay_guard_full` (503) | Over 100k sign-ins in 10 min on one process | Not expected in normal use. |
+| `mint_failed` (503) | Google signed the user in, but the server couldn't make the one-time code that hands the sign-in to the page | Sign in again. If it repeats, report it. |
+
+This table lists every label the server can log: every cause goes through one function, `failed` in
+`server/auth/http.js`, and the labels it can receive are exactly `CAUSES` in `server/auth/oidc.js` plus
+`SIGN_IN_CAUSES` in `server/auth/http.js`. `test/auth/signin-cause.test.js` checks that every label written in
+either file's source is in those lists and the other way round, and that this table names exactly those labels.
+
+The exchange step can fail separately: the page says "sign-in failed (invalid-code)". That is the 60 s exchange
+window or a dropped exchange cookie. Sign in again.
+
+If `POST /boards` gives **403 `forbidden`**, the admin match failed. Admin by email needs Google to vouch for the
+email: the account's Workspace domain (`hd`) must equal the email's domain. A Workspace account whose address is on a
+secondary domain gets no email from the server, so it can't match an email admin.
 
 ## Postgres roles (least privilege)
 

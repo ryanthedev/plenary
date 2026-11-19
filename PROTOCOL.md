@@ -666,6 +666,42 @@ record.
   anchors and element ids are board-local, and a blob URL is minted only for a board the requester has a role on,
   in that board's tenant.
 
+## Sign-in code exchange
+
+No long-lived token ever appears in a URL. After Google sign-in the server hands the page a single-use code, and the
+page trades it for a session token.
+
+1. **Callback.** `GET /auth/callback` answers 302 to the post-login URL with `#code=<code>` (for a share link, the
+   board URL with `#code=<code>`, plus `&link=invalid` or `&link=unavailable` where that applies). It also sets
+   `__Host-plen_xchg`, an HttpOnly, Secure, SameSite=Strict, host-only cookie that lives 60 s and carries the signed
+   identity.
+2. **Client.** Read `#code`, drop the fragment at once (`history.replaceState`), then `POST /auth/exchange` from the
+   same origin with `credentials: "same-origin"`, `Content-Type: application/json` and body `{"code":"<code>"}`.
+   The server accepts only the post-login URL's origin, so the auth routes and the page share one origin.
+3. **Answers** (JSON, `no-store` on success):
+   - `200 {token, user, name, email, domain, exp}`; the exchange cookie is cleared.
+   - `400 {error:"invalid-code"}`: unknown, expired (> 60 s), already used, or not this browser's. One answer for all,
+     so there is no oracle.
+   - `403 {error:"bad-origin"}`: the `Origin` header is not the post-login origin.
+   - `503 {error:"unavailable"}`: the server can't issue a session right now; the code is not spent, so one jittered
+     retry is reasonable. Sign-in not configured at all answers `503 {error:"sign-in-unavailable"}`.
+   - A non-JSON body is refused with 415 and an oversized one with 413.
+   - `{error:"network"}` is client-only: no answer at all. The server never sends it.
+4. The token then goes in `hello` (kept in memory and sessionStorage, never localStorage or a URL).
+
+Field types of the 200 body:
+
+- `user`: a non-empty string (`google:<sub>`, or `dev:<name>` for dev tokens).
+- `name`: a string, or null (Google sent none; an empty name becomes null).
+- `email`: a string, or null whenever Google isn't authoritative for it (a consumer account not at `@gmail.com`, or a
+  Workspace user on a secondary domain). Show it only if present.
+- `domain`: a string, or null: the Workspace `hd` domain, null for any non-Workspace account. It says who the user
+  is, not how they got access (an invite or share-link user from a Workspace keeps their own domain).
+- `exp`: an integer, seconds since the epoch.
+
+The client side of this contract is `web/ports/auth.js`; `test/web/contracts/auth-contract.js` runs it against every
+adapter.
+
 ## Ports
 
 All ports are async (Promises; QuickJS has them). The room imports none of them directly; the server passes them in.

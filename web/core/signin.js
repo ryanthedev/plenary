@@ -230,7 +230,7 @@ export async function pageSignIn({ query, fragment, replaceFragment, storage, au
 }
 
 /**
- * What to tell the person after sign-in, or null. Never blames the person for a code the network spent (p6-edgev
+ * What to tell the user after sign-in, or null. Never blames the user for a code the network spent (p6-edgev
  * LOW-4: a lost answer then a retry reads as invalid-code), and says when the tab is still someone else (LOW-5).
  * @param {SignIn & { dev?: string | null }} s
  * @param {string | null} [still]  the display name the tab is still signed in as, when an exchange failed

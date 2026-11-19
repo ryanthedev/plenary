@@ -1,6 +1,6 @@
 // Shared Postgres start-up helpers for the Postgres adapters (server/store/postgres.js, server/registry/postgres.js).
-// Not an adapter of any port: adapter-only support code. Adapters of different ports never import each other
-//, so what both need lives here. Core code must not import it
+// Not an adapter of any port: adapter-only support code. Adapters of different ports never import each other,
+// so what both need lives here. Core code must not import it
 // (test/architecture.test.js). A leaf: it imports nothing.
 //
 // Least privilege: Postgres checks CREATE privilege before IF NOT EXISTS, so every helper looks first (pg_namespace,

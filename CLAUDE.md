@@ -4,14 +4,13 @@ A live infinite canvas for enterprise all-hands: a few presenters draw, thousand
 100k+ watch live, in several regions, smooth as butter. Open source. Grown out of herdr-draw
 (github.com/ryanthedev/herdr-draw), whose core it shares.
 
-Name: **Plenary** (decided 2026-11-11). The person may add "Omni" (their LLC); `omniplenary` was free on
-GitHub, npm and .com on 2026-11-11. The name lives only here and in package.json until it is settled:
+Name: **Plenary** (decided 2026-11-11). The name lives only here and in package.json until it is settled:
 nothing is registered or published yet. Do not create GitHub repos, orgs, npm packages or domains unasked.
 
 ## Decisions (2026-11-11, from the design conversation and the design doc)
 
 - End goal = non-functional requirements, not the first build. Iterate milestone by milestone and adopt
-  infrastructure only when a measurement says so. Design doc: https://claude.ai/artifact/UGGaj27ZqojZmVSDUqz8Mu
+  infrastructure only when a measurement says so.
 - NFRs: per board a handful of editors, ~2k annotators, **100k live viewers (today's ceiling, confirmed)**;
   editors < 150 ms in the home region, viewers < 1 s worldwide; 60–120 fps client; 100k joins in 2 min;
   an acknowledged op is never lost; multi-region with a home region per tenant; enterprise SSO/SCIM/audit.
@@ -20,7 +19,7 @@ nothing is registered or published yet. Do not create GitHub repos, orgs, npm pa
 - Self-hosting means open source, not a one-process product.
 - The server never runs layout; clients do (as herdr-draw does).
 
-## Decisions (2026-11-11, M2 scope, from the person)
+## Decisions (2026-11-11, M2 scope, from the maintainer)
 
 - **M2 is a scale-ready product**, replacing "adopt infrastructure only when measured" for M2: one program,
   two roles (gateways hold sockets and fan out; room hosts sequence one board each, sharded by board, with a
@@ -36,7 +35,7 @@ nothing is registered or published yet. Do not create GitHub repos, orgs, npm pa
   annotations, cursors, avatars, selections, laser, draw, highlighter, emotes, reactions, comment threads,
   a connection status pill.
 - **drawh** gets the protocol by byte-identical copy + SOURCE.json for now; maybe a published package later
-  (nothing published until the person says so).
+  (nothing published until the maintainer says so).
 
 ## Milestones
 
@@ -55,7 +54,7 @@ test/                bun test
 
 - **packages/core is not edited here.** Change it in herdr-draw (its tests, its scripts/release.sh), then
   re-copy and update SOURCE.json. `test/core-source.test.js` fails on drift. Moving herdr-draw onto this
-  package is a separate step the person approves.
+  package is a separate step the maintainer approves.
 - **Plain JS + JSDoc, no build step**: Herdr loads .js as copied, and its QuickJS runtime lacks some
   globals (no TextDecoder). packages/protocol imports only core's doc.js/model.js and its own files;
   `test/purity.test.js` checks it.

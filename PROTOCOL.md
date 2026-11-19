@@ -1084,7 +1084,7 @@ the same key is correct in both.
 |---|---|
 | first use | runs the create; the object and the key commit together; **201** |
 | again, after the first committed (whatever happened to the first call's response) | **the first object, rebuilt** for the caller as they are now (rule below): **201** with it read fresh, plus the header `Idempotent-Replayed: true`. Nothing is created |
-| again, while the first is still running (a call cut by the deadline keeps running) | the retry's create waits on the same row, then finds the first's: the same 201 replay. **There is no `in-progress` answer** (and no 409) |
+| again, while the first is still running (a call cut by the deadline keeps running) | the retry's create waits on the same row until the first commits or rolls back, then replays (201) or runs fresh. The wait is bounded by the adapter's lock limit (Postgres `lock_timeout`, 5000 ms; SQLite busy timeout, 5000 ms): past it the answer is `503 unavailable` (the transaction rolled back, nothing written) and the client retries with the same key. **There is no `in-progress` answer** (and no 409) |
 | again, after the first failed before committing (a refusal, a rolled-back transaction) | the key left no trace: the retry runs as a first use |
 | again, with a different route, path parameter or body | `422 {error:"idempotency-key-reused"}`; nothing runs |
 

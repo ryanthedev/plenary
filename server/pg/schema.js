@@ -53,3 +53,16 @@ export async function migrate(tx, schema, tables) {
   const todo = await missing(tx, s, Object.keys(tables));
   if (todo.length) await tx.unsafe(todo.map(name => `CREATE TABLE "${s}".${name} (${tables[name]})`).join(";\n"));
 }
+
+/**
+ * Refuses to start on a table whose columns are not exactly `columns` (a store from before a schema change: the adapters never ALTER).
+ * Without it the server starts and every call that touches the table fails later with an obscure 42703. Call inside the start-up transaction.
+ * @param {*} tx @param {string} schema @param {string} table @param {string[]} columns the expected column names
+ */
+export async function assertColumns(tx, schema, table, columns) {
+  const s = needSchema(schema);
+  const have = (await tx.unsafe("SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 ORDER BY column_name", [s, table])).map(r => r.column_name);
+  if (have.length && JSON.stringify(have) !== JSON.stringify([...columns].sort()))
+    throw new Error(`postgres: table "${s}".${table} has columns (${have.join(", ")}) but this version needs (${[...columns].sort().join(", ")}): it is from an older version. `
+      + `Reset the store or drop the table (DROP TABLE "${s}".${table}); the next start-up recreates it`);
+}

@@ -105,7 +105,7 @@ test("a board made under a key is made with its owner in the same step (nothing 
   expect(await mem.grants((await b.json()).board.id)).toEqual([{ user: "dev:ada", role: "owner" }]);
 });
 
-test("a refusal made before anything was written is not stored: the claim is dropped", async () => {
+test("a refusal made before anything was written is a failure of the create: its key row rolls back with it", async () => {
   const r = await post("/boards", { title: "t", space: "nope" }, { key: K });
   expect(r.status).toBe(403);
   expect(mem.idemSize()).toBe(0);
@@ -203,7 +203,7 @@ test("SEC another user replaying the same key never sees the first user's result
   expect(JSON.stringify(bb)).not.toContain(a.link.id);
 });
 
-// ---- B1: only an error that proves nothing was written frees the key ----
+// ---- the key row and the object commit together, or neither does ----
 
 test("DW-86b a create that COMMITS and then fails unclearly (client-timeout) or crashes before its answer: the retry returns the first board immediately, never 409 and never a second board", async () => {
   hooks.after.createBoard = () => { throw Object.assign(new Error("no answer"), { code: "client-timeout" }); };
@@ -256,6 +256,20 @@ test("POST /teams with a key: the retry returns the first Team (replay header), 
   expect(await c.json()).toEqual({ error: "idempotency-key-reused" });
   expect((await post("/teams", { name: "Platform" })).status).toBe(201);
   expect(await mem.teams(acme.id)).toHaveLength(2);
+});
+
+test("SEC a Team created under a key by someone who then loses team.manage: the replay is 403 and the body names no Team", async () => {
+  const fac = await mem.createRole({ tenant: acme.id, name: "Facilitator", boardRole: "viewer", permissions: ["team.manage"] });
+  const grant = role => mem.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: "dev:bo" }, role });
+  await grant(fac.id);
+  const made = await (await post("/teams", { name: "Ops" }, { tok: "bo", key: K })).json();
+  expect(made.team.id).toBeTruthy();
+  expect((await post("/teams", { name: "Ops" }, { tok: "bo", key: K })).status).toBe(201);   // still allowed: replayed
+  await grant(null);
+  const r = await post("/teams", { name: "Ops" }, { tok: "bo", key: K });
+  expect(r.status).toBe(403);
+  expect(r.headers.get("idempotent-replayed")).toBeNull();
+  expect(await r.text()).not.toContain(made.team.id);
 });
 
 test("POST /teams replay is authorized again, and a Team created after a lost response is not duplicated", async () => {

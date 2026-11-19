@@ -184,11 +184,11 @@ export const idemErr = {
   replay: ref => Object.assign(new Error("registry: idempotent replay"), { name: "RegistryError", code: "idem-replay", ref }),
   mismatch: () => Object.assign(new Error("registry: idempotency key reused"), { name: "RegistryError", code: "idem-mismatch" }),
 };
-/** `idem` as the adapters take it: absent = null; else three non-empty strings, or "registry: bad idempotency key". */
+/** `idem` as the adapters take it (the key's format is http.js's to enforce): absent = null; else three non-empty strings, or "registry: bad idempotency key". */
 export const idemOf = idem => {
   if (idem == null) return null;
   const { user, key, fp } = idem;
-  for (const v of [user, key, fp]) if (typeof v !== "string" || !v || v.includes(" ")) throw new Error("registry: bad idempotency key");
+  for (const v of [user, key, fp]) if (typeof v !== "string" || !v) throw new Error("registry: bad idempotency key");
   return { user, key, fp };
 };
 export const HOME = { recentKeep: 50, starScan: 200, sharedScan: 200, batch: 200, searchScan: { default: 1000, max: 5000 }, candidates: { spaces: { default: 100, max: 200 }, groups: { default: 50, max: 100 } } };

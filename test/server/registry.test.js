@@ -155,6 +155,13 @@ describe("sqlite registry", () => {
     expect(sql.length).toBe(mem.length);
   });
 
+  test("a store whose reg_idempotency has the old claim/result columns refuses to start with a clear error naming the table", () => {
+    const path = file(), old = new Database(path);
+    old.run("CREATE TABLE reg_idempotency (member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, claim TEXT NOT NULL, result TEXT, at INTEGER NOT NULL, PRIMARY KEY (member, k))");
+    old.close();
+    expect(() => sqliteRegistry({ path, fullfsync: false })).toThrow(/reg_idempotency.*older version.*drop the table/i);
+  });
+
   test("durable keyed create: the key survives close and reopen (a crash after the commit), so the retry gets the first object, not a second", async () => {
     const path = file(), idem = { user: "google:root", key: "key-0001-aaaa", fp: "f".repeat(64) };
     let r = sqliteRegistry({ path, fullfsync: false });

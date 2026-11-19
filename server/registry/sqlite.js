@@ -138,6 +138,9 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     // Idempotent creates (PROTOCOL.md): one row per (member, key), written in the create's own transaction; `ref` is the id it made.
     db.run(`CREATE TABLE IF NOT EXISTS reg_idempotency (
       member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, ref TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (member, k))`);
+    const idemCols = db.query("PRAGMA table_info(reg_idempotency)").all().map(c => c.name).sort().join(",");
+    if (idemCols !== "at,fp,k,member,ref")   // the adapters never ALTER: an older shape is reset, not migrated
+      throw new Error(`sqlite registry: table reg_idempotency has columns (${idemCols}) but this version needs (at,fp,k,member,ref): it is from an older version. Reset the store or drop the table (DROP TABLE reg_idempotency); the next start-up recreates it`);
     db.run("CREATE INDEX IF NOT EXISTS reg_idempotency_at ON reg_idempotency (at)");
     db.run("CREATE INDEX IF NOT EXISTS reg_recents_member ON reg_recents (member, opened_at DESC, board DESC)");
     db.run("CREATE INDEX IF NOT EXISTS reg_stars_member ON reg_stars (member, at DESC, board DESC)");

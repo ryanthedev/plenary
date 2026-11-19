@@ -73,7 +73,7 @@
 import { SQL } from "bun";
 import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
-import { needSchema, migrate, missing as absent } from "../pg/schema.js";
+import { needSchema, migrate, assertColumns, missing as absent } from "../pg/schema.js";
 
 /**
  * Thrown by `setGrant` when the change would leave a board with no owner ("last-owner"), by a call that ran out of time
@@ -191,6 +191,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       await tx.unsafe("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', '0', true)", [String(lockMs)]);
       await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-schema:${s}`]);
       await migrate(tx, s, registryTables(s));
+      await assertColumns(tx, s, "reg_idempotency", ["member", "k", "fp", "ref", "at"]);   // holds only 24 h of keys; an older shape is reset, never altered
       const noIndex = await absent(tx, s, Object.keys(REGISTRY_INDEXES));
       if (noIndex.length) await tx.unsafe(noIndex.map(name => `CREATE INDEX ${name} ON "${s}".${REGISTRY_INDEXES[name]}`).join(";\n"));
       // Every right on every table, each on its own (the names are constants and `s` passed needSchema).

@@ -1,11 +1,11 @@
 # deploy/
 
-Packaging for the single-node Plenary server (`server/main.js`). Nothing here is published: no registry pushes, no
-public images.
+Packaging for the single-node Plenary server (`server/main.js`). Nothing is published yet: no registry pushes, no
+public images. Publishing is a manual step that needs the owner's go (see [Release](#release)).
 
 | File | What |
 |---|---|
-| `Dockerfile` | Single-node image on `oven/bun:1.4.4-slim`. Installs dependencies from `bun.lock` (`bun install --frozen-lockfile --production`) in their own layer, then copies the source. Runs `bun run server/main.js` as the non-root `bun` user, listens on 0.0.0.0:8080, data in `/data`, health check on `GET /health`. |
+| `Dockerfile` | Single-node image on `oven/bun:1.4.4-slim`, pinned by digest, one stage (a builder stage would save nothing: the install cache is already removed in its layer). Installs dependencies from `bun.lock` (`bun install --frozen-lockfile --production`) in their own layer, then copies the source. Runs `bun run server/main.js` as the fixed non-root user `1000:1000` (app code and `node_modules` are read-only and root-owned; `/data` is the data dir), exec-form `CMD` so bun is PID 1 and receives SIGTERM (clean stop, exit 0), OCI labels from build args `VERSION`, `REVISION`, `CREATED`, listens on 0.0.0.0:8080, data in `/data`, health check on `GET /health`. |
 | `compose.yml` | One `plenary` service with a named volume for SQLite and blobs, published on `127.0.0.1:8080` only, `restart: unless-stopped`. |
 | `cluster.compose.yml`, `cluster/` | Phase-4 cluster shape (never run on Docker): see [Cluster](#cluster-phase-4-not-run-on-docker-yet). |
 
@@ -14,6 +14,58 @@ docker build -f deploy/Dockerfile -t plenary:dev .      # context is the repo ro
 docker compose -f deploy/compose.yml up --build         # binds 127.0.0.1:8080 only
 curl -s http://127.0.0.1:8080/health                    # 200 + JSON
 ```
+
+## Release
+
+Image name: `ghcr.io/ryanthedev/plenary`. **Nothing is published until the owner says so.** CI builds and smoke-tests
+the image (job `image`, `scripts/image-smoke.sh`) but never pushes and holds no registry credentials. Size: about
+217 MB by podman's measure (`image inspect .Size`, arm64), nearly all of it the Bun base image; docker's figure for the amd64 image on the CI runner is about 85 MB (84,827,381 bytes; the `image size:` line in the `image` job's log). The two tools measure differently (podman counts the uncompressed layers), so compare sizes only within one tool.
+
+**Tags:** every release gets `X.Y.Z` and `sha-<7 chars of the git commit>`. Only a **stable** release (no `-rc.1` style suffix) also moves `X.Y`, `X` and `latest`; a pre-release never does. Never move an `X.Y.Z` tag.
+
+**Check before a release:** `main` is the commit to release, `bun test` and `bun run test:cluster` pass, CI is green.
+
+```sh
+# Run from the repo root, on the commit to release.
+VERSION=0.1.0                                   # no leading v
+REVISION="$(git rev-parse HEAD)"
+SHA="$(git rev-parse --short=7 HEAD)"
+IMAGE=ghcr.io/ryanthedev/plenary
+
+# 1. Local check, single platform, nothing pushed (docker buildx; podman is not covered for releases):
+docker buildx build -f deploy/Dockerfile --load -t "$IMAGE:check" \
+  --build-arg VERSION="$VERSION" --build-arg REVISION="$REVISION" .
+SMOKE_IMAGE="$IMAGE:check" scripts/image-smoke.sh        # tests the existing image, keeps it; then: docker rmi "$IMAGE:check"
+
+# 2. Publish (MANUAL; needs the owner's go and a token with write:packages:
+#    `echo "$GHCR_TOKEN" | docker login ghcr.io -u ryanthedev --password-stdin`). This is the only publish path:
+#    one multi-arch build (amd64 + arm64, both in the base image) pushed straight to the registry.
+docker buildx build -f deploy/Dockerfile --push \
+  --platform linux/amd64,linux/arm64 \
+  --build-arg VERSION="$VERSION" --build-arg REVISION="$REVISION" \
+  --build-arg CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -t "$IMAGE:$VERSION" -t "$IMAGE:sha-$SHA" .
+
+# 2b. STABLE RELEASES ONLY (skip for a pre-release such as 0.2.0-rc.1): move the floating tags to the same image.
+docker buildx imagetools create -t "$IMAGE:${VERSION%.*}" -t "$IMAGE:${VERSION%%.*}" -t "$IMAGE:latest" "$IMAGE:$VERSION"
+
+# 3. Tag the commit and push the tag (also manual):
+git tag -a "v$VERSION" -m "Plenary $VERSION" && git push origin "v$VERSION"
+```
+
+Verify what was published: `docker buildx imagetools inspect "$IMAGE:$VERSION"` (both platforms listed), then
+`docker inspect` / `skopeo inspect` shows labels `org.opencontainers.image.version`, `.revision`, `.source`. The first
+push creates the package as private; making it public is the owner's call in the GitHub package settings.
+
+Run a released image with either compose file, without building: `PLENARY_IMAGE=ghcr.io/ryanthedev/plenary:0.1.0 docker compose -f deploy/compose.yml up`
+(both compose files take the image name from `PLENARY_IMAGE`, default `plenary:dev` for a local build).
+
+**Bumping the base image:** read the new multi-arch index digest (`podman manifest inspect` does not print it; use
+`curl -sI -H "Authorization: Bearer <pull token>" -H "Accept: application/vnd.oci.image.index.v1+json" https://registry-1.docker.io/v2/oven/bun/manifests/<tag>`
+and take `docker-content-digest`), change the tag and digest in `FROM` together, and set CI's `bun-version` to the same
+Bun version. `test/deploy-image.test.js` fails if they disagree.
+
+**Local check without Docker:** `CONTAINER_CLI=podman scripts/image-smoke.sh` (it removes the image and container it makes).
 
 ## What runs today
 
@@ -77,7 +129,8 @@ The Compose project is named `plenary` (`name:` in `compose.yml`), so the data v
 
 CI (`.github/workflows/ci.yml`) runs `bun test` on every push and pull request. Before the tests it clones
 herdr-draw (public, read-only) at the commit in `packages/core/SOURCE.json`, so the core-copy check runs there too.
-Both jobs install with `bun install --frozen-lockfile` and fail if `bun.lock` is missing or out of date.
+The `image` job builds `deploy/Dockerfile` and runs `scripts/image-smoke.sh` (healthy, non-root, clean SIGTERM stop).
+The two test jobs install with `bun install --frozen-lockfile` and fail if `bun.lock` is missing or out of date.
 The cluster job generates a throwaway `COOKIE_KEY` per run (`openssl rand -hex 32`, masked in the log).
 A second job, `test-cluster-services`, runs the same `bun test` with Postgres (a service container), NATS and an
 S3-compatible blob store, and `DATABASE_URL`, `NATS_URL` and `S3_*` set, so engine's cluster-adapter tests run there.

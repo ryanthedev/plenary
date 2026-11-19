@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join, relative, dirname } from "node:path";
 import { spawn as nodeSpawn } from "node:child_process";
 import { missingBins, rigStatus, isOurs, stopRig, STARTED_CLOCK, ownerGone, writeOwnerRecord, writeFileAtomic, reapStaleRigs, _setPsPath } from "../../scripts/cluster-rig.js";
+import { DEFAULT_FILES } from "../../scripts/test-cluster-files.js";
 import { freshDir, track, cleanupAll, CLEANUP_TIMEOUT_MS, rigUp, spawnTracked, lstart } from "./rig-guard.js";
 
 const ROOT = new URL("../..", import.meta.url).pathname;
@@ -19,6 +20,12 @@ test("H1: test-cluster starts the rig services-only, never a node or the LB", ()
   const up = SCRIPT.match(/\["up",[^\]]*\]/)?.[0] ?? "";
   expect(up).toContain('"--services-only"');
   expect(up).not.toMatch(/--gateways|--hosts/);
+});
+
+test("the bun test spawn preloads test/preload.js by path (its cwd is the rig dir, where bunfig.toml is not found)", () => {
+  const spawn = SCRIPT.match(/Bun\.spawn\(\[BUN[^\]]*\]/)?.[0] ?? "";
+  expect(spawn).toMatch(/"test"/);
+  expect(spawn).toMatch(/--preload=\$\{join\(ROOT, "test\/preload\.js"\)\}/);
 });
 
 test("M5 (v5): every `down` (the teardown's and the reaper's) goes through rigDown, which reruns one killed in the spawn window", () => {
@@ -48,12 +55,11 @@ const unallowed = (root, f, allow = ALLOW) => {
 const gatedFiles = (root, allow = ALLOW) => walk(join(root, "test")).filter(f => CODE_FILE.test(f)).map(f => relative(root, f))
   .filter(f => unallowed(root, f, allow).length > 0).sort();
 /**
- * Files that name an allowlisted helper but are neither listed in `script` nor allowlisted themselves (a new importer).
+ * Files that name an allowlisted helper but are neither in the `listed` array nor allowlisted themselves (a new importer).
  * A helper is named by its basename, with or without its extension (bun resolves `./helper` too), as a whole path
  * segment inside a string: `"./helper"`, `'../a/helper.js'`, `` `helper.ts` `` (rig-tools-v5 L24).
  */
-const orphans = (root, script, allow = ALLOW) => {
-  const listed = [...script.matchAll(/"(test\/[\w./-]+)"/g)].map(m => m[1]);
+const orphans = (root, listed, allow = ALLOW) => {
   const helpers = Object.keys(allow).filter(f => !TEST_FILE.test(f)).map(h => h.split("/").pop().replace(CODE_FILE, ""))
     .map(stem => new RegExp(`[/"'\`]${stem.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\.(js|jsx|ts|tsx|mjs|cjs|mts|cts))?["'\`]`));
   return walk(join(root, "test")).filter(f => CODE_FILE.test(f)).map(f => relative(root, f))
@@ -61,7 +67,7 @@ const orphans = (root, script, allow = ALLOW) => {
 };
 
 test("L6: the gated list in test-cluster.js is exactly the test files (and helpers) that name DATABASE_URL, NATS_URL or an S3_* variable", () => {
-  const listed = [...SCRIPT.matchAll(/"(test\/[\w./-]+)"/g)].map(m => m[1]).sort();
+  const listed = [...DEFAULT_FILES].sort();   // the data module, not a scrape of the script: a quoted path in a comment there counts for nothing
   expect(listed).toEqual(gatedFiles(ROOT));
   expect(listed.every(f => TEST_FILE.test(f))).toBe(true);   // a helper is never listed: it has an allowance and a listed importer
 });
@@ -74,7 +80,7 @@ test("L12/L17: the allowed lines are exact (a stale one hides a later read), and
 });
 
 test("L18: every file that names an allowlisted helper is itself listed or allowlisted", () => {
-  expect(orphans(ROOT, SCRIPT)).toEqual([]);
+  expect(orphans(ROOT, DEFAULT_FILES)).toEqual([]);
 });
 
 test("L6b/L12/L17/L18: the scan catches every read form, in every test suffix, in helpers, and any new, appended or swapped read in an allowlisted file", () => {
@@ -120,7 +126,9 @@ test("L6b/L12/L17/L18: the scan catches every read form, in every test suffix, i
     writeFileSync(join(root, "test/a/spawned.test.js"), "const f = join(import.meta.dir, `helper.js`);");
     writeFileSync(join(root, "test/a/ok.test.js"), 'import "./helper.js";');
     writeFileSync(join(root, "test/a/lookalike.test.js"), 'import "./helper-ts.ts"; import "./my-helper.js"; const helper = 1;');   // another file, and a bare word
-    expect(orphans(root, '"test/a/ok.test.js"', helper).sort()).toEqual(["test/a/extless.test.js", "test/a/importer.test.js", "test/a/spawned.test.js"]);
+    // L6: a file dropped from the list is not covered by a path quoted elsewhere (the list is an array, never scraped text)
+    expect(DEFAULT_FILES.slice(1).sort()).not.toEqual(gatedFiles(ROOT));
+    expect(orphans(root, ["test/a/ok.test.js"], helper).sort()).toEqual(["test/a/extless.test.js", "test/a/importer.test.js", "test/a/spawned.test.js"]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

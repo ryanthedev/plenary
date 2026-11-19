@@ -3,20 +3,11 @@ import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { DEFAULT_FILES } from "./test-cluster-files.js";
 import { reapStaleRigs, TERMINAL_SIGNALS, writeOwnerRecord } from "./cluster-rig.js";
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
 const RIG_CLI = join(ROOT, "scripts/cluster-rig.js");
 const BUN = Bun.which("bun") ?? process.execPath;
-const DEFAULT_FILES = [
-  "test/server/pg-store.test.js",
-  "test/server/pg-registry.test.js",
-  "test/server/nats-bus.test.js",
-  "test/server/room-host-lease.test.js",
-  "test/server/room-host-proc.test.js",
-  "test/server/main-cluster.test.js",
-  "test/server/s3-blobs.test.js",
-  "test/admin/tenants.test.js",
-];
 const FILES = process.argv.length > 2 ? process.argv.slice(2) : DEFAULT_FILES;   // explicit files (relative to the repo root) only for the guard test
 
 const hash = createHash("sha256").update(`${ROOT}\0${process.pid}`).digest("hex").slice(0, 6);
@@ -56,9 +47,8 @@ try {
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", LANG: "C",
     ...Object.fromEntries(["DATABASE_URL", "NATS_URL", "S3_ENDPOINT", "S3_BUCKET", "S3_REGION", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"].map(k => [k, rig[k]])),
   };
-  // cwd is the rig dir (no .env or stray files), where bun finds no bunfig.toml: preload test/preload.js (safety nets, temp root) by absolute path, or it is skipped.
-  // (the path is split: the L6 guard reads any quoted test path here as a gated test file.)
-  child = Bun.spawn([BUN, "--no-env-file", `--preload=${join(ROOT, "test", "preload.js")}`, "test", ...FILES.map(f => resolve(ROOT, f))], {
+  // cwd is the rig dir (no .env or stray files), where bun finds no bunfig.toml: preload the safety nets and temp root explicitly, or they are skipped.
+  child = Bun.spawn([BUN, "--no-env-file", `--preload=${join(ROOT, "test/preload.js")}`, "test", ...FILES.map(f => resolve(ROOT, f))], {
     cwd: dir, env, stdin: "inherit", stdout: "pipe", stderr: "pipe",
   });
   let combined = "";

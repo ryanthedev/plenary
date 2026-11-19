@@ -209,7 +209,7 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
       const ctxs = got;
       const t = now();
       const own = new Map();   // "space:<id>" / "group:<id>" → may the identity open boards there (from the context already read)
-      const opens = (k, ctx) => { if (!own.has(k)) own.set(k, resolveAccess({ ctx }, identity, t, opts).ladder != null); return own.get(k); };
+      const opens = (k, ctx) => { if (!own.has(k)) { const a = resolveAccess({ ctx }, identity, t, opts); own.set(k, (a.ladder ?? a.trashed?.ladder ?? null) != null); } return own.get(k); };   // a Space or Group in Trash: could they open it before (the Trash list names where a board was)
       for (const [id, r] of rows) {
         const base = ctxs.get(keyOf(scopeOf(r.board)));
         if (!base) continue;
@@ -237,7 +237,8 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
       if (!identity || typeof identity.user !== "string" || typeof linkId !== "string") return null;
       const l = await registry.link(linkId);
       if (!live(l, now())) return null;
-      await registry.addLinkUse(l.id, identity.user);
+      // A board in Trash cannot be joined (PROTOCOL.md § Trash and restore): the Registry refuses the use in the same atomic step (code "in-trash"), answered like an unknown link, nothing recorded.
+      try { await registry.addLinkUse(l.id, identity.user); } catch (e) { if (e?.code === "in-trash") return null; throw e; }
       return { board: l.board };
     },
 
@@ -285,13 +286,13 @@ const tenancyOver = (registry, now, recordUntil, adminBoardContent) => tenancy({
  *   recordTtlMs: board records (default 10 min, above the 60 s pass, so a pass reads them from memory). The fields the
  *     cache reads from them (board.id, board.memberRole, board.tenant) never change: the port has no update or delete
  *     for either (p5-loadv finding 6). `moveBoard` (#53) changes `board.space`: it announces `{ board }` and `invalidate(board)` drops the board record
- *     with the roles, links and the chain. IF a future port adds another update (setMemberRole, deleteBoard), it must announce the same way;
- *   the CHAIN of a board (its Space, Group and tenant records, `registry.accessContext`'s `chain`): kept for `ttlMs` per
+ *     with the roles, links and the chain. Trash (#54) changes `trashedAt`/`trashedWith`: this 10-minute record never supplies them (the resolver reads the board row from the CHAIN below), and `trashBoard`/`restoreBoard` announce `{ board }` (main.js), which drops the chain. IF a future port adds another update (setMemberRole, deleteBoard), it must announce the same way;
+ *   the CHAIN of a board (its board row, Space, Group and tenant records, `registry.accessContext`'s `chain`; the board row and Space carry `trashedAt`): kept for `ttlMs` per
  *     board, so a hello after the first reads only the volatile parts (grants, roles, Team members) in the one
  *     statement. `invalidate(board)` drops it, and a read in flight across an invalidation never fills it. What it holds
  *     can change (a Space moved, a general access edited, a domain or admin added): such a write must announce every
  *     board it reaches (PROTOCOL.md § Organization, "Freshness"), and the timed pass reads the chain fresh (`fresh`)
- *     anyway, so it is never older than ttlMs. A tenant's `admins` and `domains` only ever grow, so a stale chain can only
+ *     anyway, so it is never older than ttlMs (30 s): if a Trash or Restore announcement is lost, a hello can see the old state for up to that long, and the next timed pass closes or admits it. A tenant's `admins` and `domains` only ever grow, so a stale chain can only
  *     delay a gain, never hide a revoke;
  *   adminBoardContent: pass-through to `tenancy` (does a Unit admin get board content everywhere? default false);
  *   linkTtlMs: link records (default 30 s; a link changes by revokeLink, which announces `{ board }` and drops them).

@@ -30,6 +30,9 @@ import { createDialogs, randomKey } from "./adapters/dom/dialogs.js";
 import { httpAccess } from "./adapters/access/http.js";
 import { httpShare } from "./adapters/share/http.js";
 import { httpMove } from "./adapters/move/http.js";
+import { httpTrash } from "./adapters/trash/http.js";
+import { mountTrashPage, mountTrashNotice } from "./adapters/dom/trash.js";
+import { createTrashModel, createNoticeModel } from "./core/trash.js";
 import { httpRoles } from "./adapters/roles/http.js";
 import { mountRolesPage } from "./adapters/dom/roles.js";
 import { createRolesModel } from "./core/role-admin.js";
@@ -74,7 +77,7 @@ if (back) { q.set("board", back); history.replaceState(history.state, "", `${loc
 // A link with no board lands on Home (everyone, a dev user included): Recent, Starred, Shared with me, the Space tree, search.
 const board = asked ?? back;
 const idParam = name => (/^[\w-]{1,64}$/.test(q.get(name) ?? "") ? q.get(name) : null);
-const spaceId = idParam("space"), groupId = idParam("group"), teamId = idParam("team"), teamsPage = q.has("teams"), rolesPage = q.has("roles");
+const spaceId = idParam("space"), groupId = idParam("group"), teamId = idParam("team"), teamsPage = q.has("teams"), rolesPage = q.has("roles"), trashPage = q.has("trash");
 const accessArg = /^(unit|group|space|board):([\w-]{1,64})$/.exec(q.get("access") ?? "");
 /** A link to another page of this app, keeping the theme. */
 const hrefTo = params => `?${new URLSearchParams({ ...params, ...(theme0 ? { theme: theme0 } : {}) })}`;
@@ -98,12 +101,16 @@ if (!signIn.token) {
   const fetchNow = (...a) => globalThis.fetch(...a);
   const spacesApi = httpSpaces({ fetch: fetchNow, token: signIn.token, timers: clock });
   const hrefs = { home: location.pathname, board: id => hrefTo({ board: id }), space: id => hrefTo({ space: id }), group: id => hrefTo({ group: id }),
-    team: id => hrefTo({ team: id }), teams: hrefTo({ teams: "1" }), roles: hrefTo({ roles: "1" }), access: (type, id) => hrefTo({ access: `${type}:${id}` }) };
+    team: id => hrefTo({ team: id }), teams: hrefTo({ teams: "1" }), roles: hrefTo({ roles: "1" }), trash: hrefTo({ trash: "1" }), access: (type, id) => hrefTo({ access: `${type}:${id}` }) };
   const dialogs = createDialogs({ host: root, api: spacesApi, hrefs, go: href => location.assign(href) });
   if (rolesPage) {
     // The Roles screen (PROTOCOL.md § Roles): the server answers 404 to a caller without roles.manage, which shows the same "not available" page.
     const model = createRolesModel({ api: httpRoles({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey() });
     mountRolesPage({ root, model, hrefs, signIn: signInLink }); hideGate(); model.load();
+  } else if (trashPage) {
+    // The Trash (PROTOCOL.md § Trash and restore): what this person may restore. A caller outside a Unit gets the same "not available" page.
+    const model = createTrashModel({ api: httpTrash({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey() });
+    mountTrashPage({ root, model, hrefs, signIn: signInLink }); hideGate(); model.load();
   } else if (teamId || teamsPage || accessArg) {
     // Teams, a Team, or the access page of a scope (PROTOCOL.md § Teams and access). An id the person can't open shows the same "not available" page as one that does not exist.
     const api = httpAccess({ fetch: fetchNow, token: signIn.token, timers: clock });
@@ -114,13 +121,14 @@ if (!signIn.token) {
     // A Space or Group page. An id the person can't open shows the same "not available" page as one that does not exist.
     const model = createPageModel({ api: spacesApi, kind: spaceId ? "space" : "group", id: spaceId ?? groupId });
     (spaceId ? mountSpacePage : mountGroupPage)({ root, model, dialogs, hrefs, signIn: signInLink, access: httpAccess({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey(),
-      move: { port: httpMove({ fetch: fetchNow, token: signIn.token, timers: clock }), clock, newKey: () => randomKey() } });
+      move: { port: httpMove({ fetch: fetchNow, token: signIn.token, timers: clock }), clock, newKey: () => randomKey() },
+      trash: { api: httpTrash({ fetch: fetchNow, token: signIn.token, timers: clock }), clock, newKey: () => randomKey() } });
     hideGate();
     model.load();
   } else {
     const model = createHomeModel({ api: httpHome({ fetch: fetchNow, token: signIn.token, timers: clock }), clock });
     mountHome({ root, model, clock, signIn: signInLink, homeHref: location.pathname, dialogs,
-      boardHref: hrefs.board, spaceHref: hrefs.space, groupHref: hrefs.group, teamsHref: hrefs.teams, rolesHref: hrefs.roles, unitAccessHref: id => hrefs.access("unit", id) });
+      boardHref: hrefs.board, spaceHref: hrefs.space, groupHref: hrefs.group, teamsHref: hrefs.teams, trashHref: hrefs.trash, rolesHref: hrefs.roles, unitAccessHref: id => hrefs.access("unit", id) });
     hideGate();
     model.load();
   }
@@ -130,9 +138,21 @@ if (!signIn.token) {
   const me = { role: null, user: id?.user ?? "me", name: id?.name ?? id?.email ?? "You" };
   const net = wsNet({ url: sameOriginWsUrl(location), WebSocket: globalThis.WebSocket, clock, inflate: browserInflate() });
   const app = mountApp({
-    startSession: ({ mine, onChange }) => createSession({
-      join: () => net.join(), token: signIn.token, board, client: "web", user: me.user, mine, onChange, clock,
-    }),
+    startSession: ({ mine, onChange }) => {
+      // A board that refuses the visit may be in Trash (PROTOCOL.md § Trash and restore): ask once, and say so over the page when it is; any other answer leaves the page's own refusal.
+      let session = null, asked = false;
+      const trashNotice = () => {
+        asked = true;
+        const model = createNoticeModel({ api: httpTrash({ fetch: (...a) => globalThis.fetch(...a), token: signIn.token, timers: clock }), board, newKey: () => randomKey() });
+        mountTrashNotice({ host: document.body, model, homeHref: location.pathname, onRestored: () => location.reload() });
+        model.load();
+      };
+      session = createSession({
+        join: () => net.join(), token: signIn.token, board, client: "web", user: me.user, mine, clock,
+        onChange: (...a) => { onChange(...a); if (!asked && session?.status === "refused") trashNotice(); },
+      });
+      return session;
+    },
     net, board, me, prefs: localStore(), theme: q.get("theme"),
     // Why the pill says "View only" (PROTOCOL.md § Access explanation and requests): looked up when the pill is opened, with Ask for access.
     access: httpAccess({ fetch: (...a) => globalThis.fetch(...a), token: signIn.token, timers: clock }), newKey: () => randomKey(),

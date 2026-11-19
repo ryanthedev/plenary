@@ -4,9 +4,10 @@
 // layout is one column that works at 390 and 1280 px. Visuals are plain on purpose (#56 restyles); structure follows design/orgs/mock.html.
 
 import { h, replace } from "./dom.js";
-import { keeper } from "./focus.js";
+import { keeper, announce } from "./focus.js";
 import { whyCard } from "./explain.js";
 import { openMove, showMoveToast } from "./move.js";
+import { showTrashToast } from "./toast.js";
 import { createMoveModel } from "../../core/move.js";
 import { generalText, spaceEmpty, groupEmpty } from "../../core/spaces.js";
 
@@ -111,7 +112,7 @@ const afterRender = () => { let fn = null; return { set: f => { fn = f; }, run: 
  *   signIn?: { href: string, text?: string } | null }} o
  * @returns {{ destroy(): void }}
  */
-export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null, access = null, newKey = null, move = null }) {
+export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null, access = null, newKey = null, move = null, trash = null }) {
   let whyRef = null;
   const S = model.state;
   const { status, main } = shell(root, hrefs);
@@ -123,6 +124,20 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null, acc
   const end = (to) => { editing = null; after.set(to); render(); };
   const focusTitle = () => h1?.focus?.();
 
+  /** Move a board to Trash: no dialog (Undo is the safety net, PROTOCOL.md § Trash and restore); the toast takes focus, and on its end focus goes back to the page. */
+  async function trashBoard(c) {
+    const r = await trash.api.trash(c.id, { from: S.page.space.id }, trash.newKey?.() ?? null);
+    if (r.error) { S.notice = r.error === "forbidden" ? "You can't move this board to Trash." : r.error === "moved" ? "This board was moved by someone else. Reload and try again." : "Could not move it to Trash. Try again."; showNotice(status, model); status.focus?.(); announce(S.notice); return; }
+    model.load().then(() => showTrashToast({ host: globalThis.document.body, api: trash.api, kind: "board", result: r.result, clock: trash.clock, newKey: trash.newKey, onChange: () => model.load(), restoreFocus: () => main.focus?.() }));
+  }
+  async function trashSpace() {
+    const sp = S.page.space;
+    const r = await trash.api.trashSpace(sp.id, trash.newKey?.() ?? null);
+    if (r.error) { S.notice = r.error === "forbidden" ? "You can't move this Space to Trash." : "Could not move it to Trash. Try again."; showNotice(status, model); status.focus?.(); announce(S.notice); return; }
+    showTrashToast({ host: globalThis.document.body, api: trash.api, kind: "space", result: r.result, clock: trash.clock, newKey: trash.newKey, onChange: () => model.load(), restoreFocus: () => main.focus?.() });
+    model.load();                                     // the Space is gone from reach: the page says so, the toast offers Undo (which loads it again)
+  }
+
   function card(c) {
     const where = [c.role].filter(Boolean).join(" · ");
     const menuCfg = { label: `More for ${c.title || "Untitled"}`, items: [
@@ -131,6 +146,7 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null, acc
       { text: "Move to…", hidden: !move || !c.can?.move, onSelect: opener => openMove({ host: root, opener, model: createMoveModel({ move: move.port, board: c.id, newKey: move.newKey }),
         onMoved: result => { model.load().then(() => showMoveToast({ host: globalThis.document.body, move: move.port, board: c.id, result, clock: move.clock, newKey: move.newKey, onChange: () => model.load(), restoreFocus: () => main.focus?.() })); } }) },
       { text: "Rename", hidden: !c.can?.rename, onSelect: () => { editing = { type: "board", id: c.id }; render(); } },
+      { text: "Move to Trash", hidden: !trash || !c.can?.trash, onSelect: () => trashBoard(c) },
     ] };
     const menu = keys.keep(`card-menu:${c.id}`, () => overflowMenu(menuCfg));
     menu.update(menuCfg);
@@ -172,8 +188,9 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null, acc
     const menuCfg = { label: "Space options", items: [
       { text: "Rename", hidden: !p.can.rename, onSelect: () => { editing = { type: "title" }; render(); } },
       { text: "General access…", hidden: !p.can.general, onSelect: b => dialogs.general({ opener: b, current: sp.general, onSave: r => model.setGeneral(r) }) },
+      { text: "Move to Trash", hidden: !trash || !p.can.trash, onSelect: () => trashSpace() },
     ] };
-    const menu = p.can.rename || p.can.general ? keys.keep("space-options", () => overflowMenu(menuCfg)) : null;
+    const menu = p.can.rename || p.can.general || (trash && p.can.trash) ? keys.keep("space-options", () => overflowMenu(menuCfg)) : null;
     if (menu) { menu.update(menuCfg); keys.mark(menu.button, "space-options"); }
     const input = inlineEditor({ editing: editing?.type === "title", session: title, text: sp.name, label: "Space name",
       onSave: (v, moved) => model.rename(v).then(ok => { if (ok) end(moved ? null : focusTitle); else render(); }), onCancel: () => end(focusTitle) });

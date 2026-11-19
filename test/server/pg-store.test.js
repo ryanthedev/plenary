@@ -372,27 +372,29 @@ describe.skipIf(!url)("postgres store", () => {
     } finally { resume(); await holder.close(); await other.close(); await own.close().catch(() => {}); await drop(schema); }
   });
 
-  test("L3: a role without UPDATE on pl_leases is refused at start-up (denied), not at its first fenced write", async () => {
-    const [{ ok }] = await client().unsafe("SELECT rolsuper OR rolcreaterole AS ok FROM pg_roles WHERE rolname = current_user");
-    if (!ok) { console.warn("pg-store: skipping L3 (the DATABASE_URL role can't create roles)"); return; }
-    const schema = schemaName(), role = `pl_test_app_${process.pid}_${++n}`, pass = "pl-test-" + Date.now().toString(36);
-    const owner = await postgresStore({ sql: client(), schema });
-    await owner.close();
-    await client().unsafe(`CREATE ROLE "${role}" LOGIN PASSWORD '${pass}'`);
-    await client().unsafe(`GRANT USAGE ON SCHEMA "${schema}" TO "${role}"`);
-    await client().unsafe(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO "${role}"`);
-    await client().unsafe(`REVOKE UPDATE ON "${schema}".pl_leases FROM "${role}"`);
-    const u = new URL(url); u.username = role; u.password = pass;
-    const app = new SQL({ url: u.toString(), max: 2 });
-    try {
-      const err = await postgresStore({ sql: app, schema }).then(() => null, e => e);
-      expect(err?.code).toBe("denied");
-      expect(err.message).toContain("UPDATE on pl_leases");
-    } finally {
-      await app.close(); await drop(schema);
-      await client().unsafe(`DROP ROLE IF EXISTS "${role}"`);
-    }
-  });
+  for (const [priv, table] of [["UPDATE", "pl_leases"], ["DELETE", "pl_leases"], ["DELETE", "pl_entries"]]) {
+    test(`L3: a role without ${priv} on ${table} is refused at start-up (denied), not at its first fenced write or purge`, async () => {
+      const [{ ok }] = await client().unsafe("SELECT rolsuper OR rolcreaterole AS ok FROM pg_roles WHERE rolname = current_user");
+      if (!ok) { console.warn(`pg-store: skipping L3 ${priv} ${table} (the DATABASE_URL role can't create roles)`); return; }
+      const schema = schemaName(), role = `pl_test_app_${process.pid}_${++n}`, pass = "pl-test-" + Date.now().toString(36);
+      const owner = await postgresStore({ sql: client(), schema });
+      await owner.close();
+      await client().unsafe(`CREATE ROLE "${role}" LOGIN PASSWORD '${pass}'`);
+      await client().unsafe(`GRANT USAGE ON SCHEMA "${schema}" TO "${role}"`);
+      await client().unsafe(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO "${role}"`);
+      await client().unsafe(`REVOKE ${priv} ON "${schema}".${table} FROM "${role}"`);
+      const u = new URL(url); u.username = role; u.password = pass;
+      const app = new SQL({ url: u.toString(), max: 2 });
+      try {
+        const err = await postgresStore({ sql: app, schema }).then(() => null, e => e);
+        expect(err?.code).toBe("denied");
+        expect(err.message).toContain(`${priv} on ${table}`);
+      } finally {
+        await app.close(); await drop(schema);
+        await client().unsafe(`DROP ROLE IF EXISTS "${role}"`);
+      }
+    });
+  }
 
   test("ten stores on separate pools racing at one seq: exactly one wins per round", async () => {
     const schema = schemaName();
@@ -448,6 +450,9 @@ describe.skipIf(!url)("postgres store", () => {
       await store.putCheckpoint(T, B, { seq: 1, id: "c:1", by: "u1", at: 1 }, l.epoch);
       await store.release(T, B, "h-a", l.epoch);
       expect((await store.getCheckpoint(T, B))?.seq).toBe(1);
+      await store.purgeBoard(T, B);                                              // the Trash purge: DELETE on pl_entries, pl_checkpoints(+parts) and pl_leases
+      expect(await store.read(T, B, 1, 10)).toEqual([]);
+      expect(await store.getCheckpoint(T, B)).toBe(null);
       await store.close();
       // The same role on a schema nobody migrated: refused (it may not CREATE), so the test above proves least privilege.
       const denied = await postgresStore({ sql: app, schema: bare }).then(() => null, e => e);

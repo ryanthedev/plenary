@@ -195,8 +195,8 @@ right they use at start-up, so a role with `USAGE` but missing grants is refused
 `lacks DELETE on reg_link_uses`), not on its first request:
 
 - **Registry:** `SELECT, INSERT, UPDATE, DELETE` on every `reg_*` table.
-- **Store:** `SELECT, INSERT` on `pl_entries`; `SELECT, INSERT, DELETE` on `pl_checkpoints` and on `pl_checkpoint_parts`; `SELECT, INSERT, UPDATE`
-  on `pl_leases` (the epoch fence's `FOR SHARE` needs `UPDATE`).
+- **Store:** `SELECT, INSERT, DELETE` on `pl_entries` (DELETE: the Trash purge); `SELECT, INSERT, DELETE` on `pl_checkpoints` and on `pl_checkpoint_parts`; `SELECT, INSERT, UPDATE, DELETE`
+  on `pl_leases` (the epoch fence's `FOR SHARE` needs `UPDATE`; the Trash purge `DELETE`).
 
 Step 3's grants cover both.
 

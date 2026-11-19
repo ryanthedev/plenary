@@ -46,7 +46,7 @@ export function homeService({ registry, tenancy, now = Date.now }) {
   async function cards(identity, unit, entries, { found: given, keep, can = false } = {}) {
     const found = given ?? await accessAll(identity, [...new Set(entries.map(e => e.id))]);
     // `can` (the Space page): what the person may do to the board, as permissions the resolver already computed (never a role name).
-    const extra = f => (can ? { can: { rename: f.access.permissions.has("board.edit") || f.access.permissions.has("members.manage"), move: f.access.permissions.has("move") } } : {});
+    const extra = f => (can ? { can: { rename: f.access.permissions.has("board.edit") || f.access.permissions.has("members.manage"), move: f.access.permissions.has("move"), trash: f.access.permissions.has("delete") } } : {});
     const out = entries.filter(e => openable(found.get(e.id)) && (!keep || keep(found.get(e.id)))).map(e => card(found.get(e.id), { ...(e.at != null ? { at: e.at } : {}), ...extra(found.get(e.id)) }));
     if (out.length) {
       const stars = new Set(await registry.starredAmong(identity.user, out.map(c => c.id)));

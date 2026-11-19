@@ -42,6 +42,13 @@ describe.skipIf(!url)("postgres registry", () => {
   const schemaName = () => `pl_test_reg_${process.pid}_${Date.now().toString(36)}_${++n}`;
   const drop = s => client().unsafe(`DROP SCHEMA IF EXISTS "${s}" CASCADE`);
   const schemas = new Map();
+  /** For the trash races: waits until the call under test is blocked on ANY lock in this schema, or has already settled (then the caller's assertions on the outcome decide: a missing lock shows as a settled call, never as a timeout). */
+  const blockedOrSettled = async (f, schema) => {
+    for (const end = Date.now() + HUNG_MS; !f.done; await Bun.sleep(20)) {
+      if ((await client().unsafe(`SELECT count(*)::int AS c FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE $1`, [`%${schema}%`]))[0].c >= 1) return;
+      if (Date.now() > end) throw new Error(`timed out after ${HUNG_MS} ms: the call neither blocked nor settled`);
+    }
+  };
   /** Waits (until a real HUNG_MS deadline) until at least `n` backends are blocked on a lock in a statement matching `like`; fails with a named message after it, so a loaded machine fails cleanly. */
   const waitBlocked = async (like, n = 1) => {
     let c = 0;
@@ -292,6 +299,104 @@ describe.skipIf(!url)("postgres registry", () => {
       expect(await p).toBe("last-owner");
       expect(await r.grants(board.id)).toEqual([{ user: "y", role: "owner" }]);
     } finally { other.release(); await r.close(); await drop(schema); }
+  });
+
+  // MED-2 (#54): a write that puts or keeps a board in a Space reads the Space FOR SHARE, so a trashSpace that is in flight (it holds the Space FOR UPDATE) cannot commit between the read
+  // and the write and strand a live board in a Space that went to Trash. Each case holds that lock on a second connection, uncommitted, as a concurrent trashSpace does.
+  describe("trash races: a board is never left live in a Space that went to Trash", () => {
+    const setup = async () => {
+      const schema = schemaName();
+      const r = await postgresRegistry({ url, schema, max: 3 });
+      const other = await client().reserve();
+      const t = await r.createTenant({ domain: null });
+      const sp = await r.createSpace({ tenant: t.id, name: "S", owner: "u" }), dst = await r.createSpace({ tenant: t.id, name: "D", owner: "u" });
+      const trashing = async space => {   // what trashSpace does, up to its COMMIT
+        await other.unsafe("BEGIN");
+        await other.unsafe(`SELECT id FROM "${schema}".reg_spaces WHERE id = $1 FOR UPDATE`, [space]);
+        await other.unsafe(`UPDATE "${schema}".reg_spaces SET trashed_at = 5, trashed_by = 'u' WHERE id = $1`, [space]);
+      };
+      return { schema, r, other, t, sp, dst, trashing };
+    };
+    const settledFlag = p => { const f = { done: false }; p.then(() => { f.done = true; }, () => { f.done = true; }); return f; };
+
+    test("createBoard waits for the Space's lock, then refuses the Space that went to Trash", async () => {
+      const { schema, r, other, t, sp, trashing } = await setup();
+      try {
+        await trashing(sp.id);
+        const p = r.createBoard({ tenant: t.id, title: "late", space: sp.id, owner: "u" }).then(() => "created", e => e.message);
+        const f = settledFlag(p);
+        await blockedOrSettled(f, schema);
+        expect(f.done).toBe(false);
+        await other.unsafe("COMMIT");
+        expect(await p).toMatch(/no such space/);
+        expect((await r.boardsIn({ type: "space", id: sp.id }, { withTrashed: true })).ids).toEqual([]);
+      } finally { await other.unsafe("ROLLBACK").catch(() => {}); other.release(); await r.close(); await drop(schema); }
+    }, RACE_CEILING);
+
+    test("moveBoard into a Space being trashed waits, then refuses it; the board stays where it was, live", async () => {
+      const { schema, r, other, t, sp, dst, trashing } = await setup();
+      try {
+        const b = await r.createBoard({ tenant: t.id, title: "m", space: sp.id, owner: "u" });
+        await trashing(dst.id);
+        const p = r.moveBoard({ board: b.id, from: sp.id, to: dst.id }).then(() => "moved", e => e.message);
+        const f = settledFlag(p);
+        await blockedOrSettled(f, schema);
+        expect(f.done).toBe(false);
+        await other.unsafe("COMMIT");
+        expect(await p).toMatch(/no such space/);
+        expect(await r.board(b.id)).toMatchObject({ space: sp.id, trashedAt: null });
+      } finally { await other.unsafe("ROLLBACK").catch(() => {}); other.release(); await r.close(); await drop(schema); }
+    }, RACE_CEILING);
+
+    test("moveBoard OUT of a Space being trashed waits for it, then finds the board trashed (in-trash): it never lands live in the target while trashed with the source", async () => {
+      const { schema, r, other, t, sp, dst, trashing } = await setup();
+      try {
+        const b = await r.createBoard({ tenant: t.id, title: "o", space: sp.id, owner: "u" });
+        await trashing(sp.id);
+        await other.unsafe(`UPDATE "${schema}".reg_boards SET trashed_at = 5, trashed_by = 'u', trashed_with = $1 WHERE id = $2`, [sp.id, b.id]);   // what trashSpace does to its boards
+        const p = r.moveBoard({ board: b.id, from: sp.id, to: dst.id }).then(() => "moved", e => e.code ?? e.message);
+        const f = settledFlag(p);
+        await blockedOrSettled(f, schema);
+        expect(f.done).toBe(false);
+        await other.unsafe("COMMIT");
+        expect(await p).toBe("in-trash");
+        expect(await r.board(b.id)).toMatchObject({ space: sp.id, trashedWith: sp.id });
+      } finally { await other.unsafe("ROLLBACK").catch(() => {}); other.release(); await r.close(); await drop(schema); }
+    }, RACE_CEILING);
+
+    test("restoreBoard waits for its Space's lock; a Space that went to Trash meanwhile refuses it (space-in-trash), and the board stays in Trash", async () => {
+      const { schema, r, other, t, sp, trashing } = await setup();
+      try {
+        const b = await r.createBoard({ tenant: t.id, title: "r", space: sp.id, owner: "u" });
+        await r.trashBoard({ board: b.id, from: sp.id, by: "u" });
+        await trashing(sp.id);
+        const p = r.restoreBoard({ board: b.id }).then(() => "restored", e => e.code);
+        const f = settledFlag(p);
+        await blockedOrSettled(f, schema);
+        expect(f.done).toBe(false);
+        await other.unsafe("COMMIT");
+        expect(await p).toBe("space-in-trash");
+        expect((await r.board(b.id)).trashedAt).not.toBe(null);
+      } finally { await other.unsafe("ROLLBACK").catch(() => {}); other.release(); await r.close(); await drop(schema); }
+    }, RACE_CEILING);
+
+    test("addLinkUse waits for a trashBoard in flight and then refuses (in-trash): no use is recorded for a trashed board", async () => {
+      const { schema, r, other, t, sp } = await setup();
+      try {
+        const b = await r.createBoard({ tenant: t.id, title: "l", space: sp.id, owner: "u" });
+        const lk = await r.createLink({ board: b.id, role: "viewer", by: "u" });
+        await other.unsafe("BEGIN");
+        await other.unsafe(`SELECT id FROM "${schema}".reg_boards WHERE id = $1 FOR UPDATE`, [b.id]);
+        await other.unsafe(`UPDATE "${schema}".reg_boards SET trashed_at = 5, trashed_by = 'u' WHERE id = $1`, [b.id]);
+        const p = r.addLinkUse(lk.id, "guest").then(() => "used", e => e.code);
+        const f = settledFlag(p);
+        await blockedOrSettled(f, schema);
+        expect(f.done).toBe(false);
+        await other.unsafe("COMMIT");
+        expect(await p).toBe("in-trash");
+        expect(await r.linkUses(b.id, "guest")).toEqual([]);
+      } finally { await other.unsafe("ROLLBACK").catch(() => {}); other.release(); await r.close(); await drop(schema); }
+    }, RACE_CEILING);
   });
 
   test("an access request waits for its scope's advisory lock, whoever asks (the lock that keeps concurrent asks by different people under scopePending), then goes through", async () => {

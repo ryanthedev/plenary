@@ -17,7 +17,7 @@
 // `user`; insertion order is an explicit `n` column (Postgres: BIGSERIAL / identity), upserts use ON CONFLICT.
 
 import { Database } from "bun:sqlite";
-import { RegistryError, batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
+import { RegistryError, batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, TRASH, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 import { assertShapes } from "../sqlite/schema.js";
 
@@ -73,7 +73,8 @@ const createSchema = d => {
       PRIMARY KEY (tenant, member))`);
     d.run(`CREATE TABLE IF NOT EXISTS reg_boards (
       id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), title TEXT NOT NULL,
-      member_role TEXT, created_at INTEGER NOT NULL)`);
+      member_role TEXT, created_at INTEGER NOT NULL,
+      trashed_at INTEGER, trashed_by TEXT, trashed_with TEXT, purging INTEGER NOT NULL DEFAULT 0)`);
     d.run(`CREATE TABLE IF NOT EXISTS reg_grants (
       board TEXT NOT NULL REFERENCES reg_boards(id), member TEXT NOT NULL, role TEXT NOT NULL, n INTEGER NOT NULL,
       PRIMARY KEY (board, member))`);
@@ -98,7 +99,8 @@ const createSchema = d => {
       id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), name TEXT NOT NULL, general_role TEXT, created_at INTEGER NOT NULL)`);
     d.run(`CREATE TABLE IF NOT EXISTS reg_spaces (
       id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), grp TEXT REFERENCES reg_groups(id), name TEXT NOT NULL,
-      kind TEXT NOT NULL, owner_user TEXT, general_role TEXT, created_at INTEGER NOT NULL, UNIQUE (tenant, owner_user))`);
+      kind TEXT NOT NULL, owner_user TEXT, general_role TEXT, created_at INTEGER NOT NULL,
+      trashed_at INTEGER, trashed_by TEXT, purging INTEGER NOT NULL DEFAULT 0, UNIQUE (tenant, owner_user))`);
     d.run(`CREATE TABLE IF NOT EXISTS reg_board_spaces (
       board TEXT PRIMARY KEY REFERENCES reg_boards(id), space TEXT NOT NULL REFERENCES reg_spaces(id))`);
     d.run(`CREATE TABLE IF NOT EXISTS reg_teams (
@@ -132,6 +134,12 @@ const createSchema = d => {
     d.run("CREATE INDEX IF NOT EXISTS reg_stars_member ON reg_stars (member, at DESC, board DESC)");
     d.run("CREATE INDEX IF NOT EXISTS reg_grants_member ON reg_grants (member)");
     d.run("CREATE INDEX IF NOT EXISTS reg_boards_tenant ON reg_boards (tenant, id)");
+    d.run("CREATE INDEX IF NOT EXISTS reg_boards_trash ON reg_boards (trashed_at) WHERE trashed_at IS NOT NULL");
+    d.run("CREATE INDEX IF NOT EXISTS reg_boards_purging ON reg_boards (id) WHERE purging = 1");
+    d.run("CREATE INDEX IF NOT EXISTS reg_spaces_purging ON reg_spaces (id) WHERE purging = 1");
+    d.run("CREATE INDEX IF NOT EXISTS reg_boards_trashed_with ON reg_boards (trashed_with) WHERE trashed_with IS NOT NULL");
+    d.run("CREATE INDEX IF NOT EXISTS reg_board_spaces_space ON reg_board_spaces (space, board)");
+    d.run("CREATE INDEX IF NOT EXISTS reg_spaces_trash ON reg_spaces (trashed_at) WHERE trashed_at IS NOT NULL");
     d.run("CREATE INDEX IF NOT EXISTS reg_invites_email ON reg_invites (email)");
     d.run("CREATE INDEX IF NOT EXISTS reg_link_uses_member ON reg_link_uses (member, board)");
     d.run("CREATE INDEX IF NOT EXISTS reg_scope_grants_role ON reg_scope_grants (role, subject_type, subject)");
@@ -198,7 +206,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     insDomain: db.query("INSERT INTO reg_tenant_domains (domain, tenant, n) VALUES (?, ?, ?)"),
     setPrimary: db.query("UPDATE reg_tenants SET domain = ? WHERE id = ? AND domain IS NULL"),
 
-    board: db.query("SELECT id, tenant, title, member_role, created_at, (SELECT space FROM reg_board_spaces WHERE board = reg_boards.id) AS space FROM reg_boards WHERE id = ?"),
+    board: db.query("SELECT id, tenant, title, member_role, created_at, trashed_at, trashed_by, trashed_with, purging, (SELECT space FROM reg_board_spaces WHERE board = reg_boards.id) AS space FROM reg_boards WHERE id = ?"),
     insBoardSpace: db.query("INSERT INTO reg_board_spaces (board, space) VALUES (?, ?)"),
     putBoardSpace: db.query("UPDATE reg_board_spaces SET space = ?2 WHERE board = ?1"),
 
@@ -206,8 +214,8 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     groups: db.query("SELECT * FROM reg_groups WHERE tenant = ? ORDER BY created_at, id"),
     insGroup: db.query("INSERT INTO reg_groups (id, tenant, name, general_role, created_at) VALUES (?, ?, ?, ?, ?)"),
     space: db.query("SELECT * FROM reg_spaces WHERE id = ?"),
-    spaces: db.query("SELECT * FROM reg_spaces WHERE tenant = ? ORDER BY created_at, id"),
-    spacesIn: db.query("SELECT * FROM reg_spaces WHERE grp = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?3"),
+    spaces: db.query("SELECT * FROM reg_spaces WHERE tenant = ? AND trashed_at IS NULL ORDER BY created_at, id"),
+    spacesIn: db.query("SELECT * FROM reg_spaces WHERE grp = ?1 AND trashed_at IS NULL AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?3"),
     renameBoard: db.query("UPDATE reg_boards SET title = ?2 WHERE id = ?1"),
     renameSpace: db.query("UPDATE reg_spaces SET name = ?2 WHERE id = ?1"),
     renameGroup: db.query("UPDATE reg_groups SET name = ?2 WHERE id = ?1"),
@@ -246,9 +254,10 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     teamOwned: db.query("SELECT scope_type, scope_id FROM reg_scope_grants WHERE subject_type = 'team' AND subject = ? AND role = 'owner' AND scope_type IN ('group', 'space')"),
     teamSize: db.query("SELECT count(*) AS c FROM reg_team_members WHERE team = ?"),
     teamHas: db.query("SELECT 1 AS x FROM reg_team_members WHERE team = ? AND member = ?"),
-    boardsInUnit: db.query("SELECT id FROM reg_boards WHERE tenant = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?3"),
-    boardsInSpace: db.query("SELECT board AS id FROM reg_board_spaces WHERE space = ?1 AND (?2 IS NULL OR board > ?2) ORDER BY board LIMIT ?3"),
-    boardsInGroup: db.query("SELECT bs.board AS id FROM reg_board_spaces bs JOIN reg_spaces s ON s.id = bs.space WHERE s.grp = ?1 AND (?2 IS NULL OR bs.board > ?2) ORDER BY bs.board LIMIT ?3"),
+    // ?4 = 1: boards in Trash are listed too (an announcement reaches them).
+    boardsInUnit: db.query("SELECT id FROM reg_boards WHERE tenant = ?1 AND (?4 = 1 OR trashed_at IS NULL) AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?3"),
+    boardsInSpace: db.query("SELECT bs.board AS id FROM reg_board_spaces bs JOIN reg_boards b ON b.id = bs.board WHERE bs.space = ?1 AND (?4 = 1 OR b.trashed_at IS NULL) AND (?2 IS NULL OR bs.board > ?2) ORDER BY bs.board LIMIT ?3"),
+    boardsInGroup: db.query("SELECT bs.board AS id FROM reg_board_spaces bs JOIN reg_spaces s ON s.id = bs.space JOIN reg_boards b ON b.id = bs.board WHERE s.grp = ?1 AND (?4 = 1 OR b.trashed_at IS NULL) AND (?2 IS NULL OR bs.board > ?2) ORDER BY bs.board LIMIT ?3"),
     scopesOf: db.query(`SELECT scope_type, scope_id, role FROM reg_scope_grants WHERE subject_type = ?1 AND subject = ?2
       AND (?3 IS NULL OR (scope_type || char(10) || scope_id) > ?3) ORDER BY scope_type, scope_id LIMIT ?4`),
     sgrantN: db.query("SELECT coalesce(max(n), 0) + 1 AS n FROM reg_scope_grants WHERE scope_type = ? AND scope_id = ?"),
@@ -295,13 +304,13 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
         UNION SELECT g.scope_id AS board FROM reg_team_members m CROSS JOIN reg_scope_grants g INDEXED BY reg_scope_grants_subject ON g.subject_type = 'team' AND g.subject = m.team AND g.scope_type = 'board'
           WHERE m.member = ?1
         UNION SELECT board FROM reg_invites WHERE ?2 IS NOT NULL AND email = ?2 AND revoked = 0
-        UNION SELECT board FROM reg_link_uses WHERE member = ?1) ORDER BY board LIMIT ?3`),
-    search: db.query(`SELECT w.id FROM (SELECT id, title FROM reg_boards WHERE tenant = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?4) w
+        UNION SELECT board FROM reg_link_uses WHERE member = ?1) WHERE NOT EXISTS (SELECT 1 FROM reg_boards x WHERE x.id = board AND x.trashed_at IS NOT NULL) ORDER BY board LIMIT ?3`),
+    search: db.query(`SELECT w.id FROM (SELECT id, title FROM reg_boards WHERE tenant = ?1 AND trashed_at IS NULL AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?4) w
       JOIN reg_board_spaces bs ON bs.board = w.id JOIN reg_spaces s ON s.id = bs.space
       WHERE ?3 IS NULL OR w.title LIKE ?3 ESCAPE '\\' OR s.name LIKE ?3 ESCAPE '\\'
       ORDER BY w.id`),
-    searchEdge: db.query("SELECT id FROM reg_boards WHERE tenant = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT 2 OFFSET ?3"),
-    spaceCand: db.query(`SELECT s.* FROM reg_spaces s WHERE s.tenant = ?1 AND (?2 IS NULL OR s.id > ?2) AND (?4 = 1
+    searchEdge: db.query("SELECT id FROM reg_boards WHERE tenant = ?1 AND trashed_at IS NULL AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT 2 OFFSET ?3"),
+    spaceCand: db.query(`SELECT s.* FROM reg_spaces s WHERE s.tenant = ?1 AND s.trashed_at IS NULL AND (?2 IS NULL OR s.id > ?2) AND (?4 = 1
         OR s.general_role IS NOT NULL OR s.owner_user = ?3
         OR EXISTS (SELECT 1 FROM reg_scope_grants g WHERE g.scope_type = 'space' AND g.scope_id = s.id AND ((g.subject_type = 'user' AND g.subject = ?3)
           OR (g.subject_type = 'team' AND g.subject IN (SELECT team FROM reg_team_members WHERE member = ?3))))
@@ -313,7 +322,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     groupCand: db.query(`SELECT gr.* FROM reg_groups gr WHERE gr.tenant = ?1 AND (?3 = 1 OR gr.general_role IS NOT NULL
         OR EXISTS (SELECT 1 FROM reg_scope_grants g WHERE g.scope_type = 'group' AND g.scope_id = gr.id AND ((g.subject_type = 'user' AND g.subject = ?2)
           OR (g.subject_type = 'team' AND g.subject IN (SELECT team FROM reg_team_members WHERE member = ?2))))) ORDER BY gr.id LIMIT ?4`),
-    rowsBoards: db.query(`SELECT id, tenant, title, member_role, created_at, (SELECT space FROM reg_board_spaces WHERE board = reg_boards.id) AS space
+    rowsBoards: db.query(`SELECT id, tenant, title, member_role, created_at, trashed_at, trashed_by, trashed_with, purging, (SELECT space FROM reg_board_spaces WHERE board = reg_boards.id) AS space
       FROM reg_boards WHERE id IN (SELECT value FROM json_each(?))`),
     rowsGrants: db.query("SELECT board, role FROM reg_grants WHERE member = ? AND board IN (SELECT value FROM json_each(?))"),
     rowsTeamGrants: db.query(`SELECT scope_id, subject_type, subject, role FROM reg_scope_grants WHERE scope_type = 'board'
@@ -323,6 +332,38 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     rowsUses: db.query("SELECT board, link FROM reg_link_uses WHERE member = ? AND board IN (SELECT value FROM json_each(?)) ORDER BY n"),
     rowsLinks: db.query(`SELECT l.* FROM reg_link_uses u JOIN reg_links l ON l.id = u.link
       WHERE u.member = ? AND u.board IN (SELECT value FROM json_each(?)) ORDER BY u.n`),
+    // Trash (PROTOCOL.md § Trash and restore)
+    trashBoard: db.query("UPDATE reg_boards SET trashed_at = ?2, trashed_by = ?3, trashed_with = NULL WHERE id = ?1 AND trashed_at IS NULL"),
+    trashSpace: db.query("UPDATE reg_spaces SET trashed_at = ?2, trashed_by = ?3 WHERE id = ?1 AND trashed_at IS NULL"),
+    trashSpaceBoards: db.query("UPDATE reg_boards SET trashed_at = ?2, trashed_by = ?3, trashed_with = ?1 WHERE trashed_at IS NULL AND id IN (SELECT board FROM reg_board_spaces WHERE space = ?1)"),
+    restoreBoard: db.query("UPDATE reg_boards SET trashed_at = NULL, trashed_by = NULL, trashed_with = NULL, purging = 0 WHERE id = ?1"),
+    restoreSpace: db.query("UPDATE reg_spaces SET trashed_at = NULL, trashed_by = NULL WHERE id = ?1"),
+    restoreSpaceBoards: db.query("UPDATE reg_boards SET trashed_at = NULL, trashed_by = NULL, trashed_with = NULL, purging = 0 WHERE trashed_with = ?1"),
+    spaceBoardsClaimed: db.query("SELECT 1 AS x FROM reg_boards WHERE trashed_with = ? AND purging = 1 LIMIT 1"),
+    trashedBoards: db.query("SELECT id, tenant, title, member_role, created_at, trashed_at, trashed_by, trashed_with, purging, (SELECT space FROM reg_board_spaces WHERE board = reg_boards.id) AS space FROM reg_boards WHERE tenant = ?1 AND trashed_at IS NOT NULL AND trashed_with IS NULL AND purging = 0 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?3"),
+    trashedSpaces: db.query(`SELECT s.*, (SELECT count(*) FROM (SELECT 1 FROM reg_boards b WHERE b.trashed_with = s.id LIMIT ?4)) AS boards FROM reg_spaces s
+      WHERE s.tenant = ?1 AND s.trashed_at IS NOT NULL AND s.purging = 0 AND (?2 IS NULL OR s.id > ?2) ORDER BY s.id LIMIT ?3`),
+    dueBoards: db.query("SELECT id, tenant, title, member_role, created_at, trashed_at, trashed_by, trashed_with, purging, (SELECT space FROM reg_board_spaces WHERE board = reg_boards.id) AS space FROM reg_boards WHERE trashed_at IS NOT NULL AND (trashed_at <= ?1 OR purging = 1) ORDER BY trashed_at, id LIMIT ?2"),
+    dueSpaces: db.query("SELECT * FROM reg_spaces WHERE trashed_at IS NOT NULL AND (trashed_at <= ?1 OR purging = 1) ORDER BY trashed_at, id LIMIT ?2"),
+    unclaimedBoards: db.query("SELECT id, tenant, title, member_role, created_at, trashed_at, trashed_by, trashed_with, purging, (SELECT space FROM reg_board_spaces WHERE board = reg_boards.id) AS space FROM reg_boards WHERE trashed_at IS NOT NULL AND purging = 0 AND trashed_with IS NULL AND trashed_at <= ?1 ORDER BY trashed_at, id LIMIT ?2"),
+    unclaimedSpaces: db.query("SELECT * FROM reg_spaces WHERE trashed_at IS NOT NULL AND purging = 0 AND trashed_at <= ?1 ORDER BY trashed_at, id LIMIT ?2"),
+    claimedBoards: db.query("SELECT id, tenant, title, member_role, created_at, trashed_at, trashed_by, trashed_with, purging, (SELECT space FROM reg_board_spaces WHERE board = reg_boards.id) AS space FROM reg_boards WHERE purging = 1 AND trashed_at IS NOT NULL AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?1"),
+    claimedSpaces: db.query("SELECT * FROM reg_spaces WHERE purging = 1 AND trashed_at IS NOT NULL AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?1"),
+    claimBoard: db.query("UPDATE reg_boards SET purging = 1 WHERE id = ?1 AND trashed_at IS NOT NULL AND (trashed_with IS NULL OR purging = 1) AND (purging = 1 OR trashed_at <= ?2)"),
+    claimSpace: db.query("UPDATE reg_spaces SET purging = 1 WHERE id = ?1 AND trashed_at IS NOT NULL AND (purging = 1 OR trashed_at <= ?2)"),
+    claimSpaceBoards: db.query("UPDATE reg_boards SET purging = 1 WHERE trashed_with = ?1"),
+    spaceHasBoards: db.query("SELECT 1 AS x FROM reg_board_spaces WHERE space = ? LIMIT 1"),
+    purgeGrants: db.query("DELETE FROM reg_grants WHERE board = ?"),
+    purgeScoped: db.query("DELETE FROM reg_scope_grants WHERE scope_type = ?1 AND scope_id = ?2"),
+    purgeInvites: db.query("DELETE FROM reg_invites WHERE board = ?"),
+    purgeUses: db.query("DELETE FROM reg_link_uses WHERE board = ?"),
+    purgeLinks: db.query("DELETE FROM reg_links WHERE board = ?"),
+    purgeRecents: db.query("DELETE FROM reg_recents WHERE board = ?"),
+    purgeStars: db.query("DELETE FROM reg_stars WHERE board = ?"),
+    purgeAsks: db.query("DELETE FROM reg_access_requests WHERE scope_type = ?1 AND scope_id = ?2"),
+    purgeBoardSpace: db.query("DELETE FROM reg_board_spaces WHERE board = ?"),
+    purgeBoardRow: db.query("DELETE FROM reg_boards WHERE id = ?"),
+    purgeSpaceRow: db.query("DELETE FROM reg_spaces WHERE id = ?"),
     boardExists: db.query("SELECT 1 AS x FROM reg_boards WHERE id = ?"),
     insBoard: db.query("INSERT INTO reg_boards (id, tenant, title, member_role, created_at) VALUES (?, ?, ?, ?, ?)"),
 
@@ -361,9 +402,9 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     id: r.id, domain: r.domain, domains: [...(r.domain ? [r.domain] : []), ...q.extraDomains.all(r.id).map(d => d.domain)],
     kind: needKind(q.tenantKind.get(r.id)?.kind, r.id, absent),   // the look-up always runs (uniform statement count); `absent` = uniformTenant's placeholder row, never returned
     admins: q.admins.all(r.id).map(a => a.member), createdAt: r.created_at };
-  const rowBoard = r => r && { id: r.id, tenant: r.tenant, title: r.title, memberRole: r.member_role, space: r.space, createdAt: r.created_at };
+  const rowBoard = r => r && { id: r.id, tenant: r.tenant, title: r.title, memberRole: r.member_role, space: r.space, createdAt: r.created_at, trashedAt: r.trashed_at, trashedBy: r.trashed_by, trashedWith: r.trashed_with };
   const rowGroup = r => r && { id: r.id, tenant: r.tenant, name: r.name, generalRole: r.general_role, createdAt: r.created_at };
-  const rowSpace = r => r && { id: r.id, tenant: r.tenant, group: r.grp, name: r.name, kind: r.kind, owner: r.owner_user, generalRole: r.general_role, createdAt: r.created_at };
+  const rowSpace = r => r && { id: r.id, tenant: r.tenant, group: r.grp, name: r.name, kind: r.kind, owner: r.owner_user, generalRole: r.general_role, createdAt: r.created_at, trashedAt: r.trashed_at, trashedBy: r.trashed_by };
   const rowTeam = r => r && { id: r.id, tenant: r.tenant, name: r.name, createdAt: r.created_at };
   const rowRole = r => r && { id: r.id, tenant: r.tenant, name: r.name, base: r.base, boardRole: r.board_role, permissions: JSON.parse(r.permissions), createdAt: r.created_at };
   const rowSg = r => ({ subject: { type: r.subject_type, id: r.subject }, role: r.role });
@@ -431,7 +472,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
 
   const createBoardTx = db.transaction((tenant, title, memberRole, space, owner, idem, createdAt) => {
     if (!q.tenantExists.get(tenant)) throw new Error("registry: no such tenant");
-    if (q.space.get(space)?.tenant !== tenant) throw new Error("registry: no such space");
+    { const sp = q.space.get(space); if (sp?.tenant !== tenant || sp.trashed_at != null) throw new Error("registry: no such space"); }
     idemEnter(idem, createdAt);
     const id = fresh(mint.board, i => !!q.boardExists.get(i));
     q.insBoard.run(id, tenant, title, memberRole === undefined ? null : memberRole, createdAt);
@@ -445,7 +486,8 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   const moveBoardTx = db.transaction((board, from, to, idem, at) => {
     const b = q.board.get(board);
     if (!b) throw new Error("registry: no such board");
-    if (q.space.get(to)?.tenant !== b.tenant) throw new Error("registry: no such space");
+    { const sp = q.space.get(to); if (sp?.tenant !== b.tenant || sp.trashed_at != null) throw new Error("registry: no such space"); }
+    if (b.trashed_at != null) throw new RegistryError("in-trash", "the board is in Trash");
     idemEnter(idem, at);
     const moved = b.space !== to;
     if (moved) {
@@ -454,6 +496,85 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     }
     idemPut(idem, board + (moved ? ":moved" : ":noop"), at);
     return { board: rowBoard(q.board.get(board)), moved };
+  });
+
+  // Trash: each is ONE IMMEDIATE transaction (the key row, the compare-and-set and the marks commit together).
+  const trashBoardTx = db.transaction((board, from, by, idem, at) => {
+    const b = q.board.get(board);
+    if (!b) throw new Error("registry: no such board");
+    idemEnter(idem, at);
+    const trashed = b.trashed_at == null;
+    if (trashed) {
+      if (b.space !== from) throw new RegistryError("moved", "the board is no longer in that Space");
+      q.trashBoard.run(board, at, by);
+    }
+    idemPut(idem, board + (trashed ? ":trashed" : ":noop"), at);
+    return { board: rowBoard(q.board.get(board)), trashed };
+  });
+  const restoreBoardTx = db.transaction((board, idem, into, at) => {
+    const b = q.board.get(board);
+    if (!b) throw new Error("registry: no such board");
+    idemEnter(idem, at);
+    const restored = b.trashed_at != null;
+    if (restored) {
+      if (b.purging) throw new RegistryError("purged", "the board is being deleted for good");
+      if (b.trashed_with != null) throw new RegistryError("with-space", "the board went to Trash with its Space: restore the Space");
+      if (q.space.get(b.space)?.trashed_at != null) {
+        // The Space is in Trash: a destination chosen by the caller (PROTOCOL.md § Trash and restore) takes the board; without one the restore is refused.
+        if (into == null) throw new RegistryError("space-in-trash", "the board's Space is in Trash: restore the Space first");
+        const sp = q.space.get(into);
+        if (sp?.tenant !== b.tenant || sp.trashed_at != null) throw new Error("registry: no such space");
+        q.putBoardSpace.run(board, into);
+      }
+      q.restoreBoard.run(board);
+    }
+    idemPut(idem, board + (restored ? ":restored" : ":noop"), at);
+    return { board: rowBoard(q.board.get(board)), restored };
+  });
+  const trashSpaceTx = db.transaction((space, by, idem, at) => {
+    const s = q.space.get(space);
+    if (!s) throw new Error("registry: no such space");
+    if (s.kind === "personal") throw new RegistryError("personal", "a personal space is never trashed");
+    idemEnter(idem, at);
+    const trashed = s.trashed_at == null;
+    let boards = 0;
+    if (trashed) { q.trashSpace.run(space, at, by); boards = q.trashSpaceBoards.run(space, at, by).changes; }
+    idemPut(idem, space + (trashed ? ":trashed:" + boards : ":noop"), at);
+    return { space: rowSpace(q.space.get(space)), trashed, boards };
+  });
+  const restoreSpaceTx = db.transaction((space, idem, at) => {
+    const s = q.space.get(space);
+    if (!s) throw new Error("registry: no such space");
+    idemEnter(idem, at);
+    const restored = s.trashed_at != null;
+    let boards = 0;
+    if (restored) {
+      if (s.purging || q.spaceBoardsClaimed.get(space)) throw new RegistryError("purged", "the Space is being deleted for good");
+      q.restoreSpace.run(space); boards = q.restoreSpaceBoards.run(space).changes;
+    }
+    idemPut(idem, space + (restored ? ":restored:" + boards : ":noop"), at);
+    return { space: rowSpace(q.space.get(space)), restored, boards };
+  });
+  const claimTx = db.transaction((type, id, before) => {
+    if (type === "board") return q.claimBoard.run(id, before).changes > 0;
+    if (q.claimSpace.run(id, before).changes === 0) return false;
+    q.claimSpaceBoards.run(id);
+    return true;
+  });
+  const purgeBoardTx = db.transaction(board => {
+    const b = q.board.get(board);
+    if (!b) return true;
+    if (!b.purging || b.trashed_at == null) return false;
+    q.purgeGrants.run(board); q.purgeScoped.run("board", board); q.purgeInvites.run(board); q.purgeUses.run(board); q.purgeLinks.run(board);
+    q.purgeRecents.run(board); q.purgeStars.run(board); q.purgeAsks.run("board", board); q.purgeBoardSpace.run(board); q.purgeBoardRow.run(board);
+    return true;
+  });
+  const purgeSpaceTx = db.transaction(space => {
+    const s = q.space.get(space);
+    if (!s) return true;
+    if (!s.purging || q.spaceHasBoards.get(space)) return false;
+    q.purgeScoped.run("space", space); q.purgeAsks.run("space", space); q.purgeSpaceRow.run(space);
+    return true;
   });
 
   // The last-owner check and the write share one IMMEDIATE transaction (the write lock is held from the first read).
@@ -487,6 +608,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   const addUseTx = db.transaction((link, user) => {
     const l = q.link.get(link);
     if (!l) throw new Error("registry: no such link");
+    if (q.board.get(l.board)?.trashed_at != null) throw new RegistryError("in-trash", "the board is in Trash");   // atomic with the use: no read for the caller, no race with a trash
     q.insUse.run(l.board, user, link, q.useN.get(l.board, user).n);
   });
 
@@ -658,6 +780,57 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       return moveBoardTx.immediate(board, from, to, idemOf(idem), now());
     },
 
+    async trashBoard({ board, from, by, idem }) {
+      ready();
+      if (!str(board)) throw new Error("registry: no such board");
+      if (!str(from) || !from) throw new Error("registry: no such space");
+      if (!str(by) || !by) throw new Error("registry: bad user");
+      return trashBoardTx.immediate(board, from, by, idemOf(idem), now());
+    },
+    async restoreBoard({ board, idem, into = null }) {
+      ready();
+      if (!str(board) || (into != null && !str(into))) throw new Error("registry: no such board");
+      return restoreBoardTx.immediate(board, idemOf(idem), into, now());
+    },
+    async trashSpace({ space, by, idem }) {
+      ready();
+      if (!str(space)) throw new Error("registry: no such space");
+      if (!str(by) || !by) throw new Error("registry: bad user");
+      return trashSpaceTx.immediate(space, by, idemOf(idem), now());
+    },
+    async restoreSpace({ space, idem }) {
+      ready();
+      if (!str(space)) throw new Error("registry: no such space");
+      return restoreSpaceTx.immediate(space, idemOf(idem), now());
+    },
+    async trashedBoards(tenant, { after = null, limit } = {}) {
+      ready();
+      const cur = orgDefaults.cursor(after, "id"), n = smallLimit(limit, TRASH.page.default, TRASH.page.max);
+      const rows = str(tenant) ? q.trashedBoards.all(tenant, cur, n + 1).map(rowBoard) : [];
+      return { boards: rows.slice(0, n), next: rows.length > n ? rows[n - 1].id : null };
+    },
+    async trashedSpaces(tenant, { after = null, limit } = {}) {
+      ready();
+      const cur = orgDefaults.cursor(after, "id"), n = smallLimit(limit, TRASH.page.default, TRASH.page.max);
+      const rows = str(tenant) ? q.trashedSpaces.all(tenant, cur, n + 1, TRASH.sizeCap + 1).map(r => ({ ...rowSpace(r), boards: r.boards })) : [];
+      return { spaces: rows.slice(0, n), next: rows.length > n ? rows[n - 1].id : null };
+    },
+    async trashDue({ before, limit, claimed, after } = {}) {
+      ready();
+      if (!Number.isFinite(before)) throw new Error("registry: bad time");
+      const n = smallLimit(limit, TRASH.due.default, TRASH.due.max);
+      if (claimed === false) return { boards: q.unclaimedBoards.all(before, n).map(rowBoard), spaces: q.unclaimedSpaces.all(before, n).map(rowSpace) };
+      if (claimed === true) return { boards: q.claimedBoards.all(n, after?.board ?? null).map(rowBoard), spaces: q.claimedSpaces.all(n, after?.space ?? null).map(rowSpace) };
+      return { boards: q.dueBoards.all(before, n).map(rowBoard), spaces: q.dueSpaces.all(before, n).map(rowSpace) };
+    },
+    async purgeClaim({ type, id, before }) {
+      ready();
+      if ((type !== "board" && type !== "space") || !Number.isFinite(before) || !str(id)) throw new Error("registry: bad purge");
+      return claimTx.immediate(type, id, before);
+    },
+    async purgeBoard(board) { ready(); return str(board) ? purgeBoardTx.immediate(board) : true; },
+    async purgeSpace(space) { ready(); return str(space) ? purgeSpaceTx.immediate(space) : true; },
+
     async setGrant(board, user, role) {
       ready();
       if (!str(board)) throw new Error("registry: no such board");
@@ -751,6 +924,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       if (up.run(id, v.name !== undefined ? 1 : 0, v.name ?? null, v.generalRole !== undefined ? 1 : 0, v.generalRole ?? null).changes === 0) throw new Error(`registry: no such ${type}`);
       return row(get.get(id));
     },
+    async personalSpace(tenant, user) { ready(); return str(tenant) ? rowSpace(q.personal.get(tenant, String(user))) ?? null : null; },
     async ensurePersonalSpace(tenant, user) {
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");
@@ -990,11 +1164,11 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       }
       return out;
     },
-    async boardsIn(scope, { after = null, limit } = {}) {
+    async boardsIn(scope, { after = null, limit, withTrashed = false } = {}) {
       ready();
       const { type, id } = orgDefaults.scope(scope), n = pageLimit(limit), cur = orgDefaults.cursor(after, "id");
       const q1 = type === "unit" ? q.boardsInUnit : type === "group" ? q.boardsInGroup : type === "space" ? q.boardsInSpace : null;
-      const ids = q1 ? q1.all(id, cur, n + 1).map(r => r.id) : [];
+      const ids = q1 ? q1.all(id, cur, n + 1, withTrashed ? 1 : 0).map(r => r.id) : [];
       return { ids: ids.slice(0, n), next: ids.length > n ? ids[n - 1] : null };
     },
     async scopesOf(subject, { after = null, limit } = {}) {

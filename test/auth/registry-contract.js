@@ -1413,6 +1413,353 @@ export function registryContract(name, makeRegistry, opts = {}) {
       });
     });
 
+    // ---- Trash (PROTOCOL.md § Trash and restore): atomic trash, restore and purge with compare-and-set and idempotency keys ----
+    describe("trash", () => {
+      const U = "dev:ada", DAY = 24 * 3600_000;
+      const mk = async () => {
+        const t = await r.createTenant({ domain: "acme.com" });
+        const g = await r.createGroup({ tenant: t.id, name: "G" });
+        const a = await r.createSpace({ tenant: t.id, name: "A", group: g.id, owner: U }), b = await r.createSpace({ tenant: t.id, name: "B", owner: U });
+        const b1 = await r.createBoard({ tenant: t.id, title: "one", space: a.id, owner: U }), b2 = await r.createBoard({ tenant: t.id, title: "two", space: a.id, owner: U });
+        return { t, g, a, b, b1, b2 };
+      };
+      const idemOf = (key = "key-trash-0001") => ({ user: U, key, fp: "f".repeat(64) });
+      test("trashBoard marks the board (who, when), compare-and-sets on `from`, and a second call is a no-op", async () => {
+        const { a, b, b1 } = await mk();
+        clock.t += 5;
+        const out = await r.trashBoard({ board: b1.id, from: a.id, by: U });
+        expect(out).toMatchObject({ trashed: true, board: { id: b1.id, space: a.id, trashedAt: clock.t, trashedBy: U, trashedWith: null } });
+        expect(await r.board(b1.id)).toMatchObject({ trashedAt: clock.t, trashedBy: U });
+        clock.t += 5;
+        expect(await r.trashBoard({ board: b1.id, from: a.id, by: "dev:bo" })).toMatchObject({ trashed: false, board: { trashedAt: clock.t - 5, trashedBy: U } });   // the first clock and person stay
+        const b2 = await r.createBoard({ tenant: (await r.board(b1.id)).tenant, space: a.id, owner: U });
+        await expect(r.trashBoard({ board: b2.id, from: b.id, by: U })).rejects.toMatchObject({ code: "moved" });   // not in `from`
+        expect((await r.board(b2.id)).trashedAt).toBe(null);
+      });
+      test("input errors: unknown board, a missing `from` or `by`", async () => {
+        const { a, b1 } = await mk();
+        await expect(r.trashBoard({ board: "b-nope0000000000", from: a.id, by: U })).rejects.toThrow(/no such board/);
+        await expect(r.trashBoard({ board: b1.id, by: U })).rejects.toThrow(/no such space/);
+        await expect(r.trashBoard({ board: b1.id, from: a.id })).rejects.toThrow(/bad user/);
+        expect((await r.board(b1.id)).trashedAt).toBe(null);
+      });
+      test("a trashed board keeps its grants, invites, links and link uses, and comes back whole", async () => {
+        const { a, b1 } = await mk();
+        await r.setGrant(b1.id, "dev:bo", "editor");
+        const inv = await r.createInvite({ board: b1.id, email: "x@y.com", role: "viewer", by: U });
+        const lk = await r.createLink({ board: b1.id, role: "viewer", by: U });
+        await r.addLinkUse(lk.id, "dev:cy");
+        await r.trashBoard({ board: b1.id, from: a.id, by: U });
+        expect(await sorted(b1.id)).toEqual([{ user: "dev:ada", role: "owner" }, { user: "dev:bo", role: "editor" }]);
+        expect((await r.invites(b1.id)).map(i => i.id)).toEqual([inv.id]);
+        expect(await r.linkUses(b1.id, "dev:cy")).toEqual([lk.id]);
+        expect(await r.restoreBoard({ board: b1.id })).toMatchObject({ restored: true, board: { trashedAt: null, trashedBy: null, trashedWith: null, space: a.id } });
+        expect(await sorted(b1.id)).toHaveLength(2); expect((await r.invites(b1.id))[0].revoked).toBe(false); expect(await r.linkUses(b1.id, "dev:cy")).toEqual([lk.id]);
+        expect((await r.restoreBoard({ board: b1.id })).restored).toBe(false);   // not in Trash: a no-op
+      });
+      test("the access context carries the trash fields, and the lists leave a trashed board out (boardsIn, searchBoards, sharedBoards) unless asked", async () => {
+        const { t, g, a, b1, b2 } = await mk();
+        await r.setGrant(b1.id, "dev:bo", "viewer"); await r.setGrant(b2.id, "dev:bo", "viewer");
+        await r.trashBoard({ board: b1.id, from: a.id, by: U });
+        const ctx = await r.accessContext({ type: "board", id: b1.id });
+        expect(ctx.board).toMatchObject({ trashedAt: clock.t, trashedBy: U });
+        expect((await r.boardsIn({ type: "space", id: a.id })).ids).toEqual([b2.id]);
+        expect((await r.boardsIn({ type: "group", id: g.id })).ids).toEqual([b2.id]);
+        expect((await r.boardsIn({ type: "unit", id: t.id })).ids).toEqual([b2.id]);
+        expect((await r.boardsIn({ type: "space", id: a.id }, { withTrashed: true })).ids.sort()).toEqual([b1.id, b2.id].sort());
+        expect((await r.boardsIn({ type: "unit", id: t.id }, { withTrashed: true })).ids).toHaveLength(2);
+        expect((await r.searchBoards(t.id, { q: "one" })).ids).toEqual([]);
+        expect((await r.searchBoards(t.id, { q: "two" })).ids).toEqual([b2.id]);
+        expect(await r.sharedBoards("dev:bo", null)).toEqual([b2.id]);
+      });
+      test("addLinkUse of a board in Trash rejects code in-trash and records nothing; after Restore it records", async () => {
+        const { a, b1 } = await mk();
+        const lk = await r.createLink({ board: b1.id, role: "viewer", by: U });
+        await r.trashBoard({ board: b1.id, from: a.id, by: U });
+        await expect(r.addLinkUse(lk.id, "dev:cy")).rejects.toMatchObject({ code: "in-trash" });
+        expect(await r.linkUses(b1.id, "dev:cy")).toEqual([]);
+        await r.restoreBoard({ board: b1.id });
+        await r.addLinkUse(lk.id, "dev:cy");
+        expect(await r.linkUses(b1.id, "dev:cy")).toEqual([lk.id]);
+      });
+      test("a board cannot be created in, or moved into, a Space in Trash, and a trashed board cannot be moved", async () => {
+        const { t, a, b, b1 } = await mk();
+        await r.trashSpace({ space: b.id, by: U });
+        await expect(r.createBoard({ tenant: t.id, space: b.id, owner: U })).rejects.toThrow(/no such space/);
+        await expect(r.moveBoard({ board: b1.id, from: a.id, to: b.id })).rejects.toThrow(/no such space/);
+        await r.trashBoard({ board: b1.id, from: a.id, by: U });
+        const c = await r.createSpace({ tenant: t.id, name: "C", owner: U });
+        await expect(r.moveBoard({ board: b1.id, from: a.id, to: c.id })).rejects.toMatchObject({ code: "in-trash" });
+      });
+      test("trashSpace takes every live board with it, with one clock; a board already in Trash keeps its own", async () => {
+        const { t, g, a, b1, b2 } = await mk();
+        const lone = await r.createBoard({ tenant: t.id, title: "three", space: a.id, owner: U });
+        clock.t += DAY;
+        await r.trashBoard({ board: b2.id, from: a.id, by: "dev:bo" });
+        const own = clock.t;
+        clock.t += DAY;
+        const out = await r.trashSpace({ space: a.id, by: U });
+        expect(out).toMatchObject({ trashed: true, boards: 2, space: { id: a.id, trashedAt: clock.t, trashedBy: U } });
+        expect(await r.board(b1.id)).toMatchObject({ trashedAt: clock.t, trashedBy: U, trashedWith: a.id });
+        expect(await r.board(lone.id)).toMatchObject({ trashedAt: clock.t, trashedWith: a.id });
+        expect(await r.board(b2.id)).toMatchObject({ trashedAt: own, trashedBy: "dev:bo", trashedWith: null });
+        expect((await r.space(a.id)).trashedAt).toBe(clock.t);
+        expect((await r.spaces(t.id)).map(s => s.id)).not.toContain(a.id);
+        expect((await r.spacesIn(g.id)).spaces).toEqual([]);
+        expect((await r.spaceCandidates(t.id, { user: U, all: true })).spaces.map(s => s.id)).not.toContain(a.id);
+        expect((await r.trashSpace({ space: a.id, by: "dev:bo" }))).toMatchObject({ trashed: false, boards: 0, space: { trashedBy: U } });
+      });
+      test("restoreSpace brings back the Space and exactly the boards that went with it; a board trashed on its own stays", async () => {
+        const { a, b1, b2 } = await mk();
+        await r.trashBoard({ board: b2.id, from: a.id, by: U });
+        await r.trashSpace({ space: a.id, by: U });
+        expect(await r.restoreSpace({ space: a.id })).toMatchObject({ restored: true, boards: 1, space: { trashedAt: null, trashedBy: null } });
+        expect(await r.board(b1.id)).toMatchObject({ trashedAt: null, trashedWith: null });
+        expect((await r.board(b2.id)).trashedAt).not.toBe(null);
+        expect((await r.restoreSpace({ space: a.id })).restored).toBe(false);
+      });
+      test("restoreBoard refuses a board that went with its Space (with-space) and a board whose own Space is in Trash (space-in-trash)", async () => {
+        const { a, b1, b2 } = await mk();
+        await r.trashBoard({ board: b2.id, from: a.id, by: U });
+        await r.trashSpace({ space: a.id, by: U });
+        await expect(r.restoreBoard({ board: b1.id })).rejects.toMatchObject({ code: "with-space" });
+        await expect(r.restoreBoard({ board: b2.id })).rejects.toMatchObject({ code: "space-in-trash" });
+        expect((await r.board(b1.id)).trashedAt).not.toBe(null);
+        await r.restoreSpace({ space: a.id });
+        expect((await r.restoreBoard({ board: b2.id })).restored).toBe(true);
+      });
+      test("a personal Space is never trashed (code personal); unknown Space rejects", async () => {
+        const { t } = await mk();
+        const p = await r.ensurePersonalSpace(t.id, U);
+        await expect(r.trashSpace({ space: p.id, by: U })).rejects.toMatchObject({ code: "personal" });
+        await expect(r.trashSpace({ space: "s-nope00000000", by: U })).rejects.toThrow(/no such space/);
+        await expect(r.restoreSpace({ space: "s-nope00000000" })).rejects.toThrow(/no such space/);
+        expect((await r.space(p.id)).trashedAt).toBe(null);
+      });
+      test("keys: the key row is written in the same step, a replay answers the first result, another request is a mismatch", async () => {
+        const { a, b, b1 } = await mk();
+        const idem = idemOf();
+        await r.trashBoard({ board: b1.id, from: a.id, by: U, idem });
+        await r.restoreBoard({ board: b1.id });
+        await expect(r.trashBoard({ board: b1.id, from: a.id, by: U, idem })).rejects.toMatchObject({ code: "idem-replay", ref: `${b1.id}:trashed` });
+        expect((await r.board(b1.id)).trashedAt).toBe(null);   // the replay changed nothing
+        await expect(r.trashBoard({ board: b1.id, from: b.id, by: U, idem: { ...idem, fp: "b".repeat(64) } })).rejects.toMatchObject({ code: "idem-mismatch" });
+        const k2 = idemOf("key-trash-0002");
+        await r.trashBoard({ board: b1.id, from: a.id, by: U, idem: k2 });
+        await r.restoreBoard({ board: b1.id, idem: k2 }).then(() => { throw new Error("same key, other call"); }, e => expect(e.code).toMatch(/idem-/));
+        const k3 = idemOf("key-trash-0003");
+        expect((await r.restoreBoard({ board: b1.id, idem: k3 })).restored).toBe(true);
+        await expect(r.restoreBoard({ board: b1.id, idem: k3 })).rejects.toMatchObject({ code: "idem-replay", ref: `${b1.id}:restored` });
+      });
+      test("a refused trash (moved) writes no key row: the same key works for the right request afterwards", async () => {
+        const { a, b, b1 } = await mk();
+        const idem = idemOf("key-trash-0004");
+        await expect(r.trashBoard({ board: b1.id, from: b.id, by: U, idem })).rejects.toMatchObject({ code: "moved" });
+        expect(await r.idemGet(idem)).toEqual({ state: "none" });
+        expect((await r.trashBoard({ board: b1.id, from: a.id, by: U, idem })).trashed).toBe(true);
+      });
+      test("space keys: trashSpace and restoreSpace replay with their own refs", async () => {
+        const { a } = await mk();
+        const k1 = idemOf("key-trash-0005"), k2 = idemOf("key-trash-0006");
+        await r.trashSpace({ space: a.id, by: U, idem: k1 });
+        await expect(r.trashSpace({ space: a.id, by: U, idem: k1 })).rejects.toMatchObject({ code: "idem-replay", ref: expect.stringMatching(new RegExp(`^${a.id}:trashed:\\d+$`)) });
+        await r.restoreSpace({ space: a.id, idem: k2 });
+        await expect(r.restoreSpace({ space: a.id, idem: k2 })).rejects.toMatchObject({ code: "idem-replay", ref: expect.stringMatching(new RegExp(`^${a.id}:restored:\\d+$`)) });
+      });
+      test("concurrent trash and restore of one board: the board ends in one consistent state, each caller gets success or a coded refusal", async () => {
+        const { a, b1 } = await mk();
+        await r.trashBoard({ board: b1.id, from: a.id, by: U });
+        const out = await Promise.allSettled([r.restoreBoard({ board: b1.id }), r.restoreBoard({ board: b1.id }), r.trashBoard({ board: b1.id, from: a.id, by: U })]);
+        for (const o of out) if (o.status === "rejected") throw o.reason;   // none of the three can fail: restore of a restored board and trash of a trashed one are no-ops
+        const row = await r.board(b1.id);
+        expect(row.trashedAt === null ? row.trashedBy === null : row.trashedBy === U).toBe(true);
+      });
+      test("trashedBoards / trashedSpaces list the Unit's Trash by id, pages, and leave out boards that went with a Space", async () => {
+        const { t, a, b, b1, b2 } = await mk();
+        const other = await r.createTenant({ domain: "other.com" });
+        const os = await r.createSpace({ tenant: other.id, name: "O", owner: "dev:z" });
+        const ob = await r.createBoard({ tenant: other.id, space: os.id, owner: "dev:z" });
+        await r.trashBoard({ board: ob.id, from: os.id, by: "dev:z" });
+        await r.trashBoard({ board: b1.id, from: a.id, by: U });
+        await r.trashSpace({ space: b.id, by: U });
+        const x = await r.createBoard({ tenant: t.id, space: b.id, owner: U }).catch(() => null);   // refused: the Space is in Trash
+        expect(x).toBe(null);
+        expect((await r.trashedBoards(t.id)).boards.map(x => x.id)).toEqual([b1.id]);
+        const withSpace = await r.createSpace({ tenant: t.id, name: "W", owner: U });
+        const w = await r.createBoard({ tenant: t.id, space: withSpace.id, owner: U });
+        await r.trashSpace({ space: withSpace.id, by: U });
+        expect((await r.trashedBoards(t.id)).boards.map(x => x.id)).toEqual([b1.id]);   // w went with its Space: not listed
+        const sp = (await r.trashedSpaces(t.id)).spaces;
+        expect(sp.map(s => s.id).sort()).toEqual([b.id, withSpace.id].sort());
+        expect(sp.find(s => s.id === withSpace.id)).toMatchObject({ boards: 1, trashedBy: U });
+        expect(w.id).toBeTruthy();
+        await r.trashBoard({ board: b2.id, from: a.id, by: U });
+        const p1 = await r.trashedBoards(t.id, { limit: 1 });
+        expect(p1.boards).toHaveLength(1); expect(p1.next).toBe(p1.boards[0].id);
+        const p2 = await r.trashedBoards(t.id, { limit: 1, after: p1.next });
+        expect([p1.boards[0].id, p2.boards[0].id].sort()).toEqual([b1.id, b2.id].sort()); expect(p2.next).toBe(null);
+        await expect(r.trashedBoards(t.id, { after: "bad\ncursor" })).rejects.toThrow(/bad cursor/);
+        expect((await r.trashedBoards(other.id)).boards.map(x => x.id)).toEqual([ob.id]);
+      });
+      test("trashDue lists what has been in Trash since `before` or earlier, oldest first, bounded; claimed rows always", async () => {
+        const { a, b, b1, b2 } = await mk();
+        await r.trashBoard({ board: b1.id, from: a.id, by: U });
+        clock.t += DAY;
+        await r.trashBoard({ board: b2.id, from: a.id, by: U });
+        clock.t += DAY;
+        await r.trashSpace({ space: b.id, by: U });
+        expect((await r.trashDue({ before: T0 - 1 })).boards).toEqual([]);
+        expect((await r.trashDue({ before: T0 })).boards.map(x => x.id)).toEqual([b1.id]);
+        const all = await r.trashDue({ before: clock.t });
+        expect(all.boards.map(x => x.id)).toEqual([b1.id, b2.id]); expect(all.spaces.map(x => x.id)).toEqual([b.id]);
+        expect((await r.trashDue({ before: clock.t, limit: 1 })).boards).toHaveLength(1);
+        await expect(r.trashDue({ before: "x" })).rejects.toThrow(/bad time/);
+        expect(await r.purgeClaim({ type: "board", id: b2.id, before: T0 })).toBe(false);   // not due yet
+        expect(await r.purgeClaim({ type: "board", id: b2.id, before: T0 + DAY })).toBe(true);
+        expect((await r.trashDue({ before: T0 })).boards.map(x => x.id).sort()).toEqual([b1.id, b2.id].sort());   // claimed: listed whatever `before` says
+      });
+      test("purgeClaim: only a board in Trash and past its time, idempotent; from then on restore is refused (purged) and the Trash list drops it", async () => {
+        const { t, a, b1, b2 } = await mk();
+        expect(await r.purgeClaim({ type: "board", id: b1.id, before: clock.t + DAY })).toBe(false);   // live
+        expect(await r.purgeClaim({ type: "board", id: "b-nope0000000000", before: clock.t + DAY })).toBe(false);
+        await r.trashBoard({ board: b1.id, from: a.id, by: U });
+        expect(await r.purgeClaim({ type: "board", id: b1.id, before: clock.t - 1 })).toBe(false);
+        expect(await r.purgeClaim({ type: "board", id: b1.id, before: clock.t })).toBe(true);
+        expect(await r.purgeClaim({ type: "board", id: b1.id, before: 0 })).toBe(true);   // already claimed: stays true
+        await expect(r.restoreBoard({ board: b1.id })).rejects.toMatchObject({ code: "purged" });
+        expect((await r.trashedBoards(t.id)).boards).toEqual([]);
+        expect((await r.board(b1.id)).trashedAt).not.toBe(null);
+        await expect(r.purgeClaim({ type: "group", id: b2.id, before: 1 })).rejects.toThrow(/bad purge/);
+      });
+      test("purgeBoard deletes a CLAIMED board's rows only, is idempotent, and a partial purge resumes", async () => {
+        const { t, a, b1, b2 } = await mk();
+        await r.setGrant(b1.id, "dev:bo", "editor");
+        await r.createInvite({ board: b1.id, email: "x@y.com", role: "viewer", by: U });
+        const lk = await r.createLink({ board: b1.id, role: "viewer", by: U });
+        await r.addLinkUse(lk.id, "dev:cy");
+        await r.markOpened("dev:bo", b1.id); await r.setStarred("dev:bo", b1.id, true);
+        await r.setScopedGrant({ scope: { type: "board", id: b1.id }, subject: { type: "team", id: (await r.createTeam({ tenant: t.id, name: "tm" })).id }, role: "viewer" });
+        await r.trashBoard({ board: b1.id, from: a.id, by: U });
+        expect(await r.purgeBoard(b1.id)).toBe(false);          // not claimed: nothing happens
+        expect(await r.board(b1.id)).not.toBe(null); expect(await r.grants(b1.id)).toHaveLength(2);
+        await r.purgeClaim({ type: "board", id: b1.id, before: clock.t });
+        expect(await r.purgeBoard(b1.id)).toBe(true);
+        expect(await r.board(b1.id)).toBe(null);
+        expect(await r.grants(b1.id)).toEqual([]); expect(await r.invites(b1.id)).toEqual([]); expect(await r.links(b1.id)).toEqual([]);
+        expect(await r.link(lk.id)).toBe(null); expect(await r.linkUses(b1.id, "dev:cy")).toEqual([]);
+        expect(await r.recents("dev:bo")).toEqual([]); expect(await r.starred("dev:bo")).toEqual([]);
+        expect(await r.accessContext({ type: "board", id: b1.id })).toBe(null);
+        expect(await r.purgeBoard(b1.id)).toBe(true);           // gone already: done
+        expect((await r.boardsIn({ type: "space", id: a.id }, { withTrashed: true })).ids).toEqual([b2.id]);   // the neighbour is untouched
+        expect(await r.grants(b2.id)).toHaveLength(1);
+      });
+      test("purgeClaim of a Space claims the boards that went with it; purgeSpace waits for them, then removes the Space and its grants", async () => {
+        const { t, a, b, b1, b2 } = await mk();
+        await r.trashBoard({ board: b2.id, from: a.id, by: U });
+        clock.t += DAY;
+        await r.trashSpace({ space: a.id, by: U });
+        await r.createInvite({ board: b1.id, email: "q@y.com", role: "viewer", by: U });
+        expect(await r.purgeSpace(a.id)).toBe(false);                 // not claimed
+        expect(await r.purgeClaim({ type: "space", id: a.id, before: clock.t })).toBe(true);
+        expect((await r.trashDue({ before: 0 })).boards.map(x => x.id)).toEqual([b1.id]);   // b1 went with the Space: claimed with it; b2 (own clock, not due at `before`) is not
+        expect(await r.purgeSpace(a.id)).toBe(false);                 // boards still reference it
+        expect(await r.purgeBoard(b1.id)).toBe(true);
+        expect(await r.purgeSpace(a.id)).toBe(false);                 // b2 is still there
+        await r.purgeClaim({ type: "board", id: b2.id, before: clock.t });
+        expect(await r.purgeBoard(b2.id)).toBe(true);
+        expect(await r.purgeSpace(a.id)).toBe(true);
+        expect(await r.space(a.id)).toBe(null);
+        expect(await r.accessContext({ type: "space", id: a.id })).toBe(null);
+        expect(await r.purgeSpace(a.id)).toBe(true);
+        expect((await r.space(b.id)).id).toBe(b.id);                  // another Space untouched
+        expect((await r.spaces(t.id)).map(s => s.id)).toContain(b.id);
+      });
+      test("a claimed Space cannot be restored (purged)", async () => {
+        const { a } = await mk();
+        await r.trashSpace({ space: a.id, by: U });
+        await r.purgeClaim({ type: "space", id: a.id, before: clock.t });
+        await expect(r.restoreSpace({ space: a.id })).rejects.toMatchObject({ code: "purged" });
+      });
+      test("a board that went to Trash with its Space is claimed ONLY with its Space; a restored Space's boards are never deleted (reviewer P1)", async () => {
+        const { a, b1, b2 } = await mk();
+        await r.trashSpace({ space: a.id, by: U });
+        clock.t += 31 * DAY;
+        expect(await r.purgeClaim({ type: "board", id: b1.id, before: clock.t })).toBe(false);   // alone: refused
+        expect((await r.trashDue({ before: clock.t, claimed: false })).boards).toEqual([]);      // not offered as unclaimed work either
+        expect((await r.restoreSpace({ space: a.id })).boards).toBe(2);
+        expect(await r.purgeBoard(b1.id)).toBe(false);                                           // never claimed, and live
+        expect(await r.board(b1.id)).toMatchObject({ trashedAt: null });
+        expect(await r.board(b2.id)).not.toBe(null);
+      });
+      test("a Space claim claims its boards together; restoreSpace is then refused (purged) and no board loses its claim half-way; purgeBoard also needs the board in Trash", async () => {
+        const { a, b1, b2 } = await mk();
+        await r.trashSpace({ space: a.id, by: U });
+        expect(await r.purgeClaim({ type: "space", id: a.id, before: clock.t })).toBe(true);
+        expect(await r.purgeClaim({ type: "board", id: b1.id, before: clock.t })).toBe(true);    // already claimed by its Space: idempotent
+        await expect(r.restoreSpace({ space: a.id })).rejects.toMatchObject({ code: "purged" });
+        await expect(r.restoreBoard({ board: b1.id })).rejects.toMatchObject({ code: "purged" });
+        expect(await r.purgeBoard(b1.id)).toBe(true);
+        expect(await r.board(b1.id)).toBe(null); expect(await r.board(b2.id)).not.toBe(null);
+        expect(await r.purgeBoard("b-nope000000000")).toBe(true);
+      });
+      test("every restore path clears the purge claim: a restored board is not due and is trashable again with a fresh clock", async () => {
+        const { a, b1 } = await mk();
+        await r.trashBoard({ board: b1.id, from: a.id, by: U });
+        await r.restoreBoard({ board: b1.id });
+        clock.t += 31 * DAY;
+        await r.trashBoard({ board: b1.id, from: a.id, by: U });
+        expect((await r.trashDue({ before: clock.t - DAY })).boards).toEqual([]);                // trashed just now: not due, not claimed
+        expect(await r.purgeClaim({ type: "board", id: b1.id, before: clock.t - DAY })).toBe(false);
+        expect((await r.restoreBoard({ board: b1.id })).restored).toBe(true);
+      });
+      test("restoreBoard into: a board whose own Space is in Trash moves into the given live Space of the Unit as it is restored; a trashed or foreign Space is refused", async () => {
+        const { t, a, b, b1 } = await mk();
+        await r.trashBoard({ board: b1.id, from: a.id, by: U });
+        await r.trashSpace({ space: a.id, by: U });
+        const other = await r.createTenant({ domain: "globex.com" });
+        const foreign = await r.createSpace({ tenant: other.id, name: "F", owner: U });
+        await expect(r.restoreBoard({ board: b1.id, into: foreign.id })).rejects.toThrow(/no such space/);
+        await expect(r.restoreBoard({ board: b1.id, into: a.id })).rejects.toThrow(/no such space/);
+        await expect(r.restoreBoard({ board: b1.id })).rejects.toMatchObject({ code: "space-in-trash" });
+        expect(await r.restoreBoard({ board: b1.id, into: b.id })).toMatchObject({ restored: true, board: { id: b1.id, space: b.id, trashedAt: null } });
+        expect((await r.boardsIn({ type: "space", id: b.id })).ids).toEqual([b1.id]);
+        expect(t.id).toBe((await r.board(b1.id)).tenant);
+      });
+      test("trashDue claimed:false lists due unclaimed own-clock rows; claimed:true pages the claimed rows by id after a cursor", async () => {
+        const { t, a, b, b1, b2 } = await mk();
+        const c1 = await r.createBoard({ tenant: t.id, title: "three", space: b.id, owner: U });
+        await r.trashBoard({ board: c1.id, from: b.id, by: U });
+        await r.trashSpace({ space: a.id, by: U });
+        clock.t += 31 * DAY;
+        const un = await r.trashDue({ before: clock.t, claimed: false });
+        expect([un.boards.map(x => x.id), un.spaces.map(x => x.id)]).toEqual([[c1.id], [a.id]]);   // b1, b2 follow their Space
+        await r.purgeClaim({ type: "space", id: a.id, before: clock.t }); await r.purgeClaim({ type: "board", id: c1.id, before: clock.t });
+        expect(await r.trashDue({ before: clock.t, claimed: false })).toEqual({ boards: [], spaces: [] });
+        const all = (await r.trashDue({ before: clock.t, claimed: true })).boards.map(x => x.id);
+        expect(all.sort()).toEqual([b1.id, b2.id, c1.id].sort());
+        const first = (await r.trashDue({ before: clock.t, claimed: true, limit: 1 })).boards[0].id;
+        const next = (await r.trashDue({ before: clock.t, claimed: true, limit: 1, after: { board: first } })).boards[0].id;
+        expect(next > first).toBe(true);
+        expect((await r.trashDue({ before: clock.t, claimed: true, after: { board: all.sort().at(-1) } })).boards).toEqual([]);
+        expect((await r.trashDue({ before: clock.t, claimed: true })).spaces.map(x => x.id)).toEqual([a.id]);
+      });
+      test("personalSpace is a pure read: null until ensurePersonalSpace creates it, then the same Space", async () => {
+        const { t } = await mk();
+        expect(await r.personalSpace(t.id, "dev:newcomer")).toBe(null);
+        expect(await r.personalSpace(t.id, "dev:newcomer")).toBe(null);          // reading again still creates nothing
+        const made = await r.ensurePersonalSpace(t.id, "dev:newcomer");
+        expect(await r.personalSpace(t.id, "dev:newcomer")).toMatchObject({ id: made.id, kind: "personal", owner: "dev:newcomer" });
+        expect(await r.personalSpace("t-nope00000000", "dev:newcomer")).toBe(null);
+      });
+      test("keyed Space calls store their board count in the ref", async () => {
+        const { a } = await mk();
+        await r.trashSpace({ space: a.id, by: U, idem: idemOf("key-space-tr-1") });
+        expect((await r.idemGet(idemOf("key-space-tr-1"))).ref).toBe(`${a.id}:trashed:2`);
+        await r.restoreSpace({ space: a.id, idem: idemOf("key-space-rs-1") });
+        expect((await r.idemGet(idemOf("key-space-rs-1"))).ref).toBe(`${a.id}:restored:2`);
+      });
+    });
+
     // ---- moveBoard (PROTOCOL.md § Move board): one atomic compare-and-set of the board's Space ----
     describe("moveBoard", () => {
       const U = "dev:ada";

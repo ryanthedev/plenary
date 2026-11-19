@@ -150,7 +150,7 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
       if (scope.type === "board") { await announce(unit.id, scope.id); return; }    // a board scope is that one board (boardsIn lists none for it)
       do {
         if (closing) break;
-        const p = await registry.boardsIn(scope, { after, limit: ANNOUNCE.page });
+        const p = await registry.boardsIn(scope, { after, limit: ANNOUNCE.page, withTrashed: true });   // trashed boards too: a Space going to Trash must reach its open sockets
         for (let i = 0; i < p.ids.length && !closing; i += ANNOUNCE.par) await Promise.all(p.ids.slice(i, i + ANNOUNCE.par).map(async b => { try { await announce(unit.id, b); sent++; } catch (err) { try { log.warn("grants announcement failed", { board: b, err }); } catch {} } }));
         after = p.next;
         if (after != null && ++pages >= ANNOUNCE.pages) { log.warn("grants announcement stopped at its bound; the timed re-check covers the rest", { scope: scope.type, sent }); break; }
@@ -311,7 +311,7 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
       const groupOpens = group ? opens(await tenancy.effective(identity, { type: "group", id: group.id })) : false;
       const list = await home.spaceBoards(identity, sp.id, { can: true });
       const manage = sp.kind !== "personal" && may(a, "members.manage");
-      const can = { createBoard: createsBoards(a), rename: manage, general: manage };
+      const can = { createBoard: createsBoards(a), rename: manage, general: manage, trash: sp.kind !== "personal" && may(a, "delete") };   // `trash`: Move to Trash (PROTOCOL.md § Trash and restore)
       // Why a control is off, from the SAME Access that decided `can` (PROTOCOL.md § Access explanation and requests); only for a caller who cannot create boards here.
       const why = can.createBoard || sp.kind === "personal" ? null : await explainer.explain(identity, { type: "space", row: sp, access: a, unit, manage });
       return { space: spaceView(sp, groupOpens ? group : null), can, ...(why ? { why } : {}), boards: list.results, more: list.more };

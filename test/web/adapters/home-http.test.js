@@ -32,6 +32,12 @@ test("every failure is a value from HOME_ERRORS, never a throw: 401, 403, 5xx, b
   expect(() => httpHome({ token: "t" })).toThrow(TypeError);
 });
 
+test("normalizeHome: can.createGroup is true only for a literal true", () => {
+  expect(normalizeHome(GOOD).can).toEqual({ createGroup: false });
+  expect(normalizeHome({ ...GOOD, can: { createGroup: true } }).can).toEqual({ createGroup: true });
+  expect(normalizeHome({ ...GOOD, can: { createGroup: "yes" } }).can).toEqual({ createGroup: false });
+});
+
 test("normalizeHome drops what the page must not render: bad ids, odd types, oversize lists and strings", () => {
   const n = normalizeHome({ ...GOOD, recent: [{ id: "../x", title: "t" }, null, "s", { id: "ok", title: "x".repeat(500), path: [{ type: "evil", name: "n" }, { type: "group", name: "G" }], starred: "yes" }, ...Array.from({ length: 80 }, (_, i) => ({ id: "c" + i }))] });
   expect(n.recent.length).toBe(47);   // the first 50 entries, minus the 3 bad ones
@@ -60,19 +66,13 @@ test("star: PUT to star, DELETE to unstar, 204 is ok, 403 forbidden; a bad id ma
   expect(seen.length).toBe(3);
 });
 
-test("space: GET /home/search?space=<id>; the Space is named only when the server names it; bad id makes no request", async () => {
-  let url;
-  const r = await home(async u => { url = u; return answer(200, { space: { id: "s-1", name: "Design" }, results: [GOOD.recent[0]], more: false })(); }).space("s-1");
-  expect(url).toBe("/home/search?space=s-1");
-  expect(r).toEqual({ space: { id: "s-1", name: "Design" }, results: [GOOD.recent[0]], more: false });
-  expect((await home(answer(200, { space: null, results: [], more: false })).space("s-1")).space).toBe(null);
-  expect(await home(answer(200, {})).space("s-1")).toEqual({ error: "unavailable" });
-  expect(await home(answer(401, {})).space("s-1")).toEqual({ error: "auth" });
-  expect(await home(answer(200, {})).space("../x")).toEqual({ error: "forbidden" });
-});
-
 test("owned and the 'shared' path part survive normalisation", () => {
   const n = normalizeHome({ ...GOOD, owned: [{ id: "o1", title: "Mine", role: "owner", path: [{ type: "shared", name: "Shared with you" }], starred: false }] });
   expect(n.owned).toEqual([{ id: "o1", title: "Mine", role: "owner", path: [{ type: "shared", name: "Shared with you" }], starred: false }]);
   expect(normalizeHome({ ...GOOD, owned: undefined }).owned).toEqual([]);
+});
+
+test("a card or node with no id is dropped (a missing id is not the id \"undefined\")", () => {
+  const n = normalizeHome({ ...GOOD, recent: [{ title: "no id", role: "viewer", path: [], starred: false }, GOOD.recent[0]] });
+  expect(n.recent.map(c => c.id)).toEqual(["b-1"]);
 });

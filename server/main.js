@@ -87,6 +87,7 @@ import { sessions as makeSessions } from "./auth/session.js";
 import { googleOidc } from "./auth/oidc.js";
 import { httpRoutes } from "./auth/http.js";
 import { homeService, recentRecorder } from "./auth/home.js";
+import { spaceService } from "./auth/spaces.js";
 import { bootstrapTenant } from "./admin/tenants.js";
 import { subjects } from "./bus/port.js";
 import { isClusterId } from "./ids.js";
@@ -442,11 +443,15 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   };
   if (devMenu) config.devSignIn = devMenu;
   const home = homeService({ registry, tenancy });
-  const http = httpRoutes({ registry, sessions, oidc, tenancy, home, now: Date.now, config, log: log.child({ component: "auth" }), ...(dev.enabled ? { dev } : {}) });
+  // A general-access change on a Space or Group tells every board it reaches to re-check roles (PROTOCOL.md § Organization, Freshness).
+  const spaces = spaceService({ registry, tenancy, home, announce: (tenant, board) => bus.publish(subjects.grants(tenant, board), { board }), log: log.child({ component: "spaces" }) });
+  const http = httpRoutes({ registry, sessions, oidc, tenancy, home, spaces, now: Date.now, config, log: log.child({ component: "auth" }), ...(dev.enabled ? { dev } : {}) });
   const server = createServer({ auth, registry, store, bus, blobs, blobKey, ...(env.PUBLIC_URL ? { publicUrl: origin } : {}), ...(quotaRaw ? { quotaBytes: Number(quotaRaw) } : {}), log, limits, http, deflate: zlibDeflate(), onWelcomed: recentRecorder({ registry, log: log.child({ component: "home" }) }), port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
     roles, node, host: { hostname: node, leaseTtlMs } });
   return { server, store, bus, registry, log, devBoard, oidc, node, roles, cluster, clusterId, leaseTtlMs,
-    async stop() { await server.stop(); await bus.close(); await store.close(); await rawRegistry.close(); } };
+    async stop() { await server.stop(); await Promise.race([spaces.settled(), new Promise(r => setTimeout(r, 2000).unref?.())]);   // let grants announcements finish (bounded)
+      spaces.close();                                   // nothing more starts against the buses and stores closed below
+      await bus.close(); await store.close(); await rawRegistry.close(); } };
 }
 
 /**

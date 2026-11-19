@@ -7,6 +7,7 @@ import { localRoom } from "../../web/adapters/transport/local.js";
 import { createSession } from "../../web/core/session.js";
 import { memoryStore } from "../../web/adapters/storage/memory.js";
 import { syncCollabPort } from "../../web/adapters/collab/sync.js";
+import { announced } from "../../web/adapters/dom/focus.js";
 import { mountApp } from "../../web/adapters/dom/app.js";
 import { expiryNotice, shouldProbe, takeReturnBoard, rememberBoard, connectionBanner, RETURN_KEY, EXPIRY_WARN_MS } from "../../web/core/roles.js";
 
@@ -525,6 +526,101 @@ test("V5 style chip with nothing selected (Editor.style only) shows", () => {
   expect(chip().className).toContain("on");
 });
 
+test("focus survives a chrome rebuild: a panel chip keeps focus after it is activated and the panel is redrawn", () => {
+  rig = setup(); const { S, step } = rig;
+  S.act("board", e => e.select([])); step(20);
+  const chip = () => find(page.byId.panel, e => e.attrs?.title === "strokeWidth 4");
+  const before = chip(); before.focus(); before.click(); step(20);
+  expect(chip()).not.toBe(before);                                       // the panel was rebuilt
+  expect(page.doc.activeElement).toBe(chip());                           // and focus is on the new chip, not lost
+});
+
+test("focus follows the control's own key, not its label: pressing Lock on any of three layers keeps focus on THAT layer's Lock", () => {
+  rig = setup(); const { bo, step, app } = rig;
+  app.setPanel({ type: "noop" }); step(20);
+  bo.act("board", e => e.addLayer("Two"), { settings: true }); bo.act("board", e => e.addLayer("Three"), { settings: true }); step(20);
+  const lockBtns = () => page.byId.panel.all().filter(e => e.tagName === "BUTTON" && /^layer:.+:lock$/.test(e.attrs["data-fk"] ?? ""));
+  expect(lockBtns().length).toBe(3);
+  for (const which of [lockBtns().length - 1, 0, 1]) {
+    const target = lockBtns()[which], key = target.attrs["data-fk"], title = target.attrs.title;
+    target.focus(); target.click(); step(20);
+    const now = lockBtns().find(e => e.attrs["data-fk"] === key);
+    expect(now.attrs.title).not.toBe(title);                                // the layer's state flipped (Lock <-> Unlock) and its title changed ...
+    expect(page.doc.activeElement).toBe(now);                               // ... and focus is on that same layer's toggle, not another layer's "Lock"
+  }
+});
+
+test("dialog chips: activating a format chip rebuilds the dialog and focus stays on that same chip", () => {
+  rig = setup(); const { step, app } = rig;
+  app.ui.dialog = "export"; app.setPanel({ type: "noop" }); step(20);
+  const chip = text => find(page.byId.dialogs, e => e.tagName === "BUTTON" && e.textContent === text);
+  const before = chip("2×"); before.focus(); before.click(); step(20);
+  const now = chip("2×");
+  expect(now).not.toBe(before);                                          // rebuilt
+  expect(now.className).toContain("on");
+  expect(page.doc.activeElement).toBe(now);                              // focus on the same chip, not the body and not another chip
+});
+
+test("a layer removed from outside never hands focus to another layer's Lock: focus goes to a neutral layer row", () => {
+  rig = setup(); const { bo, step, app } = rig;
+  app.setPanel({ type: "noop" }); step(20);
+  bo.act("board", e => e.addLayer("Two"), { settings: true }); bo.act("board", e => e.addLayer("Three"), { settings: true }); step(20);
+  const locks = () => page.byId.panel.all().filter(e => e.tagName === "BUTTON" && /^layer:.+:lock$/.test(e.attrs["data-fk"] ?? ""));
+  const mid = locks()[1], midId = mid.attrs["data-fk"].split(":")[1];
+  mid.focus();
+  bo.act("board", e => e.deleteLayer(midId), { settings: true }); step(20);
+  expect(locks().length).toBe(2);
+  const now = page.doc.activeElement;
+  expect(now.attrs["data-fk"]).toMatch(/^layer:[^:]+:row$/);              // a neutral row, not a Lock/Hide toggle
+});
+
+test("notes drawer: notes added from the compose box show in the list while the compose box keeps its focus and its text", () => {
+  rig = setup(); const { step, app } = rig;
+  app.ui.drawer = "notes"; app.setPanel({ type: "noop" }); step(20);
+  const compose = () => find(page.byId.drawer, e => e.tagName === "TEXTAREA");
+  const rows = () => page.byId.drawer.all().filter(e => e.className?.startsWith?.("note-row"));
+  expect(rows().length).toBe(0);
+  expect(page.byId.drawer.textContent).toContain("No notes yet.");
+  const ta = compose(); ta.focus();
+  for (const text of ["first note", "second note"]) {
+    ta.value = text; ta.fire("keydown", { key: "Enter" }); step(20);
+    expect(compose()).toBe(ta);                                         // the compose box itself was never rebuilt
+    expect(page.doc.activeElement).toBe(ta);
+  }
+  expect(rows().length).toBe(2);                                          // the list shows both notes
+  expect(page.byId.drawer.textContent).not.toContain("No notes yet.");
+  ta.value = "half-typed"; step(20);
+  expect(ta.value).toBe("half-typed");
+});
+
+test("layers: the list is role=list, each row a listitem named \"Layer: <name>\"; a layer removed under focus is announced", () => {
+  rig = setup(); const { bo, step, app } = rig;
+  app.setPanel({ type: "noop" }); step(20);
+  bo.act("board", e => e.addLayer("Two"), { settings: true }); bo.act("board", e => e.addLayer("Three"), { settings: true }); step(20);
+  const list = find(page.byId.panel, e => e.attrs?.role === "list");
+  expect(list.attrs["aria-label"]).toBe("Layers");
+  const items = page.byId.panel.all().filter(e => e.attrs?.role === "listitem");
+  expect(items.map(e => e.attrs["aria-label"]).sort()).toEqual(["Layer: Layer 1", "Layer: Three", "Layer: Two"].sort());
+  expect(items.every(e => list.all().includes(e))).toBe(true);
+  const locks = () => page.byId.panel.all().filter(e => e.tagName === "BUTTON" && /^layer:.+:lock$/.test(e.attrs["data-fk"] ?? ""));
+  const mid = locks()[1], midId = mid.attrs["data-fk"].split(":")[1];
+  mid.focus();
+  bo.act("board", e => e.deleteLayer(midId), { settings: true }); step(20);
+  expect(announced()).toMatch(/^That layer is no longer here; moved to the (next|previous) one\.$/);
+});
+
+test("notes drawer: rows are listitems named \"Note: <text>, by <author>\" inside a role=list", () => {
+  rig = setup(); const { step, app } = rig;
+  app.ui.drawer = "notes"; app.setPanel({ type: "noop" }); step(20);
+  const ta = find(page.byId.drawer, e => e.tagName === "TEXTAREA"); ta.focus();
+  ta.value = "alpha note"; ta.fire("keydown", { key: "Enter" }); step(20);
+  const list = find(page.byId.drawer, e => e.attrs?.role === "list");
+  expect(list.attrs["aria-label"]).toBe("Notes");
+  const rows = page.byId.drawer.all().filter(e => e.attrs?.role === "listitem");
+  expect(rows.map(e => e.attrs["aria-label"])).toEqual(["Note: alpha note, by you"]);
+  expect(list.all().includes(rows[0])).toBe(true);
+});
+
 test("V6 remote layer add / rename and a shape on it: panel layers", () => {
   rig = setup(); const { bo, step, app } = rig;
   app.setPanel({ type: "noop" }); step(20);
@@ -625,11 +721,11 @@ test("K2 app.js: no setTimeout/setInterval/performance.now/Date.now in the sourc
 test("K3 main.js: the token goes only into createSession; sign-in leaves for the fixed href; the return board only via takeReturnBoard", async () => {
   const src = await Bun.file(new URL("../../web/main.js", import.meta.url)).text();
   const code = src.replace(/\/\/.*$/gm, "");
-  expect(code.match(/signIn\.token/g).length).toBe(3);                         // the gate check, createSession's token, and the Home port's (its Bearer header)
+  expect(code.match(/signIn\.token/g).length).toBe(4);                         // the gate check, createSession's token, and the Home and Spaces ports' (their Bearer header)
   expect(code).toMatch(/httpHome\(\{[^}]*token: signIn\.token,/);
   expect(code).toMatch(/if \(!signIn\.token\)/);
   expect(code).toMatch(/createSession\(\{[^}]*token: signIn\.token,/);
-  expect(code.match(/location\.assign\(([^)]*)\)/g)).toEqual(["location.assign(signInLink.href)"]);
+  expect(code.match(/location\.assign\(([^)]*)\)/g)).toEqual(["location.assign(href)", "location.assign(signInLink.href)"]);   // the first: after a create, to our own relative ?board= / ?space= link (hrefTo)
   expect(code).not.toMatch(/console\.|localStorage|sessionStorage|tabStore\.(set|get)/);
   expect(code).not.toMatch(/RETURN_KEY|plenary\.return/);                       // read only through takeReturnBoard
   expect(code).toMatch(/const back = takeReturnBoard\(tabStore, \{ outcome: signIn\.outcome, board: asked \}\);/);

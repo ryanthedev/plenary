@@ -61,6 +61,7 @@ const NOT_ADAPTERS = {
   "server/auth/tenancy.js": "core: role resolution over the Registry port (platform's CLASSES calls it core)",
   "server/auth/resolver.js": "core: the pure permission resolver (domain logic; reads only rows handed to it)",
   "server/auth/permissions.js": "core: permissions, built-in roles and their clipping per scope (pure domain data)",
+  "server/auth/spaces.js": "core: Space and Group pages, pickers, create and rename over the Registry port, tenancy and Home (PROTOCOL.md § Spaces and Groups)",
   "server/auth/home.js": "core: the Home screen's lists, tree and search over the Registry port and tenancy (PROTOCOL.md § Home)",
 };
 /** Non-port modules a driven adapter may import. */

@@ -37,7 +37,10 @@
 //   POST   /auth/exchange                      { code } + exchange cookie + Origin → 200 { token, user, name, email,
 //                                              domain, exp }; 400 invalid-code; 403 bad-origin; 503 unavailable
 //   GET    /auth/logout                        clears the login cookie, 302 to postLogoutUrl
-//   POST   /boards                             { title?, memberRole? } → 201 { board }; tenant = the caller's
+//   POST   /boards                             { title?, space?, memberRole? } → 201 { board }; board.create at `space`, else the personal space
+//   PATCH  /boards/:board                      { title } → 200 { board };  GET /spaces?can=board.create, GET /groups?can=space.create,
+//   POST /spaces, GET|PATCH /spaces/:id, GET|PATCH /groups/:id: PROTOCOL.md § Spaces and Groups (server/auth/spaces.js)
+//   (tenant of POST /boards = the caller's
 //   GET    /boards/:board/invites              → { invites }
 //   POST   /boards/:board/invites              { email, role, expiresAt? } → 201 { invite }
 //   DELETE /boards/:board/invites/:invite      → 204
@@ -76,7 +79,8 @@
 //   This handler never throws (the engine would turn a throw into a 500).
 
 import { b64url, unb64url, utf8, fromUtf8 } from "./util.js";
-import { AdminError, createBoard, createInvite, listInvites, revokeInvite, createLink, listLinks, revokeLink, setGrant } from "../admin/boards.js";
+import { spaceService } from "./spaces.js";
+import { AdminError, createInvite, listInvites, revokeInvite, createLink, listLinks, revokeLink, setGrant } from "../admin/boards.js";
 
 export const LOGIN_COOKIE = "__Host-plen_login";
 export const EXCHANGE_COOKIE = "__Host-plen_xchg";
@@ -120,7 +124,7 @@ const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
  *   now?: () => number, config: object, dev?: { enabled?: boolean, verify(t: string): Promise<object|null> } | null,
  *   testHooks?: { pruned?(p: { visited: number, expired: number, live: number }): void } | null }} deps   (tests only, not an API)
  */
-export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, config = {}, dev = null, log = stdoutLog, testHooks = null }) {
+export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, spaces = spaceService({ registry, tenancy, home, now }), config = {}, dev = null, log = stdoutLog, testHooks = null }) {
   if (!registry || !sessions || !tenancy) throw new Error("http: registry, sessions and tenancy are required");
   const postLoginUrl = absUrl(config.postLoginUrl, "postLoginUrl");
   const postLogoutUrl = config.postLogoutUrl ? absUrl(config.postLogoutUrl, "postLogoutUrl") : postLoginUrl;
@@ -391,12 +395,46 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
     ["/auth/logout", { GET: () => redirect(postLogoutUrl, [clearLogin]) }],
     ["/boards", { POST: async req => {
       const who = await caller(req);
-      const b = await body(req, ["title", "memberRole"]);
-      const t = await tenancy.tenantOf(who);
-      if (!t) throw new AdminError("forbidden", "not allowed");
-      const board = await createBoard(defined({ caller: who, tenant: t.id, title: b.title, memberRole: b.memberRole }), admin);
-      return json(201, { board });
+      const b = await body(req, ["title", "memberRole", "space"]);
+      return json(201, { board: await spaces.createBoard(who, defined(b)) });
     } }],
+    ["/boards/:board", { PATCH: async (req, p) => {
+      const who = await caller(req);
+      const b = await body(req, ["title"]);
+      if (!("title" in b)) throw refuse(400, "bad-request");
+      return json(200, { board: await spaces.renameBoard(who, p.board, b.title) });
+    } }],
+    ["/spaces", {
+      GET: async (req, url) => {
+        const who = await caller(req);
+        if (url.searchParams.get("can") !== "board.create" || [...url.searchParams.keys()].length !== 1) throw refuse(400, "bad-request");
+        return json(200, await spaces.boardPicker(who));
+      },
+      POST: async req => {
+        const who = await caller(req);
+        const b = await body(req, ["name", "group", "general"]);
+        return json(201, { space: await spaces.createSpace(who, defined(b)) });
+      },
+    }],
+    ["/groups", {
+      POST: async (req) => {
+        const who = await caller(req);
+        const b = await body(req, ["name", "general"]);
+        return json(201, { group: await spaces.createGroup(who, defined(b)) });
+      },
+      GET: async (req, url) => {
+      const who = await caller(req);
+      if (url.searchParams.get("can") !== "space.create" || [...url.searchParams.keys()].length !== 1) throw refuse(400, "bad-request");
+      return json(200, await spaces.spacePicker(who));
+    } }],
+    ["/spaces/:id", {
+      GET: async (req, p) => json(200, await spaces.spacePage(await caller(req), p.id)),
+      PATCH: async (req, p) => { const who = await caller(req); return json(200, { space: await spaces.update(who, "space", p.id, await body(req, ["name", "general"])) }); },
+    }],
+    ["/groups/:id", {
+      GET: async (req, p, url) => json(200, await spaces.groupPage(await caller(req), p.id, url.searchParams.get("after"))),
+      PATCH: async (req, p) => { const who = await caller(req); return json(200, { group: await spaces.update(who, "group", p.id, await body(req, ["name", "general"])) }); },
+    }],
     ["/boards/:board/invites", {
       GET: async (req, p) => json(200, { invites: await listInvites({ caller: await caller(req), board: p.board }, admin) }),
       POST: async (req, p) => {
@@ -471,7 +509,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
         const params = {};
         try { r.names.forEach((n, i) => { params[n] = decodeURIComponent(m[i + 1]); }); }
         catch { return err(400, "bad-request"); }
-        if (r.names.length) return await fn(req, params);
+        if (r.names.length) return await fn(req, params, url);
         return await fn(req, url);
       }
       return null;
@@ -479,6 +517,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       if (e instanceof Refusal) return e.res;
       if (e instanceof AdminError) {
         if (e.code === "forbidden") return err(403, "forbidden");
+        if (e.code === "not-found") return err(404, "not-found");
         if (e.code === "bad-request") return err(400, "bad-request", { message: String(e.message).slice(0, 200) });
         if (e.code === "last-owner") return err(409, "last-owner");
         if (e.code === "owner-grant-failed") return err(503, "owner-grant-failed", { board: e.board });

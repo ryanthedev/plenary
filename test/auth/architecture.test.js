@@ -33,6 +33,7 @@ export const CLASSES = {
   "server/auth/tenancy.js": "core",          // role resolution over the Registry port
   "server/auth/resolver.js": "core",         // the permission resolver: pure union of every source, with sources (domain logic)
   "server/auth/permissions.js": "core",      // permissions, built-in roles, role clipping per scope (domain data, pure)
+  "server/auth/spaces.js": "core",           // Spaces and Groups: pages, pickers, create, rename, general access (PROTOCOL.md § Spaces and Groups)
   "server/auth/home.js": "core",             // the Home screen's read side over the Registry port + tenancy (PROTOCOL.md § Home)
   "server/admin/boards.js": "core",          // admin use cases over the Registry port
   "server/admin/tenants.js": "core",         // bootstrapTenant over the Registry port (its CLI root: scripts/admin-bootstrap.js)
@@ -159,4 +160,22 @@ test("checker: unspaced import, template-literal import() and require() (p5-hexv
 test("checker: an extensionless or unknown in-scope target is a violation", () => {
   expect(one("server/auth/a.js", `import { x } from "./b";`)).toEqual(["server/auth/a.js -> server/auth/b [runtime]: imports an unclassified path (extensionless? add it to CLASSES)"]);
   expect(one("server/registry/x.js", `import { x } from "../auth/a";`)).toHaveLength(1);
+});
+
+// ---- #48: adapters only translate; the Space/Group rules live in the core service ----
+const WRITES = /\bregistry\s*\.\s*(createBoard|createSpace|createGroup|rename|updateScope|setGeneralRole|setScopedGrant|ensurePersonalSpace)\b/;
+const writesOrgDirectly = src => WRITES.test(src);
+
+test("the HTTP adapter calls no Space, Group or board write on the Registry: the core service owns them", () => {
+  const src = readFileSync(join(ROOT, "server/auth/http.js"), "utf8").replace(/\/\/.*$/gm, "").replace(/\/\*[^]*?\*\//g, "");
+  expect(writesOrgDirectly(src)).toBe(false);
+  expect(src).toMatch(/spaces\.createBoard\(/);
+});
+test("planted: a route that writes the Registry itself is caught; the service file is core and imports no adapter", () => {
+  expect(writesOrgDirectly("await registry.createSpace({ tenant })")).toBe(true);
+  expect(writesOrgDirectly("await registry.rename({ type: 'space' }, n)")).toBe(true);
+  expect(writesOrgDirectly("await spaces.createBoard(who, b)")).toBe(false);
+  expect(CLASSES["server/auth/spaces.js"]).toBe("core");
+  expect(violations([{ path: "server/auth/spaces.js", src: `import { x } from "./http.js";` }], CLASSES)).toEqual(expect.arrayContaining([expect.stringContaining("core imports driving")]));
+  expect(violations([{ path: "server/auth/spaces.js", src: `import { x } from "./registry.js";` }], CLASSES)).toEqual(expect.arrayContaining([expect.stringContaining("core imports adapter")]));
 });

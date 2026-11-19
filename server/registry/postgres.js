@@ -16,7 +16,7 @@
 // text) resolves to null / [] / false (PROTOCOL.md § Auth: null = `auth`, a throw = `unavailable`).
 //
 // Least privilege (PROTOCOL.md § Store, "Least privilege"; the Registry too): start-up creates only what is missing
-// (migrate() in server/pg/schema.js for the tables, the same to_regclass look-up here for the two indexes), so the
+// (migrate() in server/pg/schema.js for the tables, the same to_regclass look-up here for the indexes of REGISTRY_INDEXES), so the
 // server may run as a role with USAGE on the schema and SELECT/INSERT/UPDATE/DELETE on these tables, against a schema
 // an owner role created ahead of time. Nothing here ever ALTERs, DROPs or GRANTs. A start-up refused for lack of a
 // privilege (a missing table with no CREATE right, or no USAGE) throws "postgres registry: start-up in schema … was
@@ -71,7 +71,7 @@
 // owns that pool) or `sql` (a Bun SQL client you own). `schema` names the Postgres schema. Never reads env.
 
 import { SQL } from "bun";
-import { mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, smallLimit, searchQuery, asciiFold } from "../auth/registry-port.js";
+import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, smallLimit, searchQuery, asciiFold } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 import { needSchema, migrate, missing as absent } from "../pg/schema.js";
 
@@ -131,6 +131,7 @@ export const REGISTRY_INDEXES = {
   reg_invites_board: "reg_invites (board, email)",
   reg_links_board: "reg_links (board)",
   reg_spaces_tenant: "reg_spaces (tenant)",
+  reg_spaces_grp: "reg_spaces (grp, id)",
   reg_groups_tenant: "reg_groups (tenant)",
   reg_teams_tenant: "reg_teams (tenant)",
   reg_recents_member: "reg_recents (member, opened_at DESC, board DESC)",
@@ -202,7 +203,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     }
     if (err?.errno === DENIED) {
       throw Object.assign(new Error(`postgres registry: start-up in schema "${s}" was refused for lack of a privilege (${err.message}). `
-        + "If tables are missing, run the migrate step as the schema owner; otherwise grant this role USAGE on the schema "
+        + "If tables or indexes are missing, run the migrate step as the schema owner; otherwise grant this role USAGE on the schema "
         + "and SELECT, INSERT, UPDATE, DELETE on its tables (deploy/README.md, Postgres roles)", { cause: err }), { code: "denied" });
     }
     throw err;
@@ -498,10 +499,45 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     },
     async space(id) { ready(); return key(id) ? rowSpace(await one(db, `SELECT * FROM ${SP} WHERE id = $1`, [id])) : null; },
     async spaces(tenant) { ready(); return key(tenant) ? (await db.unsafe(`SELECT * FROM ${SP} WHERE tenant = $1 ORDER BY created_at, id`, [tenant])).map(rowSpace) : []; },
+    async spacesIn(group, { after = null, limit } = {}) {
+      ready();
+      const n = pageLimit(limit), cur = orgDefaults.cursor(after, "id");
+      if (!key(group)) return { spaces: [], next: null };
+      const rows = (await db.unsafe(`SELECT * FROM ${SP} WHERE grp = $1 AND ($2::text IS NULL OR id > $2) ORDER BY id LIMIT $3`, [group, cur, n + 1])).map(rowSpace);
+      return { spaces: rows.slice(0, n), next: rows.length > n ? rows[n - 1].id : null };
+    },
+    async rename(scope, name) {
+      ready();
+      const { type, id } = orgDefaults.renamable(scope, ["board", "space", "group"]);
+      const v = type === "board" ? orgDefaults.title(name) : orgDefaults.name(name);
+      if (!key(id)) throw new Error(`registry: no such ${type}`);
+      return write(async tx => {
+        const r = type === "board" ? await tx.unsafe(`UPDATE ${BD} SET title = $2 WHERE id = $1`, [id, v])
+          : await tx.unsafe(`UPDATE ${type === "space" ? SP : GR} SET name = $2 WHERE id = $1`, [id, v]);
+        if (r.count === 0) throw new Error(`registry: no such ${type}`);
+        return type === "board" ? rowBoard(await one(tx, `${BOARD_SQL} WHERE b.id = $1`, [id]))
+          : type === "space" ? rowSpace(await one(tx, `SELECT * FROM ${SP} WHERE id = $1`, [id])) : rowGroup(await one(tx, `SELECT * FROM ${GR} WHERE id = $1`, [id]));
+      });
+    },
+    async updateScope(scope, patch) {
+      ready();
+      const { type, id } = orgDefaults.renamable(scope, ["space", "group"]), v = orgDefaults.patch(patch);
+      if (!key(id)) throw new Error(`registry: no such ${type}`);
+      return write(async tx => {
+        const T2 = type === "space" ? SP : GR;
+        if ((await tx.unsafe(`UPDATE ${T2} SET name = CASE WHEN $2::boolean THEN $3 ELSE name END, general_role = CASE WHEN $4::boolean THEN $5 ELSE general_role END WHERE id = $1`,
+          [id, v.name !== undefined, v.name ?? null, v.generalRole !== undefined, v.generalRole ?? null])).count === 0) throw new Error(`registry: no such ${type}`);
+        const row = await one(tx, `SELECT * FROM ${T2} WHERE id = $1`, [id]);
+        return type === "space" ? rowSpace(row) : rowGroup(row);
+      });
+    },
     async ensurePersonalSpace(tenant, user) {
       ready();
       if (!key(tenant)) throw new Error("registry: no such tenant");
       const u = String(user), createdAt = now();
+      // Read first: Home calls this on every load; the primary write happens only when the row is missing.
+      const had = rowSpace(await one(db, `SELECT * FROM ${SP} WHERE tenant = $1 AND owner_user = $2`, [tenant, u]));
+      if (had) return had;
       return write(async tx => {
         if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
         // One per (tenant, user): the unique key settles two racing first sign-ins; the loser reads the winner's row.
@@ -681,6 +717,51 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       for (const g of Object.values(scoped).flat()) if (g.subject.type === "team") teams[g.subject.id] = [];
       for (const m of by("m").sort((x, y) => (x.member < y.member ? -1 : 1))) teams[m.team].push(m.member);
       return { ...out, scoped, roles: by("R").map(rowRole).sort((x, y) => x.createdAt - y.createdAt || (x.id < y.id ? -1 : 1)), teams };
+    },
+    // `accessContext` for many Unit, Group or Space scopes in ONE statement (one snapshot): the chains and tenants, the chains' grants, the
+    // Units' roles and the members of the Teams those grants name (only `users`, when given), as JSON rows tagged by kind, then assembled
+    // per scope exactly as `accessContext` does. The Home lists and the pickers use it so M Spaces cost one read, not M.
+    async accessContexts(scopes, { users } = {}) {
+      ready();
+      const list = batchScopes(scopes).filter(sc => key(sc.id)), us = users ? users.filter(key) : null;
+      const out = new Map(batchScopes(scopes).map(sc => [sc.type + "\n" + sc.id, null]));
+      if (!list.length) return out;
+      const rows = await db.unsafe(`WITH req AS (SELECT t, id FROM unnest($1::text[], $2::text[]) AS r(t, id)),
+        c AS (
+          SELECT r.t, r.id AS k, s.tenant, s.grp AS gid, s.id AS sid FROM req r JOIN ${SP} s ON r.t = 'space' AND s.id = r.id
+          UNION ALL SELECT r.t, r.id, g.tenant, g.id, NULL::text FROM req r JOIN ${GR} g ON r.t = 'group' AND g.id = r.id
+          UNION ALL SELECT r.t, r.id, u.id, NULL::text, NULL::text FROM req r JOIN ${T} u ON r.t = 'unit' AND u.id = r.id),
+        sg AS (SELECT c.t, c.k, g.* FROM c JOIN ${SG} g ON (g.scope_type = 'unit' AND g.scope_id = c.tenant) OR (g.scope_type = 'group' AND g.scope_id = c.gid)
+          OR (g.scope_type = 'space' AND g.scope_id = c.sid))
+        SELECT 'c' AS k, row_to_json(c)::text AS j FROM c
+        UNION ALL SELECT 'T', json_build_object('id', t.id, 'domain', t.domain, 'created_at', t.created_at,
+          'kind', (SELECT kind FROM ${TM} WHERE tenant = t.id),
+          'extra', (SELECT coalesce(json_agg(domain ORDER BY n), '[]'::json) FROM ${TD} WHERE tenant = t.id),
+          'admins', (SELECT coalesce(json_agg(member ORDER BY n), '[]'::json) FROM ${A} WHERE tenant = t.id))::text FROM ${T} t WHERE t.id IN (SELECT tenant FROM c)
+        UNION ALL SELECT 'S', row_to_json(s)::text FROM ${SP} s WHERE s.id IN (SELECT sid FROM c WHERE sid IS NOT NULL)
+        UNION ALL SELECT 'G', row_to_json(g)::text FROM ${GR} g WHERE g.id IN (SELECT gid FROM c WHERE gid IS NOT NULL)
+        UNION ALL SELECT 'g', row_to_json(sg)::text FROM sg
+        UNION ALL SELECT 'R', row_to_json(r)::text FROM ${RO} r WHERE r.tenant IN (SELECT tenant FROM c)
+        UNION ALL SELECT 'm', json_build_object('team', m.team, 'member', m.member)::text FROM ${TU} m
+          WHERE m.team IN (SELECT subject FROM sg WHERE subject_type = 'team') AND ($3::text[] IS NULL OR m.member = ANY($3::text[]))`,
+      [list.map(sc => sc.type), list.map(sc => sc.id), us]);
+      const by = k => rows.filter(r => r.k === k).map(r => JSON.parse(r.j));
+      const tenants = new Map(by("T").map(t => [t.id, { id: t.id, domain: t.domain, domains: [...(t.domain ? [t.domain] : []), ...t.extra], kind: t.kind ?? "company", admins: t.admins, createdAt: num(t.created_at) }]));
+      const spaces = new Map(by("S").map(x => [x.id, rowSpace(x)])), groups = new Map(by("G").map(x => [x.id, rowGroup(x)]));
+      const roles = new Map();
+      for (const r of by("R")) { if (!roles.has(r.tenant)) roles.set(r.tenant, []); roles.get(r.tenant).push(rowRole(r)); }
+      const members = new Map();
+      for (const m of by("m")) { if (!members.has(m.team)) members.set(m.team, []); members.get(m.team).push(m.member); }
+      const grants = by("g").sort((x, y) => x.n - y.n);
+      for (const c of by("c")) {
+        const mine = grants.filter(g => g.t === c.t && g.k === c.k), scoped = { unit: [], group: [], space: [], board: [] };
+        for (const g of mine) scoped[g.scope_type].push(rowSg(g));
+        const teams = {};
+        for (const g of Object.values(scoped).flat()) if (g.subject.type === "team") teams[g.subject.id] = [...(members.get(g.subject.id) ?? [])].sort();
+        out.set(c.t + "\n" + c.k, { tenant: tenants.get(c.tenant), board: null, space: c.sid ? spaces.get(c.sid) : null, group: c.gid ? groups.get(c.gid) : null, scoped,
+          roles: (roles.get(c.tenant) ?? []).sort((x, y) => x.createdAt - y.createdAt || (x.id < y.id ? -1 : 1)), teams });
+      }
+      return out;
     },
     // ---- Home (PROTOCOL.md § Home) ----
     async markOpened(user, board) {

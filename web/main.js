@@ -4,7 +4,7 @@
 // the same origin's /ws, and the DOM chrome. No dev rooms and no dev user table here (manager decision, p6-hex fix
 // round): those live in web/dev-main.js. `?as=` exists here only through the server's own answer (GET /auth/dev, below). test/web/architecture.test.js checks this file's whole import graph.
 //
-// URL: ?board=<id> &theme=light|dark &as=<dev user>
+// URL: ?board=<id> | ?space=<id> | ?group=<id> (a Space or Group page, PROTOCOL.md § Spaces and Groups) &theme=light|dark &as=<dev user>
 //      &as= works ONLY when the server says dev sign-in is on (GET /auth/dev, web/ports/devconfig.js: the server has
 //      a local server with PLENARY_DEV_TOKENS, no Google sign-in and a loopback bind); otherwise it is ignored and nothing in the page offers it. With dev on, the sign-in screen lists
 //      the dev users, and a link with no board lands on Home.
@@ -24,6 +24,10 @@ import { showGate, hideGate } from "./adapters/dom/gate.js";
 import { httpHome } from "./adapters/home/http.js";
 import { mountHome } from "./adapters/dom/home.js";
 import { createHomeModel } from "./core/home.js";
+import { httpSpaces } from "./adapters/spaces/http.js";
+import { mountSpacePage, mountGroupPage } from "./adapters/dom/spaces.js";
+import { createDialogs } from "./adapters/dom/dialogs.js";
+import { createPageModel } from "./core/spaces.js";
 import { takeSignIn, signInNotice, asParam, menuSignIn, devLinks } from "./core/signin.js";
 import { createSession } from "./core/session.js";
 import { rememberBoard, takeReturnBoard } from "./core/roles.js";
@@ -61,6 +65,10 @@ const back = takeReturnBoard(tabStore, { outcome: signIn.outcome, board: asked }
 if (back) { q.set("board", back); history.replaceState(history.state, "", `${location.pathname}?${q}`); }
 // A link with no board lands on Home (everyone, a dev user included): Recent, Starred, Shared with me, the Space tree, search.
 const board = asked ?? back;
+const idParam = name => (/^[\w-]{1,64}$/.test(q.get(name) ?? "") ? q.get(name) : null);
+const spaceId = idParam("space"), groupId = idParam("group");
+/** A link to another page of this app, keeping the theme. */
+const hrefTo = params => `?${new URLSearchParams({ ...params, ...(theme0 ? { theme: theme0 } : {}) })}`;
 const signInLink = { href: "/auth/login", text: "Sign in with Google" };
 
 if (!signIn.token) {
@@ -78,11 +86,23 @@ if (!signIn.token) {
   document.querySelector(".app")?.remove();
   const root = document.createElement("div");
   document.body.append(root);
-  const model = createHomeModel({ api: httpHome({ fetch: (...a) => globalThis.fetch(...a), token: signIn.token, timers: clock }), clock });
-  mountHome({ root, model, clock, signIn: signInLink, homeHref: location.pathname,
-    boardHref: id => `?${new URLSearchParams({ board: id, ...(theme0 ? { theme: theme0 } : {}) })}` });
-  hideGate();
-  model.load();
+  const fetchNow = (...a) => globalThis.fetch(...a);
+  const spacesApi = httpSpaces({ fetch: fetchNow, token: signIn.token, timers: clock });
+  const hrefs = { home: location.pathname, board: id => hrefTo({ board: id }), space: id => hrefTo({ space: id }), group: id => hrefTo({ group: id }) };
+  const dialogs = createDialogs({ host: root, api: spacesApi, hrefs, go: href => location.assign(href) });
+  if (spaceId || groupId) {
+    // A Space or Group page. An id the person can't open shows the same "not available" page as one that does not exist.
+    const model = createPageModel({ api: spacesApi, kind: spaceId ? "space" : "group", id: spaceId ?? groupId });
+    (spaceId ? mountSpacePage : mountGroupPage)({ root, model, dialogs, hrefs, signIn: signInLink });
+    hideGate();
+    model.load();
+  } else {
+    const model = createHomeModel({ api: httpHome({ fetch: fetchNow, token: signIn.token, timers: clock }), clock });
+    mountHome({ root, model, clock, signIn: signInLink, homeHref: location.pathname, dialogs,
+      boardHref: hrefs.board, spaceHref: hrefs.space, groupHref: hrefs.group });
+    hideGate();
+    model.load();
+  }
 } else {
   // Display only (p6-landv L5): the room decides the real user and role on every hello (the note lock uses welcome.user).
   const id = signIn.identity;

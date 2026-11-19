@@ -156,8 +156,8 @@ give them absolute. A file from before 2026-11-12's p8-rig3 has absolute paths; 
 `status --json` adds `alive` to every `procs` entry, and `pid` and `alive` to every `nodes` entry.
 
 For a load client: connect to `lb.wsUrl`. Create a board through `lb.url` with `POST /boards` and
-`Authorization: Bearer <rig-admin's token>`. Because every token is in domain `rig.test`, a board's `memberRole`
-admits all of them. Raise roles with `PUT /boards/:board/grants/dev%3A<name>`.
+`Authorization: Bearer <rig-admin's token>` (it lands in that user's personal space, private to its owner). A board made without `memberRole` has none, so the other tokens in domain `rig.test` can't open it until the
+owner raises them, unless the `POST /boards` body passes `memberRole` (every token is in domain `rig.test`, so it admits all of them). Raise roles with `PUT /boards/:board/grants/dev%3A<name>`.
 
 ## Safety
 

@@ -3,6 +3,7 @@
 // keeps UI preferences in the storage port it is given. Every write goes through session.act/setTool/key; nothing
 // here touches the protocol, a transport or sign-in (web/main.js, the composition root, wires those).
 
+import { captureFocus, restoreFocus } from "./focus.js";
 import { Editor } from "../../../packages/core/editor.js";
 import { parsePanel, serializePanel, applyPanel, panelLayout, dragWidth } from "../../../packages/core/panel.js";
 import { isMermaid } from "../../../packages/core/mermaid.js";
@@ -427,28 +428,33 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   }
 
   // The notes stream as a list: text, author (you, or unknown until v1's noteAuthor), jump / edit / delete.
-  function notesList() {
+  // The notes drawer's list element (kept so rows can be refreshed while the compose box is being typed in).
+  const notesRefs = { list: null };
+  function notesList(rowsOnly = false) {
     const N = S.eds.notes, may = S.may();
     const { notes, labels } = notesInfo(N.doc);
     const label = e => (e.type === "text" ? e.text : labels.get(e.id)?.text) || { freedraw: "Highlight / drawing", image: "Picture", arrow: "Arrow", line: "Line" }[e.type] || "Note";
     const rows = notes.slice(0, 200).map(e => {
       const mine = S.isMine(e.id), canChange = may && mine;
       const jump = () => { N.fit([e]); S.syncView("notes"); chromeDirty = true; };
-      return h("div.note-row", {}, h("span.sw", { style: { background: safeColor(e.backgroundColor !== "transparent" ? e.backgroundColor : e.strokeColor), width: "10px", height: "10px" } }),
+      return h("div.note-row", { role: "listitem", "aria-label": `Note: ${label(e)}, by ${S.mine.has(e.id) ? "you" : "someone else"}`, "data-fk": `note:${e.id}:row`, tabindex: "-1" }, h("span.sw", { style: { background: safeColor(e.backgroundColor !== "transparent" ? e.backgroundColor : e.strokeColor), width: "10px", height: "10px" } }),
         h("div.txt", {}, h("div", {}, label(e)),
           h("div.meta", {}, h("span", { style: { fontWeight: 600 } }, S.mine.has(e.id) ? "You" : "—"), e.type === "freedraw" ? h("span", {}, "highlight") : null),
-          h("div.acts", {}, h("button", { onclick: jump }, "jump to"),
+          h("div.acts", {}, h("button", { "data-fk": `note:${e.id}:jump`, onclick: jump }, "jump to"),
             may && S.effective !== "viewer" ? (canChange ? [
-              h("button", { onclick: () => { jump(); S.act("notes", n => { n.select([e.id]); n.beginText(e, { x: e.x, y: e.y }); }); } }, "edit"),
-              h("button", { onclick: () => S.act("notes", n => n.deleteIds([e.id])) }, "delete")] : h("span.lock", {}, "🔒 someone else's")) : null)));
+              h("button", { "data-fk": `note:${e.id}:edit`, onclick: () => { jump(); S.act("notes", n => { n.select([e.id]); n.beginText(e, { x: e.x, y: e.y }); }); } }, "edit"),
+              h("button", { "data-fk": `note:${e.id}:delete`, onclick: () => S.act("notes", n => n.deleteIds([e.id])) }, "delete")] : h("span.lock", {}, "🔒 someone else's")) : null)));
     });
+    const list = h("div.notes-list", { role: "list", "aria-label": "Notes" }, rows.length ? rows : h("div.hint", { style: { padding: "6px 8px" } }, "No notes yet."), notes.length > 200 ? h("div.hint", {}, `${notes.length - 200} more`) : null);
+    if (rowsOnly) return list;
+    notesRefs.list = list;
     const compose = !may || S.effective === "viewer"
       ? h("div.hint.compose", {}, S.role === "viewer" ? "Viewers read notes; only annotators and presenters add them." : "Read-only: you can't add or change notes.")
       : h("div.compose", {}, h("textarea.field", { placeholder: "Write a note… it lands at the center of your view", rows: 2, onkeydown: e => {
         e.stopPropagation();
         if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); const v = e.currentTarget.value.trim(); if (!v) return; const b = S.eds.board; S.placeNote(b.toWorld({ x: b.size.w / 2, y: b.size.h / 2 }), v); e.currentTarget.value = ""; chromeDirty = true; }
       } }));
-    return [h("div.notes-list", {}, rows.length ? rows : h("div.hint", { style: { padding: "6px 8px" } }, "No notes yet."), notes.length > 200 ? h("div.hint", {}, `${notes.length - 200} more`) : null), compose];
+    return [list, compose];
   }
   function drawerBody(which) {
     // Comment threads: the collab UI's drawer (its own Notes/Comments header is hidden here; ours switches).
@@ -457,8 +463,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   }
   function drawerTabs(key) {
     const which = ui[key] || "notes";
-    return h("span.seg", {}, h("button" + (which === "notes" ? ".on" : ""), { onclick: () => { ui[key] = "notes"; chromeDirty = true; } }, "Notes"),
-      h("button" + (which === "comments" ? ".on" : ""), { onclick: () => { ui[key] = "comments"; chromeDirty = true; } }, "Comments"));
+    return h("span.seg", {}, h("button" + (which === "notes" ? ".on" : ""), { "data-fk": `drawer-tab:${key}:notes`, onclick: () => { ui[key] = "notes"; chromeDirty = true; } }, "Notes"),
+      h("button" + (which === "comments" ? ".on" : ""), { "data-fk": `drawer-tab:${key}:comments`, onclick: () => { ui[key] = "comments"; chromeDirty = true; } }, "Comments"));
   }
 
   const T = id => toolsFor("presenter").find(t => t.id === id);
@@ -515,6 +521,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const a = h("a", { href: URL.createObjectURL(blob), download: name }); document.body.append(a); a.click(); a.remove();
     clock.set(() => URL.revokeObjectURL(a.href), 5000);
   }
+  // A dialog control that changes what the dialog shows (a format chip) rebuilds the dialog: remember which control had focus so chrome() puts it back.
+  function rebuildDialog(d) { pendingFocus = captureFocus(chromeRoots()); d.replaceChildren(); chromeDirty = true; }
   function dialogs() {
     const d = $("#dialogs"), may = S.may();
     if (document.activeElement?.closest?.("#dialogs") && d.firstChild) return;   // don't rebuild under the cursor
@@ -526,7 +534,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       replace(d, h("div.dialog-veil", { onclick: e => { if (e.target === e.currentTarget) close(); } }, h("div.dialog", { role: "dialog", "aria-label": "Insert a Mermaid flowchart" },
         h("h2", {}, "◇→ Insert a Mermaid flowchart", h("span.spacer"), h("button.tb", { onclick: close, title: "Close" }, "✕")),
         h("div.dbody", {}, h("div.cols", {}, ta, h("div.preview", {}, cv)),
-          h("div.row", {}, h("span.lab", {}, "Arrows"), h("span.opts", {}, chip("╱ straight", !ui.mermaid.elbow, () => { ui.mermaid.elbow = false; ui.dialog = "mermaid"; d.replaceChildren(); chromeDirty = true; }), chip("┐ elbow", ui.mermaid.elbow, () => { ui.mermaid.elbow = true; d.replaceChildren(); chromeDirty = true; }))),
+          h("div.row", {}, h("span.lab", {}, "Arrows"), h("span.opts", {}, chip("╱ straight", !ui.mermaid.elbow, () => { ui.mermaid.elbow = false; ui.dialog = "mermaid"; rebuildDialog(d); }), chip("┐ elbow", ui.mermaid.elbow, () => { ui.mermaid.elbow = true; rebuildDialog(d); }))),
           h("div.hint", {}, "Flowcharts only (graph / flowchart, TD TB BT LR RL, subgraphs become frames). Pasting Mermaid text on the board does the same.")),
         h("footer", {}, h("button.btn", { onclick: close }, "Cancel"), h("button.btn.primary", { disabled: !may, onclick: () => {
           let err = null;
@@ -535,7 +543,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         } }, "Insert as shapes")))));
       mermaidPreview(cv);
     } else if (ui.dialog === "export" && S.role === "presenter") {
-      const cv = h("canvas"), x = ui.export, set = (k, v) => { x[k] = v; d.replaceChildren(); chromeDirty = true; };
+      const cv = h("canvas"), x = ui.export, set = (k, v) => { x[k] = v; rebuildDialog(d); };
       replace(d, h("div.dialog-veil", { onclick: e => { if (e.target === e.currentTarget) close(); } }, h("div.dialog", { style: { width: "min(520px,100%)" }, role: "dialog", "aria-label": "Export the board" },
         h("h2", {}, "⤓ Export the board", h("span.spacer"), h("button.tb", { onclick: close, title: "Close" }, "✕")),
         h("div.dbody", {}, h("div.preview", { style: { minHeight: "120px" } }, cv),
@@ -656,10 +664,18 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const drawer = $("#drawer");
     drawer.hidden = !ui.drawer;
     if (!ui.drawer) return true;
-    if (busy(drawer)) return false;
+    if (busy(drawer)) {
+      // Typing in the compose box: refresh only the rows (a note just added must show), and leave the box (its text, its focus) alone.
+      if (ui.drawer !== "notes" || !notesRefs.list || !drawer.contains(notesRefs.list)) return false;
+      notesRefs.list.replaceChildren(...notesList(true).childNodes);
+      return true;
+    }
     replace(drawer, h("header", {}, h("h3", {}, "Annotations"), drawerTabs("drawer"), h("button.tb", { title: "Close", onclick: () => { ui.drawer = null; chromeDirty = true; } }, "✕")), drawerBody(ui.drawer));
     return true;
   }
+  // Focus across a rebuild of the chrome: wherever it was inside a rebuilt root, it goes back to that control's twin (by label, title, text or position).
+  let pendingFocus = null;
+  const chromeRoots = () => ["#topbar", "#panel", "#drawer", "#timeline", "#hudBL", "#hudBC", "#hudBR", "#dock", "#sheet", "#dialogs", "#overlays"].map(sel => $(sel)).filter(Boolean);
   function chrome() {
     inPlace();
     document.body.classList.toggle("stale", S.status !== "live");
@@ -673,12 +689,15 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if ((S.gesture || !chromeDirty) && now - chromeAt < CHROME_MS) return;   // mid-drag, playback, incoming ops: a few times a second at most
     const env = envKey(), force = chromeDirty || env !== keys.env;
     chromeDirty = false; gateKey = gate; chromeAt = now; keys.env = env;
+    const held = pendingFocus ?? captureFocus(chromeRoots());
+    pendingFocus = null;
     for (const [name, part] of Object.entries(parts)) {
       const k = part.key();
       if (!force && k === keys[name]) continue;
       if (part.build() === false) { keys[name] = undefined; continue; }   // busy: try again later
       keys[name] = k; rebuilds[name]++;
     }
+    restoreFocus(held);
     if (collab && isPhone()) {
       const canvasRect = canvas.getBoundingClientRect();
       const overlays = [$("#sheet"), $("#dock")];

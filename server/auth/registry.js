@@ -2,7 +2,7 @@
 // last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
 import { normEmail } from "./util.js";
-import { mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, smallLimit, searchQuery, asciiFold } from "./registry-port.js";
+import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, smallLimit, searchQuery, asciiFold } from "./registry-port.js";
 
 /**
  * @typedef {import("./registry-port.js").Registry} Registry
@@ -163,6 +163,26 @@ export function memoryRegistry({ now = Date.now } = {}) {
     },
     async space(id) { return copy(spaces.get(id)); },
     async spaces(tenant) { return [...spaces.values()].filter(s => s.tenant === tenant).map(copy); },
+    async spacesIn(group, { after = null, limit } = {}) {
+      after = orgDefaults.cursor(after, "id");
+      const n = pageLimit(limit), rest = [...spaces.values()].filter(s => s.group === group && (after == null || s.id > after)).sort((a, b) => (a.id < b.id ? -1 : 1));
+      return { spaces: rest.slice(0, n).map(copy), next: rest.length > n ? rest[n - 1].id : null };
+    },
+    async rename(scope, name) {
+      const { type, id } = orgDefaults.renamable(scope, ["board", "space", "group"]);
+      const row = (type === "board" ? boards : type === "space" ? spaces : groups).get(id);
+      need(row, type);
+      if (type === "board") row.title = orgDefaults.title(name); else row.name = orgDefaults.name(name);
+      return copy(row);
+    },
+    async updateScope(scope, patch) {
+      const { type, id } = orgDefaults.renamable(scope, ["space", "group"]);
+      const v = orgDefaults.patch(patch), row = (type === "space" ? spaces : groups).get(id);
+      need(row, type);
+      if (v.name !== undefined) row.name = v.name;
+      if (v.generalRole !== undefined) row.generalRole = v.generalRole;
+      return copy(row);
+    },
     async ensurePersonalSpace(tenant, user) {
       need(tenants.has(tenant), "tenant");
       user = String(user);
@@ -255,6 +275,12 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const inTeam = t => [...(members.get(t) ?? [])].filter(u => !want || want.has(u));
       return copy({ tenant, board: board ?? null, space: space ?? null, group: group ?? null, scoped: sc,
         roles: [...(roles.get(tenant.id)?.values() ?? [])], teams: Object.fromEntries([...teamIds].map(t => [t, inTeam(t)])) });
+    },
+
+    async accessContexts(scopes, { users } = {}) {
+      const out = new Map();
+      for (const sc of batchScopes(scopes)) out.set(sc.type + "\n" + sc.id, await this.accessContext(sc, { users }));
+      return out;
     },
 
     // ---- Home (PROTOCOL.md § Home) ----

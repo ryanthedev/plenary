@@ -51,9 +51,11 @@ export function homeService({ registry, tenancy, now = Date.now }) {
   const card = (f, unit, extra = {}) => ({ id: f.board.id, title: f.board.title, role: f.access.ladder, path: pathOf(f, unit), starred: false, ...extra });
 
   /** Cards for `entries` ({ id, at? }) in order, dropping what the person can't open; star flags in one query. `keep(found)` filters further. */
-  async function cards(identity, unit, entries, { found: given, keep } = {}) {
+  async function cards(identity, unit, entries, { found: given, keep, can = false } = {}) {
     const found = given ?? await accessAll(identity, [...new Set(entries.map(e => e.id))]);
-    const out = entries.filter(e => openable(found.get(e.id)) && (!keep || keep(found.get(e.id)))).map(e => card(found.get(e.id), unit, e.at != null ? { at: e.at } : {}));
+    // `can` (the Space page): what the person may do to the board, as permissions the resolver already computed (never a role name).
+    const extra = f => (can ? { can: { rename: f.access.permissions.has("board.edit") || f.access.permissions.has("members.manage") } } : {});
+    const out = entries.filter(e => openable(found.get(e.id)) && (!keep || keep(found.get(e.id)))).map(e => card(found.get(e.id), unit, { ...(e.at != null ? { at: e.at } : {}), ...extra(found.get(e.id)) }));
     if (out.length) {
       const stars = new Set(await registry.starredAmong(identity.user, out.map(c => c.id)));
       for (const c of out) c.starred = stars.has(c.id);
@@ -129,17 +131,20 @@ export function homeService({ registry, tenancy, now = Date.now }) {
     async home(identity) {
       const unit = await tenancy.tenantOf(identity);
       const base = { guest: !unit, user: { user: identity.user, name: identity.name ?? identity.email ?? identity.user }, unit: unit ? { id: unit.id, kind: unit.kind } : null, limits: LIMITS };
-      const [rec, star, { owned, shared }, theTree] = await Promise.all([
+      if (unit) await registry.ensurePersonalSpace(unit.id, identity.user);        // a member always has a place to put a board (JOURNEY J1)
+      const [rec, star, { owned, shared }, theTree, unitAccess] = await Promise.all([
         registry.recents(identity.user, { limit: SCAN.recent }),
         unit ? registry.starred(identity.user, { limit: SCAN.starred }) : [],
         reached(identity, unit),
         unit ? tree(identity, unit) : null,
+        unit ? tenancy.effective(identity, { type: "unit", id: unit.id }) : null,
       ]);
       const mine = await cards(identity, unit, [...rec.map(r => ({ id: r.board, at: r.at })), ...star.map(r => ({ id: r.board, at: r.at }))]);
       const byId = new Map(); for (const c of mine) if (!byId.has(c.id)) byId.set(c.id, c);
       const pick = rows => rows.filter(r => byId.has(r.board)).map(r => ({ ...byId.get(r.board), at: r.at }));
       return { ...base, recent: pick(rec).slice(0, LIMITS.recent), starred: pick(star).slice(0, LIMITS.starred),
-        owned: owned.slice(0, LIMITS.owned), shared: shared.slice(0, LIMITS.shared), tree: theTree };
+        owned: owned.slice(0, LIMITS.owned), shared: shared.slice(0, LIMITS.shared), tree: theTree,
+        can: { createGroup: !!unitAccess?.permissions.has("group.create") } };
     },
 
     /**
@@ -178,7 +183,7 @@ export function homeService({ registry, tenancy, now = Date.now }) {
      * GET /home/search?space=<id>: the boards of one Space the person can open. `space` is named only when they can open the Space
      * itself (else a board reached another way still lists, under "Shared with you", and the Space stays unnamed).
      */
-    async spaceBoards(identity, spaceId) {
+    async spaceBoards(identity, spaceId, { can = false } = {}) {
       const unit = await tenancy.tenantOf(identity);
       const sp = unit ? await registry.space(spaceId) : null;
       if (!sp || sp.tenant !== unit.id) return { space: null, results: [], more: false };
@@ -191,7 +196,7 @@ export function homeService({ registry, tenancy, now = Date.now }) {
         after = p.next;
         if (after == null) break;
       }
-      const results = (await cards(identity, unit, ids.map(id => ({ id })), { found })).sort(byTitle);
+      const results = (await cards(identity, unit, ids.map(id => ({ id })), { found, can })).sort(byTitle);
       // As in search: `more` never reflects boards the person can't open. For a Space they can't open it is only the 50-card overflow.
       return { space: named ? { id: sp.id, name: sp.name } : null, results: results.slice(0, LIMITS.space), more: results.length > LIMITS.space || (named && after != null) };
     },

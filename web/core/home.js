@@ -47,13 +47,13 @@ export function emptyText(data, view) {
 export function createHomeModel({ api, clock, debounceMs = SEARCH_DEBOUNCE_MS }) {
   /** @type {{ status: "loading"|"ready"|"error"|"signed-out", error: string|null, data: HomeData|null, view: string,
    *   query: string, search: { status: "idle"|"loading"|"ready"|"error", q: string, results: Card[], more: boolean },
-   *   space: { status: "loading"|"ready"|"error", id: string, name: string, results: Card[], more: boolean } | null, notice: string|null }} */
-  const state = { status: "loading", error: null, data: null, view: "home", query: "", search: { status: "idle", q: "", results: [], more: false }, space: null, notice: null };
+   *   notice: string|null }} */
+  const state = { status: "loading", error: null, data: null, view: "home", query: "", search: { status: "idle", q: "", results: [], more: false }, notice: null };
   const subs = new Set();
   const emit = () => { for (const f of [...subs]) f(state); };
   let seq = 0, timer = null;
 
-  const lists = () => [state.data?.recent, state.data?.starred, state.data?.owned, state.data?.shared, state.search.results, state.space?.results].filter(Boolean);
+  const lists = () => [state.data?.recent, state.data?.starred, state.data?.owned, state.data?.shared, state.search.results].filter(Boolean);
   const cards = id => lists().flat().filter(c => c.id === id);
 
   async function load() {
@@ -82,24 +82,10 @@ export function createHomeModel({ api, clock, debounceMs = SEARCH_DEBOUNCE_MS })
     subscribe(f) { subs.add(f); return () => subs.delete(f); },
     load,
     /** Which list the main area shows. */
-    setView(view) { if (VIEWS.includes(view)) { state.view = view; state.space = null; emit(); } },
-    /** Show one Space's boards (by id, not by text). A newer choice, a search or a view change supersedes an answer still in flight. */
-    showSpace(id, name) {
-      const mine = ++seq;
-      clock.clear(timer); timer = null; state.query = ""; state.search = { status: "idle", q: "", results: [], more: false };
-      state.space = { status: "loading", id, name, results: [], more: false }; emit();
-      api.space(id).then(r => {
-        if (mine !== seq || state.space?.id !== id) return;
-        if ("results" in r) state.space = { status: "ready", id, name: r.space?.name ?? name, results: r.results, more: r.more };
-        else if (r.error === "auth") { state.status = "signed-out"; state.error = "auth"; state.space = null; }
-        else state.space = { status: "error", id, name, results: [], more: false };
-        emit();
-      });
-    },
+    setView(view) { if (VIEWS.includes(view)) { state.view = view; emit(); } },
     /** The search box's text: debounced; an empty or too-long text clears the search at once. */
     setQuery(text) {
       state.query = String(text ?? "");
-      state.space = null;
       clock.clear(timer); timer = null;
       const q = cleanQuery(state.query);
       if (q === null) { seq++; state.search = { status: "idle", q: "", results: [], more: false }; emit(); return; }
@@ -132,10 +118,6 @@ export function createHomeModel({ api, clock, debounceMs = SEARCH_DEBOUNCE_MS })
     main() {
       const d = state.data;
       if (!d) return null;
-      if (state.space) {
-        const sp = state.space;
-        return { kind: "space", title: sp.name, status: sp.status, cards: sp.results, more: sp.more, empty: { title: "No boards you can open here.", detail: "" } };
-      }
       if (cleanQuery(state.query) !== null) {
         const s = state.search;
         return { kind: "search", title: `Results for “${cleanQuery(state.query)}”`, status: s.status, cards: s.results, more: s.more,

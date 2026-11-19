@@ -33,6 +33,10 @@
 // are not counted. Role strings are stored as given (the admin layer validates them with server/auth/permissions.js;
 // the resolver ignores a role that is not valid where it is held).
 //
+// accessContexts(scopes, { users }) is the same read for up to HOME.batch Unit, Group or Space scopes at once (the Home lists and the pickers have
+// many Spaces to check): one statement on Postgres, one transaction on SQLite, so a page of N boards over M Spaces costs a fixed number of
+// statements, not M reads. Its answer for each scope equals `accessContext`'s (test/auth/registry-contract.js).
+//
 // accessContext(scope, { users, chain }): `users` (user ids, at most a few thousand) limits `teams` to those users'
 // memberships, so a hello reads one user's and a re-check pass reads its own users', never a whole Team. `chain` is a
 // Chain the caller already holds for this scope (a cache's); the adapter then skips reading it (and returns it as given),
@@ -114,11 +118,15 @@ export const mint = {
  *   setTeamMember(team: string, user: string, member: boolean): Promise<void>,
  *   teamMembers(team: string): Promise<string[]>,
  *   setScopedGrant(o: { scope: ScopeRef, subject: Subject, role: string|null }): Promise<void>,   // rejects a user subject on a board (use setGrant) and a Team of another tenant; Group/Space: code "last-owner"
+ *   rename(scope: { type: "board"|"space"|"group", id: string }, name: string): Promise<Board|Space|Group>,   // a board's title (trimmed, 0-200 chars) or a Space's / Group's name (trimmed, 1-200); rejects an unknown scope, nothing else changes
+ *   updateScope(scope: { type: "space"|"group", id: string }, patch: { name?: string, generalRole?: string|null }): Promise<Space|Group>,   // rename and/or change general access in ONE atomic step (null = only people added); at least one field; rejects an unknown scope; nothing else changes
+ *   spacesIn(group: string, o?: { after?: string|null, limit?: number }): Promise<{ spaces: Space[], next: string|null }>,   // a Group's Spaces, by id, one bounded page (default 500, cap 1000); an unknown Group lists none
  *   scopedGrants(scope: ScopeRef): Promise<ScopedGrant[]>,
  *   createRole(o: { tenant: string, name: string, base?: string|null, boardRole: Role, permissions?: string[] }): Promise<CustomRole>,
  *   updateRole(tenant: string, id: string, patch: { name?: string, boardRole?: Role|null, permissions?: string[] }): Promise<CustomRole>,   // id "member" (the editable Unit member role) is created on first update; rejects an unknown id
  *   role(tenant: string, id: string): Promise<CustomRole|null>,
  *   roles(tenant: string): Promise<CustomRole[]>,
+ *   accessContexts(scopes: ScopeRef[], o?: { users?: string[] }): Promise<Map<string, AccessContext|null>>,   // `accessContext` for many Unit, Group or Space scopes (at most HOME.batch, else rejects) in ONE step; keys are `type + "\n" + id`, null for an unknown scope
  *   accessContext(scope: ScopeRef, o?: { users?: string[], chain?: Chain }): Promise<AccessContext|null>,   // null for an unknown scope; see "accessContext" below
  *   boardsIn(scope: ScopeRef, o?: { after?: string|null, limit?: number }): Promise<{ ids: string[], next: string|null }>,   // board ids in a Unit, Group or Space, by id, one bounded page
  *   scopesOf(subject: Subject, o?: { after?: string|null, limit?: number }): Promise<{ scopes: (ScopeRef & { role: string })[], next: string|null }>,   // the scopes a user or Team holds a grant on (not boards: a board's own user grants are `grants`)
@@ -153,6 +161,17 @@ export const mint = {
 
 /** Home (PROTOCOL.md § Home): rows kept per user in Recent, rows a starred / shared read may return, and the most boards one `boardRows` / `starredAmong` call takes. */
 export const HOME = { recentKeep: 50, starScan: 200, sharedScan: 200, batch: 200, searchScan: { default: 1000, max: 5000 }, candidates: { spaces: { default: 100, max: 200 }, groups: { default: 50, max: 100 } } };
+/** The scopes of `accessContexts`: distinct Unit, Group or Space refs, at most HOME.batch. @returns {{ type: string, id: string }[]} */
+export function batchScopes(scopes) {
+  if (!Array.isArray(scopes) || scopes.length > HOME.batch) throw new Error("registry: bad scopes");
+  const seen = new Map();
+  for (const sc of scopes) {
+    const { type, id } = orgDefaults.scope(sc);
+    if (type === "board") throw new Error("registry: bad scopes");
+    seen.set(type + "\n" + id, { type, id });
+  }
+  return [...seen.values()];
+}
 /** A small read's limit: default `d`, at least 1, at most `max`. */
 export const smallLimit = (n, d, max) => Math.min(max, Math.max(1, Math.floor(Number(n) || d)));
 /** ASCII case folding, the only folding search does (every adapter agrees: PROTOCOL.md § Home). */
@@ -182,6 +201,22 @@ export const orgDefaults = {
     const n = typeof v === "string" ? v.trim() : "";
     if (!n || n.length > 200) fail("name");
     return n;
+  },
+  /** A board title: a string, trimmed, 0-200 chars (a board may be untitled), no NUL. */
+  title(v) {
+    const n = typeof v === "string" ? v.trim() : "";
+    if (typeof v !== "string" || n.length > 200 || n.includes("\0")) fail("title");
+    return n;
+  },
+  /** The patch of `updateScope`: `{ name?, generalRole? }` with at least one field, each validated like create. */
+  patch(p) {
+    if (!p || typeof p !== "object" || (p.name === undefined && p.generalRole === undefined)) fail("patch");
+    return { name: p.name === undefined ? undefined : orgDefaults.name(p.name), generalRole: p.generalRole === undefined ? undefined : orgDefaults.grantRole(p.generalRole) };
+  },
+  /** The scope a `rename` / `updateScope` names: one of `types`. */
+  renamable(s, types) {
+    if (!s || !types.includes(s.type) || typeof s.id !== "string" || !s.id || s.id.includes("\0")) fail("scope");
+    return { type: s.type, id: s.id };
   },
   /** The name of a member's personal Space until they rename it. */
   personalName: user => `${String(user).replace(/^[a-z]+:/, "")}'s space`,

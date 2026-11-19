@@ -1,5 +1,5 @@
 // A stock single node (server/main.js start(env), port 0, temp data dir) bootstraps each dev domain's tenant from
-// PLENARY_DEV_TOKENS, so an admin dev token can POST /boards and a non-admin of that domain can't (brief
+// PLENARY_DEV_TOKENS, so a dev token of that domain can POST /boards (into its personal space) and a user with no tenant can't (brief
 // p5-devadmin, live finding S1). Plus the operator CLI (scripts/admin-bootstrap.js) in process, on SQLite.
 import { test, expect, afterAll } from "bun:test";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
@@ -22,7 +22,7 @@ const TOKENS = {
 const env = (dir, tokens = TOKENS) => ({ PLENARY_DATA_DIR: dir, PORT: "0", LOG_LEVEL: "error", PLENARY_DEV_TOKENS: JSON.stringify(tokens) });
 const post = (app, token) => fetch(app.server.url + "/boards", { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ title: "all hands" }) });
 
-test("start(env): an admin dev token can POST /boards (201), a non-admin of its domain gets 403; a restart keeps one tenant", async () => {
+test("start(env): a dev token of the domain can POST /boards (201) and owns the board; a restart keeps one tenant", async () => {
   const dir = tempDir();
   let app = await start(env(dir));
   let tenantId;
@@ -35,7 +35,12 @@ test("start(env): an admin dev token can POST /boards (201), a non-admin of its 
     const { board } = await ok.json();
     expect(board.tenant).toBe(tenantId);
     expect(await app.registry.grant(board.id, "dev:ann")).toBe("owner");
-    expect((await post(app, MEMBER)).status).toBe(403);
+    // Since #48 any member of the Unit makes boards in their personal space (no admin needed); a user with no Unit still can't (next test).
+    const mine = await post(app, MEMBER);
+    expect(mine.status).toBe(201);
+    const made = (await mine.json()).board;
+    expect(await app.registry.grant(made.id, "dev:bob")).toBe("owner");
+    expect((await app.registry.space(made.space)).owner).toBe("dev:bob");
   } finally { await app.stop(); }
 
   // Restart on the same data dir, with bob flagged admin too and ann's flag dropped: same tenant, both admins.

@@ -17,7 +17,7 @@
 // `user`; insertion order is an explicit `n` column (Postgres: BIGSERIAL / identity), upserts use ON CONFLICT.
 
 import { Database } from "bun:sqlite";
-import { mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, smallLimit, searchQuery, asciiFold } from "../auth/registry-port.js";
+import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, smallLimit, searchQuery, asciiFold } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 
 /** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code`. */
@@ -142,6 +142,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     db.run("CREATE INDEX IF NOT EXISTS reg_scope_grants_subject ON reg_scope_grants (subject_type, subject, scope_type)");
     db.run("CREATE INDEX IF NOT EXISTS reg_team_members_member ON reg_team_members (member)");
     db.run("CREATE INDEX IF NOT EXISTS reg_spaces_tenant ON reg_spaces (tenant)");
+    db.run("CREATE INDEX IF NOT EXISTS reg_spaces_grp ON reg_spaces (grp, id)");
     db.run("CREATE INDEX IF NOT EXISTS reg_groups_tenant ON reg_groups (tenant)");
     db.run("CREATE INDEX IF NOT EXISTS reg_teams_tenant ON reg_teams (tenant)");
   }).immediate(), clock, onAttempt);
@@ -174,6 +175,12 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     insGroup: db.query("INSERT INTO reg_groups (id, tenant, name, general_role, created_at) VALUES (?, ?, ?, ?, ?)"),
     space: db.query("SELECT * FROM reg_spaces WHERE id = ?"),
     spaces: db.query("SELECT * FROM reg_spaces WHERE tenant = ? ORDER BY created_at, id"),
+    spacesIn: db.query("SELECT * FROM reg_spaces WHERE grp = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?3"),
+    renameBoard: db.query("UPDATE reg_boards SET title = ?2 WHERE id = ?1"),
+    renameSpace: db.query("UPDATE reg_spaces SET name = ?2 WHERE id = ?1"),
+    renameGroup: db.query("UPDATE reg_groups SET name = ?2 WHERE id = ?1"),
+    patchSpace: db.query("UPDATE reg_spaces SET name = CASE WHEN ?2 = 1 THEN ?3 ELSE name END, general_role = CASE WHEN ?4 = 1 THEN ?5 ELSE general_role END WHERE id = ?1"),
+    patchGroup: db.query("UPDATE reg_groups SET name = CASE WHEN ?2 = 1 THEN ?3 ELSE name END, general_role = CASE WHEN ?4 = 1 THEN ?5 ELSE general_role END WHERE id = ?1"),
     personal: db.query("SELECT * FROM reg_spaces WHERE tenant = ? AND owner_user = ?"),
     insSpace: db.query("INSERT INTO reg_spaces (id, tenant, grp, name, kind, owner_user, general_role, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"),
     team: db.query("SELECT * FROM reg_teams WHERE id = ?"),
@@ -437,20 +444,28 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
   });
   // One snapshot read of a scope's whole chain: a fixed number of statements however many grants, Teams or members.
   // `chain` (already read by the caller) skips the chain statements; `users` limits Team members to those users.
+  /** `rowTenant`, but its three look-ups run even when the row is missing (no-match id), so the statement count doesn't depend on existence. */
+  const uniformTenant = r => { const t = rowTenant(r ?? { id: "", domain: null, created_at: 0 }); return r ? t : null; };
+  // The SAME statements run whether or not the scope exists (no-match parameters stand in for a missing row), so a refusal's cost can't
+  // tell an unknown id from a hidden one (PROTOCOL.md § Spaces and Groups, "the same Registry work").
   const contextTx = db.transaction((type, id, users, held) => {
     const board = held ? held.board : type === "board" ? rowBoard(q.board.get(id)) : null;
-    const space = held ? held.space : type === "space" ? rowSpace(q.space.get(id)) : board?.space ? rowSpace(q.space.get(board.space)) : null;
-    const group = held ? held.group : type === "group" ? rowGroup(q.group.get(id)) : space?.group ? rowGroup(q.group.get(space.group)) : null;
+    const space = held ? held.space : rowSpace(q.space.get(type === "space" ? id : board?.space ?? ""));
+    const group = held ? held.group : type === "group" ? rowGroup(q.group.get(id)) : rowGroup(q.group.get(space?.group ?? ""));
     const owner = board ?? space ?? group;
-    const tenant = held ? held.tenant : rowTenant(q.tenant.get(type === "unit" ? id : owner?.tenant));
-    if (!tenant || (type !== "unit" && !owner)) return null;
-    const sg = (t, i) => (i == null ? [] : q.sgrants.all(t, i).map(rowSg));
-    const scoped = { unit: sg("unit", tenant.id), group: sg("group", group?.id), space: sg("space", space?.id), board: sg("board", board?.id) };
+    const tenant = held ? held.tenant : uniformTenant(q.tenant.get(type === "unit" ? id : owner?.tenant ?? ""));
+    const sg = (t, i) => q.sgrants.all(t, i ?? "").map(rowSg);
+    const scoped = { unit: sg("unit", tenant?.id), group: sg("group", group?.id), space: sg("space", space?.id), board: sg("board", board?.id) };
     const teamIds = [...new Set(Object.values(scoped).flat().filter(g => g.subject.type === "team").map(g => g.subject.id))];
     const teams = Object.fromEntries(teamIds.map(t => [t, []]));
-    if (teamIds.length) for (const m of q.membersOf.all(JSON.stringify(teamIds), users ? JSON.stringify(users) : null)) teams[m.team].push(m.member);
-    return { tenant, board, space, group, scoped, roles: q.roles.all(tenant.id).map(rowRole), teams };
+    for (const m of q.membersOf.all(JSON.stringify(teamIds), users ? JSON.stringify(users) : null)) teams[m.team].push(m.member);
+    const roles = q.roles.all(tenant?.id ?? "").map(rowRole);
+    if (!tenant || (type !== "unit" && !owner)) return null;
+    return { tenant, board, space, group, scoped, roles, teams };
   });
+
+  /** `accessContexts`: every scope's context from ONE transaction (one snapshot). */
+  const contextsTx = db.transaction((list, users) => list.map(sc => [sc.type + "\n" + sc.id, contextTx(sc.type, sc.id, users, null)]));
 
   return {
     async createTenant({ domain, domains = [], kind = "company", admins = [] }) {
@@ -557,10 +572,33 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     },
     async space(id) { ready(); return str(id) ? rowSpace(q.space.get(id)) ?? null : null; },
     async spaces(tenant) { ready(); return str(tenant) ? q.spaces.all(tenant).map(rowSpace) : []; },
+    async spacesIn(group, { after = null, limit } = {}) {
+      ready();
+      const n = pageLimit(limit), cur = orgDefaults.cursor(after, "id");
+      const rows = str(group) ? q.spacesIn.all(group, cur, n + 1).map(rowSpace) : [];
+      return { spaces: rows.slice(0, n), next: rows.length > n ? rows[n - 1].id : null };
+    },
+    async rename(scope, name) {
+      ready();
+      const { type, id } = orgDefaults.renamable(scope, ["board", "space", "group"]);
+      const v = type === "board" ? orgDefaults.title(name) : orgDefaults.name(name);
+      const [up, get, row] = type === "board" ? [q.renameBoard, q.board, rowBoard] : type === "space" ? [q.renameSpace, q.space, rowSpace] : [q.renameGroup, q.group, rowGroup];
+      if (up.run(id, v).changes === 0) throw new Error(`registry: no such ${type}`);
+      return row(get.get(id));
+    },
+    async updateScope(scope, patch) {
+      ready();
+      const { type, id } = orgDefaults.renamable(scope, ["space", "group"]), v = orgDefaults.patch(patch);
+      const [up, get, row] = type === "space" ? [q.patchSpace, q.space, rowSpace] : [q.patchGroup, q.group, rowGroup];
+      if (up.run(id, v.name !== undefined ? 1 : 0, v.name ?? null, v.generalRole !== undefined ? 1 : 0, v.generalRole ?? null).changes === 0) throw new Error(`registry: no such ${type}`);
+      return row(get.get(id));
+    },
     async ensurePersonalSpace(tenant, user) {
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");
-      return personalTx.immediate(tenant, String(user), now());
+      // Read first: Home calls this on every load, and the write lock (BEGIN IMMEDIATE) is taken only when the row is missing.
+      const had = rowSpace(q.personal.get(tenant, String(user)));
+      return had ?? personalTx.immediate(tenant, String(user), now());
     },
     async createTeam({ tenant, name }) {
       ready();
@@ -601,6 +639,11 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       ready();
       const { type, id } = orgDefaults.scope(scope);
       return contextTx(type, id, users ? users.filter(str) : null, chain ?? null);
+    },
+    async accessContexts(scopes, { users } = {}) {
+      ready();
+      const list = batchScopes(scopes), us = users ? users.filter(str) : null;
+      return new Map(contextsTx(list, us));
     },
     // ---- Home (PROTOCOL.md § Home) ----
     async markOpened(user, board) {

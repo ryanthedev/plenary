@@ -27,6 +27,7 @@
 //   collab.setTheme(theme) · collab.destroy()
 //   collab.setBottomInset(px)  reserve the visible bottom-sheet / dock area when positioning comment popovers
 
+import { captureFocus, restoreFocus } from "../focus.js";
 import { h, replace } from "./dom.js";
 import { EMOTES, PRESENCE, canWrite } from "../../../core/collab/limits.js";
 import { FLAGS } from "../../../core/collab/flags.js";
@@ -248,14 +249,14 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     const rv = c.reactions, canReact = c.canReact;
     const chips = (rv.length || canReact) && !c.deleted ? h("div.react-chips.collab-chips", {},
       rv.map(r => h(`button.chip-r${r.mine ? ".mine" : ""}${r.pending ? ".pending" : ""}`, {
-        disabled: !c.canReact, title: c.canReact ? (r.mine ? `Remove your ${r.emoji}` : `React ${r.emoji}`) : `${r.n} reacted ${r.emoji}`,
+        "data-fk": `msg:${c.id}:react:${r.emoji}`, disabled: !c.canReact, title: c.canReact ? (r.mine ? `Remove your ${r.emoji}` : `React ${r.emoji}`) : `${r.n} reacted ${r.emoji}`,
         onclick: () => recordOp(r.mine ? "unreact" : "react", { do: "react", id: c.id, emoji: r.emoji, on: !r.mine }) }, `${r.emoji} `, h("b", {}, String(r.n)))),
-      c.canReact ? h("button.chip-r.add", { title: "React", onclick: () => { S.reactFor = S.reactFor === c.id ? null : c.id; renderPopover(); } }, "＋") : null) : null;
-    const reactRow = S.reactFor === c.id && c.canReact ? h("div.collab-reactrow", {}, EMOTES.map(e => h("button", { title: e, onclick: () => { S.reactFor = null; const has = rv.find(r => r.emoji === e)?.mine; recordOp(has ? "unreact" : "react", { do: "react", id: c.id, emoji: e, on: !has }); } }, e))) : null;
+      c.canReact ? h("button.chip-r.add", { "data-fk": `msg:${c.id}:react-add`, title: "React", onclick: () => { S.reactFor = S.reactFor === c.id ? null : c.id; renderPopover(); } }, "＋") : null) : null;
+    const reactRow = S.reactFor === c.id && c.canReact ? h("div.collab-reactrow", {}, EMOTES.map(e => h("button", { "data-fk": `msg:${c.id}:pick:${e}`, title: e, onclick: () => { S.reactFor = null; const has = rv.find(r => r.emoji === e)?.mine; recordOp(has ? "unreact" : "react", { do: "react", id: c.id, emoji: e, on: !has }); } }, e))) : null;
     return h(`div.msg${c.pending ? ".pending" : ""}`, {}, av(c.by, c.name),
       h("div.mbody", {},
         h("div.who", {}, c.name, h("span", {}, ago(c.at, C.now())), c.edited ? h("span", {}, "edited") : null, c.pending ? h("span.sending", {}, "sending…") : null,
-          c.canDelete ? h("button.del", { title: "Delete this comment", onclick: () => recordOp("deleteComment", { do: "delete", id: c.id }) }, "delete") : null),
+          c.canDelete ? h("button.del", { "data-fk": `msg:${c.id}:delete`, title: "Delete this comment", onclick: () => recordOp("deleteComment", { do: "delete", id: c.id }) }, "delete") : null),
         c.deleted ? h("p.deleted", {}, "Comment deleted") : h("p", {}, c.text), chips, reactRow));
   }
 
@@ -274,18 +275,20 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
         if (recordOp("reply", { do: "reply", id, thread: t.id, text })) { field.value = ""; S.drafts.delete(t.id); }
       };
       const foot = h("div.reply", {}, field, h("button.btn.primary", { onclick: send }, "Send"));
-      pop = { id: t.id, head: h("header"), body: h("div.body"), foot, field, readFoot: h("div.reply.hint"), el: null };
+      pop = { id: t.id, head: h("header", { "data-fk": "heading", tabindex: "-1" }), body: h("div.body"), foot, field, readFoot: h("div.reply.hint"), el: null };
       pop.el = h("div.pop.collab-pop", { role: "dialog", "aria-label": "Comment thread" }, pop.head, pop.body, pop.foot, pop.readFoot);
       delete sigs.pop;
     }
     // Rebuild the head and messages only when what they show changed (a click mid-rebuild is lost).
     if (changed("pop", JSON.stringify([t, S.reactFor, port.role, Math.floor(C.now() / 30_000)]))) {
+      const held = captureFocus([pop.el]);       // a Resolve or reaction button that was just used keeps focus
       replace(pop.head,
         t.resolved ? [h("span", {}, "✓"), h("b", {}, `Resolved by ${t.resolved.name ?? "someone"}`)] : h("span.anchor", {}, anchorText(t)),
         h("span.spacer"),
-        t.canResolve ? h("button.btn", { disabled: t.statePending, onclick: () => recordOp(t.resolved ? "reopen" : "resolve", { do: t.resolved ? "reopen" : "resolve", id: t.id }) }, t.resolved ? "Reopen" : "✓ Resolve") : null,
+        t.canResolve ? h("button.btn", { "data-fk": `thread:${t.id}:resolve`, "aria-disabled": t.statePending ? "true" : null, onclick: () => !t.statePending && recordOp(t.resolved ? "reopen" : "resolve", { do: t.resolved ? "reopen" : "resolve", id: t.id }) }, t.resolved ? "Reopen" : "✓ Resolve") : null,
         h("button.tb", { title: "Close", onclick: () => openThread(null) }, "✕"));
       replace(pop.body, t.resolved || t.detached ? h("div.anchor.muted", {}, anchorText(t)) : null, t.comments.map(c => message(t, c)));
+      restoreFocus(held);
       pop.foot.hidden = !t.canReply;
       pop.readFoot.hidden = t.canReply;
       replace(pop.readFoot, port.role === "viewer" ? "Viewers read comments; they can't reply or react." : "Read-only: you can't reply or react.");
@@ -335,6 +338,8 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
   // A cluster's own list (listThreads): only its threads, until "Show all" or a list tab.
   const onlyText = h("span"), onlyBar = h("div.collab-only", { hidden: true }, onlyText, " ", h("button", { onclick: () => { S.only = null; renderDrawer(); } }, "Show all"));
   const scroller = h("div.notes-list");
+  /** Rebuild the drawer rows, keeping focus on the control that had it (a row, a jump / edit / delete button). */
+  const swapRows = (...kids) => { const held = captureFocus([scroller]); replace(scroller, ...kids); restoreFocus(held); };
   parts.drawer.append(h("header", {}, h("h3", {}, "Annotations"), h("span.seg", {}, tabNotes, tabComments)), listTabs, onlyBar, scroller);
   const label = (el, text, on) => { if (el.textContent !== text) replace(el, text); el.classList.toggle("on", on); };
   // The notes rows are built only while the notes tab shows (C-7); the comments tab's "Notes N" label is a count
@@ -352,15 +357,16 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     if (only) { const text = `${only.length} ${only.length === 1 ? "thread" : "threads"} here`; if (onlyText.textContent !== text) replace(onlyText, text); }
     if (S.drawer === "notes") {
       sigs.drawerRev = null;     // the comments rows must be rebuilt on the way back
+      scroller.setAttribute("role", "list"); scroller.setAttribute("aria-label", "Notes");
       if (!changed("drawer", JSON.stringify(["notes", nv]))) return;
-      replace(scroller, nv.rows.length ? nv.rows.map(n => h("div.note-row", { "data-note": n.id },
+      swapRows(nv.rows.length ? nv.rows.map(n => h("div.note-row", { "data-note": n.id, role: "listitem", "aria-label": `Note: ${n.text}, by ${n.author}`, "data-fk": `note:${n.id}:row`, tabindex: "-1" },
         h("span.sw", { style: { background: safeColor(n.color), width: "10px", height: "10px" } }),
         h("div.txt", {}, h("div", {}, n.text),
           h("div.meta", {}, h("span.author", { style: { color: n.by ? colorOf(n.by) : "var(--muted)" } }, n.author), n.kind === "highlight" ? h("span", {}, "highlight") : null),
           h("div.acts", {},
-            port.jumpTo ? h("button", { onclick: () => port.jumpTo(n.at) }, "jump to") : null,
-            n.canEdit ? h("button", { onclick: () => port.editNote(n.id) }, "edit") : null,
-            n.canDelete ? h("button", { onclick: () => port.deleteNote(n.id) }, "delete") : null,
+            port.jumpTo ? h("button", { "data-fk": `note:${n.id}:jump`, onclick: () => port.jumpTo(n.at) }, "jump to") : null,
+            n.canEdit ? h("button", { "data-fk": `note:${n.id}:edit`, onclick: () => port.editNote(n.id) }, "edit") : null,
+            n.canDelete ? h("button", { "data-fk": `note:${n.id}:delete`, onclick: () => port.deleteNote(n.id) }, "delete") : null,
             n.locked ? h("span.lock", {}, `🔒 ${n.author}'s`) : null)))) : h("div.hint", {}, "No notes yet."),
         nv.more ? h("div.hint", {}, `${fmt(nv.more)} more`) : null);
     } else {
@@ -368,13 +374,14 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
       const which = only ? `only:${[...S.only].join(",")}` : S.list;
       // Keyed on what the rows show, so a reaction or a here doesn't rebuild every row; built only when the
       // records view changed (rvRev), else the last key stands.
+      scroller.setAttribute("role", "group"); scroller.setAttribute("aria-label", "Comments");
       if (sigs.drawerRev === `${which}|${S.open}|${rvRev}`) return;
       sigs.drawerRev = `${which}|${S.open}|${rvRev}`;
       if (!changed("drawer", JSON.stringify(["comments", which, S.open, list.map(t => [t.id, t.name, t.count, t.pending, t.detached, t.point, t.comments.find(c => !c.deleted)?.text])]))) return;
-      replace(scroller, list.length ? list.map(t => {
+      swapRows(list.length ? list.map(t => {
         const first = t.comments.find(c => !c.deleted);
         const go = () => { openThread(t.id); port.jumpTo?.({ x: t.x, y: t.y }); };
-        return h(`div.note-row.thread-row${t.resolved ? ".done" : ""}${S.open === t.id ? ".on" : ""}`, { "data-thread": t.id, role: "button", tabindex: "0",
+        return h(`div.note-row.thread-row${t.resolved ? ".done" : ""}${S.open === t.id ? ".on" : ""}`, { "data-thread": t.id, "data-fk": `thread:${t.id}`, role: "button", tabindex: "0",
           onclick: go, onkeydown: e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } } },
           av(t.by, t.name), h("div.txt", {}, h("div", {}, first?.text ?? ""),
             h("div.meta", {}, h("span", {}, t.name ?? "Someone"), h("span", {}, anchorText(t))),

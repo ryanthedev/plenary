@@ -930,7 +930,7 @@ describe("stuck host (#65)", () => {
   for (const how of ["the progress watchdog", "an append timeout"]) test(`L1 single node, ${how} stops the room: a writer's hello every 500 ms is served within the cooldown (ttl + margin) + two hello intervals`, async () => {
     const { bus, V, raw, host, lostWhy } = vworld();
     const sa = stallable(raw, V.timers);
-    const ttl = 3_000, margin = 60, watchdog = how === "the progress watchdog";
+    const ttl = 9_000, margin = 180, watchdog = how === "the progress watchdog";   // renewEvery 3,000: the watch's own poll would add up to 3 s
     const A = host({ store: sa.store, holder: "h-a", leaseTtlMs: ttl, heartbeatMs: 200, ...(watchdog ? { appendTimeoutMs: 600_000, stuckMs: 3_000, now: () => 5 } : { appendTimeoutMs: 500 }) });
     try {
       await A.open(T, B);
@@ -942,7 +942,7 @@ describe("stuck host (#65)", () => {
       sa.append = "ok";
       const stopAt = V.now();
       let served = null;
-      for (let i = 1; served === null && V.now() - stopAt < 20_000; i++) {   // the gateway: open, then the hello, on each writer reconnect
+      for (let i = 1; served === null && V.now() - stopAt < 40_000; i++) {   // the gateway: open, then the hello, on each writer reconnect
         const sentAt = V.now() - stopAt;
         await A.open(T, B); g.hello(`r${i}`, "a");
         await V.advance(500);

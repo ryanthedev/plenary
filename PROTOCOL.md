@@ -1200,13 +1200,13 @@ Unit **member** role is editable in its **management permissions only** (its nam
   The permissions the caller may tick are those they hold themselves (the same rule the server enforces), listed as `matrix.tickable` (a Unit admin: every management permission).
 - **No escalation.** Unless the caller is a Unit admin, a write needs the role's definition **at the Unit** (`roleDef(role, "unit")`: ladder content permissions plus management permissions, ladder step
   included) to be a **subset of the caller's own permissions at the Unit** (what the resolver gives them there, member role's included), both for the role as it is now (so a role cannot be edited, or
-  deleted, by someone who could not hold it) and as it would become. A permission the caller lacks cannot be put in a role, and a role above the caller cannot be touched. The `team.manage`
+  deleted, by someone who could not hold it) and as it would become. A permission the caller lacks cannot be put in a role, and a role above the caller cannot be touched. Every custom role carries a board step, whose content permissions are part of the measure, so a non-admin who holds no board content of their own (only the Unit `member` role's management permissions, say) can edit no role: delegating role editing means giving the delegate a role with a board step. A Unit admin is not held to it (they manage without content). The `team.manage`
   back door (§ Teams and access) still holds with no change: a Team's grants are re-read live, so a role edit that adds a permission to a role a Team holds is checked at the next Team change against
   the caller's own rights there.
 - **Validation** (`roleProblem`, then names): name trimmed 1-200, no NUL; `boardRole` one of the four steps for a custom role; `permissions` distinct management permissions; `member` takes
   `permissions` only (a `name` or `boardRole` in the patch is 400). Body fields outside the list are refused.
 - **The many-people warning.** An edit that changes `permissions` or `boardRole` of a role is **many** when it is used in **more than 10 places** or by **more than 50 people** (a person's grants plus the
-  sizes of the Teams that hold it, read for up to 50 Teams, each size counted to 1001; the Unit `member` role: the directory's member count, counted to 51), or when `member` is edited. A many edit
+  sizes of the Teams that hold it, read for up to 50 Teams, each size counted to 1001; the Unit `member` role: the directory's member count, counted to 51). A many edit
   without `confirm: true` changes **nothing** and answers `409 { error: "confirm-required", impact: { places, people, capped } }` (counts only, capped at 100 / 1001 / 51; no name). The screen shows the
   count and asks; **Save anyway** sends the same patch with `confirm: true`. A rename never needs it.
 - **Delete is refused while the role is in use** (decision: refuse, never reassign: reassigning would silently change what people can do). The check and the delete are ONE atomic Registry step

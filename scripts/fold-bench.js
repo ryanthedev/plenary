@@ -1,7 +1,7 @@
 // How long a checkpoint of an N MB board holds the event loop: the longest single block, in ms of wall clock
 // (PROTOCOL.md § Recovery, "Incremental fold"). A report, not a gate (the gate counts steps: test/fold.test.js).
-//   bun scripts/fold-bench.js [--root <repo>] [--mb 10,27,50] [--strokes 20] [--clients 4000]
-// --strokes N: a tail of N entries of ~600 KB each (big freehand strokes) to catch up before the copy; --clients N: N op-id records
+//   bun scripts/fold-bench.js [--root <repo>] [--mb 10,27,50] [--strokes 20 [--stroke-points 30000]] [--clients 4000]
+// --strokes N: a tail of N entries of ~600 KB each (freehand strokes: point arrays) to catch up before the copy; --clients N: N op-id records
 // of 256 pairs in the base (the heap the fold keeps afterwards is reported as `retainedMB`).
 // --root points at another checkout (e.g. `git archive <sha> packages server | tar -x -C <dir>`) to measure the old
 // whole-state fold against this one: the script uses whichever checkpoint API that tree has.
@@ -12,7 +12,7 @@ import { join } from "node:path";
 
 const arg = (k, d) => { const i = process.argv.indexOf(k); return i > 0 ? process.argv[i + 1] : d; };
 const root = resolve(arg("--root", new URL("..", import.meta.url).pathname));
-const sizes = arg("--mb", "10,27,50").split(",").map(Number), strokes = +arg("--strokes", 0), clients = +arg("--clients", 0);
+const sizes = arg("--mb", "10,27,50").split(",").map(Number), strokes = +arg("--strokes", 0), strokePoints = +arg("--stroke-points", 30_000), clients = +arg("--clients", 0);
 const { Room } = await import(`${root}/packages/protocol/room.js`);
 const { makeElement } = await import(`${root}/packages/core/model.js`);
 const encodePath = `${root}/server/encode/sliced.js`;
@@ -33,7 +33,7 @@ for (const mb of sizes) {
   const b = room.connect(() => {});
   room.receive(b, { t: "hello", v: 1, board: "b1", since: 0, client: "w" }, { n: 1, user: "ua", role: "editor" });
   room.receive(b, { t: "op", id: "w:1", sentAt: 0, stream: "board", op: { elements: [rect("second")] } }, { n: 2 });
-  for (let i = 0; i < strokes; i++) room.receive(b, { t: "op", id: `w:${i + 2}`, sentAt: 0, stream: "board", op: { elements: [rect(`stroke${i}`, { text: "s".repeat(600_000) })] } }, { n: i + 3 });
+  for (let i = 0; i < strokes; i++) room.receive(b, { t: "op", id: `w:${i + 2}`, sentAt: 0, stream: "board", op: { elements: [rect(`stroke${i}`, { points: Array.from({ length: strokePoints }, (_, k) => [k * 1.37 + 0.123, k * 0.91 + 0.456]) })] } }, { n: i + 3 });
   const out = { mb, elements: elements.length, ...(strokes ? { strokes } : {}), ...(clients ? { clients } : {}) };
   cp = null; Bun.gc(true); const heap0 = process.memoryUsage().heapUsed;
   let made;

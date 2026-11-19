@@ -295,6 +295,21 @@ describe.skipIf(!url)("postgres store", () => {
     } finally { stalled.release(); await store.close(); await drop(schema); }
   });
 
+  test("a checkpoint write stuck behind another session's lock on the lease row settles within leaseLockTimeoutMs as unavailable, then succeeds once it ends", async () => {
+    const schema = schemaName();
+    const store = await postgresStore({ url, schema, max: 2, leaseLockTimeoutMs: 500 });
+    const stalled = await client().reserve();
+    try {
+      const e = (await store.acquire(T, B, "h-a", 60_000)).epoch;
+      await stalled.unsafe("BEGIN");
+      await stalled.unsafe(`SELECT epoch FROM "${schema}".pl_leases WHERE tenant = $1 AND board = $2 FOR UPDATE`, [T, B]);   // a takeover mid-flight
+      expect(await orHung(code(store.putCheckpoint(T, B, { seq: 3 }, e)))).toBe("unavailable");   // the fence's FOR SHARE waits, then gives up: never forever
+      await stalled.unsafe("COMMIT");
+      await store.putCheckpoint(T, B, { seq: 3 }, e);
+      expect((await store.getCheckpoint(T, B)).seq).toBe(3);
+    } finally { stalled.release(); await store.close(); await drop(schema); }
+  });
+
   test("R2-L1: a lease call's lock wait is capped at half its ttl, even when leaseLockTimeoutMs is longer", async () => {
     const schema = schemaName();
     // The adapter runs on a client we own, whose transactions' statements are recorded: the bound Postgres is given is

@@ -525,12 +525,14 @@ older version of a deleted element would bring it back on that client only.
   - **Cost.** Element objects are never mutated once stored (`Doc.apply` replaces by id), so the checkpoint shares them
     with the shadow: the copy is of references, not of the board. The checkpoint also takes the shadow's op-id arrays
     (the shadow dies with the job). Work is counted in units: an element reference or a client's op-id pair = 1; an entry
-    applied = 16 + its op's chars / 32 (applying stringifies and clones what the entry carries, so **bytes** are the cost,
-    not element counts); a thread = 1 + its comments. A step stops after `FOLD_STEP_UNITS` (8192; the host's `foldUnits`),
-    so an entry over 256 KB of op text is a step of its own (the one unavoidable overshoot). Measured by
-    `scripts/fold-bench.js` at load ~10 to 30: the longest step is 0.5 to 1.7 ms at 10, 27 and 50 MB, 1.0 ms at 27 MB plus a
-    tail of 20 entries of 600 KB strokes (29 steps; before byte-counting a 20-entry 600 KB-stroke tail made one 78 ms
-    step), and 0.9 ms with 4,000 clients x 256 pairs (254 steps). Heap kept after a fold with 4,000 clients: 0.2 MB (the
+    applied = 16 + its op's chars / 16 (applying stringifies and clones what the entry carries, so **bytes** are the cost,
+    not element counts; calibrated on point-array strokes, which cost 2 to 3 times more per char than text); a thread = 1 +
+    its comments. A step stops after `FOLD_STEP_UNITS` (8192; the host's `foldUnits`), so about 128 KB of op text per
+    step. **One entry is indivisible**, so an entry over that is a step of its own: the ceiling of a step is the cost of
+    the largest entry in the tail (an op is at most about 1 MB). Measured by `scripts/fold-bench.js` at load ~10 to 30:
+    the longest step is 0.5 to 1.7 ms at 10, 27 and 50 MB; 1.0 ms for a tail of 1,500 strokes of 8 KB (120 steps); 0.9 ms
+    with 4,000 clients x 256 pairs (254 steps); and 5.4 ms (about 8 ms per MB of op) when the tail holds 660 KB point-array
+    strokes, each its own step (before byte-counting a 20-entry 600 KB-stroke tail made one 78 ms step). Heap kept after a fold with 4,000 clients: 0.2 MB (the
     old whole-state fold: 10.4 MB, as the bench measures it). The shadow's own size bookkeeping is off (`measure: false`).
   - **Scheduling is a port.** The package has no timers and runs in QuickJS: the room takes `schedule(fn)`, which runs `fn`
     on a later turn of the host's loop. The host passes `setImmediate` (its `schedule` option; tests pass a queue). With no

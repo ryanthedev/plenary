@@ -20,7 +20,7 @@ import { clone } from "../core/model.js";
 
 /** Work units per step: a step is a fraction of a millisecond to a few ms (test/fold-bench measures it). */
 export const FOLD_STEP_UNITS = 8192;
-const ENTRY_UNITS = 16, CHARS_PER_UNIT = 32;
+const ENTRY_UNITS = 16, CHARS_PER_UNIT = 16;
 
 export class Folder {
   /** @param {{ blank: () => object, base: () => object, tail: () => object[], sizes: () => number[] }} room  blank(): an empty log-less Room for the shadow;

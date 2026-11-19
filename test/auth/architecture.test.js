@@ -34,6 +34,7 @@ export const CLASSES = {
   "server/auth/resolver.js": "core",         // the permission resolver: pure union of every source, with sources (domain logic)
   "server/auth/permissions.js": "core",      // permissions, built-in roles, role clipping per scope (domain data, pure)
   "server/auth/access.js": "core",          // Teams and access at a scope (PROTOCOL.md § Teams and access)
+  "server/auth/roles.js": "core",           // Roles: custom roles and the permission matrix (PROTOCOL.md § Roles)
   "server/auth/spaces.js": "core",           // Spaces and Groups: pages, pickers, create, rename, general access (PROTOCOL.md § Spaces and Groups)
   "server/auth/home.js": "core",             // the Home screen's read side over the Registry port + tenancy (PROTOCOL.md § Home)
   "server/admin/boards.js": "core",          // admin use cases over the Registry port

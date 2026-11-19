@@ -33,11 +33,13 @@ test("every failure is a value from HOME_ERRORS, never a throw: 401, 403, 5xx, b
 });
 
 test("normalizeHome: can.createGroup is true only for a literal true", () => {
-  expect(normalizeHome(GOOD).can).toEqual({ createGroup: false, manageAccess: false });
-  expect(normalizeHome({ ...GOOD, can: { createGroup: true } }).can).toEqual({ createGroup: true, manageAccess: false });
-  expect(normalizeHome({ ...GOOD, can: { createGroup: "yes" } }).can).toEqual({ createGroup: false, manageAccess: false });
+  expect(normalizeHome(GOOD).can).toEqual({ createGroup: false, manageAccess: false, manageRoles: false });
+  expect(normalizeHome({ ...GOOD, can: { createGroup: true } }).can).toEqual({ createGroup: true, manageAccess: false, manageRoles: false });
+  expect(normalizeHome({ ...GOOD, can: { createGroup: "yes" } }).can).toEqual({ createGroup: false, manageAccess: false, manageRoles: false });
   expect(normalizeHome({ ...GOOD, can: { manageAccess: true } }).can.manageAccess).toBe(true);
   expect(normalizeHome({ ...GOOD, can: { manageAccess: 1 } }).can.manageAccess).toBe(false);
+  expect(normalizeHome({ ...GOOD, can: { manageRoles: true } }).can.manageRoles).toBe(true);
+  expect(normalizeHome({ ...GOOD, can: { manageRoles: 1 } }).can.manageRoles).toBe(false);
 });
 
 test("normalizeHome drops what the page must not render: bad ids, odd types, oversize lists and strings", () => {

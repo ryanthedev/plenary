@@ -15,8 +15,8 @@ import { TEAMS } from "./registry-port.js";
 /** What one read shows at most, and the work each does (PROTOCOL.md § Teams and access, Bounds). */
 export const LIMITS = Object.freeze({ teams: TEAMS.page.default, rows: 50, inherited: 20, boardPeople: 200, search: 8, admins: 100, scopes: 5000, teamScopes: 50, scopePage: 500, backlog: 2000, addPages: 20, retries: 3 });
 const TYPES = ["unit", "group", "space", "board"];
-const LADDER_NAMES = { viewer: "Viewer", commenter: "Commenter", annotator: "Annotator", editor: "Editor", owner: "Owner" };
-const LADDER_SUMMARY = {
+export const LADDER_NAMES = { viewer: "Viewer", commenter: "Commenter", annotator: "Annotator", editor: "Editor", owner: "Owner" };
+export const LADDER_SUMMARY = {
   viewer: "Can view", commenter: "Can view and comment", annotator: "Can view, comment and annotate", editor: "Can edit, and create boards and Spaces where that applies",
   owner: "Everything an editor can do, plus manage who has access, move, delete and transfer",
 };
@@ -24,9 +24,9 @@ const LADDER_SUMMARY = {
 const refused = () => new AdminError("forbidden", "not allowed");
 const missing = () => new AdminError("not-found", "not found");
 const bad = m => new AdminError("bad-request", m);
-const idOf = v => (typeof v === "string" && /^[\w-]{1,64}$/.test(v) ? v : null);
+export const idOf = v => (typeof v === "string" && /^[\w-]{1,64}$/.test(v) ? v : null);
 const userIdOf = v => (typeof v === "string" && v.length > 0 && v.length <= 200 && !v.includes("\0") && !v.includes("\n") ? v : null);
-const nameOf = v => { const n = typeof v === "string" ? v.trim() : ""; if (!n || n.length > 200 || n.includes("\0")) throw bad("bad name"); return n; };
+export const nameOf = v => { const n = typeof v === "string" ? v.trim() : ""; if (!n || n.length > 200 || n.includes("\0")) throw bad("bad name"); return n; };
 const queryOf = v => { if (v == null) return null; if (typeof v !== "string" || v.length > 100 || v.includes("\0")) throw bad("bad query"); return v.trim() || null; };
 const cursorOf = (v, kind) => {
   if (v == null) return null;
@@ -37,7 +37,7 @@ const cursorOf = (v, kind) => {
 /** "google:123" / "dev:ada" → the part a person would read, for a user with no directory entry. */
 const plainName = id => String(id).replace(/^[a-z]+:/, "");
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const mgmtOf = def => [...def.permissions].filter(p => MGMT_PERMS.includes(p));
+export const mgmtOf = def => [...def.permissions].filter(p => MGMT_PERMS.includes(p));
 
 /**
  * @param {{ registry: import("./registry-port.js").Registry, tenancy: ReturnType<typeof import("./tenancy.js").tenancy>,
@@ -379,6 +379,7 @@ export function accessService({ registry, tenancy, announce = () => {}, backlog 
         else await registry.setScopedGrant({ scope, subject: sub, role });
       } catch (err) {
         if (err?.code === "last-owner") throw new AdminError("last-owner", `a ${type} keeps at least one owner`);
+        if (err?.code === "no-role") throw new AdminError("bad-role", "that role does not apply here");   // deleted since it was read
         throw err;
       }
       // A change that reduces access is a revocation: anything but a pure widening (the new role holds every permission the old one did).

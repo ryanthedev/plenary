@@ -71,7 +71,7 @@
 // owns that pool) or `sql` (a Bun SQL client you own). `schema` names the Postgres schema. Never reads env.
 
 import { SQL } from "bun";
-import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText } from "../auth/registry-port.js";
+import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 import { needSchema, migrate, assertColumns, missing as absent } from "../pg/schema.js";
 
@@ -81,7 +81,7 @@ import { needSchema, migrate, assertColumns, missing as absent } from "../pg/sch
  * never sent; "client-timeout": sent, no answer). Match on `err.code`.
  */
 export class PgRegistryError extends Error {
-  /** @param {"last-owner" | "lock-timeout" | "statement-timeout" | "overloaded" | "queue-timeout" | "client-timeout"} code */
+  /** @param {"last-owner" | "limit" | "in-use" | "lock-timeout" | "statement-timeout" | "overloaded" | "queue-timeout" | "client-timeout"} code */
   constructor(code, message, options) {
     super(message, options); this.name = "RegistryError"; this.code = code;
   }
@@ -147,6 +147,7 @@ export const REGISTRY_INDEXES = {
   reg_invites_email: "reg_invites (email)",
   reg_link_uses_member: "reg_link_uses (member, board)",
   reg_scope_grants_subject: "reg_scope_grants (subject_type, subject, scope_type)",
+  reg_scope_grants_role: "reg_scope_grants (role, subject_type, subject)",
   reg_team_members_member: "reg_team_members (member)",
 };
 /** The tables' column definitions for one schema (foreign keys name it), as `migrate` takes them. */
@@ -221,6 +222,9 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
   const seq = async fs => { const out = []; for (const f of fs) out.push(await f()); return out; };
   const ready = () => { if (!open) throw new Error("registry: closed"); };
   /** One durable, bounded write transaction: the timeouts ride the synchronous_commit round trip (a caller's `sql` too). */
+  /** A grant row `g` of this Unit (`tenant` = a parameter like "$3"): a scoped grant has no tenant column, its scope's row says whose it is. */
+  const ownGrant = t => `CASE g.scope_type WHEN 'unit' THEN g.scope_id = ${t} WHEN 'group' THEN EXISTS (SELECT 1 FROM ${GR} x WHERE x.id = g.scope_id AND x.tenant = ${t}) `
+    + `WHEN 'space' THEN EXISTS (SELECT 1 FROM ${SP} x WHERE x.id = g.scope_id AND x.tenant = ${t}) ELSE EXISTS (SELECT 1 FROM ${BD} x WHERE x.id = g.scope_id AND x.tenant = ${t}) END`;
   const write = f => db.begin(async tx => {
     await tx.unsafe("SELECT set_config('synchronous_commit', 'on', true), set_config('lock_timeout', $1, true), "
       + "set_config('statement_timeout', $2, true)", [String(lockMs), String(stmtMs)]);
@@ -728,6 +732,8 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       await write(async tx => {
         const tenant = await tenantOfScope(tx, type, id);
         if (!tenant) throw new Error("registry: no such scope");
+        // FOR KEY SHARE conflicts with deleteRole's FOR UPDATE: the delete either waits for this grant (then sees it: in-use) or has committed (no row: refused).
+        if (isCustomRoleId(r) && !(await one(tx, `SELECT 1 AS x FROM ${RO} WHERE tenant = $1 AND id = $2 FOR KEY SHARE`, [tenant, r]))) throw new PgRegistryError("no-role", "no such custom role in this Unit");
         if (sub.type === "team" && (await one(tx, `SELECT tenant FROM ${TE} WHERE id = $1`, [sub.id]))?.tenant !== tenant) throw new Error("registry: no such team");
         if (type === "board" && sub.type === "user") throw new Error("registry: a user's grant on a board is setGrant");
         if (type === "group" || type === "space") {
@@ -753,14 +759,16 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       const { type, id } = orgDefaults.scope(scope);
       return key(id) ? (await grantsOn(db, type, id)).map(rowSg) : [];
     },
-    async createRole({ tenant, name, base = null, boardRole, permissions = [] }) {
+    async createRole({ tenant, name, base = null, boardRole, permissions = [], max, idem }) {
       ready();
       if (!key(tenant)) throw new Error("registry: no such tenant");
-      const n = orgDefaults.name(name), createdAt = now(), perms = JSON.stringify([...permissions]);
+      const n = orgDefaults.name(name), createdAt = now(), perms = JSON.stringify([...permissions]), k = idemStart(idem);
       return write(async tx => {
-        if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
+        if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1 FOR NO KEY UPDATE`, [tenant]))) throw new Error("registry: no such tenant");   // the Unit's row serialises creates, so `max` is exact
         let id;
         for (;;) { id = mint.role(); if (!(await one(tx, `SELECT 1 AS x FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id]))) break; }
+        await idemPut(tx, k, id, createdAt);          // before the cap: a replay of a role that fit is a replay even when the Unit is full now
+        if (max !== undefined && (await one(tx, `SELECT count(*)::int AS n FROM ${RO} WHERE tenant = $1 AND id <> $2`, [tenant, MEMBER_ROLE_ID])).n >= max) throw new PgRegistryError("limit", "the Unit has the most custom roles it can");
         await tx.unsafe(`INSERT INTO ${RO} (tenant, id, name, base, board_role, permissions, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
           [tenant, id, n, nz(base), nz(boardRole), perms, createdAt]);
         return rowRole(await one(tx, `SELECT * FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id]));
@@ -787,6 +795,31 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         return rowRole(await one(tx, `SELECT * FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id]));
       });
     },
+    async deleteRole(tenant, id) {
+      ready();
+      if (id === MEMBER_ROLE_ID) throw new Error("registry: bad role");
+      if (!key(tenant) || !key(id)) throw new Error("registry: no such role");
+      return write(async tx => {
+        if (!(await one(tx, `SELECT 1 AS x FROM ${RO} WHERE tenant = $1 AND id = $2 FOR UPDATE`, [tenant, id]))) throw new Error("registry: no such role");
+        if (await one(tx, `SELECT 1 AS x FROM ${SG} g WHERE g.role = $1 AND ${ownGrant("$2")} LIMIT 1`, [id, tenant])) throw new PgRegistryError("in-use", "a grant still holds this role");
+        await tx.unsafe(`DELETE FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id]);
+      });
+    },
+    async roleUsage(tenant, ids, { cap } = {}) {
+      ready();
+      if (!key(tenant) || (ids ?? []).includes(MEMBER_ROLE_ID)) throw new Error("registry: bad role");
+      const c = capOf(cap, ROLE_LIMITS.usageCap), out = new Map();
+      for (const id of [...new Set((ids ?? []).filter(key))].slice(0, ROLE_LIMITS.custom + 1)) {
+        const own = ownGrant("$3");
+        const u = await one(db, `SELECT (SELECT count(*)::int FROM (SELECT 1 FROM ${SG} g WHERE g.role = $1 AND ${own} LIMIT $2) a) AS places,
+          (SELECT count(*)::int FROM (SELECT DISTINCT g.subject FROM ${SG} g WHERE g.role = $1 AND g.subject_type = 'user' AND ${own} LIMIT $2) b) AS users,
+          (SELECT coalesce(string_agg(subject, ',' ORDER BY subject), '') FROM (SELECT DISTINCT g.subject FROM ${SG} g WHERE g.role = $1 AND g.subject_type = 'team' AND ${own} ORDER BY g.subject LIMIT $4) c) AS teams`,
+          [id, c + 1, tenant, ROLE_LIMITS.teamIds]);
+        out.set(id, { places: u.places, users: u.users, teams: u.teams ? u.teams.split(",") : [] });
+      }
+      return out;
+    },
+    async memberCount(tenant, { cap } = {}) { ready(); return key(tenant) ? (await one(db, `SELECT count(*)::int AS n FROM (SELECT 1 FROM ${MB} WHERE tenant = $1 LIMIT $2) x`, [tenant, capOf(cap, ROLE_LIMITS.memberCap) + 1])).n : 0; },
     async role(tenant, id) { ready(); return key(tenant) && key(id) ? rowRole(await one(db, `SELECT * FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id])) : null; },
     async roles(tenant) { ready(); return key(tenant) ? (await db.unsafe(`SELECT * FROM ${RO} WHERE tenant = $1 ORDER BY created_at, id`, [tenant])).map(rowRole) : []; },
     // The resolver's one read: ONE statement (so one consistent snapshot) however many grants, Teams or members exist:

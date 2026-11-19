@@ -255,7 +255,7 @@ test("§ Pacing: frames read from a live socket faster than they are handled are
   await until(() => s.texts.some(t => t.includes('"welcome"')), "the welcome");
   const pad = "x".repeat(1000);
   const burst = Array.from({ length: 300 }, (_, i) => ({ t: "presence", k: "cursor", x: i, y: 0, pad }));
-  for (const m of burst) s.send(m);
+  s.sendAll(burst);
   await s.closed;
   expect(s.texts.map(t => JSON.parse(t)).filter(m => m.t === "error")).toEqual([{ t: "error", code: "unavailable", message: "too much sent at once" }]);
   expect(r.logs().some(l => l.msg === "frame queue overflow" && l.state === "live")).toBe(true);

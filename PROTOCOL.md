@@ -938,7 +938,7 @@ board's chain (its Space, Group and tenant records) for at most its `ttlMs` and 
 Design: design/orgs/JOURNEY.md (J1, J5, §4 [home], §5). Code: `server/auth/home.js` (core), routes in `server/auth/http.js`,
 Registry calls below. All routes authenticate like every other route in http.js: `Authorization: Bearer <session or dev token>`, no cookie.
 
-- `GET /home` → `{ guest, user, unit, recent, starred, owned, shared, tree, limits, can: { createGroup } }`. A Unit member's first `/home` makes their personal space (`ensurePersonalSpace`, idempotent), so it is always in the tree; `can.createGroup` = the caller holds `group.create` at the Unit root (false for a guest); `can.manageAccess` = the caller holds `members.manage` at the Unit (the page then links the Unit's access page; false for a guest).
+- `GET /home` → `{ guest, user, unit, recent, starred, owned, shared, tree, limits, can: { createGroup, manageAccess, manageRoles } }`. A Unit member's first `/home` makes their personal space (`ensurePersonalSpace`, idempotent), so it is always in the tree; `can.createGroup` = the caller holds `group.create` at the Unit root (false for a guest); `can.manageAccess` = the caller holds `members.manage` at the Unit (the page then links the Unit's access page; false for a guest).
   - `guest`: true when the caller has no Unit (`tenantOf` null: a gmail user, a domain with no Unit, and every dev-token user without a
     domain, so the README "Try it" users are guests). A guest gets **Recent, Your boards (`owned`) and Shared with me (`shared`)**
     (JOURNEY J1): `starred` is `[]` (no Starred: a guest's star is refused, 403), `tree` is null, `unit` null, and the page offers no "New board".

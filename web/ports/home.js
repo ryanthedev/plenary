@@ -25,7 +25,7 @@ export const HOME_ERRORS = Object.freeze(["auth", "forbidden", "unavailable", "n
  * @typedef {{ id: string, name: string, personal: boolean }} SpaceNode
  * @typedef {{ groups: { id: string, name: string, spaces: SpaceNode[] }[], spaces: SpaceNode[], other: { boards: { id: string, title: string }[], more: boolean }, more: boolean }} Tree
  * @typedef {{ guest: boolean, user: { user: string, name: string }, unit: { id: string, kind: string } | null,
- *   recent: Card[], starred: Card[], owned: Card[], shared: Card[], tree: Tree | null, limits: Record<string, number>, can: { createGroup: boolean, manageAccess: boolean } }} HomeData
+ *   recent: Card[], starred: Card[], owned: Card[], shared: Card[], tree: Tree | null, limits: Record<string, number>, can: { createGroup: boolean, manageAccess: boolean, manageRoles: boolean } }} HomeData
  * @typedef {object} HomePort
  * @property {() => Promise<{ home: HomeData } | { error: string }>} load
  * @property {(q: string) => Promise<{ q: string, results: Card[], more: boolean } | { error: string }>} search

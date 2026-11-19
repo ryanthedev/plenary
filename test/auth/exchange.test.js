@@ -270,3 +270,78 @@ test("exp comes from the sessions adapter's verify(), not the token's format; no
     expect((await exchange(s.code, { cookie: s.cookie })).status).toBe(200);
   }
 });
+
+test("a Unit member's sign-in is recorded in the member directory (best effort); a guest's is not", async () => {
+  const unit = (await registry.tenantByDomain("acme.com"));
+  const a = await signIn(ADMIN);
+  expect((await exchange(a.code, { cookie: a.cookie })).status).toBe(200);
+  await new Promise(r => setTimeout(r, 0));
+  expect(await registry.membersAmong(unit.id, ["google:1001"])).toEqual([{ user: "google:1001", name: "Ann", email: "ann@acme.com" }]);
+  const g = await signIn(GUEST);
+  expect((await exchange(g.code, { cookie: g.cookie })).status).toBe(200);
+  await new Promise(r => setTimeout(r, 0));
+  expect(await registry.membersAmong(unit.id, ["google:2001"])).toEqual([]);
+  // a Registry that cannot record never fails the sign-in
+  const broken = new Proxy(registry, { get: (t, k) => (k === "touchMember" ? async () => { throw new Error("down"); } : t[k]) });
+  const via = node({ registry: broken });
+  const b = await signIn({ ...ADMIN, sub: "1002", email: "bo@acme.com" }, { via });
+  expect((await exchange(b.code, { cookie: b.cookie, via })).status).toBe(200);
+});
+
+test("the directory write after sign-in is bounded: 16 in flight, one per user, the rest dropped; failures log one rate-limited line", async () => {
+  const unit = await registry.tenantByDomain("acme.com");
+  let calls = 0, release; const gate = new Promise(r => { release = r; });
+  const slow = new Proxy(registry, { get: (t, k) => (k === "touchMember" ? async (...a) => { calls++; await gate; return t.touchMember(...a); } : t[k]) });
+  const via = node({ registry: slow });
+  const signed = [];
+  for (let i = 0; i < 20; i++) {
+    const s = await signIn({ ...ADMIN, sub: `30${String(i).padStart(2, "0")}`, email: `u${i}@acme.com` }, { via });
+    expect((await exchange(s.code, { cookie: s.cookie, via })).status).toBe(200);
+    signed.push(`google:30${String(i).padStart(2, "0")}`);
+  }
+  await new Promise(r => setTimeout(r, 0));
+  expect(calls).toBe(16);                                       // the other four were dropped, not queued
+  release(); await new Promise(r => setTimeout(r, 5));
+  expect((await registry.membersAmong(unit.id, signed)).length).toBe(16);
+  // one in flight per user: a second sign-in of the same person while the first write runs adds none
+  let again = 0, release2; const gate2 = new Promise(r => { release2 = r; });
+  const once = new Proxy(registry, { get: (t, k) => (k === "touchMember" ? async () => { again++; await gate2; } : t[k]) });
+  const v2 = node({ registry: once });
+  for (let i = 0; i < 3; i++) { const s = await signIn(ADMIN, { via: v2 }); await exchange(s.code, { cookie: s.cookie, via: v2 }); }
+  await new Promise(r => setTimeout(r, 0));
+  expect(again).toBe(1);
+  release2();
+  // failures: one warn per minute, with nothing identifying in it
+  const warns = [];
+  const down = new Proxy(registry, { get: (t, k) => (k === "touchMember" ? async () => { throw new Error("secret-detail google:1001"); } : t[k]) });
+  const v3 = node({ registry: down, log: { warn: (m, f) => warns.push([m, f]) } });
+  for (let i = 0; i < 3; i++) { const s = await signIn({ ...ADMIN, sub: `40${i}`, email: `d${i}@acme.com` }, { via: v3 }); await exchange(s.code, { cookie: s.cookie, via: v3 }); await new Promise(r => setTimeout(r, 0)); }
+  expect(warns).toHaveLength(1);
+  expect(JSON.stringify(warns)).not.toMatch(/secret-detail|google:|acme/);
+  clock.t += 61_000;
+  const s = await signIn({ ...ADMIN, sub: "409", email: "d9@acme.com" }, { via: v3 }); await exchange(s.code, { cookie: s.cookie, via: v3 }); await new Promise(r => setTimeout(r, 0));
+  expect(warns).toHaveLength(2);
+});
+
+test("a hung directory write keeps its slot past the cutoff (it only logs); the slot frees when the write settles; drops are logged anonymously", async () => {
+  let release; const gate = new Promise(r => { release = r; });
+  const hang = new Proxy(registry, { get: (t, k) => (k === "touchMember" ? async () => { await gate; } : t[k]) });
+  const warns = [];
+  const via = node({ registry: hang, log: { warn: (m, f) => warns.push([m, f]) }, config: { ...config, touchTimeoutMs: 30 } });
+  const signAs = async n => { const s = await signIn({ ...ADMIN, sub: `50${String(n).padStart(2, "0")}`, email: `h${n}@acme.com` }, { via }); expect((await exchange(s.code, { cookie: s.cookie, via })).status).toBe(200); };
+  for (let i = 0; i < 17; i++) await signAs(i);
+  await new Promise(r => setTimeout(r, 0));
+  expect(warns.map(w => w[0])).toEqual(["member directory write dropped (too many in flight); Home records the person later"]);
+  await new Promise(r => setTimeout(r, 80));                    // past the cutoff: still hung, still holding its slot
+  clock.t += 61_000;
+  await signAs(98);                                             // dropped: the 16 slots are still taken
+  await new Promise(r => setTimeout(r, 0));
+  expect(warns).toHaveLength(2);
+  expect(warns[1][0]).toContain("dropped");
+  release(); await new Promise(r => setTimeout(r, 5));          // the writes settle: slots free
+  clock.t += 61_000;
+  warns.length = 0;
+  await signAs(99); await new Promise(r => setTimeout(r, 0));
+  expect(warns).toHaveLength(0);                                // accepted, not dropped
+  expect(JSON.stringify(warns)).not.toMatch(/google:|acme/);
+});

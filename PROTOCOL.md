@@ -829,8 +829,7 @@ record.
 ### Organization (Units, Groups, Spaces, Teams)
 
 Boards are organized as **Unit > Group > Space > Board**. Design: design/orgs/JOURNEY.md (§ 1, 2). The Registry stores it
-(§ Registry, "Organization"); the resolver below turns it into access. Nothing here adds an HTTP route or UI: those are
-the later board-organization issues.
+(§ Registry, "Organization"); the resolver below turns it into access. The routes and pages are § Home, § Spaces and Groups and § Teams and access.
 
 - **Unit** = today's tenant, plus a `kind` label (`company` | `enterprise`) and **one or more Workspace domains**
   (`tenant.domains`; `tenant.domain` stays the first). A domain belongs to at most one tenant. Units don't nest, so the
@@ -843,6 +842,8 @@ the later board-organization issues.
   Spaces existed).
 - **Personal space**: a Space with an `owner` (one per member per Unit, made by `ensurePersonalSpace`), private
   (`generalRole` null), the member its owner. **Team**: a named set of Unit members.
+- **A Team's membership is a grant.** Adding someone to a Team gives them each role the Team holds, so changing membership (and deleting the Team) needs the caller to be able to grant
+  or revoke each of those roles at each of those scopes, unless they are a Unit admin (§ Teams and access). No `team.manage` holder can reach a role through a Team they could not grant directly.
 - **Scoped grants**: a role for a user or a Team on a Unit, Group, Space or board (`setScopedGrant`). A user's own grant on
   a board stays in `grants` (`setGrant`), so the room's path and the last-owner rule are unchanged. A Group or Space keeps
   at least one `owner` grant (a user's or a Team's), atomically, like a board (the Unit's admins are the backstop and aren't counted).
@@ -854,12 +855,12 @@ the later board-organization issues.
 
 **Permissions** (`server/auth/permissions.js`): `board.view`, `board.comment`, `board.annotate`, `board.edit` (board content:
 cumulative up the ladder) and the management permissions `board.create`, `space.create`, `group.create`, `members.manage`, `move`, `delete`,
-`transfer`, `roles.manage`. A role held at a scope gives its permissions *within that scope* (a role on a container
-covers everything inside it), clipped to what exists there: `roles.manage` and `group.create` only at the Unit; `space.create` at the Unit
+`transfer`, `roles.manage`, `team.manage`. A role held at a scope gives its permissions *within that scope* (a role on a container
+covers everything inside it), clipped to what exists there: `roles.manage`, `team.manage` and `group.create` only at the Unit; `space.create` at the Unit
 and Groups; `board.create` at the Unit, Groups and Spaces; a board has only the ladder plus `members.manage`, `move`, `delete`
 and `transfer`. Built-ins: `owner` = the four content permissions plus `board.create`, `space.create`, `members.manage`,
 `move`, `delete`, `transfer`; `editor` = content plus `board.create`, `space.create`; `annotator`, `commenter`, `viewer` =
-content only; Unit `admin` = every management permission (and board content only where the deployment sets
+content only; Unit `admin` = every management permission, `team.manage` included (and board content only where the deployment sets
 `adminBoardContent`, below); Unit `member` = `space.create` until an admin edits it.
 
 **Resolution** (`server/auth/resolver.js`, pure). An identity's access to a board (or to a Space, Group or the Unit) is
@@ -937,7 +938,7 @@ board's chain (its Space, Group and tenant records) for at most its `ttlMs` and 
 Design: design/orgs/JOURNEY.md (J1, J5, §4 [home], §5). Code: `server/auth/home.js` (core), routes in `server/auth/http.js`,
 Registry calls below. All routes authenticate like every other route in http.js: `Authorization: Bearer <session or dev token>`, no cookie.
 
-- `GET /home` → `{ guest, user, unit, recent, starred, owned, shared, tree, limits, can: { createGroup } }`. A Unit member's first `/home` makes their personal space (`ensurePersonalSpace`, idempotent), so it is always in the tree; `can.createGroup` = the caller holds `group.create` at the Unit root (false for a guest).
+- `GET /home` → `{ guest, user, unit, recent, starred, owned, shared, tree, limits, can: { createGroup } }`. A Unit member's first `/home` makes their personal space (`ensurePersonalSpace`, idempotent), so it is always in the tree; `can.createGroup` = the caller holds `group.create` at the Unit root (false for a guest); `can.manageAccess` = the caller holds `members.manage` at the Unit (the page then links the Unit's access page; false for a guest).
   - `guest`: true when the caller has no Unit (`tenantOf` null: a gmail user, a domain with no Unit, and every dev-token user without a
     domain, so the README "Try it" users are guests). A guest gets **Recent, Your boards (`owned`) and Shared with me (`shared`)**
     (JOURNEY J1): `starred` is `[]` (no Starred: a guest's star is refused, 403), `tree` is null, `unit` null, and the page offers no "New board".
@@ -1104,6 +1105,73 @@ submit**. Without the header a create behaves as before.
 - **Port** (§ Registry, `idemClaim`, `idemFinish`, `idemRelease`): the store is behind the Registry port; memory, SQLite (`reg_idempotency`) and Postgres
   (`reg_idempotency`, one atomic upsert-claim) implement it, and `registry-contract.js` pins the three.
 
+## Teams and access (#49)
+
+Design: design/orgs/JOURNEY.md (J4, J9, J10, §4 [space-settings] [access] [unit-members, teams]). Code: `server/auth/access.js` (core: every decision below),
+routes in `server/auth/http.js` (they only translate), Registry calls `renameTeam`, `deleteTeam`, `teamsPage`, `teamsAmong`, `teamMembersPage`, `scopedGrantsPage`,
+`touchMember`, `membersAmong`, `findMembers` (§ Registry). Every route authenticates like Home (`Authorization: Bearer`) and **checks permissions, never role names**.
+Names are access, exactly as in § Spaces and Groups: an id the caller may not use (unknown, in another Unit, or hidden) gets one answer (a read `404 not-found`, a write
+`403 forbidden`, same body) and the same Registry work; a caller with no Unit (a guest) gets 403 everywhere.
+
+**The member directory.** A Unit's membership comes from `hd` at sign-in and is not stored, so a person can be added to a Team, Space, Group or the Unit only after the
+server has seen them: `GET /home` and the sign-in code exchange (best effort) record the caller in `reg_members (tenant, member, name, email)` (the exchange write is bounded: at most 16 directory writes in flight per process and one per user at a time, a slot frees only when its write settles, which the Registry's own bounds guarantee (SQLite `busy_timeout`, Postgres `lock_timeout`/`statement_timeout`); after 5 s (`config.touchTimeoutMs`, clamped like `devSignIn.waitMs`) the write is only logged as slow; the excess is dropped (the person's next Home records them); a failure, slow write or drop logs one rate-limited warning that identifies no one) (`touchMember`: one read, a write only when the row is new or the name
+or email changed). A person who has never signed in is not in the directory and cannot be added to a Team, Group, Space or the Unit (400 `unknown-person`, the same answer for an id that is a guest, in
+another Unit or never seen). A change to a grant that already exists needs no directory row. A NEW person grant on a board (this surface and `PUT /boards/:board/grants/:user`, one rule, `knownOnBoard` in server/admin/boards.js) is accepted only for a person in the board's Unit's directory (or an admin of it named by id), one who already holds a grant on that board, or a guest who redeemed a link of that board; never an `email:` entry, another Unit's member or an id nobody has seen (400 `unknown-person`). A Unit admin named by user id (`tenant.admins`, an `email:` entry excluded) counts as in the directory. Searching is `findMembers`: ASCII-folded substring of name, email or
+user id, at most 50 results, by name then id; it scans one Unit's rows, never another's. A row with no directory entry (a grant older than the directory) is shown with
+the name derived from its id (the part after `google:` / `dev:`).
+
+**Teams.** A Team is a named set of Unit members. **Who manages a Team: the `team.manage` permission at the Unit root** (a new management permission; Unit scope only:
+clipped away at Group, Space and board; the built-in Unit `admin` holds it, the Unit `member` role does not by default, and a custom role may carry it). A Team has no owner of
+its own and so no last-owner rule of its own; what protects a Group or Space is that it keeps one counted `owner` (below), and a Team that is such an owner cannot be deleted
+or emptied while it is the only one. Any Unit member may read the Team list and a Team's members (the Unit's directory, like a GitHub organisation's teams).
+
+| Route | Needs | Answers |
+|---|---|---|
+| `GET /teams?after=&q=` | a Unit | `{ teams: [{ id, name, size }], next, can: { create } }`: by id, 50 a page (`next` is the cursor); `q` = ASCII-folded name substring (1-100 chars); `size` counts to 1001 (1001 = more than 1000); `can.create` = `team.manage` at the Unit |
+| `POST /teams` `{ name }` | `team.manage` | 201 `{ team: { id, name, size: 0 } }`; name trimmed, 1-200 |
+| `GET /teams/:id?after=` | a Unit; the Team in the caller's Unit | `{ team: { id, name, size }, can: { manage }, members: [{ user, name, email }], next }`: members by user id, 50 a page |
+| `PATCH /teams/:id` `{ name }` | `team.manage` | 200 `{ team }` |
+| `DELETE /teams/:id` | `team.manage` | 204. Removes the Team, its members and every grant it holds in one atomic step. **409 `last-owner`** (nothing changes) if it is the only counted owner of a Group or Space. **409 `too-large`** if it holds grants on more than 5000 scopes (remove some first) |
+| `PUT /teams/:id/members/:user` | `team.manage`; `:user` in the directory | 204, idempotent. A guest or unknown person: 400 `unknown-person` |
+| `DELETE /teams/:id/members/:user` | `team.manage` | 204, idempotent. **409 `last-owner`** if it would empty the only counted owner of a Group or Space |
+
+**A Team's grants are the caller's to give.** Adding a person to a Team gives them every grant the Team holds, and removing one (or deleting the Team) takes those away, so `team.manage`
+alone is not enough: unless the caller is a Unit admin, they must be able to do each of those as a direct grant, that is `members.manage` at each scope the Team holds a grant on and
+the role grantable by them there (the rule of § Access at a scope below, `owner` on a board only for a Unit admin). The check runs at write time over `scopesOf({ type: "team" })`, at most 50
+scopes (51 are read to tell); a Team holding more, or any scope the caller falls short on, is the ordinary 403 `forbidden`, the same body whatever the reason (it names no scope). A role stored on a
+Team that means nothing at its scope is ignored. Granting a Team a role (`PUT /access/.../grants/team/...`) is checked exactly as for a person.
+
+A Team's members are Unit members only; a Team membership or grant written for a guest is inert (§ Organization), which is why the write is refused rather than stored.
+
+**Access at a scope.** One surface for every scope: `unit` (id = the Unit's id), `group`, `space` and `board`.
+
+| Route | Needs | Answers |
+|---|---|---|
+| `GET /access/:type/:id?after=` | open the scope, or `members.manage` at it | `{ scope: { type, id, name? }, can: { manage }, general, admins, rows, next, inherited, roles }` |
+| `PUT /access/:type/:id/grants/:subjectType/:subject` `{ role }` | `members.manage` at the scope; the role grantable by the caller (below) | 200 `{ row }`: adds the person (`subjectType` `user`; `:subject` the URL-encoded user id) or Team (`team`) with `role`, or changes their role; idempotent |
+| `DELETE /access/:type/:id/grants/:subjectType/:subject` | `members.manage`; the existing role manageable by the caller | 204, idempotent |
+| `GET /directory?q=` | a Unit | `{ people: [{ user, name, email }], teams: [{ id, name, size }] }`: the picker's search, at most 8 of each; `q` 0-100 chars (empty = the first ones) |
+
+- `rows`: the grants set AT this scope, by subject type then id, 50 a page: `{ subject: { type: "user"|"team", id, name, email?, size? }, role, roleName, via: "direct"|"team", can: { change, remove } }`.
+  `via` is `direct` for a person, `team` for a Team. At a board the first page also carries the board's direct person grants (`grants`, up to 200). `can.*` is per row (below).
+- `general`: the general-access row of this scope and of the containers above it: `[{ scope: { type, id, name? }, role }]` (a Space's `generalRole`, its Group's, a board's `memberRole`; null roles are left out). A scope's own change is `PATCH` (§ Spaces and Groups).
+- `inherited`: grants on the containers above (a board: its Space then its Group; a Space: its Group), the first 20 of each: `{ scope: { type, id, name }, subject, role, roleName, via: "inherited" }`; only for a container the caller can open (names are access); read-only.
+- `admins` (`unit` scope only): the Unit's admins by id, up to 100, `{ user, name, email }`; admin is not a grantable role, so these rows are read-only.
+- `roles`: the picker: **the roles valid at this scope that the caller may grant**, `{ id, name, custom, summary, ladder, people }`. Built-in ladder roles `viewer` .. `owner` at Group, Space and board; at the Unit only custom roles (a Unit role is `admin` and `member`, neither grantable); custom roles filtered by `ALLOWED_AT` (a role is listed where `roleDef` gives it any meaning). `people: false` marks a role that cannot be given to a person (at a board, a custom role: a person's board grant is the ladder's own `grants` table) so the UI offers it for Teams only.
+- **Who may grant or change what.** The caller needs `members.manage` at the scope, and may only hand out or alter a role whose **management permissions are a subset of their own at that scope** (no escalation: `owner` needs `transfer`; a custom role with `delete` needs `delete`). Content permissions are not compared, so a Unit admin, who manages without content access, can still grant `editor`. At a **board**, today's rule stays (server/admin/boards.js): a person's grant goes through `setGrant`, so a board owner sets roles up to `editor`, may change an owner's grant only their own, and only a Unit admin sets `owner`; a Team's board grant follows the same limits. A role not valid at the scope (a Unit role, `admin`, `member`, unknown) is 400 `bad-role`. `can.change` / `can.remove` of a row is whether the same rule would allow it.
+- **Personal space.** Its access is its owner's own: `members.manage` there is not offered (`can.manage` false, writes 403), as for rename.
+- **Last owner.** A Space and a Group keep at least one counted `owner` (a person, or a Team with a member), atomically on memory, SQLite and Postgres (§ Registry). The access routes surface it as **409 `last-owner`**; the same holds for removing a Team's last member and deleting a Team. A board keeps its owner through `setGrant`'s own rule (unchanged). The Unit's admins are the backstop and are not counted.
+- **Idempotency.** `PUT` with the role already held and `DELETE` of nothing are successes that change nothing and announce nothing.
+
+**Freshness (§ Organization).** Every change here announces through the one bounded, fair scheduler of § Spaces and Groups (`announceChange`): a change to a grant on a Unit, Group,
+Space or board announces that scope's boards (a board scope: that board); a **Team member add or remove** pages `scopesOf({ type: "team", id })` (500 a page) and announces each scope;
+a **Team delete** collects those scopes first (refusing past 5000, 409 `too-large`), deletes, then announces each; a **rename** is not access and announces nothing. A change that reduces access (a
+removal, a lower role, a Team member removed, a Team deleted) is a revocation: it goes through the revocation queue and **is never dropped**. The walk over a Team's scopes waits (never drops) while the scheduler's backlog is above 2000, so a Team with many grants cannot grow it without bound. An add (`revoke: false`) beyond 20 pages of a Team's scopes is left to the timed re-check (≤ 60 s) with one log line.
+
+**Bounds.** `GET /teams`: one statement (size counted to 1001 per Team). `GET /teams/:id`: the Team row, one `effective` at the Unit, one member page, one `membersAmong`. `GET /access/..`: the scope row and its one `effective`
+(both whatever the id), then one grants page, one `membersAmong` and one `teamsAmong` over that page, the Unit's roles, and, for a Space or board, the container rows and their `effective`. `GET /directory`:
+one `findMembers` and one `teamsPage`. Nothing loops a Unit's members, boards or Spaces.
+
 ## Sign-in code exchange
 
 No long-lived token ever appears in a URL. After Google sign-in the server hands the page a single-use code, and the
@@ -1198,7 +1266,7 @@ method names are stable. Ids are server-minted over `[a-z0-9-]`.
 | share links | `createLink({ board, role, expiresAt, by })` (role per link), `link(id)`, `links(board)`, `revokeLink(id)`, `addLinkUse(link, user)`, `linkUses(board, user)` |
 | idempotency | `idemClaim(user, key, fp) → { state: "new" \| "done" \| "in-progress" \| "mismatch", result? }`, `idemFinish(user, key, claim, result)`, `idemRelease(user, key, claim)` (§ Idempotent creates; `idemClaim` returns the `claim` on `new`) |
 | home | `markOpened(user, board)`, `recents(user, { limit })`, `setStarred(user, board, on)`, `starred(user, { limit })`, `starredAmong(user, boards)`, `sharedBoards(user, email, { limit })`, `searchBoards(tenant, { q, unfiled, after, scan })`, `spaceCandidates(tenant, { user, all, after, limit })`, `groupCandidates(tenant, { user, all, limit })`, `boardRows(boards, { user, email })` (§ Home) |
-| organization | `createGroup`, `group`, `groups`; `createSpace`, `space`, `spaces`, `ensurePersonalSpace(tenant, user)`; `createTeam`, `team`, `teams`, `setTeamMember`, `teamMembers`; `setScopedGrant({ scope, subject, role \| null })`, `scopedGrants(scope)`; `createRole`, `updateRole`, `role`, `roles`; `accessContext(scope, { users, chain })`; `boardsIn(scope, { after, limit })`, `scopesOf(subject, { after, limit })`; `accessContexts(scopes, { users })` (the batch of `accessContext`, one statement on Postgres), `rename({ type: "board"\|"space"\|"group", id }, name)`, `updateScope({ type: "space"\|"group", id }, { name?, generalRole? })` (atomic; returns the row), `spacesIn(group, { after, limit })` (§ Spaces and Groups) |
+| organization | `createGroup`, `group`, `groups`; `createSpace`, `space`, `spaces`, `ensurePersonalSpace(tenant, user)`; `createTeam`, `team`, `teams`, `setTeamMember`, `teamMembers`; `setScopedGrant({ scope, subject, role \| null })`, `scopedGrants(scope)`; `createRole`, `updateRole`, `role`, `roles`; `accessContext(scope, { users, chain })`; `boardsIn(scope, { after, limit })`, `scopesOf(subject, { after, limit })`; `accessContexts(scopes, { users })` (the batch of `accessContext`, one statement on Postgres), `rename({ type: "board"\|"space"\|"group", id }, name)`, `updateScope({ type: "space"\|"group", id }, { name?, generalRole? })` (atomic; returns the row), `spacesIn(group, { after, limit })` (§ Spaces and Groups); Teams and access (§ Teams and access): `renameTeam`, `deleteTeam` (atomic, `last-owner`), `teamsPage(tenant, { after, limit, q })`, `teamsAmong(tenant, ids)`, `teamMembersPage(team, { after, limit })`, `scopedGrant(scope, subject)`, `scopedGrantsPage(scope, { after, limit })`, and the member directory `touchMember(tenant, { user, name, email })`, `membersAmong(tenant, users)`, `findMembers(tenant, { q, limit })` (table `reg_members`) |
 
 Single node: SQLite; cluster: Postgres. The room never calls it; gateways and Auth do. On Postgres the server
 runs as a role that doesn't own the schema (§ Store, Least privilege).

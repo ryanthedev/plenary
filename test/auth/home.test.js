@@ -28,10 +28,10 @@ describe("a member's place and what they may create (#48)", () => {
     const h1 = await home.home(ada);
     expect(h1.tree.spaces.map(s => s.name)).toEqual(["ada's space"]);
     expect((await home.home(ada)).tree.spaces.length).toBe(1);               // idempotent
-    expect(h1.can).toEqual({ createGroup: false });
-    expect((await home.home(root)).can).toEqual({ createGroup: true });
+    expect(h1.can).toEqual({ createGroup: false, manageAccess: false });
+    expect((await home.home(root)).can).toEqual({ createGroup: true, manageAccess: true });
     const g = await home.home(kim);                                         // a guest has no Unit, so no personal space and no Group
-    expect([g.tree, g.can]).toEqual([null, { createGroup: false }]);
+    expect([g.tree, g.can]).toEqual([null, { createGroup: false, manageAccess: false }]);
   });
 });
 

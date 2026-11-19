@@ -41,6 +41,8 @@
 //   POST   /boards                             { title?, space?, memberRole? } → 201 { board }; board.create at `space`, else the personal space
 //   PATCH  /boards/:board                      { title } → 200 { board };  GET /spaces?can=board.create, GET /groups?can=space.create,
 //   POST /spaces, GET|PATCH /spaces/:id, GET|PATCH /groups/:id: PROTOCOL.md § Spaces and Groups (server/auth/spaces.js)
+//   GET|POST /teams, GET|PATCH|DELETE /teams/:id, PUT|DELETE /teams/:id/members/:user, GET /directory,
+//   GET /access/:type/:id, PUT|DELETE /access/:type/:id/grants/:subjectType/:subject: PROTOCOL.md § Teams and access (server/auth/access.js)
 //   (tenant of POST /boards = the caller's
 //   GET    /boards/:board/invites              → { invites }
 //   POST   /boards/:board/invites              { email, role, expiresAt? } → 201 { invite }
@@ -81,6 +83,7 @@
 
 import { b64url, unb64url, utf8, fromUtf8 } from "./util.js";
 import { spaceService } from "./spaces.js";
+import { accessService } from "./access.js";
 import { AdminError, createInvite, listInvites, readInvite, revokeInvite, createLink, listLinks, readLink, revokeLink, setGrant } from "../admin/boards.js";
 
 export const LOGIN_COOKIE = "__Host-plen_login";
@@ -130,7 +133,7 @@ const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
  *   now?: () => number, config: object, dev?: { enabled?: boolean, verify(t: string): Promise<object|null> } | null,
  *   testHooks?: { pruned?(p: { visited: number, expired: number, live: number }): void, routes?(table: { pattern: string, methods: string[], names: string[] }[]): void } | null }} deps   (tests only, not an API)
  */
-export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, spaces = spaceService({ registry, tenancy, home, now }), config = {}, dev = null, log = stdoutLog, testHooks = null, timers = { set: (f, ms) => setTimeout(f, ms), clear: h => clearTimeout(h) } }) {
+export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, spaces = spaceService({ registry, tenancy, home, now }), access = accessService({ registry, tenancy, announce: spaces.announceChange, backlog: spaces.backlog, settled: spaces.settled }), config = {}, dev = null, log = stdoutLog, testHooks = null, timers = { set: (f, ms) => setTimeout(f, ms), clear: h => clearTimeout(h) } }) {
   if (!registry || !sessions || !tenancy) throw new Error("http: registry, sessions and tenancy are required");
   /** `p`, or a rejection with message "timeout" after `ms` on the injected timers. */
   const bounded = (p, ms) => new Promise((res, rej) => { const t = timers.set(() => rej(new Error("timeout")), ms); p.then(v => { timers.clear(t); res(v); }, e => { timers.clear(t); rej(e); }); });
@@ -251,6 +254,25 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
     } catch { return null; }
   }
 
+  // The member directory write after a sign-in: best effort and bounded. At most TOUCH_MAX in flight and one per user at a time; the excess is
+  // dropped (the person's next Home records them). A slot frees only when the write itself settles: the Registry adapters bound their own calls
+  // (SQLite busy_timeout, Postgres lock_timeout/statement_timeout), so a hang cannot hold it for long. config.touchTimeoutMs (default 5 s,
+  // clamped like devSignIn.waitMs) only stops WAITING: it logs, it never frees the slot. A failure, a slow write or a drop logs one
+  // rate-limited line that identifies no one.
+  const TOUCH_MAX = 16, touching = new Set();
+  const tm = Number(config.touchTimeoutMs ?? 5000), TOUCH_MS = Number.isFinite(tm) && tm > 0 ? Math.min(2 ** 31 - 1, Math.max(1, Math.round(tm))) : 5000;
+  let lastTouchWarn = -Infinity;
+  const touchWarn = why => { if (now() - lastTouchWarn < 60_000) return; lastTouchWarn = now(); try { log?.warn?.(`member directory write ${why}; Home records the person later`); } catch {} };
+  function recordMember(identity) {
+    if (typeof registry.touchMember !== "function") return;
+    if (touching.size >= TOUCH_MAX || touching.has(identity.user)) { if (!touching.has(identity.user)) touchWarn("dropped (too many in flight)"); return; }
+    touching.add(identity.user);
+    const timer = setTimeout(() => touchWarn("is slow"), TOUCH_MS);
+    (async () => { const unit = await tenancy.tenantOf(identity); if (unit) await registry.touchMember(unit.id, identity); })()
+      .catch(() => touchWarn("failed"))
+      .finally(() => { clearTimeout(timer); touching.delete(identity.user); });
+  }
+
   async function exchange(req) {
     if (!oidc) return err(503, "sign-in-unavailable");
     // Origin first: a refusal here spends nothing (the contract's fake does the same).
@@ -269,6 +291,8 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
     let exp;
     try { exp = (await sessions.verify(token))?.exp; } catch { exp = null; }
     if (!Number.isInteger(exp)) { usedCodes.release(x.h); return err(503, "unavailable"); }
+    // The member directory (PROTOCOL.md § Teams and access): a Unit member who signs in is findable by the pickers. Best effort, off the request path.
+    recordMember(x.identity);
     return withCookie(json(200, { token, ...x.identity, exp }), clearXchg);
   }
 
@@ -495,6 +519,30 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       GET: async (req, p, url) => json(200, await spaces.groupPage(await caller(req), p.id, url.searchParams.get("after"))),
       PATCH: async (req, p) => { const who = await caller(req); return json(200, { group: await spaces.update(who, "group", p.id, await body(req, ["name", "general"])) }); },
     }],
+    ["/teams", {
+      GET: async (req, url) => json(200, await access.listTeams(await caller(req), { after: url.searchParams.get("after"), q: url.searchParams.get("q") })),
+      POST: async req => { const who = await caller(req); const b = await body(req, ["name"]); return json(201, { team: await access.createTeam(who, b) }); },
+    }],
+    ["/teams/:id", {
+      GET: async (req, p, url) => json(200, await access.teamPage(await caller(req), p.id, url.searchParams.get("after"))),
+      PATCH: async (req, p) => { const who = await caller(req); const b = await body(req, ["name"]); return json(200, { team: await access.renameTeam(who, p.id, b.name) }); },
+      DELETE: async (req, p) => { await access.deleteTeam(await caller(req), p.id); return json(204); },
+    }],
+    ["/teams/:id/members/:user", {
+      PUT: async (req, p) => { await access.setMember(await caller(req), p.id, p.user, true); return json(204); },
+      DELETE: async (req, p) => { await access.setMember(await caller(req), p.id, p.user, false); return json(204); },
+    }],
+    ["/directory", { GET: async (req, url) => json(200, await access.directory(await caller(req), { q: url.searchParams.get("q") })) }],
+    ["/access/:type/:id", { GET: async (req, p, url) => json(200, await access.accessPage(await caller(req), p.type, p.id, url.searchParams.get("after"))) }],
+    ["/access/:type/:id/grants/:subjectType/:subject", {
+      PUT: async (req, p) => {
+        const who = await caller(req);
+        const b = await body(req, ["role"]);
+        if (typeof b.role !== "string") throw refuse(400, "bad-request");
+        return json(200, { row: await access.setGrant(who, p.type, p.id, p.subjectType, p.subject, b.role) });
+      },
+      DELETE: async (req, p) => { await access.setGrant(await caller(req), p.type, p.id, p.subjectType, p.subject, null); return json(204); },
+    }],
     ["/boards/:board/invites", {
       GET: async (req, p) => json(200, { invites: await listInvites({ caller: await caller(req), board: p.board }, admin) }),
       POST: async (req, p) => {
@@ -608,6 +656,8 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
         if (e.code === "not-found") return err(404, "not-found");
         if (e.code === "bad-request") return err(400, "bad-request", { message: String(e.message).slice(0, 200) });
         if (e.code === "last-owner") return err(409, "last-owner");
+        if (e.code === "too-large") return err(409, "too-large");
+        if (e.code === "unknown-person" || e.code === "bad-role") return err(400, e.code);
         if (e.code === "owner-grant-failed") return err(503, "owner-grant-failed", { board: e.board });
       }
       return err(503, "unavailable");

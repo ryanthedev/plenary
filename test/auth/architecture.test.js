@@ -33,6 +33,7 @@ export const CLASSES = {
   "server/auth/tenancy.js": "core",          // role resolution over the Registry port
   "server/auth/resolver.js": "core",         // the permission resolver: pure union of every source, with sources (domain logic)
   "server/auth/permissions.js": "core",      // permissions, built-in roles, role clipping per scope (domain data, pure)
+  "server/auth/access.js": "core",          // Teams and access at a scope (PROTOCOL.md § Teams and access)
   "server/auth/spaces.js": "core",           // Spaces and Groups: pages, pickers, create, rename, general access (PROTOCOL.md § Spaces and Groups)
   "server/auth/home.js": "core",             // the Home screen's read side over the Registry port + tenancy (PROTOCOL.md § Home)
   "server/admin/boards.js": "core",          // admin use cases over the Registry port
@@ -176,6 +177,7 @@ test("planted: a route that writes the Registry itself is caught; the service fi
   expect(writesOrgDirectly("await registry.rename({ type: 'space' }, n)")).toBe(true);
   expect(writesOrgDirectly("await spaces.createBoard(who, b)")).toBe(false);
   expect(CLASSES["server/auth/spaces.js"]).toBe("core");
+  expect(CLASSES["server/auth/access.js"]).toBe("core");
   expect(violations([{ path: "server/auth/spaces.js", src: `import { x } from "./http.js";` }], CLASSES)).toEqual(expect.arrayContaining([expect.stringContaining("core imports driving")]));
   expect(violations([{ path: "server/auth/spaces.js", src: `import { x } from "./registry.js";` }], CLASSES)).toEqual(expect.arrayContaining([expect.stringContaining("core imports adapter")]));
 });

@@ -17,7 +17,7 @@
 // `user`; insertion order is an explicit `n` column (Postgres: BIGSERIAL / identity), upserts use ON CONFLICT.
 
 import { Database } from "bun:sqlite";
-import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, smallLimit, searchQuery, asciiFold } from "../auth/registry-port.js";
+import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 
 /** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code`. */
@@ -122,6 +122,8 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), name TEXT NOT NULL, created_at INTEGER NOT NULL)`);
     db.run(`CREATE TABLE IF NOT EXISTS reg_team_members (
       team TEXT NOT NULL REFERENCES reg_teams(id), member TEXT NOT NULL, PRIMARY KEY (team, member))`);
+    db.run(`CREATE TABLE IF NOT EXISTS reg_members (
+      tenant TEXT NOT NULL REFERENCES reg_tenants(id), member TEXT NOT NULL, name TEXT, email TEXT, PRIMARY KEY (tenant, member))`);
     db.run(`CREATE TABLE IF NOT EXISTS reg_scope_grants (
       scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject TEXT NOT NULL, role TEXT NOT NULL, n INTEGER NOT NULL,
       PRIMARY KEY (scope_type, scope_id, subject_type, subject))`);
@@ -199,6 +201,22 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     sgrants: db.query("SELECT subject_type, subject, role FROM reg_scope_grants WHERE scope_type = ? AND scope_id = ? ORDER BY n"),
     sgrant: db.query("SELECT role FROM reg_scope_grants WHERE scope_type = ? AND scope_id = ? AND subject_type = ? AND subject = ?"),
     // Owners that guard a Group or Space: a user's, or a Team's while the Team has a member.
+    teamsPage: db.query(`SELECT t.id, t.tenant, t.name, t.created_at, (SELECT count(*) FROM (SELECT 1 FROM reg_team_members m WHERE m.team = t.id LIMIT ${TEAMS.sizeCap + 1})) AS size
+      FROM reg_teams t WHERE t.tenant = ?1 AND (?2 IS NULL OR t.id > ?2) AND (?3 IS NULL OR t.name LIKE ?3 ESCAPE '\\') ORDER BY t.id LIMIT ?4`),
+    teamsAmong: db.query(`SELECT t.id, t.tenant, t.name, t.created_at, (SELECT count(*) FROM (SELECT 1 FROM reg_team_members m WHERE m.team = t.id LIMIT ${TEAMS.sizeCap + 1})) AS size
+      FROM reg_teams t WHERE t.tenant = ? AND t.id IN (SELECT value FROM json_each(?)) ORDER BY t.id`),
+    membersPage: db.query("SELECT member FROM reg_team_members WHERE team = ? AND (?2 IS NULL OR member > ?2) ORDER BY member LIMIT ?3"),
+    sgrantsPage: db.query(`SELECT subject_type, subject, role FROM reg_scope_grants WHERE scope_type = ?1 AND scope_id = ?2
+      AND (?3 IS NULL OR subject_type || char(10) || subject > ?3) ORDER BY subject_type, subject LIMIT ?4`),
+    delTeamGrants: db.query("DELETE FROM reg_scope_grants WHERE subject_type = 'team' AND subject = ?"),
+    delTeamMembers: db.query("DELETE FROM reg_team_members WHERE team = ?"),
+    delTeam: db.query("DELETE FROM reg_teams WHERE id = ?"),
+    renTeam: db.query("UPDATE reg_teams SET name = ? WHERE id = ?"),
+    dirGet: db.query("SELECT member AS user, name, email FROM reg_members WHERE tenant = ? AND member = ?"),
+    dirPut: db.query("INSERT INTO reg_members (tenant, member, name, email) VALUES (?, ?, ?, ?) ON CONFLICT (tenant, member) DO UPDATE SET name = excluded.name, email = excluded.email"),
+    dirAmong: db.query("SELECT member AS user, name, email FROM reg_members WHERE tenant = ? AND member IN (SELECT value FROM json_each(?))"),
+    dirFind: db.query(`SELECT member AS user, name, email FROM reg_members WHERE tenant = ?1 AND (?2 IS NULL OR name LIKE ?2 ESCAPE '\\' OR email LIKE ?2 ESCAPE '\\' OR member LIKE ?2 ESCAPE '\\')
+      ORDER BY coalesce(name, member), member LIMIT ?3`),
     sowners: db.query(`SELECT subject_type, subject FROM reg_scope_grants g WHERE scope_type = ? AND scope_id = ? AND role = 'owner'
       AND (subject_type = 'user' OR EXISTS (SELECT 1 FROM reg_team_members m WHERE m.team = g.subject))`),
     teamOwned: db.query("SELECT scope_type, scope_id FROM reg_scope_grants WHERE subject_type = 'team' AND subject = ? AND role = 'owner' AND scope_type IN ('group', 'space')"),
@@ -423,6 +441,17 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     }
     (member ? q.insMember : q.delMember).run(team, user);
   });
+  const deleteTeamTx = db.transaction(team => {
+    needRow(q.team.get(team), "team");
+    // An empty Team guards nothing (it is not counted), so only a Team with members can be the last counted owner.
+    if (q.teamSize.get(team).c > 0) for (const o of q.teamOwned.all(team)) if (q.sowners.all(o.scope_type, o.scope_id).length <= 1)
+      throw new SqlRegistryError("last-owner", `a ${o.scope_type} keeps at least one owner`);
+    q.delTeamGrants.run(team); q.delTeamMembers.run(team); q.delTeam.run(team);
+  });
+  const touchTx = db.transaction((tenant, user, name, email) => {
+    const cur = q.dirGet.get(tenant, user);
+    if (!cur || cur.name !== name || cur.email !== email) q.dirPut.run(tenant, user, name, email);
+  });
   const setSgrantTx = db.transaction((type, id, st, sid, role) => {
     const tenant = scopeTenant(type, id);
     needRow(tenant, "scope");
@@ -625,6 +654,66 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       setMemberTx.immediate(team, String(user), !!member);
     },
     async teamMembers(team) { ready(); return str(team) ? q.members.all(team).map(r => r.member) : []; },
+    async renameTeam(team, name) {
+      ready();
+      const n = orgDefaults.name(name);
+      if (!str(team) || !q.team.get(team)) throw new Error("registry: no such team");
+      q.renTeam.run(n, team);
+      return rowTeam(q.team.get(team));
+    },
+    async deleteTeam(team) {
+      ready();
+      if (!str(team)) throw new Error("registry: no such team");
+      deleteTeamTx.immediate(team);
+    },
+    async teamsPage(tenant, { after = null, limit, q: term = null } = {}) {
+      ready();
+      const cur = orgDefaults.cursor(after, "id"), n = smallLimit(limit, TEAMS.page.default, TEAMS.page.max), like = likeOf(term);
+      if (!str(tenant)) return { teams: [], next: null };
+      const rows = q.teamsPage.all(tenant, cur, like, n + 1), page = rows.slice(0, n);
+      return { teams: page.map(r => ({ ...rowTeam(r), size: r.size })), next: rows.length > n ? page[n - 1].id : null };
+    },
+    async teamsAmong(tenant, ids) {
+      ready();
+      const is = [...new Set((ids ?? []).filter(str))].slice(0, TEAMS.among);
+      return str(tenant) && is.length ? q.teamsAmong.all(tenant, JSON.stringify(is)).map(r => ({ ...rowTeam(r), size: r.size })) : [];
+    },
+    async teamMembersPage(team, { after = null, limit } = {}) {
+      ready();
+      const cur = orgDefaults.cursor(after, "id"), n = smallLimit(limit, TEAMS.page.default, TEAMS.page.max);
+      if (!str(team)) return { users: [], next: null };
+      const rows = q.membersPage.all(team, cur, n + 1).map(r => r.member), page = rows.slice(0, n);
+      return { users: page, next: rows.length > n ? page[n - 1] : null };
+    },
+    async scopedGrant(scope, subject) {
+      ready();
+      const { type, id } = orgDefaults.scope(scope), sub = orgDefaults.subject(subject);
+      return q.sgrant.get(type, id, sub.type, sub.id)?.role ?? null;
+    },
+    async scopedGrantsPage(scope, { after = null, limit } = {}) {
+      ready();
+      const { type, id } = orgDefaults.scope(scope), cur = orgDefaults.cursor(after, "subject"), n = smallLimit(limit, TEAMS.page.default, TEAMS.page.max);
+      const rows = q.sgrantsPage.all(type, id, cur, n + 1), page = rows.slice(0, n);
+      return { grants: page.map(rowSg), next: rows.length > n ? page[n - 1].subject_type + "\n" + page[n - 1].subject : null };
+    },
+    async touchMember(tenant, { user, name = null, email = null }) {
+      ready();
+      if (!str(tenant) || !q.tenantExists.get(tenant)) throw new Error("registry: no such tenant");
+      if (!str(user) || !user) throw new Error("registry: bad user");
+      const nm = profileText(name, 200), em = profileText(email, 320), cur = q.dirGet.get(tenant, user);
+      // Read first: Home calls this on every load, and the write lock (BEGIN IMMEDIATE) is taken only when the row is new or changed.
+      if (!cur || cur.name !== nm || cur.email !== em) touchTx.immediate(tenant, user, nm, em);
+    },
+    async membersAmong(tenant, users) {
+      ready();
+      const us = [...new Set((users ?? []).filter(str))].slice(0, TEAMS.among);
+      return str(tenant) && us.length ? q.dirAmong.all(tenant, JSON.stringify(us)) : [];
+    },
+    async findMembers(tenant, { q: term = null, limit } = {}) {
+      ready();
+      const like = likeOf(term), n = smallLimit(limit, TEAMS.find.default, TEAMS.find.max);
+      return str(tenant) ? q.dirFind.all(tenant, like, n) : [];
+    },
     async setScopedGrant({ scope, subject, role }) {
       ready();
       const { type, id } = orgDefaults.scope(scope), sub = orgDefaults.subject(subject);

@@ -11,6 +11,7 @@ import { registryContract } from "../auth/registry-contract.js";
 import { legacyEquivalence } from "../auth/legacy-migration.js";
 import { accessEquivalence } from "../auth/access-equivalence.js";
 import { Database } from "bun:sqlite";
+import { accessRace } from "../auth/access-race.js";
 
 const dir = mkdtempSync(join(tmpdir(), "plenary-registry-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -19,6 +20,7 @@ const file = () => join(dir, `r${++n}.db`);
 
 // Platform's contract, on a fresh file per test (a file, not :memory:, so WAL and fsync are in play).
 registryContract("sqlite", async ({ now }) => sqliteRegistry({ path: file(), now, fullfsync: false }), { cleanup: r => r.close(), batch: true });
+accessRace("sqlite", async () => { const path = file(), a = sqliteRegistry({ path, fullfsync: false }), b = sqliteRegistry({ path, fullfsync: false }); return { a, b, close: async () => { await a.close(); await b.close(); } }; });
 accessEquivalence("sqlite", async ({ now }) => sqliteRegistry({ path: ":memory:", now, fullfsync: false }), { cleanup: r => r.close() });
 
 // A database from before board organization: the seven original tables (their DDL as of 1d0bcbe), filled with a legacy state.

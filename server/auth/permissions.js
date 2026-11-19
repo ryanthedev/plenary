@@ -16,7 +16,7 @@ export { SCOPES };
 /** Board-content permissions: the live room's ladder, one step each. */
 export const CONTENT_PERMS = ["board.view", "board.comment", "board.annotate", "board.edit"];
 /** Management permissions: what the admin layer checks. */
-export const MGMT_PERMS = ["board.create", "space.create", "group.create", "members.manage", "move", "delete", "transfer", "roles.manage"];
+export const MGMT_PERMS = ["board.create", "space.create", "group.create", "members.manage", "move", "delete", "transfer", "roles.manage", "team.manage"];
 export const PERMISSIONS = [...CONTENT_PERMS, ...MGMT_PERMS];
 
 /** The content permissions of each ladder role (owner has all four; ownership itself is the ladder role `owner`). */
@@ -26,8 +26,8 @@ export const contentPerms = ladder => CONTENT_PERMS.slice(0, CONTENT_OF[ladder] 
 /** Which management permissions mean something at each scope; a role holding others there gets them dropped. */
 export const ALLOWED_AT = {
   unit: MGMT_PERMS,
-  group: MGMT_PERMS.filter(p => p !== "roles.manage" && p !== "group.create"),
-  space: MGMT_PERMS.filter(p => p !== "roles.manage" && p !== "space.create" && p !== "group.create"),
+  group: MGMT_PERMS.filter(p => p !== "roles.manage" && p !== "group.create" && p !== "team.manage"),
+  space: MGMT_PERMS.filter(p => p !== "roles.manage" && p !== "space.create" && p !== "group.create" && p !== "team.manage"),
   board: ["members.manage", "move", "delete", "transfer"],
 };
 

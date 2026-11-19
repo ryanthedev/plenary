@@ -117,6 +117,16 @@ export const mint = {
  *   spaces(tenant: string): Promise<Space[]>,
  *   ensurePersonalSpace(tenant: string, user: string): Promise<Space>,   // idempotent, one per (tenant, user); private (generalRole null), the user is its owner
  *   createTeam(o: { tenant: string, name: string }): Promise<Team>,
+ *   renameTeam(team: string, name: string): Promise<Team>,   // trimmed 1-200; rejects an unknown Team
+ *   deleteTeam(team: string): Promise<void>,   // removes the Team, its members and EVERY grant it holds, atomically; code "last-owner" (nothing changes) when it is the only counted owner of a Group or Space; rejects an unknown Team
+ *   teamsPage(tenant: string, o?: { after?: string|null, limit?: number, q?: string|null }): Promise<{ teams: (Team & { size: number })[], next: string|null }>,   // by id, one bounded page (default 50, cap 200); `q`: ASCII-folded substring of the name; `size` = members, counted to at most TEAM_SIZE_CAP + 1 (a Team of 100k costs one index probe of 1001 rows)
+ *   teamsAmong(tenant: string, ids: string[]): Promise<(Team & { size: number })[]>,   // those of `ids` (at most 200) that are Teams of this tenant, with `size` as in teamsPage, by id
+ *   teamMembersPage(team: string, o?: { after?: string|null, limit?: number }): Promise<{ users: string[], next: string|null }>,   // by user id (default 50, cap 200)
+ *   scopedGrant(scope: ScopeRef, subject: Subject): Promise<string|null>,   // one grant's role (null = none): the single-row read a grant change compares against
+ *   scopedGrantsPage(scope: ScopeRef, o?: { after?: string|null, limit?: number }): Promise<{ grants: ScopedGrant[], next: string|null }>,   // by subject ("user"/"team" then id; cursor "<type>\n<id>"), default 50, cap 200
+ *   touchMember(tenant: string, o: { user: string, name?: string|null, email?: string|null }): Promise<void>,   // the member directory: records a Unit member seen at sign-in (the code exchange) or on Home; writes only when the row is new or its name/email changed
+ *   membersAmong(tenant: string, users: string[]): Promise<{ user: string, name: string|null, email: string|null }[]>,   // those of `users` (at most 200) in the Unit's directory
+ *   findMembers(tenant: string, o?: { q?: string|null, limit?: number }): Promise<{ user: string, name: string|null, email: string|null }[]>,   // directory search by ASCII-folded substring of name, email or user id; by name then id; default 20, cap 50
  *   team(id: string): Promise<Team|null>,
  *   teams(tenant: string): Promise<Team[]>,
  *   setTeamMember(team: string, user: string, member: boolean): Promise<void>,
@@ -188,6 +198,18 @@ export const asciiFold = t => String(t).replace(/[A-Z]/g, c => c.toLowerCase());
 /** The `q` of `searchBoards`: a string, trimmed, 1-100 chars; else "registry: bad query". */
 export const searchQuery = q => { const t = typeof q === "string" ? q.trim() : ""; if (!t || t.length > 100 || t.includes("\0")) throw new Error("registry: bad query"); return t; };
 
+/** Teams (PROTOCOL.md § Teams and access): page sizes of the Team and grant listings, the directory search, and the cap a Team's `size` is counted to. */
+export const TEAMS = { page: { default: 50, max: 200 }, find: { default: 20, max: 50 }, sizeCap: 1000, among: 200 };
+/** The `q` of a Team or directory search: null/empty = no filter; else trimmed, at most 100 chars, no NUL. Returns the LIKE pattern (ASCII-folded, wildcards literal) or null. */
+export function likeOf(q) {
+  if (q == null) return null;
+  const t = typeof q === "string" ? q.trim() : null;
+  if (t === null || t.length > 100 || t.includes("\0")) fail("query");
+  return t ? "%" + asciiFold(t).replace(/[\\%_]/g, "\\$&") + "%" : null;
+}
+/** The fields a directory row carries: a short string or null. */
+export const profileText = (v, max) => (typeof v === "string" && v.trim() ? v.trim().slice(0, max) : null);
+
 /** Page size for `boardsIn` / `scopesOf`: default and cap. */
 export const PAGE = { default: 500, max: 1000 };
 /** A page limit as the adapters apply it. */
@@ -244,12 +266,12 @@ export const orgDefaults = {
    * must be what a previous page's `next` was (boardsIn: a board id; scopesOf: "<type>\n<id>"), else it is REFUSED with
    * "registry: bad cursor" rather than silently restarting from the beginning (a caller looping on `next` would never end).
    * An unknown but well-formed cursor is just a position.
-   * @param {"id"|"scope"} kind
+   * @param {"id"|"scope"|"subject"} kind
    */
   cursor(after, kind) {
     if (after == null) return null;
     const ok = typeof after === "string" && after.length > 0 && after.length <= 600 && !after.includes("\0")
-      && (kind === "id" ? !after.includes("\n") : /^(unit|group|space|board)\n./.test(after));
+      && (kind === "id" ? !after.includes("\n") : (kind === "subject" ? /^(user|team)\n./ : /^(unit|group|space|board)\n./).test(after));
     if (!ok) fail("cursor");
     return after;
   },

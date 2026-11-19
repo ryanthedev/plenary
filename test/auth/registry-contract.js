@@ -519,6 +519,151 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect((await r.scopedGrants({ type: "space", id: sp.id })).filter(g => g.role === "owner")).toHaveLength(1);
       });
 
+      // ---- Teams and access (PROTOCOL.md § Teams and access, #49) ----
+
+      test("renameTeam / teamsPage / teamMembersPage: paged by id, q filters by ASCII-folded name, size counts members (capped)", async () => {
+        const t = await unit(), other = await r.createTenant({ domain: "globex.com" });
+        const made = [];
+        for (const n of ["Design", "Infra", "Design Ops", "Sales_100%"]) made.push(await r.createTeam({ tenant: t.id, name: n }));
+        await r.createTeam({ tenant: other.id, name: "Elsewhere" });
+        for (const u of ["google:c", "google:a", "google:b"]) await r.setTeamMember(made[0].id, u, true);
+        const all = []; let after = null, pages = 0;
+        do { const p = await r.teamsPage(t.id, { after, limit: 3 }); all.push(...p.teams); after = p.next; pages++; } while (after);
+        expect(all.map(x => x.id)).toEqual(made.map(x => x.id).sort());
+        expect(pages).toBe(2);
+        expect(all.find(x => x.id === made[0].id)).toMatchObject({ name: "Design", size: 3, tenant: t.id });
+        expect((await r.teamsPage(t.id, { q: "dEsIgN" })).teams.map(x => x.name).sort()).toEqual(["Design", "Design Ops"]);
+        expect((await r.teamsPage(t.id, { q: "_100%" })).teams.map(x => x.name)).toEqual(["Sales_100%"]);   // LIKE characters are literal
+        expect((await r.teamsPage(t.id, { q: "%" })).teams.map(x => x.name)).toEqual(["Sales_100%"]);
+        expect((await r.teamsPage(t.id, { q: "  " })).teams).toHaveLength(4);
+        expect((await r.teamsPage("t-nope00000000")).teams).toEqual([]);
+        const among = await r.teamsAmong(t.id, [made[0].id, made[2].id, made[0].id, "tm-nope00000000", (await r.teamsPage(other.id)).teams[0].id]);   // another Unit's Team is absent
+        expect(among.map(x => x.id)).toEqual([made[0].id, made[2].id].sort());
+        expect(among.find(x => x.id === made[0].id).size).toBe(3);
+        expect(await r.teamsAmong(t.id, [])).toEqual([]);
+        for (const bad of ["", 5, "a\nb"]) await expect(r.teamsPage(t.id, { after: bad })).rejects.toThrow("bad cursor");
+        const ms = []; after = null;
+        do { const p = await r.teamMembersPage(made[0].id, { after, limit: 2 }); ms.push(...p.users); after = p.next; } while (after);
+        expect(ms).toEqual(["google:a", "google:b", "google:c"]);
+        expect(await r.teamMembersPage("tm-nope00000000")).toEqual({ users: [], next: null });
+        const renamed = await r.renameTeam(made[1].id, "  Platform  ");
+        expect(renamed).toMatchObject({ id: made[1].id, name: "Platform", tenant: t.id });
+        expect((await r.team(made[1].id)).name).toBe("Platform");
+        await expect(r.renameTeam(made[1].id, "   ")).rejects.toThrow();
+        await expect(r.renameTeam("tm-nope00000000", "X")).rejects.toThrow();
+      });
+
+      test("scopedGrantsPage: by subject type then id, cursor is a previous next, an unknown scope lists none", async () => {
+        const t = await unit();
+        const sp = await r.createSpace({ tenant: t.id, name: "Design", owner: "google:ann" });
+        const tm = await r.createTeam({ tenant: t.id, name: "Leads" });
+        await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "team", id: tm.id }, role: "editor" });
+        for (const u of ["google:zed", "google:bob"]) await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "user", id: u }, role: "viewer" });
+        const got = []; let after = null;
+        do { const p = await r.scopedGrantsPage({ type: "space", id: sp.id }, { after, limit: 2 }); got.push(...p.grants); after = p.next; } while (after);
+        expect(got.map(g => `${g.subject.type}:${g.subject.id}:${g.role}`)).toEqual([`team:${tm.id}:editor`, "user:google:ann:owner", "user:google:bob:viewer", "user:google:zed:viewer"]);
+        expect(await r.scopedGrantsPage({ type: "space", id: "s-nope00000000" })).toEqual({ grants: [], next: null });
+        expect(await r.scopedGrant({ type: "space", id: sp.id }, { type: "team", id: tm.id })).toBe("editor");
+        expect(await r.scopedGrant({ type: "space", id: sp.id }, { type: "user", id: "google:nobody" })).toBe(null);
+        expect(await r.scopedGrant({ type: "space", id: "s-nope00000000" }, { type: "user", id: "google:bob" })).toBe(null);
+        for (const bad of ["", "space\nx", "a"]) await expect(r.scopedGrantsPage({ type: "space", id: sp.id }, { after: bad })).rejects.toThrow("bad cursor");
+      });
+
+      test("deleteTeam removes the Team, its members and every grant it holds; an unknown Team rejects", async () => {
+        const t = await unit();
+        const sp = await r.createSpace({ tenant: t.id, name: "Design", owner: "google:ann" });
+        const b = await r.createBoard({ tenant: t.id, space: sp.id });
+        const tm = await r.createTeam({ tenant: t.id, name: "Leads" }), keep = await r.createTeam({ tenant: t.id, name: "Keep" });
+        await r.setTeamMember(tm.id, "google:lee", true);
+        for (const [type, id] of [["space", sp.id], ["board", b.id], ["unit", t.id]]) {
+          await r.setScopedGrant({ scope: { type, id }, subject: { type: "team", id: tm.id }, role: "viewer" });
+          await r.setScopedGrant({ scope: { type, id }, subject: { type: "team", id: keep.id }, role: "viewer" });
+        }
+        await r.deleteTeam(tm.id);
+        expect(await r.team(tm.id)).toBe(null);
+        expect(await r.teamMembers(tm.id)).toEqual([]);
+        expect((await r.teamsPage(t.id)).teams.map(x => x.id)).toEqual([keep.id]);
+        for (const [type, id] of [["space", sp.id], ["board", b.id], ["unit", t.id]])
+          expect((await r.scopedGrants({ type, id })).filter(g => g.subject.type === "team").map(g => g.subject.id)).toEqual([keep.id]);
+        expect((await r.scopesOf({ type: "team", id: tm.id })).scopes).toEqual([]);
+        await expect(r.deleteTeam(tm.id)).rejects.toThrow();
+        await expect(r.deleteTeam("tm-nope00000000")).rejects.toThrow();
+      });
+
+      test("deleteTeam keeps one owner: refused (nothing changes) while the Team is the only counted owner; an empty Team guards nothing", async () => {
+        const t = await unit();
+        const sp = await r.createSpace({ tenant: t.id, name: "Design", owner: "google:ann" });
+        const g = await r.createGroup({ tenant: t.id, name: "P", owner: "google:ann" });
+        const tm = await r.createTeam({ tenant: t.id, name: "Leads" });
+        for (const scope of [{ type: "space", id: sp.id }, { type: "group", id: g.id }]) {
+          await r.setScopedGrant({ scope, subject: { type: "team", id: tm.id }, role: "owner" });
+          await r.setTeamMember(tm.id, "google:lee", true);
+        }
+        await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "user", id: "google:ann" }, role: null });   // the Team is Design's only counted owner
+        expect((await r.deleteTeam(tm.id).catch(e => e)).code).toBe("last-owner");
+        expect(await r.team(tm.id)).toMatchObject({ id: tm.id });
+        expect(await r.teamMembers(tm.id)).toEqual(["google:lee"]);
+        expect(await r.scopedGrants({ type: "space", id: sp.id })).toEqual([{ subject: { type: "team", id: tm.id }, role: "owner" }]);
+        await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "user", id: "google:ann" }, role: "owner" });
+        await r.deleteTeam(tm.id);                                                              // Ann still owns Design and Product: fine
+        expect(await r.scopedGrants({ type: "space", id: sp.id })).toEqual([{ subject: { type: "user", id: "google:ann" }, role: "owner" }]);
+        // an empty Team that is the only owner on paper guards nothing, so it can go (the real owner is the user)
+        const empty = await r.createTeam({ tenant: t.id, name: "Empty" });
+        await r.setScopedGrant({ scope: { type: "group", id: g.id }, subject: { type: "team", id: empty.id }, role: "owner" });
+        await r.deleteTeam(empty.id);
+      });
+
+      test("last owner under concurrency: deleting the Team that owns, racing a demotion of the other owner, leaves one counted owner", async () => {
+        for (let round = 0; round < 3; round++) {
+          const t = await unit({ domain: `r${round}.acme.com` });
+          const sp = await r.createSpace({ tenant: t.id, name: "Design", owner: "google:ann" });
+          const tm = await r.createTeam({ tenant: t.id, name: "Leads" });
+          await r.setTeamMember(tm.id, "google:lee", true);
+          await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "team", id: tm.id }, role: "owner" });
+          const res = await Promise.allSettled([r.deleteTeam(tm.id), r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "user", id: "google:ann" }, role: null })]);
+          expect(res.filter(x => x.status === "fulfilled")).toHaveLength(1);
+          expect(res.find(x => x.status === "rejected").reason.code).toBe("last-owner");
+          expect((await r.scopedGrants({ type: "space", id: sp.id })).filter(g => g.role === "owner")).toHaveLength(1);
+        }
+      });
+
+      test("last owner under concurrency: two Teams each losing their last member at once leave a counted owner", async () => {
+        const t = await unit();
+        const sp = await r.createSpace({ tenant: t.id, name: "Design", owner: "google:ann" });
+        const a = await r.createTeam({ tenant: t.id, name: "A" }), b = await r.createTeam({ tenant: t.id, name: "B" });
+        await r.setTeamMember(a.id, "google:x", true); await r.setTeamMember(b.id, "google:y", true);
+        for (const tm of [a, b]) await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "team", id: tm.id }, role: "owner" });
+        await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "user", id: "google:ann" }, role: null });
+        const res = await Promise.allSettled([r.setTeamMember(a.id, "google:x", false), r.setTeamMember(b.id, "google:y", false), r.deleteTeam(a.id)]);
+        expect(res.filter(x => x.status === "fulfilled").length).toBeGreaterThanOrEqual(1);
+        const left = await Promise.all([a, b].map(async tm => (await r.team(tm.id)) && (await r.teamMembers(tm.id)).length));
+        expect(left.some(n => n > 0)).toBe(true);                                             // some Team still has a member and still owns
+        expect((await r.scopedGrants({ type: "space", id: sp.id })).some(g => g.role === "owner")).toBe(true);
+      });
+
+      test("the member directory: touchMember upserts (idempotent), is per Unit, membersAmong and findMembers read it", async () => {
+        const t = await unit(), other = await r.createTenant({ domain: "globex.com" });
+        await r.touchMember(t.id, { user: "google:ann", name: "Ann Lee", email: "ann@acme.com" });
+        await r.touchMember(t.id, { user: "google:ann", name: "Ann Lee", email: "ann@acme.com" });
+        await r.touchMember(t.id, { user: "google:bob", name: null });
+        await r.touchMember(t.id, { user: "google:cy", name: "Cy 100%_", email: "cy@acme.com" });
+        await r.touchMember(other.id, { user: "google:ann", name: "Other Ann" });
+        expect((await r.membersAmong(t.id, ["google:ann", "google:nobody", "google:ann"]))).toEqual([{ user: "google:ann", name: "Ann Lee", email: "ann@acme.com" }]);
+        expect((await r.membersAmong(other.id, ["google:ann"]))[0].name).toBe("Other Ann");
+        expect(await r.membersAmong(t.id, [])).toEqual([]);
+        await r.touchMember(t.id, { user: "google:ann", name: "Ann Smith", email: "ann@acme.com" });   // a changed name overwrites
+        expect((await r.membersAmong(t.id, ["google:ann"]))[0].name).toBe("Ann Smith");
+        expect((await r.findMembers(t.id, {})).map(m => m.user)).toEqual(["google:ann", "google:cy", "google:bob"]);          // by name (else the id), then id: "Ann Smith", "Cy 100%_", "google:bob"
+        expect((await r.findMembers(t.id, { q: "SMITH" })).map(m => m.user)).toEqual(["google:ann"]);
+        expect((await r.findMembers(t.id, { q: "cy@acme" })).map(m => m.user)).toEqual(["google:cy"]);                           // email
+        expect((await r.findMembers(t.id, { q: "bob" })).map(m => m.user)).toEqual(["google:bob"]);                              // user id
+        expect((await r.findMembers(t.id, { q: "100%_" })).map(m => m.user)).toEqual(["google:cy"]);                             // LIKE characters are literal
+        expect((await r.findMembers(t.id, { q: "%" })).map(m => m.user)).toEqual(["google:cy"]);
+        expect(await r.findMembers(t.id, { q: "zzz" })).toEqual([]);
+        expect((await r.findMembers(t.id, { limit: 2 }))).toHaveLength(2);
+        await expect(r.touchMember("t-nope00000000", { user: "google:x" })).rejects.toThrow();
+      });
+
       test("boardsIn pages the board ids of a Space, a Group and a Unit by id; a board and an unknown scope have none", async () => {
         const t = await unit(), other = await r.createTenant({ domain: "globex.com" });
         const g = await r.createGroup({ tenant: t.id, name: "P" });

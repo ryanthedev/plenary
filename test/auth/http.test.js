@@ -372,10 +372,13 @@ test("bodies: JSON only, capped at 16 KB (counted as read), objects only, unknow
   expect((await post('{"title":"ok"}', { "content-type": "application/json; charset=utf-8" })).status).toBe(201);
   // Grants need `role` (null removes).
   const { board } = await (await post("{}")).json();
+  await registry.touchMember(acme.id, { user: "google:9" });          // a new person grant needs someone the server knows
   const g = p => call(`/boards/${board.id}/grants/google%3A9`, { method: "PUT", headers: { authorization: "Bearer " + admin, "content-type": "application/json" }, body: p });
   expect((await g("{}")).status).toBe(400);
   expect((await g('{"role":"viewer"}')).status).toBe(204);
   expect((await g('{"role":null}')).status).toBe(204);
+  const unknown = await call(`/boards/${board.id}/grants/email%3Azed%40acme.com`, { method: "PUT", headers: { authorization: "Bearer " + admin, "content-type": "application/json" }, body: '{"role":"viewer"}' });
+  expect([unknown.status, await unknown.json()]).toEqual([400, { error: "unknown-person" }]);
   expect(await registry.grant(board.id, "google:9")).toBe(null);
   // A bad percent-escape in a path segment is a 400, not a throw.
   expect((await call(`/boards/${board.id}/grants/%E0%A4%A`, { method: "PUT", headers: { authorization: "Bearer " + admin, "content-type": "application/json" }, body: '{"role":"viewer"}' })).status).toBe(400);

@@ -27,6 +27,9 @@ import { createHomeModel } from "./core/home.js";
 import { httpSpaces } from "./adapters/spaces/http.js";
 import { mountSpacePage, mountGroupPage } from "./adapters/dom/spaces.js";
 import { createDialogs } from "./adapters/dom/dialogs.js";
+import { httpAccess } from "./adapters/access/http.js";
+import { mountTeamsPage, mountTeamPage, mountAccessPage } from "./adapters/dom/access.js";
+import { createTeamsModel, createTeamModel, createAccessModel } from "./core/access.js";
 import { createPageModel } from "./core/spaces.js";
 import { takeSignIn, signInNotice, asParam, menuSignIn, devLinks } from "./core/signin.js";
 import { createSession } from "./core/session.js";
@@ -66,7 +69,8 @@ if (back) { q.set("board", back); history.replaceState(history.state, "", `${loc
 // A link with no board lands on Home (everyone, a dev user included): Recent, Starred, Shared with me, the Space tree, search.
 const board = asked ?? back;
 const idParam = name => (/^[\w-]{1,64}$/.test(q.get(name) ?? "") ? q.get(name) : null);
-const spaceId = idParam("space"), groupId = idParam("group");
+const spaceId = idParam("space"), groupId = idParam("group"), teamId = idParam("team"), teamsPage = q.has("teams");
+const accessArg = /^(unit|group|space|board):([\w-]{1,64})$/.exec(q.get("access") ?? "");
 /** A link to another page of this app, keeping the theme. */
 const hrefTo = params => `?${new URLSearchParams({ ...params, ...(theme0 ? { theme: theme0 } : {}) })}`;
 const signInLink = { href: "/auth/login", text: "Sign in with Google" };
@@ -88,9 +92,16 @@ if (!signIn.token) {
   document.body.append(root);
   const fetchNow = (...a) => globalThis.fetch(...a);
   const spacesApi = httpSpaces({ fetch: fetchNow, token: signIn.token, timers: clock });
-  const hrefs = { home: location.pathname, board: id => hrefTo({ board: id }), space: id => hrefTo({ space: id }), group: id => hrefTo({ group: id }) };
+  const hrefs = { home: location.pathname, board: id => hrefTo({ board: id }), space: id => hrefTo({ space: id }), group: id => hrefTo({ group: id }),
+    team: id => hrefTo({ team: id }), teams: hrefTo({ teams: "1" }), access: (type, id) => hrefTo({ access: `${type}:${id}` }) };
   const dialogs = createDialogs({ host: root, api: spacesApi, hrefs, go: href => location.assign(href) });
-  if (spaceId || groupId) {
+  if (teamId || teamsPage || accessArg) {
+    // Teams, a Team, or the access page of a scope (PROTOCOL.md § Teams and access). An id the person can't open shows the same "not available" page as one that does not exist.
+    const api = httpAccess({ fetch: fetchNow, token: signIn.token, timers: clock });
+    if (teamsPage) { const model = createTeamsModel({ api }); mountTeamsPage({ root, model, hrefs, signIn: signInLink }); hideGate(); model.load(); }
+    else if (teamId) { const model = createTeamModel({ api, id: teamId }); mountTeamPage({ root, model, api, hrefs, signIn: signInLink }); hideGate(); model.load(); }
+    else { const model = createAccessModel({ api, type: accessArg[1], id: accessArg[2] }); mountAccessPage({ root, model, api, hrefs, signIn: signInLink }); hideGate(); model.load(); }
+  } else if (spaceId || groupId) {
     // A Space or Group page. An id the person can't open shows the same "not available" page as one that does not exist.
     const model = createPageModel({ api: spacesApi, kind: spaceId ? "space" : "group", id: spaceId ?? groupId });
     (spaceId ? mountSpacePage : mountGroupPage)({ root, model, dialogs, hrefs, signIn: signInLink });
@@ -99,7 +110,7 @@ if (!signIn.token) {
   } else {
     const model = createHomeModel({ api: httpHome({ fetch: fetchNow, token: signIn.token, timers: clock }), clock });
     mountHome({ root, model, clock, signIn: signInLink, homeHref: location.pathname, dialogs,
-      boardHref: hrefs.board, spaceHref: hrefs.space, groupHref: hrefs.group });
+      boardHref: hrefs.board, spaceHref: hrefs.space, groupHref: hrefs.group, teamsHref: hrefs.teams, unitAccessHref: id => hrefs.access("unit", id) });
     hideGate();
     model.load();
   }

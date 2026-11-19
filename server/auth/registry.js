@@ -2,7 +2,7 @@
 // last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
 import { normEmail } from "./util.js";
-import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, smallLimit, searchQuery, asciiFold } from "./registry-port.js";
+import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText } from "./registry-port.js";
 
 /**
  * @typedef {import("./registry-port.js").Registry} Registry
@@ -33,6 +33,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
   /** @type {Map<string, Space>} */ const spaces = new Map();
   /** @type {Map<string, Team>} */ const teams = new Map();
   /** @type {Map<string, Set<string>>} team → members */ const members = new Map();
+  /** @type {Map<string, Map<string, { user: string, name: string|null, email: string|null }>>} tenant → user → directory row */ const directory = new Map();
   /** @type {Map<string, Map<string, string>>} "type\nid" → ("type\nid" of the subject → role) */ const scoped = new Map();
   /** @type {Map<string, Map<string, CustomRole>>} tenant → id → role */ const roles = new Map();
   /** @type {Map<string, Map<string, number>>} user → board → opened at (Recent) */ const recent = new Map();
@@ -221,6 +222,65 @@ export function memoryRegistry({ now = Date.now } = {}) {
       set.delete(u);
     },
     async teamMembers(team) { return [...(members.get(team) ?? [])]; },
+    async renameTeam(team, name) {
+      const tm = teams.get(team);
+      need(tm, "team");
+      tm.name = orgDefaults.name(name);
+      return copy(tm);
+    },
+    async deleteTeam(team) {
+      need(teams.has(team), "team");
+      // Check and write with no await in between: atomic in one JS process.
+      if ((members.get(team)?.size ?? 0) > 0) for (const [k, g] of scoped) {
+        const [type, ...id] = k.split("\n");
+        if ((type === "group" || type === "space") && g.get(sk("team", team)) === "owner" && countedOwners(type, id.join("\n")).length <= 1)
+          throw new RegistryError("last-owner", `a ${type} keeps at least one owner`);
+      }
+      for (const [k, g] of scoped) { g.delete(sk("team", team)); if (!g.size) scoped.delete(k); }
+      members.delete(team); teams.delete(team);
+    },
+    async teamsPage(tenant, { after = null, limit, q = null } = {}) {
+      const cur = orgDefaults.cursor(after, "id"), n = smallLimit(limit, TEAMS.page.default, TEAMS.page.max), like = likeOf(q), term = like && asciiFold(q.trim());
+      const all = [...teams.values()].filter(t => t.tenant === tenant && (cur == null || t.id > cur) && (term == null || asciiFold(t.name).includes(term))).sort((a, b) => (a.id < b.id ? -1 : 1));
+      const page = all.slice(0, n);
+      return { teams: page.map(t => ({ ...copy(t), size: Math.min(members.get(t.id)?.size ?? 0, TEAMS.sizeCap + 1) })), next: all.length > n ? page[n - 1].id : null };
+    },
+    async teamsAmong(tenant, ids) {
+      return [...new Set((ids ?? []).slice(0, TEAMS.among))].map(i => teams.get(i)).filter(t => t?.tenant === tenant).sort((a, b) => (a.id < b.id ? -1 : 1))
+        .map(t => ({ ...copy(t), size: Math.min(members.get(t.id)?.size ?? 0, TEAMS.sizeCap + 1) }));
+    },
+    async teamMembersPage(team, { after = null, limit } = {}) {
+      const cur = orgDefaults.cursor(after, "id"), n = smallLimit(limit, TEAMS.page.default, TEAMS.page.max);
+      const all = [...(members.get(team) ?? [])].filter(u => cur == null || u > cur).sort();
+      return { users: all.slice(0, n), next: all.length > n ? all[n - 1] : null };
+    },
+    async scopedGrant(scope, subject) {
+      const { type, id } = orgDefaults.scope(scope), sub = orgDefaults.subject(subject);
+      return scoped.get(sk(type, id))?.get(sk(sub.type, sub.id)) ?? null;
+    },
+    async scopedGrantsPage(scope, { after = null, limit } = {}) {
+      const { type, id } = orgDefaults.scope(scope), cur = orgDefaults.cursor(after, "subject"), n = smallLimit(limit, TEAMS.page.default, TEAMS.page.max);
+      const all = [...(scoped.get(sk(type, id)) ?? [])].filter(([k]) => cur == null || k > cur).sort(([a], [b]) => (a < b ? -1 : 1));
+      const rows = all.slice(0, n).map(([k, role]) => { const [t, ...i] = k.split("\n"); return { subject: { type: t, id: i.join("\n") }, role }; });
+      return { grants: rows, next: all.length > n ? all[n - 1][0] : null };
+    },
+    async touchMember(tenant, { user, name = null, email = null }) {
+      need(tenants.has(tenant), "tenant");
+      if (typeof user !== "string" || !user || user.includes("\0")) throw new Error("registry: bad user");
+      const row = { user, name: profileText(name, 200), email: profileText(email, 320) };
+      const m = directory.get(tenant) ?? new Map(); directory.set(tenant, m);
+      const cur = m.get(user);
+      if (!cur || cur.name !== row.name || cur.email !== row.email) m.set(user, row);
+    },
+    async membersAmong(tenant, users) {
+      const m = directory.get(tenant);
+      return [...new Set((users ?? []).slice(0, TEAMS.among))].map(u => m?.get(u)).filter(Boolean).map(copy);
+    },
+    async findMembers(tenant, { q = null, limit } = {}) {
+      const like = likeOf(q), term = like && asciiFold(q.trim()), n = smallLimit(limit, TEAMS.find.default, TEAMS.find.max);
+      const hit = r => term == null || [r.name ?? "", r.email ?? "", r.user].some(x => asciiFold(x).includes(term));
+      return [...(directory.get(tenant)?.values() ?? [])].filter(hit).sort((a, b) => ((a.name ?? a.user) + "\n" + a.user < (b.name ?? b.user) + "\n" + b.user ? -1 : 1)).slice(0, n).map(copy);
+    },
 
     async setScopedGrant({ scope, subject, role }) {
       const { type, id } = orgDefaults.scope(scope), sub = orgDefaults.subject(subject), r = orgDefaults.grantRole(role);

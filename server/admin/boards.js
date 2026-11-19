@@ -17,7 +17,7 @@ import { isUnitAdmin } from "../auth/resolver.js";
 
 export class AdminError extends Error {
   /**
-   * @param {"forbidden"|"bad-request"|"not-found"|"last-owner"|"owner-grant-failed"} code
+   * @param {"forbidden"|"bad-request"|"not-found"|"last-owner"|"owner-grant-failed"|"unknown-person"|"bad-role"|"too-large"} code
    * @param {string} [message]
    * @param {{ board?: string, cause?: unknown }} [extra]  `board`: the id of a board created without its owner grant
    */
@@ -47,6 +47,20 @@ async function managed(registry, caller, boardId) {
   throw forbidden();
 }
 
+/**
+ * May a NEW direct grant on `board` name `user`? Only a person the server has reason to know on this board: one in the board's Unit's directory (or an admin
+ * of it named by id), one who already holds a grant here, or one who redeemed a link of this board (a guest the owner shared with). Never an `email:` entry,
+ * never another Unit's member or an id nobody has seen. One rule for both routes that write a person's board grant (PROTOCOL.md § Teams and access).
+ * @param {Registry} registry @param {{ id: string, tenant: string }} board @param {string} user
+ */
+export async function knownOnBoard(registry, board, user) {
+  if (typeof user !== "string" || !user || user.length > 200 || /[\0\n]/.test(user) || user.startsWith("email:")) return false;
+  if (await registry.grant(board.id, user)) return true;
+  if ((await registry.membersAmong(board.tenant, [user])).length) return true;
+  if ((await registry.tenant(board.tenant))?.admins?.includes(user)) return true;
+  return (await registry.linkUses(board.id, user)).length > 0;
+}
+
 const expiry = (v, now) => {
   if (v == null) return null;
   if (!Number.isFinite(v) || v <= now) throw bad("expiresAt must be a future time (ms)");
@@ -64,6 +78,8 @@ export async function setGrant({ caller, board, user, role }, { registry }) {
     if (role === "owner") throw forbidden();
     if (current === "owner" && user !== caller.user) throw forbidden();
   }
+  // Refusals by rank come first (a non-admin gives no owner to anyone); then who a NEW grant may name.
+  if (role !== null && current == null && !(await knownOnBoard(registry, b, user))) throw new AdminError("unknown-person", "that person is not known on this board");
   if (current === "owner" && role !== "owner") {
     const owners = (await registry.grants(b.id)).filter(g => g.role === "owner");
     if (owners.length <= 1) throw new AdminError("last-owner", "a board keeps at least one owner");

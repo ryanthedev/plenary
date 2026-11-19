@@ -193,3 +193,15 @@ test("destroy removes the page and unsubscribes", async () => {
   h.destroy();
   expect(root.childNodes.length).toBe(0);
 });
+
+test("Home links to Teams for a member, and to the organization's access only when the server says the caller manages it; a guest sees neither", async () => {
+  const at = { teamsHref: "?teams=1", unitAccessHref: id => `?access=unit:${id}` };
+  await mount({ ...DATA, can: { createGroup: false, manageAccess: false } }, at);
+  const side = () => root.find(e => e.hasClass("home-side")).findAll(e => e.tagName === "A").map(e => [e.getAttribute("href"), textOf(e)]);
+  expect(side()).toContainEqual(["?teams=1", "Teams"]);
+  expect(side().map(x => x[1])).not.toContain("Organization access");
+  await mount({ ...DATA, can: { createGroup: true, manageAccess: true } }, at);
+  expect(side()).toContainEqual(["?access=unit:t", "Organization access"]);
+  await mount({ ...DATA, guest: true, unit: null, tree: null, can: { createGroup: false, manageAccess: false } }, at);
+  expect(side().map(x => x[1])).not.toContain("Teams");
+});

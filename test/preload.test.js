@@ -1,7 +1,7 @@
 // test/preload.js (bunfig.toml preload): its safety nets run for EVERY test file of a run, not only the first that
 // imports helpers.js or rig.js (e1-tests-v HIGH-1), and its per-run temp root is swept when its owner is gone.
 import { test, expect } from "bun:test";
-import { mkdirSync, mkdtempSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, existsSync, readFileSync, readdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir, hostname } from "node:os";
 import { join } from "node:path";
 import { ownerAlive, sweepStaleRoots, makeRunRoot } from "./temp-root.js";
@@ -83,3 +83,18 @@ test("ownerAlive: ESRCH alone means gone", () => {
     expect(ownerAlive(12345)).toBe(false);
   } finally { process.kill = kill; }
 });
+
+test("a FIFO named owner.json in a dead run's root is skipped, never read (reading it would block the whole run's preload)", async () => {
+  const base = mkdtempSync(join(tmpdir(), "plen-preload-"));
+  const root = join(base, "plen-run-999999-x");
+  mkdirSync(root);
+  expect(Bun.spawnSync(["mkfifo", join(root, "owner.json")]).exitCode).toBe(0);
+  const script = `import { sweepStaleRoots } from ${JSON.stringify(join(import.meta.dir, "temp-root.js"))};
+    console.log(JSON.stringify(sweepStaleRoots(${JSON.stringify(base)}, { alive: () => false })));`;
+  const p = Bun.spawn([process.execPath, "--no-env-file", "-e", script], { stdout: "pipe", stderr: "ignore" });
+  const out = await Promise.race([new Response(p.stdout).text(), Bun.sleep(10_000).then(() => { p.kill("SIGKILL"); return null; })]);
+  expect(out).not.toBeNull();
+  expect(JSON.parse(out)).toEqual([]);
+  expect(existsSync(root)).toBe(true);
+  rmSync(base, { recursive: true, force: true });
+}, 30_000);

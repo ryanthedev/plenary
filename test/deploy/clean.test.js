@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { join, relative } from "node:path";
-import { clean, summarize, measure, openPaths, openUnder, renameExcl, loadNativeRename, resetNativeRenameWarning, ROOT } from "../../scripts/clean.js";
+import { clean, summarize, measure, openPaths, openUnder, resolveOpens, resolveNoOpen, renameExcl, loadNativeRename, resetNativeRenameWarning, ROOT } from "../../scripts/clean.js";
 
 const made = [], kids = [];
 const sandbox = realpathSync(mkdtempSync(join(tmpdir(), "plenary-cleantest-")));
@@ -118,10 +118,10 @@ test("a symlink to outside is skipped at the top level and never entered inside 
 });
 
 test("refuses a base that is / or $HOME (or a parent of the repo or home)", () => {
-  expect(() => clean({ tempDir: "/", rigRoot: null })).toThrow(/refusing/);
-  expect(() => clean({ tempDir: process.env.HOME, rigRoot: null })).toThrow(/refusing/);
-  expect(() => clean({ tempDir: tmpdir(), scratch: "/Users", rigRoot: null })).toThrow(/refusing/);
-  expect(() => clean({ tempDir: join(sandbox, "missing"), rigRoot: null }).items).not.toThrow();
+  expect(() => clean({ tempDir: "/", rigRoot: null, openPathsFn: () => [] })).toThrow(/refusing/);
+  expect(() => clean({ tempDir: process.env.HOME, rigRoot: null, openPathsFn: () => [] })).toThrow(/refusing/);
+  expect(() => clean({ tempDir: tmpdir(), scratch: "/Users", rigRoot: null, openPathsFn: () => [] })).toThrow(/refusing/);
+  expect(() => clean({ tempDir: join(sandbox, "missing"), rigRoot: null, openPathsFn: () => [] }).items).not.toThrow();
 });
 
 test("a refused base throws before lsof is run (no system-wide scan for a request that is refused anyway)", () => {
@@ -601,8 +601,8 @@ test("ROOT is the real path of the checkout, also with a space in it or behind a
 });
 
 test("the rig dir is refused like the others when it resolves to / or $HOME", () => {
-  expect(() => clean({ tempDir: join(sandbox, "none"), rigRoot: "/" })).toThrow(/refusing/);
-  expect(() => clean({ tempDir: join(sandbox, "none"), rigRoot: process.env.HOME })).toThrow(/refusing/);
+  expect(() => clean({ tempDir: join(sandbox, "none"), rigRoot: "/", openPathsFn: () => [] })).toThrow(/refusing/);
+  expect(() => clean({ tempDir: join(sandbox, "none"), rigRoot: process.env.HOME, openPathsFn: () => [] })).toThrow(/refusing/);
 });
 
 test("--min-age under 10 minutes needs force", () => {
@@ -613,4 +613,107 @@ test("--min-age under 10 minutes needs force", () => {
   const cli = spawnSync(process.execPath, [join(ROOT, "scripts/clean.js"), "--min-age", "5m"], { encoding: "utf8" });
   expect(cli.status).toBe(1);
   expect(cli.stderr).toMatch(/needs --force/);
+});
+
+// A hang found 2026-11-19: clean() resolved every path lsof listed with realpathSync, which opens it; a pty slave under /dev
+// blocked open(2) in the kernel for good (uninterruptible), freezing every `bun test` run. Tests never touch a real device:
+// they use a /dev path that does not exist, and a spy that records what the code stats and resolves.
+test("resolveOpens never stats or resolves anything under /dev, and resolves only plain files and directories", () => {
+  const w = world(), file = join(w.root, "plain"), fifo = join(w.root, "pipe");
+  writeFileSync(file, "x");
+  expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+  const resolved = [], statted = [], realpath = p => (resolved.push(p), p), stat = p => (statted.push(p), lstatSync(p));
+  const out = resolveOpens(["/dev/plenary-no-such-device", "/dev/plenary-no-such-pty", fifo, file, w.root, join(w.root, "gone")], stat, realpath);
+  expect(resolved).toEqual([file, w.root]);
+  expect(statted.some(p => p.startsWith("/dev/"))).toBe(false);
+  expect(out).toEqual(expect.arrayContaining(["/dev/plenary-no-such-device", fifo, file, w.root]));   // still reported as lsof printed them
+});
+
+test("a FIFO candidate in the temp dir is kept and never opened; a FIFO or missing path as a base is refused or absent without opening", async () => {
+  const w = world(), fifo = join(w.tempDir, "plenary-test-fifo11"), pipeBase = join(w.root, "pipe-base");
+  expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+  expect(spawnSync("mkfifo", [pipeBase]).status).toBe(0);
+  // A subprocess with a timer that does not wait after the kill: a regression ends this test at the timer, never the run.
+  const script = `import { clean } from ${JSON.stringify(join(ROOT, "scripts/clean.js"))};
+    const r = clean({ tempDir: ${JSON.stringify(w.tempDir)}, rigRoot: null, now: Date.now() + 3 * 3_600_000, yes: true, openPathsFn: () => [${JSON.stringify(fifo)}, "/dev/plenary-no-such-device"] });
+    let refused = ""; try { clean({ tempDir: ${JSON.stringify(pipeBase)}, rigRoot: null, openPathsFn: () => [] }); } catch (e) { refused = e.message; }
+    console.log(JSON.stringify({ items: r.items.map(i => [i.status, i.why]), refused }));`;
+  const p = Bun.spawn([process.execPath, "--no-env-file", "-e", script], { stdout: "pipe", stderr: "ignore" });
+  kids.push(p);
+  const out = await Promise.race([new Response(p.stdout).text(), Bun.sleep(15_000).then(() => { p.kill("SIGKILL"); return null; })]);
+  expect(out).not.toBeNull();
+  const got = JSON.parse(out);
+  expect(got.items).toEqual([["kept", "not a regular file or directory"]]);
+  expect(got.refused).toMatch(/not a directory \(never opened\)/);
+  expect(lstatSync(fifo).isFIFO()).toBe(true);
+}, 30_000);
+
+test("a rig.json that is not a regular file keeps the rig (never handed to the status child)", () => {
+  const w = world(), d = join(w.rigRoot, "odd");
+  mkdirSync(d); expect(spawnSync("mkfifo", [join(d, "rig.json")]).status).toBe(0);
+  let asked = 0;
+  const r = clean({ ...w, now: LATER(), yes: true, openPathsFn: () => [], rigAlive: () => (asked++, false) });
+  expect(asked).toBe(0);
+  expect(byName(r, "odd").why).toMatch(/no rig.json/);
+});
+
+test("resolveNoOpen: symlink chains, relative links, .. after a link, missing parts and loops, without opening anything", () => {
+  const w = world(), r = realpathSync(w.root), at = (...p) => join(w.root, ...p);
+  mkdirSync(at("a/b"), { recursive: true }); mkdirSync(at("c"));
+  writeFileSync(at("a/b/f"), "x");
+  symlinkSync("b", at("a/rel"));                    // relative, same dir
+  symlinkSync(at("a/rel"), at("c/abs"));            // absolute, onto a link: a chain
+  symlinkSync("../a/b", at("c/up"));                // relative with ..
+  symlinkSync("loop2", at("loop1")); symlinkSync("loop1", at("loop2"));
+  expect(resolveNoOpen(at("c/abs/f"))).toBe(join(r, "a/b/f"));
+  expect(resolveNoOpen(w.root + "/c/up/../b/f")).toBe(join(r, "a/b/f"));   // .. applies to the resolved dir (a/b), not the link's parent
+  expect(resolveNoOpen(w.root + "/a/./b/../rel")).toBe(join(r, "a/b"));
+  expect(resolveNoOpen(at("a/b"))).toBe(realpathSync(at("a/b")));
+  expect(resolveNoOpen("/")).toBe("/");
+  expect(() => resolveNoOpen(at("loop1"))).toThrow(/symbolic links/);
+  expect(() => resolveNoOpen(at("a/nope/x"))).toThrow(expect.objectContaining({ code: "ENOENT" }));
+  const fifo = at("pipe"); expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+  expect(resolveNoOpen(fifo)).toBe(join(r, "pipe"));                 // a FIFO resolves without being opened
+});
+
+// Case-insensitive volumes (default APFS): /USERS/R and /users are $HOME and its parent, and string compares of spellings miss them.
+test("a base that is $HOME or a parent of it is refused under any letter case (by identity)", () => {
+  const home = process.env.HOME, up = home.toUpperCase();
+  const refuse = dir => expect(() => clean({ tempDir: join(sandbox, "none"), scratch: dir, rigRoot: null, maxTimeMs: 0, openPathsFn: () => [] })).toThrow(/refusing/);
+  if (existsSync(up)) refuse(up);                                  // only where the volume folds case
+  if (existsSync("/users")) refuse("/users");
+  if (existsSync(home.toLowerCase())) refuse(home.toLowerCase());
+  refuse(home);
+});
+
+test("resolveNoOpen restores the stored spelling, so a lsof path matches a differently-cased base", () => {
+  const w = world(), d = entry(w.tempDir, "plenary-test-case11"), swapped = join(w.root.toUpperCase(), "temp");
+  if (!existsSync(swapped)) return;                                // a case-sensitive volume: nothing to fold
+  expect(resolveNoOpen(join(swapped, "plenary-test-case11"))).toBe(d);
+  const lsof = fakeLsof(w, `case "$*" in *+D*) exit 1;; esac\nprintf 'p1\\0n${d}/sub/f\\0\\n'\nexit 1`);
+  expect(byName(clean({ ...w, tempDir: swapped, lsof, now: LATER(), yes: true }), "plenary-test-case11")).toMatchObject({ status: "kept", why: "in use" });
+});
+
+test("resolveNoOpen: a trailing slash on a non-directory is ENOTDIR", () => {
+  const w = world(), f = join(w.root, "plain");
+  writeFileSync(f, "x");
+  expect(resolveNoOpen(f)).toBe(join(realpathSync(w.root), "plain"));
+  expect(() => resolveNoOpen(f + "/")).toThrow(expect.objectContaining({ code: "ENOTDIR" }));
+  expect(resolveNoOpen(w.root + "/")).toBe(realpathSync(w.root));
+});
+
+test("macOS firmlink: /System/Volumes/Data is refused as a base, and its spelling of a path resolves to lsof's", () => {
+  const data = "/System/Volumes/Data";
+  if (!existsSync(join(data, "Users"))) return;                    // not a firmlinked system
+  expect(() => clean({ tempDir: join(sandbox, "none"), scratch: data, rigRoot: null, maxTimeMs: 0, openPathsFn: () => [] })).toThrow(/refusing/);
+  expect(() => clean({ tempDir: join(sandbox, "none"), scratch: join(data, process.env.HOME), rigRoot: null, maxTimeMs: 0, openPathsFn: () => [] })).toThrow(/refusing/);
+  expect(resolveNoOpen(join(data, ROOT))).toBe(ROOT);
+});
+
+test("resolveNoOpen keeps the given spelling under a directory that can be entered but not listed", () => {
+  const w = world(), dir = join(w.root, "x-only");
+  mkdirSync(join(dir, "Sub"), { recursive: true });
+  chmodSync(dir, 0o111);
+  try { expect(resolveNoOpen(join(dir, "Sub"))).toBe(join(realpathSync(w.root), "x-only", "Sub")); }
+  finally { chmodSync(dir, 0o755); }
 });

@@ -80,6 +80,7 @@ export const mint = {
   board: () => "b-" + randomId(16),
   invite: () => "i-" + randomId(16),
   link: () => randomId(26),
+  request: () => "ar-" + randomId(12),
 };
 
 /**
@@ -99,6 +100,7 @@ export const mint = {
  *   scoped: { unit: ScopedGrant[], group: ScopedGrant[], space: ScopedGrant[], board: ScopedGrant[] },
  *   roles: CustomRole[], teams: Record<string, string[]> }} AccessContext   `scoped`: the grants on each scope of the chain (a board's are Team grants only; user grants on a board are `grants`); `roles`: the Unit's stored roles; `teams`: for each Team that appears in `scoped`, its members (only those named in `users`, when given)
  * @typedef {{ board: Board, grant: Role|null, teamGrants: ScopedGrant[], myTeams: string[], invites: Invite[], links: Link[] }} BoardRows   `teamGrants`: Team grants on the board; `myTeams`: those of the user's Teams that appear in `teamGrants`; `invites`: non-revoked, to the user's email; `links`: the link records of the user's uses on this board
+ * @typedef {{ id: string, tenant: string, scope: ScopeRef, user: string, role: string, state: "pending"|"dismissed", at: number }} AccessRequest
  * @typedef {{ id: string, board: string, email: string, role: Role, expiresAt: number|null, revoked: boolean, by: string, createdAt: number }} Invite
  * @typedef {{ id: string, board: string, role: Role, expiresAt: number|null, revoked: boolean, by: string, createdAt: number }} Link
  *
@@ -174,9 +176,29 @@ export const mint = {
  *   searchBoards(tenant: string, o?: { q?: string, unfiled?: boolean, after?: string|null, scan?: number }): Promise<{ ids: string[], next: string|null }>,   // board ids in a Unit whose title or Space's name contains q (ASCII case-folding only, LIKE characters literal; `unfiled`: boards in no Space, q then matches the title). By id. A page examines the next `scan` boards (default 1000, at most 5000) and returns EVERY match among them; `next` is set only when the Unit goes on past that window, never because of how many matched (a caller that hides some matches must not learn their number from `next`)
  *   spaceCandidates(tenant: string, o: { user: string, all?: boolean, after?: string|null, limit?: number }): Promise<{ spaces: Space[], groups: Group[], next: string|null }>,   // the Unit's Spaces the user COULD open, by id (a superset; the resolver decides): general access set, the user's personal space, a grant to the user or one of their Teams on the Space or its Group, a Group with general access; `all` = every Space (the user holds a Unit-level role). `groups`: the Groups of the returned Spaces. Limit default 100, at most 200
  *   groupCandidates(tenant: string, o: { user: string, all?: boolean, limit?: number }): Promise<Group[]>,   // Groups the user could open, by id, at most `limit` (default 50, at most 100): general access set, or a grant to the user or a Team of theirs, or `all`
+ *   requestAccess(o: { tenant: string, scope: ScopeRef, user: string, role: string, idem?: Idem }): Promise<AccessRequest>,   // Access requests (#51): ONE atomic step (the key first, then the scope's existence in the tenant, the person's own row, the cooldown, the limits, the write); an open request is returned as it is; rejects code "rate-limited" with `retryAfterMs` (null: no wait helps)
+ *   accessRequest(scope: ScopeRef, user: string): Promise<AccessRequest|null>,   // the person's row at the scope (pending, or dismissed and still in its cooldown), null once expired
+ *   accessRequests(scope: ScopeRef, o?: { limit?: number }): Promise<AccessRequest[]>,   // the PENDING ones, newest first (default 50, at most 200), none older than ASK.ttlMs
+ *   closeAccessRequest(scope: ScopeRef, user: string, state: "dismissed"|"granted"): Promise<boolean>,   // "dismissed" keeps the row (it holds the cooldown), "granted" deletes it; true when a row was pending
+ *   grantHolders(scope: ScopeRef, roles: string[], o?: { limit?: number }): Promise<ScopedGrant[]>,   // the scoped grants AT the scope whose role is one of `roles`, by subject, at most `limit` (default and cap ASK.holders)
  *   boardRows(boards: string[], o: { user: string, email?: string|null }): Promise<Map<string, BoardRows>>,   // the board-scope rows the resolver reads for one user over at most BATCH boards, in a fixed number of statements; unknown ids are absent
  * }} Registry
  */
+
+/**
+ * Access requests (PROTOCOL.md § Access explanation and requests): the limits every adapter applies inside `requestAccess`'s one atomic step.
+ * cooldownMs: a dismissed request blocks a new one this long from when it was made; perUser per windowMs: requests one person may make across all scopes;
+ * scopePending: pending requests one scope holds; ttlMs: a request older than this is ignored and pruned (pruned `prune` at a time); holders: most `grantHolders` returns.
+ */
+export const ASK = Object.freeze({ cooldownMs: 24 * 3600_000, windowMs: 24 * 3600_000, perUser: 20, scopePending: 200, ttlMs: 30 * 24 * 3600_000, prune: 100, holders: 20, page: { default: 50, max: 200 } });
+/** The refusal of `requestAccess`: code "rate-limited", `retryAfterMs` = when it may succeed (null: not before something else changes). */
+export const askLimited = retryAfterMs => Object.assign(new Error("registry: access requests are rate limited"), { name: "RegistryError", code: "rate-limited", retryAfterMs });
+/** The scope types a request names, and the validated shape of one (every adapter agrees). */
+export const ASK_SCOPES = ["group", "space", "board"];
+export const askScope = s => { const sc = orgDefaults.scope(s); if (!ASK_SCOPES.includes(sc.type)) fail("scope"); return sc; };
+export const askRole = r => { if (typeof r !== "string" || !r || r.length > 64 || r.includes("\0")) fail("role"); return r; };
+/** The pending request an adapter returns for one at `at`, pending and not expired, else a dismissed one in its cooldown; null when it no longer matters. */
+export const askLive = (row, t) => (!row || t - row.at >= ASK.ttlMs ? null : row.state === "dismissed" && t - row.at >= ASK.cooldownMs ? null : row);
 
 /** Home (PROTOCOL.md § Home): rows kept per user in Recent, rows a starred / shared read may return, and the most boards one `boardRows` / `starredAmong` call takes. */
 /** Idempotent creates (PROTOCOL.md): a key row is kept `ttlMs`; expired rows are pruned `prune` at a time, every `every`-th keyed create. */

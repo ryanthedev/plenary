@@ -17,7 +17,7 @@
 // `user`; insertion order is an explicit `n` column (Postgres: BIGSERIAL / identity), upserts use ON CONFLICT.
 
 import { Database } from "bun:sqlite";
-import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId } from "../auth/registry-port.js";
+import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 
 /** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code`. */
@@ -135,6 +135,12 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     db.run(`CREATE TABLE IF NOT EXISTS reg_roles (
       tenant TEXT NOT NULL REFERENCES reg_tenants(id), id TEXT NOT NULL, name TEXT NOT NULL, base TEXT, board_role TEXT,
       permissions TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (tenant, id))`);
+    // Access requests (PROTOCOL.md § Access explanation and requests): one row per (scope, member); a dismissed row stays until its cooldown ends.
+    db.run(`CREATE TABLE IF NOT EXISTS reg_access_requests (
+      id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, member TEXT NOT NULL,
+      role TEXT NOT NULL, state TEXT NOT NULL, at INTEGER NOT NULL, UNIQUE (scope_type, scope_id, member))`);
+    db.run("CREATE INDEX IF NOT EXISTS reg_access_requests_member ON reg_access_requests (tenant, member, at)");
+    db.run("CREATE INDEX IF NOT EXISTS reg_access_requests_scope ON reg_access_requests (scope_type, scope_id, state, at DESC)");
     // Home (PROTOCOL.md § Home): Recent and Starred, one row per (member, board). Additive like the rest.
     db.run(`CREATE TABLE IF NOT EXISTS reg_recents (
       member TEXT NOT NULL, board TEXT NOT NULL REFERENCES reg_boards(id), opened_at INTEGER NOT NULL, PRIMARY KEY (member, board))`);
@@ -254,6 +260,17 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     memberN: db.query("SELECT count(*) AS n FROM (SELECT 1 FROM reg_members WHERE tenant = ?1 LIMIT ?2)"),
     insRole: db.query("INSERT INTO reg_roles (tenant, id, name, base, board_role, permissions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"),
     upRole: db.query("UPDATE reg_roles SET name = ?, board_role = ?, permissions = ? WHERE tenant = ? AND id = ?"),
+    askGet: db.query("SELECT * FROM reg_access_requests WHERE scope_type = ? AND scope_id = ? AND member = ?"),
+    askUp: db.query(`INSERT INTO reg_access_requests (id, tenant, scope_type, scope_id, member, role, state, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)
+      ON CONFLICT (scope_type, scope_id, member) DO UPDATE SET role = excluded.role, state = 'pending', at = excluded.at`),
+    askUser: db.query("SELECT count(*) AS n, min(at) AS first FROM reg_access_requests WHERE tenant = ? AND member = ? AND at > ?"),
+    askScopeN: db.query("SELECT count(*) AS n FROM reg_access_requests WHERE scope_type = ? AND scope_id = ? AND state = 'pending' AND at > ?"),
+    askList: db.query("SELECT * FROM reg_access_requests WHERE scope_type = ? AND scope_id = ? AND state = 'pending' AND at > ? ORDER BY at DESC, id DESC LIMIT ?"),
+    askPrune: db.query("DELETE FROM reg_access_requests WHERE rowid IN (SELECT rowid FROM reg_access_requests WHERE at <= ?1 LIMIT ?2)"),
+    askDismiss: db.query("UPDATE reg_access_requests SET state = 'dismissed' WHERE scope_type = ? AND scope_id = ? AND member = ? AND state = 'pending'"),
+    askDel: db.query("DELETE FROM reg_access_requests WHERE scope_type = ? AND scope_id = ? AND member = ?"),
+    holders: db.query(`SELECT subject_type, subject, role FROM reg_scope_grants WHERE scope_type = ?1 AND scope_id = ?2
+      AND role IN (SELECT value FROM json_each(?3)) ORDER BY subject_type, subject LIMIT ?4`),
     upRecent: db.query(`INSERT INTO reg_recents (member, board, opened_at) VALUES (?1, ?2, ?3)
       ON CONFLICT (member, board) DO UPDATE SET opened_at = excluded.opened_at`),
     pruneRecent: db.query(`DELETE FROM reg_recents WHERE member = ?1 AND board IN
@@ -381,6 +398,29 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     if (e && t - e.at < IDEM.ttlMs) throw e.fp !== idem.fp ? idemErr.mismatch() : idemErr.replay(e.ref);
   };
   const idemPut = (idem, ref, t) => { if (idem) q.idemPut.run(idem.user, idem.key, idem.fp, ref, t); };
+
+  const rowAsk = r => r && { id: r.id, tenant: r.tenant, scope: { type: r.scope_type, id: r.scope_id }, user: r.member, role: r.role, state: r.state, at: r.at };
+  // One IMMEDIATE transaction: the key, the scope, the person's row, the cooldown and both limits are read and the row written under one write lock.
+  const requestTx = db.transaction((tenant, sc, user, role, idem, t) => {
+    idemEnter(idem, t);
+    needRow(scopeTenant(sc.type, sc.id) === tenant, "scope");
+    q.askPrune.run(t - ASK.ttlMs, ASK.prune);
+    const cur = askLive(rowAsk(q.askGet.get(sc.type, sc.id, user)), t);
+    if (cur?.state === "pending") { idemPut(idem, cur.id, t); return cur; }
+    if (cur) throw askLimited(cur.at + ASK.cooldownMs - t);
+    const mine = q.askUser.get(tenant, user, t - ASK.windowMs);
+    if (mine.n >= ASK.perUser) throw askLimited(mine.first + ASK.windowMs - t);
+    if (q.askScopeN.get(sc.type, sc.id, t - ASK.ttlMs).n >= ASK.scopePending) throw askLimited(null);
+    const id = q.askGet.get(sc.type, sc.id, user)?.id ?? fresh(mint.request, i => !!db.query("SELECT 1 AS x FROM reg_access_requests WHERE id = ?").get(i));
+    q.askUp.run(id, tenant, sc.type, sc.id, user, role, t);
+    idemPut(idem, id, t);
+    return rowAsk(q.askGet.get(sc.type, sc.id, user));
+  });
+  const closeAskTx = db.transaction((sc, user, state, t) => {
+    const was = askLive(rowAsk(q.askGet.get(sc.type, sc.id, user)), t)?.state === "pending";
+    if (state === "granted") q.askDel.run(sc.type, sc.id, user); else if (was) q.askDismiss.run(sc.type, sc.id, user);
+    return was;
+  });
 
   const createBoardTx = db.transaction((tenant, title, memberRole, space, owner, idem, createdAt) => {
     if (!q.tenantExists.get(tenant)) throw new Error("registry: no such tenant");
@@ -810,6 +850,35 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       const list = batchScopes(scopes), us = users ? users.filter(str) : null;
       return new Map(contextsTx(list, us));
     },
+    // ---- Access requests (PROTOCOL.md § Access explanation and requests) ----
+    async requestAccess({ tenant, scope, user, role, idem }) {
+      ready();
+      const sc = askScope(scope), r = askRole(role);
+      if (!str(tenant) || !str(user) || !user || user.includes("\0")) throw new Error("registry: no such scope");
+      return requestTx.immediate(tenant, sc, user, r, idemOf(idem), now());
+    },
+    async accessRequest(scope, user) {
+      ready();
+      const sc = orgDefaults.scope(scope);
+      return str(user) ? askLive(rowAsk(q.askGet.get(sc.type, sc.id, user)), now()) : null;
+    },
+    async accessRequests(scope, { limit } = {}) {
+      ready();
+      const sc = askScope(scope);
+      return q.askList.all(sc.type, sc.id, now() - ASK.ttlMs, smallLimit(limit, ASK.page.default, ASK.page.max)).map(rowAsk);
+    },
+    async closeAccessRequest(scope, user, state) {
+      ready();
+      const sc = askScope(scope);
+      if (state !== "dismissed" && state !== "granted") throw new Error("registry: bad state");
+      return str(user) ? closeAskTx.immediate(sc, user, state, now()) : false;
+    },
+    async grantHolders(scope, roles, { limit } = {}) {
+      ready();
+      const sc = orgDefaults.scope(scope), want = [...new Set((roles ?? []).filter(str))].slice(0, 100);
+      return want.length ? q.holders.all(sc.type, sc.id, JSON.stringify(want), smallLimit(limit, ASK.holders, ASK.holders)).map(rowSg) : [];
+    },
+
     // ---- Idempotent creates (PROTOCOL.md) ----
     async idemGet(o) {
       ready();

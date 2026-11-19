@@ -9,13 +9,14 @@
 import { AdminError, knownOnBoard } from "../admin/boards.js";
 import { isUnitAdmin } from "./resolver.js";
 import { ROLES } from "./util.js";
-import { roleDef, MGMT_PERMS } from "./permissions.js";
+import { roleDef, MGMT_PERMS, UNIT_ROLES } from "./permissions.js";
 import { TEAMS } from "./registry-port.js";
+import { LADDER_NAMES, roleLabel as labelOf, explainService, askRolesFor } from "./explain.js";
 
 /** What one read shows at most, and the work each does (PROTOCOL.md § Teams and access, Bounds). */
 export const LIMITS = Object.freeze({ teams: TEAMS.page.default, rows: 50, inherited: 20, boardPeople: 200, search: 8, admins: 100, scopes: 5000, teamScopes: 50, scopePage: 500, backlog: 2000, addPages: 20, retries: 3 });
 const TYPES = ["unit", "group", "space", "board"];
-export const LADDER_NAMES = { viewer: "Viewer", commenter: "Commenter", annotator: "Annotator", editor: "Editor", owner: "Owner" };
+export { LADDER_NAMES };
 export const LADDER_SUMMARY = {
   viewer: "Can view", commenter: "Can view and comment", annotator: "Can view, comment and annotate", editor: "Can edit, and create boards and Spaces where that applies",
   owner: "Everything an editor can do, plus manage who has access, move, delete and transfer",
@@ -45,7 +46,7 @@ export const mgmtOf = def => [...def.permissions].filter(p => MGMT_PERMS.include
  *   backlog?: () => number, settled?: () => Promise<void>, log?: { warn(msg: string, f?: object): void } }} deps
  *   announce: hands a change to the announcement scheduler (spaceService.announceChange); backlog / settled: its load, so a long walk waits instead of piling up.
  */
-export function accessService({ registry, tenancy, announce = () => {}, backlog = () => 0, settled = async () => {}, log = { warn() {} } }) {
+export function accessService({ registry, tenancy, now = Date.now, explainer = explainService({ registry, now }), announce = () => {}, backlog = () => 0, settled = async () => {}, log = { warn() {} } }) {
   const may = (a, p) => a.permissions.has(p);
   const opens = a => a.ladder != null;
   const warn = (msg, f) => { try { log.warn(msg, f); } catch {} };
@@ -133,7 +134,7 @@ export function accessService({ registry, tenancy, announce = () => {}, backlog 
   }
 
   // ---- naming rows ----
-  const roleLabel = (role, roles) => LADDER_NAMES[role] ?? roles.get(role)?.name ?? (role === "admin" ? "Admin" : role === "member" ? "Member" : String(role));
+  const roleLabel = labelOf;
   const summaryOf = (role, def, roles) => {
     if (LADDER_SUMMARY[role]) return LADDER_SUMMARY[role];
     const m = mgmtOf(def), c = roles.get(role);
@@ -188,6 +189,16 @@ export function accessService({ registry, tenancy, announce = () => {}, backlog 
   /** A personal space's access is its owner's own. */
   const isPersonal = sc => sc.type === "space" && sc.row.kind === "personal";
   const manages = sc => !isPersonal(sc) && may(sc.access, "members.manage");
+
+  /** The pending requests at a scope, with the requesters named (only a `members.manage` holder is ever handed these). */
+  async function requestsOf(unit, scope, roles) {
+    const list = await registry.accessRequests(scope, { limit: LIMITS.rows });
+    const label = await named(unit, list.map(r => ({ type: "user", id: r.user })));
+    return list.map(r => ({ user: label({ type: "user", id: r.user }), role: r.role, roleName: roleLabel(r.role, roles), at: r.at }));
+  }
+  /** The roles the caller may ask for at a scope (none: they may not ask: personal space, the Unit, nothing to open, already a manager). */
+  const askable = sc => (sc.type !== "unit" && opens(sc.access) && !manages(sc) && !isPersonal(sc) ? askRolesFor(sc.access) : []);
+  const requestRow = (r, roleList) => ({ role: r.role, roleName: labelOf(r.role, new Map(roleList.map(x => [x.id, x]))), at: r.at, state: r.state });
 
   return {
     // ================= Teams =================
@@ -289,12 +300,17 @@ export function accessService({ registry, tenancy, announce = () => {}, backlog 
       const admin = isUnitAdmin(unit, identity), manage = manages(sc);
       const scope = { type, id: row.id };
       const canSee = opens(access);
-      const [page, roleList, people] = await Promise.all([
+      const [page, roleList, people, unitPage] = await Promise.all([
         registry.scopedGrantsPage(scope, { after: cur, limit: LIMITS.rows }),
         registry.roles(unit.id),
         type === "board" && cur === null ? registry.grants(row.id) : [],
+        type !== "unit" ? registry.scopedGrantsPage({ type: "unit", id: unit.id }, { limit: LIMITS.rows }) : null,
       ]);
       const roles = new Map(roleList.map(r => [r.id, r]));
+      // Access that comes from the Unit itself: its admins, the grants on it whose role carries board content here, and the Unit member role's board role.
+      const orgAdmins = type !== "unit" ? (unit.admins ?? []).filter(a => !a.startsWith("email:")) : [];
+      const unitGrants = unitPage ? unitPage.grants.filter(g => !UNIT_ROLES.includes(g.role) && roleDef(g.role, type, roles)?.ladder != null) : [];
+      const memberLadder = type !== "unit" ? roleDef("member", "unit", roles)?.ladder ?? null : null;
 
       // The containers above, for the inherited rows and the general-access rows: only the ones the caller can open (names are access).
       const above = [];
@@ -312,18 +328,24 @@ export function accessService({ registry, tenancy, announce = () => {}, backlog 
       const rawRows = [...page.grants.filter(g => type !== "board" || g.subject.type === "team"), ...userRows];
       // A board lists its direct people on the first page; the page's own rows are Team grants there (a person's board grant lives in `grants`).
       const adminList = type === "unit" ? (unit.admins ?? []).filter(a => !a.startsWith("email:")).slice(0, LIMITS.admins).map(a => ({ type: "user", id: a })) : [];
-      const label = named(unit, [...rawRows.map(r => r.subject), ...inheritedPages.flatMap(p => p.grants.map(g => g.subject)), ...adminList]);
+      const label = named(unit, [...rawRows.map(r => r.subject), ...inheritedPages.flatMap(p => p.grants.map(g => g.subject)), ...adminList, ...unitGrants.map(g => g.subject), ...orgAdmins.slice(0, LIMITS.inherited).map(a => ({ type: "user", id: a }))]);
       const nameOfSubject = await label;
       const canTouch = (role, g) => manage && touchable(access, role, type, roles, admin, g, identity);
       const toRow = (g, extra = {}) => ({ subject: nameOfSubject(g.subject), role: g.role, roleName: roleLabel(g.role, roles), via: g.subject.type === "team" ? "team" : "direct", ...extra });
       const rows = rawRows.map(g => toRow(g, { can: { change: canTouch(g.role, g.subject), remove: canTouch(g.role, g.subject) } }));
       const inherited = above.flatMap((c, i) => inheritedPages[i].grants.map(g => ({ scope: { type: c.type, id: c.row.id, name: c.row.name }, subject: nameOfSubject(g.subject), role: g.role, roleName: roleLabel(g.role, roles), via: "inherited" })));
+      for (const g of unitGrants) inherited.push({ scope: { type: "unit", id: unit.id }, subject: nameOfSubject(g.subject), role: g.role, roleName: roleLabel(g.role, roles), via: "inherited" });
       const general = [];
       if (canSee) {
         if (type === "board" && row.memberRole) general.push({ scope: { type, id: row.id, name: row.title }, role: row.memberRole });
         else if ((type === "space" || type === "group") && row.generalRole) general.push({ scope: { type, id: row.id, name: row.name }, role: row.generalRole });
       }
       for (const c of above) if (c.row.generalRole) general.push({ scope: { type: c.type, id: c.row.id, name: c.row.name }, role: c.row.generalRole });
+      if (memberLadder) general.push({ scope: { type: "unit", id: unit.id }, role: memberLadder });
+      const [why, requests] = await Promise.all([
+        explainer.explain(identity, { type, row, access, unit, manage, personal: isPersonal(sc) }),
+        manage && type !== "unit" ? requestsOf(unit, scope, roles) : [],
+      ]);
 
       // The picker: only roles valid here that the caller may hand out.
       const options = [...ROLES.filter(r => type !== "unit"), ...[...roles.values()].filter(r => r.id !== "member").sort((a, b) => a.name.localeCompare(b.name)).map(r => r.id)];
@@ -338,6 +360,8 @@ export function accessService({ registry, tenancy, announce = () => {}, backlog 
         can: { manage },
         general,
         ...(type === "unit" ? { admins: adminList.map(a => { const v = nameOfSubject(a); return { user: v.id, name: v.name, email: v.email }; }) } : {}),
+        ...(type !== "unit" ? { organization: { admins: orgAdmins.slice(0, LIMITS.inherited).map(a => { const v = nameOfSubject({ type: "user", id: a }); return { user: v.id, name: v.name }; }), more: orgAdmins.length > LIMITS.inherited || unitPage.next != null, memberRole: memberLadder } } : {}),
+        ...why, ...(manage && type !== "unit" ? { requests } : {}),
         rows, next: page.next, inherited, roles: pick,
       };
     },
@@ -386,7 +410,64 @@ export function accessService({ registry, tenancy, announce = () => {}, backlog 
       const before = cur == null ? null : roleDef(cur, type, roles), after = role == null ? null : roleDef(role, type, roles);
       const revoke = before != null && (after == null || [...before.permissions].some(p => !after.permissions.has(p)));
       announce(unit, scope, { revoke });
+      // The person now holds the access they may have asked for: their request is done (best effort; a leftover only shows a stale row to managers until it expires).
+      if (role !== null && subjectType === "user") await registry.closeAccessRequest(scope, sid, "granted").catch(err => warn("could not close an access request", { err }));
       return role === null ? null : rowOf(unit, sub, role, roles, type, access, admin, identity);
+    },
+
+    // ================= Access requests (#51) =================
+
+    /**
+     * GET /boards/:board/explain: the explanation for anyone who can open the board, a guest included (their sources are board-scope only, so nothing else is
+     * named, no owners, no Ask). The same `effective(..., { uniform: true })` as every other board route; an unknown or hidden board is one `not-found`.
+     */
+    async boardExplain(identity, boardId) {
+      const unit = await unitOf(identity), id = idOf(boardId);
+      const [row, access] = await Promise.all([id ? registry.board(id) : null, tenancy.effective(identity, id ?? "", { uniform: true })]);
+      if (!row || !opens(access)) throw missing();
+      const own = unit && row.tenant === unit.id ? unit : null;
+      return explainer.explain(identity, { type: "board", row, access, unit: own, manage: !!own && may(access, "members.manage") });
+    },
+
+
+    /**
+     * POST /access/:type/:id/requests: the caller asks the scope's owners for `role`. Refused (the one 403, after the same reads) unless they are a Unit member who can open
+     * a Space, Group or board that is not a personal space, do not already manage it, and the role is one they may ask for.
+     * @param {import("./idp-port.js").Identity} identity @param {import("./registry-port.js").Idem} [idem]
+     */
+    async requestAccess(identity, type, id, role, idem) {
+      if (typeof role !== "string" || !role || role.length > 64) throw bad("bad role");
+      const unit = await unitOf(identity);
+      const sc = await scopeOf(identity, unit, type, id);
+      const may_ = sc ? askable(sc) : [];
+      if (!may_.length) throw refused();
+      if (!may_.some(r => r.id === role)) throw new AdminError("bad-role", "that role cannot be asked for here");
+      let r;
+      try { r = await registry.requestAccess({ tenant: unit.id, scope: { type, id: sc.row.id }, user: identity.user, role, idem }); }
+      catch (err) {
+        if (err?.code === "rate-limited") throw new AdminError("rate-limited", "too many requests", { data: { retryAfter: err.retryAfterMs == null ? null : Math.max(1, Math.ceil(err.retryAfterMs / 1000)) } });
+        throw err;
+      }
+      return requestRow(r, await registry.roles(unit.id));
+    },
+    /** The replay of a keyed `POST .../requests`: authorized AGAIN as the create was, then the caller's request read fresh. */
+    async replayRequest(identity, type, id, ref) {
+      const unit = await unitOf(identity);
+      const sc = await scopeOf(identity, unit, type, id);
+      if (!sc || type === "unit" || !opens(sc.access) || manages(sc) || isPersonal(sc)) throw refused();
+      const r = await registry.accessRequest({ type, id: sc.row.id }, identity.user);
+      if (!r || r.id !== ref) throw refused();
+      return requestRow(r, await registry.roles(unit.id));
+    },
+
+    /** DELETE /access/:type/:id/requests/:user: a manager dismisses a request (it stays as dismissed, holding the cooldown). Idempotent. */
+    async dismissRequest(identity, type, id, user) {
+      const u = userIdOf(user);
+      if (!u) throw bad("bad user");
+      const unit = await unitOf(identity);
+      const sc = await scopeOf(identity, unit, type, id);
+      if (!sc || type === "unit" || !manages(sc)) throw refused();
+      await registry.closeAccessRequest({ type, id: sc.row.id }, u, "dismissed");
     },
 
     /** Wait for the walks over Teams' scopes (tests; a shutdown). */

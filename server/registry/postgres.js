@@ -71,7 +71,7 @@
 // owns that pool) or `sql` (a Bun SQL client you own). `schema` names the Postgres schema. Never reads env.
 
 import { SQL } from "bun";
-import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId } from "../auth/registry-port.js";
+import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 import { needSchema, migrate, assertColumns, missing as absent } from "../pg/schema.js";
 
@@ -126,6 +126,8 @@ const REGISTRY_TABLE_DDL = {
   // Home (PROTOCOL.md § Home): Recent and Starred. Additive, like the organization tables.
   reg_recents: "member TEXT NOT NULL, board TEXT NOT NULL REFERENCES $S.reg_boards(id), opened_at BIGINT NOT NULL, PRIMARY KEY (member, board)",
   reg_stars: "member TEXT NOT NULL, board TEXT NOT NULL REFERENCES $S.reg_boards(id), at BIGINT NOT NULL, PRIMARY KEY (member, board)",
+  // Access requests (PROTOCOL.md § Access explanation and requests): one row per (scope, member); a dismissed row stays until its cooldown ends.
+  reg_access_requests: "id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, member TEXT NOT NULL, role TEXT NOT NULL, state TEXT NOT NULL, at BIGINT NOT NULL, UNIQUE (scope_type, scope_id, member)",
   // Idempotent creates (PROTOCOL.md): one row per (member, key), written in the create's own transaction; `ref` is the id it made.
   reg_idempotency: "member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, ref TEXT NOT NULL, at BIGINT NOT NULL, PRIMARY KEY (member, k)",
   reg_roles: "tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), id TEXT NOT NULL, name TEXT NOT NULL, base TEXT, board_role TEXT, permissions TEXT NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY (tenant, id)",
@@ -142,6 +144,8 @@ export const REGISTRY_INDEXES = {
   reg_recents_member: "reg_recents (member, opened_at DESC, board DESC)",
   reg_stars_member: "reg_stars (member, at DESC, board DESC)",
   reg_idempotency_at: "reg_idempotency (at)",
+  reg_access_requests_member: "reg_access_requests (tenant, member, at)",
+  reg_access_requests_scope: "reg_access_requests (scope_type, scope_id, state, at DESC)",
   reg_grants_member: "reg_grants (member)",
   reg_boards_tenant: "reg_boards (tenant, id)",
   reg_invites_email: "reg_invites (email)",
@@ -182,7 +186,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     I = `"${s}".reg_invites`, L = `"${s}".reg_links`, U = `"${s}".reg_link_uses`,
     TM = `"${s}".reg_tenant_meta`, TD = `"${s}".reg_tenant_domains`, GR = `"${s}".reg_groups`, SP = `"${s}".reg_spaces`, BS = `"${s}".reg_board_spaces`,
     TE = `"${s}".reg_teams`, TU = `"${s}".reg_team_members`, SG = `"${s}".reg_scope_grants`, RO = `"${s}".reg_roles`, MB = `"${s}".reg_members`,
-    RC = `"${s}".reg_recents`, ST = `"${s}".reg_stars`, ID = `"${s}".reg_idempotency`;
+    RC = `"${s}".reg_recents`, ST = `"${s}".reg_stars`, ID = `"${s}".reg_idempotency`, AR = `"${s}".reg_access_requests`;
   let idemCalls = 0;
 
   try {
@@ -252,6 +256,12 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     if (!e) throw new Error("registry: idempotency row vanished");
     throw e.fp !== idem.fp ? idemErr.mismatch() : idemErr.replay(e.ref);
   };
+  /** The key checked FIRST (before any limit): a live row rejects the create with the replay (or the mismatch), whatever else has changed since. */
+  const idemEnterPg = async (tx, idem, t) => {
+    if (!idem) return;
+    const e = await one(tx, `SELECT fp, ref, at FROM ${ID} WHERE member = $1 AND k = $2`, [idem.user, idem.key]);
+    if (e && t - Number(e.at) < IDEM.ttlMs) throw e.fp !== idem.fp ? idemErr.mismatch() : idemErr.replay(e.ref);
+  };
   /** Validates a create's `idem` and, every IDEM.every-th keyed create, prunes expired rows (its own gated call, never awaited: a failed prune never fails or slows a create). */
   const idemStart = idem => {
     const k = idemOf(idem);
@@ -281,6 +291,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
   const rowTeam = r => r && { id: r.id, tenant: r.tenant, name: r.name, createdAt: num(r.created_at) };
   const rowRole = r => r && { id: r.id, tenant: r.tenant, name: r.name, base: r.base, boardRole: r.board_role, permissions: JSON.parse(r.permissions), createdAt: num(r.created_at) };
   const rowSg = r => ({ subject: { type: r.subject_type, id: r.subject }, role: r.role });
+  const rowAsk = r => r && { id: r.id, tenant: r.tenant, scope: { type: r.scope_type, id: r.scope_id }, user: r.member, role: r.role, state: r.state, at: num(r.at) };
   const grantsOn = (q, type, id) => q.unsafe(`SELECT subject_type, subject, role FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 ORDER BY n`, [type, id]);
   /** Owner grants that guard a Group or Space: a user's, or a Team's while the Team has a member. */
   const countedOwners = (q, type, id) => q.unsafe(`SELECT subject_type, subject FROM ${SG} g WHERE scope_type = $1 AND scope_id = $2 AND role = 'owner'
@@ -922,6 +933,65 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       return out;
     },
     // ---- Idempotent creates (PROTOCOL.md) ----
+    // ---- Access requests (PROTOCOL.md § Access explanation and requests) ----
+    async requestAccess({ tenant, scope, user, role, idem }) {
+      ready();
+      const sc = askScope(scope), r = askRole(role), k = idemStart(idem);
+      if (!key(tenant) || !key(user) || !user) throw new Error("registry: no such scope");
+      return write(async tx => {
+        // One writer per person at a time: the per-person count and the one row per scope are read and written under it (and the key's unique index serialises a retry).
+        await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-ask:${s}:${tenant}:${user}`]);
+        const t = now();
+        await idemEnterPg(tx, k, t);
+        if ((await tenantOfScope(tx, sc.type, sc.id)) !== tenant) throw new Error("registry: no such scope");
+        await tx.unsafe(`DELETE FROM ${AR} WHERE id IN (SELECT id FROM ${AR} WHERE scope_type = $1 AND scope_id = $2 AND at <= $3 LIMIT $4)`, [sc.type, sc.id, t - ASK.ttlMs, ASK.prune]);
+        const row = await one(tx, `SELECT * FROM ${AR} WHERE scope_type = $1 AND scope_id = $2 AND member = $3`, [sc.type, sc.id, user]);
+        const cur = askLive(rowAsk(row), t);
+        if (cur?.state === "pending") { await idemPut(tx, k, cur.id, t); return cur; }
+        if (cur) throw askLimited(cur.at + ASK.cooldownMs - t);
+        const mine = await one(tx, `SELECT count(*) AS n, min(at) AS first FROM ${AR} WHERE tenant = $1 AND member = $2 AND at > $3`, [tenant, user, t - ASK.windowMs]);
+        if (Number(mine.n) >= ASK.perUser) throw askLimited(Number(mine.first) + ASK.windowMs - t);
+        if (Number((await one(tx, `SELECT count(*) AS n FROM ${AR} WHERE scope_type = $1 AND scope_id = $2 AND state = 'pending' AND at > $3`, [sc.type, sc.id, t - ASK.ttlMs])).n) >= ASK.scopePending) throw askLimited(null);
+        const id = row?.id ?? await fresh(tx, mint.request, AR);
+        await idemPut(tx, k, id, t);
+        await tx.unsafe(`INSERT INTO ${AR} (id, tenant, scope_type, scope_id, member, role, state, at) VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
+          ON CONFLICT (scope_type, scope_id, member) DO UPDATE SET role = excluded.role, state = 'pending', at = excluded.at`, [id, tenant, sc.type, sc.id, user, r, t]);
+        return rowAsk(await one(tx, `SELECT * FROM ${AR} WHERE id = $1`, [id]));
+      });
+    },
+    async accessRequest(scope, user) {
+      ready();
+      const sc = orgDefaults.scope(scope);
+      return key(user) && key(sc.id) ? askLive(rowAsk(await one(db, `SELECT * FROM ${AR} WHERE scope_type = $1 AND scope_id = $2 AND member = $3`, [sc.type, sc.id, user])), now()) : null;
+    },
+    async accessRequests(scope, { limit } = {}) {
+      ready();
+      const sc = askScope(scope);
+      if (!key(sc.id)) return [];
+      return (await db.unsafe(`SELECT * FROM ${AR} WHERE scope_type = $1 AND scope_id = $2 AND state = 'pending' AND at > $3 ORDER BY at DESC, id DESC LIMIT $4`,
+        [sc.type, sc.id, now() - ASK.ttlMs, smallLimit(limit, ASK.page.default, ASK.page.max)])).map(rowAsk);
+    },
+    async closeAccessRequest(scope, user, state) {
+      ready();
+      const sc = askScope(scope);
+      if (state !== "dismissed" && state !== "granted") throw new Error("registry: bad state");
+      if (!key(user) || !key(sc.id)) return false;
+      return write(async tx => {
+        const row = await one(tx, `SELECT * FROM ${AR} WHERE scope_type = $1 AND scope_id = $2 AND member = $3 FOR UPDATE`, [sc.type, sc.id, user]);
+        const was = askLive(rowAsk(row), now())?.state === "pending";
+        if (state === "granted") { if (row) await tx.unsafe(`DELETE FROM ${AR} WHERE id = $1`, [row.id]); }
+        else if (was) await tx.unsafe(`UPDATE ${AR} SET state = 'dismissed' WHERE id = $1`, [row.id]);
+        return was;
+      });
+    },
+    async grantHolders(scope, roles, { limit } = {}) {
+      ready();
+      const sc = orgDefaults.scope(scope), want = [...new Set((roles ?? []).filter(key))].slice(0, 100);
+      if (!want.length || !key(sc.id)) return [];
+      return (await db.unsafe(`SELECT subject_type, subject, role FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 AND role = ANY($3::text[])
+        ORDER BY subject_type COLLATE "C", subject COLLATE "C" LIMIT $4`, [sc.type, sc.id, want, smallLimit(limit, ASK.holders, ASK.holders)])).map(rowSg);
+    },
+
     async idemGet(o) {
       ready();
       const i = idemOf(o);

@@ -17,7 +17,7 @@ import { isUnitAdmin } from "../auth/resolver.js";
 
 export class AdminError extends Error {
   /**
-   * @param {"forbidden"|"bad-request"|"not-found"|"last-owner"|"unknown-person"|"bad-role"|"too-large"|"in-use"|"confirm-required"} code
+   * @param {"forbidden"|"bad-request"|"not-found"|"last-owner"|"unknown-person"|"bad-role"|"too-large"|"in-use"|"confirm-required"|"rate-limited"} code
    * @param {string} [message]
    * @param {{ cause?: unknown, data?: object }} [extra]  `data`: fields the HTTP answer adds (`in-use`, `confirm-required`)
    */
@@ -90,6 +90,8 @@ export async function setGrant({ caller, board, user, role }, { registry }) {
     if (err?.code === "last-owner") throw new AdminError("last-owner", "a board keeps at least one owner");
     throw err;
   }
+  // The person now holds access they may have asked for (PROTOCOL.md § Access explanation and requests): close the request. Best effort.
+  if (role !== null) await registry.closeAccessRequest?.({ type: "board", id: b.id }, user, "granted").catch(() => {});
 }
 
 /** Invite an email to a board. Works across domains. */

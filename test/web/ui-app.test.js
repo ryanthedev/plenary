@@ -49,13 +49,13 @@ class E extends N {
 }
 const IDS = ["topbar", "panel", "drawer", "timeline", "hudBL", "hudBC", "hudBR", "dock", "sheet", "dialogs", "overlays", "veil", "toast", "picker"];
 
-let frames, winL, page, media;
+let frames, winL, page, media, resizeCallbacks;
 // The globals this file stubs, put back afterwards so later files' fallbacks never see the stub page.
 const GLOBALS = ["document", "Node", "devicePixelRatio", "matchMedia", "ResizeObserver", "requestAnimationFrame", "addEventListener", "removeEventListener"];
 const saved = Object.fromEntries(GLOBALS.map(k => [k, Object.getOwnPropertyDescriptor(globalThis, k)]));
 afterAll(() => { for (const k of GLOBALS) { if (saved[k]) Object.defineProperty(globalThis, k, saved[k]); else delete globalThis[k]; } });
 function installPage() {
-  frames = []; winL = {}; media = new Map();
+  frames = []; winL = {}; media = new Map(); resizeCallbacks = [];
   const body = new E("body"), main = new E("div"), canvasBox = new E("div"), board = new E("canvas"), ink = new E("textarea");
   main.className = "main"; body.append(main); main.append(canvasBox); canvasBox.append(board, ink);
   const byId = { canvas: canvasBox, board, ink };
@@ -75,7 +75,7 @@ function installPage() {
       const m = media.get(query);
       return { get matches() { return m.matches; }, addEventListener: (type, fn) => { if (type === "change") m.listeners.push(fn); } };
     },
-    ResizeObserver: class { constructor(fn) { this.fn = fn; } observe() { this.fn([]); } },
+    ResizeObserver: class { constructor(fn) { this.fn = fn; resizeCallbacks.push(fn); } observe() { this.fn([]); } },
     requestAnimationFrame: fn => frames.push(fn),
     addEventListener: (t, fn) => { (winL[t] ??= []).push(fn); },
     removeEventListener: (t, fn) => { winL[t] = (winL[t] ?? []).filter(f => f !== fn); },
@@ -234,6 +234,30 @@ test("More menu follows menu keyboard navigation and restores focus after activa
   expect(rig.app.ui.drawer).toBe("notes");
 });
 
+test("More menu carries focus across resize-driven topbar rebuilds after keyboard activation", () => {
+  rig = setup({ collab: true });
+  let more = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More");
+  more.focus();
+  more.fire("keydown", { key: "Enter" });
+  more.click(); // native button Enter activation
+  const comments = find(page.byId.topbar, e => e.attrs.role === "menuitem" && e.attrs["aria-label"] === "Comments");
+  comments.focus(); comments.click();
+  expect(rig.app.ui.drawer).toBe("comments");
+  rig.step(1); // rebuild after drawer activation, before the observer's second dirty pass
+  resizeCallbacks[0]([]);
+  rig.step(2);
+  more = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More");
+  expect(page.doc.activeElement).toBe(more);
+});
+
+test("topbar rebuild does not steal focus from the canvas", () => {
+  rig = setup({ collab: true });
+  page.board.focus();
+  rig.app.ui.drawer = "comments";
+  rig.step(2);
+  expect(page.doc.activeElement).toBe(page.board);
+});
+
 test("all collaboration emoji toolbar buttons have descriptive accessible labels", () => {
   rig = setup({ collab: true });
   const toolbarButtons = page.doc.body.all().filter(e => e.tagName === "BUTTON" && e.classList.contains("tb"));
@@ -278,10 +302,25 @@ test("six-digit viewer count remains available in the mounted header", () => {
   expect(page.byId.topbar.all().filter(e => e.classList.contains("av")).length).toBeGreaterThanOrEqual(2);
 });
 
+test("1280px header keeps its board name rule with a six-digit viewer count and three writers", () => {
+  rig = setup({ collab: true });
+  const cy = createSession({ join: () => rig.net.join(), token: "t-cy", board: "b1", client: "cy", user: "cy", clock: rig.net.clock });
+  cy.setSize(1200, 800);
+  rig.step(4);
+  rig.net.broadcast({ t: "here", writerCount: 3, viewers: 999999 });
+  while (rig.net.step());
+  rig.step(2);
+  const watching = find(page.byId.topbar, e => e.classList.contains("watching"));
+  expect(watching.textContent).toBe("👁 999,999 viewers");
+  expect(page.byId.topbar.all().filter(e => e.classList.contains("av")).length).toBeGreaterThanOrEqual(3);
+});
+
 test("phone dock uses visible Comments text in its accessible name", () => {
   rig = setup({ collab: true });
   const comments = find(page.byId.dock, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "Comments");
   expect(comments.textContent).toBe("💬Comments");
+  expect(comments.attrs.title).toBe("Comments");
+  expect(page.byId.dock.all().filter(e => e.tagName === "BUTTON").every(e => e.attrs["aria-label"] && e.attrs.title === e.attrs["aria-label"])).toBe(true);
 });
 
 test("local drawing on an empty board does not move the view", () => {

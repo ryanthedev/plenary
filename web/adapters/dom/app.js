@@ -323,7 +323,6 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     h("span.ic", {}, t.icon), t.keys?.[0] ? h("span.k", {}, t.keys[0].toUpperCase()) : null);
   }
 
-  let moreButton = null;
   function topbar() {
     const role = S.role, tools = toolsFor(role), may = S.may();
     const core = tools.filter(t => !["image", "note", "highlighter"].includes(t.id)), extras = tools.filter(t => ["image", "note", "highlighter"].includes(t.id));
@@ -332,7 +331,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const toggleTheme = () => setTheme(ui.theme === "dark" ? "light" : "dark");
     const togglePanel = () => setPanel({ type: "open" });
     const toggleExport = () => openDialog("export");
-    const extraAction = (label, action, disabled = false) => h("button.header-extra.btn.ghost", { role: "menuitem", "aria-label": label, title: label, disabled, onclick: () => { refocusMore = true; setMore(false); action(); } }, label);
+    const extraAction = (label, action, disabled = false) => h("button.header-extra.btn.ghost", { role: "menuitem", "aria-label": label, title: label, disabled, onclick: () => { setMore(false); action(); } }, label);
     const moreOpen = !!ui.moreOpen;
     let menu;
     const menuItems = () => {
@@ -352,7 +351,6 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       if (e.key === "ArrowDown" && !ui.moreOpen) { e.preventDefault(); setMore(true); }
       else if (e.key === "Escape" && ui.moreOpen) { e.preventDefault(); setMore(false, true); }
     } }, "More");
-    moreButton = more;
     menu = h("div.header-more-menu", { role: "menu", hidden: !moreOpen, onkeydown: e => {
       if (e.key === "Escape") { e.preventDefault(); setMore(false, true); }
       else if (e.key === "Tab") setMore(false);
@@ -469,7 +467,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const T = id => toolsFor("presenter").find(t => t.id === id);
   function dock() {
     const may = S.may(), role = S.role;
-    const btn = (ic, label, on, onclick, disabled = false, ariaLabel = label) => h("button.tb" + (on ? ".on" : ""), { onclick, disabled, "aria-label": ariaLabel }, h("span.ic", {}, ic), label);
+    const btn = (ic, label, on, onclick, disabled = false, ariaLabel = label) => h("button.tb" + (on ? ".on" : ""), { onclick, disabled, "aria-label": ariaLabel, title: ariaLabel }, h("span.ic", {}, ic), label);
     const sheet = id => () => { ui.sheet = ui.sheet === id ? null : id; chromeDirty = true; };
     const tool = id => btn(T(id).icon, T(id).name, S.tool === id, () => { if (id === "image") openPicker(); S.setTool(id); chromeDirty = true; }, !may);
     let items;
@@ -587,7 +585,6 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   //                connection): incoming ops, a pan or a zoom leave every key alone, so nothing rebuilds.
   // Keys read per-revision memos (notesInfo, boardInfo), never a scan per frame. ui.rebuilds counts rebuilds per part.
   const CHROME_MS = 250;
-  let refocusMore = false;
   const rebuilds = ui.rebuilds = { topbar: 0, panel: 0, drawer: 0, timeline: 0, hud: 0, overlays: 0, dock: 0, sheet: 0, dialogs: 0 };
   let chromeAt = -Infinity, gateKey = "", chromeHeld = false;
   document.addEventListener("pointerdown", e => { if (e.target !== canvas) chromeHeld = true; }, true);
@@ -608,8 +605,29 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     return JSON.stringify([propsModel(ed), B.sel.size > 0, S.eds.notes.sel.size > 0, B.selected()[0]?.customData?.anim?.preset ?? null,
       bi.framesSig, B.frameAt, !!B.play, B.doc.layers, bi.counts, B.activeLayer]);
   };
+  const buildTopbar = () => {
+    const root = $("#topbar"), active = document.activeElement;
+    const ownsFocus = root.contains(active);
+    const identity = ownsFocus && {
+      ariaLabel: active.getAttribute?.("aria-label"),
+      title: active.getAttribute?.("title"),
+      role: active.getAttribute?.("role"),
+    };
+    replace(root, topbar());
+    if (!identity) return root;
+    const descendants = [];
+    const visit = el => { for (const child of el.children) { descendants.push(child); visit(child); } };
+    visit(root);
+    const same = descendants.find(el => identity.ariaLabel
+      ? el.getAttribute?.("aria-label") === identity.ariaLabel
+      : identity.title ? el.getAttribute?.("title") === identity.title : identity.role && el.getAttribute?.("role") === identity.role);
+    const closedMenuItem = identity.role === "menuitem" && !ui.moreOpen;
+    const fallback = closedMenuItem ? descendants.find(el => el.getAttribute?.("aria-label") === "More") : null;
+    (fallback ?? same)?.focus?.();
+    return root;
+  };
   const parts = {
-    topbar: { key: () => notesCount(), build: () => replace($("#topbar"), topbar()) },
+    topbar: { key: () => notesCount(), build: buildTopbar },
     panel: { key: () => (S.role === "viewer" || !ui.panel.open ? "" : panelKey()), build: buildPanel },
     drawer: { key: () => (ui.drawer === "notes" ? notesRowsKey() : ""), build: buildDrawer },
     timeline: { key: () => { const B = S.eds.board, bi = boardInfo(B.doc), t = B.time(); return S.role !== "presenter" ? "" : JSON.stringify([bi.marks, bi.dur, !!B.play, B.play ? null : t]); }, build: timeline },
@@ -663,10 +681,6 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       if (!force && k === keys[name]) continue;
       if (part.build() === false) { keys[name] = undefined; continue; }   // busy: try again later
       keys[name] = k; rebuilds[name]++;
-    }
-    if (refocusMore) {
-      refocusMore = false;
-      moreButton?.focus?.();
     }
     if (collab && isPhone()) {
       const canvasRect = canvas.getBoundingClientRect();

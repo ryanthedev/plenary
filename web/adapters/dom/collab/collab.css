@@ -9,6 +9,7 @@
 .pin.detached { box-shadow: 0 0 0 2px var(--chrome), 0 0 0 3px var(--warn); }
 
 .collab-pop textarea.field { color: var(--fg); resize: vertical; font: inherit; font-size: 12.5px; min-height: 72px; }
+.collab-pop .reply textarea.field { min-height: 36px; }
 .collab-pop .spacer { flex: 1; }
 .collab-pop .anchor.muted { color: var(--muted); font-size: 12px; }
 .collab-pop.compose .reply { margin-top: 12px; }

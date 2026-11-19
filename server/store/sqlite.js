@@ -26,6 +26,7 @@
 
 import { Database } from "bun:sqlite";
 import { needId, PortError } from "../ids.js";
+import { encodeSliced } from "../encode/sliced.js";
 
 const MAX_READ = 10_000;
 /** The longest lease (ms): a holder that dies with a longer one would block its board for that long. */
@@ -176,7 +177,8 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
     async putCheckpoint(tenant, board, cp, epoch) {
       ready(tenant, board); needWriteEpoch(epoch);
       if (!cp || typeof cp !== "object" || !Number.isSafeInteger(cp.seq) || cp.seq < 0) throw new PortError("bad-entry", "a checkpoint needs a seq");
-      putCpTx.immediate(tenant, board, cp.seq, JSON.stringify(cp), epoch);
+      // Encoded in slices (the event loop breathes between them); the fence is checked in the transaction below, after.
+      putCpTx.immediate(tenant, board, cp.seq, await encodeSliced(cp), epoch);
     },
 
     /** The checkpoint with the highest seq; with `beforeSeq`, the highest below it (to step back past a bad one). */

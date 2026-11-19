@@ -89,11 +89,14 @@ export function newHolder(hostname) {
  *   timers: { setTimeout, clearTimeout, setInterval, clearInterval } this host's timers (default the globals).
  */
 export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now = Date.now, appendTimeoutMs = 4_000, sweepMs = 1_000,
-  heartbeatMs = 2_000, pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rules, maxBusBytes = bus.maxBytes ?? MAX_BUS_BYTES, tailFoldBytes = CHECKPOINT_BYTES,
+  heartbeatMs = 2_000, pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rules, maxBusBytes = bus.maxBytes ?? MAX_BUS_BYTES, tailFoldBytes = CHECKPOINT_BYTES, foldUnits, schedule, checkpointTimeoutMs = 30_000,
   holder, hostname = globalThis.process?.env?.HOSTNAME, leaseTtlMs = 10_000, watchIdleMs = 60_000, monotonic = performance.now.bind(performance), timers = globalThis }) {
   // tailFoldBytes: the Room's byte trigger for a checkpoint (§ Recovery, "When"): the log since the last one reaches this
   //   many chars and a quarter of the state's size (so a rewrite never costs more than ~4x the log). Default CHECKPOINT_BYTES.
+  // foldUnits: work per step of an incremental checkpoint (fold.js; default FOLD_STEP_UNITS). Each step is its own
+  //   `schedule(fn)` turn (default the injected timers' setImmediate, else the global; tests pass a queue they drain). checkpointTimeoutMs: a checkpoint write unanswered this long is failed (reported; the room's next fold may start), so a checkpoint never holds the loop for more than one step (§ Recovery, "Incremental fold").
   checkLeaseTtl(leaseTtlMs);
+  const sched = schedule ?? (fn => (timers.setImmediate ?? globalThis.setImmediate)(fn));   // the injected timers' turn, else the global one
   // Every timer of this host runs on `timers` (tests pass fake ones and advance them, with `monotonic` and the Store's
   // clock moved in step); the names shadow the globals for this whole function.
   const { setTimeout, clearTimeout, setInterval, clearInterval } = timers;
@@ -140,9 +143,9 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     } catch (err) { log.error("entries publish failed", { tenant: slot.tenant, board: slot.board, err }); }
   }
 
-  function withTimeout(p) {
+  function withTimeout(p, ms = appendTimeoutMs) {
     let timer;
-    const t = new Promise((_, rej) => { timer = setTimeout(() => rej(new PortError("timeout", "the store did not answer in time")), appendTimeoutMs); });
+    const t = new Promise((_, rej) => { timer = setTimeout(() => rej(new PortError("timeout", "the store did not answer in time")), ms); });
     return Promise.race([p, t]).finally(() => clearTimeout(timer));
   }
 
@@ -164,9 +167,12 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       },
       putCheckpoint(cp) {
         const p = store.putCheckpoint(tenant, board, cp, slot.epoch);
-        slot.writes.add(p); p.finally(() => slot.writes.delete(p)).catch(() => {});
         p.catch(err => fenced("checkpoint", err));
-        return p;
+        // A write that never answers must still settle, or the room's `writing` never drops (no later fold starts) and
+        // close() waits on it forever: the room and the slot track the timed one.
+        const timed = withTimeout(p, checkpointTimeoutMs);
+        slot.writes.add(timed); timed.finally(() => slot.writes.delete(timed)).catch(() => {});
+        return timed;
       },
     };
   }
@@ -300,7 +306,9 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       else log.error(`room: ${what}`, { tenant, board, ...detail });
     };
     // § Recovery, Room identity: the epoch is the lease's (acquire bumps it durably), so two builds never share one.
-    const opts = { board, tenant, log: logOf(slot), now, epoch: slot.epoch, report, foldBytes: tailFoldBytes, ...(rules ? { rules } : {}) };
+    const opts = { board, tenant, log: logOf(slot), now, epoch: slot.epoch, report, foldBytes: tailFoldBytes, ...(foldUnits ? { foldUnits } : {}),
+      // A step runs only while this slot lives: a lost lease or a stopped host abandons a fold in progress, writing nothing.
+      schedule: fn => sched(() => { if (!slot.dead) fn(); }), ...(rules ? { rules } : {}) };
     for (let before; ;) {
       const cp = await store.getCheckpoint(tenant, board, before);
       const entries = await readFrom(tenant, board, cp && cp.seq > 0 ? cp.seq : 1);

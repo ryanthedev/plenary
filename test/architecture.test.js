@@ -18,7 +18,7 @@
 //             ("adapter->core" otherwise; manager decision on p-archv question 3).
 //             DRIVING adapters (HTTP/WebSocket calling into the core: server.js, static.js, blob-http.js, auth/http.js) may also
 //             import core.
-//   adapter-only support: SUPPORT_DIRS (server/pg/) holds code several adapters share (Postgres start-up). It counts
+//   adapter-only support: SUPPORT_DIRS (server/pg/, server/encode/) holds code several adapters share (Postgres start-up, sliced JSON encoding). It counts
 //             as an adapter (core may not import it, it may not import other adapters) that any adapter may import.
 //   root      COMPOSITION_ROOTS pick and wire adapters; nothing imports a root. Every script under scripts/ must be a
 //             root (strict on purpose, p-archv L3): a new dev script is added here when it is written.
@@ -35,7 +35,7 @@ const SCAN = ["packages", "server", "scripts", "deploy"];   // every non-test co
 const CORE_DIRS = ["packages/protocol/", "packages/core/", "server/admin/"];
 const CORE_FILES = ["server/gateway.js", "server/room-host.js", "server/feed.js", "server/breather.js", "server/ids.js", "server/log.js", "server/blob-access.js"];
 const ADAPTER_DIRS = ["server/store/", "server/registry/", "server/bus/", "server/blobs/", "server/auth/", "server/compress/"];
-const SUPPORT_DIRS = ["server/pg/"];
+const SUPPORT_DIRS = ["server/pg/", "server/encode/"];
 /** Driving adapters, each with its group: server.js serves HTTP/WebSocket (Bun.serve) and mounts static.js. */
 const DRIVING = {
   "server/server.js": "server/http",
@@ -48,6 +48,7 @@ const COMPOSITION_ROOTS = [
   "scripts/dev-google.js",        // dev harness, self-described composition root for a local Google sign-in check (p5-google)
   "scripts/admin-bootstrap.js",   // platform: tenant bootstrap CLI; its core part, server/admin/tenants.js, imports only ports
   "scripts/cluster-rig.js",       // platform (p8-rig): local cluster rig CLI; spawns processes, imports no project module
+  "scripts/fold-bench.js",        // platform: reports how long a checkpoint holds the event loop (imports whatever checkout --root names)
   "scripts/clean.js",             // platform: safe cleanup CLI for test temp dirs, stopped rigs and scratch copies; shells out to lsof and the rig CLI
   "scripts/test-cluster.js",      // test harness: starts and tears down an isolated local services rig
   "scripts/test-cluster-files.js", // test harness data: the gated test files test-cluster.js runs, also imported by its guard

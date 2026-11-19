@@ -177,6 +177,19 @@ export function storeContract(name, make) {
       expect(await code(store.putCheckpoint(T, B, null, e))).toBe("bad-entry");
     });
 
+    test("checkpoints: a big one (encoded in slices) reads back exactly, and a big one from a fenced holder writes nothing", async () => {
+      const { store } = await fresh();
+      const e = await own(store);
+      const elements = Array.from({ length: 6000 }, (_, i) => ({ id: `e${i}`, type: "rectangle", x: i, text: "é😀\"\\".repeat(40), points: [[i, 1], [2, 3]], gone: undefined }));
+      const cp = { seq: 9, streams: { board: { elements, appState: { herdr: { layers: [{ id: "base" }] } } } }, noteAuthor: [["a", "b"]] };
+      expect(JSON.stringify(cp).length).toBeGreaterThan(1_000_000);
+      await store.putCheckpoint(T, B, cp, e);
+      expect(await store.getCheckpoint(T, B)).toEqual(JSON.parse(JSON.stringify(cp)));
+      expect(await store.openEpoch(T, B)).toBeGreaterThan(e);           // the board moves on: e is stale
+      expect(await code(store.putCheckpoint(T, B, { ...cp, seq: 12 }, e))).toBe("fenced");
+      expect((await store.getCheckpoint(T, B)).seq).toBe(9);
+    });
+
     test("checkpoints: beforeSeq steps back past a bad one; only the newest 3 are kept", async () => {
       const { store } = await fresh();
       const e = await own(store);

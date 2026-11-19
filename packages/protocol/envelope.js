@@ -55,6 +55,8 @@ export const PING_IDLE_MS = 10_000;      // § Pacing: a gateway pings a connect
 export const CONN_SILENCE_MS = 30_000;   // § Pacing: and closes one it heard nothing from (no frame, no pong) this long
 export const GATEWAY_SILENCE_MS = 30_000; // rule 6: a gateway not heard from this long has lost its connections
 export const MAX_NAME_CHARS = 200;
+/** The op-id table's key: a client id holds no colon, so this can't collide. */
+export const keyOf = (user, client) => `${client}:${user}`;
 export const CHECKPOINT_EVERY = 1000;    // § Recovery, "When": entries since the last checkpoint
 export const CHECKPOINT_BYTES = 64 * 1024; // § Recovery, "When": op bytes since the last checkpoint (the join tail)
 export const CHECKPOINT_STATE_RATIO = 4;   // § Recovery, "When": and not before that tail is 1/4 of the state's size (a rewrite costs at most ~4x the log)

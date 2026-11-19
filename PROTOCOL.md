@@ -510,8 +510,55 @@ older version of a deleted element would bring it back on that client only.
   announced. (The entry count only brings a fold forward once the byte gate is met, so it does not bound the tail by itself.) (An insert-only board folds to
   about its own size, so its join is about the log's size either way; the folds pay off when ops rewrite what the
   state already holds: moves, resizes, deletes. Compression, § Joining, is what shrinks the rest.) Also when the
-  room is stopped cleanly. The copy is of the **resolved** state at `seq` S, taken synchronously (with entries
-  still unresolved too: only resolved ones are in it); the write is asynchronous.
+  room is stopped cleanly. The checkpoint is of the **resolved** state at one `seq` S (with entries still unresolved
+  too: only resolved ones are in it), taken in small steps ("Incremental fold", below); the write is asynchronous.
+- **Incremental fold** (decided 2026-11-19, TECH-DEBT row 39; `packages/protocol/fold.js`). A checkpoint of a big board
+  must not hold the event loop (every board on the host waits), so the fold is a job of steps, each bounded.
+  - **Shadow room.** For one job the room builds a second, log-less room (the *shadow*) from its current checkpoint, and
+    drops it when the job ends or is abandoned (nothing resident between folds: a resident shadow held a third copy of
+    the op-id table and the comment threads, 57.9 MB at 4,000 clients x 256 pairs). The shadow applies only **resolved**
+    entries, through the same `applyEntry`. A job picks S = the room's resolved seq, catches the shadow up to
+    S from the kept tail (`tail[0]` is `base.seq + 1`), then copies the shadow's state into the checkpoint. The job never
+    reads the live state, so ops that land mid-job (accepted, appended, acked, broadcast) change nothing it copies, and
+    unresolved entries merged into the live state are never in it. The checkpoint is exactly the state at S by
+    construction, not by locking.
+  - **Cost.** Element objects are never mutated once stored (`Doc.apply` replaces by id), so the checkpoint shares them
+    with the shadow: the copy is of references, not of the board. The checkpoint also takes the shadow's op-id arrays
+    (the shadow dies with the job). Work is counted in units: an element reference or a client's op-id pair = 1; an entry
+    applied = 16 + its op's chars / 16 (applying stringifies and clones what the entry carries, so **bytes** are the cost,
+    not element counts; calibrated on point-array strokes, which cost 2 to 3 times more per char than text); a thread = 1 +
+    its comments. A step stops after `FOLD_STEP_UNITS` (8192; the host's `foldUnits`), so about 128 KB of op text per
+    step. **One entry is indivisible**, so an entry over that is a step of its own: the ceiling of a step is the cost of
+    the largest entry in the tail (an op is at most about 1 MB). Measured by `scripts/fold-bench.js` at load ~10 to 30:
+    the longest step is 0.5 to 1.7 ms at 10, 27 and 50 MB; 1.0 ms for a tail of 1,500 strokes of 8 KB (120 steps); 0.9 ms
+    with 4,000 clients x 256 pairs (254 steps); and 5.4 ms (about 8 ms per MB of op) when the tail holds 660 KB point-array
+    strokes, each its own step (before byte-counting a 20-entry 600 KB-stroke tail made one 78 ms step). Heap kept after a fold with 4,000 clients: 0.2 MB (the
+    old whole-state fold: 10.4 MB, as the bench measures it). The shadow's own size bookkeeping is off (`measure: false`).
+  - **Scheduling is a port.** The package has no timers and runs in QuickJS: the room takes `schedule(fn)`, which runs `fn`
+    on a later turn of the host's loop. The host passes `setImmediate` (its `schedule` option; tests pass a queue). With no
+    `schedule` an automatic checkpoint runs whole, in one call, as `checkpoint()` does (a clean stop, tests).
+  - **Failure.** One job at a time, and none starts while the previous checkpoint's write is unsettled (a slow Store sees
+    at most one write in flight). The host fails a write unanswered for `checkpointTimeoutMs` (30 s) and reports it, so
+    `writing` always settles and later folds resume (Postgres also bounds the fence's lock wait with `lock_timeout`).
+    `status()` shows `folding` and `writing`. `base` and the tail change only when a job completes, so catch-up and joins are served
+    from the old base until then. A room that stops (`fail`: lease lost, a fenced write, a failed append) or a host slot
+    that dies abandons its job: no step runs, nothing is written. A `checkpoint()` call that takes a running job over
+    invalidates the steps already scheduled for it (a turn token), so one chain steps a job. A takeover while a job runs is the same fence as before:
+    the write at the end carries the old epoch and is refused `fenced` in the Store's own transaction (§ Store). A job
+    that throws is reported (`checkpoint-failed`), dropped with its shadow, and the next job rebuilds the shadow from `base`.
+  - **Encoding.** The adapters encode a checkpoint in slices too (`server/encode/sliced.js`, the same text as
+    `JSON.stringify`, the loop handed back every ~256 KiB; a thread's comments are pieces of their own): 21 ms at 50 MB became under 3 ms. The Store port is unchanged.
+  - **Options weighed.** (a) *Persistent / copy-on-write Doc*: O(1) snapshot, but `Doc` lives in `packages/core`, which is
+    never edited here, and a wrapper would leak into every reader of `byId`. (b) *Copy a slice per tick against an overlay of
+    later changes*: needs the pre-image of every change since S, including the unresolved entries already merged into the
+    live state (elements, appState, records, op-id table, note authors, eviction): an undo log across five structures,
+    easy to get subtly wrong. (c) *Encode in a Worker from a structured clone*: the clone is the O(n) block, QuickJS has no
+    Worker, and a port for it would still need (a) or (b) underneath. (d) *Shadow replica* (chosen): reuses `applyEntry`
+    (already the proven replay path), hides the whole mechanism behind `checkpoint()` / `startCheckpoint()` and the
+    `schedule` port, and costs memory about equal to what the old fold held (live state plus the base).
+  - **Order of a checkpoint's elements** is now the shadow's insertion order, not paint order. Readers still sort by layer
+    and z (`Doc.live()`), but it breaks z ties by array position, so for equal z the paint order of a client loaded
+    from a snapshot follows this insertion order (it did follow paint order before).
 - **A checkpoint may lag the live `seq`.** Between a fold and the gateways learning of it (the write's
   acknowledgement, then the next heartbeat's `cp`, ≤ 2 s) a join is served from the older checkpoint with a longer
   tail: slower, never wrong. A checkpoint that can't be read, or doesn't match the log (see Rebuild), is skipped for
@@ -1324,12 +1371,12 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   Compressed catch-up (§ Joining) takes a varied 2,000-element board from 1.1 to 2.2 MB down to 0.15 to 0.6 MB (4× to 7×;
   near-identical shapes reach 30×), but a board near the caps is still tens of MB after it. M4's load test sets the
   real cap.
-- **A checkpoint blocks the room host's event loop while it copies the state** (`Room.fold()` clones every element:
-  about 3 ms per MB of state (4.6 ms per MB measured at load ~40); with unresolved entries it also replays the tail into a fresh Room, which costs more (not measured); 83 to 93 ms measured at 27 MB, about 150 ms or more extrapolated at 50 MB), and the
-  quarter-state rule (§ Recovery, "When") makes folds about twice as frequent as before. During the copy no op, ack or
-  heartbeat for any board on that host is handled. The copy is taken synchronously on purpose (the checkpoint is the
-  state at one `seq`, and the fence and write order depend on it); taking it incrementally (a copy-on-write
-  Doc, or cloning a few elements per tick while holding writes' ordering) or encoding off-thread is not done. The catch-up deflate itself is off the loop, but `Buffer.from(text)` before it is not (about 10 to 20 ms per
+- **The Store's own write of a big checkpoint still holds the loop** (SQLite): the room's copy and the adapters' encoding
+  are in bounded steps (§ Recovery, "Incremental fold"; under 3 ms each at 50 MB), but `bun:sqlite` inserts the whole
+  text in one synchronous call: about 4 ms per MB (measured: 55 ms at 10 MB, 124 ms at 27 MB, 232 ms at 50 MB, once per
+  fold, at load ~10), mostly the fsync. Postgres writes over a socket, off the loop; its driver converts the text to bytes
+  in one call (measured stall: 11 ms at 27 MB, 21.5 ms at 50 MB). Fixing it means storing a checkpoint as several rows committed apart and linked by a final one (a storage
+  format change; TECH-DEBT). The catch-up deflate itself is off the loop, but `Buffer.from(text)` before it is not (about 10 to 20 ms per
   18 MB text, once per text).
 - **Compressed catch-up is for clients that can inflate.** A runtime with no zlib (Herdr's QuickJS) joins as before:
   plain text, the full size.

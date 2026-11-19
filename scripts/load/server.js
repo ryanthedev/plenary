@@ -84,7 +84,7 @@ export async function startServer({ tokensPath, dataDir, env = {}, nofile = 6553
       const dec = new TextDecoder();
       for await (const chunk of stream) {
         const s = dec.decode(chunk, { stream: true });
-        if (out[k].length < HEAD_BYTES) out[k] += s;   // only the head: a long run logs a lot (and must still be drained)
+        if (out[k].length < HEAD_BYTES) out[k] = (out[k] + s).slice(0, HEAD_BYTES);   // only the head, cut at the cap exactly (a chunk's size depends on the load): a long run logs a lot (and must still be drained)
         file?.write(s);
       }
     };

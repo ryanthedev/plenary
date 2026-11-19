@@ -493,17 +493,17 @@ describe.skipIf(!url)("postgres store", () => {
 
   test("the header's transaction takes the checkpoint lock: a sweep released into the window between its part count and its commit waits, and the checkpoint stays readable", async () => {
     const schema = schemaName();
-    const gateA = Promise.withResolvers(), gateB = Promise.withResolvers(), bReady = Promise.withResolvers();
+    const gateA = Promise.withResolvers(), gateB = Promise.withResolvers(), bReady = Promise.withResolvers(), aAtHeader = Promise.withResolvers();
     let holdA = true, holdB = true, counted = false;
     const store = await postgresStore({ sql: client(), schema, partChars: PART, onPart: async step => {
-      if (step === "header" && holdA) { holdA = false; await gateA.promise; }                 // seq 25: every part in, header held back
+      if (step === "header" && holdA) { holdA = false; aAtHeader.resolve(); await gateA.promise; }                 // seq 25: every part in, header held back
       else if (step === "sweep" && holdB) { holdB = false; bReady.resolve(); await gateB.promise; }   // seq 30: header landed, its sweep paused
       else if (step === "header-counted" && counted) { counted = false; gateB.resolve(); await Bun.sleep(150); }   // 25 has counted its parts: the sweep's delete runs now
     } });
     try {
       const e = await own(store);
       const late = store.putCheckpoint(T, B, big(25, "late"), e);
-      await Bun.sleep(30);
+      await aAtHeader.promise;                                                                  // seq 25 is at its header (an event, not a guess at how long its parts take)
       const newest = store.putCheckpoint(T, B, big(30, "newest"), e);
       await bReady.promise;
       counted = true; gateA.resolve();

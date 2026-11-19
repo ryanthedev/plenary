@@ -240,23 +240,22 @@ export function storeContract(name, make) {
       const seen = [];
       let abortAt = null, store;
       const { store: s, raw } = await fresh({ partChars: PART, onPart: async step => {
-        console.error("DBG hook", step, abortAt, Date.now() % 100000);
         if (abortAt === null || step === "sweep") return;
-        seen.push([step, (await store.getCheckpoint(T, B))?.seq]); console.error("DBG got", step, Date.now() % 100000);
+        seen.push([step, (await store.getCheckpoint(T, B))?.seq]);
         if (step === abortAt) throw new Error("simulated crash");
       } });
       store = s;
       const e = await own(store);
-      console.error("DBG ps", require("node:child_process").spawnSync("sh",["-c","uptime; ps -eo pid,ppid,pcpu,etime,args --sort=-pcpu | head -15 | cut -c1-200"]).stdout.toString(), process.getActiveResourcesInfo?.().join(",")); await store.putCheckpoint(T, B, big(10, "old"), e); console.error("DBG put old done");
+      await store.putCheckpoint(T, B, big(10, "old"), e);
       const before = await raw.partRows(T, B);
-      abortAt = "part:3"; console.error("DBG before", before);
-      await expect(store.putCheckpoint(T, B, big(20, "new"), e)).rejects.toThrow("simulated crash");
+      abortAt = "part:3";
+      expect((await store.putCheckpoint(T, B, big(20, "new"), e).catch(x => x))?.message).toBe("simulated crash");
       expect(seen.map(x => x[0])).toEqual(["part:0", "part:1", "part:2", "part:3"]);
       expect(seen.every(x => x[1] === 10)).toBe(true);                                    // the old one the whole time
       expect((await store.getCheckpoint(T, B)).tag).toBe("old");
       expect(await raw.partRows(T, B)).toBe(before);                                      // the aborted write cleaned up after itself
       abortAt = "header"; seen.length = 0;                                                // every part written, header not
-      await expect(store.putCheckpoint(T, B, big(20, "new"), e)).rejects.toThrow("simulated crash");
+      expect((await store.putCheckpoint(T, B, big(20, "new"), e).catch(x => x))?.message).toBe("simulated crash");
       expect(seen.at(-1)).toEqual(["header", 10]);
       expect((await store.getCheckpoint(T, B)).tag).toBe("old");
       expect(await raw.partRows(T, B)).toBe(before);

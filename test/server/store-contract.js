@@ -28,6 +28,8 @@ const LONG = 60_000, SHORT = 300;
 export const entry = (seq, o = {}) => ({ seq, board: B, tenant: T, stream: "board", op: { appState: { grid: seq } }, by: "u1", id: `c:${seq}`, ...o });
 /** Take the board's lease as a test host and return its epoch: every append and checkpoint is fenced (§ Store). */
 export const own = async (store, tenant = T, board = B) => (await store.acquire(tenant, board, "h-test", LONG)).epoch;
+/** The error a promise rejects with (a test fails if it resolves). Use this, not `expect(p).rejects`, around work that yields with setImmediate: on Bun 1.4.4/Linux the matcher stalls each yield 100-900 ms (README, Dev loop; TECH-DEBT 63). */
+export const rejection = p => p.then(() => { throw new Error("expected a rejection"); }, e => e);
 export const code = async p => { try { await p; return "resolved"; } catch (e) { return e.code ?? `threw ${e.message}`; } };
 
 /**
@@ -249,13 +251,13 @@ export function storeContract(name, make) {
       await store.putCheckpoint(T, B, big(10, "old"), e);
       const before = await raw.partRows(T, B);
       abortAt = "part:3";
-      await expect(store.putCheckpoint(T, B, big(20, "new"), e)).rejects.toThrow("simulated crash");
+      expect((await rejection(store.putCheckpoint(T, B, big(20, "new"), e))).message).toBe("simulated crash");   // not `expect(...).rejects`: it stalls this put's setImmediate yields (see rejection)
       expect(seen.map(x => x[0])).toEqual(["part:0", "part:1", "part:2", "part:3"]);
       expect(seen.every(x => x[1] === 10)).toBe(true);                                    // the old one the whole time
       expect((await store.getCheckpoint(T, B)).tag).toBe("old");
       expect(await raw.partRows(T, B)).toBe(before);                                      // the aborted write cleaned up after itself
       abortAt = "header"; seen.length = 0;                                                // every part written, header not
-      await expect(store.putCheckpoint(T, B, big(20, "new"), e)).rejects.toThrow("simulated crash");
+      expect((await rejection(store.putCheckpoint(T, B, big(20, "new"), e))).message).toBe("simulated crash");   // not `expect(...).rejects`: it stalls this put's setImmediate yields (see rejection)
       expect(seen.at(-1)).toEqual(["header", 10]);
       expect((await store.getCheckpoint(T, B)).tag).toBe("old");
       expect(await raw.partRows(T, B)).toBe(before);

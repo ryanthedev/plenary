@@ -102,7 +102,7 @@ export function rigAliveViaCli(dir, timeout = 60_000, spawn = spawnSync) {
   try { return JSON.parse(r.stdout).procs.some(p => p.alive); } catch { return true; }
 }
 
-let nativeRenameExcl = null, nativeRenameErrno = null, warnedNativeFallback = false;
+let nativeRenameExcl = null, nativeRenameErrno = null, warnedNativeFallback = false, nativeRenameFailurePlatform = null;
 export function resetNativeRenameWarning() { warnedNativeFallback = false; }
 export function loadNativeRename(loader = dlopen, platform = process.platform, warn = message => console.error(message), install = true, allowRacyRename = false) {
   let rename = null, errnoReader = null;
@@ -128,14 +128,12 @@ export function loadNativeRename(loader = dlopen, platform = process.platform, w
     rename = null;
     errnoReader = null;
   }
-  if ((platform === "darwin" || platform === "linux") && !rename && !warnedNativeFallback) {
-    warnedNativeFallback = true;
-    warn(allowRacyRename ? "exclusive rename unavailable; using check-then-rename" : "exclusive rename unavailable; refusing to remove (pass --allow-racy-rename to use check-then-rename)");
-  }
+  if ((platform === "darwin" || platform === "linux") && !rename) nativeRenameFailurePlatform = platform;
+  else if (rename && nativeRenameFailurePlatform === platform) nativeRenameFailurePlatform = null;
   if (install) { nativeRenameExcl = rename; nativeRenameErrno = errnoReader; }
   return rename;
 }
-loadNativeRename(dlopen, process.platform, message => console.error(message), true, process.argv.includes("--allow-racy-rename"));
+loadNativeRename(dlopen, process.platform, message => console.error(message), true);
 
 export function renameExcl(from, to, { forceFallback = false, stat = lstatSync } = {}) {
   if (!forceFallback && nativeRenameExcl) {
@@ -183,10 +181,16 @@ const refuseBase = (p, what) => {
  * scratch, minAgeMs, now, lsof (binary), rigAlive(dir) => bool, yes, allowRacyRename.
  */
 export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), scratch = null, minAgeMs = 2 * HOUR, now = Date.now(),
-  lsof = "lsof", rigAlive = rigAliveViaCli, yes = false, force = false, allowRacyRename = false, uid = process.getuid(), beforeRemove = null,
+  lsof = "lsof", rigAlive = rigAliveViaCli, yes = false, force = false, allowRacyRename = false, warn = message => console.error(message), uid = process.getuid(), beforeRemove = null,
   afterRename = null, stat = lstatSync, clock = Date.now, maxTimeMs = 5 * 60_000, openPathsFn = openPaths, openUnderFn = openUnder,
   renameExclFn = null, platform = process.platform, nativeRenameAvailable = !!nativeRenameExcl } = {}) {
   if (minAgeMs < MIN_SAFE_AGE_MS && !force) throw new Error(`--min-age under ${MIN_SAFE_AGE_MS / 60_000} minutes needs --force (a younger entry may still be in use)`);
+  if (yes && (platform === "darwin" || platform === "linux") && !nativeRenameAvailable && !warnedNativeFallback) {
+    warnedNativeFallback = true;
+    if (nativeRenameFailurePlatform === platform || !nativeRenameFailurePlatform) {
+      warn(allowRacyRename ? "exclusive rename unavailable; using check-then-rename" : "exclusive rename unavailable; refusing to remove (pass --allow-racy-rename to use check-then-rename)");
+    }
+  }
   const items = [];
   const bases = [["temp", tempDir, isTempName], ["scratch", scratch, () => true]];
   const deadline = clock() + maxTimeMs;

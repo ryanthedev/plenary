@@ -352,10 +352,13 @@ test("a failed darwin native loader warns once and --yes refuses without racy re
   const warnings = [], w = world(), d = entry(w.tempDir, "plenary-test-loadr1");
   resetNativeRenameWarning();
   loadNativeRename(() => { throw new Error("missing library"); }, "darwin", message => warnings.push(message), false);
-  const r = clean({ ...w, now: LATER(), yes: true, platform: "darwin", nativeRenameAvailable: false });
+  const r = clean({ ...w, now: LATER(), yes: true, platform: "darwin", nativeRenameAvailable: false, warn: message => warnings.push(message) });
   expect(warnings).toEqual(["exclusive rename unavailable; refusing to remove (pass --allow-racy-rename to use check-then-rename)"]);
   expect(byName(r, "plenary-test-loadr1")).toMatchObject({ status: "kept", why: expect.stringMatching(/exclusive rename unavailable/) });
   expect(summarize([{ target: "temp", status: "kept", bytes: 0, why: "exclusive rename unavailable; --allow-racy-rename required to remove" }], true)).toContain("1 refused");
+  expect(existsSync(d)).toBe(true);
+  const forced = clean({ ...w, now: LATER(), yes: true, force: true, platform: "darwin", nativeRenameAvailable: false });
+  expect(byName(forced, "plenary-test-loadr1")).toMatchObject({ status: "kept", why: expect.stringMatching(/exclusive rename unavailable/) });
   expect(existsSync(d)).toBe(true);
   const allowed = clean({ ...w, now: LATER(), yes: true, platform: "darwin", nativeRenameAvailable: false, allowRacyRename: true });
   expect(byName(allowed, "plenary-test-loadr1").status).toBe("removed");
@@ -365,12 +368,26 @@ test("linux native-loader failure refuses unless check-then-rename is explicitly
   const warnings = [], w = world(), d = entry(w.tempDir, "plenary-test-loadr2");
   resetNativeRenameWarning();
   loadNativeRename(() => { throw new Error("missing library"); }, "linux", message => warnings.push(message), false);
-  const refused = clean({ ...w, now: LATER(), yes: true, platform: "linux", nativeRenameAvailable: false });
+  const refused = clean({ ...w, now: LATER(), yes: true, platform: "linux", nativeRenameAvailable: false, warn: message => warnings.push(message) });
   expect(warnings).toEqual(["exclusive rename unavailable; refusing to remove (pass --allow-racy-rename to use check-then-rename)"]);
   expect(byName(refused, "plenary-test-loadr2").status).toBe("kept");
+  const forced = clean({ ...w, now: LATER(), yes: true, force: true, platform: "linux", nativeRenameAvailable: false });
+  expect(byName(forced, "plenary-test-loadr2")).toMatchObject({ status: "kept", why: expect.stringMatching(/exclusive rename unavailable/) });
+  expect(existsSync(d)).toBe(true);
   const allowed = clean({ ...w, now: LATER(), yes: true, platform: "linux", nativeRenameAvailable: false, allowRacyRename: true });
   expect(byName(allowed, "plenary-test-loadr2").status).toBe("removed");
   expect(existsSync(d)).toBe(false);
+});
+
+test("library clean warnings follow its allowRacyRename option and emit once", () => {
+  const warnings = [], w = world();
+  resetNativeRenameWarning();
+  clean({ ...w, yes: true, platform: "linux", nativeRenameAvailable: false, allowRacyRename: false, warn: message => warnings.push(message) });
+  clean({ ...w, yes: true, platform: "linux", nativeRenameAvailable: false, allowRacyRename: true, warn: message => warnings.push(message) });
+  expect(warnings).toEqual(["exclusive rename unavailable; refusing to remove (pass --allow-racy-rename to use check-then-rename)"]);
+  resetNativeRenameWarning();
+  clean({ ...w, yes: true, platform: "linux", nativeRenameAvailable: false, allowRacyRename: true, warn: message => warnings.push(message) });
+  expect(warnings.at(-1)).toBe("exclusive rename unavailable; using check-then-rename");
 });
 
 test.skipIf(process.platform !== "darwin")("native exclusive rename refuses a recreated target with EEXIST", () => {

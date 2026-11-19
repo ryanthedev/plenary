@@ -54,7 +54,7 @@ test("a file made before the lease (epoch-only leases table) is an old-format st
   old.run("INSERT INTO leases (tenant, board, epoch) VALUES (?, ?, 5)", [T, B]);
   old.close();
   let err;
-  const fds = readdirSync("/dev/fd").length;
+  Bun.gc(true); const fds = readdirSync("/dev/fd").length;   // collect an earlier test's handle first, or it could finalize between the two counts
   try { sqliteStore({ path }); } catch (e) { err = e; }
   expect(err?.code).toBe("old-format");
   expect(readdirSync("/dev/fd").length).toBe(fds);                                                                      // the refused open left no handle (an rmSync would pass either way)

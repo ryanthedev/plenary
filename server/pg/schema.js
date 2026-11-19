@@ -57,11 +57,12 @@ export async function migrate(tx, schema, tables) {
 /** The column names a table's DDL (the cluster test `ddlColumns equals the catalog` checks it against Postgres for every table of the Store and the Registry) (`tables` entries: "col defs, constraints") declares: its depth-0 comma parts, minus table constraints. */
 export function ddlColumns(defs) {
   const parts = []; let depth = 0, cur = "";
-  let quoted = false;   // inside "…" (an identifier may hold a comma or a parenthesis)
+  let quote = null;   // inside "…" (an identifier) or '…' (a literal; '' is an escaped quote and toggles twice): neither may split or nest
   for (const ch of defs) {
-    if (ch === '"') quoted = !quoted;
-    else if (!quoted) { if (ch === "(") depth++; else if (ch === ")") depth--; }
-    if (ch === "," && depth === 0 && !quoted) { parts.push(cur); cur = ""; } else cur += ch;
+    if (quote) { if (ch === quote) quote = null; }
+    else if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === "(") depth++; else if (ch === ")") depth--;
+    if (ch === "," && depth === 0 && !quote) { parts.push(cur); cur = ""; } else cur += ch;
   }
   parts.push(cur);
   return parts.map(p => p.trim()).filter(p => p && !/^(PRIMARY|UNIQUE|CHECK|FOREIGN|CONSTRAINT|EXCLUDE|LIKE)\b/i.test(p)).map(p => p.split(/\s+/)[0].replace(/"/g, ""));

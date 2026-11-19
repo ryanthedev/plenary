@@ -327,12 +327,14 @@ test("a hung directory write keeps its slot past the cutoff (it only logs); the 
   let release; const gate = new Promise(r => { release = r; });
   const hang = new Proxy(registry, { get: (t, k) => (k === "touchMember" ? async () => { await gate; } : t[k]) });
   const warns = [];
-  const via = node({ registry: hang, log: { warn: (m, f) => warns.push([m, f]) }, config: { ...config, touchTimeoutMs: 30 } });
+  const pending = new Set();                                    // an injected timer: the "slow" cutoff fires when the test says, never by wall-clock luck under load
+  const timers = { set: f => { const h = { f }; pending.add(h); return h; }, clear: h => pending.delete(h) };
+  const via = node({ registry: hang, timers, log: { warn: (m, f) => warns.push([m, f]) }, config: { ...config, touchTimeoutMs: 30 } });
   const signAs = async n => { const s = await signIn({ ...ADMIN, sub: `50${String(n).padStart(2, "0")}`, email: `h${n}@acme.com` }, { via }); expect((await exchange(s.code, { cookie: s.cookie, via })).status).toBe(200); };
   for (let i = 0; i < 17; i++) await signAs(i);
   await new Promise(r => setTimeout(r, 0));
   expect(warns.map(w => w[0])).toEqual(["member directory write dropped (too many in flight); Home records the person later"]);
-  await new Promise(r => setTimeout(r, 80));                    // past the cutoff: still hung, still holding its slot
+  for (const h of [...pending]) h.f();                          // past the cutoff: still hung, still holding its slot (the "slow" line is rate-limited behind the drop line)
   clock.t += 61_000;
   await signAs(98);                                             // dropped: the 16 slots are still taken
   await new Promise(r => setTimeout(r, 0));

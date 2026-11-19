@@ -67,6 +67,20 @@ export function isUnitAdmin(tenant, identity) {
 }
 
 /**
+ * The context a board WOULD have in another Space (PROTOCOL.md § Move board): its Space, Group and their grants come from `target` (the destination
+ * Space's own context), everything else (the board's rows, the Unit's grants and roles, the tenant) stays. Teams' members are the union of both reads.
+ * Pure; the dry run of a move and nothing else builds a context this way, then runs `resolveAccess` over both, so the diff is the enforcing code's answer.
+ * @param {AccessContext} ctx the board's context @param {AccessContext} target the destination Space's context
+ * @returns {AccessContext}
+ */
+export function movedContext(ctx, target) {
+  const teams = { ...ctx.teams };
+  for (const [id, users] of Object.entries(target.teams ?? {})) teams[id] = [...new Set([...(teams[id] ?? []), ...users])];
+  return { ...ctx, board: ctx.board && { ...ctx.board, space: target.space?.id ?? null }, space: target.space, group: target.group,
+    scoped: { unit: ctx.scoped.unit, group: target.scoped.group, space: target.scoped.space, board: ctx.scoped.board }, teams };
+}
+
+/**
  * @param {{ ctx: AccessContext, grant?: Role|null, invites?: object[], links?: (object|null)[], teams?: Set<string> }} rows
  *   ctx: the registry's view of the target's scope chain (registry.accessContext); the target is the innermost scope in
  *   it. grant/invites/links: the board-scope rows of this user (direct grant, invites to their email, link records of

@@ -721,7 +721,7 @@ test("K2 app.js: no setTimeout/setInterval/performance.now/Date.now in the sourc
 test("K3 main.js: the token goes only into createSession; sign-in leaves for the fixed href; the return board only via takeReturnBoard", async () => {
   const src = await Bun.file(new URL("../../web/main.js", import.meta.url)).text();
   const code = src.replace(/\/\/.*$/gm, "");
-  expect(code.match(/signIn\.token/g).length).toBe(9);                         // the gate check, createSession's token, and the Home, Spaces, Access and Roles ports' (their Bearer header), plus the Access port of the Space page (Ask for access) and of the canvas pill (why view-only), plus the Share port of the canvas (Share dialog)
+  expect(code.match(/signIn\.token/g).length).toBe(10);                         // the gate check, createSession's token, and the Home, Spaces, Access and Roles ports' (their Bearer header), plus the Move port's, the Access port of the Space page (Ask for access) and of the canvas pill (why view-only), plus the Share port of the canvas (Share dialog)
   expect(code).toMatch(/httpHome\(\{[^}]*token: signIn\.token,/);
   expect(code).toMatch(/if \(!signIn\.token\)/);
   expect(code).toMatch(/createSession\(\{[^}]*token: signIn\.token,/);

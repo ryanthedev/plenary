@@ -89,6 +89,7 @@ import { spaceService } from "./spaces.js";
 import { accessService } from "./access.js";
 import { explainService } from "./explain.js";
 import { rolesService } from "./roles.js";
+import { moveService } from "./move.js";
 import { AdminError, createInvite, listInvites, readInvite, revokeInvite, createLink, listLinks, readLink, revokeLink, setGrant, shareView } from "../admin/boards.js";
 
 export const LOGIN_COOKIE = "__Host-plen_login";
@@ -136,7 +137,7 @@ const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
  *   now?: () => number, config: object, dev?: { enabled?: boolean, verify(t: string): Promise<object|null> } | null,
  *   testHooks?: { pruned?(p: { visited: number, expired: number, live: number }): void, routes?(table: { pattern: string, methods: string[], names: string[] }[]): void } | null }} deps   (tests only, not an API)
  */
-export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, explainer = explainService({ registry, now }), spaces = spaceService({ registry, tenancy, home, now, explainer }), access = accessService({ registry, tenancy, now, explainer, announce: spaces.announceChange, backlog: spaces.backlog, settled: spaces.settled }), roles = rolesService({ registry, tenancy, announce: spaces.announceChange }), config = {}, dev = null, log = stdoutLog, testHooks = null, timers = { set: (f, ms) => setTimeout(f, ms), clear: h => clearTimeout(h) } }) {
+export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, explainer = explainService({ registry, now }), spaces = spaceService({ registry, tenancy, home, now, explainer }), moves = moveService({ registry, tenancy, spaces, now }), access = accessService({ registry, tenancy, now, explainer, announce: spaces.announceChange, backlog: spaces.backlog, settled: spaces.settled }), roles = rolesService({ registry, tenancy, announce: spaces.announceChange }), config = {}, dev = null, log = stdoutLog, testHooks = null, timers = { set: (f, ms) => setTimeout(f, ms), clear: h => clearTimeout(h) } }) {
   if (!registry || !sessions || !tenancy) throw new Error("http: registry, sessions and tenancy are required");
   /** `p`, or a rejection with message "timeout" after `ms` on the injected timers. */
   const bounded = (p, ms) => new Promise((res, rej) => { const t = timers.set(() => rej(new Error("timeout")), ms); p.then(v => { timers.clear(t); res(v); }, e => { timers.clear(t); rej(e); }); });
@@ -405,17 +406,17 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
    * (a link or an invite carries its secret). A repeat is answered from the row (`idemGet`) or, when it raced the first create, by the create's own
    * `idem-replay` rejection; a changed request is 422. `run` is NOT cancelled by the request deadline: it commits or rolls back whole.
    */
-  async function keyed(req, who, route, params, b, run, rebuild) {
+  async function keyed(req, who, route, params, b, run, rebuild, status = 201) {
     const k = req.headers.get("idempotency-key");
-    if (k === null) return json(201, await run(undefined));
+    if (k === null) return json(status, await run(undefined));
     if (!IDEM_KEY.test(k)) throw refuse(400, "bad-idempotency-key");
     const idem = { user: who.user, key: k, fp: await fingerprint(route, params, b) };
-    const replayed = async id => json(201, await rebuild(id), { "idempotent-replayed": "true" });   // re-authorized for the caller as they are NOW; a refusal propagates as the route's own
+    const replayed = async id => json(status, await rebuild(id), { "idempotent-replayed": "true" });   // re-authorized for the caller as they are NOW; a refusal propagates as the route's own
     let g;
     try { g = await registry.idemGet(idem); } catch { throw refuse(503, "unavailable"); }
     if (g.state === "mismatch") return err(422, "idempotency-key-reused");
     if (g.state === "done") return replayed(g.ref);
-    try { return json(201, await run(idem)); }
+    try { return json(status, await run(idem)); }
     catch (e) {
       if (e?.code === "idem-replay") return replayed(e.ref);
       if (e?.code === "idem-mismatch") return err(422, "idempotency-key-reused");
@@ -558,6 +559,19 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       },
       DELETE: async (req, p) => { await access.setGrant(await caller(req), p.type, p.id, p.subjectType, p.subject, null); return json(204); },
     }],
+    ["/boards/:board/move", {
+      GET: async (req, p) => json(200, await moves.options(await caller(req), p.board)),
+      POST: async (req, p) => {
+        const who = await caller(req);
+        const b = await body(req, ["from", "to"]);
+        return keyed(req, who, "POST /boards/:board/move", p, b, async idem => moves.move(who, p.board, b, idem), async () => moves.replay(who, p.board, b), 200);
+      },
+    }],
+    ["/boards/:board/move/preview", { GET: async (req, p, url) => {
+      const who = await caller(req), to = url.searchParams.get("to");
+      if (to === null || [...url.searchParams.keys()].length !== 1) throw refuse(400, "bad-request");
+      return json(200, await moves.preview(who, p.board, to));
+    } }],
     ["/boards/:board/share", { GET: async (req, p) => {
       const v = await shareView({ caller: await caller(req), board: p.board }, admin);
       return json(200, publicUrl ? { ...v, links: v.links.map(l => ({ ...l, url: `${publicUrl}/links/${encodeURIComponent(l.id)}` })) } : v);
@@ -676,6 +690,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
         if (e.code === "too-large") return err(409, "too-large");
         if (e.code === "in-use" || e.code === "confirm-required") return err(409, e.code, e.data ?? {});
         if (e.code === "superseded") return err(409, "superseded");
+        if (e.code === "moved") return err(409, "moved");
         if (e.code === "unknown-person" || e.code === "bad-role") return err(400, e.code);
         if (e.code === "rate-limited") { const s = e.data?.retryAfter ?? null; return err(429, "rate-limited", { retryAfter: s }, s == null ? undefined : { "retry-after": String(s) }); }
       }

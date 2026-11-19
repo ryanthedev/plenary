@@ -6,6 +6,8 @@
 import { h, replace } from "./dom.js";
 import { keeper } from "./focus.js";
 import { whyCard } from "./explain.js";
+import { openMove, showMoveToast } from "./move.js";
+import { createMoveModel } from "../../core/move.js";
 import { generalText, spaceEmpty, groupEmpty } from "../../core/spaces.js";
 
 /**
@@ -104,12 +106,12 @@ function inlineEditor({ editing, session, text, label, onSave, onCancel }) {
 const afterRender = () => { let fn = null; return { set: f => { fn = f; }, run: () => { const f = fn; fn = null; f?.(); } }; };
 
 /**
- * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/spaces.js").createPageModel>, dialogs: ReturnType<typeof import("./dialogs.js").createDialogs>,
+ * @param {{ root: HTMLElement, move?: { port: import("../../ports/move.js").MovePort, clock: import("../../ports/clock.js").Clock, newKey?: (() => string)|null }|null, model: ReturnType<typeof import("../../core/spaces.js").createPageModel>, dialogs: ReturnType<typeof import("./dialogs.js").createDialogs>,
  *   hrefs: { home: string, board(id: string): string, space(id: string): string, group(id: string): string },
  *   signIn?: { href: string, text?: string } | null }} o
  * @returns {{ destroy(): void }}
  */
-export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null, access = null, newKey = null }) {
+export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null, access = null, newKey = null, move = null }) {
   let whyRef = null;
   const S = model.state;
   const { status, main } = shell(root, hrefs);
@@ -126,6 +128,8 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null, acc
     const menuCfg = { label: `More for ${c.title || "Untitled"}`, items: [
       { text: "Open", href: hrefs.board(c.id) },
       { text: "Who has access", href: hrefs.access?.("board", c.id), hidden: !hrefs.access },
+      { text: "Move to…", hidden: !move || !c.can?.move, onSelect: opener => openMove({ host: root, opener, model: createMoveModel({ move: move.port, board: c.id, newKey: move.newKey }),
+        onMoved: result => { model.load().then(() => showMoveToast({ host: globalThis.document.body, move: move.port, board: c.id, result, clock: move.clock, newKey: move.newKey, onChange: () => model.load(), restoreFocus: () => main.focus?.() })); } }) },
       { text: "Rename", hidden: !c.can?.rename, onSelect: () => { editing = { type: "board", id: c.id }; render(); } },
     ] };
     const menu = keys.keep(`card-menu:${c.id}`, () => overflowMenu(menuCfg));

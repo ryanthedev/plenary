@@ -17,7 +17,7 @@
 // `user`; insertion order is an explicit `n` column (Postgres: BIGSERIAL / identity), upserts use ON CONFLICT.
 
 import { Database } from "bun:sqlite";
-import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
+import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, movedErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 
 /** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code`. */
@@ -197,6 +197,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
 
     board: db.query("SELECT id, tenant, title, member_role, created_at, (SELECT space FROM reg_board_spaces WHERE board = reg_boards.id) AS space FROM reg_boards WHERE id = ?"),
     insBoardSpace: db.query("INSERT INTO reg_board_spaces (board, space) VALUES (?, ?)"),
+    putBoardSpace: db.query("INSERT INTO reg_board_spaces (board, space) VALUES (?, ?) ON CONFLICT (board) DO UPDATE SET space = excluded.space"),
 
     group: db.query("SELECT * FROM reg_groups WHERE id = ?"),
     groups: db.query("SELECT * FROM reg_groups WHERE tenant = ? ORDER BY created_at, id"),
@@ -436,6 +437,21 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     return rowBoard(q.board.get(id));
   });
 
+  // The compare-and-set of the board's Space, with the key row, in one IMMEDIATE transaction (the write lock is held from the first read).
+  const moveBoardTx = db.transaction((board, from, to, idem, at) => {
+    const b = q.board.get(board);
+    if (!b) throw new Error("registry: no such board");
+    if (q.space.get(to)?.tenant !== b.tenant) throw new Error("registry: no such space");
+    idemEnter(idem, at);
+    const moved = (b.space ?? null) !== to;
+    if (moved) {
+      if ((b.space ?? null) !== from) throw movedErr();
+      q.putBoardSpace.run(board, to);
+    }
+    idemPut(idem, board, at);
+    return { board: rowBoard(q.board.get(board)), moved };
+  });
+
   // The last-owner check and the write share one IMMEDIATE transaction (the write lock is held from the first read).
   const setGrantTx = db.transaction((board, user, role) => {
     if (!q.boardExists.get(board)) throw new Error("registry: no such board");
@@ -631,6 +647,12 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       return createBoardTx.immediate(tenant, String(title), memberRole === undefined ? undefined : nz(memberRole), nz(space), owner == null ? null : String(owner), idemOf(idem), now());
     },
     async board(id) { ready(); return str(id) ? rowBoard(q.board.get(id)) ?? null : null; },
+    async moveBoard({ board, from = null, to, idem }) {
+      ready();
+      if (!str(board)) throw new Error("registry: no such board");
+      if (!str(to)) throw new Error("registry: no such space");
+      return moveBoardTx.immediate(board, from == null ? null : String(from), to, idemOf(idem), now());
+    },
 
     async setGrant(board, user, role) {
       ready();

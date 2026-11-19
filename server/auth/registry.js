@@ -2,7 +2,7 @@
 // last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
 import { normEmail } from "./util.js";
-import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "./registry-port.js";
+import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, movedErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "./registry-port.js";
 
 /**
  * @typedef {import("./registry-port.js").Registry} Registry
@@ -112,6 +112,19 @@ export function memoryRegistry({ now = Date.now } = {}) {
       return copy(b);
     },
     async board(id) { return copy(boards.get(id)); },
+    async moveBoard({ board, from, to, idem: key }) {
+      const b = boards.get(board);
+      if (!b) throw new Error("registry: no such board");
+      if (spaces.get(to)?.tenant !== b.tenant) throw new Error("registry: no such space");
+      const k = idemEnter(key);
+      const moved = b.space !== to;
+      if (moved) {
+        if (b.space !== (from ?? null)) throw movedErr();
+        b.space = to;
+      }
+      idemPut(k, b.id);
+      return { board: copy(b), moved };
+    },
 
     async setGrant(board, user, role) {
       if (!boards.has(board)) throw new Error("registry: no such board");

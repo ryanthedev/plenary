@@ -264,6 +264,14 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
       return registry.createBoard({ tenant: unit.id, title: t, space: target, owner: identity.user, idem, ...(memberRole !== undefined ? { memberRole } : {}) });
     },
 
+    /**
+     * The Space `id` of `unit` when the caller may put a board there (they open it and hold `board.create`; never another member's personal space), with their access to it; else
+     * null. The one rule of POST /boards and of a move's destination (PROTOCOL.md § Move board). @param {Identity} identity @param {{ id: string }} unit @param {unknown} id
+     */
+    async createTarget(identity, unit, id) {
+      try { return await boardCreateAccess(identity, unit, id); } catch (e) { if (e?.code === "forbidden") return null; throw e; }
+    },
+
     /** GET /spaces?can=board.create. @param {Identity} identity */
     async boardPicker(identity) {
       const unit = await unitOf(identity);

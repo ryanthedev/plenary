@@ -71,7 +71,7 @@
 // owns that pool) or `sql` (a Bun SQL client you own). `schema` names the Postgres schema. Never reads env.
 
 import { SQL } from "bun";
-import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
+import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, movedErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 import { needSchema, migrate, assertColumns, missing as absent } from "../pg/schema.js";
 
@@ -405,6 +405,26 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       });
     },
     async board(id) { ready(); return key(id) ? rowBoard(await one(db, `${BOARD_SQL} WHERE b.id = $1`, [id])) : null; },
+    async moveBoard({ board, from = null, to, idem }) {
+      ready();
+      if (!key(board)) throw new Error("registry: no such board");
+      if (!key(to)) throw new Error("registry: no such space");
+      const k = idemStart(idem), at = now();
+      return write(async tx => {
+        // The board row lock serialises every move of this board (and a grant change); the compare-and-set reads after it is held.
+        const b = await one(tx, `SELECT id, tenant FROM ${BD} WHERE id = $1 FOR UPDATE`, [board]);
+        if (!b) throw new Error("registry: no such board");
+        if ((await one(tx, `SELECT tenant FROM ${SP} WHERE id = $1`, [to]))?.tenant !== b.tenant) throw new Error("registry: no such space");
+        await idemPut(tx, k, board, at);
+        const cur = (await one(tx, `SELECT space FROM ${BS} WHERE board = $1`, [board]))?.space ?? null;
+        const moved = cur !== to;
+        if (moved) {
+          if (cur !== (from == null ? null : String(from))) throw movedErr();
+          await tx.unsafe(`INSERT INTO ${BS} (board, space) VALUES ($1, $2) ON CONFLICT (board) DO UPDATE SET space = excluded.space`, [board, to]);
+        }
+        return { board: rowBoard(await one(tx, `${BOARD_SQL} WHERE b.id = $1`, [board])), moved };
+      });
+    },
 
     async setGrant(board, user, role) {
       ready();

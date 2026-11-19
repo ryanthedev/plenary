@@ -539,3 +539,25 @@ test("text safety: an owner's name that looks like markup is text", async () => 
   expect(textOf(card)).toContain("<img src=x onerror=alert(1)>");
   expect(card.findAll(e => e.tagName === "IMG")).toHaveLength(0);
 });
+
+test("#53 Move to… is in a card's menu only where the server says can.move and the page has a move port; choosing it opens the Move dialog and focus goes to its first control", async () => {
+  const calls2 = [];
+  const move = { port: { options: async b => { calls2.push(b); return { error: "forbidden" }; } }, clock: { now: () => 0, set: () => 1, clear() {} }, newKey: () => "k" };
+  const page = SP(); page.boards[0].can = { rename: true, move: true };
+  await spacePage(page, { move });
+  const menu = i => root.findAll(e => e.tagName === "BUTTON" && /^More for/.test(e.getAttribute("aria-label") ?? ""))[i];
+  menu(1).click();
+  expect(root.findAll(e => e.getAttribute("role") === "menuitem").map(textOf)).toEqual(["Open"]);                 // Locked: no can.move
+  menu(1).click(); menu(0).click();
+  const items = root.findAll(e => e.getAttribute("role") === "menuitem");
+  expect(items.map(textOf)).toEqual(["Open", "Move to…", "Rename"]);
+  items[1].click(); await settle();
+  expect(calls2).toEqual(["b-1"]);
+  expect(root.findAll(e => e.getAttribute("role") === "dialog").length).toBe(1);
+});
+test("#53 without a move port the page offers no Move even when can.move is true", async () => {
+  const page = SP(); page.boards[0].can = { rename: true, move: true };
+  await spacePage(page);
+  root.findAll(e => e.tagName === "BUTTON" && /^More for/.test(e.getAttribute("aria-label") ?? ""))[0].click();
+  expect(root.findAll(e => e.getAttribute("role") === "menuitem").map(textOf)).toEqual(["Open", "Rename"]);
+});

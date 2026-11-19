@@ -113,6 +113,7 @@ export const mint = {
  *   tenantAdminsAmong(users: string[], o?: { timeoutMs?: number }): Promise<string[]>,   // those of `users` who are an admin of ANY tenant (the dev sign-in menu never offers one)
  *   createBoard(o: { tenant: string, title?: string, memberRole?: Role|null, space?: string, owner?: string, idem?: Idem }): Promise<Board>,   // `owner` gets an owner grant in the same step; without `space`: unfiled, memberRole default "viewer" (as always); with `space` (same tenant): memberRole default null = inherit the Space
  *   createGroup(o: { tenant: string, name: string, generalRole?: Role|null, owner?: string, idem?: Idem }): Promise<Group>,   // generalRole default null; `owner` gets an owner grant in the same step
+ *   moveBoard(o: { board: string, from: string|null, to: string, idem?: Idem }): Promise<{ board: Board, moved: boolean }>,   // ONE atomic compare-and-set of the board's Space (PROTOCOL.md § Move board): in `from` (null = unfiled) -> set, moved true; already in `to` -> no change, moved false; anywhere else rejects code "moved"; the key row is written in the same step
  *   group(id: string): Promise<Group|null>,
  *   groups(tenant: string): Promise<Group[]>,
  *   createSpace(o: { tenant: string, name: string, group?: string|null, generalRole?: Role|null, owner?: string, idem?: Idem }): Promise<Space>,   // generalRole default "viewer"; null = only people added
@@ -214,6 +215,8 @@ export const askLimits = o => {
 /** Home (PROTOCOL.md § Home): rows kept per user in Recent, rows a starred / shared read may return, and the most boards one `boardRows` / `starredAmong` call takes. */
 /** Idempotent creates (PROTOCOL.md): a key row is kept `ttlMs`; expired rows are pruned `prune` at a time, every `every`-th keyed create. */
 export const IDEM = Object.freeze({ ttlMs: 24 * 3600_000, prune: 500, every: 64 });
+/** The rejection of `moveBoard` whose board is in neither `from` nor `to` (someone moved it meanwhile). Match on `code`, not the class. */
+export const movedErr = () => Object.assign(new Error("registry: the board is no longer in that Space"), { name: "RegistryError", code: "moved" });
 /** @typedef {{ user: string, key: string, fp: string }} Idem  The Idempotency-Key of a create: its user, the key, the SHA-256 fingerprint of the request. */
 /** The two rejections of a keyed create that met a live row. Match on `code`, not the class. */
 export const idemErr = {

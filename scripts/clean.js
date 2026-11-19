@@ -108,7 +108,7 @@ export function resolveNoOpen(p, stat = lstatSync, readlink = readlinkSync, cach
     for (const c of rest) { if (c === "..") break; lead.push(c); }
     try {
       for (let k = 1; k <= Math.min(lead.length, 4); k++) {
-        const tail = lead.slice(0, k).join(sep), a = statSync(`/System/Volumes/Data/${tail}`), b = statSync(`/${tail}`);
+        const tail = lead.slice(0, k).join(sep), a = statSync(`/System/Volumes/Data/${tail}`, { bigint: true }), b = statSync(`/${tail}`, { bigint: true });   // bigint: system-volume inodes exceed 2^53
         if (a.dev === b.dev && a.ino === b.ino) { todo.length -= 3; break; }
       }
     } catch { /* not a firmlinked system, or a missing part: keep the spelling */ }
@@ -236,7 +236,7 @@ const refuseBase = (p, what) => {
   const home = resolveNoOpen(homedir());
   // By identity (dev+ino; stat opens nothing; the only check): a case-insensitive volume answers /USERS/R or /users for $HOME or its parents, and no
   // string compare of spellings can be trusted there.
-  const key = q => { const st = statSync(q); return `${st.dev}:${st.ino}`; };
+  const key = q => { const st = statSync(q, { bigint: true }); return `${st.dev}:${st.ino}`; };
   const protectedKeys = new Set();
   const add = q => { try { protectedKeys.add(key(q)); } catch { /* absent here (no firmlink off macOS) */ } };
   const DATA = "/System/Volumes/Data";   // macOS firmlink: the same directories again, under their physical parent

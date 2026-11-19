@@ -742,7 +742,7 @@ describe.skipIf(!url)("postgres registry", () => {
         await until(() => r.gate().running === 0);
         expect(await r.grant(b.id, "u")).toBe("editor");                            // usable again
       } finally { await r.close(); await drop(schema); }
-    });
+    }, 30_000);   // failure-only ceiling (TECH-DEBT row 31): the 800 ms lock wait is the server's own clock, but a fresh schema, a cold pool and a drop around it are not; ~1.5 s alone
   }
 
   test("queue-timeout means never sent: a write that timed out waiting is absent after the lock clears", async () => {

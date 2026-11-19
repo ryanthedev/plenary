@@ -23,6 +23,7 @@
 // is skipped, never queued: the next move or the commit supersedes it. Hello and real ops are never gated.
 
 import { Replica } from "../../packages/protocol/replica.js";
+export { BLOB_PENDING_MS } from "../../packages/protocol/envelope.js";   // the one number clients and servers share for how long an upload is pending (re-offered after it)
 import { presenceProblem, presenceLimiter, MAX_PREVIEW_ELEMENTS } from "../../packages/protocol/presence.js";
 import { clone } from "../../packages/core/model.js";
 import { PRESENCE_BACKLOG_BYTES } from "../ports/transport.js";

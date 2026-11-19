@@ -343,6 +343,20 @@ test("start(env): PLENARY_TRASH_SWEEP_MS must be an integer from 1000 to 8640000
   }
 });
 
+test("start(env): PLENARY_BLOB_REAP_MS must be an integer from 1000 to 86400000 (checked before anything opens); a gateway node has a blob reaper, a host-only node has none", async () => {
+  for (const bad of ["999", "86400001", "1.5e3", "abc", "", "0", " 2000", "-1000"]) {
+    const dir = tempDir();
+    await expect(start(devEnv(dir, { PLENARY_BLOB_REAP_MS: bad }))).rejects.toThrow(/PLENARY_BLOB_REAP_MS/);
+    expect(existsSync(join(dir, "registry.db"))).toBe(false);
+  }
+  for (const good of [undefined, "1000", "86400000"]) {
+    const app = await start(devEnv(tempDir(), good === undefined ? {} : { PLENARY_BLOB_REAP_MS: good }));
+    expect(typeof app.reaper.sweep).toBe("function");
+    expect(await app.reaper.sweep()).toEqual({ deleted: 0, revived: 0, raced: 0, failed: 0, more: false });
+    await app.stop();
+  }
+});
+
 test("revocation: a grant change through the Registry closes a connection that lost its role", async () => {
   const app = await start(devEnv(tempDir()));
   try {

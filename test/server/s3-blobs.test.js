@@ -117,3 +117,14 @@ st("s3: a caller-given session token is what gets signed (the store rejects a wr
   const png = fakePng(64, 5), h = sha1(png);
   expect(await code(s3Blobs({ ...cfg, sessionToken: "not-a-real-token" }).get(freshTenant(), h))).toBe("unavailable");
 });
+
+st("s3: delete of an object removes exactly that key; a missing bucket is an error, not 'already gone'", async () => {
+  const blobs = s3Blobs(cfg), ta = freshTenant();
+  const a = fakePng(90, 31), b = fakePng(91, 32);
+  await blobs.put(ta, sha1(a), a); await blobs.put(ta, sha1(b), b);
+  await blobs.delete(ta, sha1(a));
+  const raw = new Bun.S3Client(cfg);
+  expect((await raw.list({ prefix: `${ta}/` })).contents.map(c => c.key)).toEqual([`${ta}/${sha1(b)}`]);
+  const nowhere = s3Blobs({ ...cfg, bucket: `plenary-no-such-bucket-${process.pid}` });
+  expect(await code(nowhere.delete(ta, sha1(a)))).toBe("unavailable");
+});

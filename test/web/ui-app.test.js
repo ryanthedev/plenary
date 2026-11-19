@@ -2,6 +2,7 @@
 // (p7-chrome): the chrome is rebuilt only when what a part shows changes (C-2, C-8), the zoom % and pill update in
 // place, `online` / a long-hidden tab reconnects (C-4), the collab UI gets the clock port (C-6), a refused or
 // expiring sign-in offers "Sign in again" (C-9), and the cap's countdown reads the clock port (C-17).
+import { BLOB_PENDING_MS } from "../../packages/protocol/envelope.js";
 import { test, expect, beforeEach, afterAll } from "bun:test";
 import { localRoom } from "../../web/adapters/transport/local.js";
 import { createSession } from "../../web/core/session.js";
@@ -1074,7 +1075,7 @@ const PIC = { id: "c".repeat(40), mimeType: "image/png", dataURL: "data:image/pn
 // A picture with bytes is painted through `new Image()`: a stub that never loads.
 beforeEach(() => { globalThis.Image = class { set src(v) { this._src = v; } }; });
 afterAll(() => { delete globalThis.Image; });
-const spyNet = () => { const wants = [], files = [], stamps = []; return { wants, files, net: { kind: "local", put() {}, onFile: fn => { files.push(fn); }, want: (id, stamp) => { wants.push(id); stamps.push(stamp); } }, stamps }; };
+const spyNet = () => { const wants = [], files = [], stamps = [], puts = []; return { wants, files, puts, net: { kind: "local", put: f => { puts.push(f.id); }, onFile: fn => { files.push(fn); }, want: (id, stamp) => { wants.push(id); stamps.push(stamp); } }, stamps }; };
 
 test("DW-42.3: a picture on the board whose bytes this client lacks is asked for through net.want, and not asked for once it has them", () => {
   const spy = spyNet();
@@ -1102,6 +1103,64 @@ test("a picture this client placed itself, and a deleted one, are never asked fo
   const id = [...bo.eds.board.doc.byId.values()].find(e => e.fileId === "d".repeat(40)).id;
   bo.eds.board.select([id]); bo.eds.board.key("Delete"); step(4);
   expect(S.missingFiles()).toEqual([]);
+});
+
+test("#92: a picture placed by this client's own op without being uploaded (a pasted selection) is uploaded by the frame loop; one put or fetched within BLOB_PENDING_MS is not offered again, an older one is", () => {
+  const spy = spyNet();
+  rig = setup({ appNet: spy.net });
+  const { S, bo, step, net } = rig;
+  const OTHER = { ...PIC, id: "e".repeat(40) };
+  bo.addPicture(OTHER); step(3);
+  const ed = bo.eds.board;
+  ed.select([[...ed.doc.byId.values()].find(e => e.fileId === OTHER.id).id]);
+  const text = ed.copy();                                                 // a clipboard that carries the element and its bytes
+  expect(text).toContain(OTHER.id);
+  S.paste(text); step(4);
+  expect(spy.puts).toEqual([OTHER.id]);                                   // the frame loop put it
+  S.paste(text); step(4);
+  expect(spy.puts).toEqual([OTHER.id]);                                   // just put: not again for BLOB_PENDING_MS
+  net.advance(BLOB_PENDING_MS + 1000); step(2);
+  S.paste(text); step(4);
+  expect(spy.puts).toEqual([OTHER.id, OTHER.id]);                         // the server may have deleted it since: offered again with the op that places it
+  S.addPicture(PIC); step(3);
+  spy.files[0]({ id: "f".repeat(40), mimeType: PIC.mimeType, dataURL: PIC.dataURL });   // fetched from the server
+  step(3);
+  expect(spy.puts).toEqual([OTHER.id, OTHER.id]);                         // placed through addPicture (the app uploads it itself) or fetched: never offered here
+});
+
+test("#92 MED-B: moving, resizing or restyling pictures that are already placed re-uploads nothing, however old their last put", () => {
+  const spy = spyNet();
+  rig = setup({ appNet: spy.net });
+  const { S, bo, step, net } = rig;
+  const ids = ["1", "2", "3"].map(k => k.repeat(40));
+  for (const id of ids) { S.addPicture({ ...PIC, id }); step(3); }
+  step(5);
+  expect(spy.puts).toEqual([]);                                           // addPicture's own upload is the app's (the test calls S directly)
+  net.advance(BLOB_PENDING_MS * 2); step(3);                              // every picture's last put is now older than the window
+  const ed = S.eds.board;
+  ed.select([...ed.doc.byId.values()].filter(e => e.type === "image").map(e => e.id));
+  const sent = S.sent;
+  S.act("board", e => e.nudge(10, 0)); step(4); S.act("board", e => e.nudge(0, 10)); step(4);   // move all of them (ops of image elements)
+  expect(S.sent).toBeGreaterThan(sent);                                   // they really were sent
+  expect(spy.puts).toEqual([]);
+});
+
+test("#92 MED-C: a picture placed offline (its op resent after the reconnect, which never passes the Editor) is offered again on `live` when its last put is older than BLOB_PENDING_MS", () => {
+  const spy = spyNet();
+  rig = setup({ appNet: spy.net });
+  const { S, bo, step, net, joins } = rig;
+  const OTHER = { ...PIC, id: "9".repeat(40) };
+  bo.addPicture(OTHER); step(3);
+  const ed = bo.eds.board;
+  ed.select([[...ed.doc.byId.values()].find(e => e.fileId === OTHER.id).id]);
+  const text = ed.copy();
+  joins[0].fail(); step(2);                                               // ada goes offline
+  S.paste(text); step(4);                                                 // placed offline: put once at placement (it would be lost with the connection)
+  expect(spy.puts).toEqual([OTHER.id]);
+  net.advance(80 * 60_000);                                               // 80 minutes: the picture is condemned and reaped meanwhile
+  S.reconnect(); step(30); net.advance(1000); step(30);
+  expect(S.status).toBe("live");
+  expect(spy.puts).toEqual([OTHER.id, OTHER.id]);                         // the resend does not pass the Editor: the reconnect offers it again
 });
 
 test("L1/L2: S.missing() is memoised on the documents' revisions (no scan per frame) and its stamp changes when an element showing the picture does", () => {

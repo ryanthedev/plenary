@@ -51,6 +51,18 @@ describe("wsNet blobs", () => {
     expect(s.fails).toEqual([]);
   });
 
+  test("#92: a picture whose upload finished is put again when the session offers it again (the server may have deleted it), not skipped as already done", async () => {
+    const s = await setup(() => new Response("{}", { status: 200 }));   // 200: the server already had it
+    await s.welcome();
+    s.net.put({ id: ID, mimeType: "image/png", dataURL }); await tick();
+    s.ws().say({ t: "blob", sha1: ID, url: "http://x.test/blobs/t1" }); await tick();
+    expect(s.calls.map(c => c.method)).toEqual(["PUT"]);
+    s.net.put({ id: ID, mimeType: "image/png", dataURL }); s.clock.advance(1000); await tick();       // offered again (the asks are paced)
+    expect(s.ws().asks).toEqual([{ t: "blob", sha1: ID, put: true }, { t: "blob", sha1: ID, put: true }]);
+    s.ws().say({ t: "blob", sha1: ID, url: "http://x.test/blobs/t2" }); await tick();
+    expect(s.calls.map(c => c.method)).toEqual(["PUT", "PUT"]);
+  });
+
   test("a path answer (no PUBLIC_URL on the server) is resolved against the origin the client connected to", async () => {
     const s = await setup(() => ok());
     await s.welcome();

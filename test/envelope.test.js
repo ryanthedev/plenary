@@ -1,7 +1,7 @@
 // The checks every op passes before a room looks at the board (PROTOCOL.md § Limits, § The element op).
 import { test, expect } from "bun:test";
 import { direct } from "./world.js";
-import { opProblem, parseOpId, isSha1, canWrite, recordProblem, deeperThan, STREAMS, ELEMENT_STREAMS, PROTOCOL_VERSION, RULES_VERSION, MAX_OP_DEPTH, OP_RATE, CAPS, isTab, TAB_RE, MAX_WRITER_CONNS, MAX_TAB_CONNS } from "../packages/protocol/envelope.js";
+import { opProblem, parseOpId, isSha1, blobRefsOf, canWrite, recordProblem, deeperThan, STREAMS, ELEMENT_STREAMS, PROTOCOL_VERSION, RULES_VERSION, MAX_OP_DEPTH, OP_RATE, CAPS, isTab, TAB_RE, MAX_WRITER_CONNS, MAX_TAB_CONNS } from "../packages/protocol/envelope.js";
 import { makeElement } from "../packages/core/model.js";
 
 const rect = (id, extra = {}) => makeElement("rectangle", { id, ...extra });
@@ -108,4 +108,18 @@ test("hello.tab format (§ Messages, hello.tab): 1-32 of [A-Za-z0-9_-]; caps 8 t
   for (const bad of ["", "x".repeat(33), "a b", "a:b", "a.b", "a|b", "é", 1, null, undefined, ["a"], {}]) expect(isTab(bad)).toBe(false);
   expect(TAB_RE.source).toBe("^[A-Za-z0-9_-]{1,32}$");
   expect([MAX_WRITER_CONNS, MAX_TAB_CONNS]).toEqual([8, 2]);
+});
+
+test("blobRefsOf (§ Blobs, References): the distinct SHA-1 fileIds of image elements across entries, deleted ones included; nothing else", () => {
+  const A = "a".repeat(40), B = "b".repeat(40);
+  const img = (id, fileId, extra = {}) => makeElement("image", { id, fileId, ...extra });
+  const entries = [
+    { seq: 1, op: { elements: [img("i1", A), img("i2", A), rect("r"), img("i3", B, { isDeleted: true })] } },
+    { seq: 2, op: { appState: { grid: 1 } } },                                           // no elements
+    { seq: 3, op: { do: "thread", id: "t" } },                                           // a records action
+    { seq: 4, op: { elements: [img("i4", null), img("i5", "nope"), img("i6", A.toUpperCase()), { id: "x", type: "text", fileId: A }] } },   // not references
+    { seq: 5 }, null,                                                                    // malformed entries are skipped, never thrown on
+  ];
+  expect(blobRefsOf(entries).sort()).toEqual([A, B]);
+  expect(blobRefsOf([])).toEqual([]);
 });

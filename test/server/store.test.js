@@ -22,6 +22,9 @@ storeContract("sqlite", async opts => {
       putCheckpointRow: async (t, b, seq, data) => one("INSERT INTO checkpoints (tenant, board, seq, data) VALUES (?, ?, ?, ?)", t, b, seq, data),
       putPartRow: async (t, b, seq, wid, n, data) => one("INSERT INTO checkpoint_parts (tenant, board, seq, wid, n, data) VALUES (?, ?, ?, ?, ?, ?)", t, b, seq, wid, n, data),
       partRows: async (t, b) => raw.query("SELECT count(*) AS c FROM checkpoint_parts WHERE tenant = ? AND board = ?").get(t, b).c,
+      putRefRow: async (t, b, sha1) => one("INSERT OR IGNORE INTO blob_refs (tenant, sha1, board) VALUES (?, ?, ?)", t, sha1, b),
+      refRows: async (t, b) => raw.query("SELECT count(*) AS c FROM blob_refs WHERE tenant = ? AND board = ?").get(t, b).c,
+      pendingRows: async (t, b) => raw.query("SELECT count(*) AS c FROM blob_pending WHERE tenant = ? AND board = ?").get(t, b).c,
     } };
 });
 
@@ -79,22 +82,6 @@ test("the old-format rule is general: a changed column set in any Store table re
   }
 });
 
-test("a checkpoint stored as one plain JSON row (no header, no parts: what a small checkpoint is) reads, and parts sit beside it", async () => {
-  const path = join(tempDir(), "plenary.db");
-  const old = new Database(path, { create: true });
-  old.run("CREATE TABLE checkpoints (tenant TEXT NOT NULL, board TEXT NOT NULL, seq INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq)) WITHOUT ROWID");
-  const cp = { seq: 7, streams: { board: { elements: Array.from({ length: 300 }, (_, i) => ({ id: `e${i}`, text: "😀".repeat(20) })) } } };
-  old.run("INSERT INTO checkpoints (tenant, board, seq, data) VALUES (?, ?, 7, ?)", [T, B, JSON.stringify(cp)]);
-  old.close();
-  const store = sqliteStore({ path, partChars: 1000 });
-  expect(await store.getCheckpoint(T, B)).toEqual(cp);
-  const epoch = await store.openEpoch(T, B);
-  await store.putCheckpoint(T, B, { ...cp, seq: 8 }, epoch);
-  expect((await store.getCheckpoint(T, B)).seq).toBe(8);
-  expect(await store.getCheckpoint(T, B, 8)).toEqual(cp);
-  await store.close();
-});
-
 test("a header whose parts hold the wrong number of chars is refused as corrupt, never parsed", async () => {
   const path = join(tempDir(), "plenary.db");
   const store = sqliteStore({ path, partChars: 100 });
@@ -110,4 +97,46 @@ test("a header whose parts hold the wrong number of chars is refused as corrupt,
   await store.putCheckpoint(T, B, { seq: 2, small: true }, epoch);                   // an older, readable one is what a caller steps back to
   expect(await store.getCheckpoint(T, B)).toEqual({ seq: 2, small: true });
   raw.close(); await store.close();
+});
+
+test("#92 no back-compat: a pre-#92 file (the four older tables, with a board's entries in it) is an old-format store: refused, and left exactly as found (no blob table is added)", () => {
+  const path = join(tempDir(), "plenary.db");
+  const old = new Database(path, { create: true });
+  old.run("CREATE TABLE entries (tenant TEXT NOT NULL, board TEXT NOT NULL, seq INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq)) WITHOUT ROWID");
+  old.run("CREATE TABLE checkpoints (tenant TEXT NOT NULL, board TEXT NOT NULL, seq INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq)) WITHOUT ROWID");
+  old.run("CREATE TABLE checkpoint_parts (tenant TEXT NOT NULL, board TEXT NOT NULL, seq INTEGER NOT NULL, wid TEXT NOT NULL, n INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq, wid, n))");
+  old.run("CREATE TABLE leases (tenant TEXT NOT NULL, board TEXT NOT NULL, epoch INTEGER NOT NULL, holder TEXT, expires_at INTEGER, PRIMARY KEY (tenant, board)) WITHOUT ROWID");
+  old.run("INSERT INTO entries (tenant, board, seq, data) VALUES (?, ?, 1, ?)", [T, B, JSON.stringify(entry(1))]);
+  old.close();
+  let err;
+  try { sqliteStore({ path }); } catch (e) { err = e; }
+  expect(err?.code).toBe("old-format");
+  expect(err.message).toMatch(/blob_refs/);
+  const after = new Database(path, { readonly: true });
+  expect(after.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all().map(r => r.name)).toEqual(["checkpoint_parts", "checkpoints", "entries", "leases"]);
+  expect(after.query("SELECT count(*) AS c FROM entries").get().c).toBe(1);
+  after.close();
+});
+
+test("#92 indexes: the purge and the prune each have one (by board, by expiry)", () => {
+  const path = join(tempDir(), "plenary.db");
+  sqliteStore({ path }).close();
+  const raw = new Database(path, { readonly: true });
+  expect(raw.query("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'blob_%' ORDER BY name").all().map(r => r.name)).toEqual(["blob_pending_board", "blob_pending_until", "blob_refs_board"]);
+  raw.close();
+});
+
+test("#92 no backfill: a blob table with other columns than this version's is an old-format store (refused, left as found); a file with none of them just gets them", () => {
+  for (const table of ["blob_refs", "blob_pending", "blob_condemned"]) {
+    const path = join(tempDir(), "plenary.db");
+    const old = new Database(path, { create: true });
+    old.run(`CREATE TABLE ${table} (tenant TEXT NOT NULL, sha1 TEXT NOT NULL)`);
+    old.close();
+    let err;
+    try { sqliteStore({ path }); } catch (e) { err = e; }
+    expect(err?.code).toBe("old-format");
+    expect(err.message).toContain(table);
+  }
+  const fresh = sqliteStore({ path: join(tempDir(), "plenary.db") });
+  return fresh.blobPrune(1).then(n => { expect(n).toBe(0); return fresh.close(); });
 });

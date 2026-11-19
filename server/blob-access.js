@@ -4,6 +4,7 @@
 //                                    for it after it has checked the connection's role.
 //   put(token, bytes)                what `PUT /blobs/<token>` does: verify the token, reserve quota, store.
 //   get(token)                       what `GET /blobs/<token>` does: verify the token, read.
+//   recount(tenant)                  the tenant's cached usage is stale (the reaper deleted blobs): the next put reads usage() again.
 // Both answer `{ ok: true, … }` or `{ ok: false, code }` (never throw for a client's mistake); the HTTP adapter
 // (blob-http.js) turns a code into a status. Codes: bad-token, wrong-verb, too-large, bad-length, not-image,
 // hash-mismatch, quota, not-found, unavailable.
@@ -34,19 +35,20 @@ const CODES = { "too-large": "too-large", "hash-mismatch": "hash-mismatch", "not
 
 /**
  * @param {{ blobs: { put: Function, get: Function, usage: Function }, key: Uint8Array, origin?: string,
- *           now?: () => number, quotaBytes?: number, ttlMs?: number, log?: object }} o
+ *           now?: () => number, quotaBytes?: number, ttlMs?: number, usageTtlMs?: number, log?: object }} o
+ *   usageTtlMs: a tenant's cached usage is read again when it is older than this (other nodes' puts and the reaper's deletes change it; default never, main.js passes the reap interval)
  *   key: ≥ 32 bytes (derive it from the shared key; never the key itself). origin: where browsers reach this server
  *   (PUBLIC_URL, no trailing slash); "" (the default) makes every URL the path /blobs/<token>, which the client resolves
  *   against the origin it connected to.
  */
-export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes = DEFAULT_QUOTA_BYTES, ttlMs = URL_TTL_MS, log = quietLogger }) {
+export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes = DEFAULT_QUOTA_BYTES, ttlMs = URL_TTL_MS, usageTtlMs = Infinity, log = quietLogger }) {
   if (!blobs || typeof blobs.put !== "function" || typeof blobs.get !== "function" || typeof blobs.usage !== "function") throw new TypeError("blobAccess needs a Blobs port (put, get, usage)");
   if (!(key instanceof Uint8Array) || key.length < 32) throw new TypeError("blobAccess: key must be at least 32 bytes");
   if (typeof origin !== "string") throw new TypeError("blobAccess: origin must be a string");
   if (!Number.isFinite(quotaBytes) || quotaBytes < 0) throw new TypeError("blobAccess: quotaBytes must be a number ≥ 0");
   const mac = crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
 
-  /** @type {Map<string, { used: number, reserved: number, ready: Promise<void> | null }>} */
+  /** @type {Map<string, { used: number, reserved: number, ready: Promise<void> | null, at: number, seq: number, sinceRead: number, reading: boolean }>} at: when the last read of usage answered; seq: the newest read's number; sinceRead: bytes put while it was in flight */
   const tenants = new Map();
 
   /** The signed claims of a token for `verb`, or { ok: false, code }. */
@@ -70,17 +72,32 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
     return { ok: true, tenant, board, sha1, user: claims.user ?? null };
   }
 
-  /** Read the tenant's usage once (concurrent first puts share one read); a failed read is tried again by the next put. */
+  /**
+   * Read the tenant's usage once (concurrent first puts share one read); a failed read is tried again by the next put.
+   * A put does NOT wait for the newest read when a recount supersedes the one it waited on: the count it then checks against is never too low
+   * without that wait, because (1) a read never resets the count before it answers, (2) an answer is the count it saw PLUS every byte put while it
+   * was in flight, (3) a superseded answer only ever raises the count (Math.max), and (4) every put adds its own bytes. The count may over-state, never under-state.
+   */
   function seed(tenant) {
     let st = tenants.get(tenant);
-    if (!st) tenants.set(tenant, st = { used: 0, reserved: 0, ready: null });
-    st.ready ??= Promise.resolve(blobs.usage(tenant)).then(n => { st.used = n; }, err => { st.ready = null; throw err; });
+    if (!st) tenants.set(tenant, st = { used: 0, reserved: 0, ready: null, at: 0, seq: 0, sinceRead: 0, reading: false });
+    if (st.ready && !st.reading && st.at && now() - st.at >= usageTtlMs) st.ready = null;   // stale: another node (or the reaper) changed what the tenant stores
+    if (!st.ready) {
+      const seq = ++st.seq; st.sinceRead = 0; st.reading = true;
+      st.ready = Promise.resolve(blobs.usage(tenant)).then(n => {
+        if (seq === st.seq) { st.used = n + st.sinceRead; st.at = now(); st.reading = false; }
+        else st.used = Math.max(st.used, n);
+      }, err => { if (seq === st.seq) { st.ready = null; st.reading = false; } throw err; });
+    }
     return st.ready.then(() => st);
   }
 
   const unavailable = (what, tenant, err) => { log.error(`blob ${what} failed`, { tenant, code: err?.code, err }); return { ok: false, code: "unavailable" }; };
 
   return {
+    /** The tenant's quota count is stale (blobs were deleted): the next put reads `usage` again. A put in flight finishes against the old count, which only errs towards refusing. */
+    recount(tenant) { const st = tenants.get(tenant); if (st) st.ready = null; },
+
     /** The claims of a token for `verb`, or { ok: false, code }: the HTTP adapter checks it before it reads a body. */
     verify,
 
@@ -109,7 +126,7 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
       st.reserved += n;
       try {
         const created = await blobs.put(v.tenant, v.sha1, bytes);
-        if (created) st.used += n;
+        if (created) { st.used += n; st.sinceRead += n; }   // always: a read that started before this write finished may not include it, and a count may over-state (until the next read) but never under-state
         return { ok: true, created: created !== false };
       } catch (err) {
         return CODES[err?.code] ? { ok: false, code: CODES[err.code] } : unavailable("put", v.tenant, err);

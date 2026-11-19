@@ -381,17 +381,84 @@ describe("announcements: coalesced per scope, capped overall, the final state al
     expect(seen.length).toBe(2);
     expect(seen.at(-1)).toBe("editor");                                          // pass 2 ran after the last write
   });
-  test("the cap on scopes in flight holds: beyond it a change is logged and skipped, never queued", async () => {
-    const warns = [];
-    const spaces = await Promise.all(Array.from({ length: ANNOUNCE.inflight + 4 }, (_, i) => r.createSpace({ tenant: acme.id, name: "S" + i, generalRole: "viewer", owner: "google:ada" })));
-    let maxLive = 0, live = 0;
-    const reg = new Proxy(r, { get: (t, k) => (k === "boardsIn" ? async (...a) => { live++; maxLive = Math.max(maxLive, live); await new Promise(res => setTimeout(res, 10)); live--; return t.boardsIn(...a); } : t[k]) });
-    const s = spaceService({ registry: reg, tenancy: makeTenancy({ registry: reg }), announce: () => {}, log: { warn: m => warns.push(m) } });
-    await Promise.all(spaces.map(sp => s.update(ada, "space", sp.id, { general: "editor" })));
+  // A Registry whose boardsIn waits on a gate per scope, so a test decides when each pass ends.
+  const gated = () => {
+    const live = new Set(), starts = [], gates = new Map(); let maxLive = 0;
+    const reg = new Proxy(r, { get: (t, k) => (k === "boardsIn" ? async (scope, ...a) => {
+      live.add(scope.id); starts.push(scope.id); maxLive = Math.max(maxLive, live.size);
+      if (gates.has(scope.id)) await gates.get(scope.id);
+      live.delete(scope.id); return t.boardsIn(scope, ...a);
+    } : t[k]) });
+    const hold = id => { let open; gates.set(id, new Promise(res => { open = res; })); return open; };
+    return { reg, live, starts, hold, maxLive: () => maxLive };
+  };
+  const newSpaces = (n, tenant = acme.id, owner = "google:ada") => Promise.all(Array.from({ length: n }, (_, i) => r.createSpace({ tenant, name: "Q" + i, generalRole: "viewer", owner })));
+  const tick = () => new Promise(res => setTimeout(res, 5));
+
+  test("scopes over the cap wait in a queue and run as slots free; none is dropped, and the cap holds", async () => {
+    const g = gated(), sp = await newSpaces(ANNOUNCE.perTenant + 6);
+    const opens = sp.map(x => g.hold(x.id));
+    const s = spaceService({ registry: g.reg, tenancy: makeTenancy({ registry: g.reg }), announce: () => {} });
+    await Promise.all(sp.map(x => s.update(ada, "space", x.id, { general: "editor" })));          // an upgrade: not a revocation
+    await tick();
+    expect(g.live.size).toBe(ANNOUNCE.perTenant);                                                  // one Unit may run perTenant at once
+    opens.slice(0, 2).forEach(f => f()); await tick();
+    expect(g.live.size).toBe(ANNOUNCE.perTenant);                                                  // freed slots were refilled from the queue
+    opens.forEach(f => f()); await s.settled();
+    expect(new Set(g.starts)).toEqual(new Set(sp.map(x => x.id)));                                 // every scope was announced
+    expect(g.maxLive()).toBeLessThanOrEqual(ANNOUNCE.perTenant);
+  });
+  test("tenant fairness: one Unit's burst does not delay another Unit's announce beyond a slot", async () => {
+    const g = gated(), globex = await r.createTenant({ domain: "globex.com", admins: ["google:gadmin"] });
+    const a = await newSpaces(20), b = await r.createSpace({ tenant: globex.id, name: "B", generalRole: "viewer", owner: "google:gita" });
+    const opens = a.map(x => g.hold(x.id));
+    const s = spaceService({ registry: g.reg, tenancy: makeTenancy({ registry: g.reg }), announce: () => {} });
+    await Promise.all(a.map(x => s.update(ada, "space", x.id, { general: "editor" })));
+    await s.update(ident("gita", "globex.com"), "space", b.id, { general: "editor" });
+    await tick();
+    expect(g.starts).toContain(b.id);                                                              // B started while A's burst still waits
+    expect(g.starts.filter(id => id !== b.id).length).toBe(ANNOUNCE.perTenant);
+    opens.forEach(f => f()); await s.settled();
+  });
+  test("a revocation under a full cap is announced at once, ahead of the queue", async () => {
+    const g = gated(), sp = await newSpaces(ANNOUNCE.perTenant + 3), target = sp.at(-1);
+    const opens = sp.slice(0, -1).map(x => g.hold(x.id));
+    const s = spaceService({ registry: g.reg, tenancy: makeTenancy({ registry: g.reg }), announce: () => {} });
+    for (const x of sp.slice(0, -1)) await s.update(ada, "space", x.id, { general: "editor" });
+    await tick();
+    expect(g.live.size).toBe(ANNOUNCE.perTenant);                                                  // full for this Unit
+    await s.update(ada, "space", target.id, { general: null });                                    // viewer -> only people added: a revocation
+    await tick();
+    expect(g.starts).toContain(target.id);                                                         // started although the Unit's slots are full
+    opens.forEach(f => f()); await s.settled();
+    expect(new Set(g.starts)).toEqual(new Set(sp.map(x => x.id)));
+  });
+  test("a scope that keeps changing yields its slot after ANNOUNCE.repasses passes, to the back of the queue", async () => {
+    const g = gated(), [x, y] = await newSpaces(2);
+    let n = 0;
+    const reg = new Proxy(g.reg, { get: (t, k) => (k === "boardsIn" ? async (scope, ...a) => { const out = await t.boardsIn(scope, ...a); if (scope.id === x.id && ++n < 6) s.announceChange(acmeUnit, { type: "space", id: x.id }); return out; } : t[k]) });
+    const acmeUnit = { id: acme.id };
+    const s = spaceService({ registry: reg, tenancy: makeTenancy({ registry: reg }), announce: () => {} });
+    s.announceChange(acmeUnit, { type: "space", id: x.id });
+    s.announceChange(acmeUnit, { type: "space", id: y.id });
     await s.settled();
-    expect(maxLive).toBeLessThanOrEqual(ANNOUNCE.inflight);
-    expect(warns.filter(m => /too many in flight/.test(m)).length).toBeGreaterThan(0);
-    for (const sp of spaces) expect((await r.space(sp.id)).generalRole).toBe("editor");      // the change itself is never skipped
+    expect(n).toBe(6);                                                                              // x kept getting new work and still finished all of it
+    expect(g.starts.filter(id => id === x.id).length).toBe(6);
+    expect(g.starts.includes(y.id)).toBe(true);
+  });
+  test("no lost re-pass: a change landing at any microtask after the last publish still gets its pass", async () => {
+    const acmeUnit = { id: acme.id };
+    await r.createBoard({ tenant: acme.id, space: design.id });
+    for (let depth = 0; depth <= 14; depth++) {
+      let pagers = 0, first = true, svc2;
+      const reg = new Proxy(r, { get: (t, k) => (k === "boardsIn" ? (...a) => { pagers++; return t.boardsIn(...a); } : t[k]) });
+      const hop = n => (n <= 0 ? svc2.announceChange(acmeUnit, { type: "space", id: design.id }) : queueMicrotask(() => hop(n - 1)));
+      svc2 = spaceService({ registry: reg, tenancy: makeTenancy({ registry: reg }), announce: () => { if (first) { first = false; hop(depth); } } });
+      svc2.announceChange(acmeUnit, { type: "space", id: design.id });
+      await svc2.settled();
+      await tick();
+      expect([depth, pagers]).toEqual([depth, 2]);
+    }
   });
   test("a log.warn that throws inside the announcement is not an unhandled rejection", async () => {
     await mkBoards(2);

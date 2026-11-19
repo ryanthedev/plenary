@@ -11,6 +11,26 @@ const arg = (k, d) => { const i = process.argv.indexOf(k); return i > 0 ? proces
 const root = resolve(arg("--root", new URL("..", import.meta.url).pathname));
 const sizes = arg("--n", "1,100,1000,10000").split(",").map(Number), frames = +arg("--frames", 20), entryChars = +arg("--entry", 300), asJson = process.argv.includes("--json");
 const presence = process.argv.includes("--presence"), prefix = presence ? '{"t":"presence"' : '{"t":"entries"';   // bytes below = chars of the (ASCII) text: the sink does no work of its own
+if (process.argv.includes("--real-sockets")) {
+  const N = Math.min(100, +arg("--sockets", 100)), socks = [];
+  let recv = 0, want = 0, wake = null;
+  const server = Bun.serve({ port: 0, fetch(req, srv) { return srv.upgrade(req) ? undefined : new Response("x"); }, websocket: { open(ws) { socks.push(ws); ws.subscribe("b"); }, message() {} } });
+  const clients = await Promise.all(Array.from({ length: N }, () => new Promise(r => { const c = new WebSocket(`ws://127.0.0.1:${server.port}`); c.onopen = () => r(c); c.onmessage = () => { if (++recv >= want && wake) wake(); }; })));
+  await new Promise(r => setTimeout(r, 50));
+  const med = a => [...a].sort((x, y) => x - y)[a.length >> 1];
+  const trial = async (label, size, fn) => {
+    const loop = [], all = [];
+    for (let i = 0; i < 25; i++) { recv = 0; want = N; const p = new Promise(r => { wake = r; }); const t0 = performance.now(); fn(); loop.push(performance.now() - t0); await p; all.push(performance.now() - t0); }
+    console.log(JSON.stringify({ sockets: N, chars: size, mode: label, sendLoopUsPerSocket: +(med(loop.slice(5)) * 1000 / N).toFixed(2), untilAllReceivedUsPerSocket: +(med(all.slice(5)) * 1000 / N).toFixed(2) }));
+  };
+  for (const size of [300, 8000, 100000]) {
+    const text = '{"t":"entries","entries":[' + "x".repeat(size) + "]}";
+    await trial("ws.send(string)", size, () => { for (const ws of socks) ws.send(text); });
+    await trial("server.publish(topic,string)", size, () => { server.publish("b", text); });
+  }
+  for (const c of clients) c.close();
+  server.stop(true); process.exit(0);
+}
 const { gateway } = await import(`${root}/server/gateway.js`);
 const { memoryBus, subjects } = await import(`${root}/server/bus/memory.js`);
 

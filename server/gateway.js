@@ -349,11 +349,14 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     dropQueue(c);
     refuse(ws, "unavailable", "the server is busy: try again shortly", 1013, "over budget");
   }
-  /** Queue one of this connection's own frames (live traffic, an error) behind whatever it is already owed. */
-  function push(ws, data) {
+  /**
+   * Queue one of this connection's own frames (live traffic, an error) behind whatever it is already owed. A frame sent to many
+   * connections (a live `entries` frame, a presence batch, `here`, emotes) is measured once by its sender and passed as `len`:
+   * its UTF-8 length is a scan of the whole text, which at 10,000 viewers was the largest JS cost of a frame (PROTOCOL.md § Bus, Fan-out cost).
+   */
+  function push(ws, data, len = bytesOf(data)) {
     const c = ws.data;
     if (c.state !== "live") return;
-    const len = bytesOf(data);
     if (!admit(ws, len)) return;
     c.out.push({ data, len, shared: false }); c.outBytes += len;
     flush(ws);
@@ -448,12 +451,13 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
   const welcomedOn = b => [...b.conns].filter(ws => ws.data.state === "live" && ws.data.welcomed);
 
   function onLive(b, { from, to, data }) {
+    const len = bytesOf(data);   // once for the frame, not once per viewer
     for (const ws of b.conns) {
       const c = ws.data;
       if (c.state !== "live" || c.next === undefined || to < c.next) continue;
       // The feed hands every resolved entry once, in order, and a connection joins it at the feed's seq: no cut needed.
       if (from > c.next) { log.error("feed skipped entries for a connection", { conn: c.id, next: c.next, from }); cut(ws, "missed entries"); continue; }
-      push(ws, data); c.next = to + 1;
+      push(ws, data, len); c.next = to + 1;
     }
   }
 
@@ -804,15 +808,15 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
    */
   async function hereSend(b) {
     b.hSending = true; b.hOut = false; b.hSentAt = now();
-    const full = b.hText, count = b.hCountText, ver = b.hVer;
+    const full = b.hText, count = b.hCountText, ver = b.hVer, fullLen = bytesOf(full), countLen = bytesOf(count);
     try {
       let n = 0;
       for (const ws of b.conns) {
         if (++n % 256 === 0) await breathe();
         const c = ws.data;
         if (c.state !== "live" || !c.welcomed || c.outBytes > lim.maxConnQueuedBytes / 2) continue;   // a reader this far behind skips it (it may drop)
-        if (c.hVer === ver) push(ws, count);
-        else { push(ws, full); c.hVer = ver; }
+        if (c.hVer === ver) push(ws, count, countLen);
+        else { push(ws, full, fullLen); c.hVer = ver; }
       }
     } finally { b.hSending = false; }
   }
@@ -838,7 +842,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     try {
       for (const b of boards.values()) {
         if (!b.coalescer.size) continue;
-        const batch = b.coalescer.flush(), full = codec.encode({ t: "presence", batch });
+        const batch = b.coalescer.flush(), full = codec.encode({ t: "presence", batch }), fullLen = bytesOf(full);
         // Whose presence is in the batch, looked up once per connection: a mass close (thousands of `leave`s) must
         // not make this connections × batch (p2-tune: 2,000 leaves × 2,000 connections held the loop ~130 ms).
         const senders = new Set(batch.map(x => `${x.user}\n${x.client}`));
@@ -846,7 +850,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
           const c = ws.data;
           if (c.outBytes > lim.maxConnQueuedBytes / 2) continue;   // presence may drop: a reader this far behind skips it
           const mine = x => x.user === c.user && x.client === c.client;
-          if (!senders.has(`${c.user}\n${c.client}`)) { push(ws, full); continue; }
+          if (!senders.has(`${c.user}\n${c.client}`)) { push(ws, full, fullLen); continue; }
           const rest = batch.filter(x => !mine(x));
           if (rest.length) push(ws, codec.encode({ t: "presence", batch: rest }));
         }
@@ -870,7 +874,8 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
           if (win > w - 2) continue;
           b.sums.delete(win);
           const data = codec.encode({ t: "emotes", counts });
-          for (const ws of welcomedOn(b)) push(ws, data);
+          const len = bytesOf(data);
+          for (const ws of welcomedOn(b)) push(ws, data, len);
         }
       }
     } catch (err) { log.error("gateway: emote tick failed", { err }); }

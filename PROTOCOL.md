@@ -1576,6 +1576,16 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
     repaired like a lost message: Store poll for entries, the client's timeouts for replies.
 - Single node: an in-memory bus with the same contract. Cluster: NATS core.
 
+#### Fan-out cost (#66)
+
+What one live frame costs a gateway for N viewers, measured by `scripts/fanout-bench.js` (in-process: fake viewer sockets, stub Store, the in-memory Bus; no real sockets; `--root <checkout>` compares trees; a report, not a gate; run it `nice -n 19 timeout 60`, one process at a time). Findings an agent must keep true:
+
+- **Already encode-once** (before #66): the feed encodes a resolved run of entries once (`frameOf`), the gateway hands the same string to every connection's queue, and presence, `here` and emote frames are encoded once per board. Live frames are never compressed (deflate exists only for catch-up texts, § Joining): a per-connection compression context would cost O(viewers x frame) CPU and memory per frame; the shared catch-up deflate stays the only compression. Per-viewer state stays per viewer: `next` (resume seq, a gap cuts the connection), the queue and its budgets, `blocked` (waits for `drain`), and `presence`/`here` dropping for a reader over half its queue bound.
+- **Where the time went** (10,000 viewers, one 8,000-char entry per frame, stub sockets, before): 2.9 ms wall per frame, of which the per-viewer `Buffer.byteLength` of the same text was ~2 ms (a scan of the whole frame per connection, O(viewers x frame size)); the rest, ~0.1 us per viewer, is queue bookkeeping (`push`, `flush`, `observe`). A 300-char frame: ~1.0 ms, dominated by that bookkeeping.
+- **Change:** a frame sent to many connections is measured once by its sender and passed to `push(ws, data, len)` (`onLive`, the presence batch, `here`, emotes). After: 0.75-0.8 ms per frame at 10,000 viewers for the 8,000-char frame (about 3.7x), 0.75-0.8 ms for the 300-char frame (~1.3x); both ~0.08 us of JS per viewer. Presence tick at 10,000 viewers: ~1.3 ms of synchronous work per 50 ms. The count must stay UTF-8 bytes (the unit of `getBufferedAmount` and the budgets): `test/server/fanout.test.js` fails if it falls back to characters.
+- **Not in the JS path** (measured with 100 loopback sockets, server-side time around the send loop, Bun 1.4.4): the native `ws.send(string)` costs ~3 us per socket for 300 to 8,000 chars and ~12 us for 100,000 chars, 10 to 30 times the whole JS cost above. That is the real per-viewer floor on one core; more viewers per gateway means more gateways or Bun's multi-core sharing, not more JS tuning. `server.publish(topic, text)` (uWS pub/sub) was not faster end to end and would bypass the per-connection queue, budgets and `next` check, so it is not used.
+- Numbers are one machine under load (other agents running); compare with `--root` on the same machine in the same minute.
+
 ### Blobs
 
 - `put(tenant, sha1, bytes) → boolean` (true: stored now; false: the tenant already had it), `get(tenant, sha1) → bytes | null`,

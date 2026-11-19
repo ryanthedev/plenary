@@ -48,6 +48,9 @@
     "node, roles, port: Number(env.PORT), leaseTtlMs: Number(env.PLENARY_LEASE_TTL_MS), databaseUrl: env.DATABASE_URL,",
     "natsUrl: env.NATS_URL, dataDir: env.PLENARY_DATA_DIR, maxConnsPerUser: Number(env.PLENARY_MAX_CONNS_PER_USER),"
   ],
+  "test/server/request-deadline.test.js": [
+    "const cluster = () => ({ ...base(), DATABASE_URL: \"postgres://u:pw@127.0.0.1:1/p\", NATS_URL: \"nats://127.0.0.1:1\", COOKIE_KEY: \"k\".repeat(32), PLENARY_BLOBS: \"local-disk\" });"
+  ],
   "test/server/room-host-child.js": [
     "const store = await postgresStore({ url: process.env.DATABASE_URL, schema, max: 3 });",
     "const bus = await natsBus({ url: process.env.NATS_URL, cluster: null });"

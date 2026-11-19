@@ -773,13 +773,13 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       if (!key(user) || !key(k) || !key(fp)) throw new Error("registry: bad idempotency key");
       const t = now();
       if (++idemCalls % IDEM.every === 0) {   // best effort, bounded: a failed prune never fails a claim
-        db.unsafe(`DELETE FROM ${ID} WHERE ctid IN (SELECT ctid FROM ${ID} WHERE (result IS NULL AND at < $1) OR (result IS NOT NULL AND at < $2) LIMIT $3)`,
+        db.unsafe(`DELETE FROM ${ID} WHERE ctid IN (SELECT ctid FROM ${ID} WHERE (result IS NULL AND at <= $1) OR (result IS NOT NULL AND at <= $2) LIMIT $3)`,
           [t - IDEM.claimMs, t - IDEM.ttlMs, IDEM.prune]).catch(() => {});
       }
       // ONE statement: insert the claim, or take over an expired row; no row back = a live one is there.
       const won = await write(tx => tx.unsafe(`INSERT INTO ${ID} (member, k, fp, result, at) VALUES ($1, $2, $3, NULL, $4)
         ON CONFLICT (member, k) DO UPDATE SET fp = excluded.fp, result = NULL, at = excluded.at
-        WHERE (${ID}.result IS NULL AND ${ID}.at < $5) OR (${ID}.result IS NOT NULL AND ${ID}.at < $6) RETURNING 1 AS x`,
+        WHERE (${ID}.result IS NULL AND ${ID}.at <= $5) OR (${ID}.result IS NOT NULL AND ${ID}.at <= $6) RETURNING 1 AS x`,
       [user, k, fp, t, t - IDEM.claimMs, t - IDEM.ttlMs]));
       if (won.length) return { state: "new" };
       const e = (await db.unsafe(`SELECT fp, result FROM ${ID} WHERE member = $1 AND k = $2`, [user, k]))[0];

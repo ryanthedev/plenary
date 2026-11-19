@@ -226,7 +226,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     idemPut: db.query("INSERT OR REPLACE INTO reg_idempotency (member, k, fp, result, at) VALUES (?, ?, ?, NULL, ?)"),
     idemFin: db.query("UPDATE reg_idempotency SET result = ?, at = ? WHERE member = ? AND k = ? AND fp = ?"),
     idemDel: db.query("DELETE FROM reg_idempotency WHERE member = ? AND k = ? AND fp = ? AND result IS NULL"),
-    idemPrune: db.query("DELETE FROM reg_idempotency WHERE rowid IN (SELECT rowid FROM reg_idempotency WHERE (result IS NULL AND at < ?1) OR (result IS NOT NULL AND at < ?2) LIMIT ?3)"),
+    idemPrune: db.query("DELETE FROM reg_idempotency WHERE rowid IN (SELECT rowid FROM reg_idempotency WHERE (result IS NULL AND at <= ?1) OR (result IS NOT NULL AND at <= ?2) LIMIT ?3)"),
     upStar: db.query("INSERT INTO reg_stars (member, board, at) VALUES (?, ?, ?) ON CONFLICT (member, board) DO NOTHING"),
     delStar: db.query("DELETE FROM reg_stars WHERE member = ? AND board = ?"),
     stars: db.query("SELECT board, at FROM reg_stars WHERE member = ? ORDER BY at DESC, board DESC LIMIT ?"),

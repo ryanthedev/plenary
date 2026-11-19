@@ -202,16 +202,16 @@ test("#92 MED-4: a superseded usage read is ignored when it answers", async () =
 
 test("#92 MED-4: two overlapping usage reads with a put during each, resolving in either order and the late put landing before or after: no quota check ever sees a count below the true stored bytes", async () => {
   for (const order of [[1, 2], [2, 1]]) for (const lateFirst of [true, false]) {
-    let holdPuts = [], holdReads = [];
+    const holdPuts = new Map(); let holdReads = [];            // puts are held by picture (their arrival order at the adapter varies), reads by call order
     const { access, inner } = make({ quotaBytes: 350, wrap: {
-      put: async (...a) => { const g = holdPuts.shift(); if (g) await g.promise; return inner.put(...a); },
+      put: async (...a) => { const g = holdPuts.get(a[1]); if (g) await g.promise; return inner.put(...a); },
       usage: async (...a) => { const n = await inner.usage(...a); const g = holdReads.shift(); if (g) await g.promise; return n; },   // the answer is fixed when asked, delivered when released
     } });
     const pic = k => fakePng(100, 60 + k), put = async k => access.put(await putUrl(access, "t1", pic(k)), pic(k));
     const tick = () => new Promise(r => setTimeout(r, 4));
     expect((await put(0)).ok).toBe(true);                       // S: 100 stored (the first read, unheld)
     const g1 = deferred(), g1b = deferred(), r1 = deferred(), r2 = deferred();
-    holdPuts = [g1, g1b];
+    holdPuts.set(sha1(pic(1)), g1); holdPuts.set(sha1(pic(2)), g1b);
     const p1 = put(1), p1b = put(2);                            // both past the seed, held before their bytes are stored
     await tick();
     holdReads = [r1, r2];

@@ -22,6 +22,12 @@ test("H1: test-cluster starts the rig services-only, never a node or the LB", ()
   expect(up).not.toMatch(/--gateways|--hosts/);
 });
 
+test("the script runs the gated list the guard checks: it imports DEFAULT_FILES from test-cluster-files.js, defines none, and FILES falls back to it", () => {
+  expect(SCRIPT).toContain('import { DEFAULT_FILES } from "./test-cluster-files.js";');
+  expect(SCRIPT.match(/\bDEFAULT_FILES\s*=/g)).toBeNull();
+  expect(SCRIPT).toMatch(/const FILES = process\.argv\.length > 2 \? process\.argv\.slice\(2\) : DEFAULT_FILES;/);
+});
+
 test("the bun test spawn preloads test/preload.js by path (its cwd is the rig dir, where bunfig.toml is not found)", () => {
   const spawn = SCRIPT.match(/Bun\.spawn\(\[BUN[^\]]*\]/)?.[0] ?? "";
   expect(spawn).toMatch(/"test"/);
@@ -126,8 +132,6 @@ test("L6b/L12/L17/L18: the scan catches every read form, in every test suffix, i
     writeFileSync(join(root, "test/a/spawned.test.js"), "const f = join(import.meta.dir, `helper.js`);");
     writeFileSync(join(root, "test/a/ok.test.js"), 'import "./helper.js";');
     writeFileSync(join(root, "test/a/lookalike.test.js"), 'import "./helper-ts.ts"; import "./my-helper.js"; const helper = 1;');   // another file, and a bare word
-    // L6: a file dropped from the list is not covered by a path quoted elsewhere (the list is an array, never scraped text)
-    expect(DEFAULT_FILES.slice(1).sort()).not.toEqual(gatedFiles(ROOT));
     expect(orphans(root, ["test/a/ok.test.js"], helper).sort()).toEqual(["test/a/extless.test.js", "test/a/importer.test.js", "test/a/spawned.test.js"]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

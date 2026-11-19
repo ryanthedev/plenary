@@ -205,6 +205,25 @@ test("comments drawer lists open and resolved threads; notes drawer shows author
   collab.destroy();
 });
 
+test("focus survives a drawer rebuild: a focused thread row is found again after the list changes", () => {
+  const { port, collab } = setup("annotator");
+  port.here({ writers: [{ user: "pri", name: "Priya", role: "annotator" }], writerCount: 1, viewers: 0 });
+  port.remote({ do: "thread", id: "t1", anchor: { point: { x: 1, y: 1 } }, text: "first one" }, "pri", "Priya");
+  const d = collab.parts.drawer, doc = globalThis.document, body = {};
+  collab.showDrawer("comments");
+  doc.body = body; const orig = Object.getPrototypeOf(d).focus;
+  Object.getPrototypeOf(d).focus = function () { doc.activeElement = this; };
+  try {
+    const row = byClass(d, "thread-row")[0]; doc.activeElement = row;
+    port.remote({ do: "thread", id: "t2", anchor: { point: { x: 2, y: 2 } }, text: "second one" }, "pri", "Priya");   // the list is rebuilt
+    const rows = byClass(d, "thread-row");
+    expect(rows.length).toBe(2);
+    const now = doc.activeElement;
+    expect(rows.includes(now)).toBe(true);                         // focus is on a row of the new list, not lost
+    expect(now.textContent).toContain("first one");                // the same thread's row
+  } finally { Object.getPrototypeOf(d).focus = orig; collab.destroy(); }
+});
+
 test("presence in: cursors are drawn on the overlay with names; going offline clears them", () => {
   const { port, collab, clock } = setup("viewer");
   port.here({ writers: [{ user: "maya", name: "Maya", role: "owner" }, { user: "pri", name: "Priya", role: "annotator" }], writerCount: 2, viewers: 1 });

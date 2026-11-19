@@ -525,6 +525,15 @@ test("V5 style chip with nothing selected (Editor.style only) shows", () => {
   expect(chip().className).toContain("on");
 });
 
+test("focus survives a chrome rebuild: a panel chip keeps focus after it is activated and the panel is redrawn", () => {
+  rig = setup(); const { S, step } = rig;
+  S.act("board", e => e.select([])); step(20);
+  const chip = () => find(page.byId.panel, e => e.attrs?.title === "strokeWidth 4");
+  const before = chip(); before.focus(); before.click(); step(20);
+  expect(chip()).not.toBe(before);                                       // the panel was rebuilt
+  expect(page.doc.activeElement).toBe(chip());                           // and focus is on the new chip, not lost
+});
+
 test("V6 remote layer add / rename and a shape on it: panel layers", () => {
   rig = setup(); const { bo, step, app } = rig;
   app.setPanel({ type: "noop" }); step(20);

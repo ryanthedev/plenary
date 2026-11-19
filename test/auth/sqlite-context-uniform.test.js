@@ -22,6 +22,10 @@ test("accessContext(s): same statement count for existing, unknown and other-typ
     const sp = await r.createSpace({ tenant: t.id, name: "S", group: g.id, owner: "dev:a" });
     const sp2 = await r.createSpace({ tenant: t.id, name: "S2", group: g.id, owner: "dev:a" });
     const b = await r.createBoard({ tenant: t.id, title: "B", space: sp.id });
+    // Team grants on every real scope: the team-members read has work to do for them, and must still run for an unknown id.
+    const team = await r.createTeam({ tenant: t.id, name: "Crew" });
+    for (const scope of [{ type: "unit", id: t.id }, { type: "group", id: g.id }, { type: "space", id: sp.id }, { type: "space", id: sp2.id }, { type: "board", id: b.id }])
+      await r.setScopedGrant({ scope, subject: { type: "team", id: team.id }, role: "viewer" });
     const cost = async scope => { count = 0; await r.accessContext(scope, { users: ["dev:a"] }); return count; };
     for (const [type, real] of [["space", sp.id], ["group", g.id], ["board", b.id], ["unit", t.id]]) {
       const known = await cost({ type, id: real }), unknown = await cost({ type, id: "x-nope" });

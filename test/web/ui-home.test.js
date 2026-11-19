@@ -54,6 +54,51 @@ test("New group is offered only when the server says can.createGroup, and opens 
   expect(dialogCalls).toEqual([["group", ng]]);
 });
 
+// Focus survives a redraw: every control that can hold focus has a stable key, and the redraw puts focus back on its twin.
+describe_focus();
+function describe_focus() {
+  let focused, doc, body;
+  const fk = el => el?.getAttribute("data-fk");
+  const withFocus = async fn => {
+    await mount();
+    doc = globalThis.document; body = {}; doc.body = body; doc.activeElement = body; focused = [];
+    const orig = FakeElement.prototype.focus;
+    FakeElement.prototype.focus = function () { focused.push(this); doc.activeElement = this; };
+    try { await fn(); } finally { FakeElement.prototype.focus = orig; }
+  };
+  const byKey = k => root.findAll(e => fk(e) === k)[0];
+  test("activating a star keeps focus on that star after the redraw", () => withFocus(async () => {
+    const st = byKey("star:Recent:a"); doc.activeElement = st;
+    st.click(); await settle();
+    expect(api.stars).toEqual([["a", true]]);
+    expect(fk(focused.at(-1))).toBe("star:Recent:a");
+    expect(root.findAll(e => e === focused.at(-1)).length).toBe(1);                                  // and it is the live one in the page
+  }));
+  test("activating the Starred nav keeps focus on the Starred nav", () => withFocus(async () => {
+    const nav = byKey("nav:starred"); doc.activeElement = nav;
+    nav.click(); await settle();
+    expect(fk(focused.at(-1))).toBe("nav:starred");
+    expect(textOf(root.find(e => e.tagName === "H1"))).toBe("Starred");
+  }));
+  test("a reload, a notice and a search result each leave focus where it was (or on the nearest sibling)", () => withFocus(async () => {
+    doc.activeElement = byKey("nav:shared"); await model.load(); await settle();
+    expect(fk(focused.at(-1))).toBe("nav:shared");
+    doc.activeElement = byKey("card:Recent:a"); model.notify("Could not star that."); await settle();
+    expect(fk(focused.at(-1))).toBe("card:Recent:a");
+    expect(byKey("dismiss")).toBeDefined();
+    // a search replaces the lists: the focused card is gone, so focus goes to the same kind of control, else the heading, never the body
+    doc.activeElement = byKey("card:Recent:a");
+    model.setQuery("r1"); await settle(); await settle();
+    const now = fk(focused.at(-1));
+    expect(now === "heading" || now.startsWith("card:")).toBe(true);
+  }));
+  test("a control that was never marked is not refocused (an input keeps its own focus)", () => withFocus(async () => {
+    const input = root.find(e => e.tagName === "INPUT"); doc.activeElement = input; const n = focused.length;
+    model.notify("hello"); await settle();
+    expect(focused.length).toBe(n);
+  }));
+}
+
 test("star buttons are labelled and pressed-state is exposed; clicking toggles through the port", async () => {
   await mount();
   const star = buttons().find(b => b.getAttribute("aria-label") === "Star A");

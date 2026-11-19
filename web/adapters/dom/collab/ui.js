@@ -27,6 +27,7 @@
 //   collab.setTheme(theme) · collab.destroy()
 //   collab.setBottomInset(px)  reserve the visible bottom-sheet / dock area when positioning comment popovers
 
+import { captureFocus, restoreFocus } from "../focus.js";
 import { h, replace } from "./dom.js";
 import { EMOTES, PRESENCE, canWrite } from "../../../core/collab/limits.js";
 import { FLAGS } from "../../../core/collab/flags.js";
@@ -280,12 +281,14 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     }
     // Rebuild the head and messages only when what they show changed (a click mid-rebuild is lost).
     if (changed("pop", JSON.stringify([t, S.reactFor, port.role, Math.floor(C.now() / 30_000)]))) {
+      const held = captureFocus([pop.head, pop.body]);       // a Resolve or reaction button that was just used keeps focus
       replace(pop.head,
         t.resolved ? [h("span", {}, "✓"), h("b", {}, `Resolved by ${t.resolved.name ?? "someone"}`)] : h("span.anchor", {}, anchorText(t)),
         h("span.spacer"),
         t.canResolve ? h("button.btn", { disabled: t.statePending, onclick: () => recordOp(t.resolved ? "reopen" : "resolve", { do: t.resolved ? "reopen" : "resolve", id: t.id }) }, t.resolved ? "Reopen" : "✓ Resolve") : null,
         h("button.tb", { title: "Close", onclick: () => openThread(null) }, "✕"));
       replace(pop.body, t.resolved || t.detached ? h("div.anchor.muted", {}, anchorText(t)) : null, t.comments.map(c => message(t, c)));
+      restoreFocus(held);
       pop.foot.hidden = !t.canReply;
       pop.readFoot.hidden = t.canReply;
       replace(pop.readFoot, port.role === "viewer" ? "Viewers read comments; they can't reply or react." : "Read-only: you can't reply or react.");
@@ -335,6 +338,8 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
   // A cluster's own list (listThreads): only its threads, until "Show all" or a list tab.
   const onlyText = h("span"), onlyBar = h("div.collab-only", { hidden: true }, onlyText, " ", h("button", { onclick: () => { S.only = null; renderDrawer(); } }, "Show all"));
   const scroller = h("div.notes-list");
+  /** Rebuild the drawer rows, keeping focus on the control that had it (a row, a jump / edit / delete button). */
+  const swapRows = (...kids) => { const held = captureFocus([scroller]); replace(scroller, ...kids); restoreFocus(held); };
   parts.drawer.append(h("header", {}, h("h3", {}, "Annotations"), h("span.seg", {}, tabNotes, tabComments)), listTabs, onlyBar, scroller);
   const label = (el, text, on) => { if (el.textContent !== text) replace(el, text); el.classList.toggle("on", on); };
   // The notes rows are built only while the notes tab shows (C-7); the comments tab's "Notes N" label is a count
@@ -353,7 +358,7 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     if (S.drawer === "notes") {
       sigs.drawerRev = null;     // the comments rows must be rebuilt on the way back
       if (!changed("drawer", JSON.stringify(["notes", nv]))) return;
-      replace(scroller, nv.rows.length ? nv.rows.map(n => h("div.note-row", { "data-note": n.id },
+      swapRows(nv.rows.length ? nv.rows.map(n => h("div.note-row", { "data-note": n.id },
         h("span.sw", { style: { background: safeColor(n.color), width: "10px", height: "10px" } }),
         h("div.txt", {}, h("div", {}, n.text),
           h("div.meta", {}, h("span.author", { style: { color: n.by ? colorOf(n.by) : "var(--muted)" } }, n.author), n.kind === "highlight" ? h("span", {}, "highlight") : null),
@@ -371,7 +376,7 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
       if (sigs.drawerRev === `${which}|${S.open}|${rvRev}`) return;
       sigs.drawerRev = `${which}|${S.open}|${rvRev}`;
       if (!changed("drawer", JSON.stringify(["comments", which, S.open, list.map(t => [t.id, t.name, t.count, t.pending, t.detached, t.point, t.comments.find(c => !c.deleted)?.text])]))) return;
-      replace(scroller, list.length ? list.map(t => {
+      swapRows(list.length ? list.map(t => {
         const first = t.comments.find(c => !c.deleted);
         const go = () => { openThread(t.id); port.jumpTo?.({ x: t.x, y: t.y }); };
         return h(`div.note-row.thread-row${t.resolved ? ".done" : ""}${S.open === t.id ? ".on" : ""}`, { "data-thread": t.id, role: "button", tabindex: "0",

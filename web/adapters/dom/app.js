@@ -3,6 +3,7 @@
 // keeps UI preferences in the storage port it is given. Every write goes through session.act/setTool/key; nothing
 // here touches the protocol, a transport or sign-in (web/main.js, the composition root, wires those).
 
+import { captureFocus, restoreFocus } from "./focus.js";
 import { Editor } from "../../../packages/core/editor.js";
 import { parsePanel, serializePanel, applyPanel, panelLayout, dragWidth } from "../../../packages/core/panel.js";
 import { isMermaid } from "../../../packages/core/mermaid.js";
@@ -515,6 +516,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const a = h("a", { href: URL.createObjectURL(blob), download: name }); document.body.append(a); a.click(); a.remove();
     clock.set(() => URL.revokeObjectURL(a.href), 5000);
   }
+  // A dialog control that changes what the dialog shows (a format chip) rebuilds the dialog: remember which control had focus so chrome() puts it back.
+  function rebuildDialog(d) { pendingFocus = captureFocus(chromeRoots()); d.replaceChildren(); chromeDirty = true; }
   function dialogs() {
     const d = $("#dialogs"), may = S.may();
     if (document.activeElement?.closest?.("#dialogs") && d.firstChild) return;   // don't rebuild under the cursor
@@ -526,7 +529,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       replace(d, h("div.dialog-veil", { onclick: e => { if (e.target === e.currentTarget) close(); } }, h("div.dialog", { role: "dialog", "aria-label": "Insert a Mermaid flowchart" },
         h("h2", {}, "◇→ Insert a Mermaid flowchart", h("span.spacer"), h("button.tb", { onclick: close, title: "Close" }, "✕")),
         h("div.dbody", {}, h("div.cols", {}, ta, h("div.preview", {}, cv)),
-          h("div.row", {}, h("span.lab", {}, "Arrows"), h("span.opts", {}, chip("╱ straight", !ui.mermaid.elbow, () => { ui.mermaid.elbow = false; ui.dialog = "mermaid"; d.replaceChildren(); chromeDirty = true; }), chip("┐ elbow", ui.mermaid.elbow, () => { ui.mermaid.elbow = true; d.replaceChildren(); chromeDirty = true; }))),
+          h("div.row", {}, h("span.lab", {}, "Arrows"), h("span.opts", {}, chip("╱ straight", !ui.mermaid.elbow, () => { ui.mermaid.elbow = false; ui.dialog = "mermaid"; rebuildDialog(d); }), chip("┐ elbow", ui.mermaid.elbow, () => { ui.mermaid.elbow = true; rebuildDialog(d); }))),
           h("div.hint", {}, "Flowcharts only (graph / flowchart, TD TB BT LR RL, subgraphs become frames). Pasting Mermaid text on the board does the same.")),
         h("footer", {}, h("button.btn", { onclick: close }, "Cancel"), h("button.btn.primary", { disabled: !may, onclick: () => {
           let err = null;
@@ -535,7 +538,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         } }, "Insert as shapes")))));
       mermaidPreview(cv);
     } else if (ui.dialog === "export" && S.role === "presenter") {
-      const cv = h("canvas"), x = ui.export, set = (k, v) => { x[k] = v; d.replaceChildren(); chromeDirty = true; };
+      const cv = h("canvas"), x = ui.export, set = (k, v) => { x[k] = v; rebuildDialog(d); };
       replace(d, h("div.dialog-veil", { onclick: e => { if (e.target === e.currentTarget) close(); } }, h("div.dialog", { style: { width: "min(520px,100%)" }, role: "dialog", "aria-label": "Export the board" },
         h("h2", {}, "⤓ Export the board", h("span.spacer"), h("button.tb", { onclick: close, title: "Close" }, "✕")),
         h("div.dbody", {}, h("div.preview", { style: { minHeight: "120px" } }, cv),
@@ -660,6 +663,9 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     replace(drawer, h("header", {}, h("h3", {}, "Annotations"), drawerTabs("drawer"), h("button.tb", { title: "Close", onclick: () => { ui.drawer = null; chromeDirty = true; } }, "✕")), drawerBody(ui.drawer));
     return true;
   }
+  // Focus across a rebuild of the chrome: wherever it was inside a rebuilt root, it goes back to that control's twin (by label, title, text or position).
+  let pendingFocus = null;
+  const chromeRoots = () => ["#topbar", "#panel", "#drawer", "#timeline", "#hudBL", "#hudBC", "#hudBR", "#dock", "#sheet", "#dialogs", "#overlays"].map(sel => $(sel)).filter(Boolean);
   function chrome() {
     inPlace();
     document.body.classList.toggle("stale", S.status !== "live");
@@ -673,12 +679,15 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if ((S.gesture || !chromeDirty) && now - chromeAt < CHROME_MS) return;   // mid-drag, playback, incoming ops: a few times a second at most
     const env = envKey(), force = chromeDirty || env !== keys.env;
     chromeDirty = false; gateKey = gate; chromeAt = now; keys.env = env;
+    const held = pendingFocus ?? captureFocus(chromeRoots());
+    pendingFocus = null;
     for (const [name, part] of Object.entries(parts)) {
       const k = part.key();
       if (!force && k === keys[name]) continue;
       if (part.build() === false) { keys[name] = undefined; continue; }   // busy: try again later
       keys[name] = k; rebuilds[name]++;
     }
+    restoreFocus(held);
     if (collab && isPhone()) {
       const canvasRect = canvas.getBoundingClientRect();
       const overlays = [$("#sheet"), $("#dock")];

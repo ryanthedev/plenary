@@ -4,6 +4,7 @@
 // layout is one column that works at 390 and 1280 px. Visuals are plain on purpose (#56 restyles); structure follows design/orgs/mock.html.
 
 import { h, replace } from "./dom.js";
+import { keeper } from "./focus.js";
 import { generalText, spaceEmpty, groupEmpty } from "../../core/spaces.js";
 
 /**
@@ -98,28 +99,6 @@ function inlineEditor({ editing, session, text, label, onSave, onCancel }) {
   return el;
 }
 
-/**
- * Keeps controls alive across renders and focus where it was. `keep(key, make)` hands back the same element every render (so a click that
- * began on it before a re-render still lands, and an open menu stays open); `mark(el, key)` labels what may hold focus. `around(fn)` runs a
- * render and puts focus back on the marked element that had it (a rebuilt link or the moved button), so a Tab-out of a rename that saved
- * never drops focus to the body.
- */
-function keeper() {
-  const kept = new Map(), marks = new Map(); let used = new Set();
-  const fk = () => globalThis.document?.activeElement?.getAttribute?.("data-fk") ?? null;
-  return {
-    keep(key, make) { let v = kept.get(key); if (!v) kept.set(key, v = make()); used.add(key); return v; },
-    mark(el, key) { el.setAttribute("data-fk", key); marks.set(key, el); return el; },
-    around(fn) {
-      const had = fk(), prev = globalThis.document?.activeElement ?? null; used = new Set(); marks.clear();
-      fn();
-      for (const k of [...kept.keys()]) if (!used.has(k)) kept.delete(k);
-      if (had) marks.get(had)?.focus?.();
-      else if (prev?.isConnected && globalThis.document?.activeElement !== prev) prev.focus?.();       // an unmarked element that was moved (an open menu's item)     // a no-op when it still holds focus; the caller's own end-of-edit focus runs after this
-    },
-  };
-}
-
 /** What to focus once the next render is in the page (a rename ended: the title, or the card's link). */
 const afterRender = () => { let fn = null; return { set: f => { fn = f; }, run: () => { const f = fn; fn = null; f?.(); } }; };
 
@@ -185,7 +164,7 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null }) {
     if (menu) { menu.update(menuCfg); keys.mark(menu.button, "space-options"); }
     const input = inlineEditor({ editing: editing?.type === "title", session: title, text: sp.name, label: "Space name",
       onSave: (v, moved) => model.rename(v).then(ok => { if (ok) end(moved ? null : focusTitle); else render(); }), onCancel: () => end(focusTitle) });
-    h1 = h("h1", { id: "page-title", tabindex: "-1" }, input ?? sp.name);
+    h1 = keys.mark(h("h1", { id: "page-title", tabindex: "-1" }, input ?? sp.name), "heading");
     const head = h("div.sp-head", {}, h1,
       h("span.badge", {}, sp.personal ? "Personal · only you" : "Space"), h("span.spacer"), newBoard, menu?.el);
     const sub = h("p.sub-h", {}, sp.personal ? "Only you can see what's here until you share it." : generalText(sp.general));
@@ -212,10 +191,21 @@ export function mountGroupPage({ root, model, dialogs, hrefs, signIn = null }) {
     showNotice(status, model);
     if (gate(S, main, () => model.load(), signIn)) return;
     // Only the in-flight flag changed: update the one control that shows it, rebuild nothing (focus and clicks stay where they are).
-    if (S.busy && shown && shown.page === S.page && shown.editing === editing) { if (moreBtn) moreBtn.disabled = true; return; }
+    if (S.busy && shown && shown.page === S.page && shown.editing === editing) { moreBtn?.setAttribute("aria-disabled", "true"); return; }
     shown = { page: S.page, editing };
     keys.around(draw);
     after.run();
+  }
+  /** Load the next page, then move focus to the first Space that arrived (the last one when it was the final page). */
+  function showMore() {
+    if (S.busy || !S.page?.next) return;
+    const before = S.page.spaces.length;
+    after.set(() => {
+      const ids = S.page.spaces.map(s => `space-link:${s.id}`);
+      if (S.page.spaces.length <= before) return;                       // the load failed: focus stays on the button
+      keys.focusKey(ids[S.page.next ? before : ids.length - 1]);
+    });
+    model.loadMore();
   }
   function draw() {
     const p = S.page, g = p.group;
@@ -229,14 +219,15 @@ export function mountGroupPage({ root, model, dialogs, hrefs, signIn = null }) {
     if (menu) { menu.update(menuCfg); keys.mark(menu.button, "group-options"); }
     const input = inlineEditor({ editing, session: title, text: g.name, label: "Group name",
       onSave: (v, moved) => model.rename(v).then(ok => { if (ok) end(moved); else render(); }), onCancel: end });
-    h1 = h("h1", { id: "page-title", tabindex: "-1" }, input ?? g.name);
+    h1 = keys.mark(h("h1", { id: "page-title", tabindex: "-1" }, input ?? g.name), "heading");
     const head = h("div.sp-head", {}, h1, h("span.badge", {}, "Group"), h("span.spacer"), newSpace, menu?.el);
     const empty = groupEmpty(p, g.name);
     replace(main, h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " /"), head, h("p.sub-h", {}, generalText(g.general)),
       p.spaces.length ? h("ul.cards", { "aria-label": `Spaces in ${g.name}` }, p.spaces.map(s => h("li.card", {},
-        h("a.card-open", { href: hrefs.space(s.id) }, h("span.t", {}, s.name), h("span.p", {}, generalText(s.general))))))
+        keys.mark(h("a.card-open", { href: hrefs.space(s.id) }, h("span.t", {}, s.name), h("span.p", {}, generalText(s.general))), `space-link:${s.id}`))))
         : message(empty.title, empty.detail),
-      (moreBtn = p.next ? keys.mark(h("button.btn", { type: "button", disabled: S.busy, onclick: () => model.loadMore() }, "Show more Spaces"), "show-more") : null));
+      // aria-disabled, not disabled: disabling a focused button would blur it. Clicks are ignored while a page is loading.
+      (moreBtn = p.next ? keys.mark(h("button.btn", { type: "button", "aria-disabled": S.busy ? "true" : "false", onclick: showMore }, "Show more Spaces"), "show-more") : null));
   }
   const unsub = model.subscribe(render);
   render();

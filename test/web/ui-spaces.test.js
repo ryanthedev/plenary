@@ -399,6 +399,65 @@ test("card rename: Tab to that card's ⋯ keeps the button; a mousedown on ⋯ a
   expect(textOf(root.find(e => e.tagName === "H1"))).toBe("Mouse");
 });
 
+const trackFocus = () => { const doc = globalThis.document, body = {}; doc.body = body; doc.activeElement = body; FakeElement.prototype.focus = function () { focused.push(this); doc.activeElement = this; }; return doc; };
+const fk = el => el?.getAttribute("data-fk");
+
+let nextPage = "s-9";
+test("Show more Spaces: the button stays focusable while loading (aria-disabled, clicks ignored), then focus moves to the first new Space", async () => {
+  api.pages.group = GP({ next: "s-2" });
+  const model = createPageModel({ api, kind: "group", id: "g-1" });
+  mountGroupPage({ root, model, dialogs: dialogsFor(), hrefs }); await model.load();
+  const doc = trackFocus();
+  let finish; const gate = new Promise(res => { finish = res; });
+  const orig = api.answer;
+  api.answer = (name, ...a) => (name === "group" && a[1] ? gate.then(() => ({ page: GP({ spaces: [{ id: "s-3", name: "New one", general: null }, { id: "s-4", name: "Newer", general: null }], next: nextPage }) })) : orig(name, ...a));
+  const more = btn("Show more Spaces"); doc.activeElement = more;
+  more.click();
+  expect(more.getAttribute("aria-disabled")).toBe("true");                                          // not `disabled`: a disabled button would lose focus
+  expect(more.disabled).toBeFalsy();
+  more.click(); more.click();
+  expect(calls.filter(c => c[0] === "group" && c[2] === "s-2").length).toBe(1);                      // clicks while busy are ignored
+  expect(doc.activeElement).toBe(more);
+  finish(); await settle(); await settle();
+  expect(fk(doc.activeElement)).toBe("space-link:s-3");                                              // the first Space that arrived (the page had 2: s-1, s-2)
+  expect(btn("Show more Spaces")).toBeDefined();                                                     // another page remains
+});
+
+test("Show more Spaces on the final page: focus goes to the last Space link", async () => {
+  nextPage = null;
+  api.pages.group = GP({ next: "s-2" });
+  const model = createPageModel({ api, kind: "group", id: "g-1" });
+  mountGroupPage({ root, model, dialogs: dialogsFor(), hrefs }); await model.load();
+  const doc = trackFocus();
+  const orig = api.answer; api.answer = (name, ...a) => (name === "group" && a[1] ? { page: GP({ spaces: [{ id: "s-3", name: "A", general: null }, { id: "s-4", name: "B", general: null }], next: null }) } : orig(name, ...a));
+  const more = btn("Show more Spaces"); doc.activeElement = more; more.click(); await settle(); await settle();
+  expect(fk(doc.activeElement)).toBe("space-link:s-4");
+  nextPage = "s-9";
+});
+
+test("a failed Show more leaves focus on the button", async () => {
+  api.pages.group = GP({ next: "s-2" });
+  const model = createPageModel({ api, kind: "group", id: "g-1" });
+  mountGroupPage({ root, model, dialogs: dialogsFor(), hrefs }); await model.load();
+  const doc = trackFocus();
+  const orig = api.answer; api.answer = (name, ...a) => (name === "group" && a[1] ? { error: "unavailable" } : orig(name, ...a));
+  const more = btn("Show more Spaces"); doc.activeElement = more; more.click(); await settle(); await settle();
+  expect(fk(doc.activeElement)).toBe("show-more");
+});
+
+test("when the focused card disappears on reload, focus goes to the next card, then the previous, then the heading", async () => {
+  const mk = ids => SP({ boards: ids.map(id => ({ id, title: id, role: "editor", path: [], starred: false, can: { rename: true } })) });
+  const { model } = await spacePage(mk(["b-1", "b-2", "b-3"]));
+  const doc = trackFocus();
+  const key = id => root.findAll(e => fk(e) === `card-link:${id}`)[0];
+  doc.activeElement = key("b-2"); api.pages.space = mk(["b-1", "b-3"]); await model.load();
+  expect(fk(doc.activeElement)).toBe("card-link:b-3");                                               // the next card
+  doc.activeElement = key("b-3"); api.pages.space = mk(["b-1"]); await model.load();
+  expect(fk(doc.activeElement)).toBe("card-link:b-1");                                               // no next: the previous
+  doc.activeElement = key("b-1"); api.pages.space = mk([]); await model.load();
+  expect(fk(doc.activeElement)).toBe("heading");                                                     // no cards: the page title
+});
+
 test("the busy re-render keeps the typed text in the card editor (no flash of the old title)", async () => {
   await spacePage();
   let release; api.answer = (n, id, t) => (n === "renameBoard" ? new Promise(r => { release = () => r({ board: { id, title: t } }); }) : undefined);

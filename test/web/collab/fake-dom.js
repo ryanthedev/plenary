@@ -36,6 +36,7 @@ export class FakeElement extends FakeNode {
   all() { return [this, ...this.childNodes.filter(n => n.nodeType === 1).flatMap(c => c.all())]; }
   find(pred) { return this.all().find(pred); }
   findAll(pred) { return this.all().filter(pred); }
+  contains(n) { for (let x = n; x; x = x.parentNode) if (x === this) return true; return false; }
   hasClass(c) { return this.classList.contains(c); }
 }
 for (const k of ["innerHTML", "outerHTML"]) Object.defineProperty(FakeElement.prototype, k, sink(k));

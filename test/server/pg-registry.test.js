@@ -777,9 +777,12 @@ describe.skipIf(!url)("postgres registry", () => {
         await whileLocked(`LOCK TABLE "${schema}".reg_grants IN ACCESS EXCLUSIVE MODE`, async () => {
           const all = await Promise.all(Array.from({ length: 8 }, () => timed(r.grant(b.id, "u"))));
           const codes = all.map(([e]) => e?.code);
-          const sentCode = stmt === lim ? "statement-timeout" : "lock-timeout";       // equal limits: statement fires first
-          for (const c of codes) expect([sentCode, "queue-timeout"]).toContain(c);
-          expect(codes.filter(c => c === sentCode).length).toBe(max);                // the sent ones, one per connection
+          // The sent calls end by whichever server-side limit fires: with equal limits both expire at ~800 ms and which one the server reports is a
+          // race (TECH-DEBT row 44), so either is right; with the statement limit far above, only the lock limit can fire. Every call must settle with
+          // one of these codes (a call that never settled, or settled ok, is in neither list), and exactly one per connection was sent.
+          const sentCodes = stmt === lim ? ["statement-timeout", "lock-timeout"] : ["lock-timeout"];
+          for (const c of codes) expect([...sentCodes, "queue-timeout"]).toContain(c);
+          expect(codes.filter(c => sentCodes.includes(c)).length).toBe(max);          // the sent ones, one per connection
         });
         await until(() => r.gate().running === 0, "the gate to go idle");
         expect(await r.grant(b.id, "u")).toBe("editor");                            // usable again
@@ -788,7 +791,9 @@ describe.skipIf(!url)("postgres registry", () => {
   }
 
   test("queue-timeout means never sent: a write that timed out waiting is absent after the lock clears", async () => {
-    const schema = schemaName(), lim = 800;
+    // The sent write must still be inside its limit when the lock is released (right after p2's queue timeout, 0.2 x lim + 50 ms): a roomy limit leaves
+    // ~3 s of slack for a loaded machine, where 800 ms left ~0.6 s.
+    const schema = schemaName(), lim = 4000;
     const r = await postgresRegistry({ url, schema, max: 1, lockTimeoutMs: lim, statementTimeoutMs: lim });
     try {
       const t = await r.createTenant({ domain: null });
@@ -797,9 +802,9 @@ describe.skipIf(!url)("postgres registry", () => {
       const [first, second] = await whileLocked(`SELECT id FROM "${schema}".reg_boards WHERE id = '${b.id}' FOR UPDATE`, async () => {
         const p1 = r.setGrant(b.id, "u1", "editor").then(() => "ok", e => e.code);       // sent: waits on the row lock
         const p2 = r.setGrant(b.id, "u2", "editor").then(() => "ok", e => e.code);       // waits for the one connection
-        expect(await p2).toBe("queue-timeout");                                          // at about 210 ms
+        expect(await p2).toBe("queue-timeout");                                          // at about 0.2 x lim + 50 ms
         return [p1, "queue-timeout"];
-      });                                                                                // lock released before 800 ms
+      });                                                                                // lock released well before lim
       expect(await first).toBe("ok");                                                    // the sent one then committed
       expect(second).toBe("queue-timeout");
       expect(await r.grant(b.id, "u1")).toBe("editor");

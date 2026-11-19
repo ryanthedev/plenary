@@ -40,13 +40,13 @@ const posInt = v => Number.isSafeInteger(v) && v > 0;
 
 /**
  * @param {{ path: string, fullfsync?: boolean, busyTimeoutMs?: number, keepCheckpoints?: number, now?: () => number,
- *   partChars?: number, onPart?: (step: string) => void | Promise<void> }} o
+ *   partChars?: number, onPart?: (step: string) => void | Promise<void>, onSkip?: (s: { tenant: string, board: string, seq: number }) => void }} o
  *   `path` is a file (":memory:" for throwaway use). `now`: the lease clock in ms (default Date.now; tests inject one).
  *   `partChars`: the most chars in one checkpoint part (default 1 Mi). `onPart`: test hook, awaited before each part
- *   ("part:<n>"), before the header ("header") and before each orphan group's delete ("sweep"); a throw aborts the write there (a sweep never fails a write).
+ *   ("part:<n>"), before the header ("header") and before each orphan group's delete ("sweep"); a throw aborts the write there (a sweep never fails a write). `onSkip`: called once for each checkpoint getCheckpoint skips because its parts are missing (the server logs it).
  */
 export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3, now = Date.now,
-  partChars = PART_CHARS, onPart }) {
+  partChars = PART_CHARS, onPart, onSkip }) {
   const db = new Database(path, { create: true, strict: true });
   let open = true;
   db.run(`PRAGMA busy_timeout=${Math.max(0, Math.floor(busyTimeoutMs))}`);
@@ -263,6 +263,7 @@ export function sqliteStore({ path, fullfsync = true, busyTimeoutMs = 5000, keep
           if (text.length !== head.chars) throw new PortError("corrupt", `checkpoint ${row.seq}'s parts hold ${text.length} chars, not ${head.chars}`);
         }
         if (text !== null) return JSON.parse(text);
+        try { onSkip?.({ tenant, board, seq: row.seq }); } catch { /* a logger must not fail a read */ }
         below = row.seq;
       }
     },

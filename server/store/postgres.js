@@ -101,13 +101,13 @@ const MAX_TTL = 10 * 60_000;
  *   txIdleTimeoutMs: a write transaction idle this long (its client paused mid-write) is ended by the server (default 5 s).
  *   leaseLockTimeoutMs: the longest a lease call waits on a row lock (default 2 s, at most half its ttl), then "unavailable".
  *   partChars: the most chars in one checkpoint part (default 1 Mi). onPart: test hook, awaited before each part
- *   ("part:<n>"), before the header ("header") and before each orphan group's delete ("sweep"); a throw aborts the write there (a sweep never fails a write).
+ *   ("part:<n>"), before the header ("header"), after its part count ("header-counted") and before each orphan group's delete ("sweep"); a throw aborts the write there (a sweep never fails a write). onSkip: called once for each checkpoint getCheckpoint skips because its parts are missing (the server logs it).
  * @returns {Promise<{ append: Function, read: Function, lastSeq: Function, putCheckpoint: Function,
  *   getCheckpoint: Function, openEpoch: Function, epoch: Function, acquire: Function, renew: Function,
  *   release: Function, lease: Function, settings(): Promise<object>, clusterId(): Promise<string>, close(): Promise<void> }>}
  */
 export async function postgresStore({ url, sql, max, schema = "public", keepCheckpoints = 3, lockTimeoutMs = 15_000,
-  txIdleTimeoutMs = 5_000, leaseLockTimeoutMs = 2_000, partChars = PART_CHARS, onPart }) {
+  txIdleTimeoutMs = 5_000, leaseLockTimeoutMs = 2_000, partChars = PART_CHARS, onPart, onSkip }) {
   if (!sql && !url) throw new Error("postgres store: pass url or sql");
   const s = needSchema(schema);
   const owned = !sql;
@@ -190,6 +190,11 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
   const lastOf = async (q, tenant, board) =>
     Number((await q.unsafe(`SELECT coalesce(max(seq), 0) AS m FROM ${E} WHERE tenant = $1 AND board = $2`, [tenant, board]))[0].m);
 
+  /** The board's checkpoint lock (a header's commit vs a sweep's delete), held to the end of `tx`; a wait past lock_timeout is "unavailable". */
+  const cpLock = async (tx, tenant, board) => {
+    try { await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-cp:${s}:${tenant}:${board}`]); }
+    catch (err) { if (err?.errno === LOCK_TIMEOUT) throw new PortError("unavailable", "the checkpoint lock is held by another session: try again"); throw err; }
+  };
   /** Removes part rows no header names (aborted, fenced, pruned or crashed writes), older than the newest header. Never throws. */
   const sweepParts = async (tenant, board, mine) => {
     try {
@@ -197,12 +202,16 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
         await db.unsafe(`SELECT DISTINCT seq, wid FROM ${CP} WHERE tenant = $1 AND board = $2`, [tenant, board]));
       if (mine && !gone.some(g => g.wid === mine.wid)) gone.push(mine);   // an aborted write's own, whatever the newest header
       // Under the board's checkpoint lock (the header's transaction takes it too) and only while no header names the write: a
-      // header that lands while the sweep runs (a slow write finishing) keeps its parts.
-      for (const g of gone) { await onPart?.("sweep"); await db.begin(async tx => {
-        await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-cp:${s}:${tenant}:${board}`]);
-        await tx.unsafe(`DELETE FROM ${CP} WHERE tenant = $1 AND board = $2 AND seq = $3 AND wid = $4
-          AND NOT EXISTS (SELECT 1 FROM ${C} WHERE tenant = $1 AND board = $2 AND seq = $3 AND data LIKE $5)`, [tenant, board, g.seq, g.wid, headerLike(g.wid)]);
-      }); }
+      // header that lands while the sweep runs (a slow write finishing) keeps its parts. Bounded like every write (lock_timeout,
+      // idle cut); a sweep that can't get the lock gives up here and the next write sweeps again.
+      for (const g of gone) {
+        await onPart?.("sweep");
+        await write(async tx => {
+          await cpLock(tx, tenant, board);
+          await tx.unsafe(`DELETE FROM ${CP} WHERE tenant = $1 AND board = $2 AND seq = $3 AND wid = $4
+            AND NOT EXISTS (SELECT 1 FROM ${C} WHERE tenant = $1 AND board = $2 AND seq = $3 AND data LIKE $5)`, [tenant, board, g.seq, g.wid, headerLike(g.wid)]);
+        }, leaseLockTimeoutMs);
+      }
     } catch { /* best effort: the next checkpoint's sweep takes what is left */ }
   };
 
@@ -304,8 +313,9 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
         await onPart?.("header");
         await write(async tx => {
           await fence(tx, tenant, board, epoch);
-          await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-cp:${s}:${tenant}:${board}`]);   // vs a sweep's delete
+          await cpLock(tx, tenant, board);   // vs a sweep's delete
           const [{ c }] = await tx.unsafe(`SELECT count(*)::int AS c FROM ${CP} WHERE tenant = $1 AND board = $2 AND seq = $3 AND wid = $4`, [tenant, board, cp.seq, wid]);
+          await onPart?.("header-counted");   // test hook: the window between the count and the commit
           if (c !== parts.length) throw new PortError("unavailable", "a checkpoint part is missing: try again");
           await put(tx, headerOf(wid, parts.length, text.length)); await prune(tx);
         }, leaseLockTimeoutMs);
@@ -334,6 +344,7 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
           if (text.length !== head.chars) throw new PortError("corrupt", `checkpoint ${seq}'s parts hold ${text.length} chars, not ${head.chars}`);
         }
         if (text !== null) return JSON.parse(text);
+        try { onSkip?.({ tenant, board, seq }); } catch { /* a logger must not fail a read */ }
         below = seq;
       }
     },

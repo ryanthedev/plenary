@@ -484,6 +484,74 @@ describe.skipIf(!url)("postgres store", () => {
     } finally { await drop(schema); }
   });
 
+  // ---- The checkpoint lock (a header's commit vs a sweep's delete) ----
+  const PART = 4000;
+  const big = (seq, tag) => ({ seq, tag, streams: { board: { elements: Array.from({ length: 125 }, (_, i) => ({ id: `e${i}`, text: "x".repeat(70) + tag })) } } });
+  const lockKey = (schema, t = T, b = B) => `plenary-cp:${schema}:${t}:${b}`;
+  /** An outside session holding the board's checkpoint lock until `release()`. */
+  const holdLock = async (schema, t, b) => {
+    let release; const held = new Promise(r => { release = r; });
+    let acquired; const got = new Promise(r => { acquired = r; });
+    const tx = client().begin(async q => { await q.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [lockKey(schema, t, b)]); acquired(); await held; });
+    await got;
+    return { release: async () => { release(); await tx; } };
+  };
+
+  test("the header's transaction takes the checkpoint lock: a sweep released into the window between its part count and its commit waits, and the checkpoint stays readable", async () => {
+    const schema = schemaName();
+    const gateA = Promise.withResolvers(), gateB = Promise.withResolvers(), bReady = Promise.withResolvers();
+    let holdA = true, holdB = true, counted = false;
+    const store = await postgresStore({ sql: client(), schema, partChars: PART, onPart: async step => {
+      if (step === "header" && holdA) { holdA = false; await gateA.promise; }                 // seq 25: every part in, header held back
+      else if (step === "sweep" && holdB) { holdB = false; bReady.resolve(); await gateB.promise; }   // seq 30: header landed, its sweep paused
+      else if (step === "header-counted" && counted) { counted = false; gateB.resolve(); await Bun.sleep(150); }   // 25 has counted its parts: the sweep's delete runs now
+    } });
+    try {
+      const e = await own(store);
+      const late = store.putCheckpoint(T, B, big(25, "late"), e);
+      await Bun.sleep(30);
+      const newest = store.putCheckpoint(T, B, big(30, "newest"), e);
+      await bReady.promise;
+      counted = true; gateA.resolve();
+      await Promise.all([late, newest]);
+      expect((await store.getCheckpoint(T, B)).tag).toBe("newest");
+      expect((await store.getCheckpoint(T, B, 30))?.tag).toBe("late");                         // complete: without the lock the delete wins and this is skipped
+      await store.close();
+    } finally { await drop(schema); }
+  });
+
+  test("an outside session holding the checkpoint lock: a write's header gives up as unavailable naming it, within ~2 x leaseLockTimeoutMs, and a sweep waits no longer than that", async () => {
+    const schema = schemaName();
+    const t = 300;
+    let hold = null, takeOnSweep = false;
+    const store = await postgresStore({ sql: client(), schema, partChars: PART, leaseLockTimeoutMs: t, onPart: async step => {
+      if (step === "sweep" && takeOnSweep && !hold) hold = await holdLock(schema);   // the first sweep finds the lock taken
+    } });
+    try {
+      const e = await own(store);
+      // (a) the lock is taken before the write: its header can't commit.
+      let first = await holdLock(schema);
+      const t0 = performance.now();
+      const err = await store.putCheckpoint(T, B, big(10, "a"), e).catch(x => x);
+      expect(err.code).toBe("unavailable");
+      expect(err.message).toContain("checkpoint lock");
+      expect(performance.now() - t0).toBeLessThan(2 * t + 1500);                         // plus the parts' own writes; far under the 4 s of an unbounded wait
+      await first.release();
+      expect(await store.getCheckpoint(T, B)).toBe(null);                                // nothing became visible
+      takeOnSweep = true;
+      // (b) a sweep that can't get the lock gives up quietly: the write itself succeeded.
+      await client().unsafe(`INSERT INTO "${schema}".pl_checkpoint_parts (tenant, board, seq, wid, n, data) VALUES ($1, $2, 1, 'orphan', 0, 'x')`, [T, B]);
+      const t1 = performance.now();
+      await store.putCheckpoint(T, B, big(20, "b"), e);
+      expect(performance.now() - t1).toBeLessThan(2 * t + 1500);
+      expect((await store.getCheckpoint(T, B)).tag).toBe("b");
+      await hold.release();
+      await store.putCheckpoint(T, B, big(30, "c"), e);                                  // the next write sweeps the orphan
+      expect((await client().unsafe(`SELECT count(*)::int AS c FROM "${schema}".pl_checkpoint_parts WHERE wid = 'orphan'`))[0].c).toBe(0);
+      await store.close();
+    } finally { await drop(schema); }
+  });
+
   test("bad schema names and missing connection are refused", async () => {
     await expect(postgresStore({ sql: client(), schema: 'x"; DROP TABLE y; --' })).rejects.toThrow("bad schema name");
     await expect(postgresStore({ sql: client(), schema: "Upper" })).rejects.toThrow("bad schema name");

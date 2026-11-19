@@ -322,6 +322,19 @@ export function storeContract(name, make) {
       expect(await raw.partRows(T, B)).toBeGreaterThanOrEqual(parts(big(25, "late")) + parts(big(30, "newest")));
     });
 
+    test("parts: a header whose parts are gone is skipped as a bad checkpoint, once, reported through onSkip, and the next one below is returned", async () => {
+      const skipped = [];
+      const { store, raw } = await fresh({ partChars: PART, onSkip: s => skipped.push(s) });
+      const e = await own(store);
+      await store.putCheckpoint(T, B, big(10, "ok"), e);
+      await raw.putCheckpointRow(T, B, 20, "\u0001cp-parts 1 no-such-wid 3 9999");        // names parts that don't exist
+      const got = await store.getCheckpoint(T, B);
+      expect(got.tag).toBe("ok");
+      expect(skipped).toEqual([{ tenant: T, board: B, seq: 20 }]);
+      expect((await store.getCheckpoint(T, B, 20)).tag).toBe("ok");                       // a read that starts below it never sees it
+      expect(skipped.length).toBe(1);
+    });
+
     test("parts: a checkpoint in the old format (one big row of JSON, no header) still reads, alone and beside parts", async () => {
       const { store, raw } = await fresh({ partChars: PART });
       const e = await own(store);

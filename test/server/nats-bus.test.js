@@ -1,13 +1,16 @@
 // The NATS Bus (server/bus/nats.js) against the Bus contract, and the contract against memory.js too (so the
 // contract itself is known to describe the single-node bus). NATS tests skip when NATS_URL is unset; when it is
 // set, a NATS that can't be reached fails them (it never skips).
-import { test, expect, afterAll } from "bun:test";
+import { test, expect, afterAll, setDefaultTimeout } from "bun:test";
 import { memoryBus } from "../../server/bus/memory.js";
 import { natsBus, subjects, encodeMessage, decodeMessage, MAX_BUS_BYTES } from "../../server/bus/nats.js";
 import { busContract, runTenant } from "./bus-contract.js";
 import { until, sleep, spawnTracked } from "./helpers.js";
 
 const URL = process.env.NATS_URL;
+// Failure-only ceiling for tests doing real NATS work: bun's 5 s default fails them under machine load (TECH-DEBT row 36). It fires only when
+// something never completes; nothing asserts on how long a test took.
+setDefaultTimeout(30_000);
 const nt = URL ? test : test.skip;
 const code = async p => { try { await p; return "resolved"; } catch (e) { return e.code ?? `threw ${e.message}`; } };
 
@@ -114,7 +117,8 @@ nt("nats: a refused publish nobody awaits goes to onError, not to an unhandled r
     bus.publish(subjects.inbox(tenant, "b-ff"), { data: "x".repeat(MAX_BUS_BYTES + 1) });   // not awaited
     bus.publish("plen.*.b", 1);                                                            // not awaited
     bus.publish(subjects.inbox(tenant, "b-ff"), { deep: { b: new Uint8Array(1) } });       // not awaited
-    await sleep(50);
+    await until(() => errors.length === 3, "the three refusals reaching onError");
+    await sleep(0);   // one more turn: an unhandled rejection would be reported by now
   } finally { process.off("unhandledRejection", onUnhandled); }
   expect(errors).toEqual(["too-large", "bad-id", "bad-entry"]);
   expect(unhandled).toBe(0);

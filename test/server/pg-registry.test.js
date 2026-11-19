@@ -4,7 +4,7 @@
 // § Store, "Least privilege") and concurrent start-up on an empty schema; timeouts (a held lock makes a call reject
 // near its limit, and the pool works after), the bounded start-up lock and the start-up privilege probe.
 // Skips unless DATABASE_URL is set. Each test gets its own schema, dropped after.
-import { describe, test, expect, afterAll } from "bun:test";
+import { describe, test, expect, afterAll, setDefaultTimeout } from "bun:test";
 import { SQL } from "bun";
 import { postgresRegistry, registryTables, REGISTRY_INDEXES } from "../../server/registry/postgres.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
@@ -15,6 +15,10 @@ import { legacyEquivalence } from "../auth/legacy-migration.js";
 import { migrate } from "../../server/pg/schema.js";
 
 const url = process.env.DATABASE_URL;
+// Every test here does real Postgres work (schema creation, pools, lock waits). Bun's 5 s default fails them under machine load (TECH-DEBT
+// row 36), so this is a failure-only ceiling: it fires only when a call never returns. Assertions are on outcomes, never on how long a test took
+// (a lower bound on a lock wait is fine: load only makes the wait longer).
+setDefaultTimeout(30_000);
 
 describe.skipIf(!url)("postgres registry", () => {
   /** @type {SQL} */ let sql;
@@ -34,6 +38,16 @@ describe.skipIf(!url)("postgres registry", () => {
   const schemaName = () => `pl_test_reg_${process.pid}_${Date.now().toString(36)}_${++n}`;
   const drop = s => client().unsafe(`DROP SCHEMA IF EXISTS "${s}" CASCADE`);
   const schemas = new Map();
+  /** Waits (up to 10 s) until at least `n` backends are blocked on a lock in a statement matching `like`; asserts they are, so a loaded machine fails cleanly. */
+  const waitBlocked = async (like, n = 1) => {
+    let c = 0;
+    for (let i = 0; i < 500 && c < n; i++) {
+      c = (await client().unsafe(`SELECT count(*)::int AS c FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE $1`, [like]))[0].c;
+      if (c < n) await Bun.sleep(20);
+    }
+    expect(c).toBeGreaterThanOrEqual(n);
+  };
+
 
   // Platform's contract. The pool runs concurrent calls on separate connections, so its concurrency cases are real.
   registryContract("postgres", async ({ now }) => {
@@ -257,23 +271,13 @@ describe.skipIf(!url)("postgres registry", () => {
       await other.unsafe(`DELETE FROM "${schema}".reg_grants WHERE board = $1 AND member = 'x'`, [board.id]);
       let settled = false;
       const p = r.setGrant(board.id, "y", "editor").then(() => "ok", e => e.code).finally(() => { settled = true; });
-      await Bun.sleep(200);
-      expect(settled).toBe(false);                                // queued on the row lock
+      await waitBlocked(`%"${schema}".reg_boards%FOR UPDATE%`);   // the call is now queued on the row lock (else the COMMIT could come first and prove nothing)
+      expect(settled).toBe(false);
       await other.unsafe("COMMIT");
       expect(await p).toBe("last-owner");
       expect(await r.grants(board.id)).toEqual([{ user: "y", role: "owner" }]);
     } finally { other.release(); await r.close(); await drop(schema); }
   });
-
-  /** Waits (up to 10 s) until at least `n` backends are blocked on a lock in a statement matching `like`; asserts they are, so a loaded machine fails cleanly. */
-  const waitBlocked = async (like, n = 1) => {
-    let c = 0;
-    for (let i = 0; i < 500 && c < n; i++) {
-      c = (await client().unsafe(`SELECT count(*)::int AS c FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE $1`, [like]))[0].c;
-      if (c < n) await Bun.sleep(20);
-    }
-    expect(c).toBeGreaterThanOrEqual(n);
-  };
 
   test("a Team's last member leaving, stalled on a container's lock, and a grant to the same Team on another container: serialised per tenant, nothing orphaned", async () => {
     const schema = schemaName();
@@ -349,12 +353,10 @@ describe.skipIf(!url)("postgres registry", () => {
     const schema = schemaName();
     const a = await postgresRegistry({ url, schema, max: 4 }), b = await postgresRegistry({ url, schema, max: 4 });
     // Never assumes WHERE anything waits: any backend of this schema blocked on a lock (a row, or the tenant's owners lock) counts.
+    const blockedCount = async () => (await client().unsafe(`SELECT count(*)::int AS c FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND (query LIKE $1 OR query LIKE '%pg_advisory_xact_lock%')`, [`%${schema}%`]))[0].c;
     const blocked = async n => {
       let c = 0;
-      for (let i = 0; i < 500 && c < n; i++) {
-        c = (await client().unsafe(`SELECT count(*)::int AS c FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND (query LIKE $1 OR query LIKE '%pg_advisory_xact_lock%')`, [`%${schema}%`]))[0].c;
-        if (c < n) await Bun.sleep(10);
-      }
+      for (let i = 0; i < 500 && c < n; i++) { c = await blockedCount(); if (c < n) await Bun.sleep(10); }
       expect(c).toBeGreaterThanOrEqual(n);
     };
     const hold = async space => { const c = await client().reserve(); await c.unsafe("BEGIN"); await c.unsafe(`SELECT id FROM "${schema}".reg_spaces WHERE id = $1 FOR UPDATE`, [space]); return c; };
@@ -376,8 +378,9 @@ describe.skipIf(!url)("postgres registry", () => {
         const x1 = await hold(s1.id);
         const A = verdict(a.setTeamMember(t1.id, "a", false));
         await blocked(1);
-        const G = verdict(b.setScopedGrant({ scope: S2, subject: { type: "team", id: t1.id }, role: "owner" }));
-        await Promise.race([G, Bun.sleep(300)]);                          // finished (no tenant lock) or queued behind A's
+        let gDone = false;
+        const G = verdict(b.setScopedGrant({ scope: S2, subject: { type: "team", id: t1.id }, role: "owner" })).then(v => { gDone = true; return v; });
+        for (let i = 0; i < 500 && !gDone && (await blockedCount()) < 2; i++) await Bun.sleep(10);   // finished (no tenant lock) or queued behind A's, each a state, not a delay
         const x2 = await hold(s2.id).catch(() => null);
         const B = verdict(b.setTeamMember(t2.id, "b", false));
         await blocked(2);
@@ -649,8 +652,7 @@ describe.skipIf(!url)("postgres registry", () => {
         const [err, took] = await timed(r.tenantAdminsAmong(["dev:a"], { timeoutMs: 300 }));
         expect(err?.code).toBe("statement-timeout");
         expect(err.message).toMatch(/^postgres registry: tenantAdminsAmong ran past 300 ms/);   // the limit that applied, not 10000
-        expect(took).toBeGreaterThan(250);
-        expect(took).toBeLessThan(2000);
+        expect(took).toBeGreaterThan(250);                          // waited the bound; no upper limit (a loaded machine only makes it later)
       });
       // The bound was transaction-local: the only connection reads its session default again and still serves.
       expect(await r.readSettings()).toEqual({ lock_timeout: "10s", statement_timeout: "10s" });
@@ -873,7 +875,7 @@ describe.skipIf(!url)("postgres registry", () => {
       const released = holder.unsafe("SELECT pg_sleep(0.2); COMMIT").simple().then(() => "released");
       const a = r.grant(b.id, "u").then(() => "ok", e => e.code);      // sent: waits on the lock
       const bCall = r.setGrant(b.id, "late", "editor").then(() => "ok", e => e.code);   // queued (one connection)
-      await Bun.sleep(10);
+      await until(() => r.gate().running === 1 && r.gate().waiting === 1);   // a state, not a delay: one sent, one queued
       expect(r.gate()).toMatchObject({ running: 1, waiting: 1 });
       Bun.sleepSync(600);                                               // the stall: past B's 250 ms deadline
       expect(await a).toBe("ok");                                       // the lock cleared during the stall

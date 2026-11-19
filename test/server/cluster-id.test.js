@@ -2,7 +2,7 @@
 // a missing or malformed id from the Store refuses the start (fail closed) and closes what opened; the id reaches
 // the Bus adapter only through its `cluster` option; a bad one is refused before anything connects; a node from
 // before the id (unscoped subjects) and a scoped one never exchange a message.
-import { test, expect, afterAll } from "bun:test";
+import { test, expect, afterAll, setDefaultTimeout } from "bun:test";
 import { join } from "node:path";
 import { start } from "../../server/main.js";
 import { sqliteStore } from "../../server/store/sqlite.js";
@@ -13,6 +13,9 @@ import { subjects } from "../../server/bus/port.js";
 import { tempDir, cleanup, sleep } from "./helpers.js";
 
 afterAll(cleanup);
+// Failure-only ceiling for tests doing real NATS and start-up work: bun's 5 s default fails them under machine load (TECH-DEBT row 36). It fires only when
+// something never completes; nothing asserts on how long a test took.
+setDefaultTimeout(30_000);
 
 const ID = "c-0123456789abcdef";
 const env = () => ({ PLENARY_DATA_DIR: tempDir(), PORT: "0", LOG_LEVEL: "info", DATABASE_URL: "postgres://u:pw@127.0.0.1:1/p", NATS_URL: "nats://127.0.0.1:1", COOKIE_KEY: "k".repeat(32), PLENARY_BLOBS: "local-disk" });

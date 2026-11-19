@@ -19,7 +19,7 @@ afterAll(async () => {
   const a = new SQL({ url, max: 1 });
   for (const s of schemas) await a.unsafe(`DROP SCHEMA IF EXISTS "${s}" CASCADE`);
   await a.close();
-});
+}, 30_000);   // DROP SCHEMA per test schema on real Postgres; failure-only ceiling for a loaded machine (TECH-DEBT row 36)
 
 function gw(bus, id) {
   const got = [], n = new Map();

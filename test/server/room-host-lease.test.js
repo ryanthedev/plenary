@@ -513,9 +513,9 @@ test("L3 (repro H): an event-loop stall past the deadline stops the room; a rene
 
 test("L4: close() settles an append in flight before it releases the lease", async () => {
   const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
-  let gate = null, order = [];
+  let gate = null, order = [], inAppend = false;
   const store = { ...raw,
-    append: async (...a) => { if (gate) await gate; const r = await raw.append(...a); order.push("append landed"); return r; },
+    append: async (...a) => { if (gate) { inAppend = true; await gate; } const r = await raw.append(...a); order.push("append landed"); return r; },
     release: async (...a) => { order.push("release"); return raw.release(...a); } };
   const A = roomHost({ store, bus, holder: "h-a", leaseTtlMs: 30_000 });
   try {
@@ -523,7 +523,8 @@ test("L4: close() settles an append in flight before it releases the lease", asy
     const g = fakeGateway(bus);
     g.hello("c1", "a"); await g.welcome("c1");
     let open; gate = new Promise(r => { open = r; });
-    g.op("c1", "a", 1); await bus.flush(); await sleep(20);
+    g.op("c1", "a", 1); await bus.flush();
+    await until(() => inAppend, "the op's append to be in flight");
     const closing = A.close();
     await sleep(200);
     expect(order).toEqual([]);                                               // still waiting on the append
@@ -553,10 +554,11 @@ test("L7: past 1,000 held hellos on a watched board, the extra ones are answered
     await Bh.open(T, B);
     const g = fakeGateway(bus);
     for (let i = 0; i < 1_005; i++) g.hello(`c${i}`, `x${i}`);
-    await bus.flush(); await sleep(50);
-    const answered = new Set(g.got.filter(m => m.close === 1013).map(m => m.conn));
-    expect([...answered].sort()).toEqual(["c1000", "c1001", "c1002", "c1003", "c1004"]);
-    await until(() => g.got.filter(m => m.close === 1013).length === 1_005, "the held ones at the silence", 6_000);
+    await bus.flush();
+    await until(() => g.got.filter(m => m.close === 1013).length === 1_005, "the held ones at the silence", 15_000);
+    // The five over the cap are answered at once, the held ones only at the silence: so they come first, in the order sent (an order, not a delay).
+    const order = g.got.filter(m => m.close === 1013).map(m => m.conn);
+    expect(order.slice(0, 5)).toEqual(["c1000", "c1001", "c1002", "c1003", "c1004"]);
   } finally { await Bh.close(); await raw.close(); await bus.close(); }
 }, 15000);
 
@@ -574,7 +576,7 @@ test("R2-L1: `welcomed` shrinks with `conns` (close notices, a listing, the swee
     const live = conns.slice(1000, 1500);
     await bus.publish(subjects.inbox(T, B), { gateway: "g-1", conns: live });
     await host.idle(T, B);
-    await sleep(120);   // a sweep or two
+    await until(async () => { const p = await host.peek(T, B); return p.conns === 500 && p.welcomed === 500; }, "the sweep to drop the closed connections", 15_000);
     const p = await host.peek(T, B);
     expect([p.conns, p.welcomed]).toEqual([500, 500]);
     // The lease is lost: 1013 goes to exactly the 500 welcomed live connections, nobody else.

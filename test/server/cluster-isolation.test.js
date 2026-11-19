@@ -26,7 +26,7 @@ describe.skipIf(!PG || !NATS)("two clusters on one NATS", () => {
     for (const s of socks) try { s.ws.close(); } catch { /* gone */ }
     for (const a of apps) await a.stop().catch(() => {});
     if (admin) { for (const d of dbs) await admin.unsafe(`DROP DATABASE IF EXISTS "${d}" WITH (FORCE)`).catch(() => {}); await admin.close(); }
-  });
+  }, 60_000);   // stops up to 4 nodes and force-drops 3 databases: under load this overran bun's 5 s hook default (TECH-DEBT row 36); a failure-only ceiling
   const newDb = async tag => {
     admin ??= new SQL({ url: PG, max: 1 });
     const name = `plen_iso_${tag}_${process.pid}_${Date.now().toString(36)}`;

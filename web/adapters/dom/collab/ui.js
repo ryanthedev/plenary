@@ -275,17 +275,17 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
         if (recordOp("reply", { do: "reply", id, thread: t.id, text })) { field.value = ""; S.drafts.delete(t.id); }
       };
       const foot = h("div.reply", {}, field, h("button.btn.primary", { onclick: send }, "Send"));
-      pop = { id: t.id, head: h("header"), body: h("div.body"), foot, field, readFoot: h("div.reply.hint"), el: null };
+      pop = { id: t.id, head: h("header", { "data-fk": "heading", tabindex: "-1" }), body: h("div.body"), foot, field, readFoot: h("div.reply.hint"), el: null };
       pop.el = h("div.pop.collab-pop", { role: "dialog", "aria-label": "Comment thread" }, pop.head, pop.body, pop.foot, pop.readFoot);
       delete sigs.pop;
     }
     // Rebuild the head and messages only when what they show changed (a click mid-rebuild is lost).
     if (changed("pop", JSON.stringify([t, S.reactFor, port.role, Math.floor(C.now() / 30_000)]))) {
-      const held = captureFocus([pop.head, pop.body]);       // a Resolve or reaction button that was just used keeps focus
+      const held = captureFocus([pop.el]);       // a Resolve or reaction button that was just used keeps focus
       replace(pop.head,
         t.resolved ? [h("span", {}, "✓"), h("b", {}, `Resolved by ${t.resolved.name ?? "someone"}`)] : h("span.anchor", {}, anchorText(t)),
         h("span.spacer"),
-        t.canResolve ? h("button.btn", { disabled: t.statePending, onclick: () => recordOp(t.resolved ? "reopen" : "resolve", { do: t.resolved ? "reopen" : "resolve", id: t.id }) }, t.resolved ? "Reopen" : "✓ Resolve") : null,
+        t.canResolve ? h("button.btn", { "data-fk": `thread:${t.id}:resolve`, disabled: t.statePending, onclick: () => recordOp(t.resolved ? "reopen" : "resolve", { do: t.resolved ? "reopen" : "resolve", id: t.id }) }, t.resolved ? "Reopen" : "✓ Resolve") : null,
         h("button.tb", { title: "Close", onclick: () => openThread(null) }, "✕"));
       replace(pop.body, t.resolved || t.detached ? h("div.anchor.muted", {}, anchorText(t)) : null, t.comments.map(c => message(t, c)));
       restoreFocus(held);
@@ -358,7 +358,7 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     if (S.drawer === "notes") {
       sigs.drawerRev = null;     // the comments rows must be rebuilt on the way back
       if (!changed("drawer", JSON.stringify(["notes", nv]))) return;
-      swapRows(nv.rows.length ? nv.rows.map(n => h("div.note-row", { "data-note": n.id },
+      swapRows(nv.rows.length ? nv.rows.map(n => h("div.note-row", { "data-note": n.id, "data-fk": `note:${n.id}:row`, tabindex: "-1" },
         h("span.sw", { style: { background: safeColor(n.color), width: "10px", height: "10px" } }),
         h("div.txt", {}, h("div", {}, n.text),
           h("div.meta", {}, h("span.author", { style: { color: n.by ? colorOf(n.by) : "var(--muted)" } }, n.author), n.kind === "highlight" ? h("span", {}, "highlight") : null),

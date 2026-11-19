@@ -269,7 +269,39 @@ test("comments drawer: threads that start with identical text keep their own foc
   } finally { f.restore(); collab.destroy(); }
 });
 
-test("a deleted note's focus falls to the next delete, then the previous, never to another kind of control", () => {
+test("popover: when the focused comment's delete disappears, focus goes to the popover heading, never to another comment's delete", () => {
+  const { port, collab } = setup("editor");
+  port.remote({ do: "thread", id: "t1", anchor: { point: { x: 1, y: 1 } }, text: "first" }, "me", "Jordan P.");
+  port.remote({ do: "reply", id: "c2", thread: "t1", text: "second" }, "me", "Jordan P.");
+  port.remote({ do: "reply", id: "c3", thread: "t1", text: "third" }, "me", "Jordan P.");
+  collab.openThread("t1");
+  const f = focusRig();
+  try {
+    const dels = () => dom.root.all().filter(e => /^msg:.+:delete$/.test(e.getAttribute?.("data-fk") ?? ""));
+    expect(dels().length).toBe(3);
+    f.doc.activeElement = dels().find(e => e.getAttribute("data-fk") === "msg:c2:delete");
+    port.remote({ do: "delete", id: "c2" }, "me", "Jordan P.");                                // removed from outside
+    expect(dels().some(e => e.getAttribute("data-fk") === "msg:c2:delete")).toBe(false);
+    expect(/:delete$/.test(f.doc.activeElement.getAttribute("data-fk") ?? "")).toBe(false);   // not c1's or c3's delete
+    expect(f.doc.activeElement.getAttribute("data-fk")).toBe("heading");
+  } finally { f.restore(); collab.destroy(); }
+});
+
+test("Resolve / Reopen is one control with one key: it keeps focus when its label flips", () => {
+  const { port, collab } = setup("editor");
+  port.remote({ do: "thread", id: "t1", anchor: { point: { x: 1, y: 1 } }, text: "first" }, "me", "Jordan P.");
+  collab.openThread("t1");
+  const f = focusRig();
+  try {
+    const resolve = () => dom.root.all().find(e => e.getAttribute?.("data-fk") === "thread:t1:resolve");
+    expect(resolve().textContent).toContain("Resolve");
+    f.doc.activeElement = resolve(); resolve().click();
+    expect(resolve().textContent).toContain("Reopen");                                        // the label flipped and the head was rebuilt ...
+    expect(f.doc.activeElement).toBe(resolve());                                              // ... focus is on the new button, same key
+  } finally { f.restore(); collab.destroy(); }
+});
+
+test("a deleted note's focus falls to a NEUTRAL control (a note row), never to another note's delete", () => {
   const { port, collab } = setup("annotator", { notes: [note("n1", 1), note("n2", 2)], noteAuthors: { n1: "me", n2: "me" } });
   port.editNote = () => {}; port.deleteNote = () => {};
   const d = collab.parts.drawer, f = focusRig();
@@ -279,7 +311,11 @@ test("a deleted note's focus falls to the next delete, then the previous, never 
     f.doc.activeElement = del("n2");
     port.setElement("notes", "n2", null);
     port.remote({ do: "thread", id: "tx", anchor: { point: { x: 1, y: 1 } }, text: "tick" }, "pri", "Priya");
-    expect(f.doc.activeElement.getAttribute("data-fk")).toBe("note:n1:delete");
+    expect(f.doc.activeElement.getAttribute("data-fk")).toBe("note:n1:row");                   // the neighbouring row, not n1's delete
+    expect(/:(delete|edit)$/.test(f.doc.activeElement.getAttribute("data-fk"))).toBe(false);
+    port.setElement("notes", "n1", null);
+    port.remote({ do: "thread", id: "ty", anchor: { point: { x: 1, y: 1 } }, text: "tick" }, "pri", "Priya");
+    expect(/:(delete|edit)$/.test(f.doc.activeElement?.getAttribute?.("data-fk") ?? "")).toBe(false);   // nothing left: no action control gets focus
   } finally { f.restore(); collab.destroy(); }
 });
 

@@ -428,14 +428,16 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   }
 
   // The notes stream as a list: text, author (you, or unknown until v1's noteAuthor), jump / edit / delete.
-  function notesList() {
+  // The notes drawer's list element (kept so rows can be refreshed while the compose box is being typed in).
+  const notesRefs = { list: null };
+  function notesList(rowsOnly = false) {
     const N = S.eds.notes, may = S.may();
     const { notes, labels } = notesInfo(N.doc);
     const label = e => (e.type === "text" ? e.text : labels.get(e.id)?.text) || { freedraw: "Highlight / drawing", image: "Picture", arrow: "Arrow", line: "Line" }[e.type] || "Note";
     const rows = notes.slice(0, 200).map(e => {
       const mine = S.isMine(e.id), canChange = may && mine;
       const jump = () => { N.fit([e]); S.syncView("notes"); chromeDirty = true; };
-      return h("div.note-row", {}, h("span.sw", { style: { background: safeColor(e.backgroundColor !== "transparent" ? e.backgroundColor : e.strokeColor), width: "10px", height: "10px" } }),
+      return h("div.note-row", { "data-fk": `note:${e.id}:row`, tabindex: "-1" }, h("span.sw", { style: { background: safeColor(e.backgroundColor !== "transparent" ? e.backgroundColor : e.strokeColor), width: "10px", height: "10px" } }),
         h("div.txt", {}, h("div", {}, label(e)),
           h("div.meta", {}, h("span", { style: { fontWeight: 600 } }, S.mine.has(e.id) ? "You" : "—"), e.type === "freedraw" ? h("span", {}, "highlight") : null),
           h("div.acts", {}, h("button", { "data-fk": `note:${e.id}:jump`, onclick: jump }, "jump to"),
@@ -443,13 +445,16 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
               h("button", { "data-fk": `note:${e.id}:edit`, onclick: () => { jump(); S.act("notes", n => { n.select([e.id]); n.beginText(e, { x: e.x, y: e.y }); }); } }, "edit"),
               h("button", { "data-fk": `note:${e.id}:delete`, onclick: () => S.act("notes", n => n.deleteIds([e.id])) }, "delete")] : h("span.lock", {}, "🔒 someone else's")) : null)));
     });
+    const list = h("div.notes-list", {}, rows.length ? rows : h("div.hint", { style: { padding: "6px 8px" } }, "No notes yet."), notes.length > 200 ? h("div.hint", {}, `${notes.length - 200} more`) : null);
+    if (rowsOnly) return list;
+    notesRefs.list = list;
     const compose = !may || S.effective === "viewer"
       ? h("div.hint.compose", {}, S.role === "viewer" ? "Viewers read notes; only annotators and presenters add them." : "Read-only: you can't add or change notes.")
       : h("div.compose", {}, h("textarea.field", { placeholder: "Write a note… it lands at the center of your view", rows: 2, onkeydown: e => {
         e.stopPropagation();
         if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); const v = e.currentTarget.value.trim(); if (!v) return; const b = S.eds.board; S.placeNote(b.toWorld({ x: b.size.w / 2, y: b.size.h / 2 }), v); e.currentTarget.value = ""; chromeDirty = true; }
       } }));
-    return [h("div.notes-list", {}, rows.length ? rows : h("div.hint", { style: { padding: "6px 8px" } }, "No notes yet."), notes.length > 200 ? h("div.hint", {}, `${notes.length - 200} more`) : null), compose];
+    return [list, compose];
   }
   function drawerBody(which) {
     // Comment threads: the collab UI's drawer (its own Notes/Comments header is hidden here; ours switches).
@@ -659,7 +664,12 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const drawer = $("#drawer");
     drawer.hidden = !ui.drawer;
     if (!ui.drawer) return true;
-    if (busy(drawer)) return false;
+    if (busy(drawer)) {
+      // Typing in the compose box: refresh only the rows (a note just added must show), and leave the box (its text, its focus) alone.
+      if (ui.drawer !== "notes" || !notesRefs.list || !drawer.contains(notesRefs.list)) return false;
+      notesRefs.list.replaceChildren(...notesList(true).childNodes);
+      return true;
+    }
     replace(drawer, h("header", {}, h("h3", {}, "Annotations"), drawerTabs("drawer"), h("button.tb", { title: "Close", onclick: () => { ui.drawer = null; chromeDirty = true; } }, "✕")), drawerBody(ui.drawer));
     return true;
   }

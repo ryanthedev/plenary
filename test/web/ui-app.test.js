@@ -560,6 +560,38 @@ test("dialog chips: activating a format chip rebuilds the dialog and focus stays
   expect(page.doc.activeElement).toBe(now);                              // focus on the same chip, not the body and not another chip
 });
 
+test("a layer removed from outside never hands focus to another layer's Lock: focus goes to a neutral layer row", () => {
+  rig = setup(); const { bo, step, app } = rig;
+  app.setPanel({ type: "noop" }); step(20);
+  bo.act("board", e => e.addLayer("Two"), { settings: true }); bo.act("board", e => e.addLayer("Three"), { settings: true }); step(20);
+  const locks = () => page.byId.panel.all().filter(e => e.tagName === "BUTTON" && /^layer:.+:lock$/.test(e.attrs["data-fk"] ?? ""));
+  const mid = locks()[1], midId = mid.attrs["data-fk"].split(":")[1];
+  mid.focus();
+  bo.act("board", e => e.deleteLayer(midId), { settings: true }); step(20);
+  expect(locks().length).toBe(2);
+  const now = page.doc.activeElement;
+  expect(now.attrs["data-fk"]).toMatch(/^layer:[^:]+:row$/);              // a neutral row, not a Lock/Hide toggle
+});
+
+test("notes drawer: notes added from the compose box show in the list while the compose box keeps its focus and its text", () => {
+  rig = setup(); const { step, app } = rig;
+  app.ui.drawer = "notes"; app.setPanel({ type: "noop" }); step(20);
+  const compose = () => find(page.byId.drawer, e => e.tagName === "TEXTAREA");
+  const rows = () => page.byId.drawer.all().filter(e => e.className?.startsWith?.("note-row"));
+  expect(rows().length).toBe(0);
+  expect(page.byId.drawer.textContent).toContain("No notes yet.");
+  const ta = compose(); ta.focus();
+  for (const text of ["first note", "second note"]) {
+    ta.value = text; ta.fire("keydown", { key: "Enter" }); step(20);
+    expect(compose()).toBe(ta);                                         // the compose box itself was never rebuilt
+    expect(page.doc.activeElement).toBe(ta);
+  }
+  expect(rows().length).toBe(2);                                          // the list shows both notes
+  expect(page.byId.drawer.textContent).not.toContain("No notes yet.");
+  ta.value = "half-typed"; step(20);
+  expect(ta.value).toBe("half-typed");
+});
+
 test("V6 remote layer add / rename and a shape on it: panel layers", () => {
   rig = setup(); const { bo, step, app } = rig;
   app.setPanel({ type: "noop" }); step(20);

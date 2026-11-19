@@ -20,6 +20,15 @@ test("captureFocus remembers a key and nothing about what the control says", () 
   expect(b).toContain("keyOf(");
 });
 
+test("the fallback never yields an action control: no kindOf, and every neutral target is a row or a self-keyed row", () => {
+  expect(src).not.toMatch(/kindOf|ACTIONS/);
+  const table = src.slice(src.indexOf("const NEUTRAL"), src.indexOf("const neutralFor"));
+  const targets = [...table.matchAll(/to: m => `([^`]+)`/g)].map(m => m[1]);
+  expect(targets.length).toBeGreaterThan(0);
+  for (const t of targets) expect(t).not.toMatch(/delete|edit|lock|visible|react|resolve|jump/);          // a row (`...:row`) or a row that is itself neutral
+  expect(table).not.toMatch(/delete|edit\b|lock|visible|react|resolve/);
+});
+
 test("automatic keys are only made for a label that is unique in its root, and are never used as a fallback", () => {
   expect(src).toMatch(/count\.get\(k\) === 1/);
   expect(code(body("restoreFocus"))).toMatch(/!held\.key\.startsWith\("auto:"\)/);

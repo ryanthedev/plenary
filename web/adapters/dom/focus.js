@@ -39,9 +39,18 @@ export function keeper() {
 const kids = el => [...(el.children ?? [])];
 const walk = root => { const out = []; const visit = e => { for (const c of kids(e)) { out.push(c); visit(c); } }; visit(root); return out; };
 const keyOf = el => el.getAttribute?.("data-fk") ?? null;
-/** The kind of control a key names, for the fallback when its row is gone: `thread:<id>` -> "thread", `note:<id>:delete` -> "note:delete". Anything else has no kind (no fallback). */
-const ACTIONS = new Set(["delete", "edit", "jump", "lock", "visible"]);
-const kindOf = k => { const p = String(k).split(":"); return p.length === 2 ? p[0] : p.length === 3 && ACTIONS.has(p[2]) ? `${p[0]}:${p[2]}` : null; };
+/**
+ * Where focus goes when its control's key is gone (the row was deleted, a toggle's control left): only to a NEUTRAL control, never to the same
+ * action on another row (a delete, edit, lock, visibility or reaction on a neighbour would be one Enter from acting on something the person
+ * did not choose). `row` is a row's own focusable (tabindex -1) element. Rows keyed `thread:<id>` and `frame:<id>` are themselves neutral.
+ * Order: the same row's neutral key, the next row's, the previous row's, then the root's "heading".
+ */
+const NEUTRAL = [
+  { from: /^(note):([^:]+):[a-z]+$/, to: m => `${m[1]}:${m[2]}:row`, rows: /^note:([^:]+):row$/ },
+  { from: /^(layer):([^:]+):[a-z]+$/, to: m => `${m[1]}:${m[2]}:row`, rows: /^layer:([^:]+):row$/ },
+  { from: /^(thread|frame):([^:]+)$/, to: m => `${m[1]}:${m[2]}`, rows: /^(?:thread|frame):[^:]+$/ },
+];
+const neutralFor = key => { for (const n of NEUTRAL) { const m = n.from.exec(key); if (m) return { same: n.to(m), rows: n.rows }; } return null; };
 const CONTROL = /^(BUTTON|A|INPUT|SELECT|TEXTAREA)$/;
 const sayText = el => (el.textContent ?? "").trim().slice(0, 40);
 
@@ -84,8 +93,12 @@ export function restoreFocus(held) {
   const keyed = walk(held.root).filter(e => keyOf(e) !== null), byKey = k => keyed.find(e => keyOf(e) === k);
   let to = byKey(held.key);
   if (!to && !held.key.startsWith("auto:")) {
-    const kind = kindOf(held.key), i = held.order.indexOf(held.key), same = kind === null ? [] : held.order.map((k, j) => [k, j]).filter(([k]) => kindOf(k) === kind);
-    to = [...same.filter(([, j]) => j > i), ...same.filter(([, j]) => j < i).reverse()].map(([k]) => byKey(k)).find(Boolean) ?? byKey("heading");
+    const nb = neutralFor(held.key);
+    if (nb) {
+      const i = held.order.indexOf(held.key), rows = held.order.map((k, j) => [k, j]).filter(([k]) => nb.rows.test(k) && k !== held.key);
+      to = [byKey(nb.same), ...[...rows.filter(([, j]) => j > i), ...rows.filter(([, j]) => j < i).reverse()].map(([k]) => byKey(k))].find(Boolean);
+    }
+    to ??= byKey("heading");
   }
   to?.focus?.();
   return !!to;

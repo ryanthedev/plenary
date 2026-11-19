@@ -168,10 +168,9 @@ await (await postgresStore({ url, schema })).close();
 console.log("migrated", schema);'
 ```
 
-**Upgrading.** Run step 2 again, as the owner, **before** starting upgraded nodes under the runtime role: start-up as a role without
-`CREATE` on the schema cannot add a table or an index, and refuses with the privilege error naming this step. What adds objects:
-the #48 release (Spaces and Groups pages) adds the index `reg_spaces_grp` on `reg_spaces (grp, id)`, which pages a Group's Spaces
-and finds a Space's Group. Nothing is altered or dropped; a one-owner database needs no extra step (the first node creates it).
+**New tables and indexes.** Run step 2 as the owner **before** starting nodes of a version that adds a table or an index under the runtime
+role: start-up as a role without `CREATE` on the schema cannot add one, and refuses with the privilege error naming this step.
+Nothing is altered or dropped. There is no data migration (see "Old-format stores").
 
 **3. Grant the runtime role, as the owner** (`psql` on database `plenary`). Identity columns need no sequence grant.
 The `DEFAULT PRIVILEGES` line covers tables the owner creates later, so a migrate that adds a table needs no new grant:
@@ -182,16 +181,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO plenary_a
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO plenary_app;
 ```
 
-**Upgrading to a version with checkpoint parts** (PROTOCOL.md § Recovery, "Checkpoint parts") adds the table `pl_checkpoint_parts`:
-run step 2 as the owner before starting a runtime-role node (the default privileges cover its grants; without that line, grant it
-`SELECT, INSERT, DELETE`). A runtime role that starts first is refused at start-up (code `denied`, below). Nodes of the old and the new
-version can share a database until the first checkpoint over 1 Mi chars is written; after that an old node can't read it (rolling
-back: PROTOCOL.md, same section). A single-node SQLite file needs nothing: the table is created when it opens.
-
-**Upgrading to a version with the cluster id** (PROTOCOL.md § Bus, Cluster id) adds the table `pl_cluster`: run step 2
-as the owner before starting a runtime-role node (the default privileges already cover its grants). The id changes
-every bus subject, so old and new nodes do not talk over NATS: replace a cluster's nodes together (hosts first), not
-one by one. A database copied for staging or a restore test keeps the original's id; run `DELETE FROM pl_cluster;` on
+**The cluster id** (PROTOCOL.md § Bus, Cluster id) lives in the table `pl_cluster` (run step 2 as the owner first; the default
+privileges cover its grants). A database copied for staging or a restore test keeps the original's id; run `DELETE FROM pl_cluster;` on
 the copy (all its nodes stopped) before it shares a NATS server with the original. The id prefix keeps honest clusters
 apart; it is not access control: for real separation give each cluster its own NATS account or user limited to
 `<id>.>`. The id is on the `cluster adapters open` log line and in `SELECT id FROM pl_cluster`.
@@ -208,10 +199,8 @@ right they use at start-up, so a role with `USAGE` but missing grants is refused
 
 Step 3's grants cover both.
 
-**Upgrading a schema made before the lease (phase 4).** Nodes refuse to start with `needs-migration` if `pl_leases`
-lacks `holder` and `expires_at`. Run once, as the owner role, on each Plenary schema:
-`ALTER TABLE "<schema>".pl_leases ADD COLUMN IF NOT EXISTS holder TEXT, ADD COLUMN IF NOT EXISTS expires_at BIGINT;`
-It is idempotent and keeps every board's epoch. (Start-up itself never runs it: nodes still never ALTER.)
+**Old-format stores.** There is no migration: a schema or SQLite file from before the current table shapes is refused at start-up
+(code `old-format`, "Reset the store"). Drop the schema (or delete the SQLite file) and start again; nothing is ALTERed or read silently.
 
 ### Registry time limits
 

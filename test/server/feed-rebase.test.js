@@ -86,7 +86,7 @@ test("a look that misses (the checkpoint isn't written yet) is made again when t
   } finally { await s.close(); }
 });
 
-test("mixed versions, heartbeats without cp: a due look, then at most 3 retries after a miss, then none until due again", async () => {
+test("no cp heard yet (heartbeats without one): a due look, then at most 3 retries after a miss, then none until due again", async () => {
   const s = await setup({ n: 3, feedOpts: { rebaseEvery: 2 } });
   try {
     const atStart = s.io.cpReads;
@@ -94,16 +94,14 @@ test("mixed versions, heartbeats without cp: a due look, then at most 3 retries 
     expect(s.io.cpReads - atStart).toBe(4);                               // the due look and 3 retries, of 10 heartbeats
     expect(s.feed.base.seq).toBe(0);
   } finally { await s.close(); }
-  // A rolling upgrade back and forth: on a cp host's heartbeat a due tail is no look; the next heartbeat, from a host
-  // from before cp, puts the feed back on the bounded rule, so the due tail is looked at.
+  // Once a cp is heard, a heartbeat without one does not forget it: a due tail is no look until a newer cp is announced.
   const u = await setup({ n: 3, feedOpts: { rebaseEvery: 2 } });
   try {
     const atStart = u.io.cpReads;
     await u.beat({ cp: 0 });
-    expect(u.io.cpReads - atStart).toBe(0);
     await u.checkpoint(3);
     await u.beat();
-    expect([u.io.cpReads - atStart, u.feed.base.seq]).toEqual([1, 3]);
+    expect([u.io.cpReads - atStart, u.feed.base.seq]).toEqual([0, 0]);
   } finally { await u.close(); }
   // The checkpoint lands during the retries: found.
   const f = await setup({ n: 3, feedOpts: { rebaseEvery: 2 } });
@@ -115,7 +113,7 @@ test("mixed versions, heartbeats without cp: a due look, then at most 3 retries 
   } finally { await f.close(); }
 });
 
-test("mixed versions, Store polls only (no room heartbeating): the same bound, counted against the polls", async () => {
+test("Store polls only (no room heartbeating): the same bound, counted against the polls", async () => {
   const s = await setup({ n: 3, feedOpts: { rebaseEvery: 2, pollMs: 100 } });
   try {
     const atStart = s.io.cpReads;

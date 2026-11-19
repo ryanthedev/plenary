@@ -2,13 +2,12 @@
 // has: same answers as the in-memory one on edge cases, close/reopen, two handles on one file, and a real
 // cross-process race on the last owner.
 import { test, expect, afterAll, describe } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { sqliteRegistry } from "../../server/registry/sqlite.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { registryContract } from "../auth/registry-contract.js";
-import { legacyEquivalence } from "../auth/legacy-migration.js";
 import { accessEquivalence } from "../auth/access-equivalence.js";
 import { Database } from "bun:sqlite";
 import { accessRace } from "../auth/access-race.js";
@@ -23,7 +22,7 @@ registryContract("sqlite", async ({ now }) => sqliteRegistry({ path: file(), now
 accessRace("sqlite", async () => { const path = file(), a = sqliteRegistry({ path, fullfsync: false }), b = sqliteRegistry({ path, fullfsync: false }); return { a, b, close: async () => { await a.close(); await b.close(); } }; });
 accessEquivalence("sqlite", async ({ now }) => sqliteRegistry({ path: ":memory:", now, fullfsync: false }), { cleanup: r => r.close() });
 
-// A database from before board organization: the seven original tables (their DDL as of 1d0bcbe), filled with a legacy state.
+// An old-format file: the seven tables from before board organization.
 const LEGACY_DDL = [
   "CREATE TABLE reg_tenants (id TEXT PRIMARY KEY, domain TEXT UNIQUE, created_at INTEGER NOT NULL)",
   "CREATE TABLE reg_tenant_admins (tenant TEXT NOT NULL REFERENCES reg_tenants(id), member TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (tenant, member))",
@@ -35,27 +34,18 @@ const LEGACY_DDL = [
     revoked INTEGER NOT NULL, by_user TEXT, created_at INTEGER NOT NULL)`,
   "CREATE TABLE reg_link_uses (board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES reg_links(id), n INTEGER NOT NULL, PRIMARY KEY (board, member, link))",
 ];
-let legacyFile;
-legacyEquivalence("sqlite", {
-  async install(st) {
-    legacyFile = file();
-    const db = new Database(legacyFile, { create: true, strict: true });
-    db.run("PRAGMA journal_mode=WAL");
-    for (const sql of LEGACY_DDL) db.run(sql);
-    st.tenants.forEach(t => { db.run("INSERT INTO reg_tenants VALUES (?, ?, 1)", [t.id, t.domain]); t.admins.forEach((a, n) => db.run("INSERT INTO reg_tenant_admins VALUES (?, ?, ?)", [t.id, a, n + 1])); });
-    st.boards.forEach(b => db.run("INSERT INTO reg_boards VALUES (?, ?, ?, ?, 1)", [b.id, b.tenant, b.title, b.memberRole]));
-    st.grants.forEach((g, n) => db.run("INSERT INTO reg_grants VALUES (?, ?, ?, ?)", [g.board, g.user, g.role, n + 1]));
-    st.invites.forEach(i => db.run("INSERT INTO reg_invites (id, board, email, role, expires_at, revoked, by_user, created_at) VALUES (?, ?, ?, ?, ?, ?, 'x', 1)", [i.id, i.board, i.email, i.role, i.expiresAt, i.revoked ? 1 : 0]));
-    st.links.forEach(l => db.run("INSERT INTO reg_links (id, board, role, expires_at, revoked, by_user, created_at) VALUES (?, ?, ?, ?, ?, 'x', 1)", [l.id, l.board, l.role, l.expiresAt, l.revoked ? 1 : 0]));
-    st.uses.forEach((u, n) => db.run("INSERT INTO reg_link_uses VALUES (?, ?, ?, ?)", [u.board, u.user, u.link, n + 1]));
-    db.close();
-  },
-  async open() { const registry = sqliteRegistry({ path: legacyFile, now: () => 5_000_000, fullfsync: false }); return { registry, close: () => registry.close() }; },
-  async count() {
-    const db = new Database(legacyFile, { readonly: true });
-    try { const c = t => db.query(`SELECT count(*) AS c FROM ${t}`).get().c; return { boards: c("reg_boards"), grants: c("reg_grants"), invites: c("reg_invites"), links: c("reg_links") }; }
-    finally { db.close(); }
-  },
+test("a file from before the organization (boards, no Spaces) is an old-format store: refused with code old-format, and left as it was", () => {
+  const path = file();
+  const db = new Database(path, { create: true, strict: true });
+  for (const sql of LEGACY_DDL) db.run(sql);
+  db.close();
+  let err;
+  try { sqliteRegistry({ path, fullfsync: false }); } catch (e) { err = e; }
+  expect(err?.code).toBe("old-format");
+  expect(err.message).toMatch(/Reset the store/);
+  const after = new Database(path, { readonly: true });
+  expect(after.query("SELECT name FROM sqlite_master WHERE name = 'reg_spaces'").get()).toBe(null);   // nothing was added
+  after.close();
 });
 
 describe("sqlite registry", () => {
@@ -159,14 +149,39 @@ describe("sqlite registry", () => {
     const path = file(), old = new Database(path);
     old.run("CREATE TABLE reg_idempotency (member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, claim TEXT NOT NULL, result TEXT, at INTEGER NOT NULL, PRIMARY KEY (member, k))");
     old.close();
-    expect(() => sqliteRegistry({ path, fullfsync: false })).toThrow(/reg_idempotency.*older version.*drop the table/i);
+    expect(() => sqliteRegistry({ path, fullfsync: false })).toThrow(/reg_idempotency.*older version.*Reset the store/i);
   });
 
   test("a store whose reg_access_requests lacks closed_at refuses to start with a clear error naming the table", () => {
     const path = file(), old = new Database(path);
     old.run("CREATE TABLE reg_access_requests (id TEXT PRIMARY KEY, tenant TEXT NOT NULL, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, member TEXT NOT NULL, role TEXT NOT NULL, state TEXT NOT NULL, at INTEGER NOT NULL, UNIQUE (scope_type, scope_id, member))");
     old.close();
-    expect(() => sqliteRegistry({ path, fullfsync: false })).toThrow(/reg_access_requests.*older version.*drop the table/i);
+    expect(() => sqliteRegistry({ path, fullfsync: false })).toThrow(/reg_access_requests.*older version.*Reset the store/i);
+  });
+
+  test("the old-format rule is general: a column missing from ANY table refuses the file, which is left untouched and deletable; a fresh file and a reopen do not false-fire", async () => {
+    const fresh = file(); const r = sqliteRegistry({ path: fresh, fullfsync: false }); await r.close();
+    const again = sqliteRegistry({ path: fresh, fullfsync: false }); await again.close();   // a reopen: nothing refused
+    for (const [table, drop] of [["reg_teams", "created_at"], ["reg_members", "email"], ["reg_scope_grants", "n"], ["reg_tenants", "created_at"]]) {
+      const path = file(), db = new Database(path);
+      db.run("PRAGMA journal_mode=DELETE");
+      sqliteRegistry({ path: fresh, fullfsync: false }).close();      // (shape source) a good file
+      const good = new Database(fresh, { readonly: true });
+      const cols = good.query(`PRAGMA table_info(${table})`).all().map(c => c.name).filter(c => c !== drop);
+      good.close();
+      db.run(`CREATE TABLE ${table} (${cols.map(c => `${c} TEXT`).join(", ")})`);
+      db.close();
+      let err; const fds = readdirSync("/dev/fd").length;
+      try { sqliteRegistry({ path, fullfsync: false }); } catch (e) { err = e; }
+      expect([table, err?.code]).toEqual([table, "old-format"]);
+      expect(readdirSync("/dev/fd").length).toBe(fds);                                                                      // the refused open left no handle (an rmSync would pass either way)
+      expect(err.message).toContain(table);
+      const after = new Database(path, { readonly: true });
+      expect(after.query("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(t => t.name)).toEqual([table]);   // nothing was created
+      expect(after.query("PRAGMA journal_mode").get().journal_mode).toBe("delete");                                         // the WAL switch never happened
+      after.close();
+      rmSync(path);                                                                                                         // the handle was released: the file can go
+    }
   });
 
   test("durable keyed create: the key survives close and reopen (a crash after the commit), so the retry gets the first object, not a second", async () => {

@@ -9,6 +9,24 @@
 
 import { needId, isClusterId, PortError } from "../ids.js";
 
+/** The members every Bus adapter has (test/server/adapter-surface.test.js). Adapter extras: `subscriberCount` (both), `isUp()` (NATS connection state); neither is called by core. */
+export const BUS_MEMBERS = Object.freeze(["publish", "subscribe", "flush", "close", "maxBytes"]);
+
+/**
+ * @typedef {{
+ *   publish(subject: string, msg: object): void | Promise<void>,
+ *     // Fire and forget, at-most-once, asynchronous delivery. msg is plain data (a top-level Uint8Array field is allowed).
+ *     // Rejects PortError "too-large" over MAX_BUS_BYTES (nothing sent); "unavailable" while a networked bus is down (dropped, not queued);
+ *     // "bad-id" / TypeError for a bad subject. After close(): resolves, delivers nothing.
+ *   subscribe(subject: string, fn: (msg: object, subject: string) => void): () => void,
+ *     // Exact subject, no wildcards. One handler subscribed twice is one subscription. Returns an idempotent unsubscribe.
+ *     // A handler that throws or rejects loses that message only (onError hears it); others and later messages are unaffected.
+ *   flush(): Promise<void>,   // resolves once everything published so far has left this process
+ *   close(): Promise<void>,
+ *   maxBytes: number,         // the message cap (MAX_BUS_BYTES)
+ * }} Bus  Ordered per subject for one publisher; no order across publishers.
+ */
+
 /** § Bus: no message the protocol needs is over 2 MB (NATS: max_payload, headers included). */
 export const MAX_BUS_BYTES = 2 * 1024 * 1024;
 

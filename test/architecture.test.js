@@ -18,7 +18,7 @@
 //             ("adapter->core" otherwise; manager decision on p-archv question 3).
 //             DRIVING adapters (HTTP/WebSocket calling into the core: server.js, static.js, blob-http.js, auth/http.js) may also
 //             import core.
-//   adapter-only support: SUPPORT_DIRS (server/pg/, server/encode/) holds code several adapters share (Postgres start-up, sliced JSON encoding). It counts
+//   adapter-only support: SUPPORT_DIRS (server/pg/, server/sqlite/, server/encode/) holds code several adapters share (Postgres start-up, sliced JSON encoding). It counts
 //             as an adapter (core may not import it, it may not import other adapters) that any adapter may import.
 //   root      COMPOSITION_ROOTS pick and wire adapters; nothing imports a root. Every script under scripts/ must be a
 //             root (strict on purpose, p-archv L3): a new dev script is added here when it is written.
@@ -35,7 +35,7 @@ const SCAN = ["packages", "server", "scripts", "deploy"];   // every non-test co
 const CORE_DIRS = ["packages/protocol/", "packages/core/", "server/admin/"];
 const CORE_FILES = ["server/gateway.js", "server/room-host.js", "server/feed.js", "server/breather.js", "server/ids.js", "server/log.js", "server/blob-access.js"];
 const ADAPTER_DIRS = ["server/store/", "server/registry/", "server/bus/", "server/blobs/", "server/auth/", "server/compress/"];
-const SUPPORT_DIRS = ["server/pg/", "server/encode/"];
+const SUPPORT_DIRS = ["server/pg/", "server/sqlite/", "server/encode/"];
 /** Driving adapters, each with its group: server.js serves HTTP/WebSocket (Bun.serve) and mounts static.js. */
 const DRIVING = {
   "server/server.js": "server/http",
@@ -113,11 +113,11 @@ test("every allowlist entry says why", () => {
 test("the classes are what they must be (no vacuous pass)", () => {
   for (const p of ["packages/protocol/room.js", "packages/protocol/replica.js", "packages/core/doc.js", "server/gateway.js",
     "server/room-host.js", "server/feed.js", "server/ids.js", "server/log.js", "server/admin/boards.js", "server/auth/tenancy.js",
-    "server/bus/port.js", "server/blobs/port.js", "server/auth/port.js", "server/auth/idp-port.js", "server/auth/registry-port.js",
+    "server/bus/port.js", "server/blobs/port.js", "server/store/port.js", "server/auth/port.js", "server/auth/idp-port.js", "server/auth/registry-port.js",
     "server/auth/util.js", "server/auth/resolver.js", "server/auth/permissions.js"]) expect([p, isCore(p), isAdapter(p)]).toEqual([p, true, false]);
   for (const p of ["server/store/sqlite.js", "server/store/postgres.js", "server/registry/postgres.js", "server/bus/nats.js",
     "server/bus/memory.js", "server/blobs/s3.js", "server/blobs/disk.js", "server/auth/oidc.js", "server/auth/dev.js",
-    "server/auth/http.js", "server/server.js", "server/pg/schema.js"]) expect([p, isAdapter(p), isCore(p)]).toEqual([p, true, false]);
+    "server/auth/http.js", "server/server.js", "server/pg/schema.js", "server/sqlite/schema.js"]) expect([p, isAdapter(p), isCore(p)]).toEqual([p, true, false]);
   for (const p of ["packages/natsbus/bus.js", "server/redis-cache.js", "scripts/seed.js"]) expect([p, isCore(p) || isAdapter(p)]).toEqual([p, false]);
   expect(adapterGroup("server/static.js")).toBe(adapterGroup("server/server.js"));
   expect(adapterGroup("server/blobs/s3.js")).not.toBe(adapterGroup("server/blobs/disk.js"));
@@ -134,7 +134,19 @@ test("shared code goes through ports and support modules, not through another ad
   expect(importsOf("server/registry/postgres.js").map(i => i.to)).toContain("server/pg/schema.js");
   expect(importsOf("server/store/postgres.js").map(i => i.to)).toContain("server/pg/schema.js");
   expect(importsOf("server/pg/schema.js")).toEqual([]);   // a leaf
+  for (const f of ["server/store/sqlite.js", "server/registry/sqlite.js"]) expect(importsOf(f).map(i => i.to)).toContain("server/sqlite/schema.js");
+  expect(importsOf("server/sqlite/schema.js")).toEqual([]);   // bun:sqlite is a bare package, not a project edge
   for (const f of ["server/blobs/s3.js", "server/blobs/disk.js"]) expect(importsOf(f).map(i => i.to)).toContain("server/blobs/port.js");
+});
+
+test("every adapter imports its port module (one documented interface per port)", () => {
+  const PORT_OF = {
+    "server/store/sqlite.js": "server/store/port.js", "server/store/postgres.js": "server/store/port.js",
+    "server/registry/sqlite.js": "server/auth/registry-port.js", "server/registry/postgres.js": "server/auth/registry-port.js", "server/auth/registry.js": "server/auth/registry-port.js",
+    "server/bus/memory.js": "server/bus/port.js", "server/bus/nats.js": "server/bus/port.js",
+    "server/blobs/disk.js": "server/blobs/port.js", "server/blobs/s3.js": "server/blobs/port.js",
+  };
+  for (const [adapter, port] of Object.entries(PORT_OF)) expect([adapter, importsOf(adapter).map(i => i.to).includes(port)]).toEqual([adapter, true]);
 });
 
 // ---- the rules themselves, on planted sources: a violation of each kind fails ----

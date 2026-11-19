@@ -1,7 +1,8 @@
 // The Registry port (PROTOCOL.md § Registry): tenants, the board registry (`Registry.board(id)`; the Store has no
 // board lookup), per-board grants, invites and share links. No adapter code here: adapters are server/auth/registry.js
 // (memory) and server/registry/{sqlite,postgres}.js (engine). Every adapter passes test/auth/registry-contract.js.
-// Method names are STABLE.
+// Method names are STABLE. Adapter-only extras (never called by core): sqlite `pragmas()`, postgres `settings()`, `readSettings()`,
+// `idemPrune()`, `gate()` (main.js reads it for the log), `idemSize()` (tests; every adapter has it); test/server/adapter-surface.test.js pins the surface of every adapter.
 //
 // Last owner: `setGrant` refuses to remove or demote a board's last `owner` grant, throwing an error whose
 // `code` is "last-owner" (match on the code, not the class: other adapters throw their own). The check and the
@@ -30,7 +31,7 @@
 // it holds Groups, Spaces (in a Group or at the root; a member's personal Space is a Space with an `owner`), Teams
 // (named sets of members), custom roles, and scoped grants (a role for a user or Team on a Unit, Group, Space or board;
 // a user's own grant on a board stays in `grants`). A board lives in at most one Space (`board.space`; null = filed
-// nowhere, which is every board made before Spaces existed). `accessContext` is the one read the resolver needs for
+// nowhere: the dev board, or one a script made without a Space). `accessContext` is the one read the resolver needs for
 // a scope's whole chain (board, Space, Group, Unit) so a hello costs one call, not one per table.
 //
 // Last owner, again: `setScopedGrant` on a Group or Space refuses to remove or demote its last `owner` grant (a user's
@@ -64,10 +65,32 @@
 
 import { randomId } from "./util.js";
 
-/** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code === "last-owner"`. */
+/** The method names of the Registry port (the typedef below, in order; `batch` ones included). test/server/adapter-surface.test.js checks every adapter against it. */
+export const REGISTRY_METHODS = Object.freeze([
+  "createTenant", "addTenantDomain", "tenant", "tenantByDomain", "addTenantAdmin", "tenantAdminsAmong",
+  "createBoard", "createGroup", "group", "groups", "createSpace", "space",
+  "spaces", "ensurePersonalSpace", "createTeam", "renameTeam", "deleteTeam", "teamsPage",
+  "teamsAmong", "teamMembersPage", "scopedGrant", "scopedGrantsPage", "touchMember", "membersAmong",
+  "findMembers", "team", "teams", "setTeamMember", "teamMembers", "setScopedGrant",
+  "rename", "updateScope", "spacesIn", "scopedGrants", "createRole", "deleteRole",
+  "roleUsage", "memberCount", "updateRole", "role", "roles", "accessContexts",
+  "accessContext", "boardsIn", "scopesOf", "board", "moveBoard", "setGrant", "grant",
+  "grants", "createInvite", "invite", "invites", "invitesFor", "revokeInvite",
+  "createLink", "link", "links", "revokeLink", "addLinkUse", "linkUses",
+  "idemGet", "markOpened", "recents", "setStarred", "starred", "starredAmong",
+  "sharedBoards", "searchBoards", "spaceCandidates", "groupCandidates", "requestAccess", "accessRequest",
+  "accessRequests", "closeAccessRequest", "grantHolders", "boardRows", "close",
+]);
+
+/**
+ * The one error class every Registry adapter throws for a refused call; match on `err.code`, never the class.
+ * Codes: "last-owner" (setGrant, setScopedGrant, setTeamMember), "no-role", "limit", "in-use" (custom roles), "moved" (moveBoard: the board is in neither `from` nor `to`), "corrupt" (a stored row breaks an invariant, e.g. a tenant with no kind row), "idem-replay" /
+ * "idem-mismatch" (see `idemErr`), "rate-limited" (requestAccess); the Postgres adapter adds "lock-timeout", "statement-timeout",
+ * "overloaded", "queue-timeout", "client-timeout" (a timeout REJECTS, never resolves to null).
+ */
 export class RegistryError extends Error {
-  /** @param {"last-owner"} code */
-  constructor(code, message) { super(message); this.name = "RegistryError"; this.code = code; }
+  /** @param {string} code @param {string} message @param {ErrorOptions} [options] */
+  constructor(code, message, options) { super(message, options); this.name = "RegistryError"; this.code = code; }
 }
 
 /** Tenant ids: "t-" + 12 of [a-z0-9]; Group "g-", Space "s-", Team "tm-", custom role "r-", each + 12. Board ids: "b-" + 16. Invite ids: "i-" + 16. Link ids: 26 (≈ 134 bits). */
@@ -183,6 +206,7 @@ export const mint = {
  *   closeAccessRequest(scope: ScopeRef, user: string, state: "dismissed"|"granted"): Promise<boolean>,   // both keep the row and stamp `closedAt`: "dismissed" holds the cooldown (counted from `closedAt`), "granted" only the per-person count (a granted row is never returned and never blocks); true when a row was pending
  *   grantHolders(scope: ScopeRef, roles: string[], o?: { limit?: number }): Promise<ScopedGrant[]>,   // the scoped grants AT the scope whose role is one of `roles`, by subject, at most `limit` (default and cap ASK.holders)
  *   boardRows(boards: string[], o: { user: string, email?: string|null }): Promise<Map<string, BoardRows>>,   // the board-scope rows the resolver reads for one user over at most BATCH boards, in a fixed number of statements; unknown ids are absent
+ *   close(): Promise<void>,   // idempotent; the memory adapter has nothing to release and resolves at once
  * }} Registry
  */
 
@@ -193,7 +217,7 @@ export const mint = {
  */
 export const ASK = Object.freeze({ cooldownMs: 24 * 3600_000, windowMs: 24 * 3600_000, perUser: 20, scopePending: 200, ttlMs: 30 * 24 * 3600_000, prune: 100, holders: 20, page: { default: 50, max: 200 } });
 /** The refusal of `requestAccess`: code "rate-limited", `retryAfterMs` = when it may succeed (null: not before something else changes). */
-export const askLimited = retryAfterMs => Object.assign(new Error("registry: access requests are rate limited"), { name: "RegistryError", code: "rate-limited", retryAfterMs });
+export const askLimited = retryAfterMs => Object.assign(new RegistryError("rate-limited", "registry: access requests are rate limited"), { retryAfterMs });
 /** The scope types a request names, and the validated shape of one (every adapter agrees). */
 export const ASK_SCOPES = ["group", "space", "board"];
 export const askScope = s => { const sc = orgDefaults.scope(s); if (!ASK_SCOPES.includes(sc.type)) fail("scope"); return sc; };
@@ -215,13 +239,11 @@ export const askLimits = o => {
 /** Home (PROTOCOL.md § Home): rows kept per user in Recent, rows a starred / shared read may return, and the most boards one `boardRows` / `starredAmong` call takes. */
 /** Idempotent creates (PROTOCOL.md): a key row is kept `ttlMs`; expired rows are pruned `prune` at a time, every `every`-th keyed create. */
 export const IDEM = Object.freeze({ ttlMs: 24 * 3600_000, prune: 500, every: 64 });
-/** The rejection of `moveBoard` whose board is in neither `from` nor `to` (someone moved it meanwhile). Match on `code`, not the class. */
-export const movedErr = () => Object.assign(new Error("registry: the board is no longer in that Space"), { name: "RegistryError", code: "moved" });
 /** @typedef {{ user: string, key: string, fp: string }} Idem  The Idempotency-Key of a create: its user, the key, the SHA-256 fingerprint of the request. */
 /** The two rejections of a keyed create that met a live row. Match on `code`, not the class. */
 export const idemErr = {
-  replay: ref => Object.assign(new Error("registry: idempotent replay"), { name: "RegistryError", code: "idem-replay", ref }),
-  mismatch: () => Object.assign(new Error("registry: idempotency key reused"), { name: "RegistryError", code: "idem-mismatch" }),
+  replay: ref => Object.assign(new RegistryError("idem-replay", "registry: idempotent replay"), { ref }),
+  mismatch: () => new RegistryError("idem-mismatch", "registry: idempotency key reused"),
 };
 /** `idem` as the adapters take it (the key's format is http.js's to enforce): absent = null; else three non-empty strings, or "registry: bad idempotency key". */
 export const idemOf = idem => {

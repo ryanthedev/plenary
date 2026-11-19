@@ -1,7 +1,23 @@
 // The Blobs port (PROTOCOL.md § Blobs): what every Blobs adapter (disk.js, s3.js) checks before storing.
 //   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB, a hash mismatch, and anything that isn't a PNG/JPEG/GIF/WebP
 //   get(tenant, sha1)          bytes, or null
+//   usage(tenant)             the total bytes the tenant's blobs take (the quota's starting point)
 // Shared port pieces, no adapter code: adapters never import each other.
+//
+// Errors are PortError codes: bad-id (tenant or sha1), bad-entry (not bytes, or empty), too-large, hash-mismatch, not-image.
+// put answers true when it stored the blob now and false when the tenant already had it; the first bytes for a hash are kept.
+// Blobs are per tenant: the same sha1 under two tenants is two blobs. An infrastructure failure rejects (never null).
+
+/** The method names every Blobs adapter has (test/server/adapter-surface.test.js). */
+export const BLOBS_METHODS = Object.freeze(["put", "get", "usage"]);
+
+/**
+ * @typedef {{
+ *   put(tenant: string, sha1: string, bytes: Uint8Array): Promise<boolean>,
+ *   get(tenant: string, sha1: string): Promise<null | Uint8Array>,
+ *   usage(tenant: string): Promise<number>,
+ * }} Blobs
+ */
 
 import { isSha1, PortError } from "../ids.js";
 

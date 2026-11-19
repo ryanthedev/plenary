@@ -356,7 +356,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   const dev = devAuth(tokens ? { enabled: true, tokens } : undefined);
   const sessions = await makeSessions({ key: sessionKey });
   // PLENARY_ADMIN_BOARD_CONTENT=1: a Unit admin enters every room of the Unit as owner (default off: an admin manages
-  // every board but needs a role to enter one, as before Spaces; PROTOCOL.md § Organization).
+  // every board but needs a role to enter one; PROTOCOL.md § Organization).
   const adminBoardContent = ["1", "true"].includes(String(env.PLENARY_ADMIN_BOARD_CONTENT ?? "").trim().toLowerCase());
   const tenancy = makeTenancy({ registry, adminBoardContent });
   // Hellos read roles through a per-process cache; the gateway invalidates it on `grants` and its timed pass reads fresh (p5-load).

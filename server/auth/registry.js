@@ -2,7 +2,7 @@
 // last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
 import { normEmail } from "./util.js";
-import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, movedErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "./registry-port.js";
+import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "./registry-port.js";
 
 /**
  * @typedef {import("./registry-port.js").Registry} Registry
@@ -73,6 +73,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
   const scopeTenant = (type, id) => (type === "unit" ? tenants.get(id) : type === "group" ? groups.get(id) : type === "space" ? spaces.get(id) : boards.get(id))?.[type === "unit" ? "id" : "tenant"];
 
   return {
+    async close() {},
     async createTenant({ domain, domains = [], kind = "company", admins = [] }) {
       const ds = domainList(domain, domains);
       if (!KINDS.includes(kind)) throw new Error("registry: bad unit kind");
@@ -119,7 +120,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const k = idemEnter(key);
       const moved = b.space !== to;
       if (moved) {
-        if (b.space !== (from ?? null)) throw movedErr();
+        if (b.space !== (from ?? null)) throw new RegistryError("moved", "the board is no longer in that Space");
         b.space = to;
       }
       idemPut(k, b.id);

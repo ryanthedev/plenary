@@ -3,6 +3,7 @@
 import { test, expect, afterAll } from "bun:test";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
+import { rmSync, readdirSync } from "node:fs";
 import { sqliteStore } from "../../server/store/sqlite.js";
 import { storeContract, entry, code } from "./store-contract.js";
 import { tempDir, cleanup } from "./helpers.js";
@@ -46,25 +47,39 @@ test("lease expiry is judged on the injected clock alone, to the millisecond", a
   await store.close();
 });
 
-test("a file made before the lease (epoch-only leases table) is upgraded in place and keeps its epochs", async () => {
+test("a file made before the lease (epoch-only leases table) is an old-format store: refused with code old-format, and left as it was", () => {
   const path = join(tempDir(), "plenary.db");
   const old = new Database(path, { create: true });
   old.run("CREATE TABLE leases (tenant TEXT NOT NULL, board TEXT NOT NULL, epoch INTEGER NOT NULL, PRIMARY KEY (tenant, board)) WITHOUT ROWID");
   old.run("INSERT INTO leases (tenant, board, epoch) VALUES (?, ?, 5)", [T, B]);
   old.close();
-  const store = sqliteStore({ path });
-  expect(await store.epoch(T, B)).toBe(5);
-  expect(await store.lease(T, B)).toEqual({ holder: null, epoch: 5, expiresAt: null, live: false, remainingMs: 0 });
-  expect((await store.acquire(T, B, "h-a", 1_000)).epoch).toBe(6);                // unheld: taken at once
-  await store.append(T, B, [entry(1)], 0, 6);
-  expect(await store.openEpoch(T, B)).toBe(7);
-  await store.close();
-  const again = sqliteStore({ path });                                            // a second open: no ALTER runs twice
-  expect(await again.epoch(T, B)).toBe(7);
-  await again.close();
+  let err;
+  const fds = readdirSync("/dev/fd").length;
+  try { sqliteStore({ path }); } catch (e) { err = e; }
+  expect(err?.code).toBe("old-format");
+  expect(readdirSync("/dev/fd").length).toBe(fds);                                                                      // the refused open left no handle (an rmSync would pass either way)
+  expect(err.message).toMatch(/Reset the store/);
+  const after = new Database(path, { readonly: true });
+  expect(after.query("PRAGMA table_info(leases)").all().map(c => c.name)).toEqual(["tenant", "board", "epoch"]);   // never ALTERed
+  expect(after.query("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(t => t.name)).toEqual(["leases"]);   // no entries/checkpoints/parts were created
+  expect(after.query("PRAGMA journal_mode").get().journal_mode).toBe("delete");                                         // the WAL switch never happened
+  after.close();
+  rmSync(path);                                                                                                         // no handle was left open: the file can go
 });
 
-test("a file made before checkpoint parts (no checkpoint_parts table, one big JSON row) opens, reads it, and takes parts beside it", async () => {
+test("the old-format rule is general: a changed column set in any Store table refuses the file; a reopen of a good file does not", async () => {
+  const good = join(tempDir(), "plenary.db"), s = sqliteStore({ path: good }); await s.close();
+  sqliteStore({ path: good }).close();
+  for (const table of ["entries", "checkpoints", "checkpoint_parts"]) {
+    const path = join(tempDir(), "plenary.db"), db = new Database(path);
+    db.run(`CREATE TABLE ${table} (tenant TEXT NOT NULL, board TEXT NOT NULL, seq INTEGER NOT NULL)`);   // `data` missing
+    db.close();
+    let err; try { sqliteStore({ path }); } catch (e) { err = e; }
+    expect([table, err?.code]).toEqual([table, "old-format"]);
+  }
+});
+
+test("a checkpoint stored as one plain JSON row (no header, no parts: what a small checkpoint is) reads, and parts sit beside it", async () => {
   const path = join(tempDir(), "plenary.db");
   const old = new Database(path, { create: true });
   old.run("CREATE TABLE checkpoints (tenant TEXT NOT NULL, board TEXT NOT NULL, seq INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq)) WITHOUT ROWID");

@@ -12,8 +12,8 @@ import { registryContract } from "../auth/registry-contract.js";
 import { accessRace } from "../auth/access-race.js";
 import { accessEquivalence } from "../auth/access-equivalence.js";
 import { tenancy } from "../../server/auth/tenancy.js";
-import { legacyEquivalence } from "../auth/legacy-migration.js";
-import { migrate } from "../../server/pg/schema.js";
+import { migrate, ddlColumns } from "../../server/pg/schema.js";
+import { STORE_TABLES } from "../../server/store/postgres.js";
 
 const url = process.env.DATABASE_URL;
 // Every test here does real Postgres work (schema creation, pools, lock waits). Bun's 5 s default fails them under machine load (TECH-DEBT
@@ -34,7 +34,7 @@ describe.skipIf(!url)("postgres registry", () => {
   const canCreateRoles = async () =>
     (await client().unsafe("SELECT rolsuper OR rolcreaterole AS ok FROM pg_roles WHERE rolname = current_user"))[0].ok;
   afterAll(async () => {
-    try { if (priv.app) await priv.app.close(); if (priv.made) await dropRole(priv.role); if (legacySchema) await drop(legacySchema); }
+    try { if (priv.app) await priv.app.close(); if (priv.made) await dropRole(priv.role); }
     finally { if (sql) await sql.close(); }
   });
   let n = 0;
@@ -114,29 +114,20 @@ describe.skipIf(!url)("postgres registry", () => {
     } catch (err) { await drop(schema); throw err; }
   }, { cleanup: async r => { await r.close(); await drop(schemas.get(r)); schemas.delete(r); }, batch: true });
 
-  // A schema from before board organization: only the seven original tables (same DDL, still the first seven of registryTables),
-  // filled with a legacy state; the adapter's start-up then creates the rest and must change nobody's access.
+  // A schema from before board organization: only the seven original tables (the first seven of registryTables):
+  // the tables of a pre-organization schema; start-up refuses it.
   const LEGACY_TABLES = ["reg_tenants", "reg_tenant_admins", "reg_boards", "reg_grants", "reg_invites", "reg_links", "reg_link_uses"];
-  let legacySchema = null;
-  legacyEquivalence("postgres", {
-    async install(st) {
-      if (legacySchema) await drop(legacySchema);
-      legacySchema = schemaName();
-      const all = registryTables(legacySchema), old = Object.fromEntries(LEGACY_TABLES.map(t => [t, all[t]]));
-      await client().begin(tx => migrate(tx, legacySchema, old));
-      const S = `"${legacySchema}"`, q = (text, p) => client().unsafe(text, p);
-      for (const t of st.tenants) { await q(`INSERT INTO ${S}.reg_tenants VALUES ($1, $2, 1)`, [t.id, t.domain]); for (const a of t.admins) await q(`INSERT INTO ${S}.reg_tenant_admins (tenant, member) VALUES ($1, $2)`, [t.id, a]); }
-      for (const b of st.boards) await q(`INSERT INTO ${S}.reg_boards VALUES ($1, $2, $3, $4, 1)`, [b.id, b.tenant, b.title, b.memberRole]);
-      for (const g of st.grants) await q(`INSERT INTO ${S}.reg_grants (board, member, role) VALUES ($1, $2, $3)`, [g.board, g.user, g.role]);
-      for (const i of st.invites) await q(`INSERT INTO ${S}.reg_invites (id, board, email, role, expires_at, revoked, by_user, created_at) VALUES ($1, $2, $3, $4, $5, $6, 'x', 1)`, [i.id, i.board, i.email, i.role, i.expiresAt, i.revoked]);
-      for (const l of st.links) await q(`INSERT INTO ${S}.reg_links (id, board, role, expires_at, revoked, by_user, created_at) VALUES ($1, $2, $3, $4, $5, 'x', 1)`, [l.id, l.board, l.role, l.expiresAt, l.revoked]);
-      for (const u of st.uses) await q(`INSERT INTO ${S}.reg_link_uses (board, member, link) VALUES ($1, $2, $3)`, [u.board, u.user, u.link]);
-    },
-    async open() { const registry = await postgresRegistry({ sql: client(), schema: legacySchema, now: () => 5_000_000 }); return { registry, close: () => registry.close() }; },
-    async count() {
-      const c = async t => Number((await client().unsafe(`SELECT count(*) AS c FROM "${legacySchema}".${t}`))[0].c);
-      return { boards: await c("reg_boards"), grants: await c("reg_grants"), invites: await c("reg_invites"), links: await c("reg_links") };
-    },
+  test("a schema from before the organization (boards, no Spaces) is an old-format store: refused with code old-format, and left as it was", async () => {
+    const schema = schemaName();
+    const all = registryTables(schema), old = Object.fromEntries(LEGACY_TABLES.map(t => [t, all[t]]));
+    try {
+      await client().begin(tx => migrate(tx, schema, old));
+      const err = await postgresRegistry({ sql: client(), schema }).then(() => null, e => e);
+      expect(err?.code).toBe("old-format");
+      expect(err.message).toMatch(/Reset the store/);
+      const [{ c }] = await client().unsafe("SELECT count(*)::int AS c FROM pg_tables WHERE schemaname = $1", [schema]);
+      expect(c).toBe(LEGACY_TABLES.length);                                         // nothing was added
+    } finally { await drop(schema); }
   });
   test("accessContext is ONE statement (one snapshot), cold or with a held chain; a cold hello is a handful", async () => {
     const schema = schemaName();
@@ -613,7 +604,7 @@ describe.skipIf(!url)("postgres registry", () => {
     try {
       await client().unsafe(`DROP TABLE "${schema}".reg_idempotency`);
       await client().unsafe(`CREATE TABLE "${schema}".reg_idempotency (member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, claim TEXT NOT NULL, result TEXT, at BIGINT NOT NULL, PRIMARY KEY (member, k))`);
-      await expect(postgresRegistry({ url, schema, max: 2 })).rejects.toThrow(/reg_idempotency.*older version.*DROP TABLE/);
+      await expect(postgresRegistry({ url, schema, max: 2 })).rejects.toThrow(/reg_idempotency.*older version.*Reset the store/);
     } finally { await drop(schema); }
   }, 30_000);
 
@@ -623,7 +614,41 @@ describe.skipIf(!url)("postgres registry", () => {
     await r.close();
     try {
       await client().unsafe(`ALTER TABLE "${schema}".reg_access_requests DROP COLUMN closed_at`);
-      await expect(postgresRegistry({ url, schema, max: 2 })).rejects.toThrow(/reg_access_requests.*older version.*DROP TABLE/);
+      await expect(postgresRegistry({ url, schema, max: 2 })).rejects.toThrow(/reg_access_requests.*older version.*Reset the store/);
+    } finally { await drop(schema); }
+  }, 30_000);
+
+  test("the old-format rule is general: a column missing from ANY table refuses the schema (and a reopen of a good one, and the runtime role, do not false-fire)", async () => {
+    const schema = schemaName();
+    try {
+      await (await postgresRegistry({ url, schema, max: 2 })).close();
+      await (await postgresRegistry({ url, schema, max: 2 })).close();                       // a reopen: nothing refused
+      const app = await runtime();                                                           // the runtime role (no CREATE) reads the catalog too: no false-fire
+      if (app) {
+        await client().unsafe(`GRANT USAGE ON SCHEMA "${schema}" TO "${priv.role}"`);
+        await client().unsafe(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO "${priv.role}"`);
+        await (await postgresRegistry({ sql: app, schema })).close();
+      }
+      for (const [table, col] of [["reg_teams", "created_at"], ["reg_members", "email"], ["reg_scope_grants", "role"]]) {
+        await client().unsafe(`ALTER TABLE "${schema}".${table} DROP COLUMN ${col}`);
+        const err = await postgresRegistry({ url, schema, max: 2 }).then(() => null, e => e);
+        expect([table, err?.code]).toEqual([table, "old-format"]);
+        expect(err.message).toContain(table);
+        expect(err.message).toContain(`drop the schema "${schema}"`);                      // never advises dropping one table
+        await client().unsafe(`ALTER TABLE "${schema}".${table} ADD COLUMN ${col} TEXT`);   // (the names match again; the types no longer matter to the rule)
+      }
+    } finally { await drop(schema); }
+  }, 30_000);
+
+  test("ddlColumns equals the catalog: for every table of the Registry and the Store, the columns parsed from the DDL are the columns Postgres made", async () => {
+    const schema = schemaName();
+    const tables = { ...registryTables(schema), ...STORE_TABLES };
+    try {
+      await client().begin(tx => migrate(tx, schema, tables));
+      for (const [t, defs] of Object.entries(tables)) {
+        const got = (await client().unsafe(`SELECT a.attname FROM pg_attribute a WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped`, [`"${schema}".${t}`])).map(r => r.attname).sort();
+        expect([t, ddlColumns(defs).sort()]).toEqual([t, got]);
+      }
     } finally { await drop(schema); }
   }, 30_000);
 

@@ -1,6 +1,6 @@
 // The Registry port on SQLite (PROTOCOL.md § Registry): tenants (Units), boards, grants, invites, share links, link uses, and
 // the board organization (Groups, Spaces, Teams, scoped grants, roles, `accessContext`). Start-up only ever ADDS tables
-// (CREATE TABLE IF NOT EXISTS), so opening a database from before the organization is the whole migration, and re-running it is a no-op.
+// (CREATE TABLE IF NOT EXISTS); a file from an older shape is refused (code "old-format"), never migrated.
 // Same contract and semantics as platform's in-memory adapter (server/auth/registry.js); method names are stable.
 //
 // Durable = WAL + synchronous=FULL (+ fullfsync on macOS), like server/store/sqlite.js: a resolved write survives a
@@ -17,15 +17,14 @@
 // `user`; insertion order is an explicit `n` column (Postgres: BIGSERIAL / identity), upserts use ON CONFLICT.
 
 import { Database } from "bun:sqlite";
-import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, movedErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
+import { RegistryError, batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
+import { assertShapes } from "../sqlite/schema.js";
 
-/** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code`. */
-export class SqlRegistryError extends Error {
-  /** @param {"last-owner"} code */
-  constructor(code, message) { super(message); this.name = "RegistryError"; this.code = code; }
-}
-
+/** An old-format store is refused at start-up (never read silently, never ALTERed). */
+const oldFormat = msg => Object.assign(new Error(msg), { code: "old-format" });
+/** A tenant row always has its kind row (createTenant writes both in one step): a missing one is a corrupt store, never a silent default. */
+const needKind = (kind, id, absent = false) => { if (!absent && typeof kind !== "string") throw new RegistryError("corrupt", `tenant ${id} has no kind row`); return kind ?? null; };
 const str = v => typeof v === "string";
 
 /**
@@ -65,11 +64,95 @@ export function sqliteRegistry(opts) {
   catch (err) { try { db.close(); } catch {} throw err; }   // a failed start-up (a busy file, an old-format table) never leaks the handle
 }
 
+/** The Registry's tables and indexes. Run on the file (all IF NOT EXISTS) and on a scratch database, whose table shapes the file's must match. */
+const createSchema = d => {
+    d.run(`CREATE TABLE IF NOT EXISTS reg_tenants (
+      id TEXT PRIMARY KEY, domain TEXT UNIQUE, created_at INTEGER NOT NULL)`);
+    d.run(`CREATE TABLE IF NOT EXISTS reg_tenant_admins (
+      tenant TEXT NOT NULL REFERENCES reg_tenants(id), member TEXT NOT NULL, n INTEGER NOT NULL,
+      PRIMARY KEY (tenant, member))`);
+    d.run(`CREATE TABLE IF NOT EXISTS reg_boards (
+      id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), title TEXT NOT NULL,
+      member_role TEXT, created_at INTEGER NOT NULL)`);
+    d.run(`CREATE TABLE IF NOT EXISTS reg_grants (
+      board TEXT NOT NULL REFERENCES reg_boards(id), member TEXT NOT NULL, role TEXT NOT NULL, n INTEGER NOT NULL,
+      PRIMARY KEY (board, member))`);
+    d.run(`CREATE TABLE IF NOT EXISTS reg_invites (
+      n INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES reg_boards(id),
+      email TEXT NOT NULL, role TEXT NOT NULL, expires_at INTEGER, revoked INTEGER NOT NULL, by_user TEXT,
+      created_at INTEGER NOT NULL)`);
+    d.run("CREATE INDEX IF NOT EXISTS reg_tenant_admins_member ON reg_tenant_admins (member)");
+    d.run("CREATE INDEX IF NOT EXISTS reg_invites_board ON reg_invites (board, email)");
+    d.run(`CREATE TABLE IF NOT EXISTS reg_links (
+      n INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES reg_boards(id),
+      role TEXT NOT NULL, expires_at INTEGER, revoked INTEGER NOT NULL, by_user TEXT, created_at INTEGER NOT NULL)`);
+    d.run("CREATE INDEX IF NOT EXISTS reg_links_board ON reg_links (board)");
+    d.run(`CREATE TABLE IF NOT EXISTS reg_link_uses (
+      board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES reg_links(id), n INTEGER NOT NULL,
+      PRIMARY KEY (board, member, link))`);
+    // Board organization (a board with no reg_board_spaces row is unfiled; every statement is IF NOT EXISTS, so re-running start-up is a no-op).
+    d.run("CREATE TABLE IF NOT EXISTS reg_tenant_meta (tenant TEXT PRIMARY KEY REFERENCES reg_tenants(id), kind TEXT NOT NULL)");
+    d.run(`CREATE TABLE IF NOT EXISTS reg_tenant_domains (
+      domain TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), n INTEGER NOT NULL)`);
+    d.run(`CREATE TABLE IF NOT EXISTS reg_groups (
+      id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), name TEXT NOT NULL, general_role TEXT, created_at INTEGER NOT NULL)`);
+    d.run(`CREATE TABLE IF NOT EXISTS reg_spaces (
+      id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), grp TEXT REFERENCES reg_groups(id), name TEXT NOT NULL,
+      kind TEXT NOT NULL, owner_user TEXT, general_role TEXT, created_at INTEGER NOT NULL, UNIQUE (tenant, owner_user))`);
+    d.run(`CREATE TABLE IF NOT EXISTS reg_board_spaces (
+      board TEXT PRIMARY KEY REFERENCES reg_boards(id), space TEXT NOT NULL REFERENCES reg_spaces(id))`);
+    d.run(`CREATE TABLE IF NOT EXISTS reg_teams (
+      id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), name TEXT NOT NULL, created_at INTEGER NOT NULL)`);
+    d.run(`CREATE TABLE IF NOT EXISTS reg_team_members (
+      team TEXT NOT NULL REFERENCES reg_teams(id), member TEXT NOT NULL, PRIMARY KEY (team, member))`);
+    d.run(`CREATE TABLE IF NOT EXISTS reg_members (
+      tenant TEXT NOT NULL REFERENCES reg_tenants(id), member TEXT NOT NULL, name TEXT, email TEXT, PRIMARY KEY (tenant, member))`);
+    d.run(`CREATE TABLE IF NOT EXISTS reg_scope_grants (
+      scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject TEXT NOT NULL, role TEXT NOT NULL, n INTEGER NOT NULL,
+      PRIMARY KEY (scope_type, scope_id, subject_type, subject))`);
+    d.run(`CREATE TABLE IF NOT EXISTS reg_roles (
+      tenant TEXT NOT NULL REFERENCES reg_tenants(id), id TEXT NOT NULL, name TEXT NOT NULL, base TEXT, board_role TEXT,
+      permissions TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (tenant, id))`);
+    // Access requests (PROTOCOL.md § Access explanation and requests): one row per (scope, member); a dismissed row stays until its cooldown ends.
+    d.run(`CREATE TABLE IF NOT EXISTS reg_access_requests (
+      id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, member TEXT NOT NULL,
+      role TEXT NOT NULL, state TEXT NOT NULL, at INTEGER NOT NULL, closed_at INTEGER, UNIQUE (scope_type, scope_id, member))`);
+    d.run("CREATE INDEX IF NOT EXISTS reg_access_requests_member ON reg_access_requests (tenant, member, at)");
+    d.run("CREATE INDEX IF NOT EXISTS reg_access_requests_scope ON reg_access_requests (scope_type, scope_id, state, at DESC)");
+    // Home (PROTOCOL.md § Home): Recent and Starred, one row per (member, board).
+    d.run(`CREATE TABLE IF NOT EXISTS reg_recents (
+      member TEXT NOT NULL, board TEXT NOT NULL REFERENCES reg_boards(id), opened_at INTEGER NOT NULL, PRIMARY KEY (member, board))`);
+    d.run(`CREATE TABLE IF NOT EXISTS reg_stars (
+      member TEXT NOT NULL, board TEXT NOT NULL REFERENCES reg_boards(id), at INTEGER NOT NULL, PRIMARY KEY (member, board))`);
+    // Idempotent creates (PROTOCOL.md): one row per (member, key), written in the create's own transaction; `ref` is the id it made.
+    d.run(`CREATE TABLE IF NOT EXISTS reg_idempotency (
+      member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, ref TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (member, k))`);
+    d.run("CREATE INDEX IF NOT EXISTS reg_idempotency_at ON reg_idempotency (at)");
+    d.run("CREATE INDEX IF NOT EXISTS reg_recents_member ON reg_recents (member, opened_at DESC, board DESC)");
+    d.run("CREATE INDEX IF NOT EXISTS reg_stars_member ON reg_stars (member, at DESC, board DESC)");
+    d.run("CREATE INDEX IF NOT EXISTS reg_grants_member ON reg_grants (member)");
+    d.run("CREATE INDEX IF NOT EXISTS reg_boards_tenant ON reg_boards (tenant, id)");
+    d.run("CREATE INDEX IF NOT EXISTS reg_invites_email ON reg_invites (email)");
+    d.run("CREATE INDEX IF NOT EXISTS reg_link_uses_member ON reg_link_uses (member, board)");
+    d.run("CREATE INDEX IF NOT EXISTS reg_scope_grants_role ON reg_scope_grants (role, subject_type, subject)");
+    d.run("CREATE INDEX IF NOT EXISTS reg_scope_grants_subject ON reg_scope_grants (subject_type, subject, scope_type)");
+    d.run("CREATE INDEX IF NOT EXISTS reg_team_members_member ON reg_team_members (member)");
+    d.run("CREATE INDEX IF NOT EXISTS reg_spaces_tenant ON reg_spaces (tenant)");
+    d.run("CREATE INDEX IF NOT EXISTS reg_spaces_grp ON reg_spaces (grp, id)");
+    d.run("CREATE INDEX IF NOT EXISTS reg_groups_tenant ON reg_groups (tenant)");
+    d.run("CREATE INDEX IF NOT EXISTS reg_teams_tenant ON reg_teams (tenant)");
+};
+
 function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 5000, busy = {} }) {
   const { clock = Date.now, onAttempt } = busy;
   let open = true;
   const wait = Math.max(0, Math.floor(busyTimeoutMs));
   db.run(`PRAGMA busy_timeout=${wait}`);
+  // Before any write to the file (no WAL switch, no CREATE): an old-format file is refused as it was found.
+  const has = t => !!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(t);
+  if (has("reg_boards") && !has("reg_spaces"))   // from before the organization: boards, no Spaces
+    throw oldFormat("sqlite registry: the file has reg_boards but no reg_spaces: it is from an older version. Reset the store (delete the file)");
+  assertShapes(db, createSchema, "sqlite registry");
   // Several processes opening one brand-new file at once (N nodes or bootstrap scripts): switching to WAL needs an
   // exclusive lock, and SQLite returns BUSY for it without calling the busy handler, so busy_timeout alone doesn't
   // help (reproduced: ~1 in 10 of 12 simultaneous opens failed at this pragma). So: skip the switch once the file
@@ -86,89 +169,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   db.run("PRAGMA foreign_keys=ON");
 
   onBusyRetry(db, deadline, () => db.transaction(() => {
-    db.run(`CREATE TABLE IF NOT EXISTS reg_tenants (
-      id TEXT PRIMARY KEY, domain TEXT UNIQUE, created_at INTEGER NOT NULL)`);
-    db.run(`CREATE TABLE IF NOT EXISTS reg_tenant_admins (
-      tenant TEXT NOT NULL REFERENCES reg_tenants(id), member TEXT NOT NULL, n INTEGER NOT NULL,
-      PRIMARY KEY (tenant, member))`);
-    db.run(`CREATE TABLE IF NOT EXISTS reg_boards (
-      id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), title TEXT NOT NULL,
-      member_role TEXT, created_at INTEGER NOT NULL)`);
-    db.run(`CREATE TABLE IF NOT EXISTS reg_grants (
-      board TEXT NOT NULL REFERENCES reg_boards(id), member TEXT NOT NULL, role TEXT NOT NULL, n INTEGER NOT NULL,
-      PRIMARY KEY (board, member))`);
-    db.run(`CREATE TABLE IF NOT EXISTS reg_invites (
-      n INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES reg_boards(id),
-      email TEXT NOT NULL, role TEXT NOT NULL, expires_at INTEGER, revoked INTEGER NOT NULL, by_user TEXT,
-      created_at INTEGER NOT NULL)`);
-    db.run("CREATE INDEX IF NOT EXISTS reg_tenant_admins_member ON reg_tenant_admins (member)");
-    db.run("CREATE INDEX IF NOT EXISTS reg_invites_board ON reg_invites (board, email)");
-    db.run(`CREATE TABLE IF NOT EXISTS reg_links (
-      n INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES reg_boards(id),
-      role TEXT NOT NULL, expires_at INTEGER, revoked INTEGER NOT NULL, by_user TEXT, created_at INTEGER NOT NULL)`);
-    db.run("CREATE INDEX IF NOT EXISTS reg_links_board ON reg_links (board)");
-    db.run(`CREATE TABLE IF NOT EXISTS reg_link_uses (
-      board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES reg_links(id), n INTEGER NOT NULL,
-      PRIMARY KEY (board, member, link))`);
-    // Board organization (additive: new tables only, so a database from before it opens unchanged; every statement is
-    // IF NOT EXISTS, so re-running start-up is a no-op). Existing boards stay unfiled (no reg_board_spaces row), existing
-    // tenants read as kind "company" with their one domain, and nothing about anyone's access changes.
-    db.run("CREATE TABLE IF NOT EXISTS reg_tenant_meta (tenant TEXT PRIMARY KEY REFERENCES reg_tenants(id), kind TEXT NOT NULL)");
-    db.run(`CREATE TABLE IF NOT EXISTS reg_tenant_domains (
-      domain TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), n INTEGER NOT NULL)`);
-    db.run(`CREATE TABLE IF NOT EXISTS reg_groups (
-      id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), name TEXT NOT NULL, general_role TEXT, created_at INTEGER NOT NULL)`);
-    db.run(`CREATE TABLE IF NOT EXISTS reg_spaces (
-      id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), grp TEXT REFERENCES reg_groups(id), name TEXT NOT NULL,
-      kind TEXT NOT NULL, owner_user TEXT, general_role TEXT, created_at INTEGER NOT NULL, UNIQUE (tenant, owner_user))`);
-    db.run(`CREATE TABLE IF NOT EXISTS reg_board_spaces (
-      board TEXT PRIMARY KEY REFERENCES reg_boards(id), space TEXT NOT NULL REFERENCES reg_spaces(id))`);
-    db.run(`CREATE TABLE IF NOT EXISTS reg_teams (
-      id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), name TEXT NOT NULL, created_at INTEGER NOT NULL)`);
-    db.run(`CREATE TABLE IF NOT EXISTS reg_team_members (
-      team TEXT NOT NULL REFERENCES reg_teams(id), member TEXT NOT NULL, PRIMARY KEY (team, member))`);
-    db.run(`CREATE TABLE IF NOT EXISTS reg_members (
-      tenant TEXT NOT NULL REFERENCES reg_tenants(id), member TEXT NOT NULL, name TEXT, email TEXT, PRIMARY KEY (tenant, member))`);
-    db.run(`CREATE TABLE IF NOT EXISTS reg_scope_grants (
-      scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject TEXT NOT NULL, role TEXT NOT NULL, n INTEGER NOT NULL,
-      PRIMARY KEY (scope_type, scope_id, subject_type, subject))`);
-    db.run(`CREATE TABLE IF NOT EXISTS reg_roles (
-      tenant TEXT NOT NULL REFERENCES reg_tenants(id), id TEXT NOT NULL, name TEXT NOT NULL, base TEXT, board_role TEXT,
-      permissions TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (tenant, id))`);
-    // Access requests (PROTOCOL.md § Access explanation and requests): one row per (scope, member); a dismissed row stays until its cooldown ends.
-    db.run(`CREATE TABLE IF NOT EXISTS reg_access_requests (
-      id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, member TEXT NOT NULL,
-      role TEXT NOT NULL, state TEXT NOT NULL, at INTEGER NOT NULL, closed_at INTEGER, UNIQUE (scope_type, scope_id, member))`);
-    const askCols = db.query("PRAGMA table_info(reg_access_requests)").all().map(c => c.name).sort().join(",");
-    if (askCols !== "at,closed_at,id,member,role,scope_id,scope_type,state,tenant")   // never ALTERed: an older shape is reset, not migrated
-      throw new Error(`sqlite registry: table reg_access_requests has columns (${askCols}) but this version needs (at,closed_at,id,member,role,scope_id,scope_type,state,tenant): it is from an older version. Reset the store or drop the table (DROP TABLE reg_access_requests); the next start-up recreates it`);
-    db.run("CREATE INDEX IF NOT EXISTS reg_access_requests_member ON reg_access_requests (tenant, member, at)");
-    db.run("CREATE INDEX IF NOT EXISTS reg_access_requests_scope ON reg_access_requests (scope_type, scope_id, state, at DESC)");
-    // Home (PROTOCOL.md § Home): Recent and Starred, one row per (member, board). Additive like the rest.
-    db.run(`CREATE TABLE IF NOT EXISTS reg_recents (
-      member TEXT NOT NULL, board TEXT NOT NULL REFERENCES reg_boards(id), opened_at INTEGER NOT NULL, PRIMARY KEY (member, board))`);
-    db.run(`CREATE TABLE IF NOT EXISTS reg_stars (
-      member TEXT NOT NULL, board TEXT NOT NULL REFERENCES reg_boards(id), at INTEGER NOT NULL, PRIMARY KEY (member, board))`);
-    // Idempotent creates (PROTOCOL.md): one row per (member, key), written in the create's own transaction; `ref` is the id it made.
-    db.run(`CREATE TABLE IF NOT EXISTS reg_idempotency (
-      member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, ref TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (member, k))`);
-    const idemCols = db.query("PRAGMA table_info(reg_idempotency)").all().map(c => c.name).sort().join(",");
-    if (idemCols !== "at,fp,k,member,ref")   // the adapters never ALTER: an older shape is reset, not migrated
-      throw new Error(`sqlite registry: table reg_idempotency has columns (${idemCols}) but this version needs (at,fp,k,member,ref): it is from an older version. Reset the store or drop the table (DROP TABLE reg_idempotency); the next start-up recreates it`);
-    db.run("CREATE INDEX IF NOT EXISTS reg_idempotency_at ON reg_idempotency (at)");
-    db.run("CREATE INDEX IF NOT EXISTS reg_recents_member ON reg_recents (member, opened_at DESC, board DESC)");
-    db.run("CREATE INDEX IF NOT EXISTS reg_stars_member ON reg_stars (member, at DESC, board DESC)");
-    db.run("CREATE INDEX IF NOT EXISTS reg_grants_member ON reg_grants (member)");
-    db.run("CREATE INDEX IF NOT EXISTS reg_boards_tenant ON reg_boards (tenant, id)");
-    db.run("CREATE INDEX IF NOT EXISTS reg_invites_email ON reg_invites (email)");
-    db.run("CREATE INDEX IF NOT EXISTS reg_link_uses_member ON reg_link_uses (member, board)");
-    db.run("CREATE INDEX IF NOT EXISTS reg_scope_grants_role ON reg_scope_grants (role, subject_type, subject)");
-    db.run("CREATE INDEX IF NOT EXISTS reg_scope_grants_subject ON reg_scope_grants (subject_type, subject, scope_type)");
-    db.run("CREATE INDEX IF NOT EXISTS reg_team_members_member ON reg_team_members (member)");
-    db.run("CREATE INDEX IF NOT EXISTS reg_spaces_tenant ON reg_spaces (tenant)");
-    db.run("CREATE INDEX IF NOT EXISTS reg_spaces_grp ON reg_spaces (grp, id)");
-    db.run("CREATE INDEX IF NOT EXISTS reg_groups_tenant ON reg_groups (tenant)");
-    db.run("CREATE INDEX IF NOT EXISTS reg_teams_tenant ON reg_teams (tenant)");
+    createSchema(db);
   }).immediate(), clock, onAttempt);
   db.run(`PRAGMA busy_timeout=${wait}`);                     // start-up spent part of it; runtime gets the whole budget
 
@@ -354,9 +355,10 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   /** A fresh server-minted id: retried on the (astronomically rare) collision. */
   const fresh = (f, exists) => { let id; do id = f(); while (exists(id)); return id; };
 
-  const rowTenant = r => r && {
+  const rowTenant = (r, absent = false) => r && {
     id: r.id, domain: r.domain, domains: [...(r.domain ? [r.domain] : []), ...q.extraDomains.all(r.id).map(d => d.domain)],
-    kind: q.tenantKind.get(r.id)?.kind ?? "company", admins: q.admins.all(r.id).map(a => a.member), createdAt: r.created_at };
+    kind: needKind(q.tenantKind.get(r.id)?.kind, r.id, absent),   // the look-up always runs (uniform statement count); `absent` = uniformTenant's placeholder row, never returned
+    admins: q.admins.all(r.id).map(a => a.member), createdAt: r.created_at };
   const rowBoard = r => r && { id: r.id, tenant: r.tenant, title: r.title, memberRole: r.member_role, space: r.space ?? null, createdAt: r.created_at };
   const rowGroup = r => r && { id: r.id, tenant: r.tenant, name: r.name, generalRole: r.general_role, createdAt: r.created_at };
   const rowSpace = r => r && { id: r.id, tenant: r.tenant, group: r.grp, name: r.name, kind: r.kind, owner: r.owner_user, generalRole: r.general_role, createdAt: r.created_at };
@@ -445,7 +447,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     idemEnter(idem, at);
     const moved = (b.space ?? null) !== to;
     if (moved) {
-      if ((b.space ?? null) !== from) throw movedErr();
+      if ((b.space ?? null) !== from) throw new RegistryError("moved", "the board is no longer in that Space");
       q.putBoardSpace.run(board, to);
     }
     idemPut(idem, board, at);
@@ -457,7 +459,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     if (!q.boardExists.get(board)) throw new Error("registry: no such board");
     const cur = q.grant.get(board, user)?.role ?? null;
     if (cur === "owner" && role !== "owner" && q.owners.get(board).c <= 1)
-      throw new SqlRegistryError("last-owner", "a board keeps at least one owner");
+      throw new RegistryError("last-owner", "a board keeps at least one owner");
     if (role == null) q.delGrant.run(board, user);
     else q.upGrant.run(board, user, role, q.grantN.get(board).n);
   });
@@ -535,7 +537,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     if (!member && q.teamSize.get(team).c === 1 && q.teamHas.get(team, user)) {
       // Removing the last member of a Team that is the only counted owner of a Group or Space would leave it ownerless.
       for (const o of q.teamOwned.all(team)) if (q.sowners.all(o.scope_type, o.scope_id).length <= 1)
-        throw new SqlRegistryError("last-owner", `a ${o.scope_type} keeps at least one owner`);
+        throw new RegistryError("last-owner", `a ${o.scope_type} keeps at least one owner`);
     }
     (member ? q.insMember : q.delMember).run(team, user);
   });
@@ -543,7 +545,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     needRow(q.team.get(team), "team");
     // An empty Team guards nothing (it is not counted), so only a Team with members can be the last counted owner.
     if (q.teamSize.get(team).c > 0) for (const o of q.teamOwned.all(team)) if (q.sowners.all(o.scope_type, o.scope_id).length <= 1)
-      throw new SqlRegistryError("last-owner", `a ${o.scope_type} keeps at least one owner`);
+      throw new RegistryError("last-owner", `a ${o.scope_type} keeps at least one owner`);
     q.delTeamGrants.run(team); q.delTeamMembers.run(team); q.delTeam.run(team);
   });
   const touchTx = db.transaction((tenant, user, name, email) => {
@@ -553,21 +555,21 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   const setSgrantTx = db.transaction((type, id, st, sid, role) => {
     const tenant = scopeTenant(type, id);
     needRow(tenant, "scope");
-    if (isCustomRoleId(role) && !q.role.get(tenant, role)) throw new SqlRegistryError("no-role", "no such custom role in this Unit");
+    if (isCustomRoleId(role) && !q.role.get(tenant, role)) throw new RegistryError("no-role", "no such custom role in this Unit");
     if (st === "team") needRow(q.team.get(sid)?.tenant === tenant, "team");
     if (type === "board" && st === "user") throw new Error("registry: a user's grant on a board is setGrant");
     const cur = q.sgrant.get(type, id, st, sid)?.role ?? null;
     if ((type === "group" || type === "space") && cur === "owner" && role !== "owner") {
       const counted = q.sowners.all(type, id);
       if (counted.some(o => o.subject_type === st && o.subject === sid) && counted.length <= 1)
-        throw new SqlRegistryError("last-owner", `a ${type} keeps at least one owner`);
+        throw new RegistryError("last-owner", `a ${type} keeps at least one owner`);
     }
     putSg(type, id, st, sid, role);
   });
   const createRoleTx = db.transaction((tenant, name, base, boardRole, perms, createdAt, max, idem) => {
     needRow(q.tenantExists.get(tenant), "tenant");
     idemEnter(idem, createdAt);
-    if (max !== undefined && q.roleCount.get(tenant).n >= max) throw new SqlRegistryError("limit", "the Unit has the most custom roles it can");
+    if (max !== undefined && q.roleCount.get(tenant).n >= max) throw new RegistryError("limit", "the Unit has the most custom roles it can");
     const id = fresh(mint.role, i => !!q.role.get(tenant, i));
     q.insRole.run(tenant, id, name, base, boardRole, JSON.stringify(perms), createdAt);
     idemPut(idem, id, createdAt);
@@ -575,7 +577,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   });
   const deleteRoleTx = db.transaction((tenant, id) => {
     needRow(q.role.get(tenant, id), "role");
-    if (q.roleHeld.get(id, 1, tenant)) throw new SqlRegistryError("in-use", "a grant still holds this role");
+    if (q.roleHeld.get(id, 1, tenant)) throw new RegistryError("in-use", "a grant still holds this role");
     q.delRole.run(tenant, id);
   });
   const updateRoleTx = db.transaction((tenant, id, patch, createdAt) => {
@@ -593,7 +595,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   // One snapshot read of a scope's whole chain: a fixed number of statements however many grants, Teams or members.
   // `chain` (already read by the caller) skips the chain statements; `users` limits Team members to those users.
   /** `rowTenant`, but its three look-ups run even when the row is missing (no-match id), so the statement count doesn't depend on existence. */
-  const uniformTenant = r => { const t = rowTenant(r ?? { id: "", domain: null, created_at: 0 }); return r ? t : null; };
+  const uniformTenant = r => { const t = rowTenant(r ?? { id: "", domain: null, created_at: 0 }, !r); return r ? t : null; };
   // The SAME statements run whether or not the scope exists (no-match parameters stand in for a missing row), so a refusal's cost can't
   // tell an unknown id from a hidden one (PROTOCOL.md § Spaces and Groups, "the same Registry work").
   const contextTx = db.transaction((type, id, users, held) => {

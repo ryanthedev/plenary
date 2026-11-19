@@ -10,7 +10,7 @@
 // The suite uses only the public Registry methods, and refusals are matched by `err.code`, never by class.
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { IDEM } from "../../server/auth/registry-port.js";
+import { IDEM, ASK } from "../../server/auth/registry-port.js";
 
 /**
  * @param {string} name
@@ -1219,6 +1219,188 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect(rb.links.map(x => x.id)).toEqual([l.id]);
         expect((await r.boardRows([a.id], { user: "google:bob" })).get(a.id)).toMatchObject({ grant: null, myTeams: [], invites: [], links: [] });
         expect((await r.boardRows([], { user: "google:ann" })).size).toBe(0);
+      });
+    });
+
+    // ---- access requests (#51): one atomic step per ask; the limits live in the Registry so every gateway agrees ----
+    describe("access requests", () => {
+      const U = "google:ann", FP = "f".repeat(64);
+      const mk = async () => {
+        const t = await r.createTenant({ domain: "acme.com", admins: ["google:root"] });
+        const sp = await r.createSpace({ tenant: t.id, name: "Platform", owner: "google:own" });
+        const b = await r.createBoard({ tenant: t.id, title: "B", space: sp.id, owner: "google:own" });
+        return { t, sp, b, S: { type: "space", id: sp.id } };
+      };
+      const ask = (t, S, o = {}) => r.requestAccess({ tenant: t.id, scope: S, user: U, role: "editor", ...o });
+
+      test("asks once per (scope, person): a second ask returns the open request, unchanged and not newer", async () => {
+        const { t, S } = await mk();
+        const a = await ask(t, S);
+        expect(a).toMatchObject({ tenant: t.id, scope: S, user: U, role: "editor", state: "pending", at: T0 });
+        clock.t += 1000;
+        expect(await ask(t, S, { role: "annotator" })).toEqual(a);
+        expect(await r.accessRequests(S)).toEqual([a]);
+        expect(await r.accessRequest(S, U)).toEqual(a);
+        expect(await r.accessRequest(S, "google:bob")).toBeNull();
+      });
+      test("works at a Group and a board; a Unit, an unknown scope and another Unit's scope are refused and change nothing", async () => {
+        const { t, sp, b } = await mk();
+        const g = await r.createGroup({ tenant: t.id, name: "G", owner: "google:own" });
+        for (const S of [{ type: "group", id: g.id }, { type: "board", id: b.id }]) expect((await ask(t, S)).scope).toEqual(S);
+        await expect(ask(t, { type: "unit", id: t.id })).rejects.toThrow();
+        await expect(ask(t, { type: "space", id: "s-nope00000000" })).rejects.toThrow();
+        const t2 = await r.createTenant({ domain: "other.com" });
+        await expect(ask(t2, { type: "space", id: sp.id })).rejects.toThrow();
+        await expect(ask(t, { type: "space", id: sp.id }, { role: "" })).rejects.toThrow();
+        expect(await r.accessRequests({ type: "space", id: sp.id })).toEqual([]);
+      });
+      test("accessRequests lists only the scope's pending ones, newest first, bounded by limit", async () => {
+        const { t, S } = await mk();
+        for (const u of ["google:a", "google:b", "google:c"]) { await r.requestAccess({ tenant: t.id, scope: S, user: u, role: "viewer" }); clock.t += 10; }
+        expect((await r.accessRequests(S)).map(x => x.user)).toEqual(["google:c", "google:b", "google:a"]);
+        expect((await r.accessRequests(S, { limit: 2 })).map(x => x.user)).toEqual(["google:c", "google:b"]);
+        await r.closeAccessRequest(S, "google:b", "dismissed");
+        expect((await r.accessRequests(S)).map(x => x.user)).toEqual(["google:c", "google:a"]);
+      });
+      test("a dismissed request keeps its cooldown: a new ask is rate-limited with the wait, and works once it has passed", async () => {
+        const { t, S } = await mk();
+        await ask(t, S);
+        expect(await r.closeAccessRequest(S, U, "dismissed")).toBe(true);
+        expect(await r.closeAccessRequest(S, U, "dismissed")).toBe(false);   // idempotent
+        expect(await r.accessRequest(S, U)).toMatchObject({ state: "dismissed" });
+        clock.t += 3600_000;
+        await expect(ask(t, S)).rejects.toMatchObject({ code: "rate-limited", retryAfterMs: ASK.cooldownMs - 3600_000 });
+        clock.t += ASK.cooldownMs - 3600_000 - 1;
+        await expect(ask(t, S)).rejects.toMatchObject({ code: "rate-limited", retryAfterMs: 1 });
+        clock.t += 1;
+        expect(await r.accessRequest(S, U)).toBeNull();
+        const again = await ask(t, S);
+        expect(again).toMatchObject({ state: "pending", at: clock.t });
+        expect((await r.accessRequests(S)).length).toBe(1);
+      });
+      test("granting closes the request: it is no longer returned, asking again is allowed, and the row still counts toward the person's quota", async () => {
+        const { t, S } = await mk();
+        await ask(t, S);
+        expect(await r.closeAccessRequest(S, U, "granted")).toBe(true);
+        expect(await r.accessRequest(S, U)).toBeNull();
+        expect(await r.accessRequests(S)).toEqual([]);
+        expect(await r.closeAccessRequest(S, U, "granted")).toBe(false);
+        expect((await ask(t, S)).state).toBe("pending");
+        await expect(r.closeAccessRequest(S, U, "bogus")).rejects.toThrow();
+      });
+      test("a grant does not return quota: perUser counts granted rows too", async () => {
+        const { t } = await mk();
+        for (let i = 0; i < 3; i++) { const sp = await r.createSpace({ tenant: t.id, name: "S" + i, owner: "google:own" }); const S = { type: "space", id: sp.id }; await r.requestAccess({ tenant: t.id, scope: S, user: U, role: "editor", limits: { perUser: 3 } }); await r.closeAccessRequest(S, U, "granted"); }
+        const sp = await r.createSpace({ tenant: t.id, name: "S9", owner: "google:own" });
+        await expect(r.requestAccess({ tenant: t.id, scope: { type: "space", id: sp.id }, user: U, role: "editor", limits: { perUser: 3 } })).rejects.toMatchObject({ code: "rate-limited" });
+      });
+      test("the cooldown runs from the dismissal, not from the ask: dismissing a day-old request still holds 24 h", async () => {
+        const { t, S } = await mk();
+        await ask(t, S);
+        clock.t += ASK.cooldownMs + 5000;                 // asked long ago; dismissed now
+        expect(await r.closeAccessRequest(S, U, "dismissed")).toBe(true);
+        expect(await r.accessRequest(S, U)).toMatchObject({ state: "dismissed", closedAt: clock.t });
+        await expect(ask(t, S)).rejects.toMatchObject({ code: "rate-limited", retryAfterMs: ASK.cooldownMs });
+        clock.t += ASK.cooldownMs - 1;
+        await expect(ask(t, S)).rejects.toMatchObject({ code: "rate-limited", retryAfterMs: 1 });
+        clock.t += 1;
+        expect((await ask(t, S)).state).toBe("pending");
+      });
+      test("concurrent asks by different people on one scope never pass the scope limit (injectable lower limit)", async () => {
+        const { t, S } = await mk();
+        for (let round = 0; round < 3; round++) {
+          const sp = await r.createSpace({ tenant: t.id, name: "R" + round, owner: "google:own" }), SC = { type: "space", id: sp.id };
+          const out = await Promise.allSettled(Array.from({ length: 12 }, (_, i) => r.requestAccess({ tenant: t.id, scope: SC, user: "google:c" + i, role: "viewer", limits: { scopePending: 4 } })));
+          expect(out.filter(o => o.status === "fulfilled").length).toBe(4);
+          for (const o of out.filter(o => o.status === "rejected")) expect(o.reason).toMatchObject({ code: "rate-limited", retryAfterMs: null });
+          expect((await r.accessRequests(SC)).length).toBe(4);
+        }
+        expect(S.id).toBeTruthy();
+      });
+      test("supersede: a pending ask for another role is replaced (a new id) only when asked to; the scope count leaves the replaced row out", async () => {
+        const { t, S } = await mk();
+        const a = await r.requestAccess({ tenant: t.id, scope: S, user: "google:c0", role: "viewer", limits: { scopePending: 2 } });
+        expect((await r.requestAccess({ tenant: t.id, scope: S, user: "google:c0", role: "editor", limits: { scopePending: 2 } }))).toMatchObject({ id: a.id, role: "viewer" });   // not asked to: as it was
+        await r.requestAccess({ tenant: t.id, scope: S, user: "google:c1", role: "viewer", limits: { scopePending: 2 } });   // the scope is full now
+        const b = await r.requestAccess({ tenant: t.id, scope: S, user: "google:c0", role: "editor", supersede: true, limits: { scopePending: 2 } });
+        expect(b).toMatchObject({ role: "editor", state: "pending" });
+        expect(b.id).not.toBe(a.id);                                                   // a key whose ref is the old id can never replay this one
+        const same = await r.requestAccess({ tenant: t.id, scope: S, user: "google:c0", role: "editor", supersede: true, limits: { scopePending: 2 } });   // same role: nothing to replace
+        expect(same.at).toBe(b.at);
+        await expect(r.requestAccess({ tenant: t.id, scope: S, user: "google:c2", role: "viewer", limits: { scopePending: 2 } })).rejects.toMatchObject({ code: "rate-limited" });
+        expect((await r.accessRequests(S)).length).toBe(2);
+      });
+      test("one person may make ASK.perUser requests in the window across scopes; the next is rate-limited until the oldest leaves it", async () => {
+        const { t } = await mk();
+        const spaces = [];
+        for (let i = 0; i < ASK.perUser + 1; i++) spaces.push(await r.createSpace({ tenant: t.id, name: "S" + i, owner: "google:own" }));
+        for (let i = 0; i < ASK.perUser; i++) { await ask(t, { type: "space", id: spaces[i].id }); clock.t += 1000; }
+        const last = { type: "space", id: spaces[ASK.perUser].id };
+        const first = T0 + ASK.windowMs - clock.t;
+        await expect(ask(t, last)).rejects.toMatchObject({ code: "rate-limited", retryAfterMs: first });
+        await r.requestAccess({ tenant: t.id, scope: last, user: "google:other", role: "viewer" });   // another person is not limited by it
+        clock.t = T0 + ASK.windowMs;
+        expect((await ask(t, last)).state).toBe("pending");
+      });
+      test("a scope holds at most ASK.scopePending pending requests; dismissing frees a slot", async () => {
+        const { t, S } = await mk();
+        for (let i = 0; i < ASK.scopePending; i++) await r.requestAccess({ tenant: t.id, scope: S, user: "google:u" + i, role: "viewer" });
+        await expect(ask(t, S)).rejects.toMatchObject({ code: "rate-limited", retryAfterMs: null });
+        await r.closeAccessRequest(S, "google:u0", "dismissed");
+        expect((await ask(t, S)).state).toBe("pending");
+      });
+      test("requests older than ASK.ttlMs are ignored and a new ask replaces them", async () => {
+        const { t, S } = await mk();
+        await ask(t, S);
+        clock.t += ASK.ttlMs;
+        expect(await r.accessRequests(S)).toEqual([]);
+        expect(await r.accessRequest(S, U)).toBeNull();
+        expect((await ask(t, S)).at).toBe(clock.t);
+      });
+      test("the key is checked first and written with the request: a retry replays even when a limit has since been reached", async () => {
+        const { t, S } = await mk();
+        const idem = { user: U, key: "key-ask-0001", fp: FP };
+        const a = await ask(t, S, { idem });
+        await expect(ask(t, S, { idem })).rejects.toMatchObject({ code: "idem-replay", ref: a.id });
+        await expect(ask(t, S, { idem: { ...idem, fp: "0".repeat(64) } })).rejects.toMatchObject({ code: "idem-mismatch" });
+        await r.closeAccessRequest(S, U, "dismissed");
+        await expect(ask(t, S, { idem })).rejects.toMatchObject({ code: "idem-replay", ref: a.id });   // not rate-limited: the key wins
+        await expect(ask(t, S, { idem: { ...idem, key: "key-ask-0002" } })).rejects.toMatchObject({ code: "rate-limited" });
+        expect(await r.idemGet({ ...idem, key: "key-ask-0002" })).toEqual({ state: "none" });   // a refused ask stores no key
+      });
+      test("a repeat of an open request under a new key returns the same request and records that key", async () => {
+        const { t, S } = await mk();
+        const a = await ask(t, S);
+        const again = await ask(t, S, { idem: { user: U, key: "key-ask-0003", fp: FP } });
+        expect(again.id).toBe(a.id);
+        expect(await r.idemGet({ user: U, key: "key-ask-0003", fp: FP })).toEqual({ state: "done", ref: a.id });
+      });
+      test("concurrent asks by one person make exactly one request", async () => {
+        const { t, S } = await mk();
+        const out = await Promise.allSettled(Array.from({ length: 8 }, () => ask(t, S)));
+        expect(out.every(o => o.status === "fulfilled")).toBe(true);
+        expect(new Set(out.map(o => o.value.id)).size).toBe(1);
+        expect((await r.accessRequests(S)).length).toBe(1);
+      });
+      test("concurrent asks by one person across scopes never pass perUser", async () => {
+        const { t } = await mk();
+        const spaces = [];
+        for (let i = 0; i < ASK.perUser + 5; i++) spaces.push(await r.createSpace({ tenant: t.id, name: "S" + i, owner: "google:own" }));
+        const out = await Promise.allSettled(spaces.map(s => ask(t, { type: "space", id: s.id })));
+        expect(out.filter(o => o.status === "fulfilled").length).toBe(ASK.perUser);
+        for (const o of out.filter(o => o.status === "rejected")) expect(o.reason).toMatchObject({ code: "rate-limited" });
+      });
+      test("grantHolders: the scoped grants at the scope whose role is listed, by subject, bounded", async () => {
+        const { t, sp, S } = await mk();
+        const team = await r.createTeam({ tenant: t.id, name: "Infra" });
+        await r.setScopedGrant({ scope: S, subject: { type: "team", id: team.id }, role: "editor" });
+        await r.setScopedGrant({ scope: S, subject: { type: "user", id: "google:v" }, role: "viewer" });
+        const got = await r.grantHolders(S, ["owner", "editor"]);
+        expect(got).toEqual([{ subject: { type: "team", id: team.id }, role: "editor" }, { subject: { type: "user", id: "google:own" }, role: "owner" }]);
+        expect(await r.grantHolders(S, [])).toEqual([]);
+        expect(await r.grantHolders({ type: "space", id: "s-nope00000000" }, ["owner"])).toEqual([]);
+        expect(await r.grantHolders({ type: "group", id: sp.id }, ["owner"])).toEqual([]);
+        expect((await r.grantHolders(S, ["owner", "editor"], { limit: 1 })).length).toBe(1);
       });
     });
   });

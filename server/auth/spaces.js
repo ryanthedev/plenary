@@ -9,6 +9,7 @@ import { AdminError } from "../admin/boards.js";
 import { resolveAccess } from "./resolver.js";
 import { ROLES } from "./util.js";
 import { homeService } from "./home.js";
+import { explainService } from "./explain.js";
 
 /** @typedef {import("./idp-port.js").Identity} Identity */
 
@@ -51,7 +52,7 @@ const idOf = v => (typeof v === "string" && /^[\w-]{1,64}$/.test(v) ? v : null);
  *   log?: { warn(msg: string, f?: object): void } }} deps
  *   announce: tells every live connection on a board to re-check its role (the `.grants` message; main.js gives the bus's). Best effort.
  */
-export function spaceService({ registry, tenancy, home = null, announce = async () => {}, now = Date.now, log = { warn() {} } }) {
+export function spaceService({ registry, tenancy, home = null, announce = async () => {}, now = Date.now, explainer = explainService({ registry, now }), log = { warn() {} } }) {
   home ??= homeService({ registry, tenancy, now });
   const may = (a, p) => a.permissions.has(p);
   /** The shape every page and picker names a Space in. `group` only when the person can open that Group. */
@@ -302,7 +303,10 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
       const groupOpens = group ? opens(await tenancy.effective(identity, { type: "group", id: group.id })) : false;
       const list = await home.spaceBoards(identity, sp.id, { can: true });
       const manage = sp.kind !== "personal" && may(a, "members.manage");
-      return { space: spaceView(sp, groupOpens ? group : null), can: { createBoard: createsBoards(a), rename: manage, general: manage }, boards: list.results, more: list.more };
+      const can = { createBoard: createsBoards(a), rename: manage, general: manage };
+      // Why a control is off, from the SAME Access that decided `can` (PROTOCOL.md § Access explanation and requests); only for a caller who cannot create boards here.
+      const why = can.createBoard || sp.kind === "personal" ? null : await explainer.explain(identity, { type: "space", row: sp, access: a, unit, manage });
+      return { space: spaceView(sp, groupOpens ? group : null), can, ...(why ? { why } : {}), boards: list.results, more: list.more };
     },
 
     /** GET /groups/:id: its Spaces (all of them open to anyone who opens the Group), 100 a page. */

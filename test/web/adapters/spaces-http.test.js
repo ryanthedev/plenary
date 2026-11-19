@@ -85,3 +85,11 @@ test("a create retried with the same key is just another POST: the server answer
   expect(SPACES_ERRORS).not.toContain("in-progress");
   expect(await api(answer(409, { error: "x" })).createSpace({ name: "S", key: "key-0002-abcd" })).toEqual({ error: "unavailable" });   // an unexpected status
 });
+
+test("#51 the Space page carries `why` when the server sends one, checked; a malformed one is dropped, never the page", () => {
+  const why = { mine: { role: { id: "viewer", name: "Viewer" }, sources: [] }, guest: false, needs: { "board.create": { role: "editor", roleName: "Editor", held: false } }, owners: [{ type: "user", id: "google:pri", name: "Priya" }],
+    ask: { can: true, roles: [{ id: "editor", name: "Editor" }], pending: null, retryAfterMs: null } };
+  expect(normalizeSpacePage({ ...SPACE, can: { createBoard: false }, why }).why).toEqual(why);
+  expect("why" in normalizeSpacePage(SPACE)).toBe(false);
+  expect("why" in normalizeSpacePage({ ...SPACE, why: { nope: 1 } })).toBe(false);
+});

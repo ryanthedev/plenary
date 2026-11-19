@@ -20,7 +20,7 @@ const USERS = { "t-ada": { user: "ada", role: "owner" }, "t-bo": { user: "bo", r
   "t-di": { user: "di", role: "annotator" }, "t-vi": { user: "vi", role: "viewer" } };
 
 /** ada's page over a room with bo (a second presenter, headless) on the same virtual clock. */
-function setup({ expAt = null, relogin = null, collab = false, role = null, token = "t-ada", prefs = memoryStore(), wrap = null, appNet = null } = {}) {
+function setup({ expAt = null, relogin = null, collab = false, role = null, token = "t-ada", prefs = memoryStore(), wrap = null, appNet = null, access = null } = {}) {
   installPage();
   const net = localRoom({ users: USERS, clock: true });
   const joins = [], hooks = {};
@@ -29,7 +29,7 @@ function setup({ expAt = null, relogin = null, collab = false, role = null, toke
   const app = mountApp({
     startSession: ({ mine, onChange }) => createSession({ join: () => { const t = net.join(); joins.push(t); return wrap ? wrap(t) : t; }, token, board: "b1", client: USERS[token].user, user: USERS[token].user, mine, onChange, clock: net.clock }),
     net: appNet ?? { kind: "local", put() {}, onFile() {} }, board: "b1", me: { user: USERS[token].user, name: "Ada", role }, prefs, theme: "light",
-    clock: net.clock, expAt, relogin,
+    clock: net.clock, expAt, relogin, access, newKey: () => "key-pill-0001",
     collab: collab ? (S, o) => { hooks.jumpTo = o.jumpTo; return syncCollabPort(S, { name: "Ada", frame: fn => net.clock.set(fn, 16), ...o }); } : null,
   });
   /** n animation frames, 16 ms of virtual time each, the room settled in between. */
@@ -721,7 +721,7 @@ test("K2 app.js: no setTimeout/setInterval/performance.now/Date.now in the sourc
 test("K3 main.js: the token goes only into createSession; sign-in leaves for the fixed href; the return board only via takeReturnBoard", async () => {
   const src = await Bun.file(new URL("../../web/main.js", import.meta.url)).text();
   const code = src.replace(/\/\/.*$/gm, "");
-  expect(code.match(/signIn\.token/g).length).toBe(6);                         // the gate check, createSession's token, and the Home, Spaces, Access and Roles ports' (their Bearer header)
+  expect(code.match(/signIn\.token/g).length).toBe(8);                         // the gate check, createSession's token, and the Home, Spaces, Access and Roles ports' (their Bearer header), plus the Access port of the Space page (Ask for access) and of the canvas pill (why view-only)
   expect(code).toMatch(/httpHome\(\{[^}]*token: signIn\.token,/);
   expect(code).toMatch(/if \(!signIn\.token\)/);
   expect(code).toMatch(/createSession\(\{[^}]*token: signIn\.token,/);
@@ -1119,4 +1119,104 @@ test("L1/L2: S.missing() is memoised on the documents' revisions (no scan per fr
   bo.act("board", ed => { ed.select([el.id]); ed.nudge(10, 0); }); step(4);   // a change touching that picture
   expect(S.missing()).not.toBe(first);
   expect(S.missing().get(PIC.id)).not.toBe(first.get(PIC.id));
+});
+
+// ---- the pill explains a view-only role (PROTOCOL.md § Access explanation and requests, #51) ----
+const WHY = { mine: { role: { id: "viewer", name: "Viewer" }, sources: [{ kind: "team", scope: { type: "space", id: "s-1", name: "Platform" }, role: "viewer", roleName: "Viewer", ladder: "viewer", strongest: true, team: { id: "tm-1", name: "Infra" } }] },
+  needs: { "board.edit": { role: "editor", roleName: "Editor" } }, owners: [{ type: "user", id: "google:pri", name: "Priya" }, { type: "user", id: "google:tom", name: "Tom" }],
+  ask: { can: true, roles: [{ id: "annotator", name: "Annotator" }, { id: "editor", name: "Editor" }], pending: null, retryAfterMs: null } };
+const accessStub = (over = {}) => { const calls = []; return { calls, explainBoard: async b => { calls.push(["explainBoard", b]); return over.explain ?? { why: WHY }; }, ask: async (...a) => { calls.push(["ask", ...a]); return over.ask ?? { request: { role: a[2], roleName: "Editor", at: 1, state: "pending" } }; } }; };
+const pillOf = () => find(page.byId.topbar, e => /^pill\b/.test(e.className));
+const settleP = () => new Promise(r => setTimeout(r, 0));
+
+test("#51 a viewer's pill is a button that explains the role: keyboard, Escape returns focus, the text names the source and who to ask", async () => {
+  const access = accessStub();
+  rig = setup({ token: "t-vi", access });
+  const pill = pillOf();
+  expect(pill.className).toMatch(/readonly/);
+  expect([pill.getAttribute("role"), pill.getAttribute("tabindex"), pill.getAttribute("aria-haspopup"), pill.getAttribute("aria-expanded")]).toEqual(["button", "0", "dialog", "false"]);
+  expect(pill.title).toMatch(/Press to see why/);
+  pill.fire("keydown", { key: "Enter" });
+  await settleP();
+  const pop = find(page.doc.body, e => /pill-pop/.test(e.className));
+  expect(pill.getAttribute("aria-expanded")).toBe("true");
+  expect(pop.getAttribute("role")).toBe("dialog");
+  expect(pop.parentNode).toBe(pill.parentNode);                // beside the pill in DOM order, so Tab out of it lands on the next control
+  expect(access.calls[0]).toEqual(["explainBoard", "b1"]);
+  const t = pop.textContent;
+  expect(t).toContain("Viewer via Space Platform · Infra team.");
+  expect(t).toContain("Editing needs Editor. Owners: Priya, Tom.");
+  expect(find(pop, e => e.tagName === "BUTTON" && e.textContent === "Ask for access")).toBeTruthy();
+  pill.fire("keydown", { key: " " });                   // toggles closed
+  expect(find(page.doc.body, e => /pill-pop/.test(e.className))).toBeUndefined();
+  pill.fire("keydown", { key: "Enter" }); await settleP();
+  page.doc.fire("keydown", { key: "Escape" });
+  expect(find(page.doc.body, e => /pill-pop/.test(e.className))).toBeUndefined();
+  expect(globalThis.document.activeElement).toBe(pill);
+});
+
+test("#51 Ask for access from the pill sends the role with one Idempotency-Key and moves focus to the confirmation", async () => {
+  const access = accessStub();
+  rig = setup({ token: "t-vi", access });
+  pillOf().click(); await settleP();
+  const pop = find(page.doc.body, e => /pill-pop/.test(e.className));
+  const ask = find(pop, e => e.tagName === "BUTTON" && e.textContent === "Ask for access");
+  ask.click(); await settleP();
+  expect(access.calls.at(-1)).toEqual(["ask", "board", "b1", "editor", "key-pill-0001"]);
+  const status = find(pop, e => e.getAttribute("data-fk") === "ask-status");
+  expect(status.textContent).toContain("You asked for Editor");
+  expect(globalThis.document.activeElement).toBe(status);
+  expect(ask.hidden).toBe(true);
+});
+
+test("#51 the pill of an editor, and a viewer page with no access port, stays a plain pill; a failed lookup says so", async () => {
+  rig = setup({ token: "t-ada", access: accessStub() });
+  expect(pillOf().getAttribute("role")).toBeNull();
+  rig = setup({ token: "t-vi" });
+  expect(pillOf().getAttribute("role")).toBeNull();
+  rig = setup({ token: "t-vi", access: accessStub({ explain: { error: "unavailable" } }) });
+  pillOf().click(); await settleP();
+  expect(find(page.doc.body, e => /pill-pop/.test(e.className)).textContent).toContain("Could not look that up");
+});
+
+test("#51 the non-modal pill popover closes when focus tabs out of it, but not when focus moves inside it or to the pill", async () => {
+  rig = setup({ token: "t-vi", access: accessStub() });
+  const pill = pillOf();
+  pill.click(); await settleP();
+  const pop = () => find(page.doc.body, e => /pill-pop/.test(e.className));
+  const inside = find(pop(), e => e.tagName === "BUTTON");
+  pop().fire("focusout", { relatedTarget: inside });             // within the popover
+  expect(pop()).toBeTruthy();
+  pop().fire("focusout", { relatedTarget: pill });               // back to the pill
+  expect(pop()).toBeTruthy();
+  const hasFocus = page.doc.hasFocus; page.doc.hasFocus = () => false;
+  pop().fire("focusout", { relatedTarget: null });               // the window lost focus: stays
+  expect(pop()).toBeTruthy();
+  page.doc.hasFocus = () => true;
+  pop().fire("focusout", { relatedTarget: null });               // tabbed past the last control onto nothing, page still focused: closes
+  expect(pop()).toBeUndefined();
+  page.doc.hasFocus = hasFocus;
+  pill.click(); await settleP();
+  pop().fire("focusout", { relatedTarget: page.byId.topbar });   // somewhere else on the page
+  expect(pop()).toBeUndefined();
+  expect(pill.getAttribute("aria-expanded")).toBe("false");
+});
+
+test("#51 a successful Ask from the pill keeps the popover open and puts focus on the confirmation (hiding the focused button is not tabbing out)", async () => {
+  const access = accessStub();
+  rig = setup({ token: "t-vi", access });
+  pillOf().click(); await settleP();
+  const pop = () => find(page.doc.body, e => /pill-pop/.test(e.className));
+  const ask = find(pop(), e => e.tagName === "BUTTON" && e.textContent === "Ask for access");
+  ask.focus();
+  expect(globalThis.document.activeElement).toBe(ask);
+  ask.fire("keydown", { key: "Enter" }); ask.click(); await settleP();
+  expect(pop()).toBeTruthy();
+  expect(pillOf().getAttribute("aria-expanded")).toBe("true");
+  const status = find(pop(), e => e.getAttribute("data-fk") === "ask-status");
+  expect(status.textContent).toContain("You asked for Editor");
+  expect(globalThis.document.activeElement).toBe(status);
+  expect(ask.hidden).toBe(true);
+  pop().fire("focusout", { relatedTarget: page.byId.topbar });     // a real Tab-out still closes it
+  expect(pop()).toBeUndefined();
 });

@@ -162,8 +162,15 @@ export function createAccessModel({ api, type, id }) {
       const at = rowAt(subject);
       const verb = at >= 0 ? "now" : "added as";
       return act(m, () => api.setGrant(type, id, { type: subject.type, id: subject.id }, role), r => {
+        if (subject.type === "user" && S.page.requests) S.page.requests = S.page.requests.filter(q => q.user.id !== subject.id);   // the server closed it with the grant
         if (at >= 0) S.page.rows[at] = r.row; else S.page.rows = [r.row, ...S.page.rows];
       }, r => `${r.row.subject.name} ${verb} ${r.row.roleName}`);
+    },
+    /** An owner dismisses a request for more access (it stays recorded as dismissed on the server; the person may ask again later). */
+    async dismissRequest(user) {
+      const req = S.page.requests?.find(r => r.user.id === user);
+      if (!req) return true;
+      return act(m, () => api.dismissRequest(type, id, user), () => { S.page.requests = S.page.requests.filter(r => r.user.id !== user); }, `Dismissed the request of ${req.user.name}`);
     },
     async remove(subject) {
       const at = rowAt(subject);

@@ -4,6 +4,7 @@ import { test, expect, beforeEach, afterEach } from "bun:test";
 import { FakeElement, installDom, textOf } from "./collab/fake-dom.js";
 import { mountTeamsPage, mountTeamPage, mountAccessPage } from "../../web/adapters/dom/access.js";
 import { createTeamsModel, createTeamModel, createAccessModel, failText, sizeText, viaText } from "../../web/core/access.js";
+import { askView } from "../../web/adapters/dom/explain.js";
 import { announced } from "../../web/adapters/dom/focus.js";
 
 const hrefs = { home: "./", team: id => `?team=${id}`, teams: "?teams=1", space: id => `?space=${id}`, group: id => `?group=${id}`, board: id => `?board=${id}`, access: (t, id) => `?access=${t}:${id}` };
@@ -20,6 +21,8 @@ const all = pred => root.findAll(pred);
 const btn = text => all(e => e.tagName === "BUTTON").find(b => textOf(b).trim() === text || b.getAttribute("aria-label") === text);
 const byLabel = (tag, label) => all(e => e.tagName === tag && e.getAttribute("aria-label") === label)[0];
 const items = label => byLabel("UL", label)?.findAll(e => e.tagName === "LI") ?? [];
+/** Every person and Team row of the access page: the lists are grouped by source (directly, through teams), so this joins them, in the page's name order. */
+const rowsAll = () => [...items("People added directly to this Space"), ...items("Teams with access to this Space")].map(li => li.getAttribute("aria-label")).sort((a, b) => (a.toLowerCase() < b.toLowerCase() ? -1 : 1));
 const picker = { setTimer: f => { f(); return 0; } };
 const hold = () => { let release; const p = new Promise(r => { release = r; }); return { p, release }; };
 
@@ -39,13 +42,14 @@ beforeEach(() => {
     directory: q => ({ people: [{ user: "google:lee", name: "lee", email: "lee@acme.com" }, { user: "google:kay", name: "kay", email: null }].filter(p => !q || p.name.includes(q)), teams: q ? [] : [{ id: "tm-9", name: "Ops", size: 4 }] }),
     setGrant: (t, id, s, role) => ({ row: { subject: { ...s, name: ({ "tm-9": "Ops" })[s.id] ?? s.id.replace(/^\w+:/, ""), ...(s.type === "team" ? { size: 4 } : { email: null }) }, role, roleName: ROLES.find(r => r.id === role)?.name ?? role, via: s.type === "team" ? "team" : "direct", can: { change: true, remove: true } } }),
     removeGrant: () => ({}),
+    ask: (ty, id, role) => ({ request: { role, roleName: "Editor", at: 5, state: "pending" } }), dismissRequest: () => ({}),
   })[name]?.(...a);
 });
 afterEach(() => { delete globalThis.document; delete globalThis.Node; });
 
 async function teamsPage() { const model = createTeamsModel({ api }); mountTeamsPage({ root, model, hrefs }); await model.load(); return model; }
 async function teamPage() { const model = createTeamModel({ api, id: "tm-1" }); mountTeamPage({ root, model, api, hrefs, picker }); await model.load(); await settle(); return model; }
-async function accessPage(type = "space") { const model = createAccessModel({ api, type, id: "s-1" }); mountAccessPage({ root, model, api, hrefs, picker }); await model.load(); await settle(); return model; }
+async function accessPage(type = "space") { const model = createAccessModel({ api, type, id: "s-1" }); mountAccessPage({ root, model, api, hrefs, picker, newKey: () => "key-fixed-0001" }); await model.load(); await settle(); return model; }
 
 test("Teams list: named list items, sizes, links by team id, sorted by name; Create only when allowed", async () => {
   await teamsPage();
@@ -170,11 +174,11 @@ test("the access page: general access, rows named 'who, role, from where', inher
     inherited: [{ scope: { type: "group", id: "g-1", name: "Product" }, subject: { type: "team", id: "tm-1", name: "Infra", size: 3 }, role: "viewer", roleName: "Viewer", via: "inherited" }] });
   await accessPage();
   expect(items("General access").map(li => li.getAttribute("aria-label"))).toEqual(["Everyone in the organization: viewer (Space Design)"]);
-  expect(items("People and teams with access to this Space").map(li => li.getAttribute("aria-label"))).toEqual(["ada, Owner, Added directly", "Infra, Viewer, Team", "max, Editor, Added directly"]);
+  expect(rowsAll()).toEqual(["ada, Owner, Added directly", "Infra, Viewer, Team", "max, Editor, Added directly"]);
   expect(byLabel("SELECT", "Role of ada")).toBeUndefined();
   expect(byLabel("SELECT", "Role of max")).toBeTruthy();
   expect(btn("Remove ada")).toBeUndefined();
-  expect(items("Access inherited from above")[0].getAttribute("aria-label")).toBe("Infra, Viewer, via Group Product");
+  expect(items("Access inherited from Group Product")[0].getAttribute("aria-label")).toBe("Infra, Viewer, via Group Product");
   expect(all(e => e.tagName === "A" && e.getAttribute("href") === "?access=group:g-1")).toHaveLength(1);
   const keys = all(e => e.getAttribute("data-fk")).map(e => e.getAttribute("data-fk"));
   for (const k of ["who:user:google:ada", "who:user:google:max", "who:team:tm-1", "role:user:google:max", "remove:user:google:max", "role:team:tm-1"]) expect(keys).toContain(k);
@@ -188,7 +192,7 @@ test("changing a role asks the port, shows the server's row, and says it; a Team
   sel.value = "viewer"; sel.dispatch("change"); await settle();
   expect(calls.at(-1)).toEqual(["setGrant", "space", "s-1", { type: "user", id: "google:max" }, "viewer"]);
   expect(announced()).toBe("max now Viewer");
-  expect(items("People and teams with access to this Space").map(li => li.getAttribute("aria-label"))).toContain("max, Viewer, Added directly");
+  expect(rowsAll()).toContain("max, Viewer, Added directly");
 });
 
 test("the server's refusals are said in words: the last owner, an unknown person, a bad role", async () => {
@@ -198,7 +202,7 @@ test("the server's refusals are said in words: the last owner, an unknown person
     api.answer = (n, ...a) => (n === "removeGrant" || n === "setGrant" ? r : real(n, ...a));
     btn("Remove max").click(); await settle();
     expect(textOf(root.find(e => e.hasClass("home-status")))).toContain(text);
-    expect(items("People and teams with access to this Space").map(li => li.getAttribute("aria-label"))).toContain("max, Editor, Added directly");   // nothing changed on a refusal
+    expect(rowsAll()).toContain("max, Editor, Added directly");   // nothing changed on a refusal
   }
 });
 
@@ -224,14 +228,14 @@ test("one picker, every scope: it lists the roles the server gave and only those
   byLabel("SELECT", "Role").value = "editor"; byLabel("SELECT", "Role").dispatch("change");
   btn("Add").click(); await settle(); await settle();
   expect(calls.filter(c => c[0] === "setGrant").at(-1)).toEqual(["setGrant", "space", "s-1", { type: "team", id: "tm-9" }, "editor"]);
-  expect(items("People and teams with access to this Space").map(li => li.getAttribute("aria-label"))).toContain("Ops, Editor, Team");
+  expect(rowsAll()).toContain("Ops, Editor, Team");
 });
 
 test("a viewer sees who has access and nothing to change; the unit page says when there are no roles to give", async () => {
   state.access = AP({ can: { manage: false }, roles: [], rows: AP().rows.map(r => ({ ...r, can: { change: false, remove: false } })) });
   await accessPage();
   expect([btn("Add"), btn("Remove max"), byLabel("SELECT", "Role of max"), byLabel("INPUT", "Search people or teams")]).toEqual([undefined, undefined, undefined, undefined]);
-  expect(items("People and teams with access to this Space")).toHaveLength(3);
+  expect(rowsAll()).toHaveLength(3);
   state.access = AP({ scope: { type: "unit", id: "t-1" }, roles: [], general: [], rows: [] }); root.replaceChildren();
   await accessPage("unit");
   expect(textOf(root.find(e => e.hasClass("home-empty") && textOf(e).includes("nothing to add")))).toContain("make one first");
@@ -312,4 +316,112 @@ test("the confirmation and the focus fallback are said together, not one over th
   globalThis.document.activeElement = null;
   btn("Remove Infra").click(); await settle(); await settle();
   expect(announced()).toBe("Removed Infra");
+});
+
+// ---- #51: your access, who has access grouped by source, requests ----
+const SRC = (o = {}) => ({ kind: "team", scope: { type: "space", id: "s-1", name: "Design" }, role: "viewer", roleName: "Viewer", ladder: "viewer", strongest: false, team: { id: "tm-1", name: "Infra" }, ...o });
+const WHY = (o = {}) => ({ mine: { role: { id: "commenter", name: "Commenter" }, sources: [SRC(), SRC({ kind: "general", scope: { type: "group", id: "g-1", name: "Product" }, role: "commenter", roleName: "Commenter", ladder: "commenter", strongest: true, team: undefined })] },
+  needs: { "board.create": { role: "editor", roleName: "Editor" } }, owners: [{ type: "user", id: "google:ada", name: "ada" }], ask: { can: true, roles: [{ id: "annotator", name: "Annotator" }, { id: "editor", name: "Editor" }], pending: null, retryAfterMs: null }, ...o });
+const VIEWER = (o = {}) => AP({ can: { manage: false }, roles: [], rows: [U("google:ada", "ada", "owner", "Owner", { change: false, remove: false }), TM("tm-1", "Infra", "viewer", "Viewer")], why: WHY(), ...o });
+
+test("Your access lists every source and marks the strongest; Who has access is grouped by where it comes from", async () => {
+  state.access = VIEWER({ inherited: [{ scope: { type: "group", id: "g-1", name: "Product" }, subject: { type: "team", id: "tm-2", name: "Design", size: 4 }, role: "viewer", roleName: "Viewer", via: "inherited" },
+      { scope: { type: "unit", id: "t-1" }, subject: { type: "user", id: "google:eve", name: "eve", email: null }, role: "r-read", roleName: "Reader", via: "inherited" }],
+    general: [{ scope: { type: "unit", id: "t-1" }, role: "viewer" }], organization: { admins: [{ user: "google:root", name: "root" }], more: false, memberRole: "viewer" } });
+  await accessPage();
+  const mine = items("Where your access comes from");
+  expect(mine.map(li => li.getAttribute("aria-label"))).toEqual(["Viewer · via the Infra team", "Commenter · via everyone in the organization on Group Product, grants the most"]);
+  expect(textOf(mine[1])).toContain("Grants the most");
+  expect(textOf(mine[0])).not.toContain("Grants the most");
+  expect(items("People added directly to this Space").map(li => li.getAttribute("aria-label"))).toEqual(["ada, Owner, Added directly"]);
+  expect(items("Teams with access to this Space").map(li => li.getAttribute("aria-label"))).toEqual(["Infra, Viewer, Team"]);
+  expect(items("Access inherited from Group Product").map(li => li.getAttribute("aria-label"))).toEqual(["Design, Viewer, via Group Product"]);
+  expect(items("Access inherited from your organization").map(li => li.getAttribute("aria-label"))).toEqual(["eve, Reader, via organization"]);
+  expect(items("General access").map(li => li.getAttribute("aria-label"))).toEqual(["Everyone in the organization: viewer (organization)"]);
+  expect(items("Organization admins").map(li => li.getAttribute("aria-label"))).toEqual(["root"]);
+  expect(btn("Remove ada")).toBeUndefined();
+});
+
+test("Ask for access on the Access page: a real button, the role the server offers, one key, focus to the confirmation, said aloud", async () => {
+  state.access = VIEWER();
+  await accessPage();
+  const ask = btn("Ask for access");
+  expect(ask.disabled).toBe(false);
+  expect(textOf(root.find(e => e.tagName === "SELECT" && e.getAttribute("aria-label") === "Role to ask for"))).toContain("Editor");
+  ask.click(); await settle();
+  expect(calls.filter(c => c[0] === "ask")).toEqual([["ask", "space", "s-1", "editor", "key-fixed-0001"]]);
+  const status = root.find(e => e.getAttribute("data-fk") === "ask-status");
+  expect(textOf(status)).toContain("You asked for Editor");
+  expect(globalThis.document.activeElement).toBe(status);
+  expect(announced()).toContain("Request sent");
+  expect(ask.hidden).toBe(true);
+});
+
+test("a refused ask (rate limited) is said in words and the button stays, off", async () => {
+  state.access = VIEWER();
+  await accessPage();
+  const real = api.answer; api.answer = (n, ...a) => (n === "ask" ? { error: "limited", retryAfter: 3600 } : real(n, ...a));
+  btn("Ask for access").click(); await settle();
+  expect(textOf(root.find(e => e.getAttribute("data-fk") === "ask-status"))).toBe("You've asked too many times. Try again in about an hour.");
+  expect(announced()).toContain("too many times");
+  expect(btn("Ask for access").getAttribute("aria-disabled")).toBe("true");   // off (still in the tab order) until the wait is over
+});
+
+test("a pending request shows as sent, with no button to press again; an owner sees no Ask for themselves", async () => {
+  state.access = VIEWER({ why: WHY({ ask: { can: true, roles: [{ id: "editor", name: "Editor" }], pending: { role: "editor", roleName: "Editor", at: 1 }, retryAfterMs: null } }) });
+  await accessPage();
+  expect(btn("Ask for access").hidden).toBe(true);
+  expect(textOf(root.find(e => e.getAttribute("data-fk") === "ask-status"))).toContain("You asked for Editor");
+  root.replaceChildren();
+  state.access = AP({ why: WHY({ ask: { can: false, roles: [], pending: null, retryAfterMs: null } }) });
+  await accessPage();
+  expect(btn("Ask for access")).toBeUndefined();
+});
+
+test("owners see the requests: named, with Dismiss (focus falls back to a neighbour), and granting the person removes theirs", async () => {
+  state.access = AP({ why: WHY(), requests: [{ user: { id: "google:dev", name: "dev", email: "dev@acme.com" }, role: "editor", roleName: "Editor", at: 1 }, { user: { id: "google:kim", name: "kim", email: null }, role: "annotator", roleName: "Annotator", at: 2 }] });
+  await accessPage();
+  expect(items("Access requests").map(li => li.getAttribute("aria-label"))).toEqual(["dev asked for Editor", "kim asked for Annotator"]);
+  btn("Dismiss the request of dev").click(); await settle();
+  expect(calls.filter(c => c[0] === "dismissRequest")).toEqual([["dismissRequest", "space", "s-1", "google:dev"]]);
+  expect(items("Access requests").map(li => li.getAttribute("aria-label"))).toEqual(["kim asked for Annotator"]);
+  expect(announced()).toContain("Dismissed the request of dev");
+  // granting through the picker closes the person's request (the server does it too)
+  const model = createAccessModel({ api, type: "space", id: "s-1" });
+  await model.load();
+  await model.set({ type: "user", id: "google:kim", name: "kim" }, "annotator");
+  expect(model.state.page.requests.map(r => r.user.id)).toEqual(["google:dev"]);
+});
+
+test("a closed request in its cooldown starts with the button off and says when the owner may be asked again", async () => {
+  state.access = VIEWER({ why: WHY({ ask: { can: true, roles: [{ id: "editor", name: "Editor" }], pending: null, retryAfterMs: 3 * 3600_000 } }) });
+  await accessPage();
+  expect(btn("Ask for access").getAttribute("aria-disabled")).toBe("true");
+  expect(textOf(root.find(e => e.getAttribute("data-fk") === "ask-status"))).toBe("You asked recently and the request was closed. You can ask again in 3 hours.");
+});
+
+test("after a 429 the Ask button comes back by itself when the wait the server named has elapsed (no reload)", async () => {
+  const timers = [];
+  const api = { ask: async () => ({ error: "limited", retryAfter: 90 }) };
+  const why = { mine: { role: { id: "viewer", name: "Viewer" }, sources: [] }, guest: false, needs: {}, owners: [], ask: { can: true, roles: [{ id: "editor", name: "Editor" }], pending: null, retryAfterMs: null } };
+  const v = askView({ api, type: "space", id: "s-1", why, setTimer: (f, ms) => { timers.push({ f, ms }); return timers.length; }, clearTimer: n => { timers[n - 1].cleared = true; } });
+  const button = v.el.findAll(e => e.tagName === "BUTTON")[0];
+  button.click(); await settle();
+  expect(button.getAttribute("aria-disabled")).toBe("true");
+  expect(timers.filter(x => !x.cleared).map(x => x.ms)).toEqual([90_000]);
+  timers.at(-1).f();                                              // the wait elapses
+  expect(button.getAttribute("aria-disabled")).toBe("false");
+  expect(textOf(v.el.findAll(e => e.getAttribute("data-fk") === "ask-status")[0])).toBe("");
+});
+
+test("the 409 superseded path says so in the status line too (not only the live region), keeps focus on it, and shows the current request", async () => {
+  const why = { mine: { role: { id: "viewer", name: "Viewer" }, sources: [] }, guest: false, needs: {}, owners: [], ask: { can: true, roles: [{ id: "editor", name: "Editor" }], pending: null, retryAfterMs: null } };
+  const cur = { ...why, ask: { ...why.ask, pending: { role: "editor", roleName: "Editor", at: 5 } } };
+  const v = askView({ api: { ask: async () => ({ error: "conflict", code: "superseded" }) }, type: "space", id: "s-1", why, reload: async () => cur });
+  const button = v.el.findAll(e => e.tagName === "BUTTON")[0];
+  button.focus(); button.click(); await settle();
+  const status = v.el.findAll(e => e.getAttribute("data-fk") === "ask-status")[0];
+  expect(textOf(status)).toMatch(/^Your earlier request was replaced by a newer one\. This is the one the owners see\. You asked for Editor\./);
+  expect(globalThis.document.activeElement).toBe(status);
+  expect(announced()).toContain("replaced by a newer one");
 });

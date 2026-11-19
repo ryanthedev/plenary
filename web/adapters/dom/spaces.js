@@ -5,6 +5,7 @@
 
 import { h, replace } from "./dom.js";
 import { keeper } from "./focus.js";
+import { whyCard } from "./explain.js";
 import { generalText, spaceEmpty, groupEmpty } from "../../core/spaces.js";
 
 /**
@@ -108,7 +109,8 @@ const afterRender = () => { let fn = null; return { set: f => { fn = f; }, run: 
  *   signIn?: { href: string, text?: string } | null }} o
  * @returns {{ destroy(): void }}
  */
-export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null }) {
+export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null, access = null, newKey = null }) {
+  let whyRef = null;
   const S = model.state;
   const { status, main } = shell(root, hrefs);
   /** @type {null | { type: "title" } | { type: "board", id: string }} */
@@ -155,8 +157,14 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null }) {
     const crumbs = h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " / ",
       sp.group ? [h("a", { href: hrefs.group(sp.group.id) }, sp.group.name), " / "] : null);
     spaceId = sp.id;
-    const newBoard = keys.mark(keys.keep(`new-board:${p.can.createBoard}`, () => h("button.btn.primary", { type: "button", disabled: !p.can.createBoard, "aria-disabled": p.can.createBoard ? null : "true",
-      title: p.can.createBoard ? null : "You can't add boards here", onclick: e => dialogs.newBoard({ opener: e.currentTarget, space: spaceId }) }, "＋ New board")), "new-board");
+    // Off, never `disabled`: the button stays in the tab order and says why (aria-describedby the visible why-card), so keyboard and screen-reader users get the reason too.
+    const can = p.can.createBoard, why = !can && p.why ? p.why : null;
+    const newBoard = keys.mark(keys.keep(`new-board:${can}:${why ? "why" : ""}`, () => h("button.btn.primary", { type: "button", "aria-disabled": can ? null : "true", "aria-describedby": why ? "why-new-board" : null,
+      title: can ? null : "You can't add boards here", onclick: e => { if (e.currentTarget.getAttribute("aria-disabled") === "true") { e.preventDefault?.(); whyRef?.focus?.(); return; }   // an off button reads its reason: focus goes to the card
+         dialogs.newBoard({ opener: e.currentTarget, space: spaceId }); } }, "＋ New board")), "new-board");
+    whyRef = null;
+    const whyEl = why ? keys.keep(`why:${sp.id}:${JSON.stringify([why.mine, why.owners, why.ask])}`, () => whyCard({ why, here: { type: "space", id: sp.id }, what: "Creating boards", permission: "board.create", id: "why-new-board", access, newKey, hereName: sp.name })).el : null;
+    whyRef = whyEl;
     const menuCfg = { label: "Space options", items: [
       { text: "Rename", hidden: !p.can.rename, onSelect: () => { editing = { type: "title" }; render(); } },
       { text: "General access…", hidden: !p.can.general, onSelect: b => dialogs.general({ opener: b, current: sp.general, onSave: r => model.setGeneral(r) }) },
@@ -171,7 +179,7 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null }) {
       hrefs.access && !sp.personal ? keys.mark(h("a.btn", { href: hrefs.access("space", sp.id) }, "Members"), "members") : null, newBoard, menu?.el);
     const sub = h("p.sub-h", {}, sp.personal ? "Only you can see what's here until you share it." : generalText(sp.general));
     const empty = spaceEmpty(p);
-    replace(main, crumbs, head, sub,
+    replace(main, crumbs, head, sub, whyEl,
       p.boards.length ? h("ul.cards", { "aria-label": `Boards in ${sp.name}` }, p.boards.map(c => card(c))) : message(empty.title, empty.detail),
       p.more ? h("p.muted", {}, "More boards are in this Space. Use search on Home to find them.") : null);
   }

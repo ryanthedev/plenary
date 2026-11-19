@@ -114,6 +114,9 @@ const ROUTES = {
   "DELETE /roles/:id": { path: "/roles/r-abc" },
   "GET /directory": { path: "/directory?q=a" },
   "GET /access/:type/:id": { path: "/access/space/sp1" },
+  "POST /access/:type/:id/requests": { path: "/access/space/sp1/requests", body: { role: "editor" } },
+  "DELETE /access/:type/:id/requests/:user": { path: "/access/space/sp1/requests/dev:bo" },
+  "GET /boards/:board/explain": { path: `/boards/${B}/explain` },
   "PUT /access/:type/:id/grants/:subjectType/:subject": { path: "/access/space/sp1/grants/user/dev:bo", body: { role: "viewer" } },
   "DELETE /access/:type/:id/grants/:subjectType/:subject": { path: "/access/space/sp1/grants/user/dev:bo" },
 };

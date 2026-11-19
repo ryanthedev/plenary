@@ -10,6 +10,8 @@ import { h, replace } from "./dom.js";
 import { keeper, announce, announced } from "./focus.js";
 import { shell, showNotice, gate, message } from "./spaces.js";
 import { createPickerModel, sizeText, viaText, generalLine, SCOPE_NOUN } from "../../core/access.js";
+import { ownersText } from "../../core/explain.js";
+import { askView, sourceRow } from "./explain.js";
 
 /** A button that is "disabled" without leaving the tab order: clicks are ignored while it says so. */
 export const act = (attrs, text, on, isOff) => h("button.btn", { type: "button", ...attrs, onclick: e => { if (e.currentTarget.getAttribute("aria-disabled") === "true" || isOff?.()) { e.preventDefault?.(); return; } on(e); } }, text);
@@ -166,11 +168,11 @@ export function mountTeamPage({ root, model, api, hrefs, signIn = null, picker =
  * The access page of a scope (unit | group | space | board): who has access and through what, change or remove a role where the server allows it, and
  * the one picker to add a person or Team.
  */
-export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker = {} }) {
+export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker = {}, newKey = null }) {
   const S = model.state;
   const { status, main } = shell(root, hrefs);
   const keys = keeper();
-  let view = null, after = null, controls = [];
+  let view = null, after = null, controls = [], ask = null, askSig = null;
   function render() {
     showNotice(status, model);
     if (gate(S, main, () => model.load(), signIn)) { quiet(S); return; }
@@ -191,23 +193,49 @@ export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker
       who(s, keys, s.type === "team" ? `team of ${s.size ?? 0}` : s.email ?? ""), select, h("span.p", {}, viaText(r)),
       r.can?.remove ? keys.mark(ctl(act({ "aria-label": `Remove ${s.name}` }, "Remove", () => model.remove(s), () => S.busy)), `remove:${k}`) : null);
   };
+  /** One titled list. `label` names the list for screen readers; the heading is the visible name of the source. */
+  const group = (title, label, items, note = null) => (items.length ? h("section", { "aria-label": title }, h("h3", {}, title), note ? h("p.muted", {}, note) : null, h("ul.rows", { "aria-label": label }, items)) : null);
   function draw() {
     controls = [];
-    const p = S.page, sc = p.scope, noun = SCOPE_NOUN[sc.type] ?? sc.type;
+    const p = S.page, sc = p.scope, noun = SCOPE_NOUN[sc.type] ?? sc.type, here = { type: sc.type, id: sc.id };
     view ??= pickerView({ api, teams: true, rolesFor: t => model.rolesFor(t), onAdd: (subject, role) => model.set(subject, role), label: "Add people or teams", ...picker });
     view.refresh();
     const back = sc.type === "space" ? hrefs.space(sc.id) : sc.type === "group" ? hrefs.group(sc.id) : sc.type === "board" ? hrefs.board(sc.id) : hrefs.home;
     const addable = p.can.manage && p.roles.length > 0;
+    // Your access: every source, the strongest marked; Ask for access when the server says the caller may.
+    const w = p.why;
+    const askKey = w ? JSON.stringify([sc.id, w.ask]) : null;
+    if (askKey !== askSig) { askSig = askKey; ask = w && api?.ask && (w.ask.can || w.ask.pending) ? askView({ api, type: sc.type, id: sc.id, why: w, newKey }) : null; }
+    const mineSection = w ? h("section", { "aria-label": "Your access" }, h("h2", {}, "Your access"),
+      h("p", {}, w.mine.role ? `You have ${w.mine.role.name} access to this ${noun}. You get everything any of these gives you; the one that gives the most is marked.` : `You have no board access of your own to this ${noun}.`),
+      w.mine.sources.length ? h("ul.rows", { "aria-label": "Where your access comes from" }, w.mine.sources.map(s => { const x = sourceRow(s, here); return h("li.row", { "aria-label": x.text + (x.strongest ? ", grants the most" : "") }, h("span.who", {}, x.text), x.strongest ? h("span.badge", {}, "Grants the most") : null); })) : null,
+      w.ask.can || w.ask.pending ? h("p", {}, ownersText(w.owners, w.guest)) : null, ask?.el) : null;
+    const requests = p.requests?.length ? h("section", { "aria-label": "Access requests" }, h("h2", {}, "Access requests"),
+      h("p.muted", {}, "These people asked for more access. Add them below to grant it, or dismiss the request."),
+      h("ul.rows", { "aria-label": "Access requests" }, p.requests.map(r => h("li.row", { "aria-label": `${r.user.name} asked for ${r.roleName}` },
+        who({ type: "user", id: r.user.id, name: r.user.name }, keys, `asked for ${r.roleName}`),
+        keys.mark(ctl(act({ "aria-label": `Dismiss the request of ${r.user.name}` }, "Dismiss", () => model.dismissRequest(r.user.id), () => S.busy)), `remove:request:${r.user.id}`))))) : null;
+    const rows = sortRows(p.rows), direct = rows.filter(r => r.via !== "team"), teams = rows.filter(r => r.via === "team");
+    const inheritedBy = new Map();
+    for (const r of p.inherited) { const k = `${r.scope?.type}:${r.scope?.id}`; if (!inheritedBy.has(k)) inheritedBy.set(k, []); inheritedBy.get(k).push(r); }
+    const inheritedRow = r => h("li.row", { "aria-label": `${r.subject.name}, ${r.roleName}, ${viaText(r)}` }, h("span.who", {}, r.subject.name), h("span.p", {}, r.roleName),
+      r.scope && r.scope.type !== "unit" ? h("a", { href: hrefs.access(r.scope.type, r.scope.id) }, viaText(r)) : h("span.p", {}, viaText(r)));
+    const general = [...p.general.map(g => h("li.row", { "aria-label": generalLine(g) }, h("span.who", {}, generalLine(g))))];
+    const orgAdmins = p.organization?.admins ?? [];
+    const nothing = !rows.length && !p.inherited.length && !p.general.length && !orgAdmins.length;
     replace(main, h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " / ", sc.type === "unit" ? null : [h("a", { href: back }, sc.name ?? noun), " /"]),
       h("div.sp-head", {}, keys.mark(h("h1", { id: "page-title", tabindex: "-1" }, `Access${sc.name ? ": " + sc.name : sc.type === "unit" ? ": organization" : ""}`), "heading"), h("span.badge", {}, sc.personal ? "Personal · only you" : noun)),
-      p.general.length ? h("ul.rows", { "aria-label": "General access" }, p.general.map(g => h("li.row", { "aria-label": generalLine(g) }, h("span.who", {}, generalLine(g))))) : null,
+      mineSection, requests,
       h("h2", {}, "Who has access"),
-      p.rows.length ? h("ul.rows", { "aria-label": `People and teams with access to this ${noun}` }, sortRows(p.rows).map(rowView))
-        : message("Only the people set elsewhere have access.", p.can.manage ? "Add people or teams below." : ""),
+      nothing ? message("Only the people set elsewhere have access.", p.can.manage ? "Add people or teams below." : "") : null,
+      group("Added directly", `People added directly to this ${noun}`, direct.map(rowView)),
+      group("Through teams", `Teams with access to this ${noun}`, teams.map(rowView)),
+      [...inheritedBy].map(([k, list]) => { const s = list[0].scope; const from = s?.type === "unit" ? "your organization" : `${SCOPE_NOUN[s?.type] ?? "container"} ${s?.name ?? ""}`.trim();
+        return group(`Inherited from ${from}`, `Access inherited from ${from}`, list.map(inheritedRow)); }),
+      group("Everyone in the organization", "General access", general),
+      group("Organization admins", "Organization admins", orgAdmins.map(a => h("li.row", { "aria-label": a.name }, h("span.who", {}, a.name))), p.organization?.more ? "They manage access in every Space. The list shows the first few." : "They manage access in every Space; they see boards only where they are added."),
       p.next ? keys.mark(act({}, "Show more", () => model.loadMore()), "show-more") : null,
-      p.admins?.length ? [h("h2", {}, "Admins"), h("ul.rows", { "aria-label": "Admins" }, p.admins.map(a => h("li.row", { "aria-label": a.name }, h("span.who", {}, a.name, a.email ? h("small", {}, ` ${a.email}`) : null), h("span.p", {}, "Admin"))))] : null,
-      p.inherited.length ? [h("h2", {}, "Inherited"), h("ul.rows", { "aria-label": "Access inherited from above" }, p.inherited.map(r => h("li.row", { "aria-label": `${r.subject.name}, ${r.roleName}, ${viaText(r)}` },
-        h("span.who", {}, r.subject.name), h("span.p", {}, r.roleName), r.scope ? h("a", { href: r.scope.type === "group" ? hrefs.access("group", r.scope.id) : hrefs.access("space", r.scope.id) }, viaText(r)) : null)))] : null,
+      p.admins?.length ? [h("h2", {}, "Admins"), h("ul.rows", { "aria-label": "Admins" }, p.admins.map(a => h("li.row", { "aria-label": a.name }, h("span.who", {}, a.name, a.email ? h("small", {}, ` ${a.email}`) : null))))] : null,
       addable ? h("section", { "aria-label": "Add people or teams" }, h("h2", {}, "Add people or teams"), view.el)
         : p.can.manage ? message("There is nothing to add here yet.", sc.type === "unit" ? "Unit roles are custom roles: make one first." : "") : null);
   }

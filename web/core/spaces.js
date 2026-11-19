@@ -4,6 +4,8 @@
 
 /** @typedef {import("../ports/spaces.js").SpacesPort} SpacesPort */
 
+import { withArticle, holderText } from "./explain.js";
+
 export const TITLE_MAX = 200, NAME_MAX = 200;
 /** The general-access choices the pages offer, in the order shown: [value, label]. null = only people added. */
 export const GENERAL_CHOICES = Object.freeze([["viewer", "Everyone can view"], ["commenter", "Everyone can comment"], ["annotator", "Everyone can annotate"], ["editor", "Everyone can edit"], [null, "Only people added"]]);
@@ -26,7 +28,13 @@ const keyer = newKey => { let key = null; return { reset() { key = null; }, get(
 /** Empty-state copy for a Space page (JOURNEY §5). */
 export function spaceEmpty(page) {
   if (page.space.personal) return { title: "Only you can see what's here until you share it.", detail: page.can.createBoard ? "Start a board to fill it." : "" };
-  return page.can.createBoard ? { title: "No boards yet.", detail: "" } : { title: "No boards yet.", detail: "You can't add boards here; ask an owner to add you as an editor." };
+  if (page.can.createBoard) return { title: "No boards yet.", detail: "" };
+  // The server says who you are here and what adding boards needs (page.why), so the sentence is never a guess.
+  const w = page.why, need = w?.needs?.["board.create"];
+  const detail = w?.mine?.role && need
+    ? (need.held ? `You're ${withArticle(w.mine.role.name)} here through ${holderText(w.mine) ?? "a role"}, which does not allow creating boards. Owners can add you as ${withArticle(need.roleName)}.` : `You're ${withArticle(w.mine.role.name)} here; owners can add you as ${withArticle(need.roleName)}.`)
+    : "You can't add boards here; ask an owner to add you as an editor.";
+  return { title: "No boards yet.", detail };
 }
 export const groupEmpty = (page, name) => ({ title: `No Spaces in ${name} yet.`, detail: page.can.createSpace ? "" : "Group editors can add Spaces here." });
 

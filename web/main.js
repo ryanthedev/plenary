@@ -107,11 +107,11 @@ if (!signIn.token) {
     const api = httpAccess({ fetch: fetchNow, token: signIn.token, timers: clock });
     if (teamsPage) { const model = createTeamsModel({ api }); mountTeamsPage({ root, model, hrefs, signIn: signInLink }); hideGate(); model.load(); }
     else if (teamId) { const model = createTeamModel({ api, id: teamId }); mountTeamPage({ root, model, api, hrefs, signIn: signInLink }); hideGate(); model.load(); }
-    else { const model = createAccessModel({ api, type: accessArg[1], id: accessArg[2] }); mountAccessPage({ root, model, api, hrefs, signIn: signInLink }); hideGate(); model.load(); }
+    else { const model = createAccessModel({ api, type: accessArg[1], id: accessArg[2] }); mountAccessPage({ root, model, api, hrefs, signIn: signInLink, newKey: () => randomKey() }); hideGate(); model.load(); }
   } else if (spaceId || groupId) {
     // A Space or Group page. An id the person can't open shows the same "not available" page as one that does not exist.
     const model = createPageModel({ api: spacesApi, kind: spaceId ? "space" : "group", id: spaceId ?? groupId });
-    (spaceId ? mountSpacePage : mountGroupPage)({ root, model, dialogs, hrefs, signIn: signInLink });
+    (spaceId ? mountSpacePage : mountGroupPage)({ root, model, dialogs, hrefs, signIn: signInLink, access: httpAccess({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey() });
     hideGate();
     model.load();
   } else {
@@ -131,6 +131,8 @@ if (!signIn.token) {
       join: () => net.join(), token: signIn.token, board, client: "web", user: me.user, mine, onChange, clock,
     }),
     net, board, me, prefs: localStore(), theme: q.get("theme"),
+    // Why the pill says "View only" (PROTOCOL.md § Access explanation and requests): looked up when the pill is opened, with Ask for access.
+    access: httpAccess({ fetch: (...a) => globalThis.fetch(...a), token: signIn.token, timers: clock }), newKey: () => randomKey(),
     // The collaboration UI over this session (presence and records ride the board connection; web/adapters/collab/sync.js).
     collab: (S, o) => syncCollabPort(S, { name: me.name, ...o }),
     notice: signInNotice({ ...signIn, dev: null }, me.name),

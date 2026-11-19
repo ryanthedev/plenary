@@ -301,3 +301,17 @@ test("L7 readLink / readInvite: a revoked or expired one is not-found, a live on
   await mem.revokeInvite(i.id);
   await expect(readInvite({ caller, board, invite: i.id }, at(1))).rejects.toMatchObject({ code: "not-found" });
 });
+
+test("an access request's key retried after a later ask replaced the request is 409 superseded, never the newer request", async () => {
+  await mem.touchMember(acme.id, { user: "dev:bo", name: "bo", email: "bo@acme.com" });
+  const sp = (await (await post("/spaces", { name: "S", general: "viewer" })).json()).space.id;
+  const a = await post(`/access/space/${sp}/requests`, { role: "commenter" }, { tok: "bo", key: K });
+  expect(a.status).toBe(201);
+  expect((await a.json()).request.role).toBe("commenter");
+  const again = await post(`/access/space/${sp}/requests`, { role: "commenter" }, { tok: "bo", key: K });
+  expect([again.status, again.headers.get("idempotent-replayed")]).toEqual([201, "true"]);
+  await mem.requestAccess({ tenant: acme.id, scope: { type: "space", id: sp }, user: "dev:bo", role: "editor", supersede: true });   // a later ask replaced it
+  const stale = await post(`/access/space/${sp}/requests`, { role: "commenter" }, { tok: "bo", key: K });
+  expect(stale.status).toBe(409);
+  expect(await stale.json()).toEqual({ error: "superseded" });
+});

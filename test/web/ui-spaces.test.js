@@ -37,10 +37,10 @@ beforeEach(() => {
 afterEach(() => { delete globalThis.document; delete globalThis.Node; });
 
 const dialogsFor = () => createDialogs({ host: root, api, hrefs, go: h => closes.push(h), newKey: () => "key-fixed-0001" });
-async function spacePage(page = SP()) {
+async function spacePage(page = SP(), extra = {}) {
   api.pages.space = page;
   const model = createPageModel({ api, kind: "space", id: "s-1" });
-  const m = mountSpacePage({ root, model, dialogs: dialogsFor(), hrefs });
+  const m = mountSpacePage({ root, model, dialogs: dialogsFor(), hrefs, ...extra });
   await model.load();
   return { model, m };
 }
@@ -59,7 +59,7 @@ test("Space page: crumbs, title, badge, general access, boards as links; New boa
 test("a person who can't create sees a disabled New board with a reason, and no Space options", async () => {
   await spacePage(SP({ can: { createBoard: false, rename: false, general: false }, boards: [] }));
   const nb = btn("＋ New board");
-  expect([nb.disabled, nb.getAttribute("aria-disabled"), nb.getAttribute("title")]).toEqual([true, "true", "You can't add boards here"]);
+  expect([nb.disabled, nb.getAttribute("aria-disabled"), nb.getAttribute("title")]).toEqual([false, "true", "You can't add boards here"]);   // aria-disabled, never disabled: it stays in the tab order
   expect(btn("Space options")).toBeUndefined();
   expect(textOf(root.find(e => e.hasClass("home-empty")))).toBe("No boards yet.You can't add boards here; ask an owner to add you as an editor.");
 });
@@ -489,4 +489,53 @@ test("L6 randomKey: crypto.randomUUID when it exists, else getRandomValues (plai
   expect(k).toBe("ab".repeat(16));
   expect(k).toMatch(/^[A-Za-z0-9_-]{8,64}$/);          // a valid Idempotency-Key
   expect(randomKey()).toMatch(/^[A-Za-z0-9_-]{8,64}$/);
+});
+
+// ---- #51: the why-card behind a disabled New board ----
+const WHY = (o = {}) => ({ mine: { role: { id: "viewer", name: "Viewer" }, sources: [{ kind: "team", scope: { type: "space", id: "s-1", name: "Design" }, role: "viewer", roleName: "Viewer", ladder: "viewer", strongest: true, team: { id: "tm-1", name: "Infra" } }] },
+  needs: { "board.create": { role: "editor", roleName: "Editor" } }, owners: [{ type: "user", id: "google:pri", name: "Priya" }, { type: "user", id: "google:tom", name: "Tom" }],
+  ask: { can: true, roles: [{ id: "annotator", name: "Annotator" }, { id: "editor", name: "Editor" }], pending: null, retryAfterMs: null }, ...o });
+const viewerPage = (o = {}) => SP({ can: { createBoard: false, rename: false, general: false }, boards: [], why: WHY(o) });
+
+test("a disabled New board stays focusable and is described by a visible card: role, source, what is needed, who to ask", async () => {
+  globalThis.document.body = new FakeElement("body");   // the polite live region lives in <body>
+  const access = { async ask(...a) { calls.push(["ask", ...a]); return { request: { role: a[2], roleName: "Editor", at: 3, state: "pending" } }; } };
+  await spacePage(viewerPage(), { access, newKey: () => "key-fixed-0002" });
+  const nb = btn("＋ New board");
+  expect([nb.disabled, nb.getAttribute("aria-disabled"), nb.getAttribute("aria-describedby")]).toEqual([false, "true", "why-new-board"]);
+  const card = root.find(e => e.getAttribute("id") === "why-new-board");
+  expect(textOf(card)).toContain("You're a Viewer in Design, via the Infra team.");
+  expect(textOf(card)).toContain("Creating boards needs Editor.");
+  expect(textOf(card)).toContain("Owners: Priya, Tom.");
+  expect(textOf(root.find(e => e.hasClass("home-empty")))).toBe("No boards yet.You're a Viewer here; owners can add you as an Editor.");
+  nb.click();
+  expect(root.find(e => e.getAttribute("role") === "dialog")).toBeUndefined();   // an off button opens nothing
+  expect(focused.at(-1)).toBe(card);                                                 // it reads its reason: focus goes to the card
+  // Ask for access: a real button in the card, outside any tooltip; one keyed request; focus to the confirmation
+  const ask = btn("Ask for access");
+  ask.click(); await settle();
+  expect(calls.filter(c => c[0] === "ask")).toEqual([["ask", "space", "s-1", "editor", "key-fixed-0002"]]);
+  const status = root.find(e => e.getAttribute("data-fk") === "ask-status");
+  expect(focused.at(-1)).toBe(status);
+  expect(announced()).toContain("Request sent");
+});
+
+test("an editor sees no card; a viewer with no Ask offered gets the explanation only; without an access port there is no Ask button", async () => {
+  await spacePage(SP());
+  expect(root.find(e => e.getAttribute("id") === "why-new-board")).toBeUndefined();
+  root.replaceChildren();
+  await spacePage(viewerPage({ ask: { can: false, roles: [], pending: null, retryAfterMs: null } }), { access: { ask: async () => ({}) } });
+  expect(textOf(root.find(e => e.getAttribute("id") === "why-new-board"))).toContain("Creating boards needs Editor.");
+  expect(btn("Ask for access")).toBeUndefined();
+  root.replaceChildren();
+  await spacePage(viewerPage());
+  expect(btn("Ask for access")).toBeUndefined();
+  expect(textOf(root.find(e => e.getAttribute("id") === "why-new-board"))).toContain("Owners: Priya, Tom.");
+});
+
+test("text safety: an owner's name that looks like markup is text", async () => {
+  await spacePage(viewerPage({ owners: [{ type: "user", id: "google:x", name: "<img src=x onerror=alert(1)>" }] }));
+  const card = root.find(e => e.getAttribute("id") === "why-new-board");
+  expect(textOf(card)).toContain("<img src=x onerror=alert(1)>");
+  expect(card.findAll(e => e.tagName === "IMG")).toHaveLength(0);
 });

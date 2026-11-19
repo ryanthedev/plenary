@@ -2,7 +2,7 @@
 // last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
 import { normEmail } from "./util.js";
-import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId } from "./registry-port.js";
+import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "./registry-port.js";
 
 /**
  * @typedef {import("./registry-port.js").Registry} Registry
@@ -39,6 +39,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
   /** @type {Map<string, Map<string, number>>} user → board → opened at (Recent) */ const recent = new Map();
   /** @type {Map<string, Map<string, number>>} user → board → starred at */ const stars = new Map();
   /** @type {Map<string, { fp: string, ref: string, at: number }>} user + "\n" + key → fingerprint and the id it made (Idempotent creates) */ const idem = new Map();
+  /** @type {Map<string, import("./registry-port.js").AccessRequest>} "type\nid\nuser" → the person's one request at a scope (Access requests, #51) */ const requests = new Map();
   let idemCalls = 0;
   const idemLive = (e, t) => e && t - e.at < IDEM.ttlMs;
   /** A keyed create's first step: rejects (nothing written yet) when a live row holds the key. Returns the validated key, or null. */
@@ -393,6 +394,51 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const out = new Map();
       for (const sc of batchScopes(scopes)) out.set(sc.type + "\n" + sc.id, await this.accessContext(sc, { users }));
       return out;
+    },
+
+    // ---- Access requests (PROTOCOL.md § Access explanation and requests) ----
+    async requestAccess({ tenant, scope, user, role, idem: key, limits, supersede }) {
+      const lim = askLimits(limits);
+      const sc = askScope(scope), r = askRole(role);
+      need(typeof user === "string" && user && !user.includes("\0"), "member");
+      const i = idemEnter(key);                      // the key first: a retried success replays even when a limit has since been reached
+      need(typeof tenant === "string" && scopeTenant(sc.type, sc.id) === tenant, "scope");
+      const t = now(), k = sk(sc.type, sk(sc.id, user));
+      let pruned = 0;
+      for (const [x, v] of requests) if (t - (v.closedAt ?? v.at) >= ASK.ttlMs && pruned++ < ASK.prune) requests.delete(x);
+      const cur = askLive(requests.get(k), t);
+      if (cur?.state === "pending" && !(supersede === true && cur.role !== r)) { idemPut(i, cur.id); return copy(cur); }
+      if (cur && cur.state !== "pending") throw askLimited(askWait(cur, t));
+      const mine = [...requests.values()].filter(v => v.user === user && v.tenant === tenant && t - v.at < ASK.windowMs && !(v.scope.type === sc.type && v.scope.id === sc.id));   // the row being replaced counts once, as the new ask
+      if (mine.length >= lim.perUser) throw askLimited(Math.min(...mine.map(v => v.at)) + ASK.windowMs - t);
+      if ([...requests.values()].filter(v => v.scope.type === sc.type && v.scope.id === sc.id && v.state === "pending" && v.user !== user).length >= lim.scopePending) throw askLimited(null);
+      const ids = new Set([...requests.values()].map(v => v.id));
+      let id;
+      while (!id || ids.has(id)) id = mint.request();
+      const row = { id, tenant, scope: sc, user, role: r, state: "pending", at: t, closedAt: null };
+      requests.set(k, row);
+      idemPut(i, row.id);
+      return copy(row);
+    },
+    async accessRequest(scope, user) { return copy(askLive(requests.get(sk(scope.type, sk(scope.id, user))), now())); },
+    async accessRequests(scope, { limit } = {}) {
+      const sc = askScope(scope), t = now();
+      return [...requests.values()].filter(v => v.scope.type === sc.type && v.scope.id === sc.id && v.state === "pending" && t - v.at < ASK.ttlMs)
+        .sort((a, b) => b.at - a.at || (a.id < b.id ? 1 : -1)).slice(0, smallLimit(limit, ASK.page.default, ASK.page.max)).map(copy);
+    },
+    async closeAccessRequest(scope, user, state) {
+      const sc = askScope(scope), k = sk(sc.type, sk(sc.id, user)), v = requests.get(k);
+      if (state !== "dismissed" && state !== "granted") throw new Error("registry: bad state");
+      if (!v) return false;
+      const t = now(), was = v.state === "pending" && t - v.at < ASK.ttlMs;
+      if (state === "granted") { v.state = "granted"; v.closedAt = t; } else if (was) { v.state = "dismissed"; v.closedAt = t; }
+      return was;
+    },
+    async grantHolders(scope, rolesIn, { limit } = {}) {
+      const sc = orgDefaults.scope(scope), want = new Set(rolesIn ?? []);
+      return [...(scoped.get(sk(sc.type, sc.id)) ?? [])].filter(([, role]) => want.has(role))
+        .map(([k, role]) => { const [st, ...si] = k.split("\n"); return { subject: { type: st, id: si.join("\n") }, role }; })
+        .sort((a, b) => (a.subject.type + "\n" + a.subject.id < b.subject.type + "\n" + b.subject.id ? -1 : 1)).slice(0, smallLimit(limit, ASK.holders, ASK.holders));
     },
 
     // ---- Idempotent creates (PROTOCOL.md) ----

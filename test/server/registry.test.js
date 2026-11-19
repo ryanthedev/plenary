@@ -162,6 +162,13 @@ describe("sqlite registry", () => {
     expect(() => sqliteRegistry({ path, fullfsync: false })).toThrow(/reg_idempotency.*older version.*drop the table/i);
   });
 
+  test("a store whose reg_access_requests lacks closed_at refuses to start with a clear error naming the table", () => {
+    const path = file(), old = new Database(path);
+    old.run("CREATE TABLE reg_access_requests (id TEXT PRIMARY KEY, tenant TEXT NOT NULL, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, member TEXT NOT NULL, role TEXT NOT NULL, state TEXT NOT NULL, at INTEGER NOT NULL, UNIQUE (scope_type, scope_id, member))");
+    old.close();
+    expect(() => sqliteRegistry({ path, fullfsync: false })).toThrow(/reg_access_requests.*older version.*drop the table/i);
+  });
+
   test("durable keyed create: the key survives close and reopen (a crash after the commit), so the retry gets the first object, not a second", async () => {
     const path = file(), idem = { user: "google:root", key: "key-0001-aaaa", fp: "f".repeat(64) };
     let r = sqliteRegistry({ path, fullfsync: false });

@@ -288,6 +288,26 @@ describe.skipIf(!url)("postgres registry", () => {
     } finally { other.release(); await r.close(); await drop(schema); }
   });
 
+  test("an access request waits for its scope's advisory lock, whoever asks (the lock that keeps concurrent asks by different people under scopePending), then goes through", async () => {
+    const schema = schemaName();
+    const r = await postgresRegistry({ url, schema, max: 2 });
+    let lockedAsk;
+    try {
+      const t = await r.createTenant({ domain: null });
+      const sp = await r.createSpace({ tenant: t.id, name: "S", owner: "own" }), other = await r.createSpace({ tenant: t.id, name: "O", owner: "own" });
+      await whileLocked(`SELECT pg_advisory_xact_lock(hashtext('plenary-ask-scope:${schema}:space:${sp.id}'))`, async () => {
+        let done = false;
+        const ask = r.requestAccess({ tenant: t.id, scope: { type: "space", id: sp.id }, user: "someone", role: "viewer" }).then(x => { done = true; return x; });
+        await waitBlocked("%pg_advisory_xact_lock%");
+        expect(done).toBe(false);                                                         // held: the ask is queued, not racing
+        expect((await r.requestAccess({ tenant: t.id, scope: { type: "space", id: other.id }, user: "someone", role: "viewer" })).state).toBe("pending");   // another scope is not held up
+        expect(done).toBe(false);
+        lockedAsk = ask;
+      });
+      expect((await lockedAsk).state).toBe("pending");
+    } finally { await r.close(); await drop(schema); }
+  });
+
   test("a Team's last member leaving, stalled on a container's lock, and a grant to the same Team on another container: serialised per tenant, nothing orphaned", async () => {
     const schema = schemaName();
     const r = await postgresRegistry({ url, schema, max: 2 }), r2 = await postgresRegistry({ url, schema, max: 2 });
@@ -594,6 +614,16 @@ describe.skipIf(!url)("postgres registry", () => {
       await client().unsafe(`DROP TABLE "${schema}".reg_idempotency`);
       await client().unsafe(`CREATE TABLE "${schema}".reg_idempotency (member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, claim TEXT NOT NULL, result TEXT, at BIGINT NOT NULL, PRIMARY KEY (member, k))`);
       await expect(postgresRegistry({ url, schema, max: 2 })).rejects.toThrow(/reg_idempotency.*older version.*DROP TABLE/);
+    } finally { await drop(schema); }
+  }, 30_000);
+
+  test("a schema whose reg_access_requests lacks closed_at refuses to start with a clear error naming the table", async () => {
+    const schema = schemaName();
+    const r = await postgresRegistry({ url, schema, max: 2 });
+    await r.close();
+    try {
+      await client().unsafe(`ALTER TABLE "${schema}".reg_access_requests DROP COLUMN closed_at`);
+      await expect(postgresRegistry({ url, schema, max: 2 })).rejects.toThrow(/reg_access_requests.*older version.*DROP TABLE/);
     } finally { await drop(schema); }
   }, 30_000);
 

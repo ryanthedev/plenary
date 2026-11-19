@@ -181,6 +181,7 @@ function build(db, { fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3
   const qDropReferenced = db.query(`DELETE FROM blob_condemned WHERE tenant = ?1 AND sha1 = ?2 AND claimed_until IS NULL
     AND EXISTS (SELECT 1 FROM blob_refs WHERE tenant = ?1 AND sha1 = ?2)`);
   const qClaimed = db.query("SELECT revived FROM blob_condemned WHERE tenant = ? AND sha1 = ? AND claimed_until IS NOT NULL");
+  const qMarkRevived = db.query("UPDATE blob_condemned SET revived = 1 WHERE tenant = ? AND sha1 = ? AND claimed_until IS NOT NULL");
   const qSettle = db.query("DELETE FROM blob_condemned WHERE tenant = ? AND sha1 = ? AND claimed_until IS NOT NULL RETURNING revived");
   const qPrune = db.query(`DELETE FROM blob_pending WHERE (tenant, sha1, board) IN (SELECT tenant, sha1, board FROM blob_pending WHERE until_at <= ? LIMIT ?)`);
 
@@ -392,19 +393,21 @@ function build(db, { fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3
     },
 
     /**
-     * The reaper's two settle calls (PROTOCOL.md § Blobs, "References and purge"). Without `deleted`, after the bytes were quarantined: is anything
-     * referencing the hash (a revived mark, a reference, a live pending upload)? Yes: the condemnation is dropped and false says put the bytes back.
-     * No: true says delete them, and the claimed row STAYS, so a delete that fails is retried by the next claim. With `{ deleted: true }`, after the
-     * delete: drops the row; false = a reference arrived since the verdict (the bytes are gone: the client's re-upload heals it); a missing row is true.
+     * The reaper's settle calls (PROTOCOL.md § Blobs, "References and purge"). Without options, after the bytes were quarantined: is anything
+     * referencing the hash (a revived mark, a reference, a live pending upload)? Yes: false says put the bytes back, and the claimed row STAYS (marked
+     * revived). No: true says delete them, and the row stays too. So a restore or a delete that fails is retried by the next claim, whose verdict is
+     * the same. With `{ restored: true }`, after the restore: drops the row. With `{ deleted: true }`, after the delete: drops the row; false = a
+     * reference arrived since the verdict (the bytes are gone: the client's re-upload heals it); a missing row is true.
      */
-    async blobReaped(tenant, sha1, { deleted = false } = {}) {
+    async blobReaped(tenant, sha1, { deleted = false, restored = false } = {}) {
       needId(tenant, "tenant"); checkPend(sha1, 1);
       if (!open) throw new PortError("closed", "the store is closed");
       return db.transaction(() => {
+        if (restored) { qSettle.get(tenant, sha1); return true; }
         if (deleted) { const row = qSettle.get(tenant, sha1); return !row || (!row.revived && !qInUse.get(tenant, sha1, clock()).used); }
         const row = qClaimed.get(tenant, sha1);
         if (!row) return false;
-        if (row.revived || qInUse.get(tenant, sha1, clock()).used) { qSettle.get(tenant, sha1); return false; }
+        if (row.revived || qInUse.get(tenant, sha1, clock()).used) { qMarkRevived.run(tenant, sha1); return false; }   // keep: the row STAYS (revived) until the restore is done, so a failed restore is retried
         return true;
       }).immediate();
     },

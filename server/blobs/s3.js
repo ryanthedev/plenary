@@ -4,7 +4,7 @@
 //   get(tenant, sha1)          bytes, or null when there is no such blob (every other failure throws)
 //   quarantine / restore / delete   move the object to `.quarantine/<tenant>/<sha1>` (copy through this process, then delete the original: the
 //                              copy exists before the original goes) and back, or remove both keys (S3's DELETE answers 204 for an absent key: idempotent)
-//   usage(tenant)              the bytes the tenant's objects take (a paged ListObjectsV2 of `<tenant>/`)
+//   usage(tenant)              the bytes the tenant's objects take, quarantined ones included (a paged ListObjectsV2 of `<tenant>/` and `.quarantine/<tenant>/`)
 // A blob is the object `<tenant>/<sha1>` in one bucket. Both ids are validated before they reach a key, so one
 // tenant can't name another's object. An S3 PUT is atomic (readers see the whole object or none) and durable once
 // it returns, so there is no temp-file dance.
@@ -127,14 +127,18 @@ export function s3Blobs({ endpoint, bucket, region, accessKeyId, secretAccessKey
       needId(tenant, "tenant");
       return within(usageTimeoutMs, "usage", async signal => {
         const abandon = p => new Promise((res, rej) => { signal.addEventListener("abort", () => rej(signal.reason), { once: true }); p.then(res, rej); });
-        let total = 0, startAfter;
-        for (;;) {
-          const page = await abandon(s3.list({ prefix: `${tenant}/`, maxKeys: 1000, ...(startAfter ? { startAfter } : {}) }));
-          const keys = page.contents ?? [];
-          for (const o of keys) total += Number(o.size) || 0;
-          if (!page.isTruncated || !keys.length) return total;
-          startAfter = keys[keys.length - 1].key;
+        let total = 0;
+        for (const prefix of [`${tenant}/`, `${QUARANTINE}/${tenant}/`]) {   // quarantined objects still take the space (and may come back)
+          let startAfter;
+          for (;;) {
+            const page = await abandon(s3.list({ prefix, maxKeys: 1000, ...(startAfter ? { startAfter } : {}) }));
+            const keys = page.contents ?? [];
+            for (const o of keys) total += Number(o.size) || 0;
+            if (!page.isTruncated || !keys.length) break;
+            startAfter = keys[keys.length - 1].key;
+          }
         }
+        return total;
       });
     },
 

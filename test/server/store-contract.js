@@ -785,7 +785,8 @@ export function storeContract(name, make) {
         await store.blobPend(T, B2, H1, LONG);                                       // the claim lapsed (its node died, the bytes may be quarantined): the row stays, revived
         expect(await condemned(store, { graceMs: SHORT })).toEqual([`${T}/${H1}`]);  // and is offered again, so a reaper settles it
         expect(await store.blobClaim(T, H1, { graceMs: SHORT, claimMs: LONG })).toBe(true);   // claimable although an upload is pending: it was claimed before
-        expect(await store.blobReaped(T, H1)).toBe(false);                           // keep: put the bytes back
+        expect(await store.blobReaped(T, H1)).toBe(false);                           // keep: put the bytes back (the row stays, revived, until the restore is done)
+        expect(await store.blobReaped(T, H1, { restored: true })).toBe(true);
         expect(await condemned(store)).toEqual([]);
       });
 
@@ -796,7 +797,9 @@ export function storeContract(name, make) {
         await put(store, B2, [H1]);                                                  // an op names the picture now: the row is NOT deleted
         expect(await code(store.blobPend(T, B3, H1, SHORT))).toBe("unavailable");    // a deleted row would let this through (and the PUT then find the old bytes)
         expect(await store.blobClaim(T, H1, { graceMs: 0, claimMs: LONG })).toBe(false);   // still held
-        expect(await store.blobReaped(T, H1)).toBe(false);                           // revived: put the bytes back (and the row is dropped)
+        expect(await store.blobReaped(T, H1)).toBe(false);                           // revived: put the bytes back
+        expect(await code(store.blobPend(T, B3, H1, SHORT))).toBe("unavailable");    // the row (and the claim) stays until the restore is done
+        expect(await store.blobReaped(T, H1, { restored: true })).toBe(true);
         await store.blobPend(T, B3, H1, SHORT);                                      // settled: asks go through again
         expect(await store.blobReaped(T, H1)).toBe(false);                           // nothing left to settle
       });
@@ -811,7 +814,25 @@ export function storeContract(name, make) {
         expect(await store.blobReaped(T, H3)).toBe(true);
         expect(await store.blobReaped(T, H1, { deleted: true })).toBe(true);
         expect(await store.blobReaped(T, H1)).toBe(false);                           // settled: not ours any more
-        expect(await store.blobReaped(T, H2, { deleted: true })).toBe(true);         // the row was dropped with the verdict
+        expect(await store.blobReaped(T, H2, { restored: true })).toBe(true);
+        expect(await store.blobReaped(T, H2)).toBe(false);                           // dropped by the restored step
+      });
+
+      test("HIGH-A: a keep verdict leaves the row claimed and revived until the restore is done, so a restore that failed is retried: the next claim says keep again", async () => {
+        const { store, expire } = await fresh();
+        await put(store, B, [H1]); await store.purgeBoard(T, B);
+        expect(await store.blobClaim(T, H1, { graceMs: SHORT, claimMs: SHORT })).toBe(false);   // too young
+        await expire();
+        expect(await store.blobClaim(T, H1, { graceMs: SHORT, claimMs: SHORT })).toBe(true);
+        await put(store, B2, [H1]);                                                  // a reference under the claim
+        expect(await store.blobReaped(T, H1)).toBe(false);                           // keep ... and the process dies before the restore
+        await expire();                                                              // the claim lapses
+        expect(await condemned(store, { graceMs: SHORT })).toEqual([`${T}/${H1}`]);  // the row is still there: offered again
+        expect(await store.blobClaim(T, H1, { graceMs: SHORT, claimMs: LONG })).toBe(true);
+        expect(await store.blobReaped(T, H1)).toBe(false);                           // keep again: restore is retried
+        expect(await store.blobReaped(T, H1, { restored: true })).toBe(true);
+        expect(await condemned(store, { graceMs: 0 })).toEqual([]);
+        expect(await store.blobClaim(T, H1, { graceMs: 0, claimMs: LONG })).toBe(false);   // done
       });
 
       test("a reference that lands during a delete keeps the condemnation row under its claim (revived), never ends it", async () => {

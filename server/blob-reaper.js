@@ -8,7 +8,7 @@
 //                  marks the condemnation revived instead of ending it (the row, and so the claim, stays).
 //   2. quarantine  `Blobs.quarantine`: the bytes move out of reach but are not destroyed.
 //   3. settle      `Store.blobReaped`: in one transaction says whether anything references the hash now (a revived mark, a reference, a pending
-//                  upload). Yes: the condemnation is dropped and `Blobs.restore` puts the bytes back. No: `Blobs.delete` destroys them, then
+//                  upload). Yes: `Blobs.restore` puts the bytes back, then `blobReaped(…, { restored: true })` drops the row. No: `Blobs.delete` destroys them, then
 //                  `Store.blobReaped(…, { deleted: true })` drops the row (the row stays until then, so a failing delete is retried). A reference
 //                  landing at any moment before the verdict never loses the bytes; one landing during the final delete call is counted `raced`, logged
 //                  as an error, and healed by the client's re-upload (PROTOCOL.md § Blobs, "References and purge").
@@ -42,6 +42,9 @@ export function blobReaper({ store, blobs, clock = { now: Date.now }, log = { wa
   /** Where the next page resumes (null = from the start). Lost on restart, which only re-reads from the start. */
   let cursor = null;
 
+  /** Tenants whose stored bytes changed in this sweep: told to `onDeleted` once each when it ends (a recount reads the whole tenant). */
+  const touched = new Set();
+
   /** One hash. @returns {Promise<"deleted"|"revived"|"raced"|"skipped"|"failed">} */
   async function reap({ tenant, sha1 }) {
     try {
@@ -51,8 +54,9 @@ export function blobReaper({ store, blobs, clock = { now: Date.now }, log = { wa
       if (clock.now() - t0 > claimMs / 2) { say("warn", "blob reap too slow to settle inside its claim; a later sweep finishes it", { tenant, sha1 }); return "failed"; }
       const forGood = await store.blobReaped(tenant, sha1);   // the verdict; the claimed row stays until the delete is done, so a failing delete is retried
       if (forGood) await blobs.delete(tenant, sha1); else await blobs.restore(tenant, sha1);
-      const clean = !forGood || await store.blobReaped(tenant, sha1, { deleted: true });
-      try { onDeleted?.(tenant); } catch (err) { say("warn", "blob reaper: quota recount failed", { tenant, err }); }
+      // The row stayed through the delete or the restore, so a failure above is retried by the next claim; only now does it go.
+      const clean = await store.blobReaped(tenant, sha1, forGood ? { deleted: true } : { restored: true });
+      if (forGood) touched.add(tenant);
       if (!clean) { say("error", "blob reaped under a new reference: a board references a picture whose bytes are gone; a client that holds it uploads it again", { tenant, sha1 }); return "raced"; }
       return forGood ? "deleted" : "revived";
     } catch (err) { say("warn", "blob reap failed; a later sweep retries it", { tenant, sha1, err }); return "failed"; }
@@ -79,7 +83,10 @@ export function blobReaper({ store, blobs, clock = { now: Date.now }, log = { wa
             if (page.length < limit) { cursor = null; return out; }   // a short page: wrap, the next sweep starts again from the start
           }
         } catch (err) { say("warn", "blob reaper sweep failed", { err }); out.failed++; }
-        finally { running = null; }
+        finally {
+          for (const tenant of touched) { try { onDeleted?.(tenant); } catch (err) { say("warn", "blob reaper: quota recount failed", { tenant, err }); } }
+          touched.clear(); running = null;
+        }
         return out;
       })();
     },

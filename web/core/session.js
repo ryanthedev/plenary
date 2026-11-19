@@ -132,7 +132,7 @@ export function createSession({ join, token, board, client = "web", tab = null, 
       }
       if (stream === "notes") for (const el of op.elements ?? []) if (!known(el.id)) mineNow().add(el.id);
       if (op.elements?.length || op.appState) s.sent++;
-      if (!op.transient) offerPlaced(ed, op);
+      if (!op.transient) offerPlaced(stream, ed, op);
       inner(op);
     };
   }
@@ -310,21 +310,36 @@ export function createSession({ join, token, board, client = "web", tab = null, 
   const stored = new Map();
   /** Pictures waiting for the app to upload them (see `unsavedFiles`): fileId → file. */
   const offers = new Map();
+  /** Image elements this client placed whose op may not be acknowledged yet: elementId → { stream, fileId } (see the re-offer on every `live`). */
+  const awaiting = new Map();
+  /** Offers `fileId`'s bytes for upload unless this client put or fetched it within BLOB_PENDING_MS. */
+  const offerFile = (ed, fileId, t) => {
+    const file = ed.doc.files?.[fileId];
+    if (!file || t - (stored.get(fileId) ?? -Infinity) < BLOB_PENDING_MS) return;
+    stored.set(fileId, t); offers.set(fileId, file);
+  };
   /**
-   * A committed op that places an image element whose bytes this client holds: offer the picture for upload unless this client put or fetched it
-   * within BLOB_PENDING_MS. The server may have deleted a picture no board used for a while (PROTOCOL.md § Blobs, "References and purge"); the bytes
-   * of a pasted selection or a library item never travel in ops, so the client that places them puts them again. A put the server answered "already
-   * had it" does not count as stored for longer than that window.
+   * A committed op of this client that PLACES an image (a new element, or one whose fileId changed; never a move, resize or restyle of a picture that
+   * is already there): offer its picture for upload unless this client put or fetched it within BLOB_PENDING_MS. The server may have deleted a picture
+   * no board used for a while (PROTOCOL.md § Blobs, "References and purge"), and the bytes of a pasted selection or a library item never travel in
+   * ops, so the client that places them puts them again. The element is remembered until the room sequences it: an op sent offline is resent on
+   * reconnect without passing here, so every `live` offers its picture again (same age rule).
    */
-  const offerPlaced = (ed, op) => {
+  const offerPlaced = (stream, ed, op) => {
     const t = stamp();
     for (const el of op.elements ?? []) {
       if (el.type !== "image" || el.isDeleted || typeof el.fileId !== "string") continue;
-      const file = ed.doc.files?.[el.fileId];
-      if (!file || t - (stored.get(el.fileId) ?? -Infinity) < BLOB_PENDING_MS) continue;
-      stored.set(el.fileId, t); offers.set(el.fileId, file);
+      if (C.element(stream, el.id)?.fileId === el.fileId) continue;   // already placed with this picture: a move, resize or restyle
+      awaiting.set(el.id, { stream, fileId: el.fileId });
+      offerFile(ed, el.fileId, t);
     }
+    if (awaiting.size > 500) for (const [id, w] of awaiting) if (C.sequenced(w.stream, id)) awaiting.delete(id);
   };
+  statusFns.add(st => {
+    if (st !== "live") return;
+    const t = stamp();
+    for (const [id, w] of awaiting) { if (C.sequenced(w.stream, id)) awaiting.delete(id); else offerFile(eds[w.stream], w.fileId, t); }
+  });
   /**
    * Pictures the app should put now: each placed by this client's own op (a pasted selection, a library item, a duplicate), bytes held, not put
    * or fetched by this client for BLOB_PENDING_MS. Asked every frame; empty when nothing was placed (nothing walks the documents).

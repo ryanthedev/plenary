@@ -101,8 +101,8 @@ export const STORE_METHODS = Object.freeze(["append", "read", "lastSeq", "putChe
  *     // Hashes condemned at least graceMs (integer >= 0) ago on the Store's clock and not under a live claim, ascending by (tenant, sha1) after `after`, at most limit (1..MAX_CONDEMNED_PAGE).
  *   blobClaim(tenant: string, sha1: string, o: { graceMs: number, claimMs: number }): Promise<boolean>,
  *     // The reaper's conditional claim (claimMs: positive integer): true only if the hash is condemned for graceMs, not under a live claim, and either STILL UNREFERENCED with no live pending reference, or claimed before (a reaper died mid-way: it must put the bytes back or finish). An unclaimed hash that has a reference loses its condemnation.
- *   blobReaped(tenant: string, sha1: string, o?: { deleted?: boolean }): Promise<boolean>,
- *     // The settle, after the bytes were quarantined. Without `deleted`: true = nothing references the hash (no revive mark, reference or live pending upload): delete the bytes (the claimed row stays, so a failed delete is retried); false = put them back (the row is dropped). With `deleted: true` (after the delete): drops the row; false = a reference arrived since the verdict; a missing row is true.
+ *   blobReaped(tenant: string, sha1: string, o?: { deleted?: boolean, restored?: boolean }): Promise<boolean>,
+ *     // The settle, after the bytes were quarantined. Without `deleted`: true = nothing references the hash (no revive mark, reference or live pending upload): delete the bytes (the claimed row stays, so a failed delete is retried); false = put them back (the row stays, marked revived, so a failed restore is retried). With `restored: true` (after the restore) or `deleted: true` (after the delete): drops the row; false = a reference arrived since the verdict; a missing row is true.
  *   blobPrune(limit: number): Promise<number>,   // deletes at most limit (positive integer) expired pending references; returns how many
  *   close(): Promise<void>,   // idempotent; every later call rejects "closed"
  * }} Store

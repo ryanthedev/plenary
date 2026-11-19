@@ -2,7 +2,7 @@
 //   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB, a hash mismatch, and anything that isn't a PNG/JPEG/GIF/WebP
 //   get(tenant, sha1)          bytes, or null
 //   usage(tenant)             the total bytes the tenant's blobs take (the quota's starting point)
-//   quarantine(tenant, sha1)  moves the blob out of reach (get answers null, usage stops counting it) without destroying it; idempotent (an absent blob is not an error)
+//   quarantine(tenant, sha1)  moves the blob out of reach (get answers null; usage still counts it) without destroying it; idempotent (an absent blob is not an error)
 //   restore(tenant, sha1)     puts a quarantined blob back, unless the tenant has the blob again (then the quarantined copy is dropped); idempotent
 //   delete(tenant, sha1)      removes the blob for good, quarantined copy included; idempotent
 //             (only the blob reaper, server/blob-reaper.js, calls these three: PROTOCOL.md § Blobs, "References and purge")
@@ -31,7 +31,7 @@ import { isSha1, PortError } from "../ids.js";
 import { BLOB_PENDING_MS } from "../../packages/protocol/envelope.js";
 
 export const MAX_BLOB_BYTES = 10 * 1024 * 1024;
-/** Where quarantined blobs live, outside every tenant's own folder or key prefix (so usage() stops counting them): `<QUARANTINE>/<tenant>/<sha1>`. */
+/** Where quarantined blobs live, outside every tenant's own folder or key prefix (get never finds them; usage() adds them in): `<QUARANTINE>/<tenant>/<sha1>`. */
 export const QUARANTINE = ".quarantine";
 export { BLOB_PENDING_MS };   // how long a pending reference protects an upload (defined in the protocol package: clients use it too)
 /** How long a hash stays condemned before the reaper may delete it: well past the signed URL's 5 minutes and the pending window. */

@@ -1128,6 +1128,41 @@ test("#92: a picture placed by this client's own op without being uploaded (a pa
   expect(spy.puts).toEqual([OTHER.id, OTHER.id]);                         // placed through addPicture (the app uploads it itself) or fetched: never offered here
 });
 
+test("#92 MED-B: moving, resizing or restyling pictures that are already placed re-uploads nothing, however old their last put", () => {
+  const spy = spyNet();
+  rig = setup({ appNet: spy.net });
+  const { S, bo, step, net } = rig;
+  const ids = ["1", "2", "3"].map(k => k.repeat(40));
+  for (const id of ids) { S.addPicture({ ...PIC, id }); step(3); }
+  step(5);
+  expect(spy.puts).toEqual([]);                                           // addPicture's own upload is the app's (the test calls S directly)
+  net.advance(BLOB_PENDING_MS * 2); step(3);                              // every picture's last put is now older than the window
+  const ed = S.eds.board;
+  ed.select([...ed.doc.byId.values()].filter(e => e.type === "image").map(e => e.id));
+  const sent = S.sent;
+  S.act("board", e => e.nudge(10, 0)); step(4); S.act("board", e => e.nudge(0, 10)); step(4);   // move all of them (ops of image elements)
+  expect(S.sent).toBeGreaterThan(sent);                                   // they really were sent
+  expect(spy.puts).toEqual([]);
+});
+
+test("#92 MED-C: a picture placed offline (its op resent after the reconnect, which never passes the Editor) is offered again on `live` when its last put is older than BLOB_PENDING_MS", () => {
+  const spy = spyNet();
+  rig = setup({ appNet: spy.net });
+  const { S, bo, step, net, joins } = rig;
+  const OTHER = { ...PIC, id: "9".repeat(40) };
+  bo.addPicture(OTHER); step(3);
+  const ed = bo.eds.board;
+  ed.select([[...ed.doc.byId.values()].find(e => e.fileId === OTHER.id).id]);
+  const text = ed.copy();
+  joins[0].fail(); step(2);                                               // ada goes offline
+  S.paste(text); step(4);                                                 // placed offline: put once at placement (it would be lost with the connection)
+  expect(spy.puts).toEqual([OTHER.id]);
+  net.advance(80 * 60_000);                                               // 80 minutes: the picture is condemned and reaped meanwhile
+  S.reconnect(); step(30); net.advance(1000); step(30);
+  expect(S.status).toBe("live");
+  expect(spy.puts).toEqual([OTHER.id, OTHER.id]);                         // the resend does not pass the Editor: the reconnect offers it again
+});
+
 test("L1/L2: S.missing() is memoised on the documents' revisions (no scan per frame) and its stamp changes when an element showing the picture does", () => {
   const spy = spyNet();
   rig = setup({ appNet: spy.net });

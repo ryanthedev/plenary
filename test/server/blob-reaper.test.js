@@ -241,3 +241,31 @@ test("a PUT URL for a hash being deleted is refused (the gateway answers unavail
   access.recount(T);                                                                     // ... until it is told
   expect(await put(b)).toMatchObject({ ok: true, created: true });
 });
+
+test("HIGH-A: a restore that fails once does not lose the picture: the row stays claimed, and the next sweep (after the claim lapses) brings the bytes back", async () => {
+  const p = png(33);
+  await place("b-one", p); await store.purgeBoard(T, "b-one"); t.now += BLOB_GRACE_MS;
+  const gate = deferred(), mid = deferred();
+  const held = { ...blobs, quarantine: async (...a) => { mid.resolve(); await gate.promise; return blobs.quarantine(...a); } };
+  let failRestore = true;
+  const flaky = { ...held, restore: async (...a) => { if (failRestore) { failRestore = false; throw new Error("disk full"); } return blobs.restore(...a); } };
+  const run = make({ blobs: flaky }).sweep();
+  await mid.promise;
+  await refer("b-two", p);                                                              // a reference lands under the claim
+  gate.resolve();
+  expect(await run).toMatchObject({ revived: 0, failed: 1 });                           // the restore threw
+  expect(await has(p)).toBe(false);                                                     // the bytes sit in quarantine ...
+  expect(await store.blobPend(T, "b-three", p.id, MIN).catch(e => e.code)).toBe("unavailable");   // ... and the claim holds
+  t.now += 3 * MIN;                                                                     // it lapses
+  expect(await make({ blobs: flaky }).sweep()).toMatchObject({ revived: 1, failed: 0 });
+  expect(await has(p)).toBe(true);                                                      // back
+  expect(await store.blobCondemned({ graceMs: 0, limit: 10 })).toEqual([]);
+});
+
+test("LOW-D: the quota hook hears each tenant once per sweep, not once per reaped hash", async () => {
+  const pics = [png(34), png(35), png(36)];
+  for (const [i, p] of pics.entries()) { await place(`b-${i}`, p); await store.purgeBoard(T, `b-${i}`); }
+  t.now += BLOB_GRACE_MS;
+  expect(await reaper.sweep()).toMatchObject({ deleted: 3 });
+  expect(deleted).toEqual([T]);
+});

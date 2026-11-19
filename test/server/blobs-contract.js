@@ -141,10 +141,13 @@ export function blobsContract(label, makeBlobs, { skip = false } = {}) {
     await blobs.put(ta, ha, a); await blobs.put(ta, hb, b); await blobs.put(tb, ha, a);
     await blobs.quarantine(ta, ha);
     expect(await blobs.get(ta, ha)).toBe(null);
-    expect(await blobs.usage(ta)).toBe(300);
+    expect(await blobs.usage(ta)).toBe(500);                   // still counted: the bytes are kept (and a usage read mid-reap must not miss them)
+    expect(await blobs.usage(tb)).toBe(200);                   // another tenant's folder is its own
     expect(await blobs.get(ta, hb)).toEqual(b); expect(await blobs.get(tb, ha)).toEqual(a);   // neighbours untouched
     await blobs.quarantine(ta, ha);                            // again: nothing live to move is not an error
     await blobs.quarantine(ta, sha1(fakePng(50, 43)));         // never stored
+    expect(await blobs.usage(ta)).toBe(500);
+    await blobs.delete(ta, ha); await blobs.put(ta, ha, a); await blobs.quarantine(ta, ha);   // gone for good, then stored and quarantined afresh
     await blobs.restore(ta, ha);
     expect(await blobs.get(ta, ha)).toEqual(a);
     expect(await blobs.usage(ta)).toBe(500);

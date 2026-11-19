@@ -3,7 +3,7 @@
 //                              true when it stored the blob, false when the tenant already had it
 //   get(tenant, sha1)          bytes, or null
 //   quarantine / restore / delete   rename the file to <dir>/.quarantine/<tenant>/<sha1> and back (one atomic rename each), or unlink it and its quarantined copy
-//   usage(tenant)              the bytes the tenant's blobs take (a walk of its folder; the quota's starting point)
+//   usage(tenant)              the bytes the tenant's blobs take, quarantined ones included (a walk of its folders; the quota's starting point)
 // A blob lives at <dir>/<tenant>/<first 2 hex>/<sha1>. Both ids are validated before they touch a path, so there is
 // no traversal and one tenant can't name another's file. Writes go to a temp file, are fsynced, then hard-linked
 // under the blob's name (which never replaces: the first bytes for a hash are kept), and the folder is fsynced:
@@ -67,6 +67,9 @@ export function diskBlobs({ dir }) {
       for (const shard of await list(join(dir, tenant)))
         if (shard.isDirectory()) for (const f of await list(join(dir, tenant, shard.name)))
           if (f.isFile() && isSha1(f.name)) total += (await stat(join(dir, tenant, shard.name, f.name)).catch(() => null))?.size ?? 0;
+      // Quarantined blobs still take the space (and may come back): a count taken mid-reap must not miss them.
+      for (const f of await list(join(dir, QUARANTINE, tenant)))
+        if (f.isFile() && isSha1(f.name)) total += (await stat(join(dir, QUARANTINE, tenant, f.name)).catch(() => null))?.size ?? 0;
       return total;
     },
 

@@ -461,24 +461,26 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
     },
 
     /**
-     * The reaper's two settle calls (PROTOCOL.md § Blobs, "References and purge"). Without `deleted`, after the bytes were quarantined: is anything
-     * referencing the hash (a revived mark, a reference, a live pending upload)? Yes: the condemnation is dropped and false says put the bytes back.
-     * No: true says delete them, and the claimed row STAYS, so a delete that fails is retried by the next claim. With `{ deleted: true }`, after the
-     * delete: drops the row; false = a reference arrived since the verdict (the bytes are gone: the client's re-upload heals it); a missing row is true.
+     * The reaper's settle calls (PROTOCOL.md § Blobs, "References and purge"). Without options, after the bytes were quarantined: is anything
+     * referencing the hash (a revived mark, a reference, a live pending upload)? Yes: false says put the bytes back, and the claimed row STAYS (marked
+     * revived). No: true says delete them, and the row stays too. So a restore or a delete that fails is retried by the next claim, whose verdict is
+     * the same. With `{ restored: true }`, after the restore: drops the row. With `{ deleted: true }`, after the delete: drops the row; false = a
+     * reference arrived since the verdict (the bytes are gone: the client's re-upload heals it); a missing row is true.
      */
-    async blobReaped(tenant, sha1, { deleted = false } = {}) {
+    async blobReaped(tenant, sha1, { deleted = false, restored = false } = {}) {
       needId(tenant, "tenant"); checkPend(sha1, 1);
       if (!open) throw new PortError("closed", "the store is closed");
       const keep = `revived OR EXISTS (SELECT 1 FROM ${BR} r WHERE r.tenant = $1 AND r.sha1 = $2)
         OR EXISTS (SELECT 1 FROM ${BP} p WHERE p.tenant = $1 AND p.sha1 = $2 AND p.until_at > ${DB_NOW})`;
       return write(async tx => {
+        if (restored) { await tx.unsafe(`DELETE FROM ${BC} WHERE tenant = $1 AND sha1 = $2 AND claimed_until IS NOT NULL`, [tenant, sha1]); return true; }
         if (deleted) {
           const rows = await tx.unsafe(`DELETE FROM ${BC} WHERE tenant = $1 AND sha1 = $2 AND claimed_until IS NOT NULL RETURNING ${keep} AS keep`, [tenant, sha1]);
           return !rows.length || rows[0].keep === false;
         }
         const rows = await tx.unsafe(`SELECT ${keep} AS keep FROM ${BC} WHERE tenant = $1 AND sha1 = $2 AND claimed_until IS NOT NULL FOR UPDATE`, [tenant, sha1]);
         if (!rows.length) return false;
-        if (rows[0].keep) { await tx.unsafe(`DELETE FROM ${BC} WHERE tenant = $1 AND sha1 = $2`, [tenant, sha1]); return false; }
+        if (rows[0].keep) { await tx.unsafe(`UPDATE ${BC} SET revived = true WHERE tenant = $1 AND sha1 = $2`, [tenant, sha1]); return false; }   // the row STAYS until the restore is done
         return true;
       });
     },

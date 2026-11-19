@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import { lstatSync, readdirSync, readFileSync, realpathSync, rmSync, existsSync, renameSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { dlopen, FFIType } from "bun:ffi";
+import { dlopen, FFIType, read } from "bun:ffi";
 
 export const ROOT = realpathSync(resolve(fileURLToPath(new URL("..", import.meta.url))));
 const RIG_CLI = join(ROOT, "scripts/cluster-rig.js");
@@ -101,23 +101,50 @@ export function rigAliveViaCli(dir, timeout = 60_000, spawn = spawnSync) {
   try { return JSON.parse(r.stdout).procs.some(p => p.alive); } catch { return true; }
 }
 
-let nativeRenameExcl;
-try {
-  if (process.platform === "darwin") {
-    const lib = dlopen("libSystem.B.dylib", { renamex_np: { args: [FFIType.ptr, FFIType.ptr, FFIType.u32], returns: FFIType.i32 } });
-    nativeRenameExcl = (from, to) => lib.symbols.renamex_np(Buffer.from(from + "\0"), Buffer.from(to + "\0"), 0x4);
-  } else if (process.platform === "linux") {
-    const lib = dlopen("libc.so.6", { renameat2: { args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.u32], returns: FFIType.i32 } });
-    nativeRenameExcl = (from, to) => lib.symbols.renameat2(-100, Buffer.from(from + "\0"), -100, Buffer.from(to + "\0"), 1);
+let nativeRenameExcl = null, nativeRenameErrno = null, warnedNativeFallback = false;
+export function loadNativeRename(loader = dlopen, platform = process.platform, warn = message => console.error(message), install = true) {
+  let rename = null, errnoReader = null;
+  try {
+    if (platform === "darwin") {
+      const lib = loader("libSystem.B.dylib", {
+        renamex_np: { args: [FFIType.ptr, FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
+        __error: { args: [], returns: FFIType.ptr },
+      });
+      const renamex = lib.symbols.renamex_np, getErrno = lib.symbols.__error;
+      rename = (from, to) => renamex(Buffer.from(from + "\0"), Buffer.from(to + "\0"), 0x4);
+      errnoReader = () => read.i32(getErrno());
+    } else if (platform === "linux") {
+      const lib = loader("libc.so.6", {
+        renameat2: { args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
+        __errno_location: { args: [], returns: FFIType.ptr },
+      });
+      const renameat2 = lib.symbols.renameat2, getErrno = lib.symbols.__errno_location;
+      rename = (from, to) => renameat2(-100, Buffer.from(from + "\0"), -100, Buffer.from(to + "\0"), 1);
+      errnoReader = () => read.i32(getErrno());
+    }
+  } catch {
+    rename = null;
+    errnoReader = null;
   }
-} catch { /* use the guarded fallback when the platform symbol is unavailable */ }
+  if ((platform === "darwin" || platform === "linux") && !rename && !warnedNativeFallback) {
+    warnedNativeFallback = true;
+    warn("exclusive rename unavailable; using check-then-rename");
+  }
+  if (install) { nativeRenameExcl = rename; nativeRenameErrno = errnoReader; }
+  return rename;
+}
+loadNativeRename();
 
 export function renameExcl(from, to, { forceFallback = false, stat = lstatSync } = {}) {
   if (!forceFallback && nativeRenameExcl) {
     if (nativeRenameExcl(from, to) === 0) return;
-    try { stat(to); const e = new Error(`target exists: ${to}`); e.code = "EEXIST"; throw e; }
-    catch (e) { if (e.code === "EEXIST") throw e; }
-    throw new Error(`exclusive rename failed: ${from} -> ${to}`);
+    const errno = nativeRenameErrno?.();
+    const errnoNames = { 1: "EPERM", 2: "ENOENT", 13: "EACCES", 16: "EBUSY", 17: "EEXIST", 18: "EXDEV", 20: "ENOTDIR", 22: "EINVAL", 28: "ENOSPC", 30: "EROFS" };
+    const name = errnoNames[errno] ?? errno;
+    const error = new Error(errnoNames[errno] === "EEXIST" ? `target exists: ${to} (EEXIST)` : `exclusive rename failed: ${name}`);
+    error.code = errnoNames[errno] ?? String(errno);
+    error.errno = errno;
+    throw error;
   }
   try { stat(to); const e = new Error(`target exists: ${to}`); e.code = "EEXIST"; throw e; }
   catch (e) { if (e.code !== "ENOENT") throw e; }
@@ -155,13 +182,13 @@ const refuseBase = (p, what) => {
 export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), scratch = null, minAgeMs = 2 * HOUR, now = Date.now(),
   lsof = "lsof", rigAlive = rigAliveViaCli, yes = false, force = false, uid = process.getuid(), beforeRemove = null,
   afterRename = null, stat = lstatSync, clock = Date.now, maxTimeMs = 5 * 60_000, openPathsFn = openPaths, openUnderFn = openUnder,
-  renameExclFn = null, rigAliveFn = null, forceFallbackRename = false } = {}) {
+  renameExclFn = null, platform = process.platform, nativeRenameAvailable = !!nativeRenameExcl } = {}) {
   if (minAgeMs < MIN_SAFE_AGE_MS && !force) throw new Error(`--min-age under ${MIN_SAFE_AGE_MS / 60_000} minutes needs --force (a younger entry may still be in use)`);
   const items = [];
   const bases = [["temp", tempDir, isTempName], ["scratch", scratch, () => true]];
   const deadline = clock() + maxTimeMs;
   const timeLeft = () => Math.max(0, deadline - clock());
-  const safeRename = (from, to) => renameExclFn ? renameExclFn(from, to) : renameExcl(from, to, { stat, forceFallback: forceFallbackRename });
+  const safeRename = (from, to) => renameExclFn ? renameExclFn(from, to) : renameExcl(from, to, { stat });
   const deadlineCheck = () => timeLeft() <= 0;
   const existsLstat = p => { try { stat(p); return true; } catch (e) { if (e.code === "ENOENT") return false; throw e; } };
   let opens = null, opensError = null;
@@ -178,6 +205,7 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
       const st = stat(path);
       if (st.isSymbolicLink()) { item.why = "symlink"; return; }
       if (st.uid !== uid) { item.why = `owned by uid ${st.uid}, not ${uid}`; return; }
+      if (yes && platform === "darwin" && !nativeRenameAvailable && !force) { item.why = "exclusive rename unavailable; --force required to remove"; return; }
       if (st.dev !== stat(base).dev) { item.status = "failed"; item.why = "candidate is a mount point (different device from parent)"; return; }
       const m = measure(path, stat, undefined, deadlineCheck);
       item.bytes = m.bytes;
@@ -197,16 +225,20 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
       const parked = name.startsWith(DELETING) ? path : join(base, DELETING + name);
       if (parked !== path) { if (existsLstat(parked)) { item.why = "a parked copy already exists"; return; } safeRename(path, parked); afterRename?.(parked, path); }
       const parkedStat = stat(parked);
+      const restoreChanged = () => {
+        if (parked === path) return;
+        if (existsLstat(path)) item.why = "changed while parking; original path exists";
+        else safeRename(parked, path);
+      };
       let after;
       try { after = measure(parked, stat, undefined, deadlineCheck); }
       catch (e) {
-        if (e.message !== "skipped (time limit)") throw e;
-        item.why = "skipped (time limit)";
-        if (parked !== path) { if (existsLstat(path)) item.why += "; original path exists"; else safeRename(parked, path); }
+        if (e.message === "skipped (time limit)") { item.why = "skipped (time limit)"; restoreChanged(); if (item.why.includes("original path exists")) item.why = "skipped (time limit); original path exists"; }
+        else { item.why = "changed while parking"; restoreChanged(); }
         return;
       }
-      if (parkedStat.dev !== judged.dev || parkedStat.ino !== judged.ino || parkedStat.mtimeMs !== judged.mtimeMs || now - after.newest < (extra?.minIdleMs ?? minAgeMs) || after.bytes !== scanned.bytes || after.newest !== scanned.newest) {
-        if (parked !== path) { if (existsLstat(path)) item.why = "changed while parking; original path exists"; else safeRename(parked, path); }
+      if (parkedStat.dev !== judged.dev || parkedStat.ino !== judged.ino || parkedStat.mtimeMs !== judged.mtimeMs || after.bytes !== scanned.bytes || after.newest !== scanned.newest) {
+        restoreChanged();
         if (!item.why) item.why = "changed while parking";
         return;
       }
@@ -222,7 +254,7 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
       if (why) { if (parked !== path) { if (existsLstat(path)) item.why = `${why}; original path exists`; else safeRename(parked, path); } if (!item.why) item.why = why; return; }
       rmSync(parked, { recursive: true, force: true });
       item.status = "removed";
-    } catch (e) { if (e.message === "skipped (time limit)") item.why = e.message; else { item.status = "failed"; item.why = e.message; } }
+    } catch (e) { if (e.message === "skipped (time limit)") item.why = e.message; else if (e.code === "EEXIST") { item.why = `target/original path exists${e.message ? `: ${e.message}` : ""}`; } else { item.status = "failed"; item.why = e.message; } }
   };
 
   for (const [target, dir, match] of bases) {
@@ -245,7 +277,7 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
         if (!existsSync(join(p, "rig.json"))) return "no rig.json (an up in progress or failed)";
         const left = timeLeft();
         if (left <= 0) return "skipped (time limit)";
-        const alive = rigAliveFn ? rigAliveFn(p, Math.max(1, Math.min(60_000, left))) : rigAlive(p, Math.max(1, Math.min(60_000, left)));
+        const alive = rigAlive(p, Math.max(1, Math.min(60_000, left)));
         return alive ? "rig alive or unknown" : "";
       } });
     }

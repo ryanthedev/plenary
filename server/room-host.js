@@ -292,7 +292,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       const sent = perf();
       const l = await withTimeout(store.acquire(tenant, board, me, leaseTtlMs), storeTimeoutMs);
       if (closed) {
-        if (l) await withTimeout(Promise.resolve(store.release(tenant, board, me, l.epoch)), storeTimeoutMs).catch(() => {});
+        if (l) await withTimeout(Promise.resolve().then(() => store.release(tenant, board, me, l.epoch)), storeTimeoutMs).catch(() => {});
         throw closedError();
       }
       if (l) return start(tenant, board, key, l, sent);
@@ -636,7 +636,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
         await slot.releaseP;
         if (slot.leaseLost) continue;
         try {
-          await withTimeout(Promise.resolve(store.release(slot.tenant, slot.board, me, slot.epoch)), storeTimeoutMs);   // never answers: the lease lapses by its ttl (logged below)
+          await withTimeout(Promise.resolve().then(() => store.release(slot.tenant, slot.board, me, slot.epoch)), storeTimeoutMs);   // never answers: the lease lapses by its ttl (logged below)
           // A host watching this board takes it at once (L2), not when it next asks the Store.
           if (!slot.announced) bus.publish(subjects.entries(slot.tenant, slot.board), { seq: slot.durable, epoch: slot.epoch, cp: slot.room?.heartbeat().cp ?? 0, released: true })?.catch?.(() => {});
         } catch (err) { log.warn("lease release failed; it lapses within its ttl", { tenant: slot.tenant, board: slot.board, err }); }

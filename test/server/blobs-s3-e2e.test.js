@@ -26,7 +26,7 @@ st("DW-42.2: bytes uploaded through one gateway are drawn by a page on another, 
     up.close();
     await a.stop();
 
-    const b = await rig({ blobs: s3Blobs(cfg()), registry: a.registry, ids: a.ids, server: { blobKey: key } });   // no disk shared with a's blobs
+    const b = await rig({ dir: a.dir, blobs: s3Blobs(cfg()), registry: a.registry, ids: a.ids, server: { blobKey: key } });   // the same log (a clean restart); the blobs are only in S3, none on this disk
     down = page(b, "viewer");
     await down.until(() => down.S.eds.board.doc.files[id]?.dataURL === dataURL, "the bytes from S3 in the fresh page");
   } finally { up?.close(); down?.close(); }

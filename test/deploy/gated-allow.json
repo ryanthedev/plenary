@@ -50,7 +50,7 @@
   ],
   "test/server/room-host-child.js": [
     "const store = await postgresStore({ url: process.env.DATABASE_URL, schema, max: 3 });",
-    "bus = await natsBus({ url: process.env.NATS_URL, cluster: null });"
+    "const bus = await natsBus({ url: process.env.NATS_URL, cluster: null });"
   ],
   "test/deploy/test-cluster.test.js": [
     "const GATED_NAME = /\\b(DATABASE_URL|NATS_URL|S3_[A-Z0-9_]+)\\b/;   // any form: process.env.X, [\"X\"], destructuring, a bare constant",

@@ -57,6 +57,7 @@ nav.side h4 { margin: 14px 8px 4px; font-size: 11px; text-transform: uppercase; 
 .nav { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 8px; border-radius: 6px; text-align: left; }
 .nav:hover { background: var(--hover); }
 .nav.on { background: var(--accent-soft); font-weight: 600; }
+.nav.on .n { color: var(--muted); }
 .nav .n { margin-left: auto; color: var(--dim); font-size: 11px; }
 .nav.sub { padding-left: 26px; }
 .ic { width: 16px; text-align: center; color: var(--muted); }
@@ -72,9 +73,9 @@ h2.sec { font-size: 13px; margin: 22px 0 10px; display: flex; gap: 8px; align-it
 .tab { padding: 8px 12px; border-bottom: 2px solid transparent; color: var(--muted); }
 .tab.on { border-color: var(--accent); color: var(--fg); font-weight: 600; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; }
-.card { border: 1px solid var(--border); border-radius: 10px; background: var(--surface); overflow: hidden; position: relative; cursor: pointer; }
+.card { border: 1px solid var(--border); border-radius: 10px; background: var(--surface); position: relative; cursor: pointer; }
 .card:hover { box-shadow: var(--shadow); }
-.thumb { height: 112px; background: var(--chrome); position: relative; }
+.thumb { height: 112px; background: var(--chrome); position: relative; overflow: hidden; border-radius: 10px 10px 0 0; }
 .thumb svg { position: absolute; inset: 0; width: 100%; height: 100%; }
 .card .meta { padding: 8px 10px; }
 .card .t { font-weight: 600; display: flex; align-items: center; gap: 6px; }
@@ -154,17 +155,36 @@ table.matrix td code { font: 11px var(--mono); color: var(--muted); }
 <script>
 const P = { ada: ["Ada Park", "var(--u-me)"], dev: ["Dev Rao", "var(--u-dev)"], maya: ["Maya Lin", "var(--u-maya)"], priya: ["Priya Shah", "var(--u-priya)"],
   sam: ["Sam Ortiz", "var(--u-sam)"], tom: ["Tom Berg", "var(--u-tom)"] };
-const av = (k, sq) => `<span class="av${sq ? " sq" : ""}" style="background:${P[k] ? P[k][1] : "var(--frame)"}">${(P[k] ? P[k][0] : k).split(" ").map(w => w[0]).join("").slice(0, 2)}</span>`;
-const tav = n => `<span class="av sq" style="background:var(--frame)">${n[0]}</span>`;
+const av = (k, sq) => `<span class="av${sq ? " sq" : ""}" style="background:${P[k] ? P[k][1] : "var(--muted)"};color:${P[k] ? "#fff" : "var(--surface)"}">${(P[k] ? P[k][0] : k).split(" ").map(w => w[0]).join("").slice(0, 2)}</span>`;
+const tav = n => `<span class="av sq" style="background:var(--muted);color:var(--surface)">${n[0]}</span>`;
 const SCREENS = ["home", "shared", "group", "space", "space-viewer", "space-personal", "space-settings", "access", "roles", "new-board", "new-space", "move", "share", "trash"];
 const DIALOGS = { "new-board": "space-personal", "new-space": "group", move: "space-personal", share: "space" };
 const q = new URLSearchParams(location.search);
 let S = SCREENS.includes(q.get("s")) ? q.get("s") : "home";
 const theme = q.get("theme") === "dark" ? "dark" : "light";
 document.documentElement.dataset.theme = theme;
-let menuOpen = null, toast = null, loc = "ada", ga = "view", inviteRole = "commenter";
-const go = s => { S = s; menuOpen = null; toast = null; const u = new URLSearchParams(location.search); u.set("s", s); history.replaceState(null, "", "?" + u); render(); };
+const WHO = { roles: "priya", "space-viewer": "dev", access: "dev" };
+const me = () => WHO[S] || "ada";
+let roleSel = ["editor", "member", "facilitator"].includes(q.get("role")) ? q.get("role") : "editor";
+let menuOpen = q.get("menu"), toast = null, loc = "ada", ga = "view", inviteRole = "commenter";
+const go = s => { S = s; menuOpen = null; roleSel = "editor"; toast = null; const u = new URLSearchParams(location.search); u.set("s", s); history.replaceState(null, "", "?" + u); render(); };
 
+const TICK = {};
+const ROLES = {
+  editor: { name: "Editor", kind: "🔒 built-in", note: "Built-in roles are read-only: duplicate one to make a custom role. Assigned at Group, Space or board scope; it applies to everything inside.",
+    used: "Used in 148 places, for example: Design team on Space Design · Leadership on Space Q4 Planning · Ada on board Roadmap.",
+    rows: [["View, comment, annotate", "board.view…annotate", "na", 1, 1, 1], ["Edit board content", "board.edit", "na", 1, 1, 1], ["Create board", "board.create", "na", 1, 1, "na"], ["Create space", "space.create", "na", 1, "na", "na"],
+      ["Manage members", "members.manage", "na", 0, 0, 0], ["Move out", "move", "na", 0, 0, 0], ["Delete / restore", "delete", "na", 0, "own", 0], ["Transfer ownership", "transfer", "na", 0, 0, 0], ["Manage roles", "roles.manage", "na", "na", "na", "na"]] },
+  member: { name: "Unit member", kind: "built-in · editable", edit: 1, note: "What everyone in Acme gets, at Unit scope. Board access comes from General access on each Group, Space and board, not from here.",
+    used: "212 people. “own” = their personal space and boards they own.",
+    rows: [["Create board", "board.create", "own", "na", "na", "na"], ["Create teams", "members.manage", 1, "na", "na", "na"], ["Move / delete own boards", "move, delete", "own", "na", "na", "na"], ["Create space at the root", "space.create", 1, "na", "na", "na"],
+      ["Transfer own boards", "transfer", "own", "na", "na", "na"], ["Manage roles", "roles.manage", 0, "na", "na", "na"]] },
+  facilitator: { name: "Facilitator", kind: "custom · from Editor", edit: 1, board: "Edit", note: "Like Editor, plus can invite people and make share links. Can't move, delete or transfer.",
+    used: "Used in 4 places: Space Q4 Planning (Leadership), Space Design (Maya), 2 boards.",
+    rows: [["Create board", "board.create", "na", 1, 1, "na"], ["Create space", "space.create", "na", 0, "na", "na"], ["Manage members", "members.manage", "na", 1, 1, 1], ["Move out", "move", "na", 0, 0, 0],
+      ["Delete / restore", "delete", "na", 0, 0, 0], ["Transfer ownership", "transfer", "na", 0, 0, 0]] },
+};
+if (q.get("tick")) TICK[q.get("tick")] = 0;
 const BOARDS = {
   ada: [["Offsite ideas", "2 h ago"], ["1:1 notes", "yesterday"], ["Sketches", "3 d ago"]],
   design: [["Roadmap", "10 min ago", 1], ["Onboarding flow", "1 h ago"], ["Brand refresh", "2 d ago", 1], ["Research wall", "last week"]],
@@ -190,13 +210,13 @@ function cards(list, path) {
 function topBar() {
   return `<div class="logo"><i></i>Plenary</div><span class="unit">· Acme</span><span class="spacer"></span>
     <div class="search">⌕ Search boards and Spaces<kbd>/</kbd></div><span class="spacer"></span>
-    <button class="btn ghost" data-go="roles" title="Unit settings">⚙ Unit settings</button>${av("ada")}`;
+    <button class="btn ghost" data-go="roles" title="Unit settings">⚙ Unit settings</button>${av(me())}`;
 }
 function side() {
-  const n = (s, ic, label, extra = "", cls = "") => `<button class="nav ${cls} ${cls !== "x" && (S === s || DIALOGS[S] === s || (s === "space" && S === "space-settings")) ? "on" : ""}" data-go="${s}"><span class="ic">${ic}</span>${label}${extra}</button>`;
+  const n = (s, ic, label, extra = "", cls = "") => `<button class="nav ${cls} ${cls !== "nohl" && (S === s || DIALOGS[S] === s || (s === "space" && S === "space-settings")) ? "on" : ""}" data-go="${s}"><span class="ic">${ic}</span>${label}${extra}</button>`;
   return `<button class="btn primary" style="width:100%;justify-content:center;margin-bottom:8px" data-go="new-board">＋ New board</button>
-    ${n("home", "⌂", "Home")}${n("home", "★", "Starred", '<span class="n">3</span>', "x")}${n("shared", "⇄", "Shared with me", '<span class="n">4</span>')}
-    ${n("space-personal", "◐", "Ada's space", '<span class="n">3</span>')}
+    ${n("home", "⌂", "Home")}${n("home", "★", "Starred", '<span class="n">3</span>', "nohl")}${n("shared", "⇄", "Shared with me", '<span class="n">4</span>')}
+    ${n("space-personal", "◐", P[me()][0].split(" ")[0] + "'s space", '<span class="n">3</span>')}
     <h4>Product</h4>${n("group", "▦", "Product")}${n("space", "▢", "Design", '<span class="n">4</span>', "sub")}<button class="nav sub"><span class="ic">▢</span>Q4 Planning<span class="n">2</span></button>
     <h4>Engineering</h4><button class="nav ${S === "space-viewer" || S === "access" ? "on" : ""}" data-go="space-viewer"><span class="ic">▢</span>Platform<span class="n">2</span></button>
     <h4>Not in a group</h4><button class="nav"><span class="ic">▢</span>Social club<span class="n">5</span></button>
@@ -245,8 +265,8 @@ const V = {
 
   access: () => `<div class="wrap"><div class="crumbs"><a>Acme</a> / <a>Engineering</a> /</div><div class="head">${tav("Platform")}<h1>Platform</h1></div>
     <div class="tabs"><a class="tab" data-go="space-viewer">Boards</a><span class="tab">Members</span><span class="tab on">Access</span></div>
-    <div class="panel" style="margin-bottom:18px"><b>Your access: Viewer</b><p class="from" style="margin:2px 0 8px">Every source that gives you a role here. The highest one wins.</p>
-      <div class="src win">${av("dev")}<span>Viewer</span><span class="from">via the <b>Infra</b> team · set on Space Platform</span><span class="spacer"></span><span class="badge lock">winning</span></div>
+    <div class="panel" style="margin-bottom:18px"><b>Your access: Viewer</b><p class="from" style="margin:2px 0 8px">Every source that gives you access here. You get everything any of them grants; nothing takes access away.</p>
+      <div class="src win">${av("dev")}<span>Viewer</span><span class="from">via the <b>Infra</b> team · set on Space Platform</span><span class="spacer"></span><span class="badge lock">grants the most</span></div>
       <div class="src">${tav("Acme")}<span>Viewer</span><span class="from">via Everyone in Acme · General access on Group Engineering</span></div>
       <p style="margin:10px 0 0">To create boards you need <b>Editor</b>. Owners: Priya Shah, Tom Berg · <a>Ask for access</a></p></div>
     <h2 class="sec">Who has access</h2>
@@ -255,20 +275,18 @@ const V = {
          [tav("SRE"), "SRE team (4)", "Editor", "Direct · this Space"], [tav("Eng"), "Engineering owners", "Owner", "Inherited · Group Engineering"], [tav("Acme"), "Everyone in Acme", "Viewer", "General access · Group Engineering"]]
         .map(([a, n, r, f]) => `<tr><td><span class="who">${a}${n}</span></td><td>${r}</td><td class="from">${f}</td></tr>`).join("")}</table></div>`,
 
-  roles: () => `<div class="wrap"><div class="crumbs">Acme / Unit settings /</div><div class="head"><h1>Roles</h1><span class="badge">Unit: Acme · Company</span><span class="spacer"></span><button class="btn">Duplicate a role…</button></div>
+  roles: () => { const R = ROLES[roleSel]; return `<div class="wrap"><div class="crumbs">Acme / Unit settings /</div><div class="head"><h1>Roles</h1><span class="badge">Unit: Acme · Company</span><span class="spacer"></span><button class="btn" data-role="facilitator">Duplicate a role…</button></div>
     <div class="tabs"><span class="tab">Members</span><span class="tab">Teams</span><span class="tab on">Roles</span><span class="tab">Domains</span><span class="tab">Offboarding</span></div>
-    <div class="split"><div class="rolelist">${[["Unit admin", "Everything, everywhere", "2 people", 1], ["Unit member", "What everyone in Acme gets", "212 people", 2], ["Owner", "Manage, move, delete, transfer", "61 places", 1], ["Editor", "Edit boards; create boards in Spaces", "148 places", 1, 1],
-      ["Annotator", "Draw annotations on top", "40 places", 1], ["Commenter", "Comment threads", "22 places", 1], ["Viewer", "Watch only", "305 places", 1], ["Facilitator", "Like Editor, plus can invite", "custom · 4 places", 0]]
-      .map(([n, d, u, b, on]) => `<button class="r ${on ? "on" : ""}"><span style="flex:1"><b>${n}</b> ${b === 1 ? "🔒" : b === 2 ? '<span class="badge">editable</span>' : '<span class="badge">custom</span>'}<small>${d}</small></span><small>${u}</small></button>`).join("")}</div>
-    <div class="panel"><div class="row"><b style="font-size:15px">Editor</b><span class="badge lock">🔒 built-in</span><span class="spacer"></span><button class="btn">Duplicate</button></div>
-      <p class="from" style="margin:4px 0 0">Built-in roles are read-only. Duplicate one to make a custom role. Assigned at Group, Space or board scope; it applies to everything inside.</p>
+    <div class="split"><div class="rolelist">${[["Unit admin", "Everything, everywhere", "2 people", 1], ["Unit member", "What everyone in Acme gets", "212 people", 2, "member"], ["Owner", "Manage, move, delete, transfer", "61 places", 1], ["Editor", "Edit boards; create boards in Spaces", "148 places", 1, "editor"],
+      ["Annotator", "Draw annotations on top", "40 places", 1], ["Commenter", "Comment threads", "22 places", 1], ["Viewer", "Watch only", "305 places", 1], ["Facilitator", "Like Editor, plus can invite", "custom · 4 places", 0, "facilitator"]]
+      .map(([n, d, u, b, k]) => `<button class="r ${k === roleSel ? "on" : ""}" ${k ? `data-role="${k}"` : ""}><span style="flex:1"><b>${n}</b> ${b === 1 ? "🔒" : b === 2 ? '<span class="badge">editable</span>' : '<span class="badge">custom</span>'}<small>${d}</small></span><small>${u}</small></button>`).join("")}</div>
+    <div class="panel"><div class="row"><b style="font-size:15px">${R.name}</b><span class="badge lock">${R.kind}</span><span class="spacer"></span>${R.edit ? '<button class="btn primary">Save role</button>' : '<button class="btn" data-role="facilitator">Duplicate</button>'}</div>
+      <p class="from" style="margin:4px 0 0">${R.note}</p>
+      ${R.board ? `<label class="l" style="margin-top:10px">Board content<select class="role" style="width:240px"><option>${R.board}</option></select><span class="h">One step of the board ladder (view, comment, annotate, edit). The live room sees this step.</span></label>` : ""}
       <table class="matrix"><tr><th>Permission</th><th>Unit</th><th>Group</th><th>Space</th><th>Board</th></tr>
-      ${[["View, comment, annotate", "board.view…annotate", "na", 1, 1, 1], ["Edit board content", "board.edit", "na", 1, 1, 1], ["Create board", "board.create", "na", 1, 1, "na"], ["Create space", "space.create", "na", 1, "na", "na"],
-         ["Manage members", "members.manage", "na", 0, 0, 0], ["Move out", "move", "na", 0, 0, 0], ["Delete / restore", "delete", "na", 0, "own", 0], ["Transfer ownership", "transfer", "na", 0, 0, 0], ["Manage roles", "roles.manage", 0, "na", "na", "na"]]
-        .map(([n, c, ...v]) => `<tr><td>${n}<br><code>${c}</code></td>${v.map(x => `<td>${x === "na" ? '<span class="ck na" title="not at this scope"></span>' : x === "own" ? '<span class="ck y">✓</span><br><small class="from">own</small>' : x ? '<span class="ck y">✓</span>' : '<span class="ck"></span>'}</td>`).join("")}</tr>`).join("")}</table>
-      <p class="from" style="margin:10px 0 0">Used in 148 places, for example: Design team on Space Design · Leadership on Space Q4 Planning · Ada on board Roadmap.</p>
-      <div class="banner" style="margin-top:12px">Editing <b>Unit member</b>: unticking “Create space” stops 212 members creating Spaces at the root. Existing Spaces are unaffected.</div></div></div></div>`,
-
+      ${R.rows.map(([n, c, ...v], ri) => `<tr><td>${n}<br><code>${c}</code></td>${v.map((x, ci) => { const k = roleSel + ri + "-" + ci; const on = k in TICK ? TICK[k] : x; return `<td>${x === "na" ? '<span class="ck na" title="not at this scope"></span>' : R.edit && x !== "own" ? `<button class="ck ${on ? "y" : ""}" data-tick="${k}" aria-label="${n} at ${["Unit", "Group", "Space", "Board"][ci]}">${on ? "✓" : ""}</button>` : x === "own" ? '<span class="ck y">✓</span><br><small class="from">own</small>' : x ? '<span class="ck y">✓</span>' : '<span class="ck"></span>'}</td>`; }).join("")}</tr>`).join("")}</table>
+      <p class="from" style="margin:10px 0 0">${R.used}</p>
+      ${roleSel === "member" && TICK["member3-0"] === 0 ? '<div class="banner" style="margin-top:12px">Unticking <b>Create space</b> stops 212 members creating Spaces at the root. Existing Spaces are unaffected. Takes effect within about 60 s.</div>' : roleSel === "facilitator" ? '<div class="banner" style="margin-top:12px">Used in 4 places. Saving changes what those people can do within about 60 s.</div>' : ""}</div></div></div>`; },
   trash: () => `<div class="wrap"><h1>Trash</h1><p class="sub-h">Boards you deleted, and boards deleted from Spaces you own. Kept 30 days, then purged. Free on every plan.</p>
     <table class="list"><tr><th>Board</th><th>Was in</th><th>Deleted by</th><th>Left</th><th></th></tr>
     ${[["Old retro", "Product / Design", "maya", "27 days"], ["Scratch 4", "Ada's space", "ada", "3 days"]].map(([b, w, by, l]) => `<tr><td><b>${b}</b></td><td class="from">${w}</td><td><span class="who">${av(by)}${P[by][0]}</span></td><td>${l}</td><td style="text-align:right"><button class="btn" data-restore="${b}">Restore</button></td></tr>`).join("")}</table></div>`,
@@ -286,7 +304,7 @@ function spacePage(name, group, key, canCreate) {
     <span style="position:relative"><button class="btn primary" ${canCreate ? 'data-go="new-board"' : 'aria-disabled="true" id="nb"'}>＋ New board</button>
     ${canCreate ? "" : `<div class="tip" style="right:0;top:38px"><p>You're a <b>Viewer</b> in Platform, via the <b>Infra</b> team.</p><p>Creating boards needs <b>Editor</b>. Owners: Priya Shah, Tom Berg.</p><a>Ask for access</a> · <a data-go="access">Why?</a></div>`}</span></div>
     <p class="sub-h">${canCreate ? "Design team: Editor · Everyone in Acme: Viewer · Owners: Maya, Priya" : "Infra team: Viewer · SRE team: Editor · Everyone in Acme: Viewer"}</p>
-    <div class="tabs"><span class="tab on">Boards</span><a class="tab" data-go="${canCreate ? "space-settings" : "access"}">Members</a><a class="tab" data-go="access">Access</a></div>
+    <div class="tabs"><span class="tab on">Boards</span><a class="tab" data-go="${canCreate ? "space-settings" : "access"}">Members</a>${canCreate ? '<span class="tab" style="opacity:.45" title="Opens this Space\'s own Access tab (not mocked)">Access</span>' : '<a class="tab" data-go="access">Access</a>'}</div>
     ${cards(BOARDS[key], group + " / " + name)}</div>`;
 }
 
@@ -309,7 +327,7 @@ const D = {
   share: () => dlg("Share “Roadmap”", `<div class="row"><input class="field" value="kim@partner.io"><select class="role" data-inv>${["viewer", "commenter", "annotator", "editor"].map(r => `<option ${r === inviteRole ? "selected" : ""}>${r[0].toUpperCase() + r.slice(1)}</option>`).join("")}</select><button class="btn primary">Invite</button></div>
     <p style="margin:-6px 0 0"><span class="guest">Guest · outside Acme</span> <span class="from">Guests can be given up to Editor on this board only. Invite expires in 30 days.</span></p>
     <table class="list"><tr><th colspan="3">On this board</th></tr>${row(av("ada"), "Ada Park (you)", "ada@acme.com", "Owner")}
-      <tr><td><span class="who"><span class="av" style="background:var(--frame)">K</span><span>kim@partner.io <span class="guest">Guest</span><small>invite pending · 30 days</small></span></span></td><td>Commenter</td><td style="text-align:right"><button class="btn ghost">✕</button></td></tr>
+      <tr><td><span class="who"><span class="av" style="background:var(--muted);color:var(--surface)">K</span><span>kim@partner.io <span class="guest">Guest</span><small>invite pending · 30 days</small></span></span></td><td>Commenter</td><td style="text-align:right"><button class="btn ghost">✕</button></td></tr>
       <tr><th colspan="3" style="padding-top:14px">Who else has access · inherited</th></tr>
       <tr><td><span class="who">${tav("Design")}Design team</span></td><td>Editor</td><td class="from">via Space <a data-go="space">Design</a></td></tr>
       <tr><td><span class="who">${tav("Acme")}Everyone in Acme</span></td><td>Viewer</td><td class="from">via Space Design</td></tr>
@@ -322,7 +340,7 @@ function dlg(title, body, primary, secondary = "Cancel") {
 }
 
 function render() {
-  document.getElementById("mockbar").innerHTML = `<b>MOCK</b> board organization · screen:
+  document.getElementById("mockbar").innerHTML = `<b>MOCK</b> board organization · viewing as <b>${P[me()][0]}</b>${me() === "priya" ? " (Unit admin)" : me() === "dev" ? " (Infra team)" : " (member)"} · screen:
     <select id="pickS">${SCREENS.map(s => `<option ${s === S ? "selected" : ""}>${s}</option>`).join("")}</select>
     <a href="?s=${S}&theme=${theme === "dark" ? "light" : "dark"}">${theme === "dark" ? "light" : "dark"} theme</a>`;
   document.getElementById("topbar").innerHTML = topBar();
@@ -334,10 +352,12 @@ function render() {
   document.getElementById("pickS").onchange = e => go(e.target.value);
 }
 document.addEventListener("click", e => {
-  const t = e.target.closest("[data-go],[data-menu],[data-close],[data-done],[data-loc],[data-ga],[data-trash],[data-restore],[data-undo]");
+  const t = e.target.closest("[data-role],[data-tick],[data-go],[data-menu],[data-close],[data-done],[data-loc],[data-ga],[data-trash],[data-restore],[data-undo]");
   if (!t) return;
   if (t.dataset.close !== undefined && t.tagName !== "BUTTON" && t !== e.target) return;
-  if (t.dataset.menu) { menuOpen = menuOpen === t.dataset.menu ? null : t.dataset.menu; render(); }
+  if (t.dataset.role) { roleSel = t.dataset.role; render(); }
+  else if (t.dataset.tick) { const k = t.dataset.tick; TICK[k] = t.classList.contains("y") ? 0 : 1; render(); }
+  else if (t.dataset.menu) { menuOpen = menuOpen === t.dataset.menu ? null : t.dataset.menu; render(); }
   else if (t.dataset.loc) { loc = t.dataset.loc; render(); }
   else if (t.dataset.ga) { ga = t.dataset.ga; render(); }
   else if (t.dataset.trash) { menuOpen = null; toast = `“${t.dataset.trash}” moved to Trash`; render(); }

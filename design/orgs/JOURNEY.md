@@ -2,7 +2,8 @@
 
 Status: design draft, 2026-11-18. No product code yet. The clickable mock is `mock.html` in this folder, and
 `shots/` has one screenshot per screen. Mock screen ids appear in brackets, like [home]. Open the mock with
-`open design/orgs/mock.html` and add `?s=<id>` to jump to a screen.
+`open design/orgs/mock.html` and add `?s=<id>` to jump to a screen. The striped mock bar names the person you are
+viewing as: Ada (a member), Priya (a Unit admin, on Roles) or Dev (Infra team, on Platform).
 
 The model, in the user's words: *"think of it like GitHub. You can create a place to store different boards. You
 can have teams who can edit or view that place. And then you can organize places into higher units. And you can
@@ -54,7 +55,13 @@ The board ladder from today stays as the set of built-in roles at every scope:
 
 Built-in roles cannot be edited, except **Unit member**, which an admin can change. That is the default
 everyone gets. **Custom roles are proposed for v1.** An admin makes one by duplicating a built-in role and
-ticking or unticking permissions, and can then assign it at any scope. Permissions:
+ticking or unticking permissions, and can then assign it at any scope. A custom role has two parts:
+
+- **Board content**: one step of the ladder (view, comment, annotate or edit). This is what the live room sees, because a
+  room still receives one ladder role per connection, as it does today.
+- **Management permissions**: the ticks below, which the admin API checks (`board.create`, `members.manage` and the rest).
+
+So a custom role never needs the room to change. Permissions:
 
 | Permission | Means |
 |---|---|
@@ -128,7 +135,8 @@ personal space. That is why Move shows who gains and loses access (J3).
 | `memberRole` on a board | board General access: same meaning, new default for personal boards |
 | invites and links (board owner or admin, up to editor) | unchanged, still board scope only |
 | `POST /boards`, admin only | `board.create` on the target Space; always allowed in your own personal space |
-| "only a tenant admin grants `owner`" | **Deviation:** a Space or Group owner may also grant board `owner` inside it |
+| "only a tenant admin grants `owner`" | **Deviation:** a Space or Group owner may also grant board `owner` inside it, and a board's owner may transfer it (`transfer`) |
+| the room gets one ladder role (`viewer`…`owner`) | unchanged: a custom role's *board content* step is what the room gets; its other permissions stay in the admin layer |
 | last-owner invariant (board) | kept; Spaces and Groups also keep ≥1 owner (a Unit admin is the backstop, never counted) |
 | no board list, rename or delete | Home, Space pages, rename in place, Trash |
 | web/main.js:73 "No board in this link" when signed in without `?board=` | goes to [home] |
@@ -208,8 +216,8 @@ were the only owner of**.
    Miro does it.
 3. **[admin-offboard]:** Sam's personal space becomes the ordinary Space "Sam's space (archived)", owned by the
    recipient. Its board URLs and guests' access stay.
-4. Sam's grants, team memberships and the links he made are removed. The invites he sent stay until they expire
-   (open question 5).
+4. Sam's own grants and team memberships are removed. The invites and share links he made stay until they expire,
+   now vouched for by the new owner, so guests keep access (open question 5).
 
 ### J8. Trash and restore
 Trash is free on every plan, with no paywall.
@@ -222,7 +230,7 @@ Trash is free on every plan, with no paywall.
 4. After 30 days a board is purged. A Space in Trash takes its boards with it, and brings them back on restore.
 
 ### J9. Admin manages roles
-1. **[roles]** (Unit settings, then Roles): Ada, a Unit admin, sees every role as a row: built-in ones marked
+1. **[roles]** (Unit settings, then Roles): Priya, a Unit admin, sees every role as a row: built-in ones marked
    🔒, then custom ones. Each row shows its scope range, a one-line summary and "used in N places".
 2. **[roles]:** she clicks **Editor**. The detail pane shows the **permission matrix**: permissions down the side,
    scopes (Unit, Group, Space, Board) across, with ✓ wherever it applies. Built-in roles are read-only and offer
@@ -236,16 +244,16 @@ Trash is free on every plan, with no paywall.
    members tab (Group), **[share]** (board) and Unit settings, then Members (Unit) all have **Add people or
    teams**, then a role picker listing the built-in and custom roles valid at that scope. Each role in the picker
    carries its one-line summary.
-6. Editing a custom role that is in use shows "Used on 4 Spaces, 2 Teams" before **Save**, and changes take
+6. Editing a custom role that is in use shows "Used in 4 places" before **Save**, and changes take
    effect within one re-check pass (about 60 s).
 
 ### J10. Member sees why they can or can't do something
 1. **[space] (Platform):** Dev, a member of the Infra team, sees **New board** disabled. Hovering over it shows
    "You're a **Viewer** in Platform, via the **Infra** team. Creating boards needs Editor. Owners: Priya, Tom."
    with an **Ask for access** link that messages the owners.
-2. **[access]** (the Space's **Access** tab): Dev opens **Your access**, which lists every source and its role,
-   with the winning one in bold:
-   - Viewer · via the Infra team · on Space Platform (**winning**)
+2. **[access]** (the Space's **Access** tab): Dev opens **Your access**, which lists every source and what it
+   grants. He gets everything any of them grants, and the source that grants the most is marked:
+   - Viewer · via the Infra team · on Space Platform (**grants the most**)
    - Viewer · via Everyone in Acme · on Group Engineering
 3. **[access]:** below it, **Who has access** (visible to all members) groups people by source: direct, by team,
    inherited from the Group, General access. Each row reads *name · role · from where*. Owners also get "Remove"
@@ -260,11 +268,12 @@ Trash is free on every plan, with no paywall.
 | home | Home: Recent, Starred, sidebar tree, Search | yes |
 | shared | Shared with me | yes |
 | group | Group page: its Spaces, members, New space | yes |
-| space | Space page: boards grid, New board, Members, Access, ⋯ menu | yes (incl. J10 hover) |
+| space | Space page: boards grid, New board, Members, Access, ⋯ menu | yes (`?s=space&menu=Roadmap` opens ⋯) |
+| space-viewer | The same Space page seen by a viewer: New board disabled, with the "why" card (J10) | yes |
 | space-personal | Personal space | yes |
 | space-settings | Space members and teams, General access, inherited rows | yes |
 | access | Space Access tab: your access with sources, who has access and from where | yes |
-| roles | Unit settings › Roles: list + role detail with permission matrix | yes |
+| roles | Unit settings › Roles: list + role detail with permission matrix | yes (`&role=editor\|member\|facilitator`) |
 | new-board | New board dialog | yes |
 | new-space | New space dialog | yes |
 | move | Move dialog with the access diff | yes |
@@ -299,6 +308,7 @@ Trash is free on every plan, with no paywall.
 3. **No deny:** is it OK that a board can't be more private than its Space? The alternative is a per-board
    "restrict" switch, which brings deny rules and makes J10's explanations harder.
 4. **Custom roles in v1:** yes, by duplicating a built-in role (my default), or built-ins only at first?
-5. **A leaver's pending invites:** do they stay until they expire (my default) or get revoked with the leaver?
+5. **A leaver's invites and share links:** do they stay until they expire, vouched for by the new owner (my default),
+   or get revoked with the leaver, cutting off guests?
 6. **Guests on Spaces:** board-only (my default, today's rule), or allow a guest on a whole Space, for example an
    agency?

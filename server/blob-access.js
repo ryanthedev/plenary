@@ -9,7 +9,7 @@
 // hash-mismatch, quota, not-found, unavailable.
 //
 // Token: base64url(payload) "." base64url(HMAC-SHA256(key, "b1." payload)); payload = JSON { tenant, board, sha1, verb,
-// exp (ms) }. The key is the deployment's (every gateway verifies every other gateway's URLs). The role is checked
+// user?, exp (ms) }. The key is the deployment's (every gateway verifies every other gateway's URLs). The role is checked
 // when the URL is asked for, never here: a URL is a bearer capability for its 5 minutes. Tenant, hash and verb come
 // only from the verified payload, so nothing a caller sends can name another tenant's blob.
 //
@@ -61,8 +61,9 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
     } catch { return { ok: false, code: "bad-token" }; }
     const { tenant, board, sha1, exp } = claims ?? {};
     if (!isId(tenant) || !isId(board) || !isSha1(sha1) || !VERBS.includes(claims.verb) || !Number.isFinite(exp) || exp <= now()) return { ok: false, code: "bad-token" };
+    if (claims.user !== undefined && (typeof claims.user !== "string" || !claims.user || claims.user.length > 128)) return { ok: false, code: "bad-token" };
     if (claims.verb !== verb) return { ok: false, code: "wrong-verb" };
-    return { ok: true, tenant, board, sha1 };
+    return { ok: true, tenant, board, sha1, user: claims.user ?? null };
   }
 
   /** Read the tenant's usage once (concurrent first puts share one read); a failed read is tried again by the next put. */
@@ -79,10 +80,11 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
     /** The claims of a token for `verb`, or { ok: false, code }: the HTTP adapter checks it before it reads a body. */
     verify,
 
-    /** A signed URL for (tenant, board, sha1, verb). The caller has checked the role. */
-    async url(tenant, board, sha1, verb) {
+    /** A signed URL for (tenant, board, sha1, verb); `user` (the requester, a string) rides in the token so the HTTP side can cap one user's uploads. The caller has checked the role. */
+    async url(tenant, board, sha1, verb, user = null) {
       if (!isId(tenant) || !isId(board) || !isSha1(sha1) || !VERBS.includes(verb)) throw new PortError("bad-id", "bad blob url scope");
-      const payload = b64url(utf8(JSON.stringify({ tenant, board, sha1, verb, exp: now() + ttlMs })));
+      if (user !== null && (typeof user !== "string" || !user || user.length > 128)) throw new PortError("bad-id", "bad blob url user");
+      const payload = b64url(utf8(JSON.stringify({ tenant, board, sha1, verb, ...(user !== null ? { user } : {}), exp: now() + ttlMs })));
       return `${origin}/blobs/${payload}.${b64url(await crypto.subtle.sign("HMAC", await mac, utf8("b1." + payload)))}`;
     },
 

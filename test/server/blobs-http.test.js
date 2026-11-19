@@ -184,6 +184,44 @@ test("PUT bodies in flight are limited per node: past the limit 503 busy (retrya
   b.end();
 });
 
+/** Timers a test fires by hand: no real waiting. */
+const handTimers = () => { const q = []; return { q, set: (fn, ms) => { const t = { fn, ms }; q.push(t); return t; }, clear: t => { const i = q.indexOf(t); if (i >= 0) q.splice(i, 1); }, fireAll: () => { for (const t of q.splice(0)) t.fn(); } }; };
+
+test("one user's stalled uploads can't take the node's slots: the per-user cap refuses their third, another user still uploads", async () => {
+  const r = await rig({ server: { maxBlobPuts: 8, blobHttp: { maxPutsPerUser: 2 } } }), a = await as(r, "editor"), b = await as(r, "owner");
+  const bytes = fakePng(300, 5), h = sha1(bytes), url = async s => tok((await ask(s, h, true)).url);
+  const x1 = await stalledPut(r, await url(a), 300, 10), x2 = await stalledPut(r, await url(a), 300, 10);
+  const third = await url(a);
+  await until(async () => (await fetch(r.server.url + "/blobs/" + third, { method: "PUT", body: bytes })).status === 503, "the third PUT of one user refused");
+  expect((await fetch(r.server.url + "/blobs/" + await url(b), { method: "PUT", body: bytes })).status).toBe(201);   // the node has room for others
+  x1.end(); x2.end();
+});
+
+test("a second PUT on a token already being read is refused 409, and the token works again once the first is gone", async () => {
+  const r = await rig({ server: { blobHttp: { maxPutsPerUser: 8 } } }), s = await as(r, "editor"), bytes = fakePng(300, 6), h = sha1(bytes);
+  const t = tok((await ask(s, h, true)).url);
+  const first = await stalledPut(r, t, 300, 10);
+  await until(async () => { const x = await fetch(r.server.url + "/blobs/" + t, { method: "PUT", body: bytes }); return x.status === 409 && (await x.json()).error === "in-flight"; }, "the same token refused while in flight");
+  first.end();
+  await until(async () => (await fetch(r.server.url + "/blobs/" + t, { method: "PUT", body: bytes })).status === 201, "the token usable again");
+});
+
+test("a body that drips is cut off at the total deadline (virtual time), however often it sends: 408, and the slot is freed", async () => {
+  const timers = handTimers();
+  const r = await rig({ server: { blobHttp: { timers, bodyDeadlineMs: 120_000, maxPutsPerUser: 1 } } }), s = await as(r, "editor"), bytes = fakePng(300, 7), h = sha1(bytes);
+  const t = tok((await ask(s, h, true)).url), t2 = tok((await ask(s, h, true)).url);
+  const drip = await stalledPut(r, t, 300, 10);
+  await until(() => timers.q.length === 1, "the deadline armed for the body");
+  expect(timers.q[0].ms).toBe(120_000);
+  drip.sock.write(new Uint8Array(5).fill(1));                              // it keeps sending: the idle timeout never fires
+  expect((await fetch(r.server.url + "/blobs/" + t2, { method: "PUT", body: bytes })).status).toBe(503);   // its slot is held
+  timers.fireAll();                                                        // the deadline passes
+  await until(() => drip.reply().startsWith("HTTP/1.1 408"), "408 for the drip");
+  expect(drip.reply()).toContain("timeout");
+  expect((await fetch(r.server.url + "/blobs/" + t2, { method: "PUT", body: bytes })).status).toBe(201);   // freed
+  drip.end();
+});
+
 test("an upload that stops sending is cut by the idle timeout the server sets (not Bun's default)", async () => {
   const r = await rig({ server: { idleTimeoutSec: 1 } }), s = await as(r, "editor"), h = sha1(fakePng(300, 3));
   const stalled = await stalledPut(r, tok((await ask(s, h, true)).url), 1000, 10);

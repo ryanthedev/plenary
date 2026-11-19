@@ -132,7 +132,7 @@ const OP_ID = /^\s*\{\s*"t"\s*:\s*"op"\s*,\s*"id"\s*:\s*"([^"\\]{1,256})"/;
  *   bus: object,
  *   rooms: { open(tenant: string, board: string): Promise<void> },
  *   log?: object, codec?: object, id?: string, limits?: Partial<typeof LIMITS>, now?: () => number,
- *   blobUrl?: (tenant: string, board: string, sha1: string, verb: "GET" | "PUT") => Promise<string>,   // signs a blob URL (blob-access.js); absent: `blob` requests get `unavailable`
+ *   blobUrl?: (tenant: string, board: string, sha1: string, verb: "GET" | "PUT", user: string) => Promise<string>,   // signs a blob URL (blob-access.js); absent: `blob` requests get `unavailable`
  * }} o
  */
 export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed, timers = globalThis, blobUrl = null }) {
@@ -1056,7 +1056,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     if (put && !putAllowed(`${c.tenant}/${c.board}/${c.user}`)) return no("limit", "too many uploads: ask again later");
     if (!blobUrl) return no("unavailable", "this server stores no pictures");
     let url;
-    try { url = await blobUrl(c.tenant, c.board, msg.sha1, put ? "PUT" : "GET"); }
+    try { url = await blobUrl(c.tenant, c.board, msg.sha1, put ? "PUT" : "GET", c.user); }
     catch (err) { log.error("blob url failed", { conn: c.id, err }); return no("unavailable", "try again shortly"); }
     push(ws, codec.encode({ t: "blob", sha1: msg.sha1, url }));
   }

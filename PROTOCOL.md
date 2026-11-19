@@ -932,7 +932,7 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   user per board per gateway. Over -> `error` `limit` (ask again later).
 - **The URL is `<PUBLIC_URL>/blobs/<token>`** when `PUBLIC_URL` is set, else the path `/blobs/<token>`, which the client
   resolves against the origin it connected to (the `ws` URL with `http`). `token = base64url(payload) "." base64url(HMAC-SHA256(key, "b1." payload))`,
-  `payload` the JSON `{ tenant, board, sha1, verb: "GET" | "PUT", exp }` (`exp` in epoch ms). `key` is derived from the
+  `payload` the JSON `{ tenant, board, sha1, verb: "GET" | "PUT", user?, exp }` (`exp` in epoch ms). `key` is derived from the
   deployment's shared `COOKIE_KEY`, so every gateway verifies every other gateway's URLs; a single node without one
   signs with a random key per process, so a URL does not survive a restart (the client asks again). A bad, forged,
   tampered or expired token is `401 { "error": "bad-token" }`, a verb other than the token's is `405`. The role is
@@ -947,7 +947,7 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   PNG, JPEG, GIF or WebP (SVG refused), then reserves quota and stores. The first bytes for a hash are kept: a put
   of a stored blob succeeds without storing. `201` stored now, `200` already stored, `400 bad-length` (no or
   zero length), `413 too-large`, `415 not-image`, `422 hash-mismatch`, `507 quota`, `503 unavailable`
-  (the store failed or took too long; safe to retry), `503 busy` (a node reads at most 8 PUT bodies at once; retry), `401`.
+  (the store failed or took too long; safe to retry), `503 busy` (a node reads at most 8 PUT bodies at once and one user, per board, at most 2; retry), `409 in-flight` (a second PUT on a token already being read), `408 timeout` (the whole body must arrive within 120 s however slowly it drips; retryable), `401`.
   The body is read as it arrives (memory follows the bytes sent, not the `Content-Length` claimed). Bodies are JSON `{ "error": code }`.
 - **`GET /blobs/<token>`** (a get URL): `200` with the bytes, `Content-Type` of the sniffed kind, `X-Content-Type-Options:
   nosniff`, `Cache-Control: no-store`, and a `Content-Security-Policy: default-src 'none'; sandbox`; `404 not-found`

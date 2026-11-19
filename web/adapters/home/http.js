@@ -1,8 +1,10 @@
-// Home adapter over fetch: implements web/ports/home.js against GET /home, GET /home/search and PUT/DELETE /home/stars/:board.
+// Home adapter over fetch: implements web/ports/home.js against GET /home, GET /home/search?q= and PUT/DELETE /home/stars/:board.
 // Imports nothing (fetch and timers are injected). The body's shape is checked here, because the page renders it and puts
 // ids in links: ids are 1-64 of [A-Za-z0-9_-], strings are capped, lists are capped, anything else is dropped.
 
-const ID = /^[\w-]{1,64}$/;
+const ID_RE = /^[\w-]{1,64}$/;
+/** A valid id: a string (a missing field is not the id "undefined"). */
+const ID = { test: v => typeof v === "string" && ID_RE.test(v) };
 const str = (v, max = 200) => (typeof v === "string" ? v.slice(0, max) : "");
 const list = (v, max, f) => (Array.isArray(v) ? v.slice(0, max).map(f).filter(Boolean) : []);
 
@@ -69,14 +71,6 @@ export function httpHome({ fetch, token, base = "", timeoutMs = 10_000, timers =
       if (r.error) return r;
       const b = r.body;
       return b && Array.isArray(b.results) ? { q: str(b.q, 100), results: list(b.results, 50, card), more: b.more === true } : { error: "unavailable" };
-    },
-    async space(id) {
-      if (!ID.test(id)) return { error: "forbidden" };
-      const r = await ask(`/home/search?space=${encodeURIComponent(id)}`, "GET");
-      if (r.error) return r;
-      const b = r.body;
-      if (!b || !Array.isArray(b.results)) return { error: "unavailable" };
-      return { space: b.space && ID.test(b.space.id) ? { id: b.space.id, name: str(b.space.name) } : null, results: list(b.results, 50, card), more: b.more === true };
     },
     async star(board, on) {
       if (!ID.test(board)) return { error: "forbidden" };

@@ -8,10 +8,11 @@ import { pathText, whenText } from "../../core/home.js";
 
 /**
  * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/home.js").createHomeModel>, clock: import("../../ports/clock.js").Clock,
- *   boardHref: (id: string) => string, homeHref?: string, signIn?: { href: string, text?: string } | null }} o
+ *   boardHref: (id: string) => string, spaceHref: (id: string) => string, groupHref: (id: string) => string,
+ *   dialogs: Pick<ReturnType<typeof import("./dialogs.js").createDialogs>, "newBoard"|"newSpace">, homeHref?: string, signIn?: { href: string, text?: string } | null }} o
  * @returns {{ destroy(): void }}
  */
-export function mountHome({ root, model, clock, boardHref, homeHref = "./", signIn = null }) {
+export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref, dialogs, homeHref = "./", signIn = null }) {
   const S = model.state;
   const status = h("div.home-status", { role: "status", "aria-live": "polite" });
   const search = h("input.home-search", { type: "search", placeholder: "Search boards and Spaces", "aria-label": "Search boards and Spaces", autocomplete: "off", maxlength: "100", spellcheck: "false",
@@ -28,8 +29,9 @@ export function mountHome({ root, model, clock, boardHref, homeHref = "./", sign
   root.replaceChildren(home);
 
   const guest = () => !!S.data?.guest;
-  const newBoard = () => h("button.btn.primary", { type: "button", onclick: () => model.notify("New board is coming soon: boards are made by an admin for now.") }, "＋ New board");
-  const navBtn = (view, label, count) => h("button.nav", { type: "button", "aria-current": S.view === view && !S.query.trim() && !S.space ? "page" : null,
+  const newBoard = () => h("button.btn.primary", { type: "button", onclick: e => dialogs.newBoard({ opener: e.currentTarget }) }, "＋ New board");
+  const newSpace = () => h("button.btn", { type: "button", onclick: e => dialogs.newSpace({ opener: e.currentTarget }) }, "＋ New space");
+  const navBtn = (view, label, count) => h("button.nav", { type: "button", "aria-current": S.view === view && !S.query.trim() ? "page" : null,
     onclick: () => { search.value = ""; model.setQuery(""); model.setView(view); } }, label, count != null ? h("span.n", {}, String(count)) : null);
 
   function star(c) {
@@ -49,13 +51,12 @@ export function mountHome({ root, model, clock, boardHref, homeHref = "./", sign
   function renderSide() {
     const d = S.data;
     if (!d) return replace(side);
-    // A Space opens its own list (by id, through the server), not a text search for its name.
-    const node = s => h("button.nav.sub", { type: "button", title: `Boards in ${s.name}`, "aria-label": `Boards in ${s.name}`, "aria-current": S.space?.id === s.id ? "page" : null,
-      onclick: () => { search.value = ""; model.showSpace(s.id, s.name); } }, s.personal ? "◐ " : "▢ ", s.name);
+    // A Space opens its own page (?space=<id>), a Group its (?group=<id>).
+    const node = s => h("a.nav.sub", { href: spaceHref(s.id), title: `Open ${s.name}`, "aria-label": `Open ${s.name}` }, s.personal ? "◐ " : "▢ ", s.name);
     const t = d.tree;
-    replace(side, d.guest ? null : newBoard(), navBtn("home", "Home"), d.guest ? null : navBtn("starred", "Starred", d.starred.length), navBtn("shared", "Shared with me", d.shared.length),
+    replace(side, d.guest ? null : newBoard(), d.guest ? null : newSpace(), navBtn("home", "Home"), d.guest ? null : navBtn("starred", "Starred", d.starred.length), navBtn("shared", "Shared with me", d.shared.length),
       t && h("div.tree", { role: "group", "aria-label": "Groups and Spaces" },
-        t.groups.map(g => h("div.grp", {}, h("h4", {}, g.name), g.spaces.map(node))),
+        t.groups.map(g => h("div.grp", {}, h("h4", {}, h("a", { href: groupHref(g.id) }, g.name)), g.spaces.map(node))),
         t.spaces.length ? h("div.grp", {}, h("h4", {}, "Not in a group"), t.spaces.map(node)) : null,
         t.other.boards.length ? h("div.grp", {}, h("h4", {}, "Other boards"), t.other.boards.map(b => h("a.nav.sub", { href: boardHref(b.id) }, b.title || "Untitled"))) : null,
         t.more || t.other.more ? h("p.muted", {}, "Some Spaces or boards are not listed. Use search.") : null));
@@ -68,11 +69,11 @@ export function mountHome({ root, model, clock, boardHref, homeHref = "./", sign
       signIn ? h("a.btn.primary", { href: signIn.href }, signIn.text ?? "Sign in") : null);
     const m = model.main();
     if (!m) return replace(main);
-    if (m.kind === "search" || m.kind === "space") {
+    if (m.kind === "search") {
       return replace(main, h("h1", {}, m.title), m.status === "loading" && !m.cards.length ? h("p.muted", {}, "Searching…")
-        : m.status === "error" ? empty({ title: m.kind === "space" ? "Could not load this Space." : "Search failed.", detail: "Try again in a moment." })
+        : m.status === "error" ? empty({ title: "Search failed.", detail: "Try again in a moment." })
           : m.cards.length ? cardList(m.cards, "Search results") : empty(m.empty),
-      m.more ? h("p.muted", {}, m.kind === "space" ? "More boards are in this Space. Use search." : "More boards match. Narrow the search.") : null);
+      m.more ? h("p.muted", {}, "More boards match. Narrow the search.") : null);
     }
     if (m.sections) {
       const shown = m.sections.filter(s => s.cards.length);

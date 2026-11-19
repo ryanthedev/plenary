@@ -11,16 +11,17 @@ const DATA = { guest: false, user: { user: "dev:ada", name: "ada" }, unit: { id:
   recent: [card("a", { at: 1_000_000 - 600_000 }), card("b")], starred: [card("b", { starred: true })], owned: [], shared: [card("c")],
   tree: { groups: [{ id: "g", name: "Product", spaces: [{ id: "s1", name: "Design", personal: false }] }], spaces: [{ id: "s2", name: "ada's space", personal: true }],
     other: { boards: [{ id: "o1", title: "Old board" }], more: false }, more: false } };
-let root, clock, api, model, listeners, h;
+let root, clock, api, model, listeners, h, dialogs, dialogCalls;
 const mount = async (data = DATA, extra = {}) => {
   const dom = installDom(); root = dom.root;
   listeners = {}; globalThis.document.addEventListener = (t, f) => { listeners[t] = f; }; globalThis.document.removeEventListener = () => {};
   globalThis.Node = Object.getPrototypeOf(FakeElement);
   clock = virtualClock({ t0: 1_000_000 });
-  api = { stars: [], searches: [], spaces: [], space: async id => { api.spaces.push(id); return { space: { id, name: "Design" }, results: [card("sp1", { title: "In design" })], more: false }; }, load: async () => ({ home: structuredClone(data) }), search: async q => { api.searches.push(q); return { q, results: [card("r1", { title: "Result one" })], more: false }; },
+  api = { stars: [], searches: [], load: async () => ({ home: structuredClone(data) }), search: async q => { api.searches.push(q); return { q, results: [card("r1", { title: "Result one" })], more: false }; },
     star: async (id, on) => { api.stars.push([id, on]); return { ok: true }; } };
   model = createHomeModel({ api, clock });
-  h = mountHome({ root, model, clock, boardHref: id => `?board=${id}`, signIn: { href: "/auth/login", text: "Sign in" }, ...extra });
+  dialogCalls = []; dialogs = { newBoard: o => dialogCalls.push(["board", o.opener]), newSpace: o => dialogCalls.push(["space", o.opener]) };
+  h = mountHome({ root, model, clock, dialogs, boardHref: id => `?board=${id}`, spaceHref: id => `?space=${id}`, groupHref: id => `?group=${id}`, signIn: { href: "/auth/login", text: "Sign in" }, ...extra });
   await model.load();
 };
 afterEach(() => { delete globalThis.document; delete globalThis.Node; });
@@ -38,7 +39,9 @@ test("Home: Recent then Starred cards link to the board, with path, role and age
   expect(links().filter(([h]) => h === "?board=o1")).toEqual([["?board=o1", "Old board"]]);
   const side = root.find(e => e.hasClass("home-side"));
   expect(side.findAll(e => e.tagName === "H4").map(textOf)).toEqual(["Product", "Not in a group", "Other boards"]);
-  expect(side.findAll(e => e.tagName === "BUTTON").map(textOf)).toEqual(["＋ New board", "Home", "Starred1", "Shared with me1", "▢ Design", "◐ ada's space"]);
+  expect(side.findAll(e => e.tagName === "BUTTON").map(textOf)).toEqual(["＋ New board", "＋ New space", "Home", "Starred1", "Shared with me1"]);
+  // Spaces and Groups are links to their own pages (?space= / ?group=), not search buttons
+  expect(side.findAll(e => e.tagName === "A").map(e => [e.getAttribute("href"), textOf(e)])).toEqual([["?group=g", "Product"], ["?space=s1", "▢ Design"], ["?space=s2", "◐ ada's space"], ["?board=o1", "Old board"]]);
   expect(side.find(e => e.getAttribute("aria-current") === "page").textContent).toBe("Home");
 });
 
@@ -60,7 +63,7 @@ test("views: Starred and Shared with me show one list each", async () => {
   expect(root.find(e => e.getAttribute("aria-current") === "page").textContent).toMatch(/^Shared with me/);
 });
 
-test("search: typing shows results after the debounce; each result has its path; Escape clears; clicking a Space searches its name", async () => {
+test("search: typing shows results after the debounce; each result has its path; Escape clears; a Space is a link to its page", async () => {
   await mount();
   const input = root.find(e => e.tagName === "INPUT");
   expect(input.getAttribute("aria-label")).toBe("Search boards and Spaces");
@@ -70,11 +73,7 @@ test("search: typing shows results after the debounce; each result has its path;
   expect(textOf(byClass(root, "card-open")[0])).toBe("Result oneProduct / Design · editor");
   input.dispatch("keydown", { key: "Escape" });
   expect(input.value).toBe(""); expect(textOf(root.find(e => e.tagName === "H1"))).toBe("Home");
-  buttons().find(b => b.getAttribute("aria-label") === "Boards in Design").click(); await settle();
-  expect(api.spaces).toEqual(["s1"]);                                          // by id, not a text search
   expect(api.searches.length).toBe(1);
-  expect(textOf(root.find(e => e.tagName === "H1"))).toBe("Design");
-  expect(textOf(byClass(root, "card-open")[0])).toMatch(/^In design/);
 });
 
 test("'/' focuses search unless typing in a field", async () => {
@@ -101,11 +100,12 @@ test("a guest sees Shared with me only, with the empty copy when there is nothin
   expect(textOf(root.find(e => e.hasClass("home-empty")))).toBe("Nothing is shared with you yet.Open the link you were sent.");
 });
 
-test("first run: the welcome empty state; New board says it is coming", async () => {
+test("first run: the welcome empty state; New board and New space open their dialogs from the clicked button", async () => {
   await mount({ ...DATA, recent: [], starred: [], shared: [], tree: { groups: [], spaces: [], other: { boards: [], more: false }, more: false } });
   expect(textOf(root.find(e => e.hasClass("home-empty")))).toBe("Welcome to Plenary.Start a board, or join a Space your team already uses.");
-  buttons().find(b => textOf(b) === "＋ New board").click();
-  expect(textOf(root.find(e => e.hasClass("home-status")))).toMatch(/New board is coming soon/);
+  const nb = buttons().find(b => textOf(b) === "＋ New board"), ns = buttons().find(b => textOf(b) === "＋ New space");
+  nb.click(); ns.click();
+  expect(dialogCalls).toEqual([["board", nb], ["space", ns]]);                   // the opener is passed, so focus can return to it
   expect(root.find(e => e.hasClass("home-status")).getAttribute("role")).toBe("status");
 });
 

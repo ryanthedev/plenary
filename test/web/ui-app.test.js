@@ -625,11 +625,11 @@ test("K2 app.js: no setTimeout/setInterval/performance.now/Date.now in the sourc
 test("K3 main.js: the token goes only into createSession; sign-in leaves for the fixed href; the return board only via takeReturnBoard", async () => {
   const src = await Bun.file(new URL("../../web/main.js", import.meta.url)).text();
   const code = src.replace(/\/\/.*$/gm, "");
-  expect(code.match(/signIn\.token/g).length).toBe(3);                         // the gate check, createSession's token, and the Home port's (its Bearer header)
+  expect(code.match(/signIn\.token/g).length).toBe(4);                         // the gate check, createSession's token, and the Home and Spaces ports' (their Bearer header)
   expect(code).toMatch(/httpHome\(\{[^}]*token: signIn\.token,/);
   expect(code).toMatch(/if \(!signIn\.token\)/);
   expect(code).toMatch(/createSession\(\{[^}]*token: signIn\.token,/);
-  expect(code.match(/location\.assign\(([^)]*)\)/g)).toEqual(["location.assign(signInLink.href)"]);
+  expect(code.match(/location\.assign\(([^)]*)\)/g)).toEqual(["location.assign(href)", "location.assign(signInLink.href)"]);   // the first: after a create, to our own relative ?board= / ?space= link (hrefTo)
   expect(code).not.toMatch(/console\.|localStorage|sessionStorage|tabStore\.(set|get)/);
   expect(code).not.toMatch(/RETURN_KEY|plenary\.return/);                       // read only through takeReturnBoard
   expect(code).toMatch(/const back = takeReturnBoard\(tabStore, \{ outcome: signIn\.outcome, board: asked \}\);/);

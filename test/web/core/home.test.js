@@ -7,12 +7,11 @@ const card = (id, o = {}) => ({ id, title: id.toUpperCase(), role: "editor", pat
 const data = (o = {}) => ({ guest: false, user: { user: "dev:ada", name: "ada" }, unit: { id: "t1", kind: "company" }, recent: [card("a"), card("b")], starred: [card("b", { starred: true })], owned: [], shared: [card("c")],
   tree: { groups: [], spaces: [], other: { boards: [], more: false }, more: false }, limits: { recent: 12 }, ...o });
 function fakeApi(over = {}) {
-  const calls = { load: 0, search: [], space: [], star: [] }, pending = [];
+  const calls = { load: 0, search: [], star: [] }, pending = [];
   return {
     calls, pending,
     load: async () => { calls.load++; return over.load ? over.load() : { home: structuredClone(data()) }; },
     search: q => { calls.search.push(q); return new Promise(res => pending.push({ q, res })); },
-    space: id => { calls.space.push(id); return new Promise(res => pending.push({ space: id, res })); },
     star: async (id, on) => { calls.star.push([id, on]); return over.star ? over.star(id, on) : { ok: true }; },
   };
 }
@@ -132,24 +131,6 @@ test("notices can be set and dismissed", async () => {
   const { m } = setup(); await m.load();
   m.notify("hi"); expect(m.state.notice).toBe("hi");
   m.dismissNotice(); expect(m.state.notice).toBe(null);
-});
-
-test("a Space opens by id: its own list, newest choice wins, a search or view change supersedes it, an error shows", async () => {
-  const { m, api, clock } = setup();
-  await m.load();
-  m.showSpace("s1", "Design"); m.showSpace("s2", "Ops");
-  expect(api.calls.space).toEqual(["s1", "s2"]);
-  api.pending[0].res({ space: { id: "s1", name: "Design" }, results: [card("x")], more: false }); await tick();
-  expect(m.state.space).toMatchObject({ id: "s2", status: "loading" });            // the stale answer for s1 was ignored
-  api.pending[1].res({ space: { id: "s2", name: "Ops" }, results: [card("y")], more: true }); await tick();
-  expect(m.main()).toMatchObject({ kind: "space", title: "Ops", status: "ready", more: true, cards: [{ id: "y" }] });
-  m.setQuery("zz"); expect(m.state.space).toBe(null);                            // searching leaves the Space
-  m.showSpace("s3", "Gone"); api.pending.at(-1).res({ error: "unavailable" }); await tick();
-  expect(m.main()).toMatchObject({ kind: "space", status: "error", cards: [] });
-  m.setView("shared"); expect(m.state.space).toBe(null);
-  m.showSpace("s4", "Locked"); api.pending.at(-1).res({ space: null, results: [card("z")], more: false }); await tick();
-  expect(m.state.space.name).toBe("Locked");                                       // an unnamed Space keeps the name it was clicked with
-  void clock;
 });
 
 test("search with no hits uses the JOURNEY copy", async () => {

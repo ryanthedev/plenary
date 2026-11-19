@@ -87,7 +87,7 @@ export function pillPopover({ pill, explain, board, access = null, newKey = null
     const body = h("div", { id: "pill-pop-body" }, h("p", { role: "status" }, "Looking up why…"));
     pop.append(body, h("button.btn", { type: "button", onclick: () => close() }, "Close"));
     pop.addEventListener("focusout", onOut);
-    document.body.append(pop);
+    (pill.after ? pill.after(pop) : document.body.append(pop));   // right after the pill in DOM order: Tab out of the popover lands on the next control, not the body
     const r = pill.getBoundingClientRect?.();
     if (r) Object.assign(pop.style, { top: `${Math.round(r.bottom + 6)}px`, right: "12px" });
     pill.setAttribute("aria-expanded", "true");
@@ -100,7 +100,7 @@ export function pillPopover({ pill, explain, board, access = null, newKey = null
     const card = access && (w.ask.can || w.ask.pending) ? askView({ api: access, type: "board", id: board, why: w, newKey }) : null;
     replace(body, h("p", {}, pillLine(w.mine) + "."),
       w.mine.sources.length ? h("ul.rows", { "aria-label": "Where your access comes from" }, w.mine.sources.map(s => { const x = sourceRow(s, here); return h("li.row", {}, x.text, x.strongest ? h("span.badge", {}, "grants the most") : null); })) : null,
-      w.needs["board.edit"] ? h("p", {}, `${needText(w.needs["board.edit"], "Editing", w.mine.role?.name)} ${ownersText(w.owners, w.guest)}`) : h("p", {}, ownersText(w.owners, w.guest)),
+      w.needs["board.edit"] ? h("p", {}, `${needText(w.needs["board.edit"], "Editing", w.mine)} ${ownersText(w.owners, w.guest)}`) : h("p", {}, ownersText(w.owners, w.guest)),
       card?.el);
     (card ? pop.querySelector?.("[data-fk=ask]") : pop.querySelector?.("button"))?.focus?.();
   }

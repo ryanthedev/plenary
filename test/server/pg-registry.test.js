@@ -617,6 +617,16 @@ describe.skipIf(!url)("postgres registry", () => {
     } finally { await drop(schema); }
   }, 30_000);
 
+  test("a schema whose reg_access_requests lacks closed_at refuses to start with a clear error naming the table", async () => {
+    const schema = schemaName();
+    const r = await postgresRegistry({ url, schema, max: 2 });
+    await r.close();
+    try {
+      await client().unsafe(`ALTER TABLE "${schema}".reg_access_requests DROP COLUMN closed_at`);
+      await expect(postgresRegistry({ url, schema, max: 2 })).rejects.toThrow(/reg_access_requests.*older version.*DROP TABLE/);
+    } finally { await drop(schema); }
+  }, 30_000);
+
   test("durable keyed create: the key survives close and reopen (a crash after the commit), so the retry gets the first object, not a second", async () => {
     const schema = schemaName(), idem = { user: "google:root", key: "key-0001-aaaa", fp: "f".repeat(64) };
     let r = await postgresRegistry({ url, schema, max: 2 });

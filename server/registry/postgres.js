@@ -196,6 +196,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       await tx.unsafe("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', '0', true)", [String(lockMs)]);
       await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-schema:${s}`]);
       await migrate(tx, s, registryTables(s));
+      await assertColumns(tx, s, "reg_access_requests", ["id", "tenant", "scope_type", "scope_id", "member", "role", "state", "at", "closed_at"]);   // never altered: an older shape is reset
       await assertColumns(tx, s, "reg_idempotency", ["member", "k", "fp", "ref", "at"]);   // holds only 24 h of keys; an older shape is reset, never altered
       const noIndex = await absent(tx, s, Object.keys(REGISTRY_INDEXES));
       if (noIndex.length) await tx.unsafe(noIndex.map(name => `CREATE INDEX ${name} ON "${s}".${REGISTRY_INDEXES[name]}`).join(";\n"));
@@ -934,7 +935,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     },
     // ---- Idempotent creates (PROTOCOL.md) ----
     // ---- Access requests (PROTOCOL.md § Access explanation and requests) ----
-    async requestAccess({ tenant, scope, user, role, idem, limits }) {
+    async requestAccess({ tenant, scope, user, role, idem, limits, supersede }) {
       ready();
       const sc = askScope(scope), r = askRole(role), k = idemStart(idem), lim = askLimits(limits);
       if (!key(tenant) || !key(user) || !user) throw new Error("registry: no such scope");
@@ -949,11 +950,11 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         await tx.unsafe(`DELETE FROM ${AR} WHERE id IN (SELECT id FROM ${AR} WHERE scope_type = $1 AND scope_id = $2 AND COALESCE(closed_at, at) <= $3 LIMIT $4)`, [sc.type, sc.id, t - ASK.ttlMs, ASK.prune]);
         const row = await one(tx, `SELECT * FROM ${AR} WHERE scope_type = $1 AND scope_id = $2 AND member = $3`, [sc.type, sc.id, user]);
         const cur = askLive(rowAsk(row), t);
-        if (cur?.state === "pending") { await idemPut(tx, k, cur.id, t); return cur; }
-        if (cur) throw askLimited(askWait(cur, t));
+        if (cur?.state === "pending" && !(supersede === true && cur.role !== r)) { await idemPut(tx, k, cur.id, t); return cur; }
+        if (cur && cur.state !== "pending") throw askLimited(askWait(cur, t));
         const mine = await one(tx, `SELECT count(*) AS n, min(at) AS first FROM ${AR} WHERE tenant = $1 AND member = $2 AND at > $3 AND NOT (scope_type = $4 AND scope_id = $5)`, [tenant, user, t - ASK.windowMs, sc.type, sc.id]);
         if (Number(mine.n) >= lim.perUser) throw askLimited(Number(mine.first) + ASK.windowMs - t);
-        if (Number((await one(tx, `SELECT count(*) AS n FROM ${AR} WHERE scope_type = $1 AND scope_id = $2 AND state = 'pending' AND at > $3`, [sc.type, sc.id, t - ASK.ttlMs])).n) >= lim.scopePending) throw askLimited(null);
+        if (Number((await one(tx, `SELECT count(*) AS n FROM ${AR} WHERE scope_type = $1 AND scope_id = $2 AND state = 'pending' AND at > $3 AND member <> $4`, [sc.type, sc.id, t - ASK.ttlMs, user])).n) >= lim.scopePending) throw askLimited(null);
         const id = row?.id ?? await fresh(tx, mint.request, AR);
         await idemPut(tx, k, id, t);
         await tx.unsafe(`INSERT INTO ${AR} (id, tenant, scope_type, scope_id, member, role, state, at) VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)

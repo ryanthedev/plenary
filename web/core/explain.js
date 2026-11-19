@@ -72,11 +72,13 @@ export function pillLine(mine) {
 export const withArticle = name => `${/^[AEIOU]/i.test(name) ? "an" : "a"} ${name}`;
 /** "Owners: Priya, Tom."; with none named: an organization admin (a member), or whoever shared the board (a guest has no organization to ask). */
 export const ownersText = (owners, guest = false) => (owners.length ? `Owners: ${owners.map(o => o.name).join(", ")}.` : guest ? "Ask whoever shared this with you." : "Ask an organization admin.");
+/** The role a held access comes from, named: "the Content editor role", "the organization's Member member role" (the strongest source). */
+export const holderText = mine => { const s = strongestOf(mine)[0]; return !s ? null : s.kind === "unit" ? `the organization's ${s.roleName} role` : `the ${s.roleName} role`; };
 /**
  * What the control needs, against what the caller has: "Creating boards needs Editor." or, when their role is already that high, why it is not enough.
  * @param {{ role: string, roleName: string, held: boolean }} need
  */
-export const needText = (need, what, roleName) => (need.held ? `${what} needs the built-in ${need.roleName} role. Your ${roleName ?? need.roleName} access comes from a role that does not include it.` : `${what} needs ${need.roleName}.`);
+export const needText = (need, what, mine) => (need.held ? `${what} needs the built-in ${need.roleName} role. Your ${mine.role?.name ?? need.roleName} access comes from ${holderText(mine) ? holderText(mine) + ", which" : "a role that"} does not allow ${what.toLowerCase()}.` : `${what} needs ${need.roleName}.`);
 /**
  * The why-card of a disabled control: [headline, what is needed, who to ask]. `what`: the thing the control does ("Creating boards"), `permission`: the key the server listed in `needs`.
  * @param {Explain} why @param {{ type: string, id: string }} here @param {string} what @param {string} permission @param {string|null} [hereName] the scope's name, for "in Platform"
@@ -88,7 +90,7 @@ export function whyLines(why, here, what, permission, hereName = null) {
   const where = hereName ? `in ${hereName}` : "here";
   const lines = [m.role ? `You're ${withArticle(name)} ${where}${strong.length ? ", " + strong.map(s => sourceText(s, here)).join(" and ") : ""}.` : `You have no board access of your own ${where}.`];
   const need = why.needs[permission];
-  if (need) lines.push(needText(need, what, m.role?.name));
+  if (need) lines.push(needText(need, what, m));
   lines.push(ownersText(why.owners, why.guest));
   return lines;
 }

@@ -4,7 +4,7 @@
 
 /** @typedef {import("../ports/spaces.js").SpacesPort} SpacesPort */
 
-import { withArticle } from "./explain.js";
+import { withArticle, holderText } from "./explain.js";
 
 export const TITLE_MAX = 200, NAME_MAX = 200;
 /** The general-access choices the pages offer, in the order shown: [value, label]. null = only people added. */
@@ -32,7 +32,7 @@ export function spaceEmpty(page) {
   // The server says who you are here and what adding boards needs (page.why), so the sentence is never a guess.
   const w = page.why, need = w?.needs?.["board.create"];
   const detail = w?.mine?.role && need
-    ? (need.held ? `You're ${withArticle(w.mine.role.name)} here, but that role cannot create boards. Owners can add you as ${withArticle(need.roleName)}.` : `You're ${withArticle(w.mine.role.name)} here; owners can add you as ${withArticle(need.roleName)}.`)
+    ? (need.held ? `You're ${withArticle(w.mine.role.name)} here through ${holderText(w.mine) ?? "a role"}, which does not allow creating boards. Owners can add you as ${withArticle(need.roleName)}.` : `You're ${withArticle(w.mine.role.name)} here; owners can add you as ${withArticle(need.roleName)}.`)
     : "You can't add boards here; ask an owner to add you as an editor.";
   return { title: "No boards yet.", detail };
 }

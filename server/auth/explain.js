@@ -6,7 +6,7 @@
 
 import { roleDef } from "./permissions.js";
 import { ROLES, rank } from "./util.js";
-import { ASK } from "./registry-port.js";
+import { askWait } from "./registry-port.js";
 
 export const LADDER_NAMES = { viewer: "Viewer", commenter: "Commenter", annotator: "Annotator", editor: "Editor", owner: "Owner" };
 /** The name a role is shown by: a ladder name, "Admin"/"Member" (Unit roles), or a custom role's own name. */
@@ -119,7 +119,7 @@ export function explainService({ registry, now = Date.now }) {
         const [o, req] = await Promise.all([ownersOf(unit.id, type, row, access, roles), ask.can ? registry.accessRequest({ type, id: row.id }, identity.user) : null]);
         owners = o;
         if (req?.state === "pending") ask.pending = { role: req.role, roleName: roleLabel(req.role, roles), at: req.at };
-        else if (req) ask.retryAfterMs = Math.max(0, req.at + ASK.cooldownMs - now());
+        else if (req) ask.retryAfterMs = Math.max(0, askWait(req, now()));
       }
       return { mine, needs, owners, ask, guest: !unit };
     },

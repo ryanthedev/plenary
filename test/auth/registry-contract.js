@@ -1317,6 +1317,18 @@ export function registryContract(name, makeRegistry, opts = {}) {
         }
         expect(S.id).toBeTruthy();
       });
+      test("supersede: a pending ask for another role is replaced in place (same id) only when asked to; the scope count leaves the replaced row out", async () => {
+        const { t, S } = await mk();
+        const a = await r.requestAccess({ tenant: t.id, scope: S, user: "google:c0", role: "viewer", limits: { scopePending: 2 } });
+        expect((await r.requestAccess({ tenant: t.id, scope: S, user: "google:c0", role: "editor", limits: { scopePending: 2 } }))).toMatchObject({ id: a.id, role: "viewer" });   // not asked to: as it was
+        await r.requestAccess({ tenant: t.id, scope: S, user: "google:c1", role: "viewer", limits: { scopePending: 2 } });   // the scope is full now
+        const b = await r.requestAccess({ tenant: t.id, scope: S, user: "google:c0", role: "editor", supersede: true, limits: { scopePending: 2 } });
+        expect(b).toMatchObject({ id: a.id, role: "editor", state: "pending" });
+        const same = await r.requestAccess({ tenant: t.id, scope: S, user: "google:c0", role: "editor", supersede: true, limits: { scopePending: 2 } });   // same role: nothing to replace
+        expect(same.at).toBe(b.at);
+        await expect(r.requestAccess({ tenant: t.id, scope: S, user: "google:c2", role: "viewer", limits: { scopePending: 2 } })).rejects.toMatchObject({ code: "rate-limited" });
+        expect((await r.accessRequests(S)).length).toBe(2);
+      });
       test("one person may make ASK.perUser requests in the window across scopes; the next is rate-limited until the oldest leaves it", async () => {
         const { t } = await mk();
         const spaces = [];

@@ -1141,6 +1141,7 @@ test("#51 a viewer's pill is a button that explains the role: keyboard, Escape r
   const pop = find(page.doc.body, e => /pill-pop/.test(e.className));
   expect(pill.getAttribute("aria-expanded")).toBe("true");
   expect(pop.getAttribute("role")).toBe("dialog");
+  expect(pop.parentNode).toBe(pill.parentNode);                // beside the pill in DOM order, so Tab out of it lands on the next control
   expect(access.calls[0]).toEqual(["explainBoard", "b1"]);
   const t = pop.textContent;
   expect(t).toContain("Viewer via Space Platform · Infra team.");

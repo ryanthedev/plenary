@@ -139,6 +139,9 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     db.run(`CREATE TABLE IF NOT EXISTS reg_access_requests (
       id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, member TEXT NOT NULL,
       role TEXT NOT NULL, state TEXT NOT NULL, at INTEGER NOT NULL, closed_at INTEGER, UNIQUE (scope_type, scope_id, member))`);
+    const askCols = db.query("PRAGMA table_info(reg_access_requests)").all().map(c => c.name).sort().join(",");
+    if (askCols !== "at,closed_at,id,member,role,scope_id,scope_type,state,tenant")   // never ALTERed: an older shape is reset, not migrated
+      throw new Error(`sqlite registry: table reg_access_requests has columns (${askCols}) but this version needs (at,closed_at,id,member,role,scope_id,scope_type,state,tenant): it is from an older version. Reset the store or drop the table (DROP TABLE reg_access_requests); the next start-up recreates it`);
     db.run("CREATE INDEX IF NOT EXISTS reg_access_requests_member ON reg_access_requests (tenant, member, at)");
     db.run("CREATE INDEX IF NOT EXISTS reg_access_requests_scope ON reg_access_requests (scope_type, scope_id, state, at DESC)");
     // Home (PROTOCOL.md § Home): Recent and Starred, one row per (member, board). Additive like the rest.
@@ -264,7 +267,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     askUp: db.query(`INSERT INTO reg_access_requests (id, tenant, scope_type, scope_id, member, role, state, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)
       ON CONFLICT (scope_type, scope_id, member) DO UPDATE SET role = excluded.role, state = 'pending', at = excluded.at, closed_at = NULL`),
     askUser: db.query("SELECT count(*) AS n, min(at) AS first FROM reg_access_requests WHERE tenant = ?1 AND member = ?2 AND at > ?3 AND NOT (scope_type = ?4 AND scope_id = ?5)"),
-    askScopeN: db.query("SELECT count(*) AS n FROM reg_access_requests WHERE scope_type = ? AND scope_id = ? AND state = 'pending' AND at > ?"),
+    askScopeN: db.query("SELECT count(*) AS n FROM reg_access_requests WHERE scope_type = ? AND scope_id = ? AND state = 'pending' AND at > ? AND member <> ?"),
     askList: db.query("SELECT * FROM reg_access_requests WHERE scope_type = ? AND scope_id = ? AND state = 'pending' AND at > ? ORDER BY at DESC, id DESC LIMIT ?"),
     askPrune: db.query("DELETE FROM reg_access_requests WHERE rowid IN (SELECT rowid FROM reg_access_requests WHERE COALESCE(closed_at, at) <= ?1 LIMIT ?2)"),
     askClose: db.query("UPDATE reg_access_requests SET state = ?1, closed_at = ?2 WHERE scope_type = ?3 AND scope_id = ?4 AND member = ?5"),
@@ -400,16 +403,16 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
 
   const rowAsk = r => r && { id: r.id, tenant: r.tenant, scope: { type: r.scope_type, id: r.scope_id }, user: r.member, role: r.role, state: r.state, at: r.at, closedAt: r.closed_at ?? null };
   // One IMMEDIATE transaction: the key, the scope, the person's row, the cooldown and both limits are read and the row written under one write lock.
-  const requestTx = db.transaction((tenant, sc, user, role, idem, t, lim) => {
+  const requestTx = db.transaction((tenant, sc, user, role, idem, t, lim, supersede) => {
     idemEnter(idem, t);
     needRow(scopeTenant(sc.type, sc.id) === tenant, "scope");
     q.askPrune.run(t - ASK.ttlMs, ASK.prune);
     const cur = askLive(rowAsk(q.askGet.get(sc.type, sc.id, user)), t);
-    if (cur?.state === "pending") { idemPut(idem, cur.id, t); return cur; }
-    if (cur) throw askLimited(askWait(cur, t));
+    if (cur?.state === "pending" && !(supersede === true && cur.role !== role)) { idemPut(idem, cur.id, t); return cur; }
+    if (cur && cur.state !== "pending") throw askLimited(askWait(cur, t));
     const mine = q.askUser.get(tenant, user, t - ASK.windowMs, sc.type, sc.id);
     if (mine.n >= lim.perUser) throw askLimited(mine.first + ASK.windowMs - t);
-    if (q.askScopeN.get(sc.type, sc.id, t - ASK.ttlMs).n >= lim.scopePending) throw askLimited(null);
+    if (q.askScopeN.get(sc.type, sc.id, t - ASK.ttlMs, user).n >= lim.scopePending) throw askLimited(null);
     const id = q.askGet.get(sc.type, sc.id, user)?.id ?? fresh(mint.request, i => !!db.query("SELECT 1 AS x FROM reg_access_requests WHERE id = ?").get(i));
     q.askUp.run(id, tenant, sc.type, sc.id, user, role, t);
     idemPut(idem, id, t);
@@ -850,11 +853,11 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       return new Map(contextsTx(list, us));
     },
     // ---- Access requests (PROTOCOL.md § Access explanation and requests) ----
-    async requestAccess({ tenant, scope, user, role, idem, limits }) {
+    async requestAccess({ tenant, scope, user, role, idem, limits, supersede }) {
       ready();
       const sc = askScope(scope), r = askRole(role);
       if (!str(tenant) || !str(user) || !user || user.includes("\0")) throw new Error("registry: no such scope");
-      return requestTx.immediate(tenant, sc, user, r, idemOf(idem), now(), askLimits(limits));
+      return requestTx.immediate(tenant, sc, user, r, idemOf(idem), now(), askLimits(limits), supersede);
     },
     async accessRequest(scope, user) {
       ready();

@@ -19,7 +19,9 @@ test("copy: general access, empty states (JOURNEY §5), errors", () => {
   const why = (role, held) => ({ mine: { role: { id: role.toLowerCase(), name: role }, sources: [] }, guest: false, owners: [], needs: { "board.create": { role: "editor", roleName: "Editor", held } } });
   expect(spaceEmpty(page({ can: { createBoard: false }, why: why("Editor", false) })).detail).toBe("You're an Editor here; owners can add you as an Editor.");   // "an", not "a Editor"
   expect(spaceEmpty(page({ can: { createBoard: false }, why: why("Viewer", false) })).detail).toBe("You're a Viewer here; owners can add you as an Editor.");
-  expect(spaceEmpty(page({ can: { createBoard: false }, why: why("Editor", true) })).detail).toBe("You're an Editor here, but that role cannot create boards. Owners can add you as an Editor.");
+  expect(spaceEmpty(page({ can: { createBoard: false }, why: why("Editor", true) })).detail).toBe("You're an Editor here through a role, which does not allow creating boards. Owners can add you as an Editor.");
+  const named = { ...why("Editor", true) }; named.mine = { ...named.mine, sources: [{ kind: "direct", scope: { type: "space", id: "s-1", name: "P" }, role: "r-ce", roleName: "Content editor", ladder: "editor", strongest: true }] };
+  expect(spaceEmpty(page({ can: { createBoard: false }, why: named })).detail).toBe("You're an Editor here through the Content editor role, which does not allow creating boards. Owners can add you as an Editor.");
   expect(spaceEmpty(page({ space: { personal: true }, can: { createBoard: true } })).title).toBe("Only you can see what's here until you share it.");
   expect(groupEmpty({ can: { createSpace: true } }, "Product").title).toBe("No Spaces in Product yet.");
   expect(groupEmpty({ can: { createSpace: false } }, "Product").detail).toMatch(/Group editors/);

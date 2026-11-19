@@ -51,7 +51,11 @@ test("JOURNEY J10 copy: the why lines and the pill line", () => {
   expect(withArticle("Viewer")).toBe("a Viewer");
   // held: their role already ranks as high as the control asks, so "needs Editor" would be false; say why it is not enough
   const held = WHY({ mine: { role: { id: "editor", name: "Editor" }, sources: [] }, needs: { "board.create": { role: "editor", roleName: "Editor", held: true } } });
-  expect(whyLines(held, here, "Creating boards", "board.create")[1]).toBe("Creating boards needs the built-in Editor role. Your Editor access comes from a role that does not include it.");
+  const CE = SRC({ kind: "direct", scope: { type: "space", id: "s-1", name: "Platform" }, role: "r-ce", roleName: "Content editor", ladder: "editor", team: undefined });
+  const heldBy = (src) => WHY({ mine: { role: { id: "editor", name: "Editor" }, sources: [src] }, needs: { "board.create": { role: "editor", roleName: "Editor", held: true } } });
+  expect(whyLines(heldBy(CE), here, "Creating boards", "board.create")[1]).toBe("Creating boards needs the built-in Editor role. Your Editor access comes from the Content editor role, which does not allow creating boards.");
+  expect(whyLines(heldBy({ ...CE, kind: "unit", scope: { type: "unit", id: "t-1" }, role: "member", roleName: "Member" }), here, "Creating boards", "board.create")[1]).toContain("comes from the organization's Member role, which does not allow");
+  expect(whyLines(held, here, "Creating boards", "board.create")[1]).toBe("Creating boards needs the built-in Editor role. Your Editor access comes from a role that does not allow creating boards.");   // no source named
   expect(waitText(30 * 60_000)).toBe("in 30 minutes");
   expect(waitText(24 * 3600_000)).toBe("in 24 hours");
   expect(waitText(0)).toBe("");

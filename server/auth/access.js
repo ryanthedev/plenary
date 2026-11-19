@@ -190,9 +190,14 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
   const isPersonal = sc => sc.type === "space" && sc.row.kind === "personal";
   const manages = sc => !isPersonal(sc) && may(sc.access, "members.manage");
 
+  /** Whether `access` already holds every permission of `role` at a `type` scope (what an ask for it could add is nothing). */
+  const reaches = (access, role, type, roles) => { const want = roleDef(role, type, roles); return !!access && !!want && [...want.permissions].every(p => access.permissions.has(p)); };
+
   /**
    * The pending requests at a scope, requesters named (only a `members.manage` holder is ever handed these). A request whose person already REACHES the role asked for (a Team
-   * they are in, a grant at a containing Group) is hidden and closed as granted: one batch of access reads for the page's at most LIMITS.rows requesters.
+   * they are in, a grant at a containing Group) is hidden, never written to: a read must not race another manager's dismissal or record a grant that may be revoked later. The
+   * hidden row stays pending (and counts toward scopePending) until the grant route closes it, a new ask supersedes it, or its ttl prunes it. One batch of access reads
+   * for the page's at most LIMITS.rows requesters.
    */
   async function requestsOf(unit, scope, roles) {
     const list = await registry.accessRequests(scope, { limit: LIMITS.rows });
@@ -201,13 +206,8 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
     // Every directory row is a Unit member (only members are recorded), so they stand as members of the Unit's first domain.
     const ids = list.map(r => ({ user: r.user, email: label({ type: "user", id: r.user }).email, domain: unit.domains?.[0] ?? null }));
     const got = await tenancy.effectiveAmong(scope, ids);
-    const out = [];
-    for (const r of list) {
-      const a = got.get(r.user), want = roleDef(r.role, scope.type, roles);
-      if (a && want && [...want.permissions].every(p => a.permissions.has(p))) { await registry.closeAccessRequest(scope, r.user, "granted").catch(err => warn("could not close an access request", { err })); continue; }
-      out.push({ user: label({ type: "user", id: r.user }), role: r.role, roleName: roleLabel(r.role, roles), at: r.at });
-    }
-    return out;
+    return list.filter(r => !reaches(got.get(r.user), r.role, scope.type, roles))
+      .map(r => ({ user: label({ type: "user", id: r.user }), role: r.role, roleName: roleLabel(r.role, roles), at: r.at }));
   }
   /** The roles the caller may ask for at a scope (none: they may not ask: personal space, the Unit, nothing to open, already a manager). */
   const askable = (sc, roles) => (sc.type !== "unit" && opens(sc.access) && !manages(sc) && !isPersonal(sc) ? askRolesFor(sc.access, sc.type, roles) : []);
@@ -456,8 +456,12 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
       const may_ = sc ? askable(sc, new Map(roleList.map(r => [r.id, r]))) : [];
       if (!may_.length) throw refused();
       if (!may_.some(r => r.id === role)) throw new AdminError("bad-role", "that role cannot be asked for here");
+      // A pending ask whose role the caller already reaches (a grant landed since) is stale: the new ask replaces it instead of returning it.
+      const roleMap = new Map(roleList.map(r => [r.id, r]));
+      const open = await registry.accessRequest({ type, id: sc.row.id }, identity.user);
+      const supersede = open?.state === "pending" && open.role !== role && reaches(sc.access, open.role, type, roleMap);
       let r;
-      try { r = await registry.requestAccess({ tenant: unit.id, scope: { type, id: sc.row.id }, user: identity.user, role, idem }); }
+      try { r = await registry.requestAccess({ tenant: unit.id, scope: { type, id: sc.row.id }, user: identity.user, role, idem, supersede }); }
       catch (err) {
         if (err?.code === "rate-limited") throw new AdminError("rate-limited", "too many requests", { data: { retryAfter: err.retryAfterMs == null ? null : Math.max(1, Math.ceil(err.retryAfterMs / 1000)) } });
         throw err;

@@ -240,6 +240,17 @@ describe("Ask for access", () => {
     clock.t += ASK.cooldownMs;
     expect((await svc.requestAccess(dev, "space", platform.id, "editor")).state).toBe("pending");
   });
+  test("the page's retry wait runs from the dismissal, not the ask: it agrees with the 429 the route gives", async () => {
+    await svc.requestAccess(dev, "space", platform.id, "editor");
+    clock.t += 20 * 3600_000;                                                          // dismissed 20 h after the ask
+    await svc.dismissRequest(pat, "space", platform.id, dev.user);
+    clock.t += 3600_000;
+    const wait = ASK.cooldownMs - 3600_000;
+    expect((await svc.accessPage(dev, "space", platform.id)).ask).toMatchObject({ pending: null, retryAfterMs: wait });
+    expect((await svc.boardExplain(dev, board.id)).ask.retryAfterMs ?? wait).toBeGreaterThan(0);
+    const err = await svc.requestAccess(dev, "space", platform.id, "editor").catch(e => e);
+    expect(err).toMatchObject({ code: "rate-limited", data: { retryAfter: wait / 1000 } });
+  });
   test("only a manager dismisses; a bad user id is a bad request", async () => {
     await svc.requestAccess(dev, "space", platform.id, "editor");
     expect(await code(svc.dismissRequest(dev, "space", platform.id, dev.user))).toBe("forbidden");
@@ -361,7 +372,7 @@ describe("a guest from another Unit on a link learns nothing of this Unit", () =
 });
 
 describe("requests of people who already reach the role are not shown", () => {
-  test("a Team grant or a Group grant that reaches the asked role closes the request on read; a lower one leaves it", async () => {
+  test("a Team grant or a Group grant that reaches the asked role hides the request on read (never writes); a lower one leaves it", async () => {
     await svc.requestAccess(dev, "space", platform.id, "editor");
     await svc.requestAccess(eve, "space", platform.id, "annotator");
     const ids = async () => (await svc.accessPage(pat, "space", platform.id)).requests.map(x => x.user.id).sort();
@@ -370,6 +381,29 @@ describe("requests of people who already reach the role are not shown", () => {
     expect(await ids()).toEqual([dev.user, eve.user].sort());                       // dev is annotator now (Team), asked editor: still waiting
     await r.setScopedGrant({ scope: { type: "group", id: eng.id }, subject: U(dev.user), role: "editor" });
     expect(await ids()).toEqual([eve.user]);
-    expect(await r.accessRequest({ type: "space", id: platform.id }, dev.user)).toBeNull();                  // closed as granted
+    expect((await r.accessRequest({ type: "space", id: platform.id }, dev.user)).state).toBe("pending");    // hidden, not closed: a read writes nothing
+  });
+  test("a manager's dismissal between two reads survives them: the read path never overwrites it with granted", async () => {
+    await svc.requestAccess(dev, "space", platform.id, "annotator");
+    await r.setScopedGrant({ scope: { type: "space", id: platform.id }, subject: { type: "team", id: infra.id }, role: "annotator" });   // dev reaches annotator
+    await svc.accessPage(pat, "space", platform.id);                                    // the read that used to close it
+    await svc.dismissRequest(pat, "space", platform.id, dev.user);
+    await svc.accessPage(pat, "space", platform.id);
+    expect(await r.accessRequest({ type: "space", id: platform.id }, dev.user)).toMatchObject({ state: "dismissed", closedAt: clock.t });
+  });
+  test("a stale pending ask (the caller since reaches its role) is replaced by a new, higher ask in place, never returned as it was", async () => {
+    const first = await svc.requestAccess(dev, "space", platform.id, "annotator");
+    await r.setScopedGrant({ scope: { type: "space", id: platform.id }, subject: { type: "team", id: infra.id }, role: "annotator" });
+    const next = await svc.requestAccess(dev, "space", platform.id, "editor");
+    expect(next).toMatchObject({ role: "editor", state: "pending" });
+    const rows = await r.accessRequests({ type: "space", id: platform.id });
+    expect(rows.map(x => [x.user, x.role])).toEqual([[dev.user, "editor"]]);        // one row, replaced
+    expect(rows[0].id).toBeTruthy();
+    expect(first.role).toBe("annotator");
+  });
+  test("a pending ask the caller does not yet reach is returned as it is, whatever role is asked next", async () => {
+    await svc.requestAccess(dev, "space", platform.id, "annotator");
+    const again = await svc.requestAccess(dev, "space", platform.id, "editor");
+    expect(again.role).toBe("annotator");
   });
 });

@@ -397,7 +397,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
     },
 
     // ---- Access requests (PROTOCOL.md § Access explanation and requests) ----
-    async requestAccess({ tenant, scope, user, role, idem: key, limits }) {
+    async requestAccess({ tenant, scope, user, role, idem: key, limits, supersede }) {
       const lim = askLimits(limits);
       const sc = askScope(scope), r = askRole(role);
       need(typeof user === "string" && user && !user.includes("\0"), "member");
@@ -407,11 +407,11 @@ export function memoryRegistry({ now = Date.now } = {}) {
       let pruned = 0;
       for (const [x, v] of requests) if (t - (v.closedAt ?? v.at) >= ASK.ttlMs && pruned++ < ASK.prune) requests.delete(x);
       const cur = askLive(requests.get(k), t);
-      if (cur?.state === "pending") { idemPut(i, cur.id); return copy(cur); }
-      if (cur) throw askLimited(askWait(cur, t));
+      if (cur?.state === "pending" && !(supersede === true && cur.role !== r)) { idemPut(i, cur.id); return copy(cur); }
+      if (cur && cur.state !== "pending") throw askLimited(askWait(cur, t));
       const mine = [...requests.values()].filter(v => v.user === user && v.tenant === tenant && t - v.at < ASK.windowMs && !(v.scope.type === sc.type && v.scope.id === sc.id));   // the row being replaced counts once, as the new ask
       if (mine.length >= lim.perUser) throw askLimited(Math.min(...mine.map(v => v.at)) + ASK.windowMs - t);
-      if ([...requests.values()].filter(v => v.scope.type === sc.type && v.scope.id === sc.id && v.state === "pending").length >= lim.scopePending) throw askLimited(null);
+      if ([...requests.values()].filter(v => v.scope.type === sc.type && v.scope.id === sc.id && v.state === "pending" && v.user !== user).length >= lim.scopePending) throw askLimited(null);
       const ids = new Set([...requests.values()].map(v => v.id));
       let id = requests.get(k)?.id;
       while (!id || (ids.has(id) && id !== requests.get(k)?.id)) id = mint.request();

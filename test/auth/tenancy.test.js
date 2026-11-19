@@ -1,7 +1,7 @@
 import { test, expect, beforeEach } from "bun:test";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy } from "../../server/auth/tenancy.js";
-import { createBoard } from "./fixtures.js";
+import { createBoard, mkBoard, spaceOf } from "./fixtures.js";
 import { isUnitAdmin } from "../../server/auth/resolver.js";
 import { createInvite, createLink, revokeInvite, revokeLink, listInvites, listLinks, setGrant, AdminError } from "../../server/admin/boards.js";
 
@@ -130,10 +130,10 @@ test("cross-tenant: nothing in tenant A resolves a role on tenant B's board", as
   expect(await model.role(ann, gb.id)).toBe("annotator");
 });
 
-test("fixtures createBoard: an unfiled board with its owner grant (board creation by permission: test/auth/spaces.test.js)", async () => {
+test("fixtures createBoard: a board in the fixture Space with its owner grant (board creation by permission: test/auth/spaces.test.js)", async () => {
   const b = await createBoard({ caller: admin, tenant: acme.id, title: "Q4" }, { registry });
   expect(b.id).toMatch(/^[a-z0-9-]+$/);
-  expect(await registry.board(b.id)).toMatchObject({ id: b.id, tenant: acme.id, title: "Q4", memberRole: "viewer", space: null });
+  expect(await registry.board(b.id)).toMatchObject({ id: b.id, tenant: acme.id, title: "Q4", memberRole: "viewer", space: await spaceOf(registry, acme.id) });
   expect(await registry.grant(b.id, admin.user)).toBe("owner");
 });
 
@@ -160,9 +160,9 @@ test("a revoke that names another board's link or invite is refused", async () =
 
 test("M5: role() caps what the Registry holds: unknown roles ignored, memberRole/invites below owner, links to LINK_ROLES", async () => {
   // Direct Registry writes, bypassing the admin checks (the engine's SQL Registry is a second writer).
-  const b = await registry.createBoard({ tenant: acme.id, memberRole: "owner" });
+  const b = await mkBoard(registry, { tenant: acme.id, memberRole: "owner" });
   expect(await model.role(ann, b.id)).toBe("editor");
-  const b2 = await registry.createBoard({ tenant: acme.id, memberRole: "god" });
+  const b2 = await mkBoard(registry, { tenant: acme.id, memberRole: "god" });
   expect(await model.role(ann, b2.id)).toBe(null);
   await registry.setGrant(b2.id, ann.user, "god");
   expect(await model.role(ann, b2.id)).toBe(null);

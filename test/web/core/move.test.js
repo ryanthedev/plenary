@@ -53,10 +53,7 @@ test("submit sends from and to under one key, reused by a retry; a success forge
   expect(p.calls.filter(c => c[0] === "move").map(c => [c[1], c[2]])).toEqual([[{ from: "s-1", to: "s-2" }, "key-1"], [{ from: "s-1", to: "s-2" }, "key-1"]]);
   expect(m.state.said).toBe("Moved Roadmap to Design.");
 });
-test("an unfiled board moves from null; a hidden source cannot be moved from here", async () => {
-  const p = port({ options: { options: { ...OPTIONS, from: null } } });
-  const m = createMoveModel({ move: p, board: "b-1" }); await m.load(); await m.choose("s-2"); await m.submit();
-  expect(p.calls.find(c => c[0] === "move")[1]).toEqual({ from: null, to: "s-2" });
+test("a hidden source cannot be moved from here", async () => {
   const h = createMoveModel({ move: port({ options: { options: { ...OPTIONS, from: { hidden: true } } } }), board: "b-1" }); await h.load(); await h.choose("s-2");
   expect(await h.submit()).toBe(false); expect(h.state.notice).toContain("not one you can open");
 });

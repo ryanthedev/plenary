@@ -15,6 +15,7 @@ import { tenancy } from "../../server/auth/tenancy.js";
 import { makeElement } from "../../packages/core/model.js";
 import { sock } from "./rig.js";
 import { tempDir, cleanup, sleep, until } from "./helpers.js";
+import { mkBoard } from "../auth/fixtures.js";
 
 afterAll(cleanup);
 
@@ -27,7 +28,7 @@ const op = (client, k) => ({ t: "op", id: `${client}:${k}`, sentAt: 0, stream: "
 async function cluster() {
   const dir = tempDir(), bus = memoryBus(), registry = memoryRegistry();
   const tenant = await registry.createTenant({ domain: "acme.test" });
-  const board = await registry.createBoard({ tenant: tenant.id, title: "roles", memberRole: null });
+  const board = await mkBoard(registry, { tenant: tenant.id, title: "roles", memberRole: null });
   const names = ["ed1", "ed2", "ed3", "ed4", "ed5"];
   for (const n of names) await registry.setGrant(board.id, "dev:" + n, "editor");
   const dev = devAuth({ enabled: true, tokens: Object.fromEntries(names.map(n => [tok(n), { name: n }])) });

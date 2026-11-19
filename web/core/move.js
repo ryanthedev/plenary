@@ -83,7 +83,7 @@ export function createMoveModel({ move, board, newKey = null }) {
     /** @returns {Promise<boolean>} */
     async submit() {
       if (!this.canMove()) return false;
-      const from = S.options.from && !S.options.from.hidden ? S.options.from.id : S.options.from === null ? null : undefined;
+      const from = S.options.from && !S.options.from.hidden ? S.options.from.id : undefined;
       if (from === undefined) { S.notice = "This board's current Space is not one you can open, so it cannot be moved from here."; S.said = S.notice; emit(); return false; }
       const to = S.to;
       S.busy = true; S.notice = null; emit();

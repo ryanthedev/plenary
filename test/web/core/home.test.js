@@ -5,7 +5,7 @@ import { virtualClock } from "../../../web/adapters/clock/virtual.js";
 
 const card = (id, o = {}) => ({ id, title: id.toUpperCase(), role: "editor", path: [{ type: "space", id: "s1", name: "Design" }], starred: false, ...o });
 const data = (o = {}) => ({ guest: false, user: { user: "dev:ada", name: "ada" }, unit: { id: "t1", kind: "company" }, recent: [card("a"), card("b")], starred: [card("b", { starred: true })], owned: [], shared: [card("c")],
-  tree: { groups: [], spaces: [], other: { boards: [], more: false }, more: false }, limits: { recent: 12 }, ...o });
+  tree: { groups: [], spaces: [], more: false }, limits: { recent: 12 }, ...o });
 function fakeApi(over = {}) {
   const calls = { load: 0, search: [], star: [] }, pending = [];
   return {

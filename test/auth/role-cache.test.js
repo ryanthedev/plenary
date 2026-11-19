@@ -6,6 +6,7 @@ import { tenancy, roleCache, combine, identityKey, USE_CHUNK } from "../../serve
 import { memoryBus } from "../../server/bus/memory.js";
 import { subjects } from "../../server/bus/port.js";
 import { announcingRegistry } from "../../server/main.js";
+import { mkBoard } from "./fixtures.js";
 
 const T0 = Date.UTC(2026, 10, 12);
 let clock, raw, reg, calls, acme, board;
@@ -27,7 +28,7 @@ beforeEach(async () => {
   clock = { t: T0 };
   raw = memoryRegistry({ now });
   acme = await raw.createTenant({ domain: "acme.com", admins: ["google:root"] });
-  board = await raw.createBoard({ tenant: acme.id, title: "All hands", memberRole: "viewer" });
+  board = await mkBoard(raw, { tenant: acme.id, title: "All hands", memberRole: "viewer" });
   await raw.setGrant(board.id, "google:root", "owner");
   ({ reg, calls } = counting(raw));
 });
@@ -192,7 +193,7 @@ test("a hello's read in flight during rolesFor never overwrites the fresher writ
 test("GAP-M3 (p5-loadv): rolesFor in flight across invalidate(board) does not write its stale answer", async () => {
   const raw = memoryRegistry();
   const t = await raw.createTenant({ domain: null });
-  const b = await raw.createBoard({ tenant: t.id, memberRole: null });
+  const b = await mkBoard(raw, { tenant: t.id, memberRole: null });
   await raw.setGrant(b.id, "u", "editor");
   let open; const gate = new Promise(r => { open = r; }); let hold = true, grantCalls = 0;
   const reg = { ...raw, grants: async x => { const v = await raw.grants(x); if (hold) { hold = false; await gate; } return v; }, grant: async (x, u) => { grantCalls++; return raw.grant(x, u); } };
@@ -332,8 +333,8 @@ test("differential: tenancy.role, tenancy.rolesFor (batch and fallback) and role
     clock = { t: T0 };
     const r = memoryRegistry({ now });
     const t = await r.createTenant({ domain: "acme.com" });
-    const other = await r.createBoard({ tenant: t.id });
-    const b = await r.createBoard({ tenant: t.id, memberRole: ROLE[rnd(ROLE.length)] });
+    const other = await mkBoard(r, { tenant: t.id });
+    const b = await mkBoard(r, { tenant: t.id, memberRole: ROLE[rnd(ROLE.length)] });
     const people = Array.from({ length: 30 }, (_, i) => id(`google:p${i}`, [null, "acme.com", "globex.com"][rnd(3)], rnd(4) ? `P${i}@x.com` : null));
     const links = [];
     for (let i = 0; i < 6; i++) links.push(await r.createLink({ board: rnd(4) ? b.id : other.id, role: ROLE[rnd(5)], expiresAt: rnd(2) ? T0 + rnd(3) * 1000 - 1000 : null, by: "x" }));

@@ -90,7 +90,7 @@ const ROUTES = {
   "GET /groups/:id": { path: "/groups/g1" },
   "PATCH /groups/:id": { path: "/groups/g1", body: { name: "n" } },
   "GET /boards/:board/move": { path: `/boards/${B}/move` },
-  "POST /boards/:board/move": { path: `/boards/${B}/move`, body: { from: null, to: "sp1" } },
+  "POST /boards/:board/move": { path: `/boards/${B}/move`, body: { from: "sp0", to: "sp1" } },
   "GET /boards/:board/move/preview": { path: `/boards/${B}/move/preview?to=sp1` },
   "GET /boards/:board/share": { path: `/boards/${B}/share` },
   "GET /boards/:board/invites": { path: `/boards/${B}/invites` },

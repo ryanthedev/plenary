@@ -14,6 +14,7 @@ import { accessEquivalence } from "../auth/access-equivalence.js";
 import { tenancy } from "../../server/auth/tenancy.js";
 import { migrate, ddlColumns } from "../../server/pg/schema.js";
 import { STORE_TABLES } from "../../server/store/postgres.js";
+import { mkBoard } from "../auth/fixtures.js";
 
 const url = process.env.DATABASE_URL;
 // Every test here does real Postgres work (schema creation, pools, lock waits). Bun's 5 s default fails them under machine load (TECH-DEBT
@@ -70,7 +71,7 @@ describe.skipIf(!url)("postgres registry", () => {
     try {
       const t = await r.createTenant({ domain: "recent.com" });
       const ids = [];
-      for (let i = 0; i < 110; i++) ids.push((await r.createBoard({ tenant: t.id, title: `c${i}` })).id);
+      for (let i = 0; i < 110; i++) ids.push((await mkBoard(r, { tenant: t.id, title: `c${i}` })).id);
       for (const id of ids.slice(0, 50)) await r.markOpened("dev:cc", id);
       await Promise.all(ids.slice(50).map(id => r.markOpened("dev:cc", id)));
       const [{ n }] = await client().unsafe(`SELECT count(*)::int AS n FROM "${schema}".reg_recents WHERE member = 'dev:cc'`);
@@ -127,6 +128,20 @@ describe.skipIf(!url)("postgres registry", () => {
       expect(err.message).toMatch(/Reset the store/);
       const [{ c }] = await client().unsafe("SELECT count(*)::int AS c FROM pg_tables WHERE schemaname = $1", [schema]);
       expect(c).toBe(LEGACY_TABLES.length);                                         // nothing was added
+    } finally { await drop(schema); }
+  });
+  test("a schema holding a board that is in no Space is an old-format store (pre-#90 unfiled board): refused with code old-format, and left as it was", async () => {
+    const schema = schemaName();
+    try {
+      const r = await postgresRegistry({ sql: client(), schema });
+      const t = await r.createTenant({ domain: "acme.com" }), sp = await r.createSpace({ tenant: t.id, name: "S" });
+      const kept = await r.createBoard({ tenant: t.id, space: sp.id }), unfiled = await r.createBoard({ tenant: t.id, space: sp.id });
+      await r.close();
+      await client().unsafe(`DELETE FROM "${schema}".reg_board_spaces WHERE board = $1`, [unfiled.id]);   // what an older version left behind
+      const err = await postgresRegistry({ sql: client(), schema }).then(() => null, e => e);
+      expect(err?.code).toBe("old-format");
+      expect(err.message).toMatch(/no Space.*Reset the store/);
+      expect((await client().unsafe(`SELECT board FROM "${schema}".reg_board_spaces`)).map(x => x.board)).toEqual([kept.id]);   // nothing was repaired or added
     } finally { await drop(schema); }
   });
   test("accessContext is ONE statement (one snapshot), cold or with a held chain; a cold hello is a handful", async () => {
@@ -231,7 +246,7 @@ describe.skipIf(!url)("postgres registry", () => {
     const r = await postgresRegistry({ sql: client(), schema, now: () => 42 });
     try {
       const t = await r.createTenant({ domain: null });
-      const b = await r.createBoard({ tenant: t.id });
+      const b = await mkBoard(r, { tenant: t.id });
       const i = await r.createInvite({ board: b.id, email: "a@b.c", role: "viewer", by: "x" });
       const l = await r.createLink({ board: b.id, role: "viewer", by: "x" });
       expect([t.createdAt, b.createdAt, i.createdAt, l.createdAt]).toEqual([42, 42, 42, 42]);
@@ -244,7 +259,7 @@ describe.skipIf(!url)("postgres registry", () => {
     const b = await postgresRegistry({ url, schema, max: 2 });
     try {
       const t = await a.createTenant({ domain: null });
-      const board = await a.createBoard({ tenant: t.id });
+      const board = await mkBoard(a, { tenant: t.id });
       for (let round = 0; round < ROUNDS; round++) {
         await a.setGrant(board.id, "x", "owner");
         await b.setGrant(board.id, "y", "owner");
@@ -262,7 +277,7 @@ describe.skipIf(!url)("postgres registry", () => {
     const other = await client().reserve();
     try {
       const t = await r.createTenant({ domain: null });
-      const board = await r.createBoard({ tenant: t.id });
+      const board = await mkBoard(r, { tenant: t.id });
       await r.setGrant(board.id, "x", "owner");
       await r.setGrant(board.id, "y", "owner");
       // Another connection takes the board lock and removes x, uncommitted (what a concurrent setGrant does).
@@ -448,16 +463,19 @@ describe.skipIf(!url)("postgres registry", () => {
       names.set(t.id, "T");
       const t2 = await r.createTenant({ domain: null });
       names.set(t2.id, "T2");
-      const b = await r.createBoard({ tenant: t.id, title: 42, memberRole: null });
+      const sp = await r.createSpace({ tenant: t.id, name: "SP" });
+      names.set(sp.id, "SP");
+      const b = await r.createBoard({ tenant: t.id, space: sp.id, title: 42, memberRole: null });
       names.set(b.id, "B");
-      const c = await r.createBoard({ tenant: t.id });
+      const c = await r.createBoard({ tenant: t.id, space: sp.id });
       names.set(c.id, "C");
       await rec("board B", () => r.board(b.id));
       await rec("board C", () => r.board(c.id));
       await rec("tenant", () => r.tenant(t.id));
       await rec("tenant null domain", () => r.tenant(t2.id));
       await rec("dup domain", () => r.createTenant({ domain: "ACME.COM" }));
-      await rec("no tenant board", () => r.createBoard({ tenant: "t-nope" }));
+      await rec("no tenant board", () => r.createBoard({ tenant: "t-nope", space: sp.id }));
+      await rec("no space board", () => r.createBoard({ tenant: t.id }));
       await rec("addAdmin unknown", () => r.addTenantAdmin("t-nope", "x"));
       await r.addTenantAdmin(t.id, "google:c");
       await r.addTenantAdmin(t.id, "google:a");
@@ -542,7 +560,7 @@ describe.skipIf(!url)("postgres registry", () => {
       // Every kind of write (identity columns included: no sequence grant needed) and read, as the runtime role.
       const t = await r.createTenant({ domain: "acme.com", admins: ["google:a"] });
       await r.addTenantAdmin(t.id, "google:b");
-      const b = await r.createBoard({ tenant: t.id, title: "x" });
+      const b = await mkBoard(r, { tenant: t.id, title: "x" });
       await r.setGrant(b.id, "google:a", "owner");
       await r.setGrant(b.id, "google:b", "editor");
       await r.setGrant(b.id, "google:b", null);
@@ -657,11 +675,11 @@ describe.skipIf(!url)("postgres registry", () => {
     let r = await postgresRegistry({ url, schema, max: 2 });
     try {
       const t = await r.createTenant({ domain: "acme.com", admins: ["google:root"] });
-      const b = await r.createBoard({ tenant: t.id, title: "Once", owner: "google:root", idem });
+      const b = await mkBoard(r, { tenant: t.id, title: "Once", owner: "google:root", idem });
       await r.close();
       r = await postgresRegistry({ url, schema, max: 2 });
       expect(await r.idemGet(idem)).toEqual({ state: "done", ref: b.id });
-      await expect(r.createBoard({ tenant: t.id, title: "Once", owner: "google:root", idem })).rejects.toMatchObject({ code: "idem-replay", ref: b.id });
+      await expect(mkBoard(r, { tenant: t.id, title: "Once", owner: "google:root", idem })).rejects.toMatchObject({ code: "idem-replay", ref: b.id });
       expect((await r.boardsIn({ type: "unit", id: t.id })).ids).toEqual([b.id]);
       expect(await r.grants(b.id)).toEqual([{ user: "google:root", role: "owner" }]);
     } finally { await r.close(); await drop(schema); }
@@ -673,7 +691,7 @@ describe.skipIf(!url)("postgres registry", () => {
     try {
       const t = await r.createTenant({ domain: "acme.com", admins: ["google:root"] });
       await r.addTenantAdmin(t.id, "google:ann");
-      const b = await r.createBoard({ tenant: t.id, title: "All hands", memberRole: "annotator" });
+      const b = await mkBoard(r, { tenant: t.id, title: "All hands", memberRole: "annotator" });
       await r.setGrant(b.id, "google:root", "owner");
       await r.setGrant(b.id, "google:ann", "editor");
       const i = await r.createInvite({ board: b.id, email: "cfo@partner.example", role: "editor", expiresAt: 99, by: "google:root" });
@@ -716,7 +734,7 @@ describe.skipIf(!url)("postgres registry", () => {
     try {
       expect(await r.readSettings()).toEqual({ lock_timeout: "400ms", statement_timeout: "10s" });
       const t = await r.createTenant({ domain: null });
-      const b = await r.createBoard({ tenant: t.id });
+      const b = await mkBoard(r, { tenant: t.id });
       await r.setGrant(b.id, "u", "editor");
       await whileLocked(`LOCK TABLE "${schema}".reg_grants IN ACCESS EXCLUSIVE MODE`, async () => {
         const [err, took] = await timed(r.grant(b.id, "u"));
@@ -762,7 +780,7 @@ describe.skipIf(!url)("postgres registry", () => {
     const r = await postgresRegistry({ url, schema, max: 2, lockTimeoutMs: 10_000, statementTimeoutMs: 400 });
     try {
       const t = await r.createTenant({ domain: null });
-      const b = await r.createBoard({ tenant: t.id });
+      const b = await mkBoard(r, { tenant: t.id });
       await r.setGrant(b.id, "o", "owner");
       await whileLocked(`SELECT id FROM "${schema}".reg_boards WHERE id = '${b.id}' FOR UPDATE`, async () => {
         const [err, took] = await timed(r.setGrant(b.id, "u", "editor"));
@@ -784,7 +802,7 @@ describe.skipIf(!url)("postgres registry", () => {
     try {
       expect(await r.settings()).toMatchObject({ synchronous_commit: "on", lock_timeout: "300ms", statement_timeout: "10s" });
       const t = await r.createTenant({ domain: null });
-      const b = await r.createBoard({ tenant: t.id });
+      const b = await mkBoard(r, { tenant: t.id });
       await r.setGrant(b.id, "o", "owner");
       await whileLocked(`SELECT id FROM "${schema}".reg_boards WHERE id = '${b.id}' FOR UPDATE`, async () => {
         const [err, took] = await timed(r.setGrant(b.id, "u", "editor"));
@@ -859,7 +877,7 @@ describe.skipIf(!url)("postgres registry", () => {
       const r = await postgresRegistry({ url, schema, max, lockTimeoutMs: lim, statementTimeoutMs: stmt });
       try {
         const t = await r.createTenant({ domain: null });
-        const b = await r.createBoard({ tenant: t.id });
+        const b = await mkBoard(r, { tenant: t.id });
         await r.setGrant(b.id, "u", "editor");
         await warm(max, () => r.grant(b.id, "u"));
         await whileLocked(`LOCK TABLE "${schema}".reg_grants IN ACCESS EXCLUSIVE MODE`, async () => {
@@ -885,7 +903,7 @@ describe.skipIf(!url)("postgres registry", () => {
     const r = await postgresRegistry({ url, schema, max: 1, lockTimeoutMs: lim, statementTimeoutMs: lim });
     try {
       const t = await r.createTenant({ domain: null });
-      const b = await r.createBoard({ tenant: t.id });
+      const b = await mkBoard(r, { tenant: t.id });
       await r.setGrant(b.id, "o", "owner");
       const [first, second] = await whileLocked(`SELECT id FROM "${schema}".reg_boards WHERE id = '${b.id}' FOR UPDATE`, async () => {
         const p1 = r.setGrant(b.id, "u1", "editor").then(() => "ok", e => e.code);       // sent: waits on the row lock
@@ -905,7 +923,7 @@ describe.skipIf(!url)("postgres registry", () => {
     const r = await postgresRegistry({ url, schema, max: 2, maxQueued: 3, lockTimeoutMs: lim, statementTimeoutMs: lim });
     try {
       const t = await r.createTenant({ domain: null });
-      const b = await r.createBoard({ tenant: t.id });
+      const b = await mkBoard(r, { tenant: t.id });
       await warm(2, () => r.board(b.id));
       await warm(2, () => r.grant(b.id, "u"));
       expect(r.gate()).toEqual({ running: 0, waiting: 0, maxInFlight: 2, maxQueued: 3, queueTimeoutMs: 250 });
@@ -931,7 +949,7 @@ describe.skipIf(!url)("postgres registry", () => {
     const r = await postgresRegistry({ sql: client(), schema, lockTimeoutMs: lim, statementTimeoutMs: lim });
     try {
       const t = await r.createTenant({ domain: null });
-      const b = await r.createBoard({ tenant: t.id });
+      const b = await mkBoard(r, { tenant: t.id });
       await whileLocked(`LOCK TABLE "${schema}".reg_grants IN ACCESS EXCLUSIVE MODE`, async () => {
         const [err, took] = await timed(r.grant(b.id, "u"));
         expect(err?.code).toBe("client-timeout");                     // the caller's session has no lock_timeout
@@ -948,7 +966,7 @@ describe.skipIf(!url)("postgres registry", () => {
     let closed = false;
     try {
       const t = await r.createTenant({ domain: null });
-      const b = await r.createBoard({ tenant: t.id });
+      const b = await mkBoard(r, { tenant: t.id });
       await whileLocked(`LOCK TABLE "${schema}".reg_grants IN ACCESS EXCLUSIVE MODE`, async () => {
         const sent = r.grant(b.id, "u").catch(e => e.code);
         const queued = r.grant(b.id, "u").catch(e => e.message);
@@ -968,7 +986,7 @@ describe.skipIf(!url)("postgres registry", () => {
     try {
       expect(r.gate().queueTimeoutMs).toBe(250);
       const t = await r.createTenant({ domain: null });
-      const b = await r.createBoard({ tenant: t.id });
+      const b = await mkBoard(r, { tenant: t.id });
       await r.grant(b.id, "warm");                                      // prepared, as on a running server
       await holder.unsafe("BEGIN");
       await holder.unsafe(`LOCK TABLE "${schema}".reg_grants IN ACCESS EXCLUSIVE MODE`);

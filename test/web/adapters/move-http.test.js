@@ -22,12 +22,14 @@ test("options, preview and move: Bearer token, no cookies, never cached, bodies 
   expect(calls[2][1].headers["idempotency-key"]).toBe("key-1");
   expect(JSON.parse(calls[2][1].body)).toEqual({ from: "s-1", to: "s-2" });
 });
-test("an unfiled board's from is null in the body; a result with no undo is null", async () => {
+test("a result with no undo is null; a move without a `from` Space id is refused before any request", async () => {
   const calls = [];
   const f = async (u, i) => { calls.push(i); return answer(200, { ...RESULT, undo: null })(); };
-  const r = await api(f).move("b-1", { from: null, to: "s-2" });
-  expect(JSON.parse(calls[0].body)).toEqual({ from: null, to: "s-2" });
+  const r = await api(f).move("b-1", { from: "s-1", to: "s-2" });
+  expect(JSON.parse(calls[0].body)).toEqual({ from: "s-1", to: "s-2" });
   expect(r.result.undo).toBeNull();
+  expect(await api(f).move("b-1", { from: null, to: "s-2" })).toEqual({ error: "forbidden" });
+  expect(calls).toHaveLength(1);
 });
 test("statuses map to errors: 401 auth, 403 forbidden, 404 notfound, 409 moved, 400/422 invalid, 5xx and junk unavailable, a throw network", async () => {
   for (const [status, error] of [[401, "auth"], [403, "forbidden"], [404, "notfound"], [409, "moved"], [400, "invalid"], [422, "invalid"], [503, "unavailable"], [201, "unavailable"]]) expect(await api(answer(status, {})).options("b-1")).toEqual({ error });

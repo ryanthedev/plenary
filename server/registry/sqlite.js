@@ -90,7 +90,7 @@ const createSchema = d => {
     d.run(`CREATE TABLE IF NOT EXISTS reg_link_uses (
       board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES reg_links(id), n INTEGER NOT NULL,
       PRIMARY KEY (board, member, link))`);
-    // Board organization (a board with no reg_board_spaces row is unfiled; every statement is IF NOT EXISTS, so re-running start-up is a no-op).
+    // Board organization (every board has exactly one reg_board_spaces row; every statement is IF NOT EXISTS, so re-running start-up is a no-op).
     d.run("CREATE TABLE IF NOT EXISTS reg_tenant_meta (tenant TEXT PRIMARY KEY REFERENCES reg_tenants(id), kind TEXT NOT NULL)");
     d.run(`CREATE TABLE IF NOT EXISTS reg_tenant_domains (
       domain TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), n INTEGER NOT NULL)`);
@@ -152,6 +152,8 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   const has = t => !!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(t);
   if (has("reg_boards") && !has("reg_spaces"))   // from before the organization: boards, no Spaces
     throw oldFormat("sqlite registry: the file has reg_boards but no reg_spaces: it is from an older version. Reset the store (delete the file)");
+  if (has("reg_boards") && (!has("reg_board_spaces") || db.query("SELECT 1 AS x FROM reg_boards b WHERE NOT EXISTS (SELECT 1 FROM reg_board_spaces s WHERE s.board = b.id) LIMIT 1").get()))   // a board in no Space (pre-#90)
+    throw oldFormat("sqlite registry: the file holds a board that is in no Space: it is from an older version. Reset the store (delete the file)");
   assertShapes(db, createSchema, "sqlite registry");
   // Several processes opening one brand-new file at once (N nodes or bootstrap scripts): switching to WAL needs an
   // exclusive lock, and SQLite returns BUSY for it without calling the busy handler, so busy_timeout alone doesn't
@@ -198,7 +200,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
 
     board: db.query("SELECT id, tenant, title, member_role, created_at, (SELECT space FROM reg_board_spaces WHERE board = reg_boards.id) AS space FROM reg_boards WHERE id = ?"),
     insBoardSpace: db.query("INSERT INTO reg_board_spaces (board, space) VALUES (?, ?)"),
-    putBoardSpace: db.query("INSERT INTO reg_board_spaces (board, space) VALUES (?, ?) ON CONFLICT (board) DO UPDATE SET space = excluded.space"),
+    putBoardSpace: db.query("UPDATE reg_board_spaces SET space = ?2 WHERE board = ?1"),
 
     group: db.query("SELECT * FROM reg_groups WHERE id = ?"),
     groups: db.query("SELECT * FROM reg_groups WHERE tenant = ? ORDER BY created_at, id"),
@@ -294,9 +296,9 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
           WHERE m.member = ?1
         UNION SELECT board FROM reg_invites WHERE ?2 IS NOT NULL AND email = ?2 AND revoked = 0
         UNION SELECT board FROM reg_link_uses WHERE member = ?1) ORDER BY board LIMIT ?3`),
-    search: db.query(`SELECT w.id FROM (SELECT id, title FROM reg_boards WHERE tenant = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?5) w
-      LEFT JOIN reg_board_spaces bs ON bs.board = w.id LEFT JOIN reg_spaces s ON s.id = bs.space
-      WHERE (?3 IS NULL OR w.title LIKE ?3 ESCAPE '\\' OR (?4 = 0 AND s.name LIKE ?3 ESCAPE '\\')) AND (?4 = 0 OR bs.board IS NULL)
+    search: db.query(`SELECT w.id FROM (SELECT id, title FROM reg_boards WHERE tenant = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?4) w
+      JOIN reg_board_spaces bs ON bs.board = w.id JOIN reg_spaces s ON s.id = bs.space
+      WHERE ?3 IS NULL OR w.title LIKE ?3 ESCAPE '\\' OR s.name LIKE ?3 ESCAPE '\\'
       ORDER BY w.id`),
     searchEdge: db.query("SELECT id FROM reg_boards WHERE tenant = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT 2 OFFSET ?3"),
     spaceCand: db.query(`SELECT s.* FROM reg_spaces s WHERE s.tenant = ?1 AND (?2 IS NULL OR s.id > ?2) AND (?4 = 1
@@ -359,7 +361,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     id: r.id, domain: r.domain, domains: [...(r.domain ? [r.domain] : []), ...q.extraDomains.all(r.id).map(d => d.domain)],
     kind: needKind(q.tenantKind.get(r.id)?.kind, r.id, absent),   // the look-up always runs (uniform statement count); `absent` = uniformTenant's placeholder row, never returned
     admins: q.admins.all(r.id).map(a => a.member), createdAt: r.created_at };
-  const rowBoard = r => r && { id: r.id, tenant: r.tenant, title: r.title, memberRole: r.member_role, space: r.space ?? null, createdAt: r.created_at };
+  const rowBoard = r => r && { id: r.id, tenant: r.tenant, title: r.title, memberRole: r.member_role, space: r.space, createdAt: r.created_at };
   const rowGroup = r => r && { id: r.id, tenant: r.tenant, name: r.name, generalRole: r.general_role, createdAt: r.created_at };
   const rowSpace = r => r && { id: r.id, tenant: r.tenant, group: r.grp, name: r.name, kind: r.kind, owner: r.owner_user, generalRole: r.general_role, createdAt: r.created_at };
   const rowTeam = r => r && { id: r.id, tenant: r.tenant, name: r.name, createdAt: r.created_at };
@@ -429,11 +431,11 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
 
   const createBoardTx = db.transaction((tenant, title, memberRole, space, owner, idem, createdAt) => {
     if (!q.tenantExists.get(tenant)) throw new Error("registry: no such tenant");
-    if (space != null && q.space.get(space)?.tenant !== tenant) throw new Error("registry: no such space");
+    if (q.space.get(space)?.tenant !== tenant) throw new Error("registry: no such space");
     idemEnter(idem, createdAt);
     const id = fresh(mint.board, i => !!q.boardExists.get(i));
-    q.insBoard.run(id, tenant, title, memberRole === undefined ? (space != null ? null : "viewer") : memberRole, createdAt);
-    if (space != null) q.insBoardSpace.run(id, space);
+    q.insBoard.run(id, tenant, title, memberRole === undefined ? null : memberRole, createdAt);
+    q.insBoardSpace.run(id, space);
     if (owner != null) q.upGrant.run(id, owner, "owner", q.grantN.get(id).n);
     idemPut(idem, id, createdAt);
     return rowBoard(q.board.get(id));
@@ -445,9 +447,9 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     if (!b) throw new Error("registry: no such board");
     if (q.space.get(to)?.tenant !== b.tenant) throw new Error("registry: no such space");
     idemEnter(idem, at);
-    const moved = (b.space ?? null) !== to;
+    const moved = b.space !== to;
     if (moved) {
-      if ((b.space ?? null) !== from) throw new RegistryError("moved", "the board is no longer in that Space");
+      if (b.space !== from) throw new RegistryError("moved", "the board is no longer in that Space");
       q.putBoardSpace.run(board, to);
     }
     idemPut(idem, board + (moved ? ":moved" : ":noop"), at);
@@ -645,15 +647,15 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     async createBoard({ tenant, title = "", memberRole, space, owner, idem }) {
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");
-      if (space != null && !str(space)) throw new Error("registry: no such space");
-      return createBoardTx.immediate(tenant, String(title), memberRole === undefined ? undefined : nz(memberRole), nz(space), owner == null ? null : String(owner), idemOf(idem), now());
+      if (!str(space)) throw new Error("registry: no such space");
+      return createBoardTx.immediate(tenant, String(title), memberRole === undefined ? undefined : nz(memberRole), space, owner == null ? null : String(owner), idemOf(idem), now());
     },
     async board(id) { ready(); return str(id) ? rowBoard(q.board.get(id)) ?? null : null; },
-    async moveBoard({ board, from = null, to, idem }) {
+    async moveBoard({ board, from, to, idem }) {
       ready();
       if (!str(board)) throw new Error("registry: no such board");
-      if (!str(to)) throw new Error("registry: no such space");
-      return moveBoardTx.immediate(board, from == null ? null : String(from), to, idemOf(idem), now());
+      if (!str(from) || !str(to)) throw new Error("registry: no such space");
+      return moveBoardTx.immediate(board, from, to, idemOf(idem), now());
     },
 
     async setGrant(board, user, role) {
@@ -944,12 +946,12 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       ready();
       return str(user) ? q.shared.all(user, email ? normEmail(email) : null, smallLimit(limit, HOME.sharedScan, HOME.sharedScan)).map(r => r.board) : [];
     },
-    async searchBoards(tenant, { q: term, unfiled = false, after = null, scan } = {}) {
+    async searchBoards(tenant, { q: term, after = null, scan } = {}) {
       ready();
       const cur = orgDefaults.cursor(after, "id"), cap = smallLimit(scan, HOME.searchScan.default, HOME.searchScan.max);
       const like = term == null ? null : "%" + asciiFold(searchQuery(term)).replace(/[\\%_]/g, "\\$&") + "%";
       if (!str(tenant)) return { ids: [], next: null };
-      const ids = q.search.all(tenant, cur, like, unfiled ? 1 : 0, cap).map(r => r.id);
+      const ids = q.search.all(tenant, cur, like, cap).map(r => r.id);
       const edge = q.searchEdge.all(tenant, cur, cap - 1);          // [last board examined, one more] when the Unit goes on past the window
       return { ids, next: edge.length === 2 ? edge[0].id : null };
     },

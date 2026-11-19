@@ -882,8 +882,8 @@ Boards are organized as **Unit > Group > Space > Board**. Design: design/orgs/JO
 - **Group**: a named shelf of Spaces (one level: Groups don't nest). **Space**: holds boards; it sits in one Group or at
   the Unit root. Both carry **general access**: `generalRole`, the role "everyone in the Unit" gets (members only, never
   `owner`; null = only people added). A board keeps its own general access in `memberRole` (§ Tenancy above): the same
-  meaning, widened. A board lives in at most one Space (`board.space`; null = *unfiled*, which is every board made before
-  Spaces existed).
+  meaning, widened. Every board lives in exactly one Space (`board.space`, never null): there are no unfiled boards. The
+  Registry refuses `createBoard` without a `space` of the board's own Unit, and the board's Space row is written in the create's own atomic step.
 - **Personal space**: a Space with an `owner` (one per member per Unit, made by `ensurePersonalSpace`), private
   (`generalRole` null), the member its owner. **Team**: a named set of Unit members.
 - **A Team's membership is a grant.** Adding someone to a Team gives them each role the Team holds, so changing membership (and deleting the Team) needs the caller to be able to grant
@@ -946,10 +946,9 @@ ladder `owner` are off unless the deployment sets `adminBoardContent`: `PLENARY_
 server/main.js and given to `tenancy` and `roleCache`), so no one's access changes by upgrading.
 
 **Defaults.** A personal space is private (`generalRole` null) and its owner owns it. A new Space gives `viewer` (its
-creator may pick none). A new board in a Space has `memberRole` null, so it **inherits** the Space; a board made without
-a Space keeps today's `memberRole` default (`viewer`).
+creator may pick none). A new board has `memberRole` null, so it **inherits** its Space, unless the creator passes one.
 
-**No migration.** Plenary has no data to carry over: a store from before the organization (a `reg_boards` with no `reg_spaces`), or in which ANY table's columns differ from its current DDL (one helper per engine checks every table: `server/sqlite/schema.js`, `server/pg/schema.js`; the expected columns are the adapter's own CREATE statements), is **refused at start-up** with code `old-format` ("Reset the store"); it is never read silently and never ALTERed. The advice is always to reset the whole store (SQLite: delete the file; Postgres: drop the schema), never one table: the Store's lease table holds every board's epoch. Unfiled boards (`space` null: the dev board, a board a script made without a Space) are a state, not a rule: they show under "Other boards" and add no source of access.
+**No migration.** Plenary has no data to carry over: a store from before the organization (a `reg_boards` with no `reg_spaces`), or in which ANY table's columns differ from its current DDL (one helper per engine checks every table: `server/sqlite/schema.js`, `server/pg/schema.js`; the expected columns are the adapter's own CREATE statements), is **refused at start-up** with code `old-format` ("Reset the store"); it is never read silently and never ALTERed. The advice is always to reset the whole store (SQLite: delete the file; Postgres: drop the schema), never one table: the Store's lease table holds every board's epoch. A store holding a board with no Space row in `reg_board_spaces` is old-format too and is refused the same way at start-up (SQLite and Postgres). There are no unfiled boards and no "Other boards".
 
 **Freshness.** The resolver reads live; `.grants` (§ Bus) is per board. A change to anything the resolver reads above a
 board (a scoped grant on a Space, Group or the Unit; a Team's grants or membership; a Space's or Group's general access or
@@ -986,17 +985,15 @@ Registry calls below. All routes authenticate like every other route in http.js:
   - `owned` ("Your boards", guests only; `[]` for a member): up to 50 boards the guest holds a direct **owner** grant on, by title, with an empty `path`. A member's
     owned boards are already in their Spaces and the tree. `shared` ("Shared with me"): up to 50, by title. **Shared means** boards the person
     reaches through a source on the board itself (a direct grant, a grant to a Team they are in, a live invite to their email, a link they redeemed;
-    `Registry.sharedBoards`) and, for a member, whose place the tree doesn't already show: boards in a Space they can open, and boards in
-    no Space in their own Unit (listed under "Other boards"), are not repeated in Shared. An owned board in a Space the member can't open does show in Shared. All of it is
+    `Registry.sharedBoards`) and, for a member, whose place the tree doesn't already show: boards in a Space they can open are not repeated in Shared. An owned board in a Space the member can't open does show in Shared. All of it is
     filtered by what the resolver says they can open now, so an expired invite or revoked link vanishes.
   - **Names are access.** `path` names only what the person can open: `[{ type: "group", id, name }, { type: "space", id, name }]` for a Space (and
     Group) they can open boards in; any Space or Group above a board they reach another way is replaced by the neutral
-    `{ type: "shared", name: "Shared with you" }` (a Group they can't open is dropped when the Space is open); a board in no Space is
-    `{ type: "other", name: "Other boards" }` for a member of its Unit, else "Shared with you". A guest never sees another Unit's Group or Space names.
+    `{ type: "shared", name: "Shared with you" }` (a Group they can't open is dropped when the Space is open); a Space they can't open is "Shared with you". A guest never sees another Unit's Group or Space names.
     The check is the resolver's own answer for the Space / Group (`accessMany`, below), not a stored flag.
-  - `tree` (members): `{ groups: [{ id, name, spaces: [{ id, name, personal }] }], spaces: [...Spaces in no Group, or in a Group they can't open], other: { boards: [{ id, title }], more }, more }`.
-    Only Spaces and Groups the person can open boards in appear. `other`: the unfiled boards they can open (up to 20; `more` true if more exist or the scan stopped).
-    `tree.more`: true when the page of Space candidates (100), the Group candidates (50; one more is asked for to tell), or the grant checks (40 Spaces, 20 Groups) left something out. "Other boards" is a pseudo-group for the boards filed in no Space: one constant (`OTHER` in home.js).
+  - `tree` (members): `{ groups: [{ id, name, spaces: [{ id, name, personal }] }], spaces: [...Spaces in no Group, or in a Group they can't open], more }`.
+    Only Spaces and Groups the person can open boards in appear.
+    `tree.more`: true when the page of Space candidates (100), the Group candidates (50; one more is asked for to tell), or the grant checks (40 Spaces, 20 Groups) left something out.
   - `limits`: the caps in force, so the page needs no copy of them.
 - `GET /home/search?q=<text>` → `{ q, results, more }`. `q` trimmed, 1-100 chars (else 400). Members: boards of the person's Unit whose **title** contains `q`,
   or whose Space name contains `q` **and the person can open that Space** (an unopenable Space's name is no search key), plus matching titles among `owned` and `shared`.
@@ -1017,7 +1014,7 @@ Registry calls below. All routes authenticate like every other route in http.js:
 **"Boards I can open", efficiently.** The listing never asks the resolver once per board in the Unit. Every list is built from a *candidate* query that is bounded in SQL (recents ≤ 30
 rows, starred ≤ 60, shared ≤ 60, a search window of ≤ 1000 examined boards, ≤ 2 windows) and the candidates then go through ONE batch, `tenancy.accessMany(identity, ids)`:
 `Registry.boardRows(ids, { user, email })` (SQLite 7 statements, Postgres 6, for the whole batch, however many boards: boards, the user's grants, Team grants on the boards, the user's Teams among
-them, invites to their email, link uses, the links) plus **one `accessContext` per distinct Space (or Unit, for unfiled boards)** among the candidates, then the pure `resolveAccess` per board, and
+them, invites to their email, link uses, the links) plus **one `accessContext` per distinct Space** among the candidates, then the pure `resolveAccess` per board, and
 once per distinct Space and Group from the context already in hand (no more reads) for `spaceOpen` / `groupOpen`, which the path rule above needs. So a page of N candidates costs 6-7 batch statements plus one per distinct
 Space, never N × 4. The answer is the resolver's, board for board (test/auth/access-equivalence.js checks it against `tenancy.effective`: ladder, permissions, sources and `until`, on memory,
 SQLite and Postgres, several seeds, with custom roles, Group, Space and Unit grants, `adminBoardContent` on and off, and a second Unit in one batch).
@@ -1032,7 +1029,7 @@ Not a separate port: they are per-user rows over the Registry's own board ids wi
 board's row is inert (the access filter drops it). Home's tables are created like the Organization ones (if missing); its reads use these indexes: `reg_invites (email)`, `reg_link_uses (member, board)`,
 `reg_scope_grants (subject_type, subject, scope_type)`, `reg_team_members (member)`, `reg_grants (member)`, `reg_boards (tenant, id)`.
 
-Pending maintainer decisions kept as-is: a Unit admin gets no board content by being admin (a board they cannot open is not listed); unfiled boards appear under "Other boards" (above).
+Pending maintainer decisions kept as-is: a Unit admin gets no board content by being admin (a board they cannot open is not listed).
 
 ## Spaces and Groups (pages, pickers, create and rename, #48)
 
@@ -1050,7 +1047,7 @@ Space's id may still `board.create` in it, **except in another member's personal
 
 | Route | Needs | Answers |
 |---|---|---|
-| `POST /boards` `{ title?, space?, memberRole? }` | a Unit (members only: a guest, or a user with no Unit, gets 403). `space` omitted or null = the caller's **personal space** (made on first use; always allowed). `space: "<id>"` needs `board.create` at that Space | 201 `{ board }` (the board record). The caller becomes its `owner`. `memberRole` absent = null: the board inherits its Space (a personal space is private); else a role below `owner` (400 otherwise). Replaces the admin-only rule |
+| `POST /boards` `{ title?, space?, memberRole? }` | a Unit (members only: a guest, or a user with no Unit, gets 403). `space` omitted or null = the caller's **personal space** (made on first use; always allowed): the board service (server/auth/spaces.js) fills it in, because the Registry itself requires a Space. `space: "<id>"` needs `board.create` at that Space | 201 `{ board }` (the board record). The caller becomes its `owner`. `memberRole` absent = null: the board inherits its Space (a personal space is private); else a role below `owner` (400 otherwise). Replaces the admin-only rule |
 | `GET /spaces?can=board.create` | a Unit | `{ spaces: [{ id, name, personal, general, group: { id, name } \| null }], more }`: the Spaces the caller can open **and** holds `board.create` in (`general` = the Space's general-access role or null), their personal space first. A Group's name appears only when the caller can open the Group. The picker and `POST /boards` use one function, so what is listed is what is accepted. `more` = the bounded candidate scan left something out |
 | `POST /groups` `{ name, general? }` | `group.create` at the Unit root (a permission, not a role name; the built-in Unit `admin` holds it, `owner`/`editor`/`member` do not, a custom Unit role can). `name` trimmed, 1-200; `general` as for spaces, default `null` | 201 `{ group: { id, name, general } }`; the caller becomes its `owner` |
 | `GET /groups?can=space.create` | a Unit | `{ root, groups: [{ id, name }], more }`: `root` = the caller holds `space.create` at the Unit root; `groups` = the Groups they can open and hold `space.create` in |
@@ -1361,7 +1358,7 @@ Every route authenticates like Home (`Authorization: Bearer`) and **checks permi
 
 **What a move is.** A board's Space (`board.space`) changes; nothing else about the board does. Its id and URL, its direct grants, Team grants on the board, `memberRole`, invites, share links and link uses **travel with it**.
 What changes is the access that comes from the places above it: the old Space's and Group's grants and general access stop reaching it, the new Space's and Group's start (§ Tenancy, "Resolution"). A board is never more private than its Space (§ Organization).
-A board with no Space (*unfiled*, from before Spaces) can be moved into one; nothing moves a board **out** to no Space (`to` is always a Space), so an unfiled board has no Undo.
+Every board is in a Space, so a move is always Space to Space and `from` is always a Space id; nothing moves a board **out** to no Space.
 
 **Permissions (RBAC, never role names).** One move needs all of:
 1. **`move`** on the board, read from `tenancy.effective(caller, board, { uniform: true })`: held at the board, or at its Space, Group or the Unit (a board owner, a Space or Group owner, a Unit admin, a custom role that carries it).
@@ -1374,7 +1371,7 @@ Destination refusals (2, 3, 4) are the same `403 forbidden`, a destination in an
 
 | Route | Needs | Answers |
 |---|---|---|
-| `GET /boards/:board/move` | `move` on the board | 200 `{ board: { id, title }, from: { id, name, personal } \| { hidden: true } \| null, destinations: [{ id, name, personal, general, group }], more }`. `destinations` are exactly the Spaces the caller **may move this board into** (rules 2 to 4, evaluated for each; at most 100; `more`), never the current one, the caller's personal space first. `from` names the current Space only when the caller can open it (`hidden: true` otherwise; `null` = unfiled) |
+| `GET /boards/:board/move` | `move` on the board | 200 `{ board: { id, title }, from: { id, name, personal } \| { hidden: true }, destinations: [{ id, name, personal, general, group }], more }`. `destinations` are exactly the Spaces the caller **may move this board into** (rules 2 to 4, evaluated for each; at most 100; `more`), never the current one, the caller's personal space first. `from` names the current Space only when the caller can open it (`hidden: true` otherwise) |
 | `GET /boards/:board/move/preview?to=<space>` | rules 1 to 4 | 200 the **access diff**, below. Read-only |
 | `POST /boards/:board/move` `{ from, to }` (`Idempotency-Key`) | rules 1 to 4 | 200 `{ board: { id, title, space: { id, name } }, moved, undo: { space: { id, name, personal } } \| null }` |
 
@@ -1389,7 +1386,7 @@ Destination refusals (2, 3, 4) are the same `403 forbidden`, a destination in an
   The mover appears as themself (`self: true`) like anyone else. **A Unit admin is named only like anyone else**: when they hold a grant on the board or on a container the caller can open. Being an admin is never a row of its own (the `admin` source gives management permissions, and board content only where the Unit is configured to give it, in which case it is the same before and after and shows as a keep for that named person).
 - **`invites`, `links`**: the live ones that travel, counted, **only for a caller who holds `members.manage` on the board** (the Share dialog's rule: an invite is an address, a link is a capability); otherwise `null`. Always **keeps**, never named.
 
-**The move (`POST`).** `from` is the Space the caller **believes the board is in** (its id; `null` for an unfiled board) and `to` the destination: a **compare-and-set**. The Registry step `moveBoard({ board, from, to })` (§ Registry) changes the Space only if the board is still in `from`:
+**The move (`POST`).** `from` is the Space the caller **believes the board is in** (its id, required: a missing or non-id `from` is 400 `bad-request`) and `to` the destination: a **compare-and-set**. The Registry step `moveBoard({ board, from, to })` (§ Registry) changes the Space only if the board is still in `from`:
 - in `from` → it moves (`moved: true`);
 - already in `to` → nothing changes and the answer is the same success (`moved: false`), so a double submit, a retry and an Undo that already happened are harmless;
 - anywhere else → `409 { error: "moved" }`, nothing changed: someone moved it meanwhile. Two concurrent moves cannot interleave: exactly one of two different destinations wins, the other is the 409.
@@ -1400,7 +1397,7 @@ a Space-A owner who moved a board into a Space where they are only an editor rep
 **Freshness.** A move changes who reaches the board, so it announces `{ board }` on the board's `grants` subject (the announcing Registry, `server/main.js`, as every grants change): each gateway invalidates the board's cached roles and chain and re-checks its connections now. A person who **lost** access is cut within that pass (the socket closes `1008`; a person whose role only dropped gets `1012` and reconnects at the lower step); if the message is lost, within
 the gateway's timed re-check (≤ 60 s, § Auth) plus its retry (≤ 14 s). A person who gained access is welcomed by their next hello (a cached role lives ≤ 30 s) or the next timed pass. The board record cache (`roleCache`) drops the board's record too, so no node serves the old Space past the announcement.
 
-**Undo.** The server keeps no undo state; **Undo is an ordinary move back** the page makes with the `undo` the move answered, `POST /boards/:board/move { from: <the Space it moved to>, to: <the Space it came from> }` under **its own** Idempotency-Key. `undo` is decided **after the write, from the board's new place**: fresh reads of `move` on the board where it is now and of rules 2 to 4 for the original Space. It is `null` (no Undo is offered) when the board was unfiled, when the move did nothing (`moved: false`), or when either check fails now (for example a Space-A owner who moved Zed's board into a Space where they are only an editor holds no `move` there: no Undo). So an offered Undo is one that would succeed at that moment. The page shows the toast for **10 seconds**, a UI affordance only (the endpoint works at any time). What can change in between, and what Undo then does (all of it the move rules above, nothing special-cased):
+**Undo.** The server keeps no undo state; **Undo is an ordinary move back** the page makes with the `undo` the move answered, `POST /boards/:board/move { from: <the Space it moved to>, to: <the Space it came from> }` under **its own** Idempotency-Key. `undo` is decided **after the write, from the board's new place**: fresh reads of `move` on the board where it is now and of rules 2 to 4 for the original Space. It is `null` (no Undo is offered) when the move did nothing (`moved: false`), or when either check fails now (for example a Space-A owner who moved Zed's board into a Space where they are only an editor holds no `move` there: no Undo). So an offered Undo is one that would succeed at that moment. The page shows the toast for **10 seconds**, a UI affordance only (the endpoint works at any time). What can change in between, and what Undo then does (all of it the move rules above, nothing special-cased):
 - nothing changed → the board returns (`200`, `moved: true`);
 - the board is already back (someone, or a double click) → `200`, `moved: false`;
 - someone moved it elsewhere → `409 moved`: the page says "Can't undo: the board has been moved again";
@@ -1538,14 +1535,14 @@ method names are stable. Ids are server-minted over `[a-z0-9-]`.
 | Area | Calls |
 |---|---|
 | tenants | `createTenant({ domain, domains, kind, admins })` (`kind` default `company`), `tenant(id) → { id, domain, domains, kind, admins, createdAt }`, `tenantByDomain(domain)` (any of the Unit's domains → tenant), `addTenantAdmin(tenant, user)`, `addTenantDomain(tenant, domain)` |
-| boards | `createBoard({ tenant, title, memberRole, space, owner?, idem? }) → { id, tenant, title, memberRole, space, createdAt }`, `board(id) → { tenant, title, memberRole, space, … } \| null` (`space` null = unfiled) |
+| boards | `createBoard({ tenant, title, memberRole, space, owner?, idem? }) → { id, tenant, title, memberRole, space, createdAt }`, `board(id) → { tenant, title, memberRole, space, … } \| null` (`space` is required by `createBoard` and never null) |
 | grants | `setGrant(board, user, role \| null)`, `grant(board, user) → role \| null`, `grants(board)` |
 | invites | `createInvite({ board, email, role, expiresAt, by, idem? })`, `invite(id)`, `invites(board)`, `invitesFor(board, email)`, `revokeInvite(id)` |
 | share links | `createLink({ board, role, expiresAt, by, idem? })` (role per link), `link(id)`, `links(board)`, `revokeLink(id)`, `addLinkUse(link, user)`, `linkUses(board, user)` |
 | idempotency | the optional `idem: { user, key, fp }` of `createBoard`, `createGroup`, `createSpace`, `createTeam`, `createInvite`, `createLink` (the key row is written in the create's own atomic step; a live one rejects with `code` `idem-replay` + `ref`, or `idem-mismatch`), and `idemGet({ user, key, fp }) → { state: "none" \| "done" \| "mismatch", ref? }` (§ Idempotent creates) |
-| home | `markOpened(user, board)`, `recents(user, { limit })`, `setStarred(user, board, on)`, `starred(user, { limit })`, `starredAmong(user, boards)`, `sharedBoards(user, email, { limit })`, `searchBoards(tenant, { q, unfiled, after, scan })`, `spaceCandidates(tenant, { user, all, after, limit })`, `groupCandidates(tenant, { user, all, limit })`, `boardRows(boards, { user, email })` (§ Home) |
+| home | `markOpened(user, board)`, `recents(user, { limit })`, `setStarred(user, board, on)`, `starred(user, { limit })`, `starredAmong(user, boards)`, `sharedBoards(user, email, { limit })`, `searchBoards(tenant, { q, after, scan })`, `spaceCandidates(tenant, { user, all, after, limit })`, `groupCandidates(tenant, { user, all, limit })`, `boardRows(boards, { user, email })` (§ Home) |
 | access requests (#51) | `requestAccess({ tenant, scope, user, role, idem?, limits?, supersede? }) → AccessRequest` (one atomic step: key, existing row, cooldown, per-user and per-scope limits, write; rejects code `rate-limited` with `retryAfterMs`), `accessRequest(scope, user) → AccessRequest \| null`, `accessRequests(scope, { limit }) → AccessRequest[]` (pending, newest first, default 50, at most 200), `closeAccessRequest(scope, user, "dismissed" \| "granted") → boolean` (both keep the row with `closedAt`: `dismissed` holds the cooldown, `granted` only the per-person count; a closed pending row is never reopened by a read), `grantHolders(scope, roles, { limit }) → ScopedGrant[]` (scoped grants at the scope whose role is in `roles`, by subject, at most 20); table `reg_access_requests` (tenant, scope, member, role, state `pending`|`dismissed`|`granted`, at, closed_at; unique per scope and member) |
-| move (#53) | `moveBoard({ board, from, to, idem? }) → { board, moved }` (§ Move board): ONE atomic step compare-and-sets the board's Space (`from`: the id it must be in, `null` = unfiled; `to`: a Space of the board's Unit): in `from` → set, `moved: true`; already in `to` → no change, `moved: false`; anywhere else rejects code `moved`, nothing written; the key row (`idem`) is written in the same step. An unknown board or Space rejects `registry: no such board` / `no such space` |
+| move (#53) | `moveBoard({ board, from, to, idem? }) → { board, moved }` (§ Move board): ONE atomic step compare-and-sets the board's Space (`from`: the id of the Space it must be in, required (a non-string rejects `registry: no such space`); `to`: a Space of the board's Unit): in `from` → set, `moved: true`; already in `to` → no change, `moved: false`; anywhere else rejects code `moved`, nothing written; the key row (`idem`) is written in the same step. An unknown board or Space rejects `registry: no such board` / `no such space` |
 | organization | `createGroup`, `group`, `groups`; `createSpace`, `space`, `spaces`, `ensurePersonalSpace(tenant, user)`; `createTeam`, `team`, `teams`, `setTeamMember`, `teamMembers`; `setScopedGrant({ scope, subject, role \| null })` (a role shaped `r-…` must be a custom role of the scope's Unit, checked in the write: code `no-role`), `scopedGrants(scope)`; `createRole({ tenant, name, base, boardRole, permissions, max? })` (`max`: rejects code `limit` when the Unit already has `max` custom roles, atomically), `updateRole`, `role`, `roles`; Roles (§ Roles): `deleteRole(tenant, id)` (ONE atomic step: rejects code `in-use` while any scoped grant holds the role, `member` is never deleted, an unknown id rejects `registry: no such role`), `roleUsage(tenant, ids, { cap })` (per id, **this Unit's grants only**: a scoped grant has no tenant column, so its scope's row says whose it is and another Unit's grant of the same role string never counts, nor does a Team id of another Unit appear; `member` is refused: `{ places, users, teams }` = grant rows holding it counted to `cap + 1`, DISTINCT user subjects counted to `cap + 1`, and up to 50 Team ids, in one statement per id; index on `reg_scope_grants (role)`), `memberCount(tenant, { cap })` (directory rows, counted to `cap + 1`); `accessContext(scope, { users, chain })`; `boardsIn(scope, { after, limit })`, `scopesOf(subject, { after, limit })`; `accessContexts(scopes, { users })` (the batch of `accessContext`, one statement on Postgres), `rename({ type: "board"\|"space"\|"group", id }, name)`, `updateScope({ type: "space"\|"group", id }, { name?, generalRole? })` (atomic; returns the row), `spacesIn(group, { after, limit })` (§ Spaces and Groups); Teams and access (§ Teams and access): `renameTeam`, `deleteTeam` (atomic, `last-owner`), `teamsPage(tenant, { after, limit, q })`, `teamsAmong(tenant, ids)`, `teamMembersPage(team, { after, limit })`, `scopedGrant(scope, subject)`, `scopedGrantsPage(scope, { after, limit })`, and the member directory `touchMember(tenant, { user, name, email })`, `membersAmong(tenant, users)`, `findMembers(tenant, { q, limit })` (table `reg_members`) |
 
 Single node: SQLite; cluster: Postgres. The room never calls it; gateways and Auth do. On Postgres the server
@@ -1584,7 +1581,7 @@ runs as a role that doesn't own the schema (§ Store, Least privilege).
 - **Postgres tables** (all created only if missing, like the first seven; nothing is ever altered): `reg_tenant_meta` (kind),
   `reg_tenant_domains` (a Unit's domains after its first, which stays in `reg_tenants.domain`; a domain is unique across both,
   serialised by an advisory lock), `reg_groups`, `reg_spaces` (unique `(tenant, owner_user)`: one personal space per member),
-  `reg_board_spaces` (a board's Space; no row = unfiled), `reg_teams`, `reg_team_members`, `reg_scope_grants` (scope, subject,
+  `reg_board_spaces` (a board's Space; exactly one row per board), `reg_teams`, `reg_team_members`, `reg_scope_grants` (scope, subject,
   role), `reg_roles` (custom roles and the Unit's `member` override). SQLite has the same tables with the same names.
 - `memberRole` may be `null` (§ Tenancy). Calls keyed by an id alone carry no tenant: the admin API checks it
   (§ Tenancy).

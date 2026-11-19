@@ -12,6 +12,7 @@ import { tenancy, roleCache } from "../../server/auth/tenancy.js";
 import { Replica } from "../../packages/protocol/replica.js";
 import { jsonCodec } from "../../packages/protocol/codec.js";
 import { tempDir, sleep, until, testNets } from "./helpers.js";
+import { mkBoard } from "../auth/fixtures.js";
 
 /**
  * The room host's heartbeat in tests (production default 2 s). Things a test waits for ride on it: the gateway's board feed
@@ -46,8 +47,8 @@ export async function rig(o = {}) {
   const ids = o.ids ?? {};
   if (!o.ids) {
     const tenant = await registry.createTenant({ domain: "acme.test" });
-    const board = await registry.createBoard({ tenant: tenant.id, title: "all hands", memberRole: null });
-    const other = await registry.createBoard({ tenant: tenant.id, title: "no grants here", memberRole: null });
+    const board = await mkBoard(registry, { tenant: tenant.id, title: "all hands", memberRole: null });
+    const other = await mkBoard(registry, { tenant: tenant.id, title: "no grants here", memberRole: null });
     Object.assign(ids, { tenant: tenant.id, board: board.id, otherBoard: other.id });
     for (const role of ROLES) await registry.setGrant(board.id, "dev:" + role, role);
     for (let i = 0; i < 8; i++) await registry.setGrant(board.id, "dev:editor" + i, "editor");

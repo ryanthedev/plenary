@@ -421,26 +421,40 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   }
   if (dev.enabled && !roles.gateway) log.warn("dev tokens are on, but the dev sign-in menu (GET /auth/dev) is OFF: " + off + " (no dev board on this node)", { host });
   else if (dev.enabled) {
-    // Reuse the dev board across restarts (the Registry has no list call to find it by).
+    // Reuse the dev tenant, Space and board across restarts (the Registry has no list call to find them by). Each step is written to
+    // the file as soon as it exists, so a crash between steps resumes instead of minting a second tenant or Space (a kill between
+    // createBoard and the write is a replay of the board's idempotency key).
     const devFile = join(dataDir, "dev-board.json");
-    let saved = null;
-    if (existsSync(devFile)) { try { saved = JSON.parse(readFileSync(devFile, "utf8")).board; } catch { saved = null; } }
+    let saved = {};
+    if (existsSync(devFile)) { try { saved = JSON.parse(readFileSync(devFile, "utf8")) ?? {}; } catch { saved = {}; } }
+    const save = () => { writeFileSync(devFile + ".tmp", JSON.stringify(saved)); renameSync(devFile + ".tmp", devFile); };   // whole or not at all (a kill mid-write must not leave half a file)
+    const str = v => (typeof v === "string" ? v : null);
     // Not in a try: a Registry that can't answer must fail the start, not mint a second dev board.
-    let board = typeof saved === "string" ? await rawRegistry.board(saved) : null;
+    let board = str(saved.board) ? await rawRegistry.board(saved.board) : null;
+    let space = null;
     if (!board) {
-      const tenant = await registry.createTenant({ domain: null });
-      board = await registry.createBoard({ tenant: tenant.id, title: "dev board", memberRole: null });
-      // Written whole or not at all (a kill mid-write must not leave half a file that hides the board).
-      writeFileSync(devFile + ".tmp", JSON.stringify({ board: board.id }));
-      renameSync(devFile + ".tmp", devFile);
-    }
-    // Across restarts a token's role may have dropped. The Registry refuses to demote a board's last owner
+      let tenant = str(saved.tenant) ? await rawRegistry.tenant(saved.tenant) : null;
+      if (!tenant) { tenant = await registry.createTenant({ domain: null }); saved = { tenant: tenant.id }; save(); }
+      space = str(saved.space) ? await rawRegistry.space(saved.space) : null;
+      if (space?.tenant !== tenant.id) {
+        space = await registry.createSpace({ tenant: tenant.id, name: "Dev", generalRole: null });   // every board lives in a Space; only the dev tokens' grants open it
+        saved = { tenant: tenant.id, space: space.id }; save();
+      }
+      // A fixed idempotency key per Space: a kill between createBoard and the file write makes the next start's create a replay, which reuses the board.
+      try { board = await registry.createBoard({ tenant: tenant.id, title: "dev board", memberRole: null, space: space.id, idem: { user: "dev:seed", key: `dev-board-${space.id}`, fp: "dev-board" } }); }
+      catch (err) { if (err?.code !== "idem-replay") throw err; board = await rawRegistry.board(err.ref); }
+      saved = { tenant: tenant.id, space: space.id, board: board.id }; save();
+    } else space = await rawRegistry.space(board.space);
+    // Across restarts a token's role may have dropped. The Registry refuses to demote a board's (or Space's) last owner
     // (code "last-owner"): that grant is kept and the start goes on. Raises go first, so a new owner named in the
-    // same start is in place before an old one is lowered.
+    // same start is in place before an old one is lowered. Each dev user holds its token role on the Dev Space too, so
+    // the Space lists and opens for them, not only the board.
     const byRank = [...best].sort((a, b) => ROLES.indexOf(a[1]) - ROLES.indexOf(b[1]));
     for (const [user, role] of byRank) {
       try { await registry.setGrant(board.id, user, role); }
       catch (err) { if (err?.code !== "last-owner") throw err; log.warn("a dev token would demote the dev board's last owner; kept as owner", { user }); }
+      try { await registry.setScopedGrant({ scope: { type: "space", id: space.id }, subject: { type: "user", id: user }, role }); }
+      catch (err) { if (err?.code !== "last-owner") throw err; log.warn("a dev token would demote the dev Space's last owner; kept as owner", { user }); }
     }
     devBoard = board.id;
     // Each dev domain with a token flagged admin gets its tenant, those users as its admins (p5-devadmin). A bad

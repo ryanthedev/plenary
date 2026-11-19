@@ -11,6 +11,7 @@ import { registryContract } from "../auth/registry-contract.js";
 import { accessEquivalence } from "../auth/access-equivalence.js";
 import { Database } from "bun:sqlite";
 import { accessRace } from "../auth/access-race.js";
+import { mkBoard } from "../auth/fixtures.js";
 
 const dir = mkdtempSync(join(tmpdir(), "plenary-registry-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -48,6 +49,24 @@ test("a file from before the organization (boards, no Spaces) is an old-format s
   after.close();
 });
 
+test("a file holding a board that is in no Space is an old-format store (pre-#90 unfiled board): refused with code old-format, and left as it was", async () => {
+  const path = file();
+  const r = sqliteRegistry({ path, fullfsync: false });
+  const t = await r.createTenant({ domain: "acme.com" }), sp = await r.createSpace({ tenant: t.id, name: "S" });
+  const kept = await r.createBoard({ tenant: t.id, space: sp.id }), unfiled = await r.createBoard({ tenant: t.id, space: sp.id });
+  await r.close();
+  const raw = new Database(path, { strict: true });
+  raw.run("DELETE FROM reg_board_spaces WHERE board = ?", [unfiled.id]);   // what an older version left behind
+  raw.close();
+  let err;
+  try { sqliteRegistry({ path, fullfsync: false }); } catch (e) { err = e; }
+  expect(err?.code).toBe("old-format");
+  expect(err.message).toMatch(/no Space.*Reset the store/);
+  const after = new Database(path, { readonly: true });
+  expect(after.query("SELECT board FROM reg_board_spaces").all()).toEqual([{ board: kept.id }]);   // nothing was repaired or added
+  after.close();
+});
+
 describe("sqlite registry", () => {
   test("pragmas: WAL, synchronous=FULL, fullfsync on by default; start-up leaves the whole busy_timeout", async () => {
     const r = sqliteRegistry({ path: file() });
@@ -72,16 +91,19 @@ describe("sqlite registry", () => {
       names.set(t.id, "T");
       const t2 = await r.createTenant({ domain: null });
       names.set(t2.id, "T2");
-      const b = await r.createBoard({ tenant: t.id, title: 42, memberRole: null });
+      const sp = await r.createSpace({ tenant: t.id, name: "SP" });
+      names.set(sp.id, "SP");
+      const b = await r.createBoard({ tenant: t.id, space: sp.id, title: 42, memberRole: null });
       names.set(b.id, "B");
-      const c = await r.createBoard({ tenant: t.id });
+      const c = await r.createBoard({ tenant: t.id, space: sp.id });
       names.set(c.id, "C");
       await rec("board B", () => r.board(b.id));
       await rec("board C", () => r.board(c.id));
       await rec("tenant", () => r.tenant(t.id));
       await rec("tenant null domain", () => r.tenant(t2.id));
       await rec("dup domain", () => r.createTenant({ domain: "ACME.COM" }));
-      await rec("no tenant board", () => r.createBoard({ tenant: "t-nope" }));
+      await rec("no tenant board", () => r.createBoard({ tenant: "t-nope", space: sp.id }));
+      await rec("no space board", () => r.createBoard({ tenant: t.id }));
       await rec("addAdmin unknown", () => r.addTenantAdmin("t-nope", "x"));
       await r.addTenantAdmin(t.id, "google:c");
       await r.addTenantAdmin(t.id, "google:a");
@@ -188,11 +210,11 @@ describe("sqlite registry", () => {
     const path = file(), idem = { user: "google:root", key: "key-0001-aaaa", fp: "f".repeat(64) };
     let r = sqliteRegistry({ path, fullfsync: false });
     const t = await r.createTenant({ domain: "acme.com", admins: ["google:root"] });
-    const b = await r.createBoard({ tenant: t.id, title: "Once", owner: "google:root", idem });
+    const b = await mkBoard(r, { tenant: t.id, title: "Once", owner: "google:root", idem });
     await r.close();   // the process dies after the commit, before any answer was stored anywhere else
     r = sqliteRegistry({ path, fullfsync: false });
     expect(await r.idemGet(idem)).toEqual({ state: "done", ref: b.id });
-    await expect(r.createBoard({ tenant: t.id, title: "Once", owner: "google:root", idem })).rejects.toMatchObject({ code: "idem-replay", ref: b.id });
+    await expect(mkBoard(r, { tenant: t.id, title: "Once", owner: "google:root", idem })).rejects.toMatchObject({ code: "idem-replay", ref: b.id });
     expect((await r.boardsIn({ type: "unit", id: t.id })).ids).toEqual([b.id]);
     expect(await r.grants(b.id)).toEqual([{ user: "google:root", role: "owner" }]);
     await r.close();
@@ -203,7 +225,7 @@ describe("sqlite registry", () => {
     let r = sqliteRegistry({ path, now: () => 7, fullfsync: false });
     const t = await r.createTenant({ domain: "acme.com", admins: ["google:root"] });
     await r.addTenantAdmin(t.id, "google:ann");
-    const b = await r.createBoard({ tenant: t.id, title: "All hands", memberRole: "annotator" });
+    const b = await mkBoard(r, { tenant: t.id, title: "All hands", memberRole: "annotator" });
     await r.setGrant(b.id, "google:root", "owner");
     await r.setGrant(b.id, "google:ann", "editor");
     const i = await r.createInvite({ board: b.id, email: "cfo@partner.example", role: "editor", expiresAt: 99, by: "google:root" });
@@ -234,7 +256,7 @@ describe("sqlite registry", () => {
     const a = sqliteRegistry({ path, fullfsync: false });
     const b = sqliteRegistry({ path, fullfsync: false });
     const t = await a.createTenant({ domain: null });
-    const board = await a.createBoard({ tenant: t.id });
+    const board = await mkBoard(a, { tenant: t.id });
     for (let round = 0; round < 20; round++) {
       await a.setGrant(board.id, "x", "owner");
       await b.setGrant(board.id, "y", "owner");
@@ -252,7 +274,7 @@ describe("sqlite registry", () => {
     const path = file();
     const r = sqliteRegistry({ path, fullfsync: false });
     const t = await r.createTenant({ domain: null });
-    const board = await r.createBoard({ tenant: t.id });
+    const board = await mkBoard(r, { tenant: t.id });
     const ROUNDS = 40;
     const mod = resolve(import.meta.dir, "../../server/registry/sqlite.js");
     const child = user => `

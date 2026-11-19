@@ -190,9 +190,8 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
     },
     /**
      * One user's access to many boards (PROTOCOL.md § Home, "Boards I can open"): `registry.boardRows` reads every board-scope
-     * row for the whole batch (a fixed number of statements), plus ONE `accessContext` per distinct Space (or Unit, for unfiled
-     * boards) among them, then the same pure `resolveAccess` as `effective`, so it can't disagree with it. From the context it
-     * already holds, each distinct Space's and Group's OWN access is resolved too (no further reads), so a caller can tell a board it
+     * row for the whole batch (a fixed number of statements), plus ONE `accessContext` per distinct Space among them (every board has one), then the same pure `resolveAccess` as `effective`, so it can't
+     * disagree with it. From the context it already holds, each distinct Space's and Group's OWN access is resolved too (no further reads), so a caller can tell a board it
      * may open apart from the Space and Group above it that it may not (their names must not leak). At most HOME.batch ids; unknown
      * boards are absent. `spaceOpen` / `groupOpen`: may the identity open boards in that Space / Group (false when there is none).
      * @returns {Promise<Map<string, { access: import("./resolver.js").Access, grant: Role|null, board: Board, space: object|null, group: object|null, spaceOpen: boolean, groupOpen: boolean }>>}
@@ -201,11 +200,11 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
       const out = new Map();
       if (!okIdentity(identity) || !Array.isArray(boardIds) || !boardIds.length) return out;
       const rows = await registry.boardRows(boardIds.slice(0, HOME.batch), { user: identity.user, email: identity.email ?? null });
-      const scopeOf = b => (b.space ? { type: "space", id: b.space } : { type: "unit", id: b.tenant });
+      const scopeOf = b => ({ type: "space", id: b.space });
       const keyOf = sc => sc.type + "\n" + sc.id;
       const scopes = new Map();
       for (const r of rows.values()) scopes.set(keyOf(scopeOf(r.board)), scopeOf(r.board));
-      // ONE batch read for every distinct Space (or Unit) among the boards (TECH-DEBT row 35: it was one read per Space).
+      // ONE batch read for every distinct Space among the boards (TECH-DEBT row 35: it was one read per Space).
       const got = await registry.accessContexts([...scopes.values()], { users: [identity.user] });
       const ctxs = got;
       const t = now();

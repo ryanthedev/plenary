@@ -73,7 +73,7 @@ export function httpMove({ fetch, token, base = "", timeoutMs = 10_000, timers =
       return diff ? { diff } : bad();
     },
     async move(board, { from, to }, key = null) {
-      if (!isId(board) || !isId(to) || (from !== null && !isId(from))) return { error: "forbidden" };
+      if (!isId(board) || !isId(to) || !isId(from)) return { error: "forbidden" };
       const r = await ask(`/boards/${q(board)}/move`, "POST", { from, to }, key);
       if (r.error) return r;
       const result = normalizeResult(r.body);

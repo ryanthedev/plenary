@@ -46,11 +46,11 @@ describe("who may move where", () => {
   test("a non-mover (editor, stranger, guest, unknown id, other Unit) gets the one forbidden", async () => {
     await r.setGrant(board.id, "google:max", "editor");
     const globex = await r.createTenant({ domain: "globex.com" });
-    const alien = await r.createBoard({ tenant: globex.id, title: "x", owner: "google:g" });
+    const alien = await r.createBoard({ tenant: globex.id, space: (await r.createSpace({ tenant: globex.id, name: "G" })).id, title: "x", owner: "google:g" });
     for (const [who, id] of [[max, board.id], [zed, board.id], [kim, board.id], [ada, "b-nope0000000000"], [ada, alien.id], [ada, "a b"]]) {
       expect(await code(mv.options(who, id))).toBe("forbidden");
       expect(await code(mv.preview(who, id, design.id))).toBe("forbidden");
-      expect(await code(mv.move(who, id, { from: null, to: design.id }))).toBe("forbidden");
+      expect(await code(mv.move(who, id, { from: platform.id, to: design.id }))).toBe("forbidden");
     }
   });
   test("a non-mover costs the board read, the access reads and nothing else (no destination, name or diff reads)", async () => {
@@ -226,9 +226,9 @@ describe("the move: compare-and-set, idempotent, undo", () => {
     expect((await r.board(board.id)).space).toBe(design.id);
     expect(await r.grant(board.id, "google:ada")).toBe("owner");           // direct grants travel
   });
-  test("an unfiled board moves in and has no undo", async () => {
-    const loose = await r.createBoard({ tenant: acme.id, title: "L", owner: "google:ada" });
-    expect(await mv.move(ada, loose.id, { from: null, to: design.id })).toMatchObject({ moved: true, undo: null });
+  test("`from` is required: a missing, null or malformed one is bad-request, and nothing moves", async () => {
+    for (const body of [{ to: design.id }, { from: null, to: design.id }, { from: "a b", to: design.id }]) expect(await code(mv.move(ada, board.id, body))).toBe("bad-request");
+    expect((await r.board(board.id)).space).toBe(adasSpace.id);
   });
   test("undo is a move back; double undo is a harmless no-op; a move in between makes it 409 moved", async () => {
     await mv.move(ada, board.id, { from: adasSpace.id, to: design.id });
@@ -298,7 +298,6 @@ describe("review fixes (#53)", () => {
   });
   test("LOW-3: a stale `from` is 409 moved before anything is written; a board already in `to` stays the no-op success", async () => {
     expect(await code(mv.move(ada, board.id, { from: platform.id, to: design.id }))).toBe("moved");      // it is in her personal space
-    expect(await code(mv.move(ada, board.id, { from: null, to: design.id }))).toBe("moved");
     expect((await r.board(board.id)).space).toBe(adasSpace.id);
     await mv.move(ada, board.id, { from: adasSpace.id, to: design.id });
     expect((await mv.move(ada, board.id, { from: platform.id, to: design.id })).moved).toBe(false);       // already there: harmless whatever `from` says

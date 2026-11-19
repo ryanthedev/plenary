@@ -329,7 +329,7 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
       const above = [];
       let hiddenAbove = false;      // access comes from a container the caller can't open: a boolean only (no name, no count)
       if (type === "board" || type === "space") {
-        const space = type === "board" ? (row.space ? await registry.space(row.space) : null) : row;
+        const space = type === "board" ? await registry.space(row.space) : row;
         const group = type === "space" ? (row.group ? await registry.group(row.group) : null) : space?.group ? await registry.group(space.group) : null;
         const cands = type === "board" ? [space && { type: "space", row: space }, group && { type: "group", row: group }] : [group && { type: "group", row: group }];
         const list = cands.filter(Boolean);

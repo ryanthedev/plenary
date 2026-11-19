@@ -12,7 +12,7 @@ export const MOVE_ERRORS = Object.freeze(["auth", "forbidden", "notfound", "inva
 
 /**
  * @typedef {{ id: string, name: string, personal: boolean, general: string|null, group: { id: string, name: string }|null }} Destination
- * @typedef {{ board: { id: string, title: string }, from: { id: string, name: string, personal: boolean }|{ hidden: true }|null, destinations: Destination[], more: boolean }} MoveOptions
+ * @typedef {{ board: { id: string, title: string }, from: { id: string, name: string, personal: boolean }|{ hidden: true }, destinations: Destination[], more: boolean }} MoveOptions
  * @typedef {{ id: string, name: string }} RoleView
  * @typedef {{ subject: { type: "user"|"team"|"everyone", id?: string, name: string }, self?: boolean, before: RoleView|null, after: RoleView|null }} DiffEntry
  * @typedef {{ board: { id: string, title: string }, from: object|null, to: { id: string, name: string, personal: boolean }, gains: DiffEntry[], keeps: DiffEntry[], loses: DiffEntry[], invites: number|null, links: number|null, hidden: boolean, more: boolean }} MoveDiff

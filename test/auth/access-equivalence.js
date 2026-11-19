@@ -38,16 +38,16 @@ export function accessEquivalence(name, makeRegistry, { seeds = [7, 19, 101], cl
         for (let i = 0; i < 3; i++) { const t = await r.createTeam({ tenant: acme.id, name: `t${i}` }); teams.push(t); for (const p of people) if (rnd(2)) await r.setTeamMember(t.id, p.user, true); }
         const groups = [];
         for (let i = 0; i < 2; i++) groups.push(await r.createGroup({ tenant: acme.id, name: `g${i}`, generalRole: pick(GENERAL) }));
-        const spaces = [null];
+        const spaces = [];
         for (let i = 0; i < 5; i++) spaces.push((await r.createSpace({ tenant: acme.id, name: `s${i}`, group: pick([null, ...groups.map(g => g.id)]), generalRole: pick(GENERAL) })).id);
         spaces.push((await r.ensurePersonalSpace(acme.id, "google:ada")).id);
         const subj = () => (rnd(2) ? { type: "user", id: pick(people).user } : { type: "team", id: pick(teams).id });
-        for (const sp of spaces.slice(1)) if (rnd(2)) await r.setScopedGrant({ scope: { type: "space", id: sp }, subject: subj(), role: pick(grantable) });
+        for (const sp of spaces) if (rnd(2)) await r.setScopedGrant({ scope: { type: "space", id: sp }, subject: subj(), role: pick(grantable) });
         for (const g of groups) { await r.setScopedGrant({ scope: { type: "group", id: g.id }, subject: { type: "user", id: pick(people).user }, role: pick(grantable) }); if (rnd(2)) await r.setScopedGrant({ scope: { type: "group", id: g.id }, subject: { type: "team", id: pick(teams).id }, role: pick(ROLES.slice(0, 4)) }); }
         if (rnd(2)) await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: subj(), role: pick(grantable) });
         const boards = [];
         const mkBoard = async (tenant, space) => {
-          const b = await r.createBoard({ tenant, title: `b${boards.length}`, ...(space ? { space } : {}), memberRole: pick(GENERAL) });
+          const b = await r.createBoard({ tenant, title: `b${boards.length}`, space, memberRole: pick(GENERAL) });
           boards.push(b);
           for (const p of people) {
             if (rnd(6) === 0) await r.setGrant(b.id, p.user, pick(ROLES));
@@ -57,7 +57,8 @@ export function accessEquivalence(name, makeRegistry, { seeds = [7, 19, 101], cl
           if (tenant === acme.id && rnd(5) === 0) await r.setScopedGrant({ scope: { type: "board", id: b.id }, subject: { type: "team", id: pick(teams).id }, role: pick(["viewer", "editor"]) });
         };
         for (let i = 0; i < 40; i++) await mkBoard(acme.id, pick(spaces));
-        for (let i = 0; i < 4; i++) await mkBoard(globex.id, null);              // a second Unit in the same batch
+        const gspace = (await r.createSpace({ tenant: globex.id, name: "gs" })).id;
+        for (let i = 0; i < 4; i++) await mkBoard(globex.id, gspace);              // a second Unit in the same batch
         clock += 6000;                                                           // some invites and links have expired now
         let open = 0;
         for (const p of people) {

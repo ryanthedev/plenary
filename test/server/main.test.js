@@ -1,7 +1,7 @@
 // `bun server/main.js` as a child process: it starts, logs JSON lines without secrets, serves /health and a
 // socket, survives bad frames, and shuts down on SIGTERM.
 import { test, expect, afterAll } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { inflateSync } from "node:zlib";
 import { tempDir, cleanup, until, spawnTracked } from "./helpers.js";
@@ -122,7 +122,7 @@ test("main.js started twice on one data dir: the same board, its acked ops, and 
     const acks = s.msgs.filter(m => m.t === "ack");
     a.p.child.kill("SIGTERM");
     expect(await a.p.child.exited).toBe(0);
-    expect(JSON.parse(readFileSync(join(dir, "dev-board.json"), "utf8"))).toEqual({ board: a.board });
+    expect(JSON.parse(readFileSync(join(dir, "dev-board.json"), "utf8"))).toMatchObject({ board: a.board });
 
     // Second start: ann's token now says editor (she stays owner: the board keeps its last owner), bob is promoted.
     b = await boot(dir, { ann: "editor", bob: "annotator", cy: "viewer" });
@@ -333,9 +333,9 @@ test("start(env): COOKIE_KEY: refused when short; required in cluster mode; rand
 test("revocation: a grant change through the Registry closes a connection that lost its role", async () => {
   const app = await start(devEnv(tempDir()));
   try {
-    // An unfiled board with no general access (a board made by POST /boards would sit in ann's personal space, which she owns: no revocation by grant).
+    // A board with no general access (a board made by POST /boards would sit in ann's personal space, which she owns: no revocation by grant).
     const t = await app.registry.createTenant({ domain: "acme.test", admins: ["dev:ann"] });
-    const board = await app.registry.createBoard({ tenant: t.id, memberRole: null });
+    const board = await mkBoard(app.registry, { tenant: t.id, memberRole: null });
     await app.registry.setGrant(board.id, "dev:ann", "owner");
     await app.registry.setGrant(board.id, "dev:bob", "owner");          // a second owner, so ann may be removed
     const s = await sock(app.server.wsUrl);
@@ -355,8 +355,37 @@ test("revocation: a grant change through the Registry closes a connection that l
   } finally { await app.stop(); }
 });
 
+test("dev board: it lives in a private Dev Space whose grants mirror the token roles, and a restart (or a crash before the board was written) reuses the tenant and Space", async () => {
+  const dir = tempDir();
+  const env = { PLENARY_DATA_DIR: dir, PORT: "0", LOG_LEVEL: "error", PLENARY_DEV_TOKENS: JSON.stringify({ [`${TOKEN}-ann`]: { name: "ann", role: "owner" }, [`${TOKEN}-bob`]: { name: "bob", role: "viewer" } }) };
+  const first = await start(env);
+  let tenant, space, board;
+  try {
+    board = await first.registry.board(first.devBoard);
+    space = await first.registry.space(board.space);
+    tenant = board.tenant;
+    expect(space).toMatchObject({ name: "Dev", tenant, generalRole: null, group: null });   // a private Space: nobody gets in by membership
+    expect(board.memberRole).toBe(null);
+    for (const [user, role] of [["dev:ann", "owner"], ["dev:bob", "viewer"]]) {
+      expect([user, await first.registry.grant(board.id, user), await first.registry.scopedGrant({ type: "space", id: space.id }, { type: "user", id: user })]).toEqual([user, role, role]);
+    }
+  } finally { await first.stop(); }
+  // A crash after createBoard but before the file recorded the board: the file holds only the tenant and Space ids.
+  const file = join(dir, "dev-board.json");
+  expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ tenant, space: space.id, board: board.id });
+  writeFileSync(file, JSON.stringify({ tenant, space: space.id }));
+  const second = await start(env);
+  try {
+    const again = await second.registry.board(second.devBoard);
+    expect([again.tenant, again.space]).toEqual([tenant, space.id]);   // no second tenant or Space
+    expect(again.id).toBe(board.id);                                      // the kill landed after createBoard: its idempotency key replays, so the same board comes back (no stray board)
+    expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ tenant, space: space.id, board: again.id });
+  } finally { await second.stop(); }
+});
+
 // ---- p4-wire: the cluster env (no Postgres or NATS needed: every case here is refused or single node) ----
 import { nodeConfig, defaultNodeId, redact } from "../../server/main.js";
+import { mkBoard } from "../auth/fixtures.js";
 
 const PW = "hunter2-FAKE-pw";
 const PG = `postgres://plen:${PW}@127.0.0.1:1/plenary`, NATS = `nats://plen:${PW}@127.0.0.1:1`;

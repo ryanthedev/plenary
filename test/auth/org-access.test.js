@@ -234,11 +234,11 @@ test("a guest named in Space, Group, Unit and Team grants still has only board s
   expect(await ten.role(kim, b.id)).toBe("viewer");
 });
 
-test("filing a legacy board into a Space with no general access and no grants changes nobody's role (the shape of a later backfill)", async () => {
+test("a board in a Space with no general access and no grants gets exactly its own sources: grant, invite, link, board general access", async () => {
   const legacy = await r.createSpace({ tenant: acme.id, name: "Legacy", generalRole: null });
   const link = async b => { const l = await r.createLink({ board: b.id, role: "annotator", by: "google:x" }); await r.addLinkUse(l.id, "google:lou"); };
-  const plain = await r.createBoard({ tenant: acme.id, memberRole: "commenter" }), filed = await r.createBoard({ tenant: acme.id, memberRole: "commenter", space: legacy.id });
-  for (const b of [plain, filed]) { await r.setGrant(b.id, "google:gina", "owner"); await r.createInvite({ board: b.id, email: "ivy@partner.io", role: "editor", by: "google:gina" }); await link(b); }
-  const people = [id("gina"), id("bob"), id("lou", null), id("ivy", "partner.io"), id("zed", "globex.com"), id("root")];
-  for (const p of people) expect(await ten.role(p, filed.id)).toBe(await ten.role(p, plain.id));
+  const filed = await r.createBoard({ tenant: acme.id, memberRole: "commenter", space: legacy.id });
+  await r.setGrant(filed.id, "google:gina", "owner"); await r.createInvite({ board: filed.id, email: "ivy@partner.io", role: "editor", by: "google:gina" }); await link(filed);
+  const want = [[id("gina"), "owner"], [id("bob"), "commenter"], [id("lou", null), "annotator"], [id("ivy", "partner.io"), "editor"], [id("zed", "globex.com"), null], [id("root"), "commenter"]];   // root is a Unit member too: the board's general access, no extra admin content access
+  for (const [p, role] of want) expect([p.user, await ten.role(p, filed.id)]).toEqual([p.user, role]);
 });

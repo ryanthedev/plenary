@@ -83,7 +83,6 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
    * back there (rules 2 to 4, fresh reads), else null. So an offered Undo is one that would succeed now (PROTOCOL.md § Move board, "Undo").
    */
   async function undoNow(identity, boardId, from) {
-    if (from == null) return null;
     try {
       const t = await target(identity, await mover(identity, boardId), from);
       return { space: { id: t.row.id, name: t.row.name, personal: t.row.kind === "personal" } };
@@ -97,12 +96,12 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
      */
     async options(identity, boardId) {
       const m = await mover(identity, boardId);
-      const [picked, from] = await Promise.all([spaces.boardPicker(identity), m.row.space ? openSpace(identity, m.unit, m.row.space) : null]);
+      const [picked, from] = await Promise.all([spaces.boardPicker(identity), openSpace(identity, m.unit, m.row.space)]);
       const cand = picked.spaces.filter(s => s.id !== m.row.space).slice(0, HOME.batch);
       // ONE batch read settles rule 4 for every candidate (its own context holds its Space's and Group's grants).
       const ctxs = cand.length ? await registry.accessContexts(cand.map(s => ({ type: "space", id: s.id })), { users: [identity.user] }) : new Map();
       const ok = cand.filter(s => { const c = ctxs.get("space\n" + s.id); return c && withinLadder(m.access.ladder, givenBy(c), m.admin); });
-      return { board: { id: m.row.id, title: m.row.title }, from: m.row.space ? from ?? { hidden: true } : null, destinations: ok.slice(0, LIMITS.destinations), more: picked.more || ok.length > LIMITS.destinations };
+      return { board: { id: m.row.id, title: m.row.title }, from: from ?? { hidden: true }, destinations: ok.slice(0, LIMITS.destinations), more: picked.more || ok.length > LIMITS.destinations };
     },
 
     /**
@@ -172,7 +171,7 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
       const manage = m.access.permissions.has("members.manage");
       const live = x => !x.revoked && (x.expiresAt == null || x.expiresAt > t);
       const [inv, lnk] = manage ? await Promise.all([registry.invites(m.row.id), registry.links(m.row.id)]) : [null, null];
-      const from = m.row.space ? await openSpace(identity, m.unit, m.row.space) ?? { hidden: true } : null;
+      const from = await openSpace(identity, m.unit, m.row.space) ?? { hidden: true };
       return {
         board: { id: m.row.id, title: m.row.title }, from, to: { id: dst.row.id, name: dst.row.name, personal: dst.row.kind === "personal" },
         gains, keeps, loses, invites: inv ? inv.filter(live).length : null, links: lnk ? lnk.filter(live).length : null, hidden, more,
@@ -180,16 +179,16 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
     },
 
     /**
-     * POST /boards/:board/move: the compare-and-set move (rules 1 to 4, then the Registry's atomic step). `from`: the Space the caller believes the board is in (null = unfiled).
-     * @param {import("./idp-port.js").Identity} identity @param {string} boardId @param {{ from?: string|null, to?: string }} body @param {import("./registry-port.js").Idem} [idem]
+     * POST /boards/:board/move: the compare-and-set move (rules 1 to 4, then the Registry's atomic step). `from`: the Space the caller believes the board is in (required: every board has one).
+     * @param {import("./idp-port.js").Identity} identity @param {string} boardId @param {{ from?: string, to?: string }} body @param {import("./registry-port.js").Idem} [idem]
      */
-    async move(identity, boardId, { from = null, to } = {}, idem) {
-      if (from !== null && !idOf(from)) throw bad("bad from");
+    async move(identity, boardId, { from, to } = {}, idem) {
+      if (!idOf(from)) throw bad("bad from");
       if (!idOf(to)) throw bad("bad to");
       if (from === to) throw bad("from and to are the same Space");
       const m = await mover(identity, boardId);
       const dst = await target(identity, m, to);
-      const cur = m.row.space ?? null;
+      const cur = m.row.space;
       if (cur !== to && cur !== from) throw new AdminError("moved", "the board is not in the Space you moved it from");   // stale `from`: the Registry would refuse too
       let out;
       try { out = await registry.moveBoard({ board: m.row.id, from, to: dst.row.id, idem }); }
@@ -202,7 +201,7 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
      * answer. The caller is re-checked only as far as no leak needs: they must still be able to OPEN the destination (not `move` on the source: the board is not there any more). A board
      * that is no longer in `to` answers `moved`.
      */
-    async replay(identity, boardId, { from = null, to } = {}, ref = "") {
+    async replay(identity, boardId, { from, to } = {}, ref = "") {
       const id = idOf(boardId), unit = await tenancy.tenantOf(identity);
       const row = unit && id ? await registry.board(id) : null;
       const dst = row && row.tenant === unit.id ? await openSpace(identity, unit, to) : null;

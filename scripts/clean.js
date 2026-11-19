@@ -99,8 +99,15 @@ export function openUnder(path, lsof = "lsof", timeout = 60_000) {
  */
 export function resolveNoOpen(p, stat = lstatSync, readlink = readlinkSync, cache = new Map(), readdir = readdirSync) {
   let cur = sep, links = 0;
-  const names = dir => { if (!cache.has(dir)) cache.set(dir, readdir(dir)); return cache.get(dir); };
+  const names = dir => { if (!cache.has(dir)) { let l; try { l = readdir(dir); } catch { l = []; } cache.set(dir, l); } return cache.get(dir); };   // enterable but unlistable: keep the given spelling
   const todo = (p.startsWith(sep) ? p : process.cwd() + sep + p).split(sep).filter(Boolean).reverse();
+  // macOS firmlink: /System/Volumes/Data/<x> is /<x> (what lsof prints). Drop the prefix only where both are provably the same directory.
+  if (todo.length > 3 && todo.at(-1) === "System" && todo.at(-2) === "Volumes" && todo.at(-3) === "Data") {
+    try {
+      const x = todo.at(-4), a = statSync(`/System/Volumes/Data/${x}`), b = statSync(`/${x}`);
+      if (a.dev === b.dev && a.ino === b.ino) todo.length -= 3;
+    } catch { /* not a firmlinked system: keep the spelling */ }
+  }
   while (todo.length) {
     let c = todo.pop();
     if (c === ".") continue;
@@ -226,7 +233,10 @@ const refuseBase = (p, what) => {
   // string compare of spellings can be trusted there.
   const key = q => { const st = statSync(q); return `${st.dev}:${st.ino}`; };
   const protectedKeys = new Set();
-  for (const start of [home, ROOT]) for (let d = start; ; d = dirname(d)) { protectedKeys.add(key(d)); if (d === sep) break; }
+  const add = q => { try { protectedKeys.add(key(q)); } catch { /* absent here (no firmlink off macOS) */ } };
+  const DATA = "/System/Volumes/Data";   // macOS firmlink: the same directories again, under their physical parent
+  add(DATA);
+  for (const start of [home, ROOT]) for (let d = start; ; d = dirname(d)) { add(d); if (d !== sep) add(DATA + d); if (d === sep) break; }
   if (protectedKeys.has(key(p)))
     throw new Error(`refusing to clean ${what} ${p}: it is /, $HOME, the repo or one of their parents (same directory by identity)`);
   return real;

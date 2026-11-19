@@ -118,9 +118,9 @@ test("a symlink to outside is skipped at the top level and never entered inside 
 });
 
 test("refuses a base that is / or $HOME (or a parent of the repo or home)", () => {
-  expect(() => clean({ tempDir: "/", rigRoot: null })).toThrow(/refusing/);
-  expect(() => clean({ tempDir: process.env.HOME, rigRoot: null })).toThrow(/refusing/);
-  expect(() => clean({ tempDir: tmpdir(), scratch: "/Users", rigRoot: null })).toThrow(/refusing/);
+  expect(() => clean({ tempDir: "/", rigRoot: null, openPathsFn: () => [] })).toThrow(/refusing/);
+  expect(() => clean({ tempDir: process.env.HOME, rigRoot: null, openPathsFn: () => [] })).toThrow(/refusing/);
+  expect(() => clean({ tempDir: tmpdir(), scratch: "/Users", rigRoot: null, openPathsFn: () => [] })).toThrow(/refusing/);
   expect(() => clean({ tempDir: join(sandbox, "missing"), rigRoot: null, openPathsFn: () => [] }).items).not.toThrow();
 });
 
@@ -601,8 +601,8 @@ test("ROOT is the real path of the checkout, also with a space in it or behind a
 });
 
 test("the rig dir is refused like the others when it resolves to / or $HOME", () => {
-  expect(() => clean({ tempDir: join(sandbox, "none"), rigRoot: "/" })).toThrow(/refusing/);
-  expect(() => clean({ tempDir: join(sandbox, "none"), rigRoot: process.env.HOME })).toThrow(/refusing/);
+  expect(() => clean({ tempDir: join(sandbox, "none"), rigRoot: "/", openPathsFn: () => [] })).toThrow(/refusing/);
+  expect(() => clean({ tempDir: join(sandbox, "none"), rigRoot: process.env.HOME, openPathsFn: () => [] })).toThrow(/refusing/);
 });
 
 test("--min-age under 10 minutes needs force", () => {
@@ -700,4 +700,20 @@ test("resolveNoOpen: a trailing slash on a non-directory is ENOTDIR", () => {
   expect(resolveNoOpen(f)).toBe(join(realpathSync(w.root), "plain"));
   expect(() => resolveNoOpen(f + "/")).toThrow(expect.objectContaining({ code: "ENOTDIR" }));
   expect(resolveNoOpen(w.root + "/")).toBe(realpathSync(w.root));
+});
+
+test("macOS firmlink: /System/Volumes/Data is refused as a base, and its spelling of a path resolves to lsof's", () => {
+  const data = "/System/Volumes/Data";
+  if (!existsSync(join(data, "Users"))) return;                    // not a firmlinked system
+  expect(() => clean({ tempDir: join(sandbox, "none"), scratch: data, rigRoot: null, maxTimeMs: 0, openPathsFn: () => [] })).toThrow(/refusing/);
+  expect(() => clean({ tempDir: join(sandbox, "none"), scratch: join(data, process.env.HOME), rigRoot: null, maxTimeMs: 0, openPathsFn: () => [] })).toThrow(/refusing/);
+  expect(resolveNoOpen(join(data, ROOT))).toBe(ROOT);
+});
+
+test("resolveNoOpen keeps the given spelling under a directory that can be entered but not listed", () => {
+  const w = world(), dir = join(w.root, "x-only");
+  mkdirSync(join(dir, "Sub"), { recursive: true });
+  chmodSync(dir, 0o111);
+  try { expect(resolveNoOpen(join(dir, "Sub"))).toBe(join(realpathSync(w.root), "x-only", "Sub")); }
+  finally { chmodSync(dir, 0o755); }
 });

@@ -236,10 +236,11 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     roles: db.query("SELECT * FROM reg_roles WHERE tenant = ? ORDER BY created_at, id"),
     roleCount: db.query("SELECT count(*) AS n FROM reg_roles WHERE tenant = ? AND id <> 'member'"),
     delRole: db.query("DELETE FROM reg_roles WHERE tenant = ? AND id = ?"),
-    roleHeld: db.query("SELECT 1 AS x FROM reg_scope_grants WHERE role = ? LIMIT 1"),
-    useAll: db.query("SELECT count(*) AS n FROM (SELECT 1 FROM reg_scope_grants WHERE role = ?1 LIMIT ?2)"),
-    useUsers: db.query("SELECT count(*) AS n FROM (SELECT 1 FROM reg_scope_grants WHERE role = ?1 AND subject_type = 'user' LIMIT ?2)"),
-    useTeams: db.query("SELECT DISTINCT subject FROM reg_scope_grants WHERE role = ?1 AND subject_type = 'team' ORDER BY subject LIMIT ?2"),
+    // The tenant's own grants only: a scoped grant has no tenant column, so its scope's row says whose it is (a shared id such as "member" must never count another Unit's).
+    roleHeld: db.query("SELECT 1 AS x FROM reg_scope_grants g WHERE g.role = ?1 AND CASE g.scope_type WHEN 'unit' THEN g.scope_id = ?3 WHEN 'group' THEN EXISTS (SELECT 1 FROM reg_groups x WHERE x.id = g.scope_id AND x.tenant = ?3) WHEN 'space' THEN EXISTS (SELECT 1 FROM reg_spaces x WHERE x.id = g.scope_id AND x.tenant = ?3) ELSE EXISTS (SELECT 1 FROM reg_boards x WHERE x.id = g.scope_id AND x.tenant = ?3) END LIMIT ?2"),
+    useAll: db.query("SELECT count(*) AS n FROM (SELECT 1 FROM reg_scope_grants g WHERE g.role = ?1 AND CASE g.scope_type WHEN 'unit' THEN g.scope_id = ?3 WHEN 'group' THEN EXISTS (SELECT 1 FROM reg_groups x WHERE x.id = g.scope_id AND x.tenant = ?3) WHEN 'space' THEN EXISTS (SELECT 1 FROM reg_spaces x WHERE x.id = g.scope_id AND x.tenant = ?3) ELSE EXISTS (SELECT 1 FROM reg_boards x WHERE x.id = g.scope_id AND x.tenant = ?3) END LIMIT ?2)"),
+    useUsers: db.query("SELECT count(*) AS n FROM (SELECT 1 FROM reg_scope_grants g WHERE g.role = ?1 AND g.subject_type = 'user' AND CASE g.scope_type WHEN 'unit' THEN g.scope_id = ?3 WHEN 'group' THEN EXISTS (SELECT 1 FROM reg_groups x WHERE x.id = g.scope_id AND x.tenant = ?3) WHEN 'space' THEN EXISTS (SELECT 1 FROM reg_spaces x WHERE x.id = g.scope_id AND x.tenant = ?3) ELSE EXISTS (SELECT 1 FROM reg_boards x WHERE x.id = g.scope_id AND x.tenant = ?3) END LIMIT ?2)"),
+    useTeams: db.query("SELECT DISTINCT g.subject FROM reg_scope_grants g WHERE g.role = ?1 AND g.subject_type = 'team' AND CASE g.scope_type WHEN 'unit' THEN g.scope_id = ?3 WHEN 'group' THEN EXISTS (SELECT 1 FROM reg_groups x WHERE x.id = g.scope_id AND x.tenant = ?3) WHEN 'space' THEN EXISTS (SELECT 1 FROM reg_spaces x WHERE x.id = g.scope_id AND x.tenant = ?3) ELSE EXISTS (SELECT 1 FROM reg_boards x WHERE x.id = g.scope_id AND x.tenant = ?3) END ORDER BY g.subject LIMIT ?2"),
     memberN: db.query("SELECT count(*) AS n FROM (SELECT 1 FROM reg_members WHERE tenant = ?1 LIMIT ?2)"),
     insRole: db.query("INSERT INTO reg_roles (tenant, id, name, base, board_role, permissions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"),
     upRole: db.query("UPDATE reg_roles SET name = ?, board_role = ?, permissions = ? WHERE tenant = ? AND id = ?"),
@@ -482,7 +483,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
   });
   const deleteRoleTx = db.transaction((tenant, id) => {
     needRow(q.role.get(tenant, id), "role");
-    if (q.roleHeld.get(id)) throw new SqlRegistryError("in-use", "a grant still holds this role");
+    if (q.roleHeld.get(id, 1, tenant)) throw new SqlRegistryError("in-use", "a grant still holds this role");
     q.delRole.run(tenant, id);
   });
   const updateRoleTx = db.transaction((tenant, id, patch, createdAt) => {
@@ -754,11 +755,12 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       if (!str(tenant) || !str(id)) throw new Error("registry: no such role");
       deleteRoleTx.immediate(tenant, id);
     },
-    async roleUsage(ids, { cap } = {}) {
+    async roleUsage(tenant, ids, { cap } = {}) {
       ready();
+      if (!str(tenant) || (ids ?? []).includes(MEMBER_ROLE_ID)) throw new Error("registry: bad role");
       const c = capOf(cap, ROLE_LIMITS.usageCap), out = new Map();
       for (const id of [...new Set((ids ?? []).filter(str))].slice(0, ROLE_LIMITS.custom + 1))
-        out.set(id, { places: q.useAll.get(id, c + 1).n, users: q.useUsers.get(id, c + 1).n, teams: q.useTeams.all(id, ROLE_LIMITS.teamIds).map(r => r.subject) });
+        out.set(id, { places: q.useAll.get(id, c + 1, tenant).n, users: q.useUsers.get(id, c + 1, tenant).n, teams: q.useTeams.all(id, ROLE_LIMITS.teamIds, tenant).map(r => r.subject) });
       return out;
     },
     async memberCount(tenant, { cap } = {}) { ready(); return str(tenant) ? q.memberN.get(tenant, capOf(cap, ROLE_LIMITS.memberCap) + 1).n : 0; },

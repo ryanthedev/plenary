@@ -50,6 +50,8 @@ export function memoryRegistry({ now = Date.now } = {}) {
     .filter(([k, role]) => role === "owner" && (k.startsWith("user\n") || (members.get(k.slice(5))?.size ?? 0) > 0)).map(([k]) => k);
   const need = (ok, what) => { if (!ok) throw new Error(`registry: no such ${what}`); };
   const sk = (a, b) => a + "\n" + b;
+  /** Is the scope key ("type\nid") one of this Unit's? A scoped grant carries no tenant: its scope says whose it is. */
+  const ownScope = (k, tenant) => { const i = k.indexOf("\n"); return scopeTenant(k.slice(0, i), k.slice(i + 1)) === tenant; };
   const putScoped = (type, id, st, sid, role) => {
     const k = sk(type, id);
     if (!scoped.has(k)) scoped.set(k, new Map());
@@ -325,14 +327,15 @@ export function memoryRegistry({ now = Date.now } = {}) {
     async deleteRole(tenant, id) {
       if (id === MEMBER_ROLE_ID) throw new Error("registry: bad role");
       need(roles.get(tenant)?.has(id), "role");
-      for (const g of scoped.values()) for (const role of g.values()) if (role === id) throw new RegistryError("in-use", "a grant still holds this role");
+      for (const [sc, g] of scoped) for (const role of g.values()) if (role === id && ownScope(sc, tenant)) throw new RegistryError("in-use", "a grant still holds this role");
       roles.get(tenant).delete(id);
     },
-    async roleUsage(ids, { cap } = {}) {
+    async roleUsage(tenant, ids, { cap } = {}) {
+      if (typeof tenant !== "string" || (ids ?? []).includes(MEMBER_ROLE_ID)) throw new Error("registry: bad role");
       const c = capOf(cap, ROLE_LIMITS.usageCap), want = new Map([...new Set(ids ?? [])].slice(0, ROLE_LIMITS.custom + 1).map(i => [i, { places: 0, users: 0, teams: [] }]));
-      for (const g of scoped.values()) for (const [k, role] of g) {
+      for (const [sc, g] of scoped) for (const [k, role] of g) {
         const u = want.get(role);
-        if (!u) continue;
+        if (!u || !ownScope(sc, tenant)) continue;
         if (u.places <= c) u.places++;
         if (k.startsWith("user\n")) { if (u.users <= c) u.users++; } else if (u.teams.length < ROLE_LIMITS.teamIds && !u.teams.includes(k.slice(5))) u.teams.push(k.slice(5));
       }

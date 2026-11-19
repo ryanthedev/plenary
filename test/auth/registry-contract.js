@@ -830,11 +830,11 @@ export function registryContract(name, makeRegistry, opts = {}) {
         await grant({ type: "space", id: sp.id }, { type: "user", id: "google:x" }, a.id);
         await grant({ type: "space", id: sp2.id }, { type: "team", id: team.id }, a.id);
         await grant({ type: "unit", id: t.id }, { type: "user", id: "google:y" }, a.id);
-        const use = await r.roleUsage([a.id, "r-none00000000"]);
+        const use = await r.roleUsage(t.id, [a.id, "r-none00000000"]);
         expect(use.get(a.id)).toEqual({ places: 3, users: 2, teams: [team.id] });
         expect(use.get("r-none00000000")).toEqual({ places: 0, users: 0, teams: [] });
-        expect((await r.roleUsage([a.id], { cap: 2 })).get(a.id)).toMatchObject({ places: 3, users: 2 });   // cap + 1: "more than 2"
-        expect((await r.roleUsage([a.id], { cap: 1 })).get(a.id)).toMatchObject({ places: 2, users: 2 });
+        expect((await r.roleUsage(t.id, [a.id], { cap: 2 })).get(a.id)).toMatchObject({ places: 3, users: 2 });   // cap + 1: "more than 2"
+        expect((await r.roleUsage(t.id, [a.id], { cap: 1 })).get(a.id)).toMatchObject({ places: 2, users: 2 });
         await expect(r.deleteRole(t.id, a.id)).rejects.toMatchObject({ code: "in-use" });
         expect(await r.role(t.id, a.id)).toMatchObject({ id: a.id });                 // nothing changed
         await grant({ type: "space", id: sp.id }, { type: "user", id: "google:x" }, null);
@@ -847,6 +847,27 @@ export function registryContract(name, makeRegistry, opts = {}) {
         await expect(r.deleteRole(t.id, a.id)).rejects.toThrow("no such role");
         await expect(r.deleteRole(t.id, "member")).rejects.toThrow("bad role");
         await r.createRole({ tenant: t.id, name: "C", boardRole: "viewer", max: 2 });  // a slot is free again
+      });
+
+      test("roles (#50): usage and delete count THIS Unit's grants only, never another Unit's grant of the same role string (two Units)", async () => {
+        const t = await unit(), u = await r.createTenant({ domain: "globex.com" });
+        const a = await r.createRole({ tenant: t.id, name: "A", boardRole: "viewer" });
+        const ts = await r.createSpace({ tenant: t.id, name: "TS" }), us = await r.createSpace({ tenant: u.id, name: "US" });
+        const ug = await r.createGroup({ tenant: u.id, name: "UG" }), ub = await r.createBoard({ tenant: u.id, space: us.id });
+        const uteam = await r.createTeam({ tenant: u.id, name: "UT" });
+        // Another Unit holds grants of the very same role string on every kind of scope (an adapter stores a role string as given).
+        await r.setScopedGrant({ scope: { type: "space", id: us.id }, subject: { type: "user", id: "google:o1" }, role: a.id });
+        await r.setScopedGrant({ scope: { type: "group", id: ug.id }, subject: { type: "team", id: uteam.id }, role: a.id });
+        await r.setScopedGrant({ scope: { type: "unit", id: u.id }, subject: { type: "user", id: "google:o2" }, role: a.id });
+        await r.setScopedGrant({ scope: { type: "board", id: ub.id }, subject: { type: "team", id: uteam.id }, role: a.id });
+        expect((await r.roleUsage(t.id, [a.id])).get(a.id)).toEqual({ places: 0, users: 0, teams: [] });
+        expect((await r.roleUsage(u.id, [a.id])).get(a.id)).toEqual({ places: 4, users: 2, teams: [uteam.id] });
+        await r.setScopedGrant({ scope: { type: "space", id: ts.id }, subject: { type: "user", id: "google:t1" }, role: a.id });
+        expect((await r.roleUsage(t.id, [a.id])).get(a.id)).toEqual({ places: 1, users: 1, teams: [] });
+        await r.setScopedGrant({ scope: { type: "space", id: ts.id }, subject: { type: "user", id: "google:t1" }, role: null });
+        await r.deleteRole(t.id, a.id);                                                     // the other Unit's grants do not block it
+        await expect(r.roleUsage(t.id, ["member"])).rejects.toThrow("bad role");
+        await expect(r.roleUsage(t.id, [a.id, "member"])).rejects.toThrow("bad role");
       });
 
       test("memberCount counts the directory to cap + 1, per Unit", async () => {

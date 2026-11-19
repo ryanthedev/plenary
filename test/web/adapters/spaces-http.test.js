@@ -4,8 +4,8 @@ import { httpSpaces, normalizeSpacePage, normalizeGroupPage } from "../../../web
 import { SPACES_ERRORS } from "../../../web/ports/spaces.js";
 
 const answer = (status, body) => async () => ({ status, text: async () => (typeof body === "string" ? body : JSON.stringify(body)) });
-const SPACE = { space: { id: "s-1", name: "Design", personal: false, general: "viewer", group: { id: "g-1", name: "Product" } }, can: { createBoard: true, rename: true, general: false },
-  boards: [{ id: "b-1", title: "Roadmap", role: "editor", path: [{ type: "space", id: "s-1", name: "Design" }], starred: false, can: { rename: true, move: false } }], more: false };
+const SPACE = { space: { id: "s-1", name: "Design", personal: false, general: "viewer", group: { id: "g-1", name: "Product" } }, can: { createBoard: true, rename: true, general: false, trash: false },
+  boards: [{ id: "b-1", title: "Roadmap", role: "editor", path: [{ type: "space", id: "s-1", name: "Design" }], starred: false, can: { rename: true, move: false, trash: false } }], more: false };
 const GROUP = { group: { id: "g-1", name: "Product", general: null }, can: { createSpace: true, rename: false, general: false }, spaces: [{ id: "s-1", name: "Design", general: "viewer" }], next: null };
 const api = (fetch, o = {}) => httpSpaces({ fetch, token: "tok", ...o });
 const seen = () => { const calls = []; return { calls, fetch: async (url, init) => { calls.push([url, init]); return answer(200, { board: { id: "b-9", title: "T" }, space: SPACE.space, group: GROUP.group, spaces: [], groups: [], root: true })(); } }; };
@@ -62,7 +62,7 @@ test("bad ids make no request; ids and strings are checked and capped", async ()
   const long = normalizeSpacePage({ ...SPACE, space: { ...SPACE.space, name: "x".repeat(500), group: { id: "bad id", name: "g" } } });
   expect(long.space.name.length).toBe(200);
   expect(long.space.group).toBe(null);
-  expect(normalizeSpacePage({ ...SPACE, can: undefined }).can).toEqual({ createBoard: false, rename: false, general: false });      // permissions default to no
+  expect(normalizeSpacePage({ ...SPACE, can: undefined }).can).toEqual({ createBoard: false, rename: false, general: false, trash: false });      // permissions default to no
   expect(normalizeGroupPage({ ...GROUP, next: "bad id" }).next).toBe(null);
   expect(normalizeGroupPage({ ...GROUP, spaces: [{ id: "x y", name: "n" }, GROUP.spaces[0]] }).spaces).toEqual(GROUP.spaces);
 });

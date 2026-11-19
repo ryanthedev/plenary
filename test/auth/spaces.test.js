@@ -168,14 +168,14 @@ describe("pages: Space and Group answer the same for hidden, unknown and other-U
     await r.createBoard({ tenant: acme.id, title: "Alpha", space: design.id });
     const p = await svc.spacePage(ada, design.id);
     expect(p.space).toEqual({ id: design.id, name: "Design", personal: false, general: "viewer", group: { id: product.id, name: "Product" } });
-    expect(p.can).toEqual({ createBoard: true, rename: true, general: true });
+    expect(p.can).toEqual({ createBoard: true, rename: true, general: true, trash: true });
     expect(p.boards.map(c => c.title)).toEqual(["Alpha", "Roadmap"]);
     expect(p.boards.every(c => c.can.rename)).toBe(true);
     expect(p.more).toBe(false);
     const v = await svc.spacePage(max, design.id);                    // Design has general viewer; Product has none: max opens Design but not Product
     expect(v.space.group).toBe(null);
-    expect(v.can).toEqual({ createBoard: false, rename: false, general: false });
-    expect(v.boards.find(c => c.id === b1.id).can).toEqual({ rename: false, move: false });
+    expect(v.can).toEqual({ createBoard: false, rename: false, general: false, trash: false });
+    expect(v.boards.find(c => c.id === b1.id).can).toEqual({ rename: false, move: false, trash: false });
   });
   test("byte-identical refusal for hidden, unknown, other-Unit and guest requests", async () => {
     const globex = await r.createTenant({ domain: "globex.com" });

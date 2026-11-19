@@ -13,7 +13,7 @@ const gen = v => (typeof v === "string" ? v.slice(0, 32) : null);
 
 const part = p => (p && typeof p === "object" && ["group", "space", "other", "shared"].includes(p.type) ? { type: p.type, ...(ID.test(p.id) ? { id: p.id } : {}), name: str(p.name) } : null);
 const card = c => (c && typeof c === "object" && ID.test(c.id)
-  ? { id: c.id, title: str(c.title), role: str(c.role, 32), path: list(c.path, 4, part), starred: c.starred === true, ...(c.can && typeof c.can === "object" ? { can: { rename: c.can.rename === true, move: c.can.move === true } } : {}) } : null);
+  ? { id: c.id, title: str(c.title), role: str(c.role, 32), path: list(c.path, 4, part), starred: c.starred === true, ...(c.can && typeof c.can === "object" ? { can: { rename: c.can.rename === true, move: c.can.move === true, trash: c.can.trash === true } } : {}) } : null);
 const grp = g => (g && typeof g === "object" && ID.test(g.id) ? { id: g.id, name: str(g.name) } : null);
 const info = s => (s && typeof s === "object" && ID.test(s.id) ? { id: s.id, name: str(s.name), personal: s.personal === true, general: gen(s.general), group: grp(s.group) } : null);
 
@@ -21,7 +21,7 @@ const info = s => (s && typeof s === "object" && ID.test(s.id) ? { id: s.id, nam
 export function normalizeSpacePage(b) {
   const space = info(b?.space);
   if (!space || !Array.isArray(b.boards)) return null;
-  return { space, can: { createBoard: b.can?.createBoard === true, rename: b.can?.rename === true, general: b.can?.general === true }, boards: list(b.boards, 50, card), more: b.more === true, ...(b.why && normalizeExplain(b.why) ? { why: normalizeExplain(b.why) } : {}) };
+  return { space, can: { createBoard: b.can?.createBoard === true, rename: b.can?.rename === true, general: b.can?.general === true, trash: b.can?.trash === true }, boards: list(b.boards, 50, card), more: b.more === true, ...(b.why && normalizeExplain(b.why) ? { why: normalizeExplain(b.why) } : {}) };
 }
 /** @param {object} b @returns {import("../../ports/spaces.js").GroupPage | null} */
 export function normalizeGroupPage(b) {

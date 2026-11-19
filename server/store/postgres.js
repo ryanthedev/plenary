@@ -76,10 +76,10 @@ export const STORE_TABLES = Object.freeze({
 const DENIED = "42501", LOCK_TIMEOUT = "55P03", IDLE_CUT = "25P03";
 /** What the Store's statements need on each table (L3: probed at start-up, so a misgrant fails at open). */
 const NEEDS = Object.freeze({
-  pl_entries: ["SELECT", "INSERT"],
+  pl_entries: ["SELECT", "INSERT", "DELETE"],   // DELETE: purgeBoard
   pl_checkpoints: ["SELECT", "INSERT", "DELETE"],
   pl_checkpoint_parts: ["SELECT", "INSERT", "DELETE"],
-  pl_leases: ["SELECT", "INSERT", "UPDATE"],   // UPDATE: the lease calls, and FOR SHARE in a fenced write
+  pl_leases: ["SELECT", "INSERT", "UPDATE", "DELETE"],   // UPDATE: the lease calls, and FOR SHARE in a fenced write; DELETE: purgeBoard
   pl_cluster: ["SELECT", "INSERT"],
 });
 /** The database's clock, ms since 1970. */
@@ -375,6 +375,12 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
       const r = rows[0], live = r.live === true;
       return { holder: r.holder, epoch: Number(r.epoch), expiresAt: r.expires_at === null ? null : Number(r.expires_at), live,
         remainingMs: live ? Number(r.expires_at) - Number(r.now) : 0 };
+    },
+
+    /** Deletes everything the store holds for one board, in one transaction (PROTOCOL.md § Trash and restore, "Purge"). Idempotent. */
+    async purgeBoard(tenant, board) {
+      ready(tenant, board);
+      await write(async tx => { for (const tb of [E, C, CP, L]) await tx.unsafe(`DELETE FROM ${tb} WHERE tenant = $1 AND board = $2`, [tenant, board]); });
     },
 
     /**

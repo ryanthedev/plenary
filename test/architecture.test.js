@@ -33,7 +33,7 @@ import { ROOT, listFiles, importsOf, checkBoundaries } from "./arch-scan.js";
 
 const SCAN = ["packages", "server", "scripts", "deploy"];   // every non-test code folder but web/ (client's)
 const CORE_DIRS = ["packages/protocol/", "packages/core/", "server/admin/"];
-const CORE_FILES = ["server/gateway.js", "server/room-host.js", "server/feed.js", "server/breather.js", "server/ids.js", "server/log.js", "server/blob-access.js"];
+const CORE_FILES = ["server/gateway.js", "server/room-host.js", "server/feed.js", "server/breather.js", "server/ids.js", "server/log.js", "server/blob-access.js", "server/trash-sweep.js"];
 const ADAPTER_DIRS = ["server/store/", "server/registry/", "server/bus/", "server/blobs/", "server/auth/", "server/compress/"];
 const SUPPORT_DIRS = ["server/pg/", "server/sqlite/", "server/encode/"];
 /** Driving adapters, each with its group: server.js serves HTTP/WebSocket (Bun.serve) and mounts static.js. */
@@ -67,6 +67,7 @@ const NOT_ADAPTERS = {
   "server/auth/roles.js": "core: the Roles screen's reads and writes (custom roles, the no-escalation rule, delete, the many-people confirmation) over the Registry port and tenancy (PROTOCOL.md § Roles)",
   "server/auth/spaces.js": "core: Space and Group pages, pickers, create and rename over the Registry port, tenancy and Home (PROTOCOL.md § Spaces and Groups)",
   "server/auth/move.js": "core: move a board between Spaces: options, the access diff, the compare-and-set move (PROTOCOL.md § Move board)",
+  "server/auth/trash.js": "core: trash and restore a board or Space, the Trash list and the board-URL notice over the Registry port and tenancy (PROTOCOL.md § Trash and restore)",
   "server/auth/home.js": "core: the Home screen's lists, tree and search over the Registry port and tenancy (PROTOCOL.md § Home)",
 };
 /** Non-port modules a driven adapter may import. */

@@ -597,5 +597,40 @@ export function storeContract(name, make) {
       expect(await code(store.release(T, B, "h-a", undefined))).toBe("bad-entry");
       expect(await store.lease(T, B)).toBe(null);                                   // nothing was written
     });
+
+    test("purgeBoard (PROTOCOL.md § Trash and restore): deletes the board's log, checkpoints and lease, leaves every other board and tenant alone, is idempotent, and fences a stale host", async () => {
+      const { store } = await fresh();
+      const other = "b-two", T2 = "t-bbb";
+      const epoch = await own(store);
+      await store.append(T, B, [entry(1), entry(2)], 0, epoch);
+      await store.putCheckpoint(T, B, { seq: 2, tenant: T, board: B, state: {} }, epoch);
+      const e2 = await own(store, T, other);
+      await store.append(T, other, [entry(1, { board: other })], 0, e2);
+      const e3 = await own(store, T2, B);
+      await store.append(T2, B, [entry(1, { tenant: T2 })], 0, e3);
+      await store.purgeBoard(T, B);
+      expect(await store.lastSeq(T, B)).toBe(0);
+      expect(await store.read(T, B)).toEqual([]);
+      expect(await store.getCheckpoint(T, B)).toBe(null);
+      expect(await store.lease(T, B)).toBe(null);
+      expect(await store.epoch(T, B)).toBe(0);
+      expect(await store.lastSeq(T, other)).toBe(1);                                // the neighbour board
+      expect(await store.lastSeq(T2, B)).toBe(1);                                   // the same board id in another tenant
+      await store.purgeBoard(T, B);                                                 // idempotent
+      await store.purgeBoard(T, "b-never-built");                                   // nothing there is not an error
+      expect(await code(store.append(T, B, [entry(3)], 2, epoch))).toBe("fenced"); // the stale host writes nothing
+      expect(await store.lastSeq(T, B)).toBe(0);
+      expect(await code(store.purgeBoard("a.b", B))).toBe("bad-id");
+    });
+
+    test("purgeBoard removes a checkpoint stored as parts, header and parts together", async () => {
+      const { store, raw } = await fresh({ partChars: 64 });
+      const epoch = await own(store);
+      await store.putCheckpoint(T, B, { seq: 1, tenant: T, board: B, state: { big: "x".repeat(600) } }, epoch);
+      if (raw) expect(await raw.partRows(T, B)).toBeGreaterThan(0);
+      await store.purgeBoard(T, B);
+      expect(await store.getCheckpoint(T, B)).toBe(null);
+      if (raw) expect(await raw.partRows(T, B)).toBe(0);
+    });
   });
 }

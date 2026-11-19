@@ -2,13 +2,13 @@
 // by its heading, focus moves in, Tab stays inside, Escape closes, focus returns to the opener on cancel); destinations are a radio group; choosing one loads the access diff,
 // whose three lists are headed, plain-text lists (no colour-only meaning) and are said once through the page's polite live region; Move stays off until that diff has loaded;
 // names and titles are other people's words (textContent only). After a move the dialog closes and focus goes to the toast's Undo button (the card that opened the dialog is
-// gone). The toast is not a live region itself (its sentence is announced once, through `announce`), never traps focus, lasts UNDO_MS, and gives focus back to the page when it
-// goes away while focus was inside it.
+// gone). The toast is ./toast.js's (shared with Move to Trash).
 
 import { h, replace } from "./dom.js";
 import { announce } from "./focus.js";
 import { openDialog } from "./dialogs.js";
-import { diffText, destinationText, createUndo, movedText, UNDO_MS } from "../../core/move.js";
+import { diffText, destinationText, createUndo, movedText } from "../../core/move.js";
+import { showUndoToast } from "./toast.js";
 
 let seq = 0;
 const NOTES = {
@@ -79,59 +79,10 @@ export function openMove({ host, model, opener = null, onMoved }) {
 }
 
 /**
- * The Undo toast. `result` is the move's answer; with no `undo` in it the toast is a plain notice. Returns `{ dismiss, el }`.
+ * The Undo toast. `result` is the move's answer; with no `undo` in it the toast is a plain notice. Returns `{ dismiss, el }`. (The toast itself is ./toast.js, shared with Move to Trash.)
  * @param {{ host: HTMLElement, move: import("../../ports/move.js").MovePort, board: string, result: import("../../ports/move.js").MoveResult, clock: import("../../ports/clock.js").Clock,
  *   newKey?: (() => string)|null, onChange?(): void, restoreFocus?(): void }} o
  */
 export function showMoveToast({ host, move, board, result, clock, newKey = null, onChange = () => {}, restoreFocus = () => {} }) {
-  const undo = createUndo({ move, board, result, newKey });
-  const text = h("span", {}, movedText(result.board.title, result.board.space.name));
-  const undoBtn = undo.available ? h("button.btn", { type: "button", "data-fk": "move-undo", onclick: () => run() }, "Undo") : null;
-  const close = h("button.btn.ghost", { type: "button", "aria-label": "Dismiss", onclick: () => dismiss() }, "Dismiss");
-  const el = h("div.move-toast", { role: "group", "aria-label": "Board moved",
-    onkeydown: e => {
-      if (e.key === "Escape") { e.preventDefault?.(); dismiss(); return; }
-      // Tab off either end of the toast leaves it (the toast is the last thing in the page, so the browser's own focus move has no element to name in `relatedTarget`): it goes, and focus goes on where Tab takes it.
-      const at = globalThis.document?.activeElement, first = undoBtn ?? close;
-      if (e.key === "Tab" && ((!e.shiftKey && at === close) || (e.shiftKey && at === first))) dismiss(false);
-    },
-    onfocusin: () => { inFocus = true; sync(); },
-    // Focus moving to something outside the toast dismisses it (the person has gone on); focus lost to nowhere (a click on the page, a window switch) only resumes the countdown.
-    onfocusout: e => { inFocus = false; if (e.relatedTarget && !el.contains?.(e.relatedTarget)) dismiss(false); else sync(); },
-    onmouseenter: () => { over = true; sync(); }, onmouseleave: () => { over = false; sync(); } }, text, " ", undoBtn, close);
-  host.append(el);
-  announce(text.textContent + (undoBtn ? " Undo is available for 10 seconds." : ""));
-  // The countdown pauses while focus is inside the toast or the pointer is over it (a person reading or aiming at Undo is never cut off), and resumes with what was left.
-  let timer = null, left = UNDO_MS, startedAt = 0, inFocus = false, over = false, gone = false, working = false;
-  const arm = () => { startedAt = clock.mono(); timer = clock.set(() => dismiss(), left); };
-  const hold = () => { if (timer !== null) { clock.clear(timer); timer = null; left = Math.max(0, left - (clock.mono() - startedAt)); } };
-  const sync = () => { if (gone) return; if (inFocus || over) hold(); else if (timer === null && !working) arm(); };
-  const schedule = ms => { hold(); left = ms; sync(); };
-  // The countdown holds whenever focus is inside the toast, whatever put it there (the page's own focus on Undo included: a person on Undo is never cut off). Focus moving out, Escape or
-  // Dismiss end it; a pointer user who never focuses it gets the 10 s.
-  (undoBtn ?? close).focus?.();
-  inFocus = !!el.contains?.(globalThis.document?.activeElement);
-  sync();
-  function dismiss(restore = true) {
-    if (gone) return;
-    gone = true; if (timer !== null) clock.clear(timer);
-    const had = !!el.contains?.(globalThis.document?.activeElement);
-    el.remove();
-    if (had && restore) restoreFocus();
-  }
-  async function run() {
-    if (working || gone) return;
-    working = true; hold();
-    undoBtn?.setAttribute("aria-disabled", "true");
-    const r = await undo.run();
-    working = false;
-    if (gone) return;
-    text.textContent = r.text; undoBtn?.remove(); announce(r.text);
-    schedule(r.ok ? 4000 : UNDO_MS);
-    if (r.ok) onChange();
-    close.focus?.();                                        // the page moves focus off the Undo it just removed
-    inFocus = !!el.contains?.(globalThis.document?.activeElement);
-    sync();
-  }
-  return { dismiss, el };
+  return showUndoToast({ host, text: movedText(result.board.title, result.board.space.name), label: "Board moved", undo: createUndo({ move, board, result, newKey }), clock, onChange, restoreFocus });
 }

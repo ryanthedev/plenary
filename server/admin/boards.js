@@ -19,7 +19,7 @@ import { withinLadder } from "../auth/permissions.js";
 
 export class AdminError extends Error {
   /**
-   * @param {"forbidden"|"bad-request"|"not-found"|"last-owner"|"unknown-person"|"bad-role"|"too-large"|"in-use"|"confirm-required"|"rate-limited"|"moved"} code
+   * @param {"forbidden"|"bad-request"|"not-found"|"last-owner"|"unknown-person"|"bad-role"|"too-large"|"in-use"|"confirm-required"|"rate-limited"|"moved"|"with-space"|"space-in-trash"|"purged"} code
    * @param {string} [message]
    * @param {{ cause?: unknown, data?: object }} [extra]  `data`: fields the HTTP answer adds (`in-use`, `confirm-required`)
    */
@@ -43,7 +43,7 @@ async function isTenantAdmin(registry, caller, tenantId) {
 async function managed(registry, caller, boardId) {
   if (!caller || typeof caller.user !== "string" || typeof boardId !== "string") throw forbidden();
   const b = await registry.board(boardId);
-  if (!b) throw forbidden();
+  if (!b || b.trashedAt != null) throw forbidden();   // a board in Trash has no management but Restore (PROTOCOL.md § Trash and restore)
   if ((await registry.grant(b.id, caller.user)) === "owner") return b;
   if (await isTenantAdmin(registry, caller, b.tenant)) return b;
   throw forbidden();

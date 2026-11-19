@@ -46,7 +46,7 @@ export const DEFAULT_READ_LIMIT = 1000;
 /** The longest lease (ms): a holder that dies with a longer one would block its board for that long. */
 export const MAX_LEASE_TTL_MS = 10 * 60_000;
 /** The method names of the Store port, in declaration order (test/server/adapter-surface.test.js checks every adapter has exactly these, plus the adapter-only ones). */
-export const STORE_METHODS = Object.freeze(["append", "read", "lastSeq", "putCheckpoint", "getCheckpoint", "openEpoch", "epoch", "acquire", "renew", "release", "lease", "close"]);
+export const STORE_METHODS = Object.freeze(["append", "read", "lastSeq", "putCheckpoint", "getCheckpoint", "openEpoch", "epoch", "acquire", "renew", "release", "lease", "purgeBoard", "close"]);
 
 /**
  * @typedef {{ epoch: number, expiresAt: number }} StoreLease  what acquire / renew grant; `expiresAt` is on the Store's clock
@@ -84,6 +84,7 @@ export const STORE_METHODS = Object.freeze(["append", "read", "lastSeq", "putChe
  *     // Extends to now + ttlMs, only as `holder` at `epoch` (even if it lapsed and nobody took it); else null. epoch required.
  *   release(tenant: string, board: string, holder: string, epoch: number): Promise<void>,   // as `holder` at `epoch` only, else a no-op; the epoch stays
  *   lease(tenant: string, board: string): Promise<null | LeaseRecord>,   // null = no room was ever built
+ *   purgeBoard(tenant: string, board: string): Promise<void>,   // PROTOCOL.md § Trash and restore, "Purge": deletes the board's entries, checkpoints, checkpoint parts and lease record in ONE transaction; idempotent (nothing there is not an error); a stale host's later write is "fenced" (no lease row). The caller (the trash sweeper) has already made the board unreachable
  *   close(): Promise<void>,   // idempotent; every later call rejects "closed"
  * }} Store
  */

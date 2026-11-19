@@ -5,7 +5,7 @@ public images. Publishing is a manual step that needs the owner's go (see [Relea
 
 | File | What |
 |---|---|
-| `Dockerfile` | Single-node image on `oven/bun:1.4.4-slim`, pinned by digest, one stage (a builder stage would save nothing: the install cache is already removed in its layer). Installs dependencies from `bun.lock` (`bun install --frozen-lockfile --production`) in their own layer, then copies the source. Runs `bun run server/main.js` as the fixed non-root user `1000:1000` (writable: `/data` only), exec-form `CMD` so bun is PID 1 and receives SIGTERM (clean stop, exit 0), OCI labels from build args `VERSION`, `REVISION`, `CREATED`, listens on 0.0.0.0:8080, data in `/data`, health check on `GET /health`. |
+| `Dockerfile` | Single-node image on `oven/bun:1.4.4-slim`, pinned by digest, one stage (a builder stage would save nothing: the install cache is already removed in its layer). Installs dependencies from `bun.lock` (`bun install --frozen-lockfile --production`) in their own layer, then copies the source. Runs `bun run server/main.js` as the fixed non-root user `1000:1000` (app code and `node_modules` are read-only and root-owned; `/data` is the data dir), exec-form `CMD` so bun is PID 1 and receives SIGTERM (clean stop, exit 0), OCI labels from build args `VERSION`, `REVISION`, `CREATED`, listens on 0.0.0.0:8080, data in `/data`, health check on `GET /health`. |
 | `compose.yml` | One `plenary` service with a named volume for SQLite and blobs, published on `127.0.0.1:8080` only, `restart: unless-stopped`. |
 | `cluster.compose.yml`, `cluster/` | Phase-4 cluster shape (never run on Docker): see [Cluster](#cluster-phase-4-not-run-on-docker-yet). |
 
@@ -19,9 +19,9 @@ curl -s http://127.0.0.1:8080/health                    # 200 + JSON
 
 Image name: `ghcr.io/ryanthedev/plenary`. **Nothing is published until the owner says so.** CI builds and smoke-tests
 the image (job `image`, `scripts/image-smoke.sh`) but never pushes and holds no registry credentials. Size: about
-217 MB, nearly all of it the Bun base image.
+217 MB by podman's measure (`image inspect .Size`, arm64), nearly all of it the Bun base image; docker's figure for the amd64 image is DOCKER_SIZE (the `image size:` line in the `image` job's log).
 
-**Tags:** semver `X.Y.Z` (also `X.Y`, `X`, `latest` for a stable release) and `sha-<7 chars of the git commit>`. Never move a semver tag.
+**Tags:** every release gets `X.Y.Z` and `sha-<7 chars of the git commit>`. Only a **stable** release (no `-rc.1` style suffix) also moves `X.Y`, `X` and `latest`; a pre-release never does. Never move an `X.Y.Z` tag.
 
 **Check before a release:** `main` is the commit to release, `bun test` and `bun run test:cluster` pass, CI is green.
 
@@ -32,19 +32,24 @@ REVISION="$(git rev-parse HEAD)"
 SHA="$(git rev-parse --short=7 HEAD)"
 IMAGE=ghcr.io/ryanthedev/plenary
 
-# 1. Build. Multi-arch (amd64 + arm64: the base image has both); docker buildx or podman.
-docker buildx build -f deploy/Dockerfile \
+# 1. Local check, single platform, nothing pushed (docker buildx; podman is not covered for releases):
+docker buildx build -f deploy/Dockerfile --load -t "$IMAGE:check" \
+  --build-arg VERSION="$VERSION" --build-arg REVISION="$REVISION" .
+IMAGE="$IMAGE:check" scripts/image-smoke.sh        # tests the existing image, keeps it; then: docker rmi "$IMAGE:check"
+
+# 2. Publish (MANUAL; needs the owner's go and a token with write:packages:
+#    `echo "$GHCR_TOKEN" | docker login ghcr.io -u ryanthedev --password-stdin`). This is the only publish path:
+#    one multi-arch build (amd64 + arm64, both in the base image) pushed straight to the registry.
+docker buildx build -f deploy/Dockerfile --push \
   --platform linux/amd64,linux/arm64 \
   --build-arg VERSION="$VERSION" --build-arg REVISION="$REVISION" \
   --build-arg CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  -t "$IMAGE:$VERSION" -t "$IMAGE:${VERSION%.*}" -t "$IMAGE:${VERSION%%.*}" -t "$IMAGE:sha-$SHA" -t "$IMAGE:latest" .
+  -t "$IMAGE:$VERSION" -t "$IMAGE:sha-$SHA" .
 
-# 2. Smoke-test the single-arch result first if you built locally:  scripts/image-smoke.sh plenary-release-check
+# 2b. STABLE RELEASES ONLY (skip for a pre-release such as 0.2.0-rc.1): move the floating tags to the same image.
+docker buildx imagetools create -t "$IMAGE:${VERSION%.*}" -t "$IMAGE:${VERSION%%.*}" -t "$IMAGE:latest" "$IMAGE:$VERSION"
 
-# 3. Publish (MANUAL; needs the owner's go and a token with write:packages: `echo "$GHCR_TOKEN" | docker login ghcr.io -u ryanthedev --password-stdin`).
-#    Re-run the build above with --push added, or push a local single-arch build:  docker push "$IMAGE:$VERSION"  (and each tag).
-
-# 4. Tag the commit and push the tag (also manual):
+# 3. Tag the commit and push the tag (also manual):
 git tag -a "v$VERSION" -m "Plenary $VERSION" && git push origin "v$VERSION"
 ```
 

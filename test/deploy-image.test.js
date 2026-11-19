@@ -29,6 +29,22 @@ test("runs as a fixed numeric non-root user, with a HEALTHCHECK and an exec-form
   expect(cmd[0]).toMatch(/^CMD \[".*"\]$/); // exec form: bun is PID 1 and gets SIGTERM itself
 });
 
+test("source is copied root-owned: no COPY --chown, only /data is chowned", () => {
+  expect(docker.filter((l) => /^COPY\s+--chown/i.test(l))).toEqual([]);
+  const chowns = docker.filter((l) => /\bchown\b/.test(l));
+  expect(chowns.length).toBe(1);
+  expect(chowns[0]).toMatch(/chown \S+ \/data$/);
+});
+
+test("HEALTHCHECK is exec form (no shell)", () => {
+  expect(instr("HEALTHCHECK")[0]).toMatch(/CMD \["bun", "-e", /);
+});
+
+test("cluster compose builds the image once", () => {
+  const builds = read("deploy/cluster.compose.yml").match(/^\s+build:/gm) ?? [];
+  expect(builds.length).toBe(1);
+});
+
 test("dependencies come from the frozen lockfile, production only", () => {
   expect(docker.join("\n")).toMatch(/bun install --frozen-lockfile --production/);
   expect(docker.some((l) => /^COPY\s+\.\s/.test(l))).toBe(false); // never `COPY . .`

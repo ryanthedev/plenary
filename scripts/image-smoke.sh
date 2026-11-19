@@ -1,20 +1,29 @@
 #!/usr/bin/env bash
-# Image smoke test: build deploy/Dockerfile, start the container, wait for health, assert it runs as non-root and
-# stops cleanly on SIGTERM. Works with docker or podman (CONTAINER_CLI=podman). Cleans up what it creates.
-# Usage: scripts/image-smoke.sh [tag]     (default tag plenary-smoke-$$)
+# Image smoke test: start a container, wait for health, assert it runs as non-root with read-only app code and stops
+# cleanly on SIGTERM. Works with docker or podman (CONTAINER_CLI=podman); removes the container it starts.
+# Usage:
+#   scripts/image-smoke.sh [tag]           build deploy/Dockerfile as <tag> (default plenary-smoke-$$), test it, remove
+#                                          the image. Refuses a tag that already exists.
+#   IMAGE=<ref> scripts/image-smoke.sh     test an existing image (no build); the image is kept.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-cli="${CONTAINER_CLI:-docker}"
-tag="${1:-plenary-smoke-$$}"
-name="$tag"
-cleanup() { "$cli" rm -f "$name" >/dev/null 2>&1 || true; "$cli" rmi -f "$tag" >/dev/null 2>&1 || true; }
+cli="${CONTAINER_CLI:-docker}"; cliname="$(basename "$cli")"
+name="plenary-smoke-$$-$RANDOM"   # always generated: the trap can only remove what this run created
+built=
+cleanup() { "$cli" rm -f "$name" >/dev/null 2>&1 || true; [ -z "$built" ] || "$cli" rmi -f "$tag" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
-fmt=(); [ "$cli" = podman ] && fmt=(--format docker)   # podman drops HEALTHCHECK in OCI format
-"$cli" build ${fmt[@]+"${fmt[@]}"} -f deploy/Dockerfile \
-  --build-arg VERSION=smoke --build-arg REVISION="$(git rev-parse HEAD 2>/dev/null || echo unknown)" \
-  -t "$tag" .
-echo "image size: $("$cli" image inspect "$tag" --format '{{.Size}}') bytes"
+revision="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+if [ -n "${IMAGE:-}" ]; then
+  tag="$IMAGE"; check_rev=
+else
+  tag="${1:-plenary-smoke-$$}"; check_rev=1
+  if "$cli" image inspect "$tag" >/dev/null 2>&1; then echo "image '$tag' already exists; refusing to overwrite and delete it" >&2; exit 1; fi
+  fmt=(); [ "$cliname" = podman ] && fmt=(--format docker)   # podman drops HEALTHCHECK in OCI format
+  built=1
+  "$cli" build ${fmt[@]+"${fmt[@]}"} -f deploy/Dockerfile --build-arg VERSION=smoke --build-arg REVISION="$revision" -t "$tag" .
+fi
+echo "image size: $("$cli" image inspect "$tag" --format '{{.Size}}') bytes ($cliname's measure)"
 
 # Port 0 on the host side: the runtime picks a free port.
 "$cli" run -d --name "$name" -p 127.0.0.1::8080 "$tag" >/dev/null
@@ -28,17 +37,31 @@ done
 [ -n "$ok" ] || { echo "no /health within 60 s" >&2; "$cli" logs "$name" >&2; exit 1; }
 echo "healthy on host port $port"
 
-# The image's own HEALTHCHECK command must exist and pass (run it now: the first scheduled run is 30 s away).
+# The image's own HEALTHCHECK must exist and report healthy.
 [ "$("$cli" inspect "$name" --format '{{len .Config.Healthcheck.Test}}')" -gt 0 ] || { echo "no HEALTHCHECK" >&2; exit 1; }
-if [ "$cli" = podman ]; then "$cli" healthcheck run "$name"; else "$cli" exec "$name" bun -e "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"; fi
+if [ "$cliname" = podman ]; then
+  "$cli" healthcheck run "$name"   # podman has no scheduler without systemd: run it once
+else
+  ok=; deadline=$((SECONDS + 90))  # first scheduled run is one interval (30 s) after start
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    [ "$("$cli" inspect "$name" --format '{{.State.Health.Status}}')" = healthy ] && { ok=1; break; }
+    sleep 2
+  done
+  [ -n "$ok" ] || { echo "health status never became healthy" >&2; "$cli" inspect "$name" --format '{{json .State.Health}}' >&2; exit 1; }
+fi
 echo "healthcheck passes"
+
 uid="$("$cli" exec "$name" id -u)"; gid="$("$cli" exec "$name" id -g)"
 [ "$uid" != 0 ] && [ "$gid" != 0 ] || { echo "container runs as root ($uid:$gid)" >&2; exit 1; }
 echo "runs as $uid:$gid"
-rev="$("$cli" inspect "$tag" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
-[ "$rev" = "$(git rev-parse HEAD 2>/dev/null || echo unknown)" ] || { echo "revision label is '$rev'" >&2; exit 1; }
+if [ -n "$check_rev" ]; then
+  rev="$("$cli" inspect "$tag" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+  [ "$rev" = "$revision" ] || { echo "revision label is '$rev'" >&2; exit 1; }
+fi
 "$cli" exec "$name" sh -c 'touch /data/.w && rm /data/.w' || { echo "/data not writable" >&2; exit 1; }
-if "$cli" exec "$name" sh -c 'touch /app/.w' 2>/dev/null; then echo "/app is writable" >&2; exit 1; fi
+for d in /app /app/server /app/web /app/packages /app/node_modules; do
+  if "$cli" exec "$name" sh -c "touch $d/.w" 2>/dev/null; then echo "$d is writable by uid $uid" >&2; exit 1; fi
+done
 
 # SIGTERM: the server must exit on its own well inside the 10 s stop grace, not be killed.
 start=$SECONDS

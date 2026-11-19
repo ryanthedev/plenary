@@ -9,9 +9,9 @@
 # PLENARY_ROLES (gateway/host split) and PLENARY_LEASE_TTL_MS, plus COOKIE_KEY, which cluster mode requires. Set
 # PLENARY_ROLES on every app node: an empty DATABASE_URL and NATS_URL (e.g. an unset interpolation) mean single node
 # (SQLite, in-memory bus), and the explicit roles make such a node refuse to start instead of running alone. NATS
-# stays without auth for now: the bus drops user:pass from NATS_URL (p4-wirev M1, engine's fix pending). S3_* are never
-# read: blobs stay on each node's local disk for M2 (engine, 2026-11-12), so the blobs services below are kept for
-# later and unused.
+# stays without auth for now: the bus drops user:pass from NATS_URL (p4-wirev M1, engine's fix pending). The nodes keep
+# blobs in the MinIO `blobs` service below through S3_ENDPOINT, S3_BUCKET, S3_REGION, S3_ACCESS_KEY_ID and
+# S3_SECRET_ACCESS_KEY (a cluster node with no S3_ENDPOINT refuses to start).
 #
 # Roles (PLENARY_ROLES, comma list of `gateway` and `host`, default `gateway,host`), the same split as the rig's default:
 #   app-1  gateway    app-2  gateway    app-3  host
@@ -35,9 +35,6 @@ name: plenary-cluster
 
 # Shared settings for the three app nodes.
 x-app: &app
-  build:
-    context: ..
-    dockerfile: deploy/Dockerfile
   # Same image name as compose.yml: one local build serves both stacks, and PLENARY_IMAGE selects a released image.
   image: ${PLENARY_IMAGE:-plenary:dev}
   # No published ports: the load balancer is the only way in.
@@ -50,6 +47,8 @@ x-app: &app
     retries: 3
     start_period: 10s
   depends_on:
+    image-build:
+      condition: service_completed_successfully
     postgres:
       condition: service_healthy
     nats:
@@ -89,8 +88,18 @@ x-app-env: &app-env
   S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
 
 services:
+  # The image is built once, by this build-only service; the app nodes only use the tag and wait for it to finish.
+  # `command` replaces the server so the container exits at once with 0.
+  image-build:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: ${PLENARY_IMAGE:-plenary:dev}
+    command: ["bun", "--version"]
+    restart: "no"
+
   postgres:
-    # 17 matches the commented block in compose.yml.
+    # 17 pinned to the patch release.
     image: postgres:17.11-alpine3.23
     environment:
       POSTGRES_USER: plenary

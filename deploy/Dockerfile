@@ -34,12 +34,14 @@ RUN BUN_INSTALL_CACHE_DIR=/tmp/bun-install-cache bun install --frozen-lockfile -
 # (.env, a local database, .git, a host node_modules) cannot reach the image this way. The root .dockerignore is
 # the second line of defence: it also filters inside these directories (for example server/.env or web/x.db).
 # A new top-level runtime directory must be added here.
-COPY --chown=bun:bun packages/ ./packages/
-COPY --chown=bun:bun server/ ./server/
+# No --chown on purpose: the files stay root-owned and read-only to uid 1000, so a compromised server process cannot
+# rewrite the code it runs (test/deploy-image.test.js rejects COPY --chown on these).
+COPY packages/ ./packages/
+COPY server/ ./server/
 # web/ is the browser client; the server serves it at / (deploy/README.md "What runs today").
-COPY --chown=bun:bun web/ ./web/
+COPY web/ ./web/
 
-# SQLite database and blobs live here; compose mounts a named volume on it.
+# SQLite database and blobs live here (the one directory uid 1000 owns); compose mounts a named volume on it.
 RUN mkdir -p /data && chown bun:bun /data
 # HOST=0.0.0.0: main.js listens on 127.0.0.1 unless HOST is set, and a container must listen on all interfaces
 # to be reachable through a published port. compose.yml still publishes only on the host's 127.0.0.1.
@@ -48,15 +50,15 @@ ENV PLENARY_DATA_DIR=/data \
     HOST=0.0.0.0
 
 # Fixed numeric uid:gid (the base image's `bun` user is 1000:1000), so Kubernetes `runAsNonRoot` can verify it
-# without resolving a name. /data is the only path this user can write.
+# without resolving a name. App code and node_modules are read-only to it; /data is the data dir and the only path it can write.
 USER 1000:1000
 
 EXPOSE 8080
 
-# GET /health returns 200 + JSON while the server is up. bun-slim has no curl, so this uses Bun's fetch.
+# GET /health returns 200 + JSON while the server is up. bun-slim has no curl, so this uses Bun's fetch, in exec form (no shell).
 # 127.0.0.1 works because HOST=0.0.0.0 includes loopback.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD bun -e "fetch('http://127.0.0.1:' + (process.env.PORT || 8080) + '/health').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
+  CMD ["bun", "-e", "fetch('http://127.0.0.1:' + (process.env.PORT || 8080) + '/health').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
 
 # main.js stops cleanly on SIGTERM (docker stop): server, bus, then store. Exec form, so bun is PID 1 and gets the
 # signal itself (no shell in between); a shell-form CMD would swallow it and docker stop would wait 10 s, then SIGKILL.

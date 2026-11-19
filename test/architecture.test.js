@@ -49,6 +49,7 @@ const COMPOSITION_ROOTS = [
   "scripts/admin-bootstrap.js",   // platform: tenant bootstrap CLI; its core part, server/admin/tenants.js, imports only ports
   "scripts/cluster-rig.js",       // platform (p8-rig): local cluster rig CLI; spawns processes, imports no project module
   "scripts/fold-bench.js",        // platform: reports how long a checkpoint holds the event loop (imports whatever checkout --root names)
+  "scripts/fanout-bench.js",      // platform: reports what a live frame costs a gateway for N viewers (imports whatever checkout --root names; #66)
   "scripts/clean.js",             // platform: safe cleanup CLI for test temp dirs, stopped rigs and scratch copies; shells out to lsof and the rig CLI
   "scripts/test-cluster.js",      // test harness: starts and tears down an isolated local services rig
   "scripts/test-cluster-files.js", // test harness data: the gated test files test-cluster.js runs, also imported by its guard

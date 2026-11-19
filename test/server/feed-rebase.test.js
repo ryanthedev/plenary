@@ -241,6 +241,19 @@ test("while backing off, a due tail (a host without cp) makes no look either", a
   } finally { await s.close(); }
 });
 
+test("a `released` message is a host leaving: it neither raises the feed's epoch nor counts as the room being alive (#65 N2)", async () => {
+  const s = await setup({ n: 3 });
+  try {
+    const heard = s.feed.lastHeard, epoch = s.feed.epoch;
+    await sleep(5);                                                        // `now` moves, so a refreshed lastHeard would differ
+    await s.beat({ epoch: epoch + 5, cp: 0, released: true });             // a failed build's release: an epoch of a room that never served
+    expect([s.feed.epoch, s.feed.lastHeard]).toEqual([epoch, heard]);
+    await s.beat({ epoch: epoch + 5, cp: 0 });                             // the same epoch in a live heartbeat does count
+    expect(s.feed.epoch).toBe(epoch + 5);
+    expect(s.feed.lastHeard).toBeGreaterThan(heard);
+  } finally { await s.close(); }
+});
+
 test("a host's `released` message carries cp: the feed stays on the cp rule and reads the stop checkpoint it names", async () => {
   const s = await setup({ n: 3, feedOpts: { rebaseEvery: 2 } });
   try {

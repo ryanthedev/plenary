@@ -28,11 +28,14 @@ export function askView({ api, type, id, why, newKey = null, reload = null, setT
   function paint() {
     if (timer != null) { clearTimer(timer); timer = null; }
     const sent = S.status === "sent", wait = S.status === "limited" || (S.retryAfterMs != null && S.retryAfterMs > 0 && !sent);
-    button.hidden = sent; select.parentNode.hidden = sent || why.ask.roles.length < 2;
+    select.parentNode.hidden = sent || why.ask.roles.length < 2;
     button.setAttribute("aria-disabled", S.status === "busy" || wait ? "true" : "false");
     status.textContent = sent
       ? `You asked for ${S.pending?.roleName ?? "access"}. The owners will see your request on the Access page; you will have it when one of them adds you.`
       : S.status === "busy" ? "Sending…" : S.message ?? (wait ? `You asked recently and the request was closed. You can ask again ${S.retryAfterMs ? waitText(S.retryAfterMs) : "later"}.` : "");
+    // Focus moves to the confirmation BEFORE the focused button is hidden: hiding it first would blur to nothing (a focusout that reads as tabbing out of a popover).
+    if (sent && globalThis.document?.activeElement === button) status.focus?.();
+    button.hidden = sent;
     if (sent) { button.setAttribute("aria-hidden", "true"); }
     // The wait was told to us: when it elapses the button works again without a reload (a 2^31 ms cap keeps setTimeout sane).
     else if (wait && S.retryAfterMs > 0) timer = setTimer(() => { timer = null; model.clearLimit(); }, Math.min(S.retryAfterMs, 2 ** 31 - 1));
@@ -77,6 +80,7 @@ export function pillPopover({ pill, explain, board, access = null, newKey = null
   const onOut = e => {
     const to = e.relatedTarget;
     if (!pop || (to && (pop.contains(to) || pill.contains(to)))) return;
+    if (e.target?.hidden || e.target?.isConnected === false) return;   // the popover itself hid or removed the focused control: not the user leaving
     if (to || document.hasFocus?.() !== false) close(false);
   };
   const onDown = e => { if (pop && !pop.contains(e.target) && !pill.contains(e.target)) close(false); };

@@ -1201,3 +1201,22 @@ test("#51 the non-modal pill popover closes when focus tabs out of it, but not w
   expect(pop()).toBeUndefined();
   expect(pill.getAttribute("aria-expanded")).toBe("false");
 });
+
+test("#51 a successful Ask from the pill keeps the popover open and puts focus on the confirmation (hiding the focused button is not tabbing out)", async () => {
+  const access = accessStub();
+  rig = setup({ token: "t-vi", access });
+  pillOf().click(); await settleP();
+  const pop = () => find(page.doc.body, e => /pill-pop/.test(e.className));
+  const ask = find(pop(), e => e.tagName === "BUTTON" && e.textContent === "Ask for access");
+  ask.focus();
+  expect(globalThis.document.activeElement).toBe(ask);
+  ask.fire("keydown", { key: "Enter" }); ask.click(); await settleP();
+  expect(pop()).toBeTruthy();
+  expect(pillOf().getAttribute("aria-expanded")).toBe("true");
+  const status = find(pop(), e => e.getAttribute("data-fk") === "ask-status");
+  expect(status.textContent).toContain("You asked for Editor");
+  expect(globalThis.document.activeElement).toBe(status);
+  expect(ask.hidden).toBe(true);
+  pop().fire("focusout", { relatedTarget: page.byId.topbar });     // a real Tab-out still closes it
+  expect(pop()).toBeUndefined();
+});

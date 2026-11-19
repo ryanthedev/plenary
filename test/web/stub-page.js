@@ -16,10 +16,20 @@ export class E extends N {
   constructor(tag) {
     super(1); this.tagName = tag.toUpperCase(); this.className = ""; this.listeners = {}; this.attrs = {}; this.dataset = {};
     this.style = { setProperty(k, v) { this[k] = v; }, getPropertyValue(k) { return this[k] ?? ""; } };
-    this.hidden = false; this.disabled = false; this.value = ""; this.scrollTop = 0; this.width = 300; this.height = 150;
+    this._hidden = false; this.disabled = false; this.value = ""; this.scrollTop = 0; this.width = 300; this.height = 150;
     const self = this;
     this.classList = { contains: c => self.className.split(/\s+/).includes(c), add: c => self.classList.toggle(c, true), remove: c => self.classList.toggle(c, false),
       toggle: (c, on) => { const s = new Set(self.className.split(/\s+/).filter(Boolean)); if (on ?? !s.has(c)) s.add(c); else s.delete(c); self.className = [...s].join(" "); } };
+  }
+  // Like a browser: hiding the focused element blurs it, and the focusout (relatedTarget null) bubbles up the tree.
+  get hidden() { return this._hidden; }
+  set hidden(v) {
+    this._hidden = !!v;
+    const d = globalThis.document;
+    if (v && d && d.activeElement === this) {
+      d.activeElement = d.body ?? null;
+      for (let n = this, ev = { target: this, relatedTarget: null }; n; n = n.parentNode) for (const fn of n.listeners?.focusout ?? []) fn({ ...ev, currentTarget: n });
+    }
   }
   setAttribute(k, v) { this.attrs[k] = String(v); }
   getAttribute(k) { return this.attrs[k] ?? null; }

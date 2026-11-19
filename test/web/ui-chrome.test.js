@@ -18,12 +18,12 @@ test("header ellipsis rules cover 1024, 1279, and 1280 pixel desktop widths", ()
   expect(css).toMatch(/\.watching\s*\{[^}]*min-width:\s*0[^}]*overflow:\s*hidden[^}]*text-overflow:\s*ellipsis[^}]*flex:\s*0 1 auto/s);
   expect(css).toMatch(/\.collab-pop\s*\{[^}]*overflow-y:\s*auto/s);
   expect(css).toMatch(/\.collab-pop > header, \.collab-pop > \.reply\s*\{[^}]*flex-shrink:\s*0/s);
-  expect(css).toMatch(/\.collab-pop \.body\s*\{[^}]*flex:\s*1 1 auto[^}]*min-height:\s*3\.5em[^}]*overflow:\s*auto/s);
-  expect(css).toMatch(/\.collab-pop \.body::after\s*\{[^}]*position:\s*sticky[^}]*linear-gradient/s);
+  expect(css).toMatch(/\.collab-pop \.body\s*\{[^}]*flex:\s*0 0 auto[^}]*min-height:\s*3\.5em[^}]*overflow:\s*visible/s);
+  expect(css).toMatch(/\.collab-pop\s*\{\s*background:[^}]*radial-gradient[^}]*rgba\(0,\s*0,\s*0[^}]*var\(--raised\)/s);
   expect(css).toMatch(/@media\s*\(max-width:\s*360px\)[\s\S]*?\.dock \.tb\s*\{[^}]*font-size:\s*0/s);
   expect(css).toMatch(/@media\s*\(max-width:\s*360px\)[\s\S]*?\.dock \.tb \.ic\s*\{[^}]*font-size:\s*18px/s);
   expect(css).not.toMatch(/font-size:\s*7\.5px|letter-spacing:\s*-\.03em/);
-  expect(css).toMatch(/\.dock \.tb\s*\{[^}]*font-size:\s*9px/s);
+  expect(css).toMatch(/\.dock \.tb\s*\{[^}]*font-size:\s*8\.75px/s);
   expect(css).toMatch(/@media\s*\(min-width:\s*600px\)\s*and\s*\(max-width:\s*1023px\)[\s\S]*?\.dock \.tb\s*\{[^}]*font-size:\s*10px/s);
 });
 

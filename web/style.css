@@ -261,7 +261,7 @@ body .phone-only { display: none !important; }
     border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); padding: 4px; justify-content: space-between; }
   .dock .tb { flex: 1 1 0; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; height: 44px; flex-direction: column; gap: 1px; font-size: 9px; }
   .dock .tb .ic { font-size: 18px; }
-  .dock .tb { font-size: 9px; padding: 0 1px; }
+  .dock .tb { font-size: 8.75px; padding: 0; }
   .dock .tb .k { display: none; }
   .hud-bl { bottom: 76px; left: 8px; }
   .hud-bc { display: none; }
@@ -297,8 +297,8 @@ body .phone-only { display: none !important; }
 
 .collab-pop { max-width: calc(100% - 16px); max-height: calc(100% - 16px); display: flex; flex-direction: column; overflow-y: auto; }
 .collab-pop > header, .collab-pop > .reply { flex-shrink: 0; }
-.collab-pop .body { flex: 1 1 auto; min-height: 3.5em; max-height: none; overflow: auto; }
-.collab-pop .body::after { content: ""; display: block; position: sticky; bottom: 0; height: 12px; margin-top: -12px; background: linear-gradient(transparent, var(--raised)); pointer-events: none; }
+.collab-pop .body { flex: 0 0 auto; min-height: 3.5em; max-height: none; overflow: visible; }
+.collab-pop { background: linear-gradient(var(--raised) 30%, transparent) 0 0 / 100% 24px no-repeat local, linear-gradient(transparent, var(--raised) 70%) 0 100% / 100% 24px no-repeat local, radial-gradient(farthest-side at 50% 100%, rgba(0,0,0,.3), transparent) 0 100% / 100% 10px no-repeat scroll, var(--raised); }
 
 svg text { font-family: var(--font); }
 [hidden] { display: none !important; }

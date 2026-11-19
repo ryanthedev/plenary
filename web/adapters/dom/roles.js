@@ -86,7 +86,7 @@ export function mountRolesPage({ root, model, hrefs, signIn = null }) {
         d?.isNew ? h("span.badge", {}, `Copy of ${S.page.roles.find(x => x.id === d.base)?.name ?? "a role"}`) : null,
         !d?.isNew && r?.kind === "custom" && r.base ? h("span.badge", {}, `Like ${S.page.roles.find(x => x.id === r.base)?.name ?? "another role"}`) : null),
       used ? h("p", {}, used) : null,
-      !editable ? h("p.muted", {}, "Built-in roles are read-only. Duplicate one to make your own.") : member ? h("p.muted", {}, "Everyone in the organization has this role. You can change its permissions, not its name or board access.") : null,
+      !editable ? h("p.muted", {}, r?.kind === "member" ? "Only a Unit admin can change what every member gets." : r?.kind === "custom" ? "This role gives more than you hold yourself, so you can't change it. Duplicate it to make your own." : "Built-in roles are read-only. Duplicate one to make your own.") : member ? h("p.muted", {}, "Everyone in the organization has this role. You can change its permissions, not its name or board access.") : null,
       h("div.pick-row", {}, h("label.l", {}, "Name", nameIn), h("label.l", {}, "Board access", ladderSel)),
       matrixView(model.rows(), editable),
       S.confirm ? h("div.banner", { role: "alert" }, h("p", {}, impactText(r ?? { kind: "custom" }, S.confirm.impact), " Saving changes what they can do within about a minute."),

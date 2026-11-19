@@ -272,3 +272,16 @@ test("a row says what the role is: one-line summary, where it applies, use; a sa
   expect(textOf(items("Roles")[3])).toContain("Annotator board access, plus 1 management permission");
   expect(textOf(root)).toContain("Like Owner");
 });
+
+test("a role the caller may not edit shows no checkboxes to tick or Save, and says why (the member role, a custom role above the caller)", async () => {
+  page.roles[2] = role("member", "Unit member", "member", { editable: false, permissions: ["board.create"], used: { members: 12, capped: false } });
+  page.roles[3] = role("r-fac", "Facilitator", "custom", { editable: false, ladder: "annotator", permissions: ["board.create"], used: { places: 4, capped: false } });
+  await mount();                                                     // the first custom role is selected, but there is no draft for a read-only one
+  expect(btn("Save role")).toBeUndefined();
+  expect(textOf(root)).toContain("This role gives more than you hold yourself, so you can't change it. Duplicate it to make your own.");
+  expect(all(e => e.tagName === "INPUT" && e.getAttribute("type") === "checkbox").every(b => b.getAttribute("aria-disabled") === "true")).toBe(true);
+  btn("Unit member").click(); await settle();
+  expect(btn("Save role")).toBeUndefined();
+  expect(textOf(root)).toContain("Only a Unit admin can change what every member gets.");
+  expect(btn("Duplicate")).toBeTruthy();
+});

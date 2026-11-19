@@ -54,16 +54,16 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
   const allMgmt = id => mgmtOf({ permissions: new Set(SCOPES.flatMap(t => [...(roleDef(id, t, new Map())?.permissions ?? [])])) });
 
   /** One role as the screen shows it. `used`: `{ places, capped }` (custom), `{ members, capped }` (member), or null (built-in). */
-  function view(role, roles, used = null) {
+  function view(role, roles, used = null, st = null) {
     if (ROLES.includes(role)) return { id: role, name: LADDER_NAMES[role], kind: "builtin", editable: false, summary: LADDER_SUMMARY[role], ladder: role, permissions: allMgmt(role), scopes: scopesOf(role, roles), used: null };
     if (role === "admin") return { id: "admin", name: "Unit admin", kind: "builtin", editable: false, summary: "Manages the Unit: every management permission", ladder: null, permissions: [...MGMT_PERMS], scopes: scopesOf("admin", roles), used: null };
     if (role === MEMBER_ROLE_ID) {
       const m = memberOf(roles);
-      return { id: MEMBER_ROLE_ID, name: "Unit member", kind: "member", editable: true, summary: "What everyone in the Unit gets", ladder: null, permissions: m.permissions.filter(p => MGMT_PERMS.includes(p)), scopes: scopesOf(MEMBER_ROLE_ID, roles), used };
+      return { id: MEMBER_ROLE_ID, name: "Unit member", kind: "member", editable: !!st && unitWide(st), summary: "What everyone in the Unit gets", ladder: null, permissions: m.permissions.filter(p => MGMT_PERMS.includes(p)), scopes: scopesOf(MEMBER_ROLE_ID, roles), used };
     }
     const c = roles.get(role);
     const mgmt = c.permissions.filter(p => MGMT_PERMS.includes(p)).length;
-    return { id: c.id, name: c.name, kind: "custom", editable: true, summary: `${LADDER_NAMES[c.boardRole] ?? "No"} board access${mgmt ? `, plus ${mgmt} management permission${mgmt === 1 ? "" : "s"}` : ""}`, ...(c.base ? { base: c.base } : {}), ladder: c.boardRole, permissions: c.permissions.filter(p => MGMT_PERMS.includes(p)), scopes: scopesOf(c.id, roles), used };
+    return { id: c.id, name: c.name, kind: "custom", editable: !!st && within(st, unitPerms(c.id, roles)), summary: `${LADDER_NAMES[c.boardRole] ?? "No"} board access${mgmt ? `, plus ${mgmt} management permission${mgmt === 1 ? "" : "s"}` : ""}`, ...(c.base ? { base: c.base } : {}), ladder: c.boardRole, permissions: c.permissions.filter(p => MGMT_PERMS.includes(p)), scopes: scopesOf(c.id, roles), used };
   }
   const placesUsed = u => ({ places: Math.min(u.places, ROLE_LIMITS.usageCap), capped: u.places > ROLE_LIMITS.usageCap });
   const membersUsed = n => ({ members: Math.min(n, ROLE_LIMITS.memberCap), capped: n > ROLE_LIMITS.memberCap });
@@ -113,10 +113,11 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
   }
 
   /** The view a write answers with. */
-  async function answer(unit, t, roles, impact = null) {
-    if (t.member) return view(MEMBER_ROLE_ID, roles, membersUsed(impact ? impact.people : await registry.memberCount(unit.id, { cap: ROLE_LIMITS.memberCap })));
+  async function answer(st, t, roles, impact = null) {
+    const { unit } = st;
+    if (t.member) return view(MEMBER_ROLE_ID, roles, membersUsed(impact ? impact.people : await registry.memberCount(unit.id, { cap: ROLE_LIMITS.memberCap })), st);
     const used = impact ? { places: impact.places, capped: impact.capped } : placesUsed((await registry.roleUsage(unit.id, [t.id])).get(t.id));
-    return view(t.id, roles, used);
+    return view(t.id, roles, used, st);
   }
 
   return {
@@ -129,7 +130,7 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
       const custom = list.filter(r => r.id !== MEMBER_ROLE_ID).sort((a, b) => (a.name.toLowerCase() < b.name.toLowerCase() ? -1 : a.name.toLowerCase() > b.name.toLowerCase() ? 1 : a.id < b.id ? -1 : 1));
       const usage = custom.length ? await registry.roleUsage(st.unit.id, custom.map(r => r.id), { cap: ROLE_LIMITS.usageCap }) : new Map();
       return {
-        roles: [...ROLES.map(r => view(r, roles)), view("admin", roles), view(MEMBER_ROLE_ID, roles, membersUsed(members)), ...custom.map(r => view(r.id, roles, placesUsed(usage.get(r.id) ?? { places: 0 })))],
+        roles: [...ROLES.map(r => view(r, roles)), view("admin", roles), view(MEMBER_ROLE_ID, roles, membersUsed(members), st), ...custom.map(r => view(r.id, roles, placesUsed(usage.get(r.id) ?? { places: 0 }), st))],
         matrix: matrix(st), can: { admin: st.admin }, limits: { custom: LIMITS.custom, many: LIMITS.many },
       };
     },
@@ -139,7 +140,7 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
       const st = await gate(identity), t = await target(st.unit, id);
       if (!t.row || t.member) throw missing();
       const u = (await registry.roleUsage(st.unit.id, [t.id])).get(t.id);
-      return view(t.id, t.roles, placesUsed(u));
+      return view(t.id, t.roles, placesUsed(u), st);
     },
 
     /** POST /roles: a new custom role. `base` = the id it was duplicated from (display only). @returns {Promise<object>} the RoleView */
@@ -159,7 +160,7 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
       let made;
       try { made = await registry.createRole({ tenant: st.unit.id, name, base, boardRole: cand.boardRole, permissions: cand.permissions, max: LIMITS.custom }); }
       catch (err) { if (err?.code === "limit") throw new AdminError("too-large", "the Unit has the most custom roles it can"); throw err; }
-      return view(made.id, storedMap([...roles.values(), made]), placesUsed({ places: 0 }));
+      return view(made.id, storedMap([...roles.values(), made]), placesUsed({ places: 0 }), st);
     },
 
     /**
@@ -184,7 +185,7 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
         impact = await impactOf(unit, t.id);
         if (isMany(impact) && b.confirm !== true) throw new AdminError("confirm-required", "this change reaches many people", { data: { impact } });
       }
-      if (!material && !rename) return answer(unit, t, t.roles);
+      if (!material && !rename) return answer(st, t, t.roles);
       let out;
       try { out = await registry.updateRole(unit.id, t.id, patch); }
       catch (err) {
@@ -192,7 +193,7 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
         throw err;
       }
       if (material && (t.member || impact.places > 0)) announce(unit, unitScope(unit), { revoke: ![...before].every(p => after.has(p)) });   // anything but a pure widening
-      return answer(unit, { ...t, row: out }, new Map([...t.roles, [out.id, out]]), impact);
+      return answer(st, { ...t, row: out }, new Map([...t.roles, [out.id, out]]), impact);
     },
 
     /** DELETE /roles/:id: a custom role nobody holds. 409 `in-use` (with a count) while any grant holds it. */

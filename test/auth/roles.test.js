@@ -200,6 +200,17 @@ describe("no escalation (non-admin editors)", () => {
     expect(await code(svc.create(lee, { name: "spaces", boardRole: "viewer", permissions: ["space.create"] }))).toBe("forbidden");
     expect((await svc.list(lee)).can.admin).toBe(false);
   });
+  test("the list says what THIS caller may edit: the member role only for a Unit admin; a custom role above the caller is read-only, one within their rights is editable", async () => {
+    const mgr = await r.createRole({ tenant: acme.id, name: "Mgr", boardRole: "editor", permissions: ["roles.manage", "board.create"] });
+    const low = await r.createRole({ tenant: acme.id, name: "Low", boardRole: "viewer", permissions: ["board.create"] });
+    const high = await r.createRole({ tenant: acme.id, name: "High", boardRole: "editor", permissions: ["roles.manage", "board.create", "delete"] });
+    await holdAtUnit(lee.user, mgr.id);
+    const l = await svc.list(lee), a = await svc.list(root);
+    expect([byId(l, "member").editable, byId(l, low.id).editable, byId(l, high.id).editable, byId(l, mgr.id).editable]).toEqual([false, true, false, true]);
+    expect([byId(a, "member").editable, byId(a, high.id).editable]).toEqual([true, true]);
+    expect(await code(svc.update(lee, high.id, { name: "x" }))).toBe("forbidden");         // what the list says is what the write does
+    expect((await svc.update(lee, low.id, { name: "Lower" })).editable).toBe(true);
+  });
   test("the Unit member role changes what EVERY member may do: a non-admin roles.manage holder (with a board step and the member permissions) is refused; a Unit admin edits it", async () => {
     const mgr = await r.createRole({ tenant: acme.id, name: "Mgr", boardRole: "editor", permissions: ["roles.manage", "space.create"] });
     await holdAtUnit(lee.user, mgr.id);

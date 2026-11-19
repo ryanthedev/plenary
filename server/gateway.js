@@ -703,9 +703,9 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     // socket before it; `welcoming` stops a second welcome being taken meanwhile.
     c.welcoming = true; c.answered = true; clearTimeout(c.timer);
     const b = c.b, since = c.since;
-    // A client that asked for deflate (`?z=deflate` on /ws) gets the catch-up texts compressed once and shared (§ Joining):
-    // they are made ready outside the feed's queue (a big snapshot's deflate must not hold up live entries), and if an entry
-    // landed meanwhile (the tail's last frame is a new text) the step is tried again, up to 3 times, then sent as it stands.
+    // A client that asked for deflate (`?z=deflate` on /ws) gets the catch-up texts compressed once and shared (§ Joining): they
+    // are made ready outside the feed's queue (a big snapshot's deflate must not hold up live entries). Entries landing
+    // meanwhile cannot make them stale: the open last chunk is sent as a compressed prefix plus a plain cut, so there is no retry.
     const send = () => {
       push(ws, typeof welcomeData === "function" ? welcomeData() : welcomeData);
       c.welcomed = true;
@@ -718,16 +718,11 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       else if (!b.hText) hereRefresh(b, now());
       push(ws, b.hText); c.hVer = b.hVer;
     };
-    const attempt = async tries => {
+    const attempt = async () => {
       if (c.z && c.state === "live") await b.feed.prepare(since);
-      const sent = await b.feed.atomically(() => {
-        if (c.state !== "live") return true;
-        if (c.z && tries < 3 && !b.feed.prepared(since)) return false;
-        send(); return true;
-      });
-      if (!sent) await attempt(tries + 1);
+      await b.feed.atomically(() => { if (c.state === "live") send(); });
     };
-    b.feed.reach(upTo).then(() => attempt(0)).catch(err => { log.error("catch-up failed", { conn: c.id, err }); if (c.state === "live") refuse(ws, "unavailable", "try again shortly", 1013, "unavailable"); });
+    b.feed.reach(upTo).then(attempt).catch(err => { log.error("catch-up failed", { conn: c.id, err }); if (c.state === "live") refuse(ws, "unavailable", "try again shortly", 1013, "unavailable"); });
   }
 
   // ---- `here` (PROTOCOL.md § Presence, `here`; § Bus `.here`): never logged, bounded per board ----

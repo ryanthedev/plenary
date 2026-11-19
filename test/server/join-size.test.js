@@ -7,7 +7,7 @@
 // 100 ops as 4,340 KB in 7 frames (five 1 MB `entries` chunks); 2,000 shapes + 2,000 moves as 873 KB (an 861 KB snapshot
 // and 12 KB of tail, because the 1,000-entry fold had just run: the tail can be up to ~1,000 entries longer).
 import { test, expect, afterAll } from "bun:test";
-import { buildBoard, measureJoin, rig, kb, zlibDeflate, shape } from "./join-measure.js";
+import { buildBoard, measureJoin, rig, kb, zlibDeflate, shape, variedShapes } from "./join-measure.js";
 import { cleanup, until } from "./helpers.js";
 import { roomState, tokenOf } from "./rig.js";
 import { Replica } from "../../packages/protocol/replica.js";
@@ -29,6 +29,7 @@ async function boardRig(o = {}) {
   });
   return { r, io };
 }
+const ENVELOPE = 1.3, RACE = 70_000;                                     // entries carry ~25% over their ops; RACE: one op's entries that raced the checkpoint
 const tailOf = j => j.kinds.filter(k => k.t === "entries").reduce((n, k) => n + k.bytes, 0);
 const snapshotOf = j => j.kinds.find(k => k.t === "snapshot")?.bytes ?? 0;
 const sameDoc = (replica, r) => expect(replica.state()).toEqual(roomState(r.room0));
@@ -50,10 +51,11 @@ for (const [label, build, seq] of BOARDS) test(`DW-43.1 DW-68.2: ${label}: the j
   report(label + " plain", plain); report(label + " compressed", z);
   if (process.env.JOIN_REPORT) console.log(`  store writes: ${io.checkpoints} checkpoints, ${kb(io.checkpointBytes)} against a ${kb(io.logBytes)} log (${(io.checkpointBytes / io.logBytes).toFixed(2)}x)`);
   // Snapshot + short tail: the room folded (checkpoint > 0), the join starts at it and the tail is at most the larger of
-  // CHECKPOINT_BYTES and a quarter of the state (op bytes; the entry text adds its envelope, so allow 1.5x) ...
+  // CHECKPOINT_BYTES and 1/(RATIO-1) of the snapshot (the fold needs tail >= state/RATIO, state = snapshot + tail; op bytes,
+  // and the entry text adds its envelope, about a quarter) ...
   expect(b.checkpoint).toBeGreaterThan(0);
   expect(plain.kinds.map(k => k.t)).toEqual(["welcome", "snapshot", ...plain.kinds.filter(k => k.t === "entries").map(() => "entries"), "here"]);
-  expect(tailOf(plain)).toBeLessThanOrEqual(1.5 * Math.max(CHECKPOINT_BYTES, snapshotOf(plain) / CHECKPOINT_STATE_RATIO) + 70_000);   // + one op's worth of entries that raced the checkpoint
+  expect(tailOf(plain)).toBeLessThanOrEqual(ENVELOPE * Math.max(CHECKPOINT_BYTES, snapshotOf(plain) / (CHECKPOINT_STATE_RATIO - 1)) + RACE);   // + one op's worth of entries that raced the checkpoint
   expect(plain.replica.applied).toBe(seq);
   // ... compressed: the same messages, in one binary frame per big text, a small fraction of the bytes.
   expect(z.msgs).toEqual(plain.msgs);
@@ -77,7 +79,7 @@ test("DW-68.1: a board of many small ops folds by bytes long before 1,000 entrie
   r.room0 = await r.room();
   const j = await measureJoin(r);
   expect(j.kinds.map(k => k.t)).toContain("snapshot");
-  expect(tailOf(j)).toBeLessThan(1.5 * CHECKPOINT_BYTES + 5_000);
+  expect(tailOf(j)).toBeLessThan(ENVELOPE * CHECKPOINT_BYTES + 5_000);
   sameDoc(j.replica, r);
   j.close(); await r.stop();
 }, 60_000);
@@ -127,8 +129,7 @@ test("a missing or damaged checkpoint falls back to the one before it, or to the
   expect(good.kinds.some(k => k.t === "snapshot")).toBe(true);
   good.close(); await feedGone(r);
   // Missing: the Store answers no checkpoint at all.
-  mode.cp = () => null;
-  await feedGone(r);                                                      // the next join builds a fresh feed, reading the Store again
+  mode.cp = () => null;                                                   // (the feed is gone, so the next join builds a fresh one, reading the Store again)
   const missing = await measureJoin(r, { name: "missing" });
   sameDoc(missing.replica, r);
   expect(missing.kinds.filter(k => k.t === "entries").length).toBeGreaterThan(0);
@@ -143,25 +144,42 @@ test("a missing or damaged checkpoint falls back to the one before it, or to the
   await r.stop();
 }, 60_000);
 
-test("DW-43.2: an entry that lands while a join's catch-up is being compressed: the join is compressed anyway (the new last frame is compressed too) and still converges", async () => {
+test("DW-43.F1: an entry lands during EVERY deflate: the big frame still goes compressed (prefix + plain cut), deflates stay bounded, the join converges", async () => {
   const real = zlibDeflate();
-  let hook = null, calls = 0;
-  const { r } = await boardRig({ deflate: async d => { calls++; if (hook) { const h = hook; hook = null; await h(); } return real(d); } });
+  let landing = false, calls = 0, op;
+  const { r } = await boardRig({ deflate: async d => { calls++; if (landing) await op([shape(1000 + calls)]); return real(d); } });
   const w = await r.sock();
   w.send({ t: "hello", v: 1, token: tokenOf("editor"), board: r.ids.board, since: 0, client: "live" });
   await w.next(m => m.t === "welcome");
   let n = 0;
-  const op = els => { w.send({ t: "op", id: `live:${++n}`, sentAt: 0, stream: "board", op: { elements: els } }); return until(() => w.msgs.filter(m => m.t === "ack").length === n, "ack", 30_000); };
+  op = els => { w.send({ t: "op", id: `live:${++n}`, sentAt: 0, stream: "board", op: { elements: els } }); return until(() => w.msgs.filter(m => m.t === "ack").length === n, "ack", 30_000); };
   for (let i = 0; i < 300; i += 50) await op(Array.from({ length: 50 }, (_, k) => shape(i + k)));
-  hook = () => op([shape(1000)]);                                         // lands in the middle of the first deflate
-  const j = await measureJoin(r, { z: true, name: "mid" });
-  expect(calls).toBeGreaterThanOrEqual(2);                                // the tail's last frame was a new text: compressed again
-  expect(j.kinds.filter(k => k.binary).length).toBe(j.kinds.filter(k => k.t === "entries" || k.t === "snapshot").length);   // none fell back to plain
+  landing = true;
+  const joins = [];
+  for (let i = 0; i < 4; i++) joins.push(await measureJoin(r, { z: true, name: "mid" + i }));
+  const j = joins[0];
+  expect(calls).toBe(1);                                                  // one deflate for the open chunk, however many joins and landed ops
+  expect(j.kinds.filter(k => k.t === "entries").map(k => k.binary)).toEqual([true, false]);   // the chunk as of the deflate, then a small plain cut
+  expect(j.kinds.find(k => k.binary).bytes).toBeGreaterThan(j.kinds.find(k => k.t === "entries" && !k.binary).bytes);
   r.room0 = await r.room();
-  await until(() => j.replica.applied === r.room0.resolved, "the live entry to reach the joiner", 10_000);   // and the entry that landed arrived once, after the catch-up
-  sameDoc(j.replica, r);
-  j.close(); await w.close(); await r.stop();
+  for (const x of joins) { await until(() => x.replica.applied === r.room0.resolved, "the landed entries to reach the joiner", 10_000); sameDoc(x.replica, r); x.close(); }
+  await w.close(); await r.stop();
 }, 60_000);
+
+for (const [freehand, min, max] of [[0, 5, 12], [0.3, 2.5, 6]]) test(`a varied board (random floats, colours, words, arrows, ${freehand * 100}% freehand): the join table the doc quotes, and a real compression ratio`, async () => {
+  const { r } = await boardRig();
+  await buildBoard(r, { shapes: 2000, make: n => variedShapes({ n, freehand }) });
+  r.room0 = await r.room();
+  const plain = await measureJoin(r, { name: "vplain" }), z = await measureJoin(r, { z: true, name: "vz" });
+  const label = `varied 2,000 elements (${freehand * 100}% freehand)`;
+  report(label + " plain", plain); report(label + " compressed", z);
+  if (process.env.JOIN_REPORT) console.log(`  ratio ${(plain.bytes / z.bytes).toFixed(1)}x`);
+  expect(z.msgs).toEqual(plain.msgs);
+  expect(plain.bytes / z.bytes).toBeGreaterThan(min);                      // measured 7.0x and 3.7x: freehand coordinates barely compress
+  expect(plain.bytes / z.bytes).toBeLessThan(max);                         // and not the 30x of identical shapes
+  sameDoc(z.replica, r);
+  plain.close(); z.close(); await r.stop();
+}, 120_000);
 
 test("a join that asks for deflate on a cold gateway (its feed not yet started) still gets compressed frames", async () => {
   const { r } = await boardRig();

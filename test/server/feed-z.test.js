@@ -77,26 +77,82 @@ test("zlibDeflate: small or dense input is not worth compressing (null); text is
   expect(z.byteLength).toBeLessThan(t.length / 5);
 });
 
-test("prepared(): false until every shared text a join would send is settled; an entry landing makes the last frame new, and prepare() settles it again", async () => {
+// F1 (review): on a busy board a new entry lands during every deflate of the open last chunk. The compressed form is a prefix of
+// that chunk (entries up to the seq the deflate started at) plus a small plain cut of the entries after it, so it is never stale.
+async function busy({ n = 40, deflate: wrap, zSlack }) {
   const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
-  const { epoch } = await raw.acquire(T, B, "h-z2", 60_000);
-  await raw.append(T, B, Array.from({ length: 40 }, (_, k) => entry(k + 1)), 0, epoch);
-  let release; const gate = new Promise(r => { release = r; });
-  const real = zlibDeflate(), feed = boardFeed({ tenant: T, board: B, store: raw, bus, onLive() {}, deflate: async d => { await gate; return real(d); } });
-  expect(feed.prepared(0)).toBe(true);                                      // nothing to send yet (cold: base empty, no tail)
-  const cold = feed.prepare(0);                                             // before ready: waits for the feed's start, then compresses
-  release(); await cold;
-  expect(feed.seq).toBe(40);
-  expect(feed.prepared(0)).toBe(true);
-  expect(feed.catchUp(0, true).every(f => f.z)).toBe(true);
-  await raw.append(T, B, [entry(41)], 40, epoch);
-  await bus.publish(subjects.entries(T, B), { from: 41, to: 41, items: [JSON.stringify(entry(41))] });
-  await bus.flush(); await feed.atomically(() => {});
-  expect(feed.seq).toBe(41);
-  expect(feed.prepared(0)).toBe(false);                                     // the open last frame is a new text
-  expect(feed.catchUp(0, true).some(f => !f.z)).toBe(true);                 // sent plain rather than wrong
+  const { epoch } = await raw.acquire(T, B, "h-zb", 60_000);
+  await raw.append(T, B, Array.from({ length: n }, (_, k) => entry(k + 1)), 0, epoch);
+  let seq = n, calls = 0, landing = true;
+  const real = zlibDeflate(), land = async () => {
+    const e = entry(++seq);
+    await raw.append(T, B, [e], seq - 1, epoch);
+    await bus.publish(subjects.entries(T, B), { from: seq, to: seq, items: [JSON.stringify(e)] });
+    await bus.flush();
+  };
+  const feed = boardFeed({ tenant: T, board: B, store: raw, bus, onLive() {}, ...(zSlack ? { zSlack } : {}),
+    deflate: async d => { calls++; if (landing) await land(); return real(d); } });
+  await feed.ready;
+  return { feed, land, calls: () => calls, stop: () => { landing = false; }, close: async () => { feed.close(); await raw.close(); await bus.close(); } };
+}
+const seqs = frames => frames.flatMap(f => JSON.parse(text(f)).entries.map(e => e.seq));
+
+test("DW-43.F1: an entry landing during every deflate never makes the big frame plain: compressed prefix + plain cut, one deflate", async () => {
+  const s = await busy({});
+  await s.feed.prepare(0);
+  await s.feed.atomically(() => {});
+  const startSeq = s.feed.seq;
+  expect(startSeq).toBeGreaterThan(40);                                     // the op landed during the deflate
+  const frames = s.feed.catchUp(0, true);
+  expect(frames[0].z).toBe(true);                                           // the big frame went compressed
+  expect(frames.slice(1).every(f => !f.z && f.shared === false)).toBe(true); // only the small cut after it is plain
+  expect(frames.length).toBe(2);
+  expect(frames[1].bytes).toBeLessThan(frames[0].bytes);
+  expect(seqs(frames)).toEqual(Array.from({ length: startSeq }, (_, k) => k + 1));   // contiguous, in order, up to the feed's seq
+  expect(s.calls()).toBe(1);                                                // no retry loop
+  // many more joins while entries keep landing (each join's deflate would land one, if it deflated): bounded work
+  s.stop();
+  for (let i = 0; i < 20; i++) { await s.feed.prepare(0); expect(seqs(s.feed.catchUp(0, true))).toEqual(Array.from({ length: s.feed.seq }, (_, k) => k + 1)); }
+  expect(s.calls()).toBe(1);
+  await s.close();
+});
+
+test("F1: the open chunk's prefix is made again only after zSlack bytes of new entries, and the join stays contiguous", async () => {
+  const s = await busy({ zSlack: 2048 });
+  await s.feed.prepare(0); await s.feed.atomically(() => {});
+  expect(s.calls()).toBe(1);
+  await s.feed.prepare(0);                                                  // 1 entry (~0.4 KB) since: under the slack
+  expect(s.calls()).toBe(1);
+  s.stop();
+  for (let i = 0; i < 8; i++) await s.land();                               // ~3 KB of entries: over the slack
+  await s.feed.atomically(() => {});
+  await s.feed.prepare(0);
+  expect(s.calls()).toBe(2);                                                // made again, once
+  expect(seqs(s.feed.catchUp(0, true))).toEqual(Array.from({ length: s.feed.seq }, (_, k) => k + 1));
+  await s.close();
+});
+
+test("F1: a chunk that closes after its prefix was compressed still goes as prefix + plain cut, never as a whole plain chunk", async () => {
+  const raw = sqliteStore({ path: join(tempDir(), "plenary.db") }), bus = memoryBus();
+  const { epoch } = await raw.acquire(T, B, "h-zc", 60_000);
+  await raw.append(T, B, Array.from({ length: 20 }, (_, k) => entry(k + 1)), 0, epoch);
+  const real = zlibDeflate();
+  const feed = boardFeed({ tenant: T, board: B, store: raw, bus, onLive() {}, deflate: real, chunkBytes: 12 * 1024 });
+  await feed.ready;
+  await feed.prepare(0);                                                    // chunk still open: prefix to seq 20
+  const add = async (from, to) => {
+    const items = Array.from({ length: to - from + 1 }, (_, k) => entry(from + k));
+    await raw.append(T, B, items, from - 1, epoch);
+    await bus.publish(subjects.entries(T, B), { from, to, items: items.map(x => JSON.stringify(x)) });
+    await bus.flush(); await feed.atomically(() => {});
+  };
+  await add(21, 60);                                                        // the first chunk closes; later ones open
+  const frames = feed.catchUp(0, true);
+  expect(frames.length).toBeGreaterThan(2);
+  expect(frames[0].z).toBe(true);                                           // the closed chunk: its compressed prefix
+  expect(seqs(frames)).toEqual(Array.from({ length: 60 }, (_, k) => k + 1));
   await feed.prepare(0);
-  expect(feed.prepared(0)).toBe(true);
-  expect(feed.catchUp(0, true).every(f => f.z)).toBe(true);
+  expect(feed.catchUp(0, true).filter(f => f.z).length).toBeGreaterThanOrEqual(2);
+  expect(seqs(feed.catchUp(0, true))).toEqual(Array.from({ length: 60 }, (_, k) => k + 1));
   feed.close(); await raw.close(); await bus.close();
 });

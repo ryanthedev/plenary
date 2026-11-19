@@ -96,3 +96,45 @@ test("browserInflate, where the runtime has DecompressionStream, inflates a zlib
   expect(new TextDecoder().decode(await inflate(new Uint8Array(deflateSync(Buffer.from(text)))))).toBe(text);
   expect(jsonCodec.decode(text).seq).toBe(1);
 });
+
+test("F2: a throw from the core's onMessage on an inflated frame escapes like the text path's: no drop, no reconnect, the chain lives on", async () => {
+  const w = world(), got = []; let drops = 0;
+  const t = wsTransport({ url: URL_, WebSocket: w.FakeWS, inflate: nodeInflate });
+  t.onMessage(m => { if (m.t === "snapshot") throw new Error("core bug"); got.push(m.t); });
+  t.onDrop(() => { drops++; });
+  const s = await w.open();
+  const rethrows = [], realQM = globalThis.queueMicrotask;   // the transport rethrows through queueMicrotask: capture it, then run it
+  globalThis.queueMicrotask = f => { rethrows.push(f); };
+  try {
+    s.deliver(z({ t: "snapshot", seq: 1 }));
+    s.deliver(z({ t: "entries", entries: [] }));
+    for (let i = 0; i < 20 && got.length < 1; i++) await tick();
+    await tick();
+  } finally { globalThis.queueMicrotask = realQM; }
+  const escaped = rethrows.map(f => { try { f(); return null; } catch (e) { return e.message; } }).filter(Boolean);
+  expect(escaped).toEqual(["core bug"]);                                   // surfaced, as the text path's throw is
+  expect(drops).toBe(0);                                                   // not a reconnect
+  expect(w.sockets.length).toBe(1);
+  expect(got).toEqual(["entries"]);                                        // and the next frame still arrives
+});
+
+test("a reconnect while the old socket's binary frame is still inflating: nothing from the old socket reaches the new connection", async () => {
+  const w = world(), got = [];
+  let release;
+  const gate = new Promise(r => { release = r; });
+  const t = wsTransport({ url: URL_, WebSocket: w.FakeWS, inflate: async b => { await gate; return nodeInflate(b); } });
+  t.onMessage(m => got.push(m));
+  const old = await w.open();
+  old.deliver(z({ t: "snapshot", seq: 9, streams: {} }));                  // inflating (gated)
+  old.deliver(JSON.stringify({ t: "entries", entries: [{ seq: 10 }] }));   // queued behind it
+  t.reopen();
+  const fresh = await w.open();
+  expect(fresh).not.toBe(old);
+  fresh.deliver(JSON.stringify({ t: "welcome", seq: 0 }));                 // the new connection has nothing behind it: synchronous
+  release();
+  for (let i = 0; i < 20; i++) await tick();
+  expect(got.map(m => m.t)).toEqual(["welcome"]);
+  fresh.deliver(z({ t: "snapshot", seq: 0, streams: {} }));
+  for (let i = 0; i < 20 && got.length < 2; i++) await tick();
+  expect(got.map(m => m.t)).toEqual(["welcome", "snapshot"]);
+});

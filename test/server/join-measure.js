@@ -12,6 +12,34 @@ export const shape = (i, version = 1) => makeElement("rectangle", {
   id: "s" + i, x: (i % 100) * 24, y: Math.floor(i / 100) * 24, width: 20, height: 20, seed: 1000 + i, versionNonce: 7000 + version * 31 + i, version, updated: 1_700_000_000_000,
 });
 
+/**
+ * A deterministic board of mixed, "real" content: random 2-decimal floats and ids, colours, words, arrows with bend points, and (when
+ * `freehand` > 0) that share of freehand strokes with 40 to 160 jittery points and pressures. Compresses far less than `shape`
+ * (repeated field names compress well; coordinates, ids, seeds and strokes do not): this is the figure PROTOCOL.md § Joining quotes.
+ */
+export function variedShapes({ n, freehand = 0.3, seed = 7 }) {
+  let a = seed >>> 0;
+  const rnd = () => { a = (a + 0x6d2b79f5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  const pick = xs => xs[Math.floor(rnd() * xs.length)];
+  const f = (lo, hi) => Math.round((lo + rnd() * (hi - lo)) * 100) / 100, id = () => Array.from({ length: 21 }, () => "abcdefghijklmnopqrstuvwxyz0123456789"[Math.floor(rnd() * 36)]).join("");
+  const colours = ["#1e1e1e", "#e03131", "#2f9e44", "#1971c2", "#f08c00", "#6741d9", "#0c8599", "#c2255c", "transparent", "#ffc9c9", "#b2f2bb", "#a5d8ff"];
+  const words = "design review roadmap latency shard gateway tenant checkpoint replica quorum budget launch owner risk spike backlog".split(" ");
+  const common = () => ({ id: id(), x: f(-4000, 4000), y: f(-4000, 4000), width: f(20, 400), height: f(20, 300), angle: rnd() < 0.8 ? 0 : f(-1, 1), seed: Math.floor(rnd() * 2 ** 31), versionNonce: Math.floor(rnd() * 2 ** 31),
+    strokeColor: pick(colours), backgroundColor: pick(colours), updated: 1_700_000_000_000 + Math.floor(rnd() * 1e9), version: 1 + Math.floor(rnd() * 5) });
+  return Array.from({ length: n }, () => {
+    const r = rnd();
+    if (r < freehand) {
+      const k = 40 + Math.floor(rnd() * 120); let x = 0, y = 0;
+      const points = Array.from({ length: k }, () => [x = Math.round((x + f(-6, 6)) * 100) / 100, y = Math.round((y + f(-6, 6)) * 100) / 100]);
+      return makeElement("freedraw", { ...common(), points, pressures: points.map(() => Math.round(rnd() * 100) / 100) });
+    }
+    const q = (r - freehand) / (1 - freehand);
+    if (q < 0.45) return makeElement(pick(["rectangle", "ellipse", "diamond"]), common());
+    if (q < 0.75) { const text = Array.from({ length: 2 + Math.floor(rnd() * 8) }, () => pick(words)).join(" "); return makeElement("text", { ...common(), text, originalText: text }); }
+    return makeElement("arrow", { ...common(), points: [[0, 0], [f(-300, 300), f(-200, 200)], [f(-300, 300), f(-200, 200)]] });
+  });
+}
+
 /** The UTF-8 length of a text frame, or the byte length of a binary one. */
 export const wireBytes = d => (typeof d === "string" ? Buffer.byteLength(d) : d.byteLength ?? d.size ?? 0);
 
@@ -20,15 +48,16 @@ export const wireBytes = d => (typeof d === "string" ? Buffer.byteLength(d) : d.
  * (version + 1 each, as a drag sends), waiting for every ack. Returns when the room, the Store and the gateway's feed agree
  * and the feed has re-based on the room's newest checkpoint (so a join now sees the steady state).
  */
-export async function buildBoard(r, { shapes, perOp = 100, edits = 0 }) {
+export async function buildBoard(r, { shapes, perOp = 100, edits = 0, make = null }) {
+  const made = make ? make(shapes) : null;
   const w = await r.sock();
   w.send({ t: "hello", v: 1, token: tokenOf("editor"), board: r.ids.board, since: 0, client: "builder" });
   await w.next(m => m.t === "welcome");
   let n = 0;
   const send = els => w.send({ t: "op", id: `builder:${++n}`, sentAt: 0, stream: "board", op: { elements: els } });
-  for (let i = 0; i < shapes; i += perOp) send(Array.from({ length: Math.min(perOp, shapes - i) }, (_, k) => shape(i + k)));
+  for (let i = 0; i < shapes; i += perOp) send(made ? made.slice(i, i + perOp) : Array.from({ length: Math.min(perOp, shapes - i) }, (_, k) => shape(i + k)));
   const version = new Map();
-  for (let e = 0; e < edits; e++) { const i = (e * 7) % shapes, v = (version.get(i) ?? 1) + 1; version.set(i, v); send([{ ...shape(i, v), x: 5 + e }]); }
+  for (let e = 0; e < edits; e++) { const i = (e * 7) % shapes, v = (version.get(i) ?? 1) + 1; version.set(i, v); send([{ ...(made ? { ...made[i], version: made[i].version + v } : shape(i, v)), x: 5 + e }]); }
   await until(() => w.msgs.filter(m => m.t === "ack").length === n, "every op acked", 60_000);
   const errors = w.msgs.filter(m => m.t === "error");
   if (errors.length) throw new Error("builder got errors: " + JSON.stringify(errors.slice(0, 2)));

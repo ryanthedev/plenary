@@ -190,15 +190,15 @@ export function wsTransport({ url, WebSocket: WS, codec = jsonCodec, maxQueued =
       // Behind a frame still inflating, or itself compressed: in arrival order, through the chain.
       c.behind++;
       c.order = c.order.then(async () => {
-        try {
-          let data = e.data;
+        let data = e.data;
+        try {   // only the inflate step is a "bad frame"; what deliver (the core's handler) throws is a bug, never a reconnect
           if (typeof data !== "string") {
             const bytes = data instanceof Blob ? new Uint8Array(await data.arrayBuffer()) : new Uint8Array(data.buffer ?? data, data.byteOffset ?? 0, data.byteLength);
             data = new TextDecoder().decode(await inflate(bytes));
           }
-          c.behind--;
-          deliver(data);
-        } catch { c.behind--; fail(c); }
+        } catch { c.behind--; fail(c); return; }
+        c.behind--;
+        try { deliver(data); } catch (err) { queueMicrotask(() => { throw err; }); }   // surfaces like the text path's throw; the chain lives on
       });
     };
     ws.onerror = () => fail(c);

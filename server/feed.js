@@ -25,18 +25,19 @@ const EMPTY = { seq: 0, id: null, by: null, at: null, streams: { board: { elemen
 
 /**
  * @param {{ tenant: string, board: string, store: object, bus: object, onLive: (e: { from: number, to: number, data: string }) => void,
- *   log?: object, codec?: object, deflate?: (data: string | Uint8Array) => Promise<Uint8Array | null>, pollMs?: number, chunkBytes?: number, pageSize?: number, pageBytes?: number, rebaseEvery?: number, rebaseBytes?: number, random?: () => number }} o
+ *   log?: object, codec?: object, deflate?: (data: string | Uint8Array) => Promise<Uint8Array | null>, pollMs?: number, chunkBytes?: number, pageSize?: number, pageBytes?: number, rebaseEvery?: number, rebaseBytes?: number, zSlack?: number, random?: () => number }} o
  *   deflate: compresses one catch-up text once (PROTOCOL.md § Joining); absent, or answering null for a frame, joiners get it plain.
+ *   zSlack: bytes of new entries after which the open last chunk's compressed prefix is made again (default 16 KiB).
  *   random: the backoff's jitter source, [0, 1) (tests pass a fixed one).
  *   onLive: called for every run of new resolved entries, in seq order, with the encoded `entries` frame.
  */
 export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger, codec = jsonCodec, deflate = null, pollMs = 5_000, chunkBytes = 1024 * 1024,
-  pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rebaseEvery = 1_000, rebaseBytes = 4 * 1024 * 1024, random = Math.random }) {
+  pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rebaseEvery = 1_000, rebaseBytes = 4 * 1024 * 1024, zSlack = 16 * 1024, random = Math.random }) {
   const key = `${tenant}/${board}`;
   const self = {
     tenant, board, seq: 0, epoch: 0, ready: null, closed: false, gapAt: 0,
     base: EMPTY, tail: [],   // tail: [{ seq, id, by, at, text }], seq = base.seq + 1 …
-    snap: null, chunks: [], chunksLen: 0, lastHeard: Date.now(), nextRebase: rebaseEvery, tailBytes: 0, nextRebaseBytes: rebaseBytes,
+    snap: null, zTail: null, chunks: [], chunksLen: 0, lastHeard: Date.now(), nextRebase: rebaseEvery, tailBytes: 0, nextRebaseBytes: rebaseBytes,
     cpHeard: null, lookedAt: 0, retries: 0, looks: 0, failures: 0, skip: 0, failedFor: 0,   // the checkpoint look (rebase, below)
   };
   const frameOf = list => (codec === jsonCodec ? `{"t":"entries","entries":[${list.map(x => x.text).join(",")}]}` : codec.encode({ t: "entries", entries: list.map(x => JSON.parse(x.text)) }));
@@ -154,7 +155,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
     const cut = self.tail.slice(0, cp.seq - self.base.seq);
     self.tail = self.tail.slice(cp.seq - self.base.seq);
     for (const x of cut) self.tailBytes -= x.text.length;
-    self.base = cp; self.snap = null; self.chunks = []; self.chunksLen = 0; self.retries = 0;
+    self.base = cp; self.snap = null; self.zTail = null; self.chunks = []; self.chunksLen = 0; self.retries = 0;
     again();
   }
   function again() { self.nextRebase = self.tail.length + rebaseEvery; self.nextRebaseBytes = self.tailBytes + rebaseBytes; }
@@ -224,25 +225,50 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
   /** Compress a text once; every joiner who wants it shares the result (`z`: the bytes, or null = not worth it). */
   const squeeze = part => (part.zp ??= Promise.resolve(deflate(part.data)).then(z => { part.z = z ?? null; }, err => { part.z = null; log.warn("feed: compression failed; joiners get plain text", { tenant, board, err }); }));
 
+  // The tail's last chunk grows with every entry, so its text is never the same twice: compressing "the chunk" would go stale
+  // before it could be sent. Instead its compressed form is a PREFIX (`self.zTail`: the chunk's entries up to seq `to`, fixed
+  // when the deflate started) and a join sends it followed by the few entries after `to` as a small plain cut of its own. Always
+  // valid, however many entries land during the deflate; re-made only after `zSlack` bytes of new entries (bounded work).
+  const zTailOf = ch => { const z = self.zTail; return z && z.base === self.base.seq && z.from === ch.from && z.to <= ch.to ? z : null; };
+  const slackBytes = (ch, z) => { let n = 0; for (let i = z.to - self.base.seq; i < ch.to - self.base.seq; i++) n += self.tail[i].text.length; return n; };
+  function squeezeTail(ch) {
+    let z = zTailOf(ch);
+    if (z && (!z.settled || slackBytes(ch, z) < zSlack)) return z.p;
+    z = self.zTail = { base: self.base.seq, from: ch.from, to: ch.to, z: null, settled: false };
+    return z.p = Promise.resolve(deflate(ch.data)).then(r => { z.z = r ?? null; z.settled = true; }, err => { z.settled = true; log.warn("feed: compression failed; joiners get plain text", { tenant, board, err }); });
+  }
+
   /**
    * Rule 3: the frames that bring a client at `since` up to the feed's seq, as `{ data, bytes, shared }` (`shared`
    * names encode-once text many joiners hold; a client starting inside a chunk gets its own cut of it). With `z`
    * (the client asked for deflate, § Joining) a text whose compressed form is ready goes as that form (binary, shared
    * under its own name); one that isn't ready, or isn't worth compressing, goes plain: `prepare(since)` first makes them ready.
+   * A chunk with only a compressed prefix goes as that prefix, then its newer entries as a plain cut: same entries, same order.
    */
-  self.catchUp = (since, z = false) => parts(since).map(({ part, key: shared, own }) => {
-    if (own !== undefined) return { data: own, bytes: utf8Length(own), shared: false };
-    if (z && part.z) return { data: part.z, bytes: part.z.byteLength, shared: shared + "/z", z: true };
-    return { data: part.data, bytes: part.bytes, shared };
+  self.catchUp = (since, z = false) => parts(since).flatMap(({ part, key: shared, own }) => {
+    if (own !== undefined) return [{ data: own, bytes: utf8Length(own), shared: false }];
+    if (z && part.z) return [{ data: part.z, bytes: part.z.byteLength, shared: shared + "/z", z: true }];
+    const pre = z && part.from !== undefined && !part.z ? zTailOf(part) : null;
+    if (pre?.z) {
+      const out = [{ data: pre.z, bytes: pre.z.byteLength, shared: `${key}/c${pre.base}.${pre.from}-${pre.to}/z`, z: true }];
+      if (part.to > pre.to) {
+        const cut = frameOf(self.tail.slice(pre.to - self.base.seq, part.to - self.base.seq));
+        out.push({ data: cut, bytes: utf8Length(cut), shared: false });
+      }
+      return out;
+    }
+    return [{ data: part.data, bytes: part.bytes, shared }];
   });
   /**
    * Have the compressed form of every text a join at `since` would send, so catchUp(since, true) can use it. Waits for the
-   * feed's start (a join may ask before it has read the Store). One deflate per text: the tail's last, still-growing frame
-   * is a new text each time an entry lands, so it is compressed again (the tail is short: § Recovery, "When").
+   * feed's start (a join may ask before it has read the Store). One deflate per text; the open last chunk gets a prefix form
+   * (above), re-made only after `zSlack` bytes of new entries. Entries landing while this runs never make the result stale.
    */
-  self.prepare = async since => { if (deflate) { await self.ready; await Promise.all(parts(since).filter(p => p.part).map(p => squeeze(p.part))); } };
-  /** Whether every shared text a join at `since` would send has its compressed form settled (made, or declined) right now. */
-  self.prepared = since => !deflate || parts(since).every(p => p.own !== undefined || p.part.z !== undefined);
+  self.prepare = async since => {
+    if (!deflate) return;
+    await self.ready;
+    await Promise.all(parts(since).filter(p => p.part).map(({ part }) => part.from === undefined ? squeeze(part) : part.closed ? squeeze(part) : squeezeTail(part)));
+  };
   /** Make sure the feed has every entry up to `seq` (a writer's welcome may name entries the bus hasn't brought yet). */
   self.reach = seq => (seq > self.seq ? run(() => repair(seq)) : Promise.resolve());
   /** Run `f` when no feed step is running, so what it reads (seq, tail) and what is delivered next agree. */

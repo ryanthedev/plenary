@@ -19,7 +19,7 @@ import { withinLadder } from "../auth/permissions.js";
 
 export class AdminError extends Error {
   /**
-   * @param {"forbidden"|"bad-request"|"not-found"|"last-owner"|"unknown-person"|"bad-role"|"too-large"|"in-use"|"confirm-required"|"rate-limited"} code
+   * @param {"forbidden"|"bad-request"|"not-found"|"last-owner"|"unknown-person"|"bad-role"|"too-large"|"in-use"|"confirm-required"|"rate-limited"|"moved"} code
    * @param {string} [message]
    * @param {{ cause?: unknown, data?: object }} [extra]  `data`: fields the HTTP answer adds (`in-use`, `confirm-required`)
    */

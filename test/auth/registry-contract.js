@@ -1403,5 +1403,100 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect((await r.grantHolders(S, ["owner", "editor"], { limit: 1 })).length).toBe(1);
       });
     });
+
+    // ---- moveBoard (PROTOCOL.md § Move board): one atomic compare-and-set of the board's Space ----
+    describe("moveBoard", () => {
+      const U = "dev:ada";
+      const mk = async () => {
+        const t = await r.createTenant({ domain: "acme.com" });
+        const g = await r.createGroup({ tenant: t.id, name: "G" });
+        const a = await r.createSpace({ tenant: t.id, name: "A", owner: U }), b = await r.createSpace({ tenant: t.id, name: "B", group: g.id, owner: U }), c = await r.createSpace({ tenant: t.id, name: "C", owner: U });
+        const board = await r.createBoard({ tenant: t.id, title: "T", space: a.id, owner: U });
+        return { t, g, a, b, c, board };
+      };
+      test("moves from the expected Space; the board and its context follow; grants, invites and links stay", async () => {
+        const { a, b, g, board } = await mk();
+        await r.setGrant(board.id, "dev:bo", "editor");
+        const inv = await r.createInvite({ board: board.id, email: "x@y.com", role: "viewer", by: U });
+        const lk = await r.createLink({ board: board.id, role: "viewer", by: U });
+        const out = await r.moveBoard({ board: board.id, from: a.id, to: b.id });
+        expect(out.moved).toBe(true);
+        expect(out.board).toMatchObject({ id: board.id, space: b.id, title: "T" });
+        expect((await r.board(board.id)).space).toBe(b.id);
+        const ctx = await r.accessContext({ type: "board", id: board.id });
+        expect(ctx.space.id).toBe(b.id); expect(ctx.group.id).toBe(g.id);
+        expect((await r.boardsIn({ type: "space", id: b.id })).ids).toEqual([board.id]);
+        expect((await r.boardsIn({ type: "space", id: a.id })).ids).toEqual([]);
+        expect(await sorted(board.id)).toEqual([{ user: "dev:ada", role: "owner" }, { user: "dev:bo", role: "editor" }]);
+        expect((await r.invite(inv.id)).revoked).toBe(false); expect((await r.link(lk.id)).board).toBe(board.id);
+      });
+      test("an unfiled board can be moved into a Space (from: null)", async () => {
+        const { t, a } = await mk();
+        const loose = await r.createBoard({ tenant: t.id, title: "L", owner: U });
+        expect((await r.board(loose.id)).space).toBeNull();
+        expect((await r.moveBoard({ board: loose.id, from: null, to: a.id })).moved).toBe(true);
+        expect((await r.board(loose.id)).space).toBe(a.id);
+      });
+      test("already in `to` is a no-op success (moved: false), whatever `from` says", async () => {
+        const { a, b, board } = await mk();
+        await r.moveBoard({ board: board.id, from: a.id, to: b.id });
+        expect(await r.moveBoard({ board: board.id, from: a.id, to: b.id })).toMatchObject({ moved: false, board: { space: b.id } });
+        expect((await r.moveBoard({ board: board.id, from: null, to: b.id })).moved).toBe(false);
+      });
+      test("a board in neither `from` nor `to` rejects code moved and changes nothing", async () => {
+        const { a, b, c, board } = await mk();
+        await expect(r.moveBoard({ board: board.id, from: b.id, to: c.id })).rejects.toMatchObject({ code: "moved" });
+        await expect(r.moveBoard({ board: board.id, from: null, to: c.id })).rejects.toMatchObject({ code: "moved" });
+        expect((await r.board(board.id)).space).toBe(a.id);
+      });
+      test("unknown board, unknown Space and another Unit's Space reject", async () => {
+        const { a, board } = await mk();
+        const t2 = await r.createTenant({ domain: "other.com" });
+        const foreign = await r.createSpace({ tenant: t2.id, name: "F", owner: "dev:z" });
+        await expect(r.moveBoard({ board: "b-nope0000000000", from: null, to: a.id })).rejects.toThrow(/no such board/);
+        await expect(r.moveBoard({ board: board.id, from: a.id, to: "s-nope00000000" })).rejects.toThrow(/no such space/);
+        await expect(r.moveBoard({ board: board.id, from: a.id, to: foreign.id })).rejects.toThrow(/no such space/);
+        expect((await r.board(board.id)).space).toBe(a.id);
+      });
+      test("concurrent moves to different Spaces: exactly one wins, the other is moved; the board ends in the winner's", async () => {
+        const { a, b, c, board } = await mk();
+        const out = await Promise.allSettled([r.moveBoard({ board: board.id, from: a.id, to: b.id }), r.moveBoard({ board: board.id, from: a.id, to: c.id })]);
+        expect(out.filter(o => o.status === "fulfilled").length).toBe(1);
+        const lost = out.find(o => o.status === "rejected");
+        expect(lost.reason).toMatchObject({ code: "moved" });
+        const won = out.find(o => o.status === "fulfilled").value;
+        expect((await r.board(board.id)).space).toBe(won.board.space);
+      });
+      test("concurrent identical moves: both succeed, one moved", async () => {
+        const { a, b, board } = await mk();
+        const out = await Promise.all(Array.from({ length: 6 }, () => r.moveBoard({ board: board.id, from: a.id, to: b.id })));
+        expect(out.filter(o => o.moved).length).toBe(1);
+        expect((await r.board(board.id)).space).toBe(b.id);
+      });
+      test("a keyed move writes its key in the same step: a repeat rejects idem-replay naming the board and moves nothing; another body is idem-mismatch", async () => {
+        const { a, b, board } = await mk();
+        const idem = { user: U, key: "move-key-0001", fp: "a".repeat(64) };
+        await r.moveBoard({ board: board.id, from: a.id, to: b.id, idem });
+        expect(await r.idemGet(idem)).toEqual({ state: "done", ref: `${board.id}:moved` });
+        await r.moveBoard({ board: board.id, from: b.id, to: a.id });   // back again, with no key
+        await expect(r.moveBoard({ board: board.id, from: a.id, to: b.id, idem })).rejects.toMatchObject({ code: "idem-replay", ref: `${board.id}:moved` });
+        expect((await r.board(board.id)).space).toBe(a.id);
+        await expect(r.moveBoard({ board: board.id, from: a.id, to: b.id, idem: { ...idem, fp: "b".repeat(64) } })).rejects.toMatchObject({ code: "idem-mismatch" });
+      });
+      test("a keyed no-op move stores `:noop`, so a replay can report the real flag", async () => {
+        const { a, b, board } = await mk();
+        await r.moveBoard({ board: board.id, from: a.id, to: b.id });
+        const idem = { user: U, key: "move-key-0003", fp: "d".repeat(64) };
+        expect((await r.moveBoard({ board: board.id, from: a.id, to: b.id, idem })).moved).toBe(false);
+        expect(await r.idemGet(idem)).toEqual({ state: "done", ref: `${board.id}:noop` });
+      });
+      test("a refused keyed move leaves no key behind (the retry runs fresh)", async () => {
+        const { a, b, c, board } = await mk();
+        const idem = { user: U, key: "move-key-0002", fp: "c".repeat(64) };
+        await expect(r.moveBoard({ board: board.id, from: b.id, to: c.id, idem })).rejects.toMatchObject({ code: "moved" });
+        expect(await r.idemGet(idem)).toEqual({ state: "none" });
+        expect((await r.moveBoard({ board: board.id, from: a.id, to: c.id, idem })).moved).toBe(true);
+      });
+    });
   });
 }

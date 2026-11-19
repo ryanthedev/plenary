@@ -113,6 +113,19 @@ export function memoryRegistry({ now = Date.now } = {}) {
       return copy(b);
     },
     async board(id) { return copy(boards.get(id)); },
+    async moveBoard({ board, from, to, idem: key }) {
+      const b = boards.get(board);
+      if (!b) throw new Error("registry: no such board");
+      if (spaces.get(to)?.tenant !== b.tenant) throw new Error("registry: no such space");
+      const k = idemEnter(key);
+      const moved = b.space !== to;
+      if (moved) {
+        if (b.space !== (from ?? null)) throw new RegistryError("moved", "the board is no longer in that Space");
+        b.space = to;
+      }
+      idemPut(k, b.id + (moved ? ":moved" : ":noop"));
+      return { board: copy(b), moved };
+    },
 
     async setGrant(board, user, role) {
       if (!boards.has(board)) throw new Error("registry: no such board");

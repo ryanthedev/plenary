@@ -29,6 +29,7 @@ import { mountSpacePage, mountGroupPage } from "./adapters/dom/spaces.js";
 import { createDialogs, randomKey } from "./adapters/dom/dialogs.js";
 import { httpAccess } from "./adapters/access/http.js";
 import { httpShare } from "./adapters/share/http.js";
+import { httpMove } from "./adapters/move/http.js";
 import { httpRoles } from "./adapters/roles/http.js";
 import { mountRolesPage } from "./adapters/dom/roles.js";
 import { createRolesModel } from "./core/role-admin.js";
@@ -112,7 +113,8 @@ if (!signIn.token) {
   } else if (spaceId || groupId) {
     // A Space or Group page. An id the person can't open shows the same "not available" page as one that does not exist.
     const model = createPageModel({ api: spacesApi, kind: spaceId ? "space" : "group", id: spaceId ?? groupId });
-    (spaceId ? mountSpacePage : mountGroupPage)({ root, model, dialogs, hrefs, signIn: signInLink, access: httpAccess({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey() });
+    (spaceId ? mountSpacePage : mountGroupPage)({ root, model, dialogs, hrefs, signIn: signInLink, access: httpAccess({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey(),
+      move: { port: httpMove({ fetch: fetchNow, token: signIn.token, timers: clock }), clock, newKey: () => randomKey() } });
     hideGate();
     model.load();
   } else {

@@ -3,10 +3,10 @@
 
 import { test, expect, afterAll } from "bun:test";
 import { appendFileSync, mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, existsSync, symlinkSync, rmSync, chmodSync, realpathSync, lstatSync, statSync, renameSync, utimesSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { clean, summarize, measure, openPaths, openUnder, resolveOpens, resolveNoOpen, renameExcl, loadNativeRename, resetNativeRenameWarning, ROOT } from "../../scripts/clean.js";
 
 const made = [], kids = [];
@@ -77,7 +77,7 @@ test("an entry a process holds open (a file, or its cwd) is kept", () => {
   expect([byName(r, "plenary-test-hfile1").why, byName(r, "plenary-test-hcwd11").why]).toEqual(["in use", "in use"]);
   expect(existsSync(a) && existsSync(b)).toBe(true);
   expect(existsSync(free)).toBe(false);
-});
+}, 10_000);   // real system-wide lsofs (3-5 per test): measured 0.7-1.3 s per test on macOS at load ~20; the default 5 s was passed once under heavier load; lsof's cost grows with the machine's processes, not with this test
 
 test("a plen-run root is kept while its owner pid lives (owner.json or the name), removed once it is gone", () => {
   const w = world();
@@ -118,9 +118,10 @@ test("a symlink to outside is skipped at the top level and never entered inside 
 });
 
 test("refuses a base that is / or $HOME (or a parent of the repo or home)", () => {
+  // the parent of $HOME is /Users on macOS and /home on Linux: a literal "/Users" is no directory on a Linux runner, and an absent base is skipped, not refused
   expect(() => clean({ tempDir: "/", rigRoot: null, openPathsFn: () => [] })).toThrow(/refusing/);
   expect(() => clean({ tempDir: process.env.HOME, rigRoot: null, openPathsFn: () => [] })).toThrow(/refusing/);
-  expect(() => clean({ tempDir: tmpdir(), scratch: "/Users", rigRoot: null, openPathsFn: () => [] })).toThrow(/refusing/);
+  expect(() => clean({ tempDir: tmpdir(), scratch: dirname(homedir()), rigRoot: null, openPathsFn: () => [] })).toThrow(/refusing/);
   expect(() => clean({ tempDir: join(sandbox, "missing"), rigRoot: null, openPathsFn: () => [] }).items).not.toThrow();
 });
 
@@ -128,7 +129,7 @@ test("a refused base throws before lsof is run (no system-wide scan for a reques
   let scans = 0;
   const spy = () => { scans++; return []; };
   expect(() => clean({ tempDir: "/", rigRoot: null, openPathsFn: spy })).toThrow(/refusing/);
-  expect(() => clean({ tempDir: tmpdir(), scratch: "/Users", rigRoot: null, openPathsFn: spy })).toThrow(/refusing/);
+  expect(() => clean({ tempDir: tmpdir(), scratch: dirname(homedir()), rigRoot: null, openPathsFn: spy })).toThrow(/refusing/);
   expect(() => clean({ tempDir: join(sandbox, "none"), rigRoot: "/", openPathsFn: spy })).toThrow(/refusing/);
   // a symlink to / or $HOME, and a relative path that resolves to one, are refused the same way (as temp, scratch and rig)
   const w = world(), toRoot = join(w.root, "to-root"), toHome = join(w.root, "to-home");
@@ -216,7 +217,7 @@ test("--scratch: direct children, old and unused, are removed; held ones stay; s
   expect(existsSync(join(scratch, "lnk"))).toBe(true);
   expect(existsSync(w.root)).toBe(true);
   expect(summarize(r.items, true)).toMatch(/^removed 1 entries.*scratch: 1/);
-});
+}, 10_000);   // real system-wide lsofs (3-5 per test): measured 0.7-1.3 s per test on macOS at load ~20; the default 5 s was passed once under heavier load; lsof's cost grows with the machine's processes, not with this test
 
 test("measure counts a tree without following links", () => {
   const w = world(), d = entry(w.root, "m");
@@ -248,7 +249,7 @@ test("a dir that becomes in use after the snapshot is renamed, re-checked, put b
   expect(existsSync(d)).toBe(true);
   expect(existsSync(join(w.tempDir, ".plen-deleting-plenary-test-late11"))).toBe(false);
   expect(existsSync(other)).toBe(false);
-});
+}, 10_000);   // real system-wide lsofs (3-5 per test): measured 0.7-1.3 s per test on macOS at load ~20; the default 5 s was passed once under heavier load; lsof's cost grows with the machine's processes, not with this test
 
 test("a failing per-path re-check puts the dir back", () => {
   const w = world(), d = entry(w.tempDir, "plenary-test-rechk1");
@@ -582,13 +583,14 @@ test("an odd path (a newline in it): lsof -F0 output is parsed whole (escaped by
   writeFileSync(odd, "z");
   holder(`exec 3<"${odd}"; exec sleep 60`, w.root, w);
   waitHeld(w, d);
-  expect(openPaths(w.lsof).some(p => p === odd)).toBe(false);                       // lsof escapes the newline, so the raw path never matches ...
-  expect(openPaths(w.lsof).some(p => p === odd.replace("\n", "\\n"))).toBe(true);    // ... but the field is kept whole, escaped, under the entry's prefix
+  const held = openPaths(w.lsof);                                                    // one system-wide lsof for both checks
+  expect(held.some(p => p === odd)).toBe(false);                                     // lsof escapes the newline, so the raw path never matches ...
+  expect(held.some(p => p === odd.replace("\n", "\\n"))).toBe(true);                // ... but the field is kept whole, escaped, under the entry's prefix
   const r = clean({ ...w, now: LATER(), yes: true });
   expect(r.items[0]).toMatchObject({ status: "kept", why: "in use" });
   expect(existsSync(odd)).toBe(true);
   expect(openUnder(d, w.lsof)).toBe("in use (re-check)");
-});
+}, 10_000);   // real system-wide lsofs (3-5 per test): measured 0.7-1.3 s per test on macOS at load ~20; the default 5 s was passed once under heavier load; lsof's cost grows with the machine's processes, not with this test
 
 test("ROOT is the real path of the checkout, also with a space in it or behind a symlink", async () => {
   const w = world(), home = join(w.root, "sp ace", "repo"), real = realpathSync(w.root) + "/sp ace/repo";

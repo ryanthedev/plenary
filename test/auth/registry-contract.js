@@ -816,6 +816,50 @@ export function registryContract(name, makeRegistry, opts = {}) {
         await expect(r.createRole({ tenant: t.id, name: "", boardRole: "viewer" })).rejects.toThrow();
       });
 
+      test("roles (#50): createRole max is exact and ignores the member override; deleteRole is refused while any grant holds the role, never the member role; roleUsage counts to cap + 1", async () => {
+        const t = await unit(), u = await r.createTenant({ domain: "globex.com" });
+        await r.updateRole(t.id, "member", { permissions: [] });                       // the override does not count against max
+        const a = await r.createRole({ tenant: t.id, name: "A", boardRole: "viewer", max: 2 });
+        await r.createRole({ tenant: t.id, name: "B", boardRole: "viewer", max: 2 });
+        await expect(r.createRole({ tenant: t.id, name: "C", boardRole: "viewer", max: 2 })).rejects.toMatchObject({ code: "limit" });
+        expect((await r.roles(t.id)).length).toBe(3);
+        await r.createRole({ tenant: u.id, name: "A2", boardRole: "viewer", max: 2 });  // another Unit's roles are not counted
+        const sp = await r.createSpace({ tenant: t.id, name: "S" }), sp2 = await r.createSpace({ tenant: t.id, name: "S2" });
+        const team = await r.createTeam({ tenant: t.id, name: "T" });
+        const grant = (scope, subject, role) => r.setScopedGrant({ scope, subject, role });
+        await grant({ type: "space", id: sp.id }, { type: "user", id: "google:x" }, a.id);
+        await grant({ type: "space", id: sp2.id }, { type: "team", id: team.id }, a.id);
+        await grant({ type: "unit", id: t.id }, { type: "user", id: "google:y" }, a.id);
+        const use = await r.roleUsage([a.id, "r-none00000000"]);
+        expect(use.get(a.id)).toEqual({ places: 3, users: 2, teams: [team.id] });
+        expect(use.get("r-none00000000")).toEqual({ places: 0, users: 0, teams: [] });
+        expect((await r.roleUsage([a.id], { cap: 2 })).get(a.id)).toMatchObject({ places: 3, users: 2 });   // cap + 1: "more than 2"
+        expect((await r.roleUsage([a.id], { cap: 1 })).get(a.id)).toMatchObject({ places: 2, users: 2 });
+        await expect(r.deleteRole(t.id, a.id)).rejects.toMatchObject({ code: "in-use" });
+        expect(await r.role(t.id, a.id)).toMatchObject({ id: a.id });                 // nothing changed
+        await grant({ type: "space", id: sp.id }, { type: "user", id: "google:x" }, null);
+        await grant({ type: "space", id: sp2.id }, { type: "team", id: team.id }, null);
+        await expect(r.deleteRole(t.id, a.id)).rejects.toMatchObject({ code: "in-use" });   // the Unit grant still holds it
+        await grant({ type: "unit", id: t.id }, { type: "user", id: "google:y" }, null);
+        await expect(r.deleteRole(u.id, a.id)).rejects.toThrow("no such role");        // another Unit's id is no role
+        await r.deleteRole(t.id, a.id);
+        expect(await r.role(t.id, a.id)).toBe(null);
+        await expect(r.deleteRole(t.id, a.id)).rejects.toThrow("no such role");
+        await expect(r.deleteRole(t.id, "member")).rejects.toThrow("bad role");
+        await r.createRole({ tenant: t.id, name: "C", boardRole: "viewer", max: 2 });  // a slot is free again
+      });
+
+      test("memberCount counts the directory to cap + 1, per Unit", async () => {
+        const t = await unit(), u = await r.createTenant({ domain: "globex.com" });
+        expect(await r.memberCount(t.id)).toBe(0);
+        for (let i = 0; i < 5; i++) await r.touchMember(t.id, { user: `google:m${i}`, name: `M${i}` });
+        await r.touchMember(u.id, { user: "google:o", name: "O" });
+        expect(await r.memberCount(t.id)).toBe(5);
+        expect(await r.memberCount(t.id, { cap: 3 })).toBe(4);
+        expect(await r.memberCount(u.id)).toBe(1);
+        expect(await r.memberCount("t-nope00000000")).toBe(0);
+      });
+
       test("accessContext: the whole chain in one answer; unknown scope is null; a Unit and a Space scope work too", async () => {
         const t = await unit({ domains: ["acme.io"], admins: ["google:root"] });
         const g = await r.createGroup({ tenant: t.id, name: "Product", generalRole: "viewer" });

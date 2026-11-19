@@ -2,7 +2,7 @@
 // last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
 import { normEmail } from "./util.js";
-import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText } from "./registry-port.js";
+import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf } from "./registry-port.js";
 
 /**
  * @typedef {import("./registry-port.js").Registry} Registry
@@ -300,9 +300,10 @@ export function memoryRegistry({ now = Date.now } = {}) {
       return [...(scoped.get(sk(type, id)) ?? [])].map(([k, role]) => { const [t, ...i] = k.split("\n"); return { subject: { type: t, id: i.join("\n") }, role }; });
     },
 
-    async createRole({ tenant, name, base = null, boardRole, permissions = [] }) {
+    async createRole({ tenant, name, base = null, boardRole, permissions = [], max }) {
       need(tenants.has(tenant), "tenant");
       const m = roles.get(tenant) ?? new Map(); roles.set(tenant, m);
+      if (max !== undefined && [...m.keys()].filter(i => i !== MEMBER_ROLE_ID).length >= max) throw new RegistryError("limit", "the Unit has the most custom roles it can");
       const r = { id: fresh(m, mint.role), tenant, name: orgDefaults.name(name), base, boardRole, permissions: [...permissions], createdAt: now() };
       m.set(r.id, r);
       return copy(r);
@@ -321,6 +322,24 @@ export function memoryRegistry({ now = Date.now } = {}) {
       if (patch.permissions !== undefined) r.permissions = [...patch.permissions];
       return copy(r);
     },
+    async deleteRole(tenant, id) {
+      if (id === MEMBER_ROLE_ID) throw new Error("registry: bad role");
+      need(roles.get(tenant)?.has(id), "role");
+      for (const g of scoped.values()) for (const role of g.values()) if (role === id) throw new RegistryError("in-use", "a grant still holds this role");
+      roles.get(tenant).delete(id);
+    },
+    async roleUsage(ids, { cap } = {}) {
+      const c = capOf(cap, ROLE_LIMITS.usageCap), want = new Map([...new Set(ids ?? [])].slice(0, ROLE_LIMITS.custom + 1).map(i => [i, { places: 0, users: 0, teams: [] }]));
+      for (const g of scoped.values()) for (const [k, role] of g) {
+        const u = want.get(role);
+        if (!u) continue;
+        if (u.places <= c) u.places++;
+        if (k.startsWith("user\n")) { if (u.users <= c) u.users++; } else if (u.teams.length < ROLE_LIMITS.teamIds && !u.teams.includes(k.slice(5))) u.teams.push(k.slice(5));
+      }
+      for (const u of want.values()) u.teams.sort();
+      return want;
+    },
+    async memberCount(tenant, { cap } = {}) { return Math.min(directory.get(tenant)?.size ?? 0, capOf(cap, ROLE_LIMITS.memberCap) + 1); },
     async role(tenant, id) { return copy(roles.get(tenant)?.get(id)); },
     async roles(tenant) { return [...(roles.get(tenant)?.values() ?? [])].map(copy); },
 

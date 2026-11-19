@@ -71,7 +71,7 @@
 // owns that pool) or `sql` (a Bun SQL client you own). `schema` names the Postgres schema. Never reads env.
 
 import { SQL } from "bun";
-import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText } from "../auth/registry-port.js";
+import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 import { needSchema, migrate, missing as absent } from "../pg/schema.js";
 
@@ -81,7 +81,7 @@ import { needSchema, migrate, missing as absent } from "../pg/schema.js";
  * never sent; "client-timeout": sent, no answer). Match on `err.code`.
  */
 export class PgRegistryError extends Error {
-  /** @param {"last-owner" | "lock-timeout" | "statement-timeout" | "overloaded" | "queue-timeout" | "client-timeout"} code */
+  /** @param {"last-owner" | "limit" | "in-use" | "lock-timeout" | "statement-timeout" | "overloaded" | "queue-timeout" | "client-timeout"} code */
   constructor(code, message, options) {
     super(message, options); this.name = "RegistryError"; this.code = code;
     // The call never began or was rolled back (registry-port.js, `rolledBack`): a queue refusal, or a lock or statement limit inside a transaction.
@@ -150,6 +150,7 @@ export const REGISTRY_INDEXES = {
   reg_invites_email: "reg_invites (email)",
   reg_link_uses_member: "reg_link_uses (member, board)",
   reg_scope_grants_subject: "reg_scope_grants (subject_type, subject, scope_type)",
+  reg_scope_grants_role: "reg_scope_grants (role, subject_type, subject)",
   reg_team_members_member: "reg_team_members (member)",
 };
 /** The tables' column definitions for one schema (foreign keys name it), as `migrate` takes them. */
@@ -728,12 +729,13 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       const { type, id } = orgDefaults.scope(scope);
       return key(id) ? (await grantsOn(db, type, id)).map(rowSg) : [];
     },
-    async createRole({ tenant, name, base = null, boardRole, permissions = [] }) {
+    async createRole({ tenant, name, base = null, boardRole, permissions = [], max }) {
       ready();
       if (!key(tenant)) throw new Error("registry: no such tenant");
       const n = orgDefaults.name(name), createdAt = now(), perms = JSON.stringify([...permissions]);
       return write(async tx => {
-        if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
+        if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1 FOR NO KEY UPDATE`, [tenant]))) throw new Error("registry: no such tenant");   // the Unit's row serialises creates, so `max` is exact
+        if (max !== undefined && (await one(tx, `SELECT count(*)::int AS n FROM ${RO} WHERE tenant = $1 AND id <> $2`, [tenant, MEMBER_ROLE_ID])).n >= max) throw new PgRegistryError("limit", "the Unit has the most custom roles it can");
         let id;
         for (;;) { id = mint.role(); if (!(await one(tx, `SELECT 1 AS x FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id]))) break; }
         await tx.unsafe(`INSERT INTO ${RO} (tenant, id, name, base, board_role, permissions, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
@@ -762,6 +764,27 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         return rowRole(await one(tx, `SELECT * FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id]));
       });
     },
+    async deleteRole(tenant, id) {
+      ready();
+      if (id === MEMBER_ROLE_ID) throw new Error("registry: bad role");
+      if (!key(tenant) || !key(id)) throw new Error("registry: no such role");
+      return write(async tx => {
+        if (!(await one(tx, `SELECT 1 AS x FROM ${RO} WHERE tenant = $1 AND id = $2 FOR UPDATE`, [tenant, id]))) throw new Error("registry: no such role");
+        if (await one(tx, `SELECT 1 AS x FROM ${SG} WHERE role = $1 LIMIT 1`, [id])) throw new PgRegistryError("in-use", "a grant still holds this role");
+        await tx.unsafe(`DELETE FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id]);
+      });
+    },
+    async roleUsage(ids, { cap } = {}) {
+      ready();
+      const c = capOf(cap, ROLE_LIMITS.usageCap), out = new Map();
+      for (const id of [...new Set((ids ?? []).filter(key))].slice(0, ROLE_LIMITS.custom + 1)) {
+        const n = async extra => (await one(db, `SELECT count(*)::int AS n FROM (SELECT 1 FROM ${SG} WHERE role = $1${extra} LIMIT $2) x`, [id, c + 1])).n;
+        out.set(id, { places: await n(""), users: await n(" AND subject_type = 'user'"),
+          teams: (await db.unsafe(`SELECT DISTINCT subject FROM ${SG} WHERE role = $1 AND subject_type = 'team' ORDER BY subject LIMIT $2`, [id, ROLE_LIMITS.teamIds])).map(r => r.subject) });
+      }
+      return out;
+    },
+    async memberCount(tenant, { cap } = {}) { ready(); return key(tenant) ? (await one(db, `SELECT count(*)::int AS n FROM (SELECT 1 FROM ${MB} WHERE tenant = $1 LIMIT $2) x`, [tenant, capOf(cap, ROLE_LIMITS.memberCap) + 1])).n : 0; },
     async role(tenant, id) { ready(); return key(tenant) && key(id) ? rowRole(await one(db, `SELECT * FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id])) : null; },
     async roles(tenant) { ready(); return key(tenant) ? (await db.unsafe(`SELECT * FROM ${RO} WHERE tenant = $1 ORDER BY created_at, id`, [tenant])).map(rowRole) : []; },
     // The resolver's one read: ONE statement (so one consistent snapshot) however many grants, Teams or members exist:

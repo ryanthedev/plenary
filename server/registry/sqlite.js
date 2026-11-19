@@ -17,7 +17,7 @@
 // `user`; insertion order is an explicit `n` column (Postgres: BIGSERIAL / identity), upserts use ON CONFLICT.
 
 import { Database } from "bun:sqlite";
-import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText } from "../auth/registry-port.js";
+import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 
 /** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code`. */
@@ -146,6 +146,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     db.run("CREATE INDEX IF NOT EXISTS reg_boards_tenant ON reg_boards (tenant, id)");
     db.run("CREATE INDEX IF NOT EXISTS reg_invites_email ON reg_invites (email)");
     db.run("CREATE INDEX IF NOT EXISTS reg_link_uses_member ON reg_link_uses (member, board)");
+    db.run("CREATE INDEX IF NOT EXISTS reg_scope_grants_role ON reg_scope_grants (role, subject_type, subject)");
     db.run("CREATE INDEX IF NOT EXISTS reg_scope_grants_subject ON reg_scope_grants (subject_type, subject, scope_type)");
     db.run("CREATE INDEX IF NOT EXISTS reg_team_members_member ON reg_team_members (member)");
     db.run("CREATE INDEX IF NOT EXISTS reg_spaces_tenant ON reg_spaces (tenant)");
@@ -233,6 +234,13 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     delSgrant: db.query("DELETE FROM reg_scope_grants WHERE scope_type = ? AND scope_id = ? AND subject_type = ? AND subject = ?"),
     role: db.query("SELECT * FROM reg_roles WHERE tenant = ? AND id = ?"),
     roles: db.query("SELECT * FROM reg_roles WHERE tenant = ? ORDER BY created_at, id"),
+    roleCount: db.query("SELECT count(*) AS n FROM reg_roles WHERE tenant = ? AND id <> 'member'"),
+    delRole: db.query("DELETE FROM reg_roles WHERE tenant = ? AND id = ?"),
+    roleHeld: db.query("SELECT 1 AS x FROM reg_scope_grants WHERE role = ? LIMIT 1"),
+    useAll: db.query("SELECT count(*) AS n FROM (SELECT 1 FROM reg_scope_grants WHERE role = ?1 LIMIT ?2)"),
+    useUsers: db.query("SELECT count(*) AS n FROM (SELECT 1 FROM reg_scope_grants WHERE role = ?1 AND subject_type = 'user' LIMIT ?2)"),
+    useTeams: db.query("SELECT DISTINCT subject FROM reg_scope_grants WHERE role = ?1 AND subject_type = 'team' ORDER BY subject LIMIT ?2"),
+    memberN: db.query("SELECT count(*) AS n FROM (SELECT 1 FROM reg_members WHERE tenant = ?1 LIMIT ?2)"),
     insRole: db.query("INSERT INTO reg_roles (tenant, id, name, base, board_role, permissions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"),
     upRole: db.query("UPDATE reg_roles SET name = ?, board_role = ?, permissions = ? WHERE tenant = ? AND id = ?"),
     upRecent: db.query(`INSERT INTO reg_recents (member, board, opened_at) VALUES (?1, ?2, ?3)
@@ -465,11 +473,17 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     }
     putSg(type, id, st, sid, role);
   });
-  const createRoleTx = db.transaction((tenant, name, base, boardRole, perms, createdAt) => {
+  const createRoleTx = db.transaction((tenant, name, base, boardRole, perms, createdAt, max) => {
     needRow(q.tenantExists.get(tenant), "tenant");
+    if (max !== undefined && q.roleCount.get(tenant).n >= max) throw new SqlRegistryError("limit", "the Unit has the most custom roles it can");
     const id = fresh(mint.role, i => !!q.role.get(tenant, i));
     q.insRole.run(tenant, id, name, base, boardRole, JSON.stringify(perms), createdAt);
     return rowRole(q.role.get(tenant, id));
+  });
+  const deleteRoleTx = db.transaction((tenant, id) => {
+    needRow(q.role.get(tenant, id), "role");
+    if (q.roleHeld.get(id)) throw new SqlRegistryError("in-use", "a grant still holds this role");
+    q.delRole.run(tenant, id);
   });
   const updateRoleTx = db.transaction((tenant, id, patch, createdAt) => {
     needRow(q.tenantExists.get(tenant), "tenant");
@@ -724,16 +738,30 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       const { type, id } = orgDefaults.scope(scope);
       return q.sgrants.all(type, id).map(rowSg);
     },
-    async createRole({ tenant, name, base = null, boardRole, permissions = [] }) {
+    async createRole({ tenant, name, base = null, boardRole, permissions = [], max }) {
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");
-      return createRoleTx.immediate(tenant, orgDefaults.name(name), nz(base), nz(boardRole), [...permissions], now());
+      return createRoleTx.immediate(tenant, orgDefaults.name(name), nz(base), nz(boardRole), [...permissions], now(), max);
     },
     async updateRole(tenant, id, patch) {
       ready();
       if (!str(tenant) || !str(id)) throw new Error("registry: no such role");
       return updateRoleTx.immediate(tenant, id, patch ?? {}, now());
     },
+    async deleteRole(tenant, id) {
+      ready();
+      if (id === MEMBER_ROLE_ID) throw new Error("registry: bad role");
+      if (!str(tenant) || !str(id)) throw new Error("registry: no such role");
+      deleteRoleTx.immediate(tenant, id);
+    },
+    async roleUsage(ids, { cap } = {}) {
+      ready();
+      const c = capOf(cap, ROLE_LIMITS.usageCap), out = new Map();
+      for (const id of [...new Set((ids ?? []).filter(str))].slice(0, ROLE_LIMITS.custom + 1))
+        out.set(id, { places: q.useAll.get(id, c + 1).n, users: q.useUsers.get(id, c + 1).n, teams: q.useTeams.all(id, ROLE_LIMITS.teamIds).map(r => r.subject) });
+      return out;
+    },
+    async memberCount(tenant, { cap } = {}) { ready(); return str(tenant) ? q.memberN.get(tenant, capOf(cap, ROLE_LIMITS.memberCap) + 1).n : 0; },
     async role(tenant, id) { ready(); return str(tenant) && str(id) ? rowRole(q.role.get(tenant, id)) ?? null : null; },
     async roles(tenant) { ready(); return str(tenant) ? q.roles.all(tenant).map(rowRole) : []; },
     async accessContext(scope, { users, chain } = {}) {

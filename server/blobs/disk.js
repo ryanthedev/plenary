@@ -1,14 +1,15 @@
 // The Blobs port on local disk (PROTOCOL.md § Blobs), for a single node.
-//   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB, a hash mismatch, and anything that isn't a PNG/JPEG/GIF/WebP
+//   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB, a hash mismatch, and anything that isn't a PNG/JPEG/GIF/WebP;
+//                              true when it stored the blob, false when the tenant already had it
 //   get(tenant, sha1)          bytes, or null
+//   usage(tenant)              the bytes the tenant's blobs take (a walk of its folder; the quota's starting point)
 // A blob lives at <dir>/<tenant>/<first 2 hex>/<sha1>. Both ids are validated before they touch a path, so there is
 // no traversal and one tenant can't name another's file. Writes go to a temp file, are fsynced, then hard-linked
 // under the blob's name (which never replaces: the first bytes for a hash are kept), and the folder is fsynced:
 // a crash never leaves a half-written file under a blob's name, and a put that resolved survives power loss.
-// SEAM(p3): the per-tenant quota (§ Limits, default 10 GB) is not enforced here yet; it comes with the signed-URL
-// routes, which are the only way bytes arrive.
+// The per-tenant quota is enforced above the port (server/blob-access.js), from usage() and put()'s answer.
 
-import { mkdir, open, link, unlink, readFile, stat } from "node:fs/promises";
+import { mkdir, open, link, unlink, readFile, stat, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { needId, isSha1, PortError } from "../ids.js";
 
@@ -35,7 +36,7 @@ export function diskBlobs({ dir }) {
     async put(tenant, sha1, bytes) {
       const { folder, file } = place(tenant, sha1);
       const b = checkBlob(sha1, bytes);
-      if (await exists(file)) return;          // same hash = same bytes: nothing to do
+      if (await exists(file)) return false;    // same hash = same bytes: nothing to do
       await mkdir(folder, { recursive: true });
       const tmp = join(folder, `.tmp-${process.pid}-${Date.now().toString(36)}-${++n}`);
       let fh;
@@ -45,12 +46,25 @@ export function diskBlobs({ dir }) {
         await fh.sync();
         await fh.close(); fh = null;
         // link() fails if the name exists, so two puts racing on one hash keep the first; rename() would replace it.
-        try { await link(tmp, file); } catch (err) { if (err?.code !== "EEXIST") throw err; }
+        let stored = true;
+        try { await link(tmp, file); } catch (err) { if (err?.code !== "EEXIST") throw err; stored = false; }
         await syncDir(folder);
+        return stored;
       } catch (err) {
         if (fh) await fh.close().catch(() => {});
         throw err;
       } finally { await unlink(tmp).catch(() => {}); }
+    },
+
+    /** @returns {Promise<number>} bytes of the tenant's stored blobs (temp files of puts in flight are not counted) */
+    async usage(tenant) {
+      needId(tenant, "tenant");
+      let total = 0;
+      const list = async d => { try { return await readdir(d, { withFileTypes: true }); } catch (err) { if (err?.code === "ENOENT") return []; throw err; } };
+      for (const shard of await list(join(dir, tenant)))
+        if (shard.isDirectory()) for (const f of await list(join(dir, tenant, shard.name)))
+          if (f.isFile() && isSha1(f.name)) total += (await stat(join(dir, tenant, shard.name, f.name)).catch(() => null))?.size ?? 0;
+      return total;
     },
 
     /** @returns {Promise<Uint8Array | null>} */

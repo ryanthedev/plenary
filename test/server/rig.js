@@ -34,6 +34,7 @@ export const tokenOf = name => `${SECRET}-${name}-token`;
 /**
  * @param {{ verifyDelayMs?: number, cache?: object, wrapStore?: (s: object) => object, wrapAuth?: (a: object) => object,
  *   wrapRegistry?: (r: object) => object, wrapBus?: (b: object) => object, now?: () => number, timers?: object, limits?: object, host?: object, dir?: string, registry?: object, ids?: object }} [o]
+ * `blobs`: the Blobs adapter (default: disk in `dir`; null: none). `server`: more createServer options (blobKey, quotaBytes, publicUrl).
  * Pass `dir`, `registry` and `ids` from an earlier rig to restart "the same server" on the same data.
  */
 export async function rig(o = {}) {
@@ -78,7 +79,7 @@ export async function rig(o = {}) {
   bus.subscribe(subjects.inbox(ids.tenant, ids.otherBoard), m => inbox.push(m));
   // Catch-up frames are the gateway's now (its board feed): the scaffold's room-host knobs map onto the feed's.
   const feed = { ...(o.host?.chunkBytes ? { chunkBytes: o.host.chunkBytes } : {}), ...(o.host?.tailFoldBytes ? { rebaseBytes: Math.max(1, Math.floor(o.host.tailFoldBytes / 4)) } : {}), ...(o.limits?.feed ?? {}) };
-  const server = createServer({ auth, registry: reg, store, bus, ...(o.onWelcomed ? { onWelcomed: o.onWelcomed } : {}), blobs: diskBlobs({ dir: join(dir, "blobs") }), log, port: 0, limits: { opRate: 1e6, opBurst: 1e6, ...(o.limits ?? {}), feed }, host: { heartbeatMs: HEARTBEAT_MS, ...o.host }, ...(o.now ? { now: o.now } : {}), ...(o.timers ? { timers: o.timers } : {}) });   // the gateway's op pace is off unless a test sets it
+  const server = createServer({ auth, registry: reg, store, bus, ...(o.onWelcomed ? { onWelcomed: o.onWelcomed } : {}), blobs: o.blobs === undefined ? diskBlobs({ dir: join(dir, "blobs") }) : o.blobs, ...(o.server ?? {}), log, port: 0, limits: { opRate: 1e6, opBurst: 1e6, ...(o.limits ?? {}), feed }, host: { heartbeatMs: HEARTBEAT_MS, ...o.host }, ...(o.now ? { now: o.now } : {}), ...(o.timers ? { timers: o.timers } : {}) });   // the gateway's op pace is off unless a test sets it
 
   const self = {
     dir, lines, log, registry, ids, store, rawStore, bus, server, inbox, calls, cacheCalls,

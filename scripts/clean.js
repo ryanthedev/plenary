@@ -205,6 +205,11 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
   };
   const deadlineCheck = () => timeLeft() <= 0;
   const existsLstat = p => { try { stat(p); return true; } catch (e) { if (e.code === "ENOENT") return false; throw e; } };
+  // A base that is refused throws before anything shells out (the system-wide lsof below is the slow part). The resolved
+  // paths are kept: the scan loops below use them, so each base is resolved once.
+  const resolved = new Map();
+  for (const [target, dir] of bases) if (dir) try { resolved.set(target, refuseBase(dir, target === "temp" ? "the temp dir" : "the scratch dir")); } catch (e) { if (e.code !== "ENOENT") throw e; }
+  const realRig = rigRoot && existsSync(rigRoot) ? refuseBase(rigRoot, "the rig dir") : null;
   let opens = null, opensError = null;
   const initialLeft = timeLeft();
   if (initialLeft <= 0) opensError = "skipped (time limit)";
@@ -273,8 +278,8 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
 
   for (const [target, dir, match] of bases) {
     if (!dir) continue;
-    let real;
-    try { real = refuseBase(dir, target === "temp" ? "the temp dir" : "the scratch dir"); } catch (e) { if (e.code === "ENOENT") continue; throw e; }
+    const real = resolved.get(target);
+    if (!real) continue;   // missing
     for (const name of readdirSync(real).sort()) {
       if (!match(name)) continue;
       consider(target, real, name, target === "temp" && name.replace(DELETING, "").startsWith("plen-run-")
@@ -282,8 +287,8 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
     }
   }
 
-  if (rigRoot && existsSync(rigRoot)) {
-    const real = refuseBase(rigRoot, "the rig dir");
+  if (realRig) {
+    const real = realRig;
     for (const name of readdirSync(real).sort()) {
       const dir = join(real, name);
       if (!lstatSync(dir).isDirectory()) continue;

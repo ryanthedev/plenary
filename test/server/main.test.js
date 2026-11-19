@@ -328,7 +328,7 @@ import { nodeConfig, defaultNodeId, redact } from "../../server/main.js";
 
 const PW = "hunter2-FAKE-pw";
 const PG = `postgres://plen:${PW}@127.0.0.1:1/plenary`, NATS = `nats://plen:${PW}@127.0.0.1:1`;
-const KEY = { COOKIE_KEY: "k".repeat(32) };
+const KEY = { COOKIE_KEY: "k".repeat(32), PLENARY_BLOBS: "local-disk" };   // a cluster start must name its picture storage (these tests start none)
 
 /** start(env) that must be refused: the error and every log line, both free of the fake password. */
 const refused = (env, pattern) => refusedWith(env, {}, pattern);

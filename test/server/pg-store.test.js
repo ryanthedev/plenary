@@ -192,6 +192,17 @@ describe.skipIf(!url)("postgres store", () => {
 
   // ---- Round 2 (p4-store-leasev H1, M1, L3) ----
 
+  /** Poll pg_stat_activity until `n` backends are waiting on a lock in a statement matching `like`; a clear failure after 10 s. */
+  const waitBlocked = async (like, what, { n = 1, done = () => false } = {}) => {
+    let c = 0;
+    for (const end = Date.now() + 10_000; Date.now() < end; await Bun.sleep(10)) {
+      c = (await client().unsafe(`SELECT count(*)::int AS c FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE $1`, [like]))[0].c;
+      if (c >= n) return;
+      if (done()) throw new Error(`${what} finished instead of waiting`);
+    }
+    throw new Error(`timed out after 10 s: ${what} never showed as lock-waiting in pg_stat_activity (${c}/${n})`);
+  };
+
   const DBMS = "SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint AS t";
 
   for (const what of ["append", "checkpoint"]) test(`H1 window: a takeover can't commit while a fenced ${what} is past its fence check`, async () => {
@@ -209,10 +220,11 @@ describe.skipIf(!url)("postgres store", () => {
       let wrote = null, took = false;
       const w = (what === "append" ? code(store.append(T, B, [entry(2)], 1, epoch)) : code(store.putCheckpoint(T, B, { seq: 9, by: "a" }, epoch)))
         .then(r => { wrote = r; return r; });
-      await Bun.sleep(200);
+      const table = what === "append" ? "pl_entries" : "pl_checkpoints";
+      await waitBlocked(`%INSERT INTO "${schema}".${table}%`, `the fenced ${what}'s insert, parked behind the open row`);   // past its fence check
       const take = taker.unsafe(`UPDATE "${schema}".pl_leases SET epoch = epoch + 1, holder = 'h-b' WHERE tenant = $1 AND board = $2`, [T, B])
         .then(() => { took = true; });
-      await Bun.sleep(200);
+      await waitBlocked(`UPDATE "${schema}".pl_leases SET epoch = epoch + 1%`, "the takeover's UPDATE", { done: () => took });   // waiting on the write's FOR SHARE
       expect(took).toBe(false);                                    // the takeover waits behind the parked write
       expect(wrote).toBe(null);
       await parker.unsafe("ROLLBACK");

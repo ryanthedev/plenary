@@ -208,15 +208,205 @@ export function wsTransport({ url, WebSocket: WS, codec = jsonCodec, maxQueued =
   };
 }
 
+const SHA1 = /^[0-9a-f]{40}$/;
+const RASTER = /^image\/(png|jpeg|gif|webp)$/;
+const RETRY_STATUS = new Set([401, 404, 408, 429, 500, 502, 503, 504]);   // 401: the 5-minute URL ran out; 404: a GET before the upload landed
+const RETRY_CODES = new Set(["limit", "unavailable", "auth"]);             // a refused `blob` request that can pass (PROTOCOL.md § Blobs)
+const b64 = bytes => { let s = ""; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000)); return btoa(s); };
+
 /**
- * The net (web/ports/net.js) over WebSockets: one wsTransport per join() to the same gateway URL. No blob path yet
- * (pictures go through signed blob URLs in v1; until then put does nothing and onFile never fires).
- * @param {{ url: string, WebSocket: new (url: string) => any, clock?: Pick<import("../../ports/clock.js").Clock, "mono" | "set" | "clear"> }} o
+ * The picture path of wsNet (PROTOCOL.md § Blobs, "Client rules"): bytes go to and from the server's blob store through
+ * signed URLs, which the gateway hands out over the tab's ONE board connection (a second socket would eat one of the
+ * tab's two connection slots). It wraps each transport join() makes: `welcome`, `blob` replies and `sha1`-tagged
+ * `error`s are read here, everything else passes through untouched; the session never sees a blob message.
+ *   - One `blob` request in flight, at least 120 ms apart (the gateway allows 10 a second). Transfers have their own
+ *     slots: at most 2 PUTs (the server allows an account 2) and 4 GETs at once.
+ *   - Nothing is asked before `welcome` and the asks are repeated after every reconnect.
+ *   - A failure that can pass is tried again with backoff on a fresh URL, up to 6 tries; then the task rests (a download
+ *     waits for want(), an upload wakes itself) and revives on the next welcome. A task has ONE timer (`t.timer`), and
+ *     enqueue() clears it: a stale wake-up can never re-queue a task that moved on.
+ *   - `limit` and a PUT's 503 `busy` / 409 `in-flight` are not failed tries: `limit` backs off past the put window,
+ *     `busy` waits the server's Retry-After and sends the SAME URL again while it is still valid (no new ask).
+ *   - A picture the server doesn't have (404) rests longer each round (30 s doubling to 10 min) until a want() brings a
+ *     new `stamp` (a document change touching that file) or the connection is welcomed again.
+ *   - A final failure of an upload (quota, forbidden, not an image, too large, …) is reported through onFail; so is the
+ *     first wait for limit / busy / gave-up, with `retrying: true`.
+ * @param {{ fetch: typeof fetch, clock: Pick<import("../../ports/clock.js").Clock, "mono" | "set" | "clear">, base: string }} o  base: the http(s) origin of the gateway
+ */
+function blobClient({ fetch: fetchFn, clock, base }) {
+  const GAP_MS = 120, ASK_TIMEOUT_MS = 10_000, MAX_TRIES = 6, MAX_LIMITS = 20, MAX_BUSY = 60, REST_MS = 30_000, MAX_REST_MS = 600_000;
+  const CAP = { PUT: 2, GET: 4 };                                  // transfers at once, per verb
+  const XFER_TIMEOUT_MS = { PUT: 150_000, GET: 30_000 };           // a PUT may take the server's whole 120 s body deadline
+  const URL_FRESH_MS = 240_000;                                    // a signed URL lasts 5 minutes: reuse it for 4
+  /** key `${verb}:${sha1}` → { verb, id, file?, tries, limits, busies, rests, stamp, url, urlAt, state: "idle" | "asking" | "xfer" | "done" | "rest", timer, until } */
+  const tasks = new Map();
+  const queue = [];
+  const slots = { PUT: 0, GET: 0 };
+  const fileFns = new Set(), failFns = new Set();
+  let link = null, live = false, inflight = null, lastAsk = -Infinity, gapTimer = null;
+
+  /** The server may answer a path (no PUBLIC_URL): it is relative to where this client connected. */
+  const resolve = u => { try { return new URL(u, base).href; } catch { return u; } };
+  const emit = (fns, v) => { for (const fn of fns) { try { fn(v); } catch {} } };
+  const clearTimer = t => { if (t.timer != null) { clock.clear(t.timer); t.timer = null; } };
+  const tell = (t, code) => emit(failFns, { id: t.id, verb: t.verb, code, retrying: true });
+  /** Put a task in line (any timer it still holds is stale: it is cleared here, in the one place every route goes through). */
+  const enqueue = t => { if (t.state === "done") return; clearTimer(t); t.state = "idle"; if (!queue.includes(t)) queue.push(t); pump(); };
+  const finish = t => { clearTimer(t); t.state = "done"; t.file = undefined; t.url = null; };
+  /** Rest. An upload wakes itself after REST_MS (a picture someone placed must go up eventually); a download rests longer each round and waits for want(). */
+  function rest(t, wake = false) {
+    clearTimer(t); t.state = "rest"; t.url = null;
+    if (t.verb === "GET") t.until = clock.mono() + Math.min(MAX_REST_MS, REST_MS * 2 ** (t.rests++));
+    else t.until = clock.mono() + REST_MS;
+    if (wake && t.verb === "PUT") t.timer = clock.set(() => { t.timer = null; if (t.state !== "rest") return; t.tries = t.limits = t.busies = 0; enqueue(t); }, REST_MS);
+  }
+  /**
+   * A failure that can pass: ask again after a backoff. A `limit` (the gateway's rate, PROTOCOL.md § Blobs) is not a
+   * failed try: it backs off past the put window instead (2, 4, 8, 16, then 30 s) and is told to the user once.
+   */
+  function retry(t, limited = false) {
+    clearTimer(t); t.url = null;
+    if (limited) {
+      if (t.verb === "PUT" && !t.toldLimit) { t.toldLimit = true; tell(t, "limit"); }
+      if (++t.limits > MAX_LIMITS) return rest(t, true);
+    } else if (++t.tries >= MAX_TRIES) {
+      if (t.verb === "PUT" && !t.toldGaveUp) { t.toldGaveUp = true; tell(t, "gave-up"); }
+      return rest(t, true);
+    }
+    t.state = "idle";
+    const wait = limited ? Math.min(30_000, 2000 * 2 ** Math.min(t.limits - 1, 4)) : Math.min(30_000, 1000 * 2 ** (t.tries - 1));
+    t.timer = clock.set(() => { t.timer = null; enqueue(t); }, wait * (0.5 + Math.random() / 2));
+  }
+  /** The server was reachable but full (503 busy) or reading this token already (409): wait its Retry-After, then send the same URL again. Not a failed try. */
+  function busy(t, retryAfter) {
+    clearTimer(t);
+    if (!t.toldBusy) { t.toldBusy = true; tell(t, "busy"); }
+    if (++t.busies > MAX_BUSY) return rest(t, true);
+    t.state = "idle";
+    const secs = Number(retryAfter);
+    t.timer = clock.set(() => { t.timer = null; enqueue(t); }, Math.min(30_000, Math.max(1000, (Number.isFinite(secs) ? secs : 2) * 1000)) * (1 + Math.random() / 2));
+  }
+  /** A failure that won't pass by asking again. */
+  function fatal(t, code) { if (t.verb === "PUT") emit(failFns, { id: t.id, verb: t.verb, code }); rest(t); t.until = Infinity; }
+
+  function pump() {
+    for (;;) {
+      const t = queue.find(x => slots[x.verb] < CAP[x.verb]);
+      if (!t) return;
+      if (t.url && clock.mono() - t.urlAt < URL_FRESH_MS) { queue.splice(queue.indexOf(t), 1); transfer(t, t.url); continue; }   // a URL still good: no new ask
+      t.url = null;
+      if (!live || inflight || gapTimer != null) return;
+      const wait = lastAsk + GAP_MS - clock.mono();
+      if (wait > 0) { gapTimer = clock.set(() => { gapTimer = null; pump(); }, wait); return; }
+      queue.splice(queue.indexOf(t), 1);
+      t.state = "asking"; inflight = t; lastAsk = clock.mono();
+      link.send({ t: "blob", sha1: t.id, ...(t.verb === "PUT" ? { put: true } : {}) });
+      t.timer = clock.set(() => { t.timer = null; if (inflight === t) { inflight = null; retry(t); pump(); } }, ASK_TIMEOUT_MS);
+      return;
+    }
+  }
+
+  async function transfer(t, url) {
+    if (t.state === "done" || (t.verb === "PUT" && !t.file)) return;   // never run on a finished task
+    slots[t.verb]++; t.state = "xfer"; clearTimer(t);
+    const ctl = new AbortController();
+    t.timer = clock.set(() => { t.timer = null; ctl.abort(); }, XFER_TIMEOUT_MS[t.verb]);
+    try {
+      if (t.verb === "PUT") {
+        const m = /^data:([^;,]+);base64,(.*)$/s.exec(t.file.dataURL);
+        if (!m) return fatal(t, "bad-file");
+        const res = await fetchFn(url, { method: "PUT", body: Uint8Array.from(atob(m[2]), c => c.charCodeAt(0)), headers: { "content-type": m[1] }, signal: ctl.signal });
+        if (res.ok) return finish(t);
+        const err = (await res.json().catch(() => null))?.error;
+        if ((res.status === 503 && err === "busy") || (res.status === 409 && err === "in-flight")) return busy(t, res.headers.get("retry-after"));
+        if (RETRY_STATUS.has(res.status)) return retry(t);
+        return fatal(t, err ?? `http-${res.status}`);
+      }
+      const res = await fetchFn(url, { signal: ctl.signal });
+      if (res.ok) {
+        const type = res.headers.get("content-type") ?? "";
+        if (!RASTER.test(type)) return fatal(t, "not-image");
+        const file = { id: t.id, mimeType: type, dataURL: `data:${type};base64,${b64(new Uint8Array(await res.arrayBuffer()))}` };
+        finish(t); emit(fileFns, file); return;
+      }
+      return RETRY_STATUS.has(res.status) ? retry(t) : fatal(t, `http-${res.status}`);
+    } catch { retry(t); }          // a network error, or the abort of a transfer that took too long
+    finally { slots[t.verb]--; pump(); }
+  }
+
+  /** The current connection ended (a drop, a reopen, a close): the request in flight is asked again at the next welcome. */
+  const lost = which => {
+    if (which !== link) return;
+    live = false;
+    const t = inflight; inflight = null;
+    if (t) enqueue(t);
+  };
+  const fresh = (verb, id, stamp) => ({ verb, id, tries: 0, limits: 0, busies: 0, rests: 0, stamp, url: null, urlAt: 0, state: "idle", timer: null, until: 0 });
+
+  return {
+    /** Wrap a transport: read what is ours, pass the rest on. */
+    attach(tr) {
+      let handler = () => {};
+      const self = { ...tr,
+        onMessage(fn) { handler = fn; },
+        onDrop: tr.onDrop ? fn => tr.onDrop(() => { lost(self); fn(); }) : undefined,
+        reopen() { lost(self); return tr.reopen(); },
+        close() { lost(self); if (link === self) link = null; return tr.close(); } };
+      tr.onMessage(m => {
+        if (self !== link) return handler(m);
+        if (m?.t === "welcome") {
+          live = true;
+          for (const t of tasks.values()) if (t.state === "rest" && t.until !== Infinity) { t.tries = t.limits = t.busies = t.rests = 0; enqueue(t); }
+          handler(m); pump(); return;
+        }
+        const t = inflight;
+        const mine = m?.t === "blob" ? m.sha1 : m?.t === "error" && typeof m.sha1 === "string" && m.id === undefined ? m.sha1 : null;
+        if (mine === null) return handler(m);
+        if (!t || t.id !== mine) return;                       // a late answer to a request already given up on
+        clearTimer(t); inflight = null;
+        if (m.t === "blob") { t.url = resolve(m.url); t.urlAt = clock.mono(); queue.unshift(t); t.state = "idle"; }   // transfer as soon as its verb has a slot
+        else if (RETRY_CODES.has(m.code)) retry(t, m.code === "limit");
+        else fatal(t, m.code);
+        pump();
+      });
+      lost(link); link = self; live = false;
+      return self;
+    },
+    put(file) {
+      if (!SHA1.test(file?.id) || typeof file.dataURL !== "string") return;
+      const k = `PUT:${file.id}`, old = tasks.get(k);
+      if (old) { if (old.state === "rest") { Object.assign(old, { file, tries: 0, limits: 0, busies: 0, toldLimit: false, toldGaveUp: false, toldBusy: false, until: 0 }); enqueue(old); } return; }   // the same picture again: only a rested (failed) upload is tried again
+      const t = { ...fresh("PUT", file.id), file };
+      tasks.set(k, t); enqueue(t);
+    },
+    /** @param {string} id @param {string} [stamp] what the document says about this picture (changes when an element showing it changes): a new stamp ends a rest */
+    want(id, stamp) {
+      if (!SHA1.test(id)) return;                              // a bad id would hold the one request slot for nothing
+      const k = `GET:${id}`, t = tasks.get(k);
+      if (!t) { const n = fresh("GET", id, stamp); tasks.set(k, n); return enqueue(n); }
+      const changed = stamp !== undefined && t.stamp !== stamp;
+      if (changed) t.stamp = stamp;
+      const waiting = t.state === "rest" && t.until !== Infinity, backoff = t.state === "idle" && t.timer != null;   // resting, or between tries
+      if ((waiting && (changed || t.until <= clock.mono())) || (backoff && changed)) { t.tries = t.limits = t.busies = 0; if (changed) t.rests = 0; enqueue(t); }
+      else if (t.state === "done") { tasks.delete(k); this.want(id, stamp); }   // asked for again after it arrived: the Editor lost it, fetch again
+    },
+    onFile: fn => { fileFns.add(fn); },
+    onFail: fn => { failFns.add(fn); },
+  };
+}
+
+/**
+ * The net (web/ports/net.js) over WebSockets: one wsTransport per join() to the same gateway URL, and the picture path
+ * (blobClient above: put, want, onFile, onFail).
+ * @param {{ url: string, WebSocket: new (url: string) => any, fetch?: typeof fetch,
+ *           clock?: Pick<import("../../ports/clock.js").Clock, "mono" | "set" | "clear"> }} o
  * @returns {import("../../ports/net.js").Net}
  */
-export function wsNet({ url, WebSocket: WS, clock }) {
+export function wsNet({ url, WebSocket: WS, fetch: fetchFn = globalThis.fetch?.bind(globalThis), clock }) {
   if (typeof url !== "string" || !/^wss?:\/\//.test(url)) throw new TypeError("wsNet: a ws:// or wss:// url is required");
-  return { kind: "ws", join: () => wsTransport({ url, WebSocket: WS, ...(clock ? { clock } : {}) }), put: () => {}, onFile: () => {} };
+  const blobs = blobClient({ fetch: (...a) => fetchFn(...a), clock: clock ?? globalClock, base: url.replace(/^ws/, "http") });
+  return { kind: "ws", join: () => blobs.attach(wsTransport({ url, WebSocket: WS, ...(clock ? { clock } : {}) })),
+    put: f => blobs.put(f), want: (id, stamp) => blobs.want(id, stamp), onFile: fn => blobs.onFile(fn), onFail: fn => blobs.onFail(fn) };
 }
 
 /** The gateway's URL for a page at `loc` (same origin, path /ws; wss on https). Never carries a token. */

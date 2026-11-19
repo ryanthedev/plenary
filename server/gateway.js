@@ -23,11 +23,11 @@
 // there is no room for is told `unavailable`, a reader that drains nothing for stallMs is cut, whatever it sends.
 
 import { jsonCodec } from "../packages/protocol/codec.js";
-import { ROLES, MAX_CLIENT_CHARS, PROTOCOL_VERSION, RULES_VERSION, MAX_WRITER_CONNS, MAX_TAB_CONNS, opProblem, parseOpId, isTab } from "../packages/protocol/envelope.js";
+import { ROLES, MAX_CLIENT_CHARS, PROTOCOL_VERSION, RULES_VERSION, MAX_WRITER_CONNS, MAX_TAB_CONNS, opProblem, parseOpId, isTab, canWrite } from "../packages/protocol/envelope.js";
 import { presenceProblem, presenceLimiter, presenceCoalescer, EMOTES } from "../packages/protocol/presence.js";
 import { subjects, busBytes, MAX_BUS_BYTES } from "./bus/port.js";
 import { boardFeed } from "./feed.js";
-import { isId } from "./ids.js";
+import { isId, isSha1 } from "./ids.js";
 import { quietLogger } from "./log.js";
 import { breathe } from "./breather.js";
 import { identityKey } from "./auth/tenancy.js";   // the one spelling of the re-check grouping key (p5-load)
@@ -89,6 +89,8 @@ export const LIMITS = {
   herePublishMs: 5_000,                     // `.here` published at least this often
   hereTtlMs: 15_000,                        // another gateway's `.here` counts this long
   hereBigBoard: 1_000,                      // more connections than this on a board here…
+  blobRate: 10,                             // § Blobs: `blob` requests per second per connection (a token bucket of this size)
+  blobPutsPerMin: 30,                       // § Blobs: put URLs per minute per (user, board) on this gateway
   hereBigMs: 5_000,                         // …and `here` goes to them at most this often
   feed: {},                               // options for each board's feed (pollMs, chunkBytes, …; tests)
 };
@@ -131,9 +133,10 @@ const OP_ID = /^\s*\{\s*"t"\s*:\s*"op"\s*,\s*"id"\s*:\s*"([^"\\]{1,256})"/;
  *   rooms: { open(tenant: string, board: string): Promise<void> },
  *   onWelcomed?: (user: string, board: string) => void,   // called after a connection is welcomed (Recent, PROTOCOL.md § Home); must not throw or block
  *   log?: object, codec?: object, id?: string, limits?: Partial<typeof LIMITS>, now?: () => number,
+ *   blobUrl?: (tenant: string, board: string, sha1: string, verb: "GET" | "PUT", user: string) => Promise<string>,   // signs a blob URL (blob-access.js); absent: `blob` requests get `unavailable`
  * }} o
  */
-export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed, timers = globalThis, onWelcomed = null }) {
+export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed, timers = globalThis, blobUrl = null, onWelcomed = null }) {
   // Every timer of the gateway runs on `timers` (tests pass fake ones, with `now` moved in step); the names shadow the globals here.
   const { setTimeout, clearTimeout, setInterval, clearInterval } = timers;
   const lim = { ...LIMITS, ...limits };
@@ -405,6 +408,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
   const sweep = setInterval(() => {
     try {
       const t = now();
+      for (const [k, a] of putTimes) if (!a.length || t - a[a.length - 1] >= 60_000) putTimes.delete(k);
       for (const ws of [...conns.values()]) {
         const c = ws.data;
         if (c.state !== "live") continue;
@@ -1026,6 +1030,39 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     pumpOps(ws);
   }
 
+  // § Blobs: put URLs per (user, board), a sliding minute; the keys with nothing left in the window go in the sweep.
+  const putTimes = new Map();
+  const putAllowed = key => {
+    const t = now(), a = (putTimes.get(key) ?? []).filter(x => t - x < 60_000);
+    if (a.length >= lim.blobPutsPerMin) { putTimes.set(key, a); return false; }
+    a.push(t); putTimes.set(key, a); return true;
+  };
+
+  /**
+   * § Blobs: `{ t: "blob", sha1, put? }` → `{ t: "blob", sha1, url }`, or an `error` with no id and the request's sha1.
+   * Not through badFrame: a refused request is no strike and never closes the connection. Tenant and board are the
+   * connection's own, never the message's.
+   */
+  async function blob(ws, msg) {
+    const c = ws.data;
+    const sha = typeof msg.sha1 === "string" && msg.sha1.length <= 64 ? { sha1: msg.sha1 } : {};   // echoed even when malformed (a short string only), so the client's request slot is freed
+    const no = (code, message) => push(ws, codec.encode({ t: "error", ...sha, code, message }));
+    if (!c.welcomed) return no("auth", "wait for welcome");
+    const t = now();                                         // 10/s per connection, every request counted (refused ones too)
+    c.blobTokens = Math.min(lim.blobRate, (c.blobTokens ?? lim.blobRate) + ((t - (c.blobAt ?? t)) / 1000) * lim.blobRate); c.blobAt = t;
+    if (c.blobTokens < 1) return no("limit", "too many blob requests: ask again shortly");
+    c.blobTokens -= 1;
+    if (!isSha1(msg.sha1) || (msg.put !== undefined && msg.put !== true)) return no("bad-op", "a blob request is { sha1: 40 lowercase hex, put?: true }");
+    const put = msg.put === true;
+    if (put ? !(canWrite(c.role, "board") || canWrite(c.role, "notes")) : !c.role) return no("forbidden", put ? `${c.role} can't upload pictures` : "no role on this board");
+    if (put && !putAllowed(`${c.tenant}/${c.board}/${c.user}`)) return no("limit", "too many uploads: ask again later");
+    if (!blobUrl) return no("unavailable", "this server stores no pictures");
+    let url;
+    try { url = await blobUrl(c.tenant, c.board, msg.sha1, put ? "PUT" : "GET", c.user); }
+    catch (err) { log.error("blob url failed", { conn: c.id, err }); return no("unavailable", "try again shortly"); }
+    push(ws, codec.encode({ t: "blob", sha1: msg.sha1, url }));
+  }
+
   /** Presence (§ Presence): checked, rate-limited, relayed over the bus; it never touches the room or the log. */
   function presence(ws, msg) {
     const c = ws.data;
@@ -1063,7 +1100,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     if (msg.t === "presence") return presence(ws, msg);
     // Rule 11: one board per connection. A second hello gets `bad-op` and the connection is closed.
     if (msg.t === "hello") { counts.badFrames++; log.warn("frame refused", { conn: c.id, why: "second-hello", state: c.state }); return refuse(ws, "bad-op", "already said hello", 1008, "second hello"); }
-    // SEAM(p3): `blob` (signed URLs) is not served yet; it is refused like an unknown type.
+    if (msg.t === "blob") return blob(ws, msg);
     badFrame(ws, "unknown-type", "unknown message type");
   }
 

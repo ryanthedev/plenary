@@ -12,6 +12,8 @@ import { tempDir, cleanup, until } from "./helpers.js";
 import { sock } from "./rig.js";
 
 afterAll(cleanup);
+// The rig's S3 (the cluster's picture storage): a cluster node refuses to start without it. Many nodes share it, which the single-gateway local-disk opt-in could not serve.
+const S3_ENV = () => Object.fromEntries(["S3_ENDPOINT", "S3_BUCKET", "S3_REGION", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"].filter(k => process.env[k]).map(k => [k, process.env[k]]));
 const PG = process.env.DATABASE_URL, NATS = process.env.NATS_URL;
 const TTL = 3_000;
 const TOKEN = "S3CR3T-isolation-token";
@@ -32,7 +34,7 @@ describe.skipIf(!PG || !NATS)("two clusters on one NATS", () => {
     const u = new URL(PG); u.pathname = "/" + name; return u.toString();
   };
   const node = async (dbUrl, id, roles) => {
-    const app = await start({ DATABASE_URL: dbUrl, NATS_URL: NATS, COOKIE_KEY: "c".repeat(40), PLENARY_DEV_TOKENS: TOKENS, LOG_LEVEL: "error", PORT: "0",
+    const app = await start({ DATABASE_URL: dbUrl, NATS_URL: NATS, COOKIE_KEY: "c".repeat(40), ...S3_ENV(), PLENARY_DEV_TOKENS: TOKENS, LOG_LEVEL: "error", PORT: "0",
       PLENARY_NODE_ID: id, PLENARY_ROLES: roles, PLENARY_LEASE_TTL_MS: String(TTL), PLENARY_DATA_DIR: tempDir(`plenary-iso-${id}-`) }, { write: () => {} });
     apps.push(app);
     return { app, url: `http://127.0.0.1:${app.server.port}`, ws: `ws://127.0.0.1:${app.server.port}/ws`, dbUrl };

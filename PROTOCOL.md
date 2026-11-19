@@ -261,7 +261,7 @@ Server → client
 | `here` | `writers: [{ user, name, role }]` (≤ 50), `writerCount`, `viewers` (count) | who's on the board (§ Presence); sent on change, at most 1/s (every 5 s on big boards); without `writers` when only a count changed |
 | `emotes` | `counts: { emoji: n }` | viewers' emotes summed per 500 ms |
 | `blob` | `sha1`, `url` | a signed URL, 5 minutes, one blob, one verb |
-| `error` | `id?`, `code`, `message` | codes below |
+| `error` | `id?`, `sha1?`, `code`, `message` | codes below; `sha1` only on a refused `blob` request (§ Blobs) |
 
 Error codes, and what the client does:
 
@@ -274,7 +274,7 @@ Error codes, and what the client does:
 | `auth` | bad token, unknown board, no role, or no hello yet; the connection is closed | keep pending ops; sign in again, then reconnect |
 | `version` | unknown protocol `v` | stop; the app must update |
 
-An `error` with no `id` is not about an op (a `blob` request: `bad-op`, `forbidden`, `limit`; a ninth writer
+An `error` with no `id` is not about an op (a `blob` request, which also carries its `sha1`: `bad-op`, `forbidden`, `limit`, `unavailable`; a ninth writer
 tab or a third connection of one tab: `limit`, then closed; an op frame with no readable id: `bad-op`; or a connection-wide `unavailable`,
 `auth`, `version`): nothing pending is dropped for it. Each ends: a `blob` refusal ends with that request (ask
 again later); a connection-level one ends the connection, and the client reconnects with backoff (or signs in
@@ -1118,19 +1118,62 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
 
 ### Blobs
 
-- `put(tenant, sha1, bytes)`, `get(tenant, sha1) → bytes | null`.
-- **No token on HTTP.** A client asks over its socket: `{ t: "blob", sha1, put?: true }`; the server checks the role
-  and answers `{ t: "blob", sha1, url }`, a signed URL scoped to (tenant, board, sha1, GET or PUT), valid 5 minutes.
-  Works for `<img>`, browsers and Herdr alike, and keeps the token out of headers and URLs.
-- **`sha1` is exactly 40 lowercase hex characters.** Anything else is answered `bad-op` (an `error` with no `id`)
-  before the server signs anything or calls Blobs, so no adapter ever sees a key like `../other-tenant/x`.
-- **Rates:** `blob` requests 10/s per connection; put URLs 30 per minute per user per board. Over → `error`
-  `limit` with no `id` (nothing is dropped; ask again later).
+- `put(tenant, sha1, bytes) → boolean` (true: stored now; false: the tenant already had it), `get(tenant, sha1) → bytes | null`,
+  `usage(tenant) → bytes` (the total the tenant's blobs take; the quota's starting point).
+- **No token on HTTP.** A client asks over its socket (on the connection that has been welcomed, never a second one):
+  `{ t: "blob", sha1, put?: true }`; the gateway checks the role and answers `{ t: "blob", sha1, url }`, a signed URL
+  scoped to (tenant, board, sha1, GET or PUT), valid 5 minutes. The tenant and board are the connection's, never the
+  message's. Works for `<img>`, browsers and Herdr alike, and keeps the token out of headers and URLs.
+- **`sha1` is exactly 40 lowercase hex characters, and `put` is `true` or absent.** Anything else is answered
+  `bad-op` before the server signs anything or calls Blobs, so no adapter ever sees a key like `../other-tenant/x`.
+- **Refusals** are an `error` with no `id` and the request's `sha1` (echoed as given when it is a string of at most 64 characters, even a malformed one), so the client matches it
+  to its request; nothing else is dropped for it. `bad-op` (shape), `forbidden` (role), `limit` (rate), `unavailable`
+  (this node has no blob store, or signing is down: ask again later), `auth` (before `welcome`; the connection stays).
+  Checks run in this order: rate, shape, role, put rate.
+- **Rates:** `blob` requests 10/s per connection (every request counts, refused ones too); put URLs 30 per minute per
+  user per board per gateway. Over -> `error` `limit` (ask again later).
+- **The URL is `<PUBLIC_URL>/blobs/<token>`** when `PUBLIC_URL` is set, else the path `/blobs/<token>`, which the client
+  resolves against the origin it connected to (the `ws` URL with `http`). `token = base64url(payload) "." base64url(HMAC-SHA256(key, "b1." payload))`,
+  `payload` the JSON `{ tenant, board, sha1, verb: "GET" | "PUT", user?, exp }` (`exp` in epoch ms). `key` is derived from the
+  deployment's shared `COOKIE_KEY`, so every gateway verifies every other gateway's URLs; a single node without one
+  signs with a random key per process, so a URL does not survive a restart (the client asks again). A bad, forged,
+  tampered or expired token is `401 { "error": "bad-token" }`, a verb other than the token's is `405`. The role is
+  checked when the URL is asked for, not when it is used: a URL is a 5-minute bearer capability.
+- **A cluster must name its storage.** `main.js` refuses a cluster node (`DATABASE_URL`/`NATS_URL`) without `S3_ENDPOINT`:
+  a picture put through one node would be unreadable through another. `PLENARY_BLOBS=local-disk` opts a cluster with a
+  single gateway into disk (the start warns).
 - **A signed PUT URL ends at our server**, never directly at S3: the server must hash and type-check the bytes
   before they are stored.
+- **`PUT /blobs/<token>`** (a put URL): the body is the bytes, with a `Content-Length` (chunked bodies are refused).
+  The server refuses before reading more than 10 MB, hashes the bytes and refuses a mismatch, checks they are a
+  PNG, JPEG, GIF or WebP (SVG refused), then reserves quota and stores. The first bytes for a hash are kept: a put
+  of a stored blob succeeds without storing. `201` stored now, `200` already stored, `400 bad-length` (no or
+  zero length), `413 too-large`, `415 not-image`, `422 hash-mismatch`, `507 quota`, `503 unavailable`
+  (the store failed or took too long; safe to retry), `503 busy` (a node reads at most 8 PUT bodies at once and one account (per tenant, across its boards) at most 2; retry), `409 in-flight` (a second PUT on a token already being read), `408 timeout` (the whole body must arrive within 120 s however slowly it drips; retryable), `401`.
+  The body is read as it arrives (memory follows the bytes sent, not the `Content-Length` claimed). Bodies are JSON `{ "error": code }`.
+- **`GET /blobs/<token>`** (a get URL): `200` with the bytes, `Content-Type` of the sniffed kind, `X-Content-Type-Options:
+  nosniff`, `Cache-Control: no-store`, and a `Content-Security-Policy: default-src 'none'; sandbox`; `404 not-found`
+  (nothing stored under that hash yet: an element's op can arrive before its upload finishes, so a client retries);
+  `503 unavailable`; `401`.
 - Upload needs write on `board` or `notes` (not `records`: commenters can't place images); reading needs any role
-  on the board. The server hashes the bytes and refuses a mismatch; cap **10 MB**; per-tenant quota (§ Limits);
-  images only (PNG, JPEG, GIF, WebP; SVG refused). Put is idempotent: the first bytes for a hash are kept.
+  on the board, a viewer included. Cap **10 MB**.
+- **Quota** (default 10 GB per tenant, `PLENARY_BLOB_QUOTA_BYTES`): a node reads `usage(tenant)` once (its first put
+  for that tenant), then adds what it stores. A put reserves its bytes before storing and gives them back when it
+  fails or the blob was already there, so concurrent puts on one node never go over. Several nodes each count their own
+  puts after the first read: the real overshoot is at most the sum of what the other nodes store before this one
+  restarts (Known limits).
+- **Client rules** (web client, `wsNet`): an upload is `blob` ask then PUT; a download is `blob` ask then GET. Only
+  well-formed ids (40 lowercase hex) are asked for. A failure that can pass (no welcome yet, a dropped connection,
+  `unavailable`, 408, 429, 5xx, a network error, a timeout) is asked again with backoff on a fresh URL, up to 6 tries;
+  a GET `404` the same way (not yet). A `limit` is not a failed try: it backs off (2 s doubling to 30 s, up to 20
+  times) and the user is told once. A PUT answered `503 busy` or `409 in-flight` was reachable, not failed: the client waits
+  the `Retry-After` and sends the same URL again while it is fresh (4 minutes), without a new ask or a counted try, and says
+  "the server is busy" once. At most 2 PUTs (the server's per-account cap) and 4 GETs run at once; a PUT may take up to
+  150 s (the server's body deadline is 120 s). After the tries, a download rests 30 s, doubling each round up to 10 min (asked again by the next `want` after the rest, at once when a
+  document change touching that picture arrives, and after a reconnect), an upload
+  wakes itself after 30 s and tries again, so a picture someone placed always goes up once the server takes it. `quota`,
+  `too-large`, `not-image`, `hash-mismatch`, `forbidden` and `bad-op` are final and shown to the user. Requests wait
+  for `welcome` and are asked again after every reconnect.
 - Bytes never travel in ops. A blob is stored once per tenant, shared by that tenant's boards.
 
 ## Known limits of v1.1
@@ -1142,7 +1185,11 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   a pane that still holds the file's old copy can write it back. A copy at 1,001 or just above (within 1,000 of
   the room's version) is accepted and undoes later edits to it without a word; anything higher is held back with
   a warning. drawh warns at import time.
-- Within a tenant, a guest with a role on one board can read another board's blob if they know its SHA-1.
+- **Blobs are tenant-wide, by decision.** Within a tenant, anyone with a role on one board can read another board's blob
+  if they know its SHA-1. Hashes are not guessable, and a `200` against a `404` only tells you whether the tenant holds
+  an image whose bytes you already have. Per-board blobs would cost storage and cross-board dedupe; not done.
+- **`/blobs/*` sends no CORS headers**, so the page must be same-origin with it: `PUBLIC_URL` must be the origin the
+  page is served from (unset, the URL is a path and always is).
 - **SHA-1 keys, first put wins:** a tenant writer able to make a chosen-prefix collision could plant bytes another
   user's image later resolves to. Small in practice; the fix (key by SHA-256, keep `fileId` as a lookup) is open.
 - Blobs are never garbage-collected; only the quota bounds them.
@@ -1155,7 +1202,9 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
 - **The op rate is per gateway:** a user connected through G gateways can write up to G × 8 connections × 20
   ops/s. The connection cap (8 per user per board) is per gateway too.
 - **Blob quota:** any writer, guests included, can fill the tenant's quota at the put rate (300 MB a minute).
-  Per-user quotas are M6.
+  Per-user quotas are M6. The count is per node after its first read of `usage` (§ Blobs): with N nodes a tenant can
+  overshoot by what the other N-1 store until a node restarts. A tab closed before its upload finishes leaves an
+  element whose bytes only that tab ever had (the placeholder, for everyone else).
 - **Checkpoint bodies aren't checksummed** by the protocol (the pure package has no hash in every runtime); a
   damaged body is the Store adapter's to detect. The whole log is kept, so a rebuild from 0 always works.
 - **Author names on comments are the name at write time** and stay in the log.

@@ -196,7 +196,7 @@ export function staticSite({ mounts = DEFAULT_MOUNTS, log = { info() {}, warn() 
     if (req.method !== "GET" && req.method !== "HEAD") return null;
     const path = url.pathname;
     if (!safePath(path)) return null;
-    const key = path === "/" ? "/index.html" : path;
+    const key = path === "/" ? "/index.html" : path === "/favicon.ico" ? "/favicon.svg" : path;
     if (denied(key)) return null;                      // belt and braces: the map never holds one
     const file = files.get(key);
     if (!file) return null;

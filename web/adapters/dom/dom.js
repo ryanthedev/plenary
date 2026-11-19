@@ -14,6 +14,13 @@ export function h(tag, attrs = {}, ...kids) {
     else el.setAttribute(k, v === true ? "" : String(v));
   }
   for (const k of kids.flat(Infinity)) if (k != null && k !== false) el.append(k instanceof Node ? k : document.createTextNode(String(k)));
+  if (name === "button" && el.classList?.contains("tb")) {
+    const label = attrs?.["aria-label"] ?? attrs?.title ?? el.textContent.trim();
+    if (label) {
+      el.setAttribute("aria-label", label);
+      if (!attrs?.title) el.setAttribute("title", label);
+    }
+  }
   return el;
 }
 export const $ = (sel, root = document) => root.querySelector(sel);

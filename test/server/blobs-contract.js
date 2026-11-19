@@ -94,4 +94,23 @@ export function blobsContract(label, makeBlobs, { skip = false } = {}) {
     await Promise.all(Array.from({ length: 8 }, () => blobs.put(ta, h, bytes)));
     expect(await blobs.get(ta, h)).toEqual(bytes);
   });
+
+  t(`${label}: put answers true when it stored the blob and false when the tenant already had it`, async () => {
+    const blobs = await makeBlobs(), ta = freshTenant(), tb = freshTenant();
+    const bytes = fakePng(150, 11), h = sha1(bytes);
+    expect(await blobs.put(ta, h, bytes)).toBe(true);
+    expect(await blobs.put(ta, h, bytes)).toBe(false);
+    expect(await blobs.put(tb, h, bytes)).toBe(true);        // another tenant's copy is its own
+  });
+
+  t(`${label}: usage is the bytes the tenant's blobs take: 0 when empty, once per blob, per tenant, ids checked`, async () => {
+    const blobs = await makeBlobs(), ta = freshTenant(), tb = freshTenant();
+    expect(await blobs.usage(ta)).toBe(0);
+    const a = fakePng(150, 12), b = fakePng(333, 13), c = fakePng(77, 14);
+    await blobs.put(ta, sha1(a), a); await blobs.put(ta, sha1(b), b); await blobs.put(ta, sha1(b), b);
+    await blobs.put(tb, sha1(c), c);
+    expect(await blobs.usage(ta)).toBe(150 + 333);
+    expect(await blobs.usage(tb)).toBe(77);
+    for (const bad of ["..", "a/b", "", null]) expect(await code(blobs.usage(bad))).toBe("bad-id");
+  });
 }

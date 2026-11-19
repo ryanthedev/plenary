@@ -18,7 +18,7 @@ import { cleanup, tempDir, sleep, until, deferred, spawnTracked } from "./helper
 afterAll(cleanup);
 
 const PW = "Hunter2-FAKE-pw", TOK = "Tok3n-FAKE-nats";
-const KEY = { COOKIE_KEY: "k".repeat(32) };
+const KEY = { COOKIE_KEY: "k".repeat(32), PLENARY_BLOBS: "local-disk" };   // a cluster start must name its picture storage (these tests start none)
 const PG = `postgres://plen:${PW}@127.0.0.1:1/plenary`;
 
 /** start(env) that must be refused; returns the error and the captured lines. */

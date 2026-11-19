@@ -15,7 +15,7 @@ import { tempDir, cleanup, sleep } from "./helpers.js";
 afterAll(cleanup);
 
 const ID = "c-0123456789abcdef";
-const env = () => ({ PLENARY_DATA_DIR: tempDir(), PORT: "0", LOG_LEVEL: "info", DATABASE_URL: "postgres://u:pw@127.0.0.1:1/p", NATS_URL: "nats://127.0.0.1:1", COOKIE_KEY: "k".repeat(32) });
+const env = () => ({ PLENARY_DATA_DIR: tempDir(), PORT: "0", LOG_LEVEL: "info", DATABASE_URL: "postgres://u:pw@127.0.0.1:1/p", NATS_URL: "nats://127.0.0.1:1", COOKIE_KEY: "k".repeat(32), PLENARY_BLOBS: "local-disk" });
 
 /** Fake cluster adapters on SQLite and the memory bus; `store` shapes what the Store says about its cluster id. */
 function adapters(store, seen = {}) {

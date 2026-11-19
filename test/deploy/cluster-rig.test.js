@@ -142,7 +142,8 @@ describe.skipIf(SKIP)("cluster rig (real postgres, nats, caddy; stub nodes)", ()
       // Every node got the contract env; the shared keys are the same everywhere; nothing else leaked in (.env, process.env).
       const infos = await Promise.all(rig.nodes.map(async n => (await fetch(n.url + "/info")).json()));
       const allowed = ["COOKIE_KEY", "DATABASE_URL", "HOME", "HOST", "LANG", "LOG_LEVEL", "NATS_URL", "PATH", "PLENARY_DATA_DIR", "PLENARY_DEV_TOKENS",
-        "PLENARY_LEASE_TTL_MS", "PLENARY_MAX_CONNS_PER_USER", "PLENARY_NODE_ID", "PLENARY_ROLES", "PORT", "SESSION_KEY"];
+        "PLENARY_LEASE_TTL_MS", "PLENARY_MAX_CONNS_PER_USER", "PLENARY_NODE_ID", "PLENARY_ROLES", "PORT", "SESSION_KEY",
+        "S3_ACCESS_KEY_ID", "S3_BUCKET", "S3_ENDPOINT", "S3_REGION", "S3_SECRET_ACCESS_KEY"];   // the nodes get the rig's MinIO: a cluster node refuses to start without picture storage
       for (const [i, info] of infos.entries()) {
         const n = rig.nodes[i];
         expect(info).toMatchObject({ node: n.id, roles: n.roles, port: n.port, leaseTtlMs: 4321, databaseUrl: rig.postgres.url, natsUrl: rig.nats.url, dataDir: n.dataDir, maxConnsPerUser: 100000 });

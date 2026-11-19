@@ -41,5 +41,8 @@ test("ddlColumns: the columns of a Postgres DDL string, minus table constraints,
   expect(ddlColumns("tenant TEXT NOT NULL, board TEXT NOT NULL, seq BIGINT NOT NULL, PRIMARY KEY (tenant, board, seq)")).toEqual(["tenant", "board", "seq"]);
   expect(ddlColumns("id TEXT NOT NULL, singleton BOOLEAN NOT NULL DEFAULT true PRIMARY KEY CHECK (singleton)")).toEqual(["id", "singleton"]);
   expect(ddlColumns(`tenant TEXT NOT NULL REFERENCES "s".reg_tenants(id), grp TEXT REFERENCES "s".reg_groups(id), UNIQUE (tenant, owner_user)`)).toEqual(["tenant", "grp"]);
+  expect(ddlColumns("d TEXT DEFAULT 'a,b', e TEXT")).toEqual(["d", "e"]);                    // a comma inside a literal
+  expect(ddlColumns("d TEXT DEFAULT 'it''s, ok', e TEXT, f TEXT CHECK (f <> '(')")).toEqual(["d", "e", "f"]);   // an escaped quote, and a parenthesis inside a literal
+  expect(ddlColumns(`"a,b" TEXT, c TEXT`)).toEqual(["a,b", "c"]);
   expect(ddlColumns("n BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE")).toEqual(["n", "id"]);
 });

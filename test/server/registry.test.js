@@ -171,7 +171,7 @@ describe("sqlite registry", () => {
       good.close();
       db.run(`CREATE TABLE ${table} (${cols.map(c => `${c} TEXT`).join(", ")})`);
       db.close();
-      let err; const fds = readdirSync("/dev/fd").length;
+      let err; Bun.gc(true); const fds = readdirSync("/dev/fd").length;   // collect an earlier test's handle first, or it could finalize between the two counts
       try { sqliteRegistry({ path, fullfsync: false }); } catch (e) { err = e; }
       expect([table, err?.code]).toEqual([table, "old-format"]);
       expect(readdirSync("/dev/fd").length).toBe(fds);                                                                      // the refused open left no handle (an rmSync would pass either way)

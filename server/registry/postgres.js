@@ -71,9 +71,9 @@
 // owns that pool) or `sql` (a Bun SQL client you own). `schema` names the Postgres schema. Never reads env.
 
 import { SQL } from "bun";
-import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId } from "../auth/registry-port.js";
+import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
-import { needSchema, migrate, missing as absent } from "../pg/schema.js";
+import { needSchema, migrate, assertColumns, missing as absent } from "../pg/schema.js";
 
 /**
  * Thrown by `setGrant` when the change would leave a board with no owner ("last-owner"), by a call that ran out of time
@@ -84,8 +84,6 @@ export class PgRegistryError extends Error {
   /** @param {"last-owner" | "limit" | "in-use" | "lock-timeout" | "statement-timeout" | "overloaded" | "queue-timeout" | "client-timeout"} code */
   constructor(code, message, options) {
     super(message, options); this.name = "RegistryError"; this.code = code;
-    // The call never began or was rolled back (registry-port.js, `rolledBack`): a queue refusal, or a lock or statement limit inside a transaction.
-    if (["queue-timeout", "overloaded", "lock-timeout", "statement-timeout"].includes(code)) this.rolledBack = true;
   }
 }
 
@@ -128,9 +126,8 @@ const REGISTRY_TABLE_DDL = {
   // Home (PROTOCOL.md § Home): Recent and Starred. Additive, like the organization tables.
   reg_recents: "member TEXT NOT NULL, board TEXT NOT NULL REFERENCES $S.reg_boards(id), opened_at BIGINT NOT NULL, PRIMARY KEY (member, board)",
   reg_stars: "member TEXT NOT NULL, board TEXT NOT NULL REFERENCES $S.reg_boards(id), at BIGINT NOT NULL, PRIMARY KEY (member, board)",
-  // Idempotent creates (PROTOCOL.md): one row per (member, key); `result` NULL while the create runs. Additive. No migration for `claim`:
-  // the table never shipped without it (it first appears in this branch).
-  reg_idempotency: "member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, claim TEXT NOT NULL, result TEXT, at BIGINT NOT NULL, PRIMARY KEY (member, k)",
+  // Idempotent creates (PROTOCOL.md): one row per (member, key), written in the create's own transaction; `ref` is the id it made.
+  reg_idempotency: "member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, ref TEXT NOT NULL, at BIGINT NOT NULL, PRIMARY KEY (member, k)",
   reg_roles: "tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), id TEXT NOT NULL, name TEXT NOT NULL, base TEXT, board_role TEXT, permissions TEXT NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY (tenant, id)",
 };
 /** Index name → "table (columns)"; created after the tables, only if missing (to_regclass), like the tables. */
@@ -195,6 +192,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       await tx.unsafe("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', '0', true)", [String(lockMs)]);
       await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-schema:${s}`]);
       await migrate(tx, s, registryTables(s));
+      await assertColumns(tx, s, "reg_idempotency", ["member", "k", "fp", "ref", "at"]);   // holds only 24 h of keys; an older shape is reset, never altered
       const noIndex = await absent(tx, s, Object.keys(REGISTRY_INDEXES));
       if (noIndex.length) await tx.unsafe(noIndex.map(name => `CREATE INDEX ${name} ON "${s}".${REGISTRY_INDEXES[name]}`).join(";\n"));
       // Every right on every table, each on its own (the names are constants and `s` passed needSchema).
@@ -240,6 +238,26 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     return err;
   };
   const one = async (q, text, params) => (await q.unsafe(text, params))[0] ?? null;
+  /**
+   * A keyed create's key row, written INSIDE its transaction (the object and the key commit together or not at all). A concurrent create with the
+   * same key waits on the unique index until the first commits or rolls back; a live row rejects the create (the transaction rolls back).
+   */
+  const idemPut = async (tx, idem, ref, t) => {
+    if (!idem) return;
+    const won = await tx.unsafe(`INSERT INTO ${ID} (member, k, fp, ref, at) VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (member, k) DO UPDATE SET fp = excluded.fp, ref = excluded.ref, at = excluded.at WHERE ${ID}.at <= $6 RETURNING 1 AS x`,
+    [idem.user, idem.key, idem.fp, ref, t, t - IDEM.ttlMs]);
+    if (won.length) return;
+    const e = await one(tx, `SELECT fp, ref FROM ${ID} WHERE member = $1 AND k = $2`, [idem.user, idem.key]);
+    if (!e) throw new Error("registry: idempotency row vanished");
+    throw e.fp !== idem.fp ? idemErr.mismatch() : idemErr.replay(e.ref);
+  };
+  /** Validates a create's `idem` and, every IDEM.every-th keyed create, prunes expired rows (its own gated call, never awaited: a failed prune never fails or slows a create). */
+  const idemStart = idem => {
+    const k = idemOf(idem);
+    if (k && ++idemCalls % IDEM.every === 0) api.idemPrune(now()).catch(() => {});
+    return k;
+  };
   /** A fresh server-minted id: retried on the (astronomically rare) collision. */
   const fresh = async (q, f, table) => {
     for (;;) { const id = f(); if (!(await one(q, `SELECT 1 AS x FROM ${table} WHERE id = $1`, [id]))) return id; }
@@ -356,19 +374,21 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       });
     },
 
-    async createBoard({ tenant, title = "", memberRole, space }) {
+    async createBoard({ tenant, title = "", memberRole, space, owner, idem }) {
       ready();
       if (!key(tenant)) throw new Error("registry: no such tenant");
       if (space != null && !key(space)) throw new Error("registry: no such space");
-      const createdAt = now();
+      const k = idemStart(idem), createdAt = now();
       return write(async tx => {
         // Nothing deletes tenants today; the foreign key is the fence if that changes.
         if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
         if (space != null && (await one(tx, `SELECT tenant FROM ${SP} WHERE id = $1`, [space]))?.tenant !== tenant) throw new Error("registry: no such space");
         const id = await fresh(tx, mint.board, BD);
+        await idemPut(tx, k, id, createdAt);
         await tx.unsafe(`INSERT INTO ${BD} (id, tenant, title, member_role, created_at) VALUES ($1, $2, $3, $4, $5)`,
           [id, tenant, String(title), memberRole === undefined ? (space != null ? null : "viewer") : nz(memberRole), createdAt]);
         if (space != null) await tx.unsafe(`INSERT INTO ${BS} (board, space) VALUES ($1, $2)`, [id, space]);
+        if (owner != null) await tx.unsafe(`INSERT INTO ${G} (board, member, role) VALUES ($1, $2, 'owner')`, [id, String(owner)]);
         return rowBoard(await one(tx, `${BOARD_SQL} WHERE b.id = $1`, [id]));
       });
     },
@@ -402,13 +422,14 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       return (await db.unsafe(`SELECT member, role FROM ${G} WHERE board = $1 ORDER BY n`, [board])).map(r => ({ user: r.member, role: r.role }));
     },
 
-    async createInvite({ board, email, role, expiresAt = null, by }) {
+    async createInvite({ board, email, role, expiresAt = null, by, idem }) {
       ready();
       if (!key(board)) throw new Error("registry: no such board");
-      const createdAt = now();
+      const k = idemStart(idem), createdAt = now();
       return write(async tx => {
         if (!(await boardExists(tx, board))) throw new Error("registry: no such board");
         const id = await fresh(tx, mint.invite, I);
+        await idemPut(tx, k, id, createdAt);
         await tx.unsafe(`INSERT INTO ${I} (id, board, email, role, expires_at, revoked, by_user, created_at)
           VALUES ($1, $2, $3, $4, $5, false, $6, $7)`, [id, board, normEmail(email), role, nz(expiresAt), nz(by), createdAt]);
         return rowInvite(await one(tx, `SELECT * FROM ${I} WHERE id = $1`, [id]));
@@ -431,13 +452,14 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       return write(async tx => (await tx.unsafe(`UPDATE ${I} SET revoked = true WHERE id = $1`, [id])).count > 0);
     },
 
-    async createLink({ board, role, expiresAt = null, by }) {
+    async createLink({ board, role, expiresAt = null, by, idem }) {
       ready();
       if (!key(board)) throw new Error("registry: no such board");
-      const createdAt = now();
+      const k = idemStart(idem), createdAt = now();
       return write(async tx => {
         if (!(await boardExists(tx, board))) throw new Error("registry: no such board");
         const id = await fresh(tx, mint.link, L);
+        await idemPut(tx, k, id, createdAt);
         await tx.unsafe(`INSERT INTO ${L} (id, board, role, expires_at, revoked, by_user, created_at)
           VALUES ($1, $2, $3, $4, false, $5, $6)`, [id, board, role, nz(expiresAt), nz(by), createdAt]);
         return rowLink(await one(tx, `SELECT * FROM ${L} WHERE id = $1`, [id]));
@@ -482,13 +504,14 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     },
 
     // ---- organization (PROTOCOL.md § Registry, "Organization") ----
-    async createGroup({ tenant, name, generalRole = null, owner }) {
+    async createGroup({ tenant, name, generalRole = null, owner, idem }) {
       ready();
       if (!key(tenant)) throw new Error("registry: no such tenant");
-      const n = orgDefaults.name(name), createdAt = now();
+      const n = orgDefaults.name(name), k = idemStart(idem), createdAt = now();
       return write(async tx => {
         if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
         const id = await fresh(tx, mint.group, GR);
+        await idemPut(tx, k, id, createdAt);
         await tx.unsafe(`INSERT INTO ${GR} (id, tenant, name, general_role, created_at) VALUES ($1, $2, $3, $4, $5)`, [id, tenant, n, nz(generalRole), createdAt]);
         if (owner != null) await putSg(tx, "group", id, "user", String(owner), "owner");
         return rowGroup(await one(tx, `SELECT * FROM ${GR} WHERE id = $1`, [id]));
@@ -496,15 +519,16 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     },
     async group(id) { ready(); return key(id) ? rowGroup(await one(db, `SELECT * FROM ${GR} WHERE id = $1`, [id])) : null; },
     async groups(tenant) { ready(); return key(tenant) ? (await db.unsafe(`SELECT * FROM ${GR} WHERE tenant = $1 ORDER BY created_at, id`, [tenant])).map(rowGroup) : []; },
-    async createSpace({ tenant, name, group = null, generalRole = "viewer", owner }) {
+    async createSpace({ tenant, name, group = null, generalRole = "viewer", owner, idem }) {
       ready();
       if (!key(tenant)) throw new Error("registry: no such tenant");
       if (group != null && !key(group)) throw new Error("registry: no such group");
-      const n = orgDefaults.name(name), createdAt = now();
+      const n = orgDefaults.name(name), k = idemStart(idem), createdAt = now();
       return write(async tx => {
         if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
         if (group != null && (await one(tx, `SELECT tenant FROM ${GR} WHERE id = $1`, [group]))?.tenant !== tenant) throw new Error("registry: no such group");
         const id = await fresh(tx, mint.space, SP);
+        await idemPut(tx, k, id, createdAt);
         await tx.unsafe(`INSERT INTO ${SP} (id, tenant, grp, name, kind, owner_user, general_role, created_at) VALUES ($1, $2, $3, $4, 'shared', NULL, $5, $6)`,
           [id, tenant, group, n, nz(generalRole), createdAt]);
         if (owner != null) await putSg(tx, "space", id, "user", String(owner), "owner");
@@ -563,13 +587,14 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         return rowSpace(await one(tx, `SELECT * FROM ${SP} WHERE tenant = $1 AND owner_user = $2`, [tenant, u]));
       });
     },
-    async createTeam({ tenant, name }) {
+    async createTeam({ tenant, name, idem }) {
       ready();
       if (!key(tenant)) throw new Error("registry: no such tenant");
-      const n = orgDefaults.name(name), createdAt = now();
+      const n = orgDefaults.name(name), k = idemStart(idem), createdAt = now();
       return write(async tx => {
         if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
         const id = await fresh(tx, mint.team, TE);
+        await idemPut(tx, k, id, createdAt);
         await tx.unsafe(`INSERT INTO ${TE} (id, tenant, name, created_at) VALUES ($1, $2, $3, $4)`, [id, tenant, n, createdAt]);
         return rowTeam(await one(tx, `SELECT * FROM ${TE} WHERE id = $1`, [id]));
       });
@@ -734,15 +759,16 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       const { type, id } = orgDefaults.scope(scope);
       return key(id) ? (await grantsOn(db, type, id)).map(rowSg) : [];
     },
-    async createRole({ tenant, name, base = null, boardRole, permissions = [], max }) {
+    async createRole({ tenant, name, base = null, boardRole, permissions = [], max, idem }) {
       ready();
       if (!key(tenant)) throw new Error("registry: no such tenant");
-      const n = orgDefaults.name(name), createdAt = now(), perms = JSON.stringify([...permissions]);
+      const n = orgDefaults.name(name), createdAt = now(), perms = JSON.stringify([...permissions]), k = idemStart(idem);
       return write(async tx => {
         if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1 FOR NO KEY UPDATE`, [tenant]))) throw new Error("registry: no such tenant");   // the Unit's row serialises creates, so `max` is exact
-        if (max !== undefined && (await one(tx, `SELECT count(*)::int AS n FROM ${RO} WHERE tenant = $1 AND id <> $2`, [tenant, MEMBER_ROLE_ID])).n >= max) throw new PgRegistryError("limit", "the Unit has the most custom roles it can");
         let id;
         for (;;) { id = mint.role(); if (!(await one(tx, `SELECT 1 AS x FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id]))) break; }
+        await idemPut(tx, k, id, createdAt);          // before the cap: a replay of a role that fit is a replay even when the Unit is full now
+        if (max !== undefined && (await one(tx, `SELECT count(*)::int AS n FROM ${RO} WHERE tenant = $1 AND id <> $2`, [tenant, MEMBER_ROLE_ID])).n >= max) throw new PgRegistryError("limit", "the Unit has the most custom roles it can");
         await tx.unsafe(`INSERT INTO ${RO} (tenant, id, name, base, board_role, permissions, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
           [tenant, id, n, nz(base), nz(boardRole), perms, createdAt]);
         return rowRole(await one(tx, `SELECT * FROM ${RO} WHERE tenant = $1 AND id = $2`, [tenant, id]));
@@ -896,34 +922,17 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       return out;
     },
     // ---- Idempotent creates (PROTOCOL.md) ----
-    async idemClaim(user, k, fp) {
+    async idemGet(o) {
       ready();
-      if (!key(user) || !key(k) || !key(fp)) throw new Error("registry: bad idempotency key");
-      const t = now(), claim = crypto.randomUUID();
-      if (++idemCalls % IDEM.every === 0) api.idemPrune(t).catch(() => {});   // its own gated call, never awaited: a failed prune never fails or slows a claim
-      // ONE statement: insert the claim, or take over an expired row; no row back = a live one is there.
-      const won = await write(tx => tx.unsafe(`INSERT INTO ${ID} (member, k, fp, claim, result, at) VALUES ($1, $2, $3, $4, NULL, $5)
-        ON CONFLICT (member, k) DO UPDATE SET fp = excluded.fp, claim = excluded.claim, result = NULL, at = excluded.at
-        WHERE (${ID}.result IS NULL AND ${ID}.at <= $6) OR (${ID}.result IS NOT NULL AND ${ID}.at <= $7) RETURNING 1 AS x`,
-      [user, k, fp, claim, t, t - IDEM.claimMs, t - IDEM.ttlMs]));
-      if (won.length) return { state: "new", claim };
-      const e = (await db.unsafe(`SELECT fp, result FROM ${ID} WHERE member = $1 AND k = $2`, [user, k]))[0];
-      if (!e) return { state: "in-progress" };   // released between the two statements: the caller retries
-      return e.fp !== fp ? { state: "mismatch" } : e.result === null ? { state: "in-progress" } : { state: "done", result: e.result };
+      const i = idemOf(o);
+      if (!i) throw new Error("registry: bad idempotency key");
+      const e = await one(db, `SELECT fp, ref, at FROM ${ID} WHERE member = $1 AND k = $2`, [i.user, i.key]);
+      return !e || now() - Number(e.at) >= IDEM.ttlMs ? { state: "none" } : e.fp !== i.fp ? { state: "mismatch" } : { state: "done", ref: e.ref };
     },
-    /** Deletes up to IDEM.prune expired rows (bounded). Called by idemClaim; a method so it goes through the gate. */
+    /** Deletes up to IDEM.prune expired rows (bounded). Called by the keyed creates; a method so it goes through the gate. */
     async idemPrune(t) {
       ready();
-      await write(tx => tx.unsafe(`DELETE FROM ${ID} WHERE ctid IN (SELECT ctid FROM ${ID} WHERE (result IS NULL AND at <= $1) OR (result IS NOT NULL AND at <= $2) LIMIT $3)`,
-        [t - IDEM.claimMs, t - IDEM.ttlMs, IDEM.prune]));
-    },
-    async idemFinish(user, k, claim, result) {
-      ready();
-      if (key(user) && key(k) && key(claim)) await write(tx => tx.unsafe(`UPDATE ${ID} SET result = $1, at = $2 WHERE member = $3 AND k = $4 AND claim = $5`, [String(result), now(), user, k, claim]));
-    },
-    async idemRelease(user, k, claim) {
-      ready();
-      if (key(user) && key(k) && key(claim)) await write(tx => tx.unsafe(`DELETE FROM ${ID} WHERE member = $1 AND k = $2 AND claim = $3 AND result IS NULL`, [user, k, claim]));
+      await write(tx => tx.unsafe(`DELETE FROM ${ID} WHERE ctid IN (SELECT ctid FROM ${ID} WHERE at <= $1 LIMIT $2)`, [t - IDEM.ttlMs, IDEM.prune]));
     },
     /** The stored rows (tests). */
     async idemSize() { return Number((await db.unsafe(`SELECT count(*) AS n FROM ${ID}`))[0].n); },

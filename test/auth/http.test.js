@@ -408,25 +408,14 @@ test("a Registry that throws gives 503 unavailable, never 403 or 500", async () 
   expect(new URLSearchParams(new URL(res.headers.get("location")).hash.slice(1)).get("link")).toBe("unavailable");
 });
 
-test("createBoard: an owner grant that fails twice reports the board id (503); one failure is retried", async () => {
+test("createBoard: the board and its owner grant are one Registry step (a failing setGrant is not part of it; no ownerless board)", async () => {
   const admin = await tokenFor(ADMIN);
-  let fails = 2;
-  const flaky = { ...registry, setGrant: async (...a) => { if (fails-- > 0) throw new Error("db blip"); return registry.setGrant(...a); } };
-  routes = build({ registry: flaky });
-  const r = await api("/boards", admin, "POST", { title: "orphan" });
-  expect(r.status).toBe(503);
-  const body = await r.json();
-  expect(body.error).toBe("owner-grant-failed");
-  expect(body.board).toMatch(/^b-[a-z0-9]{16}$/);
-  expect(await registry.board(body.board)).toMatchObject({ title: "orphan" });
-  expect(await registry.grant(body.board, "google:1001")).toBe(null);
-  expect((await registry.board(body.board)).space).toMatch(/^s-/);   // it sits in the caller's personal space
-  fails = 1;
-  const ok = await api("/boards", admin, "POST", { title: "retried" });
-  expect(ok.status).toBe(201);
-  expect(await registry.grant((await ok.json()).board.id, "google:1001")).toBe("owner");
-  // Directly against the admin layer as well.
-  fails = 5;
+  routes = build({ registry: { ...registry, setGrant: async () => { throw new Error("db blip"); } } });
+  const r = await api("/boards", admin, "POST", { title: "whole" });
+  expect(r.status).toBe(201);
+  const id = (await r.json()).board.id;
+  expect(await registry.grant(id, "google:1001")).toBe("owner");
+  expect((await registry.board(id)).space).toMatch(/^s-/);   // it sits in the caller's personal space
 });
 
 // ---- mounting ----

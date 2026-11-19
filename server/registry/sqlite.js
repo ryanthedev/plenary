@@ -17,7 +17,7 @@
 // `user`; insertion order is an explicit `n` column (Postgres: BIGSERIAL / identity), upserts use ON CONFLICT.
 
 import { Database } from "bun:sqlite";
-import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId } from "../auth/registry-port.js";
+import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 
 /** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code`. */
@@ -59,9 +59,14 @@ function onBusyRetry(db, deadline, f, clock = Date.now, onAttempt) {
  *   (default Date.now) and a hook told the busy_timeout each start-up attempt was given.
  * @returns {import("../auth/registry-port.js").Registry & { close(): Promise<void>, pragmas(): object }}
  */
-export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTimeoutMs = 5000, busy = {} }) {
+export function sqliteRegistry(opts) {
+  const db = new Database(opts.path, { create: true, strict: true });
+  try { return build(db, opts); }
+  catch (err) { try { db.close(); } catch {} throw err; }   // a failed start-up (a busy file, an old-format table) never leaks the handle
+}
+
+function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 5000, busy = {} }) {
   const { clock = Date.now, onAttempt } = busy;
-  const db = new Database(path, { create: true, strict: true });
   let open = true;
   const wait = Math.max(0, Math.floor(busyTimeoutMs));
   db.run(`PRAGMA busy_timeout=${wait}`);
@@ -135,10 +140,12 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       member TEXT NOT NULL, board TEXT NOT NULL REFERENCES reg_boards(id), opened_at INTEGER NOT NULL, PRIMARY KEY (member, board))`);
     db.run(`CREATE TABLE IF NOT EXISTS reg_stars (
       member TEXT NOT NULL, board TEXT NOT NULL REFERENCES reg_boards(id), at INTEGER NOT NULL, PRIMARY KEY (member, board))`);
-    // Idempotent creates (PROTOCOL.md): one row per (member, key); `result` NULL while the create runs. Additive. No migration for `claim`:
-    // the table never shipped without it (it first appears in this branch).
+    // Idempotent creates (PROTOCOL.md): one row per (member, key), written in the create's own transaction; `ref` is the id it made.
     db.run(`CREATE TABLE IF NOT EXISTS reg_idempotency (
-      member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, claim TEXT NOT NULL, result TEXT, at INTEGER NOT NULL, PRIMARY KEY (member, k))`);
+      member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, ref TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (member, k))`);
+    const idemCols = db.query("PRAGMA table_info(reg_idempotency)").all().map(c => c.name).sort().join(",");
+    if (idemCols !== "at,fp,k,member,ref")   // the adapters never ALTER: an older shape is reset, not migrated
+      throw new Error(`sqlite registry: table reg_idempotency has columns (${idemCols}) but this version needs (at,fp,k,member,ref): it is from an older version. Reset the store or drop the table (DROP TABLE reg_idempotency); the next start-up recreates it`);
     db.run("CREATE INDEX IF NOT EXISTS reg_idempotency_at ON reg_idempotency (at)");
     db.run("CREATE INDEX IF NOT EXISTS reg_recents_member ON reg_recents (member, opened_at DESC, board DESC)");
     db.run("CREATE INDEX IF NOT EXISTS reg_stars_member ON reg_stars (member, at DESC, board DESC)");
@@ -252,12 +259,10 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     pruneRecent: db.query(`DELETE FROM reg_recents WHERE member = ?1 AND board IN
       (SELECT board FROM reg_recents WHERE member = ?1 ORDER BY opened_at DESC, board DESC LIMIT -1 OFFSET ?2)`),
     recents: db.query("SELECT board, opened_at AS at FROM reg_recents WHERE member = ? ORDER BY opened_at DESC, board DESC LIMIT ?"),
-    idemGet: db.query("SELECT fp, result, at FROM reg_idempotency WHERE member = ? AND k = ?"),
+    idemGet: db.query("SELECT fp, ref, at FROM reg_idempotency WHERE member = ? AND k = ?"),
     idemCount: db.query("SELECT count(*) AS n FROM reg_idempotency"),
-    idemPut: db.query("INSERT OR REPLACE INTO reg_idempotency (member, k, fp, claim, result, at) VALUES (?, ?, ?, ?, NULL, ?)"),
-    idemFin: db.query("UPDATE reg_idempotency SET result = ?, at = ? WHERE member = ? AND k = ? AND claim = ?"),
-    idemDel: db.query("DELETE FROM reg_idempotency WHERE member = ? AND k = ? AND claim = ? AND result IS NULL"),
-    idemPrune: db.query("DELETE FROM reg_idempotency WHERE rowid IN (SELECT rowid FROM reg_idempotency WHERE (result IS NULL AND at <= ?1) OR (result IS NOT NULL AND at <= ?2) LIMIT ?3)"),
+    idemPut: db.query("INSERT OR REPLACE INTO reg_idempotency (member, k, fp, ref, at) VALUES (?, ?, ?, ?, ?)"),
+    idemPrune: db.query("DELETE FROM reg_idempotency WHERE rowid IN (SELECT rowid FROM reg_idempotency WHERE at <= ?1 LIMIT ?2)"),
     upStar: db.query("INSERT INTO reg_stars (member, board, at) VALUES (?, ?, ?) ON CONFLICT (member, board) DO NOTHING"),
     delStar: db.query("DELETE FROM reg_stars WHERE member = ? AND board = ?"),
     stars: db.query("SELECT board, at FROM reg_stars WHERE member = ? ORDER BY at DESC, board DESC LIMIT ?"),
@@ -367,12 +372,25 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     q.insAdmin.run(tenant, user, q.adminN.get(tenant).n);
   });
 
-  const createBoardTx = db.transaction((tenant, title, memberRole, space, createdAt) => {
+  // Idempotent creates: both run INSIDE the create's transaction (a throw rolls the whole create back), so the row and the object commit together.
+  /** Rejects when a live row holds the key: the same fingerprint replays, another is a mismatch. */
+  const idemEnter = (idem, t) => {
+    if (!idem) return;
+    if (++idemCalls % IDEM.every === 0) q.idemPrune.run(t - IDEM.ttlMs, IDEM.prune);
+    const e = q.idemGet.get(idem.user, idem.key);
+    if (e && t - e.at < IDEM.ttlMs) throw e.fp !== idem.fp ? idemErr.mismatch() : idemErr.replay(e.ref);
+  };
+  const idemPut = (idem, ref, t) => { if (idem) q.idemPut.run(idem.user, idem.key, idem.fp, ref, t); };
+
+  const createBoardTx = db.transaction((tenant, title, memberRole, space, owner, idem, createdAt) => {
     if (!q.tenantExists.get(tenant)) throw new Error("registry: no such tenant");
     if (space != null && q.space.get(space)?.tenant !== tenant) throw new Error("registry: no such space");
+    idemEnter(idem, createdAt);
     const id = fresh(mint.board, i => !!q.boardExists.get(i));
     q.insBoard.run(id, tenant, title, memberRole === undefined ? (space != null ? null : "viewer") : memberRole, createdAt);
     if (space != null) q.insBoardSpace.run(id, space);
+    if (owner != null) q.upGrant.run(id, owner, "owner", q.grantN.get(id).n);
+    idemPut(idem, id, createdAt);
     return rowBoard(q.board.get(id));
   });
 
@@ -386,17 +404,21 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     else q.upGrant.run(board, user, role, q.grantN.get(board).n);
   });
 
-  const createInviteTx = db.transaction((board, email, role, expiresAt, by, createdAt) => {
+  const createInviteTx = db.transaction((board, email, role, expiresAt, by, idem, createdAt) => {
     if (!q.boardExists.get(board)) throw new Error("registry: no such board");
+    idemEnter(idem, createdAt);
     const id = fresh(mint.invite, i => !!q.invite.get(i));
     q.insInvite.run(id, board, email, role, expiresAt, by, createdAt);
+    idemPut(idem, id, createdAt);
     return rowInvite(q.invite.get(id));
   });
 
-  const createLinkTx = db.transaction((board, role, expiresAt, by, createdAt) => {
+  const createLinkTx = db.transaction((board, role, expiresAt, by, idem, createdAt) => {
     if (!q.boardExists.get(board)) throw new Error("registry: no such board");
+    idemEnter(idem, createdAt);
     const id = fresh(mint.link, i => !!q.link.get(i));
     q.insLink.run(id, board, role, expiresAt, by, createdAt);
+    idemPut(idem, id, createdAt);
     return rowLink(q.link.get(id));
   });
 
@@ -414,19 +436,23 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
   };
   const scopeTenant = (type, id) => (type === "unit" ? q.tenantExists.get(id) && id : type === "group" ? q.group.get(id)?.tenant
     : type === "space" ? q.space.get(id)?.tenant : q.board.get(id)?.tenant);
-  const createGroupTx = db.transaction((tenant, name, generalRole, owner, createdAt) => {
+  const createGroupTx = db.transaction((tenant, name, generalRole, owner, idem, createdAt) => {
     needRow(q.tenantExists.get(tenant), "tenant");
+    idemEnter(idem, createdAt);
     const id = fresh(mint.group, i => !!q.group.get(i));
     q.insGroup.run(id, tenant, name, generalRole, createdAt);
     if (owner != null) putSg("group", id, "user", owner, "owner");
+    idemPut(idem, id, createdAt);
     return rowGroup(q.group.get(id));
   });
-  const createSpaceTx = db.transaction((tenant, name, group, generalRole, owner, createdAt) => {
+  const createSpaceTx = db.transaction((tenant, name, group, generalRole, owner, idem, createdAt) => {
     needRow(q.tenantExists.get(tenant), "tenant");
     if (group != null) needRow(q.group.get(group)?.tenant === tenant, "group");
+    idemEnter(idem, createdAt);
     const id = fresh(mint.space, i => !!q.space.get(i));
     q.insSpace.run(id, tenant, group, name, "shared", null, generalRole, createdAt);
     if (owner != null) putSg("space", id, "user", owner, "owner");
+    idemPut(idem, id, createdAt);
     return rowSpace(q.space.get(id));
   });
   const personalTx = db.transaction((tenant, user, createdAt) => {
@@ -438,10 +464,12 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     putSg("space", id, "user", user, "owner");
     return rowSpace(q.space.get(id));
   });
-  const createTeamTx = db.transaction((tenant, name, createdAt) => {
+  const createTeamTx = db.transaction((tenant, name, idem, createdAt) => {
     needRow(q.tenantExists.get(tenant), "tenant");
+    idemEnter(idem, createdAt);
     const id = fresh(mint.team, i => !!q.team.get(i));
     q.insTeam.run(id, tenant, name, createdAt);
+    idemPut(idem, id, createdAt);
     return rowTeam(q.team.get(id));
   });
   const setMemberTx = db.transaction((team, user, member) => {
@@ -478,11 +506,13 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     }
     putSg(type, id, st, sid, role);
   });
-  const createRoleTx = db.transaction((tenant, name, base, boardRole, perms, createdAt, max) => {
+  const createRoleTx = db.transaction((tenant, name, base, boardRole, perms, createdAt, max, idem) => {
     needRow(q.tenantExists.get(tenant), "tenant");
+    idemEnter(idem, createdAt);
     if (max !== undefined && q.roleCount.get(tenant).n >= max) throw new SqlRegistryError("limit", "the Unit has the most custom roles it can");
     const id = fresh(mint.role, i => !!q.role.get(tenant, i));
     q.insRole.run(tenant, id, name, base, boardRole, JSON.stringify(perms), createdAt);
+    idemPut(idem, id, createdAt);
     return rowRole(q.role.get(tenant, id));
   });
   const deleteRoleTx = db.transaction((tenant, id) => {
@@ -552,11 +582,11 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       addAdminTx.immediate(tenant, String(user));
     },
 
-    async createBoard({ tenant, title = "", memberRole, space }) {
+    async createBoard({ tenant, title = "", memberRole, space, owner, idem }) {
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");
       if (space != null && !str(space)) throw new Error("registry: no such space");
-      return createBoardTx.immediate(tenant, String(title), memberRole === undefined ? undefined : nz(memberRole), nz(space), now());
+      return createBoardTx.immediate(tenant, String(title), memberRole === undefined ? undefined : nz(memberRole), nz(space), owner == null ? null : String(owner), idemOf(idem), now());
     },
     async board(id) { ready(); return str(id) ? rowBoard(q.board.get(id)) ?? null : null; },
 
@@ -574,10 +604,10 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       return str(board) ? q.grants.all(board).map(r => ({ user: r.member, role: r.role })) : [];
     },
 
-    async createInvite({ board, email, role, expiresAt = null, by }) {
+    async createInvite({ board, email, role, expiresAt = null, by, idem }) {
       ready();
       if (!str(board)) throw new Error("registry: no such board");
-      return createInviteTx.immediate(board, normEmail(email), role, nz(expiresAt), nz(by), now());
+      return createInviteTx.immediate(board, normEmail(email), role, nz(expiresAt), nz(by), idemOf(idem), now());
     },
     async invite(id) { ready(); return str(id) ? rowInvite(q.invite.get(id)) ?? null : null; },
     async invites(board) { ready(); return str(board) ? q.invites.all(board).map(rowInvite) : []; },
@@ -588,10 +618,10 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     },
     async revokeInvite(id) { ready(); return str(id) ? q.revokeInvite.run(id).changes > 0 : false; },
 
-    async createLink({ board, role, expiresAt = null, by }) {
+    async createLink({ board, role, expiresAt = null, by, idem }) {
       ready();
       if (!str(board)) throw new Error("registry: no such board");
-      return createLinkTx.immediate(board, role, nz(expiresAt), nz(by), now());
+      return createLinkTx.immediate(board, role, nz(expiresAt), nz(by), idemOf(idem), now());
     },
     async link(id) { ready(); return str(id) ? rowLink(q.link.get(id)) ?? null : null; },
     async links(board) { ready(); return str(board) ? q.links.all(board).map(rowLink) : []; },
@@ -617,18 +647,18 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     },
 
     // ---- organization (PROTOCOL.md § Registry, "Organization") ----
-    async createGroup({ tenant, name, generalRole = null, owner }) {
+    async createGroup({ tenant, name, generalRole = null, owner, idem }) {
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");
-      return createGroupTx.immediate(tenant, orgDefaults.name(name), nz(generalRole), owner == null ? null : String(owner), now());
+      return createGroupTx.immediate(tenant, orgDefaults.name(name), nz(generalRole), owner == null ? null : String(owner), idemOf(idem), now());
     },
     async group(id) { ready(); return str(id) ? rowGroup(q.group.get(id)) ?? null : null; },
     async groups(tenant) { ready(); return str(tenant) ? q.groups.all(tenant).map(rowGroup) : []; },
-    async createSpace({ tenant, name, group = null, generalRole = "viewer", owner }) {
+    async createSpace({ tenant, name, group = null, generalRole = "viewer", owner, idem }) {
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");
       if (group != null && !str(group)) throw new Error("registry: no such group");
-      return createSpaceTx.immediate(tenant, orgDefaults.name(name), nz(group), nz(generalRole), owner == null ? null : String(owner), now());
+      return createSpaceTx.immediate(tenant, orgDefaults.name(name), nz(group), nz(generalRole), owner == null ? null : String(owner), idemOf(idem), now());
     },
     async space(id) { ready(); return str(id) ? rowSpace(q.space.get(id)) ?? null : null; },
     async spaces(tenant) { ready(); return str(tenant) ? q.spaces.all(tenant).map(rowSpace) : []; },
@@ -660,10 +690,10 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       const had = rowSpace(q.personal.get(tenant, String(user)));
       return had ?? personalTx.immediate(tenant, String(user), now());
     },
-    async createTeam({ tenant, name }) {
+    async createTeam({ tenant, name, idem }) {
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");
-      return createTeamTx.immediate(tenant, orgDefaults.name(name), now());
+      return createTeamTx.immediate(tenant, orgDefaults.name(name), idemOf(idem), now());
     },
     async team(id) { ready(); return str(id) ? rowTeam(q.team.get(id)) ?? null : null; },
     async teams(tenant) { ready(); return str(tenant) ? q.teams.all(tenant).map(rowTeam) : []; },
@@ -743,10 +773,10 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       const { type, id } = orgDefaults.scope(scope);
       return q.sgrants.all(type, id).map(rowSg);
     },
-    async createRole({ tenant, name, base = null, boardRole, permissions = [], max }) {
+    async createRole({ tenant, name, base = null, boardRole, permissions = [], max, idem }) {
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");
-      return createRoleTx.immediate(tenant, orgDefaults.name(name), nz(base), nz(boardRole), [...permissions], now(), max);
+      return createRoleTx.immediate(tenant, orgDefaults.name(name), nz(base), nz(boardRole), [...permissions], now(), max, idemOf(idem));
     },
     async updateRole(tenant, id, patch) {
       ready();
@@ -781,21 +811,13 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       return new Map(contextsTx(list, us));
     },
     // ---- Idempotent creates (PROTOCOL.md) ----
-    async idemClaim(user, key, fp) {
+    async idemGet(o) {
       ready();
-      if (!str(user) || !str(key) || !str(fp)) throw new Error("registry: bad idempotency key");
-      const t = now();
-      if (++idemCalls % IDEM.every === 0) q.idemPrune.run(t - IDEM.claimMs, t - IDEM.ttlMs, IDEM.prune);
-      return db.transaction(() => {
-        const e = q.idemGet.get(user, key);
-        if (e && t - e.at < (e.result === null ? IDEM.claimMs : IDEM.ttlMs)) return e.fp !== fp ? { state: "mismatch" } : e.result === null ? { state: "in-progress" } : { state: "done", result: e.result };
-        const claim = crypto.randomUUID();
-        q.idemPut.run(user, key, fp, claim, t);
-        return { state: "new", claim };
-      }).immediate();
+      const i = idemOf(o);
+      if (!i) throw new Error("registry: bad idempotency key");
+      const e = q.idemGet.get(i.user, i.key);
+      return !e || now() - e.at >= IDEM.ttlMs ? { state: "none" } : e.fp !== i.fp ? { state: "mismatch" } : { state: "done", ref: e.ref };
     },
-    async idemFinish(user, key, claim, result) { ready(); if (str(user) && str(key) && str(claim)) q.idemFin.run(String(result), now(), user, key, claim); },
-    async idemRelease(user, key, claim) { ready(); if (str(user) && str(key) && str(claim)) q.idemDel.run(user, key, claim); },
     /** The stored rows (tests). */ idemSize: () => q.idemCount.get().n,
 
     // ---- Home (PROTOCOL.md § Home) ----
@@ -894,15 +916,6 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
 
     async close() { if (!open) return; open = false; db.close(); },
   };
-  // A busy or locked database rolled the call back before it wrote anything: say so on the error (`rolledBack`, registry-port.js), so a caller
-  // that must know whether a write may have happened (the idempotency key's release, http.js) needs no knowledge of SQLite's codes.
-  for (const [name, f] of Object.entries(api)) {
-    if (f.constructor.name !== "AsyncFunction") continue;
-    api[name] = async function (...args) {
-      try { return await f.apply(this, args); }
-      catch (err) { if (typeof err?.code === "string" && (err.code.startsWith("SQLITE_BUSY") || err.code.startsWith("SQLITE_LOCKED"))) err.rolledBack = true; throw err; }
-    };
-  }
   return api;
 }
 

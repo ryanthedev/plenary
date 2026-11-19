@@ -2,7 +2,7 @@
 // last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
 import { normEmail } from "./util.js";
-import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId } from "./registry-port.js";
+import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId } from "./registry-port.js";
 
 /**
  * @typedef {import("./registry-port.js").Registry} Registry
@@ -38,9 +38,20 @@ export function memoryRegistry({ now = Date.now } = {}) {
   /** @type {Map<string, Map<string, CustomRole>>} tenant → id → role */ const roles = new Map();
   /** @type {Map<string, Map<string, number>>} user → board → opened at (Recent) */ const recent = new Map();
   /** @type {Map<string, Map<string, number>>} user → board → starred at */ const stars = new Map();
-  /** @type {Map<string, { fp: string, claim: string, result: string|null, at: number }>} user + "\n" + key → claim or answer (Idempotent creates) */ const idem = new Map();
+  /** @type {Map<string, { fp: string, ref: string, at: number }>} user + "\n" + key → fingerprint and the id it made (Idempotent creates) */ const idem = new Map();
   let idemCalls = 0;
-  const idemLive = (e, t) => e && t - e.at < (e.result === null ? IDEM.claimMs : IDEM.ttlMs);
+  const idemLive = (e, t) => e && t - e.at < IDEM.ttlMs;
+  /** A keyed create's first step: rejects (nothing written yet) when a live row holds the key. Returns the validated key, or null. */
+  const idemEnter = o => {
+    const i = idemOf(o);
+    if (!i) return null;
+    const t = now(), e = idem.get(i.user + "\n" + i.key);
+    if (++idemCalls % IDEM.every === 0) { let n = 0; for (const [x, v] of idem) if (!idemLive(v, t) && n++ < IDEM.prune) idem.delete(x); }
+    if (idemLive(e, t)) throw e.fp !== i.fp ? idemErr.mismatch() : idemErr.replay(e.ref);
+    return i;
+  };
+  /** A keyed create's last step (synchronous with the write: one atomic step in a JS process). */
+  const idemPut = (i, ref) => { if (i) idem.set(i.user + "\n" + i.key, { fp: i.fp, ref, at: now() }); };
   const newest = m => [...(m ?? [])].map(([board, at]) => ({ board, at })).sort((a, b) => b.at - a.at || (a.board < b.board ? 1 : -1));
   const copy = x => (x ? structuredClone(x) : null);
   const fresh = (map, f) => { let id; do id = f(); while (map.has(id)); return id; };
@@ -89,11 +100,14 @@ export function memoryRegistry({ now = Date.now } = {}) {
       if (!t.admins.includes(user)) t.admins.push(user);
     },
 
-    async createBoard({ tenant, title = "", memberRole, space }) {
+    async createBoard({ tenant, title = "", memberRole, space, owner, idem: key }) {
       if (!tenants.has(tenant)) throw new Error("registry: no such tenant");
       if (space != null && spaces.get(space)?.tenant !== tenant) throw new Error("registry: no such space");
+      const k = idemEnter(key);
       const b = { id: fresh(boards, mint.board), tenant, title: String(title), memberRole: memberRole === undefined ? (space != null ? null : "viewer") : memberRole, space: space ?? null, createdAt: now() };
       boards.set(b.id, b);
+      if (owner != null) grants.set(b.id, new Map([[String(owner), "owner"]]));
+      idemPut(k, b.id);
       return copy(b);
     },
     async board(id) { return copy(boards.get(id)); },
@@ -110,10 +124,12 @@ export function memoryRegistry({ now = Date.now } = {}) {
     async grant(board, user) { return grants.get(board)?.get(user) ?? null; },
     async grants(board) { return [...(grants.get(board) ?? [])].map(([user, role]) => ({ user, role })); },
 
-    async createInvite({ board, email, role, expiresAt = null, by }) {
+    async createInvite({ board, email, role, expiresAt = null, by, idem: key }) {
       if (!boards.has(board)) throw new Error("registry: no such board");
+      const k = idemEnter(key);
       const i = { id: fresh(invites, mint.invite), board, email: normEmail(email), role, expiresAt, revoked: false, by, createdAt: now() };
       invites.set(i.id, i);
+      idemPut(k, i.id);
       return copy(i);
     },
     async invite(id) { return copy(invites.get(id)); },
@@ -124,10 +140,12 @@ export function memoryRegistry({ now = Date.now } = {}) {
     },
     async revokeInvite(id) { const i = invites.get(id); if (!i) return false; i.revoked = true; return true; },
 
-    async createLink({ board, role, expiresAt = null, by }) {
+    async createLink({ board, role, expiresAt = null, by, idem: key }) {
       if (!boards.has(board)) throw new Error("registry: no such board");
+      const k = idemEnter(key);
       const l = { id: fresh(links, mint.link), board, role, expiresAt, revoked: false, by, createdAt: now() };
       links.set(l.id, l);
+      idemPut(k, l.id);
       return copy(l);
     },
     async link(id) { return copy(links.get(id)); },
@@ -149,22 +167,26 @@ export function memoryRegistry({ now = Date.now } = {}) {
     },
 
     // ---- organization: Groups, Spaces, Teams, scoped grants, roles ----
-    async createGroup({ tenant, name, generalRole = null, owner }) {
+    async createGroup({ tenant, name, generalRole = null, owner, idem: key }) {
       need(tenants.has(tenant), "tenant");
+      const k = idemEnter(key);
       const g = { id: fresh(groups, mint.group), tenant, name: orgDefaults.name(name), generalRole, createdAt: now() };
       groups.set(g.id, g);
       if (owner != null) putScoped("group", g.id, "user", String(owner), "owner");
+      idemPut(k, g.id);
       return copy(g);
     },
     async group(id) { return copy(groups.get(id)); },
     async groups(tenant) { return [...groups.values()].filter(g => g.tenant === tenant).map(copy); },
 
-    async createSpace({ tenant, name, group = null, generalRole = "viewer", owner }) {
+    async createSpace({ tenant, name, group = null, generalRole = "viewer", owner, idem: key }) {
       need(tenants.has(tenant), "tenant");
       if (group != null) need(groups.get(group)?.tenant === tenant, "group");
+      const k = idemEnter(key);
       const sp = { id: fresh(spaces, mint.space), tenant, group, name: orgDefaults.name(name), kind: "shared", owner: null, generalRole, createdAt: now() };
       spaces.set(sp.id, sp);
       if (owner != null) putScoped("space", sp.id, "user", String(owner), "owner");
+      idemPut(k, sp.id);
       return copy(sp);
     },
     async space(id) { return copy(spaces.get(id)); },
@@ -201,10 +223,12 @@ export function memoryRegistry({ now = Date.now } = {}) {
       return copy(sp);
     },
 
-    async createTeam({ tenant, name }) {
+    async createTeam({ tenant, name, idem: key }) {
       need(tenants.has(tenant), "tenant");
+      const k = idemEnter(key);
       const tm = { id: fresh(teams, mint.team), tenant, name: orgDefaults.name(name), createdAt: now() };
       teams.set(tm.id, tm); members.set(tm.id, new Set());
+      idemPut(k, tm.id);
       return copy(tm);
     },
     async team(id) { return copy(teams.get(id)); },
@@ -303,12 +327,14 @@ export function memoryRegistry({ now = Date.now } = {}) {
       return [...(scoped.get(sk(type, id)) ?? [])].map(([k, role]) => { const [t, ...i] = k.split("\n"); return { subject: { type: t, id: i.join("\n") }, role }; });
     },
 
-    async createRole({ tenant, name, base = null, boardRole, permissions = [], max }) {
+    async createRole({ tenant, name, base = null, boardRole, permissions = [], max, idem: key }) {
       need(tenants.has(tenant), "tenant");
       const m = roles.get(tenant) ?? new Map(); roles.set(tenant, m);
+      const k = idemEnter(key);
       if (max !== undefined && [...m.keys()].filter(i => i !== MEMBER_ROLE_ID).length >= max) throw new RegistryError("limit", "the Unit has the most custom roles it can");
       const r = { id: fresh(m, mint.role), tenant, name: orgDefaults.name(name), base, boardRole, permissions: [...permissions], createdAt: now() };
       m.set(r.id, r);
+      idemPut(k, r.id);
       return copy(r);
     },
     async updateRole(tenant, id, patch) {
@@ -370,17 +396,12 @@ export function memoryRegistry({ now = Date.now } = {}) {
     },
 
     // ---- Idempotent creates (PROTOCOL.md) ----
-    async idemClaim(user, key, fp) {
-      if (typeof user !== "string" || typeof key !== "string" || typeof fp !== "string") throw new Error("registry: bad idempotency key");
-      const k = user + "\n" + key, t = now(), e = idem.get(k);
-      if (++idemCalls % IDEM.every === 0) { let n = 0; for (const [x, v] of idem) if (!idemLive(v, t) && n++ < IDEM.prune) idem.delete(x); }
-      if (idemLive(e, t)) return e.fp !== fp ? { state: "mismatch" } : e.result === null ? { state: "in-progress" } : { state: "done", result: e.result };
-      const claim = crypto.randomUUID();
-      idem.set(k, { fp, claim, result: null, at: t });
-      return { state: "new", claim };
+    async idemGet(o) {
+      const i = idemOf(o);
+      if (!i) throw new Error("registry: bad idempotency key");
+      const e = idem.get(i.user + "\n" + i.key);
+      return !idemLive(e, now()) ? { state: "none" } : e.fp !== i.fp ? { state: "mismatch" } : { state: "done", ref: e.ref };
     },
-    async idemFinish(user, key, claim, result) { const e = idem.get(user + "\n" + key); if (e && e.claim === claim) { e.result = String(result); e.at = now(); } },
-    async idemRelease(user, key, claim) { const k = user + "\n" + key, e = idem.get(k); if (e && e.claim === claim && e.result === null) idem.delete(k); },
     /** The stored rows (tests). */ idemSize: () => idem.size,
 
     // ---- Home (PROTOCOL.md § Home) ----

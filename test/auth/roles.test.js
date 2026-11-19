@@ -462,4 +462,19 @@ describe("over HTTP", () => {
     expect([d.status, d.headers.get("idempotent-replayed")]).toEqual([201, null]);
     expect(d.body.role.id).not.toBe(c.body.role.id);
   });
+  test("a replay is authorized again: a manager who lost roles.manage, or whose rights no longer cover the role, gets 403 and never the stored role", async () => {
+    const mgr = await r.createRole({ tenant: acme.id, name: "Mgr", boardRole: "editor", permissions: ["roles.manage", "move"] });
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: U("dev:max"), role: mgr.id });
+    const body = { name: "Mine", boardRole: "viewer", permissions: ["move"] }, h = { "idempotency-key": "role-key-0003" };
+    const first = await api("max", "/roles", "POST", body, h);
+    expect(first.status).toBe(201);
+    await r.updateRole(acme.id, mgr.id, { permissions: ["roles.manage"] });                     // `move` is no longer held: the role is above max now
+    const above = await api("max", "/roles", "POST", body, h);
+    expect([above.status, above.body]).toEqual([403, { error: "forbidden" }]);
+    await r.updateRole(acme.id, mgr.id, { permissions: ["roles.manage", "move"] });
+    expect((await api("max", "/roles", "POST", body, h)).headers.get("idempotent-replayed")).toBe("true");
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: U("dev:max"), role: null });   // lost roles.manage
+    const lost = await api("max", "/roles", "POST", body, h);
+    expect([lost.status, lost.body]).toEqual([403, { error: "forbidden" }]);
+  });
 });

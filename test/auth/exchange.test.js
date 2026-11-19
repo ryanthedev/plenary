@@ -327,20 +327,24 @@ test("a hung directory write keeps its slot past the cutoff (it only logs); the 
   let release; const gate = new Promise(r => { release = r; });
   const hang = new Proxy(registry, { get: (t, k) => (k === "touchMember" ? async () => { await gate; } : t[k]) });
   const warns = [];
-  const pending = new Set();                                    // an injected timer: the "slow" cutoff fires when the test says, never by wall-clock luck under load
-  const timers = { set: f => { const h = { f }; pending.add(h); return h; }, clear: h => pending.delete(h) };
+  const q = new Map(); let tid = 0, vnow = 0;   // virtual timers: the cutoff never depends on how fast this machine runs the 17 sign-ins
+  const timers = { set: (fn, ms) => { q.set(++tid, { fn, at: vnow + ms }); return tid; }, clear: h => { q.delete(h); } };
+  const advance = ms => { vnow += ms; for (const [h, e] of [...q]) if (e.at <= vnow) { q.delete(h); e.fn(); } };
   const via = node({ registry: hang, timers, log: { warn: (m, f) => warns.push([m, f]) }, config: { ...config, touchTimeoutMs: 30 } });
   const signAs = async n => { const s = await signIn({ ...ADMIN, sub: `50${String(n).padStart(2, "0")}`, email: `h${n}@acme.com` }, { via }); expect((await exchange(s.code, { cookie: s.cookie, via })).status).toBe(200); };
   for (let i = 0; i < 17; i++) await signAs(i);
   await new Promise(r => setTimeout(r, 0));
   expect(warns.map(w => w[0])).toEqual(["member directory write dropped (too many in flight); Home records the person later"]);
-  for (const h of [...pending]) h.f();                          // past the cutoff: still hung, still holding its slot (the "slow" line is rate-limited behind the drop line)
+  clock.t += 61_000;                                            // the rate limit's window passes
+  advance(30);                                                  // past the cutoff: still hung, still holding its slot; the timeout only logs "slow"
+  expect(warns.map(w => w[0]).at(-1)).toContain("slow");
+  warns.length = 0;
   clock.t += 61_000;
   await signAs(98);                                             // dropped: the 16 slots are still taken
   await new Promise(r => setTimeout(r, 0));
-  expect(warns).toHaveLength(2);
-  expect(warns[1][0]).toContain("dropped");
-  release(); await new Promise(r => setTimeout(r, 5));          // the writes settle: slots free
+  expect(warns).toHaveLength(1);
+  expect(warns[0][0]).toContain("dropped");
+  release(); await new Promise(r => setTimeout(r, 0)); await new Promise(r => setTimeout(r, 0));   // the writes settle (microtasks): slots free
   clock.t += 61_000;
   warns.length = 0;
   await signAs(99); await new Promise(r => setTimeout(r, 0));

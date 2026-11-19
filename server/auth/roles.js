@@ -139,12 +139,13 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
     async read(identity, id) {
       const st = await gate(identity), t = await target(st.unit, id);
       if (!t.row || t.member) throw missing();
+      if (!within(st, unitPerms(t.id, t.roles))) throw refused();            // a replay holds the create's own limit: no escalation, as now
       const u = (await registry.roleUsage(st.unit.id, [t.id])).get(t.id);
       return view(t.id, t.roles, placesUsed(u), st);
     },
 
     /** POST /roles: a new custom role. `base` = the id it was duplicated from (display only). @returns {Promise<object>} the RoleView */
-    async create(identity, b) {
+    async create(identity, b, idem) {
       const st = await gate(identity);
       const name = nameOf(b.name);
       const cand = { id: "new", name, boardRole: b.boardRole ?? null, permissions: b.permissions ?? [] };
@@ -158,7 +159,7 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
       }
       if (!within(st, unitPermsOf(cand, roles))) throw refused();
       let made;
-      try { made = await registry.createRole({ tenant: st.unit.id, name, base, boardRole: cand.boardRole, permissions: cand.permissions, max: LIMITS.custom }); }
+      try { made = await registry.createRole({ tenant: st.unit.id, name, base, boardRole: cand.boardRole, permissions: cand.permissions, max: LIMITS.custom, idem }); }
       catch (err) { if (err?.code === "limit") throw new AdminError("too-large", "the Unit has the most custom roles it can"); throw err; }
       return view(made.id, storedMap([...roles.values(), made]), placesUsed({ places: 0 }), st);
     },

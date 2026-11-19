@@ -33,84 +33,117 @@ export function registryContract(name, makeRegistry, opts = {}) {
     const sorted = async b => (await r.grants(b)).sort((x, y) => x.user.localeCompare(y.user));
     const owners = async b => (await r.grants(b)).filter(g => g.role === "owner").map(g => g.user).sort();
 
-    // ---- idempotent creates (PROTOCOL.md "Idempotent creates") ----
+    // ---- idempotent creates (PROTOCOL.md "Idempotent creates"): the key's row is written in the create's own atomic step ----
 
-    describe("idempotency keys", () => {
-      const U = "dev:ada", K = "key-0001-aaaa", FP = "f".repeat(64), FP2 = "0".repeat(64), MIN = 60_000;
-      test("claim: new (with a claim token), then in-progress (same fp), mismatch (other fp); another user or key is independent", async () => {
-        const c = await r.idemClaim(U, K, FP);
-        expect(c).toMatchObject({ state: "new" });
-        expect(typeof c.claim).toBe("string");
-        expect(c.claim.length).toBeGreaterThan(15);
-        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "in-progress" });
-        expect(await r.idemClaim(U, K, FP2)).toEqual({ state: "mismatch" });
-        expect((await r.idemClaim("dev:bob", K, FP)).state).toBe("new");
-        const other = await r.idemClaim(U, "key-0002-bbbb", FP);
-        expect(other.state).toBe("new");
-        expect(other.claim).not.toBe(c.claim);
+    describe("idempotency keys (exactly-once creates)", () => {
+      const U = "dev:ada", K = "key-0001-aaaa", FP = "f".repeat(64), FP2 = "0".repeat(64);
+      const idem = (o = {}) => ({ user: U, key: K, fp: FP, ...o });
+      /** Each keyed create, as a function of its idem (a tenant, a board for invites and links). */
+      const creates = async () => {
+        const { t, b } = await tenantWithBoard();
+        const n = { v: 0 };
+        return {
+          board: i => r.createBoard({ tenant: t.id, title: "T", owner: U, idem: i }),
+          group: i => r.createGroup({ tenant: t.id, name: "G", owner: U, idem: i }),
+          space: i => r.createSpace({ tenant: t.id, name: "S", owner: U, idem: i }),
+          team: i => r.createTeam({ tenant: t.id, name: "Tm", idem: i }),
+          role: i => r.createRole({ tenant: t.id, name: "Rl", boardRole: "viewer", permissions: ["move"], idem: i }),
+          invite: i => r.createInvite({ board: b.id, email: "x@y.com", role: "viewer", by: U, idem: i }),
+          link: i => r.createLink({ board: b.id, role: "viewer", by: U, idem: i }),
+        };
+      };
+      const KINDS_ = ["board", "group", "space", "team", "role", "invite", "link"];
+
+      for (const kind of KINDS_) {
+        test(`${kind}: the first create stores the key with its id; a repeat rejects idem-replay naming that id and creates nothing; another fingerprint is idem-mismatch`, async () => {
+          const c = await creates();
+          expect(await r.idemGet(idem())).toEqual({ state: "none" });
+          const made = await c[kind](idem());
+          expect(await r.idemGet(idem())).toEqual({ state: "done", ref: made.id });
+          expect(await r.idemGet(idem({ fp: FP2 }))).toEqual({ state: "mismatch" });
+          await expect(c[kind](idem())).rejects.toMatchObject({ code: "idem-replay", ref: made.id });
+          await expect(c[kind](idem({ fp: FP2 }))).rejects.toMatchObject({ code: "idem-mismatch" });
+          expect(await r.idemSize()).toBe(1);
+          // nothing was made by the rejected repeats
+          const again = await c[kind](idem({ key: "key-0002-bbbb" }));
+          expect(again.id).not.toBe(made.id);
+        });
+      }
+      test("a board made with an owner and a key: the owner grant is part of the same step", async () => {
+        const c = await creates();
+        const b = await c.board(idem());
+        expect(await r.grants(b.id)).toEqual([{ user: U, role: "owner" }]);
       });
-      test("finish: a repeat gets the stored answer; a wrong claim neither finishes nor reads it", async () => {
-        const { claim } = await r.idemClaim(U, K, FP);
-        await r.idemFinish(U, K, "not-the-claim", "{\"no\":1}");
-        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "in-progress" });
-        await r.idemFinish(U, K, claim, "{\"status\":201}");
-        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "done", result: "{\"status\":201}" });
-        expect(await r.idemClaim(U, K, FP2)).toEqual({ state: "mismatch" });
+      test("a create that FAILS leaves no key behind (the key row rolls back with it), so the retry runs fresh", async () => {
+        const { t } = await tenantWithBoard();
+        await expect(r.createSpace({ tenant: t.id, name: "S", group: "g-nonexistent", idem: idem() })).rejects.toThrow();
+        await expect(r.createBoard({ tenant: "t-nonexistent", idem: idem() })).rejects.toThrow();
+        expect(await r.idemGet(idem())).toEqual({ state: "none" });
+        expect(await r.idemSize()).toBe(0);
+        expect((await r.createBoard({ tenant: t.id, idem: idem() })).id).toBeTruthy();
       });
-      test("release drops an unfinished row of that claim only", async () => {
-        const { claim } = await r.idemClaim(U, K, FP);
-        await r.idemRelease(U, K, "not-the-claim");
-        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "in-progress" });   // another claim cannot release it
-        await r.idemRelease(U, K, claim);
-        const again = await r.idemClaim(U, K, FP);
-        expect(again.state).toBe("new");
-        await r.idemFinish(U, K, again.claim, "x");
-        await r.idemRelease(U, K, again.claim);
-        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "done", result: "x" });   // a finished row stays
+      test("role: a create refused by the cap leaves no key; a replay of a role that fit is a replay even when the Unit is full now; concurrent same key makes one role", async () => {
+        const { t } = await tenantWithBoard();
+        await r.createRole({ tenant: t.id, name: "A", boardRole: "viewer", max: 1 });
+        await expect(r.createRole({ tenant: t.id, name: "B", boardRole: "viewer", max: 1, idem: idem() })).rejects.toMatchObject({ code: "limit" });
+        expect(await r.idemGet(idem())).toEqual({ state: "none" });
+        expect(await r.idemSize()).toBe(0);
+        const made = await r.createRole({ tenant: t.id, name: "B", boardRole: "viewer", max: 2, idem: idem() });
+        await expect(r.createRole({ tenant: t.id, name: "B", boardRole: "viewer", max: 2, idem: idem() })).rejects.toMatchObject({ code: "idem-replay", ref: made.id });   // full now: still a replay
+        await expect(r.createRole({ tenant: t.id, name: "B", boardRole: "viewer", max: 2, idem: idem({ fp: FP2 }) })).rejects.toMatchObject({ code: "idem-mismatch" });
+        const out = await Promise.allSettled(Array.from({ length: 6 }, () => r.createRole({ tenant: t.id, name: "C", boardRole: "viewer", idem: idem({ key: "key-0009-cccc" }) })));
+        expect(out.filter(o => o.status === "fulfilled")).toHaveLength(1);
+        for (const l of out.filter(o => o.status === "rejected")) expect(l.reason).toMatchObject({ code: "idem-replay" });
+        expect((await r.roles(t.id)).map(x => x.name).sort()).toEqual(["A", "B", "C"]);
       });
-      test("an unfinished claim is taken over after IDEM.claimMs (5 min); a finished answer lives 24 h", async () => {
-        await r.idemClaim(U, K, FP);
-        clock.t += IDEM.claimMs - 1;
-        expect((await r.idemClaim(U, K, FP)).state).toBe("in-progress");
-        clock.t += 1;
-        const b = await r.idemClaim(U, K, FP2);   // free again, even for another body
-        expect(b.state).toBe("new");
-        await r.idemFinish(U, K, b.claim, "y");
+      test("keys are per user and per key: another user, or another key, is independent", async () => {
+        const c = await creates();
+        const a = await c.board(idem());
+        const b = await c.board(idem({ user: "dev:bob" }));
+        const d = await c.board(idem({ key: "key-0002-bbbb" }));
+        expect(new Set([a.id, b.id, d.id]).size).toBe(3);
+      });
+      test("a key row lives IDEM.ttlMs (24 h); after that the key counts as absent and the next create replaces it", async () => {
+        const c = await creates();
+        const a = await c.board(idem());
         clock.t += IDEM.ttlMs - 1;
-        expect(await r.idemClaim(U, K, FP2)).toEqual({ state: "done", result: "y" });
+        expect(await r.idemGet(idem())).toEqual({ state: "done", ref: a.id });
+        await expect(c.board(idem())).rejects.toMatchObject({ code: "idem-replay" });
         clock.t += 1;
-        expect((await r.idemClaim(U, K, FP)).state).toBe("new");
+        expect(await r.idemGet(idem())).toEqual({ state: "none" });
+        const b = await c.board(idem({ fp: FP2 }));   // free again, even for another body
+        expect(b.id).not.toBe(a.id);
+        expect(await r.idemGet(idem({ fp: FP2 }))).toEqual({ state: "done", ref: b.id });
+        expect(await r.idemSize()).toBe(1);
       });
-      test("FENCING: after a takeover the stale run's finish and release change nothing of the new claim", async () => {
-        const a = await r.idemClaim(U, K, FP);
-        clock.t += IDEM.claimMs + MIN;                 // A is still running, past the claim window
-        const b = await r.idemClaim(U, K, FP);         // B takes the key over
-        expect(b.state).toBe("new");
-        expect(b.claim).not.toBe(a.claim);
-        await r.idemRelease(U, K, a.claim);            // A gives up: must not free B's claim
-        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "in-progress" });
-        await r.idemFinish(U, K, a.claim, "from-A");   // A finishes late: must not write B's answer
-        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "in-progress" });
-        await r.idemFinish(U, K, b.claim, "from-B");
-        await r.idemFinish(U, K, a.claim, "A-again");  // and cannot overwrite it afterwards either
-        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "done", result: "from-B" });
-      });
-      test("expired rows are pruned by age as claims arrive (bounded storage)", async () => {
-        for (let i = 0; i < 100; i++) { const k = `old-key-${String(i).padStart(4, "0")}`; const c = await r.idemClaim(U, k, FP); await r.idemFinish(U, k, c.claim, "z"); }
+      test("expired rows are pruned by age as keyed creates arrive (bounded storage)", async () => {
+        const c = await creates();
+        for (let i = 0; i < 100; i++) await c.team(idem({ key: `old-key-${String(i).padStart(4, "0")}` }));
         expect(await r.idemSize()).toBe(100);
         clock.t += IDEM.ttlMs + 1;
-        for (let i = 0; i < 64; i++) await r.idemClaim(U, `new-key-${String(i).padStart(4, "0")}`, FP);
+        for (let i = 0; i < 64; i++) await c.team(idem({ key: `new-key-${String(i).padStart(4, "0")}` }));
         await new Promise(res => setTimeout(res, 300));   // the prune is a separate, un-awaited call on Postgres
-        expect(await r.idemSize()).toBeLessThan(100);   // the 64th claim pruned the expired ones
+        expect(await r.idemSize()).toBeLessThan(100);
       });
-      test("concurrent claims of one key: exactly one is new", async () => {
-        const out = await Promise.all(Array.from({ length: 8 }, () => r.idemClaim(U, K, FP)));
-        expect(out.filter(o => o.state === "new")).toHaveLength(1);
-        expect(out.filter(o => o.state === "in-progress")).toHaveLength(7);
+      test("concurrent creates of one key: exactly one object is made, the others reject idem-replay naming it", async () => {
+        const c = await creates();
+        const out = await Promise.allSettled(Array.from({ length: 8 }, () => c.board(idem())));
+        const won = out.filter(o => o.status === "fulfilled");
+        expect(won).toHaveLength(1);
+        const lost = out.filter(o => o.status === "rejected");
+        expect(lost).toHaveLength(7);
+        for (const l of lost) expect(l.reason).toMatchObject({ code: "idem-replay", ref: won[0].value.id });
+        const t = (await r.tenantByDomain("acme.com")).id;
+        expect((await r.boardsIn({ type: "unit", id: t })).ids).toHaveLength(2);   // the setup board + the one made
       });
-      test("a bad user, key or fingerprint rejects", async () => {
-        await expect(r.idemClaim(U, 5, FP)).rejects.toThrow();
-        await expect(r.idemClaim(U, K, undefined)).rejects.toThrow();
+      test("a create without a key is unaffected; a bad user, key or fingerprint rejects before anything is made", async () => {
+        const { t } = await tenantWithBoard();
+        await r.createBoard({ tenant: t.id }); await r.createBoard({ tenant: t.id });
+        expect(await r.idemSize()).toBe(0);
+        for (const bad of [idem({ user: 5 }), idem({ key: "" }), idem({ fp: undefined })]) {
+          await expect(r.createBoard({ tenant: t.id, idem: bad })).rejects.toThrow();
+          await expect(r.idemGet(bad)).rejects.toThrow();
+        }
       });
     });
 

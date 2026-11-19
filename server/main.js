@@ -75,7 +75,6 @@ import { postgresStore } from "./store/postgres.js";
 import { memoryBus } from "./bus/memory.js";
 import { natsBus } from "./bus/nats.js";
 import { postgresRegistry } from "./registry/postgres.js";
-import { IDEM } from "./auth/registry-port.js";
 import { checkLeaseTtl } from "./room-host.js";
 import { diskBlobs } from "./blobs/disk.js";
 import { zlibDeflate } from "./compress/zlib.js";
@@ -149,23 +148,11 @@ export function nodeConfig(env, host = osHostname()) {
   }
   checkInnerLimits(requestDeadlineMs, { ...(cluster ? { "the Postgres Registry's statement and lock limits": REGISTRY_LIMIT_MS } : { "the SQLite Registry's busy timeout": SQLITE_BUSY_MS }),
     ...(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET ? { "Google's request timeout": OIDC_TIMEOUT_MS } : {}) });
-  if (!cluster) checkClaimWindow(SQLITE_BUSY_MS);
   return { cluster, node, roles, leaseTtlMs, requestDeadlineMs };
 }
 
 /** The limits main.js gives the adapters a request waits on; each must stay under the request deadline or its 503 would come before the call gives up. */
 export const REGISTRY_LIMIT_MS = 5000, OIDC_TIMEOUT_MS = 3500, SQLITE_BUSY_MS = 5000;
-/** The longest chain of Registry calls one keyed create makes (claim, scope reads, create, two owner grants, finish), with room to spare. */
-const CREATE_CHAIN_CALLS = 10;
-/**
- * Fencing needs a claim to outlive the create that holds it (PROTOCOL.md "Idempotent creates"): refuses to start when IDEM.claimMs is under
- * CREATE_CHAIN_CALLS of the Registry's longest single call, which is what a stale run could still be doing when a takeover happens.
- * @param {number} perCallMs
- */
-export function checkClaimWindow(perCallMs) {
-  if (!(IDEM.claimMs >= CREATE_CHAIN_CALLS * perCallMs))
-    throw new Error(`the idempotency claim window (${IDEM.claimMs} ms) must be at least ${CREATE_CHAIN_CALLS} Registry calls of ${perCallMs} ms: a stale create could outlive its claim`);
-}
 /** Refuses to start when any inner single-call limit is not below the deadline. @param {number} deadlineMs @param {Record<string, number>} limits */
 export function checkInnerLimits(deadlineMs, limits) {
   for (const [what, ms] of Object.entries(limits))
@@ -533,7 +520,6 @@ async function openCluster(env, node, log, adapters = {}, requestDeadlineMs = RE
       if (g) {
         const call = g.queueTimeoutMs + REGISTRY_LIMIT_MS + 1000;
         checkInnerLimits(requestDeadlineMs, { "the Postgres Registry's longest call (queue wait + limit + 1 s backstop)": call });
-        checkClaimWindow(call);
       }
     } catch (err) { await Promise.resolve().then(() => r.close()).catch(() => {}); throw err; }
     return r;

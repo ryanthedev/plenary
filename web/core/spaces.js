@@ -11,7 +11,6 @@ export const GENERAL_CHOICES = Object.freeze([["viewer", "Everyone can view"], [
 export const generalText = g => (GENERAL_CHOICES.find(([v]) => v === (g ?? null)) ?? GENERAL_CHOICES[4])[1];
 
 const ERR = {
-  "in-progress": "It is still being created. Give it a moment, then try again.",
   forbidden: "You can't do that here.", notfound: "That is not available to you.", invalid: "The server did not accept that.",
   auth: "You are signed out. Sign in again.", network: "No answer from the server. Try again.", unavailable: "The server could not do that. Try again in a moment.",
 };

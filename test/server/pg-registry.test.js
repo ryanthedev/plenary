@@ -586,6 +586,32 @@ describe.skipIf(!url)("postgres registry", () => {
     } finally { for (const h of hs) await h.close(); await drop(schema); }
   });
 
+  test("a schema whose reg_idempotency has the old claim/result columns refuses to start with a clear error naming the table", async () => {
+    const schema = schemaName();
+    const r = await postgresRegistry({ url, schema, max: 2 });
+    await r.close();
+    try {
+      await client().unsafe(`DROP TABLE "${schema}".reg_idempotency`);
+      await client().unsafe(`CREATE TABLE "${schema}".reg_idempotency (member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, claim TEXT NOT NULL, result TEXT, at BIGINT NOT NULL, PRIMARY KEY (member, k))`);
+      await expect(postgresRegistry({ url, schema, max: 2 })).rejects.toThrow(/reg_idempotency.*older version.*DROP TABLE/);
+    } finally { await drop(schema); }
+  }, 30_000);
+
+  test("durable keyed create: the key survives close and reopen (a crash after the commit), so the retry gets the first object, not a second", async () => {
+    const schema = schemaName(), idem = { user: "google:root", key: "key-0001-aaaa", fp: "f".repeat(64) };
+    let r = await postgresRegistry({ url, schema, max: 2 });
+    try {
+      const t = await r.createTenant({ domain: "acme.com", admins: ["google:root"] });
+      const b = await r.createBoard({ tenant: t.id, title: "Once", owner: "google:root", idem });
+      await r.close();
+      r = await postgresRegistry({ url, schema, max: 2 });
+      expect(await r.idemGet(idem)).toEqual({ state: "done", ref: b.id });
+      await expect(r.createBoard({ tenant: t.id, title: "Once", owner: "google:root", idem })).rejects.toMatchObject({ code: "idem-replay", ref: b.id });
+      expect((await r.boardsIn({ type: "unit", id: t.id })).ids).toEqual([b.id]);
+      expect(await r.grants(b.id)).toEqual([{ user: "google:root", role: "owner" }]);
+    } finally { await r.close(); await drop(schema); }
+  }, 30_000);
+
   test("durable: everything survives close and reopen (a fresh pool)", async () => {
     const schema = schemaName();
     let r = await postgresRegistry({ url, schema, max: 2, now: () => 7 });

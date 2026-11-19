@@ -10,7 +10,8 @@
 //   want(id)       OPTIONAL. This client shows a picture whose bytes it lacks: fetch them (wsNet: a signed download);
 //                  they arrive through onFile. Called every frame the placeholder is drawn, so it dedupes. Never throws.
 //   onFile(fn)     fn(file) for every picture fetched for want(), or (dev nets) shared by another tab.
-//   onFail(fn)     OPTIONAL. fn({ id, verb, code }) when an upload failed for good (quota, forbidden, gave-up, …).
+//   onFail(fn)     OPTIONAL. fn({ id, verb, code, retrying? }) when an upload failed for good (quota, forbidden, …), or, with retrying: true,
+//                  is waiting to be tried again (limit: too many uploads; gave-up: the server can't be reached).
 
 /**
  * @typedef {{ id: string, mimeType: string, dataURL: string }} BlobFile
@@ -20,7 +21,7 @@
  * @property {(file: BlobFile) => void} put
  * @property {(id: string) => void} [want]
  * @property {(fn: (file: BlobFile) => void) => void} onFile
- * @property {(fn: (e: { id: string, verb: string, code: string }) => void) => void} [onFail]
+ * @property {(fn: (e: { id: string, verb: string, code: string, retrying?: boolean }) => void) => void} [onFail]
  */
 
 export {};

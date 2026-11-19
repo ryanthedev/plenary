@@ -100,11 +100,11 @@ describe("wsNet blobs", () => {
     await s.welcome();
     s.net.put({ id: ID, mimeType: "image/png", dataURL });
     s.ws().say({ t: "error", code: "limit", message: "slow down", sha1: ID }); await tick();
-    expect(s.fails).toEqual([]);
-    s.clock.advance(1100); await tick();
+    expect(s.fails).toEqual([{ id: ID, verb: "PUT", code: "limit", retrying: true }]);   // told once, not a final failure
+    s.clock.advance(2100); await tick();                                // a limit backs off 2 s (jittered down to 1 s), not 1 s
     expect(s.ws().asks).toHaveLength(2);
     s.ws().say({ t: "error", code: "forbidden", message: "no", sha1: ID }); await tick();
-    expect(s.fails).toEqual([{ id: ID, verb: "PUT", code: "forbidden" }]);
+    expect(s.fails.at(-1)).toEqual({ id: ID, verb: "PUT", code: "forbidden" });
     s.clock.advance(120_000); await tick();
     expect(s.ws().asks).toHaveLength(2);                               // final: never asked again
     expect(s.passed.map(m => m.t)).toEqual(["welcome"]);              // the session saw none of the blob traffic
@@ -193,5 +193,61 @@ describe("wsNet blobs", () => {
     s.clock.advance(10_001); await tick();                             // no answer in 10 s: asked again later
     s.ws().say({ t: "blob", sha1: ID2, url: "http://x.test/blobs/x" }); await tick();
     expect(s.calls).toEqual([]);
+  });
+
+  test("an id that isn't 40 lowercase hex is never asked for (it would hold the one request slot for nothing)", async () => {
+    const s = await setup(() => ok());
+    await s.welcome();
+    for (const bad of ["x", "A".repeat(40), "a".repeat(39), "a".repeat(41), "../etc/passwd", "", null, undefined, 5]) { s.net.want(bad); s.net.put({ id: bad, mimeType: "image/png", dataURL }); }
+    s.clock.advance(500); await tick();
+    expect(s.ws().asks).toEqual([]);
+    s.net.want(ID);                                                    // and a good one right after is asked at once
+    expect(s.ws().asks).toEqual([{ t: "blob", sha1: ID }]);
+  });
+
+  test("35 uploads against a 30-a-minute put limit all go up: `limit` is no failed try, it backs off, and the user is told once each", async () => {
+    const s = await setup(() => new Response("{}", { status: 201 }));
+    const stamps = [], uploaded = new Set();
+    const ws = () => s.ws();
+    // A server stand-in on the virtual clock: 30 put URLs per sliding minute, then `limit` with the sha1.
+    const serve = m => queueMicrotask(() => {
+      if (m.t !== "blob") return;
+      const now = s.clock.now();
+      while (stamps.length && now - stamps[0] >= 60_000) stamps.shift();
+      if (m.put && stamps.length >= 30) return ws().say({ t: "error", code: "limit", message: "slow", sha1: m.sha1 });
+      if (m.put) stamps.push(now);
+      ws().say({ t: "blob", sha1: m.sha1, url: `http://x.test/blobs/${m.sha1}` });
+    });
+    await s.welcome();
+    const orig = ws().send.bind(ws()); ws().send = d => { orig(d); serve(JSON.parse(d)); };
+    const ids = Array.from({ length: 35 }, (_, i) => i.toString(16).padStart(40, "0"));
+    for (const id of ids) s.net.put({ id, mimeType: "image/png", dataURL });
+    for (let i = 0; i < 600 && s.calls.length < 35; i++) { s.clock.advance(500); await tick(2); }
+    for (const c of s.calls) uploaded.add(c.url);
+    expect(s.calls).toHaveLength(35);
+    expect(uploaded.size).toBe(35);                                    // each exactly once
+    expect(s.fails.every(f => f.code === "limit" && f.retrying)).toBe(true);
+    expect(s.fails.length).toBe(new Set(s.fails.map(f => f.id)).size); // told once per picture
+    expect(s.fails.length).toBeGreaterThan(0);
+  });
+
+  test("an upload that used up its tries wakes itself 30 s later and goes up when the server is back (no welcome needed)", async () => {
+    let up = false;
+    const s = await setup(() => new Response("{}", { status: up ? 201 : 503 }));
+    await s.welcome();
+    s.net.put({ id: ID, mimeType: "image/png", dataURL });
+    const answer = async () => { s.ws().say({ t: "blob", sha1: ID, url: "http://x.test/blobs/u" }); await tick(); };
+    for (let i = 0; i < 6; i++) {
+      await answer();                                                  // a URL that works, then a PUT that gets a 503
+      if (i < 5) for (const n = s.ws().asks.length; s.ws().asks.length === n;) { s.clock.advance(500); await tick(); }
+    }
+    expect(s.fails).toEqual([{ id: ID, verb: "PUT", code: "gave-up", retrying: true }]);
+    up = true;
+    for (const n = s.ws().asks.length; s.ws().asks.length === n;) { s.clock.advance(1000); await tick(); }   // the 30 s rest ends by itself
+    await answer();
+    expect(s.calls.at(-1).method).toBe("PUT");
+    expect(s.fails).toHaveLength(1);                                   // the toast isn't repeated
+    s.clock.advance(120_000); await tick();
+    expect(s.ws().asks).toHaveLength(7);                               // and it is done: nothing more asked
   });
 });

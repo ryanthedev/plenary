@@ -303,6 +303,12 @@ export function createSession({ join, token, board, client = "web", tab = null, 
     s.act(stream, ed => { id = ed.addImage(file, at); });
     return id;
   };
+  /** The `fileId`s of live image elements, in either Editor, whose bytes neither Editor holds (what a net should fetch). */
+  s.missingFiles = () => {
+    const have = id => Object.values(eds).some(ed => ed.doc.files?.[id]), out = new Set();
+    for (const ed of Object.values(eds)) for (const el of ed.doc.byId.values()) if (el.type === "image" && !el.isDeleted && typeof el.fileId === "string" && !have(el.fileId)) out.add(el.fileId);
+    return [...out];
+  };
   /** Picture bytes fetched for a placeholder (net.want → onFile; PROTOCOL.md § Blobs): shown in both Editors, never sent as an op. */
   s.receiveFiles = files => { for (const ed of Object.values(eds)) { ed.doc.apply({ files }); ed.changed(); } };
 

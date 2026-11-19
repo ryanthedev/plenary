@@ -15,7 +15,7 @@ function make(o = {}) {
   const inner = o.blobs ?? diskBlobs({ dir: join(tempDir(), "blobs") });
   const calls = { usage: 0, put: 0 };
   const blobs = { put: (...a) => { calls.put++; return inner.put(...a); }, get: (...a) => inner.get(...a), usage: (...a) => { calls.usage++; return inner.usage(...a); }, ...(o.wrap ?? {}) };
-  const access = blobAccess({ blobs, key: o.key ?? KEY, origin: () => "http://h.test", now: () => clock.t, ...(o.quotaBytes !== undefined ? { quotaBytes: o.quotaBytes } : {}) });
+  const access = blobAccess({ blobs, key: o.key ?? KEY, origin: "http://h.test", now: () => clock.t, ...(o.quotaBytes !== undefined ? { quotaBytes: o.quotaBytes } : {}) });
   return { access, clock, calls, inner };
 }
 const putUrl = (a, tenant, bytes, board = "b1") => a.url(tenant, board, sha1(bytes), "PUT").then(tokenOf);
@@ -134,9 +134,9 @@ test("a stored blob that isn't an image is never served", async () => {
 });
 
 test("construction checks its inputs", () => {
-  const blobs = diskBlobs({ dir: tempDir() }), base = { blobs, key: KEY, origin: () => "" };
+  const blobs = diskBlobs({ dir: tempDir() }), base = { blobs, key: KEY, origin: "" };
   expect(() => blobAccess({ ...base, key: new Uint8Array(8) })).toThrow(TypeError);
   expect(() => blobAccess({ ...base, blobs: { put() {}, get() {} } })).toThrow(TypeError);
-  expect(() => blobAccess({ ...base, origin: undefined })).toThrow(TypeError);
+  expect(() => blobAccess({ ...base, origin: 5 })).toThrow(TypeError);
   expect(() => blobAccess({ ...base, quotaBytes: -1 })).toThrow(TypeError);
 });

@@ -10,82 +10,16 @@ import { syncCollabPort } from "../../web/adapters/collab/sync.js";
 import { mountApp } from "../../web/adapters/dom/app.js";
 import { expiryNotice, shouldProbe, takeReturnBoard, rememberBoard, connectionBanner, RETURN_KEY, EXPIRY_WARN_MS } from "../../web/core/roles.js";
 
-// ── a stub page: just enough DOM for app.js (text only; no layout) ──
-class N {
-  constructor(type) { this.nodeType = type; this.parentNode = null; this.childNodes = []; }
-  append(...ns) { for (const n of ns) { const x = n instanceof N ? n : new T(String(n)); x.parentNode?.removeChild(x); x.parentNode = this; this.childNodes.push(x); } }
-  removeChild(n) { const i = this.childNodes.indexOf(n); if (i >= 0) this.childNodes.splice(i, 1); n.parentNode = null; }
-  replaceChildren(...ns) { this.replaced = (this.replaced ?? 0) + 1; for (const c of [...this.childNodes]) this.removeChild(c); this.append(...ns); }
-  remove() { this.parentNode?.removeChild(this); }
-  get textContent() { return this.childNodes.map(c => c.textContent).join(""); }
-  set textContent(v) { for (const c of [...this.childNodes]) this.removeChild(c); this.append(new T(String(v))); }
-}
-class T extends N { constructor(t) { super(3); this.data = t; } get textContent() { return this.data; } }
-const CTX = { measureText: t => ({ width: String(t).length * 7 }), getImageData: () => ({ data: [] }), createLinearGradient: () => ({ addColorStop() {} }), createPattern: () => null };
-class E extends N {
-  constructor(tag) {
-    super(1); this.tagName = tag.toUpperCase(); this.className = ""; this.listeners = {}; this.attrs = {}; this.dataset = {};
-    this.style = { setProperty(k, v) { this[k] = v; }, getPropertyValue(k) { return this[k] ?? ""; } };
-    this.hidden = false; this.disabled = false; this.value = ""; this.scrollTop = 0; this.width = 300; this.height = 150;
-    const self = this;
-    this.classList = { contains: c => self.className.split(/\s+/).includes(c), add: c => self.classList.toggle(c, true), remove: c => self.classList.toggle(c, false),
-      toggle: (c, on) => { const s = new Set(self.className.split(/\s+/).filter(Boolean)); if (on ?? !s.has(c)) s.add(c); else s.delete(c); self.className = [...s].join(" "); } };
-  }
-  setAttribute(k, v) { this.attrs[k] = String(v); }
-  getAttribute(k) { return this.attrs[k] ?? null; }
-  addEventListener(t, fn) { (this.listeners[t] ??= []).push(fn); }
-  removeEventListener(t, fn) { this.listeners[t] = (this.listeners[t] ?? []).filter(f => f !== fn); }
-  fire(t, ev = {}) { const e = { target: this, currentTarget: this, button: 0, preventDefault() { this.defaultPrevented = true; }, stopPropagation() {}, ...ev }; for (const fn of this.listeners[t] ?? []) fn(e); return e; }
-  click() { if (!this.disabled) this.fire("click"); }
-  focus() {} blur() {} setPointerCapture() {} setSelectionRange() {} select() {}
-  after(n) { const p = this.parentNode; p.append(n); }
-  contains(n) { for (let x = n; x; x = x.parentNode) if (x === this) return true; return false; }
-  closest() { return null; }
-  replaceWith(n) { const p = this.parentNode; if (!p) return; const i = p.childNodes.indexOf(this); p.removeChild(this); n.parentNode?.removeChild(n); n.parentNode = p; p.childNodes.splice(i, 0, n); }
-  getBoundingClientRect() { return { left: 0, top: 0, width: 1200, height: 800, right: 1200, bottom: 800 }; }
-  getContext() { return new Proxy({}, { get: (_, k) => (k in CTX ? CTX[k] : () => {}), set: () => true }); }
-  get children() { return this.childNodes.filter(c => c.nodeType === 1); }
-  all() { return [this, ...this.children.flatMap(c => c.all())]; }
-}
-const IDS = ["topbar", "panel", "drawer", "timeline", "hudBL", "hudBC", "hudBR", "dock", "sheet", "dialogs", "overlays", "veil", "toast", "picker"];
-
-let frames, winL, page;
-// The globals this file stubs, put back afterwards so later files' fallbacks never see the stub page.
-const GLOBALS = ["document", "Node", "devicePixelRatio", "matchMedia", "ResizeObserver", "requestAnimationFrame", "addEventListener", "removeEventListener"];
-const saved = Object.fromEntries(GLOBALS.map(k => [k, Object.getOwnPropertyDescriptor(globalThis, k)]));
-afterAll(() => { for (const k of GLOBALS) { if (saved[k]) Object.defineProperty(globalThis, k, saved[k]); else delete globalThis[k]; } });
-function installPage() {
-  frames = []; winL = {};
-  const body = new E("body"), main = new E("div"), canvasBox = new E("div"), board = new E("canvas"), ink = new E("textarea");
-  main.className = "main"; body.append(main); main.append(canvasBox); canvasBox.append(board, ink);
-  const byId = { canvas: canvasBox, board, ink };
-  for (const id of IDS) { byId[id] = new E(id === "picker" ? "input" : "div"); body.append(byId[id]); }
-  const docL = {};
-  const doc = {
-    body, documentElement: new E("html"), activeElement: null, visibilityState: "visible",
-    createElement: t => new E(t), createTextNode: t => new T(t),
-    querySelector: s => (s === ".main" ? main : s.startsWith("#") ? byId[s.slice(1)] ?? null : null),
-    addEventListener: (t, fn) => { (docL[t] ??= []).push(fn); },
-    fire(t, ev = {}) { for (const fn of docL[t] ?? []) fn({ target: board, preventDefault() {}, ...ev }); },
-  };
-  Object.assign(globalThis, {
-    document: doc, Node: N, devicePixelRatio: 1,
-    matchMedia: () => ({ matches: false, addEventListener() {} }),
-    ResizeObserver: class { constructor(fn) { this.fn = fn; } observe() { this.fn([]); } },
-    requestAnimationFrame: fn => frames.push(fn),
-    addEventListener: (t, fn) => { (winL[t] ??= []).push(fn); },
-    removeEventListener: (t, fn) => { winL[t] = (winL[t] ?? []).filter(f => f !== fn); },
-  });
-  page = { doc, byId, board };
-  return page;
-}
-const fireWin = (t, ev = {}) => { for (const fn of winL[t] ?? []) fn({ preventDefault() {}, ...ev }); };
+import { installPage as install, stub, fireWin, restoreGlobals } from "./stub-page.js";
+let page;
+const installPage = () => (page = install());
+afterAll(restoreGlobals);
 
 const USERS = { "t-ada": { user: "ada", role: "owner" }, "t-bo": { user: "bo", role: "editor" }, "t-cy": { user: "cy", role: "annotator" },
   "t-di": { user: "di", role: "annotator" }, "t-vi": { user: "vi", role: "viewer" } };
 
 /** ada's page over a room with bo (a second presenter, headless) on the same virtual clock. */
-function setup({ expAt = null, relogin = null, collab = false, role = null, token = "t-ada", prefs = memoryStore(), wrap = null } = {}) {
+function setup({ expAt = null, relogin = null, collab = false, role = null, token = "t-ada", prefs = memoryStore(), wrap = null, appNet = null } = {}) {
   installPage();
   const net = localRoom({ users: USERS, clock: true });
   const joins = [], hooks = {};
@@ -93,13 +27,13 @@ function setup({ expAt = null, relogin = null, collab = false, role = null, toke
   bo.setSize(1200, 800);
   const app = mountApp({
     startSession: ({ mine, onChange }) => createSession({ join: () => { const t = net.join(); joins.push(t); return wrap ? wrap(t) : t; }, token, board: "b1", client: USERS[token].user, user: USERS[token].user, mine, onChange, clock: net.clock }),
-    net: { kind: "local", put() {}, onFile() {} }, board: "b1", me: { user: USERS[token].user, name: "Ada", role }, prefs, theme: "light",
+    net: appNet ?? { kind: "local", put() {}, onFile() {} }, board: "b1", me: { user: USERS[token].user, name: "Ada", role }, prefs, theme: "light",
     clock: net.clock, expAt, relogin,
     collab: collab ? (S, o) => { hooks.jumpTo = o.jumpTo; return syncCollabPort(S, { name: "Ada", frame: fn => net.clock.set(fn, 16), ...o }); } : null,
   });
   /** n animation frames, 16 ms of virtual time each, the room settled in between. */
   // Deliveries until quiet, then 16 ms of timers (never settle(): the collab UI's frame loop re-arms forever).
-  const step = (n = 1) => { for (let i = 0; i < n; i++) { while (net.step()); net.advance(16); while (net.step()); const q = frames; frames = []; for (const fn of q) fn(); } };
+  const step = (n = 1) => { for (let i = 0; i < n; i++) { while (net.step()); net.advance(16); while (net.step()); const q = stub.frames; stub.frames = []; for (const fn of q) fn(); } };
   step(3);
   return { net, app, S: app.S, bo, step, joins, hooks, prefs };
 }
@@ -868,4 +802,40 @@ test("p8-tidyv R3-H1: a message on the old socket while the link is down (a resy
   deliver({ t: "here", writerCount: 1, viewers: 3 });           // the old socket still delivers while down
   net.advance(200); step(1);                                     // the probe fires before the backoff
   expect(reopens()).toBe(1);
+});
+
+// Issue #42: the app must ask its net for the bytes of every picture it shows without them. render.js draws such a picture
+// as a dashed path (never an `image` item), so asking from the display list never fires: it asks from the documents.
+const PIC = { id: "c".repeat(40), mimeType: "image/png", dataURL: "data:image/png;base64,iVBORw0KGgo=", width: 100, height: 80 };
+// A picture with bytes is painted through `new Image()`: a stub that never loads.
+beforeEach(() => { globalThis.Image = class { set src(v) { this._src = v; } }; });
+afterAll(() => { delete globalThis.Image; });
+const spyNet = () => { const wants = [], files = []; return { wants, files, net: { kind: "local", put() {}, onFile: fn => { files.push(fn); }, want: id => wants.push(id) } }; };
+
+test("DW-42.3: a picture on the board whose bytes this client lacks is asked for through net.want, and not asked for once it has them", () => {
+  const spy = spyNet();
+  rig = setup({ appNet: spy.net });
+  const { S, bo, step } = rig;
+  expect(spy.wants).toEqual([]);
+  bo.addPicture(PIC); step(4);                                  // bo's op carries the element, never the bytes
+  expect(S.missingFiles()).toEqual([PIC.id]);
+  expect(spy.wants.length).toBeGreaterThan(0);
+  expect(new Set(spy.wants)).toEqual(new Set([PIC.id]));
+  spy.files[0]({ id: PIC.id, mimeType: PIC.mimeType, dataURL: PIC.dataURL });   // the net delivers them (onFile → receiveFiles)
+  expect(S.missingFiles()).toEqual([]);
+  const before = spy.wants.length;
+  S.eds.board.changed(); step(4);
+  expect(spy.wants.length).toBe(before);
+});
+
+test("a picture this client placed itself, and a deleted one, are never asked for", () => {
+  const spy = spyNet();
+  rig = setup({ appNet: spy.net });
+  const { S, bo, step } = rig;
+  S.addPicture(PIC); step(3);
+  expect(S.missingFiles()).toEqual([]);
+  bo.addPicture({ ...PIC, id: "d".repeat(40) }); step(3);
+  const id = [...bo.eds.board.doc.byId.values()].find(e => e.fileId === "d".repeat(40)).id;
+  bo.eds.board.select([id]); bo.eds.board.key("Delete"); step(4);
+  expect(S.missingFiles()).toEqual([]);
 });

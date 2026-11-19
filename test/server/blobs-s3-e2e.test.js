@@ -1,42 +1,36 @@
-// Issue #42 on S3-compatible storage (a cluster): the web client uploads through a gateway, the gateway process is
-// replaced, a different gateway (its own data dir, its own process, the same key and bucket) serves the bytes to a fresh
-// client. Skips without S3_ENDPOINT (S3_BUCKET, S3_REGION, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY); `bun run test:cluster` sets them.
+// Issue #42 on S3-compatible storage (a cluster): a page uploads through a gateway, the gateway is replaced, a
+// different gateway (the same key and bucket, no shared disk) serves the bytes to a fresh page, which draws them. Skips without S3_ENDPOINT (S3_BUCKET, S3_REGION, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY); `bun run test:cluster` sets them.
 import { test, expect, afterAll } from "bun:test";
-import { wsNet } from "../../web/adapters/transport/ws.js";
+import { appClient, restoreAppGlobals } from "../web/app-client.js";
 import { s3Blobs } from "../../server/blobs/s3.js";
 import { rig, tokenOf } from "./rig.js";
-import { cleanup, fakePng, sha1, until } from "./helpers.js";
+import { cleanup, fakePng, sha1 } from "./helpers.js";
 
-afterAll(cleanup);
+afterAll(() => { restoreAppGlobals(); cleanup(); });
 const E = process.env, on = !!E.S3_ENDPOINT, st = on ? test : test.skip;
 const cfg = () => ({ endpoint: E.S3_ENDPOINT, bucket: E.S3_BUCKET, region: E.S3_REGION ?? "us-east-1", accessKeyId: E.S3_ACCESS_KEY_ID, secretAccessKey: E.S3_SECRET_ACCESS_KEY });
 
-async function join(server, ids, name) {
-  const net = wsNet({ url: server.wsUrl, WebSocket }), got = [], tr = net.join(), msgs = [];
-  net.onFile(f => got.push(f));
-  tr.onMessage(m => msgs.push(m));
-  tr.send({ t: "hello", v: 1, token: tokenOf(name), board: ids.board, since: 0, client: name });
-  await until(() => msgs.find(m => m.t === "welcome"), `${name}'s welcome`);
-  return { net, got, close: () => tr.close() };
-}
+const page = (r, name) => appClient({ url: r.server.wsUrl, board: r.ids.board, token: tokenOf(name), user: "dev:" + name });
 
-st("DW-42.2: bytes uploaded through one gateway are served by another, from S3, after the first is gone", async () => {
+st("DW-42.2: bytes uploaded through one gateway are drawn by a page on another, from S3, after the first is gone", async () => {
   const key = new Uint8Array(32).fill(9), bytes = fakePng(4000, 21), id = sha1(bytes);
-  const file = { id, mimeType: "image/png", dataURL: `data:image/png;base64,${Buffer.from(bytes).toString("base64")}` };
-  const a = await rig({ blobs: s3Blobs(cfg()), server: { blobKey: key } });
-  const up = await join(a.server, a.ids, "editor");
-  up.net.put(file);
-  const raw = new Bun.S3Client(cfg());
-  await until(() => raw.file(`${a.ids.tenant}/${id}`).exists(), "the object in the bucket");
-  up.close();
-  await a.stop();
+  const dataURL = `data:image/png;base64,${Buffer.from(bytes).toString("base64")}`;
+  let up, down;
+  try {
+    const a = await rig({ blobs: s3Blobs(cfg()), server: { blobKey: key } });
+    up = page(a, "owner");
+    await up.until(() => up.S.role === "presenter", "welcome as a presenter");
+    expect(up.upload({ id, mimeType: "image/png", dataURL, width: 100, height: 80 })).toBeTruthy();
+    const raw = new Bun.S3Client(cfg());
+    await up.until(async () => (await raw.file(`${a.ids.tenant}/${id}`).exists()) && (await a.rawStore.lastSeq(a.ids.tenant, a.ids.board)) >= 1, "the object in the bucket and the element in the log");
+    up.close();
+    await a.stop();
 
-  const b = await rig({ blobs: s3Blobs(cfg()), registry: a.registry, ids: a.ids, server: { blobKey: key } });   // no disk shared with a's blobs
-  const down = await join(b.server, b.ids, "viewer");
-  down.net.want(id);
-  expect(await until(() => down.got[0], "the bytes from S3")).toEqual(file);
-  down.close();
-});
+    const b = await rig({ blobs: s3Blobs(cfg()), registry: a.registry, ids: a.ids, server: { blobKey: key } });   // no disk shared with a's blobs
+    down = page(b, "viewer");
+    await down.until(() => down.S.eds.board.doc.files[id]?.dataURL === dataURL, "the bytes from S3 in the fresh page");
+  } finally { up?.close(); down?.close(); }
+}, 40_000);
 
 st("S3: the quota reads the tenant's usage from the bucket", async () => {
   const bytes = fakePng(900, 22), id = sha1(bytes);

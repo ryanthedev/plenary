@@ -25,7 +25,7 @@ const json = (status, body) => new Response(JSON.stringify(body), { status, head
  *   auth: object, registry: object, store: object, bus: object, blobs?: object, log?: object,
  *   port?: number, hostname?: string,
  *   http?: (req: Request, url: URL) => Response | undefined | Promise<Response | undefined>,
- *   blobKey?: Uint8Array, quotaBytes?: number, publicUrl?: string,   // blobs: ≥ 32-byte signing key (default: random per process), tenant quota, the origin signed URLs name (default none: a path)
+ *   blobKey?: Uint8Array, quotaBytes?: number, publicUrl?: string, maxBlobPuts?: number, idleTimeoutSec?: number,   // blobs: ≥ 32-byte signing key (default: random per process), tenant quota, the origin signed URLs name (default none: a path)
  *   limits?: object, host?: object, static?: false | { mounts?: { url: string, dir: string }[] },
  *   roles?: { gateway: boolean, host: boolean }, node?: string, now?: () => number, timers?: object,
  * }} o — `port: 0` picks a free port. `host` options go to the room host (tests; main.js passes hostname and
@@ -34,7 +34,7 @@ const json = (status, body) => new Response(JSON.stringify(body), { status, head
  *   (names a gateway-only node's open requests). `now`, `timers`: the gateway's clock and timers; tests inject virtual ones (default Date.now and the globals).
  */
 export function createServer({ auth, registry, store, bus, blobs = null, log = quietLogger, port = 0, hostname = "127.0.0.1", http, limits, host = {}, static: web = {},
-  roles = { gateway: true, host: true }, node = "node", now, timers, blobKey, quotaBytes, publicUrl }) {
+  roles = { gateway: true, host: true }, node = "node", now, timers, blobKey, quotaBytes, publicUrl, maxBlobPuts, idleTimeoutSec = 30 }) {
   if (!roles || (!roles.gateway && !roles.host)) throw new TypeError("createServer needs at least one role (gateway, host)");
   const started = Date.now();
   const badRequest = badRequestLimiter();
@@ -43,13 +43,16 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
     ? roomHost({ store, bus, log, ...host })
     : remoteRooms({ bus, node, timeoutMs: host.leaseTtlMs ?? 10_000, log });
   const unserve = roles.host ? serveOpens({ bus, rooms, log }) : () => {};
-  let origin = publicUrl?.replace(/\/+$/, "") ?? "";   // "": signed URLs are the path /blobs/<token>, which the client resolves against the origin it connected to
-  const access = blobs && roles.gateway ? blobAccess({ blobs, key: blobKey ?? crypto.getRandomValues(new Uint8Array(32)), origin: () => origin, log, ...(now ? { now } : {}), ...(quotaBytes !== undefined ? { quotaBytes } : {}) }) : null;
-  const blobHttp = access ? blobRoutes({ access }) : null;
+  const origin = publicUrl?.replace(/\/+$/, "") ?? "";   // "": signed URLs are the path /blobs/<token>, which the client resolves against the origin it connected to
+  const access = blobs && roles.gateway ? blobAccess({ blobs, key: blobKey ?? crypto.getRandomValues(new Uint8Array(32)), origin, log, ...(now ? { now } : {}), ...(quotaBytes !== undefined ? { quotaBytes } : {}) }) : null;
+  const blobHttp = access ? blobRoutes({ access, ...(maxBlobPuts ? { maxPuts: maxBlobPuts } : {}) }) : null;
   const gw = roles.gateway ? makeGateway({ auth, registry, store, bus, rooms, log, limits, ...(access ? { blobUrl: access.url } : {}), ...(now ? { now } : {}), ...(timers ? { timers } : {}) }) : null;
 
   const server = Bun.serve({
     port, hostname,
+    // Bun's default is 10 s without a byte either way, which would cut a slow upload of a 10 MB picture mid-body (WebSockets have their
+    // own timeout, the gateway's). Set, not inherited.
+    idleTimeout: idleTimeoutSec,
     async fetch(req, srv) {
       try {
         let url;

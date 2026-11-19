@@ -62,8 +62,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   if (!ui.drawer && me.role === "annotator") ui.drawer = "notes";
   net.onFile(file => { S.receiveFiles({ [file.id]: file }); });
   // A picture that could not be saved for everyone (PROTOCOL.md § Blobs): it shows here, but nobody else will see it.
-  const WHY = { quota: "the storage quota is full", forbidden: "you can't upload here", "too-large": "it is over 10 MB", "not-image": "it is not a PNG, JPEG, GIF or WebP", "gave-up": "the server could not be reached" };
-  net.onFail?.(({ code }) => toast(`The picture was not saved for others: ${WHY[code] ?? code}`, 6000));
+  const WHY = { quota: "the storage quota is full", forbidden: "you can't upload here", "too-large": "it is over 10 MB", "not-image": "it is not a PNG, JPEG, GIF or WebP", "gave-up": "the server could not be reached (still trying)", limit: "too many uploads at once (still trying)" };
+  net.onFail?.(({ code, retrying }) => toast(`The picture ${retrying ? "is not saved for others yet" : "was not saved for others"}: ${WHY[code] ?? code}`, 6000));
 
   const isPhone = () => matchMedia("(max-width: 640px)").matches;
   const canvas = $("#board"), ink = $("#ink"), ctx = canvas.getContext("2d");
@@ -106,19 +106,9 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   function draw() {
     const theme = THEMES[ui.theme];
     const items = S.displayList(theme);
-    // A picture whose bytes haven't arrived yet shows as a dashed box, and its bytes are asked for (the net dedupes and
-    // paces; a picture the server doesn't have, or can't reach, stays a dashed box).
-    const files = allFiles();
-    for (let i = 0; i < items.length; i++) {
-      const it = items[i];
-      if (it.t === "image" && !files[it.fileId]) {
-        net.want?.(it.fileId);
-        const { x, y, w, h: hh } = it;
-        items.splice(i, 1, { t: "path", cmds: [["M", x, y], ["L", x + w, y], ["L", x + w, y + hh], ["L", x, y + hh], ["L", x, y]], stroke: theme.dim, width: 1, dash: [5, 4] },
-          { t: "text", x: x + 8, y: y + 6, text: "picture (bytes not here yet)", size: 11, color: theme.dim, align: "left", lineHeight: 1.2 });
-        i++;
-      }
-    }
+    // A picture whose bytes haven't arrived is drawn by core as a dashed box (render.js); its bytes are asked for here
+    // (the net dedupes, paces and rests; a picture the server doesn't have stays a dashed box).
+    for (const id of S.missingFiles()) net.want?.(id);
     const { w, h: hh } = S.eds.board.size;
     paint(ctx, items, { width: w, height: hh, dpr: canvas.width / Math.max(1, w), background: theme.bg, image });
     canvas.style.cursor = S.may() || S.tool === "hand" ? S.ed.cursor() ?? "default" : "grab";

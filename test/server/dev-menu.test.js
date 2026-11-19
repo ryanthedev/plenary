@@ -234,7 +234,7 @@ test("a Registry that fails at start turns the menu OFF with one warn line; the 
     postgresRegistry: async () => ({ ...sqliteRegistry({ path: join(tempDir(), "r.db") }), tenantAdminsAmong: async () => { throw Object.assign(new Error("connect to postgres://u:SECRETPW@h failed"), { code: "ERR_POSTGRES_SERVER_ERROR", errno: "42P01" }); } }),
     natsBus: async () => memoryBus({}),
   };
-  const app = await start({ PLENARY_DATA_DIR: tempDir(), PORT: "0", LOG_LEVEL: "warn", DATABASE_URL: "postgres://x@127.0.0.1:1/p", NATS_URL: "nats://127.0.0.1:1", COOKIE_KEY: "c".repeat(32), PLENARY_DEV_TOKENS: TOK }, { adapters, write: l => lines.push(l) });
+  const app = await start({ PLENARY_DATA_DIR: tempDir(), PORT: "0", LOG_LEVEL: "warn", DATABASE_URL: "postgres://x@127.0.0.1:1/p", NATS_URL: "nats://127.0.0.1:1", COOKIE_KEY: "c".repeat(32), PLENARY_BLOBS: "local-disk", PLENARY_DEV_TOKENS: TOK }, { adapters, write: l => lines.push(l) });
   try {
     expect((await get(app)).status).toBe(404);
     const got = lines.join("");
@@ -329,7 +329,7 @@ test("the start-up OFF warn's cause: a SQLSTATE first, then code, then name; a h
       postgresRegistry: async () => ({ ...sqliteRegistry({ path: join(tempDir(), "r.db") }), tenantAdminsAmong: async () => { throw Object.assign(new Error("boom"), props); } }),
       natsBus: async () => memoryBus({}),
     };
-    const app = await start({ PLENARY_DATA_DIR: tempDir(), PORT: "0", LOG_LEVEL: "warn", DATABASE_URL: "postgres://x@127.0.0.1:1/p", NATS_URL: "nats://127.0.0.1:1", COOKIE_KEY: "c".repeat(32), PLENARY_DEV_TOKENS: TOK }, { adapters, write: l => lines.push(l) });
+    const app = await start({ PLENARY_DATA_DIR: tempDir(), PORT: "0", LOG_LEVEL: "warn", DATABASE_URL: "postgres://x@127.0.0.1:1/p", NATS_URL: "nats://127.0.0.1:1", COOKIE_KEY: "c".repeat(32), PLENARY_BLOBS: "local-disk", PLENARY_DEV_TOKENS: TOK }, { adapters, write: l => lines.push(l) });
     try {
       const got = lines.join("");
       expect([JSON.stringify(props), got.includes(`tenant admin ${want}`)]).toEqual([JSON.stringify(props), true]);

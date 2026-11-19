@@ -32,7 +32,7 @@ describe.skipIf(!PG || !NATS)("two clusters on one NATS", () => {
     const u = new URL(PG); u.pathname = "/" + name; return u.toString();
   };
   const node = async (dbUrl, id, roles) => {
-    const app = await start({ DATABASE_URL: dbUrl, NATS_URL: NATS, COOKIE_KEY: "c".repeat(40), PLENARY_DEV_TOKENS: TOKENS, LOG_LEVEL: "error", PORT: "0",
+    const app = await start({ DATABASE_URL: dbUrl, NATS_URL: NATS, COOKIE_KEY: "c".repeat(40), PLENARY_BLOBS: "local-disk", PLENARY_DEV_TOKENS: TOKENS, LOG_LEVEL: "error", PORT: "0",
       PLENARY_NODE_ID: id, PLENARY_ROLES: roles, PLENARY_LEASE_TTL_MS: String(TTL), PLENARY_DATA_DIR: tempDir(`plenary-iso-${id}-`) }, { write: () => {} });
     apps.push(app);
     return { app, url: `http://127.0.0.1:${app.server.port}`, ws: `ws://127.0.0.1:${app.server.port}/ws`, dbUrl };

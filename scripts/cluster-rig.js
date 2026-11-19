@@ -600,6 +600,7 @@ export async function startRig(opts = {}) {
         PLENARY_NODE_ID: n.id, PLENARY_ROLES: n.roles.join(","), PLENARY_LEASE_TTL_MS: String(leaseTtlMs),
         DATABASE_URL: rig.postgres.url, NATS_URL: rig.nats.url,
         COOKIE_KEY: keys.COOKIE_KEY, SESSION_KEY: keys.SESSION_KEY,
+        S3_ENDPOINT: rig.blobs.url, S3_BUCKET: rig.blobs.bucket, S3_REGION: "us-east-1", S3_ACCESS_KEY_ID: rig.blobs.accessKey, S3_SECRET_ACCESS_KEY: rig.blobs.secretKey,
         PLENARY_DEV_TOKENS: tokensJson, PLENARY_MAX_CONNS_PER_USER: String(maxConnsPerUser),
       });
       const proc = launch(rig, kids, `node:${n.id}`, nodeCmd, { env, cwd: nodeDir, log, abort: opts.abort });

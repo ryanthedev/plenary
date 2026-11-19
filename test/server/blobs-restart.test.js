@@ -1,44 +1,33 @@
-// Issue #42: uploaded images vanished after a server restart. The whole path, with the REAL web client (wsNet) against
-// a REAL server (test/server/rig.js): upload → stop the server → a new server on the same data → a fresh client loads
-// the board and gets the picture's bytes back. A server-only test would not show the "picture (bytes not here yet)"
-// placeholder going away; this one ends where the app's `net.onFile` hands bytes to the Editors.
+// Issue #42: uploaded images vanished after a server restart. The whole path, with the REAL canvas app (app.js on a stub
+// page, test/web/app-client.js) over the real web client (wsNet) against a REAL server (test/server/rig.js): upload,
+// stop the server, start a new one on the same data, and a fresh page loads the board and DRAWS the picture's bytes
+// into its Editor. Nobody calls `want` here: the app asks for the bytes of the pictures it shows without them.
+// (Decoding a File needs a browser, so the upload half runs the two lines app.js runs after decoding: S.addPicture, net.put.)
 import { test, expect, afterAll } from "bun:test";
-import { wsNet } from "../../web/adapters/transport/ws.js";
+import { appClient, restoreAppGlobals } from "../web/app-client.js";
 import { rig, tokenOf } from "./rig.js";
-import { cleanup, fakePng, sha1, until } from "./helpers.js";
+import { cleanup, fakePng, sha1 } from "./helpers.js";
 
-afterAll(cleanup);
+afterAll(() => { restoreAppGlobals(); cleanup(); });
 
-const dataUrl = (bytes, type = "image/png") => `data:${type};base64,${Buffer.from(bytes).toString("base64")}`;
+const page = (r, name) => appClient({ url: r.server.wsUrl, board: r.ids.board, token: tokenOf(name), user: "dev:" + name });
 
-/** A web-client net on `server`, joined and welcomed as `name`; `got` collects what onFile delivers. */
-async function join(server, ids, name) {
-  const net = wsNet({ url: server.wsUrl, WebSocket });
-  const got = [];
-  net.onFile(f => got.push(f));
-  const tr = net.join(), msgs = [];
-  tr.onMessage(m => msgs.push(m));
-  tr.send({ t: "hello", v: 1, token: tokenOf(name), board: ids.board, since: 0, client: name });
-  await until(() => msgs.find(m => m.t === "welcome"), `${name}'s welcome`);
-  return { net, got, msgs, close: () => tr.close() };
-}
+test("DW-42.1 DW-42.3: a picture uploaded by one page is drawn by a fresh page after a server restart", async () => {
+  const bytes = fakePng(3000, 9), id = sha1(bytes), dataURL = `data:image/png;base64,${Buffer.from(bytes).toString("base64")}`;
+  let up, down;
+  try {
+    const a = await rig();
+    up = page(a, "owner");
+    await up.until(() => up.S.role === "presenter", "the uploader welcomed as a presenter");
+    expect(up.upload({ id, mimeType: "image/png", dataURL, width: 100, height: 80 })).toBeTruthy();
+    await up.until(async () => (await a.server.blobs.get(a.ids.tenant, id)) !== null && (await a.rawStore.lastSeq(a.ids.tenant, a.ids.board)) >= 1, "the bytes in the Blobs adapter and the element in the log");
+    up.close();
+    await a.stop();
 
-test("DW-42.1 DW-42.3: a picture uploaded by a client is still there for a fresh client after a server restart", async () => {
-  const bytes = fakePng(3000, 9), id = sha1(bytes);
-  const file = { id, mimeType: "image/png", dataURL: dataUrl(bytes) };
-
-  const a = await rig();
-  const up = await join(a.server, a.ids, "editor");
-  up.net.put(file);
-  await until(async () => (await a.server.blobs.get(a.ids.tenant, id)) !== null, "the bytes in the Blobs adapter");
-  up.close();
-  await a.stop();
-
-  const b = await rig({ dir: a.dir, registry: a.registry, ids: a.ids });           // the same data, a new process-worth of server
-  const down = await join(b.server, b.ids, "viewer");
-  down.net.want?.(id);                                                             // what the app does for an image element with no bytes
-  const f = await until(() => down.got.find(x => x.id === id), "the picture's bytes after the restart");
-  expect(f.dataURL).toBe(file.dataURL);
-  expect(f.mimeType).toBe("image/png");
-  down.close();
-});
+    const b = await rig({ dir: a.dir, registry: a.registry, ids: a.ids });            // the same data, a new server
+    down = page(b, "viewer");
+    await down.until(() => down.S.eds.board.doc.files[id]?.dataURL === dataURL, "the picture's bytes in the fresh page's Editor");
+    expect(down.wanted).toContain(id);                                                 // asked for by the app's own draw
+    expect(down.S.missingFiles()).toEqual([]);
+  } finally { up?.close(); down?.close(); }
+}, 40_000);

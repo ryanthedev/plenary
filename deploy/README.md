@@ -252,8 +252,9 @@ and stable across that node's restarts (a fixed value per service).
 
 **Cluster env** (names confirmed by engine; Compose sets them): `DATABASE_URL`, `NATS_URL`, `S3_ENDPOINT`, `S3_BUCKET`,
 `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `PLENARY_NODE_ID`, `PLENARY_ROLES`.
-Pictures: with `S3_ENDPOINT` set (all five `S3_*` required) their bytes go to the bucket; without it a node uses its own
-disk and warns, and another node can't read what it stored. Signed picture URLs are keyed from `COOKIE_KEY` (same on
+Pictures: with `S3_ENDPOINT` set (all five `S3_*` required) their bytes go to the bucket. A cluster node without it
+**refuses to start** (another node could not read what this one stored); `PLENARY_BLOBS=local-disk` opts a cluster with
+a single gateway into the node's own disk (the start warns). Signed picture URLs are keyed from `COOKIE_KEY` (same on
 every node) and name `PUBLIC_URL` when it is set. `PLENARY_BLOB_QUOTA_BYTES` sets the per-tenant limit (default 10 GiB;
 enforced per node, see PROTOCOL.md Known limits).
 

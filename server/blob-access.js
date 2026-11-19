@@ -33,15 +33,16 @@ const MAX_TOKEN_CHARS = 1024;
 const CODES = { "too-large": "too-large", "hash-mismatch": "hash-mismatch", "not-image": "not-image", "bad-entry": "bad-length" };
 
 /**
- * @param {{ blobs: { put: Function, get: Function, usage: Function }, key: Uint8Array, origin: () => string,   // "" gives the path /blobs/<token>
+ * @param {{ blobs: { put: Function, get: Function, usage: Function }, key: Uint8Array, origin?: string,
  *           now?: () => number, quotaBytes?: number, ttlMs?: number, log?: object }} o
- *   key: ≥ 32 bytes (derive it from the shared key, never use the key itself). origin: where this server is reached
- *   (read at each URL, so a `port: 0` server can say its port after it listens).
+ *   key: ≥ 32 bytes (derive it from the shared key; never the key itself). origin: where browsers reach this server
+ *   (PUBLIC_URL, no trailing slash); "" (the default) makes every URL the path /blobs/<token>, which the client resolves
+ *   against the origin it connected to.
  */
-export function blobAccess({ blobs, key, origin, now = Date.now, quotaBytes = DEFAULT_QUOTA_BYTES, ttlMs = URL_TTL_MS, log = quietLogger }) {
+export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes = DEFAULT_QUOTA_BYTES, ttlMs = URL_TTL_MS, log = quietLogger }) {
   if (!blobs || typeof blobs.put !== "function" || typeof blobs.get !== "function" || typeof blobs.usage !== "function") throw new TypeError("blobAccess needs a Blobs port (put, get, usage)");
   if (!(key instanceof Uint8Array) || key.length < 32) throw new TypeError("blobAccess: key must be at least 32 bytes");
-  if (typeof origin !== "function") throw new TypeError("blobAccess needs origin()");
+  if (typeof origin !== "string") throw new TypeError("blobAccess: origin must be a string");
   if (!Number.isFinite(quotaBytes) || quotaBytes < 0) throw new TypeError("blobAccess: quotaBytes must be a number ≥ 0");
   const mac = crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
 
@@ -82,7 +83,7 @@ export function blobAccess({ blobs, key, origin, now = Date.now, quotaBytes = DE
     async url(tenant, board, sha1, verb) {
       if (!isId(tenant) || !isId(board) || !isSha1(sha1) || !VERBS.includes(verb)) throw new PortError("bad-id", "bad blob url scope");
       const payload = b64url(utf8(JSON.stringify({ tenant, board, sha1, verb, exp: now() + ttlMs })));
-      return `${origin()}/blobs/${payload}.${b64url(await crypto.subtle.sign("HMAC", await mac, utf8("b1." + payload)))}`;
+      return `${origin}/blobs/${payload}.${b64url(await crypto.subtle.sign("HMAC", await mac, utf8("b1." + payload)))}`;
     },
 
     /** @returns {Promise<{ ok: true, created: boolean } | { ok: false, code: string }>} */

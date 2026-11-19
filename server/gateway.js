@@ -1043,14 +1043,14 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
    */
   async function blob(ws, msg) {
     const c = ws.data;
-    const sha = isSha1(msg.sha1) ? { sha1: msg.sha1 } : {};
+    const sha = typeof msg.sha1 === "string" && msg.sha1.length <= 64 ? { sha1: msg.sha1 } : {};   // echoed even when malformed (a short string only), so the client's request slot is freed
     const no = (code, message) => push(ws, codec.encode({ t: "error", ...sha, code, message }));
     if (!c.welcomed) return no("auth", "wait for welcome");
     const t = now();                                         // 10/s per connection, every request counted (refused ones too)
     c.blobTokens = Math.min(lim.blobRate, (c.blobTokens ?? lim.blobRate) + ((t - (c.blobAt ?? t)) / 1000) * lim.blobRate); c.blobAt = t;
     if (c.blobTokens < 1) return no("limit", "too many blob requests: ask again shortly");
     c.blobTokens -= 1;
-    if (!sha.sha1 || (msg.put !== undefined && msg.put !== true)) return no("bad-op", "a blob request is { sha1: 40 lowercase hex, put?: true }");
+    if (!isSha1(msg.sha1) || (msg.put !== undefined && msg.put !== true)) return no("bad-op", "a blob request is { sha1: 40 lowercase hex, put?: true }");
     const put = msg.put === true;
     if (put ? !(canWrite(c.role, "board") || canWrite(c.role, "notes")) : !c.role) return no("forbidden", put ? `${c.role} can't upload pictures` : "no role on this board");
     if (put && !putAllowed(`${c.tenant}/${c.board}/${c.user}`)) return no("limit", "too many uploads: ask again later");

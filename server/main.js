@@ -2,8 +2,9 @@
 //   Single node (neither DATABASE_URL nor NATS_URL): SQLite store and registry, in-memory bus, both roles.
 //   Cluster node (both set): Postgres store and registry, NATS bus, the roles PLENARY_ROLES names.
 //   Blobs (picture bytes; PROTOCOL.md § Blobs): S3-compatible when S3_ENDPOINT is set, else local disk
-//   (PLENARY_DATA_DIR/blobs). A cluster node without S3_* still starts, on its own disk, with a loud warning: a
-//   picture put through one node is then unreadable through another, so a real cluster sets S3_*.
+//   (PLENARY_DATA_DIR/blobs). A cluster node (DATABASE_URL/NATS_URL) with no S3_ENDPOINT REFUSES to start: a
+//   picture put through one node would be unreadable through another. PLENARY_BLOBS=local-disk opts in to disk for a
+//   cluster with a single gateway (the start warns).
 //
 // Environment (no secrets in the repo; none of these values is ever logged):
 //   PORT                 default 8080 (0 = any free port)
@@ -18,6 +19,7 @@
 //   S3_ENDPOINT, S3_BUCKET, S3_REGION, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY   S3-compatible blobs (the bucket must
 //                        exist). S3_ENDPOINT set → all five are required, else the start is refused naming the missing
 //                        ones. S3_SESSION_TOKEN (optional) goes to the client. Never logged.
+//   PLENARY_BLOBS        unset, or `local-disk` (see above); anything else refuses the start. Not with S3_ENDPOINT.
 //   PLENARY_BLOB_QUOTA_BYTES   per-tenant picture storage, default 10 GiB (a positive integer, else the start is refused)
 //   LOG_LEVEL            debug | info | warn | error
 //   PLENARY_MAX_CONNS_PER_USER   open sockets one user may hold (default 64). A load test that shares a few dev
@@ -441,10 +443,18 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
     async stop() { await server.stop(); await bus.close(); await store.close(); await rawRegistry.close(); } };
 }
 
-/** S3 when S3_ENDPOINT is set (all five settings, or the start is refused), else this node's disk. */
+/**
+ * S3 when S3_ENDPOINT is set (all five settings, or the start is refused), else this node's disk. A cluster node must
+ * name its choice: without S3_ENDPOINT it needs PLENARY_BLOBS=local-disk (a cluster with ONE gateway, where nobody else
+ * reads the disk), because a picture put through one node would be unreadable through another.
+ */
 function openBlobs(env, dataDir, cluster, log) {
+  const mode = env.PLENARY_BLOBS;
+  if (mode !== undefined && mode !== "local-disk") throw new Error('PLENARY_BLOBS must be "local-disk" (or unset)');
+  if (mode === "local-disk" && env.S3_ENDPOINT) throw new Error("PLENARY_BLOBS=local-disk and S3_ENDPOINT are both set: pick one");
   if (!env.S3_ENDPOINT) {
-    if (cluster) log.warn("S3_ENDPOINT is not set: pictures are stored on this node's disk, and another node cannot read them");
+    if (cluster && mode !== "local-disk") throw new Error("cluster mode needs picture storage every node can reach: set S3_ENDPOINT (with S3_BUCKET, S3_REGION, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY), or PLENARY_BLOBS=local-disk for a cluster with a single gateway");
+    if (cluster) log.warn("PLENARY_BLOBS=local-disk: pictures are stored on this node's disk; a second gateway could not read them");
     return diskBlobs({ dir: join(dataDir, "blobs") });
   }
   const names = ["S3_BUCKET", "S3_REGION", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"], missing = names.filter(n => !env[n]);

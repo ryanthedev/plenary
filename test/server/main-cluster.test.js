@@ -34,7 +34,7 @@ describe.skipIf(!PG || !NATS)("cluster: three main.js processes on Postgres + NA
   });
 
   async function node(id, roles) {
-    const p = spawn({ DATABASE_URL: dbUrl, NATS_URL: NATS, COOKIE_KEY: "c".repeat(40), PLENARY_DEV_TOKENS: TOKENS, LOG_LEVEL: "info",
+    const p = spawn({ DATABASE_URL: dbUrl, NATS_URL: NATS, COOKIE_KEY: "c".repeat(40), PLENARY_BLOBS: "local-disk", PLENARY_DEV_TOKENS: TOKENS, LOG_LEVEL: "info",
       PLENARY_NODE_ID: id, PLENARY_ROLES: roles, PLENARY_LEASE_TTL_MS: String(TTL), PLENARY_DATA_DIR: tempDir(`plenary-cluster-${id}-`) });
     procs.push(p);
     const { port } = await p.line("server listening");

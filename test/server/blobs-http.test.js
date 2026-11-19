@@ -39,7 +39,10 @@ test("a malformed request is bad-op without a signature, never closes the connec
   for (const bad of [{ sha1: SIG.toUpperCase() }, { sha1: "a".repeat(39) }, { sha1: "../../etc/passwd" }, {}, { sha1: 5 }, { sha1: SIG + "0" }])
     expect(await s.ask({ t: "blob", ...bad })).toMatchObject({ t: "error", code: "bad-op" });
   for (const put of [false, "yes", 1, null]) expect(await s.ask({ t: "blob", sha1: SIG, put })).toMatchObject({ t: "error", code: "bad-op", sha1: SIG });
-  expect((await s.ask({ t: "blob", sha1: "x" })).sha1).toBe(undefined);
+  // The short string is echoed even though it is no sha1, so the client's one request slot is freed; a long one is not echoed.
+  expect((await s.ask({ t: "blob", sha1: "x" })).sha1).toBe("x");
+  expect((await s.ask({ t: "blob", sha1: "y".repeat(65) })).sha1).toBe(undefined);
+  expect((await s.ask({ t: "blob", sha1: 5 })).sha1).toBe(undefined);
   expect(await ask(s, SIG)).toMatchObject({ t: "blob" });
   expect(s.closed).toBe(null);
 });
@@ -156,4 +159,33 @@ test("DW-42.1: a signed URL survives a restart only with a shared key; without o
   const s2 = await as(c, "viewer");                                                                         // …and a new ask works, for the bytes stored before
   const g = await fetch(c.server.url + (await ask(s2, h)).url);
   expect(new Uint8Array(await g.arrayBuffer())).toEqual(bytes);
+});
+
+/** A raw HTTP PUT that sends its headers and `sent` bytes of a body it promised `len` of, then stalls. */
+async function stalledPut(r, token, len, sent) {
+  const url = new URL(r.server.url), chunks = [];
+  let closed = false;
+  const sock = await Bun.connect({ hostname: url.hostname, port: Number(url.port), socket: {
+    data(_, d) { chunks.push(Buffer.from(d).toString()); }, close() { closed = true; }, error() { closed = true; }, open(s) {
+      s.write(`PUT /blobs/${token} HTTP/1.1\r\nHost: x\r\nContent-Length: ${len}\r\n\r\n`); s.write(new Uint8Array(sent).fill(1)); } } });
+  return { sock, reply: () => chunks.join(""), closed: () => closed, end: () => sock.end() };
+}
+
+test("PUT bodies in flight are limited per node: past the limit 503 busy (retryable), and a freed slot works again", async () => {
+  const r = await rig({ server: { maxBlobPuts: 2 } }), s = await as(r, "editor"), bytes = fakePng(300, 1), h = sha1(bytes);
+  const put = async () => tok((await ask(s, h, true)).url);
+  const a = await stalledPut(r, await put(), 300, 10), b = await stalledPut(r, await put(), 300, 10);
+  const third = await put();
+  await until(async () => (await fetch(r.server.url + "/blobs/" + third, { method: "PUT", body: bytes })).status === 503, "the third PUT refused as busy");
+  const busy = await fetch(r.server.url + "/blobs/" + third, { method: "PUT", body: bytes });
+  expect([busy.status, (await busy.json()).error, busy.headers.get("retry-after")]).toEqual([503, "busy", "2"]);
+  a.end();                                                                      // a stalled upload that goes away frees its slot
+  await until(async () => (await fetch(r.server.url + "/blobs/" + third, { method: "PUT", body: bytes })).status === 201, "a freed slot");
+  b.end();
+});
+
+test("an upload that stops sending is cut by the idle timeout the server sets (not Bun's default)", async () => {
+  const r = await rig({ server: { idleTimeoutSec: 1 } }), s = await as(r, "editor"), h = sha1(fakePng(300, 3));
+  const stalled = await stalledPut(r, tok((await ask(s, h, true)).url), 1000, 10);
+  await until(() => stalled.closed(), "the stalled upload closed by the idle timeout", 6000);
 });

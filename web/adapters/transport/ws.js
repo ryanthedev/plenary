@@ -208,6 +208,7 @@ export function wsTransport({ url, WebSocket: WS, codec = jsonCodec, maxQueued =
   };
 }
 
+const SHA1 = /^[0-9a-f]{40}$/;
 const RASTER = /^image\/(png|jpeg|gif|webp)$/;
 const RETRY_STATUS = new Set([401, 404, 408, 429, 500, 502, 503, 504]);   // 401: the 5-minute URL ran out; 404: a GET before the upload landed
 const RETRY_CODES = new Set(["limit", "unavailable", "auth"]);             // a refused `blob` request that can pass (PROTOCOL.md § Blobs)
@@ -226,7 +227,7 @@ const b64 = bytes => { let s = ""; for (let i = 0; i < bytes.length; i += 0x8000
  * @param {{ fetch: typeof fetch, clock: Pick<import("../../ports/clock.js").Clock, "mono" | "set" | "clear">, base: string }} o  base: the http(s) origin of the gateway
  */
 function blobClient({ fetch: fetchFn, clock, base }) {
-  const GAP_MS = 120, ASK_TIMEOUT_MS = 10_000, XFER_TIMEOUT_MS = 30_000, MAX_TRIES = 6, REST_MS = 30_000, MAX_XFERS = 4;
+  const GAP_MS = 120, ASK_TIMEOUT_MS = 10_000, XFER_TIMEOUT_MS = 30_000, MAX_TRIES = 6, MAX_LIMITS = 20, REST_MS = 30_000, MAX_XFERS = 4;
   /** key `${verb}:${sha1}` → { verb, id, file?, tries, state: "idle" | "asking" | "xfer" | "done" | "rest", timer, until } */
   const tasks = new Map();
   const queue = [];
@@ -239,13 +240,27 @@ function blobClient({ fetch: fetchFn, clock, base }) {
   const clearTimer = t => { if (t.timer != null) { clock.clear(t.timer); t.timer = null; } };
   const enqueue = t => { t.state = "idle"; if (!queue.includes(t)) queue.push(t); pump(); };
   const finish = t => { clearTimer(t); t.state = "done"; t.file = undefined; };
-  const rest = t => { clearTimer(t); t.state = "rest"; t.until = clock.mono() + REST_MS; };
-  /** A failure that can pass: ask again after a backoff, or rest when the tries are used up. */
-  function retry(t) {
+  /** Rest for REST_MS. An upload wakes itself then (a picture someone placed must go up eventually); a download waits for want(). */
+  function rest(t, wake = false) {
+    clearTimer(t); t.state = "rest"; t.until = clock.mono() + REST_MS;
+    if (wake && t.verb === "PUT") t.timer = clock.set(() => { t.timer = null; t.tries = 0; t.limits = 0; enqueue(t); }, REST_MS);
+  }
+  /**
+   * A failure that can pass: ask again after a backoff. A `limit` (the gateway's rate, PROTOCOL.md § Blobs) is not a
+   * failed try: it backs off past the put window instead (2, 4, 8, 16, then 30 s) and is told to the user once.
+   */
+  function retry(t, limited = false) {
     clearTimer(t);
-    if (++t.tries >= MAX_TRIES) { if (t.verb === "PUT") { emit(failFns, { id: t.id, verb: t.verb, code: "gave-up" }); } return rest(t); }
+    if (limited) {
+      if (t.verb === "PUT" && !t.toldLimit) { t.toldLimit = true; emit(failFns, { id: t.id, verb: t.verb, code: "limit", retrying: true }); }
+      if (++t.limits > MAX_LIMITS) return rest(t, true);
+    } else if (++t.tries >= MAX_TRIES) {
+      if (t.verb === "PUT" && !t.toldGaveUp) { t.toldGaveUp = true; emit(failFns, { id: t.id, verb: t.verb, code: "gave-up", retrying: true }); }
+      return rest(t, true);
+    }
     t.state = "idle";
-    t.timer = clock.set(() => { t.timer = null; enqueue(t); }, Math.min(30_000, 1000 * 2 ** (t.tries - 1)) * (0.5 + Math.random() / 2));
+    const wait = limited ? Math.min(30_000, 2000 * 2 ** Math.min(t.limits - 1, 4)) : Math.min(30_000, 1000 * 2 ** (t.tries - 1));
+    t.timer = clock.set(() => { t.timer = null; enqueue(t); }, wait * (0.5 + Math.random() / 2));
   }
   /** A failure that won't pass by asking again. */
   function fatal(t, code) { if (t.verb === "PUT") emit(failFns, { id: t.id, verb: t.verb, code }); rest(t); t.until = Infinity; }
@@ -315,7 +330,7 @@ function blobClient({ fetch: fetchFn, clock, base }) {
         if (!t || t.id !== mine) return;                       // a late answer to a request already given up on
         clearTimer(t); inflight = null;
         if (m.t === "blob") transfer(t, resolve(m.url));
-        else if (RETRY_CODES.has(m.code)) retry(t);
+        else if (RETRY_CODES.has(m.code)) retry(t, m.code === "limit");
         else fatal(t, m.code);
         pump();
       });
@@ -323,16 +338,16 @@ function blobClient({ fetch: fetchFn, clock, base }) {
       return self;
     },
     put(file) {
-      const k = `PUT:${file?.id}`, old = tasks.get(k);
-      if (typeof file?.id !== "string" || typeof file.dataURL !== "string") return;
-      if (old) { if (old.state === "rest") { Object.assign(old, { file, tries: 0, until: 0 }); enqueue(old); } return; }   // the same picture again: only a rested (failed) upload is tried again
-      const t = { verb: "PUT", id: file.id, file, tries: 0, state: "idle", timer: null, until: 0 };
+      if (!SHA1.test(file?.id) || typeof file.dataURL !== "string") return;
+      const k = `PUT:${file.id}`, old = tasks.get(k);
+      if (old) { if (old.state === "rest") { Object.assign(old, { file, tries: 0, limits: 0, toldLimit: false, toldGaveUp: false, until: 0 }); enqueue(old); } return; }   // the same picture again: only a rested (failed) upload is tried again
+      const t = { verb: "PUT", id: file.id, file, tries: 0, limits: 0, state: "idle", timer: null, until: 0 };
       tasks.set(k, t); enqueue(t);
     },
     want(id) {
-      if (typeof id !== "string") return;
+      if (!SHA1.test(id)) return;                              // a bad id would hold the one request slot for nothing
       const k = `GET:${id}`, t = tasks.get(k);
-      if (!t) { const n = { verb: "GET", id, tries: 0, state: "idle", timer: null, until: 0 }; tasks.set(k, n); return enqueue(n); }
+      if (!t) { const n = { verb: "GET", id, tries: 0, limits: 0, state: "idle", timer: null, until: 0 }; tasks.set(k, n); return enqueue(n); }
       if (t.state === "rest" && t.until <= clock.mono()) { t.tries = 0; enqueue(t); }
       else if (t.state === "done") { tasks.delete(k); this.want(id); }   // asked for again after it arrived: the Editor lost it, fetch again
     },

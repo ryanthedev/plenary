@@ -924,7 +924,7 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   message's. Works for `<img>`, browsers and Herdr alike, and keeps the token out of headers and URLs.
 - **`sha1` is exactly 40 lowercase hex characters, and `put` is `true` or absent.** Anything else is answered
   `bad-op` before the server signs anything or calls Blobs, so no adapter ever sees a key like `../other-tenant/x`.
-- **Refusals** are an `error` with no `id` and the request's `sha1` (when it was a valid one), so the client matches it
+- **Refusals** are an `error` with no `id` and the request's `sha1` (echoed as given when it is a string of at most 64 characters, even a malformed one), so the client matches it
   to its request; nothing else is dropped for it. `bad-op` (shape), `forbidden` (role), `limit` (rate), `unavailable`
   (this node has no blob store, or signing is down: ask again later), `auth` (before `welcome`; the connection stays).
   Checks run in this order: rate, shape, role, put rate.
@@ -937,6 +937,9 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   signs with a random key per process, so a URL does not survive a restart (the client asks again). A bad, forged,
   tampered or expired token is `401 { "error": "bad-token" }`, a verb other than the token's is `405`. The role is
   checked when the URL is asked for, not when it is used: a URL is a 5-minute bearer capability.
+- **A cluster must name its storage.** `main.js` refuses a cluster node (`DATABASE_URL`/`NATS_URL`) without `S3_ENDPOINT`:
+  a picture put through one node would be unreadable through another. `PLENARY_BLOBS=local-disk` opts a cluster with a
+  single gateway into disk (the start warns).
 - **A signed PUT URL ends at our server**, never directly at S3: the server must hash and type-check the bytes
   before they are stored.
 - **`PUT /blobs/<token>`** (a put URL): the body is the bytes, with a `Content-Length` (chunked bodies are refused).
@@ -944,7 +947,8 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   PNG, JPEG, GIF or WebP (SVG refused), then reserves quota and stores. The first bytes for a hash are kept: a put
   of a stored blob succeeds without storing. `201` stored now, `200` already stored, `400 bad-length` (no or
   zero length), `413 too-large`, `415 not-image`, `422 hash-mismatch`, `507 quota`, `503 unavailable`
-  (the store failed or took too long; safe to retry), `401`. Bodies are JSON `{ "error": code }`.
+  (the store failed or took too long; safe to retry), `503 busy` (a node reads at most 8 PUT bodies at once; retry), `401`.
+  The body is read as it arrives (memory follows the bytes sent, not the `Content-Length` claimed). Bodies are JSON `{ "error": code }`.
 - **`GET /blobs/<token>`** (a get URL): `200` with the bytes, `Content-Type` of the sniffed kind, `X-Content-Type-Options:
   nosniff`, `Cache-Control: no-store`, and a `Content-Security-Policy: default-src 'none'; sandbox`; `404 not-found`
   (nothing stored under that hash yet: an element's op can arrive before its upload finishes, so a client retries);
@@ -956,9 +960,12 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   fails or the blob was already there, so concurrent puts on one node never go over. Several nodes each count their own
   puts after the first read: the real overshoot is at most the sum of what the other nodes store before this one
   restarts (Known limits).
-- **Client rules** (web client, `wsNet`): an upload is `blob` ask then PUT; a download is `blob` ask then GET. A failure
-  that can pass (no welcome yet, a dropped connection, `limit`, `unavailable`, 408, 429, 5xx, a network error, a
-  timeout) is asked again with backoff on a fresh URL, up to 6 tries; a GET `404` the same way (not yet). `quota`,
+- **Client rules** (web client, `wsNet`): an upload is `blob` ask then PUT; a download is `blob` ask then GET. Only
+  well-formed ids (40 lowercase hex) are asked for. A failure that can pass (no welcome yet, a dropped connection,
+  `unavailable`, 408, 429, 5xx, a network error, a timeout) is asked again with backoff on a fresh URL, up to 6 tries;
+  a GET `404` the same way (not yet). A `limit` is not a failed try: it backs off (2 s doubling to 30 s, up to 20
+  times) and the user is told once. After the tries, a download rests 30 s (asked again by the next `want`), an upload
+  wakes itself after 30 s and tries again, so a picture someone placed always goes up once the server takes it. `quota`,
   `too-large`, `not-image`, `hash-mismatch`, `forbidden` and `bad-op` are final and shown to the user. Requests wait
   for `welcome` and are asked again after every reconnect.
 - Bytes never travel in ops. A blob is stored once per tenant, shared by that tenant's boards.
@@ -972,7 +979,11 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   a pane that still holds the file's old copy can write it back. A copy at 1,001 or just above (within 1,000 of
   the room's version) is accepted and undoes later edits to it without a word; anything higher is held back with
   a warning. drawh warns at import time.
-- Within a tenant, a guest with a role on one board can read another board's blob if they know its SHA-1.
+- **Blobs are tenant-wide, by decision.** Within a tenant, anyone with a role on one board can read another board's blob
+  if they know its SHA-1. Hashes are not guessable, and a `200` against a `404` only tells you whether the tenant holds
+  an image whose bytes you already have. Per-board blobs would cost storage and cross-board dedupe; not done.
+- **`/blobs/*` sends no CORS headers**, so the page must be same-origin with it: `PUBLIC_URL` must be the origin the
+  page is served from (unset, the URL is a path and always is).
 - **SHA-1 keys, first put wins:** a tenant writer able to make a chosen-prefix collision could plant bytes another
   user's image later resolves to. Small in practice; the fix (key by SHA-256, keep `fileId` as a lookup) is open.
 - Blobs are never garbage-collected; only the quota bounds them.

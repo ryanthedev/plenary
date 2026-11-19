@@ -182,7 +182,7 @@ test("bad frames get an error and/or a close, never reach a room, and never kill
   s.send({ t: "launch-missiles" });
   await s.next(m => m.t === "ack" && m.id === "raw:1");
   expect(s.msgs.filter(m => m.t === "error").map(m => m.code)).toEqual(["bad-op", "bad-op"]);
-  s.send({ t: "blob", sha1: "a".repeat(40) });                                             // not served yet: strike three
+  s.send({ t: "teleport" });                                                                // another unknown type: strike three (`blob` is served now: test/server/blobs-http.test.js)
   expect((await s.whenClosed()).code).toBe(1008);
   expect(s.msgs.filter(m => m.t === "error").length).toBe(3);
   // Rule 11: a second hello gets `bad-op` and the connection is closed at once; the room never sees it.

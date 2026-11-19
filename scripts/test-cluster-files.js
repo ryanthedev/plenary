@@ -11,5 +11,6 @@ export const DEFAULT_FILES = [
   "test/server/cluster-isolation.test.js",
   "test/server/s3-blobs.test.js",
   "test/server/blobs-s3-e2e.test.js",
+  "test/server/blobs-main.test.js",   // names S3_* (its start-up refusal test); its children get an explicit env, so the rig's values never reach them
   "test/admin/tenants.test.js",
 ];

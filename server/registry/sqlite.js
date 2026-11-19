@@ -17,7 +17,7 @@
 // `user`; insertion order is an explicit `n` column (Postgres: BIGSERIAL / identity), upserts use ON CONFLICT.
 
 import { Database } from "bun:sqlite";
-import { mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, smallLimit, searchQuery, asciiFold } from "../auth/registry-port.js";
+import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, smallLimit, searchQuery, asciiFold } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 
 /** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code`. */
@@ -179,8 +179,8 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     renameBoard: db.query("UPDATE reg_boards SET title = ?2 WHERE id = ?1"),
     renameSpace: db.query("UPDATE reg_spaces SET name = ?2 WHERE id = ?1"),
     renameGroup: db.query("UPDATE reg_groups SET name = ?2 WHERE id = ?1"),
-    generalSpace: db.query("UPDATE reg_spaces SET general_role = ?2 WHERE id = ?1"),
-    generalGroup: db.query("UPDATE reg_groups SET general_role = ?2 WHERE id = ?1"),
+    patchSpace: db.query("UPDATE reg_spaces SET name = CASE WHEN ?2 = 1 THEN ?3 ELSE name END, general_role = CASE WHEN ?4 = 1 THEN ?5 ELSE general_role END WHERE id = ?1"),
+    patchGroup: db.query("UPDATE reg_groups SET name = CASE WHEN ?2 = 1 THEN ?3 ELSE name END, general_role = CASE WHEN ?4 = 1 THEN ?5 ELSE general_role END WHERE id = ?1"),
     personal: db.query("SELECT * FROM reg_spaces WHERE tenant = ? AND owner_user = ?"),
     insSpace: db.query("INSERT INTO reg_spaces (id, tenant, grp, name, kind, owner_user, general_role, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"),
     team: db.query("SELECT * FROM reg_teams WHERE id = ?"),
@@ -459,6 +459,9 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     return { tenant, board, space, group, scoped, roles: q.roles.all(tenant.id).map(rowRole), teams };
   });
 
+  /** `accessContexts`: every scope's context from ONE transaction (one snapshot). */
+  const contextsTx = db.transaction((list, users) => list.map(sc => [sc.type + "\n" + sc.id, contextTx(sc.type, sc.id, users, null)]));
+
   return {
     async createTenant({ domain, domains = [], kind = "company", admins = [] }) {
       ready();
@@ -578,11 +581,11 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       if (up.run(id, v).changes === 0) throw new Error(`registry: no such ${type}`);
       return row(get.get(id));
     },
-    async setGeneralRole(scope, role) {
+    async updateScope(scope, patch) {
       ready();
-      const { type, id } = orgDefaults.renamable(scope, ["space", "group"]);
-      const [up, get, row] = type === "space" ? [q.generalSpace, q.space, rowSpace] : [q.generalGroup, q.group, rowGroup];
-      if (up.run(id, nz(orgDefaults.grantRole(role))).changes === 0) throw new Error(`registry: no such ${type}`);
+      const { type, id } = orgDefaults.renamable(scope, ["space", "group"]), v = orgDefaults.patch(patch);
+      const [up, get, row] = type === "space" ? [q.patchSpace, q.space, rowSpace] : [q.patchGroup, q.group, rowGroup];
+      if (up.run(id, v.name !== undefined ? 1 : 0, v.name ?? null, v.generalRole !== undefined ? 1 : 0, v.generalRole ?? null).changes === 0) throw new Error(`registry: no such ${type}`);
       return row(get.get(id));
     },
     async ensurePersonalSpace(tenant, user) {
@@ -629,6 +632,11 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       ready();
       const { type, id } = orgDefaults.scope(scope);
       return contextTx(type, id, users ? users.filter(str) : null, chain ?? null);
+    },
+    async accessContexts(scopes, { users } = {}) {
+      ready();
+      const list = batchScopes(scopes), us = users ? users.filter(str) : null;
+      return new Map(contextsTx(list, us));
     },
     // ---- Home (PROTOCOL.md § Home) ----
     async markOpened(user, board) {

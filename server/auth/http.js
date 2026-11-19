@@ -416,7 +416,13 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
         return json(201, { space: await spaces.createSpace(who, defined(b)) });
       },
     }],
-    ["/groups", { GET: async (req, url) => {
+    ["/groups", {
+      POST: async (req) => {
+        const who = await caller(req);
+        const b = await body(req, ["name", "general"]);
+        return json(201, { group: await spaces.createGroup(who, defined(b)) });
+      },
+      GET: async (req, url) => {
       const who = await caller(req);
       if (url.searchParams.get("can") !== "space.create" || [...url.searchParams.keys()].length !== 1) throw refuse(400, "bad-request");
       return json(200, await spaces.spacePicker(who));

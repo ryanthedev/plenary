@@ -69,10 +69,14 @@ export function combine(rows, identity, t, opts) {
 export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity, adminBoardContent = false }) {
   const opts = { adminBoardContent };
   /** One user's access to a board: ladder role, permissions, sources. @returns {Promise<import("./resolver.js").Access>} */
-  async function accessOn(identity, boardId) {
+  async function accessOn(identity, boardId, { uniform = false } = {}) {
     if (!okIdentity(identity) || typeof boardId !== "string") return nothing();
     const ctx = await registry.accessContext({ type: "board", id: boardId }, { users: [identity.user] });
-    if (!ctx?.board) return nothing();
+    if (!ctx?.board) {
+      // `uniform`: an admin route that must not tell an unknown board from a hidden one by how much it reads does the same reads and drops them.
+      if (uniform) { await registry.grant(boardId, identity.user); if (identity.email) await registry.invitesFor(boardId, identity.email); await registry.linkUses(boardId, identity.user); }
+      return nothing();
+    }
     const t = now();
     const grant = await registry.grant(ctx.board.id, identity.user);
     const invites = identity.email ? await registry.invitesFor(ctx.board.id, identity.email) : [];
@@ -145,12 +149,24 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
      * board id, or `{ type: "board"|"space"|"group"|"unit", id }`. What the admin layer asks ("may this user board.create
      * in this Space?") and what the UI asks ("why can't I edit?"): permissions, never role names.
      */
-    async effective(identity, scope) {
-      if (typeof scope === "string") return accessOn(identity, scope);
+    async effective(identity, scope, o = {}) {
+      if (typeof scope === "string") return accessOn(identity, scope, o);
       if (!okIdentity(identity) || !scope || typeof scope.id !== "string") return nothing();
-      if (scope.type === "board") return accessOn(identity, scope.id);
+      if (scope.type === "board") return accessOn(identity, scope.id, o);
       const ctx = await registry.accessContext(scope, { users: [identity.user] });
       return ctx ? resolveAccess({ ctx }, identity, now(), opts) : nothing();
+    },
+    /**
+     * `effective` for many Unit, Group or Space scopes from ONE batch read (`registry.accessContexts`), at most HOME.batch.
+     * @param {{ type: "unit"|"group"|"space", id: string }[]} scopes @returns {Promise<Map<string, import("./resolver.js").Access>>} keyed `type + "\n" + id`; an unknown scope answers `nothing`
+     */
+    async effectiveMany(identity, scopes) {
+      const out = new Map();
+      if (!okIdentity(identity) || !Array.isArray(scopes) || !scopes.length) return out;
+      const got = await registry.accessContexts(scopes, { users: [identity.user] });
+      const t = now();
+      for (const [k, ctx] of got) out.set(k, ctx ? resolveAccess({ ctx }, identity, t, opts) : nothing());
+      return out;
     },
     /**
      * One user's access to many boards (PROTOCOL.md § Home, "Boards I can open"): `registry.boardRows` reads every board-scope
@@ -169,9 +185,9 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
       const keyOf = sc => sc.type + "\n" + sc.id;
       const scopes = new Map();
       for (const r of rows.values()) scopes.set(keyOf(scopeOf(r.board)), scopeOf(r.board));
-      const ctxs = new Map(), todo = [...scopes];
-      for (let i = 0; i < todo.length; i += 8)
-        await Promise.all(todo.slice(i, i + 8).map(async ([k, sc]) => ctxs.set(k, await registry.accessContext(sc, { users: [identity.user] }))));
+      // ONE batch read for every distinct Space (or Unit) among the boards (TECH-DEBT row 35: it was one read per Space).
+      const got = await registry.accessContexts([...scopes.values()], { users: [identity.user] });
+      const ctxs = got;
       const t = now();
       const own = new Map();   // "space:<id>" / "group:<id>" → may the identity open boards there (from the context already read)
       const opens = (k, ctx) => { if (!own.has(k)) own.set(k, resolveAccess({ ctx }, identity, t, opts).ladder != null); return own.get(k); };

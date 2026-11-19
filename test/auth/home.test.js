@@ -22,6 +22,19 @@ beforeEach(async () => {
   acme = await r.createTenant({ domain: "acme.com", admins: ["google:root"] });
 });
 
+describe("a member's place and what they may create (#48)", () => {
+  test("home gives every Unit member a personal space once, and says who may create a Group", async () => {
+    const root = ident("root");
+    const h1 = await home.home(ada);
+    expect(h1.tree.spaces.map(s => s.name)).toEqual(["ada's space"]);
+    expect((await home.home(ada)).tree.spaces.length).toBe(1);               // idempotent
+    expect(h1.can).toEqual({ createGroup: false });
+    expect((await home.home(root)).can).toEqual({ createGroup: true });
+    const g = await home.home(kim);                                         // a guest has no Unit, so no personal space and no Group
+    expect([g.tree, g.can]).toEqual([null, { createGroup: false }]);
+  });
+});
+
 describe("access leak: a board the person can't open never appears, however it got into a list", () => {
   test("recent, starred, shared and search all drop a Space board with no access", async () => {
     const open = await r.createSpace({ tenant: acme.id, name: "Open" });
@@ -51,7 +64,7 @@ describe("access leak: a board the person can't open never appears, however it g
     await r.setScopedGrant({ scope: { type: "space", id: closed.id }, subject: { type: "user", id: ada.user }, role: "editor" });
     const h = await home.home(ada);
     expect(h.recent.map(c => [c.id, c.role])).toEqual([[b.id, "editor"]]);
-    expect(h.tree.spaces.map(s => s.name)).toEqual(["Closed"]);
+    expect(h.tree.spaces.map(s => s.name).sort()).toEqual(["Closed", "ada's space"]);
     await r.setScopedGrant({ scope: { type: "space", id: closed.id }, subject: { type: "user", id: ada.user }, role: null });
     expect((await home.home(ada)).recent).toEqual([]);
   });
@@ -130,7 +143,7 @@ describe("Recent, Starred, Shared", () => {
     for (const b of [inSpace, lone]) await r.markOpened(ada.user, b.id);
     const h = await home.home(ada);
     expect(Object.fromEntries(h.recent.map(c => [c.title, c.role]))).toEqual({ "Via space": "editor", "Via board": "annotator" });
-    expect(h.tree.spaces.map(s => s.name)).toEqual(["Platform"]);
+    expect(h.tree.spaces.map(s => s.name).sort()).toEqual(["Platform", "ada's space"]);
   });
 });
 
@@ -212,7 +225,7 @@ describe("a guest's Home", () => {
 });
 
 describe("the batch access check", () => {
-  test("accessMany costs a fixed number of Registry calls: one boardRows, one accessContext per distinct Space", async () => {
+  test("accessMany costs a fixed number of Registry calls: one boardRows and ONE accessContexts, whatever the number of Spaces (TECH-DEBT row 35)", async () => {
     const spaces = await Promise.all(["a", "b", "c"].map(n => r.createSpace({ tenant: acme.id, name: n })));
     const boards = [];
     for (let i = 0; i < 90; i++) boards.push(await mk(spaces[i % 3].id, `b${i}`));
@@ -221,7 +234,7 @@ describe("the batch access check", () => {
     const spy = new Proxy(r, { get: (t, k) => (typeof t[k] === "function" ? (...a) => { calls[k] = (calls[k] ?? 0) + 1; return t[k](...a); } : t[k]) });
     const found = await tenancy({ registry: spy, now }).accessMany(ada, boards.map(b => b.id));
     expect(found.size).toBe(100);
-    expect(calls).toEqual({ boardRows: 1, accessContext: 4 });                  // 3 Spaces + the Unit, however many boards
+    expect(calls).toEqual({ boardRows: 1, accessContexts: 1 });                // 3 Spaces + the Unit in one batch, however many boards
   });
 });
 
@@ -294,7 +307,7 @@ describe("names are access too: path redaction and Space-name search (member and
     expect(h.recent[0].path.map(p => p.name)).toEqual(["Open Space"]);
     expect(JSON.stringify(h)).not.toContain("Closed Group");
     expect(h.tree.groups).toEqual([]);                                                            // and not in the tree either
-    expect(h.tree.spaces.map(x => x.name)).toEqual(["Open Space"]);
+    expect(h.tree.spaces.map(x => x.name).sort()).toEqual(["Open Space", "ada's space"]);
   });
 
   test("a guest never sees another Unit's Group or Space names, on any list or in search", async () => {

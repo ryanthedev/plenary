@@ -2,7 +2,7 @@
 // last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
 import { normEmail } from "./util.js";
-import { mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, smallLimit, searchQuery, asciiFold } from "./registry-port.js";
+import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, smallLimit, searchQuery, asciiFold } from "./registry-port.js";
 
 /**
  * @typedef {import("./registry-port.js").Registry} Registry
@@ -175,11 +175,12 @@ export function memoryRegistry({ now = Date.now } = {}) {
       if (type === "board") row.title = orgDefaults.title(name); else row.name = orgDefaults.name(name);
       return copy(row);
     },
-    async setGeneralRole(scope, role) {
+    async updateScope(scope, patch) {
       const { type, id } = orgDefaults.renamable(scope, ["space", "group"]);
-      const row = (type === "space" ? spaces : groups).get(id);
+      const v = orgDefaults.patch(patch), row = (type === "space" ? spaces : groups).get(id);
       need(row, type);
-      row.generalRole = orgDefaults.grantRole(role);
+      if (v.name !== undefined) row.name = v.name;
+      if (v.generalRole !== undefined) row.generalRole = v.generalRole;
       return copy(row);
     },
     async ensurePersonalSpace(tenant, user) {
@@ -274,6 +275,12 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const inTeam = t => [...(members.get(t) ?? [])].filter(u => !want || want.has(u));
       return copy({ tenant, board: board ?? null, space: space ?? null, group: group ?? null, scoped: sc,
         roles: [...(roles.get(tenant.id)?.values() ?? [])], teams: Object.fromEntries([...teamIds].map(t => [t, inTeam(t)])) });
+    },
+
+    async accessContexts(scopes, { users } = {}) {
+      const out = new Map();
+      for (const sc of batchScopes(scopes)) out.set(sc.type + "\n" + sc.id, await this.accessContext(sc, { users }));
+      return out;
     },
 
     // ---- Home (PROTOCOL.md § Home) ----

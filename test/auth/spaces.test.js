@@ -243,10 +243,12 @@ describe("rename and general access", () => {
     await svc.update(ada, "space", design.id, { name: "Renamed" });
     expect(announced).toEqual([]);
     expect((await svc.update(ada, "space", design.id, { general: null })).general).toBe(null);
+    await svc.settled();
     expect(announced.sort()).toEqual(inDesign.map(b => b.id).sort());
     announced.length = 0;
     expect((await r.space(design.id)).generalRole).toBe(null);
     await svc.update(ada, "group", product.id, { general: "viewer" });                          // a Group reaches its Spaces' boards
+    await svc.settled();
     expect(announced.sort()).toEqual(inDesign.map(b => b.id).sort());
     expect(elsewhere.length).toBe(2);
     expect(await ten.role(max, inDesign[0].id)).toBe("viewer");                                 // and the new access is what the resolver answers
@@ -256,11 +258,13 @@ describe("rename and general access", () => {
     const warns = [];
     const flaky = spaceService({ registry: r, tenancy: ten, announce: () => { throw new Error("bus down"); }, log: { warn: (m) => warns.push(m) } });
     expect((await flaky.update(ada, "space", design.id, { general: "commenter" })).general).toBe("commenter");
+    await flaky.settled();
     expect(warns.length).toBe(8);
     let pages = 0;
     const paging = { ...r, boardsIn: async (...a) => { pages++; const p = await r.boardsIn(...a); return { ids: p.ids, next: "b-more0000000000x" }; } };
     const s3 = spaceService({ registry: paging, tenancy: ten, announce: () => {}, log: { warn: (m) => warns.push(m) } });
     await s3.update(ada, "space", design.id, { general: "viewer" });
+    await s3.settled();
     expect(pages).toBe(ANNOUNCE.pages);
     expect(warns.at(-1)).toMatch(/bound/);
   });
@@ -275,6 +279,76 @@ describe("rename and general access", () => {
     expect(await code(svc.renameBoard(ada, b.id, "x".repeat(201)))).toBe("bad-request");
     expect(announced).toEqual([]);
     expect((await r.board(b.id)).title).toBe("");
+  });
+});
+
+describe("uniform work and no-name answers (PROTOCOL.md § Spaces and Groups)", () => {
+  // Wrap the Registry so every call is counted by method; a refusal must do the same Registry work whatever the id was.
+  const counted = () => {
+    const calls = [];
+    const reg = new Proxy(r, { get: (t, k) => (typeof t[k] === "function" ? (...a) => { calls.push(String(k)); return t[k](...a); } : t[k]) });
+    const s = spaceService({ registry: reg, tenancy: makeTenancy({ registry: reg }), announce: () => {} });
+    return { s, run: async f => { calls.length = 0; await f(s).catch(() => {}); return [...calls].sort().join(","); } };
+  };
+  test("DW-3: hidden, unknown, other-Unit and malformed ids cost the same Registry calls, for every route", async () => {
+    const globex = await r.createTenant({ domain: "globex.com" });
+    const foreign = await r.createSpace({ tenant: globex.id, name: "Theirs" }), foreignGroup = await r.createGroup({ tenant: globex.id, name: "TheirG", generalRole: "viewer" });
+    const hiddenGroup = await r.createGroup({ tenant: acme.id, name: "Hidden group", generalRole: null, owner: "google:ada" });
+    const { run } = counted();
+    const spaceIds = [secret.id, "s-nope00000000", foreign.id];
+    const groupIds = [hiddenGroup.id, "g-nope00000000", foreignGroup.id];
+    const cases = {
+      "GET space": (id) => s => s.spacePage(max, id),
+      "PATCH space": (id) => s => s.update(max, "space", id, { name: "x" }),
+      "POST board": (id) => s => s.createBoard(max, { space: id }),
+    };
+    for (const [name, mk] of Object.entries(cases)) {
+      const costs = new Set(await Promise.all(spaceIds.map(id => run(mk(id)))));
+      expect([name, costs.size]).toEqual([name, 1]);
+    }
+    const gcases = { "GET group": id => s => s.groupPage(max, id), "PATCH group": id => s => s.update(max, "group", id, { name: "x" }), "POST space in group": id => s => s.createSpace(max, { name: "n", group: id }) };
+    for (const [name, mk] of Object.entries(gcases)) {
+      const costs = new Set();
+      for (const id of groupIds) costs.add(await run(mk(id)));       // serial: one shared call log
+      expect([name, costs.size]).toEqual([name, 1]);
+    }
+    const bcosts = new Set();
+    for (const id of [(await r.createBoard({ tenant: acme.id, space: secret.id })).id, "b-nope000000000000", (await r.createBoard({ tenant: globex.id, space: foreign.id })).id])
+      bcosts.add(await run(s => s.renameBoard(max, id, "x")));
+    expect(bcosts.size).toBe(1);
+  });
+  test("DW-4: a manager who cannot open a Space learns no stored name from PATCH, only what they sent", async () => {
+    const priv = await r.createSpace({ tenant: acme.id, name: "Ada private", generalRole: null, owner: "google:ada" });
+    const renamed = await svc.update(root, "space", priv.id, { name: "Fresh" });
+    expect(renamed).toEqual({ id: priv.id, name: "Fresh" });
+    const out = await svc.update(root, "space", priv.id, { general: null });
+    expect(out).toEqual({ id: priv.id, general: null });
+    expect(JSON.stringify(out)).not.toContain("Fresh");
+    const hg = await r.createGroup({ tenant: acme.id, name: "Closed G", generalRole: null, owner: "google:ada" });
+    expect(await svc.update(root, "group", hg.id, { general: "viewer" })).toEqual({ id: hg.id, general: "viewer" });
+  });
+  test("DW-5: a Unit admin cannot create a board in another member's personal space, with the ordinary refusal", async () => {
+    const mine = await svc.createBoard(max, {});
+    expect(await code(svc.createBoard(root, { space: mine.space }))).toBe("forbidden");
+    expect(await r.boardsIn({ type: "space", id: mine.space })).toEqual({ ids: [mine.id], next: null });
+    expect((await svc.createBoard(max, { space: mine.space })).space).toBe(mine.space);       // its owner still can
+  });
+});
+
+describe("POST /groups: group.create at the Unit root", () => {
+  test("a Unit admin creates a Group and owns it; a member, a guest and a name-less call do not", async () => {
+    const g = await svc.createGroup(root, { name: "  Platform org " });
+    expect(g).toEqual({ id: expect.any(String), name: "Platform org", general: null });
+    expect(await ten.role(root, (await r.createBoard({ tenant: acme.id, space: (await r.createSpace({ tenant: acme.id, name: "in g", group: g.id, owner: "google:root" })).id })).id)).not.toBe(undefined);
+    expect(await code(svc.createGroup(max, { name: "x" }))).toBe("forbidden");
+    expect(await code(svc.createGroup(kim, { name: "x" }))).toBe("forbidden");
+    expect(await code(svc.createGroup(root, { name: "" }))).toBe("bad-request");
+    expect(await code(svc.createGroup(root, { name: "x", general: "owner" }))).toBe("bad-request");
+    expect((await svc.createGroup(root, { name: "Open", general: "viewer" })).general).toBe("viewer");
+  });
+  test("a member holding a custom role with group.create at the Unit may create (checked by permission, not role name)", async () => {
+    expect((await ten.effective(root, { type: "unit", id: acme.id })).permissions.has("group.create")).toBe(true);
+    expect((await ten.effective(max, { type: "unit", id: acme.id })).permissions.has("group.create")).toBe(false);
   });
 });
 
@@ -314,6 +388,15 @@ describe("over HTTP: statuses, bodies, and the leak answers byte for byte", () =
       expect((await api(who, "/boards", "POST", { space: space.id })).status).toBe(403);
       expect((await api(who, "/spaces?can=board.create")).text).not.toContain("Q4");
     }
+  });
+  test("POST /groups: 201 for a Unit admin, 403 for a member, 400 for a bad body", async () => {
+    expect((await api("max", "/groups", "POST", { name: "x" })).status).toBe(403);
+    await r.addTenantAdmin(acme.id, "dev:ada");
+    const ok = await api("ada", "/groups", "POST", { name: "Org" });
+    expect([ok.status, JSON.parse(ok.text).group.name]).toEqual([201, "Org"]);
+    expect((await api("ada", "/groups", "POST", {})).status).toBe(400);
+    expect((await api("ada", "/groups", "POST", { name: "x", extra: 1 })).status).toBe(400);
+    expect((await api(null, "/groups", "POST", { name: "x" })).status).toBe(401);
   });
   test("hidden, unknown and other-Unit ids: identical status and body, reads and writes", async () => {
     const globex = await r.createTenant({ domain: "globex.com" });

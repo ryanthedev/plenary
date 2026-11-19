@@ -131,17 +131,20 @@ export function homeService({ registry, tenancy, now = Date.now }) {
     async home(identity) {
       const unit = await tenancy.tenantOf(identity);
       const base = { guest: !unit, user: { user: identity.user, name: identity.name ?? identity.email ?? identity.user }, unit: unit ? { id: unit.id, kind: unit.kind } : null, limits: LIMITS };
-      const [rec, star, { owned, shared }, theTree] = await Promise.all([
+      if (unit) await registry.ensurePersonalSpace(unit.id, identity.user);        // a member always has a place to put a board (JOURNEY J1)
+      const [rec, star, { owned, shared }, theTree, unitAccess] = await Promise.all([
         registry.recents(identity.user, { limit: SCAN.recent }),
         unit ? registry.starred(identity.user, { limit: SCAN.starred }) : [],
         reached(identity, unit),
         unit ? tree(identity, unit) : null,
+        unit ? tenancy.effective(identity, { type: "unit", id: unit.id }) : null,
       ]);
       const mine = await cards(identity, unit, [...rec.map(r => ({ id: r.board, at: r.at })), ...star.map(r => ({ id: r.board, at: r.at }))]);
       const byId = new Map(); for (const c of mine) if (!byId.has(c.id)) byId.set(c.id, c);
       const pick = rows => rows.filter(r => byId.has(r.board)).map(r => ({ ...byId.get(r.board), at: r.at }));
       return { ...base, recent: pick(rec).slice(0, LIMITS.recent), starred: pick(star).slice(0, LIMITS.starred),
-        owned: owned.slice(0, LIMITS.owned), shared: shared.slice(0, LIMITS.shared), tree: theTree };
+        owned: owned.slice(0, LIMITS.owned), shared: shared.slice(0, LIMITS.shared), tree: theTree,
+        can: { createGroup: !!unitAccess?.permissions.has("group.create") } };
     },
 
     /**

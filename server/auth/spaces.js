@@ -6,7 +6,6 @@
 // that is hidden all answer alike (a read: `not-found`; a write: `forbidden`).
 
 import { AdminError } from "../admin/boards.js";
-import { HOME } from "./registry-port.js";
 import { resolveAccess } from "./resolver.js";
 import { ROLES } from "./util.js";
 import { homeService } from "./home.js";
@@ -14,7 +13,7 @@ import { homeService } from "./home.js";
 /** @typedef {import("./idp-port.js").Identity} Identity */
 
 /** What one read shows at most, and the work each does (PROTOCOL.md § Spaces and Groups, Bounds). */
-export const LIMITS = Object.freeze({ spaces: 100, groups: 50, groupSpaces: 100, grantChecks: 40, groupChecks: 20, par: 8 });
+export const LIMITS = Object.freeze({ spaces: 100, groups: 50, groupSpaces: 100 });
 /** Freshness fan-out: pages of `boardsIn` announced inline; a larger scope's rest waits for the timed re-check (≤ 60 s). */
 export const ANNOUNCE = Object.freeze({ pages: 20, page: 500, par: 50 });
 /** The general-access roles a Space or Group may carry: the ladder below `owner` (null = only people added). */
@@ -58,28 +57,30 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
 
   /** The caller's Unit, or null (a guest, or a domain with no Unit). */
   const unitOf = identity => tenancy.tenantOf(identity);
-  /** The Space, if it is in the caller's Unit. */
-  async function spaceIn(unit, id) {
-    const s = idOf(id) ? await registry.space(id) : null;
-    return s && s.tenant === unit.id ? s : null;
+  /**
+   * The Space or Group `id` in the caller's Unit with the caller's access to it, or null. The SAME two reads happen whatever the id (fine,
+   * unknown, in another Unit or hidden), so a refusal can't be told from another by how much work it did (PROTOCOL.md § Spaces and Groups).
+   */
+  async function scopeOf(identity, unit, type, id) {
+    if (!idOf(id)) return null;
+    const [row, access] = await Promise.all([type === "space" ? registry.space(id) : registry.group(id), tenancy.effective(identity, { type, id })]);
+    return row && unit && row.tenant === unit.id ? { row, access } : null;
   }
-  async function groupIn(unit, id) {
-    const g = idOf(id) ? await registry.group(id) : null;
-    return g && g.tenant === unit.id ? g : null;
-  }
-  /** `fn` over `items`, `par` at a time, in order. */
-  async function mapPar(items, fn, par = LIMITS.par) {
-    const out = [];
-    for (let i = 0; i < items.length; i += par) out.push(...await Promise.all(items.slice(i, i + par).map(fn)));
-    return out;
-  }
+
   /** What general access alone gives, from the rows in hand (no read): enough to say yes; a "no" needs the full answer. */
   const general = (unit, identity, space, group, t) => resolveAccess({ ctx: { tenant: unit, board: null, space, group, scoped: NO_GRANTS, roles: [], teams: {} } }, identity, t);
   /** The single rule for "may create a board here" (picker and POST /boards both): the resolver's answer holds `board.create`. */
   const createsBoards = a => may(a, "board.create");
   const opens = a => a.ladder != null;
 
-  /** After a change to what everyone in a scope gets: tell every board it reaches (bounded; the rest waits for the timed re-check). */
+  /** Announcements in flight (they run after the response; `settled()` waits for them). */
+  const inflight = new Set();
+  /** After a change to what everyone in a scope gets: tell every board it reaches, off the request path (bounded; the rest waits for the timed re-check). */
+  function announceLater(unit, scope) {
+    const p = announceScope(unit, scope).finally(() => inflight.delete(p));
+    inflight.add(p);
+  }
+  /** The announcement itself (never rejects). */
   async function announceScope(unit, scope) {
     let after = null, pages = 0, sent = 0;
     try {
@@ -92,53 +93,45 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
     } catch (err) { log.warn("grants announcement failed", { scope: scope.type, err }); }
   }
 
-  /** The Spaces the person can open and `board.create` in (their personal space first), for the picker. */
+  /** The Spaces the person can open and `board.create` in (their personal space first), for the picker. One batch read settles every candidate. */
   async function creatableSpaces(identity, unit) {
     const personal = await registry.ensurePersonalSpace(unit.id, identity.user);
     const all = opens(await tenancy.effective(identity, { type: "unit", id: unit.id }));   // a Unit-level role covers everything inside
     const cand = await registry.spaceCandidates(unit.id, { user: identity.user, all, limit: LIMITS.spaces });
     const groups = new Map(cand.groups.map(g => [g.id, g]));
     const t = now();
-    let more = cand.next != null, checks = 0;
     const out = [], pending = [];
     for (const s of cand.spaces) {
       if (s.id === personal.id) continue;
-      const g = s.group ? groups.get(s.group) ?? null : null;
-      const fast = general(unit, identity, s, g, t);
-      if (opens(fast) && createsBoards(fast)) out.push(s);
-      else if (checks++ < LIMITS.grantChecks) pending.push(s);
-      else more = true;
+      const fast = general(unit, identity, s, s.group ? groups.get(s.group) ?? null : null, t);
+      if (opens(fast) && createsBoards(fast)) out.push(s); else pending.push(s);
     }
-    for (const r of await mapPar(pending, async s => { const a = await tenancy.effective(identity, { type: "space", id: s.id }); return opens(a) && createsBoards(a) ? s : null; })) if (r) out.push(r);
+    const got = await tenancy.effectiveMany(identity, pending.map(s => ({ type: "space", id: s.id })));
+    for (const s of pending) { const a = got.get("space\n" + s.id); if (a && opens(a) && createsBoards(a)) out.push(s); }
     // A Group is named only if the person can open it.
-    const named = new Map();
-    let gChecks = 0;
-    for (const s of out) if (s.group && groups.has(s.group) && !named.has(s.group)) {
-      const g = groups.get(s.group);
-      if (opens(general(unit, identity, null, g, t))) named.set(g.id, g);
-      else if (gChecks++ < LIMITS.groupChecks) { if (opens(await tenancy.effective(identity, { type: "group", id: g.id }))) named.set(g.id, g); }
-      else more = true;
+    const named = new Map(), askGroups = [];
+    for (const g of new Set(out.map(s => s.group).filter(id => id && groups.has(id)))) {
+      if (opens(general(unit, identity, null, groups.get(g), t))) named.set(g, groups.get(g)); else askGroups.push(g);
     }
+    const gotG = await tenancy.effectiveMany(identity, askGroups.map(id => ({ type: "group", id })));
+    for (const id of askGroups) if (opens(gotG.get("group\n" + id) ?? { ladder: null })) named.set(id, groups.get(id));
     out.sort((a, b) => (a.name.toLowerCase() < b.name.toLowerCase() ? -1 : a.name.toLowerCase() > b.name.toLowerCase() ? 1 : a.id < b.id ? -1 : 1));
-    return { spaces: [spaceView(personal, null), ...out.map(s => spaceView(s, s.group ? named.get(s.group) : null))], more };
+    return { spaces: [spaceView(personal, null), ...out.map(s => spaceView(s, s.group ? named.get(s.group) : null))], more: cand.next != null };
   }
 
   /** The Groups the person can open and `space.create` in. */
   async function creatableGroups(identity, unit) {
-    const all = opens(await tenancy.effective(identity, { type: "unit", id: unit.id }));
-    const root = may(await tenancy.effective(identity, { type: "unit", id: unit.id }), "space.create");
-    const cand = await registry.groupCandidates(unit.id, { user: identity.user, all, limit: LIMITS.groups + 1 });
-    let more = cand.length > LIMITS.groups, checks = 0;
+    const unitAccess = await tenancy.effective(identity, { type: "unit", id: unit.id });
+    const cand = await registry.groupCandidates(unit.id, { user: identity.user, all: opens(unitAccess), limit: LIMITS.groups + 1 });
     const t = now(), out = [], pending = [];
     for (const g of cand.slice(0, LIMITS.groups)) {
       const fast = general(unit, identity, null, g, t);
-      if (opens(fast) && may(fast, "space.create")) out.push(g);
-      else if (checks++ < LIMITS.groupChecks) pending.push(g);
-      else more = true;
+      if (opens(fast) && may(fast, "space.create")) out.push(g); else pending.push(g);
     }
-    for (const r of await mapPar(pending, async g => { const a = await tenancy.effective(identity, { type: "group", id: g.id }); return opens(a) && may(a, "space.create") ? g : null; })) if (r) out.push(r);
+    const got = await tenancy.effectiveMany(identity, pending.map(g => ({ type: "group", id: g.id })));
+    for (const g of pending) { const a = got.get("group\n" + g.id); if (a && opens(a) && may(a, "space.create")) out.push(g); }
     out.sort((a, b) => (a.name.toLowerCase() < b.name.toLowerCase() ? -1 : a.name.toLowerCase() > b.name.toLowerCase() ? 1 : a.id < b.id ? -1 : 1));
-    return { root, groups: out.map(g => ({ id: g.id, name: g.name })), more };
+    return { root: may(unitAccess, "space.create"), groups: out.map(g => ({ id: g.id, name: g.name })), more: cand.length > LIMITS.groups };
   }
 
   return {
@@ -156,9 +149,10 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
       let target;
       if (space === null) target = (await registry.ensurePersonalSpace(unit.id, identity.user)).id;
       else {
-        const sp = await spaceIn(unit, space);
-        if (!sp || !createsBoards(await tenancy.effective(identity, { type: "space", id: sp.id }))) throw refused();
-        target = sp.id;
+        const sc = await scopeOf(identity, unit, "space", space);
+        // Nobody writes into another member's personal space, an admin included (it is private until its owner shares from it).
+        if (!sc || !createsBoards(sc.access) || (sc.row.kind === "personal" && sc.row.owner !== identity.user)) throw refused();
+        target = sc.row.id;
       }
       const board = await registry.createBoard({ tenant: unit.id, title: t, space: target, ...(memberRole !== undefined ? { memberRole } : {}) });
       // createBoard takes no creator: the owner grant is a second call. Retry once; if it still fails, report the failure WITH the board id.
@@ -197,9 +191,9 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
       let g = null, access;
       if (group === null) access = await tenancy.effective(identity, { type: "unit", id: unit.id });
       else {
-        g = await groupIn(unit, group);
-        if (!g) throw refused();
-        access = await tenancy.effective(identity, { type: "group", id: g.id });
+        const sc = await scopeOf(identity, unit, "group", group);
+        if (!sc) throw refused();
+        ({ row: g, access } = sc);
       }
       if (!may(access, "space.create")) throw refused();
       const s = await registry.createSpace({ tenant: unit.id, name: n, group: g?.id ?? null, generalRole: gen, owner: identity.user });
@@ -209,10 +203,9 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
     /** GET /spaces/:id. Hidden, unknown and other-Unit ids are one `not-found`. @param {Identity} identity @param {string} id */
     async spacePage(identity, id) {
       const unit = await unitOf(identity);
-      const sp = unit ? await spaceIn(unit, id) : null;
-      if (!sp) throw missing();
-      const a = await tenancy.effective(identity, { type: "space", id: sp.id });
-      if (!opens(a)) throw missing();
+      const sc = await scopeOf(identity, unit, "space", id);
+      if (!sc || !opens(sc.access)) throw missing();
+      const { row: sp, access: a } = sc;
       const group = sp.group ? await registry.group(sp.group) : null;
       const groupOpens = group ? opens(await tenancy.effective(identity, { type: "group", id: group.id })) : false;
       const list = await home.spaceBoards(identity, sp.id, { can: true });
@@ -223,10 +216,9 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
     /** GET /groups/:id: its Spaces (all of them open to anyone who opens the Group), 100 a page. */
     async groupPage(identity, id, after = null) {
       const unit = await unitOf(identity);
-      const g = unit ? await groupIn(unit, id) : null;
-      if (!g) throw missing();
-      const a = await tenancy.effective(identity, { type: "group", id: g.id });
-      if (!opens(a)) throw missing();
+      const sc = await scopeOf(identity, unit, "group", id);
+      if (!sc || !opens(sc.access)) throw missing();
+      const { row: g, access: a } = sc;
       if (after !== null && !idOf(after)) throw bad("bad cursor");
       const page = await registry.spacesIn(g.id, { after, limit: LIMITS.groupSpaces });
       const spaces = page.spaces.map(s => ({ id: s.id, name: s.name, general: s.generalRole ?? null }))
@@ -244,24 +236,39 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
       const name = patch.name !== undefined ? nameOf(patch.name) : undefined;
       const gen = patch.general !== undefined ? generalOf(patch.general) : undefined;
       const unit = await unitOf(identity);
-      const row = unit ? await (type === "space" ? spaceIn : groupIn)(unit, id) : null;
-      if (!row || !may(await tenancy.effective(identity, { type, id: row.id }), "members.manage")) throw refused();
-      if (row.kind === "personal") throw bad("a personal space keeps its name and stays private");
-      let out = row;
-      if (name !== undefined) out = await registry.rename({ type, id: row.id }, name);
-      if (gen !== undefined) {
-        out = await registry.setGeneralRole({ type, id: row.id }, gen);
-        await announceScope(unit, { type, id: row.id });
-      }
+      const sc = await scopeOf(identity, unit, type, id);
+      if (!sc || !may(sc.access, "members.manage")) throw refused();
+      if (sc.row.kind === "personal") throw bad("a personal space keeps its name and stays private");
+      const out = await registry.updateScope({ type, id: sc.row.id }, { ...(name !== undefined ? { name } : {}), ...(gen !== undefined ? { generalRole: gen } : {}) });
+      if (gen !== undefined) announceLater(unit, { type, id: sc.row.id });
+      // Names are access: someone who may manage a scope without opening it (a Unit admin, while admin board content is off) learns only what they
+      // just sent, never the name they did not set.
+      if (!opens(sc.access)) return { id: out.id, ...(name !== undefined ? { name } : {}), ...(gen !== undefined ? { general: gen } : {}) };
       if (type === "group") return { id: out.id, name: out.name, general: out.generalRole ?? null };
       const g = out.group ? await registry.group(out.group) : null;
       return spaceView(out, g && opens(await tenancy.effective(identity, { type: "group", id: g.id })) ? g : null);
     },
 
+    /**
+     * POST /groups: a Group at the Unit root; needs `group.create` there. The creator becomes its owner. General access defaults to none.
+     * @param {Identity} identity @param {{ name: string, general?: string|null }} o
+     */
+    async createGroup(identity, { name, general: gen = null } = {}) {
+      const n = nameOf(name);
+      generalOf(gen);
+      const unit = await unitOf(identity);
+      if (!unit || !may(await tenancy.effective(identity, { type: "unit", id: unit.id }), "group.create")) throw refused();
+      const g = await registry.createGroup({ tenant: unit.id, name: n, generalRole: gen, owner: identity.user });
+      return { id: g.id, name: g.name, general: g.generalRole ?? null };
+    },
+
+    /** Wait for the announcements started by earlier changes (tests; a shutdown). */
+    settled: () => Promise.all([...inflight]).then(() => {}),
+
     /** PATCH /boards/:board: a new title; needs `board.edit` or `members.manage` on the board. Not access, so nothing is announced. */
     async renameBoard(identity, id, title) {
       const t = titleOf(title);
-      const a = idOf(id) ? await tenancy.effective(identity, id) : null;
+      const a = idOf(id) ? await tenancy.effective(identity, id, { uniform: true }) : null;
       if (!a || !(may(a, "board.edit") || may(a, "members.manage"))) throw refused();
       return registry.rename({ type: "board", id }, t);
     },

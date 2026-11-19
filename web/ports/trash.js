@@ -3,7 +3,7 @@
 //
 // Every call ALWAYS resolves (never rejects): a value, or `{ error }` with one of TRASH_ERRORS:
 //   "auth" 401 · "forbidden" 403 (no `delete` there, or nothing to see: an unknown board answers the same) · "notfound" 404 · "invalid" 400/422 · "moved" 409 (the board is in another Space than the caller thought)
-//   · "with-space" 409 (the board went to Trash with its Space: restore the Space) · "space-in-trash" 409 (its Space is in Trash) · "purged" 409 (being deleted for good)
+//   · "would-escalate" 409 (restoring into the personal space would raise the restorer's role) · "with-space" 409 (the board went to Trash with its Space: restore the Space) · "space-in-trash" 409 (its Space is in Trash) · "purged" 409 (being deleted for good)
 //   · "unavailable" a 5xx, bad JSON, a wrong shape or no answer in time · "network" no answer at all
 //
 //   trash(board, { from }, key?)       → { result: TrashResult }    POST /boards/:board/trash   (`key`: the Idempotency-Key of one submit, reused by its retries)
@@ -17,7 +17,7 @@ export const TRASH_ERRORS = Object.freeze(["auth", "forbidden", "notfound", "inv
 
 /**
  * @typedef {{ board: { id: string, title: string, space: { id: string, name: string } }, trashed: boolean, trashedAt: number, expiresAt: number, undo: { restore: true }|null }} TrashResult
- * @typedef {{ board: { id: string, title: string, space: { id: string, name: string } }, restored: boolean }} RestoreResult
+ * @typedef {{ board: { id: string, title: string, space: { id: string, name: string } }, restored: boolean, movedTo?: { id: string, name: string, personal: boolean } }} RestoreResult
  * @typedef {{ space: { id: string, name: string }, trashed?: boolean, restored?: boolean, boards: number, undo?: { restore: true }|null }} SpaceResult
  * @typedef {{ board: { id: string, title: string }, trashedAt: number, expiresAt: number, daysLeft: number, canRestore: boolean, by?: { id: string, name: string },
  *   from?: { space: { id: string, name: string, personal: boolean }|null, group: { id: string, name: string }|null }, via?: { space: { id: string, name: string }|null, canRestore: boolean } }} Notice

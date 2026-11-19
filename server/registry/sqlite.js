@@ -135,6 +135,8 @@ const createSchema = d => {
     d.run("CREATE INDEX IF NOT EXISTS reg_grants_member ON reg_grants (member)");
     d.run("CREATE INDEX IF NOT EXISTS reg_boards_tenant ON reg_boards (tenant, id)");
     d.run("CREATE INDEX IF NOT EXISTS reg_boards_trash ON reg_boards (trashed_at) WHERE trashed_at IS NOT NULL");
+    d.run("CREATE INDEX IF NOT EXISTS reg_boards_purging ON reg_boards (id) WHERE purging = 1");
+    d.run("CREATE INDEX IF NOT EXISTS reg_spaces_purging ON reg_spaces (id) WHERE purging = 1");
     d.run("CREATE INDEX IF NOT EXISTS reg_boards_trashed_with ON reg_boards (trashed_with) WHERE trashed_with IS NOT NULL");
     d.run("CREATE INDEX IF NOT EXISTS reg_board_spaces_space ON reg_board_spaces (space, board)");
     d.run("CREATE INDEX IF NOT EXISTS reg_spaces_trash ON reg_spaces (trashed_at) WHERE trashed_at IS NOT NULL");
@@ -334,15 +336,20 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     trashBoard: db.query("UPDATE reg_boards SET trashed_at = ?2, trashed_by = ?3, trashed_with = NULL WHERE id = ?1 AND trashed_at IS NULL"),
     trashSpace: db.query("UPDATE reg_spaces SET trashed_at = ?2, trashed_by = ?3 WHERE id = ?1 AND trashed_at IS NULL"),
     trashSpaceBoards: db.query("UPDATE reg_boards SET trashed_at = ?2, trashed_by = ?3, trashed_with = ?1 WHERE trashed_at IS NULL AND id IN (SELECT board FROM reg_board_spaces WHERE space = ?1)"),
-    restoreBoard: db.query("UPDATE reg_boards SET trashed_at = NULL, trashed_by = NULL, trashed_with = NULL WHERE id = ?1"),
+    restoreBoard: db.query("UPDATE reg_boards SET trashed_at = NULL, trashed_by = NULL, trashed_with = NULL, purging = 0 WHERE id = ?1"),
     restoreSpace: db.query("UPDATE reg_spaces SET trashed_at = NULL, trashed_by = NULL WHERE id = ?1"),
-    restoreSpaceBoards: db.query("UPDATE reg_boards SET trashed_at = NULL, trashed_by = NULL, trashed_with = NULL WHERE trashed_with = ?1"),
+    restoreSpaceBoards: db.query("UPDATE reg_boards SET trashed_at = NULL, trashed_by = NULL, trashed_with = NULL, purging = 0 WHERE trashed_with = ?1"),
+    spaceBoardsClaimed: db.query("SELECT 1 AS x FROM reg_boards WHERE trashed_with = ? AND purging = 1 LIMIT 1"),
     trashedBoards: db.query("SELECT id, tenant, title, member_role, created_at, trashed_at, trashed_by, trashed_with, purging, (SELECT space FROM reg_board_spaces WHERE board = reg_boards.id) AS space FROM reg_boards WHERE tenant = ?1 AND trashed_at IS NOT NULL AND trashed_with IS NULL AND purging = 0 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?3"),
     trashedSpaces: db.query(`SELECT s.*, (SELECT count(*) FROM (SELECT 1 FROM reg_boards b WHERE b.trashed_with = s.id LIMIT ?4)) AS boards FROM reg_spaces s
       WHERE s.tenant = ?1 AND s.trashed_at IS NOT NULL AND s.purging = 0 AND (?2 IS NULL OR s.id > ?2) ORDER BY s.id LIMIT ?3`),
     dueBoards: db.query("SELECT id, tenant, title, member_role, created_at, trashed_at, trashed_by, trashed_with, purging, (SELECT space FROM reg_board_spaces WHERE board = reg_boards.id) AS space FROM reg_boards WHERE trashed_at IS NOT NULL AND (trashed_at <= ?1 OR purging = 1) ORDER BY trashed_at, id LIMIT ?2"),
     dueSpaces: db.query("SELECT * FROM reg_spaces WHERE trashed_at IS NOT NULL AND (trashed_at <= ?1 OR purging = 1) ORDER BY trashed_at, id LIMIT ?2"),
-    claimBoard: db.query("UPDATE reg_boards SET purging = 1 WHERE id = ?1 AND trashed_at IS NOT NULL AND (purging = 1 OR trashed_at <= ?2)"),
+    unclaimedBoards: db.query("SELECT id, tenant, title, member_role, created_at, trashed_at, trashed_by, trashed_with, purging, (SELECT space FROM reg_board_spaces WHERE board = reg_boards.id) AS space FROM reg_boards WHERE trashed_at IS NOT NULL AND purging = 0 AND trashed_with IS NULL AND trashed_at <= ?1 ORDER BY trashed_at, id LIMIT ?2"),
+    unclaimedSpaces: db.query("SELECT * FROM reg_spaces WHERE trashed_at IS NOT NULL AND purging = 0 AND trashed_at <= ?1 ORDER BY trashed_at, id LIMIT ?2"),
+    claimedBoards: db.query("SELECT id, tenant, title, member_role, created_at, trashed_at, trashed_by, trashed_with, purging, (SELECT space FROM reg_board_spaces WHERE board = reg_boards.id) AS space FROM reg_boards WHERE purging = 1 AND trashed_at IS NOT NULL AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?1"),
+    claimedSpaces: db.query("SELECT * FROM reg_spaces WHERE purging = 1 AND trashed_at IS NOT NULL AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?1"),
+    claimBoard: db.query("UPDATE reg_boards SET purging = 1 WHERE id = ?1 AND trashed_at IS NOT NULL AND (trashed_with IS NULL OR purging = 1) AND (purging = 1 OR trashed_at <= ?2)"),
     claimSpace: db.query("UPDATE reg_spaces SET purging = 1 WHERE id = ?1 AND trashed_at IS NOT NULL AND (purging = 1 OR trashed_at <= ?2)"),
     claimSpaceBoards: db.query("UPDATE reg_boards SET purging = 1 WHERE trashed_with = ?1"),
     spaceHasBoards: db.query("SELECT 1 AS x FROM reg_board_spaces WHERE space = ? LIMIT 1"),
@@ -504,7 +511,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     idemPut(idem, board + (trashed ? ":trashed" : ":noop"), at);
     return { board: rowBoard(q.board.get(board)), trashed };
   });
-  const restoreBoardTx = db.transaction((board, idem, at) => {
+  const restoreBoardTx = db.transaction((board, idem, into, at) => {
     const b = q.board.get(board);
     if (!b) throw new Error("registry: no such board");
     idemEnter(idem, at);
@@ -512,7 +519,13 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     if (restored) {
       if (b.purging) throw new RegistryError("purged", "the board is being deleted for good");
       if (b.trashed_with != null) throw new RegistryError("with-space", "the board went to Trash with its Space: restore the Space");
-      if (q.space.get(b.space)?.trashed_at != null) throw new RegistryError("space-in-trash", "the board's Space is in Trash: restore the Space first");
+      if (q.space.get(b.space)?.trashed_at != null) {
+        // The Space is in Trash: a destination chosen by the caller (PROTOCOL.md § Trash and restore) takes the board; without one the restore is refused.
+        if (into == null) throw new RegistryError("space-in-trash", "the board's Space is in Trash: restore the Space first");
+        const sp = q.space.get(into);
+        if (sp?.tenant !== b.tenant || sp.trashed_at != null) throw new Error("registry: no such space");
+        q.putBoardSpace.run(board, into);
+      }
       q.restoreBoard.run(board);
     }
     idemPut(idem, board + (restored ? ":restored" : ":noop"), at);
@@ -526,7 +539,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     const trashed = s.trashed_at == null;
     let boards = 0;
     if (trashed) { q.trashSpace.run(space, at, by); boards = q.trashSpaceBoards.run(space, at, by).changes; }
-    idemPut(idem, space + (trashed ? ":trashed" : ":noop"), at);
+    idemPut(idem, space + (trashed ? ":trashed:" + boards : ":noop"), at);
     return { space: rowSpace(q.space.get(space)), trashed, boards };
   });
   const restoreSpaceTx = db.transaction((space, idem, at) => {
@@ -536,10 +549,10 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     const restored = s.trashed_at != null;
     let boards = 0;
     if (restored) {
-      if (s.purging) throw new RegistryError("purged", "the Space is being deleted for good");
+      if (s.purging || q.spaceBoardsClaimed.get(space)) throw new RegistryError("purged", "the Space is being deleted for good");
       q.restoreSpace.run(space); boards = q.restoreSpaceBoards.run(space).changes;
     }
-    idemPut(idem, space + (restored ? ":restored" : ":noop"), at);
+    idemPut(idem, space + (restored ? ":restored:" + boards : ":noop"), at);
     return { space: rowSpace(q.space.get(space)), restored, boards };
   });
   const claimTx = db.transaction((type, id, before) => {
@@ -551,7 +564,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   const purgeBoardTx = db.transaction(board => {
     const b = q.board.get(board);
     if (!b) return true;
-    if (!b.purging) return false;
+    if (!b.purging || b.trashed_at == null) return false;
     q.purgeGrants.run(board); q.purgeScoped.run("board", board); q.purgeInvites.run(board); q.purgeUses.run(board); q.purgeLinks.run(board);
     q.purgeRecents.run(board); q.purgeStars.run(board); q.purgeAsks.run("board", board); q.purgeBoardSpace.run(board); q.purgeBoardRow.run(board);
     return true;
@@ -774,10 +787,10 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       if (!str(by) || !by) throw new Error("registry: bad user");
       return trashBoardTx.immediate(board, from, by, idemOf(idem), now());
     },
-    async restoreBoard({ board, idem }) {
+    async restoreBoard({ board, idem, into = null }) {
       ready();
-      if (!str(board)) throw new Error("registry: no such board");
-      return restoreBoardTx.immediate(board, idemOf(idem), now());
+      if (!str(board) || (into != null && !str(into))) throw new Error("registry: no such board");
+      return restoreBoardTx.immediate(board, idemOf(idem), into, now());
     },
     async trashSpace({ space, by, idem }) {
       ready();
@@ -802,10 +815,12 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       const rows = str(tenant) ? q.trashedSpaces.all(tenant, cur, n + 1, TRASH.sizeCap + 1).map(r => ({ ...rowSpace(r), boards: r.boards })) : [];
       return { spaces: rows.slice(0, n), next: rows.length > n ? rows[n - 1].id : null };
     },
-    async trashDue({ before, limit } = {}) {
+    async trashDue({ before, limit, claimed, after } = {}) {
       ready();
       if (!Number.isFinite(before)) throw new Error("registry: bad time");
       const n = smallLimit(limit, TRASH.due.default, TRASH.due.max);
+      if (claimed === false) return { boards: q.unclaimedBoards.all(before, n).map(rowBoard), spaces: q.unclaimedSpaces.all(before, n).map(rowSpace) };
+      if (claimed === true) return { boards: q.claimedBoards.all(n, after?.board ?? null).map(rowBoard), spaces: q.claimedSpaces.all(n, after?.space ?? null).map(rowSpace) };
       return { boards: q.dueBoards.all(before, n).map(rowBoard), spaces: q.dueSpaces.all(before, n).map(rowSpace) };
     },
     async purgeClaim({ type, id, before }) {

@@ -20,7 +20,7 @@ export function normalizeTrashed(b) {
 export function normalizeRestored(b) {
   const sp = b?.board?.space;
   if (!b || typeof b !== "object" || !isId(b.board?.id) || !isId(sp?.id) || typeof b.restored !== "boolean") return null;
-  return { board: { id: b.board.id, title: str(b.board.title), space: { id: sp.id, name: str(sp.name) } }, restored: b.restored };
+  return { board: { id: b.board.id, title: str(b.board.title), space: { id: sp.id, name: str(sp.name) } }, restored: b.restored, ...(space(b.movedTo) ? { movedTo: space(b.movedTo) } : {}) };
 }
 /** @returns {import("../../ports/trash.js").SpaceResult | null} */
 export function normalizeSpace(b) {
@@ -34,7 +34,7 @@ export function normalizeNotice(b) {
   const from = b.from && typeof b.from === "object" ? { space: space(b.from.space), group: group(b.from.group) } : null;
   const via = b.via && typeof b.via === "object" ? { space: group(b.via.space), canRestore: b.via.canRestore === true } : null;
   return { board: { id: b.board.id, title: str(b.board.title) }, trashedAt: ms(b.trashedAt), expiresAt: ms(b.expiresAt), daysLeft: b.daysLeft, canRestore: b.canRestore,
-    ...(person(b.by) ? { by: person(b.by) } : {}), ...(from ? { from } : {}), ...(via ? { via } : {}) };
+    ...(space(b.into) ? { into: space(b.into) } : {}), ...(person(b.by) ? { by: person(b.by) } : {}), ...(from ? { from } : {}), ...(via ? { via } : {}) };
 }
 const item = i => {
   if (!i || typeof i !== "object" || days(i.daysLeft) === null || !isId(i.id)) return null;
@@ -55,7 +55,7 @@ export function httpTrash({ fetch, token, base = "", timeoutMs = 10_000, timers 
   const set = timers ? timers.set : (fn, t) => setTimeout(fn, t);
   const clear = timers ? timers.clear : h => clearTimeout(h);
   const STATUS = { 400: "invalid", 401: "auth", 403: "forbidden", 404: "notfound", 422: "invalid" };
-  const CONFLICT = { moved: "moved", "with-space": "with-space", "space-in-trash": "space-in-trash", purged: "purged" };
+  const CONFLICT = { moved: "moved", "would-escalate": "would-escalate", "with-space": "with-space", "space-in-trash": "space-in-trash", purged: "purged" };
   /** One request: `{ body }` or `{ error }`. Never throws. */
   async function ask(path, method = "GET", json, key = null) {
     const ctl = typeof AbortController === "function" ? new AbortController() : null;

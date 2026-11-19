@@ -145,14 +145,19 @@ export function memoryRegistry({ now = Date.now } = {}) {
       idemPut(k, b.id + (trashed ? ":trashed" : ":noop"));
       return { board: copy(b), trashed };
     },
-    async restoreBoard({ board, idem: key }) {
+    async restoreBoard({ board, idem: key, into = null }) {
       const b = boards.get(board);
       if (!b) throw new Error("registry: no such board");
       const k = idemEnter(key), restored = b.trashedAt != null;
       if (restored) {
         if (claimed.has("b\n" + b.id)) throw new RegistryError("purged", "the board is being deleted for good");
         if (b.trashedWith != null) throw new RegistryError("with-space", "the board went to Trash with its Space: restore the Space");
-        if (spaces.get(b.space)?.trashedAt != null) throw new RegistryError("space-in-trash", "the board's Space is in Trash: restore the Space first");
+        if (spaces.get(b.space)?.trashedAt != null) {
+          if (into == null) throw new RegistryError("space-in-trash", "the board's Space is in Trash: restore the Space first");
+          const sp = spaces.get(into);
+          if (sp?.tenant !== b.tenant || sp.trashedAt != null) throw new Error("registry: no such space");
+          b.space = into;
+        }
         Object.assign(b, { trashedAt: null, trashedBy: null, trashedWith: null });
       }
       idemPut(k, b.id + (restored ? ":restored" : ":noop"));
@@ -170,7 +175,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
         Object.assign(s, { trashedAt: at, trashedBy: by });
         for (const b of boards.values()) if (b.space === s.id && b.trashedAt == null) { Object.assign(b, { trashedAt: at, trashedBy: by, trashedWith: s.id }); n++; }
       }
-      idemPut(k, s.id + (trashed ? ":trashed" : ":noop"));
+      idemPut(k, s.id + (trashed ? ":trashed:" + n : ":noop"));
       return { space: copy(s), trashed, boards: n };
     },
     async restoreSpace({ space, idem: key }) {
@@ -179,11 +184,11 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const k = idemEnter(key), restored = s.trashedAt != null;
       let n = 0;
       if (restored) {
-        if (claimed.has("s\n" + s.id)) throw new RegistryError("purged", "the Space is being deleted for good");
+        if (claimed.has("s\n" + s.id) || [...boards.values()].some(b => b.trashedWith === s.id && claimed.has("b\n" + b.id))) throw new RegistryError("purged", "the Space is being deleted for good");
         Object.assign(s, { trashedAt: null, trashedBy: null });
         for (const b of boards.values()) if (b.trashedWith === s.id) { Object.assign(b, { trashedAt: null, trashedBy: null, trashedWith: null }); n++; }
       }
-      idemPut(k, s.id + (restored ? ":restored" : ":noop"));
+      idemPut(k, s.id + (restored ? ":restored:" + n : ":noop"));
       return { space: copy(s), restored, boards: n };
     },
     async trashedBoards(tenant, { after = null, limit } = {}) {
@@ -199,17 +204,26 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const size = id => Math.min([...boards.values()].filter(b => b.trashedWith === id).length, TRASH.sizeCap + 1);
       return { spaces: rest.slice(0, n).map(s => ({ ...copy(s), boards: size(s.id) })), next: rest.length > n ? rest[n - 1].id : null };
     },
-    async trashDue({ before, limit } = {}) {
+    async trashDue({ before, limit, claimed: want, after } = {}) {
       if (!Number.isFinite(before)) throw new Error("registry: bad time");
       const n = smallLimit(limit, TRASH.due.default, TRASH.due.max);
+      const byId = (a, b) => (a.id < b.id ? -1 : 1), oldest = (a, b) => a.trashedAt - b.trashedAt || byId(a, b);
+      if (want === false) {   // due and unclaimed; a board that went with its Space follows its Space's claim
+        const pick = (m, c) => [...m.values()].filter(x => x.trashedAt != null && x.trashedAt <= before && x.trashedWith == null && !claimed.has(c + "\n" + x.id)).sort(oldest).slice(0, n).map(copy);
+        return { boards: pick(boards, "b"), spaces: pick(spaces, "s") };
+      }
+      if (want === true) {   // claimed, by id after the cursor: a stuck row cannot hold the head of the line
+        const pick = (m, c, cur) => [...m.values()].filter(x => x.trashedAt != null && claimed.has(c + "\n" + x.id) && (cur == null || x.id > cur)).sort(byId).slice(0, n).map(copy);
+        return { boards: pick(boards, "b", after?.board), spaces: pick(spaces, "s", after?.space) };
+      }
       const due = (row, c) => row.trashedAt != null && (row.trashedAt <= before || claimed.has(c + "\n" + row.id));
-      const oldest = (a, b) => a.trashedAt - b.trashedAt || (a.id < b.id ? -1 : 1);
       return { boards: [...boards.values()].filter(b => due(b, "b")).sort(oldest).slice(0, n).map(copy), spaces: [...spaces.values()].filter(s => due(s, "s")).sort(oldest).slice(0, n).map(copy) };
     },
     async purgeClaim({ type, id, before }) {
       if ((type !== "board" && type !== "space") || !Number.isFinite(before)) throw new Error("registry: bad purge");
       const row = (type === "board" ? boards : spaces).get(id), c = type === "board" ? "b" : "s";
       if (!row || row.trashedAt == null || !(row.trashedAt <= before || claimed.has(c + "\n" + id))) return false;
+      if (type === "board" && row.trashedWith != null && !claimed.has("b\n" + id)) return false;   // a board that went with its Space is claimed only with it
       claimed.add(c + "\n" + id);
       if (type === "space") for (const b of boards.values()) if (b.trashedWith === id) claimed.add("b\n" + b.id);
       return true;
@@ -217,7 +231,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
     async purgeBoard(board) {
       const b = boards.get(board);
       if (!b) return true;
-      if (!claimed.has("b\n" + board)) return false;
+      if (!claimed.has("b\n" + board) || b.trashedAt == null) return false;
       grants.delete(board); scoped.delete(sk("board", board));
       for (const [id, i] of invites) if (i.board === board) invites.delete(id);
       for (const [id, l] of links) if (l.board === board) links.delete(id);

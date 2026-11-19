@@ -1,10 +1,13 @@
 // The purge of Trash (PROTOCOL.md § Trash and restore, "Purge"). Core: depends on the Registry and Store ports and an injected Clock, nothing else; main.js wires a timer to `sweep()`.
 //
-// Order, per board (every step idempotent, so a crash at any point leaves a claimed row that `trashDue` still lists and the next pass, on any node, resumes):
-//   1. claim    `purgeClaim`: one conditional write; from here a Restore is refused, so nothing restorable is ever deleted.
+// Order, per board (every step idempotent, so a crash at any point leaves a claimed row that `trashDue({ claimed: true })` still lists and the next pass, on any node, resumes):
+//   1. claim    `purgeClaim`: one conditional write; from here a Restore is refused, so nothing restorable is ever deleted. A board that went to Trash with its Space is claimed only
+//               WITH its Space (the Registry refuses it alone), so a restorable board is never claimed; the sweeper reads only own-clock boards and Spaces as unclaimed work.
 //   2. content  `Store.purgeBoard`: the log, checkpoints and lease. (Blobs are tenant-wide and shared by the Unit's other boards: not deleted, see the protocol.)
 //   3. rows     `Registry.purgeBoard`: grants, invites, links and the rest, then the board.
 // A Space: claim (which claims the boards that went with it), purge those boards, then `purgeSpace` once none references it.
+// Starvation: unclaimed work is read oldest first and each item leaves that list once claimed; claimed rows are read by id after a cursor kept here across sweeps, so a row that keeps failing
+// is retried in turn, never at the head of every read.
 // Two nodes sweeping at once is safe: the claim is a conditional write and every delete is a no-op the second time.
 
 import { TRASH } from "./auth/registry-port.js";
@@ -23,39 +26,44 @@ import { TRASH } from "./auth/registry-port.js";
 export function trashSweeper({ registry, store, clock = { now: Date.now }, log = { warn() {} }, ttlMs = TRASH.ttlMs, limit = TRASH.due.default, passes = 10 }) {
   const warn = (msg, fields) => { try { log.warn(msg, fields); } catch { /* a broken log never stops a purge */ } };
   let running = null;
+  /** Where the next read of claimed rows resumes (ids; null = from the start). Lost on restart, which only re-reads from the start. */
+  let cursor = { board: null, space: null };
 
-  /** One item's steps; a failure is logged and leaves the claimed row for the next pass. @returns {Promise<boolean>} done */
+  /** One claimed board's steps; a failure is logged and leaves the claimed row for a later pass. @returns {Promise<boolean>} done */
   async function purgeBoard(b) {
     try {
       await store.purgeBoard(b.tenant, b.id);
       return await registry.purgeBoard(b.id);
-    } catch (err) { warn("trash purge of a board failed; the next pass resumes it", { board: b.id, err }); return false; }
+    } catch (err) { warn("trash purge of a board failed; a later pass resumes it", { board: b.id, err }); return false; }
   }
 
+  /** One pass: claim what is due, then work through a page of claimed rows. */
   async function pass(before) {
-    let due = await registry.trashDue({ before, limit });
-    // Spaces first: claiming one claims the boards that went with it, so they show in the next read as due.
-    let claimedSpaces = 0;
-    for (const s of due.spaces) {
-      try { if (await registry.purgeClaim({ type: "space", id: s.id, before })) claimedSpaces++; } catch (err) { warn("trash claim of a Space failed", { space: s.id, err }); }
+    const out = { boards: 0, spaces: 0, failed: 0, claimed: 0, full: false };
+    const due = await registry.trashDue({ before, limit, claimed: false });
+    out.full = due.boards.length >= limit || due.spaces.length >= limit;
+    // Spaces first: claiming one claims the boards that went with it.
+    for (const [type, rows] of [["space", due.spaces], ["board", due.boards]]) {
+      for (const r of rows) {
+        try { if (await registry.purgeClaim({ type, id: r.id, before })) out.claimed++; }
+        catch (err) { out.failed++; warn(`trash claim of a ${type} failed`, { [type]: r.id, err }); }
+      }
     }
-    if (claimedSpaces) due = { boards: (await registry.trashDue({ before, limit })).boards, spaces: due.spaces };
-    const out = { boards: 0, spaces: 0, failed: 0, full: due.boards.length >= limit || due.spaces.length >= limit };
-    for (const b of due.boards) {
-      let claimed = false;
-      try { claimed = await registry.purgeClaim({ type: "board", id: b.id, before }); } catch (err) { warn("trash claim of a board failed", { board: b.id, err }); }
-      if (!claimed) { out.failed++; continue; }
-      if (await purgeBoard(b)) out.boards++; else out.failed++;
+    const cl = await registry.trashDue({ before, limit, claimed: true, after: cursor });
+    for (const b of cl.boards) { if (await purgeBoard(b)) out.boards++; else out.failed++; }
+    for (const s of cl.spaces) {
+      try { if (await registry.purgeSpace(s.id)) out.spaces++; }   // false: a board of it is still being purged (counted on its own)
+      catch (err) { warn("trash purge of a Space failed; a later pass resumes it", { space: s.id, err }); out.failed++; }
     }
-    for (const s of due.spaces) {
-      try { if (await registry.purgeSpace(s.id)) out.spaces++; } catch (err) { warn("trash purge of a Space failed; the next pass resumes it", { space: s.id, err }); out.failed++; }
-    }
+    // A full page moves the cursor on; a short one wraps it, so the next read starts again from the start.
+    cursor = { board: cl.boards.length >= limit ? cl.boards.at(-1).id : null, space: cl.spaces.length >= limit ? cl.spaces.at(-1).id : null };
+    out.full ||= cl.boards.length >= limit || cl.spaces.length >= limit;
     return out;
   }
 
   return {
     /**
-     * One sweep: everything in Trash since `now() - ttl` or earlier, in up to `passes` reads. Never rejects; a sweep already running is joined, not doubled.
+     * One sweep: everything in Trash since `now() - ttl` or earlier, in up to `passes` passes. Never rejects; a sweep already running is joined, not doubled.
      * @returns {Promise<SweepResult>}
      */
     sweep() {
@@ -66,8 +74,8 @@ export function trashSweeper({ registry, store, clock = { now: Date.now }, log =
           for (let i = 0; i < passes; i++) {
             const o = await pass(before);
             total.boards += o.boards; total.spaces += o.spaces; total.failed += o.failed;
-            // Stop at the first pass that handled nothing new (a failing item would repeat forever) or did not fill a page.
-            if (!o.full || o.boards + o.spaces === 0) break;
+            // Stop at the first pass that did nothing new (a failing item would repeat forever) or did not fill a page.
+            if (!o.full || o.boards + o.spaces + o.claimed === 0) break;
             if (i === passes - 1) total.more = true;
           }
         } catch (err) { warn("trash sweep failed", { err }); total.failed++; }

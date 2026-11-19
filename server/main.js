@@ -272,9 +272,9 @@ export function announcingRegistry(registry, bus, log) {
   return {
     ...registry,
     setGrant: after("setGrant", board => board),
-    moveBoard: after("moveBoard", o => o?.board),
+    moveBoard: after("moveBoard", o => o?.board),           // a move changes who reaches the board (PROTOCOL.md § Move board)
     trashBoard: after("trashBoard", o => o?.board),         // Trash and Restore change who reaches the board: open sockets close, caches drop it (PROTOCOL.md § Trash and restore)
-    restoreBoard: after("restoreBoard", o => o?.board),     // a move changes who reaches the board (PROTOCOL.md § Move board)
+    restoreBoard: after("restoreBoard", o => o?.board),
     createInvite: after("createInvite", o => o?.board),
     revokeInvite: after("revokeInvite", async id => (await registry.invite(id).catch(() => null))?.board),
     createLink: after("createLink", o => o?.board),

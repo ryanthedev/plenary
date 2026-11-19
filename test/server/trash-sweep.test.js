@@ -138,6 +138,36 @@ for (const [name, make] of [["sqlite registry", () => sqliteRegistry({ path: ":m
       expect(await s.sweep()).toMatchObject({ boards: 1, spaces: 1, failed: 0 });
       expect(await reg.space(sp.id)).toBe(null);
     });
+    test("reviewer P2: a Space claim that fails and a Store purge that fails never leave a restorable board claimed; after a restore the board is live, fresh on a new trash, and restorable", async () => {
+      await reg.trashSpace({ space: sp.id, by: U });
+      clock.t += TRASH.ttlMs;
+      let claimFail = 1, storeFail = 1;
+      const shaky = { ...reg, trashDue: o => reg.trashDue(o), purgeClaim: async o => { if (o.type === "space" && claimFail-- > 0) throw new Error("claim down"); return reg.purgeClaim(o); }, purgeBoard: id => reg.purgeBoard(id), purgeSpace: id => reg.purgeSpace(id) };
+      const flaky = { purgeBoard: async (t, b) => { if (storeFail-- > 0) throw new Error("store down"); return store.purgeBoard(t, b); } };
+      const s = trashSweeper({ registry: shaky, store: flaky, clock: { now: () => clock.t }, log: { warn: (m, f) => warned.push([m, f]) } });
+      expect(await s.sweep()).toMatchObject({ boards: 0, spaces: 0, failed: 1 });
+      expect((await reg.board(b1.id)).trashedAt).not.toBe(null);              // went with the Space: never claimed alone
+      expect(await reg.purgeBoard(b1.id)).toBe(false);
+      await reg.restoreSpace({ space: sp.id });
+      expect((await reg.board(b1.id)).trashedAt).toBe(null);
+      expect((await content(b1)).seq).toBe(2);                                   // the content is untouched
+      await reg.trashBoard({ board: b1.id, from: sp.id, by: U });
+      expect(await s.sweep()).toMatchObject({ boards: 0, spaces: 0, failed: 0 });   // trashed just now: not due
+      expect((await reg.restoreBoard({ board: b1.id })).restored).toBe(true);
+    });
+    test("a row that keeps failing does not starve the rest: with limit 1 every claimed row is reached in turn", async () => {
+      const many = [];
+      for (let i = 0; i < 3; i++) many.push(await reg.createBoard({ tenant: tenant.id, title: `m${i}`, space: sp.id, owner: U }));
+      const all = [b1, b2, ...many];
+      for (const b of all) await reg.trashBoard({ board: b.id, from: sp.id, by: U });
+      clock.t += TRASH.ttlMs;
+      const stuck = [...all].map(b => b.id).sort()[0];
+      const flaky = { purgeBoard: async (t, b) => { if (b === stuck) throw new Error("stuck"); return store.purgeBoard(t, b); } };
+      const s = trashSweeper({ registry: reg, store: flaky, clock: { now: () => clock.t }, limit: 1, passes: 1, log: { warn: (m, f) => warned.push([m, f]) } });
+      for (let i = 0; i < 12; i++) await s.sweep();
+      expect((await reg.trashedBoards(tenant.id)).boards).toEqual([]);                    // all claimed (none listed as restorable)
+      for (const b of all) expect(await reg.board(b.id) === null).toBe(b.id !== stuck);   // every other board is gone, the stuck one remains claimed
+    });
     test("a sweep never rejects: a Registry that throws is a counted failure, and a sweep in flight is joined, not doubled", async () => {
       const broken = { trashDue: async () => { throw new Error("registry down"); } };
       const s = trashSweeper({ registry: broken, store, clock: { now: () => clock.t }, log: { warn: (m, f) => warned.push([m, f]) } });
@@ -147,7 +177,7 @@ for (const [name, make] of [["sqlite registry", () => sqliteRegistry({ path: ":m
       const slow = { ...reg, trashDue: async o => { calls++; await Bun.sleep(10); return reg.trashDue(o); } };
       const s2 = trashSweeper({ registry: slow, store, clock: { now: () => clock.t } });
       const [a, c] = await Promise.all([s2.sweep(), s2.sweep()]);
-      expect(a).toBe(c); expect(calls).toBe(1);
+      expect(a).toBe(c); expect(calls).toBe(2);   // one pass: the unclaimed read and the claimed read
     });
     test("a big Trash drains over passes (limit per read) and reports more when the passes run out", async () => {
       const many = [];

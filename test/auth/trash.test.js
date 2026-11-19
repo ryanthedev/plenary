@@ -35,6 +35,39 @@ beforeEach(async () => {
   board = await r.createBoard({ tenant: acme.id, title: "Roadmap", space: design.id, owner: "google:ada", memberRole: null });
 });
 
+describe("personal space boards: the owner's, and an admin's only with board-content access", () => {
+  let mine;
+  const svc = adminBoardContent => {
+    const t = makeTenancy({ registry: r, now: () => clock.t, adminBoardContent });
+    return trashService({ registry: r, tenancy: t, spaces: spaceService({ registry: r, tenancy: t, home }), now: () => clock.t });
+  };
+  beforeEach(async () => { mine = await r.createBoard({ tenant: acme.id, title: "Private notes", space: adasSpace.id, owner: "google:ada" }); });
+  test("the owner trashes, sees, is told and restores; a manage-only Unit admin gets nothing: no write, no list row, no notice", async () => {
+    const manageOnly = svc(false);
+    expect((await tr.trashBoard(ada, mine.id, { from: adasSpace.id })).trashed).toBe(true);
+    expect(await code(manageOnly.restoreBoard(root, mine.id))).toBe("forbidden");
+    expect(await code(manageOnly.notice(root, mine.id))).toBe("forbidden");
+    expect((await manageOnly.list(root)).items.map(i => i.title)).not.toContain("Private notes");
+    expect(JSON.stringify(await manageOnly.list(root))).not.toContain("Private notes");
+    expect((await tr.list(ada)).items.map(i => i.title)).toContain("Private notes");
+    expect((await tr.notice(ada, mine.id))).toMatchObject({ canRestore: true, by: { id: "google:ada" } });
+    expect((await r.board(mine.id)).trashedAt).not.toBe(null);
+    expect((await tr.restoreBoard(ada, mine.id)).restored).toBe(true);
+    expect(await code(manageOnly.trashBoard(root, mine.id, { from: adasSpace.id }))).toBe("forbidden");
+    expect((await r.board(mine.id)).trashedAt).toBe(null);
+  });
+  test("with board-content access (adminBoardContent) a Unit admin may trash, list, be told and restore it; a shared Space's board needs only `delete` either way", async () => {
+    const withContent = svc(true);
+    expect((await withContent.trashBoard(root, mine.id, { from: adasSpace.id })).trashed).toBe(true);
+    expect((await withContent.list(root)).items.map(i => i.title)).toContain("Private notes");
+    expect((await withContent.notice(root, mine.id)).canRestore).toBe(true);
+    expect((await withContent.restoreBoard(root, mine.id)).restored).toBe(true);
+    const manageOnly = svc(false);
+    expect((await manageOnly.trashBoard(root, board.id, { from: design.id })).trashed).toBe(true);
+    expect((await manageOnly.list(root)).items.map(i => i.title)).toContain("Roadmap");
+  });
+});
+
 describe("who may trash and restore (the `delete` permission)", () => {
   test("a board owner, a Space owner and a Unit admin may; an editor, a viewer, a stranger, a guest, an unknown id and another Unit's board get the one forbidden", async () => {
     await r.setGrant(board.id, "google:max", "editor");
@@ -155,16 +188,29 @@ describe("trash, undo and restore", () => {
     expect(await tr.restoreBoard(ada, board.id)).toMatchObject({ restored: true, board: { id: board.id, space: { id: design.id } } });
     expect((await tr.restoreBoard(ada, board.id)).restored).toBe(false);
   });
-  test("a board whose Space is in Trash is not restored on its own (409 space-in-trash); one taken with its Space is restored through the Space", async () => {
+  test("an own-clock board whose Space is in Trash is restored into the restorer's personal space (J8 step 3), and says so; one taken with its Space only through the Space", async () => {
     const other = await r.createBoard({ tenant: acme.id, title: "Other", space: design.id, owner: "google:ada" });
     await tr.trashBoard(ada, board.id, { from: design.id });
     await tr.trashSpace(ada, design.id);
-    expect(await code(tr.restoreBoard(ada, board.id))).toBe("space-in-trash");
+    expect((await tr.notice(ada, board.id))).toMatchObject({ canRestore: true, into: { id: adasSpace.id, personal: true } });
     expect(await code(tr.restoreBoard(ada, other.id))).toBe("with-space");
+    const out = await tr.restoreBoard(ada, board.id);
+    expect(out).toMatchObject({ restored: true, board: { id: board.id, space: { id: adasSpace.id } }, movedTo: { id: adasSpace.id, personal: true } });
+    expect((await r.board(board.id)).space).toBe(adasSpace.id);
     await tr.restoreSpace(ada, design.id);
     expect((await r.board(other.id)).trashedAt).toBe(null);
-    expect((await r.board(board.id)).trashedAt).not.toBe(null);   // its own clock: still in Trash
-    expect((await tr.restoreBoard(ada, board.id)).restored).toBe(true);
+    expect((await r.board(other.id)).space).toBe(design.id);
+  });
+  test("restoring into the personal space may not raise the restorer's own role: an editor-level deleter is refused (would-escalate, and canRestore says so); a Unit admin is exempt", async () => {
+    const janitor = await r.createRole({ tenant: acme.id, name: "Janitor", boardRole: "editor", permissions: ["delete"] });
+    await r.setScopedGrant({ scope: { type: "space", id: design.id }, subject: { type: "user", id: "google:max" }, role: janitor.id });
+    await tr.trashBoard(ada, board.id, { from: design.id });
+    await tr.trashSpace(ada, design.id);
+    expect((await tr.notice(max, board.id)).canRestore).toBe(false);
+    expect(await code(tr.restoreBoard(max, board.id))).toBe("would-escalate");
+    expect((await r.board(board.id)).trashedAt).not.toBe(null);
+    expect((await tr.notice(root, board.id)).canRestore).toBe(true);
+    expect((await tr.restoreBoard(root, board.id)).movedTo.personal).toBe(true);
   });
   test("a claimed (being purged) board cannot be restored: 409 purged", async () => {
     await tr.trashBoard(ada, board.id, { from: design.id });
@@ -364,9 +410,10 @@ describe("over HTTP", () => {
     const sp = await api("ada", `/spaces/${design.id}/trash`, "POST", {});
     expect([sp.status, sp.json.trashed, sp.json.boards]).toEqual([200, true, 0]);
     expect((await api("ada", `/spaces/${design.id}`)).status).toBe(404);
-    expect((await api("ada", `/boards/${board.id}/restore`, "POST", {})).status).toBe(409);   // its Space is in Trash
+    const rb = await api("ada", `/boards/${board.id}/restore`, "POST", {});   // its Space is in Trash: it comes back in Ada's personal space
+    expect([rb.status, rb.json.restored, rb.json.movedTo.personal]).toEqual([200, true, true]);
     expect((await api("ada", `/spaces/${design.id}/restore`, "POST", {})).json.restored).toBe(true);
-    expect((await api("ada", `/boards/${board.id}/restore`, "POST", {})).json.restored).toBe(true);
+    expect((await api("ada", `/boards/${board.id}/restore`, "POST", {})).json.restored).toBe(false);
     expect((await api("ada", `/spaces/${design.id}`)).status).toBe(200);
   });
   test("a card's can.trash follows the `delete` permission", async () => {

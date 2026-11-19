@@ -79,6 +79,7 @@ export function mountTrashNotice({ host, model, homeHref, onRestored = () => {} 
       if (n.by) lines.push(h("p", {}, `Deleted by ${n.by.name}${n.from ? ` from ${fromText(n.from)}` : ""}.`));
       if (n.via) lines.push(h("p", {}, n.via.space ? `It went to Trash with its Space, ${n.via.space.name}.` : "It went to Trash with its Space."));
       if (!can) lines.push(h("p", {}, "Ask someone who can restore it. Its access, invites and links come back with it."));
+      else if (n.into && !viaSpace) lines.push(h("p", {}, `Its Space is in Trash too, so Restore puts it in your personal space. Its access, invites and links come back with it.`));
       else lines.push(h("p", {}, viaSpace && !n.canRestore ? `Restoring brings back ${viaSpace.name} and its boards, with their access, invites and links.` : "Restoring brings back its access, invites and links."));
     }
     const acts = S.status === "restored"

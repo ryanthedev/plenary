@@ -716,7 +716,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
         if (e.code === "in-use" || e.code === "confirm-required") return err(409, e.code, e.data ?? {});
         if (e.code === "superseded") return err(409, "superseded");
         if (e.code === "moved") return err(409, "moved");
-        if (e.code === "with-space" || e.code === "space-in-trash" || e.code === "purged") return err(409, e.code);
+        if (e.code === "with-space" || e.code === "space-in-trash" || e.code === "purged" || e.code === "would-escalate") return err(409, e.code);
         if (e.code === "unknown-person" || e.code === "bad-role") return err(400, e.code);
         if (e.code === "rate-limited") { const s = e.data?.retryAfter ?? null; return err(429, "rate-limited", { retryAfter: s }, s == null ? undefined : { "retry-after": String(s) }); }
       }

@@ -135,6 +135,8 @@ export const REGISTRY_INDEXES = {
   reg_grants_member: "reg_grants (member)",
   reg_boards_tenant: "reg_boards (tenant, id)",
   reg_boards_trash: "reg_boards (trashed_at) WHERE trashed_at IS NOT NULL",
+  reg_boards_purging: "reg_boards (id) WHERE purging",
+  reg_spaces_purging: "reg_spaces (id) WHERE purging",
   reg_boards_trashed_with: "reg_boards (trashed_with) WHERE trashed_with IS NOT NULL",
   reg_board_spaces_space: "reg_board_spaces (space, board)",
   reg_spaces_trash: "reg_spaces (trashed_at) WHERE trashed_at IS NOT NULL",
@@ -391,7 +393,8 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       return write(async tx => {
         // Nothing deletes tenants today; the foreign key is the fence if that changes.
         if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
-        { const sp = await one(tx, `SELECT tenant, trashed_at FROM ${SP} WHERE id = $1`, [space]); if (sp?.tenant !== tenant || sp.trashed_at != null) throw new Error("registry: no such space"); }
+        // FOR SHARE: a concurrent trashSpace (FOR UPDATE on the Space) waits for this insert to commit, so it trashes the new board too; a board is never left live in a Space that went to Trash.
+        { const sp = await one(tx, `SELECT tenant, trashed_at FROM ${SP} WHERE id = $1 FOR SHARE`, [space]); if (sp?.tenant !== tenant || sp.trashed_at != null) throw new Error("registry: no such space"); }
         const id = await fresh(tx, mint.board, BD);
         await idemPut(tx, k, id, createdAt);
         await tx.unsafe(`INSERT INTO ${BD} (id, tenant, title, member_role, created_at) VALUES ($1, $2, $3, $4, $5)`,
@@ -408,10 +411,12 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       if (!key(from) || !key(to)) throw new Error("registry: no such space");
       const k = idemStart(idem), at = now();
       return write(async tx => {
+        // Lock order is Space, then board (trashSpace's order, so the two cannot deadlock). The target Space is held FOR SHARE: a concurrent trashSpace waits, so the board is never left live in a Space that went to Trash.
+        const sp = await one(tx, `SELECT tenant, trashed_at FROM ${SP} WHERE id = $1 FOR SHARE`, [to]);
         // The board row lock serialises every move of this board (and a grant change); the compare-and-set reads after it is held.
         const b = await one(tx, `SELECT id, tenant, trashed_at FROM ${BD} WHERE id = $1 FOR UPDATE`, [board]);
         if (!b) throw new Error("registry: no such board");
-        { const sp = await one(tx, `SELECT tenant, trashed_at FROM ${SP} WHERE id = $1`, [to]); if (sp?.tenant !== b.tenant || sp.trashed_at != null) throw new Error("registry: no such space"); }
+        if (sp?.tenant !== b.tenant || sp.trashed_at != null) throw new Error("registry: no such space");
         if (b.trashed_at != null) throw new RegistryError("in-trash", "the board is in Trash");
         const cur = (await one(tx, `SELECT space FROM ${BS} WHERE board = $1`, [board]))?.space;
         const moved = cur !== to;
@@ -444,20 +449,29 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         return { board: rowBoard(await one(tx, `${BOARD_SQL} WHERE b.id = $1`, [board])), trashed };
       });
     },
-    async restoreBoard({ board, idem }) {
+    async restoreBoard({ board, idem, into = null }) {
       ready();
-      if (!key(board)) throw new Error("registry: no such board");
+      if (!key(board) || (into != null && !key(into))) throw new Error("registry: no such board");
       const k = idemStart(idem), at = now();
       return write(async tx => {
-        const b = await one(tx, `SELECT id, trashed_at, trashed_with, purging FROM ${BD} WHERE id = $1 FOR UPDATE`, [board]);
+        // Lock order is Space (FOR SHARE: a concurrent trashSpace waits, so no live board is left in a Space that went to Trash), then the board (trashSpace's order). The board's Space is read first, then re-checked under the board lock.
+        const at0 = (await one(tx, `SELECT space FROM ${BS} WHERE board = $1`, [board]))?.space;
+        const sp = at0 == null ? null : await one(tx, `SELECT tenant, trashed_at FROM ${SP} WHERE id = $1 FOR SHARE`, [at0]);
+        const dest = into == null ? null : await one(tx, `SELECT tenant, trashed_at FROM ${SP} WHERE id = $1 FOR SHARE`, [into]);
+        const b = await one(tx, `SELECT id, tenant, trashed_at, trashed_with, purging FROM ${BD} WHERE id = $1 FOR UPDATE`, [board]);
         if (!b) throw new Error("registry: no such board");
         const restored = b.trashed_at != null;
         await idemPut(tx, k, board + (restored ? ":restored" : ":noop"), at);
         if (restored) {
+          if ((await one(tx, `SELECT space FROM ${BS} WHERE board = $1`, [board]))?.space !== at0) throw new RegistryError("moved", "the board is no longer in that Space");
           if (b.purging) throw new RegistryError("purged", "the board is being deleted for good");
           if (b.trashed_with != null) throw new RegistryError("with-space", "the board went to Trash with its Space: restore the Space");
-          if ((await one(tx, `SELECT s.trashed_at FROM ${BS} bs JOIN ${SP} s ON s.id = bs.space WHERE bs.board = $1`, [board]))?.trashed_at != null) throw new RegistryError("space-in-trash", "the board's Space is in Trash: restore the Space first");
-          await tx.unsafe(`UPDATE ${BD} SET trashed_at = NULL, trashed_by = NULL, trashed_with = NULL WHERE id = $1`, [board]);
+          if (sp?.trashed_at != null) {
+            if (into == null) throw new RegistryError("space-in-trash", "the board's Space is in Trash: restore the Space first");
+            if (dest?.tenant !== b.tenant || dest.trashed_at != null) throw new Error("registry: no such space");
+            await tx.unsafe(`UPDATE ${BS} SET space = $2 WHERE board = $1`, [board, into]);
+          }
+          await tx.unsafe(`UPDATE ${BD} SET trashed_at = NULL, trashed_by = NULL, trashed_with = NULL, purging = FALSE WHERE id = $1`, [board]);
         }
         return { board: rowBoard(await one(tx, `${BOARD_SQL} WHERE b.id = $1`, [board])), restored };
       });
@@ -472,12 +486,12 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         if (!s) throw new Error("registry: no such space");
         if (s.kind === "personal") throw new RegistryError("personal", "a personal space is never trashed");
         const trashed = s.trashed_at == null;
-        await idemPut(tx, k, space + (trashed ? ":trashed" : ":noop"), at);
         let boards = 0;
         if (trashed) {
           await tx.unsafe(`UPDATE ${SP} SET trashed_at = $2, trashed_by = $3 WHERE id = $1`, [space, at, by]);
           boards = (await tx.unsafe(`UPDATE ${BD} SET trashed_at = $2, trashed_by = $3, trashed_with = $1 WHERE trashed_at IS NULL AND id IN (SELECT board FROM ${BS} WHERE space = $1) RETURNING 1 AS x`, [space, at, by])).length;
         }
+        await idemPut(tx, k, space + (trashed ? ":trashed:" + boards : ":noop"), at);
         return { space: rowSpace(await one(tx, `SELECT * FROM ${SP} WHERE id = $1`, [space])), trashed, boards };
       });
     },
@@ -489,13 +503,13 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         const s = await one(tx, `SELECT id, trashed_at, purging FROM ${SP} WHERE id = $1 FOR UPDATE`, [space]);
         if (!s) throw new Error("registry: no such space");
         const restored = s.trashed_at != null;
-        await idemPut(tx, k, space + (restored ? ":restored" : ":noop"), at);
         let boards = 0;
         if (restored) {
-          if (s.purging) throw new RegistryError("purged", "the Space is being deleted for good");
+          if (s.purging || await one(tx, `SELECT 1 AS x FROM ${BD} WHERE trashed_with = $1 AND purging LIMIT 1`, [space])) throw new RegistryError("purged", "the Space is being deleted for good");
           await tx.unsafe(`UPDATE ${SP} SET trashed_at = NULL, trashed_by = NULL WHERE id = $1`, [space]);
-          boards = (await tx.unsafe(`UPDATE ${BD} SET trashed_at = NULL, trashed_by = NULL, trashed_with = NULL WHERE trashed_with = $1 RETURNING 1 AS x`, [space])).length;
+          boards = (await tx.unsafe(`UPDATE ${BD} SET trashed_at = NULL, trashed_by = NULL, trashed_with = NULL, purging = FALSE WHERE trashed_with = $1 RETURNING 1 AS x`, [space])).length;
         }
+        await idemPut(tx, k, space + (restored ? ":restored:" + boards : ":noop"), at);
         return { space: rowSpace(await one(tx, `SELECT * FROM ${SP} WHERE id = $1`, [space])), restored, boards };
       });
     },
@@ -514,10 +528,22 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         WHERE s.tenant = $1 AND s.trashed_at IS NOT NULL AND NOT s.purging AND ($2::text IS NULL OR s.id > $2) ORDER BY s.id LIMIT $3`, [tenant, cur, n + 1, TRASH.sizeCap + 1])).map(r => ({ ...rowSpace(r), boards: Number(r.boards) }));
       return { spaces: rows.slice(0, n), next: rows.length > n ? rows[n - 1].id : null };
     },
-    async trashDue({ before, limit } = {}) {
+    async trashDue({ before, limit, claimed, after } = {}) {
       ready();
       if (!Number.isFinite(before)) throw new Error("registry: bad time");
       const n = smallLimit(limit, TRASH.due.default, TRASH.due.max);
+      if (claimed === false) {
+        const [boards, spaces] = await Promise.all([
+          db.unsafe(`${BOARD_SQL} WHERE b.trashed_at IS NOT NULL AND NOT b.purging AND b.trashed_with IS NULL AND b.trashed_at <= $1 ORDER BY b.trashed_at, b.id LIMIT $2`, [before, n]),
+          db.unsafe(`SELECT * FROM ${SP} WHERE trashed_at IS NOT NULL AND NOT purging AND trashed_at <= $1 ORDER BY trashed_at, id LIMIT $2`, [before, n])]);
+        return { boards: boards.map(rowBoard), spaces: spaces.map(rowSpace) };
+      }
+      if (claimed === true) {
+        const [boards, spaces] = await Promise.all([
+          db.unsafe(`${BOARD_SQL} WHERE b.purging AND b.trashed_at IS NOT NULL AND ($2::text IS NULL OR b.id > $2) ORDER BY b.id LIMIT $1`, [n, after?.board ?? null]),
+          db.unsafe(`SELECT * FROM ${SP} WHERE purging AND trashed_at IS NOT NULL AND ($2::text IS NULL OR id > $2) ORDER BY id LIMIT $1`, [n, after?.space ?? null])]);
+        return { boards: boards.map(rowBoard), spaces: spaces.map(rowSpace) };
+      }
       const [boards, spaces] = await Promise.all([
         db.unsafe(`${BOARD_SQL} WHERE b.trashed_at IS NOT NULL AND (b.trashed_at <= $1 OR b.purging) ORDER BY b.trashed_at, b.id LIMIT $2`, [before, n]),
         db.unsafe(`SELECT * FROM ${SP} WHERE trashed_at IS NOT NULL AND (trashed_at <= $1 OR purging) ORDER BY trashed_at, id LIMIT $2`, [before, n])]);
@@ -528,7 +554,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       if ((type !== "board" && type !== "space") || !Number.isFinite(before) || !key(id)) throw new Error("registry: bad purge");
       return write(async tx => {
         const T_ = type === "board" ? BD : SP;
-        const hit = (await tx.unsafe(`UPDATE ${T_} SET purging = TRUE WHERE id = $1 AND trashed_at IS NOT NULL AND (purging OR trashed_at <= $2) RETURNING 1 AS x`, [id, before])).length > 0;
+        const hit = (await tx.unsafe(`UPDATE ${T_} SET purging = TRUE WHERE id = $1 AND trashed_at IS NOT NULL AND (purging OR trashed_at <= $2)${type === "board" ? " AND (trashed_with IS NULL OR purging)" : ""} RETURNING 1 AS x`, [id, before])).length > 0;   // a board that went with its Space is claimed only with it
         if (hit && type === "space") await tx.unsafe(`UPDATE ${BD} SET purging = TRUE WHERE trashed_with = $1`, [id]);
         return hit;
       });
@@ -537,9 +563,9 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       ready();
       if (!key(board)) return true;
       return write(async tx => {
-        const b = await one(tx, `SELECT id, purging FROM ${BD} WHERE id = $1 FOR UPDATE`, [board]);
+        const b = await one(tx, `SELECT id, purging, trashed_at FROM ${BD} WHERE id = $1 FOR UPDATE`, [board]);
         if (!b) return true;
-        if (!b.purging) return false;
+        if (!b.purging || b.trashed_at == null) return false;
         await tx.unsafe(`DELETE FROM ${G} WHERE board = $1`, [board]);
         await tx.unsafe(`DELETE FROM ${SG} WHERE scope_type = 'board' AND scope_id = $1`, [board]);
         await tx.unsafe(`DELETE FROM ${I} WHERE board = $1`, [board]);
@@ -653,9 +679,9 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       ready();
       if (!key(link)) throw new Error("registry: no such link");
       await write(async tx => {
-        const l = await one(tx, `SELECT l.board, b.trashed_at FROM ${L} l JOIN ${BD} b ON b.id = l.board WHERE l.id = $1`, [link]);
+        const l = await one(tx, `SELECT l.board, b.trashed_at FROM ${L} l JOIN ${BD} b ON b.id = l.board WHERE l.id = $1 FOR SHARE OF b`, [link]);
         if (!l) throw new Error("registry: no such link");
-        if (l.trashed_at != null) throw new RegistryError("in-trash", "the board is in Trash");   // atomic with the use: no read for the caller, no race with a trash
+        if (l.trashed_at != null) throw new RegistryError("in-trash", "the board is in Trash");   // FOR SHARE OF b: a concurrent trashBoard (FOR UPDATE on the board) waits for this insert or is seen by it; no read for the caller
         await tx.unsafe(`INSERT INTO ${U} (board, member, link) VALUES ($1, $2, $3)
           ON CONFLICT (board, member, link) DO NOTHING`, [l.board, String(user), link]);
       });

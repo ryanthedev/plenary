@@ -6,6 +6,9 @@
 
 import { AdminError } from "../admin/boards.js";
 import { TRASH, HOME, TEAMS } from "./registry-port.js";
+import { isUnitAdmin } from "./resolver.js";
+import { withinLadder } from "./permissions.js";
+import { givenBy } from "./move.js";
 
 /** What one read shows at most, and how much of the Unit's Trash a read looks at. */
 export const LIMITS = Object.freeze({ items: 50, scanPages: 5, page: 100 });
@@ -20,7 +23,7 @@ const could = a => (a.ladder ?? a.trashed?.ladder ?? null) != null;
 /** Whole days left, rounded up: the last day reads 1, 0 only once it is due. */
 const daysLeft = (at, t) => Math.max(0, Math.ceil((at + TRASH.ttlMs - t) / DAY));
 /** The Registry's refusals of a restore, as the codes the route answers. */
-const RESTORE_CODES = { "with-space": "the board went to Trash with its Space: restore the Space", "space-in-trash": "the board's Space is in Trash: restore the Space first", purged: "it is being deleted for good" };
+const RESTORE_CODES = { "would-escalate": "restoring into your personal space would give you a higher role on the board than you hold", "with-space": "the board went to Trash with its Space: restore the Space", "space-in-trash": "the board's Space is in Trash: restore the Space first", purged: "it is being deleted for good" };
 
 /**
  * @param {{ registry: import("./registry-port.js").Registry, tenancy: ReturnType<typeof import("./tenancy.js").tenancy>,
@@ -32,8 +35,17 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
     const id = idOf(boardId);
     if (!id) throw refused();
     const [unit, row, access] = await Promise.all([tenancy.tenantOf(identity), registry.board(id), tenancy.effective(identity, id, { uniform: true })]);
-    if (!unit || !row || row.tenant !== unit.id || !access.permissions.has("delete")) throw refused();
+    if (!unit || !row || row.tenant !== unit.id || !access.permissions.has("delete") || !(await personalOk(row, access))) throw refused();
     return { unit, row, access };
+  }
+  /**
+   * A board in a personal space is its owner's: `delete` alone (a manage-only Unit admin holds it on every board) is not enough there. The caller must also have been able to OPEN it before
+   * it went to Trash (the space owner; an admin only where board-content access is on). Boards in shared Spaces keep the `delete` rule.
+   */
+  async function personalOk(row, access) {
+    if (!row.space) return true;
+    const sp = await registry.space(row.space);
+    return sp?.kind !== "personal" || could(access);
   }
   /** The Space, the caller's access and their Unit, if they hold `delete` on it and it is not personal. */
   async function spaceDeleter(identity, spaceId) {
@@ -56,6 +68,18 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
   }
   const clockOf = at => ({ trashedAt: at, expiresAt: at + TRASH.ttlMs });
   const boardOut = (row, space) => ({ id: row.id, title: row.title, space });
+  /** The count a keyed Space call stored in its ref (`<space>:trashed:<n>`, `<space>:restored:<n>`); 0 for an older or a no-op ref. */
+  const countOf = ref => Number(/:(?:trashed|restored):(\d+)$/.exec(String(ref))?.[1] ?? 0);
+  /**
+   * Where Restore puts an own-clock board whose Space is in Trash (J8 step 3): the caller's personal space, if their own role on the board does not rise there (#53's rule 4; a Unit admin is
+   * exempt). `null` = the board's Space is live (it goes back where it was); otherwise `{ space, ok }`, `ok` false = Restore would escalate.
+   */
+  async function destination(identity, d) {
+    if (d.row.trashedWith != null || !d.row.space || (await registry.space(d.row.space))?.trashedAt == null) return null;
+    const space = await registry.ensurePersonalSpace(d.unit.id, identity.user);
+    const ctx = await registry.accessContext({ type: "space", id: space.id }, { users: [identity.user] });
+    return { space, ok: !!ctx && withinLadder(d.access.trashed?.ladder ?? d.access.ladder, givenBy(ctx), isUnitAdmin(d.unit, identity)) };
+  }
 
   const asAdminError = e => {
     if (e?.code === "moved") return new AdminError("moved", "the board has been moved since");
@@ -87,9 +111,12 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
     /** POST /boards/:board/restore (needs `delete` on the board). */
     async restoreBoard(identity, boardId, idem) {
       const d = await deleter(identity, boardId);
+      const dest = d.row.trashedAt == null ? null : await destination(identity, d);
+      if (dest && !dest.ok) throw asAdminError({ code: "would-escalate" });
       let out;
-      try { out = await registry.restoreBoard({ board: d.row.id, idem }); } catch (e) { throw asAdminError(e); }
-      return { board: boardOut(out.board, await spaceView(identity, out.board.space)), restored: out.restored };
+      try { out = await registry.restoreBoard({ board: d.row.id, idem, ...(dest ? { into: dest.space.id } : {}) }); } catch (e) { throw asAdminError(e); }
+      const moved = !!dest && out.restored;   // the answer says where it went: the caller's own personal space, which they may name
+      return { board: boardOut(out.board, await spaceView(identity, out.board.space)), restored: out.restored, ...(moved ? { movedTo: { id: dest.space.id, name: dest.space.name, personal: true } } : {}) };
     },
     async replayRestore(identity, boardId, ref = "") {
       const d = await deleter(identity, boardId);
@@ -108,8 +135,8 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
     async replayTrashSpace(identity, spaceId, ref = "") {
       const d = await spaceDeleter(identity, spaceId);
       if (d.row.trashedAt == null) throw new AdminError("moved", "the Space has been restored since");
-      const trashed = String(ref).endsWith(":trashed");
-      return { space: { id: d.row.id, name: d.row.name }, trashed, boards: 0, ...clockOf(d.row.trashedAt), undo: trashed ? { restore: true } : null };
+      const trashed = String(ref).includes(":trashed");
+      return { space: { id: d.row.id, name: d.row.name }, trashed, boards: countOf(ref), ...clockOf(d.row.trashedAt), undo: trashed ? { restore: true } : null };
     },
     /** POST /spaces/:space/restore */
     async restoreSpace(identity, spaceId, idem) {
@@ -122,7 +149,7 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
     async replayRestoreSpace(identity, spaceId, ref = "") {
       const d = await spaceDeleter(identity, spaceId);
       if (d.row.trashedAt != null) throw new AdminError("moved", "the Space has been trashed since");
-      return { space: { id: d.row.id, name: d.row.name }, restored: String(ref).endsWith(":restored"), boards: 0 };
+      return { space: { id: d.row.id, name: d.row.name }, restored: String(ref).includes(":restored"), boards: countOf(ref) };
     },
 
     /**
@@ -133,10 +160,14 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
       const id = idOf(boardId);
       if (!id) throw refused();
       const [unit, row, access] = await Promise.all([tenancy.tenantOf(identity), registry.board(id), tenancy.effective(identity, id, { uniform: true })]);
-      const manage = access.permissions.has("delete");
+      const manage = access.permissions.has("delete") && !!row && await personalOk(row, access);
       if (!unit || !row || row.tenant !== unit.id || !access.trashed || !(manage || could(access))) throw refused();
       const t = now(), withSpace = row.trashedWith != null;
       const out = { board: { id: row.id, title: row.title }, ...clockOf(access.trashed.at), daysLeft: daysLeft(access.trashed.at, t), canRestore: manage && !withSpace };
+      if (out.canRestore) {
+        const dest = await destination(identity, { unit, row, access });
+        if (dest) { out.canRestore = dest.ok; if (dest.ok) out.into = { id: dest.space.id, name: dest.space.name, personal: true }; }
+      }
       if (withSpace) {
         const [sp, sa] = await Promise.all([registry.space(row.trashedWith), tenancy.effective(identity, { type: "space", id: row.trashedWith })]);
         out.via = { space: sp && (could(sa) || sa.permissions.has("delete")) ? { id: sp.id, name: sp.name } : null, canRestore: !!sp && sa.permissions.has("delete") };
@@ -169,7 +200,7 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
         const got = p.boards.length ? await tenancy.accessMany(identity, p.boards.map(b => b.id).slice(0, HOME.batch)) : new Map();
         for (const b of p.boards) {
           const f = got.get(b.id);
-          if (!f?.access.trashed || !f.access.permissions.has("delete")) continue;
+          if (!f?.access.trashed || !f.access.permissions.has("delete") || (f.space?.kind === "personal" && !could(f.access))) continue;   // a personal space's boards are listed for those who could open them
           if (items.length >= LIMITS.items) { more = true; break; }
           items.push({ type: "board", id: b.id, title: b.title, from: { space: f.spaceOpen && f.space ? { id: f.space.id, name: f.space.name, personal: f.space.kind === "personal" } : null, group: f.groupOpen && f.group ? { id: f.group.id, name: f.group.name } : null },
             by: b.trashedBy, trashedAt: b.trashedAt });

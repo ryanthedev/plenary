@@ -55,3 +55,11 @@ test("shapes are checked: a list drops items it cannot read and caps text; a not
   expect([g.title.length, g.by.name.length]).toEqual([200, 200]);
   expect(await api(answer(200, { ...NOTICE, daysLeft: "soon" })).notice("b-1")).toEqual({ error: "unavailable" });
 });
+
+test("a restore into the personal space carries movedTo; a notice carries `into`; the escalation refusal is its own error", async () => {
+  const MOVED = { ...RESTORED, movedTo: { id: "s-9", name: "ada's space", personal: true } };
+  expect((await api(answer(200, MOVED)).restore("b-1")).result.movedTo).toEqual({ id: "s-9", name: "ada's space", personal: true });
+  expect((await api(answer(200, RESTORED)).restore("b-1")).result.movedTo).toBeUndefined();
+  expect((await api(answer(200, { ...NOTICE, into: { id: "s-9", name: "mine", personal: true } })).notice("b-1")).notice.into).toEqual({ id: "s-9", name: "mine", personal: true });
+  expect(await api(answer(409, { error: "would-escalate" })).restore("b-1")).toEqual({ error: "would-escalate" });
+});

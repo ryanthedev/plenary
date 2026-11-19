@@ -4,7 +4,7 @@ import { test, expect, beforeEach, afterEach } from "bun:test";
 import { FakeElement, installDom, textOf } from "./collab/fake-dom.js";
 import { showTrashToast } from "../../web/adapters/dom/toast.js";
 import { mountTrashPage, mountTrashNotice } from "../../web/adapters/dom/trash.js";
-import { createTrashModel, createNoticeModel, createTrashUndo, daysText, fromText, failText } from "../../web/core/trash.js";
+import { createTrashModel, createNoticeModel, createTrashUndo, daysText, fromText, failText, restoredText } from "../../web/core/trash.js";
 import { announced } from "../../web/adapters/dom/focus.js";
 import { virtualClock } from "../../web/adapters/clock/virtual.js";
 
@@ -258,4 +258,17 @@ test("createTrashUndo with no undo offers nothing and runs nothing", async () =>
   const u = createTrashUndo({ api: { restore: async () => { throw new Error("no"); } }, kind: "board", id: "b-1", name: "x", undo: null });
   expect(u.available).toBe(false);
   expect(await u.run()).toEqual({ ok: false, text: "" });
+});
+
+test("#54 wording: a restore into the personal space says where it went (toast and Trash page), the escalation refusal explains itself", async () => {
+  const to = { id: "s-9", name: "ada's space", personal: true };
+  expect(restoredText("Roadmap", to)).toBe("Restored Roadmap to your personal space.");
+  expect(restoredText("Roadmap")).toBe("Restored Roadmap.");
+  const api = { restore: async () => ({ result: { board: { id: "b-1", title: "Roadmap", space: { id: "s-9", name: "x" } }, restored: true, movedTo: to } }) };
+  expect(await createTrashUndo({ api, kind: "board", id: "b-1", name: "Roadmap", undo: { restore: true } }).run()).toEqual({ ok: true, text: "Restored Roadmap to your personal space." });
+  expect(failText("would-escalate")).toContain("higher role");
+  const notice = createNoticeModel({ api: { notice: async () => ({ notice: { board: { id: "b-1", title: "Roadmap" }, daysLeft: 3, canRestore: true, into: to } }), restore: api.restore }, board: "b-1" });
+  await notice.load();
+  await notice.restore();
+  expect(notice.state.message).toBe("Restored Roadmap to your personal space.");
 });

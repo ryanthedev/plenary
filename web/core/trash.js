@@ -11,6 +11,7 @@ export const EMPTY = Object.freeze({ title: "Trash is empty.", detail: "Deleted 
 const MSG = {
   forbidden: "You can't restore this.", notfound: "This is not available to you.", invalid: "The server did not accept that.",
   moved: "This board was moved by someone else. Reload and try again.",
+  "would-escalate": "This board can't be restored into your personal space, because it would give you a higher role than you hold. Ask an owner to restore it.",
   "with-space": "This board went to Trash with its Space. Restore the Space to bring it back.",
   "space-in-trash": "This board's Space is in Trash. Restore the Space first.",
   purged: "This has been deleted for good and can't be restored.",
@@ -25,7 +26,7 @@ export const daysText = n => (n > 0 ? `${plural(n, "day")} left` : "Due to be de
 /** The toast's sentence and the live region's. */
 export const trashedText = title => `Moved ${title || "Untitled"} to Trash.`;
 export const trashedSpaceText = (name, boards) => `Moved ${name} to Trash${boards ? ` with ${plural(boards, "board")}` : ""}.`;
-export const restoredText = name => `Restored ${name || "Untitled"}.`;
+export const restoredText = (name, to = null) => `Restored ${name || "Untitled"}${to ? ` to ${to.personal ? "your personal space" : to.name}` : ""}.`;
 
 /** Where a board was, as one line: "Product / Design", "Design", "Personal space" or a note that the place is not one the person can open. */
 export function fromText(from) {
@@ -54,7 +55,7 @@ export function createTrashUndo({ api, kind, id, name, undo, newKey = null }) {
       const r = kind === "board" ? await api.restore(id, key) : await api.restoreSpace(id, key);
       busy = false;
       if (r.error) return { ok: false, text: failText(r.error) };
-      return { ok: true, text: restoredText(name) };
+      return { ok: true, text: restoredText(name, r.result?.movedTo ?? null) };
     },
   };
 }
@@ -89,7 +90,7 @@ export function createTrashModel({ api, newKey = null }) {
       const at = S.items.indexOf(item);
       S.items = S.items.filter(i => i !== item);
       S.next = S.items[Math.min(at, S.items.length - 1)] ?? null;
-      S.said = restoredText(item.type === "board" ? item.title : item.name); emit();
+      S.said = restoredText(item.type === "board" ? item.title : item.name, r.result?.movedTo ?? null); emit();
       return true;
     },
   };
@@ -124,7 +125,7 @@ export function createNoticeModel({ api, board, newKey = null }) {
       const r = viaSpace && !n.canRestore ? await api.restoreSpace(n.via.space.id, key) : await api.restore(board, key);
       S.busy = false;
       if (r.error) { S.message = failText(r.error); emit(); return false; }
-      key = null; S.status = "restored"; S.message = restoredText(n.board.title); emit();
+      key = null; S.status = "restored"; S.message = restoredText(n.board.title, r.result?.movedTo ?? n.into ?? null); emit();
       return true;
     },
   };

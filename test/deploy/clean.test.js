@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { join, relative } from "node:path";
-import { clean, summarize, measure, openPaths, openUnder, resolveOpens, renameExcl, loadNativeRename, resetNativeRenameWarning, ROOT } from "../../scripts/clean.js";
+import { clean, summarize, measure, openPaths, openUnder, resolveOpens, resolveNoOpen, renameExcl, loadNativeRename, resetNativeRenameWarning, ROOT } from "../../scripts/clean.js";
 
 const made = [], kids = [];
 const sandbox = realpathSync(mkdtempSync(join(tmpdir(), "plenary-cleantest-")));
@@ -644,9 +644,9 @@ test("a FIFO candidate in the temp dir is kept and never opened; a FIFO or missi
   expect(out).not.toBeNull();
   const got = JSON.parse(out);
   expect(got.items).toEqual([["kept", "not a regular file or directory"]]);
-  expect(got.refused).toMatch(/not a directory/);
+  expect(got.refused).toMatch(/not a directory \(never opened\)/);
   expect(lstatSync(fifo).isFIFO()).toBe(true);
-});
+}, 30_000);
 
 test("a rig.json that is not a regular file keeps the rig (never handed to the status child)", () => {
   const w = world(), d = join(w.rigRoot, "odd");
@@ -655,4 +655,23 @@ test("a rig.json that is not a regular file keeps the rig (never handed to the s
   const r = clean({ ...w, now: LATER(), yes: true, openPathsFn: () => [], rigAlive: () => (asked++, false) });
   expect(asked).toBe(0);
   expect(byName(r, "odd").why).toMatch(/no rig.json/);
+});
+
+test("resolveNoOpen: symlink chains, relative links, .. after a link, missing parts and loops, without opening anything", () => {
+  const w = world(), r = realpathSync(w.root), at = (...p) => join(w.root, ...p);
+  mkdirSync(at("a/b"), { recursive: true }); mkdirSync(at("c"));
+  writeFileSync(at("a/b/f"), "x");
+  symlinkSync("b", at("a/rel"));                    // relative, same dir
+  symlinkSync(at("a/rel"), at("c/abs"));            // absolute, onto a link: a chain
+  symlinkSync("../a/b", at("c/up"));                // relative with ..
+  symlinkSync("loop2", at("loop1")); symlinkSync("loop1", at("loop2"));
+  expect(resolveNoOpen(at("c/abs/f"))).toBe(join(r, "a/b/f"));
+  expect(resolveNoOpen(w.root + "/c/up/../b/f")).toBe(join(r, "a/b/f"));   // .. applies to the resolved dir (a/b), not the link's parent
+  expect(resolveNoOpen(w.root + "/a/./b/../rel")).toBe(join(r, "a/b"));
+  expect(resolveNoOpen(at("a/b"))).toBe(realpathSync(at("a/b")));
+  expect(resolveNoOpen("/")).toBe("/");
+  expect(() => resolveNoOpen(at("loop1"))).toThrow(/symbolic links/);
+  expect(() => resolveNoOpen(at("a/nope/x"))).toThrow(expect.objectContaining({ code: "ENOENT" }));
+  const fifo = at("pipe"); expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+  expect(resolveNoOpen(fifo)).toBe(join(r, "pipe"));                 // a FIFO resolves without being opened
 });

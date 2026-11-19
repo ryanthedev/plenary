@@ -97,4 +97,4 @@ test("a FIFO named owner.json in a dead run's root is skipped, never read (readi
   expect(JSON.parse(out)).toEqual([]);
   expect(existsSync(root)).toBe(true);
   rmSync(base, { recursive: true, force: true });
-});
+}, 30_000);

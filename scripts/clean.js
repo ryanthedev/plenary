@@ -8,8 +8,8 @@
 //   2. stopped rigs: <repo>/.rig/<name> dirs whose processes are all gone, as `cluster-rig.js status` decides it (it
 //      applies the rig's psInfo rule: a ps that fails reads as "alive", so the rig stays). A live rig is never touched.
 //   3. --scratch <dir>: its direct children, same age and in-use rules as 1 (agents' scratch copies).
-// Accepted limits: a path is lstat'd and then resolved, so something swapped for a device in between could still be opened
-// (a race only a process of this user can win); and a hung network or autofs path in lsof output can still block the lstat itself.
+// Paths are resolved by resolveNoOpen (lstat + readlink, never open), so no race can make this open a device. Accepted limit: a
+// hung network or autofs path in lsof output can still block the lstat itself.
 // Never opens anything that is not a plain file or directory (a FIFO, socket or device is kept, never resolved: opening a
 // pty slave or a named pipe can block forever), never follows a symlink (a symlinked entry is skipped; links inside an entry are unlinked, not entered), never touches
 // anything outside the temp dir, this repo's .rig and the given scratch dir, and refuses a base that is / or $HOME.
@@ -22,9 +22,9 @@
 
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { lstatSync, statSync, readdirSync, readFileSync, realpathSync, rmSync, existsSync, renameSync } from "node:fs";
+import { lstatSync, statSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, existsSync, renameSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { dlopen, FFIType, read } from "bun:ffi";
 
 export const ROOT = realpathSync(resolve(fileURLToPath(new URL("..", import.meta.url))));
@@ -93,12 +93,34 @@ export function openUnder(path, lsof = "lsof", timeout = 60_000) {
 }
 
 /**
+ * realpath that never opens anything: walks the components with lstat and readlink only (as Node's JS realpath does), so a
+ * device, FIFO or socket met on the way is never opened and there is no lstat-then-open race. Throws the lstat error
+ * (ENOENT, ENOTDIR) for a missing component, and ELOOP past 40 links.
+ */
+export function resolveNoOpen(p, stat = lstatSync, readlink = readlinkSync) {
+  let cur = sep, links = 0;
+  const todo = (p.startsWith(sep) ? p : process.cwd() + sep + p).split(sep).filter(Boolean).reverse();
+  while (todo.length) {
+    const c = todo.pop();
+    if (c === ".") continue;
+    if (c === "..") { cur = dirname(cur); continue; }
+    const next = join(cur, c);
+    if (!stat(next).isSymbolicLink()) { cur = next; continue; }
+    if (++links > 40) throw Object.assign(new Error(`too many symbolic links: ${p}`), { code: "ELOOP" });
+    const target = readlink(next);
+    if (target.startsWith(sep)) cur = sep;
+    todo.push(...target.split(sep).filter(Boolean).reverse());
+  }
+  return cur;
+}
+
+/**
  * The paths a lsof answer is matched against: each as lsof printed it, plus its resolved form for a regular file or a
  * directory only. lsof also lists devices (a pty slave under /dev), named pipes and sockets, and resolving one of those
  * means opening it, which can block for good (a pty slave with no peer hangs open(2) in the kernel, uninterruptibly),
  * so a path is lstat'd first and anything that is not a plain file or directory is never resolved or opened.
  */
-export function resolveOpens(paths, stat = lstatSync, realpath = realpathSync) {
+export function resolveOpens(paths, stat = lstatSync, realpath = resolveNoOpen) {
   const out = new Set();
   for (const p of paths) {
     out.add(p);
@@ -191,8 +213,8 @@ function ownerPid(dir, name) {
 const underAny = (opens, p) => opens.some(o => o === p || o.startsWith(p + sep));
 const refuseBase = (p, what) => {
   if (!statSync(p).isDirectory()) throw new Error(`refusing to clean ${what} ${p}: not a directory (never opened)`);   // stat does not open; realpath does
-  const real = realpathSync(p);
-  const home = realpathSync(homedir());
+  const real = resolveNoOpen(p);
+  const home = resolveNoOpen(homedir());
   if (real === sep || real === home || home.startsWith(real + sep) || ROOT === real || ROOT.startsWith(real + sep))
     throw new Error(`refusing to clean ${what} ${p}: it resolves to ${real} (/, $HOME, the repo or one of their parents)`);
   return real;
@@ -254,7 +276,7 @@ export function clean({ tempDir = defaultTemp(), rigRoot = join(ROOT, ".rig"), s
       if (extra?.check) { const why = extra.check(path, name); if (why) { item.why = why; return; } }
       if (extra?.skipOpen !== true) {
         if (opensError) { item.why = `in-use check failed: ${opensError}`; return; }
-        if (underAny(opens, realpathSync(path)) || underAny(opens, path)) { item.why = "in use"; return; }
+        if (underAny(opens, resolveNoOpen(path)) || underAny(opens, path)) { item.why = "in use"; return; }
       }
       if (!yes) { item.status = "would-remove"; return; }
       const scanned = measure(path, stat, undefined, deadlineCheck);

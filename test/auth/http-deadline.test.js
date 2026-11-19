@@ -101,6 +101,17 @@ const ROUTES = {
   "PUT /home/stars/:board": { path: `/home/stars/${B}` },
   "DELETE /home/stars/:board": { path: `/home/stars/${B}` },
   "GET /links/:id": { path: "/links/abc" },
+  "GET /teams": { path: "/teams" },
+  "POST /teams": { path: "/teams", body: { name: "T" } },
+  "GET /teams/:id": { path: "/teams/t1" },
+  "PATCH /teams/:id": { path: "/teams/t1", body: { name: "T2" } },
+  "DELETE /teams/:id": { path: "/teams/t1" },
+  "PUT /teams/:id/members/:user": { path: "/teams/t1/members/dev:bo" },
+  "DELETE /teams/:id/members/:user": { path: "/teams/t1/members/dev:bo" },
+  "GET /directory": { path: "/directory?q=a" },
+  "GET /access/:type/:id": { path: "/access/space/sp1" },
+  "PUT /access/:type/:id/grants/:subjectType/:subject": { path: "/access/space/sp1/grants/user/dev:bo", body: { role: "viewer" } },
+  "DELETE /access/:type/:id/grants/:subjectType/:subject": { path: "/access/space/sp1/grants/user/dev:bo" },
 };
 const request = (key) => {
   const [method, ...rest] = key.split(" ");

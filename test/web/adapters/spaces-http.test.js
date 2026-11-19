@@ -66,3 +66,12 @@ test("bad ids make no request; ids and strings are checked and capped", async ()
   expect(normalizeGroupPage({ ...GROUP, next: "bad id" }).next).toBe(null);
   expect(normalizeGroupPage({ ...GROUP, spaces: [{ id: "x y", name: "n" }, GROUP.spaces[0]] }).spaces).toEqual(GROUP.spaces);
 });
+
+test("a create sends its Idempotency-Key header when given one, and none otherwise; 422 is refused input, 409 in-progress is unavailable", async () => {
+  const s = seen(), a = api(s.fetch);
+  await a.createBoard({ title: "T", key: "key-0001-abcd" }); await a.createSpace({ name: "S", key: "key-0002-abcd" }); await a.createGroup({ name: "G", key: "key-0003-abcd" });
+  await a.createBoard({ title: "T" });
+  expect(s.calls.map(c => c[1].headers["idempotency-key"])).toEqual(["key-0001-abcd", "key-0002-abcd", "key-0003-abcd", undefined]);
+  expect(await api(answer(422, { error: "idempotency-key-reused" })).createBoard({ title: "T", key: "key-0001-abcd" })).toEqual({ error: "invalid" });
+  expect(await api(answer(409, { error: "in-progress" })).createBoard({ title: "T", key: "key-0001-abcd" })).toEqual({ error: "unavailable" });
+});

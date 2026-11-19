@@ -2,7 +2,7 @@
 // last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
 import { normEmail } from "./util.js";
-import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, smallLimit, searchQuery, asciiFold } from "./registry-port.js";
+import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, smallLimit, searchQuery, asciiFold } from "./registry-port.js";
 
 /**
  * @typedef {import("./registry-port.js").Registry} Registry
@@ -37,6 +37,9 @@ export function memoryRegistry({ now = Date.now } = {}) {
   /** @type {Map<string, Map<string, CustomRole>>} tenant → id → role */ const roles = new Map();
   /** @type {Map<string, Map<string, number>>} user → board → opened at (Recent) */ const recent = new Map();
   /** @type {Map<string, Map<string, number>>} user → board → starred at */ const stars = new Map();
+  /** @type {Map<string, { fp: string, result: string|null, at: number }>} user + "\n" + key → claim or answer (Idempotent creates) */ const idem = new Map();
+  let idemCalls = 0;
+  const idemLive = (e, t) => e && t - e.at < (e.result === null ? IDEM.claimMs : IDEM.ttlMs);
   const newest = m => [...(m ?? [])].map(([board, at]) => ({ board, at })).sort((a, b) => b.at - a.at || (a.board < b.board ? 1 : -1));
   const copy = x => (x ? structuredClone(x) : null);
   const fresh = (map, f) => { let id; do id = f(); while (map.has(id)); return id; };
@@ -282,6 +285,19 @@ export function memoryRegistry({ now = Date.now } = {}) {
       for (const sc of batchScopes(scopes)) out.set(sc.type + "\n" + sc.id, await this.accessContext(sc, { users }));
       return out;
     },
+
+    // ---- Idempotent creates (PROTOCOL.md) ----
+    async idemClaim(user, key, fp) {
+      if (typeof user !== "string" || typeof key !== "string" || typeof fp !== "string") throw new Error("registry: bad idempotency key");
+      const k = user + "\n" + key, t = now(), e = idem.get(k);
+      if (++idemCalls % IDEM.every === 0) { let n = 0; for (const [x, v] of idem) if (!idemLive(v, t) && n++ < IDEM.prune) idem.delete(x); }
+      if (idemLive(e, t)) return e.fp !== fp ? { state: "mismatch" } : e.result === null ? { state: "in-progress" } : { state: "done", result: e.result };
+      idem.set(k, { fp, result: null, at: t });
+      return { state: "new" };
+    },
+    async idemFinish(user, key, fp, result) { const e = idem.get(user + "\n" + key); if (e && e.fp === fp) { e.result = String(result); e.at = now(); } },
+    async idemRelease(user, key, fp) { const k = user + "\n" + key, e = idem.get(k); if (e && e.fp === fp && e.result === null) idem.delete(k); },
+    /** The stored rows (tests). */ idemSize: () => idem.size,
 
     // ---- Home (PROTOCOL.md § Home) ----
     async markOpened(user, board) {

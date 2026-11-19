@@ -85,7 +85,7 @@ import { sqliteRegistry } from "./registry/sqlite.js";
 import { tenancy as makeTenancy, roleCache } from "./auth/tenancy.js";
 import { sessions as makeSessions } from "./auth/session.js";
 import { googleOidc } from "./auth/oidc.js";
-import { httpRoutes } from "./auth/http.js";
+import { httpRoutes, REQUEST_DEADLINE_MS } from "./auth/http.js";
 import { homeService, recentRecorder } from "./auth/home.js";
 import { spaceService } from "./auth/spaces.js";
 import { bootstrapTenant } from "./admin/tenants.js";
@@ -138,7 +138,24 @@ export function nodeConfig(env, host = osHostname()) {
     try { checkLeaseTtl(leaseTtlMs); }
     catch (err) { throw new Error(`PLENARY_LEASE_TTL_MS: ${err instanceof RangeError ? err.message.replace("leaseTtlMs", "the lease ttl") : "invalid"}`); }
   }
-  return { cluster, node, roles, leaseTtlMs };
+  // The HTTP request deadline (PROTOCOL.md "HTTP request deadline") and the inner single-call limits it must stay above.
+  let requestDeadlineMs = REQUEST_DEADLINE_MS;
+  if (env.PLENARY_REQUEST_DEADLINE_MS !== undefined) {
+    const raw = String(env.PLENARY_REQUEST_DEADLINE_MS).trim();
+    requestDeadlineMs = /^\d{1,10}$/.test(raw) ? Number(raw) : NaN;
+    if (!(requestDeadlineMs >= 1 && requestDeadlineMs <= 2 ** 31 - 1)) throw new Error("PLENARY_REQUEST_DEADLINE_MS must be a whole number of milliseconds, at least 1");
+  }
+  checkInnerLimits(requestDeadlineMs, { ...(cluster ? { "the Postgres Registry's statement and lock limits": REGISTRY_LIMIT_MS } : {}),
+    ...(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET ? { "Google's request timeout": OIDC_TIMEOUT_MS } : {}) });
+  return { cluster, node, roles, leaseTtlMs, requestDeadlineMs };
+}
+
+/** The limits main.js gives the adapters a request waits on; each must stay under the request deadline or its 503 would come before the call gives up. */
+export const REGISTRY_LIMIT_MS = 5000, OIDC_TIMEOUT_MS = 3500;
+/** Refuses to start when any inner single-call limit is not below the deadline. @param {number} deadlineMs @param {Record<string, number>} limits */
+export function checkInnerLimits(deadlineMs, limits) {
+  for (const [what, ms] of Object.entries(limits))
+    if (!(ms < deadlineMs)) throw new Error(`PLENARY_REQUEST_DEADLINE_MS (${deadlineMs} ms) must be above ${what} (${ms} ms): a request would be answered 503 while its call still runs`);
 }
 
 /**
@@ -295,7 +312,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   // Every line this node logs, from any component, has the URLs' secrets redacted (p4-wire2 L2).
   const log = redactingLogger(createLogger({ level: env.LOG_LEVEL || "info", ...(write ? { write } : {}) }), [env.DATABASE_URL, env.NATS_URL]);
   // Every refusal of the cluster env comes before anything is created, connected or listening.
-  const { cluster, node, roles, leaseTtlMs } = nodeConfig(env, hostname ?? osHostname());
+  const { cluster, node, roles, leaseTtlMs, requestDeadlineMs } = nodeConfig(env, hostname ?? osHostname());
   const dataDir = env.PLENARY_DATA_DIR || "./data";
   mkdirSync(dataDir, { recursive: true });
 
@@ -344,7 +361,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   const auth = authPort({ sessions, dev, tenancy: roleCache({ registry, now: Date.now, adminBoardContent }) });
   // Google sign-in only when both halves of the OAuth client are there; otherwise /auth answers 503.
   const oidc = env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET
-    ? googleOidc({ clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET, redirectUri, fetch: fetchFn })
+    ? googleOidc({ clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET, redirectUri, fetch: fetchFn, timeoutMs: OIDC_TIMEOUT_MS })
     : null;
   log.info("sign-in", { google: !!oidc, devTokens: dev.enabled, cluster });
   if (!!env.GOOGLE_CLIENT_ID !== !!env.GOOGLE_CLIENT_SECRET)
@@ -440,6 +457,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
     postLoginUrl: env.POST_LOGIN_URL || `${origin}/`,
     boardUrl: env.BOARD_URL || `${origin}/?board={board}`,
     publicUrl: origin,
+    requestDeadlineMs,
   };
   if (devMenu) config.devSignIn = devMenu;
   const home = homeService({ registry, tenancy });
@@ -492,7 +510,7 @@ async function openCluster(env, node, log, adapters = {}) {
     }
   };
   const store = await open("Postgres store", "DATABASE_URL", () => make.postgresStore({ url: env.DATABASE_URL, onSkip: skipped => log.error("checkpoint unreadable: parts missing; stepped back", skipped) }));
-  const rawRegistry = await open("Postgres registry", "DATABASE_URL", () => make.postgresRegistry({ url: env.DATABASE_URL }));
+  const rawRegistry = await open("Postgres registry", "DATABASE_URL", () => make.postgresRegistry({ url: env.DATABASE_URL, statementTimeoutMs: REGISTRY_LIMIT_MS, lockTimeoutMs: REGISTRY_LIMIT_MS }));
   // The cluster id lives in the Store: two nodes on one database are one cluster. It enters the Bus through the
   // adapter's `cluster` option, so every subject on the wire carries it and a foreign cluster on the same NATS can't
   // answer a remote open, take a lease or ack an op (PROTOCOL.md § Bus, Cluster id). A missing or malformed id

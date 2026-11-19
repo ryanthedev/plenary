@@ -1045,21 +1045,49 @@ per page). `GET /groups/:id`: one `effective`, one `spacesIn` page. Nothing loop
 
 ## HTTP request deadline (#73, TECH-DEBT row 16)
 
-Every route `httpRoutes` (server/auth/http.js) serves answers within a **request deadline**, default **8000 ms** (`config.requestDeadlineMs`, a positive
-integer), or answers `503 {error:"unavailable"}` (the same body and code as any Registry or verifier outage). One wrapper in the dispatcher covers the whole
-route table, the body read, the bearer check and the handler, so a route added later is covered with no per-route code. The deadline sits under every
-proxy and idle cut in front of the server (Bun's default is 10 s without a byte, and Postgres statement/lock limits reach 15 s); the client sees a status,
-never a dropped connection. `GET /auth/dev` keeps its own tighter 3 s wait on the Registry. Blob PUT/GET (`blob-http.js`) has its own body deadline and is
-not under this one.
+Every route `httpRoutes` (server/auth/http.js) serves answers within a **request deadline**, default **8000 ms** (`config.requestDeadlineMs`; main.js reads
+`PLENARY_REQUEST_DEADLINE_MS`), or answers `503 {error:"unavailable"}` (the same body and code as any Registry or verifier outage). One wrapper in the
+dispatcher covers the whole route table, the body read, the bearer check and the handler, so a route added later is covered with no per-route code
+(`test/auth/http-deadline.test.js` enumerates the table and fails on a route it does not know). The deadline sits under the idle cut in front of the server
+(Bun's own default is 10 s without a byte; `server.js` sets 30 s, `idleTimeoutSec`) and under any proxy's, so the client sees a status, never a dropped
+connection. `GET /auth/dev` keeps its own tighter 3 s wait. Blob PUT/GET (`blob-http.js`) has its own body deadline and is not under this one.
 
-**What a 503 means on a write.** The work is not cancelled (the Registry port has no cancel; a statement already sent to the database runs to its
-own limit). So a 503 from a write route (`POST /boards`, `/spaces`, `/groups`, `PATCH` of a board, Space or Group, invites, links, `PUT` grants, `DELETE`
-invite/link, stars) says **"may or may not have applied; retry is safe"**. The retry is safe because each write is idempotent or detectable: grants,
-stars, revokes, renames and `updateScope` set a value (repeating them changes nothing); a retried `POST` of a create may leave the first, committed
-object behind next to the second (a duplicate board, Space, Group, invite or link, never a lost or corrupt one), which the caller lists and deletes or
-ignores. After the 503 is sent the late result is **discarded**: the response is built once, the late handler's return value or rejection is dropped (handled,
-never an unhandled rejection), and nothing it finishes is sent to the client. A multi-step create (`POST /boards` = create, then the owner grant) that
-the deadline cuts between its steps ends as its own `owner-grant-failed` case does today.
+**Inner limits stay under the deadline.** A call that runs past the deadline still works on after the 503, so every single-call limit below it is kept
+shorter: main.js starts the Postgres Registry with `statementTimeoutMs` and `lockTimeoutMs` of **5000** and Google's `timeoutMs` of **3500**, and **refuses to
+start** (a loud error naming the setting) when one of them is not below the deadline. Several calls in a row (create then owner grant) can still add up
+past it; that case is the next paragraph's.
+
+**What a 503 means on a write.** The work is not cancelled (the Registry port has no cancel; a statement already sent to the database runs to its own
+limit). So a 503 from a write route says **"may or may not have applied"**, and after the 503 is sent the late result is **discarded**: the response is
+built once, and the late handler's return value or rejection is dropped (handled, never an unhandled rejection) and counted (`stats().late`) and logged
+(at most one line per 10 s, with the route and whether it applied or failed).
+- **Safe to retry as is:** grants, stars, revokes, renames and `updateScope` set a value; repeating them changes nothing.
+- **Retry with the same `Idempotency-Key`:** a create (`POST /boards`, `/spaces`, `/groups`, `/boards/:board/invites`, `/boards/:board/links`) makes a new
+  object on every call, so without the key a retry can leave the first, committed object next to the second (and no route deletes a board, Space or
+  Group). Send the header and a retry returns the first call's answer. See the next section.
+
+## Idempotent creates (`Idempotency-Key`, #73)
+
+`POST /boards`, `POST /spaces`, `POST /groups`, `POST /boards/:board/invites` and `POST /boards/:board/links` accept an `Idempotency-Key` header: 8-64 of
+`[A-Za-z0-9_-]` (anything else is 400 `bad-idempotency-key`); a client makes one per submit (a random UUID is fine) and **reuses it for every retry of that
+submit**. Without the header a create behaves as before.
+
+| Same key, per signed-in user | Answer |
+|---|---|
+| first use | runs the create; the answer is stored under the key |
+| again, after the first finished | **the first answer, replayed**: same status and body (a 201 with the object, or a stored `503 owner-grant-failed` with the board id), plus the header `Idempotent-Replayed: true`. Nothing is created |
+| again, while the first is still running (a call cut by the deadline keeps running) | `409 {error:"in-progress"}` with `Retry-After: 1`; the client retries until it gets the stored answer |
+| again, with a different route, path parameter or body | `422 {error:"idempotency-key-reused"}`; nothing runs |
+
+- **The deadline does not lose the answer.** The create keeps running after the 503, and its outcome is stored when it finishes, so a later retry gets the
+  real result: the board id, or `owner-grant-failed` with the id of the board that has no owner yet (a Unit admin repairs it, § Registry).
+- **Not stored:** a refusal made before anything was written (400, 403, 404 from the use case) or a failure with no outcome: the claim is dropped and the
+  retry runs again.
+- **Scope and retention.** A key belongs to its user (ids are globally unique, so the Unit adds nothing). A finished answer is kept **24 h**; a claim whose
+  create never reported (a crash) can be taken over after **60 s**. The store is bounded by age: expired rows are deleted in small batches as keys arrive.
+  The body is stored as a SHA-256 fingerprint plus the answer; the request body is not.
+- **Port** (§ Registry, `idemClaim`, `idemFinish`, `idemRelease`): the store is behind the Registry port; memory, SQLite (`reg_idempotency`) and Postgres
+  (`reg_idempotency`, one atomic upsert-claim) implement it, and `registry-contract.js` pins the three.
 
 ## Sign-in code exchange
 
@@ -1153,6 +1181,7 @@ method names are stable. Ids are server-minted over `[a-z0-9-]`.
 | grants | `setGrant(board, user, role \| null)`, `grant(board, user) → role \| null`, `grants(board)` |
 | invites | `createInvite({ board, email, role, expiresAt, by })`, `invite(id)`, `invites(board)`, `invitesFor(board, email)`, `revokeInvite(id)` |
 | share links | `createLink({ board, role, expiresAt, by })` (role per link), `link(id)`, `links(board)`, `revokeLink(id)`, `addLinkUse(link, user)`, `linkUses(board, user)` |
+| idempotency | `idemClaim(user, key, fp) → { state: "new" \| "done" \| "in-progress" \| "mismatch", result? }`, `idemFinish(user, key, fp, result)`, `idemRelease(user, key, fp)` (§ Idempotent creates) |
 | home | `markOpened(user, board)`, `recents(user, { limit })`, `setStarred(user, board, on)`, `starred(user, { limit })`, `starredAmong(user, boards)`, `sharedBoards(user, email, { limit })`, `searchBoards(tenant, { q, unfiled, after, scan })`, `spaceCandidates(tenant, { user, all, after, limit })`, `groupCandidates(tenant, { user, all, limit })`, `boardRows(boards, { user, email })` (§ Home) |
 | organization | `createGroup`, `group`, `groups`; `createSpace`, `space`, `spaces`, `ensurePersonalSpace(tenant, user)`; `createTeam`, `team`, `teams`, `setTeamMember`, `teamMembers`; `setScopedGrant({ scope, subject, role \| null })`, `scopedGrants(scope)`; `createRole`, `updateRole`, `role`, `roles`; `accessContext(scope, { users, chain })`; `boardsIn(scope, { after, limit })`, `scopesOf(subject, { after, limit })`; `accessContexts(scopes, { users })` (the batch of `accessContext`, one statement on Postgres), `rename({ type: "board"\|"space"\|"group", id }, name)`, `updateScope({ type: "space"\|"group", id }, { name?, generalRole? })` (atomic; returns the row), `spacesIn(group, { after, limit })` (§ Spaces and Groups) |
 

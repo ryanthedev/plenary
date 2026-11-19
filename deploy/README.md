@@ -35,6 +35,7 @@ These are the variables `server/main.js` reads; nothing else is read.
 | `HOST` | `0.0.0.0` | Listen address. main.js defaults to `127.0.0.1`, which a container cannot be reached on, so the image sets it. |
 | `PLENARY_DATA_DIR` | `/data` | `plenary.db` (SQLite) and `blobs/` go here. Compose mounts the `plenary-data` volume on it. |
 | `PLENARY_DEV_TOKENS` | unset | JSON: `{ "<token>": { "name": "ann", "role": "editor", "email"?, "domain"? } }`. Unset, empty or `{}` = off. Invalid JSON is logged and treated as off. |
+| `PLENARY_REQUEST_DEADLINE_MS` | `8000` | Every HTTP route answers within this many ms or with 503 `unavailable` (PROTOCOL.md "HTTP request deadline"). A positive integer. Start-up refuses when the Registry's statement/lock limits (5000 ms in a cluster) or Google's timeout (3500 ms) are not below it, so lower it only with those in mind. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Logs are structured, to stdout. |
 | `COOKIE_KEY` | unset | At least 32 bytes; signs sign-in cookies and sessions. Unset on a single node = a random key per start (every restart signs everyone out). **Required in cluster mode** (`DATABASE_URL` or `NATS_URL` set): the server refuses to start without it, and every node must have the same value. |
 | `SESSION_KEY` | unset | At least 32 bytes; signs sessions only, if you want it separate from `COOKIE_KEY` (default: `COOKIE_KEY`). Not set by either compose file. |
@@ -227,7 +228,7 @@ Every Registry call on Postgres answers or rejects within a bound, and a rejecti
 | `queueTimeoutMs` | 0.2 × the smaller limit + 50 ms | a call's wait for a connection; it is then refused and never sent | `queue-timeout` |
 | (fixed) | the larger limit + 1 s after sending | a sent call with no answer (dead peer); it may still have taken effect | `client-timeout` |
 
-**For a cluster, set `statementTimeoutMs` and `lockTimeoutMs` to 3–5 s**, above the gateway's 2 s re-check bound
+**For a cluster, set `statementTimeoutMs` and `lockTimeoutMs` to 3–5 s** (`server/main.js` passes 5000 ms to the Registry itself, so one call stays under the 8 s HTTP request deadline), above the gateway's 2 s re-check bound
 (`recheckLookupMs`). The main reason: `queueTimeoutMs` is then 0.65–1.05 s, below those 2 s, so a re-check lookup the
 gateway has already given up on is never sent. With the 15 s defaults `queueTimeoutMs` is 3050 ms, and an abandoned
 lookup can still take a connection. Each connection is also pinned for less time under a stuck lock. Measured:

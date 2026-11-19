@@ -44,13 +44,13 @@ const field = (label, hint, control) => h("label.l", {}, label, hint ? h("span.h
 const errorLine = () => h("p.sp-error", { role: "alert" });
 
 /**
- * @param {{ host: HTMLElement, api: import("../../ports/spaces.js").SpacesPort, hrefs: { board(id: string): string, space(id: string): string, group(id: string): string }, go(href: string): void }} o
+ * @param {{ host: HTMLElement, api: import("../../ports/spaces.js").SpacesPort, hrefs: { board(id: string): string, space(id: string): string, group(id: string): string }, go(href: string): void, newKey?: () => string }} o   `newKey`: the Idempotency-Key maker (default crypto.randomUUID)
  */
-export function createDialogs({ host, api, hrefs, go }) {
+export function createDialogs({ host, api, hrefs, go, newKey = () => globalThis.crypto.randomUUID() }) {
   return {
     /** New board: title + Location (only Spaces where the person can create, their personal space first). */
     newBoard({ opener = null, space = null } = {}) {
-      const model = createNewBoardModel({ api, space });
+      const model = createNewBoardModel({ api, space, newKey });
       const S = model.state;
       const title = h("input.field", { type: "text", maxlength: "200", autocomplete: "off", "aria-label": "Title", placeholder: "Untitled", oninput: e => model.setTitle(e.target.value) });
       const where = h("div.pick", { role: "radiogroup", "aria-label": "Location" }, h("p.muted", {}, "Loading…"));
@@ -83,7 +83,7 @@ export function createDialogs({ host, api, hrefs, go }) {
 
     /** New space: name, Group (where the person is an editor, or none), general access. */
     newSpace({ opener = null, group = null } = {}) {
-      const model = createNewSpaceModel({ api, group });
+      const model = createNewSpaceModel({ api, group, newKey });
       const S = model.state;
       const name = h("input.field", { type: "text", maxlength: "200", autocomplete: "off", "aria-label": "Name", oninput: e => model.setName(e.target.value) });
       const groupSel = h("select.field", { "aria-label": "Group", onchange: e => model.setGroup(e.target.value) });
@@ -119,7 +119,7 @@ export function createDialogs({ host, api, hrefs, go }) {
 
     /** New group (offered only to people who may create one): a name and who in the organization can open it. */
     newGroup({ opener = null } = {}) {
-      const model = createNewGroupModel({ api });
+      const model = createNewGroupModel({ api, newKey });
       const S = model.state;
       const name = h("input.field", { type: "text", maxlength: "200", autocomplete: "off", "aria-label": "Name", oninput: e => model.setName(e.target.value) });
       const sel = h("select.field", { "aria-label": "General access", onchange: e => model.setGeneral(e.target.value) },

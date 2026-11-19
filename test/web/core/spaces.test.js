@@ -1,6 +1,6 @@
 // web/core/spaces.js: the Space / Group page model and the New board / New space dialog models, on a fake Spaces port.
 import { test, expect } from "bun:test";
-import { createPageModel, createNewBoardModel, createNewSpaceModel, createNewGroupModel, spaceEmpty, groupEmpty, generalText, errorText, GENERAL_CHOICES } from "../../../web/core/spaces.js";
+import { createPageModel, createNewBoardModel, createNewSpaceModel, createNewGroupModel, spaceEmpty, groupEmpty, generalText, errorText, createErrorText, GENERAL_CHOICES } from "../../../web/core/spaces.js";
 
 const page = (o = {}) => ({ space: { id: "s-1", name: "Design", personal: false, general: "viewer", group: null }, can: { createBoard: true, rename: true, general: true },
   boards: [{ id: "b-1", title: "Roadmap", role: "editor", path: [], starred: false, can: { rename: true } }], more: false, ...o });
@@ -76,14 +76,14 @@ test("setGeneral and renameBoard update the page; a Group page renames its Group
 test("New board: personal space is the default; a preset Space is chosen when listed; submit sends no space for the personal one", async () => {
   const spaces = [{ id: "s-me", name: "ada's space", personal: true, general: null, group: null }, { id: "s-d", name: "Design", personal: false, general: "viewer", group: { id: "g", name: "Product" } }];
   const { api, calls } = mk({ boardSpaces: () => ({ spaces, more: false }), createBoard: () => ({ board: { id: "b-new" } }) });
-  const m = createNewBoardModel({ api, space: "s-d" }); await m.load();
+  const m = createNewBoardModel({ api, space: "s-d", newKey: () => "k-board-001" }); await m.load();
   expect(m.state.space).toBe("s-d");
   expect(m.hint()).toMatch(/inherit|gets the Space's access/i);
   m.choose("s-nope"); expect(m.state.space).toBe("s-d");
   m.choose("s-me"); expect(m.hint()).toBe("Only you will see it until you share it.");
   m.setTitle("  Offsite ideas ");
   expect(await m.submit()).toBe(true);
-  expect(calls.at(-1)).toEqual(["createBoard", { title: "Offsite ideas" }]);
+  expect(calls.at(-1)).toEqual(["createBoard", { title: "Offsite ideas", key: "k-board-001" }]);
   expect(m.state.created).toEqual({ id: "b-new" });
   const n = createNewBoardModel({ api, space: "s-gone" }); await n.load();
   expect(n.state.space).toBe("s-me");                      // an unlisted preset falls back to the personal space
@@ -138,4 +138,42 @@ test("New space: Group choices, root vs Group-only people, general access, name 
   expect(await only.submit()).toBe(false); expect(only.state.error).toMatch(/Pick a Group/);
   const none = createNewSpaceModel({ api: mk({ spaceGroups: () => ({ root: false, groups: [], more: false }) }).api }); await none.load();
   expect(none.canCreate()).toBe(false);
+});
+
+test("a create keeps ONE Idempotency-Key across retries of a submit, and takes a new one after a success or a changed input (all three dialogs)", async () => {
+  let n = 0; const newKey = () => `key-${++n}-0000`;
+  const sent = [];
+  const { api } = mk({ boardSpaces: () => ({ spaces: [{ id: "s-me", name: "me", personal: true, general: null, group: null }], more: false }),
+    spaceGroups: () => ({ root: true, groups: [], more: false }),
+    createBoard: o => { sent.push(o.key); return sent.length < 3 ? { error: "unavailable" } : { board: { id: "b1" } }; },
+    createSpace: o => { sent.push(o.key); return sent.length < 7 ? { error: "network" } : { space: { id: "s1", name: "S" } }; },
+    createGroup: o => { sent.push(o.key); return sent.length < 10 ? { error: "unavailable" } : { group: { id: "g1", name: "G" } }; } });
+  const b = createNewBoardModel({ api, newKey }); await b.load();
+  await b.submit(); await b.submit();                    // the same submit, retried
+  expect(sent).toEqual(["key-1-0000", "key-1-0000"]);
+  b.setTitle("changed"); await b.submit();               // a changed input is a new request
+  expect(sent.at(-1)).toBe("key-2-0000");
+  expect(b.state.created).toEqual({ id: "b1" });
+  const s = createNewSpaceModel({ api, newKey }); await s.load(); s.setName("S");
+  await s.submit(); await s.submit(); s.setGeneral("editor"); await s.submit();
+  expect(sent.slice(3, 6)).toEqual(["key-3-0000", "key-3-0000", "key-4-0000"]);
+  await s.submit();
+  expect(s.state.created).toEqual({ id: "s1", name: "S" });
+  const g = createNewGroupModel({ api, newKey }); g.setName("G");
+  await g.submit(); await g.submit(); await g.submit();
+  expect(new Set(sent.slice(7)).size).toBeLessThanOrEqual(2);
+  // a success ends the key: the next submit is a new one
+  const before = sent.length; g.setName("H"); await g.submit();
+  expect(sent[before]).not.toBe(sent[before - 1]);
+});
+
+test("a create with no key maker sends no key; an unclear failure of a create says it may have been created and that trying again is safe", async () => {
+  const { api, calls } = mk({ boardSpaces: () => ({ spaces: [{ id: "s-me", name: "me", personal: true, general: null, group: null }], more: false }), createBoard: () => ({ error: "unavailable" }) });
+  const m = createNewBoardModel({ api }); await m.load(); await m.submit();
+  expect(calls.at(-1)).toEqual(["createBoard", { title: "" }]);
+  expect(m.state.error).toMatch(/may have been created/i);
+  expect(m.state.error).toMatch(/trying again is safe/i);
+  expect(createErrorText("network")).toMatch(/may have been created/i);
+  expect(createErrorText("forbidden")).toBe(errorText("forbidden"));   // a clear refusal keeps its own text
+  expect(errorText("unavailable")).not.toMatch(/may have been created/i);   // reads and renames are not creates
 });

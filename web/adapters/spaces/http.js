@@ -38,17 +38,17 @@ export function httpSpaces({ fetch, token, base = "", timeoutMs = 10_000, timers
   if (typeof fetch !== "function") throw new TypeError("httpSpaces: fetch is required");
   const set = timers ? timers.set : (fn, ms) => setTimeout(fn, ms);
   const clear = timers ? timers.clear : h => clearTimeout(h);
-  const STATUS = { 400: "invalid", 401: "auth", 403: "forbidden", 404: "notfound" };
+  const STATUS = { 400: "invalid", 401: "auth", 403: "forbidden", 404: "notfound", 422: "invalid" };   // 409 in-progress and any 5xx: "unavailable"
 
   /** One request: `{ body }` (a parsed 200/201 body), or `{ error }`. Never throws. */
-  async function ask(path, method = "GET", json) {
+  async function ask(path, method = "GET", json, key = null) {
     const ctl = typeof AbortController === "function" ? new AbortController() : null;
     let timer = null;
     const timeout = new Promise(resolve => { timer = set(() => { try { ctl?.abort(); } catch {} resolve({ error: "unavailable" }); }, timeoutMs); });
     const run = (async () => {
       let res;
       try {
-        res = await fetch(base + path, { method, headers: { authorization: `Bearer ${token}`, ...(json !== undefined ? { "content-type": "application/json" } : {}) },
+        res = await fetch(base + path, { method, headers: { authorization: `Bearer ${token}`, ...(json !== undefined ? { "content-type": "application/json" } : {}), ...(typeof key === "string" && key ? { "idempotency-key": key } : {}) },
           ...(json !== undefined ? { body: JSON.stringify(json) } : {}), credentials: "omit", cache: "no-store", redirect: "error", signal: ctl?.signal });
       } catch { return { error: "network" }; }
       if (STATUS[res?.status]) return { error: STATUS[res.status] };
@@ -94,19 +94,19 @@ export function httpSpaces({ fetch, token, base = "", timeoutMs = 10_000, timers
       if (r.error) return r;
       return Array.isArray(r.body?.groups) ? { root: r.body.root === true, groups: list(r.body.groups, 50, grp), more: r.body.more === true } : bad();
     },
-    async createBoard({ title, space = null }) {
-      const r = await ask("/boards", "POST", { title, ...(space ? { space } : {}) });
+    async createBoard({ title, space = null, key }) {
+      const r = await ask("/boards", "POST", { title, ...(space ? { space } : {}) }, key);
       if (r.error) return r;
       return ID.test(r.body?.board?.id) ? { board: { id: r.body.board.id } } : bad();
     },
-    async createSpace({ name, group = null, general }) {
-      const r = await ask("/spaces", "POST", { name, ...(group ? { group } : {}), ...(general !== undefined ? { general } : {}) });
+    async createSpace({ name, group = null, general, key }) {
+      const r = await ask("/spaces", "POST", { name, ...(group ? { group } : {}), ...(general !== undefined ? { general } : {}) }, key);
       if (r.error) return r;
       const s = info(r.body?.space);
       return s ? { space: s } : bad();
     },
-    async createGroup({ name, general }) {
-      const r = await ask("/groups", "POST", { name, ...(general !== undefined ? { general } : {}) });
+    async createGroup({ name, general, key }) {
+      const r = await ask("/groups", "POST", { name, ...(general !== undefined ? { general } : {}) }, key);
       if (r.error) return r;
       const g = grp(r.body?.group);
       return g ? { group: g } : bad();

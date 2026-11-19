@@ -60,7 +60,7 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
         try { url = new URL(req.url); }
         catch { badRequest(log); return json(400, { error: "bad-request" }); }   // a malformed Host header: no stack, a short line at most
         if (url.pathname === "/health" && (req.method === "GET" || req.method === "HEAD"))
-          return json(200, { ok: true, uptimeMs: Date.now() - started, roles: { gateway: !!gw, host: !!roles.host }, gateway: gw ? gw.stats() : null, ...rooms.stats() });
+          return json(200, { ok: true, uptimeMs: Date.now() - started, roles: { gateway: !!gw, host: !!roles.host }, gateway: gw ? gw.stats() : null, ...(http?.stats ? { http: http.stats() } : {}), ...rooms.stats() });
         if (!gw) return json(404, { error: "not-found" });   // host only: nothing but /health
         if (url.pathname === "/ws") {
           if (srv.upgrade(req, { data: { z: url.searchParams.get("z") === "deflate" } })) return undefined;   // § Joining: the client can inflate catch-up

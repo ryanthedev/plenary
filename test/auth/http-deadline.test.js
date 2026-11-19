@@ -38,24 +38,31 @@ const flush = () => new Promise(r => setImmediate(r));
 const as = tok => ({ authorization: `Bearer ${tok}` });
 const json = body => ({ "content-type": "application/json", ...as("ada") });
 
-let gate, vt, registry, routes, hungOidc;
+let gate, vt, registry, mem, routes, hungOidc, table, acme, idp, realOidc;
 beforeEach(async () => {
   gate = { hung: false, late: [], release() { const l = gate.late.splice(0); gate.hung = false; for (const f of l) f(); } };
   vt = virtualTimers();
-  registry = gated(memoryRegistry(), gate);
+  mem = memoryRegistry();
+  registry = gated(mem, gate);
   const tenancy = gated(makeTenancy({ registry }), gate);
   const dev = devAuth({ enabled: true, tokens: { ada: { name: "ada", domain: "acme.com", email: "ada@acme.com" } } });
-  hungOidc = { begin: () => new Promise(() => {}), callback: () => new Promise(() => {}) };
-  await registry.createTenant({ domain: "acme.com" });
-  routes = httpRoutes({ registry, sessions: await makeSessions({ key: "s".repeat(32) }), tenancy, home: gated(homeService({ registry, tenancy }), gate), oidc: hungOidc, config, dev, timers: vt, log: { warn() {} } });
+  idp = await fakeIdp({ now: Date.now }); await idp.addKey("k1");
+  realOidc = googleOidc({ clientId: CLIENT_ID, clientSecret: "secret", redirectUri: ORIGIN + "/auth/callback", fetch: idp.fetch, now: Date.now });
+  // begin hangs (GET /auth/login); finish hangs once gate.idp is set (GET /auth/callback with a valid state).
+  hungOidc = { begin: () => (gate.idpBegin ? new Promise(() => {}) : realOidc.begin()), finish: a => (gate.idp ? new Promise(() => {}) : realOidc.finish(a)) };
+  acme = await mem.createTenant({ domain: "acme.com" });
+  // Every optional dependency on: home, oidc, the dev sign-in menu. The guard enumerates what this builds.
+  routes = httpRoutes({ registry, sessions: await makeSessions({ key: "s".repeat(32) }), tenancy, home: gated(homeService({ registry, tenancy }), gate), oidc: hungOidc, dev,
+    config: { ...config, devSignIn: { board: "b-dev", users: [{ name: "ada", token: "ada", role: "editor" }], hosts: ["localhost"] } },
+    timers: vt, log: { warn() {} }, testHooks: { routes: t => { table = t; } } });
 });
 
 /** Run `p`; it must still be pending until the virtual deadline, then answer 503 unavailable. */
-async function expect503AtDeadline(p) {
+async function expect503AtDeadline(p, at = DEADLINE) {
   let res = null; p.then(r => { res = r; });
   await flush();
   expect(res).toBeNull();
-  vt.advance(DEADLINE - 1); await flush();
+  vt.advance(at - 1); await flush();
   expect(res).toBeNull();
   vt.advance(1); await flush();
   expect(res?.status).toBe(503);
@@ -67,7 +74,8 @@ async function expect503AtDeadline(p) {
 // so it needs no deadline to answer (its status is pinned).
 const B = "board-1";
 const ROUTES = {
-  "GET /auth/login": { path: "/auth/login" },   // the IdP hangs
+  "GET /auth/dev": { path: "/auth/dev", headers: { host: "localhost" }, at: 3000 },   // its own tighter wait, on the same timers
+  "GET /auth/login": { path: "/auth/login", idpBegin: true },   // the IdP hangs
   "GET /auth/callback": { path: "/auth/callback", fast: 400 },
   "POST /auth/exchange": { path: "/auth/exchange", init: { method: "POST" }, fast: 403 },   // its slow-Sessions case is its own test below
   "GET /auth/logout": { path: "/auth/logout", fast: 302 },
@@ -98,20 +106,20 @@ const request = (key) => {
   const [method, ...rest] = key.split(" ");
   const f = ROUTES[key];
   const init = { method, ...(f.init ?? {}) };
-  init.headers = f.body ? json(f.body) : (f.path.startsWith("/auth/") ? {} : as("ada"));
+  init.headers = f.headers ?? (f.body ? json(f.body) : (f.path.startsWith("/auth/") ? {} : as("ada")));
   if (f.body) init.body = JSON.stringify(f.body);
   return new Request(ORIGIN + f.path, init);
 };
 
 test("guard: every route in the table is classified here; the ones that reach a slow dependency answer 503 at the deadline", async () => {
-  const table = routes.routes.flatMap(r => r.methods.map(m => `${m} ${r.pattern}`));
-  expect(table.filter(k => !(k in ROUTES))).toEqual([]);   // a new route: add its request above
-  expect(Object.keys(ROUTES).filter(k => !table.includes(k))).toEqual([]);   // a stale entry
-  gate.hung = true;
-  for (const key of table) {
+  const keys = table.flatMap(r => r.methods.map(m => `${m} ${r.pattern}`));
+  expect(keys.filter(k => !(k in ROUTES))).toEqual([]);   // a new route: add its request above
+  expect(Object.keys(ROUTES).filter(k => !keys.includes(k))).toEqual([]);   // a stale entry
+  gate.hung = true; gate.idpBegin = true;
+  for (const key of keys) {
     const f = ROUTES[key];
     if (f.fast) { const r = await routes(request(key)); expect([key, r.status]).toEqual([key, f.fast]); continue; }
-    await expect503AtDeadline(routes(request(key)));
+    await expect503AtDeadline(routes(request(key)), f.at);
   }
   expect(vt.pending()).toBe(0);   // no timer left behind
 });
@@ -134,20 +142,49 @@ test("POST /auth/exchange: a slow Sessions.issue answers 503 at the deadline", a
   await expect503AtDeadline(r(new Request(ORIGIN + "/auth/exchange", { method: "POST", headers: { "content-type": "application/json", origin: ORIGIN, cookie }, body: JSON.stringify({ code }) })));
 });
 
-test("a late result is dropped: the 503 stands, a late rejection is handled, a late write may land (retry is safe)", async () => {
+test("GET /auth/callback: a slow IdP (valid state, hanging finish) answers 503 at the deadline", async () => {
+  const start = await routes(new Request(ORIGIN + "/auth/login"));
+  const loc = new URL(start.headers.get("location"));
+  idp.codes.set("g1", await idp.mint({ sub: "1001", email: "ann@acme.com", hd: "acme.com", name: "Ann", nonce: loc.searchParams.get("nonce") }));
+  const login = start.headers.getSetCookie().find(c => c.startsWith(LOGIN_COOKIE)).split(";")[0];
+  gate.idp = true;
+  await expect503AtDeadline(routes(new Request(ORIGIN + "/auth/callback?" + new URLSearchParams({ code: "g1", state: loc.searchParams.get("state") }), { headers: { cookie: login } })));
+});
+
+test("a late write lands after the 503: its board exists, and a retry with the same key returns that board (no duplicate)", async () => {
   let unhandled = 0; const on = () => { unhandled++; }; process.on("unhandledRejection", on);
   try {
     gate.hung = true;
-    const p = routes(new Request(ORIGIN + "/boards", { method: "POST", headers: json(), body: JSON.stringify({ title: "late" }) }));
-    await expect503AtDeadline(p);
-    // The slow call finishes after the 503: the answer already sent is the only one, nothing throws.
-    gate.release(); await flush(); await flush();
-    // A late failure: the dependency rejects after the deadline.
-    gate.hung = true;
-    const bad = routes(new Request(ORIGIN + "/home", { headers: as("ada") }));
-    await flush(); vt.advance(DEADLINE); expect((await bad).status).toBe(503);
-    for (const f of gate.late.splice(0)) f();
+    const mk = () => new Request(ORIGIN + "/boards", { method: "POST", headers: { ...json(), "idempotency-key": "retry-key-0001" }, body: JSON.stringify({ title: "late" }) });
+    await expect503AtDeadline(routes(mk()));
+    gate.release(); await flush(); await flush(); await flush();
+    const found = await mem.searchBoards(acme.id, { q: "late" });
+    expect(found.ids).toHaveLength(1);   // the late create happened
+    const retry = await routes(mk());
+    expect(retry.status).toBe(201);
+    expect(retry.headers.get("idempotent-replayed")).toBe("true");
+    expect((await retry.json()).board.id).toBe(found.ids[0]);
+    expect((await mem.searchBoards(acme.id, { q: "late" })).ids).toHaveLength(1);   // still one
+    expect(unhandled).toBe(0);
+  } finally { process.off("unhandledRejection", on); }
+});
+
+test("a late result and a late rejection are handled (no unhandledRejection), counted and logged; stats count deadline hits per route", async () => {
+  let unhandled = 0; const on = () => { unhandled++; }; process.on("unhandledRejection", on);
+  const lines = [], pend = [];
+  const home = { home: () => new Promise((res, rej) => pend.push({ res, rej })) };
+  const r = httpRoutes({ registry: mem, sessions: await makeSessions({ key: "s".repeat(32) }), tenancy: makeTenancy({ registry: mem }), home,
+    dev: devAuth({ enabled: true, tokens: { ada: { name: "ada", domain: "acme.com", email: "ada@acme.com" } } }), config, timers: vt, log: { warn: m => lines.push(m) } });
+  try {
+    const a = r(new Request(ORIGIN + "/home", { headers: as("ada") })), b = r(new Request(ORIGIN + "/home", { headers: as("ada") }));
+    await flush(); vt.advance(DEADLINE);
+    expect([(await a).status, (await b).status]).toEqual([503, 503]);
+    expect(r.stats()).toMatchObject({ deadlineMs: DEADLINE, deadline: { "GET /home": 2 }, late: { applied: 0, failed: 0 } });
+    pend[0].res({ guest: false }); pend[1].rej(new Error("db down"));
     await flush(); await flush();
+    expect(r.stats().late).toEqual({ applied: 1, failed: 1 });
+    expect(lines.filter(l => /request deadline/.test(l))).toHaveLength(1);        // at most one line per 10 s
+    expect(lines.filter(l => /finished after its 503/.test(l))).toHaveLength(1);
     expect(unhandled).toBe(0);
   } finally { process.off("unhandledRejection", on); }
 });

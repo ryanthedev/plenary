@@ -36,7 +36,7 @@ beforeEach(() => {
 });
 afterEach(() => { delete globalThis.document; delete globalThis.Node; });
 
-const dialogsFor = () => createDialogs({ host: root, api, hrefs, go: h => closes.push(h) });
+const dialogsFor = () => createDialogs({ host: root, api, hrefs, go: h => closes.push(h), newKey: () => "key-fixed-0001" });
 async function spacePage(page = SP()) {
   api.pages.space = page;
   const model = createPageModel({ api, kind: "space", id: "s-1" });
@@ -211,7 +211,7 @@ test("Group page: Spaces as links, New space opens the dialog preset to this Gro
   dlg.find(e => e.getAttribute("aria-label") === "Name").value = "Q5";
   dlg.find(e => e.getAttribute("aria-label") === "Name").dispatch("input", { target: { value: "Q5" } });
   dlg.find(e => e.tagName === "FORM").dispatch("submit"); await settle();
-  expect(calls.find(c => c[0] === "createSpace")).toEqual(["createSpace", { name: "Q5", group: "g-1", general: "viewer" }]);
+  expect(calls.find(c => c[0] === "createSpace")).toEqual(["createSpace", { name: "Q5", group: "g-1", general: "viewer", key: "key-fixed-0001" }]);
   expect(closes).toEqual(["?space=s-new"]);
   btn("Show more Spaces").click(); await settle();
   expect(calls.some(c => c[0] === "group" && c[2] === "s-2")).toBe(true);
@@ -227,7 +227,7 @@ test("New group dialog: name and general access, creates and goes to the Group p
   expect(textOf(dlg.find(e => e.getAttribute("role") === "alert"))).toBe("Give the Group a name.");
   dlg.find(e => e.getAttribute("aria-label") === "Name").dispatch("input", { target: { value: "Org" } });
   dlg.find(e => e.tagName === "FORM").dispatch("submit"); await settle();
-  expect(calls.find(c => c[0] === "createGroup")).toEqual(["createGroup", { name: "Org", general: null }]);
+  expect(calls.find(c => c[0] === "createGroup")).toEqual(["createGroup", { name: "Org", general: null, key: "key-fixed-0001" }]);
   expect(closes).toEqual(["?group=g-new"]);
   expect(root.find(e => e.getAttribute("role") === "dialog")).toBeUndefined();
   expect(d.close).toBeTypeOf("function");
@@ -260,7 +260,7 @@ test("New board dialog: Location lists the picker's Spaces (personal first and c
   expect(closes).toEqual([]);
   api.answer = (n) => (n === "createBoard" ? { board: { id: "b-new" } } : undefined);
   dlg.find(e => e.tagName === "FORM").dispatch("submit"); await settle();
-  expect(calls.filter(c => c[0] === "createBoard").at(-1)).toEqual(["createBoard", { title: "Offsite ideas", space: "s-1" }]);
+  expect(calls.filter(c => c[0] === "createBoard").at(-1)).toEqual(["createBoard", { title: "Offsite ideas", space: "s-1", key: "key-fixed-0001" }]);
   expect(closes).toEqual(["?board=b-new"]);
   expect(root.find(e => e.getAttribute("role") === "dialog")).toBeUndefined();
   expect(focused.at(-1)).toBe(opener);                                 // focus goes back to what opened it
@@ -296,7 +296,7 @@ test("New space dialog: general access radios; Only people added is sent as null
   dlg.find(e => e.getAttribute("aria-label") === "Name").dispatch("input", { target: { value: "Hidden" } });
   dlg.findAll(e => e.getAttribute("type") === "radio")[1].dispatch("change");
   dlg.find(e => e.tagName === "FORM").dispatch("submit"); await settle();
-  expect(calls.find(c => c[0] === "createSpace")).toEqual(["createSpace", { name: "Hidden", group: null, general: null }]);
+  expect(calls.find(c => c[0] === "createSpace")).toEqual(["createSpace", { name: "Hidden", group: null, general: null, key: "key-fixed-0001" }]);
   expect(closes).toEqual(["?space=s-new"]);
   api.answer = (n) => (n === "spaceGroups" ? { root: false, groups: [], more: false } : undefined);
   d.newSpace({}); await settle();

@@ -17,7 +17,7 @@
 // `user`; insertion order is an explicit `n` column (Postgres: BIGSERIAL / identity), upserts use ON CONFLICT.
 
 import { Database } from "bun:sqlite";
-import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, smallLimit, searchQuery, asciiFold } from "../auth/registry-port.js";
+import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, smallLimit, searchQuery, asciiFold } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 
 /** Thrown by `setGrant` when the change would leave a board with no owner. Match on `err.code`. */
@@ -133,6 +133,10 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       member TEXT NOT NULL, board TEXT NOT NULL REFERENCES reg_boards(id), opened_at INTEGER NOT NULL, PRIMARY KEY (member, board))`);
     db.run(`CREATE TABLE IF NOT EXISTS reg_stars (
       member TEXT NOT NULL, board TEXT NOT NULL REFERENCES reg_boards(id), at INTEGER NOT NULL, PRIMARY KEY (member, board))`);
+    // Idempotent creates (PROTOCOL.md): one row per (member, key); `result` NULL while the create runs. Additive.
+    db.run(`CREATE TABLE IF NOT EXISTS reg_idempotency (
+      member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, result TEXT, at INTEGER NOT NULL, PRIMARY KEY (member, k))`);
+    db.run("CREATE INDEX IF NOT EXISTS reg_idempotency_at ON reg_idempotency (at)");
     db.run("CREATE INDEX IF NOT EXISTS reg_recents_member ON reg_recents (member, opened_at DESC, board DESC)");
     db.run("CREATE INDEX IF NOT EXISTS reg_stars_member ON reg_stars (member, at DESC, board DESC)");
     db.run("CREATE INDEX IF NOT EXISTS reg_grants_member ON reg_grants (member)");
@@ -148,6 +152,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
   }).immediate(), clock, onAttempt);
   db.run(`PRAGMA busy_timeout=${wait}`);                     // start-up spent part of it; runtime gets the whole budget
 
+  let idemCalls = 0;
   const q = {
     tenant: db.query("SELECT id, domain, created_at FROM reg_tenants WHERE id = ?"),
     tenantByDomain: db.query(`SELECT id, domain, created_at FROM reg_tenants WHERE domain = ?1
@@ -216,6 +221,12 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     pruneRecent: db.query(`DELETE FROM reg_recents WHERE member = ?1 AND board IN
       (SELECT board FROM reg_recents WHERE member = ?1 ORDER BY opened_at DESC, board DESC LIMIT -1 OFFSET ?2)`),
     recents: db.query("SELECT board, opened_at AS at FROM reg_recents WHERE member = ? ORDER BY opened_at DESC, board DESC LIMIT ?"),
+    idemGet: db.query("SELECT fp, result, at FROM reg_idempotency WHERE member = ? AND k = ?"),
+    idemCount: db.query("SELECT count(*) AS n FROM reg_idempotency"),
+    idemPut: db.query("INSERT OR REPLACE INTO reg_idempotency (member, k, fp, result, at) VALUES (?, ?, ?, NULL, ?)"),
+    idemFin: db.query("UPDATE reg_idempotency SET result = ?, at = ? WHERE member = ? AND k = ? AND fp = ?"),
+    idemDel: db.query("DELETE FROM reg_idempotency WHERE member = ? AND k = ? AND fp = ? AND result IS NULL"),
+    idemPrune: db.query("DELETE FROM reg_idempotency WHERE rowid IN (SELECT rowid FROM reg_idempotency WHERE (result IS NULL AND at < ?1) OR (result IS NOT NULL AND at < ?2) LIMIT ?3)"),
     upStar: db.query("INSERT INTO reg_stars (member, board, at) VALUES (?, ?, ?) ON CONFLICT (member, board) DO NOTHING"),
     delStar: db.query("DELETE FROM reg_stars WHERE member = ? AND board = ?"),
     stars: db.query("SELECT board, at FROM reg_stars WHERE member = ? ORDER BY at DESC, board DESC LIMIT ?"),
@@ -645,6 +656,23 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       const list = batchScopes(scopes), us = users ? users.filter(str) : null;
       return new Map(contextsTx(list, us));
     },
+    // ---- Idempotent creates (PROTOCOL.md) ----
+    async idemClaim(user, key, fp) {
+      ready();
+      if (!str(user) || !str(key) || !str(fp)) throw new Error("registry: bad idempotency key");
+      const t = now();
+      if (++idemCalls % IDEM.every === 0) q.idemPrune.run(t - IDEM.claimMs, t - IDEM.ttlMs, IDEM.prune);
+      return db.transaction(() => {
+        const e = q.idemGet.get(user, key);
+        if (e && t - e.at < (e.result === null ? IDEM.claimMs : IDEM.ttlMs)) return e.fp !== fp ? { state: "mismatch" } : e.result === null ? { state: "in-progress" } : { state: "done", result: e.result };
+        q.idemPut.run(user, key, fp, t);
+        return { state: "new" };
+      }).immediate();
+    },
+    async idemFinish(user, key, fp, result) { ready(); if (str(user) && str(key) && str(fp)) q.idemFin.run(String(result), now(), user, key, fp); },
+    async idemRelease(user, key, fp) { ready(); if (str(user) && str(key) && str(fp)) q.idemDel.run(user, key, fp); },
+    /** The stored rows (tests). */ idemSize: () => q.idemCount.get().n,
+
     // ---- Home (PROTOCOL.md § Home) ----
     async markOpened(user, board) {
       ready();

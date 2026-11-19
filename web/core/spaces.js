@@ -15,6 +15,11 @@ const ERR = {
   auth: "You are signed out. Sign in again.", network: "No answer from the server. Try again.", unavailable: "The server could not do that. Try again in a moment.",
 };
 export const errorText = e => ERR[e] ?? ERR.unavailable;
+/** A create that got no clear answer may have been made: say so, and that trying again is safe (the retry carries the same Idempotency-Key). */
+const MAYBE = " It may have been created. Trying again is safe.";
+export const createErrorText = e => (e === "unavailable" ? "The server did not answer in time." + MAYBE : e === "network" ? "No answer from the server." + MAYBE : errorText(e));
+// One Idempotency-Key per submit, reused by every retry of it (PROTOCOL.md "Idempotent creates"); a changed input starts a new one. The
+// maker (`newKey`) comes from the root through the dialogs (core reads no global); with none, a create is sent without a key.
 
 /** Empty-state copy for a Space page (JOURNEY §5). */
 export function spaceEmpty(page) {
@@ -103,9 +108,10 @@ export function createPageModel({ api, kind, id }) {
 
 /**
  * The New board dialog: a title and a location (only Spaces where the person can create; their personal space first and the default).
- * @param {{ api: SpacesPort, space?: string|null }} o   `space`: the Space to preselect (when opened from a Space page)
+ * @param {{ api: SpacesPort, space?: string|null, newKey?: () => string }} o   `newKey`: the Idempotency-Key maker (one per submit, reused on retry); `space`: the Space to preselect (when opened from a Space page)
  */
-export function createNewBoardModel({ api, space = null }) {
+export function createNewBoardModel({ api, space = null, newKey = null }) {
+  let key = null;
   const state = { status: "loading", spaces: [], more: false, title: "", space: null, busy: false, error: null, created: null };
   const subs = new Set();
   const emit = () => { for (const f of [...subs]) f(state); };
@@ -118,8 +124,8 @@ export function createNewBoardModel({ api, space = null }) {
       else { state.spaces = r.spaces; state.more = r.more; state.status = "ready"; state.space = r.spaces.some(s => s.id === space) ? space : (r.spaces[0]?.id ?? null); }
       emit();
     },
-    setTitle(t) { state.title = String(t ?? ""); state.error = null; emit(); },
-    choose(id) { if (state.spaces.some(s => s.id === id)) { state.space = id; emit(); } },
+    setTitle(t) { key = null; state.title = String(t ?? ""); state.error = null; emit(); },
+    choose(id) { if (state.spaces.some(s => s.id === id)) { key = null; state.space = id; emit(); } },
     /** Hint under the list: what the new board will inherit. */
     hint() {
       const s = state.spaces.find(x => x.id === state.space);
@@ -133,9 +139,9 @@ export function createNewBoardModel({ api, space = null }) {
       if (title.length > TITLE_MAX) { state.error = `Titles are at most ${TITLE_MAX} characters.`; emit(); return false; }
       state.busy = true; state.error = null; emit();
       const s = state.spaces.find(x => x.id === state.space);
-      const r = await api.createBoard({ title, ...(s.personal ? {} : { space: s.id }) });
+      const r = await api.createBoard({ title, ...(s.personal ? {} : { space: s.id }), ...(newKey ? { key: (key ??= newKey()) } : {}) });
       state.busy = false;
-      if (r.error) state.error = errorText(r.error); else state.created = r.board;
+      if (r.error) state.error = createErrorText(r.error); else { state.created = r.board; key = null; }
       emit();
       return !r.error;
     },
@@ -146,24 +152,25 @@ export function createNewBoardModel({ api, space = null }) {
  * The New group dialog (a Unit-level permission, decided by the server: Home only offers it when `can.createGroup`): a name and general access.
  * @param {{ api: SpacesPort }} o
  */
-export function createNewGroupModel({ api }) {
+export function createNewGroupModel({ api, newKey = null }) {
+  let key = null;
   const state = { name: "", general: null, busy: false, error: null, created: null };
   const subs = new Set();
   const emit = () => { for (const f of [...subs]) f(state); };
   return {
     state,
     subscribe(f) { subs.add(f); return () => subs.delete(f); },
-    setName(n) { state.name = String(n ?? ""); state.error = null; emit(); },
-    setGeneral(g) { state.general = g === "none" || g == null ? null : g; emit(); },
+    setName(n) { key = null; state.name = String(n ?? ""); state.error = null; emit(); },
+    setGeneral(g) { key = null; state.general = g === "none" || g == null ? null : g; emit(); },
     async submit() {
       if (state.busy) return false;
       const name = state.name.trim();
       if (!name) { state.error = "Give the Group a name."; emit(); return false; }
       if (name.length > NAME_MAX) { state.error = `Names are at most ${NAME_MAX} characters.`; emit(); return false; }
       state.busy = true; state.error = null; emit();
-      const r = await api.createGroup({ name, general: state.general });
+      const r = await api.createGroup({ name, general: state.general, ...(newKey ? { key: (key ??= newKey()) } : {}) });
       state.busy = false;
-      if (r.error) state.error = errorText(r.error); else state.created = r.group;
+      if (r.error) state.error = createErrorText(r.error); else { state.created = r.group; key = null; }
       emit();
       return !r.error;
     },
@@ -174,7 +181,8 @@ export function createNewGroupModel({ api }) {
  * The New space dialog: a name, a Group (only where the person is an editor, or none), and general access.
  * @param {{ api: SpacesPort, group?: string|null }} o
  */
-export function createNewSpaceModel({ api, group = null }) {
+export function createNewSpaceModel({ api, group = null, newKey = null }) {
+  let key = null;
   const state = { status: "loading", root: false, groups: [], more: false, name: "", group: null, general: "viewer", busy: false, error: null, created: null };
   const subs = new Set();
   const emit = () => { for (const f of [...subs]) f(state); };
@@ -192,9 +200,9 @@ export function createNewSpaceModel({ api, group = null }) {
     },
     /** Can this person make a Space anywhere at all? */
     canCreate() { return state.root || state.groups.length > 0; },
-    setName(n) { state.name = String(n ?? ""); state.error = null; emit(); },
-    setGroup(id) { state.group = id || null; emit(); },
-    setGeneral(g) { state.general = g === "none" || g == null ? null : g; emit(); },
+    setName(n) { key = null; state.name = String(n ?? ""); state.error = null; emit(); },
+    setGroup(id) { key = null; state.group = id || null; emit(); },
+    setGeneral(g) { key = null; state.general = g === "none" || g == null ? null : g; emit(); },
     async submit() {
       if (state.busy || state.status !== "ready") return false;
       const name = state.name.trim();
@@ -202,9 +210,9 @@ export function createNewSpaceModel({ api, group = null }) {
       if (name.length > NAME_MAX) { state.error = `Names are at most ${NAME_MAX} characters.`; emit(); return false; }
       if (state.group === null && !state.root) { state.error = "Pick a Group: you can't add Spaces outside one."; emit(); return false; }
       state.busy = true; state.error = null; emit();
-      const r = await api.createSpace({ name, group: state.group, general: state.general });
+      const r = await api.createSpace({ name, group: state.group, general: state.general, ...(newKey ? { key: (key ??= newKey()) } : {}) });
       state.busy = false;
-      if (r.error) state.error = errorText(r.error); else state.created = r.space;
+      if (r.error) state.error = createErrorText(r.error); else { state.created = r.space; key = null; }
       emit();
       return !r.error;
     },

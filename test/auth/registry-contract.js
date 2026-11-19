@@ -32,6 +32,65 @@ export function registryContract(name, makeRegistry, opts = {}) {
     const sorted = async b => (await r.grants(b)).sort((x, y) => x.user.localeCompare(y.user));
     const owners = async b => (await r.grants(b)).filter(g => g.role === "owner").map(g => g.user).sort();
 
+    // ---- idempotent creates (PROTOCOL.md "Idempotent creates") ----
+
+    describe("idempotency keys", () => {
+      const U = "dev:ada", K = "key-0001-aaaa", FP = "f".repeat(64);
+      test("claim: new, then in-progress (same fp), mismatch (other fp); another user or key is independent", async () => {
+        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "new" });
+        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "in-progress" });
+        expect(await r.idemClaim(U, K, "0".repeat(64))).toEqual({ state: "mismatch" });
+        expect(await r.idemClaim("dev:bob", K, FP)).toEqual({ state: "new" });
+        expect(await r.idemClaim(U, "key-0002-bbbb", FP)).toEqual({ state: "new" });
+      });
+      test("finish: a repeat gets the stored answer; a wrong fp neither finishes nor reads it", async () => {
+        await r.idemClaim(U, K, FP);
+        await r.idemFinish(U, K, "0".repeat(64), "{\"no\":1}");
+        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "in-progress" });
+        await r.idemFinish(U, K, FP, "{\"status\":201}");
+        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "done", result: "{\"status\":201}" });
+        expect(await r.idemClaim(U, K, "0".repeat(64))).toEqual({ state: "mismatch" });
+      });
+      test("release drops an unfinished claim only", async () => {
+        await r.idemClaim(U, K, FP);
+        await r.idemRelease(U, K, "0".repeat(64));
+        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "in-progress" });   // another fp cannot release it
+        await r.idemRelease(U, K, FP);
+        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "new" });
+        await r.idemFinish(U, K, FP, "x");
+        await r.idemRelease(U, K, FP);
+        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "done", result: "x" });
+      });
+      test("an unfinished claim is taken over after 60 s; a finished answer lives 24 h", async () => {
+        await r.idemClaim(U, K, FP);
+        clock.t += 59_999;
+        expect((await r.idemClaim(U, K, FP)).state).toBe("in-progress");
+        clock.t += 1;
+        expect(await r.idemClaim(U, K, "0".repeat(64))).toEqual({ state: "new" });   // free again, even for another body
+        await r.idemFinish(U, K, "0".repeat(64), "y");
+        clock.t += 24 * 3600_000 - 1;
+        expect(await r.idemClaim(U, K, "0".repeat(64))).toEqual({ state: "done", result: "y" });
+        clock.t += 1;
+        expect(await r.idemClaim(U, K, FP)).toEqual({ state: "new" });
+      });
+      test("expired rows are pruned by age as claims arrive (bounded storage)", async () => {
+        for (let i = 0; i < 100; i++) { await r.idemClaim(U, `old-key-${String(i).padStart(4, "0")}`, FP); await r.idemFinish(U, `old-key-${String(i).padStart(4, "0")}`, FP, "z"); }
+        expect(await r.idemSize()).toBe(100);
+        clock.t += 24 * 3600_000 + 1;
+        for (let i = 0; i < 64; i++) await r.idemClaim(U, `new-key-${String(i).padStart(4, "0")}`, FP);
+        expect(await r.idemSize()).toBeLessThan(100);   // the 64th claim pruned the expired ones
+      });
+      test("concurrent claims of one key: exactly one is new", async () => {
+        const out = await Promise.all(Array.from({ length: 8 }, () => r.idemClaim(U, K, FP)));
+        expect(out.filter(o => o.state === "new")).toHaveLength(1);
+        expect(out.filter(o => o.state === "in-progress")).toHaveLength(7);
+      });
+      test("a bad user, key or fingerprint rejects", async () => {
+        await expect(r.idemClaim(U, 5, FP)).rejects.toThrow();
+        await expect(r.idemClaim(U, K, undefined)).rejects.toThrow();
+      });
+    });
+
     // ---- tenants ----
 
     test("createTenant: minted id t- + 12 [a-z0-9], domain lower-cased, admins, createdAt", async () => {

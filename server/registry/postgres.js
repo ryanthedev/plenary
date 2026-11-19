@@ -71,7 +71,7 @@
 // owns that pool) or `sql` (a Bun SQL client you own). `schema` names the Postgres schema. Never reads env.
 
 import { SQL } from "bun";
-import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, smallLimit, searchQuery, asciiFold } from "../auth/registry-port.js";
+import { batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, smallLimit, searchQuery, asciiFold } from "../auth/registry-port.js";
 import { normEmail } from "../auth/util.js";
 import { needSchema, migrate, missing as absent } from "../pg/schema.js";
 
@@ -123,6 +123,8 @@ const REGISTRY_TABLE_DDL = {
   // Home (PROTOCOL.md § Home): Recent and Starred. Additive, like the organization tables.
   reg_recents: "member TEXT NOT NULL, board TEXT NOT NULL REFERENCES $S.reg_boards(id), opened_at BIGINT NOT NULL, PRIMARY KEY (member, board)",
   reg_stars: "member TEXT NOT NULL, board TEXT NOT NULL REFERENCES $S.reg_boards(id), at BIGINT NOT NULL, PRIMARY KEY (member, board)",
+  // Idempotent creates (PROTOCOL.md): one row per (member, key); `result` NULL while the create runs. Additive.
+  reg_idempotency: "member TEXT NOT NULL, k TEXT NOT NULL, fp TEXT NOT NULL, result TEXT, at BIGINT NOT NULL, PRIMARY KEY (member, k)",
   reg_roles: "tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), id TEXT NOT NULL, name TEXT NOT NULL, base TEXT, board_role TEXT, permissions TEXT NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY (tenant, id)",
 };
 /** Index name → "table (columns)"; created after the tables, only if missing (to_regclass), like the tables. */
@@ -136,6 +138,7 @@ export const REGISTRY_INDEXES = {
   reg_teams_tenant: "reg_teams (tenant)",
   reg_recents_member: "reg_recents (member, opened_at DESC, board DESC)",
   reg_stars_member: "reg_stars (member, at DESC, board DESC)",
+  reg_idempotency_at: "reg_idempotency (at)",
   reg_grants_member: "reg_grants (member)",
   reg_boards_tenant: "reg_boards (tenant, id)",
   reg_invites_email: "reg_invites (email)",
@@ -175,7 +178,8 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     I = `"${s}".reg_invites`, L = `"${s}".reg_links`, U = `"${s}".reg_link_uses`,
     TM = `"${s}".reg_tenant_meta`, TD = `"${s}".reg_tenant_domains`, GR = `"${s}".reg_groups`, SP = `"${s}".reg_spaces`, BS = `"${s}".reg_board_spaces`,
     TE = `"${s}".reg_teams`, TU = `"${s}".reg_team_members`, SG = `"${s}".reg_scope_grants`, RO = `"${s}".reg_roles`,
-    RC = `"${s}".reg_recents`, ST = `"${s}".reg_stars`;
+    RC = `"${s}".reg_recents`, ST = `"${s}".reg_stars`, ID = `"${s}".reg_idempotency`;
+  let idemCalls = 0;
 
   try {
     await db.begin(async tx => {
@@ -763,6 +767,36 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       }
       return out;
     },
+    // ---- Idempotent creates (PROTOCOL.md) ----
+    async idemClaim(user, k, fp) {
+      ready();
+      if (!key(user) || !key(k) || !key(fp)) throw new Error("registry: bad idempotency key");
+      const t = now();
+      if (++idemCalls % IDEM.every === 0) {   // best effort, bounded: a failed prune never fails a claim
+        db.unsafe(`DELETE FROM ${ID} WHERE ctid IN (SELECT ctid FROM ${ID} WHERE (result IS NULL AND at < $1) OR (result IS NOT NULL AND at < $2) LIMIT $3)`,
+          [t - IDEM.claimMs, t - IDEM.ttlMs, IDEM.prune]).catch(() => {});
+      }
+      // ONE statement: insert the claim, or take over an expired row; no row back = a live one is there.
+      const won = await write(tx => tx.unsafe(`INSERT INTO ${ID} (member, k, fp, result, at) VALUES ($1, $2, $3, NULL, $4)
+        ON CONFLICT (member, k) DO UPDATE SET fp = excluded.fp, result = NULL, at = excluded.at
+        WHERE (${ID}.result IS NULL AND ${ID}.at < $5) OR (${ID}.result IS NOT NULL AND ${ID}.at < $6) RETURNING 1 AS x`,
+      [user, k, fp, t, t - IDEM.claimMs, t - IDEM.ttlMs]));
+      if (won.length) return { state: "new" };
+      const e = (await db.unsafe(`SELECT fp, result FROM ${ID} WHERE member = $1 AND k = $2`, [user, k]))[0];
+      if (!e) return { state: "in-progress" };   // released between the two statements: the caller retries
+      return e.fp !== fp ? { state: "mismatch" } : e.result === null ? { state: "in-progress" } : { state: "done", result: e.result };
+    },
+    async idemFinish(user, k, fp, result) {
+      ready();
+      if (key(user) && key(k) && key(fp)) await write(tx => tx.unsafe(`UPDATE ${ID} SET result = $1, at = $2 WHERE member = $3 AND k = $4 AND fp = $5`, [String(result), now(), user, k, fp]));
+    },
+    async idemRelease(user, k, fp) {
+      ready();
+      if (key(user) && key(k) && key(fp)) await write(tx => tx.unsafe(`DELETE FROM ${ID} WHERE member = $1 AND k = $2 AND fp = $3 AND result IS NULL`, [user, k, fp]));
+    },
+    /** The stored rows (tests). */
+    async idemSize() { return Number((await db.unsafe(`SELECT count(*) AS n FROM ${ID}`))[0].n); },
+
     // ---- Home (PROTOCOL.md § Home) ----
     async markOpened(user, board) {
       ready();

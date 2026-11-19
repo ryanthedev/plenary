@@ -90,11 +90,12 @@ const CODE_TTL_SEC = 60;
 const COOKIE_ATTRS = "Path=/; Secure; HttpOnly; SameSite=Lax";
 const XCHG_ATTRS = "Path=/; Secure; HttpOnly; SameSite=Strict";
 
-/** How long GET /auth/dev waits for the Registry before it answers 503 (under Bun's 10 s idle timeout). */
+/** How long GET /auth/dev waits for the Registry before it answers 503 (a tighter bound than the request deadline). */
 const DEV_MENU_WAIT_MS = 3000;
-const bounded = (p, ms) => new Promise((res, rej) => { const t = setTimeout(() => rej(new Error("timeout")), ms); p.then(v => { clearTimeout(t); res(v); }, e => { clearTimeout(t); rej(e); }); });
-/** The default request deadline (PROTOCOL.md "HTTP request deadline"): under Bun's 10 s idle cut and the Postgres 15 s limits. */
-const REQUEST_DEADLINE_MS = 8000;
+/** The default request deadline (PROTOCOL.md "HTTP request deadline"): under the idle cut (server.js sets 30 s; Bun's own default is 10 s) and the inner limits main.js sets. */
+export const REQUEST_DEADLINE_MS = 8000;
+/** `Idempotency-Key`: 8-64 of [A-Za-z0-9_-] (PROTOCOL.md "Idempotent creates"). */
+const IDEM_KEY = /^[A-Za-z0-9_-]{8,64}$/;
 const NO_STORE = { "cache-control": "no-store" };
 const json = (status, body, headers = {}) =>
   new Response(body === undefined ? null : JSON.stringify(body), {
@@ -125,10 +126,12 @@ const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
  *   oidc?: import("./idp-port.js").IdP | null,
  *   tenancy: { redeemLink(id: object, link: string): Promise<{board: string}|null>, tenantOf(id: object): Promise<{id: string}|null> },
  *   now?: () => number, config: object, dev?: { enabled?: boolean, verify(t: string): Promise<object|null> } | null,
- *   testHooks?: { pruned?(p: { visited: number, expired: number, live: number }): void } | null }} deps   (tests only, not an API)
+ *   testHooks?: { pruned?(p: { visited: number, expired: number, live: number }): void, routes?(table: { pattern: string, methods: string[], names: string[] }[]): void } | null }} deps   (tests only, not an API)
  */
 export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, spaces = spaceService({ registry, tenancy, home, now }), config = {}, dev = null, log = stdoutLog, testHooks = null, timers = { set: (f, ms) => setTimeout(f, ms), clear: h => clearTimeout(h) } }) {
   if (!registry || !sessions || !tenancy) throw new Error("http: registry, sessions and tenancy are required");
+  /** `p`, or a rejection with message "timeout" after `ms` on the injected timers. */
+  const bounded = (p, ms) => new Promise((res, rej) => { const t = timers.set(() => rej(new Error("timeout")), ms); p.then(v => { timers.clear(t); res(v); }, e => { timers.clear(t); rej(e); }); });
   const deadlineMs = config.requestDeadlineMs ?? REQUEST_DEADLINE_MS;
   if (!Number.isInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 2 ** 31 - 1) throw new Error("http: config.requestDeadlineMs must be a positive integer (ms)");
   const postLoginUrl = absUrl(config.postLoginUrl, "postLoginUrl");
@@ -360,6 +363,43 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
   }
   const defined = o => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined));
 
+  /** SHA-256 hex of the route, its path parameters and the body with sorted keys: what "the same request" means for a key. */
+  async function fingerprint(route, params, b) {
+    const text = JSON.stringify([route, Object.entries(params).sort(), Object.entries(b).sort(([x], [y]) => (x < y ? -1 : 1))]);
+    return [...new Uint8Array(await crypto.subtle.digest("SHA-256", utf8(text)))].map(x => x.toString(16).padStart(2, "0")).join("");
+  }
+  /**
+   * A create route's body of work, made idempotent by the `Idempotency-Key` header (PROTOCOL.md "Idempotent creates"). `run()` resolves
+   * `{ status, body }`. Without a key it just runs. With one the key is claimed in the Registry first; a repeat gets the stored answer,
+   * a repeat while the first runs gets 409, a changed request 422. `run` is NOT cancelled by the request deadline: its outcome is
+   * stored when it finishes (even after the client got a 503), which is what lets a retry find the board a cut-off call created.
+   */
+  async function keyed(req, who, route, params, b, run) {
+    const k = req.headers.get("idempotency-key");
+    if (k === null) { const r = await run(); return json(r.status, r.body); }
+    if (!IDEM_KEY.test(k)) throw refuse(400, "bad-idempotency-key");
+    const fp = await fingerprint(route, params, b), user = who.user;
+    let c;
+    try { c = await registry.idemClaim(user, k, fp); } catch { throw refuse(503, "unavailable"); }
+    if (c.state === "mismatch") return err(422, "idempotency-key-reused");
+    if (c.state === "in-progress") return err(409, "in-progress", {}, { "retry-after": "1" });
+    if (c.state === "done") {
+      let r; try { r = JSON.parse(c.result); } catch { r = null; }
+      if (r && Number.isInteger(r.status)) return json(r.status, r.body, { "idempotent-replayed": "true" });
+      throw refuse(503, "unavailable");
+    }
+    let out;
+    try { out = await run(); }
+    catch (e) {
+      // The create ran and left a board with no owner: that IS its outcome, with the board's id (a retry gets it back).
+      if (e instanceof AdminError && e.code === "owner-grant-failed") out = { status: 503, body: { error: "owner-grant-failed", board: e.board } };
+      else { await registry.idemRelease(user, k, fp).catch(() => {}); throw e; }   // refused or failed with no outcome: the retry runs again
+    }
+    // If this write fails the claim expires (60 s) and a retry runs again: the same "may have applied" a keyless create has.
+    await registry.idemFinish(user, k, fp, JSON.stringify(out)).catch(() => {});
+    return json(out.status, out.body);
+  }
+
   // ---- routes ----
   const admin = { registry, now };
   // GET /auth/dev: the dev sign-in menu for the served page (web/adapters/auth/devconfig.js). Exists ONLY while the dev
@@ -400,8 +440,8 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
     ["/auth/logout", { GET: () => redirect(postLogoutUrl, [clearLogin]) }],
     ["/boards", { POST: async req => {
       const who = await caller(req);
-      const b = await body(req, ["title", "memberRole", "space"]);
-      return json(201, { board: await spaces.createBoard(who, defined(b)) });
+      const b = defined(await body(req, ["title", "memberRole", "space"]));
+      return keyed(req, who, "POST /boards", {}, b, async () => ({ status: 201, body: { board: await spaces.createBoard(who, b) } }));
     } }],
     ["/boards/:board", { PATCH: async (req, p) => {
       const who = await caller(req);
@@ -417,15 +457,15 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       },
       POST: async req => {
         const who = await caller(req);
-        const b = await body(req, ["name", "group", "general"]);
-        return json(201, { space: await spaces.createSpace(who, defined(b)) });
+        const b = defined(await body(req, ["name", "group", "general"]));
+        return keyed(req, who, "POST /spaces", {}, b, async () => ({ status: 201, body: { space: await spaces.createSpace(who, b) } }));
       },
     }],
     ["/groups", {
       POST: async (req) => {
         const who = await caller(req);
-        const b = await body(req, ["name", "general"]);
-        return json(201, { group: await spaces.createGroup(who, defined(b)) });
+        const b = defined(await body(req, ["name", "general"]));
+        return keyed(req, who, "POST /groups", {}, b, async () => ({ status: 201, body: { group: await spaces.createGroup(who, b) } }));
       },
       GET: async (req, url) => {
       const who = await caller(req);
@@ -445,7 +485,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       POST: async (req, p) => {
         const who = await caller(req);
         const b = await body(req, ["email", "role", "expiresAt"]);
-        return json(201, { invite: await createInvite({ caller: who, board: p.board, email: b.email, role: b.role, expiresAt: b.expiresAt ?? null }, admin) });
+        return keyed(req, who, "POST /boards/:board/invites", p, b, async () => ({ status: 201, body: { invite: await createInvite({ caller: who, board: p.board, email: b.email, role: b.role, expiresAt: b.expiresAt ?? null }, admin) } }));
       },
     }],
     ["/boards/:board/invites/:id", { DELETE: async (req, p) => {
@@ -457,8 +497,10 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       POST: async (req, p) => {
         const who = await caller(req);
         const b = await body(req, ["role", "expiresAt"]);
-        const link = await createLink({ caller: who, board: p.board, role: b.role, expiresAt: b.expiresAt ?? null }, admin);
-        return json(201, { link, ...(publicUrl ? { url: `${publicUrl}/links/${encodeURIComponent(link.id)}` } : {}) });
+        return keyed(req, who, "POST /boards/:board/links", p, b, async () => {
+          const link = await createLink({ caller: who, board: p.board, role: b.role, expiresAt: b.expiresAt ?? null }, admin);
+          return { status: 201, body: { link, ...(publicUrl ? { url: `${publicUrl}/links/${encodeURIComponent(link.id)}` } : {}) } };
+        });
       },
     }],
     ["/boards/:board/links/:id", { DELETE: async (req, p) => {
@@ -504,16 +546,25 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
   });
 
   // One deadline for the whole route table (PROTOCOL.md "HTTP request deadline"). The work is not cancellable (the Registry port has no
-  // cancel), so on expiry the 503 wins and the late settlement is dropped here: handled, never an unhandled rejection, never sent.
-  let lastDeadlineWarn = -Infinity;
+  // cancel), so on expiry the 503 wins and the late settlement is dropped here: handled, never an unhandled rejection, never sent;
+  // it is counted and logged (at most one line per 10 s) so an operator sees what finished after the client was told 503.
+  const stat = { deadline: {}, late: { applied: 0, failed: 0 } };
+  let lastWarn = -Infinity, lastLate = -Infinity;
   const withDeadline = (run, what) => new Promise((resolve, reject) => {
     let over = false;
+    const late = (ok, why) => {
+      stat.late[ok ? "applied" : "failed"]++;
+      if (now() - lastLate >= 10_000) { lastLate = now(); log.warn(`${what} finished after its 503 (${ok ? "applied" : "failed"}${why ? ": " + why : ""})`); }
+    };
     const t = timers.set(() => {
       over = true;
-      if (now() - lastDeadlineWarn >= 10_000) { lastDeadlineWarn = now(); log.warn(`request deadline (${deadlineMs} ms) passed on ${what}; answering 503`); }
+      stat.deadline[what] = (stat.deadline[what] ?? 0) + 1;
+      if (now() - lastWarn >= 10_000) { lastWarn = now(); log.warn(`request deadline (${deadlineMs} ms) passed on ${what}; answering 503`); }
       resolve(err(503, "unavailable"));
     }, deadlineMs);
-    (async () => run())().then(v => { if (!over) { timers.clear(t); resolve(v); } }, e => { if (!over) { timers.clear(t); reject(e); } });
+    (async () => run())().then(
+      v => { if (over) late(!(v instanceof Response) || v.status < 400, v instanceof Response ? String(v.status) : ""); else { timers.clear(t); resolve(v); } },
+      e => { if (over) late(false, String(e?.code ?? e?.message ?? e).slice(0, 80)); else { timers.clear(t); reject(e); } });
   });
 
   async function handle(req, url) {
@@ -543,8 +594,10 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       return err(503, "unavailable");
     }
   }
-  /** The route table, for the guard test: every entry is dispatched through withDeadline. */
-  handle.routes = routes.map(r => ({ pattern: r.pattern, methods: Object.keys(r.methods), names: r.names }));
+  /** Deadline hits per "METHOD /pattern" and the late settlements counted since start (for /health). */
+  handle.stats = () => ({ deadlineMs, deadline: { ...stat.deadline }, late: { ...stat.late } });
+  // The route table, for the guard test: every entry is dispatched through withDeadline.
+  testHooks?.routes?.(routes.map(r => ({ pattern: r.pattern, methods: Object.keys(r.methods), names: r.names })));
   return handle;
 }
 

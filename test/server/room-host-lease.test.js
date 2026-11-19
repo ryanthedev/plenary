@@ -329,12 +329,12 @@ test("renew starts before the rebuild: a rebuild longer than the ttl keeps the l
   const Bh = roomHost({ store: raw, bus, holder: "h-b", leaseTtlMs: 1_500 });
   try {
     const opening = A.open(T, B);
-    await renewed.promise;                                                 // four renews in, still mid-rebuild: past the whole ttl
+    await withCeiling(renewed.promise, "four renews during the rebuild");                                                 // four renews in, still mid-rebuild: past the whole ttl
     expect(await raw.acquire(T, B, "h-b", 600)).toBe(null);               // still A's: it renewed while building
     gate.resolve(); await opening;
     expect((await A.peek(T, B))?.durable).toBe(1);
   } finally { await A.close(); await Bh.close(); await raw.close(); await bus.close(); }
-}, 10000);
+}, 45000);   // above the 30 s CEILING_MS wait for the renews
 
 // ---- Round 2 (p4-hostv): each verifier repro as a test ----
 

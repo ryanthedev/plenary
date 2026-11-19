@@ -18,7 +18,7 @@ import { tempDir, cleanup, sleep, until } from "./helpers.js";
 
 afterAll(cleanup);
 
-const TTL = 600;
+const TTL = 3_000;   // a node drops its room after a stall of 2/3 of it: 2 s of event-loop stall is tolerated
 const tok = name => `S3CR3T-roles-${name}`;
 const rect = (id, x) => makeElement("rectangle", { id, x, y: 0, width: 10, height: 10 });
 const op = (client, k) => ({ t: "op", id: `${client}:${k}`, sentAt: 0, stream: "board", op: { elements: [rect(`${client}-${k}`, k)] } });
@@ -113,7 +113,7 @@ test("a gateway-only node with no host answers a writer's hello `unavailable` on
     expect(s.msgs.filter(m => m.t === "error").map(m => m.code)).toEqual(["unavailable"]);
     expect(g.lines.map(l => JSON.parse(l)).find(l => l.msg === "hello failed")).toMatchObject({ what: "room" });
   } finally { await c.stop(); }
-}, 10000);
+}, 45000);   // above the 30 s wait for the close; the real wait is the 3 s ttl
 
 test("gateway-only plus two hosts: one welcome and one ack per op; after the holder stops, the next writer is welcomed by the other", async () => {
   const c = await cluster();

@@ -155,7 +155,7 @@ test("main.js started twice on one data dir: the same board, its acked ops, and 
 // this one constant): a writer's hello in that window is answered `unavailable` (1013) or times out at the gateway,
 // and the client retries, as a real client does. Anything else is a failure, and so is no welcome within the ttl + 30 s (a
 // backstop). That the window is the configured ttl is checked on the lease the dead process left (below), not by a clock.
-const LEASE_TTL_MS = 3_000;   // the server minimum: a node drops its room after a stall of 2/3 of it, so 2 s of stall is tolerated
+const LEASE_TTL_MS = 3_000;   // 3 s: a node drops its room after a stall of 2/3 of its ttl, so this tolerates a 2 s event-loop stall (the ttl itself may be as low as 3 ms)
 const leaseEnv = { PLENARY_LEASE_TTL_MS: String(LEASE_TTL_MS) };
 async function welcomedAfterRestart(port, board, name) {
   const end = Date.now() + LEASE_TTL_MS + 30_000;

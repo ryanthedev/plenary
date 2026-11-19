@@ -1,7 +1,7 @@
 // Cluster isolation on a shared NATS (PROTOCOL.md § Bus, Cluster id; GitHub issue #63). Two clusters, each with its
 // own Postgres database, share ONE NATS server. A foreign cluster's host must never answer a board-open, take a
 // lease, or acknowledge an op into its own Store. Real Postgres and NATS; skips without DATABASE_URL and NATS_URL.
-// Nodes run in this process through start() (the same wiring main.js uses). TTL 3 s is the lowest the server accepts.
+// Nodes run in this process through start() (the same wiring main.js uses). TTL 3 s: a node drops its room after a stall of 2/3 of its ttl, so 2 s of event-loop stall is tolerated (the server accepts as low as 3 ms).
 import { test, expect, afterAll, describe, setDefaultTimeout } from "bun:test";
 import { SQL } from "bun";
 import { start } from "../../server/main.js";

@@ -29,7 +29,7 @@
 import { Database } from "bun:sqlite";
 import { needId, PortError } from "../ids.js";
 import { assertShapes } from "../sqlite/schema.js";
-import { DEFAULT_READ_LIMIT, needBoard, needLeaseEpoch, needTtl, checkAppend, checkRead, fitBytes, checkCheckpoint, checkBeforeSeq } from "./port.js";
+import { DEFAULT_READ_LIMIT, needBoard, needLeaseEpoch, needTtl, checkAppend, checkRead, fitBytes, checkCheckpoint, checkBeforeSeq, checkBlobRefs, checkPend, checkReap } from "./port.js";
 import { encodeSliced } from "../encode/sliced.js";
 import { PART_CHARS, splitParts, headerOf, parseHeader, orphanGroups, headerLike } from "../encode/cp-parts.js";
 
@@ -66,6 +66,14 @@ const createTables = d => {
   d.run(`CREATE TABLE IF NOT EXISTS leases (
     tenant TEXT NOT NULL, board TEXT NOT NULL, epoch INTEGER NOT NULL, holder TEXT, expires_at INTEGER,
     PRIMARY KEY (tenant, board)) WITHOUT ROWID`);
+  // Blob references (PROTOCOL.md § Blobs, "References and purge"): which boards use a hash, the uploads about to be used
+  // (until_at on the store's clock), and the hashes no board uses any more (condemned_at: when; claimed_until: a reaper's claim).
+  d.run(`CREATE TABLE IF NOT EXISTS blob_refs (
+    tenant TEXT NOT NULL, sha1 TEXT NOT NULL, board TEXT NOT NULL, PRIMARY KEY (tenant, sha1, board)) WITHOUT ROWID`);
+  d.run(`CREATE TABLE IF NOT EXISTS blob_pending (
+    tenant TEXT NOT NULL, sha1 TEXT NOT NULL, board TEXT NOT NULL, until_at INTEGER NOT NULL, PRIMARY KEY (tenant, sha1, board)) WITHOUT ROWID`);
+  d.run(`CREATE TABLE IF NOT EXISTS blob_condemned (
+    tenant TEXT NOT NULL, sha1 TEXT NOT NULL, condemned_at INTEGER NOT NULL, claimed_until INTEGER, PRIMARY KEY (tenant, sha1)) WITHOUT ROWID`);
 };
 
 function build(db, { fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3, now = Date.now, partChars = PART_CHARS, onPart, onSkip }) {
@@ -148,11 +156,34 @@ function build(db, { fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3
 
   // BEGIN IMMEDIATE: the write lock is taken before the read, so two handles (two processes) can't both see the
   // same last seq and both insert. The primary key is the second fence.
-  const appendTx = db.transaction((tenant, board, rows, expectSeq, epoch) => {
+  // Blob references. ?1 tenant ?2 sha1 ?3 now. "In use" = a reference of any board, or a pending one that has not expired.
+  const qRef = db.query("INSERT OR IGNORE INTO blob_refs (tenant, sha1, board) VALUES (?, ?, ?)");
+  const qUnpend = db.query("DELETE FROM blob_pending WHERE tenant = ? AND sha1 = ? AND board = ?");
+  const qUncondemn = db.query("DELETE FROM blob_condemned WHERE tenant = ? AND sha1 = ?");
+  const qDelRefs = db.query("DELETE FROM blob_refs WHERE tenant = ? AND board = ? RETURNING sha1");
+  const qDelPend = db.query("DELETE FROM blob_pending WHERE tenant = ? AND board = ? RETURNING sha1");
+  const inUse = `(EXISTS (SELECT 1 FROM blob_refs WHERE tenant = ?1 AND sha1 = ?2) OR EXISTS (SELECT 1 FROM blob_pending WHERE tenant = ?1 AND sha1 = ?2 AND until_at > ?3))`;
+  const qInUse = db.query(`SELECT ${inUse} AS used`);
+  const qCondemn = db.query("INSERT OR IGNORE INTO blob_condemned (tenant, sha1, condemned_at) VALUES (?, ?, ?)");
+  const qLiveClaim = db.query("SELECT 1 AS x FROM blob_condemned WHERE tenant = ? AND sha1 = ? AND claimed_until > ?");
+  const qPend = db.query(`INSERT INTO blob_pending (tenant, sha1, board, until_at) VALUES (?, ?, ?, ?)
+    ON CONFLICT (tenant, sha1, board) DO UPDATE SET until_at = max(until_at, excluded.until_at)`);
+  const qCondemned = db.query(`SELECT tenant, sha1 FROM blob_condemned WHERE condemned_at <= ?1 AND (claimed_until IS NULL OR claimed_until <= ?2)
+    AND (tenant, sha1) > (?3, ?4) ORDER BY tenant, sha1 LIMIT ?5`);
+  const qClaim = db.query(`UPDATE blob_condemned SET claimed_until = ?4 WHERE tenant = ?1 AND sha1 = ?2 AND condemned_at <= ?5
+    AND (claimed_until IS NULL OR claimed_until <= ?3) AND NOT ${inUse}`);
+  const qDropReferenced = db.query(`DELETE FROM blob_condemned WHERE tenant = ?1 AND sha1 = ?2 AND (claimed_until IS NULL OR claimed_until <= ?3)
+    AND EXISTS (SELECT 1 FROM blob_refs WHERE tenant = ?1 AND sha1 = ?2)`);
+  const qReaped = db.query("DELETE FROM blob_condemned WHERE tenant = ? AND sha1 = ? AND claimed_until IS NOT NULL");
+  const qPrune = db.query(`DELETE FROM blob_pending WHERE (tenant, sha1, board) IN (SELECT tenant, sha1, board FROM blob_pending WHERE until_at <= ? LIMIT ?)`);
+
+  const appendTx = db.transaction((tenant, board, rows, expectSeq, epoch, refs) => {
     fence(tenant, board, epoch);   // first: a fenced host hears "fenced" (stop), not "conflict" (rebuild)
     const last = qLast.get(tenant, board).m ?? 0;
     if (last !== expectSeq) throw new PortError("conflict", `board is at seq ${last}, not ${expectSeq}`);
     for (const [seq, data] of rows) qInsert.run(tenant, board, seq, data);
+    // The references ride in the entries' transaction: an acknowledged op always has them. Each replaces the board's pending one and cancels a condemnation.
+    for (const sha1 of refs) { qRef.run(tenant, sha1, board); qUnpend.run(tenant, sha1, board); qUncondemn.run(tenant, sha1); }
   });
 
   const ready = (tenant, board) => {
@@ -167,12 +198,13 @@ function build(db, { fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3
      * Writes every entry or none, only if the board's last seq is `expectSeq` and only if `epoch` is
      * the board's lease epoch (else PortError "fenced"; no epoch at all is "bad-entry": every write is fenced). Resolves once durable.
      */
-    async append(tenant, board, entries, expectSeq, epoch) {
+    async append(tenant, board, entries, expectSeq, epoch, opts) {
       ready(tenant, board);
+      const refs = checkBlobRefs(opts);
       // Everything is checked and serialised before the transaction starts: a bad entry writes nothing.
       const { seqs, datas } = checkAppend(tenant, board, entries, expectSeq, epoch);
       const rows = seqs.map((seq, i) => [seq, datas[i]]);
-      try { appendTx.immediate(tenant, board, rows, expectSeq, epoch); }
+      try { appendTx.immediate(tenant, board, rows, expectSeq, epoch, refs); }
       catch (err) {
         if (err instanceof PortError) throw err;
         // The unique key fired: someone else holds that seq. Same answer as a stale expectSeq.
@@ -308,10 +340,62 @@ function build(db, { fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3
       return { holder: row.holder, epoch: row.epoch, expiresAt: row.expires_at, live, remainingMs: live ? row.expires_at - t : 0 };
     },
 
-    /** Deletes everything the store holds for one board, in one transaction (PROTOCOL.md § Trash and restore, "Purge"). Idempotent. */
+    /**
+     * Deletes everything the store holds for one board, in one transaction (PROTOCOL.md § Trash and restore, "Purge"): its
+     * references too, and every hash that is left with no reference and no live pending one is condemned. Idempotent.
+     */
     async purgeBoard(tenant, board) {
       ready(tenant, board);
-      db.transaction(() => { for (const q of qPurge) q.run(tenant, board); }).immediate();
+      db.transaction(() => {
+        for (const q of qPurge) q.run(tenant, board);
+        const t = clock();
+        const hashes = new Set([...qDelRefs.all(tenant, board), ...qDelPend.all(tenant, board)].map(r => r.sha1));
+        for (const sha1 of hashes) if (!qInUse.get(tenant, sha1, t).used) qCondemn.run(tenant, sha1, t);
+      }).immediate();
+    },
+
+    /** A pending reference, and the end of any condemnation; refused while a reaper's claim is live. */
+    async blobPend(tenant, board, sha1, ttlMs) {
+      ready(tenant, board); checkPend(sha1, ttlMs);
+      db.transaction(() => {
+        const t = clock();
+        if (qLiveClaim.get(tenant, sha1, t)) throw new PortError("unavailable", "the blob is being deleted: ask again shortly");
+        qUncondemn.run(tenant, sha1); qPend.run(tenant, sha1, board, t + ttlMs);
+      }).immediate();
+    },
+
+    /** Condemned long enough and not claimed, in (tenant, sha1) order after the cursor. */
+    async blobCondemned({ graceMs, after = null, limit } = {}) {
+      if (!open) throw new PortError("closed", "the store is closed");
+      checkReap({ graceMs, limit, after });
+      const t = clock();
+      return qCondemned.all(t - graceMs, t, after?.tenant ?? "", after?.sha1 ?? "", limit).map(r => ({ tenant: r.tenant, sha1: r.sha1 }));
+    },
+
+    /** The reaper's conditional claim: only while the hash is still condemned for graceMs, unclaimed and unreferenced. */
+    async blobClaim(tenant, sha1, { graceMs, claimMs } = {}) {
+      needId(tenant, "tenant"); checkPend(sha1, 1); checkReap({ graceMs, claimMs }, { claim: true });
+      if (!open) throw new PortError("closed", "the store is closed");
+      return db.transaction(() => {
+        const t = clock();
+        if (qClaim.run(tenant, sha1, t, t + claimMs, t - graceMs).changes) return true;
+        qDropReferenced.run(tenant, sha1, t);   // a hash a board references is not condemned (a purge raced a new reference)
+        return false;
+      }).immediate();
+    },
+
+    /** The delete is done: drops the claimed condemnation. false = a new reference cancelled it meanwhile. */
+    async blobReaped(tenant, sha1) {
+      needId(tenant, "tenant"); checkPend(sha1, 1);
+      if (!open) throw new PortError("closed", "the store is closed");
+      return db.transaction(() => qReaped.run(tenant, sha1).changes > 0).immediate();
+    },
+
+    /** Deletes at most `limit` expired pending references. */
+    async blobPrune(limit) {
+      if (!open) throw new PortError("closed", "the store is closed");
+      if (!Number.isSafeInteger(limit) || limit < 1) throw new PortError("bad-entry", "limit must be a positive integer");
+      return db.transaction(() => qPrune.run(clock(), limit).changes).immediate();
     },
 
     /** What the store was opened with, read back from SQLite (for /health and tests). */

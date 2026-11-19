@@ -33,7 +33,7 @@ import { ROOT, listFiles, importsOf, checkBoundaries } from "./arch-scan.js";
 
 const SCAN = ["packages", "server", "scripts", "deploy"];   // every non-test code folder but web/ (client's)
 const CORE_DIRS = ["packages/protocol/", "packages/core/", "server/admin/"];
-const CORE_FILES = ["server/gateway.js", "server/room-host.js", "server/feed.js", "server/breather.js", "server/ids.js", "server/log.js", "server/blob-access.js", "server/instrument.js", "server/trash-sweep.js"];
+const CORE_FILES = ["server/gateway.js", "server/room-host.js", "server/feed.js", "server/breather.js", "server/ids.js", "server/log.js", "server/blob-access.js", "server/instrument.js", "server/trash-sweep.js", "server/blob-reaper.js"];
 const ADAPTER_DIRS = ["server/store/", "server/registry/", "server/bus/", "server/blobs/", "server/auth/", "server/compress/", "server/metrics/"];
 const SUPPORT_DIRS = ["server/pg/", "server/sqlite/", "server/encode/"];
 /** Driving adapters, each with its group: server.js serves HTTP/WebSocket (Bun.serve) and mounts static.js. */

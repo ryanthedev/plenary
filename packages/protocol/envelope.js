@@ -64,6 +64,13 @@ export const CHECKPOINT_STATE_RATIO = 4;   // § Recovery, "When": and not befor
 /** A blob's key and an image's `fileId`: a SHA-1 as exactly 40 lowercase hex characters (§ Blobs). */
 export const isSha1 = v => typeof v === "string" && /^[0-9a-f]{40}$/.test(v);
 
+/** The distinct blob hashes the image elements of these entries' ops name (§ Blobs, "References and purge"): deleted elements count (an undo brings them back). */
+export function blobRefsOf(entries) {
+  const out = new Set();
+  for (const e of entries) for (const el of e?.op?.elements ?? []) if (el?.type === "image" && isSha1(el.fileId)) out.add(el.fileId);
+  return [...out];
+}
+
 /** `client:counter` → { client, counter }, or null. The counter is a positive safe integer in plain digits. */
 export function parseOpId(id) {
   if (typeof id !== "string") return null;

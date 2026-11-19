@@ -20,6 +20,7 @@
 //                        exist). S3_ENDPOINT set → all five are required, else the start is refused naming the missing
 //                        ones. S3_SESSION_TOKEN (optional) goes to the client. Never logged.
 //   PLENARY_BLOBS        unset, or `local-disk` (see above); anything else refuses the start. Not with S3_ENDPOINT.
+//   PLENARY_BLOB_REAP_MS     how often a gateway node deletes the pictures no board references any more (PROTOCOL.md § Blobs, "References and purge"), integer ms from 1000 to 86400000, default 600000 (10 min). Safe beside other nodes (a conditional claim).
 //   PLENARY_TRASH_SWEEP_MS   how often this node purges boards past their 30 days in Trash (PROTOCOL.md § Trash and restore), integer ms from 1000 to 86400000, default 600000 (10 min). Every node sweeps; a sweep is idempotent and safe beside another node's.
 //   PLENARY_BLOB_QUOTA_BYTES   per-tenant picture storage, default 10 GiB (a positive integer, else the start is refused)
 //   PLENARY_METRICS_TOKEN  ≥ 16 chars of [A-Za-z0-9-._~+/] (+ trailing =); turns on GET /metrics (Bearer token, PROTOCOL.md § Metrics). Unset: 404, nothing recorded. Never logged.
@@ -96,6 +97,7 @@ import { homeService, recentRecorder } from "./auth/home.js";
 import { spaceService } from "./auth/spaces.js";
 import { accessService } from "./auth/access.js";
 import { trashSweeper } from "./trash-sweep.js";
+import { blobReaper } from "./blob-reaper.js";
 import { bootstrapTenant } from "./admin/tenants.js";
 import { subjects } from "./bus/port.js";
 import { isClusterId } from "./ids.js";
@@ -325,6 +327,8 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   // Every refusal of the cluster env comes before anything is created, connected or listening.
   const { cluster, node, roles, leaseTtlMs, requestDeadlineMs } = nodeConfig(env, hostname ?? osHostname());
   const sweepRaw = env.PLENARY_TRASH_SWEEP_MS;   // checked here, before anything opens
+  const reapRaw = env.PLENARY_BLOB_REAP_MS;
+  if (reapRaw !== undefined && !(/^\d{4,8}$/.test(reapRaw) && Number(reapRaw) >= 1000 && Number(reapRaw) <= 86_400_000)) throw new Error("PLENARY_BLOB_REAP_MS must be an integer from 1000 to 86400000");
   if (sweepRaw !== undefined && !(/^\d{4,8}$/.test(sweepRaw) && Number(sweepRaw) >= 1000 && Number(sweepRaw) <= 86_400_000)) throw new Error("PLENARY_TRASH_SWEEP_MS must be an integer from 1000 to 86400000");
   const dataDir = env.PLENARY_DATA_DIR || "./data";
   mkdirSync(dataDir, { recursive: true });
@@ -505,8 +509,12 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   const sweeper = trashSweeper({ registry: rawRegistry, store, clock: { now: Date.now }, log: log.child({ component: "trash" }) });
   const sweepTimer = setInterval(() => { sweeper.sweep().then(r => { if (r.boards || r.spaces || r.failed) log.info("trash sweep", r); }); }, Number(sweepRaw ?? 600_000));
   sweepTimer.unref?.();
-  return { server, store, bus, registry, log, devBoard, sweeper, oidc, node, roles, cluster, clusterId, leaseTtlMs,
-    async stop() { clearInterval(sweepTimer); await server.stop(); await Promise.race([access.settled().then(() => spaces.settled()), new Promise(r => setTimeout(r, 2000).unref?.())]);   // let grants announcements finish (bounded)
+  // The blob reaper: on a gateway node only (the node that serves pictures; with PLENARY_BLOBS=local-disk it is the one whose disk holds them). Every sweep is idempotent and claimed conditionally, so several nodes are safe.
+  const reaper = roles.gateway ? blobReaper({ store, blobs, clock: { now: Date.now }, log: log.child({ component: "blob-reaper" }), onDeleted: tenant => server.recountBlobs(tenant) }) : null;
+  const reapTimer = reaper && setInterval(() => { reaper.sweep().then(r => { if (r.deleted || r.failed) log.info("blob sweep", r); }); }, Number(reapRaw ?? 600_000));
+  reapTimer?.unref?.();
+  return { server, store, bus, registry, log, devBoard, sweeper, reaper, oidc, node, roles, cluster, clusterId, leaseTtlMs,
+    async stop() { clearInterval(sweepTimer); clearInterval(reapTimer); await server.stop(); await Promise.race([access.settled().then(() => spaces.settled()), new Promise(r => setTimeout(r, 2000).unref?.())]);   // let grants announcements finish (bounded)
       spaces.close();                                   // nothing more starts against the buses and stores closed below
       await bus.close(); await rawStore.close(); await rawRegistry.close(); } };
 }

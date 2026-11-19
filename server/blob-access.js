@@ -4,6 +4,7 @@
 //                                    for it after it has checked the connection's role.
 //   put(token, bytes)                what `PUT /blobs/<token>` does: verify the token, reserve quota, store.
 //   get(token)                       what `GET /blobs/<token>` does: verify the token, read.
+//   recount(tenant)                  the tenant's cached usage is stale (the reaper deleted blobs): the next put reads usage() again.
 // Both answer `{ ok: true, … }` or `{ ok: false, code }` (never throw for a client's mistake); the HTTP adapter
 // (blob-http.js) turns a code into a status. Codes: bad-token, wrong-verb, too-large, bad-length, not-image,
 // hash-mismatch, quota, not-found, unavailable.
@@ -81,6 +82,9 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
   const unavailable = (what, tenant, err) => { log.error(`blob ${what} failed`, { tenant, code: err?.code, err }); return { ok: false, code: "unavailable" }; };
 
   return {
+    /** The tenant's quota count is stale (blobs were deleted): the next put reads `usage` again. A put in flight finishes against the old count, which only errs towards refusing. */
+    recount(tenant) { const st = tenants.get(tenant); if (st) st.ready = null; },
+
     /** The claims of a token for `verb`, or { ok: false, code }: the HTTP adapter checks it before it reads a body. */
     verify,
 

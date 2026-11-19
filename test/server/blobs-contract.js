@@ -113,4 +113,25 @@ export function blobsContract(label, makeBlobs, { skip = false } = {}) {
     expect(await blobs.usage(tb)).toBe(77);
     for (const bad of ["..", "a/b", "", null]) expect(await code(blobs.usage(bad))).toBe("bad-id");
   });
+
+  t(`${label}: delete removes the blob and its bytes from usage, is idempotent, and touches nothing else (another hash, another tenant)`, async () => {
+    const blobs = await makeBlobs(), ta = freshTenant(), tb = freshTenant();
+    const a = fakePng(200, 21), b = fakePng(300, 22), ha = sha1(a), hb = sha1(b);
+    await blobs.put(ta, ha, a); await blobs.put(ta, hb, b); await blobs.put(tb, ha, a);
+    expect(await blobs.delete(ta, ha)).toBeUndefined();
+    expect(await blobs.get(ta, ha)).toBe(null);
+    expect(await blobs.usage(ta)).toBe(300);
+    expect(await blobs.get(ta, hb)).toEqual(b);                 // the neighbour hash
+    expect(await blobs.get(tb, ha)).toEqual(a);                 // the same hash in another tenant
+    await blobs.delete(ta, ha);                                 // again: nothing there is not an error
+    await blobs.delete(ta, sha1(fakePng(50, 23)));              // never stored
+    expect(await blobs.put(ta, ha, a)).toBe(true);              // and it can be stored again
+    expect(await blobs.get(ta, ha)).toEqual(a);
+  });
+
+  t(`${label}: delete checks its ids like put and get`, async () => {
+    const blobs = await makeBlobs(), ta = freshTenant(), h = sha1(fakePng(80, 24));
+    for (const bad of ["..", "../x", "a/b", "", null, "T-A"]) expect(await code(blobs.delete(bad, h))).toBe("bad-id");
+    for (const s of ["../outside", "..", "", h.toUpperCase(), h.slice(1), `${ta}/${h}`, null]) expect(await code(blobs.delete(ta, s))).toBe("bad-id");
+  });
 }

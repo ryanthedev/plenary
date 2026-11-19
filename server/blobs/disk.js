@@ -2,6 +2,7 @@
 //   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB, a hash mismatch, and anything that isn't a PNG/JPEG/GIF/WebP;
 //                              true when it stored the blob, false when the tenant already had it
 //   get(tenant, sha1)          bytes, or null
+//   delete(tenant, sha1)       unlinks the blob (an absent one is fine) and syncs the folder
 //   usage(tenant)              the bytes the tenant's blobs take (a walk of its folder; the quota's starting point)
 // A blob lives at <dir>/<tenant>/<first 2 hex>/<sha1>. Both ids are validated before they touch a path, so there is
 // no traversal and one tenant can't name another's file. Writes go to a temp file, are fsynced, then hard-linked
@@ -65,6 +66,13 @@ export function diskBlobs({ dir }) {
         if (shard.isDirectory()) for (const f of await list(join(dir, tenant, shard.name)))
           if (f.isFile() && isSha1(f.name)) total += (await stat(join(dir, tenant, shard.name, f.name)).catch(() => null))?.size ?? 0;
       return total;
+    },
+
+    /** Removes the blob; idempotent. @returns {Promise<void>} */
+    async delete(tenant, sha1) {
+      const { folder, file } = place(tenant, sha1);
+      try { await unlink(file); } catch (err) { if (err?.code === "ENOENT" || err?.code === "ENOTDIR") return; throw err; }
+      await syncDir(folder);
     },
 
     /** @returns {Promise<Uint8Array | null>} */

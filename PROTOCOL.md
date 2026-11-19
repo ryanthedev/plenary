@@ -1448,7 +1448,7 @@ An **Item** is `{ type: "board", id, title, from: { space: { id, name, personal 
 
 **Purge.** `trashSweeper` (`server/trash-sweep.js`) runs on a timer on **every node with the Registry** (main.js; a node that is not a gateway or room host too), judging **only an injected clock** (`now()`; tests advance it, nobody waits 30 days). Each pass reads `trashDue({ before: now - 30 d, limit, claimed: false })` (own-clock boards and Spaces past their time, oldest first; a board that went with its Space is not offered: it follows its Space), claims them, then works a page of **claimed** rows (`trashDue({ claimed: true, after })`, by id after a cursor the sweeper keeps across sweeps, so a row that keeps failing is retried in turn and never holds the head of every read). Per item:
 1. **Claim** (`purgeClaim`): one conditional write marks the row *purging* if it is still in Trash and past its time (a Space also claims the boards that went with it, **in the same transaction**; a board that went with its Space is claimed **only** that way: `purgeClaim` of it alone is `false` unless its Space already claimed it). From here **Restore is refused** (`409 purged`; `restoreSpace` too, if the Space or any of its boards is claimed): nothing that could still be restored is ever deleted. Every restore clears the purging mark of what it restores, and `purgeBoard` also requires the board to be in Trash.
-2. **Delete the content** through the ports: `Store.purgeBoard(tenant, board)` (log entries, checkpoints, lease row and epoch; idempotent). **Blobs are not deleted**: they are tenant-wide and content-addressed (§ Blobs, "Blobs are tenant-wide, by decision"), shared by the Unit's other boards, and no index says which boards use a hash; per-board blob references and the purge of unreferenced blobs are issue #92.
+2. **Delete the content** through the ports: `Store.purgeBoard(tenant, board)` (log entries, checkpoints, lease row and epoch, **and the board's blob references**, which condemns the blobs nothing else references, in the same transaction; idempotent). The blob bytes themselves are deleted later by the blob reaper (§ Blobs, "References and purge"), never in the purge's own path.
 3. **Delete the Registry rows** (`purgeBoard`: grants, scoped grants, invites, links and uses, recents, stars, access requests and the board, one transaction; a Space: `purgeSpace` after its boards, its scoped grants and requests). Both refuse (`false`) for a row that was not claimed (`purgeBoard`: or is not in Trash). A claimed row whose Store purge or Registry delete failed stays claimed and is retried; `purgeSpace` waits (`false`) while a board of it remains.
 **Failure.** Every step is idempotent and ordered so a crash leaves a claimed row that still lists in `trashDue({ claimed: true })`: the next pass (on any node) resumes at step 2 or 3; a failed item is logged and left for a later pass, the pass goes on with the rest. A failed Space claim claims nothing, so its boards stay restorable. Two nodes purging one board at once both succeed (deletes of absent rows are no-ops, the claim is a conditional write). A pass handles at most `limit` boards and Spaces; a sweep makes at most `passes` passes and reports `more` when it stopped full (the next timer tick goes on).
 
@@ -1639,8 +1639,13 @@ Postgres. In short:
 
 | Call | Contract |
 |---|---|
-| `purgeBoard(tenant, board)` | Deletes the board's log entries, checkpoints (and parts) and lease: the Trash purge, after the Registry claim. Idempotent (an absent board is a no-op). Blobs are not touched. |
-| `append(tenant, board, entries, expectSeq, epoch)` | atomic: writes every entry or none, only if `epoch` is the board's lease epoch (else `fenced`, checked first) and the board's last `seq` is `expectSeq` (else `conflict`); no epoch is `bad-entry` |
+| `purgeBoard(tenant, board)` | Deletes the board's log entries, checkpoints (and parts), lease, blob references and pending blob references, and **condemns** every hash that is left with no reference and no live pending one (§ Blobs, "References and purge"), all in ONE transaction: the Trash purge, after the Registry claim. Idempotent (an absent board is a no-op). Blob bytes are not touched. |
+| `append(tenant, board, entries, expectSeq, epoch, { blobRefs }?)` | atomic: writes every entry or none, only if `epoch` is the board's lease epoch (else `fenced`, checked first) and the board's last `seq` is `expectSeq` (else `conflict`); no epoch is `bad-entry`. `blobRefs` (the SHA-1 `fileId`s of the entries' image elements, at most 100,000, each 40 lowercase hex, else `bad-entry`) are recorded as the board's references in the SAME transaction, which also turns each one's pending reference into a real one and cancels the hash's condemnation |
+| `blobPend(tenant, board, sha1, ttlMs)` | records a **pending** reference (until the Store's clock + `ttlMs`, at most one day) for an upload about to happen and cancels the hash's condemnation; `unavailable` while a reaper holds a live claim on the hash (ask again) |
+| `blobCondemned({ graceMs, after?, limit })` | `[{ tenant, sha1 }]` condemned at least `graceMs` ago on the Store's clock and not claimed, ascending by `(tenant, sha1)` after the cursor `after` (a row of the same shape), at most `limit` (1 to 1,000) |
+| `blobClaim(tenant, sha1, { graceMs, claimMs })` | the reaper's conditional claim: true (and the hash is claimed for `claimMs`) only if the hash is condemned for `graceMs`, not claimed, **still unreferenced and with no live pending reference**; a hash that turns out referenced loses its condemnation; false otherwise |
+| `blobReaped(tenant, sha1)` | after the bytes are deleted: removes the claimed condemnation; false when a new reference cancelled it while the delete ran |
+| `blobPrune(limit)` | deletes at most `limit` expired pending references; returns the count |
 | `read(tenant, board, fromSeq, limit, maxBytes?) → entries` | ascending `seq`, at most `limit` (capped at 10,000); `maxBytes` stops the page near that much text; the array carries `bytes` |
 | `lastSeq(tenant, board)` | the board's last `seq`, 0 = empty |
 | `putCheckpoint(tenant, board, cp, epoch)`, `getCheckpoint(tenant, board, beforeSeq?) → cp \| null` | the highest `seq` wins, never the last write; fenced like `append`; `beforeSeq` finds the one before a bad checkpoint |
@@ -1819,7 +1824,8 @@ What one live frame costs a gateway for N viewers, measured by `scripts/fanout-b
 ### Blobs
 
 - `put(tenant, sha1, bytes) → boolean` (true: stored now; false: the tenant already had it), `get(tenant, sha1) → bytes | null`,
-  `usage(tenant) → bytes` (the total the tenant's blobs take; the quota's starting point).
+  `usage(tenant) → bytes` (the total the tenant's blobs take; the quota's starting point),
+  `delete(tenant, sha1)` (removes the blob; idempotent: an absent blob is not an error; the blob reaper's only way to delete).
 - **No token on HTTP.** A client asks over its socket (on the connection that has been welcomed, never a second one):
   `{ t: "blob", sha1, put?: true }`; the gateway checks the role and answers `{ t: "blob", sha1, url }`, a signed URL
   scoped to (tenant, board, sha1, GET or PUT), valid 5 minutes. The tenant and board are the connection's, never the
@@ -1876,9 +1882,19 @@ What one live frame costs a gateway for N viewers, measured by `scripts/fanout-b
   for `welcome` and are asked again after every reconnect.
 - Bytes never travel in ops. A blob is stored once per tenant, shared by that tenant's boards.
 
-## Known limits of v1.1
+#### References and purge (#92)
 
-- **Purge leaves blobs.** Blobs are per-Unit and content-addressed with no per-board index, so a purged board's blobs stay (and count against the quota) until per-board blob references and a purge of unreferenced blobs exist. Not built: issue #92 (TECH-DEBT.md row 52).
+Blobs are per-Unit and content-addressed, so a hash may be used by several boards. The Store keeps the index that says which.
+- **References.** `pl_blob_refs (tenant, sha1, board)` (SQLite `blob_refs`). The room host reads the image `fileId`s of the entries it appends (`blobRefsOf`, `packages/protocol/envelope.js`: every element with `type: "image"` and a SHA-1 `fileId`, deleted ones too, since an undo brings them back) and hands them to `Store.append`, which writes them in the entries' own transaction: an acknowledged op always has its references. References are only ever removed by `purgeBoard`. They **survive Trash**, so a Restore never misses a blob. The log is never pruned and checkpoints are folded from it, so a checkpoint holds no reference the entries do not.
+- **Pending references.** `pl_blob_pending (tenant, sha1, board, until)`. The gateway records one (`blobPend`, 10 minutes, `BLOB_PENDING_MS`) before it signs a PUT URL, so an upload that lands before its op is not condemned. The op's append replaces it; `blobPrune` deletes expired ones.
+- **Condemned.** `pl_blob_condemned (tenant, sha1, at, claimed_until)`. `purgeBoard` condemns each hash that was this board's and now has no reference and no live pending one (a hash shared with another board is kept). A new reference (`append`, `blobPend`) cancels the condemnation.
+- **The reaper** (`server/blob-reaper.js`, a timer on every gateway node, `PLENARY_BLOB_REAP_MS`, default 10 minutes) works on an injected Clock: per pass at most `limit` items read after a cursor it keeps (a stuck item never holds the head), a time budget per sweep. Per item: `blobClaim` (condemned for at least the grace, `BLOB_GRACE_MS` = 60 minutes, which must exceed the URL TTL, 5 minutes; not claimed; **still unreferenced**, pending included) then `Blobs.delete` then `blobReaped`. The claim is a conditional write, so two nodes never delete one hash twice at once; deletes are idempotent; a claim expires (`claimMs`, 2 minutes) so a node that died mid-delete costs one retry. A failure is logged and the item is retried by a later pass; the sweep never throws.
+- **Residual race.** A reference that lands in the milliseconds between a claim and its delete, without an earlier `blobPend`, cancels the condemnation but cannot stop the delete: `blobReaped` then returns false and the reaper logs an error ("blob reaped under a new reference"). The op is kept; the picture's bytes must be uploaded again. An upload always asks for a PUT URL first, and that is refused (`unavailable`) while a claim is live, so only a reference with no upload (a pasted element whose bytes the client skips) can hit it.
+- **Quota.** After a sweep deletes blobs, the reaper's node drops each affected tenant's cached usage (`access.recount`), so the next put reads `usage(tenant)` again (a walk of the folder or a paged list). Other nodes keep their older, larger count until their next restart (the same per-node limit as § Quota), which only errs towards refusing.
+- **No backfill.** A store from before this version has no references: its boards' blobs are never condemned by a purge, and a hash first referenced after the upgrade may be condemned by another board's purge while an old board still uses it. Reset the store (pre-launch data).
+- **Never referenced, never deleted.** An upload whose op never came (pending expired, no reference) is not condemned; only the quota bounds it.
+
+## Known limits of v1.1
 
 - **`layers` is one key.** Two editors changing layers at once no longer lose one silently: the second gets
   `stale-setting` and its app re-applies the change on the current list. Still per key, not per layer: editing
@@ -1894,7 +1910,7 @@ What one live frame costs a gateway for N viewers, measured by `scripts/fanout-b
   page is served from (unset, the URL is a path and always is).
 - **SHA-1 keys, first put wins:** a tenant writer able to make a chosen-prefix collision could plant bytes another
   user's image later resolves to. Small in practice; the fix (key by SHA-256, keep `fileId` as a lookup) is open.
-- Blobs are never garbage-collected; only the quota bounds them.
+- Blobs are deleted only when their last board is purged from Trash (§ Blobs, "References and purge"); an upload that was never referenced stays, bounded by the quota.
 - Tombstones are never compacted; the stream caps count them.
 - **The log grows forever in M2** (never pruned).
 - **Durability is per Store node** (§ Store): losing that node's disk, or failing over to a replica that lags,

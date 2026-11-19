@@ -2,6 +2,7 @@
 //   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB, a hash mismatch, and anything that isn't a PNG/JPEG/GIF/WebP;
 //                              true when it stored the blob, false when the tenant already had it
 //   get(tenant, sha1)          bytes, or null when there is no such blob (every other failure throws)
+//   delete(tenant, sha1)       removes the object (S3's DELETE answers 204 for an absent key too: idempotent)
 //   usage(tenant)              the bytes the tenant's objects take (a paged ListObjectsV2 of `<tenant>/`)
 // A blob is the object `<tenant>/<sha1>` in one bucket. Both ids are validated before they reach a key, so one
 // tenant can't name another's object. An S3 PUT is atomic (readers see the whole object or none) and durable once
@@ -106,6 +107,17 @@ export function s3Blobs({ endpoint, bucket, region, accessKeyId, secretAccessKey
           if (!page.isTruncated || !keys.length) return total;
           startAfter = keys[keys.length - 1].key;
         }
+      });
+    },
+
+    /** Removes the object; idempotent. @returns {Promise<void>} */
+    async delete(tenant, sha1) {
+      const k = key(tenant, sha1);
+      return within(putTimeoutMs, "delete", async signal => {
+        const res = await call(signal, putTimeoutMs, "delete", s3.presign(k, { method: "DELETE", expiresIn: SIGNED_FOR }), { method: "DELETE" });
+        if (res.status === 404 && (await s3Code(res)) === "NoSuchKey") return;   // a missing bucket is an error, a missing key is done
+        if (!res.ok) throw await failed("delete", res);
+        await res.arrayBuffer();                    // drain, so the connection is reusable
       });
     },
 

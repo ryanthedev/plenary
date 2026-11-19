@@ -92,6 +92,8 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
     url: `http://${hostname}:${server.port}`,
     wsUrl: `ws://${hostname}:${server.port}/ws`,
     gateway: gw, rooms, blobs, site,
+    /** The blob reaper's hook (PROTOCOL.md § Blobs, "Quota"): drops a tenant's cached usage after deletes. A no-op on a node with no blob access. */
+    recountBlobs: tenant => access?.recount(tenant),
     /** Stop taking connections, close sockets, stop rooms. Does not close the store or the bus (the caller's). */
     async stop() { unserve(); if (gw) await gw.close(); await server.stop(true); await rooms.close(); log.info("server stopped", { port: server.port }); },
   };

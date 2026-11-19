@@ -196,7 +196,8 @@ right they use at start-up, so a role with `USAGE` but missing grants is refused
 
 - **Registry:** `SELECT, INSERT, UPDATE, DELETE` on every `reg_*` table.
 - **Store:** `SELECT, INSERT, DELETE` on `pl_entries` (DELETE: the Trash purge); `SELECT, INSERT, DELETE` on `pl_checkpoints` and on `pl_checkpoint_parts`; `SELECT, INSERT, UPDATE, DELETE`
-  on `pl_leases` (the epoch fence's `FOR SHARE` needs `UPDATE`; the Trash purge `DELETE`).
+  on `pl_leases` (the epoch fence's `FOR SHARE` needs `UPDATE`; the Trash purge `DELETE`); `SELECT, INSERT, DELETE` on `pl_blob_refs` (DELETE: the Trash purge);
+  `SELECT, INSERT, UPDATE, DELETE` on `pl_blob_pending` (UPDATE: a second upload request extends the pending reference) and on `pl_blob_condemned` (UPDATE: the blob reaper's claim). Blob references and the reaper: PROTOCOL.md § Blobs, "References and purge".
 
 Step 3's grants cover both.
 
@@ -258,7 +259,7 @@ Pictures: with `S3_ENDPOINT` set (all five `S3_*` required) their bytes go to th
 **refuses to start** (another node could not read what this one stored); `PLENARY_BLOBS=local-disk` opts a cluster with
 a single gateway into the node's own disk (the start warns). Signed picture URLs are keyed from `COOKIE_KEY` (same on
 every node) and name `PUBLIC_URL` when it is set. `PLENARY_BLOB_QUOTA_BYTES` sets the per-tenant limit (default 10 GiB;
-enforced per node, see PROTOCOL.md Known limits).
+enforced per node, see PROTOCOL.md Known limits). A gateway node deletes the pictures no board references any more (the board was purged from Trash, and 60 minutes passed) every `PLENARY_BLOB_REAP_MS` (default 600000; 1000 to 86400000); with `PLENARY_BLOBS=local-disk` run it on the node whose disk holds the pictures (the one gateway).
 
 Put the four required secrets in `deploy/.env` (git-ignored) or your shell, with your own values. Use letters and
 digits for `POSTGRES_PASSWORD`, because it goes into `DATABASE_URL` unescaped. `COOKIE_KEY` is one value that Compose

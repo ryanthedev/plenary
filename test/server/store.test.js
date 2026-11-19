@@ -22,6 +22,9 @@ storeContract("sqlite", async opts => {
       putCheckpointRow: async (t, b, seq, data) => one("INSERT INTO checkpoints (tenant, board, seq, data) VALUES (?, ?, ?, ?)", t, b, seq, data),
       putPartRow: async (t, b, seq, wid, n, data) => one("INSERT INTO checkpoint_parts (tenant, board, seq, wid, n, data) VALUES (?, ?, ?, ?, ?, ?)", t, b, seq, wid, n, data),
       partRows: async (t, b) => raw.query("SELECT count(*) AS c FROM checkpoint_parts WHERE tenant = ? AND board = ?").get(t, b).c,
+      putRefRow: async (t, b, sha1) => one("INSERT OR IGNORE INTO blob_refs (tenant, sha1, board) VALUES (?, ?, ?)", t, sha1, b),
+      refRows: async (t, b) => raw.query("SELECT count(*) AS c FROM blob_refs WHERE tenant = ? AND board = ?").get(t, b).c,
+      pendingRows: async (t, b) => raw.query("SELECT count(*) AS c FROM blob_pending WHERE tenant = ? AND board = ?").get(t, b).c,
     } };
 });
 
@@ -110,4 +113,19 @@ test("a header whose parts hold the wrong number of chars is refused as corrupt,
   await store.putCheckpoint(T, B, { seq: 2, small: true }, epoch);                   // an older, readable one is what a caller steps back to
   expect(await store.getCheckpoint(T, B)).toEqual({ seq: 2, small: true });
   raw.close(); await store.close();
+});
+
+test("#92 no backfill: a blob table with other columns than this version's is an old-format store (refused, left as found); a file with none of them just gets them", () => {
+  for (const table of ["blob_refs", "blob_pending", "blob_condemned"]) {
+    const path = join(tempDir(), "plenary.db");
+    const old = new Database(path, { create: true });
+    old.run(`CREATE TABLE ${table} (tenant TEXT NOT NULL, sha1 TEXT NOT NULL)`);
+    old.close();
+    let err;
+    try { sqliteStore({ path }); } catch (e) { err = e; }
+    expect(err?.code).toBe("old-format");
+    expect(err.message).toContain(table);
+  }
+  const fresh = sqliteStore({ path: join(tempDir(), "plenary.db") });
+  return fresh.blobPrune(1).then(n => { expect(n).toBe(0); return fresh.close(); });
 });

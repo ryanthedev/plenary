@@ -3,7 +3,8 @@
 // Order, per board (every step idempotent, so a crash at any point leaves a claimed row that `trashDue({ claimed: true })` still lists and the next pass, on any node, resumes):
 //   1. claim    `purgeClaim`: one conditional write; from here a Restore is refused, so nothing restorable is ever deleted. A board that went to Trash with its Space is claimed only
 //               WITH its Space (the Registry refuses it alone), so a restorable board is never claimed; the sweeper reads only own-clock boards and Spaces as unclaimed work.
-//   2. content  `Store.purgeBoard`: the log, checkpoints and lease. (Blobs are tenant-wide and shared by the Unit's other boards: not deleted, see the protocol.)
+//   2. content  `Store.purgeBoard`: the log, checkpoints, lease and blob references; in the same transaction it condemns the hashes nothing else references. The bytes go later,
+//               through the blob reaper (server/blob-reaper.js), never here.
 //   3. rows     `Registry.purgeBoard`: grants, invites, links and the rest, then the board.
 // A Space: claim (which claims the boards that went with it), purge those boards, then `purgeSpace` once none references it.
 // Starvation: unclaimed work is read oldest first and each item leaves that list once claimed; claimed rows are read by id after a cursor kept here across sweeps, so a row that keeps failing

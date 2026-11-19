@@ -2,6 +2,7 @@
 //   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB, a hash mismatch, and anything that isn't a PNG/JPEG/GIF/WebP
 //   get(tenant, sha1)          bytes, or null
 //   usage(tenant)             the total bytes the tenant's blobs take (the quota's starting point)
+//   delete(tenant, sha1)      removes the blob; idempotent (an absent blob is not an error); only the blob reaper (server/blob-reaper.js) calls it
 // Shared port pieces, no adapter code: adapters never import each other.
 //
 // Errors are PortError codes: bad-id (tenant or sha1), bad-entry (not bytes, or empty), too-large, hash-mismatch, not-image.
@@ -9,19 +10,24 @@
 // Blobs are per tenant: the same sha1 under two tenants is two blobs. An infrastructure failure rejects (never null).
 
 /** The method names every Blobs adapter has (test/server/adapter-surface.test.js). */
-export const BLOBS_METHODS = Object.freeze(["put", "get", "usage"]);
+export const BLOBS_METHODS = Object.freeze(["put", "get", "usage", "delete"]);
 
 /**
  * @typedef {{
  *   put(tenant: string, sha1: string, bytes: Uint8Array): Promise<boolean>,
  *   get(tenant: string, sha1: string): Promise<null | Uint8Array>,
  *   usage(tenant: string): Promise<number>,
+ *   delete(tenant: string, sha1: string): Promise<void>,
  * }} Blobs
  */
 
 import { isSha1, PortError } from "../ids.js";
 
 export const MAX_BLOB_BYTES = 10 * 1024 * 1024;
+/** How long a pending reference (PROTOCOL.md § Blobs, "References and purge") protects an upload: its signed URL lives 5 minutes, and the op that references it follows. */
+export const BLOB_PENDING_MS = 10 * 60_000;
+/** How long a hash stays condemned before the reaper may delete it: well past the signed URL's 5 minutes and the pending window. */
+export const BLOB_GRACE_MS = 60 * 60_000;
 
 /** "png" | "jpeg" | "gif" | "webp" | null, from the first bytes. SVG (and everything else) is null. */
 export function imageKind(b) {

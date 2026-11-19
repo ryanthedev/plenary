@@ -691,3 +691,29 @@ for (const seed of [1, 2]) test(`clients converge through the Room over real soc
   noSecrets(r);
   await r.stop();
 }, 30000);
+
+test("onWelcomed (Recent, PROTOCOL.md § Home): called once per welcomed connection with the user and board; never for a refused hello; a throwing hook doesn't drop the connection", async () => {
+  const seen = [];
+  const r = await rig({ onWelcomed: (u, b) => { seen.push([u, b]); if (u === "dev:viewer") throw new Error("boom"); } });
+  const stranger = await r.sock();
+  stranger.send(hello(r, "stranger"));
+  await stranger.next(m => m.t === "error");
+  expect(seen).toEqual([]);
+  const ed = await r.sock(); ed.send(hello(r, "editor")); await ed.next(m => m.t === "welcome");
+  const vw = await r.sock(); vw.send(hello(r, "viewer")); await vw.next(m => m.t === "welcome");   // a viewer's welcome is the gateway's own
+  expect(seen).toEqual([["dev:editor", r.ids.board], ["dev:viewer", r.ids.board]]);
+  ed.send({ t: "op", id: "raw:2", sentAt: 0, stream: "board", op: { elements: [rect("h")] } });
+  await ed.next(m => m.t === "ack" && m.id === "raw:2");                                           // the editor's connection still works
+  await r.stop();
+});
+
+test("a welcomed connection reaches Recent through recentRecorder over a real Registry", async () => {
+  const { memoryRegistry } = await import("../../server/auth/registry.js");
+  const { recentRecorder } = await import("../../server/auth/home.js");
+  const registry = memoryRegistry();
+  const r = await rig({ registry, onWelcomed: recentRecorder({ registry }) });
+  const s = await r.sock(); s.send(hello(r, "editor")); await s.next(m => m.t === "welcome");
+  await until(async () => (await registry.recents("dev:editor")).length === 1);
+  expect((await registry.recents("dev:editor"))[0].board).toBe(r.ids.board);
+  await r.stop();
+});

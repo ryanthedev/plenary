@@ -45,6 +45,10 @@
 //   POST   /boards/:board/links                { role, expiresAt? } → 201 { link, url? }
 //   DELETE /boards/:board/links/:link          → 204
 //   PUT    /boards/:board/grants/:user         { role | null } → 204   (user ids are URL-encoded, e.g. google%3A123)
+//   GET    /home                               → { guest, user, unit, recent, starred, shared, tree, limits }   (needs `home`; PROTOCOL.md § Home)
+//   GET    /home/search?q=                     → { q, results, more }   (q: 1-100 chars, else 400)
+//   PUT    /home/stars/:board                  → 204 (403 `forbidden` without a role on the board)
+//   DELETE /home/stars/:board                  → 204
 //   GET    /links/:link                        redeem: Bearer → 200 { board, url }; no Bearer → sign in first,
 //                                              the link rides in the login cookie, the callback redeems it
 //
@@ -115,7 +119,7 @@ const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
  *   now?: () => number, config: object, dev?: { enabled?: boolean, verify(t: string): Promise<object|null> } | null,
  *   testHooks?: { pruned?(p: { visited: number, expired: number, live: number }): void } | null }} deps   (tests only, not an API)
  */
-export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Date.now, config = {}, dev = null, log = stdoutLog, testHooks = null }) {
+export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, config = {}, dev = null, log = stdoutLog, testHooks = null }) {
   if (!registry || !sessions || !tenancy) throw new Error("http: registry, sessions and tenancy are required");
   const postLoginUrl = absUrl(config.postLoginUrl, "postLoginUrl");
   const postLogoutUrl = config.postLogoutUrl ? absUrl(config.postLogoutUrl, "postLogoutUrl") : postLoginUrl;
@@ -424,6 +428,19 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
       await setGrant({ caller: who, board: p.board, user: p.user, role: b.role }, admin);
       return json(204);
     } }],
+    ...(home ? [
+      ["/home", { GET: async req => json(200, await home.home(await caller(req))) }],
+      ["/home/search", { GET: async (req, url) => {
+        const who = await caller(req);
+        const q = (url.searchParams.get("q") ?? "").trim();
+        if (!q || q.length > 100 || q.includes("\0")) throw refuse(400, "bad-request");
+        return json(200, await home.search(who, q));
+      } }],
+      ["/home/stars/:board", {
+        PUT: async (req, p) => { if (!(await home.star(await caller(req), p.board, true))) throw new AdminError("forbidden", "not allowed"); return json(204); },
+        DELETE: async (req, p) => { await home.star(await caller(req), p.board, false); return json(204); },
+      }],
+    ] : []),
     ["/links/:id", { GET: async (req, p) => {
       if (!req.headers.has("authorization")) return beginLogin(p.id.slice(0, 128));
       const who = await caller(req);

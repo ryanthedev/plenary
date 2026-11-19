@@ -89,6 +89,7 @@ export const mint = {
  * @typedef {{ tenant: Tenant, board: Board|null, space: Space|null, group: Group|null,
  *   scoped: { unit: ScopedGrant[], group: ScopedGrant[], space: ScopedGrant[], board: ScopedGrant[] },
  *   roles: CustomRole[], teams: Record<string, string[]> }} AccessContext   `scoped`: the grants on each scope of the chain (a board's are Team grants only; user grants on a board are `grants`); `roles`: the Unit's stored roles; `teams`: for each Team that appears in `scoped`, its members (only those named in `users`, when given)
+ * @typedef {{ board: Board, grant: Role|null, teamGrants: ScopedGrant[], myTeams: string[], invites: Invite[], links: Link[] }} BoardRows   `teamGrants`: Team grants on the board; `myTeams`: those of the user's Teams that appear in `teamGrants`; `invites`: non-revoked, to the user's email; `links`: the link records of the user's uses on this board
  * @typedef {{ id: string, board: string, email: string, role: Role, expiresAt: number|null, revoked: boolean, by: string, createdAt: number }} Invite
  * @typedef {{ id: string, board: string, role: Role, expiresAt: number|null, revoked: boolean, by: string, createdAt: number }} Link
  *
@@ -137,8 +138,25 @@ export const mint = {
  *   addLinkUse(link: string, user: string): Promise<void>,
  *   linkUses(board: string, user: string): Promise<string[]>,
  *   linkUsesFor?(board: string, users: string[]): Promise<Map<string, string[]>>,   // OPTIONAL batch (below)
+ *   markOpened(user: string, board: string): Promise<void>,   // Home (PROTOCOL.md § Home): Recent. Upserts (user, board) at now(); keeps the user's newest RECENT_KEEP rows; rejects an unknown board
+ *   recents(user: string, o?: { limit?: number }): Promise<{ board: string, at: number }[]>,   // newest first; limit default 12, at most RECENT_KEEP
+ *   setStarred(user: string, board: string, on: boolean): Promise<void>,   // idempotent; rejects an unknown board when starring; un-starring never rejects
+ *   starred(user: string, o?: { limit?: number }): Promise<{ board: string, at: number }[]>,   // newest star first; limit default 50, at most STAR_SCAN
+ *   starredAmong(user: string, boards: string[]): Promise<string[]>,   // those of `boards` (at most BATCH) the user starred
+ *   sharedBoards(user: string, email: string|null, o?: { limit?: number }): Promise<string[]>,   // boards with a board-scope source other than ownership: a non-owner grant, a non-revoked invite to `email`, a redeemed link; by id, at most SHARED_SCAN
+ *   searchBoards(tenant: string, o?: { q?: string, unfiled?: boolean, after?: string|null, limit?: number }): Promise<{ ids: string[], next: string|null }>,   // board ids in a Unit whose title or Space's name contains q (case-insensitive, literal); `unfiled`: boards in no Space (q then matches the title); by id, one bounded page (default 100, at most 200)
+ *   boardRows(boards: string[], o: { user: string, email?: string|null }): Promise<Map<string, BoardRows>>,   // the board-scope rows the resolver reads for one user over at most BATCH boards, in a fixed number of statements; unknown ids are absent
  * }} Registry
  */
+
+/** Home (PROTOCOL.md § Home): rows kept per user in Recent, rows a starred / shared read may return, and the most boards one `boardRows` / `starredAmong` call takes. */
+export const HOME = { recentKeep: 50, starScan: 200, sharedScan: 200, batch: 200, searchPage: { default: 100, max: 200 } };
+/** A page limit for `searchBoards`. */
+export const searchLimit = n => Math.min(HOME.searchPage.max, Math.max(1, Math.floor(Number(n) || HOME.searchPage.default)));
+/** A small read's limit: default `d`, at least 1, at most `max`. */
+export const smallLimit = (n, d, max) => Math.min(max, Math.max(1, Math.floor(Number(n) || d)));
+/** The `q` of `searchBoards`: a string, trimmed, 1-100 chars; else "registry: bad query". */
+export const searchQuery = q => { const t = typeof q === "string" ? q.trim() : ""; if (!t || t.length > 100 || t.includes("\0")) throw new Error("registry: bad query"); return t; };
 
 /** Page size for `boardsIn` / `scopesOf`: default and cap. */
 export const PAGE = { default: 500, max: 1000 };

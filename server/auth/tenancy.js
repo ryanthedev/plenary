@@ -19,6 +19,7 @@
 
 import { normEmail } from "./util.js";
 import { resolveAccess, teamIndex } from "./resolver.js";
+import { HOME } from "./registry-port.js";
 
 /** @typedef {import("./registry-port.js").Registry} Registry */
 /** @typedef {import("./registry-port.js").Role} Role */
@@ -150,6 +151,36 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
       if (scope.type === "board") return accessOn(identity, scope.id);
       const ctx = await registry.accessContext(scope, { users: [identity.user] });
       return ctx ? resolveAccess({ ctx }, identity, now(), opts) : nothing();
+    },
+    /**
+     * One user's access to many boards (PROTOCOL.md § Home, "Boards I can open"): `registry.boardRows` reads every board-scope
+     * row for the whole batch in a fixed number of statements, plus ONE `accessContext` per distinct Space (or Unit, for unfiled
+     * boards) among them, then the same pure `resolveAccess` as `effective`, so it can't disagree with it. At most HOME.batch
+     * ids. Unknown boards are absent. @returns {Promise<Map<string, { access: import("./resolver.js").Access, board: Board, space: object|null, group: object|null }>>}
+     */
+    async accessMany(identity, boardIds) {
+      const out = new Map();
+      if (!okIdentity(identity) || !Array.isArray(boardIds) || !boardIds.length) return out;
+      const rows = await registry.boardRows(boardIds.slice(0, HOME.batch), { user: identity.user, email: identity.email ?? null });
+      const scopeOf = b => (b.space ? { type: "space", id: b.space } : { type: "unit", id: b.tenant });
+      const keyOf = sc => sc.type + "\n" + sc.id;
+      const scopes = new Map();
+      for (const r of rows.values()) scopes.set(keyOf(scopeOf(r.board)), scopeOf(r.board));
+      const ctxs = new Map(), todo = [...scopes];
+      for (let i = 0; i < todo.length; i += 8)
+        await Promise.all(todo.slice(i, i + 8).map(async ([k, sc]) => ctxs.set(k, await registry.accessContext(sc, { users: [identity.user] }))));
+      const t = now();
+      for (const [id, r] of rows) {
+        const base = ctxs.get(keyOf(scopeOf(r.board)));
+        if (!base) continue;
+        const teams = { ...base.teams };
+        for (const g of r.teamGrants) if (g.subject.type === "team" && !(g.subject.id in teams)) teams[g.subject.id] = r.myTeams.includes(g.subject.id) ? [identity.user] : [];
+        const ctx = { ...base, board: r.board, scoped: { ...base.scoped, board: r.teamGrants }, teams };
+        const links = r.links.map(l => l);
+        const access = resolveAccess({ ctx, grant: r.grant, invites: r.invites, links }, identity, t, opts);
+        out.set(id, { access, board: r.board, space: base.space, group: base.group });
+      }
+      return out;
     },
     /** @returns {Promise<Map<string, Role|null>>} identityKey(identity) → role, one entry per distinct requested identity */
     async rolesFor(boardId, identities) {

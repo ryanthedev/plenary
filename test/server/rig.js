@@ -78,7 +78,7 @@ export async function rig(o = {}) {
   bus.subscribe(subjects.inbox(ids.tenant, ids.otherBoard), m => inbox.push(m));
   // Catch-up frames are the gateway's now (its board feed): the scaffold's room-host knobs map onto the feed's.
   const feed = { ...(o.host?.chunkBytes ? { chunkBytes: o.host.chunkBytes } : {}), ...(o.host?.tailFoldBytes ? { rebaseBytes: Math.max(1, Math.floor(o.host.tailFoldBytes / 4)) } : {}), ...(o.limits?.feed ?? {}) };
-  const server = createServer({ auth, registry: reg, store, bus, blobs: diskBlobs({ dir: join(dir, "blobs") }), log, port: 0, limits: { opRate: 1e6, opBurst: 1e6, ...(o.limits ?? {}), feed }, host: { heartbeatMs: HEARTBEAT_MS, ...o.host }, ...(o.now ? { now: o.now } : {}), ...(o.timers ? { timers: o.timers } : {}) });   // the gateway's op pace is off unless a test sets it
+  const server = createServer({ auth, registry: reg, store, bus, ...(o.onWelcomed ? { onWelcomed: o.onWelcomed } : {}), blobs: diskBlobs({ dir: join(dir, "blobs") }), log, port: 0, limits: { opRate: 1e6, opBurst: 1e6, ...(o.limits ?? {}), feed }, host: { heartbeatMs: HEARTBEAT_MS, ...o.host }, ...(o.now ? { now: o.now } : {}), ...(o.timers ? { timers: o.timers } : {}) });   // the gateway's op pace is off unless a test sets it
 
   const self = {
     dir, lines, log, registry, ids, store, rawStore, bus, server, inbox, calls, cacheCalls,

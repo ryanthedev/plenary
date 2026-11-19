@@ -129,10 +129,11 @@ const OP_ID = /^\s*\{\s*"t"\s*:\s*"op"\s*,\s*"id"\s*:\s*"([^"\\]{1,256})"/;
  *   store: { read: Function, getCheckpoint: Function, epoch: Function },
  *   bus: object,
  *   rooms: { open(tenant: string, board: string): Promise<void> },
+ *   onWelcomed?: (user: string, board: string) => void,   // called after a connection is welcomed (Recent, PROTOCOL.md § Home); must not throw or block
  *   log?: object, codec?: object, id?: string, limits?: Partial<typeof LIMITS>, now?: () => number,
  * }} o
  */
-export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed, timers = globalThis }) {
+export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed, timers = globalThis, onWelcomed = null }) {
   // Every timer of the gateway runs on `timers` (tests pass fake ones, with `now` moved in step); the names shadow the globals here.
   const { setTimeout, clearTimeout, setInterval, clearInterval } = timers;
   const lim = { ...LIMITS, ...limits };
@@ -703,6 +704,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       if (c.state !== "live") return;
       push(ws, typeof welcomeData === "function" ? welcomeData() : welcomeData);
       c.welcomed = true;
+      try { onWelcomed?.(c.user, c.board); } catch (err) { log.warn("onWelcomed failed", { err }); }
       for (const f of b.feed.catchUp(since)) pushShared(ws, f);
       c.next = b.feed.seq + 1;
       // Who's here, right after the catch-up: the full list. A board this gateway hasn't published for yet gets its

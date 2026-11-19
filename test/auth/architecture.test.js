@@ -33,6 +33,7 @@ export const CLASSES = {
   "server/auth/tenancy.js": "core",          // role resolution over the Registry port
   "server/auth/resolver.js": "core",         // the permission resolver: pure union of every source, with sources (domain logic)
   "server/auth/permissions.js": "core",      // permissions, built-in roles, role clipping per scope (domain data, pure)
+  "server/auth/home.js": "core",             // the Home screen's read side over the Registry port + tenancy (PROTOCOL.md § Home)
   "server/admin/boards.js": "core",          // admin use cases over the Registry port
   "server/admin/tenants.js": "core",         // bootstrapTenant over the Registry port (its CLI root: scripts/admin-bootstrap.js)
   "server/auth/registry.js": "adapter",      // in-memory Registry

@@ -775,6 +775,55 @@ board scope is that one board) and publishes `{ board }` on each board's `.grant
 announcing is best-effort like every bus message, and the timed pass repairs a lost one. The gateway's role cache holds a
 board's chain (its Space, Group and tenant records) for at most its `ttlMs` and drops it on `.grants`.
 
+### Home (the read API behind the Home screen, #47)
+
+Design: design/orgs/JOURNEY.md (J1, J5, §4 [home], §5). Code: `server/auth/home.js` (core), routes in `server/auth/http.js`,
+Registry calls below. All routes authenticate like every other route in http.js: `Authorization: Bearer <session or dev token>`, no cookie.
+
+- `GET /home` → `{ guest, user, unit, recent, starred, shared, tree, limits }`.
+  - `guest`: true when the caller has no Unit (`tenantOf` null: a gmail user, a domain with no Unit). A guest gets `shared` only:
+    `recent` and `starred` are `[]`, `tree` is null, `unit` null.
+  - `recent`: the last 12 boards the person opened (newest first). `starred`: up to 50, newest star first. `shared`: up to 50,
+    by title. Each is a list of **cards**: `{ id, title, role, path, starred, at? }`. `role` = the ladder role the person
+    holds now. `path` = `[{ type: "group"|"space"|"other", id, name }]` outermost first (a Space in no Group is one entry; an unfiled
+    board's path is the one entry `{ type: "other", name: "Other boards" }`). `at` = when it was opened (recent) or starred (starred).
+  - `tree` (members): `{ groups: [{ id, name, spaces: [{ id, name, personal }] }], spaces: [...the Spaces in no Group], other: { boards: [{ id, title }], more } }`.
+    Only Spaces and Groups the person can open boards in appear (the resolver's ladder is not null on them); `other` lists the
+    unfiled boards the person can open (up to 20; `more` true if the scan stopped early). "Other boards" is a pseudo-group for the boards
+    made before Spaces existed: one constant (`OTHER` in home.js) so a later migration into a legacy Space removes it in one place.
+  - `limits`: the caps in force (`recent`, `starred`, `shared`, `search`, `spaces`), so the page needs no copy of them.
+- `GET /home/search?q=<text>` → `{ q, results: [card], more }`. `q` trimmed, 1-100 chars (else 400). Members: boards of the person's Unit whose
+  **title or Space name** contains `q` (case-insensitive, `%`, `_` and `\` are literal), plus matching titles among `shared`. At
+  most 20 results, newest id order; `more` true if the scan cap was reached. Guests: matching titles among `shared`. A board the person
+  cannot open is never returned, whatever it is called.
+- `PUT /home/stars/:board` / `DELETE /home/stars/:board` → 204. Starring needs a role on the board (else 403 `forbidden`, the same
+  answer for an unknown board); unstarring is always allowed and idempotent.
+- **Recent is written by the server**, not the page: when a gateway welcomes a connection it calls `markOpened(user, board)` (debounced
+  per user and board for 60 s per gateway, best effort: a failed write is logged and dropped). One row per (user, board); only
+  the newest 50 per user are kept.
+
+**"Boards I can open", efficiently.** The listing never asks the resolver once per board in the Unit. Every list is built from a
+*candidate* query that is bounded in SQL (recents ≤ 30 rows, starred ≤ 60, shared ≤ 60, a search page ≤ 100 rows, up to 2 pages) and the
+candidates then go through ONE batch, `tenancy.accessMany(identity, ids)`: `Registry.boardRows(ids, { user, email })` (one
+statement per table for the whole batch: boards, the user's grants, Team grants on the boards, the user's Teams among them,
+invites to the user's email, link uses and their links) plus **one `accessContext` per distinct Space (or Unit, for unfiled
+boards)** among the candidates, then the pure resolver (`resolveAccess`) per board. So a page of N candidates costs 5 batch statements plus
+one per distinct Space, never N × 4. The answer is the resolver's, board for board (test/auth/home.test.js checks it against
+`tenancy.effective` on random registries). The tree asks `effective` once per Space and Group of the Unit, at most 200 Spaces
+(`limits.spaces`; a Unit with more shows the first 200 by creation and the page says so), 8 at a time.
+
+**Where Recent and Starred live.** Two new Registry tables, `reg_recents (member, board, opened_at)` and `reg_stars (member, board, at)`,
+both keyed `(member, board)` and indexed `(member, time DESC)`. Not a separate port: they are per-user rows over the Registry's own board
+ids with the same durability and tenancy reads, and they must be read in the same snapshot as the access check. They hold no
+board data, so an unreadable board's row is inert (the access filter drops it). Additive tables like the Organization ones.
+
+**Shared with me** = boards where the person holds a board-scope source other than ownership: a grant that is not `owner`, a
+non-revoked invite to their email, a link they redeemed (`Registry.sharedBoards`); then filtered by what the resolver says they can open
+now (so an expired invite or revoked link vanishes). For a Unit member it includes boards of their own Unit shared with them directly.
+
+Pending maintainer decisions kept as-is: a Unit admin gets no board content by being admin (a board they cannot open is not listed); unfiled
+boards appear under "Other boards" (above), not in a legacy Space.
+
 ## Sign-in code exchange
 
 No long-lived token ever appears in a URL. After Google sign-in the server hands the page a single-use code, and the
@@ -867,6 +916,7 @@ method names are stable. Ids are server-minted over `[a-z0-9-]`.
 | grants | `setGrant(board, user, role \| null)`, `grant(board, user) → role \| null`, `grants(board)` |
 | invites | `createInvite({ board, email, role, expiresAt, by })`, `invite(id)`, `invites(board)`, `invitesFor(board, email)`, `revokeInvite(id)` |
 | share links | `createLink({ board, role, expiresAt, by })` (role per link), `link(id)`, `links(board)`, `revokeLink(id)`, `addLinkUse(link, user)`, `linkUses(board, user)` |
+| home | `markOpened(user, board)`, `recents(user, { limit })`, `setStarred(user, board, on)`, `starred(user, { limit })`, `starredAmong(user, boards)`, `sharedBoards(user, email, { limit })`, `searchBoards(tenant, { q, unfiled, after, limit })`, `boardRows(boards, { user, email })` (§ Home) |
 | organization | `createGroup`, `group`, `groups`; `createSpace`, `space`, `spaces`, `ensurePersonalSpace(tenant, user)`; `createTeam`, `team`, `teams`, `setTeamMember`, `teamMembers`; `setScopedGrant({ scope, subject, role \| null })`, `scopedGrants(scope)`; `createRole`, `updateRole`, `role`, `roles`; `accessContext(scope, { users, chain })`; `boardsIn(scope, { after, limit })`, `scopesOf(subject, { after, limit })` |
 
 Single node: SQLite; cluster: Postgres. The room never calls it; gateways and Auth do. On Postgres the server

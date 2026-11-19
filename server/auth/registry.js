@@ -2,7 +2,7 @@
 // last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
 import { normEmail } from "./util.js";
-import { mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit } from "./registry-port.js";
+import { mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, searchLimit, smallLimit, searchQuery } from "./registry-port.js";
 
 /**
  * @typedef {import("./registry-port.js").Registry} Registry
@@ -35,6 +35,9 @@ export function memoryRegistry({ now = Date.now } = {}) {
   /** @type {Map<string, Set<string>>} team → members */ const members = new Map();
   /** @type {Map<string, Map<string, string>>} "type\nid" → ("type\nid" of the subject → role) */ const scoped = new Map();
   /** @type {Map<string, Map<string, CustomRole>>} tenant → id → role */ const roles = new Map();
+  /** @type {Map<string, Map<string, number>>} user → board → opened at (Recent) */ const recent = new Map();
+  /** @type {Map<string, Map<string, number>>} user → board → starred at */ const stars = new Map();
+  const newest = m => [...(m ?? [])].map(([board, at]) => ({ board, at })).sort((a, b) => b.at - a.at || (a.board < b.board ? 1 : -1));
   const copy = x => (x ? structuredClone(x) : null);
   const fresh = (map, f) => { let id; do id = f(); while (map.has(id)); return id; };
 
@@ -252,6 +255,52 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const inTeam = t => [...(members.get(t) ?? [])].filter(u => !want || want.has(u));
       return copy({ tenant, board: board ?? null, space: space ?? null, group: group ?? null, scoped: sc,
         roles: [...(roles.get(tenant.id)?.values() ?? [])], teams: Object.fromEntries([...teamIds].map(t => [t, inTeam(t)])) });
+    },
+
+    // ---- Home (PROTOCOL.md § Home) ----
+    async markOpened(user, board) {
+      if (!boards.has(board)) throw new Error("registry: no such board");
+      if (!recent.has(user)) recent.set(user, new Map());
+      const m = recent.get(user);
+      m.set(board, now());
+      for (const r of newest(m).slice(HOME.recentKeep)) m.delete(r.board);
+    },
+    async recents(user, { limit } = {}) { return newest(recent.get(user)).slice(0, smallLimit(limit, 12, HOME.recentKeep)); },
+    async setStarred(user, board, on) {
+      if (!on) { stars.get(user)?.delete(board); return; }
+      if (!boards.has(board)) throw new Error("registry: no such board");
+      if (!stars.has(user)) stars.set(user, new Map());
+      if (!stars.get(user).has(board)) stars.get(user).set(board, now());
+    },
+    async starred(user, { limit } = {}) { return newest(stars.get(user)).slice(0, smallLimit(limit, 50, HOME.starScan)); },
+    async starredAmong(user, ids) { const m = stars.get(user); return [...new Set(ids.slice(0, HOME.batch))].filter(b => m?.has(b)); },
+    async sharedBoards(user, email, { limit } = {}) {
+      const e = email ? normEmail(email) : null, out = new Set();
+      for (const [b, g] of grants) if (g.has(user) && g.get(user) !== "owner") out.add(b);
+      for (const i of invites.values()) if (e && i.email === e && !i.revoked) out.add(i.board);
+      for (const [k, ls] of uses) if (k.endsWith("\n" + user) && ls.size) out.add(k.slice(0, k.length - user.length - 1));
+      return [...out].filter(b => boards.has(b)).sort().slice(0, smallLimit(limit, HOME.sharedScan, HOME.sharedScan));
+    },
+    async searchBoards(tenant, { q, unfiled = false, after = null, limit } = {}) {
+      after = orgDefaults.cursor(after, "id");
+      const term = q == null ? null : searchQuery(q).toLowerCase(), n = searchLimit(limit);
+      const hit = b => (unfiled ? !b.space : true) && (term == null || b.title.toLowerCase().includes(term) || (!unfiled && b.space && spaces.get(b.space)?.name.toLowerCase().includes(term)));
+      const all = [...boards.values()].filter(b => b.tenant === tenant && hit(b) && (after == null || b.id > after)).map(b => b.id).sort();
+      return { ids: all.slice(0, n), next: all.length > n ? all[n - 1] : null };
+    },
+    async boardRows(ids, { user, email = null } = {}) {
+      const out = new Map(), e = email ? normEmail(email) : null;
+      for (const id of [...new Set(ids)].slice(0, HOME.batch)) {
+        const board = boards.get(id);
+        if (!board) continue;
+        const teamGrants = [...(scoped.get(sk("board", id)) ?? [])].map(([k, role]) => { const [type, ...i] = k.split("\n"); return { subject: { type, id: i.join("\n") }, role }; });
+        const myTeams = teamGrants.filter(g => g.subject.type === "team" && members.get(g.subject.id)?.has(user)).map(g => g.subject.id);
+        const useIds = [...(uses.get(id + "\n" + user) ?? [])];
+        out.set(id, copy({ board, grant: grants.get(id)?.get(user) ?? null, teamGrants, myTeams,
+          invites: [...invites.values()].filter(i => e && i.board === id && i.email === e && !i.revoked),
+          links: useIds.map(l => links.get(l)).filter(Boolean) }));
+      }
+      return out;
     },
 
     async boardsIn(scope, { after = null, limit } = {}) {

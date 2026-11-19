@@ -568,5 +568,132 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect((await r.tenant(t.id)).domains).toEqual(["acme.com"]);
       });
     });
+
+    // ---- Home: Recent, Starred, Shared with me, search, boardRows (PROTOCOL.md § Home) ----
+    describe("home", () => {
+      const mk = async () => {
+        const t = await r.createTenant({ domain: "acme.com", admins: ["dev:root"] });
+        const sp = await r.createSpace({ tenant: t.id, name: "Design Studio" });
+        const a = await r.createBoard({ tenant: t.id, title: "Roadmap", space: sp.id });
+        const b = await r.createBoard({ tenant: t.id, title: "Offsite 100%_ideas" });
+        const c = await r.createBoard({ tenant: t.id, title: "Other roadmap thing" });
+        return { t, sp, a, b, c };
+      };
+
+      test("markOpened / recents: newest first, one row per board, limit, unknown board rejects", async () => {
+        const { a, b, c } = await mk();
+        for (const x of [a, b, c]) { await r.markOpened("dev:ada", x.id); clock.t += 1000; }
+        clock.t += 1000;
+        await r.markOpened("dev:ada", a.id);      // reopen: moves to the front, no duplicate
+        const rec = await r.recents("dev:ada");
+        expect(rec.map(x => x.board)).toEqual([a.id, c.id, b.id]);
+        expect(rec[0].at).toBe(clock.t);
+        expect((await r.recents("dev:ada", { limit: 2 })).map(x => x.board)).toEqual([a.id, c.id]);
+        expect(await r.recents("dev:bob")).toEqual([]);
+        await expect(r.markOpened("dev:ada", "b-nope000000000000")).rejects.toThrow();
+      });
+
+      test("markOpened keeps only the newest 50 rows per user (other users untouched)", async () => {
+        const { t } = await mk();
+        const ids = [];
+        for (let i = 0; i < 55; i++) { ids.push((await r.createBoard({ tenant: t.id, title: `b${i}` })).id); }
+        for (const id of ids) { await r.markOpened("dev:ada", id); clock.t += 1; }
+        await r.markOpened("dev:bob", ids[0]);
+        const rec = await r.recents("dev:ada", { limit: 1000 });
+        expect(rec.length).toBe(50);
+        expect(rec[0].board).toBe(ids[54]);
+        expect(rec.map(x => x.board)).not.toContain(ids[0]);
+        expect((await r.recents("dev:bob")).map(x => x.board)).toEqual([ids[0]]);
+      });
+
+      test("setStarred / starred / starredAmong: idempotent, newest star first, un-star never rejects", async () => {
+        const { a, b } = await mk();
+        await r.setStarred("dev:ada", a.id, true);
+        clock.t += 1000;
+        await r.setStarred("dev:ada", b.id, true);
+        clock.t += 1000;
+        await r.setStarred("dev:ada", a.id, true);        // already starred: the star keeps its place
+        expect((await r.starred("dev:ada")).map(x => x.board)).toEqual([b.id, a.id]);
+        expect((await r.starredAmong("dev:ada", [a.id, "b-nope000000000000"])).sort()).toEqual([a.id]);
+        expect(await r.starredAmong("dev:bob", [a.id, b.id])).toEqual([]);
+        await r.setStarred("dev:ada", a.id, false);
+        await r.setStarred("dev:ada", a.id, false);
+        await r.setStarred("dev:ada", "b-nope000000000000", false);
+        expect((await r.starred("dev:ada")).map(x => x.board)).toEqual([b.id]);
+        await expect(r.setStarred("dev:ada", "b-nope000000000000", true)).rejects.toThrow();
+        expect(await r.starredAmong("dev:ada", [])).toEqual([]);
+      });
+
+      test("sharedBoards: non-owner grants, non-revoked invites to the email, redeemed links; never ownership", async () => {
+        const { t, a, b, c } = await mk();
+        const d = await r.createBoard({ tenant: t.id, title: "D" });
+        const e = await r.createBoard({ tenant: t.id, title: "E" });
+        await r.setGrant(a.id, "google:ann", "editor");
+        await r.setGrant(b.id, "google:ann", "owner");
+        await r.createInvite({ board: c.id, email: "Ann@Example.com", role: "viewer", by: "dev:root" });
+        const dead = await r.createInvite({ board: e.id, email: "ann@example.com", role: "viewer", by: "dev:root" });
+        await r.revokeInvite(dead.id);
+        const l = await r.createLink({ board: d.id, role: "viewer", by: "dev:root" });
+        await r.addLinkUse(l.id, "google:ann");
+        expect((await r.sharedBoards("google:ann", "ann@example.com")).sort()).toEqual([a.id, c.id, d.id].sort());
+        expect((await r.sharedBoards("google:ann", null)).sort()).toEqual([a.id, d.id].sort());
+        expect(await r.sharedBoards("google:nobody", "nobody@example.com")).toEqual([]);
+        expect((await r.sharedBoards("google:ann", "ann@example.com", { limit: 1 })).length).toBe(1);
+      });
+
+      test("searchBoards: title or Space name, case-insensitive, LIKE characters literal, tenant-scoped, paged, unfiled", async () => {
+        const { t, a, b, c } = await mk();
+        const other = await r.createTenant({ domain: "globex.com" });
+        await r.createBoard({ tenant: other.id, title: "Roadmap" });
+        expect((await r.searchBoards(t.id, { q: "ROADMAP" })).ids.sort()).toEqual([a.id, c.id].sort());
+        expect((await r.searchBoards(t.id, { q: "design studio" })).ids).toEqual([a.id]);     // a Space name finds its boards
+        expect((await r.searchBoards(t.id, { q: "100%_" })).ids).toEqual([b.id]);
+        expect((await r.searchBoards(t.id, { q: "%" })).ids).toEqual([b.id]);                // not a wildcard
+        expect((await r.searchBoards(t.id, { q: "_" })).ids).toEqual([b.id]);
+        expect((await r.searchBoards(t.id, { q: "\\" })).ids).toEqual([]);
+        expect((await r.searchBoards(t.id, { q: "zzz" })).ids).toEqual([]);
+        expect((await r.searchBoards(t.id, { unfiled: true })).ids.sort()).toEqual([b.id, c.id].sort());
+        expect((await r.searchBoards(t.id, { unfiled: true, q: "design studio" })).ids).toEqual([]);   // unfiled: titles only
+        const p1 = await r.searchBoards(t.id, { q: "roadmap", limit: 1 });
+        expect(p1.ids.length).toBe(1);
+        expect(p1.next).toBe(p1.ids[0]);
+        const p2 = await r.searchBoards(t.id, { q: "roadmap", limit: 1, after: p1.next });
+        expect([...p1.ids, ...p2.ids].sort()).toEqual([a.id, c.id].sort());
+        expect(p2.next).toBe(null);
+        await expect(r.searchBoards(t.id, { q: "   " })).rejects.toThrow();
+        await expect(r.searchBoards(t.id, { q: "x".repeat(101) })).rejects.toThrow();
+        await expect(r.searchBoards(t.id, { q: "a", after: "x\ny" })).rejects.toThrow("bad cursor");
+        expect((await r.searchBoards("t-nope00000000", { q: "a" })).ids).toEqual([]);
+      });
+
+      test("boardRows: the board-scope rows for one user over a batch; unknown ids absent", async () => {
+        const { t, sp, a, b } = await mk();
+        const team = await r.createTeam({ tenant: t.id, name: "Infra" });
+        const other = await r.createTeam({ tenant: t.id, name: "Other" });
+        await r.setTeamMember(team.id, "google:ann", true);
+        await r.setScopedGrant({ scope: { type: "board", id: a.id }, subject: { type: "team", id: team.id }, role: "editor" });
+        await r.setScopedGrant({ scope: { type: "board", id: a.id }, subject: { type: "team", id: other.id }, role: "viewer" });
+        await r.setGrant(a.id, "google:ann", "annotator");
+        await r.createInvite({ board: a.id, email: "ann@example.com", role: "viewer", by: "dev:root" });
+        await r.createInvite({ board: a.id, email: "someone@example.com", role: "viewer", by: "dev:root" });
+        const l = await r.createLink({ board: b.id, role: "viewer", by: "dev:root" });
+        await r.addLinkUse(l.id, "google:ann");
+        const m = await r.boardRows([a.id, b.id, "b-nope000000000000", a.id], { user: "google:ann", email: "ann@example.com" });
+        expect([...m.keys()].sort()).toEqual([a.id, b.id].sort());
+        const ra = m.get(a.id);
+        expect(ra.board).toMatchObject({ id: a.id, tenant: t.id, title: "Roadmap", space: sp.id });
+        expect(ra.grant).toBe("annotator");
+        expect(ra.teamGrants).toEqual([{ subject: { type: "team", id: team.id }, role: "editor" }, { subject: { type: "team", id: other.id }, role: "viewer" }]);
+        expect(ra.myTeams).toEqual([team.id]);
+        expect(ra.invites.map(i => i.email)).toEqual(["ann@example.com"]);
+        expect(ra.links).toEqual([]);
+        const rb = m.get(b.id);
+        expect(rb).toMatchObject({ grant: null, teamGrants: [], myTeams: [], invites: [] });
+        expect(rb.board.space).toBe(null);
+        expect(rb.links.map(x => x.id)).toEqual([l.id]);
+        expect((await r.boardRows([a.id], { user: "google:bob" })).get(a.id)).toMatchObject({ grant: null, myTeams: [], invites: [], links: [] });
+        expect((await r.boardRows([], { user: "google:ann" })).size).toBe(0);
+      });
+    });
   });
 }

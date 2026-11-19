@@ -405,9 +405,9 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         const b = await one(tx, `SELECT id, tenant FROM ${BD} WHERE id = $1 FOR UPDATE`, [board]);
         if (!b) throw new Error("registry: no such board");
         if ((await one(tx, `SELECT tenant FROM ${SP} WHERE id = $1`, [to]))?.tenant !== b.tenant) throw new Error("registry: no such space");
-        await idemPut(tx, k, board, at);
         const cur = (await one(tx, `SELECT space FROM ${BS} WHERE board = $1`, [board]))?.space ?? null;
         const moved = cur !== to;
+        await idemPut(tx, k, board + (moved ? ":moved" : ":noop"), at);      // the key first (it rejects a replay before the compare-and-set can); its answer says whether the move happened
         if (moved) {
           if (cur !== (from == null ? null : String(from))) throw new RegistryError("moved", "the board is no longer in that Space");
           await tx.unsafe(`INSERT INTO ${BS} (board, space) VALUES ($1, $2) ON CONFLICT (board) DO UPDATE SET space = excluded.space`, [board, to]);

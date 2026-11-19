@@ -88,29 +88,48 @@ export function showMoveToast({ host, move, board, result, clock, newKey = null,
   const text = h("span", {}, movedText(result.board.title, result.board.space.name));
   const undoBtn = undo.available ? h("button.btn", { type: "button", "data-fk": "move-undo", onclick: () => run() }, "Undo") : null;
   const close = h("button.btn.ghost", { type: "button", "aria-label": "Dismiss", onclick: () => dismiss() }, "Dismiss");
-  const el = h("div.move-toast", { role: "group", "aria-label": "Board moved", onkeydown: e => { if (e.key === "Escape") { e.preventDefault?.(); dismiss(); } } }, text, " ", undoBtn, close);
+  const el = h("div.move-toast", { role: "group", "aria-label": "Board moved",
+    onkeydown: e => {
+      if (e.key === "Escape") { e.preventDefault?.(); dismiss(); return; }
+      // Tab off either end of the toast leaves it (the toast is the last thing in the page, so the browser's own focus move has no element to name in `relatedTarget`): it goes, and focus goes on where Tab takes it.
+      const at = globalThis.document?.activeElement, first = undoBtn ?? close;
+      if (e.key === "Tab" && ((!e.shiftKey && at === close) || (e.shiftKey && at === first))) dismiss(false);
+    },
+    onfocusin: () => { if (!initial) { inFocus = true; sync(); } },
+    // Focus moving to something outside the toast dismisses it (the person has gone on); focus lost to nowhere (a click on the page, a window switch) only resumes the countdown.
+    onfocusout: e => { inFocus = false; if (e.relatedTarget && !el.contains?.(e.relatedTarget)) dismiss(false); else sync(); },
+    onmouseenter: () => { over = true; sync(); }, onmouseleave: () => { over = false; sync(); } }, text, " ", undoBtn, close);
   host.append(el);
   announce(text.textContent + (undoBtn ? " Undo is available for 10 seconds." : ""));
-  let timer = clock.set(() => dismiss(), UNDO_MS), gone = false, working = false;
-  (undoBtn ?? close).focus?.();
-  function dismiss() {
+  // The countdown pauses while focus is inside the toast or the pointer is over it (a person reading or aiming at Undo is never cut off), and resumes with what was left.
+  let timer = null, left = UNDO_MS, startedAt = 0, inFocus = false, over = false, gone = false, working = false, initial = false;
+  const arm = () => { startedAt = clock.now(); timer = clock.set(() => dismiss(), left); };
+  const hold = () => { if (timer !== null) { clock.clear(timer); timer = null; left = Math.max(0, left - (clock.now() - startedAt)); } };
+  const sync = () => { if (gone) return; if (inFocus || over) hold(); else if (timer === null && !working) arm(); };
+  const schedule = ms => { hold(); left = ms; sync(); };
+  // The focus the page itself puts on Undo (the card that opened the dialog is gone) does not hold the countdown: a person who does nothing still sees the toast go. Focus the person
+  // moves within or onto the toast (Tab, a click) does.
+  initial = true; (undoBtn ?? close).focus?.(); initial = false;
+  sync();
+  function dismiss(restore = true) {
     if (gone) return;
-    gone = true; clock.clear(timer);
+    gone = true; if (timer !== null) clock.clear(timer);
     const had = !!el.contains?.(globalThis.document?.activeElement);
     el.remove();
-    if (had) restoreFocus();
+    if (had && restore) restoreFocus();
   }
   async function run() {
     if (working || gone) return;
-    working = true; clock.clear(timer);
+    working = true; hold();
     undoBtn?.setAttribute("aria-disabled", "true");
     const r = await undo.run();
     working = false;
     if (gone) return;
     text.textContent = r.text; undoBtn?.remove(); announce(r.text);
-    timer = clock.set(() => dismiss(), r.ok ? 4000 : UNDO_MS);
+    schedule(r.ok ? 4000 : UNDO_MS);
     if (r.ok) onChange();
-    close.focus?.();
+    initial = true; close.focus?.(); initial = false;     // the page moves focus off the Undo it just removed
+    sync();
   }
   return { dismiss, el };
 }

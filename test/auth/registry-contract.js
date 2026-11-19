@@ -1477,11 +1477,18 @@ export function registryContract(name, makeRegistry, opts = {}) {
         const { a, b, board } = await mk();
         const idem = { user: U, key: "move-key-0001", fp: "a".repeat(64) };
         await r.moveBoard({ board: board.id, from: a.id, to: b.id, idem });
-        expect(await r.idemGet(idem)).toEqual({ state: "done", ref: board.id });
+        expect(await r.idemGet(idem)).toEqual({ state: "done", ref: `${board.id}:moved` });
         await r.moveBoard({ board: board.id, from: b.id, to: a.id });   // back again, with no key
-        await expect(r.moveBoard({ board: board.id, from: a.id, to: b.id, idem })).rejects.toMatchObject({ code: "idem-replay", ref: board.id });
+        await expect(r.moveBoard({ board: board.id, from: a.id, to: b.id, idem })).rejects.toMatchObject({ code: "idem-replay", ref: `${board.id}:moved` });
         expect((await r.board(board.id)).space).toBe(a.id);
         await expect(r.moveBoard({ board: board.id, from: a.id, to: b.id, idem: { ...idem, fp: "b".repeat(64) } })).rejects.toMatchObject({ code: "idem-mismatch" });
+      });
+      test("a keyed no-op move stores `:noop`, so a replay can report the real flag", async () => {
+        const { a, b, board } = await mk();
+        await r.moveBoard({ board: board.id, from: a.id, to: b.id });
+        const idem = { user: U, key: "move-key-0003", fp: "d".repeat(64) };
+        expect((await r.moveBoard({ board: board.id, from: a.id, to: b.id, idem })).moved).toBe(false);
+        expect(await r.idemGet(idem)).toEqual({ state: "done", ref: `${board.id}:noop` });
       });
       test("a refused keyed move leaves no key behind (the retry runs fresh)", async () => {
         const { a, b, c, board } = await mk();

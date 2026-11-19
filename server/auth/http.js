@@ -564,7 +564,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       POST: async (req, p) => {
         const who = await caller(req);
         const b = await body(req, ["from", "to"]);
-        return keyed(req, who, "POST /boards/:board/move", p, b, async idem => moves.move(who, p.board, b, idem), async () => moves.replay(who, p.board, b), 200);
+        return keyed(req, who, "POST /boards/:board/move", p, b, async idem => moves.move(who, p.board, b, idem), async ref => moves.replay(who, p.board, b, ref), 200);
       },
     }],
     ["/boards/:board/move/preview", { GET: async (req, p, url) => {

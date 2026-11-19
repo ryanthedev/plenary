@@ -450,7 +450,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       if ((b.space ?? null) !== from) throw new RegistryError("moved", "the board is no longer in that Space");
       q.putBoardSpace.run(board, to);
     }
-    idemPut(idem, board, at);
+    idemPut(idem, board + (moved ? ":moved" : ":noop"), at);
     return { board: rowBoard(q.board.get(board)), moved };
   });
 

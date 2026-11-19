@@ -123,7 +123,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
         if (b.space !== (from ?? null)) throw new RegistryError("moved", "the board is no longer in that Space");
         b.space = to;
       }
-      idemPut(k, b.id);
+      idemPut(k, b.id + (moved ? ":moved" : ":noop"));
       return { board: copy(b), moved };
     },
 

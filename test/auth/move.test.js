@@ -88,15 +88,45 @@ describe("who may move where", () => {
     const b = await r.createBoard({ tenant: acme.id, title: "B", space: platform.id });
     await r.setScopedGrant({ scope: { type: "space", id: platform.id }, subject: { type: "user", id: "google:max" }, role: role.id });
     await r.setScopedGrant({ scope: { type: "space", id: design.id }, subject: { type: "user", id: "google:max" }, role: role.id });
-    expect(givenBy(await r.accessContext({ type: "space", id: design.id }), "google:max")).toBe("owner");   // Design's owner (ada) and its Team (editor)
+    expect(givenBy(await r.accessContext({ type: "space", id: design.id }))).toBe("owner");   // Design's owner (ada) and its Team (editor)
     expect(await code(mv.move(max, b.id, { from: platform.id, to: design.id }))).toBe("forbidden");   // max opens and creates there, but would hand Design's owner and Team more than his viewer step
     expect((await mv.options(max, b.id)).destinations.map(d => d.id)).not.toContain(design.id);
     const quiet = await r.createSpace({ tenant: acme.id, name: "Quiet", generalRole: "viewer" });
     await r.setScopedGrant({ scope: { type: "space", id: quiet.id }, subject: { type: "user", id: "google:max" }, role: role.id });
     expect((await mv.move(max, b.id, { from: platform.id, to: quiet.id })).moved).toBe(true);              // viewer for others: within what max holds
-    expect(givenBy(await r.accessContext({ type: "space", id: design.id }), "google:ada")).toBe("editor");   // the mover's own grant never counts: only the Team's is left
+    expect(givenBy(await r.accessContext({ type: "space", id: design.id }))).toBe("owner");   // the mover's own grant counts too (Design's owner is ada herself): no skipping self
     const c = await r.createBoard({ tenant: acme.id, title: "C", space: platform.id });
     expect((await mv.move(root, c.id, { from: platform.id, to: design.id })).moved).toBe(true);              // a Unit admin is exempt
+  });
+  test("HIGH-1: a mover below owner cannot become owner by moving a board into a Space they own, or into their personal space", async () => {
+    const role = await r.createRole({ tenant: acme.id, name: "Mover", boardRole: "viewer", permissions: ["move", "board.create"] });
+    const b = await r.createBoard({ tenant: acme.id, title: "Adas", space: platform.id, owner: "google:ada" });
+    await r.setScopedGrant({ scope: { type: "space", id: platform.id }, subject: { type: "user", id: "google:max" }, role: role.id });
+    const mine = await r.createSpace({ tenant: acme.id, name: "Mine", generalRole: null, owner: "google:max" });
+    const maxs = await r.ensurePersonalSpace(acme.id, "google:max");
+    expect((await ten.effective(max, b.id)).ladder).toBe("viewer");
+    for (const to of [mine.id, maxs.id]) expect(await code(mv.move(max, b.id, { from: platform.id, to }))).toBe("forbidden");
+    expect((await r.board(b.id)).space).toBe(platform.id);
+    expect((await mv.options(max, b.id)).destinations.map(d => d.id)).not.toContain(mine.id);
+    expect((await mv.options(max, b.id)).destinations.map(d => d.id)).not.toContain(maxs.id);
+    expect((await ten.effective(max, b.id)).ladder).toBe("viewer");            // never raised
+  });
+  test("HIGH-1: a mover with `move` and no board content at all (a stored role with no board step) cannot go from nothing to owner either", async () => {
+    const none = await r.createRole({ tenant: acme.id, name: "MoveOnly", boardRole: null, permissions: ["move", "board.create"] });   // the Registry stores what it is given; roleDef reads no ladder from it
+    const b = await r.createBoard({ tenant: acme.id, title: "Adas", space: platform.id, owner: "google:ada" });
+    await r.setScopedGrant({ scope: { type: "space", id: platform.id }, subject: { type: "user", id: "google:max" }, role: none.id });
+    const mine = await r.createSpace({ tenant: acme.id, name: "Mine", generalRole: null, owner: "google:max" });
+    const a0 = await ten.effective(max, b.id);
+    expect([a0.ladder, a0.permissions.has("move")]).toEqual([null, true]);
+    expect(await code(mv.move(max, b.id, { from: platform.id, to: mine.id }))).toBe("forbidden");
+    expect(await code(mv.move(max, b.id, { from: platform.id, to: (await r.ensurePersonalSpace(acme.id, "google:max")).id }))).toBe("forbidden");
+    expect((await r.board(b.id)).space).toBe(platform.id);
+    expect((await ten.effective(max, b.id)).ladder).toBeNull();
+  });
+  test("HIGH-1: a board owner (and so an owner-step mover) still moves into a Space they own or their personal space", async () => {
+    const mine = await r.createSpace({ tenant: acme.id, name: "Mine", generalRole: null, owner: "google:ada" });
+    expect((await mv.move(ada, board.id, { from: adasSpace.id, to: mine.id })).moved).toBe(true);
+    expect((await mv.move(ada, board.id, { from: mine.id, to: adasSpace.id })).moved).toBe(true);
   });
 });
 
@@ -230,6 +260,51 @@ describe("the move: compare-and-set, idempotent, undo", () => {
   });
 });
 
+describe("review fixes (#53)", () => {
+  test("MED-1: undo is decided after the write: a Space owner who moves Zed's board into a Space where they are only an editor is offered no Undo", async () => {
+    const b2 = await r.createSpace({ tenant: acme.id, name: "B2", generalRole: null, owner: "google:root" });
+    await r.setScopedGrant({ scope: { type: "space", id: b2.id }, subject: { type: "user", id: "google:ada" }, role: "editor" });
+    const zeds = await r.createBoard({ tenant: acme.id, title: "Zeds", space: platform.id, owner: "google:zed" });
+    const out = await mv.move(ada, zeds.id, { from: platform.id, to: b2.id });
+    expect(out).toMatchObject({ moved: true, undo: null });                       // ada is a Space-A owner (move at A) but only an editor at B: no move there
+    expect(await code(mv.move(ada, zeds.id, { from: b2.id, to: platform.id }))).toBe("forbidden");   // so the answer never promised what is refused
+  });
+  test("MED-1: an offered undo succeeds", async () => {
+    const out = await mv.move(ada, board.id, { from: adasSpace.id, to: design.id });
+    expect(out.undo.space.id).toBe(adasSpace.id);
+    expect((await mv.move(ada, board.id, { from: design.id, to: out.undo.space.id })).moved).toBe(true);
+  });
+  test("MED-1b: replay by the same caller whose board is now in `to` answers the first result even without move there; a board moved on is 409; an unopenable `to` is 403", async () => {
+    const b2 = await r.createSpace({ tenant: acme.id, name: "B2", generalRole: null, owner: "google:root" });
+    await r.setScopedGrant({ scope: { type: "space", id: b2.id }, subject: { type: "user", id: "google:ada" }, role: "editor" });
+    const zeds = await r.createBoard({ tenant: acme.id, title: "Zeds", space: platform.id, owner: "google:zed" });
+    await mv.move(ada, zeds.id, { from: platform.id, to: b2.id });
+    const rep = await mv.replay(ada, zeds.id, { from: platform.id, to: b2.id }, `${zeds.id}:moved`);
+    expect(rep).toMatchObject({ moved: true, undo: null, board: { id: zeds.id, space: { id: b2.id, name: "B2" } } });
+    await r.moveBoard({ board: zeds.id, from: b2.id, to: design.id });
+    expect(await code(mv.replay(ada, zeds.id, { from: platform.id, to: b2.id }, `${zeds.id}:moved`))).toBe("moved");
+    expect(await code(mv.replay(max, zeds.id, { from: platform.id, to: b2.id }, `${zeds.id}:moved`))).toBe("forbidden");   // max cannot open B2
+  });
+  test("LOW-4: a replay reports the real moved flag (noop stays false) and offers undo only for a real move", async () => {
+    await mv.move(ada, board.id, { from: adasSpace.id, to: design.id });
+    expect(await mv.replay(ada, board.id, { from: adasSpace.id, to: design.id }, `${board.id}:noop`)).toMatchObject({ moved: false, undo: null });
+    expect(await mv.replay(ada, board.id, { from: adasSpace.id, to: design.id }, `${board.id}:moved`)).toMatchObject({ moved: true, undo: { space: { id: adasSpace.id } } });
+  });
+  test("LOW-2: preview of a Space the caller can't open is the one 403 whether or not the board is in it; of the board's own open Space it is 400", async () => {
+    const hushed = await r.createBoard({ tenant: acme.id, title: "H", space: secret.id, owner: "google:ada" });
+    expect(await code(mv.preview(ada, hushed.id, secret.id))).toBe("forbidden");           // the board IS in Secret: still 403, no oracle
+    expect(await code(mv.preview(ada, hushed.id, platform.id))).toBe(null);   // an openable, creatable other Space previews fine
+    expect(await code(mv.preview(ada, board.id, adasSpace.id))).toBe("bad-request");       // her own open Space: the board is already there
+  });
+  test("LOW-3: a stale `from` is 409 moved before anything is written; a board already in `to` stays the no-op success", async () => {
+    expect(await code(mv.move(ada, board.id, { from: platform.id, to: design.id }))).toBe("moved");      // it is in her personal space
+    expect(await code(mv.move(ada, board.id, { from: null, to: design.id }))).toBe("moved");
+    expect((await r.board(board.id)).space).toBe(adasSpace.id);
+    await mv.move(ada, board.id, { from: adasSpace.id, to: design.id });
+    expect((await mv.move(ada, board.id, { from: platform.id, to: design.id })).moved).toBe(false);       // already there: harmless whatever `from` says
+  });
+});
+
 describe("the announcement", () => {
   test("a move announces { board } on the grants subject exactly once, through the announcing Registry", async () => {
     const published = [];
@@ -282,13 +357,31 @@ describe("over HTTP", () => {
     expect(first.status).toBe(200);
     expect(JSON.parse(first.text).moved).toBe(true);
     expect((await api("ada", `/boards/${board.id}/move`, "POST", { from: design.id, to: platform.id })).status).toBe(200);   // on, unkeyed
-    const again = await api("ada", `/boards/${board.id}/move`, "POST", body, key);
-    expect([again.status, again.headers.get("idempotent-replayed")]).toEqual([200, "true"]);
-    expect((await r.board(board.id)).space).toBe(platform.id);                                                       // the replay moved nothing
+    const moved = await api("ada", `/boards/${board.id}/move`, "POST", body, key);                                 // the board moved on since: the key's `to` no longer holds it
+    expect(moved.status).toBe(409);
+    expect((await r.board(board.id)).space).toBe(platform.id);                                                       // and nothing moved
     expect((await api("ada", `/boards/${board.id}/move`, "POST", { from: adasSpace.id, to: platform.id }, key)).status).toBe(422);
     expect(await api("ada", `/boards/${board.id}/move`, "POST", { from: adasSpace.id, to: design.id })).toMatchObject({ status: 409, text: '{"error":"moved"}' });
     expect((await api("ada", `/boards/${board.id}/move`, "POST", { ...body, x: 1 })).status).toBe(400);
     expect((await api("ada", `/boards/${board.id}/move`, "POST", { from: null })).status).toBe(400);
+  });
+  test("MED-1b over HTTP: a Space owner's keyed move into a Space where they are an editor replays 200 (not 403), with the real moved flag; the same key for another body is 422", async () => {
+    const b2 = await r.createSpace({ tenant: acme.id, name: "B2", generalRole: null, owner: "google:root" });
+    await r.setScopedGrant({ scope: { type: "space", id: b2.id }, subject: { type: "user", id: "dev:ada" }, role: "editor" });
+    const zeds = await r.createBoard({ tenant: acme.id, title: "Zeds", space: platform.id, owner: "google:zed" });
+    const body = { from: platform.id, to: b2.id }, key = { "idempotency-key": "move-key-http-2" };
+    const first = await api("ada", `/boards/${zeds.id}/move`, "POST", body, key);
+    expect(first.status).toBe(200);
+    expect(JSON.parse(first.text)).toMatchObject({ moved: true, undo: null });
+    const again = await api("ada", `/boards/${zeds.id}/move`, "POST", body, key);
+    expect([again.status, again.headers.get("idempotent-replayed")]).toEqual([200, "true"]);
+    expect(JSON.parse(again.text)).toMatchObject({ moved: true, board: { id: zeds.id, space: { id: b2.id } } });
+    expect((await api("ada", `/boards/${zeds.id}/move`, "POST", { from: platform.id, to: design.id }, key)).status).toBe(422);
+    // a no-op under its own key replays as a no-op
+    const nk = { "idempotency-key": "move-key-http-3" };
+    await r.moveBoard({ board: board.id, from: adasSpace.id, to: platform.id });
+    const n1 = await api("ada", `/boards/${board.id}/move`, "POST", { from: design.id, to: platform.id }, nk), n2 = await api("ada", `/boards/${board.id}/move`, "POST", { from: design.id, to: platform.id }, nk);
+    expect([n1.status, JSON.parse(n1.text).moved, n2.status, JSON.parse(n2.text).moved, n2.headers.get("idempotent-replayed")]).toEqual([200, false, 200, false, "true"]);
   });
   test("a card's can.move is true for a mover, false for a viewer", async () => {
     await r.moveBoard({ board: board.id, from: adasSpace.id, to: platform.id });

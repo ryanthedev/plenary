@@ -25,18 +25,20 @@ const opens = a => a?.ladder != null;
 const GHOST = "\0ghost";
 
 /**
- * The highest board role the destination gives to anyone but `self`: its Space's and Group's scoped grants and general access (rule 4, "no escalation").
- * Reads every grant, hidden containers included: the answer is a role, never a name.
- * @param {import("./registry-port.js").AccessContext} ctx the destination Space's context @param {string} self the mover's user id
+ * The highest board role the destination gives to ANYONE, the mover included: its Space's and Group's scoped grants and general access (rule 4, "no escalation").
+ * The mover's own grants count too: a mover whose board role is below it must not become its owner by moving the board into a Space they own, or into their personal
+ * space. Bounded by the mover's own board role before the move, their own role after it can never be higher. Reads every grant, hidden containers included: the answer is a
+ * role, never a name.
+ * @param {import("./registry-port.js").AccessContext} ctx the destination Space's context
  */
-export function givenBy(ctx, self) {
+export function givenBy(ctx) {
   const roles = new Map((ctx.roles ?? []).map(r => [r.id, r]));
   let top = null;
   for (const type of ["space", "group"]) {
     const row = ctx[type];
     if (!row) continue;
     for (const g of ctx.scoped?.[type] ?? []) {
-      if (UNIT_ROLES.includes(g.role) || (g.subject.type === "user" && g.subject.id === self)) continue;
+      if (UNIT_ROLES.includes(g.role)) continue;
       top = higher(top, roleDef(g.role, type, roles)?.ladder ?? null);
     }
     top = higher(top, capTo(row.generalRole, INVITE_ROLES));
@@ -65,7 +67,7 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
     const t = await spaces.createTarget(identity, m.unit, to);
     if (!t) throw refused();
     const ctx = await registry.accessContext({ type: "space", id: t.row.id }, { users: [identity.user] });
-    if (!ctx || !withinLadder(m.access.ladder, givenBy(ctx, identity.user), m.admin)) throw refused();
+    if (!ctx || !withinLadder(m.access.ladder, givenBy(ctx), m.admin)) throw refused();
     return { ...t, ctx };
   }
 
@@ -76,11 +78,16 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
     return row && row.tenant === unit.id && opens(access) ? { id: row.id, name: row.name, personal: row.kind === "personal" } : null;
   }
 
-  /** What Undo would be: the Space the board came from, if the caller could put a board back there now (same rules as a move), else null. */
-  async function undoOf(identity, m, from) {
+  /**
+   * What Undo would be, decided AFTER the write from the board's new place: the Space it came from, if the caller can move the board now (`move` where it is now) and put a board
+   * back there (rules 2 to 4, fresh reads), else null. So an offered Undo is one that would succeed now (PROTOCOL.md § Move board, "Undo").
+   */
+  async function undoNow(identity, boardId, from) {
     if (from == null) return null;
-    try { const t = await target(identity, m, from); return { space: { id: t.row.id, name: t.row.name, personal: t.row.kind === "personal" } }; }
-    catch (e) { if (e?.code === "forbidden") return null; throw e; }
+    try {
+      const t = await target(identity, await mover(identity, boardId), from);
+      return { space: { id: t.row.id, name: t.row.name, personal: t.row.kind === "personal" } };
+    } catch (e) { if (e?.code === "forbidden") return null; throw e; }
   }
 
   return {
@@ -94,7 +101,7 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
       const cand = picked.spaces.filter(s => s.id !== m.row.space).slice(0, HOME.batch);
       // ONE batch read settles rule 4 for every candidate (its own context holds its Space's and Group's grants).
       const ctxs = cand.length ? await registry.accessContexts(cand.map(s => ({ type: "space", id: s.id })), { users: [identity.user] }) : new Map();
-      const ok = cand.filter(s => { const c = ctxs.get("space\n" + s.id); return c && withinLadder(m.access.ladder, givenBy(c, identity.user), m.admin); });
+      const ok = cand.filter(s => { const c = ctxs.get("space\n" + s.id); return c && withinLadder(m.access.ladder, givenBy(c), m.admin); });
       return { board: { id: m.row.id, title: m.row.title }, from: m.row.space ? from ?? { hidden: true } : null, destinations: ok.slice(0, LIMITS.destinations), more: picked.more || ok.length > LIMITS.destinations };
     },
 
@@ -104,8 +111,8 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
      */
     async preview(identity, boardId, to) {
       const m = await mover(identity, boardId);
+      const dst = await target(identity, m, to);                     // first: a Space the caller can't open is the one 403, whether or not the board is in it
       if (m.row.space && m.row.space === to) throw bad("the board is already there");
-      const dst = await target(identity, m, to);
       const t = now();
       const board = { type: "board", id: m.row.id };
       // Phase 1 (light reads: Team members only for the caller): who is on the scopes involved. Phase 2 reads again for exactly those people.
@@ -182,18 +189,27 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
       if (from === to) throw bad("from and to are the same Space");
       const m = await mover(identity, boardId);
       const dst = await target(identity, m, to);
+      const cur = m.row.space ?? null;
+      if (cur !== to && cur !== from) throw new AdminError("moved", "the board is not in the Space you moved it from");   // stale `from`: the Registry would refuse too
       let out;
       try { out = await registry.moveBoard({ board: m.row.id, from, to: dst.row.id, idem }); }
       catch (e) { if (e?.code === "moved") throw new AdminError("moved", "the board has been moved since"); throw e; }
-      return { board: { id: out.board.id, title: out.board.title, space: { id: dst.row.id, name: dst.row.name } }, moved: out.moved, undo: await undoOf(identity, m, from) };
+      return { board: { id: out.board.id, title: out.board.title, space: { id: dst.row.id, name: dst.row.name } }, moved: out.moved, undo: out.moved ? await undoNow(identity, out.board.id, from) : null };
     },
 
-    /** The replay of a keyed move: authorized AGAIN as the move was, for the caller as they are now, then the board read fresh (`moved` is true: a replay reports the first success). */
-    async replay(identity, boardId, { from = null, to } = {}) {
-      const m = await mover(identity, boardId);
-      const dst = await target(identity, m, to);
-      const row = await registry.board(m.row.id);
-      return { board: { id: row.id, title: row.title, space: { id: dst.row.id, name: dst.row.name } }, moved: true, undo: await undoOf(identity, m, from) };
+    /**
+     * The replay of a keyed move by the same user (the key row is per user). `ref` is the Registry's stored answer, `<board>:moved` or `<board>:noop`, so `moved` is the real first
+     * answer. The caller is re-checked only as far as no leak needs: they must still be able to OPEN the destination (not `move` on the source: the board is not there any more). A board
+     * that is no longer in `to` answers `moved`.
+     */
+    async replay(identity, boardId, { from = null, to } = {}, ref = "") {
+      const id = idOf(boardId), unit = await tenancy.tenantOf(identity);
+      const row = unit && id ? await registry.board(id) : null;
+      const dst = row && row.tenant === unit.id ? await openSpace(identity, unit, to) : null;
+      if (!dst) throw refused();
+      if (row.space !== to) throw new AdminError("moved", "the board has been moved since");
+      const moved = String(ref).endsWith(":moved");
+      return { board: { id: row.id, title: row.title, space: { id: dst.id, name: dst.name } }, moved, undo: moved ? await undoNow(identity, row.id, from) : null };
     },
   };
 }

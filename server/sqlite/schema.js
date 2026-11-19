@@ -21,18 +21,22 @@ export function assertShapes(db, build, label) {
     build(scratch);
     const cols = (d, t) => d.query(`PRAGMA table_info("${t}")`).all().map(c => c.name).sort().join(",");
     const tables = scratch.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all().map(r => r.name);
-    const present = tables.filter(t => cols(db, t) !== "");
-    for (const t of present) {
-      const have = cols(db, t);
-      const need = cols(scratch, t);
-      if (have !== need) {
-        throw Object.assign(new Error(`${label}: table ${t} has columns (${have}) but this version needs (${need}): the file is from an older version. `
-          + "Reset the store (delete the file); the next start-up recreates it"), { code: "old-format" });
+    // One read transaction: every table is looked at in ONE snapshot. Several processes opening a brand-new file at once would otherwise see
+    // another's create half way (the first tables absent, the last present) and refuse it as half-migrated.
+    db.transaction(() => {
+      const present = tables.filter(t => cols(db, t) !== "");
+      for (const t of present) {
+        const have = cols(db, t);
+        const need = cols(scratch, t);
+        if (have !== need) {
+          throw Object.assign(new Error(`${label}: table ${t} has columns (${have}) but this version needs (${need}): the file is from an older version. `
+            + "Reset the store (delete the file); the next start-up recreates it"), { code: "old-format" });
+        }
       }
-    }
-    // Never half-migrated: a file with some of this adapter's tables and not all is from another version (we never ALTER or add tables to a used file).
-    if (present.length && present.length < tables.length)
-      throw Object.assign(new Error(`${label}: the file has tables (${present.join(", ")}) but not (${tables.filter(t => !present.includes(t)).join(", ")}): it is from an older version. `
-        + "Reset the store (delete the file); the next start-up recreates it"), { code: "old-format" });
+      // Never half-migrated: a file with some of this adapter's tables and not all is from another version (we never ALTER or add tables to a used file).
+      if (present.length && present.length < tables.length)
+        throw Object.assign(new Error(`${label}: the file has tables (${present.join(", ")}) but not (${tables.filter(t => !present.includes(t)).join(", ")}): it is from an older version. `
+          + "Reset the store (delete the file); the next start-up recreates it"), { code: "old-format" });
+    })();
   } finally { scratch.close(); }
 }

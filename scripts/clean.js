@@ -103,7 +103,7 @@ export function rigAliveViaCli(dir, timeout = 60_000, spawn = spawnSync) {
 }
 
 let nativeRenameExcl = null, nativeRenameErrno = null, warnedNativeFallback = false, nativeRenameFailurePlatform = null;
-export function resetNativeRenameWarning() { warnedNativeFallback = false; }
+export function resetNativeRenameWarning() { warnedNativeFallback = false; nativeRenameFailurePlatform = null; }
 export function loadNativeRename(loader = dlopen, platform = process.platform, warn = message => console.error(message), install = true, allowRacyRename = false) {
   let rename = null, errnoReader = null;
   try {
@@ -128,9 +128,12 @@ export function loadNativeRename(loader = dlopen, platform = process.platform, w
     rename = null;
     errnoReader = null;
   }
-  if ((platform === "darwin" || platform === "linux") && !rename) nativeRenameFailurePlatform = platform;
-  else if (rename && nativeRenameFailurePlatform === platform) nativeRenameFailurePlatform = null;
-  if (install) { nativeRenameExcl = rename; nativeRenameErrno = errnoReader; }
+  if (install) {
+    if ((platform === "darwin" || platform === "linux") && !rename) nativeRenameFailurePlatform = platform;
+    else if (rename && nativeRenameFailurePlatform === platform) nativeRenameFailurePlatform = null;
+    nativeRenameExcl = rename;
+    nativeRenameErrno = errnoReader;
+  }
   return rename;
 }
 loadNativeRename(dlopen, process.platform, message => console.error(message), true);

@@ -348,6 +348,17 @@ test("exclusive rename EEXIST is reported as kept with the target collision", ()
   expect(existsSync(d)).toBe(true);
 });
 
+test("a non-installing native loader failure does not leak platform state into clean", () => {
+  const warnings = [], w = world(), d = entry(w.tempDir, "plenary-test-nolek1");
+  resetNativeRenameWarning();
+  loadNativeRename(() => { throw new Error("missing library"); }, "darwin", () => {}, false);
+  const r = clean({ ...w, now: LATER(), yes: true, platform: "linux", nativeRenameAvailable: false, warn: message => warnings.push(message) });
+  expect(warnings).toEqual(["exclusive rename unavailable; refusing to remove (pass --allow-racy-rename to use check-then-rename)"]);
+  expect(byName(r, "plenary-test-nolek1")).toMatchObject({ status: "kept", why: expect.stringMatching(/exclusive rename unavailable/) });
+  expect(existsSync(d)).toBe(true);
+  resetNativeRenameWarning();
+});
+
 test("a failed darwin native loader warns once and --yes refuses without racy rename consent", () => {
   const warnings = [], w = world(), d = entry(w.tempDir, "plenary-test-loadr1");
   resetNativeRenameWarning();

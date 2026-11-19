@@ -413,8 +413,8 @@ export function memoryRegistry({ now = Date.now } = {}) {
       if (mine.length >= lim.perUser) throw askLimited(Math.min(...mine.map(v => v.at)) + ASK.windowMs - t);
       if ([...requests.values()].filter(v => v.scope.type === sc.type && v.scope.id === sc.id && v.state === "pending" && v.user !== user).length >= lim.scopePending) throw askLimited(null);
       const ids = new Set([...requests.values()].map(v => v.id));
-      let id = requests.get(k)?.id;
-      while (!id || (ids.has(id) && id !== requests.get(k)?.id)) id = mint.request();
+      let id;
+      while (!id || ids.has(id)) id = mint.request();
       const row = { id, tenant, scope: sc, user, role: r, state: "pending", at: t, closedAt: null };
       requests.set(k, row);
       idemPut(i, row.id);

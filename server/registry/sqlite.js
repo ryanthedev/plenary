@@ -265,7 +265,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     upRole: db.query("UPDATE reg_roles SET name = ?, board_role = ?, permissions = ? WHERE tenant = ? AND id = ?"),
     askGet: db.query("SELECT * FROM reg_access_requests WHERE scope_type = ? AND scope_id = ? AND member = ?"),
     askUp: db.query(`INSERT INTO reg_access_requests (id, tenant, scope_type, scope_id, member, role, state, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)
-      ON CONFLICT (scope_type, scope_id, member) DO UPDATE SET role = excluded.role, state = 'pending', at = excluded.at, closed_at = NULL`),
+      ON CONFLICT (scope_type, scope_id, member) DO UPDATE SET id = excluded.id, role = excluded.role, state = 'pending', at = excluded.at, closed_at = NULL`),
     askUser: db.query("SELECT count(*) AS n, min(at) AS first FROM reg_access_requests WHERE tenant = ?1 AND member = ?2 AND at > ?3 AND NOT (scope_type = ?4 AND scope_id = ?5)"),
     askScopeN: db.query("SELECT count(*) AS n FROM reg_access_requests WHERE scope_type = ? AND scope_id = ? AND state = 'pending' AND at > ? AND member <> ?"),
     askList: db.query("SELECT * FROM reg_access_requests WHERE scope_type = ? AND scope_id = ? AND state = 'pending' AND at > ? ORDER BY at DESC, id DESC LIMIT ?"),
@@ -413,7 +413,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     const mine = q.askUser.get(tenant, user, t - ASK.windowMs, sc.type, sc.id);
     if (mine.n >= lim.perUser) throw askLimited(mine.first + ASK.windowMs - t);
     if (q.askScopeN.get(sc.type, sc.id, t - ASK.ttlMs, user).n >= lim.scopePending) throw askLimited(null);
-    const id = q.askGet.get(sc.type, sc.id, user)?.id ?? fresh(mint.request, i => !!db.query("SELECT 1 AS x FROM reg_access_requests WHERE id = ?").get(i));
+    const id = fresh(mint.request, i => !!db.query("SELECT 1 AS x FROM reg_access_requests WHERE id = ?").get(i));
     q.askUp.run(id, tenant, sc.type, sc.id, user, role, t);
     idemPut(idem, id, t);
     return rowAsk(q.askGet.get(sc.type, sc.id, user));

@@ -474,7 +474,9 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
       const sc = await scopeOf(identity, unit, type, id);
       if (!sc || type === "unit" || !opens(sc.access) || manages(sc) || isPersonal(sc)) throw refused();
       const r = await registry.accessRequest({ type, id: sc.row.id }, identity.user);
-      if (!r || r.id !== ref) throw refused();
+      if (!r) throw refused();
+      if (r.id !== ref) throw new AdminError("superseded", "that request was replaced by a later one");   // the key's request is not the open one any more: never answer with the newer
+
       return requestRow(r, await registry.roles(unit.id));
     },
 

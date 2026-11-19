@@ -955,10 +955,10 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         const mine = await one(tx, `SELECT count(*) AS n, min(at) AS first FROM ${AR} WHERE tenant = $1 AND member = $2 AND at > $3 AND NOT (scope_type = $4 AND scope_id = $5)`, [tenant, user, t - ASK.windowMs, sc.type, sc.id]);
         if (Number(mine.n) >= lim.perUser) throw askLimited(Number(mine.first) + ASK.windowMs - t);
         if (Number((await one(tx, `SELECT count(*) AS n FROM ${AR} WHERE scope_type = $1 AND scope_id = $2 AND state = 'pending' AND at > $3 AND member <> $4`, [sc.type, sc.id, t - ASK.ttlMs, user])).n) >= lim.scopePending) throw askLimited(null);
-        const id = row?.id ?? await fresh(tx, mint.request, AR);
+        const id = await fresh(tx, mint.request, AR);   // every write mints a new id: a key's ref names one request, never a later one
         await idemPut(tx, k, id, t);
         await tx.unsafe(`INSERT INTO ${AR} (id, tenant, scope_type, scope_id, member, role, state, at) VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
-          ON CONFLICT (scope_type, scope_id, member) DO UPDATE SET role = excluded.role, state = 'pending', at = excluded.at, closed_at = NULL`, [id, tenant, sc.type, sc.id, user, r, t]);
+          ON CONFLICT (scope_type, scope_id, member) DO UPDATE SET id = excluded.id, role = excluded.role, state = 'pending', at = excluded.at, closed_at = NULL`, [id, tenant, sc.type, sc.id, user, r, t]);
         return rowAsk(await one(tx, `SELECT * FROM ${AR} WHERE id = $1`, [id]));
       });
     },

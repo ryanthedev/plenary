@@ -401,6 +401,17 @@ describe("requests of people who already reach the role are not shown", () => {
     expect(rows[0].id).toBeTruthy();
     expect(first.role).toBe("annotator");
   });
+  test("a retried keyed POST after a supersede is told 409 superseded, never handed the newer request; the current id still replays", async () => {
+    await svc.requestAccess(dev, "space", platform.id, "annotator");
+    const oldId = (await r.accessRequest({ type: "space", id: platform.id }, dev.user)).id;
+    expect((await svc.replayRequest(dev, "space", platform.id, oldId)).role).toBe("annotator");
+    await r.setScopedGrant({ scope: { type: "space", id: platform.id }, subject: { type: "team", id: infra.id }, role: "annotator" });
+    await svc.requestAccess(dev, "space", platform.id, "editor");
+    const cur = (await r.accessRequest({ type: "space", id: platform.id }, dev.user)).id;
+    expect(cur).not.toBe(oldId);
+    expect(await code(svc.replayRequest(dev, "space", platform.id, oldId))).toBe("superseded");
+    expect((await svc.replayRequest(dev, "space", platform.id, cur)).role).toBe("editor");
+  });
   test("a pending ask the caller does not yet reach is returned as it is, whatever role is asked next", async () => {
     await svc.requestAccess(dev, "space", platform.id, "annotator");
     const again = await svc.requestAccess(dev, "space", platform.id, "editor");

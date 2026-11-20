@@ -7,7 +7,7 @@
 import { h, replace } from "./dom.js";
 import { announce } from "./focus.js";
 import { openDialog } from "./dialogs.js";
-import { diffText, destinationText, createUndo, movedText } from "../../core/move.js";
+import { diffText, destinationText, createUndo, movedText, createMoveModel } from "../../core/move.js";
 import { showUndoToast } from "./toast.js";
 
 let seq = 0;
@@ -85,4 +85,17 @@ export function openMove({ host, model, opener = null, onMoved }) {
  */
 export function showMoveToast({ host, move, board, result, clock, newKey = null, onChange = () => {}, restoreFocus = () => {} }) {
   return showUndoToast({ host, text: movedText(result.board.title, result.board.space.name), label: "Board moved", undo: createUndo({ move, board, result, newKey }), clock, onChange, restoreFocus });
+}
+
+/**
+ * The whole Move flow behind one call, shared by every entry point (a Space page card, a Home card, the board page's menu): the dialog, then on success `reload()` (the page refreshes
+ * what it shows) and the Undo toast, whose own `onChange` (an Undo that worked) calls `reload()` again. `restoreFocus` is where focus goes when the toast ends with focus inside it.
+ * @param {{ host: HTMLElement, move: { port: import("../../ports/move.js").MovePort, clock: import("../../ports/clock.js").Clock, newKey?: (() => string)|null }, board: string,
+ *   opener?: { focus?: () => void }|null, reload(): unknown, restoreFocus?(): void, toastHost?: HTMLElement }} o
+ */
+export function startMove({ host, move, board, opener = null, reload, restoreFocus = () => {}, toastHost = globalThis.document.body }) {
+  const model = createMoveModel({ move: move.port, board, newKey: move.newKey });
+  return openMove({ host, model, opener, onMoved: result => {
+    Promise.resolve(reload()).catch(() => {}).then(() => showMoveToast({ host: toastHost, move: move.port, board, result, clock: move.clock, newKey: move.newKey, onChange: reload, restoreFocus }));
+  } });
 }

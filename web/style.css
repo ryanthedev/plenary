@@ -46,6 +46,7 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 .spacer { flex: 1; }
 .board-name { font-weight: 600; font-size: 13px; padding: 0 6px; white-space: nowrap; min-width: 56px; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; }
 .board-name small { font-weight: 400; color: var(--dim); }
+.board-space { font-size: 12px; color: var(--dim); white-space: nowrap; max-width: 160px; overflow: hidden; text-overflow: ellipsis; }
 .btn { height: 28px; padding: 0 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
 .btn:hover { background: var(--hover); }
 .btn.primary { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
@@ -253,6 +254,7 @@ body .phone-only { display: none !important; }
   .avatars { gap: 4px; }
   .board-name { font-size: 13px; max-width: 110px; overflow: hidden; text-overflow: ellipsis; padding: 0 2px; }
   .board-name small { display: none; }
+  .board-space { max-width: 80px; }
   .pill { padding: 0 8px; }
   .pill .sub { display: none; }
   .av { width: 24px; height: 24px; }
@@ -382,6 +384,8 @@ body.stale .watching { opacity: .45; }
 .card-menu { position: absolute; top: 6px; right: 6px; }
 .card .card-menu .more { height: 30px; }
 .card > .card-open { padding-right: 44px; }
+.card.has-menu > .card-open { padding-right: 82px; }
+.card .card-menu.home-menu { right: 42px; }
 .sp-veil { position: fixed; z-index: 40; }
 .sp-dialog { max-width: 520px; max-height: 92vh; overflow-y: auto; }
 .sp-dialog form { margin: 0; }

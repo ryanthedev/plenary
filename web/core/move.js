@@ -122,3 +122,18 @@ export function createUndo({ move, board, result, newKey = null }) {
     },
   };
 }
+
+/**
+ * What the board page needs to know: may this person move the board, and which Space is it in. Read through the existing options route (PROTOCOL.md § Move board, "Where it appears"):
+ * a 200 means yes (`space` is where the board is, null when the caller can't open it), any error means no. Never rejects.
+ * @param {import("../ports/move.js").MovePort} move @param {string} board
+ * @returns {Promise<{ can: boolean, space: { id: string, name: string }|null }>}
+ */
+export async function probeMove(move, board) {
+  try {
+    const r = await move.options(board);
+    if (r.error || !r.options) return { can: false, space: null };
+    const f = r.options.from;
+    return { can: true, space: f && !f.hidden ? { id: f.id, name: f.name } : null };
+  } catch { return { can: false, space: null }; }
+}

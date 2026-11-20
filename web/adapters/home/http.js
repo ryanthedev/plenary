@@ -10,7 +10,8 @@ const list = (v, max, f) => (Array.isArray(v) ? v.slice(0, max).map(f).filter(Bo
 
 const part = p => (p && typeof p === "object" && ["group", "space", "shared"].includes(p.type) ? { type: p.type, ...(ID.test(p.id) ? { id: p.id } : {}), name: str(p.name) } : null);
 const card = c => (c && typeof c === "object" && ID.test(c.id)
-  ? { id: c.id, title: str(c.title), role: str(c.role, 32), path: list(c.path, 4, part), starred: c.starred === true, ...(Number.isFinite(c.at) ? { at: c.at } : {}) } : null);
+  ? { id: c.id, title: str(c.title), role: str(c.role, 32), path: list(c.path, 4, part), starred: c.starred === true, ...(Number.isFinite(c.at) ? { at: c.at } : {}),
+    ...(c.can && typeof c.can === "object" ? { can: { rename: c.can.rename === true, move: c.can.move === true, trash: c.can.trash === true } } : {}) } : null);
 const node = s => (s && typeof s === "object" && ID.test(s.id) ? { id: s.id, name: str(s.name), personal: s.personal === true } : null);
 const tree = t => (t && typeof t === "object" ? {
   groups: list(t.groups, 200, g => (g && ID.test(g.id) ? { id: g.id, name: str(g.name), spaces: list(g.spaces, 200, node) } : null)),

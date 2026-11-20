@@ -43,9 +43,9 @@ export function homeService({ registry, tenancy, now = Date.now }) {
   const card = (f, extra = {}) => ({ id: f.board.id, title: f.board.title, role: f.access.ladder, path: pathOf(f), starred: false, ...extra });
 
   /** Cards for `entries` ({ id, at? }) in order, dropping what the person can't open; star flags in one query. `keep(found)` filters further. */
-  async function cards(identity, unit, entries, { found: given, keep, can = false } = {}) {
+  async function cards(identity, unit, entries, { found: given, keep, can = !!unit } = {}) {
     const found = given ?? await accessAll(identity, [...new Set(entries.map(e => e.id))]);
-    // `can` (the Space page): what the person may do to the board, as permissions the resolver already computed (never a role name).
+    // `can` (the Space page and a member's Home cards, never a guest's): what the person may do to the board, as permissions the resolver already computed (never a role name).
     const extra = f => (can ? { can: { rename: f.access.permissions.has("board.edit") || f.access.permissions.has("members.manage"), move: f.access.permissions.has("move"), trash: f.access.permissions.has("delete") } } : {});
     const out = entries.filter(e => openable(found.get(e.id)) && (!keep || keep(found.get(e.id)))).map(e => card(found.get(e.id), { ...(e.at != null ? { at: e.at } : {}), ...extra(found.get(e.id)) }));
     if (out.length) {

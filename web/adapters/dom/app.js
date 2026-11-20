@@ -21,6 +21,8 @@ import { h, $, replace } from "./dom.js";
 import { pillPopover } from "./explain.js";
 import { openShare } from "./share.js";
 import { createShareModel } from "../../core/share.js";
+import { startMove } from "./move.js";
+import { probeMove } from "../../core/move.js";
 import { mountCollab } from "./collab/ui.js";
 import { collabFrame } from "./collab/frame.js";
 import { hitTest } from "../../../packages/core/geometry.js";
@@ -44,7 +46,7 @@ import { hitTest } from "../../../packages/core/geometry.js";
  *   homeHref: where the top bar's Home link goes (the Home screen); null = no link (dev rooms).
  * @returns {{ S: object, ui: object, net: object, setTheme(t: string): void, openDialog(d: string): void, setPanel(op: object): void }}
  */
-export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null, homeHref = null, access = null, newKey = null, share = null }) {
+export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null, homeHref = null, access = null, newKey = null, share = null, move = null }) {
   if (!clock || typeof clock.now !== "function" || typeof clock.mono !== "function") throw new Error("mountApp: the clock port is required");
   const get = k => { try { return prefs.get(k); } catch { return null; } };
   const put = (k, v) => { try { prefs.set(k, v); } catch {} };
@@ -342,6 +344,19 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     openShare({ host: document.body, model, opener: shareOpener, accessHref: `${loc?.pathname ?? "/"}?access=board:${encodeURIComponent(board)}`, now: () => clock.now() });
   }
 
+  // Move to… (PROTOCOL.md § Move board, "Where it appears"): offered only when the move route answered for this board (`can`), which also names the Space shown beside the board name.
+  // Probed once now and again after a move or an Undo, so the name and the menu item follow the board without a reload. `moveGen` drops an answer a newer probe has outdated.
+  const moveInfo = { can: false, space: null };
+  let moveGen = 0;
+  const refreshMove = () => {
+    if (!move) return Promise.resolve();
+    const mine = ++moveGen;
+    return probeMove(move.port, board).then(r => { if (mine !== moveGen) return; moveInfo.can = r.can; moveInfo.space = r.space; chromeDirty = true; });
+  };
+  const moveOpener = { focus() { document.querySelector(".header-more")?.focus?.(); } };
+  const openMoveDialog = () => startMove({ host: document.body, move, board, opener: moveOpener, reload: refreshMove, restoreFocus: () => canvas.focus?.() });
+  refreshMove();
+
   function topbar() {
     const role = S.role, tools = toolsFor(role), may = S.may();
     const core = tools.filter(t => !["image", "note", "highlighter"].includes(t.id)), extras = tools.filter(t => ["image", "note", "highlighter"].includes(t.id));
@@ -388,6 +403,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       role === "presenter" ? extraAction("Mermaid", () => openDialog("mermaid"), !may) : null,
       role === "presenter" ? extraAction("Export", toggleExport) : null,
       share && S.canShare ? extraAction("Share", () => openShareDialog()) : null,
+      move && moveInfo.can ? extraAction("Move to…", openMoveDialog) : null,
       role !== "viewer" ? extraAction("Side panel", togglePanel) : null,
       extraAction("Light / dark", toggleTheme),
     ]);
@@ -413,6 +429,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
           h("button.tb", { title: "Redo (⌘⇧Z)", disabled: !may, onclick: () => { S.act(S.active, e => e.redo()); } }, h("span.ic", {}, "↷"))] : null),
       homeHref ? h("a.btn.ghost", { href: homeHref, title: "Home", "aria-label": "Home" }, "⌂") : null,
       h("span.board-name", {}, board, net.kind === "ws" ? null : [" ", h("small", {}, "· dev room")]),
+      moveInfo.space ? h("span.board-space", { title: "The Space this board is in" }, "in ", moveInfo.space.name) : null,
       h("span.spacer"),
       actions,
     ];
@@ -656,7 +673,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     return root;
   };
   const parts = {
-    topbar: { key: () => `${notesCount()}${S.canShare ? ":share" : ""}`, build: buildTopbar },
+    topbar: { key: () => `${notesCount()}${S.canShare ? ":share" : ""}${moveInfo.can ? ":move" : ""}:${moveInfo.space?.id ?? ""}:${moveInfo.space?.name ?? ""}`, build: buildTopbar },
     panel: { key: () => (S.role === "viewer" || !ui.panel.open ? "" : panelKey()), build: buildPanel },
     drawer: { key: () => (ui.drawer === "notes" ? notesRowsKey() : ""), build: buildDrawer },
     timeline: { key: () => { const B = S.eds.board, bi = boardInfo(B.doc), t = B.time(); return S.role !== "presenter" ? "" : JSON.stringify([bi.marks, bi.dur, !!B.play, B.play ? null : t]); }, build: timeline },

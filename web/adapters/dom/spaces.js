@@ -6,9 +6,8 @@
 import { h, replace } from "./dom.js";
 import { keeper, announce } from "./focus.js";
 import { whyCard } from "./explain.js";
-import { openMove, showMoveToast } from "./move.js";
+import { startMove } from "./move.js";
 import { showTrashToast } from "./toast.js";
-import { createMoveModel } from "../../core/move.js";
 import { generalText, spaceEmpty, groupEmpty } from "../../core/spaces.js";
 
 /**
@@ -143,8 +142,7 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null, acc
     const menuCfg = { label: `More for ${c.title || "Untitled"}`, items: [
       { text: "Open", href: hrefs.board(c.id) },
       { text: "Who has access", href: hrefs.access?.("board", c.id), hidden: !hrefs.access },
-      { text: "Move to…", hidden: !move || !c.can?.move, onSelect: opener => openMove({ host: root, opener, model: createMoveModel({ move: move.port, board: c.id, newKey: move.newKey }),
-        onMoved: result => { model.load().then(() => showMoveToast({ host: globalThis.document.body, move: move.port, board: c.id, result, clock: move.clock, newKey: move.newKey, onChange: () => model.load(), restoreFocus: () => main.focus?.() })); } }) },
+      { text: "Move to…", hidden: !move || !c.can?.move, onSelect: opener => startMove({ host: root, move, board: c.id, opener, reload: () => model.load(), restoreFocus: () => main.focus?.() }) },
       { text: "Rename", hidden: !c.can?.rename, onSelect: () => { editing = { type: "board", id: c.id }; render(); } },
       { text: "Move to Trash", hidden: !trash || !c.can?.trash, onSelect: () => trashBoard(c) },
     ] };

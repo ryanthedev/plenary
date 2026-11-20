@@ -215,3 +215,44 @@ test("Home links to Roles only when the server says the caller may manage roles 
   await mount({ ...DATA, guest: true, unit: null, tree: null, can: { createGroup: false, manageAccess: false, manageRoles: true } }, at);
   expect(side().map(x => x[1])).not.toContain("Roles");
 });
+
+// #91: Home cards offer Move to… (the shared startMove flow) only where the server says can.move and the page has a move port.
+describe_move();
+function describe_move() {
+  const OPTS = { board: { id: "a", title: "A" }, from: { id: "s1", name: "Design", personal: false }, destinations: [{ id: "s2", name: "Plat", personal: false, general: null, group: null }], more: false };
+  const DIFF = { board: { id: "a", title: "A" }, from: OPTS.from, to: { id: "s2", name: "Plat", personal: false }, gains: [], keeps: [], loses: [], invites: null, links: null, hidden: false, more: false };
+  const RES = { board: { id: "a", title: "A", space: { id: "s2", name: "Plat" } }, moved: true, undo: { space: { id: "s1", name: "Design", personal: false } } };
+  const mk = () => { const calls = []; return { calls, port: { options: async b => { calls.push(["options", b]); return { options: OPTS }; }, preview: async (b, to) => { calls.push(["preview", to]); return { diff: DIFF }; },
+    move: async (b, body, key) => { calls.push(["move", body, key]); return { result: RES }; } }, clock: virtualClock({ t0: 1_000_000 }), newKey: () => "k1" }; };
+  const withMove = { ...DATA, recent: [card("a", { can: { rename: true, move: true, trash: true } }), card("b", { can: { rename: true, move: false, trash: true } })], starred: [], shared: [card("c")] };
+  const menuBtns = () => buttons().filter(b => /^More for/.test(b.getAttribute("aria-label") ?? ""));
+  test("#91 Home: only a card whose can.move is true has a ⋯ menu, with Move to… as its item; no move port, no menu", async () => {
+    await mount(withMove, { move: mk() });
+    expect(menuBtns().map(b => b.getAttribute("aria-label"))).toEqual(["More for A"]);
+    menuBtns()[0].click();
+    expect(root.findAll(e => e.getAttribute("role") === "menuitem").map(textOf)).toEqual(["Move to…"]);
+    await mount(withMove);                                                          // no port
+    expect(menuBtns()).toEqual([]);
+  });
+  test("#91 Home: choosing Move to… opens the shared dialog; moving reloads Home and shows the Undo toast; Undo moves back and reloads again", async () => {
+    const mv = mk();
+    await mount(withMove, { move: mv });
+    globalThis.document.body = new FakeElement("body");
+    let loads = 0; const load0 = api.load; api.load = async () => { loads++; return load0(); };
+    menuBtns()[0].click();
+    root.find(e => e.getAttribute("role") === "menuitem").click(); await settle(); await settle();
+    expect(mv.calls[0]).toEqual(["options", "a"]);
+    const dlg = root.find(e => e.getAttribute("role") === "dialog");
+    expect(dlg).toBeTruthy();
+    const radio = root.find(e => e.tagName === "INPUT" && e.getAttribute("type") === "radio");
+    radio.checked = true; radio.dispatch("change", { target: radio }); await settle();
+    root.find(e => e.tagName === "FORM").dispatch("submit"); await settle(); await settle(); await settle();
+    expect(mv.calls.filter(c => c[0] === "move")).toEqual([["move", { from: "s1", to: "s2" }, "k1"]]);
+    expect(loads).toBe(1);                                                          // Home reloaded after the move
+    const toast = globalThis.document.body.find(e => e.getAttribute("aria-label") === "Board moved");
+    expect(textOf(toast)).toContain("Moved A to Plat.");
+    toast.find(e => e.getAttribute("data-fk") === "move-undo").click(); await settle(); await settle();
+    expect(mv.calls.filter(c => c[0] === "move").at(-1)[1]).toEqual({ from: "s2", to: "s1" });
+    expect(loads).toBe(2);
+  });
+}

@@ -389,6 +389,23 @@ describe("one Space's boards (the tree's click)", () => {
   });
 });
 
+describe("can on Home cards (#91)", () => {
+  test("a member's Home and search cards carry can.move from the resolver's `move` permission (an owner has it, a plain viewer does not); a guest's cards carry no `can`", async () => {
+    const sp = await r.createSpace({ tenant: acme.id, name: "Design" });
+    const mine = await mk(sp.id, "Mine"), theirs = await mk(sp.id, "Theirs");
+    await r.setGrant(mine.id, ada.user, "owner"); await r.setGrant(theirs.id, ada.user, "viewer");
+    const via = [await home.search(ada, "Mine"), await home.search(ada, "Theirs")].map(x => x.results[0]);
+    expect(via[0].can.move).toBe(true);
+    expect(via[1].can.move).toBe(false);
+    expect(Object.keys(via[0].can).sort()).toEqual(["move", "rename", "trash"]);
+    await r.setGrant(mine.id, kim.user, "owner");
+    const g = await home.home(kim);
+    expect(g.guest).toBe(true);
+    expect(g.owned.length + g.shared.length).toBeGreaterThan(0);
+    for (const c of [...g.shared, ...g.owned]) expect(c.can).toBeUndefined();
+  });
+});
+
 describe("bounds", () => {
   const spy = reg => { const calls = {}; return { calls, reg: new Proxy(reg, { get: (t, k) => (typeof t[k] === "function" ? (...a) => { calls[k] = (calls[k] ?? 0) + 1; return t[k](...a); } : t[k]) }) }; };
 

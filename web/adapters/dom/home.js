@@ -5,15 +5,18 @@
 
 import { h, replace } from "./dom.js";
 import { keeper } from "./focus.js";
+import { overflowMenu } from "./spaces.js";
+import { startMove } from "./move.js";
 import { pathText, whenText } from "../../core/home.js";
 
 /**
  * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/home.js").createHomeModel>, clock: import("../../ports/clock.js").Clock,
  *   boardHref: (id: string) => string, spaceHref: (id: string) => string, groupHref: (id: string) => string,
+ *   move?: { port: import("../../ports/move.js").MovePort, clock: import("../../ports/clock.js").Clock, newKey?: (() => string)|null }|null,
  *   dialogs: Pick<ReturnType<typeof import("./dialogs.js").createDialogs>, "newBoard"|"newSpace"|"newGroup">, homeHref?: string, signIn?: { href: string, text?: string } | null }} o
  * @returns {{ destroy(): void }}
  */
-export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref, teamsHref = null, trashHref = null, rolesHref = null, unitAccessHref = null, dialogs, homeHref = "./", signIn = null }) {
+export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref, teamsHref = null, trashHref = null, rolesHref = null, unitAccessHref = null, dialogs, homeHref = "./", signIn = null, move = null }) {
   const S = model.state, keys = keeper(), mark = keys.mark;
   const status = h("div.home-status", { role: "status", "aria-live": "polite" });
   const search = h("input.home-search", { type: "search", placeholder: "Search boards and Spaces", "aria-label": "Search boards and Spaces", autocomplete: "off", maxlength: "100", spellcheck: "false",
@@ -44,8 +47,15 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
   function card(c, sec) {
     const when = c.at != null ? whenText(c.at, clock.now()) : "";
     const where = pathText(c.path);
-    return h("li.card", {},
-      mark(h("a.card-open", { href: boardHref(c.id) }, h("span.t", {}, c.title || "Untitled"), h("span.p", {}, [where, c.role, when].filter(Boolean).join(" · "))), `card:${sec}:${c.id}`),
+    // ⋯ menu: Move to… only for a card whose `can.move` is true (PROTOCOL.md § Move board, "Where it appears"); the menu is kept across redraws so an open one survives a star toggle.
+    const label = c.title || "Untitled";
+    const menuCfg = { label: `More for ${label}`, items: [{ text: "Move to…", hidden: !move || !c.can?.move, onSelect: opener => startMove({ host: root, move, board: c.id, opener, reload: () => model.load(), restoreFocus: () => main.focus?.() }) }] };
+    const menu = move && c.can?.move ? keys.keep(`menu:${sec}:${c.id}`, () => overflowMenu(menuCfg)) : null;
+    menu?.update(menuCfg);
+    if (menu) mark(menu.button, `menu:${sec}:${c.id}`);
+    return h(`li.card${menu ? ".has-menu" : ""}`, {},
+      mark(h("a.card-open", { href: boardHref(c.id) }, h("span.t", {}, label), h("span.p", {}, [where, c.role, when].filter(Boolean).join(" · "))), `card:${sec}:${c.id}`),
+      menu ? h("span.card-menu.home-menu", {}, menu.el) : null,
       guest() ? null : star(c, sec));
   }
   const cardList = (cards, label) => h("ul.cards", { "aria-label": label }, cards.map(c => card(c, label)));

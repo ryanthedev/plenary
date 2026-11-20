@@ -21,7 +21,7 @@ const USERS = { "t-ada": { user: "ada", role: "owner" }, "t-bo": { user: "bo", r
   "t-di": { user: "di", role: "annotator" }, "t-vi": { user: "vi", role: "viewer" } };
 
 /** ada's page over a room with bo (a second presenter, headless) on the same virtual clock. */
-function setup({ expAt = null, relogin = null, collab = false, role = null, token = "t-ada", prefs = memoryStore(), wrap = null, appNet = null, access = null, share = null } = {}) {
+function setup({ expAt = null, relogin = null, collab = false, role = null, token = "t-ada", prefs = memoryStore(), wrap = null, appNet = null, access = null, share = null, move = null } = {}) {
   installPage();
   const net = localRoom({ users: USERS, clock: true });
   const joins = [], hooks = {};
@@ -30,7 +30,7 @@ function setup({ expAt = null, relogin = null, collab = false, role = null, toke
   const app = mountApp({
     startSession: ({ mine, onChange }) => createSession({ join: () => { const t = net.join(); joins.push(t); return wrap ? wrap(t) : t; }, token, board: "b1", client: USERS[token].user, user: USERS[token].user, mine, onChange, clock: net.clock }),
     net: appNet ?? { kind: "local", put() {}, onFile() {} }, board: "b1", me: { user: USERS[token].user, name: "Ada", role }, prefs, theme: "light",
-    clock: net.clock, expAt, relogin, access, share, newKey: () => "key-pill-0001",
+    clock: net.clock, expAt, relogin, access, share, move: move && { clock: net.clock, ...move }, newKey: () => "key-pill-0001",
     collab: collab ? (S, o) => { hooks.jumpTo = o.jumpTo; return syncCollabPort(S, { name: "Ada", frame: fn => net.clock.set(fn, 16), ...o }); } : null,
   });
   /** n animation frames, 16 ms of virtual time each, the room settled in between. */
@@ -722,7 +722,7 @@ test("K2 app.js: no setTimeout/setInterval/performance.now/Date.now in the sourc
 test("K3 main.js: the token goes only into createSession; sign-in leaves for the fixed href; the return board only via takeReturnBoard", async () => {
   const src = await Bun.file(new URL("../../web/main.js", import.meta.url)).text();
   const code = src.replace(/\/\/.*$/gm, "");
-  expect(code.match(/signIn\.token/g).length).toBe(13);                         // the gate check, createSession's token, and the Home, Spaces, Access and Roles ports' (their Bearer header), plus the Move port's, and the Trash port's (the Trash page, the Space page's Move to Trash, the board-URL notice), the Access port of the Space page (Ask for access) and of the canvas pill (why view-only), plus the Share port of the canvas (Share dialog)
+  expect(code.match(/signIn\.token/g).length).toBe(15);                         // the gate check, createSession's token, and the Home, Spaces, Access and Roles ports' (their Bearer header), plus the Move port's, and the Trash port's (the Trash page, the Space page's Move to Trash, the board-URL notice), the Access port of the Space page (Ask for access) and of the canvas pill (why view-only), plus the Share port of the canvas (Share dialog), and the Move port's on Home cards and on the canvas (#91)
   expect(code).toMatch(/httpHome\(\{[^}]*token: signIn\.token,/);
   expect(code).toMatch(/if \(!signIn\.token\)/);
   expect(code).toMatch(/createSession\(\{[^}]*token: signIn\.token,/);
@@ -1316,4 +1316,63 @@ test("DW-52.3e the Share button shows only when the welcome says can.share: a cu
   expect(button()).toBeUndefined();
   rig = setup({ token: "t-cy", wrap: said(true) });                                    // no share port wired: no button either
   expect(button()).toBeUndefined();
+});
+
+// #91: the board page's More menu offers Move to… (the shared startMove flow) only where the existing move route answered for this board; the Space shows beside the board name and follows a move.
+function movePort(o = {}) {
+  const st = { space: { id: "s1", name: "Design", personal: false }, calls: [], forbidden: false, ...o };
+  const options = () => ({ board: { id: "b1", title: "B" }, from: st.space, destinations: [{ id: "s2", name: "Plat", personal: false, general: null, group: null }], more: false });
+  const port = { options: async b => { st.calls.push(["options", b]); return st.forbidden ? { error: "forbidden" } : { options: options() }; },
+    preview: async (b, to) => ({ diff: { board: { id: "b1", title: "B" }, from: st.space, to: { id: to, name: "Plat", personal: false }, gains: [], keeps: [], loses: [], invites: null, links: null, hidden: false, more: false } }),
+    move: async (b, body, key) => { st.calls.push(["move", body, key]); const from = st.space; st.space = { id: body.to, name: body.to === "s2" ? "Plat" : "Design", personal: false };
+      return { result: { board: { id: "b1", title: "B", space: { id: st.space.id, name: st.space.name } }, moved: true, undo: { space: { id: from.id, name: from.name, personal: false } } } }; } };
+  return { st, move: { port, newKey: () => "mk" } };
+}
+const moveItem = () => find(page.byId.topbar, e => e.getAttribute?.("role") === "menuitem" && e.textContent === "Move to…");
+const spaceLabel = () => find(page.byId.topbar, e => /\bboard-space\b/.test(e.className ?? ""))?.textContent ?? null;
+const flush = async (n = 4) => { for (let i = 0; i < n; i++) await settleP(); };
+
+test("#91 board page: Move to… and the Space name show only when the move route answers (a 403 or no port shows neither)", async () => {
+  const ok = movePort();
+  rig = setup({ move: ok.move }); await flush(); rig.step(2);
+  expect(ok.st.calls[0]).toEqual(["options", "b1"]);
+  expect(moveItem()).toBeTruthy();
+  expect(spaceLabel()).toBe("in Design");
+  const no = movePort({ forbidden: true });
+  rig = setup({ move: no.move }); await flush(); rig.step(2);
+  expect(moveItem()).toBeUndefined(); expect(spaceLabel()).toBeNull();
+  rig = setup(); await flush(); rig.step(2);
+  expect(moveItem()).toBeUndefined();
+});
+
+test("#91 board page: Move to… opens the shared dialog; after the move the Space name follows without a reload and the Undo toast moves it back", async () => {
+  const mp = movePort();
+  rig = setup({ move: mp.move }); await flush(); rig.step(2);
+  moveItem().click(); await flush();
+  const dlg = find(globalThis.document.body, e => e.getAttribute?.("role") === "dialog");
+  expect(dlg).toBeTruthy();
+  const radio = find(dlg, e => e.tagName === "INPUT" && e.getAttribute("type") === "radio");
+  radio.checked = true; radio.fire("change", { target: radio }); await flush();
+  find(dlg, e => e.tagName === "FORM").fire("submit", { preventDefault() {} }); await flush(8); rig.step(2);
+  expect(mp.st.calls.filter(c => c[0] === "move")).toEqual([["move", { from: "s1", to: "s2" }, "mk"]]);
+  expect(spaceLabel()).toBe("in Plat");
+  const toast = find(globalThis.document.body, e => e.getAttribute?.("aria-label") === "Board moved");
+  expect(toast.textContent).toContain("Moved B to Plat.");
+  find(toast, e => e.getAttribute?.("data-fk") === "move-undo").click(); await flush(8); rig.step(2);
+  expect(mp.st.calls.filter(c => c[0] === "move").at(-1)[1]).toEqual({ from: "s2", to: "s1" });
+  expect(spaceLabel()).toBe("in Design");
+});
+
+test("#91 board page: a move that leaves the mover without `move` takes the menu item away (the probe runs again after it)", async () => {
+  const mp = movePort();
+  rig = setup({ move: mp.move }); await flush(); rig.step(2);
+  expect(moveItem()).toBeTruthy();
+  const orig = mp.move.port.move;
+  mp.move.port.move = async (...a) => { const r = await orig(...a); mp.st.forbidden = true; return r; };
+  moveItem().click(); await flush();
+  const dlg = find(globalThis.document.body, e => e.getAttribute?.("role") === "dialog");
+  const radio = find(dlg, e => e.tagName === "INPUT" && e.getAttribute("type") === "radio");
+  radio.checked = true; radio.fire("change", { target: radio }); await flush();
+  find(dlg, e => e.tagName === "FORM").fire("submit", { preventDefault() {} }); await flush(8); rig.step(2);
+  expect(moveItem()).toBeUndefined(); expect(spaceLabel()).toBeNull();
 });

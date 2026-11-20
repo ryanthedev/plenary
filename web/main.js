@@ -128,7 +128,8 @@ if (!signIn.token) {
   } else {
     const model = createHomeModel({ api: httpHome({ fetch: fetchNow, token: signIn.token, timers: clock }), clock });
     mountHome({ root, model, clock, signIn: signInLink, homeHref: location.pathname, dialogs,
-      boardHref: hrefs.board, spaceHref: hrefs.space, groupHref: hrefs.group, teamsHref: hrefs.teams, trashHref: hrefs.trash, rolesHref: hrefs.roles, unitAccessHref: id => hrefs.access("unit", id) });
+      boardHref: hrefs.board, spaceHref: hrefs.space, groupHref: hrefs.group, teamsHref: hrefs.teams, trashHref: hrefs.trash, rolesHref: hrefs.roles, unitAccessHref: id => hrefs.access("unit", id),
+      move: { port: httpMove({ fetch: fetchNow, token: signIn.token, timers: clock }), clock, newKey: () => randomKey() } });
     hideGate();
     model.load();
   }
@@ -158,6 +159,8 @@ if (!signIn.token) {
     access: httpAccess({ fetch: (...a) => globalThis.fetch(...a), token: signIn.token, timers: clock }), newKey: () => randomKey(),
     // The Share dialog's calls (PROTOCOL.md § Share dialog).
     share: httpShare({ fetch: (...a) => globalThis.fetch(...a), token: signIn.token, timers: clock }),
+    // Move to… in the More menu (PROTOCOL.md § Move board, "Where it appears"): the same port as the Space page and Home.
+    move: httpMove({ fetch: (...a) => globalThis.fetch(...a), token: signIn.token, timers: clock }),
     // The collaboration UI over this session (presence and records ride the board connection; web/adapters/collab/sync.js).
     collab: (S, o) => syncCollabPort(S, { name: me.name, ...o }),
     notice: signInNotice({ ...signIn, dev: null }, me.name),

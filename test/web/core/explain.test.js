@@ -132,7 +132,7 @@ test("content tier (#88): `content` survives normalizeExplain and the sentences 
   const n = normalizeExplain({ ...WHY(), mine: { role: { id: "owner", name: "Owner" }, sources: [tier, { ...tier, content: "content.bogus" }] } });
   expect(n.mine.sources[0].content).toBe("content.personal");
   expect(n.mine.sources[1].content).toBeUndefined();                                                  // an unknown permission id is dropped
-  expect(sourceText(n.mine.sources[0], { type: "board", id: "b-1" })).toBe('through the permission "Open personal spaces" (Unit content admin + personal)');
+  expect(sourceText(n.mine.sources[0], { type: "board", id: "b-1" })).toBe('through the permission "Open personal spaces"');
   expect(sourceText(n.mine.sources[1], { type: "board", id: "b-1" })).toContain("through a role");   // without `content` the old wording
   expect(pillLine({ ...n.mine, sources: [n.mine.sources[0]] })).toBe("Owner via Open personal spaces");
   expect(whyLines(n, { type: "board", id: "b-1" }, "Editing", "board.edit")[0]).toContain('"Open personal spaces"');

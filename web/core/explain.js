@@ -58,7 +58,7 @@ export function sourceText(s, here = null) {
   if (s.kind === "general") return s.scope.type === "unit" ? "via everyone in the organization" : `via everyone in the organization${on}`;
   if (s.kind === "invite") return "through an invite";
   if (s.kind === "link") return "through a share link";
-  if (s.content) return `through the permission "${CONTENT_LABEL[s.content]}" (${s.roleName})`;   // the content tier names the permission that lets them in (#88)
+  if (s.content) return `through the permission "${CONTENT_LABEL[s.content]}"`;   // the content tier names the permission that lets them in (#88)
   if (s.kind === "unit") return s.role === "admin" ? "as an organization admin" : s.role === "member" ? "as an organization member" : `through a role${on || " here"}`;
   return at ? "added directly" : `added directly${on}`;
 }

@@ -10,7 +10,7 @@ import { askWait } from "./registry-port.js";
 
 export const LADDER_NAMES = { viewer: "Viewer", commenter: "Commenter", annotator: "Annotator", editor: "Editor", owner: "Owner" };
 /** The name a role is shown by: a ladder name, "Admin"/"Member" (Unit roles), or a custom role's own name. */
-export const BUILTIN_UNIT_NAMES = { admin: "Admin", member: "Member", "content-admin": "Unit content admin", "content-admin-personal": "Unit content admin (incl. personal spaces)" };
+export const BUILTIN_UNIT_NAMES = { admin: "Admin", member: "Member", "content-admin": "Unit content admin", "content-admin-personal": "Unit content admin + personal" };
 export const roleLabel = (role, roles) => LADDER_NAMES[role] ?? BUILTIN_UNIT_NAMES[role] ?? roles.get(role)?.name ?? String(role);
 
 /** The permission whose absence a disabled control explains, per scope type: New board in a Space, New space in a Group, editing a board. */

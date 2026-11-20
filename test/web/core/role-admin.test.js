@@ -201,3 +201,21 @@ test("after a save the built-ins and the member role keep the server's order; on
   model.select("r-ops"); model.setName("Aardvark"); await model.save();
   expect(order()).toEqual(["viewer", "owner", "admin", "member", "r-ops", "r-fac"]);          // Aardvark before Facilitator; the built-ins did not move
 });
+
+test("content tier (#88): rows carry a plain help line, are tickable only when the server lists them (a holder), never in the Unit member role, and the draft keeps them", async () => {
+  page.matrix = MATRIX({ tickable: ["board.create", "content.shared"] });
+  page.matrix.permissions.push({ id: "content.shared", group: "content-tier", scopes: ["unit"] }, { id: "content.personal", group: "content-tier", scopes: ["unit"] });
+  page.roles.find(r => r.id === "r-fac").permissions = ["content.shared"];
+  await ready();
+  const rows = () => Object.fromEntries(model.rows().map(r => [r.id, r]));
+  expect(rows()["content.shared"]).toMatchObject({ group: "content-tier", ticked: true, tickable: true, label: "Open every shared board" });
+  expect(rows()["content.shared"].help).toContain("Not personal spaces");
+  expect(rows()["content.shared"].cells.map(c => c.state)).toEqual(["yes", "na", "na", "na"]);       // Unit only
+  expect(rows()["content.personal"]).toMatchObject({ ticked: false, tickable: false });             // the caller does not hold it: the server did not list it
+  expect(model.toggle("content.personal")).toBe(false);
+  expect(model.toggle("content.shared")).toBe(true);
+  expect(model.state.draft.permissions).not.toContain("content.shared");
+  model.select("member");
+  expect(rows()["content.shared"].tickable).toBe(false);                                              // the member role carries no content tier
+  expect(model.toggle("content.shared")).toBe(false);
+});

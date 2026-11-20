@@ -180,7 +180,7 @@ describe("a Team's grants are the caller's to give: adding or removing a member 
     const many = new Proxy(r, { get: (t, k) => (k === "scopesOf" ? async (_s, o) => { seen = o.limit; return { scopes: Array.from({ length: o.limit }, (_, i) => ({ type: "board", id: `b${i}`, role: "viewer" })), next: "x" }; } : t[k]) });
     expect(await code(mk(many).setMember(max, infra.id, lee.user, true))).toBe("forbidden");
     expect(seen).toBe(LIMITS.teamScopes + 1);
-    expect(await code(mk(many).setMember(root, infra.id, lee.user, true))).toBe(null);          // a Unit admin is not subject to it
+    expect(await code(mk(many).setMember(root, infra.id, lee.user, true))).toBe("forbidden");   // adding is checked for personal-space grants; a Team too large to check is refused (fails closed)
   });
   test("granting a Team a role fails exactly as it would for a person", async () => {
     const { mine } = await setup();
@@ -261,10 +261,11 @@ describe("Teams: freshness (every change announces, revocations never dropped)",
     await s.settled();
     expect(ann).toEqual([{ scope: `space:${platform.id}`, revoke: true }]);
     ann.length = 0; fails = 99;
-    await s.setMember(root, infra.id, max.user, true);       // the write itself is not undone by an announcement failure
+    await r.setTeamMember(infra.id, max.user, true);
+    await s.setMember(root, infra.id, max.user, false);      // the write itself is not undone by an announcement failure
     await s.settled();
     expect(logs.some(m => /team announcement failed/.test(m))).toBe(true);
-    expect(await r.teamMembers(infra.id)).toEqual([max.user]);
+    expect(await r.teamMembers(infra.id)).toEqual([]);
   });
   test("deleting a Team with grants on more than 5000 scopes is too-large, and changes nothing", async () => {
     const many = new Proxy(r, { get: (t, k) => (k === "scopesOf" ? async () => ({ scopes: Array.from({ length: LIMITS.scopes + 1 }, (_, i) => ({ type: "board", id: `b${i}`, role: "viewer" })), next: null }) : t[k]) });

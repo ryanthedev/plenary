@@ -255,7 +255,7 @@ describe("trash, undo and restore", () => {
     expect(await code(t3.restoreBoard(max, b2.id))).toBe("would-escalate");
     expect((await r.board(b2.id)).trashedAt).not.toBe(null);
   });
-  test("restoring into the personal space may not raise the restorer's own role: an editor-level deleter is refused (would-escalate, and canRestore says so); a manage-only Unit admin is refused too, a content.shared holder (owner step) is not", async () => {
+  test("restoring into the personal space may not raise the restorer's own role: an editor-level deleter is refused (would-escalate, and canRestore says so); a manage-only Unit admin is refused too, and so is a content.shared holder (the tier never launders into a personal space)", async () => {
     const janitor = await r.createRole({ tenant: acme.id, name: "Janitor", boardRole: "editor", permissions: ["delete"] });
     await r.setScopedGrant({ scope: { type: "space", id: design.id }, subject: { type: "user", id: "google:max" }, role: janitor.id });
     await tr.trashBoard(ada, board.id, { from: design.id });
@@ -266,8 +266,8 @@ describe("trash, undo and restore", () => {
     expect((await tr.notice(root, board.id)).canRestore).toBe(false);                              // manage-only: no board role to carry into a personal space
     expect(await code(tr.restoreBoard(root, board.id))).toBe("would-escalate");
     await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: "google:root" }, role: "content-admin" });
-    expect((await tr.notice(root, board.id)).canRestore).toBe(true);
-    expect((await tr.restoreBoard(root, board.id)).movedTo.personal).toBe(true);
+    expect((await tr.notice(root, board.id)).canRestore).toBe(false);                              // the tier is nobody's grant: it does not carry an owner step into a personal space
+    expect(await code(tr.restoreBoard(root, board.id))).toBe("would-escalate");
   });
   test("a claimed (being purged) board cannot be restored: 409 purged", async () => {
     await tr.trashBoard(ada, board.id, { from: design.id });

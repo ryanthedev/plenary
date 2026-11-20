@@ -4,7 +4,7 @@ import { test, expect, beforeEach, describe } from "bun:test";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
 import { spaceService } from "../../server/auth/spaces.js";
-import { moveService, givenBy } from "../../server/auth/move.js";
+import { moveService } from "../../server/auth/move.js";
 import { mayMove } from "../../server/auth/resolver.js";
 import { announcingRegistry } from "../../server/main.js";
 import { httpRoutes } from "../../server/auth/http.js";
@@ -73,14 +73,16 @@ describe("who may move where", () => {
     expect(await code(mv.move(ada, board.id, { from: adasSpace.id, to: viewOnly.id }))).toBe("forbidden");
     expect((await r.board(board.id)).space).toBe(adasSpace.id);
   });
-  test("a Unit admin (manage-only or holding the tier) moves a board between Spaces where nobody gains a role; where someone would gain one above the mover's own role (the tier never counts) it is refused (#88 per-person gain rule)", async () => {
+  test("a manage-only Unit admin moves nothing (rule 2); a content.shared holder moves a board between Spaces where nobody gains a role; where someone would gain one above the mover's own role (the tier never counts) it is refused (#88 per-person gain rule)", async () => {
     const b = await r.createBoard({ tenant: acme.id, title: "Shared one", space: design.id, owner: "google:ada", memberRole: null });   // a personal-space board is the owner's (below)
-    expect((await mv.move(root, b.id, { from: design.id, to: platform.id })).moved).toBe(true);             // platform's people (owner ada) are a subset of Design's: nobody gains, so a manage-only admin moves it
+    expect(await code(mv.move(root, b.id, { from: design.id, to: platform.id }))).toBe("forbidden");           // a manage-only admin opens neither Space (rule 2): they move nothing, whoever would gain
+    expect((await r.board(b.id)).space).toBe(design.id);
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: "google:root" }, role: "content-admin" });   // content.shared: opens every shared Space and board
+    expect((await mv.move(root, b.id, { from: design.id, to: platform.id })).moved).toBe(true);             // platform's people (owner ada) are a subset of Design's: nobody gains
     expect((await r.board(b.id)).space).toBe(platform.id);
     const open = await r.createSpace({ tenant: acme.id, name: "Open", generalRole: "editor", owner: "google:ada" });
     expect(await code(mv.move(root, b.id, { from: platform.id, to: open.id }))).toBe("forbidden");           // everyone in the Unit would gain editor
     expect(await code(mv.move(root, b.id, { from: platform.id, to: design.id }))).toBe("forbidden");         // the Design team would gain editor
-    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: "google:root" }, role: "content-admin" });
     expect(await code(mv.move(root, b.id, { from: platform.id, to: open.id }))).toBe("forbidden");           // content.shared opens content; its owner step hands out nothing
     expect((await mv.options(root, b.id)).destinations.map(d => d.name)).not.toContain("Open");
   });
@@ -96,13 +98,11 @@ describe("who may move where", () => {
     const b = await r.createBoard({ tenant: acme.id, title: "B", space: platform.id });
     await r.setScopedGrant({ scope: { type: "space", id: platform.id }, subject: { type: "user", id: "google:max" }, role: role.id });
     await r.setScopedGrant({ scope: { type: "space", id: design.id }, subject: { type: "user", id: "google:max" }, role: role.id });
-    expect(givenBy(await r.accessContext({ type: "space", id: design.id }))).toBe("owner");   // Design's owner (ada) and its Team (editor)
     expect(await code(mv.move(max, b.id, { from: platform.id, to: design.id }))).toBe("forbidden");   // max opens and creates there, but would hand Design's owner and Team more than his viewer step
     expect((await mv.options(max, b.id)).destinations.map(d => d.id)).not.toContain(design.id);
     const quiet = await r.createSpace({ tenant: acme.id, name: "Quiet", generalRole: "viewer" });
     await r.setScopedGrant({ scope: { type: "space", id: quiet.id }, subject: { type: "user", id: "google:max" }, role: role.id });
     expect((await mv.move(max, b.id, { from: platform.id, to: quiet.id })).moved).toBe(true);              // viewer for others: within what max holds
-    expect(givenBy(await r.accessContext({ type: "space", id: design.id }))).toBe("owner");   // the mover's own grant counts too (Design's owner is ada herself): no skipping self
   });
   test("HIGH-1: a mover below owner cannot become owner by moving a board into a Space they own, or into their personal space", async () => {
     const role = await r.createRole({ tenant: acme.id, name: "Mover", boardRole: "viewer", permissions: ["move", "board.create"] });

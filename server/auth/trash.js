@@ -6,8 +6,9 @@
 
 import { AdminError } from "../admin/boards.js";
 import { TRASH, HOME, TEAMS } from "./registry-port.js";
-import { withinLadder } from "./permissions.js";
-import { givenBy } from "./move.js";
+import { gainContext } from "./move.js";
+import { ownLadder } from "./resolver.js";
+import { rank } from "./util.js";
 
 /** What one read shows at most, and how much of the Unit's Trash a read looks at. */
 export const LIMITS = Object.freeze({ items: 50, scanPages: 5, page: 100 });
@@ -68,9 +69,10 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
     if (d.row.trashedWith != null || !d.row.space || (await registry.space(d.row.space))?.trashedAt == null) return null;
     // Only a lookup: nothing is written until the restore will proceed (`go` creates a missing personal space after the escalation check passed). 
     const space = await registry.personalSpace(d.unit.id, identity.user);
-    const ctx = space && await registry.accessContext({ type: "space", id: space.id }, { users: [identity.user] });
-    // A personal space that does not exist yet will be created with its owner (the restorer) as its owner, so the board role it gives the restorer is "owner".
-    return { space, ok: withinLadder(d.access.trashed?.ladder ?? d.access.ladder, space ? (ctx ? givenBy(ctx) : "owner") : "owner") };
+    // Rule 4, the per-person gain rule (move.js `gainContext`), against the board role the restorer holds WITHOUT the content tier (the tier never launders into a personal space they would own). A personal space that does not
+    // exist yet will be created with its restorer as its owner: owner, a gain for anyone whose own step is lower.
+    const own = ownLadder(d.access);
+    return { space, ok: space ? !!(await gainContext(registry, identity, d.row.id, space.id, own, now())) : rank(own) >= rank("owner") };
   }
 
   const asAdminError = e => {

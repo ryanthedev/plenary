@@ -166,8 +166,9 @@ describe("routes: Home tree, search, trash, move, offboarding by tier", () => {
     for (const who of ["low", "chiefS"]) expect((await api(who, `/boards/${diary.id}/move`, "POST", { from: adaSp.id, to: dst.id })).status).toBe(403);
     expect((await r.board(diary.id)).space).toBe(adaSp.id);
     expect((await api("chiefP", `/boards/${diary.id}/move`, "POST", { from: adaSp.id, to: dst.id })).status).toBe(200);
-    // between Spaces with the same people nobody gains a role, so even a manage-only admin may move a shared board (and back)
-    expect((await api("low", `/boards/${roadmap.id}/move`, "POST", { from: designSp.id, to: dst.id })).status).toBe(200);
+    // a manage-only admin opens no Space, so they move nothing (rule 2); a content.shared holder moves a shared board between Spaces with the same people (and back)
+    expect((await api("low", `/boards/${roadmap.id}/move`, "POST", { from: designSp.id, to: dst.id })).status).toBe(403);
+    expect((await api("chiefS", `/boards/${roadmap.id}/move`, "POST", { from: designSp.id, to: dst.id })).status).toBe(200);
     expect((await api("chiefS", `/boards/${roadmap.id}/move`, "POST", { from: dst.id, to: designSp.id })).status).toBe(200);
   });
   test("offboarding: handing over a personal space needs content.personal; content.shared alone is manage-only for it", async () => {
@@ -398,12 +399,14 @@ describe("move: the per-person gain rule (the tier never hands out a role) and t
     expect(out.status).toBe(200);
     expect(out.json.undo).toBe(null);                                                           // no longer a board keeper may move: no Undo offered
   });
-  test("a manage-only admin moves a board between Spaces whose people are the same (nobody gains), and is offered exactly those; Undo is offered", async () => {
+  test("a content.shared holder moves a board between Spaces whose people are the same (nobody gains) and is offered exactly those, with Undo; a manage-only admin moves nothing and is offered nothing", async () => {
     const same = await r.createSpace({ tenant: acme.id, name: "Same people", generalRole: null, owner: "dev:ada" });
     await r.createSpace({ tenant: acme.id, name: "Open", generalRole: "editor", owner: "dev:ada" });
-    const o = await api("low", `/boards/${roadmap.id}/move`);
-    expect(o.json.destinations.map(d => d.name)).not.toContain("Open");                           // an admin who cannot open a Space is not offered it (rule 2, unchanged); the move route itself applies the gain rule
-    const out = await api("low", `/boards/${roadmap.id}/move`, "POST", { from: designSp.id, to: same.id });
+    expect((await api("low", `/boards/${roadmap.id}/move`)).json.destinations).toEqual([]);
+    expect((await api("low", `/boards/${roadmap.id}/move`, "POST", { from: designSp.id, to: same.id })).status).toBe(403);
+    const o = await api("chiefS", `/boards/${roadmap.id}/move`);
+    expect(o.json.destinations.map(d => d.name)).toEqual(["Same people"]);                          // never the Open Space (everyone would gain editor)
+    const out = await api("chiefS", `/boards/${roadmap.id}/move`, "POST", { from: designSp.id, to: same.id });
     expect(out.status).toBe(200);
     expect(out.json.undo?.space.id).toBe(designSp.id);
   });
@@ -421,5 +424,44 @@ describe("move: the per-person gain rule (the tier never hands out a role) and t
     }
     expect((await grant("chiefS", "editor")).status).toBe(200);                                  // a Unit admin with the tier is exempt
     expect((await link("chiefS", "editor")).status).toBe(201);
+  });
+});
+
+describe("restore does not launder the tier; move routes enforce rule 2 and leak no name; a pure content.personal holder cannot move out", () => {
+  test("H1: a content.shared holder with a local {viewer, delete} Space role restores a board into their own personal space only if they would not gain a role: refused with and without the tier, so no owner step to share from", async () => {
+    const janitor = await r.createRole({ tenant: acme.id, name: "Janitor", boardRole: "viewer", permissions: ["delete"] });
+    await r.setScopedGrant({ scope: { type: "space", id: designSp.id }, subject: { type: "user", id: "dev:cy" }, role: janitor.id });
+    expect((await api("ada", `/boards/${roadmap.id}/trash`, "POST", { from: designSp.id })).status).toBe(200);
+    expect((await api("ada", `/spaces/${designSp.id}/trash`, "POST", {})).status).toBe(200);
+    for (const withTier of [false, true]) {
+      if (withTier) await hold("cy", "content-admin");
+      const res = await api("cy", `/boards/${roadmap.id}/restore`, "POST", {});
+      expect([withTier, res.status, res.json?.error]).toEqual([withTier, 409, "would-escalate"]);
+    }
+    expect((await r.board(roadmap.id)).trashedAt).not.toBe(null);
+    expect((await api("cy", `/access/board/${roadmap.id}/grants/user/dev:bo`, "PUT", { role: "editor" })).status).toBe(403);
+  });
+  test("H2: a move of a shared board into a Space the caller cannot open is the bare 403 on every move route, and the options leak no title", async () => {
+    const secret = await r.createSpace({ tenant: acme.id, name: "Hidden vault", generalRole: null, owner: "dev:ada" });
+    const body = res => JSON.stringify(res.json ?? "");
+    for (const res of [await api("low", `/boards/${roadmap.id}/move`, "POST", { from: designSp.id, to: secret.id }), await api("low", `/boards/${roadmap.id}/move/preview?to=${secret.id}`)]) {
+      expect(res.status).toBe(403);
+      expect(body(res)).toBe('{"error":"forbidden"}');
+    }
+    const o = await api("low", `/boards/${roadmap.id}/move`);
+    expect(o.status).toBe(200);
+    expect(o.json.board).toEqual({ id: roadmap.id });
+    for (const leak of ["Roadmap", "Hidden vault", "Design"]) expect(body(o)).not.toContain(leak);
+    const fine = await api("chiefS", `/boards/${roadmap.id}/move`);
+    expect(fine.json.board.title).toBe("Roadmap");                                               // the title goes to someone who opens the board
+    expect((await api("chiefS", `/boards/${roadmap.id}/move/preview?to=${secret.id}`)).status).toBe(200);
+  });
+  test("M1: a content.personal holder with no board.create at the destination (the tier gives move and delete only) is refused and offered nothing; an admin who also holds it moves out", async () => {
+    const pure = await r.createRole({ tenant: acme.id, name: "Pure", boardRole: "viewer", permissions: ["content.personal"] });
+    await hold("keeper", pure.id);
+    const quiet = await r.createSpace({ tenant: acme.id, name: "Quiet", generalRole: null, owner: "dev:ada" });
+    expect((await api("keeper", `/boards/${diary.id}/move`)).json.destinations).toEqual([]);
+    expect((await api("keeper", `/boards/${diary.id}/move`, "POST", { from: adaSp.id, to: quiet.id })).status).toBe(403);
+    expect((await api("chiefP", `/boards/${diary.id}/move`, "POST", { from: adaSp.id, to: quiet.id })).status).toBe(200);
   });
 });

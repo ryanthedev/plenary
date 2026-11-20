@@ -7,9 +7,9 @@
 
 import { AdminError } from "../admin/boards.js";
 import { resolveAccess, movedContext, mayMove, ownLadder } from "./resolver.js";
-import { roleDef, UNIT_ROLES } from "./permissions.js";
+import { UNIT_ROLES } from "./permissions.js";
 import { LADDER_NAMES } from "./explain.js";
-import { capTo, higher, rank, ROLES, INVITE_ROLES } from "./util.js";
+import { higher, rank, ROLES } from "./util.js";
 import { HOME, TEAMS } from "./registry-port.js";
 
 /** What one read shows at most: entries per list, people and Teams looked at, destinations offered. */
@@ -22,29 +22,9 @@ const plainName = id => String(id).replace(/^[a-z]+:/, "");
 const roleView = r => (r ? { id: r, name: LADDER_NAMES[r] ?? r } : null);
 const byName = (a, b) => (a.subject.name.toLowerCase() < b.subject.name.toLowerCase() ? -1 : a.subject.name.toLowerCase() > b.subject.name.toLowerCase() ? 1 : (a.subject.id ?? "") < (b.subject.id ?? "") ? -1 : 1);
 const opens = a => a?.ladder != null;
+/** The board as a caller may name it: its title only when they open it (names are access, #51); a manager who does not learns nothing but the id. */
+const boardView = (row, access) => (opens(access) ? { id: row.id, title: row.title } : { id: row.id });
 const GHOST = "\0ghost";
-
-/**
- * The highest board role the destination gives to ANYONE, the mover included: its Space's and Group's scoped grants and general access (rule 4, "no escalation").
- * The mover's own grants count too: a mover whose board role is below it must not become its owner by moving the board into a Space they own, or into their personal
- * space. Bounded by the mover's own board role before the move, their own role after it can never be higher. Reads every grant, hidden containers included: the answer is a
- * role, never a name.
- * @param {import("./registry-port.js").AccessContext} ctx the destination Space's context
- */
-export function givenBy(ctx) {
-  const roles = new Map((ctx.roles ?? []).map(r => [r.id, r]));
-  let top = null;
-  for (const type of ["space", "group"]) {
-    const row = ctx[type];
-    if (!row) continue;
-    for (const g of ctx.scoped?.[type] ?? []) {
-      if (UNIT_ROLES.includes(g.role)) continue;
-      top = higher(top, roleDef(g.role, type, roles)?.ladder ?? null);
-    }
-    top = higher(top, capTo(row.generalRole, INVITE_ROLES));
-  }
-  return top;
-}
 
 /** Every user the destination's Space and Group and the Unit name in a grant (whose Team memberships a move check must read), and the mover. */
 const namedUsers = (identity, ctxs) => [...new Set([identity.user, ...ctxs.flatMap(c => ["space", "group", "unit"].flatMap(t => (c.scoped?.[t] ?? []).filter(g => g.subject.type === "user" && !UNIT_ROLES.includes(g.role)).map(g => g.subject.id)))])];
@@ -79,6 +59,18 @@ export function raisesAbove(ctx, tctx, mover, moverBefore, own, t) {
 }
 
 /**
+ * Rule 4 for ONE destination, read fresh (used by a move and by Trash's restore-into-the-personal-space): the destination Space's context when the move raises nobody above `own`, else null (also null when a context is gone).
+ * @param {import("./registry-port.js").Registry} registry @param {import("./idp-port.js").Identity} identity @param {string} boardId @param {string} spaceId @param {string|null} own the mover's board role without the tier @param {number} t
+ */
+export async function gainContext(registry, identity, boardId, spaceId, own, t) {
+  const first = await registry.accessContext({ type: "space", id: spaceId }, { users: [identity.user] });
+  if (!first) return null;
+  const users = namedUsers(identity, [first]).slice(0, LIMITS.people + 1);
+  const [ctx, tctx] = await Promise.all([registry.accessContext({ type: "board", id: boardId }, { users }), registry.accessContext({ type: "space", id: spaceId }, { users })]);
+  return ctx?.board && tctx && !raisesAbove(ctx, tctx, identity, own, own, t) ? tctx : null;
+}
+
+/**
  * @param {{ registry: import("./registry-port.js").Registry, tenancy: ReturnType<typeof import("./tenancy.js").tenancy>,
  *   spaces: Pick<ReturnType<typeof import("./spaces.js").spaceService>, "createTarget"|"boardPicker">, now?: () => number }} deps
  */
@@ -97,12 +89,9 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
   /** Rules 2 to 4 for one destination: its row, the caller's access and its context; else `forbidden`. Rule 4 is `raisesAbove` (per-person gain), read fresh with every named person's Teams. */
   async function target(identity, m, to) {
     const t = await spaces.createTarget(identity, m.unit, to);
-    if (!t) throw refused();
-    const first = await registry.accessContext({ type: "space", id: t.row.id }, { users: [identity.user] });
-    if (!first) throw refused();
-    const users = namedUsers(identity, [first]).slice(0, LIMITS.people + 1);
-    const [ctx, tctx] = await Promise.all([registry.accessContext({ type: "board", id: m.row.id }, { users }), registry.accessContext({ type: "space", id: t.row.id }, { users })]);
-    if (!ctx?.board || !tctx || raisesAbove(ctx, tctx, identity, ownLadder(m.access), ownLadder(m.access), now())) throw refused();
+    if (!t || !opens(t.access)) throw refused();                  // rule 2: the destination is one the caller opens (a manage-only admin who opens none moves nothing, and learns no name)
+    const tctx = await gainContext(registry, identity, m.row.id, t.row.id, ownLadder(m.access), now());
+    if (!tctx) throw refused();
     return { ...t, ctx: tctx };
   }
 
@@ -140,7 +129,7 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
       const [ctxs, bctx] = cand.length ? await Promise.all([registry.accessContexts(refs, { users }), registry.accessContext({ type: "board", id: m.row.id }, { users })]) : [new Map(), null];
       const t = now(), own = ownLadder(m.access);
       const ok = cand.filter(s => { const c = ctxs.get(key(s)); return c && bctx?.board && !raisesAbove(bctx, c, identity, own, own, t); });
-      return { board: { id: m.row.id, title: m.row.title }, from: from ?? { hidden: true }, destinations: ok.slice(0, LIMITS.destinations), more: picked.more || ok.length > LIMITS.destinations };
+      return { board: boardView(m.row, m.access), from: from ?? { hidden: true }, destinations: ok.slice(0, LIMITS.destinations), more: picked.more || ok.length > LIMITS.destinations };
     },
 
     /**
@@ -212,7 +201,7 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
       const [inv, lnk] = manage ? await Promise.all([registry.invites(m.row.id), registry.links(m.row.id)]) : [null, null];
       const from = await openSpace(identity, m.unit, m.row.space) ?? { hidden: true };
       return {
-        board: { id: m.row.id, title: m.row.title }, from, to: { id: dst.row.id, name: dst.row.name, personal: dst.row.kind === "personal" },
+        board: boardView(m.row, m.access), from, to: { id: dst.row.id, name: dst.row.name, personal: dst.row.kind === "personal" },
         gains, keeps, loses, invites: inv ? inv.filter(live).length : null, links: lnk ? lnk.filter(live).length : null, hidden, more,
       };
     },
@@ -232,7 +221,7 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
       let out;
       try { out = await registry.moveBoard({ board: m.row.id, from, to: dst.row.id, idem }); }
       catch (e) { if (e?.code === "moved") throw new AdminError("moved", "the board has been moved since"); throw e; }
-      return { board: { id: out.board.id, title: out.board.title, space: { id: dst.row.id, name: dst.row.name } }, moved: out.moved, undo: out.moved ? await undoNow(identity, out.board.id, from) : null };
+      return { board: { ...boardView(out.board, m.access), space: { id: dst.row.id, name: dst.row.name } }, moved: out.moved, undo: out.moved ? await undoNow(identity, out.board.id, from) : null };
     },
 
     /**
@@ -247,7 +236,8 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
       if (!dst) throw refused();
       if (row.space !== to) throw new AdminError("moved", "the board has been moved since");
       const moved = String(ref).endsWith(":moved");
-      return { board: { id: row.id, title: row.title, space: { id: dst.id, name: dst.name } }, moved, undo: moved ? await undoNow(identity, row.id, from) : null };
+      const seen = await tenancy.effective(identity, row.id, { uniform: true });
+      return { board: { ...boardView(row, seen), space: { id: dst.id, name: dst.name } }, moved, undo: moved ? await undoNow(identity, row.id, from) : null };
     },
   };
 }

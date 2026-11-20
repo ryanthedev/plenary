@@ -154,6 +154,13 @@ describe("a personal-space board is its owner's (TECH-DEBT 67)", () => {
     const shared = await r.createBoard({ tenant: acme.id, title: "S", space: design.id, owner: "google:ada", memberRole: null });
     expect((await mv.move(root, shared.id, { from: design.id, to: dst.id })).moved).toBe(true);
   });
+  test("with row 66 (a Unit-wide grant gives no board content on a personal space) a Unit-wide custom role carrying move and an editor step still cannot move the board", async () => {
+    const role = await r.createRole({ tenant: acme.id, name: "Mover", boardRole: "editor", permissions: ["move"] });
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: max.user }, role: role.id });
+    const a = await ten.effective(max, board.id);
+    expect([a.ladder, a.hiddenPersonal, mayMove(a)]).toEqual([null, true, false]);
+    expect(await code(mv.move(max, board.id, { from: adasSpace.id, to: design.id }))).toBe("forbidden");
+  });
   test("the owner moves their own personal-space board out", async () => {
     expect((await mv.move(ada, board.id, { from: adasSpace.id, to: design.id })).moved).toBe(true);
     expect(mayMove(await ten.effective(ada, board.id))).toBe(true);

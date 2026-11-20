@@ -121,10 +121,23 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
    * to do each of those as a direct grant (`members.manage` at the scope and the role grantable by them there, the same `touchable` rule), or `team.manage`
    * would be a back door to roles the caller cannot give. A Unit admin passes. Bounded: at most LIMITS.teamScopes scopes are read and checked; a Team that
    * holds more, or any scope the caller falls short on, is the ordinary refusal for a non-admin.
+   * ADDING a member is the one change that widens access: a Unit admin's pass does not reach a personal space or a board in one (they are its owner's, PROTOCOL.md § Organization), so for those scopes the admin needs
+   * `members.manage` from the resolver like anyone (a manage-only admin has none there). Removing never widens, and offboarding relies on it: an admin always may. A Team too large to check is refused for adding.
    */
-  async function mayChangeTeam(identity, unit, team) {
-    if (isUnitAdmin(unit, identity)) return true;
+  async function mayChangeTeam(identity, unit, team, { adding = false } = {}) {
+    const admin = isUnitAdmin(unit, identity);
+    if (admin && !adding) return true;
     const p = await registry.scopesOf({ type: "team", id: team }, { limit: LIMITS.teamScopes + 1 });
+    if (admin) {
+      if (p.scopes.length > LIMITS.teamScopes) return false;
+      for (const sc of p.scopes) {
+        const space = sc.type === "space" ? await registry.space(sc.id) : sc.type === "board" ? await registry.space((await registry.board(sc.id))?.space) : null;
+        if (space?.kind !== "personal") continue;
+        const access = await tenancy.effective(identity, sc.type === "board" ? sc.id : { type: sc.type, id: sc.id }, { uniform: true });
+        if (!may(access, "members.manage")) return false;
+      }
+      return true;
+    }
     if (p.scopes.length > LIMITS.teamScopes) return false;
     if (!p.scopes.length) return true;
     const roles = new Map((await registry.roles(unit.id)).map(r => [r.id, r]));
@@ -285,7 +298,7 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
       const u = userIdOf(user);
       if (!u) throw bad("bad user");
       const { unit, team } = await managedTeam(identity, id);
-      if (!(await mayChangeTeam(identity, unit, team.id))) throw refused();
+      if (!(await mayChangeTeam(identity, unit, team.id, { adding: member === true }))) throw refused();
       if (member && !(await isKnownPerson(unit, u))) throw new AdminError("unknown-person", "that person is not a member of this Unit");
       try { await registry.setTeamMember(team.id, u, member); }
       catch (err) {

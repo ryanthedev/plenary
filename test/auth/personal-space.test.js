@@ -75,9 +75,39 @@ test("a content-access admin (board content on) still moves, grants, shares and 
   expect(await content("root", `/boards/${diary.id}/grants/dev:bo`, "PUT", { role: "viewer" })).toBe(204);
   expect(await content("root", `/boards/${diary.id}/links`, "POST", { role: "viewer", expiresAt: null })).toBe(201);
   expect(await content("root", `/boards/${diary.id}`, "PATCH", { title: "ok" })).toBe(200);
-  const shared = await r.createBoard({ tenant: acme.id, title: "Shared", space: rootSp.id, owner: root.user, memberRole: null });
+  const shared = await r.createBoard({ tenant: acme.id, title: "Shared", space: rootSp.id, owner: ada.user, memberRole: null });
   const other = await r.createSpace({ tenant: acme.id, name: "Other", generalRole: null, owner: ada.user });
-  await r.setGrant(shared.id, ada.user, "viewer");
+  await r.setScopedGrant({ scope: { type: "space", id: other.id }, subject: { type: "user", id: root.user }, role: "owner" });
   expect(await plain("root", `/boards/${shared.id}/grants/dev:bo`, "PUT", { role: "viewer" })).toBe(204);
-  expect(await plain("root", `/boards/${shared.id}/move`, "POST", { from: rootSp.id, to: other.id })).toBeLessThan(500);
+  expect(await plain("root", `/boards/${shared.id}/links`, "POST", { role: "viewer", expiresAt: null })).toBe(201);
+  expect(await plain("root", `/boards/${shared.id}`, "PATCH", { title: "ren" })).toBe(200);
+  expect(await plain("root", `/boards/${shared.id}/move`, "POST", { from: rootSp.id, to: other.id })).toBe(200);
+  expect((await r.board(shared.id)).space).toBe(other.id);
+});
+
+describe("Teams (the personal-space rule reaches the Team path)", () => {
+  let team;
+  beforeEach(async () => {
+    team = await r.createTeam({ tenant: acme.id, name: "T" });
+    await r.setScopedGrant({ scope: { type: "board", id: diary.id }, subject: { type: "team", id: team.id }, role: "editor" });
+  });
+  const members = async () => (await r.teamMembers?.(team.id, {}))?.users ?? null;
+  test("a manage-only admin may not add anyone (himself included) to a Team that holds a grant on a personal board: 403, nothing changes", async () => {
+    expect(await plain("root", `/teams/${team.id}/members/dev:root`, "PUT")).toBe(403);
+    expect(await plain("root", `/teams/${team.id}/members/dev:bo`, "PUT")).toBe(403);
+    const a = await ten.effective(root, diary.id);
+    expect(a.ladder).toBe(null);
+    expect((await r.teamsAmong(acme.id, [team.id]))[0].size).toBe(0);
+  });
+  test("a Team with only shared-Space grants: the admin adds; the admin removes from T; the owner adds to T", async () => {
+    const t2 = await r.createTeam({ tenant: acme.id, name: "T2" });
+    await r.setScopedGrant({ scope: { type: "space", id: rootSp.id }, subject: { type: "team", id: t2.id }, role: "editor" });
+    expect(await plain("root", `/teams/${t2.id}/members/dev:bo`, "PUT")).toBe(204);
+    const tm = await r.createRole({ tenant: acme.id, name: "Team keeper", boardRole: null, permissions: ["team.manage"] });
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: ada.user }, role: tm.id });
+    expect(await plain("ada", `/teams/${team.id}/members/dev:bo`, "PUT")).toBe(204);     // team.manage, and members.manage on her own board
+    expect((await r.teamsAmong(acme.id, [team.id]))[0].size).toBe(1);
+    expect(await plain("root", `/teams/${team.id}/members/dev:bo`, "DELETE")).toBe(204);   // removing never widens: open to admins
+    expect((await r.teamsAmong(acme.id, [team.id]))[0].size).toBe(0);
+  });
 });

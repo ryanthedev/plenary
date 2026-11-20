@@ -1855,7 +1855,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
 
     // ---- Leaver offboarding (PROTOCOL.md § Leaver offboarding, #55) ----
     describe("leaver offboarding: ownedAlone, reassignOwner, removeMember", () => {
-      const SAM = "google:sam", ADA = "google:ada", BOB = "google:bob";
+      const SAM = "google:sam", ADA = "google:ada", BOB = "google:bob", HAND = { to: ADA, name: "x" };
       const setup = async () => {
         const t = await r.createTenant({ domain: "acme.com", admins: ["google:root"] });
         for (const u of [SAM, ADA, BOB, "google:root"]) await r.touchMember(t.id, { user: u, name: u.slice(7), email: u.slice(7) + "@acme.com" });
@@ -1922,24 +1922,58 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect(await r.scopedGrant({ type: "space", id: sp.id }, { type: "team", id: team.id })).toBe("owner");
         expect(await r.scopedGrant({ type: "space", id: sp.id }, { type: "user", id: ADA })).toBe("owner");
       });
-      test("a personal space becomes an archived, shared Space owned by the recipient; its boards, grants, invites and links are untouched", async () => {
+      test("a personal space is handed over only WITH the removal: reassignOwner refuses it (personal), removeMember with a handover makes it an archived shared Space owned by the recipient, its boards, grants, invites and links untouched", async () => {
         const t = await setup();
         const mine = await r.ensurePersonalSpace(t.id, SAM);
         const b = await mkBoard(r, { tenant: t.id, title: "Private", space: mine.id, owner: SAM });
         await r.setGrant(b.id, "google:guest", "editor");
         const inv = await r.createInvite({ board: b.id, email: "k@x.io", role: "viewer", by: SAM });
         const link = await r.createLink({ board: b.id, role: "viewer", by: SAM });
-        expect(await r.reassignOwner({ scope: { type: "space", id: mine.id }, from: SAM, to: ADA, name: "Sam's space (archived)" })).toEqual({ done: true });
+        await expect(r.reassignOwner({ scope: { type: "space", id: mine.id }, from: SAM, to: ADA, name: "x" })).rejects.toMatchObject({ code: "personal" });
+        expect((await r.space(mine.id)).kind).toBe("personal");
+        await expect(r.removeMember({ tenant: t.id, user: SAM, by: ADA })).rejects.toMatchObject({ code: "still-owns" });
+        await expect(r.removeMember({ tenant: t.id, user: SAM, by: ADA, handover: { to: SAM, name: "x" } })).rejects.toMatchObject({ code: "bad-recipient" });
+        expect((await r.space(mine.id)).kind).toBe("personal");                                 // a refusal rolled the handover back
+        expect(await r.removeMember({ tenant: t.id, user: SAM, by: ADA, handover: { to: ADA, name: "Sam's space (archived)" } })).toMatchObject({ removed: true, handedOver: true });
         const sp = await r.space(mine.id);
         expect(sp).toMatchObject({ kind: "shared", owner: null, name: "Sam's space (archived)", generalRole: null });
         expect(sp.archivedAt).toBe(T0);
         expect(await r.personalSpace(t.id, SAM)).toBe(null);
         expect((await r.board(b.id)).space).toBe(mine.id);
         expect(await r.grant(b.id, "google:guest")).toBe("editor");
-        expect((await r.invite(inv.id)).revoked).toBe(false);
+        expect((await r.invite(inv.id)).revoked).toBe(false);                                   // made BY the leaver: stays
         expect((await r.link(link.id)).revoked).toBe(false);
-        expect(await keys(t)).toEqual([]);
         expect(await r.scopedGrant({ type: "space", id: mine.id }, { type: "user", id: ADA })).toBe("owner");
+      });
+      test("removal revokes invites addressed to the leaver's email on this Unit's boards (any case), not other people's, not another Unit's, not ones they created", async () => {
+        const t = await setup();
+        const other = await r.createTenant({ domain: "other.com" });
+        const sp = await r.createSpace({ tenant: t.id, name: "S", owner: ADA });
+        const b = await mkBoard(r, { tenant: t.id, title: "B", space: sp.id, owner: ADA });
+        const ob = await mkBoard(r, { tenant: other.id, title: "O", owner: "google:x" });
+        const mine = await r.createInvite({ board: b.id, email: "Sam@Acme.com", role: "viewer", by: ADA });
+        const bobs = await r.createInvite({ board: b.id, email: "bob@acme.com", role: "viewer", by: ADA });
+        const made = await r.createInvite({ board: b.id, email: "lee@x.io", role: "viewer", by: SAM });
+        const foreign = await r.createInvite({ board: ob.id, email: "sam@acme.com", role: "viewer", by: "google:x" });
+        await mkPersonalDone();
+        expect((await r.removeMember({ tenant: t.id, user: SAM, by: ADA, handover: HAND })).invites).toBe(1);
+        expect((await r.invite(mine.id)).revoked).toBe(true);
+        for (const i of [bobs, made, foreign]) expect((await r.invite(i.id)).revoked).toBe(false);
+      });
+      test("a person the Unit removed cannot be given a grant or Team seat afterwards (removed), and a grant racing the removal never leaves a row naming them", async () => {
+        const t = await setup();
+        const sp = await r.createSpace({ tenant: t.id, name: "S", owner: ADA });
+        const team = await r.createTeam({ tenant: t.id, name: "T" });
+        const rs = await Promise.allSettled([r.removeMember({ tenant: t.id, user: SAM, by: ADA, handover: HAND }),
+          r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "user", id: SAM }, role: "owner" }), r.setTeamMember(team.id, SAM, true)]);
+        expect(rs[0].status).toBe("fulfilled");
+        const removed = (await r.memberState(t.id, SAM)).removed;
+        expect(removed).toBe(true);
+        expect(await r.scopedGrant({ type: "space", id: sp.id }, { type: "user", id: SAM })).toBe(null);
+        expect(await r.teamMembers(team.id)).toEqual([]);
+        await expect(r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "user", id: SAM }, role: "editor" })).rejects.toMatchObject({ code: "removed" });
+        await expect(r.setTeamMember(team.id, SAM, true)).rejects.toMatchObject({ code: "removed" });
+        await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "user", id: SAM }, role: null });   // clearing is always fine
       });
       test("reassignOwner refuses a recipient who is the leaver, not in the directory or removed (bad-recipient), changing nothing", async () => {
         const t = await setup();
@@ -1947,24 +1981,24 @@ export function registryContract(name, makeRegistry, opts = {}) {
         const sp2 = await r.createSpace({ tenant: t.id, name: "S2", owner: BOB });
         for (const to of [SAM, "google:nobody"]) await expect(r.reassignOwner({ scope: { type: "space", id: sp.id }, from: SAM, to })).rejects.toMatchObject({ code: "bad-recipient" });
         await r.reassignOwner({ scope: { type: "space", id: sp2.id }, from: BOB, to: ADA });
-        await r.removeMember({ tenant: t.id, user: BOB, by: ADA });
+        await r.removeMember({ tenant: t.id, user: BOB, by: ADA, handover: HAND });
         await expect(r.reassignOwner({ scope: { type: "space", id: sp.id }, from: SAM, to: BOB })).rejects.toMatchObject({ code: "bad-recipient" });
         expect(await r.scopedGrant({ type: "space", id: sp.id }, { type: "user", id: SAM })).toBe("owner");
       });
       test("removeMember refuses while the user solely owns something (still-owns) and changes nothing; an admin is refused (is-admin)", async () => {
         const t = await setup();
         const sp = await r.createSpace({ tenant: t.id, name: "S", owner: SAM });
-        await expect(r.removeMember({ tenant: t.id, user: SAM, by: ADA })).rejects.toMatchObject({ code: "still-owns" });
+        await expect(r.removeMember({ tenant: t.id, user: SAM, by: ADA, handover: HAND })).rejects.toMatchObject({ code: "still-owns" });
         expect((await r.memberState(t.id, SAM)).removed).toBe(false);
         expect(await r.scopedGrant({ type: "space", id: sp.id }, { type: "user", id: SAM })).toBe("owner");
-        await expect(r.removeMember({ tenant: t.id, user: "google:root", by: ADA })).rejects.toMatchObject({ code: "is-admin" });
-        await expect(r.removeMember({ tenant: t.id, user: "google:nobody", by: ADA })).rejects.toThrow();
+        await expect(r.removeMember({ tenant: t.id, user: "google:root", by: ADA, handover: HAND })).rejects.toMatchObject({ code: "is-admin" });
+        await expect(r.removeMember({ tenant: t.id, user: "google:nobody", by: ADA, handover: HAND })).rejects.toThrow();
       });
       test("an admin named by an email: entry is refused too (is-admin), whatever the case of the address; nothing changes", async () => {
         const t = await setup();
         await r.touchMember(t.id, { user: "google:eve", name: "Eve", email: "Eve@Acme.com" });
         await r.addTenantAdmin(t.id, "email:eve@acme.com");
-        await expect(r.removeMember({ tenant: t.id, user: "google:eve", by: ADA })).rejects.toMatchObject({ code: "is-admin" });
+        await expect(r.removeMember({ tenant: t.id, user: "google:eve", by: ADA, handover: HAND })).rejects.toMatchObject({ code: "is-admin" });
         expect((await r.memberState(t.id, "google:eve")).removed).toBe(false);
       });
       test("removeMember marks the member and deletes their board grants, scoped grants, Team memberships and access requests, only in this Unit; guests' rows and others' stay", async () => {
@@ -1980,11 +2014,10 @@ export function registryContract(name, makeRegistry, opts = {}) {
         await r.setTeamMember(team.id, SAM, true); await r.setTeamMember(team.id, ADA, true);
         await r.requestAccess({ tenant: t.id, scope: { type: "space", id: shared.id }, user: SAM, role: "editor" });
         const mine = await r.ensurePersonalSpace(t.id, SAM);
-        await r.reassignOwner({ scope: { type: "space", id: mine.id }, from: SAM, to: ADA, name: "x" });
         clock.t += 1000;
-        const out = await r.removeMember({ tenant: t.id, user: SAM, by: ADA });
+        const out = await r.removeMember({ tenant: t.id, user: SAM, by: ADA, handover: HAND });
         expect(out).toMatchObject({ removed: true, teams: 1 });
-        expect(out.grants).toBe(1); expect(out.scopedGrants).toBe(1);
+        expect(out.grants).toBe(1); expect(out.scopedGrants).toBe(2);   // the editor grant and his own owner grant on the personal space he handed over
         expect(await r.memberState(t.id, SAM)).toMatchObject({ removed: true, removedAt: T0 + 1000, removedBy: ADA });
         expect(await r.grant(b.id, SAM)).toBe(null);
         expect(await r.grant(b.id, ADA)).toBe("owner");
@@ -1992,12 +2025,12 @@ export function registryContract(name, makeRegistry, opts = {}) {
         expect(await r.scopedGrant({ type: "space", id: shared.id }, { type: "user", id: SAM })).toBe(null);
         expect(await r.teamMembers(team.id)).toEqual([ADA]);
         expect(await r.accessRequest({ type: "space", id: shared.id }, SAM)).toBe(null);
-        expect(await r.removeMember({ tenant: t.id, user: SAM, by: ADA })).toMatchObject({ removed: false });
+        expect(await r.removeMember({ tenant: t.id, user: SAM, by: ADA, handover: HAND })).toMatchObject({ removed: false });
       });
       test("a removed member is listed as removed, never found, kept by touchMember, and nothing is created for them", async () => {
         const t = await setup();
-        await r.reassignOwner({ scope: { type: "space", id: (await r.ensurePersonalSpace(t.id, SAM)).id }, from: SAM, to: ADA, name: "x" });
-        await r.removeMember({ tenant: t.id, user: SAM, by: ADA });
+        await r.ensurePersonalSpace(t.id, SAM);
+        await r.removeMember({ tenant: t.id, user: SAM, by: ADA, handover: HAND });
         expect((await r.membersAmong(t.id, [SAM]))[0]).toMatchObject({ user: SAM, removed: true });
         expect((await r.findMembers(t.id, { q: "sam" })).map(m => m.user)).toEqual([]);
         await r.touchMember(t.id, { user: SAM, name: "Sam 2", email: "sam@acme.com" });
@@ -2010,8 +2043,8 @@ export function registryContract(name, makeRegistry, opts = {}) {
       test("accessContext and accessContexts name the removed among the requested users, and only those", async () => {
         const t = await setup();
         const sp = await r.createSpace({ tenant: t.id, name: "S" });
-        await r.reassignOwner({ scope: { type: "space", id: (await r.ensurePersonalSpace(t.id, SAM)).id }, from: SAM, to: ADA, name: "x" });
-        await r.removeMember({ tenant: t.id, user: SAM, by: ADA });
+        await r.ensurePersonalSpace(t.id, SAM);
+        await r.removeMember({ tenant: t.id, user: SAM, by: ADA, handover: HAND });
         expect((await r.accessContext({ type: "space", id: sp.id }, { users: [SAM, ADA] })).removed).toEqual([SAM]);
         expect((await r.accessContext({ type: "space", id: sp.id }, { users: [ADA] })).removed).toEqual([]);
         expect((await r.accessContext({ type: "space", id: sp.id })).removed).toEqual([]);
@@ -2021,17 +2054,17 @@ export function registryContract(name, makeRegistry, opts = {}) {
         const t = await setup();
         const sp = await r.createSpace({ tenant: t.id, name: "S", owner: SAM });
         const k1 = { user: ADA, key: "leave-key-0001", fp: "a".repeat(64) }, k2 = { user: ADA, key: "leave-key-0002", fp: "b".repeat(64) };
-        await expect(r.removeMember({ tenant: t.id, user: SAM, by: ADA, idem: k2 })).rejects.toMatchObject({ code: "still-owns" });
+        await expect(r.removeMember({ tenant: t.id, user: SAM, by: ADA, handover: HAND, idem: k2 })).rejects.toMatchObject({ code: "still-owns" });
         expect(await r.idemGet(k2)).toEqual({ state: "none" });
         await r.reassignOwner({ scope: { type: "space", id: sp.id }, from: SAM, to: ADA, idem: k1 });
         expect(await r.idemGet(k1)).toEqual({ state: "done", ref: `${sp.id}:reassigned` });
         await expect(r.reassignOwner({ scope: { type: "space", id: sp.id }, from: SAM, to: ADA, idem: k1 })).rejects.toMatchObject({ code: "idem-replay", ref: `${sp.id}:reassigned` });
         await expect(r.reassignOwner({ scope: { type: "space", id: sp.id }, from: SAM, to: BOB, idem: { ...k1, fp: "c".repeat(64) } })).rejects.toMatchObject({ code: "idem-mismatch" });
         await mkPersonalDone(t);
-        await r.removeMember({ tenant: t.id, user: SAM, by: ADA, idem: k2 });
+        await r.removeMember({ tenant: t.id, user: SAM, by: ADA, handover: HAND, idem: k2 });
         expect(await r.idemGet(k2)).toEqual({ state: "done", ref: `${SAM}:removed` });
       });
-      const mkPersonalDone = async t => { const p = await r.personalSpace(t.id, SAM); if (p) await r.reassignOwner({ scope: { type: "space", id: p.id }, from: SAM, to: ADA, name: "x" }); };
+      const mkPersonalDone = async () => {};
       test("concurrent reassigns of one item: exactly one wins (done true), the other is a no-op; the container always has an owner", async () => {
         const t = await setup();
         const sp = await r.createSpace({ tenant: t.id, name: "S", owner: SAM });
@@ -2044,7 +2077,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
       test("removal racing a create for the leaver: either the create is refused as removed or the removal as still-owns, never an ownerless Space", async () => {
         const t = await setup();
         await mkPersonalDone(t);
-        const results = await Promise.allSettled([r.removeMember({ tenant: t.id, user: SAM, by: ADA }), r.createSpace({ tenant: t.id, name: "Late", owner: SAM })]);
+        const results = await Promise.allSettled([r.removeMember({ tenant: t.id, user: SAM, by: ADA, handover: HAND }), r.createSpace({ tenant: t.id, name: "Late", owner: SAM })]);
         const removed = (await r.memberState(t.id, SAM)).removed, late = (await r.spaces(t.id)).find(s => s.name === "Late");
         if (removed) expect(late).toBeUndefined(); else expect(results[0].reason?.code).toBe("still-owns");
         if (late) expect(removed).toBe(false);

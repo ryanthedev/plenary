@@ -304,8 +304,9 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
   /** Rejects (nothing written) when the Unit removed `user`. The owners lock first, so a removal in flight is either committed (refused here) or waits for this create. */
   const noRemoved = async (tx, tenant, user) => {
     if (user == null) return;
-    await lockOwners(tx, tenant);
-    if ((await one(tx, `SELECT removed_at FROM ${MB} WHERE tenant = $1 AND member = $2`, [tenant, String(user)]))?.removed_at != null) throw new RegistryError("removed", "registry: the member was removed from the Unit");
+    // FOR SHARE on the member's own row (not the tenant-wide owners lock: creating a Space must not serialise a Unit): `removeMember` holds the row FOR UPDATE, so this create either
+    // waits and then sees the removal, or is committed before the removal reads its items (the removal then refuses `still-owns`).
+    if ((await one(tx, `SELECT removed_at FROM ${MB} WHERE tenant = $1 AND member = $2 FOR SHARE`, [tenant, String(user)]))?.removed_at != null) throw new RegistryError("removed", "registry: the member was removed from the Unit");
   };
   /**
    * What `user` solely owns in a Unit (PROTOCOL.md § Leaver offboarding): their personal space, and every Group or Space they own (their own grant, or a Team's they are in) with no other person owner and no Team owner with a member besides them.
@@ -836,7 +837,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       await write(async tx => {
         const tm = await one(tx, `SELECT tenant FROM ${TE} WHERE id = $1`, [team]);
         if (!tm) throw new Error("registry: no such team");
-        if (member) { await tx.unsafe(`INSERT INTO ${TU} (team, member) VALUES ($1, $2) ON CONFLICT (team, member) DO NOTHING`, [team, u]); return; }
+        if (member) { await lockOwners(tx, tm.tenant); await noRemoved(tx, tm.tenant, u); await tx.unsafe(`INSERT INTO ${TU} (team, member) VALUES ($1, $2) ON CONFLICT (team, member) DO NOTHING`, [team, u]); return; }
         // Removing the last member of a Team that is the only counted owner of a Group or Space would leave it ownerless.
         // Lock order, here and in setScopedGrant, is: the tenant's owners lock, then container, then the Team's member rows
         // (never the Team row). The tenant lock (rare admin writes, so serialising them per tenant is cheap) is what makes
@@ -964,6 +965,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         if (isCustomRoleId(r) && !(await one(tx, `SELECT 1 AS x FROM ${RO} WHERE tenant = $1 AND id = $2 FOR KEY SHARE`, [tenant, r]))) throw new RegistryError("no-role", "no such custom role in this Unit");
         if (sub.type === "team" && (await one(tx, `SELECT tenant FROM ${TE} WHERE id = $1`, [sub.id]))?.tenant !== tenant) throw new Error("registry: no such team");
         if (type === "board" && sub.type === "user") throw new Error("registry: a user's grant on a board is setGrant");
+        if (sub.type === "user" && r != null) { await lockOwners(tx, tenant); await noRemoved(tx, tenant, sub.id); }   // a grant naming a removed person is refused, under the same lock the removal holds
         if (type === "group" || type === "space") {
           // The tenant's owners lock first (see setTeamMember), then, like setGrant, the container's row lock; the reads run after both.
           await lockOwners(tx, tenant);
@@ -1370,18 +1372,19 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       ready();
       const sc = orgDefaults.renamable(scope, ["space", "group"]);
       if (!key(from) || !key(to) || !key(sc.id)) throw new Error("registry: no such member");
-      const n = name == null ? null : orgDefaults.name(name), k = idemStart(idem), at = now();
+      const k = idemStart(idem), at = now();
       return write(async tx => {
         const tenant = await tenantOfScope(tx, sc.type, sc.id);
         if (!tenant) throw new Error(`registry: no such ${sc.type}`);
         await lockOwners(tx, tenant);
         const row = await one(tx, `SELECT * FROM ${sc.type === "space" ? SP : GR} WHERE id = $1 FOR UPDATE`, [sc.id]);
+        if (!row) throw new Error(`registry: no such ${sc.type}`);   // purged between the tenant lookup and the lock: a clean refusal
+        if (sc.type === "space" && row.kind === "personal") throw new RegistryError("personal", "registry: a personal space is handed over only by removeMember");
         const dir = await one(tx, `SELECT removed_at FROM ${MB} WHERE tenant = $1 AND member = $2`, [tenant, to]);
         if (from === to || !dir || dir.removed_at != null) throw new RegistryError("bad-recipient", "registry: the recipient is not a live member of the Unit");
-        const personal = sc.type === "space" && row.kind === "personal" && row.owner_user === from;
         // Share-lock the Team member rows the count reads, so a member leaving a Team owner at this moment is committed (seen) or waits for us.
         await tx.unsafe(`SELECT 1 FROM ${TU} WHERE team IN (SELECT subject FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 AND subject_type = 'team' AND role = 'owner') ORDER BY team, member FOR SHARE`, [sc.type, sc.id]);
-        const done = personal || !!(await one(tx, `SELECT 1 AS x FROM (SELECT $1::text AS t, $2::text AS i) c WHERE EXISTS (SELECT 1 FROM ${SG} g WHERE g.scope_type = c.t AND g.scope_id = c.i AND g.role = 'owner'
+        const done = !!(await one(tx, `SELECT 1 AS x FROM (SELECT $1::text AS t, $2::text AS i) c WHERE EXISTS (SELECT 1 FROM ${SG} g WHERE g.scope_type = c.t AND g.scope_id = c.i AND g.role = 'owner'
           AND ((g.subject_type = 'user' AND g.subject = $3) OR (g.subject_type = 'team' AND EXISTS (SELECT 1 FROM ${TU} m WHERE m.team = g.subject AND m.member = $3))))
           AND NOT EXISTS (SELECT 1 FROM ${SG} o WHERE o.scope_type = c.t AND o.scope_id = c.i AND o.role = 'owner'
           AND ((o.subject_type = 'user' AND o.subject <> $3) OR (o.subject_type = 'team' AND EXISTS (SELECT 1 FROM ${TU} x WHERE x.team = o.subject AND x.member <> $3))))`, [sc.type, sc.id, from]));
@@ -1389,34 +1392,45 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         if (done) {
           await putSg(tx, sc.type, sc.id, "user", to, "owner");
           await putSg(tx, sc.type, sc.id, "user", from, null);
-          if (personal) await tx.unsafe(`UPDATE ${SP} SET kind = 'shared', owner_user = NULL, archived_at = $2, name = $3 WHERE id = $1`, [sc.id, at, n ?? row.name]);
         }
         return { done };
       });
     },
-    async removeMember({ tenant, user, by, idem }) {
+    async removeMember({ tenant, user, by, handover, idem }) {
       ready();
       if (!key(tenant)) throw new Error("registry: no such tenant");
       if (!key(user) || !key(by)) throw new Error("registry: no such member");
-      const k = idemStart(idem), at = now();
+      const k = idemStart(idem), at = now(), hname = handover?.name == null ? null : orgDefaults.name(handover.name);
       return write(async tx => {
         if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
         await lockOwners(tx, tenant);
         const cur = await one(tx, `SELECT removed_at, email FROM ${MB} WHERE tenant = $1 AND member = $2 FOR UPDATE`, [tenant, user]);
         if (!cur) throw new Error("registry: no such member");
-        if (cur.removed_at != null) { await idemPut(tx, k, user + ":noop", at); return { removed: false, grants: 0, scopedGrants: 0, teams: 0 }; }
+        if (cur.removed_at != null) { await idemPut(tx, k, user + ":noop", at); return { removed: false, grants: 0, scopedGrants: 0, teams: 0, invites: 0, handedOver: false }; }
         if (await one(tx, `SELECT 1 AS x FROM ${A} WHERE tenant = $1 AND (member = $2 OR ($3::text IS NOT NULL AND member = 'email:' || lower(trim($3::text))))`, [tenant, user, cur.email ?? null])) throw new RegistryError("is-admin", "registry: a Unit admin cannot be removed");
         // The Team member rows the count reads: share-locked, so a member joining or leaving a Team owner is committed (seen) or waits for us.
         await tx.unsafe(`SELECT 1 FROM ${TU} WHERE team IN (SELECT m.team FROM ${TU} m WHERE m.member = $1)
           AND team IN (SELECT subject FROM ${SG} WHERE subject_type = 'team' AND role = 'owner' AND scope_type IN ('group', 'space')) ORDER BY team, member FOR SHARE`, [user]);
+        // The personal space goes WITH the removal (never alone): `handover: { to, name }` makes it an archived Space owned by `to`, in this same transaction (a refusal below rolls it back).
+        const personal = await one(tx, `SELECT id, name FROM ${SP} WHERE tenant = $1 AND owner_user = $2 AND kind = 'personal' FOR UPDATE`, [tenant, user]);
+        let to = null;
+        if (personal && handover) {
+          to = String(handover.to);
+          const rd = await one(tx, `SELECT removed_at FROM ${MB} WHERE tenant = $1 AND member = $2 FOR SHARE`, [tenant, to]);
+          if (to === user || !rd || rd.removed_at != null) throw new RegistryError("bad-recipient", "registry: the recipient is not a live member of the Unit");
+          await putSg(tx, "space", personal.id, "user", to, "owner");
+          await tx.unsafe(`UPDATE ${SP} SET kind = 'shared', owner_user = NULL, archived_at = $2, name = $3 WHERE id = $1`, [personal.id, at, hname ?? personal.name]);
+        }
         if ((await ownedAloneRows(tx, tenant, user, null, 1)).length) throw new RegistryError("still-owns", "registry: the member still solely owns something");
         await idemPut(tx, k, user + ":removed", at);
+        // Invites addressed to the leaver go with their grants; invites and links they CREATED stay.
+        const invites = cur.email ? (await tx.unsafe(`UPDATE ${I} SET revoked = TRUE WHERE NOT revoked AND lower(trim(email)) = lower(trim($1)) AND board IN (SELECT id FROM ${BD} WHERE tenant = $2)`, [cur.email, tenant])).count : 0;
         const grants = (await tx.unsafe(`DELETE FROM ${G} WHERE member = $1 AND board IN (SELECT id FROM ${BD} WHERE tenant = $2)`, [user, tenant])).count;
         const scopedGrants = (await tx.unsafe(`DELETE FROM ${SG} g WHERE g.subject_type = 'user' AND g.subject = $1 AND g.scope_type <> 'board' AND ${ownGrant("$2")}`, [user, tenant])).count;
         const teams = (await tx.unsafe(`DELETE FROM ${TU} WHERE member = $1 AND team IN (SELECT id FROM ${TE} WHERE tenant = $2)`, [user, tenant])).count;
         await tx.unsafe(`DELETE FROM ${AR} WHERE tenant = $1 AND member = $2`, [tenant, user]);
         await tx.unsafe(`UPDATE ${MB} SET removed_at = $3, removed_by = $4 WHERE tenant = $1 AND member = $2`, [tenant, user, at, by]);
-        return { removed: true, grants, scopedGrants, teams };
+        return { removed: true, grants, scopedGrants, teams, invites, handedOver: !!to };
       });
     },
     async scopesOf(subject, { after = null, limit } = {}) {

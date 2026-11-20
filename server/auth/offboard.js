@@ -4,6 +4,8 @@
 // person (`removeMember`, which REFUSES while anything is left, so an owner-less Space or Group cannot exist and a half-done offboarding leaves the leaver active).
 // Every check is a PERMISSION read from the resolver's answer (`members.manage` at the Unit root; the owner role grantable at the item, #52's no-escalation rule), never a role name.
 // Board titles are never read here: a manage-only admin sees counts, not content.
+// A PERSONAL space is not an item to reassign: it goes with the removal (`remove` body `to`), in the same atomic step, and only for a caller who could OPEN it (a ladder role there: its owner, or
+// an admin where board-content access is on). A manage-only admin can offboard everyone whose personal space is empty of their say, but not read or hand over somebody's private boards.
 
 import { AdminError } from "../admin/boards.js";
 import { isUnitAdmin } from "./resolver.js";
@@ -25,11 +27,12 @@ const cursorOf = v => { if (v == null) return null; if (typeof v !== "string" ||
 /**
  * @param {{ registry: import("./registry-port.js").Registry, tenancy: ReturnType<typeof import("./tenancy.js").tenancy>,
  *   announce?: (unit: { id: string }, scope: { type: string, id: string }, o?: { revoke?: boolean }) => void,
- *   managerOf?: (unit: { id: string }, user: string) => Promise<string|null>, now?: () => number }} deps
+ *   managerOf?: (unit: { id: string }, user: string) => Promise<string|null>, forget?: (user: string) => void, now?: () => number }} deps
  *   managerOf: the seam for "their manager, if the directory knows them" (no manager field exists until SCIM / Entra sync, #36); the default knows nobody.
+ *   forget: drops this node's warm role entries of a removed person at once (roleCache.forgetUser); the other nodes get the Unit-wide revocation.
  *   announce: hands a change to the announcement scheduler (spaceService.announceChange).
  */
-export function offboardService({ registry, tenancy, announce = () => {}, managerOf = async () => null }) {
+export function offboardService({ registry, tenancy, announce = () => {}, managerOf = async () => null, forget = () => {} }) {
   /** The caller's Unit and their admin flag, if they hold `members.manage` at the Unit root; else `forbidden` (a guest, a removed member and a caller with no say are one answer). */
   async function gate(identity) {
     const unit = await tenancy.tenantOf(identity);
@@ -76,6 +79,7 @@ export function offboardService({ registry, tenancy, announce = () => {}, manage
     const leaver = await leaverOf(unit, userId);
     const [row, access] = await Promise.all([type === "space" ? registry.space(id) : registry.group(id), tenancy.effective(identity, { type, id })]);
     if (!row || row.tenant !== unit.id || !grantable(access, "owner", type, NO_ROLES, admin)) throw refused();
+    if (type === "space" && row.kind === "personal") throw bad("a personal space is handed over with the removal", "personal");
     const recipient = await registry.memberState(unit.id, to);
     if (!recipient || recipient.removed || to === leaver.user) throw bad("the recipient must be another live member of the Unit", "bad-recipient");
     return { unit, leaver, type, row, recipient: { id: recipient.user, name: recipient.name ?? plainName(recipient.user) } };
@@ -98,20 +102,21 @@ export function offboardService({ registry, tenancy, announce = () => {}, manage
       for (let k = 0; k < page.items.length; k++) {
         const { type, id } = page.items[k], row = rows[k];
         if (!row) continue;                                                     // purged between the two reads
-        const may = !!grantable(access.get(type + "\n" + id), "owner", type, NO_ROLES, admin);
-        const v = itemView(type, row, leaver);
+        const a = access.get(type + "\n" + id), v = itemView(type, row, leaver);
+        const may = !v.personal && !!grantable(a, "owner", type, NO_ROLES, admin), handover = v.personal && (a?.ladder ?? null) != null && !!grantable(a, "owner", type, NO_ROLES, admin);
         if (type === "space") {                                                 // a COUNT of boards, never a title: a manage-only admin may not read what is in a personal space
           const b = await registry.boardsIn({ type: "space", id }, { limit: LIMITS.boards + 1, withTrashed: true });
           v.boards = Math.min(b.ids.length, LIMITS.boards); v.boardsCapped = b.ids.length > LIMITS.boards;
         }
-        items.push({ ...v, can: { reassign: may, ...(may ? {} : { why: "Needs a Unit admin, or an owner of this" }) } });
+        items.push({ ...v, can: v.personal ? { reassign: false, handover, why: handover ? "Goes with the removal" : "Private to its owner: needs board-content access" }
+          : { reassign: may, ...(may ? {} : { why: "Needs a Unit admin, or an owner of this" }) } });
       }
       const isAdmin = unit.admins.includes(leaver.user) || (!!leaver.email && unit.admins.includes("email:" + normEmail(leaver.email)));   // by id or by `email:` entry, as removeMember refuses
       const defaults = await defaultRecipient(unit, leaver, identity);
       return {
         member: { id: leaver.user, name: leaver.name, email: leaver.email ?? null, removed: leaver.removed },
         defaults, items, next: page.next, blocked: isAdmin ? "admin" : null,
-        canRemove: !leaver.removed && !isAdmin && cursor == null && items.length === 0 && page.next == null,
+        canRemove: !leaver.removed && !isAdmin && cursor == null && page.next == null && items.every(i => i.personal && i.can.handover),
       };
     },
 
@@ -121,10 +126,14 @@ export function offboardService({ registry, tenancy, announce = () => {}, manage
      */
     async reassign(identity, userId, body, idem) {
       const p = await prepare(identity, userId, body);
-      const personal = p.type === "space" && p.row.kind === "personal" && p.row.owner === p.leaver.user;
       let out;
-      try { out = await registry.reassignOwner({ scope: { type: p.type, id: p.row.id }, from: p.leaver.user, to: p.recipient.id, ...(personal ? { name: `${p.leaver.name}'s space (archived)`.slice(0, 200) } : {}), idem }); }
-      catch (e) { if (e instanceof RegistryError && e.code === "bad-recipient") throw bad("the recipient must be another live member of the Unit", "bad-recipient"); throw e; }
+      try { out = await registry.reassignOwner({ scope: { type: p.type, id: p.row.id }, from: p.leaver.user, to: p.recipient.id, idem }); }
+      catch (e) {
+        if (e instanceof RegistryError && e.code === "bad-recipient") throw bad("the recipient must be another live member of the Unit", "bad-recipient");
+        if (e instanceof RegistryError && e.code === "personal") throw bad("a personal space is handed over with the removal", "personal");
+        if (/no such/.test(e?.message ?? "")) throw new AdminError("not-found", "not found");     // purged between the read and the write
+        throw e;
+      }
       if (out.done) announce(p.unit, { type: p.type, id: p.row.id }, { revoke: true });
       return this.view(p, out.done);
     },
@@ -140,21 +149,33 @@ export function offboardService({ registry, tenancy, announce = () => {}, manage
     },
 
     /**
-     * POST /members/:user/remove: the last step. Refused (nothing changes) while the leaver still solely owns anything.
+     * POST /members/:user/remove `{ to? }`: the last step. Refused (nothing changes) while the leaver still solely owns anything but a personal space; that goes with the removal to `to`
+     * (required when it exists), archived, and only a caller with a ladder role on it (content access) may hand it over.
      * @param {import("./registry-port.js").Idem} [idem]
      */
-    async remove(identity, userId, idem) {
-      const { unit } = await gate(identity);
+    async remove(identity, userId, body, idem) {
+      const { unit, admin } = await gate(identity);
       const leaver = await leaverOf(unit, userId);
       if (leaver.user === identity.user) throw bad("you cannot remove yourself");
+      const personal = await registry.personalSpace(unit.id, leaver.user);
+      let handover;
+      if (personal && !leaver.removed) {
+        const access = await tenancy.effective(identity, { type: "space", id: personal.id });
+        if ((access.ladder ?? null) == null || !grantable(access, "owner", "space", NO_ROLES, admin)) throw refused();
+        const to = userIdOf(body?.to), rec = to && await registry.memberState(unit.id, to);
+        if (!rec || rec.removed || to === leaver.user) throw bad("the new owner of their personal space must be another live member of the Unit", "bad-recipient");
+        handover = { to, name: `${leaver.name}'s space (archived)`.slice(0, 200) };
+      }
       let out;
-      try { out = await registry.removeMember({ tenant: unit.id, user: leaver.user, by: identity.user, idem }); }
+      try { out = await registry.removeMember({ tenant: unit.id, user: leaver.user, by: identity.user, ...(handover ? { handover } : {}), idem }); }
       catch (e) {
         if (e instanceof RegistryError && (e.code === "still-owns" || e.code === "is-admin")) throw new AdminError(e.code, e.message);
+        if (e instanceof RegistryError && e.code === "bad-recipient") throw bad("the new owner of their personal space must be another live member of the Unit", "bad-recipient");
+        if (/no such/.test(e?.message ?? "")) throw new AdminError("not-found", "not found");
         throw e;
       }
       // The leaver's sockets: everything of the Unit is re-checked as a revocation (never dropped); HTTP stopped at once (`tenantOf`).
-      if (out.removed) announce(unit, { type: "unit", id: unit.id }, { revoke: true });
+      if (out.removed) { forget(leaver.user); announce(unit, { type: "unit", id: unit.id }, { revoke: true }); }
       return out;
     },
     /** The replay of a keyed remove: the same checks, the counts are not stored (null). `ref` is `<user>:removed` or `<user>:noop`. */

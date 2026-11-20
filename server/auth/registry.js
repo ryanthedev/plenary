@@ -64,7 +64,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
   const countedOwners = (type, id) => [...(scoped.get(sk(type, id)) ?? [])]
     .filter(([k, role]) => role === "owner" && (k.startsWith("user\n") || (members.get(k.slice(5))?.size ?? 0) > 0)).map(([k]) => k);
   /** Rejects (nothing written) when `user` is a person the Unit has removed (PROTOCOL.md § Leaver offboarding). */
-  const noRemoved = (tenant, user) => { if (user != null && directory.get(tenant)?.get(String(user))?.removedAt != null) throw new RegistryError("removed", "registry: the member was removed from the Unit"); };
+  const noRemoved = (tenant, user, _grant) => { if (user != null && directory.get(tenant)?.get(String(user))?.removedAt != null) throw new RegistryError("removed", "registry: the member was removed from the Unit"); };
   /**
    * Does `user` solely own this Group or Space? They hold an owner grant (their own, or a Team's they are in), and no other counted owner would be left once they go: no other
    * person owner, and no Team owner with a member besides them (PROTOCOL.md § Leaver offboarding).
@@ -406,7 +406,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
     async setTeamMember(team, user, member) {
       need(teams.has(team), "team");
       const set = members.get(team), u = String(user);
-      if (member) { set.add(u); return; }
+      if (member) { noRemoved(teams.get(team).tenant, u, true); set.add(u); return; }
       // Removing the last member of a Team that is the only counted owner of a Group or Space would leave it ownerless.
       if (set.size === 1 && set.has(u)) for (const [k, g] of scoped) {
         const [type, ...id] = k.split("\n");
@@ -482,6 +482,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const { type, id } = orgDefaults.scope(scope), sub = orgDefaults.subject(subject), r = orgDefaults.grantRole(role);
       need(scopeTenant(type, id) != null, "scope");
       if (isCustomRoleId(r) && !roles.get(scopeTenant(type, id))?.has(r)) throw new RegistryError("no-role", "no such custom role in this Unit");
+      if (sub.type === "user" && r != null) noRemoved(scopeTenant(type, id), sub.id, true);
       if (sub.type === "team") need(teams.get(sub.id)?.tenant === scopeTenant(type, id), "team");
       if (type === "board" && sub.type === "user") throw new Error("registry: a user's grant on a board is setGrant");
       const g = scoped.get(sk(type, id));
@@ -711,27 +712,42 @@ export function memoryRegistry({ now = Date.now } = {}) {
       from = String(from); to = String(to);
       const dir = directory.get(row.tenant);
       if (from === to || !dir?.has(to) || dir.get(to).removedAt != null) throw new RegistryError("bad-recipient", "registry: the recipient is not a live member of the Unit");
+      if (sc.type === "space" && row.kind === "personal") throw new RegistryError("personal", "registry: a personal space is handed over only by removeMember");
       const k = idemEnter(key);
-      const personal = sc.type === "space" && row.kind === "personal" && row.owner === from;
-      const done = personal || soleOwner(sc.type, sc.id, from);
+      const done = soleOwner(sc.type, sc.id, from);
       if (done) {
         putScoped(sc.type, sc.id, "user", to, "owner");
         putScoped(sc.type, sc.id, "user", from, null);
-        if (personal) Object.assign(row, { kind: "shared", owner: null, archivedAt: now(), name: orgDefaults.name(name ?? row.name) });
       }
       idemPut(k, sc.id + (done ? ":reassigned" : ":noop"));
       return { done };
     },
-    async removeMember({ tenant, user, by, idem: key }) {
+    async removeMember({ tenant, user, by, handover, idem: key }) {
       need(tenants.has(tenant), "tenant");
       user = String(user);
       const row = directory.get(tenant)?.get(user);
       if (!row) throw new Error("registry: no such member");
       const k = idemEnter(key);
-      if (row.removedAt != null) { idemPut(k, user + ":noop"); return { removed: false, grants: 0, scopedGrants: 0, teams: 0 }; }
+      if (row.removedAt != null) { idemPut(k, user + ":noop"); return { removed: false, grants: 0, scopedGrants: 0, teams: 0, invites: 0, handedOver: false }; }
       const adm = tenants.get(tenant).admins;
       if (adm.includes(user) || (row.email && adm.includes("email:" + normEmail(row.email)))) throw new RegistryError("is-admin", "registry: a Unit admin cannot be removed");
-      if (aloneOf(tenant, user, null, 1).items.length) throw new RegistryError("still-owns", "registry: the member still solely owns something");
+      // The personal space goes WITH the removal (never alone): `handover: { to, name }` makes it an archived Space owned by `to`, in this same step.
+      const personal = [...spaces.values()].find(s => s.tenant === tenant && s.kind === "personal" && s.owner === user);
+      let to = null;
+      if (personal && handover) {
+        to = String(handover.to);
+        const rd = directory.get(tenant)?.get(to);
+        if (to === user || !rd || rd.removedAt != null) throw new RegistryError("bad-recipient", "registry: the recipient is not a live member of the Unit");
+      }
+      if (aloneOf(tenant, user, null, 5).items.some(i => !(to && i.id === personal.id))) throw new RegistryError("still-owns", "registry: the member still solely owns something");
+      if (to) {
+        putScoped("space", personal.id, "user", to, "owner");
+        Object.assign(personal, { kind: "shared", owner: null, archivedAt: now(), name: orgDefaults.name(handover.name ?? personal.name) });
+      }
+      // Invites addressed to the leaver's own email on this Unit's boards go with their grants (invites and links they CREATED stay).
+      let inv = 0;
+      const mail = row.email ? normEmail(row.email) : null;
+      if (mail) for (const i of invites.values()) if (!i.revoked && boards.get(i.board)?.tenant === tenant && normEmail(i.email) === mail) { i.revoked = true; inv++; }
       let g = 0, sg = 0, t = 0;
       for (const [b, m] of grants) if (boards.get(b)?.tenant === tenant && m.delete(user)) g++;
       for (const [sk0, m] of scoped) if (ownScope(sk0, tenant) && m.delete(sk("user", user))) sg++;
@@ -739,7 +755,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
       for (const [rk, v] of [...requests]) if (v.tenant === tenant && v.user === user) requests.delete(rk);
       Object.assign(row, { removedAt: now(), removedBy: String(by) });
       idemPut(k, user + ":removed");
-      return { removed: true, grants: g, scopedGrants: sg, teams: t };
+      return { removed: true, grants: g, scopedGrants: sg, teams: t, invites: inv, handedOver: !!to };
     },
 
     async scopesOf(subject, { after = null, limit } = {}) {

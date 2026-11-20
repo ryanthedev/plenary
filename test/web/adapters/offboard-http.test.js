@@ -26,12 +26,17 @@ test("reassign and remove: a key header, the body, the answers", async () => {
   expect(r.result).toEqual({ item: { type: "space", id: "s-1", name: "Sam's space (archived)", archived: true }, to: { id: "google:ada", name: "Ada" }, done: true });
   expect(calls[0][1].headers["idempotency-key"]).toBe("key-1");
   expect(JSON.parse(calls[0][1].body)).toEqual({ type: "space", id: "s-1", to: "google:ada" });
-  expect((await api(f).remove("google:sam", "key-2")).result).toEqual({ removed: true, grants: 2, scopedGrants: 1, teams: 0 });
+  expect((await api(f).remove("google:sam", "google:ada", "key-2")).result).toEqual({ removed: true, grants: 2, scopedGrants: 1, teams: 0 });
   expect(calls[1][0]).toBe("/members/google%3Asam/remove");
+  expect(JSON.parse(calls[1][1].body)).toEqual({ to: "google:ada" });                  // the new owner of their personal space goes with the removal
+  expect(calls[1][1].headers["idempotency-key"]).toBe("key-2");
+  await api(f).remove("google:sam", null, "key-3");
+  expect(JSON.parse(calls[2][1].body)).toEqual({});
+  expect(await api(f).remove("google:sam", "a\nb", "key-4")).toEqual({ error: "forbidden" });
 });
 test("statuses map to errors, with the server's code: 401 auth, 403 forbidden, 404 notfound, 400 bad-recipient, 409 still-owns, 5xx and junk unavailable, a throw network", async () => {
   for (const [status, body, want] of [[401, {}, { error: "auth" }], [403, {}, { error: "forbidden" }], [404, {}, { error: "notfound" }], [400, { error: "bad-recipient" }, { error: "invalid", code: "bad-recipient" }],
-    [409, { error: "still-owns" }, { error: "conflict", code: "still-owns" }], [409, { error: "is-admin" }, { error: "conflict", code: "is-admin" }], [422, {}, { error: "invalid" }], [503, {}, { error: "unavailable" }]])
+    [409, { error: "still-owns" }, { error: "conflict", code: "still-owns" }], [409, { error: "is-admin" }, { error: "conflict", code: "is-admin" }], [409, { error: "personal" }, { error: "conflict", code: "personal" }], [422, {}, { error: "invalid" }], [503, {}, { error: "unavailable" }]])
     expect(await api(answer(status, body)).remove("google:sam")).toEqual(want);
   expect(await api(answer(200, "not json")).list("google:sam")).toEqual({ error: "unavailable" });
   expect(await api(answer(200, { member: {} })).list("google:sam")).toEqual({ error: "unavailable" });

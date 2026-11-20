@@ -13,7 +13,7 @@ export function normalizeItem(i) {
   if (!i || typeof i !== "object" || !TYPES.includes(i.type) || !isId(i.id)) return null;
   return { type: i.type, id: i.id, name: str(i.name), personal: i.personal === true, archived: i.archived === true, trashed: i.trashed === true,
     ...(count(i.boards) !== null ? { boards: count(i.boards), boardsCapped: i.boardsCapped === true } : {}),
-    can: { reassign: i.can?.reassign === true, ...(typeof i.can?.why === "string" ? { why: str(i.can.why, 200) } : {}) } };
+    can: { reassign: i.can?.reassign === true, ...(i.can?.handover === true ? { handover: true } : {}), ...(typeof i.can?.why === "string" ? { why: str(i.can.why, 200) } : {}) } };
 }
 /** @returns {import("../../ports/offboard.js").Page|null} */
 export function normalizePage(b) {
@@ -30,7 +30,7 @@ export function httpOffboard({ fetch, token, base = "", timeoutMs = 10_000, time
   const set = timers ? timers.set : (fn, t) => setTimeout(fn, t);
   const clear = timers ? timers.clear : h => clearTimeout(h);
   const STATUS = { 400: "invalid", 401: "auth", 403: "forbidden", 404: "notfound", 422: "invalid" };
-  const CODES = ["bad-recipient", "still-owns", "is-admin"];
+  const CODES = ["bad-recipient", "still-owns", "is-admin", "personal"];
   /** One request: `{ body }` or `{ error, code? }`. Never throws. */
   async function ask(path, method = "GET", json, key = null) {
     const ctl = typeof AbortController === "function" ? new AbortController() : null;
@@ -70,9 +70,9 @@ export function httpOffboard({ fetch, token, base = "", timeoutMs = 10_000, time
       const item = normalizeItem({ ...r.body?.item, can: {} }), p = person(r.body?.to);
       return item && p && typeof r.body.done === "boolean" ? { result: { item: { type: item.type, id: item.id, name: item.name, archived: item.archived }, to: p, done: r.body.done } } : bad();
     },
-    async remove(user, key = null) {
-      if (!isUser(user)) return { error: "forbidden" };
-      const r = await ask(`/members/${q(user)}/remove`, "POST", {}, key);
+    async remove(user, to = null, key = null) {
+      if (!isUser(user) || (to !== null && !isUser(to))) return { error: "forbidden" };
+      const r = await ask(`/members/${q(user)}/remove`, "POST", to ? { to } : {}, key);
       if (r.error) return r;
       return typeof r.body?.removed === "boolean" ? { result: { removed: r.body.removed, grants: count(r.body.grants), scopedGrants: count(r.body.scopedGrants), teams: count(r.body.teams) } } : bad();
     },

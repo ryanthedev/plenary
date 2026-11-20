@@ -90,6 +90,7 @@ import { authPort } from "./auth/port.js";
 import { devAuth } from "./auth/dev.js";
 import { sqliteRegistry } from "./registry/sqlite.js";
 import { tenancy as makeTenancy, roleCache } from "./auth/tenancy.js";
+import { offboardService } from "./auth/offboard.js";
 import { sessions as makeSessions } from "./auth/session.js";
 import { googleOidc } from "./auth/oidc.js";
 import { httpRoutes, REQUEST_DEADLINE_MS } from "./auth/http.js";
@@ -382,7 +383,8 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   const adminBoardContent = ["1", "true"].includes(String(env.PLENARY_ADMIN_BOARD_CONTENT ?? "").trim().toLowerCase());
   const tenancy = makeTenancy({ registry, adminBoardContent });
   // Hellos read roles through a per-process cache; the gateway invalidates it on `grants` and its timed pass reads fresh (p5-load).
-  const auth = authPort({ sessions, dev, tenancy: roleCache({ registry, now: Date.now, adminBoardContent }) });
+  const roleCached = roleCache({ registry, now: Date.now, adminBoardContent });
+  const auth = authPort({ sessions, dev, tenancy: roleCached });
   // Google sign-in only when both halves of the OAuth client are there; otherwise /auth answers 503.
   const oidc = env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET
     ? googleOidc({ clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET, redirectUri, fetch: fetchFn, timeoutMs: OIDC_TIMEOUT_MS })
@@ -502,7 +504,9 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   // A general-access change on a Space or Group tells every board it reaches to re-check roles (PROTOCOL.md § Organization, Freshness).
   const spaces = spaceService({ registry, tenancy, home, announce: (tenant, board) => bus.publish(subjects.grants(tenant, board), { board }), log: log.child({ component: "spaces" }) });
   const access = accessService({ registry, tenancy, announce: spaces.announceChange, backlog: spaces.backlog, settled: spaces.settled, log: log.child({ component: "access" }) });
-  const http = httpRoutes({ registry, sessions, oidc, tenancy, home, spaces, access, now: Date.now, config, log: log.child({ component: "auth" }), ...(dev.enabled ? { dev } : {}) });
+  // A removed person's warm role entries on this node go at once (other nodes get the Unit-wide revocation announced by the service; #55 LOW-4).
+  const offboard = offboardService({ registry, tenancy, announce: spaces.announceChange, forget: user => roleCached.forgetUser(user) });
+  const http = httpRoutes({ registry, sessions, oidc, tenancy, home, spaces, access, offboard, now: Date.now, config, log: log.child({ component: "auth" }), ...(dev.enabled ? { dev } : {}) });
   const server = createServer({ auth, registry, store, bus, blobs, blobKey, ...(env.PUBLIC_URL ? { publicUrl: origin } : {}), ...(quotaRaw ? { quotaBytes: Number(quotaRaw) } : {}), blobUsageTtlMs: Number(reapRaw ?? 600_000), log, limits, http, deflate: zlibDeflate(), onWelcomed: recentRecorder({ registry, log: log.child({ component: "home" }) }), port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
     roles, node, host: { hostname: node, leaseTtlMs }, metrics, ...(prom ? { metricsEndpoint: { token: metricsToken, render: prom.render } } : {}) });
   // The purge of Trash: every node sweeps on a timer (the claim is a conditional write and every delete a no-op the second time, so two nodes are safe). The timer is the only wall-clock wait; tests drive `sweep()` on an injected clock.

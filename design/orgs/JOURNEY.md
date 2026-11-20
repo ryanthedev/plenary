@@ -215,10 +215,13 @@ were the only owner of**.
 2. **[admin-offboard]:** each item is assigned to **Sam's manager** if the directory knows them, otherwise to the
    admin doing the removal, and can be changed per item. Nothing goes silently to "the oldest admin", the way
    Miro does it.
-3. **[admin-offboard]:** Sam's personal space becomes the ordinary Space "Sam's space (archived)", owned by the
-   recipient. Its board URLs and guests' access stay.
-4. Sam's own grants and team memberships are removed. The invites and share links he made stay until they expire,
-   now vouched for by the new owner, so guests keep access (open question 5).
+3. **[admin-offboard]:** Sam's personal space is private to him: it is not a row to reassign, it **goes with the
+   removal** to the recipient the admin picks, as the ordinary Space "Sam's space (archived)". Only an admin who
+   could open it (board-content access, a permission) may hand it over; a manage-only admin sees a count of its
+   boards and "needs board-content access", and Remove stays locked for Sam. Board URLs and guests' access stay.
+4. Sam's own grants and team memberships are removed, and so are invites addressed to his own email. The invites
+   and share links he made stay until they expire, now vouched for by the new owner, so guests keep access
+   (open question 5).
 
 ### J8. Trash and restore
 Trash is free on every plan, with no paywall.

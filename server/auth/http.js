@@ -609,8 +609,8 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
     } }],
     ["/members/:user/remove", { POST: async (req, p) => {
       const who = await caller(req);
-      const b = await body(req, []);
-      return keyed(req, who, "POST /members/:user/remove", p, b, async idem => offboard.remove(who, p.user, idem), async ref => offboard.replayRemove(who, p.user, ref), 200);
+      const b = await body(req, ["to"]);
+      return keyed(req, who, "POST /members/:user/remove", p, b, async idem => offboard.remove(who, p.user, b, idem), async ref => offboard.replayRemove(who, p.user, ref), 200);
     } }],
     ["/trash", { GET: async req => json(200, await trash.list(await caller(req))) }],
     ["/boards/:board/share", { GET: async (req, p) => {
@@ -734,7 +734,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
         if (e.code === "moved") return err(409, "moved");
         if (e.code === "with-space" || e.code === "space-in-trash" || e.code === "purged" || e.code === "would-escalate") return err(409, e.code);
         if (e.code === "unknown-person" || e.code === "bad-role" || e.code === "bad-recipient") return err(400, e.code);
-        if (e.code === "still-owns" || e.code === "is-admin") return err(409, e.code);
+        if (e.code === "still-owns" || e.code === "is-admin" || e.code === "personal") return err(409, e.code);
         if (e.code === "rate-limited") { const s = e.data?.retryAfter ?? null; return err(429, "rate-limited", { retryAfter: s }, s == null ? undefined : { "retry-after": String(s) }); }
       }
       if (e?.code === "removed") return err(403, "forbidden");   // a create racing a removal (the Registry refused in its own step)

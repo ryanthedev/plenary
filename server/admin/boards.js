@@ -36,7 +36,12 @@ const bad = m => new AdminError("bad-request", m);
 /** Is the caller an admin of the tenant? The rule is the resolver's (server/auth/resolver.js, isUnitAdmin). */
 async function isTenantAdmin(registry, caller, tenantId) {
   if (!caller || typeof caller.user !== "string" || typeof tenantId !== "string") return false;
-  return isUnitAdmin(await registry.tenant(tenantId), caller);
+  return liveAdmin(registry, await registry.tenant(tenantId), caller);
+}
+/** `isUnitAdmin` for a person the Unit has NOT removed: a removed person is never an admin, whatever the admin list says (PROTOCOL.md § Leaver offboarding). Every admin check outside the resolver goes through this. */
+export async function liveAdmin(registry, unit, caller) {
+  if (!unit || !isUnitAdmin(unit, caller)) return false;
+  return !(await registry.memberState(unit.id, caller.user))?.removed;
 }
 
 /** The board, if the caller may manage it; else throws `forbidden` (unknown board included). */
@@ -59,7 +64,7 @@ export async function knownOnBoard(registry, board, user) {
   if (typeof user !== "string" || !user || user.length > 200 || /[\0\n]/.test(user) || user.startsWith("email:")) return false;
   if (await registry.grant(board.id, user)) return true;
   if ((await registry.membersAmong(board.tenant, [user])).some(m => !m.removed)) return true;   // a person the Unit removed gets no NEW grant (PROTOCOL.md § Leaver offboarding)
-  if ((await registry.tenant(board.tenant))?.admins?.includes(user)) return true;
+  if ((await registry.tenant(board.tenant))?.admins?.includes(user) && !(await registry.memberState(board.tenant, user))?.removed) return true;
   return (await registry.linkUses(board.id, user)).length > 0;
 }
 
@@ -72,7 +77,7 @@ async function sharer({ registry, tenancy }, caller, boardId) {
   const [b, access] = await Promise.all([registry.board(boardId), tenancy.effective(caller, boardId, { uniform: true })]);
   if (!b || !access.permissions.has("members.manage")) throw forbidden();
   const unit = await registry.tenant(b.tenant);
-  return { b, access, unit, admin: isUnitAdmin(unit, caller) };
+  return { b, access, unit, admin: await liveAdmin(registry, unit, caller) };
 }
 /** Nobody gives more board role than they hold (a Unit admin may): `forbidden` otherwise. */
 const mayGive = (s, role) => { if (!withinLadder(s.access.ladder, role, s.admin)) throw forbidden(); };

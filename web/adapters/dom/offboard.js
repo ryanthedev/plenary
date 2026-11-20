@@ -21,6 +21,10 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
   const S = model.state;
   const { status, main } = shell(root, hrefs);
   let dlg = null, reviewBtn = null, removeBtn = null, h1 = null, focusTo = null;
+  /** The control with this `data-fk` in the CURRENT page (a redraw replaces every node, so a held reference points at a detached one), else the heading. */
+  const keeper = k => (typeof main.querySelector === "function" ? main.querySelector(`[data-fk="${k}"]`) : main.find(e => e.getAttribute?.("data-fk") === k)) ?? h1;
+  /** An opener the dialog focuses when it closes: resolved THEN (after the redraws the apply made), never a node held from before. */
+  const openerOf = k => ({ focus: () => keeper(k)?.focus?.() });
 
   const searchBox = (label, run, results, pick, id) => {
     const input = h("input.field", { type: "search", id, maxlength: "100", autocomplete: "off", "aria-label": label });
@@ -30,13 +34,13 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
   };
 
   function row(i) {
-    const to = model.recipientOf(i), res = S.results.get(model.itemKey(i)), people = model.people();
-    const sel = h("select.field", { "aria-label": `New owner of ${i.name}`, "aria-disabled": i.can.reassign && !S.busy ? "false" : "true",
-      onchange: e => { const p = people.find(x => x.id === e.target.value); if (p && i.can.reassign && !S.busy) { focusTo = () => sel; model.choose(i, p); } else e.target.value = to.id; } },
+    const to = model.recipientOf(i), res = S.results.get(model.itemKey(i)), people = model.people(), may = i.can.reassign || i.can.handover === true, fk = "pick:" + model.itemKey(i).replace("\n", ":");
+    const sel = h("select.field", { "data-fk": fk, "aria-label": `New owner of ${i.name}`, "aria-disabled": may && !S.busy ? "false" : "true",
+      onchange: e => { const p = people.find(x => x.id === e.target.value); if (p && may && !S.busy) { focusTo = () => keeper(fk); model.choose(i, p); } else e.target.value = to.id; } },
       people.map(p => h("option", { value: p.id, selected: p.id === to.id }, p.id === S.defaults.recipient.id ? `${p.name} (${S.defaults.reason === "manager" ? "their manager" : "you"})` : p.name)));
     return h("tr", {}, h("th", { scope: "row" }, itemLabel(i), " ", h("span.badge", {}, i.type === "group" ? "Group" : i.personal ? "Personal space" : "Space"), i.trashed ? h("span.badge", {}, " In Trash") : null),
-      h("td", {}, i.can.reassign ? sel : h("span.muted", {}, i.can.why ?? "You can't hand this on.")),
-      h("td", {}, res ? h("span", { role: res.ok ? null : "alert" }, res.ok ? "Done. " : "Not done. ", res.text) : i.can.reassign ? "Not yet" : "Skipped"));
+      h("td", {}, may ? sel : h("span.muted", {}, i.can.why ?? "You can't hand this on.")),
+      h("td", {}, res ? h("span", { role: res.ok ? null : "alert" }, res.ok ? "Done. " : "Not done. ", res.text) : i.can.reassign ? "Not yet" : i.can.handover ? "Goes with the removal" : "Skipped"));
   }
 
   function draw() {
@@ -49,14 +53,14 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
     const crumbs = h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " /");
     const finder = searchBox("Find a person", q => model.search(q), S.found, p => model.open(p.id), "offboard-find");
     if (!S.member) return replace(main, crumbs, h("div.sp-head", {}, h1), h("p.sub-h", {}, "Reassign what they solely own, then remove them. Nothing moves until you confirm."), finder);
-    const m = S.member, d = S.defaults, n = S.items.length, can = model.actionable().length;
+    const m = S.member, d = S.defaults, n = S.items.length, can = model.actionable().length, qualifies = can > 0 || model.handedOver() !== null;
     const table = h("table.matrix", {}, h("caption", {}, `What ${m.name} solely owns`),
       h("thead", {}, h("tr", {}, h("th", { scope: "col" }, "Item"), h("th", { scope: "col" }, "New owner"), h("th", { scope: "col" }, "Status"))), h("tbody", {}, S.items.map(row)));
-    reviewBtn = act({ "data-fk": "review" }, "Review and reassign…", () => { dlg = null; focusTo = () => reviewBtn; if (model.openConfirm("items")) openConfirm(reviewBtn); }, () => S.busy || !can);
-    removeBtn = act({ "data-fk": "remove" }, `Remove ${m.name}…`, () => { focusTo = () => removeBtn; if (model.openConfirm("remove")) openConfirm(removeBtn); }, () => S.busy || !S.canRemove);
+    reviewBtn = act({ "data-fk": "review" }, "Review and reassign…", () => { dlg = null; if (model.openConfirm("items")) openConfirm(openerOf("review")); }, () => S.busy || !can);
+    removeBtn = act({ "data-fk": "remove" }, `Remove ${m.name}…`, () => { if (model.openConfirm("remove")) openConfirm(openerOf("remove")); }, () => S.busy || !S.canRemove);
     setOff(reviewBtn, S.busy || !can); setOff(removeBtn, S.busy || !S.canRemove);
     replace(main, crumbs, h("div.sp-head", {}, h1, h("span.badge", {}, m.removed ? "Removed" : "Member")),
-      h("p", {}, `${m.name}${m.email ? ` (${m.email})` : ""}. Each item goes to ${d.recipient.name} (${d.reason === "manager" ? "their manager" : "you, as no manager is known"}) unless you pick someone else in its row.`),
+      h("p", {}, `${m.name}${m.email ? ` (${m.email})` : ""}.`, qualifies ? ` Each item goes to ${d.recipient.name} (${d.reason === "manager" ? "their manager" : "you, as no manager is known"}) unless you pick someone else in its row.` : " You can't hand on any of their items."),
       m.removed ? h("p", {}, `${m.name} has been removed from the Unit.`) : null,
       S.blocked === "admin" ? h("p", { role: "status" }, `${m.name} is a Unit admin and can't be removed here.`) : null,
       n ? [h("h2", {}, "Items"), h("div.matrix-scroll", { role: "region", "aria-label": `What ${m.name} solely owns`, tabindex: "0" }, table), S.next ? h("button.btn", { type: "button", onclick: () => model.more() }, "Show more") : null,
@@ -68,8 +72,9 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
   /** The confirm step: a plain list of exactly what happens. */
   function openConfirm(opener) {
     const m = S.member, remove = S.confirm === "remove";
-    const lines = remove ? removeLines(m.name) : model.actionable().map(i => planLine(i, model.recipientOf(i)));
-    const skipped = remove ? [] : S.items.filter(i => !i.can.reassign);
+    const hand = model.handedOver();
+    const lines = remove ? [...removeLines(m.name), ...(hand ? [planLine(hand, model.recipientOf(hand))] : [])] : model.actionable().map(i => planLine(i, model.recipientOf(i)));
+    const skipped = remove ? [] : S.items.filter(i => !i.can.reassign && !i.personal);
     const progress = h("p", { role: "status", "aria-live": "polite" });
     const go = h("button.btn.primary", { type: "submit" }, remove ? `Remove ${m.name}` : "Reassign");
     const cancel = h("button.btn", { type: "button", onclick: () => d.close() }, "Cancel");

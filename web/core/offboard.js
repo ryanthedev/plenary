@@ -6,6 +6,7 @@ const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 const MSG = {
   forbidden: "You can't do that. Only a Unit admin, or an owner of the item, can hand it on.", notfound: "This person is not available.", invalid: "The server did not accept that.",
   "bad-recipient": "The new owner must be another member of the Unit who has not been removed.",
+  personal: "A personal space goes with the removal. It can't be reassigned on its own.",
   "still-owns": "This person still solely owns something. Reassign it first.", "is-admin": "A Unit admin can't be removed here.",
 };
 const MAYBE = " It may have worked. Trying again unchanged is safe.";
@@ -56,6 +57,8 @@ export function createOffboardModel({ api, newKey = null }) {
     recipientOf(i) { return S.choice.get(ik(i)) ?? S.defaults?.recipient ?? null; },
     /** The items the screen can act on now (the server says which). */
     actionable() { return S.items.filter(i => i.can.reassign); },
+    /** Their personal space, when the caller may hand it over: it goes WITH the removal (the server never reassigns it alone). */
+    handedOver() { return S.items.find(i => i.personal && i.can.handover) ?? null; },
     /** Look a person up for the leaver picker. */
     async search(term, into = "found") {
       S.searching = true; emit();
@@ -119,10 +122,11 @@ export function createOffboardModel({ api, newKey = null }) {
     async remove() {
       if (S.busy || S.confirm !== "remove") return false;
       S.busy = true; S.notice = null; S.progress = `Removing ${S.member.name}…`; emit();
-      const r = await api.remove(S.member.id, keyFor("remove"));
+      const p = self.handedOver(), to = p ? self.recipientOf(p) : null, k = "remove\n" + (to?.id ?? "");
+      const r = await api.remove(S.member.id, to?.id ?? null, keyFor(k));
       S.busy = false; S.progress = null;
       if (r.error) { fail(r); S.confirm = null; emit(); if (r.code === "still-owns") await self.loadFor(S.member.id); return false; }
-      keys.delete("remove"); S.confirm = null;
+      keys.delete(k); S.confirm = null;
       S.said = `${S.member.name} was removed from the Unit.`;
       emit();
       await self.loadFor(S.member.id);

@@ -141,8 +141,10 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
 
   /** Is `user` a person the Unit knows: in its directory, or one of its admins named by id (the operator vouches for them)? */
   async function isKnownPerson(unit, user) {
+    const row = (await registry.membersAmong(unit.id, [user]))[0];
+    if (row?.removed) return false;
     if (unit.admins?.includes(user) && !user.startsWith("email:")) return true;     // an `email:` entry is an admin not yet seen: not a person with an id
-    return (await registry.membersAmong(unit.id, [user])).some(m => !m.removed);   // a person the Unit removed is not offered (PROTOCOL.md § Leaver offboarding)
+    return !!row;   // a person the Unit removed is not offered (PROTOCOL.md § Leaver offboarding)
   }
 
   // ---- naming rows ----

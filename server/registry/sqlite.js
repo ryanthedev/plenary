@@ -253,6 +253,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
         AND ((g.subject_type = 'user' AND g.subject = ?3) OR (g.subject_type = 'team' AND EXISTS (SELECT 1 FROM reg_team_members m WHERE m.team = g.subject AND m.member = ?3))))
       AND NOT EXISTS (SELECT 1 FROM reg_scope_grants o WHERE o.scope_type = c.t AND o.scope_id = c.i AND o.role = 'owner'
         AND ((o.subject_type = 'user' AND o.subject <> ?3) OR (o.subject_type = 'team' AND EXISTS (SELECT 1 FROM reg_team_members x WHERE x.team = o.subject AND x.member <> ?3))))`),
+    revokeInvitesTo: db.query("UPDATE reg_invites SET revoked = 1 WHERE revoked = 0 AND lower(trim(email)) = lower(trim(?1)) AND board IN (SELECT id FROM reg_boards WHERE tenant = ?2)"),
     archiveSpace: db.query("UPDATE reg_spaces SET kind = 'shared', owner_user = NULL, archived_at = ?2, name = ?3 WHERE id = ?1"),
     isAdmin: db.query("SELECT 1 AS x FROM reg_tenant_admins WHERE tenant = ?1 AND (member = ?2 OR (?3 IS NOT NULL AND member = 'email:' || lower(trim(?3))))"),
     markRemoved: db.query("UPDATE reg_members SET removed_at = ?3, removed_by = ?4 WHERE tenant = ?1 AND member = ?2 AND removed_at IS NULL"),
@@ -663,6 +664,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   });
   const setMemberTx = db.transaction((team, user, member) => {
     needRow(q.team.get(team), "team");
+    if (member) noRemoved(q.team.get(team).tenant, user);
     if (!member && q.teamSize.get(team).c === 1 && q.teamHas.get(team, user)) {
       // Removing the last member of a Team that is the only counted owner of a Group or Space would leave it ownerless.
       for (const o of q.teamOwned.all(team)) if (q.sowners.all(o.scope_type, o.scope_id).length <= 1)
@@ -686,6 +688,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     needRow(tenant, "scope");
     if (isCustomRoleId(role) && !q.role.get(tenant, role)) throw new RegistryError("no-role", "no such custom role in this Unit");
     if (st === "team") needRow(q.team.get(sid)?.tenant === tenant, "team");
+    if (st === "user" && role != null) noRemoved(tenant, sid);
     if (type === "board" && st === "user") throw new Error("registry: a user's grant on a board is setGrant");
     const cur = q.sgrant.get(type, id, st, sid)?.role ?? null;
     if ((type === "group" || type === "space") && cur === "owner" && role !== "owner") {
@@ -699,28 +702,38 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   const reassignTx = db.transaction((sc, from, to, name, idem, at) => {
     const row = sc.type === "space" ? q.space.get(sc.id) : q.group.get(sc.id);
     needRow(row, sc.type);
+    if (sc.type === "space" && row.kind === "personal") throw new RegistryError("personal", "registry: a personal space is handed over only by removeMember");
     const dir = q.dirGet.get(row.tenant, to);
     if (from === to || !dir || dir.removed_at != null) throw new RegistryError("bad-recipient", "registry: the recipient is not a live member of the Unit");
     idemEnter(idem, at);
-    const personal = sc.type === "space" && row.kind === "personal" && row.owner_user === from;
-    const done = personal || !!q.soleOne.get(sc.type, sc.id, from);
+    const done = !!q.soleOne.get(sc.type, sc.id, from);
     if (done) {
       putSg(sc.type, sc.id, "user", to, "owner");
       putSg(sc.type, sc.id, "user", from, null);
-      if (personal) q.archiveSpace.run(sc.id, at, name ?? row.name);
     }
     idemPut(idem, sc.id + (done ? ":reassigned" : ":noop"), at);
     return { done };
   });
-  const removeTx = db.transaction((tenant, user, by, idem, at) => {
+  const removeTx = db.transaction((tenant, user, by, handover, idem, at) => {
     needRow(q.tenantExists.get(tenant), "tenant");
     const cur = q.dirGet.get(tenant, user);
     needRow(cur, "member");
     idemEnter(idem, at);
-    if (cur.removed_at != null) { idemPut(idem, user + ":noop", at); return { removed: false, grants: 0, scopedGrants: 0, teams: 0 }; }
+    if (cur.removed_at != null) { idemPut(idem, user + ":noop", at); return { removed: false, grants: 0, scopedGrants: 0, teams: 0, invites: 0, handedOver: false }; }
     if (q.isAdmin.get(tenant, user, cur.email ?? null)) throw new RegistryError("is-admin", "registry: a Unit admin cannot be removed");
-    if (q.ownedAlone.all(tenant, user, null, 1).length) throw new RegistryError("still-owns", "registry: the member still solely owns something");
-    const out = { removed: true, grants: q.delUserGrants.run(user, tenant).changes, scopedGrants: q.delUserScoped.run(user, tenant).changes, teams: q.delUserTeams.run(user, tenant).changes };
+    // The personal space goes WITH the removal (never alone): `handover: { to, name }` makes it an archived Space owned by `to`, in this same transaction.
+    const personal = q.personal.get(tenant, user);
+    let to = null;
+    if (personal && handover) {
+      to = String(handover.to);
+      const rd = q.dirGet.get(tenant, to);
+      if (to === user || !rd || rd.removed_at != null) throw new RegistryError("bad-recipient", "registry: the recipient is not a live member of the Unit");
+      putSg("space", personal.id, "user", to, "owner");
+      q.archiveSpace.run(personal.id, at, handover.name ?? personal.name);
+    }
+    if (q.ownedAlone.all(tenant, user, null, 1).length) throw new RegistryError("still-owns", "registry: the member still solely owns something");   // a throw rolls the handover back too
+    const invites = cur.email ? q.revokeInvitesTo.run(cur.email, tenant).changes : 0;   // invites addressed to the leaver go with their grants; ones they CREATED stay
+    const out = { removed: true, grants: q.delUserGrants.run(user, tenant).changes, scopedGrants: q.delUserScoped.run(user, tenant).changes, teams: q.delUserTeams.run(user, tenant).changes, invites, handedOver: !!to };
     q.delUserAsks.run(tenant, user);
     q.markRemoved.run(tenant, user, at, by);
     idemPut(idem, user + ":removed", at);
@@ -1226,11 +1239,11 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       if (!str(from) || !str(to)) throw new Error("registry: no such member");
       return reassignTx.immediate(sc, from, to, name == null ? null : orgDefaults.name(name), idemOf(idem), now());
     },
-    async removeMember({ tenant, user, by, idem }) {
+    async removeMember({ tenant, user, by, handover, idem }) {
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");
       if (!str(user) || !str(by)) throw new Error("registry: no such member");
-      return removeTx.immediate(tenant, user, by, idemOf(idem), now());
+      return removeTx.immediate(tenant, user, by, handover?.to == null ? null : { to: handover.to, name: handover.name == null ? null : orgDefaults.name(handover.name) }, idemOf(idem), now());
     },
     async scopesOf(subject, { after = null, limit } = {}) {
       ready();

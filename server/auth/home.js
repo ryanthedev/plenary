@@ -78,8 +78,9 @@ export function homeService({ registry, tenancy, now = Date.now }) {
   async function tree(identity, unit) {
     const ua = await tenancy.effective(identity, { type: "unit", id: unit.id });
     const all = ua.ladder != null;                                                    // a Unit-level role covers everything inside ... except other people's personal spaces:
-    const allPersonal = ua.sources.some(x => x.scope.type === "unit" && x.kind === "unit" && x.role === "admin" && x.ladder != null);   // only a Unit admin WITH board-content access opens those (TECH-DEBT row 66)
-    const cand = await registry.spaceCandidates(unit.id, { user: identity.user, all, limit: LIMITS.spaces });
+    const allPersonal = ua.permissions.has("content.personal");                       // only the content tier's `content.personal` opens those (#88, TECH-DEBT row 66); `content.shared` alone (all) does not
+    // `content.personal` without `content.shared` reaches no shared Space at the root, so it lists every Space as a candidate and the resolver answers per Space (bounded by SCAN.grantChecks).
+    const cand = await registry.spaceCandidates(unit.id, { user: identity.user, all: all || allPersonal, limit: LIMITS.spaces });
     const groups = new Map(cand.groups.map(g => [g.id, g]));
     const t = now();
     // What general access alone gives, from the rows in hand (no read); anything more needs the resolver's full answer.

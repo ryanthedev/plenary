@@ -49,7 +49,8 @@ describe("TECH-DEBT row 66: a Unit-wide board role reaches no personal space", (
     expect(ids(hb.recent)).toEqual([]);
     expect((await home.search(bob, "Diary")).results.map(c => c.id)).toEqual([]);
     expect((await ten.role(bob, diary.id))).toBe(null);
-    const admin = homeService({ registry: r, tenancy: tenancy({ registry: r, now, adminBoardContent: true }) });
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: root.user }, role: "content-admin-personal" });
+    const admin = homeService({ registry: r, tenancy: tenancy({ registry: r, now }) });
     expect((await admin.home(root)).tree.spaces.map(s => s.name).sort()).toEqual(["Team", "ada's space", "bob's space", "root's space"]);
     expect(ids((await admin.search(root, "Diary")).results)).toEqual([diary.id]);
     expect(shared.id).toBeTruthy();

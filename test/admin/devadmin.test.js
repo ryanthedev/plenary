@@ -98,7 +98,7 @@ test("CLI: bad arguments exit 2 with usage and touch nothing", async () => {
     expect(x.o.err.join("\n").length).toBeGreaterThan(0);
   }
   expect(existsSync(join(dir, "registry.db"))).toBe(false);
-  expect(parseArgs(["--domain=acme.com", "--admin", "a@acme.com", "--admin", "dev:b"])).toEqual({ domain: "acme.com", admins: ["a@acme.com", "dev:b"] });
+  expect(parseArgs(["--domain=acme.com", "--admin", "a@acme.com", "--admin", "dev:b"])).toEqual({ domain: "acme.com", admins: ["a@acme.com", "dev:b"], contentAdmins: [], contentAdminsPersonal: [] });
 });
 
 test("CLI: an email admin off --domain, or a control character, exits 2 naming the entry and touches nothing", async () => {

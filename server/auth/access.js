@@ -9,7 +9,7 @@
 import { AdminError, knownOnBoard } from "../admin/boards.js";
 import { isUnitAdmin } from "./resolver.js";
 import { ROLES } from "./util.js";
-import { roleDef, MGMT_PERMS, UNIT_ROLES, withinLadder } from "./permissions.js";
+import { roleDef, ROLE_PERMS, TIER_PERMS, TIER_ROLES, UNIT_ROLES, withinLadder } from "./permissions.js";
 import { TEAMS } from "./registry-port.js";
 import { LADDER_NAMES, roleLabel as labelOf, explainService, askRolesFor } from "./explain.js";
 
@@ -38,7 +38,8 @@ const cursorOf = (v, kind) => {
 /** "google:123" / "dev:ada" → the part a person would read, for a user with no directory entry. */
 const plainName = id => String(id).replace(/^[a-z]+:/, "");
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-export const mgmtOf = def => [...def.permissions].filter(p => MGMT_PERMS.includes(p));
+/** The management and content-tier permissions a role definition carries (what the no-escalation rule compares to the caller's own; an admin is exempt from none of them). */
+export const mgmtOf = def => [...def.permissions].filter(p => ROLE_PERMS.includes(p));
 
 /**
  * The definition of `role` at `type` if the caller may hand it out there, else null. Valid there (roleDef), never `admin` or `member`, its management
@@ -129,6 +130,13 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
     const admin = isUnitAdmin(unit, identity);
     if (admin && !adding) return true;
     if (admin) {
+      // A Team's Unit-wide grant of a content-tier role is content access for everyone added: the admin needs those permissions themselves (#88, no exemption).
+      const ug = await registry.scopedGrant({ type: "unit", id: unit.id }, { type: "team", id: team });
+      const tier = ug && roleDef(ug, "unit", new Map((await registry.roles(unit.id)).map(r => [r.id, r])));
+      if (tier && mgmtOf(tier).some(p => TIER_PERMS.includes(p))) {
+        const ua = await tenancy.effective(identity, { type: "unit", id: unit.id });
+        if (!mgmtOf(tier).every(p => may(ua, p) || !TIER_PERMS.includes(p))) return false;
+      }
       // Only the Team's grants on a personal space or a board in one matter here (one bounded query, usually none); a Team of any size is otherwise the admin's to change. Over that query's own cap: refused.
       const pp = await registry.personalScopesOf({ type: "team", id: team }, { limit: LIMITS.teamScopes });
       if (pp.more) return false;
@@ -382,7 +390,7 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
       ]);
 
       // The picker: only roles valid here that the caller may hand out.
-      const options = [...ROLES.filter(r => type !== "unit"), ...[...roles.values()].filter(r => r.id !== "member").sort((a, b) => a.name.localeCompare(b.name)).map(r => r.id)];
+      const options = [...ROLES.filter(r => type !== "unit"), ...(type === "unit" ? Object.keys(TIER_ROLES) : []), ...[...roles.values()].filter(r => r.id !== "member").sort((a, b) => a.name.localeCompare(b.name)).map(r => r.id)];
       const pick = [];
       for (const r of manage ? options : []) {
         const def = grantable(access, r, type, roles, admin);

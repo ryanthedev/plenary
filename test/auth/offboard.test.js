@@ -13,19 +13,20 @@ import { mkBoard } from "./fixtures.js";
 import { identityKey, roleCache } from "../../server/auth/tenancy.js";
 
 const ident = (n, domain = "acme.com") => ({ user: `google:${n}`, name: n[0].toUpperCase() + n.slice(1), email: `${n}@${domain}`, domain });
-const root = ident("root"), ada = ident("ada"), sam = ident("sam"), bob = ident("bob"), cy = ident("cy"), kim = ident("kim", "partner.io");
+const root = ident("root"), ada = ident("ada"), sam = ident("sam"), bob = ident("bob"), cy = ident("cy"), kim = ident("kim", "partner.io"), low = ident("low");   // low: a manage-only Unit admin (no content tier)
 const code = p => p.then(() => null, e => e.code ?? e.message);
 let clock, r, ten, manageOnly, off, acme, fieldNotes, group, shared, samSpace, secret, noted, announced, manager;
 
 beforeEach(async () => {
   clock = { t: Date.UTC(2026, 10, 11) };
   r = memoryRegistry({ now: () => clock.t });
-  ten = makeTenancy({ registry: r, now: () => clock.t, adminBoardContent: true });          // root can open personal spaces; the manage-only case builds its own below
-  manageOnly = makeTenancy({ registry: r, now: () => clock.t });
+  ten = makeTenancy({ registry: r, now: () => clock.t });          // root holds the content tier (below) and can open personal spaces; `low` is a manage-only admin
+  manageOnly = ten;
   announced = []; manager = null;
   off = offboardService({ registry: r, tenancy: ten, announce: (unit, scope, o) => announced.push([scope.type, scope.id, !!o?.revoke]), managerOf: async () => manager });
-  acme = await r.createTenant({ domain: "acme.com", admins: ["google:root"] });
-  for (const p of [root, ada, sam, bob, cy]) await r.touchMember(acme.id, { user: p.user, name: p.name, email: p.email });
+  acme = await r.createTenant({ domain: "acme.com", admins: ["google:root", "google:low"] });
+  await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: root.user }, role: "content-admin-personal" });
+  for (const p of [root, ada, sam, bob, cy, low]) await r.touchMember(acme.id, { user: p.user, name: p.name, email: p.email });
   samSpace = await r.ensurePersonalSpace(acme.id, sam.user);
   secret = await mkBoard(r, { tenant: acme.id, title: "Secret plan", space: samSpace.id, owner: sam.user });
   await r.setGrant(secret.id, kim.user, "editor");                                    // an outside guest
@@ -104,14 +105,14 @@ describe("who may reassign (permissions, never role names)", () => {
   describe("a personal space is private to its owner (HIGH-2)", () => {
     const mo = () => offboardService({ registry: r, tenancy: manageOnly, announce: () => {}, managerOf: async () => null });
     test("a manage-only Unit admin sees the personal space as a count, cannot hand it over, and cannot remove its owner; nothing changes", async () => {
-      expect((await manageOnly.effective(root, secret.id)).ladder).toBe(null);
-      const out = await mo().list(root, sam.user);
+      expect((await manageOnly.effective(low, secret.id)).ladder).toBe(null);
+      const out = await mo().list(low, sam.user);
       const mine = out.items.find(i => i.personal);
       expect(mine.can).toEqual({ reassign: false, handover: false, why: "Private to its owner: needs board-content access" });
       expect(JSON.stringify(out)).not.toContain("Secret plan");
       expect(out.canRemove).toBe(false);
-      await moveAll2(mo());
-      expect(await code(mo().remove(root, sam.user, { to: ada.user }))).toBe("forbidden");
+      await moveAll2(mo(), ada.user, low);
+      expect(await code(mo().remove(low, sam.user, { to: ada.user }))).toBe("forbidden");
       expect((await r.memberState(acme.id, sam.user)).removed).toBe(false);
       expect((await r.personalSpace(acme.id, sam.user)).id).toBe(samSpace.id);
       expect(await manageOnly.role(ada, secret.id)).toBe(null);
@@ -128,7 +129,7 @@ describe("who may reassign (permissions, never role names)", () => {
       await r.updateRole(acme.id, "member", { boardRole: "viewer", permissions: [] });
       expect(await ten.role(bob, secret.id)).toBe(null);                                         // Bob: plain member, member role viewer
       expect(await ten.role(bob, noted.id)).toBe("viewer");                                      // ... still reaches a shared Space's boards via the member role / general access
-      expect((await manageOnly.effective(root, secret.id)).ladder).toBe(null);                  // a manage-only admin: nothing
+      expect((await manageOnly.effective(low, secret.id)).ladder).toBe(null);                   // a manage-only admin: nothing
       const role = await r.createRole({ tenant: acme.id, name: "Wide", boardRole: "editor", permissions: ["members.manage"] });
       await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: cy.user }, role: role.id });
       expect(await ten.role(cy, secret.id)).toBe(null);                                          // a Unit-scope custom role with a boardRole
@@ -142,8 +143,8 @@ describe("who may reassign (permissions, never role names)", () => {
     });
     test("row 66: in that config a manage-only admin still cannot hand the personal space over, a content-access admin can", async () => {
       await r.updateRole(acme.id, "member", { boardRole: "editor", permissions: [] });
-      await moveAll2(mo());
-      expect(await code(mo().remove(root, sam.user, { to: ada.user }))).toBe("forbidden");
+      await moveAll2(mo(), ada.user, low);
+      expect(await code(mo().remove(low, sam.user, { to: ada.user }))).toBe("forbidden");
       expect((await r.memberState(acme.id, sam.user)).removed).toBe(false);
       await moveAll(ada.user);
       expect(await code(off.remove(root, sam.user, { to: ada.user }))).toBe(null);
@@ -332,6 +333,7 @@ describe("over HTTP", () => {
     const tok = n => ({ name: n, domain: "acme.com", email: `${n}@acme.com` });
     for (const n of ["root", "ada", "bob", "sam"]) await r.touchMember(acme.id, { user: "dev:" + n, name: n, email: `${n}@acme.com` });
     await r.addTenantAdmin(acme.id, "dev:root");
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: "dev:root" }, role: "content-admin-personal" });   // the handover of Sam's personal space needs the content tier
     await r.ensurePersonalSpace(acme.id, "dev:sam");
     hfn = await r.createSpace({ tenant: acme.id, name: "HFN", owner: "dev:sam" });
     await r.createGroup({ tenant: acme.id, name: "HG", owner: "dev:sam" });

@@ -1,13 +1,15 @@
 // Operator CLI: create a Workspace domain's tenant and name its first admins (brief p5-devadmin). A composition
 // root: it opens the same Registry the server uses and runs bootstrapTenant (server/admin/tenants.js) over it.
 //
-//   bun scripts/admin-bootstrap.js --domain acme.com --admin alice@acme.com [--admin google:<sub>] [--admin dev:ann]
+//   bun scripts/admin-bootstrap.js --domain acme.com --admin alice@acme.com [--admin google:<sub>] [--admin dev:ann] [--content-admin <user>] [--content-admin-personal <user>]
 //
 // --domain   the Google Workspace domain (the `hd` claim); required
 // --admin    required, repeatable; google:<sub>, dev:<name>, or an email on --domain (stored as email:<addr>). An
 //            email admin is matched at Google sign-in when Google vouches for that email and the user's Workspace
 //            domain is the tenant's, so the first admin can be named before they have ever signed in. An email on
 //            another domain, or any control character, is refused (exit 2, naming the entry).
+// --content-admin / --content-admin-personal   repeatable; google:<sub> or dev:<name> (never an email): the user gets the Unit role `content-admin` (opens every shared board) or
+//            `content-admin-personal` (those and other people's personal spaces). The content tier is passed on only by a holder, so this is how the first holder appears. Additive.
 // --data-dir the single node's data directory (default: PLENARY_DATA_DIR, else ./data), as server/main.js reads it
 //
 // Which Registry: DATABASE_URL set → Postgres (schema "public", the adapter's default); else SQLite at
@@ -19,15 +21,15 @@
 
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
-import { bootstrapTenant, normDomain, normAdmin, shown, escapeUnsafe } from "../server/admin/tenants.js";
+import { bootstrapTenant, normDomain, normAdmin, normContentAdmin, shown, escapeUnsafe } from "../server/admin/tenants.js";
 import { sqliteRegistry } from "../server/registry/sqlite.js";
 import { postgresRegistry } from "../server/registry/postgres.js";
 
-const USAGE = "usage: bun scripts/admin-bootstrap.js --domain <domain> --admin <google:sub|dev:name|email> [--admin …] [--data-dir <dir>]";
+const USAGE = "usage: bun scripts/admin-bootstrap.js --domain <domain> --admin <google:sub|dev:name|email> [--admin …] [--content-admin <user>] [--content-admin-personal <user>] [--data-dir <dir>]";
 
-/** @returns {{ domain?: string, admins: string[], dataDir?: string }} */
+/** @returns {{ domain?: string, admins: string[], contentAdmins: string[], contentAdminsPersonal: string[], dataDir?: string }} */
 export function parseArgs(argv) {
-  const o = { admins: [] };
+  const o = { admins: [], contentAdmins: [], contentAdminsPersonal: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const [flag, inline] = a.startsWith("--") && a.includes("=") ? [a.slice(0, a.indexOf("=")), a.slice(a.indexOf("=") + 1)] : [a, undefined];
@@ -39,6 +41,8 @@ export function parseArgs(argv) {
     };
     if (flag === "--domain") o.domain = value();
     else if (flag === "--admin") o.admins.push(value());
+    else if (flag === "--content-admin") o.contentAdmins.push(value());
+    else if (flag === "--content-admin-personal") o.contentAdminsPersonal.push(value());
     else if (flag === "--data-dir") o.dataDir = value();
     else throw new UsageError(`unknown argument: ${shown(flag)}`);   // escaped: argv can hold any byte
   }
@@ -61,6 +65,7 @@ export async function run(argv, env = {}, { out = s => console.log(s), err = s =
     args = parseArgs(argv);
     const domain = normDomain(args.domain);
     for (const a of args.admins) normAdmin(a, domain);
+    for (const a of [...args.contentAdmins, ...args.contentAdminsPersonal]) normContentAdmin(a);
   }
   catch (e) { err(`${e.message}\n${USAGE}`); return 2; }
 
@@ -69,7 +74,7 @@ export async function run(argv, env = {}, { out = s => console.log(s), err = s =
   const deadline = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`timed out after ${Math.round(timeoutMs / 1000)} s`)), timeoutMs); });
   deadline.catch(() => {});
   try {
-    const { tenant, created, added } = await Promise.race([deadline, (async () => {
+    const { tenant, created, added, content } = await Promise.race([deadline, (async () => {
       if (env.DATABASE_URL) { registry = await postgresRegistry({ url: env.DATABASE_URL }); store = "postgres"; }
       else {
         const dir = args.dataDir || env.PLENARY_DATA_DIR || "./data";
@@ -77,9 +82,9 @@ export async function run(argv, env = {}, { out = s => console.log(s), err = s =
         registry = sqliteRegistry({ path: join(dir, "registry.db") });
         store = "sqlite";
       }
-      return bootstrapTenant({ registry, domain: args.domain, admins: args.admins });
+      return bootstrapTenant({ registry, domain: args.domain, admins: args.admins, contentAdmins: args.contentAdmins, contentAdminsPersonal: args.contentAdminsPersonal });
     })()]);
-    out(JSON.stringify({ ok: true, registry: store, tenant: tenant.id, domain: tenant.domain, created, added, admins: tenant.admins }));
+    out(JSON.stringify({ ok: true, registry: store, tenant: tenant.id, domain: tenant.domain, created, added, content, admins: tenant.admins }));
     return 0;
   } catch (e) {
     // Messages only: a driver error could carry connection details, so no stack and no cause. URLs are redacted

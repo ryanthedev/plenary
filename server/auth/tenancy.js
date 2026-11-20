@@ -51,23 +51,20 @@ const okIdentity = id => !!id && typeof id.user === "string";
  * board; only this board's count). Every stored role is capped there: unknown roles count for nothing; invites and
  * general access stay below owner; links stay within LINK_ROLES.
  * @param {{ ctx: import("./registry-port.js").AccessContext, grant: Role|null, invites: Invite[], links: (Link|null)[] }} rows
- * @param {Identity} identity @param {number} t @param {{ adminBoardContent?: boolean }} [opts]
+ * @param {Identity} identity @param {number} t
  * @returns {Resolved}
  */
-export function combine(rows, identity, t, opts) {
-  const a = resolveAccess(rows, identity, t, opts);
+export function combine(rows, identity, t) {
+  const a = resolveAccess(rows, identity, t);
   return { role: a.ladder ?? null, share: a.permissions.has("members.manage"), move: mayMove(a), until: a.until };
 }
 
 /**
- * @param {{ registry: Registry, now?: () => number, recordUntil?: (record: object) => number, adminBoardContent?: boolean }} deps
- *   adminBoardContent: does a Unit admin get board content (ladder owner) on every board of the Unit? Default false,
- *   which keeps today's rule (an admin manages every board but enters a room only with a role). See resolver.js.
+ * @param {{ registry: Registry, now?: () => number, recordUntil?: (record: object) => number }} deps
  *   recordUntil: for a cache over this tenancy (roleCache): until when a link record `resolve` read may be relied on
  *   (its memo's end). `resolve`'s `until` is capped by it, so an answer never outlives the records it was built from.
  */
-export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity, adminBoardContent = false }) {
-  const opts = { adminBoardContent };
+export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity }) {
   /** One user's access to a board: ladder role, permissions, sources. @returns {Promise<import("./resolver.js").Access>} */
   async function accessOn(identity, boardId, { uniform = false } = {}) {
     if (!okIdentity(identity) || typeof boardId !== "string") return nothing();
@@ -82,7 +79,7 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
     const invites = identity.email ? await registry.invitesFor(ctx.board.id, identity.email) : [];
     const links = [];
     for (const id of await registry.linkUses(ctx.board.id, identity.user)) links.push(await registry.link(id));
-    const a = resolveAccess({ ctx, grant, invites, links }, identity, t, opts);
+    const a = resolveAccess({ ctx, grant, invites, links }, identity, t);
     // Links can change (revokeLink): cap by every link record read.
     for (const l of links) if (l) a.until = Math.min(a.until, recordUntil(l));
     return a;
@@ -137,8 +134,8 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
       const invites = id.email ? invitesBy.get(normEmail(id.email)) ?? [] : [];
       const links = (uses.get(id.user) ?? []).map(l => linkById.get(l) ?? null);
       const rows = { ctx, grant: grants.get(id.user) ?? null, invites, links, teams: teamsOf.get(id.user) ?? NO_TEAMS };
-      out.set(k, { ...combine(rows, id, t, opts), identity: id,
-        ...(shaped ? { before: resolveAccess(rows, id, t, opts), after: resolveAccess({ ...rows, ctx: shaped, teams: teamsAfter.get(id.user) ?? NO_TEAMS }, id, t, opts) } : {}) });
+      out.set(k, { ...combine(rows, id, t), identity: id,
+        ...(shaped ? { before: resolveAccess(rows, id, t), after: resolveAccess({ ...rows, ctx: shaped, teams: teamsAfter.get(id.user) ?? NO_TEAMS }, id, t) } : {}) });
     }
     return out;
   }
@@ -160,7 +157,7 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
       if (!okIdentity(identity) || !scope || typeof scope.id !== "string") return nothing();
       if (scope.type === "board") return accessOn(identity, scope.id, o);
       const ctx = await registry.accessContext(scope, { users: [identity.user] });
-      return ctx ? resolveAccess({ ctx }, identity, now(), opts) : nothing();
+      return ctx ? resolveAccess({ ctx }, identity, now()) : nothing();
     },
     /**
      * The effective access of MANY identities at one scope: one `accessContext` for a Unit, Group or Space (at most 50 identities), one `accessOn` each for a board. A Map user → Access.
@@ -173,7 +170,7 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
       if (scope.type === "board") { for (const id of ids) out.set(id.user, await accessOn(id, scope.id)); return out; }
       const ctx = await registry.accessContext(scope, { users: ids.map(i => i.user) });
       const t = now(), teams = ctx ? teamIndex(ctx) : null;
-      for (const id of ids) out.set(id.user, ctx ? resolveAccess({ ctx, teams: teams.get(id.user) ?? NO_TEAMS }, id, t, opts) : nothing());
+      for (const id of ids) out.set(id.user, ctx ? resolveAccess({ ctx, teams: teams.get(id.user) ?? NO_TEAMS }, id, t) : nothing());
       return out;
     },
     /**
@@ -185,7 +182,7 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
       if (!okIdentity(identity) || !Array.isArray(scopes) || !scopes.length) return out;
       const got = await registry.accessContexts(scopes, { users: [identity.user] });
       const t = now();
-      for (const [k, ctx] of got) out.set(k, ctx ? resolveAccess({ ctx }, identity, t, opts) : nothing());
+      for (const [k, ctx] of got) out.set(k, ctx ? resolveAccess({ ctx }, identity, t) : nothing());
       return out;
     },
     /**
@@ -209,14 +206,14 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
       const ctxs = got;
       const t = now();
       const own = new Map();   // "space:<id>" / "group:<id>" → may the identity open boards there (from the context already read)
-      const opens = (k, ctx) => { if (!own.has(k)) { const a = resolveAccess({ ctx }, identity, t, opts); own.set(k, (a.ladder ?? a.trashed?.ladder ?? null) != null); } return own.get(k); };   // a Space or Group in Trash: could they open it before (the Trash list names where a board was)
+      const opens = (k, ctx) => { if (!own.has(k)) { const a = resolveAccess({ ctx }, identity, t); own.set(k, (a.ladder ?? a.trashed?.ladder ?? null) != null); } return own.get(k); };   // a Space or Group in Trash: could they open it before (the Trash list names where a board was)
       for (const [id, r] of rows) {
         const base = ctxs.get(keyOf(scopeOf(r.board)));
         if (!base) continue;
         const teams = { ...base.teams };
         for (const g of r.teamGrants) if (g.subject.type === "team" && !(g.subject.id in teams)) teams[g.subject.id] = r.myTeams.includes(g.subject.id) ? [identity.user] : [];
         const ctx = { ...base, board: r.board, scoped: { ...base.scoped, board: r.teamGrants }, teams };
-        const access = resolveAccess({ ctx, grant: r.grant, invites: r.invites, links: r.links }, identity, t, opts);
+        const access = resolveAccess({ ctx, grant: r.grant, invites: r.invites, links: r.links }, identity, t);
         const spaceOpen = !!base.space && opens("space\n" + base.space.id, { ...base, board: null });
         const groupOpen = !!base.group && opens("group\n" + base.group.id, { ...base, board: null, space: null });
         out.set(id, { access, grant: r.grant, board: r.board, space: base.space, group: base.group, spaceOpen, groupOpen });
@@ -251,7 +248,7 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
   };
 }
 
-const tenancyOver = (registry, now, recordUntil, adminBoardContent) => tenancy({ registry, now, recordUntil, adminBoardContent });
+const tenancyOver = (registry, now, recordUntil) => tenancy({ registry, now, recordUntil });
 
 // ---- roleCache: a role cache over `tenancy` (p5-load; p-audit F8). Depends only on the Registry port. ----
 //
@@ -280,7 +277,7 @@ const tenancyOver = (registry, now, recordUntil, adminBoardContent) => tenancy({
 // Errors are never cached: a Registry failure propagates (the gateway answers `unavailable`).
 
 /**
- * @param {{ registry: Registry, now?: () => number, ttlMs?: number, recordTtlMs?: number, linkTtlMs?: number, maxEntries?: number, maxRecords?: number, adminBoardContent?: boolean }} o
+ * @param {{ registry: Registry, now?: () => number, ttlMs?: number, recordTtlMs?: number, linkTtlMs?: number, maxEntries?: number, maxRecords?: number }} o
  *   ttlMs: a role entry's longest life, counted from when the oldest changeable data it rests on was read (default
  *     30 s; keep it ≤ the gateway's 60 s re-check, see the report). An entry built from a memoized link record ends no
  *     later than that record's memo (p5-load2v MEDIUM 0), so with linkTtlMs ≤ ttlMs a role is never served from data
@@ -296,12 +293,12 @@ const tenancyOver = (registry, now, recordUntil, adminBoardContent) => tenancy({
  *     board it reaches (PROTOCOL.md § Organization, "Freshness"), and the timed pass reads the chain fresh (`fresh`)
  *     anyway, so it is never older than ttlMs (30 s): if a Trash or Restore announcement is lost, a hello can see the old state for up to that long, and the next timed pass closes or admits it. A tenant's `admins` and `domains` only ever grow, so a stale chain can only
  *     delay a gain, never hide a revoke;
- *   adminBoardContent: pass-through to `tenancy` (does a Unit admin get board content everywhere? default false);
+ *   A role gaining or losing a content-tier permission (#88) changes what every Unit-scope holder resolves on every board: the role edit announces the Unit (roles.js) and the announcement drops these entries like any grant change;
  *   linkTtlMs: link records (default 30 s; a link changes by revokeLink, which announces `{ board }` and drops them).
  */
 const STAMP_MAX = 10_000;
 
-export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlMs = 600_000, linkTtlMs = 30_000, maxEntries = 200_000, maxRecords = 100_000, adminBoardContent = false }) {
+export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlMs = 600_000, linkTtlMs = 30_000, maxEntries = 200_000, maxRecords = 100_000 }) {
   if (!registry) throw new Error("roleCache: registry is required");
   const stats = { hits: 0, misses: 0, fills: 0, discarded: 0, recordHits: 0, recordMisses: 0 };
 
@@ -370,7 +367,7 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
     } finally { endRead(); }
   }
   const view = { ...registry, board, link: memo("link", id => registry.link(id)), accessContext };
-  const tenancy = tenancyOver(view, now, l => linkUntil.get(l) ?? Infinity, adminBoardContent);
+  const tenancy = tenancyOver(view, now, l => linkUntil.get(l) ?? Infinity);
 
   // ---- roles ----
   // Entries are keyed by board + identityKey (user, email, domain), as the gateway groups connections, so two

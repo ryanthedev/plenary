@@ -17,7 +17,19 @@ export { SCOPES };
 export const CONTENT_PERMS = ["board.view", "board.comment", "board.annotate", "board.edit"];
 /** Management permissions: what the admin layer checks. */
 export const MGMT_PERMS = ["board.create", "space.create", "group.create", "members.manage", "move", "delete", "transfer", "roles.manage", "team.manage"];
-export const PERMISSIONS = [...CONTENT_PERMS, ...MGMT_PERMS];
+/**
+ * Content-tier permissions (#88): who may OPEN boards beyond their own access. Held only at the Unit (ALLOWED_AT), never by the Unit admin role, and grantable only by someone who holds them
+ * (an admin has no exemption: `grantable`, roles.js `within`). `content.shared`: every board in every shared Space, Group and the Unit root, as board `owner`. `content.personal`: the same in
+ * other people's personal spaces, as their owner would (open, move out, trash, hand over). Separate, so a Unit may grant either, or both.
+ */
+export const TIER_PERMS = ["content.shared", "content.personal"];
+/** What a custom role may carry: management permissions and the content tier. (The Unit member role carries management permissions only.) */
+export const ROLE_PERMS = [...MGMT_PERMS, ...TIER_PERMS];
+export const PERMISSIONS = [...CONTENT_PERMS, ...MGMT_PERMS, ...TIER_PERMS];
+/** Built-in Unit roles of the content tier, grantable at the Unit only. Names are labels; every check reads the permissions. */
+export const TIER_ROLES = Object.freeze({ "content-admin": ["content.shared"], "content-admin-personal": ["content.shared", "content.personal"] });
+/** What a content-tier source adds on a PERSONAL space (target space or board): the owner's management, so the holder can move out, trash and hand over what they may open. */
+const OWNER_MGMT = ["board.create", "members.manage", "move", "delete", "transfer"];
 
 /** The content permissions of each ladder role (owner has all four; ownership itself is the ladder role `owner`). */
 const CONTENT_OF = { viewer: 1, commenter: 2, annotator: 3, editor: 4, owner: 4 };
@@ -25,7 +37,7 @@ export const contentPerms = ladder => CONTENT_PERMS.slice(0, CONTENT_OF[ladder] 
 
 /** Which management permissions mean something at each scope; a role holding others there gets them dropped. */
 export const ALLOWED_AT = {
-  unit: MGMT_PERMS,
+  unit: [...MGMT_PERMS, ...TIER_PERMS],
   group: MGMT_PERMS.filter(p => p !== "roles.manage" && p !== "group.create" && p !== "team.manage"),
   space: MGMT_PERMS.filter(p => p !== "roles.manage" && p !== "space.create" && p !== "group.create" && p !== "team.manage"),
   board: ["members.manage", "move", "delete", "transfer"],
@@ -46,15 +58,13 @@ export { MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS };
  * @param {string} role  a ladder name, "admin", "member", or a custom role id
  * @param {ScopeType} scope
  * @param {Map<string, CustomRole>} [roles]  the Unit's stored roles by id (custom roles, and the "member" override)
- * @param {{ adminBoardContent?: boolean }} [o]  adminBoardContent: whether Unit admin carries board content (view..edit, ladder owner)
  */
-export function roleDef(role, scope, roles = new Map(), { adminBoardContent = false } = {}) {
+export function roleDef(role, scope, roles = new Map()) {
   const at = ALLOWED_AT[scope];
   if (!at || typeof role !== "string") return null;
   const clip = list => list.filter(p => at.includes(p));
-  if (role === "admin") return scope === "unit"
-    ? { permissions: new Set([...(adminBoardContent ? CONTENT_PERMS : []), ...MGMT_PERMS]), ladder: adminBoardContent ? "owner" : null }
-    : null;
+  if (role === "admin") return scope === "unit" ? { permissions: new Set(MGMT_PERMS), ladder: null } : null;   // manages; NO board content: that is the content tier
+  if (TIER_ROLES[role]) return scope === "unit" ? { permissions: new Set(TIER_ROLES[role]), ladder: null } : null;
   if (role === MEMBER_ROLE_ID) {
     if (scope !== "unit") return null;
     const o = roles.get(MEMBER_ROLE_ID);
@@ -69,7 +79,7 @@ export function roleDef(role, scope, roles = new Map(), { adminBoardContent = fa
   const c = roles.get(role);
   if (!c) return null;
   const ladder = ladderOf(c.boardRole);
-  return { permissions: new Set([...contentPerms(ladder), ...clip(c.permissions.filter(p => MGMT_PERMS.includes(p)))]), ladder };
+  return { permissions: new Set([...contentPerms(ladder), ...clip(c.permissions.filter(p => ROLE_PERMS.includes(p)))]), ladder };
 }
 
 /**
@@ -92,9 +102,22 @@ const ladderOf = r => (INVITE_ROLES.includes(r) ? r : null);
 export function roleProblem(r, { member = false } = {}) {
   if (!r || typeof r !== "object") return "bad role";
   if (r.boardRole == null ? !member : !INVITE_ROLES.includes(r.boardRole)) return "a role carries exactly one board role: viewer, commenter, annotator or editor";
-  if (!Array.isArray(r.permissions) || r.permissions.some(p => !MGMT_PERMS.includes(p)) || new Set(r.permissions).size !== r.permissions.length)
-    return "permissions must be distinct management permissions: " + MGMT_PERMS.join(", ");
+  const allowed = member ? MGMT_PERMS : ROLE_PERMS;
+  if (!Array.isArray(r.permissions) || r.permissions.some(p => !allowed.includes(p)) || new Set(r.permissions).size !== r.permissions.length)
+    return "permissions must be distinct " + (member ? "management permissions: " : "management or content permissions: ") + allowed.join(", ");
   return null;
 }
 
 export { rank };
+
+/**
+ * What the content tier gives a Unit-scope source on a target (#88): `null` when it reaches nothing here, else `{ via, perms, ladder: "owner" }`. A source reaches shared Spaces (and the Group and the Unit
+ * root) with `content.shared` and personal spaces (the space and its boards) with `content.personal`. On a personal target it also carries the owner's management (`OWNER_MGMT`), the only place the tier
+ * gives management: on shared Spaces management is the admin's own permissions, and the Unit root and Groups give a content holder content only.
+ * @param {Set<string>} perms the source's permissions  @param {boolean} personal  the target is a personal space or a board in one
+ */
+export function tierReach(perms, personal) {
+  const via = personal ? "content.personal" : "content.shared";
+  if (!perms.has(via)) return null;
+  return { via, ladder: "owner", perms: [...CONTENT_PERMS, ...(personal ? OWNER_MGMT : [])] };
+}

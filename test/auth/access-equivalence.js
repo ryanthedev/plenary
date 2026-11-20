@@ -2,7 +2,7 @@
 // permissions, sources and `until`. Run on every Registry adapter (memory in home.test.js, SQLite in test/server/registry.test.js,
 // Postgres in test/server/pg-registry.test.js). A seeded random Unit: Groups and Spaces with general access, user and Team grants
 // on Spaces, Groups and boards, custom roles, direct grants, live / expiring / revoked invites and links, a second Unit in the same
-// batch, guests and Unit admins; checked with adminBoardContent off and on.
+// batch, guests and Unit admins; checked with the content tier absent and held by the admin.
 import { test, expect } from "bun:test";
 import { tenancy } from "../../server/auth/tenancy.js";
 
@@ -14,16 +14,17 @@ const ROLES = ["viewer", "commenter", "annotator", "editor", "owner"], GENERAL =
  * @param {{ seeds?: number[], cleanup?: (r: any) => Promise<void>|void }} [o]
  */
 export function accessEquivalence(name, makeRegistry, { seeds = [7, 19, 101], cleanup } = {}) {
-  for (const seed of seeds) for (const adminBoardContent of [false, true]) {
-    test(`accessMany equals effective on a random Unit (${name}, seed ${seed}, adminBoardContent ${adminBoardContent})`, async () => {
+  for (const seed of seeds) for (const content of [false, true]) {
+    test(`accessMany equals effective on a random Unit (${name}, seed ${seed}, content tier ${content})`, async () => {
       let clock = 1_000_000, s = seed;
       const now = () => clock;
       const rnd = n => { s = (s * 1103515245 + 12345) & 0x7fffffff; return (s >>> 4) % n; };
       const pick = a => a[rnd(a.length)];
       const r = await makeRegistry({ now });
       try {
-        const ten = tenancy({ registry: r, now, adminBoardContent });
+        const ten = tenancy({ registry: r, now });
         const acme = await r.createTenant({ domain: "acme.com", domains: ["acme.io"], admins: ["google:root"] });
+        if (content) await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: "google:root" }, role: seed % 2 ? "content-admin" : "content-admin-personal" });
         const globex = await r.createTenant({ domain: "globex.com" });
         const people = [
           { user: "google:ada", email: "ada@acme.com", domain: "acme.com" }, { user: "google:bob", email: "bob@acme.com", domain: "acme.com" },

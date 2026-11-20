@@ -10,11 +10,11 @@
 //   PORT                 default 8080 (0 = any free port)
 //   HOST                 default 127.0.0.1 (a container needs HOST=0.0.0.0)
 //   PLENARY_DATA_DIR     data directory, default ./data  (plenary.db, blobs/); the name deploy/ uses
-//   PLENARY_DEV_TOKENS   JSON: { "<token>": { "name": "ann", "role": "editor", "email"?, "domain"?, "admin"? } }.
+//   PLENARY_DEV_TOKENS   JSON: { "<token>": { "name": "ann", "role": "editor", "email"?, "domain"?, "admin"?, "content"?: "shared"|"all" } }.
 //                        Unset = dev tokens off (then only Google sign-in, if configured, admits anyone).
 //                        For each `domain` with a token flagged `"admin": true`, the start makes that domain's
 //                        tenant if missing and adds those users as its admins (server/admin/tenants.js), so they can
-//                        POST /boards. Domains with no admin token get no tenant from here.
+//                        POST /boards. `"content": "shared"|"all"` gives that user the content tier (Unit role content-admin / content-admin-personal; an admin has no board content without it, #88). Domains with no admin or content token get no tenant from here.
 //                        Additive: dropping `admin` later removes nobody (the operator CLI is scripts/admin-bootstrap.js).
 //   S3_ENDPOINT, S3_BUCKET, S3_REGION, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY   S3-compatible blobs (the bucket must
 //                        exist). S3_ENDPOINT set → all five are required, else the start is refused naming the missing
@@ -378,12 +378,9 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   const registry = announcingRegistry(rawRegistry, bus, log);
   const dev = devAuth(tokens ? { enabled: true, tokens } : undefined);
   const sessions = await makeSessions({ key: sessionKey });
-  // PLENARY_ADMIN_BOARD_CONTENT=1: a Unit admin enters every room of the Unit as owner (default off: an admin manages
-  // every board but needs a role to enter one; PROTOCOL.md § Organization).
-  const adminBoardContent = ["1", "true"].includes(String(env.PLENARY_ADMIN_BOARD_CONTENT ?? "").trim().toLowerCase());
-  const tenancy = makeTenancy({ registry, adminBoardContent });
+  const tenancy = makeTenancy({ registry });
   // Hellos read roles through a per-process cache; the gateway invalidates it on `grants` and its timed pass reads fresh (p5-load).
-  const roleCached = roleCache({ registry, now: Date.now, adminBoardContent });
+  const roleCached = roleCache({ registry, now: Date.now });
   const auth = authPort({ sessions, dev, tenancy: roleCached });
   // Google sign-in only when both halves of the OAuth client are there; otherwise /auth answers 503.
   const oidc = env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET
@@ -471,14 +468,18 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
     devBoard = board.id;
     // Each dev domain with a token flagged admin gets its tenant, those users as its admins (p5-devadmin). A bad
     // domain is skipped with an error log; a Registry failure fails the start.
+    // A token may also carry `content`: "shared" (Unit role content-admin) or "all" (content-admin-personal), the first holders of the content tier (#88).
     const domains = new Map();
     for (const t of Object.values(tokens)) {
-      if (t?.admin !== true || typeof t.name !== "string" || !t.name || typeof t.domain !== "string" || !t.domain) continue;
-      const d = t.domain.trim().toLowerCase();
-      domains.set(d, [...(domains.get(d) ?? []), "dev:" + t.name]);
+      if (typeof t?.name !== "string" || !t.name || typeof t.domain !== "string" || !t.domain || (t.admin !== true && !["shared", "all"].includes(t.content))) continue;
+      const d = t.domain.trim().toLowerCase(), e = domains.get(d) ?? { admins: [], shared: [], all: [] };
+      if (t.admin === true) e.admins.push("dev:" + t.name);
+      if (t.content === "shared") e.shared.push("dev:" + t.name);
+      if (t.content === "all") e.all.push("dev:" + t.name);
+      domains.set(d, e);
     }
-    for (const [domain, admins] of domains) {
-      try { const r = await bootstrapTenant({ registry, domain, admins }); log.info("dev tenant", { tenant: r.tenant.id, domain, created: r.created, added: r.added }); }
+    for (const [domain, { admins, shared, all }] of domains) {
+      try { const r = await bootstrapTenant({ registry, domain, admins, contentAdmins: shared, contentAdminsPersonal: all }); log.info("dev tenant", { tenant: r.tenant.id, domain, created: r.created, added: r.added }); }
       catch (err) { if (err?.code !== "bad-request") throw err; log.error("dev token domain skipped", { domain, err }); }
     }
     if (off) log.warn("dev tokens are on, but the dev sign-in menu (GET /auth/dev) is OFF: " + off, { host });

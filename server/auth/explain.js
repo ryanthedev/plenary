@@ -10,7 +10,8 @@ import { askWait } from "./registry-port.js";
 
 export const LADDER_NAMES = { viewer: "Viewer", commenter: "Commenter", annotator: "Annotator", editor: "Editor", owner: "Owner" };
 /** The name a role is shown by: a ladder name, "Admin"/"Member" (Unit roles), or a custom role's own name. */
-export const roleLabel = (role, roles) => LADDER_NAMES[role] ?? roles.get(role)?.name ?? (role === "admin" ? "Admin" : role === "member" ? "Member" : String(role));
+export const BUILTIN_UNIT_NAMES = { admin: "Admin", member: "Member", "content-admin": "Unit content admin", "content-admin-personal": "Unit content admin (incl. personal spaces)" };
+export const roleLabel = (role, roles) => LADDER_NAMES[role] ?? BUILTIN_UNIT_NAMES[role] ?? roles.get(role)?.name ?? String(role);
 
 /** The permission whose absence a disabled control explains, per scope type: New board in a Space, New space in a Group, editing a board. */
 export const KEY_PERMISSION = { space: "board.create", group: "space.create", board: "board.edit" };
@@ -42,7 +43,7 @@ export function mineOf(access, { roles, scopeName = () => undefined, teamName = 
     sources: access.sources.map(s => {
       const name = scopeName(s.scope), team = s.team ? teamName(s.team) : undefined;
       return {
-        kind: s.kind, scope: { type: s.scope.type, id: s.scope.id, ...(name !== undefined ? { name } : {}) }, role: s.role, roleName: roleLabel(s.role, roles), ladder: s.ladder,
+        kind: s.kind, scope: { type: s.scope.type, id: s.scope.id, ...(name !== undefined ? { name } : {}) }, role: s.role, roleName: roleLabel(s.role, roles), ladder: s.ladder, ...(s.content ? { content: s.content } : {}),
         ...(s.team ? { team: { id: s.team, ...(team !== undefined ? { name: team } : {}) } } : {}), strongest: top != null && s.ladder === top,
       };
     }),

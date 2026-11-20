@@ -63,7 +63,7 @@ describe("the list and the matrix", () => {
     const sp = await r.createSpace({ tenant: acme.id, name: "S" });
     await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: U(max.user), role: c.id });
     const l = await svc.list(root);
-    expect(l.roles.map(x => x.id).slice(0, 7)).toEqual(["viewer", "commenter", "annotator", "editor", "owner", "admin", "member"]);
+    expect(l.roles.map(x => x.id).slice(0, 9)).toEqual(["viewer", "commenter", "annotator", "editor", "owner", "admin", "content-admin", "content-admin-personal", "member"]);
     for (const id of ["viewer", "editor", "owner", "admin"]) expect(byId(l, id)).toMatchObject({ kind: "builtin", editable: false, used: null });
     expect(byId(l, "member")).toMatchObject({ kind: "member", editable: true, permissions: ["space.create"], ladder: null });
     expect(byId(l, c.id)).toMatchObject({ kind: "custom", editable: true, base: "editor", ladder: "editor", used: { places: 1, capped: false } });
@@ -122,7 +122,7 @@ describe("create and edit", () => {
     for (let i = 0; i < LIMITS.custom; i++) await svc.create(root, { name: `R${i}`, boardRole: "viewer", permissions: [] });
     expect(await code(svc.create(root, { name: "one more", boardRole: "viewer", permissions: [] }))).toBe("too-large");
     expect((await r.roles(acme.id)).length).toBe(LIMITS.custom);
-    expect((await svc.list(root)).roles.length).toBe(7 + LIMITS.custom);
+    expect((await svc.list(root)).roles.length).toBe(9 + LIMITS.custom);
     expect((await rolesService({ registry: r, tenancy: ten }).create(gia, { name: "mine", boardRole: "viewer", permissions: [] })).name).toBe("mine");
   });
   test("edit: name, ladder step and permissions; the answer is the view; a no-op writes and announces nothing", async () => {

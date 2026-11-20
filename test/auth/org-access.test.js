@@ -102,7 +102,8 @@ test("Unit admin: management permissions everywhere, but no room role unless the
   const root = { user: "google:root", email: "root@acme.com", domain: "acme.com" };
   expect(await ten.role(root, b.id)).toBe(null);                                  // today's rule: an admin enters no room without a role
   expect((await ten.effective(root, b.id)).permissions.has("transfer")).toBe(true);
-  expect(await tenancy({ registry: r, now, adminBoardContent: true }).role(root, b.id)).toBe("owner");
+  await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: root.user }, role: "content-admin" });
+  expect(await tenancy({ registry: r, now }).role(root, b.id)).toBe("owner");
 });
 
 test("rolesFor (the re-check pass) and role (a hello) agree on every source, and through the cache", async () => {
@@ -207,13 +208,14 @@ test("a re-check pass reads the chain fresh and costs a fixed number of calls ho
   expect([role(0), role(1), role(9998), role(9999)]).toEqual(["annotator", "viewer", "annotator", "viewer"]);   // the Space's general access (viewer) for the rest
 });
 
-test("adminBoardContent is reachable through roleCache (and tenancy): a Unit admin enters every room as owner when the deployment says so", async () => {
+test("the content tier (`content.shared`) is reachable through roleCache: a Unit admin enters no room until a content role is granted, then every shared room as owner", async () => {
   const sp = await r.createSpace({ tenant: acme.id, name: "Closed", generalRole: null });
   const b = await board(sp.id);
   const root = { user: "google:root", email: "root@acme.com", domain: "acme.com" };
   expect(await roleCache({ registry: r, now }).role(root, b.id)).toBe(null);
-  expect(await roleCache({ registry: r, now, adminBoardContent: true }).role(root, b.id)).toBe("owner");
-  expect((await roleCache({ registry: r, now, adminBoardContent: true }).rolesFor(b.id, [root])).get(`${root.user}\n${root.email}\n${root.domain}`)).toBe("owner");
+  await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: root.user }, role: "content-admin" });
+  expect(await roleCache({ registry: r, now }).role(root, b.id)).toBe("owner");
+  expect((await roleCache({ registry: r, now }).rolesFor(b.id, [root])).get(`${root.user}\n${root.email}\n${root.domain}`)).toBe("owner");
 });
 
 test("a guest named in Space, Group, Unit and Team grants still has only board scope (end to end through tenancy)", async () => {

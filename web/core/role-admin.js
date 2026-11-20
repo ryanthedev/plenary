@@ -13,6 +13,13 @@ export const PERM_LABEL = {
   "board.create": "Create boards", "space.create": "Create Spaces", "group.create": "Create Groups", "members.manage": "Manage who has access",
   move: "Move boards out", delete: "Delete and restore", transfer: "Transfer ownership", "roles.manage": "Manage roles", "team.manage": "Manage teams",
 };
+/** The content tier (Unit level only): who may open boards beyond their own access. Said plainly, because it is the sensitive part of a role. */
+PERM_LABEL["content.shared"] = "Open every shared board";
+PERM_LABEL["content.personal"] = "Open personal spaces";
+export const PERM_HELP = {
+  "content.shared": "Open and edit any board in any shared Space, as its owner. Not personal spaces.",
+  "content.personal": "Open and manage boards in other people's personal spaces, as their owner would. Needs a reason: it reads private work.",
+};
 export const permLabel = id => PERM_LABEL[id] ?? id;
 export const SCOPE_LABEL = { unit: "Organization", group: "Group", space: "Space", board: "Board" };
 export const LADDER_LABEL = { viewer: "Viewer", commenter: "Commenter", annotator: "Annotator", editor: "Editor" };
@@ -143,7 +150,7 @@ export function createRolesModel({ api, newKey = null }) {
     /** Tick or untick a management permission: only one the server lists as tickable, and only in a role that can be edited. */
     toggle(id) {
       const d = S.draft;
-      if (!d || !S.page.matrix.tickable.includes(id)) return false;
+      if (!d || !S.page.matrix.tickable.includes(id) || (current()?.kind === "member" && id.startsWith("content."))) return false;   // the Unit member role carries no content tier
       d.permissions = d.permissions.includes(id) ? d.permissions.filter(p => p !== id) : [...d.permissions, id];
       emit();
       return true;
@@ -211,7 +218,8 @@ export function createRolesModel({ api, newKey = null }) {
       return M.permissions.map(p => {
         const ticked = p.group === "content" ? !!M.content[src.ladder]?.includes(p.id) : src.permissions.includes(p.id);
         return {
-          id: p.id, group: p.group, label: permLabel(p.id), ticked, tickable: p.group === "management" && editable && M.tickable.includes(p.id),
+          id: p.id, group: p.group, label: permLabel(p.id), ...(PERM_HELP[p.id] ? { help: PERM_HELP[p.id] } : {}), ticked,
+          tickable: p.group !== "content" && editable && M.tickable.includes(p.id) && !(r?.kind === "member" && p.group === "content-tier"),
           cells: M.scopes.map(s => ({ scope: s, state: !p.scopes.includes(s) ? "na" : ticked ? "yes" : "no" })),
         };
       });

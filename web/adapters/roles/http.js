@@ -26,7 +26,7 @@ export function normalizeRolesPage(b) {
     roles: list(b.roles, 80, normalizeRole),
     matrix: {
       scopes: SCOPES,
-      permissions: list(m.permissions, 20, p => (perm(p?.id) ? { id: p.id, group: p.group === "content" ? "content" : "management", scopes: list(p.scopes, 4, s => (SCOPES.includes(s) ? s : null)) } : null)),
+      permissions: list(m.permissions, 20, p => (perm(p?.id) ? { id: p.id, group: p.group === "content" ? "content" : p.group === "content-tier" ? "content-tier" : "management", scopes: list(p.scopes, 4, s => (SCOPES.includes(s) ? s : null)) } : null)),
       content: Object.fromEntries(Object.entries(m.content && typeof m.content === "object" ? m.content : {}).slice(0, 6).map(([k, v]) => [str(k, 16), list(v, 6, perm)])),
       ladders: list(m.ladders, 6, l => (typeof l === "string" ? str(l, 16) : null)), tickable: list(m.tickable, 20, perm),
     },

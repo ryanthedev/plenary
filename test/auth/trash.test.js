@@ -37,13 +37,15 @@ beforeEach(async () => {
 
 describe("personal space boards: the owner's, and an admin's only with board-content access", () => {
   let mine;
-  const svc = adminBoardContent => {
-    const t = makeTenancy({ registry: r, now: () => clock.t, adminBoardContent });
+  /** The service as `root` stands: with the content tier (`content.personal`) or as a manage-only admin. */
+  const svc = async content => {
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: root.user }, role: content ? "content-admin-personal" : null });
+    const t = makeTenancy({ registry: r, now: () => clock.t });
     return trashService({ registry: r, tenancy: t, spaces: spaceService({ registry: r, tenancy: t, home }), now: () => clock.t });
   };
   beforeEach(async () => { mine = await r.createBoard({ tenant: acme.id, title: "Private notes", space: adasSpace.id, owner: "google:ada" }); });
   test("the owner trashes, sees, is told and restores; a manage-only Unit admin gets nothing: no write, no list row, no notice", async () => {
-    const manageOnly = svc(false);
+    const manageOnly = await svc(false);
     expect((await tr.trashBoard(ada, mine.id, { from: adasSpace.id })).trashed).toBe(true);
     expect(await code(manageOnly.restoreBoard(root, mine.id))).toBe("forbidden");
     expect(await code(manageOnly.notice(root, mine.id))).toBe("forbidden");
@@ -56,13 +58,13 @@ describe("personal space boards: the owner's, and an admin's only with board-con
     expect(await code(manageOnly.trashBoard(root, mine.id, { from: adasSpace.id }))).toBe("forbidden");
     expect((await r.board(mine.id)).trashedAt).toBe(null);
   });
-  test("with board-content access (adminBoardContent) a Unit admin may trash, list, be told and restore it; a shared Space's board needs only `delete` either way", async () => {
-    const withContent = svc(true);
+  test("with the content tier (`content.personal`) a Unit admin may trash, list, be told and restore it; a shared Space's board needs only `delete` either way", async () => {
+    const withContent = await svc(true);
     expect((await withContent.trashBoard(root, mine.id, { from: adasSpace.id })).trashed).toBe(true);
     expect((await withContent.list(root)).items.map(i => i.title)).toContain("Private notes");
     expect((await withContent.notice(root, mine.id)).canRestore).toBe(true);
     expect((await withContent.restoreBoard(root, mine.id)).restored).toBe(true);
-    const manageOnly = svc(false);
+    const manageOnly = await svc(false);
     expect((await manageOnly.trashBoard(root, board.id, { from: design.id })).trashed).toBe(true);
     expect((await manageOnly.list(root)).items.map(i => i.title)).toContain("Roadmap");
   });

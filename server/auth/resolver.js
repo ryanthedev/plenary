@@ -10,7 +10,7 @@
 //   3. general  "everyone in the Unit" on the board (`memberRole`), the Space and the Group, for Unit members only
 //   4. invite   a live invite to the user's authoritative email (board scope, capped below owner)
 //   5. link     a live share link the user redeemed (board scope, within LINK_ROLES)
-//   6. unit     Unit admin (`tenant.admins`), then roles granted on the Unit (the user's, then their Teams'), then the
+//   6. unit     Unit admin (`tenant.admins`: management only, NO board content), then roles granted on the Unit (the user's, then their Teams'), then the
 //               Unit member role for members
 //
 // WHO COUNTS AS INSIDE. A *member* is an identity whose Workspace domain (`hd`) is one of the tenant's domains: only
@@ -28,7 +28,7 @@
 // `admin` and `member` are not grantable roles: admin comes only from `tenant.admins`, member only from membership.
 
 import { capTo, higher, normEmail, LINK_ROLES, INVITE_ROLES } from "./util.js";
-import { roleDef, MEMBER_ROLE_ID, UNIT_ROLES, CONTENT_PERMS, ALLOWED_AT } from "./permissions.js";
+import { roleDef, tierReach, MEMBER_ROLE_ID, UNIT_ROLES, CONTENT_PERMS, ALLOWED_AT } from "./permissions.js";
 
 /** @typedef {import("./registry-port.js").Role} Role */
 /** @typedef {import("./registry-port.js").AccessContext} AccessContext */
@@ -36,7 +36,7 @@ import { roleDef, MEMBER_ROLE_ID, UNIT_ROLES, CONTENT_PERMS, ALLOWED_AT } from "
 /**
  * One reason a user has some access.
  * @typedef {{ kind: "direct"|"team"|"general"|"invite"|"link"|"unit", scope: { type: ScopeType, id: string },
- *   role: string, team?: string, permissions: string[], ladder: Role|null }} Source
+ *   role: string, team?: string, permissions: string[], ladder: Role|null, content?: "content.shared"|"content.personal" }} Source   `content`: the content-tier permission that gives this source its board content here
  * @typedef {{ at: number, by: string|null, with: string|null, space: boolean, ladder: Role|null }} Trashed  what a target in Trash answers: when and by whom, the Space that took it (boards), whether a Space in the chain is in Trash, and the board role the caller held before
  * @typedef {{ ladder: Role|null, member?: boolean, permissions: Set<string>, sources: Source[], until: number, trashed?: Trashed }} Access
  */
@@ -88,11 +88,9 @@ export function movedContext(ctx, target) {
  *   their uses); ignored off a board. teams: this user's Teams (from `teamIndex`), computed from ctx if absent.
  * @param {{ user: string, email?: string|null, domain?: string|null }} identity
  * @param {number} t
- * @param {{ adminBoardContent?: boolean }} [opts]  see roleDef. Default false: a Unit admin has every management
- *   permission but no board content unless granted (today's behaviour: a tenant admin enters no room without a role).
  * @returns {Access}
  */
-export function resolveAccess({ ctx, grant = null, invites = [], links = [], teams }, identity, t, opts = {}) {
+export function resolveAccess({ ctx, grant = null, invites = [], links = [], teams }, identity, t) {
   const { tenant, board, space, group } = ctx;
   const roles = new Map((ctx.roles ?? []).map(r => [r.id, r]));
   // A person the Unit removed is a guest (PROTOCOL.md § Leaver offboarding): not a member, so no general access, member role, Space, Group, Unit or Team source.
@@ -109,14 +107,17 @@ export function resolveAccess({ ctx, grant = null, invites = [], links = [], tea
   /** @type {Source[]} */ const sources = [];
   let until = Infinity;
   const add = (kind, scope, role, team) => {
-    const def = roleDef(role, scope.type, roles, opts);
+    const def = roleDef(role, scope.type, roles);
     if (!def) return;
     const keep = role === MEMBER_ROLE_ID && target !== "unit" ? contentOnly : visible;   // the member role's management permissions are the Unit's own
-    // A personal space and its boards belong to their owner: on them every Unit-scope source (the member role, a Unit-wide grant, a Unit Team's grant, and the admin role without board content) gives NOTHING, content or
-    // management (`move`, `delete`, `transfer`, `members.manage`, `board.edit`), so a manage-only admin sees and controls none of it. What counts is the owner (a Space-scope source), board-scope sources (a grant, an invite, a
-    // link: each gives what it gives) and a Unit admin WITH board-content access (the admin source whose role carries a ladder). TECH-DEBT rows 66 and 67; PROTOCOL.md § Organization.
-    const dead = personal && scope.type === "unit" && !(kind === "unit" && role !== MEMBER_ROLE_ID && def.ladder != null);
-    sources.push({ kind, scope, role, ...(team ? { team } : {}), permissions: dead ? [] : [...def.permissions].filter(p => keep.has(p)), ladder: dead ? null : def.ladder });
+    // A personal space and its boards belong to their owner: on them every Unit-scope source (the member role, a Unit-wide grant, a Unit Team's grant, the admin role) gives NOTHING, content or management
+    // (`move`, `delete`, `transfer`, `members.manage`, `board.edit`), so a manage-only admin sees and controls none of it. What counts is the owner (a Space-scope source), board-scope sources (a grant, an invite, a
+    // link: each gives what it gives) and a Unit-scope source holding the content tier. The tier (permissions.js `tierReach`): `content.personal` opens personal spaces as the owner would; `content.shared` opens
+    // every shared board as board owner. TECH-DEBT rows 66 and 67; PROTOCOL.md § Organization, § Admin levels.
+    const tier = scope.type === "unit" && role !== MEMBER_ROLE_ID ? tierReach(def.permissions, personal) : null;
+    const dead = personal && scope.type === "unit" && !tier;
+    const perms = dead ? [] : [...new Set([...def.permissions, ...(tier?.perms ?? [])])].filter(p => keep.has(p));
+    sources.push({ kind, scope, role, ...(team ? { team } : {}), permissions: perms, ladder: dead ? null : higher(def.ladder, tier?.ladder ?? null), ...(tier ? { content: tier.via } : {}) });
   };
   /** Grants on a Space, Group or the Unit, or a Team's grant anywhere, count only for the inside; and never the Unit roles `admin` and `member`. */
   const grantsOn = scope => {

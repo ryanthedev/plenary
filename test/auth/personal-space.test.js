@@ -12,10 +12,10 @@ const ORIGIN = "https://plenary.test";
 let r, acme, diary, adaSp, rootSp, plain, content, ten;
 const ada = { user: "dev:ada", name: "ada", email: "ada@acme.com", domain: "acme.com" }, root = { user: "dev:root", name: "root", email: "root@acme.com", domain: "acme.com" };
 
-async function mkRoutes(adminBoardContent) {
-  const t = makeTenancy({ registry: r, adminBoardContent });
-  const dev = devAuth({ enabled: true, tokens: { ada: { name: "ada", domain: "acme.com", email: "ada@acme.com" }, root: { name: "root", domain: "acme.com", email: "root@acme.com" }, bo: { name: "bo", domain: "acme.com", email: "bo@acme.com" } } });
-  const routes = httpRoutes({ registry: r, sessions: await makeSessions({ key: "s".repeat(32) }), tenancy: t, adminBoardContent,
+async function mkRoutes() {
+  const t = makeTenancy({ registry: r });
+  const dev = devAuth({ enabled: true, tokens: { ada: { name: "ada", domain: "acme.com", email: "ada@acme.com" }, root: { name: "root", domain: "acme.com", email: "root@acme.com" }, bo: { name: "bo", domain: "acme.com", email: "bo@acme.com" }, chief: { name: "chief", domain: "acme.com", email: "chief@acme.com" } } });
+  const routes = httpRoutes({ registry: r, sessions: await makeSessions({ key: "s".repeat(32) }), tenancy: t,
     config: { cookieKey: "k".repeat(32), postLoginUrl: ORIGIN + "/", boardUrl: ORIGIN + "/b/{board}", publicUrl: ORIGIN }, dev });
   let n = 0;
   return async (tok, path, method = "GET", body) => {
@@ -25,12 +25,13 @@ async function mkRoutes(adminBoardContent) {
 }
 beforeEach(async () => {
   r = memoryRegistry();
-  acme = await r.createTenant({ domain: "acme.com", admins: ["dev:root"] });
-  for (const p of [ada, root, { user: "dev:bo", name: "bo", email: "bo@acme.com" }]) await r.touchMember(acme.id, { user: p.user, name: p.name, email: p.email });
+  acme = await r.createTenant({ domain: "acme.com", admins: ["dev:root", "dev:chief"] });
+  await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: "dev:chief" }, role: "content-admin-personal" });   // chief: a Unit admin WITH the content tier; root: manage-only
+  for (const p of [ada, root, { user: "dev:chief", name: "chief", email: "chief@acme.com" }, { user: "dev:bo", name: "bo", email: "bo@acme.com" }]) await r.touchMember(acme.id, { user: p.user, name: p.name, email: p.email });
   adaSp = await r.ensurePersonalSpace(acme.id, ada.user);
   diary = await r.createBoard({ tenant: acme.id, title: "Diary", space: adaSp.id, owner: ada.user, memberRole: null });
   rootSp = await r.createSpace({ tenant: acme.id, name: "Root's", generalRole: null, owner: root.user });
-  plain = await mkRoutes(false); content = await mkRoutes(true); ten = makeTenancy({ registry: r });
+  plain = await mkRoutes(); content = plain; ten = makeTenancy({ registry: r });
 });
 const attacks = api => [
   ["move options", () => api("root", `/boards/${diary.id}/move`)],
@@ -71,10 +72,10 @@ test("the owner still moves, renames, shares and trashes their own personal boar
   expect(await plain("ada", `/boards/${diary.id}/trash`, "POST", { from: adaSp.id })).toBe(200);
 });
 test("a content-access admin (board content on) still moves, grants, shares and renames; and a manage-only admin still manages a SHARED-space board", async () => {
-  expect(await content("root", `/boards/${diary.id}/move`)).toBe(200);
-  expect(await content("root", `/boards/${diary.id}/grants/dev:bo`, "PUT", { role: "viewer" })).toBe(204);
-  expect(await content("root", `/boards/${diary.id}/links`, "POST", { role: "viewer", expiresAt: null })).toBe(201);
-  expect(await content("root", `/boards/${diary.id}`, "PATCH", { title: "ok" })).toBe(200);
+  expect(await content("chief", `/boards/${diary.id}/move`)).toBe(200);
+  expect(await content("chief", `/boards/${diary.id}/grants/dev:bo`, "PUT", { role: "viewer" })).toBe(204);
+  expect(await content("chief", `/boards/${diary.id}/links`, "POST", { role: "viewer", expiresAt: null })).toBe(201);
+  expect(await content("chief", `/boards/${diary.id}`, "PATCH", { title: "ok" })).toBe(200);
   const shared = await r.createBoard({ tenant: acme.id, title: "Shared", space: rootSp.id, owner: ada.user, memberRole: null });
   const other = await r.createSpace({ tenant: acme.id, name: "Other", generalRole: null, owner: ada.user });
   await r.setScopedGrant({ scope: { type: "space", id: other.id }, subject: { type: "user", id: root.user }, role: "owner" });

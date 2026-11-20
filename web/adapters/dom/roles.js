@@ -55,7 +55,7 @@ export function mountRolesPage({ root, model, hrefs, signIn = null }) {
         ? h("td", {}, h("span", {}, r.ticked ? "Yes" : "No"), h("small", {}, " set by board access"))
         : h("td", {}, keys.mark(ctl(h("input", { type: "checkbox", checked: r.ticked, "aria-label": `${r.label}, ${r.id}`, "aria-disabled": r.tickable ? "false" : "true",
           onclick: e => { if (!r.tickable || S.busy) { e.preventDefault?.(); return; } model.toggle(r.id); } })), `perm:${r.id}`));
-      return h("tr", {}, h("th", { scope: "row" }, r.label, h("br"), h("code", {}, r.id)), grant,
+      return h("tr", {}, h("th", { scope: "row" }, r.label, h("br"), h("code", {}, r.id), r.help ? h("br") : null, r.help ? h("small", {}, r.help) : null), grant,
         r.cells.map(c => h("td", {}, h("span", { "aria-hidden": "true" }, CELL[c.state][0]), h("span.sr-only", {}, `${SCOPE_LABEL[c.scope]}: ${CELL[c.state][1]}`))));
     });
     return h("div.matrix-scroll", { role: "region", "aria-label": "Permission matrix", tabindex: "0" },
@@ -104,7 +104,7 @@ export function mountRolesPage({ root, model, hrefs, signIn = null }) {
     const p = S.page;
     replace(main, h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " /"),
       h("div.sp-head", {}, keys.mark(h("h1", { id: "page-title", tabindex: "-1" }, "Roles"), "heading"), h("span.badge", {}, "Organization")),
-      h("p.muted", {}, "A role is a board access step plus management permissions. The server checks permissions, never role names."),
+      h("p.muted", {}, "A role is a board access step plus management permissions, and for the whole organization optionally the content tier (opening shared or personal boards). The server checks permissions, never role names."),
       h("ul.rows", { "aria-label": "Roles" }, p.roles.map(listItem)),
       p.roles.every(r => r.kind !== "custom") ? message("No custom roles yet.", "Built-in roles cover most needs. Duplicate one to make your own.") : null,
       detail());

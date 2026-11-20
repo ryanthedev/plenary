@@ -147,7 +147,8 @@ describe("a personal-space board is its owner's (TECH-DEBT 67)", () => {
   });
   test("a content-access admin (board content on) may, like the owner; and a manage-only admin still moves a SHARED-space board", async () => {
     const dst = await rootSpace();
-    const ten2 = makeTenancy({ registry: r, adminBoardContent: true });
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: root.user }, role: "content-admin-personal" });
+    const ten2 = makeTenancy({ registry: r });
     const mv2 = moveService({ registry: r, tenancy: ten2, spaces: spaceService({ registry: r, tenancy: ten2 }) });
     expect(mayMove(await ten2.effective(root, board.id))).toBe(true);
     expect((await mv2.move(root, board.id, { from: adasSpace.id, to: dst.id })).moved).toBe(true);

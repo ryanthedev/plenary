@@ -102,13 +102,27 @@ export function normAdmin(a, domain) {
 }
 
 /**
- * @param {{ registry: Registry, domain: string, admins?: string[] }} o
- * @returns {Promise<{ tenant: Tenant, created: boolean, added: string[] }>}  `added`: admins this call added
+ * A user id that may hold a content-tier role (#88): `google:<sub>` or `dev:<name>`. An `email:` name is refused: a grant is held by a user id (the admin list alone matches by email before first sign-in).
+ * @param {unknown} a
  */
-export async function bootstrapTenant({ registry, domain, admins = [] }) {
+export function normContentAdmin(a) {
+  const s = normAdmin(a);
+  if (s.startsWith("email:")) throw new BootstrapError(`a content admin is named by user id (google:<sub> or dev:<name>), not an email: ${shown(a)}`);
+  return s;
+}
+
+/**
+ * @param {{ registry: Registry, domain: string, admins?: string[], contentAdmins?: string[], contentAdminsPersonal?: string[] }} o
+ *   contentAdmins / contentAdminsPersonal: users given the built-in Unit role `content-admin` (every shared Space's boards) or `content-admin-personal` (those and personal spaces) at the Unit. The content tier can be
+ *   passed on only by a holder (PROTOCOL.md § Admin levels), so this operator step is the one way the first holder appears. Additive like `admins`: it never removes a grant or replaces any other role (a user already
+ *   on `content-admin` is raised to `content-admin-personal` when asked).
+ * @returns {Promise<{ tenant: Tenant, created: boolean, added: string[], content: string[] }>}  `added`: admins this call added; `content`: users whose content-tier grant this call set
+ */
+export async function bootstrapTenant({ registry, domain, admins = [], contentAdmins = [], contentAdminsPersonal = [] }) {
   const d = normDomain(domain);
-  if (!Array.isArray(admins)) throw new BootstrapError("admins must be a list");
+  if (!Array.isArray(admins) || !Array.isArray(contentAdmins) || !Array.isArray(contentAdminsPersonal)) throw new BootstrapError("admins and content admins must be lists");
   const want = [...new Set(admins.map(a => normAdmin(a, d)))];
+  const shared = [...new Set(contentAdmins.map(normContentAdmin))], personal = [...new Set(contentAdminsPersonal.map(normContentAdmin))];
 
   let t = await registry.tenantByDomain(d), created = false;
   if (!t) {
@@ -126,5 +140,13 @@ export async function bootstrapTenant({ registry, domain, admins = [] }) {
     await registry.addTenantAdmin(t.id, a);
     added.push(a);
   }
-  return { tenant: (await registry.tenant(t.id)) ?? t, created, added };
+  const content = [];
+  const scope = { type: "unit", id: t.id };
+  for (const [users, role] of [[shared, "content-admin"], [personal, "content-admin-personal"]]) for (const user of users) {
+    const subject = { type: "user", id: user }, cur = await registry.scopedGrant(scope, subject);
+    if (cur === role || (cur != null && !(cur === "content-admin" && role === "content-admin-personal"))) continue;   // additive: another role (or a higher tier) stays
+    await registry.setScopedGrant({ scope, subject, role });
+    content.push(user);
+  }
+  return { tenant: (await registry.tenant(t.id)) ?? t, created, added, content };
 }

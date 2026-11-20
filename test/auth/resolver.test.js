@@ -125,7 +125,7 @@ describe("the Unit", () => {
     const a = resolveAccess({ ctx: at("unit") }, unitAdmin, T);
     expect(a.ladder).toBe(null);
     expect([...a.permissions].sort()).toEqual([...MGMT_PERMS].sort());
-    expect(resolveAccess({ ctx: at("unit") }, unitAdmin, T, { adminBoardContent: true }).ladder).toBe("owner");
+    expect(a.sources.every(x => x.content === undefined)).toBe(true);
   });
 
   test("permissions are clipped to the target asked about: an admin asked about a board or Space has no roles.manage", () => {
@@ -265,7 +265,7 @@ describe("permissions.js", () => {
     const roles = new Map([["r-1", { id: "r-1", permissions: [...MGMT_PERMS], boardRole: "editor" }], ["r-2", { id: "r-2", permissions: ["delete"], boardRole: "owner" }]]);
     for (const scope of ["unit", "group", "space", "board"]) {
       const d = roleDef("r-1", scope, roles);
-      expect([...d.permissions].filter(p => MGMT_PERMS.includes(p)).sort()).toEqual([...ALLOWED_AT[scope]].sort());
+      expect([...d.permissions].filter(p => MGMT_PERMS.includes(p)).sort()).toEqual(ALLOWED_AT[scope].filter(p => MGMT_PERMS.includes(p)).sort());
       expect(d.ladder).toBe("editor");
     }
     expect(roleDef("r-2", "space", roles).ladder).toBe(null);     // a stored "owner" board role is not trusted

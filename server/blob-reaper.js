@@ -56,7 +56,7 @@ export function blobReaper({ store, blobs, clock = { now: Date.now }, log = { wa
       if (forGood) await blobs.delete(tenant, sha1); else await blobs.restore(tenant, sha1);
       // The row stayed through the delete or the restore, so a failure above is retried by the next claim; only now does it go.
       const clean = await store.blobReaped(tenant, sha1, forGood ? { deleted: true } : { restored: true });
-      if (forGood) touched.add(tenant);
+      touched.add(tenant);   // a delete frees bytes; a restore can land between a concurrent usage read's two walks (it counts the quarantine in one, the live folder in the other)
       if (!clean) { say("error", "blob reaped under a new reference: a board references a picture whose bytes are gone; a client that holds it uploads it again", { tenant, sha1 }); return "raced"; }
       return forGood ? "deleted" : "revived";
     } catch (err) { say("warn", "blob reap failed; a later sweep retries it", { tenant, sha1, err }); return "failed"; }

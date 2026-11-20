@@ -5,9 +5,10 @@
 // SIGKILL escalation, the health-wait timeout, secrets absent from logs/; and from p8-rig3:
 // a failing ps refuses instead of reading as "gone", one `up` per dir (lock), a moved rig's paths, the real main.js e2e.
 import { test, expect, afterAll, describe } from "bun:test";
-import { rmSync, readFileSync, writeFileSync, existsSync, statSync, readdirSync, mkdirSync, renameSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, statSync, readdirSync, mkdirSync, renameSync, chmodSync } from "node:fs";
 import { join } from "node:path";
-import { stopRig, rigStatus, killNode, readRig, isOurs, psInfo, TERMINAL_SIGNALS, STARTED_CLOCK, portFree, missingBins, _setPsPath, _setIpcPaths, _setLockHook, pgShmOf, removeOrphanShm, parseIpcsSegments, s3Env, parseArgs } from "../../scripts/cluster-rig.js";
+import { tmpdir } from "node:os";
+import { waitFor, stopRig, rigStatus, killNode, readRig, isOurs, psInfo, TERMINAL_SIGNALS, STARTED_CLOCK, portFree, missingBins, _setPsPath, _setIpcPaths, _setLockHook, pgShmOf, removeOrphanShm, parseIpcsSegments, s3Env, parseArgs } from "../../scripts/cluster-rig.js";
 import { freshDir, track, rigUp as startRig, spawnTracked, cleanupAll, CLEANUP_TIMEOUT_MS, killRecorded, namingDir } from "./rig-guard.js";
 
 const ROOT = new URL("../..", import.meta.url).pathname;
@@ -47,6 +48,24 @@ test("S3 environment output includes every setting consumed by the blob adapter"
     "S3_ENDPOINT=http://127.0.0.1:9000", "S3_BUCKET=plenary", "S3_REGION=us-east-1",
     "S3_ACCESS_KEY_ID=local-key", "S3_SECRET_ACCESS_KEY=local-secret",
   ]);
+});
+
+test("waitFor: a service that died, and one that never gets ready, report the tail of their log (down --clean removes the log)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "plenary-rig-")), log = join(dir, "minio.log");
+  try {
+    writeFileSync(log, "x".repeat(5000) + '\nERROR Missing credential environment variable "MINIO_ROOT_PASSWORD"\n');
+    const gone = Bun.spawnSync(["true"]).pid ?? 99_999, dead = { name: "minio", pid: gone, started: null, log };   // an exited process, a dead record: not ours
+    const died = await waitFor(() => false, { what: "minio", proc: dead, deadline: Date.now() + 5000 }).catch(e => e);
+    expect(died.message).toMatch(/minio: the process exited before it was ready \(log: .*minio\.log\)/);
+    expect(died.message).toContain('Missing credential environment variable "MINIO_ROOT_PASSWORD"');
+    expect(died.message.length).toBeLessThan(700);                                 // the tail only, never the whole log
+    const late = await waitFor(() => false, { what: "minio", proc: null, deadline: Date.now() - 1 }).catch(e => e);
+    expect(late.message).toBe("minio: not ready after the timeout (log: n/a)");    // no proc, no log, no tail
+    const slow = await waitFor(() => false, { what: "minio", proc: { ...dead, pid: process.pid, started: psInfo(process.pid).started }, deadline: Date.now() - 1 }).catch(e => e);
+    expect(slow.message).toContain("not ready after the timeout");
+    expect(slow.message).toContain("MINIO_ROOT_PASSWORD");                         // the timeout branch carries the tail too
+    expect(await waitFor(() => true, { what: "x", proc: dead, deadline: 0 })).toBeUndefined();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("rig CLI parses down-all and clean as independent flags", () => {

@@ -87,7 +87,11 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
       st.ready = Promise.resolve(blobs.usage(tenant)).then(n => {
         if (seq === st.seq) { st.used = n + st.sinceRead; st.at = now(); st.reading = false; }
         else st.used = Math.max(st.used, n);
-      }, err => { if (seq === st.seq) { st.ready = null; st.reading = false; } throw err; });
+      }, err => {
+        if (seq !== st.seq && st.ready) return st.ready;   // superseded: whoever waited on this read follows the current one (its failure, if any, is theirs)
+        if (seq === st.seq) { st.ready = null; st.reading = false; }
+        throw err;
+      });
     }
     return st.ready.then(() => st);
   }

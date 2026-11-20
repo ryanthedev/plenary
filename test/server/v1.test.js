@@ -247,20 +247,18 @@ test("a board feed picks up the host's checkpoint written just after the entries
   await r.stop();
 }, 20000);
 
-test("§ Pacing: frames read from a live socket faster than they are handled are capped in bytes: past maxLiveQueuedBytes, `unavailable` and close", async () => {
-  // One TCP write of 300 frames of ~1 KB: Bun hands them to the gateway back to back, before its pump handles one.
+test("§ Pacing (real socket): one frame bigger than maxLiveQueuedBytes gets `unavailable` and close 1013, a bystander on the board is untouched", async () => {
+  // One frame over the cap overflows however the kernel chunks the read (no burst, no race with the pump): the live cap
+  // over a real socket, the error frame and the close code. The burst-of-small-frames case is test/server/pacing-queue.test.js.
   const r = await rig({ limits: { maxLiveQueuedBytes: 32 * 1024 } });
-  const s = await rawSock(r.server.wsUrl, { frames: true }); s.send(hello(r, "editor"));
-  s.read();
-  await until(() => s.texts.some(t => t.includes('"welcome"')), "the welcome");
-  const pad = "x".repeat(1000);
-  const burst = Array.from({ length: 300 }, (_, i) => ({ t: "presence", k: "cursor", x: i, y: 0, pad }));
-  for (const m of burst) s.send(m);
-  await s.closed;
-  expect(s.texts.map(t => JSON.parse(t)).filter(m => m.t === "error")).toEqual([{ t: "error", code: "unavailable", message: "too much sent at once" }]);
-  expect(r.logs().some(l => l.msg === "frame queue overflow" && l.state === "live")).toBe(true);
-  // A well-behaved client on the same board is untouched.
+  const s = await r.sock(); s.send(hello(r, "editor")); await s.next(m => m.t === "welcome");
   const ok = await r.sock(); ok.send(hello(r, "viewer")); await ok.next(m => m.t === "welcome");
+  s.send({ t: "presence", k: "cursor", x: 1, y: 0, pad: "x".repeat(40 * 1024) });
+  expect((await s.whenClosed(5000)).code).toBe(1013);                       // a short deadline: with no cap this fails here, not after 30 s
+  expect(s.msgs.filter(m => m.t === "error")).toEqual([{ t: "error", code: "unavailable", message: "too much sent at once" }]);
+  expect(r.logs().some(l => l.msg === "frame queue overflow" && l.state === "live")).toBe(true);
+  ok.send({ t: "presence", k: "cursor", x: 2, y: 0 });                      // the bystander still talks, and is still connected
+  await sleep(50);
   expect(ok.closed).toBe(null);
   await r.stop();
 }, 20000);

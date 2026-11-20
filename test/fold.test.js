@@ -258,19 +258,19 @@ test("an abort mid-adopt drops the shadow: the next job adopts the checkpoint af
   expect(fromCp(d.log, d.log.checkpoints.at(-1), { board: "b1", tenant: "t1" })).toEqual(stateAt(d.log, 12, { board: "b1", tenant: "t1" }));
 });
 
-test("DW: the step cap holds in BYTES: big-element entries (600 KB point-array strokes) and a thousand clients' op-id table each stay under the cap", () => {
+test("DW: the step cap holds in BYTES: big-element entries (~180 KB point-array strokes, each over a whole step) and a thousand clients' op-id table each stay under the cap", () => {
   const m = manual(), d = direct(undefined, { auto: false, schedule: m.schedule });
-  const pad = null, stroke = id => rect(id, { points: Array.from({ length: 30_000 }, (_, k) => [k * 1.37 + 0.123, k * 0.91 + 0.456]) });   // ~600 KB of point array: what a freehand stroke is
+  const pad = null, stroke = id => rect(id, { points: Array.from({ length: 9_000 }, (_, k) => [k * 1.37 + 0.123, k * 0.91 + 0.456]) });   // ~180 KB of point array: a freehand stroke, sized to be over one step (8192 units = 128 KB) and no more: the cap is proved by units, so a bigger stroke only costs time
   const a = d.join("ua", "editor", "a");
   for (let i = 1; i <= 20; i++) a.op(i, "board", { elements: [stroke(`stroke${i}`)] });
   for (let c = 0; c < 1000; c++) { const j = d.join("u" + c, "editor", "k" + c); j.op(1, "board", { elements: [rect(`k${c}`)] }); }
   d.room.checkpoint();                                         // a base with 1,020 op-id records ...
-  for (let i = 21; i <= 40; i++) a.op(i, "board", { elements: [stroke(`stroke${i}`)] });   // ... and a tail of 12 MB
+  for (let i = 21; i <= 40; i++) a.op(i, "board", { elements: [stroke(`stroke${i}`)] });   // ... and a tail of ~3.6 MB
   d.room.startCheckpoint(); m.drain();
   const cap = FOLD_STEP_UNITS + 16 + JSON.stringify(stroke("x")).length / 16;             // one entry past the budget is the most a step can overshoot by
   expect(d.room.folder.maxUnits).toBeLessThanOrEqual(cap);
-  expect(d.room.folder.maxUnits).toBeGreaterThan(FOLD_STEP_UNITS);   // (a 600 KB entry alone is over a step: it is a step of its own)
-  expect(d.room.folder.steps).toBeGreaterThan(20);             // 12 MB of tail was spread over many steps, not one
+  expect(d.room.folder.maxUnits).toBeGreaterThan(FOLD_STEP_UNITS);   // (a ~180 KB entry alone is over a step: it is a step of its own)
+  expect(d.room.folder.steps).toBeGreaterThan(20);             // 3.6 MB of tail was spread over many steps, not one
   expect(fromCp(d.log, d.log.checkpoints.at(-1), { board: "b1", tenant: "t1" })).toEqual(stateAt(d.log, 1040, { board: "b1", tenant: "t1" }));
 });
 

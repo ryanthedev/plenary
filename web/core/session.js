@@ -310,7 +310,7 @@ export function createSession({ join, token, board, client = "web", tab = null, 
   const stored = new Map();
   /** Pictures waiting for the app to upload them (see `unsavedFiles`): fileId → file. */
   const offers = new Map();
-  /** Image elements this client placed whose op may not be acknowledged yet: elementId → { stream, fileId } (see the re-offer on every `live`). */
+  /** Image elements this client placed whose op may not be acknowledged yet: elementId → { stream, fileId } (see `unsavedFiles`). */
   const awaiting = new Map();
   /** Offers `fileId`'s bytes for upload unless this client put or fetched it within BLOB_PENDING_MS. */
   const offerFile = (ed, fileId, t) => {
@@ -323,7 +323,7 @@ export function createSession({ join, token, board, client = "web", tab = null, 
    * is already there): offer its picture for upload unless this client put or fetched it within BLOB_PENDING_MS. The server may have deleted a picture
    * no board used for a while (PROTOCOL.md § Blobs, "References and purge"), and the bytes of a pasted selection or a library item never travel in
    * ops, so the client that places them puts them again. The element is remembered until the room sequences it: an op sent offline is resent on
-   * reconnect without passing here, so every `live` offers its picture again (same age rule).
+   * reconnect without passing here, so its acknowledgement offers the picture again (same age rule; see `unsavedFiles`).
    */
   const offerPlaced = (stream, ed, op) => {
     const t = stamp();
@@ -333,19 +333,32 @@ export function createSession({ join, token, board, client = "web", tab = null, 
       awaiting.set(el.id, { stream, fileId: el.fileId });
       offerFile(ed, el.fileId, t);
     }
-    if (awaiting.size > 500) for (const [id, w] of awaiting) if (C.sequenced(w.stream, id)) awaiting.delete(id);
+    if (awaiting.size > 500) for (const [id, w] of awaiting) if (!stillAwaited(id, w)) awaiting.delete(id);
   };
-  statusFns.add(st => {
-    if (st !== "live") return;
-    const t = stamp();
-    for (const [id, w] of awaiting) { if (C.sequenced(w.stream, id)) awaiting.delete(id); else offerFile(eds[w.stream], w.fileId, t); }
-  });
+  /** Is this placed picture still waiting for its op to be sequenced? No when the room did, when it refused the op (the link's copy of the element is gone), or when the Editor no longer shows the element. */
+  const stillAwaited = (id, w) => {
+    if (C.sequenced(w.stream, id)) return false;
+    const mine = eds[w.stream].doc.get(id);
+    return !!mine && !mine.isDeleted && mine.fileId === w.fileId && C.element(w.stream, id)?.fileId === w.fileId;
+  };
   /**
    * Pictures the app should put now: each placed by this client's own op (a pasted selection, a library item, a duplicate), bytes held, not put
    * or fetched by this client for BLOB_PENDING_MS. Asked every frame; empty when nothing was placed (nothing walks the documents).
    * @returns {object[]} files as `net.put` takes them
    */
-  s.unsavedFiles = () => { if (!offers.size) return []; const out = [...offers.values()]; offers.clear(); return out; };
+  s.unsavedFiles = () => {
+    // The pictures this client placed wait for their ops to be sequenced (acknowledged, also after a reconnect that resent them without passing the Editor):
+    // then the same age rule applies. A refused op is never sequenced and its element leaves the link's copy: dropped, never offered.
+    if (awaiting.size) {
+      const t = stamp();
+      for (const [id, w] of awaiting) {
+        if (C.sequenced(w.stream, id)) { awaiting.delete(id); offerFile(eds[w.stream], w.fileId, t); }
+        else if (!stillAwaited(id, w)) awaiting.delete(id);
+      }
+    }
+    if (!offers.size) return [];
+    const out = [...offers.values()]; offers.clear(); return out;
+  };
   /**
    * Live image elements, in either Editor, whose bytes neither Editor holds: Map fileId → stamp. The stamp names what the
    * documents say about that file (its elements and their versions), so a net can tell "a change touched this picture"

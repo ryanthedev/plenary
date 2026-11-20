@@ -296,14 +296,12 @@ whose `compose.yml` is unchanged.
 | `nats` | `nats:2.15.3-alpine` | Bus, NATS core (no JetStream). Config `cluster/nats.conf` raises `max_payload` to 2 MB, as PROTOCOL.md asks. |
 | `blobs` | `pgsty/minio:RELEASE.2026-08-04T00-00-00Z` | S3-compatible blobs. MinIO stopped publishing `minio/minio` on Docker Hub; this is a community-maintained MinIO fork. |
 | `blobs-init` | same | One shot: creates the bucket (`S3_BUCKET`, default `plenary`), then exits. |
-| `app-1` | built from `Dockerfile` | `server/main.js`, roles `gateway,host`. No published ports. |
-| `app-2` | same | Roles `gateway` only. |
-| `app-3` | same | Roles `host` only: never behind the load balancer. |
-| `lb` | `caddy:2.11.9-alpine` | Routes `/ws` (WebSocket) and `/health` to the **gateway** nodes only (`app-1`, `app-2`), round robin with health checks; everything else is 404. The only published port: `127.0.0.1:8090` (`PLENARY_LB_PORT`). |
+| `app-1`, `app-2`, `app-3` | built from `Dockerfile` | `server/main.js`, each with roles `gateway,host` (set explicitly), so any node can take over a killed host's boards. No published ports. |
+| `lb` | `caddy:2.11.9-alpine` | Proxies every path (`/ws`, `/health`, the HTTP API, the web app) to the three nodes, round robin with health checks. The only published port: `127.0.0.1:8090` (`PLENARY_LB_PORT`). |
 
 **Roles.** `PLENARY_ROLES` is a comma list of `gateway` (holds client sockets, fans out) and `host` (sequences
-boards), default `gateway,host`. The stack runs two gateways and two room hosts, so "gateways separate from room
-hosts" is exercised and a killed host's boards have another host to move to. `PLENARY_NODE_ID` is unique per node
+boards), default `gateway,host`. All three nodes hold both roles, so a killed host's boards have two other hosts to move to
+(`bun run test:compose` kills one). Role-split shapes: the native rig's `--hosts`. `PLENARY_NODE_ID` is unique per node
 and stable across that node's restarts (a fixed value per service).
 
 **Cluster env** (names confirmed by engine; Compose sets them): `DATABASE_URL`, `NATS_URL`, `S3_ENDPOINT`, `S3_BUCKET`,
@@ -344,10 +342,56 @@ docker compose -f deploy/cluster.compose.yml down          # add -v to delete th
 **What is missing:**
 
 - **Blobs.** Nothing in `server/` writes blobs yet, so the S3-compatible store is not exercised by the server.
-- **Takeover on this stack.** Leases and takeover are built and tested (and run on the local rig,
-  `deploy/cluster/RIG.md`); the "kill a board's host" check has not been run on this Compose file.
+- **Takeover on this stack:** run by `bun run test:compose` (below), on Podman; not yet on Docker.
 - **Run once, on Podman, not Docker (2026-11-12, p8-cookie).** With `COOKIE_KEY` set, all three app nodes start in
   cluster mode and the load balancer answers `/health` with 200. Docker Compose 5.1.3 against Podman 5.8.2's API split the
   exec-form app healthcheck at its first space and marked the nodes unhealthy (which of the two splits it is not
   isolated), so that run used a local override with a `CMD-SHELL` healthcheck.
   Not yet run on Docker itself.
+
+### Cluster test on containers (`bun run test:compose`, #71)
+
+For agents. `scripts/test-compose.js` runs the cluster file plus `deploy/cluster.compose.test.yml` (override) and checks
+the real protocol end to end. Never part of `bun test` or `bun run test:cluster` (heavy: builds an image, nine containers).
+Takes about 40 s warm.
+
+- **Runtime:** `docker` (with `docker compose`) else `podman`; `CONTAINER_CLI=docker|podman|<path>` forces one (a path that
+  does not exist is reported as not found). For podman it runs `docker-compose` (else `podman compose`) with `DOCKER_HOST` set
+  to podman's API socket (macOS: from `podman machine inspect`; Linux: `podman info`), unless `DOCKER_HOST` is already set.
+  No runtime or no Compose: a loud `SKIPPED test:compose` banner on stderr and exit 0; `--require` or
+  `PLENARY_COMPOSE_REQUIRE=1` makes that exit 1. Exit codes: 0 pass, 1 fail, 124 a deadline or command timed out, 130 interrupted.
+- **Isolation:** project `plenary-c3-<pid>-<6 random hex>` and the same name as image tag (unique per run, so two runs with one pid on a shared daemon never collide; nothing parses the name, leftovers are found by the owner label), random secrets per run, host ports random on
+  127.0.0.1 (read with `compose port`; never 8099 or any fixed port). The cluster file itself runs all three nodes as
+  `gateway,host`; the override adds only the random ports, `PLENARY_LEASE_TTL_MS=3000`, `restart: "no"` (the test decides when
+  a node returns), CPU/memory limits and owner labels. The `lb` service is not started (clients connect to the nodes
+  directly). The script renices itself (19).
+- **What it checks, with bounded waits only (health, lease epoch read from Postgres, op counts; no fixed sleeps):**
+  1. two editors on two gateways write 60 ops to one board: the Postgres log has seq 1..60, no gap, no duplicate id; a viewer
+     on the third node (welcome role `viewer`, asserted) holds all 60; an op the viewer sends is refused `forbidden` and
+     appends nothing;
+  2. five failure cases, each while both editors stream 30 ops/s, each ending with the invariants below:
+     a. SIGKILL the board's host (it has clients); a survivor takes the lease at a higher epoch (about 3 s); the node is
+        restarted afterwards and serves a new client;
+     b. SIGKILL the new host and start it again at once (`restart: unless-stopped` racing the takeover): the lease epoch
+        only rises and no epoch has two holders;
+     b2. SIGKILL all three nodes, start only the old host: nobody else can take the lease, so the restarted node wins it
+        back (deterministic; the whole cluster restarting on the Postgres state); then the other two are started;
+     c. SIGKILL the host with no client on it (clients moved off first);
+     d. SIGKILL a non-host gateway with clients: no takeover, the lease epoch and holder do not change.
+  3. the lease is polled every 50 ms through each case: epochs only rise and no epoch has two holders;
+  4. invariants: the log read right after the takeover (before any resend) holds every op acked before the kill; at the
+     end the log has no gap or duplicate, every ack ever seen is in it at its acked seq, and every client's full state
+     (canonical JSON of its elements, sorted by id) equals the state folded from the log. Ops never acked and not in the
+     log are counted (`neverAckedLost`; the Replica resends pending ops, so 0 is normal).
+- **Teardown on every exit path** (pass, fail, 12 min deadline, SIGINT/SIGTERM/SIGHUP; handlers are installed before anything
+  starts; the `down` runs detached so a terminal Ctrl-C cannot cut it, and running commands are killed on abort):
+  `down -v --remove-orphans`, `rmi` of the image it built, then a check that no container, volume or network labelled with
+  the project and no image tag remains; leftovers fail the run.
+- **Leftovers of a SIGKILLed run:** every container, network, volume and image carries the label
+  `plenary.c3.owner=machine-id|boot|pid|process-start` (machine id: macOS IOPlatformUUID, Linux /etc/machine-id; so a renamed host keeps its leftovers sweepable). Every run (and `bun scripts/test-compose.js --sweep`) first removes what
+  carries that label from this machine when its owner is provably dead: pid gone, or the pid now has another process start time
+  (a reused pid, image included; Linux: boot id + /proc/<pid>/stat field 22; macOS: `ps lstart` within 5 s). A boot id or clock
+  change alone is never proof. It never touches another machine's, a live owner's, or anything on doubt.
+- **On failure** it prints the last container log lines before teardown. `--keep-image` keeps the built image.
+- **CI (not set up):** a job on a runner with docker would run `PLENARY_COMPOSE_REQUIRE=1 bun run test:compose`; GitHub's
+  runners have docker and compose, and the first run pulls four images.

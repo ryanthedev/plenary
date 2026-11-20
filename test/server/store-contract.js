@@ -308,16 +308,16 @@ export function storeContract(name, make) {
     });
 
     test("parts: a stale write's header landing while a sweep is yielding keeps its parts; the checkpoint under the newest reads complete", async () => {
-      let gateA = null, holdA = false, swept = false, slowDone = null;
+      let gateA = null, holdA = false, swept = false, slowDone = null, atHeader = null;
       const { store, raw } = await fresh({ partChars: PART, onPart: async step => {
-        if (holdA && step === "header") { holdA = false; await gateA.promise; return; }
+        if (holdA && step === "header") { holdA = false; atHeader.resolve(); await gateA.promise; return; }
         if (step === "sweep" && slowDone && !swept) { swept = true; gateA.resolve(); await slowDone; }   // seq 25's header commits between the sweep's steps
       } });
       const e = await own(store);
       await raw.putPartRow(T, B, 5, "crashed-wid", 0, "x");                              // a second orphan group, so the sweep has steps
-      gateA = Promise.withResolvers(); holdA = true;
+      gateA = Promise.withResolvers(); atHeader = Promise.withResolvers(); holdA = true;
       slowDone = store.putCheckpoint(T, B, big(25, "late"), e);                          // every part written, header held back
-      await Bun.sleep(30);
+      await atHeader.promise;                                                            // wait on the hook, not a guessed delay: the first write to reach "header" is the one held
       await store.putCheckpoint(T, B, big(30, "newest"), e);                             // lands, and sweeps seq 25's group as an orphan
       expect(swept).toBe(true);
       await slowDone;                                                                    // its header is in
@@ -353,13 +353,14 @@ export function storeContract(name, make) {
     });
 
     test("parts: a late write never hides a newer checkpoint; one overtaken mid-write may be refused as unavailable, and leaves nothing", async () => {
-      let gate = null, hold = false;
-      const { store, raw } = await fresh({ partChars: PART, onPart: async step => { if (hold && step === "part:1") { hold = false; await gate.promise; } } });
+      let gate = null, hold = false, reached = null;
+      const { store, raw } = await fresh({ partChars: PART, onPart: async step => { if (hold && step === "part:1") { hold = false; reached.resolve(); await gate.promise; } } });
       const e = await own(store);
       // A slow write of seq 10 is still between its parts while seq 20 lands (and sweeps the parts nobody names).
-      gate = Promise.withResolvers(); hold = true;
+      // Wait for the slow write to be held (not a guessed delay: under load the fast write could reach "part:1" first and hang on the gate).
+      gate = Promise.withResolvers(); reached = Promise.withResolvers(); hold = true;
       const slow = code(store.putCheckpoint(T, B, big(10, "slow"), e));
-      await Bun.sleep(30);
+      await reached.promise;
       await store.putCheckpoint(T, B, big(20, "fast"), e);
       const fastRows = await raw.partRows(T, B);
       gate.resolve();
@@ -368,9 +369,9 @@ export function storeContract(name, make) {
       for (const below of [21, 20, 11]) { const got = await store.getCheckpoint(T, B, below); expect(got === null || got.tag === (below > 20 ? "fast" : "slow")).toBe(true); }
       expect(await raw.partRows(T, B)).toBeLessThanOrEqual(fastRows + parts(big(10, "slow")) + 1);
       // The same seq twice, the first one slow: the first header wins and the loser leaves no part rows.
-      gate = Promise.withResolvers(); hold = true;
+      gate = Promise.withResolvers(); reached = Promise.withResolvers(); hold = true;
       const a = code(store.putCheckpoint(T, B, big(30, "a"), e));
-      await Bun.sleep(30);
+      await reached.promise;
       await store.putCheckpoint(T, B, big(30, "b"), e);
       gate.resolve();
       expect(["resolved", "unavailable"]).toContain(await a);

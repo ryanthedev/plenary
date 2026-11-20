@@ -36,7 +36,7 @@ export const removeLines = name => [
 export function createOffboardModel({ api, newKey = null }) {
   const S = {
     status: "pick",            // pick | loading | ready | forbidden | notfound | signed-out | error
-    found: [], foundOwner: [], searching: false, member: null, defaults: null, items: [], next: null, blocked: null, canRemove: false,
+    found: [], foundOwner: [], query: { found: "", foundOwner: "" }, searching: false, member: null, defaults: null, items: [], next: null, blocked: null, canRemove: false,
     known: [],                 // other people the admin searched for: offered in every row's picker
     choice: new Map(),         // item key -> the person chosen for it (absent = the default)
     results: new Map(),        // item key -> { ok, text } after an apply
@@ -61,7 +61,7 @@ export function createOffboardModel({ api, newKey = null }) {
     handedOver() { return S.items.find(i => i.personal && i.can.handover) ?? null; },
     /** Look a person up for the leaver picker. */
     async search(term, into = "found") {
-      S.searching = true; emit();
+      S.searching = true; S.query[into] = String(term ?? "").slice(0, 100); emit();      // the box keeps what was typed across redraws
       const r = await api.people(term);
       S.searching = false;
       if (r.error) { fail(r); S[into] = []; } else { S[into] = r.people; S.said = r.people.length ? `${plural(r.people.length, "person")} found.` : "Nobody found."; }

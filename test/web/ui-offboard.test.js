@@ -196,3 +196,17 @@ test("MED-1b: Enter in a search box and Enter on a match keep focus on a live, k
   expect([live(), fk()]).toEqual([true, "heading"]);
   expect(globalThis.document.activeElement.tagName).toBe("H1");
 });
+test("the typed query survives a redraw in both searches (the box shows what was last searched)", async () => {
+  await mount();
+  const box = label => all(e => e.tagName === "INPUT", all(e => e.tagName === "FORM" && e.getAttribute("aria-label") === label)[0])[0];
+  const form = all(e => e.tagName === "FORM" && e.getAttribute("aria-label") === "Find a new owner")[0];
+  box("Find a new owner").value = "ad"; form.dispatch("submit"); await settle();
+  expect(box("Find a new owner").value).toBe("ad");                                 // the page was redrawn: a NEW input node with the old text
+  all(e => e.tagName === "BUTTON" && textOf(e) === "Ada")[0].click(); await settle();
+  expect(box("Find a new owner").value).toBe("ad");
+  const dom = installDom(); root = dom.root;
+  const model = createOffboardModel({ api: { list: async () => page(ITEMS), people: async () => ({ people: [ADA] }) } });
+  mountOffboardPage({ root, model, hrefs: { home: "./" }, signIn: null });
+  box("Find a person").value = "sa"; all(e => e.tagName === "FORM" && e.getAttribute("aria-label") === "Find a person")[0].dispatch("submit"); await settle();
+  expect(box("Find a person").value).toBe("sa");
+});

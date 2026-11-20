@@ -26,8 +26,8 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
   /** An opener the dialog focuses when it closes: resolved THEN (after the redraws the apply made), never a node held from before. */
   const openerOf = k => ({ focus: () => keeper(k)?.focus?.() });
 
-  const searchBox = (label, run, results, pick, id) => {
-    const input = h("input.field", { type: "search", id, "data-fk": `find:${id}`, maxlength: "100", autocomplete: "off", "aria-label": label });
+  const searchBox = (label, run, results, pick, id, into) => {
+    const input = h("input.field", { type: "search", id, "data-fk": `find:${id}`, maxlength: "100", autocomplete: "off", "aria-label": label, value: S.query[into] ?? "" });
     const form = h("form", { role: "search", "aria-label": label, onsubmit: e => { e.preventDefault?.(); run(input.value); } }, input, h("button.btn", { type: "submit" }, "Search"));
     const list = results.length ? h("ul.matches", { "aria-label": `${label}: matches` }, results.map(p => h("li", {}, h("button.btn.ghost", { type: "button", "data-fk": `match:${id}:${p.id}`, onclick: () => { focusTo = id === "offboard-owner" ? `find:${id}` : "heading"; pick(p); } }, p.name)))) : null;
     return h("div", {}, form, S.searching ? h("p.muted", {}, "Searching…") : list);
@@ -51,7 +51,7 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
     if (S.status === "error") return replace(main, message("Could not load this page.", S.notice ?? "The server did not answer."), h("a.btn", { href: hrefs.home }, "Back to Home"));
     h1 = h("h1", { id: "page-title", tabindex: "-1", "data-fk": "heading" }, "Offboard a member");
     const crumbs = h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " /");
-    const finder = searchBox("Find a person", q => model.search(q), S.found, p => model.open(p.id), "offboard-find");
+    const finder = searchBox("Find a person", q => model.search(q), S.found, p => model.open(p.id), "offboard-find", "found");
     if (!S.member) return replace(main, crumbs, h("div.sp-head", {}, h1), h("p.sub-h", {}, "Reassign what they solely own, then remove them. Nothing moves until you confirm."), finder);
     const m = S.member, d = S.defaults, n = S.items.length, can = model.actionable().length, qualifies = can > 0 || model.handedOver() !== null;
     const table = h("table.matrix", {}, h("caption", {}, `What ${m.name} solely owns`),
@@ -64,7 +64,7 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
       m.removed ? h("p", {}, `${m.name} has been removed from the Unit.`) : null,
       S.blocked === "admin" ? h("p", { role: "status" }, `${m.name} is a Unit admin and can't be removed here.`) : null,
       n ? [h("h2", {}, "Items"), h("div.matrix-scroll", { role: "region", "aria-label": `What ${m.name} solely owns`, tabindex: "0" }, table), S.next ? h("button.btn", { type: "button", onclick: () => model.more() }, "Show more") : null,
-        h("h2", {}, "Another new owner"), h("p.muted", {}, "Search for a person to offer them in every row's list."), searchBox("Find a new owner", q => model.search(q, "foundOwner"), S.foundOwner, p => model.addKnown(p), "offboard-owner")]
+        h("h2", {}, "Another new owner"), h("p.muted", {}, "Search for a person to offer them in every row's list."), searchBox("Find a new owner", q => model.search(q, "foundOwner"), S.foundOwner, p => model.addKnown(p), "offboard-owner", "foundOwner")]
         : !m.removed && !S.blocked ? message(`${m.name} solely owns nothing.`, "They can be removed now.") : null,
       h("div.pick-row", {}, n ? reviewBtn : null, !m.removed && !S.blocked ? removeBtn : null));
   }

@@ -124,16 +124,18 @@ export function createUndo({ move, board, result, newKey = null }) {
 }
 
 /**
- * What the board page needs to know: may this person move the board, and which Space is it in. Read through the existing options route (PROTOCOL.md § Move board, "Where it appears"):
- * a 200 means yes (`space` is where the board is, null when the caller can't open it), any error means no. Never rejects.
+ * Where the board is, for the board page of a person whose welcome said `can.move` (PROTOCOL.md § Move board, "Where it appears"), read through the existing options route:
+ * `can: true` with the Space (null when the caller can't open it); `can: false` only when the server REFUSED (403, 404: they no longer hold `move`); `can: null` for anything else
+ * (network, 5xx, a bad body: unknown, so the caller changes nothing and the item stays). Never rejects.
  * @param {import("../ports/move.js").MovePort} move @param {string} board
- * @returns {Promise<{ can: boolean, space: { id: string, name: string }|null }>}
+ * @returns {Promise<{ can: boolean|null, space: { id: string, name: string }|null }>}
  */
 export async function probeMove(move, board) {
   try {
     const r = await move.options(board);
-    if (r.error || !r.options) return { can: false, space: null };
+    if (r.error) return { can: r.error === "forbidden" || r.error === "notfound" ? false : null, space: null };
+    if (!r.options) return { can: null, space: null };
     const f = r.options.from;
     return { can: true, space: f && !f.hidden ? { id: f.id, name: f.name } : null };
-  } catch { return { can: false, space: null }; }
+  } catch { return { can: null, space: null }; }
 }

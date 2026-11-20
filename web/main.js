@@ -160,7 +160,7 @@ if (!signIn.token) {
     // The Share dialog's calls (PROTOCOL.md § Share dialog).
     share: httpShare({ fetch: (...a) => globalThis.fetch(...a), token: signIn.token, timers: clock }),
     // Move to… in the More menu (PROTOCOL.md § Move board, "Where it appears"): the same port as the Space page and Home.
-    move: httpMove({ fetch: (...a) => globalThis.fetch(...a), token: signIn.token, timers: clock }),
+    move: { port: httpMove({ fetch: (...a) => globalThis.fetch(...a), token: signIn.token, timers: clock }), clock, newKey: () => randomKey() },
     // The collaboration UI over this session (presence and records ride the board connection; web/adapters/collab/sync.js).
     collab: (S, o) => syncCollabPort(S, { name: me.name, ...o }),
     notice: signInNotice({ ...signIn, dev: null }, me.name),

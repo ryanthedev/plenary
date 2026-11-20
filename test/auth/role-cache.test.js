@@ -368,7 +368,7 @@ test("rolesFor: unknown board → every user null; users deduplicated; chunks of
   expect(m.get(identityKey(people[0]))).toBe("viewer");
   const none = await ten.rolesFor("b-nope", people.slice(0, 2));
   expect([...none.values()]).toEqual([null, null]);
-  expect(combine({ ctx: await raw.accessContext({ type: "board", id: board.id }), grant: null, invites: [], links: [] }, id("google:z"), T0)).toEqual({ role: "viewer", share: false, until: Infinity });
+  expect(combine({ ctx: await raw.accessContext({ type: "board", id: board.id }), grant: null, invites: [], links: [] }, id("google:z"), T0)).toEqual({ role: "viewer", share: false, move: false, until: Infinity });
 });
 
 // ---- F4: share-link redemption no longer announces ----

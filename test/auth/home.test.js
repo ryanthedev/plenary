@@ -406,6 +406,24 @@ describe("can on Home cards (#91)", () => {
   });
 });
 
+describe("can.move needs the board's own Unit (#91)", () => {
+  test("an acme member holding owner on a globex board is offered no Move on Home (the route would refuse them); the same member's own-Unit board is", async () => {
+    const globex = await r.createTenant({ domain: "globex.com" }), gs = await r.createSpace({ tenant: globex.id, name: "G" });
+    const foreign = await mkBoard(r, { tenant: globex.id, space: gs.id, title: "Foreign" });
+    await r.setGrant(foreign.id, ada.user, "owner");
+    const sp = await r.createSpace({ tenant: acme.id, name: "Design" }), own = await mk(sp.id, "Own"); await r.setGrant(own.id, ada.user, "owner");
+    const h = await home.home(ada), found = [...h.shared, ...(await home.search(ada, "Foreign")).results].filter(c => c.id === foreign.id);
+    expect(found.length).toBeGreaterThan(0);
+    for (const c of found) expect(c.can.move).toBe(false);
+    expect((await home.search(ada, "Own")).results[0].can.move).toBe(true);
+  });
+  test("GET /home/search?space= cards carry can (LOW-1)", async () => {
+    const sp = await r.createSpace({ tenant: acme.id, name: "Design" }), b = await mk(sp.id, "B"); await r.setGrant(b.id, ada.user, "owner");
+    const res = await home.spaceBoards(ada, sp.id);
+    expect(res.results.map(c => [c.id, c.can.move])).toEqual([[b.id, true]]);
+  });
+});
+
 describe("bounds", () => {
   const spy = reg => { const calls = {}; return { calls, reg: new Proxy(reg, { get: (t, k) => (typeof t[k] === "function" ? (...a) => { calls[k] = (calls[k] ?? 0) + 1; return t[k](...a); } : t[k]) }) }; };
 

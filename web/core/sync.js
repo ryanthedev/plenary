@@ -96,9 +96,10 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
   let limited = null;             // the room's message, from the cap's refusal until the next welcome
   let nextTryAt = null;           // when the backoff reopens (now()-based), while one is armed
   let roleSeen = null;            // the last non-null welcome.role: kept across resyncs (set before status fires)
+  let moveSeen = false;           // the last welcome's `can.move` (the move permission as a Unit member): Move to…
   let shareSeen = false;          // the last welcome's `can.share` (members.manage on the board): the Share button
   let roleTold = null;            // the last role reported through onRoom
-  let shareTold = false;
+  let shareTold = false, moveTold = false;
   let userSeen = null;            // the last non-null welcome.user: kept across resyncs
   // Element ids the room has sequenced, per stream (entries and snapshots of this link; never cleared, as the old
   // per-session reader kept them): a write to one is a change, not a create.
@@ -184,7 +185,7 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
     const did = replica.receive(msg);
     noteSequenced(did);
     // Who and what the room says this link is, before any status change reports it (the session reads them then).
-    if (replica.role) { roleSeen = replica.role; shareSeen = replica.canShare === true; }
+    if (replica.role) { roleSeen = replica.role; shareSeen = replica.canShare === true; moveSeen = replica.canMove === true; }
     if (replica.user) userSeen = replica.user;
     if (limited && replica.welcomed) limited = null;   // in: the cap let this connection through
     if (status === "live" && !did.reset && !replica.resync) {
@@ -208,7 +209,7 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
   function afterReceive(msg, did, refusedRecord) {
     if (msg?.t === "presence" && Array.isArray(msg.batch)) onRoom({ type: "presence", batch: msg.batch });
     if (refusedRecord && did.dropped.includes(msg.id)) onRoom({ type: "refused", ...refusedRecord });
-    if (roleSeen && (roleSeen !== roleTold || shareSeen !== shareTold)) { roleTold = roleSeen; shareTold = shareSeen; onRoom({ type: "role", role: roleSeen, share: shareSeen }); }
+    if (roleSeen && (roleSeen !== roleTold || shareSeen !== shareTold || moveSeen !== moveTold)) { roleTold = roleSeen; shareTold = shareSeen; moveTold = moveSeen; onRoom({ type: "role", role: roleSeen, share: shareSeen, move: moveSeen }); }
     if (did.refusedSettings.length || did.retryReady.length) {
       const touched = new Set();
       for (const r of did.refusedSettings) {
@@ -252,6 +253,8 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
     get lastRole() { return roleSeen; },
     /** Did the last welcome say the person may share the board (`can.share`)? Kept through a resync. */
     get canShare() { return shareSeen; },
+    /** Did the last welcome say the person may move the board (`can.move`)? */
+    get canMove() { return moveSeen; },
     /** How many hellos this link has sent (each connect, whatever started it). */
     get hellos() { return hellos; },
     /** This link's wire client id (hello.client = the name plus the Replica's session part): presence names it. */

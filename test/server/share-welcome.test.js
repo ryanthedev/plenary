@@ -40,3 +40,28 @@ test("through the role cache: the cached answer carries the flag, so a second he
   expect(r.cacheCalls.rolesFor + r.calls.role).toBeGreaterThan(0);
   await r.stop();
 });
+
+// #91: `can.move` rides the same welcome (PROTOCOL.md § Share dialog, "can.move"): the `move` permission as a member of the board's Unit. Present only when true, merged with can.share.
+test("#91 the welcome says can.move only to a Unit member holding `move` on the board (an owner by user id without the Unit's domain does not); it merges with can.share and is absent otherwise", async () => {
+  const r = await rig();
+  expect((await welcomeOf(r, "owner")).can).toEqual({ share: true });                 // owner, but no Workspace domain: the move route would refuse them
+  await r.stop();
+  // a member (domain acme.test) with a custom role carrying move and members.manage, and one with move alone
+  for (const [permissions, want] of [[["move", "members.manage"], { share: true, move: true }], [["move"], { move: true }], [[], null]]) {
+    const r2 = await managerRig("annotator", permissions);
+    const w = await welcomeOf(r2, "stranger");
+    if (want) expect(w.can).toEqual(want); else expect(w).not.toHaveProperty("can");
+    await r2.stop();
+  }
+  const rv = await managerRig("viewer", ["move"]);                                      // a viewer step: the gateway-built welcome
+  const w = await welcomeOf(rv, "stranger");
+  expect([w.role, w.can]).toEqual(["viewer", { move: true }]);
+  await rv.stop();
+});
+
+test("#91 through the role cache the cached answer carries move too", async () => {
+  const r = await managerRig("annotator", ["move"], { cache: {} });
+  expect((await welcomeOf(r, "stranger")).can).toEqual({ move: true });
+  expect((await welcomeOf(r, "stranger")).can).toEqual({ move: true });
+  await r.stop();
+});

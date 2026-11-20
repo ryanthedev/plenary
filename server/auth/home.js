@@ -10,7 +10,7 @@
 // for a Space they can open.
 
 import { asciiFold, HOME } from "./registry-port.js";
-import { resolveAccess } from "./resolver.js";
+import { resolveAccess, mayMove } from "./resolver.js";
 
 /** @typedef {import("./idp-port.js").Identity} Identity */
 /** @typedef {{ type: "group"|"space"|"other"|"shared", id?: string, name: string }} PathPart */
@@ -46,7 +46,7 @@ export function homeService({ registry, tenancy, now = Date.now }) {
   async function cards(identity, unit, entries, { found: given, keep, can = !!unit } = {}) {
     const found = given ?? await accessAll(identity, [...new Set(entries.map(e => e.id))]);
     // `can` (the Space page and a member's Home cards, never a guest's): what the person may do to the board, as permissions the resolver already computed (never a role name).
-    const extra = f => (can ? { can: { rename: f.access.permissions.has("board.edit") || f.access.permissions.has("members.manage"), move: f.access.permissions.has("move"), trash: f.access.permissions.has("delete") } } : {});
+    const extra = f => (can ? { can: { rename: f.access.permissions.has("board.edit") || f.access.permissions.has("members.manage"), move: mayMove(f.access), trash: f.access.permissions.has("delete") } } : {});
     const out = entries.filter(e => openable(found.get(e.id)) && (!keep || keep(found.get(e.id)))).map(e => card(found.get(e.id), { ...(e.at != null ? { at: e.at } : {}), ...extra(found.get(e.id)) }));
     if (out.length) {
       const stars = new Set(await registry.starredAmong(identity.user, out.map(c => c.id)));
@@ -174,7 +174,7 @@ export function homeService({ registry, tenancy, now = Date.now }) {
      * GET /home/search?space=<id>: the boards of one Space the person can open. `space` is named only when they can open the Space
      * itself (else a board reached another way still lists, under "Shared with you", and the Space stays unnamed).
      */
-    async spaceBoards(identity, spaceId, { can = false } = {}) {
+    async spaceBoards(identity, spaceId, { can = true } = {}) {
       const unit = await tenancy.tenantOf(identity);
       const sp = unit ? await registry.space(spaceId) : null;
       if (!sp || sp.tenant !== unit.id) return { space: null, results: [], more: false };

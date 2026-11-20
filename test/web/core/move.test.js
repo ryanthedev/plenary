@@ -75,9 +75,10 @@ test("undo: a move back from the new Space to the old under its own key; moved a
   expect(movedText("", "X")).toBe("Moved Untitled to X.");
 });
 
-test("#91 probeMove: a 200 means the caller may move it and names the Space; a hidden Space is null; any error (forbidden included) or a throw means no", async () => {
+test("#91 probeMove: a 200 names the Space (null when hidden); only a refusal (403, 404) says can: false; any other failure is unknown (null), so the page keeps what it had", async () => {
   expect(await probeMove(port(), "b-1")).toEqual({ can: true, space: { id: "s-1", name: "Mine" } });
   expect(await probeMove(port({ options: { options: { ...OPTIONS, from: { hidden: true } } } }), "b-1")).toEqual({ can: true, space: null });
-  for (const error of ["forbidden", "notfound", "auth", "unavailable", "network"]) expect(await probeMove({ options: async () => ({ error }) }, "b-1")).toEqual({ can: false, space: null });
-  expect(await probeMove({ options: async () => { throw new Error("x"); } }, "b-1")).toEqual({ can: false, space: null });
+  for (const error of ["forbidden", "notfound"]) expect(await probeMove({ options: async () => ({ error }) }, "b-1")).toEqual({ can: false, space: null });
+  for (const error of ["auth", "unavailable", "network", "invalid"]) expect(await probeMove({ options: async () => ({ error }) }, "b-1")).toEqual({ can: null, space: null });
+  expect(await probeMove({ options: async () => { throw new Error("x"); } }, "b-1")).toEqual({ can: null, space: null });
 });

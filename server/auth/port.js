@@ -4,7 +4,7 @@
 //   verify(token) → Promise<{ user, name, email, domain, exp? } | null>   (a Session, idp-port.js; returned as the
 //     verifier gave it, so `exp` reaches the gateway, which closes the connection then; dev tokens have none)
 //   role(identity, board) → Promise<role | null>
-//   access?(identity, board) → Promise<{ role: role | null, share: boolean }>   a hello's whole answer from one read: `share` = the identity holds members.manage here (the welcome's `can.share`)
+//   access?(identity, board) → Promise<{ role: role | null, share: boolean, move: boolean }>   a hello's whole answer from one read: `share` = the identity holds members.manage here (the welcome's `can.share`), `move` = it holds `move` as a Unit member (`can.move`)
 // The gateway awaits both (plus the board lookup) before it forwards a hello; the room sees only {user, role, client}.
 // If § Auth changes shape, this file is the one to change.
 //
@@ -47,7 +47,7 @@ export function authPort({ sessions, dev, tenancy }) {
     },
     // The role plus `share`, from the same read (no second Registry read for the flag).
     async access(identity, board) {
-      return typeof tenancy.access === "function" ? tenancy.access(identity, board) : { role: await tenancy.role(identity, board), share: false };
+      return typeof tenancy.access === "function" ? tenancy.access(identity, board) : { role: await tenancy.role(identity, board), share: false, move: false };
     },
     // p5-load: the batch (Map user → role|null, fresh) and the cache's invalidation, when the tenancy has them.
     ...(typeof tenancy.rolesFor === "function" ? { rolesFor: (board, identities) => tenancy.rolesFor(board, identities) } : {}),

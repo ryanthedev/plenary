@@ -482,6 +482,13 @@ test("hello.tab: `new Replica({ tab })` puts it in every hello; without `tab` th
   expect(got[0]).toMatchObject({ t: "welcome", user: "u" });
 });
 
+test("#91 welcome.can.move is kept as canMove: true only when exactly true; independent of can.share", () => {
+  const mk = can => { const r = new Replica({ client: "c" }); r.receive({ t: "welcome", seq: 0, role: "viewer", user: "u", horizon: 0, rv: 1, ...(can ? { can } : {}) }); return r; };
+  expect([mk({ move: true }).canMove, mk({ move: true }).canShare]).toEqual([true, false]);
+  expect([mk({ share: true, move: true }).canMove, mk({ share: true, move: true }).canShare]).toEqual([true, true]);
+  expect(mk({ move: "yes" }).canMove).toBe(false); expect(mk(null).canMove).toBe(false); expect(new Replica({ client: "c" }).canMove).toBe(false);
+});
+
 test("welcome.can.share is kept as canShare: true only when the welcome says so, false when absent or not exactly true", () => {
   const mk = can => { const r = new Replica({ client: "c" }); r.receive({ t: "welcome", seq: 0, role: "annotator", user: "u", horizon: 0, rv: 1, ...(can ? { can } : {}) }); return r; };
   expect(mk({ share: true }).canShare).toBe(true);

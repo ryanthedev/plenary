@@ -68,7 +68,7 @@ export function installPage() {
   const doc = {
     body, documentElement: new E("html"), activeElement: null, visibilityState: "visible",
     createElement: t => new E(t), createTextNode: t => new T(t),
-    querySelector: s => (s === ".main" ? main : s.startsWith("#") ? byId[s.slice(1)] ?? null : null),
+    querySelector: s => (s === ".main" ? main : s.startsWith("#") ? byId[s.slice(1)] ?? null : /^\[[\w-]+\]$/.test(s) ? body.all().find(e => e.hasAttribute?.(s.slice(1, -1))) ?? null : /^\.[\w-]+$/.test(s) ? body.all().find(e => e.classList?.contains(s.slice(1))) ?? null : null),
     addEventListener: (t, fn) => { (docL[t] ??= []).push(fn); },
     removeEventListener: (t, fn) => { docL[t] = (docL[t] ?? []).filter(f => f !== fn); },
     fire(t, ev = {}) { for (const fn of docL[t] ?? []) fn({ target: board, preventDefault() {}, stopPropagation() {}, ...ev }); },

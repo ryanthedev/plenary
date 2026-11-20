@@ -1318,42 +1318,59 @@ test("DW-52.3e the Share button shows only when the welcome says can.share: a cu
   expect(button()).toBeUndefined();
 });
 
-// #91: the board page's More menu offers Move to… (the shared startMove flow) only where the existing move route answered for this board; the Space shows beside the board name and follows a move.
+// #91: the board page offers Move to… (the shared startMove flow) only where the welcome says can.move; the Space name is read from the move route only for such a person.
 function movePort(o = {}) {
-  const st = { space: { id: "s1", name: "Design", personal: false }, calls: [], forbidden: false, ...o };
+  const st = { space: { id: "s1", name: "Design", personal: false }, calls: [], optionsError: null, ...o };
   const options = () => ({ board: { id: "b1", title: "B" }, from: st.space, destinations: [{ id: "s2", name: "Plat", personal: false, general: null, group: null }], more: false });
-  const port = { options: async b => { st.calls.push(["options", b]); return st.forbidden ? { error: "forbidden" } : { options: options() }; },
+  const port = { options: async b => { st.calls.push(["options", b]); return st.optionsError ? { error: st.optionsError } : { options: options() }; },
     preview: async (b, to) => ({ diff: { board: { id: "b1", title: "B" }, from: st.space, to: { id: to, name: "Plat", personal: false }, gains: [], keeps: [], loses: [], invites: null, links: null, hidden: false, more: false } }),
     move: async (b, body, key) => { st.calls.push(["move", body, key]); const from = st.space; st.space = { id: body.to, name: body.to === "s2" ? "Plat" : "Design", personal: false };
       return { result: { board: { id: "b1", title: "B", space: { id: st.space.id, name: st.space.name } }, moved: true, undo: { space: { id: from.id, name: from.name, personal: false } } } }; } };
   return { st, move: { port, newKey: () => "mk" } };
 }
+const canMoveWelcome = can => t => ({ ...t, onMessage: fn => t.onMessage(m => fn(m?.t === "welcome" && can ? { ...m, can: { ...m.can, move: true } } : m)) });
 const moveItem = () => find(page.byId.topbar, e => e.getAttribute?.("role") === "menuitem" && e.textContent === "Move to…");
+const moveBtn = () => find(page.byId.topbar, e => e.getAttribute?.("data-move-open") === "1");
 const spaceLabel = () => find(page.byId.topbar, e => /\bboard-space\b/.test(e.className ?? ""))?.textContent ?? null;
 const flush = async (n = 4) => { for (let i = 0; i < n; i++) await settleP(); };
+const doMove = async () => {
+  moveBtn().click(); await flush();
+  const dlg = find(globalThis.document.body, e => e.getAttribute?.("role") === "dialog");
+  const radio = find(dlg, e => e.tagName === "INPUT" && e.getAttribute("type") === "radio");
+  radio.checked = true; radio.fire("change", { target: radio }); await flush();
+  find(dlg, e => e.tagName === "FORM").fire("submit", { preventDefault() {} }); await flush(8); rig.step(2);
+};
 
-test("#91 board page: Move to… and the Space name show only when the move route answers (a 403 or no port shows neither)", async () => {
+test("#91 board page: the Move button, its menu item and the Space name need the welcome's can.move; without it no request is made at all", async () => {
   const ok = movePort();
-  rig = setup({ move: ok.move }); await flush(); rig.step(2);
-  expect(ok.st.calls[0]).toEqual(["options", "b1"]);
+  rig = setup({ move: ok.move, wrap: canMoveWelcome(true) }); await flush(); rig.step(2);
+  expect(ok.st.calls).toEqual([["options", "b1"]]);                       // the Space name, read once
+  expect(moveBtn()).toBeTruthy(); expect(moveBtn().getAttribute("aria-haspopup")).toBe("dialog");
   expect(moveItem()).toBeTruthy();
   expect(spaceLabel()).toBe("in Design");
-  const no = movePort({ forbidden: true });
-  rig = setup({ move: no.move }); await flush(); rig.step(2);
-  expect(moveItem()).toBeUndefined(); expect(spaceLabel()).toBeNull();
-  rig = setup(); await flush(); rig.step(2);
-  expect(moveItem()).toBeUndefined();
+  const no = movePort();
+  rig = setup({ move: no.move, wrap: canMoveWelcome(false) }); await flush(); rig.step(2);
+  expect(no.st.calls).toEqual([]);                                         // a viewer-heavy board costs nothing: no probe for someone the welcome does not name
+  expect(moveBtn()).toBeUndefined(); expect(moveItem()).toBeUndefined(); expect(spaceLabel()).toBeNull();
+  rig = setup({ wrap: canMoveWelcome(true) }); await flush(); rig.step(2);
+  expect(moveBtn()).toBeUndefined();                                       // no move port wired
+});
+
+test("#91 board page: a failed read of the Space name (5xx, network) leaves Move in place; only a refusal takes it away", async () => {
+  for (const optionsError of ["unavailable", "network", "auth"]) {
+    const mp = movePort({ optionsError });
+    rig = setup({ move: mp.move, wrap: canMoveWelcome(true) }); await flush(); rig.step(2);
+    expect(moveBtn()).toBeTruthy(); expect(spaceLabel()).toBeNull();
+  }
+  const mp = movePort({ optionsError: "forbidden" });
+  rig = setup({ move: mp.move, wrap: canMoveWelcome(true) }); await flush(); rig.step(2);
+  expect(moveBtn()).toBeUndefined(); expect(moveItem()).toBeUndefined();
 });
 
 test("#91 board page: Move to… opens the shared dialog; after the move the Space name follows without a reload and the Undo toast moves it back", async () => {
   const mp = movePort();
-  rig = setup({ move: mp.move }); await flush(); rig.step(2);
-  moveItem().click(); await flush();
-  const dlg = find(globalThis.document.body, e => e.getAttribute?.("role") === "dialog");
-  expect(dlg).toBeTruthy();
-  const radio = find(dlg, e => e.tagName === "INPUT" && e.getAttribute("type") === "radio");
-  radio.checked = true; radio.fire("change", { target: radio }); await flush();
-  find(dlg, e => e.tagName === "FORM").fire("submit", { preventDefault() {} }); await flush(8); rig.step(2);
+  rig = setup({ move: mp.move, wrap: canMoveWelcome(true) }); await flush(); rig.step(2);
+  await doMove();
   expect(mp.st.calls.filter(c => c[0] === "move")).toEqual([["move", { from: "s1", to: "s2" }, "mk"]]);
   expect(spaceLabel()).toBe("in Plat");
   const toast = find(globalThis.document.body, e => e.getAttribute?.("aria-label") === "Board moved");
@@ -1363,16 +1380,29 @@ test("#91 board page: Move to… opens the shared dialog; after the move the Spa
   expect(spaceLabel()).toBe("in Design");
 });
 
-test("#91 board page: a move that leaves the mover without `move` takes the menu item away (the probe runs again after it)", async () => {
+test("#91 board page: a move after which the route refuses the mover takes the Move button away", async () => {
   const mp = movePort();
-  rig = setup({ move: mp.move }); await flush(); rig.step(2);
-  expect(moveItem()).toBeTruthy();
+  rig = setup({ move: mp.move, wrap: canMoveWelcome(true) }); await flush(); rig.step(2);
   const orig = mp.move.port.move;
-  mp.move.port.move = async (...a) => { const r = await orig(...a); mp.st.forbidden = true; return r; };
-  moveItem().click(); await flush();
+  mp.move.port.move = async (...a) => { const r = await orig(...a); mp.st.optionsError = "forbidden"; return r; };
+  await doMove();
+  expect(moveBtn()).toBeUndefined(); expect(moveItem()).toBeUndefined();
+});
+
+test("#91 board page: closing the dialog returns focus to a visible Move control", async () => {
+  const mp = movePort();
+  rig = setup({ move: mp.move, wrap: canMoveWelcome(true) }); await flush(); rig.step(2);
+  moveBtn().click(); await flush();
   const dlg = find(globalThis.document.body, e => e.getAttribute?.("role") === "dialog");
-  const radio = find(dlg, e => e.tagName === "INPUT" && e.getAttribute("type") === "radio");
-  radio.checked = true; radio.fire("change", { target: radio }); await flush();
-  find(dlg, e => e.tagName === "FORM").fire("submit", { preventDefault() {} }); await flush(8); rig.step(2);
-  expect(moveItem()).toBeUndefined(); expect(spaceLabel()).toBeNull();
+  dlg.parentNode.fire("keydown", { key: "Escape", preventDefault() {}, stopPropagation() {} }); await flush();
+  expect(globalThis.document.activeElement?.getAttribute?.("data-move-open") ?? globalThis.document.activeElement?.tagName).toBe("1");
+});
+
+test("#91 mountApp validates the move wiring: a bare port (the shape main.js once passed) throws; main.js passes { port, clock, newKey } at every move: site", async () => {
+  const mp = movePort();
+  expect(() => setup({ move: mp.move.port })).toThrow(/move must be/);
+  const code = (await Bun.file(new URL("../../web/main.js", import.meta.url)).text()).replace(/\/\/.*$/gm, "");
+  const sites = code.match(/\bmove: \{?[^\n]*/g);
+  expect(sites.length).toBe(3);
+  for (const l of sites) expect(l).toMatch(/^move: \{ port: httpMove\(\{[^}]*\}\), clock, newKey: \(\) => randomKey\(\) \}/);
 });

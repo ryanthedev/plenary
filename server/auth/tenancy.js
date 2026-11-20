@@ -18,7 +18,7 @@
 // the same pure `combine`, so they can't disagree (test/auth/role-cache.test.js checks it on random registries).
 
 import { normEmail } from "./util.js";
-import { resolveAccess, teamIndex, movedContext } from "./resolver.js";
+import { resolveAccess, teamIndex, movedContext, mayMove } from "./resolver.js";
 import { HOME } from "./registry-port.js";
 
 /** @typedef {import("./registry-port.js").Registry} Registry */
@@ -28,7 +28,7 @@ import { HOME } from "./registry-port.js";
 /** @typedef {import("./registry-port.js").Invite} Invite */
 /** @typedef {import("./registry-port.js").Link} Link */
 /** @typedef {import("./idp-port.js").Identity} Identity */
-/** @typedef {{ role: Role|null, share: boolean, until: number }} Resolved  `share`: does the identity hold `members.manage` on the board (the Share button, PROTOCOL.md § Share dialog); `until`: the soonest `expiresAt` among the live invites and links consulted (Infinity if none); the answer may change then without any message */
+/** @typedef {{ role: Role|null, share: boolean, move: boolean, until: number }} Resolved  `move`: the `move` permission (a Unit member's only, resolver.js; the welcome's `can.move`); `share`: does the identity hold `members.manage` on the board (the Share button, PROTOCOL.md § Share dialog); `until`: the soonest `expiresAt` among the live invites and links consulted (Infinity if none); the answer may change then without any message */
 
 /** Users per `linkUsesFor` call (SQL bind limits; a 100k pass is 100 queries, not one 100k-parameter one). */
 export const USE_CHUNK = 1000;
@@ -56,7 +56,7 @@ const okIdentity = id => !!id && typeof id.user === "string";
  */
 export function combine(rows, identity, t, opts) {
   const a = resolveAccess(rows, identity, t, opts);
-  return { role: a.ladder ?? null, share: a.permissions.has("members.manage"), until: a.until };
+  return { role: a.ladder ?? null, share: a.permissions.has("members.manage"), move: mayMove(a), until: a.until };
 }
 
 /**
@@ -90,7 +90,7 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
   /** One user's role with the time it may change by itself. @returns {Promise<Resolved>} */
   async function resolve(identity, boardId) {
     const a = await accessOn(identity, boardId);
-    return { role: a.ladder, share: a.permissions.has("members.manage"), until: a.until };
+    return { role: a.ladder, share: a.permissions.has("members.manage"), move: mayMove(a), until: a.until };
   }
 
   /**
@@ -104,7 +104,7 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
     const ids = new Map();
     for (const id of identities ?? []) if (okIdentity(id)) { const k = identityKey(id); if (!ids.has(k)) ids.set(k, id); }
     const out = new Map();
-    const none = () => { for (const [k, id] of ids) out.set(k, { role: null, share: false, until: Infinity, identity: id }); return out; };
+    const none = () => { for (const [k, id] of ids) out.set(k, { role: null, share: false, move: false, until: Infinity, identity: id }); return out; };
     if (typeof boardId !== "string" || !ids.size) return none();
     const users = [...new Set([...ids.values()].map(id => id.user))];
     const ctx = given ?? await registry.accessContext({ type: "board", id: boardId }, { users, fresh: true });   // a pass reads everything fresh
@@ -146,8 +146,8 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
   return {
     /** @returns {Promise<Role|null>} */
     async role(identity, boardId) { return (await resolve(identity, boardId)).role; },
-    /** A hello's whole answer from the one read: `{ role, share }` (`share` = `members.manage` on the board, from the same Access as the role). */
-    async access(identity, boardId) { const r = await resolve(identity, boardId); return { role: r.role, share: r.share }; },
+    /** A hello's whole answer from the one read: `{ role, share, move }` (`share` = `members.manage` on the board, `move` = the `move` permission, from the same Access as the role). */
+    async access(identity, boardId) { const r = await resolve(identity, boardId); return { role: r.role, share: r.share, move: r.move }; },
     resolve,
     resolveMany,
     /**
@@ -373,7 +373,7 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
   // Entries are keyed by board + identityKey (user, email, domain), as the gateway groups connections, so two
   // identities of one user each have their own entry. Indexed by board and by (board, user) for invalidation.
   // Stamps stay per (board, user): coarser than per identity, so never staler.
-  /** @type {Map<string, { board: string, user: string, role: Role, share: boolean, until: number }>} insertion order = age */
+  /** @type {Map<string, { board: string, user: string, role: Role, share: boolean, move: boolean, until: number }>} insertion order = age */
   const entries = new Map();
   /** @type {Map<string, Set<string>>} board → its entry keys */ const byBoard = new Map();
   /** @type {Map<string, Set<string>>} board + user → its entry keys (one per identity) */ const byUser = new Map();
@@ -385,11 +385,11 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
     if (!e) return;
     entries.delete(k); unindex(byBoard, e.board, k); unindex(byUser, ukey(e.board, e.user), k);
   }
-  function put(b, identity, role, until, share = false) {
+  function put(b, identity, role, until, share = false, move = false) {
     const k = ekey(b, identity);
     remove(k);
     if (entries.size >= maxEntries) remove(entries.keys().next().value);
-    entries.set(k, { board: b, user: identity.user, role, share, until });
+    entries.set(k, { board: b, user: identity.user, role, share, move, until });
     index(byBoard, b, k); index(byUser, ukey(b, identity.user), k);
   }
   function dropBoard(b) { for (const k of [...(byBoard.get(b) ?? [])]) remove(k); }
@@ -399,9 +399,9 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
     async role(identity, boardId) { return (await this.access(identity, boardId)).role; },
     /** A hello's answer, cached the same way: `{ role, share }`. */
     async access(identity, boardId) {
-      if (!identity || typeof identity.user !== "string" || typeof boardId !== "string") return { role: null, share: false };
+      if (!identity || typeof identity.user !== "string" || typeof boardId !== "string") return { role: null, share: false, move: false };
       const k = ekey(boardId, identity), t0 = now(), e = entries.get(k);
-      if (e && e.until > t0) { stats.hits++; return { role: e.role, share: e.share }; }
+      if (e && e.until > t0) { stats.hits++; return { role: e.role, share: e.share, move: e.move }; }
       if (e) remove(k);
       stats.misses++;
       const c0 = clock;
@@ -412,11 +412,11 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
         // fill (before endRead clears the stamps)
         if (r && r.role != null) {
           if (stale(boardId, identity.user, c0)) stats.discarded++;
-          else { const until = Math.min(t0 + ttlMs, r.until); if (until > now()) { put(boardId, identity, r.role, until, r.share); stats.fills++; } }
+          else { const until = Math.min(t0 + ttlMs, r.until); if (until > now()) { put(boardId, identity, r.role, until, r.share, r.move); stats.fills++; } }
         }
         endRead();
       }
-      return { role: r.role, share: r.share };
+      return { role: r.role, share: r.share, move: r.move };
     },
 
     /**
@@ -441,7 +441,7 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
             if (others) { if (userStamp.size < STAMP_MAX) userStamp.set(uk, ++clock); else boardStamp.set(boardId, ++clock); }
             if (r.role == null || moved) continue;
             const until = Math.min(t0 + ttlMs, r.until);
-            if (until > now()) put(boardId, r.identity, r.role, until, r.share);
+            if (until > now()) put(boardId, r.identity, r.role, until, r.share, r.move);
           }
         }
         endRead();

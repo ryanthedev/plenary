@@ -61,10 +61,11 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // user's stored one. Before the first welcome it is the sign-in's user.
   const mineKeyOf = user => `plenary.mine.${board}.${user}`;
   const mineKey = mineKeyOf(me.user);
-  let chromeDirty = true;
+  let chromeDirty = true, syncMove = () => {};
+  if (move && (typeof move.port?.options !== "function" || typeof move.clock?.mono !== "function")) throw new TypeError("mountApp: move must be { port: MovePort, clock, newKey? }");
   const S = startSession({
     mine: (() => { try { const v = JSON.parse(get(mineKey) ?? "[]"); return Array.isArray(v) ? v : []; } catch { return []; } })(),
-    onChange: () => { chromeDirty = true; },
+    onChange: () => { chromeDirty = true; syncMove(); },
   });
   if (!ui.drawer && me.role === "annotator") ui.drawer = "notes";
   net.onFile(file => { S.receiveFiles({ [file.id]: file }); });
@@ -337,25 +338,40 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
 
   // Share (PROTOCOL.md § Share dialog): offered only when the welcome said `can.share` (members.manage on the board); if that changed mid-session the server answers 403 and the dialog says so.
   // The chrome is rebuilt while the dialog is open, so focus goes back to whichever of the Share button and the More button is shown now, not to the element that opened it.
-  const shareOpener = { focus() { const c = [document.querySelector("[data-share-open]"), document.querySelector(".header-more")]; (c.find(e => e && e.offsetParent !== null) ?? c.find(Boolean))?.focus?.(); } };
+  const shareOpener = { focus() { const c = [document.querySelector("[data-share-open]"), document.querySelector(".header-more"), document.querySelector("[data-dock-more]")]; (c.find(e => e && e.offsetParent !== null) ?? c.find(Boolean))?.focus?.(); } };
   function openShareDialog() {
     const loc = globalThis.location, origin = loc?.origin ?? "", boardUrl = `${origin}${loc?.pathname ?? "/"}?board=${encodeURIComponent(board)}`;
     const model = createShareModel({ share, access, board, newKey, now: () => clock.now(), urls: { board: boardUrl, link: id => `${origin}/links/${encodeURIComponent(id)}` } });
     openShare({ host: document.body, model, opener: shareOpener, accessHref: `${loc?.pathname ?? "/"}?access=board:${encodeURIComponent(board)}`, now: () => clock.now() });
   }
 
-  // Move to… (PROTOCOL.md § Move board, "Where it appears"): offered only when the move route answered for this board (`can`), which also names the Space shown beside the board name.
-  // Probed once now and again after a move or an Undo, so the name and the menu item follow the board without a reload. `moveGen` drops an answer a newer probe has outdated.
-  const moveInfo = { can: false, space: null };
-  let moveGen = 0;
+  // Move to… (PROTOCOL.md § Move board, "Where it appears"): offered only when the welcome said `can.move` (no request to find out), unless the move route has since refused this person
+  // (`denied`: a 403 or 404 after a move or an Undo; a new welcome that says `can.move` clears it). The Space shown beside the board name is read from that route's `from`, only by a person
+  // the welcome let move, once the welcome has come and again after a move or an Undo. A failed read leaves the item in place and the name unshown. `moveGen` drops an outdated answer.
+  const moveInfo = { space: null, denied: false };
+  let moveGen = 0, moveWelcomed = false, booted = false;
+  const canMove = () => !!move && S.canMove === true && !moveInfo.denied;
   const refreshMove = () => {
-    if (!move) return Promise.resolve();
+    if (!move || S.canMove !== true) return Promise.resolve();
     const mine = ++moveGen;
-    return probeMove(move.port, board).then(r => { if (mine !== moveGen) return; moveInfo.can = r.can; moveInfo.space = r.space; chromeDirty = true; });
+    return probeMove(move.port, board).then(r => {
+      if (mine !== moveGen) return;
+      if (r.can === false) moveInfo.denied = true;
+      else if (r.can === true) moveInfo.space = r.space;
+      chromeDirty = true;
+    });
   };
-  const moveOpener = { focus() { document.querySelector(".header-more")?.focus?.(); } };
-  const openMoveDialog = () => startMove({ host: document.body, move, board, opener: moveOpener, reload: refreshMove, restoreFocus: () => canvas.focus?.() });
-  refreshMove();
+  /** After every session change: a welcome that newly says can.move clears a refusal and reads the Space once. */
+  syncMove = () => {
+    if (!booted || !move) return;
+    if (S.canMove === true && !moveWelcomed) { moveWelcomed = true; moveInfo.denied = false; refreshMove(); }
+    else if (S.canMove !== true && moveWelcomed) { moveWelcomed = false; moveInfo.space = null; chromeDirty = true; }
+  };
+  // Escape and Cancel return focus to a control that is on screen at this width (the chrome is rebuilt meanwhile): the Move or Share button, else the More button.
+  const visibleControl = sel => { const c = sel.map(q => document.querySelector(q)); return c.find(e => e && e.offsetParent !== null) ?? c.find(Boolean); };
+  const moveOpener = { focus() { (visibleControl(["[data-move-open]", ".header-more", "[data-dock-more]"]) ?? canvas)?.focus?.(); } };
+  const openMoveDialog = () => { ui.sheet = null; chromeDirty = true; startMove({ host: document.body, move, board, opener: moveOpener, reload: refreshMove, restoreFocus: () => canvas.focus?.() }); };
+  booted = true; syncMove();
 
   function topbar() {
     const role = S.role, tools = toolsFor(role), may = S.may();
@@ -403,7 +419,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       role === "presenter" ? extraAction("Mermaid", () => openDialog("mermaid"), !may) : null,
       role === "presenter" ? extraAction("Export", toggleExport) : null,
       share && S.canShare ? extraAction("Share", () => openShareDialog()) : null,
-      move && moveInfo.can ? extraAction("Move to…", openMoveDialog) : null,
+      canMove() ? extraAction("Move to…", openMoveDialog) : null,
       role !== "viewer" ? extraAction("Side panel", togglePanel) : null,
       extraAction("Light / dark", toggleTheme),
     ]);
@@ -416,6 +432,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         collab ? collab.parts.avatars : h("div.avatars", {},
           h("span.stack", {}, h("span.av.live", { style: { background: "var(--u-me)" }, title: `${me.name} (you)` }, me.name.slice(0, 2).toUpperCase()))),
         share && S.canShare ? h("button.btn.desk-only.header-extra", { "aria-haspopup": "dialog", "data-share-open": "1", title: "Share this board", onclick: () => openShareDialog() }, "Share") : null,
+        canMove() ? h("button.btn.desk-only.header-extra", { "aria-haspopup": "dialog", "data-move-open": "1", title: "Move this board to another Space", onclick: () => openMoveDialog() }, "Move to…") : null,
         pillEl,
         role !== "viewer" ? h("button.tb.desk-only.header-extra" + (ui.panel.open ? ".on" : ""), { title: "Side panel (I)", onclick: togglePanel }, h("span.ic", {}, "◧"), h("span.k", {}, "I")) : null,
         h("button.tb.header-extra" + (role === "viewer" ? "" : ".theme-btn"), { title: "Light / dark", onclick: toggleTheme }, h("span.ic", {}, ui.theme === "dark" ? "☀" : "☾")),
@@ -511,7 +528,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const T = id => toolsFor("presenter").find(t => t.id === id);
   function dock() {
     const may = S.may(), role = S.role;
-    const btn = (ic, label, on, onclick, disabled = false, ariaLabel = label) => h("button.tb" + (on ? ".on" : ""), { onclick, disabled, "aria-label": ariaLabel, title: ariaLabel }, h("span.ic", {}, ic), label);
+    const btn = (ic, label, on, onclick, disabled = false, ariaLabel = label) => h("button.tb" + (on ? ".on" : ""), { onclick, disabled, "aria-label": ariaLabel, title: ariaLabel, ...(label === "More" ? { "data-dock-more": "1" } : {}) }, h("span.ic", {}, ic), label);
     const sheet = id => () => { ui.sheet = ui.sheet === id ? null : id; chromeDirty = true; };
     const tool = id => btn(T(id).icon, T(id).name, S.tool === id, () => { if (id === "image") openPicker(); S.setTool(id); chromeDirty = true; }, !may);
     let items;
@@ -530,6 +547,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       const may = S.may();
       body = h("div.tool-grid", {}, toolsFor(S.role).map(t => h("button.tb" + (S.tool === t.id ? ".on" : ""), { disabled: t.id !== "hand" && !may, onclick: () => { if (t.id === "image") openPicker(); S.setTool(t.id); ui.sheet = null; chromeDirty = true; } }, h("span.ic", {}, t.icon), t.name)),
         S.role === "presenter" ? [h("button.tb", { disabled: !may, onclick: () => openDialog("mermaid") }, h("span.ic", {}, "◇→"), "Mermaid"), h("button.tb", { onclick: () => openDialog("export") }, h("span.ic", {}, "⤓"), "Export")] : null,
+        share && S.canShare ? h("button.tb", { onclick: () => { ui.sheet = null; chromeDirty = true; openShareDialog(); } }, h("span.ic", {}, "⇪"), "Share") : null,
+        canMove() ? h("button.tb", { onclick: () => openMoveDialog() }, h("span.ic", {}, "⇄"), "Move to…") : null,
         S.role !== "viewer" ? h("button.tb" + (S.toolLock() ? ".on" : ""), { disabled: !may, onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, S.toolLock() ? "🔒" : "🔓"), "Lock tool") : null,
         h("button.tb", { onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, ui.theme === "dark" ? "☀" : "☾"), ui.theme === "dark" ? "Light" : "Dark"));
     } else if (ui.sheet === "panel") body = h("div.scroll", {}, panelNodes(true));
@@ -639,7 +658,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // Don't rebuild a panel or drawer the user is typing in.
   const busy = el => el.contains(document.activeElement) && /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName);
   // What every part depends on from the page and the session (a change rebuilds them all, as chromeDirty does).
-  const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.library.length].join("|");
+  const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.library.length, S.canShare, canMove()].join("|");
   const notesRowsKey = () => {
     const { notes, labels } = notesInfo(S.eds.notes.doc);
     return JSON.stringify([notes.length, S.mine.size, notes.slice(0, 200).map(e => [e.id, e.text ?? labels.get(e.id)?.text ?? "", e.backgroundColor, e.strokeColor, S.isMine(e.id)])]);
@@ -673,7 +692,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     return root;
   };
   const parts = {
-    topbar: { key: () => `${notesCount()}${S.canShare ? ":share" : ""}${moveInfo.can ? ":move" : ""}:${moveInfo.space?.id ?? ""}:${moveInfo.space?.name ?? ""}`, build: buildTopbar },
+    topbar: { key: () => `${notesCount()}${S.canShare ? ":share" : ""}${canMove() ? ":move" : ""}:${moveInfo.space?.id ?? ""}:${moveInfo.space?.name ?? ""}`, build: buildTopbar },
     panel: { key: () => (S.role === "viewer" || !ui.panel.open ? "" : panelKey()), build: buildPanel },
     drawer: { key: () => (ui.drawer === "notes" ? notesRowsKey() : ""), build: buildDrawer },
     timeline: { key: () => { const B = S.eds.board, bi = boardInfo(B.doc), t = B.time(); return S.role !== "presenter" ? "" : JSON.stringify([bi.marks, bi.dur, !!B.play, B.play ? null : t]); }, build: timeline },

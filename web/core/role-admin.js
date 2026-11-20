@@ -4,6 +4,7 @@
 // refuses nonsense early. Copy follows design/orgs/JOURNEY.md J9.
 
 import { errorText as baseError, NAME_MAX } from "./spaces.js";
+import { CONTENT_LABEL } from "./explain.js";
 
 /** @typedef {import("../ports/roles.js").RoleView} RoleView */
 
@@ -14,8 +15,7 @@ export const PERM_LABEL = {
   move: "Move boards out", delete: "Delete and restore", transfer: "Transfer ownership", "roles.manage": "Manage roles", "team.manage": "Manage teams",
 };
 /** The content tier (Unit level only): who may open boards beyond their own access. Said plainly, because it is the sensitive part of a role. */
-PERM_LABEL["content.shared"] = "Open every shared board";
-PERM_LABEL["content.personal"] = "Open personal spaces";
+Object.assign(PERM_LABEL, CONTENT_LABEL);
 export const PERM_HELP = {
   "content.shared": "Open and edit any board in any shared Space, as its owner. Not personal spaces.",
   "content.personal": "Open and manage boards in other people's personal spaces, as their owner would. Needs a reason: it reads private work.",
@@ -220,6 +220,7 @@ export function createRolesModel({ api, newKey = null }) {
         return {
           id: p.id, group: p.group, label: permLabel(p.id), ...(PERM_HELP[p.id] ? { help: PERM_HELP[p.id] } : {}), ticked,
           tickable: p.group !== "content" && editable && M.tickable.includes(p.id) && !(r?.kind === "member" && p.group === "content-tier"),
+          ...(p.group === "content-tier" && editable && !(M.tickable.includes(p.id) && r?.kind !== "member") ? { reason: r?.kind === "member" ? "The Unit member role never carries this." : "Only someone who holds this can grant it." } : {}),
           cells: M.scopes.map(s => ({ scope: s, state: !p.scopes.includes(s) ? "na" : ticked ? "yes" : "no" })),
         };
       });

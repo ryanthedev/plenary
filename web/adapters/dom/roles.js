@@ -50,13 +50,18 @@ export function mountRolesPage({ root, model, hrefs, signIn = null }) {
 
   function matrixView(rows, editable) {
     const head = h("tr", {}, h("th", { scope: "col" }, "Permission"), h("th", { scope: "col" }, "Granted"), S.page.matrix.scopes.map(s => h("th", { scope: "col" }, SCOPE_LABEL[s] ?? s)));
-    const body = rows.map(r => {
+    let tierHead = false;
+    const body = rows.flatMap(r => {
+      const heading = r.group === "content-tier" && !tierHead && (tierHead = true)
+        ? h("tr.tier-head", {}, h("th", { scope: "colgroup", colspan: String(2 + S.page.matrix.scopes.length) }, "Content tier", h("br"), h("small", {}, "Opening boards beyond your own access. Held at the organization only; only someone who holds a permission can give it.")))
+        : null;
       const grant = r.group === "content"
         ? h("td", {}, h("span", {}, r.ticked ? "Yes" : "No"), h("small", {}, " set by board access"))
-        : h("td", {}, keys.mark(ctl(h("input", { type: "checkbox", checked: r.ticked, "aria-label": `${r.label}, ${r.id}`, "aria-disabled": r.tickable ? "false" : "true",
+        : h("td", {}, keys.mark(ctl(h("input", { type: "checkbox", checked: r.ticked, "aria-label": `${r.label}, ${r.id}`, "aria-disabled": r.tickable ? "false" : "true", ...(r.reason ? { "aria-describedby": `reason-${r.id.replace(/\W/g, "-")}` } : {}),
           onclick: e => { if (!r.tickable || S.busy) { e.preventDefault?.(); return; } model.toggle(r.id); } })), `perm:${r.id}`));
-      return h("tr", {}, h("th", { scope: "row" }, r.label, h("br"), h("code", {}, r.id), r.help ? h("br") : null, r.help ? h("small", {}, r.help) : null), grant,
+      const row = h("tr", {}, h("th", { scope: "row" }, r.label, h("br"), h("code", {}, r.id), r.help ? h("br") : null, r.help ? h("small", {}, r.help) : null, r.reason ? h("br") : null, r.reason ? h("small", { id: `reason-${r.id.replace(/\W/g, "-")}`, class: "reason" }, r.reason) : null), grant,
         r.cells.map(c => h("td", {}, h("span", { "aria-hidden": "true" }, CELL[c.state][0]), h("span.sr-only", {}, `${SCOPE_LABEL[c.scope]}: ${CELL[c.state][1]}`))));
+      return heading ? [heading, row] : [row];
     });
     return h("div.matrix-scroll", { role: "region", "aria-label": "Permission matrix", tabindex: "0" },
       h("table.matrix", {}, h("caption", {}, editable ? "Permissions by scope. Tick a permission to grant it." : "Permissions by scope. This role is read-only."), h("thead", {}, head), h("tbody", {}, body)));

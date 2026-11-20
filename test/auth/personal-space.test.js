@@ -71,11 +71,13 @@ test("the owner still moves, renames, shares and trashes their own personal boar
   expect(await plain("ada", `/boards/${diary.id}/move`)).toBe(200);
   expect(await plain("ada", `/boards/${diary.id}/trash`, "POST", { from: adaSp.id })).toBe(200);
 });
-test("a content-access admin (board content on) still moves, grants, shares and renames; and a manage-only admin still manages a SHARED-space board", async () => {
-  expect(await content("chief", `/boards/${diary.id}/move`)).toBe(200);
-  expect(await content("chief", `/boards/${diary.id}/grants/dev:bo`, "PUT", { role: "viewer" })).toBe(204);
-  expect(await content("chief", `/boards/${diary.id}/links`, "POST", { role: "viewer", expiresAt: null })).toBe(201);
+test("a content.personal holder opens, renames, trashes, restores and moves out a personal board, but never shares it (grant, link, invite) or makes its own grant (#88 M2); a manage-only admin still manages a SHARED-space board", async () => {
   expect(await content("chief", `/boards/${diary.id}`, "PATCH", { title: "ok" })).toBe(200);
+  expect(await content("chief", `/boards/${diary.id}/grants/dev:bo`, "PUT", { role: "viewer" })).toBe(403);
+  expect(await content("chief", `/access/board/${diary.id}/grants/user/dev:bo`, "PUT", { role: "viewer" })).toBe(403);
+  expect(await content("chief", `/boards/${diary.id}/links`, "POST", { role: "viewer", expiresAt: null })).toBe(403);
+  expect(await content("chief", `/boards/${diary.id}/invites`, "POST", { email: "x@acme.com", role: "viewer", expiresAt: null })).toBe(403);
+  expect(await content("chief", `/boards/${diary.id}/move`)).toBe(200);
   const shared = await r.createBoard({ tenant: acme.id, title: "Shared", space: rootSp.id, owner: ada.user, memberRole: null });
   const other = await r.createSpace({ tenant: acme.id, name: "Other", generalRole: null, owner: ada.user });
   await r.setScopedGrant({ scope: { type: "space", id: other.id }, subject: { type: "user", id: root.user }, role: "owner" });

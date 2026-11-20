@@ -338,7 +338,8 @@ describe("uniform work and no-name answers (PROTOCOL.md § Spaces and Groups)", 
     expect(out).toEqual({ id: priv.id, general: null });
     expect(JSON.stringify(out)).not.toContain("Fresh");
     const hg = await r.createGroup({ tenant: acme.id, name: "Closed G", generalRole: null, owner: "google:ada" });
-    expect(await svc.update(root, "group", hg.id, { general: "viewer" })).toEqual({ id: hg.id, general: "viewer" });
+    expect(await code(svc.update(root, "group", hg.id, { general: "viewer" }))).toBe("forbidden");   // widening hands out a role the manage-only admin does not hold (#88); narrowing and renaming need none
+    expect(await svc.update(root, "group", hg.id, { name: "Closed H" })).toEqual({ id: hg.id, name: "Closed H" });
   });
   test("DW-5: a Unit admin cannot create a board in another member's personal space, with the ordinary refusal", async () => {
     const mine = await svc.createBoard(max, {});

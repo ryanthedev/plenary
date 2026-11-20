@@ -116,7 +116,7 @@ export function normContentAdmin(a) {
  *   contentAdmins / contentAdminsPersonal: users given the built-in Unit role `content-admin` (every shared Space's boards) or `content-admin-personal` (those and personal spaces) at the Unit. The content tier can be
  *   passed on only by a holder (PROTOCOL.md § Admin levels), so this operator step is the one way the first holder appears. Additive like `admins`: it never removes a grant or replaces any other role (a user already
  *   on `content-admin` is raised to `content-admin-personal` when asked).
- * @returns {Promise<{ tenant: Tenant, created: boolean, added: string[], content: string[] }>}  `added`: admins this call added; `content`: users whose content-tier grant this call set
+ * @returns {Promise<{ tenant: Tenant, created: boolean, added: string[], content: string[], skipped: { user: string, role: string }[] }>}  `added`: admins this call added; `content`: users whose content-tier grant this call set; `skipped`: users asked for a content role who already hold another Unit role (kept; change it from the Unit access page)
  */
 export async function bootstrapTenant({ registry, domain, admins = [], contentAdmins = [], contentAdminsPersonal = [] }) {
   const d = normDomain(domain);
@@ -140,13 +140,14 @@ export async function bootstrapTenant({ registry, domain, admins = [], contentAd
     await registry.addTenantAdmin(t.id, a);
     added.push(a);
   }
-  const content = [];
+  const content = [], skipped = [];
   const scope = { type: "unit", id: t.id };
   for (const [users, role] of [[shared, "content-admin"], [personal, "content-admin-personal"]]) for (const user of users) {
     const subject = { type: "user", id: user }, cur = await registry.scopedGrant(scope, subject);
-    if (cur === role || (cur != null && !(cur === "content-admin" && role === "content-admin-personal"))) continue;   // additive: another role (or a higher tier) stays
+    if (cur === role || (cur === "content-admin-personal" && role === "content-admin")) continue;   // already there (or higher): nothing to do
+    if (cur != null && !(cur === "content-admin" && role === "content-admin-personal")) { skipped.push({ user, role: cur }); continue; }   // additive: a user holding another Unit role keeps it, and the caller is told
     await registry.setScopedGrant({ scope, subject, role });
     content.push(user);
   }
-  return { tenant: (await registry.tenant(t.id)) ?? t, created, added, content };
+  return { tenant: (await registry.tenant(t.id)) ?? t, created, added, content, skipped };
 }

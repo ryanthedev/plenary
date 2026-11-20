@@ -62,6 +62,23 @@ test("the list: named list items with kind and use, custom first selected; a bui
   expect(btn("Delete role…")).toBeUndefined();
 });
 
+test("content tier (#88): its rows sit under their own heading, and a box the caller cannot tick says why, wired by aria-describedby", async () => {
+  page.matrix = { ...MATRIX, permissions: [...MATRIX.permissions, { id: "content.shared", group: "content-tier", scopes: ["unit"] }, { id: "content.personal", group: "content-tier", scopes: ["unit"] }], tickable: ["board.create", "content.shared"] };
+  page.roles.find(r => r.id === "r-fac").permissions = ["content.shared"];
+  await mount();
+  const heads = all(e => e.tagName === "TH" && e.getAttribute("scope") === "colgroup").map(textOf);
+  expect(heads).toHaveLength(1);
+  expect(heads[0]).toContain("Content tier");
+  const shared = byKey("perm:content.shared"), personal = byKey("perm:content.personal");
+  expect([on(shared), shared.getAttribute("aria-disabled"), shared.getAttribute("aria-describedby") ?? null]).toEqual([true, "false", null]);
+  expect(personal.getAttribute("aria-disabled")).toBe("true");
+  const id = personal.getAttribute("aria-describedby");
+  expect(id).toBe("reason-content-personal");
+  const reason = all(e => e.getAttribute("id") === id)[0];
+  expect(textOf(reason)).toBe("Only someone who holds this can grant it.");
+  expect(all(e => e.disabled === true)).toEqual([]);
+});
+
 test("the matrix: a scrollable named region, a table with column and row headers, a checkbox named by its permission, cells that say where it applies", async () => {
   await mount();
   const region = all(e => e.getAttribute("aria-label") === "Permission matrix")[0];

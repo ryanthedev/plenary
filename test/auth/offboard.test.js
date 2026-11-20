@@ -108,7 +108,7 @@ describe("who may reassign (permissions, never role names)", () => {
       expect((await manageOnly.effective(low, secret.id)).ladder).toBe(null);
       const out = await mo().list(low, sam.user);
       const mine = out.items.find(i => i.personal);
-      expect(mine.can).toEqual({ reassign: false, handover: false, why: "Private to its owner: needs board-content access" });
+      expect(mine.can).toEqual({ reassign: false, handover: false, why: "Private to its owner: needs the content.personal permission" });
       expect(JSON.stringify(out)).not.toContain("Secret plan");
       expect(out.canRemove).toBe(false);
       await moveAll2(mo(), ada.user, low);

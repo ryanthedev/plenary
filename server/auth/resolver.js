@@ -36,7 +36,7 @@ import { roleDef, tierReach, MEMBER_ROLE_ID, UNIT_ROLES, CONTENT_PERMS, ALLOWED_
 /**
  * One reason a user has some access.
  * @typedef {{ kind: "direct"|"team"|"general"|"invite"|"link"|"unit", scope: { type: ScopeType, id: string },
- *   role: string, team?: string, permissions: string[], ladder: Role|null, content?: "content.shared"|"content.personal" }} Source   `content`: the content-tier permission that gives this source its board content here
+ *   role: string, team?: string, permissions: string[], ladder: Role|null, content?: "content.shared"|"content.personal", own?: Role|null }} Source   `content`: the content-tier permission that gives this source its board content here (`ladder` is then at least owner); `own`: the ladder the same role gives WITHOUT the tier
  * @typedef {{ at: number, by: string|null, with: string|null, space: boolean, ladder: Role|null }} Trashed  what a target in Trash answers: when and by whom, the Space that took it (boards), whether a Space in the chain is in Trash, and the board role the caller held before
  * @typedef {{ ladder: Role|null, member?: boolean, permissions: Set<string>, sources: Source[], until: number, trashed?: Trashed }} Access
  */
@@ -117,7 +117,7 @@ export function resolveAccess({ ctx, grant = null, invites = [], links = [], tea
     const tier = scope.type === "unit" && role !== MEMBER_ROLE_ID ? tierReach(def.permissions, personal) : null;
     const dead = personal && scope.type === "unit" && !tier;
     const perms = dead ? [] : [...new Set([...def.permissions, ...(tier?.perms ?? [])])].filter(p => keep.has(p));
-    sources.push({ kind, scope, role, ...(team ? { team } : {}), permissions: perms, ladder: dead ? null : higher(def.ladder, tier?.ladder ?? null), ...(tier ? { content: tier.via } : {}) });
+    sources.push({ kind, scope, role, ...(team ? { team } : {}), permissions: perms, ladder: dead ? null : higher(def.ladder, tier?.ladder ?? null), ...(tier ? { content: tier.via, own: def.ladder } : {}) });
   };
   /** Grants on a Space, Group or the Unit, or a Team's grant anywhere, count only for the inside; and never the Unit roles `admin` and `member`. */
   const grantsOn = scope => {
@@ -170,3 +170,16 @@ export function resolveAccess({ ctx, grant = null, invites = [], links = [], tea
  * @param {Access} a
  */
 export const mayMove = a => a.permissions.has("move") && a.member === true;
+
+/**
+ * Does this access hold the content tier AT THIS TARGET (`content.shared` on a shared one, `content.personal` on a personal one)? The one test behind every ladder exemption (#88): the holder may hand out board roles
+ * and move a board where they'd gain a role, as a Unit admin used to. Read from the sources, which name the permission; never a role name and never `isUnitAdmin`.
+ * @param {Access} a
+ */
+export const holdsTier = a => !!a && a.sources.some(s => s.content != null);
+
+/**
+ * The board ladder this access holds WITHOUT the content tier: what the holder may hand out (`withinLadder` for grants, links, invites). The tier's owner step lets its holder open and act as the owner, never hand out roles by itself.
+ * @param {Access} a @returns {Role|null}
+ */
+export const ownLadder = a => a.sources.reduce((r, s) => higher(r, s.content != null ? s.own ?? null : s.ladder), /** @type {Role|null} */ (null));

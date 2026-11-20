@@ -406,7 +406,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
     // The dev sign-in menu: each name once, with the role it is actually granted (the highest across its tokens). A token
     // with admin or a domain is a tenant admin or a Workspace member. Identity is per name (dev:<name>), so a name that ANY
     // token flags admin or gives a domain is never published, whatever its other tokens say.
-    const privileged = new Set(Object.values(tokens).filter(t => t && (t.admin === true || t.domain)).map(t => t.name));
+    const privileged = new Set(Object.values(tokens).filter(t => t && (t.admin === true || t.domain || t.content)).map(t => t.name));
     for (const [token, t] of Object.entries(tokens)) {
       if (!t || typeof t.name !== "string" || !t.name || privileged.has(t.name) || offered.has(t.name)) continue;
       offered.set(t.name, { name: t.name, token, role: best.get("dev:" + t.name) });
@@ -479,7 +479,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
       domains.set(d, e);
     }
     for (const [domain, { admins, shared, all }] of domains) {
-      try { const r = await bootstrapTenant({ registry, domain, admins, contentAdmins: shared, contentAdminsPersonal: all }); log.info("dev tenant", { tenant: r.tenant.id, domain, created: r.created, added: r.added }); }
+      try { const r = await bootstrapTenant({ registry, domain, admins, contentAdmins: shared, contentAdminsPersonal: all }); log.info("dev tenant", { tenant: r.tenant.id, domain, created: r.created, added: r.added, content: r.content, ...(r.skipped.length ? { skipped: r.skipped } : {}) }); }
       catch (err) { if (err?.code !== "bad-request") throw err; log.error("dev token domain skipped", { domain, err }); }
     }
     if (off) log.warn("dev tokens are on, but the dev sign-in menu (GET /auth/dev) is OFF: " + off, { host });

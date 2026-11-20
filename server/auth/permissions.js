@@ -28,8 +28,13 @@ export const ROLE_PERMS = [...MGMT_PERMS, ...TIER_PERMS];
 export const PERMISSIONS = [...CONTENT_PERMS, ...MGMT_PERMS, ...TIER_PERMS];
 /** Built-in Unit roles of the content tier, grantable at the Unit only. Names are labels; every check reads the permissions. */
 export const TIER_ROLES = Object.freeze({ "content-admin": ["content.shared"], "content-admin-personal": ["content.shared", "content.personal"] });
-/** What a content-tier source adds on a PERSONAL space (target space or board): the owner's management, so the holder can move out, trash and hand over what they may open. */
-const OWNER_MGMT = ["board.create", "members.manage", "move", "delete", "transfer"];
+export const isTierRole = r => typeof r === "string" && Object.hasOwn(TIER_ROLES, r);
+/**
+ * What a content-tier source adds on a PERSONAL space (target space or board), besides the content permissions: `move` (move out) and `delete` (trash, restore). Handing a leaver's personal space over is checked on
+ * the tier itself (offboard.js `holdsTier`). NOT `members.manage`, `transfer` or `board.create`: the tier lets its holder open and act as the owner for those four things, never share to a third party, make links or
+ * invites, or create boards in someone's personal space (PROTOCOL.md § Admin levels).
+ */
+const OWNER_MGMT = ["move", "delete"];
 
 /** The content permissions of each ladder role (owner has all four; ownership itself is the ladder role `owner`). */
 const CONTENT_OF = { viewer: 1, commenter: 2, annotator: 3, editor: 4, owner: 4 };
@@ -64,7 +69,7 @@ export function roleDef(role, scope, roles = new Map()) {
   if (!at || typeof role !== "string") return null;
   const clip = list => list.filter(p => at.includes(p));
   if (role === "admin") return scope === "unit" ? { permissions: new Set(MGMT_PERMS), ladder: null } : null;   // manages; NO board content: that is the content tier
-  if (TIER_ROLES[role]) return scope === "unit" ? { permissions: new Set(TIER_ROLES[role]), ladder: null } : null;
+  if (isTierRole(role)) return scope === "unit" ? { permissions: new Set(TIER_ROLES[role]), ladder: null } : null;
   if (role === MEMBER_ROLE_ID) {
     if (scope !== "unit") return null;
     const o = roles.get(MEMBER_ROLE_ID);

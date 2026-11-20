@@ -316,7 +316,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       WHERE ?3 IS NULL OR w.title LIKE ?3 ESCAPE '\\' OR s.name LIKE ?3 ESCAPE '\\'
       ORDER BY w.id`),
     searchEdge: db.query("SELECT id FROM reg_boards WHERE tenant = ?1 AND trashed_at IS NULL AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT 2 OFFSET ?3"),
-    spaceCand: db.query(`SELECT s.* FROM reg_spaces s WHERE s.tenant = ?1 AND s.trashed_at IS NULL AND (?2 IS NULL OR s.id > ?2) AND (?4 = 1
+    spaceCand: db.query(`SELECT s.* FROM reg_spaces s WHERE s.tenant = ?1 AND s.trashed_at IS NULL AND (?2 IS NULL OR s.id > ?2) AND (?6 = 0 OR s.kind = 'personal') AND (?4 = 1
         OR s.general_role IS NOT NULL OR s.owner_user = ?3
         OR EXISTS (SELECT 1 FROM reg_scope_grants g WHERE g.scope_type = 'space' AND g.scope_id = s.id AND ((g.subject_type = 'user' AND g.subject = ?3)
           OR (g.subject_type = 'team' AND g.subject IN (SELECT team FROM reg_team_members WHERE member = ?3))))
@@ -1183,11 +1183,11 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       const edge = q.searchEdge.all(tenant, cur, cap - 1);          // [last board examined, one more] when the Unit goes on past the window
       return { ids, next: edge.length === 2 ? edge[0].id : null };
     },
-    async spaceCandidates(tenant, { user, all = false, after = null, limit } = {}) {
+    async spaceCandidates(tenant, { user, all = false, personal = false, after = null, limit } = {}) {
       ready();
       const cur = orgDefaults.cursor(after, "id"), n = smallLimit(limit, HOME.candidates.spaces.default, HOME.candidates.spaces.max);
       if (!str(tenant) || !str(user)) return { spaces: [], groups: [], next: null };
-      const rows = q.spaceCand.all(tenant, cur, user, all ? 1 : 0, n + 1), page = rows.slice(0, n);
+      const rows = q.spaceCand.all(tenant, cur, user, all ? 1 : 0, n + 1, personal ? 1 : 0), page = rows.slice(0, n);
       const gids = [...new Set(page.map(r => r.grp).filter(Boolean))];
       return { spaces: page.map(rowSpace), groups: gids.length ? q.groupsByIds.all(JSON.stringify(gids)).map(rowGroup) : [], next: rows.length > n ? page[n - 1].id : null };
     },

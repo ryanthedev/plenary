@@ -26,6 +26,8 @@ beforeEach(async () => {
   svc = mk();
   acme = await r.createTenant({ domain: "acme.com", admins: ["google:root"] });
   for (const p of [ada, max, lee, root]) await r.touchMember(acme.id, { user: p.user, name: p.name, email: p.email });
+  // root is an admin who also holds `content.shared`: a manage-only admin may not hand out board roles above their own (#88, test/auth/tiers.test.js), and these tests are about grants themselves.
+  await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: root.user }, role: "content-admin" });
   product = await r.createGroup({ tenant: acme.id, name: "Product", generalRole: null, owner: "google:ada" });
   design = await r.createSpace({ tenant: acme.id, name: "Design", group: product.id, generalRole: "viewer", owner: "google:ada" });
   secret = await r.createSpace({ tenant: acme.id, name: "Secret roadmap", generalRole: null, owner: "google:root" });
@@ -366,7 +368,7 @@ describe("access page: who has access, through what, and the picker", () => {
     expect(await svc.setGrant(lee, "space", platform.id, "user", max.user, fac.id)).toMatchObject({ role: fac.id, roleName: "Facilitator" });
     // a role that has no meaning at the Space (roles.manage is Unit-only) is simply clipped, still listed; the Unit page lists custom roles only
     const unit = await svc.accessPage(root, "unit", acme.id);
-    expect(unit.roles.map(x => x.name)).toEqual(["Facilitator", "Wide"]);
+    expect(unit.roles.map(x => x.name)).toEqual(["Unit content admin", "Facilitator", "Wide"]);   // root holds content.shared, so the built-in is theirs to give
     expect(unit.admins).toEqual([{ user: "google:root", name: "root", email: "root@acme.com" }]);
   });
   test("a board lists its people and Team grants, its Space's general access and inherited rows; custom roles are for Teams only", async () => {
@@ -413,7 +415,7 @@ describe("grant writes: add, change, remove, idempotency, announcements", () => 
     expect(await code(svc.setGrant(root, "unit", acme.id, "user", max.user, "member"))).toBe("bad-role");
     await svc.setGrant(root, "unit", acme.id, "user", max.user, fac.id);
     await svc.setGrant(root, "unit", acme.id, "team", infra.id, fac.id);
-    expect(await grants("unit", acme.id)).toEqual([`team:${infra.id}:${fac.id}`, `user:google:max:${fac.id}`]);
+    expect(await grants("unit", acme.id)).toEqual([`team:${infra.id}:${fac.id}`, `user:google:max:${fac.id}`, "user:google:root:content-admin"]);
     expect(ann.map(a => a.scope)).toEqual([`group:${product.id}`, `unit:${acme.id}`, `unit:${acme.id}`]);
   });
   test("a viewer, an editor, a stranger, a guest and a user with no Unit cannot change access, with the one refusal", async () => {
@@ -584,7 +586,8 @@ describe("no leaks: hidden, unknown and other-Unit ids answer alike and cost the
     }
   });
   test("the manager of a Space they cannot open learns no name: the page shows the scope without it", async () => {
-    // root is a Unit admin: manages every Space, opens none of the private ones while admin board content is off
+    // root is a manage-only Unit admin here (no content tier): manages every Space, opens none of the private ones
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: root.user }, role: null });
     const priv = await r.createSpace({ tenant: acme.id, name: "Ada private", generalRole: null, owner: "google:ada" });
     const p = await svc.accessPage(root, "space", priv.id);
     expect(p.can.manage).toBe(true);

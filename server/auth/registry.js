@@ -656,12 +656,12 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const scanned = window.slice(0, cap);
       return { ids: scanned.filter(id => hit(boards.get(id))), next: window.length > cap ? scanned[cap - 1] : null };   // `next`: the Unit goes on past the window, whatever matched
     },
-    async spaceCandidates(tenant, { user, all = false, after = null, limit } = {}) {
+    async spaceCandidates(tenant, { user, all = false, personal = false, after = null, limit } = {}) {
       after = orgDefaults.cursor(after, "id");
       const n = smallLimit(limit, HOME.candidates.spaces.default, HOME.candidates.spaces.max);
       const mine = [sk("user", user), ...[...members].filter(([, m]) => m.has(user)).map(([t]) => sk("team", t))];
       const granted = (type, id) => { const g = scoped.get(sk(type, id)); return !!g && mine.some(k => g.has(k)); };
-      const rows = [...spaces.values()].filter(sp => sp.tenant === tenant && sp.trashedAt == null && (after == null || sp.id > after)
+      const rows = [...spaces.values()].filter(sp => sp.tenant === tenant && sp.trashedAt == null && (after == null || sp.id > after) && (!personal || sp.kind === "personal")
         && (all || sp.generalRole != null || sp.owner === user || granted("space", sp.id)
           || (sp.group != null && (groups.get(sp.group)?.generalRole != null || granted("group", sp.group))))).sort((a, b) => (a.id < b.id ? -1 : 1));
       const page = rows.slice(0, n), gs = [...new Set(page.map(sp => sp.group).filter(Boolean))].map(g => groups.get(g)).filter(Boolean);

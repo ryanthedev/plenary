@@ -6,7 +6,7 @@
 // resolver's answer (`move` on the board, `board.create` at the destination), never a role name. Names are access (#51): a person, Team or container the caller may not see is never named.
 
 import { AdminError } from "../admin/boards.js";
-import { isUnitAdmin, resolveAccess, movedContext, mayMove } from "./resolver.js";
+import { resolveAccess, movedContext, mayMove } from "./resolver.js";
 import { roleDef, withinLadder, UNIT_ROLES } from "./permissions.js";
 import { LADDER_NAMES } from "./explain.js";
 import { capTo, higher, ROLES, INVITE_ROLES } from "./util.js";
@@ -60,14 +60,14 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
     if (!id) throw refused();                                   // malformed: nothing to read (the id is not an existence oracle)
     const [unit, row, access] = await Promise.all([tenancy.tenantOf(identity), registry.board(id), tenancy.effective(identity, id, { uniform: true })]);
     if (!unit || !row || row.tenant !== unit.id || !mayMove(access)) throw refused();   // the one rule the welcome and the cards use too
-    return { unit, row, access, admin: isUnitAdmin(unit, identity) };
+    return { unit, row, access };
   }
   /** Rules 2 to 4 for one destination: its row, the caller's access and its context; else `forbidden`. */
   async function target(identity, m, to) {
     const t = await spaces.createTarget(identity, m.unit, to);
     if (!t) throw refused();
     const ctx = await registry.accessContext({ type: "space", id: t.row.id }, { users: [identity.user] });
-    if (!ctx || !withinLadder(m.access.ladder, givenBy(ctx), m.admin)) throw refused();
+    if (!ctx || !withinLadder(m.access.ladder, givenBy(ctx))) throw refused();
     return { ...t, ctx };
   }
 
@@ -100,7 +100,7 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
       const cand = picked.spaces.filter(s => s.id !== m.row.space).slice(0, HOME.batch);
       // ONE batch read settles rule 4 for every candidate (its own context holds its Space's and Group's grants).
       const ctxs = cand.length ? await registry.accessContexts(cand.map(s => ({ type: "space", id: s.id })), { users: [identity.user] }) : new Map();
-      const ok = cand.filter(s => { const c = ctxs.get("space\n" + s.id); return c && withinLadder(m.access.ladder, givenBy(c), m.admin); });
+      const ok = cand.filter(s => { const c = ctxs.get("space\n" + s.id); return c && withinLadder(m.access.ladder, givenBy(c)); });
       return { board: { id: m.row.id, title: m.row.title }, from: from ?? { hidden: true }, destinations: ok.slice(0, LIMITS.destinations), more: picked.more || ok.length > LIMITS.destinations };
     },
 

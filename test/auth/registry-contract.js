@@ -1189,6 +1189,8 @@ export function registryContract(name, makeRegistry, opts = {}) {
         const names = async o => (await r.spaceCandidates(t.id, { user: "dev:ann", ...o })).spaces.map(x => x.name).sort();
         expect(await names()).toEqual(["ByTeam", "ByUser", "General", "InGranted", "InOpen", "ann's space"].sort());
         expect((await names({ all: true })).length).toBe(9);                       // a Unit-level role: every Space of the Unit, nothing of another Unit
+        expect(await names({ all: true, personal: true })).toEqual(["ann's space", "bob's space"]);   // `personal`: only personal Spaces (#88 LOW-5), so shared ones never fill a page
+        expect(await names({ personal: true })).toEqual(["ann's space"]);
         const first = await r.spaceCandidates(t.id, { user: "dev:ann", all: true, limit: 4 });
         expect(first.spaces.length).toBe(4);
         expect(first.next).toBe(first.spaces[3].id);

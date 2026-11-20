@@ -6,7 +6,6 @@
 
 import { AdminError } from "../admin/boards.js";
 import { TRASH, HOME, TEAMS } from "./registry-port.js";
-import { isUnitAdmin } from "./resolver.js";
 import { withinLadder } from "./permissions.js";
 import { givenBy } from "./move.js";
 
@@ -63,8 +62,7 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
   /** The count a keyed Space call stored in its ref (`<space>:trashed:<n>`, `<space>:restored:<n>`); 0 for an older or a no-op ref. */
   const countOf = ref => Number(/:(?:trashed|restored):(\d+)$/.exec(String(ref))?.[1] ?? 0);
   /**
-   * Where Restore puts an own-clock board whose Space is in Trash (J8 step 3): the caller's personal space, if their own role on the board does not rise there (#53's rule 4; a Unit admin is
-   * exempt). `null` = the board's Space is live (it goes back where it was); otherwise `{ space, ok }`, `ok` false = Restore would escalate.
+   * Where Restore puts an own-clock board whose Space is in Trash (J8 step 3): the caller's personal space, if their own role on the board does not rise there (#53's rule 4; no exemption: a holder of the content tier already carries the owner step). `null` = the board's Space is live (it goes back where it was); otherwise `{ space, ok }`, `ok` false = Restore would escalate.
    */
   async function destination(identity, d) {
     if (d.row.trashedWith != null || !d.row.space || (await registry.space(d.row.space))?.trashedAt == null) return null;
@@ -72,7 +70,7 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
     const space = await registry.personalSpace(d.unit.id, identity.user);
     const ctx = space && await registry.accessContext({ type: "space", id: space.id }, { users: [identity.user] });
     // A personal space that does not exist yet will be created with its owner (the restorer) as its owner, so the board role it gives the restorer is "owner".
-    return { space, ok: withinLadder(d.access.trashed?.ladder ?? d.access.ladder, space ? (ctx ? givenBy(ctx) : "owner") : "owner", isUnitAdmin(d.unit, identity)) };
+    return { space, ok: withinLadder(d.access.trashed?.ladder ?? d.access.ladder, space ? (ctx ? givenBy(ctx) : "owner") : "owner") };
   }
 
   const asAdminError = e => {

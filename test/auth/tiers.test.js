@@ -4,7 +4,7 @@
 // Built-in Unit roles `content-admin` (shared) and `content-admin-personal` (both); a custom role may carry either. Nothing is ever read from a role NAME.
 // Three layers: the pure resolver, the services (no escalation, roles screen, Team path, cache), and the HTTP routes end to end (open, Home, search, trash, move, offboarding, explain).
 import { test, expect, beforeEach, describe } from "bun:test";
-import { resolveAccess } from "../../server/auth/resolver.js";
+import { resolveAccess, holdsTier, ownLadder } from "../../server/auth/resolver.js";
 import { roleDef, roleProblem, tierReach, TIER_ROLES, TIER_PERMS, ROLE_PERMS } from "../../server/auth/permissions.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy as makeTenancy, roleCache } from "../../server/auth/tenancy.js";
@@ -49,9 +49,11 @@ describe("resolver: the tier decides, the admin role carries no content", () => 
   test("content.personal: owner of other people's personal spaces and boards, with the owner's management there (move out, trash, hand over)", () => {
     const pe = as(personal, "content-admin-personal");
     expect(pe.ladder).toBe("owner");
-    for (const p of ["board.view", "board.edit", "move", "delete", "transfer", "members.manage"]) expect(pe.permissions.has(p)).toBe(true);
+    for (const p of ["board.view", "board.edit", "move", "delete"]) expect(pe.permissions.has(p)).toBe(true);
+    for (const p of ["members.manage", "transfer", "board.create"]) expect(pe.permissions.has(p)).toBe(false);          // open and act as owner for move-out/trash/handover only; never share or create (#88 M2)
+    expect(holdsTier(pe)).toBe(true);
+    expect(ownLadder(pe)).toBe(null);                                                                                   // the tier's owner step never counts toward what the holder may hand out
     expect(pe.sources.find(s => s.role === "content-admin-personal")).toMatchObject({ content: "content.personal" });
-    expect(as(personal, "content-admin-personal", "space").permissions.has("board.create")).toBe(true);   // hand-over needs the owner role grantable on the Space
     expect(as(personal, "content-admin-personal", "space").ladder).toBe("owner");
     expect(as(shared, "content-admin-personal").ladder).toBe("owner");   // the role carries both
   });
@@ -159,12 +161,13 @@ describe("routes: Home tree, search, trash, move, offboarding by tier", () => {
     expect((await api("chiefP", `/boards/${diary.id}/restore`, "POST", {})).status).toBe(200);
     expect((await api("low", `/boards/${roadmap.id}/trash`, "POST", { from: designSp.id })).status).toBe(200);
   });
-  test("move out of a personal space (#53 comment): content.personal only; a shared Space's board moves by `move` alone", async () => {
+  test("move out of a personal space (#53 comment): content.personal only; a shared board moves only for someone who would not gain a role (the tier's owner step)", async () => {
     const dst = await r.createSpace({ tenant: acme.id, name: "Dest", generalRole: null, owner: "dev:root" });
     for (const who of ["low", "chiefS"]) expect((await api(who, `/boards/${diary.id}/move`, "POST", { from: adaSp.id, to: dst.id })).status).toBe(403);
     expect((await r.board(diary.id)).space).toBe(adaSp.id);
     expect((await api("chiefP", `/boards/${diary.id}/move`, "POST", { from: adaSp.id, to: dst.id })).status).toBe(200);
-    expect((await api("low", `/boards/${roadmap.id}/move`, "POST", { from: designSp.id, to: dst.id })).status).toBe(200);
+    expect((await api("low", `/boards/${roadmap.id}/move`, "POST", { from: designSp.id, to: dst.id })).status).toBe(403);   // manage-only: dst gives its owner a role the admin does not hold (rule 4, no exemption)
+    expect((await api("chiefS", `/boards/${roadmap.id}/move`, "POST", { from: designSp.id, to: dst.id })).status).toBe(200);
   });
   test("offboarding: handing over a personal space needs content.personal; content.shared alone is manage-only for it", async () => {
     const item = async who => (await api(who, `/members/${encodeURIComponent("dev:ada")}/offboarding`)).json?.items?.find(i => i.personal);
@@ -193,14 +196,16 @@ describe("no escalation: the tier is passed on only by a holder", () => {
     expect((await svc.create(p, { name: "Both", boardRole: "viewer", permissions: ["content.shared", "content.personal"] })).permissions.length).toBe(2);
     expect(await code(svc.update(low, "member", { permissions: ["content.shared"] }))).toBe("bad-request");   // the member role never carries it
   });
-  test("grants: only a holder gives content-admin (shared) or content-admin-personal (needs content.personal); a manage-only admin cannot change or clear one either", async () => {
+  test("grants: only a holder gives content-admin (shared) or content-admin-personal (needs content.personal); a manage-only admin may clear or lower one, never raise it", async () => {
     const a = mkAccess();
     const give = (who, to, role) => code(a.setGrant(ident(who), "unit", acme.id, "user", "dev:" + to, role));
     expect(await give("low", "bo", "content-admin")).toBe("forbidden");
     expect(await give("root", "bo", "content-admin-personal")).toBe("forbidden");
     expect(await give("chiefS", "bo", "content-admin-personal")).toBe("forbidden");
     expect(await give("chiefS", "bo", "content-admin")).toBe(null);
-    expect(await give("low", "bo", null)).toBe("forbidden");                                       // clearing is touching: not theirs
+    expect(await give("low", "bo", null)).toBe(null);                                              // removing never widens: any manager may clear a tier grant (decision a)
+    expect(await give("chiefS", "bo", "content-admin")).toBe(null);
+    expect(await give("low", "bo", "content-admin-personal")).toBe("forbidden");                    // but never widen it
     expect(await give("chiefP", "bo", "content-admin-personal")).toBe(null);
     expect(await give("chiefP", "bo", null)).toBe(null);
     const picks = (await a.accessPage(ident("low"), "unit", acme.id)).roles.map(x => x.id);
@@ -249,5 +254,125 @@ describe("operator bootstrap is the one way the first holder appears", () => {
     await bootstrapTenant({ registry: reg, domain: "globex.com", contentAdmins: ["dev:g", "dev:h"] });
     expect([await reg.scopedGrant(unit, { type: "user", id: "dev:g" }), await reg.scopedGrant(unit, { type: "user", id: "dev:h" })]).toEqual(["content-admin-personal", "content-admin-personal"]);
     expect(await code(bootstrapTenant({ registry: reg, domain: "globex.com", contentAdmins: ["a@globex.com"] }))).toBe("bad-request");
+    // LOW-2: a user who already holds another Unit role is not silently skipped: they are reported (the CLI exits 1)
+    const role = await reg.createRole({ tenant: out.tenant.id, name: "Other", boardRole: "viewer", permissions: [] });
+    await reg.setScopedGrant({ scope: unit, subject: { type: "user", id: "dev:k" }, role: role.id });
+    const again = await bootstrapTenant({ registry: reg, domain: "globex.com", contentAdmins: ["dev:k"] });
+    expect([again.content, again.skipped]).toEqual([[], [{ user: "dev:k", role: role.id }]]);
+    expect(await reg.scopedGrant(unit, { type: "user", id: "dev:k" })).toBe(role.id);
+  });
+});
+
+// ---------- H1 / M2 (review of #88): every ladder exemption is the tier, never "is a Unit admin" ----------
+describe("a manage-only Unit admin is held to their own board role (E1-E5); the matching tier holder is exempt", () => {
+  const UID = () => acme.id;
+  const SELF = "dev:low";
+  let lowSp;
+  beforeEach(async () => { lowSp = await r.ensurePersonalSpace(acme.id, SELF); });
+  test("E1: PUT /access/board/:b/grants/user/<self> owner (and a viewer, and to a third party) is refused; a content.shared holder may", async () => {
+    for (const [role, who] of [["owner", SELF], ["viewer", SELF], ["viewer", "dev:bo"]])
+      expect((await api("low", `/access/board/${roadmap.id}/grants/user/${who}`, "PUT", { role })).status).toBe(403);
+    expect(await r.grant(roadmap.id, SELF)).toBe(null);
+    expect((await api("low", `/boards/${roadmap.id}/grants/${SELF}`, "PUT", { role: "owner" })).status).toBe(403);   // the legacy route too
+    expect((await api("chiefS", `/access/board/${roadmap.id}/grants/user/dev:chiefS`, "PUT", { role: "owner" })).status).toBe(200);
+    expect(await r.grant(roadmap.id, "dev:chiefS")).toBe("owner");
+  });
+  test("E2: a custom role (it always carries a board role) granted to oneself at the Unit is refused; a holder may", async () => {
+    const role = await r.createRole({ tenant: acme.id, name: "Peeker", boardRole: "viewer", permissions: [] });
+    expect((await api("low", `/access/unit/${UID()}/grants/user/${SELF}`, "PUT", { role: role.id })).status).toBe(403);
+    expect(await r.scopedGrant({ type: "unit", id: UID() }, { type: "user", id: SELF })).toBe(null);
+    expect((await api("chiefS", `/access/unit/${UID()}/grants/user/dev:bo`, "PUT", { role: role.id })).status).toBe(200);
+  });
+  test("E3: moving a shared board into one's own personal space is refused; a content.shared holder (owner step) may", async () => {
+    expect((await api("low", `/boards/${roadmap.id}/move`, "POST", { from: designSp.id, to: lowSp.id })).status).toBe(403);
+    expect((await r.board(roadmap.id)).space).toBe(designSp.id);
+    expect((await api("chiefS", `/boards/${roadmap.id}/move`, "POST", { from: designSp.id, to: (await r.ensurePersonalSpace(acme.id, "dev:chiefS")).id })).status).toBe(200);
+  });
+  test("E4: PATCH /spaces/:s general access widened is refused (narrowing and renaming are not); a holder may widen", async () => {
+    expect((await api("low", `/spaces/${designSp.id}`, "PATCH", { general: "editor" })).status).toBe(403);
+    expect((await r.space(designSp.id)).generalRole).toBe(null);
+    expect((await api("low", `/spaces/${designSp.id}`, "PATCH", { name: "Design 2" })).status).toBe(200);
+    expect((await api("chiefS", `/spaces/${designSp.id}`, "PATCH", { general: "editor" })).status).toBe(200);
+    expect((await api("low", `/spaces/${designSp.id}`, "PATCH", { general: null })).status).toBe(200);              // narrowing never needs a role
+  });
+  test("E5: a link or an invite on a shared board is refused (the share list offers no role); a holder may, up to any role", async () => {
+    expect((await api("low", `/boards/${roadmap.id}/links`, "POST", { role: "viewer", expiresAt: null })).status).toBe(403);
+    expect((await api("low", `/boards/${roadmap.id}/invites`, "POST", { email: "x@acme.com", role: "viewer", expiresAt: null })).status).toBe(403);
+    const share = await api("low", `/boards/${roadmap.id}/share`);
+    expect([share.json.limits.inviteRoles, share.json.limits.linkRoles]).toEqual([[], []]);
+    expect((await api("chiefS", `/boards/${roadmap.id}/links`, "POST", { role: "editor", expiresAt: null })).status).toBe(201);
+    expect((await api("chiefS", `/boards/${roadmap.id}/invites`, "POST", { email: "x@acme.com", role: "editor", expiresAt: null })).status).toBe(201);
+  });
+  test("what the manage-only admin keeps: Teams, role definitions, Space settings other than access, trash of a shared board, removing a grant", async () => {
+    const t = await api("low", "/teams", "POST", { name: "Ops" });
+    expect(t.status).toBe(201);
+    expect((await api("low", "/roles", "POST", { name: "Plain", boardRole: "viewer", permissions: ["move"] })).status).toBe(201);
+    expect((await api("low", `/spaces/${designSp.id}`, "PATCH", { name: "Design 3" })).status).toBe(200);
+    expect((await api("low", `/boards/${roadmap.id}/trash`, "POST", { from: designSp.id })).status).toBe(200);
+  });
+  test("Teams: a manage-only admin cannot add THEMSELF to a Team that holds a board role (the same check as anyone); adding another member stays the admin's", async () => {
+    const team = await r.createTeam({ tenant: acme.id, name: "Editors" });
+    await r.setScopedGrant({ scope: { type: "space", id: designSp.id }, subject: { type: "team", id: team.id }, role: "editor" });
+    expect((await api("low", `/teams/${team.id}/members/${SELF}`, "PUT")).status).toBe(403);
+    expect((await api("low", `/teams/${team.id}/members/dev:bo`, "PUT")).status).toBe(204);
+    expect(await ten.role(ident("low"), roadmap.id)).toBe(null);
+  });
+  test("offboarding: a manage-only admin reassigns a leaver's shared Space to ANOTHER member, never to themself; a holder may take it", async () => {
+    const sp = await r.createSpace({ tenant: acme.id, name: "Leaver's", generalRole: null, owner: "dev:bo" });
+    const ask = (who, to) => api(who, `/members/${encodeURIComponent("dev:bo")}/offboarding/reassign`, "POST", { type: "space", id: sp.id, to }, undefined);
+    expect((await ask("low", SELF)).status).toBe(403);
+    expect((await ask("low", "dev:ada")).status).toBe(200);
+    const sp2 = await r.createSpace({ tenant: acme.id, name: "Leaver's 2", generalRole: null, owner: "dev:bo" });
+    const mine = await api("chiefS", `/members/${encodeURIComponent("dev:bo")}/offboarding/reassign`, "POST", { type: "space", id: sp2.id, to: "dev:chiefS" });
+    expect(mine.status).toBe(200);
+  });
+});
+
+describe("M2: content.personal opens and acts as owner for move-out, trash, restore and handover only", () => {
+  test("a content.personal holder cannot share a personal board, make a link or invite, transfer it, or create a board in someone's personal space", async () => {
+    for (const [path, method, body] of [[`/boards/${diary.id}/grants/dev:bo`, "PUT", { role: "viewer" }], [`/access/board/${diary.id}/grants/user/dev:bo`, "PUT", { role: "viewer" }],
+      [`/access/board/${diary.id}/grants/user/dev:chiefP`, "PUT", { role: "owner" }], [`/boards/${diary.id}/links`, "POST", { role: "viewer", expiresAt: null }],
+      [`/boards/${diary.id}/invites`, "POST", { email: "x@acme.com", role: "viewer", expiresAt: null }], ["/boards", "POST", { space: adaSp.id, title: "planted" }]])
+      expect([path, (await api("chiefP", path, method, body)).status]).toEqual([path, 403]);
+    const a = await ten.effective(ident("chiefP"), diary.id);
+    expect(["members.manage", "transfer", "board.create"].some(p => a.permissions.has(p))).toBe(false);
+    for (const [path, method, body, want] of [[`/boards/${diary.id}`, "PATCH", { title: "Renamed" }, 200], [`/boards/${diary.id}/trash`, "POST", { from: adaSp.id }, 200], [`/boards/${diary.id}/restore`, "POST", {}, 200]])
+      expect([path, (await api("chiefP", path, method, body)).status]).toEqual([path, want]);
+  });
+  test("content.shared likewise: its owner step opens a shared board but does not by itself let a non-admin holder share it", async () => {
+    await r.touchMember(acme.id, { user: "dev:pure", name: "pure", email: "pure@acme.com" });
+    const ten2 = makeTenancy({ registry: r });
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: "dev:pure" }, role: "content-admin" });
+    const a = await ten2.effective(ident("pure"), roadmap.id);
+    expect([a.ladder, a.permissions.has("members.manage"), holdsTier(a), ownLadder(a)]).toEqual(["owner", false, true, null]);
+  });
+});
+
+describe("who holds the tier is visible, and the built-ins are guarded", () => {
+  test("every Unit admin sees the tier holders on the Unit access page and a 'used in N places' count on the built-in roles (read-only)", async () => {
+    const page = await api("low", `/access/unit/${acme.id}`);
+    const rows = page.json.rows.filter(x => x.role.startsWith("content-admin"));
+    expect(rows.map(x => [x.subject.id, x.role]).sort()).toEqual([["dev:chiefP", "content-admin-personal"], ["dev:chiefS", "content-admin"]]);
+    expect(rows.every(x => x.can.remove === true && x.can.change === false)).toBe(true);                          // may clear, may not change or raise
+    const list = await api("low", "/roles");
+    const byId = id => list.json.roles.find(x => x.id === id);
+    expect([byId("content-admin").used, byId("content-admin-personal").used]).toEqual([{ places: 1, capped: false }, { places: 1, capped: false }]);
+    expect(byId("content-admin").editable).toBe(false);
+  });
+  test("LOW-6: a copy of a tier role is refused to someone who could not hold it; a holder may copy; a custom role's summary names the tier separately", async () => {
+    expect((await api("low", "/roles", "POST", { name: "Copy", boardRole: "viewer", permissions: [], base: "content-admin" })).status).toBe(403);
+    expect((await api("chiefS", "/roles", "POST", { name: "Copy", boardRole: "viewer", permissions: ["move", "content.shared"], base: "content-admin" })).status).toBe(201);
+    const l = await api("chiefS", "/roles");
+    expect(l.json.roles.find(x => x.name === "Copy").summary).toBe("Viewer board access, plus 1 management permission, plus opening shared boards");
+    expect((await api("low", "/roles", "POST", { name: "Odd", boardRole: "viewer", permissions: [], base: "constructor" })).status).toBe(400);
+  });
+});
+
+describe("a ladder exemption is the tier (mutant guard)", () => {
+  test("the resolver's tier source is what exempts: holdsTier is false for an admin without it and for a content.shared holder on a personal board", async () => {
+    expect(holdsTier(await ten.effective(ident("low"), roadmap.id))).toBe(false);
+    expect(holdsTier(await ten.effective(ident("chiefS"), roadmap.id))).toBe(true);
+    expect(holdsTier(await ten.effective(ident("chiefS"), diary.id))).toBe(false);
+    expect(holdsTier(await ten.effective(ident("chiefP"), diary.id))).toBe(true);
   });
 });

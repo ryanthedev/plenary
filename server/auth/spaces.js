@@ -6,8 +6,8 @@
 // that is hidden all answer alike (a read: `not-found`; a write: `forbidden`).
 
 import { AdminError } from "../admin/boards.js";
-import { resolveAccess } from "./resolver.js";
-import { ROLES } from "./util.js";
+import { resolveAccess, holdsTier, ownLadder } from "./resolver.js";
+import { ROLES, rank } from "./util.js";
 import { homeService } from "./home.js";
 import { explainService } from "./explain.js";
 
@@ -331,7 +331,7 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
     },
 
     /**
-     * PATCH /spaces/:id and /groups/:id: rename and/or change general access; needs `members.manage` there. A personal space refuses both
+     * PATCH /spaces/:id and /groups/:id: rename and/or change general access; needs `members.manage` there, and widening general access needs a board role at least that high (without the content tier) or the tier. A personal space refuses both
      * (its name and privacy are its owner's own). A general-access change tells every board it reaches.
      * @param {Identity} identity @param {"space"|"group"} type @param {string} id @param {{ name?: string, general?: string|null }} patch
      */
@@ -343,9 +343,11 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
       const sc = await scopeOf(identity, unit, type, id);
       if (!sc || !may(sc.access, "members.manage")) throw refused();
       if (sc.row.kind === "personal") throw refused();      // its name and privacy are its owner's own; the same 403 as any refusal, so nothing says which Space is personal
+      // General access gives every member a board role: widening it hands out a role, so no more than the caller holds without the content tier (a holder of it is exempt); narrowing never needs it (#88).
+      if (gen != null && rank(gen) > rank(sc.row.generalRole ?? null) && rank(gen) > rank(ownLadder(sc.access)) && !holdsTier(sc.access)) throw refused();
       const out = await registry.updateScope({ type, id: sc.row.id }, { ...(name !== undefined ? { name } : {}), ...(gen !== undefined ? { generalRole: gen } : {}) });
       if (gen !== undefined) announceLater(unit, { type, id: sc.row.id }, { revoke: RANK.indexOf(gen) < RANK.indexOf(sc.row.generalRole ?? null) });
-      // Names are access: someone who may manage a scope without opening it (a Unit admin, while admin board content is off) learns only what they
+      // Names are access: someone who may manage a scope without opening it (a manage-only Unit admin) learns only what they
       // just sent, never the name they did not set.
       if (!opens(sc.access)) return { id: out.id, ...(name !== undefined ? { name } : {}), ...(gen !== undefined ? { general: gen } : {}) };
       if (type === "group") return { id: out.id, name: out.name, general: out.generalRole ?? null };

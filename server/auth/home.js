@@ -79,8 +79,13 @@ export function homeService({ registry, tenancy, now = Date.now }) {
     const ua = await tenancy.effective(identity, { type: "unit", id: unit.id });
     const all = ua.ladder != null;                                                    // a Unit-level role covers everything inside ... except other people's personal spaces:
     const allPersonal = ua.permissions.has("content.personal");                       // only the content tier's `content.personal` opens those (#88, TECH-DEBT row 66); `content.shared` alone (all) does not
-    // `content.personal` without `content.shared` reaches no shared Space at the root, so it lists every Space as a candidate and the resolver answers per Space (bounded by SCAN.grantChecks).
-    const cand = await registry.spaceCandidates(unit.id, { user: identity.user, all: all || allPersonal, limit: LIMITS.spaces });
+    // `content.personal` without `content.shared` reaches no shared Space at the root: its own candidates (grants, general access) and, separately, every personal Space (a `personal` query, so shared Spaces they cannot open never fill the page).
+    let cand = await registry.spaceCandidates(unit.id, { user: identity.user, all, limit: LIMITS.spaces });
+    if (allPersonal && !all) {
+      const pers = await registry.spaceCandidates(unit.id, { user: identity.user, all: true, personal: true, limit: LIMITS.spaces });
+      const byId = new Map([...cand.spaces, ...pers.spaces].map(s => [s.id, s]));
+      cand = { spaces: [...byId.values()].sort((a, b) => (a.id < b.id ? -1 : 1)).slice(0, LIMITS.spaces), groups: [...new Map([...cand.groups, ...pers.groups].map(g => [g.id, g])).values()], next: cand.next ?? pers.next ?? (byId.size > LIMITS.spaces ? "more" : null) };
+    }
     const groups = new Map(cand.groups.map(g => [g.id, g]));
     const t = now();
     // What general access alone gives, from the rows in hand (no read); anything more needs the resolver's full answer.

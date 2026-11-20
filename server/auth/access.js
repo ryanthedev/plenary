@@ -7,7 +7,7 @@
 // scheduler in spaces.js through `announce`; it never holds a queue of its own).
 
 import { AdminError, knownOnBoard } from "../admin/boards.js";
-import { isUnitAdmin } from "./resolver.js";
+import { isUnitAdmin, holdsTier, ownLadder } from "./resolver.js";
 import { ROLES } from "./util.js";
 import { roleDef, ROLE_PERMS, TIER_PERMS, TIER_ROLES, UNIT_ROLES, withinLadder } from "./permissions.js";
 import { TEAMS } from "./registry-port.js";
@@ -43,13 +43,13 @@ export const mgmtOf = def => [...def.permissions].filter(p => ROLE_PERMS.include
 
 /**
  * The definition of `role` at `type` if the caller may hand it out there, else null. Valid there (roleDef), never `admin` or `member`, its management
- * permissions a subset of the caller's own at that scope and its board role no higher than the caller's own (no escalation, `withinLadder`), and, at a board, `owner` only for a Unit admin (today's rule).
+ * permissions a subset of the caller's own at that scope and its board role no higher than the caller's own (no escalation, `withinLadder` over the ladder held WITHOUT the content tier, `ownLadder`), and, at a board, `owner` only for a holder of the content tier at that target (`exempt` = `holdsTier(access)`; #88: a Unit admin without the tier is held to their own ladder).
  */
-export function grantable(access, role, type, roles, admin) {
+export function grantable(access, role, type, roles, exempt) {
   if (role === "admin" || role === "member") return null;
   const def = roleDef(role, type, roles);
-  if (!def || !mgmtOf(def).every(p => access.permissions.has(p)) || !withinLadder(access.ladder, def.ladder, admin)) return null;   // management permissions a subset of the caller's, and no more board role than they hold (a Unit admin is exempt)
-  if (type === "board" && role === "owner" && !admin) return null;
+  if (!def || !mgmtOf(def).every(p => access.permissions.has(p)) || !withinLadder(ownLadder(access), def.ladder, exempt)) return null;   // management permissions a subset of the caller's, and no more board role than they hold (a Unit admin is exempt)
+  if (type === "board" && role === "owner" && !exempt) return null;
   return def;
 }
 
@@ -121,13 +121,13 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
   /**
    * Adding a person to a Team grants them every grant the Team holds, and removing one revokes them (so does deleting the Team): the caller must be able
    * to do each of those as a direct grant (`members.manage` at the scope and the role grantable by them there, the same `touchable` rule), or `team.manage`
-   * would be a back door to roles the caller cannot give. A Unit admin passes. Bounded: at most LIMITS.teamScopes scopes are read and checked; a Team that
+   * would be a back door to roles the caller cannot give. A Unit admin passes, except to add themself (that takes the Team's grants for themself: the same check as anyone). Bounded: at most LIMITS.teamScopes scopes are read and checked; a Team that
    * holds more, or any scope the caller falls short on, is the ordinary refusal for a non-admin.
    * ADDING a member is the one change that widens access: a Unit admin's pass does not reach a personal space or a board in one (they are its owner's, PROTOCOL.md § Organization), so for those scopes the admin needs
    * `members.manage` from the resolver like anyone (a manage-only admin has none there). Removing never widens, and offboarding relies on it: an admin always may. Only the Team's grants on personal scopes are read for that (`personalScopesOf`, at most LIMITS.teamScopes; a Team holding more of those is refused for adding).
    */
-  async function mayChangeTeam(identity, unit, team, { adding = false } = {}) {
-    const admin = isUnitAdmin(unit, identity);
+  async function mayChangeTeam(identity, unit, team, { adding = false, self = false } = {}) {
+    const admin = isUnitAdmin(unit, identity) && !(adding && self);   // adding YOURSELF to a Team is taking its grants: the per-scope check below, with no admin pass (#88)
     if (admin && !adding) return true;
     if (admin) {
       // A Team's Unit-wide grant of a content-tier role is content access for everyone added: the admin needs those permissions themselves (#88, no exemption).
@@ -156,7 +156,7 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
     for (const sc of p.scopes) {
       if (!validAt(sc.role, sc.type, roles)) continue;                          // a stale role counts for nothing: nothing to give or take
       const access = sc.type === "board" ? await tenancy.effective(identity, sc.id, { uniform: true }) : got.get(sc.type + "\n" + sc.id);
-      if (!access || !may(access, "members.manage") || !touchable(access, sc.role, sc.type, roles, false, subject, identity)) return false;
+      if (!access || !may(access, "members.manage") || !touchable(access, sc.role, sc.type, roles, holdsTier(access), subject, identity)) return false;
     }
     return true;
   }
@@ -190,13 +190,15 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
   // ---- who may grant what ----
   /**
    * May the caller alter or clear an existing grant of `role` held by `subject` at `type`? A role valid nowhere is stale and any manager may clear it;
-   * else it must be grantable by the caller. At a board a person's `owner` grant is changed only by a Unit admin or by its holder (today's rule).
+   * else it must be grantable by the caller. At a board a person's `owner` grant is changed only by a holder of the content tier there or by its holder.
    */
-  function touchable(access, role, type, roles, admin, subject, identity) {
+  function touchable(access, role, type, roles, exempt, subject, identity) {
     if (!validAt(role, type, roles)) return true;
-    if (type === "board" && subject.type === "user" && role === "owner" && !admin) return subject.id === identity.user;
-    return !!grantable(access, role, type, roles, admin);
+    if (type === "board" && subject.type === "user" && role === "owner" && !exempt) return subject.id === identity.user;
+    return !!grantable(access, role, type, roles, exempt);
   }
+  /** Does `role` at `type` carry a content-tier permission? */
+  const hasTier = (role, type, roles) => validAt(role, type, roles) && mgmtOf(roleDef(role, type, roles)).some(p => TIER_PERMS.includes(p));
   const validAt = (role, type, roles) => role !== "admin" && role !== "member" && roleDef(role, type, roles) != null;
 
   /**
@@ -307,7 +309,7 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
       const u = userIdOf(user);
       if (!u) throw bad("bad user");
       const { unit, team } = await managedTeam(identity, id);
-      if (!(await mayChangeTeam(identity, unit, team.id, { adding: member === true }))) throw refused();
+      if (!(await mayChangeTeam(identity, unit, team.id, { adding: member === true, self: u === identity.user }))) throw refused();
       if (member && !(await isKnownPerson(unit, u))) throw new AdminError("unknown-person", "that person is not a member of this Unit");
       try { await registry.setTeamMember(team.id, u, member); }
       catch (err) {
@@ -335,7 +337,7 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
       const sc = await scopeOf(identity, unit, type, id);
       if (!sc || !(opens(sc.access) || may(sc.access, "members.manage"))) throw missing();
       const { row, access } = sc;
-      const admin = isUnitAdmin(unit, identity), manage = manages(sc);
+      const exempt = holdsTier(access), manage = manages(sc);
       const scope = { type, id: row.id };
       const canSee = opens(access);
       const [page, roleList, people, unitPage] = await Promise.all([
@@ -372,9 +374,10 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
       const adminList = type === "unit" ? (unit.admins ?? []).filter(a => !a.startsWith("email:")).slice(0, LIMITS.admins).map(a => ({ type: "user", id: a })) : [];
       const label = named(unit, [...rawRows.map(r => r.subject), ...inheritedPages.flatMap(p => p.grants.map(g => g.subject)), ...adminList, ...unitGrants.map(g => g.subject), ...orgAdmins.slice(0, LIMITS.inherited).map(a => ({ type: "user", id: a }))]);
       const nameOfSubject = await label;
-      const canTouch = (role, g) => manage && touchable(access, role, type, roles, admin, g, identity);
+      const canTouch = (role, g) => manage && touchable(access, role, type, roles, exempt, g, identity);
+      const canRemove = (role, g) => canTouch(role, g) || (manage && hasTier(role, type, roles));   // clearing a content-tier grant never widens access: any manager may
       const toRow = (g, extra = {}) => ({ subject: nameOfSubject(g.subject), role: g.role, roleName: roleLabel(g.role, roles), via: g.subject.type === "team" ? "team" : "direct", ...extra });
-      const rows = rawRows.map(g => toRow(g, { can: { change: canTouch(g.role, g.subject), remove: canTouch(g.role, g.subject) } }));
+      const rows = rawRows.map(g => toRow(g, { can: { change: canTouch(g.role, g.subject), remove: canRemove(g.role, g.subject) } }));
       const inherited = above.flatMap((c, i) => inheritedPages[i].grants.map(g => ({ scope: { type: c.type, id: c.row.id, name: c.row.name }, subject: nameOfSubject(g.subject), role: g.role, roleName: roleLabel(g.role, roles), via: "inherited" })));
       for (const g of unitGrants) inherited.push({ scope: { type: "unit", id: unit.id }, subject: nameOfSubject(g.subject), role: g.role, roleName: roleLabel(g.role, roles), via: "inherited" });
       const general = [];
@@ -393,7 +396,7 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
       const options = [...ROLES.filter(r => type !== "unit"), ...(type === "unit" ? Object.keys(TIER_ROLES) : []), ...[...roles.values()].filter(r => r.id !== "member").sort((a, b) => a.name.localeCompare(b.name)).map(r => r.id)];
       const pick = [];
       for (const r of manage ? options : []) {
-        const def = grantable(access, r, type, roles, admin);
+        const def = grantable(access, r, type, roles, exempt);
         if (def) pick.push({ id: r, name: roleLabel(r, roles), custom: !LADDER_NAMES[r], summary: summaryOf(r, def, roles), ladder: def.ladder, people: !(type === "board" && !LADDER_NAMES[r]) });
       }
       const name = type === "board" ? row.title : type === "unit" ? undefined : row.name;
@@ -422,21 +425,26 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
       const sc = await scopeOf(identity, unit, type, id);
       if (!sc || !manages(sc)) throw refused();
       const { row, access } = sc, scope = { type, id: row.id }, sub = { type: subjectType, id: sid };
-      const admin = isUnitAdmin(unit, identity);
+      const exempt = holdsTier(access);
       const roles = new Map((await registry.roles(unit.id)).map(r => [r.id, r]));
       const personBoard = type === "board" && subjectType === "user";
       const cur = personBoard ? await registry.grant(row.id, sid) : await registry.scopedGrant(scope, sub);
-      const touch = r => touchable(access, r, type, roles, admin, sub, identity);
+      // Removing or lowering the content tier never widens access, so any manager may (like removing a Team member): a change whose tier permissions are a subset of the current grant's counts as held.
+      const tierOf = r => (r != null && validAt(r, type, roles) ? mgmtOf(roleDef(r, type, roles)).filter(p => TIER_PERMS.includes(p)) : []);
+      const curTier = cur == null ? [] : tierOf(cur);
+      const narrows = r => curTier.length > 0 && tierOf(r).every(p => curTier.includes(p));
+      const touch = (r, to) => touchable(access, r, type, roles, exempt, sub, identity) || narrows(to);
 
       if (role === null) {
         if (cur == null) return null;
-        if (!touch(cur)) throw refused();
+        if (!touch(cur, null)) throw refused();
       } else {
         if (!validAt(role, type, roles) || (personBoard && !ROLES.includes(role))) throw new AdminError("bad-role", "that role does not apply here");
-        const def = grantable(access, role, type, roles, admin);
+        const held = narrows(role) ? { ...access, permissions: new Set([...access.permissions, ...curTier]) } : access;
+        const def = grantable(held, role, type, roles, exempt);
         if (!def) throw refused();
-        if (cur === role) return { ...(await rowOf(unit, sub, role, roles, type, access, admin, identity)) };
-        if (cur != null && !touch(cur)) throw refused();
+        if (cur === role) return { ...(await rowOf(unit, sub, role, roles, type, access, exempt, identity)) };
+        if (cur != null && !touch(cur, role)) throw refused();
         // A change to an existing grant needs no directory row. A NEW person grant above a board needs one; on a board, the shared rule of the old route (guests hold board scope).
         if (subjectType === "user") { if (cur == null && !(await (personBoard ? knownOnBoard(registry, row, sid) : isKnownPerson(unit, sid)))) throw new AdminError("unknown-person", "that person is not a member of this Unit"); }
         else if (!(await registry.teamsAmong(unit.id, [sid])).length) throw refused();
@@ -455,7 +463,7 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
       announce(unit, scope, { revoke });
       // The person now holds the access they may have asked for: their request is done (best effort; a leftover only shows a stale row to managers until it expires).
       if (role !== null && subjectType === "user") await registry.closeAccessRequest(scope, sid, "granted").catch(err => warn("could not close an access request", { err }));
-      return role === null ? null : rowOf(unit, sub, role, roles, type, access, admin, identity);
+      return role === null ? null : rowOf(unit, sub, role, roles, type, access, exempt, identity);
     },
 
     // ================= Access requests (#51) =================
@@ -525,9 +533,9 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
   };
 
   /** The row a successful put answers with. */
-  async function rowOf(unit, sub, role, roles, type, access, admin, identity) {
+  async function rowOf(unit, sub, role, roles, type, access, exempt, identity) {
     const label = await named(unit, [sub]);
-    const can = touchable(access, role, type, roles, admin, sub, identity);
-    return { subject: label(sub), role, roleName: roleLabel(role, roles), via: sub.type === "team" ? "team" : "direct", can: { change: can, remove: can } };
+    const can = touchable(access, role, type, roles, exempt, sub, identity);
+    return { subject: label(sub), role, roleName: roleLabel(role, roles), via: sub.type === "team" ? "team" : "direct", can: { change: can, remove: can || hasTier(role, type, roles) } };
   }
 }

@@ -8,7 +8,7 @@
 import { AdminError } from "../admin/boards.js";
 import { isUnitAdmin } from "./resolver.js";
 import { INVITE_ROLES, ROLES } from "./util.js";
-import { roleDef, roleProblem, contentPerms, ALLOWED_AT, CONTENT_PERMS, MGMT_PERMS, TIER_PERMS, TIER_ROLES, ROLE_PERMS, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, SCOPES } from "./permissions.js";
+import { isTierRole, roleDef, roleProblem, contentPerms, ALLOWED_AT, CONTENT_PERMS, MGMT_PERMS, TIER_PERMS, TIER_ROLES, ROLE_PERMS, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, SCOPES } from "./permissions.js";
 import { ROLE_LIMITS } from "./registry-port.js";
 import { LADDER_NAMES, LADDER_SUMMARY, idOf, nameOf, mgmtOf } from "./access.js";
 import { BUILTIN_UNIT_NAMES } from "./explain.js";
@@ -59,14 +59,14 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
   function view(role, roles, used = null, st = null) {
     if (ROLES.includes(role)) return { id: role, name: LADDER_NAMES[role], kind: "builtin", editable: false, summary: LADDER_SUMMARY[role], ladder: role, permissions: allMgmt(role), scopes: scopesOf(role, roles), used: null };
     if (role === "admin") return { id: "admin", name: "Unit admin", kind: "builtin", editable: false, summary: "Manages the Unit: every management permission, no board content", ladder: null, permissions: [...MGMT_PERMS], scopes: scopesOf("admin", roles), used: null };
-    if (TIER_ROLES[role]) return { id: role, name: BUILTIN_UNIT_NAMES[role], kind: "builtin", editable: false, summary: TIER_ROLES[role].includes("content.personal") ? "Opens every board of the Unit, including other people's personal spaces" : "Opens every board in every shared Space (not personal spaces)", ladder: null, permissions: [...TIER_ROLES[role]], scopes: scopesOf(role, roles), used: null };
+    if (isTierRole(role)) return { id: role, name: BUILTIN_UNIT_NAMES[role], kind: "builtin", editable: false, used, summary: TIER_ROLES[role].includes("content.personal") ? "Opens every board of the Unit, including other people's personal spaces" : "Opens every board in every shared Space (not personal spaces)", ladder: null, permissions: [...TIER_ROLES[role]], scopes: scopesOf(role, roles) };
     if (role === MEMBER_ROLE_ID) {
       const m = memberOf(roles);
       return { id: MEMBER_ROLE_ID, name: "Unit member", kind: "member", editable: !!st && unitWide(st), summary: "What everyone in the Unit gets", ladder: null, permissions: m.permissions.filter(p => MGMT_PERMS.includes(p)), scopes: scopesOf(MEMBER_ROLE_ID, roles), used };
     }
     const c = roles.get(role);
-    const mgmt = c.permissions.filter(p => ROLE_PERMS.includes(p)).length;
-    return { id: c.id, name: c.name, kind: "custom", editable: !!st && within(st, unitPerms(c.id, roles)), summary: `${LADDER_NAMES[c.boardRole] ?? "No"} board access${mgmt ? `, plus ${mgmt} management permission${mgmt === 1 ? "" : "s"}` : ""}`, ...(c.base ? { base: c.base } : {}), ladder: c.boardRole, permissions: c.permissions.filter(p => ROLE_PERMS.includes(p)), scopes: scopesOf(c.id, roles), used };
+    const mgmt = c.permissions.filter(p => MGMT_PERMS.includes(p)).length, tier = c.permissions.filter(p => TIER_PERMS.includes(p)).length;
+    return { id: c.id, name: c.name, kind: "custom", editable: !!st && within(st, unitPerms(c.id, roles)), summary: `${LADDER_NAMES[c.boardRole] ?? "No"} board access${mgmt ? `, plus ${mgmt} management permission${mgmt === 1 ? "" : "s"}` : ""}${tier ? `, plus ${c.permissions.filter(p => TIER_PERMS.includes(p)).map(p => (p === "content.shared" ? "opening shared boards" : "opening personal spaces")).join(" and ")}` : ""}`, ...(c.base ? { base: c.base } : {}), ladder: c.boardRole, permissions: c.permissions.filter(p => ROLE_PERMS.includes(p)), scopes: scopesOf(c.id, roles), used };
   }
   const placesUsed = u => ({ places: Math.min(u.places, ROLE_LIMITS.usageCap), capped: u.places > ROLE_LIMITS.usageCap });
   const membersUsed = n => ({ members: Math.min(n, ROLE_LIMITS.memberCap), capped: n > ROLE_LIMITS.memberCap });
@@ -132,8 +132,10 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
       const roles = storedMap(list);
       const custom = list.filter(r => r.id !== MEMBER_ROLE_ID).sort((a, b) => (a.name.toLowerCase() < b.name.toLowerCase() ? -1 : a.name.toLowerCase() > b.name.toLowerCase() ? 1 : a.id < b.id ? -1 : 1));
       const usage = custom.length ? await registry.roleUsage(st.unit.id, custom.map(r => r.id), { cap: ROLE_LIMITS.usageCap }) : new Map();
+      // Who holds the content tier is visible, read-only, to every Unit admin: the built-in tier roles carry a "used in N places" count like a custom role (#88; the people are on the Unit access page).
+      const tierUsage = await registry.roleUsage(st.unit.id, Object.keys(TIER_ROLES), { cap: ROLE_LIMITS.usageCap });
       return {
-        roles: [...ROLES.map(r => view(r, roles)), view("admin", roles), ...Object.keys(TIER_ROLES).map(r => view(r, roles)), view(MEMBER_ROLE_ID, roles, membersUsed(members), st), ...custom.map(r => view(r.id, roles, placesUsed(usage.get(r.id) ?? { places: 0 }), st))],
+        roles: [...ROLES.map(r => view(r, roles)), view("admin", roles), ...Object.keys(TIER_ROLES).map(r => view(r, roles, placesUsed(tierUsage.get(r) ?? { places: 0 }))), view(MEMBER_ROLE_ID, roles, membersUsed(members), st), ...custom.map(r => view(r.id, roles, placesUsed(usage.get(r.id) ?? { places: 0 }), st))],
         matrix: matrix(st), can: { admin: st.admin }, limits: { custom: LIMITS.custom, many: LIMITS.many },
       };
     },
@@ -157,7 +159,8 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
       const roles = storedMap(await registry.roles(st.unit.id));
       let base = null;
       if (b.base != null) {
-        if (typeof b.base !== "string" || !(ROLES.includes(b.base) || b.base === "admin" || TIER_ROLES[b.base] || b.base === MEMBER_ROLE_ID || (roles.has(b.base) && b.base !== MEMBER_ROLE_ID))) throw bad("bad base");
+        if (isTierRole(b.base) && !within(st, TIER_ROLES[b.base])) throw refused();      // a copy of a tier role is held to the tier too: no label of a role the caller could not hold
+        if (typeof b.base !== "string" || !(ROLES.includes(b.base) || b.base === "admin" || isTierRole(b.base) || b.base === MEMBER_ROLE_ID || (roles.has(b.base) && b.base !== MEMBER_ROLE_ID))) throw bad("bad base");
         base = b.base;
       }
       if (!within(st, unitPermsOf(cand, roles))) throw refused();

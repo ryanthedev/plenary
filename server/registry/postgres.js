@@ -1294,18 +1294,18 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       const edge = await db.unsafe(`SELECT id FROM ${BD} WHERE tenant = $1 AND trashed_at IS NULL AND ($2::text IS NULL OR id > $2) ORDER BY id LIMIT 2 OFFSET $3`, [tenant, cur, cap - 1]);
       return { ids, next: edge.length === 2 ? edge[0].id : null };
     },
-    async spaceCandidates(tenant, { user, all = false, after = null, limit } = {}) {
+    async spaceCandidates(tenant, { user, all = false, personal = false, after = null, limit } = {}) {
       ready();
       const cur = orgDefaults.cursor(after, "id"), n = smallLimit(limit, HOME.candidates.spaces.default, HOME.candidates.spaces.max);
       if (!key(tenant) || !key(user)) return { spaces: [], groups: [], next: null };
-      const rows = await db.unsafe(`SELECT s.* FROM ${SP} s WHERE s.tenant = $1 AND s.trashed_at IS NULL AND ($2::text IS NULL OR s.id > $2) AND ($4::boolean
+      const rows = await db.unsafe(`SELECT s.* FROM ${SP} s WHERE s.tenant = $1 AND s.trashed_at IS NULL AND ($2::text IS NULL OR s.id > $2) AND (NOT $6::boolean OR s.kind = 'personal') AND ($4::boolean
           OR s.general_role IS NOT NULL OR s.owner_user = $3
           OR EXISTS (SELECT 1 FROM ${SG} g WHERE g.scope_type = 'space' AND g.scope_id = s.id AND ((g.subject_type = 'user' AND g.subject = $3)
             OR (g.subject_type = 'team' AND g.subject IN (SELECT team FROM ${TU} WHERE member = $3))))
           OR s.grp IN (SELECT id FROM ${GR} WHERE tenant = $1 AND general_role IS NOT NULL)
           OR EXISTS (SELECT 1 FROM ${SG} g WHERE g.scope_type = 'group' AND g.scope_id = s.grp AND ((g.subject_type = 'user' AND g.subject = $3)
             OR (g.subject_type = 'team' AND g.subject IN (SELECT team FROM ${TU} WHERE member = $3)))))
-        ORDER BY s.id LIMIT $5`, [tenant, cur, user, !!all, n + 1]);
+        ORDER BY s.id LIMIT $5`, [tenant, cur, user, !!all, n + 1, !!personal]);
       const page = rows.slice(0, n), gids = [...new Set(page.map(r => r.grp).filter(Boolean))];
       const groups = gids.length ? await db.unsafe(`SELECT * FROM ${GR} WHERE id IN (SELECT jsonb_array_elements_text($1::text::jsonb))`, [JSON.stringify(gids)]) : [];
       return { spaces: page.map(rowSpace), groups: groups.map(rowGroup), next: rows.length > n ? page[n - 1].id : null };

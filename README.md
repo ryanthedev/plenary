@@ -32,8 +32,8 @@ users have no Unit, so they are guests: Recent, Your boards and Shared with me, 
 the shape appears in the other; the ⌂ in the top bar goes back to Home, where the board is now in Recent. With no `?as=` the
 sign-in screen lists the dev users as buttons. `PORT=0` picks a free port instead (read it from the `server
 listening` log line). Dev sign-in is a local-only convenience. It exists only while **all** of these hold: `PLENARY_DEV_TOKENS` names at
-least one user (unset, empty and `{}` are off; a name with any `admin` or `domain` token, or that is a tenant admin in the registry (an earlier run, or
-`scripts/admin-bootstrap.js --admin dev:<name>`), is never offered), the server
+least one user (unset, empty and `{}` are off; a name with any `admin`, `content` or `domain` token, or that is a tenant admin in the registry (an earlier run, or
+`scripts/admin-bootstrap.js --admin dev:<name>`), is never offered; `"content": "shared"` or `"all"` on a token with a `domain` gives that user the content tier, Unit role `content-admin` or `content-admin-personal`), the server
 binds a loopback `HOST` (the default `127.0.0.1`) and any `PUBLIC_URL` is a loopback name, Google sign-in is not
 configured, and the node is a gateway. Behind a reverse proxy (a public `PUBLIC_URL`) the menu stays off. Otherwise there is no `/auth/dev` route, no buttons, `?as=` is
 ignored, and (if dev tokens are set) the log says why. When it is on, `GET /auth/dev` publishes the dev users' tokens
@@ -83,7 +83,7 @@ to any page on this machine's loopback names, and the log says so; tokens with `
 | `packages/protocol/` | The protocol as code: envelope, codec, `Replica` (client), `Room` (reference sequencer), presence, records, ports (interfaces for storage, bus, blobs and auth). |
 | `server/` | The server: gateway, room host, stores (SQLite, Postgres), buses (memory, NATS), blobs (disk, S3), registries, sign-in and admin. |
 | `web/` | The canvas page (served by `server/`), painter, editor-to-replica sync, collaboration UI, and the browser's ports and adapters. |
-| `scripts/` | `admin-bootstrap.js` (first tenant admin), `load/` (load client), `cluster-rig.js` (local cluster), `dev-google.js` (a dev-only harness for checking Google sign-in by hand). None is the product server. |
+| `scripts/` | `admin-bootstrap.js` (first tenant admin and first content-tier holders), `load/` (load client), `cluster-rig.js` (local cluster), `dev-google.js` (a dev-only harness for checking Google sign-in by hand). None is the product server. |
 | `test/` | All tests (`bun test`). |
 | `deploy/` | Dockerfile and Compose files (see Docker). |
 | `PROTOCOL.md` | The protocol v1.1 spec. |
@@ -170,6 +170,7 @@ PORT=8080 PLENARY_DATA_DIR="$(mktemp -d)" OIDC_REDIRECT_URI=http://localhost:808
   `curl -X POST -H "Authorization: Bearer tok-ann" -H "Content-Type: application/json" -d '{"title":"All hands"}' http://localhost:8099/boards` answers 201 with the board. (An `admin` or `domain` token is never offered in the sign-in menu; use it only this way.)
 - **Operator CLI:** `bun scripts/admin-bootstrap.js --domain acme.com --admin alice@acme.com` (run with the same
   environment as the server; idempotent, additive; `--admin` takes an email on the domain, `google:<sub>` or `dev:<name>`).
+  `--content-admin <user>` (every shared board) and `--content-admin-personal <user>` (and personal spaces) name the first holders of the content tier by user id (`google:<sub>` or `dev:<name>`, never an email): a Unit admin has no board content and cannot hand out board roles without it, and only a holder can pass the tier on. A user who already holds another Unit role is reported in `skipped` and the exit code is 1.
 
 ### Open the canvas without the server
 

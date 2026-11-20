@@ -73,8 +73,10 @@ describe("who may move where", () => {
     expect(await code(mv.move(ada, board.id, { from: adasSpace.id, to: viewOnly.id }))).toBe("forbidden");
     expect((await r.board(board.id)).space).toBe(adasSpace.id);
   });
-  test("a Unit admin moves any board by the Unit-wide move permission (no board content needed), and is exempt from the ladder rule", async () => {
+  test("a Unit admin holds the Unit-wide move permission but, without the content tier, may not move a board where they would gain a role; a content.shared holder (owner step) may (#88)", async () => {
     const b = await r.createBoard({ tenant: acme.id, title: "Shared one", space: design.id, owner: "google:ada", memberRole: null });   // a personal-space board is the owner's (below)
+    expect(await code(mv.move(root, b.id, { from: design.id, to: platform.id }))).toBe("forbidden");   // platform gives members editor: the manage-only admin would gain it
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: "google:root" }, role: "content-admin" });
     expect((await mv.move(root, b.id, { from: design.id, to: platform.id })).moved).toBe(true);
     expect((await r.board(b.id)).space).toBe(platform.id);
   });
@@ -98,7 +100,9 @@ describe("who may move where", () => {
     expect((await mv.move(max, b.id, { from: platform.id, to: quiet.id })).moved).toBe(true);              // viewer for others: within what max holds
     expect(givenBy(await r.accessContext({ type: "space", id: design.id }))).toBe("owner");   // the mover's own grant counts too (Design's owner is ada herself): no skipping self
     const c = await r.createBoard({ tenant: acme.id, title: "C", space: platform.id });
-    expect((await mv.move(root, c.id, { from: platform.id, to: design.id })).moved).toBe(true);              // a Unit admin is exempt
+    expect(await code(mv.move(root, c.id, { from: platform.id, to: design.id }))).toBe("forbidden");        // a manage-only Unit admin is held to their own (no) board role
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: "google:root" }, role: "content-admin" });
+    expect((await mv.move(root, c.id, { from: platform.id, to: design.id })).moved).toBe(true);              // a content.shared holder is an owner of every shared board
   });
   test("HIGH-1: a mover below owner cannot become owner by moving a board into a Space they own, or into their personal space", async () => {
     const role = await r.createRole({ tenant: acme.id, name: "Mover", boardRole: "viewer", permissions: ["move", "board.create"] });

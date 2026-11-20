@@ -11,7 +11,7 @@
 // same `forbidden` error, so existence doesn't leak.
 
 import { ROLES, LINK_ROLES, INVITE_ROLES, normEmail } from "../auth/util.js";
-import { isUnitAdmin } from "../auth/resolver.js";
+import { isUnitAdmin, holdsTier, ownLadder } from "../auth/resolver.js";
 import { withinLadder } from "../auth/permissions.js";
 
 /** @typedef {import("../auth/registry-port.js").Registry} Registry */
@@ -83,8 +83,13 @@ async function sharer({ registry, tenancy }, caller, boardId) {
   const unit = await registry.tenant(b.tenant);
   return { b, access, unit, admin: await liveAdmin(registry, unit, caller) };
 }
-/** Nobody gives more board role than they hold (a Unit admin may): `forbidden` otherwise. */
-const mayGive = (s, role) => { if (!withinLadder(s.access.ladder, role, s.admin)) throw forbidden(); };
+/**
+ * May this access hand out board role `role`? Nobody gives more than they hold WITHOUT the content tier (`ownLadder`); a holder of the tier at this board (`content.shared`, or `content.personal` on a personal one: `holdsTier`) is exempt.
+ * A Unit admin without the tier is held to their own ladder like anyone (#88).
+ */
+const givable = (access, role) => withinLadder(ownLadder(access), role, holdsTier(access));
+/** `forbidden` unless `givable`. */
+const mayGive = (s, role) => { if (!givable(s.access, role)) throw forbidden(); };
 
 /** An invite's life when the request names none (JOURNEY J6); `null`, sent on purpose, is "never". */
 export const INVITE_TTL_MS = 30 * 86_400_000;
@@ -108,11 +113,14 @@ export async function setGrant({ caller, board, user, role }, { registry, tenanc
   const b = await managed(registry, caller, board, tenancy);
   if (role !== null && !ROLES.includes(role)) throw bad("bad role");
   if (typeof user !== "string" || !user) throw bad("bad user");
-  const admin = await isTenantAdmin(registry, caller, b.tenant);
+  // A holder of the content tier at this board is exempt from the ladder limit (#88); everyone else, a Unit admin included, gives at most their own role and never `owner`.
+  const access = tenancy ? await tenancy.effective(caller, b.id, { uniform: true }) : null;
+  const exempt = access ? holdsTier(access) : await isTenantAdmin(registry, caller, b.tenant);
   const current = await registry.grant(b.id, user);
-  if (!admin) {
+  if (!exempt) {
     if (role === "owner") throw forbidden();
     if (current === "owner" && user !== caller.user) throw forbidden();
+    if (access && role !== null && !givable(access, role)) throw forbidden();
   }
   // Refusals by rank come first (a non-admin gives no owner to anyone); then who a NEW grant may name.
   if (role !== null && current == null && !(await knownOnBoard(registry, b, user))) throw new AdminError("unknown-person", "that person is not known on this board");
@@ -195,7 +203,7 @@ export const SHARE_LIST_MAX = 200;
 /**
  * GET /boards/:board/share: everything the Share dialog edits, in one permission-gated read: the board's live invites (each tagged `guest` when the address is outside
  * the Unit) and share links, the Unit's domains (so the form can tag a guest before sending; `unit` is null for a caller outside the Unit, who is told per invite),
- * and the roles (no higher than the caller's own, unless a Unit admin) and default life an invite or link may take. Only a
+ * and the roles (no higher than the caller's own without the content tier, unless they hold it) and default life an invite or link may take. Only a
  * `members.manage` holder gets it (an invite is an address, a link is a capability): anyone else is the one `forbidden`. Revoked and expired ones are not listed.
  */
 export async function shareView({ caller, board }, deps) {
@@ -203,7 +211,7 @@ export async function shareView({ caller, board }, deps) {
   const s = await sharer(deps, caller, board), b = s.b;
   const [invites, links] = await Promise.all([registry.invites(b.id), registry.links(b.id)]);
   const unit = s.unit, inside = (await deps.tenancy.tenantOf(caller))?.id === b.tenant;
-  const may = role => withinLadder(s.access.ladder, role, s.admin);
+  const may = role => givable(s.access, role);
   const t = now();
   const live = x => !x.revoked && (x.expiresAt == null || x.expiresAt > t);
   const newest = list => list.filter(live).sort((x, y) => y.createdAt - x.createdAt || (x.id < y.id ? -1 : 1));

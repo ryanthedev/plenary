@@ -9,11 +9,14 @@ const list = (v, max, f) => (Array.isArray(v) ? v.slice(0, max).map(f).filter(Bo
 const SCOPES = ["unit", "group", "space", "board"];
 const KINDS = ["direct", "team", "general", "invite", "link", "unit"];
 
+/** The content-tier permissions as the screens word them (the Roles screen shares these, web/core/role-admin.js). */
+export const CONTENT_LABEL = { "content.shared": "Open every shared board", "content.personal": "Open personal spaces" };
 const scopeRef = s => (s && typeof s === "object" && SCOPES.includes(s.type) && isId(s.id) ? { type: s.type, id: s.id, ...(typeof s.name === "string" ? { name: str(s.name) } : {}) } : null);
 const source = s => {
   const scope = scopeRef(s?.scope);
   if (!scope || !KINDS.includes(s.kind) || typeof s.role !== "string") return null;
   return { kind: s.kind, scope, role: str(s.role, 64), roleName: str(s.roleName, 64), ladder: typeof s.ladder === "string" ? str(s.ladder, 32) : null, strongest: s.strongest === true,
+    ...(typeof s.content === "string" && s.content in CONTENT_LABEL ? { content: s.content } : {}),
     ...(s.team && isId(s.team.id) ? { team: { id: s.team.id, ...(typeof s.team.name === "string" ? { name: str(s.team.name) } : {}) } } : {}) };
 };
 const roleOpt = o => (o && typeof o === "object" && typeof o.id === "string" && o.id.length <= 64 ? { id: o.id, name: str(o.name, 64) } : null);
@@ -55,6 +58,7 @@ export function sourceText(s, here = null) {
   if (s.kind === "general") return s.scope.type === "unit" ? "via everyone in the organization" : `via everyone in the organization${on}`;
   if (s.kind === "invite") return "through an invite";
   if (s.kind === "link") return "through a share link";
+  if (s.content) return `through the permission "${CONTENT_LABEL[s.content]}" (${s.roleName})`;   // the content tier names the permission that lets them in (#88)
   if (s.kind === "unit") return s.role === "admin" ? "as an organization admin" : s.role === "member" ? "as an organization member" : `through a role${on || " here"}`;
   return at ? "added directly" : `added directly${on}`;
 }
@@ -64,7 +68,7 @@ export const strongestOf = mine => mine.sources.filter(s => s.strongest);
 /** The one-line explanation (canvas pill, tooltips): "Commenter via Space Platform · Infra team". */
 export function pillLine(mine) {
   if (!mine.role) return "No board access of your own";
-  const via = strongestOf(mine).map(s => (s.kind === "team" ? `${scopeText(s.scope)} · ${s.team?.name ?? "a"} team` : s.kind === "general" ? `${scopeText(s.scope)} · everyone` : s.kind === "invite" ? "invite" : s.kind === "link" ? "share link" : s.kind === "unit" ? "organization" : scopeText(s.scope)));
+  const via = strongestOf(mine).map(s => (s.content ? CONTENT_LABEL[s.content] : s.kind === "team" ? `${scopeText(s.scope)} · ${s.team?.name ?? "a"} team` : s.kind === "general" ? `${scopeText(s.scope)} · everyone` : s.kind === "invite" ? "invite" : s.kind === "link" ? "share link" : s.kind === "unit" ? "organization" : scopeText(s.scope)));
   return via.length ? `${mine.role.name} via ${via.join(" and ")}` : mine.role.name;
 }
 
@@ -73,7 +77,7 @@ export const withArticle = name => `${/^[AEIOU]/i.test(name) ? "an" : "a"} ${nam
 /** "Owners: Priya, Tom."; with none named: an organization admin (a member), or whoever shared the board (a guest has no organization to ask). */
 export const ownersText = (owners, guest = false) => (owners.length ? `Owners: ${owners.map(o => o.name).join(", ")}.` : guest ? "Ask whoever shared this with you." : "Ask an organization admin.");
 /** The role a held access comes from, named: "the Content editor role", "the organization's Member role" (the strongest source). */
-export const holderText = mine => { const s = strongestOf(mine)[0]; return !s ? null : s.kind === "unit" ? `the organization's ${s.roleName} role` : `the ${s.roleName} role`; };
+export const holderText = mine => { const s = strongestOf(mine)[0]; return !s ? null : s.content ? `the "${CONTENT_LABEL[s.content]}" permission` : s.kind === "unit" ? `the organization's ${s.roleName} role` : `the ${s.roleName} role`; };
 /**
  * What the control needs, against what the caller has: "Creating boards needs Editor." or, when their role is already that high, why it is not enough.
  * @param {{ role: string, roleName: string, held: boolean }} need

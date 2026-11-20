@@ -10,6 +10,7 @@
 //            another domain, or any control character, is refused (exit 2, naming the entry).
 // --content-admin / --content-admin-personal   repeatable; google:<sub> or dev:<name> (never an email): the user gets the Unit role `content-admin` (opens every shared board) or
 //            `content-admin-personal` (those and other people's personal spaces). The content tier is passed on only by a holder, so this is how the first holder appears. Additive.
+// A user named for a content role who already holds another Unit role is left as is, listed in `skipped`, and the exit code is 1 (everything else was applied).
 // --data-dir the single node's data directory (default: PLENARY_DATA_DIR, else ./data), as server/main.js reads it
 //
 // Which Registry: DATABASE_URL set → Postgres (schema "public", the adapter's default); else SQLite at
@@ -74,7 +75,7 @@ export async function run(argv, env = {}, { out = s => console.log(s), err = s =
   const deadline = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`timed out after ${Math.round(timeoutMs / 1000)} s`)), timeoutMs); });
   deadline.catch(() => {});
   try {
-    const { tenant, created, added, content } = await Promise.race([deadline, (async () => {
+    const { tenant, created, added, content, skipped } = await Promise.race([deadline, (async () => {
       if (env.DATABASE_URL) { registry = await postgresRegistry({ url: env.DATABASE_URL }); store = "postgres"; }
       else {
         const dir = args.dataDir || env.PLENARY_DATA_DIR || "./data";
@@ -84,7 +85,8 @@ export async function run(argv, env = {}, { out = s => console.log(s), err = s =
       }
       return bootstrapTenant({ registry, domain: args.domain, admins: args.admins, contentAdmins: args.contentAdmins, contentAdminsPersonal: args.contentAdminsPersonal });
     })()]);
-    out(JSON.stringify({ ok: true, registry: store, tenant: tenant.id, domain: tenant.domain, created, added, content, admins: tenant.admins }));
+    out(JSON.stringify({ ok: true, registry: store, tenant: tenant.id, domain: tenant.domain, created, added, content, skipped, admins: tenant.admins }));
+    if (skipped.length) { err(`not changed: ${skipped.map(x => `${shown(x.user)} already holds ${shown(x.role)}`).join("; ")} (change it from the Unit access page, then run again)`); return 1; }
     return 0;
   } catch (e) {
     // Messages only: a driver error could carry connection details, so no stack and no cause. URLs are redacted

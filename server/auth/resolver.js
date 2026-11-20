@@ -38,7 +38,7 @@ import { roleDef, MEMBER_ROLE_ID, UNIT_ROLES, CONTENT_PERMS, ALLOWED_AT } from "
  * @typedef {{ kind: "direct"|"team"|"general"|"invite"|"link"|"unit", scope: { type: ScopeType, id: string },
  *   role: string, team?: string, permissions: string[], ladder: Role|null }} Source
  * @typedef {{ at: number, by: string|null, with: string|null, space: boolean, ladder: Role|null }} Trashed  what a target in Trash answers: when and by whom, the Space that took it (boards), whether a Space in the chain is in Trash, and the board role the caller held before
- * @typedef {{ ladder: Role|null, member?: boolean, permissions: Set<string>, sources: Source[], until: number, trashed?: Trashed }} Access
+ * @typedef {{ ladder: Role|null, member?: boolean, hiddenPersonal?: boolean, permissions: Set<string>, sources: Source[], until: number, trashed?: Trashed }} Access
  */
 
 const live = (x, t) => x && !x.revoked && (x.expiresAt == null || t < x.expiresAt);
@@ -151,14 +151,16 @@ export function resolveAccess({ ctx, grant = null, invites = [], links = [], tea
   const ladder = sources.reduce((r, s) => higher(r, s.ladder), /** @type {Role|null} */ (null));
   // TRASH (PROTOCOL.md § Trash and restore). A board in Trash, a board in a Space in Trash and a Space in Trash are out of reach of everything: no board role (so no room, and `opens` is false
   // in every list and page), and no permission but `delete` (restore and purge). `trashed.ladder` is the role the caller held before, so "could they open it" survives for the notice.
+  // A board in someone's personal space is its owner's: without board content there (the owner, or an admin only where board-content access is on) it stays closed to `move`, whatever else the caller holds (#91, TECH-DEBT 67).
+  const hiddenPersonal = !!board && space?.kind === "personal" && ladder == null;
   const gone = board?.trashedAt != null ? board : space?.trashedAt != null ? space : null;
-  if (gone) return { ladder: null, permissions: new Set(permissions.has("delete") ? ["delete"] : []), sources, until, member, trashed: { at: gone.trashedAt, by: gone.trashedBy ?? null, with: board?.trashedWith ?? null, space: space?.trashedAt != null, ladder } };
-  return { ladder, permissions, sources, until, member };
+  if (gone) return { ladder: null, permissions: new Set(permissions.has("delete") ? ["delete"] : []), sources, until, member, hiddenPersonal, trashed: { at: gone.trashedAt, by: gone.trashedBy ?? null, with: board?.trashedWith ?? null, space: space?.trashedAt != null, ladder } };
+  return { ladder, permissions, sources, until, member, hiddenPersonal };
 }
 
 /**
- * May this access move the board? The `move` permission AND membership of the board's Unit: the move route refuses anyone whose Workspace domain is not the Unit's (PROTOCOL.md § Move board), so the
+ * May this access move the board? The `move` permission AND membership of the board's Unit AND not a personal-space board the caller cannot open (`hiddenPersonal`: a manage-only admin holds `move` everywhere but has no say over someone's personal boards): the move route refuses anyone whose Workspace domain is not the Unit's (PROTOCOL.md § Move board), so the
  * welcome's `can.move` and a card's `can.move` are true exactly where the route can work. `Access.member` is `isUnitMember` for the access's tenant.
  * @param {Access} a
  */
-export const mayMove = a => a.permissions.has("move") && a.member === true;
+export const mayMove = a => a.permissions.has("move") && a.member === true && a.hiddenPersonal !== true;

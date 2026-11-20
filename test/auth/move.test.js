@@ -5,6 +5,7 @@ import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
 import { spaceService } from "../../server/auth/spaces.js";
 import { moveService, givenBy } from "../../server/auth/move.js";
+import { mayMove } from "../../server/auth/resolver.js";
 import { announcingRegistry } from "../../server/main.js";
 import { httpRoutes } from "../../server/auth/http.js";
 import { sessions as makeSessions } from "../../server/auth/session.js";
@@ -73,8 +74,9 @@ describe("who may move where", () => {
     expect((await r.board(board.id)).space).toBe(adasSpace.id);
   });
   test("a Unit admin moves any board by the Unit-wide move permission (no board content needed), and is exempt from the ladder rule", async () => {
-    expect((await mv.move(root, board.id, { from: adasSpace.id, to: platform.id })).moved).toBe(true);
-    expect((await r.board(board.id)).space).toBe(platform.id);
+    const b = await r.createBoard({ tenant: acme.id, title: "Shared one", space: design.id, owner: "google:ada", memberRole: null });   // a personal-space board is the owner's (below)
+    expect((await mv.move(root, b.id, { from: design.id, to: platform.id })).moved).toBe(true);
+    expect((await r.board(b.id)).space).toBe(platform.id);
   });
   test("a Space owner (move at the Space) moves a board they do not own; a Space editor cannot", async () => {
     const b = await r.createBoard({ tenant: acme.id, title: "Theirs", space: platform.id, owner: "google:max" });
@@ -127,6 +129,34 @@ describe("who may move where", () => {
     const mine = await r.createSpace({ tenant: acme.id, name: "Mine", generalRole: null, owner: "google:ada" });
     expect((await mv.move(ada, board.id, { from: adasSpace.id, to: mine.id })).moved).toBe(true);
     expect((await mv.move(ada, board.id, { from: mine.id, to: adasSpace.id })).moved).toBe(true);
+  });
+});
+
+describe("a personal-space board is its owner's (TECH-DEBT 67)", () => {
+  const rootSpace = () => r.createSpace({ tenant: acme.id, name: "Root's", generalRole: null, owner: "google:root" });
+  test("a manage-only Unit admin (holds `move` everywhere) cannot move a member's personal-space board out: the route refuses, and can.move is false", async () => {
+    const dst = await rootSpace();
+    expect(await code(mv.move(root, board.id, { from: adasSpace.id, to: dst.id }))).toBe("forbidden");
+    expect(await code(mv.options(root, board.id))).toBe("forbidden");
+    expect(await code(mv.preview(root, board.id, dst.id))).toBe("forbidden");
+    expect((await r.board(board.id)).space).toBe(adasSpace.id);
+    const a = await ten.effective(root, board.id);
+    expect(a.permissions.has("move")).toBe(true);                     // the raw permission is there ...
+    expect(mayMove(a)).toBe(false);                                   // ... the offer is not
+    expect((await ten.access(root, board.id)).move).toBe(false);
+  });
+  test("a content-access admin (board content on) may, like the owner; and a manage-only admin still moves a SHARED-space board", async () => {
+    const dst = await rootSpace();
+    const ten2 = makeTenancy({ registry: r, adminBoardContent: true });
+    const mv2 = moveService({ registry: r, tenancy: ten2, spaces: spaceService({ registry: r, tenancy: ten2 }) });
+    expect(mayMove(await ten2.effective(root, board.id))).toBe(true);
+    expect((await mv2.move(root, board.id, { from: adasSpace.id, to: dst.id })).moved).toBe(true);
+    const shared = await r.createBoard({ tenant: acme.id, title: "S", space: design.id, owner: "google:ada", memberRole: null });
+    expect((await mv.move(root, shared.id, { from: design.id, to: dst.id })).moved).toBe(true);
+  });
+  test("the owner moves their own personal-space board out", async () => {
+    expect((await mv.move(ada, board.id, { from: adasSpace.id, to: design.id })).moved).toBe(true);
+    expect(mayMove(await ten.effective(ada, board.id))).toBe(true);
   });
 });
 

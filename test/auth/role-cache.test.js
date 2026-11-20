@@ -206,6 +206,23 @@ test("GAP-M3 (p5-loadv): rolesFor in flight across invalidate(board) does not wr
   expect(grantCalls).toBe(1);
 });
 
+test("LOW-4b (#55): a hello's role read in flight across forgetUser(user) does not write its stale answer, and the next role is fresh", async () => {
+  const raw = memoryRegistry();
+  const t = await raw.createTenant({ domain: null });
+  const b = await mkBoard(raw, { tenant: t.id, memberRole: null });
+  await raw.setGrant(b.id, "u", "editor");
+  await raw.setGrant(b.id, "v", "viewer");
+  let open; const gate = new Promise(r => { open = r; }); let hold = true;
+  const reg = { ...raw, grant: async (x, u) => { const v = await raw.grant(x, u); if (hold && u === "u") { hold = false; await gate; } return v; } };
+  const c = roleCache({ registry: reg, ttlMs: 3_600_000 });
+  const p = c.role({ user: "u" }, b.id);                                   // read the "editor" grant, then wait inside registry.grant
+  await new Promise(r => setTimeout(r, 5));
+  await raw.setGrant(b.id, "u", null); c.forgetUser("u");                  // the removal: the grant is gone, this node forgets the person
+  open(); await p;                                                         // the in-flight read may answer "editor", but must not fill the cache with it
+  expect(await c.role({ user: "u" }, b.id)).toBe(null);
+  expect(await c.role({ user: "v" }, b.id)).toBe("viewer");                // other people are untouched
+});
+
 test("two identities of one user (one invited email, one not) each get their own answer: rolesFor, fallback and cache", async () => {
   const cache = roleCache({ registry: reg, now });
   const ten = tenancy({ registry: reg, now }), fallback = tenancy({ registry: counting(raw, { drop: ["linkUsesFor"] }).reg, now });

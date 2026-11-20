@@ -244,7 +244,9 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
 
     /** The tenant an identity belongs to by Workspace domain, or null (no `hd` = guest only). */
     async tenantOf(identity) {
-      return identity?.domain ? registry.tenantByDomain(identity.domain) : null;
+      const t = identity?.domain ? await registry.tenantByDomain(identity.domain) : null;
+      // A person the Unit removed has no Unit (PROTOCOL.md § Leaver offboarding): a guest to every route. One primary-key read per request.
+      return t && (await registry.memberState(t.id, identity.user))?.removed ? null : t;
     },
   };
 }
@@ -308,8 +310,9 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
   /** @type {Map<string, number>} */ const boardStamp = new Map();
   /** @type {Map<string, number>} */ const userStamp = new Map();
   const ukey = (board, user) => board + "\n" + user;
-  const stale = (board, user, c0) => (boardStamp.get(board) ?? 0) > c0 || (userStamp.get(ukey(board, user)) ?? 0) > c0;
-  const endRead = () => { if (--reading === 0) { boardStamp.clear(); userStamp.clear(); } };   // no read in flight: stamps can't matter
+  /** @type {Map<string, number>} user -> stamp of the last `forgetUser` (a person removed from a Unit: every board at once) */ const personStamp = new Map();
+  const stale = (board, user, c0) => (boardStamp.get(board) ?? 0) > c0 || (userStamp.get(ukey(board, user)) ?? 0) > c0 || (personStamp.get(user) ?? 0) > c0;
+  const endRead = () => { if (--reading === 0) { boardStamp.clear(); userStamp.clear(); personStamp.clear(); } };   // no read in flight: stamps can't matter
 
   // ---- records: board, link (by id) ----
   /** @type {Map<string, { value: any, until: number, board: string|null }>} */ const records = new Map();
@@ -463,6 +466,16 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
       }
       dropBoard(boardId); dropLinks(boardId); chains.delete(boardId); records.delete("board:" + boardId);   // a move changes the board's Space (PROTOCOL.md § Move board)
       if (reading) boardStamp.set(boardId, ++clock); else clock++;   // clock moves either way: no read joins across it
+    },
+
+    /**
+     * Drop every cached role of one user on every board, now (a removal from a Unit, #55): a hello after it reads fresh, and a read in flight across it never fills. Synchronous.
+     * Cost O(entries), paid once per removal; the other nodes learn from the Unit-wide revocation they receive.
+     */
+    forgetUser(user) {
+      if (typeof user !== "string") return;
+      for (const [k, e] of [...entries]) if (e.user === user) remove(k);
+      if (reading) personStamp.set(user, ++clock); else clock++;
     },
 
     /** The board record, memoized (the gateway's own hello lookup may use it: board records never change). */

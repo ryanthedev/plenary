@@ -79,12 +79,12 @@ export const REGISTRY_METHODS = Object.freeze([
   "createLink", "link", "links", "revokeLink", "addLinkUse", "linkUses",
   "idemGet", "markOpened", "recents", "setStarred", "starred", "starredAmong",
   "sharedBoards", "searchBoards", "spaceCandidates", "groupCandidates", "requestAccess", "accessRequest",
-  "accessRequests", "closeAccessRequest", "grantHolders", "boardRows", "close",
+  "accessRequests", "closeAccessRequest", "grantHolders", "boardRows", "memberState", "ownedAlone", "reassignOwner", "removeMember", "close",
 ]);
 
 /**
  * The one error class every Registry adapter throws for a refused call; match on `err.code`, never the class.
- * Codes: "last-owner" (setGrant, setScopedGrant, setTeamMember), "no-role", "limit", "in-use" (custom roles), "moved" (moveBoard: the board is in neither `from` nor `to`; trashBoard: it is not in `from`), "with-space" (restoreBoard of a board that went to Trash with its Space), "space-in-trash" (restoreBoard of an own-clock board whose Space is in Trash, when no `into` is given), "purged" (restoreBoard, or restoreSpace, of a row, or of a Space with a board, claimed for purge), "in-trash" (addLinkUse and moveBoard of a trashed board), "personal" (trashSpace of a personal Space), "corrupt" (a stored row breaks an invariant, e.g. a tenant with no kind row), "idem-replay" /
+ * Codes: "last-owner" (setGrant, setScopedGrant, setTeamMember), "removed" (createSpace / createGroup / ensurePersonalSpace for a removed owner), "still-owns", "is-admin" (removeMember), "bad-recipient" (reassignOwner), "no-role", "limit", "in-use" (custom roles), "moved" (moveBoard: the board is in neither `from` nor `to`; trashBoard: it is not in `from`), "with-space" (restoreBoard of a board that went to Trash with its Space), "space-in-trash" (restoreBoard of an own-clock board whose Space is in Trash, when no `into` is given), "purged" (restoreBoard, or restoreSpace, of a row, or of a Space with a board, claimed for purge), "in-trash" (addLinkUse and moveBoard of a trashed board), "personal" (trashSpace of a personal Space), "corrupt" (a stored row breaks an invariant, e.g. a tenant with no kind row), "idem-replay" /
  * "idem-mismatch" (see `idemErr`), "rate-limited" (requestAccess); the Postgres adapter adds "lock-timeout", "statement-timeout",
  * "overloaded", "queue-timeout", "client-timeout" (a timeout REJECTS, never resolves to null).
  */
@@ -112,7 +112,7 @@ export const mint = {
  * @typedef {{ id: string, domain: string|null, domains: string[], kind: UnitKind, admins: string[], createdAt: number }} Tenant   `domain`: the first domain (null if none); `domains`: every domain the Unit owns, `domain` first
  * @typedef {{ id: string, tenant: string, title: string, memberRole: Role|null, space: string|null, createdAt: number, trashedAt: number|null, trashedBy: string|null, trashedWith: string|null }} Board   `trashedAt` (ms) set = in Trash (PROTOCOL.md § Trash and restore); `trashedWith`: the Space whose trashing took it (null: trashed on its own)
  * @typedef {{ id: string, tenant: string, name: string, generalRole: Role|null, createdAt: number }} Group
- * @typedef {{ id: string, tenant: string, group: string|null, name: string, kind: "shared"|"personal", owner: string|null, generalRole: Role|null, createdAt: number, trashedAt: number|null, trashedBy: string|null }} Space   `trashedAt` set = the Space and its boards are in Trash
+ * @typedef {{ id: string, tenant: string, group: string|null, name: string, kind: "shared"|"personal", owner: string|null, generalRole: Role|null, createdAt: number, trashedAt: number|null, trashedBy: string|null, archivedAt: number|null }} Space   `trashedAt` set = the Space and its boards are in Trash; `archivedAt` set = a former personal space handed to a new owner (PROTOCOL.md § Leaver offboarding: a label, nothing more)
  * @typedef {{ id: string, tenant: string, name: string, createdAt: number }} Team
  * @typedef {{ id: string, tenant: string, name: string, base: string|null, boardRole: Role|null, permissions: string[], createdAt: number }} CustomRole
  * @typedef {{ type: "unit"|"group"|"space"|"board", id: string }} ScopeRef   a Unit's id is its tenant id
@@ -121,7 +121,7 @@ export const mint = {
  * @typedef {{ tenant: Tenant, board: Board|null, space: Space|null, group: Group|null }} Chain   the scope's stable records (a roleCache may keep them for a while and hand them back)
  * @typedef {{ tenant: Tenant, board: Board|null, space: Space|null, group: Group|null,
  *   scoped: { unit: ScopedGrant[], group: ScopedGrant[], space: ScopedGrant[], board: ScopedGrant[] },
- *   roles: CustomRole[], teams: Record<string, string[]> }} AccessContext   `scoped`: the grants on each scope of the chain (a board's are Team grants only; user grants on a board are `grants`); `roles`: the Unit's stored roles; `teams`: for each Team that appears in `scoped`, its members (only those named in `users`, when given)
+ *   roles: CustomRole[], teams: Record<string, string[]>, removed: string[] }} AccessContext   `removed`: those of the requested `users` the Unit has removed (PROTOCOL.md § Leaver offboarding; none when no `users` were given).    `scoped`: the grants on each scope of the chain (a board's are Team grants only; user grants on a board are `grants`); `roles`: the Unit's stored roles; `teams`: for each Team that appears in `scoped`, its members (only those named in `users`, when given)
  * @typedef {{ board: Board, grant: Role|null, teamGrants: ScopedGrant[], myTeams: string[], invites: Invite[], links: Link[] }} BoardRows   `teamGrants`: Team grants on the board; `myTeams`: those of the user's Teams that appear in `teamGrants`; `invites`: non-revoked, to the user's email; `links`: the link records of the user's uses on this board
  * @typedef {{ id: string, tenant: string, scope: ScopeRef, user: string, role: string, state: "pending"|"dismissed"|"granted", at: number, closedAt: number|null }} AccessRequest
  * @typedef {{ id: string, board: string, email: string, role: Role, expiresAt: number|null, revoked: boolean, by: string, createdAt: number }} Invite
@@ -149,11 +149,11 @@ export const mint = {
  *   purgeSpace(space: string): Promise<boolean>,   // deletes a CLAIMED Space's rows (its scoped grants, access requests, the Space); true when done or gone; false when not claimed or a board still references it
  *   group(id: string): Promise<Group|null>,
  *   groups(tenant: string): Promise<Group[]>,
- *   createSpace(o: { tenant: string, name: string, group?: string|null, generalRole?: Role|null, owner?: string, idem?: Idem }): Promise<Space>,   // generalRole default "viewer"; null = only people added
+ *   createSpace(o: { tenant: string, name: string, group?: string|null, generalRole?: Role|null, owner?: string, idem?: Idem }): Promise<Space>,   // generalRole default "viewer"; null = only people added; an `owner` the Unit has removed rejects code "removed", nothing written
  *   space(id: string): Promise<Space|null>,
  *   spaces(tenant: string): Promise<Space[]>,
  *   personalSpace(tenant: string, user: string): Promise<Space|null>,   // the user's personal space, or null when it does not exist yet: a pure read (a GET never creates it; ensurePersonalSpace does)
- *   ensurePersonalSpace(tenant: string, user: string): Promise<Space>,   // idempotent, one per (tenant, user); private (generalRole null), the user is its owner
+ *   ensurePersonalSpace(tenant: string, user: string): Promise<Space>,   // idempotent, one per (tenant, user); private (generalRole null), the user is its owner; a removed user rejects code "removed" (nothing written)
  *   createTeam(o: { tenant: string, name: string, idem?: Idem }): Promise<Team>,
  *   renameTeam(team: string, name: string): Promise<Team>,   // trimmed 1-200; rejects an unknown Team
  *   deleteTeam(team: string): Promise<void>,   // removes the Team, its members and EVERY grant it holds, atomically; code "last-owner" (nothing changes) when it is the only counted owner of a Group or Space; rejects an unknown Team
@@ -162,9 +162,9 @@ export const mint = {
  *   teamMembersPage(team: string, o?: { after?: string|null, limit?: number }): Promise<{ users: string[], next: string|null }>,   // by user id (default 50, cap 200)
  *   scopedGrant(scope: ScopeRef, subject: Subject): Promise<string|null>,   // one grant's role (null = none): the single-row read a grant change compares against
  *   scopedGrantsPage(scope: ScopeRef, o?: { after?: string|null, limit?: number }): Promise<{ grants: ScopedGrant[], next: string|null }>,   // by subject ("user"/"team" then id; cursor "<type>\n<id>"), default 50, cap 200
- *   touchMember(tenant: string, o: { user: string, name?: string|null, email?: string|null }): Promise<void>,   // the member directory: records a Unit member seen at sign-in (the code exchange) or on Home; writes only when the row is new or its name/email changed
- *   membersAmong(tenant: string, users: string[]): Promise<{ user: string, name: string|null, email: string|null }[]>,   // those of `users` (at most 200) in the Unit's directory
- *   findMembers(tenant: string, o?: { q?: string|null, limit?: number }): Promise<{ user: string, name: string|null, email: string|null }[]>,   // directory search by ASCII-folded substring of name, email or user id; by name then id; default 20, cap 50
+ *   touchMember(tenant: string, o: { user: string, name?: string|null, email?: string|null }): Promise<void>,   // never clears a removal. The member directory: records a Unit member seen at sign-in (the code exchange) or on Home; writes only when the row is new or its name/email changed
+ *   membersAmong(tenant: string, users: string[]): Promise<{ user: string, name: string|null, email: string|null, removed: boolean }[]>,   // those of `users` (at most 200) in the Unit's directory
+ *   findMembers(tenant: string, o?: { q?: string|null, limit?: number }): Promise<{ user: string, name: string|null, email: string|null }[]>,   // never a removed person   // directory search by ASCII-folded substring of name, email or user id; by name then id; default 20, cap 50
  *   team(id: string): Promise<Team|null>,
  *   teams(tenant: string): Promise<Team[]>,
  *   setTeamMember(team: string, user: string, member: boolean): Promise<void>,
@@ -216,6 +216,10 @@ export const mint = {
  *   accessRequests(scope: ScopeRef, o?: { limit?: number }): Promise<AccessRequest[]>,   // the PENDING ones, newest first (default 50, at most 200), none older than ASK.ttlMs
  *   closeAccessRequest(scope: ScopeRef, user: string, state: "dismissed"|"granted"): Promise<boolean>,   // both keep the row and stamp `closedAt`: "dismissed" holds the cooldown (counted from `closedAt`), "granted" only the per-person count (a granted row is never returned and never blocks); true when a row was pending
  *   grantHolders(scope: ScopeRef, roles: string[], o?: { limit?: number }): Promise<ScopedGrant[]>,   // the scoped grants AT the scope whose role is one of `roles`, by subject, at most `limit` (default and cap ASK.holders)
+ *   memberState(tenant: string, user: string): Promise<{ user: string, name: string|null, email: string|null, removed: boolean, removedAt: number|null, removedBy: string|null }|null>,   // the directory row, or null when the person was never seen (PROTOCOL.md § Leaver offboarding); `tenancy.tenantOf` reads `removed` on every request
+ *   ownedAlone(tenant: string, user: string, o?: { after?: string|null, limit?: number }): Promise<{ items: { type: "space"|"group", id: string, personal: boolean }[], next: string|null }>,   // what the user solely owns: their personal space (always), and every Group or Space (trashed ones too) whose only COUNTED owner they are; by "<type>\n<id>", default 50, cap 200
+ *   reassignOwner(o: { scope: { type: "space"|"group", id: string }, from: string, to: string, idem?: Idem }): Promise<{ done: boolean }>,   // ONE atomic compare-and-set (tenant owners lock, then the container row): `from` still the only counted owner -> `to` becomes owner and `from`'s grant goes, `done` true; otherwise nothing changes, `done` false. A PERSONAL space is refused (code "personal": it goes with `removeMember`, never alone). `to` must be a live directory member of the scope's Unit (code "bad-recipient"), not `from`; a scope purged meanwhile rejects "registry: no such space|group"; ref `<scope id>:reassigned` / `<scope id>:noop`
+ *   removeMember(o: { tenant: string, user: string, by: string, handover?: { to: string, name?: string }, idem?: Idem }): Promise<{ removed: boolean, grants: number, scopedGrants: number, teams: number, invites: number, handedOver: boolean }>,   // ONE atomic step (owners lock, then the member row): refuses code "still-owns" (nothing changes) while `ownedAlone` holds anything but the personal space, "is-admin" for a tenant admin, rejects a person not in the directory. `handover` makes the personal space, if any, an archived shared Space (owner null, archivedAt now, named `name`) owned by `to` IN THE SAME STEP (a live member other than the leaver, else "bad-recipient"; without it a personal space counts as owned and the removal is refused). Then marks the row removed, deletes the user's board grants, scoped grants in this Unit, Team memberships and access requests, and revokes invites addressed to their email on this Unit's boards (invites and links they CREATED stay); already removed -> removed false; ref `<user>:removed` / `<user>:noop`
  *   boardRows(boards: string[], o: { user: string, email?: string|null }): Promise<Map<string, BoardRows>>,   // the board-scope rows the resolver reads for one user over at most BATCH boards, in a fixed number of statements; unknown ids are absent
  *   close(): Promise<void>,   // idempotent; the memory adapter has nothing to release and resolves at once
  * }} Registry

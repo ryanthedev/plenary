@@ -34,6 +34,9 @@ import { httpTrash } from "./adapters/trash/http.js";
 import { mountTrashPage, mountTrashNotice } from "./adapters/dom/trash.js";
 import { createTrashModel, createNoticeModel } from "./core/trash.js";
 import { httpRoles } from "./adapters/roles/http.js";
+import { httpOffboard } from "./adapters/offboard/http.js";
+import { createOffboardModel } from "./core/offboard.js";
+import { mountOffboardPage } from "./adapters/dom/offboard.js";
 import { mountRolesPage } from "./adapters/dom/roles.js";
 import { createRolesModel } from "./core/role-admin.js";
 import { mountTeamsPage, mountTeamPage, mountAccessPage } from "./adapters/dom/access.js";
@@ -77,7 +80,7 @@ if (back) { q.set("board", back); history.replaceState(history.state, "", `${loc
 // A link with no board lands on Home (everyone, a dev user included): Recent, Starred, Shared with me, the Space tree, search.
 const board = asked ?? back;
 const idParam = name => (/^[\w-]{1,64}$/.test(q.get(name) ?? "") ? q.get(name) : null);
-const spaceId = idParam("space"), groupId = idParam("group"), teamId = idParam("team"), teamsPage = q.has("teams"), rolesPage = q.has("roles"), trashPage = q.has("trash");
+const spaceId = idParam("space"), groupId = idParam("group"), teamId = idParam("team"), teamsPage = q.has("teams"), rolesPage = q.has("roles"), trashPage = q.has("trash"), offboardPage = q.has("offboard");
 const accessArg = /^(unit|group|space|board):([\w-]{1,64})$/.exec(q.get("access") ?? "");
 /** A link to another page of this app, keeping the theme. */
 const hrefTo = params => `?${new URLSearchParams({ ...params, ...(theme0 ? { theme: theme0 } : {}) })}`;
@@ -101,12 +104,17 @@ if (!signIn.token) {
   const fetchNow = (...a) => globalThis.fetch(...a);
   const spacesApi = httpSpaces({ fetch: fetchNow, token: signIn.token, timers: clock });
   const hrefs = { home: location.pathname, board: id => hrefTo({ board: id }), space: id => hrefTo({ space: id }), group: id => hrefTo({ group: id }),
-    team: id => hrefTo({ team: id }), teams: hrefTo({ teams: "1" }), roles: hrefTo({ roles: "1" }), trash: hrefTo({ trash: "1" }), access: (type, id) => hrefTo({ access: `${type}:${id}` }) };
+    team: id => hrefTo({ team: id }), teams: hrefTo({ teams: "1" }), roles: hrefTo({ roles: "1" }), offboard: hrefTo({ offboard: "1" }), trash: hrefTo({ trash: "1" }), access: (type, id) => hrefTo({ access: `${type}:${id}` }) };
   const dialogs = createDialogs({ host: root, api: spacesApi, hrefs, go: href => location.assign(href) });
   if (rolesPage) {
     // The Roles screen (PROTOCOL.md § Roles): the server answers 404 to a caller without roles.manage, which shows the same "not available" page.
     const model = createRolesModel({ api: httpRoles({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey() });
     mountRolesPage({ root, model, hrefs, signIn: signInLink }); hideGate(); model.load();
+  } else if (offboardPage) {
+    // The leaver screen (PROTOCOL.md § Leaver offboarding): a caller without members.manage gets the same "not available" page. `?offboard=<user id>` opens a person.
+    const who = q.get("offboard") && q.get("offboard") !== "1" ? q.get("offboard").slice(0, 200) : null;
+    const model = createOffboardModel({ api: httpOffboard({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey() });
+    mountOffboardPage({ root, model, hrefs, signIn: signInLink, start: who }); hideGate();
   } else if (trashPage) {
     // The Trash (PROTOCOL.md § Trash and restore): what this person may restore. A caller outside a Unit gets the same "not available" page.
     const model = createTrashModel({ api: httpTrash({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey() });
@@ -128,7 +136,7 @@ if (!signIn.token) {
   } else {
     const model = createHomeModel({ api: httpHome({ fetch: fetchNow, token: signIn.token, timers: clock }), clock });
     mountHome({ root, model, clock, signIn: signInLink, homeHref: location.pathname, dialogs,
-      boardHref: hrefs.board, spaceHref: hrefs.space, groupHref: hrefs.group, teamsHref: hrefs.teams, trashHref: hrefs.trash, rolesHref: hrefs.roles, unitAccessHref: id => hrefs.access("unit", id),
+      boardHref: hrefs.board, spaceHref: hrefs.space, groupHref: hrefs.group, teamsHref: hrefs.teams, trashHref: hrefs.trash, rolesHref: hrefs.roles, offboardHref: hrefs.offboard, unitAccessHref: id => hrefs.access("unit", id),
       move: { port: httpMove({ fetch: fetchNow, token: signIn.token, timers: clock }), clock, newKey: () => randomKey() } });
     hideGate();
     model.load();

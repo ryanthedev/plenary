@@ -301,6 +301,44 @@ describe.skipIf(!url)("postgres registry", () => {
     } finally { other.release(); await r.close(); await drop(schema); }
   });
 
+  // LOW-2 (#55): a Space purged between reassignOwner's tenant lookup and its row lock is a clean "no such space" refusal, never a TypeError (a 503).
+  test("reassignOwner of a Space purged while it waits for the row lock rejects with 'no such space'", async () => {
+    const schema = schemaName();
+    const r = await postgresRegistry({ url, schema, max: 2 });
+    const other = await client().reserve();
+    try {
+      const t = await r.createTenant({ domain: "acme.com" });
+      for (const u of ["google:sam", "google:ada"]) await r.touchMember(t.id, { user: u, name: u });
+      const sp = await r.createSpace({ tenant: t.id, name: "S", owner: "google:sam" });
+      await other.unsafe("BEGIN");
+      await other.unsafe(`SELECT id FROM "${schema}".reg_spaces WHERE id = $1 FOR UPDATE`, [sp.id]);
+      const p = r.reassignOwner({ scope: { type: "space", id: sp.id }, from: "google:sam", to: "google:ada" }).then(() => "ok", e => e.message);
+      await waitBlocked(`%"${schema}".reg_spaces%FOR UPDATE%`);
+      await other.unsafe(`DELETE FROM "${schema}".reg_scope_grants WHERE scope_type = 'space' AND scope_id = $1`, [sp.id]);
+      await other.unsafe(`DELETE FROM "${schema}".reg_spaces WHERE id = $1`, [sp.id]);
+      await other.unsafe("COMMIT");
+      expect(await p).toMatch(/no such space/);
+    } finally { other.release(); await r.close(); await drop(schema); }
+  });
+  // LOW-3 (#55): creating a Space takes no tenant-wide lock: a held owners lock (a removal in flight) does not block it, while a held member row (FOR UPDATE) does, and the create then sees the removal.
+  test("createSpace for an owner is not serialised behind the tenant's owners lock, but waits for the owner's own member row and is refused once removed", async () => {
+    const schema = schemaName();
+    const r = await postgresRegistry({ url, schema, max: 3 });
+    const other = await client().reserve();
+    try {
+      const t = await r.createTenant({ domain: "acme.com" });
+      for (const u of ["google:sam", "google:ada"]) await r.touchMember(t.id, { user: u, name: u });
+      await other.unsafe("BEGIN");
+      await other.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-owners:${schema}:${t.id}`]);
+      expect((await r.createSpace({ tenant: t.id, name: "free", owner: "google:ada" })).name).toBe("free");   // not blocked by the owners lock
+      await other.unsafe(`SELECT 1 FROM "${schema}".reg_members WHERE tenant = $1 AND member = 'google:sam' FOR UPDATE`, [t.id]);
+      await other.unsafe(`UPDATE "${schema}".reg_members SET removed_at = 1, removed_by = 'x' WHERE tenant = $1 AND member = 'google:sam'`, [t.id]);
+      const p = r.createSpace({ tenant: t.id, name: "late", owner: "google:sam" }).then(() => "ok", e => e.code);
+      await waitBlocked(`%"${schema}".reg_members%FOR SHARE%`);
+      await other.unsafe("COMMIT");
+      expect(await p).toBe("removed");
+    } finally { other.release(); await r.close(); await drop(schema); }
+  });
   // MED-2 (#54): a write that puts or keeps a board in a Space reads the Space FOR SHARE, so a trashSpace that is in flight (it holds the Space FOR UPDATE) cannot commit between the read
   // and the write and strand a live board in a Space that went to Trash. Each case holds that lock on a second connection, uncommitted, as a concurrent trashSpace does.
   describe("trash races: a board is never left live in a Space that went to Trash", () => {

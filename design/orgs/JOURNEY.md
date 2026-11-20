@@ -207,6 +207,7 @@ shared with you yet. Open the link you were sent."
 5. **[share]:** ✕ revokes an invite or link. Access ends within about 60 s, as with today's re-check.
 
 ### J7. Leaver offboarding
+> **Built (#55), amended:** removal is a durable marker on the Unit's directory row (membership is not stored), so "removed" means a guest everywhere; the list shows personal space, sole-owned Spaces and Groups (boards are not items: a Space always keeps an owner); reassign first, remove last, and the removal refuses while anything is left; "archived" is a label only; invites and links stay (open question 5 answered). Spec: PROTOCOL.md § Leaver offboarding.
 Content belongs to Spaces, not people, so a leaver only affects their **personal space** and **whatever they
 were the only owner of**.
 1. **[admin-offboard]** (spec only): an admin removes Sam (later, SCIM does it). The screen lists what Sam alone
@@ -214,10 +215,13 @@ were the only owner of**.
 2. **[admin-offboard]:** each item is assigned to **Sam's manager** if the directory knows them, otherwise to the
    admin doing the removal, and can be changed per item. Nothing goes silently to "the oldest admin", the way
    Miro does it.
-3. **[admin-offboard]:** Sam's personal space becomes the ordinary Space "Sam's space (archived)", owned by the
-   recipient. Its board URLs and guests' access stay.
-4. Sam's own grants and team memberships are removed. The invites and share links he made stay until they expire,
-   now vouched for by the new owner, so guests keep access (open question 5).
+3. **[admin-offboard]:** Sam's personal space is private to him: it is not a row to reassign, it **goes with the
+   removal** to the recipient the admin picks, as the ordinary Space "Sam's space (archived)". Only an admin who
+   could open it (board-content access, a permission) may hand it over; a manage-only admin sees a count of its
+   boards and "needs board-content access", and Remove stays locked for Sam. Board URLs and guests' access stay.
+4. Sam's own grants and team memberships are removed, and so are invites addressed to his own email. The invites
+   and share links he made stay until they expire, now vouched for by the new owner, so guests keep access
+   (open question 5).
 
 ### J8. Trash and restore
 Trash is free on every plan, with no paywall.
@@ -281,7 +285,7 @@ Trash is free on every plan, with no paywall.
 | trash | Trash with Restore | yes |
 | home (guest) | Home with Shared with me only | spec only (J1) |
 | board-in-trash | Canvas gate "This board is in Trash" | spec only |
-| admin-offboard | Unit settings › reassign a leaver's sole-owned items | spec only |
+| admin-offboard | Unit settings › reassign a leaver's sole-owned items (`?offboard=1`) | built (#55) |
 | unit-members, teams | Unit settings › Members, Teams | spec only (same pattern as space-settings) |
 
 ## 5. Empty states

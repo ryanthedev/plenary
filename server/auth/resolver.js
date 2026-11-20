@@ -19,7 +19,7 @@
 // the inside are on Spaces, Groups, the Unit and Teams: for anyone else the resolver skips every Space, Group and Unit
 // grant and every Team source, so a guest holds only board-scope sources (a direct grant, an invite or a link), however
 // the Registry's rows came to name them. The Registry can't tell a guest (membership is read from `hd` at sign-in, not
-// stored), so this read-time rule is the enforcement.
+// stored; the Unit's removal marker, `ctx.removed`, turns a member into a guest), so this read-time rule is the enforcement.
 //
 // PERMISSIONS ARE CLIPPED WHERE ASKED. A role held at a scope covers what is inside it, but a permission only means
 // something at some targets (ALLOWED_AT): every source's permissions are cut to the target asked about, so a Unit admin
@@ -95,10 +95,13 @@ export function movedContext(ctx, target) {
 export function resolveAccess({ ctx, grant = null, invites = [], links = [], teams }, identity, t, opts = {}) {
   const { tenant, board, space, group } = ctx;
   const roles = new Map((ctx.roles ?? []).map(r => [r.id, r]));
-  const member = isUnitMember(tenant, identity), admin = isUnitAdmin(tenant, identity);
+  // A person the Unit removed is a guest (PROTOCOL.md § Leaver offboarding): not a member, so no general access, member role, Space, Group, Unit or Team source.
+  const removed = !!ctx.removed?.includes(identity.user);
+  const member = !removed && isUnitMember(tenant, identity), admin = !removed && isUnitAdmin(tenant, identity);   // removal revokes admin too (fail closed)
   const inside = member || admin;
   const myTeams = inside ? teams ?? teamIndex(ctx).get(identity.user) ?? new Set() : new Set();
   const target = board ? "board" : space ? "space" : group ? "group" : "unit";
+  const personal = space?.kind === "personal";
   const visible = new Set([...CONTENT_PERMS, ...ALLOWED_AT[target]]), contentOnly = new Set(CONTENT_PERMS);
   /** The scope chain from the target outward, without the Unit. */
   const chain = [board && { type: "board", id: board.id }, space && { type: "space", id: space.id }, group && { type: "group", id: group.id }].filter(Boolean);
@@ -109,7 +112,10 @@ export function resolveAccess({ ctx, grant = null, invites = [], links = [], tea
     const def = roleDef(role, scope.type, roles, opts);
     if (!def) return;
     const keep = role === MEMBER_ROLE_ID && target !== "unit" ? contentOnly : visible;   // the member role's management permissions are the Unit's own
-    sources.push({ kind, scope, role, ...(team ? { team } : {}), permissions: [...def.permissions].filter(p => keep.has(p)), ladder: def.ladder });
+    // A personal space and its boards are visible only to the owner (a Space-scope source), to board-scope sources (a grant, invite, link) and to a Unit admin WITH board-content access (kind "unit", role admin): a Unit-wide
+    // grant, a Unit Team's grant or the Unit member role gives no board content there, whatever its boardRole (TECH-DEBT row 66; PROTOCOL.md § Organization).
+    const noContent = personal && scope.type === "unit" && (kind !== "unit" || role === MEMBER_ROLE_ID);
+    sources.push({ kind, scope, role, ...(team ? { team } : {}), permissions: [...def.permissions].filter(p => keep.has(p) && !(noContent && contentOnly.has(p))), ladder: noContent ? null : def.ladder });
   };
   /** Grants on a Space, Group or the Unit, or a Team's grant anywhere, count only for the inside; and never the Unit roles `admin` and `member`. */
   const grantsOn = scope => {

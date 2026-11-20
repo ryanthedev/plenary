@@ -41,6 +41,18 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 export const mgmtOf = def => [...def.permissions].filter(p => MGMT_PERMS.includes(p));
 
 /**
+ * The definition of `role` at `type` if the caller may hand it out there, else null. Valid there (roleDef), never `admin` or `member`, its management
+ * permissions a subset of the caller's own at that scope and its board role no higher than the caller's own (no escalation, `withinLadder`), and, at a board, `owner` only for a Unit admin (today's rule).
+ */
+export function grantable(access, role, type, roles, admin) {
+  if (role === "admin" || role === "member") return null;
+  const def = roleDef(role, type, roles);
+  if (!def || !mgmtOf(def).every(p => access.permissions.has(p)) || !withinLadder(access.ladder, def.ladder, admin)) return null;   // management permissions a subset of the caller's, and no more board role than they hold (a Unit admin is exempt)
+  if (type === "board" && role === "owner" && !admin) return null;
+  return def;
+}
+
+/**
  * @param {{ registry: import("./registry-port.js").Registry, tenancy: ReturnType<typeof import("./tenancy.js").tenancy>,
  *   announce?: (unit: { id: string }, scope: { type: string, id: string }, o?: { revoke?: boolean }) => void,
  *   backlog?: () => number, settled?: () => Promise<void>, log?: { warn(msg: string, f?: object): void } }} deps
@@ -129,8 +141,10 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
 
   /** Is `user` a person the Unit knows: in its directory, or one of its admins named by id (the operator vouches for them)? */
   async function isKnownPerson(unit, user) {
+    const row = (await registry.membersAmong(unit.id, [user]))[0];
+    if (row?.removed) return false;
     if (unit.admins?.includes(user) && !user.startsWith("email:")) return true;     // an `email:` entry is an admin not yet seen: not a person with an id
-    return (await registry.membersAmong(unit.id, [user])).length > 0;
+    return !!row;   // a person the Unit removed is not offered (PROTOCOL.md § Leaver offboarding)
   }
 
   // ---- naming rows ----
@@ -152,17 +166,6 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
   }
 
   // ---- who may grant what ----
-  /**
-   * The definition of `role` at `type` if the caller may hand it out there, else null. Valid there (roleDef), never `admin` or `member`, its management
-   * permissions a subset of the caller's own at that scope and its board role no higher than the caller's own (no escalation, `withinLadder`), and, at a board, `owner` only for a Unit admin (today's rule).
-   */
-  function grantable(access, role, type, roles, admin) {
-    if (role === "admin" || role === "member") return null;
-    const def = roleDef(role, type, roles);
-    if (!def || !mgmtOf(def).every(p => access.permissions.has(p)) || !withinLadder(access.ladder, def.ladder, admin)) return null;   // management permissions a subset of the caller's, and no more board role than they hold (a Unit admin is exempt)
-    if (type === "board" && role === "owner" && !admin) return null;
-    return def;
-  }
   /**
    * May the caller alter or clear an existing grant of `role` held by `subject` at `type`? A role valid nowhere is stale and any manager may clear it;
    * else it must be grantable by the caller. At a board a person's `owner` grant is changed only by a Unit admin or by its holder (today's rule).

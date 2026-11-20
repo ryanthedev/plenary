@@ -123,7 +123,7 @@ test("rows say what and where it was, who deleted it and the days left; each Res
   const t = textOf(rows()[0]);
   expect(t).toContain("Roadmap <b>x</b>"); expect(t).toContain("Was in Product / Design"); expect(t).toContain("Deleted by Ada <u>"); expect(t).toContain("27 days left");
   expect(all(e => e.tagName === "B" || e.tagName === "U")).toEqual([]);
-  expect(textOf(rows()[1])).toContain("A Space you can't open"); expect(textOf(rows()[1])).toContain("1 day left");
+  expect(textOf(rows()[1])).toContain("Was in a Space you can't open"); expect(textOf(rows()[1])).toContain("1 day left");
   expect(textOf(rows()[2])).toContain("Old Space"); expect(textOf(rows()[2])).toContain("4 boards went with it"); expect(textOf(rows()[2])).toContain("Due to be deleted soon");
   expect(btn("Restore Roadmap <b>x</b>")).toBeDefined(); expect(btn("Restore Space Old Space")).toBeDefined();
   expect(all(e => e.getAttribute("aria-label") === "Trash" && e.tagName === "UL").length).toBe(1);
@@ -251,7 +251,7 @@ test("daysText, fromText and failText", () => {
   expect([daysText(28), daysText(1), daysText(0)]).toEqual(["28 days left", "1 day left", "Due to be deleted soon"]);
   expect(fromText({ space: { name: "Design", personal: false }, group: { name: "Product" } })).toBe("Product / Design");
   expect(fromText({ space: { name: "ada's space", personal: true }, group: null })).toBe("Personal space");
-  expect(fromText({ space: null, group: null })).toBe("A Space you can't open");
+  expect(fromText({ space: null, group: null })).toBe("a Space you can't open");
   expect(failText("with-space")).toContain("Restore the Space"); expect(failText("unavailable")).toContain("Trying again unchanged is safe"); expect(failText("weird")).toBe("Something went wrong.");
 });
 test("createTrashUndo with no undo offers nothing and runs nothing", async () => {
@@ -276,8 +276,15 @@ test("#54 wording: a restore into the personal space says where it went (toast a
 test("a hidden title shows the placeholder, never 'Untitled' or a blank, on the Trash page and in the notice; an empty title is still Untitled", async () => {
   const { title, ...hidden } = BOARD;
   await page([hidden]);
-  expect(textOf(rows()[0])).toContain("a board you can't open");
+  expect(textOf(all(e => e.hasClass("t"), rows()[0])[0])).toBe("A board you can't open");   // a heading: capitalised
   expect(btn("Restore a board you can't open")).toBeDefined();
-  expect(boardName(undefined)).toBe("a board you can't open"); expect(boardName("")).toBe("Untitled"); expect(boardName("Roadmap")).toBe("Roadmap");
+  expect(boardName(undefined)).toBe("a board you can't open"); expect(boardName(undefined, { start: true })).toBe("A board you can't open"); expect(boardName("roadmap", { start: true })).toBe("roadmap"); expect(boardName("")).toBe("Untitled"); expect(boardName("Roadmap")).toBe("Roadmap");
   expect(restoredText(boardName(undefined))).toBe("Restored a board you can't open.");
+});
+
+test("the notice opens a sentence with 'A board you can't open' (capitalised, said once) while a title stays as written", async () => {
+  await notice({ ...NOTICE, board: { id: "b-1" } });
+  expect(textOf(gate())).toContain("A board you can't open: 28 days left");
+  expect(announced()).toContain("A board you can't open: 28 days left");
+  expect(textOf(gate())).not.toContain("a board you can't open:");
 });

@@ -38,6 +38,7 @@ import { hitTest } from "../../../packages/core/geometry.js";
  *   collab: the root's collab port factory (web/ports/collab.js; production and dev: web/adapters/collab/sync.js over
  *   the session). The collaboration UI (./collab/ui.js) mounts over it: avatars, emotes, cursors, selections, laser,
  *   previews, comment threads. Without it the page has none of that.
+ *   trashShown: true while the Trash notice stands over the page (the board is in Trash): the refused-sign-in banner is then hidden, since signing in again cannot help.
  *   startSession: the root's createSession with everything but the page's own bits. prefs: the per-browser store
  *   (local storage; a failing store reads as empty). notice: shown once (sign-in, share link).
  *   clock: the root's clock port (banner countdowns, the hidden-tab timer, the collab UI). expAt: when the sign-in
@@ -46,7 +47,7 @@ import { hitTest } from "../../../packages/core/geometry.js";
  *   homeHref: where the top bar's Home link goes (the Home screen); null = no link (dev rooms).
  * @returns {{ S: object, ui: object, net: object, setTheme(t: string): void, openDialog(d: string): void, setPanel(op: object): void }}
  */
-export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null, homeHref = null, access = null, newKey = null, share = null, move = null }) {
+export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null, homeHref = null, access = null, newKey = null, share = null, move = null, trashShown = () => false }) {
   if (!clock || typeof clock.now !== "function" || typeof clock.mono !== "function") throw new Error("mountApp: the clock port is required");
   const get = k => { try { return prefs.get(k); } catch { return null; } };
   const put = (k, v) => { try { prefs.set(k, v); } catch {} };
@@ -625,7 +626,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const expiry = () => expiryNotice({ expAt, now: clock.now() });
   function banners() {
     const out = [];
-    const b = connectionBanner({ status: S.status, online: S.online, viewer: S.effective === "viewer", pending: S.pending, readOnly: S.readOnly,
+    const b = S.status === "refused" && trashShown() ? null : connectionBanner({ status: S.status, online: S.online, viewer: S.effective === "viewer", pending: S.pending, readOnly: S.readOnly,
       limited: S.limited, nextTryIn: nextTryIn(), relogin: !!relogin });
     if (b) out.push(h("div.banner", {}, b.text,
       b.relogin ? [reloginLink(), " "] : null,
@@ -698,7 +699,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     drawer: { key: () => (ui.drawer === "notes" ? notesRowsKey() : ""), build: buildDrawer },
     timeline: { key: () => { const B = S.eds.board, bi = boardInfo(B.doc), t = B.time(); return S.role !== "presenter" ? "" : JSON.stringify([bi.marks, bi.dur, !!B.play, B.play ? null : t]); }, build: timeline },
     hud: { key: () => JSON.stringify([boardInfo(S.eds.board.doc).framesSig, S.eds.board.frameAt]), build: hud },
-    overlays: { key: () => JSON.stringify([S.status, S.online, S.pending, S.limited, nextTryIn() == null ? null : Math.ceil(nextTryIn() / 1000), S.settingsRefused.map(r => [r.stream, r.i, r.ready, r.code, r.keys]), expiry()?.bucket ?? null]), build: () => replace($("#overlays"), banners()) },
+    overlays: { key: () => JSON.stringify([S.status, trashShown(), S.online, S.pending, S.limited, nextTryIn() == null ? null : Math.ceil(nextTryIn() / 1000), S.settingsRefused.map(r => [r.stream, r.i, r.ready, r.code, r.keys]), expiry()?.bucket ?? null]), build: () => replace($("#overlays"), banners()) },
     dock: { key: () => "", build: dock },
     sheet: { key: () => (!ui.sheet || !isPhone() ? "" : ui.sheet === "panel" ? panelKey() : ui.sheet === "tools" ? "" : notesRowsKey()), build: sheetView },
     dialogs: { key: () => (ui.dialog === "export" ? `${S.eds.board.doc.rev}|${JSON.stringify(ui.export)}` : `${ui.mermaid.elbow}`), build: dialogs },

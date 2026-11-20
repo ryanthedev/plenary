@@ -146,7 +146,9 @@ if (!signIn.token) {
   const id = signIn.identity;
   const me = { role: null, user: id?.user ?? "me", name: id?.name ?? id?.email ?? "You" };
   const net = wsNet({ url: sameOriginWsUrl(location), WebSocket: globalThis.WebSocket, clock, inflate: browserInflate() });
+  let inTrash = false;   // the Trash notice is showing: the room's "refused" banner would send the person to sign in for nothing
   const app = mountApp({
+    trashShown: () => inTrash,
     startSession: ({ mine, onChange }) => {
       // A board that refuses the visit may be in Trash (PROTOCOL.md § Trash and restore): ask once, and say so over the page when it is; any other answer leaves the page's own refusal.
       let session = null, asked = false;
@@ -154,6 +156,7 @@ if (!signIn.token) {
         asked = true;
         const model = createNoticeModel({ api: httpTrash({ fetch: (...a) => globalThis.fetch(...a), token: signIn.token, timers: clock }), board, newKey: () => randomKey() });
         mountTrashNotice({ host: document.body, model, homeHref: location.pathname, onRestored: () => location.reload() });
+        model.subscribe(() => { inTrash = model.state.status === "ready" || model.state.status === "restored"; onChange(); });   // the page redraws its banners
         model.load();
       };
       session = createSession({

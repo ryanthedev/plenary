@@ -25,16 +25,18 @@ const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 export const daysText = n => (n > 0 ? `${plural(n, "day")} left` : "Due to be deleted soon");
 /** The toast's sentence and the live region's. */
 /** What a board is called on this page: its title, "Untitled" when it has none, or a placeholder when the server hid the title (the caller could not open the board). */
-export const boardName = title => (title === undefined ? "a board you can't open" : title || "Untitled");
+export const HIDDEN_BOARD = "a board you can't open";
+/** `start`: the name opens a sentence or a heading, so only the placeholder is capitalised (a person's title is never touched). */
+export const boardName = (title, { start = false } = {}) => (title === undefined ? (start ? "A" + HIDDEN_BOARD.slice(1) : HIDDEN_BOARD) : title || "Untitled");
 export const trashedText = title => `Moved ${boardName(title)} to Trash.`;
 export const trashedSpaceText = (name, boards) => `Moved ${name} to Trash${boards ? ` with ${plural(boards, "board")}` : ""}.`;
 export const restoredText = (name, to = null) => `Restored ${name || "Untitled"}${to ? ` to ${to.personal ? "your personal space" : to.name}` : ""}.`;
 
-/** Where a board was, as one line: "Product / Design", "Design", "Personal space" or a note that the place is not one the person can open. */
+/** Where a board was, as one line: "Product / Design", "Design", "Personal space" or a note that the place is not one the person can open (lower case: it always follows "Was in" or "from"). */
 export function fromText(from) {
   if (!from) return "";
   const sp = from.space;
-  if (!sp) return from.group ? `${from.group.name ?? "A Group"} / a Space you can't open` : "A Space you can't open";
+  if (!sp) return from.group ? `${from.group.name ?? "A Group"} / a Space you can't open` : "a Space you can't open";
   const name = sp.personal ? "Personal space" : sp.name;
   return from.group?.name ? `${from.group.name} / ${name}` : name;
 }

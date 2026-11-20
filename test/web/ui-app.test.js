@@ -21,16 +21,16 @@ const USERS = { "t-ada": { user: "ada", role: "owner" }, "t-bo": { user: "bo", r
   "t-di": { user: "di", role: "annotator" }, "t-vi": { user: "vi", role: "viewer" } };
 
 /** ada's page over a room with bo (a second presenter, headless) on the same virtual clock. */
-function setup({ expAt = null, relogin = null, collab = false, role = null, token = "t-ada", prefs = memoryStore(), wrap = null, appNet = null, access = null, share = null, move = null } = {}) {
+function setup({ expAt = null, relogin = null, collab = false, role = null, token = "t-ada", prefs = memoryStore(), wrap = null, appNet = null, access = null, share = null, move = null, trashShown = undefined } = {}) {
   installPage();
   const net = localRoom({ users: USERS, clock: true });
   const joins = [], hooks = {};
   const bo = createSession({ join: () => net.join(), token: "t-bo", board: "b1", client: "bo", user: "bo", clock: net.clock });
   bo.setSize(1200, 800);
   const app = mountApp({
-    startSession: ({ mine, onChange }) => createSession({ join: () => { const t = net.join(); joins.push(t); return wrap ? wrap(t) : t; }, token, board: "b1", client: USERS[token].user, user: USERS[token].user, mine, onChange, clock: net.clock }),
+    startSession: ({ mine, onChange }) => { hooks.onChange = onChange; return createSession({ join: () => { const t = net.join(); joins.push(t); return wrap ? wrap(t) : t; }, token, board: "b1", client: USERS[token].user, user: USERS[token].user, mine, onChange, clock: net.clock }); },
     net: appNet ?? { kind: "local", put() {}, onFile() {} }, board: "b1", me: { user: USERS[token].user, name: "Ada", role }, prefs, theme: "light",
-    clock: net.clock, expAt, relogin, access, share, move: move && { clock: net.clock, ...move }, newKey: () => "key-pill-0001",
+    clock: net.clock, expAt, relogin, access, share, ...(trashShown ? { trashShown } : {}), move: move && { clock: net.clock, ...move }, newKey: () => "key-pill-0001",
     collab: collab ? (S, o) => { hooks.jumpTo = o.jumpTo; return syncCollabPort(S, { name: "Ada", frame: fn => net.clock.set(fn, 16), ...o }); } : null,
   });
   /** n animation frames, 16 ms of virtual time each, the room settled in between. */
@@ -329,6 +329,17 @@ test("C-4: back online and back from a long hide reconnect (both jittered); a sh
   expect(shouldProbe({ status: "connecting" })).toBe(true);
 });
 
+test("a refused hello shows no sign-in banner while the Trash notice stands (the board is in Trash), and does again if it goes", () => {
+  let inTrash = true;
+  rig = setup({ relogin: { href: "/auth/login", go() {} }, trashShown: () => inTrash });
+  const { S, step } = rig;
+  for (const t of rig.joins) { const send = t.send; t.send = m => send(m.t === "hello" ? { ...m, token: "dead" } : m); }
+  S.reconnect(); step(10);
+  expect(S.status).toBe("refused");
+  expect(text(page.byId.overlays)).not.toMatch(/refused this sign-in|Sign in again/);
+  inTrash = false; rig.hooks.onChange(); step(2);
+  expect(text(page.byId.overlays)).toMatch(/The room refused this sign-in/);
+});
 test("C-9: a refused sign-in links to sign-in (remembering the board); expiry warns before exp, on the clock port", () => {
   let went = 0;
   const store = memoryStore();

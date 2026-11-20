@@ -19,7 +19,7 @@
 // the inside are on Spaces, Groups, the Unit and Teams: for anyone else the resolver skips every Space, Group and Unit
 // grant and every Team source, so a guest holds only board-scope sources (a direct grant, an invite or a link), however
 // the Registry's rows came to name them. The Registry can't tell a guest (membership is read from `hd` at sign-in, not
-// stored), so this read-time rule is the enforcement.
+// stored; the Unit's removal marker, `ctx.removed`, turns a member into a guest), so this read-time rule is the enforcement.
 //
 // PERMISSIONS ARE CLIPPED WHERE ASKED. A role held at a scope covers what is inside it, but a permission only means
 // something at some targets (ALLOWED_AT): every source's permissions are cut to the target asked about, so a Unit admin
@@ -95,7 +95,9 @@ export function movedContext(ctx, target) {
 export function resolveAccess({ ctx, grant = null, invites = [], links = [], teams }, identity, t, opts = {}) {
   const { tenant, board, space, group } = ctx;
   const roles = new Map((ctx.roles ?? []).map(r => [r.id, r]));
-  const member = isUnitMember(tenant, identity), admin = isUnitAdmin(tenant, identity);
+  // A person the Unit removed is a guest (PROTOCOL.md § Leaver offboarding): not a member, so no general access, member role, Space, Group, Unit or Team source.
+  const removed = !!ctx.removed?.includes(identity.user);
+  const member = !removed && isUnitMember(tenant, identity), admin = isUnitAdmin(tenant, identity);
   const inside = member || admin;
   const myTeams = inside ? teams ?? teamIndex(ctx).get(identity.user) ?? new Set() : new Set();
   const target = board ? "board" : space ? "space" : group ? "group" : "unit";

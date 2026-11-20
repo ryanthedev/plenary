@@ -38,6 +38,7 @@ export const CLASSES = {
   "server/auth/roles.js": "core",           // Roles: custom roles and the permission matrix (PROTOCOL.md § Roles)
   "server/auth/spaces.js": "core",           // Spaces and Groups: pages, pickers, create, rename, general access (PROTOCOL.md § Spaces and Groups)
   "server/auth/trash.js": "core",           // trash and restore a board or Space, the Trash list and the board-URL notice (PROTOCOL.md § Trash and restore)
+  "server/auth/offboard.js": "core",        // leaver offboarding: the list, per-item reassignment and the removal (PROTOCOL.md § Leaver offboarding)
   "server/auth/move.js": "core",             // move a board: options, the access diff, the compare-and-set move (PROTOCOL.md § Move board)
   "server/auth/home.js": "core",             // the Home screen's read side over the Registry port + tenancy (PROTOCOL.md § Home)
   "server/admin/boards.js": "core",          // admin use cases over the Registry port

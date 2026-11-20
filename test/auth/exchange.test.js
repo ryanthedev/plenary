@@ -276,7 +276,7 @@ test("a Unit member's sign-in is recorded in the member directory (best effort);
   const a = await signIn(ADMIN);
   expect((await exchange(a.code, { cookie: a.cookie })).status).toBe(200);
   await new Promise(r => setTimeout(r, 0));
-  expect(await registry.membersAmong(unit.id, ["google:1001"])).toEqual([{ user: "google:1001", name: "Ann", email: "ann@acme.com" }]);
+  expect(await registry.membersAmong(unit.id, ["google:1001"])).toEqual([{ user: "google:1001", name: "Ann", email: "ann@acme.com", removed: false }]);
   const g = await signIn(GUEST);
   expect((await exchange(g.code, { cookie: g.cookie })).status).toBe(200);
   await new Promise(r => setTimeout(r, 0));

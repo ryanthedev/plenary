@@ -58,7 +58,7 @@ async function managed(registry, caller, boardId) {
 export async function knownOnBoard(registry, board, user) {
   if (typeof user !== "string" || !user || user.length > 200 || /[\0\n]/.test(user) || user.startsWith("email:")) return false;
   if (await registry.grant(board.id, user)) return true;
-  if ((await registry.membersAmong(board.tenant, [user])).length) return true;
+  if ((await registry.membersAmong(board.tenant, [user])).some(m => !m.removed)) return true;   // a person the Unit removed gets no NEW grant (PROTOCOL.md § Leaver offboarding)
   if ((await registry.tenant(board.tenant))?.admins?.includes(user)) return true;
   return (await registry.linkUses(board.id, user)).length > 0;
 }

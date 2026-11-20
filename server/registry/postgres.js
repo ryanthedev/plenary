@@ -103,11 +103,11 @@ const REGISTRY_TABLE_DDL = {
   reg_tenant_meta: "tenant TEXT PRIMARY KEY REFERENCES $S.reg_tenants(id), kind TEXT NOT NULL",
   reg_tenant_domains: "domain TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), n BIGINT GENERATED ALWAYS AS IDENTITY",
   reg_groups: "id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), name TEXT NOT NULL, general_role TEXT, created_at BIGINT NOT NULL",
-  reg_spaces: "id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), grp TEXT REFERENCES $S.reg_groups(id), name TEXT NOT NULL, kind TEXT NOT NULL, owner_user TEXT, general_role TEXT, created_at BIGINT NOT NULL, trashed_at BIGINT, trashed_by TEXT, purging BOOLEAN NOT NULL DEFAULT FALSE, UNIQUE (tenant, owner_user)",
+  reg_spaces: "id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), grp TEXT REFERENCES $S.reg_groups(id), name TEXT NOT NULL, kind TEXT NOT NULL, owner_user TEXT, general_role TEXT, created_at BIGINT NOT NULL, trashed_at BIGINT, trashed_by TEXT, purging BOOLEAN NOT NULL DEFAULT FALSE, archived_at BIGINT, UNIQUE (tenant, owner_user)",
   reg_board_spaces: "board TEXT PRIMARY KEY REFERENCES $S.reg_boards(id), space TEXT NOT NULL REFERENCES $S.reg_spaces(id)",
   reg_teams: "id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), name TEXT NOT NULL, created_at BIGINT NOT NULL",
   reg_team_members: "team TEXT NOT NULL REFERENCES $S.reg_teams(id), member TEXT NOT NULL, PRIMARY KEY (team, member)",
-  reg_members: "tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), member TEXT NOT NULL, name TEXT, email TEXT, PRIMARY KEY (tenant, member)",
+  reg_members: "tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), member TEXT NOT NULL, name TEXT, email TEXT, removed_at BIGINT, removed_by TEXT, PRIMARY KEY (tenant, member)",
   reg_scope_grants: "scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject TEXT NOT NULL, role TEXT NOT NULL, n BIGINT GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (scope_type, scope_id, subject_type, subject)",
   // Home (PROTOCOL.md § Home): Recent and Starred.
   reg_recents: "member TEXT NOT NULL, board TEXT NOT NULL REFERENCES $S.reg_boards(id), opened_at BIGINT NOT NULL, PRIMARY KEY (member, board)",
@@ -287,7 +287,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
   const BOARD_SQL = `SELECT b.*, (SELECT space FROM ${BS} WHERE board = b.id) AS space FROM ${BD} b`;
   const rowBoard = r => r && { id: r.id, tenant: r.tenant, title: r.title, memberRole: r.member_role, space: r.space, createdAt: num(r.created_at), trashedAt: num(r.trashed_at), trashedBy: r.trashed_by ?? null, trashedWith: r.trashed_with ?? null };
   const rowGroup = r => r && { id: r.id, tenant: r.tenant, name: r.name, generalRole: r.general_role, createdAt: num(r.created_at) };
-  const rowSpace = r => r && { id: r.id, tenant: r.tenant, group: r.grp, name: r.name, kind: r.kind, owner: r.owner_user, generalRole: r.general_role, createdAt: num(r.created_at), trashedAt: num(r.trashed_at), trashedBy: r.trashed_by ?? null };
+  const rowSpace = r => r && { id: r.id, tenant: r.tenant, group: r.grp, name: r.name, kind: r.kind, owner: r.owner_user, generalRole: r.general_role, createdAt: num(r.created_at), trashedAt: num(r.trashed_at), trashedBy: r.trashed_by ?? null, archivedAt: num(r.archived_at) };
   const rowTeam = r => r && { id: r.id, tenant: r.tenant, name: r.name, createdAt: num(r.created_at) };
   const rowRole = r => r && { id: r.id, tenant: r.tenant, name: r.name, base: r.base, boardRole: r.board_role, permissions: JSON.parse(r.permissions), createdAt: num(r.created_at) };
   const rowSg = r => ({ subject: { type: r.subject_type, id: r.subject }, role: r.role });
@@ -301,6 +301,26 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     AND scope_type IN ('group', 'space') ORDER BY scope_type, scope_id`, [team]);
   /** One lock per tenant for every write that can lower a Group's or Space's counted owners (see setTeamMember). Always taken FIRST. */
   const lockOwners = (tx, tenant) => tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-owners:${s}:${tenant}`]);
+  /** Rejects (nothing written) when the Unit removed `user`. The owners lock first, so a removal in flight is either committed (refused here) or waits for this create. */
+  const noRemoved = async (tx, tenant, user) => {
+    if (user == null) return;
+    await lockOwners(tx, tenant);
+    if ((await one(tx, `SELECT removed_at FROM ${MB} WHERE tenant = $1 AND member = $2`, [tenant, String(user)]))?.removed_at != null) throw new RegistryError("removed", "registry: the member was removed from the Unit");
+  };
+  /**
+   * What `user` solely owns in a Unit (PROTOCOL.md § Leaver offboarding): their personal space, and every Group or Space they own (their own grant, or a Team's they are in) with no other person owner and no Team owner with a member besides them.
+   * `$1` tenant, `$2` user, `$3` cursor "<type>\n<id>", `$4` limit.
+   */
+  const ownedAloneRows = (q, tenant, user, cursor, n) => q.unsafe(`WITH c(t, i) AS (
+      SELECT scope_type, scope_id FROM ${SG} WHERE subject_type = 'user' AND subject = $2 AND role = 'owner' AND scope_type IN ('group', 'space')
+      UNION SELECT g.scope_type, g.scope_id FROM ${TU} m JOIN ${SG} g ON g.subject_type = 'team' AND g.subject = m.team AND g.role = 'owner' AND g.scope_type IN ('group', 'space') WHERE m.member = $2
+      UNION SELECT 'space', id FROM ${SP} WHERE tenant = $1 AND owner_user = $2)
+    SELECT c.t AS type, c.i AS id, (c.t = 'space' AND EXISTS (SELECT 1 FROM ${SP} p WHERE p.id = c.i AND p.owner_user = $2)) AS personal FROM c
+    WHERE (CASE c.t WHEN 'space' THEN (SELECT tenant FROM ${SP} WHERE id = c.i) ELSE (SELECT tenant FROM ${GR} WHERE id = c.i) END) = $1
+      AND ($3::text IS NULL OR (c.t || E'\n' || c.i) COLLATE "C" > $3)
+      AND ((c.t = 'space' AND EXISTS (SELECT 1 FROM ${SP} p WHERE p.id = c.i AND p.owner_user = $2)) OR NOT EXISTS (SELECT 1 FROM ${SG} o WHERE o.scope_type = c.t AND o.scope_id = c.i AND o.role = 'owner'
+        AND ((o.subject_type = 'user' AND o.subject <> $2) OR (o.subject_type = 'team' AND EXISTS (SELECT 1 FROM ${TU} x WHERE x.team = o.subject AND x.member <> $2)))))
+    ORDER BY c.t COLLATE "C", c.i COLLATE "C" LIMIT $4`, [tenant, user, cursor, n]);
   const putSg = async (tx, type, id, st, sid, role) => {
     if (role == null) await tx.unsafe(`DELETE FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 AND subject_type = $3 AND subject = $4`, [type, id, st, sid]);
     else await tx.unsafe(`INSERT INTO ${SG} (scope_type, scope_id, subject_type, subject, role) VALUES ($1, $2, $3, $4, $5)
@@ -714,6 +734,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       const n = orgDefaults.name(name), k = idemStart(idem), createdAt = now();
       return write(async tx => {
         if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
+        await noRemoved(tx, tenant, owner);
         const id = await fresh(tx, mint.group, GR);
         await idemPut(tx, k, id, createdAt);
         await tx.unsafe(`INSERT INTO ${GR} (id, tenant, name, general_role, created_at) VALUES ($1, $2, $3, $4, $5)`, [id, tenant, n, nz(generalRole), createdAt]);
@@ -731,6 +752,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       return write(async tx => {
         if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
         if (group != null && (await one(tx, `SELECT tenant FROM ${GR} WHERE id = $1`, [group]))?.tenant !== tenant) throw new Error("registry: no such group");
+        await noRemoved(tx, tenant, owner);
         const id = await fresh(tx, mint.space, SP);
         await idemPut(tx, k, id, createdAt);
         await tx.unsafe(`INSERT INTO ${SP} (id, tenant, grp, name, kind, owner_user, general_role, created_at) VALUES ($1, $2, $3, $4, 'shared', NULL, $5, $6)`,
@@ -783,6 +805,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       if (had) return had;
       return write(async tx => {
         if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
+        await noRemoved(tx, tenant, u);
         // One per (tenant, user): the unique key settles two racing first sign-ins; the loser reads the winner's row.
         const id = await fresh(tx, mint.space, SP);
         const made = await one(tx, `INSERT INTO ${SP} (id, tenant, grp, name, kind, owner_user, general_role, created_at)
@@ -921,14 +944,14 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     async membersAmong(tenant, users) {
       ready();
       const us = [...new Set((users ?? []).filter(key))].slice(0, TEAMS.among);
-      return key(tenant) && us.length ? (await db.unsafe(`SELECT member AS "user", name, email FROM ${MB} WHERE tenant = $1 AND member = ANY($2::text[])`, [tenant, us])) : [];
+      return key(tenant) && us.length ? (await db.unsafe(`SELECT member AS "user", name, email, removed_at IS NOT NULL AS removed FROM ${MB} WHERE tenant = $1 AND member = ANY($2::text[])`, [tenant, us])) : [];
     },
     async findMembers(tenant, { q: term = null, limit } = {}) {
       ready();
       const like = likeOf(term), n = smallLimit(limit, TEAMS.find.default, TEAMS.find.max);
       if (!key(tenant)) return [];
       const fold = c => `translate(${c}, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')`;
-      return await db.unsafe(`SELECT member AS "user", name, email FROM ${MB} WHERE tenant = $1 AND ($2::text IS NULL OR ${fold("coalesce(name, '')")} LIKE $2 ESCAPE '\\'
+      return await db.unsafe(`SELECT member AS "user", name, email FROM ${MB} WHERE tenant = $1 AND removed_at IS NULL AND ($2::text IS NULL OR ${fold("coalesce(name, '')")} LIKE $2 ESCAPE '\\'
         OR ${fold("coalesce(email, '')")} LIKE $2 ESCAPE '\\' OR ${fold("member")} LIKE $2 ESCAPE '\\') ORDER BY coalesce(name, member) COLLATE "C", member COLLATE "C" LIMIT $3`, [tenant, like, n]);
     },
     async setScopedGrant({ scope, subject, role }) {
@@ -1060,7 +1083,8 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         UNION ALL SELECT 'g', row_to_json(sg)::text FROM sg
         UNION ALL SELECT 'R', row_to_json(r)::text FROM ${RO} r JOIN c ON r.tenant = c.tenant
         UNION ALL SELECT 'm', json_build_object('team', m.team, 'member', m.member)::text FROM ${TU} m
-          WHERE m.team IN (SELECT subject FROM sg WHERE subject_type = 'team') AND (${U}::text[] IS NULL OR m.member = ANY(${U}::text[]))`, params);
+          WHERE m.team IN (SELECT subject FROM sg WHERE subject_type = 'team') AND (${U}::text[] IS NULL OR m.member = ANY(${U}::text[]))
+        UNION ALL SELECT 'x', json_build_object('member', x.member)::text FROM ${MB} x WHERE x.tenant IN (SELECT tenant FROM c) AND x.removed_at IS NOT NULL AND ${U}::text[] IS NOT NULL AND x.member = ANY(${U}::text[])`, params);
       const by = k => rows.filter(r => r.k === k).map(r => JSON.parse(r.j));
       const ids = by("c")[0];
       if (!ids) return null;
@@ -1079,7 +1103,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       const teams = {};
       for (const g of Object.values(scoped).flat()) if (g.subject.type === "team") teams[g.subject.id] = [];
       for (const m of by("m").sort((x, y) => (x.member < y.member ? -1 : 1))) teams[m.team].push(m.member);
-      return { ...out, scoped, roles: by("R").map(rowRole).sort((x, y) => x.createdAt - y.createdAt || (x.id < y.id ? -1 : 1)), teams };
+      return { ...out, scoped, roles: by("R").map(rowRole).sort((x, y) => x.createdAt - y.createdAt || (x.id < y.id ? -1 : 1)), teams, removed: by("x").map(x => x.member).sort() };
     },
     // `accessContext` for many Unit, Group or Space scopes in ONE statement (one snapshot): the chains and tenants, the chains' grants, the
     // Units' roles and the members of the Teams those grants name (only `users`, when given), as JSON rows tagged by kind, then assembled
@@ -1106,7 +1130,8 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         UNION ALL SELECT 'g', row_to_json(sg)::text FROM sg
         UNION ALL SELECT 'R', row_to_json(r)::text FROM ${RO} r WHERE r.tenant IN (SELECT tenant FROM c)
         UNION ALL SELECT 'm', json_build_object('team', m.team, 'member', m.member)::text FROM ${TU} m
-          WHERE m.team IN (SELECT subject FROM sg WHERE subject_type = 'team') AND ($3::text[] IS NULL OR m.member = ANY($3::text[]))`,
+          WHERE m.team IN (SELECT subject FROM sg WHERE subject_type = 'team') AND ($3::text[] IS NULL OR m.member = ANY($3::text[]))
+        UNION ALL SELECT 'x', json_build_object('tenant', x.tenant, 'member', x.member)::text FROM ${MB} x WHERE x.tenant IN (SELECT tenant FROM c) AND x.removed_at IS NOT NULL AND $3::text[] IS NOT NULL AND x.member = ANY($3::text[])`,
       [list.map(sc => sc.type), list.map(sc => sc.id), us]);
       const by = k => rows.filter(r => r.k === k).map(r => JSON.parse(r.j));
       const tenants = new Map(by("T").map(t => [t.id, { id: t.id, domain: t.domain, domains: [...(t.domain ? [t.domain] : []), ...t.extra], kind: needKind(t.kind, t.id), admins: t.admins, createdAt: num(t.created_at) }]));
@@ -1115,6 +1140,8 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       for (const r of by("R")) { if (!roles.has(r.tenant)) roles.set(r.tenant, []); roles.get(r.tenant).push(rowRole(r)); }
       const members = new Map();
       for (const m of by("m")) { if (!members.has(m.team)) members.set(m.team, []); members.get(m.team).push(m.member); }
+      const gone = new Map();
+      for (const x of by("x")) { if (!gone.has(x.tenant)) gone.set(x.tenant, []); gone.get(x.tenant).push(x.member); }
       const grants = by("g").sort((x, y) => x.n - y.n);
       for (const c of by("c")) {
         const mine = grants.filter(g => g.t === c.t && g.k === c.k), scoped = { unit: [], group: [], space: [], board: [] };
@@ -1122,7 +1149,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         const teams = {};
         for (const g of Object.values(scoped).flat()) if (g.subject.type === "team") teams[g.subject.id] = [...(members.get(g.subject.id) ?? [])].sort();
         out.set(c.t + "\n" + c.k, { tenant: tenants.get(c.tenant), board: null, space: c.sid ? spaces.get(c.sid) : null, group: c.gid ? groups.get(c.gid) : null, scoped,
-          roles: (roles.get(c.tenant) ?? []).sort((x, y) => x.createdAt - y.createdAt || (x.id < y.id ? -1 : 1)), teams });
+          roles: (roles.get(c.tenant) ?? []).sort((x, y) => x.createdAt - y.createdAt || (x.id < y.id ? -1 : 1)), teams, removed: (gone.get(c.tenant) ?? []).sort() });
       }
       return out;
     },
@@ -1325,6 +1352,72 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         : `SELECT bs.board AS id FROM ${BS} bs JOIN ${SP} s ON s.id = bs.space JOIN ${BD} b ON b.id = bs.board WHERE s.grp = $1 AND ($4::boolean OR b.trashed_at IS NULL) AND ($2::text IS NULL OR bs.board > $2) ORDER BY bs.board LIMIT $3`;
       const ids = (await db.unsafe(text, [id, cur, n + 1, !!withTrashed])).map(r => r.id);
       return { ids: ids.slice(0, n), next: ids.length > n ? ids[n - 1] : null };
+    },
+    // ---- Leaver offboarding (PROTOCOL.md § Leaver offboarding): one transaction each, the tenant's owners lock first (like every write that can lower a counted owner), then the rows ----
+    async memberState(tenant, user) {
+      ready();
+      const r = key(tenant) && key(user) ? await one(db, `SELECT member, name, email, removed_at, removed_by FROM ${MB} WHERE tenant = $1 AND member = $2`, [tenant, user]) : null;
+      return r ? { user: r.member, name: r.name, email: r.email, removed: r.removed_at != null, removedAt: num(r.removed_at), removedBy: r.removed_by ?? null } : null;
+    },
+    async ownedAlone(tenant, user, { after = null, limit } = {}) {
+      ready();
+      const cur = orgDefaults.cursor(after, "scope"), n = smallLimit(limit, TEAMS.page.default, TEAMS.page.max);
+      if (!key(tenant) || !key(user)) return { items: [], next: null };
+      const rows = (await ownedAloneRows(db, tenant, user, cur, n + 1)).map(r => ({ type: r.type, id: r.id, personal: !!r.personal })), page = rows.slice(0, n);
+      return { items: page, next: rows.length > n ? page[n - 1].type + "\n" + page[n - 1].id : null };
+    },
+    async reassignOwner({ scope, from, to, name, idem }) {
+      ready();
+      const sc = orgDefaults.renamable(scope, ["space", "group"]);
+      if (!key(from) || !key(to) || !key(sc.id)) throw new Error("registry: no such member");
+      const n = name == null ? null : orgDefaults.name(name), k = idemStart(idem), at = now();
+      return write(async tx => {
+        const tenant = await tenantOfScope(tx, sc.type, sc.id);
+        if (!tenant) throw new Error(`registry: no such ${sc.type}`);
+        await lockOwners(tx, tenant);
+        const row = await one(tx, `SELECT * FROM ${sc.type === "space" ? SP : GR} WHERE id = $1 FOR UPDATE`, [sc.id]);
+        const dir = await one(tx, `SELECT removed_at FROM ${MB} WHERE tenant = $1 AND member = $2`, [tenant, to]);
+        if (from === to || !dir || dir.removed_at != null) throw new RegistryError("bad-recipient", "registry: the recipient is not a live member of the Unit");
+        const personal = sc.type === "space" && row.kind === "personal" && row.owner_user === from;
+        // Share-lock the Team member rows the count reads, so a member leaving a Team owner at this moment is committed (seen) or waits for us.
+        await tx.unsafe(`SELECT 1 FROM ${TU} WHERE team IN (SELECT subject FROM ${SG} WHERE scope_type = $1 AND scope_id = $2 AND subject_type = 'team' AND role = 'owner') ORDER BY team, member FOR SHARE`, [sc.type, sc.id]);
+        const done = personal || !!(await one(tx, `SELECT 1 AS x FROM (SELECT $1::text AS t, $2::text AS i) c WHERE EXISTS (SELECT 1 FROM ${SG} g WHERE g.scope_type = c.t AND g.scope_id = c.i AND g.role = 'owner'
+          AND ((g.subject_type = 'user' AND g.subject = $3) OR (g.subject_type = 'team' AND EXISTS (SELECT 1 FROM ${TU} m WHERE m.team = g.subject AND m.member = $3))))
+          AND NOT EXISTS (SELECT 1 FROM ${SG} o WHERE o.scope_type = c.t AND o.scope_id = c.i AND o.role = 'owner'
+          AND ((o.subject_type = 'user' AND o.subject <> $3) OR (o.subject_type = 'team' AND EXISTS (SELECT 1 FROM ${TU} x WHERE x.team = o.subject AND x.member <> $3))))`, [sc.type, sc.id, from]));
+        await idemPut(tx, k, sc.id + (done ? ":reassigned" : ":noop"), at);
+        if (done) {
+          await putSg(tx, sc.type, sc.id, "user", to, "owner");
+          await putSg(tx, sc.type, sc.id, "user", from, null);
+          if (personal) await tx.unsafe(`UPDATE ${SP} SET kind = 'shared', owner_user = NULL, archived_at = $2, name = $3 WHERE id = $1`, [sc.id, at, n ?? row.name]);
+        }
+        return { done };
+      });
+    },
+    async removeMember({ tenant, user, by, idem }) {
+      ready();
+      if (!key(tenant)) throw new Error("registry: no such tenant");
+      if (!key(user) || !key(by)) throw new Error("registry: no such member");
+      const k = idemStart(idem), at = now();
+      return write(async tx => {
+        if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
+        await lockOwners(tx, tenant);
+        const cur = await one(tx, `SELECT removed_at FROM ${MB} WHERE tenant = $1 AND member = $2 FOR UPDATE`, [tenant, user]);
+        if (!cur) throw new Error("registry: no such member");
+        if (cur.removed_at != null) { await idemPut(tx, k, user + ":noop", at); return { removed: false, grants: 0, scopedGrants: 0, teams: 0 }; }
+        if (await one(tx, `SELECT 1 AS x FROM ${A} WHERE tenant = $1 AND member = $2`, [tenant, user])) throw new RegistryError("is-admin", "registry: a Unit admin cannot be removed");
+        // The Team member rows the count reads: share-locked, so a member joining or leaving a Team owner is committed (seen) or waits for us.
+        await tx.unsafe(`SELECT 1 FROM ${TU} WHERE team IN (SELECT m.team FROM ${TU} m WHERE m.member = $1)
+          AND team IN (SELECT subject FROM ${SG} WHERE subject_type = 'team' AND role = 'owner' AND scope_type IN ('group', 'space')) ORDER BY team, member FOR SHARE`, [user]);
+        if ((await ownedAloneRows(tx, tenant, user, null, 1)).length) throw new RegistryError("still-owns", "registry: the member still solely owns something");
+        await idemPut(tx, k, user + ":removed", at);
+        const grants = (await tx.unsafe(`DELETE FROM ${G} WHERE member = $1 AND board IN (SELECT id FROM ${BD} WHERE tenant = $2)`, [user, tenant])).count;
+        const scopedGrants = (await tx.unsafe(`DELETE FROM ${SG} g WHERE g.subject_type = 'user' AND g.subject = $1 AND g.scope_type <> 'board' AND ${ownGrant("$2")}`, [user, tenant])).count;
+        const teams = (await tx.unsafe(`DELETE FROM ${TU} WHERE member = $1 AND team IN (SELECT id FROM ${TE} WHERE tenant = $2)`, [user, tenant])).count;
+        await tx.unsafe(`DELETE FROM ${AR} WHERE tenant = $1 AND member = $2`, [tenant, user]);
+        await tx.unsafe(`UPDATE ${MB} SET removed_at = $3, removed_by = $4 WHERE tenant = $1 AND member = $2`, [tenant, user, at, by]);
+        return { removed: true, grants, scopedGrants, teams };
+      });
     },
     async scopesOf(subject, { after = null, limit } = {}) {
       ready();

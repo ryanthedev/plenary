@@ -69,6 +69,7 @@ const NOT_ADAPTERS = {
   "server/auth/spaces.js": "core: Space and Group pages, pickers, create and rename over the Registry port, tenancy and Home (PROTOCOL.md § Spaces and Groups)",
   "server/auth/move.js": "core: move a board between Spaces: options, the access diff, the compare-and-set move (PROTOCOL.md § Move board)",
   "server/auth/trash.js": "core: trash and restore a board or Space, the Trash list and the board-URL notice over the Registry port and tenancy (PROTOCOL.md § Trash and restore)",
+  "server/auth/offboard.js": "core: leaver offboarding: the list, per-item reassignment and the removal over the Registry port and tenancy (PROTOCOL.md § Leaver offboarding)",
   "server/auth/home.js": "core: the Home screen's lists, tree and search over the Registry port and tenancy (PROTOCOL.md § Home)",
 };
 /** Non-port modules a driven adapter may import. */

@@ -207,6 +207,7 @@ shared with you yet. Open the link you were sent."
 5. **[share]:** ✕ revokes an invite or link. Access ends within about 60 s, as with today's re-check.
 
 ### J7. Leaver offboarding
+> **Built (#55), amended:** removal is a durable marker on the Unit's directory row (membership is not stored), so "removed" means a guest everywhere; the list shows personal space, sole-owned Spaces and Groups (boards are not items: a Space always keeps an owner); reassign first, remove last, and the removal refuses while anything is left; "archived" is a label only; invites and links stay (open question 5 answered). Spec: PROTOCOL.md § Leaver offboarding.
 Content belongs to Spaces, not people, so a leaver only affects their **personal space** and **whatever they
 were the only owner of**.
 1. **[admin-offboard]** (spec only): an admin removes Sam (later, SCIM does it). The screen lists what Sam alone
@@ -281,7 +282,7 @@ Trash is free on every plan, with no paywall.
 | trash | Trash with Restore | yes |
 | home (guest) | Home with Shared with me only | spec only (J1) |
 | board-in-trash | Canvas gate "This board is in Trash" | spec only |
-| admin-offboard | Unit settings › reassign a leaver's sole-owned items | spec only |
+| admin-offboard | Unit settings › reassign a leaver's sole-owned items (`?offboard=1`) | built (#55) |
 | unit-members, teams | Unit settings › Members, Teams | spec only (same pattern as space-settings) |
 
 ## 5. Empty states

@@ -244,7 +244,9 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
 
     /** The tenant an identity belongs to by Workspace domain, or null (no `hd` = guest only). */
     async tenantOf(identity) {
-      return identity?.domain ? registry.tenantByDomain(identity.domain) : null;
+      const t = identity?.domain ? await registry.tenantByDomain(identity.domain) : null;
+      // A person the Unit removed has no Unit (PROTOCOL.md § Leaver offboarding): a guest to every route. One primary-key read per request.
+      return t && (await registry.memberState(t.id, identity.user))?.removed ? null : t;
     },
   };
 }

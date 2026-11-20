@@ -692,7 +692,7 @@ export function registryContract(name, makeRegistry, opts = {}) {
         await r.touchMember(t.id, { user: "google:bob", name: null });
         await r.touchMember(t.id, { user: "google:cy", name: "Cy 100%_", email: "cy@acme.com" });
         await r.touchMember(other.id, { user: "google:ann", name: "Other Ann" });
-        expect((await r.membersAmong(t.id, ["google:ann", "google:nobody", "google:ann"]))).toEqual([{ user: "google:ann", name: "Ann Lee", email: "ann@acme.com" }]);
+        expect((await r.membersAmong(t.id, ["google:ann", "google:nobody", "google:ann"]))).toEqual([{ user: "google:ann", name: "Ann Lee", email: "ann@acme.com", removed: false }]);
         expect((await r.membersAmong(other.id, ["google:ann"]))[0].name).toBe("Other Ann");
         expect(await r.membersAmong(t.id, [])).toEqual([]);
         await r.touchMember(t.id, { user: "google:ann", name: "Ann Smith", email: "ann@acme.com" });   // a changed name overwrites
@@ -1850,6 +1850,197 @@ export function registryContract(name, makeRegistry, opts = {}) {
         await expect(r.moveBoard({ board: board.id, from: b.id, to: c.id, idem })).rejects.toMatchObject({ code: "moved" });
         expect(await r.idemGet(idem)).toEqual({ state: "none" });
         expect((await r.moveBoard({ board: board.id, from: a.id, to: c.id, idem })).moved).toBe(true);
+      });
+    });
+
+    // ---- Leaver offboarding (PROTOCOL.md § Leaver offboarding, #55) ----
+    describe("leaver offboarding: ownedAlone, reassignOwner, removeMember", () => {
+      const SAM = "google:sam", ADA = "google:ada", BOB = "google:bob";
+      const setup = async () => {
+        const t = await r.createTenant({ domain: "acme.com", admins: ["google:root"] });
+        for (const u of [SAM, ADA, BOB, "google:root"]) await r.touchMember(t.id, { user: u, name: u.slice(7), email: u.slice(7) + "@acme.com" });
+        return t;
+      };
+      const keys = async (t, u = SAM) => (await r.ownedAlone(t.id, u)).items.map(i => `${i.type}:${i.id}`).sort();
+
+      test("ownedAlone lists the personal space (always), Groups and Spaces whose only counted owner is the user (trashed too), and not shared ones", async () => {
+        const t = await setup();
+        const mine = await r.ensurePersonalSpace(t.id, SAM);
+        const solo = await r.createSpace({ tenant: t.id, name: "Field notes", owner: SAM });
+        const grp = await r.createGroup({ tenant: t.id, name: "G", owner: SAM });
+        const shared = await r.createSpace({ tenant: t.id, name: "Shared", owner: SAM });
+        await r.setScopedGrant({ scope: { type: "space", id: shared.id }, subject: { type: "user", id: ADA }, role: "owner" });
+        const gone = await r.createSpace({ tenant: t.id, name: "Old", owner: SAM });
+        await r.trashSpace({ space: gone.id, by: SAM });
+        const items = (await r.ownedAlone(t.id, SAM)).items;
+        expect(items.map(i => i.id).sort()).toEqual([mine.id, solo.id, grp.id, gone.id].sort());
+        expect(items.find(i => i.id === mine.id).personal).toBe(true);
+        expect(items.find(i => i.id === solo.id).personal).toBe(false);
+        expect(await keys(t, ADA)).toEqual([`space:${(await r.personalSpace(t.id, ADA))?.id}`].filter(x => !x.endsWith("undefined")).concat([]));
+      });
+      test("a Team owner counts only with a member besides the user; the user alone in a Team that owns a Space still solely owns it", async () => {
+        const t = await setup();
+        const sp = await r.createSpace({ tenant: t.id, name: "TeamOwned" });
+        const team = await r.createTeam({ tenant: t.id, name: "T" });
+        await r.setTeamMember(team.id, SAM, true);
+        await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "team", id: team.id }, role: "owner" });
+        expect(await keys(t)).toContain(`space:${sp.id}`);
+        await r.setTeamMember(team.id, BOB, true);
+        expect(await keys(t)).not.toContain(`space:${sp.id}`);
+      });
+      test("paging: a page of one, then the cursor continues, a malformed cursor is refused", async () => {
+        const t = await setup();
+        for (let i = 0; i < 3; i++) await r.createSpace({ tenant: t.id, name: "S" + i, owner: SAM });
+        const seen = []; let after = null;
+        do { const p = await r.ownedAlone(t.id, SAM, { after, limit: 1 }); seen.push(...p.items.map(i => i.id)); after = p.next; } while (after);
+        expect(new Set(seen).size).toBe(3);
+        await expect(r.ownedAlone(t.id, SAM, { after: "nonsense" })).rejects.toThrow();
+      });
+      test("reassignOwner: the recipient becomes owner and the leaver's grant goes in one step; a second call is a no-op", async () => {
+        const t = await setup();
+        const sp = await r.createSpace({ tenant: t.id, name: "S", owner: SAM });
+        expect(await r.reassignOwner({ scope: { type: "space", id: sp.id }, from: SAM, to: ADA })).toEqual({ done: true });
+        expect(await r.scopedGrant({ type: "space", id: sp.id }, { type: "user", id: ADA })).toBe("owner");
+        expect(await r.scopedGrant({ type: "space", id: sp.id }, { type: "user", id: SAM })).toBe(null);
+        expect(await r.reassignOwner({ scope: { type: "space", id: sp.id }, from: SAM, to: BOB })).toEqual({ done: false });
+        expect(await r.scopedGrant({ type: "space", id: sp.id }, { type: "user", id: BOB })).toBe(null);
+      });
+      test("reassignOwner does nothing once the item is shared with another owner (compare-and-set)", async () => {
+        const t = await setup();
+        const sp = await r.createSpace({ tenant: t.id, name: "S", owner: SAM });
+        await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "user", id: ADA }, role: "owner" });
+        expect((await r.reassignOwner({ scope: { type: "space", id: sp.id }, from: SAM, to: BOB })).done).toBe(false);
+        expect(await r.scopedGrant({ type: "space", id: sp.id }, { type: "user", id: SAM })).toBe("owner");
+      });
+      test("reassignOwner of a Team-held Space adds the recipient and keeps the Team", async () => {
+        const t = await setup();
+        const sp = await r.createSpace({ tenant: t.id, name: "S" });
+        const team = await r.createTeam({ tenant: t.id, name: "T" });
+        await r.setTeamMember(team.id, SAM, true);
+        await r.setScopedGrant({ scope: { type: "space", id: sp.id }, subject: { type: "team", id: team.id }, role: "owner" });
+        expect((await r.reassignOwner({ scope: { type: "space", id: sp.id }, from: SAM, to: ADA })).done).toBe(true);
+        expect(await r.scopedGrant({ type: "space", id: sp.id }, { type: "team", id: team.id })).toBe("owner");
+        expect(await r.scopedGrant({ type: "space", id: sp.id }, { type: "user", id: ADA })).toBe("owner");
+      });
+      test("a personal space becomes an archived, shared Space owned by the recipient; its boards, grants, invites and links are untouched", async () => {
+        const t = await setup();
+        const mine = await r.ensurePersonalSpace(t.id, SAM);
+        const b = await mkBoard(r, { tenant: t.id, title: "Private", space: mine.id, owner: SAM });
+        await r.setGrant(b.id, "google:guest", "editor");
+        const inv = await r.createInvite({ board: b.id, email: "k@x.io", role: "viewer", by: SAM });
+        const link = await r.createLink({ board: b.id, role: "viewer", by: SAM });
+        expect(await r.reassignOwner({ scope: { type: "space", id: mine.id }, from: SAM, to: ADA, name: "Sam's space (archived)" })).toEqual({ done: true });
+        const sp = await r.space(mine.id);
+        expect(sp).toMatchObject({ kind: "shared", owner: null, name: "Sam's space (archived)", generalRole: null });
+        expect(sp.archivedAt).toBe(T0);
+        expect(await r.personalSpace(t.id, SAM)).toBe(null);
+        expect((await r.board(b.id)).space).toBe(mine.id);
+        expect(await r.grant(b.id, "google:guest")).toBe("editor");
+        expect((await r.invite(inv.id)).revoked).toBe(false);
+        expect((await r.link(link.id)).revoked).toBe(false);
+        expect(await keys(t)).toEqual([]);
+        expect(await r.scopedGrant({ type: "space", id: mine.id }, { type: "user", id: ADA })).toBe("owner");
+      });
+      test("reassignOwner refuses a recipient who is the leaver, not in the directory or removed (bad-recipient), changing nothing", async () => {
+        const t = await setup();
+        const sp = await r.createSpace({ tenant: t.id, name: "S", owner: SAM });
+        const sp2 = await r.createSpace({ tenant: t.id, name: "S2", owner: BOB });
+        for (const to of [SAM, "google:nobody"]) await expect(r.reassignOwner({ scope: { type: "space", id: sp.id }, from: SAM, to })).rejects.toMatchObject({ code: "bad-recipient" });
+        await r.reassignOwner({ scope: { type: "space", id: sp2.id }, from: BOB, to: ADA });
+        await r.removeMember({ tenant: t.id, user: BOB, by: ADA });
+        await expect(r.reassignOwner({ scope: { type: "space", id: sp.id }, from: SAM, to: BOB })).rejects.toMatchObject({ code: "bad-recipient" });
+        expect(await r.scopedGrant({ type: "space", id: sp.id }, { type: "user", id: SAM })).toBe("owner");
+      });
+      test("removeMember refuses while the user solely owns something (still-owns) and changes nothing; an admin is refused (is-admin)", async () => {
+        const t = await setup();
+        const sp = await r.createSpace({ tenant: t.id, name: "S", owner: SAM });
+        await expect(r.removeMember({ tenant: t.id, user: SAM, by: ADA })).rejects.toMatchObject({ code: "still-owns" });
+        expect((await r.memberState(t.id, SAM)).removed).toBe(false);
+        expect(await r.scopedGrant({ type: "space", id: sp.id }, { type: "user", id: SAM })).toBe("owner");
+        await expect(r.removeMember({ tenant: t.id, user: "google:root", by: ADA })).rejects.toMatchObject({ code: "is-admin" });
+        await expect(r.removeMember({ tenant: t.id, user: "google:nobody", by: ADA })).rejects.toThrow();
+      });
+      test("removeMember marks the member and deletes their board grants, scoped grants, Team memberships and access requests, only in this Unit; guests' rows and others' stay", async () => {
+        const t = await setup();
+        const other = await r.createTenant({ domain: "other.com" });
+        const shared = await r.createSpace({ tenant: t.id, name: "Shared", owner: ADA });
+        await r.setScopedGrant({ scope: { type: "space", id: shared.id }, subject: { type: "user", id: SAM }, role: "editor" });
+        const b = await mkBoard(r, { tenant: t.id, title: "B", space: shared.id, owner: SAM });
+        await r.setGrant(b.id, ADA, "owner");
+        const ob = await mkBoard(r, { tenant: other.id, title: "O", owner: "google:x" });
+        await r.setGrant(ob.id, SAM, "viewer");          // Sam as a guest in another Unit
+        const team = await r.createTeam({ tenant: t.id, name: "T" });
+        await r.setTeamMember(team.id, SAM, true); await r.setTeamMember(team.id, ADA, true);
+        await r.requestAccess({ tenant: t.id, scope: { type: "space", id: shared.id }, user: SAM, role: "editor" });
+        const mine = await r.ensurePersonalSpace(t.id, SAM);
+        await r.reassignOwner({ scope: { type: "space", id: mine.id }, from: SAM, to: ADA, name: "x" });
+        clock.t += 1000;
+        const out = await r.removeMember({ tenant: t.id, user: SAM, by: ADA });
+        expect(out).toMatchObject({ removed: true, teams: 1 });
+        expect(out.grants).toBe(1); expect(out.scopedGrants).toBe(1);
+        expect(await r.memberState(t.id, SAM)).toMatchObject({ removed: true, removedAt: T0 + 1000, removedBy: ADA });
+        expect(await r.grant(b.id, SAM)).toBe(null);
+        expect(await r.grant(b.id, ADA)).toBe("owner");
+        expect(await r.grant(ob.id, SAM)).toBe("viewer");
+        expect(await r.scopedGrant({ type: "space", id: shared.id }, { type: "user", id: SAM })).toBe(null);
+        expect(await r.teamMembers(team.id)).toEqual([ADA]);
+        expect(await r.accessRequest({ type: "space", id: shared.id }, SAM)).toBe(null);
+        expect(await r.removeMember({ tenant: t.id, user: SAM, by: ADA })).toMatchObject({ removed: false });
+      });
+      test("a removed member is listed as removed, never found, kept by touchMember, and nothing is created for them", async () => {
+        const t = await setup();
+        await r.reassignOwner({ scope: { type: "space", id: (await r.ensurePersonalSpace(t.id, SAM)).id }, from: SAM, to: ADA, name: "x" });
+        await r.removeMember({ tenant: t.id, user: SAM, by: ADA });
+        expect((await r.membersAmong(t.id, [SAM]))[0]).toMatchObject({ user: SAM, removed: true });
+        expect((await r.findMembers(t.id, { q: "sam" })).map(m => m.user)).toEqual([]);
+        await r.touchMember(t.id, { user: SAM, name: "Sam 2", email: "sam@acme.com" });
+        expect(await r.memberState(t.id, SAM)).toMatchObject({ removed: true, name: "Sam 2" });
+        await expect(r.ensurePersonalSpace(t.id, SAM)).rejects.toMatchObject({ code: "removed" });
+        await expect(r.createSpace({ tenant: t.id, name: "N", owner: SAM })).rejects.toMatchObject({ code: "removed" });
+        await expect(r.createGroup({ tenant: t.id, name: "N", owner: SAM })).rejects.toMatchObject({ code: "removed" });
+        expect((await r.spaces(t.id)).filter(s => s.name === "N")).toEqual([]);
+      });
+      test("accessContext and accessContexts name the removed among the requested users, and only those", async () => {
+        const t = await setup();
+        const sp = await r.createSpace({ tenant: t.id, name: "S" });
+        await r.reassignOwner({ scope: { type: "space", id: (await r.ensurePersonalSpace(t.id, SAM)).id }, from: SAM, to: ADA, name: "x" });
+        await r.removeMember({ tenant: t.id, user: SAM, by: ADA });
+        expect((await r.accessContext({ type: "space", id: sp.id }, { users: [SAM, ADA] })).removed).toEqual([SAM]);
+        expect((await r.accessContext({ type: "space", id: sp.id }, { users: [ADA] })).removed).toEqual([]);
+        expect((await r.accessContext({ type: "space", id: sp.id })).removed).toEqual([]);
+        expect((await r.accessContexts([{ type: "space", id: sp.id }, { type: "unit", id: t.id }], { users: [SAM] })).get("unit\n" + t.id).removed).toEqual([SAM]);
+      });
+      test("keyed: reassignOwner and removeMember write their key with the change; a repeat replays the ref, another fingerprint is a mismatch, a refusal leaves no key", async () => {
+        const t = await setup();
+        const sp = await r.createSpace({ tenant: t.id, name: "S", owner: SAM });
+        const k1 = { user: ADA, key: "leave-key-0001", fp: "a".repeat(64) }, k2 = { user: ADA, key: "leave-key-0002", fp: "b".repeat(64) };
+        await expect(r.removeMember({ tenant: t.id, user: SAM, by: ADA, idem: k2 })).rejects.toMatchObject({ code: "still-owns" });
+        expect(await r.idemGet(k2)).toEqual({ state: "none" });
+        await r.reassignOwner({ scope: { type: "space", id: sp.id }, from: SAM, to: ADA, idem: k1 });
+        expect(await r.idemGet(k1)).toEqual({ state: "done", ref: `${sp.id}:reassigned` });
+        await expect(r.reassignOwner({ scope: { type: "space", id: sp.id }, from: SAM, to: ADA, idem: k1 })).rejects.toMatchObject({ code: "idem-replay", ref: `${sp.id}:reassigned` });
+        await expect(r.reassignOwner({ scope: { type: "space", id: sp.id }, from: SAM, to: BOB, idem: { ...k1, fp: "c".repeat(64) } })).rejects.toMatchObject({ code: "idem-mismatch" });
+        await mkPersonalDone(t);
+        await r.removeMember({ tenant: t.id, user: SAM, by: ADA, idem: k2 });
+        expect(await r.idemGet(k2)).toEqual({ state: "done", ref: `${SAM}:removed` });
+      });
+      const mkPersonalDone = async t => { const p = await r.personalSpace(t.id, SAM); if (p) await r.reassignOwner({ scope: { type: "space", id: p.id }, from: SAM, to: ADA, name: "x" }); };
+      test("concurrent reassigns of one item: exactly one wins (done true), the other is a no-op; the container always has an owner", async () => {
+        const t = await setup();
+        const sp = await r.createSpace({ tenant: t.id, name: "S", owner: SAM });
+        const rs = await Promise.all([ADA, BOB].map(to => r.reassignOwner({ scope: { type: "space", id: sp.id }, from: SAM, to })));
+        expect(rs.filter(x => x.done).length).toBe(1);
+        const owners = (await r.scopedGrants({ type: "space", id: sp.id })).filter(g => g.role === "owner").map(g => g.subject.id);
+        expect(owners.length).toBe(1);
+        expect(owners[0]).not.toBe(SAM);
+      });
+      test("removal racing a create for the leaver: either the create is refused as removed or the removal as still-owns, never an ownerless Space", async () => {
+        const t = await setup();
+        await mkPersonalDone(t);
+        const results = await Promise.allSettled([r.removeMember({ tenant: t.id, user: SAM, by: ADA }), r.createSpace({ tenant: t.id, name: "Late", owner: SAM })]);
+        const removed = (await r.memberState(t.id, SAM)).removed, late = (await r.spaces(t.id)).find(s => s.name === "Late");
+        if (removed) expect(late).toBeUndefined(); else expect(results[0].reason?.code).toBe("still-owns");
+        if (late) expect(removed).toBe(false);
       });
     });
   });

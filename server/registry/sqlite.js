@@ -100,7 +100,7 @@ const createSchema = d => {
     d.run(`CREATE TABLE IF NOT EXISTS reg_spaces (
       id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), grp TEXT REFERENCES reg_groups(id), name TEXT NOT NULL,
       kind TEXT NOT NULL, owner_user TEXT, general_role TEXT, created_at INTEGER NOT NULL,
-      trashed_at INTEGER, trashed_by TEXT, purging INTEGER NOT NULL DEFAULT 0, UNIQUE (tenant, owner_user))`);
+      trashed_at INTEGER, trashed_by TEXT, purging INTEGER NOT NULL DEFAULT 0, archived_at INTEGER, UNIQUE (tenant, owner_user))`);
     d.run(`CREATE TABLE IF NOT EXISTS reg_board_spaces (
       board TEXT PRIMARY KEY REFERENCES reg_boards(id), space TEXT NOT NULL REFERENCES reg_spaces(id))`);
     d.run(`CREATE TABLE IF NOT EXISTS reg_teams (
@@ -108,7 +108,7 @@ const createSchema = d => {
     d.run(`CREATE TABLE IF NOT EXISTS reg_team_members (
       team TEXT NOT NULL REFERENCES reg_teams(id), member TEXT NOT NULL, PRIMARY KEY (team, member))`);
     d.run(`CREATE TABLE IF NOT EXISTS reg_members (
-      tenant TEXT NOT NULL REFERENCES reg_tenants(id), member TEXT NOT NULL, name TEXT, email TEXT, PRIMARY KEY (tenant, member))`);
+      tenant TEXT NOT NULL REFERENCES reg_tenants(id), member TEXT NOT NULL, name TEXT, email TEXT, removed_at INTEGER, removed_by TEXT, PRIMARY KEY (tenant, member))`);
     d.run(`CREATE TABLE IF NOT EXISTS reg_scope_grants (
       scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject TEXT NOT NULL, role TEXT NOT NULL, n INTEGER NOT NULL,
       PRIMARY KEY (scope_type, scope_id, subject_type, subject))`);
@@ -244,10 +244,11 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     delTeamMembers: db.query("DELETE FROM reg_team_members WHERE team = ?"),
     delTeam: db.query("DELETE FROM reg_teams WHERE id = ?"),
     renTeam: db.query("UPDATE reg_teams SET name = ? WHERE id = ?"),
-    dirGet: db.query("SELECT member AS user, name, email FROM reg_members WHERE tenant = ? AND member = ?"),
+    dirGet: db.query("SELECT member AS user, name, email, removed_at, removed_by FROM reg_members WHERE tenant = ? AND member = ?"),
     dirPut: db.query("INSERT INTO reg_members (tenant, member, name, email) VALUES (?, ?, ?, ?) ON CONFLICT (tenant, member) DO UPDATE SET name = excluded.name, email = excluded.email"),
-    dirAmong: db.query("SELECT member AS user, name, email FROM reg_members WHERE tenant = ? AND member IN (SELECT value FROM json_each(?))"),
-    dirFind: db.query(`SELECT member AS user, name, email FROM reg_members WHERE tenant = ?1 AND (?2 IS NULL OR name LIKE ?2 ESCAPE '\\' OR email LIKE ?2 ESCAPE '\\' OR member LIKE ?2 ESCAPE '\\')
+    dirAmong: db.query("SELECT member AS user, name, email, removed_at IS NOT NULL AS removed FROM reg_members WHERE tenant = ? AND member IN (SELECT value FROM json_each(?))"),
+    removedAmong: db.query("SELECT member FROM reg_members WHERE tenant = ? AND removed_at IS NOT NULL AND member IN (SELECT value FROM json_each(?)) ORDER BY member"),
+    dirFind: db.query(`SELECT member AS user, name, email FROM reg_members WHERE tenant = ?1 AND removed_at IS NULL AND (?2 IS NULL OR name LIKE ?2 ESCAPE '\\' OR email LIKE ?2 ESCAPE '\\' OR member LIKE ?2 ESCAPE '\\')
       ORDER BY coalesce(name, member), member LIMIT ?3`),
     sowners: db.query(`SELECT subject_type, subject FROM reg_scope_grants g WHERE scope_type = ? AND scope_id = ? AND role = 'owner'
       AND (subject_type = 'user' OR EXISTS (SELECT 1 FROM reg_team_members m WHERE m.team = g.subject))`),
@@ -260,6 +261,30 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     boardsInGroup: db.query("SELECT bs.board AS id FROM reg_board_spaces bs JOIN reg_spaces s ON s.id = bs.space JOIN reg_boards b ON b.id = bs.board WHERE s.grp = ?1 AND (?4 = 1 OR b.trashed_at IS NULL) AND (?2 IS NULL OR bs.board > ?2) ORDER BY bs.board LIMIT ?3"),
     scopesOf: db.query(`SELECT scope_type, scope_id, role FROM reg_scope_grants WHERE subject_type = ?1 AND subject = ?2
       AND (?3 IS NULL OR (scope_type || char(10) || scope_id) > ?3) ORDER BY scope_type, scope_id LIMIT ?4`),
+    // Leaver offboarding (PROTOCOL.md § Leaver offboarding). ?1 tenant, ?2 user, ?3 cursor "<type>\n<id>", ?4 limit. A candidate is a Group or Space the user owns (their own grant, or a Team's they are in) or their personal space;
+    // it is solely theirs when no other person owner and no Team owner with a member besides them remains.
+    ownedAlone: db.query(`WITH c(t, i) AS (
+        SELECT scope_type, scope_id FROM reg_scope_grants WHERE subject_type = 'user' AND subject = ?2 AND role = 'owner' AND scope_type IN ('group', 'space')
+        UNION SELECT g.scope_type, g.scope_id FROM reg_team_members m JOIN reg_scope_grants g ON g.subject_type = 'team' AND g.subject = m.team AND g.role = 'owner' AND g.scope_type IN ('group', 'space') WHERE m.member = ?2
+        UNION SELECT 'space', id FROM reg_spaces WHERE tenant = ?1 AND owner_user = ?2)
+      SELECT c.t AS type, c.i AS id, (c.t = 'space' AND EXISTS (SELECT 1 FROM reg_spaces p WHERE p.id = c.i AND p.owner_user = ?2)) AS personal FROM c
+      WHERE (CASE c.t WHEN 'space' THEN (SELECT tenant FROM reg_spaces WHERE id = c.i) ELSE (SELECT tenant FROM reg_groups WHERE id = c.i) END) = ?1
+        AND (?3 IS NULL OR (c.t || char(10) || c.i) > ?3)
+        AND ((c.t = 'space' AND EXISTS (SELECT 1 FROM reg_spaces p WHERE p.id = c.i AND p.owner_user = ?2)) OR NOT EXISTS (SELECT 1 FROM reg_scope_grants o WHERE o.scope_type = c.t AND o.scope_id = c.i AND o.role = 'owner'
+        AND ((o.subject_type = 'user' AND o.subject <> ?2) OR (o.subject_type = 'team' AND EXISTS (SELECT 1 FROM reg_team_members x WHERE x.team = o.subject AND x.member <> ?2)))))
+      ORDER BY c.t, c.i LIMIT ?4`),
+    soleOne: db.query(`WITH c(t, i) AS (SELECT ?1, ?2) SELECT 1 AS x FROM c WHERE EXISTS (SELECT 1 FROM reg_scope_grants g WHERE g.scope_type = c.t AND g.scope_id = c.i AND g.role = 'owner'
+        AND ((g.subject_type = 'user' AND g.subject = ?3) OR (g.subject_type = 'team' AND EXISTS (SELECT 1 FROM reg_team_members m WHERE m.team = g.subject AND m.member = ?3))))
+      AND NOT EXISTS (SELECT 1 FROM reg_scope_grants o WHERE o.scope_type = c.t AND o.scope_id = c.i AND o.role = 'owner'
+        AND ((o.subject_type = 'user' AND o.subject <> ?3) OR (o.subject_type = 'team' AND EXISTS (SELECT 1 FROM reg_team_members x WHERE x.team = o.subject AND x.member <> ?3))))`),
+    archiveSpace: db.query("UPDATE reg_spaces SET kind = 'shared', owner_user = NULL, archived_at = ?2, name = ?3 WHERE id = ?1"),
+    isAdmin: db.query("SELECT 1 AS x FROM reg_tenant_admins WHERE tenant = ? AND member = ?"),
+    markRemoved: db.query("UPDATE reg_members SET removed_at = ?3, removed_by = ?4 WHERE tenant = ?1 AND member = ?2 AND removed_at IS NULL"),
+    delUserGrants: db.query("DELETE FROM reg_grants WHERE member = ?1 AND board IN (SELECT id FROM reg_boards WHERE tenant = ?2)"),
+    delUserScoped: db.query(`DELETE FROM reg_scope_grants WHERE subject_type = 'user' AND subject = ?1 AND ((scope_type = 'unit' AND scope_id = ?2)
+      OR (scope_type = 'group' AND scope_id IN (SELECT id FROM reg_groups WHERE tenant = ?2)) OR (scope_type = 'space' AND scope_id IN (SELECT id FROM reg_spaces WHERE tenant = ?2)))`),
+    delUserTeams: db.query("DELETE FROM reg_team_members WHERE member = ?1 AND team IN (SELECT id FROM reg_teams WHERE tenant = ?2)"),
+    delUserAsks: db.query("DELETE FROM reg_access_requests WHERE tenant = ?1 AND member = ?2"),
     sgrantN: db.query("SELECT coalesce(max(n), 0) + 1 AS n FROM reg_scope_grants WHERE scope_type = ? AND scope_id = ?"),
     upSgrant: db.query(`INSERT INTO reg_scope_grants (scope_type, scope_id, subject_type, subject, role, n) VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT (scope_type, scope_id, subject_type, subject) DO UPDATE SET role = excluded.role`),
@@ -404,7 +429,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     admins: q.admins.all(r.id).map(a => a.member), createdAt: r.created_at };
   const rowBoard = r => r && { id: r.id, tenant: r.tenant, title: r.title, memberRole: r.member_role, space: r.space, createdAt: r.created_at, trashedAt: r.trashed_at, trashedBy: r.trashed_by, trashedWith: r.trashed_with };
   const rowGroup = r => r && { id: r.id, tenant: r.tenant, name: r.name, generalRole: r.general_role, createdAt: r.created_at };
-  const rowSpace = r => r && { id: r.id, tenant: r.tenant, group: r.grp, name: r.name, kind: r.kind, owner: r.owner_user, generalRole: r.general_role, createdAt: r.created_at, trashedAt: r.trashed_at, trashedBy: r.trashed_by };
+  const rowSpace = r => r && { id: r.id, tenant: r.tenant, group: r.grp, name: r.name, kind: r.kind, owner: r.owner_user, generalRole: r.general_role, createdAt: r.created_at, trashedAt: r.trashed_at, trashedBy: r.trashed_by, archivedAt: r.archived_at ?? null };
   const rowTeam = r => r && { id: r.id, tenant: r.tenant, name: r.name, createdAt: r.created_at };
   const rowRole = r => r && { id: r.id, tenant: r.tenant, name: r.name, base: r.base, boardRole: r.board_role, permissions: JSON.parse(r.permissions), createdAt: r.created_at };
   const rowSg = r => ({ subject: { type: r.subject_type, id: r.subject }, role: r.role });
@@ -620,8 +645,10 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   };
   const scopeTenant = (type, id) => (type === "unit" ? q.tenantExists.get(id) && id : type === "group" ? q.group.get(id)?.tenant
     : type === "space" ? q.space.get(id)?.tenant : q.board.get(id)?.tenant);
+  const noRemoved = (tenant, user) => { if (user != null && q.dirGet.get(tenant, String(user))?.removed_at != null) throw new RegistryError("removed", "registry: the member was removed from the Unit"); };
   const createGroupTx = db.transaction((tenant, name, generalRole, owner, idem, createdAt) => {
     needRow(q.tenantExists.get(tenant), "tenant");
+    noRemoved(tenant, owner);
     idemEnter(idem, createdAt);
     const id = fresh(mint.group, i => !!q.group.get(i));
     q.insGroup.run(id, tenant, name, generalRole, createdAt);
@@ -632,6 +659,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   const createSpaceTx = db.transaction((tenant, name, group, generalRole, owner, idem, createdAt) => {
     needRow(q.tenantExists.get(tenant), "tenant");
     if (group != null) needRow(q.group.get(group)?.tenant === tenant, "group");
+    noRemoved(tenant, owner);
     idemEnter(idem, createdAt);
     const id = fresh(mint.space, i => !!q.space.get(i));
     q.insSpace.run(id, tenant, group, name, "shared", null, generalRole, createdAt);
@@ -643,6 +671,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     needRow(q.tenantExists.get(tenant), "tenant");
     const have = q.personal.get(tenant, user);
     if (have) return rowSpace(have);
+    noRemoved(tenant, user);
     const id = fresh(mint.space, i => !!q.space.get(i));
     q.insSpace.run(id, tenant, null, orgDefaults.personalName(user), "personal", user, null, createdAt);
     putSg("space", id, "user", user, "owner");
@@ -690,6 +719,37 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     }
     putSg(type, id, st, sid, role);
   });
+  // ---- Leaver offboarding: both are one IMMEDIATE transaction (the write lock from the first read), the key row inside it. ----
+  const reassignTx = db.transaction((sc, from, to, name, idem, at) => {
+    const row = sc.type === "space" ? q.space.get(sc.id) : q.group.get(sc.id);
+    needRow(row, sc.type);
+    const dir = q.dirGet.get(row.tenant, to);
+    if (from === to || !dir || dir.removed_at != null) throw new RegistryError("bad-recipient", "registry: the recipient is not a live member of the Unit");
+    idemEnter(idem, at);
+    const personal = sc.type === "space" && row.kind === "personal" && row.owner_user === from;
+    const done = personal || !!q.soleOne.get(sc.type, sc.id, from);
+    if (done) {
+      putSg(sc.type, sc.id, "user", to, "owner");
+      putSg(sc.type, sc.id, "user", from, null);
+      if (personal) q.archiveSpace.run(sc.id, at, name ?? row.name);
+    }
+    idemPut(idem, sc.id + (done ? ":reassigned" : ":noop"), at);
+    return { done };
+  });
+  const removeTx = db.transaction((tenant, user, by, idem, at) => {
+    needRow(q.tenantExists.get(tenant), "tenant");
+    const cur = q.dirGet.get(tenant, user);
+    needRow(cur, "member");
+    idemEnter(idem, at);
+    if (cur.removed_at != null) { idemPut(idem, user + ":noop", at); return { removed: false, grants: 0, scopedGrants: 0, teams: 0 }; }
+    if (q.isAdmin.get(tenant, user)) throw new RegistryError("is-admin", "registry: a Unit admin cannot be removed");
+    if (q.ownedAlone.all(tenant, user, null, 1).length) throw new RegistryError("still-owns", "registry: the member still solely owns something");
+    const out = { removed: true, grants: q.delUserGrants.run(user, tenant).changes, scopedGrants: q.delUserScoped.run(user, tenant).changes, teams: q.delUserTeams.run(user, tenant).changes };
+    q.delUserAsks.run(tenant, user);
+    q.markRemoved.run(tenant, user, at, by);
+    idemPut(idem, user + ":removed", at);
+    return out;
+  });
   const createRoleTx = db.transaction((tenant, name, base, boardRole, perms, createdAt, max, idem) => {
     needRow(q.tenantExists.get(tenant), "tenant");
     idemEnter(idem, createdAt);
@@ -734,8 +794,9 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     const teams = Object.fromEntries(teamIds.map(t => [t, []]));
     for (const m of q.membersOf.all(JSON.stringify(teamIds), users ? JSON.stringify(users) : null)) teams[m.team].push(m.member);
     const roles = q.roles.all(tenant?.id ?? "").map(rowRole);
+    const removed = q.removedAmong.all(tenant?.id ?? "", users ? JSON.stringify(users) : "[]").map(r => r.member);   // the same statement whatever exists
     if (!tenant || (type !== "unit" && !owner)) return null;
-    return { tenant, board, space, group, scoped, roles, teams };
+    return { tenant, board, space, group, scoped, roles, teams, removed };
   });
 
   /** `accessContexts`: every scope's context from ONE transaction (one snapshot). */
@@ -998,7 +1059,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     async membersAmong(tenant, users) {
       ready();
       const us = [...new Set((users ?? []).filter(str))].slice(0, TEAMS.among);
-      return str(tenant) && us.length ? q.dirAmong.all(tenant, JSON.stringify(us)) : [];
+      return str(tenant) && us.length ? q.dirAmong.all(tenant, JSON.stringify(us)).map(r => ({ ...r, removed: !!r.removed })) : [];
     },
     async findMembers(tenant, { q: term = null, limit } = {}) {
       ready();
@@ -1170,6 +1231,30 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       const q1 = type === "unit" ? q.boardsInUnit : type === "group" ? q.boardsInGroup : type === "space" ? q.boardsInSpace : null;
       const ids = q1 ? q1.all(id, cur, n + 1, withTrashed ? 1 : 0).map(r => r.id) : [];
       return { ids: ids.slice(0, n), next: ids.length > n ? ids[n - 1] : null };
+    },
+    async memberState(tenant, user) {
+      ready();
+      const r = str(tenant) && str(user) ? q.dirGet.get(tenant, user) : null;
+      return r ? { user: r.user, name: r.name, email: r.email, removed: r.removed_at != null, removedAt: r.removed_at ?? null, removedBy: r.removed_by ?? null } : null;
+    },
+    async ownedAlone(tenant, user, { after = null, limit } = {}) {
+      ready();
+      const cur = orgDefaults.cursor(after, "scope"), n = smallLimit(limit, TEAMS.page.default, TEAMS.page.max);
+      if (!str(tenant) || !str(user)) return { items: [], next: null };
+      const rows = q.ownedAlone.all(tenant, user, cur, n + 1).map(r => ({ type: r.type, id: r.id, personal: !!r.personal })), page = rows.slice(0, n);
+      return { items: page, next: rows.length > n ? page[n - 1].type + "\n" + page[n - 1].id : null };
+    },
+    async reassignOwner({ scope, from, to, name, idem }) {
+      ready();
+      const sc = orgDefaults.renamable(scope, ["space", "group"]);
+      if (!str(from) || !str(to)) throw new Error("registry: no such member");
+      return reassignTx.immediate(sc, from, to, name == null ? null : orgDefaults.name(name), idemOf(idem), now());
+    },
+    async removeMember({ tenant, user, by, idem }) {
+      ready();
+      if (!str(tenant)) throw new Error("registry: no such tenant");
+      if (!str(user) || !str(by)) throw new Error("registry: no such member");
+      return removeTx.immediate(tenant, user, by, idemOf(idem), now());
     },
     async scopesOf(subject, { after = null, limit } = {}) {
       ready();

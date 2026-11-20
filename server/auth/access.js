@@ -97,6 +97,7 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
           catch (err) { if (i + 1 >= LIMITS.retries) throw err; await sleep(50 * (i + 1)); }
         }
         for (const sc of p.scopes) announce(unit, { type: sc.type, id: sc.id }, { revoke });
+        if (p.next != null && p.next === after) { warn("team announcement stopped: the cursor did not advance; the timed re-check covers the rest", { team }); break; }   // a Registry whose cursor stands still must not spin
         after = p.next;
         if (after != null && !revoke && ++pages >= LIMITS.addPages) { warn("team announcement stopped at its bound; the timed re-check covers the rest", { team }); break; }
       } while (after != null);
@@ -122,22 +123,22 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
    * would be a back door to roles the caller cannot give. A Unit admin passes. Bounded: at most LIMITS.teamScopes scopes are read and checked; a Team that
    * holds more, or any scope the caller falls short on, is the ordinary refusal for a non-admin.
    * ADDING a member is the one change that widens access: a Unit admin's pass does not reach a personal space or a board in one (they are its owner's, PROTOCOL.md § Organization), so for those scopes the admin needs
-   * `members.manage` from the resolver like anyone (a manage-only admin has none there). Removing never widens, and offboarding relies on it: an admin always may. A Team too large to check is refused for adding.
+   * `members.manage` from the resolver like anyone (a manage-only admin has none there). Removing never widens, and offboarding relies on it: an admin always may. Only the Team's grants on personal scopes are read for that (`personalScopesOf`, at most LIMITS.teamScopes; a Team holding more of those is refused for adding).
    */
   async function mayChangeTeam(identity, unit, team, { adding = false } = {}) {
     const admin = isUnitAdmin(unit, identity);
     if (admin && !adding) return true;
-    const p = await registry.scopesOf({ type: "team", id: team }, { limit: LIMITS.teamScopes + 1 });
     if (admin) {
-      if (p.scopes.length > LIMITS.teamScopes) return false;
-      for (const sc of p.scopes) {
-        const space = sc.type === "space" ? await registry.space(sc.id) : sc.type === "board" ? await registry.space((await registry.board(sc.id))?.space) : null;
-        if (space?.kind !== "personal") continue;
+      // Only the Team's grants on a personal space or a board in one matter here (one bounded query, usually none); a Team of any size is otherwise the admin's to change. Over that query's own cap: refused.
+      const pp = await registry.personalScopesOf({ type: "team", id: team }, { limit: LIMITS.teamScopes });
+      if (pp.more) return false;
+      for (const sc of pp.scopes) {
         const access = await tenancy.effective(identity, sc.type === "board" ? sc.id : { type: sc.type, id: sc.id }, { uniform: true });
         if (!may(access, "members.manage")) return false;
       }
       return true;
     }
+    const p = await registry.scopesOf({ type: "team", id: team }, { limit: LIMITS.teamScopes + 1 });
     if (p.scopes.length > LIMITS.teamScopes) return false;
     if (!p.scopes.length) return true;
     const roles = new Map((await registry.roles(unit.id)).map(r => [r.id, r]));

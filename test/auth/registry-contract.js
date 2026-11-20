@@ -819,6 +819,22 @@ export function registryContract(name, makeRegistry, opts = {}) {
         await expect(r.accessContexts("x")).rejects.toThrow("bad scopes");
       });
 
+      test("personalScopesOf: only a subject's grants on a personal space or a board in one, bounded, `more` past the cap", async () => {
+        const t = await unit();
+        const sp = await r.createSpace({ tenant: t.id, name: "Shared" }), mine = await r.ensurePersonalSpace(t.id, "google:ann");
+        const tm = await r.createTeam({ tenant: t.id, name: "Infra" }), subject = { type: "team", id: tm.id };
+        const pb = await r.createBoard({ tenant: t.id, space: mine.id }), sb = await r.createBoard({ tenant: t.id, space: sp.id });
+        for (const [type, id, role] of [["unit", t.id, "member"], ["space", sp.id, "viewer"], ["board", sb.id, "editor"], ["space", mine.id, "viewer"], ["board", pb.id, "editor"]])
+          await r.setScopedGrant({ scope: { type, id }, subject, role });
+        const got = await r.personalScopesOf(subject);
+        expect(got.more).toBe(false);
+        expect(got.scopes.map(s => `${s.type}:${s.id}:${s.role}`).sort()).toEqual([`board:${pb.id}:editor`, `space:${mine.id}:viewer`].sort());
+        const one = await r.personalScopesOf(subject, { limit: 1 });
+        expect([one.scopes.length, one.more]).toEqual([1, true]);
+        expect(await r.personalScopesOf({ type: "team", id: (await r.createTeam({ tenant: t.id, name: "Empty" })).id })).toEqual({ scopes: [], more: false });
+        expect(await r.personalScopesOf({ type: "user", id: "google:nobody" })).toEqual({ scopes: [], more: false });
+        await expect(r.personalScopesOf({ type: "robot", id: "x" })).rejects.toThrow();
+      });
       test("scopesOf pages the scopes a user or Team holds a grant on (to announce a Team membership change)", async () => {
         const t = await unit();
         const g = await r.createGroup({ tenant: t.id, name: "P" }), sp = await r.createSpace({ tenant: t.id, name: "A" });

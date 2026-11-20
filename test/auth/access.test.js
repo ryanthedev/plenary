@@ -180,7 +180,45 @@ describe("a Team's grants are the caller's to give: adding or removing a member 
     const many = new Proxy(r, { get: (t, k) => (k === "scopesOf" ? async (_s, o) => { seen = o.limit; return { scopes: Array.from({ length: o.limit }, (_, i) => ({ type: "board", id: `b${i}`, role: "viewer" })), next: "x" }; } : t[k]) });
     expect(await code(mk(many).setMember(max, infra.id, lee.user, true))).toBe("forbidden");
     expect(seen).toBe(LIMITS.teamScopes + 1);
-    expect(await code(mk(many).setMember(root, infra.id, lee.user, true))).toBe("forbidden");   // adding is checked for personal-space grants; a Team too large to check is refused (fails closed)
+  });
+  // A registry fake whose scopesOf honours the cursor: ids "b000".., filtered by `x.id > o.after`, sliced by o.limit, next = the last id when more remain.
+  const pagedFake = (N, over = {}) => { const all = Array.from({ length: N }, (_, i) => ({ type: "board", id: "b" + String(i).padStart(4, "0"), role: "viewer" }));
+    return new Proxy(r, { get: (t, k) => (k === "scopesOf" ? async (_s, o = {}) => { const rest = all.filter(x => !o.after || x.id > o.after.slice(o.after.indexOf("\n") + 1)), page = rest.slice(0, o.limit); return { scopes: page, next: rest.length > page.length ? "board\n" + page.at(-1).id : null }; } : k in over ? over[k] : t[k]) }); };
+  test("an admin changes a Team of any size (no cap lockout): removing announces every scope, adding writes (only the Team's personal-scope grants are read, and there are none)", async () => {
+    const N = LIMITS.teamScopes * 3, fake = pagedFake(N);
+    await r.setTeamMember(infra.id, lee.user, true);
+    const s = mk(fake);
+    expect(await code(s.setMember(root, infra.id, lee.user, false))).toBe(null);
+    await s.settled();
+    expect(ann).toHaveLength(N); expect(ann.every(a => a.revoke)).toBe(true);
+    expect(await r.teamMembers(infra.id)).not.toContain(lee.user);
+    expect(await code(s.setMember(root, infra.id, lee.user, true))).toBe(null);
+    await s.settled();
+    expect(await r.teamMembers(infra.id)).toContain(lee.user);
+  });
+  test("a Team holding more personal-scope grants than the cap is refused to an admin for adding (fails closed), and removing stays open", async () => {
+    const fake = pagedFake(5, { personalScopesOf: async () => ({ scopes: [], more: true }) });
+    expect(await code(mk(fake).setMember(root, infra.id, lee.user, true))).toBe("forbidden");
+    expect(await r.teamMembers(infra.id)).not.toContain(lee.user);
+    await r.setTeamMember(infra.id, lee.user, true);
+    expect(await code(mk(fake).setMember(root, infra.id, lee.user, false))).toBe(null);
+  });
+  test("an announcement failure after an admin's ADD does not undo the write: the check passes, the later walk fails, the failure is logged", async () => {
+    const logs = [], fake = new Proxy(r, { get: (t, k) => (k === "scopesOf" ? async () => { throw new Error("db down"); } : t[k]) });
+    const s = mk(fake, { log: { warn: m => logs.push(m) } });
+    expect(await code(s.setMember(root, infra.id, max.user, true))).toBe(null);
+    await s.settled();
+    expect(logs.some(m => /team announcement failed/.test(m))).toBe(true);
+    expect(await r.teamMembers(infra.id)).toContain(max.user);
+  });
+  test("a cursor that does not advance ends the walk (logged), it never spins", async () => {
+    const logs = [], stuck = new Proxy(r, { get: (t, k) => (k === "scopesOf" ? async () => ({ scopes: [{ type: "board", id: "b1", role: "viewer" }], next: "board\nb1" }) : t[k]) });
+    const s = mk(stuck, { log: { warn: m => logs.push(m) } });
+    await r.setTeamMember(infra.id, lee.user, true);
+    await s.setMember(root, infra.id, lee.user, false);
+    await s.settled();
+    expect(logs.some(m => /cursor did not advance/.test(m))).toBe(true);
+    expect(ann.length).toBeLessThanOrEqual(2);
   });
   test("granting a Team a role fails exactly as it would for a person", async () => {
     const { mine } = await setup();

@@ -1433,6 +1433,16 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         return { removed: true, grants, scopedGrants, teams, invites, handedOver: !!to };
       });
     },
+    async personalScopesOf(subject, { limit = 50 } = {}) {
+      ready();
+      const sub = orgDefaults.subject(subject), n = Math.min(Math.max(Number.isSafeInteger(limit) ? limit : 50, 1), 50);
+      if (!key(sub.id)) return { scopes: [], more: false };
+      const rows = (await db.unsafe(`SELECT g.scope_type, g.scope_id, g.role FROM ${SG} g WHERE g.subject_type = $1 AND g.subject = $2 AND (
+        (g.scope_type = 'space' AND EXISTS (SELECT 1 FROM ${SP} s WHERE s.id = g.scope_id AND s.kind = 'personal'))
+        OR (g.scope_type = 'board' AND EXISTS (SELECT 1 FROM ${BS} bs JOIN ${SP} s ON s.id = bs.space WHERE bs.board = g.scope_id AND s.kind = 'personal'))) ORDER BY g.scope_type, g.scope_id LIMIT $3`,
+        [sub.type, sub.id, n + 1])).map(r => ({ type: r.scope_type, id: r.scope_id, role: r.role }));
+      return { scopes: rows.slice(0, n), more: rows.length > n };
+    },
     async scopesOf(subject, { after = null, limit } = {}) {
       ready();
       const sub = orgDefaults.subject(subject), n = pageLimit(limit), cur = orgDefaults.cursor(after, "scope");

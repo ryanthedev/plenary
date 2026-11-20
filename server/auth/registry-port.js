@@ -74,7 +74,7 @@ export const REGISTRY_METHODS = Object.freeze([
   "findMembers", "team", "teams", "setTeamMember", "teamMembers", "setScopedGrant",
   "rename", "updateScope", "spacesIn", "scopedGrants", "createRole", "deleteRole",
   "roleUsage", "memberCount", "updateRole", "role", "roles", "accessContexts",
-  "accessContext", "boardsIn", "scopesOf", "board", "moveBoard", "trashBoard", "restoreBoard", "trashSpace", "restoreSpace", "trashedBoards", "trashedSpaces", "trashDue", "purgeClaim", "purgeBoard", "purgeSpace", "setGrant", "grant",
+  "accessContext", "boardsIn", "scopesOf", "personalScopesOf", "board", "moveBoard", "trashBoard", "restoreBoard", "trashSpace", "restoreSpace", "trashedBoards", "trashedSpaces", "trashDue", "purgeClaim", "purgeBoard", "purgeSpace", "setGrant", "grant",
   "grants", "createInvite", "invite", "invites", "invitesFor", "revokeInvite",
   "createLink", "link", "links", "revokeLink", "addLinkUse", "linkUses",
   "idemGet", "markOpened", "recents", "setStarred", "starred", "starredAmong",
@@ -185,6 +185,7 @@ export const mint = {
  *   accessContext(scope: ScopeRef, o?: { users?: string[], chain?: Chain }): Promise<AccessContext|null>,   // null for an unknown scope; see "accessContext" below
  *   boardsIn(scope: ScopeRef, o?: { after?: string|null, limit?: number, withTrashed?: boolean }): Promise<{ ids: string[], next: string|null }>,   // board ids in a Unit, Group or Space, by id, one bounded page; boards in Trash are left out unless `withTrashed` (an announcement reaches them too)
  *   scopesOf(subject: Subject, o?: { after?: string|null, limit?: number }): Promise<{ scopes: (ScopeRef & { role: string })[], next: string|null }>,   // the scopes a user or Team holds a grant on (not boards: a board's own user grants are `grants`)
+ *   personalScopesOf(subject: Subject, o?: { limit?: number }): Promise<{ scopes: (ScopeRef & { role: string })[], more: boolean }>,   // the subset of scopesOf that is a personal space or a board in one (one join, at most `limit` (default and cap 50), `more` = there are further ones): what an admin's Team change must check against the resolver
  *   board(id: string): Promise<Board|null>,
  *   setGrant(board: string, user: string, role: Role|null): Promise<void>,   // rejects code "last-owner" (atomic)
  *   grant(board: string, user: string): Promise<Role|null>,

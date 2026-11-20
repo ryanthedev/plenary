@@ -235,6 +235,10 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     boardsInUnit: db.query("SELECT id FROM reg_boards WHERE tenant = ?1 AND (?4 = 1 OR trashed_at IS NULL) AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?3"),
     boardsInSpace: db.query("SELECT bs.board AS id FROM reg_board_spaces bs JOIN reg_boards b ON b.id = bs.board WHERE bs.space = ?1 AND (?4 = 1 OR b.trashed_at IS NULL) AND (?2 IS NULL OR bs.board > ?2) ORDER BY bs.board LIMIT ?3"),
     boardsInGroup: db.query("SELECT bs.board AS id FROM reg_board_spaces bs JOIN reg_spaces s ON s.id = bs.space JOIN reg_boards b ON b.id = bs.board WHERE s.grp = ?1 AND (?4 = 1 OR b.trashed_at IS NULL) AND (?2 IS NULL OR bs.board > ?2) ORDER BY bs.board LIMIT ?3"),
+    // ?1 type, ?2 id, ?3 limit: the team's/user's grants on a personal space or a board in one.
+    personalScopesOf: db.query(`SELECT g.scope_type, g.scope_id, g.role FROM reg_scope_grants g WHERE g.subject_type = ?1 AND g.subject = ?2 AND (
+      (g.scope_type = 'space' AND EXISTS (SELECT 1 FROM reg_spaces s WHERE s.id = g.scope_id AND s.kind = 'personal'))
+      OR (g.scope_type = 'board' AND EXISTS (SELECT 1 FROM reg_board_spaces bs JOIN reg_spaces s ON s.id = bs.space WHERE bs.board = g.scope_id AND s.kind = 'personal'))) ORDER BY g.scope_type, g.scope_id LIMIT ?3`),
     scopesOf: db.query(`SELECT scope_type, scope_id, role FROM reg_scope_grants WHERE subject_type = ?1 AND subject = ?2
       AND (?3 IS NULL OR (scope_type || char(10) || scope_id) > ?3) ORDER BY scope_type, scope_id LIMIT ?4`),
     // Leaver offboarding (PROTOCOL.md § Leaver offboarding). ?1 tenant, ?2 user, ?3 cursor "<type>\n<id>", ?4 limit. A candidate is a Group or Space the user owns (their own grant, or a Team's they are in) or their personal space;
@@ -1244,6 +1248,12 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       if (!str(tenant)) throw new Error("registry: no such tenant");
       if (!str(user) || !str(by)) throw new Error("registry: no such member");
       return removeTx.immediate(tenant, user, by, handover?.to == null ? null : { to: handover.to, name: handover.name == null ? null : orgDefaults.name(handover.name) }, idemOf(idem), now());
+    },
+    async personalScopesOf(subject, { limit = 50 } = {}) {
+      ready();
+      const sub = orgDefaults.subject(subject), n = Math.min(Math.max(Number.isSafeInteger(limit) ? limit : 50, 1), 50);
+      const rows = q.personalScopesOf.all(sub.type, sub.id, n + 1).map(r => ({ type: r.scope_type, id: r.scope_id, role: r.role }));
+      return { scopes: rows.slice(0, n), more: rows.length > n };
     },
     async scopesOf(subject, { after = null, limit } = {}) {
       ready();

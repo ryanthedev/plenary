@@ -959,6 +959,7 @@ The Registry lists what is needed, in bounded pages, so no route has to guess:
 - `boardsIn(scope)`: the board ids in a Space, a Group (its Spaces') or a Unit, by id, `{ ids, next }` per page (default
   500, at most 1000).
 - `scopesOf(subject)`: the scopes (with the role) a user or Team holds a grant on, paged the same way.
+- `personalScopesOf(subject, { limit })`: the subset of those that is a personal space or a board in one, as `{ scopes, more }` (one join in SQL, at most `limit` and never more than 50; `more` when further ones exist). Read by `PUT /teams/:id/members/:user` for an admin's add (§ Teams and access).
 - A cursor (`after`) must be a previous page's `next` (a board id; or `<type>\n<id>`). A **malformed cursor is refused**
   (the call rejects with "registry: bad cursor"), never read as "start over", so a caller looping on `next` can't spin
   forever; an unknown but well-formed one is just a position.
@@ -1168,7 +1169,7 @@ or emptied while it is the only one. Any Unit member may read the Team list and 
 | `GET /teams/:id?after=` | a Unit; the Team in the caller's Unit | `{ team: { id, name, size }, can: { manage }, members: [{ user, name, email }], next }`: members by user id, 50 a page |
 | `PATCH /teams/:id` `{ name }` | `team.manage` | 200 `{ team }` |
 | `DELETE /teams/:id` | `team.manage` | 204. Removes the Team, its members and every grant it holds in one atomic step. **409 `last-owner`** (nothing changes) if it is the only counted owner of a Group or Space. **409 `too-large`** if it holds grants on more than 5000 scopes (remove some first) |
-| `PUT /teams/:id/members/:user` | `team.manage`; `:user` in the directory | 204, idempotent. A guest or unknown person: 400 `unknown-person`. **Personal spaces:** adding a member to a Team that holds any grant on a personal space or a board in one needs `members.manage` there from the resolver on each such scope; a Unit admin's pass does not reach them (a manage-only admin gets 403 and nothing changes, whoever they add), the owner passes. Removing a member stays open to admins (it never widens access) |
+| `PUT /teams/:id/members/:user` | `team.manage`; `:user` in the directory | 204, idempotent. A guest or unknown person: 400 `unknown-person`. **Personal spaces:** adding a member to a Team that holds any grant on a personal space or a board in one needs `members.manage` there from the resolver on each such scope; a Unit admin's pass does not reach them (a manage-only admin gets 403 and nothing changes, whoever they add), the owner passes. Only the Team's grants on personal scopes are read for this (Registry `personalScopesOf(team, { limit })`: one bounded join, at most 50, `more` when there are further ones; usually none), so a Team of any size is otherwise the admin's to change; a Team holding more than 50 personal-scope grants is refused to an admin for adding (fails closed). Removing a member stays open to admins (it never widens access) |
 | `DELETE /teams/:id/members/:user` | `team.manage` | 204, idempotent. **409 `last-owner`** if it would empty the only counted owner of a Group or Space |
 
 **A Team's grants are the caller's to give.** Adding a person to a Team gives them every grant the Team holds, and removing one (or deleting the Team) takes those away, so `team.manage`

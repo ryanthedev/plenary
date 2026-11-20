@@ -758,6 +758,14 @@ export function memoryRegistry({ now = Date.now } = {}) {
       return { removed: true, grants: g, scopedGrants: sg, teams: t, invites: inv, handedOver: !!to };
     },
 
+    async personalScopesOf(subject, { limit = 50 } = {}) {
+      const sub = orgDefaults.subject(subject), me = sk(sub.type, sub.id), n = Math.min(Math.max(Number.isSafeInteger(limit) ? limit : 50, 1), 50);
+      const personal = (type, id) => spaces.get(type === "space" ? id : type === "board" ? boards.get(id)?.space : null)?.kind === "personal";
+      const all = [...scoped].filter(([, g]) => g.has(me)).map(([k, g]) => { const [type, ...i] = k.split("\n"); return { type, id: i.join("\n"), role: g.get(me) }; })
+        .filter(x => personal(x.type, x.id)).sort((x, y) => (x.type + "\n" + x.id < y.type + "\n" + y.id ? -1 : 1));
+      return { scopes: all.slice(0, n), more: all.length > n };
+    },
+
     async scopesOf(subject, { after = null, limit } = {}) {
       const sub = orgDefaults.subject(subject), me = sk(sub.type, sub.id);
       after = orgDefaults.cursor(after, "scope");

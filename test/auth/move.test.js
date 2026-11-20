@@ -134,15 +134,15 @@ describe("who may move where", () => {
 
 describe("a personal-space board is its owner's (TECH-DEBT 67)", () => {
   const rootSpace = () => r.createSpace({ tenant: acme.id, name: "Root's", generalRole: null, owner: "google:root" });
-  test("a manage-only Unit admin (holds `move` everywhere) cannot move a member's personal-space board out: the route refuses, and can.move is false", async () => {
+  test("a manage-only Unit admin (holds `move` on shared boards) cannot move a member's personal-space board out: the route refuses, and can.move is false", async () => {
     const dst = await rootSpace();
     expect(await code(mv.move(root, board.id, { from: adasSpace.id, to: dst.id }))).toBe("forbidden");
     expect(await code(mv.options(root, board.id))).toBe("forbidden");
     expect(await code(mv.preview(root, board.id, dst.id))).toBe("forbidden");
     expect((await r.board(board.id)).space).toBe(adasSpace.id);
     const a = await ten.effective(root, board.id);
-    expect(a.permissions.has("move")).toBe(true);                     // the raw permission is there ...
-    expect(mayMove(a)).toBe(false);                                   // ... the offer is not
+    expect(a.permissions.has("move")).toBe(false);                    // Unit-scope sources give nothing on a personal board (row 67) ...
+    expect(mayMove(a)).toBe(false);                                   // ... so no offer
     expect((await ten.access(root, board.id)).move).toBe(false);
   });
   test("a content-access admin (board content on) may, like the owner; and a manage-only admin still moves a SHARED-space board", async () => {
@@ -158,7 +158,7 @@ describe("a personal-space board is its owner's (TECH-DEBT 67)", () => {
     const role = await r.createRole({ tenant: acme.id, name: "Mover", boardRole: "editor", permissions: ["move"] });
     await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: max.user }, role: role.id });
     const a = await ten.effective(max, board.id);
-    expect([a.ladder, a.hiddenPersonal, mayMove(a)]).toEqual([null, true, false]);
+    expect([a.ladder, a.permissions.has("move"), mayMove(a)]).toEqual([null, false, false]);
     expect(await code(mv.move(max, board.id, { from: adasSpace.id, to: design.id }))).toBe("forbidden");
   });
   test("the owner moves their own personal-space board out", async () => {

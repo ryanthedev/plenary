@@ -35,18 +35,10 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
     const id = idOf(boardId);
     if (!id) throw refused();
     const [unit, row, access] = await Promise.all([tenancy.tenantOf(identity), registry.board(id), tenancy.effective(identity, id, { uniform: true })]);
-    if (!unit || !row || row.tenant !== unit.id || !access.permissions.has("delete") || !(await personalOk(row, access))) throw refused();
+    if (!unit || !row || row.tenant !== unit.id || !access.permissions.has("delete")) throw refused();
     return { unit, row, access };
   }
-  /**
-   * A board in a personal space is its owner's: `delete` alone (a manage-only Unit admin holds it on every board) is not enough there. The caller must also have been able to OPEN it before
-   * it went to Trash (the space owner; an admin only where board-content access is on). Boards in shared Spaces keep the `delete` rule.
-   */
-  async function personalOk(row, access) {
-    if (!row.space) return true;
-    const sp = await registry.space(row.space);
-    return sp?.kind !== "personal" || could(access);
-  }
+  // A board in a personal space is its owner's: the resolver gives `delete` there only to the owner, board-scope sources and a content-access admin (never a manage-only admin), so `delete` alone is the whole check (TECH-DEBT row 67).
   /** The Space, the caller's access and their Unit, if they hold `delete` on it and it is not personal. */
   async function spaceDeleter(identity, spaceId) {
     const id = idOf(spaceId);
@@ -171,7 +163,7 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
       const id = idOf(boardId);
       if (!id) throw refused();
       const [unit, row, access] = await Promise.all([tenancy.tenantOf(identity), registry.board(id), tenancy.effective(identity, id, { uniform: true })]);
-      const manage = access.permissions.has("delete") && !!row && await personalOk(row, access);
+      const manage = access.permissions.has("delete") && !!row;
       if (!unit || !row || row.tenant !== unit.id || !access.trashed || !(manage || could(access))) throw refused();
       const t = now(), withSpace = row.trashedWith != null;
       const out = { board: { id: row.id, title: row.title }, ...clockOf(access.trashed.at), daysLeft: daysLeft(access.trashed.at, t), canRestore: manage && !withSpace };
@@ -211,7 +203,7 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
         const got = p.boards.length ? await tenancy.accessMany(identity, p.boards.map(b => b.id).slice(0, HOME.batch)) : new Map();
         for (const b of p.boards) {
           const f = got.get(b.id);
-          if (!f?.access.trashed || !f.access.permissions.has("delete") || (f.space?.kind === "personal" && !could(f.access))) continue;   // a personal space's boards are listed for those who could open them
+          if (!f?.access.trashed || !f.access.permissions.has("delete")) continue;   // a personal space's boards come with `delete` only for those the resolver lets in (never a manage-only admin)
           if (items.length >= LIMITS.items) { more = true; break; }
           items.push({ type: "board", id: b.id, title: b.title, from: { space: f.spaceOpen && f.space ? { id: f.space.id, name: f.space.name, personal: f.space.kind === "personal" } : null, group: f.groupOpen && f.group ? { id: f.group.id, name: f.group.name } : null },
             by: b.trashedBy, trashedAt: b.trashedAt });

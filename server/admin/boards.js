@@ -45,12 +45,16 @@ export async function liveAdmin(registry, unit, caller) {
 }
 
 /** The board, if the caller may manage it; else throws `forbidden` (unknown board included). */
-async function managed(registry, caller, boardId) {
+async function managed(registry, caller, boardId, tenancy = null) {
   if (!caller || typeof caller.user !== "string" || typeof boardId !== "string") throw forbidden();
   const b = await registry.board(boardId);
   if (!b || b.trashedAt != null) throw forbidden();   // a board in Trash has no management but Restore (PROTOCOL.md § Trash and restore)
   if ((await registry.grant(b.id, caller.user)) === "owner") return b;
-  if (await isTenantAdmin(registry, caller, b.tenant)) return b;
+  if (await isTenantAdmin(registry, caller, b.tenant)) {
+    // A personal space's boards are their owner's: an admin manages one only where the resolver says they hold board content there (never merely by being an admin), TECH-DEBT row 67.
+    if ((await registry.space(b.space))?.kind !== "personal") return b;
+    if (tenancy && (await tenancy.effective(caller, b.id, { uniform: true })).permissions.has("members.manage")) return b;
+  }
   throw forbidden();
 }
 
@@ -100,8 +104,8 @@ const expiry = (v, now) => {
 };
 
 /** Give a user an explicit role on a board (or remove it with null). See the rules at the top. */
-export async function setGrant({ caller, board, user, role }, { registry }) {
-  const b = await managed(registry, caller, board);
+export async function setGrant({ caller, board, user, role }, { registry, tenancy = null }) {
+  const b = await managed(registry, caller, board, tenancy);
   if (role !== null && !ROLES.includes(role)) throw bad("bad role");
   if (typeof user !== "string" || !user) throw bad("bad user");
   const admin = await isTenantAdmin(registry, caller, b.tenant);

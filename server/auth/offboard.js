@@ -9,6 +9,7 @@ import { AdminError } from "../admin/boards.js";
 import { isUnitAdmin } from "./resolver.js";
 import { grantable, idOf } from "./access.js";
 import { RegistryError } from "./registry-port.js";
+import { normEmail } from "./util.js";
 
 /** What one page shows, and how many boards are counted per Space. */
 export const LIMITS = Object.freeze({ items: 50, boards: 100 });
@@ -105,7 +106,7 @@ export function offboardService({ registry, tenancy, announce = () => {}, manage
         }
         items.push({ ...v, can: { reassign: may, ...(may ? {} : { why: "Needs a Unit admin, or an owner of this" }) } });
       }
-      const isAdmin = unit.admins.includes(leaver.user);
+      const isAdmin = unit.admins.includes(leaver.user) || (!!leaver.email && unit.admins.includes("email:" + normEmail(leaver.email)));   // by id or by `email:` entry, as removeMember refuses
       const defaults = await defaultRecipient(unit, leaver, identity);
       return {
         member: { id: leaver.user, name: leaver.name, email: leaver.email ?? null, removed: leaver.removed },

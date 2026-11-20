@@ -187,6 +187,16 @@ describe("reassigning and removing", () => {
     expect(await code(off.remove(root, "google:nobody"))).toBe("not-found");
     expect(await code(off.remove(bob, sam.user))).toBe("forbidden");
   });
+  test("an admin named by an email: entry is blocked and refused like one named by id; a removed person is never an admin to the resolver", async () => {
+    await r.addTenantAdmin(acme.id, "email:bob@acme.com");
+    expect((await off.list(root, bob.user)).blocked).toBe("admin");
+    expect(await code(off.remove(root, bob.user))).toBe("is-admin");
+    // an admin entry added AFTER the removal gives the removed person nothing
+    await moveAll(ada.user);
+    await off.remove(root, sam.user);
+    await r.addTenantAdmin(acme.id, sam.user);
+    expect((await ten.effective(sam, { type: "unit", id: acme.id })).permissions.size).toBe(0);
+  });
   test("a removed person's identity: HTTP says no Unit, the room says no role, and a board grant to them is refused as unknown-person", async () => {
     await moveAll(ada.user);
     await off.remove(root, sam.user);

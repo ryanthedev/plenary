@@ -97,7 +97,7 @@ export function resolveAccess({ ctx, grant = null, invites = [], links = [], tea
   const roles = new Map((ctx.roles ?? []).map(r => [r.id, r]));
   // A person the Unit removed is a guest (PROTOCOL.md § Leaver offboarding): not a member, so no general access, member role, Space, Group, Unit or Team source.
   const removed = !!ctx.removed?.includes(identity.user);
-  const member = !removed && isUnitMember(tenant, identity), admin = isUnitAdmin(tenant, identity);
+  const member = !removed && isUnitMember(tenant, identity), admin = !removed && isUnitAdmin(tenant, identity);   // removal revokes admin too (fail closed)
   const inside = member || admin;
   const myTeams = inside ? teams ?? teamIndex(ctx).get(identity.user) ?? new Set() : new Set();
   const target = board ? "board" : space ? "space" : group ? "group" : "unit";

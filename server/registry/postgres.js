@@ -1402,10 +1402,10 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       return write(async tx => {
         if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
         await lockOwners(tx, tenant);
-        const cur = await one(tx, `SELECT removed_at FROM ${MB} WHERE tenant = $1 AND member = $2 FOR UPDATE`, [tenant, user]);
+        const cur = await one(tx, `SELECT removed_at, email FROM ${MB} WHERE tenant = $1 AND member = $2 FOR UPDATE`, [tenant, user]);
         if (!cur) throw new Error("registry: no such member");
         if (cur.removed_at != null) { await idemPut(tx, k, user + ":noop", at); return { removed: false, grants: 0, scopedGrants: 0, teams: 0 }; }
-        if (await one(tx, `SELECT 1 AS x FROM ${A} WHERE tenant = $1 AND member = $2`, [tenant, user])) throw new RegistryError("is-admin", "registry: a Unit admin cannot be removed");
+        if (await one(tx, `SELECT 1 AS x FROM ${A} WHERE tenant = $1 AND (member = $2 OR ($3::text IS NOT NULL AND member = 'email:' || lower(trim($3::text))))`, [tenant, user, cur.email ?? null])) throw new RegistryError("is-admin", "registry: a Unit admin cannot be removed");
         // The Team member rows the count reads: share-locked, so a member joining or leaving a Team owner is committed (seen) or waits for us.
         await tx.unsafe(`SELECT 1 FROM ${TU} WHERE team IN (SELECT m.team FROM ${TU} m WHERE m.member = $1)
           AND team IN (SELECT subject FROM ${SG} WHERE subject_type = 'team' AND role = 'owner' AND scope_type IN ('group', 'space')) ORDER BY team, member FOR SHARE`, [user]);

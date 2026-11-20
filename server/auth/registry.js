@@ -729,7 +729,8 @@ export function memoryRegistry({ now = Date.now } = {}) {
       if (!row) throw new Error("registry: no such member");
       const k = idemEnter(key);
       if (row.removedAt != null) { idemPut(k, user + ":noop"); return { removed: false, grants: 0, scopedGrants: 0, teams: 0 }; }
-      if (tenants.get(tenant).admins.includes(user)) throw new RegistryError("is-admin", "registry: a Unit admin cannot be removed");
+      const adm = tenants.get(tenant).admins;
+      if (adm.includes(user) || (row.email && adm.includes("email:" + normEmail(row.email)))) throw new RegistryError("is-admin", "registry: a Unit admin cannot be removed");
       if (aloneOf(tenant, user, null, 1).items.length) throw new RegistryError("still-owns", "registry: the member still solely owns something");
       let g = 0, sg = 0, t = 0;
       for (const [b, m] of grants) if (boards.get(b)?.tenant === tenant && m.delete(user)) g++;

@@ -1960,6 +1960,13 @@ export function registryContract(name, makeRegistry, opts = {}) {
         await expect(r.removeMember({ tenant: t.id, user: "google:root", by: ADA })).rejects.toMatchObject({ code: "is-admin" });
         await expect(r.removeMember({ tenant: t.id, user: "google:nobody", by: ADA })).rejects.toThrow();
       });
+      test("an admin named by an email: entry is refused too (is-admin), whatever the case of the address; nothing changes", async () => {
+        const t = await setup();
+        await r.touchMember(t.id, { user: "google:eve", name: "Eve", email: "Eve@Acme.com" });
+        await r.addTenantAdmin(t.id, "email:eve@acme.com");
+        await expect(r.removeMember({ tenant: t.id, user: "google:eve", by: ADA })).rejects.toMatchObject({ code: "is-admin" });
+        expect((await r.memberState(t.id, "google:eve")).removed).toBe(false);
+      });
       test("removeMember marks the member and deletes their board grants, scoped grants, Team memberships and access requests, only in this Unit; guests' rows and others' stay", async () => {
         const t = await setup();
         const other = await r.createTenant({ domain: "other.com" });

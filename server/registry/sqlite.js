@@ -254,7 +254,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       AND NOT EXISTS (SELECT 1 FROM reg_scope_grants o WHERE o.scope_type = c.t AND o.scope_id = c.i AND o.role = 'owner'
         AND ((o.subject_type = 'user' AND o.subject <> ?3) OR (o.subject_type = 'team' AND EXISTS (SELECT 1 FROM reg_team_members x WHERE x.team = o.subject AND x.member <> ?3))))`),
     archiveSpace: db.query("UPDATE reg_spaces SET kind = 'shared', owner_user = NULL, archived_at = ?2, name = ?3 WHERE id = ?1"),
-    isAdmin: db.query("SELECT 1 AS x FROM reg_tenant_admins WHERE tenant = ? AND member = ?"),
+    isAdmin: db.query("SELECT 1 AS x FROM reg_tenant_admins WHERE tenant = ?1 AND (member = ?2 OR (?3 IS NOT NULL AND member = 'email:' || lower(trim(?3))))"),
     markRemoved: db.query("UPDATE reg_members SET removed_at = ?3, removed_by = ?4 WHERE tenant = ?1 AND member = ?2 AND removed_at IS NULL"),
     delUserGrants: db.query("DELETE FROM reg_grants WHERE member = ?1 AND board IN (SELECT id FROM reg_boards WHERE tenant = ?2)"),
     delUserScoped: db.query(`DELETE FROM reg_scope_grants WHERE subject_type = 'user' AND subject = ?1 AND ((scope_type = 'unit' AND scope_id = ?2)
@@ -718,7 +718,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     needRow(cur, "member");
     idemEnter(idem, at);
     if (cur.removed_at != null) { idemPut(idem, user + ":noop", at); return { removed: false, grants: 0, scopedGrants: 0, teams: 0 }; }
-    if (q.isAdmin.get(tenant, user)) throw new RegistryError("is-admin", "registry: a Unit admin cannot be removed");
+    if (q.isAdmin.get(tenant, user, cur.email ?? null)) throw new RegistryError("is-admin", "registry: a Unit admin cannot be removed");
     if (q.ownedAlone.all(tenant, user, null, 1).length) throw new RegistryError("still-owns", "registry: the member still solely owns something");
     const out = { removed: true, grants: q.delUserGrants.run(user, tenant).changes, scopedGrants: q.delUserScoped.run(user, tenant).changes, teams: q.delUserTeams.run(user, tenant).changes };
     q.delUserAsks.run(tenant, user);

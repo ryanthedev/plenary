@@ -50,8 +50,9 @@ not be in a Group, so a small Unit never has to make Groups at all. Nesting can 
 The board ladder from today stays as the set of built-in roles at every scope:
 `viewer < commenter < annotator < editor < owner`. Two built-in roles exist at Unit scope only:
 
-- **Unit admin**: everything, everywhere. Today this is one flat role. **Admin levels will be tiered as RBAC permissions** (future, #88): the permissions an admin holds are what the server checks, so tiers need no new mechanism.
-- **Unit member**: what everyone in the Unit gets.
+- **Unit admin**: manages the Unit (people, Teams, roles, Space settings, and on every Space the grants, moves and trash) and holds **no board content**: it cannot open a board's canvas, and it can touch nothing in a personal space. It is a label for a set of permissions, not a rule.
+- **Unit content admin** and **Unit content admin (incl. personal spaces)** (#88): the **content tier**, two permissions held at the Unit only. `content.shared` ("Open every shared board") opens any board in any shared Space as its owner. `content.personal` ("Open personal spaces") opens other people's personal spaces and their boards as their owner would, including moving out, trashing and handing over; it reads private work, so the screen says so. A Unit picks per person or Team: neither (a manage-only admin), shared only, or both. A custom role may carry either. These are **not** passed on by a plain admin: only someone who holds a tier permission can give it (no escalation, and an admin has no exemption here). The first holders come from the operator at set-up (`scripts/admin-bootstrap.js --content-admin`). The access explanation names the permission when it is what lets someone in ("Owner via Unit content admin · Open every shared board").
+- **Unit member**: what everyone in the Unit gets. It never carries the content tier.
 
 Built-in roles cannot be edited, except **Unit member**, which only a **Unit admin** can change (`roles.manage` at the Unit is not enough on its own: editing the member role changes what every person in the Unit gets). That is the default
 everyone gets. **Custom roles are proposed for v1.** An admin makes one by duplicating a built-in role and
@@ -78,7 +79,8 @@ Built-in roles × permission, by scope:
 
 | Scope | Role | create board | create space | manage members | move | delete | transfer |
 |---|---|---|---|---|---|---|---|
-| Unit | admin | anywhere | anywhere | everything, plus Teams and Roles | anywhere | anywhere | anywhere |
+| Unit | admin | anywhere | anywhere | everything, plus Teams and Roles | anywhere | anywhere | anywhere (no board content, nothing in personal spaces) |
+| Unit | content admin | no | no | no | no (personal: yes, with `content.personal`) | no (personal: yes, with `content.personal`) | no (personal: yes, with `content.personal`) |
 | Unit | member | in own personal space | **yes, at the Unit root** (editable) | no (Teams are managed by Unit admins only) | own boards | own boards | own boards |
 | Group | owner | in all its Spaces | in this Group | Group and its Spaces | out of the Group | its Spaces and boards | yes |
 | Group | editor | in all its Spaces | in this Group | no | no | no | no |
@@ -110,7 +112,7 @@ wins*. Nothing subtracts: there is no deny.
    Groups.
 6. **Invite** to the user's authoritative email: unchanged (board scope, up to editor).
 7. **Share link** the user redeemed: unchanged (board scope, up to editor).
-8. **Unit role**: Unit admin = owner everywhere (today's tenant admin). Unit member adds only its own
+8. **Unit role**: Unit admin adds its management permissions and no board content (the content tier, `content.shared` and `content.personal`, is what opens boards; #88). Unit member adds only its own
    permissions.
 
 Every answer keeps its **sources**, so the UI can always say *why* ("Editor via Infra team on Space Platform").
@@ -217,7 +219,7 @@ were the only owner of**.
    Miro does it.
 3. **[admin-offboard]:** Sam's personal space is private to him: it is not a row to reassign, it **goes with the
    removal** to the recipient the admin picks, as the ordinary Space "Sam's space (archived)". Only an admin who
-   could open it (board-content access, a permission) may hand it over; a manage-only admin sees a count of its
+   could open it (the `content.personal` permission) may hand it over; a manage-only admin sees a count of its
    boards and "needs board-content access", and Remove stays locked for Sam. Board URLs and guests' access stay.
 4. Sam's own grants and team memberships are removed, and so are invites addressed to his own email. The invites
    and share links he made stay until they expire, now vouched for by the new owner, so guests keep access
@@ -242,6 +244,7 @@ Trash is free on every plan, with no paywall.
 3. **[roles]:** she clicks **Duplicate**, names it "Facilitator" and ticks `board.edit`, `members.manage`
    (board) and `board.create`, but not `delete` or `move`. The pane names the permissions it is closest to
    ("like Editor, plus can invite"). She clicks **Save role**.
+3b. **[roles], content tier (#88):** two more rows sit at the bottom of the matrix, under their own heading, with a plain sentence each ("Open every shared board", "Open personal spaces") and a Unit-only column. The built-in Unit content admin roles show them ticked. Priya cannot tick either unless she holds it herself: the box is disabled, with the reason. The Unit member role never offers them.
 4. **[roles] → Unit member:** she can untick `space.create`. The banner then warns "212 members will no longer be
    able to create Spaces at the root. Existing Spaces are unaffected."
 5. **Assigning at any scope:** the picker is the same everywhere. **[space-settings]** (Space), the Group's

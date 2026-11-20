@@ -73,12 +73,16 @@ describe("who may move where", () => {
     expect(await code(mv.move(ada, board.id, { from: adasSpace.id, to: viewOnly.id }))).toBe("forbidden");
     expect((await r.board(board.id)).space).toBe(adasSpace.id);
   });
-  test("a Unit admin holds the Unit-wide move permission but, without the content tier, may not move a board where they would gain a role; a content.shared holder (owner step) may (#88)", async () => {
+  test("a Unit admin (manage-only or holding the tier) moves a board between Spaces where nobody gains a role; where someone would gain one above the mover's own role (the tier never counts) it is refused (#88 per-person gain rule)", async () => {
     const b = await r.createBoard({ tenant: acme.id, title: "Shared one", space: design.id, owner: "google:ada", memberRole: null });   // a personal-space board is the owner's (below)
-    expect(await code(mv.move(root, b.id, { from: design.id, to: platform.id }))).toBe("forbidden");   // platform gives members editor: the manage-only admin would gain it
-    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: "google:root" }, role: "content-admin" });
-    expect((await mv.move(root, b.id, { from: design.id, to: platform.id })).moved).toBe(true);
+    expect((await mv.move(root, b.id, { from: design.id, to: platform.id })).moved).toBe(true);             // platform's people (owner ada) are a subset of Design's: nobody gains, so a manage-only admin moves it
     expect((await r.board(b.id)).space).toBe(platform.id);
+    const open = await r.createSpace({ tenant: acme.id, name: "Open", generalRole: "editor", owner: "google:ada" });
+    expect(await code(mv.move(root, b.id, { from: platform.id, to: open.id }))).toBe("forbidden");           // everyone in the Unit would gain editor
+    expect(await code(mv.move(root, b.id, { from: platform.id, to: design.id }))).toBe("forbidden");         // the Design team would gain editor
+    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: "google:root" }, role: "content-admin" });
+    expect(await code(mv.move(root, b.id, { from: platform.id, to: open.id }))).toBe("forbidden");           // content.shared opens content; its owner step hands out nothing
+    expect((await mv.options(root, b.id)).destinations.map(d => d.name)).not.toContain("Open");
   });
   test("a Space owner (move at the Space) moves a board they do not own; a Space editor cannot", async () => {
     const b = await r.createBoard({ tenant: acme.id, title: "Theirs", space: platform.id, owner: "google:max" });
@@ -99,10 +103,6 @@ describe("who may move where", () => {
     await r.setScopedGrant({ scope: { type: "space", id: quiet.id }, subject: { type: "user", id: "google:max" }, role: role.id });
     expect((await mv.move(max, b.id, { from: platform.id, to: quiet.id })).moved).toBe(true);              // viewer for others: within what max holds
     expect(givenBy(await r.accessContext({ type: "space", id: design.id }))).toBe("owner");   // the mover's own grant counts too (Design's owner is ada herself): no skipping self
-    const c = await r.createBoard({ tenant: acme.id, title: "C", space: platform.id });
-    expect(await code(mv.move(root, c.id, { from: platform.id, to: design.id }))).toBe("forbidden");        // a manage-only Unit admin is held to their own (no) board role
-    await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: "google:root" }, role: "content-admin" });
-    expect((await mv.move(root, c.id, { from: platform.id, to: design.id })).moved).toBe(true);              // a content.shared holder is an owner of every shared board
   });
   test("HIGH-1: a mover below owner cannot become owner by moving a board into a Space they own, or into their personal space", async () => {
     const role = await r.createRole({ tenant: acme.id, name: "Mover", boardRole: "viewer", permissions: ["move", "board.create"] });
@@ -149,8 +149,8 @@ describe("a personal-space board is its owner's (TECH-DEBT 67)", () => {
     expect(mayMove(a)).toBe(false);                                   // ... so no offer
     expect((await ten.access(root, board.id)).move).toBe(false);
   });
-  test("a content-access admin (board content on) may, like the owner; and a manage-only admin still moves a SHARED-space board", async () => {
-    const dst = await rootSpace();
+  test("a content.personal holder moves a personal board out where nobody gains (the destination is owned by the board's owner); a manage-only admin moves a SHARED-space board the same way", async () => {
+    const dst = await r.createSpace({ tenant: acme.id, name: "Ada's shared", generalRole: null, owner: "google:ada" });
     await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: root.user }, role: "content-admin-personal" });
     const ten2 = makeTenancy({ registry: r });
     const mv2 = moveService({ registry: r, tenancy: ten2, spaces: spaceService({ registry: r, tenancy: ten2 }) });
@@ -237,7 +237,7 @@ describe("the access diff", () => {
     expect(d.from).toEqual({ hidden: true });
     expect(d.hidden).toBe(true);
     const text = JSON.stringify(d);
-    for (const leak of ["Secret", "google:max", "max", secret.id, "root"]) expect(text).not.toContain(leak);
+    for (const leak of ["Secret", "google:max", '"max"', secret.id, '"root"', "google:root"]) expect(text).not.toContain(leak);
     expect(d.keeps.map(e => e.subject.id)).toEqual(["google:ada"]);
     expect(d.loses).toEqual([]);                 // nobody visible loses: everything lost is through the hidden Space
     expect(Object.keys(d).sort()).toEqual(["board", "from", "gains", "hidden", "invites", "keeps", "links", "loses", "more", "to"]);

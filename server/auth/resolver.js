@@ -179,6 +179,14 @@ export const mayMove = a => a.permissions.has("move") && a.member === true;
 export const holdsTier = a => !!a && a.sources.some(s => s.content != null);
 
 /**
+ * May this access hand out board roles above `ownLadder`? The ladder exemption (#88): the content tier at this target AND `members.manage` from a Unit-scope source (the Unit admin role, or a Unit-wide custom role),
+ * both read as permissions. A tier holder whose only say here is a local role (a Space or board role with `members.manage`) is held to their own ladder like anyone: the tier opens content, it does not widen what a
+ * local manager may give.
+ * @param {Access} a
+ */
+export const ladderExempt = a => holdsTier(a) && a.sources.some(s => s.scope.type === "unit" && s.permissions.includes("members.manage"));
+
+/**
  * The board ladder this access holds WITHOUT the content tier: what the holder may hand out (`withinLadder` for grants, links, invites). The tier's owner step lets its holder open and act as the owner, never hand out roles by itself.
  * @param {Access} a @returns {Role|null}
  */

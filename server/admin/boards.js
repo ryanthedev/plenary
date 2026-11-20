@@ -11,7 +11,7 @@
 // same `forbidden` error, so existence doesn't leak.
 
 import { ROLES, LINK_ROLES, INVITE_ROLES, normEmail } from "../auth/util.js";
-import { isUnitAdmin, holdsTier, ownLadder } from "../auth/resolver.js";
+import { isUnitAdmin, ladderExempt, ownLadder } from "../auth/resolver.js";
 import { withinLadder } from "../auth/permissions.js";
 
 /** @typedef {import("../auth/registry-port.js").Registry} Registry */
@@ -87,7 +87,7 @@ async function sharer({ registry, tenancy }, caller, boardId) {
  * May this access hand out board role `role`? Nobody gives more than they hold WITHOUT the content tier (`ownLadder`); a holder of the tier at this board (`content.shared`, or `content.personal` on a personal one: `holdsTier`) is exempt.
  * A Unit admin without the tier is held to their own ladder like anyone (#88).
  */
-const givable = (access, role) => withinLadder(ownLadder(access), role, holdsTier(access));
+const givable = (access, role) => withinLadder(ownLadder(access), role, ladderExempt(access));
 /** `forbidden` unless `givable`. */
 const mayGive = (s, role) => { if (!givable(s.access, role)) throw forbidden(); };
 
@@ -115,7 +115,7 @@ export async function setGrant({ caller, board, user, role }, { registry, tenanc
   if (typeof user !== "string" || !user) throw bad("bad user");
   // A holder of the content tier at this board is exempt from the ladder limit (#88); everyone else, a Unit admin included, gives at most their own role and never `owner`.
   const access = tenancy ? await tenancy.effective(caller, b.id, { uniform: true }) : null;
-  const exempt = access ? holdsTier(access) : await isTenantAdmin(registry, caller, b.tenant);
+  const exempt = access ? ladderExempt(access) : await isTenantAdmin(registry, caller, b.tenant);
   const current = await registry.grant(b.id, user);
   if (!exempt) {
     if (role === "owner") throw forbidden();

@@ -7,7 +7,7 @@
 // scheduler in spaces.js through `announce`; it never holds a queue of its own).
 
 import { AdminError, knownOnBoard } from "../admin/boards.js";
-import { isUnitAdmin, holdsTier, ownLadder } from "./resolver.js";
+import { isUnitAdmin, ladderExempt, ownLadder } from "./resolver.js";
 import { ROLES } from "./util.js";
 import { roleDef, ROLE_PERMS, TIER_PERMS, TIER_ROLES, UNIT_ROLES, withinLadder } from "./permissions.js";
 import { TEAMS } from "./registry-port.js";
@@ -156,7 +156,7 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
     for (const sc of p.scopes) {
       if (!validAt(sc.role, sc.type, roles)) continue;                          // a stale role counts for nothing: nothing to give or take
       const access = sc.type === "board" ? await tenancy.effective(identity, sc.id, { uniform: true }) : got.get(sc.type + "\n" + sc.id);
-      if (!access || !may(access, "members.manage") || !touchable(access, sc.role, sc.type, roles, holdsTier(access), subject, identity)) return false;
+      if (!access || !may(access, "members.manage") || !touchable(access, sc.role, sc.type, roles, ladderExempt(access), subject, identity)) return false;
     }
     return true;
   }
@@ -337,7 +337,7 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
       const sc = await scopeOf(identity, unit, type, id);
       if (!sc || !(opens(sc.access) || may(sc.access, "members.manage"))) throw missing();
       const { row, access } = sc;
-      const exempt = holdsTier(access), manage = manages(sc);
+      const exempt = ladderExempt(access), manage = manages(sc);
       const scope = { type, id: row.id };
       const canSee = opens(access);
       const [page, roleList, people, unitPage] = await Promise.all([
@@ -425,7 +425,7 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
       const sc = await scopeOf(identity, unit, type, id);
       if (!sc || !manages(sc)) throw refused();
       const { row, access } = sc, scope = { type, id: row.id }, sub = { type: subjectType, id: sid };
-      const exempt = holdsTier(access);
+      const exempt = ladderExempt(access);
       const roles = new Map((await registry.roles(unit.id)).map(r => [r.id, r]));
       const personBoard = type === "board" && subjectType === "user";
       const cur = personBoard ? await registry.grant(row.id, sid) : await registry.scopedGrant(scope, sub);

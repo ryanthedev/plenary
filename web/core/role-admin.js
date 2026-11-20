@@ -18,7 +18,7 @@ export const PERM_LABEL = {
 Object.assign(PERM_LABEL, CONTENT_LABEL);
 export const PERM_HELP = {
   "content.shared": "Open and edit any board in any shared Space, as its owner. Not personal spaces.",
-  "content.personal": "Open and manage boards in other people's personal spaces, as their owner would. Needs a reason: it reads private work.",
+  "content.personal": "Open, move out, trash, restore and hand over boards in other people's personal spaces. Needs a reason: it reads private work.",
 };
 export const permLabel = id => PERM_LABEL[id] ?? id;
 export const SCOPE_LABEL = { unit: "Organization", group: "Group", space: "Space", board: "Board" };

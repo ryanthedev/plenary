@@ -6,10 +6,10 @@
 // resolver's answer (`move` on the board, `board.create` at the destination), never a role name. Names are access (#51): a person, Team or container the caller may not see is never named.
 
 import { AdminError } from "../admin/boards.js";
-import { resolveAccess, movedContext, mayMove } from "./resolver.js";
-import { roleDef, withinLadder, UNIT_ROLES } from "./permissions.js";
+import { resolveAccess, movedContext, mayMove, ownLadder } from "./resolver.js";
+import { roleDef, UNIT_ROLES } from "./permissions.js";
 import { LADDER_NAMES } from "./explain.js";
-import { capTo, higher, ROLES, INVITE_ROLES } from "./util.js";
+import { capTo, higher, rank, ROLES, INVITE_ROLES } from "./util.js";
 import { HOME, TEAMS } from "./registry-port.js";
 
 /** What one read shows at most: entries per list, people and Teams looked at, destinations offered. */
@@ -46,6 +46,38 @@ export function givenBy(ctx) {
   return top;
 }
 
+/** Every user the destination's Space and Group and the Unit name in a grant (whose Team memberships a move check must read), and the mover. */
+const namedUsers = (identity, ctxs) => [...new Set([identity.user, ...ctxs.flatMap(c => ["space", "group", "unit"].flatMap(t => (c.scoped?.[t] ?? []).filter(g => g.subject.type === "user" && !UNIT_ROLES.includes(g.role)).map(g => g.subject.id)))])];
+
+/**
+ * Rule 4, the PER-PERSON GAIN rule (#88; PROTOCOL.md § Move board): would the move raise anyone's board role above `own`, the mover's board role WITHOUT the content tier (`ownLadder`: the tier never lets its holder hand out
+ * a role, so moving a board is not a back door to it)? "Anyone" is every person, Team and everybody-in-the-Unit that the destination's Space, Group or the Unit names in a grant, general access included, and the mover.
+ * Each one's role is read now and as the board would have it in the destination (`movedContext`, the preview's own `gains`), hidden containers included: the answer is a yes/no, never a name. A Unit admin without the
+ * tier has no exemption. The mover's own gain is held to the same limit, so a move never raises the mover's own role either (#53). Over the limits it cannot check: refused (fail closed).
+ * @param {import("./registry-port.js").AccessContext} ctx the board's context, read with `namedUsers`  @param {import("./registry-port.js").AccessContext} tctx the destination Space's context, same users
+ * @param {import("./idp-port.js").Identity} mover @param {string|null} moverBefore the mover's board role now, without the tier  @param {string|null} own  @param {number} t
+ * @returns {boolean} true = the move would hand someone a role above `own`
+ */
+export function raisesAbove(ctx, tctx, mover, moverBefore, own, t) {
+  const users = new Set([mover.user]), teams = new Set();
+  for (const c of [tctx, ctx]) for (const type of ["space", "group", "unit"]) {
+    if (c === ctx && type !== "unit") continue;                    // the board's current containers only lose; the Unit's grants change meaning when a board leaves a personal space
+    for (const g of c.scoped?.[type] ?? []) if (!UNIT_ROLES.includes(g.role)) (g.subject.type === "user" ? users : teams).add(g.subject.id);
+  }
+  if (users.size > LIMITS.people || teams.size > LIMITS.teams) return true;
+  const after = movedContext(ctx, tctx), lim = rank(own), raised = (before, now) => rank(now) > rank(before) && rank(now) > lim;
+  const domain = ctx.tenant?.domains?.[0] ?? null, ghost = { user: GHOST, domain };
+  const ladderOf = (c, id) => ownLadder(resolveAccess({ ctx: c }, id, t));   // the content tier is nobody's grant: what a tier holder opens on their own is not a gain the move hands them
+  for (const u of users) {
+    const id = u === mover.user ? mover : { user: u, domain };
+    if (raised(u === mover.user ? moverBefore : ladderOf(ctx, id), ladderOf(after, id))) return true;
+  }
+  const team = (c, id) => resolveAccess({ ctx: c, teams: new Set([id]) }, ghost, t).sources.filter(s => s.kind === "team" && s.team === id).reduce((r, s) => higher(r, s.ladder), null);
+  for (const id of teams) if (raised(team(ctx, id), team(after, id))) return true;
+  const every = c => resolveAccess({ ctx: c, teams: new Set() }, ghost, t).sources.filter(s => s.kind === "general" || (s.kind === "unit" && s.role === "member")).reduce((r, s) => higher(r, s.ladder), null);
+  return raised(every(ctx), every(after));
+}
+
 /**
  * @param {{ registry: import("./registry-port.js").Registry, tenancy: ReturnType<typeof import("./tenancy.js").tenancy>,
  *   spaces: Pick<ReturnType<typeof import("./spaces.js").spaceService>, "createTarget"|"boardPicker">, now?: () => number }} deps
@@ -62,13 +94,16 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
     if (!unit || !row || row.tenant !== unit.id || !mayMove(access)) throw refused();   // the one rule the welcome and the cards use too
     return { unit, row, access };
   }
-  /** Rules 2 to 4 for one destination: its row, the caller's access and its context; else `forbidden`. */
+  /** Rules 2 to 4 for one destination: its row, the caller's access and its context; else `forbidden`. Rule 4 is `raisesAbove` (per-person gain), read fresh with every named person's Teams. */
   async function target(identity, m, to) {
     const t = await spaces.createTarget(identity, m.unit, to);
     if (!t) throw refused();
-    const ctx = await registry.accessContext({ type: "space", id: t.row.id }, { users: [identity.user] });
-    if (!ctx || !withinLadder(m.access.ladder, givenBy(ctx))) throw refused();
-    return { ...t, ctx };
+    const first = await registry.accessContext({ type: "space", id: t.row.id }, { users: [identity.user] });
+    if (!first) throw refused();
+    const users = namedUsers(identity, [first]).slice(0, LIMITS.people + 1);
+    const [ctx, tctx] = await Promise.all([registry.accessContext({ type: "board", id: m.row.id }, { users }), registry.accessContext({ type: "space", id: t.row.id }, { users })]);
+    if (!ctx?.board || !tctx || raisesAbove(ctx, tctx, identity, ownLadder(m.access), ownLadder(m.access), now())) throw refused();
+    return { ...t, ctx: tctx };
   }
 
   /** The Space `id` as the caller may name it: `{ id, name, personal }` when they can open it, else null. */
@@ -98,9 +133,13 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
       const m = await mover(identity, boardId);
       const [picked, from] = await Promise.all([spaces.boardPicker(identity), openSpace(identity, m.unit, m.row.space)]);
       const cand = picked.spaces.filter(s => s.id !== m.row.space).slice(0, HOME.batch);
-      // ONE batch read settles rule 4 for every candidate (its own context holds its Space's and Group's grants).
-      const ctxs = cand.length ? await registry.accessContexts(cand.map(s => ({ type: "space", id: s.id })), { users: [identity.user] }) : new Map();
-      const ok = cand.filter(s => { const c = ctxs.get("space\n" + s.id); return c && withinLadder(m.access.ladder, givenBy(c)); });
+      // Rule 4 for every candidate from batch reads: their contexts for the mover, then everyone they name (one union of users), the board's context and the candidates again with those users.
+      const key = s => "space\n" + s.id, refs = cand.map(s => ({ type: "space", id: s.id }));
+      const first = cand.length ? await registry.accessContexts(refs, { users: [identity.user] }) : new Map();
+      const users = namedUsers(identity, [...first.values()].filter(Boolean)).slice(0, LIMITS.people + 1);
+      const [ctxs, bctx] = cand.length ? await Promise.all([registry.accessContexts(refs, { users }), registry.accessContext({ type: "board", id: m.row.id }, { users })]) : [new Map(), null];
+      const t = now(), own = ownLadder(m.access);
+      const ok = cand.filter(s => { const c = ctxs.get(key(s)); return c && bctx?.board && !raisesAbove(bctx, c, identity, own, own, t); });
       return { board: { id: m.row.id, title: m.row.title }, from: from ?? { hidden: true }, destinations: ok.slice(0, LIMITS.destinations), more: picked.more || ok.length > LIMITS.destinations };
     },
 

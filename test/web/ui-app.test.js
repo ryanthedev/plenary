@@ -1389,6 +1389,18 @@ test("#91 board page: a move after which the route refuses the mover takes the M
   expect(moveBtn()).toBeUndefined(); expect(moveItem()).toBeUndefined();
 });
 
+test("#91 board page: after a refusal hid Move, the next welcome that says can.move (a reconnect) offers it again", async () => {
+  const mp = movePort();
+  rig = setup({ move: mp.move, wrap: canMoveWelcome(true) }); await flush(); rig.step(2);
+  const orig = mp.move.port.move;
+  mp.move.port.move = async (...a) => { const r = await orig(...a); mp.st.optionsError = "forbidden"; return r; };
+  await doMove();
+  expect(moveBtn()).toBeUndefined();
+  mp.st.optionsError = null;
+  rig.S.reconnect(); rig.step(30); await flush(); rig.step(2);
+  expect(moveBtn()).toBeTruthy();
+});
+
 test("#91 board page: closing the dialog returns focus to a visible Move control", async () => {
   const mp = movePort();
   rig = setup({ move: mp.move, wrap: canMoveWelcome(true) }); await flush(); rig.step(2);

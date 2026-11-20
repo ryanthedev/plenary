@@ -6,7 +6,7 @@
 // resolver's answer (`move` on the board, `board.create` at the destination), never a role name. Names are access (#51): a person, Team or container the caller may not see is never named.
 
 import { AdminError } from "../admin/boards.js";
-import { isUnitAdmin, resolveAccess, movedContext } from "./resolver.js";
+import { isUnitAdmin, resolveAccess, movedContext, mayMove } from "./resolver.js";
 import { roleDef, withinLadder, UNIT_ROLES } from "./permissions.js";
 import { LADDER_NAMES } from "./explain.js";
 import { capTo, higher, ROLES, INVITE_ROLES } from "./util.js";
@@ -59,7 +59,7 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
     const id = idOf(boardId);
     if (!id) throw refused();                                   // malformed: nothing to read (the id is not an existence oracle)
     const [unit, row, access] = await Promise.all([tenancy.tenantOf(identity), registry.board(id), tenancy.effective(identity, id, { uniform: true })]);
-    if (!unit || !row || row.tenant !== unit.id || !access.permissions.has("move")) throw refused();
+    if (!unit || !row || row.tenant !== unit.id || !mayMove(access)) throw refused();   // the one rule the welcome and the cards use too
     return { unit, row, access, admin: isUnitAdmin(unit, identity) };
   }
   /** Rules 2 to 4 for one destination: its row, the caller's access and its context; else `forbidden`. */

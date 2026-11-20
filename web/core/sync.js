@@ -96,6 +96,7 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
   let limited = null;             // the room's message, from the cap's refusal until the next welcome
   let nextTryAt = null;           // when the backoff reopens (now()-based), while one is armed
   let roleSeen = null;            // the last non-null welcome.role: kept across resyncs (set before status fires)
+  let welcomeCount = 0;           // welcomes received, one per connection (a page acts on every one, not only on a change of what it said)
   let moveSeen = false;           // the last welcome's `can.move` (the move permission as a Unit member): Move to…
   let shareSeen = false;          // the last welcome's `can.share` (members.manage on the board): the Share button
   let roleTold = null;            // the last role reported through onRoom
@@ -182,7 +183,9 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
     const was = msg?.t === "error" && msg.id !== undefined ? replica.pending.get(msg.id) : null;
     const refusedRecord = was?.stream === "records" && !["stale", "unavailable", "auth", "version", "stale-setting"].includes(msg.code)
       ? { op: clone(was.op), code: msg.code, message: typeof msg.message === "string" ? msg.message : "" } : null;
+    const wasWelcomed = replica.welcomed;
     const did = replica.receive(msg);
+    if (!wasWelcomed && replica.welcomed) welcomeCount++;
     noteSequenced(did);
     // Who and what the room says this link is, before any status change reports it (the session reads them then).
     if (replica.role) { roleSeen = replica.role; shareSeen = replica.canShare === true; moveSeen = replica.canMove === true; }
@@ -255,6 +258,8 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
     get canShare() { return shareSeen; },
     /** Did the last welcome say the person may move the board (`can.move`)? */
     get canMove() { return moveSeen; },
+    /** How many welcomes this link has had. */
+    get welcomes() { return welcomeCount; },
     /** How many hellos this link has sent (each connect, whatever started it). */
     get hellos() { return hellos; },
     /** This link's wire client id (hello.client = the name plus the Replica's session part): presence names it. */

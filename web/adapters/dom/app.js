@@ -349,7 +349,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // (`denied`: a 403 or 404 after a move or an Undo; a new welcome that says `can.move` clears it). The Space shown beside the board name is read from that route's `from`, only by a person
   // the welcome let move, once the welcome has come and again after a move or an Undo. A failed read leaves the item in place and the name unshown. `moveGen` drops an outdated answer.
   const moveInfo = { space: null, denied: false };
-  let moveGen = 0, moveWelcomed = false, booted = false;
+  let moveGen = 0, moveWelcomed = false, booted = false, moveSeenWelcome = -1;
   const canMove = () => !!move && S.canMove === true && !moveInfo.denied;
   const refreshMove = () => {
     if (!move || S.canMove !== true) return Promise.resolve();
@@ -364,7 +364,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   /** After every session change: a welcome that newly says can.move clears a refusal and reads the Space once. */
   syncMove = () => {
     if (!booted || !move) return;
-    if (S.canMove === true && !moveWelcomed) { moveWelcomed = true; moveInfo.denied = false; refreshMove(); }
+    // Every welcome that says can.move clears an earlier refusal (a reconnect after a 403 offers Move again) and reads the Space.
+    if (S.canMove === true && (!moveWelcomed || S.welcomes !== moveSeenWelcome)) { moveWelcomed = true; moveSeenWelcome = S.welcomes; moveInfo.denied = false; chromeDirty = true; refreshMove(); }
     else if (S.canMove !== true && moveWelcomed) { moveWelcomed = false; moveInfo.space = null; chromeDirty = true; }
   };
   // Escape and Cancel return focus to a control that is on screen at this width (the chrome is rebuilt meanwhile): the Move or Share button, else the More button.

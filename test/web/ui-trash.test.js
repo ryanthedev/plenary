@@ -4,7 +4,7 @@ import { test, expect, beforeEach, afterEach } from "bun:test";
 import { FakeElement, installDom, textOf } from "./collab/fake-dom.js";
 import { showTrashToast } from "../../web/adapters/dom/toast.js";
 import { mountTrashPage, mountTrashNotice } from "../../web/adapters/dom/trash.js";
-import { createTrashModel, createNoticeModel, createTrashUndo, daysText, fromText, failText, restoredText } from "../../web/core/trash.js";
+import { createTrashModel, createNoticeModel, createTrashUndo, daysText, fromText, failText, restoredText, boardName } from "../../web/core/trash.js";
 import { announced } from "../../web/adapters/dom/focus.js";
 import { virtualClock } from "../../web/adapters/clock/virtual.js";
 
@@ -271,4 +271,13 @@ test("#54 wording: a restore into the personal space says where it went (toast a
   await notice.load();
   await notice.restore();
   expect(notice.state.message).toBe("Restored Roadmap to your personal space.");
+});
+
+test("a hidden title shows the placeholder, never 'Untitled' or a blank, on the Trash page and in the notice; an empty title is still Untitled", async () => {
+  const { title, ...hidden } = BOARD;
+  await page([hidden]);
+  expect(textOf(rows()[0])).toContain("a board you can't open");
+  expect(btn("Restore a board you can't open")).toBeDefined();
+  expect(boardName(undefined)).toBe("a board you can't open"); expect(boardName("")).toBe("Untitled"); expect(boardName("Roadmap")).toBe("Roadmap");
+  expect(restoredText(boardName(undefined))).toBe("Restored a board you can't open.");
 });

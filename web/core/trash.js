@@ -24,7 +24,9 @@ const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 /** "28 days left", "1 day left", "Due to be deleted soon" once the 30 days are over and the purge has not run yet. */
 export const daysText = n => (n > 0 ? `${plural(n, "day")} left` : "Due to be deleted soon");
 /** The toast's sentence and the live region's. */
-export const trashedText = title => `Moved ${title || "Untitled"} to Trash.`;
+/** What a board is called on this page: its title, "Untitled" when it has none, or a placeholder when the server hid the title (the caller could not open the board). */
+export const boardName = title => (title === undefined ? "a board you can't open" : title || "Untitled");
+export const trashedText = title => `Moved ${boardName(title)} to Trash.`;
 export const trashedSpaceText = (name, boards) => `Moved ${name} to Trash${boards ? ` with ${plural(boards, "board")}` : ""}.`;
 export const restoredText = (name, to = null) => `Restored ${name || "Untitled"}${to ? ` to ${to.personal ? "your personal space" : to.name}` : ""}.`;
 
@@ -90,7 +92,7 @@ export function createTrashModel({ api, newKey = null }) {
       const at = S.items.indexOf(item);
       S.items = S.items.filter(i => i !== item);
       S.next = S.items[Math.min(at, S.items.length - 1)] ?? null;
-      S.said = restoredText(item.type === "board" ? item.title : item.name, r.result?.movedTo ?? null); emit();
+      S.said = restoredText(item.type === "board" ? boardName(item.title) : item.name, r.result?.movedTo ?? null); emit();
       return true;
     },
   };
@@ -125,7 +127,7 @@ export function createNoticeModel({ api, board, newKey = null }) {
       const r = viaSpace && !n.canRestore ? await api.restoreSpace(n.via.space.id, key) : await api.restore(board, key);
       S.busy = false;
       if (r.error) { S.message = failText(r.error); emit(); return false; }
-      key = null; S.status = "restored"; S.message = restoredText(n.board.title, r.result?.movedTo ?? n.into ?? null); emit();
+      key = null; S.status = "restored"; S.message = restoredText(boardName(n.board.title), r.result?.movedTo ?? n.into ?? null); emit();
       return true;
     },
   };

@@ -70,3 +70,12 @@ test("a notice's `into` may have no id yet (the personal space is created on res
   expect((await api(answer(200, { ...NOTICE, into: { id: "bad id", name: "x", personal: true } })).notice("b-1")).notice.into).toBeUndefined();
   expect((await api(answer(200, { ...NOTICE, into: { id: "s-1", name: "x", personal: false } })).notice("b-1")).notice.into).toBeUndefined();
 });
+
+test("a title the server hid stays absent in every shape (list, notice, trash and restore answers), so the page can say 'a board you can't open'", async () => {
+  const hid = o => ({ ...o, board: { id: "b-1", ...(o.board.space ? { space: o.board.space } : {}) } });
+  const f = async (u, i) => answer(200, u === "/trash" ? { items: [{ ...LIST.items[0], title: undefined }], more: false } : u.endsWith("/trash") && !i?.body ? { ...NOTICE, board: { id: "b-1" } } : hid(u.endsWith("/restore") ? RESTORED : TRASHED))();
+  expect((await api(f).list()).list.items[0]).not.toHaveProperty("title");
+  expect((await api(f).notice("b-1")).notice.board).toEqual({ id: "b-1" });
+  expect((await api(f).restore("b-1", "k")).result.board).not.toHaveProperty("title");
+  expect((await api(f).trash("b-1", { from: "s-1" }, "k")).result.board).not.toHaveProperty("title");
+});

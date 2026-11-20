@@ -3,6 +3,8 @@
 
 const ID_RE = /^[\w-]{1,64}$/;
 const isId = v => typeof v === "string" && ID_RE.test(v);
+/** A board title is absent when the server hid it (the caller could not open the board): keep it absent so the page shows the placeholder. */
+const title = v => (typeof v === "string" ? { title: str(v) } : {});
 const str = (v, max = 200) => (typeof v === "string" ? v.slice(0, max) : "");
 const ms = v => (Number.isFinite(v) && v >= 0 ? v : null);
 const days = v => (Number.isSafeInteger(v) && v >= 0 && v <= 3650 ? v : null);
@@ -16,13 +18,13 @@ const group = g => (g && typeof g === "object" && isId(g.id) ? { id: g.id, name:
 export function normalizeTrashed(b) {
   const sp = b?.board?.space;
   if (!b || typeof b !== "object" || !isId(b.board?.id) || !isId(sp?.id) || typeof b.trashed !== "boolean") return null;
-  return { board: { id: b.board.id, title: str(b.board.title), space: { id: sp.id, name: str(sp.name) } }, trashed: b.trashed, trashedAt: ms(b.trashedAt), expiresAt: ms(b.expiresAt), undo: b.undo?.restore === true ? { restore: true } : null };
+  return { board: { id: b.board.id, ...title(b.board.title), space: { id: sp.id, name: str(sp.name) } }, trashed: b.trashed, trashedAt: ms(b.trashedAt), expiresAt: ms(b.expiresAt), undo: b.undo?.restore === true ? { restore: true } : null };
 }
 /** @returns {import("../../ports/trash.js").RestoreResult | null} */
 export function normalizeRestored(b) {
   const sp = b?.board?.space;
   if (!b || typeof b !== "object" || !isId(b.board?.id) || !isId(sp?.id) || typeof b.restored !== "boolean") return null;
-  return { board: { id: b.board.id, title: str(b.board.title), space: { id: sp.id, name: str(sp.name) } }, restored: b.restored, ...(space(b.movedTo) ? { movedTo: space(b.movedTo) } : {}) };
+  return { board: { id: b.board.id, ...title(b.board.title), space: { id: sp.id, name: str(sp.name) } }, restored: b.restored, ...(space(b.movedTo) ? { movedTo: space(b.movedTo) } : {}) };
 }
 /** @returns {import("../../ports/trash.js").SpaceResult | null} */
 export function normalizeSpace(b) {
@@ -35,13 +37,13 @@ export function normalizeNotice(b) {
   if (!b || typeof b !== "object" || !isId(b.board?.id) || typeof b.canRestore !== "boolean" || days(b.daysLeft) === null) return null;
   const from = b.from && typeof b.from === "object" ? { space: space(b.from.space), group: group(b.from.group) } : null;
   const via = b.via && typeof b.via === "object" ? { space: group(b.via.space), canRestore: b.via.canRestore === true } : null;
-  return { board: { id: b.board.id, title: str(b.board.title) }, trashedAt: ms(b.trashedAt), expiresAt: ms(b.expiresAt), daysLeft: b.daysLeft, canRestore: b.canRestore,
+  return { board: { id: b.board.id, ...title(b.board.title) }, trashedAt: ms(b.trashedAt), expiresAt: ms(b.expiresAt), daysLeft: b.daysLeft, canRestore: b.canRestore,
     ...(into(b.into) ? { into: into(b.into) } : {}), ...(person(b.by) ? { by: person(b.by) } : {}), ...(from ? { from } : {}), ...(via ? { via } : {}) };
 }
 const item = i => {
   if (!i || typeof i !== "object" || days(i.daysLeft) === null || !isId(i.id)) return null;
   const base = { id: i.id, by: person(i.by), trashedAt: ms(i.trashedAt), expiresAt: ms(i.expiresAt), daysLeft: i.daysLeft };
-  if (i.type === "board") return { type: "board", title: str(i.title), from: { space: space(i.from?.space), group: group(i.from?.group) }, ...base };
+  if (i.type === "board") return { type: "board", ...title(i.title), from: { space: space(i.from?.space), group: group(i.from?.group) }, ...base };
   if (i.type === "space") return { type: "space", name: str(i.name), group: group(i.group), boards: Number.isSafeInteger(i.boards) && i.boards >= 0 ? i.boards : 0, ...base };
   return null;
 };

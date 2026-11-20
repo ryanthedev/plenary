@@ -465,3 +465,61 @@ describe("restore does not launder the tier; move routes enforce rule 2 and leak
     expect((await api("chiefP", `/boards/${diary.id}/move`, "POST", { from: adaSp.id, to: quiet.id })).status).toBe(200);
   });
 });
+
+describe("round 5: restore gain check with an existing personal space, Trash titles, board create needs the Space open", () => {
+  const trashRoadmap = async () => {
+    expect((await api("ada", `/boards/${roadmap.id}/trash`, "POST", { from: designSp.id })).status).toBe(200);
+  };
+  test("B1: restoring into an EXISTING personal space is still gain-checked: cy with a {viewer, delete} Space role gets 409 would-escalate, the board stays in Trash and cy holds no role", async () => {
+    const janitor = await r.createRole({ tenant: acme.id, name: "Janitor", boardRole: "viewer", permissions: ["delete"] });
+    await r.setScopedGrant({ scope: { type: "space", id: designSp.id }, subject: { type: "user", id: "dev:cy" }, role: janitor.id });
+    await r.ensurePersonalSpace(acme.id, "dev:cy");
+    await trashRoadmap();
+    expect((await api("ada", `/spaces/${designSp.id}/trash`, "POST", {})).status).toBe(200);
+    for (const withTier of [false, true]) {
+      if (withTier) await hold("cy", "content-admin");
+      const res = await api("cy", `/boards/${roadmap.id}/restore`, "POST", {});
+      expect([withTier, res.status, res.json?.error]).toEqual([withTier, 409, "would-escalate"]);
+    }
+    expect((await r.board(roadmap.id)).trashedAt).not.toBe(null);
+    expect((await api("cy", `/boards/${roadmap.id}`)).status).not.toBe(200);
+  });
+  test("B1 positive: the owner restoring with an existing personal space is restored into it", async () => {
+    const adaOwn = adaSp;
+    await trashRoadmap();
+    expect((await api("ada", `/spaces/${designSp.id}/trash`, "POST", {})).status).toBe(200);
+    const res = await api("ada", `/boards/${roadmap.id}/restore`, "POST", {});
+    expect(res.status).toBe(200);
+    expect(res.json.movedTo).toEqual({ id: adaOwn.id, name: adaOwn.name, personal: true });
+    expect((await r.board(roadmap.id)).space).toBe(adaOwn.id);
+  });
+  test("M1: a manage-only admin sees no board title in Trash (trash answer, list, notice, restore answer); the owner sees it everywhere", async () => {
+    const body = res => JSON.stringify(res.json ?? "");
+    const t = await api("low", `/boards/${roadmap.id}/trash`, "POST", { from: designSp.id });
+    expect(t.status).toBe(200);
+    expect(t.json.board).toEqual({ id: roadmap.id, space: { id: designSp.id } });
+    expect(body(t)).not.toContain("Roadmap");
+    const list = await api("low", "/trash");
+    expect(list.json.items.find(i => i.id === roadmap.id)).toBeDefined();
+    expect(body(list)).not.toContain("Roadmap");
+    const notice = await api("low", `/boards/${roadmap.id}/trash`);
+    expect(notice.status).toBe(200);
+    expect(notice.json.board).toEqual({ id: roadmap.id });
+    expect(body(notice)).not.toContain("Roadmap");
+    expect((await api("ada", "/trash")).json.items.find(i => i.id === roadmap.id).title).toBe("Roadmap");
+    expect((await api("ada", `/boards/${roadmap.id}/trash`)).json.board.title).toBe("Roadmap");
+    const back = await api("low", `/boards/${roadmap.id}/restore`, "POST", {});
+    expect(back.status).toBe(200);
+    expect(back.json.board.title).toBeUndefined();
+    expect(body(back)).not.toContain("Roadmap");
+    const own = await api("ada", `/boards/${roadmap.id}/trash`, "POST", { from: designSp.id });
+    expect(own.json.board.title).toBe("Roadmap");
+    expect((await api("ada", `/boards/${roadmap.id}/restore`, "POST", {})).json.board.title).toBe("Roadmap");
+  });
+  test("LOW-2: a manage-only admin cannot create a board in a Space it cannot open, by id; the owner and a content.shared holder can", async () => {
+    const secret = await r.createSpace({ tenant: acme.id, name: "Hidden vault", generalRole: null, owner: "dev:ada" });
+    const res = await api("low", "/boards", "POST", { title: "Sneak", space: secret.id });
+    expect([res.status, JSON.stringify(res.json)]).toEqual([403, '{"error":"forbidden"}']);
+    expect((await api("ada", "/boards", "POST", { title: "Fine", space: secret.id })).status).toBe(201);
+  });
+});

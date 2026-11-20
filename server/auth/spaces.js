@@ -211,10 +211,10 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
     if (!may(access, "space.create")) throw refused();
     return { g, access };
   }
-  /** The `board.create` check of POST /boards at a Space (personal ones are their owner's alone). Shared with the replay of a keyed create. */
+  /** The `board.create` check of POST /boards at a Space: the caller must open it (a manage-only admin who merely knows a Space id gets nothing), and personal ones are their owner's alone. Shared with the replay of a keyed create. */
   const boardCreateAccess = async (identity, unit, space) => {
     const sc = await scopeOf(identity, unit, "space", space);
-    if (!sc || !createsBoards(sc.access) || (sc.row.kind === "personal" && sc.row.owner !== identity.user)) throw refused();
+    if (!sc || !opens(sc.access) || !createsBoards(sc.access) || (sc.row.kind === "personal" && sc.row.owner !== identity.user)) throw refused();
     return sc;
   };
 

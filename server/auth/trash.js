@@ -59,7 +59,8 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
     return id => (id ? { id, name: out.get(id) ?? plainName(id) } : null);
   }
   const clockOf = at => ({ trashedAt: at, expiresAt: at + TRASH.ttlMs });
-  const boardOut = (row, space) => ({ id: row.id, title: row.title, space });
+  /** The board as the caller may name it: its title only if they could open it before it went to Trash (names are access, #51); a manager who could not gets `{ id }`. */
+  const boardOut = (row, space, access) => ({ id: row.id, ...(could(access) ? { title: row.title } : {}), space });
   /** The count a keyed Space call stored in its ref (`<space>:trashed:<n>`, `<space>:restored:<n>`); 0 for an older or a no-op ref. */
   const countOf = ref => Number(/:(?:trashed|restored):(\d+)$/.exec(String(ref))?.[1] ?? 0);
   /**
@@ -92,14 +93,14 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
       const d = await deleter(identity, boardId);
       let out;
       try { out = await registry.trashBoard({ board: d.row.id, from, by: identity.user, idem }); } catch (e) { throw asAdminError(e); }
-      return { board: boardOut(out.board, await spaceView(identity, from)), trashed: out.trashed, ...clockOf(out.board.trashedAt), undo: out.trashed ? { restore: true } : null };
+      return { board: boardOut(out.board, await spaceView(identity, from), d.access), trashed: out.trashed, ...clockOf(out.board.trashedAt), undo: out.trashed ? { restore: true } : null };
     },
     /** The replay of a keyed trash: the caller still holds `delete` (the resolver keeps it on a trashed board). `ref` is `<board>:trashed` or `<board>:noop`. */
     async replayTrash(identity, boardId, { from } = {}, ref = "") {
       const d = await deleter(identity, boardId);
       if (d.row.trashedAt == null) throw new AdminError("moved", "the board has been restored since");
       const trashed = String(ref).endsWith(":trashed");
-      return { board: boardOut(d.row, await spaceView(identity, idOf(from) ?? d.row.space)), trashed, ...clockOf(d.row.trashedAt), undo: trashed ? { restore: true } : null };
+      return { board: boardOut(d.row, await spaceView(identity, idOf(from) ?? d.row.space), d.access), trashed, ...clockOf(d.row.trashedAt), undo: trashed ? { restore: true } : null };
     },
 
     /** POST /boards/:board/restore (needs `delete` on the board). */
@@ -119,12 +120,12 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
         try { out = await go(dest); } catch (e2) { throw e2 instanceof AdminError ? e2 : asAdminError(e2); }
       }
       const moved = !!dest && out.restored;   // the answer says where it went: the caller's own personal space, which they may name
-      return { board: boardOut(out.board, await spaceView(identity, out.board.space)), restored: out.restored, ...(moved ? { movedTo: { id: dest.space.id, name: dest.space.name, personal: true } } : {}) };
+      return { board: boardOut(out.board, await spaceView(identity, out.board.space), d.access), restored: out.restored, ...(moved ? { movedTo: { id: dest.space.id, name: dest.space.name, personal: true } } : {}) };
     },
     async replayRestore(identity, boardId, ref = "") {
       const d = await deleter(identity, boardId);
       if (d.row.trashedAt != null) throw new AdminError("moved", "the board has been trashed since");
-      return { board: boardOut(d.row, await spaceView(identity, d.row.space)), restored: String(ref).endsWith(":restored") };
+      return { board: boardOut(d.row, await spaceView(identity, d.row.space), d.access), restored: String(ref).endsWith(":restored") };
     },
 
     /** POST /spaces/:space/trash: the Space and every live board in it, atomically; then every board re-checks (closing open sockets). */
@@ -166,7 +167,7 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
       const manage = access.permissions.has("delete") && !!row;
       if (!unit || !row || row.tenant !== unit.id || !access.trashed || !(manage || could(access))) throw refused();
       const t = now(), withSpace = row.trashedWith != null;
-      const out = { board: { id: row.id, title: row.title }, ...clockOf(access.trashed.at), daysLeft: daysLeft(access.trashed.at, t), canRestore: manage && !withSpace };
+      const out = { board: { id: row.id, ...(could(access) ? { title: row.title } : {}) }, ...clockOf(access.trashed.at), daysLeft: daysLeft(access.trashed.at, t), canRestore: manage && !withSpace };
       if (out.canRestore) {
         const dest = await destination(identity, { unit, row, access });
         if (dest) { out.canRestore = dest.ok; if (dest.ok) out.into = dest.space ? { id: dest.space.id, name: dest.space.name, personal: true } : { id: null, name: null, personal: true }; }
@@ -205,7 +206,7 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
           const f = got.get(b.id);
           if (!f?.access.trashed || !f.access.permissions.has("delete")) continue;   // a personal space's boards come with `delete` only for those the resolver lets in (never a manage-only admin)
           if (items.length >= LIMITS.items) { more = true; break; }
-          items.push({ type: "board", id: b.id, title: b.title, from: { space: f.spaceOpen && f.space ? { id: f.space.id, name: f.space.name, personal: f.space.kind === "personal" } : null, group: f.groupOpen && f.group ? { id: f.group.id, name: f.group.name } : null },
+          items.push({ type: "board", id: b.id, ...(could(f.access) ? { title: b.title } : {}), from: { space: f.spaceOpen && f.space ? { id: f.space.id, name: f.space.name, personal: f.space.kind === "personal" } : null, group: f.groupOpen && f.group ? { id: f.group.id, name: f.group.name } : null },
             by: b.trashedBy, trashedAt: b.trashedAt });
           who.push(b.trashedBy);
         }

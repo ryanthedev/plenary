@@ -6,7 +6,7 @@
 import { h, replace } from "./dom.js";
 import { announce } from "./focus.js";
 import { shell, message } from "./spaces.js";
-import { daysText, fromText, groupText, EMPTY } from "../../core/trash.js";
+import { daysText, fromText, groupText, boardName, EMPTY } from "../../core/trash.js";
 
 const NOTES = { forbidden: "You can't see the Trash.", "signed-out": "You are signed out. Sign in again to see the Trash." };
 
@@ -21,7 +21,7 @@ export function mountTrashPage({ root, model, hrefs, signIn = null }) {
   let h1 = null, after = null;
   const buttons = new Map();
   const row = item => {
-    const board = item.type === "board", title = board ? item.title || "Untitled" : item.name;
+    const board = item.type === "board", title = board ? boardName(item.title) : item.name;
     const where = board ? fromText(item.from) : [groupText(item.group), item.boards ? `${item.boards} board${item.boards === 1 ? "" : "s"} went with it` : "no boards in it"].filter(Boolean).join(" · ");
     const btn = h("button.btn", { type: "button", "aria-label": `Restore ${board ? "" : "Space "}${title}`, "aria-disabled": S.busy === item.id ? "true" : null, "data-fk": `restore:${item.id}`,
       onclick: e => { if (e.currentTarget.getAttribute("aria-disabled") === "true") { e.preventDefault?.(); return; } model.restore(item); } }, S.busy === item.id ? "Restoring…" : "Restore");
@@ -75,7 +75,7 @@ export function mountTrashNotice({ host, model, homeHref, onRestored = () => {} 
     const lines = [];
     if (S.status === "restored") lines.push(h("p", {}, S.message));
     else {
-      lines.push(h("p", {}, `${n.board.title || "Untitled"}: ${daysText(n.daysLeft)} before it is deleted for good.`));
+      lines.push(h("p", {}, `${boardName(n.board.title)}: ${daysText(n.daysLeft)} before it is deleted for good.`));
       if (n.by) lines.push(h("p", {}, `Deleted by ${n.by.name}${n.from ? ` from ${fromText(n.from)}` : ""}.`));
       if (n.via) lines.push(h("p", {}, n.via.space ? `It went to Trash with its Space, ${n.via.space.name}.` : "It went to Trash with its Space."));
       if (!can) lines.push(h("p", {}, "Ask someone who can restore it. Its access, invites and links come back with it."));

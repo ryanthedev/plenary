@@ -124,6 +124,30 @@ describe("who may reassign (permissions, never role names)", () => {
       expect(await r.scopedGrant({ type: "space", id: samSpace.id }, { type: "user", id: ada.user })).toBe("owner");
       expect((await ten.effective(ada, secret.id)).ladder).toBe("owner");
     });
+    test("row 66: a Unit member role with a boardRole, or a Unit-scope custom-role grant with one, reaches nobody's personal-space boards; only the owner, board-level sources and content-access admins do", async () => {
+      await r.updateRole(acme.id, "member", { boardRole: "viewer", permissions: [] });
+      expect(await ten.role(bob, secret.id)).toBe(null);                                         // Bob: plain member, member role viewer
+      expect(await ten.role(bob, noted.id)).toBe("viewer");                                      // ... still reaches a shared Space's boards via the member role / general access
+      expect((await manageOnly.effective(root, secret.id)).ladder).toBe(null);                  // a manage-only admin: nothing
+      const role = await r.createRole({ tenant: acme.id, name: "Wide", boardRole: "editor", permissions: ["members.manage"] });
+      await r.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: cy.user }, role: role.id });
+      expect(await ten.role(cy, secret.id)).toBe(null);                                          // a Unit-scope custom role with a boardRole
+      expect(await ten.role(cy, noted.id)).not.toBe(null);
+      expect(await ten.role(sam, secret.id)).toBe("owner");                                      // the owner
+      expect(await ten.role(kim, secret.id)).toBe("editor");                                     // a board-level grant (a guest)
+      expect(await ten.role(root, secret.id)).toBe("owner");                                     // a content-access admin
+      expect((await ten.effective(bob, { type: "space", id: samSpace.id })).ladder).toBe(null);  // and the space itself
+      const bobAt = (await manageOnly.effective(bob, secret.id)).permissions;
+      expect([...bobAt].filter(p => ["view", "comment", "edit"].includes(p))).toEqual([]);
+    });
+    test("row 66: in that config a manage-only admin still cannot hand the personal space over, a content-access admin can", async () => {
+      await r.updateRole(acme.id, "member", { boardRole: "editor", permissions: [] });
+      await moveAll2(mo());
+      expect(await code(mo().remove(root, sam.user, { to: ada.user }))).toBe("forbidden");
+      expect((await r.memberState(acme.id, sam.user)).removed).toBe(false);
+      await moveAll(ada.user);
+      expect(await code(off.remove(root, sam.user, { to: ada.user }))).toBe(null);
+    });
     test("a live member's personal space can never be reassigned on its own, by anyone, even with content access", async () => {
       expect(await code(off.reassign(root, sam.user, { type: "space", id: samSpace.id, to: ada.user }))).toBe("personal");
       expect(await r.scopedGrant({ type: "space", id: samSpace.id }, { type: "user", id: ada.user })).toBe(null);

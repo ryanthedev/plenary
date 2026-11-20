@@ -22,6 +22,8 @@ const userIdOf = v => (typeof v === "string" && v.length > 0 && v.length <= 200 
 const plainName = id => String(id).replace(/^[a-z]+:/, "");
 const TYPES = ["space", "group"];
 const NO_ROLES = new Map();
+/** Board-content access on a Space: the permission to VIEW its boards (`board.view`), which only its owner, or a Unit admin with board-content access, holds on a personal space (the resolver gives a Unit-wide role nothing there). */
+const openable = a => !!a && a.ladder != null && a.permissions.has("board.view");
 const cursorOf = v => { if (v == null) return null; if (typeof v !== "string" || v.length > 200 || !/^(space|group)\n[\w-]{1,64}$/.test(v)) throw bad("bad cursor"); return v; };
 
 /**
@@ -103,7 +105,7 @@ export function offboardService({ registry, tenancy, announce = () => {}, manage
         const { type, id } = page.items[k], row = rows[k];
         if (!row) continue;                                                     // purged between the two reads
         const a = access.get(type + "\n" + id), v = itemView(type, row, leaver);
-        const may = !v.personal && !!grantable(a, "owner", type, NO_ROLES, admin), handover = v.personal && (a?.ladder ?? null) != null && !!grantable(a, "owner", type, NO_ROLES, admin);
+        const may = !v.personal && !!grantable(a, "owner", type, NO_ROLES, admin), handover = v.personal && openable(a) && !!grantable(a, "owner", type, NO_ROLES, admin);
         if (type === "space") {                                                 // a COUNT of boards, never a title: a manage-only admin may not read what is in a personal space
           const b = await registry.boardsIn({ type: "space", id }, { limit: LIMITS.boards + 1, withTrashed: true });
           v.boards = Math.min(b.ids.length, LIMITS.boards); v.boardsCapped = b.ids.length > LIMITS.boards;
@@ -161,7 +163,7 @@ export function offboardService({ registry, tenancy, announce = () => {}, manage
       let handover;
       if (personal && !leaver.removed) {
         const access = await tenancy.effective(identity, { type: "space", id: personal.id });
-        if ((access.ladder ?? null) == null || !grantable(access, "owner", "space", NO_ROLES, admin)) throw refused();
+        if (!openable(access) || !grantable(access, "owner", "space", NO_ROLES, admin)) throw refused();
         const to = userIdOf(body?.to), rec = to && await registry.memberState(unit.id, to);
         if (!rec || rec.removed || to === leaver.user) throw bad("the new owner of their personal space must be another live member of the Unit", "bad-recipient");
         handover = { to, name: `${leaver.name}'s space (archived)`.slice(0, 200) };

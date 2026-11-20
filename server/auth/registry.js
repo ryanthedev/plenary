@@ -64,7 +64,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
   const countedOwners = (type, id) => [...(scoped.get(sk(type, id)) ?? [])]
     .filter(([k, role]) => role === "owner" && (k.startsWith("user\n") || (members.get(k.slice(5))?.size ?? 0) > 0)).map(([k]) => k);
   /** Rejects (nothing written) when `user` is a person the Unit has removed (PROTOCOL.md § Leaver offboarding). */
-  const noRemoved = (tenant, user, _grant) => { if (user != null && directory.get(tenant)?.get(String(user))?.removedAt != null) throw new RegistryError("removed", "registry: the member was removed from the Unit"); };
+  const noRemoved = (tenant, user) => { if (user != null && directory.get(tenant)?.get(String(user))?.removedAt != null) throw new RegistryError("removed", "registry: the member was removed from the Unit"); };
   /**
    * Does `user` solely own this Group or Space? They hold an owner grant (their own, or a Team's they are in), and no other counted owner would be left once they go: no other
    * person owner, and no Team owner with a member besides them (PROTOCOL.md § Leaver offboarding).
@@ -406,7 +406,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
     async setTeamMember(team, user, member) {
       need(teams.has(team), "team");
       const set = members.get(team), u = String(user);
-      if (member) { noRemoved(teams.get(team).tenant, u, true); set.add(u); return; }
+      if (member) { noRemoved(teams.get(team).tenant, u); set.add(u); return; }
       // Removing the last member of a Team that is the only counted owner of a Group or Space would leave it ownerless.
       if (set.size === 1 && set.has(u)) for (const [k, g] of scoped) {
         const [type, ...id] = k.split("\n");
@@ -482,7 +482,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const { type, id } = orgDefaults.scope(scope), sub = orgDefaults.subject(subject), r = orgDefaults.grantRole(role);
       need(scopeTenant(type, id) != null, "scope");
       if (isCustomRoleId(r) && !roles.get(scopeTenant(type, id))?.has(r)) throw new RegistryError("no-role", "no such custom role in this Unit");
-      if (sub.type === "user" && r != null) noRemoved(scopeTenant(type, id), sub.id, true);
+      if (sub.type === "user" && r != null) noRemoved(scopeTenant(type, id), sub.id);
       if (sub.type === "team") need(teams.get(sub.id)?.tenant === scopeTenant(type, id), "team");
       if (type === "board" && sub.type === "user") throw new Error("registry: a user's grant on a board is setGrant");
       const g = scoped.get(sk(type, id));

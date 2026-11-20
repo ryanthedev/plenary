@@ -7,7 +7,7 @@
 // no meaning is carried by colour alone.
 
 import { h, replace } from "./dom.js";
-import { announce } from "./focus.js";
+import { announce, captureFocus, restoreFocus } from "./focus.js";
 import { openDialog } from "./dialogs.js";
 import { shell, showNotice, message } from "./spaces.js";
 import { act, setOff, speak } from "./access.js";
@@ -27,16 +27,16 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
   const openerOf = k => ({ focus: () => keeper(k)?.focus?.() });
 
   const searchBox = (label, run, results, pick, id) => {
-    const input = h("input.field", { type: "search", id, maxlength: "100", autocomplete: "off", "aria-label": label });
+    const input = h("input.field", { type: "search", id, "data-fk": `find:${id}`, maxlength: "100", autocomplete: "off", "aria-label": label });
     const form = h("form", { role: "search", "aria-label": label, onsubmit: e => { e.preventDefault?.(); run(input.value); } }, input, h("button.btn", { type: "submit" }, "Search"));
-    const list = results.length ? h("ul.matches", { "aria-label": `${label}: matches` }, results.map(p => h("li", {}, h("button.btn.ghost", { type: "button", onclick: () => pick(p) }, p.name)))) : null;
+    const list = results.length ? h("ul.matches", { "aria-label": `${label}: matches` }, results.map(p => h("li", {}, h("button.btn.ghost", { type: "button", "data-fk": `match:${id}:${p.id}`, onclick: () => { focusTo = id === "offboard-owner" ? `find:${id}` : "heading"; pick(p); } }, p.name)))) : null;
     return h("div", {}, form, S.searching ? h("p.muted", {}, "Searching…") : list);
   };
 
   function row(i) {
     const to = model.recipientOf(i), res = S.results.get(model.itemKey(i)), people = model.people(), may = i.can.reassign || i.can.handover === true, fk = "pick:" + model.itemKey(i).replace("\n", ":");
     const sel = h("select.field", { "data-fk": fk, "aria-label": `New owner of ${i.name}`, "aria-disabled": may && !S.busy ? "false" : "true",
-      onchange: e => { const p = people.find(x => x.id === e.target.value); if (p && may && !S.busy) { focusTo = () => keeper(fk); model.choose(i, p); } else e.target.value = to.id; } },
+      onchange: e => { const p = people.find(x => x.id === e.target.value); if (p && may && !S.busy) { focusTo = fk; model.choose(i, p); } else e.target.value = to.id; } },
       people.map(p => h("option", { value: p.id, selected: p.id === to.id }, p.id === S.defaults.recipient.id ? `${p.name} (${S.defaults.reason === "manager" ? "their manager" : "you"})` : p.name)));
     return h("tr", {}, h("th", { scope: "row" }, itemLabel(i), " ", h("span.badge", {}, i.type === "group" ? "Group" : i.personal ? "Personal space" : "Space"), i.trashed ? h("span.badge", {}, " In Trash") : null),
       h("td", {}, may ? sel : h("span.muted", {}, i.can.why ?? "You can't hand this on.")),
@@ -49,7 +49,7 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
     if (S.status === "forbidden") return replace(main, message("This is not available.", "Only people who manage members can offboard someone."), h("a.btn", { href: hrefs.home }, "Back to Home"));
     if (S.status === "notfound") return replace(main, message("This person is not available.", "They may never have signed in to this Unit."), h("a.btn", { href: hrefs.home }, "Back to Home"));
     if (S.status === "error") return replace(main, message("Could not load this page.", S.notice ?? "The server did not answer."), h("a.btn", { href: hrefs.home }, "Back to Home"));
-    h1 = h("h1", { id: "page-title", tabindex: "-1" }, "Offboard a member");
+    h1 = h("h1", { id: "page-title", tabindex: "-1", "data-fk": "heading" }, "Offboard a member");
     const crumbs = h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " /");
     const finder = searchBox("Find a person", q => model.search(q), S.found, p => model.open(p.id), "offboard-find");
     if (!S.member) return replace(main, crumbs, h("div.sp-head", {}, h1), h("p.sub-h", {}, "Reassign what they solely own, then remove them. Nothing moves until you confirm."), finder);
@@ -91,10 +91,12 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
   function render() {
     showNotice(status, model);
     const note = S.notice && !S.said;
+    const held = captureFocus([main]);                                            // a redraw replaces every node: focus goes back to the control with the same data-fk
     speak(S, () => { draw(); });
+    restoreFocus(held);
     if (dlg?.progress) dlg.progress.textContent = S.progress ?? "";
     if (!S.confirm && dlg) { dlg = null; }
-    if (focusTo && !S.confirm && !S.busy) { const f = focusTo; focusTo = null; f()?.focus?.(); }
+    if (focusTo && S.status === "ready" && !S.confirm && !S.busy) { const k = focusTo; focusTo = null; keeper(k)?.focus?.(); }
     if (note) status.focus?.();
   }
   const unsub = model.subscribe(render);

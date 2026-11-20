@@ -170,3 +170,29 @@ test("MED-1: after Remove succeeds the Remove button is gone and focus falls bac
   expect(root.contains(a)).toBe(true);
   expect(a.tagName).toBe("H1");
 });
+test("MED-1b: Enter in a search box and Enter on a match keep focus on a live, keyed control of the current page (the owner search keeps it; picking a person lands on the heading)", async () => {
+  const fk = () => globalThis.document.activeElement?.getAttribute?.("data-fk");
+  const live = () => !!globalThis.document.activeElement && root.contains(globalThis.document.activeElement);
+  // "Find a new owner": submit with focus in the input, then press a match
+  await mount();
+  let form = all(e => e.tagName === "FORM" && e.getAttribute("aria-label") === "Find a new owner")[0];
+  let input = all(e => e.tagName === "INPUT", form)[0];
+  input.value = "ad"; input.focus(); form.dispatch("submit"); await settle();
+  expect([live(), fk()]).toEqual([true, "find:offboard-owner"]);
+  const match = all(e => e.tagName === "BUTTON" && textOf(e) === "Ada")[0];
+  expect(match.getAttribute("data-fk")).toBe("match:offboard-owner:google:ada");
+  match.focus(); match.click(); await settle();
+  expect([live(), fk()]).toEqual([true, "find:offboard-owner"]);                    // the picked match is offered in every row now; focus returns to the box
+  // "Find a person": submit keeps the box, picking a match opens the person and lands on the heading
+  const dom = installDom(); root = dom.root;
+  const model = createOffboardModel({ api: { list: async () => page(ITEMS), people: async () => ({ people: [{ id: "google:sam", name: "Sam" }] }) } });
+  mountOffboardPage({ root, model, hrefs: { home: "./" }, signIn: null });
+  form = all(e => e.tagName === "FORM" && e.getAttribute("aria-label") === "Find a person")[0];
+  input = all(e => e.tagName === "INPUT", form)[0];
+  input.value = "sa"; input.focus(); form.dispatch("submit"); await settle();
+  expect([live(), fk()]).toEqual([true, "find:offboard-find"]);
+  const sam = all(e => e.tagName === "BUTTON" && textOf(e) === "Sam")[0];
+  sam.focus(); sam.click(); await settle();
+  expect([live(), fk()]).toEqual([true, "heading"]);
+  expect(globalThis.document.activeElement.tagName).toBe("H1");
+});

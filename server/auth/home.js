@@ -76,7 +76,9 @@ export function homeService({ registry, tenancy, now = Date.now }) {
 
   /** The tree: the Spaces and Groups the person can open boards in. Every step is bounded (module header, PROTOCOL.md § Home). */
   async function tree(identity, unit) {
-    const all = (await tenancy.effective(identity, { type: "unit", id: unit.id })).ladder != null;   // a Unit-level role covers everything inside
+    const ua = await tenancy.effective(identity, { type: "unit", id: unit.id });
+    const all = ua.ladder != null;                                                    // a Unit-level role covers everything inside ... except other people's personal spaces:
+    const allPersonal = ua.sources.some(x => x.scope.type === "unit" && x.kind === "unit" && x.role === "admin" && x.ladder != null);   // only a Unit admin WITH board-content access opens those (TECH-DEBT row 66)
     const cand = await registry.spaceCandidates(unit.id, { user: identity.user, all, limit: LIMITS.spaces });
     const groups = new Map(cand.groups.map(g => [g.id, g]));
     const t = now();
@@ -86,6 +88,7 @@ export function homeService({ registry, tenancy, now = Date.now }) {
     let more = cand.next != null, checks = 0;
     const visible = [], pending = [];
     for (const s of cand.spaces) {
+      if (all && s.kind === "personal" && s.owner !== identity.user && !allPersonal) continue;   // not theirs to open, and not worth a check per personal space
       if (all || general(s, s.group ? groups.get(s.group) ?? null : null)) visible.push(s);
       else if (checks++ < SCAN.grantChecks) pending.push(s);
       else more = true;

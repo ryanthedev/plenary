@@ -36,6 +36,26 @@ describe("a member's place and what they may create (#48)", () => {
   });
 });
 
+describe("TECH-DEBT row 66: a Unit-wide board role reaches no personal space", () => {
+  test("with the member role giving viewer, Home's tree, recent and search show a member nobody else's personal space or its boards; a content-access admin sees them", async () => {
+    const bob = ident("bob"), root = ident("root");
+    await r.updateRole(acme.id, "member", { boardRole: "viewer", permissions: [] });
+    await home.home(ada); await home.home(bob);
+    const diary = await mk((await r.personalSpace(acme.id, ada.user)).id, "Diary entries", { memberRole: null, owner: ada.user });
+    await r.markOpened(bob.user, diary.id);
+    const shared = await r.createSpace({ tenant: acme.id, name: "Team" });
+    const hb = await home.home(bob);
+    expect(hb.tree.spaces.map(s => s.name).sort()).toEqual(["Team", "bob's space"]);
+    expect(ids(hb.recent)).toEqual([]);
+    expect((await home.search(bob, "Diary")).results.map(c => c.id)).toEqual([]);
+    expect((await ten.role(bob, diary.id))).toBe(null);
+    const admin = homeService({ registry: r, tenancy: tenancy({ registry: r, now, adminBoardContent: true }) });
+    expect((await admin.home(root)).tree.spaces.map(s => s.name).sort()).toEqual(["Team", "ada's space", "bob's space", "root's space"]);
+    expect(ids((await admin.search(root, "Diary")).results)).toEqual([diary.id]);
+    expect(shared.id).toBeTruthy();
+  });
+});
+
 describe("access leak: a board the person can't open never appears, however it got into a list", () => {
   test("recent, starred, shared and search all drop a Space board with no access", async () => {
     const open = await r.createSpace({ tenant: acme.id, name: "Open" });

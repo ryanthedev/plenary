@@ -101,6 +101,7 @@ export function resolveAccess({ ctx, grant = null, invites = [], links = [], tea
   const inside = member || admin;
   const myTeams = inside ? teams ?? teamIndex(ctx).get(identity.user) ?? new Set() : new Set();
   const target = board ? "board" : space ? "space" : group ? "group" : "unit";
+  const personal = space?.kind === "personal";
   const visible = new Set([...CONTENT_PERMS, ...ALLOWED_AT[target]]), contentOnly = new Set(CONTENT_PERMS);
   /** The scope chain from the target outward, without the Unit. */
   const chain = [board && { type: "board", id: board.id }, space && { type: "space", id: space.id }, group && { type: "group", id: group.id }].filter(Boolean);
@@ -111,7 +112,10 @@ export function resolveAccess({ ctx, grant = null, invites = [], links = [], tea
     const def = roleDef(role, scope.type, roles, opts);
     if (!def) return;
     const keep = role === MEMBER_ROLE_ID && target !== "unit" ? contentOnly : visible;   // the member role's management permissions are the Unit's own
-    sources.push({ kind, scope, role, ...(team ? { team } : {}), permissions: [...def.permissions].filter(p => keep.has(p)), ladder: def.ladder });
+    // A personal space and its boards are visible only to the owner (a Space-scope source), to board-scope sources (a grant, invite, link) and to a Unit admin WITH board-content access (kind "unit", role admin): a Unit-wide
+    // grant, a Unit Team's grant or the Unit member role gives no board content there, whatever its boardRole (TECH-DEBT row 66; PROTOCOL.md § Organization).
+    const noContent = personal && scope.type === "unit" && (kind !== "unit" || role === MEMBER_ROLE_ID);
+    sources.push({ kind, scope, role, ...(team ? { team } : {}), permissions: [...def.permissions].filter(p => keep.has(p) && !(noContent && contentOnly.has(p))), ladder: noContent ? null : def.ladder });
   };
   /** Grants on a Space, Group or the Unit, or a Team's grant anywhere, count only for the inside; and never the Unit roles `admin` and `member`. */
   const grantsOn = scope => {

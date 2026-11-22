@@ -82,7 +82,10 @@ export function renderPanel(root, ctx) {
   const m = propsModel(ed);
   const dis = !may;
   // `fk` is the control's focus key (web/adapters/dom/focus.js): made of what it changes, never of what it says, so a redraw restores focus to the SAME control.
-  const chip = (txt, on, onclick, title, view = false, fk = null) => h("button.c" + (on ? ".on" : ""), { title, disabled: !view && dis, "data-fk": fk, onclick: () => onclick?.() }, txt);
+  const chip = (txt, on, onclick, title, view = false, fk = null) => {
+    const iconOnly = typeof txt !== "string" && !Array.isArray(txt);
+    return h("button.c" + (on ? ".on" : ""), { title, ...(iconOnly && title ? { "aria-label": title } : {}), disabled: !view && dis, "data-fk": fk, onclick: () => onclick?.() }, txt);
+  };
   const act = fn => S.act(stream, fn);
   const style = patch => act(e => e.setStyle(patch));
   const row = (lab, key, ...opts) => h("div.row", {}, h("span.lab", {}, lab, key ? h("i", {}, key) : null), h("span.opts", {}, ...opts));
@@ -105,6 +108,7 @@ export function renderPanel(root, ctx) {
           type: "button",
           title: `Custom ${lab.toLowerCase()} color`,
           "aria-label": `Custom ${lab.toLowerCase()} color`,
+          "aria-expanded": String(pickerOpen),
           "data-custom-color": prop,
           disabled: dis,
           onclick: () => ctx.setColorPicker?.(pickerOpen ? null : prop),
@@ -258,8 +262,8 @@ export function renderPanel(root, ctx) {
   const sub = { properties: m.count ? `· ${m.count} selected` : "· next shape", frames: `· ${B.frames().length}`, library: `· ${(ctx.library ?? []).length}` };
   const out = [];
   if (!ctx.inSheet) out.push(h("div.panel-head", {},
-    h("button.tb" + (state.mode === "stack" ? ".on" : ""), { title: "Stack", "aria-label": "Stack layout", onclick: () => ctx.setState({ type: "mode", mode: "stack" }) }, icon("stack", { size: 15 })),
-    h("button.tb" + (state.mode === "tabs" ? ".on" : ""), { title: "Tabs", "aria-label": "Tabs layout", onclick: () => ctx.setState({ type: "mode", mode: "tabs" }) }, icon("tabs", { size: 15 })),
+    h("button.tb" + (state.mode === "stack" ? ".on" : ""), { title: "Stack", "aria-label": "Stack layout", "aria-pressed": String(state.mode === "stack"), onclick: () => ctx.setState({ type: "mode", mode: "stack" }) }, icon("stack", { size: 15 })),
+    h("button.tb" + (state.mode === "tabs" ? ".on" : ""), { title: "Tabs", "aria-label": "Tabs layout", "aria-pressed": String(state.mode === "tabs"), onclick: () => ctx.setState({ type: "mode", mode: "tabs" }) }, icon("tabs", { size: 15 })),
     h("button.tb", { title: "Fold all / unfold all", "aria-label": "Fold or unfold all", onclick: () => ctx.setState({ type: "foldAll", folded: state.folded.length < 6 }) }, icon("fold", { size: 15 })),
     h("button.tb", { title: "Reset the panel layout", "aria-label": "Reset panel layout", onclick: () => ctx.setState({ type: "reset" }) }, icon("settings", { size: 15 }))));
   if (tabs) out.push(h("div.tabs", {}, secs.map(s => h("button" + (s.active ? ".on" : ""), { "data-fk": `panel-tab:${s.id}`, onclick: () => ctx.setState({ type: "tab", id: s.id }) }, s.title))));

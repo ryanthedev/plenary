@@ -3,11 +3,9 @@
 // it, and focus goes back to whatever opened it. Text goes in through textContent only (names are other people's words).
 
 import { h, replace } from "./dom.js";
+import { trapFocus } from "./a11y.js";
 import { createNewBoardModel, createNewSpaceModel, createNewGroupModel, GENERAL_CHOICES } from "../../core/spaces.js";
 
-const FOCUSABLE = "button, input, select, textarea, a[href]";
-const focusables = el => (typeof el.querySelectorAll === "function" ? [...el.querySelectorAll(FOCUSABLE)] : el.all().filter(e => /^(BUTTON|INPUT|SELECT|TEXTAREA|A)$/.test(e.tagName)))
-  .filter(e => !e.disabled && !e.hidden);
 let seq = 0;
 
 /** A random Idempotency-Key. `crypto.randomUUID` exists only in secure contexts (plain http to a LAN or 0.0.0.0 has none), so fall back to getRandomValues. */
@@ -23,26 +21,23 @@ export function randomKey(c = globalThis.crypto) {
 export function openDialog({ host, title, body, footer, opener = null, onClose, onSubmit }) {
   const hid = `dlg-title-${++seq}`;
   const form = h("form", { onsubmit: e => { e.preventDefault?.(); onSubmit?.(); } }, h("div.dbody", {}, body), h("footer", {}, footer));
-  const dialog = h("div.dialog.sp-dialog", { role: "dialog", "aria-modal": "true", "aria-labelledby": hid }, h("h2", { id: hid }, title), form);
+  const dialog = h("div.dialog.sp-dialog", { role: "dialog", "aria-modal": "true", "aria-labelledby": hid, tabindex: "-1" }, h("h2", { id: hid }, title), form);
+  let trap = null;
   const veil = h("div.dialog-veil.sp-veil", {
     onclick: e => { if (e.target === e.currentTarget) close(); },
-    onkeydown: e => {
-      if (e.key === "Escape") { e.preventDefault?.(); close(); return; }
-      if (e.key !== "Tab") return;
-      const list = focusables(dialog);
-      if (!list.length) { e.preventDefault?.(); return; }
-      const at = globalThis.document?.activeElement, i = list.indexOf(at);
-      if (e.shiftKey && (i <= 0)) { e.preventDefault?.(); list.at(-1).focus(); }
-      else if (!e.shiftKey && (i === list.length - 1)) { e.preventDefault?.(); list[0].focus(); }
-    },
+    onkeydown: e => trap?.handleKeyDown(e),
   }, dialog);
   let closed = false;
   function close() {
     if (closed) return;
-    closed = true; veil.remove(); onClose?.(); opener?.focus?.();
+    closed = true;
+    trap?.deactivate({ restoreFocus: false });
+    veil.remove();
+    onClose?.();
+    opener?.focus?.();
   }
   host.append(veil);
-  (focusables(dialog)[0] ?? dialog).focus?.();
+  trap = trapFocus(dialog, { onEscape: close, returnFocusTo: opener });
   return { close, el: veil, dialog };
 }
 

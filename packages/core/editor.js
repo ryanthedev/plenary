@@ -853,7 +853,7 @@ export class Editor {
       g.extra = [...ids].filter(id => !this.sel.has(id));
       g.orig = new Map([...ids].map(id => [id, clone(this.doc.get(id))]).filter(([, e]) => e && this.doc.editable(e)));
       g.before = new Map([...g.orig].map(([id, e]) => [id, clone(e)]));
-      g.box = unionBox([...g.orig.values()].filter(e => !isLabel(e)).map(bounds));
+      g.box = unionBox([...g.orig.values()].filter(e => !isLabel(e)).map(e => bounds(e, this.doc)));
     }
     let dx = w.x - g.start.x, dy = w.y - g.start.y;
     if (m.shift) { if (Math.abs(dx) > Math.abs(dy)) dy = 0; else dx = 0; }
@@ -1119,7 +1119,7 @@ export class Editor {
     let bx = null, by = null;
     for (const el of this.doc.visible()) {
       if (skip.has(el.id) || isLabel(el)) continue;
-      const b = bounds(el), tx = [b.x, b.x + b.w / 2, b.x + b.w], ty = [b.y, b.y + b.h / 2, b.y + b.h];
+      const b = bounds(el, this.doc), tx = [b.x, b.x + b.w / 2, b.x + b.w], ty = [b.y, b.y + b.h / 2, b.y + b.h];
       for (const a of xs) for (const t of tx) { const d = t - a; if (Math.abs(d) <= tol && (!bx || Math.abs(d) < Math.abs(bx.d))) bx = { d, at: t, b }; }
       for (const a of ys) for (const t of ty) { const d = t - a; if (Math.abs(d) <= tol && (!by || Math.abs(d) < Math.abs(by.d))) by = { d, at: t, b }; }
     }
@@ -1304,7 +1304,7 @@ export class Editor {
     const ids = elements.filter(e => !isLabel(e)).map(e => e.id);
     this.select(ids);
     // Bring it all into view if it doesn't fit (Excalidraw zooms to imported content too).
-    const nb = unionBox(this.selected().map(bounds)), a = this.toScreen(nb), z = this.toScreen({ x: nb.x + nb.w, y: nb.y + nb.h });
+    const nb = unionBox(this.selected().map(e => bounds(e, this.doc))), a = this.toScreen(nb), z = this.toScreen({ x: nb.x + nb.w, y: nb.y + nb.h });
     if (a.x < 0 || a.y < 0 || z.x > this.size.w || z.y > this.size.h) this.fit(this.selected());
     return ids;
   }
@@ -1382,10 +1382,10 @@ export class Editor {
 
   align(how) {
     const els = this.selected().filter(e => !isLabel(e)); if (els.length < 2) return;
-    const B = unionBox(els.map(bounds));
+    const B = unionBox(els.map(e => bounds(e, this.doc)));
     this.transact(tx => {
       for (const e of els) {
-        const b = bounds(e); let dx = 0, dy = 0;
+        const b = bounds(e, this.doc); let dx = 0, dy = 0;
         if (how === "left") dx = B.x - b.x; if (how === "right") dx = B.x + B.w - (b.x + b.w); if (how === "hcenter") dx = B.x + B.w / 2 - (b.x + b.w / 2);
         if (how === "top") dy = B.y - b.y; if (how === "bottom") dy = B.y + B.h - (b.y + b.h); if (how === "vcenter") dy = B.y + B.h / 2 - (b.y + b.h / 2);
         this.shift(tx, e, dx, dy);
@@ -1396,7 +1396,7 @@ export class Editor {
   distribute(axis) {
     const els = this.selected().filter(e => !isLabel(e)); if (els.length < 3) return;
     const k = axis === "h" ? ["x", "w"] : ["y", "h"];
-    const items = els.map(e => ({ e, b: bounds(e) })).sort((a, b) => a.b[k[0]] - b.b[k[0]]);
+    const items = els.map(e => ({ e, b: bounds(e, this.doc) })).sort((a, b) => a.b[k[0]] - b.b[k[0]]);
     const span = items[items.length - 1].b[k[0]] + items[items.length - 1].b[k[1]] - items[0].b[k[0]];
     const gap = (span - items.reduce((s, i) => s + i.b[k[1]], 0)) / (items.length - 1);
     this.transact(tx => {
@@ -1589,7 +1589,7 @@ export class Editor {
     const target = !els.length
       ? { x: 40, y: 40, scale: 1 }
       : (() => {
-        const b = unionBox(els.map(bounds));
+        const b = unionBox(els.map(e => bounds(e, this.doc)));
         const scale = Math.max(0.1, Math.min(1, Math.min((this.size.w - pad * 2) / (b.w || 1), (this.size.h - pad * 2) / (b.h || 1))));
         return { scale, x: (this.size.w / scale - b.w) / 2 - b.x, y: (this.size.h / scale - b.h) / 2 - b.y };
       })();

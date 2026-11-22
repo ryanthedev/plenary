@@ -413,3 +413,72 @@ test("Bug A regression: remote peer and local selection boxes follow live drawnP
   expect(texts[0].text).toBe("Ada selected");
   port.destroy();
 });
+
+test("degenerate zero-width and zero-size shapes preserve perimeter bindings instead of treating them as interior", () => {
+  const zeroRect = makeElement("rectangle", { id: "zr", x: 100, y: 100, width: 0, height: 0 });
+  const zeroEllipse = makeElement("ellipse", { id: "ze", x: 240, y: 100, width: 0, height: 0 });
+  const thinRect = makeElement("rectangle", { id: "tr", x: 380, y: 100, width: 0, height: 80 });
+  const thinEllipse = makeElement("ellipse", { id: "te", x: 520, y: 100, width: 0, height: 80 });
+  const doc = new Doc({ elements: [zeroRect, zeroEllipse, thinRect, thinEllipse] });
+
+  for (const [el, probe] of [
+    [zeroRect, { x: 102, y: 100 }],
+    [zeroEllipse, { x: 242, y: 100 }],
+    [thinRect, { x: 382, y: 120 }],
+    [thinEllipse, { x: 522, y: 120 }],
+  ]) {
+    const hit = bindingAt(doc, probe, { tol: 12, portTol: 7, cornerTol: 5 });
+    expect(hit).not.toBeNull();
+    expect(hit.el.id).toBe(el.id);
+    expect(Array.isArray(hit.binding.fixedPoint)).toBe(true);
+
+    // resolveBindingPoint must stay pinned (never return null as if interior).
+    const resolved = resolveBindingPoint(el, hit.binding);
+    expect(resolved).not.toBeNull();
+    expect(Number.isFinite(resolved[0])).toBe(true);
+    expect(Number.isFinite(resolved[1])).toBe(true);
+
+    // Bound arrow endpoint resolves to the pinned perimeter point, not aimed at the far end.
+    const arr = makeElement("arrow", {
+      id: `arr-${el.id}`,
+      x: 0,
+      y: 0,
+      points: [[0, 0], [0, 300]],
+      startBinding: hit.binding,
+      endBinding: null,
+    });
+    const arrDoc = new Doc({ elements: [el, arr] });
+    const pts = resolvedPoints(arrDoc, arr);
+    expect(pts[0][0]).toBeCloseTo(resolved[0], 4);
+    expect(pts[0][1]).toBeCloseTo(resolved[1], 4);
+  }
+});
+
+test("editor snapMove and align use live drawnPoints bounds for bound arrows with stale points", () => {
+  const boxA = makeElement("rectangle", { id: "a", x: 100, y: 100, width: 100, height: 80 });
+  const movedB = makeElement("rectangle", { id: "b", x: 500, y: 360, width: 100, height: 80 });
+  const staleArrow = makeElement("arrow", {
+    id: "arr1",
+    x: 206,
+    y: 140,
+    width: 88,
+    height: 0,
+    points: [[0, 0], [88, 0]],   // stale: old right edge was 294; live right edge is 494, bottom is 400
+    startBinding: { elementId: "a", focus: 0, gap: 6, fixedPoint: [1, 0.5], side: "right" },
+    endBinding: { elementId: "b", focus: 0, gap: 6, fixedPoint: [0, 0.5], side: "left" },
+  });
+  const mover = makeElement("rectangle", { id: "m", x: 400, y: 500, width: 60, height: 40 });
+  const { ed } = makeEditor([boxA, movedB, staleArrow, mover]);
+
+  // 1. snapMove snaps mover's right edge (x + 60) to the arrow's LIVE right edge (494), not stale 294.
+  const snapped = ed.snapMove({ x: 400, y: 500, w: 60, h: 40 }, 32, 0, new Set(["m"]));
+  // 400 + 60 + 32 = 492 -> within 6 px of live 494 -> snaps dx to 34 so right edge hits 494!
+  expect(snapped.dx).toBeCloseTo(34, 3);
+  expect(ed.guides.some(g => g.x != null && Math.abs(g.x - 494) < 0.1)).toBe(true);
+
+  // 2. align("right") aligns mover's right edge to the arrow's LIVE right edge (494).
+  ed.select(["arr1", "m"]);
+  ed.align("right");
+  const mAfter = ed.doc.get("m");
+  expect(mAfter.x + mAfter.width).toBeCloseTo(494, 2);
+});

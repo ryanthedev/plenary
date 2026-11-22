@@ -55,7 +55,7 @@ export function corners(el) {
 // The axis-aligned box around the element as drawn (rotation included; for linear elements
 // when `doc` is passed, uses live `drawnPoints(doc, el)` so bound arrows track moved targets).
 export function bounds(el, doc = null) {
-  if (doc && isLinear(el)) {
+  if (doc && typeof doc.get === "function" && isLinear(el)) {
     const pts = drawnPoints(doc, el);
     if (pts.length) {
       let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
@@ -437,7 +437,8 @@ function resolveBindingDetails(shape, b) {
     const box = bbox({ ...shape, angle: 0 });
     const localW = { x: box.x + b.fixedPoint[0] * box.w, y: box.y + b.fixedPoint[1] * box.h };
     const w = toWorld(shape, localW);
-    const inside = isMedia(shape) ? inBox(localW, box, -0.5) : outlineDistance(shape, w) < -0.5;
+    const degenerate = box.w < 1e-6 || box.h < 1e-6;
+    const inside = !degenerate && (isMedia(shape) ? inBox(localW, box, -0.5) : outlineDistance(shape, w) < -0.5);
     if (inside) return null;
     const hit = closestPerimeterPoint(shape, w);
     return {

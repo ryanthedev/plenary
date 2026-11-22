@@ -10,6 +10,128 @@ import { overflowMenu } from "./spaces.js";
 import { startMove } from "./move.js";
 import { pathText, whenText } from "../../core/home.js";
 
+/** Build a CSP-safe inline SVG node, falling back to an empty decorative span on minimal stub DOMs. */
+function svgEl(tag, attrs = {}, kids = []) {
+  if (typeof document === "undefined" || typeof document.createElementNS !== "function") {
+    return h("span", { class: attrs.class ?? "", "aria-hidden": "true" });
+  }
+  const ns = "http://www.w3.org/2000/svg";
+  const el = document.createElementNS(ns, tag);
+  for (const [k, v] of Object.entries(attrs)) if (v != null) el.setAttribute(k, String(v));
+  for (const k of kids) if (k) el.append(k);
+  return el;
+}
+
+function brandMark() {
+  return h("span.home-brand-mark", { "aria-hidden": "true" },
+    svgEl("svg", { viewBox: "0 0 24 24", class: "home-brand-ico", "aria-hidden": "true" }, [
+      svgEl("path", { d: "M4 6a2 2 0 0 1 2-2h5v7H4V6z" }),
+      svgEl("path", { d: "M13 4h5a2 2 0 0 1 2 2v5h-7V4z" }),
+      svgEl("path", { d: "M4 13h7v7H6a2 2 0 0 1-2-2v-5z" }),
+      svgEl("path", { d: "M13 13h7v5a2 2 0 0 1-2 2h-5v-7z" }),
+    ]));
+}
+
+/** Starter presets shown in the Home template strip (non-guest users with board creation). */
+const HOME_TEMPLATES = Object.freeze([
+  { id: "blank", title: "Blank Board", boardTitle: "", desc: "Start an open canvas" },
+  { id: "architecture", title: "Architecture Diagram", boardTitle: "Architecture Diagram", desc: "Pre-titled for system flows" },
+  { id: "deck", title: "Presentation Deck", boardTitle: "Presentation Deck", desc: "Pre-titled for framed slides" },
+  { id: "retro", title: "Retro / Sticky Notes", boardTitle: "Retro / Sticky Notes", desc: "Pre-titled for team retros" },
+]);
+
+function templatePreviewSvg(id) {
+  if (id === "architecture") {
+    return svgEl("svg", { viewBox: "0 0 160 66", class: "home-tpl-svg", "aria-hidden": "true", fill: "none" }, [
+      svgEl("rect", { x: "10", y: "18", width: "42", height: "28", rx: "6", stroke: "var(--border-strong)", "stroke-width": "1.5", fill: "var(--surface)" }),
+      svgEl("rect", { x: "66", y: "10", width: "36", height: "20", rx: "5", stroke: "var(--accent)", "stroke-width": "1.5", fill: "var(--accent-soft)" }),
+      svgEl("rect", { x: "112", y: "26", width: "38", height: "26", rx: "6", stroke: "var(--border-strong)", "stroke-width": "1.5", fill: "var(--surface)" }),
+      svgEl("path", { d: "M52 28 C 58 28, 60 20, 66 20", stroke: "var(--fg-dim)", "stroke-width": "1.4", "stroke-linecap": "round" }),
+      svgEl("path", { d: "M102 20 C 107 20, 108 38, 112 38", stroke: "var(--fg-dim)", "stroke-width": "1.4", "stroke-linecap": "round" }),
+    ]);
+  }
+  if (id === "deck") {
+    return svgEl("svg", { viewBox: "0 0 160 66", class: "home-tpl-svg", "aria-hidden": "true", fill: "none" }, [
+      svgEl("rect", { x: "12", y: "12", width: "62", height: "42", rx: "6", stroke: "var(--accent)", "stroke-width": "1.5", fill: "var(--surface)" }),
+      svgEl("path", { d: "M22 24h28M22 33h40M22 40h24", stroke: "var(--fg-dim)", "stroke-width": "1.6", "stroke-linecap": "round" }),
+      svgEl("rect", { x: "86", y: "12", width: "62", height: "42", rx: "6", stroke: "var(--border-strong)", "stroke-width": "1.5", fill: "var(--surface)" }),
+      svgEl("rect", { x: "96", y: "22", width: "20", height: "20", rx: "4", stroke: "var(--accent)", "stroke-width": "1.3", fill: "var(--accent-soft)" }),
+      svgEl("path", { d: "M122 26h16M122 34h12", stroke: "var(--fg-dim)", "stroke-width": "1.5", "stroke-linecap": "round" }),
+    ]);
+  }
+  if (id === "retro") {
+    return svgEl("svg", { viewBox: "0 0 160 66", class: "home-tpl-svg", "aria-hidden": "true", fill: "none" }, [
+      svgEl("rect", { x: "14", y: "12", width: "38", height: "42", rx: "5", stroke: "var(--border)", "stroke-width": "1.2", fill: "var(--surface)" }),
+      svgEl("rect", { x: "61", y: "12", width: "38", height: "42", rx: "5", stroke: "var(--border)", "stroke-width": "1.2", fill: "var(--surface)" }),
+      svgEl("rect", { x: "108", y: "12", width: "38", height: "42", rx: "5", stroke: "var(--border)", "stroke-width": "1.2", fill: "var(--surface)" }),
+      svgEl("rect", { x: "20", y: "20", width: "26", height: "14", rx: "3", fill: "var(--warn-bg)", stroke: "var(--warn)", "stroke-width": "1.2" }),
+      svgEl("rect", { x: "67", y: "20", width: "26", height: "14", rx: "3", fill: "var(--accent-soft)", stroke: "var(--accent)", "stroke-width": "1.2" }),
+      svgEl("rect", { x: "114", y: "20", width: "26", height: "14", rx: "3", fill: "var(--ok-bg)", stroke: "var(--ok)", "stroke-width": "1.2" }),
+    ]);
+  }
+  return svgEl("svg", { viewBox: "0 0 160 66", class: "home-tpl-svg", "aria-hidden": "true", fill: "none" }, [
+    svgEl("rect", { x: "52", y: "12", width: "56", height: "42", rx: "8", stroke: "var(--border-strong)", "stroke-width": "1.4", "stroke-dasharray": "4 3", fill: "var(--surface)" }),
+    svgEl("path", { d: "M80 25v16M72 33h16", stroke: "var(--accent)", "stroke-width": "1.8", "stroke-linecap": "round" }),
+  ]);
+}
+
+function previewVariant(id) {
+  let hash = 0;
+  const s = String(id ?? "");
+  for (let i = 0; i < s.length; i++) hash = ((hash << 5) - hash + s.charCodeAt(i)) | 0;
+  return Math.abs(hash) % 4;
+}
+
+function boardPreviewSvg(id) {
+  const v = previewVariant(id);
+  if (v === 1) {
+    return svgEl("svg", { viewBox: "0 0 200 88", class: "card-preview-svg", "aria-hidden": "true", fill: "none" }, [
+      svgEl("rect", { x: "16", y: "14", width: "74", height: "58", rx: "7", stroke: "var(--border-strong)", "stroke-width": "1.5", fill: "var(--surface)" }),
+      svgEl("path", { d: "M28 30h34M28 40h48M28 50h30", stroke: "var(--fg-dim)", "stroke-width": "1.6", "stroke-linecap": "round" }),
+      svgEl("rect", { x: "108", y: "14", width: "74", height: "58", rx: "7", stroke: "var(--accent)", "stroke-width": "1.5", fill: "var(--accent-soft)" }),
+      svgEl("circle", { cx: "145", cy: "43", r: "14", stroke: "var(--accent)", "stroke-width": "1.5", fill: "var(--surface)" }),
+    ]);
+  }
+  if (v === 2) {
+    return svgEl("svg", { viewBox: "0 0 200 88", class: "card-preview-svg", "aria-hidden": "true", fill: "none" }, [
+      svgEl("rect", { x: "20", y: "18", width: "44", height: "44", rx: "6", stroke: "var(--warn)", "stroke-width": "1.4", fill: "var(--warn-bg)" }),
+      svgEl("rect", { x: "78", y: "24", width: "44", height: "44", rx: "6", stroke: "var(--accent)", "stroke-width": "1.4", fill: "var(--accent-soft)" }),
+      svgEl("rect", { x: "136", y: "16", width: "44", height: "44", rx: "6", stroke: "var(--ok)", "stroke-width": "1.4", fill: "var(--ok-bg)" }),
+    ]);
+  }
+  if (v === 3) {
+    return svgEl("svg", { viewBox: "0 0 200 88", class: "card-preview-svg", "aria-hidden": "true", fill: "none" }, [
+      svgEl("circle", { cx: "44", cy: "44", r: "18", stroke: "var(--border-strong)", "stroke-width": "1.5", fill: "var(--surface)" }),
+      svgEl("path", { d: "M62 44h28", stroke: "var(--fg-dim)", "stroke-width": "1.5", "stroke-linecap": "round" }),
+      svgEl("rect", { x: "90", y: "24", width: "42", height: "40", rx: "7", stroke: "var(--accent)", "stroke-width": "1.5", fill: "var(--accent-soft)" }),
+      svgEl("path", { d: "M132 44h22", stroke: "var(--fg-dim)", "stroke-width": "1.5", "stroke-linecap": "round" }),
+      svgEl("rect", { x: "154", y: "28", width: "30", height: "32", rx: "6", stroke: "var(--border-strong)", "stroke-width": "1.5", fill: "var(--surface)" }),
+    ]);
+  }
+  return svgEl("svg", { viewBox: "0 0 200 88", class: "card-preview-svg", "aria-hidden": "true", fill: "none" }, [
+    svgEl("rect", { x: "16", y: "18", width: "56", height: "34", rx: "6", stroke: "var(--border-strong)", "stroke-width": "1.5", fill: "var(--surface)" }),
+    svgEl("rect", { x: "124", y: "34", width: "58", height: "34", rx: "6", stroke: "var(--accent)", "stroke-width": "1.5", fill: "var(--accent-soft)" }),
+    svgEl("path", { d: "M72 35 C 96 35, 98 51, 124 51", stroke: "var(--fg-dim)", "stroke-width": "1.5", "stroke-linecap": "round" }),
+  ]);
+}
+
+/** Prefill the New board dialog's Title input when opened from a template card. */
+function prefillNewBoardTitle(dlg, boardTitle) {
+  if (!boardTitle || !dlg) return;
+  const host = dlg.dialog ?? dlg.el;
+  if (!host) return;
+  const input = typeof host.querySelector === "function"
+    ? host.querySelector('input[aria-label="Title"]')
+    : (typeof host.find === "function" ? host.find(e => e.tagName === "INPUT" && e.getAttribute?.("aria-label") === "Title") : null);
+  if (!input) return;
+  input.value = boardTitle;
+  if (typeof input.dispatchEvent === "function" && typeof Event === "function") {
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  } else if (typeof input.dispatch === "function") {
+    input.dispatch("input", { target: { value: boardTitle } });
+  }
+}
+
 /**
  * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/home.js").createHomeModel>, clock: import("../../ports/clock.js").Clock,
  *   boardHref: (id: string) => string, spaceHref: (id: string) => string, groupHref: (id: string) => string,
@@ -23,6 +145,7 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
   const S = model.state, keys = keeper(), mark = keys.mark;
   let destroyed = false;
   /** @type {null|"members"|"audit"} */ let panel = null;
+  let adminOpen = false;
   let orgBusy = false;
   const mem = { status: "idle", tenant: null, members: [], admins: [], busy: false, removing: null, seq: 0 };
   const audit = { status: "idle", tenant: null, events: [], nextBefore: null, loadingMore: false, seq: 0 };
@@ -35,10 +158,10 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
   const main = h("main.home-main", { id: "home-main", tabindex: "-1" });
   const who = h("span.home-who");
   const top = h("header.home-top", {},
-    h("a.logo", { href: homeHref, "aria-label": "Plenary home" }, "Plenary"),
+    h("a.logo", { href: homeHref, "aria-label": "Plenary home" }, brandMark(), "Plenary"),
     h("div.home-searchbox", { role: "search" }, search, h("kbd", { "aria-hidden": "true" }, "/ or ⌘K")),
     h("span.spacer"), who);
-  const home = h("div.home", { id: "home" }, top, status, h("div.home-body", {}, side, main));
+  const home = h("div.home.home-page", { id: "home" }, top, status, h("div.home-body", {}, side, main));
   root.replaceChildren(home);
 
   // Persistent inputs for self-serve Workspace creation and Members add-by-email (kept across redraws so typing never loses focus).
@@ -176,11 +299,30 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
 
   const guest = () => !!S.data?.guest;
   // Every control that can hold focus is marked with a stable key, so a redraw (a star toggled, a view picked, a load, a notice) puts focus back.
-  const newBoard = () => mark(h("button.btn.primary", { type: "button", onclick: e => dialogs.newBoard({ opener: e.currentTarget }) }, "＋ New board"), "new-board");
-  const newSpace = () => mark(h("button.btn", { type: "button", onclick: e => dialogs.newSpace({ opener: e.currentTarget }) }, "＋ New space"), "new-space");
-  const newGroup = () => (S.data?.can?.createGroup ? mark(h("button.btn", { type: "button", onclick: e => dialogs.newGroup({ opener: e.currentTarget }) }, "＋ New group"), "new-group") : null);
+  const newBoard = () => mark(h("button.btn.primary.home-new-board", { type: "button", onclick: e => dialogs.newBoard({ opener: e.currentTarget }) }, "＋ New board"), "new-board");
+  const newSpace = () => mark(h("button.btn.home-side-add", { type: "button", title: "New space", "aria-label": "New space", onclick: e => dialogs.newSpace({ opener: e.currentTarget }) }, "＋", h("span.sr-only", {}, " New space")), "new-space");
+  const newGroup = () => (S.data?.can?.createGroup ? mark(h("button.btn.home-side-add", { type: "button", title: "New group", "aria-label": "New group", onclick: e => dialogs.newGroup({ opener: e.currentTarget }) }, "＋", h("span.sr-only", {}, " New group")), "new-group") : null);
   const navBtn = (view, label, count) => mark(h("button.nav", { type: "button", "aria-current": S.view === view && !panel && !S.query.trim() ? "page" : null,
     onclick: () => { panel = null; search.value = ""; model.setQuery(""); model.setView(view); } }, label, count != null ? h("span.n", {}, String(count)) : null), `nav:${view}`);
+
+  function openTemplate(tpl, opener) {
+    if (guest() || typeof dialogs?.newBoard !== "function") return;
+    const dlg = dialogs.newBoard({ opener });
+    prefillNewBoardTitle(dlg, tpl.boardTitle);
+  }
+
+  function renderTemplates() {
+    if (guest() || S.view !== "home" || panel || S.query.trim() || typeof dialogs?.newBoard !== "function") return null;
+    return h("section.home-templates", { "aria-label": "Start from a template", "data-home-templates": "true" },
+      h("p.home-tpl-heading", {}, "Start from a template"),
+      h("div.home-tpl-grid", {}, HOME_TEMPLATES.map(tpl => mark(
+        h("button.home-tpl-card", { type: "button", "data-template": tpl.id, onclick: e => openTemplate(tpl, e.currentTarget) },
+          h("div.home-tpl-thumb", { "aria-hidden": "true" }, templatePreviewSvg(tpl.id)),
+          h("div.home-tpl-meta", {},
+            h("span.home-tpl-title", {}, tpl.title),
+            h("span.home-tpl-desc", {}, tpl.desc))),
+        `tpl:${tpl.id}`))));
+  }
 
   function star(c, sec) {
     return mark(h("button.star", { type: "button", "aria-pressed": c.starred ? "true" : "false", "aria-label": `${c.starred ? "Unstar" : "Star"} ${c.title || "Untitled"}`,
@@ -195,8 +337,20 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
     const menu = move && c.can?.move ? keys.keep(`menu:${sec}:${c.id}`, () => overflowMenu(menuCfg)) : null;
     menu?.update(menuCfg);
     if (menu) mark(menu.button, `menu:${sec}:${c.id}`);
+    const prefix = [where, c.role].filter(Boolean).join(" · ");
+    const fullMeta = [where, c.role, when].filter(Boolean).join(" · ");
+    const meta = when
+      ? h("span.p", { title: fullMeta },
+        prefix ? h("span.card-meta-prefix", {}, prefix) : null,
+        prefix ? h("span.card-meta-sep", {}, " · ") : null,
+        h("span.card-when", {}, when))
+      : h("span.p", { title: fullMeta }, h("span.card-meta-prefix", {}, prefix));
+    const roleKey = c.role ? String(c.role).toLowerCase().replace(/[^a-z0-9-]/g, "") : "";
     return h(`li.card${menu ? ".has-menu" : ""}`, {},
-      mark(h("a.card-open", { href: boardHref(c.id) }, h("span.t", {}, label), h("span.p", {}, [where, c.role, when].filter(Boolean).join(" · "))), `card:${sec}:${c.id}`),
+      mark(h("a.card-open", { href: boardHref(c.id) },
+        h("div.card-preview", { "aria-hidden": "true", "data-preview-variant": String(previewVariant(c.id)) }, boardPreviewSvg(c.id)),
+        h("div.card-body", {}, h("span.t", { title: label }, label), meta)), `card:${sec}:${c.id}`),
+      c.role ? h("span", { class: `card-role${roleKey ? ` card-role-${roleKey}` : ""}`, "aria-hidden": "true" }, c.role) : null,
       menu ? h("span.card-menu.home-menu", {}, menu.el) : null,
       guest() ? null : star(c, sec));
   }
@@ -219,18 +373,39 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
       ? mark(h("button.nav", { type: "button", "aria-current": panel === "audit" && !S.query.trim() ? "page" : null,
         onclick: () => { search.value = ""; model.setQuery(""); openAudit(); } }, "Audit log"), "nav:audit")
       : null;
-    const orgLinks = d.guest ? [] : [teamsHref ? mark(h("a.nav", { href: teamsHref }, "Teams"), "link:teams") : null,
+    const dailyLinks = d.guest ? [] : [
+      teamsHref ? mark(h("a.nav", { href: teamsHref }, "Teams"), "link:teams") : null,
       trashHref ? mark(h("a.nav", { href: trashHref }, "Trash"), "link:trash") : null,
+    ].filter(Boolean);
+    const adminLinks = d.guest ? [] : [
       membersBtn,
-      auditBtn,
       unitAccessHref && d.unit && d.can?.manageAccess ? mark(h("a.nav", { href: unitAccessHref(d.unit.id) }, "Organization access"), "link:unit-access") : null,
       rolesHref && d.can?.manageRoles ? mark(h("a.nav", { href: rolesHref }, "Roles"), "link:roles") : null,
-      offboardHref && d.can?.manageAccess ? mark(h("a.nav", { href: offboardHref }, "Offboard a member"), "link:offboard") : null];
-    replace(side, d.guest ? null : newBoard(), d.guest ? null : newSpace(), newGroup(), navBtn("home", "Home"), d.guest ? null : navBtn("starred", "Starred", d.starred.length), navBtn("shared", "Shared with me", d.shared.length), orgLinks,
-      t && h("div.tree", { role: "group", "aria-label": "Groups and Spaces" },
-        t.groups.map(g => h("div.grp", {}, h("h4", {}, mark(h("a", { href: groupHref(g.id) }, g.name), `group:${g.id}`)), g.spaces.map(node))),
-        t.spaces.length ? h("div.grp", {}, h("h4", {}, "Not in a group"), t.spaces.map(node)) : null,
-        t.more ? h("p.muted", {}, "Some Spaces or boards are not listed. Use search.") : null));
+      auditBtn,
+      offboardHref && d.can?.manageAccess ? mark(h("a.nav", { href: offboardHref }, "Offboard a member"), "link:offboard") : null,
+    ].filter(Boolean);
+    const spaceActions = d.guest ? [] : [newSpace(), newGroup()].filter(Boolean);
+    const spacesSec = (t || spaceActions.length)
+      ? h("div.home-spaces-sec", {},
+        h("div.home-side-head", {},
+          h("span.home-side-label", {}, "Spaces"),
+          spaceActions.length ? h("div.home-side-acts", {}, spaceActions) : null),
+        t && h("div.tree", { role: "group", "aria-label": "Groups and Spaces" },
+          t.groups.map(g => h("div.grp", {}, h("h4", {}, mark(h("a", { href: groupHref(g.id) }, g.name), `group:${g.id}`)), g.spaces.map(node))),
+          t.spaces.length ? h("div.grp", {}, h("h4", {}, "Not in a group"), t.spaces.map(node)) : null,
+          t.more ? h("p.muted", {}, "Some Spaces or boards are not listed. Use search.") : null))
+      : null;
+    const adminSec = adminLinks.length
+      ? h("details.home-admin", { "data-home-admin": "true", open: adminOpen || panel === "members" || panel === "audit",
+        ontoggle: e => { adminOpen = Boolean(e.currentTarget?.open); } },
+      h("summary.home-admin-summary", {}, "Workspace Admin"),
+      h("div.home-admin-list", {}, adminLinks))
+      : null;
+    replace(side,
+      d.guest ? null : newBoard(),
+      h("div.home-nav-group", {}, navBtn("home", "Home"), d.guest ? null : navBtn("starred", "Starred", d.starred.length), navBtn("shared", "Shared with me", d.shared.length), dailyLinks),
+      spacesSec,
+      adminSec);
   }
 
   function renderMembersPanel() {
@@ -302,11 +477,12 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
       m.more ? h("p.muted", {}, "More boards match. Narrow the search.") : null);
     }
     const guestCreate = guest() && org ? orgCreateCard : null;
+    const templates = renderTemplates();
     if (m.sections) {
       const shown = m.sections.filter(s => s.cards.length);
-      return replace(main, mark(h("h1", { tabindex: "-1" }, m.title), "heading"), shown.length ? shown.map(s => h("section", { "aria-label": s.title }, h("h2.sec", {}, s.title), cardList(s.cards, s.title))) : empty(m.empty), guestCreate);
+      return replace(main, mark(h("h1", { tabindex: "-1" }, m.title), "heading"), templates, shown.length ? shown.map(s => h("section", { "aria-label": s.title }, h("h2.sec", {}, s.title), cardList(s.cards, s.title))) : empty(m.empty), guestCreate);
     }
-    return replace(main, mark(h("h1", { tabindex: "-1" }, m.title), "heading"), m.cards.length ? cardList(m.cards, m.title) : empty(m.empty), guestCreate);
+    return replace(main, mark(h("h1", { tabindex: "-1" }, m.title), "heading"), templates, m.cards.length ? cardList(m.cards, m.title) : empty(m.empty), guestCreate);
   }
 
   function render() { keys.around(draw); }

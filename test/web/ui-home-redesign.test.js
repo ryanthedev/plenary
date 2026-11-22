@@ -1,0 +1,235 @@
+// #119 Boards Home redesign & customer journeys: template starter strip, calm sidebar IA with compact Spaces + actions,
+// collapsible Workspace Admin section, rich visual board cards with non-wrapping timestamps, and static/CSS invariants.
+import { test, expect, afterEach } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { FakeElement, installDom, textOf, byClass } from "./collab/fake-dom.js";
+import { mountHome } from "../../web/adapters/dom/home.js";
+import { createDialogs } from "../../web/adapters/dom/dialogs.js";
+import { createHomeModel } from "../../web/core/home.js";
+import { virtualClock } from "../../web/adapters/clock/virtual.js";
+import { staticSite } from "../../server/static.js";
+
+const card = (id, o = {}) => ({
+  id,
+  title: id.toUpperCase(),
+  role: "editor",
+  path: [{ type: "group", name: "Product" }, { type: "space", name: "Design" }],
+  starred: false,
+  ...o,
+});
+
+const BASE_DATA = {
+  guest: false,
+  user: { user: "dev:ada", name: "ada" },
+  unit: { id: "t-1", kind: "company", name: "Acme", personal: true, isAdmin: true },
+  limits: {},
+  can: { createGroup: true, manageAccess: true, manageRoles: true },
+  recent: [card("a", { role: "owner", at: 1_000_000 - 28 * 60_000 })],
+  starred: [card("b", { starred: true, role: "viewer" })],
+  owned: [],
+  shared: [card("c", { role: "commenter" })],
+  tree: {
+    groups: [{ id: "g-1", name: "Product", spaces: [{ id: "s-1", name: "Design", personal: false }] }],
+    spaces: [{ id: "s-2", name: "ada's space", personal: true }],
+    more: false,
+  },
+};
+
+afterEach(() => {
+  delete globalThis.document;
+  delete globalThis.Node;
+});
+
+async function setup(data = BASE_DATA, extra = {}) {
+  const dom = installDom();
+  const root = dom.root;
+  globalThis.document.addEventListener = () => {};
+  globalThis.document.removeEventListener = () => {};
+  globalThis.Node = Object.getPrototypeOf(FakeElement);
+  const clock = virtualClock({ t0: 1_000_000 });
+  const api = {
+    load: async () => ({ home: structuredClone(data) }),
+    search: async q => ({ q, results: [], more: false }),
+    star: async () => ({ ok: true }),
+  };
+  const model = createHomeModel({ api, clock });
+  const dialogCalls = [];
+  const dialogs = extra.dialogs ?? {
+    newBoard: o => { dialogCalls.push(["board", o?.opener]); return null; },
+    newSpace: o => { dialogCalls.push(["space", o?.opener]); return null; },
+    newGroup: o => { dialogCalls.push(["group", o?.opener]); return null; },
+  };
+  const mounted = mountHome({
+    root,
+    model,
+    clock,
+    dialogs,
+    boardHref: id => `?board=${id}`,
+    spaceHref: id => `?space=${id}`,
+    groupHref: id => `?group=${id}`,
+    ...extra,
+  });
+  await model.load();
+  return { root, model, clock, dialogCalls, mounted };
+}
+
+test("#119 template strip: renders 4 templates on Home, opens New board with prefilled title via real createDialogs, hides for guests and other views", async () => {
+  const dom = installDom();
+  const root = dom.root;
+  globalThis.document.addEventListener = () => {};
+  globalThis.document.removeEventListener = () => {};
+  globalThis.Node = Object.getPrototypeOf(FakeElement);
+  const clock = virtualClock({ t0: 1_000_000 });
+  const created = [];
+  const spacesApi = {
+    boardSpaces: async () => ({ spaces: [{ id: "s-me", name: "ada's space", personal: true, general: null, group: null }], more: false }),
+    createBoard: async body => { created.push(body); return { board: { id: "b-tpl" } }; },
+  };
+  const navigated = [];
+  const dialogs = createDialogs({
+    host: root,
+    api: /** @type {any} */ (spacesApi),
+    hrefs: { board: id => `?board=${id}`, space: id => `?space=${id}`, group: id => `?group=${id}` },
+    go: href => navigated.push(href),
+    newKey: () => "tpl-key-1",
+  });
+  const api = {
+    load: async () => ({ home: structuredClone(BASE_DATA) }),
+    search: async q => ({ q, results: [], more: false }),
+    star: async () => ({ ok: true }),
+  };
+  const model = createHomeModel({ api, clock });
+  mountHome({
+    root,
+    model,
+    clock,
+    dialogs,
+    boardHref: id => `?board=${id}`,
+    spaceHref: id => `?space=${id}`,
+    groupHref: id => `?group=${id}`,
+  });
+  await model.load();
+
+  const strip = root.find(e => e.getAttribute("data-home-templates") === "true");
+  expect(strip).toBeTruthy();
+  const tpls = strip.findAll(e => e.hasClass("home-tpl-card"));
+  expect(tpls.map(e => e.getAttribute("data-template"))).toEqual(["blank", "architecture", "deck", "retro"]);
+  expect(tpls.map(e => textOf(e.find(x => x.hasClass("home-tpl-title"))))).toEqual([
+    "Blank Board",
+    "Architecture Diagram",
+    "Presentation Deck",
+    "Retro / Sticky Notes",
+  ]);
+
+  // Clicking Architecture Diagram opens New board dialog with pre-filled title and submits cleanly
+  tpls[1].click();
+  await new Promise(r => setTimeout(r, 0));
+  const dlg = root.find(e => e.getAttribute("role") === "dialog");
+  expect(dlg).toBeTruthy();
+  const titleInput = dlg.find(e => e.tagName === "INPUT" && e.getAttribute("aria-label") === "Title");
+  expect(titleInput.value).toBe("Architecture Diagram");
+  dlg.find(e => e.tagName === "FORM").dispatch("submit");
+  await new Promise(r => setTimeout(r, 0));
+  expect(created).toEqual([{ title: "Architecture Diagram", key: "tpl-key-1" }]);
+  expect(navigated).toEqual(["?board=b-tpl"]);
+
+  // Switching to Starred hides the template strip
+  root.find(e => e.getAttribute("data-fk") === "nav:starred").click();
+  expect(root.find(e => e.getAttribute("data-home-templates") === "true")).toBeUndefined();
+
+  // Guests never see the template strip
+  const guestSetup = await setup({ ...BASE_DATA, guest: true, unit: null, tree: null, can: {} });
+  expect(guestSetup.root.find(e => e.getAttribute("data-home-templates") === "true")).toBeUndefined();
+});
+
+test("#119 sidebar IA: single primary + New board, compact + Space/Group buttons beside Spaces header, collapsible Workspace Admin hidden for non-admins even with Teams & Trash", async () => {
+  // Regular member with production Teams & Trash links but no admin capabilities: Workspace Admin section is omitted completely
+  const plain = await setup(
+    { ...BASE_DATA, unit: { id: "t-1", kind: "company", name: "Acme", personal: false, isAdmin: false }, can: { createGroup: false, manageAccess: false, manageRoles: false } },
+    { teamsHref: "?teams=1", trashHref: "?trash=1", rolesHref: "?roles=1", offboardHref: "?offboard=1", unitAccessHref: id => `?access=unit:${id}` },
+  );
+  const plainSide = plain.root.find(e => e.hasClass("home-side"));
+  expect(plainSide.find(e => e.getAttribute("data-home-admin") === "true")).toBeUndefined();
+  expect(plainSide.findAll(e => e.hasClass("home-new-board")).length).toBe(1);
+  const dailyLinks = plainSide.find(e => e.hasClass("home-nav-group")).findAll(e => e.tagName === "A").map(textOf);
+  expect(dailyLinks).toEqual(["Teams", "Trash"]);
+  const spacesHead = plainSide.find(e => e.hasClass("home-side-head"));
+  expect(textOf(spacesHead.find(e => e.hasClass("home-side-label")))).toBe("Spaces");
+  expect(spacesHead.findAll(e => e.hasClass("home-side-add")).map(textOf)).toEqual(["＋ New space"]);
+
+  // Admin user: collapsible Workspace Admin section separates admin-only links from daily nav
+  const org = {
+    createTenant: async () => ({ tenant: { id: "t-1", name: "Acme" } }),
+    listTenantMembers: async () => ({ members: ["sam@acme.com"], admins: ["ada@acme.com"] }),
+    addTenantMember: async (_t, email) => ({ email }),
+    removeTenantMember: async () => {},
+    adminAudit: async () => ({ events: [], nextBefore: null }),
+  };
+  const adm = await setup(BASE_DATA, {
+    org,
+    teamsHref: "?teams=1",
+    rolesHref: "?roles=1",
+    offboardHref: "?offboard=1",
+    trashHref: "?trash=1",
+    unitAccessHref: id => `?access=unit:${id}`,
+  });
+  const admSide = adm.root.find(e => e.hasClass("home-side"));
+  const admDetails = admSide.find(e => e.getAttribute("data-home-admin") === "true");
+  expect(admDetails).toBeTruthy();
+  expect(admDetails.tagName).toBe("DETAILS");
+  expect(textOf(admDetails.find(e => e.tagName === "SUMMARY"))).toBe("Workspace Admin");
+  const admNavText = admDetails.findAll(e => e.hasClass("nav")).map(textOf);
+  expect(admNavText).toEqual(["Members", "Organization access", "Roles", "Audit log", "Offboard a member"]);
+
+  // Opening Members auto-expands the Workspace Admin details section
+  admDetails.find(e => e.getAttribute("data-fk") === "nav:members").click();
+  await new Promise(r => setTimeout(r, 0));
+  const reopened = adm.root.find(e => e.getAttribute("data-home-admin") === "true");
+  expect(reopened.getAttribute("open") !== null || reopened.open === true).toBe(true);
+});
+
+test("#119 rich visual board cards: preview header, role pill, title tooltip, and non-wrapping timestamp span without altering card-open text", async () => {
+  const { root } = await setup();
+  expect(root.find(e => e.hasClass("home-page"))).toBeTruthy();
+  const firstCard = byClass(root, "card")[0];
+  const preview = firstCard.find(e => e.hasClass("card-preview"));
+  expect(preview).toBeTruthy();
+  expect(preview.getAttribute("aria-hidden")).toBe("true");
+  expect(textOf(preview)).toBe("");
+
+  const roleBadge = firstCard.find(e => e.hasClass("card-role"));
+  expect(roleBadge).toBeTruthy();
+  expect(roleBadge.getAttribute("aria-hidden")).toBe("true");
+  expect(textOf(roleBadge)).toBe("owner");
+  expect(roleBadge.hasClass("card-role-owner")).toBe(true);
+
+  const titleEl = firstCard.find(e => e.hasClass("t"));
+  expect(titleEl.getAttribute("title")).toBe("A");
+
+  const whenSpan = firstCard.find(e => e.hasClass("card-when"));
+  expect(whenSpan).toBeTruthy();
+  expect(textOf(whenSpan)).toBe("28 min ago");
+
+  // Link text remains clean with zero duplication
+  expect(textOf(firstCard.find(e => e.hasClass("card-open")))).toBe("AProduct / Design · owner · 28 min ago");
+});
+
+test("#119 static serving & CSS invariants: home.css is served, scoped to .home-page, timestamps nowrap, mobile targets >= 44px and 16px inputs", async () => {
+  const repo = join(import.meta.dir, "../..");
+  const site = staticSite();
+  expect(site.files.has("/home.css")).toBe(true);
+  const res = await site.handle(new Request("http://x/home.css"));
+  expect(res.status).toBe(200);
+  expect(res.headers.get("content-type")).toBe("text/css");
+
+  const css = readFileSync(join(repo, "web/home.css"), "utf8");
+  expect(css).toContain(".home-page .card-when");
+  expect(css).not.toMatch(/^\.home\s/m);
+  expect(css).toContain("white-space: nowrap");
+  expect(css).toContain("env(safe-area-inset-top)");
+  expect(css).toContain("env(safe-area-inset-bottom)");
+  expect(css).toContain("font-size: 16px");
+  expect(css).toContain("min-height: 44px");
+  expect(css).toContain("min-width: 44px");
+});

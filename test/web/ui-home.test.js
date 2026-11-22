@@ -39,7 +39,7 @@ test("Home: Recent then Starred cards link to the board, with path, role and age
   expect(textOf(first)).toBe("AProduct / Design · editor · 10 min ago");
   const side = root.find(e => e.hasClass("home-side"));
   expect(side.findAll(e => e.tagName === "H4").map(textOf)).toEqual(["Product", "Not in a group"]);
-  expect(side.findAll(e => e.tagName === "BUTTON").map(textOf)).toEqual(["＋ New board", "＋ New space", "Home", "Starred1", "Shared with me1"]);
+  expect(side.findAll(e => e.tagName === "BUTTON").map(textOf)).toEqual(["＋ New board", "Home", "Starred1", "Shared with me1", "＋ New space"]);
   // Spaces and Groups are links to their own pages (?space= / ?group=), not search buttons
   expect(side.findAll(e => e.tagName === "A").map(e => [e.getAttribute("href"), textOf(e)])).toEqual([["?group=g", "Product"], ["?space=s1", "▢ Design"], ["?space=s2", "◐ ada's space"]]);
   expect(side.find(e => e.getAttribute("aria-current") === "page").textContent).toBe("Home");

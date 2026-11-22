@@ -35,7 +35,29 @@ import { probeMove } from "../../core/move.js";
 import { mountCollab } from "./collab/ui.js";
 import { collabFrame } from "./collab/frame.js";
 import { createVideoOverlay } from "./video-overlay.js";
+import { createContextMenu, buildCanvasMenuItems } from "./context-menu.js";
 import { hitTest } from "../../../packages/core/geometry.js";
+
+const RAW_BOARD_ID_RE = /^(?:b-[a-z0-9]{8,}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+const CONTROL_BIDI_RE = /[\p{Cc}\u2028\u2029\u202A-\u202E\u2066-\u2069\u200E\u200F\u061C]/gu;
+
+/** Return true if `id` looks like a raw generated board identifier (e.g. `b-z7r15i5cc4rk28d9`). */
+export function isRawBoardId(id) {
+  return typeof id === "string" && RAW_BOARD_ID_RE.test(id.trim());
+}
+
+/** Resolve the user-facing board title, never showing a raw generated ID when untitled. */
+export function formatBoardTitle(boardId, customTitle = null) {
+  const cleaned = typeof customTitle === "string" ? customTitle.replace(CONTROL_BIDI_RE, "").trim() : "";
+  if (cleaned) return cleaned.slice(0, 200);
+  if (!boardId || isRawBoardId(boardId)) return "Untitled board";
+  return String(boardId);
+}
+
+/** Format `document.title` for the active board. */
+export function formatDocumentTitle(displayTitle) {
+  return `${displayTitle || "Untitled board"} — Plenary`;
+}
 
 /**
  * Mount the page on index.html's DOM.
@@ -45,7 +67,9 @@ import { hitTest } from "../../../packages/core/geometry.js";
  *           collab?: ((S: any, o: { jumpTo(p: { x: number, y: number, scale?: number }): void }) => any) | null,
  *           clock: import("../../ports/clock.js").Clock, expAt?: number | null,
  *           relogin?: { href: string, go(): void } | null, admin?: any, homeHref?: string | null,
- *           access?: any, newKey?: (() => string) | null, share?: any, move?: any, trashShown?: () => boolean }} o
+ *           access?: any, newKey?: (() => string) | null, share?: any, move?: any, trashShown?: () => boolean,
+ *           boardTitle?: string | null, getBoardTitle?: (() => Promise<any>) | null,
+ *           renameBoard?: ((title: string) => Promise<any>) | null }} o
  *   collab: the root's collab port factory (web/ports/collab.js; production and dev: web/adapters/collab/sync.js over
  *   the session). The collaboration UI (./collab/ui.js) mounts over it: avatars, emotes, cursors, selections, laser,
  *   previews, comment threads. Without it the page has none of that.
@@ -58,16 +82,34 @@ import { hitTest } from "../../../packages/core/geometry.js";
  *   homeHref: where the top bar's Home link goes (the Home screen); null = no link (dev rooms).
  * @returns {{ S: any, ui: any, net: any, collab: any, port: any, setTheme(t: string): void, openDialog(d: string): void, openShare(): any, setPanel(op: any): void, startComment(p: { x: number, y: number }): void }}
  */
-export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null, admin = null, homeHref = null, access = null, newKey = null, share = null, move = null, trashShown = () => false }) {
+export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null, admin = null, homeHref = null, access = null, newKey = null, share = null, move = null, trashShown = () => false, boardTitle = null, getBoardTitle = null, renameBoard = null }) {
   if (!clock || typeof clock.now !== "function" || typeof clock.mono !== "function") throw new Error("mountApp: the clock port is required");
   const get = k => { try { return prefs.get(k); } catch { return null; } };
   const put = (k, v) => { try { prefs.set(k, v); } catch {} };
   const ui = {
     theme: theme0 === "dark" || (theme0 !== "light" && matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light",
     panel: parsePanel(get("plenary.panel")), drawer: null, sheet: null, dialog: null, colorPicker: null, colorPickerState: { h: null, mode: "hex" }, library: loadLibrary(prefs),
+    renamingBoard: false,
     mermaid: { src: "flowchart LR\n  A[Idea] --> B[Spec]\n  B --> C{Review?}\n  C -->|yes| D[Build]\n  C -->|no| B\n  D --> E[Ship]", elbow: true },
     export: { format: "svg", scale: 2, page: "board" },
   };
+  let currentBoardTitle = typeof boardTitle === "string" ? boardTitle.replace(CONTROL_BIDI_RE, "").trim() : null;
+  let serverCanRename = null;
+  const displayBoardTitle = () => formatBoardTitle(board, currentBoardTitle);
+  const syncDocumentTitle = () => {
+    try {
+      if (document && typeof document === "object") document.title = formatDocumentTitle(displayBoardTitle());
+    } catch {}
+  };
+  syncDocumentTitle();
+  const resolveTitle = typeof getBoardTitle === "function"
+    ? () => getBoardTitle()
+    : (typeof admin?.getBoard === "function" ? () => admin.getBoard(board) : null);
+  const doRenameBoard = typeof renameBoard === "function"
+    ? t => renameBoard(t)
+    : (typeof admin?.renameBoard === "function"
+      ? t => admin.renameBoard(board, t)
+      : (typeof admin?.updateBoard === "function" ? t => admin.updateBoard(board, { title: t }) : null));
   // The notes this person made on this board, kept per user (p8-one-linkv L8): the key follows the user the room says
   // this tab is (welcome.user), so after a same-tab switch to another user the emptied set never overwrites the old
   // user's stored one. Before the first welcome it is the sign-in's user.
@@ -111,6 +153,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     vv.addEventListener("scroll", syncVisualViewport);
   }
   let closeMoreMenu = null;
+  let closeMoreMenuNow = () => {};
   document.addEventListener("click", e => closeMoreMenu?.(e));
   const canvas = $("#board"), ink = $("#ink"), ctx = canvas.getContext("2d");
   const allFiles = () => ({ ...S.eds.notes.doc.files, ...S.eds.board.doc.files });
@@ -149,7 +192,103 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const el = hitN ?? hitB, on = el ? { stream: hitN ? "notes" : "board", element: isLabel(el) && el.containerId ? el.containerId : el.id } : null;
     collab.startComment(w, on);
   }
-  canvas.addEventListener("contextmenu", e => { if (!collab) return; e.preventDefault(); startComment(at(e)); });
+  const contextMenu = createContextMenu({ host: document.body, doc: document });
+  function pasteAtPoint(worldPoint) {
+    if (!S.may()) { toast("View only: nothing is pasted"); return; }
+    const clip = globalThis.navigator?.clipboard;
+    if (typeof clip?.readText === "function") {
+      clip.readText().then(text => {
+        if (!S.may()) return;
+        if (text) pasteText(text, worldPoint);
+        else { S.paste(undefined, worldPoint); chromeDirty = true; }
+      }).catch(() => {
+        if (!S.may()) return;
+        S.paste(undefined, worldPoint);
+        chromeDirty = true;
+      });
+      return;
+    }
+    S.paste(undefined, worldPoint);
+    chromeDirty = true;
+  }
+  canvas.addEventListener("contextmenu", e => {
+    e.preventDefault();
+    dismissOverlays();
+    const p = at(e);
+    const w = worldAt(p);
+    const n = S.eds.notes, b = S.eds.board;
+    const hitN = hitTest(n.doc, w, n.tol()), hitB = hitN ? null : hitTest(b.doc, w, b.tol());
+    const rawHit = hitN ?? hitB;
+    const hitStream = hitN ? "notes" : hitB ? "board" : null;
+    let hitEl = null;
+    let canWriteHit = false;
+    if (rawHit && hitStream) {
+      const ed = S.eds[hitStream];
+      hitEl = isLabel(rawHit) && rawHit.containerId ? (ed.doc.get(rawHit.containerId) ?? rawHit) : rawHit;
+      const canEditTarget = hitStream === "board"
+        ? S.canWriteStream("board")
+        : (S.canWriteStream("notes") && (S.effective === "presenter" || S.isMine(hitEl.id)));
+      canWriteHit = canEditTarget;
+      const canSelectHit = hitStream === "board"
+        ? S.role === "presenter"
+        : (S.effective === "presenter" || (S.effective !== "viewer" && S.isMine(hitEl.id)));
+      if (canSelectHit && !ed.sel.has(hitEl.id)) {
+        const other = S.eds[hitStream === "board" ? "notes" : "board"];
+        other.select([]);
+        if (S.role === "presenter") S.active = hitStream;
+        ed.select(ed.withGroup(hitEl));
+        chromeDirty = true;
+      }
+    }
+    const stream = hitStream ?? (activeStream() === "notes" ? "notes" : "board");
+    const ed = S.eds[stream];
+    const mode = hitEl ? "element" : "canvas";
+    const canWrite = mode === "element" ? canWriteHit : S.canWriteStream(stream);
+    const copyToSystemClipboard = text => {
+      if (!text) return;
+      try { globalThis.navigator?.clipboard?.writeText?.(text)?.catch?.(() => {}); } catch {}
+    };
+    const items = buildCanvasMenuItems({
+      mode,
+      may: S.may(),
+      canWrite,
+      canPaste: S.may(),
+      canComment: Boolean(collab),
+      canAnnotate: S.effective !== "viewer",
+      stream,
+      selected: hitEl ? (ed.sel.has(hitEl.id) ? ed.selected() : [hitEl]) : [],
+      layers: S.eds.board.doc.layers,
+      activeLayer: S.eds.board.activeLayer,
+      actions: {
+        cut: () => {
+          if (!canWrite) return;
+          const t = S.eds[stream].copy();
+          if (t) { S.act(stream, x => x.deleteIds([...x.sel])); copyToSystemClipboard(t); }
+          chromeDirty = true;
+        },
+        copy: () => {
+          const t = S.eds[stream].copy();
+          copyToSystemClipboard(t);
+        },
+        pasteHere: () => pasteAtPoint(w),
+        duplicate: () => { S.act(stream, x => x.cloneSelection(20, 20)); chromeDirty = true; },
+        del: () => { S.act(stream, x => x.deleteIds([...x.sel])); chromeDirty = true; },
+        group: () => { S.act(stream, x => x.group()); chromeDirty = true; },
+        ungroup: () => { S.act(stream, x => x.ungroup()); chromeDirty = true; },
+        reorder: how => { S.act(stream, x => x.reorder(how)); chromeDirty = true; },
+        moveToLayer: layerId => { S.act("board", x => x.moveToLayer(layerId)); chromeDirty = true; },
+        toggleLock: () => { S.act(stream, x => x.toggleLock()); chromeDirty = true; },
+        addComment: () => startComment(p),
+        selectAll: () => { S.key("a", { cmd: true }); chromeDirty = true; },
+        addStickyNote: () => { S.placeNote(w); chromeDirty = true; },
+        zoomToFit: () => { S.fit(); chromeDirty = true; },
+        resetZoom: () => { S.zoomAt(1); chromeDirty = true; },
+      },
+    });
+    const x = typeof e.clientX === "number" ? e.clientX : p.x;
+    const y = typeof e.clientY === "number" ? e.clientY : p.y;
+    contextMenu.open({ x, y, items, opener: canvas });
+  });
   const image = imageCache(allFiles, () => { dirty = true; });
   let dirty = true, seen = -1;
 
@@ -832,7 +971,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     return bd;
   }
   function dismissOverlays({ keepSheet = false, keepDialog = false } = {}) {
-    if (ui.moreOpen) ui.moreOpen = false;
+    contextMenu.close({ restoreFocus: false });
+    if (ui.moreOpen) closeMoreMenuNow();
     if (why.isOpen()) why.close(false);
     if (!keepSheet && ui.sheet) {
       ui.sheet = null;
@@ -933,35 +1073,141 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const openMoveDialog = () => { dismissOverlays(); chromeDirty = true; startMove({ host: document.body, move, board, opener: moveOpener, reload: refreshMove, restoreFocus: () => canvas.focus?.() }); };
   booted = true; syncMove();
 
+  let userRenamed = false, renameGen = 0, focusBoardTitleAfterRename = false;
+  if (resolveTitle) {
+    Promise.resolve().then(resolveTitle).then(res => {
+      if (!res || userRenamed) return;
+      const t = typeof res === "string"
+        ? res
+        : (typeof res.title === "string" ? res.title : (typeof res.board?.title === "string" ? res.board.title : null));
+      if (typeof res === "object" && typeof res.canRename === "boolean") serverCanRename = res.canRename;
+      if (t !== null && !ui.renamingBoard) {
+        const cleaned = t.replace(CONTROL_BIDI_RE, "").trim();
+        if (cleaned || currentBoardTitle == null) {
+          currentBoardTitle = cleaned;
+          syncDocumentTitle();
+          chromeDirty = true;
+        }
+      } else if (typeof res === "object" && typeof res.canRename === "boolean") {
+        chromeDirty = true;
+      }
+    }).catch(() => {});
+  }
+
+  const canRenameBoard = () => Boolean(doRenameBoard) && S.role === "presenter" && S.may() && serverCanRename !== false;
+  function startBoardRename() {
+    if (!canRenameBoard()) return false;
+    dismissOverlays();
+    ui.renamingBoard = true;
+    chromeDirty = true;
+    return true;
+  }
+  function commitBoardRename(raw) {
+    const cleaned = typeof raw === "string" ? raw.replace(CONTROL_BIDI_RE, "").trim().slice(0, 200) : "";
+    ui.renamingBoard = false;
+    if (!cleaned || cleaned === (currentBoardTitle ?? "")) {
+      chromeDirty = true;
+      return;
+    }
+    const prev = currentBoardTitle;
+    const gen = ++renameGen;
+    userRenamed = true;
+    currentBoardTitle = cleaned;
+    syncDocumentTitle();
+    chromeDirty = true;
+    Promise.resolve().then(() => doRenameBoard?.(cleaned)).then(res => {
+      if (gen !== renameGen) return;
+      if (res && typeof res === "object" && res.error) {
+        currentBoardTitle = prev;
+        syncDocumentTitle();
+        chromeDirty = true;
+        toast("Couldn't rename board");
+        return;
+      }
+      const canonical = typeof res?.board?.title === "string" ? res.board.title.trim()
+        : (typeof res?.title === "string" ? res.title.trim() : null);
+      if (canonical !== null && canonical !== currentBoardTitle) {
+        currentBoardTitle = canonical;
+        syncDocumentTitle();
+        chromeDirty = true;
+      }
+    }).catch(() => {
+      if (gen !== renameGen) return;
+      currentBoardTitle = prev;
+      syncDocumentTitle();
+      chromeDirty = true;
+      toast("Couldn't rename board");
+    });
+  }
+  function openExcalidrawImport() {
+    if (!S.may()) return;
+    picker.click();
+  }
+
   function topbar() {
     const role = S.role, tools = toolsFor(role), may = S.may();
     const core = tools.filter(t => !["image", "note", "highlighter"].includes(t.id)), extras = tools.filter(t => ["image", "note", "highlighter"].includes(t.id));
     const toggleDrawer = type => { ui.drawer = ui.drawer === type ? null : type; chromeDirty = true; };
     const toggleNotes = () => { ui.drawer = ui.drawer ? null : "notes"; chromeDirty = true; };
     const toggleTheme = () => setTheme(ui.theme === "dark" ? "light" : "dark");
+    const toggleGrid = () => { S.act("board", e => e.setAppState({ grid: e.grid ? 0 : 20 }), { settings: true }); chromeDirty = true; };
     const togglePanel = () => setPanel({ type: "open" });
     const toggleExport = () => openDialog("export");
-    const extraAction = (icName, label, action, disabled = false) => h("button.header-extra.btn.ghost", { role: "menuitem", "aria-label": label, title: label, disabled, onclick: () => { setMore(false); action(); } }, icon(icName, { size: 15 }), label);
+    const gridOn = Boolean(S.eds.board.grid);
+    const boardMenuItem = (icName, ariaLabel, visibleLabel, action, { disabled = false, kbd = "", badge = "", on = false } = {}) =>
+      h("button.header-extra.btn.ghost.board-menu-item" + (on ? ".on" : ""), {
+        type: "button", role: "menuitem", "aria-label": ariaLabel, title: visibleLabel, disabled,
+        onclick: () => { setMore(false); action(); },
+      },
+      h("span.bm-ic", {}, icon(icName, { size: 15 })),
+      h("span.bm-lab", {}, visibleLabel),
+      badge ? h("span.bm-badge", {}, badge) : null,
+      kbd ? h("kbd.bm-kbd", {}, kbd) : null);
+    const menuSection = (title, items) => {
+      const live = items.filter(Boolean);
+      if (!live.length) return null;
+      return h("div.bm-section", { role: "group", "aria-label": title },
+        h("div.bm-section-head", { "aria-hidden": "true" }, title),
+        live);
+    };
     const moreOpen = !!ui.moreOpen;
     let menu;
     const menuItems = () => {
       const items = [];
-      const visit = node => { for (const child of node?.children ?? []) { if (child.getAttribute("role") === "menuitem") items.push(child); else visit(child); } };
+      const visit = node => { for (const child of node?.children ?? []) { if (child.getAttribute("role") === "menuitem" && !child.disabled) items.push(child); else visit(child); } };
       visit(menu);
       return items;
     };
     const setMore = (open, focus = false) => {
+      if (open) contextMenu.close({ restoreFocus: false });
       ui.moreOpen = open; more.setAttribute("aria-expanded", String(open)); menu.hidden = !open;
       if (focus) more.focus?.();
       else if (open) menuItems()[0]?.focus?.();
     };
-    const more = h("button.tb.header-more", { title: "More", "aria-label": "More", "aria-haspopup": "menu", "aria-expanded": String(moreOpen), onclick: () => {
+    const more = h("button.tb.header-more", { type: "button", title: "Board menu", "aria-label": "More", "aria-haspopup": "menu", "aria-expanded": String(moreOpen), onclick: () => {
       setMore(!ui.moreOpen);
     }, onkeydown: e => {
       if (e.key === "ArrowDown" && !ui.moreOpen) { e.preventDefault(); setMore(true); }
       else if (e.key === "Escape" && ui.moreOpen) { e.preventDefault(); setMore(false, true); }
-    } }, h("span.ic", {}, icon("more", { size: 17 })), "More");
-    menu = h("div.header-more-menu", { role: "menu", hidden: !moreOpen, onkeydown: e => {
+    } }, h("span.ic", {}, icon("menu", { size: 17 })), h("span.header-more-label", {}, "Menu"));
+    const boardSection = menuSection("Board", [
+      canRenameBoard() ? boardMenuItem("edit", "Rename board", "Rename board", () => startBoardRename()) : null,
+      role === "presenter" ? boardMenuItem("export", "Export", "Export SVG / PNG / .excalidraw", toggleExport, { kbd: "⌘⇧E" }) : null,
+      role === "presenter" ? boardMenuItem("importFile", "Import .excalidraw", "Import .excalidraw", openExcalidrawImport, { disabled: !may }) : null,
+      role === "presenter" ? boardMenuItem("mermaid", "Mermaid", "Insert Mermaid", () => openDialog("mermaid"), { disabled: !may }) : null,
+    ]);
+    const viewSection = menuSection("View", [
+      boardMenuItem(ui.theme === "dark" ? "sun" : "moon", "Light / dark", ui.theme === "dark" ? "Light theme" : "Dark theme", toggleTheme),
+      role === "presenter" ? boardMenuItem("grid", "Toggle grid", "Snap to grid", toggleGrid, { disabled: !may, kbd: "⌘'", badge: gridOn ? "On" : "", on: gridOn }) : null,
+      role !== "viewer" ? boardMenuItem("panel", "Side panel", "Side panel", togglePanel, { kbd: "I", badge: ui.panel.open ? "On" : "", on: ui.panel.open }) : null,
+    ]);
+    const collabSection = menuSection("Collaborate", [
+      boardMenuItem("note", "Notes", "Notes", toggleNotes, { badge: String(notesCount()), on: ui.drawer === "notes" }),
+      collab ? boardMenuItem("comments", "Comments", "Comments", () => toggleDrawer("comments"), { on: ui.drawer === "comments" }) : null,
+      share && S.canShare ? boardMenuItem("share", "Share", "Share board", () => openShareDialog()) : (admin ? boardMenuItem("share", "Share", "Share board", () => openAdminShare()) : null),
+      canMove() ? boardMenuItem("moveToLayer", "Move to…", "Move to…", openMoveDialog) : null,
+    ]);
+    menu = h("div.header-more-menu.board-menu", { role: "menu", "aria-label": "Board menu", hidden: !moreOpen, onkeydown: e => {
       if (e.key === "Escape") { e.preventDefault(); setMore(false, true); }
       else if (e.key === "Tab") setMore(false);
       else {
@@ -973,16 +1219,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         else if (e.key === "End") next = items.at(-1);
         if (next) { e.preventDefault(); next.focus?.(); }
       }
-    } }, [
-      collab ? extraAction("comments", "Comments", () => toggleDrawer("comments")) : null,
-      extraAction("note", "Notes", toggleNotes),
-      role === "presenter" ? extraAction("mermaid", "Mermaid", () => openDialog("mermaid"), !may) : null,
-      role === "presenter" ? extraAction("export", "Export", toggleExport) : null,
-      share && S.canShare ? extraAction("share", "Share", () => openShareDialog()) : (admin ? extraAction("share", "Share", () => openAdminShare()) : null),
-      canMove() ? extraAction("moveToLayer", "Move to…", openMoveDialog) : null,
-      role !== "viewer" ? extraAction("panel", "Side panel", togglePanel) : null,
-      extraAction(ui.theme === "dark" ? "sun" : "moon", "Light / dark", toggleTheme),
-    ]);
+    } }, [boardSection, viewSection, collabSection]);
     const actions = h("div.island.top-right.header-actions", {},
       role === "presenter" ? [
         h("button.btn.ghost.desk-only.header-extra", { title: "Insert a Mermaid flowchart", "aria-label": "Insert Mermaid flowchart", disabled: !may, onclick: () => openDialog("mermaid") }, icon("mermaid", { size: 16 })),
@@ -1000,16 +1237,57 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       role !== "viewer" ? h("button.tb.desk-only.header-extra" + (ui.panel.open ? ".on" : ""), { title: "Side panel (I)", "aria-label": "Inspector panel", "aria-expanded": String(ui.panel.open), onclick: togglePanel }, h("span.ic", {}, icon("panel", { size: 17 })), h("span.k", {}, "I")) : null,
       h("button.tb.header-extra" + (role === "viewer" ? "" : ".theme-btn"), { title: "Light / dark", "aria-label": "Toggle color theme", "aria-pressed": String(ui.theme === "dark"), onclick: toggleTheme }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 17 }))),
       role !== "viewer" ? h("button.tb.phone-only.paste-btn", { title: "Paste from clipboard", "aria-label": "Paste from clipboard", "data-action": "paste", disabled: !may, onclick: () => { pasteFromClipboard(); } }, h("span.ic", {}, icon("paste", { size: 18 }))) : null,
-      h("button.tb.phone-only.overflow-btn", { title: "More", "aria-label": "More options", "aria-haspopup": "dialog", "aria-expanded": String(ui.sheet === "tools"), onclick: e => { setSheet(ui.sheet === "tools" ? null : "tools", { opener: e?.currentTarget }); } }, h("span.ic", {}, icon("more", { size: 18 }))),
+      h("button.tb.phone-only.overflow-btn", { title: "Board menu", "aria-label": "More options", "aria-haspopup": "dialog", "aria-expanded": String(ui.sheet === "tools"), onclick: e => { setSheet(ui.sheet === "tools" ? null : "tools", { opener: e?.currentTarget }); } }, h("span.ic", {}, icon("menu", { size: 18 }))),
       more, menu);
     closeMoreMenu = e => { if (ui.moreOpen && !actions.contains(e.target)) setMore(false); };
+    closeMoreMenuNow = () => { if (ui.moreOpen) setMore(false); };
     const brandHref = homeHref || (admin ? "/" : null);
+    const titleText = displayBoardTitle();
+    let titleNode;
+    if (ui.renamingBoard && canRenameBoard()) {
+      let cancelled = false;
+      const input = h("input.board-name-input", {
+        type: "text",
+        "aria-label": "Board title",
+        maxLength: 200,
+        placeholder: "Untitled board",
+        value: currentBoardTitle || (isRawBoardId(board) ? "" : board),
+        onkeydown: e => {
+          e.stopPropagation();
+          if (e.key === "Enter") {
+            e.preventDefault();
+            focusBoardTitleAfterRename = true;
+            commitBoardRename(input.value);
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            cancelled = true;
+            focusBoardTitleAfterRename = true;
+            ui.renamingBoard = false;
+            chromeDirty = true;
+          }
+        },
+        onblur: () => {
+          if (cancelled || !ui.renamingBoard) return;
+          commitBoardRename(input.value);
+        },
+      });
+      titleNode = input;
+    } else if (canRenameBoard()) {
+      titleNode = h("button.board-name.board-name-btn", {
+        type: "button",
+        title: `${titleText} — click to rename`,
+        "aria-label": `Rename board: ${titleText}`,
+        onclick: () => startBoardRename(),
+      }, titleText, net.kind === "ws" ? null : [" ", h("small", {}, "· dev room")]);
+    } else {
+      titleNode = h("span.board-name", { title: titleText }, titleText, net.kind === "ws" ? null : [" ", h("small", {}, "· dev room")]);
+    }
     return [
       h("div.island.top-left", {},
         brandHref
           ? h("a.brand-mark", { href: brandHref, title: homeHref ? "Home" : "All boards", "aria-label": homeHref ? "Home" : "All boards", style: { textDecoration: "none" } }, icon("brand", { size: 15 }))
           : h("span.brand-mark", { "aria-hidden": "true" }, icon("brand", { size: 15 })),
-        h("span.board-name", {}, board, net.kind === "ws" ? null : [" ", h("small", {}, "· dev room")]),
+        titleNode,
         moveInfo.space ? h("span.board-space", { title: "The Space this board is in" }, "in ", moveInfo.space.name) : null),
       h("div.tools.desk-only.island.tool-rail", { "aria-label": "Drawing tools" }, core.map(t => toolButton(t)), extras.length ? h("span.sep") : null, extras.map(t => toolButton(t, ".new")),
         role !== "viewer" ? [h("span.sep"),
@@ -1217,8 +1495,15 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
             h("button.btn.sheet-action", { disabled: !may, "data-action": "paste", "aria-label": "Paste from clipboard", onclick: () => { pasteFromClipboard().then(ok => { if (ok && ui.sheet === "tools") setSheet(null, { restore: false }); }); } }, icon("paste", { size: 18 }), "Paste"),
             h("button.btn.sheet-action", { disabled: !may, "data-action": "media", "aria-label": "Insert photo or video", onclick: () => { openPicker(); setSheet(null, { restore: false }); } }, icon("image", { size: 18 }), "Photo / Video"))
         : null;
+      const gridOn = Boolean(S.eds.board.grid);
       body = h("div.scroll", {}, quickActions, h("div.tool-grid", {}, toolsFor(S.role).map(t => h("button.tb" + (S.tool === t.id ? ".on" : ""), { disabled: t.id !== "hand" && !may, "data-tool": t.id, "aria-label": t.name, "aria-pressed": String(S.tool === t.id), onclick: () => { if (t.id === "image") openPicker(); S.setTool(t.id); setSheet(null, { restore: false }); } }, h("span.ic", {}, icon(t.id, { size: 20 })), t.name)),
-        S.role === "presenter" ? [h("button.tb", { disabled: !may, "aria-haspopup": "dialog", onclick: () => openDialog("mermaid") }, h("span.ic", {}, icon("mermaid", { size: 20 })), "Mermaid"), h("button.tb", { "aria-haspopup": "dialog", onclick: () => openDialog("export") }, h("span.ic", {}, icon("export", { size: 20 })), "Export")] : null,
+        canRenameBoard() ? h("button.tb", { "aria-label": "Rename board", onclick: () => { setSheet(null, { restore: false }); startBoardRename(); } }, h("span.ic", {}, icon("edit", { size: 20 })), "Rename") : null,
+        S.role === "presenter" ? [
+          h("button.tb", { disabled: !may, "aria-haspopup": "dialog", onclick: () => openDialog("mermaid") }, h("span.ic", {}, icon("mermaid", { size: 20 })), "Mermaid"),
+          h("button.tb", { "aria-haspopup": "dialog", onclick: () => openDialog("export") }, h("span.ic", {}, icon("export", { size: 20 })), "Export"),
+          h("button.tb", { disabled: !may, "aria-label": "Import .excalidraw", onclick: () => { openExcalidrawImport(); setSheet(null, { restore: false }); } }, h("span.ic", {}, icon("importFile", { size: 20 })), "Import"),
+          h("button.tb" + (gridOn ? ".on" : ""), { disabled: !may, "aria-label": "Toggle grid", "aria-pressed": String(gridOn), onclick: () => { S.act("board", e => e.setAppState({ grid: e.grid ? 0 : 20 }), { settings: true }); chromeDirty = true; } }, h("span.ic", {}, icon("grid", { size: 20 })), "Grid"),
+        ] : null,
         share && S.canShare
           ? h("button.tb", { "aria-haspopup": "dialog", onclick: () => { setSheet(null, { restore: false }); openShareDialog(); } }, h("span.ic", {}, icon("share", { size: 20 })), "Share")
           : (admin ? h("button.tb", { "aria-haspopup": "dialog", onclick: () => { setSheet(null, { restore: false }); openAdminShare(); } }, h("span.ic", {}, icon("share", { size: 20 })), "Share") : null),
@@ -1365,7 +1650,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // Don't rebuild a panel or drawer the user is typing in.
   const busy = el => el.contains(document.activeElement) && /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName);
   // What every part depends on from the page and the session (a change rebuilds them all, as chromeDirty does).
-  const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.colorPicker, ui.library.length, S.canShare, canMove()].join("|");
+  const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.colorPicker, ui.library.length, S.canShare, canMove(), currentBoardTitle ?? "", ui.renamingBoard, serverCanRename, S.eds.board.grid].join("|");
   const notesRowsKey = () => {
     const { notes, labels } = notesInfo(S.eds.notes.doc);
     return JSON.stringify([notes.length, S.mine.size, notes.slice(0, 200).map(e => [e.id, e.text ?? labels.get(e.id)?.text ?? "", e.backgroundColor, e.strokeColor, S.isMine(e.id)])]);
@@ -1387,6 +1672,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   };
   const buildTopbar = () => {
     const root = $("#topbar"), active = document.activeElement;
+    if (ui.renamingBoard && busy(root)) return false;
     const ownsFocus = root.contains(active);
     const identity = ownsFocus && {
       ariaLabel: active.getAttribute?.("aria-label"),
@@ -1394,6 +1680,16 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       role: active.getAttribute?.("role"),
     };
     replace(root, topbar());
+    if (ui.renamingBoard) {
+      const inp = /** @type {HTMLInputElement | null} */ (root.querySelector?.("input.board-name-input") ?? root.all?.().find(e => e.tagName === "INPUT" && e.classList?.contains("board-name-input")));
+      if (inp) { inp.focus?.(); inp.select?.(); }
+      return root;
+    }
+    if (focusBoardTitleAfterRename) {
+      focusBoardTitleAfterRename = false;
+      const btn = /** @type {HTMLElement | null} */ (root.querySelector?.(".board-name-btn") ?? root.all?.().find(e => e.classList?.contains("board-name-btn")));
+      if (btn) { btn.focus?.(); return root; }
+    }
     if (!identity) return root;
     const descendants = [];
     const visit = el => { for (const child of el.children) { descendants.push(child); visit(child); } };
@@ -1407,7 +1703,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     return root;
   };
   const parts = {
-    topbar: { key: () => `${notesCount()}${S.canShare ? ":share" : ""}${canMove() ? ":move" : ""}:${moveInfo.space?.id ?? ""}:${moveInfo.space?.name ?? ""}`, build: buildTopbar },
+    topbar: { key: () => `${notesCount()}${S.canShare ? ":share" : ""}${canMove() ? ":move" : ""}:${moveInfo.space?.id ?? ""}:${moveInfo.space?.name ?? ""}:${currentBoardTitle ?? ""}:${ui.renamingBoard ? "1" : "0"}:${S.eds.board.grid}`, build: buildTopbar },
     panel: { key: () => (S.role === "viewer" || !ui.panel.open ? "" : panelKey()), build: buildPanel },
     drawer: { key: () => (ui.drawer === "notes" ? notesRowsKey() : ""), build: buildDrawer },
     timeline: { key: () => { const B = S.eds.board, bi = boardInfo(B.doc), t = B.time(); return S.role !== "presenter" ? "" : JSON.stringify([bi.marks, bi.spansSig, bi.dur, !!B.play, B.playLoop, B.playSpeed, B.reducedMotion, B.play ? null : t]); }, build: timeline },
@@ -1608,7 +1904,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     activeShare = mountShareDialog({
       root: $("#dialogs"),
       board,
-      boardTitle: board,
+      boardTitle: displayBoardTitle(),
       role: S.effective ?? me.role ?? "viewer",
       isAdmin: S.effective === "owner",
       admin,

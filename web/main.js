@@ -99,12 +99,14 @@ if (!signIn.token) {
     detail: signInNotice(/** @type {any} */ ({ ...signIn, dev: null })) ?? hint ?? "Sign in with your work Google account to open this board.",
     link: menu ? null : signInLink, links: menu ? devLinks(menu, board ?? menu.board) : [],
   });
-} else if (!board) {
+} else {
+  const spacesApi = httpSpaces({ fetch: fetchNow, token: signIn.token, timers: clock });
+  const orgApi = httpAdmin({ fetch: fetchNow, token: signIn.token });
+  if (!board) {
   // Signed in with no board in the link: Home (PROTOCOL.md § Home). Its sign-in expiry shows as "signed out" with a link back in.
   document.querySelector(".app")?.remove();
   const root = document.createElement("div");
   document.body.append(root);
-  const spacesApi = httpSpaces({ fetch: fetchNow, token: signIn.token, timers: clock });
   const hrefs = { home: location.pathname, board: id => hrefTo({ board: id }), space: id => hrefTo({ space: id }), group: id => hrefTo({ group: id }),
     team: id => hrefTo({ team: id }), teams: hrefTo({ teams: "1" }), roles: hrefTo({ roles: "1" }), offboard: hrefTo({ offboard: "1" }), trash: hrefTo({ trash: "1" }), access: (type, id) => hrefTo({ access: `${type}:${id}` }) };
   const dialogs = createDialogs({ host: root, api: spacesApi, hrefs, go: href => location.assign(href) });
@@ -138,7 +140,7 @@ if (!signIn.token) {
   } else {
     const model = createHomeModel({ api: httpHome({ fetch: fetchNow, token: signIn.token, timers: clock }), clock });
     mountHome({ root, model, clock, signIn: signInLink, homeHref: location.pathname, dialogs,
-      org: httpAdmin({ fetch: fetchNow, token: signIn.token }),
+      org: orgApi,
       boardHref: hrefs.board, spaceHref: hrefs.space, groupHref: hrefs.group, teamsHref: hrefs.teams, trashHref: hrefs.trash, rolesHref: hrefs.roles, offboardHref: hrefs.offboard, unitAccessHref: id => hrefs.access("unit", id),
       move: { port: httpMove({ fetch: fetchNow, token: signIn.token, timers: clock }), clock, newKey: () => randomKey() } });
     hideGate();
@@ -149,8 +151,19 @@ if (!signIn.token) {
   const me = { role: null, user: id?.user ?? "me", name: id?.name ?? id?.email ?? "You", email: id?.email ?? null, domain: id?.domain ?? null };
   const net = wsNet({ url: sameOriginWsUrl(location), WebSocket: globalThis.WebSocket, clock, fetch: fetchNow, inflate: browserInflate() });
   let inTrash = false;   // the Trash notice is showing: the room's "refused" banner would send the person to sign in for nothing
+  const getBoardTitle = async () => {
+    try {
+      const res = await orgApi.listBoards();
+      const hit = res?.boards?.find(b => b.id === board);
+      return hit ? { title: typeof hit.title === "string" ? hit.title : "" } : null;
+    } catch {
+      return null;
+    }
+  };
   const app = mountApp({
     trashShown: () => inTrash,
+    getBoardTitle,
+    renameBoard: title => spacesApi.renameBoard(board, title),
     startSession: ({ mine, onChange }) => {
       // A board that refuses the visit may be in Trash (PROTOCOL.md § Trash and restore): ask once, and say so over the page when it is; any other answer leaves the page's own refusal.
       let session = null, asked = false;
@@ -186,4 +199,5 @@ if (!signIn.token) {
   });
   hideGate();
   globalThis.plenary = app;
+  }
 }

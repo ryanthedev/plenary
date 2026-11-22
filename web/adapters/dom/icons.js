@@ -220,6 +220,79 @@ export const ICONS = Object.freeze({
     ["circle", { cx: 16, cy: 11.5, r: 1, fill: "currentColor" }],
     ["circle", { cx: 11, cy: 15, r: 1, fill: "currentColor" }],
   ],
+  menu: [
+    ["line", { x1: 4, y1: 6.5, x2: 20, y2: 6.5 }],
+    ["line", { x1: 4, y1: 12, x2: 20, y2: 12 }],
+    ["line", { x1: 4, y1: 17.5, x2: 20, y2: 17.5 }],
+  ],
+  edit: [
+    ["path", { d: "M12 20h9" }],
+    ["path", { d: "M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" }],
+  ],
+  importFile: [
+    ["path", { d: "M20 15v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-4" }],
+    ["polyline", { points: "16 8 12 4 8 8" }],
+    ["line", { x1: 12, y1: 4, x2: 12, y2: 15 }],
+  ],
+  grid: [
+    ["rect", { x: 4, y: 4, width: 6.5, height: 6.5, rx: 1 }],
+    ["rect", { x: 13.5, y: 4, width: 6.5, height: 6.5, rx: 1 }],
+    ["rect", { x: 4, y: 13.5, width: 6.5, height: 6.5, rx: 1 }],
+    ["rect", { x: 13.5, y: 13.5, width: 6.5, height: 6.5, rx: 1 }],
+  ],
+  cut: [
+    ["circle", { cx: 6, cy: 6, r: 2.5 }],
+    ["circle", { cx: 6, cy: 18, r: 2.5 }],
+    ["line", { x1: 20, y1: 4, x2: 8.1, y2: 15.9 }],
+    ["line", { x1: 14.5, y1: 14.5, x2: 20, y2: 20 }],
+    ["line", { x1: 8.1, y1: 8.1, x2: 12, y2: 12 }],
+  ],
+  copy: [
+    ["rect", { x: 9, y: 9, width: 11, height: 11, rx: 2 }],
+    ["path", { d: "M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" }],
+  ],
+  group: [
+    ["rect", { x: 3.5, y: 3.5, width: 17, height: 17, rx: 2, "stroke-dasharray": "3 2" }],
+    ["rect", { x: 7, y: 7, width: 5, height: 5, rx: 1 }],
+    ["rect", { x: 12, y: 12, width: 5, height: 5, rx: 1 }],
+  ],
+  ungroup: [
+    ["rect", { x: 4, y: 4, width: 7, height: 7, rx: 1.5 }],
+    ["rect", { x: 13, y: 13, width: 7, height: 7, rx: 1.5 }],
+    ["line", { x1: 14, y1: 6, x2: 18, y2: 6 }],
+    ["line", { x1: 6, y1: 18, x2: 10, y2: 18 }],
+  ],
+  bringFront: [
+    ["rect", { x: 4, y: 4, width: 10, height: 10, rx: 1.5 }],
+    ["path", { d: "M14 10h4.5A1.5 1.5 0 0 1 20 11.5v7a1.5 1.5 0 0 1-1.5 1.5h-7A1.5 1.5 0 0 1 10 18.5V14" }],
+  ],
+  bringForward: [
+    ["polyline", { points: "7 13 12 8 17 13" }],
+    ["line", { x1: 12, y1: 8, x2: 12, y2: 19 }],
+    ["line", { x1: 5, y1: 5, x2: 19, y2: 5 }],
+  ],
+  sendBackward: [
+    ["polyline", { points: "7 11 12 16 17 11" }],
+    ["line", { x1: 12, y1: 16, x2: 12, y2: 5 }],
+    ["line", { x1: 5, y1: 19, x2: 19, y2: 19 }],
+  ],
+  sendBack: [
+    ["rect", { x: 10, y: 10, width: 10, height: 10, rx: 1.5 }],
+    ["path", { d: "M10 14H5.5A1.5 1.5 0 0 1 4 12.5v-7A1.5 1.5 0 0 1 5.5 4h7A1.5 1.5 0 0 1 14 5.5V10" }],
+  ],
+  layers: [
+    ["polygon", { points: "12 3 3 8 12 13 21 8 12 3" }],
+    ["polyline", { points: "3 13 12 18 21 13" }],
+    ["polyline", { points: "3 17.5 12 22 21 17.5" }],
+  ],
+  selectAll: [
+    ["rect", { x: 4, y: 4, width: 16, height: 16, rx: 2, "stroke-dasharray": "3 2.5" }],
+    ["rect", { x: 8, y: 8, width: 8, height: 8, rx: 1 }],
+  ],
+  zoomReset: [
+    ["circle", { cx: 12, cy: 12, r: 7 }],
+    ["circle", { cx: 12, cy: 12, r: 2, fill: "currentColor" }],
+  ],
 });
 
 function createSvgNode(tag) {

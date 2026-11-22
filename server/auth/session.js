@@ -12,13 +12,14 @@ import { b64url, unb64url, utf8, fromUtf8 } from "./util.js";
 /** @typedef {import("./idp-port.js").Identity} Identity */
 /** @typedef {import("./idp-port.js").Session} Session */
 
-/** @param {{ key: Uint8Array|string, ttlSec?: number, snapshotTtlSec?: number, now?: () => number }} config */
-export async function sessions({ key, ttlSec = 12 * 3600, snapshotTtlSec = 300, now = Date.now }) {
+/** @param {{ key: Uint8Array|string, ttlSec?: number, snapshotTtlSec?: number, blobTtlSec?: number, now?: () => number }} config */
+export async function sessions({ key, ttlSec = 12 * 3600, snapshotTtlSec = 300, blobTtlSec = 300, now = Date.now }) {
   const raw = typeof key === "string" ? utf8(key) : key;
   if (!raw || raw.length < 32) throw new Error("session: key must be at least 32 bytes");
   // `exp` = iat + ttlSec must be an integer (the Verifier port and the exchange's 200 body promise one).
   if (!Number.isInteger(ttlSec) || ttlSec <= 0) throw new Error("session: ttlSec must be a positive integer");
   if (!Number.isInteger(snapshotTtlSec) || snapshotTtlSec <= 0) throw new Error("session: snapshotTtlSec must be a positive integer");
+  if (!Number.isInteger(blobTtlSec) || blobTtlSec <= 0) throw new Error("session: blobTtlSec must be a positive integer");
   const k = await crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
 
   return {
@@ -66,6 +67,34 @@ export async function sessions({ key, ttlSec = 12 * 3600, snapshotTtlSec = 300, 
         if (typeof c?.b !== "string" || !c.b || !Number.isSafeInteger(c.s) || c.s < 0 || !Number.isInteger(c.exp)) return null;
         if (Math.floor(now() / 1000) >= c.exp) return null;
         return { board: c.b, seq: c.s, exp: c.exp };
+      } catch { return null; }
+    },
+    /** Short-lived HMAC-signed ticket for HTTP blob GET/PUT (PROTOCOL.md § Blobs). Prefix "blob1." is isolated from s1./l1./x1./snap1. */
+    async issueBlobTicket(tenant, sha1, verb, ttl = blobTtlSec) {
+      if (typeof tenant !== "string" || !tenant || tenant.length > 128) throw new Error("session: blob ticket requires tenant id");
+      if (typeof sha1 !== "string" || !/^[0-9a-f]{40}$/.test(sha1)) throw new Error("session: blob ticket requires 40-char lowercase hex sha1");
+      if (verb !== "get" && verb !== "put") throw new Error("session: blob ticket verb must be get or put");
+      if (!Number.isInteger(ttl) || ttl <= 0) throw new Error("session: blob ticket ttl must be a positive integer");
+      const exp = Math.floor(now() / 1000) + ttl;
+      const payload = b64url(utf8(JSON.stringify({ t: tenant, h: sha1, v: verb, exp })));
+      const mac = await crypto.subtle.sign("HMAC", k, utf8("blob1." + payload));
+      return `blob1.${payload}.${b64url(mac)}`;
+    },
+    /** Verify a blob ticket offline (timing-safe HMAC). Returns `{ tenant, sha1, verb, exp }` or null. */
+    async verifyBlobTicket(ticket) {
+      if (typeof ticket !== "string" || ticket.length > 1024 || !ticket.startsWith("blob1.")) return null;
+      const parts = ticket.split(".");
+      if (parts.length !== 3) return null;
+      try {
+        const ok = await crypto.subtle.verify("HMAC", k, unb64url(parts[2]), utf8("blob1." + parts[1]));
+        if (!ok) return null;
+        const c = JSON.parse(fromUtf8(unb64url(parts[1])));
+        if (typeof c?.t !== "string" || !c.t || c.t.length > 128) return null;
+        if (typeof c?.h !== "string" || !/^[0-9a-f]{40}$/.test(c.h)) return null;
+        if (c?.v !== "get" && c?.v !== "put") return null;
+        if (!Number.isInteger(c?.exp)) return null;
+        if (Math.floor(now() / 1000) >= c.exp) return null;
+        return { tenant: c.t, sha1: c.h, verb: c.v, exp: c.exp };
       } catch { return null; }
     },
   };

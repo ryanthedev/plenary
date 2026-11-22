@@ -58,7 +58,7 @@ if (!signIn.token) {
   const net = wsNet({ url: sameOriginWsUrl(location), WebSocket: globalThis.WebSocket, clock, fetch: (...a) => globalThis.fetch(...a) });
   const app = mountApp({
     startSession: ({ mine, onChange }) => createSession({
-      join: () => net.join(), fetchSnapshot: net.fetchSnapshot, token: signIn.token, board, client: "web", user: me.user, mine, onChange, clock,
+      join: () => net.join(), fetchSnapshot: net.fetchSnapshot, uploadBlob: net.uploadBlob, fetchBlob: net.fetchBlob, token: signIn.token, board, client: "web", user: me.user, mine, onChange, clock,
     }),
     net, board, me, prefs: localStore(), theme: q.get("theme"),
     // The collaboration UI over this session (presence and records ride the board connection; web/adapters/collab/sync.js).

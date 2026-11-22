@@ -63,7 +63,7 @@ export function mintTab(random) {
  *   clock: the clock port (the root passes browserClock()); the Editors' clock is its now(). timers / now / random:
  *   handed to sync.js over the clock's (tests). No global fallback: sync.js throws without a clock.
  */
-export function createSession({ join, fetchSnapshot = null, token, board, client = "web", tab = null, mine = [], noteAuthor = () => null, user = null, onChange = () => {}, clock, timers, now, random } = {}) {
+export function createSession({ join, fetchSnapshot = null, uploadBlob = null, fetchBlob = null, token, board, client = "web", tab = null, mine = [], noteAuthor = () => null, user = null, onChange = () => {}, clock, timers, now, random } = {}) {
   const wall = now ?? clock?.now;
   const edClock = typeof wall === "function" ? () => wall() : undefined;
   const eds = { board: new Editor({ clock: edClock }), notes: new Editor({ clock: edClock }) };
@@ -92,14 +92,99 @@ export function createSession({ join, fetchSnapshot = null, token, board, client
   /** fn(status) on every status change of the link. */
   s.onStatus = fn => { statusFns.add(fn); return () => statusFns.delete(fn); };
 
+  const SHA1_RE = /^[0-9a-f]{40}$/;
+  const MAX_CONCURRENT_BLOBS = 4;
+  const MAX_BLOB_RETRIES = 3;
+  const blobTimerApi = timers ?? (clock ? { set: clock.set, clear: clock.clear } : null);
+  const inFlightBlobs = new Set();
+  const queuedBlobs = new Set();
+  /** @type {{ fileId: string, attempt: number }[]} */
+  const blobQueue = [];
+  const blobRetryTimers = new Set();
+  let activeBlobs = 0;
+  let blobsClosed = false;
+
+  function stopBlobs() {
+    blobsClosed = true;
+    blobQueue.length = 0;
+    queuedBlobs.clear();
+    if (blobTimerApi?.clear) {
+      for (const h of blobRetryTimers) { try { blobTimerApi.clear(h); } catch {} }
+    }
+    blobRetryTimers.clear();
+  }
+
+  function drainBlobQueue() {
+    if (blobsClosed || typeof fetchBlob !== "function") return;
+    while (activeBlobs < MAX_CONCURRENT_BLOBS && blobQueue.length) {
+      const item = blobQueue.shift();
+      queuedBlobs.delete(item.fileId);
+      if (eds.board.doc.files[item.fileId] || eds.notes.doc.files[item.fileId]) continue;
+      if (inFlightBlobs.has(item.fileId)) continue;
+      inFlightBlobs.add(item.fileId);
+      activeBlobs++;
+      Promise.resolve()
+        .then(() => C.requestBlobUrl(item.fileId, { put: false }))
+        .then(url => fetchBlob(url))
+        .then(({ mimeType, dataURL }) => {
+          if (blobsClosed) return;
+          s.receiveFiles({ [item.fileId]: { id: item.fileId, mimeType, dataURL, created: typeof wall === "function" ? wall() : 0 } });
+          onChange();
+        })
+        .catch(err => {
+          if (blobsClosed) return;
+          const code = err?.code;
+          const permanent = code === "bad-op" || code === "forbidden" || code === "unavailable";
+          if (!permanent && item.attempt < MAX_BLOB_RETRIES && typeof blobTimerApi?.set === "function") {
+            const delayMs = 250 * (2 ** item.attempt);
+            const h = blobTimerApi.set(() => {
+              blobRetryTimers.delete(h);
+              if (blobsClosed) return;
+              if (eds.board.doc.files[item.fileId] || eds.notes.doc.files[item.fileId]) return;
+              if (inFlightBlobs.has(item.fileId) || queuedBlobs.has(item.fileId)) return;
+              queuedBlobs.add(item.fileId);
+              blobQueue.push({ fileId: item.fileId, attempt: item.attempt + 1 });
+              drainBlobQueue();
+            }, delayMs);
+            blobRetryTimers.add(h);
+          }
+        })
+        .finally(() => {
+          inFlightBlobs.delete(item.fileId);
+          activeBlobs--;
+          drainBlobQueue();
+        });
+    }
+  }
+
+  function ensureBlob(fileId) {
+    if (blobsClosed || typeof fetchBlob !== "function" || !SHA1_RE.test(fileId)) return;
+    if (eds.board.doc.files[fileId] || eds.notes.doc.files[fileId]) return;
+    if (inFlightBlobs.has(fileId) || queuedBlobs.has(fileId)) return;
+    queuedBlobs.add(fileId);
+    blobQueue.push({ fileId, attempt: 0 });
+    drainBlobQueue();
+  }
+  function scanMissingBlobs() {
+    if (blobsClosed || typeof fetchBlob !== "function") return;
+    for (const ed of Object.values(eds)) {
+      for (const el of ed.doc.live()) {
+        if (el.type === "image" && el.fileId) ensureBlob(el.fileId);
+      }
+    }
+  }
+
   const wire = openLink({ transport: link, ...(typeof fetchSnapshot === "function" ? { fetchSnapshot } : {}), token, board, client, tab: s.tab,
-    onStatus: st => { s.refreshRole(); for (const fn of [...statusFns]) fn(st); onChange(); },
+    onStatus: st => { s.refreshRole(); if (st === "live") scanMissingBlobs(); for (const fn of [...statusFns]) fn(st); onChange(); },
     onHeard: () => { for (const fn of [...heardFns]) fn(); },
+    onImages: ids => { for (const id of ids) ensureBlob(id); },
     onRoom: ev => { if (ev.type === "settings" || ev.type === "limit") onChange(); for (const fn of [...roomFns]) fn(ev.type === "settings" ? ev.stream : "board", ev); },
     ...clocked });
   /** The link alone (sync.js's link members: status, role, user, client, presence, records, notes reads). */
   s.connection = wire.api;
   const C = wire.api;
+  const rawClose = C.close;
+  C.close = () => { stopBlobs(); rawClose(); };
   // Note ids the room has sequenced (so a write to one is a change, not a create), and who the room says this
   // connection is (welcome.user, checked by the gateway): the note lock uses it, never the sign-in identity, which is
   // display-only (p6-landv L5). `user` (the root's) is only a fallback before welcome.
@@ -319,6 +404,13 @@ export function createSession({ join, fetchSnapshot = null, token, board, client
     let id = null;
     s.act(stream, ed => { id = ed.addImage(file, at); });
     return id;
+  };
+  /** Upload picture bytes via signed PUT URL over the active WS link + HTTP blob adapter. */
+  s.uploadBlob = async (sha1, bytes, mimeType) => {
+    if (typeof uploadBlob !== "function") return false;
+    const url = await C.requestBlobUrl(sha1, { put: true });
+    await uploadBlob(url, bytes, mimeType);
+    return true;
   };
   /** Picture bytes from elsewhere (the blob relay): shown in both Editors, never sent as an op. */
   s.receiveFiles = files => { for (const ed of Object.values(eds)) { ed.doc.apply({ files }); ed.changed(); } };

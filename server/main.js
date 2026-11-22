@@ -366,10 +366,14 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
     issue: (board, seq) => sessions.issueSnapshotTicket(board, seq),
     verify: ticket => sessions.verifySnapshotTicket(ticket),
   };
+  const blobTickets = {
+    issue: (tenant, sha1, verb) => sessions.issueBlobTicket(tenant, sha1, verb),
+    verify: ticket => sessions.verifyBlobTicket(ticket),
+  };
   let server;
   const snapshot = { get: (board, seq) => server?.gateway?.snapshot(board, seq) ?? null };
   const http = httpRoutes({ registry, sessions, oidc, tenancy, now: Date.now, config, log: log.child({ component: "auth" }), snapshot, snapshotTickets, ...(dev.enabled ? { dev } : {}) });
-  server = createServer({ auth, registry, store, bus, blobs, log, limits, http, snapshotTickets, port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
+  server = createServer({ auth, registry, store, bus, blobs, log, limits, http, snapshotTickets, blobTickets, port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
     roles, node, host: { hostname: node, leaseTtlMs } });
   return { server, store, bus, registry, log, devBoard, oidc, node, roles, cluster, leaseTtlMs,
     async stop() { await server.stop(); await bus.close(); await store.close(); await rawRegistry.close(); } };

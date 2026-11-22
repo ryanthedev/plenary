@@ -303,7 +303,13 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const img = await new Promise(res => { const i = new Image(); i.onload = () => res(i); i.onerror = () => res(null); i.src = dataURL; });
     if (!img) return toast("That picture couldn't be read");
     const f = { id, mimeType: file.type, dataURL, width: img.naturalWidth, height: img.naturalHeight };
-    if (S.addPicture(f, at)) net.put(f);          // SEAM(v1 Blobs): signed upload; today the tab relay
+    if (typeof net.uploadBlob === "function") {
+      try { await S.uploadBlob(id, new Uint8Array(buf), file.type); }
+      catch { return toast("Picture upload failed"); }
+      S.addPicture(f, at);
+    } else if (S.addPicture(f, at)) {
+      net.put(f);          // local / shared-worker tab relay
+    }
     chromeDirty = true;
   }
   async function addLibraryFile(file) {

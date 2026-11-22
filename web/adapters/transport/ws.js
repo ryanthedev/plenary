@@ -244,9 +244,65 @@ export function httpSnapshotFetcher({ origin = null, fetch: fetchFn = (...a) => 
   };
 }
 
+/** Encode a Uint8Array to base64 in chunks so large images never overflow the call stack. */
+function bytesToBase64(bytes) {
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
 /**
- * The net (web/ports/net.js) over WebSockets: one wsTransport per join() to the same gateway URL. No blob path yet
- * (pictures go through signed blob URLs in v1; until then put does nothing and onFile never fires).
+ * HTTP blob upload/fetch adapter (PROTOCOL.md § Blobs, implements web/ports/net.js's `uploadBlob` and `fetchBlob`).
+ * Resolves relative signed URLs against `origin` and refuses cross-origin URLs.
+ * @param {{ origin?: string, fetch?: typeof globalThis.fetch }} [o]
+ */
+export function httpBlobClient({ origin = null, fetch: fetchFn = (...a) => globalThis.fetch(...a) } = {}) {
+  const base = origin ? new URL(origin) : null;
+  function resolveUrl(url, label) {
+    if (typeof url !== "string" || !url) throw new Error(`${label}: url is required`);
+    if (base) {
+      const resolved = new URL(url, base);
+      if (resolved.origin !== base.origin) throw new Error(`${label}: cross-origin blob url refused`);
+      return resolved.href;
+    }
+    if (!url.startsWith("/") || url.startsWith("//")) throw new Error(`${label}: relative path required without origin`);
+    return url;
+  }
+  return {
+    /** @type {import("../../ports/net.js").UploadBlob} */
+    async uploadBlob(url, bytes, mimeType, { signal } = {}) {
+      const target = resolveUrl(url, "uploadBlob");
+      const res = await fetchFn(target, {
+        method: "PUT",
+        headers: mimeType ? { "content-type": mimeType } : {},
+        body: bytes,
+        ...(signal ? { signal } : {}),
+      });
+      if (!res?.ok) throw new Error(`uploadBlob: HTTP ${res?.status ?? "error"}`);
+    },
+    /** @type {import("../../ports/net.js").FetchBlob} */
+    async fetchBlob(url, { signal } = {}) {
+      const target = resolveUrl(url, "fetchBlob");
+      const res = await fetchFn(target, {
+        method: "GET",
+        ...(signal ? { signal } : {}),
+      });
+      if (!res?.ok) throw new Error(`fetchBlob: HTTP ${res?.status ?? "error"}`);
+      const buf = await res.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      const mimeType = (res.headers?.get?.("content-type") || "application/octet-stream").split(";")[0].trim();
+      const dataURL = `data:${mimeType};base64,${bytesToBase64(bytes)}`;
+      return { bytes, mimeType, dataURL };
+    },
+  };
+}
+
+/**
+ * The net (web/ports/net.js) over WebSockets: one wsTransport per join() to the same gateway URL,
+ * plus HTTP snapshot and signed blob upload/fetch adapters.
  * @param {{ url: string, WebSocket: new (url: string) => any, clock?: Pick<import("../../ports/clock.js").Clock, "mono" | "set" | "clear">, fetch?: typeof globalThis.fetch }} o
  * @returns {import("../../ports/net.js").Net}
  */
@@ -255,10 +311,13 @@ export function wsNet({ url, WebSocket: WS, clock, fetch: fetchFn }) {
   const u = new URL(url);
   const origin = `${u.protocol === "wss:" ? "https:" : "http:"}//${u.host}`;
   const fetchSnapshot = httpSnapshotFetcher({ origin, ...(fetchFn ? { fetch: fetchFn } : {}) });
+  const { uploadBlob, fetchBlob } = httpBlobClient({ origin, ...(fetchFn ? { fetch: fetchFn } : {}) });
   return {
     kind: "ws",
     join: () => wsTransport({ url, WebSocket: WS, ...(clock ? { clock } : {}) }),
     fetchSnapshot,
+    uploadBlob,
+    fetchBlob,
     put: () => {},
     onFile: () => {},
   };

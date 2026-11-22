@@ -24,7 +24,7 @@
 
 import { jsonCodec } from "../packages/protocol/codec.js";
 import { snapshotOf } from "../packages/protocol/room.js";
-import { ROLES, MAX_CLIENT_CHARS, PROTOCOL_VERSION, RULES_VERSION, MAX_WRITER_CONNS, MAX_TAB_CONNS, HB_IDLE_MS, opProblem, parseOpId, isTab } from "../packages/protocol/envelope.js";
+import { ROLES, MAX_CLIENT_CHARS, PROTOCOL_VERSION, RULES_VERSION, MAX_WRITER_CONNS, MAX_TAB_CONNS, HB_IDLE_MS, opProblem, parseOpId, isTab, isSha1 } from "../packages/protocol/envelope.js";
 import { presenceProblem, presenceLimiter, presenceCoalescer, EMOTES } from "../packages/protocol/presence.js";
 import { subjects, busBytes, MAX_BUS_BYTES } from "./bus/port.js";
 import { boardFeed } from "./feed.js";
@@ -94,6 +94,8 @@ export const LIMITS = {
   hereBigBoard: 1_000,                      // more connections than this on a board here…
   hereBigMs: 5_000,                         // …and `here` goes to them at most this often
   httpSnapshotBytes: 1024 * 1024,           // F9: snapshots at/above this size offload to HTTP when the client sends hello.snap = "http"
+  blobRate: 10,                             // § Blobs: blob URL requests per second per connection (burst = blobRate)
+  blobPutPerMin: 30,                        // § Blobs: blob PUT URLs per minute per (user, board)
   feed: {},                               // options for each board's feed (pollMs, chunkBytes, …; tests)
 };
 
@@ -136,7 +138,7 @@ const OP_ID = /^\s*\{\s*"t"\s*:\s*"op"\s*,\s*"id"\s*:\s*"([^"\\]{1,256})"/;
  *   log?: object, codec?: object, id?: string, limits?: Partial<typeof LIMITS>, now?: () => number,
  * }} o
  */
-export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed, snapshotTickets = null }) {
+export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed, snapshotTickets = null, blobTickets = null }) {
   const lim = { ...LIMITS, ...limits };
   const maxBusBytes = bus.maxBytes ?? MAX_BUS_BYTES;
   // § Messages, hello.tab. A connection's tab key is "t:<tab>" for a hello with `tab`, else "c:<conn id>" (a tab of
@@ -145,6 +147,8 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
   const writersBy = new Map();
   /** @type {Map<string, number>} "user|board|tabKey" → writer connections of that tab on this gateway */
   const tabConns = new Map();
+  /** @type {Map<string, number[]>} "user|board" → recent blob PUT timestamps within 60 s (§ Blobs) */
+  const blobPuts = new Map();
   /** @type {Map<string, any>} conn id → ws */
   const conns = new Map();
   const counts = { accepted: 0, refusedAuth: 0, badFrames: 0, cut: 0, turnedAway: 0 };
@@ -1088,6 +1092,40 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     bus.publish(subjects.presence(c.tenant, c.board), { gateway: id, user: c.user, client: c.client, role: c.role, msg: clean })?.catch?.(() => {});
   }
 
+  /** Signed blob URLs (§ Blobs): `{ t: "blob", sha1, put? }` → `{ t: "blob", sha1, url }`. */
+  async function blob(ws, msg) {
+    const c = ws.data;
+    const answer = (code, message) => push(ws, codec.encode({ t: "error", code, message }));
+    if (!c.welcomed) return answer("auth", "wait for welcome");
+    if (!isSha1(msg.sha1)) return answer("bad-op", "sha1 must be 40 lowercase hex characters");
+    if (msg.put !== undefined && typeof msg.put !== "boolean") return answer("bad-op", "put must be a boolean");
+    const put = msg.put === true;
+    // § Blobs: upload needs write on board or notes (owner, editor, annotator); fail-closed allow-list.
+    if (put && c.role !== "owner" && c.role !== "editor" && c.role !== "annotator") return answer("forbidden", "only owners, editors, and annotators can upload blobs");
+    const t = now();
+    if (c.blobTokens === undefined) { c.blobTokens = lim.blobRate; c.blobAt = t; }
+    else { c.blobTokens = Math.min(lim.blobRate, c.blobTokens + Math.max(0, t - c.blobAt) * lim.blobRate / 1000); c.blobAt = t; }
+    if (c.blobTokens < 1) return answer("limit", "too many blob requests; try again later");
+    let putKey = null, putArr = null;
+    if (put) {
+      putKey = `${c.user}|${c.board}`;
+      const cutoff = t - 60_000;
+      putArr = (blobPuts.get(putKey) ?? []).filter(ts => ts > cutoff);
+      if (!putArr.length) blobPuts.delete(putKey);
+      if (putArr.length >= lim.blobPutPerMin) {
+        blobPuts.set(putKey, putArr);
+        return answer("limit", "too many blob uploads; try again later");
+      }
+    }
+    if (!blobTickets) return answer("unavailable", "blobs are not configured");
+    c.blobTokens -= 1;
+    if (put) { putArr.push(t); blobPuts.set(putKey, putArr); }
+    const ticket = await blobTickets.issue(c.tenant, msg.sha1, put ? "put" : "get");
+    if (c.state === "closed") return;
+    const url = `/blobs/${encodeURIComponent(c.tenant)}/${msg.sha1}?ticket=${encodeURIComponent(ticket)}`;
+    push(ws, codec.encode({ t: "blob", sha1: msg.sha1, url }));
+  }
+
   async function frame(ws, data) {
     const c = ws.data;
     if (c.state === "closed") return;
@@ -1107,9 +1145,9 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     }
     if (msg.t === "op") return op(ws, msg, data.length);
     if (msg.t === "presence") return presence(ws, msg);
+    if (msg.t === "blob") return blob(ws, msg);
     // Rule 11: one board per connection. A second hello gets `bad-op` and the connection is closed.
     if (msg.t === "hello") { counts.badFrames++; log.warn("frame refused", { conn: c.id, why: "second-hello", state: c.state }); return refuse(ws, "bad-op", "already said hello", 1008, "second hello"); }
-    // SEAM(p3): `blob` (signed URLs) is not served yet; it is refused like an unknown type.
     badFrame(ws, "unknown-type", "unknown message type");
   }
 

@@ -14,10 +14,14 @@
 /**
  * @typedef {{ id: string, mimeType: string, dataURL: string }} BlobFile
  * @typedef {(url: string, opts?: { signal?: AbortSignal }) => Promise<object>} FetchSnapshot
+ * @typedef {(url: string, bytes: Uint8Array, mimeType?: string, opts?: { signal?: AbortSignal }) => Promise<void>} UploadBlob
+ * @typedef {(url: string, opts?: { signal?: AbortSignal }) => Promise<{ bytes: Uint8Array, mimeType: string, dataURL: string }>} FetchBlob
  * @typedef {object} Net
  * @property {string} kind
  * @property {() => import("./transport.js").Transport} join
  * @property {FetchSnapshot} [fetchSnapshot]
+ * @property {UploadBlob} [uploadBlob]
+ * @property {FetchBlob} [fetchBlob]
  * @property {(file: BlobFile) => void} put
  * @property {(fn: (file: BlobFile) => void) => void} onFile
  */

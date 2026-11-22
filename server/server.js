@@ -14,8 +14,34 @@ import { gateway as makeGateway } from "./gateway.js";
 import { roomHost, serveOpens, remoteRooms } from "./room-host.js";
 import { quietLogger } from "./log.js";
 import { staticSite } from "./static.js";
+import { MAX_BLOB_BYTES, imageKind } from "./blobs/port.js";
+import { isId, isSha1, PortError } from "./ids.js";
 
 const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
+const BLOB_MIME = { png: "image/png", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
+
+/** Read a Request body up to `maxBytes` without buffering past the cap. Returns null if the body exceeds `maxBytes`. */
+async function readBoundedBody(req, maxBytes) {
+  if (!req.body) return new Uint8Array(0);
+  const reader = req.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      total += chunk.byteLength;
+      if (total > maxBytes) { await reader.cancel().catch(() => {}); return null; }
+      chunks.push(chunk);
+    }
+  } finally { reader.releaseLock(); }
+  if (chunks.length === 1) return chunks[0];
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+  return out;
+}
 
 /** Prometheus text exposition (0.0.4) of process, room-host, and gateway metrics (M2 Phase 8). */
 export function formatMetrics({ uptimeMs, rooms, gateway, memory = process.memoryUsage() }) {
@@ -60,7 +86,7 @@ export function formatMetrics({ uptimeMs, rooms, gateway, memory = process.memor
  *   (names a gateway-only node's open requests).
  */
 export function createServer({ auth, registry, store, bus, blobs = null, log = quietLogger, port = 0, hostname = "127.0.0.1", http, limits, host = {}, static: web = {},
-  roles = { gateway: true, host: true }, node = "node", snapshotTickets = null }) {
+  roles = { gateway: true, host: true }, node = "node", snapshotTickets = null, blobTickets = null }) {
   if (!roles || (!roles.gateway && !roles.host)) throw new TypeError("createServer needs at least one role (gateway, host)");
   const started = Date.now();
   const site = web === false || !roles.gateway ? null : staticSite({ log, ...web });
@@ -68,7 +94,62 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
     ? roomHost({ store, bus, log, ...host })
     : remoteRooms({ bus, node, timeoutMs: host.leaseTtlMs ?? 10_000, log });
   const unserve = roles.host ? serveOpens({ bus, rooms, log }) : () => {};
-  const gw = roles.gateway ? makeGateway({ auth, registry, store, bus, rooms, log, limits, snapshotTickets }) : null;
+  const gw = roles.gateway ? makeGateway({ auth, registry, store, bus, rooms, log, limits, snapshotTickets, blobTickets }) : null;
+
+  /** HTTP `/blobs/:tenant/:sha1?ticket=...` (PROTOCOL.md § Blobs): PUT, GET, HEAD backed by the Blobs port. */
+  async function handleBlob(req, url) {
+    const m = /^\/blobs\/([^/]+)\/([^/]+)$/.exec(url.pathname);
+    if (!m) return json(404, { error: "not-found" });
+    let tenant;
+    try { tenant = decodeURIComponent(m[1]); } catch { return json(400, { error: "bad-request" }); }
+    const sha1 = m[2];
+    if (!isId(tenant) || !isSha1(sha1)) return json(400, { error: "bad-request" });
+    if (req.method !== "PUT" && req.method !== "GET" && req.method !== "HEAD") {
+      return new Response(JSON.stringify({ error: "method-not-allowed" }), {
+        status: 405,
+        headers: { "content-type": "application/json", "cache-control": "no-store", allow: "GET, HEAD, PUT" },
+      });
+    }
+    if (!blobs || !blobTickets) return json(503, { error: "blobs-unavailable" });
+    const ticket = url.searchParams.get("ticket");
+    if (!ticket) return json(401, { error: "auth" });
+    const claims = await blobTickets.verify(ticket);
+    if (!claims) return json(401, { error: "auth" });
+    const wantVerb = req.method === "PUT" ? "put" : "get";
+    if (claims.verb !== wantVerb || claims.tenant !== tenant || claims.sha1 !== sha1) return json(403, { error: "forbidden" });
+
+    if (req.method === "PUT") {
+      const cl = req.headers.get("content-length");
+      if (cl !== null && Number(cl) > MAX_BLOB_BYTES) return json(413, { error: "too-large" });
+      const bytes = await readBoundedBody(req, MAX_BLOB_BYTES);
+      if (bytes === null) return json(413, { error: "too-large" });
+      try {
+        await blobs.put(tenant, sha1, bytes);
+      } catch (err) {
+        if (err instanceof PortError) {
+          if (err.code === "too-large") return json(413, { error: "too-large", message: err.message });
+          if (err.code === "bad-id" || err.code === "bad-entry" || err.code === "hash-mismatch" || err.code === "not-image") {
+            return json(400, { error: err.code, message: err.message });
+          }
+        }
+        throw err;
+      }
+      return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+    }
+
+    const bytes = await blobs.get(tenant, sha1);
+    if (!bytes) return json(404, { error: "not-found" });
+    const mime = BLOB_MIME[imageKind(bytes)] ?? "application/octet-stream";
+    return new Response(req.method === "HEAD" ? null : bytes, {
+      status: 200,
+      headers: {
+        "content-type": mime,
+        "content-length": String(bytes.byteLength),
+        "x-content-type-options": "nosniff",
+        "cache-control": "private, max-age=31536000, immutable",
+      },
+    });
+  }
 
   const server = Bun.serve({
     port, hostname,
@@ -86,6 +167,7 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
           if (srv.upgrade(req, { data: {} })) return undefined;
           return json(426, { error: "upgrade", message: "this is a WebSocket endpoint" });
         }
+        if (url.pathname.startsWith("/blobs/")) return await handleBlob(req, url);
         if (http) { const res = await http(req, url); if (res) return res; }
         if (site) { const res = await site.handle(req, url); if (res) return res; }
         return json(404, { error: "not-found" });

@@ -30,6 +30,7 @@ import { PRESENCE_BACKLOG_BYTES } from "../ports/transport.js";
 // Editor calls after which a gesture may have ended (sync.js reconciles then). Wrapped on the instance;
 // core is untouched.
 const GESTURE_ENDS = ["pointerDown", "pointerUp", "key", "setTool"];
+const SHA1_RE = /^[0-9a-f]{40}$/;
 
 /**
  * Bind an Editor to a board stream over a transport: one link (openLink) with this one Editor on it. Takes over
@@ -72,7 +73,7 @@ export function bindEditor(editor, { stream = "board", ...o }) {
  *   onRoom(ev): what the room said, once per link: presence, here, emotes, records, refused, role, limit, and
  *   settings ({ type: "settings", stream }).
  */
-export function openLink({ transport, fetchSnapshot = null, token: firstToken, board, client = "web", tab = null, session, onStatus = () => {}, onRoom = () => {}, onHeard = () => {},
+export function openLink({ transport, fetchSnapshot = null, token: firstToken, board, client = "web", tab = null, session, onStatus = () => {}, onRoom = () => {}, onHeard = () => {}, onImages = null,
   timeoutMs = 10_000, clock = null, timers = clock ? { set: clock.set, clear: clock.clear } : null, now = clock?.now, random = clock?.random }) {
   if (typeof transport?.reopen !== "function") throw new TypeError("bindEditor: the transport must have reopen() (web/ports/transport.js)");
   if (typeof now !== "function" || typeof random !== "function" || (timeoutMs !== 0 && typeof timers?.set !== "function"))
@@ -96,6 +97,15 @@ export function openLink({ transport, fetchSnapshot = null, token: firstToken, b
   let status = "connecting";
   let timer = null, closed = false, started = false;
   let snapAbort = null, snapGen = 0;   // F9: in-flight HTTP snapshot fetch cancellation & generation guard
+  /** @type {{ sha1: string, resolve: (url: string) => void, reject: (err: Error) => void, timer: any }[]} */
+  const pendingBlobs = [];
+  function rejectPendingBlobs(reason) {
+    while (pendingBlobs.length) {
+      const b = pendingBlobs.shift();
+      if (b.timer != null) { try { timers.clear(b.timer); } catch {} b.timer = null; }
+      b.reject(new Error(reason));
+    }
+  }
   function cancelSnapshotFetch() {
     snapGen++;
     if (snapAbort) {
@@ -144,6 +154,7 @@ export function openLink({ transport, fetchSnapshot = null, token: firstToken, b
 
   function connect() {
     cancelSnapshotFetch();
+    rejectPendingBlobs("blob: reconnecting");
     const [hello] = replica.connectMessages(token, board);
     hellos++;
     setStatus(limited ? "limited" : "connecting");
@@ -153,7 +164,7 @@ export function openLink({ transport, fetchSnapshot = null, token: firstToken, b
   function reopen() { if (closed) return; down = false; transport.reopen(); connect(); }
   // The Replica asked for a fresh connection. The old one stays as it is (its messages are ignored from
   // now on) until reopen() replaces it: close() is for good, never part of a resync.
-  function goDown() { cancelSnapshotFetch(); down = true; setStatus(limited ? "limited" : "connecting"); arm(); }
+  function goDown() { cancelSnapshotFetch(); rejectPendingBlobs("blob: disconnected"); down = true; setStatus(limited ? "limited" : "connecting"); arm(); }
 
   // Status from the Replica's state. Entering `live` loads every bound Editor from the caught-up Replica.
   function refreshStatus() {
@@ -232,6 +243,26 @@ export function openLink({ transport, fetchSnapshot = null, token: firstToken, b
       pump(); onRoom({ type: "limit", message: limited }); return;
     }
     if (msg?.t === "here" || msg?.t === "emotes") { replica.receive(msg); pump(); onRoom({ type: msg.t, msg }); return; }
+    if (msg?.t === "blob") {
+      replica.receive(msg);
+      const i = pendingBlobs.findIndex(b => b.sha1 === msg.sha1);
+      if (i >= 0) {
+        const b = pendingBlobs.splice(i, 1)[0];
+        if (b.timer != null) { try { timers.clear(b.timer); } catch {} b.timer = null; }
+        if (typeof msg.url === "string" && msg.url) b.resolve(msg.url);
+        else b.reject(new Error("blob: invalid url response"));
+      }
+      pump(); return;
+    }
+    if (msg?.t === "error" && msg.id === undefined && replica.welcomed && pendingBlobs.length && (msg.code === "bad-op" || msg.code === "forbidden" || msg.code === "limit" || msg.code === "unavailable")) {
+      replica.receive({ t: "hb" });
+      const b = pendingBlobs.shift();
+      if (b.timer != null) { try { timers.clear(b.timer); } catch {} b.timer = null; }
+      const err = new Error(typeof msg.message === "string" && msg.message ? msg.message : msg.code);
+      err.code = msg.code;
+      b.reject(err);
+      pump(); return;
+    }
     // A rule-5 refusal of one of my records ops: look it up before receive() drops it from pending.
     const was = msg?.t === "error" && msg.id !== undefined ? replica.pending.get(msg.id) : null;
     const refusedRecord = was?.stream === "records" && !["stale", "unavailable", "auth", "version", "stale-setting"].includes(msg.code)
@@ -282,6 +313,22 @@ export function openLink({ transport, fetchSnapshot = null, token: firstToken, b
       for (const s of touched) onRoom({ type: "settings", stream: s });
     }
     recordsChanged();
+    if (typeof onImages === "function") {
+      const fileIds = new Set();
+      if (did.snapshot) {
+        for (const stream of Object.values(replica.streams)) {
+          for (const el of stream.byId.values()) {
+            if (!el.isDeleted && el.type === "image" && SHA1_RE.test(el.fileId)) fileIds.add(el.fileId);
+          }
+        }
+      }
+      for (const e of did.entries) {
+        for (const el of e.op?.elements ?? []) {
+          if (!el.isDeleted && el.type === "image" && SHA1_RE.test(el.fileId)) fileIds.add(el.fileId);
+        }
+      }
+      if (fileIds.size) onImages([...fileIds]);
+    }
   }
   function recordsChanged() { if (replica.recordsRev !== recordsRev) { recordsRev = replica.recordsRev; onRoom({ type: "records" }); } }
   // A refused settings change goes to its stream's bind (one bind alone keeps them all, as one stream's link did).
@@ -362,8 +409,25 @@ export function openLink({ transport, fetchSnapshot = null, token: firstToken, b
       limited = null;
       reopen();
     },
+    /** Request a signed blob URL over the active WS link (§ Blobs). */
+    requestBlobUrl(sha1, { put = false } = {}) {
+      if (closed || down || !replica.welcomed) return Promise.reject(new Error("blob: not connected"));
+      if (typeof sha1 !== "string" || !SHA1_RE.test(sha1)) return Promise.reject(new Error("blob: invalid sha1"));
+      return new Promise((resolve, reject) => {
+        const entry = { sha1, resolve, reject, timer: null };
+        if (timed) {
+          entry.timer = timers.set(() => {
+            const i = pendingBlobs.indexOf(entry);
+            if (i >= 0) pendingBlobs.splice(i, 1);
+            reject(new Error("blob: request timed out"));
+          }, 10_000);
+        }
+        pendingBlobs.push(entry);
+        send(put ? { t: "blob", sha1, put: true } : { t: "blob", sha1 });
+      });
+    },
     /** Finished for good: no more sends, no timer, and the transport is closed (the only caller of its close()). */
-    close() { if (closed) return; closed = true; cancelSnapshotFetch(); arm(); transport.close(); },
+    close() { if (closed) return; closed = true; cancelSnapshotFetch(); rejectPendingBlobs("blob: closed"); arm(); transport.close(); },
   };
 
   return {

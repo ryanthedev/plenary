@@ -13,7 +13,7 @@ import {
   bbox, unionBox, inBox, boxInBox, center, normalize, hits, hitTest, shapeAt, bindTargetAt, resolvedPoints, drawnPoints, curveThrough, settle, fileScene, portsOf, portAt, outlineDistance, mapIntoBox, distToSeg, segmentsIntersect,
   bounds, corners, rotate, rotateAbout, angleOf, centerOf, toLocal, toWorld as elToWorld, normAngle,
 } from "./geometry.js";
-import { paintScene, paintElement, project, rectCmds, withAlpha, outlinePoints } from "./render.js";
+import { paintScene, paintElement, project, rectCmds, withAlpha, paintSnapIndicator } from "./render.js";
 import { PRESETS, timelineEnd } from "./anim.js";
 import { labelHostHeight, labelHostWidth } from "./text.js";
 import { isMermaid, mermaidToElements } from "./mermaid.js";
@@ -73,6 +73,7 @@ export class Editor {
     this.lastPointerType = "mouse";
     this.lastPenUpAt = -Infinity;
     this.hover = null; this.guides = []; this.laser = []; this.erasing = new Set();
+    this.hint = null; this.hintKey = ""; this.snapPreview = null;
     this.text = null;            // { id, value, isNew } while typing
     this.clipboard = null;
     this.peers = new Map();      // presence: id → { name, color, cursor, sel } (networking comes later)
@@ -86,8 +87,8 @@ export class Editor {
 
   // ── ports ──────────────────────────────────────────────────────────────
 
-  load(scene) { this.doc.load(scene); this.pruneSel(); this.fixLayer(); this.changed(); }
-  receive(op) { const ch = this.doc.apply(op); if (ch.length) { this.pruneSel(); this.fixLayer(); this.changed(); } return ch; }
+  load(scene) { this.doc.load(scene); this.clearSnapPreview(); this.pruneSel(); this.fixLayer(); this.changed(); }
+  receive(op) { const ch = this.doc.apply(op); if (ch.length) { this.pruneSnapPreview(); this.pruneSel(); this.fixLayer(); this.changed(); } return ch; }
   scene() { return fileScene(this.doc, this.doc.toScene()); }
   changed() { this.version++; }
   setSize(w, h) { this.size = { w, h }; }
@@ -153,7 +154,7 @@ export class Editor {
     to.push(back);
     this.doc.apply({ elements }, { force: true });
     this.onOp({ elements });
-    this.pruneSel(); this.changed();
+    this.pruneSnapPreview(); this.pruneSel(); this.changed();
   }
 
   setAppState(patch, history = false) {
@@ -284,6 +285,7 @@ export class Editor {
     if (!g) return;
     this.g = null;
     this.guides = [];
+    this.clearSnapPreview();
     if (g.before) {
       let mutated = false;
       for (const [id, prev] of g.before) {
@@ -354,9 +356,9 @@ export class Editor {
       if (this.g && this.g.kind !== "pinch" && this.g.kind !== "pinch-tail") {
         const dt = now - (this.downAt?.t ?? 0);
         const moved = this.g.maxMove ?? Math.hypot((this.g.last?.x ?? p.x) - (this.downAt?.p.x ?? p.x), (this.g.last?.y ?? p.y) - (this.downAt?.p.y ?? p.y));
-        if (this.g.kind === "pan") { this.g = null; if (moved >= MT_TAP_SLOP) committedPrev = true; }
+        if (this.g.kind === "pan") { this.g = null; this.clearSnapPreview(); if (moved >= MT_TAP_SLOP) committedPrev = true; }
         else if (dt < STRAY_DOT_MS && moved < STRAY_DOT_PX) { this.cancelGesture(); }
-        else if (this.g.kind !== "poly") { const prev = this.g; this.g = null; this.guides = []; this.finishSingleGesture(prev, prev.last ?? p, {}); committedPrev = true; }
+        else if (this.g.kind !== "poly") { const prev = this.g; this.g = null; this.guides = []; this.clearSnapPreview(); this.finishSingleGesture(prev, prev.last ?? p, {}); committedPrev = true; }
       }
       if (!this.mt) {
         const starts = new Map();
@@ -368,7 +370,7 @@ export class Editor {
         if (committedPrev) this.mt.moved = true;
         if (!this.mt.starts.has(pid)) this.mt.starts.set(pid, { x: p.x, y: p.y });
       }
-      if (mtPointers.length === 2) this.beginPinch(mtPointers, now);
+      if (mtPointers.length === 2) { this.clearSnapPreview(); this.beginPinch(mtPointers, now); }
       return;
     }
 
@@ -376,7 +378,7 @@ export class Editor {
     this.cancelCamera();
     if (this.text) this.commitText();
     // A press that arrives mid-gesture means we missed a release (outside the pane): finish it first.
-    if (this.g && this.g.kind !== "poly") { const prev = this.g; this.g = null; this.guides = []; this.finishSingleGesture(prev, prev.last ?? p, {}); }
+    if (this.g && this.g.kind !== "poly") { const prev = this.g; this.g = null; this.guides = []; this.clearSnapPreview(); this.finishSingleGesture(prev, prev.last ?? p, {}); }
     const w = this.toWorld(p);
     this.downAt = { p, t: now };
 
@@ -437,6 +439,14 @@ export class Editor {
         return;
       }
       this.g = { kind: h.kind === "point" ? "point" : "resize", h, start: w, box: this.selBox(), solo: this.soloRotated(), orig, before };
+      if (h.kind === "point") {
+        const el = els[0];
+        if (el && (h.i === 0 || h.i === el.points.length - 1)) {
+          const otherId = h.i === 0 ? el.endBinding?.elementId : el.startBinding?.elementId;
+          const endIndex = h.i === 0 ? 0 : -1;
+          this.setSnapPreview(this.snapAt(w, otherId, m, el.elbowed, { lineId: el.id, endIndex }));
+        }
+      }
       return;
     }
     let hit = hitTest(this.doc, w, this.tol());
@@ -462,10 +472,12 @@ export class Editor {
     const at = this.snapPoint(w);
     const s = this.style;
     const fields = { x: at.x, y: at.y, strokeColor: s.strokeColor, backgroundColor: isShape({ type: this.tool }) ? s.backgroundColor : "transparent", fillStyle: s.fillStyle, strokeWidth: s.strokeWidth, strokeStyle: s.strokeStyle, roughness: s.roughness, opacity: s.opacity, roundness: this.tool === "rectangle" || this.tool === "diamond" || this.tool === "line" || this.tool === "arrow" ? s.roundness : null };
+    let startSnap = null;
     if (this.tool === "arrow" || this.tool === "line") {
       fields.points = [[0, 0], [0, 0]];
       if (this.tool === "arrow" && s.elbowed) { fields.elbowed = true; fields.roundness = null; }
-      fields.startBinding = this.bindingAt(w, null, m, fields.elbowed);
+      startSnap = this.snapAt(w, null, m, fields.elbowed);
+      fields.startBinding = startSnap?.binding ?? null;
     }
     if (this.tool === "freedraw" && typeof m.pressure === "number" && Number.isFinite(m.pressure) && (m.pointerType === "pen" || (m.pressure !== 0.5 && m.pressure !== 0))) {
       fields.pressures = [clampPressure(m.pressure)];
@@ -473,6 +485,9 @@ export class Editor {
     }
     if (this.tool === "frame") Object.assign(fields, { backgroundColor: "transparent", strokeWidth: 1, name: `Frame ${this.doc.live().filter(e => e.type === "frame").length + 1}`, customData: { z: this.doc.minZ(this.activeLayer) - 1 } });
     const el = this.newEl(this.tool, fields);
+    if (this.tool === "arrow" || this.tool === "line") {
+      this.setSnapPreview(startSnap ? { ...startSnap, lineId: el.id, endIndex: 0 } : null);
+    }
     this.g = { kind: "create", start: at, el, p, before: new Map([[el.id, null]]) };
     this.livePut(el);
   }
@@ -501,7 +516,7 @@ export class Editor {
     if (!g) {
       if (type === "touch") return;
       this.lastPointerType = type;
-      this.updateHover(p);
+      this.updateHover(p, m);
       return;
     }
     if (g.pointerId != null && m.pointerId != null && g.pointerId !== pid) return;
@@ -535,7 +550,14 @@ export class Editor {
       case "rotate": return this.rotateSel(g, w, m);
       case "point": return this.movePoint(g, w, m);
       case "create": return this.dragCreate(g, w, m);
-      case "poly": { const el = g.el; el.points[el.points.length - 1] = [w.x - el.x, w.y - el.y]; el.endBinding = this.bindingAt(w, el.startBinding?.elementId, m, el.elbowed); return this.livePut(el); }
+      case "poly": {
+        const el = g.el;
+        el.points[el.points.length - 1] = [w.x - el.x, w.y - el.y];
+        const snap = this.snapAt(w, el.startBinding?.elementId, m, el.elbowed, { lineId: el.id, endIndex: -1 });
+        el.endBinding = snap?.binding ?? null;
+        this.setSnapPreview(snap);
+        return this.livePut(el);
+      }
       case "erase": { const from = this.toWorld(g.lastE ?? p); g.lastE = p; this.eraseAt(from, w); return; }
       case "laser": this.laser.push({ x: w.x, y: w.y, t: now }); return this.changed();
     }
@@ -561,7 +583,7 @@ export class Editor {
         this.g.kind = "pinch-tail";
       } else if (remList.length === 0) {
         const mt = this.mt, g = this.g;
-        this.mt = null; this.g = null; this.guides = [];
+        this.mt = null; this.g = null; this.guides = []; this.clearSnapPreview();
         if (!mt.moved && (now - mt.t0) < MT_TAP_MS) {
           if (!this.readOnly && mt.maxFingers === 2) this.undo();
           else if (!this.readOnly && mt.maxFingers === 3) this.redo();
@@ -575,7 +597,7 @@ export class Editor {
 
     const g = this.g; if (!g || g.kind === "poly") return;   // a click-by-click line keeps going
     if (g.pointerId != null && m.pointerId != null && g.pointerId !== pid) return;
-    this.g = null; this.guides = [];
+    this.g = null; this.guides = []; this.clearSnapPreview();
     return this.finishSingleGesture(g, p, m);
   }
 
@@ -590,7 +612,7 @@ export class Editor {
 
     if (this.mt) {
       const remList = [...this.pointers.entries()];
-      if (remList.length === 0) { this.mt = null; this.g = null; this.guides = []; this.changed(); }
+      if (remList.length === 0) { this.mt = null; this.g = null; this.guides = []; this.clearSnapPreview(); this.changed(); }
       else if (remList.length === 2) { this.beginPinch(remList, now); }
       else if (remList.length === 1 && this.g?.kind === "pinch") { this.g.kind = "pinch-tail"; }
       return;
@@ -703,13 +725,33 @@ export class Editor {
     this.changed();
   }
 
-  updateHover(p) {
+  clearSnapPreview() {
+    if (!this.snapPreview && !this.hint && !this.hintKey) return false;
+    this.snapPreview = null;
+    this.hint = null;
+    this.hintKey = "";
+    return true;
+  }
+
+  pruneSnapPreview() {
+    if (this.snapPreview && !this.doc.get(this.snapPreview.targetId)) this.clearSnapPreview();
+  }
+
+  setSnapPreview(snap) {
+    const hk = snap ? `${snap.targetId}|${snap.side ?? ""}|${snap.lineId ?? ""}|${snap.endIndex ?? ""}` : "";
+    if (hk === (this.hintKey ?? "") && !!snap === !!this.snapPreview) return false;
+    this.hintKey = hk;
+    this.hint = snap?.binding ?? null;
+    this.snapPreview = snap ?? null;
+    return true;
+  }
+
+  updateHover(p, m = {}) {
     this.pointer = p;
     const w = this.toWorld(p), linking = this.tool === "arrow" || this.tool === "line";
     // With the arrow or line tool: the shape an arrow started here would attach to, and its connection point.
-    const hint = linking ? this.bindingAt(w, null, {}, this.tool === "arrow" && this.style.elbowed) : null;
-    const hk = hint ? `${hint.elementId}|${hint.fixedPoint ?? ""}` : "";
-    if (hk !== (this.hintKey ?? "")) { this.hintKey = hk; this.hint = hint; this.changed(); }
+    const snap = linking ? this.snapAt(w, null, m, this.tool === "arrow" && this.style.elbowed) : null;
+    if (this.setSnapPreview(snap)) this.changed();
     const hit = this.tool === "select" ? hitTest(this.doc, w, this.tol()) : null;
     const id = hit?.id ?? null;
     if (id !== this.hover) { this.hover = id; this.changed(); }
@@ -718,15 +760,38 @@ export class Editor {
     if (c !== this.lastCursor) { this.lastCursor = c; this.changed(); }
   }
 
+  // Resolve binding + lightweight snap preview at world point `w`: a connection point near it (pinned there),
+  // else the bindable target under it (aimed at the other end), else null. ⌘/Ctrl held: null.
+  snapAt(w, except = null, m = {}, elbowed = false, ref = null) {
+    if (m.cmd || m.ctrl) return null;
+    const pointerType = m.pointerType ?? this.g?.pointerType ?? this.lastPointerType;
+    const scale = this.slopScale(pointerType);
+    const port = portAt(this.doc, w, (PORT_SNAP * scale) / this.view.scale, except);
+    if (port) {
+      const binding = { elementId: port.el.id, focus: 0, gap: 6, fixedPoint: port.port.fixedPoint, side: port.port.side };
+      return {
+        targetId: port.el.id,
+        side: port.port.side,
+        binding,
+        elbowed: !!elbowed,
+        ...(ref ? { lineId: ref.lineId, endIndex: ref.endIndex } : {}),
+      };
+    }
+    const s = bindTargetAt(this.doc, w, except, (BIND_PAD * scale) / this.view.scale);
+    if (!s) return null;
+    return {
+      targetId: s.id,
+      side: null,
+      binding: { elementId: s.id, focus: 0, gap: 6 },
+      elbowed: !!elbowed,
+      ...(ref ? { lineId: ref.lineId, endIndex: ref.endIndex } : {}),
+    };
+  }
+
   // What an arrow end at world point w attaches to: a connection point near it (pinned there),
   // else the shape under it (aimed at the other end), else nothing. ⌘ held: nothing.
   bindingAt(w, except, m = {}, elbowed = false) {
-    if (m.cmd || m.ctrl) return null;
-    const scale = this.slopScale(m.pointerType ?? this.lastPointerType);
-    const port = portAt(this.doc, w, (PORT_SNAP * scale) / this.view.scale, except);
-    if (port) return elbowed ? { elementId: port.el.id, focus: 0, gap: 6 } : { elementId: port.el.id, focus: 0, gap: 6, fixedPoint: port.port.fixedPoint };
-    const s = bindTargetAt(this.doc, w, except, (BIND_PAD * scale) / this.view.scale);
-    return s ? { elementId: s.id, focus: 0, gap: 6 } : null;
+    return this.snapAt(w, except, m, elbowed)?.binding ?? null;
   }
 
   // The pointer's cursor, by tool and what's under it (adapters map the names to their own):
@@ -737,10 +802,10 @@ export class Editor {
     if (g?.kind === "rotate") return "grabbing";
     if (g?.kind === "move" || g?.kind === "point") return g.kind === "point" ? "pointer" : "move";
     if (g?.kind === "resize") return RESIZE_CURSOR[g.h.dir] ?? "default";
-    if (g?.kind === "create" || g?.kind === "poly") return this.hint || this.endHint() ? "pointer" : "crosshair";
+    if (g?.kind === "create" || g?.kind === "poly") return this.snapPreview || this.hint || this.endHint() ? "pointer" : "crosshair";
     if (this.readOnly || this.tool === "hand") return "grab";
     if (this.tool === "text") return "text";
-    if (this.tool === "arrow" || this.tool === "line") return this.hint ? "pointer" : "crosshair";
+    if (this.tool === "arrow" || this.tool === "line") return this.snapPreview || this.hint ? "pointer" : "crosshair";
     if (this.tool !== "select") return "crosshair";
     const p = this.pointer; if (!p) return "default";
     const h = this.handleAt(p);
@@ -898,8 +963,17 @@ export class Editor {
     const o = g.orig.values().next().value, c = clone(o), at = this.snapPoint(w);
     c.points[g.h.i] = [at.x - o.x, at.y - o.y];
     // An end binds as it moves (to a connection point or a shape), so what you see is what you get on release.
-    if (g.h.i === 0) c.startBinding = this.bindingAt(w, c.endBinding?.elementId, m, c.elbowed);
-    if (g.h.i === c.points.length - 1) c.endBinding = this.bindingAt(w, c.startBinding?.elementId, m, c.elbowed);
+    if (g.h.i === 0) {
+      const snap = this.snapAt(w, c.endBinding?.elementId, m, c.elbowed, { lineId: c.id, endIndex: 0 });
+      c.startBinding = snap?.binding ?? null;
+      this.setSnapPreview(snap);
+    } else if (g.h.i === c.points.length - 1) {
+      const snap = this.snapAt(w, c.startBinding?.elementId, m, c.elbowed, { lineId: c.id, endIndex: -1 });
+      c.endBinding = snap?.binding ?? null;
+      this.setSnapPreview(snap);
+    } else {
+      this.clearSnapPreview();
+    }
     this.livePut(c);
   }
 
@@ -928,7 +1002,9 @@ export class Editor {
       if (m.shift) { const a = Math.round(Math.atan2(q[1], q[0]) / (Math.PI / 12)) * (Math.PI / 12), r = Math.hypot(q[0], q[1]); q = [Math.cos(a) * r, Math.sin(a) * r]; }
       el.points[el.points.length - 1] = q;
       // Bind as it's drawn: the end snaps to the shape (or connection point) under it now, not on release.
-      el.endBinding = this.bindingAt({ x: el.x + q[0], y: el.y + q[1] }, el.startBinding?.elementId, m, el.elbowed);
+      const snap = this.snapAt({ x: el.x + q[0], y: el.y + q[1] }, el.startBinding?.elementId, m, el.elbowed, { lineId: el.id, endIndex: -1 });
+      el.endBinding = snap?.binding ?? null;
+      this.setSnapPreview(snap);
     }
     this.livePut(el);
   }
@@ -959,6 +1035,7 @@ export class Editor {
   finishPoly() {
     const g = this.g; if (!g || g.kind !== "poly") return;
     this.g = null;
+    this.clearSnapPreview();
     const el = g.el;
     // Drop the trailing rubber-band point and any zero-length tail.
     while (el.points.length > 2 && dist(el.points[el.points.length - 1], el.points[el.points.length - 2]) < 4) el.points.pop();
@@ -1328,8 +1405,8 @@ export class Editor {
             if (c.type !== "arrow") continue;
             if (!v && c.elbowed) {
               const pts = resolvedPoints(this.doc, e); c.x = pts[0][0]; c.y = pts[0][1]; c.points = pts.map(p => [p[0] - c.x, p[1] - c.y]);
-              // An elbow's fixedPoints are where its route met the shape, not connection points someone chose.
-              for (const k of ["startBinding", "endBinding"]) if (c[k]?.fixedPoint) { const { fixedPoint, ...rest } = c[k]; c[k] = rest; }
+              // An elbow's auto-routed fixedPoints aren't user-chosen ports; keep explicit side-pinned ones.
+              for (const k of ["startBinding", "endBinding"]) if (c[k]?.fixedPoint && !c[k]?.side) { const { fixedPoint, ...rest } = c[k]; c[k] = rest; }
             }
             c.elbowed = v; if (v) c.roundness = null;
             continue;
@@ -1525,6 +1602,7 @@ export class Editor {
   setTool(id) {
     if (this.g?.kind === "poly") this.finishPoly();
     this.tool = id; if (id !== "select") this.hover = null;
+    this.clearSnapPreview();
     if (DRAWING_TOOLS.has(id) && this.sel.size) this.select([]);
     this.changed();
   }
@@ -1545,23 +1623,6 @@ export class Editor {
     return [...pts.map((p, i) => [i ? "L" : "M", p.x, p.y]), ["L", pts[0].x, pts[0].y]];
   }
 
-  // Where an arrow will attach: the shape's outline in the accent color, its connection points
-  // as small rings (not for elbows, which pick their own sides), and the one it takes filled.
-  paintBindHint(items, P, theme) {
-    const b = this.g ? this.endHint() : this.hint, shape = b && this.doc.get(b.elementId);
-    if (!shape) return;
-    const acc = theme.accent, ring = (x, y, r) => { const c = []; for (let i = 0; i <= 20; i++) { const t = i / 20 * Math.PI * 2; c.push([i ? "L" : "M", x + Math.cos(t) * r, y + Math.sin(t) * r]); } return c; };
-    const outline = (shape.type === "image" ? outlinePoints({ ...shape, type: "rectangle", roundness: null }) : outlinePoints(shape)).map(([x, y]) => P(x, y));
-    items.push({ t: "path", cmds: outline.map((p, i) => [i ? "L" : "M", ...p]), stroke: withAlpha(acc, 0.85), width: 2, dash: null });
-    const elbowed = this.g?.el?.elbowed ?? (this.g?.kind === "point" ? this.doc.get(this.g.orig.keys().next().value)?.elbowed : this.tool === "arrow" && this.style.elbowed);
-    if (elbowed) return;
-    for (const port of portsOf(shape)) {
-      const [x, y] = P(...port.at), on = !!b.fixedPoint && Math.hypot(b.fixedPoint[0] - port.fixedPoint[0], b.fixedPoint[1] - port.fixedPoint[1]) < 1e-6;
-      items.push({ t: "path", cmds: ring(x, y, on ? 5.5 : 4).slice(0, 20), fill: on ? acc : theme.bg });
-      items.push({ t: "path", cmds: ring(x, y, on ? 5.5 : 4), stroke: acc, width: 1.5, dash: null });
-    }
-  }
-
   displayList(theme) {
     const time = this.time();
     const items = paintScene(this.doc, this.view, theme, { time: time ?? undefined, clip: this.size ? { w: this.size.w, h: this.size.h } : null });
@@ -1573,7 +1634,7 @@ export class Editor {
       const el = this.doc.get(this.hover);
       if (el) items.push({ t: "path", cmds: this.outlineCmds(el, 4), stroke: withAlpha(acc, 0.45), width: 1, dash: null });
     }
-    this.paintBindHint(items, P, theme);
+    if (this.snapPreview) paintSnapIndicator(this.doc, this.snapPreview, this.view, theme, items);
     const els = this.selected();
     if (els.length) {
       if (els.length > 1) for (const e of els) { if (isLabel(e)) continue; items.push({ t: "path", cmds: this.outlineCmds(e, 3), stroke: withAlpha(acc, 0.5), width: 1, dash: [3, 3] }); }

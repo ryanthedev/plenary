@@ -153,16 +153,17 @@ export function shapeAt(doc, p, except) {
   return null;
 }
 
-// What an arrow end can bind to: shapes (not frames) and images. Topmost first.
-export const bindable = el => (isShape(el) && el.type !== "frame") || el.type === "image";
+// What an arrow end can bind to: shapes (including frames) and images. Topmost first.
+export const bindable = el => isShape(el) || el.type === "image";
 // On the shape itself (inside, or within `pad` of its outline): a diamond's or an ellipse's
-// empty box corners don't count.
+// empty box corners don't count; frames are hollow containers so only their outline binds.
 export function bindTargetAt(doc, p, except, pad = 4) {
   const els = doc.visible();
   for (let i = els.length - 1; i >= 0; i--) {
     const el = els[i];
     if (!bindable(el) || el.id === except) continue;
-    if (el.type === "image" ? inBox(toLocal(el, p), bbox(el), pad) : outlineDistance(el, p) <= pad) return el;
+    if (el.type === "frame") { if (Math.abs(outlineDistance(el, p)) <= pad) return el; }
+    else if (el.type === "image" ? inBox(toLocal(el, p), bbox(el), pad) : outlineDistance(el, p) <= pad) return el;
   }
   return null;
 }
@@ -171,6 +172,15 @@ export function bindTargetAt(doc, p, except, pad = 4) {
 // ends), on the outline (`at`) and `gap` out from it (`bind`), with the Excalidraw
 // `fixedPoint` an arrow end stores to stay there.
 const SIDES = [["top", 0.5, 0, 0, -1], ["right", 1, 0.5, 1, 0], ["bottom", 0.5, 1, 0, 1], ["left", 0, 0.5, -1, 0]];
+const SIDE_VEC = { top: [0, -1], right: [1, 0], bottom: [0, 1], left: [-1, 0] };
+function worldSide(el, side) {
+  if (!side || !SIDE_VEC[side]) return undefined;
+  const a = angleOf(el);
+  if (!a) return side;
+  const [vx, vy] = SIDE_VEC[side], s = Math.sin(a), k = Math.cos(a);
+  const wx = vx * k - vy * s, wy = vx * s + vy * k;
+  return Math.abs(wx) >= Math.abs(wy) ? (wx >= 0 ? "right" : "left") : (wy >= 0 ? "bottom" : "top");
+}
 export function portsOf(el, gap = 6) {
   const b = bbox({ ...el, angle: 0 });
   return SIDES.map(([side, fx, fy, nx, ny]) => {
@@ -197,10 +207,17 @@ export function portAt(doc, p, tol, except) {
 // [0.5, 0]), and on an ellipse or diamond a box point can lie well off the shape.
 // Inside the shape (excalidraw.com's aim points) it doesn't pin: the end aims at the other end.
 function fixedEnd(shape, b) {
-  if (!b?.fixedPoint || !bindable(shape)) return null;
-  const box = bbox({ ...shape, angle: 0 }), w = toWorld(shape, { x: box.x + b.fixedPoint[0] * box.w, y: box.y + b.fixedPoint[1] * box.h });
-  const inside = shape.type === "image" ? inBox(toLocal(shape, w), box, -0.5) : outlineDistance(shape, w) < -0.5;
-  return inside ? null : edgePoint(shape, w.x, w.y, b.gap ?? 6);
+  if (!b || !bindable(shape)) return null;
+  if (b.fixedPoint) {
+    const box = bbox({ ...shape, angle: 0 }), w = toWorld(shape, { x: box.x + b.fixedPoint[0] * box.w, y: box.y + b.fixedPoint[1] * box.h });
+    const inside = shape.type === "image" ? inBox(toLocal(shape, w), box, -0.5) : outlineDistance(shape, w) < -0.5;
+    return inside ? null : edgePoint(shape, w.x, w.y, b.gap ?? 6);
+  }
+  if (b.side) {
+    const port = portsOf(shape, b.gap ?? 6).find(p => p.side === b.side);
+    if (port) return port.bind;
+  }
+  return null;
 }
 
 // Where a ray from a shape's center toward (tx, ty) leaves its outline, plus gap.
@@ -231,8 +248,12 @@ export function resolvedPoints(doc, el) {
     if (memo.get(el.id)?.key === key) return memo.get(el.id).pts.map(p => [...p]);
     const end = p => ({ point: { x: p[0], y: p[1] } });
     const fromBox = s ? bounds(s) : null, toBox = e ? bounds(e) : null;
-    const obstacles = doc.visible().filter(o => bindable(o) && o !== s && o !== e).map(bounds);
-    const r = elbowRoute(fromBox ? { box: fromBox } : end(pts[0]), toBox ? { box: toBox } : end(pts[pts.length - 1]), el.startBinding?.gap ?? el.endBinding?.gap ?? 6, obstacles);
+    const fromSide = s ? worldSide(s, el.startBinding?.side) : undefined;
+    const toSide = e ? worldSide(e, el.endBinding?.side) : undefined;
+    const obstacles = doc.visible().filter(o => bindable(o) && o.type !== "frame" && o !== s && o !== e).map(bounds);
+    const fromEnd = fromBox ? (fromSide ? { box: fromBox, side: fromSide } : { box: fromBox }) : end(pts[0]);
+    const toEnd = toBox ? (toSide ? { box: toBox, side: toSide } : { box: toBox }) : end(pts[pts.length - 1]);
+    const r = elbowRoute(fromEnd, toEnd, el.startBinding?.gap ?? el.endBinding?.gap ?? 6, obstacles);
     const out = r.points.map(p => [p.x, p.y]);
     memo.set(el.id, { key, pts: out });
     return out.map(p => [...p]);

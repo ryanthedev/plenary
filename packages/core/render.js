@@ -7,7 +7,7 @@
 // Colors arrive as #rrggbb or #rrggbbaa; the theme decides what "default ink" is.
 
 import { DEFAULT_STROKE, isShape, isLinear, isLabel, textSize, MIN_PRESSURE, MAX_PRESSURE } from "./model.js";
-import { bbox, resolvedPoints, drawnPoints, toWorld, angleOf, centerOf, labelAnchor } from "./geometry.js";
+import { bbox, resolvedPoints, drawnPoints, toWorld, angleOf, centerOf, labelAnchor, portsOf } from "./geometry.js";
 import { spatialIndex } from "./spatial.js";
 import { animState } from "./anim.js";
 import { labelLines, textWidth } from "./text.js";
@@ -392,8 +392,55 @@ function cmdsBox(cmds, pad) {
 const overlaps = (a, b) => !!a && a.x0 < b.x1 && b.x0 < a.x1 && a.y0 < b.y1 && b.y0 < a.y1;
 const union = (a, b) => (a ? { x0: Math.min(a.x0, b.x0), y0: Math.min(a.y0, b.y0), x1: Math.max(a.x1, b.x1), y1: Math.max(a.y1, b.y1) } : b);
 
-// Helpers for overlays (selection, handles, cursors).
+// Helpers for overlays (selection, handles, cursors, snap indicators).
 export function rectCmds(x, y, w, h) { return [["M", x, y], ["L", x + w, y], ["L", x + w, y + h], ["L", x, y + h], ["L", x, y]]; }
+
+// Visual port / anchor snap indicators for line/arrow hover & endpoint drag preview.
+export function paintSnapIndicator(doc, snap, view, theme, out) {
+  if (!snap?.targetId) return;
+  const shape = doc.get(snap.targetId);
+  if (!shape) return;
+  const P = project(view), acc = theme.accent;
+  const circle = (x, y, r, steps = 20) => {
+    const c = [];
+    for (let i = 0; i <= steps; i++) {
+      const t = (i / steps) * Math.PI * 2;
+      c.push([i ? "L" : "M", x + Math.cos(t) * r, y + Math.sin(t) * r]);
+    }
+    return c;
+  };
+  const outline = (shape.type === "image"
+    ? outlinePoints({ ...shape, type: "rectangle", roundness: null })
+    : outlinePoints(shape)).map(([x, y]) => P(x, y));
+  out.push({ t: "path", id: "snap:outline", cmds: outline.map((p, i) => [i ? "L" : "M", ...p]), stroke: withAlpha(acc, 0.85), width: 2, dash: null });
+  const ports = portsOf(shape);
+  let activePoint = null;
+  for (const port of ports) {
+    if (snap.side != null && snap.side === port.side) {
+      activePoint = port.at;
+      continue;
+    }
+    const [px, py] = P(port.at[0], port.at[1]);
+    const ring = circle(px, py, 4);
+    out.push({ t: "path", id: `snap:port:${port.side}`, cmds: ring.slice(0, 20), fill: theme.bg });
+    out.push({ t: "path", id: `snap:port:${port.side}`, cmds: ring, stroke: withAlpha(acc, 0.75), width: 1.5, dash: null });
+  }
+  if (!activePoint && snap.lineId != null && snap.endIndex != null) {
+    const line = doc.get(snap.lineId);
+    if (line) {
+      const pts = resolvedPoints(doc, line);
+      if (pts.length) activePoint = snap.endIndex < 0 ? pts[pts.length - 1] : pts[snap.endIndex];
+    }
+  }
+  if (activePoint) {
+    const [ax, ay] = P(activePoint[0], activePoint[1]);
+    const halo = circle(ax, ay, 8.5);
+    out.push({ t: "path", id: "snap:halo", cmds: halo.slice(0, 20), fill: withAlpha(acc, 0.22) });
+    const core = circle(ax, ay, 5.5);
+    out.push({ t: "path", id: "snap:active", cmds: core.slice(0, 20), fill: acc });
+    out.push({ t: "path", id: "snap:active", cmds: core, stroke: theme.bg, width: 1.5, dash: null });
+  }
+}
 
 // `opts.clip` ({ w, h }, screen px): leave out what can't reach the screen. Generous on purpose:
 // a rotated shape's corners pass its box (half its size each way), a label rides its container, and

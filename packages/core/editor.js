@@ -1330,14 +1330,152 @@ export class Editor {
   // Returns the new element's id.
   addImage(file, at = this.toWorld({ x: this.size.w / 2, y: this.size.h / 2 })) {
     const { id, mimeType, dataURL } = file;
-    const files = this.doc.files[id] ? undefined : { [id]: { id, mimeType, dataURL, created: this.clock() } };
-    let w = Math.max(1, +file.width || 200), h = Math.max(1, +file.height || 150);
+    const natW = Number.isFinite(+file.width) && +file.width > 0 ? +file.width : 0;
+    const natH = Number.isFinite(+file.height) && +file.height > 0 ? +file.height : 0;
+    const fileEntry = { id, mimeType, dataURL, created: this.clock(), ...(natW > 0 && natH > 0 ? { width: natW, height: natH } : {}) };
+    const files = this.doc.files[id] ? undefined : { [id]: fileEntry };
+    let w = Math.max(1, natW || 200), h = Math.max(1, natH || 150);
     const k = Math.min(1, (this.size.w * 0.6) / this.view.scale / w, (this.size.h * 0.6) / this.view.scale / h);
     w *= k; h *= k;
     const el = this.newEl("image", { fileId: id, x: at.x - w / 2, y: at.y - h / 2, width: w, height: h, opacity: 100 });
     this.transact(tx => tx.add(el), { files });
     this.select([el.id]);
     return el.id;
+  }
+
+  // Non-destructively set or clear (pass null) the source crop rect on an image element.
+  // `crop`: { x, y, width, height, naturalWidth?, naturalHeight? } in source pixels (Excalidraw v2 format).
+  setImageCrop(id, crop) {
+    if (this.readOnly) return false;
+    const el = this.doc.get(id);
+    if (!el || el.type !== "image" || !this.doc.editable(el)) return false;
+    if (crop == null) {
+      this.transact(tx => { tx.get(id).crop = null; });
+      return true;
+    }
+    if (typeof crop !== "object") return false;
+    const x = Number(crop.x), y = Number(crop.y), width = Number(crop.width), height = Number(crop.height);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(width) || !Number.isFinite(height)) return false;
+    if (x < 0 || y < 0 || width <= 0 || height <= 0) return false;
+    const file = el.fileId ? this.doc.files?.[el.fileId] : null;
+    const rawNatW = Number(crop.naturalWidth);
+    const rawNatH = Number(crop.naturalHeight);
+    const fileW = Number.isFinite(file?.width) && file.width > 0 ? file.width : 0;
+    const fileH = Number.isFinite(file?.height) && file.height > 0 ? file.height : 0;
+    const naturalWidth = Number.isFinite(rawNatW) && rawNatW > 0
+      ? rawNatW
+      : (el.crop?.naturalWidth > 0 ? el.crop.naturalWidth : (fileW || Math.max(x + width, el.width || 1)));
+    const naturalHeight = Number.isFinite(rawNatH) && rawNatH > 0
+      ? rawNatH
+      : (el.crop?.naturalHeight > 0 ? el.crop.naturalHeight : (fileH || Math.max(y + height, el.height || 1)));
+    if (x >= naturalWidth || y >= naturalHeight) return false;
+    const cw = Math.min(width, naturalWidth - x);
+    const ch = Math.min(height, naturalHeight - y);
+    if (!(cw > 0 && ch > 0)) return false;
+    this.transact(tx => {
+      tx.get(id).crop = { x, y, width: cw, height: ch, naturalWidth, naturalHeight };
+    });
+    return true;
+  }
+
+  // Split an image element into `cols × rows` independent movable/animatable image elements
+  // sharing the exact same `fileId` blob (zero extra storage/upload), each with its exact sub-crop rect,
+  // positioned in a clean grid with `gap` spacing, committed as a single undoable transaction.
+  spliceImage(id, { cols = 2, rows = 1, gap = 12 } = {}) {
+    if (this.readOnly) return [];
+    const el = this.doc.get(id);
+    if (!el || el.type !== "image" || !this.doc.editable(el)) return [];
+    const c = Math.max(1, Math.min(12, Math.trunc(Number(cols) || 1)));
+    const r = Math.max(1, Math.min(12, Math.trunc(Number(rows) || 1)));
+    if (c * r < 2) return [];
+    const g = Number.isFinite(Number(gap)) ? Math.max(0, Math.min(500, Number(gap))) : 12;
+
+    const w = Math.abs(el.width);
+    const h = Math.abs(el.height);
+    if (!(w > 0 && h > 0)) return [];
+
+    const file = el.fileId ? this.doc.files?.[el.fileId] : null;
+    const fileW = Number.isFinite(file?.width) && file.width > 0 ? file.width : 0;
+    const fileH = Number.isFinite(file?.height) && file.height > 0 ? file.height : 0;
+    const hasCrop = el.crop && typeof el.crop === "object"
+      && Number.isFinite(el.crop.x) && Number.isFinite(el.crop.y)
+      && Number.isFinite(el.crop.width) && Number.isFinite(el.crop.height)
+      && el.crop.width > 0 && el.crop.height > 0;
+    const natW = hasCrop
+      ? (Number.isFinite(el.crop.naturalWidth) && el.crop.naturalWidth > 0 ? el.crop.naturalWidth : (fileW || (Math.max(0, el.crop.x) + el.crop.width)))
+      : (fileW || w);
+    const natH = hasCrop
+      ? (Number.isFinite(el.crop.naturalHeight) && el.crop.naturalHeight > 0 ? el.crop.naturalHeight : (fileH || (Math.max(0, el.crop.y) + el.crop.height)))
+      : (fileH || h);
+    const srcX = hasCrop ? Math.max(0, el.crop.x) : 0;
+    const srcY = hasCrop ? Math.max(0, el.crop.y) : 0;
+    const srcW = hasCrop ? Math.min(el.crop.width, Math.max(1e-6, natW - srcX)) : natW;
+    const srcH = hasCrop ? Math.min(el.crop.height, Math.max(1e-6, natH - srcY)) : natH;
+
+    const tileW = w / c;
+    const tileH = h / r;
+    const cropTileW = srcW / c;
+    const cropTileH = srcH / r;
+    const baseX = Math.min(el.x, el.x + el.width);
+    const baseY = Math.min(el.y, el.y + el.height);
+    const startX = baseX - (g * (c - 1)) / 2;
+    const startY = baseY - (g * (r - 1)) / 2;
+    const origCenter = { x: baseX + w / 2, y: baseY + h / 2 };
+    const angle = angleOf(el);
+    const layer = layerOf(el);
+    const baseZ = zOf(el);
+    const totalTiles = c * r;
+    const createdIds = [];
+
+    const ok = this.transact(tx => {
+      const orig = tx.get(id);
+      if (!orig) return;
+      orig.isDeleted = true;
+      for (const a of this.doc.live()) {
+        if (a.startBinding?.elementId === id) tx.get(a.id).startBinding = null;
+        if (a.endBinding?.elementId === id) tx.get(a.id).endBinding = null;
+      }
+      let idx = 0;
+      for (let row = 0; row < r; row++) {
+        for (let col = 0; col < c; col++) {
+          let tx0 = startX + col * (tileW + g);
+          let ty0 = startY + row * (tileH + g);
+          if (angle) {
+            const rc = rotate({ x: tx0 + tileW / 2, y: ty0 + tileH / 2 }, origCenter, angle);
+            tx0 = rc.x - tileW / 2;
+            ty0 = rc.y - tileH / 2;
+          }
+          const tile = makeElement("image", {
+            fileId: el.fileId,
+            status: el.status ?? "saved",
+            scale: Array.isArray(el.scale) && el.scale.length === 2 ? [el.scale[0], el.scale[1]] : [1, 1],
+            x: tx0,
+            y: ty0,
+            width: tileW,
+            height: tileH,
+            angle,
+            opacity: el.opacity ?? 100,
+            frameId: el.frameId ?? null,
+            crop: {
+              x: srcX + col * cropTileW,
+              y: srcY + row * cropTileH,
+              width: cropTileW,
+              height: cropTileH,
+              naturalWidth: natW,
+              naturalHeight: natH,
+            },
+            customData: { layer, z: baseZ + ((idx++) / totalTiles) * 0.5 },
+          });
+          tx.add(tile);
+          createdIds.push(tile.id);
+        }
+      }
+      return true;
+    });
+    if (!ok || !createdIds.length) return [];
+    this.select(createdIds);
+    this.flash = `Spliced image into ${c}×${r} pieces`;
+    return createdIds;
   }
 
   // Put a video on the board, centered at `at` (scene coords), scaled down to fit

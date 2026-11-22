@@ -58,6 +58,60 @@ function rotated(ctx, it, draw) {
   ctx.restore();
 }
 
+function clipped(ctx, clip, draw) {
+  if (!clip) return draw();
+  const x = num(clip.x), y = num(clip.y), w = num(clip.w), h = num(clip.h);
+  if (!(w > 0 && h > 0)) return;
+  ctx.save();
+  const a = num(clip.angle);
+  if (a) {
+    const cx = num(clip.cx), cy = num(clip.cy);
+    ctx.translate(cx, cy); ctx.rotate(a); ctx.translate(-cx, -cy);
+  }
+  ctx.beginPath();
+  ctx.rect(x, y, w, h);
+  ctx.clip();
+  if (a) {
+    const cx = num(clip.cx), cy = num(clip.cy);
+    ctx.translate(cx, cy); ctx.rotate(-a); ctx.translate(-cx, -cy);
+  }
+  draw();
+  ctx.restore();
+}
+
+function resolveCropSource(crop, src) {
+  if (!crop || typeof crop !== "object") return null;
+  const cx = num(crop.x, 0), cy = num(crop.y, 0);
+  const cw = num(crop.width, 0), ch = num(crop.height, 0);
+  if (!(cw > 0 && ch > 0)) return null;
+  const cNatW = num(crop.naturalWidth, 0), cNatH = num(crop.naturalHeight, 0);
+  const srcW = num(src?.naturalWidth ?? src?.width, 0);
+  const srcH = num(src?.naturalHeight ?? src?.height, 0);
+  let sx = cx, sy = cy, sw = cw, sh = ch;
+  let maxW = cNatW > 0 ? cNatW : srcW;
+  let maxH = cNatH > 0 ? cNatH : srcH;
+  if (srcW > 0 && cNatW > 0 && srcW !== cNatW) {
+    const rx = srcW / cNatW;
+    sx *= rx; sw *= rx; maxW = srcW;
+  }
+  if (srcH > 0 && cNatH > 0 && srcH !== cNatH) {
+    const ry = srcH / cNatH;
+    sy *= ry; sh *= ry; maxH = srcH;
+  }
+  sx = Math.max(0, sx);
+  sy = Math.max(0, sy);
+  if (maxW > 0) {
+    if (sx >= maxW) return null;
+    sw = Math.min(sw, maxW - sx);
+  }
+  if (maxH > 0) {
+    if (sy >= maxH) return null;
+    sh = Math.min(sh, maxH - sy);
+  }
+  if (!(sw > 0 && sh > 0)) return null;
+  return { sx, sy, sw, sh };
+}
+
 /**
  * Paint a display list.
  * @param {CanvasRenderingContext2D} ctx
@@ -76,72 +130,81 @@ export function paint(ctx, items, view) {
     const op = Math.max(0, Math.min(1, num(it.opacity, 1)));
     if (op <= 0) continue;
     ctx.globalAlpha = op;
-    if (it.t === "path") {
-      if (!Array.isArray(it.cmds) || !it.cmds.length) continue;
-      trace(ctx, it.cmds);
-      if (it.fill) { ctx.closePath(); ctx.fillStyle = color(it.fill); ctx.fill(); }
-      else {
-        const w = num(it.width, 1);
-        if (!(w > 0)) continue;   // canvas ignores a width of 0 or less and would keep the previous one
-        ctx.strokeStyle = color(it.stroke); ctx.lineWidth = w;
-        ctx.setLineDash(Array.isArray(it.dash) ? it.dash.map(v => num(v)) : []);
-        ctx.stroke();
-      }
-    } else if (it.t === "text") {
-      let text = String(it.text ?? "");
-      if (it.reveal != null && it.reveal < 1) text = text.slice(0, Math.round(text.length * Math.max(0, it.reveal)));
-      if (!text) continue;
-      const size = num(it.size, 16);
-      if (!(size > 0)) continue;
-      const lh = size * num(it.lineHeight, 1.25), lines = text.split("\n");
-      const face = Object.prototype.hasOwnProperty.call(faces, it.font) ? faces[it.font] : faces.sans;   // own keys only
-      ctx.font = `${size.toFixed(1)}px ${face}`;
-      ctx.fillStyle = color(it.color);
-      ctx.textBaseline = "alphabetic";
-      rotated(ctx, it, () => {
-        if (it.box) {
-          const cx = num(it.box.x) + num(it.box.w) / 2, top = num(it.box.y) + num(it.box.h) / 2 - (lines.length * lh) / 2;
-          ctx.textAlign = "center";
-          lines.forEach((l, i) => ctx.fillText(l, cx, top + lh * (i + 0.75)));
+    clipped(ctx, it.clip, () => {
+      if (it.t === "path") {
+        if (!Array.isArray(it.cmds) || !it.cmds.length) return;
+        trace(ctx, it.cmds);
+        if (it.fill) { ctx.closePath(); ctx.fillStyle = color(it.fill); ctx.fill(); }
+        else {
+          const w = num(it.width, 1);
+          if (!(w > 0)) return;   // canvas ignores a width of 0 or less and would keep the previous one
+          ctx.strokeStyle = color(it.stroke); ctx.lineWidth = w;
+          ctx.setLineDash(Array.isArray(it.dash) ? it.dash.map(v => num(v)) : []);
+          ctx.stroke();
+        }
+      } else if (it.t === "text") {
+        let text = String(it.text ?? "");
+        if (it.reveal != null && it.reveal < 1) text = text.slice(0, Math.round(text.length * Math.max(0, it.reveal)));
+        if (!text) return;
+        const size = num(it.size, 16);
+        if (!(size > 0)) return;
+        const lh = size * num(it.lineHeight, 1.25), lines = text.split("\n");
+        const face = Object.prototype.hasOwnProperty.call(faces, it.font) ? faces[it.font] : faces.sans;   // own keys only
+        ctx.font = `${size.toFixed(1)}px ${face}`;
+        ctx.fillStyle = color(it.color);
+        ctx.textBaseline = "alphabetic";
+        rotated(ctx, it, () => {
+          if (it.box) {
+            const cx = num(it.box.x) + num(it.box.w) / 2, top = num(it.box.y) + num(it.box.h) / 2 - (lines.length * lh) / 2;
+            ctx.textAlign = "center";
+            lines.forEach((l, i) => ctx.fillText(l, cx, top + lh * (i + 0.75)));
+          } else {
+            ctx.textAlign = "left";
+            lines.forEach((l, i) => ctx.fillText(l, num(it.x), num(it.y) + lh * (i + 0.75)));
+          }
+        });
+      } else if (it.t === "image") {
+        const src = view.image?.(it.fileId);
+        const w = num(it.w), h = num(it.h);
+        if (!src || !(w > 0 && h > 0)) return;   // skip zero/negative dimensions during scale or flip animations
+        const dx = num(it.x), dy = num(it.y);
+        if (it.crop) {
+          const c = resolveCropSource(it.crop, src);
+          if (!c) return;
+          rotated(ctx, it, () => ctx.drawImage(src, c.sx, c.sy, c.sw, c.sh, dx, dy, w, h));
         } else {
-          ctx.textAlign = "left";
-          lines.forEach((l, i) => ctx.fillText(l, num(it.x), num(it.y) + lh * (i + 0.75)));
+          rotated(ctx, it, () => ctx.drawImage(src, dx, dy, w, h));
         }
-      });
-    } else if (it.t === "image") {
-      const src = view.image?.(it.fileId);
-      const w = num(it.w), h = num(it.h);
-      if (!src || !(w > 0 && h > 0)) continue;   // skip zero/negative dimensions during scale or flip animations
-      rotated(ctx, it, () => ctx.drawImage(src, num(it.x), num(it.y), w, h));
-    } else if (it.t === "video") {
-      const x = num(it.x), y = num(it.y), w = num(it.w), h = num(it.h);
-      if (!(w > 0 && h > 0)) continue;
-      rotated(ctx, it, () => {
-        ctx.fillStyle = "#18181b";
-        ctx.fillRect(x, y, w, h);
-        ctx.strokeStyle = "#52525b";
-        ctx.lineWidth = 1;
-        ctx.setLineDash(it.status === "pending" ? [6, 4] : []);
-        ctx.strokeRect(x, y, w, h);
-        ctx.setLineDash([]);
-        // Centered play-icon badge for canvas fallback / PNG exports / thumbnails
-        const r = Math.min(24, Math.max(8, Math.min(w, h) * 0.16));
-        const cx = x + w / 2, cy = y + h / 2;
-        if (w >= 24 && h >= 24) {
-          ctx.beginPath();
-          ctx.arc(cx, cy, r, 0, Math.PI * 2);
-          ctx.fillStyle = "rgba(255,255,255,0.22)";
-          ctx.fill();
-          ctx.beginPath();
-          ctx.moveTo(cx - r * 0.32, cy - r * 0.45);
-          ctx.lineTo(cx + r * 0.5, cy);
-          ctx.lineTo(cx - r * 0.32, cy + r * 0.45);
-          ctx.closePath();
-          ctx.fillStyle = "#ffffff";
-          ctx.fill();
-        }
-      });
-    }
+      } else if (it.t === "video") {
+        const x = num(it.x), y = num(it.y), w = num(it.w), h = num(it.h);
+        if (!(w > 0 && h > 0)) return;
+        rotated(ctx, it, () => {
+          ctx.fillStyle = "#18181b";
+          ctx.fillRect(x, y, w, h);
+          ctx.strokeStyle = "#52525b";
+          ctx.lineWidth = 1;
+          ctx.setLineDash(it.status === "pending" ? [6, 4] : []);
+          ctx.strokeRect(x, y, w, h);
+          ctx.setLineDash([]);
+          // Centered play-icon badge for canvas fallback / PNG exports / thumbnails
+          const r = Math.min(24, Math.max(8, Math.min(w, h) * 0.16));
+          const cx = x + w / 2, cy = y + h / 2;
+          if (w >= 24 && h >= 24) {
+            ctx.beginPath();
+            ctx.arc(cx, cy, r, 0, Math.PI * 2);
+            ctx.fillStyle = "rgba(255,255,255,0.22)";
+            ctx.fill();
+            ctx.beginPath();
+            ctx.moveTo(cx - r * 0.32, cy - r * 0.45);
+            ctx.lineTo(cx + r * 0.5, cy);
+            ctx.lineTo(cx - r * 0.32, cy + r * 0.45);
+            ctx.closePath();
+            ctx.fillStyle = "#ffffff";
+            ctx.fill();
+          }
+        });
+      }
+    });
   }
   ctx.globalAlpha = 1;
   ctx.setLineDash([]);

@@ -483,4 +483,72 @@ describe("timeline math & Editor playback controls", () => {
     expect(ed.play?.explicit).toBe(true);
     expect(ed.displayList(theme).some(it => it.id === "r1")).toBe(false);
   });
+
+  test("#117: dissolve-in, dissolve-out, and wipe-right/left/down/up presets emit smooth opacity & clip rects", () => {
+    // Dissolve In & Dissolve Out
+    const din = makeEl({ preset: "dissolve-in", start: 100, duration: 700 });
+    expect(animState(din, 100).opacity).toBe(0);
+    expect(animState(din, 450).opacity).toBeCloseTo(0.5, 4);
+    expect(animState(din, 800).opacity).toBe(1);
+    expect(animState(din, 800).scale).toBeCloseTo(1, 6);
+
+    const dout = makeEl({ preset: "dissolve-out", start: 0, duration: 700 });
+    expect(animState(dout, 0).opacity).toBe(1);
+    expect(animState(dout, 350).opacity).toBeCloseTo(0.5, 4);
+    expect(animState(dout, 700).opacity).toBe(0);
+
+    // Wipe presets: directional normalized clip rects
+    const wr = makeEl({ preset: "wipe-right", start: 0, duration: 600 });
+    expect(animState(wr, 0)).toMatchObject({ opacity: 0, clip: { x: 0, y: 0, w: 0, h: 1 } });
+    expect(animState(wr, 300)).toMatchObject({ opacity: 1, clip: { x: 0, y: 0, w: 0.5, h: 1 } });
+    expect(animState(wr, 600)).toMatchObject({ opacity: 1, clip: { x: 0, y: 0, w: 1, h: 1 } });
+
+    const wl = makeEl({ preset: "wipe-left", start: 0, duration: 600 });
+    expect(animState(wl, 300).clip).toEqual({ x: 0.5, y: 0, w: 0.5, h: 1 });
+
+    const wd = makeEl({ preset: "wipe-down", start: 0, duration: 600 });
+    expect(animState(wd, 300).clip).toEqual({ x: 0, y: 0, w: 1, h: 0.5 });
+
+    const wu = makeEl({ preset: "wipe-up", start: 0, duration: 600 });
+    expect(animState(wu, 300).clip).toEqual({ x: 0, y: 0.5, w: 1, h: 0.5 });
+
+    // Overshooting easing (spring) still clamps clip strictly inside [0, 1]
+    const wSpring = makeEl({ preset: "wipe-right", start: 0, duration: 600, easing: "spring" });
+    for (let t = 0; t <= 600; t += 30) {
+      const c = animState(wSpring, t).clip;
+      expect(c.x).toBeGreaterThanOrEqual(0);
+      expect(c.w).toBeGreaterThanOrEqual(0);
+      expect(c.x + c.w).toBeLessThanOrEqual(1 + 1e-9);
+    }
+
+    // render.js wires screen-space clip rect mid-wipe, omits element at t=0, omits clip when fully revealed
+    const theme = { fg: "#18181B", bg: "#F8F7F4", accent: "#3B48E8", dim: "#625F57" };
+    const view = { x: 0, y: 0, scale: 1 };
+    const imgDoc = new Doc({
+      elements: [
+        makeEl({ preset: "wipe-right", start: 0, duration: 600 }, { id: "im1", type: "image", x: 100, y: 50, width: 200, height: 100, fileId: "f1" }),
+      ],
+      files: { f1: { mimeType: "image/png", dataURL: "data:image/png;base64,AA==" } },
+    });
+    expect(paintScene(imgDoc, view, theme, { time: 0 }).length).toBe(0);
+    const midItems = paintScene(imgDoc, view, theme, { time: 300 });
+    expect(midItems.length).toBe(1);
+    expect(midItems[0].clip).toEqual({ x: 100, y: 50, w: 100, h: 100 });
+    const endItems = paintScene(imgDoc, view, theme, { time: 600 });
+    expect(endItems.length).toBe(1);
+    expect(endItems[0].clip).toBeUndefined();
+
+    // Opus review regression: bound label wipes in lockstep with its container shape's box
+    const labelDoc = new Doc({
+      elements: [
+        makeEl({ preset: "wipe-right", start: 0, duration: 600 }, { id: "box1", x: 100, y: 100, width: 400, height: 100 }),
+        makeEl({ preset: "wipe-right", start: 0, duration: 600 }, { id: "lbl1", type: "text", containerId: "box1", x: 250, y: 140, width: 80, height: 20, text: "Hello", fontSize: 20, fontFamily: 1, lineHeight: 1.25 }),
+      ],
+    });
+    const wipeItems = paintScene(labelDoc, view, theme, { time: 300 });
+    const boxItem = wipeItems.find(it => it.id === "box1");
+    const lblItem = wipeItems.find(it => it.id === "lbl1");
+    expect(boxItem?.clip).toBeDefined();
+    expect(lblItem?.clip).toEqual(boxItem.clip);
+  });
 });

@@ -108,6 +108,11 @@ export const PRESETS = {
   "bounce-in":  { label: "Bounce In",   category: "entrance", duration: 750, easing: "bounce",      from: { opacity: 0, scale: 0.35, dy: -24 }, to: { opacity: 1, scale: 1, dy: 0 } },
   "zoom-in":    { label: "Zoom In",     category: "entrance", duration: 600, easing: "spring",      from: { opacity: 0, scale: 0.2 }, to: { opacity: 1, scale: 1 } },
   "flip-in":    { label: "Flip In",     category: "entrance", duration: 650, easing: "ease-out",    from: { opacity: 0, scaleX: 0.05 }, to: { opacity: 1, scaleX: 1 } },
+  "dissolve-in":{ label: "Dissolve In", category: "entrance", duration: 700, easing: "ease-in-out", from: { opacity: 0, scale: 0.985 }, to: { opacity: 1, scale: 1 } },
+  "wipe-right": { label: "Wipe Right",  category: "entrance", duration: 650, easing: "ease-in-out", fn: e => { const c = clamp01(e); return { opacity: c > 0 ? 1 : 0, clip: { x: 0, y: 0, w: c, h: 1 } }; } },
+  "wipe-left":  { label: "Wipe Left",   category: "entrance", duration: 650, easing: "ease-in-out", fn: e => { const c = clamp01(e); return { opacity: c > 0 ? 1 : 0, clip: { x: 1 - c, y: 0, w: c, h: 1 } }; } },
+  "wipe-down":  { label: "Wipe Down",   category: "entrance", duration: 650, easing: "ease-in-out", fn: e => { const c = clamp01(e); return { opacity: c > 0 ? 1 : 0, clip: { x: 0, y: 0, w: 1, h: c } }; } },
+  "wipe-up":    { label: "Wipe Up",     category: "entrance", duration: 650, easing: "ease-in-out", fn: e => { const c = clamp01(e); return { opacity: c > 0 ? 1 : 0, clip: { x: 0, y: 1 - c, w: 1, h: c } }; } },
 
   // ── Emphasis ──
   pulse:        { label: "Pulse",       category: "emphasis", duration: 600,  easing: "out",         from: { scale: 1 }, mid: { scale: 1.12 }, to: { scale: 1 }, loop: true },
@@ -120,10 +125,11 @@ export const PRESETS = {
   draw:         { label: "Draw",        category: "path",     duration: 800,  easing: "ease-in-out", from: { progress: 0 }, to: { progress: 1 } },
 
   // ── Exit ──
-  out:          { label: "Fade Out",    category: "exit",     duration: 600,  easing: "out",         from: { opacity: 1 }, to: { opacity: 0 }, legacy: true },
-  "fade-out":   { label: "Fade Out",    category: "exit",     duration: 600,  easing: "ease-in",     from: { opacity: 1 }, to: { opacity: 0 } },
-  "scale-out":  { label: "Scale Out",   category: "exit",     duration: 550,  easing: "ease-in",     from: { opacity: 1, scale: 1 }, to: { opacity: 0, scale: 0.5 } },
-  "slide-out":  { label: "Slide Out",   category: "exit",     duration: 600,  easing: "ease-in",     from: { opacity: 1, dy: 0 }, to: { opacity: 0, dy: 40 } },
+  out:           { label: "Fade Out",     category: "exit",     duration: 600,  easing: "out",         from: { opacity: 1 }, to: { opacity: 0 }, legacy: true },
+  "fade-out":    { label: "Fade Out",     category: "exit",     duration: 600,  easing: "ease-in",     from: { opacity: 1 }, to: { opacity: 0 } },
+  "dissolve-out":{ label: "Dissolve Out", category: "exit",     duration: 700,  easing: "ease-in-out", from: { opacity: 1, scale: 1 }, to: { opacity: 0, scale: 0.985 } },
+  "scale-out":   { label: "Scale Out",    category: "exit",     duration: 550,  easing: "ease-in",     from: { opacity: 1, scale: 1 }, to: { opacity: 0, scale: 0.5 } },
+  "slide-out":   { label: "Slide Out",    category: "exit",     duration: 600,  easing: "ease-in",     from: { opacity: 1, dy: 0 }, to: { opacity: 0, dy: 40 } },
 };
 
 /** Prototype-safe lookup for preset definitions. */
@@ -160,6 +166,13 @@ const clampState = o => {
   o.opacity = clamp01(o.opacity);
   o.progress = clamp01(o.progress);
   o.glow = clamp01(o.glow);
+  if (o.clip && typeof o.clip === "object") {
+    const x = clamp01(o.clip.x);
+    const y = clamp01(o.clip.y);
+    const w = Math.min(clamp01(o.clip.w), 1 - x);
+    const h = Math.min(clamp01(o.clip.h), 1 - y);
+    o.clip = { x, y, w, h };
+  }
   return o;
 };
 const mix = (a, b, k) => {

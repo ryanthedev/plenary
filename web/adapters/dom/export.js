@@ -32,20 +32,57 @@ function d(cmds) {
 export function toSvg(items, { width, height, background, files = {}, scale = 1, faces = FACES } = {}) {
   width = num(width, 800); height = num(height, 600); scale = num(scale, 1) > 0 ? num(scale, 1) : 1;
   const px = v => +(v * scale).toFixed(2), face = k => esc(faces[k] ?? faces.sans);
-  const out = [`<svg xmlns="http://www.w3.org/2000/svg" width="${px(width)}" height="${px(height)}" viewBox="0 0 ${width} ${height}">`];
-  if (background) out.push(`<rect x="0" y="0" width="${width}" height="${height}" fill="${color(background)[0]}"/>`);
+  const defs = [];
+  let clipSeq = 0;
+  const addClip = (x, y, w, h, angle = 0, cx = 0, cy = 0) => {
+    const id = `pl-clip-${++clipSeq}`;
+    const deg = num(angle) * 180 / Math.PI;
+    const turn = deg ? ` transform="rotate(${deg.toFixed(2)} ${num(cx).toFixed(1)} ${num(cy).toFixed(1)})"` : "";
+    defs.push(`<clipPath id="${id}"><rect x="${num(x).toFixed(1)}" y="${num(y).toFixed(1)}" width="${Math.max(0, num(w)).toFixed(1)}" height="${Math.max(0, num(h)).toFixed(1)}"${turn}/></clipPath>`);
+    return id;
+  };
+  const body = [];
+  if (background) body.push(`<rect x="0" y="0" width="${width}" height="${height}" fill="${color(background)[0]}"/>`);
   for (const it of items) {
     const op = Math.max(0, Math.min(1, num(it.opacity, 1)));
+    if (op <= 0) continue;
+    let itemClipId = null;
+    if (it.clip && typeof it.clip === "object") {
+      const cw = num(it.clip.w), ch = num(it.clip.h);
+      if (!(cw > 0 && ch > 0)) continue;
+      itemClipId = addClip(it.clip.x, it.clip.y, cw, ch, it.clip.angle, it.clip.cx, it.clip.cy);
+    }
+    const seg = [];
     if (it.t === "path") {
       if (!Array.isArray(it.cmds) || !it.cmds.length) continue;
-      if (it.fill) { const [c, o] = color(it.fill, op); out.push(`<path d="${d(it.cmds)}Z" fill="${c}" fill-opacity="${o.toFixed(3)}"/>`); }
-      else { const [c, o] = color(it.stroke, op); out.push(`<path d="${d(it.cmds)}" fill="none" stroke="${c}" stroke-opacity="${o.toFixed(3)}" stroke-width="${num(it.width, 1)}" stroke-linecap="round" stroke-linejoin="round"${Array.isArray(it.dash) ? ` stroke-dasharray="${it.dash.map(v => num(v)).join(" ")}"` : ""}/>`); }
+      if (it.fill) { const [c, o] = color(it.fill, op); seg.push(`<path d="${d(it.cmds)}Z" fill="${c}" fill-opacity="${o.toFixed(3)}"/>`); }
+      else { const [c, o] = color(it.stroke, op); seg.push(`<path d="${d(it.cmds)}" fill="none" stroke="${c}" stroke-opacity="${o.toFixed(3)}" stroke-width="${num(it.width, 1)}" stroke-linecap="round" stroke-linejoin="round"${Array.isArray(it.dash) ? ` stroke-dasharray="${it.dash.map(v => num(v)).join(" ")}"` : ""}/>`); }
     } else if (it.t === "image") {
       const url = files?.[it.fileId]?.dataURL;
       if (typeof url !== "string" || !DATA_URL.test(url)) continue;
+      const x = num(it.x), y = num(it.y), w = Math.max(0, num(it.w)), h = Math.max(0, num(it.h));
+      if (!(w > 0 && h > 0)) continue;
       const deg = num(it.angle) * 180 / Math.PI;
       const turn = deg ? ` transform="rotate(${deg.toFixed(2)} ${num(it.cx).toFixed(1)} ${num(it.cy).toFixed(1)})"` : "";
-      out.push(`<image href="${url}" x="${num(it.x).toFixed(1)}" y="${num(it.y).toFixed(1)}" width="${Math.max(0, num(it.w)).toFixed(1)}" height="${Math.max(0, num(it.h)).toFixed(1)}" preserveAspectRatio="none" opacity="${op.toFixed(3)}"${turn}/>`);
+      if (it.crop && typeof it.crop === "object") {
+        const cx0 = Math.max(0, num(it.crop.x, 0)), cy0 = Math.max(0, num(it.crop.y, 0));
+        let cw = num(it.crop.width, 0), ch = num(it.crop.height, 0);
+        const rawNatW = num(it.crop.naturalWidth, 0) || num(files?.[it.fileId]?.width, 0);
+        const rawNatH = num(it.crop.naturalHeight, 0) || num(files?.[it.fileId]?.height, 0);
+        const natW = rawNatW > 0 ? rawNatW : (cx0 + cw);
+        const natH = rawNatH > 0 ? rawNatH : (cy0 + ch);
+        if (cx0 >= natW || cy0 >= natH) continue;
+        cw = Math.min(cw, natW - cx0);
+        ch = Math.min(ch, natH - cy0);
+        if (!(cw > 0 && ch > 0)) continue;
+        const scaleX = w / cw, scaleY = h / ch;
+        const fullW = natW * scaleX, fullH = natH * scaleY;
+        const imgX = x - cx0 * scaleX, imgY = y - cy0 * scaleY;
+        const cropClipId = addClip(x, y, w, h);
+        seg.push(`<g opacity="${op.toFixed(3)}"${turn}><g clip-path="url(#${cropClipId})"><image href="${url}" x="${imgX.toFixed(1)}" y="${imgY.toFixed(1)}" width="${fullW.toFixed(1)}" height="${fullH.toFixed(1)}" preserveAspectRatio="none"/></g></g>`);
+      } else {
+        seg.push(`<image href="${url}" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}" preserveAspectRatio="none" opacity="${op.toFixed(3)}"${turn}/>`);
+      }
     } else if (it.t === "video") {
       const x = num(it.x), y = num(it.y), w = Math.max(0, num(it.w)), h = Math.max(0, num(it.h));
       const deg = num(it.angle) * 180 / Math.PI;
@@ -54,20 +91,26 @@ export function toSvg(items, { width, height, background, files = {}, scale = 1,
       const p1 = `${(cx - r * 0.32).toFixed(1)},${(cy - r * 0.45).toFixed(1)}`;
       const p2 = `${(cx + r * 0.5).toFixed(1)},${cy.toFixed(1)}`;
       const p3 = `${(cx - r * 0.32).toFixed(1)},${(cy + r * 0.45).toFixed(1)}`;
-      out.push(`<g opacity="${op.toFixed(3)}"${turn}><rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}" fill="#18181b" stroke="#52525b" stroke-width="1"/><circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="${r.toFixed(1)}" fill="#ffffff" fill-opacity="0.22"/><polygon points="${p1} ${p2} ${p3}" fill="#ffffff"/></g>`);
+      seg.push(`<g opacity="${op.toFixed(3)}"${turn}><rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}" fill="#18181b" stroke="#52525b" stroke-width="1"/><circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="${r.toFixed(1)}" fill="#ffffff" fill-opacity="0.22"/><polygon points="${p1} ${p2} ${p3}" fill="#ffffff"/></g>`);
     } else if (it.t === "text") {
       const text = String(it.text ?? ""); if (!text) continue;
       const deg = num(it.angle) * 180 / Math.PI;
-      if (deg) out.push(`<g transform="rotate(${deg.toFixed(2)} ${num(it.cx).toFixed(1)} ${num(it.cy).toFixed(1)})">`);
+      if (deg) seg.push(`<g transform="rotate(${deg.toFixed(2)} ${num(it.cx).toFixed(1)} ${num(it.cy).toFixed(1)})">`);
       const size = num(it.size, 16), lines = text.split("\n"), lh = size * num(it.lineHeight, 1.25), [c, o] = color(it.color, op);
       const attrs = `font-family="${face(it.font)}" font-size="${size.toFixed(1)}" fill="${c}" fill-opacity="${o.toFixed(3)}"`;
       if (it.box) {
         const cx = num(it.box.x) + num(it.box.w) / 2, top = num(it.box.y) + num(it.box.h) / 2 - (lines.length * lh) / 2;
-        lines.forEach((l, i) => out.push(`<text x="${cx.toFixed(1)}" y="${(top + lh * (i + 0.75)).toFixed(1)}" ${attrs} text-anchor="middle">${esc(l)}</text>`));
-      } else lines.forEach((l, i) => out.push(`<text x="${num(it.x).toFixed(1)}" y="${(num(it.y) + lh * (i + 0.75)).toFixed(1)}" ${attrs}>${esc(l)}</text>`));
-      if (deg) out.push("</g>");
+        lines.forEach((l, i) => seg.push(`<text x="${cx.toFixed(1)}" y="${(top + lh * (i + 0.75)).toFixed(1)}" ${attrs} text-anchor="middle">${esc(l)}</text>`));
+      } else lines.forEach((l, i) => seg.push(`<text x="${num(it.x).toFixed(1)}" y="${(num(it.y) + lh * (i + 0.75)).toFixed(1)}" ${attrs}>${esc(l)}</text>`));
+      if (deg) seg.push("</g>");
     }
+    if (!seg.length) continue;
+    if (itemClipId) body.push(`<g clip-path="url(#${itemClipId})">${seg.join("")}</g>`);
+    else body.push(...seg);
   }
+  const out = [`<svg xmlns="http://www.w3.org/2000/svg" width="${px(width)}" height="${px(height)}" viewBox="0 0 ${width} ${height}">`];
+  if (defs.length) out.push(`<defs>${defs.join("")}</defs>`);
+  out.push(...body);
   out.push("</svg>");
   return out.join("\n");
 }

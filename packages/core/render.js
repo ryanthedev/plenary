@@ -230,10 +230,22 @@ export const TEXT_MIN = 3;
 
 export const project = view => (x, y) => [(x + view.x) * view.scale, (y + view.y) * view.scale];
 
+function validCrop(crop) {
+  if (!crop || typeof crop !== "object") return null;
+  const x = Number(crop.x), y = Number(crop.y), width = Number(crop.width), height = Number(crop.height);
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(width) || !Number.isFinite(height)) return null;
+  if (x < 0 || y < 0 || width <= 0 || height <= 0) return null;
+  const out = { x, y, width, height };
+  if (typeof crop.naturalWidth === "number" && Number.isFinite(crop.naturalWidth) && crop.naturalWidth > 0) out.naturalWidth = crop.naturalWidth;
+  if (typeof crop.naturalHeight === "number" && Number.isFinite(crop.naturalHeight) && crop.naturalHeight > 0) out.naturalHeight = crop.naturalHeight;
+  return out;
+}
+
 // Paint one element into `out`. `P` maps scene → screen.
 export function paintElement(doc, el, P, view, theme, out, opts = {}) {
   const a = opts.time == null ? null : animState(el, opts.time);
   if (a && a.opacity <= 0) return;
+  if (a?.clip && (a.clip.w <= 0 || a.clip.h <= 0)) return;
   const layer = doc.layer(el.customData?.layer);
   const opacity = (el.opacity / 100) * ((layer?.opacity ?? 100) / 100) * (a ? a.opacity : 1);
   const progress = a ? a.progress : 1;
@@ -258,10 +270,32 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
     }
   }
   const glow = a?.glow ?? 0;
+  let clipRect = null;
+  if (a?.clip && !(a.clip.x <= 0 && a.clip.y <= 0 && a.clip.w >= 1 && a.clip.h >= 1)) {
+    const clipTarget = isLabel(el) ? (doc.get(el.containerId) ?? el) : el;
+    const baseBox = isLinear(clipTarget) ? bounds(clipTarget, doc) : bbox(clipTarget);
+    const pad = (isShape(clipTarget) || isLinear(clipTarget)) ? Math.max(2, (clipTarget.strokeWidth ?? 2) * 1.5 + (clipTarget.roughness ?? 1) * 3) : 0;
+    const bx = baseBox.x - pad, by = baseBox.y - pad, bw = baseBox.w + pad * 2, bh = baseBox.h + pad * 2;
+    const rx0 = bx + a.clip.x * bw, ry0 = by + a.clip.y * bh;
+    const rx1 = rx0 + a.clip.w * bw, ry1 = ry0 + a.clip.h * bh;
+    const [sx0, sy0] = QNoRot(rx0, ry0);
+    const [sx1, sy1] = QNoRot(rx1, ry1);
+    const [ccx, ccy] = QNoRot(baseBox.x + baseBox.w / 2, baseBox.y + baseBox.h / 2);
+    const clipAngle = (isLinear(clipTarget) ? 0 : angleOf(clipTarget)) + aRot;
+    clipRect = {
+      x: Math.min(sx0, sx1),
+      y: Math.min(sy0, sy1),
+      w: Math.abs(sx1 - sx0),
+      h: Math.abs(sy1 - sy0),
+      ...(clipAngle ? { angle: clipAngle, cx: ccx, cy: ccy } : {}),
+    };
+  }
   // Zoomed far out the hand-drawn wobble is under a pixel: draw clean (a quarter of the commands).
   const s = view.scale, r = rng(el.seed), rough = s < CLEAN_BELOW ? 0 : (el.roughness ?? 1) * Math.min(1.5, s);
   const stroke = ink(el.strokeColor, theme), fill = ink(el.backgroundColor, theme);
   const width = Math.max(0.5, el.strokeWidth * s), dash = el.strokeStyle === "dashed" ? [8 * s, 6 * s] : el.strokeStyle === "dotted" ? [1.5 * s, 5 * s] : null;
+  const startIdx = out.length;
+  try {
 
   if (el.type === "text") {
     // Too small to read in the pane: skip it before wrapping it (and an arrow label's background patch with it).
@@ -294,7 +328,14 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
     const b = bbox(el), [x0, y0] = QNoRot(b.x, b.y), [x1, y1] = QNoRot(b.x + b.w, b.y + b.h), [cx, cy] = QNoRot(b.x + b.w / 2, b.y + b.h / 2);
     const file = doc.files?.[el.fileId];
     if (file && typeof file.dataURL === "string") {
-      out.push({ t: "image", id: el.id, fileId: el.fileId, mimeType: file.mimeType, x: x0, y: y0, w: x1 - x0, h: y1 - y0, angle: angleOf(el) + aRot, cx, cy, opacity: opacity * progress });
+      const crop = validCrop(el.crop);
+      out.push({
+        t: "image", id: el.id, fileId: el.fileId, mimeType: file.mimeType,
+        x: x0, y: y0, w: x1 - x0, h: y1 - y0,
+        angle: angleOf(el) + aRot, cx, cy,
+        opacity: opacity * progress,
+        ...(crop ? { crop } : {}),
+      });
     } else {   // the file hasn't arrived (or was lost): a dashed box where it goes
       const pts = outlinePoints({ ...el, type: "rectangle", roundness: null }).map(p => Q(p[0], p[1]));
       out.push({ t: "path", id: el.id, cmds: pts.map((p, i) => [i ? "L" : "M", ...p]), stroke: theme.dim, width: 1, dash: [6, 4], opacity });
@@ -382,6 +423,11 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
       }
       if (fills.length) out.push({ t: "path", id: el.id, cmds: fills, fill: stroke, opacity });
       if (strokes.length) out.push({ t: "path", id: el.id, cmds: strokes, stroke, width, dash: null, opacity });
+    }
+  }
+  } finally {
+    if (clipRect) {
+      for (let i = startIdx; i < out.length; i++) out[i].clip = clipRect;
     }
   }
 }
@@ -516,6 +562,23 @@ function paintProviderEmblem(el, provider, ix, iy, size, fg, Q, s, out, opacity)
     out.push({ t: "path", id: el.id + ":ic", cmds: cardPolyCmds(el, [pt(0.24, 0.58), pt(0.42, 0.76)], Q), stroke: fg, width: sw, dash: null, opacity });
     out.push({ t: "path", id: el.id + ":ic", cmds: cardPolyCmds(el, [pt(0.22, 0.40), pt(0.60, 0.78)], Q), stroke: fg, width: sw, dash: null, opacity });
     out.push({ t: "path", id: el.id + ":ic", cmds: cardPolyCmds(el, [pt(0.30, 0.28), pt(0.72, 0.70)], Q), stroke: fg, width: sw, dash: null, opacity });
+    return;
+  }
+  if (provider === "ado") {
+    // Crisp Azure DevOps folded ribbon emblem
+    out.push({
+      t: "path", id: el.id + ":ic",
+      cmds: cardPolyCmds(el, [
+        pt(0.78, 0.22), pt(0.78, 0.72), pt(0.56, 0.84), pt(0.24, 0.72),
+        pt(0.24, 0.42), pt(0.42, 0.26), pt(0.78, 0.22),
+      ], Q, true),
+      stroke: fg, width: sw, dash: null, opacity,
+    });
+    out.push({
+      t: "path", id: el.id + ":ic",
+      cmds: cardPolyCmds(el, [pt(0.24, 0.72), pt(0.56, 0.44), pt(0.78, 0.22)], Q),
+      stroke: fg, width: sw, dash: null, opacity,
+    });
     return;
   }
   // Jira: crisp layered dual-chevron diamond mark

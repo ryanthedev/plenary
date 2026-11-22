@@ -14,6 +14,7 @@ import { animState } from "./anim.js";
 import { labelLines, textWidth } from "./text.js";
 import { cornerRadius, roundPolygon, fillLines, arrowheadCmds, fontClass, FONT_FAMILY } from "./style.js";
 import { parseLinkCardFromElement, linkCardOpenBadgeRect } from "./link-card.js";
+import { parseEmbedFromElement } from "./embed.js";
 
 /** View-independent world-space geometry cache keyed by element object (auto-GC'd on doc edits). */
 const geoCache = new WeakMap();
@@ -365,6 +366,11 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
     const card = el.type === "rectangle" ? parseLinkCardFromElement(el) : null;
     if (card) {
       paintLinkCard(el, card, Q, QNoRot, view, theme, out, { opacity, progress, aRot, aScale, glow, allText: opts.allText });
+      return;
+    }
+    const embed = el.type === "rectangle" ? parseEmbedFromElement(el) : null;
+    if (embed) {
+      paintEmbedCard(el, embed, Q, QNoRot, view, theme, out, { opacity, progress, aRot, aScale, glow, allText: opts.allText });
       return;
     }
     const pts = cachedOutline(el, opts.stats).map(p => Q(p[0], p[1]));
@@ -732,6 +738,140 @@ function paintLinkCard(el, card, Q, QNoRot, view, theme, out, { opacity, progres
       x: ux0, y: uy0, text: urlText, size: urlFontSize * s * aScale,
       color: urlColor, align: "left", lineHeight: 1.2, opacity, reveal: progress,
     });
+  }
+}
+
+function formatEmbedTime(sec) {
+  const s = Math.max(0, Math.floor(sec));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const rem = s % 60;
+  return h > 0
+    ? `${h}:${String(m).padStart(2, "0")}:${String(rem).padStart(2, "0")}`
+    : `${m}:${String(rem).padStart(2, "0")}`;
+}
+
+/** Paint a YouTube / direct video / direct image media poster card using pure vector display-list items. */
+function paintEmbedCard(el, embed, Q, QNoRot, view, theme, out, { opacity, progress, aRot, aScale, glow, allText }) {
+  const b = bbox(el);
+  const s = view.scale;
+  const meta = embed.meta;
+
+  const surface = "#121216";
+  const stageBg = "#18181F";
+  const footerBg = "#0C0C10";
+  const border = "#2E2E3A";
+  const divider = "#252530";
+  const shadow = "#00000038";
+  const titleColor = "#F4F4F5";
+  const hostColor = "#A1A1AA";
+
+  const radius = Math.min(12, Math.min(b.w, b.h) * 0.14);
+  const cardPts = cardRoundRectPts(b.x, b.y, b.w, b.h, radius, 5);
+
+  if (glow > 0) {
+    out.push({ t: "path", id: el.id + ":glow", cmds: cardPolyCmds(el, cardPts, Q, true), stroke: theme.accent, width: Math.max(1, s) + 8 * s * glow, dash: null, opacity: opacity * 0.28 * glow });
+  }
+
+  // Subtle drop shadow
+  if (progress >= 1 && b.w >= 40 && b.h >= 32) {
+    const shPts = cardRoundRectPts(b.x, b.y + 3, b.w, b.h, radius, 4);
+    out.push({ t: "path", id: el.id + ":shadow", cmds: cardPolyCmds(el, shPts, Q), fill: shadow, opacity });
+  }
+
+  // Dark cinema surface
+  out.push({ t: "path", id: el.id, cmds: cardPolyCmds(el, cardPts, Q), fill: surface, opacity });
+
+  // Inner stage & footer band geometry
+  const hasFooter = b.h >= 88 && b.w >= 80;
+  const footerH = hasFooter ? Math.min(48, Math.max(30, b.h * 0.22)) : 0;
+  const stageH = Math.max(0, b.h - footerH);
+
+  if (stageH >= 16 && b.w >= 24) {
+    const inset = Math.min(2, b.w * 0.02);
+    const stagePts = cardRoundRectPts(b.x + inset, b.y + inset, b.w - inset * 2, Math.max(1, stageH - inset), Math.max(2, radius - 2), 4);
+    out.push({ t: "path", id: el.id + ":stage", cmds: cardPolyCmds(el, stagePts, Q), fill: stageBg, opacity });
+  }
+
+  if (hasFooter) {
+    const fy = b.y + stageH;
+    const footerPts = [[b.x + 1, fy], [b.x + b.w - 1, fy], [b.x + b.w - 1, b.y + b.h - 1], [b.x + 1, b.y + b.h - 1]];
+    out.push({ t: "path", id: el.id + ":footer", cmds: cardPolyCmds(el, footerPts, Q), fill: footerBg, opacity });
+    out.push({ t: "path", id: el.id + ":divider", cmds: cardPolyCmds(el, [[b.x + 1, fy], [b.x + b.w - 1, fy]], Q), stroke: divider, width: Math.max(0.75, 1 * s), dash: null, opacity });
+  }
+
+  // Card border
+  out.push({ t: "path", id: el.id + ":border", cmds: cardPolyCmds(el, cardPts, Q, true), stroke: border, width: Math.max(0.75, 1.2 * s), dash: null, opacity });
+
+  // Rotation center for text items
+  const [cx, cy] = QNoRot(b.x + b.w / 2, b.y + b.h / 2);
+  const angle = angleOf(el) + aRot;
+
+  // Center play-triangle medallion (inside poster stage)
+  const medR = Math.min(28, Math.max(10, Math.min(b.w, stageH) * 0.17));
+  if (b.w >= 44 && stageH >= 32 && medR >= 10) {
+    const mx = b.x + b.w / 2;
+    const my = b.y + stageH / 2;
+    const ringPts = cardCirclePts(mx, my, medR, 20);
+    out.push({ t: "path", id: el.id + ":medallion", cmds: cardPolyCmds(el, ringPts, Q), fill: withAlpha(meta.accent, 0.92), opacity });
+    out.push({ t: "path", id: el.id + ":medallion-ring", cmds: cardPolyCmds(el, ringPts, Q, true), stroke: "#FFFFFF55", width: Math.max(0.75, 1.5 * s), dash: null, opacity });
+    // Crisp play triangle centered visually in medallion
+    const triPts = [
+      [mx - medR * 0.28, my - medR * 0.42],
+      [mx + medR * 0.48, my],
+      [mx - medR * 0.28, my + medR * 0.42],
+    ];
+    out.push({ t: "path", id: el.id + ":play", cmds: cardPolyCmds(el, triPts, Q), fill: "#FFFFFF", opacity });
+  }
+
+  // Top-left provider badge pill ("YouTube" / "Video" / "Image")
+  const padX = Math.min(12, b.w * 0.05);
+  const padY = Math.min(10, b.h * 0.06);
+  const badgeFontSize = Math.min(11, Math.max(8, b.h * 0.055));
+  const badgeLabel = meta.name;
+  const badgeH = Math.min(22, Math.max(14, badgeFontSize * 1.75));
+  const badgeW = Math.min(Math.max(0, b.w - padX * 2), textWidth(badgeLabel, badgeFontSize, FONT_FAMILY.sans) + 14);
+  if (badgeW >= 32 && b.y + padY + badgeH <= b.y + stageH - 4) {
+    const bx = b.x + padX;
+    const by = b.y + padY;
+    const badgePts = cardRoundRectPts(bx, by, badgeW, badgeH, Math.min(6, badgeH / 2), 4);
+    out.push({ t: "path", id: el.id + ":badge", cmds: cardPolyCmds(el, badgePts, Q), fill: meta.badgeBg, opacity });
+    if (allText || badgeFontSize * s * aScale >= TEXT_MIN) {
+      const [px0, py0] = QNoRot(bx, by), [px1, py1] = QNoRot(bx + badgeW, by + badgeH);
+      out.push({
+        t: "text", id: el.id + ":provider", font: "sans", angle, cx, cy,
+        x: px0, y: py0, text: fitCardText(badgeLabel, badgeW - 8, badgeFontSize, FONT_FAMILY.sans),
+        size: badgeFontSize * s * aScale, color: meta.badgeFg, align: "center",
+        box: { x: px0, y: py0, w: px1 - px0, h: py1 - py0 }, lineHeight: 1.15, opacity, reveal: progress,
+      });
+    }
+  }
+
+  // Footer: title + host
+  if (hasFooter) {
+    const contentX = b.x + padX;
+    const contentW = Math.max(0, b.w - padX * 2);
+    const titleSize = Math.min(12.5, Math.max(9, footerH * 0.28));
+    const hostSize = Math.min(10.5, Math.max(8, footerH * 0.23));
+    const titleY = b.y + stageH + Math.max(4, footerH * 0.14);
+    if (contentW >= 24 && (allText || titleSize * s * aScale >= TEXT_MIN)) {
+      const [tx0, ty0] = QNoRot(contentX, titleY);
+      out.push({
+        t: "text", id: el.id + ":title", font: "sans", angle, cx, cy,
+        x: tx0, y: ty0, text: fitCardText(embed.title, contentW, titleSize, FONT_FAMILY.sans),
+        size: titleSize * s * aScale, color: titleColor, align: "left", lineHeight: 1.2, opacity, reveal: progress,
+      });
+    }
+    const hostY = titleY + titleSize * 1.32;
+    const hostLabel = embed.startSec ? `${embed.host} · ${formatEmbedTime(embed.startSec)}` : embed.host;
+    if (contentW >= 24 && hostY + hostSize * 1.1 <= b.y + b.h - 2 && (allText || hostSize * s * aScale >= TEXT_MIN)) {
+      const [hx0, hy0] = QNoRot(contentX, hostY);
+      out.push({
+        t: "text", id: el.id + ":host", font: "mono", angle, cx, cy,
+        x: hx0, y: hy0, text: fitCardText(hostLabel, contentW, hostSize, FONT_FAMILY.mono),
+        size: hostSize * s * aScale, color: hostColor, align: "left", lineHeight: 1.15, opacity, reveal: progress,
+      });
+    }
   }
 }
 

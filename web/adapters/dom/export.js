@@ -5,13 +5,76 @@
 // anything). PNG paints the same items through ./paint.js onto a canvas, so it matches the screen.
 // Notes, selection, cursors and comments never show: only the board Editor's doc goes in.
 
-import { exportScene, boardTheme, LIGHT, DARK, exportToExcalidraw } from "../../../packages/core/export.js";
+import { exportScene, paintedBox, boardTheme, LIGHT, DARK, exportToExcalidraw } from "../../../packages/core/export.js";
+import { paintElement, project } from "../../../packages/core/render.js";
+import { bounds } from "../../../packages/core/geometry.js";
 import { paint, imageCache, FACES } from "./paint.js";
 
-const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 const num = (v, d = 0) => (Number.isFinite(+v) ? +v : d);
 const HEX = /^#(?:[0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
 const DATA_URL = /^data:image\/(?:png|jpeg|gif|webp|svg\+xml);base64,[A-Za-z0-9+/=]+$/;
+
+function findFrame(doc, frameId) {
+  if (!doc || typeof frameId !== "string" || !frameId) return null;
+  const direct = typeof doc.get === "function" ? doc.get(frameId) : null;
+  if (direct && !direct.isDeleted && direct.type === "frame") return direct;
+  const list = typeof doc.visible === "function" ? doc.visible() : (Array.isArray(doc.elements) ? doc.elements : []);
+  return list.find(el => el && !el.isDeleted && el.type === "frame" && el.id === frameId) ?? null;
+}
+
+function frameRect(frame) {
+  const x = Math.min(num(frame.x), num(frame.x) + num(frame.width));
+  const y = Math.min(num(frame.y), num(frame.y) + num(frame.height));
+  const w = Math.abs(num(frame.width));
+  const h = Math.abs(num(frame.height));
+  return { x, y, w, h };
+}
+
+function boxesIntersect(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+/**
+ * Compute tight export bounds for either the whole board or a single frame (`{ frameId }`).
+ * Returns `null` when `frameId` is specified but no matching live frame exists.
+ * @param {any} doc
+ * @param {{ frameId?: string, theme?: any }} [opts]
+ */
+export function exportBounds(doc, { frameId, theme = LIGHT } = {}) {
+  if (frameId != null) {
+    const frame = findFrame(doc, frameId);
+    if (!frame) return null;
+    const r = frameRect(frame);
+    return { ...r, frameId: frame.id, name: frame.name || "Frame" };
+  }
+  const box = paintedBox(doc, theme) ?? { x: 0, y: 0, w: 0, h: 0 };
+  return { x: box.x, y: box.y, w: box.w, h: box.h };
+}
+
+/** Collect visible non-frame elements belonging to or overlapping `frame`. */
+function elementsInFrame(doc, frame, box) {
+  const all = typeof doc.visible === "function" ? doc.visible() : (Array.isArray(doc.elements) ? doc.elements.filter(e => e && !e.isDeleted) : []);
+  const includedIds = new Set();
+  for (const el of all) {
+    if (!el || el.isDeleted || el.type === "frame") continue;
+    if (el.frameId === frame.id) {
+      includedIds.add(el.id);
+      continue;
+    }
+    if (el.type === "text" && el.containerId) continue; // resolved in second pass with container
+    const eb = bounds(el, doc);
+    if (eb && boxesIntersect(eb, box)) includedIds.add(el.id);
+  }
+  const out = [];
+  for (const el of all) {
+    if (!el || el.isDeleted || el.type === "frame") continue;
+    if (includedIds.has(el.id) || (el.type === "text" && el.containerId && includedIds.has(el.containerId))) {
+      out.push(el);
+    }
+  }
+  return out;
+}
 
 // #rrggbbaa → color + opacity, since not every SVG renderer reads 8-digit hex.
 function color(c, opacity = 1) {
@@ -26,10 +89,25 @@ function d(cmds) {
 
 /**
  * Display list → SVG text. `scale`: pixels per unit; the viewBox stays in drawing units.
+ * Supports optional `{ frameId, doc }` (or `{ clipToViewBox: true }`) to crop tightly to a frame.
  * @param {any[]} items
- * @param {{ width?: number, height?: number, background?: string, files?: Record<string, any>, scale?: number, faces?: Record<string, string> }} [opts]
+ * @param {{ width?: number, height?: number, background?: string, files?: Record<string, any>, scale?: number, faces?: Record<string, string>, frameId?: string, doc?: any, clipToViewBox?: boolean }} [opts]
  */
-export function toSvg(items, { width, height, background, files = {}, scale = 1, faces = FACES } = {}) {
+export function toSvg(items, { width, height, background, files = {}, scale = 1, faces = FACES, frameId, doc, clipToViewBox = false } = {}) {
+  let vbX = 0, vbY = 0;
+  let cropToFrame = !!clipToViewBox;
+  if (frameId != null && doc) {
+    const fb = exportBounds(doc, { frameId });
+    if (fb) {
+      vbX = fb.x;
+      vbY = fb.y;
+      width = Math.max(1, Math.ceil(fb.w));
+      height = Math.max(1, Math.ceil(fb.h));
+      cropToFrame = true;
+    }
+  } else if (frameId != null) {
+    cropToFrame = true;
+  }
   width = num(width, 800); height = num(height, 600); scale = num(scale, 1) > 0 ? num(scale, 1) : 1;
   const px = v => +(v * scale).toFixed(2), face = k => esc(faces[k] ?? faces.sans);
   const defs = [];
@@ -42,7 +120,7 @@ export function toSvg(items, { width, height, background, files = {}, scale = 1,
     return id;
   };
   const body = [];
-  if (background) body.push(`<rect x="0" y="0" width="${width}" height="${height}" fill="${color(background)[0]}"/>`);
+  const bgRect = background ? `<rect x="${vbX}" y="${vbY}" width="${width}" height="${height}" fill="${color(background)[0]}"/>` : null;
   for (const it of items) {
     const op = Math.max(0, Math.min(1, num(it.opacity, 1)));
     if (op <= 0) continue;
@@ -108,9 +186,17 @@ export function toSvg(items, { width, height, background, files = {}, scale = 1,
     if (itemClipId) body.push(`<g clip-path="url(#${itemClipId})">${seg.join("")}</g>`);
     else body.push(...seg);
   }
-  const out = [`<svg xmlns="http://www.w3.org/2000/svg" width="${px(width)}" height="${px(height)}" viewBox="0 0 ${width} ${height}">`];
+  const frameClipId = cropToFrame && body.length ? addClip(vbX, vbY, width, height) : null;
+  const out = [`<svg xmlns="http://www.w3.org/2000/svg" width="${px(width)}" height="${px(height)}" viewBox="${vbX} ${vbY} ${width} ${height}">`];
   if (defs.length) out.push(`<defs>${defs.join("")}</defs>`);
-  out.push(...body);
+  if (bgRect) out.push(bgRect);
+  if (frameClipId) {
+    out.push(`<g clip-path="url(#${frameClipId})">`);
+    out.push(...body);
+    out.push("</g>");
+  } else {
+    out.push(...body);
+  }
   out.push("</svg>");
   return out.join("\n");
 }
@@ -118,17 +204,109 @@ export function toSvg(items, { width, height, background, files = {}, scale = 1,
 /**
  * What an export paints. `page`: "board" (the board's own page color, ink that reads on it) or "white".
  * `theme`: "light" | "dark" (used for a board with no page color of its own, when page is "board").
+ * `frameId`: optional frame element ID to crop tightly to that frame's bounds and contained elements.
+ * @param {any} doc
+ * @param {{ page?: string, theme?: string, scale?: number, frameId?: string, padding?: number, maxPixels?: number }} [opts]
  */
-export function exportOptions(doc, { page = "board", theme = "light", scale = 2 } = {}) {
+export function exportOptions(doc, { page = "board", theme = "light", scale = 2, frameId, padding, maxPixels = 8192 } = {}) {
   const own = /^#[0-9a-f]{6}$/i.test(doc.appState?.viewBackgroundColor ?? "");
   const t = page === "white" ? LIGHT : own ? boardTheme(doc.appState) : theme === "dark" ? DARK : LIGHT;
-  return exportScene(doc, t, { scale, padding: 32, ...(page === "white" ? { background: "#ffffff" } : {}) });
+  const background = page === "white" ? "#ffffff" : t.bg;
+  if (frameId != null) {
+    const frame = findFrame(doc, frameId);
+    if (frame) {
+      const box = frameRect(frame);
+      const pad = Number.isFinite(padding) && padding >= 0 ? padding : 0;
+      const view = { x: pad - box.x, y: pad - box.y, scale: 1 };
+      const width = Math.max(1, Math.ceil(box.w + pad * 2));
+      const height = Math.max(1, Math.ceil(box.h + pad * 2));
+      const items = [];
+      const P = project(view);
+      for (const el of elementsInFrame(doc, frame, box)) {
+        paintElement(doc, el, P, view, t, items, { allText: true });
+      }
+      return {
+        items,
+        width,
+        height,
+        scale: Math.min(scale, maxPixels / Math.max(width, height)),
+        background,
+        files: doc.files,
+        clipToViewBox: true,
+        frameId: frame.id,
+      };
+    }
+  }
+  return exportScene(doc, t, { scale, padding: Number.isFinite(padding) && padding >= 0 ? padding : 32, maxPixels, background });
 }
 
-/** The board as an SVG string. */
+/**
+ * The board (or a single frame when `{ frameId }` is set) as an SVG string.
+ * @param {any} doc
+ * @param {{ page?: string, theme?: string, scale?: number, frameId?: string, padding?: number }} [opts]
+ */
 export function exportSvg(doc, opts = {}) {
   const s = exportOptions(doc, opts);
   return toSvg(s.items, s);
+}
+
+/**
+ * Build a self-contained, XSS-safe, script-free print-ready HTML document with `@page` landscape rules
+ * and one crisp `<svg>` page per frame (for one-click browser Print / Save as PDF).
+ * @param {any} doc
+ * @param {{ theme?: string, page?: string, frameIds?: string[] | null, title?: string }} [opts]
+ */
+export function buildPrintHtml(doc, { theme = "light", page = "board", frameIds = null, title = "Plenary Export" } = {}) {
+  const all = typeof doc?.visible === "function" ? doc.visible() : (Array.isArray(doc?.elements) ? doc.elements.filter(e => e && !e.isDeleted) : []);
+  const liveFrames = all.filter(el => el && !el.isDeleted && el.type === "frame");
+
+  let selectedFrames;
+  if (Array.isArray(frameIds)) {
+    const byId = new Map(liveFrames.map(f => [f.id, f]));
+    selectedFrames = frameIds.map(id => byId.get(id)).filter(Boolean);
+  } else {
+    selectedFrames = [...liveFrames].sort((a, b) => (num(a.y) - num(b.y)) || (num(a.x) - num(b.x)));
+  }
+
+  const pages = [];
+  if (selectedFrames.length > 0) {
+    for (const frame of selectedFrames) {
+      const svg = exportSvg(doc, { theme, page, scale: 1, frameId: frame.id });
+      const label = esc(frame.name || "Frame");
+      pages.push(`<section class="print-page" aria-label="${label}">${svg}</section>`);
+    }
+  } else if (!Array.isArray(frameIds)) {
+    const svg = exportSvg(doc, { theme, page, scale: 1 });
+    pages.push(`<section class="print-page" aria-label="Board">${svg}</section>`);
+  }
+
+  const safeTitle = esc(title || "Plenary Export");
+  const bg = page === "white" ? "#ffffff" : (theme === "dark" ? DARK.bg : LIGHT.bg);
+  const safeBg = color(bg)[0];
+
+  return [
+    "<!doctype html>",
+    '<html lang="en">',
+    "<head>",
+    '<meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width, initial-scale=1">',
+    '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'; img-src data:; base-uri \'none\'; form-action \'none\';">',
+    `<title>${safeTitle}</title>`,
+    "<style>",
+    "@page { size: landscape; margin: 0; }",
+    "* { box-sizing: border-box; }",
+    `html, body { margin: 0; padding: 0; background: ${safeBg}; -webkit-print-color-adjust: exact; print-color-adjust: exact; }`,
+    ".print-page { width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; overflow: hidden; padding: 16px; break-inside: avoid; page-break-inside: avoid; }",
+    ".print-page:not(:last-child) { break-after: page; page-break-after: always; }",
+    ".print-page svg { max-width: 100%; max-height: 100%; width: auto; height: auto; display: block; }",
+    "@media print { .print-page { padding: 0; } }",
+    "</style>",
+    "</head>",
+    "<body>",
+    ...pages,
+    "</body>",
+    "</html>",
+  ].join("\n");
 }
 
 /**
@@ -145,12 +323,13 @@ export function exportExcalidraw(doc, { page = "board", theme = "light", source 
 }
 
 /**
- * The board as PNG pixels: paints into `canvas` (a browser canvas, or anything with width/height/getContext).
+ * The board (or a single frame when `{ frameId }` is set) as PNG pixels: paints into `canvas`
+ * (a browser canvas, or anything with width/height/getContext).
  * `loadImage(fileId)` returns a decoded image or null (pictures still loading are skipped).
  * Returns the canvas, sized width·scale × height·scale.
  * @param {any} doc
  * @param {any} canvas
- * @param {{ loadImage?: (fileId: string) => any, page?: string, theme?: string, scale?: number }} [opts]
+ * @param {{ loadImage?: (fileId: string) => any, page?: string, theme?: string, scale?: number, frameId?: string, padding?: number }} [opts]
  */
 export function paintPng(doc, canvas, { loadImage = () => null, ...opts } = {}) {
   const s = exportOptions(doc, opts);

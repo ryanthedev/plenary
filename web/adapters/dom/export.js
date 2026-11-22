@@ -65,7 +65,7 @@ export function toSvg(items, { width, height, background, files = {}, scale = 1,
 export function exportOptions(doc, { page = "board", theme = "light", scale = 2 } = {}) {
   const own = /^#[0-9a-f]{6}$/i.test(doc.appState?.viewBackgroundColor ?? "");
   const t = page === "white" ? LIGHT : own ? boardTheme(doc.appState) : theme === "dark" ? DARK : LIGHT;
-  return exportScene(doc, t, { scale, padding: 32 });
+  return exportScene(doc, t, { scale, padding: 32, ...(page === "white" ? { background: "#ffffff" } : {}) });
 }
 
 /** The board as an SVG string. */

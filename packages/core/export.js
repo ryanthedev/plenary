@@ -6,8 +6,8 @@
 import { paintScene } from "./render.js";
 import { lineWidth } from "./text.js";
 
-// What a shared picture usually looks like: Excalidraw's white page and dark ink.
-export const LIGHT = { fg: "#1e1e1e", bg: "#ffffff", accent: "#6965db", dim: "#868e96" };
+// Warm Studio Paper (light) theme synced with web/adapters/dom/paint.js.
+export const LIGHT = { fg: "#18181B", bg: "#F8F7F4", accent: "#3B48E8", dim: "#625F57" };
 
 const finite = v => Number.isFinite(v);
 
@@ -47,7 +47,8 @@ export function exportScene(doc, theme = LIGHT, { scale = 1, padding = 32, maxPi
 
 // The board's own page (appState.viewBackgroundColor, white if unset), with ink that reads on it:
 // what the drawing looks like in excalidraw.com, whatever theme the pane happens to use.
-export const DARK = { fg: "#e9ecef", bg: "#121212", accent: "#a8a5ff", dim: "#868e96" };
+// Obsidian Studio (dark) theme synced with web/adapters/dom/paint.js.
+export const DARK = { fg: "#F4F4F5", bg: "#111113", accent: "#818CF8", dim: "#91919E" };
 export function boardTheme(appState) {
   const bg = /^#[0-9a-f]{6}$/i.test(appState?.viewBackgroundColor ?? "") ? appState.viewBackgroundColor : "#ffffff";
   const [r, g, b] = [1, 3, 5].map(i => parseInt(bg.slice(i, i + 2), 16) / 255);

@@ -8,6 +8,8 @@ import { PRESET_NAMES } from "../../../packages/core/anim.js";
 import { FONT_FAMILY, fontClass } from "../../../packages/core/style.js";
 import { isShape, isLabel, layerOf } from "../../../packages/core/model.js";
 import { parseLibrary, mergeLibrary } from "../../../packages/core/library.js";
+import { icon } from "./icons.js";
+import { createColorPicker } from "./color-picker.js";
 
 export const HEADS = [["none", null, null], ["→", null, "arrow"], ["↔", "arrow", "arrow"], ["▶", null, "triangle"], ["▷", null, "triangle_outline"], ["●", null, "dot"], ["◆", null, "diamond"], ["⊣", null, "bar"]];
 export const OPACITIES = [100, 75, 50, 25];
@@ -88,18 +90,43 @@ export function renderPanel(root, ctx) {
     const out = [];
     for (const [lab, key, prop, opts] of STYLE_ROWS) {
       if (notesOnly && !NOTE_ROWS.has(prop)) continue;
+      const isColor = prop === "strokeColor" || prop === "backgroundColor";
       const ctrls = opts.map(([t, val]) => {
-        if (prop === "strokeColor" || prop === "backgroundColor") {
+        if (isColor) {
           const on = m[prop] === val;
           return h("button.sw" + (val === "transparent" ? ".none" : "") + (on ? ".on" : ""), { title: val === "transparent" ? "No fill" : val, "aria-label": val, disabled: dis, style: val === "transparent" ? {} : { background: val }, onclick: () => style({ [prop]: val }) });
         }
         return chip(t, isOn(m, prop, val), () => style({ [prop]: val }), `${prop} ${JSON.stringify(val)}`);
       });
+      if (isColor) {
+        const pickerOpen = ctx.colorPicker === prop;
+        const customBtn = h("button.sw.sw-custom" + (pickerOpen ? ".on" : ""), {
+          type: "button",
+          title: `Custom ${lab.toLowerCase()} color`,
+          "aria-label": `Custom ${lab.toLowerCase()} color`,
+          "data-custom-color": prop,
+          disabled: dis,
+          onclick: () => ctx.setColorPicker?.(pickerOpen ? null : prop),
+        }, icon("palette", { size: 13 }));
+        ctrls.push(customBtn);
+      }
       out.push(row(lab, key, ctrls));
+      if (isColor && ctx.colorPicker === prop) {
+        out.push(createColorPicker({
+          value: m[prop] && m[prop] !== "transparent" ? m[prop] : "#3b48e8",
+          disabled: dis,
+          prefs: ctx.prefs ?? null,
+          canvas: ctx.canvas ?? null,
+          pickerState: ctx.colorPickerState ?? null,
+          onChange: hex => style({ [prop]: hex }),
+          onClose: () => ctx.setColorPicker?.(null),
+          h,
+        }));
+      }
     }
     if (!notesOnly) {
       out.push(h("div.hint", { style: { margin: "8px 0 4px" } }, "With an arrow selected (or the Arrow tool):"));
-      out.push(row("Arrow", "", chip("╱ sharp", m.arrowType === "sharp", () => style({ elbowed: false, roundness: null })), chip("◠ curve", m.arrowType === "curve", () => style({ elbowed: false, roundness: { type: 2 } })), chip("┐ elbow", m.arrowType === "elbow", () => style({ elbowed: true }), "elbowed: routed around shapes")));
+      out.push(row("Arrow", "", chip("sharp", m.arrowType === "sharp", () => style({ elbowed: false, roundness: null })), chip("curve", m.arrowType === "curve", () => style({ elbowed: false, roundness: { type: 2 } })), chip("elbow", m.arrowType === "elbow", () => style({ elbowed: true }), "elbowed: routed around shapes")));
       out.push(row("Heads", "", HEADS.map(([t, s0, e0]) => chip(t, m.heads[0] === s0 && m.heads[1] === e0, () => style({ startArrowhead: s0, endArrowhead: e0 })))));
       out.push(row("Bends", "", chip("+ bend", false, () => act(e => e.addBend())), chip("straighten", false, () => act(e => e.straighten()))));
     }
@@ -109,24 +136,24 @@ export function renderPanel(root, ctx) {
   const bodies = {
     properties,
     arrange: () => [
-      h("div.row", {}, h("span.opts", {}, [["⇤ ⌥A", "left"], ["⇥ ⌥D", "right"], ["⤒ ⌥W", "top"], ["⤓ ⌥S", "bottom"], ["↔ ⌥H", "hcenter"], ["↕ ⌥V", "vcenter"]].map(([t, w]) => chip(t, false, () => act(e => e.align(w)), `align ${w}`)))),
-      h("div.row", {}, h("span.opts", {}, chip("⇹ ⇧H", false, () => act(e => e.distribute("h"))), chip("⇳ ⇧V", false, () => act(e => e.distribute("v"))),
-        [["⤒ ⌘]", "front"], ["↑ ]", "forward"], ["↓ [", "backward"], ["⤓ ⌘[", "back"]].map(([t, w]) => chip(t, false, () => act(e => e.reorder(w)), w)))),
-      h("div.row", {}, h("span.opts", {}, chip("group ⌘G", false, () => act(e => e.group())), chip("ungroup ⌘⇧G", false, () => act(e => e.ungroup())), chip("dup ⌘D", false, () => act(e => e.cloneSelection(20, 20))), chip("lock ⌘⇧L", false, () => act(e => e.toggleLock())))),
-      h("div.row", {}, h("span.opts", {}, chip("⟲ 15° <", false, () => act(e => e.rotateBy(-15))), chip("⟳ 15° >", false, () => act(e => e.rotateBy(15))), chip("⟳ 90°", false, () => act(e => e.rotateBy(90))), chip("0°", false, () => act(e => e.resetRotation())))),
+      h("div.row", {}, h("span.opts", {}, [["Left", "left"], ["Right", "right"], ["Top", "top"], ["Bottom", "bottom"], ["Center H", "hcenter"], ["Center V", "vcenter"]].map(([t, w]) => chip(t, false, () => act(e => e.align(w)), `align ${w}`)))),
+      h("div.row", {}, h("span.opts", {}, chip("Dist H", false, () => act(e => e.distribute("h")), "Distribute horizontally"), chip("Dist V", false, () => act(e => e.distribute("v")), "Distribute vertically"),
+        [["Front", "front"], ["Forward", "forward"], ["Backward", "backward"], ["Back", "back"]].map(([t, w]) => chip(t, false, () => act(e => e.reorder(w)), w)))),
+      h("div.row", {}, h("span.opts", {}, chip("group", false, () => act(e => e.group()), "Group (⌘G)"), chip("ungroup", false, () => act(e => e.ungroup()), "Ungroup (⌘⇧G)"), chip("dup", false, () => act(e => e.cloneSelection(20, 20)), "Duplicate (⌘D)"), chip("lock", false, () => act(e => e.toggleLock()), "Lock (⌘⇧L)"))),
+      h("div.row", {}, h("span.opts", {}, chip("-15°", false, () => act(e => e.rotateBy(-15)), "Rotate -15°"), chip("+15°", false, () => act(e => e.rotateBy(15)), "Rotate +15°"), chip("+90°", false, () => act(e => e.rotateBy(90)), "Rotate +90°"), chip("0°", false, () => act(e => e.resetRotation()), "Reset rotation"))),
     ],
     frames: () => {
       const fs = B.frames();
       return [
         ...fs.map((f, i) => h("button.list-row" + (B.frameAt === f.id ? ".on" : ""), { onclick: () => { S.goToFrame(f.id); ctx.onChange(); } }, h("span.dim", {}, String(i + 1)), " ", f.name || `Frame ${i + 1}`)),
-        h("div.row", { style: { marginTop: "6px" } }, h("span.opts", {}, chip("‹ prev", false, () => S.stepFrame(-1), "PgUp", true), chip("next ›", false, () => S.stepFrame(1), "PgDn", true), chip("all", false, () => S.fit(), "Fit everything (⇧1)", true))),
+        h("div.row", { style: { marginTop: "6px" } }, h("span.opts", {}, chip([icon("chevronLeft", { size: 14 }), " prev"], false, () => S.stepFrame(-1), "PgUp", true), chip(["next ", icon("chevronRight", { size: 14 })], false, () => S.stepFrame(1), "PgDn", true), chip("all", false, () => S.fit(), "Fit everything (⇧1)", true))),
       ];
     },
     animate: () => {
       const cur = B.selected()[0]?.customData?.anim?.preset;
       return [
         h("div.row", {}, h("span.opts", {}, PRESET_NAMES.map(p => chip(p, cur === p, () => S.act("board", e => e.animate(p)))), chip("none", false, () => S.act("board", e => e.clearAnimation()), "clearAnimation"))),
-        h("div.row", {}, h("span.opts", {}, chip(B.play ? "❚❚ pause" : "▶ play", !!B.play, () => { B.playToggle(); ctx.onChange(); }, "⇧Space", true))),
+        h("div.row", {}, h("span.opts", {}, chip([icon(B.play ? "pause" : "play", { size: 14 }), B.play ? " pause" : " play"], !!B.play, () => { B.playToggle(); ctx.onChange(); }, "⇧Space", true))),
         h("div.hint", {}, "Select shapes, pick an effect: they join the timeline in order (start + 150 ms stagger)."),
       ];
     },
@@ -135,8 +162,8 @@ export function renderPanel(root, ctx) {
       const lact = fn => S.act("board", fn, { settings: true });
       return [
         ...ls.map(l => h("div.list-row" + (B.activeLayer === l.id ? ".on" : ""), { onclick: () => { B.activeLayer = l.id; B.changed(); ctx.onChange(); } },
-          h("button", { title: l.visible ? "Hide" : "Show", disabled: dis, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { visible: !l.visible })); } }, l.visible ? "◉" : "○"),
-          h("button", { title: l.locked ? "Unlock" : "Lock", disabled: dis, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { locked: !l.locked })); } }, l.locked ? "🔒" : "·"),
+          h("button.tb", { title: l.visible ? "Hide" : "Show", "aria-label": l.visible ? "Hide layer" : "Show layer", disabled: dis, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { visible: !l.visible })); } }, icon(l.visible ? "eye" : "eyeOff", { size: 14 })),
+          h("button.tb", { title: l.locked ? "Unlock" : "Lock", "aria-label": l.locked ? "Unlock layer" : "Lock layer", disabled: dis, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { locked: !l.locked })); } }, icon(l.locked ? "lock" : "unlock", { size: 14 })),
           h("span", { title: "Double-click to rename", ondblclick: ev => {
             ev.stopPropagation(); if (dis) return;
             const input = h("input.rename", { value: l.name ?? "", maxLength: 80, onkeydown: k => { k.stopPropagation(); if (k.key === "Enter") input.blur(); if (k.key === "Escape") { input.value = l.name ?? ""; input.blur(); } },
@@ -145,11 +172,11 @@ export function renderPanel(root, ctx) {
           } }, l.name || "Layer"),
           h("span.n", {}, String(count(l.id))))),
         h("div.row", { style: { marginTop: "6px" } }, h("span.opts", {},
-          chip("+", false, () => lact(e => e.addLayer()), "New layer"),
-          chip("↑", false, () => lact(e => e.moveLayer(B.activeLayer, 1)), "Move up"),
-          chip("↓", false, () => lact(e => e.moveLayer(B.activeLayer, -1)), "Move down"),
-          chip("⇢", false, () => S.act("board", e => e.moveToLayer(B.activeLayer)), "Move the selection to this layer"),
-          chip("✕", false, () => lact(e => e.deleteLayer(B.activeLayer)), "Delete layer (its shapes move down)"))),
+          chip(icon("plus", { size: 14 }), false, () => lact(e => e.addLayer()), "New layer"),
+          chip(icon("arrowUp", { size: 14 }), false, () => lact(e => e.moveLayer(B.activeLayer, 1)), "Move up"),
+          chip(icon("arrowDown", { size: 14 }), false, () => lact(e => e.moveLayer(B.activeLayer, -1)), "Move down"),
+          chip(icon("moveToLayer", { size: 14 }), false, () => S.act("board", e => e.moveToLayer(B.activeLayer)), "Move the selection to this layer"),
+          chip(icon("trash", { size: 14 }), false, () => lact(e => e.deleteLayer(B.activeLayer)), "Delete layer (its shapes move down)"))),
       ];
     },
     library: () => {
@@ -172,10 +199,10 @@ export function renderPanel(root, ctx) {
   const sub = { properties: m.count ? `· ${m.count} selected` : "· next shape", frames: `· ${B.frames().length}`, library: `· ${(ctx.library ?? []).length}` };
   const out = [];
   if (!ctx.inSheet) out.push(h("div.panel-head", {},
-    h("button.tb" + (state.mode === "stack" ? ".on" : ""), { title: "Stack", onclick: () => ctx.setState({ type: "mode", mode: "stack" }) }, "▤"),
-    h("button.tb" + (state.mode === "tabs" ? ".on" : ""), { title: "Tabs", onclick: () => ctx.setState({ type: "mode", mode: "tabs" }) }, "▭"),
-    h("button.tb", { title: "Fold all / unfold all", onclick: () => ctx.setState({ type: "foldAll", folded: state.folded.length < 6 }) }, "⊟"),
-    h("button.tb", { title: "Reset the panel layout", onclick: () => ctx.setState({ type: "reset" }) }, "⚙")));
+    h("button.tb" + (state.mode === "stack" ? ".on" : ""), { title: "Stack", "aria-label": "Stack layout", onclick: () => ctx.setState({ type: "mode", mode: "stack" }) }, icon("stack", { size: 15 })),
+    h("button.tb" + (state.mode === "tabs" ? ".on" : ""), { title: "Tabs", "aria-label": "Tabs layout", onclick: () => ctx.setState({ type: "mode", mode: "tabs" }) }, icon("tabs", { size: 15 })),
+    h("button.tb", { title: "Fold all / unfold all", "aria-label": "Fold or unfold all", onclick: () => ctx.setState({ type: "foldAll", folded: state.folded.length < 6 }) }, icon("fold", { size: 15 })),
+    h("button.tb", { title: "Reset the panel layout", "aria-label": "Reset panel layout", onclick: () => ctx.setState({ type: "reset" }) }, icon("settings", { size: 15 }))));
   if (tabs) out.push(h("div.tabs", {}, secs.map(s => h("button" + (s.active ? ".on" : ""), { onclick: () => ctx.setState({ type: "tab", id: s.id }) }, s.title))));
   for (const s of secs) {
     if (!s.active) continue;

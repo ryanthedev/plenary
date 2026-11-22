@@ -262,15 +262,15 @@ test("pageshow respects shouldProbe and Replica backoff invariants (refused, sto
 
 test("setTheme('dark') / setTheme('light') updates <meta name='theme-color'> and is safe when absent", () => {
   const r = setup({ hasThemeMeta: true });
-  expect(r.themeMeta.getAttribute("content")).toBe("#f6f6f8");
+  expect(r.themeMeta.getAttribute("content")).toBe("#F8F7F4");
 
   r.app.setTheme("dark");
   expect(r.doc.documentElement.dataset.theme).toBe("dark");
-  expect(r.themeMeta.getAttribute("content")).toBe("#18181b");
+  expect(r.themeMeta.getAttribute("content")).toBe("#111113");
 
   r.app.setTheme("light");
   expect(r.doc.documentElement.dataset.theme).toBe("light");
-  expect(r.themeMeta.getAttribute("content")).toBe("#f6f6f8");
+  expect(r.themeMeta.getAttribute("content")).toBe("#F8F7F4");
 
   // Safe when <meta name="theme-color"> is absent (stub DOMs)
   const r2 = setup({ hasThemeMeta: false });

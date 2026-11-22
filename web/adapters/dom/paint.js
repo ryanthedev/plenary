@@ -33,10 +33,10 @@ export function cappedDpr(cssW, cssH, dpr = 1, maxPixels = MAX_CANVAS_PIXELS) {
   return Math.max(1, Math.sqrt(maxPixels / (w * h)));
 }
 
-/** Light and dark themes in core's shape ({ fg, bg, accent, dim }), as in core/export.js. */
+/** Light and dark themes in core's shape ({ fg, bg, accent, dim }), synced with Warm Studio Paper / Obsidian Studio tokens. */
 export const THEMES = {
-  light: { fg: "#1e1e1e", bg: "#ffffff", accent: "#6965db", dim: "#868e96" },
-  dark: { fg: "#e9ecef", bg: "#121212", accent: "#a8a5ff", dim: "#868e96" },
+  light: { fg: "#18181B", bg: "#F8F7F4", accent: "#3B48E8", dim: "#625F57" },
+  dark: { fg: "#F4F4F5", bg: "#111113", accent: "#818CF8", dim: "#91919E" },
 };
 
 function trace(ctx, cmds) {

@@ -18,6 +18,8 @@ import { renderPanel, loadLibrary, saveLibrary, addToLibrary, propsModel } from 
 import { exportSvg, paintPng, loadPictures } from "./export.js";
 import { h, $, replace } from "./dom.js";
 import { mountShareDialog } from "./admin.js";
+import { icon } from "./icons.js";
+import { cancelActiveSampler } from "./color-picker.js";
 import { mountCollab } from "./collab/ui.js";
 import { collabFrame } from "./collab/frame.js";
 import { hitTest } from "../../../packages/core/geometry.js";
@@ -46,7 +48,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const put = (k, v) => { try { prefs.set(k, v); } catch {} };
   const ui = {
     theme: theme0 === "dark" || (theme0 !== "light" && matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light",
-    panel: parsePanel(get("plenary.panel")), drawer: null, sheet: null, dialog: null, library: loadLibrary(prefs),
+    panel: parsePanel(get("plenary.panel")), drawer: null, sheet: null, dialog: null, colorPicker: null, colorPickerState: { h: null, mode: "hex" }, library: loadLibrary(prefs),
     mermaid: { src: "flowchart LR\n  A[Idea] --> B[Spec]\n  B --> C{Review?}\n  C -->|yes| D[Build]\n  C -->|no| B\n  D --> E[Ship]", elbow: true },
     export: { format: "svg", scale: 2, page: "board" },
   };
@@ -381,9 +383,9 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (toastTimer != null) clock.clear(toastTimer);
     toastTimer = clock.set(() => { toastTimer = null; el.hidden = true; }, ms);
   }
-  const setPanel = op => { const n = applyPanel(ui.panel, op); if (n !== ui.panel) { ui.panel = n; put("plenary.panel", serializePanel(n)); } chromeDirty = true; };
+  const setPanel = op => { const n = applyPanel(ui.panel, op); if (n !== ui.panel) { ui.panel = n; put("plenary.panel", serializePanel(n)); if (!n.open) cancelActiveSampler(); } chromeDirty = true; };
   function setLibrary(items) { ui.library = items; saveLibrary(prefs, items); chromeDirty = true; }
-  const THEME_COLORS = { light: "#f6f6f8", dark: "#18181b" };
+  const THEME_COLORS = { light: "#F8F7F4", dark: "#111113" };
   const setTheme = t => {
     ui.theme = t;
     document.documentElement.dataset.theme = t;
@@ -393,51 +395,90 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     chromeDirty = true;
     collab?.setTheme(t);
   };
-  function openDialog(d) { ui.dialog = d; ui.sheet = null; chromeDirty = true; }
+  let activeShare = null;
+  function openDialog(d) {
+    cancelActiveSampler();
+    if (activeShare) { activeShare.destroy(); activeShare = null; }
+    ui.dialog = d; ui.sheet = null; chromeDirty = true;
+  }
   const keyLabel = t => (t.keys?.length ? t.keys.map(k => k.toUpperCase()).join(" ") : "");
+  const activeStream = () => (S.role === "annotator" ? "notes" : S.active);
+  const activeEditor = () => S.eds[activeStream()];
+  const undoRedoState = () => {
+    const may = S.may(), ed = activeEditor();
+    return { canUndo: may && (ed?.undoStack?.length ?? 0) > 0, canRedo: may && (ed?.redoStack?.length ?? 0) > 0 };
+  };
 
   function toolButton(t, extra = "") {
     const disabled = t.id !== "hand" && !S.may();
-    return h(`button.tb${S.tool === t.id ? ".on" : ""}${extra}`, { title: `${t.name}${keyLabel(t) ? " — " + keyLabel(t) : ""}`, disabled, "data-tool": t.id,
+    return h(`button.tb${S.tool === t.id ? ".on" : ""}${extra}`, { title: `${t.name}${keyLabel(t) ? " — " + keyLabel(t) : ""}`, "aria-label": t.name, disabled, "data-tool": t.id,
       onclick: () => { if (t.id === "image") { S.setTool("image"); openPicker(); } else S.setTool(t.id); canvas.focus(); chromeDirty = true; } },
-    h("span.ic", {}, t.icon), t.keys?.[0] ? h("span.k", {}, t.keys[0].toUpperCase()) : null);
+    h("span.ic", {}, icon(t.id, { size: 18 })), t.keys?.[0] ? h("span.k", {}, t.keys[0].toUpperCase()) : null);
   }
 
   function topbar() {
     const role = S.role, tools = toolsFor(role), may = S.may();
     const core = tools.filter(t => !["image", "note", "highlighter"].includes(t.id)), extras = tools.filter(t => ["image", "note", "highlighter"].includes(t.id));
     return [
-      h("div.tools.desk-only", {}, core.map(t => toolButton(t)), extras.length ? h("span.sep") : null, extras.map(t => toolButton(t, ".new")),
+      h("div.island.top-left", {},
+        admin
+          ? h("a.brand-mark", { href: "/", title: "All boards", "aria-label": "All boards", style: { textDecoration: "none" } }, icon("brand", { size: 15 }))
+          : h("span.brand-mark", { "aria-hidden": "true" }, icon("brand", { size: 15 })),
+        h("span.board-name", {}, board, net.kind === "ws" ? null : [" ", h("small", {}, "· dev room")])),
+      h("div.tools.desk-only.island.tool-rail", { "aria-label": "Drawing tools" }, core.map(t => toolButton(t)), extras.length ? h("span.sep") : null, extras.map(t => toolButton(t, ".new")),
         role !== "viewer" ? [h("span.sep"),
-          h("button.tb" + (S.toolLock() ? ".on" : ""), { title: "Keep the tool after drawing (Q)", disabled: !may, onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, S.toolLock() ? "🔒" : "🔓"), h("span.k", {}, "Q")),
-          h("button.tb", { title: "Undo (⌘Z)", disabled: !may, onclick: () => { S.act(S.active, e => e.undo()); } }, h("span.ic", {}, "↶")),
-          h("button.tb", { title: "Redo (⌘⇧Z)", disabled: !may, onclick: () => { S.act(S.active, e => e.redo()); } }, h("span.ic", {}, "↷"))] : null),
-      h("span.board-name", {}, board, net.kind === "ws" ? null : [" ", h("small", {}, "· dev room")]),
+          h("button.tb" + (S.toolLock() ? ".on" : ""), { title: "Keep the tool after drawing (Q)", "aria-label": "Lock tool", disabled: !may, onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 17 })), h("span.k", {}, "Q")),
+          h("button.tb", { title: "Undo (⌘Z)", "aria-label": "Undo", disabled: !may, onclick: () => { S.act(activeStream(), e => e.undo()); } }, h("span.ic", {}, icon("undo", { size: 17 }))),
+          h("button.tb", { title: "Redo (⌘⇧Z)", "aria-label": "Redo", disabled: !may, onclick: () => { S.act(activeStream(), e => e.redo()); } }, h("span.ic", {}, icon("redo", { size: 17 })))] : null),
       h("span.spacer"),
-      role === "presenter" ? [
-        h("button.btn.ghost.desk-only", { title: "Insert a Mermaid flowchart", disabled: !may, onclick: () => openDialog("mermaid") }, "◇→"),
-        h("button.btn.ghost.desk-only", { title: "Export SVG / PNG (⌘⇧E)", onclick: () => openDialog("export") }, "⤓")] : null,
-      h("button.btn.ghost.desk-only", { title: "Notes", onclick: () => { ui.drawer = ui.drawer ? null : "notes"; chromeDirty = true; } }, "❏ Notes ", h("span.dim", {}, String(notesCount()))),
-      collab ? h("button.btn.ghost.desk-only", { title: "Comments (or right-click the board)", onclick: () => { ui.drawer = ui.drawer === "comments" ? null : "comments"; chromeDirty = true; } }, "💬") : null,
-      // Who's here (`here`): the collab UI's live avatar row, kept across rebuilds (a node, moved, never rebuilt here).
-      collab ? collab.parts.avatars : h("div.avatars", {},
-        h("span.stack", {}, h("span.av.live", { style: { background: "var(--u-me)" }, title: `${me.name} (you)` }, me.name.slice(0, 2).toUpperCase()))),
-      pillEl,                                                   // the pill: one node, updated in place (inPlace)
-      role !== "viewer" ? h("button.tb.desk-only" + (ui.panel.open ? ".on" : ""), { title: "Side panel (I)", onclick: () => setPanel({ type: "open" }) }, h("span.ic", {}, "◧"), h("span.k", {}, "I")) : null,
-      h("button.tb.theme-btn", { title: "Light / dark", onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, ui.theme === "dark" ? "☀" : "☾")),
-      h("button.tb.phone-only.overflow-btn", { title: "More", "aria-label": "More options", onclick: () => { ui.sheet = ui.sheet === "tools" ? null : "tools"; chromeDirty = true; } }, h("span.ic", {}, "⋯")),
+      h("div.island.top-right", {},
+        role === "presenter" ? [
+          h("button.btn.ghost.desk-only", { title: "Insert a Mermaid flowchart", "aria-label": "Insert Mermaid flowchart", disabled: !may, onclick: () => openDialog("mermaid") }, icon("mermaid", { size: 16 })),
+          h("button.btn.ghost.desk-only", { title: "Export SVG / PNG (⌘⇧E)", "aria-label": "Export board", onclick: () => openDialog("export") }, icon("export", { size: 16 }))] : null,
+        h("button.btn.ghost.desk-only", { title: "Notes", onclick: () => { ui.drawer = ui.drawer ? null : "notes"; chromeDirty = true; } }, icon("note", { size: 16 }), "Notes ", h("span.dim", {}, String(notesCount()))),
+        collab ? h("button.btn.ghost.desk-only", { title: "Comments (or right-click the board)", "aria-label": "Comments", onclick: () => { ui.drawer = ui.drawer === "comments" ? null : "comments"; chromeDirty = true; } }, icon("comments", { size: 16 })) : null,
+        // Who's here (`here`): the collab UI's live avatar row, kept across rebuilds (a node, moved, never rebuilt here).
+        collab ? collab.parts.avatars : h("div.avatars", {},
+          h("span.stack", {}, h("span.av.live", { style: { background: "var(--u-me)" }, title: `${me.name} (you)` }, me.name.slice(0, 2).toUpperCase()))),
+        pillEl,                                                   // the pill: one node, updated in place (inPlace)
+        admin ? h("button.btn.primary.desk-only", { title: "Share board", "aria-label": "Share board", onclick: () => openShare() }, icon("share", { size: 15 }), "Share") : null,
+        role !== "viewer" ? h("button.tb.desk-only" + (ui.panel.open ? ".on" : ""), { title: "Side panel (I)", "aria-label": "Inspector panel", onclick: () => setPanel({ type: "open" }) }, h("span.ic", {}, icon("panel", { size: 17 })), h("span.k", {}, "I")) : null,
+        h("button.tb.theme-btn", { title: "Light / dark", "aria-label": "Toggle color theme", onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 17 }))),
+        h("button.tb.phone-only.overflow-btn", { title: "More", "aria-label": "More options", onclick: () => { ui.sheet = ui.sheet === "tools" ? null : "tools"; chromeDirty = true; } }, h("span.ic", {}, icon("more", { size: 18 })))),
     ];
   }
   const pillTitle = cls => pillTitleFor({ cls, status: S.status, viewer: S.effective === "viewer", readOnly: S.readOnly });
 
   function hud() {
     const B = S.eds.board, fs = boardInfo(B.doc).frames, i = fs.findIndex(f => f.id === B.frameAt), may = S.may();
+    const { canUndo, canRedo } = undoRedoState();
+    const ed = activeEditor();
+    const sel = ed ? ed.selected().filter(e => !isLabel(e)) : [];
+    const selColor = sel[0]?.strokeColor ?? "#3B48E8";
+    const selPill = isPhone() && S.role !== "viewer" && may && sel.length > 0
+      ? h("div.grp.phone-only.phone-sel-pill", { "aria-label": "Selected shape actions" },
+          h("button.tb", { title: "Color & Style", "aria-label": "Color", "data-action": "color", onclick: () => { ui.sheet = "panel"; ui.colorPicker = "strokeColor"; chromeDirty = true; } },
+            h("span.sel-swatch-dot", { style: { background: safeColor(selColor) } })),
+          h("button.tb", { title: "Duplicate", "aria-label": "Duplicate", "data-action": "duplicate", onclick: () => { S.act(activeStream(), e => e.cloneSelection(20, 20)); chromeDirty = true; } },
+            h("span.ic", {}, icon("duplicate", { size: 18 }))),
+          h("button.tb.danger", { title: "Delete", "aria-label": "Delete", "data-action": "delete", onclick: () => { S.act(activeStream(), e => e.deleteIds([...e.sel])); chromeDirty = true; } },
+            h("span.ic", {}, icon("trash", { size: 18 }))))
+      : null;
     const bl = [
-      h("div.grp" + (S.role === "viewer" ? ".desk-only" : ""), {}, h("button.tb", { title: "Previous frame (PgUp)", onclick: () => S.stepFrame(-1) }, "‹"), h("span.pct", {}, fs.length ? `${i < 0 ? "–" : i + 1} / ${fs.length}` : "0 / 0"), h("button.tb", { title: "Next frame (PgDn)", onclick: () => S.stepFrame(1) }, "›")),
-      h("div.grp.desk-only", {}, h("button.tb", { title: "Zoom out (⌘-)", onclick: () => S.zoomAt(B.view.scale / 1.2) }, "−"), zoomPct,
-        h("button.tb", { title: "Zoom in (⌘=)", onclick: () => S.zoomAt(B.view.scale * 1.2) }, "+"), h("button.tb", { title: "Fit everything (⇧1)", onclick: () => S.fit() }, "⤢")),
-      S.role !== "viewer" ? h("div.grp.phone-only", {}, h("button.tb", { title: "Fit everything", onclick: () => S.fit() }, "⤢")) : null,
-      S.role !== "viewer" ? h("div.grp.phone-only", {}, h("button.tb", { disabled: !may, title: "Undo", onclick: () => S.act(S.active, e => e.undo()) }, "↶"), h("button.tb", { disabled: !may, title: "Redo", onclick: () => S.act(S.active, e => e.redo()) }, "↷")) : null,
+      selPill,
+      h("div.grp" + (S.role === "viewer" ? ".desk-only" : ""), {}, h("button.tb", { title: "Previous frame (PgUp)", "aria-label": "Previous frame", onclick: () => S.stepFrame(-1) }, icon("chevronLeft", { size: 16 })), h("span.pct", {}, fs.length ? `${i < 0 ? "–" : i + 1} / ${fs.length}` : "0 / 0"), h("button.tb", { title: "Next frame (PgDn)", "aria-label": "Next frame", onclick: () => S.stepFrame(1) }, icon("chevronRight", { size: 16 }))),
+      h("div.grp.desk-only", {},
+        S.role !== "viewer" ? [
+          h("button.tb", { title: "Undo", "aria-label": "Undo", disabled: !canUndo, onclick: () => S.act(activeStream(), e => e.undo()) }, icon("undo", { size: 16 })),
+          h("button.tb", { title: "Redo", "aria-label": "Redo", disabled: !canRedo, onclick: () => S.act(activeStream(), e => e.redo()) }, icon("redo", { size: 16 })),
+          h("span.sep"),
+        ] : null,
+        h("button.tb", { title: "Zoom out (⌘-)", "aria-label": "Zoom out", onclick: () => S.zoomAt(B.view.scale / 1.2) }, icon("minus", { size: 16 })), zoomPct,
+        h("button.tb", { title: "Zoom in (⌘=)", "aria-label": "Zoom in", onclick: () => S.zoomAt(B.view.scale * 1.2) }, icon("plus", { size: 16 })), h("button.tb", { title: "Fit everything (⇧1)", "aria-label": "Fit everything", onclick: () => S.fit() }, icon("fit", { size: 16 }))),
+      S.role !== "viewer" ? h("div.grp.phone-only.phone-undo-pill", { "aria-label": "Undo and Redo" },
+        h("button.tb", { disabled: !canUndo, title: "Undo", "aria-label": "Undo", "data-action": "undo", onclick: () => S.act(activeStream(), e => e.undo()) }, h("span.ic", {}, icon("undo", { size: 18 }))),
+        h("button.tb", { disabled: !canRedo, title: "Redo", "aria-label": "Redo", "data-action": "redo", onclick: () => S.act(activeStream(), e => e.redo()) }, h("span.ic", {}, icon("redo", { size: 18 })))) : null,
+      S.role !== "viewer" ? h("div.grp.phone-only", {}, h("button.tb", { title: "Fit everything", "aria-label": "Fit everything", onclick: () => S.fit() }, h("span.ic", {}, icon("fit", { size: 18 })))) : null,
     ];
     // The emote bar and the phones' one emote button: the collab UI's live nodes (moved in once, then kept).
     replace($("#hudBL"), bl);
@@ -457,8 +498,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     tl.fill = h("div.fill"); tl.head = h("div.head"); tl.text = h("span.t"); tl.sig = "";
     const track = h("div.track", { title: "Click to scrub", onclick: e => { const r = e.currentTarget.getBoundingClientRect(); B.play = null; B.scrub = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * dur; B.changed(); chromeDirty = true; } },
       tl.fill, marks, tl.head);
-    replace(el, h("button.c", { title: "Play / pause (⇧Space)", onclick: () => { B.playToggle(); chromeDirty = true; } }, B.play ? "❚❚" : "▶"),
-      h("button.c", { title: "Back to editing (Esc)", onclick: () => { B.stopPlay(); chromeDirty = true; } }, "■"), track, tl.text);
+    replace(el, h("button.c", { title: "Play / pause (⇧Space)", "aria-label": B.play ? "Pause" : "Play", "data-state": B.play ? "playing" : "paused", onclick: () => { B.playToggle(); chromeDirty = true; } }, icon(B.play ? "pause" : "play", { size: 14 })),
+      h("button.c", { title: "Back to editing (Esc)", "aria-label": "Stop", onclick: () => { B.stopPlay(); chromeDirty = true; } }, icon("stop", { size: 14 })), track, tl.text);
     timelineInPlace();
   }
 
@@ -476,7 +517,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
           h("div.acts", {}, h("button", { onclick: jump }, "jump to"),
             may && S.effective !== "viewer" ? (canChange ? [
               h("button", { onclick: () => { jump(); S.act("notes", n => { n.select([e.id]); n.beginText(e, { x: e.x, y: e.y }); }); } }, "edit"),
-              h("button", { onclick: () => S.act("notes", n => n.deleteIds([e.id])) }, "delete")] : h("span.lock", {}, "🔒 someone else's")) : null)));
+              h("button", { onclick: () => S.act("notes", n => n.deleteIds([e.id])) }, "delete")] : h("span.lock", {}, icon("lock", { size: 12 }), " someone else's")) : null)));
     });
     const compose = !may || S.effective === "viewer"
       ? h("div.hint.compose", {}, S.role === "viewer" ? "Viewers read notes; only annotators and presenters add them." : "Read-only: you can't add or change notes.")
@@ -500,13 +541,13 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const T = id => toolsFor("presenter").find(t => t.id === id);
   function dock() {
     const may = S.may(), role = S.role;
-    const btn = (ic, label, on, onclick, disabled = false) => h("button.tb" + (on ? ".on" : ""), { onclick, disabled }, h("span.ic", {}, ic), label);
+    const btn = (icName, label, on, onclick, disabled = false) => h("button.tb" + (on ? ".on" : ""), { onclick, disabled }, h("span.ic", {}, icon(icName, { size: 20 })), label);
     const sheet = id => () => { ui.sheet = ui.sheet === id ? null : id; chromeDirty = true; };
-    const tool = id => btn(T(id).icon, T(id).name, S.tool === id, () => { if (id === "image") openPicker(); S.setTool(id); chromeDirty = true; }, !may);
+    const tool = id => btn(id, T(id).name, S.tool === id, () => { if (id === "image") openPicker(); S.setTool(id); chromeDirty = true; }, !may);
     let items;
-    if (role === "presenter") items = [...["select", "freedraw", "rectangle", "text"].map(tool), btn("⋯", "More", ui.sheet === "tools", sheet("tools")), btn("◧", "Style", ui.sheet === "panel", sheet("panel")), btn("❏", "Notes", ui.sheet === "notes", sheet("notes")), btn("💬", "Comments", ui.sheet === "comments", sheet("comments"))];
-    else if (role === "annotator") items = [...["select", "note", "highlighter", "freedraw"].map(tool), btn("⋯", "More", ui.sheet === "tools", sheet("tools")), btn("◧", "Style", ui.sheet === "panel", sheet("panel")), btn("❏", "Notes", ui.sheet === "notes", sheet("notes"))];
-    else items = [btn("‹", "Prev", false, () => S.stepFrame(-1)), btn("⤢", "Fit", false, () => S.fit()), btn("›", "Next", false, () => S.stepFrame(1)), btn("❏", "Notes", ui.sheet === "notes", sheet("notes")), btn("💬", "Comments", ui.sheet === "comments", sheet("comments"))];
+    if (role === "presenter") items = [...["select", "freedraw", "rectangle", "text"].map(tool), btn("more", "More", ui.sheet === "tools", sheet("tools")), btn("panel", "Style", ui.sheet === "panel", sheet("panel")), btn("note", "Notes", ui.sheet === "notes", sheet("notes")), btn("comments", "Comments", ui.sheet === "comments", sheet("comments"))];
+    else if (role === "annotator") items = [...["select", "note", "highlighter", "freedraw"].map(tool), btn("more", "More", ui.sheet === "tools", sheet("tools")), btn("panel", "Style", ui.sheet === "panel", sheet("panel")), btn("note", "Notes", ui.sheet === "notes", sheet("notes"))];
+    else items = [btn("chevronLeft", "Prev", false, () => S.stepFrame(-1)), btn("fit", "Fit", false, () => S.fit()), btn("chevronRight", "Next", false, () => S.stepFrame(1)), btn("note", "Notes", ui.sheet === "notes", sheet("notes")), btn("comments", "Comments", ui.sheet === "comments", sheet("comments"))];
     replace($("#dock"), items);
   }
   const SHEET_DISMISS_PX = 72, SHEET_FLICK_VY = 0.55;
@@ -554,21 +595,28 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const el = $("#sheet");
     el.classList.remove("dragging");
     el.style.transform = "";
-    if (!ui.sheet || !isPhone()) { el.hidden = true; el.replaceChildren(); return; }
+    if (!ui.sheet || !isPhone()) { if (isPhone()) cancelActiveSampler(); el.hidden = true; el.replaceChildren(); return; }
+    if (ui.sheet !== "panel") cancelActiveSampler();
     el.hidden = false;
     let body;
     if (ui.sheet === "tools") {
       // Every write here passes S.setTool / S.may: read-only greys and refuses it (p6-mockv round 2, MEDIUM).
       const may = S.may();
-      body = h("div.tool-grid", {}, toolsFor(S.role).map(t => h("button.tb" + (S.tool === t.id ? ".on" : ""), { disabled: t.id !== "hand" && !may, onclick: () => { if (t.id === "image") openPicker(); S.setTool(t.id); ui.sheet = null; chromeDirty = true; } }, h("span.ic", {}, t.icon), t.name)),
-        S.role === "presenter" ? [h("button.tb", { disabled: !may, onclick: () => openDialog("mermaid") }, h("span.ic", {}, "◇→"), "Mermaid"), h("button.tb", { onclick: () => openDialog("export") }, h("span.ic", {}, "⤓"), "Export")] : null,
-        S.role !== "viewer" ? h("button.tb" + (S.toolLock() ? ".on" : ""), { disabled: !may, onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, S.toolLock() ? "🔒" : "🔓"), "Lock tool") : null,
-        h("button.tb", { onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, ui.theme === "dark" ? "☀" : "☾"), ui.theme === "dark" ? "Light" : "Dark"));
+      body = h("div.tool-grid", {}, toolsFor(S.role).map(t => h("button.tb" + (S.tool === t.id ? ".on" : ""), { disabled: t.id !== "hand" && !may, "data-tool": t.id, onclick: () => { if (t.id === "image") openPicker(); S.setTool(t.id); ui.sheet = null; chromeDirty = true; } }, h("span.ic", {}, icon(t.id, { size: 20 })), t.name)),
+        S.role === "presenter" ? [h("button.tb", { disabled: !may, onclick: () => openDialog("mermaid") }, h("span.ic", {}, icon("mermaid", { size: 20 })), "Mermaid"), h("button.tb", { onclick: () => openDialog("export") }, h("span.ic", {}, icon("export", { size: 20 })), "Export")] : null,
+        admin ? h("button.tb", { onclick: () => { ui.sheet = null; chromeDirty = true; openShare(); } }, h("span.ic", {}, icon("share", { size: 20 })), "Share") : null,
+        S.role !== "viewer" ? h("button.tb" + (S.toolLock() ? ".on" : ""), { disabled: !may, onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 20 })), "Lock tool") : null,
+        h("button.tb", { onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 20 })), ui.theme === "dark" ? "Light" : "Dark"));
     } else if (ui.sheet === "panel") body = h("div.scroll", {}, panelNodes(true));
     else body = [h("div.tabs", { style: { justifyContent: "center" } }, drawerTabs("sheet")), h("div.scroll", {}, drawerBody(ui.sheet))];
     replace(el, sheetHandle(el), body);
   }
-  const panelNodes = (inSheet = false) => renderPanel(null, { session: S, state: ui.panel, h, inSheet, library: ui.library, setLibrary, setState: setPanel, onChange: () => { chromeDirty = true; } });
+  const panelNodes = (inSheet = false) => renderPanel(null, {
+    session: S, state: ui.panel, h, inSheet, library: ui.library, setLibrary, setState: setPanel,
+    prefs, canvas, colorPicker: ui.colorPicker, colorPickerState: ui.colorPickerState,
+    setColorPicker: prop => { cancelActiveSampler(); ui.colorPicker = prop; chromeDirty = true; },
+    onChange: () => { chromeDirty = true; },
+  });
 
   // Mermaid preview: import into a scratch Editor (never bound to the room) and paint it small.
   function mermaidPreview(cv) {
@@ -595,6 +643,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     clock.set(() => URL.revokeObjectURL(a.href), 5000);
   }
   function dialogs() {
+    if (activeShare) return;
     const d = $("#dialogs"), may = S.may();
     if (document.activeElement?.closest?.("#dialogs") && d.firstChild) return;   // don't rebuild under the cursor
     const close = () => { ui.dialog = null; chromeDirty = true; canvas.focus(); };
@@ -603,9 +652,9 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       const cv = h("canvas", { width: 300, height: 180 });
       const ta = h("textarea.code", { spellcheck: false, value: ui.mermaid.src, oninput: e => { ui.mermaid.src = e.target.value; mermaidPreview(cv); }, onkeydown: e => e.stopPropagation() });
       replace(d, h("div.dialog-veil", { onclick: e => { if (e.target === e.currentTarget) close(); } }, h("div.dialog", { role: "dialog", "aria-label": "Insert a Mermaid flowchart" },
-        h("h2", {}, "◇→ Insert a Mermaid flowchart", h("span.spacer"), h("button.tb", { onclick: close, title: "Close" }, "✕")),
+        h("h2", {}, icon("mermaid", { size: 17 }), " Insert a Mermaid flowchart", h("span.spacer"), h("button.tb", { onclick: close, title: "Close", "aria-label": "Close" }, icon("close", { size: 16 }))),
         h("div.dbody", {}, h("div.cols", {}, ta, h("div.preview", {}, cv)),
-          h("div.row", {}, h("span.lab", {}, "Arrows"), h("span.opts", {}, chip("╱ straight", !ui.mermaid.elbow, () => { ui.mermaid.elbow = false; ui.dialog = "mermaid"; d.replaceChildren(); chromeDirty = true; }), chip("┐ elbow", ui.mermaid.elbow, () => { ui.mermaid.elbow = true; d.replaceChildren(); chromeDirty = true; }))),
+          h("div.row", {}, h("span.lab", {}, "Arrows"), h("span.opts", {}, chip("straight", !ui.mermaid.elbow, () => { ui.mermaid.elbow = false; ui.dialog = "mermaid"; d.replaceChildren(); chromeDirty = true; }), chip("elbow", ui.mermaid.elbow, () => { ui.mermaid.elbow = true; d.replaceChildren(); chromeDirty = true; }))),
           h("div.hint", {}, "Flowcharts only (graph / flowchart, TD TB BT LR RL, subgraphs become frames). Pasting Mermaid text on the board does the same.")),
         h("footer", {}, h("button.btn", { onclick: close }, "Cancel"), h("button.btn.primary", { disabled: !may, onclick: () => {
           let err = null;
@@ -616,7 +665,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     } else if (ui.dialog === "export" && S.role === "presenter") {
       const cv = h("canvas"), x = ui.export, set = (k, v) => { x[k] = v; d.replaceChildren(); chromeDirty = true; };
       replace(d, h("div.dialog-veil", { onclick: e => { if (e.target === e.currentTarget) close(); } }, h("div.dialog", { style: { width: "min(520px,100%)" }, role: "dialog", "aria-label": "Export the board" },
-        h("h2", {}, "⤓ Export the board", h("span.spacer"), h("button.tb", { onclick: close, title: "Close" }, "✕")),
+        h("h2", {}, icon("export", { size: 17 }), " Export the board", h("span.spacer"), h("button.tb", { onclick: close, title: "Close", "aria-label": "Close" }, icon("close", { size: 16 }))),
         h("div.dbody", {}, h("div.preview", { style: { minHeight: "120px" } }, cv),
           h("div.row", {}, h("span.lab", {}, "Format"), h("span.opts", {}, chip("SVG", x.format === "svg", () => set("format", "svg")), chip("PNG", x.format === "png", () => set("format", "png")))),
           h("div.row", {}, h("span.lab", {}, "Scale"), h("span.opts", {}, chip("1×", x.scale === 1, () => set("scale", 1)), chip("2×", x.scale === 2, () => set("scale", 2)))),
@@ -669,7 +718,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // Don't rebuild a panel or drawer the person is typing in.
   const busy = el => el.contains(document.activeElement) && /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName);
   // What every part depends on from the page and the session (a change rebuilds them all, as chromeDirty does).
-  const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.library.length].join("|");
+  const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.colorPicker, ui.library.length].join("|");
   const notesRowsKey = () => {
     const { notes, labels } = notesInfo(S.eds.notes.doc);
     return JSON.stringify([notes.length, S.mine.size, notes.slice(0, 200).map(e => [e.id, e.text ?? labels.get(e.id)?.text ?? "", e.backgroundColor, e.strokeColor, S.isMine(e.id)])]);
@@ -679,14 +728,20 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const panelKey = () => {
     const B = S.eds.board, ed = S.eds[S.role === "annotator" ? "notes" : S.active], bi = boardInfo(B.doc);
     return JSON.stringify([propsModel(ed), B.sel.size > 0, S.eds.notes.sel.size > 0, B.selected()[0]?.customData?.anim?.preset ?? null,
-      bi.framesSig, B.frameAt, !!B.play, B.doc.layers, bi.counts, B.activeLayer]);
+      bi.framesSig, B.frameAt, !!B.play, B.doc.layers, bi.counts, B.activeLayer, ui.colorPicker]);
+  };
+  const hudKey = () => {
+    const { canUndo, canRedo } = undoRedoState();
+    const ed = activeEditor();
+    const sel = isPhone() && ed ? ed.selected().filter(e => !isLabel(e)) : [];
+    return JSON.stringify([boardInfo(S.eds.board.doc).framesSig, S.eds.board.frameAt, canUndo, canRedo, sel.length, sel[0]?.strokeColor ?? ""]);
   };
   const parts = {
     topbar: { key: () => notesCount(), build: () => replace($("#topbar"), topbar()) },
     panel: { key: () => (S.role === "viewer" || !ui.panel.open ? "" : panelKey()), build: buildPanel },
     drawer: { key: () => (ui.drawer === "notes" ? notesRowsKey() : ""), build: buildDrawer },
     timeline: { key: () => { const B = S.eds.board, bi = boardInfo(B.doc), t = B.time(); return S.role !== "presenter" ? "" : JSON.stringify([bi.marks, bi.dur, !!B.play, B.play ? null : t]); }, build: timeline },
-    hud: { key: () => JSON.stringify([boardInfo(S.eds.board.doc).framesSig, S.eds.board.frameAt]), build: hud },
+    hud: { key: hudKey, build: hud },
     overlays: { key: () => JSON.stringify([S.status, S.online, S.pending, S.limited, nextTryIn() == null ? null : Math.ceil(nextTryIn() / 1000), S.settingsRefused.map(r => [r.stream, r.i, r.ready, r.code, r.keys]), expiry()?.bucket ?? null]), build: () => replace($("#overlays"), banners()) },
     dock: { key: () => "", build: dock },
     sheet: { key: () => (!ui.sheet || !isPhone() ? "" : ui.sheet === "panel" ? panelKey() : ui.sheet === "tools" ? "" : notesRowsKey()), build: sheetView },
@@ -715,7 +770,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     drawer.hidden = !ui.drawer;
     if (!ui.drawer) return true;
     if (busy(drawer)) return false;
-    replace(drawer, h("header", {}, h("h3", {}, "Annotations"), drawerTabs("drawer"), h("button.tb", { title: "Close", onclick: () => { ui.drawer = null; chromeDirty = true; } }, "✕")), drawerBody(ui.drawer));
+    replace(drawer, h("header", {}, h("h3", {}, "Annotations"), drawerTabs("drawer"), h("button.tb", { title: "Close", "aria-label": "Close annotations", onclick: () => { ui.drawer = null; chromeDirty = true; } }, icon("close", { size: 16 }))), drawerBody(ui.drawer));
     return true;
   }
   function chrome() {
@@ -834,9 +889,11 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     requestAnimationFrame(frame);
   })();
 
-  let activeShare = null;
   function openShare() {
     if (!admin) return null;
+    cancelActiveSampler();
+    ui.dialog = null;
+    ui.sheet = null;
     activeShare?.destroy();
     activeShare = mountShareDialog({
       root: $("#dialogs"),
@@ -846,8 +903,9 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       isAdmin: S.effective === "owner",
       admin,
       origin: globalThis.location?.origin ?? "",
-      onClose: () => { activeShare = null; canvas.focus(); },
+      onClose: () => { activeShare = null; chromeDirty = true; canvas.focus(); },
     });
+    chromeDirty = true;
     return activeShare;
   }
   if (notice) toast(notice, 6000);

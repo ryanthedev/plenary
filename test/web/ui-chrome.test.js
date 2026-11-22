@@ -93,7 +93,7 @@ test("SVG export: board only, cropped, sanitised", () => {
   expect(bad).not.toContain("onload"); expect(bad).not.toContain("javascript"); expect(bad).toContain("#888888");
   // White page ignores the theme; dark theme uses the dark page for a board without its own color.
   expect(exportSvg(ed.doc, { page: "white", theme: "dark" })).toContain('fill="#ffffff"');
-  expect(exportSvg(ed.doc, { theme: "dark" })).toContain('fill="#121212"');
+  expect(exportSvg(ed.doc, { theme: "dark" })).toContain('fill="#111113"');
 });
 
 test("PNG export paints the same items at scale into a canvas", () => {

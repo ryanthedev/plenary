@@ -150,10 +150,10 @@ test("C-2/C-8: 60 frames of wheel panning and 100 incoming ops rebuild topbar, p
 
   // A real change still updates each part.
   const notesBtn = () => find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs.title === "Notes");
-  expect(text(notesBtn())).toBe("❏ Notes 0");
+  expect(text(notesBtn())).toBe("Notes 0");
   c0 = counts();
   bo.placeNote({ x: 300, y: 300 }, "from bo"); step(20);                     // incoming note: topbar count + drawer row
-  expect(text(notesBtn())).toBe("❏ Notes 1");
+  expect(text(notesBtn())).toBe("Notes 1");
   expect(text(page.byId.drawer)).toContain("from bo");
   let d = delta(c0, counts());
   expect(d.topbar).toBe(1); expect(d.drawer).toBe(1);
@@ -365,10 +365,10 @@ test("V1 remote note deleted: topbar count and drawer drop", () => {
   app.ui.drawer = "notes"; app.setPanel({ type: "noop" }); step(20);
   bo.placeNote({ x: 300, y: 300 }, "n1"); bo.placeNote({ x: 400, y: 300 }, "n2"); step(20);
   const btn = () => find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs.title === "Notes");
-  expect(text(btn())).toBe("❏ Notes 2");
+  expect(text(btn())).toBe("Notes 2");
   const id = bo.eds.notes.doc.live().find(e => e.type === "text" ? e.text === "n1" : bo.eds.notes.doc.labelOf(e)?.text === "n1")?.id ?? bo.eds.notes.doc.live()[0].id;
   bo.act("notes", n => n.deleteIds([id])); step(20);
-  expect(text(btn())).toBe("❏ Notes 1");
+  expect(text(btn())).toBe("Notes 1");
 });
 
 test("V2 remote note text edit updates the drawer row", () => {
@@ -470,7 +470,9 @@ test("V10 playback stops by itself: the timeline button returns to ▶", () => {
   for (let i = 0; i < 400 && S.eds.board.play; i++) step();
   expect(S.eds.board.play).toBeFalsy();
   step(20);
-  expect(find(page.byId.timeline, e => e.tagName === "BUTTON" && e.attrs?.title?.startsWith("Play")).textContent).toBe("▶");
+  const playBtn = find(page.byId.timeline, e => e.tagName === "BUTTON" && e.attrs?.title?.startsWith("Play"));
+  expect(playBtn.attrs["data-state"]).toBe("paused");
+  expect(find(playBtn, e => e.tagName === "SVG")?.attrs["data-icon"]).toBe("play");
 });
 
 // ── killers for the surviving mutants ──
@@ -521,13 +523,19 @@ test("K2 app.js: no setTimeout/setInterval/performance.now/Date.now in the sourc
   } finally { globalThis.setTimeout = real.setTimeout; globalThis.setInterval = real.setInterval; }
 });
 
-test("K3 main.js: the token goes only into createSession; sign-in leaves for the fixed href; the return board only via takeReturnBoard", async () => {
+test("K3 main.js: the token goes only into createSession and httpAdmin; sign-in leaves for the fixed href; the return board only via takeReturnBoard", async () => {
   const src = await Bun.file(new URL("../../web/main.js", import.meta.url)).text();
   const code = src.replace(/\/\/.*$/gm, "");
-  expect(code.match(/signIn\.token/g).length).toBe(2);                         // the gate check and createSession's token
+  expect(code.match(/signIn\.token/g).length).toBe(3);                         // the gate check, httpAdmin's token, and createSession's token
   expect(code).toMatch(/if \(!signIn\.token\)/);
+  expect(code).toMatch(/httpAdmin\(\{[^}]*token: signIn\.token,/);
   expect(code).toMatch(/createSession\(\{[^}]*token: signIn\.token,/);
-  expect(code.match(/location\.assign\(([^)]*)\)/g)).toEqual(["location.assign(signInLink.href)"]);
+  expect(code.match(/location\.assign\((?:[^()]+|\([^()]*\))*\)/g)).toEqual([
+    "location.assign(`${location.pathname}?board=${encodeURIComponent(b)}`)",
+    'location.assign("/auth/logout")',
+    "location.assign(signInLink.href)",
+    "location.assign(signInLink.href)",
+  ]);
   expect(code).not.toMatch(/console\.|localStorage|sessionStorage|tabStore\.(set|get)/);
   expect(code).not.toMatch(/RETURN_KEY|plenary\.return/);                       // read only through takeReturnBoard
   expect(code).toMatch(/const back = takeReturnBoard\(tabStore, \{ outcome: signIn\.outcome, board: asked \}\);/);

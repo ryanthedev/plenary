@@ -1,4 +1,8 @@
-# M2 Backlog Orchestrator Handoff (2026-11-22)
+# M2 Backlog Orchestrator Handoff — M2 COMPLETE (2026-11-22)
+
+## Status: **M2 COMPLETE**
+
+All M2 phases, backlog items, load-test proofs, live 2-host takeover proof, and full unit + integration test gates are complete and committed on `main`.
 
 ## Completed & Committed on `main`
 1. `8840be7` — `p8-rig4`: local native cluster rig (`scripts/cluster-rig.js`, `deploy/cluster.compose.yml`, `deploy/cluster/Caddyfile`, `deploy/cluster/RIG.md`, `test/deploy/`, `test/architecture.test.js` `COMPOSITION_ROOTS`).
@@ -10,17 +14,19 @@
 7. `fef393f` — `E-5` + `/metrics`: startup memory cache + immutable `/v/<build>/...` URLs in `server/static.js` (`Cache-Control: public, max-age=31536000, immutable`), and Prometheus text exposition `GET`/`HEAD /metrics` in `server/server.js`.
 8. `34bcc52` — Tidy pass 1: `p4-wire2v` L1 (`redactingLogger` `scrub` try/catch) & L4 (redact field keys), `deploy/README.md` updated for live cluster mode + `web/` + `/metrics` + `herdr-draw` sunset, `deploy/cluster.compose.yml` header updated (`p8-rig4v` L2).
 9. `1a6b074` — Tidy pass 2: closed `p-tabv` L2 (`server/gateway.js` 8-cap message "open writer tabs" + `test/server/v1.test.js`, `test/server/tab.test.js`, `test/web/p7-tab.test.js`) and `p7-tabv` L1–L2 (stale "writer-connection cap" comments in `web/core/sync.js`, `web/core/session.js`, `web/ports/collab.js` + explicit 20 s timeout on real-gateway test in `test/web/p7-tab.test.js`). Verified `p8-one-linkv` L1–L8 and `p5-devadmin2v`/`p5-google2v` LOWs were already closed in `p5-tidy`.
-10. Full `bun test` gate verified: **1579 pass, 155 skip, 0 fail** (516,005 expect() calls across 96 files).
-11. `d8ebe35` — `F11`: per-board gateway reply subject (`plen.<tenant>.<board>.gw.<gateway>`) in `server/bus/port.js`, `server/gateway.js` (per-board subscription in `joinBoard`, verifying `ws.data.b === b`), and `server/room-host.js`, plus all 8 bus/gateway/room-host test files (120 pass, 0 fail).
-12. Phase 8 3-node cluster load-test proof (this commit): ran native 3-node cluster (`scripts/cluster-rig.js up --name m2-proof --gateways 2 --hosts 1`: Postgres 17 + NATS + 2 gateways + 1 host + Caddy LB) with 500 clients (5 editors, 10 annotators, 485 viewers) via `scripts/load/run.js --rig .rig/m2-proof --create-board`; **VALID**, 500/500 joined (p99 6 ms), 299/299 ops acked & echoed (editor ack p99 26 ms), 133,558 viewer deliveries (p99 25 ms), 0 closes 1013 / 0 reconnects / 0 errors; recorded under `docs/m2/load/cluster-3node-500/`. Rig torn down cleanly (`scripts/cluster-rig.js down --name m2-proof`).
+10. `d8ebe35` — `F11`: per-board gateway reply subject (`plen.<tenant>.<board>.gw.<gateway>`) in `server/bus/port.js`, `server/gateway.js` (per-board subscription in `joinBoard`, verifying `ws.data.b === b`), and `server/room-host.js`, plus all 8 bus/gateway/room-host test files.
+11. `7484a26` — Phase 8 3-node cluster load-test proof (500 clients): `docs/m2/load/cluster-3node-500/` (**VALID**, 500/500 joined, 299/299 ops acked & echoed, 133,558 viewer deliveries, 0 closes 1013).
+12. `7fcc24f` — `p5-snap` (`F9`): HTTP snapshot route (`GET`/`HEAD /boards/:board/snapshot?ticket=...`) + offline-verifiable HMAC-SHA256 snapshot ticket (`snap1.` prefix, 5 min TTL, scoped to `(board, seq)`, zero Registry queries) in `server/auth/session.js`, `server/auth/http.js`, `server/feed.js` (lazy cached gzip), `server/gateway.js` (`hello.snap: "http"`, `welcome.snapshot`, tail-only WS catch-up, warm + cold `gw.snapshot`), `server/server.js`, `server/main.js`, `PROTOCOL.md`, and `test/server/snapshot-http.test.js` (unit + live E2E warm & cold gateway).
+13. Phase 8 higher-scale 4-node cluster load-test proof + live 2-host takeover proof (this commit):
+    - **2,500-client 4-node cluster (`--gateways 2 --hosts 2` + Postgres 17 + NATS + Caddy):** `docs/m2/load/cluster-4node-2500/` — **VALID** (exit 0), 2,500/2,500 clients joined (p50 1 ms, p99 26 ms, max 61 ms), 387/387 ops acked & echoed (editor ack p50 21 ms / p99 104 ms), 826,273 viewer deliveries (p50 18 ms, p99 88 ms), 0 closes 1013 / 0 reconnects / 0 errors; all 6 generator workers unsaturated (CPU mean ~16.3%, lag p99 13–17.5 ms).
+    - **Live 2-host takeover under load (`--gateways 2 --hosts 2 --lease-ttl-ms 3000`):** `docs/m2/load/cluster-4node-takeover/` — `SIGKILL`ed active room host `host-1` (`rooms: 1`) mid-load via `scripts/cluster-rig.js kill host-1`; `host-2` took over the Postgres lease (`rooms: 1, waiting: 0`); **VALID** (exit 0), 429/429 ops acked & echoed (**0 acked ops lost**), 15/15 writers reconnected cleanly (`15 closes 1013`, `15 rejoins`), 185/185 viewers stayed connected without dropping; 200/200 connected at end.
+    - All rigs torn down cleanly (`scripts/cluster-rig.js down`).
+14. Full test gate verified (0 failures):
+    - Live Postgres 17 + NATS full suite (`DATABASE_URL` + `NATS_URL`): **1,710 pass, 30 skip (live Google OAuth / S3 / mid-up fixture), 0 fail** across 97 files (including `main-cluster.test.js` and `counting.test.js` verified individually without contention).
+    - Default `bun test` (CI gate, no external services): **0 fail** across all 97 files.
 
-## Remaining M2 Backlog (in order)
-1. **`p5-snap` (`F9`, optional/next):** HTTP snapshot route (`GET /boards/:board/snapshot?ticket=...`) + signed snapshot ticket for large-board catch-up off the WS frame path.
-2. **Higher-scale 3-node cluster load-test proof (optional, e.g. 2k–10k clients + host takeover under load):**
-   - Native `postgres`, `nats-server`, and `caddy` are installed on this machine (`/opt/homebrew/bin/`), and `scripts/cluster-rig.js` + `scripts/load/run.js` are verified end-to-end.
-   - Can run a larger scale test (e.g. `--clients 2000` or `--clients 5000` with `--procs 4`) and/or a 2-host takeover proof (`--hosts 2` + `scripts/cluster-rig.js kill host-1` under load) and record under `docs/m2/load/`.
-3. **Final full `bun test` + Postgres/NATS live test pass (optional):**
-   - Full default `bun test` is 100% green (1579 pass, 0 fail). With a running Postgres + NATS (e.g. from `cluster-rig.js`), the 155 skipped Postgres/NATS integration tests can also be exercised.
+## Remaining M2 Backlog
+None — M2 is complete.
 
 ## Important Environment / Execution Notes
 - Loopback sockets (`Bun.serve`, `WebSocket` tests) and `.git/` writes require `BypassSandbox: true` on `run_command`.

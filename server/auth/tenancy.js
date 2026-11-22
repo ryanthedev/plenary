@@ -21,6 +21,7 @@
 import { higher, capTo, normEmail, verifiedEmail, isTenantAdminRecord, INVITE_ROLES } from "./util.js";
 import { resolveAccess, teamIndex, movedContext, mayMove } from "./resolver.js";
 import { HOME } from "./registry-port.js";
+export { oidcTenantBinding } from "./idp-port.js";
 
 /** @typedef {import("./registry-port.js").Registry} Registry */
 /** @typedef {import("./registry-port.js").Role} Role */

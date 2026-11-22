@@ -29,6 +29,11 @@
 //   PLENARY_MAX_CONNS_PER_USER   open sockets one user may hold (default 64). A load test that shares a few dev
 //                        tokens between thousands of clients must raise it.
 //   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET   Google sign-in; both set → /auth routes work, else they answer 503
+//   OIDC_ISSUER_URL, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET   Generic OIDC sign-in (Pocket ID, Authentik, Keycloak, Okta,
+//                        Auth0, Entra ID); all three set → /auth routes use OIDC discovery + PKCE (S256) with
+//                        issuer-bound tenancy. Optional: OIDC_SCOPES (default "openid email profile"),
+//                        OIDC_DISPLAY_NAME (default "SSO"), OIDC_TENANT_SLUG, OIDC_TENANT_DOMAIN,
+//                        OIDC_ALLOW_UNVERIFIED_EMAIL=1 (lab/dev opt-in), OIDC_ALLOW_HTTP_LOCALHOST=1.
 //   OIDC_REDIRECT_URI    default http://localhost:8080/auth/callback (must be on PUBLIC_URL's origin)
 //   PUBLIC_URL           this server's origin as browsers see it, default the redirect URI's origin
 //   COOKIE_KEY           ≥ 32 bytes; signs login/exchange cookies (and sessions, unless SESSION_KEY is set).
@@ -93,7 +98,7 @@ import { sqliteRegistry } from "./registry/sqlite.js";
 import { tenancy as makeTenancy, roleCache } from "./auth/tenancy.js";
 import { offboardService } from "./auth/offboard.js";
 import { sessions as makeSessions } from "./auth/session.js";
-import { googleOidc } from "./auth/oidc.js";
+import { googleOidc, genericOidc } from "./auth/oidc.js";
 import { httpRoutes, REQUEST_DEADLINE_MS } from "./auth/http.js";
 import { homeService, recentRecorder } from "./auth/home.js";
 import { spaceService } from "./auth/spaces.js";
@@ -158,7 +163,8 @@ export function nodeConfig(env, host = osHostname()) {
     if (!(requestDeadlineMs >= 1 && requestDeadlineMs <= 2 ** 31 - 1)) throw new Error("PLENARY_REQUEST_DEADLINE_MS must be a whole number of milliseconds, at least 1");
   }
   checkInnerLimits(requestDeadlineMs, { ...(cluster ? { "the Postgres Registry's statement and lock limits": REGISTRY_LIMIT_MS } : { "the SQLite Registry's busy timeout": SQLITE_BUSY_MS }),
-    ...(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET ? { "Google's request timeout": OIDC_TIMEOUT_MS } : {}) });
+    ...(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET ? { "Google's request timeout": OIDC_TIMEOUT_MS } : {}),
+    ...(env.OIDC_ISSUER_URL && env.OIDC_CLIENT_ID && env.OIDC_CLIENT_SECRET ? { "OIDC's request timeout": OIDC_TIMEOUT_MS } : {}) });
   return { cluster, node, roles, leaseTtlMs, requestDeadlineMs };
 }
 
@@ -425,13 +431,70 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   // Hellos read roles through a per-process cache; the gateway invalidates it on `grants` and its timed pass reads fresh (p5-load).
   const roleCached = roleCache({ registry, now: Date.now });
   const auth = authPort({ sessions, dev, tenancy: roleCached });
-  // Google sign-in only when both halves of the OAuth client are there; otherwise /auth answers 503.
-  const oidc = env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET
-    ? googleOidc({ clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET, redirectUri, fetch: fetchFn, timeoutMs: OIDC_TIMEOUT_MS })
+  // Sign-in: generic OIDC when OIDC_ISSUER_URL + OIDC_CLIENT_ID + OIDC_CLIENT_SECRET are set;
+  // otherwise Google OIDC when GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET are set; else /auth answers 503.
+  const hasGenericOidc = Boolean(env.OIDC_ISSUER_URL && env.OIDC_CLIENT_ID && env.OIDC_CLIENT_SECRET);
+  const hasAnyGenericOidc = Boolean(env.OIDC_ISSUER_URL || env.OIDC_CLIENT_ID || env.OIDC_CLIENT_SECRET);
+  const hasGoogle = Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET);
+  if (hasGenericOidc && hasGoogle) {
+    throw new Error("both generic OIDC (OIDC_ISSUER_URL) and Google sign-in (GOOGLE_CLIENT_ID) are configured: pick one");
+  }
+  const csv = v => String(v ?? "").split(",").map(s => s.trim()).filter(Boolean);
+  const isProd = env.NODE_ENV === "production" || cluster;
+  const allowHttpLocalhost = env.OIDC_ALLOW_HTTP_LOCALHOST === "1" || env.OIDC_ALLOW_HTTP_LOCALHOST === "true"
+    || (!isProd && LOOPBACK_HOSTS.includes(publicHostOf(origin) ?? ""));
+  const genericOidcAdapter = hasGenericOidc
+    ? genericOidc({
+      issuerUrl: env.OIDC_ISSUER_URL,
+      clientId: env.OIDC_CLIENT_ID,
+      clientSecret: env.OIDC_CLIENT_SECRET,
+      redirectUri,
+      scopes: env.OIDC_SCOPES,
+      displayName: env.OIDC_DISPLAY_NAME,
+      tenantSlug: env.OIDC_TENANT_SLUG,
+      tenantDomain: env.OIDC_TENANT_DOMAIN,
+      emailDomains: csv(env.OIDC_EMAIL_DOMAINS),
+      allowedGroups: csv(env.OIDC_ALLOWED_GROUPS),
+      groupsClaim: env.OIDC_GROUPS_CLAIM,
+      allowUnverifiedEmail: env.OIDC_ALLOW_UNVERIFIED_EMAIL === "1" || env.OIDC_ALLOW_UNVERIFIED_EMAIL === "true",
+      allowHttpLocalhost,
+      fetch: fetchFn,
+      timeoutMs: OIDC_TIMEOUT_MS,
+    })
     : null;
-  log.info("sign-in", { google: !!oidc, devTokens: dev.enabled, cluster });
+  const oidc = genericOidcAdapter
+    ?? (hasGoogle
+      ? googleOidc({ clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET, redirectUri, fetch: fetchFn, timeoutMs: OIDC_TIMEOUT_MS })
+      : null);
+  log.info("sign-in", { google: hasGoogle, oidc: hasGenericOidc, devTokens: dev.enabled, cluster });
+  if (hasAnyGenericOidc && !hasGenericOidc) {
+    const missing = ["OIDC_ISSUER_URL", "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET"].filter(k => !env[k]);
+    log.warn(`generic OIDC sign-in is half configured: ${missing.join(", ")} missing, so it stays off`);
+  }
   if (!!env.GOOGLE_CLIENT_ID !== !!env.GOOGLE_CLIENT_SECRET)
     log.warn(`Google sign-in is half configured: ${env.GOOGLE_CLIENT_ID ? "GOOGLE_CLIENT_SECRET" : "GOOGLE_CLIENT_ID"} is missing, so it stays off`);
+  // Ensure the issuer-bound tenant exists for generic OIDC so self-hosted users can sign in and create boards immediately,
+  // and optionally grant Unit admin to configured `OIDC_ADMIN_USERS` (bare `sub` or full `oidc:<slug>:<sub>`).
+  if (genericOidcAdapter) {
+    try {
+      let t = await rawRegistry.tenantByDomain(genericOidcAdapter.tenantDomain);
+      if (!t) {
+        try { t = await registry.createTenant({ domain: genericOidcAdapter.tenantDomain, name: genericOidcAdapter.displayName || "SSO" }); }
+        catch { t = await rawRegistry.tenantByDomain(genericOidcAdapter.tenantDomain); }
+      }
+      if (t) {
+        const prefix = `oidc:${genericOidcAdapter.tenantSlug}:`;
+        const adminIds = csv(env.OIDC_ADMIN_USERS).map(u => (u.startsWith("oidc:") ? u : prefix + u));
+        let adminsAdded = 0;
+        for (const u of adminIds) {
+          if (!t.admins.includes(u)) { await registry.addTenantAdmin(t.id, u); adminsAdded++; }
+        }
+        log.info("oidc tenant", { tenant: t.id, domain: genericOidcAdapter.tenantDomain, displayName: genericOidcAdapter.displayName, ...(adminsAdded ? { adminsAdded } : {}) });
+      }
+    } catch (err) {
+      log.warn("oidc tenant bootstrap failed; will retry on next restart", { domain: genericOidcAdapter.tenantDomain, err });
+    }
+  }
 
   let devBoard = null, devMenu = null;
   // Dev users from the token table (names; one grant per user), and whether the dev sign-in menu may be on at all: ONE
@@ -531,8 +594,8 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
       log.warn("dev sign-in menu is ON: GET /auth/dev publishes the tokens of the dev users to anyone who can reach this server", { users: offered.size, host });
     }
     log.warn("dev tokens are ON: not for production", { board: board.id, tenant: board.tenant, users: best.size });
-  } else if (oidc) log.info("dev tokens are off: sign-in is Google only");
-  else log.warn("dev tokens are off and Google sign-in is not configured (GOOGLE_CLIENT_ID/SECRET): every hello will be refused");
+  } else if (oidc) log.info(hasGenericOidc ? "dev tokens are off: sign-in is OIDC only" : "dev tokens are off: sign-in is Google only");
+  else log.warn("dev tokens are off and no OIDC/Google sign-in is configured (OIDC_ISSUER_URL or GOOGLE_CLIENT_ID/SECRET): every hello will be refused");
 
   const perUser = Number(env.PLENARY_MAX_CONNS_PER_USER);
   const limits = Number.isSafeInteger(perUser) && perUser > 0 ? { maxConnsPerUser: perUser } : undefined;

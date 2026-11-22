@@ -145,7 +145,7 @@ test("§ Pacing: a ninth writer connection per (user, board) gets `limit` and is
   for (let i = 0; i < 8; i++) { const s = await r.sock(); s.send(hello(r, "editor", { client: "tab" + i })); await s.next(m => m.t === "welcome"); eight.push(s); }
   const ninth = await r.sock(); ninth.send(hello(r, "editor", { client: "tab8" }));
   expect((await ninth.whenClosed()).code).toBe(1008);
-  expect(ninth.msgs).toEqual([{ t: "error", code: "limit", message: "at most 8 open writer connections per user on a board" }]);
+  expect(ninth.msgs).toEqual([{ t: "error", code: "limit", message: "at most 8 open writer tabs per user on a board" }]);
   const other = await r.sock(); other.send(hello(r, "owner")); await other.next(m => m.t === "welcome");
   // A slot frees when the gateway sees a connection close.
   await eight[0].close();

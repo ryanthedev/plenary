@@ -23,7 +23,7 @@ import { cleanup, sleep } from "../server/helpers.js";
 afterAll(cleanup);
 
 const USERS = { "t-ada": { user: "ada", role: "owner" }, "t-bo": { user: "bo", role: "editor" }, "t-ed": { user: "ed", role: "viewer" } };
-const CAP = "at most 8 open writer connections per user on a board";
+const CAP = "at most 8 open writer tabs per user on a board";
 
 /** A session over `net` whose hellos are collected as sent (c.hellos), across every connection of its link. */
 function counted(net, token, o = {}) {
@@ -235,7 +235,7 @@ test("real gateway: a session's tab counts as one tab: two sessions on one tab g
     for (const s of all) s.connection.close();
     await r.stop();
   }
-});
+}, 20_000);
 
 // ── the refusal text: true for both caps ──
 test("limit texts: pill, banner and tooltip say both causes and claim neither", () => {

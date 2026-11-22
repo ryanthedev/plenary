@@ -14,7 +14,7 @@
 //             link, which carries presence (the id others' batches name me by). ONE stable object whose fields may update
 //             (user arrives with welcome; rule 13 may change it): mount any time, read the fields live.
 //   status    string  web/core/sync.js status names: connecting | catching-up | live | refused | stopped | limited
-//             (the writer-connection cap). It is the status of the tab's one link, which carries presence and
+//             (the writer cap: 8 tabs per board, 2 connections per tab). It is the status of the tab's one link, which carries presence and
 //             records (the status pill adds congestion and the browser's online flag).
 //   onStatus(fn(status, role)) → unsubscribe                                                        ADDED
 //             called when `status` or `role` changes (presence clears and the emote bar disables off live).

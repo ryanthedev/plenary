@@ -945,7 +945,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       if (!writer) return false;
       const mine = tabConns.get(tkey) ?? 0;
       if (mine >= lim.maxConnsPerTab) { log.warn("hello refused: connections per tab", { conn: c.id, user: identity.user, board: board.id }); refuse(ws, "limit", `at most ${lim.maxConnsPerTab} open writer connections per tab on a board`, 1008, "tab cap"); return true; }
-      if (mine === 0 && (writersBy.get(wkey) ?? 0) >= lim.maxWritersPerUserBoard) { log.warn("hello refused: writer connection cap", { conn: c.id, user: identity.user, board: board.id }); refuse(ws, "limit", `at most ${lim.maxWritersPerUserBoard} open writer connections per user on a board`, 1008, "writer cap"); return true; }
+      if (mine === 0 && (writersBy.get(wkey) ?? 0) >= lim.maxWritersPerUserBoard) { log.warn("hello refused: writer tab cap", { conn: c.id, user: identity.user, board: board.id }); refuse(ws, "limit", `at most ${lim.maxWritersPerUserBoard} open writer tabs per user on a board`, 1008, "writer cap"); return true; }
       return false;
     };
     if (tooMany()) return;

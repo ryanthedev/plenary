@@ -255,7 +255,7 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
     get user() { return replica.user ?? null; },
     /** The last welcome.user, kept through a resync. */
     get lastUser() { return userSeen; },
-    /** Refused by the writer-connection cap: the room's message until a welcome, else null. It retries on the backoff by itself; reconnect() tries at once. */
+    /** Refused by the writer cap (8 tabs per board, 2 connections per tab): the room's message until a welcome, else null. It retries on the backoff by itself; reconnect() tries at once. */
     get limited() { return replica.needAuth ? null : limited; },   // refused (`auth`) wins over the cap: no stale cap shown
     /** While limited: when the backoff tries again (ms, the clock's now()), or null when no try is armed. */
     get nextTryAt() { return limited ? nextTryAt : null; },

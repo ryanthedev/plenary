@@ -8,7 +8,7 @@ import { cleanup, sleep } from "./helpers.js";
 afterAll(cleanup);
 const hello = (r, name, extra = {}) => ({ t: "hello", v: 1, token: tokenOf(name), board: r.ids.board, since: 0, client: name, ...extra });
 const FAST = { limits: { hereMs: 20, herePublishMs: 100 } };
-const CAP8 = { t: "error", code: "limit", message: "at most 8 open writer connections per user on a board" };
+const CAP8 = { t: "error", code: "limit", message: "at most 8 open writer tabs per user on a board" };
 const CAP_TAB = { t: "error", code: "limit", message: "at most 2 open writer connections per tab on a board" };
 
 async function join(r, name, extra) {

@@ -154,7 +154,7 @@ export function createSession({ join, token, board, client = "web", tab = null, 
     status: { get: () => C.status },
     // The link's outbound backlog over CONGESTED_BYTES (web/ports/transport.js): the pill says "slow link".
     congested: { get: () => C.congested() },
-    /** The writer-connection cap's message while the link is stopped by it, else null. */
+    /** The writer cap's message (8 tabs per board, 2 connections per tab) while the link is stopped by it, else null. */
     limited: { get: () => C.limited ?? null },
     /** While limited: when the link's backoff tries again (the clock's now() ms), or null. */
     limitedNextTry: { get: () => C.nextTryAt ?? null },

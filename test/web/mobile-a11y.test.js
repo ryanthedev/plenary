@@ -125,7 +125,7 @@ function makeDoc() {
   return doc;
 }
 
-function setupApp({ token = "t-ada", phone = true, coarse = true } = {}) {
+function setupApp({ token = "t-ada", phone = true, coarse = true, admin = null } = {}) {
   let frames = [];
   const winL = {};
   const doc = makeDoc();
@@ -169,6 +169,7 @@ function setupApp({ token = "t-ada", phone = true, coarse = true } = {}) {
     prefs: memoryStore(),
     theme: "light",
     clock: net.clock,
+    admin,
   });
   const step = (n = 1) => {
     for (let i = 0; i < n; i++) {
@@ -257,6 +258,28 @@ describe("a11y focus trap (web/adapters/dom/a11y.js)", () => {
 
     trap.deactivate();
     expect(doc.activeElement).toBe(trigger);
+  });
+
+  test("accessibleName handles malformed aria-labelledby IDs safely without throwing", () => {
+    const doc = makeDoc();
+    doc.querySelector = sel => {
+      if (/[^\w#\-[\]="\\]/.test(sel)) throw new Error(`SyntaxError: invalid selector ${sel}`);
+      return null;
+    };
+    const btn = new E("button");
+    btn.setAttribute("aria-labelledby", 'foo:bar[baz] 123"bad] a>b');
+    btn.textContent = "Fallback Label";
+    expect(() => accessibleName(btn, doc)).not.toThrow();
+    expect(accessibleName(btn, doc)).toBe("Fallback Label");
+
+    // Also safe when getElementById is absent and querySelector throws on malformed input
+    const stubDoc = {
+      querySelector: () => { throw new Error("DOMException: SyntaxError"); },
+    };
+    const emptyBtn = new E("button");
+    emptyBtn.setAttribute("aria-labelledby", 'bad]id"here');
+    expect(() => accessibleName(emptyBtn, stubDoc)).not.toThrow();
+    expect(accessibleName(emptyBtn, stubDoc)).toBe("");
   });
 });
 
@@ -411,6 +434,55 @@ describe("ARIA labels, dialog semantics, and live status regions", () => {
     expect(byId.sheet.hidden).toBe(true);
     expect(byId.sheetBackdrop.hidden).toBe(true);
     expect(app.ui.dialog).toBe("export");
+  });
+
+  test("admin mountShareDialog restores focus to the Share opener button on Escape, backdrop click, and Close button (not canvas)", () => {
+    const stubAdmin = {
+      listLinks: async () => ({ links: [] }),
+      listInvites: async () => ({ invites: [] }),
+      listAudit: async () => ({ events: [], nextCursor: null }),
+    };
+    const { doc, byId, step } = setupApp({ token: "t-ada", phone: false, coarse: false, admin: stubAdmin });
+
+    const getShareBtn = () => find(byId.topbar, e => e.tagName === "BUTTON" && e.getAttribute("aria-label") === "Share board");
+
+    // 1) Escape restores focus to Share board button
+    let shareBtn = getShareBtn();
+    expect(shareBtn).toBeTruthy();
+    shareBtn.focus();
+    shareBtn.click();
+    step(2);
+    let modal = find(byId.dialogs, e => e.getAttribute("role") === "dialog");
+    expect(modal).toBeTruthy();
+    modal.fire("keydown", { key: "Escape" });
+    step(2);
+    expect(byId.dialogs.children.length).toBe(0);
+    expect(doc.activeElement?.getAttribute("aria-label")).toBe("Share board");
+    expect(doc.activeElement).not.toBe(byId.board);
+
+    // 2) Backdrop click restores focus to Share board button
+    shareBtn = getShareBtn();
+    shareBtn.focus();
+    shareBtn.click();
+    step(2);
+    const veil = find(byId.dialogs, e => e.classList.contains("adm-veil"));
+    expect(veil).toBeTruthy();
+    veil.click();
+    step(2);
+    expect(byId.dialogs.children.length).toBe(0);
+    expect(doc.activeElement?.getAttribute("aria-label")).toBe("Share board");
+
+    // 3) Close button restores focus to Share board button
+    shareBtn = getShareBtn();
+    shareBtn.focus();
+    shareBtn.click();
+    step(2);
+    const closeBtn = find(byId.dialogs, e => e.tagName === "BUTTON" && e.getAttribute("data-action") === "close");
+    expect(closeBtn).toBeTruthy();
+    closeBtn.click();
+    step(2);
+    expect(byId.dialogs.children.length).toBe(0);
+    expect(doc.activeElement?.getAttribute("aria-label")).toBe("Share board");
   });
 });
 

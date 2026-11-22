@@ -75,9 +75,23 @@ export function accessibleName(el, doc = globalThis.document) {
   if (ariaLabel) return ariaLabel;
   const labelledBy = attrOf(el, "aria-labelledby")?.trim();
   if (labelledBy && doc) {
+    const findById = id => {
+      if (typeof doc.getElementById === "function") return doc.getElementById(id);
+      if (typeof doc.querySelector === "function") {
+        try {
+          const escaped = typeof globalThis.CSS?.escape === "function"
+            ? `#${globalThis.CSS.escape(id)}`
+            : `[id="${String(id).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"]`;
+          return doc.querySelector(escaped);
+        } catch {
+          return null;
+        }
+      }
+      return null;
+    };
     const text = labelledBy
       .split(/\s+/)
-      .map(id => doc.getElementById?.(id)?.textContent ?? doc.querySelector?.(`#${id}`)?.textContent ?? "")
+      .map(id => findById(id)?.textContent ?? "")
       .join(" ")
       .trim();
     if (text) return text;

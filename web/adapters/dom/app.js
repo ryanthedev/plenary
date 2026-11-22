@@ -1384,9 +1384,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   function openAdminShare() {
     if (!admin) return null;
     cancelActiveSampler();
-    ui.dialog = null;
-    ui.sheet = null;
-    activeShare?.destroy();
+    const savedOpener = captureOpener();
+    dismissOverlays();
     activeShare = mountShareDialog({
       root: $("#dialogs"),
       board,
@@ -1395,7 +1394,12 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       isAdmin: S.effective === "owner",
       admin,
       origin: globalThis.location?.origin ?? "",
-      onClose: () => { activeShare = null; chromeDirty = true; canvas.focus(); },
+      onClose: () => {
+        activeShare = null;
+        chromeDirty = true;
+        const active = document.activeElement;
+        if (!active || active === document.body || active.isConnected === false) restoreOpener(savedOpener, canvas);
+      },
     });
     chromeDirty = true;
     return activeShare;

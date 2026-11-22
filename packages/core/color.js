@@ -1,3 +1,4 @@
+// @ts-check
 // Color math for the color picker, free of Herdr so it's tested headless: parsing what a person
 // types, hex ↔ RGB ↔ HSV (the picker's hue strip and shade square), and the recent-colors list.
 //

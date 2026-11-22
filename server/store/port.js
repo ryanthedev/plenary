@@ -62,50 +62,49 @@ export const STORE_METHODS = Object.freeze(["append", "read", "lastSeq", "putChe
  *   until expiry on the Store's clock, measured there (0 unless live).
  * @typedef {object[] & { bytes: number[] }} EntryPage  entries ascending by seq; `bytes[i]` = entry i's stored length in chars
  *
- * @typedef {{
- *   append(tenant: string, board: string, entries: object[], expectSeq: number, epoch: number, opts?: { blobRefs?: string[] }): Promise<void>,
- *     // Writes every entry or none. entries[i].seq must be expectSeq + 1 + i and entries[i].tenant / .board must match. At
- *     // least one entry. epoch: REQUIRED positive integer, the lease epoch the writer holds. Errors: bad-id, bad-entry,
- *     // fenced, conflict. Resolves once durable. `opts.blobRefs`: the SHA-1 fileIds the entries' image elements name (any
- *     //   number, each 40 lowercase hex, else bad-entry; never refused over their count). They are written as the board's blob references in the SAME
- *     //   transaction as the entries (in chunks of BLOB_REF_CHUNK); each also replaces the board's pending reference for it, and cancels the hash's
- *     //   condemnation, or, when a reaper has claimed it, marks it revived (the reaper then puts the bytes back).
- *   read(tenant: string, board: string, fromSeq?: number, limit?: number, maxBytes?: number): Promise<EntryPage>,
- *     // Entries with seq >= fromSeq (default 1), ascending, at most min(limit, MAX_READ) (default DEFAULT_READ_LIMIT). With
- *     // maxBytes the page also stops once it holds about that much stored text, and always holds >= 1 entry if any
- *     // qualifies. fromSeq: integer >= 0; limit, maxBytes: positive integers (else bad-entry). [] when none.
- *   lastSeq(tenant: string, board: string): Promise<number>,   // the board's last seq; 0 = empty
- *   putCheckpoint(tenant: string, board: string, cp: object, epoch: number): Promise<void>,
- *     // Stored under cp.seq (integer >= 0, else bad-entry). The highest seq wins, never the last write; a second write of one
- *     // seq is ignored; all but the newest KEEP are pruned. epoch as in append (fenced). May reject "unavailable" when it is
- *     // overtaken mid-write by a newer checkpoint; nothing of it stays visible.
- *   getCheckpoint(tenant: string, board: string, beforeSeq?: number): Promise<null | object>,
- *     // The checkpoint with the highest seq, or the highest below beforeSeq (integer >= 0), so a caller steps back past a bad
- *     // one. A header whose parts are gone is skipped (onSkip hook), never returned. null = none.
- *   openEpoch(tenant: string, board: string): Promise<number>,
- *     // Durable atomic increment of the board's epoch (1 on the first call), kept in its lease record. Takes the board with no
- *     // lease (holder cleared), so any lease holder is fenced off. Single node.
- *   epoch(tenant: string, board: string): Promise<number>,   // the board's epoch; 0 = no room was ever built
- *   acquire(tenant: string, board: string, holder: string, ttlMs: number): Promise<null | StoreLease>,
- *     // The lease if free, expired (Store clock) or already `holder`'s; every success bumps the epoch (a new incarnation).
- *     // null = held by another. ttlMs: positive integer <= MAX_LEASE_TTL_MS. Rejects "unavailable" if the lease row can't be
- *     // locked in time (another session holds it): retry.
- *   renew(tenant: string, board: string, holder: string, epoch: number, ttlMs: number): Promise<null | StoreLease>,
- *     // Extends to now + ttlMs, only as `holder` at `epoch` (even if it lapsed and nobody took it); else null. epoch required.
- *   release(tenant: string, board: string, holder: string, epoch: number): Promise<void>,   // as `holder` at `epoch` only, else a no-op; the epoch stays
- *   lease(tenant: string, board: string): Promise<null | LeaseRecord>,   // null = no room was ever built
- *   purgeBoard(tenant: string, board: string): Promise<void>,   // PROTOCOL.md § Trash and restore, "Purge": deletes the board's entries, checkpoints, checkpoint parts, lease record, blob references and pending references, and condemns each hash left with no reference and no live pending one, in ONE transaction; idempotent (nothing there is not an error); a stale host's later write is "fenced" (no lease row). The caller (the trash sweeper) has already made the board unreachable
- *   blobPend(tenant: string, board: string, sha1: string, ttlMs: number): Promise<void>,
- *     // A pending reference until the Store's clock + ttlMs (positive integer <= MAX_PENDING_MS; a second call extends it) and cancels the hash's condemnation (a claimed one is marked revived instead). Rejects "unavailable" while a reaper's claim on the hash is live.
- *   blobCondemned(o: { graceMs: number, after?: { tenant: string, sha1: string } | null, limit: number }): Promise<{ tenant: string, sha1: string }[]>,
- *     // Hashes condemned at least graceMs (integer >= 0) ago on the Store's clock and not under a live claim, ascending by (tenant, sha1) after `after`, at most limit (1..MAX_CONDEMNED_PAGE).
- *   blobClaim(tenant: string, sha1: string, o: { graceMs: number, claimMs: number }): Promise<boolean>,
- *     // The reaper's conditional claim (claimMs: positive integer): true only if the hash is condemned for graceMs, not under a live claim, and either STILL UNREFERENCED with no live pending reference, or claimed before (a reaper died mid-way: it must put the bytes back or finish). An unclaimed hash that has a reference loses its condemnation.
- *   blobReaped(tenant: string, sha1: string, o?: { deleted?: boolean, restored?: boolean }): Promise<boolean>,
- *     // The settle, after the bytes were quarantined. Without `deleted`: true = nothing references the hash (no revive mark, reference or live pending upload): delete the bytes (the claimed row stays, so a failed delete is retried); false = put them back (the row stays, marked revived, so a failed restore is retried). With `restored: true` (after the restore) or `deleted: true` (after the delete): drops the row; false = a reference arrived since the verdict; a missing row is true.
- *   blobPrune(limit: number): Promise<number>,   // deletes at most limit (positive integer) expired pending references; returns how many
- *   close(): Promise<void>,   // idempotent; every later call rejects "closed"
- * }} Store
+ * @typedef {object} Store
+ * @property {(tenant: string, board: string, entries: object[], expectSeq: number, epoch: number, opts?: { blobRefs?: string[] }) => Promise<void>} append
+ *   Writes every entry or none. entries[i].seq must be expectSeq + 1 + i and entries[i].tenant / .board must match. At
+ *   least one entry. epoch: REQUIRED positive integer, the lease epoch the writer holds. Errors: bad-id, bad-entry,
+ *   fenced, conflict. Resolves once durable. `opts.blobRefs`: the SHA-1 fileIds the entries' image elements name (any
+ *   number, each 40 lowercase hex, else bad-entry; never refused over their count). They are written as the board's blob references in the SAME
+ *   transaction as the entries (in chunks of BLOB_REF_CHUNK); each also replaces the board's pending reference for it, and cancels the hash's
+ *   condemnation, or, when a reaper has claimed it, marks it revived (the reaper then puts the bytes back).
+ * @property {(tenant: string, board: string, fromSeq?: number, limit?: number, maxBytes?: number) => Promise<EntryPage>} read
+ *   Entries with seq >= fromSeq (default 1), ascending, at most min(limit, MAX_READ) (default DEFAULT_READ_LIMIT). With
+ *   maxBytes the page also stops once it holds about that much stored text, and always holds >= 1 entry if any
+ *   qualifies. fromSeq: integer >= 0; limit, maxBytes: positive integers (else bad-entry). [] when none.
+ * @property {(tenant: string, board: string) => Promise<number>} lastSeq  the board's last seq; 0 = empty
+ * @property {(tenant: string, board: string, cp: object, epoch: number) => Promise<void>} putCheckpoint
+ *   Stored under cp.seq (integer >= 0, else bad-entry). The highest seq wins, never the last write; a second write of one
+ *   seq is ignored; all but the newest KEEP are pruned. epoch as in append (fenced). May reject "unavailable" when it is
+ *   overtaken mid-write by a newer checkpoint; nothing of it stays visible.
+ * @property {(tenant: string, board: string, beforeSeq?: number) => Promise<null | object>} getCheckpoint
+ *   The checkpoint with the highest seq, or the highest below beforeSeq (integer >= 0), so a caller steps back past a bad
+ *   one. A header whose parts are gone is skipped (onSkip hook), never returned. null = none.
+ * @property {(tenant: string, board: string) => Promise<number>} openEpoch
+ *   Durable atomic increment of the board's epoch (1 on the first call), kept in its lease record. Takes the board with no
+ *   lease (holder cleared), so any lease holder is fenced off. Single node.
+ * @property {(tenant: string, board: string) => Promise<number>} epoch  the board's epoch; 0 = no room was ever built
+ * @property {(tenant: string, board: string, holder: string, ttlMs: number) => Promise<null | StoreLease>} acquire
+ *   The lease if free, expired (Store clock) or already `holder`'s; every success bumps the epoch (a new incarnation).
+ *   null = held by another. ttlMs: positive integer <= MAX_LEASE_TTL_MS. Rejects "unavailable" if the lease row can't be
+ *   locked in time (another session holds it): retry.
+ * @property {(tenant: string, board: string, holder: string, epoch: number, ttlMs: number) => Promise<null | StoreLease>} renew
+ *   Extends to now + ttlMs, only as `holder` at `epoch` (even if it lapsed and nobody took it); else null. epoch required.
+ * @property {(tenant: string, board: string, holder: string, epoch: number) => Promise<void>} release  as `holder` at `epoch` only, else a no-op; the epoch stays
+ * @property {(tenant: string, board: string) => Promise<null | LeaseRecord>} lease  null = no room was ever built
+ * @property {(tenant: string, board: string) => Promise<void>} purgeBoard  PROTOCOL.md § Trash and restore, "Purge": deletes the board's entries, checkpoints, checkpoint parts, lease record, blob references and pending references, and condemns each hash left with no reference and no live pending one, in ONE transaction; idempotent (nothing there is not an error); a stale host's later write is "fenced" (no lease row). The caller (the trash sweeper) has already made the board unreachable
+ * @property {(tenant: string, board: string, sha1: string, ttlMs: number) => Promise<void>} blobPend
+ *   A pending reference until the Store's clock + ttlMs (positive integer <= MAX_PENDING_MS; a second call extends it) and cancels the hash's condemnation (a claimed one is marked revived instead). Rejects "unavailable" while a reaper's claim on the hash is live.
+ * @property {(o: { graceMs: number, after?: { tenant: string, sha1: string } | null, limit: number }) => Promise<{ tenant: string, sha1: string }[]>} blobCondemned
+ *   Hashes condemned at least graceMs (integer >= 0) ago on the Store's clock and not under a live claim, ascending by (tenant, sha1) after `after`, at most limit (1..MAX_CONDEMNED_PAGE).
+ * @property {(tenant: string, sha1: string, o: { graceMs: number, claimMs: number }) => Promise<boolean>} blobClaim
+ *   The reaper's conditional claim (claimMs: positive integer): true only if the hash is condemned for graceMs, not under a live claim, and either STILL UNREFERENCED with no live pending reference, or claimed before (a reaper died mid-way: it must put the bytes back or finish). An unclaimed hash that has a reference loses its condemnation.
+ * @property {(tenant: string, sha1: string, o?: { deleted?: boolean, restored?: boolean }) => Promise<boolean>} blobReaped
+ *   The settle, after the bytes were quarantined. Without `deleted`: true = nothing references the hash (no revive mark, reference or live pending upload): delete the bytes (the claimed row stays, so a failed delete is retried); false = put them back (the row stays, marked revived, so a failed restore is retried). With `restored: true` (after the restore) or `deleted: true` (after the delete): drops the row; false = a reference arrived since the verdict; a missing row is true.
+ * @property {(limit: number) => Promise<number>} blobPrune  deletes at most limit (positive integer) expired pending references; returns how many
+ * @property {() => Promise<void>} close  idempotent; every later call rejects "closed"
  */
 
 /** A positive safe integer. */

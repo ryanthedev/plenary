@@ -52,6 +52,9 @@ jobs:
           test -f bun.lock || { echo "bun.lock is missing; dependencies must be locked." >&2; exit 1; }
           bun install --frozen-lockfile
 
+      - name: Typecheck
+        run: bun run typecheck
+
       - name: Test
         run: bun test
 

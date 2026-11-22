@@ -11,9 +11,14 @@
     "test:cluster": "bun --no-env-file scripts/test-cluster.js",
     "clean": "bun scripts/clean.js",
     "test:compose": "bun --no-env-file scripts/test-compose.js",
-    "rig": "bun --no-env-file scripts/cluster-rig.js"
+    "rig": "bun --no-env-file scripts/cluster-rig.js",
+    "typecheck": "tsc --noEmit -p jsconfig.json"
   },
   "dependencies": {
     "@nats-io/transport-node": "3.4.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.5",
+    "typescript": "^7.0.2"
   }
 }

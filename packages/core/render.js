@@ -6,7 +6,7 @@
 //   { t: "image", fileId, mimeType, x, y, w, h, angle, cx, cy, opacity? }   pixels: doc.files[fileId]
 // Colors arrive as #rrggbb or #rrggbbaa; the theme decides what "default ink" is.
 
-import { DEFAULT_STROKE, isShape, isLinear, isLabel, textSize } from "./model.js";
+import { DEFAULT_STROKE, isShape, isLinear, isLabel, textSize, MIN_PRESSURE, MAX_PRESSURE } from "./model.js";
 import { bbox, resolvedPoints, drawnPoints, toWorld, angleOf, centerOf, labelAnchor } from "./geometry.js";
 import { spatialIndex } from "./spatial.js";
 import { animState } from "./anim.js";
@@ -174,6 +174,52 @@ function smooth(cmds, pts) {
   cmds.push(["L", ...pts[pts.length - 1]]);
 }
 
+// Validate `el.pressures` against the untrimmed point count. Returns clamped pressures when valid & non-uniform, else null.
+function validPressures(el, totalPts) {
+  const raw = el.pressures;
+  if (!Array.isArray(raw) || raw.length !== totalPts || totalPts < 2) return null;
+  const out = new Array(totalPts);
+  let minP = Infinity, maxP = -Infinity;
+  for (let i = 0; i < totalPts; i++) {
+    const v = raw[i];
+    if (typeof v !== "number" || !Number.isFinite(v)) return null;
+    const c = Math.max(MIN_PRESSURE, Math.min(MAX_PRESSURE, v));
+    out[i] = c;
+    if (c < minP) minP = c;
+    if (c > maxP) maxP = c;
+  }
+  return maxP - minP > 1e-4 ? out : null;
+}
+
+// Emit variable-width smooth segments for a pressure-sensitive freedraw stroke, merging adjacent equal-width runs.
+function emitVariableFreedraw(out, el, pts, pressures, baseW, stroke, opacity) {
+  const widthFor = p => Math.max(0.5, Math.round(baseW * (0.35 + 1.15 * p) * 4) / 4);
+  const segs = [];
+  if (pts.length === 2) {
+    segs.push({ w: widthFor((pressures[0] + pressures[1]) / 2), cmds: [["M", ...pts[0]], ["L", ...pts[1]]] });
+  } else {
+    const mid = (a, b) => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+    const m0 = mid(pts[0], pts[1]);
+    segs.push({ w: widthFor((pressures[0] + pressures[1]) / 2), cmds: [["M", ...pts[0]], ["L", ...m0]] });
+    for (let i = 1; i < pts.length - 1; i++) {
+      const mPrev = mid(pts[i - 1], pts[i]), mNext = mid(pts[i], pts[i + 1]);
+      segs.push({ w: widthFor(pressures[i]), cmds: [["M", ...mPrev], ["Q", ...mNext, ...pts[i]]] });
+    }
+    const n = pts.length;
+    const mLast = mid(pts[n - 2], pts[n - 1]);
+    segs.push({ w: widthFor((pressures[n - 2] + pressures[n - 1]) / 2), cmds: [["M", ...mLast], ["L", ...pts[n - 1]]] });
+  }
+  let cur = null;
+  for (const seg of segs) {
+    if (cur && cur.width === seg.w) {
+      cur.cmds.push(...seg.cmds.slice(1));
+    } else {
+      cur = { t: "path", id: el.id, cmds: seg.cmds, stroke, width: seg.w, dash: null, opacity };
+      out.push(cur);
+    }
+  }
+}
+
 
 // Below this zoom shapes and lines are drawn clean, and text smaller than TEXT_MIN px is left out
 // (a big board fitted to a pane: hundreds of 2 px labels cost a lot to lay out and say nothing).
@@ -260,13 +306,20 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
   }
 
   if (isLinear(el) && stroke) {
-    let pts = cachedLinear(doc, el, opts.stats).map(p => Q(p[0], p[1]));
+    const rawPts = cachedLinear(doc, el, opts.stats);
+    let pts = rawPts.map(p => Q(p[0], p[1]));
     pts = trim(pts, progress);
     const cmds = [];
     if (el.type === "freedraw") {
+      const baseW = Math.max(1, width * 1.1);
+      const pressures = validPressures(el, rawPts.length);
+      if (pressures && pts.length >= 2) {
+        emitVariableFreedraw(out, el, pts, pressures, baseW, stroke, opacity);
+        return;
+      }
       if (pts.length === 1) pts = [pts[0], [pts[0][0] + 0.5, pts[0][1] + 0.5]];
       smooth(cmds, pts);
-      out.push({ t: "path", id: el.id, cmds, stroke, width: Math.max(1, width * 1.1), dash: null, opacity });
+      out.push({ t: "path", id: el.id, cmds, stroke, width: baseW, dash: null, opacity });
       return;
     }
     if (pts.length < 2) return;

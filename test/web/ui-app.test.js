@@ -947,3 +947,33 @@ test("M3 camera: pointerDown, wheel, and zoomAt cancel camera motion on both boa
   expect(B.view).toEqual(afterZoom);
   expect(N.view).toEqual(afterZoom);
 });
+
+test("M5 input: app.js forwards coalesced pen events (with pressures) and cleans up on pointercancel", () => {
+  rig = setup();
+  const { S } = rig;
+  S.setTool("freedraw");
+
+  page.board.fire("pointerdown", { clientX: 50, clientY: 50, pointerId: 1, pointerType: "pen", pressure: 0.2, button: 0 });
+  page.board.fire("pointermove", {
+    clientX: 110, clientY: 80, pointerId: 1, pointerType: "pen", pressure: 0.9, button: 0, buttons: 1,
+    getCoalescedEvents: () => [
+      { clientX: 70, clientY: 60, pointerId: 1, pointerType: "pen", pressure: 0.4, buttons: 1 },
+      { clientX: 90, clientY: 70, pointerId: 1, pointerType: "pen", pressure: 0.7, buttons: 1 },
+      { clientX: 110, clientY: 80, pointerId: 1, pointerType: "pen", pressure: 0.9, buttons: 1 },
+    ],
+  });
+  page.board.fire("pointerup", { clientX: 110, clientY: 80, pointerId: 1, pointerType: "pen", pressure: 0.9, button: 0 });
+
+  const live = S.eds.board.doc.live();
+  expect(live.length).toBe(1);
+  expect(live[0].points.length).toBe(4);
+  expect(live[0].pressures).toEqual([0.2, 0.4, 0.7, 0.9]);
+
+  // pointercancel rolls back live preview and clears active pointers without jamming.
+  page.board.fire("pointerdown", { clientX: 200, clientY: 200, pointerId: 2, pointerType: "touch", button: 0 });
+  page.board.fire("pointermove", { clientX: 240, clientY: 220, pointerId: 2, pointerType: "touch", button: 0, buttons: 1 });
+  page.board.fire("pointercancel", { clientX: 240, clientY: 220, pointerId: 2, pointerType: "touch", button: 0 });
+  expect(S.eds.board.pointers.size).toBe(0);
+  expect(S.gesture).toBeNull();
+  expect(S.eds.board.doc.live().length).toBe(1);
+});

@@ -9,6 +9,9 @@ import { textWidth } from "./text.js";
 
 export const DEFAULT_STROKE = "#1e1e1e";
 export const BASE_LAYER = "base";
+export const MIN_PRESSURE = 0.1;
+export const MAX_PRESSURE = 1.0;
+export const clampPressure = v => (typeof v === "number" && Number.isFinite(v) ? Math.max(MIN_PRESSURE, Math.min(MAX_PRESSURE, v)) : 0.5);
 
 export const SHAPES = ["rectangle", "ellipse", "diamond", "frame"];
 export const LINEAR = ["arrow", "line", "freedraw"];

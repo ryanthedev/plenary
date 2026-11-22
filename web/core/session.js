@@ -248,14 +248,24 @@ export function createSession({ join, fetchSnapshot = null, token, board, client
     return hitTest(n.doc, w, n.tol()) ?? shapeAt(n.doc, w);
   }
   s.pointerDown = (p, m = {}) => {
+    const ro = !may();
+    eds.board.readOnly = ro; eds.notes.readOnly = ro;
+    // Multi-touch: a non-primary second/third pointer id routes to the editor already owning the gesture.
+    if (s.gesture && m.pointerId != null && !eds[s.gesture].pointers.has(m.pointerId) && m.isPrimary !== true && (m.pointerType ?? "mouse") !== "mouse") {
+      const ed = eds[s.gesture];
+      eds.board.cancelCamera(); eds.notes.cancelCamera();
+      if (s.gesture === "notes" && s.tool === "arrow" && s.effective !== "presenter") m = { ...m, cmd: true };
+      ed.pointerDown(p, m); prune(); s.syncView(s.gesture);
+      return;
+    }
     eds.board.cancelCamera(); eds.notes.cancelCamera();
-    const pan = m.button === "middle" || m.space || s.tool === "hand" || !may();
+    const pan = m.button === "middle" || m.space || s.tool === "hand" || ro;
     if (pan) { s.gesture = s.active; const ed = eds[s.active]; const t = ed.tool; ed.tool = "hand"; ed.pointerDown(p, m); ed.tool = t; return; }
     if (s.tool === "note") { s.gesture = null; s.placeNote(world(p)); return; }
     if (s.tool === "image") { s.gesture = null; return; }
     // Presenters' Select reaches notes too (notes paint on top, so they win the hit).
     if (s.role === "presenter" && s.tool === "select" && !eds.notes.text && !eds.board.text) {
-      const into = eds.notes.sel.size && eds.notes.handleAt(p) ? "notes" : noteHit(p) ? "notes" : "board";
+      const into = eds.notes.sel.size && eds.notes.handleAt(p, m.pointerType) ? "notes" : noteHit(p) ? "notes" : "board";
       if (into !== s.active) { eds[s.active].select([]); s.active = into; }
     }
     const ed = eds[s.active];
@@ -276,8 +286,14 @@ export function createSession({ join, fetchSnapshot = null, token, board, client
   s.pointerUp = (p, m = {}) => {
     const ed = eds[s.gesture ?? s.active];
     if (s.gesture === "notes" && s.tool === "arrow" && s.effective !== "presenter") m = { ...m, cmd: true };
-    prune(); ed.pointerUp(p, m); prune(); s.syncView(s.gesture ?? s.active); s.gesture = null;
+    prune(); ed.pointerUp(p, m); prune(); s.syncView(s.gesture ?? s.active);
+    if (ed.pointers.size === 0) s.gesture = null;
     if (ed.tool === "select" && s.tool !== "select" && s.tool !== "highlighter" && !ed.toolLock && !["note", "image", "hand"].includes(s.tool)) { s.tool = "select"; onChange(); }
+  };
+  s.pointerCancel = (p, m = {}) => {
+    const ed = eds[s.gesture ?? s.active];
+    ed.pointerCancel(p, m); prune(); s.syncView(s.gesture ?? s.active);
+    if (ed.pointers.size === 0) s.gesture = null;
   };
   s.wheel = (d, p, m = {}) => { eds.board.cancelCamera(); eds.notes.cancelCamera(); eds[s.active].wheel(d, p, m); s.syncView(); };
   s.zoomAt = (scale, p) => { eds.board.cancelCamera(); eds.notes.cancelCamera(); eds.board.zoomAt(scale, p); s.syncView("board"); };

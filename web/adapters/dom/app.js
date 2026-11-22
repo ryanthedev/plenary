@@ -152,50 +152,55 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const at = e => { const r = canvas.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
   let last = { t: 0, x: 0, y: 0, n: 0 }, clicks = 1, space = false;
   const countClick = e => { const p = at(e), now = clock.mono(); const n = now - last.t < 400 && Math.hypot(p.x - last.x, p.y - last.y) < 6 ? last.n + 1 : 1; last = { t: now, ...p, n }; return n; };
-  const pmods = e => ({ ...mods(e), button: BUTTONS[e.button] ?? "left", clickCount: clicks, space });
+  const pmods = (e, base = e) => ({
+    ...mods(base),
+    button: BUTTONS[e.button ?? base.button] ?? "left",
+    clickCount: clicks,
+    space,
+    pointerId: e.pointerId ?? base.pointerId ?? 0,
+    pointerType: e.pointerType || base.pointerType || "mouse",
+    isPrimary: typeof e.isPrimary === "boolean" ? e.isPrimary : (typeof base.isPrimary === "boolean" ? base.isPrimary : undefined),
+    pressure: typeof e.pressure === "number" && Number.isFinite(e.pressure) ? e.pressure : undefined,
+  });
 
-  // Touch: one finger draws (or pans with the Hand); two fingers pinch-zoom and pan.
-  const touches = new Map();
-  let pinch = null;
+  // Pointer input: core Editor owns multi-touch (pinch-zoom/pan, 2/3-finger tap undo/redo, palm rejection).
   canvas.addEventListener("pointerdown", e => {
-    canvas.focus(); canvas.setPointerCapture(e.pointerId); e.preventDefault();
-    touches.set(e.pointerId, at(e));
-    if (touches.size === 2) {
-      if (S.gesture) S.pointerUp(at(e), {});
-      const [a, b] = [...touches.values()];
-      pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), scale: S.eds.board.view.scale, mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 } };
-      return;
-    }
-    if (touches.size > 2 || pinch) return;
+    canvas.focus(); canvas.setPointerCapture?.(e.pointerId); e.preventDefault();
     if (ui.sheet) { ui.sheet = null; chromeDirty = true; }
     clicks = Math.max(e.detail || 0, countClick(e));
     if (S.tool === "image") { openPicker(); return; }
-    S.pointerDown(at(e), pmods(e));
-    if (collab && S.tool === "laser" && e.button === 0) collab.laser(worldAt(at(e)));
+    const p = at(e);
+    S.pointerDown(p, pmods(e));
+    if (collab && S.tool === "laser" && e.button === 0 && S.ed.pointers.size <= 1) collab.laser(worldAt(p));
   });
   canvas.addEventListener("pointermove", e => {
-    if (touches.has(e.pointerId)) touches.set(e.pointerId, at(e));
-    if (pinch && touches.size === 2) {
-      const [a, b] = [...touches.values()], d = Math.hypot(a.x - b.x, a.y - b.y), mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-      S.wheel({ x: pinch.mid.x - mid.x, y: pinch.mid.y - mid.y }, mid, {}); pinch.mid = mid;
-      S.zoomAt(Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, pinch.scale * d / Math.max(1, pinch.d))), mid);
+    const highRate = S.gesture && (S.tool === "freedraw" || S.tool === "highlighter" || S.tool === "laser");
+    const coalesced = highRate && typeof e.getCoalescedEvents === "function" ? e.getCoalescedEvents() : null;
+    if (coalesced && coalesced.length > 0) {
+      for (const ce of coalesced) {
+        const cp = at(ce);
+        S.pointerMove(cp, pmods(ce, e));
+        if (collab && S.tool === "laser" && S.gesture && (ce.buttons & 1) && S.ed.pointers.size <= 1) collab.laser(worldAt(cp));
+      }
+      if (collab && S.ed.pointers.size <= 1) collab.pointer(worldAt(at(e)));
       return;
     }
-    if (!pinch) S.pointerMove(at(e), pmods(e));
-    if (collab && !pinch) {
-      const w = worldAt(at(e));
+    const p = at(e);
+    S.pointerMove(p, pmods(e));
+    if (collab && S.ed.pointers.size <= 1) {
+      const w = worldAt(p);
       collab.pointer(w);
       if (S.tool === "laser" && S.gesture && (e.buttons & 1)) collab.laser(w);
     }
   });
-  const up = e => {
-    touches.delete(e.pointerId);
-    if (pinch) { if (touches.size === 0) pinch = null; return; }
+  canvas.addEventListener("pointerup", e => {
     S.pointerUp(at(e), pmods(e)); chromeDirty = true;
     collabTick();
-  };
-  canvas.addEventListener("pointerup", up);
-  canvas.addEventListener("pointercancel", up);
+  });
+  canvas.addEventListener("pointercancel", e => {
+    S.pointerCancel(at(e), pmods(e)); chromeDirty = true;
+    collabTick();
+  });
   canvas.addEventListener("wheel", e => {
     e.preventDefault();
     if (e.ctrlKey || e.metaKey) { const s = S.eds.board.view.scale * Math.exp(-e.deltaY * 0.01); S.zoomAt(Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, s)), at(e)); }

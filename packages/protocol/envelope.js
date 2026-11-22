@@ -137,6 +137,7 @@ export function opProblem(msg, bytes) {
         // A tie on version is broken by versionNonce on every copy alike; without one, copies disagree.
         if (!Number.isSafeInteger(el.version) || el.version < 0 || !Number.isSafeInteger(el.versionNonce)) return bad("every element needs integer version and versionNonce");
         if (el.type === "image" && el.fileId != null && !isSha1(el.fileId)) return bad("an image's fileId is 40 lowercase hex characters");
+        if (el.pressures !== undefined && (!Array.isArray(el.pressures) || !el.pressures.every(isNum))) return bad("pressures must be an array of finite numbers");
       }
     }
     if (op.appState !== undefined) { const why = appStateProblem(op.appState); if (why) return bad(why); }

@@ -6,7 +6,7 @@
 // remote/agent ops come in through editor.receive(op).
 
 import {
-  DEFAULT_STROKE, BASE_LAYER, makeElement, clone, touch, isShape, isLinear, isLabel, layerOf, zOf, defaultLayer, newId, textSize,
+  DEFAULT_STROKE, BASE_LAYER, makeElement, clone, touch, isShape, isLinear, isLabel, layerOf, zOf, defaultLayer, newId, textSize, clampPressure,
 } from "./model.js";
 import { Doc } from "./doc.js";
 import {
@@ -46,13 +46,21 @@ const ROT_GAP = 24;        // the rotate handle sits this far above the selectio
 const ROT_SNAP = Math.PI / 12;   // shift snaps rotation to 15°
 const PORT_SNAP = 12;      // how close an arrow end must come to a connection point to take it, screen px
 const BIND_PAD = 8;        // how far outside a shape an arrow end still binds to it, screen px
+const TOUCH_SLOP_MULT = 2.5;   // M5: adaptive touch slop multiplier for coarse pointers
+const STRAY_DOT_MS = 80;       // M5: cancel 1-finger stroke if 2nd finger lands within this window
+const STRAY_DOT_PX = 8;        // M5: ...and within this travel distance
+const MT_TAP_MS = 250;         // M5: max duration for 2-finger Undo / 3-finger Redo tap
+const MT_TAP_SLOP = 12;        // M5: max per-finger movement for multi-touch tap
+const PALM_GRACE_MS = 300;     // M5: suppress single-finger touch this long after pen up
+const STALE_POINTER_MS = 15_000; // M5: prune orphaned pointers from missed pointerup/cancel
 const DRAWING_TOOLS = new Set(["rectangle", "diamond", "ellipse", "arrow", "line", "freedraw", "text", "frame"]);
 const RESIZE_CURSOR = { n: "ns-resize", s: "ns-resize", e: "ew-resize", w: "ew-resize", nw: "nwse-resize", se: "nwse-resize", ne: "nesw-resize", sw: "nesw-resize" };
 
 export class Editor {
-  constructor({ scene, onOp = () => {}, clock = () => Date.now() } = {}) {
+  constructor({ scene, onOp = () => {}, clock = () => Date.now(), readOnly = false } = {}) {
     this.doc = new Doc(scene ?? { elements: [] });
     this.onOp = onOp; this.clock = clock;
+    this.readOnly = !!readOnly;
     this.tool = "select"; this.toolLock = false;
     this.sel = new Set();
     this.view = { x: 40, y: 40, scale: 1 }; this.size = { w: 800, h: 600 };
@@ -60,6 +68,10 @@ export class Editor {
     this.activeLayer = this.doc.layers[this.doc.layers.length - 1].id;
     this.undoStack = []; this.redoStack = [];
     this.g = null;               // the gesture in progress
+    this.pointers = new Map();   // M5: active pointers: pointerId → { x, y, type, pressure, t }
+    this.mt = null;              // M5: multi-touch tap/pinch session state
+    this.lastPointerType = "mouse";
+    this.lastPenUpAt = -Infinity;
     this.hover = null; this.guides = []; this.laser = []; this.erasing = new Set();
     this.text = null;            // { id, value, isNew } while typing
     this.clipboard = null;
@@ -210,17 +222,163 @@ export class Editor {
     return [["nw", nw], ["n", n], ["ne", ne], ["e", mid(ne, se)], ["se", se], ["s", mid(se, sw)], ["sw", sw], ["w", mid(sw, nw)]]
       .map(([dir, p]) => ({ kind: "resize", dir, x: p.x, y: p.y })).concat([rot]);
   }
-  handleAt(p) { return this.handles().find(h => Math.abs(h.x - p.x) <= HANDLE && Math.abs(h.y - p.y) <= HANDLE) ?? null; }
+  slopScale(pointerType = this.lastPointerType) { return pointerType === "touch" ? TOUCH_SLOP_MULT : 1; }
+  handleAt(p, pointerType = this.lastPointerType) {
+    const r = HANDLE * this.slopScale(pointerType);
+    return this.handles().find(h => Math.abs(h.x - p.x) <= r && Math.abs(h.y - p.y) <= r) ?? null;
+  }
 
   // ── pointer input (screen px) ──────────────────────────────────────────
 
+  isPenActive() {
+    for (const pt of this.pointers.values()) if (pt.type === "pen") return true;
+    return false;
+  }
+  isPalmWindow(now = this.clock()) { return this.isPenActive() || (now - this.lastPenUpAt < PALM_GRACE_MS); }
+  touchPointers() {
+    const out = [];
+    for (const entry of this.pointers.entries()) if (entry[1].type === "touch") out.push(entry);
+    return out;
+  }
+
+  beginPinch(pair, now) {
+    const [, a] = pair[0], [, b] = pair[1];
+    this.g = {
+      kind: "pinch",
+      prevMid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+      prevDist: Math.hypot(b.x - a.x, b.y - a.y),
+      prevT: now,
+      vx: undefined,
+      vy: undefined,
+    };
+  }
+
+  updatePinch(pair, now) {
+    const g = this.g;
+    if (!g || g.kind !== "pinch") return;
+    const [, a] = pair[0], [, b] = pair[1];
+    const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    const dist = Math.hypot(b.x - a.x, b.y - a.y);
+    const w = this.toWorld(g.prevMid);
+    const nextScale = g.prevDist > 1 && dist > 1
+      ? Math.max(0.1, Math.min(8, this.view.scale * (dist / g.prevDist)))
+      : this.view.scale;
+    this.view = { scale: nextScale, x: mid.x / nextScale - w.x, y: mid.y / nextScale - w.y };
+    if (now > g.prevT) {
+      const dt = (now - g.prevT) / 1000;
+      if (dt > 0 && dt < 0.25) {
+        const ivx = (mid.x - g.prevMid.x) / dt, ivy = (mid.y - g.prevMid.y) / dt;
+        g.vx = g.vx === undefined ? ivx : g.vx * 0.4 + ivx * 0.6;
+        g.vy = g.vy === undefined ? ivy : g.vy * 0.4 + ivy * 0.6;
+      }
+    }
+    g.prevMid = mid;
+    g.prevDist = dist;
+    g.prevT = now;
+    this.changed();
+  }
+
+  /** Roll back an in-progress gesture cleanly without committing or polluting undo history. */
+  cancelGesture() {
+    const g = this.g;
+    if (!g) return;
+    this.g = null;
+    this.guides = [];
+    if (g.before) {
+      let mutated = false;
+      for (const [id, prev] of g.before) {
+        if (prev === null) {
+          if (this.doc.byId.delete(id)) mutated = true;
+        } else {
+          this.doc.byId.set(id, clone(prev));
+          mutated = true;
+        }
+      }
+      if (mutated) {
+        this.doc.rev++;
+        this.doc._sorted = null;
+        this.onOp({ elements: [], transient: true });
+      }
+    }
+    if (g.kind === "marquee" && g.base) this.sel = new Set(g.base);
+    if (g.kind === "erase") this.erasing.clear();
+    if (g.kind === "laser" && g.laserStart != null) this.laser.length = Math.min(this.laser.length, g.laserStart);
+    this.pruneSel();
+    this.changed();
+  }
+
+  pruneStalePointers(now, incomingType, isPrimary) {
+    let removed = false;
+    for (const [id, pt] of this.pointers) {
+      if (now - (pt.lastT ?? pt.t) >= STALE_POINTER_MS) { this.pointers.delete(id); removed = true; }
+    }
+    // A primary pointer down (or mouse press after a stuck touch) recovers from missed pointerup/cancel,
+    // without disturbing an active pen when a palm touch arrives (handled right after time-pruning).
+    if (!(incomingType === "touch" && this.isPenActive())) {
+      if (isPrimary === true || incomingType === "mouse") {
+        for (const [id, pt] of this.pointers) {
+          if (isPrimary === true || pt.type !== "mouse") { this.pointers.delete(id); removed = true; }
+        }
+      }
+    }
+    if (removed && this.mt && this.pointers.size < 2) {
+      this.mt = null;
+      if (this.g?.kind === "pinch" || this.g?.kind === "pinch-tail") this.g = null;
+    }
+  }
+
   pointerDown(p, m = {}) {
+    const now = this.clock();
+    const pid = m.pointerId ?? 0;
+    const type = m.pointerType ?? "mouse";
+    const pressure = typeof m.pressure === "number" && Number.isFinite(m.pressure) ? m.pressure : null;
+
+    this.pruneStalePointers(now, type, m.isPrimary);
+
+    // Palm rejection (strict): while a pen is actively down, ignore ALL touch contacts (even 2+ palm contacts)
+    // so they never interrupt, cancel, or zoom an active pen stroke.
+    if (type === "touch" && this.isPenActive()) return;
+
+    this.pointers.set(pid, { x: p.x, y: p.y, type, pressure, t: now, lastT: now });
+
+    // Palm rejection (grace window): for 300 ms after pen up, suppress single-finger touch
+    // while still allowing 2-finger touch pan/zoom.
+    const touches = this.touchPointers();
+    if (type === "touch" && touches.length === 1 && this.isPalmWindow(now)) return;
+
+    const mtPointers = touches.length >= 2 ? touches : (!this.isPenActive() && this.pointers.size >= 2 ? [...this.pointers.entries()] : null);
+    if (mtPointers) {
+      this.cancelCamera();
+      if (this.text) this.commitText();
+      let committedPrev = false;
+      if (this.g && this.g.kind !== "pinch" && this.g.kind !== "pinch-tail") {
+        const dt = now - (this.downAt?.t ?? 0);
+        const moved = this.g.maxMove ?? Math.hypot((this.g.last?.x ?? p.x) - (this.downAt?.p.x ?? p.x), (this.g.last?.y ?? p.y) - (this.downAt?.p.y ?? p.y));
+        if (this.g.kind === "pan") { this.g = null; if (moved >= MT_TAP_SLOP) committedPrev = true; }
+        else if (dt < STRAY_DOT_MS && moved < STRAY_DOT_PX) { this.cancelGesture(); }
+        else if (this.g.kind !== "poly") { const prev = this.g; this.g = null; this.guides = []; this.finishSingleGesture(prev, prev.last ?? p, {}); committedPrev = true; }
+      }
+      if (!this.mt) {
+        const starts = new Map();
+        let t0 = now;
+        for (const [id, pt] of mtPointers) { starts.set(id, { x: pt.x, y: pt.y }); if (pt.t < t0) t0 = pt.t; }
+        this.mt = { t0, maxFingers: mtPointers.length, moved: committedPrev, starts };
+      } else {
+        this.mt.maxFingers = Math.max(this.mt.maxFingers, mtPointers.length);
+        if (committedPrev) this.mt.moved = true;
+        if (!this.mt.starts.has(pid)) this.mt.starts.set(pid, { x: p.x, y: p.y });
+      }
+      if (mtPointers.length === 2) this.beginPinch(mtPointers, now);
+      return;
+    }
+
+    this.lastPointerType = type;
     this.cancelCamera();
     if (this.text) this.commitText();
     // A press that arrives mid-gesture means we missed a release (outside the pane): finish it first.
-    if (this.g && this.g.kind !== "poly") this.pointerUp(this.g.last ?? p, {});
+    if (this.g && this.g.kind !== "poly") { const prev = this.g; this.g = null; this.guides = []; this.finishSingleGesture(prev, prev.last ?? p, {}); }
     const w = this.toWorld(p);
-    this.downAt = { p, t: this.clock() };
+    this.downAt = { p, t: now };
 
     if (this.g?.kind === "poly") {   // adding points to a click-by-click line
       if (m.clickCount >= 2) return this.finishPoly();
@@ -228,28 +386,37 @@ export class Editor {
       el.endBinding = null;   // a bend, not an end: the end binds where the line finishes
       return this.livePut(el);
     }
-    if (m.button === "middle" || this.tool === "hand" || m.space) { this.g = { kind: "pan", start: p, view: { ...this.view } }; return; }
+    if (this.readOnly || m.button === "middle" || this.tool === "hand" || m.space) {
+      this.g = { kind: "pan", start: p, view: { ...this.view }, pointerId: pid, pointerType: type, maxMove: 0 };
+      return;
+    }
 
     if (m.clickCount >= 2 && this.tool === "select") {   // double-click a bend: straighten it out
-      const h = this.handleAt(p), el = this.selected()[0];
+      const h = this.handleAt(p, type), el = this.selected()[0];
       if (h?.kind === "point" && el && isLinear(el) && h.i > 0 && h.i < el.points.length - 1) return this.removeBend(el.id, h.i);
     }
     if (m.clickCount >= 2 && (this.tool === "select" || this.tool === "text")) {
-      const hit = hitTest(this.doc, w, this.tol()) ?? shapeAt(this.doc, w);
+      const hit = hitTest(this.doc, w, this.tol(type)) ?? shapeAt(this.doc, w);
       if (hit && (isShape(hit) || hit.type === "text" || isLinear(hit)) && this.doc.editable(hit)) return this.beginText(hit, w);
       if (!hit) return this.beginText(null, w);
     }
 
     switch (this.tool) {
-      case "select": return this.downSelect(p, w, m);
+      case "select": this.downSelect(p, w, m); break;
       case "text": return this.beginText(null, w);
-      case "laser": this.laser.push({ x: w.x, y: w.y, t: this.clock(), start: true }); this.g = { kind: "laser" }; return this.changed();
-      case "eraser": this.g = { kind: "erase", last: p }; this.eraseAt(w, w); return;
-      default: return this.downCreate(p, w, m);
+      case "laser": {
+        const laserStart = this.laser.length;
+        this.laser.push({ x: w.x, y: w.y, t: now, start: true });
+        this.g = { kind: "laser", laserStart, pointerId: pid, pointerType: type, maxMove: 0 };
+        return this.changed();
+      }
+      case "eraser": this.g = { kind: "erase", last: p, pointerId: pid, pointerType: type, maxMove: 0 }; this.eraseAt(w, w); return;
+      default: this.downCreate(p, w, m); break;
     }
+    if (this.g) { this.g.pointerId = pid; this.g.pointerType = type; this.g.maxMove = 0; }
   }
 
-  tol() { return 6 / this.view.scale; }
+  tol(pointerType = this.lastPointerType) { return (SNAP * this.slopScale(pointerType)) / this.view.scale; }
 
   downSelect(p, w, m) {
     const h = this.handleAt(p);
@@ -300,6 +467,10 @@ export class Editor {
       if (this.tool === "arrow" && s.elbowed) { fields.elbowed = true; fields.roundness = null; }
       fields.startBinding = this.bindingAt(w, null, m, fields.elbowed);
     }
+    if (this.tool === "freedraw" && typeof m.pressure === "number" && Number.isFinite(m.pressure) && (m.pointerType === "pen" || (m.pressure !== 0.5 && m.pressure !== 0))) {
+      fields.pressures = [clampPressure(m.pressure)];
+      if (m.pointerType === "pen") fields.simulatePressure = false;
+    }
     if (this.tool === "frame") Object.assign(fields, { backgroundColor: "transparent", strokeWidth: 1, name: `Frame ${this.doc.live().filter(e => e.type === "frame").length + 1}`, customData: { z: this.doc.minZ(this.activeLayer) - 1 } });
     const el = this.newEl(this.tool, fields);
     this.g = { kind: "create", start: at, el, p, before: new Map([[el.id, null]]) };
@@ -307,13 +478,39 @@ export class Editor {
   }
 
   pointerMove(p, m = {}) {
+    const now = this.clock();
+    const pid = m.pointerId ?? 0;
+    const tracked = this.pointers.get(pid);
+    const type = m.pointerType ?? tracked?.type ?? this.lastPointerType;
+    if (type === "touch" && this.isPenActive()) return;
+    const pressure = typeof m.pressure === "number" && Number.isFinite(m.pressure) ? m.pressure : null;
+    if (tracked) { tracked.x = p.x; tracked.y = p.y; tracked.lastT = now; if (pressure != null) tracked.pressure = pressure; }
+
+    if (this.mt) {
+      const st = this.mt.starts.get(pid);
+      if (st && Math.hypot(p.x - st.x, p.y - st.y) > MT_TAP_SLOP) this.mt.moved = true;
+      if (this.g?.kind === "pinch") {
+        const touches = this.touchPointers();
+        const mtPointers = touches.length >= 2 ? touches : (!this.isPenActive() && this.pointers.size >= 2 ? [...this.pointers.entries()] : null);
+        if (mtPointers && mtPointers.length === 2) this.updatePinch(mtPointers, now);
+      }
+      return;
+    }
+
     const g = this.g;
-    if (!g) { this.updateHover(p); return; }
+    if (!g) {
+      if (type === "touch") return;
+      this.lastPointerType = type;
+      this.updateHover(p);
+      return;
+    }
+    if (g.pointerId != null && m.pointerId != null && g.pointerId !== pid) return;
     g.last = p;
+    if (this.downAt) g.maxMove = Math.max(g.maxMove ?? 0, Math.hypot(p.x - this.downAt.p.x, p.y - this.downAt.p.y));
     const w = this.toWorld(p);
     switch (g.kind) {
       case "pan": {
-        const t = this.clock();
+        const t = now;
         if (g.prev && t > g.prev.t) {
           const dt = (t - g.prev.t) / 1000;
           if (dt > 0 && dt < 0.25) {
@@ -340,13 +537,68 @@ export class Editor {
       case "create": return this.dragCreate(g, w, m);
       case "poly": { const el = g.el; el.points[el.points.length - 1] = [w.x - el.x, w.y - el.y]; el.endBinding = this.bindingAt(w, el.startBinding?.elementId, m, el.elbowed); return this.livePut(el); }
       case "erase": { const from = this.toWorld(g.lastE ?? p); g.lastE = p; this.eraseAt(from, w); return; }
-      case "laser": this.laser.push({ x: w.x, y: w.y, t: this.clock() }); return this.changed();
+      case "laser": this.laser.push({ x: w.x, y: w.y, t: now }); return this.changed();
     }
   }
 
   pointerUp(p, m = {}) {
+    const now = this.clock();
+    const pid = m.pointerId ?? 0;
+    const tracked = this.pointers.get(pid);
+    const type = m.pointerType ?? tracked?.type ?? this.lastPointerType;
+    if (type === "touch" && this.isPenActive()) { this.pointers.delete(pid); return; }
+    if (type === "pen") this.lastPenUpAt = now;
+    this.pointers.delete(pid);
+
+    if (this.mt) {
+      const st = this.mt.starts.get(pid);
+      if (st && Math.hypot(p.x - st.x, p.y - st.y) > MT_TAP_SLOP) this.mt.moved = true;
+      const remList = [...this.pointers.entries()];
+      if (remList.length === 2) {
+        // Re-anchor pinch to the remaining 2 pointers (e.g. after a 3rd finger lifts) so there is no view jump.
+        this.beginPinch(remList, now);
+      } else if (remList.length === 1 && this.g?.kind === "pinch") {
+        this.g.kind = "pinch-tail";
+      } else if (remList.length === 0) {
+        const mt = this.mt, g = this.g;
+        this.mt = null; this.g = null; this.guides = [];
+        if (!mt.moved && (now - mt.t0) < MT_TAP_MS) {
+          if (!this.readOnly && mt.maxFingers === 2) this.undo();
+          else if (!this.readOnly && mt.maxFingers === 3) this.redo();
+        } else if (g && (g.kind === "pinch" || g.kind === "pinch-tail")) {
+          if (g.prevT != null && (now - g.prevT) <= 80 && Math.hypot(g.vx ?? 0, g.vy ?? 0) > 120) this.flingCamera(g.vx, g.vy);
+        }
+        this.changed();
+      }
+      return;
+    }
+
     const g = this.g; if (!g || g.kind === "poly") return;   // a click-by-click line keeps going
+    if (g.pointerId != null && m.pointerId != null && g.pointerId !== pid) return;
     this.g = null; this.guides = [];
+    return this.finishSingleGesture(g, p, m);
+  }
+
+  pointerCancel(p, m = {}) {
+    const now = this.clock();
+    const pid = m.pointerId ?? 0;
+    const tracked = this.pointers.get(pid);
+    const type = m.pointerType ?? tracked?.type ?? this.lastPointerType;
+    if (type === "touch" && this.isPenActive()) { this.pointers.delete(pid); return; }
+    if (type === "pen") this.lastPenUpAt = now;
+    this.pointers.delete(pid);
+
+    if (this.mt) {
+      const remList = [...this.pointers.entries()];
+      if (remList.length === 0) { this.mt = null; this.g = null; this.guides = []; this.changed(); }
+      else if (remList.length === 2) { this.beginPinch(remList, now); }
+      else if (remList.length === 1 && this.g?.kind === "pinch") { this.g.kind = "pinch-tail"; }
+      return;
+    }
+    if (this.g && (this.g.pointerId == null || m.pointerId == null || this.g.pointerId === pid)) this.cancelGesture();
+  }
+
+  finishSingleGesture(g, p, m = {}) {
     switch (g.kind) {
       case "move": {
         if (!g.moved) return this.changed();
@@ -470,9 +722,10 @@ export class Editor {
   // else the shape under it (aimed at the other end), else nothing. ⌘ held: nothing.
   bindingAt(w, except, m = {}, elbowed = false) {
     if (m.cmd || m.ctrl) return null;
-    const port = portAt(this.doc, w, PORT_SNAP / this.view.scale, except);
+    const scale = this.slopScale(m.pointerType ?? this.lastPointerType);
+    const port = portAt(this.doc, w, (PORT_SNAP * scale) / this.view.scale, except);
     if (port) return elbowed ? { elementId: port.el.id, focus: 0, gap: 6 } : { elementId: port.el.id, focus: 0, gap: 6, fixedPoint: port.port.fixedPoint };
-    const s = bindTargetAt(this.doc, w, except, BIND_PAD / this.view.scale);
+    const s = bindTargetAt(this.doc, w, except, (BIND_PAD * scale) / this.view.scale);
     return s ? { elementId: s.id, focus: 0, gap: 6 } : null;
   }
 
@@ -480,12 +733,12 @@ export class Editor {
   // default, crosshair, pointer, move, grab, grabbing, text, ns-resize, ew-resize, nwse-resize, nesw-resize.
   cursor() {
     const g = this.g;
-    if (g?.kind === "pan") return "grabbing";
+    if (g?.kind === "pan" || g?.kind === "pinch" || g?.kind === "pinch-tail") return "grabbing";
     if (g?.kind === "rotate") return "grabbing";
     if (g?.kind === "move" || g?.kind === "point") return g.kind === "point" ? "pointer" : "move";
     if (g?.kind === "resize") return RESIZE_CURSOR[g.h.dir] ?? "default";
     if (g?.kind === "create" || g?.kind === "poly") return this.hint || this.endHint() ? "pointer" : "crosshair";
-    if (this.tool === "hand") return "grab";
+    if (this.readOnly || this.tool === "hand") return "grab";
     if (this.tool === "text") return "text";
     if (this.tool === "arrow" || this.tool === "line") return this.hint ? "pointer" : "crosshair";
     if (this.tool !== "select") return "crosshair";
@@ -519,7 +772,8 @@ export class Editor {
   }
 
   moveSel(g, p, w, m) {
-    if (!g.moved && Math.hypot(p.x - g.p.x, p.y - g.p.y) < DRAG_SLOP) return;
+    const dragSlop = DRAG_SLOP * this.slopScale(g.pointerType ?? m.pointerType);
+    if (!g.moved && Math.hypot(p.x - g.p.x, p.y - g.p.y) < dragSlop) return;
     if (!g.moved) {
       g.moved = true;
       // Alt-drag leaves copies behind (the originals move).
@@ -660,6 +914,15 @@ export class Editor {
       const last = el.points[el.points.length - 1], q = [w.x - el.x, w.y - el.y];
       if (Math.hypot(q[0] - last[0], q[1] - last[1]) * this.view.scale < 1.5) return;
       el.points.push(q);
+      const hasPressure = typeof m.pressure === "number" && Number.isFinite(m.pressure);
+      const trackPressure = g.pointerType === "pen" || m.pointerType === "pen" || (Array.isArray(el.pressures) && el.pressures.length > 0) || (hasPressure && m.pressure !== 0.5 && m.pressure !== 0);
+      if (trackPressure && hasPressure) {
+        if (!Array.isArray(el.pressures)) el.pressures = [];
+        while (el.pressures.length < el.points.length - 1) el.pressures.push(el.pressures[el.pressures.length - 1] ?? 0.5);
+        el.pressures.push(clampPressure(m.pressure));
+      } else if (Array.isArray(el.pressures) && el.pressures.length > 0) {
+        el.pressures.push(el.pressures[el.pressures.length - 1]);
+      }
     } else {
       let q = [at.x - el.x, at.y - el.y];
       if (m.shift) { const a = Math.round(Math.atan2(q[1], q[0]) / (Math.PI / 12)) * (Math.PI / 12), r = Math.hypot(q[0], q[1]); q = [Math.cos(a) * r, Math.sin(a) * r]; }
@@ -672,7 +935,7 @@ export class Editor {
 
   finishCreate(g, p) {
     const el = g.el;
-    const dragged = Math.hypot(p.x - g.p.x, p.y - g.p.y) >= DRAG_SLOP;
+    const dragged = Math.hypot(p.x - g.p.x, p.y - g.p.y) >= DRAG_SLOP * this.slopScale(g.pointerType);
     if (isShape(el) || el.type === "frame") {
       if (!dragged || (Math.abs(el.width) < 4 && Math.abs(el.height) < 4)) {   // a click: default size
         const d = el.type === "frame" ? [320, 240] : [140, 80];
@@ -684,7 +947,10 @@ export class Editor {
         el.points[1] = [0, 0];
         return this.changed();
       }
-    } else if (el.type === "freedraw" && el.points.length < 2) el.points.push([0.5, 0.5]);
+    } else if (el.type === "freedraw" && el.points.length < 2) {
+      el.points.push([0.5, 0.5]);
+      if (Array.isArray(el.pressures) && el.pressures.length === 1) el.pressures.push(el.pressures[0]);
+    }
     this.endCreate(el, g.before);
   }
 
@@ -766,7 +1032,7 @@ export class Editor {
     if (!box) return { dx, dy };
     if (this.grid) { const g = this.grid; return { dx: Math.round((box.x + dx) / g) * g - box.x, dy: Math.round((box.y + dy) / g) * g - box.y }; }
     if (!this.snapOn) return { dx, dy };
-    const tol = SNAP / this.view.scale;
+    const tol = (SNAP * this.slopScale()) / this.view.scale;
     const xs = [box.x, box.x + box.w / 2, box.x + box.w].map(v => v + dx), ys = [box.y, box.y + box.h / 2, box.y + box.h].map(v => v + dy);
     let bx = null, by = null;
     for (const el of this.doc.visible()) {

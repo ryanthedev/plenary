@@ -213,6 +213,11 @@ const APP_KEYS = {
   layers: v => Array.isArray(v) && v.length >= 1 && v.length <= 100 && v.every(l => isObj(l) && typeof l.id === "string" && l.id.length <= 64 &&
     typeof l.name === "string" && l.name.length <= 200 && typeof l.visible === "boolean" && typeof l.locked === "boolean" &&
     typeof l.opacity === "number" && l.opacity >= 0 && l.opacity <= 100),
+  views: v => Array.isArray(v) && v.length <= 100 && v.every(w => isObj(w) &&
+    typeof w.id === "string" && w.id.length >= 1 && w.id.length <= 64 &&
+    typeof w.name === "string" && w.name.length <= 200 &&
+    (w.frameId === null || (typeof w.frameId === "string" && w.frameId.length <= 64)) &&
+    (w.visibleLayers === null || (Array.isArray(w.visibleLayers) && w.visibleLayers.length <= 100 && w.visibleLayers.every(id => typeof id === "string" && id.length <= 64)))),
   grid: v => typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1000,
   snap: v => typeof v === "boolean",
   timeline: v => isObj(v) && typeof v.duration === "number" && Number.isFinite(v.duration) && v.duration >= 0 && v.duration <= 3_600_000,

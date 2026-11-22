@@ -18,7 +18,11 @@ export function wins(incoming, current) {
 }
 
 export class Doc {
-  constructor(scene) { this.load(scene); }
+  constructor(scene) {
+    /** @type {((layerId: string) => boolean) | null} */
+    this._localLayerFilter = null;
+    this.load(scene);
+  }
 
   load(scene) {
     this.byId = new Map();
@@ -48,9 +52,35 @@ export class Doc {
     return this._sorted;
   }
 
+  /**
+   * Set or clear a viewer-local layer visibility filter without mutating shared `appState.herdr.layers`.
+   * Pass `null` to restore shared board layer visibility.
+   * @param {((layerId: string) => boolean) | null} fn
+   */
+  setLocalLayerFilter(fn) {
+    const next = typeof fn === "function" ? fn : null;
+    if (this._localLayerFilter === next) return;
+    this._localLayerFilter = next;
+    this.rev++;
+  }
+
+  /** Effective visibility of a layer for this viewer (respecting any local override without mutating shared state). */
+  isLayerVisible(id) {
+    if (this._localLayerFilter) return Boolean(this._localLayerFilter(id));
+    const l = this.layer(id);
+    return Boolean(l?.visible);
+  }
+
   // Elements a person can see and touch (visible, unlocked layers).
-  visible() { const hidden = new Set(this.layers.filter(l => !l.visible).map(l => l.id)); return this.live().filter(e => !hidden.has(layerOf(e))); }
-  editable(el) { const l = this.layer(layerOf(el)); return l.visible && !l.locked && !el.locked; }
+  visible() {
+    if (this._localLayerFilter) {
+      const fn = this._localLayerFilter;
+      return this.live().filter(e => Boolean(fn(layerOf(e))));
+    }
+    const hidden = new Set(this.layers.filter(l => !l.visible).map(l => l.id));
+    return this.live().filter(e => !hidden.has(layerOf(e)));
+  }
+  editable(el) { const id = layerOf(el); const l = this.layer(id); return this.isLayerVisible(id) && !l.locked && !el.locked; }
 
   labelOf(shape) { for (const el of this.byId.values()) if (!el.isDeleted && isLabel(el) && el.containerId === shape.id) return el; return null; }
 

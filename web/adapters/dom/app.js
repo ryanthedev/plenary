@@ -9,7 +9,8 @@ import { trapFocus, hasActiveOverlay } from "./a11y.js";
 import { Editor } from "../../../packages/core/editor.js";
 import { parsePanel, serializePanel, applyPanel, panelLayout, dragWidth } from "../../../packages/core/panel.js";
 import { isMermaid } from "../../../packages/core/mermaid.js";
-import { isLabel } from "../../../packages/core/model.js";
+import { isLabel, layerOf } from "../../../packages/core/model.js";
+import { listNamedFrames, viewsOf, addView, deleteView, resolveLocalLayers, captureCurrentView, stepViewIndex } from "../../../packages/core/views.js";
 import { parseLinkCardUrl, parseLinkCardFromElement, isPointInLinkCardOpenAction } from "../../../packages/core/link-card.js";
 import { parseLibrary } from "../../../packages/core/library.js";
 import { parseExcalidraw, MAX_EXCALIDRAW_INPUT_BYTES } from "../../../packages/core/excalidraw.js";
@@ -36,6 +37,7 @@ import { mountCollab } from "./collab/ui.js";
 import { collabFrame } from "./collab/frame.js";
 import { createVideoOverlay } from "./video-overlay.js";
 import { createContextMenu, buildCanvasMenuItems } from "./context-menu.js";
+import { createViewsMenu } from "./views-menu.js";
 import { hitTest } from "../../../packages/core/geometry.js";
 
 const RAW_BOARD_ID_RE = /^(?:b-[a-z0-9]{8,}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
@@ -89,6 +91,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const ui = {
     theme: theme0 === "dark" || (theme0 !== "light" && matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light",
     panel: parsePanel(get("plenary.panel")), drawer: null, sheet: null, dialog: null, colorPicker: null, colorPickerState: { h: null, mode: "hex" }, library: loadLibrary(prefs),
+    localView: { soloLayerId: null, activeViewId: null },
     renamingBoard: false,
     mermaid: { src: "flowchart LR\n  A[Idea] --> B[Spec]\n  B --> C{Review?}\n  C -->|yes| D[Build]\n  C -->|no| B\n  D --> E[Ship]", elbow: true },
     export: { format: "svg", scale: 2, page: "board" },
@@ -193,6 +196,155 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     collab.startComment(w, on);
   }
   const contextMenu = createContextMenu({ host: document.body, doc: document });
+
+  // ── Named Jump-to-Frame, Local Solo Layer & Named Presentation Views (#115) ──
+  // Local layer visibility (Solo Layer / active View filter) is strictly viewer-local:
+  // it applies via Doc.setLocalLayerFilter without EVER mutating shared appState.herdr.layers.
+  const resolvedLocalView = () => resolveLocalLayers(S.eds.board.doc.layers, ui.localView, viewsOf(S.eds.board.doc));
+  let lastLocalDocRev = -1, lastLocalSolo = null, lastLocalViewId = null, lastLocalActive = false, preLocalActiveLayer = null;
+  function syncLocalLayerFilter({ force = false } = {}) {
+    const B = S.eds.board;
+    if (!force && B.doc.rev === lastLocalDocRev && ui.localView.soloLayerId === lastLocalSolo && ui.localView.activeViewId === lastLocalViewId) return;
+    const hadLocal = lastLocalActive || Boolean(lastLocalSolo) || Boolean(lastLocalViewId);
+    const hasLocalReq = Boolean(ui.localView.soloLayerId) || Boolean(ui.localView.activeViewId);
+    if (!force && !hadLocal && !hasLocalReq) {
+      lastLocalDocRev = B.doc.rev;
+      return;
+    }
+    const views = viewsOf(B.doc);
+    const resolved = resolveLocalLayers(B.doc.layers, ui.localView, views);
+    if (ui.localView.soloLayerId && !resolved.soloLayerId) ui.localView.soloLayerId = null;
+    if (ui.localView.activeViewId && !resolved.activeViewId) ui.localView.activeViewId = null;
+    B.doc.setLocalLayerFilter(resolved.filter);
+    lastLocalDocRev = B.doc.rev;
+    lastLocalSolo = ui.localView.soloLayerId;
+    lastLocalViewId = ui.localView.activeViewId;
+    lastLocalActive = resolved.active;
+    if (resolved.filter) {
+      if (!resolved.filter(B.activeLayer)) {
+        if (preLocalActiveLayer == null) preLocalActiveLayer = B.activeLayer;
+        const fallback = resolved.soloLayerId ?? resolved.layers.find(l => l.effectiveVisible)?.id ?? null;
+        if (fallback) B.activeLayer = fallback;
+      }
+      for (const id of [...B.sel]) {
+        const el = B.doc.get(id);
+        if (el && !resolved.filter(layerOf(el))) B.sel.delete(id);
+      }
+    } else if (preLocalActiveLayer != null) {
+      if (B.doc.layers.some(l => l.id === preLocalActiveLayer)) B.activeLayer = preLocalActiveLayer;
+      preLocalActiveLayer = null;
+    }
+    B.changed();
+    dirty = true;
+    chromeDirty = true;
+    viewsMenu.refresh();
+  }
+  function toggleSoloLayer(layerId) {
+    if (typeof layerId !== "string" || !layerId) return;
+    const nextSolo = ui.localView.soloLayerId === layerId ? null : layerId;
+    if (nextSolo && !ui.localView.soloLayerId && !ui.localView.activeViewId) preLocalActiveLayer = S.eds.board.activeLayer;
+    ui.localView = { soloLayerId: nextSolo, activeViewId: null };
+    syncLocalLayerFilter({ force: true });
+  }
+  function resetLocalView() {
+    if (!ui.localView.soloLayerId && !ui.localView.activeViewId) return;
+    ui.localView = { soloLayerId: null, activeViewId: null };
+    syncLocalLayerFilter({ force: true });
+  }
+  function jumpToFrame(frameId, opts) {
+    const B = S.eds.board;
+    const fs = listNamedFrames(B.doc);
+    const idx = fs.findIndex(f => f.id === frameId);
+    const frame = idx >= 0 ? B.doc.get(frameId) : null;
+    if (!frame) return false;
+    B.frameAt = frame.id;
+    S.eds.notes.cancelCamera();
+    B.fit([frame], 24, opts);
+    S.syncView("board");
+    B.flash = `${fs[idx].rawName || "Frame"} · ${idx + 1} of ${fs.length}`;
+    dirty = true;
+    chromeDirty = true;
+    return true;
+  }
+  function stepBoardFrame(step, opts) {
+    const B = S.eds.board;
+    const fs = listNamedFrames(B.doc);
+    if (!fs.length) { S.stepFrame(step, opts); return false; }
+    const i = fs.findIndex(f => f.id === B.frameAt);
+    const next = i < 0 ? (step > 0 ? 0 : fs.length - 1) : (i + step + fs.length) % fs.length;
+    return jumpToFrame(fs[next].id, opts);
+  }
+  function activateView(viewId, opts) {
+    const views = viewsOf(S.eds.board.doc);
+    const view = views.find(v => v.id === viewId);
+    if (!view) return false;
+    ui.localView = { soloLayerId: null, activeViewId: view.id };
+    syncLocalLayerFilter({ force: true });
+    if (view.frameId) jumpToFrame(view.frameId, opts);
+    toast(`View: ${view.name}`, 1400);
+    return true;
+  }
+  function stepView(delta, opts) {
+    const views = viewsOf(S.eds.board.doc);
+    if (!views.length) {
+      toast("No saved views yet — press ⌘J to save one");
+      return false;
+    }
+    const next = stepViewIndex(views, ui.localView.activeViewId, delta);
+    if (!next) return false;
+    return activateView(next.id, opts);
+  }
+  function saveCurrentView(name = "") {
+    if (S.role !== "presenter" || !S.may()) return null;
+    const B = S.eds.board;
+    const selFrames = B.selected().filter(e => e.type === "frame");
+    const frameId = selFrames.length === 1 ? selFrames[0].id : (B.frameAt ?? null);
+    const view = captureCurrentView(B.doc, ui.localView, { name, frameId });
+    const ok = S.act("board", e => e.setAppState({ views: addView(e.doc, view) }), { settings: true });
+    if (!ok) return null;
+    ui.localView = { soloLayerId: null, activeViewId: view.id };
+    syncLocalLayerFilter({ force: true });
+    toast(`Saved view: ${view.name}`, 1600);
+    return view;
+  }
+  function deleteSavedView(viewId) {
+    if (S.role !== "presenter" || !S.may()) return false;
+    const ok = S.act("board", e => e.setAppState({ views: deleteView(e.doc, viewId) }), { settings: true });
+    if (!ok) return false;
+    if (ui.localView.activeViewId === viewId) ui.localView = { ...ui.localView, activeViewId: null };
+    syncLocalLayerFilter({ force: true });
+    return true;
+  }
+  const viewsMenu = createViewsMenu({
+    host: document.body,
+    doc: document,
+    getState: () => ({
+      frames: listNamedFrames(S.eds.board.doc),
+      views: viewsOf(S.eds.board.doc),
+      activeFrameId: S.eds.board.frameAt ?? null,
+      localView: resolvedLocalView(),
+      canSave: S.role === "presenter" && S.may(),
+    }),
+    onJumpFrame: id => { jumpToFrame(id); },
+    onSelectView: id => { activateView(id); },
+    onStepView: delta => { stepView(delta); },
+    onSaveView: name => saveCurrentView(name),
+    onDeleteView: id => { deleteSavedView(id); },
+    onResetLocalView: () => { resetLocalView(); },
+    onRestoreFocus: saved => restoreOpener(saved, visibleControl(["[data-views-open]"]) ?? canvas),
+    onClose: () => {
+      const btn = document.querySelector?.("[data-views-open]");
+      btn?.setAttribute?.("aria-expanded", "false");
+    },
+  });
+  function openViewsMenu(opener = null) {
+    if (viewsMenu.isOpen()) { viewsMenu.close({ restoreFocus: true }); return; }
+    const savedOpener = captureOpener(opener);
+    dismissOverlays();
+    const btn = document.querySelector?.("[data-views-open]");
+    btn?.setAttribute?.("aria-expanded", "true");
+    viewsMenu.open({ opener: savedOpener });
+  }
   function pasteAtPoint(worldPoint) {
     if (!S.may()) { toast("View only: nothing is pasted"); return; }
     const clip = globalThis.navigator?.clipboard;
@@ -294,6 +446,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
 
   // ── painting ──
   function draw() {
+    syncLocalLayerFilter();
     const theme = THEMES[ui.theme];
     const items = S.displayList(theme);
     // A picture whose bytes haven't arrived is drawn by core as a dashed box (render.js); its bytes are asked for here
@@ -487,10 +640,30 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   document.addEventListener("keydown", e => {
     if (e.defaultPrevented) return;
     const t = e.target;
+    const k0 = keyName(e), m0 = mods(e);
+    if ((m0.cmd || m0.ctrl) && !m0.shift && !m0.alt && k0 === "j" && viewsMenu.isOpen()) {
+      e.preventDefault(); e.stopPropagation?.();
+      viewsMenu.close({ restoreFocus: true });
+      return;
+    }
     if (hasOpenDialog() || isEditable(t) || inDialog(t) || isSlider(t)) return;   // inputs, dialogs, sliders keep their keys
     if (isInteractive(t) && (e.key === "Enter" || e.key === " " || e.code === "Space")) return;   // let focused buttons/links activate
     if (e.key === " " || e.code === "Space") space = true;
-    const k = keyName(e), m = mods(e);
+    const k = k0, m = m0;
+    if ((m.cmd || m.ctrl) && !m.shift && !m.alt && k === "j") { e.preventDefault(); e.stopPropagation?.(); openViewsMenu(); return; }
+    if (!m.cmd && !m.ctrl && !m.alt && (k === "pagedown" || k === "pageup") && resolvedLocalView().active) {
+      e.preventDefault(); e.stopPropagation?.();
+      stepBoardFrame(k === "pagedown" ? 1 : -1);
+      return;
+    }
+    if (!m.cmd && !m.ctrl && !m.alt && !m.shift && (e.key === "[" || e.key === "]")) {
+      const hasSel = (activeEditor()?.sel?.size ?? 0) > 0;
+      if ((!S.may() || !hasSel) && viewsOf(S.eds.board.doc).length > 0) {
+        e.preventDefault(); e.stopPropagation?.();
+        stepView(e.key === "]" ? 1 : -1);
+        return;
+      }
+    }
     if ((m.cmd || m.ctrl) && m.shift && k === "e") { e.preventDefault(); e.stopPropagation?.(); if (S.role === "presenter") openDialog("export"); return; }
     if (!m.cmd && !m.ctrl && !m.alt && k === "i" && S.role === "presenter") { e.preventDefault(); e.stopPropagation?.(); setPanel({ type: "open" }); return; }
     if (S.key(k, m)) { e.preventDefault(); e.stopPropagation?.(); chromeDirty = true; }
@@ -815,7 +988,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const B = S.eds.board, live = B.doc.live();
     const counts = {};
     for (const e of live) if (!isLabel(e)) { const l = e.customData?.layer ?? ""; counts[l] = (counts[l] ?? 0) + 1; }
-    const frames = B.frames();
+    const frames = listNamedFrames(B.doc);
     const marks = [...new Set(live.map(e => e.customData?.anim?.start).filter(Number.isFinite))];
     const spans = timelineSpans(live);
     const spansSig = JSON.stringify(spans.map(s => [s.id, s.preset, s.start, s.duration, s.easing, s.loop]));
@@ -972,6 +1145,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   }
   function dismissOverlays({ keepSheet = false, keepDialog = false } = {}) {
     contextMenu.close({ restoreFocus: false });
+    viewsMenu.close({ restoreFocus: false });
     if (ui.moreOpen) closeMoreMenuNow();
     if (why.isOpen()) why.close(false);
     if (!keepSheet && ui.sheet) {
@@ -1197,6 +1371,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       role === "presenter" ? boardMenuItem("mermaid", "Mermaid", "Insert Mermaid", () => openDialog("mermaid"), { disabled: !may }) : null,
     ]);
     const viewSection = menuSection("View", [
+      boardMenuItem("frame", "Jump to frame or view", "Jump to frame / view", () => openViewsMenu(), { kbd: "⌘J", badge: viewsOf(S.eds.board.doc).length ? String(viewsOf(S.eds.board.doc).length) : "" }),
       boardMenuItem(ui.theme === "dark" ? "sun" : "moon", "Light / dark", ui.theme === "dark" ? "Light theme" : "Dark theme", toggleTheme),
       role === "presenter" ? boardMenuItem("grid", "Toggle grid", "Snap to grid", toggleGrid, { disabled: !may, kbd: "⌘'", badge: gridOn ? "On" : "", on: gridOn }) : null,
       role !== "viewer" ? boardMenuItem("panel", "Side panel", "Side panel", togglePanel, { kbd: "I", badge: ui.panel.open ? "On" : "", on: ui.panel.open }) : null,
@@ -1282,13 +1457,26 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     } else {
       titleNode = h("span.board-name", { title: titleText }, titleText, net.kind === "ws" ? null : [" ", h("small", {}, "· dev room")]);
     }
+    const local = resolvedLocalView();
+    const viewsCount = viewsOf(S.eds.board.doc).length;
+    const viewsPillLabel = local.activeViewName || (local.mode === "solo" ? "Solo" : (viewsCount ? `Views (${viewsCount})` : "Jump"));
+    const viewsPill = h("button.btn.ghost.desk-only.views-pill" + (local.active ? ".on" : ""), {
+      type: "button",
+      "data-views-open": "1",
+      "aria-haspopup": "dialog",
+      "aria-expanded": String(viewsMenu.isOpen()),
+      "aria-label": "Jump to frame or view",
+      title: "Jump to frame or view (⌘J)",
+      onclick: e => openViewsMenu(e?.currentTarget ?? null),
+    }, icon("frame", { size: 14 }), h("span.views-pill-lab", {}, viewsPillLabel), h("kbd.views-pill-kbd", {}, "⌘J"));
     return [
       h("div.island.top-left", {},
         brandHref
           ? h("a.brand-mark", { href: brandHref, title: homeHref ? "Home" : "All boards", "aria-label": homeHref ? "Home" : "All boards", style: { textDecoration: "none" } }, icon("brand", { size: 15 }))
           : h("span.brand-mark", { "aria-hidden": "true" }, icon("brand", { size: 15 })),
         titleNode,
-        moveInfo.space ? h("span.board-space", { title: "The Space this board is in" }, "in ", moveInfo.space.name) : null),
+        moveInfo.space ? h("span.board-space", { title: "The Space this board is in" }, "in ", moveInfo.space.name) : null,
+        viewsPill),
       h("div.tools.desk-only.island.tool-rail", { "aria-label": "Drawing tools" }, core.map(t => toolButton(t)), extras.length ? h("span.sep") : null, extras.map(t => toolButton(t, ".new")),
         role !== "viewer" ? [h("span.sep"),
           h("button.tb" + (S.toolLock() ? ".on" : ""), { title: "Keep the tool after drawing (Q)", "aria-label": "Lock tool", "aria-pressed": String(S.toolLock()), disabled: !may, onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 17 })), h("span.k", {}, "Q")),
@@ -1325,10 +1513,31 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
           h("button.tb.danger", { title: "Delete", "aria-label": "Delete", "data-action": "delete", onclick: () => { S.act(activeStream(), e => e.deleteIds([...e.sel])); chromeDirty = true; } },
             h("span.ic", {}, icon("trash", { size: 18 }))))
       : null;
+    const local = resolvedLocalView();
+    const savedViews = viewsOf(B.doc);
+    const soloLayer = local.soloLayerId ? B.doc.layers.find(l => l.id === local.soloLayerId) : null;
+    const localFilterPill = local.active
+      ? h("div.grp.local-filter-pill", { role: "status", "aria-label": "Local layer filter active" },
+        h("span.local-filter-text", {}, local.mode === "solo" ? `Solo: ${soloLayer?.name || "Layer"}` : `View: ${local.activeViewName || "Filtered"}`),
+        h("button.btn.ghost", {
+          type: "button",
+          "data-action": "reset-local-layers",
+          title: "Clear local layer filter and show all board layers",
+          onclick: () => resetLocalView(),
+        }, "Show all layers"))
+      : null;
+    const viewsStepPill = savedViews.length
+      ? h("div.grp.desk-only.views-step-pill", { "aria-label": "Presentation views" },
+        h("button.tb", { type: "button", title: "Previous view ([)", "aria-label": "Previous view", "data-step-view": "-1", onclick: () => stepView(-1) }, icon("chevronLeft", { size: 15 })),
+        h("button.btn.ghost.views-step-label", { type: "button", title: "Jump to frame or view (⌘J)", "aria-label": "Open views navigator", onclick: e => openViewsMenu(e?.currentTarget ?? null) }, local.activeViewName || `Views (${savedViews.length})`),
+        h("button.tb", { type: "button", title: "Next view (])", "aria-label": "Next view", "data-step-view": "1", onclick: () => stepView(1) }, icon("chevronRight", { size: 15 })))
+      : null;
     const bl = [
+      localFilterPill,
       openCardPill,
       selPill,
-      h("div.grp" + (S.role === "viewer" ? ".desk-only" : ""), {}, h("button.tb", { title: "Previous frame (PgUp)", "aria-label": "Previous frame", onclick: () => S.stepFrame(-1) }, icon("chevronLeft", { size: 16 })), h("span.pct", {}, fs.length ? `${i < 0 ? "–" : i + 1} / ${fs.length}` : "0 / 0"), h("button.tb", { title: "Next frame (PgDn)", "aria-label": "Next frame", onclick: () => S.stepFrame(1) }, icon("chevronRight", { size: 16 }))),
+      viewsStepPill,
+      h("div.grp" + (S.role === "viewer" ? ".desk-only" : ""), {}, h("button.tb", { title: "Previous frame (PgUp)", "aria-label": "Previous frame", onclick: () => stepBoardFrame(-1) }, icon("chevronLeft", { size: 16 })), h("span.pct", {}, fs.length ? `${i < 0 ? "–" : i + 1} / ${fs.length}` : "0 / 0"), h("button.tb", { title: "Next frame (PgDn)", "aria-label": "Next frame", onclick: () => stepBoardFrame(1) }, icon("chevronRight", { size: 16 }))),
       h("div.grp.desk-only", {},
         S.role !== "viewer" ? [
           h("button.tb", { title: "Undo", "aria-label": "Undo", disabled: !canUndo, onclick: () => S.act(activeStream(), e => e.undo()) }, icon("undo", { size: 16 })),
@@ -1413,7 +1622,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     let items;
     if (role === "presenter") items = [...["select", "freedraw", "rectangle", "text"].map(id => id === "rectangle" ? btn(id, "Rect", S.tool === id, () => { S.setTool(id); chromeDirty = true; }, !may, T(id).name, { "aria-pressed": String(S.tool === id) }) : tool(id)), sheetBtn("more", "More", "tools"), sheetBtn("panel", "Style", "panel"), sheetBtn("note", "Notes", "notes"), sheetBtn("comments", "Comments", "comments")];
     else if (role === "annotator") items = [...["select", "note", "highlighter", "freedraw"].map(tool), sheetBtn("more", "More", "tools"), sheetBtn("panel", "Style", "panel"), sheetBtn("note", "Notes", "notes")];
-    else items = [btn("chevronLeft", "Prev", false, () => S.stepFrame(-1)), btn("fit", "Fit", false, () => S.fit()), btn("chevronRight", "Next", false, () => S.stepFrame(1)), sheetBtn("note", "Notes", "notes"), sheetBtn("comments", "Comments", "comments")];
+    else items = [btn("chevronLeft", "Prev", false, () => stepBoardFrame(-1)), btn("fit", "Fit", false, () => S.fit()), btn("chevronRight", "Next", false, () => stepBoardFrame(1)), sheetBtn("note", "Notes", "notes"), sheetBtn("comments", "Comments", "comments")];
     replace($("#dock"), items);
   }
   const SHEET_DISMISS_PX = 72, SHEET_FLICK_VY = 0.55;
@@ -1508,6 +1717,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
           ? h("button.tb", { "aria-haspopup": "dialog", onclick: () => { setSheet(null, { restore: false }); openShareDialog(); } }, h("span.ic", {}, icon("share", { size: 20 })), "Share")
           : (admin ? h("button.tb", { "aria-haspopup": "dialog", onclick: () => { setSheet(null, { restore: false }); openAdminShare(); } }, h("span.ic", {}, icon("share", { size: 20 })), "Share") : null),
         canMove() ? h("button.tb", { "aria-haspopup": "dialog", onclick: () => openMoveDialog() }, h("span.ic", {}, icon("moveToLayer", { size: 20 })), "Move to…") : null,
+        h("button.tb", { "aria-haspopup": "dialog", "aria-label": "Jump to frame or view", onclick: () => { setSheet(null, { restore: false }); openViewsMenu(); } }, h("span.ic", {}, icon("frame", { size: 20 })), "Views"),
         S.role !== "viewer" ? h("button.tb" + (S.toolLock() ? ".on" : ""), { disabled: !may, "aria-pressed": String(S.toolLock()), onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 20 })), "Lock tool") : null,
         h("button.tb", { "aria-pressed": String(ui.theme === "dark"), onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 20 })), ui.theme === "dark" ? "Light" : "Dark")));
     } else if (ui.sheet === "panel") body = h("div.scroll", {}, panelNodes(true));
@@ -1521,6 +1731,11 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     session: S, state: ui.panel, h, inSheet, library: ui.library, setLibrary, setState: setPanel,
     prefs, canvas, colorPicker: ui.colorPicker, colorPickerState: ui.colorPickerState,
     setColorPicker: prop => { cancelActiveSampler(); ui.colorPicker = prop; chromeDirty = true; },
+    localView: resolvedLocalView(),
+    onSoloLayer: toggleSoloLayer,
+    onResetLocalView: resetLocalView,
+    onJumpFrame: id => { jumpToFrame(id); },
+    onStepFrame: delta => { stepBoardFrame(delta); },
     onChange: () => { chromeDirty = true; },
   });
 
@@ -1650,7 +1865,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // Don't rebuild a panel or drawer the user is typing in.
   const busy = el => el.contains(document.activeElement) && /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName);
   // What every part depends on from the page and the session (a change rebuilds them all, as chromeDirty does).
-  const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.colorPicker, ui.library.length, S.canShare, canMove(), currentBoardTitle ?? "", ui.renamingBoard, serverCanRename, S.eds.board.grid].join("|");
+  const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.colorPicker, ui.library.length, S.canShare, canMove(), currentBoardTitle ?? "", ui.renamingBoard, serverCanRename, S.eds.board.grid, ui.localView.soloLayerId ?? "", ui.localView.activeViewId ?? ""].join("|");
   const notesRowsKey = () => {
     const { notes, labels } = notesInfo(S.eds.notes.doc);
     return JSON.stringify([notes.length, S.mine.size, notes.slice(0, 200).map(e => [e.id, e.text ?? labels.get(e.id)?.text ?? "", e.backgroundColor, e.strokeColor, S.isMine(e.id)])]);
@@ -1660,7 +1875,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const panelKey = () => {
     const B = S.eds.board, ed = S.eds[S.role === "annotator" ? "notes" : S.active], bi = boardInfo(B.doc);
     return JSON.stringify([propsModel(ed), B.sel.size > 0, S.eds.notes.sel.size > 0, B.selected()[0]?.customData?.anim ?? null,
-      bi.spansSig, bi.framesSig, B.frameAt, !!B.play, B.doc.layers, bi.counts, B.activeLayer, ui.colorPicker]);
+      bi.spansSig, bi.framesSig, B.frameAt, !!B.play, B.doc.layers, bi.counts, B.activeLayer, ui.colorPicker, ui.localView, viewsOf(B.doc)]);
   };
   const hudKey = () => {
     const { canUndo, canRedo } = undoRedoState();
@@ -1668,7 +1883,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const sel = ed ? ed.selected().filter(e => !isLabel(e)) : [];
     const selCardUrl = sel.length === 1 ? (parseLinkCardFromElement(sel[0])?.url ?? "") : "";
     const phoneSel = isPhone() ? sel : [];
-    return JSON.stringify([boardInfo(S.eds.board.doc).framesSig, S.eds.board.frameAt, canUndo, canRedo, phoneSel.length, phoneSel[0]?.strokeColor ?? "", selCardUrl]);
+    return JSON.stringify([boardInfo(S.eds.board.doc).framesSig, S.eds.board.frameAt, canUndo, canRedo, phoneSel.length, phoneSel[0]?.strokeColor ?? "", selCardUrl, ui.localView, viewsOf(S.eds.board.doc)]);
   };
   const buildTopbar = () => {
     const root = $("#topbar"), active = document.activeElement;
@@ -1703,7 +1918,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     return root;
   };
   const parts = {
-    topbar: { key: () => `${notesCount()}${S.canShare ? ":share" : ""}${canMove() ? ":move" : ""}:${moveInfo.space?.id ?? ""}:${moveInfo.space?.name ?? ""}:${currentBoardTitle ?? ""}:${ui.renamingBoard ? "1" : "0"}:${S.eds.board.grid}`, build: buildTopbar },
+    topbar: { key: () => `${notesCount()}${S.canShare ? ":share" : ""}${canMove() ? ":move" : ""}:${moveInfo.space?.id ?? ""}:${moveInfo.space?.name ?? ""}:${currentBoardTitle ?? ""}:${ui.renamingBoard ? "1" : "0"}:${S.eds.board.grid}:${ui.localView.soloLayerId ?? ""}:${ui.localView.activeViewId ?? ""}:${viewsOf(S.eds.board.doc).length}`, build: buildTopbar },
     panel: { key: () => (S.role === "viewer" || !ui.panel.open ? "" : panelKey()), build: buildPanel },
     drawer: { key: () => (ui.drawer === "notes" ? notesRowsKey() : ""), build: buildDrawer },
     timeline: { key: () => { const B = S.eds.board, bi = boardInfo(B.doc), t = B.time(); return S.role !== "presenter" ? "" : JSON.stringify([bi.marks, bi.spansSig, bi.dur, !!B.play, B.playLoop, B.playSpeed, B.reducedMotion, B.play ? null : t]); }, build: timeline },

@@ -114,7 +114,8 @@ Excalidraw's `version` and `versionNonce`; `appState` is a shallow patch of `app
 - **An image element's `fileId`**, when set, is exactly 40 lowercase hex characters (a SHA-1); anything else is
   `bad-op`.
 - **`appState` keys are a fixed set**, each checked: `layers` (1–100 of `{id, name, visible, locked, opacity 0–100}`),
-  `grid` (0–1000), `snap` (boolean), `timeline` (`{duration}` up to an hour). Unknown and prototype keys are refused.
+  `views` (0–100 of `{id, name, frameId: string | null, visibleLayers: string[] | null}`), `grid` (0–1000),
+  `snap` (boolean), `timeline` (`{duration}` up to an hour). Unknown and prototype keys are refused.
   Only owners and editors set them, on either stream.
 - **`appState` keys merge by `seq`**: a key takes the value of the highest-`seq` op that set it. `appSeq[stream][key]`
   is that `seq` (0 for a key never set). The room only logs a settings op whose bases are current (below), so the

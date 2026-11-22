@@ -1,0 +1,972 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Plenary — Phone / Chrome-on-iOS Mock (390×844)</title>
+<style>
+  :root {
+    --stage-bg: #E7E4DC;
+    --canvas-bg: #F8F7F4;
+    --canvas-dot: #DFDDD6;
+    --surface: #FFFFFF;
+    --surface-subtle: #F2F0EB;
+    --surface-hover: #EBE8E1;
+    --border: #E3E0D8;
+    --border-strong: #858178;
+    --fg: #18181B;
+    --fg-muted: #52504A;
+    --fg-dim: #625F57;
+    --accent: #3B48E8;
+    --accent-hover: #303CC9;
+    --accent-fg: #FFFFFF;
+    --accent-soft: rgba(59, 72, 232, 0.10);
+    --accent-soft-border: rgba(59, 72, 232, 0.28);
+    --ok: #157F3D;
+    --ok-bg: #ECFDF3;
+    --bad: #C81E1E;
+    --bad-bg: #FEF2F2;
+    --shadow-sm: 0 1px 3px rgba(24, 24, 27, 0.08);
+    --shadow-md: 0 6px 20px rgba(24, 24, 27, 0.12), 0 1px 3px rgba(24, 24, 27, 0.06);
+    --shadow-lg: 0 -8px 32px rgba(24, 24, 27, 0.16);
+    --font: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --note-fill: #FEF3C7;
+    --note-stroke: #D97706;
+    --note-ink: #451A03;
+    --node-fill: #FFFFFF;
+    --node-stroke: #18181B;
+    color-scheme: light;
+  }
+
+  :root[data-theme="dark"] {
+    --stage-bg: #09090B;
+    --canvas-bg: #111113;
+    --canvas-dot: #26262C;
+    --surface: #1A1A1E;
+    --surface-subtle: #232328;
+    --surface-hover: #2C2C33;
+    --border: #2E2E36;
+    --border-strong: #6D6D7A;
+    --fg: #F4F4F5;
+    --fg-muted: #A8A8B3;
+    --fg-dim: #91919E;
+    --accent: #818CF8;
+    --accent-hover: #96A0FA;
+    --accent-fg: #0E0F1A;
+    --accent-soft: rgba(129, 140, 248, 0.15);
+    --accent-soft-border: rgba(129, 140, 248, 0.35);
+    --ok: #4ADE80;
+    --ok-bg: rgba(74, 222, 128, 0.14);
+    --bad: #F87171;
+    --bad-bg: rgba(248, 113, 113, 0.14);
+    --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.05);
+    --shadow-lg: 0 -10px 36px rgba(0, 0, 0, 0.72);
+    --note-fill: #3B2F13;
+    --note-stroke: #F59E0B;
+    --note-ink: #FEF3C7;
+    --node-fill: #1E1E24;
+    --node-stroke: #E4E4E7;
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0;
+    min-height: 100%;
+    font: 14px/1.4 var(--font);
+    color: var(--fg);
+    background: var(--stage-bg);
+    -webkit-font-smoothing: antialiased;
+  }
+  button, input {
+    font: inherit;
+    color: inherit;
+    background: none;
+    border: 0;
+    padding: 0;
+  }
+  button { cursor: pointer; }
+  button:focus-visible, input:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .ico {
+    width: 20px;
+    height: 20px;
+    display: block;
+    flex-shrink: 0;
+    stroke: currentColor;
+    stroke-width: 1.75;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    fill: none;
+  }
+  .ico-18 { width: 18px; height: 18px; }
+  .ico-16 { width: 16px; height: 16px; }
+  .ico-22 { width: 22px; height: 22px; }
+
+  /* ── Desktop Preview Stage ── */
+  .preview-wrap {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    padding: 20px 16px 28px;
+  }
+  .preview-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-radius: 14px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow-sm);
+  }
+  .pc-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--fg-muted);
+    padding: 0 6px 0 4px;
+  }
+  .pc-seg {
+    display: inline-flex;
+    background: var(--surface-subtle);
+    padding: 3px;
+    border-radius: 9px;
+    gap: 2px;
+  }
+  .pc-seg button {
+    height: 30px;
+    padding: 0 11px;
+    border-radius: 7px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--fg-muted);
+  }
+  .pc-seg button.active {
+    background: var(--surface);
+    color: var(--fg);
+    font-weight: 600;
+    box-shadow: var(--shadow-sm);
+  }
+
+  /* ── 390×844 Chrome-on-iOS Viewport Frame ── */
+  .phone-frame {
+    position: relative;
+    width: 390px;
+    height: 844px;
+    border-radius: 46px;
+    background: var(--canvas-bg);
+    border: 10px solid #18181B;
+    box-shadow: 0 28px 70px rgba(0, 0, 0, 0.28), 0 0 0 1px rgba(255, 255, 255, 0.08);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .phone-screen {
+    position: relative;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    background-color: var(--canvas-bg);
+    background-image: radial-gradient(circle, var(--canvas-dot) 1.25px, transparent 1.25px);
+    background-size: 22px 22px;
+    overflow: hidden;
+  }
+
+  /* Simulated iOS status bar + safe-area top */
+  .ios-status {
+    height: 46px;
+    padding: 12px 24px 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--fg);
+    background: var(--surface);
+    position: relative;
+    z-index: 25;
+    flex-shrink: 0;
+  }
+  .ios-notch {
+    width: 112px;
+    height: 26px;
+    border-radius: 999px;
+    background: #09090B;
+    position: absolute;
+    left: 50%;
+    top: 10px;
+    transform: translateX(-50%);
+  }
+
+  /* Compact Mobile Top Bar (48px) */
+  .m-topbar {
+    height: 48px;
+    padding: 0 6px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    z-index: 25;
+    flex-shrink: 0;
+  }
+  .touch-btn {
+    min-width: 44px;
+    min-height: 44px;
+    border-radius: 11px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--fg-muted);
+    transition: background 0.12s, color 0.12s, transform 0.08s;
+  }
+  .touch-btn:active:not(:disabled) { transform: scale(0.95); background: var(--surface-hover); }
+  .touch-btn:disabled { opacity: 0.34; cursor: not-allowed; }
+  .m-title-wrap {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 0 4px;
+  }
+  .m-title {
+    font-size: 14.5px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .live-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background: var(--ok);
+    flex-shrink: 0;
+    box-shadow: 0 0 0 3px var(--ok-bg);
+  }
+  .share-chip {
+    height: 34px;
+    padding: 0 12px;
+    border-radius: 999px;
+    background: var(--accent);
+    color: var(--accent-fg);
+    font-size: 12.5px;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin: 0 2px;
+  }
+
+  /* Canvas Area */
+  .m-canvas {
+    position: relative;
+    flex: 1;
+    overflow: hidden;
+  }
+  .m-canvas svg.board-svg {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+  }
+
+  /* Contextual Selection Action Pill */
+  .context-pill {
+    position: absolute;
+    left: 50%;
+    top: 238px;
+    transform: translateX(-50%);
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 4px;
+    border-radius: 999px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow-md);
+  }
+  .context-pill[hidden] { display: none; }
+  .swatch-trigger {
+    width: 22px;
+    height: 22px;
+    border-radius: 999px;
+    border: 2px solid var(--surface);
+    box-shadow: 0 0 0 1.5px var(--border-strong);
+  }
+  .ctx-sep {
+    width: 1px;
+    height: 22px;
+    background: var(--border);
+    margin: 0 2px;
+  }
+  .ctx-danger { color: var(--bad); }
+
+  /* ── ALWAYS-REACHABLE THUMB ZONE ROW (Undo/Redo Left + Zoom Right) ── */
+  .thumb-row {
+    position: absolute;
+    left: 12px;
+    right: 12px;
+    bottom: 92px;
+    z-index: 22;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    pointer-events: none;
+  }
+  .thumb-pill {
+    pointer-events: auto;
+    display: inline-flex;
+    align-items: center;
+    padding: 3px;
+    border-radius: 14px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow-md);
+  }
+  .thumb-pill .touch-btn {
+    min-width: 44px;
+    min-height: 44px;
+    color: var(--fg);
+  }
+  .thumb-div {
+    width: 1px;
+    height: 22px;
+    background: var(--border);
+  }
+  .zoom-pill-btn {
+    min-height: 44px;
+    padding: 0 12px;
+    font: 600 12.5px/1 var(--mono);
+    color: var(--fg-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .viewer-banner {
+    pointer-events: auto;
+    height: 44px;
+    padding: 0 14px;
+    border-radius: 999px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow-md);
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12.5px;
+    color: var(--fg-muted);
+  }
+  .viewer-banner strong { color: var(--accent); font-weight: 600; }
+
+  /* ── Floating Bottom Tool Dock ── */
+  .bottom-dock {
+    position: absolute;
+    left: 12px;
+    right: 12px;
+    bottom: 26px;
+    z-index: 24;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 5px 6px;
+    border-radius: 18px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow-md);
+  }
+  .dock-btn {
+    flex: 1;
+    min-width: 44px;
+    min-height: 46px;
+    border-radius: 13px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    color: var(--fg-muted);
+    font-size: 10px;
+    font-weight: 500;
+  }
+  .dock-btn.active {
+    background: var(--accent);
+    color: var(--accent-fg);
+    font-weight: 600;
+  }
+
+  /* iOS Home Indicator */
+  .ios-home {
+    position: absolute;
+    left: 50%;
+    bottom: 7px;
+    transform: translateX(-50%);
+    width: 132px;
+    height: 5px;
+    border-radius: 999px;
+    background: var(--fg);
+    opacity: 0.22;
+    z-index: 40;
+    pointer-events: none;
+  }
+
+  /* ── Swipe-to-Dismiss Bottom Sheet ── */
+  .sheet-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.24);
+    z-index: 28;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+  }
+  .sheet-backdrop.open { opacity: 1; pointer-events: auto; }
+
+  .bottom-sheet {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    max-height: 68%;
+    z-index: 30;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    border-radius: 22px 22px 0 0;
+    box-shadow: var(--shadow-lg);
+    display: flex;
+    flex-direction: column;
+    transform: translateY(104%);
+    transition: transform 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+    padding-bottom: 22px;
+  }
+  .bottom-sheet.open { transform: translateY(0); }
+
+  .sheet-handle {
+    height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: grab;
+    flex-shrink: 0;
+  }
+  .sheet-grab {
+    width: 38px;
+    height: 4px;
+    border-radius: 999px;
+    background: var(--border-strong);
+    opacity: 0.55;
+  }
+  .sheet-tabs {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 4px;
+    padding: 0 14px 10px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .sheet-tab {
+    min-height: 40px;
+    border-radius: 10px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--fg-muted);
+    background: var(--surface-subtle);
+  }
+  .sheet-tab.active {
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+  .sheet-body {
+    overflow-y: auto;
+    padding: 14px 16px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .sheet-pane[hidden] { display: none; }
+
+  /* Mobile Custom Color Picker inside Sheet */
+  .m-sl-box {
+    position: relative;
+    height: 112px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background-color: hsl(235, 100%, 50%);
+    background-image: linear-gradient(to top, #000, transparent), linear-gradient(to right, #fff, transparent);
+    touch-action: none;
+  }
+  .m-sl-thumb {
+    position: absolute;
+    width: 20px;
+    height: 20px;
+    border-radius: 999px;
+    border: 2.5px solid #fff;
+    box-shadow: 0 0 0 1.5px rgba(0,0,0,0.45);
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+  }
+  .m-range {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 14px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+  }
+  .m-range.hue {
+    background: linear-gradient(to right, #ef4444, #f59e0b, #22c55e, #06b6d4, #3b82f6, #a855f7, #ec4899, #ef4444);
+  }
+  .m-range.alpha {
+    background-image: linear-gradient(to right, transparent, var(--m-solid, #3B48E8)), repeating-conic-gradient(#d4d4d8 0% 25%, #fff 0% 50%);
+    background-size: 100% 100%, 10px 10px;
+  }
+  .m-range::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 22px;
+    height: 22px;
+    border-radius: 999px;
+    background: #fff;
+    border: 2px solid var(--fg);
+    box-shadow: var(--shadow-sm);
+  }
+  /* 16px font-size prevents iOS Chrome auto-zoom */
+  .ios-input {
+    width: 100%;
+    min-height: 44px;
+    padding: 0 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--surface-subtle);
+    font-size: 16px;
+    color: var(--fg);
+  }
+  .m-swatches {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .m-sw {
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
+    border: 1px solid rgba(128,128,128,0.28);
+  }
+  .m-sw.active { outline: 2.5px solid var(--accent); outline-offset: 2px; }
+
+  .note-item {
+    padding: 12px;
+    border-radius: 12px;
+    background: var(--surface-subtle);
+    border: 1px solid var(--border);
+    display: flex;
+    gap: 10px;
+  }
+  .note-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 3px;
+    margin-top: 5px;
+    flex-shrink: 0;
+  }
+  .note-meta { font-size: 12px; color: var(--fg-dim); margin-top: 4px; }
+
+  .m-toast {
+    position: absolute;
+    top: 106px;
+    left: 50%;
+    transform: translateX(-50%) translateY(-6px);
+    z-index: 35;
+    background: var(--fg);
+    color: var(--surface);
+    padding: 7px 14px;
+    border-radius: 999px;
+    font-size: 12.5px;
+    font-weight: 500;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.16s, transform 0.16s;
+  }
+  .m-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  /* Full-bleed when actually opened on a real phone */
+  @media (max-width: 440px) {
+    .preview-wrap { padding: 0; gap: 0; }
+    .preview-controls { display: none; }
+    .phone-frame { width: 100vw; height: 100dvh; border: 0; border-radius: 0; box-shadow: none; }
+    .ios-status, .ios-home { display: none; }
+  }
+</style>
+</head>
+<body>
+<div class="preview-wrap">
+  <!-- Interactive Review Controls (Desktop Preview Stage) -->
+  <div class="preview-controls" aria-label="Mock preview controls">
+    <span class="pc-label">390×844 Chrome on iOS</span>
+    <div class="pc-seg" id="themeSeg">
+      <button class="active" data-val="light">Light</button>
+      <button data-val="dark">Dark</button>
+    </div>
+    <div class="pc-seg" id="modeSeg">
+      <button class="active" data-val="presenter">Editor</button>
+      <button data-val="viewer">Viewer</button>
+    </div>
+    <div class="pc-seg" id="sheetSeg">
+      <button class="active" data-val="closed">Canvas</button>
+      <button data-val="style">Style Sheet</button>
+      <button data-val="notes">Notes</button>
+      <button data-val="comments">Comments</button>
+    </div>
+  </div>
+
+  <!-- 390×844 Phone Viewport -->
+  <div class="phone-frame">
+    <div class="phone-screen">
+      <!-- iOS Status Bar / Safe Area Top -->
+      <div class="ios-status">
+        <span>9:41</span>
+        <div class="ios-notch"></div>
+        <span style="display:flex;align-items:center;gap:5px;font-size:11px;">5G · 92%</span>
+      </div>
+
+      <!-- Compact Top Bar -->
+      <header class="m-topbar">
+        <a class="touch-btn" href="mock-admin.html" aria-label="Back to Boards">
+          <svg class="ico" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>
+        </a>
+        <div class="m-title-wrap">
+          <span class="live-dot" title="Connected"></span>
+          <span class="m-title">Q3 Sync Architecture</span>
+        </div>
+        <button class="share-chip" onclick="mToast('Share sheet opened')">
+          <svg class="ico ico-16" viewBox="0 0 24 24"><path d="M4 12v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg>
+          Share
+        </button>
+        <button class="touch-btn" aria-label="More options" onclick="openSheet('style')">
+          <svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.4" fill="currentColor"/><circle cx="12" cy="12" r="1.4" fill="currentColor"/><circle cx="12" cy="19" r="1.4" fill="currentColor"/></svg>
+        </button>
+      </header>
+
+      <!-- Mobile Canvas -->
+      <div class="m-canvas">
+        <svg class="board-svg" viewBox="0 0 390 660" aria-label="Mobile canvas diagram">
+          <defs>
+            <marker id="mArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 1 2 L 8 5 L 1 8" fill="none" stroke="var(--fg-muted)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <!-- Connector -->
+          <path d="M 195 196 L 195 314" fill="none" stroke="var(--fg-muted)" stroke-width="1.8" marker-end="url(#mArrow)"/>
+          <path d="M 195 404 L 195 456" fill="none" stroke="var(--fg-muted)" stroke-width="1.8" marker-end="url(#mArrow)"/>
+
+          <!-- Selected Shape -->
+          <g id="mSelectedGroup">
+            <rect id="mSelectedRect" x="85" y="92" width="220" height="102" rx="16" fill="rgba(59, 72, 232, 0.12)" stroke="#3B48E8" stroke-width="2.2"/>
+            <text x="195" y="138" text-anchor="middle" fill="var(--fg)" font-size="15" font-weight="600">Durable Room</text>
+            <text x="195" y="159" text-anchor="middle" fill="var(--fg-muted)" font-size="12">WebSocket Fan-out</text>
+            <!-- Handles (hidden in viewer mode) -->
+            <g id="mHandles">
+              <rect x="79" y="86" width="232" height="114" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.25" stroke-dasharray="4 3"/>
+              <circle cx="79" cy="86" r="5" fill="var(--surface)" stroke="var(--accent)" stroke-width="2"/>
+              <circle cx="311" cy="86" r="5" fill="var(--surface)" stroke="var(--accent)" stroke-width="2"/>
+              <circle cx="79" cy="200" r="5" fill="var(--surface)" stroke="var(--accent)" stroke-width="2"/>
+              <circle cx="311" cy="200" r="5" fill="var(--surface)" stroke="var(--accent)" stroke-width="2"/>
+            </g>
+          </g>
+
+          <!-- Secondary Node -->
+          <g>
+            <rect x="95" y="320" width="200" height="82" rx="14" fill="var(--node-fill)" stroke="var(--node-stroke)" stroke-width="1.8"/>
+            <text x="195" y="357" text-anchor="middle" fill="var(--fg)" font-size="14" font-weight="600">R2 Snapshots</text>
+            <text x="195" y="376" text-anchor="middle" fill="var(--fg-muted)" font-size="11.5">Versioned History</text>
+          </g>
+
+          <!-- Sticky Note -->
+          <g transform="translate(105, 462)">
+            <rect width="180" height="74" rx="10" fill="var(--note-fill)" stroke="var(--note-stroke)" stroke-width="1.25"/>
+            <text x="14" y="28" fill="var(--note-ink)" font-size="12" font-weight="600">Undo / Redo Thumb Zone</text>
+            <text x="14" y="48" fill="var(--note-ink)" font-size="11" opacity="0.88">Always visible · 44×44px</text>
+          </g>
+        </svg>
+
+        <!-- Contextual Floating Action Pill (when shape selected in Editor mode) -->
+        <div class="context-pill" id="contextPill" aria-label="Selected shape actions">
+          <button class="touch-btn" id="ctxColorBtn" title="Color & Style" aria-label="Change color" onclick="openSheet('style')">
+            <span class="swatch-trigger" id="ctxSwatch" style="background:#3B48E8;"></span>
+          </button>
+          <div class="ctx-sep"></div>
+          <button class="touch-btn" title="Duplicate" aria-label="Duplicate shape" onclick="mToast('Duplicated shape')">
+            <svg class="ico ico-18" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          </button>
+          <button class="touch-btn ctx-danger" title="Delete" aria-label="Delete shape" onclick="mToast('Deleted — tap Undo below to restore')">
+            <svg class="ico ico-18" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+          </button>
+        </div>
+
+        <!-- LOWER THUMB ZONE: Always-Reachable Undo / Redo Pill (Left) + Zoom Pill (Right) -->
+        <div class="thumb-row">
+          <div class="thumb-pill" id="undoRedoPill" aria-label="Undo and Redo">
+            <button class="touch-btn" id="mUndo" aria-label="Undo">
+              <svg class="ico" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg>
+            </button>
+            <div class="thumb-div"></div>
+            <button class="touch-btn" id="mRedo" aria-label="Redo" disabled>
+              <svg class="ico" viewBox="0 0 24 24"><path d="M15 14l5-5-5-5"/><path d="M4 20v-7a4 4 0 0 1 4-4h12"/></svg>
+            </button>
+          </div>
+
+          <div class="viewer-banner" id="viewerBanner" hidden>
+            <span>Viewing only</span>
+            <span>·</span>
+            <button onclick="mToast('Edit request sent to Maya')"><strong>Request edit</strong></button>
+          </div>
+
+          <div class="thumb-pill">
+            <button class="zoom-pill-btn" id="mZoomBtn" aria-label="Reset zoom">100%</button>
+          </div>
+        </div>
+
+        <!-- Floating Bottom Tool Dock -->
+        <nav class="bottom-dock" id="bottomDock" aria-label="Mobile drawing tools">
+          <button class="dock-btn active" data-mtool="Select">
+            <svg class="ico" viewBox="0 0 24 24"><path d="M5 4l6.5 16 2.5-6 6-2.5L5 4z"/></svg>
+            <span>Select</span>
+          </button>
+          <button class="dock-btn" data-mtool="Pen">
+            <svg class="ico" viewBox="0 0 24 24"><path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 3 21l.5-4.5L17 3z"/></svg>
+            <span>Draw</span>
+          </button>
+          <button class="dock-btn" data-mtool="Shapes">
+            <svg class="ico" viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="14" rx="2.5"/></svg>
+            <span>Shapes</span>
+          </button>
+          <button class="dock-btn" data-mtool="Text">
+            <svg class="ico" viewBox="0 0 24 24"><path d="M5 6V4h14v2"/><line x1="12" y1="4" x2="12" y2="20"/><line x1="9" y1="20" x2="15" y2="20"/></svg>
+            <span>Text</span>
+          </button>
+          <button class="dock-btn" data-mtool="Notes" onclick="openSheet('notes')">
+            <svg class="ico" viewBox="0 0 24 24"><path d="M5 4h14a1 1 0 0 1 1 1v10l-5 5H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/><path d="M15 20v-5h5"/></svg>
+            <span>Notes</span>
+          </button>
+          <button class="dock-btn" data-mtool="Comments" onclick="openSheet('comments')">
+            <svg class="ico" viewBox="0 0 24 24"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5c-1.4 0-2.7-.3-3.9-.9L3 21l1.9-5.6A8.5 8.5 0 1 1 21 11.5z"/></svg>
+            <span>Threads</span>
+          </button>
+        </nav>
+
+        <!-- Swipe-to-Dismiss Bottom Sheet -->
+        <div class="sheet-backdrop" id="sheetBackdrop" onclick="closeSheet()"></div>
+        <section class="bottom-sheet" id="bottomSheet" aria-label="Inspector and threads sheet">
+          <div class="sheet-handle" id="sheetHandle" title="Swipe or tap to dismiss" onclick="closeSheet()">
+            <div class="sheet-grab"></div>
+          </div>
+          <div class="sheet-tabs" id="sheetTabs">
+            <button class="sheet-tab active" data-tab="style">Style</button>
+            <button class="sheet-tab" data-tab="notes">Notes (2)</button>
+            <button class="sheet-tab" data-tab="comments">Threads (1)</button>
+          </div>
+          <div class="sheet-body">
+            <!-- Style & Custom Color Picker Pane -->
+            <div class="sheet-pane" data-pane="style">
+              <div style="display:flex;flex-direction:column;gap:12px;">
+                <div class="m-sl-box" id="mSlBox">
+                  <div class="m-sl-thumb" id="mSlThumb" style="left:76%;top:18%;"></div>
+                </div>
+                <input type="range" class="m-range hue" id="mHue" min="0" max="360" value="235" aria-label="Hue">
+                <input type="range" class="m-range alpha" id="mAlpha" min="10" max="100" value="100" aria-label="Opacity">
+                <div style="display:flex;gap:8px;align-items:center;">
+                  <input class="ios-input" id="mHexInput" value="#3B48E8" style="font-family:var(--mono);" aria-label="Hex color">
+                  <button class="touch-btn" style="border:1px solid var(--border);background:var(--surface-subtle);padding:0 14px;font-weight:600;color:var(--fg);" onclick="closeSheet()">Done</button>
+                </div>
+                <div class="m-swatches" id="mSwatches">
+                  <button class="m-sw active" data-hex="#3B48E8" style="background:#3B48E8;"></button>
+                  <button class="m-sw" data-hex="#18181B" style="background:#18181B;"></button>
+                  <button class="m-sw" data-hex="#157F3D" style="background:#157F3D;"></button>
+                  <button class="m-sw" data-hex="#EA580C" style="background:#EA580C;"></button>
+                  <button class="m-sw" data-hex="#C026D3" style="background:#C026D3;"></button>
+                  <button class="m-sw" data-hex="#0891B2" style="background:#0891B2;"></button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Notes Pane -->
+            <div class="sheet-pane" data-pane="notes" hidden>
+              <div style="display:flex;flex-direction:column;gap:10px;">
+                <div class="note-item">
+                  <span class="note-dot" style="background:#D97706;"></span>
+                  <div>
+                    <div style="font-weight:600;">Undo / Redo Thumb Zone</div>
+                    <div style="color:var(--fg-muted);font-size:13px;">Keep Undo/Redo visible in lower-left thumb zone with 44×44px targets.</div>
+                    <div class="note-meta">Maya · 4m ago</div>
+                  </div>
+                </div>
+                <div class="note-item">
+                  <span class="note-dot" style="background:#0891B2;"></span>
+                  <div>
+                    <div style="font-weight:600;">Offline CRDT Queue</div>
+                    <div style="color:var(--fg-muted);font-size:13px;">Flush pending strokes automatically on reconnect.</div>
+                    <div class="note-meta">Dev · 18m ago</div>
+                  </div>
+                </div>
+                <input class="ios-input" placeholder="Add a quick sticky note…" onkeydown="if(event.key==='Enter'){mToast('Added sticky note');this.value='';}">
+              </div>
+            </div>
+
+            <!-- Comments Pane -->
+            <div class="sheet-pane" data-pane="comments" hidden>
+              <div style="display:flex;flex-direction:column;gap:12px;">
+                <div class="note-item" style="flex-direction:column;gap:6px;">
+                  <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <strong>Maya · Durable Room</strong>
+                    <span style="font-size:12px;color:var(--fg-dim);">6m ago</span>
+                  </div>
+                  <div style="color:var(--fg-muted);font-size:13.5px;">Should fan-out coalesce cursor frames at 30fps on mobile connections?</div>
+                </div>
+                <div class="note-item" style="flex-direction:column;gap:6px;">
+                  <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <strong>Dev</strong>
+                    <span style="font-size:12px;color:var(--fg-dim);">2m ago</span>
+                  </div>
+                  <div style="color:var(--fg-muted);font-size:13.5px;">Yes — batching at 33ms cuts battery wakeups in half.</div>
+                </div>
+                <input class="ios-input" placeholder="Reply to thread…" onkeydown="if(event.key==='Enter'){mToast('Reply posted');this.value='';}">
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="m-toast" id="mToastEl"></div>
+      <div class="ios-home"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const root = document.documentElement;
+  const mToastEl = document.getElementById('mToastEl');
+  let tTimer;
+  function mToast(msg) {
+    mToastEl.textContent = msg;
+    mToastEl.classList.add('show');
+    clearTimeout(tTimer);
+    tTimer = setTimeout(() => mToastEl.classList.remove('show'), 1800);
+  }
+
+  // Preview stage controls
+  document.getElementById('themeSeg').addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    root.dataset.theme = b.dataset.val;
+    document.querySelectorAll('#themeSeg button').forEach(x => x.classList.toggle('active', x === b));
+  });
+
+  document.getElementById('modeSeg').addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    const isViewer = b.dataset.val === 'viewer';
+    document.querySelectorAll('#modeSeg button').forEach(x => x.classList.toggle('active', x === b));
+    document.getElementById('contextPill').hidden = isViewer;
+    document.getElementById('undoRedoPill').style.display = isViewer ? 'none' : 'inline-flex';
+    document.getElementById('viewerBanner').hidden = !isViewer;
+    document.getElementById('mHandles').style.display = isViewer ? 'none' : '';
+    document.getElementById('bottomDock').style.opacity = isViewer ? '0.45' : '1';
+    document.getElementById('bottomDock').style.pointerEvents = isViewer ? 'none' : 'auto';
+  });
+
+  document.getElementById('sheetSeg').addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    if (b.dataset.val === 'closed') closeSheet();
+    else openSheet(b.dataset.val);
+  });
+
+  // Bottom sheet state
+  const sheet = document.getElementById('bottomSheet');
+  const backdrop = document.getElementById('sheetBackdrop');
+  function syncSheetSeg(val) {
+    document.querySelectorAll('#sheetSeg button').forEach(x => x.classList.toggle('active', x.dataset.val === val));
+  }
+  function openSheet(tab) {
+    sheet.classList.add('open');
+    backdrop.classList.add('open');
+    selectSheetTab(tab || 'style');
+    syncSheetSeg(tab || 'style');
+  }
+  function closeSheet() {
+    sheet.classList.remove('open');
+    backdrop.classList.remove('open');
+    syncSheetSeg('closed');
+  }
+  function selectSheetTab(tab) {
+    document.querySelectorAll('.sheet-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+    document.querySelectorAll('.sheet-pane').forEach(p => p.hidden = p.dataset.pane !== tab);
+    syncSheetSeg(tab);
+  }
+  document.getElementById('sheetTabs').addEventListener('click', (e) => {
+    const b = e.target.closest('.sheet-tab'); if (!b) return;
+    selectSheetTab(b.dataset.tab);
+  });
+
+  // Undo / Redo live demo
+  let uStack = 5, rStack = 0;
+  const mUndo = document.getElementById('mUndo');
+  const mRedo = document.getElementById('mRedo');
+  function syncUR() { mUndo.disabled = uStack === 0; mRedo.disabled = rStack === 0; }
+  mUndo.addEventListener('click', () => { if (uStack > 0) { uStack--; rStack++; syncUR(); mToast('Undid last stroke'); } });
+  mRedo.addEventListener('click', () => { if (rStack > 0) { rStack--; uStack++; syncUR(); mToast('Redid stroke'); } });
+
+  // Dock active toggle
+  document.getElementById('bottomDock').addEventListener('click', (e) => {
+    const b = e.target.closest('.dock-btn'); if (!b) return;
+    document.querySelectorAll('.dock-btn').forEach(x => x.classList.toggle('active', x === b));
+    if (b.dataset.mtool !== 'Notes' && b.dataset.mtool !== 'Comments') mToast(`Tool: ${b.dataset.mtool}`);
+  });
+
+  // Mobile Color Picker live sync
+  const mRect = document.getElementById('mSelectedRect');
+  const ctxSwatch = document.getElementById('ctxSwatch');
+  const mHexInput = document.getElementById('mHexInput');
+  const mHue = document.getElementById('mHue');
+  const mAlpha = document.getElementById('mAlpha');
+  const mSlBox = document.getElementById('mSlBox');
+  const mSlThumb = document.getElementById('mSlThumb');
+
+  function applyMobileColor(hex, alpha = 100) {
+    mHexInput.value = hex.toUpperCase();
+    ctxSwatch.style.background = hex;
+    mRect.setAttribute('stroke', hex);
+    mRect.setAttribute('fill', hex + '22');
+    mRect.setAttribute('stroke-opacity', (alpha / 100).toFixed(2));
+    mAlpha.style.setProperty('--m-solid', hex);
+  }
+  document.getElementById('mSwatches').addEventListener('click', (e) => {
+    const sw = e.target.closest('.m-sw'); if (!sw) return;
+    document.querySelectorAll('.m-sw').forEach(s => s.classList.toggle('active', s === sw));
+    applyMobileColor(sw.dataset.hex, +mAlpha.value);
+  });
+  mHue.addEventListener('input', () => {
+    const h = +mHue.value;
+    mSlBox.style.backgroundColor = `hsl(${h}, 100%, 50%)`;
+    const color = hslToHex(h, 78, 54);
+    applyMobileColor(color, +mAlpha.value);
+  });
+  mAlpha.addEventListener('input', () => applyMobileColor(mHexInput.value, +mAlpha.value));
+  function hslToHex(h, s, l) {
+    s /= 100; l /= 100;
+    const k = n => (n + h / 30) % 12;
+    const a = s * Math.min(l, 1 - l);
+    const f = n => Math.round(255 * (l - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1))));
+    return '#' + [f(0), f(8), f(4)].map(x => x.toString(16).padStart(2, '0')).join('').toUpperCase();
+  }
+</script>
+</body>
+</html>

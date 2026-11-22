@@ -1,0 +1,1373 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plenary — Desktop Canvas Mock</title>
+<style>
+  :root {
+    --canvas-bg: #F8F7F4;
+    --canvas-dot: #DFDDD6;
+    --surface: #FFFFFF;
+    --surface-subtle: #F2F0EB;
+    --surface-hover: #EBE8E1;
+    --border: #E3E0D8;
+    --border-strong: #858178;
+    --fg: #18181B;
+    --fg-muted: #52504A;
+    --fg-dim: #625F57;
+    --accent: #3B48E8;
+    --accent-hover: #303CC9;
+    --accent-fg: #FFFFFF;
+    --accent-soft: rgba(59, 72, 232, 0.10);
+    --accent-soft-border: rgba(59, 72, 232, 0.28);
+    --ok: #157F3D;
+    --ok-bg: #ECFDF3;
+    --warn: #B45309;
+    --warn-bg: #FFFBEB;
+    --bad: #C81E1E;
+    --bad-bg: #FEF2F2;
+    --shadow-sm: 0 1px 2px rgba(24, 24, 27, 0.05), 0 1px 3px rgba(24, 24, 27, 0.06);
+    --shadow-md: 0 4px 16px rgba(24, 24, 27, 0.08), 0 1px 3px rgba(24, 24, 27, 0.06);
+    --shadow-lg: 0 16px 40px rgba(24, 24, 27, 0.14), 0 2px 6px rgba(24, 24, 27, 0.08);
+    --font: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --note-fill: #FEF3C7;
+    --note-stroke: #D97706;
+    --note-ink: #451A03;
+    --node-fill: #FFFFFF;
+    --node-stroke: #18181B;
+    color-scheme: light;
+  }
+
+  :root[data-theme="dark"] {
+    --canvas-bg: #111113;
+    --canvas-dot: #26262C;
+    --surface: #1A1A1E;
+    --surface-subtle: #232328;
+    --surface-hover: #2C2C33;
+    --border: #2E2E36;
+    --border-strong: #6D6D7A;
+    --fg: #F4F4F5;
+    --fg-muted: #A8A8B3;
+    --fg-dim: #91919E;
+    --accent: #818CF8;
+    --accent-hover: #96A0FA;
+    --accent-fg: #0E0F1A;
+    --accent-soft: rgba(129, 140, 248, 0.14);
+    --accent-soft-border: rgba(129, 140, 248, 0.35);
+    --ok: #4ADE80;
+    --ok-bg: rgba(74, 222, 128, 0.14);
+    --warn: #FBBF24;
+    --warn-bg: rgba(251, 191, 36, 0.14);
+    --bad: #F87171;
+    --bad-bg: rgba(248, 113, 113, 0.14);
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+    --shadow-md: 0 6px 20px rgba(0, 0, 0, 0.48), 0 0 0 1px rgba(255, 255, 255, 0.04);
+    --shadow-lg: 0 20px 48px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(255, 255, 255, 0.06);
+    --note-fill: #3B2F13;
+    --note-stroke: #F59E0B;
+    --note-ink: #FEF3C7;
+    --node-fill: #1E1E24;
+    --node-stroke: #E4E4E7;
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    font: 13px/1.4 var(--font);
+    color: var(--fg);
+    background: var(--canvas-bg);
+    -webkit-font-smoothing: antialiased;
+  }
+  button, input {
+    font: inherit;
+    color: inherit;
+    background: none;
+    border: 0;
+    padding: 0;
+  }
+  button { cursor: pointer; }
+  button:focus-visible, input:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .ico {
+    width: 18px;
+    height: 18px;
+    display: block;
+    flex-shrink: 0;
+    stroke: currentColor;
+    stroke-width: 1.75;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    fill: none;
+  }
+  .ico-20 { width: 20px; height: 20px; }
+  .ico-16 { width: 16px; height: 16px; }
+  .ico-14 { width: 14px; height: 14px; }
+
+  /* ── Canvas Stage ── */
+  .stage {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+    background-color: var(--canvas-bg);
+    background-image: radial-gradient(circle, var(--canvas-dot) 1.25px, transparent 1.25px);
+    background-size: 24px 24px;
+    overflow: hidden;
+  }
+
+  .world {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    transition: transform 0.16s ease-out;
+    transform-origin: 48% 50%;
+  }
+
+  /* ── Floating Chrome Surfaces ── */
+  .island {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow-md);
+    border-radius: 12px;
+  }
+
+  /* ── Top Bar Islands ── */
+  .top-left {
+    position: absolute;
+    top: 14px;
+    left: 14px;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 44px;
+    padding: 0 12px 0 10px;
+  }
+  .brand-btn {
+    width: 28px;
+    height: 28px;
+    border-radius: 7px;
+    display: grid;
+    place-items: center;
+    background: var(--accent);
+    color: var(--accent-fg);
+  }
+  .crumb-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 6px;
+    border-radius: 6px;
+    color: var(--fg-muted);
+    font-weight: 500;
+    text-decoration: none;
+  }
+  .crumb-link:hover { background: var(--surface-hover); color: var(--fg); }
+  .crumb-sep { color: var(--fg-dim); font-size: 12px; }
+  .board-title {
+    font-size: 13.5px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    padding: 4px 7px;
+    border-radius: 6px;
+    color: var(--fg);
+  }
+  .board-title:hover { background: var(--surface-hover); }
+  .saved-badge {
+    font-size: 11px;
+    color: var(--fg-dim);
+    padding-left: 2px;
+  }
+
+  .top-right {
+    position: absolute;
+    top: 14px;
+    right: 14px;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 44px;
+    padding: 0 8px 0 12px;
+  }
+  .collab-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .avatar-stack {
+    display: flex;
+    align-items: center;
+  }
+  .avatar {
+    width: 26px;
+    height: 26px;
+    border-radius: 999px;
+    display: grid;
+    place-items: center;
+    font-size: 10.5px;
+    font-weight: 700;
+    color: #fff;
+    border: 2px solid var(--surface);
+    margin-left: -7px;
+    position: relative;
+  }
+  .avatar:first-child { margin-left: 0; }
+  .avatar.more {
+    background: var(--surface-subtle);
+    color: var(--fg-muted);
+    width: auto;
+    padding: 0 7px;
+    font-size: 11px;
+  }
+  .viewer-count {
+    font-size: 12px;
+    color: var(--fg-muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .viewer-count strong { color: var(--fg); font-weight: 600; }
+
+  .divider-v {
+    width: 1px;
+    height: 20px;
+    background: var(--border);
+  }
+
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 28px;
+    padding: 0 10px;
+    border-radius: 999px;
+    background: var(--ok-bg);
+    color: var(--ok);
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .status-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    background: currentColor;
+  }
+
+  .btn {
+    height: 30px;
+    padding: 0 12px;
+    border-radius: 8px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    font-size: 12.5px;
+    font-weight: 600;
+    transition: background 0.12s, border-color 0.12s, transform 0.08s;
+  }
+  .btn:active { transform: scale(0.98); }
+  .btn-primary {
+    background: var(--accent);
+    color: var(--accent-fg);
+  }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-ghost {
+    color: var(--fg-muted);
+    padding: 0 8px;
+  }
+  .btn-ghost:hover { background: var(--surface-hover); color: var(--fg); }
+  .btn-icon {
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    border-radius: 8px;
+    color: var(--fg-muted);
+  }
+  .btn-icon:hover { background: var(--surface-hover); color: var(--fg); }
+
+  /* ── Left Floating Tool Rail ── */
+  .tool-rail {
+    position: absolute;
+    left: 14px;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+    padding: 6px;
+    border-radius: 14px;
+  }
+  .tool-sep {
+    width: 24px;
+    height: 1px;
+    background: var(--border);
+    margin: 3px 0;
+  }
+  .tool-btn {
+    position: relative;
+    width: 36px;
+    height: 36px;
+    border-radius: 9px;
+    display: grid;
+    place-items: center;
+    color: var(--fg-muted);
+    transition: background 0.12s, color 0.12s;
+  }
+  .tool-btn:hover {
+    background: var(--surface-hover);
+    color: var(--fg);
+  }
+  .tool-btn.active {
+    background: var(--accent);
+    color: var(--accent-fg);
+  }
+  .tool-btn .tip {
+    position: absolute;
+    left: calc(100% + 10px);
+    top: 50%;
+    transform: translateY(-50%) translateX(-4px);
+    background: var(--fg);
+    color: var(--surface);
+    padding: 4px 8px;
+    border-radius: 6px;
+    font-size: 11.5px;
+    font-weight: 500;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.12s, transform 0.12s;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    box-shadow: var(--shadow-sm);
+  }
+  .tool-btn .tip kbd {
+    font: 10px/1 var(--mono);
+    opacity: 0.72;
+    padding: 2px 4px;
+    border-radius: 4px;
+    background: rgba(128, 128, 128, 0.25);
+  }
+  .tool-btn:hover .tip {
+    opacity: 1;
+    transform: translateY(-50%) translateX(0);
+  }
+
+  /* ── Right Floating Inspector ── */
+  .inspector {
+    position: absolute;
+    top: 70px;
+    right: 14px;
+    width: 276px;
+    max-height: calc(100vh - 90px);
+    overflow-y: auto;
+    z-index: 20;
+    border-radius: 14px;
+    display: flex;
+    flex-direction: column;
+  }
+  .insp-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 14px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .insp-title {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12.5px;
+    font-weight: 600;
+  }
+  .insp-title .tag {
+    font-size: 10.5px;
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: 5px;
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+  .insp-sec {
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .insp-sec:last-child { border-bottom: 0; }
+  .sec-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .eyebrow {
+    font-size: 10.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--fg-dim);
+  }
+
+  .seg-control {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2px;
+    padding: 2px;
+    border-radius: 8px;
+    background: var(--surface-subtle);
+  }
+  .seg-control button {
+    height: 26px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--fg-muted);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+  }
+  .seg-control button.active {
+    background: var(--surface);
+    color: var(--fg);
+    font-weight: 600;
+    box-shadow: var(--shadow-sm);
+  }
+  .mini-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 3px;
+    border: 1px solid rgba(128,128,128,0.35);
+  }
+
+  /* Custom Color Picker */
+  .sl-box {
+    position: relative;
+    width: 100%;
+    height: 124px;
+    border-radius: 10px;
+    cursor: crosshair;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    background-color: hsl(235, 80%, 57%);
+    background-image:
+      linear-gradient(to top, #000, transparent),
+      linear-gradient(to right, #fff, transparent);
+    user-select: none;
+  }
+  .sl-thumb {
+    position: absolute;
+    width: 14px;
+    height: 14px;
+    border-radius: 999px;
+    border: 2px solid #fff;
+    box-shadow: 0 0 0 1.5px rgba(0, 0, 0, 0.45), 0 2px 5px rgba(0,0,0,0.3);
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+  }
+
+  .slider-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .eyedrop-btn {
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--surface-subtle);
+    display: grid;
+    place-items: center;
+    color: var(--fg-muted);
+    flex-shrink: 0;
+  }
+  .eyedrop-btn:hover { background: var(--surface-hover); color: var(--fg); }
+  .sliders-col {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .color-range {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 10px;
+    border-radius: 999px;
+    outline: none;
+    cursor: pointer;
+    border: 1px solid var(--border);
+  }
+  .color-range.hue {
+    background: linear-gradient(to right, #ef4444, #f59e0b, #22c55e, #06b6d4, #3b82f6, #a855f7, #ec4899, #ef4444);
+  }
+  .color-range.alpha {
+    background-image:
+      linear-gradient(to right, transparent, var(--picker-solid, #3B48E8)),
+      repeating-conic-gradient(#d4d4d8 0% 25%, #ffffff 0% 50%);
+    background-size: 100% 100%, 8px 8px;
+  }
+  .color-range::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 999px;
+    background: #fff;
+    border: 2px solid var(--fg);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+  }
+
+  .format-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .format-select {
+    display: inline-flex;
+    background: var(--surface-subtle);
+    border-radius: 6px;
+    padding: 2px;
+    gap: 1px;
+  }
+  .format-select button {
+    padding: 3px 6px;
+    border-radius: 4px;
+    font: 600 10.5px/1 var(--mono);
+    color: var(--fg-muted);
+  }
+  .format-select button.active {
+    background: var(--surface);
+    color: var(--fg);
+    box-shadow: var(--shadow-sm);
+  }
+  .color-input {
+    flex: 1;
+    min-width: 0;
+    height: 28px;
+    padding: 0 8px;
+    border-radius: 7px;
+    border: 1px solid var(--border);
+    background: var(--surface-subtle);
+    font: 500 12px/1 var(--mono);
+    color: var(--fg);
+  }
+  .alpha-pill {
+    width: 44px;
+    height: 28px;
+    border-radius: 7px;
+    border: 1px solid var(--border);
+    background: var(--surface-subtle);
+    font: 500 11.5px/28px var(--mono);
+    text-align: center;
+    color: var(--fg-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .swatches {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .swatch {
+    width: 24px;
+    height: 24px;
+    border-radius: 7px;
+    border: 1px solid rgba(128, 128, 128, 0.28);
+    transition: transform 0.1s;
+    position: relative;
+  }
+  .swatch:hover { transform: scale(1.08); }
+  .swatch.active {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .swatch-add {
+    width: 24px;
+    height: 24px;
+    border-radius: 7px;
+    border: 1px dashed var(--border-strong);
+    display: grid;
+    place-items: center;
+    color: var(--fg-muted);
+  }
+  .swatch-add:hover { background: var(--surface-hover); color: var(--fg); }
+
+  .pill-row {
+    display: flex;
+    gap: 4px;
+  }
+  .opt-pill {
+    flex: 1;
+    height: 28px;
+    border-radius: 7px;
+    border: 1px solid var(--border);
+    background: var(--surface-subtle);
+    color: var(--fg-muted);
+    font-size: 11.5px;
+    font-weight: 500;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+  }
+  .opt-pill:hover { background: var(--surface-hover); color: var(--fg); }
+  .opt-pill.active {
+    border-color: var(--accent-soft-border);
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  /* ── Bottom-Left Undo/Redo + Zoom Cluster ── */
+  .hud-bl {
+    position: absolute;
+    left: 14px;
+    bottom: 14px;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    height: 40px;
+    padding: 0 5px;
+  }
+  .hud-btn {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    display: grid;
+    place-items: center;
+    color: var(--fg-muted);
+  }
+  .hud-btn:hover:not(:disabled) { background: var(--surface-hover); color: var(--fg); }
+  .hud-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+  .zoom-val {
+    min-width: 48px;
+    height: 32px;
+    border-radius: 8px;
+    font: 600 12px/32px var(--mono);
+    text-align: center;
+    color: var(--fg);
+    font-variant-numeric: tabular-nums;
+  }
+  .zoom-val:hover { background: var(--surface-hover); }
+
+  /* ── Canvas Overlays: Cursors & Comment Pin ── */
+  .collab-cursor {
+    position: absolute;
+    pointer-events: none;
+    z-index: 10;
+  }
+  .cursor-tag {
+    margin-left: 14px;
+    margin-top: -2px;
+    padding: 2px 7px;
+    border-radius: 4px 10px 10px 10px;
+    color: #fff;
+    font-size: 11px;
+    font-weight: 600;
+    box-shadow: var(--shadow-sm);
+    white-space: nowrap;
+  }
+
+  .comment-pin {
+    position: absolute;
+    left: 61%;
+    top: 31%;
+    z-index: 15;
+    width: 32px;
+    height: 32px;
+    border-radius: 16px 16px 16px 4px;
+    background: #C026D3;
+    color: #fff;
+    font-size: 12px;
+    font-weight: 700;
+    display: grid;
+    place-items: center;
+    border: 2.5px solid var(--surface);
+    box-shadow: var(--shadow-md);
+    transition: transform 0.14s;
+  }
+  .comment-pin:hover { transform: scale(1.08); }
+  .comment-pin.active {
+    outline: 3px solid var(--accent-soft-border);
+    outline-offset: 2px;
+  }
+
+  .comment-drawer {
+    position: absolute;
+    left: calc(61% + 42px);
+    top: 24%;
+    width: 296px;
+    z-index: 25;
+    border-radius: 14px;
+    box-shadow: var(--shadow-lg);
+    overflow: hidden;
+  }
+  .comment-drawer[hidden] { display: none; }
+  .cd-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  .cd-head-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12.5px;
+    font-weight: 600;
+  }
+  .cd-body {
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .c-msg {
+    display: flex;
+    gap: 9px;
+  }
+  .c-msg .avatar {
+    width: 24px;
+    height: 24px;
+    margin: 0;
+    border: 0;
+    flex-shrink: 0;
+  }
+  .c-msg-head {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    font-size: 12px;
+  }
+  .c-msg-head strong { font-weight: 600; }
+  .c-msg-head span { font-size: 11px; color: var(--fg-dim); }
+  .c-msg p { margin: 3px 0 0; font-size: 12.5px; color: var(--fg-muted); line-height: 1.45; }
+  .cd-reply {
+    display: flex;
+    gap: 6px;
+    padding: 10px 14px 12px;
+    border-top: 1px solid var(--border);
+    background: var(--surface-subtle);
+  }
+  .cd-reply input {
+    flex: 1;
+    height: 30px;
+    padding: 0 9px;
+    border-radius: 7px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    font-size: 12.5px;
+  }
+
+  /* Toast */
+  .toast {
+    position: absolute;
+    bottom: 18px;
+    left: 50%;
+    transform: translateX(-50%) translateY(8px);
+    z-index: 40;
+    background: var(--fg);
+    color: var(--surface);
+    padding: 7px 14px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 500;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.16s, transform 0.16s;
+    box-shadow: var(--shadow-md);
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+</style>
+</head>
+<body>
+<div class="stage">
+  <!-- ── Infinite Canvas Diagram (SVG) ── -->
+  <svg class="world" id="worldSvg" viewBox="0 0 1440 900" preserveAspectRatio="xMidYMid slice" aria-label="Q3 Sync Architecture diagram">
+    <defs>
+      <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M 1 2 L 8 5 L 1 8" fill="none" stroke="var(--fg-muted)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+      </marker>
+    </defs>
+
+    <!-- Frame container -->
+    <rect x="210" y="130" width="840" height="580" rx="16" fill="none" stroke="var(--border-strong)" stroke-width="1.25" stroke-dasharray="6 6" opacity="0.55"/>
+    <text x="226" y="118" fill="var(--fg-dim)" font-size="12" font-weight="600" font-family="var(--font)">Frame 1 · Realtime Sync Pipeline</text>
+
+    <!-- Connector arrows -->
+    <path d="M 412 315 C 455 315, 465 315, 504 315" fill="none" stroke="var(--fg-muted)" stroke-width="1.8" marker-end="url(#arrow)"/>
+    <path d="M 672 315 C 718 315, 722 250, 768 250" fill="none" stroke="var(--fg-muted)" stroke-width="1.8" marker-end="url(#arrow)"/>
+    <path d="M 672 315 C 718 315, 722 415, 768 415" fill="none" stroke="var(--fg-muted)" stroke-width="1.8" marker-end="url(#arrow)"/>
+    <path d="M 588 372 L 588 492" fill="none" stroke="var(--fg-muted)" stroke-width="1.8" marker-end="url(#arrow)"/>
+
+    <!-- Node 1: Client Edge -->
+    <g>
+      <rect x="252" y="275" width="160" height="80" rx="12" fill="var(--node-fill)" stroke="var(--node-stroke)" stroke-width="1.8"/>
+      <text x="332" y="311" text-anchor="middle" fill="var(--fg)" font-size="14" font-weight="600">Web &amp; iOS Client</text>
+      <text x="332" y="331" text-anchor="middle" fill="var(--fg-muted)" font-size="11.5">Local CRDT Buffer</text>
+    </g>
+
+    <!-- Node 2: SELECTED SHAPE (Synced live with Custom Color Picker!) -->
+    <g id="selectedNode">
+      <rect id="selectedRect" x="508" y="262" width="164" height="106" rx="14" fill="rgba(59, 72, 232, 0.12)" stroke="#3B48E8" stroke-width="2"/>
+      <text x="590" y="308" text-anchor="middle" fill="var(--fg)" font-size="14.5" font-weight="600">Durable Room</text>
+      <text x="590" y="328" text-anchor="middle" fill="var(--fg-muted)" font-size="11.5">WebSocket Fan-out</text>
+      <!-- Selection bounding box & handles -->
+      <rect x="502" y="256" width="176" height="118" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.25" stroke-dasharray="4 3"/>
+      <rect x="498" y="252" width="8" height="8" rx="2" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.75"/>
+      <rect x="674" y="252" width="8" height="8" rx="2" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.75"/>
+      <rect x="498" y="370" width="8" height="8" rx="2" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.75"/>
+      <rect x="674" y="370" width="8" height="8" rx="2" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.75"/>
+    </g>
+
+    <!-- Node 3: Presence -->
+    <g>
+      <rect x="772" y="212" width="184" height="76" rx="12" fill="var(--node-fill)" stroke="var(--node-stroke)" stroke-width="1.8"/>
+      <text x="864" y="246" text-anchor="middle" fill="var(--fg)" font-size="14" font-weight="600">Presence Channel</text>
+      <text x="864" y="265" text-anchor="middle" fill="var(--fg-muted)" font-size="11.5">Cursors &amp; Viewport Sync</text>
+    </g>
+
+    <!-- Node 4: Snapshot Store (Diamond) -->
+    <g>
+      <polygon points="864,366 954,415 864,464 774,415" fill="var(--node-fill)" stroke="var(--node-stroke)" stroke-width="1.8" stroke-linejoin="round"/>
+      <text x="864" y="412" text-anchor="middle" fill="var(--fg)" font-size="13" font-weight="600">Audit Gate</text>
+      <text x="864" y="429" text-anchor="middle" fill="var(--fg-muted)" font-size="11">ACL &amp; Grants</text>
+    </g>
+
+    <!-- Node 5: Snapshot Storage -->
+    <g>
+      <rect x="506" y="496" width="168" height="76" rx="12" fill="var(--node-fill)" stroke="var(--node-stroke)" stroke-width="1.8"/>
+      <text x="590" y="530" text-anchor="middle" fill="var(--fg)" font-size="14" font-weight="600">R2 Snapshots</text>
+      <text x="590" y="549" text-anchor="middle" fill="var(--fg-muted)" font-size="11.5">Versioned History</text>
+    </g>
+
+    <!-- Sticky Note -->
+    <g transform="translate(260, 470)">
+      <rect width="176" height="122" rx="10" fill="var(--note-fill)" stroke="var(--note-stroke)" stroke-width="1.25"/>
+      <text x="16" y="30" fill="var(--note-ink)" font-size="12.5" font-weight="600">Mobile Priority</text>
+      <text x="16" y="52" fill="var(--note-ink)" font-size="11.5" opacity="0.88">Keep Undo/Redo visible</text>
+      <text x="16" y="70" fill="var(--note-ink)" font-size="11.5" opacity="0.88">in the lower thumb zone</text>
+      <text x="16" y="88" fill="var(--note-ink)" font-size="11.5" opacity="0.88">on 390×844 iOS Chrome.</text>
+      <text x="16" y="109" fill="var(--note-ink)" font-size="10" font-weight="600" opacity="0.65">— Maya · 4m ago</text>
+    </g>
+  </svg>
+
+  <!-- ── Collaborator Cursors ── -->
+  <div class="collab-cursor" style="left: 29%; top: 53%;">
+    <svg width="18" height="20" viewBox="0 0 18 20" fill="none">
+      <path d="M2 2L16 8.5L9.5 11L7 17.5L2 2Z" fill="#0891B2" stroke="#fff" stroke-width="1.5" stroke-linejoin="round"/>
+    </svg>
+    <div class="cursor-tag" style="background:#0891B2;">Dev</div>
+  </div>
+
+  <!-- ── Comment Pin + Thread Drawer ── -->
+  <button class="comment-pin active" id="commentPin" title="Open comment thread" aria-label="Comment thread 1">1</button>
+  <div class="comment-drawer island" id="commentDrawer">
+    <div class="cd-head">
+      <div class="cd-head-left">
+        <svg class="ico ico-16" viewBox="0 0 24 24"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5c-1.4 0-2.7-.3-3.9-.9L3 21l1.9-5.6A8.5 8.5 0 1 1 21 11.5z"/></svg>
+        <span>Durable Room</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:4px;">
+        <button class="btn btn-ghost" id="resolveBtn" style="height:24px;font-size:11.5px;padding:0 7px;">
+          <svg class="ico ico-14" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>
+          Resolve
+        </button>
+        <button class="btn-icon" id="closeComment" aria-label="Close thread" style="width:24px;height:24px;">
+          <svg class="ico ico-14" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="cd-body" id="commentList">
+      <div class="c-msg">
+        <div class="avatar" style="background:#C026D3;">MR</div>
+        <div>
+          <div class="c-msg-head"><strong>Maya</strong><span>6m ago</span></div>
+          <p>Should fan-out coalesce cursor frames at 30fps on mobile connections?</p>
+        </div>
+      </div>
+      <div class="c-msg">
+        <div class="avatar" style="background:#0891B2;">DK</div>
+        <div>
+          <div class="c-msg-head"><strong>Dev</strong><span>2m ago</span></div>
+          <p>Yes — batching at 33ms cuts battery wakeups in half with zero perceived lag.</p>
+        </div>
+      </div>
+    </div>
+    <form class="cd-reply" id="replyForm">
+      <input type="text" id="replyInput" placeholder="Reply to thread…">
+      <button type="submit" class="btn btn-primary" style="height:30px;padding:0 10px;">Send</button>
+    </form>
+  </div>
+
+  <!-- ── Top-Left Island: Breadcrumb & Title ── -->
+  <header class="top-left island">
+    <a class="brand-btn" href="mock-admin.html" title="Plenary Boards">
+      <svg class="ico ico-16" viewBox="0 0 24 24">
+        <rect x="4" y="4" width="7" height="7" rx="1.8"/>
+        <rect x="13" y="4" width="7" height="7" rx="1.8"/>
+        <rect x="4" y="13" width="7" height="7" rx="1.8"/>
+        <circle cx="16.5" cy="16.5" r="3.5"/>
+      </svg>
+    </a>
+    <a class="crumb-link" href="mock-admin.html">Boards</a>
+    <span class="crumb-sep">/</span>
+    <button class="board-title" id="titleBtn">Q3 Sync Architecture</button>
+    <span class="saved-badge">Saved</span>
+  </header>
+
+  <!-- ── Top-Right Island: Collaborators, Status, Share, Theme ── -->
+  <div class="top-right island">
+    <div class="collab-group">
+      <div class="avatar-stack">
+        <div class="avatar" style="background:#C026D3;" title="Maya">MR</div>
+        <div class="avatar" style="background:#0891B2;" title="Dev">DK</div>
+        <div class="avatar" style="background:#EA580C;" title="Priya">PS</div>
+        <div class="avatar more">+1</div>
+      </div>
+      <span class="viewer-count"><strong>4</strong> viewing</span>
+    </div>
+    <div class="divider-v"></div>
+    <div class="status-pill" title="Realtime sync active">
+      <span class="status-dot"></span>
+      <span>Connected</span>
+    </div>
+    <button class="btn btn-primary" id="shareBtn">
+      <svg class="ico ico-14" viewBox="0 0 24 24"><path d="M4 12v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg>
+      Share
+    </button>
+    <button class="btn-icon" id="themeToggle" title="Switch Light / Dark theme" aria-label="Toggle theme">
+      <svg class="ico" id="themeIco" viewBox="0 0 24 24">
+        <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>
+      </svg>
+    </button>
+  </div>
+
+  <!-- ── Left Floating Tool Rail (100% Custom SVG Icons) ── -->
+  <nav class="tool-rail island" id="toolRail" aria-label="Canvas tools">
+    <button class="tool-btn active" data-tool="Select" aria-label="Select">
+      <svg class="ico ico-20" viewBox="0 0 24 24"><path d="M5 4l6.5 16 2.5-6 6-2.5L5 4z"/></svg>
+      <span class="tip">Select <kbd>V</kbd></span>
+    </button>
+    <button class="tool-btn" data-tool="Hand" aria-label="Hand pan">
+      <svg class="ico ico-20" viewBox="0 0 24 24"><path d="M18 11V6a2 2 0 0 0-4 0v4"/><path d="M14 10V4a2 2 0 0 0-4 0v6"/><path d="M10 10.5V6a2 2 0 0 0-4 0v8"/><path d="M18 11a2 2 0 1 1 4 0v3a8 8 0 0 1-8 8h-2a8 8 0 0 1-6.5-3.4L3.8 16a2 2 0 0 1 3.1-2.5L8 14.5"/></svg>
+      <span class="tip">Pan <kbd>H</kbd></span>
+    </button>
+    <div class="tool-sep"></div>
+    <button class="tool-btn" data-tool="Rectangle" aria-label="Rectangle">
+      <svg class="ico ico-20" viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="14" rx="2.5"/></svg>
+      <span class="tip">Rectangle <kbd>R</kbd></span>
+    </button>
+    <button class="tool-btn" data-tool="Diamond" aria-label="Diamond">
+      <svg class="ico ico-20" viewBox="0 0 24 24"><path d="M12 3.5l8.5 8.5-8.5 8.5L3.5 12 12 3.5z"/></svg>
+      <span class="tip">Diamond <kbd>D</kbd></span>
+    </button>
+    <button class="tool-btn" data-tool="Ellipse" aria-label="Ellipse">
+      <svg class="ico ico-20" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/></svg>
+      <span class="tip">Ellipse <kbd>O</kbd></span>
+    </button>
+    <button class="tool-btn" data-tool="Arrow" aria-label="Arrow">
+      <svg class="ico ico-20" viewBox="0 0 24 24"><line x1="5" y1="19" x2="19" y2="5"/><polyline points="11 5 19 5 19 13"/></svg>
+      <span class="tip">Arrow <kbd>A</kbd></span>
+    </button>
+    <div class="tool-sep"></div>
+    <button class="tool-btn" data-tool="Pen" aria-label="Freehand pen">
+      <svg class="ico ico-20" viewBox="0 0 24 24"><path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 3 21l.5-4.5L17 3z"/></svg>
+      <span class="tip">Pen <kbd>P</kbd></span>
+    </button>
+    <button class="tool-btn" data-tool="Text" aria-label="Text">
+      <svg class="ico ico-20" viewBox="0 0 24 24"><path d="M5 6V4h14v2"/><line x1="12" y1="4" x2="12" y2="20"/><line x1="9" y1="20" x2="15" y2="20"/></svg>
+      <span class="tip">Text <kbd>T</kbd></span>
+    </button>
+    <button class="tool-btn" data-tool="Sticky Note" aria-label="Sticky note">
+      <svg class="ico ico-20" viewBox="0 0 24 24"><path d="M5 4h14a1 1 0 0 1 1 1v10l-5 5H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/><path d="M15 20v-5h5"/></svg>
+      <span class="tip">Sticky Note <kbd>N</kbd></span>
+    </button>
+    <button class="tool-btn" data-tool="Frame" aria-label="Frame">
+      <svg class="ico ico-20" viewBox="0 0 24 24"><line x1="4" y1="8" x2="20" y2="8"/><line x1="4" y1="16" x2="20" y2="16"/><line x1="8" y1="4" x2="8" y2="20"/><line x1="16" y1="4" x2="16" y2="20"/></svg>
+      <span class="tip">Frame <kbd>F</kbd></span>
+    </button>
+    <div class="tool-sep"></div>
+    <button class="tool-btn" data-tool="Comment" aria-label="Comment">
+      <svg class="ico ico-20" viewBox="0 0 24 24"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5c-1.4 0-2.7-.3-3.9-.9L3 21l1.9-5.6A8.5 8.5 0 1 1 21 11.5z"/></svg>
+      <span class="tip">Comment <kbd>C</kbd></span>
+    </button>
+    <button class="tool-btn" data-tool="Eraser" aria-label="Eraser">
+      <svg class="ico ico-20" viewBox="0 0 24 24"><path d="M20 20H8l-5-5 10-10 8 8-6 7"/><path d="M10 8l7 7"/></svg>
+      <span class="tip">Eraser <kbd>E</kbd></span>
+    </button>
+  </nav>
+
+  <!-- ── Right Floating Inspector + Custom Color Picker ── -->
+  <aside class="inspector island" aria-label="Style inspector">
+    <div class="insp-head">
+      <div class="insp-title">
+        <span>Rounded Rect</span>
+        <span class="tag">1 selected</span>
+      </div>
+      <div style="display:flex;gap:2px;">
+        <button class="btn-icon" title="Duplicate (⌘D)" onclick="showToast('Duplicated Durable Room')">
+          <svg class="ico ico-16" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        </button>
+        <button class="btn-icon" title="Delete (⌫)" onclick="showToast('Delete shape')">
+          <svg class="ico ico-16" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Custom Color Picker Section -->
+    <div class="insp-sec">
+      <div class="seg-control" id="colorTarget">
+        <button class="active" data-target="stroke">
+          <span class="mini-dot" id="strokeDot" style="background:#3B48E8;"></span>
+          Stroke
+        </button>
+        <button data-target="fill">
+          <span class="mini-dot" id="fillDot" style="background:rgba(59,72,232,0.16);"></span>
+          Fill
+        </button>
+      </div>
+
+      <!-- 2D Saturation / Lightness Field -->
+      <div class="sl-box" id="slBox" aria-label="Saturation and brightness picker">
+        <div class="sl-thumb" id="slThumb" style="left:75%;top:18%;"></div>
+      </div>
+
+      <!-- Eyedropper + Hue & Opacity Sliders -->
+      <div class="slider-row">
+        <button class="eyedrop-btn" id="eyedropBtn" title="Pick color from canvas (Eyedropper)">
+          <svg class="ico ico-16" viewBox="0 0 24 24"><path d="M19 5l-1.5-1.5a2.1 2.1 0 0 0-3 0L11 7l6 6 3.5-3.5a2.1 2.1 0 0 0 0-3z"/><path d="M12 8l-7.5 7.5a2 2 0 0 0-.5 1L3 21l4.5-1a2 2 0 0 0 1-.5L16 12"/></svg>
+        </button>
+        <div class="sliders-col">
+          <input type="range" class="color-range hue" id="hueSlider" min="0" max="360" value="235" aria-label="Hue">
+          <input type="range" class="color-range alpha" id="alphaSlider" min="0" max="100" value="100" aria-label="Opacity">
+        </div>
+      </div>
+
+      <!-- Hex / RGB / HSL Switcher + Input -->
+      <div class="format-row">
+        <div class="format-select" id="formatSelect">
+          <button class="active" data-fmt="hex">HEX</button>
+          <button data-fmt="rgb">RGB</button>
+          <button data-fmt="hsl">HSL</button>
+        </div>
+        <input class="color-input" id="colorInput" value="#3B48E8" aria-label="Color value">
+        <div class="alpha-pill" id="alphaReadout">100%</div>
+      </div>
+
+      <!-- Saved Custom Swatches -->
+      <div class="sec-head" style="margin-top:2px;">
+        <span class="eyebrow">Saved Swatches</span>
+      </div>
+      <div class="swatches" id="swatchList">
+        <button class="swatch active" data-hex="#3B48E8" style="background:#3B48E8;" aria-label="Cobalt"></button>
+        <button class="swatch" data-hex="#18181B" style="background:#18181B;" aria-label="Ink"></button>
+        <button class="swatch" data-hex="#157F3D" style="background:#157F3D;" aria-label="Emerald"></button>
+        <button class="swatch" data-hex="#EA580C" style="background:#EA580C;" aria-label="Amber"></button>
+        <button class="swatch" data-hex="#C026D3" style="background:#C026D3;" aria-label="Magenta"></button>
+        <button class="swatch" data-hex="#0891B2" style="background:#0891B2;" aria-label="Teal"></button>
+        <button class="swatch-add" id="saveSwatchBtn" title="Save current color to swatches">
+          <svg class="ico ico-14" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Stroke Width & Corner Radius -->
+    <div class="insp-sec">
+      <span class="eyebrow">Stroke Weight</span>
+      <div class="pill-row" id="strokeWeightGroup">
+        <button class="opt-pill" data-w="1.25">Thin</button>
+        <button class="opt-pill active" data-w="2">Medium</button>
+        <button class="opt-pill" data-w="3.25">Bold</button>
+      </div>
+
+      <span class="eyebrow" style="margin-top:4px;">Corners</span>
+      <div class="pill-row" id="cornerGroup">
+        <button class="opt-pill" data-r="2">Sharp</button>
+        <button class="opt-pill active" data-r="14">Rounded</button>
+        <button class="opt-pill" data-r="28">Pill</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ── Bottom-Left Undo/Redo + Zoom Cluster ── -->
+  <div class="hud-bl island" aria-label="History and zoom controls">
+    <button class="hud-btn" id="undoBtn" title="Undo (⌘Z)" aria-label="Undo">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg>
+    </button>
+    <button class="hud-btn" id="redoBtn" title="Redo (⇧⌘Z)" aria-label="Redo" disabled>
+      <svg class="ico" viewBox="0 0 24 24"><path d="M15 14l5-5-5-5"/><path d="M4 20v-7a4 4 0 0 1 4-4h12"/></svg>
+    </button>
+    <div class="divider-v" style="margin:0 4px;"></div>
+    <button class="hud-btn" id="zoomOutBtn" title="Zoom out" aria-label="Zoom out">
+      <svg class="ico ico-16" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+    </button>
+    <button class="zoom-val" id="zoomResetBtn" title="Reset zoom to 100%">100%</button>
+    <button class="hud-btn" id="zoomInBtn" title="Zoom in" aria-label="Zoom in">
+      <svg class="ico ico-16" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+    </button>
+    <button class="hud-btn" id="fitBtn" title="Fit board to view" aria-label="Fit to screen">
+      <svg class="ico ico-16" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
+    </button>
+  </div>
+
+  <div class="toast" id="toast"></div>
+</div>
+
+<script>
+  const root = document.documentElement;
+  const toastEl = document.getElementById('toast');
+  let toastTimer;
+  function showToast(msg) {
+    toastEl.textContent = msg;
+    toastEl.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1800);
+  }
+
+  // Theme toggle
+  const themeToggle = document.getElementById('themeToggle');
+  const themeIco = document.getElementById('themeIco');
+  themeToggle.addEventListener('click', () => {
+    const next = root.dataset.theme === 'dark' ? 'light' : 'dark';
+    root.dataset.theme = next;
+    themeIco.innerHTML = next === 'dark'
+      ? '<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4l1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4m11.4-11.4l1.4-1.4"/>'
+      : '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>';
+    showToast(next === 'dark' ? 'Obsidian Dark theme' : 'Studio Paper Light theme');
+  });
+
+  // Tool rail
+  document.getElementById('toolRail').addEventListener('click', (e) => {
+    const btn = e.target.closest('.tool-btn');
+    if (!btn) return;
+    document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    showToast(`Tool: ${btn.dataset.tool}`);
+  });
+
+  // Comment pin & drawer
+  const commentPin = document.getElementById('commentPin');
+  const commentDrawer = document.getElementById('commentDrawer');
+  commentPin.addEventListener('click', () => {
+    const open = commentDrawer.hidden;
+    commentDrawer.hidden = !open;
+    commentPin.classList.toggle('active', open);
+  });
+  document.getElementById('closeComment').addEventListener('click', () => {
+    commentDrawer.hidden = true;
+    commentPin.classList.remove('active');
+  });
+  document.getElementById('resolveBtn').addEventListener('click', () => {
+    commentDrawer.hidden = true;
+    commentPin.style.opacity = '0.45';
+    showToast('Comment thread resolved');
+  });
+  document.getElementById('replyForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const inp = document.getElementById('replyInput');
+    const txt = inp.value.trim();
+    if (!txt) return;
+    const msg = document.createElement('div');
+    msg.className = 'c-msg';
+    msg.innerHTML = `<div class="avatar" style="background:#3B48E8;">YO</div><div><div class="c-msg-head"><strong>You</strong><span>Just now</span></div><p></p></div>`;
+    msg.querySelector('p').textContent = txt;
+    document.getElementById('commentList').appendChild(msg);
+    inp.value = '';
+  });
+
+  // Undo / Redo & Zoom
+  let undoCount = 4, redoCount = 0, zoom = 100;
+  const undoBtn = document.getElementById('undoBtn');
+  const redoBtn = document.getElementById('redoBtn');
+  const worldSvg = document.getElementById('worldSvg');
+  const zoomResetBtn = document.getElementById('zoomResetBtn');
+
+  function syncHistory() {
+    undoBtn.disabled = undoCount === 0;
+    redoBtn.disabled = redoCount === 0;
+  }
+  undoBtn.addEventListener('click', () => {
+    if (undoCount > 0) { undoCount--; redoCount++; syncHistory(); showToast('Undid last change'); }
+  });
+  redoBtn.addEventListener('click', () => {
+    if (redoCount > 0) { redoCount--; undoCount++; syncHistory(); showToast('Redid change'); }
+  });
+  function setZoom(z) {
+    zoom = Math.max(50, Math.min(200, z));
+    zoomResetBtn.textContent = `${zoom}%`;
+    worldSvg.style.transform = `scale(${zoom / 100})`;
+  }
+  document.getElementById('zoomOutBtn').addEventListener('click', () => setZoom(zoom - 10));
+  document.getElementById('zoomInBtn').addEventListener('click', () => setZoom(zoom + 10));
+  zoomResetBtn.addEventListener('click', () => setZoom(100));
+  document.getElementById('fitBtn').addEventListener('click', () => { setZoom(100); showToast('Fit board to viewport'); });
+
+  // Custom Color Picker logic
+  const selectedRect = document.getElementById('selectedRect');
+  const slBox = document.getElementById('slBox');
+  const slThumb = document.getElementById('slThumb');
+  const hueSlider = document.getElementById('hueSlider');
+  const alphaSlider = document.getElementById('alphaSlider');
+  const colorInput = document.getElementById('colorInput');
+  const alphaReadout = document.getElementById('alphaReadout');
+  const strokeDot = document.getElementById('strokeDot');
+  const fillDot = document.getElementById('fillDot');
+
+  let targetMode = 'stroke';
+  let fmt = 'hex';
+  const colorState = {
+    stroke: { h: 235, s: 79, v: 91, a: 100 },
+    fill:   { h: 235, s: 79, v: 91, a: 14 }
+  };
+
+  function hsvToRgb(h, s, v) {
+    s /= 100; v /= 100;
+    const c = v * s, x = c * (1 - Math.abs(((h / 60) % 2) - 1)), m = v - c;
+    let r = 0, g = 0, b = 0;
+    if (h < 60) [r, g, b] = [c, x, 0];
+    else if (h < 120) [r, g, b] = [x, c, 0];
+    else if (h < 180) [r, g, b] = [0, c, x];
+    else if (h < 240) [r, g, b] = [0, x, c];
+    else if (h < 300) [r, g, b] = [x, 0, c];
+    else [r, g, b] = [c, 0, x];
+    return [Math.round((r + m) * 255), Math.round((g + m) * 255), Math.round((b + m) * 255)];
+  }
+  function rgbToHex(r, g, b) {
+    return '#' + [r, g, b].map(n => n.toString(16).padStart(2, '0')).join('').toUpperCase();
+  }
+  function hexToHsv(hex) {
+    const m = hex.replace('#', '').match(/.{2}/g);
+    if (!m) return null;
+    const [r, g, b] = m.map(x => parseInt(x, 16) / 255);
+    const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+    let h = 0;
+    if (d) {
+      if (max === r) h = ((g - b) / d) % 6;
+      else if (max === g) h = (b - r) / d + 2;
+      else h = (r - g) / d + 4;
+      h = Math.round(h * 60);
+      if (h < 0) h += 360;
+    }
+    return { h, s: Math.round(max ? (d / max) * 100 : 0), v: Math.round(max * 100) };
+  }
+
+  function renderPicker() {
+    const st = colorState[targetMode];
+    const [r, g, b] = hsvToRgb(st.h, st.s, st.v);
+    const hex = rgbToHex(r, g, b);
+    const rgba = `rgba(${r}, ${g}, ${b}, ${(st.a / 100).toFixed(2)})`;
+    slBox.style.backgroundColor = `hsl(${st.h}, 100%, 50%)`;
+    slThumb.style.left = `${st.s}%`;
+    slThumb.style.top = `${100 - st.v}%`;
+    hueSlider.value = st.h;
+    alphaSlider.value = st.a;
+    alphaSlider.style.setProperty('--picker-solid', hex);
+    alphaReadout.textContent = `${st.a}%`;
+
+    if (fmt === 'hex') colorInput.value = hex;
+    else if (fmt === 'rgb') colorInput.value = `${r}, ${g}, ${b}`;
+    else {
+      const l = Math.round(((2 - st.s / 100) * st.v) / 2);
+      colorInput.value = `${st.h}°, ${st.s}%, ${l}%`;
+    }
+
+    if (targetMode === 'stroke') {
+      selectedRect.setAttribute('stroke', rgba);
+      strokeDot.style.background = rgba;
+    } else {
+      selectedRect.setAttribute('fill', rgba);
+      fillDot.style.background = rgba;
+    }
+  }
+
+  function updateSLFromEvent(e) {
+    const rect = slBox.getBoundingClientRect();
+    const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+    colorState[targetMode].s = Math.round(x * 100);
+    colorState[targetMode].v = Math.round((1 - y) * 100);
+    renderPicker();
+  }
+  let draggingSL = false;
+  slBox.addEventListener('pointerdown', (e) => { draggingSL = true; slBox.setPointerCapture(e.pointerId); updateSLFromEvent(e); });
+  slBox.addEventListener('pointermove', (e) => { if (draggingSL) updateSLFromEvent(e); });
+  slBox.addEventListener('pointerup', () => { draggingSL = false; });
+
+  hueSlider.addEventListener('input', () => { colorState[targetMode].h = +hueSlider.value; renderPicker(); });
+  alphaSlider.addEventListener('input', () => { colorState[targetMode].a = +alphaSlider.value; renderPicker(); });
+
+  document.getElementById('colorTarget').addEventListener('click', (e) => {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    targetMode = btn.dataset.target;
+    document.querySelectorAll('#colorTarget button').forEach(b => b.classList.toggle('active', b === btn));
+    renderPicker();
+  });
+
+  document.getElementById('formatSelect').addEventListener('click', (e) => {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    fmt = btn.dataset.fmt;
+    document.querySelectorAll('#formatSelect button').forEach(b => b.classList.toggle('active', b === btn));
+    renderPicker();
+  });
+
+  document.getElementById('swatchList').addEventListener('click', (e) => {
+    const sw = e.target.closest('.swatch');
+    if (!sw) return;
+    const parsed = hexToHsv(sw.dataset.hex);
+    if (!parsed) return;
+    Object.assign(colorState[targetMode], parsed);
+    document.querySelectorAll('.swatch').forEach(s => s.classList.toggle('active', s === sw));
+    renderPicker();
+  });
+
+  document.getElementById('saveSwatchBtn').addEventListener('click', () => {
+    const st = colorState[targetMode];
+    const hex = rgbToHex(...hsvToRgb(st.h, st.s, st.v));
+    const btn = document.createElement('button');
+    btn.className = 'swatch';
+    btn.dataset.hex = hex;
+    btn.style.background = hex;
+    btn.setAttribute('aria-label', hex);
+    document.getElementById('swatchList').insertBefore(btn, document.getElementById('saveSwatchBtn'));
+    showToast(`Saved ${hex} to swatches`);
+  });
+
+  document.getElementById('eyedropBtn').addEventListener('click', () => showToast('Eyedropper active — click canvas to sample'));
+  document.getElementById('shareBtn').addEventListener('click', () => showToast('Opening Share & Access modal…'));
+
+  document.getElementById('strokeWeightGroup').addEventListener('click', (e) => {
+    const btn = e.target.closest('.opt-pill');
+    if (!btn) return;
+    document.querySelectorAll('#strokeWeightGroup .opt-pill').forEach(b => b.classList.toggle('active', b === btn));
+    selectedRect.setAttribute('stroke-width', btn.dataset.w);
+  });
+
+  document.getElementById('cornerGroup').addEventListener('click', (e) => {
+    const btn = e.target.closest('.opt-pill');
+    if (!btn) return;
+    document.querySelectorAll('#cornerGroup .opt-pill').forEach(b => b.classList.toggle('active', b === btn));
+    selectedRect.setAttribute('rx', btn.dataset.r);
+  });
+
+  renderPicker();
+</script>
+</body>
+</html>

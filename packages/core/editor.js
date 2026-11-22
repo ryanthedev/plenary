@@ -18,6 +18,7 @@ import { getPreset, getEasing, timelineEnd, stepTimeline, effectiveAnimTime } fr
 import { labelHostHeight, labelHostWidth } from "./text.js";
 import { isMermaid, mermaidToElements } from "./mermaid.js";
 import { itemFromElements } from "./library.js";
+import { parseLinkCardUrl, buildLinkCard, parseLinkCardFromElement, isPointInLinkCardOpenAction } from "./link-card.js";
 
 export const TOOLS = [
   { id: "select", keys: ["v", "1"], icon: "↖", name: "Select" },
@@ -57,9 +58,9 @@ const DRAWING_TOOLS = new Set(["rectangle", "diamond", "ellipse", "arrow", "line
 const RESIZE_CURSOR = { n: "ns-resize", s: "ns-resize", e: "ew-resize", w: "ew-resize", nw: "nwse-resize", se: "nwse-resize", ne: "nesw-resize", sw: "nesw-resize" };
 
 export class Editor {
-  constructor({ scene, onOp = () => {}, clock = () => Date.now(), readOnly = false } = {}) {
+  constructor({ scene, onOp = () => {}, onOpenLink = null, clock = () => Date.now(), readOnly = false } = {}) {
     this.doc = new Doc(scene ?? { elements: [] });
-    this.onOp = onOp; this.clock = clock;
+    this.onOp = onOp; this.onOpenLink = onOpenLink; this.clock = clock;
     this.readOnly = !!readOnly;
     this.tool = "select"; this.toolLock = false;
     this.sel = new Set();
@@ -391,6 +392,10 @@ export class Editor {
       el.endBinding = null;   // a bend, not an end: the end binds where the line finishes
       return this.livePut(el);
     }
+    if (this.readOnly && m.button !== "middle" && !m.space && typeof this.onOpenLink === "function") {
+      const linkHit = this.linkCardAt(p, { badgeOnly: !(m.cmd || m.ctrl) });
+      if (linkHit) { this.onOpenLink(linkHit.card.url, linkHit.el, linkHit.card); return; }
+    }
     if (this.readOnly || m.button === "middle" || this.tool === "hand" || m.space) {
       this.g = { kind: "pan", start: p, view: { ...this.view }, pointerId: pid, pointerType: type, maxMove: 0 };
       return;
@@ -402,8 +407,22 @@ export class Editor {
     }
     if (m.clickCount >= 2 && (this.tool === "select" || this.tool === "text")) {
       const hit = hitTest(this.doc, w, this.tol(type)) ?? shapeAt(this.doc, w);
+      if (hit && parseLinkCardFromElement(hit)) {
+        const card = parseLinkCardFromElement(hit);
+        if (typeof this.onOpenLink === "function") this.onOpenLink(card.url, hit, card);
+        return;
+      }
       if (hit && (isShape(hit) || hit.type === "text" || isLinear(hit)) && this.doc.editable(hit)) return this.beginText(hit, w);
       if (!hit) return this.beginText(null, w);
+    }
+
+    if (this.tool === "select" && m.button !== "middle" && !m.space) {
+      const linkHit = this.linkCardAt(p, { badgeOnly: !(m.cmd || m.ctrl) });
+      if (linkHit && typeof this.onOpenLink === "function") {
+        this.select(this.withGroup(linkHit.el));
+        this.onOpenLink(linkHit.card.url, linkHit.el, linkHit.card);
+        return;
+      }
     }
 
     switch (this.tool) {
@@ -813,6 +832,7 @@ export class Editor {
     const p = this.pointer; if (!p) return "default";
     const h = this.handleAt(p);
     if (h) return h.kind === "rotate" ? "grab" : h.kind === "resize" ? RESIZE_CURSOR[h.dir] : "pointer";
+    if (this.linkCardAt(p, { badgeOnly: true })) return "pointer";
     return this.hover && this.doc.editable(this.doc.get(this.hover) ?? {}) ? "move" : "default";
   }
   // The binding the arrow being drawn or dragged would end with (shown while dragging).
@@ -1307,8 +1327,40 @@ export class Editor {
     return ids;
   }
 
+  // Return `{ el, card }` if screen point `p` hits a rich link card (optionally restricted to its `↗` open badge).
+  linkCardAt(p, { badgeOnly = false } = {}) {
+    if (!p) return null;
+    const w = this.toWorld(p);
+    const hit = hitTest(this.doc, w, this.tol());
+    if (!hit) return null;
+    const card = parseLinkCardFromElement(hit);
+    if (!card) return null;
+    if (badgeOnly && !isPointInLinkCardOpenAction(hit, w, Math.max(4, 4 / this.view.scale))) return null;
+    return { el: hit, card };
+  }
+
+  // Create and select a Jira, Linear, or GitHub rich link card centered at `at`. Returns its id, or null if invalid.
+  addLinkCard(parsedOrUrl, at = this.toWorld({ x: this.size.w / 2, y: this.size.h / 2 })) {
+    const parsed = typeof parsedOrUrl === "string" ? parseLinkCardUrl(parsedOrUrl) : (parsedOrUrl?.url ? parseLinkCardUrl(parsedOrUrl.url) : null);
+    if (!parsed) return null;
+    const cardEl = buildLinkCard(parsed, {
+      x: 0, y: 0,
+      layer: this.activeLayer,
+      z: this.doc.maxZ(this.activeLayer) + 1,
+    });
+    if (!cardEl) return null;
+    cardEl.x = at.x - cardEl.width / 2;
+    cardEl.y = at.y - cardEl.height / 2;
+    this.transact(tx => tx.add(cardEl));
+    this.select([cardEl.id]);
+    this.flash = `Added ${parsed.providerName} ${parsed.kind} card`;
+    return cardEl.id;
+  }
+
   paste(text = this.clipboard, at) {
     if (isMermaid(text)) { try { this.importMermaid(text, at); this.flash = "imported Mermaid"; } catch (e) { this.flash = String(e.message ?? e); } return; }
+    const linkCard = typeof text === "string" ? parseLinkCardUrl(text) : null;
+    if (linkCard) { this.addLinkCard(linkCard, at); return; }
     let data; try { data = JSON.parse(text); } catch { data = null; }
     if (!data?.elements?.length) {
       if (text && typeof text === "string") { const c = at ?? this.toWorld({ x: this.size.w / 2, y: this.size.h / 2 }); this.beginText(null, c); this.text.value = text; this.commitText(); }

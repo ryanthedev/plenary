@@ -186,3 +186,46 @@ test("#109: zero-dimension image/video/text items during scale/flip animations a
   expect(names(ctx)).not.toContain("fillText");
   expect(names(ctx)).not.toContain("strokeRect");
 });
+
+test("#117: cropped image draws via 9-arg drawImage with natural-size scaling and safe clamping", () => {
+  const ctx = fakeCtx();
+  const img = { naturalWidth: 800, naturalHeight: 400 };
+  paint(ctx, [{
+    t: "image",
+    fileId: "f1",
+    x: 20, y: 30, w: 100, h: 50,
+    angle: 0, cx: 70, cy: 55, opacity: 1,
+    // Crop specified in 400x200 space -> scales 2x to actual 800x400 natural image
+    crop: { x: 100, y: 50, width: 200, height: 100, naturalWidth: 400, naturalHeight: 200 },
+  }], { ...view, image: () => img });
+  expect(ctx.calls).toContainEqual(["drawImage", img, 200, 100, 400, 200, 20, 30, 100, 50]);
+});
+
+test("#117: clip rect uses pure save/beginPath/rect/clip/restore (WKWebView-safe, no ctx.filter)", () => {
+  const ctx = fakeCtx();
+  paint(ctx, [{
+    t: "path",
+    cmds: [["M", 10, 10], ["L", 110, 10], ["L", 110, 60]],
+    fill: "#3B48E8",
+    opacity: 1,
+    clip: { x: 10, y: 10, w: 50, h: 50 },
+  }], view);
+  const c = ctx.calls;
+  expect(c).toContainEqual(["rect", 10, 10, 50, 50]);
+  expect(names(ctx)).toContain("clip");
+  expect(names(ctx).indexOf("clip")).toBeLessThan(names(ctx).indexOf("fill"));
+  expect(names(ctx).lastIndexOf("restore")).toBeGreaterThan(names(ctx).indexOf("fill"));
+  expect(c.some(call => call[0] === "=filter")).toBe(false);
+
+  // Rotated clip rect rotates, clips, then un-rotates before drawing so paths are not double-rotated
+  const rctx = fakeCtx();
+  paint(rctx, [{
+    t: "path",
+    cmds: [["M", 10, 10], ["L", 110, 10]],
+    stroke: "#000000",
+    width: 2,
+    clip: { x: 10, y: 10, w: 50, h: 50, angle: 0.5, cx: 60, cy: 35 },
+  }], view);
+  const rots = rctx.calls.filter(call => call[0] === "rotate").map(call => call[1]);
+  expect(rots).toEqual([0.5, -0.5]);
+});

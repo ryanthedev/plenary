@@ -1,5 +1,5 @@
 // @ts-check
-// Pure Jira, Linear & GitHub rich link card URL parser, sanitizer, and element builder.
+// Pure Jira, Linear, GitHub & Azure DevOps rich link card URL parser, sanitizer, and element builder.
 // Strictly pure: no DOM, Node, or network globals. Produces 100% protocol v1.1-valid
 // Excalidraw rectangle elements with `link` and `customData.linkCard`.
 
@@ -51,6 +51,20 @@ export const LINK_CARD_PROVIDERS = Object.freeze({
     pillFg: "#0052CC",
     pillFgDark: "#85B8FF",
   }),
+  ado: Object.freeze({
+    id: "ado",
+    name: "Azure DevOps",
+    badge: "ADO",
+    accent: "#0078d4",
+    accentDark: "#4DA3FF",
+    badgeBg: "#0078d4",
+    badgeBgDark: "#0078d4",
+    badgeFg: "#FFFFFF",
+    pillBg: "#E6F3FF",
+    pillBgDark: "#16304A",
+    pillFg: "#0078d4",
+    pillFgDark: "#8CC8FF",
+  }),
 });
 
 const CONTROL_CHAR_RE = /[\u0000-\u001F\u007F]/;
@@ -66,6 +80,18 @@ const LINEAR_WORKSPACE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const LINEAR_KEY_RE = /^[A-Za-z][A-Za-z0-9]{0,15}-[1-9][0-9]{0,9}$/;
 const JIRA_HOST_RE = /^([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\.atlassian\.net$/;
 const JIRA_KEY_RE = /^[A-Za-z][A-Za-z0-9_]{0,19}-[1-9][0-9]{0,9}$/;
+const ADO_VS_HOST_RE = /^([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\.visualstudio\.com$/;
+const ADO_ORG_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$/;
+const ADO_SEG_RE = /^[A-Za-z0-9._~%-]{1,128}$/;
+const ADO_ID_RE = /^[1-9][0-9]{0,9}$/;
+
+function cleanAdoSeg(raw) {
+  if (typeof raw !== "string" || !ADO_SEG_RE.test(raw)) return null;
+  const decoded = safeDecode(raw);
+  if (decoded === "." || decoded === ".." || decoded.includes("/") || decoded.includes("\\")) return null;
+  const clean = sanitizeCardText(decoded, 64);
+  return clean || null;
+}
 
 /** Safe URI component decode that never throws and rejects control characters. */
 function safeDecode(str) {
@@ -233,6 +259,107 @@ export function parseLinkCardUrl(raw) {
       url: u.url,
       displayUrl: `${host}/browse/${key}`,
     };
+  }
+
+  // 4. Azure DevOps (ADO):
+  //    - Work Items: https://dev.azure.com/{org}/{project}/_workitems/edit/{id}
+  //                  https://{org}.visualstudio.com/{project}/_workitems/edit/{id}
+  //    - Pull Requests: https://dev.azure.com/{org}/{project}/_git/{repo}/pullrequest/{id}
+  //                     https://{org}.visualstudio.com/{project}/_git/{repo}/pullrequest/{id}
+  //    - Repos: https://dev.azure.com/{org}/{project}/_git/{repo}
+  //             https://{org}.visualstudio.com/{project}/_git/{repo}
+  //    - Boards: https://dev.azure.com/{org}/{project}/_boards/...
+  //              https://{org}.visualstudio.com/{project}/_boards/...
+  const adoVsHost = ADO_VS_HOST_RE.exec(host);
+  if (host === "dev.azure.com" || adoVsHost) {
+    let org, rawProject, rest;
+    if (host === "dev.azure.com") {
+      if (segments.length < 3) return null;
+      [org, rawProject, ...rest] = segments;
+      if (!ADO_ORG_RE.test(org)) return null;
+    } else {
+      const vsSegs = segments[0]?.toLowerCase() === "defaultcollection" ? segments.slice(1) : segments;
+      if (vsSegs.length < 2) return null;
+      org = adoVsHost[1];
+      [rawProject, ...rest] = vsSegs;
+    }
+    if (rawProject.startsWith("_")) return null;
+    const project = cleanAdoSeg(rawProject);
+    if (!project || !rest.length) return null;
+    const basePath = host === "dev.azure.com" ? `${host}/${org}/${rawProject}` : `${host}/${rawProject}`;
+    const scope = `${org}/${project}`;
+    const section = rest[0].toLowerCase();
+
+    if (section === "_workitems" && rest.length === 3 && rest[1].toLowerCase() === "edit" && ADO_ID_RE.test(rest[2])) {
+      const id = rest[2];
+      return {
+        provider: "ado",
+        providerName: LINK_CARD_PROVIDERS.ado.name,
+        kind: "Work Item",
+        key: `${scope}#${id}`,
+        shortKey: `ADO #${id}`,
+        subtitle: scope,
+        title: `Work Item #${id} · ${project}`,
+        url: u.url,
+        displayUrl: `${basePath}/_workitems/edit/${id}`,
+      };
+    }
+
+    if (section === "_git" && rest.length === 4 && rest[2].toLowerCase() === "pullrequest" && ADO_ID_RE.test(rest[3])) {
+      const repo = cleanAdoSeg(rest[1]);
+      if (!repo) return null;
+      const id = rest[3];
+      return {
+        provider: "ado",
+        providerName: LINK_CARD_PROVIDERS.ado.name,
+        kind: "PR",
+        key: `${scope}/${repo}#${id}`,
+        shortKey: `ADO PR #${id}`,
+        subtitle: `${scope}/${repo}`,
+        title: `PR #${id} · ${repo}`,
+        url: u.url,
+        displayUrl: `${basePath}/_git/${rest[1]}/pullrequest/${id}`,
+      };
+    }
+
+    if (section === "_git" && rest.length === 2) {
+      const repo = cleanAdoSeg(rest[1]);
+      if (!repo) return null;
+      return {
+        provider: "ado",
+        providerName: LINK_CARD_PROVIDERS.ado.name,
+        kind: "Repo",
+        key: `${scope}/${repo}`,
+        shortKey: "ADO Repo",
+        subtitle: scope,
+        title: `${repo} · Azure Repos`,
+        url: u.url,
+        displayUrl: `${basePath}/_git/${rest[1]}`,
+      };
+    }
+
+    if (section === "_boards") {
+      const tail = [];
+      for (const seg of rest.slice(1)) {
+        const cleaned = cleanAdoSeg(seg);
+        if (!cleaned) return null;
+        tail.push(cleaned);
+      }
+      const boardName = tail.length ? tail[tail.length - 1] : "";
+      return {
+        provider: "ado",
+        providerName: LINK_CARD_PROVIDERS.ado.name,
+        kind: "Board",
+        key: tail.length ? `${scope}/boards/${tail.join("/")}` : `${scope}/boards`,
+        shortKey: "ADO Board",
+        subtitle: scope,
+        title: boardName ? `${boardName} · Azure Boards` : `${project} · Azure Boards`,
+        url: u.url,
+        displayUrl: `${basePath}/_boards${rest.length > 1 ? "/" + rest.slice(1).join("/") : "/"}`,
+      };
+    }
+
+    return null;
   }
 
   return null;

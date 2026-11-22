@@ -135,6 +135,141 @@ describe("parseLinkCardUrl — Jira", () => {
   });
 });
 
+describe("parseLinkCardUrl — Azure DevOps (ADO)", () => {
+  test("parses Work Items on dev.azure.com and visualstudio.com", () => {
+    const wi1 = parseLinkCardUrl("https://dev.azure.com/contoso/Web%20App/_workitems/edit/4821");
+    expect(wi1).toMatchObject({
+      provider: "ado",
+      providerName: "Azure DevOps",
+      kind: "Work Item",
+      key: "contoso/Web App#4821",
+      shortKey: "ADO #4821",
+      subtitle: "contoso/Web App",
+      title: "Work Item #4821 · Web App",
+      url: "https://dev.azure.com/contoso/Web%20App/_workitems/edit/4821",
+    });
+
+    const wi2 = parseLinkCardUrl("https://contoso.visualstudio.com/Platform/_workitems/edit/99");
+    expect(wi2).toMatchObject({
+      provider: "ado",
+      providerName: "Azure DevOps",
+      kind: "Work Item",
+      key: "contoso/Platform#99",
+      shortKey: "ADO #99",
+      subtitle: "contoso/Platform",
+      title: "Work Item #99 · Platform",
+    });
+  });
+
+  test("parses Pull Requests on dev.azure.com and visualstudio.com", () => {
+    const pr1 = parseLinkCardUrl("https://dev.azure.com/contoso/Core/_git/api-gateway/pullrequest/314");
+    expect(pr1).toMatchObject({
+      provider: "ado",
+      kind: "PR",
+      key: "contoso/Core/api-gateway#314",
+      shortKey: "ADO PR #314",
+      subtitle: "contoso/Core/api-gateway",
+      title: "PR #314 · api-gateway",
+    });
+
+    const pr2 = parseLinkCardUrl("https://contoso.visualstudio.com/Core/_git/web-client/pullrequest/77?activeTab=files");
+    expect(pr2).toMatchObject({
+      provider: "ado",
+      kind: "PR",
+      key: "contoso/Core/web-client#77",
+      shortKey: "ADO PR #77",
+      subtitle: "contoso/Core/web-client",
+    });
+  });
+
+  test("parses Repos and Boards URLs", () => {
+    const repo = parseLinkCardUrl("https://dev.azure.com/contoso/Core/_git/plenary-web");
+    expect(repo).toMatchObject({
+      provider: "ado",
+      kind: "Repo",
+      key: "contoso/Core/plenary-web",
+      shortKey: "ADO Repo",
+      subtitle: "contoso/Core",
+      title: "plenary-web · Azure Repos",
+    });
+
+    const board = parseLinkCardUrl("https://dev.azure.com/contoso/Core/_boards/board/t/Core%20Team/Stories");
+    expect(board).toMatchObject({
+      provider: "ado",
+      kind: "Board",
+      key: "contoso/Core/boards/board/t/Core Team/Stories",
+      shortKey: "ADO Board",
+      subtitle: "contoso/Core",
+      title: "Stories · Azure Boards",
+    });
+
+    const boardRoot = parseLinkCardUrl("https://contoso.visualstudio.com/Core/_boards/");
+    expect(boardRoot).toMatchObject({
+      provider: "ado",
+      kind: "Board",
+      shortKey: "ADO Board",
+      title: "Core · Azure Boards",
+    });
+
+    // Legacy DefaultCollection path on visualstudio.com
+    const legacy = parseLinkCardUrl("https://contoso.visualstudio.com/DefaultCollection/Platform/_workitems/edit/512");
+    expect(legacy).toMatchObject({
+      provider: "ado",
+      kind: "Work Item",
+      key: "contoso/Platform#512",
+      shortKey: "ADO #512",
+    });
+  });
+
+  test("rejects unsafe or malformed ADO URLs and never hijacks plain Excalidraw rectangles", () => {
+    const bad = [
+      "http://dev.azure.com/contoso/Core/_workitems/edit/1",
+      "http://contoso.visualstudio.com/Core/_workitems/edit/1",
+      'https://dev.azure.com/contoso/Core/_workitems/edit/1"onclick=alert(1)',
+      "https://dev.azure.com/contoso/Core/_workitems/edit/1<script>",
+      "https://dev.azure.com/contoso/Core/_workitems/edit/1>x",
+      "https://dev.azure.com/contoso/Core/_workitems/edit/0",
+      "https://dev.azure.com/contoso/Core/_workitems/edit/abc",
+      "https://dev.azure.com/contoso/Core/_boards/..",
+      "https://dev.azure.com/contoso/_git/repo-without-project",
+      "https://visualstudio.com/Core/_workitems/edit/1",
+      "https://dev.azure.com.evil.test/contoso/Core/_workitems/edit/1",
+    ];
+    for (const u of bad) {
+      expect(parseLinkCardUrl(u)).toBeNull();
+    }
+
+    // Plain Excalidraw rectangle with an ADO link but NO customData.linkCard must NOT be hijacked
+    const plainRect = makeElement("rectangle", {
+      width: 300,
+      height: 100,
+      link: "https://dev.azure.com/contoso/Core/_workitems/edit/42",
+    });
+    expect(parseLinkCardFromElement(plainRect)).toBeNull();
+    expect(isLinkCard(plainRect)).toBe(false);
+  });
+
+  test("renders ADO card with #0078d4 accent, ADO pill, passes protocol v1.1, and pastes in Editor", () => {
+    const card = buildLinkCard("https://dev.azure.com/contoso/Core/_git/api/pullrequest/55", { x: 0, y: 0 });
+    expect(card).not.toBeNull();
+    expect(card.strokeColor).toBe("#0078d4");
+    expect(isLinkCard(card)).toBe(true);
+    expect(opProblem({ t: "op", stream: "board", id: "c1:9", sentAt: 0, op: { elements: [card] } })).toBeNull();
+
+    const doc = new Doc({ elements: [card] });
+    const items = paintScene(doc, { x: 0, y: 0, scale: 1 }, LIGHT);
+    expect(items.some(it => it.id === card.id + ":accent" && it.fill === "#0078d4")).toBe(true);
+    expect(items.some(it => it.id === card.id + ":badge" && it.fill === "#0078d4")).toBe(true);
+    expect(items.some(it => it.t === "text" && it.text === "ADO PR #55")).toBe(true);
+
+    const ed = new Editor();
+    ed.paste("https://dev.azure.com/contoso/Core/_workitems/edit/101");
+    expect(ed.flash).toBe("Added Azure DevOps Work Item card");
+    expect(ed.doc.live().length).toBe(1);
+    expect(parseLinkCardFromElement(ed.doc.live()[0])?.provider).toBe("ado");
+  });
+});
+
 describe("parseLinkCardUrl — security & malformed rejection", () => {
   const rejected = [
     "",

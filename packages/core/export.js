@@ -5,6 +5,7 @@
 
 import { paintScene } from "./render.js";
 import { lineWidth } from "./text.js";
+export { exportToExcalidraw, toExcalidrawClipboard } from "./excalidraw.js";
 
 // Warm Studio Paper (light) theme synced with web/adapters/dom/paint.js.
 export const LIGHT = { fg: "#18181B", bg: "#F8F7F4", accent: "#3B48E8", dim: "#625F57" };

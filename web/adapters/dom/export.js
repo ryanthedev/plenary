@@ -4,7 +4,7 @@
 // anything). PNG paints the same items through ./paint.js onto a canvas, so it matches the screen.
 // Notes, selection, cursors and comments never show: only the board Editor's doc goes in.
 
-import { exportScene, boardTheme, LIGHT, DARK } from "../../../packages/core/export.js";
+import { exportScene, boardTheme, LIGHT, DARK, exportToExcalidraw } from "../../../packages/core/export.js";
 import { paint, imageCache, FACES } from "./paint.js";
 
 const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -81,6 +81,15 @@ export function exportOptions(doc, { page = "board", theme = "light", scale = 2 
 export function exportSvg(doc, opts = {}) {
   const s = exportOptions(doc, opts);
   return toSvg(s.items, s);
+}
+
+/** The board as a valid Excalidraw v2 JSON string (`.excalidraw`), with embedded image `files`. */
+export function exportExcalidraw(doc, { page = "board", theme = "light", source } = {}) {
+  const own = /^#[0-9a-f]{6}$/i.test(doc.appState?.viewBackgroundColor ?? "");
+  const viewBackgroundColor = page === "white"
+    ? "#ffffff"
+    : own ? doc.appState.viewBackgroundColor : (theme === "dark" ? DARK.bg : LIGHT.bg);
+  return JSON.stringify(exportToExcalidraw(doc, { viewBackgroundColor, ...(source ? { source } : {}) }), null, 2);
 }
 
 /**

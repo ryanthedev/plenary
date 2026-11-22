@@ -66,7 +66,7 @@ export class Doc {
       changed.push(el.id);
     }
     for (const [id, f] of Object.entries(op.files ?? {})) {
-      if (this.files[id] || !f || typeof f.dataURL !== "string") continue;
+      if (this.files[id] || !f || (typeof f.dataURL !== "string" && typeof f.url !== "string" && !(f.bytes instanceof Uint8Array))) continue;
       this.files[id] = { ...f, id };
       changed.push("$file:" + id);
     }

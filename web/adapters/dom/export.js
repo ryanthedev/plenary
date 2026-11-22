@@ -41,6 +41,15 @@ export function toSvg(items, { width, height, background, files = {}, scale = 1,
       const deg = num(it.angle) * 180 / Math.PI;
       const turn = deg ? ` transform="rotate(${deg.toFixed(2)} ${num(it.cx).toFixed(1)} ${num(it.cy).toFixed(1)})"` : "";
       out.push(`<image href="${url}" x="${num(it.x).toFixed(1)}" y="${num(it.y).toFixed(1)}" width="${Math.max(0, num(it.w)).toFixed(1)}" height="${Math.max(0, num(it.h)).toFixed(1)}" preserveAspectRatio="none" opacity="${op.toFixed(3)}"${turn}/>`);
+    } else if (it.t === "video") {
+      const x = num(it.x), y = num(it.y), w = Math.max(0, num(it.w)), h = Math.max(0, num(it.h));
+      const deg = num(it.angle) * 180 / Math.PI;
+      const turn = deg ? ` transform="rotate(${deg.toFixed(2)} ${num(it.cx).toFixed(1)} ${num(it.cy).toFixed(1)})"` : "";
+      const cx = x + w / 2, cy = y + h / 2, r = Math.min(24, Math.max(8, Math.min(w, h) * 0.16));
+      const p1 = `${(cx - r * 0.32).toFixed(1)},${(cy - r * 0.45).toFixed(1)}`;
+      const p2 = `${(cx + r * 0.5).toFixed(1)},${cy.toFixed(1)}`;
+      const p3 = `${(cx - r * 0.32).toFixed(1)},${(cy + r * 0.45).toFixed(1)}`;
+      out.push(`<g opacity="${op.toFixed(3)}"${turn}><rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}" fill="#18181b" stroke="#52525b" stroke-width="1"/><circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="${r.toFixed(1)}" fill="#ffffff" fill-opacity="0.22"/><polygon points="${p1} ${p2} ${p3}" fill="#ffffff"/></g>`);
     } else if (it.t === "text") {
       const text = String(it.text ?? ""); if (!text) continue;
       const deg = num(it.angle) * 180 / Math.PI;

@@ -24,6 +24,7 @@ import { timelineSpans } from "../../../packages/core/anim.js";
 import { cancelActiveSampler } from "./color-picker.js";
 import { mountCollab } from "./collab/ui.js";
 import { collabFrame } from "./collab/frame.js";
+import { createVideoOverlay } from "./video-overlay.js";
 import { hitTest } from "../../../packages/core/geometry.js";
 
 /**
@@ -91,6 +92,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const allFiles = () => ({ ...S.eds.notes.doc.files, ...S.eds.board.doc.files });
 
   // ── collaboration (p7-wire): the collab UI over the root's port, presence painted on its own canvas ──
+  const videoOverlay = createVideoOverlay({ root: $("#canvas") });
   const overlay = h("canvas.collab-overlay", { "aria-hidden": "true" });
   canvas.after(overlay);
   // Centre the board on a world point; `scale` (optional: a cluster click zooms in) is clamped to the page's zoom
@@ -144,6 +146,15 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     }
     const { w, h: hh } = S.eds.board.size;
     paint(ctx, items, { width: w, height: hh, dpr: canvas.width / Math.max(1, w), background: theme.bg, image });
+    videoOverlay.sync({
+      displayItems: items,
+      elements: [...S.eds.board.doc.visible(), ...(S.eds.board.time() == null ? S.eds.notes.doc.visible() : [])],
+      files,
+      view: S.eds.board.view,
+      viewport: { w, h: hh },
+      selectedIds: new Set([...S.eds.board.sel, ...S.eds.notes.sel]),
+      dragging: !!S.gesture,
+    });
     canvas.style.cursor = S.may() || S.tool === "hand" ? S.ed.cursor() ?? "default" : "grab";
     syncText();
   }
@@ -292,14 +303,16 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (!onCanvas(e)) return;
     e.preventDefault();
     if (!S.may()) return toast("View only: nothing is pasted");
-    const files = [...(e.clipboardData?.files ?? [])].filter(f => f.type.startsWith("image/"));
-    if (files.length) return files.forEach(f => addPicture(f));
+    const files = [...(e.clipboardData?.files ?? [])].filter(f => f.type.startsWith("image/") || f.type.startsWith("video/"));
+    if (files.length) return files.forEach(f => (f.type.startsWith("video/") ? addVideoFile(f) : addPicture(f)));
     const text = e.clipboardData?.getData("text/plain");
     if (text) { S.paste(text); chromeDirty = true; }
   });
 
-  // Pictures and libraries: drop, paste, the Image tool's picker.
+  // Pictures, videos and libraries: drop, paste, the Image tool's picker.
   const RASTER = /^image\/(png|jpeg|gif|webp)$/;
+  const VIDEO_MIME = /^video\/(mp4|webm|quicktime)$/;
+  const MAX_VIDEO_BYTES = 50 * 1024 * 1024;
   async function addPicture(file, at) {
     if (!S.may()) return;
     if (!RASTER.test(file.type)) return toast("Pictures: PNG, JPEG, GIF or WebP");
@@ -319,12 +332,56 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     }
     chromeDirty = true;
   }
+  async function probeVideoMeta(url) {
+    return new Promise(res => {
+      if (typeof document?.createElement !== "function") return res({ width: 480, height: 270 });
+      const v = document.createElement("video");
+      let settled = false;
+      const done = meta => { if (settled) return; settled = true; try { v.removeAttribute?.("src"); v.src = ""; } catch {} res(meta); };
+      const timer = clock.set(() => done({ width: 480, height: 270 }), 3000);
+      v.preload = "metadata";
+      v.muted = true;
+      v.playsInline = true;
+      v.onloadedmetadata = () => { clock.clear(timer); done({ width: v.videoWidth || 480, height: v.videoHeight || 270 }); };
+      v.onerror = () => { clock.clear(timer); done({ width: 480, height: 270 }); };
+      v.src = url;
+    });
+  }
+  async function addVideoFile(file, at) {
+    if (!S.may()) return;
+    if (!VIDEO_MIME.test(file.type)) return toast("Videos: MP4, WebM or QuickTime");
+    if (file.size > MAX_VIDEO_BYTES) return toast("Videos are limited to 50 MB");
+    const buf = await file.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    const id = [...new Uint8Array(await crypto.subtle.digest("SHA-1", buf))].map(b => b.toString(16).padStart(2, "0")).join("");
+    let meta = { width: 480, height: 270 };
+    if (typeof URL?.createObjectURL === "function") {
+      const probeUrl = URL.createObjectURL(file);
+      try { meta = await probeVideoMeta(probeUrl); }
+      finally { try { URL.revokeObjectURL?.(probeUrl); } catch {} }
+    }
+    if (!S.may()) return;
+    const f = { id, mimeType: file.type, bytes, width: meta.width, height: meta.height };
+    if (typeof net.uploadBlob === "function") {
+      try { await S.uploadBlob(id, bytes, file.type); }
+      catch { return toast("Video upload failed"); }
+      if (!S.may()) return;
+      S.addVideo(f, at);
+    } else if (S.addVideo(f, at)) {
+      net.put(f);          // local / shared-worker tab relay
+    }
+    chromeDirty = true;
+  }
   async function addLibraryFile(file) {
     try { const items = parseLibrary(await file.text()); if (!items.length) return toast("No library items in that file"); setLibrary(addToLibrary(ui.library, items)); toast(`Library: ${items.length} added`); }
     catch { toast("That isn't an .excalidrawlib file"); }
   }
   function takeFiles(files, at) {
-    for (const f of files) { if (/\.excalidrawlib$/i.test(f.name)) addLibraryFile(f); else addPicture(f, at); }
+    for (const f of files) {
+      if (/\.excalidrawlib$/i.test(f.name)) addLibraryFile(f);
+      else if (f.type?.startsWith("video/")) addVideoFile(f, at);
+      else addPicture(f, at);
+    }
   }
   const picker = $("#picker");
   function openPicker() { if (S.may()) picker.click(); }

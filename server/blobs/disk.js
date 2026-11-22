@@ -15,7 +15,7 @@ import { needId, isSha1, PortError } from "../ids.js";
 import { checkBlob } from "./port.js";
 
 // The port's shared checks live in ./port.js; re-exported for callers that import them from here (tests).
-export { MAX_BLOB_BYTES, imageKind, checkBlob } from "./port.js";
+export { MAX_BLOB_BYTES, MAX_VIDEO_BLOB_BYTES, BLOB_MIME, imageKind, videoKind, blobKind, checkBlob } from "./port.js";
 
 /** @param {{ dir: string }} o — the root directory; created on first put. */
 export function diskBlobs({ dir }) {

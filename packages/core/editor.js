@@ -902,11 +902,11 @@ export class Editor {
     this.livePut(...els);
   }
 
-  // Shift keeps proportions; for images (photos, screenshots) it's the other way round, as in Excalidraw.
+  // Shift keeps proportions; for media (photos, screenshots, videos) it's the other way round, as in Excalidraw.
   keepAspect(m) {
     const els = this.selected().filter(e => !isLabel(e));
-    const images = els.length > 0 && els.every(e => e.type === "image");
-    return !!m.shift !== images;
+    const media = els.length > 0 && els.every(e => e.type === "image" || e.type === "video");
+    return !!m.shift !== media;
   }
 
   // Resize one rotated shape in its own frame, keeping the opposite handle fixed on screen.
@@ -1238,12 +1238,18 @@ export class Editor {
     const all = fileScene(this.doc, { elements: this.withLabels(els) }).elements;
     // Excalidraw's clipboard format (label boxes as the file has them), so pasting into excalidraw.com works too.
     const files = {};
-    for (const el of all) if (el.type === "image" && this.doc.files[el.fileId]) files[el.fileId] = this.doc.files[el.fileId];
+    for (const el of all) {
+      const f = (el.type === "image" || el.type === "video") && this.doc.files[el.fileId];
+      if (!f) continue;
+      files[el.fileId] = el.type === "video"
+        ? { id: f.id ?? el.fileId, mimeType: f.mimeType ?? el.mimeType ?? "video/mp4" }
+        : f;
+    }
     this.clipboard = JSON.stringify({ type: "excalidraw/clipboard", elements: all.map(clone), files });
     return this.clipboard;
   }
 
-  // Image blobs by file id ({ id, mimeType, dataURL, created }). Add-only, outside undo:
+  // Image/video blobs by file id ({ id, mimeType, dataURL?, url?, created }). Add-only, outside undo:
   // undoing an insert deletes the element and leaves its file, as Excalidraw does.
   addFiles(files) {
     const op = { files };
@@ -1260,6 +1266,28 @@ export class Editor {
     const k = Math.min(1, (this.size.w * 0.6) / this.view.scale / w, (this.size.h * 0.6) / this.view.scale / h);
     w *= k; h *= k;
     const el = this.newEl("image", { fileId: id, x: at.x - w / 2, y: at.y - h / 2, width: w, height: h, opacity: 100 });
+    this.transact(tx => tx.add(el), { files });
+    this.select([el.id]);
+    return el.id;
+  }
+
+  // Put a video on the board, centered at `at` (scene coords), scaled down to fit
+  // 60% of the view. `file`: { id, mimeType, dataURL?, url?, bytes?, posterDataUrl?, width, height, loop?, muted?, autoplay? }.
+  // Returns the new element's id.
+  addVideo(file, at = this.toWorld({ x: this.size.w / 2, y: this.size.h / 2 })) {
+    const { id, mimeType = "video/mp4", dataURL, url, bytes, posterDataUrl = null, loop = false, muted = true, autoplay = false } = file;
+    const entry = { id, mimeType, created: this.clock() };
+    if (dataURL != null) entry.dataURL = dataURL;
+    if (url != null) entry.url = url;
+    if (bytes != null) entry.bytes = bytes;
+    const files = this.doc.files[id] ? undefined : { [id]: entry };
+    let w = Math.max(1, +file.width || 480), h = Math.max(1, +file.height || 270);
+    const k = Math.min(1, (this.size.w * 0.6) / this.view.scale / w, (this.size.h * 0.6) / this.view.scale / h);
+    w *= k; h *= k;
+    const el = this.newEl("video", {
+      fileId: id, mimeType, posterDataUrl, loop: !!loop, muted: !!muted, autoplay: !!autoplay,
+      x: at.x - w / 2, y: at.y - h / 2, width: w, height: h, opacity: 100,
+    });
     this.transact(tx => tx.add(el), { files });
     this.select([el.id]);
     return el.id;

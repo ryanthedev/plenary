@@ -300,6 +300,24 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
     return;
   }
 
+  if (el.type === "video") {
+    const b = bbox(el), [x0, y0] = Q(b.x, b.y), [x1, y1] = Q(b.x + b.w, b.y + b.h), [cx, cy] = Q(b.x + b.w / 2, b.y + b.h / 2);
+    const file = doc.files?.[el.fileId];
+    const ready = !!(file && (typeof file.dataURL === "string" || typeof file.url === "string" || file.bytes instanceof Uint8Array));
+    out.push({
+      t: "video",
+      id: el.id,
+      fileId: el.fileId,
+      mimeType: file?.mimeType ?? el.mimeType ?? "video/mp4",
+      posterDataUrl: el.posterDataUrl ?? null,
+      status: ready ? (el.status ?? "saved") : "pending",
+      x: x0, y: y0, w: x1 - x0, h: y1 - y0,
+      angle: angleOf(el), cx, cy,
+      opacity: opacity * progress,
+    });
+    return;
+  }
+
   if (isShape(el)) {
     const pts = cachedOutline(el, opts.stats).map(p => Q(p[0], p[1]));
     if (el.type === "frame") {
@@ -385,7 +403,7 @@ export function planBatches(items, keyOf, { lookback = 48 } = {}) {
   const layers = [], texts = [];
   for (const it of items) {
     if (it.t === "text") { texts.push(it); continue; }
-    if (it.t === "image") { const b = imgBox(it); layers.push({ img: it, items: [], box: b, boxes: [b] }); continue; }
+    if (it.t === "image" || it.t === "video") { const b = imgBox(it); layers.push({ img: it, items: [], box: b, boxes: [b] }); continue; }
     if (it.t !== "path") continue;
     const key = keyOf(it), box = cmdsBox(it.cmds, (it.width ?? 0) / 2 + 1);
     let into = null;
@@ -431,7 +449,7 @@ export function paintSnapIndicator(doc, snap, view, theme, out) {
     }
     return c;
   };
-  const outline = (shape.type === "image"
+  const outline = (shape.type === "image" || shape.type === "video"
     ? outlinePoints({ ...shape, type: "rectangle", roundness: null })
     : outlinePoints(shape)).map(([x, y]) => P(x, y));
   out.push({ t: "path", id: "snap:outline", cmds: outline.map((p, i) => [i ? "L" : "M", ...p]), stroke: withAlpha(acc, 0.85), width: 2, dash: null });
@@ -477,7 +495,7 @@ function clipTest(doc, view, opts) {
     if (el.type === "text" && el.containerId) { host = doc.get(el.containerId); if (!host) return true; }
     // Lines and arrows (routes, labels along them), frames (their names run past them) and images
     // are few and cheap: always drawn.
-    if (isLinear(host) || host.type === "frame" || host.type === "image") return true;
+    if (isLinear(host) || host.type === "frame" || host.type === "image" || host.type === "video") return true;
     // Half the shape's size each way: room for a rotated corner or a label taller than its shape.
     const b = bbox(host), r = Math.max(b.w, b.h) / 2 + m;
     return b.x - r < x1 && b.x + b.w + r > x0 && b.y - r < y1 && b.y + b.h + r > y0;

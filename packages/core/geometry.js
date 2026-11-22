@@ -1,6 +1,6 @@
 // Geometry on scene coordinates: boxes, hit testing, arrow binding, transforms.
 
-import { isShape, isLinear, isLabel, textSize } from "./model.js";
+import { isShape, isLinear, isLabel, isMedia, textSize } from "./model.js";
 import { elbowRoute } from "./elbow.js";
 import { labelLines } from "./text.js";
 import { spatialIndex } from "./spatial.js";
@@ -77,7 +77,7 @@ export function normAngle(a) { const t = Math.PI * 2; a %= t; if (a < 0) a += t;
 
 // Make width/height positive and linear boxes match their points.
 export function normalize(el) {
-  if (isShape(el) || el.type === "text" || el.type === "image") {
+  if (isShape(el) || el.type === "text" || isMedia(el)) {
     if (el.width < 0) { el.x += el.width; el.width = -el.width; }
     if (el.height < 0) { el.y += el.height; el.height = -el.height; }
   }
@@ -117,7 +117,7 @@ export function hits(doc, el, p, tol) {
     for (let j = 1; j < pts.length; j++) if (distToSeg(p.x, p.y, pts[j - 1][0], pts[j - 1][1], pts[j][0], pts[j][1]) <= tol + el.strokeWidth) return true;
     return false;
   }
-  if (el.type === "text" || el.type === "image") return inBox(toLocal(el, p), bbox(el), tol);   // an image is opaque: hit anywhere on it
+  if (el.type === "text" || isMedia(el)) return inBox(toLocal(el, p), bbox(el), tol);   // media is opaque: hit anywhere on it
   if (el.type === "frame") { const b = bbox(el); return inBox(toLocal(el, p), { x: b.x, y: b.y - 24, w: b.w, h: 24 }) || Math.abs(outlineDistance(el, p)) <= tol; }
   const d = outlineDistance(el, p);
   if (Math.abs(d) <= tol + el.strokeWidth) return true;
@@ -153,8 +153,8 @@ export function shapeAt(doc, p, except) {
   return null;
 }
 
-// What an arrow end can bind to: shapes (including frames) and images. Topmost first.
-export const bindable = el => isShape(el) || el.type === "image";
+// What an arrow end can bind to: shapes (including frames), images and videos. Topmost first.
+export const bindable = el => isShape(el) || isMedia(el);
 // On the shape itself (inside, or within `pad` of its outline): a diamond's or an ellipse's
 // empty box corners don't count; frames are hollow containers so only their outline binds.
 export function bindTargetAt(doc, p, except, pad = 4) {
@@ -163,7 +163,7 @@ export function bindTargetAt(doc, p, except, pad = 4) {
     const el = els[i];
     if (!bindable(el) || el.id === except) continue;
     if (el.type === "frame") { if (Math.abs(outlineDistance(el, p)) <= pad) return el; }
-    else if (el.type === "image" ? inBox(toLocal(el, p), bbox(el), pad) : outlineDistance(el, p) <= pad) return el;
+    else if (isMedia(el) ? inBox(toLocal(el, p), bbox(el), pad) : outlineDistance(el, p) <= pad) return el;
   }
   return null;
 }
@@ -210,7 +210,7 @@ function fixedEnd(shape, b) {
   if (!b || !bindable(shape)) return null;
   if (b.fixedPoint) {
     const box = bbox({ ...shape, angle: 0 }), w = toWorld(shape, { x: box.x + b.fixedPoint[0] * box.w, y: box.y + b.fixedPoint[1] * box.h });
-    const inside = shape.type === "image" ? inBox(toLocal(shape, w), box, -0.5) : outlineDistance(shape, w) < -0.5;
+    const inside = isMedia(shape) ? inBox(toLocal(shape, w), box, -0.5) : outlineDistance(shape, w) < -0.5;
     return inside ? null : edgePoint(shape, w.x, w.y, b.gap ?? 6);
   }
   if (b.side) {

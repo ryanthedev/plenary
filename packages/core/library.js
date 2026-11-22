@@ -42,7 +42,13 @@ export function mergeLibrary(items, incoming) {
 // An item from elements (labels already included); keeps only the files its pictures use.
 export function itemFromElements(elements, { name, files = {}, now = Date.now() } = {}) {
   const els = elements.map(clone), used = {};
-  for (const e of els) if (e.type === "image" && files[e.fileId]) used[e.fileId] = files[e.fileId];
+  for (const e of els) {
+    const f = (e.type === "image" || e.type === "video") && files[e.fileId];
+    if (!f) continue;
+    used[e.fileId] = e.type === "video"
+      ? { id: f.id ?? e.fileId, mimeType: f.mimeType ?? e.mimeType ?? "video/mp4" }
+      : f;
+  }
   const label = els.find(e => isLabel(e) && e.text)?.text ?? els.find(e => e.type === "text" && e.text)?.text;
   const item = { id: newId(), status: "unpublished", created: now, elements: els, name: name ?? (label ? String(label).split("\n")[0].slice(0, 40) : undefined) };
   if (!item.name) delete item.name;

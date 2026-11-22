@@ -126,9 +126,12 @@ export function createSession({ join, fetchSnapshot = null, uploadBlob = null, f
       Promise.resolve()
         .then(() => C.requestBlobUrl(item.fileId, { put: false }))
         .then(url => fetchBlob(url))
-        .then(({ mimeType, dataURL }) => {
+        .then(({ mimeType, dataURL, bytes }) => {
           if (blobsClosed) return;
-          s.receiveFiles({ [item.fileId]: { id: item.fileId, mimeType, dataURL, created: typeof wall === "function" ? wall() : 0 } });
+          const entry = { id: item.fileId, mimeType, created: typeof wall === "function" ? wall() : 0 };
+          if (dataURL != null) entry.dataURL = dataURL;
+          if (bytes instanceof Uint8Array) entry.bytes = bytes;
+          s.receiveFiles({ [item.fileId]: entry });
           onChange();
         })
         .catch(err => {
@@ -169,7 +172,7 @@ export function createSession({ join, fetchSnapshot = null, uploadBlob = null, f
     if (blobsClosed || typeof fetchBlob !== "function") return;
     for (const ed of Object.values(eds)) {
       for (const el of ed.doc.live()) {
-        if (el.type === "image" && el.fileId) ensureBlob(el.fileId);
+        if ((el.type === "image" || el.type === "video") && el.fileId) ensureBlob(el.fileId);
       }
     }
   }
@@ -403,6 +406,13 @@ export function createSession({ join, fetchSnapshot = null, uploadBlob = null, f
     const stream = s.role === "presenter" ? "board" : "notes";
     let id = null;
     s.act(stream, ed => { id = ed.addImage(file, at); });
+    return id;
+  };
+  /** A video: on the board for presenters, in notes for annotators. `file` as core's addVideo takes it. */
+  s.addVideo = (file, at) => {
+    const stream = s.role === "presenter" ? "board" : "notes";
+    let id = null;
+    s.act(stream, ed => { id = ed.addVideo(file, at); });
     return id;
   };
   /** Upload picture bytes via signed PUT URL over the active WS link + HTTP blob adapter. */

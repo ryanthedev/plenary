@@ -109,6 +109,33 @@ export function paint(ctx, items, view) {
       const src = view.image?.(it.fileId);
       if (!src) continue;
       rotated(ctx, it, () => ctx.drawImage(src, num(it.x), num(it.y), Math.max(0, num(it.w)), Math.max(0, num(it.h))));
+    } else if (it.t === "video") {
+      const x = num(it.x), y = num(it.y), w = Math.max(0, num(it.w)), h = Math.max(0, num(it.h));
+      rotated(ctx, it, () => {
+        ctx.fillStyle = "#18181b";
+        ctx.fillRect(x, y, w, h);
+        ctx.strokeStyle = "#52525b";
+        ctx.lineWidth = 1;
+        ctx.setLineDash(it.status === "pending" ? [6, 4] : []);
+        ctx.strokeRect(x, y, w, h);
+        ctx.setLineDash([]);
+        // Centered play-icon badge for canvas fallback / PNG exports / thumbnails
+        const r = Math.min(24, Math.max(8, Math.min(w, h) * 0.16));
+        const cx = x + w / 2, cy = y + h / 2;
+        if (w >= 24 && h >= 24) {
+          ctx.beginPath();
+          ctx.arc(cx, cy, r, 0, Math.PI * 2);
+          ctx.fillStyle = "rgba(255,255,255,0.22)";
+          ctx.fill();
+          ctx.beginPath();
+          ctx.moveTo(cx - r * 0.32, cy - r * 0.45);
+          ctx.lineTo(cx + r * 0.5, cy);
+          ctx.lineTo(cx - r * 0.32, cy + r * 0.45);
+          ctx.closePath();
+          ctx.fillStyle = "#ffffff";
+          ctx.fill();
+        }
+      });
     }
   }
   ctx.globalAlpha = 1;

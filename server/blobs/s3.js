@@ -24,11 +24,10 @@
 // SEAM(p3): the per-tenant quota (§ Limits) is not enforced here, as in disk.js.
 
 import { needId, isSha1, PortError } from "../ids.js";
-import { checkBlob, imageKind, MAX_BLOB_BYTES } from "./port.js";
+import { checkBlob, blobKind, BLOB_MIME, MAX_BLOB_BYTES, MAX_VIDEO_BLOB_BYTES } from "./port.js";
 
-export { MAX_BLOB_BYTES };
+export { MAX_BLOB_BYTES, MAX_VIDEO_BLOB_BYTES };
 
-const TYPES = { png: "image/png", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
 const SIGNED_FOR = 300;    // seconds a presigned request stays valid; each is used at once
 
 /**
@@ -84,7 +83,7 @@ export function s3Blobs({ endpoint, bucket, region, accessKeyId, secretAccessKey
         if (head.ok) return;                        // same hash = same bytes: nothing to do
         if (head.status !== 404) throw await failed("put (HEAD)", head);
         const res = await call(signal, putTimeoutMs, "put", s3.presign(k, { method: "PUT", expiresIn: SIGNED_FOR }),
-          { method: "PUT", body: b, headers: { "content-type": TYPES[imageKind(b)] } });
+          { method: "PUT", body: b, headers: { "content-type": BLOB_MIME[blobKind(b)] } });
         if (!res.ok) throw await failed("put", res);
         await res.arrayBuffer();                    // drain, so the connection is reusable
       });

@@ -318,13 +318,13 @@ export function openLink({ transport, fetchSnapshot = null, token: firstToken, b
       if (did.snapshot) {
         for (const stream of Object.values(replica.streams)) {
           for (const el of stream.byId.values()) {
-            if (!el.isDeleted && el.type === "image" && SHA1_RE.test(el.fileId)) fileIds.add(el.fileId);
+            if (!el.isDeleted && (el.type === "image" || el.type === "video") && SHA1_RE.test(el.fileId)) fileIds.add(el.fileId);
           }
         }
       }
       for (const e of did.entries) {
         for (const el of e.op?.elements ?? []) {
-          if (!el.isDeleted && el.type === "image" && SHA1_RE.test(el.fileId)) fileIds.add(el.fileId);
+          if (!el.isDeleted && (el.type === "image" || el.type === "video") && SHA1_RE.test(el.fileId)) fileIds.add(el.fileId);
         }
       }
       if (fileIds.size) onImages([...fileIds]);

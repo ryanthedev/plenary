@@ -78,6 +78,9 @@ const bad = message => ({ code: "bad-op", message });
 const isObj = v => !!v && typeof v === "object" && !Array.isArray(v);
 const isId = v => typeof v === "string" && v.length > 0 && v.length <= MAX_ID_CHARS;
 const isNum = v => typeof v === "number" && Number.isFinite(v);
+const VIDEO_MIMES = ["video/mp4", "video/webm", "video/quicktime"];
+const POSTER_DATA_URL_RE = /^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/;
+const MAX_POSTER_DATA_URL_CHARS = 65536;
 
 // Objects and arrays inside one op (the op object is level 1); deeper is refused ("bad-op"). A client →
 // server frame may be 64 deep (the gateway checks it), so an op fits in its frame (+1) and a bus message (+2).
@@ -136,7 +139,14 @@ export function opProblem(msg, bytes) {
         if (!el || !isId(el.id)) return bad("every element needs a string id (at most 64 characters)");
         // A tie on version is broken by versionNonce on every copy alike; without one, copies disagree.
         if (!Number.isSafeInteger(el.version) || el.version < 0 || !Number.isSafeInteger(el.versionNonce)) return bad("every element needs integer version and versionNonce");
-        if (el.type === "image" && el.fileId != null && !isSha1(el.fileId)) return bad("an image's fileId is 40 lowercase hex characters");
+        if ((el.type === "image" || el.type === "video") && el.fileId != null && !isSha1(el.fileId)) return bad(`a ${el.type}'s fileId is 40 lowercase hex characters`);
+        if (el.type === "video") {
+          if (el.loop !== undefined && typeof el.loop !== "boolean") return bad("a video's loop must be a boolean");
+          if (el.muted !== undefined && typeof el.muted !== "boolean") return bad("a video's muted must be a boolean");
+          if (el.autoplay !== undefined && typeof el.autoplay !== "boolean") return bad("a video's autoplay must be a boolean");
+          if (el.mimeType !== undefined && (typeof el.mimeType !== "string" || !VIDEO_MIMES.includes(el.mimeType))) return bad("a video's mimeType must be video/mp4, video/webm or video/quicktime");
+          if (el.posterDataUrl !== undefined && el.posterDataUrl !== null && (typeof el.posterDataUrl !== "string" || el.posterDataUrl.length > MAX_POSTER_DATA_URL_CHARS || !POSTER_DATA_URL_RE.test(el.posterDataUrl))) return bad("a video's posterDataUrl must be a base64 PNG, JPEG or WebP data URL (at most 65536 chars)");
+        }
         if (el.pressures !== undefined && (!Array.isArray(el.pressures) || !el.pressures.every(isNum))) return bad("pressures must be an array of finite numbers");
       }
     }

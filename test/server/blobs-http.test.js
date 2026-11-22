@@ -563,3 +563,59 @@ test("blob unavailable error rejects pending request cleanly without disconnecti
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("HTTP Range requests on /blobs/: 206, 416 with security headers, bytes=0-, invalid bytes=5-2 -> 200, HEAD with Range -> 200", async () => {
+  const env = await setupServer();
+  try {
+    const mp4 = new Uint8Array(64);
+    mp4.set([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d], 0);
+    for (let i = 12; i < mp4.length; i++) mp4[i] = i;
+    const mp4Sha1 = sha1Of(mp4);
+    const putTicket = await env.sess.issueBlobTicket(env.tenant.id, mp4Sha1, "put");
+    const getTicket = await env.sess.issueBlobTicket(env.tenant.id, mp4Sha1, "get");
+    const base = `${env.srv.url}/blobs/${env.tenant.id}/${mp4Sha1}`;
+
+    const putRes = await fetch(`${base}?ticket=${encodeURIComponent(putTicket)}`, {
+      method: "PUT",
+      headers: { "content-type": "video/mp4" },
+      body: mp4,
+    });
+    expect(putRes.status).toBe(204);
+
+    // 206 Partial Content
+    const r206 = await fetch(`${base}?ticket=${encodeURIComponent(getTicket)}`, { headers: { range: "bytes=0-15" } });
+    expect(r206.status).toBe(206);
+    expect(r206.headers.get("content-type")).toBe("video/mp4");
+    expect(r206.headers.get("content-range")).toBe("bytes 0-15/64");
+    expect(r206.headers.get("accept-ranges")).toBe("bytes");
+    expect(r206.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(new Uint8Array(await r206.arrayBuffer())).toEqual(mp4.subarray(0, 16));
+
+    // Open-ended bytes=0-
+    const rOpen = await fetch(`${base}?ticket=${encodeURIComponent(getTicket)}`, { headers: { range: "bytes=0-" } });
+    expect(rOpen.status).toBe(206);
+    expect(rOpen.headers.get("content-range")).toBe("bytes 0-63/64");
+    expect((await rOpen.arrayBuffer()).byteLength).toBe(64);
+
+    // 416 Unsatisfiable range includes nosniff, cache-control, accept-ranges
+    const r416 = await fetch(`${base}?ticket=${encodeURIComponent(getTicket)}`, { headers: { range: "bytes=64-" } });
+    expect(r416.status).toBe(416);
+    expect(r416.headers.get("content-range")).toBe("bytes */64");
+    expect(r416.headers.get("accept-ranges")).toBe("bytes");
+    expect(r416.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(r416.headers.get("cache-control")).toBe("private, max-age=31536000, immutable");
+
+    // RFC 9110: invalid range bytes=5-2 (start > end) is ignored -> 200 full body
+    const rInvalid = await fetch(`${base}?ticket=${encodeURIComponent(getTicket)}`, { headers: { range: "bytes=5-2" } });
+    expect(rInvalid.status).toBe(200);
+    expect((await rInvalid.arrayBuffer()).byteLength).toBe(64);
+
+    // HEAD with Range -> 200
+    const rHead = await fetch(`${base}?ticket=${encodeURIComponent(getTicket)}`, { method: "HEAD", headers: { range: "bytes=0-15" } });
+    expect(rHead.status).toBe(200);
+    expect(rHead.headers.get("content-length")).toBe("64");
+    expect(rHead.headers.get("accept-ranges")).toBe("bytes");
+  } finally {
+    await env.cleanup();
+  }
+});

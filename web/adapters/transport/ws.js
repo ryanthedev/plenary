@@ -294,7 +294,7 @@ export function httpBlobClient({ origin = null, fetch: fetchFn = (...a) => globa
       const buf = await res.arrayBuffer();
       const bytes = new Uint8Array(buf);
       const mimeType = (res.headers?.get?.("content-type") || "application/octet-stream").split(";")[0].trim();
-      const dataURL = `data:${mimeType};base64,${bytesToBase64(bytes)}`;
+      const dataURL = mimeType.startsWith("video/") ? null : `data:${mimeType};base64,${bytesToBase64(bytes)}`;
       return { bytes, mimeType, dataURL };
     },
   };

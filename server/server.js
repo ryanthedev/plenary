@@ -14,11 +14,10 @@ import { gateway as makeGateway } from "./gateway.js";
 import { roomHost, serveOpens, remoteRooms } from "./room-host.js";
 import { quietLogger } from "./log.js";
 import { staticSite } from "./static.js";
-import { MAX_BLOB_BYTES, imageKind } from "./blobs/port.js";
+import { MAX_VIDEO_BLOB_BYTES, BLOB_MIME, blobKind, parseByteRange } from "./blobs/port.js";
 import { isId, isSha1, PortError } from "./ids.js";
 
 const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
-const BLOB_MIME = { png: "image/png", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
 
 /** Read a Request body up to `maxBytes` without buffering past the cap. Returns null if the body exceeds `maxBytes`. */
 async function readBoundedBody(req, maxBytes) {
@@ -120,8 +119,8 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
 
     if (req.method === "PUT") {
       const cl = req.headers.get("content-length");
-      if (cl !== null && Number(cl) > MAX_BLOB_BYTES) return json(413, { error: "too-large" });
-      const bytes = await readBoundedBody(req, MAX_BLOB_BYTES);
+      if (cl !== null && Number(cl) > MAX_VIDEO_BLOB_BYTES) return json(413, { error: "too-large" });
+      const bytes = await readBoundedBody(req, MAX_VIDEO_BLOB_BYTES);
       if (bytes === null) return json(413, { error: "too-large" });
       try {
         await blobs.put(tenant, sha1, bytes);
@@ -139,14 +138,38 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
 
     const bytes = await blobs.get(tenant, sha1);
     if (!bytes) return json(404, { error: "not-found" });
-    const mime = BLOB_MIME[imageKind(bytes)] ?? "application/octet-stream";
+    const mime = BLOB_MIME[blobKind(bytes)] ?? "application/octet-stream";
+    const commonHeaders = {
+      "accept-ranges": "bytes",
+      "x-content-type-options": "nosniff",
+      "cache-control": "private, max-age=31536000, immutable",
+    };
+    const parsedRange = req.method === "GET" ? parseByteRange(req.headers.get("range"), bytes.byteLength) : null;
+    if (parsedRange) {
+      if (parsedRange.unsatisfiable) {
+        return new Response(null, {
+          status: 416,
+          headers: { ...commonHeaders, "content-range": `bytes */${bytes.byteLength}` },
+        });
+      }
+      const { start, end } = parsedRange;
+      const slice = bytes.subarray(start, end + 1);
+      return new Response(slice, {
+        status: 206,
+        headers: {
+          ...commonHeaders,
+          "content-type": mime,
+          "content-length": String(slice.byteLength),
+          "content-range": `bytes ${start}-${end}/${bytes.byteLength}`,
+        },
+      });
+    }
     return new Response(req.method === "HEAD" ? null : bytes, {
       status: 200,
       headers: {
+        ...commonHeaders,
         "content-type": mime,
         "content-length": String(bytes.byteLength),
-        "x-content-type-options": "nosniff",
-        "cache-control": "private, max-age=31536000, immutable",
       },
     });
   }

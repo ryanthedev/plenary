@@ -24,7 +24,7 @@ export function paintedBox(doc, theme, items = paintScene(doc, { x: 0, y: 0, sca
       if (it.box) { add(it.box.x, it.box.y); add(it.box.x + it.box.w, it.box.y + it.box.h); continue; }
       const lines = String(it.text ?? "").split("\n"), size = it.size ?? 16;
       add(it.x, it.y); add(it.x + Math.max(...lines.map(l => lineWidth(l, size, it.font))), it.y + lines.length * size * (it.lineHeight ?? 1.25));
-    } else if (it.t === "image") {
+    } else if (it.t === "image" || it.t === "video") {
       const a = it.angle || 0, c = Math.cos(a), s = Math.sin(a);
       for (const [dx, dy] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
         const px = dx * it.w / 2, py = dy * it.h / 2;

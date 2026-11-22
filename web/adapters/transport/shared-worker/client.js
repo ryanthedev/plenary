@@ -54,7 +54,16 @@ export function sharedNet({ board, url = new URL("./worker.js", import.meta.url)
         fail: () => { if (link) port.postMessage({ t: "drop", link }); },
       };
     },
-    put: file => port.postMessage({ t: "file", board, file: { id: file.id, mimeType: file.mimeType, dataURL: file.dataURL } }),
+    put: file => port.postMessage({
+      t: "file",
+      board,
+      file: {
+        id: file.id,
+        mimeType: file.mimeType,
+        ...(file.dataURL !== undefined ? { dataURL: file.dataURL } : {}),
+        ...(file.bytes !== undefined ? { bytes: file.bytes } : {}),
+      },
+    }),
     onFile: fn => fileFns.push(fn),
   };
 }

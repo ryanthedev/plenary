@@ -63,7 +63,7 @@ export function mintTab(random) {
  *   clock: the clock port (the root passes browserClock()); the Editors' clock is its now(). timers / now / random:
  *   handed to sync.js over the clock's (tests). No global fallback: sync.js throws without a clock.
  */
-export function createSession({ join, token, board, client = "web", tab = null, mine = [], noteAuthor = () => null, user = null, onChange = () => {}, clock, timers, now, random } = {}) {
+export function createSession({ join, fetchSnapshot = null, token, board, client = "web", tab = null, mine = [], noteAuthor = () => null, user = null, onChange = () => {}, clock, timers, now, random } = {}) {
   const wall = now ?? clock?.now;
   const edClock = typeof wall === "function" ? () => wall() : undefined;
   const eds = { board: new Editor({ clock: edClock }), notes: new Editor({ clock: edClock }) };
@@ -92,7 +92,7 @@ export function createSession({ join, token, board, client = "web", tab = null, 
   /** fn(status) on every status change of the link. */
   s.onStatus = fn => { statusFns.add(fn); return () => statusFns.delete(fn); };
 
-  const wire = openLink({ transport: link, token, board, client, tab: s.tab,
+  const wire = openLink({ transport: link, ...(typeof fetchSnapshot === "function" ? { fetchSnapshot } : {}), token, board, client, tab: s.tab,
     onStatus: st => { s.refreshRole(); for (const fn of [...statusFns]) fn(st); onChange(); },
     onHeard: () => { for (const fn of [...heardFns]) fn(); },
     onRoom: ev => { if (ev.type === "settings" || ev.type === "limit") onChange(); for (const fn of [...roomFns]) fn(ev.type === "settings" ? ev.stream : "board", ev); },

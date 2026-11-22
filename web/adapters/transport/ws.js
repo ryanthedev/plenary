@@ -209,14 +209,59 @@ export function wsTransport({ url, WebSocket: WS, codec = jsonCodec, maxQueued =
 }
 
 /**
+ * HTTP snapshot fetch adapter (F9, implements web/ports/net.js's `fetchSnapshot`).
+ * Resolves relative snapshot URLs against `origin` and refuses cross-origin URLs.
+ * @param {{ origin?: string, fetch?: typeof globalThis.fetch }} [o]
+ * @returns {import("../../ports/net.js").FetchSnapshot}
+ */
+export function httpSnapshotFetcher({ origin = null, fetch: fetchFn = (...a) => globalThis.fetch(...a) } = {}) {
+  const base = origin ? new URL(origin) : null;
+  return async function fetchSnapshot(url, { signal } = {}) {
+    if (typeof url !== "string" || !url) throw new Error("fetchSnapshot: url is required");
+    let target = url;
+    if (base) {
+      const resolved = new URL(url, base);
+      if (resolved.origin !== base.origin) throw new Error("fetchSnapshot: cross-origin snapshot url refused");
+      target = resolved.href;
+    } else if (!url.startsWith("/") || url.startsWith("//")) {
+      throw new Error("fetchSnapshot: relative path required without origin");
+    }
+    const res = await fetchFn(target, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      ...(signal ? { signal } : {}),
+    });
+    if (!res?.ok) throw new Error(`fetchSnapshot: HTTP ${res?.status ?? "error"}`);
+    const snap = await res.json();
+    if (
+      !snap || typeof snap !== "object" || snap.t !== "snapshot" ||
+      !Number.isInteger(snap.seq) ||
+      !snap.streams || typeof snap.streams !== "object" ||
+      !snap.streams.board || !Array.isArray(snap.streams.board.elements) ||
+      !snap.streams.notes || !Array.isArray(snap.streams.notes.elements)
+    ) throw new Error("fetchSnapshot: invalid snapshot payload");
+    return snap;
+  };
+}
+
+/**
  * The net (web/ports/net.js) over WebSockets: one wsTransport per join() to the same gateway URL. No blob path yet
  * (pictures go through signed blob URLs in v1; until then put does nothing and onFile never fires).
- * @param {{ url: string, WebSocket: new (url: string) => any, clock?: Pick<import("../../ports/clock.js").Clock, "mono" | "set" | "clear"> }} o
+ * @param {{ url: string, WebSocket: new (url: string) => any, clock?: Pick<import("../../ports/clock.js").Clock, "mono" | "set" | "clear">, fetch?: typeof globalThis.fetch }} o
  * @returns {import("../../ports/net.js").Net}
  */
-export function wsNet({ url, WebSocket: WS, clock }) {
+export function wsNet({ url, WebSocket: WS, clock, fetch: fetchFn }) {
   if (typeof url !== "string" || !/^wss?:\/\//.test(url)) throw new TypeError("wsNet: a ws:// or wss:// url is required");
-  return { kind: "ws", join: () => wsTransport({ url, WebSocket: WS, ...(clock ? { clock } : {}) }), put: () => {}, onFile: () => {} };
+  const u = new URL(url);
+  const origin = `${u.protocol === "wss:" ? "https:" : "http:"}//${u.host}`;
+  const fetchSnapshot = httpSnapshotFetcher({ origin, ...(fetchFn ? { fetch: fetchFn } : {}) });
+  return {
+    kind: "ws",
+    join: () => wsTransport({ url, WebSocket: WS, ...(clock ? { clock } : {}) }),
+    fetchSnapshot,
+    put: () => {},
+    onFile: () => {},
+  };
 }
 
 /** The gateway's URL for a page at `loc` (same origin, path /ws; wss on https). Never carries a token. */

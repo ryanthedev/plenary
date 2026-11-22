@@ -35,6 +35,7 @@ import { recordsView, newRecordId, ago, cornerOf, reanchor, nameIndex, layoutPin
 import { notesView, notesCount, safeColor } from "../../../core/collab/notes-model.js";
 import { drawPresence, scaleOf } from "./draw.js";
 import { domClock, domFrame } from "./frame.js";
+import { cappedDpr } from "../paint.js";
 import { missingFromPort } from "../../../ports/collab.js";
 
 const BAR = EMOTES.slice(0, 6);
@@ -123,7 +124,7 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     coolTimer = C.set(() => { coolTimer = null; renderEmotes(); }, EMOTE_GAP_MS);
     renderEmotes();
     // Writers' emotes float for everyone (presence); a viewer's is only ever counted (`emotes`).
-    if (port.role !== "viewer") { presence.float(e, port.me.user); renderFloats(); }
+    if (port.role !== "viewer") { presence.float(e, port.me.user); renderFloats(); paint(); }
     return true;
   }
   const bar = BAR.map(e => { const n = h("b"); return { e, n, btn: h("button.tb", { onclick: () => sendEmote(e) }, e, n) }; });
@@ -376,23 +377,38 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
   }
 
   // ── overlay paint ──
-  let painting = false;
+  let painting = false, destroyed = false;
+  function syncPreviews() {
+    const raw = [];
+    if (live()) {
+      for (const stream of ["board", "notes"]) {
+        for (const p of port.previews(stream)) {
+          if (presence.shows(p.user)) raw.push({ ...p, stream, name: nameOf(p.user) ?? "Someone" });
+        }
+      }
+    }
+    return presence.setPreviews(raw);
+  }
   function draw(ctx) {
+    syncPreviews();
+    presence.step(undefined, { scale: scaleOf(view) });
     const pv = presence.view();
-    const previews = [];
-    if (live()) for (const stream of ["board", "notes"]) for (const p of port.previews(stream)) if (presence.shows(p.user)) previews.push({ ...p, name: nameOf(p.user) ?? "Someone" });
-    return drawPresence(ctx, pv, view, { element: port.element, previews, colorFor: colorOf, theme: S.theme });
+    return drawPresence(ctx, pv, view, { element: port.element, previews: pv.previews, colorFor: colorOf, theme: S.theme });
   }
   function paint() {
-    if (!canvasOverlay || painting) return;
+    if (destroyed || !canvasOverlay || painting) return;
     painting = true;
     raf(() => {
       painting = false;
-      const dpr = globalThis.devicePixelRatio || 1, w = canvasOverlay.clientWidth, hh = canvasOverlay.clientHeight;
+      if (destroyed) return;
+      const w = canvasOverlay.clientWidth, hh = canvasOverlay.clientHeight;
+      const dpr = cappedDpr(w, hh, globalThis.devicePixelRatio || 1);
       if (canvasOverlay.width !== Math.round(w * dpr) || canvasOverlay.height !== Math.round(hh * dpr)) { canvasOverlay.width = Math.round(w * dpr); canvasOverlay.height = Math.round(hh * dpr); }
       const ctx = canvasOverlay.getContext("2d");
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, hh);
-      if (draw(ctx) || (live() && (port.previews("board").length || port.previews("notes").length))) paint();
+      const active = draw(ctx);
+      if (floatEls.size > 0 || active) renderFloats();
+      if (active) paint();
     });
   }
 
@@ -424,7 +440,11 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
   // A slow tick: counts and floaters age out, silent peers expire.
   let tickTimer = null;
   const tick = () => {
-    tickTimer = C.set(tick, 1000); presence.prune(); renderEmotes(); renderFloats(); paint();
+    tickTimer = C.set(tick, 1000);
+    const pruned = presence.prune();
+    const previewsChanged = syncPreviews();
+    renderEmotes(); renderFloats();
+    if (pruned || previewsChanged || presence.needsFrame) paint();
     if (S.drawer !== "notes") { const before = notesTotal; countNotes(); if (before !== notesTotal) label(tabNotes, `Notes ${fmt(notesTotal)}`, false); }
   };
   tick();
@@ -451,6 +471,6 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     get statusRev() { return statusRev; },
     get state() { return { open: S.open, compose: S.compose && { x: S.compose.x, y: S.compose.y, on: S.compose.on }, drawer: S.drawer, list: S.list, picker: S.picker, toast: S.toast }; },
     /** Unmount: unsubscribe, stop timers, remove the layer, and release the port (port.destroy, when it has one). */
-    destroy() { for (const off of offs) off?.(); outbox.close(); if (tickTimer) C.clear(tickTimer); if (S.toastTimer) C.clear(S.toastTimer); if (coolTimer != null) C.clear(coolTimer); layer.remove(); port.destroy?.(); },
+    destroy() { destroyed = true; for (const off of offs) off?.(); outbox.close(); if (tickTimer) C.clear(tickTimer); if (S.toastTimer) C.clear(S.toastTimer); if (coolTimer != null) C.clear(coolTimer); layer.remove(); port.destroy?.(); },
   };
 }

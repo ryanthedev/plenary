@@ -50,6 +50,7 @@ export function bindEditor(editor, { stream = "board", ...o }) {
  * this one link with bind(editor, stream), then calls start() (the hello). Bind before start: delivery may be
  * synchronous, and a live link loads every bound Editor.
  * @param {{ transport: import("../ports/transport.js").Transport,
+ *           fetchSnapshot?: import("../ports/net.js").FetchSnapshot | null,
  *           token: string, board: string, client?: string, tab?: string | null, onStatus?: (s: string) => void,
  *           onRoom?: (ev: object) => void,
  *           timeoutMs?: number, clock?: import("../ports/clock.js").Clock,
@@ -64,19 +65,28 @@ export function bindEditor(editor, { stream = "board", ...o }) {
  *   tab: this browser tab's id (createSession mints it once per page load), sent in every hello of this link as
  *   hello.tab (PROTOCOL.md § Messages, `hello.tab`): the gateway counts tabs, not connections. null: no `tab` key at all
  *   (the gateway then counts this connection as a tab of its own).
+ *   fetchSnapshot: optional F9 HTTP snapshot fetcher from the net port. When provided, hello advertises `snap: "http"`;
+ *   on failure it disables HTTP snapshots for the next reconnect on this link and falls back cleanly to inline WS.
  *   onHeard(): every message the room sends on the current connection (welcome, entries, here, presence, …), and
  *   only those: local actions (a records op shown at once, a dismissed setting) never fire it.
  *   onRoom(ev): what the room said, once per link: presence, here, emotes, records, refused, role, limit, and
  *   settings ({ type: "settings", stream }).
  */
-export function openLink({ transport, token: firstToken, board, client = "web", tab = null, session, onStatus = () => {}, onRoom = () => {}, onHeard = () => {},
+export function openLink({ transport, fetchSnapshot = null, token: firstToken, board, client = "web", tab = null, session, onStatus = () => {}, onRoom = () => {}, onHeard = () => {},
   timeoutMs = 10_000, clock = null, timers = clock ? { set: clock.set, clear: clock.clear } : null, now = clock?.now, random = clock?.random }) {
   if (typeof transport?.reopen !== "function") throw new TypeError("bindEditor: the transport must have reopen() (web/ports/transport.js)");
   if (typeof now !== "function" || typeof random !== "function" || (timeoutMs !== 0 && typeof timers?.set !== "function"))
     throw new TypeError("bindEditor: pass the clock port (clock) or timers, now and random");
   // hello.tab: the Replica puts `tab` in every hello (first, backoff, reconnect, resync) and throws on one that fails
   // TAB_RE. It must be absent, not null, when there is none: Replica checks every value it is given.
-  const replica = new Replica({ client, ...(tab != null ? { tab } : {}), ...(session !== undefined ? { session } : {}), now, random });
+  const replica = new Replica({
+    client,
+    ...(tab != null ? { tab } : {}),
+    ...(session !== undefined ? { session } : {}),
+    now,
+    random,
+    snapHttp: typeof fetchSnapshot === "function",
+  });
   let token = firstToken;
   const timed = timeoutMs !== 0;
   // Rate limits measure intervals: monotonic time when the clock port is given (p6-portsv R2-L4), else `now`.
@@ -85,6 +95,15 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
   // connecting → catching-up → live; "refused" (sign in again), "stopped" (the app must update)
   let status = "connecting";
   let timer = null, closed = false, started = false;
+  let snapAbort = null, snapGen = 0;   // F9: in-flight HTTP snapshot fetch cancellation & generation guard
+  function cancelSnapshotFetch() {
+    snapGen++;
+    if (snapAbort) {
+      const ac = snapAbort;
+      snapAbort = null;
+      try { ac.abort(); } catch {}
+    }
+  }
   let hellos = 0;                 // hellos sent on this link (every connect: the first, backoff, reconnect())
   let down = false;               // resync asked for: the connection is closed, the backoff runs, input is ignored
   // The writer caps (PROTOCOL.md § Messages, `hello.tab`: a ninth writer tab, or a third connection of one tab, gets
@@ -124,6 +143,7 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
   }
 
   function connect() {
+    cancelSnapshotFetch();
     const [hello] = replica.connectMessages(token, board);
     hellos++;
     setStatus(limited ? "limited" : "connecting");
@@ -133,7 +153,7 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
   function reopen() { if (closed) return; down = false; transport.reopen(); connect(); }
   // The Replica asked for a fresh connection. The old one stays as it is (its messages are ignored from
   // now on) until reopen() replaces it: close() is for good, never part of a resync.
-  function goDown() { down = true; setStatus(limited ? "limited" : "connecting"); arm(); }
+  function goDown() { cancelSnapshotFetch(); down = true; setStatus(limited ? "limited" : "connecting"); arm(); }
 
   // Status from the Replica's state. Entering `live` loads every bound Editor from the caught-up Replica.
   function refreshStatus() {
@@ -141,8 +161,46 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
     if (replica.needAuth) return setStatus("refused");   // a refusal wins over the cap (p7-wirev R2-M1)
     if (limited) return setStatus("limited");
     if (down || !replica.welcomed) return setStatus("connecting");
-    if (replica.applied < replica.target) return setStatus("catching-up");
+    if (replica.awaitingSnapshot || replica.applied < replica.target) return setStatus("catching-up");
     if (status !== "live") { for (const b of binds) b.load(); setStatus("live"); }
+  }
+
+  // F9: fetch the offloaded snapshot over HTTP and feed it into Replica. On failure, disable HTTP snapshots for the
+  // next reconnect on this link so the server sends the inline WS snapshot — never dropping pending ops.
+  function startSnapshotFetch(req) {
+    cancelSnapshotFetch();
+    if (typeof fetchSnapshot !== "function" || closed || down) return;
+    const gen = ++snapGen;
+    const ac = typeof AbortController === "function" ? new AbortController() : null;
+    snapAbort = ac;
+    Promise.resolve()
+      .then(() => fetchSnapshot(req.url, ac ? { signal: ac.signal } : {}))
+      .then(snapMsg => {
+        if (gen !== snapGen || closed || down) return;
+        snapAbort = null;
+        if (
+          !snapMsg || typeof snapMsg !== "object" || snapMsg.t !== "snapshot" || snapMsg.seq !== req.seq ||
+          !snapMsg.streams || typeof snapMsg.streams !== "object" ||
+          !snapMsg.streams.board || !Array.isArray(snapMsg.streams.board.elements) ||
+          !snapMsg.streams.notes || !Array.isArray(snapMsg.streams.notes.elements)
+        ) {
+          throw new Error("invalid snapshot response");
+        }
+        const did = replica.receive(snapMsg);
+        noteSequenced(did);
+        if (status === "live" && !did.reset && !replica.resync && did.snapshot) {
+          const held = snapMsg.streams;
+          for (const b of binds) if (!held || Object.hasOwn(held, b.stream)) b.load();
+        }
+        pump();
+        afterReceive(snapMsg, did, null);
+      })
+      .catch(() => {
+        if (gen !== snapGen || closed || down) return;
+        snapAbort = null;
+        replica.disableHttpSnapshot();
+        pump();
+      });
   }
 
   // After every receive, local change and timer: send what the Replica lets go, then one timer.
@@ -197,6 +255,7 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
         for (const b of binds) { b.feed(ids.get(b.stream) ?? new Set()); b.syncSettings(); }
       }
     }
+    if (did.snapshotFetch && !did.reset && !replica.resync) startSnapshotFetch(did.snapshotFetch);
     pump();
     afterReceive(msg, did, refusedRecord);
   });
@@ -304,7 +363,7 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
       reopen();
     },
     /** Finished for good: no more sends, no timer, and the transport is closed (the only caller of its close()). */
-    close() { if (closed) return; closed = true; arm(); transport.close(); },
+    close() { if (closed) return; closed = true; cancelSnapshotFetch(); arm(); transport.close(); },
   };
 
   return {

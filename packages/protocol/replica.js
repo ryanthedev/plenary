@@ -24,18 +24,21 @@ import { Records } from "./records.js";
 import { PREVIEW_TTL_MS } from "./presence.js";
 
 export class Replica {
-  /** @param {{ client: string, tab?: string, session?: string, now?: () => number, random?: () => number, idleTimeoutMs?: number | null }} o — a name for this client (each
+  /** @param {{ client: string, tab?: string, session?: string, now?: () => number, random?: () => number, idleTimeoutMs?: number | null, snapHttp?: boolean }} o — a name for this client (each
    *  Replica adds its own session part, so a reloaded page reusing the name never collides with its old op
    *  ids; pass `session` to supply one deterministically without Math.random), the browser tab it belongs to
-   *  (sent as hello.tab, § Messages; omitted when not given), a clock in ms, and a random source in [0, 1) for
-   *  the backoff's jitter. */
-  constructor({ client, tab, session, now = Date.now, random = Math.random, idleTimeoutMs = null }) {
+   *  (sent as hello.tab, § Messages; omitted when not given), a clock in ms, a random source in [0, 1) for
+   *  the backoff's jitter, and optional `snapHttp` (F9: advertise `snap: "http"` in hello). */
+  constructor({ client, tab, session, now = Date.now, random = Math.random, idleTimeoutMs = null, snapHttp = false }) {
     if (tab !== undefined && !isTab(tab)) throw new Error("tab must match /^[A-Za-z0-9_-]{1,32}$/");
     if (session !== undefined && (typeof session !== "string" || !session || session.includes(":"))) throw new Error("session must be a non-empty string without ':'");
     this.tab = tab;
     this.client = `${client}.${session ?? Math.floor(Math.random() * 2 ** 31).toString(36)}`; this.counter = 0;
     this.now = now; this.random = random;
     this.idleTimeoutMs = idleTimeoutMs;   // explicit override (ms), or null to use ceil(2.5 * welcome.hb)
+    this.snapHttp = !!snapHttp;
+    this.snapHttpDisabled = false;        // set on HTTP snapshot failure so reconnect falls back to inline WS snapshot
+    this.awaitingSnapshot = null;         // { seq, url, bytes? } while waiting for an HTTP snapshot fetch (F9)
     this.hbTimeoutMs = 0;
     this.fails = 0;             // failed connections in a row (rule 12); back to 0 only after a proven connection
     this.goodAt = null;         // when this connection caught up to welcome.seq (null: not yet)
@@ -76,6 +79,7 @@ export class Replica {
     this.confirmedRecords = new Records();   // comments and reactions as the room ordered them
     this.noteAuthor = new Map();         // notes element id → who made it (which notes an annotator may change)
     this.buffer = new Map();             // seq → entry, arrived ahead of a gap
+    this.awaitingSnapshot = null;
     this.previewBy = new Map();          // "stream\nid" → { stream, el, user, client, at }: others' in-flight previews (display only)
     this.previews = new Map();           // element id → element, every stream together (kept for callers that predate previewsOf)
     this.overlay();
@@ -93,12 +97,14 @@ export class Replica {
     // A stale op was dropped but the copy still shows it (the connection ended before the resync): start from 0.
     if (this.staleSeen) { this.staleSeen = false; this.reset(); }
     this.resync = false; this.needAuth = false; this.welcomed = false; this.target = null; this.board = board;
+    this.awaitingSnapshot = null;
     this.early = [];   // entries and snapshots of this connection that arrived before its welcome
     this.proven();
     this.helloAt = this.now(); this.progressAt = null; this.heardAt = null; this.hbTimeoutMs = 0; this.wasProven = false; this.counted = false;
     for (const p of this.pending.values()) { p.wrote = null; p.answered = false; p.resend = p.msg.sentAt !== undefined; }
     const hello = { t: "hello", v: PROTOCOL_VERSION, token, board, since: this.applied, client: this.client };
     if (this.tab !== undefined) hello.tab = this.tab;
+    if (this.snapHttp && !this.snapHttpDisabled) hello.snap = "http";
     return [hello];
   }
 
@@ -211,7 +217,7 @@ export class Replica {
   // Held changes go out as one op once none of their keys is busy, and only on a connection that has
   // caught up (after a `stale`, only after the resync), so their base comes from the current copy.
   release() {
-    if (this.stopped || this.resync || this.staleSeen || !this.welcomed || this.applied < this.target) return;
+    if (this.stopped || this.resync || this.staleSeen || !this.welcomed || this.awaitingSnapshot || this.applied < this.target) return;
     for (const s of ELEMENT_STREAMS) {
       const h = this.held[s];
       if (!h || Object.keys(h).some(k => this.busy(s, k))) continue;
@@ -289,7 +295,7 @@ export class Replica {
   nextToSend() {
     for (const p of this.pending.values()) {
       if (p.wrote !== null) continue;
-      return p.msg.sentAt !== undefined || this.applied >= this.target ? p : null;
+      return p.msg.sentAt !== undefined || (!this.awaitingSnapshot && this.applied >= this.target) ? p : null;
     }
     return null;
   }
@@ -304,7 +310,8 @@ export class Replica {
     const t = this.now(), out = [];
     // A timeout means the server was silent for the timeout stretch: that stretch doesn't count as staying up.
     if (this.overdue(t)) {
-      const idleDue = this.welcomed && this.applied >= this.target && this.hbTimeoutMs > 0 && this.heardAt !== null && this.heardAt + this.hbTimeoutMs <= t;
+      if (this.awaitingSnapshot) { this.snapHttpDisabled = true; this.awaitingSnapshot = null; }
+      const idleDue = this.welcomed && !this.awaitingSnapshot && this.applied >= this.target && this.hbTimeoutMs > 0 && this.heardAt !== null && this.heardAt + this.hbTimeoutMs <= t;
       this.failed(idleDue ? this.heardAt : t - CONNECT_TIMEOUT_MS);
       return [];
     }
@@ -323,7 +330,7 @@ export class Replica {
   overdue(t) { const left = this.timeLeft(t); return left !== null && left <= 0; }
   timeLeft(t) {
     if (!this.welcomed) return this.helloAt + CONNECT_TIMEOUT_MS - t;
-    let left = this.applied < this.target
+    let left = (this.awaitingSnapshot || this.applied < this.target)
       ? this.progressAt + CONNECT_TIMEOUT_MS - t
       : (this.hbTimeoutMs > 0 && this.heardAt !== null ? this.heardAt + this.hbTimeoutMs - t : null);
     for (const p of this.pending.values()) if (p.wrote !== null && !p.answered) { const mine = p.wrote + OP_TIMEOUT_MS - t; left = left === null ? mine : Math.min(left, mine); }
@@ -332,6 +339,18 @@ export class Replica {
 
   // This connection failed: one more toward the backoff (once per connection), and a new one is wanted.
   failed(upTo = this.now()) { if (!this.counted) { this.proven(upTo); this.counted = true; this.fails++; } this.resync = true; }
+
+  /**
+   * HTTP snapshot fetch failed (network error, HTTP error, bad JSON, or timeout): disable HTTP snapshots for the next
+   * reconnect on this link so the server sends the inline WS snapshot, and trigger a clean reconnect without dropping
+   * any pending ops.
+   */
+  disableHttpSnapshot() {
+    this.snapHttpDisabled = true;
+    this.awaitingSnapshot = null;
+    if (this.helloAt !== null && !this.resync) this.failed();
+    else this.resync = true;
+  }
 
   // Rule 12: the count goes back to 0 only for a connection that proved itself: caught up to welcome.seq
   // and still connected 10 s later (`upTo`: when it stopped being good). Looked at when the next wait is
@@ -383,7 +402,8 @@ export class Replica {
     const did = { entries: [], snapshot: false, reset: false, settled: [], dropped: [], refusedSettings: [], retryReady: [] };
     if (!msg || this.stopped) return did;
     this.heardAt = this.now();
-    if (msg.t === "snapshot" || msg.t === "entries") this.progressAt = this.heardAt;
+    // While awaiting an HTTP snapshot, arriving tail/live entries must not extend the snapshot fetch deadline.
+    if (msg.t === "snapshot" || (msg.t === "entries" && !this.awaitingSnapshot)) this.progressAt = this.heardAt;
     if ((msg.t === "snapshot" || msg.t === "entries") && !this.welcomed && this.helloAt !== null) { this.early.push(msg); return did; }
     if (msg.t === "welcome") {
       this.welcome(msg, did);
@@ -444,12 +464,23 @@ export class Replica {
     }
     this.welcomed = true; this.role = msg.role; this.user = msg.user; this.target = msg.seq; this.horizon = msg.horizon ?? 0;
     this.progressAt = this.now();
-    if (this.applied >= this.target) this.goodAt = this.now();
-    if (other) { if (did.dropped.length) { this.discarded = (this.discarded ?? 0) + did.dropped.length; this.discard(did); } this.forgetSettings(did, "user-changed"); return; }
+    if (other) {
+      if (did.dropped.length) { this.discarded = (this.discarded ?? 0) + did.dropped.length; this.discard(did); }
+      else if (this.applied >= this.target) this.goodAt = this.now();
+      this.forgetSettings(did, "user-changed");
+      return;
+    }
     // The room has forgotten this client (§ Op ids): ops sent before its horizon may or may not have been
     // logged, and the room would answer `stale`. Drop them now, and start over from the room's copy.
     if (msg.high === 0) for (const [id, p] of this.pending) if (p.msg.sentAt !== undefined && p.msg.sentAt < this.horizon) { this.pending.delete(id); did.dropped.push(id); }
-    if (did.dropped.length) this.discard(did, did.dropped.length);
+    if (did.dropped.length) { this.discard(did, did.dropped.length); return; }
+    // F9: off-WS HTTP snapshot fetch when requested and the server advertised a snapshot newer than what we have applied.
+    const snap = msg.snapshot;
+    if (this.snapHttp && !this.snapHttpDisabled && snap && typeof snap === "object" && Number.isSafeInteger(snap.seq) && typeof snap.url === "string" && snap.url && snap.seq > this.applied) {
+      this.awaitingSnapshot = { seq: snap.seq, url: snap.url, ...(Number.isFinite(snap.bytes) ? { bytes: snap.bytes } : {}) };
+      did.snapshotFetch = { ...this.awaitingSnapshot };
+    }
+    if (!this.awaitingSnapshot && this.applied >= this.target) this.goodAt = this.now();
     this.release();
   }
 
@@ -457,7 +488,10 @@ export class Replica {
   discard(did, unconfirmed = 0) { this.unconfirmed += unconfirmed; this.reset(); did.reset = true; this.resync = true; }
 
   snapshot(msg, did) {
-    if (msg.seq <= this.applied) return;
+    if (msg.seq <= this.applied) {
+      if (this.awaitingSnapshot && msg.seq >= this.awaitingSnapshot.seq) this.awaitingSnapshot = null;
+      return;
+    }
     for (const s of ELEMENT_STREAMS) {
       const sc = msg.streams[s], doc = this.streams[s];
       doc.load({ elements: clone(sc.elements), appState: clone(sc.appState) });
@@ -468,12 +502,14 @@ export class Replica {
     this.confirmedRecords = new Records(msg.records);
     this.noteAuthor = new Map(msg.noteAuthor ?? []);
     this.applied = msg.seq; did.snapshot = true;
+    if (this.awaitingSnapshot && msg.seq >= this.awaitingSnapshot.seq) this.awaitingSnapshot = null;
     for (const k of [...this.buffer.keys()]) if (k <= this.applied) this.buffer.delete(k);
     this.overlay();
     this.drain(did);
   }
 
   drain(did) {
+    if (this.awaitingSnapshot) return;
     while (this.buffer.has(this.applied + 1)) {
       const e = this.buffer.get(this.applied + 1); this.buffer.delete(e.seq);
       if (e.rv !== undefined && !RULES[e.rv]) { this.stopped = "version"; return; }   // rules this app doesn't know

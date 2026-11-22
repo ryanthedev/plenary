@@ -55,10 +55,10 @@ if (!signIn.token) {
   // Display only (p6-landv L5): the room decides the real user and role on every hello (the note lock uses welcome.user).
   const id = signIn.identity;
   const me = { role: null, user: id?.user ?? "me", name: id?.name ?? id?.email ?? "You" };
-  const net = wsNet({ url: sameOriginWsUrl(location), WebSocket: globalThis.WebSocket, clock });
+  const net = wsNet({ url: sameOriginWsUrl(location), WebSocket: globalThis.WebSocket, clock, fetch: (...a) => globalThis.fetch(...a) });
   const app = mountApp({
     startSession: ({ mine, onChange }) => createSession({
-      join: () => net.join(), token: signIn.token, board, client: "web", user: me.user, mine, onChange, clock,
+      join: () => net.join(), fetchSnapshot: net.fetchSnapshot, token: signIn.token, board, client: "web", user: me.user, mine, onChange, clock,
     }),
     net, board, me, prefs: localStore(), theme: q.get("theme"),
     // The collaboration UI over this session (presence and records ride the board connection; web/adapters/collab/sync.js).

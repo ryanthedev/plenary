@@ -62,7 +62,7 @@ export function drawLasers(ctx, lasers, view, theme = "light") {
   const color = LASER[theme] ?? LASER.light;
   ctx.save(); ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.strokeStyle = color; ctx.fillStyle = color;
   for (const l of lasers) {
-    const pts = l.pts.map(p => ({ ...view.toScreen(p), a: Math.max(0, 1 - p.age / LASER_FADE_MS) }));
+    const pts = l.pts.map(p => ({ ...view.toScreen(p), a: Number.isFinite(p.alpha) ? p.alpha : Math.max(0, 1 - p.age / LASER_FADE_MS) }));
     for (let i = 1; i < pts.length; i++) {
       const a = Math.min(pts[i - 1].a, pts[i].a);
       if (a <= 0) continue;
@@ -92,12 +92,12 @@ export function drawCursors(ctx, cursors, view) {
 
 /**
  * Everything, in order (selections under cursors). `pv` = presence view(); `previews` = [{ el, user, name }].
- * @returns {boolean} true while something is still fading (keep painting)
+ * @returns {boolean} true while something is still animating or fading (keep painting)
  */
-export function drawPresence(ctx, pv, view, { element, previews = [], colorFor, theme = "light" }) {
+export function drawPresence(ctx, pv, view, { element, previews = pv.previews ?? [], colorFor, theme = "light" }) {
   drawSelections(ctx, pv.selections, view, element);
   drawPreviews(ctx, previews, view, colorFor);
   drawLasers(ctx, pv.lasers, view, theme);
   drawCursors(ctx, pv.cursors, view);
-  return pv.lasers.length > 0;
+  return pv.needsFrame !== undefined ? !!pv.needsFrame : pv.lasers.length > 0;
 }

@@ -16,17 +16,25 @@ const THREAD_CHARS = 64, COMMENT_CHARS = 64, REACTION_CHARS = 8;
 const threadChars = t => THREAD_CHARS + JSON.stringify(t.anchor).length;
 const reactionChars = (emoji, user) => REACTION_CHARS + emoji.length + String(user).length;
 
+function threadToJSON(t) {
+  return {
+    id: t.id, anchor: copy(t.anchor), by: t.by, name: t.name, at: t.at, ...(t.resolved ? { resolved: { ...t.resolved } } : {}),
+    // fromEntries defines own keys, so an emoji named like a prototype key stays plain data.
+    comments: t.comments.map(c => ({ id: c.id, by: c.by, name: c.name, at: c.at, text: c.text, ...(c.edited !== undefined ? { edited: c.edited } : {}), ...(c.deleted !== undefined ? { deleted: c.deleted } : {}), reactions: Object.fromEntries([...c.reactions].map(([e, us]) => [e, [...us]])) })),
+  };
+}
+
 export class Records {
   /** @param {{ threads: object[] }} [data] the snapshot shape (§ Records, "Shape in snapshots") */
   constructor(data) { this.load(data); }
 
   load(data) {
-    this.threads = new Map();    // thread id → { id, anchor, by, at, resolved?, comments: [] }, in creation order
+    this.threads = new Map();    // thread id → { id, anchor, by, at, resolved?, comments: [], _json }, in creation order
     this.comments = new Map();   // comment id → { thread, comment }; a thread's first comment has the thread's id
     this.chars = 0;
     this.rev = (this.rev ?? 0) + 1;
     for (const raw of data?.threads ?? []) {
-      const t = { id: raw.id, anchor: copy(raw.anchor), by: raw.by, name: raw.name ?? null, at: raw.at, ...(raw.resolved ? { resolved: copy(raw.resolved) } : {}), comments: [] };
+      const t = { id: raw.id, anchor: copy(raw.anchor), by: raw.by, name: raw.name ?? null, at: raw.at, ...(raw.resolved ? { resolved: copy(raw.resolved) } : {}), comments: [], _json: null };
       this.threads.set(t.id, t); this.chars += threadChars(t);
       for (const rc of raw.comments ?? []) {
         const c = { id: rc.id, by: rc.by, name: rc.name ?? null, at: rc.at, text: rc.text, ...(rc.edited !== undefined ? { edited: rc.edited } : {}), ...(rc.deleted !== undefined ? { deleted: rc.deleted } : {}), reactions: new Map() };
@@ -36,14 +44,17 @@ export class Records {
     }
   }
 
-  /** The snapshot shape: plain data, tombstones included. */
+  /** Plain snapshot JSON for one thread, cached per thread until that thread mutates (E-3). */
+  threadJSON(id) {
+    const t = this.threads.get(id);
+    if (!t) return null;
+    return t._json ?? (t._json = threadToJSON(t));
+  }
+
+  /** The snapshot shape: plain data, tombstones included. Reuses cached per-thread JSON for untouched threads. */
   toJSON() {
     const threads = [];
-    for (const t of this.threads.values()) threads.push({
-      id: t.id, anchor: copy(t.anchor), by: t.by, name: t.name, at: t.at, ...(t.resolved ? { resolved: { ...t.resolved } } : {}),
-      // fromEntries defines own keys, so an emoji named like a prototype key stays plain data.
-      comments: t.comments.map(c => ({ id: c.id, by: c.by, name: c.name, at: c.at, text: c.text, ...(c.edited !== undefined ? { edited: c.edited } : {}), ...(c.deleted !== undefined ? { deleted: c.deleted } : {}), reactions: Object.fromEntries([...c.reactions].map(([e, us]) => [e, [...us]])) })),
-    });
+    for (const t of this.threads.values()) threads.push(t._json ?? (t._json = threadToJSON(t)));
     return { threads };
   }
 
@@ -108,7 +119,7 @@ export class Records {
     if (!op || typeof op !== "object") return false;
     if (op.do === "thread") {
       if (this.comments.has(op.id) || this.threads.has(op.id)) return false;
-      const t = { id: op.id, anchor: copy(op.anchor), by, name, at, comments: [] };
+      const t = { id: op.id, anchor: copy(op.anchor), by, name, at, comments: [], _json: null };
       this.threads.set(t.id, t); this.chars += threadChars(t);
       return this.add(t, op, by, at, name);
     }
@@ -120,9 +131,10 @@ export class Records {
     if (op.do === "resolve" || op.do === "reopen" || op.do === "move") {
       const t = this.threads.get(op.id);
       if (!t || Records.hidden(t)) return false;
-      if (op.do === "move") { this.chars -= threadChars(t); t.anchor = copy(op.anchor); this.chars += threadChars(t); return true; }
+      if (op.do === "move") { this.chars -= threadChars(t); t.anchor = copy(op.anchor); this.chars += threadChars(t); t._json = null; return true; }
       if ((op.do === "resolve") === !!t.resolved) return false;   // repeating is a no-op
       if (op.do === "resolve") t.resolved = { by, name, at }; else delete t.resolved;
+      t._json = null;
       return true;
     }
     const found = this.comments.get(op.id);
@@ -132,17 +144,18 @@ export class Records {
       if (c.deleted !== undefined) return false;
       this.chars -= c.text.length;
       for (const [emoji, users] of c.reactions) for (const u of users) this.chars -= reactionChars(emoji, u);
-      c.text = ""; c.reactions = new Map(); c.deleted = at;
+      c.text = ""; c.reactions = new Map(); c.deleted = at; found.thread._json = null;
       return true;
     }
     if (this.dead(found)) return false;
-    if (op.do === "edit") { this.chars += op.text.length - c.text.length; c.text = op.text; c.edited = at; return true; }
+    if (op.do === "edit") { this.chars += op.text.length - c.text.length; c.text = op.text; c.edited = at; found.thread._json = null; return true; }
     if (op.do === "react") {
       // Set, never flip: keyed by (comment, user, emoji), so a resend or a replay lands the same.
       const users = c.reactions.get(op.emoji) ?? [], has = users.includes(by);
       if (op.on === has) return false;
       if (op.on) { users.push(by); c.reactions.set(op.emoji, users); this.chars += reactionChars(op.emoji, by); }
       else { users.splice(users.indexOf(by), 1); if (!users.length) c.reactions.delete(op.emoji); this.chars -= reactionChars(op.emoji, by); }
+      found.thread._json = null;
       return true;
     }
     return false;
@@ -151,6 +164,7 @@ export class Records {
   add(t, op, by, at, name) {
     const c = { id: op.id, by, name, at, text: op.text, reactions: new Map() };
     t.comments.push(c); this.comments.set(c.id, { thread: t, comment: c }); this.chars += COMMENT_CHARS + c.text.length;
+    t._json = null;
     return true;
   }
 }

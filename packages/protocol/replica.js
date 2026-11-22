@@ -610,13 +610,42 @@ export class Replica {
     doc.appState.herdr = next; doc.rev++; doc._sorted = null;
   }
 
-  /** Comments and reactions to show: the room's, with this client's unacknowledged actions on top (snapshot shape). */
+  /** Comments and reactions to show: the room's, with this client's unacknowledged actions on top (snapshot shape).
+   *  Incremental (E-3): reuses cached per-thread JSON for untouched threads and overlays only threads touched by
+   *  pending records ops. */
   recordsState() {
     if (this.recordsShown?.rev === this.recordsRev) return this.recordsShown.data;
-    const shown = new Records(this.confirmedRecords.toJSON()), t = this.now();
-    for (const p of this.pending.values()) if (p.stream === "records") shown.apply(p.op, this.user, t, null);
-    this.recordsShown = { rev: this.recordsRev, data: shown.toJSON() };
-    return this.recordsShown.data;
+    const pending = [];
+    for (const p of this.pending.values()) if (p.stream === "records") pending.push(p);
+    let data;
+    if (!pending.length) {
+      data = this.confirmedRecords.toJSON();
+    } else {
+      const touched = new Set();
+      for (const { op } of pending) {
+        if (!op) continue;
+        if (op.do === "thread" || op.do === "resolve" || op.do === "reopen" || op.do === "move") {
+          if (this.confirmedRecords.threads.has(op.id)) touched.add(op.id);
+        } else if (op.do === "reply") {
+          if (this.confirmedRecords.threads.has(op.thread)) touched.add(op.thread);
+        } else {
+          const tid = this.confirmedRecords.comments.get(op.id)?.thread.id;
+          if (tid) touched.add(tid);
+        }
+      }
+      const seed = [];
+      for (const tid of touched) seed.push(this.confirmedRecords.threadJSON(tid));
+      const overlay = new Records({ threads: seed }), t = this.now();
+      for (const p of pending) overlay.apply(p.op, this.user, t, null);
+      const threads = [];
+      for (const tid of this.confirmedRecords.threads.keys()) {
+        threads.push(touched.has(tid) ? overlay.threadJSON(tid) : this.confirmedRecords.threadJSON(tid));
+      }
+      for (const tid of overlay.threads.keys()) if (!touched.has(tid)) threads.push(overlay.threadJSON(tid));
+      data = { threads };
+    }
+    this.recordsShown = { rev: this.recordsRev, data };
+    return data;
   }
 
   /** The board as data, for comparing copies: elements by id, appState, the seq it's at. */

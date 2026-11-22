@@ -557,13 +557,15 @@ may drop at any hop. It doesn't touch the room: gateways relay it over the bus (
 | `laser` | `pts: [[x, y, t]]` (≤ 64) | owner, editor | 30/s | every batch; fades on clients |
 | `preview` | `stream`, `elements` (≤ 50, ≤ 64 KB) | writers of that stream | 20/s | latest per element wins; display only |
 | `emote` | `e`, one of the fixed set 👍 ❤️ 😂 🎉 👏 😮 🙏 🔥 (`EMOTES` in presence.js; changing it changes the protocol) | everyone, viewers too | 4/s | writers' as presence; viewers' only as `emotes` counts |
-| `leave` | — | sent by the gateway on disconnect | — | best effort |
+| `leave` | — | sent by the gateway on writer disconnect (viewers hold no cursor/select/preview/laser) | — | best effort |
 
 - Over the rate or size → dropped silently, no error.
 - No role checks beyond the "who sends" column: a `preview` isn't checked for note ownership. It is display only;
   the final op is checked.
-- Gateways send `presence` batches every 50 ms, coalesced. Under load they may thin: owner and editor presence
-  first; annotator and commenter cursors are capped at the 50 most recently active per board.
+- **Role-scoped fan-out:** gateways send full coalesced `presence` batches to writers every **50 ms** (20/s), and
+  send **viewers** presenters' (`owner`, `editor`) presence plus writers' `emote`s only, every **100 ms** (10/s),
+  encoded once per board. Under load they may thin further: owner and editor presence first; annotator and commenter
+  cursors are capped at the 50 most recently active per board.
 - **Emote counts:** each gateway publishes its viewers' counts for each 500 ms window on the board's `.emotes`
   subject; every gateway sums all gateways' counts for that window and sends the total to its clients.
 - A `preview` is shown over the board, never merged into it (it may tie the final op on version). The final op's

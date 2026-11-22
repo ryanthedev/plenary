@@ -74,7 +74,8 @@ export const LIMITS = {
   maxConnsPerTab: MAX_TAB_CONNS,            // writer connections per (user, board, tab) on this gateway; a third gets `limit`
   idleTimeoutSec: 30,                       // heard nothing (no frame, no pong) for this long: closed
   hbIdleMs: HB_IDLE_MS,                     // § Pacing: send { t: "hb" } to a welcomed connection with no outbound frame this long
-  presenceMs: 50,                           // coalesced presence goes out this often
+  presenceMs: 50,                           // coalesced presence goes out to writers this often (20/s)
+  viewerPresenceMs: 100,                    // coalesced presenter-only presence goes out to viewers this often (10/s, E-4)
   emoteWindowMs: 500,                       // viewers' emotes are summed per window
   connListMs: 5_000,                        // open writer connections are listed to each room this often
   roleRecheckMs: 60_000,                    // every live connection's role is computed again this often (a link or invite expiring is not a `grants` message)
@@ -215,8 +216,8 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       c.owed = 0; dropQueue(c); waiters.delete(ws); c.opq.length = 0;
       // § Bus: the close notice (rule 6), for a connection the room heard of.
       if (c.forwarded) bus.publish(subjects.inbox(c.tenant, c.board), { n: ++c.n, conn: c.id, gateway: id, closed: true })?.catch?.(() => {});
-      // § Presence: `leave`, so everyone drops this connection's cursor now rather than in 30 s.
-      if (c.welcomed) bus.publish(subjects.presence(c.tenant, c.board), { gateway: id, user: c.user, client: c.client, leave: true })?.catch?.(() => {});
+      // § Presence: `leave` for writers only (viewers hold no cursor/select/preview/laser), so everyone drops their cursor now.
+      if (c.welcomed && c.role !== "viewer") bus.publish(subjects.presence(c.tenant, c.board), { gateway: id, user: c.user, client: c.client, role: c.role, leave: true })?.catch?.(() => {});
     }
     leaveBoard(ws);   // also a connection that joined its board and closed during the rest of its hello
     try { ws.close(code, reason); } catch { /* already closed */ }
@@ -465,13 +466,15 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     const key = `${tenant}/${board}`;
     let b = boards.get(key);
     if (!b) {
-      b = { key, tenant, board, conns: new Set(), refs: 0, coalescer: presenceCoalescer(), mine: {}, sums: new Map(), unsubs: [], rc: newRecheck(),
+      b = { key, tenant, board, conns: new Set(), refs: 0, coalescer: presenceCoalescer(), viewerCoalescer: presenceCoalescer(), viewerPresenceAt: 0, mine: {}, sums: new Map(), unsubs: [], rc: newRecheck(),
         // `here` (§ Presence): this gateway's writer users and viewer connections, the latest `.here` per gateway, what was sent.
         hw: new Map(), hv: 0, hvTabs: new Map(), hFrom: new Map(), hChanged: false, hPubAt: 0, hText: null, hCountText: null, hKey: null, hVer: 0, hOut: false, hSentAt: 0, hSending: false };
       b.feed = feedOf({ tenant, board, store, bus, log, codec, onLive: e => onLive(b, e), ...lim.feed });
       b.unsubs.push(bus.subscribe(subjects.presence(tenant, board), m => {
         if (!m || typeof m.user !== "string" || typeof m.client !== "string") return;
-        if (m.leave) b.coalescer.leave(m.user, m.client); else if (m.msg && typeof m.msg === "object") b.coalescer.add(m.user, m.client, m.msg);
+        const forViewer = m.role === "owner" || m.role === "editor" || (!m.leave && m.msg?.k === "emote");
+        if (m.leave) { b.coalescer.leave(m.user, m.client); if (forViewer) b.viewerCoalescer.leave(m.user, m.client); }
+        else if (m.msg && typeof m.msg === "object") { b.coalescer.add(m.user, m.client, m.msg); if (forViewer) b.viewerCoalescer.add(m.user, m.client, m.msg); }
       }));
       b.unsubs.push(bus.subscribe(subjects.emotes(tenant, board), m => {
         if (!m || !Number.isSafeInteger(m.window) || !m.counts || typeof m.counts !== "object") return;
@@ -831,18 +834,34 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
   }, Math.max(10, Math.min(lim.hereMs, lim.herePublishMs, lim.hereBigMs)));
   hereTimer.unref?.();
 
-  // Presence out: every 50 ms, each board's coalesced batch to its welcomed connections, without their own.
+  // Presence out (E-4): every presenceMs (50 ms), writers get the full coalesced batch (without their own); every
+  // viewerPresenceMs (100 ms), viewers get presenters' presence only (owner/editor + emotes), encoded once per board.
   const presenceTimer = setInterval(() => {
     try {
+      const t = now();
       for (const b of boards.values()) {
-        if (!b.coalescer.size) continue;
-        const batch = b.coalescer.flush(), full = codec.encode({ t: "presence", batch });
-        // Whose presence is in the batch, looked up once per connection: a mass close (thousands of `leave`s) must
-        // not make this connections × batch (p2-tune: 2,000 leaves × 2,000 connections held the loop ~130 ms).
-        const senders = new Set(batch.map(x => `${x.user}\n${x.client}`));
+        const doWriters = b.coalescer.size > 0;
+        const doViewers = b.viewerCoalescer.size > 0 && t - b.viewerPresenceAt >= lim.viewerPresenceMs;
+        if (!doWriters && !doViewers) continue;
+        let batch = null, full = null, senders = null;
+        if (doWriters) {
+          batch = b.coalescer.flush();
+          full = codec.encode({ t: "presence", batch });
+          // Whose presence is in the batch, looked up once per connection: a mass close (thousands of `leave`s) must
+          // not make this connections × batch (p2-tune: 2,000 leaves × 2,000 connections held the loop ~130 ms).
+          senders = new Set(batch.map(x => `${x.user}\n${x.client}`));
+        }
+        let viewerFull = null;
+        if (doViewers) {
+          b.viewerPresenceAt = t;
+          const vb = b.viewerCoalescer.flush();
+          if (vb.length) viewerFull = codec.encode({ t: "presence", batch: vb });
+        }
         for (const ws of welcomedOn(b)) {
           const c = ws.data;
           if (c.outBytes > lim.maxConnQueuedBytes / 2) continue;   // presence may drop: a reader this far behind skips it
+          if (c.role === "viewer") { if (viewerFull) push(ws, viewerFull); continue; }
+          if (!doWriters) continue;
           const mine = x => x.user === c.user && x.client === c.client;
           if (!senders.has(`${c.user}\n${c.client}`)) { push(ws, full); continue; }
           const rest = batch.filter(x => !mine(x));
@@ -1045,7 +1064,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     hereActive(c);
     const pick = { cursor: ["x", "y"], select: ["stream", "ids"], laser: ["pts"], preview: ["stream", "elements"], emote: ["e"] }[msg.k];
     const clean = { k: msg.k }; for (const f of pick) clean[f] = msg[f];
-    bus.publish(subjects.presence(c.tenant, c.board), { gateway: id, user: c.user, client: c.client, msg: clean })?.catch?.(() => {});
+    bus.publish(subjects.presence(c.tenant, c.board), { gateway: id, user: c.user, client: c.client, role: c.role, msg: clean })?.catch?.(() => {});
   }
 
   async function frame(ws, data) {

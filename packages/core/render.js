@@ -465,6 +465,7 @@ export function paintSnapIndicator(doc, snap, view, theme, out) {
     out.push({ t: "path", id: `snap:port:${port.side}`, cmds: ring.slice(0, 20), fill: theme.bg });
     out.push({ t: "path", id: `snap:port:${port.side}`, cmds: ring, stroke: withAlpha(acc, 0.75), width: 1.5, dash: null });
   }
+  if (!activePoint && snap.at) activePoint = snap.at;
   if (!activePoint && snap.lineId != null && snap.endIndex != null) {
     const line = doc.get(snap.lineId);
     if (line) {

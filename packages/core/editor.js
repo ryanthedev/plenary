@@ -10,7 +10,7 @@ import {
 } from "./model.js";
 import { Doc } from "./doc.js";
 import {
-  bbox, unionBox, inBox, boxInBox, center, normalize, hits, hitTest, shapeAt, bindTargetAt, resolvedPoints, drawnPoints, curveThrough, settle, fileScene, portAt, mapIntoBox, segmentsIntersect,
+  bbox, unionBox, inBox, boxInBox, center, normalize, hits, hitTest, shapeAt, bindTargetAt, bindingAt as resolveBindingAt, resolvedPoints, drawnPoints, curveThrough, settle, fileScene, portAt, mapIntoBox, segmentsIntersect,
   bounds, corners, rotate, rotateAbout, angleOf, centerOf, toLocal, toWorld as elToWorld, normAngle,
 } from "./geometry.js";
 import { paintScene, project, rectCmds, withAlpha, paintSnapIndicator } from "./render.js";
@@ -44,7 +44,9 @@ const SNAP = 6;            // object snap distance, screen px
 const DRAG_SLOP = 3;       // px before a press becomes a drag
 const ROT_GAP = 24;        // the rotate handle sits this far above the selection, screen px
 const ROT_SNAP = Math.PI / 12;   // shift snaps rotation to 15°
-const PORT_SNAP = 12;      // how close an arrow end must come to a connection point to take it, screen px
+const PORT_SNAP = 12;      // how close an arrow end must come to a shape perimeter to snap to it, screen px
+const PORT_MAGNET = 7;     // gentle magnetic pull to cardinal ports along the perimeter, screen px
+const CORNER_MAGNET = 5;   // gentle magnetic pull to box corners along the perimeter, screen px
 const BIND_PAD = 8;        // how far outside a shape an arrow end still binds to it, screen px
 const TOUCH_SLOP_MULT = 2.5;   // M5: adaptive touch slop multiplier for coarse pointers
 const STRAY_DOT_MS = 80;       // M5: cancel 1-finger stroke if 2nd finger lands within this window
@@ -183,7 +185,7 @@ export class Editor {
     const g = el.groupIds?.[el.groupIds.length - 1];
     return g ? this.doc.live().filter(e => e.groupIds?.includes(g)).map(e => e.id) : [el.id];
   }
-  selBox() { const els = this.selected().filter(e => !isLabel(e)); return els.length ? unionBox(els.map(bounds)) : null; }
+  selBox() { const els = this.selected().filter(e => !isLabel(e)); return els.length ? unionBox(els.map(e => bounds(e, this.doc))) : null; }
 
   // One rotated shape is resized and outlined in its own frame; anything else uses the axis-aligned box.
   soloRotated() { const els = this.selected().filter(e => !isLabel(e)); return els.length === 1 && angleOf(els[0]) ? els[0] : null; }
@@ -545,7 +547,7 @@ export class Editor {
         g.end = w;
         const box = normBox(g.start, w);
         this.sel = new Set(g.base);
-        for (const el of this.doc.visible()) if (!isLabel(el) && boxInBox(bounds(el), box)) this.withGroup(el).forEach(id => this.sel.add(id));
+        for (const el of this.doc.visible()) if (!isLabel(el) && boxInBox(bounds(el, this.doc), box)) this.withGroup(el).forEach(id => this.sel.add(id));
         return this.changed();
       }
       case "move": return this.moveSel(g, p, w, m);
@@ -741,7 +743,8 @@ export class Editor {
   }
 
   setSnapPreview(snap) {
-    const hk = snap ? `${snap.targetId}|${snap.side ?? ""}|${snap.lineId ?? ""}|${snap.endIndex ?? ""}` : "";
+    const atKey = snap?.at ? `${Math.round(snap.at[0] * 4)},${Math.round(snap.at[1] * 4)}` : "";
+    const hk = snap ? `${snap.targetId}|${snap.side ?? ""}|${atKey}|${snap.lineId ?? ""}|${snap.endIndex ?? ""}` : "";
     if (hk === (this.hintKey ?? "") && !!snap === !!this.snapPreview) return false;
     this.hintKey = hk;
     this.hint = snap?.binding ?? null;
@@ -763,29 +766,28 @@ export class Editor {
     if (c !== this.lastCursor) { this.lastCursor = c; this.changed(); }
   }
 
-  // Resolve binding + lightweight snap preview at world point `w`: a connection point near it (pinned there),
+  // Resolve binding + lightweight snap preview at world point `w`: perimeter snap (with cardinal/corner magnet),
   // else the bindable target under it (aimed at the other end), else null. ⌘/Ctrl held: null.
   snapAt(w, except = null, m = {}, elbowed = false, ref = null) {
     if (m.cmd || m.ctrl) return null;
     const pointerType = m.pointerType ?? this.g?.pointerType ?? this.lastPointerType;
     const scale = this.slopScale(pointerType);
-    const port = portAt(this.doc, w, (PORT_SNAP * scale) / this.view.scale, except);
-    if (port) {
-      const binding = { elementId: port.el.id, focus: 0, gap: 6, fixedPoint: port.port.fixedPoint, side: port.port.side };
-      return {
-        targetId: port.el.id,
-        side: port.port.side,
-        binding,
-        elbowed: !!elbowed,
-        ...(ref ? { lineId: ref.lineId, endIndex: ref.endIndex } : {}),
-      };
-    }
-    const s = bindTargetAt(this.doc, w, except, (BIND_PAD * scale) / this.view.scale);
-    if (!s) return null;
+    const inv = scale / this.view.scale;
+    const hit = resolveBindingAt(this.doc, w, {
+      tol: PORT_SNAP * inv,
+      portTol: PORT_MAGNET * inv,
+      cornerTol: CORNER_MAGNET * inv,
+      pad: BIND_PAD * inv,
+      except,
+    });
+    if (!hit) return null;
     return {
-      targetId: s.id,
-      side: null,
-      binding: { elementId: s.id, focus: 0, gap: 6 },
+      targetId: hit.el.id,
+      side: hit.side,
+      at: hit.at,
+      fixedPoint: hit.fixedPoint,
+      snapped: hit.snapped,
+      binding: hit.binding,
       elbowed: !!elbowed,
       ...(ref ? { lineId: ref.lineId, endIndex: ref.endIndex } : {}),
     };
@@ -851,7 +853,7 @@ export class Editor {
       g.extra = [...ids].filter(id => !this.sel.has(id));
       g.orig = new Map([...ids].map(id => [id, clone(this.doc.get(id))]).filter(([, e]) => e && this.doc.editable(e)));
       g.before = new Map([...g.orig].map(([id, e]) => [id, clone(e)]));
-      g.box = unionBox([...g.orig.values()].filter(e => !isLabel(e)).map(bounds));
+      g.box = unionBox([...g.orig.values()].filter(e => !isLabel(e)).map(e => bounds(e, this.doc)));
     }
     let dx = w.x - g.start.x, dy = w.y - g.start.y;
     if (m.shift) { if (Math.abs(dx) > Math.abs(dy)) dy = 0; else dx = 0; }
@@ -1117,7 +1119,7 @@ export class Editor {
     let bx = null, by = null;
     for (const el of this.doc.visible()) {
       if (skip.has(el.id) || isLabel(el)) continue;
-      const b = bounds(el), tx = [b.x, b.x + b.w / 2, b.x + b.w], ty = [b.y, b.y + b.h / 2, b.y + b.h];
+      const b = bounds(el, this.doc), tx = [b.x, b.x + b.w / 2, b.x + b.w], ty = [b.y, b.y + b.h / 2, b.y + b.h];
       for (const a of xs) for (const t of tx) { const d = t - a; if (Math.abs(d) <= tol && (!bx || Math.abs(d) < Math.abs(bx.d))) bx = { d, at: t, b }; }
       for (const a of ys) for (const t of ty) { const d = t - a; if (Math.abs(d) <= tol && (!by || Math.abs(d) < Math.abs(by.d))) by = { d, at: t, b }; }
     }
@@ -1302,7 +1304,7 @@ export class Editor {
     const ids = elements.filter(e => !isLabel(e)).map(e => e.id);
     this.select(ids);
     // Bring it all into view if it doesn't fit (Excalidraw zooms to imported content too).
-    const nb = unionBox(this.selected().map(bounds)), a = this.toScreen(nb), z = this.toScreen({ x: nb.x + nb.w, y: nb.y + nb.h });
+    const nb = unionBox(this.selected().map(e => bounds(e, this.doc))), a = this.toScreen(nb), z = this.toScreen({ x: nb.x + nb.w, y: nb.y + nb.h });
     if (a.x < 0 || a.y < 0 || z.x > this.size.w || z.y > this.size.h) this.fit(this.selected());
     return ids;
   }
@@ -1380,10 +1382,10 @@ export class Editor {
 
   align(how) {
     const els = this.selected().filter(e => !isLabel(e)); if (els.length < 2) return;
-    const B = unionBox(els.map(bounds));
+    const B = unionBox(els.map(e => bounds(e, this.doc)));
     this.transact(tx => {
       for (const e of els) {
-        const b = bounds(e); let dx = 0, dy = 0;
+        const b = bounds(e, this.doc); let dx = 0, dy = 0;
         if (how === "left") dx = B.x - b.x; if (how === "right") dx = B.x + B.w - (b.x + b.w); if (how === "hcenter") dx = B.x + B.w / 2 - (b.x + b.w / 2);
         if (how === "top") dy = B.y - b.y; if (how === "bottom") dy = B.y + B.h - (b.y + b.h); if (how === "vcenter") dy = B.y + B.h / 2 - (b.y + b.h / 2);
         this.shift(tx, e, dx, dy);
@@ -1394,7 +1396,7 @@ export class Editor {
   distribute(axis) {
     const els = this.selected().filter(e => !isLabel(e)); if (els.length < 3) return;
     const k = axis === "h" ? ["x", "w"] : ["y", "h"];
-    const items = els.map(e => ({ e, b: bounds(e) })).sort((a, b) => a.b[k[0]] - b.b[k[0]]);
+    const items = els.map(e => ({ e, b: bounds(e, this.doc) })).sort((a, b) => a.b[k[0]] - b.b[k[0]]);
     const span = items[items.length - 1].b[k[0]] + items[items.length - 1].b[k[1]] - items[0].b[k[0]];
     const gap = (span - items.reduce((s, i) => s + i.b[k[1]], 0)) / (items.length - 1);
     this.transact(tx => {
@@ -1436,8 +1438,11 @@ export class Editor {
             if (c.type !== "arrow") continue;
             if (!v && c.elbowed) {
               const pts = resolvedPoints(this.doc, e); c.x = pts[0][0]; c.y = pts[0][1]; c.points = pts.map(p => [p[0] - c.x, p[1] - c.y]);
-              // An elbow's auto-routed fixedPoints aren't user-chosen ports; keep explicit side-pinned ones.
-              for (const k of ["startBinding", "endBinding"]) if (c[k]?.fixedPoint && !c[k]?.side) { const { fixedPoint, ...rest } = c[k]; c[k] = rest; }
+              // An elbow's legacy auto-routed fixedPoints (outside [0, 1]) aren't user-chosen; keep explicit port & perimeter pins.
+              for (const k of ["startBinding", "endBinding"]) {
+                const fp = c[k]?.fixedPoint;
+                if (fp && !c[k]?.side && (fp[0] < 0 || fp[0] > 1 || fp[1] < 0 || fp[1] > 1)) { const { fixedPoint, ...rest } = c[k]; c[k] = rest; }
+              }
             }
             c.elbowed = v; if (v) c.roundness = null;
             continue;
@@ -1584,7 +1589,7 @@ export class Editor {
     const target = !els.length
       ? { x: 40, y: 40, scale: 1 }
       : (() => {
-        const b = unionBox(els.map(bounds));
+        const b = unionBox(els.map(e => bounds(e, this.doc)));
         const scale = Math.max(0.1, Math.min(1, Math.min((this.size.w - pad * 2) / (b.w || 1), (this.size.h - pad * 2) / (b.h || 1))));
         return { scale, x: (this.size.w / scale - b.w) / 2 - b.x, y: (this.size.h / scale - b.h) / 2 - b.y };
       })();
@@ -1696,7 +1701,7 @@ export class Editor {
       const b = bbox(el);
       pts = [[b.x - pad, b.y - pad], [b.x + b.w + pad, b.y - pad], [b.x + b.w + pad, b.y + b.h + pad], [b.x - pad, b.y + b.h + pad]].map(([x, y]) => this.toScreen(elToWorld(el, { x, y })));
     } else {
-      const b = bbox(el);
+      const b = bounds(el, this.doc);
       pts = [[b.x - pad, b.y - pad], [b.x + b.w + pad, b.y - pad], [b.x + b.w + pad, b.y + b.h + pad], [b.x - pad, b.y + b.h + pad]].map(([x, y]) => this.toScreen({ x, y }));
     }
     return [...pts.map((p, i) => [i ? "L" : "M", p.x, p.y]), ["L", pts[0].x, pts[0].y]];

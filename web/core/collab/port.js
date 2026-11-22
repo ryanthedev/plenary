@@ -19,6 +19,8 @@
 //     records()/render per frame, not one per entry. records() is cached per Replica records revision.
 //   - Notes (notes(), noteAuthor, element(...)) come from the same link, which shows my own unacked ops.
 
+import { bounds as geomBounds } from "../../../packages/core/geometry.js";
+
 /**
  * @param {ReturnType<typeof import("../session.js").createSession>} session
  * @param {{ name: string, frame: (fn: () => void) => any, jumpTo?: (p: { x: number, y: number }) => void }} o
@@ -70,7 +72,15 @@ export function collabPort(session, { name, frame, jumpTo = null }) {
   ];
 
   const op = o => { C.record(o); };
-  const bounds = el => (el ? { x: el.x, y: el.y, width: el.width ?? 0, height: el.height ?? 0 } : null);
+  const elementBounds = (stream, el) => {
+    if (!el) return null;
+    const doc = {
+      get: id => C.element(stream, id),
+      visible: () => (C.elements ? C.elements(stream).filter(e => e && !e.isDeleted) : []),
+    };
+    const b = geomBounds(el, doc);
+    return { x: b.x, y: b.y, width: b.w, height: b.h };
+  };
   const port = {
     get role() { return roleNow(); },
     me,
@@ -93,7 +103,7 @@ export function collabPort(session, { name, frame, jumpTo = null }) {
     deleteComment: ({ id }) => op({ do: "delete", id }),
     noteAuthor: id => C.noteAuthor(id),
     notes: () => C.elements("notes"),
-    element: (stream, id) => bounds(C.element(stream, id)),
+    element: (stream, id) => elementBounds(stream, C.element(stream, id)),
     /** Release: no more callbacks, including a records frame already queued. mountCollab's destroy() calls it. */
     destroy() { for (const off of offs) off(); for (const k in subs) subs[k].clear(); },
   };

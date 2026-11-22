@@ -34,3 +34,6 @@ id_ed25519*
 /blobs/
 /deploy/data/
 /deploy/blobs/
+
+# Local cluster rig state (scripts/cluster-rig.js): Postgres data, logs, keys and dev tokens.
+.rig/

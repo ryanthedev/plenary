@@ -1,0 +1,157 @@
+# Local cluster rig
+
+`scripts/cluster-rig.js` runs a whole Plenary cluster natively on one Mac, with no containers: Postgres 17, NATS,
+N node processes and a Caddy load balancer. It is meant for the M2 load test (~10k clients on 3 nodes) and for the
+phase-4 takeover check ("kill a board's host, another host takes over, no acked op is lost").
+
+**Status (2026-11-12):** the rig works and is tested, with stub nodes and with the real `server/main.js`, which since
+p4-wire (7bf171b) runs in cluster mode on the env below (shared Postgres and NATS).
+
+**Env rules the rig keeps (main.js since 7bf171b, with p4-wire2's checks; docs/m2/reports/p4-wire2.md):**
+- **Every node sets `PLENARY_ROLES` explicitly** (`gateway` or `host`) and both URLs. main.js refuses to start, before
+  it opens or listens on anything, when:
+  - `DATABASE_URL` or `NATS_URL` is set but empty;
+  - only one of the two URLs is set;
+  - `PLENARY_ROLES` names anything but both roles while neither URL is set.
+  A rig node therefore never falls back to a single node (SQLite, in-memory bus) running alone.
+- **`PLENARY_NODE_ID` starts and ends with a letter or digit** (`gw-1`, `host-1`); it prefixes the node's lease holder.
+- **NATS has no auth, by choice.** The bus now passes `user:pass@` (or `token@`) from `NATS_URL` to the NATS client
+  (p4-wire2 fixed p4-wirev M1), so a password-protected NATS would work. The rig keeps its NATS without credentials
+  because it listens only on 127.0.0.1, for one user's local runs. That is a choice, not a workaround.
+
+## Needs
+
+`brew install postgresql@17 nats-server caddy` (it uses `initdb`, `postgres`, `nats-server`, `caddy` from PATH or
+/opt/homebrew/bin), plus Bun and `/bin/ps`. No npm dependencies.
+
+## Run
+
+```sh
+bun scripts/cluster-rig.js up                      # 2 gateways + 1 host, rig dir .rig/default/
+bun scripts/cluster-rig.js up --hosts 2            # two room hosts: needed for the takeover check
+bun scripts/cluster-rig.js status                  # PIDs, ports, LB URL, tokens file path
+bun scripts/cluster-rig.js status --json           # the same, as JSON (rig.json plus `alive` flags)
+bun scripts/cluster-rig.js kill host-1             # SIGKILL one node by its recorded PID
+bun scripts/cluster-rig.js down                    # stop everything this rig started
+```
+
+`up` flags: `--name <a-z0-9->` (rig dir `.rig/<name>/`), `--dir <path>`, `--gateways n` (default 2), `--hosts n`
+(default 1), `--lease-ttl-ms n` (default 10000, the same on every node), `--max-conns-per-user n` (default 100000),
+`--timeout-ms n` (default 60000, for the whole start), and `--node-cmd "<cmd> <args>"` to run something other than
+`bun server/main.js` (the tests use a stub). `status`, `kill` and `down` take `--name` or `--dir` too.
+
+`up` returns once every part answers: Postgres runs `select 1`, NATS `/healthz`, every node's `/health`, and `/health`
+through the LB. Then it exits; the processes keep running. If anything fails or times out, or `up` gets SIGINT
+(Ctrl-C), SIGTERM or SIGHUP (a closed terminal), it starts nothing more and stops everything it had started and says which part failed and where its log is. `up` refuses a rig dir that still
+has live processes (run `down` first), refuses while a postmaster that rig.json does not name still runs on its `pg/`
+(stop that PID first), and refuses while another `up` is starting the same dir (`up.lock`). It refuses a non-empty dir that has no `rig.json`. It wipes the old state of
+a stopped rig, so every `up` starts from an empty database.
+
+## What runs
+
+| Part | How | Env the nodes get |
+|---|---|---|
+| Postgres 17 | `postgres -D <rig>/pg`, TCP on 127.0.0.1 only, no Unix socket, trust auth, database `plenary`, max_connections 300 | `DATABASE_URL=postgres://postgres@127.0.0.1:<port>/plenary` |
+| NATS | `nats-server` on 127.0.0.1, `max_payload: 2MB` (as deploy/cluster/nats.conf), monitor port for `/healthz` | `NATS_URL=nats://127.0.0.1:<port>` |
+| Nodes | `bun server/main.js`, one per node, its cwd outside the repo (so Bun's `.env` auto-load never applies) | `PORT`, `HOST=127.0.0.1`, `PLENARY_DATA_DIR=<rig>/nodes/<id>/data`, `PLENARY_NODE_ID` (`gw-1`, `gw-2`, `host-1`, ...), `PLENARY_ROLES` (`gateway` or `host`), `PLENARY_LEASE_TTL_MS`, `COOKIE_KEY`, `SESSION_KEY`, `PLENARY_DEV_TOKENS`, `PLENARY_MAX_CONNS_PER_USER`, `LOG_LEVEL` |
+| LB | `caddy run` with a generated Caddyfile in the shape of deploy/cluster/Caddyfile: gateways only, round robin, active `/health` checks, WebSocket-safe | |
+
+The nodes get only the env above, plus PATH, HOME and LANG; nothing from your shell or the repo's `.env`. Every port
+is probed free at start, so none is fixed.
+
+## Files in the rig dir
+
+| File | What |
+|---|---|
+| `rig.json` | Everything the rig started and where. It is rewritten after every spawn, so `down` works even if `up` was killed. Holds no secrets. |
+| `tokens.json` (0600) | Dev tokens, in `PLENARY_DEV_TOKENS` format: `{ "<token>": { name, role, domain, admin? } }`. One owner `rig-admin` with `admin: true`; editors `editor-1..8`, annotators `annotator-1..32`, viewers `viewer-1..64`. Every one has domain `rig.test`. |
+| `keys.json` (0600) | `COOKIE_KEY` and `SESSION_KEY`, generated per rig and shared by every node. |
+| `logs/<part>.log` | One log per process (`postgres`, `nats`, `gw-1`, ..., `caddy`). |
+| `up.lock` | Present only while an `up` runs: `{ pid, started }` of that `up`. A lock whose `up` is gone is cleared by the next `up`. |
+| `up.lock.break` | Present only for the instant an `up` clears a stale `up.lock`. If one is left (that `up` died right then), every `up` refuses and names it: remove it once no `up` runs on the dir. |
+| `pg/`, `nats.conf`, `Caddyfile`, `nodes/<id>/data/`, `caddy/` | State and generated config. |
+
+The rig never prints a key or a token. Output names only the files.
+
+### rig.json (version 1, stable; the load client in scripts/load/ reads it)
+
+```
+{ version: 1, name, dir, startedClock: "lstart TZ=UTC LC_ALL=C", state: "starting" | "up" | "failed" | "down", createdAt, leaseTtlMs, maxConnsPerUser,
+  lb: { url, wsUrl, port }, tokensFile, keysFile, logsDir,
+  postgres: { port, url }, nats: { port, url, monitorPort },
+  nodes: [{ id, roles, port, url, dataDir, log }],
+  procs: [{ name: "postgres" | "nats" | "node:<id>" | "caddy", pid, started, log }] }
+```
+
+Paths inside the rig dir (`tokensFile`, `keysFile`, `logsDir`, `nodes[].dataDir`, `nodes[].log`, `procs[].log`) are
+stored **relative to the rig dir** (e.g. `"tokensFile": "tokens.json"`), so a moved rig dir still names its own files;
+resolve them against the dir you read rig.json from (scripts/load/run.js already does). `status --json` and `startRig`
+give them absolute. A file from before 2026-11-12's p8-rig3 has absolute paths; they are rebased onto the dir given.
+
+`status --json` adds `alive` to every `procs` entry, and `pid` and `alive` to every `nodes` entry.
+
+For a load client: connect to `lb.wsUrl`. Create a board through `lb.url` with `POST /boards` and
+`Authorization: Bearer <rig-admin's token>`. Because every token is in domain `rig.test`, a board's `memberRole`
+admits all of them. Raise roles with `PUT /boards/:board/grants/dev%3A<name>`.
+
+## Safety
+
+- **Only ours:** every PID in `rig.json` is stored with its start time (`ps -o lstart=`). `down` and `kill` signal a
+  PID only while that start time still matches, so a reused PID is never touched. Nothing is killed by name.
+- **Any TZ or locale:** `ps` always runs with `TZ=UTC LC_ALL=C`, so `up`, `status`, `kill` and `down` agree whatever
+  shell, CI job or daylight-saving change sits between them (`startedClock` in rig.json records this). A rig.json from
+  before this fix has no `startedClock`; its times are in an unknown local TZ and cannot be converted, so every command
+  refuses it while any of its PIDs exists and names those PIDs. Check each with
+  `LC_ALL=C TZ=UTC /bin/ps -o lstart=,command= -p <pid>`, stop the ones that are the rig's, then remove the dir.
+- **A broken `ps` refuses, never guesses:** `ps` runs as `/bin/ps`, whatever PATH says. If it cannot run, is killed,
+  exits with an error or prints something unexpected, or cannot see the rig's own process, every command refuses with
+  `cannot check processes: …` before it signals or removes anything. When `up` fails for any reason, it stops what
+  rig.json records and then, always, every process it started through its own child handles, which need no `ps`: a
+  `ps` that fails once right after a spawn and then works again leaves that process unrecorded, and only the handle
+  knows it. A save of rig.json that fails (disk full, permissions) does not skip that cleanup.
+- **One `up` per dir:** `up` takes `<dir>/up.lock` (created atomically, holding its PID and start time) before it
+  reads or wipes anything, and removes it when it returns (only if it still holds its own content). A second `up`
+  meanwhile refuses. A stale lock (its `up` is gone) is cleared only under `<dir>/up.lock.break`, taken exclusively,
+  and only while `up.lock` still holds exactly the text judged stale; a live or left-over break lock refuses. So any
+  number of `up`s racing for a stale lock end with at most one holder. `down`, `status` and
+  `kill` do not take the lock, so `down` can still stop a hung `up`'s processes.
+- **The dir you name:** `--dir`/`--name` decide which rig.json is read and written, never the `dir` inside the file.
+  A copied or moved rig.json is updated where it is, so it never overwrites another rig's record.
+- **Shutdown order:** `down` goes in reverse start order (LB, nodes, NATS, Postgres). It sends SIGTERM, or SIGINT to
+  Postgres for a fast shutdown, then SIGKILL after 10 s.
+- **No leaks from a failed or killed run:** a failed `up`, or one stopped by SIGINT, SIGTERM or SIGHUP, stops what
+  it started before it exits. Only a SIGKILLed `up` leaves processes; they are in rig.json, so `down` stops them. The
+  tests share test/deploy/rig-guard.js: `afterAll` and SIGINT/SIGTERM/SIGHUP to the test runner abort in-flight `up`s,
+  stop tracked CLI children, then stop every rig dir by recorded PID (with the test's own `/bin/ps` check as a
+  fallback) before removing the dirs. Tests kill an `up` with each signal, and kill a whole `bun test` run midway, and
+  check that nothing tied to the rig dir remains. A SIGKILL of the test runner itself is not covered.
+- **Stray state:** state stays under `.rig/` (git-ignored). Nothing listens beyond 127.0.0.1 (a test checks every
+  listening socket).
+
+### Known limits
+
+- **Env is visible to your own user.** Nodes get `COOKIE_KEY`, `SESSION_KEY` and `PLENARY_DEV_TOKENS` by env, so
+  `ps eww` run as the same Unix user shows them. Fine for a local rig; never point one at real keys.
+- **Start times have one-second resolution.** A PID reused within the same second as the original start, between the
+  check and the signal, would pass. On macOS that needs the PID space to wrap in under a second.
+- **`up` killed between a spawn and its save.** rig.json is saved right after each spawn; a SIGKILL of `up` in that
+  gap (microseconds) leaves one process `down` does not know. Find it by its command line, which names the rig dir
+  (stub nodes excepted).
+- **A left-over `up.lock.break`.** An `up` killed in the microseconds while it clears a stale lock leaves
+  `up.lock.break`; every later `up` refuses and names it until you remove it. Never cleared automatically, because
+  clearing it safely would need the same race-free takeover one level up.
+- **SIGKILL of Postgres.** If Postgres does not finish a fast shutdown within 10 s, `down` SIGKILLs the postmaster;
+  its backends normally exit on their own after that (not tested with a real Postgres). A SIGKILLed postmaster leaves
+  its SysV shared-memory segment behind, and macOS allows only 32 (`kern.sysv.shmmni`); when they run out, no Postgres
+  on the machine starts (`initdb`: "could not create shared memory segment: No space left on device"). So whoever
+  SIGKILLs a postmaster (`down`, a failed `up`'s fallback, the tests' rig-guard) reads its segment from line 7 of
+  `pg/postmaster.pid` first and, once it is gone, removes exactly that segment with `ipcrm -m <id>`, only if `ipcs`
+  lists that id with that key and NATTCH 0. A backend still attached when the postmaster died is waited for (up to
+  5 s, re-checking id, key and NATTCH each time); a segment still attached after that is kept. Segments orphaned by anything else (a SIGKILLed `up` plus a SIGKILLed
+  postmaster) are not cleaned up: check with `ipcs -m`.
+
+## Tests
+
+`bun test test/deploy` uses real Postgres, NATS and Caddy, with stub nodes (test/deploy/stub-node.js). The tests skip
+with a reason if a binary is missing. One end-to-end test runs the real main.js (hello over the LB, an op acked, the
+entry seen from the other gateway).

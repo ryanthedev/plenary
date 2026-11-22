@@ -1455,15 +1455,15 @@ export class Editor {
     const dx = box ? target.x - (box.x + box.w / 2) : 0;
     const dy = box ? target.y - (box.y + box.h / 2) : 0;
     const out = [];
+    const hasFiles = remappedFiles && Object.keys(remappedFiles).length > 0;
     const ok = this.transact(tx => {
       for (const c of remapped) {
         c.x += dx; c.y += dy;
         tx.add(c); out.push(c);
       }
       return true;
-    });
+    }, hasFiles ? { files: remappedFiles } : undefined);
     if (!ok) return [];
-    if (remappedFiles && Object.keys(remappedFiles).length) this.addFiles(remappedFiles);
     this.select(out.filter(e => !isLabel(e)).map(e => e.id));
     return out.map(e => e.id);
   }

@@ -1537,7 +1537,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   addEventListener("popstate", () => {
     if (ui.sheet) setSheet(null, { fromPopstate: true });
   });
-  addEventListener("beforeunload", e => {
+  addEventListener("beforeunload", /** @param {BeforeUnloadEvent} e */ e => {
     if (S.pending > 0) {
       e.preventDefault();
       e.returnValue = "";

@@ -1,3 +1,4 @@
+// @ts-check
 // Share adapter over fetch: implements web/ports/share.js against PROTOCOL.md § Share dialog. Imports nothing (fetch and timers are injected). Bodies are checked here
 // because the dialog renders them: ids are 1-64 of [A-Za-z0-9_-], strings and lists are capped, anything else is dropped. A link's id is a capability: it is only ever
 // put in a URL the manager copies, never in an error or a log.

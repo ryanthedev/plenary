@@ -1,3 +1,4 @@
+// @ts-check
 // Dev sign-in menu port: asks the server which dev users exist, so the served page can offer them. Imports nothing.
 // Contract test: test/web/adapters/devconfig.test.js (the http adapter, over a fake fetch).
 //

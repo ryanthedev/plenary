@@ -1,3 +1,4 @@
+// @ts-check
 // The Space page, the Group page and the New board / New space / General access dialogs, as state with no DOM (web/adapters/dom/spaces.js
 // renders them; the data comes through web/ports/spaces.js). Copy follows design/orgs/JOURNEY.md §5. The server decides every permission
 // (`can.*` in the page); the models only ask, show and refuse nonsense early.
@@ -58,10 +59,10 @@ export function createPageModel({ api, kind, id }) {
     state.status = state.page ? state.status : "loading"; state.error = null; emit();
     const r = await (kind === "space" ? api.space(id) : api.group(id));
     if (mine !== seq) return;
-    if (r.page) { state.page = r.page; state.status = "ready"; }
-    else if (r.error === "notfound" || r.error === "forbidden") { state.status = "notfound"; state.page = null; }
-    else if (r.error === "auth") { state.status = "signed-out"; state.error = "auth"; }
-    else { state.error = r.error; if (!state.page) state.status = "error"; else state.notice = "Could not refresh this page."; }
+    if ("page" in r && r.page) { state.page = r.page; state.status = "ready"; }
+    else if ("error" in r && (r.error === "notfound" || r.error === "forbidden")) { state.status = "notfound"; state.page = null; }
+    else if ("error" in r && r.error === "auth") { state.status = "signed-out"; state.error = "auth"; }
+    else { state.error = "error" in r ? r.error : "unavailable"; if (!state.page) state.status = "error"; else state.notice = "Could not refresh this page."; }
     emit();
   }
 
@@ -85,8 +86,8 @@ export function createPageModel({ api, kind, id }) {
       state.busy = true; emit();
       const r = await api.group(id, state.page.next);
       state.busy = false;
-      if (r.page) state.page = { ...state.page, spaces: [...state.page.spaces, ...r.page.spaces], next: r.page.next };
-      else fail(r.error);
+      if ("page" in r && r.page) state.page = { ...state.page, spaces: [...state.page.spaces, ...r.page.spaces], next: r.page.next };
+      else fail("error" in r ? r.error : "unavailable");
       emit();
     },
     /** Rename the page's Space or Group. A blank or too-long name is refused before any request. @returns {Promise<boolean>} */
@@ -132,8 +133,8 @@ export function createNewBoardModel({ api, space = null, newKey = null }) {
     subscribe(f) { subs.add(f); return () => subs.delete(f); },
     async load() {
       const r = await api.boardSpaces();
-      if (r.error) { state.status = "error"; state.error = errorText(r.error); }
-      else { state.spaces = r.spaces; state.more = r.more; state.status = "ready"; state.space = r.spaces.some(s => s.id === space) ? space : (r.spaces[0]?.id ?? null); }
+      if ("error" in r && r.error) { state.status = "error"; state.error = errorText(r.error); }
+      else if ("spaces" in r) { state.spaces = r.spaces; state.more = r.more; state.status = "ready"; state.space = r.spaces.some(s => s.id === space) ? space : (r.spaces[0]?.id ?? null); }
       emit();
     },
     setTitle(t) { kk.reset(); state.title = String(t ?? ""); state.error = null; emit(); },
@@ -154,16 +155,16 @@ export function createNewBoardModel({ api, space = null, newKey = null }) {
       state.busy = true; state.error = null; emit();
       let r;
       try { r = await api.createBoard({ title, ...(s.personal ? {} : { space: s.id }), ...(k ? { key: k } : {}) }); } finally { state.busy = false; }
-      if (r.error) state.error = createErrorText(r.error); else { state.created = r.board; kk.reset(); }
+      if ("error" in r && r.error) state.error = createErrorText(r.error); else if ("board" in r) { state.created = r.board; kk.reset(); }
       emit();
-      return !r.error;
+      return !("error" in r && r.error);
     },
   };
 }
 
 /**
  * The New group dialog (a Unit-level permission, decided by the server: Home only offers it when `can.createGroup`): a name and general access.
- * @param {{ api: SpacesPort }} o
+ * @param {{ api: SpacesPort, newKey?: (() => string) | null }} o
  */
 export function createNewGroupModel({ api, newKey = null }) {
   const kk = keyer(newKey);
@@ -186,16 +187,16 @@ export function createNewGroupModel({ api, newKey = null }) {
       state.busy = true; state.error = null; emit();
       let r;
       try { r = await api.createGroup({ name, general: state.general, ...(k ? { key: k } : {}) }); } finally { state.busy = false; }
-      if (r.error) state.error = createErrorText(r.error); else { state.created = r.group; kk.reset(); }
+      if ("error" in r && r.error) state.error = createErrorText(r.error); else if ("group" in r) { state.created = r.group; kk.reset(); }
       emit();
-      return !r.error;
+      return !("error" in r && r.error);
     },
   };
 }
 
 /**
  * The New space dialog: a name, a Group (only where the person is an editor, or none), and general access.
- * @param {{ api: SpacesPort, group?: string|null }} o
+ * @param {{ api: SpacesPort, group?: string|null, newKey?: (() => string) | null }} o
  */
 export function createNewSpaceModel({ api, group = null, newKey = null }) {
   const kk = keyer(newKey);
@@ -209,8 +210,8 @@ export function createNewSpaceModel({ api, group = null, newKey = null }) {
     subscribe(f) { subs.add(f); return () => subs.delete(f); },
     async load() {
       const r = await api.spaceGroups();
-      if (r.error) { state.status = "error"; state.error = errorText(r.error); }
-      else {
+      if ("error" in r && r.error) { state.status = "error"; state.error = errorText(r.error); }
+      else if ("groups" in r) {
         Object.assign(state, { root: r.root, groups: r.groups, more: r.more, status: "ready" });
         state.group = r.groups.some(g => g.id === group) ? group : (r.root ? null : (r.groups[0]?.id ?? null));
       }
@@ -231,9 +232,9 @@ export function createNewSpaceModel({ api, group = null, newKey = null }) {
       state.busy = true; state.error = null; emit();
       let r;
       try { r = await api.createSpace({ name, group: state.group, general: state.general, ...(k ? { key: k } : {}) }); } finally { state.busy = false; }
-      if (r.error) state.error = createErrorText(r.error); else { state.created = r.space; kk.reset(); }
+      if ("error" in r && r.error) state.error = createErrorText(r.error); else if ("space" in r) { state.created = r.space; kk.reset(); }
       emit();
-      return !r.error;
+      return !("error" in r && r.error);
     },
   };
 }

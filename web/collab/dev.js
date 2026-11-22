@@ -1,3 +1,4 @@
+// @ts-check
 // Dev page for web/collab: the collab UI over the fake port. Fake data only. Two peers (Maya presenting with a
 // laser and a drag, Dev selecting), annotators with cursors, a hostile display name, and a crowd of viewers
 // sending emotes. Click the board to comment on a spot; click a shape to comment on it.
@@ -52,7 +53,8 @@ const port = createFakePort({
 });
 
 // ── the view: fit the board into the canvas ──
-const canvas = document.getElementById("canvas"), board = document.getElementById("board");
+const canvas = document.getElementById("canvas");
+const board = /** @type {HTMLCanvasElement} */ (document.getElementById("board"));
 const view = { x: 0, y: 0, scale: 1, toScreen(p) { return { x: (p.x + this.x) * this.scale, y: (p.y + this.y) * this.scale }; }, toWorld(p) { return { x: p.x / this.scale - this.x, y: p.y / this.scale - this.y }; } };
 function fit() {
   const r = canvas.getBoundingClientRect(), W = 900, H = 560;
@@ -85,8 +87,8 @@ addEventListener("resize", () => { fit(); paintBoard(); collab.layout(); });
 // Theme toggle and a role switcher (dev only).
 const themeBtn = document.getElementById("themeBtn");
 themeBtn.textContent = theme === "dark" ? "☀" : "☾";
-themeBtn.onclick = () => { q.set("theme", theme === "dark" ? "light" : "dark"); location.search = q; };
-replace(document.getElementById("devbar"), "as ", h("select", { onchange: e => { q.set("role", e.currentTarget.value); location.search = q; } },
+themeBtn.onclick = () => { q.set("theme", theme === "dark" ? "light" : "dark"); location.search = q.toString(); };
+replace(document.getElementById("devbar"), "as ", h("select", { onchange: e => { q.set("role", e.currentTarget.value); location.search = q.toString(); } },
   ROLES.map(r => { const o = h("option", { value: r }, r); if (r === role) o.selected = true; return o; })),
   " ", h("button.btn", { onclick: () => port.ackAll() }, "ack pending"), " ", h("button.btn", { onclick: () => port.setStatus(port.status === "live" ? "connecting" : "live") }, "toggle live"));
 
@@ -141,4 +143,4 @@ if (open === "compose") collab.startComment({ x: 120, y: 330 });
 else if (open) collab.openThread(open);
 if (q.get("picker") === "1") collab.parts.emotes.lastChild.click();
 if (q.get("conn") === "offline") setTimeout(() => port.setStatus("connecting"), 300);
-window.collab = collab; window.port = port;
+/** @type {any} */ (window).collab = collab; /** @type {any} */ (window).port = port;

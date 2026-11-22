@@ -1,3 +1,4 @@
+// @ts-check
 // Dev menu adapter: GET /auth/dev over fetch. Implements web/ports/devconfig.js. Imports nothing: fetch and the timers
 // are injected. The server has this route only while its dev tokens are on (server/auth/http.js); any other answer
 // (404 on a production server, a proxy's page, a 5xx, bad JSON, the wrong shape, no answer in time) is null.

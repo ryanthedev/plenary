@@ -1,3 +1,4 @@
+// @ts-check
 // Net port: where a page's transports come from, plus the blobs stand-in (p6-portsv L7). Driven port; types only.
 // Imports nothing. Each transport it hands out is contract-tested (test/web/contracts/transport-contract.js).
 //
@@ -19,8 +20,8 @@
 //                  is waiting to be tried again (limit: too many uploads; gave-up: the server can't be reached).
 
 /**
- * @typedef {{ id: string, mimeType: string, dataURL: string }} BlobFile
- * @typedef {(url: string, opts?: { signal?: AbortSignal }) => Promise<object>} FetchSnapshot
+ * @typedef {{ id: string, mimeType: string, dataURL?: string, bytes?: Uint8Array }} BlobFile
+ * @typedef {(url: string, opts?: { signal?: AbortSignal }) => Promise<Record<string, any>>} FetchSnapshot
  * @typedef {(url: string, bytes: Uint8Array, mimeType?: string, opts?: { signal?: AbortSignal }) => Promise<void>} UploadBlob
  * @typedef {(url: string, opts?: { signal?: AbortSignal }) => Promise<{ bytes: Uint8Array, mimeType: string, dataURL: string }>} FetchBlob
  * @typedef {object} Net

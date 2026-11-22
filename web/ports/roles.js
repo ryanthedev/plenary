@@ -1,3 +1,4 @@
+// @ts-check
 // Roles port: the Roles screen's reads and writes (PROTOCOL.md § Roles). Imports nothing. Contract test: test/web/adapters/roles-http.test.js.
 //
 // Every call ALWAYS resolves (never rejects): a value, or `{ error, code?, ... }` with one of ROLES_ERRORS:
@@ -23,5 +24,9 @@ export const ROLES_ERRORS = Object.freeze(["auth", "forbidden", "notfound", "inv
  * @typedef {{ scopes: string[], permissions: { id: string, group: "content"|"management", scopes: string[] }[], content: Record<string, string[]>, ladders: string[], tickable: string[] }} Matrix
  * @typedef {{ roles: RoleView[], matrix: Matrix, can: { admin: boolean }, limits: { custom: number, many: { places: number, people: number } } }} RolesPage
  * @typedef {object} RolesPort
+ * @property {() => Promise<Record<string, any>>} roles
+ * @property {(o: { name: string, base?: string|null, boardRole: string, permissions: string[], key?: string|null }) => Promise<Record<string, any>>} createRole
+ * @property {(id: string, patch: { name?: string, boardRole?: string, permissions?: string[], confirm?: boolean }) => Promise<Record<string, any>>} updateRole
+ * @property {(id: string) => Promise<Record<string, any>>} removeRole
  */
 export {};

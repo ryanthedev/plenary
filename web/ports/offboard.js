@@ -1,3 +1,4 @@
+// @ts-check
 // Offboarding port: the calls behind the leaver screen (PROTOCOL.md § Leaver offboarding). Imports nothing. Contract test: test/web/adapters/offboard-http.test.js (the http adapter over a fake fetch).
 //
 // Every call ALWAYS resolves (never rejects): a value, or `{ error, code? }` with one of OFFBOARD_ERRORS:
@@ -19,5 +20,9 @@ export const OFFBOARD_ERRORS = Object.freeze(["auth", "forbidden", "notfound", "
  * @typedef {{ item: { type: string, id: string, name: string, archived: boolean }, to: Person, done: boolean }} Reassigned
  * @typedef {{ removed: boolean, grants: number|null, scopedGrants: number|null, teams: number|null }} Removed
  * @typedef {object} OffboardPort
+ * @property {(user: string, after?: string|null) => Promise<Record<string, any>>} list
+ * @property {(user: string, o: { type: string, id: string, to: string }, key?: string|null) => Promise<Record<string, any>>} reassign
+ * @property {(user: string, to: string|null, key?: string|null) => Promise<Record<string, any>>} remove
+ * @property {(q: string) => Promise<Record<string, any>>} people
  */
 export {};

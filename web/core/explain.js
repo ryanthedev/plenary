@@ -1,3 +1,4 @@
+// @ts-check
 // The access explanation as the pages show it (PROTOCOL.md § Access explanation and requests, #51), with no DOM: the shape the server answers is checked once here
 // (`normalizeExplain`, used by every adapter that carries it), the sentences are built here, and the Ask for access flow is a small model. The server decides
 // everything (`mine`, `needs`, `ask`); this file only words it. Copy follows design/orgs/JOURNEY.md J10.
@@ -28,6 +29,7 @@ const roleOpt = o => (o && typeof o === "object" && typeof o.id === "string" && 
 export function normalizeExplain(b) {
   if (!b || typeof b !== "object" || !b.mine || typeof b.mine !== "object" || !Array.isArray(b.mine.sources)) return null;
   const role = b.mine.role && typeof b.mine.role.id === "string" ? { id: str(b.mine.role.id, 32), name: str(b.mine.role.name, 64) } : null;
+  /** @type {Record<string, { role: string, roleName: string, held: boolean } | null>} */
   const needs = {};
   for (const [k, v] of Object.entries(b.needs && typeof b.needs === "object" ? b.needs : {}).slice(0, 8)) needs[str(k, 32)] = v && typeof v.role === "string" ? { role: str(v.role, 32), roleName: str(v.roleName, 64), held: v.held === true } : null;
   const a = b.ask && typeof b.ask === "object" ? b.ask : {};
@@ -113,7 +115,7 @@ export function waitText(ms) {
 /**
  * Ask for access at one scope: the role to ask for, one Idempotency-Key per submit (kept for its retries, so a retry after a lost answer is the same request), and the
  * result as state. `api.ask(type, id, role, key)` resolves `{ request }` or `{ error, retryAfter? }` (web/ports/access.js). `said` is the sentence for screen readers.
- * @param {{ api: { ask(type: string, id: string, role: string, key?: string|null): Promise<any> }, type: string, id: string, why: Explain, newKey?: (() => string)|null, onChange?: () => void }} o
+ * @param {{ api: { ask(type: string, id: string, role: string, key?: string|null): Promise<any> }, type: string, id: string, why: Explain, newKey?: (() => string)|null, onChange?: (state?: any) => void, reload?: (() => Promise<any>)|null }} o
  */
 export function createAskModel({ api, type, id, why, newKey = null, onChange = () => {}, reload = null }) {
   const state = { status: why.ask.pending ? "sent" : "idle", role: why.ask.roles.at(-1)?.id ?? why.ask.roles[0]?.id ?? null, message: null, said: null, pending: why.ask.pending, retryAfterMs: why.ask.retryAfterMs };

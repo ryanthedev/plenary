@@ -1,3 +1,4 @@
+// @ts-check
 // Editor ⇄ Replica binding: one link (transport + Replica + hello) per board, and on it one core Editor per element
 // stream, each kept in step with its stream (PROTOCOL.md v1; p8-one-link: one connection per tab).
 //
@@ -53,8 +54,9 @@ export function bindEditor(editor, { stream = "board", ...o }) {
  * synchronous, and a live link loads every bound Editor.
  * @param {{ transport: import("../ports/transport.js").Transport,
  *           fetchSnapshot?: import("../ports/net.js").FetchSnapshot | null,
- *           token: string, board: string, client?: string, tab?: string | null, onStatus?: (s: string) => void,
- *           onRoom?: (ev: object) => void,
+ *           token: string, board: string, client?: string, tab?: string | null, session?: string,
+ *           onStatus?: (s: string) => void, onRoom?: (ev: Record<string, any>) => void, onHeard?: () => void,
+ *           onImages?: ((ids: string[]) => void) | null,
  *           timeoutMs?: number, clock?: import("../ports/clock.js").Clock,
  *           timers?: { set(fn: () => void, ms: number): any, clear(h: any): void },
  *           now?: () => number, random?: () => number }} o
@@ -265,6 +267,7 @@ export function openLink({ transport, fetchSnapshot = null, token: firstToken, b
       if (idx < 0) { pump(); return; }
       const b = pendingBlobs.splice(idx, 1)[0];
       if (b.timer != null) { try { timers.clear(b.timer); } catch {} b.timer = null; }
+      /** @type {Error & { code?: string }} */
       const err = new Error(typeof msg.message === "string" && msg.message ? msg.message : msg.code);
       err.code = msg.code;
       b.reject(err);

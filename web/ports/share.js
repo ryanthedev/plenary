@@ -1,3 +1,4 @@
+// @ts-check
 // Share port: the Share dialog's calls (PROTOCOL.md § Share dialog). Imports nothing. Contract test: test/web/adapters/share-http.test.js (the http adapter over a fake fetch).
 //
 // Every call ALWAYS resolves (never rejects): a value, or `{ error, code? }` with one of SHARE_ERRORS:
@@ -17,5 +18,10 @@ export const SHARE_ERRORS = Object.freeze(["auth", "forbidden", "notfound", "inv
  * @typedef {{ id: string, role: string, expiresAt: number|null, createdAt: number, url?: string }} Link
  * @typedef {{ board: { id: string, title: string }, unit: { domains: string[] }|null, limits: { inviteRoles: string[], linkRoles: string[], inviteTtlMs: number }, invites: Invite[], links: Link[], more: boolean }} ShareView
  * @typedef {object} SharePort
+ * @property {(board: string) => Promise<Record<string, any>>} view
+ * @property {(board: string, o: { email: string, role: string, expiresAt?: number|null }, key?: string|null) => Promise<Record<string, any>>} invite
+ * @property {(board: string, o: { role: string, expiresAt?: number|null }, key?: string|null) => Promise<Record<string, any>>} link
+ * @property {(board: string, id: string) => Promise<Record<string, any>>} revokeInvite
+ * @property {(board: string, id: string) => Promise<Record<string, any>>} revokeLink
  */
 export {};

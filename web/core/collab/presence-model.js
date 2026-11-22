@@ -1,3 +1,4 @@
+// @ts-check
 // Others' presence, as something to draw (PROTOCOL.md § Presence). Pure: the clock is passed in, nothing here
 // touches the DOM or the port. Feed it `presence` batches, `leave`, `here` and `emotes`; read `view()`.
 // - A (user, client) is dropped on `leave` or after 30 s of silence. My own echo is ignored.
@@ -33,7 +34,7 @@ export function initials(name) {
 }
 
 /**
- * @param {{ now: () => number, me: { user: string, client: string }, role: string, flags?: object,
+ * @param {{ now: () => number, me: { user: string, client: string }, role: string, flags?: { viewersSeePresentersOnly?: boolean },
  *           tauMs?: number, settleEps?: number }} o
  */
 export function createPresence({ now, me, role, flags = FLAGS, tauMs = SMOOTH_TAU_MS, settleEps = SETTLE_EPSILON }) {

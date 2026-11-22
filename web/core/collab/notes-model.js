@@ -1,3 +1,4 @@
+// @ts-check
 // The notes drawer's rows (PROTOCOL.md § Streams, `notes`): each note with its author from the v1 snapshot's
 // noteAuthor. Pure. Annotators change only notes they made; owners and editors change anyone's; commenters and
 // viewers read. Edit and delete show only when the port offers them (editNote / deleteNote).
@@ -10,7 +11,7 @@ const isLabel = el => el.type === "text" && !!el.containerId;
 const KIND = { freedraw: "Highlight / drawing", image: "Picture", arrow: "Arrow", line: "Line" };
 
 /**
- * @param {object[]} elements port.notes()
+ * @param {Record<string, any>[]} elements port.notes()
  * @param {{ me: { user: string }, role: string, noteAuthor: (id: string) => string | null, nameOf: (user: string) => string | null,
  *   canEdit?: boolean, canDelete?: boolean, limit?: number }} o
  */

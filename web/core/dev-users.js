@@ -1,3 +1,4 @@
+// @ts-check
 // Dev tokens for the in-browser rooms: the URL's ?as=<name> picks token dev-<name>, which picks the user and
 // role. Never a real credential; the phase-3 server has its own (PLENARY_DEV_TOKENS).
 export const DEV_USERS = {

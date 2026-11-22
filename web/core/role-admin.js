@@ -1,3 +1,4 @@
+// @ts-check
 // The Roles screen as state with no DOM (web/adapters/dom/roles.js renders it; the data comes through web/ports/roles.js). The server decides
 // every permission: which permissions a person may tick (`matrix.tickable`), which board steps (`matrix.ladders`), where a permission means
 // anything (`matrix.permissions[].scopes`), and when an edit reaches many people (a 409 `confirm-required`). The model only asks, shows and
@@ -73,7 +74,7 @@ export function createRolesModel({ api, newKey = null }) {
     const r = roleOf(d.id);
     return !!r && (d.name !== r.name || d.ladder !== r.ladder || !same(d.permissions, r.permissions));
   };
-  /** Run a write: busy, then the failure text, or `apply`. @returns {Promise<{ ok: boolean, r: object }>} */
+  /** Run a write: busy, then the failure text, or `apply`. @returns {Promise<{ ok: boolean, r: Record<string, any> | null }>} */
   async function act(run, apply, said) {
     if (S.busy) return { ok: false, r: null };
     S.busy = true; S.notice = null; S.said = null; emit();

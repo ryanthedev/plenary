@@ -1,3 +1,4 @@
+// @ts-check
 // Clock port: time, timers and randomness for web/'s core, so tests run it on a virtual clock with a seeded
 // random. Imports nothing. Contract test: test/web/contracts/clock-contract.js (clockContract).
 //

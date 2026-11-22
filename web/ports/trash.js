@@ -1,3 +1,4 @@
+// @ts-check
 // Trash port: the calls behind Move to Trash, its Undo, the Trash page and the board-URL notice (PROTOCOL.md § Trash and restore). Imports nothing. Contract test: test/web/adapters/trash-http.test.js
 // (the http adapter over a fake fetch).
 //
@@ -16,13 +17,19 @@
 export const TRASH_ERRORS = Object.freeze(["auth", "forbidden", "notfound", "invalid", "moved", "with-space", "space-in-trash", "purged", "unavailable", "network"]);
 
 /**
- * @typedef {{ board: { id: string, title: string, space: { id: string, name: string } }, trashed: boolean, trashedAt: number, expiresAt: number, undo: { restore: true }|null }} TrashResult
- * @typedef {{ board: { id: string, title: string, space: { id: string, name: string } }, restored: boolean, movedTo?: { id: string, name: string, personal: boolean } }} RestoreResult
+ * @typedef {{ board: { id: string, title?: string, space: { id: string, name: string } }, trashed: boolean, trashedAt: number, expiresAt: number, undo: { restore: true }|null }} TrashResult
+ * @typedef {{ board: { id: string, title?: string, space: { id: string, name: string } }, restored: boolean, movedTo?: { id: string, name: string, personal: boolean } }} RestoreResult
  * @typedef {{ space: { id: string, name: string }, trashed?: boolean, restored?: boolean, boards: number, undo?: { restore: true }|null }} SpaceResult
- * @typedef {{ board: { id: string, title: string }, trashedAt: number, expiresAt: number, daysLeft: number, canRestore: boolean, by?: { id: string, name: string },
+ * @typedef {{ board: { id: string, title?: string }, trashedAt: number, expiresAt: number, daysLeft: number, canRestore: boolean, by?: { id: string, name: string },
  *   from?: { space: { id: string, name: string, personal: boolean }|null, group: { id: string, name: string }|null }, via?: { space: { id: string, name: string }|null, canRestore: boolean } }} Notice
- * @typedef {{ type: "board", id: string, title: string, from: { space: { id: string, name: string, personal: boolean }|null, group: { id: string, name: string }|null }, by: { id: string, name: string }|null, trashedAt: number, expiresAt: number, daysLeft: number }
+ * @typedef {{ type: "board", id: string, title?: string, from: { space: { id: string, name: string, personal: boolean }|null, group: { id: string, name: string }|null }, by: { id: string, name: string }|null, trashedAt: number, expiresAt: number, daysLeft: number }
  *   | { type: "space", id: string, name: string, group: { id: string, name: string|null }|null, boards: number, by: { id: string, name: string }|null, trashedAt: number, expiresAt: number, daysLeft: number }} Item
  * @typedef {object} TrashPort
+ * @property {(board: string, o: { from: string }, key?: string|null) => Promise<Record<string, any>>} trash
+ * @property {(board: string, key?: string|null) => Promise<Record<string, any>>} restore
+ * @property {(space: string, key?: string|null) => Promise<Record<string, any>>} trashSpace
+ * @property {(space: string, key?: string|null) => Promise<Record<string, any>>} restoreSpace
+ * @property {(board: string) => Promise<Record<string, any>>} notice
+ * @property {() => Promise<Record<string, any>>} list
  */
 export {};

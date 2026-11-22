@@ -1,3 +1,4 @@
+// @ts-check
 // Comment threads as something to show (PROTOCOL.md § Records). Pure: reads port.records() and an element
 // locator, never the DOM or the port's ops.
 // - Order: threads in creation order, comments in thread order (the room's `seq` order; this client's pending
@@ -31,7 +32,7 @@ export function ago(at, t) {
 export const cornerOf = b => ({ x: b.x + b.width, y: b.y });
 
 /**
- * @param {{ threads: object[], pending?: { op: object }[] }} records port.records()
+ * @param {{ threads: Record<string, any>[], pending?: { op: Record<string, any> }[] }} records port.records()
  * @param {{ me: { user: string, name: string }, role: string, element: (stream: string, id: string) => null | { x: number, y: number, width: number, height: number } }} o
  */
 export function recordsView(records, { me, role, element }) {

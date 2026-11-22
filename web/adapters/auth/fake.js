@@ -1,3 +1,4 @@
+// @ts-check
 // Auth adapter: an in-memory fake of POST /auth/exchange for tests and the
 // dev page. Implements web/ports/auth.js. Codes are single use and expire after ttlMs (60 s, as the server).
 

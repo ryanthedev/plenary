@@ -1,3 +1,4 @@
+// @ts-check
 // Who may do what in the canvas chrome. Pure: no DOM, no protocol imports (tested headless).
 //
 // The room's roles (PROTOCOL.md) map onto three kinds of chrome, as in the design mock:

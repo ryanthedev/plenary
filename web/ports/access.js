@@ -1,3 +1,4 @@
+// @ts-check
 // Access port: Teams, the access page of a scope and its grant writes, and the people/Team search the one picker uses (PROTOCOL.md § Teams and
 // access). Imports nothing. Contract test: test/web/adapters/access-http.test.js (the http adapter over a fake fetch).
 //
@@ -39,5 +40,18 @@ export const ACCESS_ERRORS = Object.freeze(["auth", "forbidden", "notfound", "in
  *   admins?: Person[], rows: Row[], next: string|null, inherited: Row[], roles: RoleOption[], organization?: { admins: { user: string, name: string }[], more: boolean, memberRole: string|null },
  *   requests?: { user: { id: string, name: string, email: string|null }, role: string, roleName: string, at: number }[], why?: import("../core/explain.js").Explain }} AccessPage
  * @typedef {object} AccessPort
+ * @property {(o?: { after?: string|null, q?: string|null }) => Promise<Record<string, any>>} teams
+ * @property {(id: string, after?: string|null) => Promise<Record<string, any>>} team
+ * @property {(name: string) => Promise<Record<string, any>>} createTeam
+ * @property {(id: string, name: string) => Promise<Record<string, any>>} renameTeam
+ * @property {(id: string) => Promise<Record<string, any>>} deleteTeam
+ * @property {(team: string, user: string, on: boolean) => Promise<Record<string, any>>} setMember
+ * @property {(q: string) => Promise<Record<string, any>>} directory
+ * @property {(type: string, id: string, after?: string|null) => Promise<Record<string, any>>} access
+ * @property {(type: string, id: string, subject: { type: "user"|"team", id: string }, role: string) => Promise<Record<string, any>>} setGrant
+ * @property {(type: string, id: string, subject: { type: "user"|"team", id: string }) => Promise<Record<string, any>>} removeGrant
+ * @property {(type: string, id: string, role: string, key?: string|null) => Promise<Record<string, any>>} ask
+ * @property {(type: string, id: string, user: string) => Promise<Record<string, any>>} dismissRequest
+ * @property {(id: string) => Promise<Record<string, any>>} explainBoard
  */
 export {};

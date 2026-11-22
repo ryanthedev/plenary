@@ -1,3 +1,4 @@
+// @ts-check
 // Sign-in core: who this tab is and the token its hello carries. Core code:
 // it imports only ports (the auth port's error list) and touches no globals; the composition root passes the
 // fragment, a function that drops it from the address bar (history.replaceState), the session-storage adapter
@@ -28,7 +29,7 @@ const TOKEN_MAX = 8192;
 
 /**
  * @typedef {{ user: string, name: string | null, email: string | null, domain: string | null }} Identity
- * @typedef {"signed-in" | "restored" | "none" | "bad-fragment" | "url-not-cleared" | "invalid-code" | "bad-origin" | "unavailable" | "network"} Outcome
+ * @typedef {"signed-in" | "restored" | "dev" | "none" | "bad-fragment" | "url-not-cleared" | "invalid-code" | "bad-origin" | "unavailable" | "network"} Outcome
  * @typedef {{ token: string | null, identity: Identity | null, exp: number | null, outcome: Outcome,
  *             link: "invalid" | "unavailable" | null }} SignIn
  */
@@ -170,11 +171,13 @@ export async function takeSignIn({ fragment, replaceFragment, storage, auth, clo
   try { replaceFragment(); } catch { cleared = false; }
 
   const params = parseFragment(fragment);
-  let link = null, code = null, outcome = null;
+  /** @type {"invalid" | "unavailable" | null} */
+  let link = null;
+  let code = null, outcome = null;
   if (params === null) outcome = "bad-fragment";
   else {
     const links = params.get("link") ?? [];
-    if (links.length === 1 && LINKS.includes(links[0])) link = links[0];
+    if (links.length === 1 && (links[0] === "invalid" || links[0] === "unavailable")) link = links[0];
     const codes = params.get("code") ?? [];
     if (codes.length === 1 && CODE_RE.test(codes[0])) code = codes[0];
     else if (codes.length > 0) outcome = "bad-fragment";
@@ -184,7 +187,7 @@ export async function takeSignIn({ fragment, replaceFragment, storage, auth, clo
   if (code !== null) {
     let r = normalize(await auth.exchange(code));
     if (RETRYABLE.includes(r.error) && !r.final) {
-      await new Promise(resolve => clock.set(resolve, RETRY_MIN_MS + Math.floor(clock.random() * RETRY_SPREAD_MS)));
+      await new Promise(resolve => clock.set(() => resolve(undefined), RETRY_MIN_MS + Math.floor(clock.random() * RETRY_SPREAD_MS)));
       r = normalize(await auth.exchange(code));
     }
     if (!r.error) {
@@ -221,7 +224,8 @@ export async function pageSignIn({ query, fragment, replaceFragment, storage, au
   if (dev) {
     try { replaceFragment(); } catch {}
     const links = parseFragment(fragment)?.get("link") ?? [];
-    const link = links.length === 1 && LINKS.includes(links[0]) ? links[0] : null;
+    /** @type {"invalid" | "unavailable" | null} */
+    const link = links.length === 1 && (links[0] === "invalid" || links[0] === "unavailable") ? links[0] : null;
     return { ...dev, dev: dev.token.slice(4), link };
   }
   const s = await takeSignIn({ fragment, replaceFragment, storage, auth, clock });

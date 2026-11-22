@@ -1,3 +1,4 @@
+// @ts-check
 // Home port: the Home screen's reads and the star toggle (PROTOCOL.md § Home, GET /home, GET /home/search, PUT/DELETE
 // /home/stars/:board). Imports nothing. Contract test: test/web/adapters/home-http.test.js (the http adapter over a fake fetch).
 //

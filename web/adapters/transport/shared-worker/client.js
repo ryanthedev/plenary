@@ -1,3 +1,4 @@
+// @ts-check
 // Transport adapter, page side of the SharedWorker dev room: implements web/ports/net.js (join → a transport of
 // web/ports/transport.js, plus the blobs stand-in put/onFile). The worker side is host.js (driven over a MessagePort)
 // with worker.js as its entry. Every tab of this browser on one board edits together.
@@ -32,7 +33,11 @@ export function sharedNet({ board, url = new URL("./worker.js", import.meta.url)
     join() {
       // One link id per connection: reopen() closes the old link and joins a new one, and only the current
       // link has handlers here, so nothing of an older connection is delivered (the contract's generation).
-      let link = null, done = false, onMsg = () => {}, onDrop = () => {};
+      let link = null, done = false;
+      /** @type {(msg: any) => void} */
+      let onMsg = () => {};
+      /** @type {() => void} */
+      let onDrop = () => {};
       const open = () => {
         if (link) { port.postMessage({ t: "close", link }); handlers.delete(link); drops.delete(link); link = null; }
         if (done) return;

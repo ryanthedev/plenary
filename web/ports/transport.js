@@ -1,3 +1,4 @@
+// @ts-check
 // Transport port: how web/'s core (sync.js) talks to a board: ONE transport per tab carries every stream (p8-one-link).
 // Driven port; types and limits only, no logic. Members may live on a prototype (a class): the session wraps each one
 // explicitly (web/core/session.js wrapTransport), and test/web/contracts/class-transport.test.js holds it to that.
@@ -58,13 +59,14 @@
 
 /**
  * @typedef {object} Transport
- * @property {(msg: object) => void} send
- * @property {(fn: (msg: object) => void) => void} onMessage
+ * @property {(msg: Record<string, any>) => void} send
+ * @property {(fn: (msg: Record<string, any>) => void) => void} onMessage
  * @property {() => void} reopen
  * @property {() => void} close
  * @property {(fn: () => void) => void} [onDrop]
  * @property {() => boolean} congested
  * @property {() => number} backlogBytes
+ * @property {() => void} [fail]
  */
 
 /** Outbound backlog (bytes) above which the core stops sending presence. */

@@ -1,3 +1,4 @@
+// @ts-check
 // Move port: the Move dialog's calls (PROTOCOL.md § Move board). Imports nothing. Contract test: test/web/adapters/move-http.test.js (the http adapter over a fake fetch).
 //
 // Every call ALWAYS resolves (never rejects): a value, or `{ error }` with one of MOVE_ERRORS:
@@ -18,5 +19,8 @@ export const MOVE_ERRORS = Object.freeze(["auth", "forbidden", "notfound", "inva
  * @typedef {{ board: { id: string, title: string }, from: object|null, to: { id: string, name: string, personal: boolean }, gains: DiffEntry[], keeps: DiffEntry[], loses: DiffEntry[], invites: number|null, links: number|null, hidden: boolean, more: boolean }} MoveDiff
  * @typedef {{ board: { id: string, title: string, space: { id: string, name: string } }, moved: boolean, undo: { space: { id: string, name: string, personal: boolean } }|null }} MoveResult
  * @typedef {object} MovePort
+ * @property {(board: string) => Promise<Record<string, any>>} options
+ * @property {(board: string, to: string) => Promise<Record<string, any>>} preview
+ * @property {(board: string, o: { from?: string, to: string }, key?: string|null) => Promise<Record<string, any>>} move
  */
 export {};

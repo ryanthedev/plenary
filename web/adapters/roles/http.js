@@ -1,3 +1,4 @@
+// @ts-check
 // Roles adapter over fetch: implements web/ports/roles.js against the routes of PROTOCOL.md § Roles. Imports nothing (fetch and timers are injected).
 // Bodies are checked here because the screen renders them: ids are 1-64 of [A-Za-z0-9_-], strings and lists are capped, anything else is dropped.
 
@@ -16,7 +17,7 @@ export function normalizeRole(r) {
   const used = u && typeof u === "object" ? ("members" in u ? { members: count(u.members), capped: u.capped === true } : { places: count(u.places), capped: u.capped === true }) : null;
   return { id: r.id, name: str(r.name), kind: r.kind, editable: r.editable === true, ...(typeof r.summary === "string" ? { summary: str(r.summary, 300) } : {}),
     ...(typeof r.base === "string" && r.base.length <= 64 ? { base: r.base } : {}), ladder: typeof r.ladder === "string" ? str(r.ladder, 16) : null,
-    permissions: list(r.permissions, 20, perm), scopes: Object.fromEntries(SCOPES.map(s => [s, list(r.scopes?.[s], 20, perm)])), used };
+    permissions: list(r.permissions, 20, perm), scopes: /** @type {Record<"unit"|"group"|"space"|"board", string[]>} */ (Object.fromEntries(SCOPES.map(s => [s, list(r.scopes?.[s], 20, perm)]))), used };
 }
 /** @returns {import("../../ports/roles.js").RolesPage|null} */
 export function normalizeRolesPage(b) {
@@ -60,6 +61,7 @@ export function httpRoles({ fetch, token, base = "", timeoutMs = 10_000, timers 
         let b = null;
         try { b = JSON.parse(await res.text()); } catch {}
         const code = CODES.includes(b?.error) ? b.error : undefined;
+        /** @type {{ error: string, code?: string, impact?: { places: number, people: number, capped: boolean }, used?: { places: number, capped: boolean }, waitMs?: number }} */
         const out = { error: STATUS[res.status], ...(code ? { code } : {}) };
         if (code === "confirm-required" && b.impact && typeof b.impact === "object") out.impact = { places: count(b.impact.places), people: count(b.impact.people), capped: b.impact.capped === true };
         if (code === "in-use") out.used = { places: count(b.places), capped: b.capped === true };

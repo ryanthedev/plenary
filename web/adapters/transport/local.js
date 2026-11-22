@@ -1,3 +1,4 @@
+// @ts-check
 // Transport adapter: an in-process reference room (packages/protocol's Room behind a gateway stand-in), for the dev
 // page, the no-SharedWorker fallback and the tests. Implements web/ports/transport.js (one transport per join()) and
 // web/ports/net.js (localNet). The one adapter allowed to import packages/protocol's Room, ports and presence rules
@@ -31,8 +32,8 @@ const RANK = { owner: 0, editor: 1, annotator: 2, commenter: 3, viewer: 4 };
  * hand `net.clock` to bindEditor / createSession (p6-hexv).
  * `makeRoom` (tests): replaces the Room with any far side of the same shape ({ connect(send) → conn, receive(conn, msg,
  * meta), disconnect(conn) }), so the transport contract can drive the link logic itself (test/web/adapters/transport-local).
- * @param {{ board?: string, tenant?: string, users: Record<string, { user: string, role: string }>, auto?: boolean, seed?: number, clock?: boolean,
- *           makeRoom?: (o: { board: string, tenant: string, log: object, now: () => number }) => object }} o
+ * @param {{ board?: string, tenant?: string, users: Record<string, { user: string, role: string, name?: string }>, auto?: boolean, seed?: number, clock?: boolean,
+ *           makeRoom?: (o: { board: string, tenant: string, log: Record<string, any>, now: () => number }) => Record<string, any> }} o
  */
 export function localRoom({ board = "b1", tenant = "t1", users, auto = false, seed = 1, clock = false, makeRoom = null }) {
   const time = { t: 0, q: [], n: 0 };
@@ -107,7 +108,7 @@ export function localRoom({ board = "b1", tenant = "t1", users, auto = false, se
       if (!who) { link.down.push(wire({ t: "error", code: "auth", message: "token refused" })); kick(); return; }
       const { token, ...hello } = msg;
       const r = room.receive(link.conn, hello, { n: ++link.n, ...who });
-      link.who = { user: who.user, role: who.role, name: users[msg.token]?.name ?? who.name ?? who.user };
+      link.who = { user: who.user, role: who.role, name: users[msg.token]?.name ?? /** @type {{ name?: string }} */ (who).name ?? who.user };
       hereSend(link);
       return r;
     }

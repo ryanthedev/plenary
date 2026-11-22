@@ -1,3 +1,4 @@
+// @ts-check
 // Auth port: trade the single-use sign-in code from the post-login fragment for a session token.
 // Imports nothing.
 // Contract test: test/web/contracts/auth-contract.js (authContract).

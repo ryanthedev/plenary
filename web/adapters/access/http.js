@@ -1,3 +1,4 @@
+// @ts-check
 // Access adapter over fetch: implements web/ports/access.js against the routes of PROTOCOL.md § Teams and access. Imports only core's explanation checker (fetch and timers
 // are injected). Bodies are checked here because the pages render them and put ids in links: ids are 1-64 of [A-Za-z0-9_-] (user ids are opaque
 // strings, up to 200 chars), strings and lists are capped, anything else is dropped.

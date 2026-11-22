@@ -1,3 +1,4 @@
+// @ts-check
 // Spaces adapter over fetch: implements web/ports/spaces.js against the routes of PROTOCOL.md § Spaces and Groups. Imports only core's explanation checker (fetch and
 // timers are injected). Bodies are checked here because the page renders them and puts ids in links: ids are 1-64 of [A-Za-z0-9_-], strings
 // and lists are capped, anything else is dropped.
@@ -17,13 +18,13 @@ const card = c => (c && typeof c === "object" && ID.test(c.id)
 const grp = g => (g && typeof g === "object" && ID.test(g.id) ? { id: g.id, name: str(g.name) } : null);
 const info = s => (s && typeof s === "object" && ID.test(s.id) ? { id: s.id, name: str(s.name), personal: s.personal === true, general: gen(s.general), group: grp(s.group) } : null);
 
-/** @param {object} b @returns {import("../../ports/spaces.js").SpacePage | null} */
+/** @param {Record<string, any>} b @returns {import("../../ports/spaces.js").SpacePage | null} */
 export function normalizeSpacePage(b) {
   const space = info(b?.space);
   if (!space || !Array.isArray(b.boards)) return null;
   return { space, can: { createBoard: b.can?.createBoard === true, rename: b.can?.rename === true, general: b.can?.general === true, trash: b.can?.trash === true }, boards: list(b.boards, 50, card), more: b.more === true, ...(b.why && normalizeExplain(b.why) ? { why: normalizeExplain(b.why) } : {}) };
 }
-/** @param {object} b @returns {import("../../ports/spaces.js").GroupPage | null} */
+/** @param {Record<string, any>} b @returns {import("../../ports/spaces.js").GroupPage | null} */
 export function normalizeGroupPage(b) {
   const g = grp(b?.group);
   if (!g || !Array.isArray(b.spaces)) return null;

@@ -1,3 +1,4 @@
+// @ts-check
 // The leaver screen as state with no DOM (web/adapters/dom/offboard.js renders it; the data comes through web/ports/offboard.js). The server decides everything (who may, what the person solely
 // owns, the default recipient: PROTOCOL.md § Leaver offboarding); the model words it, keeps one Idempotency-Key per item and per removal (reused by retries), applies the reviewed plan ONE item at a time
 // and never hides a failure. Copy follows design/orgs/JOURNEY.md J7.

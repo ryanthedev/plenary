@@ -1,3 +1,4 @@
+// @ts-check
 // The collab port's production adapter (web/ports/collab.js): core's policy (web/core/collab/port.js, p7-audit C-13)
 // with the browser's frame scheduler, which core may not read. The fake (./fake.js) is the other adapter; both pass
 // test/web/contracts/collab-contract.js.

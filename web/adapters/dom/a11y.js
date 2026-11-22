@@ -100,8 +100,65 @@ export function accessibleName(el, doc = globalThis.document) {
   return (el.textContent ?? "").trim();
 }
 
+// Unified per-document overlay stack: only the topmost active overlay handles Tab wrapping and Escape dismissal,
+// through a single document-level keydown listener per Document (attached while at least one overlay is active).
+/** @typedef {{ container: HTMLElement, handle: (e: any) => void }} OverlayEntry */
+/** @type {WeakMap<object, OverlayEntry[]>} */
+const docStacks = new WeakMap();
+/** @type {WeakMap<object, (e: any) => void>} */
+const docListeners = new WeakMap();
+/** @type {OverlayEntry[]} */
+const nullStack = [];
+const handledEvents = new WeakSet();
+
+/** @param {Document | null | undefined} doc */
+function getStack(doc) {
+  if (!doc || typeof doc !== "object") return nullStack;
+  let stack = docStacks.get(doc);
+  if (!stack) {
+    stack = [];
+    docStacks.set(doc, stack);
+  }
+  return stack;
+}
+
+/** @param {Document | null | undefined} doc */
+function ensureDocListener(doc) {
+  if (!doc || typeof doc !== "object" || typeof doc.addEventListener !== "function") return;
+  if (docListeners.has(doc)) return;
+  const listener = e => {
+    const stack = docStacks.get(doc);
+    if (!stack || !stack.length) return;
+    stack[stack.length - 1].handle(e);
+  };
+  docListeners.set(doc, listener);
+  doc.addEventListener("keydown", listener);
+}
+
+/** @param {Document | null | undefined} doc */
+function releaseDocListenerIfEmpty(doc) {
+  if (!doc || typeof doc !== "object" || typeof doc.removeEventListener !== "function") return;
+  const stack = docStacks.get(doc);
+  if (stack && stack.length > 0) return;
+  const listener = docListeners.get(doc);
+  if (listener) {
+    doc.removeEventListener("keydown", listener);
+    docListeners.delete(doc);
+  }
+}
+
+/**
+ * Return true if at least one focus-trapped modal overlay or bottom sheet is currently active on `doc`.
+ * @param {Document | null} [doc]
+ * @returns {boolean}
+ */
+export function hasActiveOverlay(doc = globalThis.document ?? null) {
+  return getStack(doc).length > 0;
+}
+
 /**
  * Create a focus trap for a modal dialog or bottom sheet.
+ * - Registers on the per-document overlay stack so only the topmost active overlay handles Tab / Escape.
  * - Saves `previousFocus` on activation (or uses `returnFocusTo`).
  * - Moves focus into the container (unless `focusOnActivate` is false).
  * - Traps Tab and Shift+Tab inside `container`.
@@ -126,12 +183,16 @@ export function createFocusTrap(container, {
 } = {}) {
   let active = false;
   let previousFocus = null;
-  const handled = new WeakSet();
+
+  const isTop = () => {
+    const stack = getStack(doc);
+    return stack.length > 0 && stack[stack.length - 1] === entry;
+  };
 
   const onKeyDown = e => {
-    if (!active || !e) return;
-    if (typeof e === "object" && handled.has(e)) return;
-    if (typeof e === "object") handled.add(e);
+    if (!active || !e || !isTop()) return;
+    if (typeof e === "object" && handledEvents.has(e)) return;
+    if (typeof e === "object") handledEvents.add(e);
 
     if (e.key === "Escape") {
       e.preventDefault?.();
@@ -160,13 +221,20 @@ export function createFocusTrap(container, {
     }
   };
 
+  /** @type {OverlayEntry} */
+  const entry = { container, handle: onKeyDown };
+
   function activate() {
     if (active || !container) return;
     active = true;
     previousFocus = returnFocusTo !== undefined ? returnFocusTo : (doc?.activeElement ?? null);
     if (attrOf(container, "tabindex") === null) container.setAttribute?.("tabindex", "-1");
+    const stack = getStack(doc);
+    const idx = stack.indexOf(entry);
+    if (idx >= 0) stack.splice(idx, 1);
+    stack.push(entry);
+    ensureDocListener(doc);
     container.addEventListener?.("keydown", onKeyDown);
-    doc?.addEventListener?.("keydown", onKeyDown);
     if (focusOnActivate) {
       const target = initialFocus ?? getFocusableElements(container)[0] ?? container;
       target?.focus?.();
@@ -176,8 +244,11 @@ export function createFocusTrap(container, {
   function deactivate({ restoreFocus = true } = {}) {
     if (!active) return;
     active = false;
+    const stack = getStack(doc);
+    const idx = stack.indexOf(entry);
+    if (idx >= 0) stack.splice(idx, 1);
+    releaseDocListenerIfEmpty(doc);
     container?.removeEventListener?.("keydown", onKeyDown);
-    doc?.removeEventListener?.("keydown", onKeyDown);
     if (restoreFocus && previousFocus && previousFocus.isConnected !== false) {
       previousFocus.focus?.();
     }

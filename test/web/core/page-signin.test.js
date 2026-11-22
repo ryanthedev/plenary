@@ -142,7 +142,7 @@ test("both roots (main.js, dev-main.js): sign-in storage is session storage; no 
   expect(app).not.toMatch(/\bsignIn\b|\.token\b|\btoken:/);           // the chrome never sees the token or the sign-in
   // What globalThis.plenary gets is mountApp's return: no token, no sign-in result in it.
   const exposed = /return \{([^}]*)\};\s*\}\s*$/.exec(app)[1];
-  expect(exposed.split(",").map(k => k.trim())).toEqual(["S", "ui", "net", "collab", "port", "setTheme", "openDialog", "openShare", "setPanel", "startComment"]);
+  expect(exposed.split(",").map(k => k.split(":")[0].trim())).toEqual(["S", "ui", "net", "collab", "port", "setTheme", "openDialog", "openShare", "setPanel", "startComment"]);
 });
 
 // p6-edgev LOW-1: a fragment that ONLY the length cap rejects (its code is well formed) is never exchanged.

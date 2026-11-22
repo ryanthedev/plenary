@@ -14,7 +14,7 @@ import { localRoom } from "../../web/adapters/transport/local.js";
 import { createSession } from "../../web/core/session.js";
 import { memoryStore } from "../../web/adapters/storage/memory.js";
 import { mountApp } from "../../web/adapters/dom/app.js";
-import { createFocusTrap, trapFocus, getFocusableElements, accessibleName } from "../../web/adapters/dom/a11y.js";
+import { createFocusTrap, trapFocus, hasActiveOverlay, getFocusableElements, accessibleName } from "../../web/adapters/dom/a11y.js";
 
 // ── minimal DOM stub with activeElement focus tracking ──
 let currentDoc = null;
@@ -76,7 +76,7 @@ class E extends N {
 }
 
 const IDS = ["topbar", "panel", "drawer", "timeline", "hudBL", "hudBC", "hudBR", "dock", "sheetBackdrop", "sheet", "dialogs", "overlays", "veil", "toast", "picker"];
-const GLOBALS = ["document", "Node", "devicePixelRatio", "matchMedia", "ResizeObserver", "requestAnimationFrame", "addEventListener", "removeEventListener", "visualViewport"];
+const GLOBALS = ["document", "Node", "devicePixelRatio", "matchMedia", "ResizeObserver", "requestAnimationFrame", "addEventListener", "removeEventListener", "visualViewport", "history", "Image"];
 const saved = Object.fromEntries(GLOBALS.map(k => [k, Object.getOwnPropertyDescriptor(globalThis, k)]));
 afterAll(() => {
   for (const k of GLOBALS) {
@@ -125,7 +125,7 @@ function makeDoc() {
   return doc;
 }
 
-function setupApp({ token = "t-ada", phone = true, coarse = true, admin = null } = {}) {
+function setupApp({ token = "t-ada", phone = true, coarse = true, admin = null, share = null, move = null, uploadBlob = null, history = undefined } = {}) {
   let frames = [];
   const winL = {};
   const doc = makeDoc();
@@ -155,21 +155,27 @@ function setupApp({ token = "t-ada", phone = true, coarse = true, admin = null }
     addEventListener: (t, fn) => { (winL[t] ??= []).push(fn); },
     removeEventListener: (t, fn) => { winL[t] = (winL[t] ?? []).filter(f => f !== fn); },
     visualViewport: undefined,
+    history,
+    Image: class { set src(v) { this._src = v; this.complete = true; this.naturalWidth = 1; this.naturalHeight = 1; this.onload?.(); } get src() { return this._src; } },
   });
 
   const net = localRoom({ board: "a11y-board", users: USERS, clock: true });
+  const appNet = { kind: "local", put() {}, onFile() {}, ...(uploadBlob ? { uploadBlob } : {}) };
   const app = mountApp({
     startSession: ({ mine, onChange }) => createSession({
       join: () => net.join(), token, board: "a11y-board",
       client: USERS[token].user, user: USERS[token].user, mine, onChange, clock: net.clock,
+      ...(uploadBlob ? { uploadBlob } : {}),
     }),
-    net: { kind: "local", put() {}, onFile() {} },
+    net: appNet,
     board: "a11y-board",
     me: { user: USERS[token].user, name: "Ada", role: null },
     prefs: memoryStore(),
     theme: "light",
     clock: net.clock,
     admin,
+    share,
+    move,
   });
   const step = (n = 1) => {
     for (let i = 0; i < n; i++) {
@@ -180,8 +186,13 @@ function setupApp({ token = "t-ada", phone = true, coarse = true, admin = null }
       for (const fn of q) fn();
     }
   };
+  const fireWin = (t, ev = {}) => {
+    const e = { defaultPrevented: false, returnValue: undefined, preventDefault() { this.defaultPrevented = true; }, ...ev };
+    for (const fn of [...(winL[t] ?? [])]) fn(e);
+    return e;
+  };
   step(3);
-  return { doc, byId: doc._byId, app, S: app.S, step };
+  return { doc, byId: doc._byId, app, S: app.S, net, step, fireWin };
 }
 
 const find = (root, pred) => root.all().find(pred);
@@ -280,6 +291,99 @@ describe("a11y focus trap (web/adapters/dom/a11y.js)", () => {
     emptyBtn.setAttribute("aria-labelledby", 'bad]id"here');
     expect(() => accessibleName(emptyBtn, stubDoc)).not.toThrow();
     expect(accessibleName(emptyBtn, stubDoc)).toBe("");
+  });
+
+  test("unified overlay stack (bubbling DOM): only topmost overlay handles Tab & Escape, single document listener, closing top restores underlying overlay", () => {
+    const doc = makeDoc();
+    globalThis.document = doc;
+    let docKeydownAdds = 0, docKeydownRemoves = 0;
+    const origAdd = doc.addEventListener, origRem = doc.removeEventListener;
+    doc.addEventListener = (t, fn) => { if (t === "keydown") docKeydownAdds++; origAdd(t, fn); };
+    doc.removeEventListener = (t, fn) => { if (t === "keydown") docKeydownRemoves++; origRem(t, fn); };
+
+    // Bubbling keydown dispatch from target -> ancestors -> document (matching real browser DOM)
+    const dispatchBubblingKeydown = (target, init) => {
+      const ev = {
+        target,
+        currentTarget: target,
+        defaultPrevented: false,
+        stopped: false,
+        preventDefault() { this.defaultPrevented = true; },
+        stopPropagation() { this.stopped = true; },
+        ...init,
+      };
+      for (let node = target; node && !ev.stopped; node = node.parentNode) {
+        ev.currentTarget = node;
+        for (const fn of [...(node.listeners?.keydown ?? [])]) fn(ev);
+      }
+      if (!ev.stopped) return doc.fire("keydown", ev);
+      return ev;
+    };
+
+    const trigger = new E("button"); trigger.textContent = "Open outer";
+    const outer = new E("div"); outer.setAttribute("role", "dialog");
+    const outerFirst = new E("button"); outerFirst.textContent = "Outer 1";
+    const outerLast = new E("button"); outerLast.textContent = "Outer 2";
+    const inner = new E("div"); inner.setAttribute("role", "dialog");
+    const innerFirst = new E("button"); innerFirst.textContent = "Inner 1";
+    const innerLast = new E("button"); innerLast.textContent = "Inner 2";
+    inner.append(innerFirst, innerLast);
+    outer.append(outerFirst, outerLast, inner);
+    doc.body.append(trigger, outer);
+
+    trigger.focus();
+    expect(hasActiveOverlay(doc)).toBe(false);
+
+    let outerEsc = 0, innerEsc = 0;
+    const outerTrap = trapFocus(outer, {
+      doc,
+      onEscape: () => { outerEsc++; outerTrap.deactivate(); },
+    });
+    expect(hasActiveOverlay(doc)).toBe(true);
+    expect(docKeydownAdds).toBe(1);
+    expect(doc.activeElement).toBe(outerFirst);
+
+    const innerTrap = trapFocus(inner, {
+      doc,
+      onEscape: () => { innerEsc++; innerTrap.deactivate(); },
+    });
+    // Still only ONE document-level keydown listener for the entire overlay stack
+    expect(docKeydownAdds).toBe(1);
+    expect(hasActiveOverlay(doc)).toBe(true);
+    expect(doc.activeElement).toBe(innerFirst);
+
+    // Tab wraps strictly inside inner overlay; outer does not interfere
+    innerLast.focus();
+    const tabInner = dispatchBubblingKeydown(innerLast, { key: "Tab", shiftKey: false });
+    expect(tabInner.defaultPrevented).toBe(true);
+    expect(doc.activeElement).toBe(innerFirst);
+
+    // Escape on inner closes ONLY inner (never bubbles to close outer)
+    const escInner = dispatchBubblingKeydown(innerFirst, { key: "Escape" });
+    expect(escInner.defaultPrevented).toBe(true);
+    expect(innerEsc).toBe(1);
+    expect(outerEsc).toBe(0);
+    expect(innerTrap.isActive()).toBe(false);
+    expect(outerTrap.isActive()).toBe(true);
+    expect(hasActiveOverlay(doc)).toBe(true);
+    expect(docKeydownRemoves).toBe(0);
+    expect(doc.activeElement).toBe(outerFirst);
+
+    // Now outer is back on top of the stack: Tab wraps inside outer
+    outerFirst.focus();
+    const shiftTabOuter = dispatchBubblingKeydown(outerFirst, { key: "Tab", shiftKey: true });
+    expect(shiftTabOuter.defaultPrevented).toBe(true);
+    expect(doc.activeElement).toBe(innerLast); // inner is still in DOM as child of outer, so it's the last focusable
+
+    // Escape from document.body (outside outer) closes outer via the single document listener
+    doc.body.focus();
+    const escOuter = dispatchBubblingKeydown(doc.body, { key: "Escape" });
+    expect(escOuter.defaultPrevented).toBe(true);
+    expect(outerEsc).toBe(1);
+    expect(outerTrap.isActive()).toBe(false);
+    expect(hasActiveOverlay(doc)).toBe(false);
+    expect(docKeydownRemoves).toBe(1);
+    expect(doc.activeElement).toBe(trigger);
   });
 });
 
@@ -483,6 +587,223 @@ describe("ARIA labels, dialog semantics, and live status regions", () => {
     step(2);
     expect(byId.dialogs.children.length).toBe(0);
     expect(doc.activeElement?.getAttribute("aria-label")).toBe("Share board");
+  });
+
+  test("M1: phone More sheet restores focus to visible dock More button (not hidden desktop .header-more)", () => {
+    const { doc, byId, app, step } = setupApp({ token: "t-ada", phone: true, coarse: true });
+
+    // Simulate real browser CSS: desktop .header-more is display:none !important on <= 1023px (offsetParent === null)
+    const markDesktopMoreHidden = () => {
+      const desktopMore = find(byId.topbar, e => e.classList.contains("header-more"));
+      if (desktopMore) desktopMore.offsetParent = null;
+    };
+    markDesktopMoreHidden();
+
+    const dockMore = find(byId.dock, e => e.hasAttribute("data-dock-more"));
+    expect(dockMore).toBeTruthy();
+    expect(dockMore.getAttribute("aria-label")).toBe("More");
+    dockMore.focus();
+    dockMore.click();
+    step(2);
+    markDesktopMoreHidden();
+    expect(app.ui.sheet).toBe("tools");
+
+    // Escape closes the sheet: focus must land on the visible dock [data-dock-more], NOT hidden .header-more
+    byId.sheet.fire("keydown", { key: "Escape" });
+    step(2);
+    expect(app.ui.sheet).toBe(null);
+    expect(doc.activeElement?.hasAttribute("data-dock-more")).toBe(true);
+    expect(doc.activeElement?.classList.contains("header-more")).toBe(false);
+
+    // Opening from topbar .overflow-btn restores focus back to .overflow-btn
+    const overflowBtn = find(byId.topbar, e => e.classList.contains("overflow-btn"));
+    expect(overflowBtn).toBeTruthy();
+    overflowBtn.focus();
+    overflowBtn.click();
+    step(2);
+    markDesktopMoreHidden();
+    expect(app.ui.sheet).toBe("tools");
+    byId.sheetBackdrop.click();
+    step(2);
+    expect(app.ui.sheet).toBe(null);
+    expect(doc.activeElement?.classList.contains("overflow-btn")).toBe(true);
+  });
+
+  test("M3: document.body-mounted Share dialog blocks board shortcuts (Delete, Cmd+Shift+E) even when focus is on body", () => {
+    const stubShare = {
+      view: async () => ({ view: { board: { id: "a11y-board", title: "Test" }, unit: { domains: [] }, limits: { inviteRoles: [], linkRoles: [], inviteTtlMs: 0 }, invites: [], links: [], more: false } }),
+    };
+    const { doc, app, S, step } = setupApp({ token: "t-ada", phone: false, coarse: false, share: stubShare });
+
+    // Place and select a rectangle on the board
+    S.setTool("rectangle");
+    S.pointerDown({ x: 40, y: 40 });
+    S.pointerMove({ x: 140, y: 120 });
+    S.pointerUp({ x: 140, y: 120 });
+    step(2);
+    expect(S.eds.board.doc.live().length).toBe(1);
+    const rectId = S.eds.board.doc.live()[0].id;
+    S.act("board", ed => ed.select([rectId]));
+
+    // Open document.body-mounted Share dialog
+    const dlg = app.openShare();
+    expect(dlg).toBeTruthy();
+    expect(hasActiveOverlay(doc)).toBe(true);
+
+    // Move focus to document.body (outside the dialog) and fire Delete and Cmd+Shift+E
+    doc.body.focus();
+    expect(doc.activeElement).toBe(doc.body);
+    doc.fire("keydown", { key: "Delete", target: doc.body });
+    doc.fire("keydown", { key: "e", metaKey: true, shiftKey: true, target: doc.body });
+    step(2);
+
+    // Shape must NOT be deleted and Export dialog must NOT open while Share dialog is active
+    expect(S.eds.board.doc.live().length).toBe(1);
+    expect(app.ui.dialog).toBe(null);
+
+    // Close Share dialog: board shortcuts resume working
+    dlg.close();
+    expect(hasActiveOverlay(doc)).toBe(false);
+    doc.fire("keydown", { key: "Delete", target: doc.body });
+    step(2);
+    expect(S.eds.board.doc.live().length).toBe(0);
+  });
+
+  test("H4: mobile bottom sheet pushes history state, popstate dismisses cleanly without double-back, and beforeunload guards unsent ops", () => {
+    const histStack = [{ page: "board" }];
+    let backCalls = 0, pushCalls = 0, replaceCalls = 0;
+    let triggerPopstate = null;
+    const mockHistory = {
+      get state() { return histStack[histStack.length - 1]; },
+      pushState(s) { pushCalls++; histStack.push(s); },
+      replaceState(s) { replaceCalls++; histStack[histStack.length - 1] = s; },
+      back() {
+        backCalls++;
+        if (histStack.length > 1) histStack.pop();
+        triggerPopstate?.();
+      },
+    };
+
+    const { byId, app, S, net, step, fireWin } = setupApp({ token: "t-ada", phone: true, coarse: true, history: mockHistory });
+    triggerPopstate = () => fireWin("popstate");
+
+    // 1) Opening a sheet pushes one history entry
+    const moreBtn = find(byId.dock, e => e.hasAttribute("data-dock-more"));
+    moreBtn.click();
+    step(2);
+    expect(app.ui.sheet).toBe("tools");
+    expect(pushCalls).toBe(1);
+    expect(histStack.length).toBe(2);
+    expect(mockHistory.state).toEqual({ plenarySheet: "tools" });
+
+    // Switching sheets replaces state rather than pushing another entry
+    const styleBtn = find(byId.dock, e => e.tagName === "BUTTON" && e.textContent.includes("Style"));
+    styleBtn.click();
+    step(2);
+    expect(app.ui.sheet).toBe("panel");
+    expect(pushCalls).toBe(1);
+    expect(replaceCalls).toBe(1);
+    expect(histStack.length).toBe(2);
+
+    // 2) Simulated iOS back-swipe (popstate) dismisses sheet without calling history.back() again
+    histStack.pop();
+    fireWin("popstate");
+    step(2);
+    expect(app.ui.sheet).toBe(null);
+    expect(byId.sheet.hidden).toBe(true);
+    expect(backCalls).toBe(0);
+    expect(histStack.length).toBe(1);
+
+    // 3) Closing sheet via Escape pops the pushed entry once without double-navigating
+    find(byId.dock, e => e.hasAttribute("data-dock-more")).click();
+    step(2);
+    expect(app.ui.sheet).toBe("tools");
+    expect(histStack.length).toBe(2);
+    byId.sheet.fire("keydown", { key: "Escape" });
+    step(2);
+    expect(app.ui.sheet).toBe(null);
+    expect(backCalls).toBe(1);
+    expect(histStack.length).toBe(1);
+
+    // 4) beforeunload: clean board does NOT block unload; unsent pending ops DO block unload
+    expect(S.pending).toBe(0);
+    const cleanUnload = fireWin("beforeunload");
+    expect(cleanUnload.defaultPrevented).toBe(false);
+
+    // Draw a shape without stepping the transport so the op is still unacked (S.pending > 0)
+    S.act("board", ed => {
+      ed.setTool("rectangle");
+      ed.pointerDown({ x: 10, y: 10 });
+      ed.pointerMove({ x: 60, y: 60 });
+      ed.pointerUp({ x: 60, y: 60 });
+    });
+    expect(S.pending).toBeGreaterThan(0);
+    const dirtyUnload = fireWin("beforeunload");
+    expect(dirtyUnload.defaultPrevented).toBe(true);
+    expect(dirtyUnload.returnValue).toBe("");
+
+    // Once the transport settles (acked), S.pending returns to 0 and beforeunload stops nagging
+    step(3);
+    expect(S.pending).toBe(0);
+    const settledUnload = fireWin("beforeunload");
+    expect(settledUnload.defaultPrevented).toBe(false);
+    void net;
+  });
+
+  test("H5: Excalidraw import aborts and toasts error when any embedded image blob upload fails", async () => {
+    let failUpload = true;
+    let uploadAttempts = 0;
+    const { byId, S, step } = setupApp({
+      token: "t-ada",
+      phone: false,
+      coarse: false,
+      uploadBlob: async () => {},
+    });
+    S.uploadBlob = async () => {
+      uploadAttempts++;
+      if (failUpload) throw new Error("network down");
+    };
+
+    const tinyPngDataUrl = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+    const excalidrawJson = JSON.stringify({
+      type: "excalidraw",
+      version: 2,
+      elements: [{
+        id: "img-1",
+        type: "image",
+        x: 10,
+        y: 20,
+        width: 100,
+        height: 100,
+        fileId: "orig-file-1",
+        status: "saved",
+      }],
+      files: {
+        "orig-file-1": { id: "orig-file-1", mimeType: "image/png", dataURL: tinyPngDataUrl, created: 1 },
+      },
+    });
+
+    const makeFile = () => ({ name: "deck.excalidraw", size: excalidrawJson.length, type: "application/json", text: async () => excalidrawJson });
+
+    // 1) Failing upload aborts the import — 0 elements committed, toast reports upload failure
+    byId.picker.files = [makeFile()];
+    byId.picker.fire("change");
+    await new Promise(r => setTimeout(r, 20));
+    step(2);
+    expect(uploadAttempts).toBe(1);
+    expect(S.eds.board.doc.live().length).toBe(0);
+    expect(byId.toast.hidden).toBe(false);
+    expect(byId.toast.textContent.toLowerCase()).toContain("upload failed");
+
+    // 2) Succeeding upload commits the imported image element cleanly
+    failUpload = false;
+    byId.picker.files = [makeFile()];
+    byId.picker.fire("change");
+    await new Promise(r => setTimeout(r, 20));
+    step(2);
+    expect(uploadAttempts).toBe(2);
+    expect(S.eds.board.doc.live().length).toBe(1);
+    expect(S.eds.board.doc.live()[0].type).toBe("image");
   });
 });
 

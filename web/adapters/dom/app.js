@@ -5,7 +5,7 @@
 // here touches the protocol, a transport or sign-in (web/main.js, the composition root, wires those).
 
 import { captureFocus, restoreFocus } from "./focus.js";
-import { trapFocus } from "./a11y.js";
+import { trapFocus, hasActiveOverlay } from "./a11y.js";
 import { Editor } from "../../../packages/core/editor.js";
 import { parsePanel, serializePanel, applyPanel, panelLayout, dragWidth } from "../../../packages/core/panel.js";
 import { isMermaid } from "../../../packages/core/mermaid.js";
@@ -343,7 +343,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   );
   const isSlider = el => matchUp(el, x => attrOf(x, "role") === "slider");
 
-  const hasOpenDialog = () => Boolean($("#dialogs")?.childNodes?.length);
+  const hasOpenDialog = () => Boolean($("#dialogs")?.childNodes?.length) || hasActiveOverlay();
 
   document.addEventListener("keydown", e => {
     if (e.defaultPrevented) return;
@@ -561,7 +561,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       outFiles[sha1] = next;
       if (RASTER.test(next.mimeType)) {
         if (typeof net.uploadBlob === "function") {
-          try { await S.uploadBlob(sha1, bytes, next.mimeType); } catch {}
+          await S.uploadBlob(sha1, bytes, next.mimeType);
         } else {
           net.put?.(next);
         }
@@ -586,9 +586,14 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const hasImageData = Object.values(parsed.files).some(f => typeof f?.dataURL === "string");
     let fileIdMap = null, files = parsed.files;
     if (hasImageData) {
-      const prepared = await prepareExcalidrawFiles(parsed.files);
-      fileIdMap = prepared.fileIdMap;
-      files = prepared.files;
+      try {
+        const prepared = await prepareExcalidrawFiles(parsed.files);
+        fileIdMap = prepared.fileIdMap;
+        files = prepared.files;
+      } catch {
+        toast("Import failed: picture upload failed");
+        return false;
+      }
       if (!S.may()) return false;
     }
     const stream = S.role === "presenter" ? S.active : "notes";
@@ -730,27 +735,81 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     chromeDirty = true;
     collab?.setTheme(t);
   };
-  let activeShare = null, dialogTrap = null, dialogOpener = null, sheetTrap = null, sheetOpener = null, sheetBackdropEl = null, dialogRebuilding = false;
+  let activeShare = null, dialogTrap = null, dialogOpener = null, sheetTrap = null, sheetOpener = null, sheetBackdropEl = null, dialogRebuilding = false, sheetHistoryPushed = false;
+  function pushSheetHistory(name) {
+    const hist = globalThis.history;
+    if (!hist || typeof hist.pushState !== "function") return;
+    try {
+      if (!sheetHistoryPushed) {
+        hist.pushState({ plenarySheet: name }, "");
+        sheetHistoryPushed = true;
+      } else if (typeof hist.replaceState === "function") {
+        hist.replaceState({ plenarySheet: name }, "");
+      }
+    } catch {}
+  }
+  function popSheetHistory({ fromPopstate = false } = {}) {
+    if (!sheetHistoryPushed) return;
+    sheetHistoryPushed = false;
+    if (fromPopstate) return;
+    const hist = globalThis.history;
+    if (!hist || typeof hist.back !== "function") return;
+    const hasState = "state" in hist && hist.state !== undefined;
+    if (!hasState || hist.state?.plenarySheet) {
+      try { hist.back(); } catch {}
+    }
+  }
+  function isVisibleControl(el) {
+    if (!el || el.hidden || el.disabled) return false;
+    if (el.getAttribute?.("aria-hidden") === "true") return false;
+    if (el.style?.display === "none" || el.style?.visibility === "hidden") return false;
+    if ("offsetParent" in el && el.offsetParent === null) return false;
+    if (isPhone() && (el.classList?.contains("header-more") || el.classList?.contains("desk-only"))) return false;
+    if (!isPhone() && el.classList?.contains("phone-only")) return false;
+    return true;
+  }
   function captureOpener(el) {
     const target = el ?? document.activeElement ?? null;
     if (!target) return null;
-    return { el: target, label: target.getAttribute?.("aria-label") ?? null };
+    const rootId = $("#dock")?.contains?.(target) ? "dock"
+      : $("#topbar")?.contains?.(target) ? "topbar"
+      : $("#hudBL")?.contains?.(target) ? "hudBL"
+      : null;
+    return {
+      el: target,
+      label: target.getAttribute?.("aria-label") ?? null,
+      rootId,
+      dockMore: Boolean(target.getAttribute?.("data-dock-more")),
+    };
   }
-  function findByAriaLabel(label) {
+  function findByAriaLabel(label, preferredRootId = null) {
     if (!label) return null;
     const visit = node => {
       for (const child of node?.children ?? []) {
-        if (child.getAttribute?.("aria-label") === label) return child;
+        if (child.getAttribute?.("aria-label") === label && isVisibleControl(child)) return child;
         const found = visit(child);
         if (found) return found;
       }
       return null;
     };
-    return visit($("#topbar")) ?? visit($("#dock")) ?? visit(document.body);
+    const roots = [];
+    if (preferredRootId) roots.push($(`#${preferredRootId}`));
+    if (isPhone()) roots.push($("#dock"), $("#topbar"), document.body);
+    else roots.push($("#topbar"), $("#dock"), document.body);
+    for (const r of roots) {
+      if (!r) continue;
+      const hit = visit(r);
+      if (hit) return hit;
+    }
+    return null;
   }
   function restoreOpener(saved, fallback = canvas) {
-    if (saved?.el && saved.el.isConnected !== false) { saved.el.focus?.(); return; }
-    const twin = findByAriaLabel(saved?.label);
+    if (saved?.el && saved.el.isConnected !== false && isVisibleControl(saved.el)) { saved.el.focus?.(); return; }
+    if (saved?.dockMore) {
+      const dockMore = /** @type {HTMLElement | null} */ (document.querySelector?.("[data-dock-more]"));
+      if (dockMore && isVisibleControl(dockMore)) { dockMore.focus?.(); return; }
+    }
+    const twin = findByAriaLabel(saved?.label, saved?.rootId ?? null);
     if (twin) { twin.focus?.(); return; }
     fallback?.focus?.();
   }
@@ -777,6 +836,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (why.isOpen()) why.close(false);
     if (!keepSheet && ui.sheet) {
       ui.sheet = null;
+      popSheetHistory();
       sheetTrap?.deactivate({ restoreFocus: false });
       sheetTrap = null;
       sheetOpener = null;
@@ -793,13 +853,15 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       }
     }
   }
-  function setSheet(next, { opener = null, restore = true } = {}) {
+  function setSheet(next, { opener = null, restore = true, fromPopstate = false } = {}) {
     if (next) {
       dismissOverlays({ keepSheet: true });
       if (!ui.sheet) sheetOpener = captureOpener(opener);
       ui.sheet = next;
+      pushSheetHistory(next);
     } else {
       ui.sheet = null;
+      popSheetHistory({ fromPopstate });
       const prevOpener = sheetOpener;
       sheetOpener = null;
       if (sheetTrap) { sheetTrap.deactivate({ restoreFocus: false }); sheetTrap = null; }
@@ -866,7 +928,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     else if (S.canMove !== true && moveWelcomed) { moveWelcomed = false; moveInfo.space = null; chromeDirty = true; }
   };
   // Escape and Cancel return focus to a control that is on screen at this width (the chrome is rebuilt meanwhile): the Move or Share button, else the More button.
-  const visibleControl = sel => { const c = sel.map(q => document.querySelector(q)); return c.find(e => e && e.offsetParent !== null) ?? c.find(Boolean); };
+  const visibleControl = sel => { const c = sel.map(q => document.querySelector(q)); return c.find(e => e && isVisibleControl(e)) ?? c.find(Boolean); };
   const moveOpener = { focus() { (visibleControl(["[data-move-open]", ".header-more", "[data-dock-more]"]) ?? canvas)?.focus?.(); } };
   const openMoveDialog = () => { dismissOverlays(); chromeDirty = true; startMove({ host: document.body, move, board, opener: moveOpener, reload: refreshMove, restoreFocus: () => canvas.focus?.() }); };
   booted = true; syncMove();
@@ -1132,6 +1194,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     el.style.transform = "";
     if (!ui.sheet || !isPhone()) {
       if (isPhone()) cancelActiveSampler();
+      if (sheetHistoryPushed) popSheetHistory();
       if (sheetTrap) { sheetTrap.deactivate({ restoreFocus: false }); sheetTrap = null; }
       if (bd) bd.hidden = true;
       el.hidden = true;
@@ -1471,6 +1534,15 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   };
   addEventListener("online", () => { S.online = true; chromeDirty = true; probe(); });
   addEventListener("offline", () => { S.online = false; chromeDirty = true; });
+  addEventListener("popstate", () => {
+    if (ui.sheet) setSheet(null, { fromPopstate: true });
+  });
+  addEventListener("beforeunload", e => {
+    if (S.pending > 0) {
+      e.preventDefault();
+      e.returnValue = "";
+    }
+  });
   addEventListener("pageshow", /** @param {PageTransitionEvent} e */ e => {
     if (!e?.persisted) return;
     hiddenAt = null;

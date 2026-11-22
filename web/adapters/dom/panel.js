@@ -8,6 +8,7 @@ import { panelSections, applyPanel } from "../../../packages/core/panel.js";
 import { getPreset, EASING_META, canonicalEasing, presetsByCategory, timelineSpans, formatTime } from "../../../packages/core/anim.js";
 import { FONT_FAMILY, fontClass } from "../../../packages/core/style.js";
 import { isShape, isLabel, layerOf } from "../../../packages/core/model.js";
+import { listNamedFrames } from "../../../packages/core/views.js";
 import { parseLibrary, mergeLibrary } from "../../../packages/core/library.js";
 import { icon } from "./icons.js";
 import { createColorPicker } from "./color-picker.js";
@@ -38,7 +39,7 @@ export function availableFor(session) {
   const b = session.eds.board;
   return id => {
     if (id === "arrange") return b.sel.size > 0 || session.eds.notes.sel.size > 0;
-    if (id === "frames") return b.frames().length > 0;
+    if (id === "frames") return listNamedFrames(b.doc).length > 0;
     return true;
   };
 }
@@ -152,10 +153,12 @@ export function renderPanel(root, ctx) {
       h("div.row", {}, h("span.opts", {}, chip("-15°", false, () => act(e => e.rotateBy(-15)), "Rotate -15°"), chip("+15°", false, () => act(e => e.rotateBy(15)), "Rotate +15°"), chip("+90°", false, () => act(e => e.rotateBy(90)), "Rotate +90°"), chip("0°", false, () => act(e => e.resetRotation()), "Reset rotation"))),
     ],
     frames: () => {
-      const fs = B.frames();
+      const fs = listNamedFrames(B.doc);
+      const goFrame = id => { if (ctx.onJumpFrame) ctx.onJumpFrame(id); else S.goToFrame(id); ctx.onChange(); };
+      const stepFrame = d => { if (ctx.onStepFrame) ctx.onStepFrame(d); else S.stepFrame(d); };
       return [
-        ...fs.map((f, i) => h("button.list-row" + (B.frameAt === f.id ? ".on" : ""), { "data-fk": `frame:${f.id}`, onclick: () => { S.goToFrame(f.id); ctx.onChange(); } }, h("span.dim", {}, String(i + 1)), " ", f.name || `Frame ${i + 1}`)),
-        h("div.row", { style: { marginTop: "6px" } }, h("span.opts", {}, chip([icon("chevronLeft", { size: 14 }), " prev"], false, () => S.stepFrame(-1), "PgUp", true), chip(["next ", icon("chevronRight", { size: 14 })], false, () => S.stepFrame(1), "PgDn", true), chip("all", false, () => S.fit(), "Fit everything (⇧1)", true))),
+        ...fs.map((f, i) => h("button.list-row" + (B.frameAt === f.id ? ".on" : ""), { "data-fk": `frame:${f.id}`, onclick: () => goFrame(f.id) }, h("span.dim", {}, String(i + 1)), " ", f.rawName || `Frame ${i + 1}`)),
+        h("div.row", { style: { marginTop: "6px" } }, h("span.opts", {}, chip([icon("chevronLeft", { size: 14 }), " prev"], false, () => stepFrame(-1), "PgUp", true), chip(["next ", icon("chevronRight", { size: 14 })], false, () => stepFrame(1), "PgDn", true), chip("all", false, () => S.fit(), "Fit everything (⇧1)", true))),
       ];
     },
     animate: () => {
@@ -227,17 +230,41 @@ export function renderPanel(root, ctx) {
     layers: () => {
       const ls = [...B.doc.layers].reverse(), count = id => B.doc.live().filter(e => layerOf(e) === id && !isLabel(e)).length;
       const lact = fn => S.act("board", fn, { settings: true });
+      const localView = ctx.localView ?? null;
+      const localById = localView?.layers ? new Map(localView.layers.map(l => [l.id, l])) : null;
+      const soloLayer = localView?.soloLayerId ? B.doc.layers.find(l => l.id === localView.soloLayerId) : null;
+      const resetBanner = localView?.active
+        ? h("div.local-layer-banner", { role: "status" },
+          h("span.local-layer-label", {},
+            localView.mode === "solo"
+              ? `Solo: ${soloLayer?.name || "Layer"}`
+              : `View: ${localView.activeViewName || "Filtered"}`),
+          h("button.c.on", {
+            type: "button",
+            title: "Clear local layer filter and show board layers",
+            "data-action": "reset-local-layers",
+            "data-fk": "layers:reset-local",
+            onclick: () => ctx.onResetLocalView?.(),
+          }, "Show all layers"))
+        : null;
       return [
-        h("div", { role: "list", "aria-label": "Layers" }, ls.map(l => h("div.list-row" + (B.activeLayer === l.id ? ".on" : ""), { role: "listitem", "aria-label": `Layer: ${l.name || "Layer"}`, "data-fk": `layer:${l.id}:row`, tabindex: "-1", onclick: () => { B.activeLayer = l.id; B.changed(); ctx.onChange(); } },
-          h("button.tb", { title: l.visible ? "Hide" : "Show", "aria-label": l.visible ? "Hide layer" : "Show layer", disabled: dis, "data-fk": `layer:${l.id}:visible`, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { visible: !l.visible })); } }, icon(l.visible ? "eye" : "eyeOff", { size: 14 })),
-          h("button.tb", { title: l.locked ? "Unlock" : "Lock", "aria-label": l.locked ? "Unlock layer" : "Lock layer", disabled: dis, "data-fk": `layer:${l.id}:lock`, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { locked: !l.locked })); } }, icon(l.locked ? "lock" : "unlock", { size: 14 })),
-          h("span", { title: "Double-click to rename", ondblclick: ev => {
-            ev.stopPropagation(); if (dis) return;
-            const input = h("input.rename", { value: l.name ?? "", maxLength: 80, onkeydown: k => { k.stopPropagation(); if (k.key === "Enter") input.blur(); if (k.key === "Escape") { input.value = l.name ?? ""; input.blur(); } },
-              onblur: () => { const n = input.value.trim(); if (n && n !== l.name) lact(e => e.updateLayer(l.id, { name: n })); ctx.onChange(); } });
-            ev.currentTarget.replaceWith(input); input.focus(); input.select();
-          } }, l.name || "Layer"),
-          h("span.n", {}, String(count(l.id)))))),
+        resetBanner,
+        h("div", { role: "list", "aria-label": "Layers" }, ls.map(l => {
+          const eff = localById?.get(l.id);
+          const isSolo = Boolean(eff?.solo);
+          const locallyHidden = Boolean(localView?.active && eff && !eff.effectiveVisible);
+          return h("div.list-row" + (B.activeLayer === l.id ? ".on" : "") + (locallyHidden ? ".local-hidden" : ""), { role: "listitem", "aria-label": `Layer: ${l.name || "Layer"}`, "data-fk": `layer:${l.id}:row`, tabindex: "-1", onclick: () => { B.activeLayer = l.id; B.changed(); ctx.onChange(); } },
+            h("button.tb", { title: l.visible ? "Hide" : "Show", "aria-label": l.visible ? "Hide layer" : "Show layer", disabled: dis, "data-fk": `layer:${l.id}:visible`, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { visible: !l.visible })); } }, icon(l.visible ? "eye" : "eyeOff", { size: 14 })),
+            h("button.tb", { title: l.locked ? "Unlock" : "Lock", "aria-label": l.locked ? "Unlock layer" : "Lock layer", disabled: dis, "data-fk": `layer:${l.id}:lock`, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { locked: !l.locked })); } }, icon(l.locked ? "lock" : "unlock", { size: 14 })),
+            h("button.tb.solo-btn" + (isSolo ? ".on" : ""), { type: "button", title: isSolo ? "Exit solo layer (local)" : "Solo layer (local only)", "aria-label": isSolo ? `Exit solo for ${l.name || "Layer"}` : `Solo ${l.name || "Layer"}`, "aria-pressed": String(isSolo), "data-fk": `layer:${l.id}:solo`, "data-solo-layer": l.id, onclick: ev => { ev.stopPropagation(); ctx.onSoloLayer?.(l.id); } }, "S"),
+            h("span", { title: "Double-click to rename", ondblclick: ev => {
+              ev.stopPropagation(); if (dis) return;
+              const input = h("input.rename", { value: l.name ?? "", maxLength: 80, onkeydown: k => { k.stopPropagation(); if (k.key === "Enter") input.blur(); if (k.key === "Escape") { input.value = l.name ?? ""; input.blur(); } },
+                onblur: () => { const n = input.value.trim(); if (n && n !== l.name) lact(e => e.updateLayer(l.id, { name: n })); ctx.onChange(); } });
+              ev.currentTarget.replaceWith(input); input.focus(); input.select();
+            } }, l.name || "Layer"),
+            h("span.n", {}, String(count(l.id))));
+        })),
         h("div.row", { style: { marginTop: "6px" } }, h("span.opts", {},
           chip(icon("plus", { size: 14 }), false, () => lact(e => e.addLayer()), "New layer"),
           chip(icon("arrowUp", { size: 14 }), false, () => lact(e => e.moveLayer(B.activeLayer, 1)), "Move up"),
@@ -263,7 +290,7 @@ export function renderPanel(root, ctx) {
   const tabs = state.mode === "tabs" || ctx.inSheet;
   const st = tabs ? { ...state, mode: "tabs" } : state;
   const secs = panelSections(st, availableFor(S));
-  const sub = { properties: m.count ? `· ${m.count} selected` : "· next shape", frames: `· ${B.frames().length}`, library: `· ${(ctx.library ?? []).length}` };
+  const sub = { properties: m.count ? `· ${m.count} selected` : "· next shape", frames: `· ${listNamedFrames(B.doc).length}`, library: `· ${(ctx.library ?? []).length}` };
   const out = [];
   if (!ctx.inSheet) out.push(h("div.panel-head", {},
     h("button.tb" + (state.mode === "stack" ? ".on" : ""), { title: "Stack", "aria-label": "Stack layout", "aria-pressed": String(state.mode === "stack"), onclick: () => ctx.setState({ type: "mode", mode: "stack" }) }, icon("stack", { size: 15 })),

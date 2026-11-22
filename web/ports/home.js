@@ -24,7 +24,7 @@ export const HOME_ERRORS = Object.freeze(["auth", "forbidden", "unavailable", "n
  * @typedef {{ id: string, title: string, role: string, path: PathPart[], starred: boolean, at?: number }} Card
  * @typedef {{ id: string, name: string, personal: boolean }} SpaceNode
  * @typedef {{ groups: { id: string, name: string, spaces: SpaceNode[] }[], spaces: SpaceNode[], more: boolean }} Tree
- * @typedef {{ guest: boolean, user: { user: string, name: string }, unit: { id: string, kind: string } | null,
+ * @typedef {{ guest: boolean, user: { user: string, name: string }, unit: { id: string, kind: string, name?: string, personal?: boolean, isAdmin?: boolean } | null,
  *   recent: Card[], starred: Card[], owned: Card[], shared: Card[], tree: Tree | null, limits: Record<string, number>, can: { createGroup: boolean, manageAccess: boolean, manageRoles: boolean } }} HomeData
  * @typedef {object} HomePort
  * @property {() => Promise<{ home: HomeData } | { error: string }>} load

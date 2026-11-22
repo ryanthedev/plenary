@@ -46,25 +46,34 @@ const NO_TEAMS = new Set();
 const okIdentity = id => !!id && typeof id.user === "string";
 
 /**
- * Applies personal-org email membership (`reg_tenant_members`) and personal-org admin `memberRole` on top of
- * `resolveAccess` without touching Workspace domain membership, RBAC, or personal-space privacy rules.
+ * Applies personal-org email membership (`reg_tenant_members`) and personal-org admin general access (`board.memberRole`
+ * and shared-Space `space.generalRole`) on top of `resolveAccess` without touching Workspace domain membership, RBAC,
+ * or personal-space privacy rules.
  */
 function applyPersonalOrgMember(a, ctx, members, identity) {
-  const board = ctx?.board, tenant = ctx?.tenant;
-  if (!board || board.trashedAt != null || ctx.space?.trashedAt != null || !board.memberRole || !tenant) return a;
-  if (ctx.space?.kind === "personal" && ctx.space.owner !== identity.user) return a;
+  const board = ctx?.board, space = ctx?.space, tenant = ctx?.tenant;
+  if (!tenant || tenant.domain !== null) return a;
+  if (board?.trashedAt != null || space?.trashedAt != null) return a;
+  if (space?.kind === "personal" && space.owner !== identity.user) return a;
   if (ctx.removed?.includes(identity.user)) return a;
-  if (tenant.domain !== null && (!members || (members instanceof Set ? !members.size : !members.length))) return a;
   const vEmail = verifiedEmail(identity);
   const isEmailMember = Boolean(vEmail && members && (members instanceof Set ? members.has(vEmail) : members.includes(vEmail)));
-  const isPersonalAdmin = tenant.domain === null && isTenantAdminRecord(tenant, identity);
+  const isPersonalAdmin = isTenantAdminRecord(tenant, identity);
   if (!isEmailMember && !isPersonalAdmin) return a;
-  const granted = capTo(board.memberRole, INVITE_ROLES);
+  const fromBoard = board?.memberRole ? capTo(board.memberRole, INVITE_ROLES) : null;
+  const fromSpace = space && space.kind !== "personal" && space.generalRole ? capTo(space.generalRole, INVITE_ROLES) : null;
+  const granted = higher(fromBoard, fromSpace);
+  if (!granted) return a;
   const bumped = higher(a.ladder, granted);
-  if (bumped === a.ladder && a.permissions.has("board.view") && (bumped !== "editor" || a.permissions.has("board.edit"))) return a;
   const permissions = new Set(a.permissions);
   permissions.add("board.view");
-  if (bumped === "editor") permissions.add("board.edit");
+  if (bumped === "commenter" || bumped === "annotator" || bumped === "editor" || bumped === "owner") permissions.add("board.comment");
+  if (bumped === "annotator" || bumped === "editor" || bumped === "owner") permissions.add("board.annotate");
+  if (bumped === "editor" || bumped === "owner") {
+    permissions.add("board.edit");
+    if (!board && space) permissions.add("board.create");
+  }
+  if (bumped === a.ladder && permissions.size === a.permissions.size) return a;
   return { ...a, ladder: bumped, permissions };
 }
 
@@ -89,6 +98,25 @@ export function combine(rows, identity, t) {
  *   (its memo's end). `resolve`'s `until` is capped by it, so an answer never outlives the records it was built from.
  */
 export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity }) {
+  const needsPersonalMembers = ctx => Boolean(
+    ctx?.tenant?.domain === null
+    && (ctx.board?.memberRole || (ctx.space && ctx.space.kind !== "personal" && ctx.space.generalRole))
+  );
+  async function personalMembersFor(ctx, identity, cache = null) {
+    if (!needsPersonalMembers(ctx) || ctx.removed?.includes(identity.user)) return null;
+    const vEmail = verifiedEmail(identity);
+    if (!vEmail || isTenantAdminRecord(ctx.tenant, identity)) return null;
+    if (cache && cache.has(ctx.tenant.id)) return cache.get(ctx.tenant.id);
+    let m = null;
+    if (typeof registry.isTenantMember === "function") {
+      if (await registry.isTenantMember(ctx.tenant.id, vEmail)) m = [vEmail];
+    } else if (typeof registry.tenantMembers === "function") {
+      m = await registry.tenantMembers(ctx.tenant.id);
+    }
+    if (cache) cache.set(ctx.tenant.id, m);
+    return m;
+  }
+
   /** One user's access to a board: ladder role, permissions, sources. @returns {Promise<import("./resolver.js").Access>} */
   async function accessOn(identity, boardId, { uniform = false } = {}) {
     if (!okIdentity(identity) || typeof boardId !== "string") return nothing();
@@ -103,17 +131,7 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
     const invites = identity.email && identity.emailVerified !== false ? await registry.invitesFor(ctx.board.id, identity.email) : [];
     const links = [];
     for (const id of await registry.linkUses(ctx.board.id, identity.user)) links.push(await registry.link(id));
-    let members = null;
-    if (ctx.board.memberRole && ctx.tenant?.domain === null && !ctx.removed?.includes(identity.user)) {
-      const vEmail = verifiedEmail(identity);
-      if (vEmail && !isTenantAdminRecord(ctx.tenant, identity)) {
-        if (typeof registry.isTenantMember === "function") {
-          if (await registry.isTenantMember(ctx.board.tenant, vEmail)) members = [vEmail];
-        } else if (typeof registry.tenantMembers === "function") {
-          members = await registry.tenantMembers(ctx.board.tenant);
-        }
-      }
-    }
+    const members = await personalMembersFor(ctx, identity);
     const a = applyPersonalOrgMember(resolveAccess({ ctx, grant, invites, links }, identity, t), ctx, members, identity);
     // Links can change (revokeLink): cap by every link record read.
     for (const l of links) if (l) a.until = Math.min(a.until, recordUntil(l));
@@ -166,7 +184,7 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
     let linkById = new Map();
     for (const ls of uses.values()) if (ls.length) { linkById = new Map((await registry.links(board.id)).map(l => [l.id, l])); break; }
     let members = null;
-    if (board.memberRole && ctx.tenant?.domain === null && typeof registry.tenantMembers === "function") {
+    if (needsPersonalMembers(ctx) && typeof registry.tenantMembers === "function") {
       const needsMembers = all.some(id => {
         const vEmail = verifiedEmail(id);
         if (!vEmail) return false;
@@ -236,7 +254,9 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
       if (!okIdentity(identity) || !scope || typeof scope.id !== "string") return nothing();
       if (scope.type === "board") return accessOn(identity, scope.id, o);
       const ctx = await registry.accessContext(scope, { users: [identity.user] });
-      return ctx ? resolveAccess({ ctx }, identity, now()) : nothing();
+      if (!ctx) return nothing();
+      const members = await personalMembersFor(ctx, identity);
+      return applyPersonalOrgMember(resolveAccess({ ctx }, identity, now()), ctx, members, identity);
     },
     /**
      * The effective access of MANY identities at one scope: one `accessContext` for a Unit, Group or Space (at most 50 identities), one `accessOn` each for a board. A Map user → Access.
@@ -261,7 +281,12 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
       if (!okIdentity(identity) || !Array.isArray(scopes) || !scopes.length) return out;
       const got = await registry.accessContexts(scopes, { users: [identity.user] });
       const t = now();
-      for (const [k, ctx] of got) out.set(k, ctx ? resolveAccess({ ctx }, identity, t) : nothing());
+      const pmCache = new Map();
+      for (const [k, ctx] of got) {
+        if (!ctx) { out.set(k, nothing()); continue; }
+        const members = await personalMembersFor(ctx, identity, pmCache);
+        out.set(k, applyPersonalOrgMember(resolveAccess({ ctx }, identity, t), ctx, members, identity));
+      }
       return out;
     },
     /**
@@ -285,31 +310,25 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
       const ctxs = got;
       const t = now();
       const own = new Map();   // "space:<id>" / "group:<id>" → may the identity open boards there (from the context already read)
-      const opens = (k, ctx) => { if (!own.has(k)) { const a = resolveAccess({ ctx }, identity, t); own.set(k, (a.ladder ?? a.trashed?.ladder ?? null) != null); } return own.get(k); };   // a Space or Group in Trash: could they open it before (the Trash list names where a board was)
-      const personalMembers = new Map();
-      const vEmail = verifiedEmail(identity);
+      const pmCache = new Map();
+      const opens = async (k, ctx) => {
+        if (!own.has(k)) {
+          const members = await personalMembersFor(ctx, identity, pmCache);
+          const a = applyPersonalOrgMember(resolveAccess({ ctx }, identity, t), ctx, members, identity);
+          own.set(k, (a.ladder ?? a.trashed?.ladder ?? null) != null);
+        }
+        return own.get(k);
+      };   // a Space or Group in Trash: could they open it before (the Trash list names where a board was)
       for (const [id, r] of rows) {
         const base = ctxs.get(keyOf(scopeOf(r.board)));
         if (!base) continue;
         const teams = { ...base.teams };
         for (const g of r.teamGrants) if (g.subject.type === "team" && !(g.subject.id in teams)) teams[g.subject.id] = r.myTeams.includes(g.subject.id) ? [identity.user] : [];
         const ctx = { ...base, board: r.board, scoped: { ...base.scoped, board: r.teamGrants }, teams };
-        let members = null;
-        if (r.board.memberRole && base.tenant?.domain === null && !base.removed?.includes(identity.user) && vEmail && !isTenantAdminRecord(base.tenant, identity)) {
-          if (!personalMembers.has(r.board.tenant)) {
-            let m = null;
-            if (typeof registry.isTenantMember === "function") {
-              if (await registry.isTenantMember(r.board.tenant, vEmail)) m = [vEmail];
-            } else if (typeof registry.tenantMembers === "function") {
-              m = await registry.tenantMembers(r.board.tenant);
-            }
-            personalMembers.set(r.board.tenant, m);
-          }
-          members = personalMembers.get(r.board.tenant);
-        }
+        const members = await personalMembersFor(ctx, identity, pmCache);
         const access = applyPersonalOrgMember(resolveAccess({ ctx, grant: r.grant, invites: r.invites, links: r.links }, identity, t), ctx, members, identity);
-        const spaceOpen = !!base.space && opens("space\n" + base.space.id, { ...base, board: null });
-        const groupOpen = !!base.group && opens("group\n" + base.group.id, { ...base, board: null, space: null });
+        const spaceOpen = !!base.space && await opens("space\n" + base.space.id, { ...base, board: null });
+        const groupOpen = !!base.group && await opens("group\n" + base.group.id, { ...base, board: null, space: null });
         out.set(id, { access, grant: r.grant, board: r.board, space: base.space, group: base.group, spaceOpen, groupOpen });
       }
       return out;

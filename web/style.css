@@ -542,6 +542,15 @@ body.stale .watching { opacity: .45; }
 .card .star[aria-pressed="true"] { color: var(--warn); }
 .home-empty { padding: 24px 0; }
 .home-empty h2 { margin: 0 0 4px; font-size: 16px; }
+.home-org-card { margin-top: 16px; padding: 16px; max-width: 520px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); display: grid; gap: 8px; }
+.home-org-card h2 { margin: 0; font-size: 16px; }
+.home-org-card p { margin: 0; }
+.home-org-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0 4px; }
+.home-org-input { flex: 1 1 220px; min-height: 44px; font-size: 16px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--chrome); color: var(--fg); }
+.home-org-btn { min-height: 44px; min-width: 44px; padding: 0 14px; }
+.home-panel-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 6px; }
+.home-panel-head h1 { margin: 0; }
+.home-panel-sub { margin: 0 0 12px; color: var(--muted); }
 .muted { color: var(--muted); }
 @media (max-width: 720px) {
   .home-body { flex-direction: column; }

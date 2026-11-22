@@ -29,6 +29,7 @@ import { mountSpacePage, mountGroupPage } from "./adapters/dom/spaces.js";
 import { createDialogs, randomKey } from "./adapters/dom/dialogs.js";
 import { httpAccess } from "./adapters/access/http.js";
 import { httpShare } from "./adapters/share/http.js";
+import { httpAdmin } from "./adapters/admin/http.js";
 import { httpMove } from "./adapters/move/http.js";
 import { httpTrash } from "./adapters/trash/http.js";
 import { mountTrashPage, mountTrashNotice } from "./adapters/dom/trash.js";
@@ -136,6 +137,7 @@ if (!signIn.token) {
   } else {
     const model = createHomeModel({ api: httpHome({ fetch: fetchNow, token: signIn.token, timers: clock }), clock });
     mountHome({ root, model, clock, signIn: signInLink, homeHref: location.pathname, dialogs,
+      org: httpAdmin({ fetch: fetchNow, token: signIn.token }),
       boardHref: hrefs.board, spaceHref: hrefs.space, groupHref: hrefs.group, teamsHref: hrefs.teams, trashHref: hrefs.trash, rolesHref: hrefs.roles, offboardHref: hrefs.offboard, unitAccessHref: id => hrefs.access("unit", id),
       move: { port: httpMove({ fetch: fetchNow, token: signIn.token, timers: clock }), clock, newKey: () => randomKey() } });
     hideGate();

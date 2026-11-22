@@ -753,7 +753,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
           }
         } else {
           const unit = await tenancy.tenantOf(who);
-          if (unit && unit.domain === null) {
+          if (unit && unit.domain === null && isTenantAdminRecord(unit, who)) {
             const board = await createBoard(defined({ caller: who, tenant: unit.id, title: b.title, memberRole: b.memberRole, space: b.space }), admin);
             return json(201, { board });
           }

@@ -11,6 +11,7 @@
 
 import { asciiFold, HOME } from "./registry-port.js";
 import { resolveAccess, mayMove } from "./resolver.js";
+import { isTenantAdminRecord } from "./util.js";
 
 /** @typedef {import("./idp-port.js").Identity} Identity */
 /** @typedef {{ type: "group"|"space"|"other"|"shared", id?: string, name: string }} PathPart */
@@ -61,14 +62,20 @@ export function homeService({ registry, tenancy, now = Date.now }) {
    * Space they can open.
    */
   async function reached(identity, unit) {
-    const ids = await registry.sharedBoards(identity.user, identity.email ?? null, { limit: SCAN.shared });
+    const directIds = await registry.sharedBoards(identity.user, identity.email ?? null, { limit: SCAN.shared });
+    let ids = directIds;
+    const isPersonalUnit = Boolean(unit && unit.domain === null);
+    if (isPersonalUnit && typeof registry.boardsIn === "function") {
+      const unitPage = await registry.boardsIn({ type: "unit", id: unit.id }, { limit: SCAN.shared });
+      ids = [...new Set([...directIds, ...unitPage.ids])].slice(0, SCAN.shared);
+    }
     const found = await accessAll(identity, ids);
-    const inTree = f => !!unit && f.spaceOpen;
+    const inTree = f => !!unit && !isPersonalUnit && f.spaceOpen;
     const mine = f => f.grant === "owner";
     const list = (keep) => cards(identity, unit, ids.map(id => ({ id })), { found, keep });
     // "Your boards" cards carry no path: a guest's own board is not "shared with" them, and what is above it is not theirs to name.
     const owned = unit ? [] : (await list(mine)).map(c => ({ ...c, path: [] })).sort(byTitle);
-    const shared = (await list(f => !inTree(f) && (!!unit || !mine(f)))).sort(byTitle);
+    const shared = (await list(f => !inTree(f) && (isPersonalUnit ? !mine(f) : (!!unit || !mine(f))))).sort(byTitle);
     return { owned, shared };
   }
 
@@ -130,7 +137,19 @@ export function homeService({ registry, tenancy, now = Date.now }) {
     /** GET /home. @param {Identity} identity */
     async home(identity) {
       const unit = await tenancy.tenantOf(identity);
-      const base = { guest: !unit, user: { user: identity.user, name: identity.name ?? identity.email ?? identity.user }, unit: unit ? { id: unit.id, kind: unit.kind } : null, limits: LIMITS };
+      const isPersonalUnit = Boolean(unit && unit.domain === null);
+      const base = {
+        guest: !unit,
+        user: { user: identity.user, name: identity.name ?? identity.email ?? identity.user },
+        unit: unit ? {
+          id: unit.id,
+          kind: unit.kind,
+          ...(unit.name ? { name: unit.name } : {}),
+          ...(isPersonalUnit ? { personal: true } : {}),
+          ...(isTenantAdminRecord(unit, identity) ? { isAdmin: true } : {}),
+        } : null,
+        limits: LIMITS,
+      };
       if (unit) { await registry.ensurePersonalSpace(unit.id, identity.user); await touch(unit, identity); }        // a member always has a place to put a board (JOURNEY J1)
       const [rec, star, { owned, shared }, theTree, unitAccess] = await Promise.all([
         registry.recents(identity.user, { limit: SCAN.recent }),

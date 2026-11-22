@@ -214,6 +214,9 @@ export async function createPersonalTenant({ caller, name }, { registry, now = D
   const admins = [caller.user];
   if (vEmail) admins.push("email:" + vEmail);
   const t = await registry.createTenant({ name: trimmed, domain: null, admins });
+  if (typeof registry.createSpace === "function") {
+    await registry.createSpace({ tenant: t.id, name: "General", generalRole: "editor", owner: caller.user });
+  }
   await recordAudit(registry, {
     tenant: t.id,
     board: null,

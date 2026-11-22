@@ -126,7 +126,7 @@ export function createHomeModel({ api, clock, debounceMs = SEARCH_DEBOUNCE_MS })
       if (state.view === "starred") return { kind: "view", title: "Starred", cards: d.starred, more: false, empty: emptyText(d, "starred") };
       if (state.view === "shared") return { kind: "view", title: "Shared with me", cards: d.shared, more: false, empty: emptyText(d, "shared") };
       return { kind: "view", title: "Home", sections: d.guest ? [{ title: "Recent", cards: d.recent }, { title: "Your boards", cards: d.owned }, { title: "Shared with me", cards: d.shared }]
-          : [{ title: "Recent", cards: d.recent }, { title: "Starred", cards: d.starred }],
+          : [{ title: "Recent", cards: d.recent }, { title: "Starred", cards: d.starred }, ...(d.unit?.personal ? [{ title: "Shared with me", cards: d.shared }] : [])],
         cards: [], more: false, empty: emptyText(d, "home") };
     },
   };

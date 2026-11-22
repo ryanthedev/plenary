@@ -619,9 +619,10 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // The chrome is rebuilt while the dialog is open, so focus goes back to whichever of the Share button and the More button is shown now, not to the element that opened it.
   const shareOpener = { focus() { const c = [document.querySelector("[data-share-open]"), document.querySelector(".header-more"), document.querySelector("[data-dock-more]")]; (c.find(e => e && e.offsetParent !== null) ?? c.find(Boolean))?.focus?.(); } };
   function openShareDialog() {
+    if (!share) return openAdminShare();
     const loc = globalThis.location, origin = loc?.origin ?? "", boardUrl = `${origin}${loc?.pathname ?? "/"}?board=${encodeURIComponent(board)}`;
     const model = createShareModel({ share, access, board, newKey, now: () => clock.now(), urls: { board: boardUrl, link: id => `${origin}/links/${encodeURIComponent(id)}` } });
-    openShare({ host: document.body, model, opener: shareOpener, accessHref: `${loc?.pathname ?? "/"}?access=board:${encodeURIComponent(board)}`, now: () => clock.now() });
+    return openShare({ host: document.body, model, opener: shareOpener, accessHref: `${loc?.pathname ?? "/"}?access=board:${encodeURIComponent(board)}`, now: () => clock.now() });
   }
 
   // Move to… (PROTOCOL.md § Move board, "Where it appears"): offered only when the welcome said `can.move` (no request to find out), unless the move route has since refused this person
@@ -698,7 +699,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       extraAction("note", "Notes", toggleNotes),
       role === "presenter" ? extraAction("mermaid", "Mermaid", () => openDialog("mermaid"), !may) : null,
       role === "presenter" ? extraAction("export", "Export", toggleExport) : null,
-      share && S.canShare ? extraAction("share", "Share", () => openShareDialog()) : (admin ? extraAction("share", "Share", () => openShare()) : null),
+      share && S.canShare ? extraAction("share", "Share", () => openShareDialog()) : (admin ? extraAction("share", "Share", () => openAdminShare()) : null),
       canMove() ? extraAction("moveToLayer", "Move to…", openMoveDialog) : null,
       role !== "viewer" ? extraAction("panel", "Side panel", togglePanel) : null,
       extraAction(ui.theme === "dark" ? "sun" : "moon", "Light / dark", toggleTheme),
@@ -714,7 +715,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         h("span.stack", {}, h("span.av.live", { style: { background: "var(--u-me)" }, title: `${me.name} (you)` }, me.name.slice(0, 2).toUpperCase()))),
       share && S.canShare
         ? h("button.btn.primary.desk-only.header-extra", { "aria-haspopup": "dialog", "data-share-open": "1", title: "Share this board", "aria-label": "Share board", onclick: () => openShareDialog() }, icon("share", { size: 15 }), "Share")
-        : (admin ? h("button.btn.primary.desk-only.header-extra", { title: "Share board", "aria-label": "Share board", onclick: () => openShare() }, icon("share", { size: 15 }), "Share") : null),
+        : (admin ? h("button.btn.primary.desk-only.header-extra", { title: "Share board", "aria-label": "Share board", onclick: () => openAdminShare() }, icon("share", { size: 15 }), "Share") : null),
       canMove() ? h("button.btn.desk-only.header-extra", { "aria-haspopup": "dialog", "data-move-open": "1", title: "Move this board to another Space", onclick: () => openMoveDialog() }, icon("moveToLayer", { size: 15 }), "Move to…") : null,
       pillEl,                                                   // the pill: one node, updated in place (inPlace)
       role !== "viewer" ? h("button.tb.desk-only.header-extra" + (ui.panel.open ? ".on" : ""), { title: "Side panel (I)", "aria-label": "Inspector panel", onclick: togglePanel }, h("span.ic", {}, icon("panel", { size: 17 })), h("span.k", {}, "I")) : null,
@@ -908,7 +909,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         S.role === "presenter" ? [h("button.tb", { disabled: !may, onclick: () => openDialog("mermaid") }, h("span.ic", {}, icon("mermaid", { size: 20 })), "Mermaid"), h("button.tb", { onclick: () => openDialog("export") }, h("span.ic", {}, icon("export", { size: 20 })), "Export")] : null,
         share && S.canShare
           ? h("button.tb", { onclick: () => { ui.sheet = null; chromeDirty = true; openShareDialog(); } }, h("span.ic", {}, icon("share", { size: 20 })), "Share")
-          : (admin ? h("button.tb", { onclick: () => { ui.sheet = null; chromeDirty = true; openShare(); } }, h("span.ic", {}, icon("share", { size: 20 })), "Share") : null),
+          : (admin ? h("button.tb", { onclick: () => { ui.sheet = null; chromeDirty = true; openAdminShare(); } }, h("span.ic", {}, icon("share", { size: 20 })), "Share") : null),
         canMove() ? h("button.tb", { onclick: () => openMoveDialog() }, h("span.ic", {}, icon("moveToLayer", { size: 20 })), "Move to…") : null,
         S.role !== "viewer" ? h("button.tb" + (S.toolLock() ? ".on" : ""), { disabled: !may, onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 20 })), "Lock tool") : null,
         h("button.tb", { onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 20 })), ui.theme === "dark" ? "Light" : "Dark")));
@@ -1249,7 +1250,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     requestAnimationFrame(frame);
   })();
 
-  function openShare() {
+  function openAdminShare() {
     if (!admin) return null;
     cancelActiveSampler();
     ui.dialog = null;
@@ -1269,5 +1270,5 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     return activeShare;
   }
   if (notice) toast(notice, 6000);
-  return { S, ui, net, collab, port, setTheme, openDialog, openShare, setPanel, startComment };
+  return { S, ui, net, collab, port, setTheme, openDialog, openShare: openShareDialog, setPanel, startComment };
 }

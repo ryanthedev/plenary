@@ -14,7 +14,7 @@ import {
   bbox, unionBox, inBox, boxInBox, center, normalize, hits, hitTest, shapeAt, bindTargetAt, bindingAt as resolveBindingAt, resolvedPoints, drawnPoints, curveThrough, settle, fileScene, portAt, mapIntoBox, segmentsIntersect,
   bounds, corners, rotate, rotateAbout, angleOf, centerOf, toLocal, toWorld as elToWorld, normAngle,
 } from "./geometry.js";
-import { paintScene, project, rectCmds, withAlpha, paintSnapIndicator } from "./render.js";
+import { paintScene, project, rectCmds, withAlpha, paintSnapIndicator, paintHoverHighlight, outlineBoxCmds } from "./render.js";
 import { getPreset, getEasing, timelineEnd, stepTimeline, effectiveAnimTime } from "./anim.js";
 import { labelHostHeight, labelHostWidth } from "./text.js";
 import { isMermaid, mermaidToElements } from "./mermaid.js";
@@ -92,7 +92,8 @@ export class Editor {
     this.scrub = null;           // a paused timeline time, or null for the editing view
     this.playLoop = false;       // repeat timeline playback on end
     this.playSpeed = 1;          // playback speed multiplier (0.5, 1, 1.5, 2)
-    this.reducedMotion = false;  // prefers-reduced-motion: settle animations to timeline end
+    this.reducedMotion = false;  // prefers-reduced-motion: settle passive animations to timeline end
+    this.userTimeline = false;   // true while user explicitly plays, pauses, or scrubs the timeline
     this.flash = null;
     this.camAnim = null;         // M3: smooth camera animation { from, to, elapsed, duration }
     this.camVel = null;          // M3: pan inertia velocity { vx, vy } in screen px/s
@@ -1670,33 +1671,58 @@ export class Editor {
     }));
   }
   duration() { return Math.max(timelineEnd(this.doc.live()), 1); }
-  playToggle() {
-    if (this.play) { this.scrub = this.time(); this.play = null; }
-    else { const from = this.scrub != null && this.scrub < this.duration() ? this.scrub : 0; this.play = { t0: this.clock(), from }; }
+  /** @param {{ explicit?: boolean }} [opts] */
+  playToggle(opts = {}) {
+    if (this.play) {
+      const wasExplicit = !!this.play.explicit;
+      this.scrub = this.time();
+      this.play = null;
+      this.userTimeline = wasExplicit && this.scrub != null;
+    } else {
+      const from = this.scrub != null && this.scrub < this.duration() ? this.scrub : 0;
+      const explicit = opts.explicit !== false;
+      this.play = { t0: this.clock(), from, explicit };
+      this.userTimeline = explicit;
+    }
     this.changed();
   }
-  stopPlay() { this.play = null; this.scrub = null; this.changed(); }
-  seekTo(ms) {
+  stopPlay() { this.play = null; this.scrub = null; this.userTimeline = false; this.changed(); }
+  /**
+   * @param {number} ms
+   * @param {{ explicit?: boolean }} [opts]
+   */
+  seekTo(ms, opts = {}) {
     const t = Math.max(0, Math.min(this.duration(), Number.isFinite(ms) ? ms : 0));
-    this.play = null; this.scrub = t; this.changed();
+    this.play = null; this.scrub = t;
+    if (typeof opts.explicit === "boolean") this.userTimeline = opts.explicit;
+    this.changed();
   }
-  stepToStart() { this.seekTo(0); }
-  stepToEnd() { this.seekTo(this.duration()); }
-  restartPlay() { this.scrub = 0; this.play = { t0: this.clock(), from: 0 }; this.changed(); }
+  stepToStart(opts) { this.seekTo(0, opts); }
+  stepToEnd(opts) { this.seekTo(this.duration(), opts); }
+  /** @param {{ explicit?: boolean }} [opts] */
+  restartPlay(opts = {}) {
+    const explicit = opts.explicit !== false;
+    this.scrub = 0;
+    this.play = { t0: this.clock(), from: 0, explicit };
+    this.userTimeline = explicit;
+    this.changed();
+  }
   setPlayLoop(on) { this.playLoop = !!on; this.changed(); }
   setReducedMotion(on) { const v = !!on; if (this.reducedMotion !== v) { this.reducedMotion = v; this.changed(); } }
   setPlaySpeed(speed) {
     const s = Number(speed);
     if (!Number.isFinite(s) || s <= 0) return;
+    const wasExplicit = this.play?.explicit !== false;
     const t = this.play ? this.time() : null;
-    if (this.play && t != null) this.play = { t0: this.clock(), from: t };
+    if (this.play && t != null) this.play = { t0: this.clock(), from: t, explicit: wasExplicit };
     this.playSpeed = s;
     this.changed();
   }
   time() {
     if (this.play) {
       const res = stepTimeline({ from: this.play.from, elapsedMs: this.clock() - this.play.t0, duration: this.duration(), speed: this.playSpeed, loop: this.playLoop });
-      if (res.ended) { this.play = null; this.scrub = null; return null; }
+      // Transitioning out of playback bumps version once so adapters repaint the resting canvas even if time() was polled outside tick().
+      if (res.ended) { this.play = null; this.scrub = null; this.userTimeline = false; this.changed(); return null; }
       return res.time;
     }
     return this.scrub;
@@ -1822,21 +1848,13 @@ export class Editor {
 
   // An element's drawn outline (rotation included), padded, in screen px.
   outlineCmds(el, padPx) {
-    const pad = padPx / this.view.scale;
-    let pts;
-    if (angleOf(el)) {
-      const b = bbox(el);
-      pts = [[b.x - pad, b.y - pad], [b.x + b.w + pad, b.y - pad], [b.x + b.w + pad, b.y + b.h + pad], [b.x - pad, b.y + b.h + pad]].map(([x, y]) => this.toScreen(elToWorld(el, { x, y })));
-    } else {
-      const b = bounds(el, this.doc);
-      pts = [[b.x - pad, b.y - pad], [b.x + b.w + pad, b.y - pad], [b.x + b.w + pad, b.y + b.h + pad], [b.x - pad, b.y + b.h + pad]].map(([x, y]) => this.toScreen({ x, y }));
-    }
-    return [...pts.map((p, i) => [i ? "L" : "M", p.x, p.y]), ["L", pts[0].x, pts[0].y]];
+    return outlineBoxCmds(this.doc, el, this.view, padPx / this.view.scale);
   }
 
   displayList(theme) {
+    const explicitPlay = !!this.play?.explicit || this.userTimeline;
     const rawTime = this.time();
-    const time = effectiveAnimTime(rawTime, this.duration(), this.reducedMotion);
+    const time = effectiveAnimTime(rawTime, this.duration(), this.reducedMotion, explicitPlay);
     const items = paintScene(this.doc, this.view, theme, { time: time ?? undefined, clip: this.size ? { w: this.size.w, h: this.size.h } : null });
     if (this.text) { const hide = this.text.id; for (let i = items.length - 1; i >= 0; i--) if (items[i].id === hide && items[i].t === "text") items.splice(i, 1); }
     if (this.erasing.size) for (const it of items) if (this.erasing.has(it.id)) it.opacity = (it.opacity ?? 1) * 0.25;
@@ -1844,7 +1862,7 @@ export class Editor {
     const P = project(this.view), acc = theme.accent;
     if (this.hover && !this.sel.has(this.hover)) {
       const el = this.doc.get(this.hover);
-      if (el) items.push({ t: "path", cmds: this.outlineCmds(el, 4), stroke: withAlpha(acc, 0.45), width: 1, dash: null });
+      if (el) paintHoverHighlight(this.doc, el, this.view, theme, items);
     }
     if (this.snapPreview) paintSnapIndicator(this.doc, this.snapPreview, this.view, theme, items);
     const els = this.selected();

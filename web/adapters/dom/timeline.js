@@ -59,7 +59,7 @@ export function buildTimeline(el, ctx) {
   const scrubAtClientX = (trackEl, clientX) => {
     const r = trackEl.getBoundingClientRect();
     const ratio = r.width > 0 ? (clientX - r.left) / r.width : 0;
-    B.seekTo(scrubTime(ratio, safeDur));
+    B.seekTo(scrubTime(ratio, safeDur), { explicit: true });
     onSeek();
   };
 
@@ -70,32 +70,38 @@ export function buildTimeline(el, ctx) {
     if (sp) {
       e.stopPropagation?.();
       B.select([sp.id]);
-      B.seekTo(sp.start);
+      B.seekTo(sp.start, { explicit: true });
       onSeek();
       onChange();
       return;
     }
+    e.preventDefault?.();
     dragging = true;
     const trackEl = e.currentTarget;
-    trackEl.setPointerCapture?.(e.pointerId);
+    if (e.pointerId != null) {
+      try { trackEl.setPointerCapture?.(e.pointerId); } catch {}
+    }
     scrubAtClientX(trackEl, e.clientX);
   };
   const onTrackPointerMove = e => {
     if (!dragging) return;
+    e.preventDefault?.();
     scrubAtClientX(e.currentTarget, e.clientX);
   };
   const onTrackPointerUp = e => {
     if (!dragging) return;
     dragging = false;
-    e.currentTarget.releasePointerCapture?.(e.pointerId);
+    if (e.pointerId != null) {
+      try { e.currentTarget.releasePointerCapture?.(e.pointerId); } catch {}
+    }
   };
   const onTrackKeyDown = e => {
     const step = e.shiftKey ? 500 : 100;
     const cur = B.time() ?? 0;
-    if (e.key === "ArrowLeft") { e.preventDefault(); e.stopPropagation(); B.seekTo(cur - step); onSeek(); }
-    else if (e.key === "ArrowRight") { e.preventDefault(); e.stopPropagation(); B.seekTo(cur + step); onSeek(); }
-    else if (e.key === "Home") { e.preventDefault(); e.stopPropagation(); B.stepToStart(); onSeek(); }
-    else if (e.key === "End") { e.preventDefault(); e.stopPropagation(); B.stepToEnd(); onSeek(); }
+    if (e.key === "ArrowLeft") { e.preventDefault(); e.stopPropagation(); B.seekTo(cur - step, { explicit: true }); onSeek(); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); e.stopPropagation(); B.seekTo(cur + step, { explicit: true }); onSeek(); }
+    else if (e.key === "Home") { e.preventDefault(); e.stopPropagation(); B.stepToStart({ explicit: true }); onSeek(); }
+    else if (e.key === "End") { e.preventDefault(); e.stopPropagation(); B.stepToEnd({ explicit: true }); onSeek(); }
     else if (e.key === " " || e.key === "Enter") { e.preventDefault(); e.stopPropagation(); B.playToggle(); onChange(); }
   };
 
@@ -109,7 +115,7 @@ export function buildTimeline(el, ctx) {
       onclick: ev => {
         ev.stopPropagation();
         B.select([sp.id]);
-        B.seekTo(sp.start);
+        B.seekTo(sp.start, { explicit: true });
         onSeek();
         onChange();
       },
@@ -165,7 +171,7 @@ export function buildTimeline(el, ctx) {
   }, icon("repeat", { size: 14 }));
 
   const rmBadge = reduced
-    ? h("span.tl-rm", { title: "Reduced motion preference detected" }, "Reduced motion")
+    ? h("span.tl-rm", { title: "Reduced motion preference detected (tap Play to animate)" }, "Reduced motion")
     : null;
 
   replace(

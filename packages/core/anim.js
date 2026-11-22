@@ -293,9 +293,9 @@ export function timelineSpans(elements) {
   return out;
 }
 
-/** Respect prefers-reduced-motion: when reducedMotion is true during passive playback, settle to timeline end. */
-export function effectiveAnimTime(time, duration, reducedMotion = false) {
+/** Respect prefers-reduced-motion: settle passive/ambient playback to timeline end, but allow explicit user-initiated Play to animate. */
+export function effectiveAnimTime(time, duration, reducedMotion = false, explicitPlay = false) {
   if (time == null) return null;
-  if (reducedMotion) return Math.max(0, Number.isFinite(duration) ? duration : 0);
+  if (reducedMotion && !explicitPlay) return Math.max(0, Number.isFinite(duration) ? duration : 0);
   return time;
 }

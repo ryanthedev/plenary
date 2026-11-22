@@ -419,4 +419,68 @@ describe("timeline math & Editor playback controls", () => {
     expect(ed.play).toBeNull();
     expect(ed.playSpeed).toBe(2);
   });
+
+  test("#109: explicit user Play animates smoothly even when prefers-reduced-motion is active, while passive/ambient play still settles", () => {
+    const theme = { fg: "#18181B", bg: "#F8F7F4", accent: "#3B48E8", dim: "#625F57" };
+    let now = 0;
+    const ed = new Editor({
+      scene: { elements: [makeEl({ preset: "fade", start: 0, duration: 600 }, { id: "r1" })] },
+      clock: () => now,
+    });
+    ed.setReducedMotion(true);
+
+    // effectiveAnimTime allows explicitPlay while settling passive playback
+    expect(effectiveAnimTime(150, 600, true, false)).toBe(600);
+    expect(effectiveAnimTime(150, 600, true, true)).toBe(150);
+
+    // Ambient / non-explicit play still settles to timeline end under reducedMotion
+    ed.playToggle({ explicit: false });
+    expect(ed.needsTick()).toBe(true);
+    expect(ed.displayList(theme).find(it => it.id === "r1")?.opacity).toBe(1);
+    ed.stopPlay();
+
+    // Explicit user-initiated Play advances smoothly across ticks even with reducedMotion: true
+    ed.playToggle();
+    expect(ed.play?.explicit).toBe(true);
+    expect(ed.needsTick()).toBe(true);
+    expect(ed.displayList(theme).some(it => it.id === "r1")).toBe(false); // t=0: opacity 0
+
+    now = 300;
+    const vBefore = ed.version;
+    ed.tick();
+    expect(ed.version).toBeGreaterThan(vBefore);
+    const midItem = ed.displayList(theme).find(it => it.id === "r1");
+    expect(midItem).toBeDefined();
+    expect(midItem.opacity).toBeCloseTo(0.75, 5);
+
+    // Pausing mid-play under reducedMotion must hold the paused frame (0.75) instead of jumping to end (1.0)
+    ed.playToggle();
+    expect(ed.play).toBeNull();
+    expect(ed.scrub).toBe(300);
+    expect(ed.displayList(theme).find(it => it.id === "r1")?.opacity).toBeCloseTo(0.75, 5);
+
+    // Explicit interactive scrub under reducedMotion renders the scrubbed frame, and stopPlay clears userTimeline
+    ed.seekTo(150, { explicit: true });
+    expect(ed.displayList(theme).find(it => it.id === "r1")?.opacity).toBeCloseTo(ease("ease-out", 0.25), 5);
+    ed.playToggle(); // resume from 150ms
+
+    // Speed change preserves explicit playback under reducedMotion
+    ed.setPlaySpeed(2);
+    expect(ed.play?.explicit).toBe(true);
+    now = 525; // 150 + 225*2 = 600ms -> settled at opacity 1
+    expect(ed.displayList(theme).find(it => it.id === "r1")?.opacity).toBe(1);
+
+    // Playback completion bumps version even if time() is called outside tick()
+    now = 1200; // past duration + holdMs
+    const vPreEnd = ed.version;
+    expect(ed.time()).toBeNull();
+    expect(ed.play).toBeNull();
+    expect(ed.needsTick()).toBe(false);
+    expect(ed.version).toBeGreaterThan(vPreEnd);
+
+    // restartPlay also sets explicit: true
+    ed.restartPlay();
+    expect(ed.play?.explicit).toBe(true);
+    expect(ed.displayList(theme).some(it => it.id === "r1")).toBe(false);
+  });
 });

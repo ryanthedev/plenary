@@ -172,3 +172,17 @@ test("a stroke of width 0 or less is skipped, not drawn at the previous width (L
   ], view);
   expect(names(ctx).filter(n => n === "stroke").length).toBe(1);
 });
+
+test("#109: zero-dimension image/video/text items during scale/flip animations are skipped safely for WKWebView", () => {
+  const ctx = fakeCtx();
+  const img = { tag: "img" };
+  paint(ctx, [
+    { t: "image", fileId: "f1", x: 10, y: 10, w: 0, h: 40, angle: 0, cx: 10, cy: 30, opacity: 1 },
+    { t: "image", fileId: "f1", x: 10, y: 10, w: 40, h: -5, angle: 0, cx: 30, cy: 10, opacity: 1 },
+    { t: "video", fileId: "v1", x: 10, y: 10, w: 0, h: 40, angle: 0, cx: 10, cy: 30, opacity: 1 },
+    { t: "text", x: 10, y: 10, text: "hi", size: 0, color: "#000000", align: "left", lineHeight: 1.25 },
+  ], { ...view, image: () => img });
+  expect(names(ctx)).not.toContain("drawImage");
+  expect(names(ctx)).not.toContain("fillText");
+  expect(names(ctx)).not.toContain("strokeRect");
+});

@@ -8,7 +8,7 @@
 // Colors arrive as #rrggbb or #rrggbbaa; the theme decides what "default ink" is.
 
 import { DEFAULT_STROKE, isShape, isLinear, isLabel, textSize, MIN_PRESSURE, MAX_PRESSURE } from "./model.js";
-import { bbox, resolvedPoints, drawnPoints, toWorld, angleOf, centerOf, labelAnchor, portsOf } from "./geometry.js";
+import { bbox, bounds, resolvedPoints, drawnPoints, toWorld, angleOf, centerOf, labelAnchor, portsOf } from "./geometry.js";
 import { spatialIndex } from "./spatial.js";
 import { animState } from "./anim.js";
 import { labelLines, textWidth } from "./text.js";
@@ -303,7 +303,7 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
   }
 
   if (el.type === "video") {
-    const b = bbox(el), [x0, y0] = Q(b.x, b.y), [x1, y1] = Q(b.x + b.w, b.y + b.h), [cx, cy] = Q(b.x + b.w / 2, b.y + b.h / 2);
+    const b = bbox(el), [x0, y0] = QNoRot(b.x, b.y), [x1, y1] = QNoRot(b.x + b.w, b.y + b.h), [cx, cy] = QNoRot(b.x + b.w / 2, b.y + b.h / 2);
     const file = doc.files?.[el.fileId];
     const ready = !!(file && (typeof file.dataURL === "string" || typeof file.url === "string" || file.bytes instanceof Uint8Array));
     out.push({
@@ -314,7 +314,7 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
       posterDataUrl: el.posterDataUrl ?? null,
       status: ready ? (el.status ?? "saved") : "pending",
       x: x0, y: y0, w: x1 - x0, h: y1 - y0,
-      angle: angleOf(el), cx, cy,
+      angle: angleOf(el) + aRot, cx, cy,
       opacity: opacity * progress,
     });
     return;
@@ -670,6 +670,51 @@ function paintLinkCard(el, card, Q, QNoRot, view, theme, out, { opacity, progres
       color: urlColor, align: "left", lineHeight: 1.2, opacity, reveal: progress,
     });
   }
+}
+
+/** Closed screen-space bounding-box path commands for `el` padded outward by `padWorld` (respecting rotation). */
+export function outlineBoxCmds(doc, el, view, padWorld) {
+  const P = project(view);
+  let pts;
+  if (angleOf(el)) {
+    const b = bbox(el);
+    pts = [
+      [b.x - padWorld, b.y - padWorld],
+      [b.x + b.w + padWorld, b.y - padWorld],
+      [b.x + b.w + padWorld, b.y + b.h + padWorld],
+      [b.x - padWorld, b.y + b.h + padWorld],
+    ].map(([x, y]) => {
+      const w = toWorld(el, { x, y });
+      return P(w.x, w.y);
+    });
+  } else {
+    const b = bounds(el, doc);
+    pts = [
+      [b.x - padWorld, b.y - padWorld],
+      [b.x + b.w + padWorld, b.y - padWorld],
+      [b.x + b.w + padWorld, b.y + b.h + padWorld],
+      [b.x - padWorld, b.y + b.h + padWorld],
+    ].map(([x, y]) => P(x, y));
+  }
+  return [...pts.map((p, i) => [i ? "L" : "M", p[0], p[1]]), ["L", pts[0][0], pts[0][1]]];
+}
+
+/** World-space outward clearance for hover highlights: keeps a crisp gap outside stroke width & hand-drawn roughness. */
+export function hoverPadWorld(el, scale) {
+  const s = Number.isFinite(scale) && scale > 0 ? scale : 1;
+  const strokeHalf = (isShape(el) || isLinear(el)) && el.type !== "frame" ? Math.max(0, el.strokeWidth ?? 0) / 2 : 0;
+  const roughPx = isShape(el) && el.type !== "frame" && s >= CLEAN_BELOW ? Math.min(4, Math.max(0, el.roughness ?? 1) * 1.5) : 0;
+  return (5 + roughPx) / s + strokeHalf;
+}
+
+/** Paint a crisp, theme-aware outward hover highlight around any selectable element (respecting rotation). */
+export function paintHoverHighlight(doc, el, view, theme, out) {
+  if (!el) return;
+  const cmds = outlineBoxCmds(doc, el, view, hoverPadWorld(el, view.scale));
+  const acc = theme.accent;
+  const dark = isDarkTheme(theme);
+  out.push({ t: "path", id: "hover:halo", cmds, stroke: withAlpha(acc, dark ? 0.32 : 0.22), width: 4, dash: null });
+  out.push({ t: "path", id: "hover:outline", cmds, stroke: withAlpha(acc, dark ? 0.95 : 0.88), width: 1.75, dash: null });
 }
 
 // Visual port / anchor snap indicators for line/arrow hover & endpoint drag preview.

@@ -260,4 +260,60 @@ describe("timeline DOM adapter", () => {
     tl.track.fire("pointermove", { pointerId: 2, clientX: 180 });
     expect(B.time()).toBe(200); // did not move after lostpointercapture
   });
+
+  test("#109: mobile touch scrubbing survives WKWebView setPointerCapture errors and Play advances under reducedMotion", () => {
+    let now = 0;
+    const B = new Editor({
+      scene: {
+        elements: [
+          { id: "r1", type: "rectangle", x: 0, y: 0, width: 100, height: 60, strokeColor: "#18181b", strokeWidth: 2, opacity: 100, customData: { anim: { preset: "fade", start: 0, duration: 800 } } },
+        ],
+      },
+      clock: () => now,
+    });
+    B.setReducedMotion(true);
+    const root = new StubNode("footer");
+    const tl = { fill: null, head: null, text: null, track: null, sig: "" };
+    let seeks = 0, changes = 0;
+    buildTimeline(root, {
+      board: B,
+      dur: B.duration(),
+      marks: [0],
+      spans: timelineSpans(B.doc.live()),
+      tl,
+      h,
+      replace,
+      onChange: () => { changes++; },
+      onSeek: () => { seeks++; updateTimelineInPlace(tl, B, B.duration()); },
+      reducedMotion: true,
+    });
+
+    // Simulate WKWebView throwing NotFoundError on setPointerCapture / releasePointerCapture for touch pointers
+    tl.track.setPointerCapture = () => { throw new Error("NotFoundError"); };
+    tl.track.releasePointerCapture = () => { throw new Error("NotFoundError"); };
+    const downEv = tl.track.fire("pointerdown", { target: tl.track, button: 0, pointerId: 7, pointerType: "touch", clientX: 50 });
+    expect(downEv.defaultPrevented).toBe(true);
+    expect(B.time()).toBe(200); // 50/200 * 800ms
+    const moveEv = tl.track.fire("pointermove", { target: tl.track, pointerId: 7, pointerType: "touch", clientX: 100 });
+    expect(moveEv.defaultPrevented).toBe(true);
+    expect(B.time()).toBe(400);
+    // Touch scrub under reducedMotion actually renders the scrubbed frame (not frozen at end)
+    const scrubItem = B.displayList({ fg: "#18181B", bg: "#F8F7F4", accent: "#3B48E8", dim: "#625F57" }).find(it => it.id === "r1");
+    expect(scrubItem?.opacity).toBeCloseTo(0.75, 5);
+    tl.track.fire("pointerup", { target: tl.track, pointerId: 7, pointerType: "touch", clientX: 100 });
+    expect(seeks).toBe(2);
+
+    // Tapping Play on mobile under reducedMotion starts explicit playback and advances timeline
+    const playBtn = root.all().find(n => n.attrs["data-state"] === "paused");
+    expect(playBtn).toBeDefined();
+    playBtn.fire("click");
+    expect(B.play?.explicit).toBe(true);
+    expect(B.needsTick()).toBe(true);
+    expect(changes).toBeGreaterThan(0);
+
+    now = 200; // from 400ms + 200ms = 600ms
+    expect(B.time()).toBe(600);
+    updateTimelineInPlace(tl, B, B.duration());
+    expect(tl.text.textContent).toBe("00:00.6 / 00:00.8");
+  });
 });

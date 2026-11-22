@@ -91,7 +91,9 @@ export function paint(ctx, items, view) {
       let text = String(it.text ?? "");
       if (it.reveal != null && it.reveal < 1) text = text.slice(0, Math.round(text.length * Math.max(0, it.reveal)));
       if (!text) continue;
-      const size = num(it.size, 16), lh = size * num(it.lineHeight, 1.25), lines = text.split("\n");
+      const size = num(it.size, 16);
+      if (!(size > 0)) continue;
+      const lh = size * num(it.lineHeight, 1.25), lines = text.split("\n");
       const face = Object.prototype.hasOwnProperty.call(faces, it.font) ? faces[it.font] : faces.sans;   // own keys only
       ctx.font = `${size.toFixed(1)}px ${face}`;
       ctx.fillStyle = color(it.color);
@@ -108,10 +110,12 @@ export function paint(ctx, items, view) {
       });
     } else if (it.t === "image") {
       const src = view.image?.(it.fileId);
-      if (!src) continue;
-      rotated(ctx, it, () => ctx.drawImage(src, num(it.x), num(it.y), Math.max(0, num(it.w)), Math.max(0, num(it.h))));
+      const w = num(it.w), h = num(it.h);
+      if (!src || !(w > 0 && h > 0)) continue;   // skip zero/negative dimensions during scale or flip animations
+      rotated(ctx, it, () => ctx.drawImage(src, num(it.x), num(it.y), w, h));
     } else if (it.t === "video") {
-      const x = num(it.x), y = num(it.y), w = Math.max(0, num(it.w)), h = Math.max(0, num(it.h));
+      const x = num(it.x), y = num(it.y), w = num(it.w), h = num(it.h);
+      if (!(w > 0 && h > 0)) continue;
       rotated(ctx, it, () => {
         ctx.fillStyle = "#18181b";
         ctx.fillRect(x, y, w, h);

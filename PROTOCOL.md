@@ -230,6 +230,9 @@ that changed since.
   30 s plus backoff. (WebSocket pongs are answered by the client's WebSocket stack, not by app code. Whether
   Herdr's WebSocket answers pings is untested; if it doesn't, an idle Herdr client is closed after 30 s and
   reconnects, which costs time only.)
+- **Downstream heartbeat (10 s):** a browser cannot see a half-open socket on a quiet board. Whenever a welcomed
+  connection has had no outbound frame sent to it for **10 s** (`HB_IDLE_MS`), the gateway sends `{ t: "hb" }`
+  (encoded once per gateway; skipped if the socket already has outbound frames queued or is backpressured).
 - **Queue cap:** 500 ops or 8 MB per connection, whichever comes first. Past it the gateway answers `unavailable`
   and closes the connection. The ops stay pending on the client, which reconnects (rule 12) and resends (rule 2).
 - **Guaranteed:** no op is refused or dropped for rate; a resend of an accepted op still gets its `ack` (the queue
@@ -253,7 +256,7 @@ Server → client
 
 | `t` | Fields | |
 |---|---|---|
-| `welcome` | `seq`, `role`, `user`, `high`, `horizon`, `rv`, `room` | `seq` = resolved seq; `high` = this (user, client)'s highest accepted counter (0 if none; omitted for viewers); `horizon` (§ Op ids); `rv` = the room's rules version (§ Recovery); `room` = `{ board, epoch }` (§ Recovery, Room identity) |
+| `welcome` | `seq`, `role`, `user`, `high`, `horizon`, `rv`, `room`, `hb?` | `seq` = resolved seq; `high` = this (user, client)'s highest accepted counter (0 if none; omitted for viewers); `horizon` (§ Op ids); `rv` = the room's rules version (§ Recovery); `room` = `{ board, epoch }` (§ Recovery, Room identity); `hb` = gateway downstream heartbeat interval in ms (10,000; omitted when no gateway sends `hb`) |
 | `snapshot` | `seq`, `streams: { board, notes }`, `appSeq`, `records`, `noteAuthor` | the client-facing board state at a resolved `seq`, tombstones included; never holds the op-id table |
 | `entries` | `entries: [{ seq, board, tenant, stream, op, by, id, at, rv, name? }]` | catch-up and live, ascending `seq`; `name` only on `records` entries (§ Records) |
 | `ack` | `id`, `seq` | the entry is durable (§ Store says against what); it is never lost short of losing the Store's own media |
@@ -261,6 +264,7 @@ Server → client
 | `here` | `writers: [{ user, name, role }]` (≤ 50), `writerCount`, `viewers` (count) | who's on the board (§ Presence); sent on change, at most 1/s (every 5 s on big boards); without `writers` when only a count changed |
 | `emotes` | `counts: { emoji: n }` | viewers' emotes summed per 500 ms |
 | `blob` | `sha1`, `url` | a signed URL, 5 minutes, one blob, one verb |
+| `hb` | (none) | downstream heartbeat sent by the gateway on an idle welcomed connection every ≤ 10 s (§ Pacing); keeps the client's 25 s idle deadline (rule 12) from firing on a quiet board |
 | `error` | `id?`, `code`, `message` | codes below |
 
 Error codes, and what the client does:
@@ -370,7 +374,8 @@ one may still be closing.
     `welcome` arrives within **10 s** of its hello; or the `welcome` names another board; or a **writer's**
     `welcome` (one with `high`) names an epoch lower than one it has seen in a writer's `welcome` (§ Recovery, Room
     identity; a viewer's `welcome` is never checked for epoch); or it is behind `welcome.seq` and no `snapshot` or `entries`
-    message arrives for **10 s**; or rule 2's op timeout fires. Before each reconnect (also after `unavailable`)
+    message arrives for **10 s**; or it is caught up (`applied ≥ welcome.seq`), `welcome.hb` was given, and no server
+    message at all arrives for `ceil(2.5 × hb)` (**25 s** at the 10 s default, `IDLE_TIMEOUT_MS`); or rule 2's op timeout fires. Before each reconnect (also after `unavailable`)
     it waits min(30 s, 0.5 s × 2^k) × a random factor in [0.5, 1), k = failed attempts in a row. A failed attempt
     is a connection that ended by one of these timeouts, by `unavailable`, or by the socket closing without the
     client asking; each connection counts once. k resets to 0 only after a connection has **proven itself**: it

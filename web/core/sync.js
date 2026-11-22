@@ -173,7 +173,7 @@ export function openLink({ transport, token: firstToken, board, client = "web", 
       replica.connectionFailed();          // rule 12: a failed attempt (its close that follows is then ignored: `down`)
       pump(); onRoom({ type: "limit", message: limited }); return;
     }
-    if (msg?.t === "here" || msg?.t === "emotes") { onRoom({ type: msg.t, msg }); return; }
+    if (msg?.t === "here" || msg?.t === "emotes") { replica.receive(msg); pump(); onRoom({ type: msg.t, msg }); return; }
     // A rule-5 refusal of one of my records ops: look it up before receive() drops it from pending.
     const was = msg?.t === "error" && msg.id !== undefined ? replica.pending.get(msg.id) : null;
     const refusedRecord = was?.stream === "records" && !["stale", "unavailable", "auth", "version", "stale-setting"].includes(msg.code)

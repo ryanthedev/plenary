@@ -19,7 +19,7 @@
 
 import { Doc } from "../core/doc.js";
 import { emptyScene, clone, randomInt } from "../core/model.js";
-import { ELEMENT_STREAMS, PROTOCOL_VERSION, RULES, OP_RATE, OP_TIMEOUT_MS, CONNECT_TIMEOUT_MS, BACKOFF, mergeAppState, appBaseProblem, isTab } from "./envelope.js";
+import { ELEMENT_STREAMS, PROTOCOL_VERSION, RULES, OP_RATE, OP_TIMEOUT_MS, CONNECT_TIMEOUT_MS, IDLE_TIMEOUT_MS, BACKOFF, mergeAppState, appBaseProblem, isTab } from "./envelope.js";
 import { Records } from "./records.js";
 import { PREVIEW_TTL_MS } from "./presence.js";
 
@@ -28,14 +28,16 @@ export class Replica {
    *  Replica adds its own session part, so a reloaded page reusing the name never collides with its old op
    *  ids), the browser tab it belongs to (sent as hello.tab, § Messages; omitted when not given), a clock in ms,
    *  and a random source in [0, 1) for the backoff's jitter. */
-  constructor({ client, tab, now = Date.now, random = Math.random }) {
+  constructor({ client, tab, now = Date.now, random = Math.random, idleTimeoutMs = null }) {
     if (tab !== undefined && !isTab(tab)) throw new Error("tab must match /^[A-Za-z0-9_-]{1,32}$/");
     this.tab = tab;
     this.client = `${client}.${Math.floor(Math.random() * 2 ** 31).toString(36)}`; this.counter = 0;
     this.now = now; this.random = random;
+    this.idleTimeoutMs = idleTimeoutMs;   // explicit override (ms), or null to use ceil(2.5 * welcome.hb)
+    this.hbTimeoutMs = 0;
     this.fails = 0;             // failed connections in a row (rule 12); back to 0 only after a proven connection
     this.goodAt = null;         // when this connection caught up to welcome.seq (null: not yet)
-    this.helloAt = null; this.progressAt = null;
+    this.helloAt = null; this.progressAt = null; this.heardAt = null;
     this.pending = new Map();   // op id → { stream, op, msg, ackSeq?, wrote, answered, resend }: kept across resets and connections
     this.tokens = OP_RATE.burst; this.tokensAt = now();   // the send pace: a bucket of OP_RATE
     this.unconfirmed = 0;       // ops dropped without knowing whether they landed (the UI says so after the resync)
@@ -90,7 +92,7 @@ export class Replica {
     this.resync = false; this.needAuth = false; this.welcomed = false; this.target = null; this.board = board;
     this.early = [];   // entries and snapshots of this connection that arrived before its welcome
     this.proven();
-    this.helloAt = this.now(); this.progressAt = null; this.counted = false;
+    this.helloAt = this.now(); this.progressAt = null; this.heardAt = null; this.hbTimeoutMs = 0; this.counted = false;
     for (const p of this.pending.values()) { p.wrote = null; p.answered = false; p.resend = p.msg.sentAt !== undefined; }
     const hello = { t: "hello", v: PROTOCOL_VERSION, token, board, since: this.applied, client: this.client };
     if (this.tab !== undefined) hello.tab = this.tab;
@@ -297,8 +299,12 @@ export class Replica {
   outgoing() {
     if (this.stopped || this.resync || this.needAuth || this.helloAt === null) return [];   // after `auth`: nothing until signed in again
     const t = this.now(), out = [];
-    // A timeout means the server was silent for the last 10 s: that stretch doesn't count as staying up.
-    if (this.overdue(t)) { this.failed(t - CONNECT_TIMEOUT_MS); return []; }
+    // A timeout means the server was silent for the timeout stretch: that stretch doesn't count as staying up.
+    if (this.overdue(t)) {
+      const idleDue = this.welcomed && this.applied >= this.target && this.hbTimeoutMs > 0 && this.heardAt !== null && this.heardAt + this.hbTimeoutMs <= t;
+      this.failed(idleDue ? this.heardAt : t - CONNECT_TIMEOUT_MS);
+      return [];
+    }
     if (!this.welcomed) return [];
     this.refill(t);
     let stamped = false;
@@ -310,11 +316,13 @@ export class Replica {
     return out;
   }
 
-  // Rules 2 and 12: no welcome, no catch-up progress, or no answer to a written op, for 10 s.
+  // Rules 2 and 12: no welcome, no catch-up progress, or no answer to a written op for 10 s; or live & idle for 25 s.
   overdue(t) { const left = this.timeLeft(t); return left !== null && left <= 0; }
   timeLeft(t) {
     if (!this.welcomed) return this.helloAt + CONNECT_TIMEOUT_MS - t;
-    let left = this.applied < this.target ? this.progressAt + CONNECT_TIMEOUT_MS - t : null;
+    let left = this.applied < this.target
+      ? this.progressAt + CONNECT_TIMEOUT_MS - t
+      : (this.hbTimeoutMs > 0 && this.heardAt !== null ? this.heardAt + this.hbTimeoutMs - t : null);
     for (const p of this.pending.values()) if (p.wrote !== null && !p.answered) { const mine = p.wrote + OP_TIMEOUT_MS - t; left = left === null ? mine : Math.min(left, mine); }
     return left;
   }
@@ -366,7 +374,8 @@ export class Replica {
   receive(msg) {
     const did = { entries: [], snapshot: false, reset: false, settled: [], dropped: [], refusedSettings: [], retryReady: [] };
     if (!msg || this.stopped) return did;
-    if (msg.t === "snapshot" || msg.t === "entries") this.progressAt = this.now();
+    this.heardAt = this.now();
+    if (msg.t === "snapshot" || msg.t === "entries") this.progressAt = this.heardAt;
     if ((msg.t === "snapshot" || msg.t === "entries") && !this.welcomed && this.helloAt !== null) { this.early.push(msg); return did; }
     if (msg.t === "welcome") {
       this.welcome(msg, did);
@@ -397,6 +406,7 @@ export class Replica {
   welcome(msg, did) {
     if (this.welcomed) return;   // one welcome per connection; a repeat changes nothing
     if (msg.rv !== undefined && !RULES[msg.rv]) { this.stopped = "version"; return; }
+    this.hbTimeoutMs = this.idleTimeoutMs !== null ? this.idleTimeoutMs : (Number.isSafeInteger(msg.hb) && msg.hb > 0 ? Math.ceil(msg.hb * 2.5) : 0);
     // Rule 12 and § Recovery, Room identity. (A welcome with no `room` is from a pre-v1.1 server: not checked.)
     const room = msg.room;
     if (room && typeof room === "object") {

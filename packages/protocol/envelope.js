@@ -52,6 +52,8 @@ export const MAX_TAB_CONNS = 2;          // § Messages, hello.tab: writer conne
 export const TAB_RE = /^[A-Za-z0-9_-]{1,32}$/;
 export const isTab = v => typeof v === "string" && TAB_RE.test(v);
 export const PING_IDLE_MS = 10_000;      // § Pacing: a gateway pings a connection that sent nothing this long
+export const HB_IDLE_MS = 10_000;        // § Pacing: a gateway sends { t: "hb" } to an idle welcomed connection this often
+export const IDLE_TIMEOUT_MS = 25_000;   // rule 12: a live caught-up client with no server message this long reconnects
 export const CONN_SILENCE_MS = 30_000;   // § Pacing: and closes one it heard nothing from (no frame, no pong) this long
 export const GATEWAY_SILENCE_MS = 30_000; // rule 6: a gateway not heard from this long has lost its connections
 export const MAX_NAME_CHARS = 200;

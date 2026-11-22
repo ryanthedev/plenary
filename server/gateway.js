@@ -23,7 +23,7 @@
 // there is no room for is told `unavailable`, a reader that drains nothing for stallMs is cut, whatever it sends.
 
 import { jsonCodec } from "../packages/protocol/codec.js";
-import { ROLES, MAX_CLIENT_CHARS, PROTOCOL_VERSION, RULES_VERSION, MAX_WRITER_CONNS, MAX_TAB_CONNS, opProblem, parseOpId, isTab } from "../packages/protocol/envelope.js";
+import { ROLES, MAX_CLIENT_CHARS, PROTOCOL_VERSION, RULES_VERSION, MAX_WRITER_CONNS, MAX_TAB_CONNS, HB_IDLE_MS, opProblem, parseOpId, isTab } from "../packages/protocol/envelope.js";
 import { presenceProblem, presenceLimiter, presenceCoalescer, EMOTES } from "../packages/protocol/presence.js";
 import { subjects, busBytes, MAX_BUS_BYTES } from "./bus/port.js";
 import { boardFeed } from "./feed.js";
@@ -73,6 +73,7 @@ export const LIMITS = {
   maxWritersPerUserBoard: MAX_WRITER_CONNS, // distinct writer TABS per (user, board) on this gateway; a ninth tab gets `limit` (§ Messages, hello.tab)
   maxConnsPerTab: MAX_TAB_CONNS,            // writer connections per (user, board, tab) on this gateway; a third gets `limit`
   idleTimeoutSec: 30,                       // heard nothing (no frame, no pong) for this long: closed
+  hbIdleMs: HB_IDLE_MS,                     // § Pacing: send { t: "hb" } to a welcomed connection with no outbound frame this long
   presenceMs: 50,                           // coalesced presence goes out this often
   emoteWindowMs: 500,                       // viewers' emotes are summed per window
   connListMs: 5_000,                        // open writer connections are listed to each room this often
@@ -144,6 +145,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
   /** @type {Map<string, any>} conn id → ws */
   const conns = new Map();
   const counts = { accepted: 0, refusedAuth: 0, badFrames: 0, cut: 0, turnedAway: 0 };
+  const hbFrame = codec.encode({ t: "hb" });   // § Pacing: downstream heartbeat, encoded once per gateway
   const sizeOf = data => (typeof data === "string" ? data.length : data?.byteLength ?? 0);   // inbound: chars
   const bytesOf = data => (typeof data === "string" ? Buffer.byteLength(data, "utf8") : data?.byteLength ?? 0);   // outbound: UTF-8 bytes
   // Bun drops a frame (send returns 0) when its socket already holds more than this. flush() never hands it one
@@ -270,6 +272,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
         let sent;
         try { sent = ws.send(item.data); } catch { cut(ws, "send failed"); return; }
         if (sent === 0) { log.error("outbound frame dropped by the transport", { conn: c.id, board: c.board, bytes: item.len, buffered: c.buffered, backpressureLimit }); cut(ws, "frame dropped by the transport"); return; }   // never a silent gap: it reconnects and catches up
+        c.lastOut = now();
         c.out.shift();
         if (item.shared) release(item.shared); else c.outBytes -= item.len;
         if (sent === -1) c.blocked = true;
@@ -384,7 +387,12 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     if (!c.welcomed && !c.welcoming && m.data !== undefined) {
       let msg = null;
       try { msg = codec.decode(m.data); } catch { msg = null; }
-      if (msg?.t === "welcome") { welcomed(ws, m.data, Number.isSafeInteger(msg.seq) ? msg.seq : 0); if (m.close) end(ws, m.close, "closed by the room"); return; }
+      if (msg?.t === "welcome") {
+        const data = lim.hbIdleMs > 0 && msg.hb === undefined ? codec.encode({ ...msg, hb: lim.hbIdleMs }) : m.data;
+        welcomed(ws, data, Number.isSafeInteger(msg.seq) ? msg.seq : 0);
+        if (m.close) end(ws, m.close, "closed by the room");
+        return;
+      }
     }
     if (m.close) {
       // The room is sending this connection away: what was queued for it is dropped, not delivered first.
@@ -413,7 +421,9 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
         // The pace is measured over a recent window, so a reader that picked up speed isn't judged on its past.
         if (c.winDrained > 0 && t - c.winStart > 4 * lim.stallGraceMs) { c.winStart = t; c.winDrained = 0; }
         // A joiner that has waited this long for room is told to come back later rather than wait for ever.
-        if (c.waitSince && t - c.waitSince > lim.maxCatchUpWaitMs) turnAway(ws, "no room for its catch-up in time");
+        if (c.waitSince && t - c.waitSince > lim.maxCatchUpWaitMs) { turnAway(ws, "no room for its catch-up in time"); continue; }
+        // § Pacing: downstream heartbeat on an idle welcomed connection so the client's 25 s watchdog stays fed.
+        if (c.welcomed && lim.hbIdleMs > 0 && !c.out.length && !c.blocked && c.buffered === 0 && t - (c.lastOut ?? 0) >= lim.hbIdleMs) push(ws, hbFrame);
       }
       // Slow readers of live traffic can add up without any one of them stalling yet.
       // (A joiner still waiting for room is owed only what queued behind its catch-up: it is told, not reset.)
@@ -962,7 +972,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     log.info("hello accepted", { conn: c.id, tenant: c.tenant, board: c.board, user: c.user, role });
     if (!writer) {
       // Rule 8: a viewer's hello never leaves the gateway. Its welcome carries the feed's seq and latest known epoch.
-      return welcomed(ws, () => codec.encode({ t: "welcome", seq: c.b.feed.seq, role, user: c.user, horizon: 0, rv: RULES_VERSION, room: { board: c.board, epoch: c.b.feed.epoch } }), 0);
+      return welcomed(ws, () => codec.encode({ t: "welcome", seq: c.b.feed.seq, role, user: c.user, horizon: 0, rv: RULES_VERSION, room: { board: c.board, epoch: c.b.feed.epoch }, ...(lim.hbIdleMs > 0 ? { hb: lim.hbIdleMs } : {}) }), 0);
     }
     // The hello timer keeps running until the room's welcome arrives (the bus may drop a hello).
     c.forwarded = true;

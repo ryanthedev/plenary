@@ -4,6 +4,7 @@
 // here touches the protocol, a transport or sign-in (web/main.js, the composition root, wires those).
 
 import { captureFocus, restoreFocus } from "./focus.js";
+import { trapFocus } from "./a11y.js";
 import { Editor } from "../../../packages/core/editor.js";
 import { parsePanel, serializePanel, applyPanel, panelLayout, dragWidth } from "../../../packages/core/panel.js";
 import { isMermaid } from "../../../packages/core/mermaid.js";
@@ -132,7 +133,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const collab = port ? mountCollab({ root: $("#canvas"), canvasOverlay: overlay, port, theme: ui.theme, clock, frame: fn => requestAnimationFrame(fn),
     view: { toScreen: p => S.eds.board.toScreen(p), toWorld: p => S.eds.board.toWorld(p), get scale() { return S.eds.board.view.scale; }, maxScale: ZOOM_MAX },
     // A cluster that can't zoom apart lists its threads in the comments drawer (the phone's sheet): show it.
-    onList: which => { if (isPhone()) ui.sheet = which; else ui.drawer = which; chromeDirty = true; } }) : null;
+    onList: which => { if (isPhone()) setSheet(which); else { ui.drawer = which; chromeDirty = true; } } }) : null;
   if (collab) collab.showDrawer("comments");
   const worldAt = p => S.eds.board.toWorld(p);
   // Selection presence and pin layout, once per frame (./collab/frame.js).
@@ -243,7 +244,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   canvas.addEventListener("pointerdown", e => {
     lastPointerTouch = e.pointerType === "touch";
     canvas.focus(); canvas.setPointerCapture?.(e.pointerId); e.preventDefault();
-    if (ui.sheet) { ui.sheet = null; chromeDirty = true; }
+    if (ui.sheet) setSheet(null, { restore: false });
     clicks = Math.max(e.detail || 0, countClick(e));
     if (S.tool === "image") { openPicker(); return; }
     const p = at(e);
@@ -677,7 +678,11 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   }
   let toastTimer = null;
   function toast(text, ms = 1800) {
-    const el = $("#toast"); el.textContent = text; el.hidden = false;
+    const el = $("#toast");
+    el.setAttribute?.("role", "status");
+    el.setAttribute?.("aria-live", "polite");
+    el.setAttribute?.("aria-atomic", "true");
+    el.textContent = text; el.hidden = false;
     if (toastTimer != null) clock.clear(toastTimer);
     toastTimer = clock.set(() => { toastTimer = null; el.hidden = true; }, ms);
   }
@@ -693,11 +698,91 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     chromeDirty = true;
     collab?.setTheme(t);
   };
-  let activeShare = null;
-  function openDialog(d) {
+  let activeShare = null, dialogTrap = null, dialogOpener = null, sheetTrap = null, sheetOpener = null, sheetBackdropEl = null, dialogRebuilding = false;
+  function captureOpener(el) {
+    const target = el ?? document.activeElement ?? null;
+    if (!target) return null;
+    return { el: target, label: target.getAttribute?.("aria-label") ?? null };
+  }
+  function findByAriaLabel(label) {
+    if (!label) return null;
+    const visit = node => {
+      for (const child of node?.children ?? []) {
+        if (child.getAttribute?.("aria-label") === label) return child;
+        const found = visit(child);
+        if (found) return found;
+      }
+      return null;
+    };
+    return visit($("#topbar")) ?? visit($("#dock")) ?? visit(document.body);
+  }
+  function restoreOpener(saved, fallback = canvas) {
+    if (saved?.el && saved.el.isConnected !== false) { saved.el.focus?.(); return; }
+    const twin = findByAriaLabel(saved?.label);
+    if (twin) { twin.focus?.(); return; }
+    fallback?.focus?.();
+  }
+  function ensureSheetBackdrop() {
+    if (sheetBackdropEl && sheetBackdropEl.parentNode) return sheetBackdropEl;
+    const existing = $("#sheetBackdrop");
+    if (existing) {
+      sheetBackdropEl = existing;
+      if (!existing._plenaryBound) {
+        existing._plenaryBound = true;
+        existing.addEventListener("click", () => setSheet(null));
+      }
+      return existing;
+    }
+    const sheetEl = $("#sheet");
+    if (!sheetEl?.parentNode) return null;
+    const bd = h("div.sheet-backdrop", { id: "sheetBackdrop", "aria-hidden": "true", hidden: true, onclick: () => setSheet(null) });
+    sheetEl.parentNode.append(bd);
+    sheetBackdropEl = bd;
+    return bd;
+  }
+  function dismissOverlays({ keepSheet = false, keepDialog = false } = {}) {
+    if (ui.moreOpen) ui.moreOpen = false;
+    if (why.isOpen()) why.close(false);
+    if (!keepSheet && ui.sheet) {
+      ui.sheet = null;
+      sheetTrap?.deactivate({ restoreFocus: false });
+      sheetTrap = null;
+      sheetOpener = null;
+      const bd = ensureSheetBackdrop();
+      if (bd) bd.hidden = true;
+    }
+    if (!keepDialog) {
+      if (activeShare) { activeShare.destroy(); activeShare = null; }
+      if (ui.dialog) {
+        ui.dialog = null;
+        dialogTrap?.deactivate({ restoreFocus: false });
+        dialogTrap = null;
+        dialogOpener = null;
+      }
+    }
+  }
+  function setSheet(next, { opener = null, restore = true } = {}) {
+    if (next) {
+      dismissOverlays({ keepSheet: true });
+      if (!ui.sheet) sheetOpener = captureOpener(opener);
+      ui.sheet = next;
+    } else {
+      ui.sheet = null;
+      const prevOpener = sheetOpener;
+      sheetOpener = null;
+      if (sheetTrap) { sheetTrap.deactivate({ restoreFocus: false }); sheetTrap = null; }
+      const bd = ensureSheetBackdrop();
+      if (bd) bd.hidden = true;
+      if (restore) restoreOpener(prevOpener, visibleControl(["[data-dock-more]", ".overflow-btn"]) ?? canvas);
+    }
+    chromeDirty = true;
+  }
+  function openDialog(d, opener = null) {
     cancelActiveSampler();
-    if (activeShare) { activeShare.destroy(); activeShare = null; }
-    ui.dialog = d; ui.sheet = null; chromeDirty = true;
+    dismissOverlays({ keepDialog: false });
+    dialogOpener = captureOpener(opener);
+    ui.dialog = d;
+    chromeDirty = true;
   }
   const keyLabel = t => (t.keys?.length ? t.keys.map(k => k.toUpperCase()).join(" ") : "");
   const activeStream = () => (S.role === "annotator" ? "notes" : S.active);
@@ -709,7 +794,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
 
   function toolButton(t, extra = "") {
     const disabled = t.id !== "hand" && !S.may();
-    return h(`button.tb${S.tool === t.id ? ".on" : ""}${extra}`, { title: `${t.name}${keyLabel(t) ? " — " + keyLabel(t) : ""}`, "aria-label": t.name, disabled, "data-tool": t.id,
+    return h(`button.tb${S.tool === t.id ? ".on" : ""}${extra}`, { title: `${t.name}${keyLabel(t) ? " — " + keyLabel(t) : ""}`, "aria-label": t.name, "aria-pressed": String(S.tool === t.id), disabled, "data-tool": t.id,
       onclick: () => { if (t.id === "image") { S.setTool("image"); openPicker(); } else S.setTool(t.id); canvas.focus(); chromeDirty = true; } },
     h("span.ic", {}, icon(t.id, { size: 18 })), t.keys?.[0] ? h("span.k", {}, t.keys[0].toUpperCase()) : null);
   }
@@ -718,6 +803,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // The chrome is rebuilt while the dialog is open, so focus goes back to whichever of the Share button and the More button is shown now, not to the element that opened it.
   const shareOpener = { focus() { const c = [document.querySelector("[data-share-open]"), document.querySelector(".header-more"), document.querySelector("[data-dock-more]")]; (c.find(e => e && e.offsetParent !== null) ?? c.find(Boolean))?.focus?.(); } };
   function openShareDialog() {
+    dismissOverlays();
     if (!share) return openAdminShare();
     const loc = globalThis.location, origin = loc?.origin ?? "", boardUrl = `${origin}${loc?.pathname ?? "/"}?board=${encodeURIComponent(board)}`;
     const model = createShareModel({ share, access, board, newKey, now: () => clock.now(), urls: { board: boardUrl, link: id => `${origin}/links/${encodeURIComponent(id)}` } });
@@ -750,7 +836,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // Escape and Cancel return focus to a control that is on screen at this width (the chrome is rebuilt meanwhile): the Move or Share button, else the More button.
   const visibleControl = sel => { const c = sel.map(q => document.querySelector(q)); return c.find(e => e && e.offsetParent !== null) ?? c.find(Boolean); };
   const moveOpener = { focus() { (visibleControl(["[data-move-open]", ".header-more", "[data-dock-more]"]) ?? canvas)?.focus?.(); } };
-  const openMoveDialog = () => { ui.sheet = null; chromeDirty = true; startMove({ host: document.body, move, board, opener: moveOpener, reload: refreshMove, restoreFocus: () => canvas.focus?.() }); };
+  const openMoveDialog = () => { dismissOverlays(); chromeDirty = true; startMove({ host: document.body, move, board, opener: moveOpener, reload: refreshMove, restoreFocus: () => canvas.focus?.() }); };
   booted = true; syncMove();
 
   function topbar() {
@@ -807,20 +893,20 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       role === "presenter" ? [
         h("button.btn.ghost.desk-only.header-extra", { title: "Insert a Mermaid flowchart", "aria-label": "Insert Mermaid flowchart", disabled: !may, onclick: () => openDialog("mermaid") }, icon("mermaid", { size: 16 })),
         h("button.btn.ghost.desk-only.header-extra", { title: "Export SVG / PNG / .excalidraw (⌘⇧E)", "aria-label": "Export board", onclick: toggleExport }, icon("export", { size: 16 }))] : null,
-      h("button.btn.ghost.desk-only.header-extra", { "aria-label": "Notes", title: "Notes", onclick: toggleNotes }, icon("note", { size: 16 }), "Notes ", h("span.dim", {}, String(notesCount()))),
-      collab ? h("button.btn.ghost.desk-only.header-extra", { "aria-label": "Comments", title: "Comments (or right-click the board)", onclick: () => toggleDrawer("comments") }, icon("comments", { size: 16 })) : null,
+      h("button.btn.ghost.desk-only.header-extra", { "aria-label": "Notes", "aria-expanded": String(ui.drawer === "notes"), title: "Notes", onclick: toggleNotes }, icon("note", { size: 16 }), "Notes ", h("span.dim", {}, String(notesCount()))),
+      collab ? h("button.btn.ghost.desk-only.header-extra", { "aria-label": "Comments", "aria-expanded": String(ui.drawer === "comments"), title: "Comments (or right-click the board)", onclick: () => toggleDrawer("comments") }, icon("comments", { size: 16 })) : null,
       // Who's here (`here`): the collab UI's live avatar row, kept across rebuilds (a node, moved, never rebuilt here).
       collab ? collab.parts.avatars : h("div.avatars", {},
         h("span.stack", {}, h("span.av.live", { style: { background: "var(--u-me)" }, title: `${me.name} (you)` }, me.name.slice(0, 2).toUpperCase()))),
       share && S.canShare
         ? h("button.btn.primary.desk-only.header-extra", { "aria-haspopup": "dialog", "data-share-open": "1", title: "Share this board", "aria-label": "Share board", onclick: () => openShareDialog() }, icon("share", { size: 15 }), "Share")
-        : (admin ? h("button.btn.primary.desk-only.header-extra", { title: "Share board", "aria-label": "Share board", onclick: () => openAdminShare() }, icon("share", { size: 15 }), "Share") : null),
-      canMove() ? h("button.btn.desk-only.header-extra", { "aria-haspopup": "dialog", "data-move-open": "1", title: "Move this board to another Space", onclick: () => openMoveDialog() }, icon("moveToLayer", { size: 15 }), "Move to…") : null,
+        : (admin ? h("button.btn.primary.desk-only.header-extra", { "aria-haspopup": "dialog", title: "Share board", "aria-label": "Share board", onclick: () => openAdminShare() }, icon("share", { size: 15 }), "Share") : null),
+      canMove() ? h("button.btn.desk-only.header-extra", { "aria-haspopup": "dialog", "aria-label": "Move board to another Space", "data-move-open": "1", title: "Move this board to another Space", onclick: () => openMoveDialog() }, icon("moveToLayer", { size: 15 }), "Move to…") : null,
       pillEl,                                                   // the pill: one node, updated in place (inPlace)
-      role !== "viewer" ? h("button.tb.desk-only.header-extra" + (ui.panel.open ? ".on" : ""), { title: "Side panel (I)", "aria-label": "Inspector panel", onclick: togglePanel }, h("span.ic", {}, icon("panel", { size: 17 })), h("span.k", {}, "I")) : null,
-      h("button.tb.header-extra" + (role === "viewer" ? "" : ".theme-btn"), { title: "Light / dark", "aria-label": "Toggle color theme", onclick: toggleTheme }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 17 }))),
+      role !== "viewer" ? h("button.tb.desk-only.header-extra" + (ui.panel.open ? ".on" : ""), { title: "Side panel (I)", "aria-label": "Inspector panel", "aria-expanded": String(ui.panel.open), onclick: togglePanel }, h("span.ic", {}, icon("panel", { size: 17 })), h("span.k", {}, "I")) : null,
+      h("button.tb.header-extra" + (role === "viewer" ? "" : ".theme-btn"), { title: "Light / dark", "aria-label": "Toggle color theme", "aria-pressed": String(ui.theme === "dark"), onclick: toggleTheme }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 17 }))),
       role !== "viewer" ? h("button.tb.phone-only.paste-btn", { title: "Paste from clipboard", "aria-label": "Paste from clipboard", "data-action": "paste", disabled: !may, onclick: () => { pasteFromClipboard(); } }, h("span.ic", {}, icon("paste", { size: 18 }))) : null,
-      h("button.tb.phone-only.overflow-btn", { title: "More", "aria-label": "More options", onclick: () => { ui.sheet = ui.sheet === "tools" ? null : "tools"; chromeDirty = true; } }, h("span.ic", {}, icon("more", { size: 18 }))),
+      h("button.tb.phone-only.overflow-btn", { title: "More", "aria-label": "More options", "aria-haspopup": "dialog", "aria-expanded": String(ui.sheet === "tools"), onclick: e => { setSheet(ui.sheet === "tools" ? null : "tools", { opener: e?.currentTarget }); } }, h("span.ic", {}, icon("more", { size: 18 }))),
       more, menu);
     closeMoreMenu = e => { if (ui.moreOpen && !actions.contains(e.target)) setMore(false); };
     const brandHref = homeHref || (admin ? "/" : null);
@@ -833,7 +919,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         moveInfo.space ? h("span.board-space", { title: "The Space this board is in" }, "in ", moveInfo.space.name) : null),
       h("div.tools.desk-only.island.tool-rail", { "aria-label": "Drawing tools" }, core.map(t => toolButton(t)), extras.length ? h("span.sep") : null, extras.map(t => toolButton(t, ".new")),
         role !== "viewer" ? [h("span.sep"),
-          h("button.tb" + (S.toolLock() ? ".on" : ""), { title: "Keep the tool after drawing (Q)", "aria-label": "Lock tool", disabled: !may, onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 17 })), h("span.k", {}, "Q")),
+          h("button.tb" + (S.toolLock() ? ".on" : ""), { title: "Keep the tool after drawing (Q)", "aria-label": "Lock tool", "aria-pressed": String(S.toolLock()), disabled: !may, onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 17 })), h("span.k", {}, "Q")),
           h("button.tb", { title: "Undo (⌘Z)", "aria-label": "Undo", disabled: !may, onclick: () => { S.act(activeStream(), e => e.undo()); } }, h("span.ic", {}, icon("undo", { size: 17 }))),
           h("button.tb", { title: "Redo (⌘⇧Z)", "aria-label": "Redo", disabled: !may, onclick: () => { S.act(activeStream(), e => e.redo()); } }, h("span.ic", {}, icon("redo", { size: 17 })))] : null),
       h("span.spacer"),
@@ -850,7 +936,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const selColor = sel[0]?.strokeColor ?? "#3B48E8";
     const selPill = isPhone() && S.role !== "viewer" && may && sel.length > 0
       ? h("div.grp.phone-only.phone-sel-pill", { "aria-label": "Selected shape actions" },
-          h("button.tb", { title: "Color & Style", "aria-label": "Color", "data-action": "color", onclick: () => { ui.sheet = "panel"; ui.colorPicker = "strokeColor"; chromeDirty = true; } },
+          h("button.tb", { title: "Color & Style", "aria-label": "Color", "aria-haspopup": "dialog", "data-action": "color", onclick: e => { ui.colorPicker = "strokeColor"; setSheet("panel", { opener: e?.currentTarget }); } },
             h("span.sel-swatch-dot", { style: { background: safeColor(selColor) } })),
           h("button.tb", { title: "Duplicate", "aria-label": "Duplicate", "data-action": "duplicate", onclick: () => { S.act(activeStream(), e => e.cloneSelection(20, 20)); chromeDirty = true; } },
             h("span.ic", {}, icon("duplicate", { size: 18 }))),
@@ -938,20 +1024,27 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const T = id => toolsFor("presenter").find(t => t.id === id);
   function dock() {
     const may = S.may(), role = S.role;
-    const btn = (icName, label, on, onclick, disabled = false, ariaLabel = label) => h("button.tb" + (on ? ".on" : ""), { onclick, disabled, "aria-label": ariaLabel, title: ariaLabel, ...(label === "More" ? { "data-dock-more": "1" } : {}) }, h("span.ic", {}, icon(icName, { size: 20 })), label);
-    const sheet = id => () => { ui.sheet = ui.sheet === id ? null : id; chromeDirty = true; };
-    const tool = id => btn(id, T(id).name, S.tool === id, () => { if (id === "image") openPicker(); S.setTool(id); chromeDirty = true; }, !may);
+    const btn = (icName, label, on, onclick, disabled = false, ariaLabel = label, extra = {}) => h("button.tb" + (on ? ".on" : ""), { onclick, disabled, "aria-label": ariaLabel, title: ariaLabel, ...(label === "More" ? { "data-dock-more": "1" } : {}), ...extra }, h("span.ic", {}, icon(icName, { size: 20 })), label);
+    const sheetBtn = (icName, label, id) => btn(icName, label, ui.sheet === id, e => setSheet(ui.sheet === id ? null : id, { opener: e?.currentTarget }), false, label, { "aria-haspopup": "dialog", "aria-expanded": String(ui.sheet === id) });
+    const tool = id => btn(id, T(id).name, S.tool === id, () => { if (id === "image") openPicker(); S.setTool(id); chromeDirty = true; }, !may, T(id).name, { "aria-pressed": String(S.tool === id) });
     let items;
-    if (role === "presenter") items = [...["select", "freedraw", "rectangle", "text"].map(id => id === "rectangle" ? btn(id, "Rect", S.tool === id, () => { S.setTool(id); chromeDirty = true; }, !may, T(id).name) : tool(id)), btn("more", "More", ui.sheet === "tools", sheet("tools")), btn("panel", "Style", ui.sheet === "panel", sheet("panel")), btn("note", "Notes", ui.sheet === "notes", sheet("notes")), btn("comments", "Comments", ui.sheet === "comments", sheet("comments"))];
-    else if (role === "annotator") items = [...["select", "note", "highlighter", "freedraw"].map(tool), btn("more", "More", ui.sheet === "tools", sheet("tools")), btn("panel", "Style", ui.sheet === "panel", sheet("panel")), btn("note", "Notes", ui.sheet === "notes", sheet("notes"))];
-    else items = [btn("chevronLeft", "Prev", false, () => S.stepFrame(-1)), btn("fit", "Fit", false, () => S.fit()), btn("chevronRight", "Next", false, () => S.stepFrame(1)), btn("note", "Notes", ui.sheet === "notes", sheet("notes")), btn("comments", "Comments", ui.sheet === "comments", sheet("comments"))];
+    if (role === "presenter") items = [...["select", "freedraw", "rectangle", "text"].map(id => id === "rectangle" ? btn(id, "Rect", S.tool === id, () => { S.setTool(id); chromeDirty = true; }, !may, T(id).name, { "aria-pressed": String(S.tool === id) }) : tool(id)), sheetBtn("more", "More", "tools"), sheetBtn("panel", "Style", "panel"), sheetBtn("note", "Notes", "notes"), sheetBtn("comments", "Comments", "comments")];
+    else if (role === "annotator") items = [...["select", "note", "highlighter", "freedraw"].map(tool), sheetBtn("more", "More", "tools"), sheetBtn("panel", "Style", "panel"), sheetBtn("note", "Notes", "notes")];
+    else items = [btn("chevronLeft", "Prev", false, () => S.stepFrame(-1)), btn("fit", "Fit", false, () => S.fit()), btn("chevronRight", "Next", false, () => S.stepFrame(1)), sheetBtn("note", "Notes", "notes"), sheetBtn("comments", "Comments", "comments")];
     replace($("#dock"), items);
   }
   const SHEET_DISMISS_PX = 72, SHEET_FLICK_VY = 0.55;
+  const SHEET_LABELS = { tools: "More tools", panel: "Style and properties", notes: "Notes", comments: "Comments" };
   function sheetHandle(el) {
     let drag = null, suppressClick = false;
     const reset = () => { drag = null; el.classList.remove("dragging"); el.style.transform = ""; };
-    const handle = h("div.sheet-handle", { role: "button", "aria-label": "Dismiss sheet", title: "Drag down or tap to close" }, h("div.grab"));
+    const handle = h("div.sheet-handle", {
+      role: "button",
+      tabindex: "0",
+      "aria-label": "Dismiss sheet",
+      title: "Drag down or tap to close",
+      onkeydown: e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault?.(); setSheet(null); } },
+    }, h("div.grab"));
     handle.addEventListener("pointerdown", e => {
       if (e.button && e.button !== 0) return;
       handle.setPointerCapture?.(e.pointerId);
@@ -975,7 +1068,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       const { dy, vy, moved } = drag;
       reset();
       if (moved) suppressClick = true;
-      if (dy > SHEET_DISMISS_PX || (dy > 24 && vy > SHEET_FLICK_VY)) { ui.sheet = null; chromeDirty = true; }
+      if (dy > SHEET_DISMISS_PX || (dy > 24 && vy > SHEET_FLICK_VY)) setSheet(null);
     });
     handle.addEventListener("pointercancel", e => {
       if (!drag || (e.pointerId != null && e.pointerId !== drag.id)) return;
@@ -984,16 +1077,30 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     });
     handle.addEventListener("click", () => {
       if (suppressClick) { suppressClick = false; return; }
-      ui.sheet = null; chromeDirty = true;
+      setSheet(null);
     });
-    return handle;
+    const closeBtn = h("button.tb.sheet-close", { type: "button", title: "Close", "aria-label": "Close sheet", onclick: () => setSheet(null) }, icon("close", { size: 16 }));
+    return h("div.sheet-head", {}, handle, closeBtn);
   }
   function sheetView() {
     const el = $("#sheet");
+    const bd = ensureSheetBackdrop();
     el.classList.remove("dragging");
     el.style.transform = "";
-    if (!ui.sheet || !isPhone()) { if (isPhone()) cancelActiveSampler(); el.hidden = true; el.replaceChildren(); return; }
+    if (!ui.sheet || !isPhone()) {
+      if (isPhone()) cancelActiveSampler();
+      if (sheetTrap) { sheetTrap.deactivate({ restoreFocus: false }); sheetTrap = null; }
+      if (bd) bd.hidden = true;
+      el.hidden = true;
+      el.replaceChildren();
+      return;
+    }
     if (ui.sheet !== "panel") cancelActiveSampler();
+    if (bd) bd.hidden = false;
+    el.setAttribute?.("role", "dialog");
+    el.setAttribute?.("aria-modal", "true");
+    el.setAttribute?.("aria-label", SHEET_LABELS[ui.sheet] ?? "Sheet");
+    if (el.getAttribute?.("tabindex") === null) el.setAttribute?.("tabindex", "-1");
     el.hidden = false;
     let body;
     if (ui.sheet === "tools") {
@@ -1001,20 +1108,23 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       const may = S.may();
       const quickActions = S.role !== "viewer"
         ? h("div.sheet-actions", {},
-            h("button.btn.sheet-action", { disabled: !may, "data-action": "paste", "aria-label": "Paste from clipboard", onclick: () => { pasteFromClipboard().then(ok => { if (ok && ui.sheet === "tools") { ui.sheet = null; chromeDirty = true; } }); } }, icon("paste", { size: 18 }), "Paste"),
-            h("button.btn.sheet-action", { disabled: !may, "data-action": "media", "aria-label": "Insert photo or video", onclick: () => { openPicker(); ui.sheet = null; chromeDirty = true; } }, icon("image", { size: 18 }), "Photo / Video"))
+            h("button.btn.sheet-action", { disabled: !may, "data-action": "paste", "aria-label": "Paste from clipboard", onclick: () => { pasteFromClipboard().then(ok => { if (ok && ui.sheet === "tools") setSheet(null, { restore: false }); }); } }, icon("paste", { size: 18 }), "Paste"),
+            h("button.btn.sheet-action", { disabled: !may, "data-action": "media", "aria-label": "Insert photo or video", onclick: () => { openPicker(); setSheet(null, { restore: false }); } }, icon("image", { size: 18 }), "Photo / Video"))
         : null;
-      body = h("div.scroll", {}, quickActions, h("div.tool-grid", {}, toolsFor(S.role).map(t => h("button.tb" + (S.tool === t.id ? ".on" : ""), { disabled: t.id !== "hand" && !may, "data-tool": t.id, onclick: () => { if (t.id === "image") openPicker(); S.setTool(t.id); ui.sheet = null; chromeDirty = true; } }, h("span.ic", {}, icon(t.id, { size: 20 })), t.name)),
-        S.role === "presenter" ? [h("button.tb", { disabled: !may, onclick: () => openDialog("mermaid") }, h("span.ic", {}, icon("mermaid", { size: 20 })), "Mermaid"), h("button.tb", { onclick: () => openDialog("export") }, h("span.ic", {}, icon("export", { size: 20 })), "Export")] : null,
+      body = h("div.scroll", {}, quickActions, h("div.tool-grid", {}, toolsFor(S.role).map(t => h("button.tb" + (S.tool === t.id ? ".on" : ""), { disabled: t.id !== "hand" && !may, "data-tool": t.id, "aria-label": t.name, "aria-pressed": String(S.tool === t.id), onclick: () => { if (t.id === "image") openPicker(); S.setTool(t.id); setSheet(null, { restore: false }); } }, h("span.ic", {}, icon(t.id, { size: 20 })), t.name)),
+        S.role === "presenter" ? [h("button.tb", { disabled: !may, "aria-haspopup": "dialog", onclick: () => openDialog("mermaid") }, h("span.ic", {}, icon("mermaid", { size: 20 })), "Mermaid"), h("button.tb", { "aria-haspopup": "dialog", onclick: () => openDialog("export") }, h("span.ic", {}, icon("export", { size: 20 })), "Export")] : null,
         share && S.canShare
-          ? h("button.tb", { onclick: () => { ui.sheet = null; chromeDirty = true; openShareDialog(); } }, h("span.ic", {}, icon("share", { size: 20 })), "Share")
-          : (admin ? h("button.tb", { onclick: () => { ui.sheet = null; chromeDirty = true; openAdminShare(); } }, h("span.ic", {}, icon("share", { size: 20 })), "Share") : null),
-        canMove() ? h("button.tb", { onclick: () => openMoveDialog() }, h("span.ic", {}, icon("moveToLayer", { size: 20 })), "Move to…") : null,
-        S.role !== "viewer" ? h("button.tb" + (S.toolLock() ? ".on" : ""), { disabled: !may, onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 20 })), "Lock tool") : null,
-        h("button.tb", { onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 20 })), ui.theme === "dark" ? "Light" : "Dark")));
+          ? h("button.tb", { "aria-haspopup": "dialog", onclick: () => { setSheet(null, { restore: false }); openShareDialog(); } }, h("span.ic", {}, icon("share", { size: 20 })), "Share")
+          : (admin ? h("button.tb", { "aria-haspopup": "dialog", onclick: () => { setSheet(null, { restore: false }); openAdminShare(); } }, h("span.ic", {}, icon("share", { size: 20 })), "Share") : null),
+        canMove() ? h("button.tb", { "aria-haspopup": "dialog", onclick: () => openMoveDialog() }, h("span.ic", {}, icon("moveToLayer", { size: 20 })), "Move to…") : null,
+        S.role !== "viewer" ? h("button.tb" + (S.toolLock() ? ".on" : ""), { disabled: !may, "aria-pressed": String(S.toolLock()), onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 20 })), "Lock tool") : null,
+        h("button.tb", { "aria-pressed": String(ui.theme === "dark"), onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 20 })), ui.theme === "dark" ? "Light" : "Dark")));
     } else if (ui.sheet === "panel") body = h("div.scroll", {}, panelNodes(true));
     else body = [h("div.tabs", { style: { justifyContent: "center" } }, drawerTabs("sheet")), h("div.scroll", {}, drawerBody(ui.sheet))];
     replace(el, sheetHandle(el), body);
+    if (!sheetTrap) {
+      sheetTrap = trapFocus(el, { onEscape: () => setSheet(null), returnFocusTo: sheetOpener?.el ?? null });
+    }
   }
   const panelNodes = (inSheet = false) => renderPanel(null, {
     session: S, state: ui.panel, h, inSheet, library: ui.library, setLibrary, setState: setPanel,
@@ -1049,18 +1159,29 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     clock.set(() => URL.revokeObjectURL(a.href), 5000);
   }
   // A dialog control that changes what the dialog shows (a format chip) rebuilds the dialog: remember which control had focus so chrome() puts it back.
-  function rebuildDialog(d) { pendingFocus = captureFocus(chromeRoots()); d.replaceChildren(); chromeDirty = true; }
+  function rebuildDialog(d) { pendingFocus = captureFocus(chromeRoots()); dialogRebuilding = true; d.replaceChildren(); chromeDirty = true; }
   function dialogs() {
     if (activeShare) return;
     const d = $("#dialogs"), may = S.may();
     if (document.activeElement?.closest?.("#dialogs") && d.firstChild) return;   // don't rebuild under the cursor
-    const close = () => { ui.dialog = null; chromeDirty = true; canvas.focus(); };
-    const chip = (t, on, onclick) => h("button.c" + (on ? ".on" : ""), { onclick }, t);
+    const close = () => {
+      ui.dialog = null;
+      const opener = dialogOpener;
+      dialogOpener = null;
+      dialogTrap?.deactivate({ restoreFocus: false });
+      dialogTrap = null;
+      chromeDirty = true;
+      restoreOpener(opener, canvas);
+    };
+    const chip = (t, on, onclick) => h("button.c" + (on ? ".on" : ""), { "aria-pressed": String(Boolean(on)), onclick }, t);
+    const rebuilding = dialogRebuilding;
+    dialogRebuilding = false;
     if (ui.dialog === "mermaid" && S.role === "presenter") {
+      dialogTrap?.deactivate({ restoreFocus: false });
       const cv = h("canvas", { width: 300, height: 180 });
-      const ta = h("textarea.code", { spellcheck: false, value: ui.mermaid.src, oninput: e => { ui.mermaid.src = e.target.value; mermaidPreview(cv); }, onkeydown: e => e.stopPropagation() });
-      replace(d, h("div.dialog-veil", { onclick: e => { if (e.target === e.currentTarget) close(); } }, h("div.dialog", { role: "dialog", "aria-label": "Insert a Mermaid flowchart" },
-        h("h2", {}, icon("mermaid", { size: 17 }), " Insert a Mermaid flowchart", h("span.spacer"), h("button.tb", { onclick: close, title: "Close", "aria-label": "Close" }, icon("close", { size: 16 }))),
+      const ta = h("textarea.code", { spellcheck: false, "aria-label": "Mermaid flowchart source", value: ui.mermaid.src, oninput: e => { ui.mermaid.src = e.target.value; mermaidPreview(cv); }, onkeydown: e => { if (e.key === "Escape") { e.preventDefault?.(); close(); return; } e.stopPropagation(); } });
+      const dlg = h("div.dialog", { role: "dialog", "aria-modal": "true", "aria-labelledby": "mermaid-dialog-title", "aria-label": "Insert a Mermaid flowchart", tabindex: "-1" },
+        h("h2", { id: "mermaid-dialog-title" }, icon("mermaid", { size: 17 }), " Insert a Mermaid flowchart", h("span.spacer"), h("button.tb", { onclick: close, title: "Close", "aria-label": "Close" }, icon("close", { size: 16 }))),
         h("div.dbody", {}, h("div.cols", {}, ta, h("div.preview", {}, cv)),
           h("div.row", {}, h("span.lab", {}, "Arrows"), h("span.opts", {}, chip("straight", !ui.mermaid.elbow, () => { ui.mermaid.elbow = false; ui.dialog = "mermaid"; rebuildDialog(d); }), chip("elbow", ui.mermaid.elbow, () => { ui.mermaid.elbow = true; rebuildDialog(d); }))),
           h("div.hint", {}, "Flowcharts only (graph / flowchart, TD TB BT LR RL, subgraphs become frames). Pasting Mermaid text on the board does the same.")),
@@ -1068,12 +1189,15 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
           let err = null;
           S.act("board", e => { try { e.importMermaid(ui.mermaid.src, undefined, { elbow: ui.mermaid.elbow }); } catch (x) { err = x; } });
           if (err) toast(String(err.message ?? err)); else close();
-        } }, "Insert as shapes")))));
+        } }, "Insert as shapes")));
+      replace(d, h("div.dialog-veil", { onclick: e => { if (e.target === e.currentTarget) close(); }, onkeydown: e => dialogTrap?.handleKeyDown(e) }, dlg));
+      dialogTrap = trapFocus(dlg, { onEscape: close, returnFocusTo: dialogOpener?.el ?? canvas, focusOnActivate: !rebuilding });
       mermaidPreview(cv);
     } else if (ui.dialog === "export" && S.role === "presenter") {
+      dialogTrap?.deactivate({ restoreFocus: false });
       const cv = h("canvas"), x = ui.export, set = (k, v) => { x[k] = v; rebuildDialog(d); };
-      replace(d, h("div.dialog-veil", { onclick: e => { if (e.target === e.currentTarget) close(); } }, h("div.dialog", { style: { width: "min(520px,100%)" }, role: "dialog", "aria-label": "Export the board" },
-        h("h2", {}, icon("export", { size: 17 }), " Export the board", h("span.spacer"), h("button.tb", { onclick: close, title: "Close", "aria-label": "Close" }, icon("close", { size: 16 }))),
+      const dlg = h("div.dialog", { style: { width: "min(520px,100%)" }, role: "dialog", "aria-modal": "true", "aria-labelledby": "export-dialog-title", "aria-label": "Export the board", tabindex: "-1" },
+        h("h2", { id: "export-dialog-title" }, icon("export", { size: 17 }), " Export the board", h("span.spacer"), h("button.tb", { onclick: close, title: "Close", "aria-label": "Close" }, icon("close", { size: 16 }))),
         h("div.dbody", {}, h("div.preview", { style: { minHeight: "120px" } }, cv),
           h("div.row", {}, h("span.lab", {}, "Format"), h("span.opts", {}, chip("SVG", x.format === "svg", () => set("format", "svg")), chip("PNG", x.format === "png", () => set("format", "png")), chip(".excalidraw", x.format === "excalidraw", () => set("format", "excalidraw")))),
           x.format !== "excalidraw" ? h("div.row", {}, h("span.lab", {}, "Scale"), h("span.opts", {}, chip("1×", x.scale === 1, () => set("scale", 1)), chip("2×", x.scale === 2, () => set("scale", 2)))) : null,
@@ -1081,9 +1205,16 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
           h("div.hint", {}, x.format === "excalidraw"
             ? "Excalidraw v2 JSON with embedded images. Opens directly in excalidraw.com or Plenary."
             : "The board stream only, cropped to what's drawn, 32 units of padding. Notes, selection, cursors and comments never show.")),
-        h("footer", {}, h("button.btn", { onclick: close }, "Cancel"), h("button.btn.primary", { onclick: () => { download(); close(); } }, "Download")))));
+        h("footer", {}, h("button.btn", { onclick: close }, "Cancel"), h("button.btn.primary", { onclick: () => { download(); close(); } }, "Download")));
+      replace(d, h("div.dialog-veil", { onclick: e => { if (e.target === e.currentTarget) close(); }, onkeydown: e => dialogTrap?.handleKeyDown(e) }, dlg));
+      dialogTrap = trapFocus(dlg, { onEscape: close, returnFocusTo: dialogOpener?.el ?? canvas, focusOnActivate: !rebuilding });
       exportPreview(cv);
-    } else { ui.dialog = null; d.replaceChildren(); }
+    } else {
+      dialogTrap?.deactivate({ restoreFocus: false });
+      dialogTrap = null;
+      ui.dialog = null;
+      d.replaceChildren();
+    }
   }
 
   // Sign in again (C-9): a link (so it reads as one and opens in a new tab if asked), whose click remembers this
@@ -1355,9 +1486,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   function openAdminShare() {
     if (!admin) return null;
     cancelActiveSampler();
-    ui.dialog = null;
-    ui.sheet = null;
-    activeShare?.destroy();
+    const savedOpener = captureOpener();
+    dismissOverlays();
     activeShare = mountShareDialog({
       root: $("#dialogs"),
       board,
@@ -1366,7 +1496,12 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       isAdmin: S.effective === "owner",
       admin,
       origin: globalThis.location?.origin ?? "",
-      onClose: () => { activeShare = null; chromeDirty = true; canvas.focus(); },
+      onClose: () => {
+        activeShare = null;
+        chromeDirty = true;
+        const active = document.activeElement;
+        if (!active || active === document.body || active.isConnected === false) restoreOpener(savedOpener, canvas);
+      },
     });
     chromeDirty = true;
     return activeShare;

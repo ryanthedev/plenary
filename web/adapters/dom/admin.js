@@ -5,6 +5,7 @@
 // Untrusted text (titles, emails, actors, errors) goes strictly through textContent via h(), never innerHTML.
 
 import { h, replace } from "./dom.js";
+import { trapFocus } from "./a11y.js";
 
 const STYLE_ID = "plenary-admin-styles";
 
@@ -607,23 +608,23 @@ export function mountShareDialog({ root, board, boardTitle = null, role = null, 
   };
 
   let closed = false;
+  let trap = null;
   const veil = h("div.adm-veil", {
     onclick: e => { if (e.target === veil) close(); },
+    onkeydown: e => trap?.handleKeyDown(e),
   });
-  const modal = h("div.adm-modal", { role: "dialog", "aria-modal": "true", "aria-label": `Share ${boardTitle || board}` });
+  const modal = h("div.adm-modal", { role: "dialog", "aria-modal": "true", "aria-label": `Share ${boardTitle || board}`, tabindex: "-1" });
   veil.append(modal);
   root.append(veil);
-
-  const onKey = e => { if (e.key === "Escape") { e.preventDefault?.(); close(); } };
-  document.addEventListener?.("keydown", onKey);
 
   function close() {
     if (closed) return;
     closed = true;
-    document.removeEventListener?.("keydown", onKey);
+    trap?.deactivate({ restoreFocus: true });
     veil.remove();
     onClose?.();
   }
+  trap = trapFocus(modal, { onEscape: close });
 
   async function loadLinks() {
     state.linksLoading = true; state.error = null; render();

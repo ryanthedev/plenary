@@ -23,7 +23,7 @@ afterAll(async () => {
 
 function gw(bus, id) {
   const got = [], n = new Map();
-  bus.subscribe(subjects.gateway(id), m => got.push({ at: performance.now(), conn: m.conn, close: m.close, msg: m.data ? JSON.parse(m.data) : null }));
+  bus.subscribe(subjects.gateway(T, B, id), m => got.push({ at: performance.now(), conn: m.conn, close: m.close, msg: m.data ? JSON.parse(m.data) : null }));
   const send = (conn, client, msg) => { const k = (n.get(conn) ?? 0) + 1; n.set(conn, k); return bus.publish(subjects.inbox(T, B), { n: k, conn, gateway: id, user: "dev:ed", name: "ed", role: "editor", client, msg }); };
   return {
     got, of: c => got.filter(m => m.conn === c),

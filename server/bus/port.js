@@ -40,8 +40,8 @@ export const subjects = {
   inbox: (tenant, board) => `plen.${needId(tenant, "tenant")}.${needId(board, "board")}.inbox`,
   /** Anyone who changes a board's grants, invites or links → gateways: { board }. Gateways re-check their connections' roles. */
   grants: (tenant, board) => `plen.${needId(tenant, "tenant")}.${needId(board, "board")}.grants`,
-  /** Room → gateway: { conn, data, close? } (welcome, ack, error only). SEAM(p4): § Bus names it per board, `plen.<tenant>.<board>.gw.<gateway>`. */
-  gateway: gateway => `plen-gw.${needId(gateway, "gateway")}`,
+  /** Room → gateway: { conn, data, close? } (welcome, ack, error only), per board (§ Bus). */
+  gateway: (tenant, board, gateway) => `plen.${needId(tenant, "tenant")}.${needId(board, "board")}.gw.${needId(gateway, "gateway")}`,
   /** Gateway-only node → every room host: { tenant, board, gateway, n } "make sure this board is served" (p4-wire). */
   open: "plen-hosts.open",
   /** Room host → the requester that asked: { n, board, state: "held" | "watching" }, after its local open settled. */

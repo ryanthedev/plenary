@@ -23,7 +23,7 @@ const never = () => new Promise(() => {});
 /** A gateway as the room host sees it over the bus: inbox messages out, `{ conn, data, close }` replies in. */
 function fakeGateway(bus, id = "g-1") {
   const got = [], n = new Map();
-  bus.subscribe(subjects.gateway(id), m => got.push({ conn: m.conn, close: m.close, msg: m.data ? JSON.parse(m.data) : null }));
+  bus.subscribe(subjects.gateway(T, B, id), m => got.push({ conn: m.conn, close: m.close, msg: m.data ? JSON.parse(m.data) : null }));
   const send = (conn, client, msg) => { const k = (n.get(conn) ?? 0) + 1; n.set(conn, k); return bus.publish(subjects.inbox(T, B), { n: k, conn, gateway: id, user: "dev:ed", name: "ed", role: "editor", client, msg }); };
   return {
     got,
@@ -302,7 +302,7 @@ test("HIGH-1: a holder woken from a stall past its deadline serves nothing that 
   const bus = memoryBus();
   const busA = {
     ...bus,
-    publish: (s, m) => { if (s.startsWith("plen-gw.")) fromA.push(m); return bus.publish(s, m); },
+    publish: (s, m) => { if (s.includes(".gw.")) fromA.push(m); return bus.publish(s, m); },
     subscribe: (s, fn) => bus.subscribe(s, m => (frozen ? queued.push(() => fn(m)) : fn(m))),
   };
   const sa = stallable(raw);

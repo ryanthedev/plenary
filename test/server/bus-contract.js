@@ -92,7 +92,7 @@ export function busContract(label, makeBus, { skip = false } = {}) {
   });
 
   t(`${label}: plain data arrives equal, including a top-level byte field`, async () => {
-    const bus = await make(), got = [], s = subjects.gateway(`${tenant}-gw`);
+    const bus = await make(), got = [], s = subjects.gateway(tenant, "b-1", `${tenant}-gw`);
     bus.subscribe(s, m => got.push(m));
     await bus.flush();
     const msgs = [

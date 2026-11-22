@@ -95,7 +95,7 @@ test("an op from a connection the rebuilt room never welcomed gets `unavailable`
   // the rebuilt room must refuse them by connection, whatever their `n`. Replay b's own envelope at the next n.
   const env = r.inbox.find(m => m.client === "b" && m.msg?.t === "hello");
   const replies = [];
-  r.bus.subscribe(subjects.gateway(r.server.gateway.id), m => replies.push(m));
+  r.bus.subscribe(subjects.gateway(r.ids.tenant, r.ids.board, r.server.gateway.id), m => replies.push(m));
   await r.bus.publish(subjects.inbox(r.ids.tenant, r.ids.board), { ...env, n: 2, msg: op("b", 1, rect("y")) });
   await r.idle();
   expect(await r.rawStore.lastSeq(r.ids.tenant, r.ids.board)).toBe(0);

@@ -183,7 +183,7 @@ test("L3: a gateway silent past 30 s (injected clock) loses its connections in t
   const got = [];
   const gw = id => {
     let n = 0;
-    bus.subscribe(subjects.gateway(id), m => got.push({ gw: id, conn: m.conn, msg: m.data ? JSON.parse(m.data) : null }));
+    bus.subscribe(subjects.gateway(T, B, id), m => got.push({ gw: id, conn: m.conn, msg: m.data ? JSON.parse(m.data) : null }));
     return {
       hello: (conn, client) => bus.publish(subjects.inbox(T, B), { n: 1, conn, gateway: id, user: "dev:ed", name: "ed", role: "editor", client, msg: { t: "hello", v: PROTOCOL_VERSION, board: B, client } }),
       list: conns => bus.publish(subjects.inbox(T, B), { gateway: id, conns, n: ++n }),

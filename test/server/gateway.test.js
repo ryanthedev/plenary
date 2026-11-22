@@ -106,7 +106,7 @@ test("slow auth: ops after welcome are acked in order and numbered per connectio
 test("rule 11: an op that arrives before its connection's welcome gets `auth` with its id, and never reaches the room", async () => {
   const { subjects } = await import("../../server/bus/port.js");
   // The room's replies to this gateway arrive 150 ms late, so the op behind the hello is read before the welcome.
-  const r = await rig({ wrapBus: b => ({ ...b, subscribe: (subject, fn) => b.subscribe(subject, subject.startsWith("plen-gw.") ? m => setTimeout(() => fn(m), 150) : fn) }) });
+  const r = await rig({ wrapBus: b => ({ ...b, subscribe: (subject, fn) => b.subscribe(subject, subject.includes(".gw.") ? m => setTimeout(() => fn(m), 150) : fn) }) });
   const s = await r.sock();
   s.send(hello(r, "editor"));
   s.send({ t: "op", id: "raw:1", sentAt: 0, stream: "board", op: { elements: [rect("a")] } });
@@ -115,7 +115,7 @@ test("rule 11: an op that arrives before its connection's welcome gets `auth` wi
   await r.idle();
   expect(r.inbox.map(m => m.msg?.t)).toEqual(["hello"]);
   expect(await r.store.lastSeq(r.ids.tenant, r.ids.board)).toBe(0);
-  expect(subjects.gateway("g-x")).toBe("plen-gw.g-x");
+  expect(subjects.gateway("t-a", "b-1", "g-x")).toBe("plen.t-a.b-1.gw.g-x");
   await r.stop();
 });
 

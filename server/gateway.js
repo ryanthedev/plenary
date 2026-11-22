@@ -380,9 +380,10 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
   }
 
   // Room → gateway: { conn, data?, close? }: `welcome`, `ack`, `error` only (§ Bus), encoded once by the room host.
-  const unsub = bus.subscribe(subjects.gateway(id), m => {
+  // Subscribed per board in joinBoard (plen.<tenant>.<board>.gw.<gateway>) so one board's reply can only touch its own connections.
+  function onGatewayReply(b, m) {
     const ws = conns.get(m?.conn);
-    if (!ws || ws.data.state !== "live") return;
+    if (!ws || ws.data.state !== "live" || ws.data.b !== b) return;
     const c = ws.data;
     if (m.data !== undefined && typeof m.data !== "string" && !(m.data instanceof Uint8Array)) return;
     if (!c.welcomed && !c.welcoming && m.data !== undefined) {
@@ -402,7 +403,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       return end(ws, m.close, m.close === 1008 ? "refused by the room" : "closed by the room");
     }
     if (m.data !== undefined) push(ws, m.data);
-  });
+  }
 
   // The sweep: re-reads every socket (drain events are the fast path; this is the safety net), restarts queues
   // whose socket emptied, and closes readers that are owed bytes and have drained none for stallMs. What a
@@ -470,6 +471,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
         // `here` (§ Presence): this gateway's writer users and viewer connections, the latest `.here` per gateway, what was sent.
         hw: new Map(), hv: 0, hvTabs: new Map(), hFrom: new Map(), hChanged: false, hPubAt: 0, hText: null, hCountText: null, hKey: null, hVer: 0, hOut: false, hSentAt: 0, hSending: false };
       b.feed = feedOf({ tenant, board, store, bus, log, codec, onLive: e => onLive(b, e), ...lim.feed });
+      b.unsubs.push(bus.subscribe(subjects.gateway(tenant, board, id), m => onGatewayReply(b, m)));
       b.unsubs.push(bus.subscribe(subjects.presence(tenant, board), m => {
         if (!m || typeof m.user !== "string" || typeof m.client !== "string") return;
         const forViewer = m.role === "owner" || m.role === "editor" || (!m.leave && m.msg?.k === "emote");
@@ -1168,7 +1170,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     /** Re-check every connection's role on a board now: `grants` (what a grants message does) or `timed` (the timer). */
     recheck: async (board, kind = "grants") => { for (const b of [...boards.values()]) if (b.board === board) await requestRecheck(b, kind === "timed" ? "timed" : "grants"); },
     async close() {
-      clearInterval(sweep); clearInterval(presenceTimer); clearInterval(emoteTimer); clearInterval(listTimer); clearInterval(roleTimer); clearInterval(hereTimer); unsub();
+      clearInterval(sweep); clearInterval(presenceTimer); clearInterval(emoteTimer); clearInterval(listTimer); clearInterval(roleTimer); clearInterval(hereTimer);
       for (const b of boards.values()) { clearTimeout(b.rc.retryTimer); b.rc.retryTimer = null; }
       for (const ws of [...conns.values()]) end(ws, 1001, "server closing");
     },

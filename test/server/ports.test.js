@@ -106,10 +106,13 @@ test("bus: subjects are per board and per kind; ids can't widen them", () => {
   expect(subjects.presence("t-a", "b-1")).toBe("plen.t-a.b-1.presence");
   expect(subjects.inbox("t-a", "b-1")).toBe("plen.t-a.b-1.inbox");
   expect(subjects.emotes("t-a", "b-1")).toBe("plen.t-a.b-1.emotes");
+  expect(subjects.gateway("t-a", "b-1", "g-1")).toBe("plen.t-a.b-1.gw.g-1");
   for (const bad of ["*", ">", "a.b", "", "t a", "A", null]) {
     expect(() => subjects.entries(bad, "b-1")).toThrow();
     expect(() => subjects.inbox("t-a", bad)).toThrow();
-    expect(() => subjects.gateway(bad)).toThrow();
+    expect(() => subjects.gateway(bad, "b-1", "g-1")).toThrow();
+    expect(() => subjects.gateway("t-a", bad, "g-1")).toThrow();
+    expect(() => subjects.gateway("t-a", "b-1", bad)).toThrow();
   }
 });
 

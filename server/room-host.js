@@ -119,9 +119,9 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   let closed = false;
   const closedError = () => new PortError("closed", "the room host is closed");
 
-  const reply = (gateway, conn, data, close) => {
-    try { bus.publish(subjects.gateway(gateway), { conn, ...(data !== undefined ? { data } : {}), ...(close ? { close } : {}) })?.catch?.(() => {}); }
-    catch { /* a bad gateway id: nobody to tell */ }
+  const reply = (tenant, board, gateway, conn, data, close) => {
+    try { bus.publish(subjects.gateway(tenant, board, gateway), { conn, ...(data !== undefined ? { data } : {}), ...(close ? { close } : {}) })?.catch?.(() => {}); }
+    catch { /* a bad id: nobody to tell */ }
   };
   const UNAVAILABLE = codec.encode({ t: "error", code: "unavailable", message: "the board is restarting: reconnect" });
 
@@ -362,7 +362,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     watches.delete(key); clearTimeout(w.timer); clearTimeout(w.silence); w.unsubEntries(); w.unsubInbox();
     if (answer) answerHeld(w);
   }
-  function answerHeld(w) { for (const h of w.pending.splice(0)) reply(h.gateway, h.conn, UNAVAILABLE, 1013); }
+  function answerHeld(w) { for (const h of w.pending.splice(0)) reply(w.tenant, w.board, h.gateway, h.conn, UNAVAILABLE, 1013); }
   /**
    * The holder's `.entries`: it is alive. A heartbeat from a holder that just opened (`opened`, or an epoch above the
    * last one heard) means the hellos held here reached nobody (its room subscribed after them): answer them
@@ -389,7 +389,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     if (!m || typeof m.gateway !== "string") return;
     w.wanted = perf();   // some gateway has writers on this board: keep watching it
     if (typeof m.conn !== "string" || m.closed || m.msg?.t !== "hello") return;
-    if (perf() - w.heardAt > silentAfter || w.pending.length >= 1_000) return reply(m.gateway, m.conn, UNAVAILABLE, 1013);
+    if (perf() - w.heardAt > silentAfter || w.pending.length >= 1_000) return reply(w.tenant, w.board, m.gateway, m.conn, UNAVAILABLE, 1013);
     w.pending.push({ gateway: m.gateway, conn: m.conn });
   }
   /** 2 heartbeats with nothing heard: the holder is silent. Answer the held hellos and try to take the board now. */
@@ -442,7 +442,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     try { slot.room?.fail(new PortError("stopped", "the room host stopped this room")); } catch { /* already stopped */ }
     // A lost lease tells only the connections this slot welcomed (HIGH-1): any other hello on the board is the new
     // holder's or a watcher's to answer.
-    for (const [ck, c] of slot.conns) if (!slot.leaseLost || slot.welcomed.has(ck)) reply(c.gateway, c.id, UNAVAILABLE, 1013);
+    for (const [ck, c] of slot.conns) if (!slot.leaseLost || slot.welcomed.has(ck)) reply(slot.tenant, slot.board, c.gateway, c.id, UNAVAILABLE, 1013);
     slot.conns.clear(); slot.welcomed.clear();
   }
 
@@ -456,7 +456,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       if (expired(slot)) return lost(slot, "the host deadline passed before a reply");
       if (msg.t === "welcome") slot.welcomed.add(ck);
       const end = msg.t === "error" && msg.code === "unavailable";   // every unavailable ends the connection
-      reply(gateway, conn, codec.encode(msg), end ? 1013 : undefined);
+      reply(slot.tenant, slot.board, gateway, conn, codec.encode(msg), end ? 1013 : undefined);
       if (end) { drop(slot, ck); if (!c.closed) slot.room.disconnect(c); }
     }, { gateway, id: conn });
     slot.conns.set(ck, c);
@@ -479,7 +479,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     }
     if (typeof m.conn !== "string") return;
     const ck = `${m.gateway}/${m.conn}`;
-    if (slot.dead) { if (!m.closed) reply(m.gateway, m.conn, UNAVAILABLE, 1013); return; }
+    if (slot.dead) { if (!m.closed) reply(slot.tenant, slot.board, m.gateway, m.conn, UNAVAILABLE, 1013); return; }
     let c = slot.conns.get(ck);
     if (m.closed) { if (c) { room.disconnect(c); drop(slot, ck); } return; }
     const msg = m.msg;
@@ -487,7 +487,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     if (!c && msg.t === "hello") c = connect(slot, m.gateway, m.conn);
     // Not a hello and not known: a connection this room never welcomed (rule 6). The Room answers `unavailable`
     // (with the op's id) to a connection it doesn't hold; the reply carries the close.
-    if (!c) c = { send: out => reply(m.gateway, m.conn, codec.encode(out), 1013), gateway: m.gateway, id: m.conn, closed: true };
+    if (!c) c = { send: out => reply(slot.tenant, slot.board, m.gateway, m.conn, codec.encode(out), 1013), gateway: m.gateway, id: m.conn, closed: true };
     // What "accepted something" looks like from outside: a new seq, or an op counted as unresolved (the Room counts
     // it just before it applies the entry, so a throw mid-apply shows here even though seq hasn't moved).
     const mark = () => { const st = room.status(); return st.seq + st.unresolvedCount; };
@@ -501,11 +501,11 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       // Nothing was accepted: only the sender hears. The message counts as received (rule 6), so the connection's
       // next one is no gap. A hello that blew up leaves no half-open connection.
       if (Number.isSafeInteger(m.n) && Number.isSafeInteger(c.n) && m.n > c.n) c.n = m.n;
-      if (isHello) { room.disconnect(c); drop(slot, ck); return reply(m.gateway, m.conn, UNAVAILABLE, 1013); }
-      return reply(m.gateway, m.conn, codec.encode({ t: "error", ...(typeof msg.id === "string" ? { id: msg.id.slice(0, 256) } : {}), code: "bad-op", message: "that message could not be handled" }));
+      if (isHello) { room.disconnect(c); drop(slot, ck); return reply(slot.tenant, slot.board, m.gateway, m.conn, UNAVAILABLE, 1013); }
+      return reply(slot.tenant, slot.board, m.gateway, m.conn, codec.encode({ t: "error", ...(typeof msg.id === "string" ? { id: msg.id.slice(0, 256) } : {}), code: "bad-op", message: "that message could not be handled" }));
     }
     // A refused hello (version, board, client id): the Room dropped it; the gateway closes the socket after the error.
-    if (isHello && c.closed && slot.conns.get(ck) === c) { drop(slot, ck); reply(m.gateway, m.conn, undefined, 1008); }
+    if (isHello && c.closed && slot.conns.get(ck) === c) { drop(slot, ck); reply(slot.tenant, slot.board, m.gateway, m.conn, undefined, 1008); }
   }
 
   const sweep = setInterval(() => {

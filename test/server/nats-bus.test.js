@@ -122,7 +122,7 @@ nt("nats: wildcards and malformed subjects are refused on publish and subscribe"
     expect(await code(bus.publish(bad, 1))).toBe("bad-id");
     expect(() => bus.subscribe(bad, () => {})).toThrow();
   }
-  expect(() => bus.subscribe(subjects.gateway("gw-1"), () => {})).not.toThrow();   // plen-gw.<id> today (SEAM p4)
+  expect(() => bus.subscribe(subjects.gateway("t-a", "b-1", "gw-1"), () => {})).not.toThrow();
 });
 
 nt("nats: a wildcard listener elsewhere would hear us, but our subscribe can't be widened", async () => {

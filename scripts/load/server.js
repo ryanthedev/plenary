@@ -1,5 +1,7 @@
-// Start one single-node server (server/main.js) for a load run or a test: port 0, a data dir, dev tokens from a
-// tokens file (never on argv or stdout). Returns its PID, port, URLs and the dev board id it logged.
+// Start one single-node server (server/main.js) for a load run or a test: a free port, a data dir, dev tokens from a
+// tokens file (never on argv or stdout). Ready when GET /health answers (and its dev-tokens log line, which names
+// the dev board, is in). Returns its PID, port, URLs and the dev board id it logged. Its data and working dirs are
+// temp dirs removed when it stops (or dies as an orphan) unless `keep`.
 //
 // The child runs in an empty temp cwd, so Bun's .env auto-load never pulls a checkout's .env into it, and through
 // `sh -c 'ulimit -n N; exec bun …'` so it can hold many sockets. Its stdout (JSON log lines) is kept in memory
@@ -10,68 +12,110 @@
 // not (run.js was SIGKILLed, or died before the server started), it sends itself SIGTERM (server/main.js's own clean
 // stop) and exits after 5 s if that did not end it. server/main.js itself is not changed.
 
-import { mkdtempSync, readFileSync, createWriteStream } from "node:fs";
+import { mkdtempSync, readFileSync, createWriteStream, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const MAIN = resolve(import.meta.dir, "../../server/main.js");
 const SELF = import.meta.path;
 export const ORPHAN_CHECK_MS = 500;
+export const SPAWN_TIMEOUT_MS = 5000;   // every ps / sh / sysctl call this tooling makes is bounded
+export const HEAD_BYTES = 256 * 1024;          // the head of the server's stdout / stderr kept in memory (the log file gets all)
+
+/** Resolve true if the child exits within ms, false if not (it never rejects, never waits longer than ms). */
+export function exitedWithin(c, ms) {
+  let t;
+  return Promise.race([c.exited.then(() => true, () => true), new Promise(r => { t = setTimeout(r, ms, false); })]).finally(() => clearTimeout(t));
+}
 
 /**
- * @param {{ tokensPath: string, dataDir?: string, env?: Record<string,string>, nofile?: number, logPath?: string, timeoutMs?: number, onChild?: (child: any) => void }} o
+ * Stop a child process, bounded: SIGTERM, SIGKILL after graceMs, and give up waiting finalMs after that (a process
+ * that survives SIGKILL, in uninterruptible sleep, must not hang the run). Resolves true if it exited.
+ */
+export async function stopChild(c, graceMs = 5000, finalMs = 2000) {
+  if (c.exitCode !== null || c.signalCode) return true;
+  try { c.kill("SIGTERM"); } catch { /* gone */ }
+  if (await exitedWithin(c, graceMs)) return true;
+  try { c.kill("SIGKILL"); } catch { /* gone */ }
+  return exitedWithin(c, finalMs);
+}
+
+/** A port nothing listens on right now (port 0, read back, released). */
+function freePort() {
+  const s = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
+  const port = s.port; s.stop(true); return port;
+}
+
+/**
+ * @param {{ tokensPath: string, dataDir?: string, env?: Record<string,string>, nofile?: number, logPath?: string, timeoutMs?: number, keep?: boolean, onChild?: (child: any) => void }} o
  *   onChild: called with the child process as soon as it is spawned, before the server is up (a caller that must
  *   stop it on a signal can't wait for this function to return).
- * @returns {Promise<{ pid: number, port: number, httpUrl: string, wsUrl: string, board: string, dataDir: string, child: any, lines: () => object[], stop: () => Promise<void> }>}
+ *   main: the server script (server/main.js; a test passes a stub to prove readiness comes from /health).
+ *   alsoClean: more dirs to remove with the server's own, also when it dies as an orphan (the run's own dir).
+ *   onCleanup: called with the cleanup function as soon as the dirs exist (a caller stopped by a signal during startup
+ *   must remove them; it has no server object yet).
+ *   keep: leave the server's data dir (when this function made it) and its working dir on disk after stop(); by
+ *   default both are removed when the server stops, and also when it exits as an orphan (see below).
+ * @returns {Promise<{ pid: number, port: number, httpUrl: string, wsUrl: string, board: string, dataDir: string, cwd: string, child: any, lines: () => object[], stop: () => Promise<void> }>}
  */
-export async function startServer({ tokensPath, dataDir, env = {}, nofile = 65536, logPath, timeoutMs = 20000, onChild }) {
+export async function startServer({ tokensPath, dataDir, env = {}, nofile = 65536, logPath, timeoutMs = 20000, keep = false, main = MAIN, alsoClean = [], onChild, onCleanup }) {
+  const tokens = readFileSync(tokensPath, "utf8");   // first: a bad path leaves nothing behind
+  const ownData = !dataDir;
   dataDir ??= mkdtempSync(join(tmpdir(), "plenary-load-data-"));
   const cwd = mkdtempSync(join(tmpdir(), "plenary-load-cwd-"));
-  const childEnv = {
-    PATH: process.env.PATH, HOME: process.env.HOME, PORT: "0", PLENARY_DATA_DIR: dataDir, LOG_LEVEL: "info",
-    PLENARY_DEV_TOKENS: readFileSync(tokensPath, "utf8"), ...env, PLENARY_LOAD_PARENT: String(process.pid),
-  };
-  // exec: the PID we get (and sample, and stop) is the server's own.
-  const child = Bun.spawn(["sh", "-c", `ulimit -n ${Math.floor(nofile)} 2>/dev/null; exec "$0" --preload "$2" "$1"`, process.execPath, MAIN, SELF], { cwd, env: childEnv, stdout: "pipe", stderr: "pipe" });
-  onChild?.(child);
-  const out = { text: "", err: "" };
+  const scratch = keep ? [] : [cwd, ...(ownData ? [dataDir] : []), ...alsoClean];
+  const cleanup = () => { for (const d of scratch) try { rmSync(d, { recursive: true, force: true }); } catch { /* gone */ } };
+  onCleanup?.(cleanup);   // before anything can fail or be signalled: the caller can clean up from here on
   const file = logPath ? createWriteStream(logPath, { mode: 0o600 }) : null;
-  const pump = async (stream, k) => {
-    const dec = new TextDecoder();
-    for await (const chunk of stream) {
-      const s = dec.decode(chunk, { stream: true });
-      // Keep only the head of stdout in memory (a long run logs a lot); the file gets everything.
-      if (out[k].length < 4_000_000) out[k] += s;
-      file?.write(s);
-    }
-  };
-  pump(child.stdout, "text"); pump(child.stderr, "err");
-  const lines = () => out.text.split("\n").filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-  const until = async (msg) => {
-    const end = Date.now() + timeoutMs;
-    while (Date.now() < end) {
-      const all = lines(), hit = all.find(l => l.msg === msg);
-      if (hit) return hit;
-      // The server refused the tokens (server/main.js logs a fixed sentence, no token): say so now, not after the timeout.
-      const refused = all.find(l => typeof l.msg === "string" && l.msg.startsWith("PLENARY_DEV_TOKENS "));
-      if (refused) throw new Error(`the server rejected the tokens file ${tokensPath}: "${refused.msg}"`);
-      if (child.exitCode !== null) throw new Error(`server exited (${child.exitCode}) before "${msg}"; stderr: ${out.err.slice(0, 300)}`);
-      await Bun.sleep(25);
-    }
-    throw new Error(`server: no "${msg}" log line within ${timeoutMs} ms`);
-  };
-  try {
-    const { port } = await until("server listening");
-    const { board } = await until("dev tokens are ON: not for production");
-    return {
-      pid: child.pid, port, board, dataDir, child, out, lines,
-      httpUrl: `http://127.0.0.1:${port}`, wsUrl: `ws://127.0.0.1:${port}/ws`,
-      async stop() {
-        if (child.exitCode === null) { child.kill("SIGTERM"); const t = setTimeout(() => child.kill("SIGKILL"), 5000); await child.exited; clearTimeout(t); }
-        file?.end();
-      },
+  let lastErr;
+  // The port is picked here (read back from a bound port 0), so readiness is an HTTP /health answer, not a log line.
+  // A port taken in between makes the server exit at once: try again, at most twice more.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const port = freePort();
+    const childEnv = {
+      PATH: process.env.PATH, HOME: process.env.HOME, PORT: String(port), PLENARY_DATA_DIR: dataDir, LOG_LEVEL: "info",
+      PLENARY_DEV_TOKENS: tokens, ...env, PLENARY_LOAD_PARENT: String(process.pid), PLENARY_LOAD_CLEAN: JSON.stringify(scratch),
     };
-  } catch (err) { child.kill("SIGKILL"); await child.exited; file?.end(); throw err; }
+    // exec: the PID we get (and sample, and stop) is the server's own.
+    const child = Bun.spawn(["sh", "-c", `ulimit -n ${Math.floor(nofile)} 2>/dev/null; exec "$0" --preload "$2" "$1"`, process.execPath, main, SELF], { cwd, env: childEnv, stdout: "pipe", stderr: "pipe" });
+    onChild?.(child);
+    const out = { text: "", err: "" };
+    const pump = async (stream, k) => {
+      const dec = new TextDecoder();
+      for await (const chunk of stream) {
+        const s = dec.decode(chunk, { stream: true });
+        if (out[k].length < HEAD_BYTES) out[k] = (out[k] + s).slice(0, HEAD_BYTES);   // only the head, cut at the cap exactly (a chunk's size depends on the load): a long run logs a lot (and must still be drained)
+        file?.write(s);
+      }
+    };
+    pump(child.stdout, "text"); pump(child.stderr, "err");
+    const lines = () => out.text.split("\n").filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const httpUrl = `http://127.0.0.1:${port}`;
+    const end = Date.now() + timeoutMs;
+    try {
+      let up = false, board = null;
+      while (Date.now() < end) {
+        // The server refused the tokens (server/main.js logs a fixed sentence, no token): say so now, not after the timeout.
+        const all = lines(), refused = all.find(l => typeof l.msg === "string" && l.msg.startsWith("PLENARY_DEV_TOKENS "));
+        if (refused) throw new Error(`the server rejected the tokens file ${tokensPath}: "${refused.msg}"`);
+        board = all.find(l => l.msg === "dev tokens are ON: not for production")?.board ?? null;
+        if (up && board) break;
+        if (child.exitCode !== null) { const e = new Error(`server exited (${child.exitCode}) before it answered /health; stderr: ${out.err.slice(0, 300)}`); e.early = true; throw e; }
+        if (!up) up = await fetch(`${httpUrl}/health`, { signal: AbortSignal.timeout(500) }).then(r => r.ok, () => false);
+        if (!(up && board)) await Bun.sleep(25);
+      }
+      if (!up || !board) throw new Error(`server: ${up ? "no dev-tokens log line" : "/health did not answer"} within ${timeoutMs} ms`);
+      return {
+        pid: child.pid, port, board, dataDir, cwd, child, out, lines, httpUrl, wsUrl: `ws://127.0.0.1:${port}/ws`, cleanup,
+        async stop() { await stopChild(child); file?.end(); cleanup(); },
+      };
+    } catch (err) {
+      await stopChild(child, 0, 2000); lastErr = err;
+      if (!err.early || child.signalCode || attempt === 2) break;   // stopped from outside (a signal): do not start another
+    }
+  }
+  file?.end(); cleanup();
+  throw lastErr;
 }
 
 /**
@@ -79,7 +123,7 @@ export async function startServer({ tokensPath, dataDir, env = {}, nofile = 6553
  * difference of two samples (cpuPct): macOS's own `ps %cpu` is a decaying average that hides saturation.
  */
 export function psSample(pid) {
-  const r = Bun.spawnSync(["ps", "-o", "time=,rss=", "-p", String(pid)]);
+  const r = Bun.spawnSync(["ps", "-o", "time=,rss=", "-p", String(pid)], { timeout: SPAWN_TIMEOUT_MS });
   const s = r.stdout.toString().trim();
   if (!s) return null;
   const [time, rss] = s.split(/\s+/);
@@ -106,6 +150,8 @@ if (loadParent > 0 && loadParent !== process.pid && Bun.main === MAIN) {
   const watch = setInterval(() => {
     if (process.ppid === loadParent) return;
     clearInterval(watch);
+    // Orphaned: the server's own dirs (the starter's list) go with it, whichever way it ends (its clean stop, or the 5 s exit).
+    process.on("exit", () => { try { for (const d of JSON.parse(process.env.PLENARY_LOAD_CLEAN || "[]")) rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ } });
     process.kill(process.pid, "SIGTERM");
     setTimeout(() => process.exit(1), 5000).unref?.();
   }, ORPHAN_CHECK_MS);

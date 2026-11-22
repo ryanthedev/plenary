@@ -1,9 +1,10 @@
 // `bun server/main.js` as a child process: it starts, logs JSON lines without secrets, serves /health and a
 // socket, survives bad frames, and shuts down on SIGTERM.
 import { test, expect, afterAll } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { tempDir, cleanup, until } from "./helpers.js";
+import { inflateSync } from "node:zlib";
+import { tempDir, cleanup, until, spawnTracked } from "./helpers.js";
 import { sock } from "./rig.js";
 import { sqliteStore } from "../../server/store/sqlite.js";
 
@@ -13,7 +14,7 @@ const TOKEN = "S3CR3T-main-token";
 
 function spawn(env) {
   // cwd: an empty temp dir, so Bun's .env auto-load finds nothing (a checkout's .env never reaches the child).
-  const child = Bun.spawn([process.execPath, MAIN], { cwd: tempDir("plenary-main-cwd-"), env: { PATH: process.env.PATH, HOME: process.env.HOME, PORT: "0", ...env }, stdout: "pipe", stderr: "pipe" });
+  const child = spawnTracked([process.execPath, MAIN], { cwd: tempDir("plenary-main-cwd-"), env: { PATH: process.env.PATH, HOME: process.env.HOME, PORT: "0", ...env }, stdout: "pipe", stderr: "pipe" });
   const out = { text: "", err: "" };
   const pump = async (stream, key) => { const dec = new TextDecoder(); for await (const chunk of stream) out[key] += dec.decode(chunk, { stream: true }); };
   pump(child.stdout, "text"); pump(child.stderr, "err");
@@ -121,7 +122,7 @@ test("main.js started twice on one data dir: the same board, its acked ops, and 
     const acks = s.msgs.filter(m => m.t === "ack");
     a.p.child.kill("SIGTERM");
     expect(await a.p.child.exited).toBe(0);
-    expect(JSON.parse(readFileSync(join(dir, "dev-board.json"), "utf8"))).toEqual({ board: a.board });
+    expect(JSON.parse(readFileSync(join(dir, "dev-board.json"), "utf8"))).toMatchObject({ board: a.board });
 
     // Second start: ann's token now says editor (she stays owner: the board keeps its last owner), bob is promoted.
     b = await boot(dir, { ann: "editor", bob: "annotator", cy: "viewer" });
@@ -152,11 +153,12 @@ test("main.js started twice on one data dir: the same board, its acked ops, and 
 
 // A kill -9 leaves the dead process's room lease live for up to its ttl (PLENARY_LEASE_TTL_MS, passed to the child from
 // this one constant): a writer's hello in that window is answered `unavailable` (1013) or times out at the gateway,
-// and the client retries, as a real client does. Anything else is a failure, and so is no welcome within the ttl + 3 s.
-const LEASE_TTL_MS = 3_000;
+// and the client retries, as a real client does. Anything else is a failure, and so is no welcome within the ttl + 30 s (a
+// backstop). That the window is the configured ttl is checked on the lease the dead process left (below), not by a clock.
+const LEASE_TTL_MS = 3_000;   // 3 s: a node drops its room after a stall of 2/3 of its ttl, so this tolerates a 2 s event-loop stall (the ttl itself may be as low as 3 ms)
 const leaseEnv = { PLENARY_LEASE_TTL_MS: String(LEASE_TTL_MS) };
 async function welcomedAfterRestart(port, board, name) {
-  const end = Date.now() + LEASE_TTL_MS + 3_000;
+  const end = Date.now() + LEASE_TTL_MS + 30_000;
   for (;;) {
     const s = await connect(port, board, name);
     const got = await until(() => s.msgs.find(m => m.t === "welcome") ?? (s.closed ? "closed" : null), "a welcome or a close", Math.max(1, end - Date.now())).catch(() => "timeout");
@@ -165,7 +167,7 @@ async function welcomedAfterRestart(port, board, name) {
       expect(s.closed.code).toBe(1013);
       expect(s.msgs.filter(m => m.t === "error").map(m => m.code)).toEqual(["unavailable"]);
     } else s.close();
-    if (Date.now() >= end) throw new Error(`no welcome within the lease ttl + 3 s (${LEASE_TTL_MS + 3_000} ms)`);
+    if (Date.now() >= end) throw new Error(`no welcome within the lease ttl + 30 s (${LEASE_TTL_MS + 30_000} ms)`);
   }
 }
 
@@ -177,10 +179,11 @@ test("kill -9 mid-stream, restart: every acked op is present, at its seq, once; 
   let counter = 0;
   const sent = [];
   // The gateway paces ops at 20/s (burst 100) and queues the rest, up to 500 per connection (PROTOCOL.md § Pacing):
-  // keep at most 200 unacked so the queue never overflows, and resend what a reconnecting client resends (its
+  // keep at most 30 unacked, so a reconnect's resends (the unacked ones and a sample, about 60) leave most of the fresh
+  // connection's burst for new ops and a round rarely waits on the pace; and resend what a reconnecting client resends (its
   // unacked ops) plus a sample of acked ones from inside the room's op-id window (the latest W = 256 counters per
   // client, § Op ids): each must come back with its first seq, not be logged again.
-  const MAX_UNACKED = 200, unacked = () => sent.filter(m => !acked.has(m.id));
+  const MAX_UNACKED = 30, unacked = () => sent.filter(m => !acked.has(m.id));
   const counterOf = m => Number(m.id.split(":")[1]);
   const resends = () => { const top = Math.max(0, ...sent.filter(m => acked.has(m.id)).map(counterOf)); const done = sent.filter(m => acked.has(m.id) && counterOf(m) > top - 200), step = Math.max(1, Math.floor(done.length / 30)); const sample = new Set(done.filter((_, i) => i % step === 0)); return sent.filter(m => sample.has(m) || !acked.has(m.id)); };
   const op = n => ({ t: "op", id: `ann:${n}`, sentAt: 0, stream: "board", op: { elements: [{ id: "tick", type: "rectangle", version: n, versionNonce: n, x: n % 1000, y: 0, width: 1, height: 1, isDeleted: false }] } });
@@ -189,13 +192,20 @@ test("kill -9 mid-stream, restart: every acked op is present, at its seq, once; 
       // Round 0 is a fresh boot: a plain welcome. Only after a kill does the client retry (L8).
       const s = round === 0 ? await connect(cur.port, board, "ann") : await welcomedAfterRestart(cur.port, board, "ann");
       if (round === 0) await s.next(m => m.t === "welcome");
-      const record = () => { for (const m of s.msgs) if (m.t === "ack") { if (acked.has(m.id)) expect([m.id, m.seq]).toEqual([m.id, acked.get(m.id)]); acked.set(m.id, m.seq); } };
+      let seen = 0;   // each message is looked at once: a rescan of the whole list on every tick cost half a million expects
+      const record = () => { for (; seen < s.msgs.length; seen++) { const m = s.msgs[seen]; if (m.t === "ack") { if (acked.has(m.id)) expect([m.id, m.seq]).toEqual([m.id, acked.get(m.id)]); acked.set(m.id, m.seq); } } };
       for (const m of resends()) s.send(m);
       const pump = setInterval(() => { record(); for (let k = 0; k < 5 && unacked().length < MAX_UNACKED; k++) { const m = op(++counter); sent.push(m); try { s.send(m); } catch { /* socket died with the server */ } } }, 5);
       const before = acked.size;
-      await until(() => { record(); return acked.size >= before + 150; }, "150 more acks", 15000);
+      // A backstop (no speed is asserted): 15 s timed out once with the machine at load average 20-40 (other loops' runs).
+      await until(() => { record(); return acked.size >= before + 100; }, "100 more acks", 60_000);
       cur.p.child.kill("SIGKILL");                // mid-stream: ops are in flight in both directions
       await cur.p.child.exited; clearInterval(pump);
+      // The dead holder's lease, as it left it: its last renew set expiresAt = then + its ttl, so what remains is at most
+      // the ttl from PLENARY_LEASE_TTL_MS (a host on the 10 s default would leave more). Time only shrinks it: no flake.
+      const db = sqliteStore({ path: join(dir, "plenary.db") });
+      const left = await db.lease(cur.tenant, board); await db.close();
+      expect(left.remainingMs).toBeLessThanOrEqual(LEASE_TTL_MS);
       await s.whenClosed(); record();
       expect(sent.length).toBeGreaterThan(acked.size);                   // some ops really were cut off unacked
       cur = await boot(dir, { ann: "owner" }, leaseEnv);
@@ -222,10 +232,10 @@ test("kill -9 mid-stream, restart: every acked op is present, at its seq, once; 
     expect(seqOf.size).toBe(log.length);                                                  // no op logged twice
     expect(seqOf.size).toBe(sent.length);                                                 // every resend landed, once
     // No count threshold: how many acks beat each kill is timing. What must hold is durability, below.
-    expect(acked.size).toBeGreaterThanOrEqual(450);                                       // true by construction (150 a round)
+    expect(acked.size).toBeGreaterThanOrEqual(300);                                       // true by construction (100 a round; > 256, so ann:1 is out of the op-id window below)
     for (const [id, at] of acked) expect([id, seqOf.get(id)]).toEqual([id, at]);          // every acked op, at its acked seq
   } finally { cur.p.child.kill("SIGKILL"); }
-}, 90000);   // up to three lease waits (ttl + 3 s each) on top of the run
+}, 300000);   // up to three lease waits (ttl + 30 s backstop each) and three 60 s ack backstops on top of the run
 
 test("main.js: PLENARY_MAX_CONNS_PER_USER sets the per-user connection cap", async () => {
   const p = spawn({ PLENARY_DATA_DIR: tempDir(), PLENARY_DEV_TOKENS: devTokens({ ann: "editor" }), PLENARY_MAX_CONNS_PER_USER: "2" });
@@ -269,6 +279,36 @@ test("start(env): POST /boards with a dev Bearer token makes a board a socket ca
   }
 });
 
+test("start(env): the product wires compressed catch-up: /ws?z=deflate gets the big snapshot as one binary zlib frame, /ws plain text (PROTOCOL.md § Joining)", async () => {
+  const app = await start(devEnv(tempDir()));
+  try {
+    await app.registry.createTenant({ domain: "acme.test", admins: ["dev:ann"] });
+    const { board } = await (await fetch(app.server.url + "/boards", { method: "POST", headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" }, body: JSON.stringify({ title: "big" }) })).json();
+    const a = await sock(app.server.wsUrl);
+    a.send({ t: "hello", v: 1, token: TOKEN, board: board.id, since: 0, client: "ann" });
+    await a.next(m => m.t === "welcome");
+    a.send({ t: "op", id: "ann:1", sentAt: 0, stream: "board", op: { elements: Array.from({ length: 60 }, (_, i) => ({ id: "e" + i, type: "rectangle", version: 1, versionNonce: i, x: i, y: 0, width: 1, height: 1, isDeleted: false, customData: { pad: "abc".repeat(40) } })) } });
+    await a.next(m => m.t === "ack");
+    await a.close();
+    const join = async z => {
+      const ws = new WebSocket(app.server.wsUrl + (z ? "?z=deflate" : "")); ws.binaryType = "arraybuffer";
+      const got = []; ws.onmessage = e => got.push(e.data);
+      await new Promise(res => { ws.onopen = res; });
+      ws.send(JSON.stringify({ t: "hello", v: 1, token: TOKEN, board: board.id, since: 0, client: "v" + z }));
+      await until(() => got.some(d => typeof d === "string" && JSON.parse(d).t === "here"), "here");
+      ws.close();
+      return got;
+    };
+    const plain = await join(false), zed = await join(true);
+    expect(plain.every(d => typeof d === "string")).toBe(true);
+    const bin = zed.filter(d => typeof d !== "string");
+    expect(bin.length).toBe(1);                                              // the entries frame (> 4 KiB): one binary frame
+    const entries = JSON.parse(inflateSync(Buffer.from(bin[0])).toString("utf8"));
+    expect(entries).toEqual(JSON.parse(plain.find(d => JSON.parse(d).t === "entries")));
+    expect(bin[0].byteLength).toBeLessThan(plain.find(d => JSON.parse(d).t === "entries").length / 3);
+  } finally { await app.stop(); }
+});
+
 test("start(env): fake Google client vars build the OIDC adapter (stub fetch, never the real client); /auth/login no longer 503", async () => {
   const calls = [];
   const fetchStub = async url => { calls.push(String(url)); return new Response("{}", { status: 500 }); };
@@ -290,12 +330,40 @@ test("start(env): COOKIE_KEY: refused when short; required in cluster mode; rand
   await app.stop();
 });
 
+test("start(env): PLENARY_TRASH_SWEEP_MS must be an integer from 1000 to 86400000 (checked before anything opens); unset and the bounds start a node with a sweeper", async () => {
+  for (const bad of ["999", "86400001", "1.5e3", "abc", "1000.5", "-1000", "", "0", " 2000", "00001000000"]) {
+    const dir = tempDir();
+    await expect(start(devEnv(dir, { PLENARY_TRASH_SWEEP_MS: bad }))).rejects.toThrow(/PLENARY_TRASH_SWEEP_MS/);
+    expect(existsSync(join(dir, "registry.db"))).toBe(false);   // refused before the data dir's databases are created
+  }
+  for (const good of [undefined, "1000", "86400000", "600000"]) {
+    const app = await start(devEnv(tempDir(), good === undefined ? {} : { PLENARY_TRASH_SWEEP_MS: good }));
+    expect(typeof app.sweeper.sweep).toBe("function");
+    await app.stop();
+  }
+});
+
+test("start(env): PLENARY_BLOB_REAP_MS must be an integer from 1000 to 86400000 (checked before anything opens); a gateway node has a blob reaper, a host-only node has none", async () => {
+  for (const bad of ["999", "86400001", "1.5e3", "abc", "", "0", " 2000", "-1000"]) {
+    const dir = tempDir();
+    await expect(start(devEnv(dir, { PLENARY_BLOB_REAP_MS: bad }))).rejects.toThrow(/PLENARY_BLOB_REAP_MS/);
+    expect(existsSync(join(dir, "registry.db"))).toBe(false);
+  }
+  for (const good of [undefined, "1000", "86400000"]) {
+    const app = await start(devEnv(tempDir(), good === undefined ? {} : { PLENARY_BLOB_REAP_MS: good }));
+    expect(typeof app.reaper.sweep).toBe("function");
+    expect(await app.reaper.sweep()).toEqual({ deleted: 0, revived: 0, raced: 0, failed: 0, more: false });
+    await app.stop();
+  }
+});
+
 test("revocation: a grant change through the Registry closes a connection that lost its role", async () => {
   const app = await start(devEnv(tempDir()));
   try {
-    await app.registry.createTenant({ domain: "acme.test", admins: ["dev:ann"] });
-    const res = await fetch(app.server.url + "/boards", { method: "POST", headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" }, body: JSON.stringify({ memberRole: null }) });
-    const { board } = await res.json();
+    // A board with no general access (a board made by POST /boards would sit in ann's personal space, which she owns: no revocation by grant).
+    const t = await app.registry.createTenant({ domain: "acme.test", admins: ["dev:ann"] });
+    const board = await mkBoard(app.registry, { tenant: t.id, memberRole: null });
+    await app.registry.setGrant(board.id, "dev:ann", "owner");
     await app.registry.setGrant(board.id, "dev:bob", "owner");          // a second owner, so ann may be removed
     const s = await sock(app.server.wsUrl);
     s.send({ t: "hello", v: 1, token: TOKEN, board: board.id, since: 0, client: "ann" });
@@ -314,12 +382,41 @@ test("revocation: a grant change through the Registry closes a connection that l
   } finally { await app.stop(); }
 });
 
+test("dev board: it lives in a private Dev Space whose grants mirror the token roles, and a restart (or a crash before the board was written) reuses the tenant and Space", async () => {
+  const dir = tempDir();
+  const env = { PLENARY_DATA_DIR: dir, PORT: "0", LOG_LEVEL: "error", PLENARY_DEV_TOKENS: JSON.stringify({ [`${TOKEN}-ann`]: { name: "ann", role: "owner" }, [`${TOKEN}-bob`]: { name: "bob", role: "viewer" } }) };
+  const first = await start(env);
+  let tenant, space, board;
+  try {
+    board = await first.registry.board(first.devBoard);
+    space = await first.registry.space(board.space);
+    tenant = board.tenant;
+    expect(space).toMatchObject({ name: "Dev", tenant, generalRole: null, group: null });   // a private Space: nobody gets in by membership
+    expect(board.memberRole).toBe(null);
+    for (const [user, role] of [["dev:ann", "owner"], ["dev:bob", "viewer"]]) {
+      expect([user, await first.registry.grant(board.id, user), await first.registry.scopedGrant({ type: "space", id: space.id }, { type: "user", id: user })]).toEqual([user, role, role]);
+    }
+  } finally { await first.stop(); }
+  // A crash after createBoard but before the file recorded the board: the file holds only the tenant and Space ids.
+  const file = join(dir, "dev-board.json");
+  expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ tenant, space: space.id, board: board.id });
+  writeFileSync(file, JSON.stringify({ tenant, space: space.id }));
+  const second = await start(env);
+  try {
+    const again = await second.registry.board(second.devBoard);
+    expect([again.tenant, again.space]).toEqual([tenant, space.id]);   // no second tenant or Space
+    expect(again.id).toBe(board.id);                                      // the kill landed after createBoard: its idempotency key replays, so the same board comes back (no stray board)
+    expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ tenant, space: space.id, board: again.id });
+  } finally { await second.stop(); }
+});
+
 // ---- p4-wire: the cluster env (no Postgres or NATS needed: every case here is refused or single node) ----
 import { nodeConfig, defaultNodeId, redact } from "../../server/main.js";
+import { mkBoard } from "../auth/fixtures.js";
 
 const PW = "hunter2-FAKE-pw";
 const PG = `postgres://plen:${PW}@127.0.0.1:1/plenary`, NATS = `nats://plen:${PW}@127.0.0.1:1`;
-const KEY = { COOKIE_KEY: "k".repeat(32) };
+const KEY = { COOKIE_KEY: "k".repeat(32), PLENARY_BLOBS: "local-disk" };   // a cluster start must name its picture storage (these tests start none)
 
 /** start(env) that must be refused: the error and every log line, both free of the fake password. */
 const refused = (env, pattern) => refusedWith(env, {}, pattern);
@@ -355,7 +452,7 @@ function leakyAdapters({ failPg = false } = {}) {
   return {
     closed,
     adapters: {
-      async postgresStore({ url }) { if (failPg) throw Object.assign(new Error(`connect failed to ${url} (password ${PW})`), { code: `E_${PW}` }); return fake("store"); },
+      async postgresStore({ url }) { if (failPg) throw Object.assign(new Error(`connect failed to ${url} (password ${PW})`), { code: `E_${PW}` }); return { ...fake("store"), clusterId: async () => "c-aaaaaaaaaaaaaaaa" }; },
       async postgresRegistry() { return fake("registry"); },
       async natsBus({ url, onError }) {
         onError(new Error(`stale connection to ${url}`), "");   // a bus error line, logged before the open fails

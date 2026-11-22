@@ -1,14 +1,17 @@
-// Fix round 2 (docs/m2/reports/p3-scaffoldv2.md): catch-up is streamed in bounded frames and paced by the socket,
+// Fix round 2: catch-up is streamed in bounded frames and paced by the socket,
 // the kept tail is folded by bytes, what the process owes its readers is budgeted, and a burst yields the loop.
 import { test, expect, afterAll } from "bun:test";
 import { join } from "node:path";
+import { cpSync } from "node:fs";
 import { rig, tokenOf, settled, roomState, client, rawSock, sock } from "./rig.js";
-import { cleanup, sleep, until, tempDir, deferred } from "./helpers.js";
+import { cleanup, sleep, until, tempDir, deferred, spawnTracked } from "./helpers.js";
 import { sqliteStore } from "../../server/store/sqlite.js";
 import { createBreather } from "../../server/breather.js";
 
 afterAll(cleanup);
 const MB = 1024 * 1024;
+// A gateway feed rebases onto a fold on the room host's next heartbeat after the checkpoint is written (it names it: `cp`; default 2 s): tests that fold and then join wait for it.
+const HB = 100;
 const hello = (r, name, extra = {}) => ({ t: "hello", v: 1, token: tokenOf(name), board: r.ids.board, since: 0, client: name, ...extra });
 // A small element op whose version rises with n (v1.1: a settings op needs `appBase`, so traffic uses elements).
 const tick = n => ({ id: "tick", type: "rectangle", version: n, versionNonce: n, x: n % 100, y: 0, width: 1, height: 1, isDeleted: false });
@@ -29,7 +32,7 @@ async function write(r, name, stream, ops) {
 test("H1: an annotator rewriting one note over and over leaves the board joinable, before and after a restart", async () => {
   // The verifier's attack (280 × 990 KB), scaled: 40 rewrites of one 200 KB note = 8 MB of log for 200 KB of board.
   // The user budget is 2 MB: the unfolded tail (8 MB) could never be owed to a joiner, the folded board can.
-  const opts = { host: { tailFoldBytes: 1 * MB, chunkBytes: 256 * 1024 }, limits: { maxUserBufferedBytes: 2 * MB, maxTotalBufferedBytes: 8 * MB } };
+  const opts = { host: { heartbeatMs: HB, tailFoldBytes: 1 * MB, chunkBytes: 256 * 1024 }, limits: { maxUserBufferedBytes: 2 * MB, maxTotalBufferedBytes: 8 * MB } };
   let r = await rig(opts);
   await write(r, "annotator", "notes", Array.from({ length: 40 }, (_, i) => big("note", i + 1, 200_000, String(i % 10))));
   for (const phase of ["before the restart", "after the restart"]) {
@@ -61,7 +64,7 @@ test("H1: an annotator rewriting one note over and over leaves the board joinabl
 }, 60000);
 
 test("H1: a tail bigger than any one frame arrives as bounded frames, in order, complete", async () => {
-  const r = await rig({ host: { chunkBytes: 64 * 1024, tailFoldBytes: 64 * MB } });
+  const r = await rig({ host: { heartbeatMs: HB, chunkBytes: 64 * 1024, tailFoldBytes: 64 * MB } });
   await write(r, "editor", "board", Array.from({ length: 30 }, (_, i) => big("e" + i, 1, 40_000)));   // 1.2 MB of tail, never folded
   const s = await r.sock(); s.send(hello(r, "viewer"));
   await until(() => s.msgs.filter(m => m.t === "entries").flatMap(m => m.entries).length === 30, "all 30 entries");
@@ -86,17 +89,22 @@ for (const shape of ["a snapshot bigger than the share", "a tail bigger than the
   // Scaled from the verifier's 70 MB board against the 64 MiB share: a 10 MB board against a 4 MiB share (and a
   // 12 MiB process budget). Before this round every such join was refused, the owner's too.
   const fold = shape.startsWith("a snapshot") ? 1 * MB : 64 * MB;
-  const opts = { limits: { maxUserBufferedBytes: 4 * MB, maxTotalBufferedBytes: 12 * MB, sweepMs: 50 }, host: { tailFoldBytes: fold } };
+  const opts = { limits: { maxUserBufferedBytes: 4 * MB, maxTotalBufferedBytes: 12 * MB, sweepMs: 50 }, host: { heartbeatMs: HB, tailFoldBytes: fold } };
   let r = await rig(opts);
   await write(r, "owner", "board", Array.from({ length: 10 }, (_, i) => big("b" + i, 1, 990_000)));
   for (const phase of ["before the restart", "after the restart"]) {
     await r.server.rooms.open(r.ids.tenant, r.ids.board);
     const peek = await r.server.rooms.peek(r.ids.tenant, r.ids.board);
-    // The host folds when the tail passes `fold` AND is at least half the state (the 2x bound), so with 1 MB the last
-    // fold is at seq 8 (a tail of 2 x 990 KB is under half of 10 MB). A clean stop checkpoints (§ Recovery, "When"),
-    // so after the restart both shapes join from a snapshot of the whole board.
+    // The host folds when the tail passes `fold` AND is a quarter of the state, in steps (§ Recovery, "Incremental fold"),
+    // one at a time: which seq the last fold lands on depends on how many entries resolved while the one before ran, so
+    // with 1 MB we wait for the folds to settle and expect one short of the end (a tail of 1 to 2 x 990 KB is under a
+    // quarter of 10 MB's fold trigger). A clean stop checkpoints (§ Recovery, "When"), so after the restart both shapes
+    // join from a snapshot of the whole board.
     if (phase === "after the restart") expect(peek.room.base.seq).toBe(10);
-    else if (fold === 1 * MB) expect(peek.room.base.seq).toBe(8); else expect(peek.room.tail.length).toBe(10);
+    else if (fold === 1 * MB) {
+      await until(() => !peek.room.status().folding && !peek.room.status().writing, "the folds to settle");
+      expect(peek.room.base.seq).toBeGreaterThanOrEqual(5); expect(peek.room.base.seq).toBeLessThanOrEqual(10);   // a snapshot of at least half the board
+    } else expect(peek.room.tail.length).toBe(10);
     // The owner, and three tabs of one viewer, all at the same moment, all from scratch.
     const names = ["owner", "viewer", "viewer", "viewer"];
     const joiners = await Promise.all(names.map(async (n, i) => { const s = await r.sock(); s.send(hello(r, n, { client: "tab" + i })); return s; }));
@@ -120,7 +128,7 @@ for (const shape of ["a snapshot bigger than the share", "a tail bigger than the
 }, 90000);
 
 test("H1 (round 3): a slow reader of a board bigger than its budget gets all of it; the server never owes it more than a socket's worth", async () => {
-  const r = await rig({ limits: { maxUserBufferedBytes: 4 * MB, maxTotalBufferedBytes: 12 * MB, stallMs: 600_000, sweepMs: 50 }, host: { tailFoldBytes: 64 * MB, chunkBytes: 256 * 1024 } });
+  const r = await rig({ limits: { maxUserBufferedBytes: 4 * MB, maxTotalBufferedBytes: 12 * MB, stallMs: 600_000, sweepMs: 50 }, host: { heartbeatMs: HB, tailFoldBytes: 64 * MB, chunkBytes: 256 * 1024 } });
   await write(r, "editor", "board", Array.from({ length: 24 }, (_, i) => big("s" + i, 1, 500_000)));   // a 12 MB tail in ~500 KB frames
   const s = await rawSock(r.server.wsUrl); s.send(hello(r, "viewer"));
   let peak = 0; const watch = setInterval(() => { peak = Math.max(peak, r.server.gateway.stats().owedBytes); }, 5);
@@ -139,10 +147,10 @@ test("H1 (round 3): a slow reader of a board bigger than its budget gets all of 
 test("H1: sockets that never read stay under the budget, are cut even while they send presence, and lock nobody else out", async () => {
   // A 24 MB board in one snapshot frame. The kernel swallows a few MB per socket, so a non-reader that was handed
   // the snapshot is owed well over 8 MB; a 32 MiB share has room for one such socket at a time.
+  // stallMs elapses on the gateway's clock, which the test moves (`skew`): each cut costs a jump, not 1.5 s of waiting.
   const limits = { maxUserBufferedBytes: 32 * MB, maxTotalBufferedBytes: 96 * MB, stallMs: 1500, stallGraceMs: 60_000, sweepMs: 50 };
-  const r = await rig({ limits, host: { tailFoldBytes: 1 * MB } });
-  await write(r, "editor", "board", Array.from({ length: 24 }, (_, i) => big("b" + i, 1, 990_000)));
-  await foldAll(r);
+  let skew = 0;
+  const r = await board24({ limits, host: { heartbeatMs: HB, tailFoldBytes: 1 * MB }, now: () => Date.now() + skew });
   const stats = () => r.server.gateway.stats();
   let peak = 0; const watch = setInterval(() => { peak = Math.max(peak, stats().owedBytes, stats().owedTracked); }, 5);
   // Six sockets on the viewer account, none of which ever reads; each keeps "talking" (presence every 40 ms).
@@ -159,7 +167,13 @@ test("H1: sockets that never read stay under the budget, are cut even while they
   expect((await r.health()).status).toBe(200);
   // Every non-reader is cut in turn: each gets the frame once there is room, reads nothing for stallMs, and goes,
   // although none of them ever stops sending.
-  await until(() => stats().conns === 1, "the non-readers to be cut", 120000);
+  // One jump per cut, each past stallMs and the six together well short of stallGraceMs (60 s): only the stall rule
+  // can be what cuts them. (A jump that finds nobody holding bytes yet is retried after 200 ms.)
+  for (let jumps = 0; stats().conns > 1; jumps++) {
+    if (jumps > 100) throw new Error("the non-readers were not cut");
+    const before = stats().cut; skew += 1600;
+    await until(() => stats().cut > before || stats().conns === 1, "a non-reader to be cut", 200).catch(() => {});
+  }
   clearInterval(chatter); clearInterval(watch);
   expect(peak).toBeLessThanOrEqual(32 * MB + 24 * MB + 2 * MB);           // the account's share + the one honest joiner, never more
   expect(stats().cut).toBe(6);
@@ -175,21 +189,24 @@ test("H1: sockets that never read stay under the budget, are cut even while they
 test("H1: non-readers spread over several accounts can't keep joiners out: the longest-stalled is cut to make room", async () => {
   // Each account stays under its own share; together they fill the process budget. stallMs is far away (60 s), so
   // only the make-room rule (stallGraceMs) can let anyone else in.
+  // stallGraceMs (400 ms) is judged on the gateway's clock, which the test moves once (`skew`) instead of waiting.
   const limits = { maxUserBufferedBytes: 32 * MB, maxTotalBufferedBytes: 48 * MB, stallMs: 600_000, stallGraceMs: 400, helloTimeoutMs: 120_000, maxCatchUpWaitMs: 120_000, sweepMs: 50 };
-  const r = await rig({ limits, host: { tailFoldBytes: 1 * MB } });
-  await write(r, "editor", "board", Array.from({ length: 24 }, (_, i) => big("b" + i, 1, 990_000)));
-  await foldAll(r);
+  let skew = 0;
+  const r = await board24({ limits, host: { heartbeatMs: HB, tailFoldBytes: 1 * MB }, now: () => Date.now() + skew });
   const stats = () => r.server.gateway.stats();
-  const dead = [];
+  const dead = [], accepted0 = stats().accepted;
   for (const account of ["editor1", "editor2", "editor3", "editor4"]) { const s = await rawSock(r.server.wsUrl); s.send(hello(r, account)); dead.push(s); }
-  await until(() => stats().accepted === 5 && stats().owedBytes > 16 * MB, "the non-readers to hold the room", 60000);   // they really hold it…
+  await until(() => stats().accepted === accepted0 + 4 && stats().owedBytes > 16 * MB, "the non-readers to hold the room", 60000);   // they really hold it…
   expect(stats().owedBytes).toBeLessThanOrEqual(48 * MB);                 // …and no more than the budget
+  // (The clock moves only while an honest joiner waits, below.)
   // Honest joiners get in one after another: whoever has read nothing the longest goes. By the make-room rule, not
   // by a timer running out: the stall rule (10 min here) can't fire, and nobody is told to wait and come back.
-  const honest = [];
+  const honest = []; let jumps = 0;
   for (const name of ["viewer", "commenter", "annotator"]) {
     const s = await r.sock(); s.send(hello(r, name, { client: "honest-" + name })); honest.push(s);
-    await s.next(m => m.t === "snapshot" || m.t === "error", "an honest joiner's snapshot", 90000);
+    // The gateway's clock runs on while it waits (500 ms a poll, at most 50 s in all: its own limits are 120 s), so the
+    // grace and the pace window it judges the dead sockets by elapse without the test sleeping through them.
+    await until(() => { if (jumps++ < 100) skew += 500; return s.msgs.some(m => m.t === "snapshot" || m.t === "error"); }, "an honest joiner's snapshot", 90000);
     expect(s.msgs.filter(m => m.t === "error")).toEqual([]);
   }
   expect(r.logs().some(l => l.msg === "reader closed" && /making room/.test(l.why))).toBe(true);
@@ -203,9 +220,7 @@ test("H1: non-readers spread over several accounts can't keep joiners out: the l
 
 test("a joiner that waits too long for room is told `unavailable`, not left hanging", async () => {
   const limits = { maxUserBufferedBytes: 32 * MB, maxTotalBufferedBytes: 30 * MB, stallMs: 600_000, stallGraceMs: 600_000, helloTimeoutMs: 120_000, maxCatchUpWaitMs: 400, sweepMs: 50 };
-  const r = await rig({ limits, host: { tailFoldBytes: 1 * MB } });
-  await write(r, "editor", "board", Array.from({ length: 24 }, (_, i) => big("b" + i, 1, 990_000)));
-  await foldAll(r);
+  const r = await board24({ limits, host: { heartbeatMs: HB, tailFoldBytes: 1 * MB } });
   const hog = await rawSock(r.server.wsUrl); hog.send(hello(r, "editor1"));
   // It holds the snapshot unread (24 MB less what the kernel took): with 30 MB in all, a second 24 MB copy can't fit.
   await until(() => r.server.gateway.stats().sharedTexts === 0 && r.server.gateway.stats().owedBytes > 6 * MB, "the hog to hold its snapshot", 60000);
@@ -377,7 +392,7 @@ test("Store.read can stop a page by size (an extension to § Store), and reports
 test("a writer active during catch-up doesn't get a slow joiner (or its other tab) cut", async () => {
   // A 10 MB snapshot against a 4 MiB share: while one tab's socket still holds the snapshot, live entries flow to
   // both of that user's tabs. They must queue behind the catch-up, not cut it.
-  const r = await rig({ limits: { maxUserBufferedBytes: 4 * MB, maxTotalBufferedBytes: 12 * MB, sweepMs: 50, stallMs: 600_000, helloTimeoutMs: 120_000 }, host: { tailFoldBytes: 1 * MB } });
+  const r = await rig({ limits: { maxUserBufferedBytes: 4 * MB, maxTotalBufferedBytes: 12 * MB, sweepMs: 50, stallMs: 600_000, helloTimeoutMs: 120_000 }, host: { heartbeatMs: HB, tailFoldBytes: 1 * MB } });
   await write(r, "owner", "board", Array.from({ length: 10 }, (_, i) => big("b" + i, 1, 990_000)));
   await foldAll(r);
   const w = await r.sock(); w.send(hello(r, "editor", { since: 10 })); await w.next(m => m.t === "welcome");
@@ -404,16 +419,14 @@ test.skipIf(!python)("trickle readers can't hold the budget against a joiner: th
   // A 24 MB board in one snapshot. stallMs is far away (60 s): a trickle reader never "stalls", it drains a little
   // all the time. Only the pace rule can move it.
   const limits = { maxUserBufferedBytes: 32 * MB, maxTotalBufferedBytes: 48 * MB, stallMs: 600_000, stallGraceMs: 400, slowEtaMs: 20_000, helloTimeoutMs: 120_000, maxCatchUpWaitMs: 120_000, sweepMs: 50 };
-  const r = await rig({ limits, host: { tailFoldBytes: 1 * MB } });
-  await write(r, "editor", "board", Array.from({ length: 24 }, (_, i) => big("b" + i, 1, 990_000)));
-  await foldAll(r);
+  const r = await board24({ limits, host: { heartbeatMs: HB, tailFoldBytes: 1 * MB } });
   const stats = () => r.server.gateway.stats();
   // Two accounts, one trickle reader each (a Python client with a 4 KB receive buffer, 32 KB every 200 ms:
   // 160 KB/s, over two minutes for what each socket holds). Only python reads slowly enough: a paused Node or Bun
   // socket pulls everything the kernel has.
   const tricklers = [];
   for (const account of ["editor1", "editor2"]) {
-    const child = Bun.spawn([python, new URL("./trickle.py", import.meta.url).pathname, String(r.server.port), "/ws", JSON.stringify(hello(r, account)), "32768", "0.2"], { stdout: "pipe", stderr: "ignore" });
+    const child = spawnTracked([python, new URL("./trickle.py", import.meta.url).pathname, String(r.server.port), "/ws", JSON.stringify(hello(r, account)), "32768", "0.2"], { stdout: "pipe", stderr: "ignore" });
     const t = { child, got: 0 }; tricklers.push(t);
     (async () => { const dec = new TextDecoder(); for await (const chunk of child.stdout) { const n = dec.decode(chunk).trim().split("\n").pop(); if (n) t.got = Number(n); } })();
   }
@@ -433,9 +446,7 @@ test.skipIf(!python)("trickle readers can't hold the budget against a joiner: th
 
 test("a reader getting through its catch-up at a fair pace is left alone: the joiner behind it waits its turn", async () => {
   const limits = { maxUserBufferedBytes: 32 * MB, maxTotalBufferedBytes: 48 * MB, stallMs: 600_000, stallGraceMs: 400, slowEtaMs: 20_000, helloTimeoutMs: 120_000, maxCatchUpWaitMs: 120_000, sweepMs: 50 };
-  const r = await rig({ limits, host: { tailFoldBytes: 1 * MB } });
-  await write(r, "editor", "board", Array.from({ length: 24 }, (_, i) => big("b" + i, 1, 990_000)));
-  await foldAll(r);
+  const r = await board24({ limits, host: { heartbeatMs: HB, tailFoldBytes: 1 * MB } });
   const stats = () => r.server.gateway.stats();
   const steady = await rawSock(r.server.wsUrl); steady.send(hello(r, "editor3")); steady.trickle(512 * 1024, 20);   // ~25 MB/s
   const second = await rawSock(r.server.wsUrl); second.send(hello(r, "editor4")); second.trickle(512 * 1024, 20);
@@ -454,14 +465,16 @@ test("joiners parked across folds can't pin a board's worth of replaced text eac
   // Between arrivals the board folds, so each waiter references a DIFFERENT snapshot string (6.0, 6.3 … 7.2 MB).
   // Distinct queued catch-up text is bounded (14 MB): without the bound the five would pin 33 MB.
   const limits = { maxUserBufferedBytes: 1 * MB, maxTotalBufferedBytes: 256 * MB, maxSharedQueuedBytes: 14 * MB, stallMs: 600_000, stallGraceMs: 600_000, maxCatchUpWaitMs: 600_000, helloTimeoutMs: 600_000, sweepMs: 50 };
-  const r = await rig({ limits, host: { tailFoldBytes: 256 * 1024 } });
+  // (The test checkpoints after the op's ack, so on a loaded machine a real heartbeat can land before the checkpoint: the feed
+  // must keep looking on later heartbeats; test/server/feed-rebase.test.js holds that down deterministically.)
+  const r = await rig({ limits, host: { heartbeatMs: HB, tailFoldBytes: 256 * 1024 } });
   await write(r, "editor", "board", Array.from({ length: 6 }, (_, i) => big("b" + i, 1, 990_000)));   // a 6 MB board
   const stats = () => r.server.gateway.stats();
   const baseSeq = async () => (await r.server.rooms.peek(r.ids.tenant, r.ids.board)).room.base.seq;
   // v1: the host folds by bytes only while the tail is at least half the board (the 2x bound), which 300 KB of
   // growth on a 6 MB board never is: the test checkpoints through the Room itself, and the gateway's feed rebases
   // onto it (on the room's next heartbeat), so each joiner below gets a different snapshot string.
-  const fold = async seq => { await r.idle(); const room = await r.room(); if (room.base.seq < seq) room.checkpoint(); expect(await baseSeq()).toBe(seq); };
+  const fold = async seq => { await r.idle(); const room = await r.room(); if (room.base.seq < seq) room.checkpoint(); await durable(room); expect(await baseSeq()).toBe(seq); };
   await fold(6);
   const hog = await rawSock(r.server.wsUrl); hog.send(hello(r, "editor1"));
   await until(() => stats().owedBytes > 0 && stats().sharedTexts === 0, "the hog's snapshot to be in its socket", 60000);
@@ -511,19 +524,43 @@ test("joiners parked across folds can't pin a board's worth of replaced text eac
  */
 /**
  * Fold the whole board into one checkpoint, so a joiner from 0 gets it as one snapshot. The scaffold's host folded
- * whenever its tail passed `tailFoldBytes`; the v1 host also needs the tail to be at least half the board (the 2x
+ * whenever its tail passed `tailFoldBytes`; the v1 host also needs the tail to be at least a quarter of the board (the 4x
  * bound), which a board written as distinct elements rarely meets. Tests about one big snapshot say so here.
  */
 async function foldAll(r) {
   await r.idle();
   const room = await r.room();
   if (room.base.seq < room.resolved) room.checkpoint();
+  await durable(room);
   expect(room.base.seq).toBe(room.seq);
+}
+/** The room's checkpoint is written and acknowledged (so the next heartbeat names it) and no fold of its own still runs. */
+const durable = room => until(() => !room.status().folding && !room.status().writing && room.savedSeq === room.base.seq, "the checkpoint to be durable");
+
+/**
+ * The 24 x 990 KB board that five tests need, folded into one snapshot: written once per file, then each test gets a
+ * copy of its directory (and the Registry that knows its ids) and a rig on it, so each opens a room rebuilt from the
+ * clean-stop checkpoint (seq 24, base 24), exactly the state foldAll leaves. Writing it took over a second a test.
+ */
+let seed24;
+async function board24(opts) {
+  seed24 ??= (async () => {
+    const r0 = await rig({ host: { heartbeatMs: HB, tailFoldBytes: 1 * MB } });
+    await write(r0, "editor", "board", Array.from({ length: 24 }, (_, i) => big("b" + i, 1, 990_000)));
+    await foldAll(r0); await r0.stop();
+    return { dir: r0.dir, registry: r0.registry, ids: r0.ids };
+  })();
+  const seed = await seed24, dir = tempDir();
+  cpSync(seed.dir, dir, { recursive: true });
+  const r = await rig({ ...opts, dir, registry: seed.registry, ids: seed.ids });
+  await r.server.rooms.open(r.ids.tenant, r.ids.board);
+  await foldAll(r);
+  return r;
 }
 
 async function bigJoin(maxSnapshotBytes) {
   const limits = { maxUserBufferedBytes: 1 * MB, maxTotalBufferedBytes: 64 * MB, maxSnapshotBytes, stallMs: 600_000, stallGraceMs: 600_000, helloTimeoutMs: 600_000, maxCatchUpWaitMs: 600_000, sweepMs: 50 };
-  const r = await rig({ limits, host: { tailFoldBytes: 256 * 1024 } });
+  const r = await rig({ limits, host: { heartbeatMs: HB, tailFoldBytes: 256 * 1024 } });
   await write(r, "annotator", "notes", Array.from({ length: 12 }, (_, i) => big("n" + i, 1, 330_000, "中")));
   await foldAll(r);
   const stats = () => r.server.gateway.stats();
@@ -586,7 +623,7 @@ test("R4-H2: a frame over the socket limit (past the spec's caps) is still sent,
   // Scaled: limits so small that the 3 MB board's snapshot is over backpressureLimit (2 MB) and over the "client
   // message" warning size. It is sent whole (Bun takes any frame into an empty socket), and said once, not per joiner.
   const limits = { maxUserBufferedBytes: 1 * MB, maxSnapshotBytes: 1 * MB, maxClientMessageBytes: 1 * MB, stallMs: 600_000, helloTimeoutMs: 600_000, maxCatchUpWaitMs: 600_000 };
-  const r = await rig({ limits, host: { tailFoldBytes: 256 * 1024 } });
+  const r = await rig({ limits, host: { heartbeatMs: HB, tailFoldBytes: 256 * 1024 } });
   await write(r, "editor", "board", Array.from({ length: 3 }, (_, i) => big("b" + i, 1, 990_000)));
   await foldAll(r);
   for (const name of ["viewer", "commenter"]) {

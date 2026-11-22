@@ -1,8 +1,9 @@
 // The canvas page's chrome: a driving adapter over the DOM (it calls into the core; it implements no port). Draws the verified
-// mock (docs/m2/design), paints through ./paint.js, feeds input to the core session (web/core/session.js), and
+// mock, paints through ./paint.js, feeds input to the core session (web/core/session.js), and
 // keeps UI preferences in the storage port it is given. Every write goes through session.act/setTool/key; nothing
 // here touches the protocol, a transport or sign-in (web/main.js, the composition root, wires those).
 
+import { captureFocus, restoreFocus } from "./focus.js";
 import { Editor } from "../../../packages/core/editor.js";
 import { parsePanel, serializePanel, applyPanel, panelLayout, dragWidth } from "../../../packages/core/panel.js";
 import { isMermaid } from "../../../packages/core/mermaid.js";
@@ -22,6 +23,11 @@ import { icon } from "./icons.js";
 import { buildTimeline, updateTimelineInPlace, prefersReducedMotion } from "./timeline.js";
 import { timelineSpans } from "../../../packages/core/anim.js";
 import { cancelActiveSampler } from "./color-picker.js";
+import { pillPopover } from "./explain.js";
+import { openShare } from "./share.js";
+import { createShareModel } from "../../core/share.js";
+import { startMove } from "./move.js";
+import { probeMove } from "../../core/move.js";
 import { mountCollab } from "./collab/ui.js";
 import { collabFrame } from "./collab/frame.js";
 import { createVideoOverlay } from "./video-overlay.js";
@@ -34,18 +40,20 @@ import { hitTest } from "../../../packages/core/geometry.js";
  *           prefs: import("../../ports/storage.js").Storage, theme?: string | null, notice?: string | null,
  *           collab?: (S: object, o: { jumpTo(p: { x: number, y: number, scale?: number }): void }) => object,
  *           clock: import("../../ports/clock.js").Clock, expAt?: number | null,
- *           relogin?: { href: string, go(): void } | null }} o
+ *           relogin?: { href: string, go(): void } | null, homeHref?: string | null }} o
  *   collab: the root's collab port factory (web/ports/collab.js; production and dev: web/adapters/collab/sync.js over
  *   the session). The collaboration UI (./collab/ui.js) mounts over it: avatars, emotes, cursors, selections, laser,
  *   previews, comment threads. Without it the page has none of that.
+ *   trashShown: true while the Trash notice stands over the page (the board is in Trash): the refused-sign-in banner is then hidden, since signing in again cannot help.
  *   startSession: the root's createSession with everything but the page's own bits. prefs: the per-browser store
  *   (local storage; a failing store reads as empty). notice: shown once (sign-in, share link).
  *   clock: the root's clock port (banner countdowns, the hidden-tab timer, the collab UI). expAt: when the sign-in
  *   ends (ms on the clock's now() scale), null when unknown: the page warns EXPIRY_WARN_MS before it. relogin: where
  *   a refused or expiring page signs in again (href shown, go() remembers the board and leaves); null = no link (dev).
+ *   homeHref: where the top bar's Home link goes (the Home screen); null = no link (dev rooms).
  * @returns {{ S: object, ui: object, net: object, setTheme(t: string): void, openDialog(d: string): void, setPanel(op: object): void }}
  */
-export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null, admin = null }) {
+export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null, admin = null, homeHref = null, access = null, newKey = null, share = null, move = null, trashShown = () => false }) {
   if (!clock || typeof clock.now !== "function" || typeof clock.mono !== "function") throw new Error("mountApp: the clock port is required");
   const get = k => { try { return prefs.get(k); } catch { return null; } };
   const put = (k, v) => { try { prefs.set(k, v); } catch {} };
@@ -60,15 +68,19 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // user's stored one. Before the first welcome it is the sign-in's user.
   const mineKeyOf = user => `plenary.mine.${board}.${user}`;
   const mineKey = mineKeyOf(me.user);
-  let chromeDirty = true;
+  let chromeDirty = true, syncMove = () => {};
+  if (move && (typeof move.port?.options !== "function" || typeof move.clock?.mono !== "function")) throw new TypeError("mountApp: move must be { port: MovePort, clock, newKey? }");
   const S = startSession({
     mine: (() => { try { const v = JSON.parse(get(mineKey) ?? "[]"); return Array.isArray(v) ? v : []; } catch { return []; } })(),
-    onChange: () => { chromeDirty = true; },
+    onChange: () => { chromeDirty = true; syncMove(); },
   });
   if (!ui.drawer && me.role === "annotator") ui.drawer = "notes";
   net.onFile(file => { S.receiveFiles({ [file.id]: file }); });
+  // A picture that could not be saved for everyone (PROTOCOL.md § Blobs): it shows here, but nobody else will see it.
+  const WHY = { quota: "the storage quota is full", forbidden: "you can't upload here", "too-large": "it is over 10 MB", "not-image": "it is not a PNG, JPEG, GIF or WebP", "gave-up": "the server could not be reached (still trying)", busy: "the server is busy (still trying)", limit: "too many uploads at once (still trying)" };
+  net.onFail?.(({ code, retrying }) => toast(`The picture ${retrying ? "is not saved for others yet" : "was not saved for others"}: ${WHY[code] ?? code}`, 6000));
 
-  const isPhone = () => matchMedia("(max-width: 640px)").matches;
+  const isPhone = () => matchMedia("(max-width: 640px)").matches || matchMedia("(max-width: 1023px)").matches;
   const isCoarse = () => matchMedia("(pointer: coarse)").matches;
   const INK_KEYBOARD_PAD_PX = 24;
   let lastPointerTouch = false;
@@ -93,6 +105,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     vv.addEventListener("resize", syncVisualViewport);
     vv.addEventListener("scroll", syncVisualViewport);
   }
+  let closeMoreMenu = null;
+  document.addEventListener("click", e => closeMoreMenu?.(e));
   const canvas = $("#board"), ink = $("#ink"), ctx = canvas.getContext("2d");
   const allFiles = () => ({ ...S.eds.notes.doc.files, ...S.eds.board.doc.files });
 
@@ -138,23 +152,17 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   function draw() {
     const theme = THEMES[ui.theme];
     const items = S.displayList(theme);
-    // A picture whose bytes haven't arrived (or never will: v0 sends no files) shows as a dashed box.
-    const files = allFiles();
-    for (let i = 0; i < items.length; i++) {
-      const it = items[i];
-      if (it.t === "image" && !files[it.fileId]) {
-        const { x, y, w, h: hh } = it;
-        items.splice(i, 1, { t: "path", cmds: [["M", x, y], ["L", x + w, y], ["L", x + w, y + hh], ["L", x, y + hh], ["L", x, y]], stroke: theme.dim, width: 1, dash: [5, 4] },
-          { t: "text", x: x + 8, y: y + 6, text: "picture (bytes not here yet)", size: 11, color: theme.dim, align: "left", lineHeight: 1.2 });
-        i++;
-      }
-    }
+    // A picture whose bytes haven't arrived is drawn by core as a dashed box (render.js); its bytes are asked for here
+    // (the net dedupes, paces and rests; a picture the server doesn't have stays a dashed box).
+    for (const [id, stamp] of S.missing()) net.want?.(id, stamp);
+    // Pictures that came in with pasted elements or a library item hold their bytes here only (files never travel in ops): put them on the server too.
+    for (const f of S.unsavedFiles()) net.put?.(f);
     const { w, h: hh } = S.eds.board.size;
     paint(ctx, items, { width: w, height: hh, dpr: canvas.width / Math.max(1, w), background: theme.bg, image });
     videoOverlay.sync({
       displayItems: items,
       elements: [...S.eds.board.doc.visible(), ...(S.eds.board.time() == null ? S.eds.notes.doc.visible() : [])],
-      files,
+      files: allFiles(),
       view: S.eds.board.view,
       viewport: { w, h: hh },
       selectedIds: new Set([...S.eds.board.sel, ...S.eds.notes.sel]),
@@ -452,7 +460,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       if (!S.may()) return;
       S.addPicture(f, at);
     } else if (S.addPicture(f, at)) {
-      net.put(f);          // local / shared-worker tab relay
+      net.put(f);          // upload through a signed URL (wsNet), or the dev tab relay
     }
     chromeDirty = true;
   }
@@ -547,17 +555,25 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     updateTimelineInPlace(tl, B, dur);
   }
   // The pill: a click while not live reconnects now (the user's own click skips the resume jitter, C-4 / p8-tidy).
-  const pillEl = h("span.pill", { onclick: () => { if (S.status !== "live" && shouldProbe({ status: S.status, gesture: S.gesture })) reconnectNow(); } });
+  // A view-only pill is a button: it opens the explanation of the role (PROTOCOL.md § Access explanation and requests): focusable, Enter and Space, Escape closes and returns focus.
+  const pillEl = h("span.pill", { onclick: () => { if (explainable()) { why.toggle(); return; } if (S.status !== "live" && shouldProbe({ status: S.status, gesture: S.gesture })) reconnectNow(); },
+    onkeydown: e => { if (explainable() && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); why.toggle(); } } });
+  const explainable = () => !!access && pillEl.classList.contains("readonly");
+  const why = pillPopover({ pill: pillEl, board, access, newKey, explain: access ? async () => { const r = await access.explainBoard(board); return r.why ? { why: r.why } : { error: r.error }; } : null });
   let pillSig = "";
   function inPlace() {
     timelineInPlace();
     const z = `${Math.round(S.eds.board.view.scale * 100)}%`;
     if (zoomPct.textContent !== z) zoomPct.textContent = z;
     const pill = pillFor({ status: S.status, online: S.online, pending: S.pending, role: S.effective, readOnly: S.readOnly, congested: S.congested });
-    const sig = JSON.stringify([pill, pillTitle(pill.cls)]);
+    const can = !!access && pill.cls === "readonly";
+    const title = pillTitle(pill.cls) + (can ? " Press to see why." : "");
+    const sig = JSON.stringify([pill, title]);
     if (sig === pillSig) return;
     pillSig = sig;
-    pillEl.className = `pill ${pill.cls}`; pillEl.title = pillTitle(pill.cls);
+    pillEl.className = `pill ${pill.cls}`; pillEl.title = title;
+    if (can) { pillEl.setAttribute?.("role", "button"); pillEl.setAttribute?.("tabindex", "0"); pillEl.setAttribute?.("aria-haspopup", "dialog"); if (!pillEl.hasAttribute?.("aria-expanded")) pillEl.setAttribute?.("aria-expanded", "false"); }
+    else { for (const a of ["role", "tabindex", "aria-haspopup", "aria-expanded"]) pillEl.removeAttribute?.(a); if (why.isOpen()) why.close(false); }
     replace(pillEl, h("span.dot"), pill.text, pill.sub ? h("span.sub", {}, ` · ${pill.sub}`) : null);
   }
   let toastTimer = null;
@@ -599,36 +615,129 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     h("span.ic", {}, icon(t.id, { size: 18 })), t.keys?.[0] ? h("span.k", {}, t.keys[0].toUpperCase()) : null);
   }
 
+  // Share (PROTOCOL.md § Share dialog): offered only when the welcome said `can.share` (members.manage on the board); if that changed mid-session the server answers 403 and the dialog says so.
+  // The chrome is rebuilt while the dialog is open, so focus goes back to whichever of the Share button and the More button is shown now, not to the element that opened it.
+  const shareOpener = { focus() { const c = [document.querySelector("[data-share-open]"), document.querySelector(".header-more"), document.querySelector("[data-dock-more]")]; (c.find(e => e && e.offsetParent !== null) ?? c.find(Boolean))?.focus?.(); } };
+  function openShareDialog() {
+    const loc = globalThis.location, origin = loc?.origin ?? "", boardUrl = `${origin}${loc?.pathname ?? "/"}?board=${encodeURIComponent(board)}`;
+    const model = createShareModel({ share, access, board, newKey, now: () => clock.now(), urls: { board: boardUrl, link: id => `${origin}/links/${encodeURIComponent(id)}` } });
+    openShare({ host: document.body, model, opener: shareOpener, accessHref: `${loc?.pathname ?? "/"}?access=board:${encodeURIComponent(board)}`, now: () => clock.now() });
+  }
+
+  // Move to… (PROTOCOL.md § Move board, "Where it appears"): offered only when the welcome said `can.move` (no request to find out), unless the move route has since refused this person
+  // (`denied`: a 403 or 404 after a move or an Undo; a new welcome that says `can.move` clears it). The Space shown beside the board name is read from that route's `from`, only by a person
+  // the welcome let move, once the welcome has come and again after a move or an Undo. A failed read leaves the item in place and the name unshown. `moveGen` drops an outdated answer.
+  const moveInfo = { space: null, denied: false };
+  let moveGen = 0, moveWelcomed = false, booted = false, moveSeenWelcome = -1;
+  const canMove = () => !!move && S.canMove === true && !moveInfo.denied;
+  const refreshMove = () => {
+    if (!move || S.canMove !== true) return Promise.resolve();
+    const mine = ++moveGen;
+    return probeMove(move.port, board).then(r => {
+      if (mine !== moveGen) return;
+      if (r.can === false) moveInfo.denied = true;
+      else if (r.can === true) moveInfo.space = r.space;
+      chromeDirty = true;
+    });
+  };
+  /** After every session change: a welcome that newly says can.move clears a refusal and reads the Space once. */
+  syncMove = () => {
+    if (!booted || !move) return;
+    // Every welcome that says can.move clears an earlier refusal (a reconnect after a 403 offers Move again) and reads the Space.
+    if (S.canMove === true && (!moveWelcomed || S.welcomes !== moveSeenWelcome)) { moveWelcomed = true; moveSeenWelcome = S.welcomes; moveInfo.denied = false; chromeDirty = true; refreshMove(); }
+    else if (S.canMove !== true && moveWelcomed) { moveWelcomed = false; moveInfo.space = null; chromeDirty = true; }
+  };
+  // Escape and Cancel return focus to a control that is on screen at this width (the chrome is rebuilt meanwhile): the Move or Share button, else the More button.
+  const visibleControl = sel => { const c = sel.map(q => document.querySelector(q)); return c.find(e => e && e.offsetParent !== null) ?? c.find(Boolean); };
+  const moveOpener = { focus() { (visibleControl(["[data-move-open]", ".header-more", "[data-dock-more]"]) ?? canvas)?.focus?.(); } };
+  const openMoveDialog = () => { ui.sheet = null; chromeDirty = true; startMove({ host: document.body, move, board, opener: moveOpener, reload: refreshMove, restoreFocus: () => canvas.focus?.() }); };
+  booted = true; syncMove();
+
   function topbar() {
     const role = S.role, tools = toolsFor(role), may = S.may();
     const core = tools.filter(t => !["image", "note", "highlighter"].includes(t.id)), extras = tools.filter(t => ["image", "note", "highlighter"].includes(t.id));
+    const toggleDrawer = type => { ui.drawer = ui.drawer === type ? null : type; chromeDirty = true; };
+    const toggleNotes = () => { ui.drawer = ui.drawer ? null : "notes"; chromeDirty = true; };
+    const toggleTheme = () => setTheme(ui.theme === "dark" ? "light" : "dark");
+    const togglePanel = () => setPanel({ type: "open" });
+    const toggleExport = () => openDialog("export");
+    const extraAction = (icName, label, action, disabled = false) => h("button.header-extra.btn.ghost", { role: "menuitem", "aria-label": label, title: label, disabled, onclick: () => { setMore(false); action(); } }, icon(icName, { size: 15 }), label);
+    const moreOpen = !!ui.moreOpen;
+    let menu;
+    const menuItems = () => {
+      const items = [];
+      const visit = node => { for (const child of node?.children ?? []) { if (child.getAttribute("role") === "menuitem") items.push(child); else visit(child); } };
+      visit(menu);
+      return items;
+    };
+    const setMore = (open, focus = false) => {
+      ui.moreOpen = open; more.setAttribute("aria-expanded", String(open)); menu.hidden = !open;
+      if (focus) more.focus?.();
+      else if (open) menuItems()[0]?.focus?.();
+    };
+    const more = h("button.tb.header-more", { title: "More", "aria-label": "More", "aria-haspopup": "menu", "aria-expanded": String(moreOpen), onclick: () => {
+      setMore(!ui.moreOpen);
+    }, onkeydown: e => {
+      if (e.key === "ArrowDown" && !ui.moreOpen) { e.preventDefault(); setMore(true); }
+      else if (e.key === "Escape" && ui.moreOpen) { e.preventDefault(); setMore(false, true); }
+    } }, h("span.ic", {}, icon("more", { size: 17 })), "More");
+    menu = h("div.header-more-menu", { role: "menu", hidden: !moreOpen, onkeydown: e => {
+      if (e.key === "Escape") { e.preventDefault(); setMore(false, true); }
+      else if (e.key === "Tab") setMore(false);
+      else {
+        const items = menuItems(), i = items.indexOf(document.activeElement);
+        let next = null;
+        if (e.key === "ArrowDown") next = items[(i + 1) % items.length];
+        else if (e.key === "ArrowUp") next = items[(i - 1 + items.length) % items.length];
+        else if (e.key === "Home") next = items[0];
+        else if (e.key === "End") next = items.at(-1);
+        if (next) { e.preventDefault(); next.focus?.(); }
+      }
+    } }, [
+      collab ? extraAction("comments", "Comments", () => toggleDrawer("comments")) : null,
+      extraAction("note", "Notes", toggleNotes),
+      role === "presenter" ? extraAction("mermaid", "Mermaid", () => openDialog("mermaid"), !may) : null,
+      role === "presenter" ? extraAction("export", "Export", toggleExport) : null,
+      share && S.canShare ? extraAction("share", "Share", () => openShareDialog()) : (admin ? extraAction("share", "Share", () => openShare()) : null),
+      canMove() ? extraAction("moveToLayer", "Move to…", openMoveDialog) : null,
+      role !== "viewer" ? extraAction("panel", "Side panel", togglePanel) : null,
+      extraAction(ui.theme === "dark" ? "sun" : "moon", "Light / dark", toggleTheme),
+    ]);
+    const actions = h("div.island.top-right.header-actions", {},
+      role === "presenter" ? [
+        h("button.btn.ghost.desk-only.header-extra", { title: "Insert a Mermaid flowchart", "aria-label": "Insert Mermaid flowchart", disabled: !may, onclick: () => openDialog("mermaid") }, icon("mermaid", { size: 16 })),
+        h("button.btn.ghost.desk-only.header-extra", { title: "Export SVG / PNG (⌘⇧E)", "aria-label": "Export board", onclick: toggleExport }, icon("export", { size: 16 }))] : null,
+      h("button.btn.ghost.desk-only.header-extra", { "aria-label": "Notes", title: "Notes", onclick: toggleNotes }, icon("note", { size: 16 }), "Notes ", h("span.dim", {}, String(notesCount()))),
+      collab ? h("button.btn.ghost.desk-only.header-extra", { "aria-label": "Comments", title: "Comments (or right-click the board)", onclick: () => toggleDrawer("comments") }, icon("comments", { size: 16 })) : null,
+      // Who's here (`here`): the collab UI's live avatar row, kept across rebuilds (a node, moved, never rebuilt here).
+      collab ? collab.parts.avatars : h("div.avatars", {},
+        h("span.stack", {}, h("span.av.live", { style: { background: "var(--u-me)" }, title: `${me.name} (you)` }, me.name.slice(0, 2).toUpperCase()))),
+      share && S.canShare
+        ? h("button.btn.primary.desk-only.header-extra", { "aria-haspopup": "dialog", "data-share-open": "1", title: "Share this board", "aria-label": "Share board", onclick: () => openShareDialog() }, icon("share", { size: 15 }), "Share")
+        : (admin ? h("button.btn.primary.desk-only.header-extra", { title: "Share board", "aria-label": "Share board", onclick: () => openShare() }, icon("share", { size: 15 }), "Share") : null),
+      canMove() ? h("button.btn.desk-only.header-extra", { "aria-haspopup": "dialog", "data-move-open": "1", title: "Move this board to another Space", onclick: () => openMoveDialog() }, icon("moveToLayer", { size: 15 }), "Move to…") : null,
+      pillEl,                                                   // the pill: one node, updated in place (inPlace)
+      role !== "viewer" ? h("button.tb.desk-only.header-extra" + (ui.panel.open ? ".on" : ""), { title: "Side panel (I)", "aria-label": "Inspector panel", onclick: togglePanel }, h("span.ic", {}, icon("panel", { size: 17 })), h("span.k", {}, "I")) : null,
+      h("button.tb.header-extra" + (role === "viewer" ? "" : ".theme-btn"), { title: "Light / dark", "aria-label": "Toggle color theme", onclick: toggleTheme }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 17 }))),
+      role !== "viewer" ? h("button.tb.phone-only.paste-btn", { title: "Paste from clipboard", "aria-label": "Paste from clipboard", "data-action": "paste", disabled: !may, onclick: () => { pasteFromClipboard(); } }, h("span.ic", {}, icon("paste", { size: 18 }))) : null,
+      h("button.tb.phone-only.overflow-btn", { title: "More", "aria-label": "More options", onclick: () => { ui.sheet = ui.sheet === "tools" ? null : "tools"; chromeDirty = true; } }, h("span.ic", {}, icon("more", { size: 18 }))),
+      more, menu);
+    closeMoreMenu = e => { if (ui.moreOpen && !actions.contains(e.target)) setMore(false); };
+    const brandHref = homeHref || (admin ? "/" : null);
     return [
       h("div.island.top-left", {},
-        admin
-          ? h("a.brand-mark", { href: "/", title: "All boards", "aria-label": "All boards", style: { textDecoration: "none" } }, icon("brand", { size: 15 }))
+        brandHref
+          ? h("a.brand-mark", { href: brandHref, title: homeHref ? "Home" : "All boards", "aria-label": homeHref ? "Home" : "All boards", style: { textDecoration: "none" } }, icon("brand", { size: 15 }))
           : h("span.brand-mark", { "aria-hidden": "true" }, icon("brand", { size: 15 })),
-        h("span.board-name", {}, board, net.kind === "ws" ? null : [" ", h("small", {}, "· dev room")])),
+        h("span.board-name", {}, board, net.kind === "ws" ? null : [" ", h("small", {}, "· dev room")]),
+        moveInfo.space ? h("span.board-space", { title: "The Space this board is in" }, "in ", moveInfo.space.name) : null),
       h("div.tools.desk-only.island.tool-rail", { "aria-label": "Drawing tools" }, core.map(t => toolButton(t)), extras.length ? h("span.sep") : null, extras.map(t => toolButton(t, ".new")),
         role !== "viewer" ? [h("span.sep"),
           h("button.tb" + (S.toolLock() ? ".on" : ""), { title: "Keep the tool after drawing (Q)", "aria-label": "Lock tool", disabled: !may, onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 17 })), h("span.k", {}, "Q")),
           h("button.tb", { title: "Undo (⌘Z)", "aria-label": "Undo", disabled: !may, onclick: () => { S.act(activeStream(), e => e.undo()); } }, h("span.ic", {}, icon("undo", { size: 17 }))),
           h("button.tb", { title: "Redo (⌘⇧Z)", "aria-label": "Redo", disabled: !may, onclick: () => { S.act(activeStream(), e => e.redo()); } }, h("span.ic", {}, icon("redo", { size: 17 })))] : null),
       h("span.spacer"),
-      h("div.island.top-right", {},
-        role === "presenter" ? [
-          h("button.btn.ghost.desk-only", { title: "Insert a Mermaid flowchart", "aria-label": "Insert Mermaid flowchart", disabled: !may, onclick: () => openDialog("mermaid") }, icon("mermaid", { size: 16 })),
-          h("button.btn.ghost.desk-only", { title: "Export SVG / PNG (⌘⇧E)", "aria-label": "Export board", onclick: () => openDialog("export") }, icon("export", { size: 16 }))] : null,
-        h("button.btn.ghost.desk-only", { title: "Notes", onclick: () => { ui.drawer = ui.drawer ? null : "notes"; chromeDirty = true; } }, icon("note", { size: 16 }), "Notes ", h("span.dim", {}, String(notesCount()))),
-        collab ? h("button.btn.ghost.desk-only", { title: "Comments (or right-click the board)", "aria-label": "Comments", onclick: () => { ui.drawer = ui.drawer === "comments" ? null : "comments"; chromeDirty = true; } }, icon("comments", { size: 16 })) : null,
-        // Who's here (`here`): the collab UI's live avatar row, kept across rebuilds (a node, moved, never rebuilt here).
-        collab ? collab.parts.avatars : h("div.avatars", {},
-          h("span.stack", {}, h("span.av.live", { style: { background: "var(--u-me)" }, title: `${me.name} (you)` }, me.name.slice(0, 2).toUpperCase()))),
-        pillEl,                                                   // the pill: one node, updated in place (inPlace)
-        admin ? h("button.btn.primary.desk-only", { title: "Share board", "aria-label": "Share board", onclick: () => openShare() }, icon("share", { size: 15 }), "Share") : null,
-        role !== "viewer" ? h("button.tb.desk-only" + (ui.panel.open ? ".on" : ""), { title: "Side panel (I)", "aria-label": "Inspector panel", onclick: () => setPanel({ type: "open" }) }, h("span.ic", {}, icon("panel", { size: 17 })), h("span.k", {}, "I")) : null,
-        h("button.tb.theme-btn", { title: "Light / dark", "aria-label": "Toggle color theme", onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 17 }))),
-        role !== "viewer" ? h("button.tb.phone-only.paste-btn", { title: "Paste from clipboard", "aria-label": "Paste from clipboard", "data-action": "paste", disabled: !may, onclick: () => { pasteFromClipboard(); } }, h("span.ic", {}, icon("paste", { size: 18 }))) : null,
-        h("button.tb.phone-only.overflow-btn", { title: "More", "aria-label": "More options", onclick: () => { ui.sheet = ui.sheet === "tools" ? null : "tools"; chromeDirty = true; } }, h("span.ic", {}, icon("more", { size: 18 })))),
+      actions,
     ];
   }
   const pillTitle = cls => pillTitleFor({ cls, status: S.status, viewer: S.effective === "viewer", readOnly: S.readOnly });
@@ -687,28 +796,33 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   }
 
   // The notes stream as a list: text, author (you, or "—" for others), jump / edit / delete.
-  function notesList() {
+  // The notes drawer's list element (kept so rows can be refreshed while the compose box is being typed in).
+  const notesRefs = { list: null };
+  function notesList(rowsOnly = false) {
     const N = S.eds.notes, may = S.may();
     const { notes, labels } = notesInfo(N.doc);
     const label = e => (e.type === "text" ? e.text : labels.get(e.id)?.text) || { freedraw: "Highlight / drawing", image: "Picture", arrow: "Arrow", line: "Line" }[e.type] || "Note";
     const rows = notes.slice(0, 200).map(e => {
       const mine = S.isMine(e.id), canChange = may && mine;
       const jump = () => { S.eds.board.cancelCamera(); N.fit([e]); S.syncView("notes"); chromeDirty = true; };
-      return h("div.note-row", {}, h("span.sw", { style: { background: safeColor(e.backgroundColor !== "transparent" ? e.backgroundColor : e.strokeColor), width: "10px", height: "10px" } }),
+      return h("div.note-row", { role: "listitem", "aria-label": `Note: ${label(e)}, by ${S.mine.has(e.id) ? "you" : "someone else"}`, "data-fk": `note:${e.id}:row`, tabindex: "-1" }, h("span.sw", { style: { background: safeColor(e.backgroundColor !== "transparent" ? e.backgroundColor : e.strokeColor), width: "10px", height: "10px" } }),
         h("div.txt", {}, h("div", {}, label(e)),
           h("div.meta", {}, h("span", { style: { fontWeight: 600 } }, S.mine.has(e.id) ? "You" : "—"), e.type === "freedraw" ? h("span", {}, "highlight") : null),
-          h("div.acts", {}, h("button", { onclick: jump }, "jump to"),
+          h("div.acts", {}, h("button", { "data-fk": `note:${e.id}:jump`, onclick: jump }, "jump to"),
             may && S.effective !== "viewer" ? (canChange ? [
-              h("button", { onclick: () => { jump(); S.act("notes", n => { n.select([e.id]); n.beginText(e, { x: e.x, y: e.y }); }); } }, "edit"),
-              h("button", { onclick: () => S.act("notes", n => n.deleteIds([e.id])) }, "delete")] : h("span.lock", {}, icon("lock", { size: 12 }), " someone else's")) : null)));
+              h("button", { "data-fk": `note:${e.id}:edit`, onclick: () => { jump(); S.act("notes", n => { n.select([e.id]); n.beginText(e, { x: e.x, y: e.y }); }); } }, "edit"),
+              h("button", { "data-fk": `note:${e.id}:delete`, onclick: () => S.act("notes", n => n.deleteIds([e.id])) }, "delete")] : h("span.lock", {}, icon("lock", { size: 12 }), " someone else's")) : null)));
     });
+    const list = h("div.notes-list", { role: "list", "aria-label": "Notes" }, rows.length ? rows : h("div.hint", { style: { padding: "6px 8px" } }, "No notes yet."), notes.length > 200 ? h("div.hint", {}, `${notes.length - 200} more`) : null);
+    if (rowsOnly) return list;
+    notesRefs.list = list;
     const compose = !may || S.effective === "viewer"
       ? h("div.hint.compose", {}, S.role === "viewer" ? "Viewers read notes; only annotators and presenters add them." : "Read-only: you can't add or change notes.")
       : h("div.compose", {}, h("textarea.field", { placeholder: "Write a note… it lands at the center of your view", rows: 2, onkeydown: e => {
         e.stopPropagation();
         if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); const v = e.currentTarget.value.trim(); if (!v) return; const b = S.eds.board; S.placeNote(b.toWorld({ x: b.size.w / 2, y: b.size.h / 2 }), v); e.currentTarget.value = ""; chromeDirty = true; }
       } }));
-    return [h("div.notes-list", {}, rows.length ? rows : h("div.hint", { style: { padding: "6px 8px" } }, "No notes yet."), notes.length > 200 ? h("div.hint", {}, `${notes.length - 200} more`) : null), compose];
+    return [list, compose];
   }
   function drawerBody(which) {
     // Comment threads: the collab UI's drawer (its own Notes/Comments header is hidden here; ours switches).
@@ -717,18 +831,18 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   }
   function drawerTabs(key) {
     const which = ui[key] || "notes";
-    return h("span.seg", {}, h("button" + (which === "notes" ? ".on" : ""), { onclick: () => { ui[key] = "notes"; chromeDirty = true; } }, "Notes"),
-      h("button" + (which === "comments" ? ".on" : ""), { onclick: () => { ui[key] = "comments"; chromeDirty = true; } }, "Comments"));
+    return h("span.seg", {}, h("button" + (which === "notes" ? ".on" : ""), { "data-fk": `drawer-tab:${key}:notes`, onclick: () => { ui[key] = "notes"; chromeDirty = true; } }, "Notes"),
+      h("button" + (which === "comments" ? ".on" : ""), { "data-fk": `drawer-tab:${key}:comments`, onclick: () => { ui[key] = "comments"; chromeDirty = true; } }, "Comments"));
   }
 
   const T = id => toolsFor("presenter").find(t => t.id === id);
   function dock() {
     const may = S.may(), role = S.role;
-    const btn = (icName, label, on, onclick, disabled = false) => h("button.tb" + (on ? ".on" : ""), { onclick, disabled }, h("span.ic", {}, icon(icName, { size: 20 })), label);
+    const btn = (icName, label, on, onclick, disabled = false, ariaLabel = label) => h("button.tb" + (on ? ".on" : ""), { onclick, disabled, "aria-label": ariaLabel, title: ariaLabel, ...(label === "More" ? { "data-dock-more": "1" } : {}) }, h("span.ic", {}, icon(icName, { size: 20 })), label);
     const sheet = id => () => { ui.sheet = ui.sheet === id ? null : id; chromeDirty = true; };
     const tool = id => btn(id, T(id).name, S.tool === id, () => { if (id === "image") openPicker(); S.setTool(id); chromeDirty = true; }, !may);
     let items;
-    if (role === "presenter") items = [...["select", "freedraw", "rectangle", "text"].map(tool), btn("more", "More", ui.sheet === "tools", sheet("tools")), btn("panel", "Style", ui.sheet === "panel", sheet("panel")), btn("note", "Notes", ui.sheet === "notes", sheet("notes")), btn("comments", "Comments", ui.sheet === "comments", sheet("comments"))];
+    if (role === "presenter") items = [...["select", "freedraw", "rectangle", "text"].map(id => id === "rectangle" ? btn(id, "Rect", S.tool === id, () => { S.setTool(id); chromeDirty = true; }, !may, T(id).name) : tool(id)), btn("more", "More", ui.sheet === "tools", sheet("tools")), btn("panel", "Style", ui.sheet === "panel", sheet("panel")), btn("note", "Notes", ui.sheet === "notes", sheet("notes")), btn("comments", "Comments", ui.sheet === "comments", sheet("comments"))];
     else if (role === "annotator") items = [...["select", "note", "highlighter", "freedraw"].map(tool), btn("more", "More", ui.sheet === "tools", sheet("tools")), btn("panel", "Style", ui.sheet === "panel", sheet("panel")), btn("note", "Notes", ui.sheet === "notes", sheet("notes"))];
     else items = [btn("chevronLeft", "Prev", false, () => S.stepFrame(-1)), btn("fit", "Fit", false, () => S.fit()), btn("chevronRight", "Next", false, () => S.stepFrame(1)), btn("note", "Notes", ui.sheet === "notes", sheet("notes")), btn("comments", "Comments", ui.sheet === "comments", sheet("comments"))];
     replace($("#dock"), items);
@@ -792,7 +906,10 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         : null;
       body = h("div.scroll", {}, quickActions, h("div.tool-grid", {}, toolsFor(S.role).map(t => h("button.tb" + (S.tool === t.id ? ".on" : ""), { disabled: t.id !== "hand" && !may, "data-tool": t.id, onclick: () => { if (t.id === "image") openPicker(); S.setTool(t.id); ui.sheet = null; chromeDirty = true; } }, h("span.ic", {}, icon(t.id, { size: 20 })), t.name)),
         S.role === "presenter" ? [h("button.tb", { disabled: !may, onclick: () => openDialog("mermaid") }, h("span.ic", {}, icon("mermaid", { size: 20 })), "Mermaid"), h("button.tb", { onclick: () => openDialog("export") }, h("span.ic", {}, icon("export", { size: 20 })), "Export")] : null,
-        admin ? h("button.tb", { onclick: () => { ui.sheet = null; chromeDirty = true; openShare(); } }, h("span.ic", {}, icon("share", { size: 20 })), "Share") : null,
+        share && S.canShare
+          ? h("button.tb", { onclick: () => { ui.sheet = null; chromeDirty = true; openShareDialog(); } }, h("span.ic", {}, icon("share", { size: 20 })), "Share")
+          : (admin ? h("button.tb", { onclick: () => { ui.sheet = null; chromeDirty = true; openShare(); } }, h("span.ic", {}, icon("share", { size: 20 })), "Share") : null),
+        canMove() ? h("button.tb", { onclick: () => openMoveDialog() }, h("span.ic", {}, icon("moveToLayer", { size: 20 })), "Move to…") : null,
         S.role !== "viewer" ? h("button.tb" + (S.toolLock() ? ".on" : ""), { disabled: !may, onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 20 })), "Lock tool") : null,
         h("button.tb", { onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 20 })), ui.theme === "dark" ? "Light" : "Dark")));
     } else if (ui.sheet === "panel") body = h("div.scroll", {}, panelNodes(true));
@@ -830,6 +947,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const a = h("a", { href: URL.createObjectURL(blob), download: name }); document.body.append(a); a.click(); a.remove();
     clock.set(() => URL.revokeObjectURL(a.href), 5000);
   }
+  // A dialog control that changes what the dialog shows (a format chip) rebuilds the dialog: remember which control had focus so chrome() puts it back.
+  function rebuildDialog(d) { pendingFocus = captureFocus(chromeRoots()); d.replaceChildren(); chromeDirty = true; }
   function dialogs() {
     if (activeShare) return;
     const d = $("#dialogs"), may = S.may();
@@ -842,7 +961,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       replace(d, h("div.dialog-veil", { onclick: e => { if (e.target === e.currentTarget) close(); } }, h("div.dialog", { role: "dialog", "aria-label": "Insert a Mermaid flowchart" },
         h("h2", {}, icon("mermaid", { size: 17 }), " Insert a Mermaid flowchart", h("span.spacer"), h("button.tb", { onclick: close, title: "Close", "aria-label": "Close" }, icon("close", { size: 16 }))),
         h("div.dbody", {}, h("div.cols", {}, ta, h("div.preview", {}, cv)),
-          h("div.row", {}, h("span.lab", {}, "Arrows"), h("span.opts", {}, chip("straight", !ui.mermaid.elbow, () => { ui.mermaid.elbow = false; ui.dialog = "mermaid"; d.replaceChildren(); chromeDirty = true; }), chip("elbow", ui.mermaid.elbow, () => { ui.mermaid.elbow = true; d.replaceChildren(); chromeDirty = true; }))),
+          h("div.row", {}, h("span.lab", {}, "Arrows"), h("span.opts", {}, chip("straight", !ui.mermaid.elbow, () => { ui.mermaid.elbow = false; ui.dialog = "mermaid"; rebuildDialog(d); }), chip("elbow", ui.mermaid.elbow, () => { ui.mermaid.elbow = true; rebuildDialog(d); }))),
           h("div.hint", {}, "Flowcharts only (graph / flowchart, TD TB BT LR RL, subgraphs become frames). Pasting Mermaid text on the board does the same.")),
         h("footer", {}, h("button.btn", { onclick: close }, "Cancel"), h("button.btn.primary", { disabled: !may, onclick: () => {
           let err = null;
@@ -851,7 +970,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         } }, "Insert as shapes")))));
       mermaidPreview(cv);
     } else if (ui.dialog === "export" && S.role === "presenter") {
-      const cv = h("canvas"), x = ui.export, set = (k, v) => { x[k] = v; d.replaceChildren(); chromeDirty = true; };
+      const cv = h("canvas"), x = ui.export, set = (k, v) => { x[k] = v; rebuildDialog(d); };
       replace(d, h("div.dialog-veil", { onclick: e => { if (e.target === e.currentTarget) close(); } }, h("div.dialog", { style: { width: "min(520px,100%)" }, role: "dialog", "aria-label": "Export the board" },
         h("h2", {}, icon("export", { size: 17 }), " Export the board", h("span.spacer"), h("button.tb", { onclick: close, title: "Close", "aria-label": "Close" }, icon("close", { size: 16 }))),
         h("div.dbody", {}, h("div.preview", { style: { minHeight: "120px" } }, cv),
@@ -872,7 +991,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const expiry = () => expiryNotice({ expAt, now: clock.now() });
   function banners() {
     const out = [];
-    const b = connectionBanner({ status: S.status, online: S.online, viewer: S.effective === "viewer", pending: S.pending, readOnly: S.readOnly,
+    const b = S.status === "refused" && trashShown() ? null : connectionBanner({ status: S.status, online: S.online, viewer: S.effective === "viewer", pending: S.pending, readOnly: S.readOnly,
       limited: S.limited, nextTryIn: nextTryIn(), relogin: !!relogin });
     if (b) out.push(h("div.banner", {}, b.text,
       b.relogin ? [reloginLink(), " "] : null,
@@ -903,10 +1022,10 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   document.addEventListener("pointerdown", e => { if (e.target !== canvas) chromeHeld = true; }, true);
   addEventListener("pointerup", () => { chromeHeld = false; }, true);
   addEventListener("pointercancel", () => { chromeHeld = false; }, true);
-  // Don't rebuild a panel or drawer the person is typing in.
+  // Don't rebuild a panel or drawer the user is typing in.
   const busy = el => el.contains(document.activeElement) && /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName);
   // What every part depends on from the page and the session (a change rebuilds them all, as chromeDirty does).
-  const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.colorPicker, ui.library.length].join("|");
+  const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.colorPicker, ui.library.length, S.canShare, canMove()].join("|");
   const notesRowsKey = () => {
     const { notes, labels } = notesInfo(S.eds.notes.doc);
     return JSON.stringify([notes.length, S.mine.size, notes.slice(0, 200).map(e => [e.id, e.text ?? labels.get(e.id)?.text ?? "", e.backgroundColor, e.strokeColor, S.isMine(e.id)])]);
@@ -924,13 +1043,34 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const sel = isPhone() && ed ? ed.selected().filter(e => !isLabel(e)) : [];
     return JSON.stringify([boardInfo(S.eds.board.doc).framesSig, S.eds.board.frameAt, canUndo, canRedo, sel.length, sel[0]?.strokeColor ?? ""]);
   };
+  const buildTopbar = () => {
+    const root = $("#topbar"), active = document.activeElement;
+    const ownsFocus = root.contains(active);
+    const identity = ownsFocus && {
+      ariaLabel: active.getAttribute?.("aria-label"),
+      title: active.getAttribute?.("title"),
+      role: active.getAttribute?.("role"),
+    };
+    replace(root, topbar());
+    if (!identity) return root;
+    const descendants = [];
+    const visit = el => { for (const child of el.children) { descendants.push(child); visit(child); } };
+    visit(root);
+    const same = descendants.find(el => identity.ariaLabel
+      ? el.getAttribute?.("aria-label") === identity.ariaLabel
+      : identity.title ? el.getAttribute?.("title") === identity.title : identity.role && el.getAttribute?.("role") === identity.role);
+    const closedMenuItem = identity.role === "menuitem" && !ui.moreOpen;
+    const fallback = closedMenuItem ? descendants.find(el => el.getAttribute?.("aria-label") === "More") : null;
+    (fallback ?? same)?.focus?.();
+    return root;
+  };
   const parts = {
-    topbar: { key: () => notesCount(), build: () => replace($("#topbar"), topbar()) },
+    topbar: { key: () => `${notesCount()}${S.canShare ? ":share" : ""}${canMove() ? ":move" : ""}:${moveInfo.space?.id ?? ""}:${moveInfo.space?.name ?? ""}`, build: buildTopbar },
     panel: { key: () => (S.role === "viewer" || !ui.panel.open ? "" : panelKey()), build: buildPanel },
     drawer: { key: () => (ui.drawer === "notes" ? notesRowsKey() : ""), build: buildDrawer },
-    timeline: { key: () => { const B = S.eds.board, bi = boardInfo(B.doc); return S.role !== "presenter" ? "" : JSON.stringify([bi.marks, bi.spansSig, bi.dur, !!B.play, B.playLoop, B.playSpeed, B.reducedMotion]); }, build: timeline },
+    timeline: { key: () => { const B = S.eds.board, bi = boardInfo(B.doc), t = B.time(); return S.role !== "presenter" ? "" : JSON.stringify([bi.marks, bi.spansSig, bi.dur, !!B.play, B.playLoop, B.playSpeed, B.reducedMotion, B.play ? null : t]); }, build: timeline },
     hud: { key: hudKey, build: hud },
-    overlays: { key: () => JSON.stringify([S.status, S.online, S.pending, S.limited, nextTryIn() == null ? null : Math.ceil(nextTryIn() / 1000), S.settingsRefused.map(r => [r.stream, r.i, r.ready, r.code, r.keys]), expiry()?.bucket ?? null]), build: () => replace($("#overlays"), banners()) },
+    overlays: { key: () => JSON.stringify([S.status, trashShown(), S.online, S.pending, S.limited, nextTryIn() == null ? null : Math.ceil(nextTryIn() / 1000), S.settingsRefused.map(r => [r.stream, r.i, r.ready, r.code, r.keys]), expiry()?.bucket ?? null]), build: () => replace($("#overlays"), banners()) },
     dock: { key: () => "", build: dock },
     sheet: { key: () => (!ui.sheet || !isPhone() ? "" : ui.sheet === "panel" ? panelKey() : ui.sheet === "tools" ? "" : notesRowsKey()), build: sheetView },
     dialogs: { key: () => (ui.dialog === "export" ? `${S.eds.board.doc.rev}|${JSON.stringify(ui.export)}` : `${ui.mermaid.elbow}`), build: dialogs },
@@ -957,10 +1097,18 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const drawer = $("#drawer");
     drawer.hidden = !ui.drawer;
     if (!ui.drawer) return true;
-    if (busy(drawer)) return false;
+    if (busy(drawer)) {
+      // Typing in the compose box: refresh only the rows (a note just added must show), and leave the box (its text, its focus) alone.
+      if (ui.drawer !== "notes" || !notesRefs.list || !drawer.contains(notesRefs.list)) return false;
+      notesRefs.list.replaceChildren(...notesList(true).childNodes);
+      return true;
+    }
     replace(drawer, h("header", {}, h("h3", {}, "Annotations"), drawerTabs("drawer"), h("button.tb", { title: "Close", "aria-label": "Close annotations", onclick: () => { ui.drawer = null; chromeDirty = true; } }, icon("close", { size: 16 }))), drawerBody(ui.drawer));
     return true;
   }
+  // Focus across a rebuild of the chrome: wherever it was inside a rebuilt root, it goes back to that control's twin (by label, title, text or position).
+  let pendingFocus = null;
+  const chromeRoots = () => ["#topbar", "#panel", "#drawer", "#timeline", "#hudBL", "#hudBC", "#hudBR", "#dock", "#sheet", "#dialogs", "#overlays"].map(sel => $(sel)).filter(Boolean);
   function chrome() {
     inPlace();
     document.body.classList.toggle("stale", S.status !== "live");
@@ -974,12 +1122,25 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if ((S.gesture || !chromeDirty) && now - chromeAt < CHROME_MS) return;   // mid-drag, playback, incoming ops: a few times a second at most
     const env = envKey(), force = chromeDirty || env !== keys.env;
     chromeDirty = false; gateKey = gate; chromeAt = now; keys.env = env;
+    const held = pendingFocus ?? captureFocus(chromeRoots());
+    pendingFocus = null;
     for (const [name, part] of Object.entries(parts)) {
       const k = part.key();
       if (!force && k === keys[name]) continue;
       if (part.build() === false) { keys[name] = undefined; continue; }   // busy: try again later
       keys[name] = k; rebuilds[name]++;
     }
+    restoreFocus(held);
+    if (collab && isPhone()) {
+      const canvasRect = canvas.getBoundingClientRect();
+      const overlays = [$("#sheet"), $("#dock")];
+      const inset = overlays.reduce((max, el) => {
+        const rect = el.getBoundingClientRect();
+        return rect.height > 0 && rect.bottom > canvasRect.top && rect.top < canvasRect.bottom
+          ? Math.max(max, canvasRect.bottom - rect.top) : max;
+      }, 0);
+      collab.setBottomInset(inset);
+    } else collab?.setBottomInset(0);
   }
 
   // ── loop ──
@@ -1043,7 +1204,10 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     // Either clock: mono may not advance through a laptop's sleep on every platform; a false positive costs one reconnect.
     if (was && since(was) > RESUME_PROBE_MS && !(heard && since(heard) <= HEARD_MS)) probe();
   });
-  matchMedia("(max-width: 640px)").addEventListener("change", () => { chromeDirty = true; });
+  matchMedia("(max-width: 1023px)").addEventListener("change", () => { chromeDirty = true; });
+  matchMedia("(min-width: 1024px) and (max-width: 1279px)").addEventListener("change", e => {
+    if (!e.matches && ui.moreOpen) { ui.moreOpen = false; chromeDirty = true; }
+  });
   setTheme(ui.theme);
   let savedMine = 0, fitted = false, mineUser = me.user;
   function saveMine() {
@@ -1058,7 +1222,15 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (S.mine.size !== savedMine) { savedMine = S.mine.size; put(mineKeyOf(mineUser), JSON.stringify([...S.mine].slice(-5000))); }
   }
   // First catch-up done: show everything once.
-  function fitOnce() { if (fitted || S.status !== "live") return; fitted = true; if (S.eds.board.doc.live().length || S.eds.notes.doc.live().length) S.fit({ animate: false }); }
+  function fitOnce() {
+    if (fitted || S.status !== "live") return;
+    const hasContent = S.eds.board.doc.live().length || S.eds.notes.doc.live().length;
+    if (!S.eds.board.size.w || !S.eds.board.size.h) return;
+    if (!hasContent) { fitted = true; return; }
+    if (S.gesture) return;
+    fitted = true;
+    S.fit({ animate: false });
+  }
   let lastFrameAt = clock.mono();
   (function frame() {
     const nowAt = clock.mono(), dt = Math.max(0, Math.min(100, nowAt - lastFrameAt));

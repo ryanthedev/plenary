@@ -4,7 +4,7 @@
 //
 // `make()` returns a FRESH adapter plus its test driver:
 //   idp                          the adapter (begin, finish)
-//   authorize(begun, identity?)  plays the person signing in at the IdP for the flow `begun` (what begin() returned)
+//   authorize(begun, identity?)  plays the user signing in at the IdP for the flow `begun` (what begin() returned)
 //                                and returns the authorization code the IdP would redirect back with
 //   expected                     the Identity that authorize() produces by default
 //   outage(on)                   optional: make the IdP unreachable (true) or reachable again (false)

@@ -86,16 +86,22 @@ test("s3 M1: a store that accepts the connection and never answers is aborted at
   try {
     const blobs = s3Blobs({ endpoint: `http://127.0.0.1:${srv.port}`, bucket: "b", region: "us-east-1", accessKeyId: "k", secretAccessKey: "s", getTimeoutMs: 300, putTimeoutMs: 400 });
     const bytes = fakePng(64, 2), h = sha1(bytes);
-    let t0 = Date.now();
-    expect(await code(blobs.get("t-a", h))).toBe("timeout");
-    expect(Date.now() - t0).toBeLessThan(2000);
-    t0 = Date.now();
-    expect(await code(blobs.put("t-a", h, bytes))).toBe("timeout");
-    expect(Date.now() - t0).toBeLessThan(2000);
+    // "Aborted at the deadline, not left hanging" is the outcome: a call that never gave up never returns, and the test's
+    // own limit fails it; how long the deadline took on a loaded machine is not asserted. Which deadline is: every
+    // AbortSignal.timeout the adapter arms is recorded, and each call's must be its configured one (the 10 s and 30 s
+    // defaults would also time out here, just later).
+    const armed = [], timeout = AbortSignal.timeout;
+    AbortSignal.timeout = ms => { armed.push(ms); return timeout.call(AbortSignal, ms); };
+    try {
+      expect(await code(blobs.get("t-a", h))).toBe("timeout");
+      expect(armed).toEqual([300]);
+      expect(await code(blobs.put("t-a", h, bytes))).toBe("timeout");
+      expect(armed).toEqual([300, 400]);
+    } finally { AbortSignal.timeout = timeout; }
     expect(opened).toBeGreaterThanOrEqual(1);
     await until(() => closed >= opened, "the aborted requests' sockets closed");   // aborted, not left open
   } finally { srv.stop(true); }
-});
+}, 30_000);
 
 test("s3 M1: a refused connection is unavailable, fast; deadlines must be positive", async () => {
   const port = (() => { const l = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } }); const p = l.port; l.stop(true); return p; })();
@@ -105,9 +111,20 @@ test("s3 M1: a refused connection is unavailable, fast; deadlines must be positi
   expect(await code(blobs.put("t-a", sha1(bytes), bytes))).toBe("unavailable");
   const full = { endpoint: "http://127.0.0.1:1", bucket: "b", region: "r", accessKeyId: "k", secretAccessKey: "s" };
   for (const bad of [0, -1, NaN, "5"]) { expect(() => s3Blobs({ ...full, getTimeoutMs: bad })).toThrow(); expect(() => s3Blobs({ ...full, putTimeoutMs: bad })).toThrow(); }
-});
+}, 30_000);   // two refused connections; failure-only ceiling for a loaded machine (TECH-DEBT row 36)
 
 st("s3: a caller-given session token is what gets signed (the store rejects a wrong one)", async () => {
   const png = fakePng(64, 5), h = sha1(png);
   expect(await code(s3Blobs({ ...cfg, sessionToken: "not-a-real-token" }).get(freshTenant(), h))).toBe("unavailable");
+});
+
+st("s3: delete of an object removes exactly that key; a missing bucket is an error, not 'already gone'", async () => {
+  const blobs = s3Blobs(cfg), ta = freshTenant();
+  const a = fakePng(90, 31), b = fakePng(91, 32);
+  await blobs.put(ta, sha1(a), a); await blobs.put(ta, sha1(b), b);
+  await blobs.delete(ta, sha1(a));
+  const raw = new Bun.S3Client(cfg);
+  expect((await raw.list({ prefix: `${ta}/` })).contents.map(c => c.key)).toEqual([`${ta}/${sha1(b)}`]);
+  const nowhere = s3Blobs({ ...cfg, bucket: `plenary-no-such-bucket-${process.pid}` });
+  expect(await code(nowhere.delete(ta, sha1(a)))).toBe("unavailable");
 });

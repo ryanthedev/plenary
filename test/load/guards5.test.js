@@ -1,207 +1,239 @@
-// The load client's guards from the p8-load4v review (p8-load5): dropping everyone (or half the clients) mid-run and
-// refusing rejoins reads INCOMPLETE, exit 1 (finding 1: connectedAtEnd < planned and skippedOffline > made for a due
-// writer role); the due clock starts at each client's first welcome, so a slow welcome on a healthy server reads
-// VALID (finding 2); unknown flags, a flag given as a value, --rig " " and an overly long ramp exit 2 (finding 3).
+// The load client's guards from the p8-load4v review (p8-load5): a server that drops clients mid-run and refuses
+// their rejoins is not VALID (MEDIUM: clients must stay connected, ops must not mostly be skipped offline); a
+// client's due clock starts at its welcome, not its connect (L2); unknown flags, a flag given as another flag's
+// value, and a ramp of years are refused, and --rig goes through the same empty-flag check (L3).
 
-import { test, expect } from "bun:test";
-import { mkdtempSync, writeFileSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { test, expect, beforeAll, afterAll } from "bun:test";
+import { tmp, cleanTmp, useScratch, scenarioGroup, childEnv } from "./tmp.js";
+import { writeFileSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { mergeResults, buildResult, headline, exitCode, parseArgs, parseOptions, MAX_RAMP_S } from "../../scripts/load/run.js";
-import { fakeServer } from "./fake-server.js";
+import { mergeResults, buildResult, headline, exitCode, parseArgs, parseOptions, dueRoles, run, MAX_RAMP_S } from "../../scripts/load/run.js";
 
 const RUN = resolve(import.meta.dir, "../../scripts/load/run.js");
-const CAL_DIR = resolve(import.meta.dir, "../../docs/m2/load/2026-11-12-calibration");
-const tmp = p => mkdtempSync(join(tmpdir(), p));
-const env = () => ({ PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR ?? tmpdir() });
+beforeAll(useScratch); afterAll(cleanTmp);
+const env = childEnv;
 async function cli(args) {
   const p = Bun.spawn([process.execPath, RUN, ...args], { stdout: "pipe", stderr: "pipe", env: env() });
   const [stdout, stderr, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
   return { stdout, stderr, code };
 }
-const tokensFile = (dir, n = 1) => {
-  const t = {}; for (let i = 0; i < n; i++) t[`lt-g5TOK${i}`] = { name: `g${i}`, role: "editor" };
+const tokensFile = (dir, n, role = "editor") => {
+  const t = {}; for (let i = 0; i < n; i++) t[`lt-g5TOK${i}`] = { name: `g${i}`, role };
   const p = join(dir, "t.json"); writeFileSync(p, JSON.stringify(t), { mode: 0o600 }); return p;
 };
 
-// ---- finding 1: connectedAtEnd < planned and skippedOffline > made ----
+// ---- the verdict, from counts ----
 
 const worker = counts => ({ worker: 0, pid: 1, cpu: [5], cpuLoadMean: 5, cpuLoadMs: 1000, lag: { n: 0, sum: 0, counts: [] },
-  stats: { counts: { joined: 4, neverJoined: 0, clients: 4, connectedAtEnd: 4, dueClients_editor: 2, dueClients_annotator: 0, ...counts }, closes: {}, errors: {}, hists: {}, joinsPerSec: {} } });
-const judge = (counts, config = { opRate: 2, noteRate: 0, commentRate: 0, duration: 30 }, plan = { editor: 2, annotator: 0, viewer: 2 }) =>
-  buildResult({ merged: mergeResults([worker(counts)]), config: { url: "ws://x", board: "b", ...config }, counts: plan, startedAt: 0, finishedAt: 1 });
+  stats: { counts: { joined: 4, neverJoined: 0, clients: 4, connectedAtEnd: 4, ...counts }, closes: {}, errors: {}, hists: {}, joinsPerSec: {} } });
+const judge = (counts, config = {}, plan = { editor: 4, annotator: 0, viewer: 0 }) =>
+  buildResult({ merged: mergeResults([worker(counts)]), config: { url: "ws://x", board: "b", opRate: 2, noteRate: 0, commentRate: 0, duration: 30, ...config }, counts: plan, startedAt: 0, finishedAt: 1 });
+const ok = { opsMade: 40, opsMade_editor: 40, opsSent: 40, acks: 40, echoes: 40 };
 
-test("buildResult + headline: disconnected clients at end or skippedOffline > made for a due role is INCOMPLETE", () => {
-  // All ops answered, but 2 of 4 clients are disconnected at the end.
-  const halfDown = judge({ connectedAtEnd: 2, opsMade: 20, opsMade_editor: 20, opsSent: 20, acks: 20, echoes: 20 });
-  expect([halfDown.clients.connected, halfDown.ops.answered, halfDown.complete, exitCode(halfDown)]).toEqual([false, true, false, 1]);
-  expect(headline(halfDown)).toBe("INCOMPLETE (2 of 4 planned clients were not connected at the end)");
-
-  // Everyone connected at the end (rejoined during drain), but editors skipped more ticks offline than ops made.
-  const keptOut = judge({ connectedAtEnd: 4, opsMade: 10, opsMade_editor: 10, opsSent: 10, acks: 10, echoes: 10, skippedOffline: 11, skippedOffline_editor: 11 });
-  expect([keptOut.clients.connected, keptOut.ops.answered, keptOut.ops.keptOut, keptOut.complete, exitCode(keptOut)]).toEqual([true, false, ["editor"], false, 1]);
-  expect(headline(keptOut)).toBe("INCOMPLETE (editors skipped 11 ops offline, more than the 10 they made)");
-
-  // Brief drop: skippedOffline <= made and everyone reconnected by the drain's end -> VALID.
-  const brief = judge({ connectedAtEnd: 4, opsMade: 10, opsMade_editor: 10, opsSent: 10, acks: 10, echoes: 10, skippedOffline: 10, skippedOffline_editor: 10 });
-  expect([brief.clients.connected, brief.ops.answered, brief.complete, headline(brief), exitCode(brief)]).toEqual([true, true, true, "VALID", 0]);
-
-  // Both failed at once: headline names both with numbers.
-  const both = judge({ connectedAtEnd: 0, opsMade: 5, opsMade_editor: 5, opsSent: 5, acks: 5, echoes: 5, skippedOffline: 30, skippedOffline_editor: 30 });
-  expect(headline(both)).toBe("INCOMPLETE (editors skipped 30 ops offline, more than the 5 they made; 4 of 4 planned clients were not connected at the end)");
+test("stayed: a client not connected at the end is INCOMPLETE (exit 1), naming the numbers", () => {
+  expect(headline(judge(ok))).toBe("VALID");
+  const r = judge({ ...ok, connectedAtEnd: 3 });
+  expect([r.clients.stayed, r.complete, exitCode(r)]).toEqual([false, false, 1]);
+  expect(headline(r)).toBe("INCOMPLETE (only 3 of 4 clients were connected at the end)");
+  expect(headline(judge({ ...ok, connectedAtEnd: 0 }))).toContain("only 0 of 4 clients were connected at the end");
 });
 
-/** Fake server for dropMid / dropMidErr / partialDrop / slowWelcome. */
-function scriptedServer(mode, { dropAfterMs = 800, welcomeDelayMs = 0 } = {}) {
-  const conns = new Set();
-  let dropped = false, seq = 0, timer = null;
+test("lateJoined: a client welcomed after the join ceiling is INCOMPLETE (exit 1), naming the numbers", () => {
+  const r = judge({ ...ok, lateJoined: 1 });
+  expect([r.clients.lateJoined, r.clients.complete, r.complete, exitCode(r)]).toEqual([1, false, false, 1]);
+  expect(headline(r)).toBe("INCOMPLETE (1 of 4 clients were welcomed more than 10 s after they first connected)");
+  expect(headline(judge({ ...ok, lateJoined: 0 }))).toBe("VALID");
+});
+
+test("present: with a role due, ops skipped offline above ops made is INCOMPLETE; equal passes; nothing due is not judged", () => {
+  expect(headline(judge({ ...ok, skippedOffline: 40 }))).toBe("VALID");
+  const r = judge({ ...ok, skippedOffline: 41 });
+  expect([r.ops.present, r.complete, exitCode(r)]).toEqual([false, false, 1]);
+  expect(headline(r)).toBe("INCOMPLETE (41 ops were skipped offline against 40 made)");
+  // No role due (op rate 0): a joins-only run; ops skipped offline are not judged.
+  expect(headline(judge({ skippedOffline: 5 }, { opRate: 0 }))).toBe("VALID");
+});
+
+test("due clock: with the workers' dueClients counts a role is due only if a client had a whole window after its welcome", () => {
+  const plan = { editor: 2, annotator: 1, viewer: 0 }, cfg = { opRate: 2, noteRate: 2, commentRate: 0, duration: 30 };
+  expect(dueRoles(plan, cfg)).toEqual(["editor", "annotator"]);                                    // the plan alone
+  expect(dueRoles(plan, cfg, { editor: 1, annotator: 0 })).toEqual(["editor"]);                    // the annotator welcomed too late
+  expect(dueRoles(plan, cfg, { editor: 0, annotator: 0 })).toEqual([]);
+  const r = judge({ dueClients: 0, dueClients_editor: 0 }, { duration: 1, opRate: 1.5 }, { editor: 1, annotator: 0, viewer: 0 });
+  expect([r.ops.due, r.ops.missing]).toEqual([[], []]);
+});
+
+// ---- live: drop clients mid-run, refuse their rejoins; a slow welcome ----
+
+/**
+ * A fake server: welcomes everyone, echoes and acks every op. `welcomeDelay`: ms before each welcome. `drop` (after
+ * `dropAfter` ms from the first hello): "all" closes every socket 1013, "half" closes the sockets of the first half
+ * of the users, "one" the first user's only; their later hellos are refused by `refuse`: "close" (1013 at once) or
+ * "error" (error unavailable), or, with `rejoinDelay` (ms), welcomed that long after the hello (a server that comes
+ * back late), or, with `refuse: null`, welcomed at once (a transient drop).
+ */
+function midServer({ welcomeDelay = 0, drop = null, dropAfter = 1500, refuse = "close", users = 4, rejoinDelay = null, dropOne = false } = {}) {
+  let seq = 0, timer = null; const log = []; const dropped = new Set(), conns = new Set();
+  const sendAll = o => { for (const c of conns) if (c.data.welcomed) c.send(JSON.stringify(o)); };
   const server = Bun.serve({
     port: 0, hostname: "127.0.0.1",
-    fetch(req, srv) { return srv.upgrade(req, { data: {} }) ? undefined : new Response("ws only", { status: 400 }); },
+    fetch(req, srv) { return srv.upgrade(req, { data: { welcomed: false } }) ? undefined : new Response("ws only", { status: 400 }); },
     websocket: {
-      open(ws) { conns.add(ws); },
-      close(ws) { conns.delete(ws); },
+      open(ws) { conns.add(ws); }, close(ws) { conns.delete(ws); },
       message(ws, raw) {
         const m = JSON.parse(String(raw));
         if (m.t === "hello") {
-          ws.data.client = m.client;
-          const isVictim = mode !== "partialDrop" || (Number(m.client?.match(/^load-[a-z](\d+)/)?.[1] ?? 0) % 2 === 0);
-          if (dropped && isVictim) {
-            if (mode === "dropMidErr") { ws.send(JSON.stringify({ t: "error", code: "unavailable", message: "down" })); ws.close(1013, "down"); }
-            else ws.close(1013, "down");
-            return;
+          if (dropped.has(m.token) && !rejoinDelay && refuse) {
+            if (refuse === "error") ws.send(JSON.stringify({ t: "error", code: "unavailable" }));
+            ws.close(1013, "busy"); return;
           }
-          const sendWelcome = () => {
-            if (ws.readyState !== 1) return;
-            ws.send(JSON.stringify({ t: "welcome", user: "dev:g0", role: "editor", seq, horizon: 0 }));
-          };
-          if (welcomeDelayMs > 0) setTimeout(sendWelcome, welcomeDelayMs);
-          else sendWelcome();
-          if ((mode === "dropMid" || mode === "dropMidErr" || mode === "partialDrop") && !timer) {
-            timer = setTimeout(() => {
-              dropped = true;
-              for (const c of [...conns]) {
-                const v = mode !== "partialDrop" || (Number(c.data.client?.match(/^load-[a-z](\d+)/)?.[1] ?? 0) % 2 === 0);
-                if (v) c.close(1013, "mid-run drop");
-              }
-            }, dropAfterMs);
-          }
-          return;
-        }
-        if (m.t === "op") {
-          seq++;
-          ws.send(JSON.stringify({ t: "ack", id: m.id, seq }));
-          const entry = JSON.stringify({ t: "entry", seq, id: m.id, by: "dev:g0", stream: m.stream, op: m.op });
-          for (const c of conns) if (c.readyState === 1) c.send(entry);
+          const delay = dropped.has(m.token) && rejoinDelay ? rejoinDelay : welcomeDelay;
+          if (drop && !timer) timer = setTimeout(() => {
+            const all = [...conns].filter(c => c.data.token);
+            const victims = drop === "all" ? all : drop === "one" ? all.slice(0, 1) : all.slice(0, Math.floor(users / 2));
+            for (const c of victims) { dropped.add(c.data.token); c.close(1013, "gone"); }
+          }, dropAfter);
+          ws.data.token = m.token;
+          const reply = () => { ws.data.welcomed = true; ws.send(JSON.stringify({ t: "welcome", user: "dev:g", role: "editor", seq, horizon: 0 })); const back = log.filter(e => e.seq > (m.since ?? 0)); if (back.length) ws.send(JSON.stringify({ t: "entries", entries: back })); };
+          delay ? setTimeout(() => { if (ws.readyState === 1) reply(); }, delay) : reply();
+        } else if (m.t === "op") {
+          const e = { seq: ++seq, id: m.id, by: "dev:g", at: Date.now(), stream: m.stream, op: m.op };
+          log.push(e); sendAll({ t: "entries", entries: [e] });
+          if (ws.readyState === 1) ws.send(JSON.stringify({ t: "ack", id: m.id, seq: e.seq }));
         }
       },
     },
   });
-  return { url: `ws://127.0.0.1:${server.port}/ws`, stop: () => { if (timer) clearTimeout(timer); server.stop(true); } };
+  return { url: `ws://127.0.0.1:${server.port}/ws`, stop: () => { clearTimeout(timer); server.stop(true); } };
+}
+async function liveRun(url, extra = [], { editors = 4, duration = 5, opRate = 4, viewers = 0 } = {}) {
+  const dir = tmp("plenary-load-g5live-");
+  const r = await cli(["--url", url, "--board", "b", "--tokens", tokensFile(dir, viewers || editors, viewers ? "viewer" : "editor"), ...(viewers ? ["--editors", "0", "--viewers", String(viewers)] : ["--editors", String(editors)]), "--ramp", "10", "--duration", String(duration), "--drain", "1", "--op-rate", String(opRate), "--cursor-rate", "0", "--out", join(dir, "out"), ...extra]);
+  return { ...r, res: JSON.parse(readFileSync(join(dir, "out", "result.json"), "utf8")) };
 }
 
-test("live CLI dropMid: server answers first ops, then drops everyone 1013 and refuses rejoins -> INCOMPLETE, exit 1", async () => {
-  const s = scriptedServer("dropMid", { dropAfterMs: 700 });
-  const dir = tmp("plenary-load-dropmid-"), tokens = tokensFile(dir);
-  let r;
-  try {
-    r = await cli(["--url", s.url, "--board", "b", "--tokens", tokens, "--editors", "2", "--ramp", "20", "--duration", "4", "--drain", "1", "--op-rate", "6", "--out", join(dir, "out")]);
-  } finally { s.stop(); }
-  const res = JSON.parse(readFileSync(join(dir, "out", "result.json"), "utf8"));
-  expect(res.ops.made.total).toBeGreaterThan(0);
-  expect(res.clients.connectedAtEnd).toBe(0);
-  expect(res.clients.connected).toBe(false);
-  expect(res.ops.skippedOfflineBy.editor).toBeGreaterThan(res.ops.made.editor);
-  expect([res.complete, r.code]).toEqual([false, 1]);
-  expect(r.stdout).toContain("INCOMPLETE (");
-  expect(r.stdout).toContain("2 of 2 planned clients were not connected at the end");
-}, 25000);
+// The live scenarios each need a few seconds of a real run. They are independent (own server, own CLI process), so
+// they run at once, started by the first test that asks for one; each test then checks its own.
+const group = scenarioGroup(), scenarios = group.fns, scenario = group.get;
+const withServer = (opts, body) => async () => { const s = midServer(opts); try { return await body(s); } finally { s.stop(); } };
 
-test("live CLI dropMidErr: later hellos get error unavailable -> INCOMPLETE, exit 1", async () => {
-  const s = scriptedServer("dropMidErr", { dropAfterMs: 700 });
-  const dir = tmp("plenary-load-dropmiderr-"), tokens = tokensFile(dir);
-  let r;
-  try {
-    r = await cli(["--url", s.url, "--board", "b", "--tokens", tokens, "--editors", "2", "--ramp", "20", "--duration", "4", "--drain", "1", "--op-rate", "6", "--out", join(dir, "out")]);
-  } finally { s.stop(); }
-  const res = JSON.parse(readFileSync(join(dir, "out", "result.json"), "utf8"));
-  expect(res.ops.made.total).toBeGreaterThan(0);
-  expect(res.clients.connectedAtEnd).toBe(0);
-  expect([res.complete, r.code]).toEqual([false, 1]);
-  expect(r.stdout).toContain("INCOMPLETE (");
-}, 25000);
+for (const [name, drop, refuse, left] of [
+  ["drops every client mid-run and refuses rejoins (close 1013)", "all", "close", 0],
+  ["drops every client mid-run and answers rejoins with an error", "all", "error", 0],
+  ["drops half the clients for good", "half", "close", 2],
+]) {
+  scenarios[name] = withServer({ drop, refuse, dropAfter: 800 }, s => liveRun(s.url, [], { duration: 3 }));
+  test(`live CLI: a server that ${name} headlines INCOMPLETE and exits 1`, async () => {
+    const r = await scenario(name);
+    expect(r.res.clients.connectedAtEnd).toBe(left);
+    expect(r.res.ops.made.total).toBeGreaterThan(0);                  // it did answer ops before the drop
+    expect([r.res.clients.stayed, r.res.complete, r.code]).toEqual([false, false, 1]);
+    expect(r.stdout).toContain(`**INCOMPLETE (only ${left} of 4 clients were connected at the end`);
+  }, 30000);
+}
 
-test("live CLI partialDrop: dropping half the clients for good -> INCOMPLETE, exit 1", async () => {
-  const s = scriptedServer("partialDrop", { dropAfterMs: 700 });
-  const dir = tmp("plenary-load-partial-"), tokens = tokensFile(dir);
-  let r;
-  try {
-    r = await cli(["--url", s.url, "--board", "b", "--tokens", tokens, "--editors", "4", "--ramp", "40", "--duration", "3", "--drain", "1", "--op-rate", "4", "--out", join(dir, "out")]);
-  } finally { s.stop(); }
-  const res = JSON.parse(readFileSync(join(dir, "out", "result.json"), "utf8"));
-  expect(res.ops.made.total).toBeGreaterThan(0);
-  expect(res.clients.connectedAtEnd).toBe(2);
-  expect(res.clients.connected).toBe(false);
-  expect([res.complete, r.code]).toEqual([false, 1]);
-  expect(r.stdout).toContain("2 of 4 planned clients were not connected at the end");
-}, 25000);
-
-// ---- finding 2: due clock starts at welcome, so slowWelcome on a healthy server reads VALID ----
-
-test("live CLI slowWelcome: welcome delayed 900 ms on a 1 s run at 1.5/s -> VALID, exit 0", async () => {
-  const s = scriptedServer("slowWelcome", { welcomeDelayMs: 900 });
-  const dir = tmp("plenary-load-sloww-"), tokens = tokensFile(dir);
-  let r;
-  try {
-    r = await cli(["--url", s.url, "--board", "b", "--tokens", tokens, "--editors", "1", "--ramp", "10", "--duration", "1", "--drain", "1", "--op-rate", "1.5", "--out", join(dir, "out")]);
-  } finally { s.stop(); }
-  const res = JSON.parse(readFileSync(join(dir, "out", "result.json"), "utf8"));
-  expect(res.clients.complete).toBe(true);
-  expect(res.clients.connected).toBe(true);
-  expect([res.complete, r.code]).toEqual([true, 0]);
+scenarios.healthy = withServer({}, s => liveRun(s.url, [], { duration: 2 }));
+test("live CLI: a healthy server reads VALID, exit 0 (the new rules do not flip a good run)", async () => {
+  const r = await scenario("healthy");
+  expect([r.res.clients.connectedAtEnd, r.res.clients.stayed, r.res.ops.present, r.res.complete, r.code]).toEqual([4, true, true, true, 0]);
   expect(r.stdout).toContain("**VALID**");
-}, 20000);
+}, 30000);
 
-// ---- finding 3: unknown flags, flag-as-value, --rig " ", ramp cap ----
+scenarios.slow = withServer({ welcomeDelay: 900, users: 1 }, s => liveRun(s.url, [], { editors: 1, duration: 1, opRate: 1.5 }));
+test("live CLI: a slow welcome on a healthy server reads VALID (the due clock starts at the welcome); ticks before it are not skipped", async () => {
+  const r = await scenario("slow");
+  expect(r.res.ops.skippedOffline).toBe(0);
+  expect([r.res.ops.due, r.res.complete, r.code]).toEqual([[], true, 0]);
+  expect(r.stdout).toContain("**VALID**");
+}, 30000);
 
-test("parseArgs and parseOptions: unknown flags, flag-as-value, and ramp cap refused", () => {
-  expect(() => parseArgs(["--op_rate", "5"])).toThrow("unknown flag --op_rate (see --help)");
+// X4 (p8-load5v LOW 3): the due clock is each client's FIRST welcome. Every client is dropped at 0.8 s and welcomed
+// back 3.5 s later, about 1.1 s before the end: measured from that second welcome no role is due and the run would read
+// VALID with no ops made; from the first welcome the editors were due, offline most of the run, and it is INCOMPLETE.
+scenarios.lateRejoin = withServer({ drop: "all", dropAfter: 800, rejoinDelay: 3500 }, s => liveRun(s.url, [], { duration: 5, opRate: 1 }));
+test("live CLI: clients dropped at once and welcomed back late read INCOMPLETE (the due clock is the first welcome, not the last)", async () => {
+  const r = await scenario("lateRejoin");
+  expect(r.res.clients.connectedAtEnd).toBe(4);                      // they did come back before the end
+  expect(r.res.ops.due).toEqual(["editor"]);
+  expect(r.res.ops.skippedOffline).toBeGreaterThan(r.res.ops.made.total);
+  expect([r.res.ops.present, r.res.complete, r.code]).toEqual([false, false, 1]);
+  expect(r.stdout).toMatch(/\*\*INCOMPLETE \(.*skipped offline/);   // "no editor op was made though … ops skipped offline" or "N ops were skipped offline against M made": which depends on ops made before the drop
+}, 30000);
+
+// L3 (p8-load5v LOW 4): one client dropped 200 ms before generation ends and let back in at once is back within the
+// drain's rejoin grace: VALID. The same drop with the rejoin refused stays INCOMPLETE (the three drop tests above).
+scenarios.transient = withServer({ drop: "one", dropAfter: 3200, refuse: null }, s => liveRun(s.url, [], { duration: 3 }));
+test("live CLI: one client dropped just before the end and let back in reads VALID (a bounded rejoin grace); a permanent drop does not", async () => {
+  const r = await scenario("transient");
+  expect(r.res.connections.closes["1013"]).toBe(1);                  // the drop really happened
+  expect(r.res.connections.rejoins).toBeGreaterThanOrEqual(1);
+  expect([r.res.clients.connectedAtEnd, r.res.clients.stayed, r.res.complete, r.code]).toEqual([4, true, true, 0]);
+  expect(r.stdout).toContain("**VALID**");
+}, 30000);
+
+// A long outage that happens to end inside the grace is still an outage (p8-load5v2 MEDIUM): viewers only, so nothing
+// but "connected at the end" can catch it. Dropped at 0.5 s (3.9 s before generation ends), welcomed back 4.5 s later plus
+// the reconnect wait: after generation ends (about 4.4 s), inside the 3 s after it.
+scenarios.longOutage = withServer({ drop: "all", dropAfter: 500, rejoinDelay: 4500 }, s => liveRun(s.url, [], { viewers: 4, duration: 4 }));
+test("live CLI: a long outage that ends inside the rejoin grace still reads INCOMPLETE (the grace is for a drop just before the end)", async () => {
+  const r = await scenario("longOutage");
+  expect(r.res.ops.due).toEqual([]);                                 // nothing but "stayed" can catch it
+  expect([r.res.clients.stayed, r.res.complete, r.code]).toEqual([false, false, 1]);
+  expect(r.stdout).toContain("**INCOMPLETE (only ");
+}, 30000);
+
+scenarios.permanentNearEnd = withServer({ drop: "one", dropAfter: 3200, refuse: "close" }, s => liveRun(s.url, [], { duration: 3 }));
+test("live CLI: one client dropped just before the end and refused stays INCOMPLETE after the grace", async () => {
+  const r = await scenario("permanentNearEnd");
+  expect([r.res.clients.connectedAtEnd, r.res.clients.stayed, r.code]).toEqual([3, false, 1]);
+  expect(r.stdout).toContain("**INCOMPLETE (only 3 of 4 clients were connected at the end");
+}, 30000);
+
+// (b): welcomed later than the join ceiling after its first connect = not joined in time. run() takes the ceiling as
+// an internal option (joinCeilingMs, as serverEnv); the CLI uses 10 s.
+scenarios.lateJoin = withServer({ welcomeDelay: 1500, users: 2 }, async s => {
+  const dir = tmp("plenary-load-g5late-");
+  return run({ url: s.url, board: "b", tokens: tokensFile(dir, 2), editors: "2", ramp: "10", duration: "2", drain: "1", "op-rate": "4", "cursor-rate": "0", out: join(dir, "out"), joinCeilingMs: 1000 }, { log: () => {} });
+});
+test("a client welcomed more than the join ceiling after it first connected is INCOMPLETE (exit 1), not VALID", async () => {
+  const res = await scenario("lateJoin");
+  expect(res.clients).toMatchObject({ planned: 2, joined: 2, neverJoined: 0, lateJoined: 2, complete: false });
+  expect(headline(res)).toBe("INCOMPLETE (2 of 2 clients were welcomed more than 1 s after they first connected)");
+  expect([res.complete, exitCode(res)]).toEqual([false, 1]);
+}, 30000);
+
+// ---- L3: arguments ----
+
+test("parseArgs refuses an unknown flag and a flag whose value is another flag, naming it", () => {
+  expect(() => parseArgs(["--op_rate", "5"])).toThrow("unknown flag --op_rate");
   expect(() => parseArgs(["--tokens", "--local"])).toThrow("--tokens needs a value, not the flag --local");
-  expect(() => parseArgs(["--rig", "--create-board"])).toThrow("--rig needs a value, not the flag --create-board");
-  expect(() => parseOptions({ viewers: "1000000", ramp: "1" })).toThrow(`at most ${MAX_RAMP_S} s; raise --ramp`);
-  // At the ramp bound (3600 s): accepted.
-  expect(parseOptions({ editors: "0", viewers: "3600", ramp: "1" }).counts.viewer).toBe(3600);
+  expect(() => parseArgs(["--viewers", "5", "--bogus"])).toThrow("unknown flag --bogus");
+  expect(() => parseArgs(["--out"])).toThrow("--out needs a value");
+  // names on Object.prototype are not flags (a plain `in` check would accept them)
+  for (const k of ["toString", "constructor", "hasOwnProperty", "__proto__", "valueOf"]) expect(() => parseArgs([`--${k}`, "5"])).toThrow(`unknown flag --${k}`);
+  // a flag given twice is refused, booleans included
+  expect(() => parseArgs(["--op-rate", "4", "--op-rate", "0.5"])).toThrow("--op-rate given twice");
+  expect(() => parseArgs(["--local", "--local"])).toThrow("--local given twice");
+  // every real flag still parses
+  expect(parseArgs(["--local", "--create-board", "--viewers", "5", "--viewers-per-user", "2", "--tokens", "/x", "--op-rate", "0"])).toEqual({ local: true, "create-board": true, viewers: "5", "viewers-per-user": "2", tokens: "/x", "op-rate": "0" });
 });
 
-test("CLI exit 2: --op_rate 5, --tokens --local, --rig \" \", and ramp over 3600 s", async () => {
-  const cases = [
-    [["--op_rate", "5"], "unknown flag --op_rate (see --help)"],
-    [["--tokens", "--local"], "--tokens needs a value, not the flag --local"],
-    [["--rig", " ", "--editors", "1"], "load: --rig is empty"],
-    [["--viewers", "1000000", "--ramp", "1"], "load: the ramp would take 1000005 s (clients / --ramp): at most 3600 s; raise --ramp"],
-  ];
-  for (const [args, msg] of cases) {
-    const r = await cli(args);
-    expect([r.code, r.stderr.trim()]).toEqual([2, msg]);
-  }
-}, 20000);
+test("CLI: unknown flags and flag-as-value exit 2 with a message naming the flag; --rig ' ' gets the empty-flag message", async () => {
+  const a = await cli(["--local", "--op_rate", "5"]);
+  expect([a.code, a.stderr]).toEqual([2, "unknown flag --op_rate (see --help)\n"]);
+  const b = await cli(["--tokens", "--local"]);
+  expect([b.code, b.stderr]).toEqual([2, "--tokens needs a value, not the flag --local\n"]);
+  const d = await cli(["--editors", "1", "--editors", "2"]);
+  expect([d.code, d.stderr]).toEqual([2, "--editors given twice\n"]);
+  const e = await cli(["--local", "--toString", "5", "--editors", "1"]);
+  expect([e.code, e.stderr]).toEqual([2, "unknown flag --toString (see --help)\n"]);
+  const c = await cli(["--rig", " ", "--editors", "1"]);
+  expect([c.code, c.stderr]).toEqual([2, "load: --rig is empty\n"]);
+});
 
-// ---- calibration result.json files: neither new rule flips any of the 15 documented runs ----
-
-test("none of the 15 calibration result.json files flips under connectedAtEnd or skippedOffline > made", () => {
-  const files = [];
-  const walk = d => {
-    for (const f of readdirSync(d)) {
-      const p = join(d, f);
-      if (statSync(p).isDirectory()) walk(p);
-      else if (f === "result.json") files.push(p);
-    }
-  };
-  walk(CAL_DIR);
-  expect(files.length).toBe(15);
-  for (const p of files) {
-    const r = JSON.parse(readFileSync(p, "utf8"));
-    expect(r.clients.connectedAtEnd).toBe(r.clients.planned);
-    expect(r.ops.skippedOffline).toBeLessThanOrEqual(r.ops.sent.total);
-  }
+test("the ramp may take at most 3600 s: refused past it, accepted at it", () => {
+  expect(MAX_RAMP_S).toBe(3600);
+  expect(() => parseOptions({ editors: "0", viewers: "1000000", ramp: "1" })).toThrow(/ramp would take 1000000 s/);
+  expect(() => parseOptions({ editors: "0", viewers: "3600", ramp: "1" })).not.toThrow();
+  expect(() => parseOptions({ editors: "0", viewers: "3601", ramp: "1" })).toThrow(/ramp would take/);
 });

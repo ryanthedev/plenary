@@ -23,6 +23,9 @@
 //     (this server's). The first four are checked at build time; the redirect URI is the caller's duty.
 //     config.boardUrl       absolute URL template with "{board}"; where a redeemed share link lands
 //     config.publicUrl      optional absolute base URL; when set, a created link carries `url` (<publicUrl>/links/<id>)
+//     config.devSignIn      optional { board, users: [{ name, token, role }], hosts: [hostname], waitMs?: Registry wait, default 3000 }: GET /auth/dev answers it, only while
+//                           `dev` is on and the request's Host is one of `hosts` (else 404: a DNS-rebinding page can't read it)
+//     config.requestDeadlineMs  every route answers within this many ms (default 8000) or 503 `unavailable`; deps.timers { set, clear } runs it (tests pass a virtual one)
 //     config.maxBody        JSON body cap in bytes (default 16384)
 //     config.maxLoginStates replay-guard size cap (default 100000); when full, callbacks get 503 (fails closed).
 //                           The used-code set of /auth/exchange has the same cap and also fails closed.
@@ -31,21 +34,36 @@
 // Routes (anything else, including /health, /ws, /blobs/*, /metrics, gives null):
 //   GET    /auth/login                         302 to Google; login state in a signed short-lived cookie
 //   GET    /auth/callback                      302 to postLoginUrl (or the board of a pending share link) #code=…,
-//                                              sets the exchange cookie (docs/m2/contracts/auth-exchange.md)
+//                                              sets the exchange cookie
 //   POST   /auth/exchange                      { code } + exchange cookie + Origin → 200 { token, user, name, email,
 //                                              domain, exp }; 400 invalid-code; 403 bad-origin; 503 unavailable
 //   GET    /auth/logout                        clears the login cookie, 302 to postLogoutUrl
-//   GET    /boards                             → 200 { boards, isAdmin }; boards accessible in caller's tenant
-//   POST   /boards                             { title?, memberRole? } → 201 { board }; tenant = the caller's
+//   GET    /boards                             → 200 { boards, isAdmin }; boards accessible in caller's tenant(s)
+//   POST   /boards                             { title?, space?, memberRole?, tenant? } → 201 { board }; board.create at `space`, else the personal space
+//   PATCH  /boards/:board                      { title?, memberRole? } → 200 { board }; DELETE /boards/:board → 204
 //   GET    /boards/:board/audit                ?limit=&before= → 200 { events, nextBefore } (owner or tenant admin)
+//   GET    /boards/:board/snapshot             ?seq=&ticket= → 200/304 (F9 off-WS HTTP catch-up)
 //   GET    /admin/audit                        ?limit=&before=&board= → 200 { events, nextBefore } (tenant admin)
+//   GET|POST /tenants, GET|POST /tenants/:id/members, DELETE /tenants/:id/members/:email (self-serve personal orgs)
+//   GET /spaces?can=board.create, GET /groups?can=space.create,
+//   POST /spaces, GET|PATCH /spaces/:id, GET|PATCH /groups/:id: PROTOCOL.md § Spaces and Groups (server/auth/spaces.js)
+//   GET|POST /teams, GET|PATCH|DELETE /teams/:id, PUT|DELETE /teams/:id/members/:user, GET /directory,
+//   GET /access/:type/:id, PUT|DELETE /access/:type/:id/grants/:subjectType/:subject: PROTOCOL.md § Teams and access (server/auth/access.js)
+//   POST /access/:type/:id/requests, DELETE /access/:type/:id/requests/:user, GET /boards/:board/explain: PROTOCOL.md § Access explanation and requests
+//   GET|POST /roles, PATCH|DELETE /roles/:id: PROTOCOL.md § Roles (server/auth/roles.js)
+//   GET    /boards/:board/share                → { board, unit: { domains }, limits, invites: [{ …, guest }], links: [{ …, url? }], more } (the Share dialog's one read; `members.manage`)
 //   GET    /boards/:board/invites              → { invites }
-//   POST   /boards/:board/invites              { email, role, expiresAt? } → 201 { invite }
+//   POST   /boards/:board/invites              { email, role, expiresAt? (default now + 30 days; null = never) } → 201 { invite: { …, guest } }
 //   DELETE /boards/:board/invites/:invite      → 204
 //   GET    /boards/:board/links                → { links }
 //   POST   /boards/:board/links                { role, expiresAt? } → 201 { link, url? }
 //   DELETE /boards/:board/links/:link          → 204
 //   PUT    /boards/:board/grants/:user         { role | null } → 204   (user ids are URL-encoded, e.g. google%3A123)
+//   GET    /home                               → { guest, user, unit, recent, starred, owned, shared, tree, limits }   (needs `home`; PROTOCOL.md § Home)
+//   GET    /home/search?q=                     → { q, results, more }   (q: 1-100 chars, else 400)
+//   GET    /home/search?space=<id>             → { space, results, more }   (the Space's boards the person can open; `space` null unless they can open the Space)
+//   PUT    /home/stars/:board                  → 204 (403 `forbidden` for a guest, or without a role on the board)
+//   DELETE /home/stars/:board                  → 204
 //   GET    /links/:link                        redeem: Bearer → 200 { board, url }; no Bearer → sign in first,
 //                                              the link rides in the login cookie, the callback redeems it
 //
@@ -72,7 +90,14 @@
 //   This handler never throws (the engine would turn a throw into a 500).
 
 import { b64url, unb64url, utf8, fromUtf8, higher, isTenantAdminRecord } from "./util.js";
-import { AdminError, listBoards, createBoard, updateBoard, deleteBoard, createInvite, listInvites, revokeInvite, createLink, listLinks, revokeLink, setGrant, listBoardAudit, listTenantAudit } from "../admin/boards.js";
+import { spaceService } from "./spaces.js";
+import { accessService } from "./access.js";
+import { explainService } from "./explain.js";
+import { rolesService } from "./roles.js";
+import { moveService } from "./move.js";
+import { trashService } from "./trash.js";
+import { offboardService } from "./offboard.js";
+import { AdminError, listBoards, createBoard, updateBoard, deleteBoard, createInvite, listInvites, readInvite, revokeInvite, createLink, listLinks, readLink, revokeLink, setGrant, shareView, listBoardAudit, listTenantAudit } from "../admin/boards.js";
 import { createPersonalTenant, listTenants, listTenantMembers, addTenantMember, removeTenantMember } from "../admin/tenants.js";
 
 export const LOGIN_COOKIE = "__Host-plen_login";
@@ -82,6 +107,12 @@ const CODE_TTL_SEC = 60;
 const COOKIE_ATTRS = "Path=/; Secure; HttpOnly; SameSite=Lax";
 const XCHG_ATTRS = "Path=/; Secure; HttpOnly; SameSite=Strict";
 
+/** How long GET /auth/dev waits for the Registry before it answers 503 (a tighter bound than the request deadline). */
+const DEV_MENU_WAIT_MS = 3000;
+/** The default request deadline (PROTOCOL.md "HTTP request deadline"): under the idle cut (server.js sets 30 s; Bun's own default is 10 s) and the inner limits main.js sets. */
+export const REQUEST_DEADLINE_MS = 8000;
+/** `Idempotency-Key`: 8-64 of [A-Za-z0-9_-] (PROTOCOL.md "Idempotent creates"). */
+const IDEM_KEY = /^[A-Za-z0-9_-]{8,64}$/;
 const NO_STORE = { "cache-control": "no-store" };
 const json = (status, body, headers = {}) =>
   new Response(body === undefined ? null : JSON.stringify(body), {
@@ -112,10 +143,14 @@ const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
  *   oidc?: import("./idp-port.js").IdP | null,
  *   tenancy: { redeemLink(id: object, link: string): Promise<{board: string}|null>, tenantOf(id: object): Promise<{id: string}|null> },
  *   now?: () => number, config: object, dev?: { enabled?: boolean, verify(t: string): Promise<object|null> } | null,
- *   testHooks?: { pruned?(p: { visited: number, expired: number, live: number }): void } | null }} deps   (tests only, not an API)
+ *   testHooks?: { pruned?(p: { visited: number, expired: number, live: number }): void, routes?(table: { pattern: string, methods: string[], names: string[] }[]): void } | null }} deps   (tests only, not an API)
  */
-export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Date.now, config = {}, dev = null, log = stdoutLog, testHooks = null, snapshot = null, snapshotTickets = null }) {
+export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, explainer = explainService({ registry, now }), spaces = spaceService({ registry, tenancy, home, now, explainer }), moves = moveService({ registry, tenancy, spaces, now }), trash = trashService({ registry, tenancy, spaces, now }), access = accessService({ registry, tenancy, now, explainer, announce: spaces.announceChange, backlog: spaces.backlog, settled: spaces.settled }), roles = rolesService({ registry, tenancy, announce: spaces.announceChange }), offboard = offboardService({ registry, tenancy, announce: spaces.announceChange }), config = {}, dev = null, log = stdoutLog, testHooks = null, snapshot = null, snapshotTickets = null, timers = { set: (f, ms) => setTimeout(f, ms), clear: h => clearTimeout(h) } }) {
   if (!registry || !sessions || !tenancy) throw new Error("http: registry, sessions and tenancy are required");
+  /** `p`, or a rejection with message "timeout" after `ms` on the injected timers. */
+  const bounded = (p, ms) => new Promise((res, rej) => { const t = timers.set(() => rej(new Error("timeout")), ms); p.then(v => { timers.clear(t); res(v); }, e => { timers.clear(t); rej(e); }); });
+  const deadlineMs = config.requestDeadlineMs ?? REQUEST_DEADLINE_MS;
+  if (!Number.isInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 2 ** 31 - 1) throw new Error("http: config.requestDeadlineMs must be a positive integer (ms)");
   const postLoginUrl = absUrl(config.postLoginUrl, "postLoginUrl");
   const postLogoutUrl = config.postLogoutUrl ? absUrl(config.postLogoutUrl, "postLogoutUrl") : postLoginUrl;
   if (typeof config.boardUrl !== "string" || !config.boardUrl.includes("{board}")) throw new Error("http: config.boardUrl must contain {board}");
@@ -207,7 +242,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
     const code = b64url(crypto.getRandomValues(new Uint8Array(32)));
     const h = b64url(await crypto.subtle.digest("SHA-256", utf8(code)));
     const exp = Math.floor(now() / 1000) + CODE_TTL_SEC;
-    // Field types per docs/m2/contracts/auth-exchange.md: name/email/domain string or null (empty name → null).
+    // Field types: name/email/domain string or null (empty name → null).
     const str = (v, max = 320) => (typeof v === "string" && v ? v.slice(0, max) : null);
     const payload = b64url(utf8(JSON.stringify({ h, u: identity.user, n: str(identity.name, 200), e: str(identity.email), d: str(identity.domain, 253), exp })));
     const mac = b64url(await crypto.subtle.sign("HMAC", await macKey, utf8("x1." + payload)));
@@ -231,6 +266,25 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
     } catch { return null; }
   }
 
+  // The member directory write after a sign-in: best effort and bounded. At most TOUCH_MAX in flight and one per user at a time; the excess is
+  // dropped (the person's next Home records them). A slot frees only when the write itself settles: the Registry adapters bound their own calls
+  // (SQLite busy_timeout, Postgres lock_timeout/statement_timeout), so a hang cannot hold it for long. config.touchTimeoutMs (default 5 s,
+  // clamped like devSignIn.waitMs) only stops WAITING: it logs, it never frees the slot. A failure, a slow write or a drop logs one
+  // rate-limited line that identifies no one.
+  const TOUCH_MAX = 16, touching = new Set();
+  const tm = Number(config.touchTimeoutMs ?? 5000), TOUCH_MS = Number.isFinite(tm) && tm > 0 ? Math.min(2 ** 31 - 1, Math.max(1, Math.round(tm))) : 5000;
+  let lastTouchWarn = -Infinity;
+  const touchWarn = why => { if (now() - lastTouchWarn < 60_000) return; lastTouchWarn = now(); try { log?.warn?.(`member directory write ${why}; Home records the person later`); } catch {} };
+  function recordMember(identity) {
+    if (typeof registry.touchMember !== "function") return;
+    if (touching.size >= TOUCH_MAX || touching.has(identity.user)) { if (!touching.has(identity.user)) touchWarn("dropped (too many in flight)"); return; }
+    touching.add(identity.user);
+    const timer = timers.set(() => touchWarn("is slow"), TOUCH_MS);
+    (async () => { const unit = await tenancy.tenantOf(identity); if (unit) await registry.touchMember(unit.id, identity); })()
+      .catch(() => touchWarn("failed"))
+      .finally(() => { timers.clear(timer); touching.delete(identity.user); });
+  }
+
   async function exchange(req) {
     if (!oidc) return err(503, "sign-in-unavailable");
     // Origin first: a refusal here spends nothing (the contract's fake does the same).
@@ -249,6 +303,8 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
     let exp;
     try { exp = (await sessions.verify(token))?.exp; } catch { exp = null; }
     if (!Number.isInteger(exp)) { usedCodes.release(x.h); return err(503, "unavailable"); }
+    // The member directory (PROTOCOL.md § Teams and access): a Unit member who signs in is findable by the pickers. Best effort, off the request path.
+    recordMember(x.identity);
     return withCookie(json(200, { token, ...x.identity, exp }), clearXchg);
   }
 
@@ -379,8 +435,39 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
     });
   }
 
+  /** SHA-256 hex of the route, its path parameters and the body with sorted keys: what "the same request" means for a key. */
+  async function fingerprint(route, params, b) {
+    const text = JSON.stringify([route, Object.entries(params).sort(), Object.entries(b).sort(([x], [y]) => (x < y ? -1 : 1))]);
+    return [...new Uint8Array(await crypto.subtle.digest("SHA-256", utf8(text)))].map(x => x.toString(16).padStart(2, "0")).join("");
+  }
+  /**
+   * A create route's body of work, made exactly-once by the `Idempotency-Key` header (PROTOCOL.md "Idempotent creates"). `run(idem)` makes the
+   * object and resolves its 201 body; `idem` (`{ user, key, fp }`, absent without a key) goes to the Registry create, which writes the key's row in
+   * the SAME transaction as the object, so the two exist together or not at all. `rebuild(id)` answers a repeat: it authorizes the caller AGAIN, as
+   * the create did, and reads the object fresh (throws `forbidden` for a caller who lost access since). Only the object's id is stored, never a body
+   * (a link or an invite carries its secret). A repeat is answered from the row (`idemGet`) or, when it raced the first create, by the create's own
+   * `idem-replay` rejection; a changed request is 422. `run` is NOT cancelled by the request deadline: it commits or rolls back whole.
+   */
+  async function keyed(req, who, route, params, b, run, rebuild, status = 201) {
+    const k = req.headers.get("idempotency-key");
+    if (k === null) return json(status, await run(undefined));
+    if (!IDEM_KEY.test(k)) throw refuse(400, "bad-idempotency-key");
+    const idem = { user: who.user, key: k, fp: await fingerprint(route, params, b) };
+    const replayed = async id => json(status, await rebuild(id), { "idempotent-replayed": "true" });   // re-authorized for the caller as they are NOW; a refusal propagates as the route's own
+    let g;
+    try { g = await registry.idemGet(idem); } catch { throw refuse(503, "unavailable"); }
+    if (g.state === "mismatch") return err(422, "idempotency-key-reused");
+    if (g.state === "done") return replayed(g.ref);
+    try { return json(status, await run(idem)); }
+    catch (e) {
+      if (e?.code === "idem-replay") return replayed(e.ref);
+      if (e?.code === "idem-mismatch") return err(422, "idempotency-key-reused");
+      throw e;
+    }
+  }
+
   // ---- routes ----
-  const admin = { registry, now };
+  const admin = { registry, tenancy, now };
   const firstAdminTenant = async who => {
     const list = typeof tenancy.tenantsFor === "function" ? await tenancy.tenantsFor(who) : [];
     const adm = list.find(t => isTenantAdminRecord(t, who));
@@ -404,7 +491,38 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
     const rawTenant = url.searchParams.get("tenant");
     return { limit, before, board: rawBoard ? rawBoard : null, tenant: rawTenant ? rawTenant : null };
   }
+  // GET /auth/dev: the dev sign-in menu for the served page (web/adapters/auth/devconfig.js). Exists ONLY while the dev
+  // verifier is on and main.js allowed the menu (a loopback bind, no Google, a gateway, an offerable user), and it leaves out any name that is a tenant admin in the Registry
+  // right now; otherwise there
+  // is no such route (404). It publishes those dev tokens, which main.js says loudly at start.
+  const devMenu = dev && dev.enabled === true && config.devSignIn ? { board: config.devSignIn.board, users: config.devSignIn.users } : null;
+  const menuWarned = new Set();
+  let lastMenuWarn = -Infinity;
+  const devHosts = new Set((config.devSignIn?.hosts ?? []).map(h => String(h).toLowerCase()));
+  // The Host header's name, port cut off ("[::1]:8099" -> "[::1]"). Bun builds req.url from it, but read it directly.
+  const hostName = req => (req.headers.get("host") ?? "").toLowerCase().replace(/:\d*$/, "");
   const routes = [
+    ...(devMenu ? [["/auth/dev", { GET: async req => {
+      if (!devHosts.has(hostName(req))) return err(404, "not-found");
+      // Checked per request, through the Registry port: a dev name that is a tenant admin (an earlier run's admin token, or
+      // scripts/admin-bootstrap.js --admin dev:<name>, even after this server started) is never offered. A Registry that
+      // cannot answer fails closed: nothing is published.
+      let admins;
+      // Whole ms (the Registry ignores a fractional bound), at most 2^31-1 (a bigger delay overflows the timer and fires at once).
+      const w = Number(config.devSignIn.waitMs ?? DEV_MENU_WAIT_MS), waitMs = Number.isFinite(w) && w > 0 ? Math.min(2 ** 31 - 1, Math.max(1, Math.round(w))) : DEV_MENU_WAIT_MS;
+      try { admins = new Set(await bounded(registry.tenantAdminsAmong(devMenu.users.map(u => "dev:" + u.name), { timeoutMs: waitMs }), waitMs)); }
+      catch (e) {
+        // Fail closed with a hint, at most one short line per 10 s (no stack, no token).
+        if (now() - lastMenuWarn >= 10_000) { lastMenuWarn = now(); log.warn(`dev sign-in menu: ${e?.message === "timeout" ? "the Registry did not answer in time" : "the Registry failed"}; answering 503`); }
+        return err(503, "unavailable");
+      }
+      const users = devMenu.users.filter(u => !admins.has("dev:" + u.name));
+      for (const u of devMenu.users) if (admins.has("dev:" + u.name) && !menuWarned.has(u.name)) {
+        menuWarned.add(u.name);   // once per name, not per request
+        log.warn(`dev sign-in menu: ${u.name} is a tenant admin in the registry, so it is not offered`);
+      }
+      return users.length ? json(200, { board: devMenu.board, users }) : err(404, "not-found");
+    } }]] : []),
     ["/auth/login", { GET: () => beginLogin(null) }],
     ["/auth/callback", { GET: (req, url) => callback(req, url) }],
     ["/auth/exchange", { POST: req => exchange(req) }],
@@ -446,6 +564,147 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
       if (!tid) throw new AdminError("forbidden", "not allowed");
       return json(200, await listTenantAudit({ caller: who, tenant: tid, board, limit, before }, admin));
     } }],
+    ["/spaces", {
+      GET: async (req, url) => {
+        const who = await caller(req);
+        if (url.searchParams.get("can") !== "board.create" || [...url.searchParams.keys()].length !== 1) throw refuse(400, "bad-request");
+        return json(200, await spaces.boardPicker(who));
+      },
+      POST: async req => {
+        const who = await caller(req);
+        const b = defined(await body(req, ["name", "group", "general"]));
+        return keyed(req, who, "POST /spaces", {}, b, async idem => ({ space: await spaces.createSpace(who, b, idem) }),
+          async id => ({ space: await spaces.replaySpace(who, id) }));
+      },
+    }],
+    ["/groups", {
+      POST: async (req) => {
+        const who = await caller(req);
+        const b = defined(await body(req, ["name", "general"]));
+        return keyed(req, who, "POST /groups", {}, b, async idem => ({ group: await spaces.createGroup(who, b, idem) }),
+          async id => ({ group: await spaces.replayGroup(who, id) }));
+      },
+      GET: async (req, url) => {
+      const who = await caller(req);
+      if (url.searchParams.get("can") !== "space.create" || [...url.searchParams.keys()].length !== 1) throw refuse(400, "bad-request");
+      return json(200, await spaces.spacePicker(who));
+    } }],
+    ["/spaces/:id", {
+      GET: async (req, p) => json(200, await spaces.spacePage(await caller(req), p.id)),
+      PATCH: async (req, p) => { const who = await caller(req); return json(200, { space: await spaces.update(who, "space", p.id, await body(req, ["name", "general"])) }); },
+    }],
+    ["/groups/:id", {
+      GET: async (req, p, url) => json(200, await spaces.groupPage(await caller(req), p.id, url.searchParams.get("after"))),
+      PATCH: async (req, p) => { const who = await caller(req); return json(200, { group: await spaces.update(who, "group", p.id, await body(req, ["name", "general"])) }); },
+    }],
+    ["/teams", {
+      GET: async (req, url) => json(200, await access.listTeams(await caller(req), { after: url.searchParams.get("after"), q: url.searchParams.get("q") })),
+      POST: async req => {
+        const who = await caller(req);
+        const b = await body(req, ["name"]);
+        return keyed(req, who, "POST /teams", {}, b, async idem => ({ team: await access.createTeam(who, b, idem) }),
+          async id => ({ team: await access.replayTeam(who, id) }));
+      },
+    }],
+    ["/teams/:id", {
+      GET: async (req, p, url) => json(200, await access.teamPage(await caller(req), p.id, url.searchParams.get("after"))),
+      PATCH: async (req, p) => { const who = await caller(req); const b = await body(req, ["name"]); return json(200, { team: await access.renameTeam(who, p.id, b.name) }); },
+      DELETE: async (req, p) => { await access.deleteTeam(await caller(req), p.id); return json(204); },
+    }],
+    ["/teams/:id/members/:user", {
+      PUT: async (req, p) => { await access.setMember(await caller(req), p.id, p.user, true); return json(204); },
+      DELETE: async (req, p) => { await access.setMember(await caller(req), p.id, p.user, false); return json(204); },
+    }],
+    ["/roles", {
+      GET: async req => json(200, await roles.list(await caller(req))),
+      POST: async req => {
+        const who = await caller(req);
+        const b = await body(req, ["name", "boardRole", "permissions", "base"]);
+        return keyed(req, who, "POST /roles", {}, b, async idem => ({ role: await roles.create(who, b, idem) }),
+          async id => ({ role: await roles.read(who, id) }));
+      },
+    }],
+    ["/roles/:id", {
+      PATCH: async (req, p) => { const who = await caller(req); return json(200, { role: await roles.update(who, p.id, await body(req, ["name", "boardRole", "permissions", "confirm"])) }); },
+      DELETE: async (req, p) => { await roles.remove(await caller(req), p.id); return json(204); },
+    }],
+    ["/directory", { GET: async (req, url) => json(200, await access.directory(await caller(req), { q: url.searchParams.get("q") })) }],
+    ["/access/:type/:id", { GET: async (req, p, url) => json(200, await access.accessPage(await caller(req), p.type, p.id, url.searchParams.get("after"))) }],
+    ["/access/:type/:id/requests", {
+      POST: async (req, p) => {
+        const who = await caller(req);
+        const b = await body(req, ["role"]);
+        return keyed(req, who, "POST /access/requests", { type: p.type, id: p.id }, b, async idem => ({ request: await access.requestAccess(who, p.type, p.id, b.role, idem) }),
+          async id => ({ request: await access.replayRequest(who, p.type, p.id, id) }));
+      },
+    }],
+    ["/access/:type/:id/requests/:user", { DELETE: async (req, p) => { await access.dismissRequest(await caller(req), p.type, p.id, p.user); return json(204); } }],
+    ["/boards/:board/explain", { GET: async (req, p) => json(200, await access.boardExplain(await caller(req), p.board)) }],
+    ["/access/:type/:id/grants/:subjectType/:subject", {
+      PUT: async (req, p) => {
+        const who = await caller(req);
+        const b = await body(req, ["role"]);
+        if (typeof b.role !== "string") throw refuse(400, "bad-request");
+        return json(200, { row: await access.setGrant(who, p.type, p.id, p.subjectType, p.subject, b.role) });
+      },
+      DELETE: async (req, p) => { await access.setGrant(await caller(req), p.type, p.id, p.subjectType, p.subject, null); return json(204); },
+    }],
+    ["/boards/:board/move", {
+      GET: async (req, p) => json(200, await moves.options(await caller(req), p.board)),
+      POST: async (req, p) => {
+        const who = await caller(req);
+        const b = await body(req, ["from", "to"]);
+        return keyed(req, who, "POST /boards/:board/move", p, b, async idem => moves.move(who, p.board, b, idem), async ref => moves.replay(who, p.board, b, ref), 200);
+      },
+    }],
+    ["/boards/:board/move/preview", { GET: async (req, p, url) => {
+      const who = await caller(req), to = url.searchParams.get("to");
+      if (to === null || [...url.searchParams.keys()].length !== 1) throw refuse(400, "bad-request");
+      return json(200, await moves.preview(who, p.board, to));
+    } }],
+    ["/boards/:board/trash", {
+      GET: async (req, p) => json(200, await trash.notice(await caller(req), p.board)),
+      POST: async (req, p) => {
+        const who = await caller(req);
+        const b = await body(req, ["from"]);
+        return keyed(req, who, "POST /boards/:board/trash", p, b, async idem => trash.trashBoard(who, p.board, b, idem), async ref => trash.replayTrash(who, p.board, b, ref), 200);
+      },
+    }],
+    ["/boards/:board/restore", { POST: async (req, p) => {
+      const who = await caller(req);
+      const b = await body(req, []);
+      return keyed(req, who, "POST /boards/:board/restore", p, b, async idem => trash.restoreBoard(who, p.board, idem), async ref => trash.replayRestore(who, p.board, ref), 200);
+    } }],
+    ["/spaces/:space/trash", { POST: async (req, p) => {
+      const who = await caller(req);
+      const b = await body(req, []);
+      return keyed(req, who, "POST /spaces/:space/trash", p, b, async idem => trash.trashSpace(who, p.space, idem), async ref => trash.replayTrashSpace(who, p.space, ref), 200);
+    } }],
+    ["/spaces/:space/restore", { POST: async (req, p) => {
+      const who = await caller(req);
+      const b = await body(req, []);
+      return keyed(req, who, "POST /spaces/:space/restore", p, b, async idem => trash.restoreSpace(who, p.space, idem), async ref => trash.replayRestoreSpace(who, p.space, ref), 200);
+    } }],
+    ["/members/:user/offboarding", { GET: async (req, p, url) => {
+      const who = await caller(req), keys = [...url.searchParams.keys()];
+      if (keys.some(k => k !== "after") || keys.length > 1) throw refuse(400, "bad-request");
+      return json(200, await offboard.list(who, p.user, url.searchParams.get("after")));
+    } }],
+    ["/members/:user/offboarding/reassign", { POST: async (req, p) => {
+      const who = await caller(req);
+      const b = await body(req, ["type", "id", "to"]);
+      return keyed(req, who, "POST /members/:user/offboarding/reassign", p, b, async idem => offboard.reassign(who, p.user, b, idem), async ref => offboard.replayReassign(who, p.user, b, ref), 200);
+    } }],
+    ["/members/:user/remove", { POST: async (req, p) => {
+      const who = await caller(req);
+      const b = await body(req, ["to"]);
+      return keyed(req, who, "POST /members/:user/remove", p, b, async idem => offboard.remove(who, p.user, b, idem), async ref => offboard.replayRemove(who, p.user, ref), 200);
+    } }],
+    ["/trash", { GET: async req => json(200, await trash.list(await caller(req))) }],
+    ["/boards/:board/share", { GET: async (req, p) => {
+      const v = await shareView({ caller: await caller(req), board: p.board }, admin);
+      return json(200, publicUrl ? { ...v, links: v.links.map(l => ({ ...l, url: `${publicUrl}/links/${encodeURIComponent(l.id)}` })) } : v);
+    } }],
     ["/boards", {
       GET: async req => {
         const who = await caller(req);
@@ -479,25 +738,50 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
       },
       POST: async req => {
         const who = await caller(req);
-        const b = await body(req, ["title", "memberRole", "tenant"]);
-        let tid;
+        const b = defined(await body(req, ["title", "memberRole", "space", "tenant"]));
         if (b.tenant !== undefined && b.tenant !== null) {
           if (typeof b.tenant !== "string" || !b.tenant) throw refuse(400, "bad-request");
-          tid = b.tenant;
+          const targetTenant = await registry.tenant(b.tenant);
+          if (!targetTenant) throw new AdminError("forbidden", "not allowed");
+          // Cross-domain tenant creation via explicit `tenant` field is refused.
+          if (targetTenant.domain !== null && (!who.domain || !targetTenant.domains?.includes(who.domain))) {
+            throw new AdminError("forbidden", "not allowed");
+          }
+          if (targetTenant.domain === null) {
+            const board = await createBoard(defined({ caller: who, tenant: b.tenant, title: b.title, memberRole: b.memberRole, space: b.space }), admin);
+            return json(201, { board });
+          }
         } else {
-          const t = await firstAdminTenant(who);
-          if (!t) throw new AdminError("forbidden", "not allowed");
-          tid = t.id;
+          const unit = await tenancy.tenantOf(who);
+          if (unit && unit.domain === null) {
+            const board = await createBoard(defined({ caller: who, tenant: unit.id, title: b.title, memberRole: b.memberRole, space: b.space }), admin);
+            return json(201, { board });
+          }
         }
-        const board = await createBoard(defined({ caller: who, tenant: tid, title: b.title, memberRole: b.memberRole }), admin);
-        return json(201, { board });
+        const spBody = defined({ title: b.title, memberRole: b.memberRole, space: b.space });
+        return keyed(req, who, "POST /boards", {}, spBody, async idem => {
+          const board = await spaces.createBoard(who, spBody, idem);
+          if (typeof registry.appendAudit === "function") {
+            await registry.appendAudit({ tenant: board.tenant, board: board.id, actor: who.user, action: "board.create", target: board.id, detail: { title: board.title, memberRole: board.memberRole }, at: now() });
+          }
+          return { board };
+        }, async id => ({ board: await spaces.replayBoard(who, id) }));
       },
     }],
     ["/boards/:board", {
       PATCH: async (req, p) => {
         const who = await caller(req);
         const b = await body(req, ["title", "memberRole"]);
-        const board = await updateBoard({ caller: who, board: p.board, title: b.title, memberRole: b.memberRole }, admin);
+        if (!("title" in b) && !("memberRole" in b)) throw refuse(400, "bad-request");
+        if ("memberRole" in b) {
+          const board = await updateBoard({ caller: who, board: p.board, title: b.title, memberRole: b.memberRole }, admin);
+          return json(200, { board });
+        }
+        if (typeof b.title !== "string" || /[\p{Cc}\u2028\u2029\u202A-\u202E\u2066-\u2069\u200E\u200F\u061C]/u.test(b.title)) throw refuse(400, "bad-request");
+        const board = await spaces.renameBoard(who, p.board, b.title);
+        if (typeof registry.appendAudit === "function") {
+          await registry.appendAudit({ tenant: board.tenant, board: board.id, actor: who.user, action: "board.update", target: board.id, detail: { title: board.title, memberRole: board.memberRole }, at: now() });
+        }
         return json(200, { board });
       },
       DELETE: async (req, p) => {
@@ -517,7 +801,9 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
       POST: async (req, p) => {
         const who = await caller(req);
         const b = await body(req, ["email", "role", "expiresAt"]);
-        return json(201, { invite: await createInvite({ caller: who, board: p.board, email: b.email, role: b.role, expiresAt: b.expiresAt ?? null }, admin) });
+        return keyed(req, who, "POST /boards/:board/invites", p, b,
+          async idem => ({ invite: await createInvite({ caller: who, board: p.board, email: b.email, role: b.role, expiresAt: b.expiresAt, idem }, admin) }),
+          async id => ({ invite: await readInvite({ caller: who, board: p.board, invite: id }, admin) }));
       },
     }],
     ["/boards/:board/invites/:id", { DELETE: async (req, p) => {
@@ -529,8 +815,10 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
       POST: async (req, p) => {
         const who = await caller(req);
         const b = await body(req, ["role", "expiresAt"]);
-        const link = await createLink({ caller: who, board: p.board, role: b.role, expiresAt: b.expiresAt ?? null }, admin);
-        return json(201, { link, ...(publicUrl ? { url: `${publicUrl}/links/${encodeURIComponent(link.id)}` } : {}) });
+        const linkBody = link => ({ link, ...(publicUrl ? { url: `${publicUrl}/links/${encodeURIComponent(link.id)}` } : {}) });
+        return keyed(req, who, "POST /boards/:board/links", p, b,
+          async idem => linkBody(await createLink({ caller: who, board: p.board, role: b.role, expiresAt: b.expiresAt ?? null, idem }, admin)),
+          async id => linkBody(await readLink({ caller: who, board: p.board, link: id }, admin)));
       },
     }],
     ["/boards/:board/links/:id", { DELETE: async (req, p) => {
@@ -544,6 +832,24 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
       await setGrant({ caller: who, board: p.board, user: p.user, role: b.role }, admin);
       return json(204);
     } }],
+    ...(home ? [
+      ["/home", { GET: async req => json(200, await home.home(await caller(req))) }],
+      ["/home/search", { GET: async (req, url) => {
+        const who = await caller(req);
+        const space = url.searchParams.get("space");
+        if (space !== null) {
+          if (!/^[\w-]{1,64}$/.test(space) || url.searchParams.has("q")) throw refuse(400, "bad-request");
+          return json(200, await home.spaceBoards(who, space));
+        }
+        const q = (url.searchParams.get("q") ?? "").trim();
+        if (!q || q.length > 100 || q.includes("\0")) throw refuse(400, "bad-request");
+        return json(200, await home.search(who, q));
+      } }],
+      ["/home/stars/:board", {
+        PUT: async (req, p) => { if (!(await home.star(await caller(req), p.board, true))) throw new AdminError("forbidden", "not allowed"); return json(204); },
+        DELETE: async (req, p) => { await home.star(await caller(req), p.board, false); return json(204); },
+      }],
+    ] : []),
     ["/links/:id", { GET: async (req, p) => {
       if (!req.headers.has("authorization")) return beginLogin(p.id.slice(0, 128));
       const who = await caller(req);
@@ -554,10 +860,32 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
   ].map(([pattern, methods]) => {
     const names = [];
     const re = new RegExp("^" + pattern.replace(/:(\w+)/g, (_, n) => { names.push(n); return "([^/]+)"; }) + "$");
-    return { re, names, methods };
+    return { re, names, methods, pattern };
   });
 
-  return async function handle(req, url) {
+  // One deadline for the whole route table (PROTOCOL.md "HTTP request deadline"). The work is not cancellable (the Registry port has no
+  // cancel), so on expiry the 503 wins and the late settlement is dropped here: handled, never an unhandled rejection, never sent;
+  // it is counted and logged (at most one line per 10 s) so an operator sees what finished after the client was told 503.
+  const stat = { deadline: {}, late: { applied: 0, failed: 0 } };
+  let lastWarn = -Infinity, lastLate = -Infinity;
+  const withDeadline = (run, what) => new Promise((resolve, reject) => {
+    let over = false;
+    const late = (ok, why) => {
+      stat.late[ok ? "applied" : "failed"]++;
+      if (now() - lastLate >= 10_000) { lastLate = now(); log.warn(`${what} finished after its 503 (${ok ? "applied" : "failed"}${why ? ": " + why : ""})`); }
+    };
+    const t = timers.set(() => {
+      over = true;
+      stat.deadline[what] = (stat.deadline[what] ?? 0) + 1;
+      if (now() - lastWarn >= 10_000) { lastWarn = now(); log.warn(`request deadline (${deadlineMs} ms) passed on ${what}; answering 503`); }
+      resolve(err(503, "unavailable"));
+    }, deadlineMs);
+    (async () => run())().then(
+      v => { if (over) late(!(v instanceof Response) || v.status < 400, v instanceof Response ? String(v.status) : ""); else { timers.clear(t); resolve(v); } },
+      e => { if (over) late(false, String(e?.code ?? e?.message ?? e).slice(0, 80)); else { timers.clear(t); reject(e); } });
+  });
+
+  async function handle(req, url) {
     try {
       url = url ?? new URL(req.url);
       for (const r of routes) {
@@ -568,8 +896,8 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
         const params = {};
         try { r.names.forEach((n, i) => { params[n] = decodeURIComponent(m[i + 1]); }); }
         catch { return err(400, "bad-request"); }
-        if (r.names.length) return await fn(req, params, url);
-        return await fn(req, url);
+        const what = `${req.method} ${r.pattern}`;
+        return await withDeadline(() => r.names.length ? fn(req, params, url) : fn(req, url), what);
       }
       return null;
     } catch (e) {
@@ -580,11 +908,24 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
         if (e.code === "bad-request") return err(400, "bad-request", { message: String(e.message).slice(0, 200) });
         if (e.code === "limit") return err(429, "limit", { message: String(e.message).slice(0, 200) });
         if (e.code === "last-owner") return err(409, "last-owner");
-        if (e.code === "owner-grant-failed") return err(503, "owner-grant-failed", { board: e.board });
+        if (e.code === "too-large") return err(409, "too-large");
+        if (e.code === "in-use" || e.code === "confirm-required") return err(409, e.code, e.data ?? {});
+        if (e.code === "superseded") return err(409, "superseded");
+        if (e.code === "moved") return err(409, "moved");
+        if (e.code === "with-space" || e.code === "space-in-trash" || e.code === "purged" || e.code === "would-escalate") return err(409, e.code);
+        if (e.code === "unknown-person" || e.code === "bad-role" || e.code === "bad-recipient") return err(400, e.code);
+        if (e.code === "still-owns" || e.code === "is-admin" || e.code === "personal") return err(409, e.code);
+        if (e.code === "rate-limited") { const s = e.data?.retryAfter ?? null; return err(429, "rate-limited", { retryAfter: s }, s == null ? undefined : { "retry-after": String(s) }); }
       }
+      if (e?.code === "removed") return err(403, "forbidden");   // a create racing a removal (the Registry refused in its own step)
       return err(503, "unavailable");
     }
-  };
+  }
+  /** Deadline hits per "METHOD /pattern" and the late settlements counted since start (for /health). */
+  handle.stats = () => ({ deadlineMs, deadline: { ...stat.deadline }, late: { ...stat.late } });
+  // The route table, for the guard test: every entry is dispatched through withDeadline.
+  testHooks?.routes?.(routes.map(r => ({ pattern: r.pattern, methods: Object.keys(r.methods), names: r.names })));
+  return handle;
 }
 
 /**

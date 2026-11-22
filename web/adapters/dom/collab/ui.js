@@ -25,7 +25,9 @@
 //                  follow with one transform on their layer while the view stays inside the placed region at the
 //                  same zoom; otherwise only the pins in the viewport plus a margin are re-placed (p7-perf C-1)
 //   collab.setTheme(theme) · collab.destroy()
+//   collab.setBottomInset(px)  reserve the visible bottom-sheet / dock area when positioning comment popovers
 
+import { captureFocus, restoreFocus } from "../focus.js";
 import { h, replace } from "./dom.js";
 import { EMOTES, PRESENCE, canWrite } from "../../../core/collab/limits.js";
 import { FLAGS } from "../../../core/collab/flags.js";
@@ -106,7 +108,9 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     const badge = (cls, n) => (n > 0 ? h(`span.av.more.${cls}`, { title: `${watching(writerCount)} people can write` }, `+${fmt(n)}`) : null);
     replace(parts.avatars,
       h("span.stack", {}, shown.map(w => av(w.user, w.name ?? "Someone", ".live")), badge("desk-more", more), badge("phone-more", phoneMore)),
-      h("span.watching", { title: `${watching(viewers)} watching` }, h("span.eye", {}, "👁 "), h("b", {}, watching(viewers)), h("span.wtxt", {}, " watching")));
+      // A count of VIEWERS only (view-only tabs, PROTOCOL.md `here.viewers`); people who can draw are the avatars beside it.
+      h("span.watching", { title: `${watching(viewers)} view-only ${viewers === 1 ? "tab" : "tabs"} watching (people who can draw show as avatars)` },
+        h("span.eye", {}, "👁 "), h("b", {}, watching(viewers)), h("span.wtxt", {}, viewers === 1 ? " viewer" : " viewers")));
   }
 
   // ── emote bar and picker ──
@@ -127,12 +131,14 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     if (port.role !== "viewer") { presence.float(e, port.me.user); renderFloats(); paint(); }
     return true;
   }
-  const bar = BAR.map(e => { const n = h("b"); return { e, n, btn: h("button.tb", { onclick: () => sendEmote(e) }, e, n) }; });
-  const more = h("button.tb", { title: "More emotes", onclick: togglePicker }, "✨");
-  const one = h("button.tb", { onclick: togglePicker }, "👏");   // phones: one button opens the picker
+  const reactionLabels = ["React with thumbs up", "React with heart", "React with laughing", "React with party popper", "React with clapping hands", "React with surprised face"];
+  const bar = BAR.map((e, i) => { const n = h("b"); return { e, n, btn: h("button.tb", { "aria-label": reactionLabels[i], onclick: () => sendEmote(e) }, e, n) }; });
+  const more = h("button.tb", { title: "More emotes", "aria-label": "More emotes", onclick: togglePicker }, "✨");
+  const one = h("button.tb", { title: "Emotes", "aria-label": "Emotes", onclick: togglePicker }, "👏");   // phones: one button opens the picker
   parts.emotes.append(...bar.map(b => b.btn), h("span.sep"), more);
   parts.emoteButton.append(one);
-  const pickerEl = h("div.emote-picker.collab-picker", { role: "menu", hidden: true }, EMOTES.map(e => h("button", { title: e, onclick: () => sendEmote(e) }, e)));
+  const pickerLabels = ["React with thumbs up", "React with heart", "React with laughing", "React with party popper", "React with clapping hands", "React with surprised face", "React with folded hands", "React with fire"];
+  const pickerEl = h("div.emote-picker.collab-picker", { role: "menu", hidden: true }, EMOTES.map((e, i) => h("button", { title: e, "aria-label": pickerLabels[i], onclick: () => sendEmote(e) }, e)));
   pickHost.append(pickerEl);
   function renderEmotes() {
     const counts = presence.view().counts, on = live() && mayPresence(port.role, "emote"), cool = on && cooling();
@@ -227,11 +233,14 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     }
     for (const [key, rec] of clusterEls) if (!keepC.has(key)) { rec.el.remove(); clusterEls.delete(key); }
   }
+  let bottomInset = 0;
   function place(pop, world) {
-    const p = screen(world), w = root.clientWidth || 1200, hgt = root.clientHeight || 800;
-    let left = p.x + 20, top = p.y - 30;
-    if (left + 310 > w) left = Math.max(8, p.x - 316);
-    top = Math.max(8, Math.min(top, hgt - 340));
+    const p = screen(world), w = root.clientWidth || 1200, hgt = Math.max(0, (root.clientHeight || 800) - bottomInset);
+    const width = Math.max(0, Math.min(300, w - 16));
+    let left = Math.max(8, Math.min(p.x + 20, w - width - 8)), top = p.y - 30;
+    pop.style.setProperty("width", `${width}px`);
+    const height = Math.min(pop.offsetHeight || 340, Math.max(0, hgt - 16));
+    top = Math.max(8, Math.min(top, hgt - height - 8));
     pop.style.setProperty("left", `${left}px`); pop.style.setProperty("top", `${top}px`);
   }
   const mount = el => { if (el.parentNode !== popHost) replace(popHost, el); };
@@ -241,14 +250,14 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     const rv = c.reactions, canReact = c.canReact;
     const chips = (rv.length || canReact) && !c.deleted ? h("div.react-chips.collab-chips", {},
       rv.map(r => h(`button.chip-r${r.mine ? ".mine" : ""}${r.pending ? ".pending" : ""}`, {
-        disabled: !c.canReact, title: c.canReact ? (r.mine ? `Remove your ${r.emoji}` : `React ${r.emoji}`) : `${r.n} reacted ${r.emoji}`,
+        "data-fk": `msg:${c.id}:react:${r.emoji}`, disabled: !c.canReact, title: c.canReact ? (r.mine ? `Remove your ${r.emoji}` : `React ${r.emoji}`) : `${r.n} reacted ${r.emoji}`,
         onclick: () => recordOp(r.mine ? "unreact" : "react", { do: "react", id: c.id, emoji: r.emoji, on: !r.mine }) }, `${r.emoji} `, h("b", {}, String(r.n)))),
-      c.canReact ? h("button.chip-r.add", { title: "React", onclick: () => { S.reactFor = S.reactFor === c.id ? null : c.id; renderPopover(); } }, "＋") : null) : null;
-    const reactRow = S.reactFor === c.id && c.canReact ? h("div.collab-reactrow", {}, EMOTES.map(e => h("button", { title: e, onclick: () => { S.reactFor = null; const has = rv.find(r => r.emoji === e)?.mine; recordOp(has ? "unreact" : "react", { do: "react", id: c.id, emoji: e, on: !has }); } }, e))) : null;
+      c.canReact ? h("button.chip-r.add", { "data-fk": `msg:${c.id}:react-add`, title: "React", onclick: () => { S.reactFor = S.reactFor === c.id ? null : c.id; renderPopover(); } }, "＋") : null) : null;
+    const reactRow = S.reactFor === c.id && c.canReact ? h("div.collab-reactrow", {}, EMOTES.map(e => h("button", { "data-fk": `msg:${c.id}:pick:${e}`, title: e, onclick: () => { S.reactFor = null; const has = rv.find(r => r.emoji === e)?.mine; recordOp(has ? "unreact" : "react", { do: "react", id: c.id, emoji: e, on: !has }); } }, e))) : null;
     return h(`div.msg${c.pending ? ".pending" : ""}`, {}, av(c.by, c.name),
       h("div.mbody", {},
         h("div.who", {}, c.name, h("span", {}, ago(c.at, C.now())), c.edited ? h("span", {}, "edited") : null, c.pending ? h("span.sending", {}, "sending…") : null,
-          c.canDelete ? h("button.del", { title: "Delete this comment", onclick: () => recordOp("deleteComment", { do: "delete", id: c.id }) }, "delete") : null),
+          c.canDelete ? h("button.del", { "data-fk": `msg:${c.id}:delete`, title: "Delete this comment", onclick: () => recordOp("deleteComment", { do: "delete", id: c.id }) }, "delete") : null),
         c.deleted ? h("p.deleted", {}, "Comment deleted") : h("p", {}, c.text), chips, reactRow));
   }
 
@@ -267,18 +276,20 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
         if (recordOp("reply", { do: "reply", id, thread: t.id, text })) { field.value = ""; S.drafts.delete(t.id); }
       };
       const foot = h("div.reply", {}, field, h("button.btn.primary", { onclick: send }, "Send"));
-      pop = { id: t.id, head: h("header"), body: h("div.body"), foot, field, readFoot: h("div.reply.hint"), el: null };
+      pop = { id: t.id, head: h("header", { "data-fk": "heading", tabindex: "-1" }), body: h("div.body"), foot, field, readFoot: h("div.reply.hint"), el: null };
       pop.el = h("div.pop.collab-pop", { role: "dialog", "aria-label": "Comment thread" }, pop.head, pop.body, pop.foot, pop.readFoot);
       delete sigs.pop;
     }
     // Rebuild the head and messages only when what they show changed (a click mid-rebuild is lost).
     if (changed("pop", JSON.stringify([t, S.reactFor, port.role, Math.floor(C.now() / 30_000)]))) {
+      const held = captureFocus([pop.el]);       // a Resolve or reaction button that was just used keeps focus
       replace(pop.head,
         t.resolved ? [h("span", {}, "✓"), h("b", {}, `Resolved by ${t.resolved.name ?? "someone"}`)] : h("span.anchor", {}, anchorText(t)),
         h("span.spacer"),
-        t.canResolve ? h("button.btn", { disabled: t.statePending, onclick: () => recordOp(t.resolved ? "reopen" : "resolve", { do: t.resolved ? "reopen" : "resolve", id: t.id }) }, t.resolved ? "Reopen" : "✓ Resolve") : null,
+        t.canResolve ? h("button.btn", { "data-fk": `thread:${t.id}:resolve`, "aria-disabled": t.statePending ? "true" : null, onclick: () => !t.statePending && recordOp(t.resolved ? "reopen" : "resolve", { do: t.resolved ? "reopen" : "resolve", id: t.id }) }, t.resolved ? "Reopen" : "✓ Resolve") : null,
         h("button.tb", { title: "Close", onclick: () => openThread(null) }, "✕"));
       replace(pop.body, t.resolved || t.detached ? h("div.anchor.muted", {}, anchorText(t)) : null, t.comments.map(c => message(t, c)));
+      restoreFocus(held);
       pop.foot.hidden = !t.canReply;
       pop.readFoot.hidden = t.canReply;
       replace(pop.readFoot, port.role === "viewer" ? "Viewers read comments; they can't reply or react." : "Read-only: you can't reply or react.");
@@ -328,6 +339,8 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
   // A cluster's own list (listThreads): only its threads, until "Show all" or a list tab.
   const onlyText = h("span"), onlyBar = h("div.collab-only", { hidden: true }, onlyText, " ", h("button", { onclick: () => { S.only = null; renderDrawer(); } }, "Show all"));
   const scroller = h("div.notes-list");
+  /** Rebuild the drawer rows, keeping focus on the control that had it (a row, a jump / edit / delete button). */
+  const swapRows = (...kids) => { const held = captureFocus([scroller]); replace(scroller, ...kids); restoreFocus(held); };
   parts.drawer.append(h("header", {}, h("h3", {}, "Annotations"), h("span.seg", {}, tabNotes, tabComments)), listTabs, onlyBar, scroller);
   const label = (el, text, on) => { if (el.textContent !== text) replace(el, text); el.classList.toggle("on", on); };
   // The notes rows are built only while the notes tab shows (C-7); the comments tab's "Notes N" label is a count
@@ -345,15 +358,16 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     if (only) { const text = `${only.length} ${only.length === 1 ? "thread" : "threads"} here`; if (onlyText.textContent !== text) replace(onlyText, text); }
     if (S.drawer === "notes") {
       sigs.drawerRev = null;     // the comments rows must be rebuilt on the way back
+      scroller.setAttribute("role", "list"); scroller.setAttribute("aria-label", "Notes");
       if (!changed("drawer", JSON.stringify(["notes", nv]))) return;
-      replace(scroller, nv.rows.length ? nv.rows.map(n => h("div.note-row", { "data-note": n.id },
+      swapRows(nv.rows.length ? nv.rows.map(n => h("div.note-row", { "data-note": n.id, role: "listitem", "aria-label": `Note: ${n.text}, by ${n.author}`, "data-fk": `note:${n.id}:row`, tabindex: "-1" },
         h("span.sw", { style: { background: safeColor(n.color), width: "10px", height: "10px" } }),
         h("div.txt", {}, h("div", {}, n.text),
           h("div.meta", {}, h("span.author", { style: { color: n.by ? colorOf(n.by) : "var(--muted)" } }, n.author), n.kind === "highlight" ? h("span", {}, "highlight") : null),
           h("div.acts", {},
-            port.jumpTo ? h("button", { onclick: () => port.jumpTo(n.at) }, "jump to") : null,
-            n.canEdit ? h("button", { onclick: () => port.editNote(n.id) }, "edit") : null,
-            n.canDelete ? h("button", { onclick: () => port.deleteNote(n.id) }, "delete") : null,
+            port.jumpTo ? h("button", { "data-fk": `note:${n.id}:jump`, onclick: () => port.jumpTo(n.at) }, "jump to") : null,
+            n.canEdit ? h("button", { "data-fk": `note:${n.id}:edit`, onclick: () => port.editNote(n.id) }, "edit") : null,
+            n.canDelete ? h("button", { "data-fk": `note:${n.id}:delete`, onclick: () => port.deleteNote(n.id) }, "delete") : null,
             n.locked ? h("span.lock", {}, `🔒 ${n.author}'s`) : null)))) : h("div.hint", {}, "No notes yet."),
         nv.more ? h("div.hint", {}, `${fmt(nv.more)} more`) : null);
     } else {
@@ -361,13 +375,14 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
       const which = only ? `only:${[...S.only].join(",")}` : S.list;
       // Keyed on what the rows show, so a reaction or a here doesn't rebuild every row; built only when the
       // records view changed (rvRev), else the last key stands.
+      scroller.setAttribute("role", "group"); scroller.setAttribute("aria-label", "Comments");
       if (sigs.drawerRev === `${which}|${S.open}|${rvRev}`) return;
       sigs.drawerRev = `${which}|${S.open}|${rvRev}`;
       if (!changed("drawer", JSON.stringify(["comments", which, S.open, list.map(t => [t.id, t.name, t.count, t.pending, t.detached, t.point, t.comments.find(c => !c.deleted)?.text])]))) return;
-      replace(scroller, list.length ? list.map(t => {
+      swapRows(list.length ? list.map(t => {
         const first = t.comments.find(c => !c.deleted);
         const go = () => { openThread(t.id); port.jumpTo?.({ x: t.x, y: t.y }); };
-        return h(`div.note-row.thread-row${t.resolved ? ".done" : ""}${S.open === t.id ? ".on" : ""}`, { "data-thread": t.id, role: "button", tabindex: "0",
+        return h(`div.note-row.thread-row${t.resolved ? ".done" : ""}${S.open === t.id ? ".on" : ""}`, { "data-thread": t.id, "data-fk": `thread:${t.id}`, role: "button", tabindex: "0",
           onclick: go, onkeydown: e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } } },
           av(t.by, t.name), h("div.txt", {}, h("div", {}, first?.text ?? ""),
             h("div.meta", {}, h("span", {}, t.name ?? "Someone"), h("span", {}, anchorText(t))),
@@ -464,6 +479,13 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
       openCompose({ x: at.x, y: at.y, on: b ? on : null }); renderAll(); return true;
     },
     openThread, showDrawer,
+    setBottomInset(value) {
+      const inset = Number.isFinite(value) ? Math.max(0, value) : 0;
+      if (inset === bottomInset) return;
+      bottomInset = inset;
+      popHost.style.setProperty("bottom", `${inset}px`);
+      renderPopover();
+    },
     layout({ board = true } = {}) { const rv = records({ reanchor: board }); renderPins(rv); renderPopover(rv); paint(); },
     draw,
     setTheme(t) { S.theme = t === "dark" ? "dark" : "light"; paint(); },

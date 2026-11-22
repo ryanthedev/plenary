@@ -6,6 +6,7 @@ import { tenancy, roleCache, combine, identityKey, USE_CHUNK } from "../../serve
 import { memoryBus } from "../../server/bus/memory.js";
 import { subjects } from "../../server/bus/port.js";
 import { announcingRegistry } from "../../server/main.js";
+import { mkBoard } from "./fixtures.js";
 
 const T0 = Date.UTC(2026, 10, 12);
 let clock, raw, reg, calls, acme, board;
@@ -27,7 +28,7 @@ beforeEach(async () => {
   clock = { t: T0 };
   raw = memoryRegistry({ now });
   acme = await raw.createTenant({ domain: "acme.com", admins: ["google:root"] });
-  board = await raw.createBoard({ tenant: acme.id, title: "All hands", memberRole: "viewer" });
+  board = await mkBoard(raw, { tenant: acme.id, title: "All hands", memberRole: "viewer" });
   await raw.setGrant(board.id, "google:root", "owner");
   ({ reg, calls } = counting(raw));
 });
@@ -192,7 +193,7 @@ test("a hello's read in flight during rolesFor never overwrites the fresher writ
 test("GAP-M3 (p5-loadv): rolesFor in flight across invalidate(board) does not write its stale answer", async () => {
   const raw = memoryRegistry();
   const t = await raw.createTenant({ domain: null });
-  const b = await raw.createBoard({ tenant: t.id, memberRole: null });
+  const b = await mkBoard(raw, { tenant: t.id, memberRole: null });
   await raw.setGrant(b.id, "u", "editor");
   let open; const gate = new Promise(r => { open = r; }); let hold = true, grantCalls = 0;
   const reg = { ...raw, grants: async x => { const v = await raw.grants(x); if (hold) { hold = false; await gate; } return v; }, grant: async (x, u) => { grantCalls++; return raw.grant(x, u); } };
@@ -203,6 +204,23 @@ test("GAP-M3 (p5-loadv): rolesFor in flight across invalidate(board) does not wr
   open(); await p;
   expect(await c.role({ user: "u" }, b.id)).toBe(null);
   expect(grantCalls).toBe(1);
+});
+
+test("LOW-4b (#55): a hello's role read in flight across forgetUser(user) does not write its stale answer, and the next role is fresh", async () => {
+  const raw = memoryRegistry();
+  const t = await raw.createTenant({ domain: null });
+  const b = await mkBoard(raw, { tenant: t.id, memberRole: null });
+  await raw.setGrant(b.id, "u", "editor");
+  await raw.setGrant(b.id, "v", "viewer");
+  let open; const gate = new Promise(r => { open = r; }); let hold = true;
+  const reg = { ...raw, grant: async (x, u) => { const v = await raw.grant(x, u); if (hold && u === "u") { hold = false; await gate; } return v; } };
+  const c = roleCache({ registry: reg, ttlMs: 3_600_000 });
+  const p = c.role({ user: "u" }, b.id);                                   // read the "editor" grant, then wait inside registry.grant
+  await new Promise(r => setTimeout(r, 5));
+  await raw.setGrant(b.id, "u", null); c.forgetUser("u");                  // the removal: the grant is gone, this node forgets the person
+  open(); await p;                                                         // the in-flight read may answer "editor", but must not fill the cache with it
+  expect(await c.role({ user: "u" }, b.id)).toBe(null);
+  expect(await c.role({ user: "v" }, b.id)).toBe("viewer");                // other people are untouched
 });
 
 test("two identities of one user (one invited email, one not) each get their own answer: rolesFor, fallback and cache", async () => {
@@ -332,8 +350,8 @@ test("differential: tenancy.role, tenancy.rolesFor (batch and fallback) and role
     clock = { t: T0 };
     const r = memoryRegistry({ now });
     const t = await r.createTenant({ domain: "acme.com" });
-    const other = await r.createBoard({ tenant: t.id });
-    const b = await r.createBoard({ tenant: t.id, memberRole: ROLE[rnd(ROLE.length)] });
+    const other = await mkBoard(r, { tenant: t.id });
+    const b = await mkBoard(r, { tenant: t.id, memberRole: ROLE[rnd(ROLE.length)] });
     const people = Array.from({ length: 30 }, (_, i) => id(`google:p${i}`, [null, "acme.com", "globex.com"][rnd(3)], rnd(4) ? `P${i}@x.com` : null));
     const links = [];
     for (let i = 0; i < 6; i++) links.push(await r.createLink({ board: rnd(4) ? b.id : other.id, role: ROLE[rnd(5)], expiresAt: rnd(2) ? T0 + rnd(3) * 1000 - 1000 : null, by: "x" }));
@@ -367,7 +385,7 @@ test("rolesFor: unknown board → every user null; users deduplicated; chunks of
   expect(m.get(identityKey(people[0]))).toBe("viewer");
   const none = await ten.rolesFor("b-nope", people.slice(0, 2));
   expect([...none.values()]).toEqual([null, null]);
-  expect(combine({ board, tenant: acme, grant: null, invites: [], links: [] }, id("google:z"), T0)).toEqual({ role: "viewer", until: Infinity });
+  expect(combine({ ctx: await raw.accessContext({ type: "board", id: board.id }), grant: null, invites: [], links: [] }, id("google:z"), T0)).toEqual({ role: "viewer", share: false, move: false, until: Infinity });
 });
 
 // ---- F4: share-link redemption no longer announces ----
@@ -408,7 +426,7 @@ test("redemption cost: a share-link use costs 2 Registry queries (link, addLinkU
   expect(c.calls).toEqual({ link: 1, addLinkUse: 1 });
 });
 
-// ---- F8: Registry queries, before and after (numbers go in docs/m2/reports/p5-load.md) ----
+// ---- F8: Registry queries, before and after ----
 
 test("query counts: hello cold/warm and a timed pass over 1,000 users on one board", async () => {
   // 1,000 users: 500 Workspace members (memberRole), 250 guests by invite, 250 guests by one shared link; 50 grants.
@@ -443,9 +461,9 @@ test("query counts: hello cold/warm and a timed pass over 1,000 users on one boa
   await measure("after: timed pass, 1000 users (no linkUsesFor: SQLite/Postgres today)", r => roleCache({ registry: r, now }).rolesFor(board.id, users), { drop: ["linkUsesFor"] });
 
   console.log("p5-load query counts\n" + Object.entries(n).map(([k, v]) => `  ${k}: ${v}`).join("\n"));
-  expect(n["before: hello (link guest)"]).toBe(5);                   // board, grant, invitesFor, linkUses, link
+  expect(n["before: hello (link guest)"]).toBe(5);                   // accessContext, grant, invitesFor, linkUses, link
   expect(n["before: timed pass, 1000 users"]).toBeGreaterThanOrEqual(4000);
-  expect(n["after: hello cold, board warm (another link guest)"]).toBe(3);  // grant, invitesFor, linkUses
+  expect(n["after: hello cold, board warm (another link guest)"]).toBe(4);  // accessContext (the board's whole scope chain, one call, never cached), grant, invitesFor, linkUses
   expect(n["after: hello warm (same user again)"]).toBe(0);
   expect(n["after: timed pass, 1000 users (linkUsesFor)"]).toBeLessThanOrEqual(7);
   expect(n["after: timed pass, 1000 users (no linkUsesFor: SQLite/Postgres today)"]).toBeLessThanOrEqual(1006);

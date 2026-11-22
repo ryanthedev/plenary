@@ -1,13 +1,13 @@
 # deploy/
 
-Packaging for the single-node Plenary server (`server/main.js`). Nothing here is published: no registry pushes, no
-public images.
+Packaging for the single-node Plenary server (`server/main.js`). Nothing is published yet: no registry pushes, no
+public images. Publishing is a manual step that needs the owner's go (see [Release](#release)).
 
 | File | What |
 |---|---|
-| `Dockerfile` | Single-node image on `oven/bun:1.4.4-slim`. Installs dependencies from `bun.lock` (`bun install --frozen-lockfile --production`) in their own layer, then copies the source. Runs `bun run server/main.js` as the non-root `bun` user, listens on 0.0.0.0:8080, data in `/data`, health check on `GET /health`. |
+| `Dockerfile` | Single-node image on `oven/bun:1.4.4-slim`, pinned by digest, one stage (a builder stage would save nothing: the install cache is already removed in its layer). Installs dependencies from `bun.lock` (`bun install --frozen-lockfile --production`) in their own layer, then copies the source. Runs `bun run server/main.js` as the fixed non-root user `1000:1000` (app code and `node_modules` are read-only and root-owned; `/data` is the data dir), exec-form `CMD` so bun is PID 1 and receives SIGTERM (clean stop, exit 0), OCI labels from build args `VERSION`, `REVISION`, `CREATED`, listens on 0.0.0.0:8080, data in `/data`, health check on `GET /health`. |
 | `compose.yml` | One `plenary` service with a named volume for SQLite and blobs, published on `127.0.0.1:8080` only, `restart: unless-stopped`. |
-| `cluster.compose.yml`, `cluster/` | Phase-4 cluster stack (Postgres + NATS + Caddy + gateway/host nodes): see [Cluster](#cluster) and `cluster/RIG.md`. |
+| `cluster.compose.yml`, `cluster/` | Phase-4 cluster shape (never run on Docker): see [Cluster](#cluster-phase-4-not-run-on-docker-yet). |
 
 ```sh
 docker build -f deploy/Dockerfile -t plenary:dev .      # context is the repo root
@@ -15,12 +15,64 @@ docker compose -f deploy/compose.yml up --build         # binds 127.0.0.1:8080 o
 curl -s http://127.0.0.1:8080/health                    # 200 + JSON
 ```
 
+## Release
+
+Image name: `ghcr.io/ryanthedev/plenary`. **Nothing is published until the owner says so.** CI builds and smoke-tests
+the image (job `image`, `scripts/image-smoke.sh`) but never pushes and holds no registry credentials. Size: about
+217 MB by podman's measure (`image inspect .Size`, arm64), nearly all of it the Bun base image; docker's figure for the amd64 image on the CI runner is about 85 MB (84,827,381 bytes; the `image size:` line in the `image` job's log). The two tools measure differently (podman counts the uncompressed layers), so compare sizes only within one tool.
+
+**Tags:** every release gets `X.Y.Z` and `sha-<7 chars of the git commit>`. Only a **stable** release (no `-rc.1` style suffix) also moves `X.Y`, `X` and `latest`; a pre-release never does. Never move an `X.Y.Z` tag.
+
+**Check before a release:** `main` is the commit to release, `bun test` and `bun run test:cluster` pass, CI is green.
+
+```sh
+# Run from the repo root, on the commit to release.
+VERSION=0.1.0                                   # no leading v
+REVISION="$(git rev-parse HEAD)"
+SHA="$(git rev-parse --short=7 HEAD)"
+IMAGE=ghcr.io/ryanthedev/plenary
+
+# 1. Local check, single platform, nothing pushed (docker buildx; podman is not covered for releases):
+docker buildx build -f deploy/Dockerfile --load -t "$IMAGE:check" \
+  --build-arg VERSION="$VERSION" --build-arg REVISION="$REVISION" .
+SMOKE_IMAGE="$IMAGE:check" scripts/image-smoke.sh        # tests the existing image, keeps it; then: docker rmi "$IMAGE:check"
+
+# 2. Publish (MANUAL; needs the owner's go and a token with write:packages:
+#    `echo "$GHCR_TOKEN" | docker login ghcr.io -u ryanthedev --password-stdin`). This is the only publish path:
+#    one multi-arch build (amd64 + arm64, both in the base image) pushed straight to the registry.
+docker buildx build -f deploy/Dockerfile --push \
+  --platform linux/amd64,linux/arm64 \
+  --build-arg VERSION="$VERSION" --build-arg REVISION="$REVISION" \
+  --build-arg CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -t "$IMAGE:$VERSION" -t "$IMAGE:sha-$SHA" .
+
+# 2b. STABLE RELEASES ONLY (skip for a pre-release such as 0.2.0-rc.1): move the floating tags to the same image.
+docker buildx imagetools create -t "$IMAGE:${VERSION%.*}" -t "$IMAGE:${VERSION%%.*}" -t "$IMAGE:latest" "$IMAGE:$VERSION"
+
+# 3. Tag the commit and push the tag (also manual):
+git tag -a "v$VERSION" -m "Plenary $VERSION" && git push origin "v$VERSION"
+```
+
+Verify what was published: `docker buildx imagetools inspect "$IMAGE:$VERSION"` (both platforms listed), then
+`docker inspect` / `skopeo inspect` shows labels `org.opencontainers.image.version`, `.revision`, `.source`. The first
+push creates the package as private; making it public is the owner's call in the GitHub package settings.
+
+Run a released image with either compose file, without building: `PLENARY_IMAGE=ghcr.io/ryanthedev/plenary:0.1.0 docker compose -f deploy/compose.yml up`
+(both compose files take the image name from `PLENARY_IMAGE`, default `plenary:dev` for a local build).
+
+**Bumping the base image:** read the new multi-arch index digest (`podman manifest inspect` does not print it; use
+`curl -sI -H "Authorization: Bearer <pull token>" -H "Accept: application/vnd.oci.image.index.v1+json" https://registry-1.docker.io/v2/oven/bun/manifests/<tag>`
+and take `docker-content-digest`), change the tag and digest in `FROM` together, and set CI's `bun-version` to the same
+Bun version. `test/deploy-image.test.js` fails if they disagree.
+
+**Local check without Docker:** `CONTAINER_CLI=podman scripts/image-smoke.sh` (it removes the image and container it makes).
+
 ## What runs today
 
-- **Endpoints:** `GET /health`, `GET /metrics` (Prometheus text format), the WebSocket at `/ws`, `POST /boards`
-  (and the board invite and link routes), Google sign-in at `/auth/*` (`server/auth/http.js`, mounted by
-  `server/main.js`; the `/auth` routes answer 503 unless both `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are set),
-  and the web app at `/` (`server/static.js`, serving `web/` and its imported `packages/` modules).
+- **Endpoints:** `GET /health`, `GET /metrics` (404 unless `PLENARY_METRICS_TOKEN` is set), the WebSocket at `/ws`, `POST /boards` (and the board invite and link routes), and
+  Google sign-in at `/auth/*` (`server/auth/http.js`, mounted by `server/main.js`; the `/auth` routes answer 503
+  unless both `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are set). The server serves the canvas page
+  at `/` (the `web/` folder), over the same port.
 - **Without dev tokens** every `hello` is refused, so no client can join. The log says so at start.
 - **With dev tokens** the server creates one dev board on its first start and logs its id each start (`dev tokens are ON`). The
   registry is SQLite in `<data>/registry.db` and the board id is kept in `<data>/dev-board.json`, so restarts reuse it.
@@ -34,7 +86,9 @@ These are the variables `server/main.js` reads; nothing else is read.
 | `PORT` | `8080` | Listen port (`0` = any free port; don't use 0 in the container, the published port is fixed). |
 | `HOST` | `0.0.0.0` | Listen address. main.js defaults to `127.0.0.1`, which a container cannot be reached on, so the image sets it. |
 | `PLENARY_DATA_DIR` | `/data` | `plenary.db` (SQLite) and `blobs/` go here. Compose mounts the `plenary-data` volume on it. |
-| `PLENARY_DEV_TOKENS` | unset | JSON: `{ "<token>": { "name": "ann", "role": "editor", "email"?, "domain"? } }`. Unset or empty = off. Invalid JSON is logged and treated as off. |
+| `PLENARY_DEV_TOKENS` | unset | JSON: `{ "<token>": { "name": "ann", "role": "editor", "email"?, "domain"? } }`. Unset, empty or `{}` = off. Invalid JSON is logged and treated as off. |
+| `PLENARY_REQUEST_DEADLINE_MS` | `8000` | Every HTTP route answers within this many ms or with 503 `unavailable` (PROTOCOL.md "HTTP request deadline"). A positive integer. Start-up refuses when the Registry's statement/lock limits (5000 ms in a cluster) or Google's timeout (3500 ms) are not below it, so lower it only with those in mind. |
+| `PLENARY_METRICS_TOKEN` | unset | At least 16 bytes. Unset = `/metrics` is a 404 and nothing is recorded. Set = `GET /metrics` (every role) answers Prometheus text to `Authorization: Bearer <token>` only, 401 otherwise. Generate with `openssl rand -hex 32`; scrape over a private network. Metric names: PROTOCOL.md "Metrics". Not set by either compose file. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Logs are structured, to stdout. |
 | `COOKIE_KEY` | unset | At least 32 bytes; signs sign-in cookies and sessions. Unset on a single node = a random key per start (every restart signs everyone out). **Required in cluster mode** (`DATABASE_URL` or `NATS_URL` set): the server refuses to start without it, and every node must have the same value. |
 | `SESSION_KEY` | unset | At least 32 bytes; signs sessions only, if you want it separate from `COOKIE_KEY` (default: `COOKIE_KEY`). Not set by either compose file. |
@@ -47,7 +101,10 @@ echo "COOKIE_KEY=$(openssl rand -hex 32)" >> deploy/.env
 ```
 
 **Dev tokens are for local use only.** Anyone holding a token is that user; there is no expiry or sign-in. Never
-set them on a server others can reach. To use them, put a value in `deploy/.env` with single quotes around the
+set them on a server others can reach. The served page's dev sign-in menu (`GET /auth/dev`, which publishes the
+tokens of users none of whose tokens has `admin` or `domain`) is on only when the server binds a loopback `HOST`, `PUBLIC_URL` (if set) is a loopback name, Google sign-in is not
+configured and the node is a gateway: in the container (`HOST=0.0.0.0`) it is always off, and the log says why. The tokens
+still work for a socket or `POST /boards`. To use them, put a value in `deploy/.env` with single quotes around the
 JSON, and make up your own token strings:
 
 ```sh
@@ -55,8 +112,8 @@ JSON, and make up your own token strings:
 PLENARY_DEV_TOKENS='{"<a-long-random-token>":{"name":"ann","role":"editor"}}'
 ```
 
-`GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are read by `server/main.js` when set (keep them in your shell or
-`deploy/.env`, never this repo).
+`GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are commented out in `compose.yml`; `server/main.js` reads them. Set
+them from your shell or `deploy/.env`, never this repo.
 
 ## Secrets and files
 
@@ -65,13 +122,15 @@ PLENARY_DEV_TOKENS='{"<a-long-random-token>":{"name":"ann","role":"editor"}}'
 - **Git:** `.env` and `.env.*` are git-ignored everywhere in the repo; only `.env.example` (a template with no
   values) may be committed.
 - **Image:** the Dockerfile copies five named paths (`package.json`, `bun.lock`, `packages/`, `server/`, `web/`), and
-  the root `.dockerignore` also keeps `.env*`, databases, `.git`, `docs/`, `test/`, all of `deploy/` and every host
+  the root `.dockerignore` also keeps `.env*`, databases, `.git`, `docs/` (kept as a guard: any docs added later stay out of the image), `test/`, all of `deploy/` and every host
   `node_modules` out of the image. `node_modules` in the image comes only from the frozen install.
 
 The Compose project is named `plenary` (`name:` in `compose.yml`), so the data volume is `plenary_plenary-data`.
 
-CI (`.github/workflows/ci.yml`) runs `bun test` on every push and pull request.
-Both jobs install with `bun install --frozen-lockfile` and fail if `bun.lock` is missing or out of date.
+CI (`.github/workflows/ci.yml`) runs `bun test` on every push and pull request. Before the tests it clones
+herdr-draw (public, read-only) at the commit in `packages/core/SOURCE.json`, so the core-copy check runs there too.
+The `image` job builds `deploy/Dockerfile` and runs `scripts/image-smoke.sh` (healthy, non-root, clean SIGTERM stop).
+The two test jobs install with `bun install --frozen-lockfile` and fail if `bun.lock` is missing or out of date.
 The cluster job generates a throwaway `COOKIE_KEY` per run (`openssl rand -hex 32`, masked in the log).
 A second job, `test-cluster-services`, runs the same `bun test` with Postgres (a service container), NATS and an
 S3-compatible blob store, and `DATABASE_URL`, `NATS_URL` and `S3_*` set, so engine's cluster-adapter tests run there.
@@ -81,10 +140,49 @@ The blob store is the same `pgsty/minio` image and tag as `cluster.compose.yml`,
 runner's loopback; the step creates the bucket and fails unless the store reports it. Its `S3_*` values are
 throwaway CI-only literals written in the workflow.
 
+## Sign-in failures (operator guide)
+
+When a Google sign-in fails, the server logs one line, `{"level":"warn","msg":"sign-in failed","cause":"..."}`,
+and the browser gets `{"error":"login-failed"}` at `/auth/callback`. The label is fixed text, never a code, state,
+token or cookie value.
+
+| `cause` | What it means | What to do |
+|---|---|---|
+| `no_login_cookie` | The browser didn't send the login cookie back (a different host name than the one that started sign-in, or cookies blocked) | Open the server by the same address on every step, then sign in again. |
+| `bad_login_cookie` | The cookie was signed with another key or is older than 10 min (for example, the server restarted with no `COOKIE_KEY`) | Sign in again. |
+| *(no line at all; Google shows its own error page, e.g. "Access blocked")* | Google refused before calling us back: usually the account isn't allowed on the OAuth client (a test user while the app is in testing), or the redirect URI doesn't match | Fix the OAuth client's audience or redirect URI in your Google Cloud project. |
+| `idp_error:access_denied` | The user pressed Cancel on Google's consent screen | Sign in again. |
+| `idp_error:<other name>` (e.g. `idp_error:server_error`, `idp_error:temporarily_unavailable`, `idp_error:login_required`) | Google sent the user back with a standard error instead of a sign-in | Wait a minute and sign in again. If it repeats, report the cause. |
+| `idp_error` (no name) | Google sent the user back with an error whose name we don't recognise, so we don't print it | Sign in again. If it repeats, report it. |
+| `state_mismatch`, `no_code`, `state_used` | The callback URL was altered, or reused (back button, double submit) | Sign in again. |
+| `invalid_grant` | Google refused the code: too old or already used | Sign in again, without lingering. |
+| `invalid_client` | The client id or secret in the server's environment is wrong | Check the environment (don't paste secrets anywhere). |
+| `invalid_request`, `unauthorized_client`, `unsupported_grant_type`, `invalid_scope` | Google refused how our server asked for the token (a bug on our side or an OAuth client setting) | Shouldn't happen. Report the cause. |
+| `idp_timeout`, `idp_unreachable`, `token_http_<n>` | Google couldn't be reached in time, the connection dropped before its whole answer arrived, or Google answered the token request with error status `<n>` and no standard error name | Check the network and retry. |
+| `bad_token_response` | Google's token answer arrived whole but wasn't JSON, whatever its status, an empty answer included (a proxy or captive portal in the way, or a Google outage page) | Retry. If it repeats, check for a proxy, then report. |
+| `bad_token`, `bad_alg`, `bad_aud`, `bad_iss`, `bad_nonce`, `bad_sig`, `bad_sub`, `expired`, `bad_time`, `stale` | Google's ID token was missing, malformed, or failed a check | Shouldn't happen. Report the cause. |
+| `unknown_kid` | Google's ID token was signed with a key we don't have, or Google's key endpoint couldn't be reached to fetch its keys (the server reads a failed key fetch as an unknown key) | Wait a minute and retry. If it repeats, report the cause. |
+| `bad_config`, `bad_expected` | The server's own sign-in setup, or the login state in the cookie, was incomplete | Shouldn't happen. Report the cause. |
+| `idp_refused`, `idp_threw` | The sign-in adapter refused without giving a reason, or crashed | Shouldn't happen with Google. Report the cause. |
+| `replay_guard_full` (503) | Over 100k sign-ins in 10 min on one process | Not expected in normal use. |
+| `mint_failed` (503) | Google signed the user in, but the server couldn't make the one-time code that hands the sign-in to the page | Sign in again. If it repeats, report it. |
+
+This table lists every label the server can log: every cause goes through one function, `failed` in
+`server/auth/http.js`, and the labels it can receive are exactly `CAUSES` in `server/auth/oidc.js` plus
+`SIGN_IN_CAUSES` in `server/auth/http.js`. `test/auth/signin-cause.test.js` checks that every label written in
+either file's source is in those lists and the other way round, and that this table names exactly those labels.
+
+The exchange step can fail separately: the page says "sign-in failed (invalid-code)". That is the 60 s exchange
+window or a dropped exchange cookie. Sign in again.
+
+If `POST /boards` gives **403 `forbidden`**, the caller has no tenant (a user whose domain has no Unit is a guest and makes no boards), or names a Space they can't create in. For a tenant that does not exist yet, the first admin must match. Admin by email needs Google to vouch for the
+email: the account's Workspace domain (`hd`) must equal the email's domain. A Workspace account whose address is on a
+secondary domain gets no email from the server, so it can't match an email admin.
+
 ## Postgres roles (least privilege)
 
-When `DATABASE_URL` and `NATS_URL` are both set, `server/main.js` runs in cluster mode using the Postgres Store and
-Registry adapters and the NATS Bus adapter.
+`server/main.js` uses the Postgres adapters when `DATABASE_URL` and `NATS_URL` are both set (see
+[What is missing](#cluster-phase-4-not-run-on-docker-yet) below). This is how the adapters behave.
 
 PROTOCOL.md § Store, "Least privilege": a Plenary node can run as a Postgres role that reads and writes the tables
 but does not own the schema. The Registry (`server/registry/postgres.js`, tables `reg_*`) and the Store
@@ -93,7 +191,7 @@ up (`to_regclass`) and create only what is missing. They never ALTER, DROP or GR
 
 | Role | Rights | Used by |
 |---|---|---|
-| owner (`plenary_owner`) | owns the database, so its `public` schema (Postgres 15+); creates the tables | the migrate step, once per schema and after an upgrade that adds a table |
+| owner (`plenary_owner`) | owns the database, so its `public` schema (Postgres 15+); creates the tables | the migrate step, once per schema and after any upgrade that adds a table or an index (see the upgrade note below) |
 | runtime (`plenary_app`) | `USAGE` on the schema; `SELECT, INSERT, UPDATE, DELETE` on its tables; no `CREATE` | every node's `DATABASE_URL` |
 
 Dev, CI and `cluster.compose.yml` use one owner role for both, which also works: the first node to start creates
@@ -124,6 +222,10 @@ await (await postgresStore({ url, schema })).close();
 console.log("migrated", schema);'
 ```
 
+**New tables and indexes.** Run step 2 as the owner **before** starting nodes of a version that adds a table or an index under the runtime
+role: start-up as a role without `CREATE` on the schema cannot add one, and refuses with the privilege error naming this step.
+Nothing is altered or dropped. There is no data migration (see "Old-format stores").
+
 **3. Grant the runtime role, as the owner** (`psql` on database `plenary`). Identity columns need no sequence grant.
 The `DEFAULT PRIVILEGES` line covers tables the owner creates later, so a migrate that adds a table needs no new grant:
 
@@ -133,6 +235,12 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO plenary_a
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO plenary_app;
 ```
 
+**The cluster id** (PROTOCOL.md § Bus, Cluster id) lives in the table `pl_cluster` (run step 2 as the owner first; the default
+privileges cover its grants). A database copied for staging or a restore test keeps the original's id; run `DELETE FROM pl_cluster;` on
+the copy (all its nodes stopped) before it shares a NATS server with the original. The id prefix keeps honest clusters
+apart; it is not access control: for real separation give each cluster its own NATS account or user limited to
+`<id>.>`. The id is on the `cluster adapters open` log line and in `SELECT id FROM pl_cluster`.
+
 **If start-up is refused**, a runtime-role node stops with `postgres registry: start-up in schema "…" was refused for
 lack of a privilege (permission denied …)` (the Store's reads `postgres store: …` the same way), code `denied`.
 Either a table is missing (run step 2) or the role lacks its grants (run step 3). Both adapters check every table
@@ -140,15 +248,14 @@ right they use at start-up, so a role with `USAGE` but missing grants is refused
 `lacks DELETE on reg_link_uses`), not on its first request:
 
 - **Registry:** `SELECT, INSERT, UPDATE, DELETE` on every `reg_*` table.
-- **Store:** `SELECT, INSERT` on `pl_entries`; `SELECT, INSERT, DELETE` on `pl_checkpoints`; `SELECT, INSERT, UPDATE`
-  on `pl_leases` (the epoch fence's `FOR SHARE` needs `UPDATE`).
+- **Store:** `SELECT, INSERT, DELETE` on `pl_entries` (DELETE: the Trash purge); `SELECT, INSERT, DELETE` on `pl_checkpoints` and on `pl_checkpoint_parts`; `SELECT, INSERT, UPDATE, DELETE`
+  on `pl_leases` (the epoch fence's `FOR SHARE` needs `UPDATE`; the Trash purge `DELETE`); `SELECT, INSERT, DELETE` on `pl_blob_refs` (DELETE: the Trash purge);
+  `SELECT, INSERT, UPDATE, DELETE` on `pl_blob_pending` (UPDATE: a second upload request extends the pending reference) and on `pl_blob_condemned` (UPDATE: the blob reaper's claim). Blob references and the reaper: PROTOCOL.md § Blobs, "References and purge". Its three indexes (`pl_blob_refs_board`, `pl_blob_pending_board`, `pl_blob_pending_until`) are created, like the tables, by the owner role's migrate step only when missing.
 
 Step 3's grants cover both.
 
-**Upgrading a schema made before the lease (phase 4).** Nodes refuse to start with `needs-migration` if `pl_leases`
-lacks `holder` and `expires_at`. Run once, as the owner role, on each Plenary schema:
-`ALTER TABLE "<schema>".pl_leases ADD COLUMN IF NOT EXISTS holder TEXT, ADD COLUMN IF NOT EXISTS expires_at BIGINT;`
-It is idempotent and keeps every board's epoch. (Start-up itself never runs it: nodes still never ALTER.)
+**Old-format stores.** There is no migration: a schema or SQLite file from before the current table shapes is refused at start-up
+(code `old-format`, "Reset the store"). Drop the schema (or delete the SQLite file) and start again; nothing is ALTERed or read silently.
 
 ### Registry time limits
 
@@ -165,7 +272,7 @@ Every Registry call on Postgres answers or rejects within a bound, and a rejecti
 | `queueTimeoutMs` | 0.2 × the smaller limit + 50 ms | a call's wait for a connection; it is then refused and never sent | `queue-timeout` |
 | (fixed) | the larger limit + 1 s after sending | a sent call with no answer (dead peer); it may still have taken effect | `client-timeout` |
 
-**For a cluster, set `statementTimeoutMs` and `lockTimeoutMs` to 3–5 s**, above the gateway's 2 s re-check bound
+**For a cluster, set `statementTimeoutMs` and `lockTimeoutMs` to 3–5 s** (`server/main.js` passes 5000 ms to the Registry itself, so one call stays under the 8 s HTTP request deadline), above the gateway's 2 s re-check bound
 (`recheckLookupMs`). The main reason: `queueTimeoutMs` is then 0.65–1.05 s, below those 2 s, so a re-check lookup the
 gateway has already given up on is never sent. With the 15 s defaults `queueTimeoutMs` is 3050 ms, and an abandoned
 lookup can still take a connection. Each connection is also pinned for less time under a stuck lock. Measured:
@@ -177,30 +284,33 @@ behind a stuck lock every call settles by about 1 × the lock limit, sent or not
 - **A shared pool:** the gate assumes the Registry is its pool's only user; pass `maxInFlight` below the pool's `max`
   if the pool is shared.
 
-## Cluster
+## Cluster (phase 4, not run on Docker yet)
 
-`cluster.compose.yml` runs the phase-4 cluster: Postgres, NATS, an S3-compatible blob store, three app nodes and a Caddy
+`cluster.compose.yml` is the phase-4 shape: Postgres, NATS, an S3-compatible blob store, three app nodes and a Caddy
 load balancer. It is a separate Compose project (`plenary-cluster`), so it never touches the single-node stack above,
 whose `compose.yml` is unchanged.
 
 | Service | Image | Role |
 |---|---|---|
-| `postgres` | `postgres:17.11-alpine3.23` | Store and Registry (`server/store/postgres.js`, `server/registry/postgres.js`). Volume `postgres-data`. |
+| `postgres` | `postgres:17.11-alpine3.23` | Store (the Postgres adapter). Volume `postgres-data`. |
 | `nats` | `nats:2.15.3-alpine` | Bus, NATS core (no JetStream). Config `cluster/nats.conf` raises `max_payload` to 2 MB, as PROTOCOL.md asks. |
 | `blobs` | `pgsty/minio:RELEASE.2026-08-04T00-00-00Z` | S3-compatible blobs. MinIO stopped publishing `minio/minio` on Docker Hub; this is a community-maintained MinIO fork. |
 | `blobs-init` | same | One shot: creates the bucket (`S3_BUCKET`, default `plenary`), then exits. |
-| `app-1` | built from `Dockerfile` | `server/main.js`, roles `gateway,host`. No published ports. |
-| `app-2` | same | Roles `gateway` only. |
-| `app-3` | same | Roles `host` only: never behind the load balancer. |
-| `lb` | `caddy:2.11.9-alpine` | Routes `/ws` (WebSocket) and `/health` to the **gateway** nodes only (`app-1`, `app-2`), round robin with health checks; everything else is 404. The only published port: `127.0.0.1:8090` (`PLENARY_LB_PORT`). |
+| `app-1`, `app-2`, `app-3` | built from `Dockerfile` | `server/main.js`, each with roles `gateway,host` (set explicitly), so any node can take over a killed host's boards. No published ports. |
+| `lb` | `caddy:2.11.9-alpine` | Proxies every path (`/ws`, `/health`, the HTTP API, the web app) to the three nodes, round robin with health checks. The only published port: `127.0.0.1:8090` (`PLENARY_LB_PORT`). |
 
 **Roles.** `PLENARY_ROLES` is a comma list of `gateway` (holds client sockets, fans out) and `host` (sequences
-boards), default `gateway,host`. The stack runs two gateways and two room hosts, so "gateways separate from room
-hosts" is exercised and a killed host's boards have another host to move to. `PLENARY_NODE_ID` is unique per node
+boards), default `gateway,host`. All three nodes hold both roles, so a killed host's boards have two other hosts to move to
+(`bun run test:compose` kills one). Role-split shapes: the native rig's `--hosts`. `PLENARY_NODE_ID` is unique per node
 and stable across that node's restarts (a fixed value per service).
 
 **Cluster env** (names confirmed by engine; Compose sets them): `DATABASE_URL`, `NATS_URL`, `S3_ENDPOINT`, `S3_BUCKET`,
 `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `PLENARY_NODE_ID`, `PLENARY_ROLES`.
+Pictures: with `S3_ENDPOINT` set (all five `S3_*` required) their bytes go to the bucket. A cluster node without it
+**refuses to start** (another node could not read what this one stored); `PLENARY_BLOBS=local-disk` opts a cluster with
+a single gateway into the node's own disk (the start warns). Signed picture URLs are keyed from `COOKIE_KEY` (same on
+every node) and name `PUBLIC_URL` when it is set. `PLENARY_BLOB_QUOTA_BYTES` sets the per-tenant limit (default 10 GiB;
+enforced per node, see PROTOCOL.md Known limits). A gateway node deletes the pictures no board references any more (the board was purged from Trash, and 60 minutes passed) every `PLENARY_BLOB_REAP_MS` (default 600000; 1000 to 86400000); with `PLENARY_BLOBS=local-disk` run it on the node whose disk holds the pictures (the one gateway).
 
 Put the four required secrets in `deploy/.env` (git-ignored) or your shell, with your own values. Use letters and
 digits for `POSTGRES_PASSWORD`, because it goes into `DATABASE_URL` unescaped. `COOKIE_KEY` is one value that Compose
@@ -231,14 +341,57 @@ docker compose -f deploy/cluster.compose.yml down          # add -v to delete th
 
 **What is missing:**
 
-- **Cluster adapters and roles.** `server/main.js` uses `DATABASE_URL` and `NATS_URL` only to decide it is in cluster
-  mode (and so require `COOKIE_KEY`); it reads none of `DATABASE_URL`, `NATS_URL`, `S3_*`,
-  `PLENARY_NODE_ID` or `PLENARY_ROLES` yet, so every node still runs both roles regardless of its setting. Each node runs single-node: its own SQLite in its container (lost on `down`),
-  its own in-memory bus, its own dev board. Two clients that land on different nodes do not see each other.
-- **Leases and takeover.** The phase-4 test ("kill a board's host, another takes over, no acked op lost") cannot run
-  until engine's leases exist.
+- **Blobs.** Nothing in `server/` writes blobs yet, so the S3-compatible store is not exercised by the server.
+- **Takeover on this stack:** run by `bun run test:compose` (below), on Podman; not yet on Docker.
 - **Run once, on Podman, not Docker (2026-11-12, p8-cookie).** With `COOKIE_KEY` set, all three app nodes start in
   cluster mode and the load balancer answers `/health` with 200. Docker Compose 5.1.3 against Podman 5.8.2's API split the
   exec-form app healthcheck at its first space and marked the nodes unhealthy (which of the two splits it is not
   isolated), so that run used a local override with a `CMD-SHELL` healthcheck.
   Not yet run on Docker itself.
+
+### Cluster test on containers (`bun run test:compose`, #71)
+
+For agents. `scripts/test-compose.js` runs the cluster file plus `deploy/cluster.compose.test.yml` (override) and checks
+the real protocol end to end. Never part of `bun test` or `bun run test:cluster` (heavy: builds an image, nine containers).
+Takes about 40 s warm.
+
+- **Runtime:** `docker` (with `docker compose`) else `podman`; `CONTAINER_CLI=docker|podman|<path>` forces one (a path that
+  does not exist is reported as not found). For podman it runs `docker-compose` (else `podman compose`) with `DOCKER_HOST` set
+  to podman's API socket (macOS: from `podman machine inspect`; Linux: `podman info`), unless `DOCKER_HOST` is already set.
+  No runtime or no Compose: a loud `SKIPPED test:compose` banner on stderr and exit 0; `--require` or
+  `PLENARY_COMPOSE_REQUIRE=1` makes that exit 1. Exit codes: 0 pass, 1 fail, 124 a deadline or command timed out, 130 interrupted.
+- **Isolation:** project `plenary-c3-<pid>-<6 random hex>` and the same name as image tag (unique per run, so two runs with one pid on a shared daemon never collide; nothing parses the name, leftovers are found by the owner label), random secrets per run, host ports random on
+  127.0.0.1 (read with `compose port`; never 8099 or any fixed port). The cluster file itself runs all three nodes as
+  `gateway,host`; the override adds only the random ports, `PLENARY_LEASE_TTL_MS=3000`, `restart: "no"` (the test decides when
+  a node returns), CPU/memory limits and owner labels. The `lb` service is not started (clients connect to the nodes
+  directly). The script renices itself (19).
+- **What it checks, with bounded waits only (health, lease epoch read from Postgres, op counts; no fixed sleeps):**
+  1. two editors on two gateways write 60 ops to one board: the Postgres log has seq 1..60, no gap, no duplicate id; a viewer
+     on the third node (welcome role `viewer`, asserted) holds all 60; an op the viewer sends is refused `forbidden` and
+     appends nothing;
+  2. five failure cases, each while both editors stream 30 ops/s, each ending with the invariants below:
+     a. SIGKILL the board's host (it has clients); a survivor takes the lease at a higher epoch (about 3 s); the node is
+        restarted afterwards and serves a new client;
+     b. SIGKILL the new host and start it again at once (`restart: unless-stopped` racing the takeover): the lease epoch
+        only rises and no epoch has two holders;
+     b2. SIGKILL all three nodes, start only the old host: nobody else can take the lease, so the restarted node wins it
+        back (deterministic; the whole cluster restarting on the Postgres state); then the other two are started;
+     c. SIGKILL the host with no client on it (clients moved off first);
+     d. SIGKILL a non-host gateway with clients: no takeover, the lease epoch and holder do not change.
+  3. the lease is polled every 50 ms through each case: epochs only rise and no epoch has two holders;
+  4. invariants: the log read right after the takeover (before any resend) holds every op acked before the kill; at the
+     end the log has no gap or duplicate, every ack ever seen is in it at its acked seq, and every client's full state
+     (canonical JSON of its elements, sorted by id) equals the state folded from the log. Ops never acked and not in the
+     log are counted (`neverAckedLost`; the Replica resends pending ops, so 0 is normal).
+- **Teardown on every exit path** (pass, fail, 12 min deadline, SIGINT/SIGTERM/SIGHUP; handlers are installed before anything
+  starts; the `down` runs detached so a terminal Ctrl-C cannot cut it, and running commands are killed on abort):
+  `down -v --remove-orphans`, `rmi` of the image it built, then a check that no container, volume or network labelled with
+  the project and no image tag remains; leftovers fail the run.
+- **Leftovers of a SIGKILLed run:** every container, network, volume and image carries the label
+  `plenary.c3.owner=machine-id|boot|pid|process-start` (machine id: macOS IOPlatformUUID, Linux /etc/machine-id; so a renamed host keeps its leftovers sweepable). Every run (and `bun scripts/test-compose.js --sweep`) first removes what
+  carries that label from this machine when its owner is provably dead: pid gone, or the pid now has another process start time
+  (a reused pid, image included; Linux: boot id + /proc/<pid>/stat field 22; macOS: `ps lstart` within 5 s). A boot id or clock
+  change alone is never proof. It never touches another machine's, a live owner's, or anything on doubt.
+- **On failure** it prints the last container log lines before teardown. `--keep-image` keeps the built image.
+- **CI (not set up):** a job on a runner with docker would run `PLENARY_COMPOSE_REQUIRE=1 bun run test:compose`; GitHub's
+  runners have docker and compose, and the first run pulls four images.

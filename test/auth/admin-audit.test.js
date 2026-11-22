@@ -26,7 +26,7 @@ const GUEST = { user: "google:2001", name: "Eve", email: "eve@gmail.com", domain
 const OTHER_ADMIN = { user: "google:3001", name: "Fay", email: "fay@globex.com", domain: "globex.com" };
 
 describe("boards listing & audit log HTTP API", () => {
-  let clock, registry, sessions, tenancy, routes, acme, globex;
+  let clock, registry, sessions, tenancy, routes, acme, acmeSpace, globex;
   const now = () => clock.t;
 
   const call = (path, token, method = "GET", body) =>
@@ -47,6 +47,9 @@ describe("boards listing & audit log HTTP API", () => {
     sessions = await makeSessions({ key: "s".repeat(32), now });
     tenancy = makeTenancy({ registry, now });
     acme = await registry.createTenant({ domain: "acme.com", admins: [ADMIN.user] });
+    await registry.setScopedGrant({ scope: { type: "unit", id: acme.id }, subject: { type: "user", id: ADMIN.user }, role: "content-admin-personal" });
+    acmeSpace = await registry.createSpace({ tenant: acme.id, name: "Shared", generalRole: null });
+    for (const m of [OWNER, EDITOR, VIEWER]) await registry.touchMember(acme.id, m);
     globex = await registry.createTenant({ domain: "globex.com", admins: [OTHER_ADMIN.user] });
     routes = httpRoutes({ registry, sessions, oidc: null, tenancy, now, config });
   });
@@ -105,7 +108,7 @@ describe("boards listing & audit log HTTP API", () => {
     const { board } = await (await call("/boards", adminTok, "POST", { title: "Audit Board", memberRole: "viewer" })).json();
 
     clock.t += 100;
-    const { invite } = await (await call(`/boards/${board.id}/invites`, adminTok, "POST", { email: "bob@partner.io", role: "editor" })).json();
+    const { invite } = await (await call(`/boards/${board.id}/invites`, adminTok, "POST", { email: "bob@partner.io", role: "editor", expiresAt: null })).json();
 
     clock.t += 100;
     expect((await call(`/boards/${board.id}/invites/${invite.id}`, adminTok, "DELETE")).status).toBe(204);
@@ -144,7 +147,7 @@ describe("boards listing & audit log HTTP API", () => {
     const viewerTok = await tok(VIEWER);
     const otherAdminTok = await tok(OTHER_ADMIN);
 
-    const { board } = await (await call("/boards", adminTok, "POST", { title: "Scoped", memberRole: "viewer" })).json();
+    const { board } = await (await call("/boards", adminTok, "POST", { title: "Scoped", memberRole: "viewer", space: acmeSpace.id })).json();
     clock.t += 10;
     await call(`/boards/${board.id}/grants/${encodeURIComponent(OWNER.user)}`, adminTok, "PUT", { role: "owner" });
     clock.t += 10;
@@ -181,7 +184,7 @@ describe("boards listing & audit log HTTP API", () => {
     const guestTok = await tok(GUEST);
     const otherAdminTok = await tok(OTHER_ADMIN);
 
-    const { board: b1 } = await (await call("/boards", adminTok, "POST", { title: "B1" })).json();
+    const { board: b1 } = await (await call("/boards", adminTok, "POST", { title: "B1", space: acmeSpace.id })).json();
     clock.t += 10;
     await call(`/boards/${b1.id}/grants/${encodeURIComponent(OWNER.user)}`, adminTok, "PUT", { role: "owner" });
     clock.t += 10;

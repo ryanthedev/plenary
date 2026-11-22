@@ -8,7 +8,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <title>Plenary</title>
 <link rel="manifest" href="/manifest.webmanifest">
-<link rel="icon" type="image/svg+xml" href="/icons/icon.svg">
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
 <link rel="apple-touch-icon" href="/icons/icon-192.png">
 <link rel="stylesheet" href="style.css">
 <link rel="stylesheet" href="adapters/dom/collab/collab.css">
@@ -17,6 +17,7 @@
 <!-- Plenary canvas (production): web/main.js over the server's /ws. URL: ?board=<id>&theme=light|dark, and
      #code=<single-use code> after sign-in. The in-browser dev rooms live on web/dev-main.html (never served). -->
 <div class="app">
+  <h1 class="sr-only">Plenary</h1>
   <header class="topbar" id="topbar"></header>
   <div class="main">
     <aside class="drawer" id="drawer" hidden></aside>

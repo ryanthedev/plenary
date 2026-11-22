@@ -2,104 +2,40 @@
 // (p7-chrome): the chrome is rebuilt only when what a part shows changes (C-2, C-8), the zoom % and pill update in
 // place, `online` / a long-hidden tab reconnects (C-4), the collab UI gets the clock port (C-6), a refused or
 // expiring sign-in offers "Sign in again" (C-9), and the cap's countdown reads the clock port (C-17).
+import { BLOB_PENDING_MS } from "../../packages/protocol/envelope.js";
 import { test, expect, beforeEach, afterAll } from "bun:test";
 import { localRoom } from "../../web/adapters/transport/local.js";
 import { createSession } from "../../web/core/session.js";
 import { memoryStore } from "../../web/adapters/storage/memory.js";
 import { syncCollabPort } from "../../web/adapters/collab/sync.js";
+import { announced } from "../../web/adapters/dom/focus.js";
 import { mountApp } from "../../web/adapters/dom/app.js";
 import { expiryNotice, shouldProbe, takeReturnBoard, rememberBoard, connectionBanner, RETURN_KEY, EXPIRY_WARN_MS } from "../../web/core/roles.js";
 
-// ── a stub page: just enough DOM for app.js (text only; no layout) ──
-class N {
-  constructor(type) { this.nodeType = type; this.parentNode = null; this.childNodes = []; }
-  append(...ns) { for (const n of ns) { const x = n instanceof N ? n : new T(String(n)); x.parentNode?.removeChild(x); x.parentNode = this; this.childNodes.push(x); } }
-  removeChild(n) { const i = this.childNodes.indexOf(n); if (i >= 0) this.childNodes.splice(i, 1); n.parentNode = null; }
-  replaceChildren(...ns) { this.replaced = (this.replaced ?? 0) + 1; for (const c of [...this.childNodes]) this.removeChild(c); this.append(...ns); }
-  remove() { this.parentNode?.removeChild(this); }
-  get textContent() { return this.childNodes.map(c => c.textContent).join(""); }
-  set textContent(v) { for (const c of [...this.childNodes]) this.removeChild(c); this.append(new T(String(v))); }
-}
-class T extends N { constructor(t) { super(3); this.data = t; } get textContent() { return this.data; } }
-const CTX = { measureText: t => ({ width: String(t).length * 7 }), getImageData: () => ({ data: [] }), createLinearGradient: () => ({ addColorStop() {} }), createPattern: () => null };
-class E extends N {
-  constructor(tag) {
-    super(1); this.tagName = tag.toUpperCase(); this.className = ""; this.listeners = {}; this.attrs = {}; this.dataset = {};
-    this.style = { setProperty(k, v) { this[k] = v; }, getPropertyValue(k) { return this[k] ?? ""; } };
-    this.hidden = false; this.disabled = false; this.value = ""; this.scrollTop = 0; this.width = 300; this.height = 150;
-    const self = this;
-    this.classList = { contains: c => self.className.split(/\s+/).includes(c), add: c => self.classList.toggle(c, true), remove: c => self.classList.toggle(c, false),
-      toggle: (c, on) => { const s = new Set(self.className.split(/\s+/).filter(Boolean)); if (on ?? !s.has(c)) s.add(c); else s.delete(c); self.className = [...s].join(" "); } };
-  }
-  setAttribute(k, v) { this.attrs[k] = String(v); }
-  getAttribute(k) { return this.attrs[k] ?? null; }
-  addEventListener(t, fn) { (this.listeners[t] ??= []).push(fn); }
-  removeEventListener(t, fn) { this.listeners[t] = (this.listeners[t] ?? []).filter(f => f !== fn); }
-  fire(t, ev = {}) { const e = { target: this, currentTarget: this, button: 0, preventDefault() { this.defaultPrevented = true; }, stopPropagation() {}, ...ev }; for (const fn of this.listeners[t] ?? []) fn(e); return e; }
-  click() { if (!this.disabled) this.fire("click"); }
-  focus() {} blur() {} setPointerCapture() {} setSelectionRange() {} select() {}
-  after(n) { const p = this.parentNode; p.append(n); }
-  contains(n) { for (let x = n; x; x = x.parentNode) if (x === this) return true; return false; }
-  closest() { return null; }
-  replaceWith(n) { const p = this.parentNode; if (!p) return; const i = p.childNodes.indexOf(this); p.removeChild(this); n.parentNode?.removeChild(n); n.parentNode = p; p.childNodes.splice(i, 0, n); }
-  getBoundingClientRect() { return { left: 0, top: 0, width: 1200, height: 800, right: 1200, bottom: 800 }; }
-  getContext() { return new Proxy({}, { get: (_, k) => (k in CTX ? CTX[k] : () => {}), set: () => true }); }
-  get children() { return this.childNodes.filter(c => c.nodeType === 1); }
-  all() { return [this, ...this.children.flatMap(c => c.all())]; }
-}
-const IDS = ["topbar", "panel", "drawer", "timeline", "hudBL", "hudBC", "hudBR", "dock", "sheet", "dialogs", "overlays", "veil", "toast", "picker"];
-
-let frames, winL, page;
-// The globals this file stubs, put back afterwards so later files' fallbacks never see the stub page.
-const GLOBALS = ["document", "Node", "devicePixelRatio", "matchMedia", "ResizeObserver", "requestAnimationFrame", "addEventListener", "removeEventListener"];
-const saved = Object.fromEntries(GLOBALS.map(k => [k, Object.getOwnPropertyDescriptor(globalThis, k)]));
-afterAll(() => { for (const k of GLOBALS) { if (saved[k]) Object.defineProperty(globalThis, k, saved[k]); else delete globalThis[k]; } });
-function installPage() {
-  frames = []; winL = {};
-  const body = new E("body"), main = new E("div"), canvasBox = new E("div"), board = new E("canvas"), ink = new E("textarea");
-  main.className = "main"; body.append(main); main.append(canvasBox); canvasBox.append(board, ink);
-  const byId = { canvas: canvasBox, board, ink };
-  for (const id of IDS) { byId[id] = new E(id === "picker" ? "input" : "div"); body.append(byId[id]); }
-  const docL = {};
-  const doc = {
-    body, documentElement: new E("html"), activeElement: null, visibilityState: "visible",
-    createElement: t => new E(t), createTextNode: t => new T(t),
-    querySelector: s => (s === ".main" ? main : s.startsWith("#") ? byId[s.slice(1)] ?? null : null),
-    addEventListener: (t, fn) => { (docL[t] ??= []).push(fn); },
-    fire(t, ev = {}) { for (const fn of docL[t] ?? []) fn({ target: board, preventDefault() {}, ...ev }); },
-  };
-  Object.assign(globalThis, {
-    document: doc, Node: N, devicePixelRatio: 1,
-    matchMedia: () => ({ matches: false, addEventListener() {} }),
-    ResizeObserver: class { constructor(fn) { this.fn = fn; } observe() { this.fn([]); } },
-    requestAnimationFrame: fn => frames.push(fn),
-    addEventListener: (t, fn) => { (winL[t] ??= []).push(fn); },
-    removeEventListener: (t, fn) => { winL[t] = (winL[t] ?? []).filter(f => f !== fn); },
-  });
-  page = { doc, byId, board };
-  return page;
-}
-const fireWin = (t, ev = {}) => { for (const fn of winL[t] ?? []) fn({ preventDefault() {}, ...ev }); };
+import { installPage as install, stub, fireWin, restoreGlobals } from "./stub-page.js";
+let page;
+const installPage = () => (page = install());
+afterAll(restoreGlobals);
 
 const USERS = { "t-ada": { user: "ada", role: "owner" }, "t-bo": { user: "bo", role: "editor" }, "t-cy": { user: "cy", role: "annotator" },
   "t-di": { user: "di", role: "annotator" }, "t-vi": { user: "vi", role: "viewer" } };
 
 /** ada's page over a room with bo (a second presenter, headless) on the same virtual clock. */
-function setup({ expAt = null, relogin = null, collab = false, role = null, token = "t-ada", prefs = memoryStore(), wrap = null } = {}) {
+function setup({ expAt = null, relogin = null, collab = false, role = null, token = "t-ada", prefs = memoryStore(), wrap = null, appNet = null, access = null, share = null, move = null, trashShown = undefined } = {}) {
   installPage();
   const net = localRoom({ users: USERS, clock: true });
   const joins = [], hooks = {};
   const bo = createSession({ join: () => net.join(), token: "t-bo", board: "b1", client: "bo", user: "bo", clock: net.clock });
   bo.setSize(1200, 800);
   const app = mountApp({
-    startSession: ({ mine, onChange }) => createSession({ join: () => { const t = net.join(); joins.push(t); return wrap ? wrap(t) : t; }, token, board: "b1", client: USERS[token].user, user: USERS[token].user, mine, onChange, clock: net.clock }),
-    net: { kind: "local", put() {}, onFile() {} }, board: "b1", me: { user: USERS[token].user, name: "Ada", role }, prefs, theme: "light",
-    clock: net.clock, expAt, relogin,
+    startSession: ({ mine, onChange }) => { hooks.onChange = onChange; return createSession({ join: () => { const t = net.join(); joins.push(t); return wrap ? wrap(t) : t; }, token, board: "b1", client: USERS[token].user, user: USERS[token].user, mine, onChange, clock: net.clock }); },
+    net: appNet ?? { kind: "local", put() {}, onFile() {} }, board: "b1", me: { user: USERS[token].user, name: "Ada", role }, prefs, theme: "light",
+    clock: net.clock, expAt, relogin, access, share, ...(trashShown ? { trashShown } : {}), move: move && { clock: net.clock, ...move }, newKey: () => "key-pill-0001",
     collab: collab ? (S, o) => { hooks.jumpTo = o.jumpTo; return syncCollabPort(S, { name: "Ada", frame: fn => net.clock.set(fn, 16), ...o }); } : null,
   });
   /** n animation frames, 16 ms of virtual time each, the room settled in between. */
   // Deliveries until quiet, then 16 ms of timers (never settle(): the collab UI's frame loop re-arms forever).
-  const step = (n = 1) => { for (let i = 0; i < n; i++) { while (net.step()); net.advance(16); while (net.step()); const q = frames; frames = []; for (const fn of q) fn(); } };
+  const step = (n = 1) => { for (let i = 0; i < n; i++) { while (net.step()); net.advance(16); while (net.step()); const q = stub.frames; stub.frames = []; for (const fn of q) fn(); } };
   step(3);
   return { net, app, S: app.S, bo, step, joins, hooks, prefs };
 }
@@ -118,6 +54,7 @@ test("C-2/C-8: 60 frames of wheel panning and 100 incoming ops rebuild topbar, p
   rig = setup();
   const { S, bo, step, app, net } = rig;
   expect(S.role).toBe("presenter");
+  expect(page.byId.topbar.all().filter(e => e.tagName === "BUTTON" && /\btb\b/.test(e.className)).every(e => e.attrs["aria-label"] && e.attrs.title)).toBe(true);
   // A busy board: the other presenter has shapes; the notes drawer is open.
   drawRect(bo, 100, 100); step(2);
   app.ui.drawer = "notes"; app.setPanel({ type: "noop" }); step(2);
@@ -165,6 +102,172 @@ test("C-2/C-8: 60 frames of wheel panning and 100 incoming ops rebuild topbar, p
   drawRect(bo, 500, 500); step(20);                                         // a new shape: the layer count in the panel
   expect(delta(c0, counts()).panel).toBe(1);
   void net;
+});
+
+test("More menu exposes header actions and closes with Escape or an outside click", () => {
+  rig = setup({ collab: true });
+  const more = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More");
+  expect(more?.attrs["aria-haspopup"]).toBe("menu");
+  expect(more?.attrs["aria-expanded"]).toBe("false");
+  more.click();
+  expect(more.attrs["aria-expanded"]).toBe("true");
+  const menu = find(page.byId.topbar, e => e.attrs.role === "menu" && e.classList.contains("header-more-menu"));
+  expect(["Comments", "Notes", "Mermaid", "Export", "Side panel", "Light / dark"].every(label => menu.all().some(e => e.tagName === "BUTTON" && e.attrs["aria-label"] === label))).toBe(true);
+  expect(menu.all().filter(e => e.tagName === "BUTTON").every(e => e.attrs.role === "menuitem")).toBe(true);
+  menu.fire("keydown", { key: "Escape" });
+  expect(more.attrs["aria-expanded"]).toBe("false");
+  expect(page.doc.activeElement).toBe(more);
+  more.click();
+  page.doc.fire("click", { target: page.byId.panel });
+  expect(more.attrs["aria-expanded"]).toBe("false");
+});
+
+test("More menu closes when the desktop width media query changes", () => {
+  rig = setup();
+  const more = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More");
+  more.click();
+  expect(more.attrs["aria-expanded"]).toBe("true");
+  const query = "(min-width: 1024px) and (max-width: 1279px)";
+  const m = page.media.get(query);
+  m.matches = false;
+  for (const fn of m.listeners) fn({ matches: false });
+  rig.step();
+  expect(find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More").attrs["aria-expanded"]).toBe("false");
+});
+
+test("More menu follows menu keyboard navigation and restores focus after activation", () => {
+  rig = setup({ collab: true });
+  const more = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More");
+  more.fire("keydown", { key: "ArrowDown" });
+  const menu = find(page.byId.topbar, e => e.attrs.role === "menu" && e.classList.contains("header-more-menu"));
+  const items = menu.all().filter(e => e.attrs.role === "menuitem");
+  expect(page.doc.activeElement).toBe(items[0]);
+  expect(items.length).toBeGreaterThan(2);
+  items[0].focus(); menu.fire("keydown", { key: "ArrowDown" });
+  expect(page.doc.activeElement).toBe(items[1]);
+  items[1].focus(); menu.fire("keydown", { key: "End" });
+  expect(page.doc.activeElement).toBe(items.at(-1));
+  items.at(-1).focus(); menu.fire("keydown", { key: "Home" });
+  expect(page.doc.activeElement).toBe(items[0]);
+  items[0].focus(); menu.fire("keydown", { key: "ArrowUp" });
+  expect(page.doc.activeElement).toBe(items.at(-1));
+  items[0].focus(); menu.fire("keydown", { key: "Tab" });
+  expect(more.attrs["aria-expanded"]).toBe("false");
+  more.fire("keydown", { key: "Escape" });
+  expect(more.attrs["aria-expanded"]).toBe("false");
+  more.fire("keydown", { key: "ArrowDown" });
+  const notes = menu.all().find(e => e.attrs.role === "menuitem" && e.attrs["aria-label"] === "Notes");
+  notes.click();
+  rig.step(2);
+  const rebuiltMore = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More");
+  expect(rebuiltMore).not.toBe(more);
+  expect(page.doc.activeElement).toBe(rebuiltMore);
+  expect(more.attrs["aria-expanded"]).toBe("false");
+  expect(rig.app.ui.drawer).toBe("notes");
+});
+
+test("More menu carries focus across resize-driven topbar rebuilds after keyboard activation", () => {
+  rig = setup({ collab: true });
+  let more = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More");
+  more.focus();
+  more.fire("keydown", { key: "Enter" });
+  more.click(); // native button Enter activation
+  const comments = find(page.byId.topbar, e => e.attrs.role === "menuitem" && e.attrs["aria-label"] === "Comments");
+  comments.focus(); comments.click();
+  expect(rig.app.ui.drawer).toBe("comments");
+  rig.step(1); // rebuild after drawer activation, before the observer's second dirty pass
+  stub.resizeCallbacks[0]([]);
+  rig.step(2);
+  more = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More");
+  expect(page.doc.activeElement).toBe(more);
+});
+
+test("topbar rebuild does not steal focus from the canvas", () => {
+  rig = setup({ collab: true });
+  page.board.focus();
+  rig.app.ui.drawer = "comments";
+  rig.step(2);
+  expect(page.doc.activeElement).toBe(page.board);
+});
+
+test("all collaboration emoji toolbar buttons have descriptive accessible labels", () => {
+  rig = setup({ collab: true });
+  const toolbarButtons = page.doc.body.all().filter(e => e.tagName === "BUTTON" && e.classList.contains("tb"));
+  expect(toolbarButtons.every(e => e.attrs["aria-label"])).toBe(true);
+  const emojiButtons = page.byId.hudBC.all().concat(page.byId.hudBR.all()).filter(e => e.tagName === "BUTTON" && e.classList.contains("tb"));
+  expect(emojiButtons.map(e => e.attrs["aria-label"])).toEqual([
+    "React with thumbs up", "React with heart", "React with laughing", "React with party popper",
+    "React with clapping hands", "React with surprised face", "More emotes", "Emotes",
+  ]);
+  const picker = find(page.doc.body, e => e.classList.contains("collab-picker"));
+  expect(picker.children.map(e => e.attrs["aria-label"])).toEqual([
+    "React with thumbs up", "React with heart", "React with laughing", "React with party popper",
+    "React with clapping hands", "React with surprised face", "React with folded hands", "React with fire",
+  ]);
+  const mermaid = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs?.title === "Insert a Mermaid flowchart");
+  expect(mermaid.attrs["aria-label"]).toBe("Insert Mermaid flowchart");
+});
+
+test("header Notes closes an already open drawer", () => {
+  rig = setup();
+  let notes = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "Notes");
+  rig.app.ui.drawer = "comments";
+  rig.step(2);
+  notes = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "Notes");
+  notes.click();
+  rig.step(2);
+  expect(rig.app.ui.drawer).toBeNull();
+  notes = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "Notes");
+  notes.click(); rig.step(2);
+  expect(rig.app.ui.drawer).toBe("notes");
+  notes = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "Notes");
+  notes.click(); rig.step(2);
+  expect(rig.app.ui.drawer).toBeNull();
+});
+
+test("six-digit viewer count remains available in the mounted header", () => {
+  rig = setup({ collab: true });
+  rig.net.broadcast({ t: "here", writerCount: 0, viewers: 100000 });
+  while (rig.net.step());
+  const watching = find(page.byId.topbar, e => e.classList.contains("watching"));
+  expect(watching.textContent).toBe("👁 100,000 viewers");
+  expect(page.byId.topbar.all().filter(e => e.classList.contains("av")).length).toBeGreaterThanOrEqual(2);
+});
+
+test("1280px header keeps its board name rule with a six-digit viewer count and three writers", () => {
+  rig = setup({ collab: true });
+  const cy = createSession({ join: () => rig.net.join(), token: "t-cy", board: "b1", client: "cy", user: "cy", clock: rig.net.clock });
+  cy.setSize(1200, 800);
+  rig.step(4);
+  rig.net.broadcast({ t: "here", writerCount: 3, viewers: 999999 });
+  while (rig.net.step());
+  rig.step(2);
+  const watching = find(page.byId.topbar, e => e.classList.contains("watching"));
+  expect(watching.textContent).toBe("👁 999,999 viewers");
+  expect(page.byId.topbar.all().filter(e => e.classList.contains("av")).length).toBeGreaterThanOrEqual(3);
+});
+
+test("phone dock uses visible Comments text in its accessible name", () => {
+  rig = setup({ collab: true });
+  const comments = find(page.byId.dock, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "Comments");
+  expect(comments.textContent).toBe("Comments");
+  expect(comments.attrs.title).toBe("Comments");
+  expect(page.byId.dock.all().filter(e => e.tagName === "BUTTON").every(e => e.attrs["aria-label"] && e.attrs.title === e.attrs["aria-label"])).toBe(true);
+});
+
+test("local drawing on an empty board does not move the view", () => {
+  rig = setup();
+  const { S, step } = rig;
+  const before = { ...S.eds.board.view };
+  S.setTool("freedraw");
+  S.pointerDown({ x: 40, y: 40 });
+  S.pointerMove({ x: 80, y: 60 });
+  step(4);
+  expect(S.eds.board.view).toEqual(before);
+  S.pointerUp({ x: 90, y: 70 });
+  step(4);
+  expect(S.eds.board.view).toEqual(before);
+  expect(S.eds.board.doc.live().length).toBeGreaterThan(0);
 });
 
 test("C-2: a local change that only bumps the Editor (undo, a panel style chip) still refreshes the part that shows it", () => {
@@ -226,6 +329,17 @@ test("C-4: back online and back from a long hide reconnect (both jittered); a sh
   expect(shouldProbe({ status: "connecting" })).toBe(true);
 });
 
+test("a refused hello shows no sign-in banner while the Trash notice stands (the board is in Trash), and does again if it goes", () => {
+  let inTrash = true;
+  rig = setup({ relogin: { href: "/auth/login", go() {} }, trashShown: () => inTrash });
+  const { S, step } = rig;
+  for (const t of rig.joins) { const send = t.send; t.send = m => send(m.t === "hello" ? { ...m, token: "dead" } : m); }
+  S.reconnect(); step(10);
+  expect(S.status).toBe("refused");
+  expect(text(page.byId.overlays)).not.toMatch(/refused this sign-in|Sign in again/);
+  inTrash = false; rig.hooks.onChange(); step(2);
+  expect(text(page.byId.overlays)).toMatch(/The room refused this sign-in/);
+});
 test("C-9: a refused sign-in links to sign-in (remembering the board); expiry warns before exp, on the clock port", () => {
   let went = 0;
   const store = memoryStore();
@@ -424,6 +538,101 @@ test("V5 style chip with nothing selected (Editor.style only) shows", () => {
   expect(chip().className).toContain("on");
 });
 
+test("focus survives a chrome rebuild: a panel chip keeps focus after it is activated and the panel is redrawn", () => {
+  rig = setup(); const { S, step } = rig;
+  S.act("board", e => e.select([])); step(20);
+  const chip = () => find(page.byId.panel, e => e.attrs?.title === "strokeWidth 4");
+  const before = chip(); before.focus(); before.click(); step(20);
+  expect(chip()).not.toBe(before);                                       // the panel was rebuilt
+  expect(page.doc.activeElement).toBe(chip());                           // and focus is on the new chip, not lost
+});
+
+test("focus follows the control's own key, not its label: pressing Lock on any of three layers keeps focus on THAT layer's Lock", () => {
+  rig = setup(); const { bo, step, app } = rig;
+  app.setPanel({ type: "noop" }); step(20);
+  bo.act("board", e => e.addLayer("Two"), { settings: true }); bo.act("board", e => e.addLayer("Three"), { settings: true }); step(20);
+  const lockBtns = () => page.byId.panel.all().filter(e => e.tagName === "BUTTON" && /^layer:.+:lock$/.test(e.attrs["data-fk"] ?? ""));
+  expect(lockBtns().length).toBe(3);
+  for (const which of [lockBtns().length - 1, 0, 1]) {
+    const target = lockBtns()[which], key = target.attrs["data-fk"], title = target.attrs.title;
+    target.focus(); target.click(); step(20);
+    const now = lockBtns().find(e => e.attrs["data-fk"] === key);
+    expect(now.attrs.title).not.toBe(title);                                // the layer's state flipped (Lock <-> Unlock) and its title changed ...
+    expect(page.doc.activeElement).toBe(now);                               // ... and focus is on that same layer's toggle, not another layer's "Lock"
+  }
+});
+
+test("dialog chips: activating a format chip rebuilds the dialog and focus stays on that same chip", () => {
+  rig = setup(); const { step, app } = rig;
+  app.ui.dialog = "export"; app.setPanel({ type: "noop" }); step(20);
+  const chip = text => find(page.byId.dialogs, e => e.tagName === "BUTTON" && e.textContent === text);
+  const before = chip("2×"); before.focus(); before.click(); step(20);
+  const now = chip("2×");
+  expect(now).not.toBe(before);                                          // rebuilt
+  expect(now.className).toContain("on");
+  expect(page.doc.activeElement).toBe(now);                              // focus on the same chip, not the body and not another chip
+});
+
+test("a layer removed from outside never hands focus to another layer's Lock: focus goes to a neutral layer row", () => {
+  rig = setup(); const { bo, step, app } = rig;
+  app.setPanel({ type: "noop" }); step(20);
+  bo.act("board", e => e.addLayer("Two"), { settings: true }); bo.act("board", e => e.addLayer("Three"), { settings: true }); step(20);
+  const locks = () => page.byId.panel.all().filter(e => e.tagName === "BUTTON" && /^layer:.+:lock$/.test(e.attrs["data-fk"] ?? ""));
+  const mid = locks()[1], midId = mid.attrs["data-fk"].split(":")[1];
+  mid.focus();
+  bo.act("board", e => e.deleteLayer(midId), { settings: true }); step(20);
+  expect(locks().length).toBe(2);
+  const now = page.doc.activeElement;
+  expect(now.attrs["data-fk"]).toMatch(/^layer:[^:]+:row$/);              // a neutral row, not a Lock/Hide toggle
+});
+
+test("notes drawer: notes added from the compose box show in the list while the compose box keeps its focus and its text", () => {
+  rig = setup(); const { step, app } = rig;
+  app.ui.drawer = "notes"; app.setPanel({ type: "noop" }); step(20);
+  const compose = () => find(page.byId.drawer, e => e.tagName === "TEXTAREA");
+  const rows = () => page.byId.drawer.all().filter(e => e.className?.startsWith?.("note-row"));
+  expect(rows().length).toBe(0);
+  expect(page.byId.drawer.textContent).toContain("No notes yet.");
+  const ta = compose(); ta.focus();
+  for (const text of ["first note", "second note"]) {
+    ta.value = text; ta.fire("keydown", { key: "Enter" }); step(20);
+    expect(compose()).toBe(ta);                                         // the compose box itself was never rebuilt
+    expect(page.doc.activeElement).toBe(ta);
+  }
+  expect(rows().length).toBe(2);                                          // the list shows both notes
+  expect(page.byId.drawer.textContent).not.toContain("No notes yet.");
+  ta.value = "half-typed"; step(20);
+  expect(ta.value).toBe("half-typed");
+});
+
+test("layers: the list is role=list, each row a listitem named \"Layer: <name>\"; a layer removed under focus is announced", () => {
+  rig = setup(); const { bo, step, app } = rig;
+  app.setPanel({ type: "noop" }); step(20);
+  bo.act("board", e => e.addLayer("Two"), { settings: true }); bo.act("board", e => e.addLayer("Three"), { settings: true }); step(20);
+  const list = find(page.byId.panel, e => e.attrs?.role === "list");
+  expect(list.attrs["aria-label"]).toBe("Layers");
+  const items = page.byId.panel.all().filter(e => e.attrs?.role === "listitem");
+  expect(items.map(e => e.attrs["aria-label"]).sort()).toEqual(["Layer: Layer 1", "Layer: Three", "Layer: Two"].sort());
+  expect(items.every(e => list.all().includes(e))).toBe(true);
+  const locks = () => page.byId.panel.all().filter(e => e.tagName === "BUTTON" && /^layer:.+:lock$/.test(e.attrs["data-fk"] ?? ""));
+  const mid = locks()[1], midId = mid.attrs["data-fk"].split(":")[1];
+  mid.focus();
+  bo.act("board", e => e.deleteLayer(midId), { settings: true }); step(20);
+  expect(announced()).toMatch(/^That layer is no longer here; moved to the (next|previous) one\.$/);
+});
+
+test("notes drawer: rows are listitems named \"Note: <text>, by <author>\" inside a role=list", () => {
+  rig = setup(); const { step, app } = rig;
+  app.ui.drawer = "notes"; app.setPanel({ type: "noop" }); step(20);
+  const ta = find(page.byId.drawer, e => e.tagName === "TEXTAREA"); ta.focus();
+  ta.value = "alpha note"; ta.fire("keydown", { key: "Enter" }); step(20);
+  const list = find(page.byId.drawer, e => e.attrs?.role === "list");
+  expect(list.attrs["aria-label"]).toBe("Notes");
+  const rows = page.byId.drawer.all().filter(e => e.attrs?.role === "listitem");
+  expect(rows.map(e => e.attrs["aria-label"])).toEqual(["Note: alpha note, by you"]);
+  expect(list.all().includes(rows[0])).toBe(true);
+});
+
 test("V6 remote layer add / rename and a shape on it: panel layers", () => {
   rig = setup(); const { bo, step, app } = rig;
   app.setPanel({ type: "noop" }); step(20);
@@ -523,19 +732,14 @@ test("K2 app.js: no setTimeout/setInterval/performance.now/Date.now in the sourc
   } finally { globalThis.setTimeout = real.setTimeout; globalThis.setInterval = real.setInterval; }
 });
 
-test("K3 main.js: the token goes only into createSession and httpAdmin; sign-in leaves for the fixed href; the return board only via takeReturnBoard", async () => {
+test("K3 main.js: the token goes only into createSession and the HTTP ports; sign-in leaves for the fixed href; the return board only via takeReturnBoard", async () => {
   const src = await Bun.file(new URL("../../web/main.js", import.meta.url)).text();
   const code = src.replace(/\/\/.*$/gm, "");
-  expect(code.match(/signIn\.token/g).length).toBe(3);                         // the gate check, httpAdmin's token, and createSession's token
+  expect(code.match(/signIn\.token/g).length).toBe(16);                         // the gate check, createSession's token, and the Home, Spaces, Access and Roles ports' (their Bearer header), plus the Move port's, and the Trash port's (the Trash page, the Space page's Move to Trash, the board-URL notice), the Access port of the Space page (Ask for access) and of the canvas pill (why view-only), plus the Share port of the canvas (Share dialog), and the Move port's on Home cards and on the canvas (#91)
+  expect(code).toMatch(/httpHome\(\{[^}]*token: signIn\.token,/);
   expect(code).toMatch(/if \(!signIn\.token\)/);
-  expect(code).toMatch(/httpAdmin\(\{[^}]*token: signIn\.token,/);
   expect(code).toMatch(/createSession\(\{[^}]*token: signIn\.token,/);
-  expect(code.match(/location\.assign\((?:[^()]+|\([^()]*\))*\)/g)).toEqual([
-    "location.assign(`${location.pathname}?board=${encodeURIComponent(b)}`)",
-    'location.assign("/auth/logout")',
-    "location.assign(signInLink.href)",
-    "location.assign(signInLink.href)",
-  ]);
+  expect(code.match(/location\.assign\(([^)]*)\)/g)).toEqual(["location.assign(href)", "location.assign(signInLink.href)"]);   // the first: after a create, to our own relative ?board= / ?space= link (hrefTo)
   expect(code).not.toMatch(/console\.|localStorage|sessionStorage|tabStore\.(set|get)/);
   expect(code).not.toMatch(/RETURN_KEY|plenary\.return/);                       // read only through takeReturnBoard
   expect(code).toMatch(/const back = takeReturnBoard\(tabStore, \{ outcome: signIn\.outcome, board: asked \}\);/);
@@ -984,4 +1188,354 @@ test("M5 input: app.js forwards coalesced pen events (with pressures) and cleans
   expect(S.eds.board.pointers.size).toBe(0);
   expect(S.gesture).toBeNull();
   expect(S.eds.board.doc.live().length).toBe(1);
+});
+
+// Issue #42: the app must ask its net for the bytes of every picture it shows without them. render.js draws such a picture
+// as a dashed path (never an `image` item), so asking from the display list never fires: it asks from the documents.
+const PIC = { id: "c".repeat(40), mimeType: "image/png", dataURL: "data:image/png;base64,iVBORw0KGgo=", width: 100, height: 80 };
+// A picture with bytes is painted through `new Image()`: a stub that never loads.
+beforeEach(() => { globalThis.Image = class { set src(v) { this._src = v; } }; });
+afterAll(() => { delete globalThis.Image; });
+const spyNet = () => { const wants = [], files = [], stamps = [], puts = []; return { wants, files, puts, net: { kind: "local", put: f => { puts.push(f.id); }, onFile: fn => { files.push(fn); }, want: (id, stamp) => { wants.push(id); stamps.push(stamp); } }, stamps }; };
+
+test("DW-42.3: a picture on the board whose bytes this client lacks is asked for through net.want, and not asked for once it has them", () => {
+  const spy = spyNet();
+  rig = setup({ appNet: spy.net });
+  const { S, bo, step } = rig;
+  expect(spy.wants).toEqual([]);
+  bo.addPicture(PIC); step(4);                                  // bo's op carries the element, never the bytes
+  expect(S.missingFiles()).toEqual([PIC.id]);
+  expect(spy.wants.length).toBeGreaterThan(0);
+  expect(new Set(spy.wants)).toEqual(new Set([PIC.id]));
+  spy.files[0]({ id: PIC.id, mimeType: PIC.mimeType, dataURL: PIC.dataURL });   // the net delivers them (onFile → receiveFiles)
+  expect(S.missingFiles()).toEqual([]);
+  const before = spy.wants.length;
+  S.eds.board.changed(); step(4);
+  expect(spy.wants.length).toBe(before);
+});
+
+test("a picture this client placed itself, and a deleted one, are never asked for", () => {
+  const spy = spyNet();
+  rig = setup({ appNet: spy.net });
+  const { S, bo, step } = rig;
+  S.addPicture(PIC); step(3);
+  expect(S.missingFiles()).toEqual([]);
+  bo.addPicture({ ...PIC, id: "d".repeat(40) }); step(3);
+  const id = [...bo.eds.board.doc.byId.values()].find(e => e.fileId === "d".repeat(40)).id;
+  bo.eds.board.select([id]); bo.eds.board.key("Delete"); step(4);
+  expect(S.missingFiles()).toEqual([]);
+});
+
+test("#92: a picture placed by this client's own op without being uploaded (a pasted selection) is uploaded by the frame loop; one put or fetched within BLOB_PENDING_MS is not offered again, an older one is", () => {
+  const spy = spyNet();
+  rig = setup({ appNet: spy.net });
+  const { S, bo, step, net } = rig;
+  const OTHER = { ...PIC, id: "e".repeat(40) };
+  bo.addPicture(OTHER); step(3);
+  const ed = bo.eds.board;
+  ed.select([[...ed.doc.byId.values()].find(e => e.fileId === OTHER.id).id]);
+  const text = ed.copy();                                                 // a clipboard that carries the element and its bytes
+  expect(text).toContain(OTHER.id);
+  S.paste(text); step(4);
+  expect(spy.puts).toEqual([OTHER.id]);                                   // the frame loop put it
+  S.paste(text); step(4);
+  expect(spy.puts).toEqual([OTHER.id]);                                   // just put: not again for BLOB_PENDING_MS
+  net.advance(BLOB_PENDING_MS + 1000); step(2);
+  S.paste(text); step(4);
+  expect(spy.puts).toEqual([OTHER.id, OTHER.id]);                         // the server may have deleted it since: offered again with the op that places it
+  S.addPicture(PIC); step(3);
+  spy.files[0]({ id: "f".repeat(40), mimeType: PIC.mimeType, dataURL: PIC.dataURL });   // fetched from the server
+  step(3);
+  expect(spy.puts).toEqual([OTHER.id, OTHER.id]);                         // placed through addPicture (the app uploads it itself) or fetched: never offered here
+});
+
+test("#92 MED-B: moving, resizing or restyling pictures that are already placed re-uploads nothing, however old their last put", () => {
+  const spy = spyNet();
+  rig = setup({ appNet: spy.net });
+  const { S, bo, step, net } = rig;
+  const ids = ["1", "2", "3"].map(k => k.repeat(40));
+  for (const id of ids) { S.addPicture({ ...PIC, id }); step(3); }
+  step(5);
+  expect(spy.puts).toEqual([]);                                           // addPicture's own upload is the app's (the test calls S directly)
+  net.advance(BLOB_PENDING_MS * 2); step(3);                              // every picture's last put is now older than the window
+  const ed = S.eds.board;
+  ed.select([...ed.doc.byId.values()].filter(e => e.type === "image").map(e => e.id));
+  const sent = S.sent;
+  S.act("board", e => e.nudge(10, 0)); step(4); S.act("board", e => e.nudge(0, 10)); step(4);   // move all of them (ops of image elements)
+  expect(S.sent).toBeGreaterThan(sent);                                   // they really were sent
+  expect(spy.puts).toEqual([]);
+});
+
+test("#92 MED-C: a picture placed offline (its op resent after the reconnect, which never passes the Editor) is offered again when its op is acknowledged, if its last put is older than BLOB_PENDING_MS", () => {
+  const spy = spyNet();
+  rig = setup({ appNet: spy.net });
+  const { S, bo, step, net, joins } = rig;
+  const OTHER = { ...PIC, id: "9".repeat(40) };
+  bo.addPicture(OTHER); step(3);
+  const ed = bo.eds.board;
+  ed.select([[...ed.doc.byId.values()].find(e => e.fileId === OTHER.id).id]);
+  const text = ed.copy();
+  joins[0].fail(); step(2);                                               // ada goes offline
+  S.paste(text); step(4);                                                 // placed offline: put once at placement (it would be lost with the connection)
+  expect(spy.puts).toEqual([OTHER.id]);
+  net.advance(80 * 60_000);                                               // 80 minutes: the picture is condemned and reaped meanwhile
+  S.reconnect(); step(30); net.advance(1000); step(30);
+  expect(S.status).toBe("live");
+  expect(spy.puts).toEqual([OTHER.id, OTHER.id]);                         // the resend does not pass the Editor: the reconnect offers it again
+});
+
+test("#92: a picture whose op the room refused (the role was lowered while offline) is never offered (its op was never sequenced)", () => {
+  const spy = spyNet();
+  rig = setup({ appNet: spy.net });
+  const { S, bo, step, net, joins } = rig;
+  const P = { ...PIC, id: "7".repeat(40) };
+  bo.addPicture(P); step(3);
+  const ed = bo.eds.board;
+  ed.select([[...ed.doc.byId.values()].find(e => e.fileId === P.id).id]);
+  const text = ed.copy();
+  const prev = USERS["t-ada"].role;
+  try {
+    joins[0].fail(); step(2);                                               // ada offline
+    S.paste(text); step(4);                                                 // placed offline: put once
+    expect(spy.puts).toEqual([P.id]);
+    USERS["t-ada"].role = "viewer";                                         // and her role is lowered meanwhile: the room will refuse the resent op
+    net.advance(80 * 60_000);
+    S.reconnect(); step(30); net.advance(1000); step(30);
+    expect(S.effective).toBe("viewer");
+    expect(spy.puts).toEqual([P.id]);                                       // refused: nothing is offered again
+  } finally { USERS["t-ada"].role = prev; }
+});
+
+test("L1/L2: S.missing() is memoised on the documents' revisions (no scan per frame) and its stamp changes when an element showing the picture does", () => {
+  const spy = spyNet();
+  rig = setup({ appNet: spy.net });
+  const { S, bo, step } = rig;
+  bo.addPicture(PIC); step(4);
+  const first = S.missing();
+  expect([...first.keys()]).toEqual([PIC.id]);
+  expect(S.missing()).toBe(first);                              // same Map: nothing changed, nothing rescanned
+  step(3);
+  expect(S.missing()).toBe(first);                              // frames alone don't invalidate it
+  expect(spy.stamps.at(-1)).toBe(first.get(PIC.id));            // the app passes the stamp to the net
+  const el = [...bo.eds.board.doc.byId.values()].find(e => e.fileId === PIC.id);
+  bo.act("board", ed => { ed.select([el.id]); ed.nudge(10, 0); }); step(4);   // a change touching that picture
+  expect(S.missing()).not.toBe(first);
+  expect(S.missing().get(PIC.id)).not.toBe(first.get(PIC.id));
+});
+
+// ---- the pill explains a view-only role (PROTOCOL.md § Access explanation and requests, #51) ----
+const WHY = { mine: { role: { id: "viewer", name: "Viewer" }, sources: [{ kind: "team", scope: { type: "space", id: "s-1", name: "Platform" }, role: "viewer", roleName: "Viewer", ladder: "viewer", strongest: true, team: { id: "tm-1", name: "Infra" } }] },
+  needs: { "board.edit": { role: "editor", roleName: "Editor" } }, owners: [{ type: "user", id: "google:pri", name: "Priya" }, { type: "user", id: "google:tom", name: "Tom" }],
+  ask: { can: true, roles: [{ id: "annotator", name: "Annotator" }, { id: "editor", name: "Editor" }], pending: null, retryAfterMs: null } };
+const accessStub = (over = {}) => { const calls = []; return { calls, explainBoard: async b => { calls.push(["explainBoard", b]); return over.explain ?? { why: WHY }; }, ask: async (...a) => { calls.push(["ask", ...a]); return over.ask ?? { request: { role: a[2], roleName: "Editor", at: 1, state: "pending" } }; } }; };
+const pillOf = () => find(page.byId.topbar, e => /^pill\b/.test(e.className));
+const settleP = () => new Promise(r => setTimeout(r, 0));
+
+test("#51 a viewer's pill is a button that explains the role: keyboard, Escape returns focus, the text names the source and who to ask", async () => {
+  const access = accessStub();
+  rig = setup({ token: "t-vi", access });
+  const pill = pillOf();
+  expect(pill.className).toMatch(/readonly/);
+  expect([pill.getAttribute("role"), pill.getAttribute("tabindex"), pill.getAttribute("aria-haspopup"), pill.getAttribute("aria-expanded")]).toEqual(["button", "0", "dialog", "false"]);
+  expect(pill.title).toMatch(/Press to see why/);
+  pill.fire("keydown", { key: "Enter" });
+  await settleP();
+  const pop = find(page.doc.body, e => /pill-pop/.test(e.className));
+  expect(pill.getAttribute("aria-expanded")).toBe("true");
+  expect(pop.getAttribute("role")).toBe("dialog");
+  expect(pop.parentNode).toBe(pill.parentNode);                // beside the pill in DOM order, so Tab out of it lands on the next control
+  expect(access.calls[0]).toEqual(["explainBoard", "b1"]);
+  const t = pop.textContent;
+  expect(t).toContain("Viewer via Space Platform · Infra team.");
+  expect(t).toContain("Editing needs Editor. Owners: Priya, Tom.");
+  expect(find(pop, e => e.tagName === "BUTTON" && e.textContent === "Ask for access")).toBeTruthy();
+  pill.fire("keydown", { key: " " });                   // toggles closed
+  expect(find(page.doc.body, e => /pill-pop/.test(e.className))).toBeUndefined();
+  pill.fire("keydown", { key: "Enter" }); await settleP();
+  page.doc.fire("keydown", { key: "Escape" });
+  expect(find(page.doc.body, e => /pill-pop/.test(e.className))).toBeUndefined();
+  expect(globalThis.document.activeElement).toBe(pill);
+});
+
+test("#51 Ask for access from the pill sends the role with one Idempotency-Key and moves focus to the confirmation", async () => {
+  const access = accessStub();
+  rig = setup({ token: "t-vi", access });
+  pillOf().click(); await settleP();
+  const pop = find(page.doc.body, e => /pill-pop/.test(e.className));
+  const ask = find(pop, e => e.tagName === "BUTTON" && e.textContent === "Ask for access");
+  ask.click(); await settleP();
+  expect(access.calls.at(-1)).toEqual(["ask", "board", "b1", "editor", "key-pill-0001"]);
+  const status = find(pop, e => e.getAttribute("data-fk") === "ask-status");
+  expect(status.textContent).toContain("You asked for Editor");
+  expect(globalThis.document.activeElement).toBe(status);
+  expect(ask.hidden).toBe(true);
+});
+
+test("#51 the pill of an editor, and a viewer page with no access port, stays a plain pill; a failed lookup says so", async () => {
+  rig = setup({ token: "t-ada", access: accessStub() });
+  expect(pillOf().getAttribute("role")).toBeNull();
+  rig = setup({ token: "t-vi" });
+  expect(pillOf().getAttribute("role")).toBeNull();
+  rig = setup({ token: "t-vi", access: accessStub({ explain: { error: "unavailable" } }) });
+  pillOf().click(); await settleP();
+  expect(find(page.doc.body, e => /pill-pop/.test(e.className)).textContent).toContain("Could not look that up");
+});
+
+test("#51 the non-modal pill popover closes when focus tabs out of it, but not when focus moves inside it or to the pill", async () => {
+  rig = setup({ token: "t-vi", access: accessStub() });
+  const pill = pillOf();
+  pill.click(); await settleP();
+  const pop = () => find(page.doc.body, e => /pill-pop/.test(e.className));
+  const inside = find(pop(), e => e.tagName === "BUTTON");
+  pop().fire("focusout", { relatedTarget: inside });             // within the popover
+  expect(pop()).toBeTruthy();
+  pop().fire("focusout", { relatedTarget: pill });               // back to the pill
+  expect(pop()).toBeTruthy();
+  const hasFocus = page.doc.hasFocus; page.doc.hasFocus = () => false;
+  pop().fire("focusout", { relatedTarget: null });               // the window lost focus: stays
+  expect(pop()).toBeTruthy();
+  page.doc.hasFocus = () => true;
+  pop().fire("focusout", { relatedTarget: null });               // tabbed past the last control onto nothing, page still focused: closes
+  expect(pop()).toBeUndefined();
+  page.doc.hasFocus = hasFocus;
+  pill.click(); await settleP();
+  pop().fire("focusout", { relatedTarget: page.byId.topbar });   // somewhere else on the page
+  expect(pop()).toBeUndefined();
+  expect(pill.getAttribute("aria-expanded")).toBe("false");
+});
+
+test("#51 a successful Ask from the pill keeps the popover open and puts focus on the confirmation (hiding the focused button is not tabbing out)", async () => {
+  const access = accessStub();
+  rig = setup({ token: "t-vi", access });
+  pillOf().click(); await settleP();
+  const pop = () => find(page.doc.body, e => /pill-pop/.test(e.className));
+  const ask = find(pop(), e => e.tagName === "BUTTON" && e.textContent === "Ask for access");
+  ask.focus();
+  expect(globalThis.document.activeElement).toBe(ask);
+  ask.fire("keydown", { key: "Enter" }); ask.click(); await settleP();
+  expect(pop()).toBeTruthy();
+  expect(pillOf().getAttribute("aria-expanded")).toBe("true");
+  const status = find(pop(), e => e.getAttribute("data-fk") === "ask-status");
+  expect(status.textContent).toContain("You asked for Editor");
+  expect(globalThis.document.activeElement).toBe(status);
+  expect(ask.hidden).toBe(true);
+  pop().fire("focusout", { relatedTarget: page.byId.topbar });     // a real Tab-out still closes it
+  expect(pop()).toBeUndefined();
+});
+
+test("DW-52.3e the Share button shows only when the welcome says can.share: a custom-role manager at an annotator step sees it, an owner whose welcome has no can.share and a viewer do not; no share port, no button", async () => {
+  const said = can => t => ({ ...t, onMessage: fn => t.onMessage(m => fn(m?.t === "welcome" && can ? { ...m, can: { share: true } } : m)) });
+  const shareStub = { view: async () => ({ error: "forbidden" }) };
+  const button = () => find(page.byId.topbar, e => e.getAttribute?.("data-share-open") === "1");
+  rig = setup({ token: "t-cy", share: shareStub, wrap: said(true) });
+  expect(rig.S.effective).toBe("annotator");
+  expect(button()).toBeTruthy();
+  expect(find(page.byId.topbar, e => e.tagName === "BUTTON" && e.getAttribute("title") === "Share this board")).toBeTruthy();
+  rig = setup({ token: "t-ada", share: shareStub, wrap: said(false) });                // an owner by the room, but this welcome did not say it
+  expect(button()).toBeUndefined();
+  rig = setup({ token: "t-vi", share: shareStub, wrap: said(false) });
+  expect(button()).toBeUndefined();
+  rig = setup({ token: "t-cy", wrap: said(true) });                                    // no share port wired: no button either
+  expect(button()).toBeUndefined();
+});
+
+// #91: the board page offers Move to… (the shared startMove flow) only where the welcome says can.move; the Space name is read from the move route only for such a person.
+function movePort(o = {}) {
+  const st = { space: { id: "s1", name: "Design", personal: false }, calls: [], optionsError: null, ...o };
+  const options = () => ({ board: { id: "b1", title: "B" }, from: st.space, destinations: [{ id: "s2", name: "Plat", personal: false, general: null, group: null }], more: false });
+  const port = { options: async b => { st.calls.push(["options", b]); return st.optionsError ? { error: st.optionsError } : { options: options() }; },
+    preview: async (b, to) => ({ diff: { board: { id: "b1", title: "B" }, from: st.space, to: { id: to, name: "Plat", personal: false }, gains: [], keeps: [], loses: [], invites: null, links: null, hidden: false, more: false } }),
+    move: async (b, body, key) => { st.calls.push(["move", body, key]); const from = st.space; st.space = { id: body.to, name: body.to === "s2" ? "Plat" : "Design", personal: false };
+      return { result: { board: { id: "b1", title: "B", space: { id: st.space.id, name: st.space.name } }, moved: true, undo: { space: { id: from.id, name: from.name, personal: false } } } }; } };
+  return { st, move: { port, newKey: () => "mk" } };
+}
+const canMoveWelcome = can => t => ({ ...t, onMessage: fn => t.onMessage(m => fn(m?.t === "welcome" && can ? { ...m, can: { ...m.can, move: true } } : m)) });
+const moveItem = () => find(page.byId.topbar, e => e.getAttribute?.("role") === "menuitem" && e.textContent === "Move to…");
+const moveBtn = () => find(page.byId.topbar, e => e.getAttribute?.("data-move-open") === "1");
+const spaceLabel = () => find(page.byId.topbar, e => /\bboard-space\b/.test(e.className ?? ""))?.textContent ?? null;
+const flush = async (n = 4) => { for (let i = 0; i < n; i++) await settleP(); };
+const doMove = async () => {
+  moveBtn().click(); await flush();
+  const dlg = find(globalThis.document.body, e => e.getAttribute?.("role") === "dialog");
+  const radio = find(dlg, e => e.tagName === "INPUT" && e.getAttribute("type") === "radio");
+  radio.checked = true; radio.fire("change", { target: radio }); await flush();
+  find(dlg, e => e.tagName === "FORM").fire("submit", { preventDefault() {} }); await flush(8); rig.step(2);
+};
+
+test("#91 board page: the Move button, its menu item and the Space name need the welcome's can.move; without it no request is made at all", async () => {
+  const ok = movePort();
+  rig = setup({ move: ok.move, wrap: canMoveWelcome(true) }); await flush(); rig.step(2);
+  expect(ok.st.calls).toEqual([["options", "b1"]]);                       // the Space name, read once
+  expect(moveBtn()).toBeTruthy(); expect(moveBtn().getAttribute("aria-haspopup")).toBe("dialog");
+  expect(moveItem()).toBeTruthy();
+  expect(spaceLabel()).toBe("in Design");
+  const no = movePort();
+  rig = setup({ move: no.move, wrap: canMoveWelcome(false) }); await flush(); rig.step(2);
+  expect(no.st.calls).toEqual([]);                                         // a viewer-heavy board costs nothing: no probe for someone the welcome does not name
+  expect(moveBtn()).toBeUndefined(); expect(moveItem()).toBeUndefined(); expect(spaceLabel()).toBeNull();
+  rig = setup({ wrap: canMoveWelcome(true) }); await flush(); rig.step(2);
+  expect(moveBtn()).toBeUndefined();                                       // no move port wired
+});
+
+test("#91 board page: a failed read of the Space name (5xx, network) leaves Move in place; only a refusal takes it away", async () => {
+  for (const optionsError of ["unavailable", "network", "auth"]) {
+    const mp = movePort({ optionsError });
+    rig = setup({ move: mp.move, wrap: canMoveWelcome(true) }); await flush(); rig.step(2);
+    expect(moveBtn()).toBeTruthy(); expect(spaceLabel()).toBeNull();
+  }
+  const mp = movePort({ optionsError: "forbidden" });
+  rig = setup({ move: mp.move, wrap: canMoveWelcome(true) }); await flush(); rig.step(2);
+  expect(moveBtn()).toBeUndefined(); expect(moveItem()).toBeUndefined();
+});
+
+test("#91 board page: Move to… opens the shared dialog; after the move the Space name follows without a reload and the Undo toast moves it back", async () => {
+  const mp = movePort();
+  rig = setup({ move: mp.move, wrap: canMoveWelcome(true) }); await flush(); rig.step(2);
+  await doMove();
+  expect(mp.st.calls.filter(c => c[0] === "move")).toEqual([["move", { from: "s1", to: "s2" }, "mk"]]);
+  expect(spaceLabel()).toBe("in Plat");
+  const toast = find(globalThis.document.body, e => e.getAttribute?.("aria-label") === "Board moved");
+  expect(toast.textContent).toContain("Moved B to Plat.");
+  find(toast, e => e.getAttribute?.("data-fk") === "move-undo").click(); await flush(8); rig.step(2);
+  expect(mp.st.calls.filter(c => c[0] === "move").at(-1)[1]).toEqual({ from: "s2", to: "s1" });
+  expect(spaceLabel()).toBe("in Design");
+});
+
+test("#91 board page: a move after which the route refuses the mover takes the Move button away", async () => {
+  const mp = movePort();
+  rig = setup({ move: mp.move, wrap: canMoveWelcome(true) }); await flush(); rig.step(2);
+  const orig = mp.move.port.move;
+  mp.move.port.move = async (...a) => { const r = await orig(...a); mp.st.optionsError = "forbidden"; return r; };
+  await doMove();
+  expect(moveBtn()).toBeUndefined(); expect(moveItem()).toBeUndefined();
+});
+
+test("#91 board page: after a refusal hid Move, the next welcome that says can.move (a reconnect) offers it again", async () => {
+  const mp = movePort();
+  rig = setup({ move: mp.move, wrap: canMoveWelcome(true) }); await flush(); rig.step(2);
+  const orig = mp.move.port.move;
+  mp.move.port.move = async (...a) => { const r = await orig(...a); mp.st.optionsError = "forbidden"; return r; };
+  await doMove();
+  expect(moveBtn()).toBeUndefined();
+  mp.st.optionsError = null;
+  rig.S.reconnect(); rig.step(30); await flush(); rig.step(2);
+  expect(moveBtn()).toBeTruthy();
+});
+
+test("#91 board page: closing the dialog returns focus to a visible Move control", async () => {
+  const mp = movePort();
+  rig = setup({ move: mp.move, wrap: canMoveWelcome(true) }); await flush(); rig.step(2);
+  moveBtn().click(); await flush();
+  const dlg = find(globalThis.document.body, e => e.getAttribute?.("role") === "dialog");
+  dlg.parentNode.fire("keydown", { key: "Escape", preventDefault() {}, stopPropagation() {} }); await flush();
+  expect(globalThis.document.activeElement?.getAttribute?.("data-move-open") ?? globalThis.document.activeElement?.tagName).toBe("1");
+});
+
+test("#91 mountApp validates the move wiring: a bare port (the shape main.js once passed) throws; main.js passes { port, clock, newKey } at every move: site", async () => {
+  const mp = movePort();
+  expect(() => setup({ move: mp.move.port })).toThrow(/move must be/);
+  const code = (await Bun.file(new URL("../../web/main.js", import.meta.url)).text()).replace(/\/\/.*$/gm, "");
+  const sites = code.match(/\bmove: \{?[^\n]*/g);
+  expect(sites.length).toBe(3);
+  for (const l of sites) expect(l).toMatch(/^move: \{ port: httpMove\(\{[^}]*\}\), clock, newKey: \(\) => randomKey\(\) \}/);
 });

@@ -182,7 +182,7 @@ test("bad frames get an error and/or a close, never reach a room, and never kill
   s.send({ t: "launch-missiles" });
   await s.next(m => m.t === "ack" && m.id === "raw:1");
   expect(s.msgs.filter(m => m.t === "error").map(m => m.code)).toEqual(["bad-op", "bad-op"]);
-  s.send({ t: "unknown-frame" });                                                          // unknown message type: strike three
+  s.send({ t: "teleport" });                                                                // another unknown type: strike three (`blob` is served now: test/server/blobs-http.test.js)
   expect((await s.whenClosed()).code).toBe(1008);
   expect(s.msgs.filter(m => m.t === "error").length).toBe(3);
   // Rule 11: a second hello gets `bad-op` and the connection is closed at once; the room never sees it.
@@ -276,16 +276,17 @@ test("the entries subject carries each entry once, after it is durable", async (
   expect(JSON.parse(seen[0].items[0])).toMatchObject({ seq: 1, tenant: r.ids.tenant, board: r.ids.board, id: expect.stringMatching(/:1$/) });
   // The room's heartbeat names its epoch (§ Bus); it is published as soon as the room is built.
   // The first one, of a newly built room only, says `opened` (a host waiting on the lease answers the hellos it held).
-  expect(beats[0]).toEqual({ seq: 0, epoch: 1, opened: true });
+  expect(beats[0]).toEqual({ seq: 0, epoch: 1, cp: 0, opened: true });
   await until(() => beats.length >= 2, "a later heartbeat", 2_000);
-  expect(beats.at(-1)).toEqual({ seq: 3, epoch: 1 });                     // later beats: no `opened`
+  expect(beats.at(-1)).toEqual({ seq: 3, epoch: 1, cp: 0 });                  // later beats: no `opened`
   await r.stop();
 });
 
 for (const mode of ["rejects", "conflicts", "times out", "times out and then lands late"]) test(`when the append ${mode}: no ack ever, everyone gets \`unavailable\`, and the room rebuilds from the Store`, async () => {
-  let fail = false, late = null; const never = deferred(), landNow = deferred();
+  let fail = false, late = null, skew = 0; const never = deferred(), landNow = deferred();
   const r = await rig({
-    host: mode.startsWith("times out") ? { appendTimeoutMs: 400 } : {},
+    // A timed-out append is a stuck stop: the host will not retake the board for ttl + margin (§ Recovery, "Stuck host"). `skew` moves its lease clock past that.
+    host: mode.startsWith("times out") ? { appendTimeoutMs: 400, monotonic: () => performance.now() + skew } : {},
     wrapStore: s => ({ ...s, append: async (tenant, board, entries, expectSeq, ...rest) => {
       if (!fail) return s.append(tenant, board, entries, expectSeq, ...rest);
       if (mode === "rejects") throw new Error("disk full");
@@ -318,6 +319,7 @@ for (const mode of ["rejects", "conflicts", "times out", "times out and then lan
   expect(b.msgs.some(m => m.t === "entries" && m.entries.some(e => e.id !== "a:1"))).toBe(false);
   expect(r.server.rooms.stats().rooms).toBe(0);
   fail = false;
+  if (mode.startsWith("times out")) skew += 60_000;   // the cooldown is over
 
   // Reconnect: the room is rebuilt from what the Store really holds, and sequencing carries on without a gap.
   const stored = mode === "conflicts" ? 2 : 1;
@@ -445,7 +447,7 @@ test("a log with a gap or a foreign entry is corruption: the room refuses to sta
   await r2.stop();
 });
 
-// ---- fix round (docs/m2/reports/p3-scaffoldv.md) ----
+// ---- fix round ----
 
 test("H1: nestedDeeperThan counts brackets outside strings, in one pass", async () => {
   const { nestedDeeperThan } = await import("../../server/gateway.js");
@@ -460,17 +462,23 @@ test("H1: nestedDeeperThan counts brackets outside strings, in one pass", async 
 });
 
 test("H1: a 30,000-deep op is refused before it is parsed, nothing is stored, and joins stay fast", async () => {
+  // "Before it is parsed" and "joins stay fast" are counted, not timed: the cliff is JSON.parse on a deep 180 KB frame
+  // (about 0.6 s each on the loop that serves everyone), so no frame this size may reach JSON.parse at all.
+  const realParse = JSON.parse, bigParses = [];
+  JSON.parse = (text, ...rest) => { if (typeof text === "string" && text.length > 100_000) bigParses.push(text.length); return realParse(text, ...rest); };
+  try { await deepOpTest(); } finally { JSON.parse = realParse; }
+  expect(bigParses).toEqual([]);
+});
+async function deepOpTest() {
   const r = await rig();
   // Built as text: JSON.stringify of something this deep is the very cliff under test (about 0.6 s a go).
   const deepOp = (id, el, n) => `{"t":"op","id":"${id}","sentAt":0,"stream":"notes","op":{"elements":[{"id":"${el}","version":1,"versionNonce":1,"type":"rectangle","customData":${'{"a":'.repeat(n)}1${"}".repeat(n)}}]}}`;
   const a = await r.sock(), watcher = await r.sock();
   a.send(hello(r, "annotator", { client: "a" })); watcher.send(hello(r, "viewer", { client: "w" }));
   await a.next(m => m.t === "welcome"); await watcher.next(m => m.t === "welcome");
-  const started = performance.now();
   for (let i = 1; i <= 6; i++) a.send(deepOp(`a:${i}`, "deep" + i, 30_000));                     // 180 KB each, valid JSON
   await a.next(m => m.id === "a:6");
   expect(a.msgs.filter(m => m.t === "error").map(m => [m.id, m.code])).toEqual([1, 2, 3, 4, 5, 6].map(i => [`a:${i}`, "bad-op"]));
-  expect(performance.now() - started).toBeLessThan(1500);                // the verifier measured 8.4 s to store them
   await r.bus.flush(); await r.idle();
   expect(r.inbox.filter(m => m.msg?.t === "op")).toEqual([]);            // the room never saw one
   expect(await r.rawStore.lastSeq(r.ids.tenant, r.ids.board)).toBe(0);
@@ -481,16 +489,14 @@ test("H1: a 30,000-deep op is refused before it is parsed, nothing is stored, an
   // (The refusal comes from the gateway and the ack from the room after a durable append: either may arrive first.)
   await a.next(m => m.id === "a:8"); await a.next(m => m.t === "ack" && m.id === "a:7");
   expect(a.msgs.filter(m => m.id === "a:7" || m.id === "a:8").map(m => `${m.t} ${m.id}`).sort()).toEqual(["ack a:7", "error a:8"]);
-  // A join, and /health at the same moment, stay fast (the verifier measured 2.1 s each).
-  const t0 = performance.now();
+  // A join, and /health at the same moment, are answered with the deep ops still in flight (the verifier measured 2.1 s each).
   const [late, health] = await Promise.all([r.sock().then(async s => { s.send(hello(r, "viewer", { client: "late" })); await s.next(m => m.t === "entries"); return s; }), r.health()]);
-  expect(performance.now() - t0).toBeLessThan(500);
   expect(health.status).toBe(200);
   expect(late.msgs.filter(noHere).map(m => m.t)).toEqual(["welcome", "entries"]);
   expect(watcher.msgs.filter(m => m.t === "entries").length).toBe(1);    // only the one valid op was broadcast
   expect(a.ws.readyState).toBe(WebSocket.OPEN);
   await r.stop();
-});
+}
 
 test("H1: catch-up is right for every `since`, and the same bytes go to every joiner", async () => {
   const r = await rig();
@@ -687,3 +693,29 @@ for (const seed of [1, 2]) test(`clients converge through the Room over real soc
   noSecrets(r);
   await r.stop();
 }, 30000);
+
+test("onWelcomed (Recent, PROTOCOL.md § Home): called once per welcomed connection with the user and board; never for a refused hello; a throwing hook doesn't drop the connection", async () => {
+  const seen = [];
+  const r = await rig({ onWelcomed: (u, b) => { seen.push([u, b]); if (u === "dev:viewer") throw new Error("boom"); } });
+  const stranger = await r.sock();
+  stranger.send(hello(r, "stranger"));
+  await stranger.next(m => m.t === "error");
+  expect(seen).toEqual([]);
+  const ed = await r.sock(); ed.send(hello(r, "editor")); await ed.next(m => m.t === "welcome");
+  const vw = await r.sock(); vw.send(hello(r, "viewer")); await vw.next(m => m.t === "welcome");   // a viewer's welcome is the gateway's own
+  expect(seen).toEqual([["dev:editor", r.ids.board], ["dev:viewer", r.ids.board]]);
+  ed.send({ t: "op", id: "raw:2", sentAt: 0, stream: "board", op: { elements: [rect("h")] } });
+  await ed.next(m => m.t === "ack" && m.id === "raw:2");                                           // the editor's connection still works
+  await r.stop();
+});
+
+test("a welcomed connection reaches Recent through recentRecorder over a real Registry", async () => {
+  const { memoryRegistry } = await import("../../server/auth/registry.js");
+  const { recentRecorder } = await import("../../server/auth/home.js");
+  const registry = memoryRegistry();
+  const r = await rig({ registry, onWelcomed: recentRecorder({ registry }) });
+  const s = await r.sock(); s.send(hello(r, "editor")); await s.next(m => m.t === "welcome");
+  await until(async () => (await registry.recents("dev:editor")).length === 1);
+  expect((await registry.recents("dev:editor"))[0].board).toBe(r.ids.board);
+  await r.stop();
+});

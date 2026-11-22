@@ -23,20 +23,28 @@ import { Replica } from "../../packages/protocol/replica.js";
 import { jsonCodec } from "../../packages/protocol/codec.js";
 import { makeElement } from "../../packages/core/model.js";
 
-/** A writer is due to make ops when rate x (genEndAt - firstWelcomeAt) reaches this: its first op comes within 1.5/rate s. */
-export const DUE_TICKS = 1.5;
-export function writerRate(role, cfg) {
-  if (role === "editor") return cfg?.opRate ?? 0;
-  if (role === "annotator") return Math.max(cfg?.noteRate ?? 0, cfg?.commentRate ?? 0);
-  return 0;
-}
-
 /** The one place a Replica is made (engine may add an optional `{ tab }` option: add it here). */
 export function makeReplica(clientName) {
   return new Replica({ client: clientName });
 }
 
 const now = () => Date.now();
+
+// A writer role is due to make ops when a client generates for rate x seconds >= this: its first op comes within
+// 1.5/rate s (ticks are jittered 0.5-1.5 x 1/rate). The clock starts at the client's first welcome (run.js dueRoles).
+export const DUE_TICKS = 1.5;
+// A client must be welcomed within this long of its first connect, or it counts as joined too late (a server that
+// answers everyone in the last seconds of a run has not served the audience); and a client that dropped and is
+// reconnecting when generation ends (its welcomed connection was lost within this long before the end) gets this long
+// after the drain to come back before "connected at the end" is read.
+export const JOIN_CEILING_MS = 10000;
+export const REJOIN_GRACE_MS = 3000;
+/** The op rate (ticks/s) a role generates at: editors on opRate, annotators on the faster of notes and comments. */
+export function writerRate(role, cfg) {
+  if (role === "editor") return cfg?.opRate ?? 0;
+  if (role === "annotator") return Math.max(cfg?.noteRate ?? 0, cfg?.commentRate ?? 0);
+  return 0;
+}
 
 export class LoadClient {
   /**
@@ -47,8 +55,9 @@ export class LoadClient {
     this.url = url; this.board = board; this.token = token; this.role = role; this.name = name; this.cfg = cfg; this.stats = stats;
     this.replica = makeReplica(name);
     this.ws = null; this.ownClose = false; this.running = true; this.generating = false;
+    this.armed = false; this.firstWelcomeAt = null; this.firstConnectAt = null; this.lastDropAt = null;
+    // armed: generation starts at the first welcome (the due clock); lastDropAt: when a welcomed connection was last lost (not a failed reconnect attempt)
     this.helloAt = null; this.liveFrom = Infinity; this.welcomedOnce = false; this.welcomed = false;
-    this.firstWelcomeAt = null; this.loopsStarted = false;
     this.writeAt = new Map();   // op id → { t: first write time (ms), acked, echoed }; gone once both are seen
     this.timers = new Set(); this.flushTimer = null;
     this.seq = 0; this.thread = null; this.replies = 0;
@@ -61,7 +70,7 @@ export class LoadClient {
 
   connect() {
     if (!this.running) return;
-    this.ownClose = false; this.welcomed = false;
+    this.ownClose = false; this.welcomed = false; this.firstConnectAt ??= now();
     let ws;
     try { ws = new WebSocket(this.url); } catch { this.stats.count("connectThrew"); this.retry(); return; }
     this.ws = ws;
@@ -77,6 +86,7 @@ export class LoadClient {
     ws.onclose = ev => {
       this.stats.closeCode(ev.code);
       if (ws !== this.ws) return;
+      if (this.welcomed) this.lastDropAt = now();
       this.ws = null; this.welcomed = false;
       if (!this.ownClose) this.replica.connectionFailed();
       this.retry();
@@ -95,13 +105,9 @@ export class LoadClient {
     const t = now();
     if (msg.t === "welcome" && !this.welcomed) {
       this.welcomed = true;
-      const first = !this.welcomedOnce;
-      this.stats.join(t - this.helloAt, t, first);
+      this.stats.join(t - this.helloAt, t, !this.welcomedOnce);
       this.welcomedOnce = true;
-      if (first) {
-        this.firstWelcomeAt = t;
-        if (this.generating && !this.loopsStarted) this.startLoops();
-      }
+      if (this.firstWelcomeAt === null) { this.firstWelcomeAt = t; if (this.armed) this.startGenerating(); }
       this.liveFrom = msg.seq;   // entries after the welcome's seq are live; before it, catch-up
     } else if (msg.t === "ack") {
       const w = this.writeAt.get(msg.id);
@@ -156,30 +162,30 @@ export class LoadClient {
   }
 
   closeSocket() {
-    const ws = this.ws; this.ws = null; this.welcomed = false;
+    const ws = this.ws; this.ws = null;
+    if (this.welcomed) this.lastDropAt = now();
+    this.welcomed = false;
     if (ws) { this.ownClose = true; try { ws.close(1000, "load client"); } catch { /* closed */ } }
   }
 
   // ---- load ----
-  // Start generating from the first welcome (not connect) so a slow welcome on a healthy server never wastes ticks
-  // before the client can write.
   startGenerating() {
     this.generating = true;
-    if (this.welcomedOnce && !this.loopsStarted) this.startLoops();
-  }
-  startLoops() {
-    this.loopsStarted = true;
     const c = this.cfg, jitter = ms => ms * (0.5 + Math.random());
     const loop = (rate, fn) => { if (!(rate > 0)) return; const tick = () => { if (!this.generating) return; fn(); this.later(jitter(1000 / rate), tick); }; this.later(jitter(1000 / rate), tick); };
     if (this.role === "editor") { loop(c.opRate, () => this.draw("board")); loop(c.cursorRate, () => this.cursor()); }
     if (this.role === "annotator") { loop(c.noteRate, () => this.draw("notes")); loop(c.commentRate, () => this.comment()); loop(c.cursorRate, () => this.cursor()); }
   }
-  stopGenerating() { this.generating = false; }
+  stopGenerating() { this.generating = false; this.armed = false; }
+  /** Generate load from this client's first welcome on (not from connect): a slow join does not eat its due window. */
+  arm() { this.armed = true; if (this.firstWelcomeAt !== null && !this.generating) this.startGenerating(); }
+  /** Whether this client had a whole due window: welcomed at least DUE_TICKS/rate s before `genEndAt`. */
+  wasDue(genEndAt) { const r = writerRate(this.role, this.cfg); return r > 0 && this.firstWelcomeAt !== null && ((genEndAt - this.firstWelcomeAt) / 1000) * r >= DUE_TICKS; }
 
   // Only while connected, and never more than 50 ops waiting: a client that can't send skips (counted), so a
   // stalled server shows as skipped ops, not as an ever-growing queue on this side.
   canWrite() {
-    if (!this.welcomed || !this.ws) { this.stats.count("skippedOffline"); this.stats.count("skippedOffline_" + this.role); return false; }
+    if (!this.welcomed || !this.ws) { this.stats.count("skippedOffline"); return false; }
     if (this.replica.pending.size >= 50) { this.stats.count("skippedBacklog"); return false; }
     return true;
   }

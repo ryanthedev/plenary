@@ -1,10 +1,17 @@
 {
   "name": "plenary",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "description": "A live infinite canvas for enterprise all-hands. Name not final; nothing published.",
   "scripts": {
-    "test": "bun test"
+    "test": "bun test",
+    "test:fast": "bun --no-env-file test test/protocol.test.js test/core-source.test.js test/convergence.test.js test/envelope.test.js test/holes.test.js test/presence.test.js test/purity.test.js test/records.test.js test/recovery.test.js test/replica.test.js test/v11.test.js test/web/core test/web/collab test/web/contracts test/web/core-runtime-globals.test.js",
+    "test:full": "bun test",
+    "test:cluster": "bun --no-env-file scripts/test-cluster.js",
+    "clean": "bun scripts/clean.js",
+    "test:compose": "bun --no-env-file scripts/test-compose.js",
+    "rig": "bun --no-env-file scripts/cluster-rig.js"
   },
   "dependencies": {
     "@nats-io/transport-node": "3.4.0"

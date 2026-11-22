@@ -513,3 +513,18 @@ test("E-2: optional `session` sets client.<session> without calling Math.random;
   } finally { Math.random = orig; }
   for (const bad of ["", "a:b", 123, null]) expect(() => new Replica({ client: "web", session: bad })).toThrow();
 });
+
+test("#91 welcome.can.move is kept as canMove: true only when exactly true; independent of can.share", () => {
+  const mk = can => { const r = new Replica({ client: "c" }); r.receive({ t: "welcome", seq: 0, role: "viewer", user: "u", horizon: 0, rv: 1, ...(can ? { can } : {}) }); return r; };
+  expect([mk({ move: true }).canMove, mk({ move: true }).canShare]).toEqual([true, false]);
+  expect([mk({ share: true, move: true }).canMove, mk({ share: true, move: true }).canShare]).toEqual([true, true]);
+  expect(mk({ move: "yes" }).canMove).toBe(false); expect(mk(null).canMove).toBe(false); expect(new Replica({ client: "c" }).canMove).toBe(false);
+});
+
+test("welcome.can.share is kept as canShare: true only when the welcome says so, false when absent or not exactly true", () => {
+  const mk = can => { const r = new Replica({ client: "c" }); r.receive({ t: "welcome", seq: 0, role: "annotator", user: "u", horizon: 0, rv: 1, ...(can ? { can } : {}) }); return r; };
+  expect(mk({ share: true }).canShare).toBe(true);
+  expect(mk({ share: "yes" }).canShare).toBe(false);
+  expect(mk(null).canShare).toBe(false);
+  expect(new Replica({ client: "c" }).canShare).toBe(false);
+});

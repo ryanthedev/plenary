@@ -1,11 +1,11 @@
-// Auth adapter: an in-memory fake of POST /auth/exchange (docs/m2/contracts/auth-exchange.md) for tests and the
+// Auth adapter: an in-memory fake of POST /auth/exchange for tests and the
 // dev page. Implements web/ports/auth.js. Codes are single use and expire after ttlMs (60 s, as the server).
 
 /**
  * @param {{ now?: () => number, ttlMs?: number, fail?: "bad-origin" | "unavailable" | "network" | "malformed" | null }} [o]
  *   now: the clock (ms; pass a virtual clock's now). fail: every exchange meets this failure (a 403, a 503, no
  *   answer at all, or a 200 that is not the shape, which an adapter reports as "unavailable"), to test callers;
- *   the code is not spent then, as on the server. Field types: auth-exchange.md "Field types" (name, email and
+ *   the code is not spent then, as on the server. Field types: PROTOCOL.md "Sign-in code exchange" (name, email and
  *   domain may be null; mint passes null through).
  */
 export function fakeAuth({ now = () => 0, ttlMs = 60_000, fail = null } = {}) {

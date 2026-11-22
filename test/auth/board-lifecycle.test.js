@@ -140,8 +140,8 @@ describe("Board lifecycle: PATCH /boards/:board and DELETE /boards/:board", () =
   test("PATCH /boards/:board: non-owners and unknown boards get 403; invalid payloads get 400", async () => {
     const board = await makeBoard();
 
-    // Non-owners (editor, viewer, stranger, even non-owner tenant admin) -> 403
-    for (const tok of [editorTok, viewerTok, strangerTok, nonOwnerAdminTok]) {
+    // Users without board.edit (viewer, stranger, non-owner tenant admin without content tier) -> 403
+    for (const tok of [viewerTok, strangerTok, nonOwnerAdminTok]) {
       const r = await api(`/boards/${board.id}`, tok, "PATCH", { title: "Hacked" });
       expect(r.status).toBe(403);
     }
@@ -151,7 +151,7 @@ describe("Board lifecycle: PATCH /boards/:board and DELETE /boards/:board", () =
     // Invalid payloads -> 400
     expect((await api(`/boards/${board.id}`, ownerTok, "PATCH", {})).status).toBe(400);
     expect((await api(`/boards/${board.id}`, ownerTok, "PATCH", { title: "Ok", bogus: 1 })).status).toBe(400);
-    expect((await api(`/boards/${board.id}`, ownerTok, "PATCH", { title: "a".repeat(121) })).status).toBe(400);
+    expect((await api(`/boards/${board.id}`, ownerTok, "PATCH", { title: "a".repeat(201) })).status).toBe(400);
     expect((await api(`/boards/${board.id}`, ownerTok, "PATCH", { title: "bad\u0007bell" })).status).toBe(400);
     expect((await api(`/boards/${board.id}`, ownerTok, "PATCH", { title: "bidi\u202Eoverride" })).status).toBe(400);
     expect((await api(`/boards/${board.id}`, ownerTok, "PATCH", { memberRole: "owner" })).status).toBe(400);

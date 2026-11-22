@@ -18,19 +18,24 @@
 //     in flight). When an append resolves, its entries are published on `.entries` (split under the bus cap)
 //     before the Room acks them.
 //   - Append timeout (4 s): the append's promise rejects, and the Room fails itself (nothing unresolved is acked).
+//   - Stuck host (#65, PROTOCOL.md § Recovery): every other Store call (build reads, acquire, lease) is bounded by
+//     `storeTimeoutMs`, and a progress watchdog stops a room whose waiting ops have not moved `seq` for `stuckMs`.
+//     Stopping = stop renewing; the Store lease lapses and a waiting host takes it. No second arbiter.
 //   - Only `welcome`, `ack` and `error` go back to a gateway (`.gw.<gateway>`). The Room's own catch-up and live
 //     broadcasts are not sent: gateways serve catch-up from the Store and fan out from `.entries` (rules 3, 8).
 //   - Every `unavailable` the Room says ends that connection (a gap, an unknown connection, a stopped room): the
 //     gateway is told to close it, and the client reconnects and is welcomed afresh.
-//   - Timers: room.sweep() (gateway silence, by the room's clock), the `{ seq, epoch }` heartbeat every 2 s, and
+//   - Timers: room.sweep() (gateway silence, by the room's clock), the `{ seq, epoch, cp }` heartbeat every 2 s, and
 //     the lease's renew and deadline (by performance.now(), never the rooms' injected clock).
 
 import { Room } from "../packages/protocol/room.js";
+import { CHECKPOINT_BYTES, blobRefsOf } from "../packages/protocol/envelope.js";
 import { jsonCodec } from "../packages/protocol/codec.js";
 import { subjects, MAX_BUS_BYTES, utf8Length } from "./bus/port.js";
 import { quietLogger } from "./log.js";
 import { PortError } from "./ids.js";
 import { breathe } from "./breather.js";
+import { noopMetrics } from "./metrics/port.js";
 
 const REPLIES = new Set(["welcome", "ack", "error"]);
 // A hello's catch-up is the gateway's (rule 8): the Room is told the client is at the end of time, so it builds none.
@@ -43,7 +48,7 @@ const NO_CATCH_UP = Number.MAX_SAFE_INTEGER;
  * @returns {{ from: number, to: number, items: string[] }[]}
  */
 export function splitEntries(entries, items, maxBytes) {
-  const out = [], room = maxBytes - 64;   // the envelope: {"from":…,"to":…,"items":[…]}
+  const out = [], room = maxBytes - 96;   // the envelope: {"from":…,"to":…,"items":[…],"epoch":…}
   let cur = null, bytes = 0;
   for (let i = 0; i < entries.length; i++) {
     const n = utf8Length(JSON.stringify(items[i])) + 1;   // as a JSON string inside the array (escapes count)
@@ -79,33 +84,45 @@ export function newHolder(hostname) {
 /**
  * @param {{ store: object, bus: object, log?: object, codec?: object, now?: () => number, appendTimeoutMs?: number,
  *   sweepMs?: number, heartbeatMs?: number, pageSize?: number, pageBytes?: number, rules?: object, maxBusBytes?: number,
- *   holder?: string, hostname?: string, leaseTtlMs?: number, watchIdleMs?: number, monotonic?: () => number }} o
+ *   holder?: string, hostname?: string, leaseTtlMs?: number, watchIdleMs?: number, storeTimeoutMs?: number, stuckMs?: number, monotonic?: () => number, timers?: object,
+ *   metrics?: import("./metrics/port.js").Metrics }} o   metrics: plenary_boards_hosted, plenary_ops_total, plenary_lease_changes_total (PROTOCOL.md § Metrics; default records nothing)
  *   now: the rooms' clock (entries' `at`, the 30 s gateway silence). rules: per rules version { W, H, every } (tests).
  *   holder: this instance's lease holder id (tests); default newHolder(hostname). leaseTtlMs: the Store lease's ttl
  *   (default 10 s), renewed every ttl/3. watchIdleMs: a board held elsewhere is watched (for a takeover) while some
  *   open() or inbox message for it came in this long (default 60 s). monotonic: the lease's clock (default
- *   performance.now(); tests move it to fake a stall). Never the rooms' `now`.
+ *   performance.now(); tests move it to fake a stall). Never the rooms' `now`. storeTimeoutMs: bound on a Store call of a
+ *   build, acquire or lease read (default 10 s). stuckMs: a room with ops waiting whose resolved seq has not moved this
+ *   long is stopped (default 2 x appendTimeoutMs; checked every heartbeatMs).
+ *   timers: { setTimeout, clearTimeout, setInterval, clearInterval } this host's timers (default the globals).
  */
 export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now = Date.now, appendTimeoutMs = 4_000, sweepMs = 1_000,
-  heartbeatMs = 2_000, pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rules, maxBusBytes = bus.maxBytes ?? MAX_BUS_BYTES, tailFoldBytes = 8 * 1024 * 1024,
-  holder, hostname = globalThis.process?.env?.HOSTNAME, leaseTtlMs = 10_000, watchIdleMs = 60_000, monotonic = performance.now.bind(performance) }) {
-  // tailFoldBytes: besides the Room's own rule (every 1,000 entries, once the log since the last checkpoint is half
-  //   its size), the host checkpoints once that log reaches this many chars AND half the state's size, so a board
-  //   rewritten in a few huge ops still gets a bounded catch-up, and a rewrite never costs more than 2× the log.
-  //   (An extension of § Recovery "When": a byte trigger, asked for since the scaffold; see the p2-swap report.)
+  heartbeatMs = 2_000, pageSize = 1_000, pageBytes = 4 * 1024 * 1024, rules, maxBusBytes = bus.maxBytes ?? MAX_BUS_BYTES, tailFoldBytes = CHECKPOINT_BYTES, foldUnits, schedule, checkpointTimeoutMs = 30_000,
+  holder, hostname = globalThis.process?.env?.HOSTNAME, leaseTtlMs = 10_000, watchIdleMs = 60_000, storeTimeoutMs = 10_000, stuckMs = 2 * appendTimeoutMs, monotonic = performance.now.bind(performance), timers = globalThis, metrics = noopMetrics }) {
+  // tailFoldBytes: the Room's byte trigger for a checkpoint (§ Recovery, "When"): the log since the last one reaches this
+  //   many chars and a quarter of the state's size (so a rewrite never costs more than ~4x the log). Default CHECKPOINT_BYTES.
+  // foldUnits: work per step of an incremental checkpoint (fold.js; default FOLD_STEP_UNITS). Each step is its own
+  //   `schedule(fn)` turn (default the injected timers' setImmediate, else the global; tests pass a queue they drain). checkpointTimeoutMs: a checkpoint write unanswered this long is failed (reported; the room's next fold may start), so a checkpoint never holds the loop for more than one step (§ Recovery, "Incremental fold").
   checkLeaseTtl(leaseTtlMs);
+  for (const [k, v] of Object.entries({ storeTimeoutMs, stuckMs })) if (!Number.isSafeInteger(v) || v < 1) throw new RangeError(`${k} must be a positive integer`);
+  log.info("room host: stuck-host bounds", { stuckMs, appendTimeoutMs, storeTimeoutMs, leaseTtlMs });   // stuckMs defaults to 2 x appendTimeoutMs
+  const sched = schedule ?? (fn => (timers.setImmediate ?? globalThis.setImmediate)(fn));   // the injected timers' turn, else the global one
+  // Every timer of this host runs on `timers` (tests pass fake ones and advance them, with `monotonic` and the Store's
+  // clock moved in step); the names shadow the globals for this whole function.
+  const { setTimeout, clearTimeout, setInterval, clearInterval } = timers;
   const perf = monotonic;   // the lease's clock: elapsed time on this host only (tests fake a stall with it)
   const me = holder ?? newHolder(hostname);
   const renewEvery = Math.floor(leaseTtlMs / 3);
   const renewTimeout = Math.max(1, Math.floor(renewEvery / 2)), renewRetry = Math.max(1, Math.floor(renewEvery / 4));
-  // A takeover attempt waits a whole ttl (plus a little) after it read the lease: the lease can't outlive that unless
-  // it was renewed, and this host never compares the Store's clock (`expiresAt`) with its own.
   // A takeover attempt is armed for the Store's own `remainingMs` on the lease (+ a small margin): this host never
   // compares the Store's clock (`expiresAt`) with its own. While it still loses, it tries again every ttl/3.
   const margin = Math.max(20, Math.floor(leaseTtlMs / 50));
   const silentAfter = 2 * heartbeatMs;
   /** @type {Map<string, Promise<object>>} key "tenant/board" → the slot, once built */
   const slots = new Map();
+  // PROTOCOL.md § Metrics. `metrics` records only; a failure inside it never reaches this code (the port never throws).
+  metrics.gauge("plenary_boards_hosted", "Rooms this host holds or is building.", () => slots.size);
+  const opsTotal = metrics.counter("plenary_ops_total", "Ops this host sequenced and made durable.");
+  const leaseChanges = metrics.counter("plenary_lease_changes_total", "Board lease changes on this host, by event (acquired, lost, released).", ["event"], ["acquired", "lost", "released"].map(event => ({ event })));
   /** key → an acquire (and the build it starts) under way, shared by concurrent opens and a takeover attempt */
   const claims = new Map();
   /** key → the latest slot whose lease this host acquired (close() releases them) */
@@ -116,6 +133,14 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   /** The host deadline has passed: this slot can't know it still holds the lease (HIGH-1). By performance.now(). */
   const expired = slot => perf() >= slot.okAt + leaseTtlMs - renewEvery;
   const watches = new Map();
+  /** key → perf() time until which this host does not claim the board: it just stopped it stuck (#65), and its own lease is still live. */
+  const cooling = new Map();
+  /** Slots whose room is built and alive: what the heartbeat tick walks. */
+  const running = new Set();
+  const coolOff = key => cooling.set(key, perf() + leaseTtlMs + margin);
+  const isCooling = key => perf() < (cooling.get(key) ?? 0);
+  /** Cooldowns that ended long ago belong to boards nobody reopened (their watch is idle-dropped by then): forget them. */
+  const pruneCooling = () => { for (const [key, until] of cooling) if (perf() >= until + watchIdleMs) cooling.delete(key); };
   let closed = false;
   const closedError = () => new PortError("closed", "the room host is closed");
 
@@ -129,7 +154,8 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   function publishEntries(slot, entries) {
     try {
       const items = entries.map(e => codec.encode(e));
-      for (const m of splitEntries(entries, items, maxBusBytes)) {
+      for (const part of splitEntries(entries, items, maxBusBytes)) {
+        const m = { ...part, epoch: slot.epoch };
         const p = bus.publish(subjects.entries(slot.tenant, slot.board), m);
         // Refused (over the cap, a bus outage): gateways repair from the Store (heartbeat gap, 5 s silence poll).
         p?.catch?.(err => log.error("entries publish refused; gateways repair from the Store", { tenant: slot.tenant, board: slot.board, from: m.from, to: m.to, err }));
@@ -137,9 +163,9 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     } catch (err) { log.error("entries publish failed", { tenant: slot.tenant, board: slot.board, err }); }
   }
 
-  function withTimeout(p) {
+  function withTimeout(p, ms = appendTimeoutMs) {
     let timer;
-    const t = new Promise((_, rej) => { timer = setTimeout(() => rej(new PortError("timeout", "the store did not answer in time")), appendTimeoutMs); });
+    const t = new Promise((_, rej) => { timer = setTimeout(() => rej(new PortError("timeout", "the store did not answer in time")), ms); });
     return Promise.race([p, t]).finally(() => clearTimeout(timer));
   }
 
@@ -149,40 +175,35 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     const fenced = (what, err) => { if (err?.code === "fenced") lost(slot, `${what} fenced: another host took the board`, err); };
     return {
       append(entries, expectSeq) {
-        const w = Promise.resolve().then(() => store.append(tenant, board, entries, expectSeq, slot.epoch));
-        slot.writes.add(w); w.finally(() => slot.writes.delete(w)).catch(() => {});   // close() settles it before release (L4)
-        return withTimeout(w).then(() => {
+        const w = withTimeout(Promise.resolve().then(() => store.append(tenant, board, entries, expectSeq, slot.epoch, { blobRefs: blobRefsOf(entries) })));   // the pictures the entries name become this board's references, in the same transaction (§ Blobs)
+        // close() settles it before release (L4). The timed promise: a hung append settles at the timeout, so close() never waits forever.
+        slot.writes.add(w); w.finally(() => slot.writes.delete(w)).catch(() => {});
+        return w.then(() => {
+          opsTotal.inc(entries.length);   // counted once the Store has them, before any early return below
           // Durable, but past the host deadline nothing is acked or broadcast from here (HIGH-1): the room stops, the
           // entries stay unacked, and the client's resend is deduplicated by the next holder.
           if (slot.leaseLost) return;
           if (expired(slot)) return lost(slot, "the host deadline passed before an append's result");
           slot.durable = entries[entries.length - 1].seq; publishEntries(slot, entries);
-          setTimeout(() => foldIfDue(slot), 0);   // after the Room has moved these entries to resolved
         }, err => { fenced("append", err); throw err; });
       },
       putCheckpoint(cp) {
         const p = store.putCheckpoint(tenant, board, cp, slot.epoch);
-        slot.writes.add(p); p.finally(() => slot.writes.delete(p)).catch(() => {});
         p.catch(err => fenced("checkpoint", err));
-        return p;
+        // A write that never answers must still settle, or the room's `writing` never drops (no later fold starts) and
+        // close() waits on it forever: the room and the slot track the timed one.
+        const timed = withTimeout(p, checkpointTimeoutMs);
+        slot.writes.add(timed); timed.finally(() => slot.writes.delete(timed)).catch(() => {});
+        return timed;
       },
     };
-  }
-
-  /** The byte trigger (tailFoldBytes, above). Only when nothing is unresolved, so the fold is of resolved state. */
-  function foldIfDue(slot) {
-    if (slot.dead) return;
-    const st = slot.room.status();
-    if (st.stopped || st.inflight || st.queued || st.seq !== st.resolved) return;
-    if (st.tailChars < tailFoldBytes || st.tailChars * 2 < st.stateChars) return;
-    try { slot.room.checkpoint(); } catch (err) { log.error("checkpoint failed", { board: slot.board, err }); }
   }
 
   /** Read every entry from `from` to the log's end, in bounded pages. */
   async function readFrom(tenant, board, from) {
     const all = [];
     for (let next = from; ;) {
-      const page = await store.read(tenant, board, next, pageSize, pageBytes);
+      const page = await withTimeout(store.read(tenant, board, next, pageSize, pageBytes), storeTimeoutMs);
       if (!page.length) break;
       for (const e of page) all.push(e);
       next = page[page.length - 1].seq + 1;
@@ -244,10 +265,20 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       slot.retryTimer.unref?.();
     });
   }
+  /**
+   * The progress watchdog (#65): ops are waiting (an append in flight, queued or held) and the resolved seq has not
+   * moved for `stuckMs` (monotonic). An idle room, or one whose appends land, is never stuck. The record resets
+   * whenever nothing waits or the seq moved, so it is at most one heartbeat stale when work first arrives.
+   */
+  function stalled(slot) {
+    const st = slot.room.status(), t = perf();
+    if (st.inflight + st.queued + st.held === 0 || st.resolved !== slot.progress.seq) { slot.progress = { seq: st.resolved, at: t }; return false; }
+    return t - slot.progress.at >= stuckMs;
+  }
   /** The lease is gone (or may be): stop the room. Never `release` (someone else may hold the board now). */
   function lost(slot, why, err) {
     if (slot.dead) return;
-    slot.leaseLost = true;
+    slot.leaseLost = true; leaseChanges.inc(1, { event: "lost" });
     log.error("room stopped: lease lost", { tenant: slot.tenant, board: slot.board, epoch: slot.epoch, why, err });
     fail(slot);
   }
@@ -258,15 +289,21 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
    * attempt does).
    */
   async function claim(tenant, board, key) {
+    if (!isCooling(key)) cooling.delete(key);
+    else {   // a stuck stop's cooldown: never re-acquire our own live lease (acquire would grant it, epoch + 1); watch it instead
+      const info = await withTimeout(store.lease(tenant, board), storeTimeoutMs);
+      if (closed) throw closedError();
+      return { held: info };
+    }
     for (let tries = 0; tries < 3; tries++) {
       const sent = perf();
-      const l = await store.acquire(tenant, board, me, leaseTtlMs);
+      const l = await withTimeout(store.acquire(tenant, board, me, leaseTtlMs), storeTimeoutMs);
       if (closed) {
-        if (l) await Promise.resolve(store.release(tenant, board, me, l.epoch)).catch(() => {});
+        if (l) await withTimeout(Promise.resolve().then(() => store.release(tenant, board, me, l.epoch)), storeTimeoutMs).catch(() => {});
         throw closedError();
       }
       if (l) return start(tenant, board, key, l, sent);
-      const info = await store.lease(tenant, board);
+      const info = await withTimeout(store.lease(tenant, board), storeTimeoutMs);
       if (closed) throw closedError();
       if (info?.live) return { held: info };
     }
@@ -284,14 +321,19 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   /** The lease is ours: renew at once (a long rebuild may outlast the ttl), then build. */
   function start(tenant, board, key, lease, sentAt) {
     const slot = { key, tenant, board, room: null, epoch: lease.epoch, dead: false, leaseLost: false, unsub: () => {}, conns: new Map(),
-      writes: new Set(), durable: 0, okAt: 0, renewTimer: null, deadlineTimer: null, renewing: false, promise: null, welcomed: new Set() };
-    startLease(slot, sentAt);
+      writes: new Set(), durable: 0, progress: { seq: 0, at: sentAt }, okAt: 0, renewTimer: null, deadlineTimer: null, renewing: false, promise: null, welcomed: new Set() };
+    startLease(slot, sentAt); leaseChanges.inc(1, { event: "acquired" });
     held.set(key, slot);
     const p = build(slot).catch(err => {
       stopLease(slot); unwatch(key, true);
+      if (err?.code === "timeout") coolOff(key);
       // L5: a build that failed for a reason other than the lease gives the board back at once, so another host
       // (or this one's next open) needn't wait out the ttl. A lost lease is never released.
-      if (!slot.leaseLost) Promise.resolve().then(() => store.release(tenant, board, me, slot.epoch)).catch(e => log.warn("lease release after a failed build failed", { tenant, board, err: e }));
+      // Then a host already watching the board is told (as after a clean stop), so it need not wait for its next poll.
+      // `releaseP` never rejects: close() waits for it, then announces only if this did not (a failed release leaves the announcing to close()).
+      if (!slot.leaseLost) slot.releaseP = withTimeout(Promise.resolve().then(() => store.release(tenant, board, me, slot.epoch)), storeTimeoutMs)   // a release that never answers: the lease lapses by its ttl
+        .then(() => { slot.announced = true; slot.released = true; leaseChanges.inc(1, { event: "released" }); bus.publish(subjects.entries(tenant, board), { seq: 0, epoch: slot.epoch, cp: 0, released: true })?.catch?.(() => {}); })
+        .catch(e => log.warn("lease release after a failed build failed", { tenant, board, err: e }));
       throw err;
     });
     slot.promise = p;
@@ -303,13 +345,19 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   async function build(slot) {
     const { tenant, board } = slot;
     const report = (what, detail) => {
-      if (what === "stopped") { log.error("room stopped", { tenant, board, seq: detail?.seq, err: detail?.err }); fail(slot); }
+      if (what === "stopped") {
+        log.error("room stopped", { tenant, board, seq: detail?.seq, err: detail?.err });
+        if (detail?.err?.code === "timeout") coolOff(slot.key);   // an append that never answered: stuck (§ Recovery, "Stuck host")
+        fail(slot);
+      }
       else log.error(`room: ${what}`, { tenant, board, ...detail });
     };
     // § Recovery, Room identity: the epoch is the lease's (acquire bumps it durably), so two builds never share one.
-    const opts = { board, tenant, log: logOf(slot), now, epoch: slot.epoch, report, ...(rules ? { rules } : {}) };
+    const opts = { board, tenant, log: logOf(slot), now, epoch: slot.epoch, report, foldBytes: tailFoldBytes, ...(foldUnits ? { foldUnits } : {}),
+      // A step runs only while this slot lives: a lost lease or a stopped host abandons a fold in progress, writing nothing.
+      schedule: fn => sched(() => { if (!slot.dead) fn(); }), ...(rules ? { rules } : {}) };
     for (let before; ;) {
-      const cp = await store.getCheckpoint(tenant, board, before);
+      const cp = await withTimeout(store.getCheckpoint(tenant, board, before), storeTimeoutMs);
       const entries = await readFrom(tenant, board, cp && cp.seq > 0 ? cp.seq : 1);
       try { slot.room = Room.rebuild({ ...opts, checkpoint: cp, entries }); break; }
       catch (err) {
@@ -321,6 +369,8 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     if (closed) throw closedError();
     if (slot.dead) throw new PortError("unavailable", "the board's lease was lost while its room was being built");
     slot.durable = slot.room.status().resolved;
+    running.add(slot);
+    slot.progress = { seq: slot.durable, at: perf() };   // the watchdog's clock starts when the room starts, not at the acquire (a slow build is not a stall)
     // Gateways (and any host watching this board) learn the new epoch now, before the inbox is served. `opened`: a
     // watcher answers the hellos it held, which this room never saw (MEDIUM-2).
     bus.publish(subjects.entries(tenant, board), { ...slot.room.heartbeat(), opened: true })?.catch?.(() => {});
@@ -342,7 +392,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   function watch(tenant, board, key, lease) {
     if (closed || watches.has(key)) return;
     const t = perf();
-    const w = { key, tenant, board, heardAt: t, wanted: t, epoch: null, timer: null, silence: null, attempting: false, pending: [],
+    const w = { key, tenant, board, heardAt: t, wanted: t, epoch: Number.isSafeInteger(lease?.epoch) ? lease.epoch : null, timer: null, silence: null, attempting: false, pending: [],
       unsubEntries: () => {}, unsubInbox: () => {} };
     watches.set(key, w);
     w.unsubEntries = bus.subscribe(subjects.entries(tenant, board), m => {
@@ -366,16 +416,19 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   /**
    * The holder's `.entries`: it is alive. A heartbeat from a holder that just opened (`opened`, or an epoch above the
    * last one heard) means the hellos held here reached nobody (its room subscribed after them): answer them
-   * `unavailable` so the clients retry (MEDIUM-2). Otherwise the holder answered them: drop them. A `released` one: the
+   * `unavailable` so the clients retry (MEDIUM-2). Otherwise the holder most likely answered them: those held longer than 2 heartbeats are dropped, younger ones stay (a late beat from a dead holder must not eat a hello). A `released` one: the
    * holder let the board go; answer the held hellos and try to take it at once (L2).
    */
   function watchEntries(w, m) {
-    w.heardAt = perf();
     const ep = Number.isSafeInteger(m?.epoch) ? m.epoch : null;
-    const fresh = m?.opened === true || (ep !== null && w.epoch !== null && ep > w.epoch);
-    if (ep !== null && (w.epoch === null || ep > w.epoch)) w.epoch = ep;
+    // A late message from an older incarnation (a dead holder's, delayed on the bus), or one with no epoch, proves nothing about the holder now.
+    if (ep === null || (w.epoch !== null && ep < w.epoch)) return;
+    w.heardAt = perf();
+    const fresh = m?.opened === true || (w.epoch !== null && ep > w.epoch);
+    if (w.epoch === null || ep > w.epoch) w.epoch = ep;
     if (m?.released === true) { answerHeld(w); clearTimeout(w.silence); attemptNow(w); return; }
-    if (fresh) answerHeld(w); else w.pending.length = 0;
+    if (fresh) answerHeld(w);
+    else w.pending = w.pending.filter(h => w.heardAt - h.at <= silentAfter);   // older ones: the live holder had its chance to answer; younger stay until it speaks or goes silent
     armSilence(w);
   }
   /**
@@ -390,7 +443,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     w.wanted = perf();   // some gateway has writers on this board: keep watching it
     if (typeof m.conn !== "string" || m.closed || m.msg?.t !== "hello") return;
     if (perf() - w.heardAt > silentAfter || w.pending.length >= 1_000) return reply(w.tenant, w.board, m.gateway, m.conn, UNAVAILABLE, 1013);
-    w.pending.push({ gateway: m.gateway, conn: m.conn });
+    w.pending.push({ gateway: m.gateway, conn: m.conn, at: perf() });
   }
   /** 2 heartbeats with nothing heard: the holder is silent. Answer the held hellos and try to take the board now. */
   function armSilence(w) {
@@ -412,7 +465,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     if (w.attempting || closed || watches.get(w.key) !== w) return;
     clearTimeout(w.timer);
     w.attempting = true;
-    attempt(w).catch(err => log.error("takeover attempt failed", { tenant: w.tenant, board: w.board, err })).finally(() => { w.attempting = false; });
+    attempt(w).catch(err => log.error("takeover attempt failed", { tenant: w.tenant, board: w.board, err })).finally(() => { w.attempting = false; if (w.rerun) { w.rerun = false; attemptNow(w); } });   // an open found the cooldown over mid-attempt: once more, now
   }
   /**
    * One takeover attempt: ask the Store whether the lease is still live; if not, acquire it and build the room. Still
@@ -424,7 +477,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     if (perf() - w.wanted > watchIdleMs) { unwatch(w.key, true); log.info("stopped watching an idle board", { tenant: w.tenant, board: w.board }); return; }
     const again = info => { if (mine()) arm(w, Math.min(renewEvery, info?.live ? info.remainingMs + margin : renewEvery)); };
     let info;
-    try { info = await store.lease(w.tenant, w.board); }
+    try { info = await withTimeout(store.lease(w.tenant, w.board), storeTimeoutMs); }
     catch (err) { log.warn("lease read failed; trying again later", { tenant: w.tenant, board: w.board, err }); return again(null); }
     if (!mine()) return;
     if (info?.live && info.holder !== me) return again(info);
@@ -437,7 +490,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   /** Throw the room away: its connections are told `unavailable` and closed; the next open builds a new one. No release. */
   function fail(slot) {
     if (slot.dead) return;
-    slot.dead = true; slot.unsub(); stopLease(slot);
+    slot.dead = true; slot.unsub(); stopLease(slot); running.delete(slot);
     if (slots.get(slot.key) === slot.promise) slots.delete(slot.key);
     try { slot.room?.fail(new PortError("stopped", "the room host stopped this room")); } catch { /* already stopped */ }
     // A lost lease tells only the connections this slot welcomed (HIGH-1): any other hello on the board is the new
@@ -516,13 +569,15 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
     }, () => {});
   }, sweepMs);
   sweep.unref?.();
-  // § Bus: the heartbeat repairs a lost last entry and tells gateways the epoch (for viewers' welcomes).
+  // § Bus: the heartbeat repairs a lost last entry, tells gateways the epoch (for viewers' welcomes) and the newest durable checkpoint.
   const beat = setInterval(() => {
-    for (const p of slots.values()) p.then(slot => {
-      if (slot.dead) return;
-      if (expired(slot)) return lost(slot, "no lease renew succeeded by the host deadline");
+    pruneCooling();
+    for (const slot of [...running]) {   // rooms built and alive: a board still building has no beat to give (and no backlog of beats to run when it ends)
+      if (slot.dead) { running.delete(slot); continue; }
+      if (expired(slot)) { lost(slot, "no lease renew succeeded by the host deadline"); continue; }
+      if (stalled(slot)) { coolOff(slot.key); lost(slot, `no progress: ops waiting and the resolved seq unmoved for ${stuckMs} ms`); continue; }
       bus.publish(subjects.entries(slot.tenant, slot.board), slot.room.heartbeat())?.catch?.(() => {});
-    }, () => {});
+    }
   }, heartbeatMs);
   beat.unref?.();
 
@@ -542,7 +597,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       const p = slots.get(key);
       if (p) { await p; return "held"; }
       const w = watches.get(key);
-      if (w) { w.wanted = perf(); return "watching"; }
+      if (w) { w.wanted = perf(); if (cooling.has(key) && !isCooling(key)) { cooling.delete(key); if (w.attempting) w.rerun = true; else attemptNow(w); } return "watching"; }   // the cooldown is over: this open is the retake, not the watch's next poll
       const r = await claimOnce(tenant, board, key);
       if (r?.held === undefined) return "held";
       watch(tenant, board, key, r.held);
@@ -585,14 +640,16 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
       }
       for (const slot of held.values()) {
         stopLease(slot);
-        if (slot.leaseLost) continue;
+        await slot.releaseP;
+        if (slot.leaseLost || slot.released) continue;   // released (and counted) already after a failed build
         try {
-          await store.release(slot.tenant, slot.board, me, slot.epoch);
+          await withTimeout(Promise.resolve().then(() => store.release(slot.tenant, slot.board, me, slot.epoch)), storeTimeoutMs);   // never answers: the lease lapses by its ttl (logged below)
+          leaseChanges.inc(1, { event: "released" });
           // A host watching this board takes it at once (L2), not when it next asks the Store.
-          bus.publish(subjects.entries(slot.tenant, slot.board), { seq: slot.durable, epoch: slot.epoch, released: true })?.catch?.(() => {});
+          if (!slot.announced) bus.publish(subjects.entries(slot.tenant, slot.board), { seq: slot.durable, epoch: slot.epoch, cp: slot.room?.heartbeat().cp ?? 0, released: true })?.catch?.(() => {});
         } catch (err) { log.warn("lease release failed; it lapses within its ttl", { tenant: slot.tenant, board: slot.board, err }); }
       }
-      held.clear(); slots.clear();
+      held.clear(); slots.clear(); running.clear();
     },
   };
 }

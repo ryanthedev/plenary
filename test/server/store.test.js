@@ -3,6 +3,7 @@
 import { test, expect, afterAll } from "bun:test";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
+import { rmSync, readdirSync } from "node:fs";
 import { sqliteStore } from "../../server/store/sqlite.js";
 import { storeContract, entry, code } from "./store-contract.js";
 import { tempDir, cleanup } from "./helpers.js";
@@ -11,11 +12,20 @@ afterAll(cleanup);
 const T = "t-aaa", B = "b-one";
 
 // Every handle on one file shares one injected clock, as two processes on one machine share the machine's.
-storeContract("sqlite", async () => {
+storeContract("sqlite", async opts => {
   const path = join(tempDir(), "plenary.db");
   let t = 1_000_000;
   const now = () => t;
-  return { store: sqliteStore({ path, now }), another: async () => sqliteStore({ path, now }), advance: ms => { t += ms; } };
+  const raw = new Database(path, { create: true }), one = (sql, ...a) => raw.query(sql).run(...a);
+  return { store: sqliteStore({ path, now, ...opts }), another: async () => sqliteStore({ path, now, ...opts }), advance: ms => { t += ms; },
+    raw: {
+      putCheckpointRow: async (t, b, seq, data) => one("INSERT INTO checkpoints (tenant, board, seq, data) VALUES (?, ?, ?, ?)", t, b, seq, data),
+      putPartRow: async (t, b, seq, wid, n, data) => one("INSERT INTO checkpoint_parts (tenant, board, seq, wid, n, data) VALUES (?, ?, ?, ?, ?, ?)", t, b, seq, wid, n, data),
+      partRows: async (t, b) => raw.query("SELECT count(*) AS c FROM checkpoint_parts WHERE tenant = ? AND board = ?").get(t, b).c,
+      putRefRow: async (t, b, sha1) => one("INSERT OR IGNORE INTO blob_refs (tenant, sha1, board) VALUES (?, ?, ?)", t, sha1, b),
+      refRows: async (t, b) => raw.query("SELECT count(*) AS c FROM blob_refs WHERE tenant = ? AND board = ?").get(t, b).c,
+      pendingRows: async (t, b) => raw.query("SELECT count(*) AS c FROM blob_pending WHERE tenant = ? AND board = ?").get(t, b).c,
+    } };
 });
 
 test("opened with WAL, synchronous=FULL and fullfsync", async () => {
@@ -40,20 +50,93 @@ test("lease expiry is judged on the injected clock alone, to the millisecond", a
   await store.close();
 });
 
-test("a file made before the lease (epoch-only leases table) is upgraded in place and keeps its epochs", async () => {
+test("a file made before the lease (epoch-only leases table) is an old-format store: refused with code old-format, and left as it was", () => {
   const path = join(tempDir(), "plenary.db");
   const old = new Database(path, { create: true });
   old.run("CREATE TABLE leases (tenant TEXT NOT NULL, board TEXT NOT NULL, epoch INTEGER NOT NULL, PRIMARY KEY (tenant, board)) WITHOUT ROWID");
   old.run("INSERT INTO leases (tenant, board, epoch) VALUES (?, ?, 5)", [T, B]);
   old.close();
-  const store = sqliteStore({ path });
-  expect(await store.epoch(T, B)).toBe(5);
-  expect(await store.lease(T, B)).toEqual({ holder: null, epoch: 5, expiresAt: null, live: false, remainingMs: 0 });
-  expect((await store.acquire(T, B, "h-a", 1_000)).epoch).toBe(6);                // unheld: taken at once
-  await store.append(T, B, [entry(1)], 0, 6);
-  expect(await store.openEpoch(T, B)).toBe(7);
-  await store.close();
-  const again = sqliteStore({ path });                                            // a second open: no ALTER runs twice
-  expect(await again.epoch(T, B)).toBe(7);
-  await again.close();
+  let err;
+  Bun.gc(true); const fds = readdirSync("/dev/fd").length;   // collect an earlier test's handle first, or it could finalize between the two counts
+  try { sqliteStore({ path }); } catch (e) { err = e; }
+  expect(err?.code).toBe("old-format");
+  expect(readdirSync("/dev/fd").length).toBe(fds);                                                                      // the refused open left no handle (an rmSync would pass either way)
+  expect(err.message).toMatch(/Reset the store/);
+  const after = new Database(path, { readonly: true });
+  expect(after.query("PRAGMA table_info(leases)").all().map(c => c.name)).toEqual(["tenant", "board", "epoch"]);   // never ALTERed
+  expect(after.query("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(t => t.name)).toEqual(["leases"]);   // no entries/checkpoints/parts were created
+  expect(after.query("PRAGMA journal_mode").get().journal_mode).toBe("delete");                                         // the WAL switch never happened
+  after.close();
+  rmSync(path);                                                                                                         // no handle was left open: the file can go
+});
+
+test("the old-format rule is general: a changed column set in any Store table refuses the file; a reopen of a good file does not", async () => {
+  const good = join(tempDir(), "plenary.db"), s = sqliteStore({ path: good }); await s.close();
+  sqliteStore({ path: good }).close();
+  for (const table of ["entries", "checkpoints", "checkpoint_parts"]) {
+    const path = join(tempDir(), "plenary.db"), db = new Database(path);
+    db.run(`CREATE TABLE ${table} (tenant TEXT NOT NULL, board TEXT NOT NULL, seq INTEGER NOT NULL)`);   // `data` missing
+    db.close();
+    let err; try { sqliteStore({ path }); } catch (e) { err = e; }
+    expect([table, err?.code]).toEqual([table, "old-format"]);
+  }
+});
+
+test("a header whose parts hold the wrong number of chars is refused as corrupt, never parsed", async () => {
+  const path = join(tempDir(), "plenary.db");
+  const store = sqliteStore({ path, partChars: 100 });
+  const epoch = await store.openEpoch(T, B);
+  await store.putCheckpoint(T, B, { seq: 3, pad: "x".repeat(450) }, epoch);
+  const raw = new Database(path);
+  raw.run("UPDATE checkpoint_parts SET data = substr(data, 2) WHERE n = 1");        // a part lost a char
+  expect(await code(store.getCheckpoint(T, B))).toBe("corrupt");
+  raw.run("UPDATE checkpoint_parts SET data = '' || data || substr('x', 1, 1) WHERE n = 1");   // restore its length: fine again
+  expect((await store.getCheckpoint(T, B)).seq).toBe(3);
+  raw.run("DELETE FROM checkpoint_parts WHERE n = 2");                                // a part is gone: a bad checkpoint, skipped like one (no older: null)
+  expect(await store.getCheckpoint(T, B)).toBe(null);
+  await store.putCheckpoint(T, B, { seq: 2, small: true }, epoch);                   // an older, readable one is what a caller steps back to
+  expect(await store.getCheckpoint(T, B)).toEqual({ seq: 2, small: true });
+  raw.close(); await store.close();
+});
+
+test("#92 no back-compat: a pre-#92 file (the four older tables, with a board's entries in it) is an old-format store: refused, and left exactly as found (no blob table is added)", () => {
+  const path = join(tempDir(), "plenary.db");
+  const old = new Database(path, { create: true });
+  old.run("CREATE TABLE entries (tenant TEXT NOT NULL, board TEXT NOT NULL, seq INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq)) WITHOUT ROWID");
+  old.run("CREATE TABLE checkpoints (tenant TEXT NOT NULL, board TEXT NOT NULL, seq INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq)) WITHOUT ROWID");
+  old.run("CREATE TABLE checkpoint_parts (tenant TEXT NOT NULL, board TEXT NOT NULL, seq INTEGER NOT NULL, wid TEXT NOT NULL, n INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq, wid, n))");
+  old.run("CREATE TABLE leases (tenant TEXT NOT NULL, board TEXT NOT NULL, epoch INTEGER NOT NULL, holder TEXT, expires_at INTEGER, PRIMARY KEY (tenant, board)) WITHOUT ROWID");
+  old.run("INSERT INTO entries (tenant, board, seq, data) VALUES (?, ?, 1, ?)", [T, B, JSON.stringify(entry(1))]);
+  old.close();
+  let err;
+  try { sqliteStore({ path }); } catch (e) { err = e; }
+  expect(err?.code).toBe("old-format");
+  expect(err.message).toMatch(/blob_refs/);
+  const after = new Database(path, { readonly: true });
+  expect(after.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all().map(r => r.name)).toEqual(["checkpoint_parts", "checkpoints", "entries", "leases"]);
+  expect(after.query("SELECT count(*) AS c FROM entries").get().c).toBe(1);
+  after.close();
+});
+
+test("#92 indexes: the purge and the prune each have one (by board, by expiry)", () => {
+  const path = join(tempDir(), "plenary.db");
+  sqliteStore({ path }).close();
+  const raw = new Database(path, { readonly: true });
+  expect(raw.query("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'blob_%' ORDER BY name").all().map(r => r.name)).toEqual(["blob_pending_board", "blob_pending_until", "blob_refs_board"]);
+  raw.close();
+});
+
+test("#92 no backfill: a blob table with other columns than this version's is an old-format store (refused, left as found); a file with none of them just gets them", () => {
+  for (const table of ["blob_refs", "blob_pending", "blob_condemned"]) {
+    const path = join(tempDir(), "plenary.db");
+    const old = new Database(path, { create: true });
+    old.run(`CREATE TABLE ${table} (tenant TEXT NOT NULL, sha1 TEXT NOT NULL)`);
+    old.close();
+    let err;
+    try { sqliteStore({ path }); } catch (e) { err = e; }
+    expect(err?.code).toBe("old-format");
+    expect(err.message).toContain(table);
+  }
+  const fresh = sqliteStore({ path: join(tempDir(), "plenary.db") });
+  return fresh.blobPrune(1).then(n => { expect(n).toBe(0); return fresh.close(); });
 });

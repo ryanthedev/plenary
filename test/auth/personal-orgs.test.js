@@ -37,20 +37,28 @@ const ADAPTERS = [
 
 test("SQLite migration: existing reg_tenants without `name` column upgrades safely and preserves rows", async () => {
   const path = join(dir, "legacy.db");
-  const db = new Database(path, { create: true });
+  // Seed a full schema DB, then downgrade it to the pre-personal-orgs shape (no reg_tenants.name, no reg_tenant_members, no reg_audit).
+  const seed = sqliteRegistry({ path, fullfsync: false });
+  await seed.close();
+  const db = new Database(path);
+  db.run("PRAGMA foreign_keys=OFF");
+  db.run("DROP TABLE reg_tenant_members");
+  db.run("DROP TABLE reg_audit");
+  db.run("DROP TABLE reg_tenants");
   db.run("CREATE TABLE reg_tenants (id TEXT PRIMARY KEY, domain TEXT UNIQUE, created_at INTEGER NOT NULL)");
-  db.run("CREATE TABLE reg_tenant_admins (tenant TEXT NOT NULL REFERENCES reg_tenants(id), member TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (tenant, member))");
   db.run("INSERT INTO reg_tenants (id, domain, created_at) VALUES ('t-legacy000001', NULL, 1000)");
   db.run("INSERT INTO reg_tenants (id, domain, created_at) VALUES ('t-legacy000002', 'acme.com', 2000)");
+  db.run("INSERT INTO reg_tenant_meta (tenant, kind) VALUES ('t-legacy000001', 'personal')");
+  db.run("INSERT INTO reg_tenant_meta (tenant, kind) VALUES ('t-legacy000002', 'company')");
   db.run("INSERT INTO reg_tenant_admins (tenant, member, n) VALUES ('t-legacy000001', 'google:1', 1)");
   db.close();
 
   const reg = sqliteRegistry({ path, fullfsync: false });
   try {
     const t1 = await reg.tenant("t-legacy000001");
-    expect(t1).toEqual({ id: "t-legacy000001", name: "Personal Workspace", domain: null, admins: ["google:1"], createdAt: 1000 });
+    expect(t1).toMatchObject({ id: "t-legacy000001", name: "Personal Workspace", domain: null, admins: ["google:1"], createdAt: 1000 });
     const t2 = await reg.tenant("t-legacy000002");
-    expect(t2).toEqual({ id: "t-legacy000002", name: "acme.com", domain: "acme.com", admins: [], createdAt: 2000 });
+    expect(t2).toMatchObject({ id: "t-legacy000002", name: "acme.com", domain: "acme.com", admins: [], createdAt: 2000 });
 
     await reg.addTenantMember(t1.id, "Friend@Gmail.com");
     expect(await reg.tenantMembers(t1.id)).toEqual(["friend@gmail.com"]);
@@ -70,7 +78,8 @@ test("tenancy: resolve vs resolveMany 100% parity for email org members, unverif
   const cache = roleCache({ registry: reg, now, ttlMs: 30_000 });
 
   const org = await reg.createTenant({ name: "Studio", domain: null, admins: ["google:owner", "email:owner@gmail.com"] });
-  const board = await reg.createBoard({ tenant: org.id, title: "Roadmap", memberRole: "editor" });
+  const space = await reg.createSpace({ tenant: org.id, name: "Studio", generalRole: null });
+  const board = await reg.createBoard({ tenant: org.id, space: space.id, title: "Roadmap", memberRole: "editor" });
   await reg.setGrant(board.id, "google:owner", "owner");
   await reg.addTenantMember(org.id, "member@gmail.com");
 

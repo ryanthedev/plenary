@@ -8,7 +8,7 @@ import { postgresStore } from "../../server/store/postgres.js";
 import { natsBus, subjects } from "../../server/bus/nats.js";
 import { PROTOCOL_VERSION } from "../../packages/protocol/envelope.js";
 import { makeElement } from "../../packages/core/model.js";
-import { sleep, until } from "./helpers.js";
+import { sleep, until, spawnTracked } from "./helpers.js";
 
 const T = "t-aaa", B = "b-one", url = process.env.DATABASE_URL, nurl = process.env.NATS_URL;
 const CHILD = new URL("./room-host-child.js", import.meta.url).pathname;
@@ -19,7 +19,7 @@ afterAll(async () => {
   const a = new SQL({ url, max: 1 });
   for (const s of schemas) await a.unsafe(`DROP SCHEMA IF EXISTS "${s}" CASCADE`);
   await a.close();
-});
+}, 30_000);   // DROP SCHEMA per test schema on real Postgres; failure-only ceiling for a loaded machine (TECH-DEBT row 36)
 
 function gw(bus, id) {
   const got = [], n = new Map();
@@ -32,32 +32,36 @@ function gw(bus, id) {
     answer: c => got.find(m => m.conn === c && (m.msg?.t === "welcome" || m.close)),
   };
 }
-async function child(holder, ttl, schema) {
-  const p = Bun.spawn(["bun", CHILD, holder, String(ttl), schema], { stdout: "pipe", stderr: "inherit", env: process.env });
+async function child(holder, ttl, schema, gatewayId) {
+  const p = spawnTracked(["bun", CHILD, holder, String(ttl), schema, ...(gatewayId ? [gatewayId] : [])], { stdout: "pipe", stderr: "pipe", env: process.env });
+  // The child's log lines (stderr) are echoed and kept, so a test can wait for one as a barrier.
+  const errLines = [];
+  (async () => { let buf = ""; for await (const chunk of p.stderr) { const t = new TextDecoder().decode(chunk); process.stderr.write(t); buf += t; const parts = buf.split("\n"); buf = parts.pop(); errLines.push(...parts); } })().catch(() => {});
   const reader = p.stdout.getReader(); let out = "";
   while (!/OPEN/.test(out)) { const { value, done } = await reader.read(); if (done) break; out += new TextDecoder().decode(value); }
-  return { p, epoch: Number(out.match(/OPEN (\d+)/)?.[1]) };
+  return { p, errLines, epoch: Number(out.match(/OPEN (\d+)/)?.[1]) };
 }
 
 for (const how of ["kill -9", "SIGSTOP"]) test.skipIf(!url || !nurl)(`a real holder process on Postgres + NATS: ${how}`, async () => {
   const schema = `pl_test_hostproc_${process.pid}_${how === "kill -9" ? "k" : "s"}_${Date.now().toString(36)}`; schemas.push(schema);
-  const ttl = 2_000;
-  const { p, epoch: eA } = await child("h-child", ttl, schema);
-  const store = await postgresStore({ url, schema, max: 3 }), bus = await natsBus({ url: nurl });
-  const Bh = roomHost({ store, bus, holder: "h-b", leaseTtlMs: ttl, heartbeatMs: 200 });
-  const g = gw(bus, `g-${how === "kill -9" ? "k" : "s"}${process.pid}`);
+  const ttl = 3_000;   // the child tolerates a 2 s event-loop stall (its host drops the room after 2/3 of the ttl)
+  const gwId = `g-${how === "kill -9" ? "k" : "s"}${process.pid}`;
+  const { p, errLines, epoch: eA } = await child("h-child", ttl, schema, gwId);
+  const store = await postgresStore({ url, schema, max: 3 }), bus = await natsBus({ url: nurl, cluster: null });
+  const Bh = roomHost({ store, bus, holder: "h-b", leaseTtlMs: 30_000, heartbeatMs: 200 });   // only the child ttl sets the takeover wait; the long one keeps B room alive through an event-loop stall
+  const g = gw(bus, gwId);
   try {
     g.hello("c1", "a"); await until(() => g.answer("c1")?.msg?.t === "welcome", "welcome from the child", 5000);
     for (let k = 1; k <= 5; k++) { g.op("c1", "a", k); await until(() => g.got.some(m => m.msg?.t === "ack" && m.msg.id === `a:${k}`), `ack ${k}`, 5000); }
     await Bh.open(T, B); expect(Bh.stats().waiting).toBe(1);
     const t0 = performance.now();
     if (how === "kill -9") p.kill(9); else process.kill(p.pid, "SIGSTOP");
-    g.hello("c2", "a");                                                      // a hello in the window: answered within ttl + 3 s
-    await until(() => g.answer("c2"), "c2 answered", ttl + 3_000);
+    g.hello("c2", "a");                                                      // a hello in the window: answered (backstop ttl + 30 s)
+    await until(() => g.answer("c2"), "c2 answered", ttl + 30_000);
     let w = null;
-    for (let i = 3; !w && performance.now() - t0 < ttl + 3_000; i++) {
+    for (let i = 3; !w && performance.now() - t0 < ttl + 30_000; i++) {
       await Bh.open(T, B); g.hello(`c${i}`, "a");
-      await until(() => g.answer(`c${i}`), "answer", ttl + 3_000).catch(() => {});
+      await until(() => g.answer(`c${i}`), "answer", ttl + 30_000).catch(() => {});
       const a = g.answer(`c${i}`); if (a?.msg?.t === "welcome") w = { conn: `c${i}`, ...a }; else await sleep(100);
     }
     expect(w).not.toBe(null);
@@ -69,17 +73,22 @@ for (const how of ["kill -9", "SIGSTOP"]) test.skipIf(!url || !nurl)(`a real hol
       await until(() => g.got.some(m => m.msg?.id === "a:6") && g.got.some(m => m.msg?.id === "x:1"), "x:1 and a:6 acked", 5000);
       const seen = g.got.length;
       process.kill(p.pid, "SIGCONT");
-      await sleep(2_000);
-      // Nothing from the woken host reaches the new holder's connections: no welcome, no ack, no 1013.
-      expect(g.got.slice(seen).filter(m => m.conn === "x1" || m.conn === w.conn)).toEqual([]);
+      // Barrier, not a delay: the woken host finds its deadline gone and stops the room (it logs that); two macrotask turns later it publishes a sentinel on
+      // this gateway's subject over its own connection, so anything it sent to this gateway before then is already in `got` (same publisher, in order).
+      await until(() => errLines.some(l => /room stopped: lease lost/.test(l)), "the woken host to stop its room", 15_000);
+      await until(() => g.got.some(m => m.conn === "__sentinel"), "the woken host's sentinel on its own connection", 15_000);
+      g.op(w.conn, "a", 7);
+      await until(() => g.got.slice(seen).some(m => m.msg?.t === "ack" && m.msg.id === "a:7"), "the sentinel ack from the new holder", 10_000);
+      // Nothing from the woken host reaches the new holder's connections: no welcome, no 1013 (the only acks are B's own: a:7).
+      expect(g.got.slice(seen).filter(m => (m.conn === "x1" || m.conn === w.conn) && !(m.msg?.t === "ack" && m.msg.id === "a:7"))).toEqual([]);
       expect(g.of("x1").filter(m => m.msg?.t === "welcome").length).toBe(1);
       expect(g.of(w.conn).filter(m => m.msg?.t === "welcome").length).toBe(1);
       expect((await Bh.peek(T, B))?.conns).toBe(2);
       const full = await store.read(T, B, 1, 100);
-      expect(full.map(e => e.id)).toEqual(["a:1", "a:2", "a:3", "a:4", "a:5", "x:1", "a:6"]);
+      expect(full.map(e => e.id)).toEqual(["a:1", "a:2", "a:3", "a:4", "a:5", "x:1", "a:6", "a:7"]);
       expect(await store.lease(T, B)).toMatchObject({ holder: "h-b", live: true });
     }
     const log = await store.read(T, B, 1, 100);
     for (let k = 1; k <= 5; k++) expect(log.filter(e => e.id === `a:${k}`).length).toBe(1);
   } finally { try { p.kill(9); } catch { /* gone */ } await Bh.close(); await bus.close(); await store.close(); }
-}, 40_000);
+}, 90_000);

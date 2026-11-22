@@ -19,8 +19,8 @@ async function refused(r, name, extra) {
   expect((await s.whenClosed()).code).toBe(1008);
   return s.msgs;
 }
-/** The latest `viewers` an observer has been told; waits until it equals `n`, then holds it for `holdMs`. */
-async function viewersSettle(obs, n, holdMs = 250) {
+/** The latest `viewers` an observer has been told; waits until it equals `n`, then holds it for `holdMs` (five of the 20 ms `here` intervals: a late spurious change would show). */
+async function viewersSettle(obs, n, holdMs = 100) {
   const last = () => obs.msgs.filter(m => m.t === "here").at(-1)?.viewers;
   const until = Date.now() + 10_000;
   while (last() !== n) { if (Date.now() > until) throw new Error(`viewers stayed ${last()}, wanted ${n}`); await sleep(10); }

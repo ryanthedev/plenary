@@ -162,22 +162,21 @@ test("live E2E: welcome.snapshot + tail-only WS catch-up + HTTP snapshot fetch (
     const auth = authPort({ sessions: sess, dev, tenancy });
 
     const tenant = await registry.createTenant({ domain: null });
-    const board = await registry.createBoard({ tenant: tenant.id, title: "big", memberRole: null });
+    const space = await registry.createSpace({ tenant: tenant.id, name: "Snap", generalRole: null });
+    const board = await registry.createBoard({ tenant: tenant.id, space: space.id, title: "big", memberRole: null });
     await registry.setGrant(board.id, "dev:ed", "editor");
     await registry.setGrant(board.id, "dev:vw", "viewer");
 
     // Seed 3 entries, save a checkpoint at seq 2, and leave seq 3 in the tail.
     const epoch = await store.openEpoch(tenant.id, board.id);
-    const room = new Room({ board: board.id, tenant: tenant.id, log: { append: () => {} }, epoch });
     const entries = [1, 2, 3].map(i => ({
       seq: i, board: board.id, tenant: tenant.id, stream: "board",
       op: { elements: [{ id: `el-${i}`, type: "rectangle", version: 1, versionNonce: i, x: i * 10, y: 0, width: 50, height: 50, payload: "x".repeat(200) }] },
       by: "dev:ed", id: `seed:${i}`, at: 1000 + i, rv: 1,
     }));
     await store.append(tenant.id, board.id, entries.slice(0, 2), 0, epoch);
-    for (const e of entries.slice(0, 2)) room.applyEntry(e);
-    room.seq = 2; room.resolved = 2; room.last = { id: "seed:2", by: "dev:ed", at: 1002 };
-    await store.putCheckpoint(tenant.id, board.id, room.fold(), epoch);
+    const room = Room.rebuild({ board: board.id, tenant: tenant.id, log: { append: () => {}, putCheckpoint: () => {} }, epoch, checkpoint: null, entries: entries.slice(0, 2) });
+    await store.putCheckpoint(tenant.id, board.id, room.checkpoint(), epoch);
     await store.append(tenant.id, board.id, [entries[2]], 2, epoch);
 
     const snapshotTickets = {

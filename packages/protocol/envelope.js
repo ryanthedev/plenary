@@ -57,10 +57,24 @@ export const IDLE_TIMEOUT_MS = 25_000;   // rule 12: a live caught-up client wit
 export const CONN_SILENCE_MS = 30_000;   // § Pacing: and closes one it heard nothing from (no frame, no pong) this long
 export const GATEWAY_SILENCE_MS = 30_000; // rule 6: a gateway not heard from this long has lost its connections
 export const MAX_NAME_CHARS = 200;
-export const CHECKPOINT_EVERY = 1000;    // § Recovery, "When"
+/** The op-id table's key: a client id holds no colon, so this can't collide. */
+export const keyOf = (user, client) => `${client}:${user}`;
+export const CHECKPOINT_EVERY = 1000;    // § Recovery, "When": entries since the last checkpoint
+export const CHECKPOINT_BYTES = 64 * 1024; // § Recovery, "When": op bytes since the last checkpoint (the join tail)
+export const CHECKPOINT_STATE_RATIO = 4;   // § Recovery, "When": and not before that tail is 1/4 of the state's size (a rewrite costs at most ~4x the log)
+
+/** How long a pending blob reference protects an upload (§ Blobs, "References and purge"): its signed URL lives 5 minutes, and the op that references it follows. A client re-offers a picture it has not put or fetched for this long when it sends an op that places it. */
+export const BLOB_PENDING_MS = 10 * 60_000;
 
 /** A blob's key and an image's `fileId`: a SHA-1 as exactly 40 lowercase hex characters (§ Blobs). */
 export const isSha1 = v => typeof v === "string" && /^[0-9a-f]{40}$/.test(v);
+
+/** The distinct blob hashes the image and video elements of these entries' ops name (§ Blobs, "References and purge"): deleted elements count (an undo brings them back). */
+export function blobRefsOf(entries) {
+  const out = new Set();
+  for (const e of entries) for (const el of e?.op?.elements ?? []) if ((el?.type === "image" || el?.type === "video") && isSha1(el.fileId)) out.add(el.fileId);
+  return [...out];
+}
 
 /** `client:counter` → { client, counter }, or null. The counter is a positive safe integer in plain digits. */
 export function parseOpId(id) {

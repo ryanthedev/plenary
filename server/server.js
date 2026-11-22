@@ -5,192 +5,74 @@
 //   gateway only    no room host, so no lease is ever taken here: the gateway's rooms.open() asks the cluster's
 //                   hosts over the bus (room-host.js remoteRooms; PROTOCOL.md § Bus). Needs a host node somewhere.
 //   GET /health   200 + small JSON
-//   GET /metrics  200 + Prometheus text exposition (uptime, memory, rooms, and gateway counters/gauges)
 //   GET /ws       the WebSocket (the token goes in the first message, never in a header or the URL)
 // Everything else goes to `http` (the platform track's routes: POST /boards, sign-in), then to the web app (static.js:
 // GET/HEAD of the page and its module graph, an allowlist built at start-up), else 404.
+//   GET /metrics  Prometheus text, on every role, only with `metricsEndpoint` (a bearer token) and else a 404 (metrics-http.js; PROTOCOL.md § Metrics)
+//   GET|PUT /blobs/<token>   signed blob URLs (blob-http.js); only when `blobs` is given. Without it the gateway
+//                            answers a socket's `blob` request `unavailable`.
 
 import { gateway as makeGateway } from "./gateway.js";
 import { roomHost, serveOpens, remoteRooms } from "./room-host.js";
 import { quietLogger } from "./log.js";
 import { staticSite } from "./static.js";
-import { MAX_VIDEO_BLOB_BYTES, BLOB_MIME, blobKind, parseByteRange } from "./blobs/port.js";
-import { isId, isSha1, PortError } from "./ids.js";
+import { blobAccess } from "./blob-access.js";
+import { blobRoutes } from "./blob-http.js";
+import { metricsRoute } from "./metrics-http.js";
+import { noopMetrics } from "./metrics/port.js";
 
 const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
-
-/** Read a Request body up to `maxBytes` without buffering past the cap. Returns null if the body exceeds `maxBytes`. */
-async function readBoundedBody(req, maxBytes) {
-  if (!req.body) return new Uint8Array(0);
-  const reader = req.body.getReader();
-  const chunks = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
-      total += chunk.byteLength;
-      if (total > maxBytes) { await reader.cancel().catch(() => {}); return null; }
-      chunks.push(chunk);
-    }
-  } finally { reader.releaseLock(); }
-  if (chunks.length === 1) return chunks[0];
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
-  return out;
-}
-
-/** Prometheus text exposition (0.0.4) of process, room-host, and gateway metrics (M2 Phase 8). */
-export function formatMetrics({ uptimeMs, rooms, gateway, memory = process.memoryUsage() }) {
-  const L = [];
-  const add = (name, type, help, value) => {
-    if (!Number.isFinite(value)) return;
-    L.push(`# HELP ${name} ${help}`, `# TYPE ${name} ${type}`, `${name} ${value}`);
-  };
-  add("plenary_up", "gauge", "1 while the Plenary server process is running.", 1);
-  add("plenary_uptime_seconds", "gauge", "Process uptime in seconds.", Math.round(uptimeMs / 100) / 10);
-  add("plenary_process_rss_bytes", "gauge", "Resident set size in bytes.", memory.rss);
-  add("plenary_process_heap_used_bytes", "gauge", "JS heap used in bytes.", memory.heapUsed);
-  add("plenary_rooms", "gauge", "Board rooms currently held by this host.", rooms?.rooms ?? 0);
-  add("plenary_rooms_waiting", "gauge", "Boards watched for failover by this host.", rooms?.waiting ?? 0);
-  if (gateway) {
-    add("plenary_gateway_connections", "gauge", "Open WebSocket connections on this gateway.", gateway.conns);
-    add("plenary_gateway_users", "gauge", "Distinct users connected to this gateway.", gateway.users);
-    add("plenary_gateway_boards", "gauge", "Active boards served by this gateway.", gateway.boards);
-    add("plenary_gateway_waiting_joiners", "gauge", "Joiners currently waiting for outbound budget.", gateway.waitingJoiners);
-    add("plenary_gateway_owed_bytes", "gauge", "Outbound bytes buffered in sockets and per-connection queues.", gateway.owedBytes);
-    add("plenary_gateway_queued_bytes", "gauge", "Inbound frame bytes queued waiting to be processed.", gateway.queuedBytes);
-    add("plenary_gateway_shared_bytes", "gauge", "Distinct shared catch-up bytes referenced by queues.", gateway.sharedBytes);
-    add("plenary_gateway_accepted_total", "counter", "Total hellos accepted by this gateway.", gateway.accepted);
-    add("plenary_gateway_refused_auth_total", "counter", "Total hellos refused for auth.", gateway.refusedAuth);
-    add("plenary_gateway_bad_frames_total", "counter", "Total bad frames received.", gateway.badFrames);
-    add("plenary_gateway_cut_total", "counter", "Total connections cut for stalls or budget limits.", gateway.cut);
-    add("plenary_gateway_turned_away_total", "counter", "Total joiners turned away for budget limits.", gateway.turnedAway);
-  }
-  return L.join("\n") + "\n";
-}
 
 /**
  * @param {{
  *   auth: object, registry: object, store: object, bus: object, blobs?: object, log?: object,
  *   port?: number, hostname?: string,
  *   http?: (req: Request, url: URL) => Response | undefined | Promise<Response | undefined>,
+ *   blobKey?: Uint8Array, quotaBytes?: number, publicUrl?: string, maxBlobPuts?: number, blobHttp?: object, idleTimeoutSec?: number,   // blobHttp: more blobRoutes options (maxPutsPerUser, bodyDeadlineMs, timers). blobs: ≥ 32-byte signing key (default: random per process), tenant quota, the origin signed URLs name (default none: a path)
+ *   metrics?: object, metricsEndpoint?: { token: string, render: () => string },   // metrics: the Metrics port given to the gateway and the room host (default: records nothing); metricsEndpoint: turns /metrics on
  *   limits?: object, host?: object, static?: false | { mounts?: { url: string, dir: string }[] },
- *   roles?: { gateway: boolean, host: boolean }, node?: string,
+ *   roles?: { gateway: boolean, host: boolean }, node?: string, now?: () => number, timers?: object,
+ *   deflate?: (data: string | Uint8Array) => Promise<Uint8Array | null>,   // compresses a shared catch-up text once, for clients that ask (PROTOCOL.md § Joining); absent: everyone gets plain text
  * }} o — `port: 0` picks a free port. `host` options go to the room host (tests; main.js passes hostname and
  *   leaseTtlMs). `static: false` serves no web app; an object passes its `mounts` to staticSite (default: the repo's
  *   web/ and packages/, from static.js's own path). `roles`: see the header (default both). `node`: this node's id
- *   (names a gateway-only node's open requests).
+ *   (names a gateway-only node's open requests). `onWelcomed(user, board)`: told when a connection is welcomed (Recent). `now`, `timers`: the gateway's clock and timers; tests inject virtual ones (default Date.now and the globals).
  */
-export function createServer({ auth, registry, store, bus, blobs = null, log = quietLogger, port = 0, hostname = "127.0.0.1", http, limits, host = {}, static: web = {},
-  roles = { gateway: true, host: true }, node = "node", snapshotTickets = null, blobTickets = null }) {
+export function createServer({ auth, registry, store, bus, blobs = null, log = quietLogger, port = 0, hostname = "127.0.0.1", http, limits, metrics = noopMetrics, metricsEndpoint, host = {}, static: web = {},
+  roles = { gateway: true, host: true }, node = "node", now, timers, deflate, blobKey, quotaBytes, blobUsageTtlMs, publicUrl, maxBlobPuts, blobHttp: blobHttpOpts, onWelcomed, idleTimeoutSec = 30, snapshotTickets = null }) {
   if (!roles || (!roles.gateway && !roles.host)) throw new TypeError("createServer needs at least one role (gateway, host)");
   const started = Date.now();
+  const badRequest = badRequestLimiter();
   const site = web === false || !roles.gateway ? null : staticSite({ log, ...web });
   const rooms = roles.host
-    ? roomHost({ store, bus, log, ...host })
+    ? roomHost({ store, bus, log, metrics, ...host })
     : remoteRooms({ bus, node, timeoutMs: host.leaseTtlMs ?? 10_000, log });
   const unserve = roles.host ? serveOpens({ bus, rooms, log }) : () => {};
-  const gw = roles.gateway ? makeGateway({ auth, registry, store, bus, rooms, log, limits, snapshotTickets, blobTickets }) : null;
+  const origin = publicUrl?.replace(/\/+$/, "") ?? "";   // "": signed URLs are the path /blobs/<token>, which the client resolves against the origin it connected to
+  const access = blobs && roles.gateway ? blobAccess({ blobs, key: blobKey ?? crypto.getRandomValues(new Uint8Array(32)), origin, log, ...(now ? { now } : {}), ...(quotaBytes !== undefined ? { quotaBytes } : {}), ...(blobUsageTtlMs ? { usageTtlMs: blobUsageTtlMs } : {}) }) : null;
+  const blobHttp = access ? blobRoutes({ access, ...(maxBlobPuts ? { maxPuts: maxBlobPuts } : {}), ...(blobHttpOpts ?? {}) }) : null;
+  const gw = roles.gateway ? makeGateway({ auth, registry, store, bus, rooms, log, limits, metrics, snapshotTickets, ...(deflate ? { deflate } : {}), ...(access ? { blobUrl: access.url } : {}), ...(now ? { now } : {}), ...(timers ? { timers } : {}), ...(onWelcomed ? { onWelcomed } : {}) }) : null;
 
-  /** HTTP `/blobs/:tenant/:sha1?ticket=...` (PROTOCOL.md § Blobs): PUT, GET, HEAD backed by the Blobs port. */
-  async function handleBlob(req, url) {
-    const m = /^\/blobs\/([^/]+)\/([^/]+)$/.exec(url.pathname);
-    if (!m) return json(404, { error: "not-found" });
-    let tenant;
-    try { tenant = decodeURIComponent(m[1]); } catch { return json(400, { error: "bad-request" }); }
-    const sha1 = m[2];
-    if (!isId(tenant) || !isSha1(sha1)) return json(400, { error: "bad-request" });
-    if (req.method !== "PUT" && req.method !== "GET" && req.method !== "HEAD") {
-      return new Response(JSON.stringify({ error: "method-not-allowed" }), {
-        status: 405,
-        headers: { "content-type": "application/json", "cache-control": "no-store", allow: "GET, HEAD, PUT" },
-      });
-    }
-    if (!blobs || !blobTickets) return json(503, { error: "blobs-unavailable" });
-    const ticket = url.searchParams.get("ticket");
-    if (!ticket) return json(401, { error: "auth" });
-    const claims = await blobTickets.verify(ticket);
-    if (!claims) return json(401, { error: "auth" });
-    const wantVerb = req.method === "PUT" ? "put" : "get";
-    if (claims.verb !== wantVerb || claims.tenant !== tenant || claims.sha1 !== sha1) return json(403, { error: "forbidden" });
-
-    if (req.method === "PUT") {
-      const cl = req.headers.get("content-length");
-      if (cl !== null && Number(cl) > MAX_VIDEO_BLOB_BYTES) return json(413, { error: "too-large" });
-      const bytes = await readBoundedBody(req, MAX_VIDEO_BLOB_BYTES);
-      if (bytes === null) return json(413, { error: "too-large" });
-      try {
-        await blobs.put(tenant, sha1, bytes);
-      } catch (err) {
-        if (err instanceof PortError) {
-          if (err.code === "too-large") return json(413, { error: "too-large", message: err.message });
-          if (err.code === "bad-id" || err.code === "bad-entry" || err.code === "hash-mismatch" || err.code === "not-image") {
-            return json(400, { error: err.code, message: err.message });
-          }
-        }
-        throw err;
-      }
-      return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
-    }
-
-    const bytes = await blobs.get(tenant, sha1);
-    if (!bytes) return json(404, { error: "not-found" });
-    const mime = BLOB_MIME[blobKind(bytes)] ?? "application/octet-stream";
-    const commonHeaders = {
-      "accept-ranges": "bytes",
-      "x-content-type-options": "nosniff",
-      "cache-control": "private, max-age=31536000, immutable",
-    };
-    const parsedRange = req.method === "GET" ? parseByteRange(req.headers.get("range"), bytes.byteLength) : null;
-    if (parsedRange) {
-      if (parsedRange.unsatisfiable) {
-        return new Response(null, {
-          status: 416,
-          headers: { ...commonHeaders, "content-range": `bytes */${bytes.byteLength}` },
-        });
-      }
-      const { start, end } = parsedRange;
-      const slice = bytes.subarray(start, end + 1);
-      return new Response(slice, {
-        status: 206,
-        headers: {
-          ...commonHeaders,
-          "content-type": mime,
-          "content-length": String(slice.byteLength),
-          "content-range": `bytes ${start}-${end}/${bytes.byteLength}`,
-        },
-      });
-    }
-    return new Response(req.method === "HEAD" ? null : bytes, {
-      status: 200,
-      headers: {
-        ...commonHeaders,
-        "content-type": mime,
-        "content-length": String(bytes.byteLength),
-      },
-    });
-  }
-
+  const metricsHttp = metricsRoute({ ...metricsEndpoint, log });
   const server = Bun.serve({
     port, hostname,
+    // Bun's default is 10 s without a byte either way, which would cut a slow upload of a 10 MB picture mid-body (WebSockets have their
+    // own timeout, the gateway's). Set, not inherited.
+    idleTimeout: idleTimeoutSec,
     async fetch(req, srv) {
       try {
-        const url = new URL(req.url);
+        let url;
+        try { url = new URL(req.url); }
+        catch { badRequest(log); return json(400, { error: "bad-request" }); }   // a malformed Host header: no stack, a short line at most
         if (url.pathname === "/health" && (req.method === "GET" || req.method === "HEAD"))
-          return json(200, { ok: true, uptimeMs: Date.now() - started, roles: { gateway: !!gw, host: !!roles.host }, gateway: gw ? gw.stats() : null, ...rooms.stats() });
-        if (url.pathname === "/metrics" && (req.method === "GET" || req.method === "HEAD")) {
-          const text = formatMetrics({ uptimeMs: Date.now() - started, rooms: rooms.stats(), gateway: gw ? gw.stats() : null });
-          return new Response(req.method === "HEAD" ? null : text, { status: 200, headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8", "cache-control": "no-store" } });
-        }
-        if (!gw) return json(404, { error: "not-found" });   // host only: nothing but /health and /metrics
+          return json(200, { ok: true, uptimeMs: Date.now() - started, roles: { gateway: !!gw, host: !!roles.host }, gateway: gw ? gw.stats() : null, ...(http?.stats ? { http: http.stats() } : {}), ...rooms.stats() });
+        if (url.pathname === "/metrics") return await metricsHttp.handle(req);   // before the host-only 404: a host node is the one with the leases
+        if (!gw) return json(404, { error: "not-found" });   // host only: nothing but /health
         if (url.pathname === "/ws") {
-          if (srv.upgrade(req, { data: {} })) return undefined;
+          if (srv.upgrade(req, { data: { z: url.searchParams.get("z") === "deflate" } })) return undefined;   // § Joining: the client can inflate catch-up
           return json(426, { error: "upgrade", message: "this is a WebSocket endpoint" });
         }
-        if (url.pathname.startsWith("/blobs/")) return await handleBlob(req, url);
+        if (blobHttp) { const res = await blobHttp.handle(req, url); if (res) return res; }
         if (http) { const res = await http(req, url); if (res) return res; }
         if (site) { const res = await site.handle(req, url); if (res) return res; }
         return json(404, { error: "not-found" });
@@ -210,7 +92,14 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
     url: `http://${hostname}:${server.port}`,
     wsUrl: `ws://${hostname}:${server.port}/ws`,
     gateway: gw, rooms, blobs, site,
+    /** The blob reaper's hook (PROTOCOL.md § Blobs, "Quota"): drops a tenant's cached usage after deletes. A no-op on a node with no blob access. */
+    recountBlobs: tenant => access?.recount(tenant),
     /** Stop taking connections, close sockets, stop rooms. Does not close the store or the bus (the caller's). */
     async stop() { unserve(); if (gw) await gw.close(); await server.stop(true); await rooms.close(); log.info("server stopped", { port: server.port }); },
   };
 }
+
+// A malformed Host header (empty, bare ::1, userinfo, port > 65535, HTTP/1.0 without Host) is the client's mistake:
+// answer 400 and log one short debug line per second at most, so a client cannot flood the log.
+/** One limiter per server: the returned function logs the line at most once a second. */
+const badRequestLimiter = () => { let last = 0; return log => { const t = Date.now(); if (t - last >= 1000) { last = t; log.debug("bad request: the URL (Host header) did not parse"); } }; };

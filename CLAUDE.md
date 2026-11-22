@@ -4,14 +4,13 @@ A live infinite canvas for enterprise all-hands: a few presenters draw, thousand
 100k+ watch live, in several regions, smooth as butter. Open source. Grown out of herdr-draw
 (github.com/ryanthedev/herdr-draw), whose core it shares.
 
-Name: **Plenary** (decided 2026-11-11). The person may add "Omni" (their LLC); `omniplenary` was free on
-GitHub, npm and .com on 2026-11-11. The name lives only here and in package.json until it is settled:
+Name: **Plenary** (decided 2026-11-11). The name lives only here and in package.json until it is settled:
 nothing is registered or published yet. Do not create GitHub repos, orgs, npm packages or domains unasked.
 
 ## Decisions (2026-11-11, from the design conversation and the design doc)
 
 - End goal = non-functional requirements, not the first build. Iterate milestone by milestone and adopt
-  infrastructure only when a measurement says so. Design doc: https://claude.ai/artifact/UGGaj27ZqojZmVSDUqz8Mu
+  infrastructure only when a measurement says so.
 - NFRs: per board a handful of editors, ~2k annotators, **100k live viewers (today's ceiling, confirmed)**;
   editors < 150 ms in the home region, viewers < 1 s worldwide; 60–120 fps client; 100k joins in 2 min;
   an acknowledged op is never lost; multi-region with a home region per tenant; enterprise SSO/SCIM/audit.
@@ -20,7 +19,7 @@ nothing is registered or published yet. Do not create GitHub repos, orgs, npm pa
 - Self-hosting means open source, not a one-process product.
 - The server never runs layout; clients do (as herdr-draw does).
 
-## Decisions (2026-11-11, M2 scope, from the person)
+## Decisions (2026-11-11, M2 scope, from the maintainer)
 
 - **M2 is a scale-ready product**, replacing "adopt infrastructure only when measured" for M2: one program,
   two roles (gateways hold sockets and fan out; room hosts sequence one board each, sharded by board, with a
@@ -29,9 +28,9 @@ nothing is registered or published yet. Do not create GitHub repos, orgs, npm pa
   never lost. Presence (cursors, laser, emotes) is never saved and may drop.
 - **Swappable adapters:** single-node = SQLite (`synchronous=FULL`), in-memory bus, local disk; cluster =
   **Postgres + NATS**, S3-compatible blobs. Logs go to the terminal (structured).
-- **Sign-in:** dev tokens, then Google (OIDC) with the OAuth client in the person's Omniping Google Cloud
+- **Sign-in:** dev tokens, then Google (OIDC) with the OAuth client in the maintainer's Google Cloud
   project; client id/secret from env only. **Tenant = Google Workspace domain; anyone else by invite or
-  share link.** Boards are created by an admin endpoint (`POST /boards`), never by a hello.
+  share link.** Boards are created by `POST /boards` (a Unit member, by `board.create` at a Space or in their personal space), never by a hello.
 - **Full canvas UI** over core's Editor (design mock approved before building) and **full collaboration**:
   annotations, cursors, avatars, selections, laser, draw, highlighter, emotes, reactions, comment threads,
   a connection status pill.

@@ -1,4 +1,4 @@
-// p4-wire2: the p4-wire verifier's findings (docs/m2/reports/p4-wirev.md), one block each.
+// p4-wire2: the p4-wire verifier's findings, one block each.
 //   M1 NATS credentials in NATS_URL reach the client as options; L1 redact()'s missing URL forms; L2 every log line
 //   after the start is redacted; L3 the sweep keeps `welcomed` equal to live welcomed conns; L4 a late `watching`
 //   resolves at the grace's end; L5 a stale publish rejection leaves a newer open alone; L6 node ids; L7 empty URLs.
@@ -13,12 +13,12 @@ import { roomHost, remoteRooms } from "../../server/room-host.js";
 import { sqliteStore } from "../../server/store/sqlite.js";
 import { sqliteRegistry } from "../../server/registry/sqlite.js";
 import { PROTOCOL_VERSION } from "../../packages/protocol/envelope.js";
-import { cleanup, tempDir, sleep, until, deferred } from "./helpers.js";
+import { cleanup, tempDir, sleep, until, deferred, spawnTracked } from "./helpers.js";
 
 afterAll(cleanup);
 
 const PW = "Hunter2-FAKE-pw", TOK = "Tok3n-FAKE-nats";
-const KEY = { COOKIE_KEY: "k".repeat(32) };
+const KEY = { COOKIE_KEY: "k".repeat(32), PLENARY_BLOBS: "local-disk" };   // a cluster start must name its picture storage (these tests start none)
 const PG = `postgres://plen:${PW}@127.0.0.1:1/plenary`;
 
 /** start(env) that must be refused; returns the error and the captured lines. */
@@ -57,7 +57,7 @@ const refusingConnect = seen => async opts => { seen.push(opts); const e = new E
 test("M1: natsBus hands the client user/pass (or token) as options, never inside `servers`", async () => {
   for (const [url, want] of [[`nats://plen:${PW}@127.0.0.1:1`, { user: "plen", pass: PW }], [`nats://${TOK}@127.0.0.1:1`, { token: TOK }]]) {
     const seen = [];
-    await expect(natsBus({ url, name: "n-1", connect: refusingConnect(seen) })).rejects.toThrow("Authorization Violation");
+    await expect(natsBus({ url, name: "n-1", cluster: null, connect: refusingConnect(seen) })).rejects.toThrow("Authorization Violation");
     expect(seen[0]).toMatchObject({ ...want, servers: ["nats://127.0.0.1:1"], name: "n-1" });
     leakFree([JSON.stringify(seen[0].servers)], [PW, TOK]);
   }
@@ -67,7 +67,7 @@ test("M1 through start(): the credentials reach the NATS client's options; the r
   for (const nats of [`nats://plen:${PW}@127.0.0.1:1`, `nats://${TOK}@127.0.0.1:1`]) {
     const seen = [];
     const adapters = {
-      postgresStore: async () => sqliteStore({ path: join(tempDir(), "p.db") }),
+      postgresStore: async () => ({ ...sqliteStore({ path: join(tempDir(), "p.db") }), clusterId: async () => "c-aaaaaaaaaaaaaaaa" }),
       postgresRegistry: async () => sqliteRegistry({ path: join(tempDir(), "r.db") }),
       natsBus: o => natsBus({ ...o, connect: refusingConnect(seen) }),
     };
@@ -86,7 +86,7 @@ async function authServer(auth) {
   const dir = tempDir("plenary-nats-auth-");
   const conf = join(dir, "nats.conf"), log = join(dir, "nats.log");
   writeFileSync(conf, `listen: "127.0.0.1:-1"\nmax_payload: 2MB\nauthorization { ${auth} }\n`);
-  const child = Bun.spawn([natsServer, "-c", conf, "-l", log], { stdout: "ignore", stderr: "ignore" });
+  const child = spawnTracked([natsServer, "-c", conf, "-l", log], { stdout: "ignore", stderr: "ignore" });
   let port;
   try {
     port = await until(async () => {
@@ -103,7 +103,7 @@ liveNats("M1 live: a NATS with user/password and one with a token both accept th
   ]) {
     const srv = await authServer(auth);
     try {
-      const bus = await natsBus({ url: good(srv.port), connectTimeoutMs: 2000 });
+      const bus = await natsBus({ url: good(srv.port), cluster: null, connectTimeoutMs: 2000 });
       const got = [];
       bus.subscribe("plen.t-a.b-1.entries", m => got.push(m));
       await bus.flush();
@@ -111,7 +111,7 @@ liveNats("M1 live: a NATS with user/password and one with a token both accept th
       await until(() => got.length === 1, "the message back");
       await bus.close();
       let err = null;
-      try { const b = await natsBus({ url: bad(srv.port), connectTimeoutMs: 2000 }); await b.close(); } catch (e) { err = e; }
+      try { const b = await natsBus({ url: bad(srv.port), cluster: null, connectTimeoutMs: 2000 }); await b.close(); } catch (e) { err = e; }
       expect(err).not.toBe(null);
       leakFree([String(err?.message), String(err?.stack)], [PW, TOK]);
     } finally { await srv.stop(); }
@@ -149,9 +149,9 @@ test("L1: whatever natsConnectOptions sends as pass or token, urlSecrets names (
 function leakyAdapters(state) {
   const leak = () => { const e = new Error(`acquire failed on ${PG} (${PW})`); e.code = `CODE_${PW}`; e.cause = new Error(`cause ${PW}`); return e; };
   return {
-    postgresStore: async () => { const s = sqliteStore({ path: join(tempDir(), "p.db") }); return { ...s, acquire: async () => { throw leak(); } }; },
+    postgresStore: async () => { const s = sqliteStore({ path: join(tempDir(), "p.db") }); return { ...s, clusterId: async () => "c-aaaaaaaaaaaaaaaa", acquire: async () => { throw leak(); } }; },
     postgresRegistry: async () => sqliteRegistry({ path: join(tempDir(), "r.db") }),
-    natsBus: async o => { state.onError = o.onError; state.bus = memoryBus({ onError: o.onError }); return state.bus; },
+    natsBus: async o => { state.onError = o.onError; state.bus = memoryBus({ onError: o.onError, cluster: o.cluster }); return state.bus; },
     leak,
   };
 }

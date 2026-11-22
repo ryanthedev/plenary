@@ -1,4 +1,4 @@
-// web/'s hexagonal boundary test (docs/m2/OFFICE.md "Architecture"; brief p6-hex). Client owns it; it reuses engine's
+// web/'s hexagonal boundary test. Client owns it; it reuses engine's
 // scanner (test/arch-scan.js, 44dd1aa: listFiles, importsOf, checkBoundaries) and never parses imports itself.
 //
 // Layers (web/):
@@ -376,7 +376,7 @@ describe("web/ architecture (hexagonal boundaries)", () => {
     expect(hits("function f() { const q = s.replace(/\\/\\//g, ''); return /a/.test(x) && fetch(u); }")).toEqual(["fetch"]);
     expect(hits("const h = a / b / 2; const w = (x) / y; setInterval(f);")).toEqual(["setInterval"]);   // division stays code
     expect(hits("const r = /Date.now() document/;")).toEqual([]);                                        // a regex body is not code
-    // p8-globals (changed expectation, listed in docs/m2/reports/p8-globals.md): a property key named like a global
+    // p8-globals (changed expectation): a property key named like a global
     // (`{ self: 1 }`) is no read of the global, and the parser knows it; HEAD's text scan flagged it. The shorthand
     // `{ self }` IS a read and is still caught.
     expect(hits("const o = { self: 1 };")).toEqual([]);

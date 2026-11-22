@@ -1,17 +1,19 @@
 // bootstrapTenant (server/admin/tenants.js) over every Registry adapter: memory, SQLite, Postgres (when
 // DATABASE_URL is set, a fresh schema per test as test/server/pg-registry.test.js does). Plus the email-named admin
 // match in server/admin/boards.js.
-import { describe, test, expect, afterAll } from "bun:test";
+import { describe, test, expect, afterAll, setDefaultTimeout } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SQL } from "bun";
 import { bootstrapTenant, normAdmin, normDomain, shown } from "../../server/admin/tenants.js";
-import { createBoard } from "../../server/admin/boards.js";
+import { isUnitAdmin } from "../../server/auth/resolver.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { sqliteRegistry } from "../../server/registry/sqlite.js";
 import { postgresRegistry } from "../../server/registry/postgres.js";
 
+// Failure-only ceiling: the Postgres adapter creates a schema per test, which bun's 5 s default fails under machine load (TECH-DEBT row 36).
+setDefaultTimeout(30_000);
 const dir = mkdtempSync(join(tmpdir(), "plenary-bootstrap-"));
 let n = 0;
 const url = process.env.DATABASE_URL;
@@ -158,7 +160,7 @@ test("normAdmin and normDomain errors never echo a raw control or format charact
   }
 });
 
-describe("an email-named admin is matched at sign-in (boards.js)", () => {
+describe("an email-named admin is matched at sign-in (resolver.js isUnitAdmin)", () => {
   const who = o => ({ user: "google:999", name: "Alice", email: "alice@acme.com", domain: "acme.com", ...o });
   const setup = async () => {
     const registry = memoryRegistry();
@@ -166,30 +168,27 @@ describe("an email-named admin is matched at sign-in (boards.js)", () => {
     return { registry, tenant };
   };
 
-  test("the vouched email in the tenant's domain may create a board, and becomes its owner by user id", async () => {
-    const { registry, tenant } = await setup();
-    const b = await createBoard({ caller: who(), tenant: tenant.id, title: "x" }, { registry });
-    expect(await registry.grant(b.id, "google:999")).toBe("owner");
+  test("the vouched email in the tenant's domain is an admin", async () => {
+    const { tenant } = await setup();
+    expect(isUnitAdmin(tenant, who())).toBe(true);
   });
 
-  test("no vouched email, another Workspace domain, or a guest with that address: forbidden", async () => {
-    const { registry, tenant } = await setup();
+  test("no vouched email, another Workspace domain, or a guest with that address: not an admin", async () => {
+    const { tenant } = await setup();
     for (const caller of [who({ email: null }), who({ domain: "globex.com" }), who({ domain: null }), who({ email: "bob@acme.com" })])
-      await expect(createBoard({ caller, tenant: tenant.id }, { registry })).rejects.toMatchObject({ code: "forbidden" });
+      expect(isUnitAdmin(tenant, caller)).toBe(false);
   });
 
   test("a dev token claiming the vouched-looking email and the tenant's domain never matches an email entry", async () => {
-    const { registry, tenant } = await setup();
-    const caller = { user: "dev:alice", name: "alice", email: "alice@acme.com", domain: "acme.com" };
-    await expect(createBoard({ caller, tenant: tenant.id }, { registry })).rejects.toMatchObject({ code: "forbidden" });
+    const { tenant } = await setup();
+    expect(isUnitAdmin(tenant, { user: "dev:alice", name: "alice", email: "alice@acme.com", domain: "acme.com" })).toBe(false);
   });
 
   test("an email entry never matches by user id, and a user-id admin still works", async () => {
     const registry = memoryRegistry();
-    // The tenant really holds email:alice@acme.com, so only the user-id guard stands between the caller and admin.
     const { tenant } = await bootstrapTenant({ registry, domain: "acme.com", admins: ["dev:ann", "alice@acme.com"] });
     expect(tenant.admins).toContain("email:alice@acme.com");
-    await createBoard({ caller: { user: "dev:ann", name: "ann", email: null, domain: null }, tenant: tenant.id }, { registry });
-    await expect(createBoard({ caller: { user: "email:alice@acme.com", name: null, email: null, domain: "acme.com" }, tenant: tenant.id }, { registry })).rejects.toMatchObject({ code: "forbidden" });
+    expect(isUnitAdmin(tenant, { user: "dev:ann", name: "ann", email: null, domain: null })).toBe(true);
+    expect(isUnitAdmin(tenant, { user: "email:alice@acme.com", name: null, email: null, domain: "acme.com" })).toBe(false);
   });
 });

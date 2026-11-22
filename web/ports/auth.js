@@ -1,10 +1,10 @@
-// Auth port: trade the single-use sign-in code from the post-login fragment for a session token
-// (docs/m2/contracts/auth-exchange.md: POST /auth/exchange). Imports nothing.
+// Auth port: trade the single-use sign-in code from the post-login fragment for a session token.
+// Imports nothing.
 // Contract test: test/web/contracts/auth-contract.js (authContract).
 //
 // Contract:
 //   exchange(code)  A Promise that ALWAYS resolves (never rejects) to exactly one of:
-//     { token, user, name, email, domain, exp }   signed in (auth-exchange.md "Field types"): token and user are
+//     { token, user, name, email, domain, exp }   signed in (PROTOCOL.md, "Sign-in code exchange"): token and user are
 //                                                  non-empty strings (user `google:<sub>` or `dev:<name>`); name,
 //                                                  email and domain are each a string or null (no name from Google;
 //                                                  email not authoritative; not a Workspace account); exp integer
@@ -13,7 +13,7 @@
 //     { error }                                    one of AUTH_ERRORS:
 //       "invalid-code"  unknown, expired (> 60 s), already used, or not this browser's (the server gives one answer
 //                       for all, so there is no oracle). Also any code that is not a non-empty string. Final:
-//                       the code is spent; send the person to sign in again.
+//                       the code is spent; send the user to sign in again.
 //       "bad-origin"    the request's Origin is not the post-login origin. Final (a deployment error).
 //       "unavailable"   the server said 503, or answered something that is not this shape. The code may still be
 //                       good for its 60 s, so ONE retry after a JITTERED wait (clock.random, e.g. 0.5–2 s) is

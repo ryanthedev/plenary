@@ -378,13 +378,13 @@ describe("F9 Live Gateway E2E (sync.js + wsNet against checkpointed createServer
     const dev = devAuth({ enabled: true, tokens: { ed: { name: "ed", role: "editor" }, vw: { name: "vw", role: "viewer" } } });
     const auth = authPort({ sessions: sess, dev, tenancy });
     const tenant = await registry.createTenant({ domain: null });
-    const board = await registry.createBoard({ tenant: tenant.id, title: "M3 Snap Board", memberRole: null });
+    const space = await registry.createSpace({ tenant: tenant.id, name: "Snap", generalRole: null });
+    const board = await registry.createBoard({ tenant: tenant.id, space: space.id, title: "M3 Snap Board", memberRole: null });
     await registry.setGrant(board.id, "dev:ed", "editor");
     await registry.setGrant(board.id, "dev:vw", "viewer");
 
     // Seed 3 entries: checkpoint at seq 2 + tail entry at seq 3
     const epoch = await store.openEpoch(tenant.id, board.id);
-    const room = new Room({ board: board.id, tenant: tenant.id, log: { append: () => {} }, epoch });
     const seedEls = [1, 2, 3].map(i => makeElement("rectangle", {
       id: `el-${i}`, x: i * 50, y: i * 20, width: 80, height: 40,
     }));
@@ -400,9 +400,8 @@ describe("F9 Live Gateway E2E (sync.js + wsNet against checkpointed createServer
       rv: 1,
     }));
     await store.append(tenant.id, board.id, entries.slice(0, 2), 0, epoch);
-    for (const e of entries.slice(0, 2)) room.applyEntry(e);
-    room.seq = 2; room.resolved = 2; room.last = { id: "seed:2", by: "dev:ed", at: 1001 };
-    await store.putCheckpoint(tenant.id, board.id, room.fold(), epoch);
+    const room = Room.rebuild({ board: board.id, tenant: tenant.id, log: { append: () => {}, putCheckpoint: () => {} }, epoch, checkpoint: null, entries: entries.slice(0, 2) });
+    await store.putCheckpoint(tenant.id, board.id, room.checkpoint(), epoch);
     await store.append(tenant.id, board.id, [entries[2]], 2, epoch);
 
     const snapshotTickets = {

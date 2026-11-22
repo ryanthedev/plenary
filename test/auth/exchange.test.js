@@ -1,4 +1,4 @@
-// Sign-in code exchange (brief p5-code; docs/m2/contracts/auth-exchange.md): the callback puts a one-time code in the
+// Sign-in code exchange (brief p5-code): the callback puts a one-time code in the
 // URL fragment and an HttpOnly exchange cookie in the browser; POST /auth/exchange turns the pair into the session
 // token. No long-lived token in any URL.
 import { test, expect, beforeAll, beforeEach } from "bun:test";
@@ -7,7 +7,8 @@ import { googleOidc } from "../../server/auth/oidc.js";
 import { sessions as makeSessions } from "../../server/auth/session.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { createBoard, createLink } from "../../server/admin/boards.js";
+import { createLink } from "../../server/admin/boards.js";
+import { createBoard } from "./fixtures.js";
 import { fakeIdp, CLIENT_ID } from "./fake-idp.js";
 
 const ORIGIN = "https://app.plenary.test";
@@ -161,7 +162,7 @@ test("the share-link path carries a code too, landing on the board", async () =>
   const who = await sessions.verify((await (await exchange(s.code, { cookie: s.cookie })).json()).token);
   const t = await tenancy.tenantOf(who);
   const board = await createBoard({ caller: who, tenant: t.id, title: "x" }, { registry, now });
-  const link = await createLink({ caller: who, board: board.id, role: "viewer", expiresAt: null }, { registry, now });
+  const link = await createLink({ caller: who, board: board.id, role: "viewer", expiresAt: null }, { registry, tenancy, now });
   const g = await signIn(GUEST, { startPath: `/links/${link.id}` });
   expect(g.res.headers.get("location").startsWith(`${ORIGIN}/b/${board.id}#code=`)).toBe(true);
   const ex = await exchange(g.code, { cookie: g.cookie });
@@ -268,4 +269,85 @@ test("exp comes from the sessions adapter's verify(), not the token's format; no
     expect((await exchange(s.code, { cookie: s.cookie, via: node({ sessions: { issue: async () => "opaque-token", verify } }) })).status).toBe(503);
     expect((await exchange(s.code, { cookie: s.cookie })).status).toBe(200);
   }
+});
+
+test("a Unit member's sign-in is recorded in the member directory (best effort); a guest's is not", async () => {
+  const unit = (await registry.tenantByDomain("acme.com"));
+  const a = await signIn(ADMIN);
+  expect((await exchange(a.code, { cookie: a.cookie })).status).toBe(200);
+  await new Promise(r => setTimeout(r, 0));
+  expect(await registry.membersAmong(unit.id, ["google:1001"])).toEqual([{ user: "google:1001", name: "Ann", email: "ann@acme.com", removed: false }]);
+  const g = await signIn(GUEST);
+  expect((await exchange(g.code, { cookie: g.cookie })).status).toBe(200);
+  await new Promise(r => setTimeout(r, 0));
+  expect(await registry.membersAmong(unit.id, ["google:2001"])).toEqual([]);
+  // a Registry that cannot record never fails the sign-in
+  const broken = new Proxy(registry, { get: (t, k) => (k === "touchMember" ? async () => { throw new Error("down"); } : t[k]) });
+  const via = node({ registry: broken });
+  const b = await signIn({ ...ADMIN, sub: "1002", email: "bo@acme.com" }, { via });
+  expect((await exchange(b.code, { cookie: b.cookie, via })).status).toBe(200);
+});
+
+test("the directory write after sign-in is bounded: 16 in flight, one per user, the rest dropped; failures log one rate-limited line", async () => {
+  const unit = await registry.tenantByDomain("acme.com");
+  let calls = 0, release; const gate = new Promise(r => { release = r; });
+  const slow = new Proxy(registry, { get: (t, k) => (k === "touchMember" ? async (...a) => { calls++; await gate; return t.touchMember(...a); } : t[k]) });
+  const via = node({ registry: slow });
+  const signed = [];
+  for (let i = 0; i < 20; i++) {
+    const s = await signIn({ ...ADMIN, sub: `30${String(i).padStart(2, "0")}`, email: `u${i}@acme.com` }, { via });
+    expect((await exchange(s.code, { cookie: s.cookie, via })).status).toBe(200);
+    signed.push(`google:30${String(i).padStart(2, "0")}`);
+  }
+  await new Promise(r => setTimeout(r, 0));
+  expect(calls).toBe(16);                                       // the other four were dropped, not queued
+  release(); await new Promise(r => setTimeout(r, 5));
+  expect((await registry.membersAmong(unit.id, signed)).length).toBe(16);
+  // one in flight per user: a second sign-in of the same person while the first write runs adds none
+  let again = 0, release2; const gate2 = new Promise(r => { release2 = r; });
+  const once = new Proxy(registry, { get: (t, k) => (k === "touchMember" ? async () => { again++; await gate2; } : t[k]) });
+  const v2 = node({ registry: once });
+  for (let i = 0; i < 3; i++) { const s = await signIn(ADMIN, { via: v2 }); await exchange(s.code, { cookie: s.cookie, via: v2 }); }
+  await new Promise(r => setTimeout(r, 0));
+  expect(again).toBe(1);
+  release2();
+  // failures: one warn per minute, with nothing identifying in it
+  const warns = [];
+  const down = new Proxy(registry, { get: (t, k) => (k === "touchMember" ? async () => { throw new Error("secret-detail google:1001"); } : t[k]) });
+  const v3 = node({ registry: down, log: { warn: (m, f) => warns.push([m, f]) } });
+  for (let i = 0; i < 3; i++) { const s = await signIn({ ...ADMIN, sub: `40${i}`, email: `d${i}@acme.com` }, { via: v3 }); await exchange(s.code, { cookie: s.cookie, via: v3 }); await new Promise(r => setTimeout(r, 0)); }
+  expect(warns).toHaveLength(1);
+  expect(JSON.stringify(warns)).not.toMatch(/secret-detail|google:|acme/);
+  clock.t += 61_000;
+  const s = await signIn({ ...ADMIN, sub: "409", email: "d9@acme.com" }, { via: v3 }); await exchange(s.code, { cookie: s.cookie, via: v3 }); await new Promise(r => setTimeout(r, 0));
+  expect(warns).toHaveLength(2);
+});
+
+test("a hung directory write keeps its slot past the cutoff (it only logs); the slot frees when the write settles; drops are logged anonymously", async () => {
+  let release; const gate = new Promise(r => { release = r; });
+  const hang = new Proxy(registry, { get: (t, k) => (k === "touchMember" ? async () => { await gate; } : t[k]) });
+  const warns = [];
+  const q = new Map(); let tid = 0, vnow = 0;   // virtual timers: the cutoff never depends on how fast this machine runs the 17 sign-ins
+  const timers = { set: (fn, ms) => { q.set(++tid, { fn, at: vnow + ms }); return tid; }, clear: h => { q.delete(h); } };
+  const advance = ms => { vnow += ms; for (const [h, e] of [...q]) if (e.at <= vnow) { q.delete(h); e.fn(); } };
+  const via = node({ registry: hang, timers, log: { warn: (m, f) => warns.push([m, f]) }, config: { ...config, touchTimeoutMs: 30 } });
+  const signAs = async n => { const s = await signIn({ ...ADMIN, sub: `50${String(n).padStart(2, "0")}`, email: `h${n}@acme.com` }, { via }); expect((await exchange(s.code, { cookie: s.cookie, via })).status).toBe(200); };
+  for (let i = 0; i < 17; i++) await signAs(i);
+  await new Promise(r => setTimeout(r, 0));
+  expect(warns.map(w => w[0])).toEqual(["member directory write dropped (too many in flight); Home records the person later"]);
+  clock.t += 61_000;                                            // the rate limit's window passes
+  advance(30);                                                  // past the cutoff: still hung, still holding its slot; the timeout only logs "slow"
+  expect(warns.map(w => w[0]).at(-1)).toContain("slow");
+  warns.length = 0;
+  clock.t += 61_000;
+  await signAs(98);                                             // dropped: the 16 slots are still taken
+  await new Promise(r => setTimeout(r, 0));
+  expect(warns).toHaveLength(1);
+  expect(warns[0][0]).toContain("dropped");
+  release(); await new Promise(r => setTimeout(r, 0)); await new Promise(r => setTimeout(r, 0));   // the writes settle (microtasks): slots free
+  clock.t += 61_000;
+  warns.length = 0;
+  await signAs(99); await new Promise(r => setTimeout(r, 0));
+  expect(warns).toHaveLength(0);                                // accepted, not dropped
+  expect(JSON.stringify(warns)).not.toMatch(/google:|acme/);
 });

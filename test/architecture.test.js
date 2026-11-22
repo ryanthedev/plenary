@@ -1,4 +1,4 @@
-// The hexagonal boundary test for packages/, server/ and scripts/ (docs/m2/OFFICE.md "Architecture"; briefs p-arch
+// The hexagonal boundary test for packages/, server/ and scripts/ (briefs p-arch
 // and its follow-up after p-archv). Static: test/arch-scan.js parses import specifiers (static, re-exports, import(),
 // require(), JSDoc import("…") types, `new URL(…, import.meta.url)`); nothing is executed. client's
 // test/web/architecture.test.js reuses the scanner for web/.
@@ -16,9 +16,9 @@
 //             by default, the strict side), plus the DRIVING adapters and SUPPORT_DIRS.
 //             Driven adapters import only ports, SHARED, SUPPORT_DIRS, their own group and bare packages
 //             ("adapter->core" otherwise; manager decision on p-archv question 3).
-//             DRIVING adapters (HTTP/WebSocket calling into the core: server.js, static.js, auth/http.js) may also
+//             DRIVING adapters (HTTP/WebSocket calling into the core: server.js, static.js, blob-http.js, auth/http.js) may also
 //             import core.
-//   adapter-only support: SUPPORT_DIRS (server/pg/) holds code several adapters share (Postgres start-up). It counts
+//   adapter-only support: SUPPORT_DIRS (server/pg/, server/sqlite/, server/encode/) holds code several adapters share (Postgres start-up, sliced JSON encoding). It counts
 //             as an adapter (core may not import it, it may not import other adapters) that any adapter may import.
 //   root      COMPOSITION_ROOTS pick and wire adapters; nothing imports a root. Every script under scripts/ must be a
 //             root (strict on purpose, p-archv L3): a new dev script is added here when it is written.
@@ -31,15 +31,17 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { ROOT, listFiles, importsOf, checkBoundaries } from "./arch-scan.js";
 
-const SCAN = ["packages", "server", "scripts", "deploy"];   // every non-test code folder but web/ (client's) and docs/
+const SCAN = ["packages", "server", "scripts", "deploy"];   // every non-test code folder but web/ (client's)
 const CORE_DIRS = ["packages/protocol/", "packages/core/", "server/admin/"];
-const CORE_FILES = ["server/gateway.js", "server/room-host.js", "server/feed.js", "server/breather.js", "server/ids.js", "server/log.js"];
-const ADAPTER_DIRS = ["server/store/", "server/registry/", "server/bus/", "server/blobs/", "server/auth/"];
-const SUPPORT_DIRS = ["server/pg/"];
+const CORE_FILES = ["server/gateway.js", "server/room-host.js", "server/feed.js", "server/breather.js", "server/ids.js", "server/log.js", "server/blob-access.js", "server/instrument.js", "server/trash-sweep.js", "server/blob-reaper.js"];
+const ADAPTER_DIRS = ["server/store/", "server/registry/", "server/bus/", "server/blobs/", "server/auth/", "server/compress/", "server/metrics/"];
+const SUPPORT_DIRS = ["server/pg/", "server/sqlite/", "server/encode/"];
 /** Driving adapters, each with its group: server.js serves HTTP/WebSocket (Bun.serve) and mounts static.js. */
 const DRIVING = {
   "server/server.js": "server/http",
   "server/static.js": "server/http",
+  "server/blob-http.js": "server/http",
+  "server/metrics-http.js": "server/http",
   "server/auth/http.js": "server/auth/http",
 };
 const COMPOSITION_ROOTS = [
@@ -47,6 +49,12 @@ const COMPOSITION_ROOTS = [
   "scripts/dev-google.js",        // dev harness, self-described composition root for a local Google sign-in check (p5-google)
   "scripts/admin-bootstrap.js",   // platform: tenant bootstrap CLI; its core part, server/admin/tenants.js, imports only ports
   "scripts/cluster-rig.js",       // platform (p8-rig): local cluster rig CLI; spawns processes, imports no project module
+  "scripts/fold-bench.js",        // platform: reports how long a checkpoint holds the event loop (imports whatever checkout --root names)
+  "scripts/fanout-bench.js",      // platform: reports what a live frame costs a gateway for N viewers (imports whatever checkout --root names; #66)
+  "scripts/clean.js",             // platform: safe cleanup CLI for test temp dirs, stopped rigs and scratch copies; shells out to lsof and the rig CLI
+  "scripts/test-cluster.js",      // test harness: starts and tears down an isolated local services rig
+  "scripts/test-compose.js",      // test harness (#71): three-node cluster test on a container runtime (`bun run test:compose`); never part of `bun test`
+  "scripts/test-cluster-files.js", // test harness data: the gated test files test-cluster.js runs, also imported by its guard
   "scripts/load/run.js", "scripts/load/worker.js", "scripts/load/tokens.js", "scripts/load/client.js", "scripts/load/server.js",
   "scripts/load/stats.js",        // platform (p8-load): load client; run.js and worker.js are entry points, the rest their modules
   "scripts/plenary-client.js", "scripts/plenary-cli.js", "scripts/plenary-mcp.js", // agent tools: CLI & stdio MCP server
@@ -56,6 +64,16 @@ const COMPOSITION_ROOTS = [
 const NOT_ADAPTERS = {
   "server/auth/util.js": "shared pure helpers (roles, base64url, ids); imported by core, ports and adapters",
   "server/auth/tenancy.js": "core: role resolution over the Registry port (platform's CLASSES calls it core)",
+  "server/auth/resolver.js": "core: the pure permission resolver (domain logic; reads only rows handed to it)",
+  "server/auth/permissions.js": "core: permissions, built-in roles and their clipping per scope (pure domain data)",
+  "server/auth/access.js": "core: Teams, access at a scope and the role picker's grant writes over the Registry port and tenancy (PROTOCOL.md § Teams and access)",
+  "server/auth/explain.js": "core: the access explanation (sources, what is needed, who to ask) built from the resolver's own Access over the Registry port (PROTOCOL.md § Access explanation and requests)",
+  "server/auth/roles.js": "core: the Roles screen's reads and writes (custom roles, the no-escalation rule, delete, the many-people confirmation) over the Registry port and tenancy (PROTOCOL.md § Roles)",
+  "server/auth/spaces.js": "core: Space and Group pages, pickers, create and rename over the Registry port, tenancy and Home (PROTOCOL.md § Spaces and Groups)",
+  "server/auth/move.js": "core: move a board between Spaces: options, the access diff, the compare-and-set move (PROTOCOL.md § Move board)",
+  "server/auth/trash.js": "core: trash and restore a board or Space, the Trash list and the board-URL notice over the Registry port and tenancy (PROTOCOL.md § Trash and restore)",
+  "server/auth/offboard.js": "core: leaver offboarding: the list, per-item reassignment and the removal over the Registry port and tenancy (PROTOCOL.md § Leaver offboarding)",
+  "server/auth/home.js": "core: the Home screen's lists, tree and search over the Registry port and tenancy (PROTOCOL.md § Home)",
 };
 /** Non-port modules a driven adapter may import. */
 const SHARED = ["server/ids.js", "server/auth/util.js"];
@@ -101,11 +119,11 @@ test("every allowlist entry says why", () => {
 test("the classes are what they must be (no vacuous pass)", () => {
   for (const p of ["packages/protocol/room.js", "packages/protocol/replica.js", "packages/core/doc.js", "server/gateway.js",
     "server/room-host.js", "server/feed.js", "server/ids.js", "server/log.js", "server/admin/boards.js", "server/auth/tenancy.js",
-    "server/bus/port.js", "server/blobs/port.js", "server/auth/port.js", "server/auth/idp-port.js", "server/auth/registry-port.js",
-    "server/auth/util.js"]) expect([p, isCore(p), isAdapter(p)]).toEqual([p, true, false]);
+    "server/bus/port.js", "server/blobs/port.js", "server/metrics/port.js", "server/instrument.js", "server/store/port.js", "server/auth/port.js", "server/auth/idp-port.js", "server/auth/registry-port.js",
+    "server/auth/util.js", "server/auth/resolver.js", "server/auth/permissions.js"]) expect([p, isCore(p), isAdapter(p)]).toEqual([p, true, false]);
   for (const p of ["server/store/sqlite.js", "server/store/postgres.js", "server/registry/postgres.js", "server/bus/nats.js",
     "server/bus/memory.js", "server/blobs/s3.js", "server/blobs/disk.js", "server/auth/oidc.js", "server/auth/dev.js",
-    "server/auth/http.js", "server/server.js", "server/pg/schema.js"]) expect([p, isAdapter(p), isCore(p)]).toEqual([p, true, false]);
+    "server/auth/http.js", "server/server.js", "server/metrics/prometheus.js", "server/metrics-http.js", "server/pg/schema.js", "server/sqlite/schema.js"]) expect([p, isAdapter(p), isCore(p)]).toEqual([p, true, false]);
   for (const p of ["packages/natsbus/bus.js", "server/redis-cache.js", "scripts/seed.js"]) expect([p, isCore(p) || isAdapter(p)]).toEqual([p, false]);
   expect(adapterGroup("server/static.js")).toBe(adapterGroup("server/server.js"));
   expect(adapterGroup("server/blobs/s3.js")).not.toBe(adapterGroup("server/blobs/disk.js"));
@@ -122,7 +140,20 @@ test("shared code goes through ports and support modules, not through another ad
   expect(importsOf("server/registry/postgres.js").map(i => i.to)).toContain("server/pg/schema.js");
   expect(importsOf("server/store/postgres.js").map(i => i.to)).toContain("server/pg/schema.js");
   expect(importsOf("server/pg/schema.js")).toEqual([]);   // a leaf
+  for (const f of ["server/store/sqlite.js", "server/registry/sqlite.js"]) expect(importsOf(f).map(i => i.to)).toContain("server/sqlite/schema.js");
+  expect(importsOf("server/sqlite/schema.js")).toEqual([]);   // bun:sqlite is a bare package, not a project edge
   for (const f of ["server/blobs/s3.js", "server/blobs/disk.js"]) expect(importsOf(f).map(i => i.to)).toContain("server/blobs/port.js");
+});
+
+test("every adapter imports its port module (one documented interface per port)", () => {
+  const PORT_OF = {
+    "server/store/sqlite.js": "server/store/port.js", "server/store/postgres.js": "server/store/port.js",
+    "server/registry/sqlite.js": "server/auth/registry-port.js", "server/registry/postgres.js": "server/auth/registry-port.js", "server/auth/registry.js": "server/auth/registry-port.js",
+    "server/bus/memory.js": "server/bus/port.js", "server/bus/nats.js": "server/bus/port.js",
+    "server/blobs/disk.js": "server/blobs/port.js", "server/blobs/s3.js": "server/blobs/port.js",
+    "server/metrics/prometheus.js": "server/metrics/port.js",
+  };
+  for (const [adapter, port] of Object.entries(PORT_OF)) expect([adapter, importsOf(adapter).map(i => i.to).includes(port)]).toEqual([adapter, true]);
 });
 
 // ---- the rules themselves, on planted sources: a violation of each kind fails ----

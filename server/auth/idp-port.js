@@ -16,7 +16,7 @@
 //     `expected` is what begin() returned (as the caller stored it). Resolves null when the sign-in is refused: a
 //     missing or mismatched state, a missing code, an incomplete `expected`, a code the IdP rejects, a token that
 //     fails verification (signature, issuer, audience, nonce, expiry). It also resolves null (never rejects) when
-//     the IdP can't be reached or times out: a sign-in is interactive and retried by the person, so an outage is a
+//     the IdP can't be reached or times out: a sign-in is interactive and retried by the user, so an outage is a
 //     failed sign-in, not a server error. Bounded: an adapter must time out its own network calls. Never rejects on
 //     garbage input, including a non-object argument (finish(null)). A code is bound to its sign-in's PKCE
 //     verifier (a code from another sign-in is refused even if the nonce matches) and works ONCE (a second finish

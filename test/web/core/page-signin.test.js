@@ -1,6 +1,6 @@
 // The page's sign-in choice (web/core/signin.js pageSignIn, signInNotice) and how main.js wires it. Replaces
 // test/web/ui-token.test.js (web/ui/token.js is gone: the post-login fragment now carries a single-use #code, not the
-// token). Each of that file's guarantees is kept here; the map is in docs/m2/reports/p6-hex.md.
+// token). Each of that file's guarantees is kept here.
 import { test, expect, beforeEach } from "bun:test";
 import { pageSignIn, signInNotice, SESSION_KEY } from "../../../web/core/signin.js";
 import { fakeAuth } from "../../../web/adapters/auth/fake.js";
@@ -82,7 +82,7 @@ test("an unavailable store: the exchange still signs in (memory only), the fragm
   expect(replaced).toBe(1);
 });
 
-// p6-edgev LOW-4 / LOW-5: the notice never blames the person, and says when the tab is still someone else.
+// p6-edgev LOW-4 / LOW-5: the notice never blames the user, and says when the tab is still someone else.
 test("signInNotice: share links, failures that don't blame, and 'still signed in as'", async () => {
   expect(signInNotice({ outcome: "signed-in", link: null, dev: null, token: "t" })).toBeNull();
   expect(signInNotice({ outcome: "dev", link: "invalid", dev: "bo", token: "dev-bo" })).toMatch(/share link is not valid/);

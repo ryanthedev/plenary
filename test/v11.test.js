@@ -110,7 +110,7 @@ test("MemoryLog epochs: 0 before any room, then +1 per build", () => {
 
 // ---- room identity ----
 
-test("every welcome names the room: board and epoch; the epoch rises on every rebuild; the heartbeat is { resolved seq, epoch }", () => {
+test("every welcome names the room: board and epoch; the epoch rises on every rebuild; the heartbeat is { resolved seq, epoch, durable checkpoint }", () => {
   const w = world(["editor", "viewer"], 3);
   w.settle();
   expect(w.room.epoch).toBe(1);
@@ -124,16 +124,40 @@ test("every welcome names the room: board and epoch; the epoch rises on every re
   const ed = link(d, clock, "u0", "editor", "x").open(), vw = link(d, clock, "u1", "viewer", "y").open();
   expect(ed.inbox[0]).toMatchObject({ t: "welcome", high: 0, room: { board: "b1", epoch: 4 } });
   expect(vw.inbox[0].room).toEqual({ board: "b1", epoch: 4 });
-  expect(w.room.heartbeat()).toEqual({ seq: 1, epoch: 4 });
+  expect(w.room.heartbeat()).toEqual({ seq: 1, epoch: 4, cp: 1 });              // rebuilt (i = 2, 3) on the checkpoint at 1 (i = 1)
 });
 
 test("the heartbeat names the resolved seq, not the speculative one", async () => {
   const slow = slowLog(), d = direct(slow, { epoch: 7 }), a = d.join("ua", "editor", "a");
   a.op(1, "board", { elements: [rect("x")] });
-  expect([d.room.seq, d.room.heartbeat()]).toEqual([1, { seq: 0, epoch: 7 }]);
+  expect([d.room.seq, d.room.heartbeat()]).toEqual([1, { seq: 0, epoch: 7, cp: 0 }]);
   slow.waiting.shift().land(); await tick();
-  expect(d.room.heartbeat()).toEqual({ seq: 1, epoch: 7 });
+  expect(d.room.heartbeat()).toEqual({ seq: 1, epoch: 7, cp: 0 });
   expect(Room.fromLog({ board: "b1", tenant: "t1", log: slow.log }).epoch).toBe(1);   // the MemoryLog's own count
+});
+
+test("the heartbeat's cp names a checkpoint only once its write is acknowledged; a failed write is never announced", async () => {
+  const puts = [];
+  const log = { append: async () => {}, putCheckpoint: cp => new Promise((res, rej) => puts.push({ cp, res, rej })) };
+  const d = direct(log, { epoch: 2 }), a = d.join("ua", "editor", "a");
+  for (let i = 1; i <= 3; i++) a.op(i, "board", { elements: [rect("x" + i)] });
+  await tick(); await tick();
+  expect(d.room.heartbeat()).toEqual({ seq: 3, epoch: 2, cp: 0 });
+  d.room.checkpoint();                                                     // taken now, written later
+  expect([puts.length, d.room.status().baseSeq, d.room.heartbeat().cp]).toEqual([1, 3, 0]);
+  puts[0].res(); await tick();
+  expect(d.room.heartbeat().cp).toBe(3);                                   // acknowledged: announced
+  a.op(4, "board", { elements: [rect("x4")] }); await tick(); await tick();
+  d.room.checkpoint();
+  puts[1].rej(new Error("store down")); await tick();
+  expect(d.room.heartbeat()).toEqual({ seq: 4, epoch: 2, cp: 3 });       // refused: the last durable one stays
+  // A slower older write that lands after a newer one never moves cp back.
+  a.op(5, "board", { elements: [rect("x5")] }); await tick(); await tick();
+  d.room.checkpoint();
+  a.op(6, "board", { elements: [rect("x6")] }); await tick(); await tick();
+  d.room.checkpoint();
+  puts[3].res(); await tick(); puts[2].res(); await tick();
+  expect(d.room.heartbeat().cp).toBe(6);
 });
 
 test("a writer's welcome from a lower epoch closes and reconnects (a failed attempt); a viewer's is only recorded", () => {

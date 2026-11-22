@@ -105,11 +105,37 @@ export function normAdmin(a, domain) {
 }
 
 /**
- * @param {{ registry: Registry, domain?: string|null, personal?: boolean, admins?: string[] }} o
- * @returns {Promise<{ tenant: Tenant, created: boolean, added: string[] }>}  `added`: admins this call added
+ * A user id that may hold a content-tier role (#88): `google:<sub>` or `dev:<name>`. An `email:` name is refused: a grant is held by a user id (the admin list alone matches by email before first sign-in).
+ * @param {unknown} a
  */
-export async function bootstrapTenant({ registry, domain, personal = false, admins = [] }) {
-  if (!Array.isArray(admins)) throw new BootstrapError("admins must be a list");
+export function normContentAdmin(a) {
+  const s = normAdmin(a);
+  if (s.startsWith("email:")) throw new BootstrapError(`a content admin is named by user id (google:<sub> or dev:<name>), not an email: ${shown(a)}`);
+  return s;
+}
+
+/**
+ * @param {{ registry: Registry, domain?: string|null, personal?: boolean, admins?: string[], contentAdmins?: string[], contentAdminsPersonal?: string[] }} o
+ *   contentAdmins / contentAdminsPersonal: users given the built-in Unit role `content-admin` (every shared Space's boards) or `content-admin-personal` (those and personal spaces) at the Unit. The content tier can be
+ *   passed on only by a holder (PROTOCOL.md § Admin levels), so this operator step is the one way the first holder appears. Additive like `admins`: it never removes a grant or replaces any other role (a user already
+ *   on `content-admin` is raised to `content-admin-personal` when asked).
+ * @returns {Promise<{ tenant: Tenant, created: boolean, added: string[], content: string[], skipped: { user: string, role: string }[] }>}  `added`: admins this call added; `content`: users whose content-tier grant this call set; `skipped`: users asked for a content role who already hold another Unit role (kept; change it from the Unit access page)
+ */
+export async function bootstrapTenant({ registry, domain, personal = false, admins = [], contentAdmins = [], contentAdminsPersonal = [] }) {
+  if (!Array.isArray(admins) || !Array.isArray(contentAdmins) || !Array.isArray(contentAdminsPersonal)) throw new BootstrapError("admins and content admins must be lists");
+  const shared = [...new Set(contentAdmins.map(normContentAdmin))], personalRoles = [...new Set(contentAdminsPersonal.map(normContentAdmin))];
+  const applyContent = async t => {
+    const content = [], skipped = [];
+    const scope = { type: "unit", id: t.id };
+    for (const [users, role] of [[shared, "content-admin"], [personalRoles, "content-admin-personal"]]) for (const user of users) {
+      const subject = { type: "user", id: user }, cur = await registry.scopedGrant(scope, subject);
+      if (cur === role || (cur === "content-admin-personal" && role === "content-admin")) continue;   // already there (or higher): nothing to do
+      if (cur != null && !(cur === "content-admin" && role === "content-admin-personal")) { skipped.push({ user, role: cur }); continue; }   // additive: a user holding another Unit role keeps it, and the caller is told
+      await registry.setScopedGrant({ scope, subject, role });
+      content.push(user);
+    }
+    return { content, skipped };
+  };
   if (personal) {
     if (domain !== undefined && domain !== null) throw new BootstrapError("cannot specify both personal and domain");
     const want = [...new Set(admins.map(a => normAdmin(a, null)))];
@@ -126,7 +152,8 @@ export async function bootstrapTenant({ registry, domain, personal = false, admi
       await registry.addTenantAdmin(t.id, a);
       added.push(a);
     }
-    return { tenant: (await registry.tenant(t.id)) ?? t, created, added };
+    const { content, skipped } = await applyContent(t);
+    return { tenant: (await registry.tenant(t.id)) ?? t, created, added, content, skipped };
   }
 
   const d = normDomain(domain);
@@ -148,7 +175,8 @@ export async function bootstrapTenant({ registry, domain, personal = false, admi
     await registry.addTenantAdmin(t.id, a);
     added.push(a);
   }
-  return { tenant: (await registry.tenant(t.id)) ?? t, created, added };
+  const { content, skipped } = await applyContent(t);
+  return { tenant: (await registry.tenant(t.id)) ?? t, created, added, content, skipped };
 }
 
 // ---- Self-serve personal orgs & email-based org membership ----
@@ -216,6 +244,8 @@ export async function listTenants({ caller }, { tenancy }) {
   };
 }
 
+const liveTenantAdmin = async (registry, t, caller) => Boolean(t && isTenantAdminRecord(t, caller) && !(await registry.memberState?.(t.id, caller.user))?.removed);
+
 /**
  * GET /tenants/:tenant/members — org admins only; 404 for unknown tenant, 403 for non-admin.
  * Returns human-friendly admin identifiers (stripped `email:` addresses and non-`google:` ids) without leaking raw
@@ -227,7 +257,7 @@ export async function listTenantMembers({ caller, tenant }, { registry }) {
   if (typeof tenant !== "string" || !tenant) throw new AdminError("not-found", "no such tenant");
   const t = await registry.tenant(tenant);
   if (!t) throw new AdminError("not-found", "no such tenant");
-  if (!isTenantAdminRecord(t, caller)) throw new AdminError("forbidden", "not allowed");
+  if (!(await liveTenantAdmin(registry, t, caller))) throw new AdminError("forbidden", "not allowed");
   const members = await registry.tenantMembers(t.id);
   const emailAdmins = t.admins.filter(a => a.startsWith("email:")).map(a => a.slice(6));
   const otherAdmins = t.admins.filter(a => !a.startsWith("email:") && !a.startsWith("google:"));
@@ -245,7 +275,7 @@ export async function addTenantMember({ caller, tenant, email }, { registry, now
   if (typeof tenant !== "string" || !tenant) throw new AdminError("not-found", "no such tenant");
   const t = await registry.tenant(tenant);
   if (!t) throw new AdminError("not-found", "no such tenant");
-  if (!isTenantAdminRecord(t, caller)) throw new AdminError("forbidden", "not allowed");
+  if (!(await liveTenantAdmin(registry, t, caller))) throw new AdminError("forbidden", "not allowed");
   if (t.domain !== null) throw new AdminError("bad-request", "domain workspaces manage membership via their workspace domain");
   if (typeof email !== "string" || CONTROL.test(email)) throw new AdminError("bad-request", "bad email");
   const e = normEmail(email);
@@ -278,7 +308,7 @@ export async function removeTenantMember({ caller, tenant, email }, { registry, 
   if (typeof tenant !== "string" || !tenant) throw new AdminError("not-found", "no such tenant");
   const t = await registry.tenant(tenant);
   if (!t) throw new AdminError("not-found", "no such tenant");
-  if (!isTenantAdminRecord(t, caller)) throw new AdminError("forbidden", "not allowed");
+  if (!(await liveTenantAdmin(registry, t, caller))) throw new AdminError("forbidden", "not allowed");
   const e = normEmail(email);
   if (!e) throw new AdminError("bad-request", "bad email");
   const removed = await registry.removeTenantMember(t.id, e);

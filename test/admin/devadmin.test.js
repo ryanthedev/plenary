@@ -1,5 +1,5 @@
 // A stock single node (server/main.js start(env), port 0, temp data dir) bootstraps each dev domain's tenant from
-// PLENARY_DEV_TOKENS, so an admin dev token can POST /boards and a non-admin of that domain can't (brief
+// PLENARY_DEV_TOKENS, so a dev token of that domain can POST /boards (into its personal space) and a user with no tenant can't (brief
 // p5-devadmin, live finding S1). Plus the operator CLI (scripts/admin-bootstrap.js) in process, on SQLite.
 import { test, expect, afterAll } from "bun:test";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
@@ -22,7 +22,7 @@ const TOKENS = {
 const env = (dir, tokens = TOKENS) => ({ PLENARY_DATA_DIR: dir, PORT: "0", LOG_LEVEL: "error", PLENARY_DEV_TOKENS: JSON.stringify(tokens) });
 const post = (app, token) => fetch(app.server.url + "/boards", { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ title: "all hands" }) });
 
-test("start(env): an admin dev token can POST /boards (201), a non-admin of its domain gets 403; a restart keeps one tenant", async () => {
+test("start(env): a dev token of the domain can POST /boards (201) and owns the board; a restart keeps one tenant", async () => {
   const dir = tempDir();
   let app = await start(env(dir));
   let tenantId;
@@ -35,7 +35,12 @@ test("start(env): an admin dev token can POST /boards (201), a non-admin of its 
     const { board } = await ok.json();
     expect(board.tenant).toBe(tenantId);
     expect(await app.registry.grant(board.id, "dev:ann")).toBe("owner");
-    expect((await post(app, MEMBER)).status).toBe(403);
+    // Since #48 any member of the Unit makes boards in their personal space (no admin needed); a user with no Unit still can't (next test).
+    const mine = await post(app, MEMBER);
+    expect(mine.status).toBe(201);
+    const made = (await mine.json()).board;
+    expect(await app.registry.grant(made.id, "dev:bob")).toBe("owner");
+    expect((await app.registry.space(made.space)).owner).toBe("dev:bob");
   } finally { await app.stop(); }
 
   // Restart on the same data dir, with bob flagged admin too and ann's flag dropped: same tenant, both admins.
@@ -93,7 +98,7 @@ test("CLI: bad arguments exit 2 with usage and touch nothing", async () => {
     expect(x.o.err.join("\n").length).toBeGreaterThan(0);
   }
   expect(existsSync(join(dir, "registry.db"))).toBe(false);
-  expect(parseArgs(["--domain=acme.com", "--admin", "a@acme.com", "--admin", "dev:b"])).toEqual({ domain: "acme.com", admins: ["a@acme.com", "dev:b"] });
+  expect(parseArgs(["--domain=acme.com", "--admin", "a@acme.com", "--admin", "dev:b"])).toEqual({ domain: "acme.com", admins: ["a@acme.com", "dev:b"], contentAdmins: [], contentAdminsPersonal: [] });
 });
 
 test("CLI: an email admin off --domain, or a control character, exits 2 naming the entry and touches nothing", async () => {
@@ -172,3 +177,17 @@ test("CLI: a Registry it can't open exits 1 and never prints the URL", async () 
   expect(x.o.out).toEqual([]);
   expect(x.o.err.join("\n")).not.toContain("s3cr3t-pw");
 }, 20000);
+
+test("CLI: a database that accepts the connection and never answers fails with exit 1 after the timeout, naming no URL", async () => {
+  // A TCP server that takes the connection and says nothing: the Postgres client waits for a handshake that never comes.
+  const hang = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {}, open() {} } });
+  const x = io();
+  const t = Date.now();
+  try {
+    const code = await run(["--domain", "acme.com", "--admin", "dev:ann"], { DATABASE_URL: `postgres://u:secretpw@127.0.0.1:${hang.port}/db` }, { ...x.io, timeoutMs: 700 });
+    expect(code).toBe(1);
+  } finally { hang.stop(true); }
+  expect(Date.now() - t).toBeLessThan(5000);
+  expect(JSON.parse(x.o.err[0])).toEqual({ ok: false, error: "failed: timed out after 1 s" });
+  expect(x.o.err.join("") + x.o.out.join("")).not.toContain("secretpw");
+}, 15000);

@@ -5,7 +5,7 @@ import { googleOidc } from "../../server/auth/oidc.js";
 import { sessions as makeSessions } from "../../server/auth/session.js";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { createBoard } from "../../server/admin/boards.js";
+import { createBoard } from "./fixtures.js";
 import { devAuth } from "../../server/auth/dev.js";
 import { fakeIdp, CLIENT_ID } from "./fake-idp.js";
 
@@ -298,17 +298,20 @@ test("Bearer missing, malformed, forged or expired → 401 auth; cookies never a
 
 // ---- admin rules ----
 
-test("POST /boards: non-admin and tenantless callers get 403; cross-tenant tenant field is refused with 403 and creates nothing", async () => {
+test("POST /boards: tenantless callers get 403; a Unit member makes a board in their personal space; a cross-tenant tenant field is refused and creates nothing", async () => {
   let creates = 0;
   const counting = { ...registry, createBoard: async o => { creates++; return registry.createBoard(o); } };
   routes = build({ registry: counting });
   const member = await tokenFor(MEMBER), guest = await tokenFor(GUEST), admin = await tokenFor(ADMIN);
-  for (const t of [member, guest]) {
-    const r = await api("/boards", t, "POST", { title: "x" });
-    expect(r.status).toBe(403);
-    expect(await r.json()).toEqual({ error: "forbidden" });
-  }
-  const other = await registry.createTenant({ domain: "globex.com", admins: ["google:9999"] });
+  const r0 = await api("/boards", guest, "POST", { title: "x" });
+  expect(r0.status).toBe(403);
+  expect(await r0.json()).toEqual({ error: "forbidden" });
+  expect(creates).toBe(0);
+  const mine = await api("/boards", member, "POST", { title: "x" });
+  expect(mine.status).toBe(201);
+  expect(creates).toBe(1);
+  creates = 0;
+  const other = await registry.createTenant({ domain: "globex.com", admins: ["google:1001"] });
   const r = await api("/boards", admin, "POST", { tenant: other.id });
   expect(r.status).toBe(403);
   expect(await r.json()).toEqual({ error: "forbidden" });
@@ -372,10 +375,13 @@ test("bodies: JSON only, capped at 16 KB (counted as read), objects only, unknow
   expect((await post('{"title":"ok"}', { "content-type": "application/json; charset=utf-8" })).status).toBe(201);
   // Grants need `role` (null removes).
   const { board } = await (await post("{}")).json();
+  await registry.touchMember(acme.id, { user: "google:9" });          // a new person grant needs someone the server knows
   const g = p => call(`/boards/${board.id}/grants/google%3A9`, { method: "PUT", headers: { authorization: "Bearer " + admin, "content-type": "application/json" }, body: p });
   expect((await g("{}")).status).toBe(400);
   expect((await g('{"role":"viewer"}')).status).toBe(204);
   expect((await g('{"role":null}')).status).toBe(204);
+  const unknown = await call(`/boards/${board.id}/grants/email%3Azed%40acme.com`, { method: "PUT", headers: { authorization: "Bearer " + admin, "content-type": "application/json" }, body: '{"role":"viewer"}' });
+  expect([unknown.status, await unknown.json()]).toEqual([400, { error: "unknown-person" }]);
   expect(await registry.grant(board.id, "google:9")).toBe(null);
   // A bad percent-escape in a path segment is a 400, not a throw.
   expect((await call(`/boards/${board.id}/grants/%E0%A4%A`, { method: "PUT", headers: { authorization: "Bearer " + admin, "content-type": "application/json" }, body: '{"role":"viewer"}' })).status).toBe(400);
@@ -405,26 +411,14 @@ test("a Registry that throws gives 503 unavailable, never 403 or 500", async () 
   expect(new URLSearchParams(new URL(res.headers.get("location")).hash.slice(1)).get("link")).toBe("unavailable");
 });
 
-test("createBoard: an owner grant that fails twice reports the board id (503); one failure is retried", async () => {
+test("createBoard: the board and its owner grant are one Registry step (a failing setGrant is not part of it; no ownerless board)", async () => {
   const admin = await tokenFor(ADMIN);
-  let fails = 2;
-  const flaky = { ...registry, setGrant: async (...a) => { if (fails-- > 0) throw new Error("db blip"); return registry.setGrant(...a); } };
-  routes = build({ registry: flaky });
-  const r = await api("/boards", admin, "POST", { title: "orphan" });
-  expect(r.status).toBe(503);
-  const body = await r.json();
-  expect(body.error).toBe("owner-grant-failed");
-  expect(body.board).toMatch(/^b-[a-z0-9]{16}$/);
-  expect(await registry.board(body.board)).toMatchObject({ title: "orphan" });
-  expect(await registry.grant(body.board, "google:1001")).toBe(null);
-  fails = 1;
-  const ok = await api("/boards", admin, "POST", { title: "retried" });
-  expect(ok.status).toBe(201);
-  expect(await registry.grant((await ok.json()).board.id, "google:1001")).toBe("owner");
-  // Directly against the admin layer as well.
-  fails = 5;
-  await expect(createBoard({ caller: { user: "google:1001" }, tenant: acme.id }, { registry: flaky }))
-    .rejects.toMatchObject({ code: "owner-grant-failed", board: expect.stringMatching(/^b-/) });
+  routes = build({ registry: { ...registry, setGrant: async () => { throw new Error("db blip"); } } });
+  const r = await api("/boards", admin, "POST", { title: "whole" });
+  expect(r.status).toBe(201);
+  const id = (await r.json()).board.id;
+  expect(await registry.grant(id, "google:1001")).toBe("owner");
+  expect((await registry.board(id)).space).toMatch(/^s-/);   // it sits in the caller's personal space
 });
 
 // ---- mounting ----

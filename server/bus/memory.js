@@ -6,8 +6,8 @@
 // Messages are passed by reference here; a network bus serialises them, so publish only plain data and never
 // change a message after publishing it.
 
-import { subjects, busBytes, MAX_BUS_BYTES } from "./port.js";
-import { PortError } from "../ids.js";
+import { subjects, busBytes, MAX_BUS_BYTES, scopeBus, scopeOnError } from "./port.js";
+import { PortError, isClusterId } from "../ids.js";
 
 export { subjects };
 
@@ -15,8 +15,16 @@ export { subjects };
  * @param {{ onError?: (err: unknown, subject: string) => void, maxBytes?: number }} [o]
  *   maxBytes: the message cap (§ Bus, 2 MB by default, as NATS); a bigger publish is refused like NATS refuses it
  *   (the promise rejects with PortError "too-large", and onError hears of it). Tests pass a small one.
+ *   cluster: scope every subject to a cluster id, as the NATS adapter does (PROTOCOL.md § Bus, Cluster id).
  */
-export function memoryBus({ onError = () => {}, maxBytes = MAX_BUS_BYTES } = {}) {
+export function memoryBus({ onError = () => {}, maxBytes = MAX_BUS_BYTES, cluster } = {}) {
+  // In-process, so no other cluster can share it: scoping is optional here (single node, tests), unlike natsBus.
+  if (cluster == null) return memoryBusUnscoped({ onError, maxBytes });
+  if (!isClusterId(cluster)) throw new PortError("bad-id", "bad cluster id");
+  return scopeBus(memoryBusUnscoped({ onError: scopeOnError(onError, cluster), maxBytes }), cluster);   // same wire naming as the NATS adapter (§ Bus, Cluster id)
+}
+
+function memoryBusUnscoped({ onError, maxBytes }) {
   /** @type {Map<string, Set<Function>>} */
   const subs = new Map();
   let queue = [], draining = false, closed = false;
@@ -53,9 +61,11 @@ export function memoryBus({ onError = () => {}, maxBytes = MAX_BUS_BYTES } = {})
     /** @returns {() => void} unsubscribe */
     subscribe(subject, fn) {
       if (typeof subject !== "string" || typeof fn !== "function") throw new TypeError("subscribe(subject, fn)");
-      if (!subs.has(subject)) subs.set(subject, new Set());
-      subs.get(subject).add(fn);
-      return () => { const set = subs.get(subject); if (!set) return; set.delete(fn); if (!set.size) subs.delete(subject); };
+      let set = subs.get(subject);
+      if (!set) subs.set(subject, set = new Set());
+      set.add(fn);
+      const mine = set;   // the set of THIS subscription: an old unsubscribe called again never removes a later subscribe of the same handler (as natsBus)
+      return () => { if (!mine.delete(fn)) return; if (!mine.size && subs.get(subject) === mine) subs.delete(subject); };
     },
     /** Resolves when everything published so far has been handed to subscribers (tests, clean shutdown). */
     flush() { return queue.length || draining ? new Promise(res => idle.push(res)) : Promise.resolve(); },

@@ -1,12 +1,42 @@
 // The Blobs port (PROTOCOL.md § Blobs): what every Blobs adapter (disk.js, s3.js) checks before storing.
 //   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB (images) / > 50 MB (videos), a hash mismatch, and anything that isn't PNG/JPEG/GIF/WebP/MP4/WebM/QuickTime
 //   get(tenant, sha1)          bytes, or null
-// Shared port pieces, no adapter code: adapters never import each other (docs/m2/OFFICE.md "Architecture").
+//   usage(tenant)             the total bytes the tenant's blobs take (the quota's starting point)
+//   quarantine(tenant, sha1)  moves the blob out of reach (get answers null; usage still counts it) without destroying it; idempotent (an absent blob is not an error)
+//   restore(tenant, sha1)     puts a quarantined blob back, unless the tenant has the blob again (then the quarantined copy is dropped); idempotent
+//   delete(tenant, sha1)      removes the blob for good, quarantined copy included; idempotent
+//             (only the blob reaper, server/blob-reaper.js, calls these three: PROTOCOL.md § Blobs, "References and purge")
+// Optional `deadlineMs`: the longest one of these calls may take (an adapter that can hang bounds its calls); the reaper requires it to be well below its claim.
+// Shared port pieces, no adapter code: adapters never import each other.
+//
+// Errors are PortError codes: bad-id (tenant or sha1), bad-entry (not bytes, or empty), too-large, hash-mismatch, not-image.
+// put answers true when it stored the blob now and false when the tenant already had it; the first bytes for a hash are kept.
+// Blobs are per tenant: the same sha1 under two tenants is two blobs. An infrastructure failure rejects (never null).
+
+/** The method names every Blobs adapter has (test/server/adapter-surface.test.js). */
+export const BLOBS_METHODS = Object.freeze(["put", "get", "usage", "quarantine", "restore", "delete"]);
+
+/**
+ * @typedef {{
+ *   put(tenant: string, sha1: string, bytes: Uint8Array): Promise<boolean>,
+ *   get(tenant: string, sha1: string): Promise<null | Uint8Array>,
+ *   usage(tenant: string): Promise<number>,
+ *   quarantine(tenant: string, sha1: string): Promise<void>,
+ *   restore(tenant: string, sha1: string): Promise<void>,
+ *   delete(tenant: string, sha1: string): Promise<void>,
+ * }} Blobs
+ */
 
 import { isSha1, PortError } from "../ids.js";
+import { BLOB_PENDING_MS } from "../../packages/protocol/envelope.js";
 
 export const MAX_BLOB_BYTES = 10 * 1024 * 1024;
 export const MAX_VIDEO_BLOB_BYTES = 50 * 1024 * 1024;
+/** Where quarantined blobs live, outside every tenant's own folder or key prefix (get never finds them; usage() adds them in): `<QUARANTINE>/<tenant>/<sha1>`. */
+export const QUARANTINE = ".quarantine";
+export { BLOB_PENDING_MS };   // how long a pending reference protects an upload (defined in the protocol package: clients use it too)
+/** How long a hash stays condemned before the reaper may delete it: well past the signed URL's 5 minutes and the pending window. */
+export const BLOB_GRACE_MS = 60 * 60_000;
 
 export const BLOB_MIME = {
   png: "image/png",

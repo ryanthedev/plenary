@@ -18,7 +18,7 @@
 import { Editor, TOOLS } from "../../packages/core/editor.js";
 import { makeElement, isLabel } from "../../packages/core/model.js";
 import { hitTest, shapeAt } from "../../packages/core/geometry.js";
-import { openLink } from "./sync.js";
+import { openLink, BLOB_PENDING_MS } from "./sync.js";
 import { uiRole, mayUseTool, streamFor, canEdit, viewKey, clipboardKey, settingsKey, EXTRAS } from "./roles.js";
 
 export const NOTE = { width: 190, height: 96, fill: "#ffec99" };
@@ -67,10 +67,11 @@ export function createSession({ join, fetchSnapshot = null, uploadBlob = null, f
   const wall = now ?? clock?.now;
   const edClock = typeof wall === "function" ? () => wall() : undefined;
   const eds = { board: new Editor({ clock: edClock }), notes: new Editor({ clock: edClock }) };
+  const stamp = () => edClock?.() ?? 0;   // the clock port's now (no clock: 0, so a picture is offered once)
   const binds = {};
   const draw = random ?? clock?.random;
   const s = {
-    eds, binds, active: "board", tool: "hand", roleSeen: null, chrome: null, blocked: 0, sent: 0,
+    eds, binds, active: "board", tool: "hand", roleSeen: null, canShare: false, canMove: false, welcomes: 0, chrome: null, blocked: 0, sent: 0,
     penStyle: null, online: true, gesture: null, flash: null,
     tab: tab ?? (typeof draw === "function" ? mintTab(draw) : null),
   };
@@ -219,6 +220,7 @@ export function createSession({ join, fetchSnapshot = null, uploadBlob = null, f
       }
       if (stream === "notes") for (const el of op.elements ?? []) if (!known(el.id)) mineNow().add(el.id);
       if (op.elements?.length || op.appState) s.sent++;
+      if (!op.transient) offerPlaced(stream, ed, op);
       inner(op);
     };
   }
@@ -230,7 +232,7 @@ export function createSession({ join, fetchSnapshot = null, uploadBlob = null, f
   s.refreshRole = () => {
     const r = C.lastRole;
     if (!r) return;
-    s.roleSeen = r;
+    s.roleSeen = r; s.canShare = C.canShare === true; s.canMove = C.canMove === true; s.welcomes = C.welcomes ?? 0;
     const ui = uiRole(r);
     if (!s.chrome) { s.chrome = ui; s.tool = ui === "viewer" ? "hand" : "select"; applyTool(); }
   };
@@ -263,7 +265,7 @@ export function createSession({ join, fetchSnapshot = null, uploadBlob = null, f
   s.may = may;
   s.canWriteStream = stream => may() && streamOk(stream);
 
-  // Is this note element one the person may change? Presenters moderate every note.
+  // Is this note element one the user may change? Presenters moderate every note.
   s.isMine = id => {
     if (s.effective === "presenter") return true;
     const a = C.noteAuthor(id) ?? noteAuthor(id);
@@ -405,6 +407,7 @@ export function createSession({ join, fetchSnapshot = null, uploadBlob = null, f
   s.addPicture = (file, at) => {
     const stream = s.role === "presenter" ? "board" : "notes";
     let id = null;
+    stored.set(file.id, stamp());                                     // the caller uploads it (not offered a second time)
     s.act(stream, ed => { id = ed.addImage(file, at); });
     return id;
   };
@@ -412,18 +415,91 @@ export function createSession({ join, fetchSnapshot = null, uploadBlob = null, f
   s.addVideo = (file, at) => {
     const stream = s.role === "presenter" ? "board" : "notes";
     let id = null;
+    stored.set(file.id, stamp());
     s.act(stream, ed => { id = ed.addVideo(file, at); });
     return id;
   };
-  /** Upload picture bytes via signed PUT URL over the active WS link + HTTP blob adapter. */
+  /** Upload picture/video bytes via signed PUT URL over the active WS link + HTTP blob adapter. */
   s.uploadBlob = async (sha1, bytes, mimeType) => {
     if (typeof uploadBlob !== "function") return false;
     const url = await C.requestBlobUrl(sha1, { put: true });
     await uploadBlob(url, bytes, mimeType);
     return true;
   };
-  /** Picture bytes from elsewhere (the blob relay): shown in both Editors, never sent as an op. */
-  s.receiveFiles = files => { for (const ed of Object.values(eds)) { ed.doc.apply({ files }); ed.changed(); } };
+  /** fileId → ms of this client's last put or fetch of that picture. */
+  const stored = new Map();
+  /** Pictures waiting for the app to upload them (see `unsavedFiles`): fileId → file. */
+  const offers = new Map();
+  /** Image elements this client placed whose op may not be acknowledged yet: elementId → { stream, fileId } (see `unsavedFiles`). */
+  const awaiting = new Map();
+  /** Offers `fileId`'s bytes for upload unless this client put or fetched it within BLOB_PENDING_MS. */
+  const offerFile = (ed, fileId, t) => {
+    const file = ed.doc.files?.[fileId];
+    if (!file || t - (stored.get(fileId) ?? -Infinity) < BLOB_PENDING_MS) return;
+    stored.set(fileId, t); offers.set(fileId, file);
+  };
+  /**
+   * A committed op of this client that PLACES an image (a new element, or one whose fileId changed; never a move, resize or restyle of a picture that
+   * is already there): offer its picture for upload unless this client put or fetched it within BLOB_PENDING_MS. The server may have deleted a picture
+   * no board used for a while (PROTOCOL.md § Blobs, "References and purge"), and the bytes of a pasted selection or a library item never travel in
+   * ops, so the client that places them puts them again. The element is remembered until the room sequences it: an op sent offline is resent on
+   * reconnect without passing here, so its acknowledgement offers the picture again (same age rule; see `unsavedFiles`).
+   */
+  const offerPlaced = (stream, ed, op) => {
+    const t = stamp();
+    for (const el of op.elements ?? []) {
+      if ((el.type !== "image" && el.type !== "video") || el.isDeleted || typeof el.fileId !== "string") continue;
+      if (C.element(stream, el.id)?.fileId === el.fileId) continue;   // already placed with this picture: a move, resize or restyle
+      awaiting.set(el.id, { stream, fileId: el.fileId });
+      offerFile(ed, el.fileId, t);
+    }
+    if (awaiting.size > 500) for (const [id, w] of awaiting) if (!stillAwaited(id, w)) awaiting.delete(id);
+  };
+  /** Is this placed picture still waiting for its op to be sequenced? No when the room did, when it refused the op (the link's copy of the element is gone), or when the Editor no longer shows the element. */
+  const stillAwaited = (id, w) => {
+    if (C.sequenced(w.stream, id)) return false;
+    const mine = eds[w.stream].doc.get(id);
+    return !!mine && !mine.isDeleted && mine.fileId === w.fileId && C.element(w.stream, id)?.fileId === w.fileId;
+  };
+  /**
+   * Pictures the app should put now: each placed by this client's own op (a pasted selection, a library item, a duplicate), bytes held, not put
+   * or fetched by this client for BLOB_PENDING_MS. Asked every frame; empty when nothing was placed (nothing walks the documents).
+   * @returns {object[]} files as `net.put` takes them
+   */
+  s.unsavedFiles = () => {
+    // The pictures this client placed wait for their ops to be sequenced (acknowledged, also after a reconnect that resent them without passing the Editor):
+    // then the same age rule applies. A refused op is never sequenced and its element leaves the link's copy: dropped, never offered.
+    if (awaiting.size) {
+      const t = stamp();
+      for (const [id, w] of awaiting) {
+        if (C.sequenced(w.stream, id)) { awaiting.delete(id); offerFile(eds[w.stream], w.fileId, t); }
+        else if (!stillAwaited(id, w)) awaiting.delete(id);
+      }
+    }
+    if (!offers.size) return [];
+    const out = [...offers.values()]; offers.clear(); return out;
+  };
+  /**
+   * Live image elements, in either Editor, whose bytes neither Editor holds: Map fileId → stamp. The stamp names what the
+   * documents say about that file (its elements and their versions), so a net can tell "a change touched this picture"
+   * from "nothing new". Memoised on the two documents' revisions: a frame that changed nothing costs two comparisons,
+   * not a scan of every element.
+   * @returns {Map<string, string>}
+   */
+  let missingKey = null, missingMap = new Map();
+  s.missing = () => {
+    const key = Object.values(eds).map(ed => ed.doc.rev ?? 0).join("|");
+    if (key === missingKey) return missingMap;
+    const have = id => Object.values(eds).some(ed => ed.doc.files?.[id]), out = new Map();
+    for (const ed of Object.values(eds)) for (const el of ed.doc.byId.values())
+      if ((el.type === "image" || el.type === "video") && !el.isDeleted && typeof el.fileId === "string" && !have(el.fileId)) out.set(el.fileId, `${out.get(el.fileId) ?? ""}${el.id}:${el.version ?? 0};`);
+    missingKey = key; missingMap = out;
+    return out;
+  };
+  /** The `fileId`s of s.missing(). */
+  s.missingFiles = () => [...s.missing().keys()];
+  /** Picture bytes fetched for a placeholder (net.want → onFile; PROTOCOL.md § Blobs): shown in both Editors, never sent as an op. */
+  s.receiveFiles = files => { for (const id of Object.keys(files)) stored.set(id, stamp()); for (const ed of Object.values(eds)) { ed.doc.apply({ files }); ed.changed(); } };
 
   // ── keys ──
   s.key = (key, m = {}) => {

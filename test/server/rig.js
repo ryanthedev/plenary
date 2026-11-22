@@ -11,7 +11,21 @@ import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy, roleCache } from "../../server/auth/tenancy.js";
 import { Replica } from "../../packages/protocol/replica.js";
 import { jsonCodec } from "../../packages/protocol/codec.js";
-import { tempDir, sleep, until } from "./helpers.js";
+import { tempDir, sleep, until, testNets } from "./helpers.js";
+import { mkBoard } from "../auth/fixtures.js";
+
+/**
+ * The room host's heartbeat in tests (production default 2 s). Things a test waits for ride on it: the gateway's board feed
+ * rebases onto a fold and catches up on the Store on the next heartbeat, and a waiting host's silence rule is 2 of them.
+ * A test that depends on the production value passes its own `host.heartbeatMs`.
+ */
+export const HEARTBEAT_MS = 200;
+
+/**
+ * Every rig not yet stopped. A test that fails before its last line would leave a gateway and its sockets running:
+ * test/preload.js stops them after every test, in every file.
+ */
+export const stopRigs = () => Promise.all([...testNets().rigs].map(r => r.stop()));
 
 export const ROLES = ["owner", "editor", "annotator", "commenter", "viewer"];
 /** Every dev token contains this, so a test can assert no token ever reaches a log line. */
@@ -20,10 +34,12 @@ export const tokenOf = name => `${SECRET}-${name}-token`;
 
 /**
  * @param {{ verifyDelayMs?: number, cache?: object, wrapStore?: (s: object) => object, wrapAuth?: (a: object) => object,
- *   wrapRegistry?: (r: object) => object, wrapBus?: (b: object) => object, limits?: object, host?: object, dir?: string, registry?: object, ids?: object }} [o]
+ *   wrapRegistry?: (r: object) => object, wrapBus?: (b: object) => object, now?: () => number, timers?: object, limits?: object, host?: object, dir?: string, registry?: object, ids?: object }} [o]
+ * `blobs`: the Blobs adapter (default: disk in `dir`; null: none). `server`: more createServer options (blobKey, quotaBytes, publicUrl).
  * Pass `dir`, `registry` and `ids` from an earlier rig to restart "the same server" on the same data.
  */
 export async function rig(o = {}) {
+  const live = testNets().rigs;
   const dir = o.dir ?? tempDir();
   const lines = [];
   const log = createLogger({ write: l => lines.push(l), level: "debug" });
@@ -31,8 +47,8 @@ export async function rig(o = {}) {
   const ids = o.ids ?? {};
   if (!o.ids) {
     const tenant = await registry.createTenant({ domain: "acme.test" });
-    const board = await registry.createBoard({ tenant: tenant.id, title: "all hands", memberRole: null });
-    const other = await registry.createBoard({ tenant: tenant.id, title: "no grants here", memberRole: null });
+    const board = await mkBoard(registry, { tenant: tenant.id, title: "all hands", memberRole: null });
+    const other = await mkBoard(registry, { tenant: tenant.id, title: "no grants here", memberRole: null });
     Object.assign(ids, { tenant: tenant.id, board: board.id, otherBoard: other.id });
     for (const role of ROLES) await registry.setGrant(board.id, "dev:" + role, role);
     for (let i = 0; i < 8; i++) await registry.setGrant(board.id, "dev:editor" + i, "editor");
@@ -41,13 +57,15 @@ export async function rig(o = {}) {
   const names = [...ROLES, ...Array.from({ length: 8 }, (_, i) => "editor" + i), "stranger"];
   const dev = devAuth({ enabled: true, tokens: Object.fromEntries(names.map(n => [tokenOf(n), { name: n }])) });
   // `o.cache`: roleCache options → hellos read through the role cache, as server/main.js wires it (p5-load).
-  let auth = authPort({ dev, tenancy: o.cache ? roleCache({ registry, ...o.cache }) : tenancy({ registry }) });
+  const clock = o.now ? { now: o.now } : {};   // the same clock reads links' and invites' expiry
+  let auth = authPort({ dev, tenancy: o.cache ? roleCache({ registry, ...clock, ...o.cache }) : tenancy({ registry, ...clock }) });
   const calls = { verify: 0, role: 0, board: 0 };
   const cacheCalls = { rolesFor: 0, invalidate: 0 };
   const inner = auth;
   auth = {
     async verify(t) { calls.verify++; if (o.verifyDelayMs) await sleep(o.verifyDelayMs); return inner.verify(t); },
     async role(id, b) { calls.role++; return inner.role(id, b); },
+    async access(id, b) { calls.role++; return inner.access(id, b); },
     ...(inner.rolesFor ? { async rolesFor(b, ids) { cacheCalls.rolesFor++; return inner.rolesFor(b, ids); } } : {}),
     ...(inner.invalidate ? { invalidate(b, u) { cacheCalls.invalidate++; return inner.invalidate(b, u); } } : {}),
   };
@@ -63,7 +81,7 @@ export async function rig(o = {}) {
   bus.subscribe(subjects.inbox(ids.tenant, ids.otherBoard), m => inbox.push(m));
   // Catch-up frames are the gateway's now (its board feed): the scaffold's room-host knobs map onto the feed's.
   const feed = { ...(o.host?.chunkBytes ? { chunkBytes: o.host.chunkBytes } : {}), ...(o.host?.tailFoldBytes ? { rebaseBytes: Math.max(1, Math.floor(o.host.tailFoldBytes / 4)) } : {}), ...(o.limits?.feed ?? {}) };
-  const server = createServer({ auth, registry: reg, store, bus, blobs: diskBlobs({ dir: join(dir, "blobs") }), log, port: 0, limits: { opRate: 1e6, opBurst: 1e6, ...(o.limits ?? {}), feed }, host: o.host });   // the gateway's op pace is off unless a test sets it
+  const server = createServer({ auth, registry: reg, store, bus, ...(o.onWelcomed ? { onWelcomed: o.onWelcomed } : {}), blobs: o.blobs === undefined ? diskBlobs({ dir: join(dir, "blobs") }) : o.blobs, ...(o.server ?? {}), log, port: 0, limits: { opRate: 1e6, opBurst: 1e6, ...(o.limits ?? {}), feed }, host: { heartbeatMs: HEARTBEAT_MS, ...o.host }, ...(o.now ? { now: o.now } : {}), ...(o.timers ? { timers: o.timers } : {}) });   // the gateway's op pace is off unless a test sets it
 
   const self = {
     dir, lines, log, registry, ids, store, rawStore, bus, server, inbox, calls, cacheCalls,
@@ -74,8 +92,13 @@ export async function rig(o = {}) {
     idle: () => server.rooms.idle(ids.tenant, ids.board),
     sock: () => sock(server.wsUrl),
     client: (name, cname) => client(self, name, cname),
-    async stop({ keepStore = false } = {}) { await server.stop(); await bus.close(); if (!keepStore) await rawStore.close(); },
+    /** Idempotent: a test that stops its rig itself and the afterEach safety net both call it. */
+    async stop({ keepStore = false } = {}) {
+      if (!live.delete(self)) return;
+      await server.stop(); await bus.close(); if (!keepStore) await rawStore.close();
+    },
   };
+  live.add(self);
   return self;
 }
 
@@ -85,7 +108,11 @@ export async function sock(url) {
   const s = { ws, msgs: [], raw: [], closed: null, send: m => ws.send(typeof m === "string" || m instanceof Uint8Array ? m : JSON.stringify(m)) };
   ws.onmessage = e => { s.raw.push(e.data); try { s.msgs.push(JSON.parse(e.data)); } catch { s.msgs.push({ unparsable: true }); } };
   const done = new Promise(res => { ws.onclose = e => { s.closed = { code: e.code, reason: e.reason }; res(s.closed); }; });
-  s.whenClosed = (ms = 30_000) => Promise.race([done, sleep(ms).then(() => { throw new Error("socket did not close"); })]);
+  s.whenClosed = (ms = 30_000) => {
+    let t;                                                   // cleared when the socket closes first, so no 30 s timer outlives the call
+    const late = new Promise((_, rej) => { t = setTimeout(() => rej(new Error("socket did not close")), ms); });
+    return Promise.race([done, late]).finally(() => clearTimeout(t));
+  };
   // Backstops, not expectations: generous so a loaded machine (other suites running) slows a test, not fails it.
   s.next = (pred, what = "a message", ms = 30_000) => until(() => s.msgs.find(pred), what, ms);
   s.close = () => { ws.close(); return done; };
@@ -214,8 +241,8 @@ export async function rawSock(wsUrl, { frames = false } = {}) {
   const s = { socket, got: 0, ended: false };
   if (frames) {
     // Optional: parse the server's (unmasked) frames into `s.texts`, so a test can check what arrived, whatever its
-    // size (Bun's own client refuses a message over 128 MiB). Only text frames are kept; others are skipped.
-    s.texts = []; let parts = [], have = 0, need = -1, hdr = 0, op = 0;
+    // size (Bun's own client refuses a message over 128 MiB). Only text frames are kept; pings are counted (`s.pings`).
+    s.texts = []; s.pings = 0; let parts = [], have = 0, need = -1, hdr = 0, op = 0;
     const flat = () => { if (parts.length > 1) parts = [Buffer.concat(parts)]; return parts[0]; };
     s.parse = d => {
       parts.push(d); have += d.length;
@@ -230,6 +257,7 @@ export async function rawSock(wsUrl, { frames = false } = {}) {
         if (have < hdr + need) return;                   // the payload isn't all here yet (no concat until it is)
         const b = flat();
         if (op === 1) s.texts.push(b.toString("utf8", hdr, hdr + need));
+        else if (op === 9) s.pings++;                    // the server's keep-alive ping (never answered: no pong is sent)
         const left = b.subarray(hdr + need); parts = left.length ? [left] : []; have = left.length; need = -1;
       }
     };

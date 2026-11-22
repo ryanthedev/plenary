@@ -1,5 +1,5 @@
 // DEV HARNESS, NOT THE PRODUCT SERVER (brief p5-google). A composition root for one local check: real Google
-// sign-in against the Omniping OAuth client, before the engine's server mounts httpRoutes (p2-swap). Nothing here
+// sign-in against your own OAuth client, before the engine's server mounts httpRoutes (p2-swap). Nothing here
 // is used by server/main.js; delete it once a rerun against the real server replaces it.
 //
 //   bun scripts/dev-google.js   serve on http://localhost:8080 (bound to 127.0.0.1); Ctrl-C stops it
@@ -104,20 +104,26 @@ export async function startDevGoogle({ env = process.env, port = PORT, hostname 
   return { server, oidc, sessions, url: `http://${hostname}:${server.port}`, stop: () => server.stop(true) };
 }
 
+/** Signals that stop the harness cleanly (a closed terminal sends SIGHUP). */
+export const STOP_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"];
+export const FETCH_TIMEOUT_MS = 15000;   // one request, headers and body: a Google that never answers must not hang a sign-in
+
 /**
  * `fetch` that never lets a URL escape in an error. When Bun's fetch throws (offline, DNS, TLS, refused), its error
  * carries the full URL in `path` (and sometimes the message), and test runners print it; an authorization URL holds
  * the client id. This rethrows a fresh Error with only the error code and no `cause`. (p5-googlev MEDIUM 1)
- * @type {typeof fetch}
+ * It also gives every request its own timeout (a caller's init.signal wins).
  */
-export async function safeFetch(input, init) {
-  try { return await fetch(input, init); }
+export const makeSafeFetch = (timeoutMs) => async (input, init) => {
+  try { return await fetch(input, { signal: AbortSignal.timeout(timeoutMs), ...init }); }
   catch (e) {
     const code = typeof e?.code === "string" && /^[A-Za-z0-9_]{1,40}$/.test(e.code) ? e.code
       : typeof e?.name === "string" && /^[A-Za-z]{1,40}$/.test(e.name) ? e.name : "error";
     throw new Error("google unreachable: " + code);
   }
-}
+};
+/** @type {typeof fetch} */
+export const safeFetch = makeSafeFetch(FETCH_TIMEOUT_MS);
 
 /**
  * Follow an authorization URL once, as a browser with no cookies would, and classify Google's answer. Google's
@@ -154,13 +160,15 @@ export async function listening(host, port, timeoutMs = 1000) {
 export const portBusy = async port => (await listening("127.0.0.1", port)) || (await listening("::1", port));
 
 if (import.meta.main) {
-  if (await portBusy(PORT)) {
-    console.error(`dev-google: something already answers on port ${PORT}; stop it first (the redirect URI fixes the port)`);
+  // DEV_GOOGLE_PORT moves the listening port only (tests; the redirect URI, and so the real sign-in, stays on 8080).
+  const listenPort = process.env.DEV_GOOGLE_PORT ? Number(process.env.DEV_GOOGLE_PORT) : PORT;
+  if (await portBusy(listenPort)) {
+    console.error(`dev-google: something already answers on port ${listenPort}; stop it first (the redirect URI fixes the port)`);
     process.exit(1);
   }
   let h;
-  try { h = await startDevGoogle(); }
+  try { h = await startDevGoogle({ port: listenPort }); }
   catch (e) { console.error(String(e.message).startsWith("dev-google:") ? e.message : `dev-google: ${e.message}`); process.exit(1); }   // p5-googlev LOW 3
   console.error(`dev-google: pid ${process.pid}; open ${ORIGIN}/ (Ctrl-C or kill ${process.pid} to stop)`);
-  for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => { h.stop(); process.exit(0); });
+  for (const sig of STOP_SIGNALS) process.on(sig, () => { h.stop(); process.exit(0); });
 }

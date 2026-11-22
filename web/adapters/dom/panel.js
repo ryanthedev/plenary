@@ -81,7 +81,8 @@ export function renderPanel(root, ctx) {
   const ed = S.eds[stream];
   const m = propsModel(ed);
   const dis = !may;
-  const chip = (txt, on, onclick, title, view = false) => h("button.c" + (on ? ".on" : ""), { title, disabled: !view && dis, onclick: () => onclick?.() }, txt);
+  // `fk` is the control's focus key (web/adapters/dom/focus.js): made of what it changes, never of what it says, so a redraw restores focus to the SAME control.
+  const chip = (txt, on, onclick, title, view = false, fk = null) => h("button.c" + (on ? ".on" : ""), { title, disabled: !view && dis, "data-fk": fk, onclick: () => onclick?.() }, txt);
   const act = fn => S.act(stream, fn);
   const style = patch => act(e => e.setStyle(patch));
   const row = (lab, key, ...opts) => h("div.row", {}, h("span.lab", {}, lab, key ? h("i", {}, key) : null), h("span.opts", {}, ...opts));
@@ -94,9 +95,9 @@ export function renderPanel(root, ctx) {
       const ctrls = opts.map(([t, val]) => {
         if (isColor) {
           const on = m[prop] === val;
-          return h("button.sw" + (val === "transparent" ? ".none" : "") + (on ? ".on" : ""), { title: val === "transparent" ? "No fill" : val, "aria-label": val, disabled: dis, style: val === "transparent" ? {} : { background: val }, onclick: () => style({ [prop]: val }) });
+          return h("button.sw" + (val === "transparent" ? ".none" : "") + (on ? ".on" : ""), { title: val === "transparent" ? "No fill" : val, "aria-label": val, disabled: dis, "data-fk": `chip:${prop}:${val}`, style: val === "transparent" ? {} : { background: val }, onclick: () => style({ [prop]: val }) });
         }
-        return chip(t, isOn(m, prop, val), () => style({ [prop]: val }), `${prop} ${JSON.stringify(val)}`);
+        return chip(t, isOn(m, prop, val), () => style({ [prop]: val }), `${prop} ${JSON.stringify(val)}`, false, `chip:${prop}:${JSON.stringify(val)}`);
       });
       if (isColor) {
         const pickerOpen = ctx.colorPicker === prop;
@@ -145,7 +146,7 @@ export function renderPanel(root, ctx) {
     frames: () => {
       const fs = B.frames();
       return [
-        ...fs.map((f, i) => h("button.list-row" + (B.frameAt === f.id ? ".on" : ""), { onclick: () => { S.goToFrame(f.id); ctx.onChange(); } }, h("span.dim", {}, String(i + 1)), " ", f.name || `Frame ${i + 1}`)),
+        ...fs.map((f, i) => h("button.list-row" + (B.frameAt === f.id ? ".on" : ""), { "data-fk": `frame:${f.id}`, onclick: () => { S.goToFrame(f.id); ctx.onChange(); } }, h("span.dim", {}, String(i + 1)), " ", f.name || `Frame ${i + 1}`)),
         h("div.row", { style: { marginTop: "6px" } }, h("span.opts", {}, chip([icon("chevronLeft", { size: 14 }), " prev"], false, () => S.stepFrame(-1), "PgUp", true), chip(["next ", icon("chevronRight", { size: 14 })], false, () => S.stepFrame(1), "PgDn", true), chip("all", false, () => S.fit(), "Fit everything (⇧1)", true))),
       ];
     },
@@ -219,16 +220,16 @@ export function renderPanel(root, ctx) {
       const ls = [...B.doc.layers].reverse(), count = id => B.doc.live().filter(e => layerOf(e) === id && !isLabel(e)).length;
       const lact = fn => S.act("board", fn, { settings: true });
       return [
-        ...ls.map(l => h("div.list-row" + (B.activeLayer === l.id ? ".on" : ""), { onclick: () => { B.activeLayer = l.id; B.changed(); ctx.onChange(); } },
-          h("button.tb", { title: l.visible ? "Hide" : "Show", "aria-label": l.visible ? "Hide layer" : "Show layer", disabled: dis, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { visible: !l.visible })); } }, icon(l.visible ? "eye" : "eyeOff", { size: 14 })),
-          h("button.tb", { title: l.locked ? "Unlock" : "Lock", "aria-label": l.locked ? "Unlock layer" : "Lock layer", disabled: dis, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { locked: !l.locked })); } }, icon(l.locked ? "lock" : "unlock", { size: 14 })),
+        h("div", { role: "list", "aria-label": "Layers" }, ls.map(l => h("div.list-row" + (B.activeLayer === l.id ? ".on" : ""), { role: "listitem", "aria-label": `Layer: ${l.name || "Layer"}`, "data-fk": `layer:${l.id}:row`, tabindex: "-1", onclick: () => { B.activeLayer = l.id; B.changed(); ctx.onChange(); } },
+          h("button.tb", { title: l.visible ? "Hide" : "Show", "aria-label": l.visible ? "Hide layer" : "Show layer", disabled: dis, "data-fk": `layer:${l.id}:visible`, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { visible: !l.visible })); } }, icon(l.visible ? "eye" : "eyeOff", { size: 14 })),
+          h("button.tb", { title: l.locked ? "Unlock" : "Lock", "aria-label": l.locked ? "Unlock layer" : "Lock layer", disabled: dis, "data-fk": `layer:${l.id}:lock`, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { locked: !l.locked })); } }, icon(l.locked ? "lock" : "unlock", { size: 14 })),
           h("span", { title: "Double-click to rename", ondblclick: ev => {
             ev.stopPropagation(); if (dis) return;
             const input = h("input.rename", { value: l.name ?? "", maxLength: 80, onkeydown: k => { k.stopPropagation(); if (k.key === "Enter") input.blur(); if (k.key === "Escape") { input.value = l.name ?? ""; input.blur(); } },
               onblur: () => { const n = input.value.trim(); if (n && n !== l.name) lact(e => e.updateLayer(l.id, { name: n })); ctx.onChange(); } });
             ev.currentTarget.replaceWith(input); input.focus(); input.select();
           } }, l.name || "Layer"),
-          h("span.n", {}, String(count(l.id))))),
+          h("span.n", {}, String(count(l.id)))))),
         h("div.row", { style: { marginTop: "6px" } }, h("span.opts", {},
           chip(icon("plus", { size: 14 }), false, () => lact(e => e.addLayer()), "New layer"),
           chip(icon("arrowUp", { size: 14 }), false, () => lact(e => e.moveLayer(B.activeLayer, 1)), "Move up"),
@@ -240,7 +241,7 @@ export function renderPanel(root, ctx) {
     library: () => {
       const items = ctx.library ?? [];
       return [
-        h("div.lib", {}, items.map(it => h("button.item", { title: `Insert ${it.name ?? "item"}`, disabled: dis, onclick: () => S.act("board", e => e.insertLibraryItem(it)) }, h("b", {}, String(it.elements.filter(e => !isLabel(e)).length)), h("span", {}, it.name ?? "item")))),
+        h("div.lib", {}, items.map((it, i) => h("button.item", { title: `Insert ${it.name ?? "item"}`, disabled: dis, "data-fk": `lib:${it.id ?? i}`, onclick: () => S.act("board", e => e.insertLibraryItem(it)) }, h("b", {}, String(it.elements.filter(e => !isLabel(e)).length)), h("span", {}, it.name ?? "item")))),
         h("div.row", { style: { marginTop: "8px" } }, h("span.opts", {}, chip("+ save selection", false, () => { const it = B.libraryItem(); if (it) ctx.setLibrary(addToLibrary(items, [it])); }, "libraryItem(name)"))),
         h("div.hint", {}, items.length ? "Click an item to insert it. Drop a .excalidrawlib to add." : "Empty. Select shapes and save them, or drop a .excalidrawlib."),
       ];
@@ -261,7 +262,7 @@ export function renderPanel(root, ctx) {
     h("button.tb" + (state.mode === "tabs" ? ".on" : ""), { title: "Tabs", "aria-label": "Tabs layout", onclick: () => ctx.setState({ type: "mode", mode: "tabs" }) }, icon("tabs", { size: 15 })),
     h("button.tb", { title: "Fold all / unfold all", "aria-label": "Fold or unfold all", onclick: () => ctx.setState({ type: "foldAll", folded: state.folded.length < 6 }) }, icon("fold", { size: 15 })),
     h("button.tb", { title: "Reset the panel layout", "aria-label": "Reset panel layout", onclick: () => ctx.setState({ type: "reset" }) }, icon("settings", { size: 15 }))));
-  if (tabs) out.push(h("div.tabs", {}, secs.map(s => h("button" + (s.active ? ".on" : ""), { onclick: () => ctx.setState({ type: "tab", id: s.id }) }, s.title))));
+  if (tabs) out.push(h("div.tabs", {}, secs.map(s => h("button" + (s.active ? ".on" : ""), { "data-fk": `panel-tab:${s.id}`, onclick: () => ctx.setState({ type: "tab", id: s.id }) }, s.title))));
   for (const s of secs) {
     if (!s.active) continue;
     out.push(h("div.sec" + (s.folded ? ".folded" : ""), { "data-sec": s.id },

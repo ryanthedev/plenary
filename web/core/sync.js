@@ -1,7 +1,7 @@
 // Editor ⇄ Replica binding: one link (transport + Replica + hello) per board, and on it one core Editor per element
 // stream, each kept in step with its stream (PROTOCOL.md v1; p8-one-link: one connection per tab).
 //
-// The seam (docs/m2/briefs/p6-base.md): Replica, Room and the codec belong to the engine track, so every
+// The seam: Replica, Room and the codec belong to the engine track, so every
 // call into them lives in this file and nowhere else in web/. The page and the tests use only what this
 // file exports; the returned handle never hands out the Replica itself.
 //
@@ -23,6 +23,7 @@
 // is skipped, never queued: the next move or the commit supersedes it. Hello and real ops are never gated.
 
 import { Replica } from "../../packages/protocol/replica.js";
+export { BLOB_PENDING_MS } from "../../packages/protocol/envelope.js";   // the one number clients and servers share for how long an upload is pending (re-offered after it)
 import { presenceProblem, presenceLimiter, MAX_PREVIEW_ELEMENTS } from "../../packages/protocol/presence.js";
 import { clone } from "../../packages/core/model.js";
 import { PRESENCE_BACKLOG_BYTES } from "../ports/transport.js";
@@ -124,7 +125,11 @@ export function openLink({ transport, fetchSnapshot = null, token: firstToken, b
   let limited = null;             // the room's message, from the cap's refusal until the next welcome
   let nextTryAt = null;           // when the backoff reopens (now()-based), while one is armed
   let roleSeen = null;            // the last non-null welcome.role: kept across resyncs (set before status fires)
+  let welcomeCount = 0;           // welcomes received, one per connection (a page acts on every one, not only on a change of what it said)
+  let moveSeen = false;           // the last welcome's `can.move` (the move permission as a Unit member): Move to…
+  let shareSeen = false;          // the last welcome's `can.share` (members.manage on the board): the Share button
   let roleTold = null;            // the last role reported through onRoom
+  let shareTold = false, moveTold = false;
   let userSeen = null;            // the last non-null welcome.user: kept across resyncs
   // Element ids the room has sequenced, per stream (entries and snapshots of this link; never cleared, as the old
   // per-session reader kept them): a write to one is a change, not a create.
@@ -256,7 +261,9 @@ export function openLink({ transport, fetchSnapshot = null, token: firstToken, b
     }
     if (msg?.t === "error" && msg.id === undefined && replica.welcomed && pendingBlobs.length && (msg.code === "bad-op" || msg.code === "forbidden" || msg.code === "limit" || msg.code === "unavailable")) {
       replica.receive({ t: "hb" });
-      const b = pendingBlobs.shift();
+      const idx = typeof msg.sha1 === "string" ? pendingBlobs.findIndex(x => x.sha1 === msg.sha1) : 0;
+      if (idx < 0) { pump(); return; }
+      const b = pendingBlobs.splice(idx, 1)[0];
       if (b.timer != null) { try { timers.clear(b.timer); } catch {} b.timer = null; }
       const err = new Error(typeof msg.message === "string" && msg.message ? msg.message : msg.code);
       err.code = msg.code;
@@ -267,10 +274,12 @@ export function openLink({ transport, fetchSnapshot = null, token: firstToken, b
     const was = msg?.t === "error" && msg.id !== undefined ? replica.pending.get(msg.id) : null;
     const refusedRecord = was?.stream === "records" && !["stale", "unavailable", "auth", "version", "stale-setting"].includes(msg.code)
       ? { op: clone(was.op), code: msg.code, message: typeof msg.message === "string" ? msg.message : "" } : null;
+    const wasWelcomed = replica.welcomed;
     const did = replica.receive(msg);
+    if (!wasWelcomed && replica.welcomed) welcomeCount++;
     noteSequenced(did);
     // Who and what the room says this link is, before any status change reports it (the session reads them then).
-    if (replica.role) roleSeen = replica.role;
+    if (replica.role) { roleSeen = replica.role; shareSeen = replica.canShare === true; moveSeen = replica.canMove === true; }
     if (replica.user) userSeen = replica.user;
     if (limited && replica.welcomed) limited = null;   // in: the cap let this connection through
     if (status === "live" && !did.reset && !replica.resync) {
@@ -295,7 +304,7 @@ export function openLink({ transport, fetchSnapshot = null, token: firstToken, b
   function afterReceive(msg, did, refusedRecord) {
     if (msg?.t === "presence" && Array.isArray(msg.batch)) onRoom({ type: "presence", batch: msg.batch });
     if (refusedRecord && did.dropped.includes(msg.id)) onRoom({ type: "refused", ...refusedRecord });
-    if (roleSeen && roleSeen !== roleTold) { roleTold = roleSeen; onRoom({ type: "role", role: roleSeen }); }
+    if (roleSeen && (roleSeen !== roleTold || shareSeen !== shareTold || moveSeen !== moveTold)) { roleTold = roleSeen; shareTold = shareSeen; moveTold = moveSeen; onRoom({ type: "role", role: roleSeen, share: shareSeen, move: moveSeen }); }
     if (did.refusedSettings.length || did.retryReady.length) {
       const touched = new Set();
       for (const r of did.refusedSettings) {
@@ -353,6 +362,12 @@ export function openLink({ transport, fetchSnapshot = null, token: firstToken, b
     get role() { return replica.role ?? null; },
     /** The last role the room gave (welcome.role), kept through a resync, when `role` is null. */
     get lastRole() { return roleSeen; },
+    /** Did the last welcome say the person may share the board (`can.share`)? Kept through a resync. */
+    get canShare() { return shareSeen; },
+    /** Did the last welcome say the person may move the board (`can.move`)? */
+    get canMove() { return moveSeen; },
+    /** How many welcomes this link has had. */
+    get welcomes() { return welcomeCount; },
     /** How many hellos this link has sent (each connect, whatever started it). */
     get hellos() { return hellos; },
     /** This link's wire client id (hello.client = the name plus the Replica's session part): presence names it. */

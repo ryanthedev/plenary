@@ -1,7 +1,7 @@
 // The checks every op passes before a room looks at the board (PROTOCOL.md § Limits, § The element op).
 import { test, expect } from "bun:test";
 import { direct } from "./world.js";
-import { opProblem, parseOpId, isSha1, canWrite, recordProblem, deeperThan, STREAMS, ELEMENT_STREAMS, PROTOCOL_VERSION, RULES_VERSION, MAX_OP_DEPTH, OP_RATE, CAPS, isTab, TAB_RE, MAX_WRITER_CONNS, MAX_TAB_CONNS } from "../packages/protocol/envelope.js";
+import { opProblem, parseOpId, isSha1, blobRefsOf, canWrite, recordProblem, deeperThan, STREAMS, ELEMENT_STREAMS, PROTOCOL_VERSION, RULES_VERSION, MAX_OP_DEPTH, OP_RATE, CAPS, isTab, TAB_RE, MAX_WRITER_CONNS, MAX_TAB_CONNS } from "../packages/protocol/envelope.js";
 import { makeElement } from "../packages/core/model.js";
 
 const rect = (id, extra = {}) => makeElement("rectangle", { id, ...extra });
@@ -45,11 +45,11 @@ test("an image's fileId is 40 lowercase hex characters", () => {
   for (const fileId of ["../t-other/x", "A".repeat(40), "a".repeat(39), 5]) expect([fileId, opProblem(image(fileId))?.code]).toEqual([fileId, "bad-op"]);
 });
 
-test("an op nested deeper than 62 levels is refused; a 30,000-deep one quickly, with no crash and nothing logged", () => {
+test("an op nested deeper than 62 levels is refused; a 30,000-deep one with no crash (no recursion to overflow) and nothing logged", () => {
   expect(MAX_OP_DEPTH).toBe(62);
   expect(opProblem(op({ op: { elements: [nested(59)] } }))).toBe(null);            // 3 + 59 = 62 levels pass
   expect(opProblem(op({ op: { elements: [nested(60)] } })).code).toBe("bad-op");
-  const deep = nested(30_000), started = performance.now();
+  const deep = nested(30_000);
   expect(deeperThan(deep, 62)).toBe(true);
   expect(opProblem(op({ op: { elements: [deep] } }))).toMatchObject({ code: "bad-op", message: "an op nests at most 62 levels deep" });
   let arrays = []; for (let i = 0; i < 30_000; i++) arrays = [arrays];
@@ -59,7 +59,19 @@ test("an op nested deeper than 62 levels is refused; a 30,000-deep one quickly, 
   expect(() => a.op(1, "board", { elements: [deep] })).not.toThrow();
   expect(a.inbox.at(-1)).toMatchObject({ t: "error", id: "a:1", code: "bad-op" });
   expect(d.log.entries.length).toBe(0);
-  expect(performance.now() - started).toBeLessThan(500);
+});
+
+test("deeperThan never recurses: a value nested past this engine's own stack limit is walked to the end without throwing", () => {
+  // The stack limit is measured here, not assumed (30,000 levels proves nothing at max 62: a recursive walk would stop
+  // at level 63 too). A recursive deeperThan overflows at about this depth with a full walk (max = Infinity).
+  let limit = 0;
+  const probe = n => { limit = n; probe(n + 1); };
+  try { probe(1); } catch { /* RangeError: the stack is full */ }
+  const levels = limit * 2, deep = nested(levels);                       // rect → customData → inner … : levels + 1 objects
+  expect(() => deeperThan(deep, Infinity)).not.toThrow();
+  expect(deeperThan(deep, Infinity)).toBe(false);
+  expect(deeperThan(deep, levels + 1)).toBe(false);                       // the deepest object is at depth levels + 1
+  expect(deeperThan(deep, levels)).toBe(true);
 });
 
 test("a first write counts from version 0: no exemption from the jump cap", () => {
@@ -96,4 +108,18 @@ test("hello.tab format (§ Messages, hello.tab): 1-32 of [A-Za-z0-9_-]; caps 8 t
   for (const bad of ["", "x".repeat(33), "a b", "a:b", "a.b", "a|b", "é", 1, null, undefined, ["a"], {}]) expect(isTab(bad)).toBe(false);
   expect(TAB_RE.source).toBe("^[A-Za-z0-9_-]{1,32}$");
   expect([MAX_WRITER_CONNS, MAX_TAB_CONNS]).toEqual([8, 2]);
+});
+
+test("blobRefsOf (§ Blobs, References): the distinct SHA-1 fileIds of image elements across entries, deleted ones included; nothing else", () => {
+  const A = "a".repeat(40), B = "b".repeat(40);
+  const img = (id, fileId, extra = {}) => makeElement("image", { id, fileId, ...extra });
+  const entries = [
+    { seq: 1, op: { elements: [img("i1", A), img("i2", A), rect("r"), img("i3", B, { isDeleted: true })] } },
+    { seq: 2, op: { appState: { grid: 1 } } },                                           // no elements
+    { seq: 3, op: { do: "thread", id: "t" } },                                           // a records action
+    { seq: 4, op: { elements: [img("i4", null), img("i5", "nope"), img("i6", A.toUpperCase()), { id: "x", type: "text", fileId: A }] } },   // not references
+    { seq: 5 }, null,                                                                    // malformed entries are skipped, never thrown on
+  ];
+  expect(blobRefsOf(entries).sort()).toEqual([A, B]);
+  expect(blobRefsOf([])).toEqual([]);
 });

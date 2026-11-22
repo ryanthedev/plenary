@@ -1,7 +1,9 @@
 import { test, expect, beforeEach } from "bun:test";
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { tenancy } from "../../server/auth/tenancy.js";
-import { createBoard, createInvite, createLink, revokeInvite, revokeLink, listInvites, listLinks, setGrant, AdminError } from "../../server/admin/boards.js";
+import { createBoard, mkBoard, spaceOf } from "./fixtures.js";
+import { isUnitAdmin } from "../../server/auth/resolver.js";
+import { createInvite, createLink, revokeInvite, revokeLink, listInvites, listLinks, setGrant, AdminError } from "../../server/admin/boards.js";
 
 let clock, registry, model, acme, globex, admin, board;
 const now = () => clock.t;
@@ -19,6 +21,7 @@ beforeEach(async () => {
   acme = await registry.createTenant({ domain: "acme.com", admins: [admin.user] });
   globex = await registry.createTenant({ domain: "globex.com", admins: ["google:gadmin"] });
   board = await createBoard({ caller: admin, tenant: acme.id, title: "All hands" }, { registry });
+  for (const p of [ann, bob]) await registry.touchMember(acme.id, { user: p.user });     // the directory (a new person grant on a board needs a known person); it adds no access
 });
 
 test("tenant and board ids are server-minted [a-z0-9-], never a domain, never a dot", async () => {
@@ -53,7 +56,7 @@ test("the creator is owner; a grant beats the default; a lower grant doesn't dem
 test("a user from another domain gets nothing, except by invite (cross-domain works)", async () => {
   expect(await model.role(bob, board.id)).toBe(null);
   expect(await model.role(gus, board.id)).toBe(null);
-  await createInvite({ caller: admin, board: board.id, email: "Bob@Globex.com", role: "annotator" }, { registry, now });
+  await createInvite({ caller: admin, board: board.id, email: "Bob@Globex.com", role: "annotator" }, { registry, tenancy: model, now });
   expect(await model.role(bob, board.id)).toBe("annotator");
   // The invite matches only a verified email (identity.email is null when Google says unverified).
   expect(await model.role({ ...bob, email: null }, board.id)).toBe(null);
@@ -62,21 +65,21 @@ test("a user from another domain gets nothing, except by invite (cross-domain wo
 });
 
 test("invite expiry and revoke take effect on the next role() call", async () => {
-  const inv = await createInvite({ caller: admin, board: board.id, email: "gus@gmail.com", role: "editor", expiresAt: clock.t + DAY }, { registry, now });
+  const inv = await createInvite({ caller: admin, board: board.id, email: "gus@gmail.com", role: "editor", expiresAt: clock.t + DAY }, { registry, tenancy: model, now });
   expect(await model.role(gus, board.id)).toBe("editor");
   clock.t += DAY;
   expect(await model.role(gus, board.id)).toBe(null);
-  const inv2 = await createInvite({ caller: admin, board: board.id, email: "gus@gmail.com", role: "viewer" }, { registry, now });
+  const inv2 = await createInvite({ caller: admin, board: board.id, email: "gus@gmail.com", role: "viewer" }, { registry, tenancy: model, now });
   expect(await model.role(gus, board.id)).toBe("viewer");
-  await revokeInvite({ caller: admin, board: board.id, invite: inv2.id }, { registry });
+  await revokeInvite({ caller: admin, board: board.id, invite: inv2.id }, { registry, tenancy: model });
   expect(await model.role(gus, board.id)).toBe(null);
-  expect((await listInvites({ caller: admin, board: board.id }, { registry })).map(i => i.id).sort()).toEqual([inv.id, inv2.id].sort());
+  expect((await listInvites({ caller: admin, board: board.id }, { registry, tenancy: model })).map(i => i.id).sort()).toEqual([inv.id, inv2.id].sort());
 });
 
 test("share link: role, redeem, expiry, revoke (next role() call); only editor/annotator/viewer", async () => {
   for (const r of ["owner", "commenter", "admin", undefined])
-    await expect(createLink({ caller: admin, board: board.id, role: r }, { registry, now })).rejects.toBeInstanceOf(AdminError);
-  const link = await createLink({ caller: admin, board: board.id, role: "annotator", expiresAt: clock.t + DAY }, { registry, now });
+    await expect(createLink({ caller: admin, board: board.id, role: r }, { registry, tenancy: model, now })).rejects.toBeInstanceOf(AdminError);
+  const link = await createLink({ caller: admin, board: board.id, role: "annotator", expiresAt: clock.t + DAY }, { registry, tenancy: model, now });
   expect(link.id).toMatch(/^[a-z0-9]{26}$/);
   expect(await model.role(gus, board.id)).toBe(null);                     // not redeemed yet
   expect(await model.redeemLink(gus, link.id)).toEqual({ board: board.id });
@@ -86,14 +89,14 @@ test("share link: role, redeem, expiry, revoke (next role() call); only editor/a
   expect(await model.role(gus, board.id)).toBe(null);                     // expired
   expect(await model.redeemLink(bob, link.id)).toBe(null);
 
-  const l2 = await createLink({ caller: admin, board: board.id, role: "editor" }, { registry, now });
+  const l2 = await createLink({ caller: admin, board: board.id, role: "editor" }, { registry, tenancy: model, now });
   await model.redeemLink(bob, l2.id);
   expect(await model.role(bob, board.id)).toBe("editor");
-  await revokeLink({ caller: admin, board: board.id, link: l2.id }, { registry });
+  await revokeLink({ caller: admin, board: board.id, link: l2.id }, { registry, tenancy: model });
   expect(await model.role(bob, board.id)).toBe(null);                     // revoked
   expect(await model.redeemLink(bob, l2.id)).toBe(null);
   expect(await model.redeemLink(bob, "nope")).toBe(null);
-  expect((await listLinks({ caller: admin, board: board.id }, { registry })).length).toBe(2);
+  expect((await listLinks({ caller: admin, board: board.id }, { registry, tenancy: model })).length).toBe(2);
 });
 
 test("unknown board == board with no role: both null, and role() writes nothing", async () => {
@@ -113,48 +116,43 @@ test("cross-tenant: nothing in tenant A resolves a role on tenant B's board", as
   expect(await model.role(ann, gb.id)).toBe(null);
   expect(await model.role(admin, gb.id)).toBe(null);                      // Acme's admin
   // An Acme link or invite doesn't reach Globex's board.
-  const link = await createLink({ caller: admin, board: board.id, role: "editor" }, { registry, now });
+  const link = await createLink({ caller: admin, board: board.id, role: "editor" }, { registry, tenancy: model, now });
   await model.redeemLink(ann, link.id);
-  await createInvite({ caller: admin, board: board.id, email: "ann@acme.com", role: "editor" }, { registry, now });
+  await createInvite({ caller: admin, board: board.id, email: "ann@acme.com", role: "editor" }, { registry, tenancy: model, now });
   expect(await model.role(ann, gb.id)).toBe(null);
   // Acme's admin can't manage Globex's board, and gets the same answer as for a board that doesn't exist.
-  const e1 = await createLink({ caller: admin, board: gb.id, role: "viewer" }, { registry, now }).catch(e => e);
-  const e2 = await createLink({ caller: admin, board: "b-nope", role: "viewer" }, { registry, now }).catch(e => e);
+  const e1 = await createLink({ caller: admin, board: gb.id, role: "viewer" }, { registry, tenancy: model, now }).catch(e => e);
+  const e2 = await createLink({ caller: admin, board: "b-nope", role: "viewer" }, { registry, tenancy: model, now }).catch(e => e);
   expect([e1.code, e1.message]).toEqual([e2.code, e2.message]);
   expect(e1.code).toBe("forbidden");
   // Explicit cross-tenant invite to that board does work.
-  await createInvite({ caller: gadmin, board: gb.id, email: "ann@acme.com", role: "annotator" }, { registry, now });
+  await createInvite({ caller: gadmin, board: gb.id, email: "ann@acme.com", role: "annotator" }, { registry, tenancy: model, now });
   expect(await model.role(ann, gb.id)).toBe("annotator");
 });
 
-test("admin: createBoard by tenant admin works; non-admin, other tenant's admin, member refused", async () => {
+test("fixtures createBoard: a board in the fixture Space with its owner grant (board creation by permission: test/auth/spaces.test.js)", async () => {
   const b = await createBoard({ caller: admin, tenant: acme.id, title: "Q4" }, { registry });
   expect(b.id).toMatch(/^[a-z0-9-]+$/);
-  expect(b.tenant).toBe(acme.id);
-  expect(await registry.board(b.id)).toMatchObject({ id: b.id, tenant: acme.id, title: "Q4", memberRole: "viewer" });
-  for (const caller of [ann, bob, id("google:gadmin", "globex.com"), null, {}])
-    await expect(createBoard({ caller, tenant: acme.id }, { registry })).rejects.toMatchObject({ code: "forbidden" });
-  await expect(createBoard({ caller: admin, tenant: "t-nope" }, { registry })).rejects.toMatchObject({ code: "forbidden" });
-  await expect(createBoard({ caller: admin, tenant: acme.id, memberRole: "owner" }, { registry })).rejects.toMatchObject({ code: "bad-request" });
-  await expect(createBoard({ caller: admin, tenant: acme.id, memberRole: "god" }, { registry })).rejects.toMatchObject({ code: "bad-request" });
+  expect(await registry.board(b.id)).toMatchObject({ id: b.id, tenant: acme.id, title: "Q4", memberRole: "viewer", space: await spaceOf(registry, acme.id) });
+  expect(await registry.grant(b.id, admin.user)).toBe("owner");
 });
 
 test("admin: a board owner (not tenant admin) manages invites and links; a member can't", async () => {
   await setGrant({ caller: admin, board: board.id, user: ann.user, role: "owner" }, { registry });
-  const l = await createLink({ caller: ann, board: board.id, role: "viewer" }, { registry, now });
+  const l = await createLink({ caller: ann, board: board.id, role: "viewer" }, { registry, tenancy: model, now });
   expect(l.by).toBe(ann.user);
   const carl = id("google:carl", "acme.com");
-  await expect(createInvite({ caller: carl, board: board.id, email: "x@y.z", role: "viewer" }, { registry, now })).rejects.toMatchObject({ code: "forbidden" });
-  await expect(revokeLink({ caller: carl, board: board.id, link: l.id }, { registry })).rejects.toMatchObject({ code: "forbidden" });
-  await expect(createInvite({ caller: admin, board: board.id, email: "x@y.z", role: "owner" }, { registry, now })).rejects.toMatchObject({ code: "bad-request" });
-  await expect(createInvite({ caller: admin, board: board.id, email: "nope", role: "viewer" }, { registry, now })).rejects.toMatchObject({ code: "bad-request" });
-  await expect(createLink({ caller: admin, board: board.id, role: "viewer", expiresAt: clock.t - 1 }, { registry, now })).rejects.toMatchObject({ code: "bad-request" });
+  await expect(createInvite({ caller: carl, board: board.id, email: "x@y.z", role: "viewer" }, { registry, tenancy: model, now })).rejects.toMatchObject({ code: "forbidden" });
+  await expect(revokeLink({ caller: carl, board: board.id, link: l.id }, { registry, tenancy: model })).rejects.toMatchObject({ code: "forbidden" });
+  await expect(createInvite({ caller: admin, board: board.id, email: "x@y.z", role: "owner" }, { registry, tenancy: model, now })).rejects.toMatchObject({ code: "bad-request" });
+  await expect(createInvite({ caller: admin, board: board.id, email: "nope", role: "viewer" }, { registry, tenancy: model, now })).rejects.toMatchObject({ code: "bad-request" });
+  await expect(createLink({ caller: admin, board: board.id, role: "viewer", expiresAt: clock.t - 1 }, { registry, tenancy: model, now })).rejects.toMatchObject({ code: "bad-request" });
 });
 
 test("a revoke that names another board's link or invite is refused", async () => {
   const b2 = await createBoard({ caller: admin, tenant: acme.id }, { registry });
-  const l = await createLink({ caller: admin, board: b2.id, role: "viewer" }, { registry, now });
-  await expect(revokeLink({ caller: admin, board: board.id, link: l.id }, { registry })).rejects.toMatchObject({ code: "forbidden" });
+  const l = await createLink({ caller: admin, board: b2.id, role: "viewer" }, { registry, tenancy: model, now });
+  await expect(revokeLink({ caller: admin, board: board.id, link: l.id }, { registry, tenancy: model })).rejects.toMatchObject({ code: "forbidden" });
   expect((await registry.link(l.id)).revoked).toBe(false);
 });
 
@@ -162,9 +160,9 @@ test("a revoke that names another board's link or invite is refused", async () =
 
 test("M5: role() caps what the Registry holds: unknown roles ignored, memberRole/invites below owner, links to LINK_ROLES", async () => {
   // Direct Registry writes, bypassing the admin checks (the engine's SQL Registry is a second writer).
-  const b = await registry.createBoard({ tenant: acme.id, memberRole: "owner" });
+  const b = await mkBoard(registry, { tenant: acme.id, memberRole: "owner" });
   expect(await model.role(ann, b.id)).toBe("editor");
-  const b2 = await registry.createBoard({ tenant: acme.id, memberRole: "god" });
+  const b2 = await mkBoard(registry, { tenant: acme.id, memberRole: "god" });
   expect(await model.role(ann, b2.id)).toBe(null);
   await registry.setGrant(b2.id, ann.user, "god");
   expect(await model.role(ann, b2.id)).toBe(null);
@@ -241,4 +239,38 @@ test("p5-fix 3 (p5-authv R1): two concurrent demotions of the only two owners le
   expect(owners.length).toBe(2);
   await Promise.allSettled(owners.map(user => setGrant({ caller: admin, board: board.id, user, role: null }, { registry })));
   expect((await registry.grants(board.id)).filter(g => g.role === "owner").length).toBe(1);
+});
+
+test("a Unit with a second domain: members of either get memberRole; an email admin on either domain is an admin, other domains are not", async () => {
+  await registry.addTenantDomain(acme.id, "acme.io");
+  await registry.addTenantAdmin(acme.id, "email:pat@acme.io");
+  const lee = id("google:lee", "acme.io", "lee@acme.io");
+  expect(await model.role(lee, board.id)).toBe("viewer");
+  const pat = id("google:pat", "acme.io", "pat@acme.io");
+  const t = await registry.tenant(acme.id);
+  expect(isUnitAdmin(t, pat)).toBe(true);
+  expect(isUnitAdmin(t, id("google:pat", "evil.com", "pat@acme.io"))).toBe(false);
+  expect(await model.role(id("google:zed", "globex.com", "z@globex.com"), board.id)).toBe(null);
+});
+
+test("setGrant (the old route) names only people the server knows on the board: directory, existing grant, link use; email:, garbage, another Unit's member and never-seen ids are unknown-person", async () => {
+  await registry.touchMember(globex.id, { user: "google:gina" });
+  await registry.addTenantAdmin(acme.id, "email:zed@acme.com");
+  for (const user of ["email:zed@acme.com", "email:", "google:nobody", "google:gina", "dev:ANN", "not a user"]) {
+    await expect(setGrant({ caller: admin, board: board.id, user, role: "viewer" }, { registry })).rejects.toMatchObject({ code: "unknown-person" });
+    expect(await registry.grant(board.id, user)).toBe(null);
+  }
+  await expect(setGrant({ caller: admin, board: board.id, user: "google:nobody", role: null }, { registry })).resolves.toBeUndefined();   // removing nothing is never refused
+  // a directory member and a guest who redeemed a link of this board
+  await setGrant({ caller: admin, board: board.id, user: ann.user, role: "editor" }, { registry });
+  const l = await registry.createLink({ board: board.id, role: "viewer", by: admin.user });
+  await expect(setGrant({ caller: admin, board: board.id, user: gus.user, role: "viewer" }, { registry })).rejects.toMatchObject({ code: "unknown-person" });
+  await registry.addLinkUse(l.id, gus.user);
+  await setGrant({ caller: admin, board: board.id, user: gus.user, role: "viewer" }, { registry });
+  // an existing grant can be changed whatever happens to the person's other records
+  await registry.setGrant(board.id, "google:old", "viewer");
+  await setGrant({ caller: admin, board: board.id, user: "google:old", role: "editor" }, { registry });
+  expect(await registry.grant(board.id, "google:old")).toBe("editor");
+  await setGrant({ caller: admin, board: board.id, user: "google:old", role: null }, { registry });
+  expect(await registry.grant(board.id, "google:old")).toBe(null);
 });

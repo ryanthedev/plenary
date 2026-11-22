@@ -24,13 +24,15 @@
 
 import { jsonCodec } from "../packages/protocol/codec.js";
 import { snapshotOf } from "../packages/protocol/room.js";
-import { ROLES, MAX_CLIENT_CHARS, PROTOCOL_VERSION, RULES_VERSION, MAX_WRITER_CONNS, MAX_TAB_CONNS, HB_IDLE_MS, opProblem, parseOpId, isTab, isSha1 } from "../packages/protocol/envelope.js";
+import { ROLES, MAX_CLIENT_CHARS, PROTOCOL_VERSION, RULES_VERSION, MAX_WRITER_CONNS, MAX_TAB_CONNS, HB_IDLE_MS, opProblem, parseOpId, isTab, canWrite } from "../packages/protocol/envelope.js";
 import { presenceProblem, presenceLimiter, presenceCoalescer, EMOTES } from "../packages/protocol/presence.js";
 import { subjects, busBytes, MAX_BUS_BYTES } from "./bus/port.js";
 import { boardFeed } from "./feed.js";
-import { isId } from "./ids.js";
+import { isId, isSha1 } from "./ids.js";
 import { quietLogger } from "./log.js";
 import { breathe } from "./breather.js";
+import { noopMetrics, FANOUT_BUCKETS } from "./metrics/port.js";
+import { BLOB_PENDING_MS } from "./blobs/port.js";
 import { identityKey } from "./auth/tenancy.js";   // the one spelling of the re-check grouping key (p5-load)
 
 export const LIMITS = {
@@ -92,10 +94,10 @@ export const LIMITS = {
   herePublishMs: 5_000,                     // `.here` published at least this often
   hereTtlMs: 15_000,                        // another gateway's `.here` counts this long
   hereBigBoard: 1_000,                      // more connections than this on a board here…
+  blobRate: 10,                             // § Blobs: `blob` requests per second per connection (a token bucket of this size)
+  blobPutsPerMin: 30,                       // § Blobs: put URLs per minute per (user, board) on this gateway
   hereBigMs: 5_000,                         // …and `here` goes to them at most this often
   httpSnapshotBytes: 1024 * 1024,           // F9: snapshots at/above this size offload to HTTP when the client sends hello.snap = "http"
-  blobRate: 10,                             // § Blobs: blob URL requests per second per connection (burst = blobRate)
-  blobPutPerMin: 30,                        // § Blobs: blob PUT URLs per minute per (user, board)
   feed: {},                               // options for each board's feed (pollMs, chunkBytes, …; tests)
 };
 
@@ -132,13 +134,18 @@ const OP_ID = /^\s*\{\s*"t"\s*:\s*"op"\s*,\s*"id"\s*:\s*"([^"\\]{1,256})"/;
  * @param {{
  *   auth: { verify(token: string): Promise<object|null>, role(identity: object, board: string): Promise<string|null> },
  *   registry: { board(id: string): Promise<{ id: string, tenant: string }|null> },
- *   store: { read: Function, getCheckpoint: Function, epoch: Function },
+ *   store: { read: Function, getCheckpoint: Function, epoch: Function, blobPend: Function },
  *   bus: object,
  *   rooms: { open(tenant: string, board: string): Promise<void> },
- *   log?: object, codec?: object, id?: string, limits?: Partial<typeof LIMITS>, now?: () => number,
+ *   onWelcomed?: (user: string, board: string) => void,   // called after a connection is welcomed (Recent, PROTOCOL.md § Home); must not throw or block
+ *   log?: object, codec?: object, deflate?: (data: string | Uint8Array) => Promise<Uint8Array | null>, id?: string, limits?: Partial<typeof LIMITS>, now?: () => number,
+ *   blobUrl?: (tenant: string, board: string, sha1: string, verb: "GET" | "PUT", user: string) => Promise<string>,   // signs a blob URL (blob-access.js); absent: `blob` requests get `unavailable`
+ *   metrics?: import("./metrics/port.js").Metrics,   // PROTOCOL.md § Metrics: plenary_connections, plenary_fanout_lag_seconds (default: records nothing)
  * }} o
  */
-export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed, snapshotTickets = null, blobTickets = null }) {
+export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed, timers = globalThis, deflate = null, blobUrl = null, onWelcomed = null, metrics = noopMetrics, snapshotTickets = null }) {
+  // Every timer of the gateway runs on `timers` (tests pass fake ones, with `now` moved in step); the names shadow the globals here.
+  const { setTimeout, clearTimeout, setInterval, clearInterval } = timers;
   const lim = { ...LIMITS, ...limits };
   const maxBusBytes = bus.maxBytes ?? MAX_BUS_BYTES;
   // § Messages, hello.tab. A connection's tab key is "t:<tab>" for a hello with `tab`, else "c:<conn id>" (a tab of
@@ -147,8 +154,6 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
   const writersBy = new Map();
   /** @type {Map<string, number>} "user|board|tabKey" → writer connections of that tab on this gateway */
   const tabConns = new Map();
-  /** @type {Map<string, number[]>} "user|board" → recent blob PUT timestamps within 60 s (§ Blobs) */
-  const blobPuts = new Map();
   /** @type {Map<string, any>} conn id → ws */
   const conns = new Map();
   const counts = { accepted: 0, refusedAuth: 0, badFrames: 0, cut: 0, turnedAway: 0 };
@@ -165,6 +170,8 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
   /** @type {Map<string, number>} */ const socketByUser = new Map();
   /** @type {Map<string, number>} */ const owedByUser = new Map();
   /** @type {Map<string, number>} */ const connsByUser = new Map();
+  metrics.gauge("plenary_connections", "WebSockets open on this gateway now.", () => conns.size);
+  const fanoutLag = metrics.histogram("plenary_fanout_lag_seconds", "Seconds from the room sequencing entries to this gateway handing their frame to its viewers' queues (includes clock skew between nodes).", { buckets: FANOUT_BUCKETS });
   const bump = (map, key, by) => { const v = (map.get(key) ?? 0) + by; if (v > 0) map.set(key, v); else map.delete(key); };
   /** Re-read one socket's buffer and bring the totals up to date. Returns what it is owed now. */
   const observe = ws => {
@@ -205,6 +212,8 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
   };
   const release = key => { const e = sharedText.get(key); if (e && --e.refs <= 0) { sharedText.delete(key); sharedBytes -= e.len; } };
   /** Forget everything queued for a connection. */
+  /** The welcome's `can` (PROTOCOL.md § Messages): each key only when true; null when neither holds. */
+  const canOf = c => (c.share || c.move ? { ...(c.share ? { share: true } : {}), ...(c.move ? { move: true } : {}) } : null);
   const dropQueue = c => { if (!c.out) return; for (const item of c.out) if (item.shared) release(item.shared); c.out.length = 0; c.outBytes = 0; c.waitSince = 0; };
 
   const end = (ws, code, reason) => {
@@ -353,11 +362,14 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     dropQueue(c);
     refuse(ws, "unavailable", "the server is busy: try again shortly", 1013, "over budget");
   }
-  /** Queue one of this connection's own frames (live traffic, an error) behind whatever it is already owed. */
-  function push(ws, data) {
+  /**
+   * Queue one of this connection's own frames (live traffic, an error) behind whatever it is already owed. A frame sent to many
+   * connections (a live `entries` frame, a presence batch, `here`, emotes) is measured once by its sender and passed as `len`:
+   * its UTF-8 length is a scan of the whole text, which at 10,000 viewers was the largest JS cost of a frame (PROTOCOL.md § Bus, Fan-out cost).
+   */
+  function push(ws, data, len = bytesOf(data)) {
     const c = ws.data;
     if (c.state !== "live") return;
-    const len = bytesOf(data);
     if (!admit(ws, len)) return;
     c.out.push({ data, len, shared: false }); c.outBytes += len;
     flush(ws);
@@ -396,7 +408,8 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       let msg = null;
       try { msg = codec.decode(m.data); } catch { msg = null; }
       if (msg?.t === "welcome") {
-        const data = lim.hbIdleMs > 0 && msg.hb === undefined ? codec.encode({ ...msg, hb: lim.hbIdleMs }) : m.data;
+        const extra = { ...(lim.hbIdleMs > 0 && msg.hb === undefined ? { hb: lim.hbIdleMs } : {}), ...(canOf(c) ? { can: canOf(c) } : {}) };
+        const data = Object.keys(extra).length ? codec.encode({ ...msg, ...extra }) : m.data;
         welcomed(ws, data, Number.isSafeInteger(msg.seq) ? msg.seq : 0);
         if (m.close) end(ws, m.close, "closed by the room");
         return;
@@ -418,6 +431,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
   const sweep = setInterval(() => {
     try {
       const t = now();
+      for (const [k, a] of putTimes) if (!a.length || t - a[a.length - 1] >= 60_000) putTimes.delete(k);
       for (const ws of [...conns.values()]) {
         const c = ws.data;
         if (c.state !== "live") continue;
@@ -458,13 +472,15 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
   const boards = new Map();
   const welcomedOn = b => [...b.conns].filter(ws => ws.data.state === "live" && ws.data.welcomed);
 
-  function onLive(b, { from, to, data }) {
+  function onLive(b, { from, to, at, data }) {
+    if (Number.isFinite(at)) fanoutLag.observe(Math.max(0, now() - at) / 1000);
+    const len = bytesOf(data);   // once for the frame, not once per viewer
     for (const ws of b.conns) {
       const c = ws.data;
       if (c.state !== "live" || c.next === undefined || to < c.next) continue;
       // The feed hands every resolved entry once, in order, and a connection joins it at the feed's seq: no cut needed.
       if (from > c.next) { log.error("feed skipped entries for a connection", { conn: c.id, next: c.next, from }); cut(ws, "missed entries"); continue; }
-      push(ws, data); c.next = to + 1;
+      push(ws, data, len); c.next = to + 1;
     }
   }
 
@@ -476,7 +492,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       b = { key, tenant, board, conns: new Set(), refs: 0, coalescer: presenceCoalescer(), viewerCoalescer: presenceCoalescer(), viewerPresenceAt: 0, mine: {}, sums: new Map(), unsubs: [], rc: newRecheck(),
         // `here` (§ Presence): this gateway's writer users and viewer connections, the latest `.here` per gateway, what was sent.
         hw: new Map(), hv: 0, hvTabs: new Map(), hFrom: new Map(), hChanged: false, hPubAt: 0, hText: null, hCountText: null, hKey: null, hVer: 0, hOut: false, hSentAt: 0, hSending: false };
-      b.feed = feedOf({ tenant, board, store, bus, log, codec, onLive: e => onLive(b, e), ...lim.feed });
+      b.feed = feedOf({ tenant, board, store, bus, log, codec, deflate, now, timers, onLive: e => onLive(b, e), ...lim.feed });
       b.unsubs.push(bus.subscribe(subjects.gateway(tenant, board, id), m => onGatewayReply(b, m)));
       b.unsubs.push(bus.subscribe(subjects.presence(tenant, board), m => {
         if (!m || typeof m.user !== "string" || typeof m.client !== "string") return;
@@ -490,7 +506,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
         for (const e of EMOTES) if (Number.isSafeInteger(m.counts[e]) && m.counts[e] > 0) sum[e] = (sum[e] ?? 0) + m.counts[e];
         b.sums.set(m.window, sum);
       }));
-      b.unsubs.push(bus.subscribe(hereSubject(tenant, board), m => {
+      b.unsubs.push(bus.subscribe(subjects.here(tenant, board), m => {
         const msg = hereCheck(m);
         if (msg && msg.gateway !== id) b.hFrom.set(msg.gateway, { msg, at: now() });   // our own is kept locally
       }));
@@ -723,7 +739,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       if (!snapInfo) return text;
       return codec.encode({ ...codec.decode(text), snapshot: snapInfo });
     };
-    b.feed.reach(upTo).then(async () => {
+    const attempt = async () => {
       let offloaded = null;
       if (c.state === "live" && c.snapHttp && snapshotTickets && since < b.feed.base.seq) {
         const snap = b.feed.snapshot();
@@ -732,12 +748,14 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
           offloaded = { seq: snap.seq, url: `/boards/${encodeURIComponent(c.board)}/snapshot?seq=${snap.seq}&ticket=${encodeURIComponent(ticket)}`, bytes: snap.bytes };
         }
       }
-      return b.feed.atomically(() => {
+      if (c.z && c.state === "live") await b.feed.prepare(offloaded ? offloaded.seq : since);
+      await b.feed.atomically(() => {
         if (c.state !== "live") return;
         const useHttp = offloaded && b.feed.base.seq === offloaded.seq;
         push(ws, attachSnapshot(welcomeData, useHttp ? offloaded : null));
         c.welcomed = true;
-        for (const f of b.feed.catchUp(useHttp ? offloaded.seq : since)) pushShared(ws, f);
+        try { onWelcomed?.(c.user, c.board); } catch (err) { log.warn("onWelcomed failed", { err }); }
+        for (const f of b.feed.catchUp(useHttp ? offloaded.seq : since, c.z)) pushShared(ws, f);
         c.next = b.feed.seq + 1;
         // Who's here, right after the catch-up: the full list. A board this gateway hasn't published for yet gets its
         // own entry now (else the first joiner's list is empty until the next tick); otherwise the cached list, at most
@@ -746,15 +764,13 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
         else if (!b.hText) hereRefresh(b, now());
         push(ws, b.hText); c.hVer = b.hVer;
       });
-    }).catch(err => { log.error("catch-up failed", { conn: c.id, err }); if (c.state === "live") refuse(ws, "unavailable", "try again shortly", 1013, "unavailable"); });
+    };
+    b.feed.reach(upTo).then(attempt).catch(err => { log.error("catch-up failed", { conn: c.id, err }); if (c.state === "live") refuse(ws, "unavailable", "try again shortly", 1013, "unavailable"); });
   }
 
   // ---- `here` (PROTOCOL.md § Presence, `here`; § Bus `.here`): never logged, bounded per board ----
   const RANK = { owner: 0, editor: 1, annotator: 2, commenter: 3 };
   const WRITER_ROLES = Object.keys(RANK);
-  // § Bus names `.here` beside `.presence`; built from the port's checked presence subject (ids validated there).
-  // SEAM(bus): server/bus/port.js could name it (`subjects.here`); this file doesn't own the port.
-  const hereSubject = (tenant, board) => subjects.presence(tenant, board).slice(0, -".presence".length) + ".here";
   /** A `.here` message from the bus, checked and cut to its fields, or null. */
   function hereCheck(m) {
     if (!isObj(m) || !isId(m.gateway) || !Array.isArray(m.writers) || m.writers.length > lim.hereMax) return null;
@@ -829,15 +845,15 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
    */
   async function hereSend(b) {
     b.hSending = true; b.hOut = false; b.hSentAt = now();
-    const full = b.hText, count = b.hCountText, ver = b.hVer;
+    const full = b.hText, count = b.hCountText, ver = b.hVer, fullLen = bytesOf(full), countLen = bytesOf(count);
     try {
       let n = 0;
       for (const ws of b.conns) {
         if (++n % 256 === 0) await breathe();
         const c = ws.data;
         if (c.state !== "live" || !c.welcomed || c.outBytes > lim.maxConnQueuedBytes / 2) continue;   // a reader this far behind skips it (it may drop)
-        if (c.hVer === ver) push(ws, count);
-        else { push(ws, full); c.hVer = ver; }
+        if (c.hVer === ver) push(ws, count, countLen);
+        else { push(ws, full, fullLen); c.hVer = ver; }
       }
     } finally { b.hSending = false; }
   }
@@ -848,7 +864,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
         if ((b.hChanged && t - b.hPubAt >= lim.hereMs) || t - b.hPubAt >= lim.herePublishMs) {
           const mine = hereMine(b);
           b.hChanged = false; b.hPubAt = t; b.hFrom.set(id, { msg: mine, at: t });
-          bus.publish(hereSubject(b.tenant, b.board), mine)?.catch?.(() => {});
+          bus.publish(subjects.here(b.tenant, b.board), mine)?.catch?.(() => {});
         }
         if (hereRefresh(b, t)) b.hOut = true;
         const every = b.conns.size > lim.hereBigBoard ? lim.hereBigMs : lim.hereMs;
@@ -867,27 +883,28 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
         const doWriters = b.coalescer.size > 0;
         const doViewers = b.viewerCoalescer.size > 0 && t - b.viewerPresenceAt >= lim.viewerPresenceMs;
         if (!doWriters && !doViewers) continue;
-        let batch = null, full = null, senders = null;
+        let batch = null, full = null, fullLen = 0, senders = null;
         if (doWriters) {
           batch = b.coalescer.flush();
           full = codec.encode({ t: "presence", batch });
+          fullLen = bytesOf(full);
           // Whose presence is in the batch, looked up once per connection: a mass close (thousands of `leave`s) must
           // not make this connections × batch (p2-tune: 2,000 leaves × 2,000 connections held the loop ~130 ms).
           senders = new Set(batch.map(x => `${x.user}\n${x.client}`));
         }
-        let viewerFull = null;
+        let viewerFull = null, viewerLen = 0;
         if (doViewers) {
           b.viewerPresenceAt = t;
           const vb = b.viewerCoalescer.flush();
-          if (vb.length) viewerFull = codec.encode({ t: "presence", batch: vb });
+          if (vb.length) { viewerFull = codec.encode({ t: "presence", batch: vb }); viewerLen = bytesOf(viewerFull); }
         }
         for (const ws of welcomedOn(b)) {
           const c = ws.data;
           if (c.outBytes > lim.maxConnQueuedBytes / 2) continue;   // presence may drop: a reader this far behind skips it
-          if (c.role === "viewer") { if (viewerFull) push(ws, viewerFull); continue; }
+          if (c.role === "viewer") { if (viewerFull) push(ws, viewerFull, viewerLen); continue; }
           if (!doWriters) continue;
           const mine = x => x.user === c.user && x.client === c.client;
-          if (!senders.has(`${c.user}\n${c.client}`)) { push(ws, full); continue; }
+          if (!senders.has(`${c.user}\n${c.client}`)) { push(ws, full, fullLen); continue; }
           const rest = batch.filter(x => !mine(x));
           if (rest.length) push(ws, codec.encode({ t: "presence", batch: rest }));
         }
@@ -911,7 +928,8 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
           if (win > w - 2) continue;
           b.sums.delete(win);
           const data = codec.encode({ t: "emotes", counts });
-          for (const ws of welcomedOn(b)) push(ws, data);
+          const len = bytesOf(data);
+          for (const ws of welcomedOn(b)) push(ws, data, len);
         }
       }
     } catch (err) { log.error("gateway: emote tick failed", { err }); }
@@ -957,7 +975,8 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     if (!board || board.id !== msg.board || !isId(board.id) || !isId(board.tenant)) return deny("board");
     const watch = watchGrants(c, board.tenant, board.id);   // before the role check (released when the socket closes)
     let gen = watch.gen;
-    try { role = await auth.role(identity, board.id); } catch (err) { return down("role", err); }
+    let share = false, move = false;
+    try { if (typeof auth.access === "function") ({ role, share, move } = await auth.access(identity, board.id)); else role = await auth.role(identity, board.id); } catch (err) { return down("role", err); }
     if (c.state !== "auth") return;
     if (!ROLES.includes(role)) return deny("role");
     const writer = role !== "viewer", wkey = `${identity.user}|${board.id}`;
@@ -995,7 +1014,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     if ((connsByUser.get(identity.user) ?? 0) >= lim.maxConnsPerUser) { log.warn("hello refused: too many connections for one user", { conn: c.id, user: identity.user }); return refuse(ws, "unavailable", "too many connections for this user", 1013, "user connection cap"); }
     if (tooMany()) return;
 
-    Object.assign(c, { state: "live", tenant: board.tenant, board: board.id, user: identity.user, identity, name: typeof identity.name === "string" ? identity.name.slice(0, 200) : null, role, client: msg.client,
+    Object.assign(c, { state: "live", tenant: board.tenant, board: board.id, user: identity.user, identity, name: typeof identity.name === "string" ? identity.name.slice(0, 200) : null, role, share: share === true, move: move === true, client: msg.client,
       since: msg.since ?? 0, snapHttp: msg.snap === "http", welcomed: false, next: undefined, wkey: writer ? wkey : null, tkey: writer ? tkey : null, tabKey,
       out: [], outBytes: 0, buffered: 0, owed: 0, blocked: false, flushing: false, waitSince: 0, progressAt: now(), winStart: now(), winDrained: 0,
       opq: [], opqBytes: 0, tokens: lim.opBurst, tokenAt: now(), opTimer: null, limiter: presenceLimiter(now) });
@@ -1016,7 +1035,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     log.info("hello accepted", { conn: c.id, tenant: c.tenant, board: c.board, user: c.user, role });
     if (!writer) {
       // Rule 8: a viewer's hello never leaves the gateway. Its welcome carries the feed's seq and latest known epoch.
-      return welcomed(ws, () => codec.encode({ t: "welcome", seq: c.b.feed.seq, role, user: c.user, horizon: 0, rv: RULES_VERSION, room: { board: c.board, epoch: c.b.feed.epoch }, ...(lim.hbIdleMs > 0 ? { hb: lim.hbIdleMs } : {}) }), 0);
+      return welcomed(ws, () => codec.encode({ t: "welcome", seq: c.b.feed.seq, role, user: c.user, horizon: 0, rv: RULES_VERSION, room: { board: c.board, epoch: c.b.feed.epoch }, ...(lim.hbIdleMs > 0 ? { hb: lim.hbIdleMs } : {}), ...(canOf(c) ? { can: canOf(c) } : {}) }), 0);
     }
     // The hello timer keeps running until the room's welcome arrives (the bus may drop a hello).
     c.forwarded = true;
@@ -1076,6 +1095,43 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     pumpOps(ws);
   }
 
+  // § Blobs: put URLs per (user, board), a sliding minute; the keys with nothing left in the window go in the sweep.
+  const putTimes = new Map();
+  const putAllowed = key => {
+    const t = now(), a = (putTimes.get(key) ?? []).filter(x => t - x < 60_000);
+    if (a.length >= lim.blobPutsPerMin) { putTimes.set(key, a); return false; }
+    a.push(t); putTimes.set(key, a); return true;
+  };
+
+  /**
+   * § Blobs: `{ t: "blob", sha1, put? }` → `{ t: "blob", sha1, url }`, or an `error` with no id and the request's sha1.
+   * Not through badFrame: a refused request is no strike and never closes the connection. Tenant and board are the
+   * connection's own, never the message's.
+   */
+  async function blob(ws, msg) {
+    const c = ws.data;
+    const sha = typeof msg.sha1 === "string" && msg.sha1.length <= 64 ? { sha1: msg.sha1 } : {};   // echoed even when malformed (a short string only), so the client's request slot is freed
+    const no = (code, message) => push(ws, codec.encode({ t: "error", ...sha, code, message }));
+    if (!c.welcomed) return no("auth", "wait for welcome");
+    const t = now();                                         // 10/s per connection, every request counted (refused ones too)
+    c.blobTokens = Math.min(lim.blobRate, (c.blobTokens ?? lim.blobRate) + ((t - (c.blobAt ?? t)) / 1000) * lim.blobRate); c.blobAt = t;
+    if (c.blobTokens < 1) return no("limit", "too many blob requests: ask again shortly");
+    c.blobTokens -= 1;
+    if (!isSha1(msg.sha1) || (msg.put !== undefined && msg.put !== true)) return no("bad-op", "a blob request is { sha1: 40 lowercase hex, put?: true }");
+    const put = msg.put === true;
+    if (put ? !(canWrite(c.role, "board") || canWrite(c.role, "notes")) : !c.role) return no("forbidden", put ? `${c.role} can't upload pictures` : "no role on this board");
+    if (put && !putAllowed(`${c.tenant}/${c.board}/${c.user}`)) return no("limit", "too many uploads: ask again later");
+    if (!blobUrl) return no("unavailable", "this server stores no pictures");
+    let url;
+    try {
+      // A pending reference first (§ Blobs, "References and purge"): an upload that lands before its op is never condemned, and a hash being deleted is refused here, so the client asks again.
+      if (put) await store.blobPend(c.tenant, c.board, msg.sha1, BLOB_PENDING_MS);
+      url = await blobUrl(c.tenant, c.board, msg.sha1, put ? "PUT" : "GET", c.user);
+    }
+    catch (err) { log[err?.code === "unavailable" ? "info" : "error"]("blob url failed", { conn: c.id, err }); return no("unavailable", "try again shortly"); }   // "unavailable" is the Store saying ask again (a hash being deleted): expected, not an error
+    push(ws, codec.encode({ t: "blob", sha1: msg.sha1, url }));
+  }
+
   /** Presence (§ Presence): checked, rate-limited, relayed over the bus; it never touches the room or the log. */
   function presence(ws, msg) {
     const c = ws.data;
@@ -1090,40 +1146,6 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     const pick = { cursor: ["x", "y"], select: ["stream", "ids"], laser: ["pts"], preview: ["stream", "elements"], emote: ["e"] }[msg.k];
     const clean = { k: msg.k }; for (const f of pick) clean[f] = msg[f];
     bus.publish(subjects.presence(c.tenant, c.board), { gateway: id, user: c.user, client: c.client, role: c.role, msg: clean })?.catch?.(() => {});
-  }
-
-  /** Signed blob URLs (§ Blobs): `{ t: "blob", sha1, put? }` → `{ t: "blob", sha1, url }`. */
-  async function blob(ws, msg) {
-    const c = ws.data;
-    const answer = (code, message) => push(ws, codec.encode({ t: "error", code, message }));
-    if (!c.welcomed) return answer("auth", "wait for welcome");
-    if (!isSha1(msg.sha1)) return answer("bad-op", "sha1 must be 40 lowercase hex characters");
-    if (msg.put !== undefined && typeof msg.put !== "boolean") return answer("bad-op", "put must be a boolean");
-    const put = msg.put === true;
-    // § Blobs: upload needs write on board or notes (owner, editor, annotator); fail-closed allow-list.
-    if (put && c.role !== "owner" && c.role !== "editor" && c.role !== "annotator") return answer("forbidden", "only owners, editors, and annotators can upload blobs");
-    const t = now();
-    if (c.blobTokens === undefined) { c.blobTokens = lim.blobRate; c.blobAt = t; }
-    else { c.blobTokens = Math.min(lim.blobRate, c.blobTokens + Math.max(0, t - c.blobAt) * lim.blobRate / 1000); c.blobAt = t; }
-    if (c.blobTokens < 1) return answer("limit", "too many blob requests; try again later");
-    let putKey = null, putArr = null;
-    if (put) {
-      putKey = `${c.user}|${c.board}`;
-      const cutoff = t - 60_000;
-      putArr = (blobPuts.get(putKey) ?? []).filter(ts => ts > cutoff);
-      if (!putArr.length) blobPuts.delete(putKey);
-      if (putArr.length >= lim.blobPutPerMin) {
-        blobPuts.set(putKey, putArr);
-        return answer("limit", "too many blob uploads; try again later");
-      }
-    }
-    if (!blobTickets) return answer("unavailable", "blobs are not configured");
-    c.blobTokens -= 1;
-    if (put) { putArr.push(t); blobPuts.set(putKey, putArr); }
-    const ticket = await blobTickets.issue(c.tenant, msg.sha1, put ? "put" : "get");
-    if (c.state === "closed") return;
-    const url = `/blobs/${encodeURIComponent(c.tenant)}/${msg.sha1}?ticket=${encodeURIComponent(ticket)}`;
-    push(ws, codec.encode({ t: "blob", sha1: msg.sha1, url }));
   }
 
   async function frame(ws, data) {
@@ -1223,7 +1245,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       return { conns: conns.size, ...counts, rechecks: { ...rechecks, running: [...boards.values()].filter(b => b.rc.running).length }, owedBytes: owed, owedTracked: owedTotal, queuedBytes: queuedTotal, users: connsByUser.size, waitingJoiners: waiters.size, sharedBytes, sharedTexts: sharedText.size, boards: boards.size };
     },
     /** A board's feed as this gateway holds it (null if it serves no one there): its base checkpoint, seq and tail. */
-    feed: (tenant, board) => { const f = boards.get(`${tenant}/${board}`)?.feed; return f ? { base: f.base.seq, seq: f.seq, tail: f.tail.length, tailBytes: f.tailBytes } : null; },
+    feed: (tenant, board) => { const f = boards.get(`${tenant}/${board}`)?.feed; return f ? { base: f.base.seq, seq: f.seq, tail: f.tail.length, tailBytes: f.tailBytes, looks: f.looks } : null; },
     /** Serve a board's snapshot at `seq` for HTTP catch-up (F9): warm feed hit in O(1), else Store checkpoint verified against the log. */
     async snapshot(board, seq) {
       if (!isId(board) || !Number.isSafeInteger(seq) || seq < 0) return null;

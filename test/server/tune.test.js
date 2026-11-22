@@ -1,6 +1,7 @@
 // p2-tune: re-check passes at scale (R1-R3), the error rule (R2), a foreign entry at seq + 1 (R4) and `here`.
 // Waits are on events (the gateway's stats, messages, closes), not on time, except where pacing itself is tested.
 import { test, expect, afterAll } from "bun:test";
+import { virtualTime } from "./virtual.js";
 import { rig, tokenOf } from "./rig.js";
 import { cleanup, sleep, until, deferred } from "./helpers.js";
 import { subjects } from "../../server/bus/port.js";
@@ -16,9 +17,9 @@ const idle = r => until(() => gw(r).stats().rechecks.running === 0, "no re-check
  * A rig whose `auth.role` can be held at a gate and made to throw. `tok-<name>` tokens are distinct users
  * (`dev:<name>`); `grant(names, role)` gives them a role on the test board.
  */
-async function roleRig(limits = {}) {
+async function roleRig(limits = {}, rigOpts = {}) {
   const ctl = { gate: null, boom: false, calls: 0, during: 0, hung: 0, hang: new Set(), fail: new Set(), holdAfter: new Set() };
-  const r = await rig({ limits: { maxConnsPerUser: 100000, roleRecheckMs: 3_600_000, ...limits }, wrapAuth: a => ({
+  const r = await rig({ ...rigOpts, limits: { maxConnsPerUser: 100000, roleRecheckMs: 3_600_000, ...limits }, wrapAuth: a => ({
     // "tok-<name>" or "tok-<name>~<email>": the email lets a test give one user's tabs different identities (LOW 4).
     verify: async t => { if (!t.startsWith("tok-")) return a.verify(t); const [n, email] = t.slice(4).split("~"); return { user: "dev:" + n, name: n, ...(email ? { email } : {}) }; },
     // ctl.hang: that user's next lookup never settles. ctl.fail: that user's lookups throw. ctl.holdAfter: the lookup
@@ -76,13 +77,24 @@ test("R1: a user's tabs share one role answer per pass; users with a writer conn
 // ---- R2: the error rule ----
 
 test("R2: a timed pass whose Registry calls fail keeps the connections, retries with backoff, then closes after the bound", async () => {
-  const { r, ctl, open } = await roleRig({ recheckRetries: 2, recheckRetryMs: 40, recheckConcurrency: 20 });   // one batch: everyone is reached
+  // The gateway's clock and timers are virtual and frozen between steps: each retry runs when the test advances to it, so the
+  // retries are counted exactly (on a loaded real clock a timer that fired a hair before its due time skipped and re-armed).
+  const V = virtualTime({ start: Date.now(), settle: () => new Promise(res => setImmediate(res)) });
+  const { r, ctl, open } = await roleRig({ recheckRetries: 2, recheckRetryMs: 40, recheckConcurrency: 20 }, { now: V.now, timers: V.timers });   // one batch: everyone is reached
   const socks = await open(names(20));
   ctl.boom = true;
   await gw(r).recheck(r.ids.board, "timed");
   expect(socks.every(s => s.closed === null)).toBe(true);                // kept: one blip closes nobody
   // Two retries (40 ms, 80 ms), both failing, then the third failure closes them all `unavailable`.
-  const closes = await Promise.all(socks.map(s => s.whenClosed(5000)));
+  for (const wait of [40, 80]) {
+    expect(V.oneShots()).toEqual([wait]);
+    const passes = gw(r).stats().rechecks.passes;
+    await V.advance(wait);
+    await until(() => gw(r).stats().rechecks.passes > passes, "the retry pass");
+    await idle(r);                                                       // to its end: it arms the next retry last
+  }
+  expect(V.oneShots()).toEqual([]);
+  const closes = await Promise.all(socks.map(s => s.whenClosed(30_000)));
   expect(closes.every(c => c.code === 1013)).toBe(true);
   expect(socks[0].msgs.at(-1)).toEqual({ t: "error", code: "unavailable", message: "could not re-check your access: reconnect" });
   expect(gw(r).stats().rechecks.retries).toBe(2);
@@ -90,17 +102,21 @@ test("R2: a timed pass whose Registry calls fail keeps the connections, retries 
 }, 20000);
 
 test("R2: a Registry blip during the timed pass closes nobody; a first batch that all fails stops the pass; the retry asks only the failed", async () => {
-  const { r, ctl, open } = await roleRig({ recheckRetries: 2, recheckRetryMs: 30, recheckConcurrency: 1 });
+  const V = virtualTime({ start: Date.now(), settle: () => new Promise(res => setImmediate(res)) });
+  const { r, ctl, open } = await roleRig({ recheckRetries: 2, recheckRetryMs: 30, recheckConcurrency: 1 }, { now: V.now, timers: V.timers });
   const socks = await open(names(40));
   ctl.boom = true;
   const c0 = ctl.calls;
   await gw(r).recheck(r.ids.board, "timed");
   expect(ctl.calls - c0).toBe(1);                                        // the whole first batch (1 lookup) failed: stop, not 40 calls
   ctl.boom = false;                                                       // the blip is over before the retry
+  expect(V.oneShots()).toEqual([30]);
+  await V.advance(30);
   await until(() => gw(r).stats().rechecks.retries >= 1, "the retry");
   await idle(r);
   expect(ctl.calls - c0).toBe(2);                                        // the retry asked only the user that failed; the
-  await sleep(150);                                                       // others, never reached, are left as they were
+  await V.advance(1_000);                                                 // others, never reached, are left as they were (and nothing is re-armed)
+  expect(V.oneShots()).toEqual([]);
   expect(socks.filter(s => s.closed).length).toBe(0);
   expect(gw(r).stats().rechecks.retries).toBe(1);                        // a clean retry schedules no more
   await r.stop();
@@ -149,8 +165,12 @@ test("here: relayed between clients (writers by user, viewers counted), updated 
   const ed = await r.sock(); ed.send(hello(r, "editor")); await ed.next(m => m.t === "welcome");
   const an = await r.sock(); an.send(hello(r, "annotator")); await an.next(m => m.t === "welcome");
   const vw = await r.sock(); vw.send(hello(r, "viewer")); await vw.next(m => m.t === "welcome");
-  const want = { t: "here", writers: [{ user: "dev:editor", name: "editor", role: "editor" }, { user: "dev:annotator", name: "annotator", role: "annotator" }], writerCount: 2, viewers: 1 };
-  for (const s of [ed, an, vw]) await s.next(m => m.t === "here" && JSON.stringify(m) === JSON.stringify(want), "the merged here");
+  const want = { writers: [{ user: "dev:editor", name: "editor", role: "editor" }, { user: "dev:annotator", name: "annotator", role: "annotator" }], writerCount: 2, viewers: 1 };
+  // What a client knows is its last full list plus its last counts: a change that leaves the list alone comes count-only
+  // (M2/LOW 5 below). Waiting for one message with both used to time out whenever the viewer joined in a later `here`
+  // tick than the annotator (a loaded machine; TECH-DEBT row 9): the editor and annotator then get the viewer's count only.
+  const merged = s => JSON.stringify(lastList(s)?.writers) === JSON.stringify(want.writers) && lastHere(s)?.writerCount === want.writerCount && lastHere(s)?.viewers === want.viewers;
+  for (const s of [ed, an, vw]) await until(() => merged(s), "the merged here", 30_000);
   await ed.close();
   await an.next(m => m.t === "here" && m.writerCount === 1 && m.writers?.[0]?.user === "dev:annotator", "here after the editor left");
   // A joiner gets the current `here` right after its catch-up.
@@ -177,7 +197,8 @@ test("here: merged across two gateways on one bus (viewers summed, a user on bot
 }, 20000);
 
 test("here: bounded with many viewers: at most hereMax writers listed (counts past it), bus messages small, slower to a big board", async () => {
-  const r = await rig({ limits: { hereMs: 30, herePublishMs: 100, hereMax: 3, hereBigBoard: 8, hereBigMs: 600 } });
+  let skew = 0;                                                          // the gateway's clock: real time plus what the churn below adds
+  const r = await rig({ now: () => Date.now() + skew, limits: { hereMs: 30, herePublishMs: 100, hereMax: 3, hereBigBoard: 8, hereBigMs: 600 } });
   const onBus = [];
   r.bus.subscribe(subjects.presence(r.ids.tenant, r.ids.board).replace(/presence$/, "here"), m => onBus.push(m));
   const writers = [];
@@ -185,9 +206,11 @@ test("here: bounded with many viewers: at most hereMax writers listed (counts pa
   const viewers = await Promise.all(Array.from({ length: 12 }, () => r.sock()));
   viewers.forEach((s, i) => s.send(hello(r, "viewer", { client: "v" + i })));
   await until(() => viewers.every(s => s.msgs.some(m => m.t === "welcome")), "viewers welcomed");
-  await viewers[0].next(m => m.t === "here" && m.viewers === 12 && m.writerCount === 5, "the here with everyone");
-  const h = lastList(viewers[0]);                                         // later count-only `here`s keep this list
-  expect(h.writerCount).toBe(5);
+  const everyone = await viewers[0].next(m => m.t === "here" && m.viewers === 12 && m.writerCount === 5, "the here with everyone");
+  expect(everyone.writerCount).toBe(5);
+  // The list is the last message that carries one; its own count may be older (the 4th and 5th writers change the
+  // count but not the three listed, so the here with everyone is count-only: a flake when read as `h.writerCount`).
+  const h = lastList(viewers[0]);
   expect(h.writers.length).toBe(3);
   expect(h.writers[0]).toEqual({ user: "dev:owner", name: "owner", role: "owner" });   // owners and editors first
   expect(h.writers.slice(1).map(w => w.role)).toEqual(["editor", "editor"]);
@@ -196,35 +219,41 @@ test("here: bounded with many viewers: at most hereMax writers listed (counts pa
   // 17 connections > hereBigBoard (8): while viewers come and go (each one welcomed, so counted, then closed),
   // `here` arrives at most every ~600 ms. Each churner waits for its welcome: closed earlier it is never counted
   // and the count would not change, so the test could not tell big-board pacing from small.
-  const watcher = viewers[1], before = watcher.msgs.filter(m => m.t === "here").length, t0 = Date.now();
+  // Eight churners at 80 ms of real time each (about two `here` ticks), with the gateway's clock 200 ms further on each: 2.2 s
+  // of its time in all, so a 600 ms pace allows about 4 heres and the 30 ms pace of a small board about 20.
+  const watcher = viewers[1], before = watcher.msgs.filter(m => m.t === "here").length;
   let churned = 0;
-  while (Date.now() - t0 < 1300) { const s = await r.sock(); s.send(hello(r, "viewer", { client: "churn" + churned++ })); await s.next(m => m.t === "welcome"); await sleep(40); s.close(); await sleep(40); }
-  expect(churned).toBeGreaterThanOrEqual(5);
+  while (churned < 8) { const s = await r.sock(); s.send(hello(r, "viewer", { client: "churn" + churned++ })); await s.next(m => m.t === "welcome"); skew += 100; await sleep(40); s.close(); await s.whenClosed(); skew += 100; await sleep(40); }
   const got = watcher.msgs.filter(m => m.t === "here").length - before;
   expect(got).toBeGreaterThanOrEqual(1);
-  expect(got).toBeLessThanOrEqual(4);                                    // 1,300 ms / 600 ms + slack; 1/s × 30 ms would be ~40
+  expect(got).toBeLessThanOrEqual(8);                                    // 2.2 s / 600 ms + slack; one per 30 ms would be ~20
   expect(lastList(watcher).writers.length).toBe(3);
   await r.stop();
 }, 30000);
 
 // ---- Round 2 (p2-tunev findings; each test is the verifier's repro) ----
 
-test("H1: a lookup that never settles is cut off at recheckLookupMs; the revoked editor is closed while the timed pass is stuck", async () => {
-  const { r, ctl, open } = await roleRig({ recheckLookupMs: 150, recheckConcurrency: 1 });
+test("H1: a lookup that never settles is cut off at recheckLookupMs; the revoked editor is closed once the stuck timed pass is cut off", async () => {
+  // The gateway's clock and timers are virtual and frozen between steps: the bound is the one-shot timer the hung lookup
+  // armed, and it must be exactly the configured 150 ms (the 2 s default would pass any timing window loosely drawn).
+  const V = virtualTime({ start: Date.now(), settle: () => new Promise(res => setImmediate(res)) });
+  const { r, ctl, open } = await roleRig({ recheckLookupMs: 150, recheckConcurrency: 1 }, { now: V.now, timers: V.timers });
   const [, victim] = await open(["stuck", "victim"], "editor");
   ctl.hang.add("dev:stuck");
   const timed = gw(r).recheck(r.ids.board, "timed");                    // not awaited: its first lookup never settles
   await until(() => ctl.hung >= 1, "the hung lookup");
-  const t0 = Date.now();
+  expect(V.oneShots()).toEqual([150]);
   await r.registry.setGrant(r.ids.board, "dev:victim", null);
   await grantsChanged(r);
-  const c = await victim.whenClosed(3000);
-  expect(c.code).toBe(1008);
-  expect(Date.now() - t0).toBeLessThan(1500);                             // ~150 ms lookup bound + one pass, not "never"
+  await V.advance(149);
+  expect([victim.closed, gw(r).stats().rechecks.timeouts]).toEqual([null, 0]);   // the bound has not passed: still stuck
+  // The grants pass waits behind the stuck timed pass, which only the lookup bound ends: without it neither ever finishes.
+  await V.advance(1);
+  expect((await victim.whenClosed(30_000)).code).toBe(1008);
   await timed;
-  expect(gw(r).stats().rechecks.timeouts).toBeGreaterThanOrEqual(1);
+  expect(gw(r).stats().rechecks.timeouts).toBe(1);
   await r.stop();
-}, 20000);
+}, 40000);
 
 test("H2: 8 users whose lookups fail are closed after their retries; 300 healthy viewers on the board stay open", async () => {
   const { r, ctl, open } = await roleRig({ recheckRetries: 1, recheckRetryMs: 20 });
@@ -240,18 +269,32 @@ test("H2: 8 users whose lookups fail are closed after their retries; 300 healthy
 }, 60000);
 
 test("M3: the retry backoff is per connection: a second failing user after a close-out is closed as fast as the first", async () => {
-  const { r, ctl, open } = await roleRig({ recheckRetries: 3, recheckRetryMs: 20 });
+  // The gateway's clock and timers are virtual and frozen between steps, so the one pending one-shot timer is the retry
+  // and its delay is exactly the backoff: a user's own is 20, 40, 80 ms; one carried over from the first user would
+  // start at 160 for the second. The test runs each retry by advancing that far.
+  const V = virtualTime({ start: Date.now(), settle: () => new Promise(res => setImmediate(res)) });
+  const { r, ctl, open } = await roleRig({ recheckRetries: 3, recheckRetryMs: 20 }, { now: V.now, timers: V.timers });
   const [a, b] = await open(["a", "b"]);
-  const timeClose = async (s, user) => {
-    ctl.fail.add(user); const t0 = Date.now();
+  const waitsOf = async (s, user) => {
+    ctl.fail.add(user); const waits = [];
     await gw(r).recheck(r.ids.board, "timed");
-    await s.whenClosed(5000); ctl.fail.delete(user);
-    return Date.now() - t0;
+    // Each retry pass is waited out to its end (it counts itself at its start and arms the next retry at its end), so
+    // the pending timers are read after it: none left means the user was closed out (the client may hear it later).
+    for (let i = 0; i < 10; i++) {
+      const due = V.oneShots();
+      if (!due.length) break;
+      expect(due.length).toBe(1);
+      waits.push(due[0]);
+      const passes = gw(r).stats().rechecks.passes;
+      await V.advance(due[0]);
+      await until(() => gw(r).stats().rechecks.passes > passes, "the retry pass");
+      await idle(r);
+    }
+    expect((await s.whenClosed(30_000)).code).toBe(1013); ctl.fail.delete(user);
+    return waits;
   };
-  const ta = await timeClose(a, "dev:a");
-  const tb = await timeClose(b, "dev:b");                                 // no clean pass in between
-  expect(ta).toBeLessThan(600);                                           // 20 + 40 + 80 ms of waits, plus slack
-  expect(tb).toBeLessThan(600);                                           // was ~1,120 ms (160/320/640 ms waits)
+  expect(await waitsOf(a, "dev:a")).toEqual([20, 40, 80]);
+  expect(await waitsOf(b, "dev:b")).toEqual([20, 40, 80]);                // no clean pass in between: still its own, not 160 / 320 / 640
   await r.stop();
 }, 20000);
 

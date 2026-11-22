@@ -27,7 +27,7 @@ this spec changes the constants and checks named below.
 | Append timeout | 5 s | **4 s**, so two appends (an op queued behind the one in flight) finish inside the client's 10 s (§ Recovery) |
 | Bus | "nothing bigger than one op" | catch-up and snapshots never travel on the bus; `.entries` batches are split under 2 MB (§ Bus) |
 | Postgres | (unstated) | a server starts as a role that doesn't own the schema; DDL is a separate migrate step (§ Store) |
-| `POST /boards` | owner gap unstated | caller must be a tenant admin; a crash between the two calls is repaired by a tenant admin (§ Registry) |
+| `POST /boards` | owner gap unstated | (v1.1) caller must be a tenant admin; a crash between the two calls is repaired by a tenant admin (§ Registry). Since #48: `board.create` at the target Space, or the caller's personal space (§ Spaces and Groups) |
 | Store | log and checkpoints | also each board's epoch: `openEpoch`, `epoch` (§ Store) |
 | Core glue | unstated | the client's op hook turns `files` into blob PUTs and `transient` into `preview` presence (§ The element op) |
 | Spec gaps | emote set unnamed; `records.js` missing from the phase-2 list | emote set named (§ Presence); `records.js` row added |
@@ -256,7 +256,7 @@ Server → client
 
 | `t` | Fields | |
 |---|---|---|
-| `welcome` | `seq`, `role`, `user`, `high`, `horizon`, `rv`, `room`, `hb?`, `snapshot?` | `seq` = resolved seq; `high` = this (user, client)'s highest accepted counter (0 if none; omitted for viewers); `horizon` (§ Op ids); `rv` = the room's rules version (§ Recovery); `room` = `{ board, epoch }` (§ Recovery, Room identity); `hb` = gateway downstream heartbeat interval in ms (10,000; omitted when no gateway sends `hb`); `snapshot` = `{ seq, url, bytes }` when `hello.snap === "http"` and the board's base snapshot is served over HTTP (§ Recovery, HTTP snapshots) |
+| `welcome` | `seq`, `role`, `user`, `high`, `horizon`, `rv`, `room`, `hb?`, `snapshot?`, `can?` | `seq` = resolved seq; `high` = this (user, client)'s highest accepted counter (0 if none; omitted for viewers); `horizon` (§ Op ids); `rv` = the room's rules version (§ Recovery); `room` = `{ board, epoch }` (§ Recovery, Room identity); `hb` = gateway downstream heartbeat interval in ms (10,000; omitted when no gateway sends `hb`); `snapshot` = `{ seq, url, bytes }` when `hello.snap === "http"` and the board's base snapshot is served over HTTP (§ Recovery, HTTP snapshots); `can` = `{ share?: true, move?: true }`, each key **present only when true**: `share`: the person holds `members.manage` on this board (§ Share dialog; the page shows its Share button only then); `move`: they hold `move` on it and are a member of its Unit (§ Move board, "Where it appears"; the page shows Move to… only then) |
 | `snapshot` | `seq`, `streams: { board, notes }`, `appSeq`, `records`, `noteAuthor` | the client-facing board state at a resolved `seq`, tombstones included; never holds the op-id table |
 | `entries` | `entries: [{ seq, board, tenant, stream, op, by, id, at, rv, name? }]` | catch-up and live, ascending `seq`; `name` only on `records` entries (§ Records) |
 | `ack` | `id`, `seq` | the entry is durable (§ Store says against what); it is never lost short of losing the Store's own media |
@@ -265,7 +265,7 @@ Server → client
 | `emotes` | `counts: { emoji: n }` | viewers' emotes summed per 500 ms |
 | `blob` | `sha1`, `url` | a signed URL, 5 minutes, one blob, one verb |
 | `hb` | (none) | downstream heartbeat sent by the gateway on an idle welcomed connection every ≤ 10 s (§ Pacing); keeps the client's 25 s idle deadline (rule 12) from firing on a quiet board |
-| `error` | `id?`, `code`, `message` | codes below |
+| `error` | `id?`, `sha1?`, `code`, `message` | codes below; `sha1` only on a refused `blob` request (§ Blobs) |
 
 Error codes, and what the client does:
 
@@ -278,7 +278,7 @@ Error codes, and what the client does:
 | `auth` | bad token, unknown board, no role, or no hello yet; the connection is closed | keep pending ops; sign in again, then reconnect |
 | `version` | unknown protocol `v` | stop; the app must update |
 
-An `error` with no `id` is not about an op (a `blob` request: `bad-op`, `forbidden`, `limit`; a ninth writer
+An `error` with no `id` is not about an op (a `blob` request, which also carries its `sha1`: `bad-op`, `forbidden`, `limit`, `unavailable`; a ninth writer
 tab or a third connection of one tab: `limit`, then closed; an op frame with no readable id: `bad-op`; or a connection-wide `unavailable`,
 `auth`, `version`): nothing pending is dropped for it. Each ends: a `blob` refusal ends with that request (ask
 again later); a connection-level one ends the connection, and the client reconnects with backoff (or signs in
@@ -320,6 +320,66 @@ one may still be closing.
   gets in on a later retry; the same tab connected through two gateways during a reconnect counts as two tabs, one
   on each.
 
+### Joining
+
+What a join costs, and how it is kept small. A join (rule 8) sends, in order: `welcome`, then catch-up, then `here`.
+Catch-up is **the latest checkpoint's `snapshot` when the client's `since` is older than it, then the `entries`
+after it** (a client already past the checkpoint gets entries only). Two things bound its size:
+
+1. **The tail is short.** The room folds a checkpoint by bytes as well as entries (§ Recovery, "When"), and a gateway
+   re-bases its cached tail on it as soon as the heartbeat names it (§ Bus, `cp`). So a join is the snapshot, plus a
+   tail of at most the larger of 64 KiB and about a third of the snapshot (the fold waits for a quarter of the *current* state, which includes the tail; test/server/join-size.test.js checks the bound), plus a few more entries until the next heartbeat.
+   `entries` frames hold at most 1 MiB each, so a long tail is several frames.
+2. **Compressed catch-up (optional, per connection).** A client that can inflate zlib connects to `/ws?z=deflate`.
+   The gateway then sends each **shared** catch-up text (the snapshot, and every `entries` frame holding at least 4 KiB
+   that is not a client-specific cut) as one **binary** WebSocket frame holding a **zlib (RFC 1950) stream** of exactly
+   the bytes the text frame would have had: the client inflates it, reads the result as UTF-8 JSON, and handles it as it
+   would that text frame. Everything else (`welcome`, `here`, live `entries`, `ack`, presence, a small or incompressible
+   text, a client's own cut of a chunk, a text with no settled compressed form when the join is sent) stays a text frame.
+   That is: a text the compressor declined, failed on, or found too small; and a snapshot or chunk whose compression had
+   not settled because a checkpoint re-based the feed during the join's own wait (the join then sends the new base's texts
+   plain, once, until a join compresses them). The gateway compresses a
+   text **once** and every joiner of that checkpoint shares the result, on a thread-pool thread, never the event loop.
+   **Frames stay in order:** a client delivers a text frame that arrives behind a binary one only after the binary one
+   is inflated and handled.
+
+   **The open last chunk** (the tail's newest `entries` frame, which grows with every entry) is never compressed
+   as it stands: a new entry would make the text stale before it could be sent. Its compressed form is a **prefix**: the
+   chunk's entries up to the seq the deflate started at, made once and shared. A join sends that binary frame, then the
+   entries after it, up to the feed's seq when the join is sent, as one small plain `entries` text frame cut for that join. Entries landing while the deflate runs, or after it, only lengthen the plain
+   cut; no retry and no stale text. The prefix is made again only after 16 KiB (`zSlack`) of newer entries, so a busy
+   board costs one deflate per 16 KiB of ops (never one per entry or per join), and a chunk that closes meanwhile is
+   sent as its prefix plus the plain rest until the next join compresses it whole. The plain cut is therefore at most
+   `zSlack` plus the entries that landed while the join waited (its snapshot deflate and the feed's queue); a chunk that
+   closed meanwhile with no settled prefix sends its rest plain, up to `chunkBytes`. The newest *settled* prefix of each
+   chunk is kept (per chunk start), so a newer deflate still in flight never hides it from a join that waited for it.
+
+   - **Negotiation is the query, nothing else.** `z=deflate` is a capability, not a credential (the token still goes
+     only in `hello`). No `z`, or any other value, means every frame is text: Herdr's mods (QuickJS has no zlib), drawh
+     and older clients are untouched. A gateway with no compressor sends text to everyone. A server never sends a
+     binary frame to a connection that did not ask.
+   - **A frame that fails to inflate** is a bad frame to the client: it drops the socket and reconnects (a new
+     connection), as for any frame it cannot decode.
+   - **Why not `permessage-deflate`.** It is the standard transparent way, and Bun's server has it, but it compresses
+     per message per socket: measured on a 0.94 MB snapshot, 3.0 ms of server CPU per join (dedicated) or 2.8 ms (shared
+     compressor) against 0.36 ms for sending a text compressed once; at 100k joins in 2 minutes (833 per second)
+     that is about 2.5 cores of deflate per second against 0.3, and it would also compress every live frame per
+     socket (100k × a small deflate per broadcast entry) unless each send opts in. Sharing one compressed frame
+     needs the compression to happen above the WebSocket layer, hence this frame. A deployment may still put a
+     proxy that does `permessage-deflate` in front: the frames then are just bigger text frames.
+   - **Cost to the client.** One `DecompressionStream("deflate")` per binary frame (browsers: Chrome 80, Safari 16.4,
+     Firefox 113). The web client enables it when the runtime has one.
+   - **Measured** (M2 join test, boards built as a user builds them: 100 shapes per op, then single-shape moves; shapes
+     of about 430 bytes of JSON, identical but for position and seed; plain text, then compressed): 2,000 shapes in 20 ops,
+     0.86 MB → 0.03 MB; 2,000 shapes and 2,000 moves, 1.1 MB → 0.04 MB; 10,000 shapes, 4.3 MB → 0.14 MB. Those are the
+     best case (near-identical elements). **A varied board** (random 2-decimal coordinates, ids and seeds, colours, words,
+     arrows with bend points; `variedShapes` in test/server/join-measure.js, 2,000 elements): without freehand, 1.1 MB →
+     0.15 MB (**7×**); with 30% freehand strokes (40 to 160 points each), 2.2 MB → 0.6 MB (**3.7×**). Expect **about 4× to 7×**
+     on real boards, and hundreds of KB (not tens) for 2,000 elements; strokes' coordinates and pressures barely compress.
+     `JOIN_REPORT=1 bun test test/server/join-size.test.js` prints the table. A plain join (no `z`) is the same size as
+     before for an insert-only board, since a checkpoint can't be smaller than the shapes it holds; folding more often
+     only bounds the replay of ops that rewrite what the state already holds.
+
 ## Rules
 
 1. **Ack after durable log.** An `ack` means the entry is in the Store (§ Store). It survives a crash of any process.
@@ -358,7 +418,7 @@ one may still be closing.
      closed or unlisted connection, and all `n` state of a gateway it has not heard from for **30 s**.
    - **Guaranteed:** no op is accepted out of order, across restarts too; `n` state is bounded by open
      connections. **May drop:** a connection (never a pending op: the client resends after reconnecting).
-7. **Boards exist only by `POST /boards`** (Registry `createBoard`). A `hello` for an unknown board is refused with
+7. **Boards exist only by `POST /boards`** (Registry `createBoard`; who may call it: § Spaces and Groups). A `hello` for an unknown board is refused with
    `auth`, the same error as a board the token has no role on, so existence doesn't leak. A hello never creates one.
 8. **Auth before the room; viewers never reach it.** The gateway awaits Auth and the Registry (§ Auth) before
    anything is forwarded; the room never sees a token. A writer's hello goes on as `{user, name, role, client}`,
@@ -455,11 +515,107 @@ serves the snapshot JSON (gzip-compressed once per `(board, seq)` when `Accept-E
   with. `rv` also covers everything else replay depends on: the element merge rules (a re-copy of packages/core
   that changes a merge result bumps `rv`) and the `appState` key set. A client that meets a `welcome` or an entry
   with an `rv` it doesn't know stops, as on `version`: the app must update.
-- **When.** Every 1,000 entries, or later: not until the bytes logged since the last checkpoint reach half that
-  checkpoint's size (so rewriting a big checkpoint costs at most about 2× the log). Also, at any entry count, once
-  those bytes reach the host's byte trigger (`tailFoldBytes`, default 8 MB) and that same half-size bound, whichever
-  comes first: a few huge ops make catch-up bounded without waiting for 1,000 entries. Also when the room is stopped
-  cleanly. The copy is of the **resolved** state at `seq` S, taken synchronously; the write is asynchronous.
+- **When.** A join is the latest checkpoint's snapshot plus the log after it (§ Joining), so the room folds when
+  that tail is long, in entries or in bytes: after **1,000 entries** (`CHECKPOINT_EVERY`), or once the ops logged
+  since the last checkpoint reach **64 KiB** (`CHECKPOINT_BYTES`; the host's `tailFoldBytes`), whichever comes first;
+  and **not before those bytes reach a quarter of the state's size** (`CHECKPOINT_STATE_RATIO` = 4; the state is the
+  snapshot plus what the tail changed, so for an insert-only board the tail reaches a third of the previous snapshot,
+  `tail >= (snapshot + tail) / 4`). The last bound is
+  what a rewrite costs: a checkpoint is about the size of the state, so a fold per quarter-state of log writes at
+  most about **4×** the log's bytes in checkpoints (measured about 2× to 3× on boards built by many ops; the join test asserts under 5×),
+  however often the board changes; and a small board (state under 256 KiB) is rewritten at most once per 64 KiB of
+  log, never per op. The consequence for the tail: it is about the larger of 64 KiB and a third of the snapshot
+  (in op bytes; the entries' envelopes add about a quarter), plus what was logged while the fold was being written and
+  announced. (The entry count only brings a fold forward once the byte gate is met, so it does not bound the tail by itself.) (An insert-only board folds to
+  about its own size, so its join is about the log's size either way; the folds pay off when ops rewrite what the
+  state already holds: moves, resizes, deletes. Compression, § Joining, is what shrinks the rest.) Also when the
+  room is stopped cleanly. The checkpoint is of the **resolved** state at one `seq` S (with entries still unresolved
+  too: only resolved ones are in it), taken in small steps ("Incremental fold", below); the write is asynchronous.
+- **Incremental fold** (decided 2026-11-19, TECH-DEBT row 39; `packages/protocol/fold.js`). A checkpoint of a big board
+  must not hold the event loop (every board on the host waits), so the fold is a job of steps, each bounded.
+  - **Shadow room.** For one job the room builds a second, log-less room (the *shadow*) from its current checkpoint, and
+    drops it when the job ends or is abandoned (nothing resident between folds: a resident shadow held a third copy of
+    the op-id table and the comment threads, 57.9 MB at 4,000 clients x 256 pairs). The shadow applies only **resolved**
+    entries, through the same `applyEntry`. A job picks S = the room's resolved seq, catches the shadow up to
+    S from the kept tail (`tail[0]` is `base.seq + 1`), then copies the shadow's state into the checkpoint. The job never
+    reads the live state, so ops that land mid-job (accepted, appended, acked, broadcast) change nothing it copies, and
+    unresolved entries merged into the live state are never in it. The checkpoint is exactly the state at S by
+    construction, not by locking.
+  - **Cost.** Element objects are never mutated once stored (`Doc.apply` replaces by id), so the checkpoint shares them
+    with the shadow: the copy is of references, not of the board. The checkpoint also takes the shadow's op-id arrays
+    (the shadow dies with the job). Work is counted in units: an element reference or a client's op-id pair = 1; an entry
+    applied = 16 + its op's chars / 16 (applying stringifies and clones what the entry carries, so **bytes** are the cost,
+    not element counts; calibrated on point-array strokes, which cost 2 to 3 times more per char than text); a thread = 1 +
+    its comments. A step stops after `FOLD_STEP_UNITS` (8192; the host's `foldUnits`), so about 128 KB of op text per
+    step. **One entry is indivisible**, so an entry over that is a step of its own: the ceiling of a step is the cost of
+    the largest entry in the tail (an op is at most about 1 MB). Measured by `scripts/fold-bench.js` at load ~10 to 30:
+    the longest step is 0.5 to 1.7 ms at 10, 27 and 50 MB; 1.0 ms for a tail of 1,500 strokes of 8 KB (120 steps); 0.9 ms
+    with 4,000 clients x 256 pairs (254 steps); and 5.4 ms (about 8 ms per MB of op) when the tail holds 660 KB point-array
+    strokes, each its own step (before byte-counting a 20-entry 600 KB-stroke tail made one 78 ms step). Heap kept after a fold with 4,000 clients: 0.2 MB (the
+    old whole-state fold: 10.4 MB, as the bench measures it). The shadow's own size bookkeeping is off (`measure: false`).
+  - **Scheduling is a port.** The package has no timers and runs in QuickJS: the room takes `schedule(fn)`, which runs `fn`
+    on a later turn of the host's loop. The host passes `setImmediate` (its `schedule` option; tests pass a queue). With no
+    `schedule` an automatic checkpoint runs whole, in one call, as `checkpoint()` does (a clean stop, tests).
+  - **Failure.** One job at a time, and none starts while the previous checkpoint's write is unsettled (a slow Store sees
+    at most one write in flight). The host fails a write unanswered for `checkpointTimeoutMs` (30 s) and reports it, so
+    `writing` always settles and later folds resume (Postgres also bounds the fence's lock wait with `lock_timeout`).
+    `status()` shows `folding` and `writing`. `base` and the tail change only when a job completes, so catch-up and joins are served
+    from the old base until then. A room that stops (`fail`: lease lost, a fenced write, a failed append) or a host slot
+    that dies abandons its job: no step runs, nothing is written. A `checkpoint()` call that takes a running job over
+    invalidates the steps already scheduled for it (a turn token), so one chain steps a job. A takeover while a job runs is the same fence as before:
+    the write at the end carries the old epoch and is refused `fenced` in the Store's own transaction (§ Store). A job
+    that throws is reported (`checkpoint-failed`), dropped with its shadow, and the next job rebuilds the shadow from `base`.
+  - **Encoding.** The adapters encode a checkpoint in slices too (`server/encode/sliced.js`, the same text as
+    `JSON.stringify`, the loop handed back every ~256 KiB; a thread's comments are pieces of their own): 21 ms at 50 MB became under 3 ms. The Store port is unchanged.
+  - **Options weighed.** (a) *Persistent / copy-on-write Doc*: O(1) snapshot, but `Doc` lives in `packages/core`, which is
+    never edited here, and a wrapper would leak into every reader of `byId`. (b) *Copy a slice per tick against an overlay of
+    later changes*: needs the pre-image of every change since S, including the unresolved entries already merged into the
+    live state (elements, appState, records, op-id table, note authors, eviction): an undo log across five structures,
+    easy to get subtly wrong. (c) *Encode in a Worker from a structured clone*: the clone is the O(n) block, QuickJS has no
+    Worker, and a port for it would still need (a) or (b) underneath. (d) *Shadow replica* (chosen): reuses `applyEntry`
+    (already the proven replay path), hides the whole mechanism behind `checkpoint()` / `startCheckpoint()` and the
+    `schedule` port, and costs memory about equal to what the old fold held (live state plus the base).
+  - **Order of a checkpoint's elements** is now the shadow's insertion order, not paint order. Readers still sort by layer
+    and z (`Doc.live()`), but it breaks z ties by array position, so for equal z the paint order of a client loaded
+    from a snapshot follows this insertion order (it did follow paint order before).
+- **Checkpoint parts** (decided 2026-11-19, TECH-DEBT row 40; `server/encode/cp-parts.js`, the two Store adapters). The fold and
+  the encoding are bounded, so the Store's own write must be too: `bun:sqlite` inserts a row in one synchronous call, about
+  4 ms per MB (mostly the fsync under `synchronous=FULL`), which held the loop 87 ms at 10 MB, 138 ms at 27 MB and 226 ms at 50 MB (`scripts/fold-bench.js`, `sqlitePutMaxStallMs`, load ~16). With parts the longest stall is
+  13.5 to 16 ms at 10, 27 and 50 MB, 15.8 to 19.6 at the worst of two runs, measured at load ~43 (one part's fsync plus the WAL's automatic checkpoint every few parts; `wal_autocheckpoint` 64 to 1000 made no clear difference). The Store
+  port is unchanged; the adapters store a checkpoint whose JSON text is longer than one part (`PART_CHARS` = 1 Mi chars,
+  option `partChars`) as parts. A checkpoint that fits one part is one row of plain JSON.
+  - **Format.** Part rows in their own table (SQLite `checkpoint_parts`, Postgres `pl_checkpoint_parts`): `(tenant, board, seq,
+    wid, n, data)`, `wid` a random id of one write attempt (two writers of one `seq` never share rows), `n` from 0. The
+    checkpoint **exists only when its header row** is in the checkpoints table under its `seq`: the text
+    `\u0001cp-parts 1 <wid> <parts> <chars>`. No JSON text can start with `\u0001`, and a one-row checkpoint starts with `{`, so a
+    reader tells them apart. The part table is created at open (SQLite) or by `migrate` (Postgres, deploy/README.md).
+  - **Write.** Encode in slices (above), cut into parts (never between the halves of a surrogate pair), then one transaction per
+    part, **each fenced** (SQLite: the lease epoch read in the write transaction; Postgres: `FOR SHARE` on the lease row), the
+    loop handed back between parts; then **the header's transaction**: fenced again, it checks that all `<parts>` rows of
+    `(seq, wid)` exist (else `unavailable`: a sweep took one), inserts the header (the first write of a `seq` is kept, as before), and prunes
+    to the newest `keepCheckpoints`. So a fenced holder stops at its next part and can never make a checkpoint visible after a
+    takeover; a crash or abort before the header leaves the previous checkpoint the newest, readable, untouched; a timed-out write
+    that still runs only ever adds a checkpoint at its own `seq`, so it can't hide a newer one (the highest `seq` wins).
+  - **Orphans.** Parts no header names are swept: by the writer after its header (the loser of a same-`seq` race, and the
+    parts of checkpoints pruned just now), by a writer that aborts or is fenced (its own parts, no fence needed to delete them), and by the
+    next checkpoint's sweep for a crash's (the sweep is `orphanGroups`: unnamed groups not newer than the newest header; a newer
+    group may be a write in flight). A write overtaken by a newer checkpoint may find its parts swept and fail `unavailable`: it was
+    stale anyway. **A delete never races a header:** every delete is conditional in its own statement on no header naming the write (SQLite: `NOT EXISTS` on the header row, one statement is atomic; Postgres: the same, run in a transaction that holds a per-board advisory lock, which the header's transaction takes too, so a header that commits while a sweep is yielding keeps its parts and a sweep that wins first makes the header's part count refuse; the sweep's transaction is bounded like every write, `lock_timeout` `leaseLockTimeoutMs` and the idle cut, and gives up quietly: the next write sweeps again; the header's own wait past it is `unavailable`, "the checkpoint lock is held"). SQLite deletes a part per statement with the loop handed back between.
+  - **Read.** The header names the parts; they are read one by one and joined (SQLite hands the loop back between parts), the
+    total length checked against the header (`corrupt` if not). A part a concurrent prune removed makes the read look again (up to 3 times); a header whose parts stay missing is a bad checkpoint and is skipped, so the caller gets the next one below it (rebuild and the feed step back the same way). The adapters report each skip through their `onSkip` option (`{ tenant, board, seq }`); `server/main.js` logs it as an error, "checkpoint unreadable: parts missing; stepped back".
+    Decoding the JSON itself is still one call (rebuild and gateway feeds only; § Known limits).
+  - **Why SQLite's parts table has a rowid.** Counting a write's parts on a `WITHOUT ROWID` table walks every row's text (15 ms for 50 x 1 MB);
+    with a rowid the key lives in a narrow index and the count is free.
+  - **Options weighed.** (a) *Incremental blob I/O on one row* (`sqlite3_blob_write`): one atomic row, but `bun:sqlite` has no blob handle and one
+    commit would still fsync the whole file. (b) *Smaller `synchronous` for checkpoints*: breaks "an acknowledged op is never lost" for their data and
+    the one-row visibility guarantee. (c) *Write the checkpoint to a file and store its name*: a second durability domain, no atomicity with the lease fence, and
+    it doesn't exist for Postgres. (d) *Parts + header row* (chosen): per-part fence, atomic visibility, one format for both adapters, old rows still readable.
+    Postgres's own stall (the driver turns the whole text into bytes in one call: 11 ms at 27 MB, 20.5 at 50 MB, measured) fell to 5.5 and 7.7 ms with parts.
+- **A checkpoint may lag the live `seq`.** Between a fold and the gateways learning of it (the write's
+  acknowledgement, then the next heartbeat's `cp`, ≤ 2 s) a join is served from the older checkpoint with a longer
+  tail: slower, never wrong. A checkpoint that can't be read, or doesn't match the log (see Rebuild), is skipped for
+  the one before it, and for the empty board last: the log has everything (M2 never prunes), so the join is longer,
+  never short of an entry.
 - **Order of durability.** A checkpoint at S holds only resolved entries, so entries ≤ S are durable. Log entries
   **< S** may be pruned only after checkpoint S is durable (entry S itself stays: the rebuild check needs it); M2
   never prunes the log.
@@ -485,11 +641,11 @@ rebuilt without guessing from the last entry.
   `Store.openEpoch(tenant, board) → epoch` (§ Store), a durable atomic increment, and welcomes nobody before it
   resolves. In a cluster this is the same row and the same step as taking the board's lease (phase 4), so a
   takeover's lease and its epoch can't diverge. Single node has the same record (its one host holds every lease).
-  Not the checkpoint, because checkpoints are written asynchronously, only every 1,000 entries or later, and the
+  Not the checkpoint, because checkpoints are written asynchronously, only now and then (§ Recovery, "When"), and the
   highest `seq` wins. A rebuild that wrote no checkpoint, or fell back past a bad one, would repeat an epoch.
 - **How gateways learn it.** A writer's `welcome` comes from the room, which knows its epoch. For a viewer's
   `welcome` the gateway uses the latest epoch it knows. The room puts `epoch` in its `.entries` heartbeat
-  (`{ seq, epoch }`, § Bus), and a gateway with no heartbeat for the board yet reads the lease record from the
+  (`{ seq, epoch, cp }`, § Bus), and a gateway with no heartbeat for the board yet reads the lease record from the
   Store, as it reads catch-up.
 - **What the client does.** `room.board` must equal its hello's board. If not, it closes and reconnects (a failed
   attempt, rule 12). The epoch checks below apply only to a **room-built** `welcome` (a writer's: it carries
@@ -511,6 +667,51 @@ rebuilt without guessing from the last entry.
   that stays up through a rebuild gets no new `welcome`. A writer meets the rebuild on its next op (`unavailable`,
   rule 6), a viewer only on its next reconnect. Nothing durable depends on the epoch: it is information for the
   client, and the fence is still the conditional append (§ Store).
+
+**Stuck host (#65): a host that is alive but not progressing is replaced through the lease, never by a second arbiter.**
+The Store lease stays the only authority. The room host (`server/room-host.js`) stops *renewing* a board it cannot
+serve; the lease then lapses by its own ttl and a waiting host takes it by the ordinary `acquire` (§ Bus, "The heartbeat,
+exactly"). Defaults: `leaseTtlMs` 10,000, `appendTimeoutMs` 4,000, `storeTimeoutMs` 10,000, `stuckMs` 8,000 (2 x
+`appendTimeoutMs`), `heartbeatMs` 2,000, renew every ttl/3 (3,333 ms).
+
+| # | What is stuck | Before #65 | Now | Room stopped within | A waiting host holds the lease within |
+|---|---|---|---|---|---|
+| a | the whole process (event loop blocked, SIGSTOP) | renews and timers cannot run; the lease lapses by its ttl; on waking the host sees `expired` at its first timer or inbox message and stops without answering | unchanged. A block of about `stuckMs` (6 s or more, with ops waiting) can also trip the watchdog on waking, before the deadline check: the writers then hear `unavailable` (1013) and reconnect, the same outcome | on waking (the lease is already gone) | last renew + ttl + margin (about 10.2 s); a waiter also tries at its own silence (2 heartbeats = 4 s) but is refused until the lapse |
+| b1 | one board's `append` never answers | `withTimeout` 4 s failed the room | unchanged | `appendTimeoutMs` (4 s) | the stop + at most 10 s (renewing stops with the room; the lease lapses ttl after the last renew, which was before the stop) |
+| b2 | a Store call of the **build** (`getCheckpoint`, a `read` page) or of `acquire`/`lease` never answers | **unbounded**: renew kept succeeding, the lease was held forever by a room that never opened, `open` never settled | each call is bounded by `storeTimeoutMs`; a build that times out stops renewing and **releases** (a failed build, not a lost lease) and then publishes `{ seq: 0, epoch, cp: 0, released: true }` on `.entries`, so a host already watching the board tries the lease at once (no wait for its next poll) | `storeTimeoutMs` (10 s) per call | the stop + one Store round trip (release, then the `released` message); if the release fails: + ttl |
+| c | sequencing stalled: ops are waiting (`inflight` + `queued` + `held` > 0) and the resolved `seq` has not moved | only the append and checkpoint timeouts, which a skewed wall clock or a Store call that never reaches the room could defeat | **progress watchdog**: each heartbeat tick compares the resolved `seq`; no movement for `stuckMs` while work waits stops the room (`lost`: never `release`, an append may be in flight) | `stuckMs` + `heartbeatMs` = 10 s at most | + ttl |
+
+- **The progress watchdog** runs on the host's `monotonic` clock and `timers` (never the rooms' `now`), on the heartbeat
+  tick (`heartbeatMs`). It records `{ seq, at }` per room; the record resets whenever nothing waits or `seq` moved. An idle
+  room is never stuck: it cannot trip the watchdog. A slow Store is not stuck either: any append that lands moves `seq`.
+  `stuckMs` should exceed `appendTimeoutMs`; if it does not, a slow but live Store is cut early (safe, only noisy). It defaults to 2 x `appendTimeoutMs`, so raising `appendTimeoutMs` raises it too; the host logs the effective `stuckMs`, `appendTimeoutMs`, `storeTimeoutMs` and `leaseTtlMs` once at start (`room host: stuck-host bounds`).
+- **What stopping does.** `lost`: the room fails, every connection it welcomed hears `unavailable` (close 1013) and
+  reconnects, renewing and the deadline timer stop, and nothing is released (a release could hang with the Store, and the
+  lapse is enough).
+- **Cooldown: a stuck host never retakes its own board at once.** `acquire` grants a lease to the holder that already
+  holds it, and gateways call `open` on every writer hello, so without a rule the stuck host would re-acquire its own
+  still-live lease (epoch + 1), hang again, and the waiting host would never get the board. After a **stuck stop** (the
+  progress watchdog, an append timeout, a build timeout) the host puts the board in a **cooldown of `leaseTtlMs` + margin**
+  (margin = max(20, ttl / 50) ms) on its monotonic clock, counted from the stop. During it `open` does not claim: it reads
+  the lease (bounded by `storeTimeoutMs`), watches the board and resolves "watching", and a waiting host's own attempt also
+  does not claim; the hello is answered `unavailable` once the heartbeat is silent. The stop came after the last renew, so
+  the lease has lapsed when the cooldown ends. Another host that holds the board is untouched by it; if none does, this host
+  takes the board when the cooldown ends. A lost lease for any other reason (renew refused, fenced, host deadline) has no
+  cooldown: the board is already someone else's or free. Cost: a single node (no other host) is also unavailable for the cooldown (10,200 ms at the defaults) after a stuck stop. The first `open` after it starts the retake at once (an `open` that finds the watch calls the attempt; the watch's own poll, every ttl/3, is only the fallback), and the writer's next reconnect is served: 10,200 ms + two reconnect intervals. Its writers get `unavailable` and reconnect meanwhile.
+- **No acknowledged op is lost.** An op is acked only after its append resolved *and* the lease was still within its host
+  deadline (§ Recovery, append). A stuck host that wakes has two defences: its own deadline check (`expired`) and the
+  Store's epoch fence. Every write the host makes carries the lease epoch and is checked **in the write's own transaction**:
+  `append`, `putCheckpoint` (small, each part, and the header; SQLite reads the lease epoch in the write transaction,
+  Postgres takes `FOR SHARE` on the lease row), so after a takeover (`acquire` raises the epoch) the old host's write is
+  `fenced` and writes nothing. `renew` and `release` are conditional on holder **and** epoch and are no-ops against a
+  newer holder. The host has no other Store write. An entry the old host made durable but never acked stays in the log;
+  the client resends it unacked and the new holder deduplicates it by op id (§ Op ids).
+- **What clients see.** A stuck room's writers get `unavailable` and reconnect (rule 12); their pending ops are resent
+  and deduplicated. Viewers lose nothing: gateways repair from the Store (§ Bus). A `hello` while no host serves the board
+  is answered `unavailable` by a waiting host once the heartbeat is silent for 2 heartbeats.
+- **A timed-out `acquire`.** The Store may still have applied it: the lease then sits held by this host with no renew and
+  lapses by its ttl; the next `acquire` by the same holder raises the epoch again. The host never trusts an answer that
+  arrived after its timeout.
 
 ## Op ids
 
@@ -660,7 +861,8 @@ record.
   creates one; a user whose domain has no tenant is a guest everywhere.
 - **Everyone signs in with Google.** A share-link guest signs in first, then redeems the link: there are no
   anonymous guests, so every connection has a verified `user`.
-- **Roles** (computed by Auth from the Registry): the highest of an explicit grant on that board (the creator gets
+- **Roles** (computed by Auth from the Registry; § Organization, after this list, widens the sources to Spaces, Groups, Teams and the
+  Unit, and is the rule today): the highest of an explicit grant on that board (the creator gets
   `owner`), a live invite to the user's **authoritative email**, a live share link the user redeemed, and — for a
   member of the tenant's Workspace domain (the `hd` claim, never the email) — the board's **`memberRole`**, set at
   `POST /boards`, default `viewer` (a reversible choice; `null` = members get nothing by membership). A user from
@@ -676,16 +878,751 @@ record.
   address is never authoritative (it has no `hd`), so that user needs a grant or a share link.
 - **`owner`:** the board's creator gets it at `POST /boards`. After that, **only a tenant admin may grant
   `owner`**; invites, share links and `memberRole` never give it. This is enforced by the admin layer
-  (server/admin), not by the Registry. A board always keeps at least one owner (§ Registry).
+  (server/admin), not by the Registry. A board always keeps at least one owner (§ Registry). The design also lets a
+  Space or Group owner grant `owner` inside it (the `transfer` permission, § Organization); that is enforced when the
+  routes for it exist, and until then only a tenant admin may.
 - **`POST /boards`** takes its tenant from the caller's verified identity (their Workspace domain's tenant),
-  never from the request body, and the caller must be an **admin of that tenant** (server/admin checks it again).
-  A caller with no tenant (a gmail user, a guest) gets `forbidden`. Admin calls that name only an id
+  never from the request body, and the caller needs **`board.create`** at the target Space or uses their personal space
+  (§ Spaces and Groups; it was tenant-admin-only before #48). A caller with no tenant (a gmail user, a guest) gets `forbidden`. Admin calls that name only an id
   (`invite(id)`, `revokeInvite`, `revokeLink`, `setGrant`, …) must first check that the id's board belongs to the caller's tenant.
 - Every log entry, checkpoint, blob and bus subject is keyed by the board's tenant: Store keys
-  `(tenant, board, seq)`, blobs `(tenant, sha1)`, subjects `plen.<tenant>.<board>.*`.
+  `(tenant, board, seq)`, blobs `(tenant, sha1)`, subjects `plen.<tenant>.<board>.*` (prefixed on the wire by the cluster id, § Bus).
 - Nothing a client sends can reach another tenant: `hello` names a board (the server finds its tenant), record
   anchors and element ids are board-local, and a blob URL is minted only for a board the requester has a role on,
   in that board's tenant.
+
+### Organization (Units, Groups, Spaces, Teams)
+
+Boards are organized as **Unit > Group > Space > Board**. Design: design/orgs/JOURNEY.md (§ 1, 2). The Registry stores it
+(§ Registry, "Organization"); the resolver below turns it into access. The routes and pages are § Home, § Spaces and Groups and § Teams and access.
+
+- **Unit** = today's tenant, plus a `kind` label (`company` | `enterprise`) and **one or more Workspace domains**
+  (`tenant.domains`; `tenant.domain` stays the first). A domain belongs to at most one tenant. Units don't nest, so the
+  tenant wall (store keys, blob keys, bus subjects) is unchanged. A Unit **member** is an identity whose `hd` is one of
+  its domains.
+- **Group**: a named shelf of Spaces (one level: Groups don't nest). **Space**: holds boards; it sits in one Group or at
+  the Unit root. Both carry **general access**: `generalRole`, the role "everyone in the Unit" gets (members only, never
+  `owner`; null = only people added). A board keeps its own general access in `memberRole` (§ Tenancy above): the same
+  meaning, widened. Every board lives in exactly one Space (`board.space`, never null): there are no unfiled boards. The
+  Registry refuses `createBoard` without a `space` of the board's own Unit, and the board's Space row is written in the create's own atomic step.
+- **Personal space**: a Space with an `owner` (one per member per Unit, made by `ensurePersonalSpace`), private
+  (`generalRole` null), the member its owner. **Team**: a named set of Unit members.
+- **A Team's membership is a grant.** Adding someone to a Team gives them each role the Team holds, so changing membership (and deleting the Team) needs the caller to be able to grant
+  or revoke each of those roles at each of those scopes, unless they are a Unit admin (§ Teams and access). No `team.manage` holder can reach a role through a Team they could not grant directly.
+- **Scoped grants**: a role for a user or a Team on a Unit, Group, Space or board (`setScopedGrant`). A user's own grant on
+  a board stays in `grants` (`setGrant`), so the room's path and the last-owner rule are unchanged. A Group or Space keeps
+  at least one `owner` grant (a user's or a Team's), atomically, like a board (the Unit's admins are the backstop and aren't counted).
+- **Roles are named sets of permissions; the server checks permissions, never role names.** Built-in, fixed: the ladder
+  `viewer < commenter < annotator < editor < owner` at Group, Space and board scope, and at the Unit **admin** and
+  **member** (member is editable). A **custom role** (per Unit) carries exactly **one board-content ladder role**
+  (viewer..editor) plus management permissions; it is made by duplicating a built-in role and can be granted at any
+  scope. Only the ladder role reaches a room: **a connection gets one ladder role**, as before.
+
+**Permissions** (`server/auth/permissions.js`): `board.view`, `board.comment`, `board.annotate`, `board.edit` (board content:
+cumulative up the ladder) and the management permissions `board.create`, `space.create`, `group.create`, `members.manage`, `move`, `delete`,
+`transfer`, `roles.manage`, `team.manage`. A role held at a scope gives its permissions *within that scope* (a role on a container
+covers everything inside it), clipped to what exists there: `roles.manage`, `team.manage` and `group.create` only at the Unit; `space.create` at the Unit
+and Groups; `board.create` at the Unit, Groups and Spaces; a board has only the ladder plus `members.manage`, `move`, `delete`
+and `transfer`. Built-ins: `owner` = the four content permissions plus `board.create`, `space.create`, `members.manage`,
+`move`, `delete`, `transfer`; `editor` = content plus `board.create`, `space.create`; `annotator`, `commenter`, `viewer` =
+content only; Unit `admin` = every management permission, `team.manage` included, and **no board content** (see **Admin levels**, below); Unit `member` =
+`space.create` until an admin edits it. The **content tier** is two more permissions, held only at the Unit: `content.shared`, `content.personal`.
+
+**Resolution** (`server/auth/resolver.js`, pure). An identity's access to a board (or to a Space, Group or the Unit) is
+the **union** of what every source grants; for the ladder that is the highest. There are **no deny rules**, so a board
+is never more private than its Space. Sources, each reported with where it came from, in this order (the order only orders
+the report: a union has no precedence). The code is the truth; this list is read from it:
+
+1. **direct** and 2. **team**, scope by scope from the target outward (board, then its Space, then its Group): the user's
+   own grant on that scope, then a grant to a Team the user is in (the source names the Team). A user's own grant on a
+   board is the `grants` table; every other scope's are scoped grants.
+3. **general**: "everyone in the Unit" on the board (`memberRole`), the Space and the Group, for Unit members only.
+4. **invite**: a live invite to the user's authoritative email (board scope; role capped below `owner`).
+5. **link**: a live share link the user redeemed (board scope; within viewer, annotator, editor).
+6. **unit**: Unit admin (the tenant's `admins`), then grants on the Unit (the user's, then their Teams'), then the Unit
+   member role for members.
+
+**Who is on a Space, Group, the Unit or a Team.** A **member** is an identity whose `hd` is one of the Unit's domains; only
+members get general access and the Unit member role. **Inside** = a member, or a Unit admin named by user id (the
+operator vouches for them; it is what lets a Unit with no domain, such as a dev tenant, have a Space owner). Only the
+inside hold Space, Group and Unit grants and Team grants: for anyone else the resolver skips every one of them, so **a guest
+holds only board-scope sources**: a direct grant on the board, an invite or a link, whatever rows the Registry holds. The
+Registry cannot tell a guest (membership comes from `hd` at sign-in and is not stored), so this read-time rule is the
+enforcement, and a scoped grant or Team membership written for a guest is inert, not an error. `admin` and `member` are not
+grantable: a scoped grant of either is ignored (admin comes only from `admins` and its guards, member only from membership).
+
+**Permissions are clipped where they are asked.** A role held at a scope covers what is inside it, but a permission means
+something only at some targets, so every source's permissions are cut to the target asked about: a Unit admin asked
+about a board has no `roles.manage`, and a plain member asked about a Group or Space has no `space.create`. The Unit member
+role's management permissions apply only when the target is the Unit itself; creating a Space in a Group needs a role on
+that Group (JOURNEY J4).
+
+The answer is `{ ladder, permissions, sources, until }`: `ladder` is the one role the room gets (null = none = `auth`),
+`permissions` the union, each `source` is `{ kind, scope: { type, id }, role, team?, permissions, ladder }` (the UI's
+"Viewer via Infra team on Space Platform"), `until` the soonest invite or link expiry (the answer can change then
+without a message). Stored roles are never trusted: an unknown role, a role not valid at its scope, an `owner` through
+general access, invite or link counts for nothing or is capped. **Unit admin and rooms:** an admin manages every board of the Unit but enters a room only
+through a role or the content tier (**Admin levels**, below). There is no deployment switch: `PLENARY_ADMIN_BOARD_CONTENT` and `adminBoardContent` are gone
+(pre-launch, no compatibility path).
+
+**Admin levels (#88).** Board content is a *permission tier*, separate from managing the Unit. Names are labels; every check reads the permissions.
+- `content.shared`: open every board in every shared Space (and the Groups and the Unit root) **as board `owner`**. It reaches no personal space.
+- `content.personal`: open other people's personal spaces and their boards **as their owner would**: open, rename, move out (where nobody gains a role), trash and restore, hand over with a leaver's removal. On a personal target it adds only `move` and `delete` to that source (move out, trash, restore); the hand-over of a leaver's personal space is checked on the tier itself (`holdsTier`, `offboard.js`). **Not** `members.manage`, `transfer` or `board.create`: the tier opens and acts as owner for those four things, never shares to a third party, makes links or invites, or creates boards in someone's personal space. On shared Spaces management is the admin's own permissions, and the Unit root and Groups give a content holder content only.
+- Held only at the Unit (`ALLOWED_AT.unit`): granted at a Group, Space or board they are clipped away and mean nothing. A custom role may carry either (`permissions` of `POST /roles`; `boardRole` is still required and stays that role's own board step, which on a shared board is *lower* than the owner step `content.shared` gives); the Unit **member** role may not (`roleProblem` refuses, `roleDef` ignores a stored one).
+- Built-in Unit roles, grantable at the Unit only like any role (`PUT /access/unit/:id/grants/:subject`): `admin` (manage only, held by `tenant.admins`, fixed), `content-admin` (= `content.shared`), `content-admin-personal` (= both). They appear in `GET /roles` (`kind: "builtin"`) after `admin`; ids and permission lists are fixed; `view.permissions` lists the tier permissions. `matrix.permissions` has them with `group: "content-tier"`, `scopes: ["unit"]`.
+- **What "manage-only" means.** A Unit admin without the tier keeps every management power: members, Teams, roles, Spaces settings, and on shared Spaces and their boards `members.manage`, `move`, `delete`, `transfer`, `board.create`, grants, invites, links, rename-as-Space-owner, trash and restore of a *shared* board. They cannot open a board's room (ladder `null`), read titles through search, the Home tree or **Trash** (`GET /trash`, `GET /boards/:b/trash` and the trash and restore answers carry `{ id }` for a board they could not open before it was trashed; the page says "a board you can't open", capitalised only where it opens a sentence or heading) of a Space they have no other source for, or touch anything in a personal space (zero permissions there; TECH-DEBT rows 66 and 67). **They are held to their own board role, which is none**: the no-escalation ladder rule (§ Share dialog) has no Unit-admin exemption any more, so they cannot give anyone, themself included, a board role on any path: `PUT /access/board/:b/grants/user/<self>`, the legacy `PUT /boards/:b/grants/:user`, a custom role (it always carries a board role) granted at the Unit, a share link or an invite, widening a Space's or Group's general access (`PATCH /spaces/:s`), taking a leaver's item for themself, adding themself to a Team that holds a board role, or moving or restoring a board where they would gain a role (every Space has an owner, so in practice they move none). Narrowing, removing and renaming need no role. What they keep: members, Teams (adding another member), role definitions (non-tier), Space settings other than access, trash and delete of shared boards, reassigning a leaver's shared item to another member. This is exactly today's default (`adminBoardContent` off); the only behaviour change is that the old switch (on = an admin got every content permission everywhere) is replaced by the tier, and the old "on" is now `content-admin-personal` on the people who should have it.
+- **No escalation.** Only someone who holds a tier permission may hand it out: a role carrying it is created, edited, granted (to a user or a Team), changed and cleared only by a holder of every tier permission it carries; **a Unit admin is exempt from the management permissions but never from the tier** (`roles.js` `within`, `access.js` `grantable`/`mgmtOf`). Adding a member to a Team that holds a Unit grant of a tier role needs the same permissions (`mayChangeTeam`). **Removing or lowering never widens, so any manager may clear a tier grant or change it to a role whose tier permissions are a subset of the current one** (`setGrant`'s `narrows`), as an admin may always remove a Team member; they may never raise it. A copy (`POST /roles` `base`) of a tier role is refused to someone who could not hold it (403).
+- **The ladder exemption is the tier plus a Unit-wide say.** `holdsTier(access)` (`resolver.js`) is true when a source of the access carries `content` (`content.shared` on a shared target, `content.personal` on a personal one). `ladderExempt(access)` is `holdsTier` **and** `members.manage` from a Unit-scope source (the Unit admin role or a Unit-wide custom role; permissions, never role names), so a tier holder whose only say on a board is a local role (say viewer + `members.manage` on a Space) is held to their own ladder. It is the only ladder exemption in the system (move uses the per-person gain rule instead, § Move board): `grantable`/`touchable` (`access.js`), `mayGive`/`givable` and `setGrant` (`admin/boards.js`), the offboarding hand-over and `spaces.update`'s general-access check. Everyone else, a Unit admin included, gives at most `ownLadder(access)`: the ladder held **without** the tier (the tier's owner step never counts toward what a holder may hand out, grants, links or invites). The mover's own ladder in `move.js` and `trash.js` does count the tier (acting as owner on the source), with no admin exemption. The one narrow exemption left is offboarding (`reassignable`): a Unit admin may give a leaver's shared Space or Group to another live member, never to themself.
+- **Who holds it is visible.** Every Unit admin reads, read-only, the holders on the Unit access page (rows with the built-in or custom role) and the "used in N places" count on the built-in tier roles in `GET /roles`; `can.remove` is true on those rows, `can.change` only for a holder.
+- **What `content.personal` can move.** Moving a board out needs `move` on it (the tier supplies it), `board.create` at the destination, a destination the caller opens (rule 2) and the per-person gain rule. The tier gives no `board.create` and no board step at a destination, so a holder who is only that (a role with just `content.personal`) is refused and offered no destination; move-out is in practice for a Unit admin (or someone with a Unit-wide `board.create` and a board step) who also holds `content.personal`, and only into a Space where nobody gains a role (e.g. one owned by the board's own owner with no general access). Trash, restore and hand-over need only the tier.
+- **Bootstrap.** Because only a holder can pass the tier on, the first holders come from the operator: `scripts/admin-bootstrap.js --content-admin <user>` / `--content-admin-personal <user>` (`bootstrapTenant({ contentAdmins, contentAdminsPersonal })`, additive, user ids only, never an email) and dev tokens `"content": "shared"|"all"` in `PLENARY_DEV_TOKENS`.
+- **Explanation.** A source in `GET /boards/:board/explain` `mine.sources` (and the resolver's `Source`) carries `content: "content.shared"|"content.personal"` when the tier is what gives it board content, so the screen says *which permission* grants it. `roleName` of the built-ins: "Unit content admin", "Unit content admin + personal".
+- **Cache and announcements.** The tier is part of what `roleCache` serves; a role edit that adds or removes a tier permission is a material change (`PATCH /roles/:id` announces the Unit, a revocation when anything is lost), and a grant or Team change announces as any other, so a cached role is dropped like any grant change. No extra key.
+- **Audit seam (M6, not built).** Content access must be audited when M6 lands. The one place every exercise of the tier passes is `resolveAccess` (`resolver.js` `add()`, the `tier` variable): a source with `content` set is a content-tier exercise, and `tenancy.accessOn` / `tenancy.resolve` / `resolveMany` are where a hello or a pass could emit an event naming `{ user, board, via }`. TODO(M6): emit `content.opened` there through a new `Audit` port (nothing audits today). TECH-DEBT row 69.
+
+**Defaults.** A personal space is private (`generalRole` null) and its owner owns it. A new Space gives `viewer` (its
+creator may pick none). A new board has `memberRole` null, so it **inherits** its Space, unless the creator passes one.
+
+**No migration.** Plenary has no data to carry over: a store from before the organization (a `reg_boards` with no `reg_spaces`), or in which ANY table's columns differ from its current DDL (one helper per engine checks every table: `server/sqlite/schema.js`, `server/pg/schema.js`; the expected columns are the adapter's own CREATE statements), is **refused at start-up** with code `old-format` ("Reset the store"); it is never read silently and never ALTERed. The advice is always to reset the whole store (SQLite: delete the file; Postgres: drop the schema), never one table: the Store's lease table holds every board's epoch. A store holding a board with no Space row in `reg_board_spaces` is old-format too and is refused the same way at start-up (SQLite and Postgres). There are no unfiled boards and no "Other boards".
+
+**Freshness.** The resolver reads live; `.grants` (§ Bus) is per board. A change to anything the resolver reads above a
+board (a scoped grant on a Space, Group or the Unit; a Team's grants or membership; a Space's or Group's general access or
+its Group; a custom or member role; a Unit's domains or admins) therefore reaches live connections only if it is announced
+for **every board it reaches**, or else on the next timed re-check (≤ 60 s; a cached hello role within the cache's 30 s).
+The Registry lists what is needed, in bounded pages, so no route has to guess:
+
+- `boardsIn(scope)`: the board ids in a Space, a Group (its Spaces') or a Unit, by id, `{ ids, next }` per page (default
+  500, at most 1000).
+- `scopesOf(subject)`: the scopes (with the role) a user or Team holds a grant on, paged the same way.
+- `personalScopesOf(subject, { limit })`: the subset of those that is a personal space or a board in one, as `{ scopes, more }` (one join in SQL, at most `limit` and never more than 50; `more` when further ones exist). Read by `PUT /teams/:id/members/:user` for an admin's add (§ Teams and access).
+- A cursor (`after`) must be a previous page's `next` (a board id; or `<type>\n<id>`). A **malformed cursor is refused**
+  (the call rejects with "registry: bad cursor"), never read as "start over", so a caller looping on `next` can't spin
+  forever; an unknown but well-formed one is just a position.
+
+How the routes of #47 and later announce: after the write succeeds, a change **on a scope** pages `boardsIn(scope)` (a
+board scope is that one board) and publishes `{ board }` on each board's `.grants` subject; a **Team membership change**
+(`setTeamMember`) pages `scopesOf({ type: "team", id })` and announces each scope's boards the same way; a **role edit** announces `boardsIn` of the Unit (which scopes use a role is not indexed); a change to the **Unit**
+(domain, admin, Unit grant, member role) does the same. Each announcement is a plain `.grants` message, so the gateway's existing one-pass-at-a-time rule bounds the work;
+announcing is best-effort like every bus message, and the timed pass repairs a lost one. The gateway's role cache holds a
+board's chain (its Space, Group and tenant records) for at most its `ttlMs` and drops it on `.grants`.
+
+### Home (the read API behind the Home screen, #47)
+
+Design: design/orgs/JOURNEY.md (J1, J5, §4 [home], §5). Code: `server/auth/home.js` (core), routes in `server/auth/http.js`,
+Registry calls below. All routes authenticate like every other route in http.js: `Authorization: Bearer <session or dev token>`, no cookie.
+
+- `GET /home` → `{ guest, user, unit, recent, starred, owned, shared, tree, limits, can: { createGroup, manageAccess, manageRoles } }`. A Unit member's first `/home` makes their personal space (`ensurePersonalSpace`, idempotent), so it is always in the tree; `can.createGroup` = the caller holds `group.create` at the Unit root (false for a guest); `can.manageAccess` = the caller holds `members.manage` at the Unit (the page then links the Unit's access page; false for a guest).
+  - `guest`: true when the caller has no Unit (`tenantOf` null: a gmail user, a domain with no Unit, and every dev-token user without a
+    domain, so the README "Try it" users are guests). A guest gets **Recent, Your boards (`owned`) and Shared with me (`shared`)**
+    (JOURNEY J1): `starred` is `[]` (no Starred: a guest's star is refused, 403), `tree` is null, `unit` null, and the page offers no "New board".
+  - `recent`: the last 12 boards the person opened (newest first). `starred`: up to 50, newest star first (members only). Each is a list of
+    **cards**: `{ id, title, role, path, starred, at?, can? }` (`can: { rename, move, trash }` on a Unit member's cards, § Move board "Where it appears"; none on a guest's). `role` = the ladder role the person holds now. `at` = when it was opened (recent) or
+    starred (starred).
+  - `owned` ("Your boards", guests only; `[]` for a member): up to 50 boards the guest holds a direct **owner** grant on, by title, with an empty `path`. A member's
+    owned boards are already in their Spaces and the tree. `shared` ("Shared with me"): up to 50, by title. **Shared means** boards the person
+    reaches through a source on the board itself (a direct grant, a grant to a Team they are in, a live invite to their email, a link they redeemed;
+    `Registry.sharedBoards`) and, for a member, whose place the tree doesn't already show: boards in a Space they can open are not repeated in Shared. An owned board in a Space the member can't open does show in Shared. All of it is
+    filtered by what the resolver says they can open now, so an expired invite or revoked link vanishes.
+  - **Names are access.** `path` names only what the person can open: `[{ type: "group", id, name }, { type: "space", id, name }]` for a Space (and
+    Group) they can open boards in; any Space or Group above a board they reach another way is replaced by the neutral
+    `{ type: "shared", name: "Shared with you" }` (a Group they can't open is dropped when the Space is open); a Space they can't open is "Shared with you". A guest never sees another Unit's Group or Space names.
+    The check is the resolver's own answer for the Space / Group (`accessMany`, below), not a stored flag.
+  - `tree` (members): `{ groups: [{ id, name, spaces: [{ id, name, personal }] }], spaces: [...Spaces in no Group, or in a Group they can't open], more }`.
+    Only Spaces and Groups the person can open boards in appear.
+    `tree.more`: true when the page of Space candidates (100), the Group candidates (50; one more is asked for to tell), or the grant checks (40 Spaces, 20 Groups) left something out.
+  - `limits`: the caps in force, so the page needs no copy of them.
+- `GET /home/search?q=<text>` → `{ q, results, more }`. `q` trimmed, 1-100 chars (else 400). Members: boards of the person's Unit whose **title** contains `q`,
+  or whose Space name contains `q` **and the person can open that Space** (an unopenable Space's name is no search key), plus matching titles among `owned` and `shared`.
+  Matching is **ASCII case-folding only** (`A-Z`; other letters compare as written; `%`, `_` and `\` literal) on every adapter. At most 20 results. Work is bounded: up to 2
+  windows, each examining the next 1000 boards of the Unit (`searchBoards`' `scan`) and returning EVERY match in it (checked 200 at a time). **`more` is true only when a 21st
+  openable match exists or the window ended before the Unit did**: never because of how many matches the person can't open, so a hidden Space's name (or a pile of hidden boards)
+  gives the same answer as a query that matches nothing. `searchBoards`' `next` likewise depends only on the window, never on the match count.
+  A board the person cannot open is never returned, whatever it is called. Guests: matching titles among `owned` and `shared`.
+- `GET /home/search?space=<id>` → `{ space, results, more }`: one Space's boards the person can open (by id, up to 50), for the tree's click. `space` is `{ id, name }` only when the
+  person can open the Space itself, else null (a board reached another way still lists, under "Shared with you"). It reads at most 3 pages of 200 boards. `more` is true on a 51st openable card, or, for a Space they can open, when
+  the pages ran out; for a Space they can't open it is only the card overflow, so a hidden Space (any size) answers exactly like an unknown id or another Unit's Space: `{ space: null, results: [], more: false }`. `space` with `q` is 400.
+- `PUT /home/stars/:board` / `DELETE /home/stars/:board` → 204. Starring needs a Unit and a role on the board (a guest, a board with no role and an unknown board all get the same 403 `forbidden`);
+  unstarring is always allowed and idempotent.
+- **Recent is written by the server**, not the page: when a gateway welcomes a connection it calls `markOpened(user, board)` (debounced per user and board for 60 s per gateway, best
+  effort). Under a join storm the write is **bounded**: at most 16 writes in flight per gateway; a welcome that finds 16 running is dropped (counted, one log line per minute), never queued. One
+  row per (user, board); only the newest 50 per user are kept, **atomically** (Postgres serialises one member's writes with a transaction advisory lock).
+
+**"Boards I can open", efficiently.** The listing never asks the resolver once per board in the Unit. Every list is built from a *candidate* query that is bounded in SQL (recents ≤ 30
+rows, starred ≤ 60, shared ≤ 60, a search window of ≤ 1000 examined boards, ≤ 2 windows) and the candidates then go through ONE batch, `tenancy.accessMany(identity, ids)`:
+`Registry.boardRows(ids, { user, email })` (SQLite 7 statements, Postgres 6, for the whole batch, however many boards: boards, the user's grants, Team grants on the boards, the user's Teams among
+them, invites to their email, link uses, the links) plus **one `accessContext` per distinct Space** among the candidates, then the pure `resolveAccess` per board, and
+once per distinct Space and Group from the context already in hand (no more reads) for `spaceOpen` / `groupOpen`, which the path rule above needs. So a page of N candidates costs 6-7 batch statements plus one per distinct
+Space, never N × 4. The answer is the resolver's, board for board (test/auth/access-equivalence.js checks it against `tenancy.effective`: ladder, permissions, sources and `until`, on memory,
+SQLite and Postgres, several seeds, with custom roles, Group, Space and Unit grants, the content tier absent and held (`content-admin`, `content-admin-personal`), and a second Unit in one batch).
+
+**The tree is bounded too.** It does not read the Unit's Spaces and Groups: `Registry.spaceCandidates(tenant, { user, all, limit })` pages Spaces in SQL (by id, 100 per page, one page) that the
+person COULD open: general access set, their personal space, a grant to them or one of their Teams on the Space or its Group, a Group with general access, or any Space if they hold a Unit-level role
+(`all`). A superset the resolver then settles: Spaces whose general access already opens them are resolved from the rows in hand (no read); only Spaces that need their grants are checked with
+`effective`, at most 40 (8 at a time), and Groups (`groupCandidates` ≤ 50, `effective` for at most 20) the same. What is left out sets `tree.more`.
+
+**Where Recent and Starred live.** Two Registry tables, `reg_recents (member, board, opened_at)` and `reg_stars (member, board, at)`, keyed `(member, board)` and indexed `(member, time DESC, board DESC)`.
+Not a separate port: they are per-user rows over the Registry's own board ids with the same durability, and they must be read with the access check. They hold no board data, so an unreadable
+board's row is inert (the access filter drops it). Home's tables are created like the Organization ones (if missing); its reads use these indexes: `reg_invites (email)`, `reg_link_uses (member, board)`,
+`reg_scope_grants (subject_type, subject, scope_type)`, `reg_team_members (member)`, `reg_grants (member)`, `reg_boards (tenant, id)`.
+
+Pending maintainer decisions kept as-is: a Unit admin gets no board content by being admin (a board they cannot open is not listed).
+
+## Spaces and Groups (pages, pickers, create and rename, #48)
+
+Design: design/orgs/JOURNEY.md (J2, J4, §4 [space] [group] [new-board] [new-space], §5). Code: `server/auth/spaces.js` (core: every decision
+below), routes in `server/auth/http.js` (they only translate), Registry calls `rename`, `updateScope`, `spacesIn`, `accessContexts` (§ Registry). Every route
+authenticates like Home (`Authorization: Bearer`), and **checks permissions, never role names**: the permission is read from the resolver's
+answer (`tenancy.effective`) at the scope the request names.
+
+**One refusal, whatever the reason.** A route that names a Space, Group or board the caller may not use answers the same for an id that does
+not exist, one in another Unit, and one that exists but is hidden: a read is `404 not-found`, a write is `403 forbidden`, same body, same
+status, and **the same Registry work** (every route reads the scope row and calls `tenancy.effective` for any id, fine or not, and a board id goes through `accessOn(..., { uniform: true })`; a test counts Registry calls per case, one case at a time). The work is the same down to the statements: SQLite's `accessContext` runs the same statements with no-match parameters when the row is missing (a test counts them), and Postgres answers in one statement either way. So no page, picker or error names or confirms a Space or Group the person cannot open. **Open** = the resolver's ladder
+role for the person is not null (the Home rule); a Unit admin does not open a private Space without the content tier (`content.shared`, **Admin levels**), so a page or picker does not list one for them. A *write* needs the Space opened: `POST /boards` into a Space the caller cannot open (a manage-only admin who merely knows its id) is 403, the ordinary refusal, and so is any other member's personal space (private until its owner shares from it).
+
+| Route | Needs | Answers |
+|---|---|---|
+| `POST /boards` `{ title?, space?, memberRole? }` | a Unit (members only: a guest, or a user with no Unit, gets 403). `space` omitted or null = the caller's **personal space** (made on first use; always allowed): the board service (server/auth/spaces.js) fills it in, because the Registry itself requires a Space. `space: "<id>"` needs `board.create` at that Space | 201 `{ board }` (the board record). The caller becomes its `owner`. `memberRole` absent = null: the board inherits its Space (a personal space is private); else a role below `owner` (400 otherwise). Replaces the admin-only rule |
+| `GET /spaces?can=board.create` | a Unit | `{ spaces: [{ id, name, personal, general, group: { id, name } \| null }], more }`: the Spaces the caller can open **and** holds `board.create` in (`general` = the Space's general-access role or null), their personal space first. A Group's name appears only when the caller can open the Group. The picker and `POST /boards` use one function, so what is listed is what is accepted. `more` = the bounded candidate scan left something out |
+| `POST /groups` `{ name, general? }` | `group.create` at the Unit root (a permission, not a role name; the built-in Unit `admin` holds it, `owner`/`editor`/`member` do not, a custom Unit role can). `name` trimmed, 1-200; `general` as for spaces, default `null` | 201 `{ group: { id, name, general } }`; the caller becomes its `owner` |
+| `GET /groups?can=space.create` | a Unit | `{ root, groups: [{ id, name }], more }`: `root` = the caller holds `space.create` at the Unit root; `groups` = the Groups they can open and hold `space.create` in |
+| `POST /spaces` `{ name, group?, general? }` | `space.create` at the Unit root (`group` omitted or null) or at the Group. `name` trimmed, 1-200. `general`: `"viewer"` (default), `"commenter"`, `"annotator"`, `"editor"` or `null` (only people added) | 201 `{ space }` (`{ id, name, personal: false, general, group }`); the caller becomes its `owner`. An unknown, other-Unit or hidden `group`: 403 |
+| `GET /spaces/:id` | open the Space | `{ space, can: { createBoard, rename, general }, boards, more }`. `boards` = Home cards (§ Home) of the boards the caller can open, by title, at most 50 (Home's bounded window: up to 3 pages), each with `can: { rename }`. `can.*` are permissions: `board.create`; `members.manage` (not for a personal space) |
+| `GET /groups/:id` | open the Group | `{ group: { id, name, general }, can: { createSpace, rename, general }, spaces: [{ id, name, general }], next }`: its Spaces, by id, 100 a page (`?after=<next>`). Every Space of a Group the caller opens is open to them (a role on a container covers what is inside), so none is filtered. Someone who can open one Space but not the Group gets 404 here (the Space shows in their Home tree) |
+| `PATCH /spaces/:id` `{ name?, general? }` | `members.manage` at the Space. A personal space: the ordinary 403 (its name and privacy are the person's own; the refusal must not say which Space is personal) | 200 `{ space }`. At least one field, else 400. Name and general access change in **one** Registry call (`updateScope`: one transaction, no half-applied change). If the caller manages the Space but cannot open it (a Unit admin, content access off), the answer is only `{ id }` plus the fields they sent: no stored name |
+| `PATCH /groups/:id` `{ name?, general? }` | `members.manage` at the Group | 200 `{ group }` (the same only-what-you-sent rule when the caller cannot open it) |
+| `PATCH /boards/:board` `{ title }` | `board.edit` or `members.manage` on the board (a title is board content; an owner and an admin hold the second). `title` trimmed, 0-200 | 200 `{ board }` |
+
+Unknown body fields are 400 `unknown-field`, as everywhere. The 4xx/5xx codes are the existing ones (400 `bad-request`, 401, 403 `forbidden`, 404
+`not-found`, 503 `unavailable`); #48 adds none.
+
+**Why `members.manage` renames a Space.** The permission list has no rename; a name is the container's management, which `members.manage` is (Space
+and Group owners hold it, editors do not). A custom role can hold it. A board's title is content, so `board.edit` also renames it.
+
+**Freshness (§ Organization).** Per route: `POST /boards` and `POST /spaces` add an owner grant on a thing that did not exist, so no live connection
+is affected and nothing is announced (the board's own `setGrant` announces as before). A rename is not access: nothing is announced. A
+**general-access change** (`PATCH` with `general`) changes what every board inside gets, so after the write it pages `boardsIn(scope)` (a Space's
+boards, or a Group's Spaces' boards) and publishes `{ board }` on each board's `.grants` subject, at most 20 pages of 500, **after the response** (off the request path; shutdown waits up to 2 s for it, and anything lost falls back to the timed re-check); a larger scope's
+rest waits for the timed re-check (≤ 60 s) and one log line says so. A failed announcement is logged, never fails the request.
+**Scheduling** (`server/auth/spaces.js`): one pass per scope at a time; a change during a pass marks the scope dirty and earns exactly one more pass (the check and the
+release of the scope happen in one synchronous step, so no change is lost); a scope yields its slot after 3 passes in a row (back of the queue). At most 8 scopes run at
+once and 4 of one Unit; scopes over the cap wait in a queue deduped by scope; only past 10,000 queued scopes is an ordinary change dropped (logged, left to the gateways' timed re-check, 60 s at most). A change that **reduces access** (general set to null or to a lower
+role) waits in its own queue, drained before the ordinary one and first-in first-out (an old revocation is never starved by newer ones), and has its own budget (16 slots overall, 8 per Unit), so a revoked viewer loses live access promptly and one Unit's flood of revocations can't starve another's. It is never dropped, shutdown (`close()`, after a 2 s wait for running passes) forgets whatever is still queued, and its priority lasts for the pass that follows the change only (an ordinary change after it queues normally).
+
+**Bounds.** `GET /spaces?can=`: one page of at most 100 candidate Spaces (`spaceCandidates`, SQL), general access settled from the rows in hand, then ONE batched `effectiveMany` (one `accessContexts` call: one statement on Postgres) for the candidates still undecided; the rest set `more`. `GET /groups?can=`: at most 50 Group candidates, one batched read.
+`GET /spaces/:id`: the Space's one `effective`, then Home's window (≤ 3 pages of 200 ids, one `accessMany` each: 6-7 statements and one context read
+per page). `GET /groups/:id`: one `effective`, one `spacesIn` page. Nothing loops the boards, Spaces or Groups of a Unit.
+
+## HTTP request deadline (#73, TECH-DEBT row 16)
+
+Every route `httpRoutes` (server/auth/http.js) serves answers within a **request deadline**, default **8000 ms** (`config.requestDeadlineMs`; main.js reads
+`PLENARY_REQUEST_DEADLINE_MS`), or answers `503 {error:"unavailable"}` (the same body and code as any Registry or verifier outage). One wrapper in the
+dispatcher covers the whole route table, the body read, the bearer check and the handler, so a route added later is covered with no per-route code
+(`test/auth/http-deadline.test.js` enumerates the table and fails on a route it does not know). The deadline sits under the idle cut in front of the server
+(Bun's own default is 10 s without a byte; `server.js` sets 30 s, `idleTimeoutSec`) and under any proxy's, so the client sees a status, never a dropped
+connection. `GET /auth/dev` keeps its own tighter 3 s wait. Blob PUT/GET (`blob-http.js`) has its own body deadline and is not under this one.
+
+**Inner limits stay under the deadline.** A call that runs past the deadline still works on after the 503, so every single-call limit below it is kept
+shorter: main.js starts the Postgres Registry with `statementTimeoutMs` and `lockTimeoutMs` of **5000** (a single node's SQLite busy timeout is 5000 too) and
+Google's `timeoutMs` of **3500**, and **refuses to start** (a loud error naming the setting) when one of them is not below the deadline. For Postgres the
+check uses the adapter's longest call as `gate()` reports it: its wait for a connection plus the limit plus a 1 s backstop (7050 ms by default). Several calls in a row (scope reads, then the create) can still add up
+past it; that case is the next paragraph's.
+
+**What a 503 means on a write.** The work is not cancelled (the Registry port has no cancel; a statement already sent to the database runs to its own
+limit). So a 503 from a write route says **"may or may not have applied"**, and after the 503 is sent the late result is **discarded**: the response is
+built once, and the late handler's return value or rejection is dropped (handled, never an unhandled rejection) and counted (`stats().late`) and logged
+(at most one line per 10 s, with the route and whether it applied or failed).
+- **Safe to retry as is:** grants, stars, revokes, renames and `updateScope` set a value; repeating them changes nothing. So do the Teams routes that are not creates (`PATCH /teams/:id`, `DELETE /teams/:id`, `PUT` / `DELETE /teams/:id/members/:user`) and the access routes (`PUT` / `DELETE /access/:type/:id/grants/:subjectType/:subject`).
+- **Retry with the same `Idempotency-Key`:** a create (`POST /boards`, `/spaces`, `/groups`, `/teams`, `/roles`, `/boards/:board/invites`, `/boards/:board/links`) makes a new
+  object on every call, so without the key a retry can leave the first, committed object next to the second (and no route deletes a board, Space or
+  Group). Send the header and a retry returns the first call's object, exactly once, whether or not the first committed. See the next section.
+
+## Idempotent creates (`Idempotency-Key`, #73, exactly-once #86)
+
+`POST /boards`, `POST /spaces`, `POST /groups`, `POST /teams`, `POST /roles`, `POST /boards/:board/invites` and `POST /boards/:board/links` accept an `Idempotency-Key` header: 8-64 of
+`[A-Za-z0-9_-]` (anything else is 400 `bad-idempotency-key`); a client makes one per submit (a random UUID is fine) and **reuses it for every retry of that
+submit**. Without the header a create behaves as before. 
+
+**The key is written in the create's own transaction.** The Registry call that creates the object also inserts the key's row `(user, key) → fingerprint, id`
+in the **same atomic step** (one SQLite transaction, one Postgres transaction, one synchronous memory step). So the object and its key commit together or
+not at all: there is no state in which the object exists and the key does not, or the reverse. Nothing is "claimed" before the work and nothing is
+"finished" after it, so a client timeout, a dropped connection, a deadline 503 or a crash at any point leaves exactly one of two states, and a retry with
+the same key is correct in both.
+
+| Same key, per signed-in user | Answer |
+|---|---|
+| first use | runs the create; the object and the key commit together; **201** |
+| again, after the first committed (whatever happened to the first call's response) | **the first object, rebuilt** for the caller as they are now (rule below): **201** with it read fresh, plus the header `Idempotent-Replayed: true`. Nothing is created |
+| again, while the first is still running (a call cut by the deadline keeps running) | the retry's create waits on the same row until the first commits or rolls back, then replays (201) or runs fresh. The wait is bounded by the adapter's lock limit (Postgres `lock_timeout`, 5000 ms; SQLite busy timeout, 5000 ms): past it the answer is `503 unavailable` (the transaction rolled back, nothing written) and the client retries with the same key. **There is no `in-progress` answer** (and no 409) |
+| again, after the first failed before committing (a refusal, a rolled-back transaction) | the key left no trace: the retry runs as a first use |
+| again, with a different route, path parameter or body | `422 {error:"idempotency-key-reused"}`; nothing runs |
+
+- **A board is created with its owner in one step.** `createBoard` takes the `owner` (like `createSpace` and `createGroup` always did): the board, its owner
+  grant and the key are one transaction. There is no board without its owner and no `owner-grant-failed` outcome.
+- **The deadline does not lose the answer.** A create cut off by the deadline keeps running and either commits (object + key) or rolls back (neither). A
+  retry gets the board id in the first case and a fresh run in the second.
+- **A replay is authorized again (security).** What is stored under a key is the object's **id**, **never a response body** (a link's `url`, an
+  invite's address and the object's other fields are not in it). A repeat re-runs the create's own authorization for the caller as they are now,
+  then reads the object fresh: `POST /boards` needs `board.create` at the board's Space (and a personal Space is its owner's alone), `POST /spaces`
+  `space.create` at its Group or the Unit, `POST /groups` `group.create`, `POST /teams` `team.manage`, `POST /roles` `roles.manage` and no escalation (§ Roles; a replay of a role since deleted is `404 not-found`), invites and links the board-manager check of the invites and links routes
+  (`readInvite`, `readLink`). A caller who lost that access since gets the route's ordinary `403 forbidden`, never the stored answer and no token. A link's `id` is itself its capability; it is the same id `reg_links` holds in the
+  same store, and it is returned only after the manager check.
+- **A replay of a revoked or expired invite or link** answers `404 not-found`, not a 201 with its url.
+- **Scope and retention.** A key belongs to its user (ids are globally unique, so the Unit adds nothing): another user's request under the same key is a separate key and never sees or collides with this user's answer. A key row is kept **24 h** (`IDEM.ttlMs`); a row older than that counts as absent, and the next create under the key replaces it. The store is bounded by age: expired rows are deleted in small batches (`IDEM.prune`) as keyed creates arrive.
+  The request body is stored only as a SHA-256 fingerprint.
+- **Port** (§ Registry): each keyed create takes an optional `idem: { user, key, fp }` and writes the row inside its own atomic step. When a live row exists it
+  rejects, changing nothing, with `code: "idem-replay"` (and `ref`: the stored id) for the same fingerprint or `code: "idem-mismatch"` for another. `idemGet({ user, key, fp })`
+  is the read-only form of the same check, which http.js asks first so a replay skips the create's work. Memory, SQLite (`reg_idempotency`) and Postgres
+  (`reg_idempotency`, the row inserted before the object, a unique conflict waits for the first writer) implement it, and `registry-contract.js` pins the three.
+  Adding the header to another create is: take `idem` in its Registry call, call the adapter's one in-transaction step, and wrap the route in `keyed` with a rebuild that re-authorizes and reads the object.
+
+## Teams and access (#49)
+
+Design: design/orgs/JOURNEY.md (J4, J9, J10, §4 [space-settings] [access] [unit-members, teams]). Code: `server/auth/access.js` (core: every decision below),
+routes in `server/auth/http.js` (they only translate), Registry calls `renameTeam`, `deleteTeam`, `teamsPage`, `teamsAmong`, `teamMembersPage`, `scopedGrantsPage`,
+`touchMember`, `membersAmong`, `findMembers` (§ Registry). Every route authenticates like Home (`Authorization: Bearer`) and **checks permissions, never role names**.
+Names are access, exactly as in § Spaces and Groups: an id the caller may not use (unknown, in another Unit, or hidden) gets one answer (a read `404 not-found`, a write
+`403 forbidden`, same body) and the same Registry work; a caller with no Unit (a guest) gets 403 everywhere.
+
+**The member directory.** A Unit's membership comes from `hd` at sign-in and is not stored, so a person can be added to a Team, Space, Group or the Unit only after the
+server has seen them: `GET /home` and the sign-in code exchange (best effort) record the caller in `reg_members (tenant, member, name, email)` (the exchange write is bounded: at most 16 directory writes in flight per process and one per user at a time, a slot frees only when its write settles, which the Registry's own bounds guarantee (SQLite `busy_timeout`, Postgres `lock_timeout`/`statement_timeout`); after 5 s (`config.touchTimeoutMs`, clamped like `devSignIn.waitMs`) the write is only logged as slow; the excess is dropped (the person's next Home records them); a failure, slow write or drop logs one rate-limited warning that identifies no one) (`touchMember`: one read, a write only when the row is new or the name
+or email changed). A person who has never signed in is not in the directory and cannot be added to a Team, Group, Space or the Unit (400 `unknown-person`, the same answer for an id that is a guest, in
+another Unit or never seen). A change to a grant that already exists needs no directory row. A NEW person grant on a board (this surface and `PUT /boards/:board/grants/:user`, one rule, `knownOnBoard` in server/admin/boards.js) is accepted only for a person in the board's Unit's directory (or an admin of it named by id), one who already holds a grant on that board, or a guest who redeemed a link of that board; never an `email:` entry, another Unit's member or an id nobody has seen (400 `unknown-person`). A Unit admin named by user id (`tenant.admins`, an `email:` entry excluded) counts as in the directory. Searching is `findMembers`: ASCII-folded substring of name, email or
+user id, at most 50 results, by name then id; it scans one Unit's rows, never another's. A row with no directory entry (a grant older than the directory) is shown with
+the name derived from its id (the part after `google:` / `dev:`).
+
+**Teams.** A Team is a named set of Unit members. **Who manages a Team: the `team.manage` permission at the Unit root** (a new management permission; Unit scope only:
+clipped away at Group, Space and board; the built-in Unit `admin` holds it, the Unit `member` role does not by default, and a custom role may carry it). A Team has no owner of
+its own and so no last-owner rule of its own; what protects a Group or Space is that it keeps one counted `owner` (below), and a Team that is such an owner cannot be deleted
+or emptied while it is the only one. Any Unit member may read the Team list and a Team's members (the Unit's directory, like a GitHub organisation's teams).
+
+| Route | Needs | Answers |
+|---|---|---|
+| `GET /teams?after=&q=` | a Unit | `{ teams: [{ id, name, size }], next, can: { create } }`: by id, 50 a page (`next` is the cursor); `q` = ASCII-folded name substring (1-100 chars); `size` counts to 1001 (1001 = more than 1000); `can.create` = `team.manage` at the Unit |
+| `POST /teams` `{ name }` (optional `Idempotency-Key`, § Idempotent creates) | `team.manage` | 201 `{ team: { id, name, size: 0 } }`; name trimmed, 1-200 |
+| `GET /teams/:id?after=` | a Unit; the Team in the caller's Unit | `{ team: { id, name, size }, can: { manage }, members: [{ user, name, email }], next }`: members by user id, 50 a page |
+| `PATCH /teams/:id` `{ name }` | `team.manage` | 200 `{ team }` |
+| `DELETE /teams/:id` | `team.manage` | 204. Removes the Team, its members and every grant it holds in one atomic step. **409 `last-owner`** (nothing changes) if it is the only counted owner of a Group or Space. **409 `too-large`** if it holds grants on more than 5000 scopes (remove some first) |
+| `PUT /teams/:id/members/:user` | `team.manage`; `:user` in the directory | 204, idempotent. A guest or unknown person: 400 `unknown-person`. **Personal spaces:** adding a member to a Team that holds any grant on a personal space or a board in one needs `members.manage` there from the resolver on each such scope; a Unit admin's pass does not reach them (a manage-only admin gets 403 and nothing changes, whoever they add), the owner passes. Only the Team's grants on personal scopes are read for this (Registry `personalScopesOf(team, { limit })`: one bounded join, at most 50, `more` when there are further ones; usually none), so a Team of any size is otherwise the admin's to change; a Team holding more than 50 personal-scope grants is refused to an admin for adding (fails closed). Removing a member stays open to admins (it never widens access) |
+| `DELETE /teams/:id/members/:user` | `team.manage` | 204, idempotent. **409 `last-owner`** if it would empty the only counted owner of a Group or Space |
+
+**A Team's grants are the caller's to give.** Adding a person to a Team gives them every grant the Team holds, and removing one (or deleting the Team) takes those away, so `team.manage`
+alone is not enough: unless the caller is a Unit admin, they must be able to do each of those as a direct grant, that is `members.manage` at each scope the Team holds a grant on and
+the role grantable by them there (the rule of § Access at a scope below, `owner` on a board only for a Unit admin). The check runs at write time over `scopesOf({ type: "team" })`, at most 50
+scopes (51 are read to tell); a Team holding more, or any scope the caller falls short on, is the ordinary 403 `forbidden`, the same body whatever the reason (it names no scope). A role stored on a
+Team that means nothing at its scope is ignored. Granting a Team a role (`PUT /access/.../grants/team/...`) is checked exactly as for a person.
+
+A Team's members are Unit members only; a Team membership or grant written for a guest is inert (§ Organization), which is why the write is refused rather than stored.
+
+**Access at a scope.** One surface for every scope: `unit` (id = the Unit's id), `group`, `space` and `board`.
+
+| Route | Needs | Answers |
+|---|---|---|
+| `GET /access/:type/:id?after=` | open the scope, or `members.manage` at it | `{ scope: { type, id, name? }, can: { manage }, general, admins, rows, next, inherited, roles }` |
+| `PUT /access/:type/:id/grants/:subjectType/:subject` `{ role }` | `members.manage` at the scope; the role grantable by the caller (below) | 200 `{ row }`: adds the person (`subjectType` `user`; `:subject` the URL-encoded user id) or Team (`team`) with `role`, or changes their role; idempotent |
+| `DELETE /access/:type/:id/grants/:subjectType/:subject` | `members.manage`; the existing role manageable by the caller | 204, idempotent |
+| `GET /directory?q=` | a Unit | `{ people: [{ user, name, email }], teams: [{ id, name, size }] }`: the picker's search, at most 8 of each; `q` 0-100 chars (empty = the first ones) |
+
+- `rows`: the grants set AT this scope, by subject type then id, 50 a page: `{ subject: { type: "user"|"team", id, name, email?, size? }, role, roleName, via: "direct"|"team", can: { change, remove } }`.
+  `via` is `direct` for a person, `team` for a Team. At a board the first page also carries the board's direct person grants (`grants`, up to 200). `can.*` is per row (below).
+- `general`: the general-access row of this scope and of the containers above it: `[{ scope: { type, id, name? }, role }]` (a Space's `generalRole`, its Group's, a board's `memberRole`; null roles are left out). A scope's own change is `PATCH` (§ Spaces and Groups).
+- `inherited`: grants on the containers above (a board: its Space then its Group; a Space: its Group), the first 20 of each: `{ scope: { type, id, name }, subject, role, roleName, via: "inherited" }`; only for a container the caller can open (names are access); read-only.
+- `admins` (`unit` scope only): the Unit's admins by id, up to 100, `{ user, name, email }`; admin is not a grantable role, so these rows are read-only.
+- `roles`: the picker: **the roles valid at this scope that the caller may grant**, `{ id, name, custom, summary, ladder, people }`. Built-in ladder roles `viewer` .. `owner` at Group, Space and board; at the Unit only custom roles (a Unit role is `admin` and `member`, neither grantable); custom roles filtered by `ALLOWED_AT` (a role is listed where `roleDef` gives it any meaning). `people: false` marks a role that cannot be given to a person (at a board, a custom role: a person's board grant is the ladder's own `grants` table) so the UI offers it for Teams only.
+- **Who may grant or change what.** The caller needs `members.manage` at the scope, and may only hand out or alter a role whose **management permissions are a subset of their own at that scope** (no escalation: `owner` needs `transfer`; a custom role with `delete` needs `delete`). **Nor may the role give more board role than the caller's own effective one at that scope** (`withinLadder`, § Share dialog, "Nobody gives more than they hold"): a manager with a viewer board step cannot give themselves or anyone `editor`. A holder of the content tier at that scope (`holdsTier`) is exempt; a Unit admin without it is held to their own ladder (§ Admin levels). At a **board**, today's rule stays (server/admin/boards.js): a person's grant goes through `setGrant`, so a board owner sets roles up to `editor`, may change an owner's grant only their own, and only a Unit admin sets `owner`; a Team's board grant follows the same limits. A role not valid at the scope (a Unit role, `admin`, `member`, unknown) is 400 `bad-role`. `can.change` / `can.remove` of a row is whether the same rule would allow it.
+- **Personal space.** Its access is its owner's own: `members.manage` there is not offered (`can.manage` false, writes 403), as for rename.
+- **Last owner.** A Space and a Group keep at least one counted `owner` (a person, or a Team with a member), atomically on memory, SQLite and Postgres (§ Registry). The access routes surface it as **409 `last-owner`**; the same holds for removing a Team's last member and deleting a Team. A board keeps its owner through `setGrant`'s own rule (unchanged). The Unit's admins are the backstop and are not counted.
+- **Idempotency.** `PUT` with the role already held and `DELETE` of nothing are successes that change nothing and announce nothing.
+
+**Freshness (§ Organization).** Every change here announces through the one bounded, fair scheduler of § Spaces and Groups (`announceChange`): a change to a grant on a Unit, Group,
+Space or board announces that scope's boards (a board scope: that board); a **Team member add or remove** pages `scopesOf({ type: "team", id })` (500 a page) and announces each scope;
+a **Team delete** collects those scopes first (refusing past 5000, 409 `too-large`), deletes, then announces each; a **rename** is not access and announces nothing. A change that reduces access (a
+removal, a lower role, a Team member removed, a Team deleted) is a revocation: it goes through the revocation queue and **is never dropped**. The walk over a Team's scopes waits (never drops) while the scheduler's backlog is above 2000, so a Team with many grants cannot grow it without bound. An add (`revoke: false`) beyond 20 pages of a Team's scopes is left to the timed re-check (≤ 60 s) with one log line.
+
+**Bounds.** `GET /teams`: one statement (size counted to 1001 per Team). `GET /teams/:id`: the Team row, one `effective` at the Unit, one member page, one `membersAmong`. `GET /access/..`: the scope row and its one `effective`
+(both whatever the id), then one grants page, one `membersAmong` and one `teamsAmong` over that page, the Unit's roles, and, for a Space or board, the container rows and their `effective`; for a manager, also the pending requests (one `accessRequests` page of at most 50, then `tenancy.effectiveAmong` over those requesters: ONE `accessContext` for a Space or Group, up to 50 sequential `accessOn` for a board; no Registry write). `GET /directory`:
+one `findMembers` and one `teamsPage`. Nothing loops a Unit's members, boards or Spaces.
+
+## Roles (#50)
+
+Design: design/orgs/JOURNEY.md (J9, §4 [roles]). Code: `server/auth/roles.js` (every decision below), routes in `server/auth/http.js` (they only translate), Registry calls `createRole`
+(with `max`), `updateRole`, `deleteRole`, `roleUsage`, `memberCount` (§ Registry), the one definition of what a role grants in `server/auth/permissions.js` (`roleDef`, `roleProblem`, `ALLOWED_AT`).
+Every route authenticates like Home (`Authorization: Bearer`) and **checks the permission `roles.manage` at the Unit root** (Unit scope only: clipped away below; the built-in Unit `admin` holds
+it; a custom role may carry it), never a role name. The Roles screen is `?roles=1`; Home links to it when `can.manageRoles` (= `roles.manage` at the Unit) is true.
+
+**What is a role.** One **board-content ladder step** (`viewer`, `commenter`, `annotator` or `editor`; never `owner`, so a role edit can never create a path to owner or board owner) plus a set of
+**management permissions** (`board.create`, `space.create`, `group.create`, `members.manage`, `move`, `delete`, `transfer`, `roles.manage`, `team.manage`). The model is ONE set, not a set per scope: where a
+permission means something is derived (`ALLOWED_AT`), so the screen cannot offer an impossible permission-at-scope pair. Built-in roles are read-only (ladder `viewer`..`owner`, Unit `admin`); the
+Unit **member** role is editable in its **management permissions only** (its name and its board content, none, are fixed: no edit can hand every member board content). Custom roles are per Unit,
+**at most 50** (409 `too-large`; the cap is checked atomically in the Registry write, so concurrent creates cannot pass it).
+
+| Route | Needs | Answers |
+|---|---|---|
+| `GET /roles` | `roles.manage` at the Unit (else the one 404 `not-found`; a guest or a caller with no Unit too) | `{ roles: RoleView[], matrix, can: { admin }, limits }` |
+| `POST /roles` `{ name, boardRole, permissions, base? }` | `roles.manage`; no escalation (below); accepts `Idempotency-Key` (§ Idempotent creates) | 201 `{ role }`; `base` = the id of the role this one was duplicated from (a built-in, `member` or a custom id; display only, `like Editor`) |
+| `PATCH /roles/:id` `{ name?, boardRole?, permissions?, confirm? }` | `roles.manage`; no escalation; a custom role, or `member` (which also needs the Unit-wide admin capability, below) | 200 `{ role }`. 409 `confirm-required` (below) |
+| `DELETE /roles/:id` | `roles.manage`; no escalation; a custom role | 204. **409 `in-use`** `{ places }` while any grant holds it |
+
+- `RoleView`: `{ id, name, kind: "builtin"|"member"|"custom", editable, summary, base?, ladder, permissions, scopes: { unit|group|space|board: string[] }, used: { places, capped } | null }`. `editable` is per caller: true only when a PATCH of that role by THIS caller can pass the checks below (the `member` role: a Unit admin; a custom role: its Unit permissions within the caller's own, or the caller is a Unit admin); always false for a built-in. The screen offers no edit where it is false and says why (member: "Only a Unit admin can change what every member gets"; custom: it gives more than the caller holds). `permissions` are the
+  management permissions it was given; `scopes[type]` is what `roleDef(role, type)` gives there (content permissions included), so the screen's matrix is the server's. `used` is `null` for a built-in (not counted); `member` carries `{ members, capped }` (the directory's size shown as at most 50; `capped: true` = more than 50) instead of `places`.
+  `summary` is one line (a custom role's reads "Editor board access, plus 2 management permissions"). `places` = the grants (a person's or a Team's, on any scope) that hold the role, **counted to 100** (`capped: true` = 100 or more; the cost is one statement of at most 101 index rows per role).
+- `matrix`: `{ scopes: ["unit","group","space","board"], permissions: [{ id, group: "content"|"management", scopes }], content, ladders, tickable }` where `scopes` is where the permission means anything (from
+  `ALLOWED_AT`; content at all four), `content` maps each board step to the content permissions it includes (the screen shows them as read-only cells next to the step), `tickable` the management permissions the caller may tick, `ladders` the ladder steps the CALLER may give (`viewer`..up to what they hold themselves; all four for a Unit admin). `can.admin` is the caller's Unit-admin flag.
+  The permissions the caller may tick are those they hold themselves (the same rule the server enforces), listed as `matrix.tickable` (a Unit admin: every management permission).
+- **The Unit member role is Unit-wide.** Editing it changes what every member may do, so it needs the Unit-wide admin capability (today: the caller is a Unit admin, the check that guards other Unit-wide admin changes; `unitWide` in `roles.js` is the one place tiered admin levels, #88, map to), on top of `roles.manage` and no escalation. A `roles.manage` holder who is not a Unit admin gets the ordinary 403 `forbidden` on `PATCH /roles/member`, whatever the body, with the same Registry reads as any refused write.
+- **No escalation.** Unless the caller is a Unit admin, a write needs the role's definition **at the Unit** (`roleDef(role, "unit")`: ladder content permissions plus management permissions, ladder step
+  included) to be a **subset of the caller's own permissions at the Unit** (what the resolver gives them there, member role's included), both for the role as it is now (so a role cannot be edited, or
+  deleted, by someone who could not hold it) and as it would become. A permission the caller lacks cannot be put in a role, and a role above the caller cannot be touched. Every custom role carries a board step, whose content permissions are part of the measure, so a non-admin who holds no board content of their own (only the Unit `member` role's management permissions, say) can edit no role: delegating role editing means giving the delegate a role with a board step. A Unit admin is not held to it (they manage without content). The `team.manage`
+  back door (§ Teams and access) still holds with no change: a Team's grants are re-read live, so a role edit that adds a permission to a role a Team holds is checked at the next Team change against
+  the caller's own rights there.
+- **Validation** (`roleProblem`, then names): name trimmed 1-200, no NUL; `boardRole` one of the four steps for a custom role; `permissions` distinct management permissions; `member` takes
+  `permissions` only (a `name` or `boardRole` in the patch is 400). Body fields outside the list are refused.
+- **The many-people warning.** An edit that changes `permissions` or `boardRole` of a role is **many** when it is used in **more than 10 places** or by **more than 50 people** (the DISTINCT people with a direct grant (one person in twelve places is one) plus the
+  sizes of the Teams that hold it, read for up to 50 Teams, each size counted to 1001, an over-estimate; the Unit `member` role: the directory's member count, shown as at most 50 with `capped: true` when there are more, and 50+ is many). A many edit
+  without `confirm: true` changes **nothing** and answers `409 { error: "confirm-required", impact: { places, people, capped } }` (counts only, capped at 100 / 1001 / 50; no name). The screen shows the
+  count and asks; **Save anyway** sends the same patch with `confirm: true`. A rename never needs it.
+- **Delete is refused while the role is in use** (decision: refuse, never reassign: reassigning would silently change what people can do). The check and the delete are ONE atomic Registry step
+  (`deleteRole`: only grants of the same Unit count, so another Unit can never block a delete). The write side closes the other half on every adapter: `setScopedGrant` of a role shaped like a custom role id (`r-…`) checks, inside the write that stores it, that the role exists in the scope's Unit, else rejects code `no-role` (a role id of another Unit, or one deleted a moment ago); the access routes answer that 400 `bad-role`. On Postgres that check takes `FOR KEY SHARE` on the role row, which conflicts with `deleteRole`'s `FOR UPDATE`, so a grant and a delete of the same role are serialised: the delete either waits and then sees the grant (409 `in-use`) or has committed first (the grant is refused). So a grant never lands on a deleted role (a role grant that predates this rule is inert: the resolver ignores an unknown role, and any manager may clear it).
+  The `member` role is never deleted (400); a built-in id is "not a role" and answers like an unknown one (403).
+- **Leaks.** An id that is unknown, belongs to another Unit, or is not a role (`admin`, a ladder name) gets the SAME answer and the same Registry work as a hidden one: a write is 403 `forbidden`,
+  identical to a caller without `roles.manage`; `GET /roles` is 404 `not-found`. No error names a scope or a person; the usage count is a number only. A role deleted between the check and the write is the
+  same 403, never a 503.
+- **Freshness.** Role definitions are read live by every access answer. An edit that changes `permissions` or `boardRole` announces `{ type: "unit" }` through the one bounded, fair scheduler
+  (`announceChange`, § Spaces and Groups): as a **revocation** (priority queue, never dropped) unless it is a pure widening (the new role holds everything the old did and no lower ladder step);
+  a rename announces nothing; an edit of a role no grant holds (`used.places` 0, read in the same request) announces nothing (nothing to re-check; the timed pass covers a grant that races in).
+  So a removed permission or a lowered ladder step reaches an open board's sockets within one pass (the next `.grants` handling, else the timed re-check ≤ 60 s), and the next HTTP call.
+  Create and delete of an unused role announce nothing.
+- **Bounds.** `GET /roles`: one `effective` at the Unit, one `roles(tenant)` (≤ 51 rows), one `roleUsage` over those ids (ONE statement per id, so ≤ 51 statements, each reading ≤ 101 index rows for the places count, ≤ 101 for the distinct users and ≤ 50 for the Team ids), one `memberCount` (≤ 51 rows read).
+  `PATCH`: the same reads plus, only for a many-check on a Team-held role, one `teamsAmong` over ≤ 50 ids. Nothing loops grants, members or boards.
+
+## Access explanation and requests (#51)
+
+Design: design/orgs/JOURNEY.md (J10, §4 [space-viewer] [access], §5). Code: `server/auth/explain.js` (the one explanation, pure helpers plus `explainService`), used by `server/auth/access.js`
+(the Access page and the requests) and `server/auth/spaces.js` (the Space page); routes in `server/auth/http.js` (they only translate); Registry calls `requestAccess`, `accessRequest`,
+`accessRequests`, `closeAccessRequest`, `grantHolders` (§ Registry). Every route authenticates like Home (`Authorization: Bearer`).
+
+**One source of truth.** The explanation is built from the `Access` that `tenancy.effective` returned for this very request, the object the same handler used for `can.*`: its `sources`
+(resolver.js) are the reasons, its `permissions` the answer. No second resolver, no client-side rule. "What would be needed" (`needs`) is derived with `roleDef` from the same permission tables
+(`permissions.js`), never a hard-coded role name. A test pins that `mine.role` equals the room's hello role (`tenancy.role`) for every source kind.
+
+**`mine`** (the caller's own access to the scope): `{ role: { id, name } | null, sources: [{ kind, scope: { type, id, name? }, role, roleName, ladder, team?: { id, name }, strongest }] }`.
+- `role` is the highest ladder role over all sources (the union's board-content step; `null` = no board content), `sources` are the resolver's, in its order: `kind` is `direct`, `team`, `general`, `invite`, `link` or `unit`
+  (Unit admin, a role on the Unit, the Unit `member` role).
+- **Strongest.** `strongest: true` marks every source whose `ladder` equals `role.id` (ties are all marked; nothing is marked when `role` is null). The caller gets everything every source grants; the mark only says which source reaches the top.
+- Names: a source's `scope.name` and `team.name` are filled for a container or Team the caller holds a source through (they hold a role there, so it is theirs to know); the Unit has no name.
+
+**`needs`**: for the scope's key permission, the lowest built-in ladder role that holds it there: `{ "board.create": { role, roleName, held } | null }` on a Space, `space.create` on a Group,
+`board.edit` on a board (none on the Unit). `null` = no built-in role has it (a custom role may). It is computed **against the caller's own `Access`**: `held` is true when the caller's ladder role is already at or above `role` yet `access.permissions` lacks the key
+permission (their role, such as the Unit `member` role set to board role editor, or a custom role with no management permissions, gives board content but not this). The sentence then says so ("your Editor access comes from a role that does not include it") instead of asking for a role the caller seems to have.
+
+**`owners`**: who to ask: up to 10 people or Teams (`{ type, id, name }`, names only) that hold `members.manage` here, found through the container chain (the scope, then its Space, then its Group) by role
+(`owner`, and custom roles that carry `members.manage` at that scope: `grantHolders`). Empty when only the Unit's admins can grant (they hold it everywhere: the page then says so).
+
+**`ask`**: `{ can, roles: [{ id, name }], pending: { role, roleName, at } | null, retryAfterMs: number | null }`.
+- `can` only for a Unit member who can open a Space, Group or board that is not a personal space and who does not already manage it. `roles` = the built-in roles above the caller's own up to `editor` (never `owner`), **plus** the `needs` role when the caller lacks the key permission even though their ladder role is at or above it (one function, `askRolesFor(access, type, roles)`, used by the explanation and by the route's check, so they cannot differ). `guest: true` (no Unit of the scope's) is also sent, so copy can tell a guest from a member with nobody to ask.
+- `pending` = their open request here. `retryAfterMs` = how long until they may ask again (counted from the dismissal), else null. A granted request is not shown.
+
+**Where it appears.** `GET /spaces/:id` carries it as `why` **only when `can.createBoard` is false** (the same predicate, same `Access`): `{ mine, needs, owners, ask }`. `GET /access/:type/:id` always carries `mine`, `needs`, `owners`, `ask` and, for `members.manage` holders, `requests`.
+`GET /boards/:board/explain` (the canvas's read-only pill) answers `{ mine, needs, owners, ask }` for anyone who can open the board, **a guest included** (a guest's sources are board-scope only, so nothing else is named, `owners` is `[]`, `ask.can` false). It calls `tenancy.effective(identity, board, { uniform: true })`, which is the same `accessOn` + `resolveAccess` a hello reaches through `tenancy.resolve` (the hello does not pass `uniform`; that flag only makes an unknown board cost the same reads as a hidden one), so the role it reports is the hello's role.
+
+**Who sees "Who has access" (decision).** Anyone who can open the scope **and** is inside its Unit (a member, or a Unit admin named by id) sees everyone who can open it and why (`rows`, `inherited`, `general`, `organization`): that is JOURNEY's "visible to all members", and "member" here never means a guest. A guest (no Unit, or another Unit's member opening a linked board) gets the ordinary 404 from `/access/..` and sees **only their own sources** (`/boards/:board/explain`); a person who cannot open the scope gets the same 404 as for an id that does not exist (same body, same Registry work), so no member list, no other Space and no Team leaks. A requester's identity (`requests`) is visible only to a current `members.manage` holder (a Unit admin included); `owners` names only who may grant.
+
+`GET /access/:type/:id` additionally answers where access comes from above the scope, so a person with access only through the Unit is accounted for:
+- `organization: { admins: [{ user, name }], more, memberRole: role | null }` (not on the Unit page, which has `admins`): the Unit's admins (they manage every board; no board content unless granted), up to 20 (`more` = there are more), and the Unit `member` role's board role when it carries board content.
+- `inherited` also holds the Unit's scoped grants whose role gives board content at this scope (`scope: { type: "unit", id }`, no name), the first 50 read (`organization.more` is true when the Unit holds more).
+
+**Ask for access.** There is no email or push infrastructure, so asking **stores a request the owners see** (Registry, below): it appears as a list on the scope's Access page, for every `members.manage` holder at the scope (owners, custom roles that carry it, and the Unit's admins), who answer by granting the role from the same page (which closes the request) or dismissing it. A request whose person **already reaches the role asked for** by another route (a Team they are in, a grant at a containing Group) is hidden from the list and closed as granted on read: `requestsOf` resolves up to 50 requesters in one batch (`tenancy.effectiveAmong`: one `accessContext` for a Space or Group, one per person on a board; every directory row is a Unit member) and keeps a request only while the person's `Access.permissions` lack some permission of the asked role.
+
+| Route | Needs | Answers |
+|---|---|---|
+| `POST /access/:type/:id/requests` `{ role }` (`Idempotency-Key`, § Idempotent creates) | `ask.can` here; `role` in `ask.roles`. `:type` is `space`, `group` or `board`. No free text. | 201 `{ request: { role, roleName, at, state: "pending" } }` (the caller's own request; the same one again while it is pending: a second ask changes nothing and sends nothing new) |
+| `DELETE /access/:type/:id/requests/:user` | `members.manage` at the scope (the rule of the grant routes) | 204, idempotent: the request stays as `dismissed` (it holds the cooldown); asking again is refused until the cooldown has passed |
+
+Any other caller (a guest, no Unit, an id that is unknown, in another Unit or hidden, a personal space, someone who already manages the scope) gets the one ordinary answer: `403 forbidden`, with the same Registry work as a success up to the point of refusal. A role not in `ask.roles` is 400 `bad-role`.
+
+- **Rate limit** (decision), enforced inside the Registry's atomic step so every gateway agrees and a retry cannot slip past: one request per (scope, person); a dismissed request blocks a new one for `ASK.cooldownMs` (24 h) **from the dismissal** (`closedAt`, stored with the row); at most `ASK.perUser` (20) requests a person may make in `ASK.windowMs` (24 h) across all scopes (every row counts for its `at`, including granted and dismissed ones, so a grant does not return quota); at most `ASK.scopePending` (200) pending per scope. On Postgres the step takes a per-scope advisory lock first and a per-person one second (always in that order), so concurrent asks by different people cannot pass the scope limit. `requestAccess` takes an optional `limits: { perUser?, scopePending? }` that can only LOWER the limits (tests). Refusal: **`429 rate-limited`** `{ error, retryAfter }` (seconds, rounded up; null when no wait helps) with a `Retry-After` header when known.
+- **Idempotency.** The create's key row is written in the same transaction as the request (`idem`, the mechanism of § Idempotent creates). A replay whose key's request is no longer the open one (superseded, or re-asked) answers `409 superseded`, never the newer request; a replay with no row left is the ordinary `403`. The key is checked **first**, so a retried success replays (`201`, `Idempotent-Replayed: true`) even when the limit has since been reached; a key reused for another body is 422. A repeat re-authorizes the caller as they are now.
+- **Freshness.** Nothing is announced (a request is not access). A request is closed (state `granted`, kept so the per-person count stays true; asking again is allowed) when the grant for that person lands at the same scope (`PUT /access/.../grants/user/:user`, `PUT /boards/:board/grants/:user`). **A read never writes:** the Access page hides a pending request whose person already reaches the role (a Team, a grant at a containing Group), and the row stays `pending` until the grant route closes it, a new ask supersedes it, or the ttl prunes it; hidden rows still count toward `scopePending` until then. A new ask for a different role than a pending one replaces it (`supersede: true` from the service; every write of a request, a supersede or a re-ask after a dismissal, mints a NEW id) only when the asker's access already reaches the pending role; otherwise the pending request is returned as it is. Requests older than `ASK.ttlMs` (30 days, counted from the dismissal for a dismissed one) are ignored and pruned.
+- **Bounds.** The Space page adds, only for a caller who cannot create boards, one `membersAmong`, one `teamsAmong`, one `grantHolders` per container, one `accessRequest`. The Access page adds the same plus one `accessRequests` page (50) for managers and, for those requests, `tenancy.effectiveAmong` (at most 50 requesters: for a Space or Group ONE `accessContext` plus one `resolveAccess` per requester in memory; for a board up to 50 sequential `accessOn` calls). It performs no Registry write. Nothing loops members.
+
+## Share dialog (#52)
+
+Design: design/orgs/JOURNEY.md (J6, §4 [share]). Code: `server/admin/boards.js` (`shareView`, `createInvite`, `createLink`, `revokeInvite`, `revokeLink`; the routes only translate, `server/auth/http.js`),
+web: `web/core/share.js` (the model), `web/adapters/share/http.js` (the port's adapter), `web/adapters/dom/share.js` (the dialog). Invites, links and the re-check are the existing ones (§ Tenancy, § Auth); this section is the one dialog over them.
+
+**Who may open it, and what they see: one rule.** The routes of this section (`GET /boards/:board/share`, the invite and link routes under `/boards/:board/`) need the **`members.manage` permission on the board**, read from the same
+`tenancy.effective(identity, board, { uniform: true })` every other route reads (a board owner, a Unit admin, a custom role that carries it, at the board or above it). It is never a role name. Anyone else, an unknown board and another Unit's board
+get the one `403 forbidden`, after the same Registry reads. An invite is an address and a link is a capability, so **only a manager is ever handed either**: a member who merely opens the board, an editor, a guest or a viewer gets nothing, not a count and not a name.
+The canvas shows the Share button **only when the welcome says `can.share`**: `members.manage` on the board, computed from the very `Access` the hello already resolves for the role (`tenancy.resolve` returns `{ role, share, until }`; the role cache stores `share` beside the role; `auth.access(identity, board) → { role, share }`; one read, no second Registry read, nothing fetched until the button is pressed). So a custom-role manager at an annotator or viewer step sees it, an editor without the permission does not. **The flag is as fresh as the role is at the hello**: a viewer's welcome is built by the gateway, a writer's by the room and passed through, the gateway adding `can` to it (re-encoded only for the few holders). The timed re-check closes a connection whose *role* changed (it reconnects and is welcomed afresh) but does **not** close one whose `members.manage` alone changed, so the button can be stale until the next connect; that is safe, because every Share route re-checks the permission and a person who lost it gets the 403 (the dialog says so, naming nobody), and one who gained it sees the button on their next connection.
+
+**`can.move`** rides the same welcome the same way (`tenancy.resolve` returns `{ role, share, move, until }`, the role cache stores `move`, `auth.access(identity, board) → { role, share, move }`, the gateway adds `can: { share?, move? }`): `move` is `mayMove(access)` (`server/auth/resolver.js`: `permissions.has("move") && Access.member`, `member` = the caller's Workspace domain is one of the board's Unit's) of the very `Access` the hello resolved, so a guest holding an owner grant or another Unit's member never has it; the move route's permission check is the same `mayMove` (plus the board-in-caller's-Unit match), so offer and enforcement cannot differ, so `can.move` is true exactly when `GET /boards/:board/move` would not answer 403 for a reason of permission. Same freshness as `can.share`: as of the hello; a change of `move` alone does not close the connection, and every Move route re-checks.
+
+`GET /boards/:board/share` answers `{ board: { id, title }, unit: { domains } | null, limits: { inviteRoles, linkRoles, inviteTtlMs }, invites, links, more }`:
+- `invites`: the **live** ones (not revoked, not expired), newest first, at most 200: `{ id, email, role, expiresAt, createdAt, guest }`. `guest` is true when the address is outside the Unit (none of `unit.domains`): such a person holds this board only.
+- `links`: the live ones, newest first, at most 200: `{ id, role, expiresAt, createdAt, url? }`. `url` is `<publicUrl>/links/<id>` for API clients (`publicUrl` is PUBLIC_URL, else the sign-in redirect's origin, default `http://localhost:8080`, which may not be a name this browser reached); **the dialog always builds the address from the page's own origin** (`<origin>/links/<id>`). The link `id` **is** the capability (26 random chars, ~134 bits): it appears only here, in the create answer and in `GET .../links`, never in a log line, a bus message or an error body.
+- `more`: either list held more than 200.
+- `unit`: the Unit's domains, so the form can tag a guest before sending, **only for a caller inside the Unit**; a guest manager (a board owner outside the Unit) gets `null` and is told per invite (`guest`, set server-side, also in the create answer) so the Unit's domain list is never sent outside it.
+- `limits`: invites may take `viewer`, `commenter`, `annotator`, `editor`; links `viewer`, `annotator`, `editor`; **each list is cut to the roles the caller may give** (below). **Never `owner`, for anyone**: the Registry-facing check is in `createInvite` / `createLink` (`400 bad-request`), and the resolver caps whatever a stored row says (`capTo`), so a guest holds at most `editor` however the row got there.
+
+**Nobody gives more than they hold** (decision, one helper `withinLadder` in server/auth/permissions.js for all three paths). Anyone who gives access, by `PUT /access/.../grants/...` (and the legacy board grant route's owner/admin rule), an invite or a share link, can give **at most their own effective board role at that scope** (`access.ladder` from `tenancy.effective`, the same answer as `members.manage`): a custom role with a viewer board step and `members.manage` can invite or link at `viewer` and cannot give anyone, itself included, `editor` (403 `forbidden`). The exemption is **holding the content tier at that board** (`holdsTier`, § Admin levels), never `isUnitAdmin` and never a role name; the ladder compared is `ownLadder` (without the tier). Consequently `limits` and the Access page's picker (`roles`) list only what the caller may give, so neither dialog offers a refused choice. The same rule bounds clearing or changing an existing grant of a higher role (`touchable`).
+
+**Expiry values.** `expiresAt` of an invite or link must be a **safe integer** (milliseconds) in the future and **at most 10 years ahead** (`MAX_EXPIRY_MS`); anything else (a fraction, 1e300, a string) is `400 bad-request` (message: "expiresAt must be a whole number of ms in the future, at most 10 years ahead") before any adapter is touched, so every Registry stores the same value.
+
+**Invite by email.** `POST /boards/:board/invites { email, role, expiresAt? }` (`Idempotency-Key`, § Idempotent creates): `expiresAt` omitted means **now + 30 days** (`INVITE_TTL_MS`); `null` means never (sent on purpose); a number must be in the future. The invite matches the person's **authoritative email** at their next sign-in or hello (§ Tenancy).
+**There is no email infrastructure, so the server sends nothing.** The inviter is shown the board's address (`?board=<id>` on the page's own origin; it is not a secret: opening it signs in and the invite grants the role to that address only) with a Copy button, and sends it themselves. An address Google is not authoritative for claims nothing (§ Tenancy): the dialog says that a guest must sign in with that very Google account.
+Inviting someone who already has more access by another route changes nothing for them (highest wins); the invite still lists as pending until it expires or is revoked. A second invite to the same address is a second row (the highest wins; revoking one leaves the other).
+
+**One body per key.** The dialog computes an invite's or link's `expiresAt` **once per Idempotency-Key** and resends the very same body on a retry (the server fingerprints the whole body, so a recomputed expiry would be `422 idempotency-key-reused`); a changed form starts a new key and body, a success clears both.
+
+**Link access.** `POST /boards/:board/links { role, expiresAt? }` is unchanged: `expiresAt` omitted is no expiry; the dialog always sends one (default 7 days; 1 day, 7 days, 30 days, never).
+Anyone using the link signs in with Google first (there are no anonymous guests), then redeems it (`GET /links/:id`): their access is that link's role on this board only.
+
+**Access from places the caller can't open.** `GET /access/:type/:id` (the Share dialog's source) adds `hiddenAbove: true`, **only when true**, when the Space or Group above the scope holds access (a scoped grant, or general access) but the caller cannot open that container, so its rows were left out of `inherited` and `general`. It is a **boolean from the same code that decides which containers show** (`access.js`, the `above` / `closed` split): no name, no count, no row. It costs one `scopedGrantsPage` of 1 per closed container (at most two). Both the Access page and the Share dialog show the one line "Some access comes from places you can't open." A person who cannot open the scope at all gets the ordinary 404 and no flag.
+
+**Inherited rows** (who else has access, and from where) are `GET /access/board/:id`'s `rows`, `inherited`, `general` and `organization` (§ Teams and access, § Access explanation and requests): **one source of truth**, the same builder the Access page uses, shown read-only in the dialog with a link to the Access page to change them. A guest manager (a board owner outside the Unit) has no Access page (it answers 404), so the dialog shows invites and links only and says why.
+
+**Revoke.** `DELETE /boards/:board/invites/:id`, `DELETE /boards/:board/links/:id`: 204, **idempotent** (a revoked, expired or repeated one answers 204; an unknown id, or another board's, is the one 403). The change is announced on the board's `.grants` subject by the announcing Registry (server/main.js), so a connected invite or link holder
+is re-checked at once and **cut off within one pass; if the message is lost, within the gateway's timed re-check (≤ 60 s, § Auth) plus its retry (≤ 14 s while the Registry answers)**. A new hello is refused as soon as the Registry row says revoked (a cached role lives ≤ 30 s). Revoking a link does not close sockets of people who also hold the board by another source: their role is computed again and stays.
+**A leaver's invites and links stay until they expire** (decision, § Organization); revoking is the owner's act.
+
+**Accessibility (the dialog).** A modal `role="dialog"` with `aria-modal`, labelled by its heading; focus moves in, Tab and Shift+Tab stay inside, Escape and the Done button close it, focus returns to the Share button. Every control has a label; the guest tag, errors and every outcome ("Invite created", "Link revoked") is visible text in one status line (`tabindex=-1`, focus moves to it after a change) and is said once, through the page's polite live region (the line itself is not a second live region, so nothing is read twice). Everything is operable from the keyboard.
+
+## Move board (#53)
+
+Design: design/orgs/JOURNEY.md (J3, §4 [move]). Code: `server/auth/move.js` (`moveService`: the options, the dry run and the move; the routes only translate, `server/auth/http.js`), Registry call `moveBoard`
+(§ Registry), tenancy `accessShaped` (the resolver run twice over one read), web: `web/core/move.js` (model), `web/adapters/move/http.js` (the port's adapter), `web/adapters/dom/move.js` (dialog and toast).
+Every route authenticates like Home (`Authorization: Bearer`) and **checks permissions, never role names**.
+
+**What a move is.** A board's Space (`board.space`) changes; nothing else about the board does. Its id and URL, its direct grants, Team grants on the board, `memberRole`, invites, share links and link uses **travel with it**.
+What changes is the access that comes from the places above it: the old Space's and Group's grants and general access stop reaching it, the new Space's and Group's start (§ Tenancy, "Resolution"). A board is never more private than its Space (§ Organization).
+Every board is in a Space, so a move is always Space to Space and `from` is always a Space id; nothing moves a board **out** to no Space.
+
+**Permissions (RBAC, never role names).** One move needs all of:
+1. **`move`** on the board, read from `tenancy.effective(caller, board, { uniform: true })`: held at the board, or at its Space, Group or the Unit (a board owner, a Space or Group owner, a Unit admin, a custom role that carries it). The check is `mayMove(access)` (`server/auth/resolver.js`), the one rule the welcome's `can.move` and every card's `can.move` use too: the permission and membership of the board's Unit. On a board in someone's personal space the resolver gives **no permission at all** to a Unit-scope source (§ Organization, "Personal spaces" below), so a manage-only Unit admin holds no `move` there, even with a viewer grant the owner gave them: the one `403`, no Move offered, so nobody can pull a member's personal board into a Space they own.
+2. **`board.create` at the destination Space, and the caller can open it** (exactly the New board rule, `boardCreateAccess`: someone else's personal space is never a destination, a Unit admin included).
+3. **The destination is in the board's Unit.** (`GET .../move` and `preview` never offer the board's current Space, and `preview` of it is `400`; the `POST` meets it as the compare-and-set's no-op below.)
+4. **No board-ladder escalation, per person** (#88; § Share dialog, "Nobody gives more than they hold"; `raisesAbove` in `server/auth/move.js`). For every person, Team and "everyone in the Unit" that the destination Space, its Group or the Unit names in a grant (general access included), and for the caller, the role the board would have there (`movedContext`, the preview's `gains`) may not be **higher than the caller's own board role without the content tier** (`ownLadder`) **when it is higher than that person's role on the board now**. So a move that raises nobody's role is always fine (between Spaces with the same people, moving out into a Space owned by the board's own owner), and one that raises someone above the mover's own role is refused: into the mover's own Space or personal space, into a Space with general access, into a Space whose Team or owner would gain. The content tier is nobody's grant: a tier holder's own opening of a board is excluded on both sides, and its owner step never lets its holder hand out a role, so `content.personal` moves a private board out only into a place where nobody gains, and a Unit admin has no exemption. This reads every grant of the destination, including the ones the caller cannot see, so the refusal is one boolean and never names anything. **Rule 2 holds on every move route**: `POST /boards/:b/move`, `GET .../move/preview` and `GET /boards/:b/move` all require a destination the caller opens (`createTarget` plus `opens`), and a refusal is the bare `403 forbidden` with no body but the error. Names are access: the board's `title` is returned (options, preview, move, replay) only to a caller who opens the board, otherwise `{ id }` alone; Space names only for Spaces the caller opens. A manage-only Unit admin opens no shared Space, so in practice moves nothing. A destination naming more than `LIMITS.people` people or `LIMITS.teams` Teams cannot be checked and is refused. The destination list (`GET /boards/:b/move`) applies the same rule from batch reads, and Undo is offered only if the same check passes after the write.
+A caller who fails 1 gets the one `403 forbidden` after the same reads as a success up to that point (no diff, no name list, no destination read: **a non-mover costs the board read and the access read, nothing more**); an unknown board, another Unit's board and a guest are the same answer.
+Destination refusals (2, 3, 4) are the same `403 forbidden`, a destination in another Unit or an unknown one included.
+
+| Route | Needs | Answers |
+|---|---|---|
+| `GET /boards/:board/move` | `move` on the board | 200 `{ board: { id, title }, from: { id, name, personal } \| { hidden: true }, destinations: [{ id, name, personal, general, group }], more }`. `destinations` are exactly the Spaces the caller **may move this board into** (rules 2 to 4, evaluated for each; at most 100; `more`), never the current one, the caller's personal space first. `from` names the current Space only when the caller can open it (`hidden: true` otherwise) |
+| `GET /boards/:board/move/preview?to=<space>` | rules 1 to 4 | 200 the **access diff**, below. Read-only |
+| `POST /boards/:board/move` `{ from, to }` (`Idempotency-Key`) | rules 1 to 4 | 200 `{ board: { id, title, space: { id, name } }, moved, undo: { space: { id, name, personal } } \| null }` |
+
+**The diff (`preview`).** `{ board: { id, title }, from, to: { id, name, personal }, gains: [Entry], keeps: [Entry], loses: [Entry], invites: n \| null, links: n \| null, hidden: boolean, more: boolean }`, where an `Entry` is
+`{ subject: { type: "user" \| "team" \| "everyone", id?, name }, self?: true, before: Role \| null, after: Role \| null }` and a `Role` is `{ id, name }` (the **board-content role** the subject holds, the ladder step the room sees; a management permission is not shown).
+- **Computed by the enforcing code.** The server reads the board's access context and the destination's once, builds the context the board *would* have (the destination's Space, Group and their grants; the board's own rows, the Unit's and every role unchanged) and runs the **same `resolveAccess`** over both: for each named person with the
+  real rows (their direct grant, invites to their email, link uses, Teams) via `tenancy.accessShaped` (the gateway's `resolveMany` path), for each named Team with that Team as the only membership, for *everyone in the organization* with a member who holds nothing else. There is no second rule: a test pins that the `after` of every entry equals what
+  `tenancy.effective` answers once the board has moved.
+- **Gains** (`after` above `before`, a first access included), **keeps** (the same role) and **loses** (`after` below `before`, all access included), each sorted by name then id, at most 50 each. `more` is true when anything was cut or the subjects exceeded their bound (100 people).
+- **Who is named (the no-leak rule, #51's).** A person or Team is named only when the caller **holds a source for it that they may see**: the board's own rows (its direct grants and Team grants) when the caller can open the board, and the grants of the old Space, the old Group, the new Space or the new Group **only for a container the caller can open** (`ladder` not null there).
+  A role is the highest over the sources the caller may see, never over a hidden one. When a container the caller cannot open holds any access (a scoped grant or general access), `hidden: true` says so (a boolean, **no count, no name**, the same sentence as § Share dialog's `hiddenAbove`: "Some access comes from places you can't open."); nobody who is reachable only through it is listed.
+  The mover appears as themself (`self: true`) like anyone else. **A Unit admin is named only like anyone else**: when they hold a grant on the board or on a container the caller can open. Being an admin is never a row of its own (the `admin` source gives management permissions, and board content only where the Unit is configured to give it, in which case it is the same before and after and shows as a keep for that named person).
+- **`invites`, `links`**: the live ones that travel, counted, **only for a caller who holds `members.manage` on the board** (the Share dialog's rule: an invite is an address, a link is a capability); otherwise `null`. Always **keeps**, never named.
+
+**The move (`POST`).** `from` is the Space the caller **believes the board is in** (its id, required: a missing or non-id `from` is 400 `bad-request`) and `to` the destination: a **compare-and-set**. The Registry step `moveBoard({ board, from, to })` (§ Registry) changes the Space only if the board is still in `from`:
+- in `from` → it moves (`moved: true`);
+- already in `to` → nothing changes and the answer is the same success (`moved: false`), so a double submit, a retry and an Undo that already happened are harmless;
+- anywhere else → `409 { error: "moved" }`, nothing changed: someone moved it meanwhile. Two concurrent moves cannot interleave: exactly one of two different destinations wins, the other is the 409.
+`403 forbidden`, `400 bad-request` (a body that is not `{ from, to }` of ids or null/id, a `to` equal to `from`), `422 idempotency-key-reused` and the 503 of the request deadline are as everywhere. The authorization (rules 1 to 4) is read **before** the Registry step. A `from` that is not where the board is (and the board is not in `to` either) is `409 moved` before the step too. `preview` answers a destination the caller cannot open `403` **before** it says `400` for the board's own Space, so the answer never tells whether a hidden Space holds the board.
+**Idempotency.** `Idempotency-Key` is the same mechanism as creates (§ Idempotent creates): the key row is written in the move's own atomic Registry step, so a retry after a 503 or a dropped answer replays the first result (200, `Idempotent-Replayed: true`) exactly once. What is stored is `<board id>:moved` or `<board id>:noop` (the first answer's `moved`), so a replay reports the real flag. A replay is by the same user (the key row is per user) and re-checks only what no leak needs: the caller can still **open the destination Space** (else `403`). It does not re-check `move` on the source (the board is no longer there:
+a Space-A owner who moved a board into a Space where they are only an editor replays the same 200). A board no longer in `to` answers `409 moved`. The answer is rebuilt fresh (title, names, `undo`). The route is in the deadline guard's table (`test/auth/http-deadline.test.js`), and **a 503 on it means "may or may not have applied"**: retry with the same key (or without one: the move is itself idempotent by the compare-and-set).
+
+**Freshness.** A move changes who reaches the board, so it announces `{ board }` on the board's `grants` subject (the announcing Registry, `server/main.js`, as every grants change): each gateway invalidates the board's cached roles and chain and re-checks its connections now. A person who **lost** access is cut within that pass (the socket closes `1008`; a person whose role only dropped gets `1012` and reconnects at the lower step); if the message is lost, within
+the gateway's timed re-check (≤ 60 s, § Auth) plus its retry (≤ 14 s). A person who gained access is welcomed by their next hello (a cached role lives ≤ 30 s) or the next timed pass. The board record cache (`roleCache`) drops the board's record too, so no node serves the old Space past the announcement.
+
+**Undo.** The server keeps no undo state; **Undo is an ordinary move back** the page makes with the `undo` the move answered, `POST /boards/:board/move { from: <the Space it moved to>, to: <the Space it came from> }` under **its own** Idempotency-Key. `undo` is decided **after the write, from the board's new place**: fresh reads of `move` on the board where it is now and of rules 2 to 4 for the original Space. It is `null` (no Undo is offered) when the move did nothing (`moved: false`), or when either check fails now (for example a Space-A owner who moved Zed's board into a Space where they are only an editor holds no `move` there: no Undo). So an offered Undo is one that would succeed at that moment. The page shows the toast for **10 seconds**, a UI affordance only (the endpoint works at any time). What can change in between, and what Undo then does (all of it the move rules above, nothing special-cased):
+- nothing changed → the board returns (`200`, `moved: true`);
+- the board is already back (someone, or a double click) → `200`, `moved: false`;
+- someone moved it elsewhere → `409 moved`: the page says "Can't undo: the board has been moved again";
+- the caller lost `move` on the board in its new place, or `board.create` or the right to open the original Space, or the original Space now gives people more than they hold → `403 forbidden`: "You can no longer put this board back in <name>" (the page holds the name; nothing new is learnt from the server).
+After the toast the same move back is still possible through Move to… on the Space the board is in now.
+
+**Where it appears (#53, #91).** Three entry points open the same dialog and toast (`web/adapters/dom/move.js` `startMove`, one copy of the move logic; `web/core/move.js` is the model):
+1. **Space page**: the card's ⋯ menu offers **Move to…** only for a card whose `can.move` is true (`GET /spaces/:id` cards carry `can: { rename, move, trash }`, `move` = `mayMove` (`move` permission and Unit membership) of the access the card's row already resolved, `home.cards`).
+2. **Home**: every card of a **Unit member** whose board is in the caller's own Unit (`GET /home`, `GET /home/search` and `GET /home/search?space=` cards: Recent, Starred, Your boards, Shared with me, search results; `can` is derived from the resolver's `move` permission, which is already false for anyone outside the board's Unit) carries the same `can` and gets the same ⋯ menu. A guest's cards carry no `can` (a guest has no Unit, so `GET .../move` would refuse them): no menu. After a move the Home page reloads; the card may now show another path.
+3. **Board page**: the top bar's **Move to…** button (desktop widths) the More menu's **Move to…** (1024 to 1279 px) and the phone dock's More sheet entry **Move to…** (≤1023 px, presenter and annotator roles) are offered only when the welcome says `can.move` (§ Welcome; no request is made to find out). The page names the board's Space beside the board name: no existing payload carries it, so **only a page whose welcome says `can.move`** reads it, from `GET /boards/:board/move`'s `from` (once after the welcome, and again after a move or an Undo). A person who cannot move a board therefore costs the server nothing extra on a page load, and a viewer-heavy board (100k viewers) costs no registry reads for this feature. Failure rules: a failed read of the Space name (network, 5xx) leaves the item in place and the name unshown; only a `403` or `404` from that route (the person has lost `move`) takes the item away until the next welcome says `can.move` again (**every** welcome that says it, a reconnect included, clears the refusal). After a move or an Undo the page reads the route again, so the name and the item follow the board without a reload.
+In all three, the destination list is `GET .../move`, the diff follows the choice (`preview`), Move is disabled until the diff has loaded for the chosen Space. The rules and the Undo are the server's and are the same whichever page asked.
+
+**Accessibility.** The dialog is the app's modal (`role="dialog"`, `aria-modal`, labelled by its heading): focus moves in, Tab stays inside, Escape and Cancel close it and focus returns to the control that opened it (the card's ⋯ button, or the board page's More button). The destination list is a radio group; choosing one loads the diff into a polite live region ("Gains access: …"), the three lists are headed lists with plain text (no colour-only meaning). After Move the dialog closes and **focus goes to the Undo button of the toast** (the card that opened it is gone), which is a `role="group"` (labelled "Board moved", not a live region itself: its sentence is said once through the page's polite live region, `announce()`), text "Moved *title* to *Space*." and an Undo and a Dismiss button. The **10 s countdown pauses while the pointer is over the toast or focus is anywhere inside it, whatever put it there (the page's own focus on Undo after a move included), and resumes with what was left**; elapsed time is measured on the Clock port's `mono()`. A pointer user who never focuses the toast gets the 10 s. Escape, Undo, Dismiss, the expiry, **focus moving to something outside the toast** and **Tab off its last button or Shift+Tab off its first** dismiss it; the first of them that happens while focus is inside returns focus to the page's main region (focus moved out by the person is left where they put it). The toast never traps focus and never moves it after the first move.
+
+## Trash and restore (#54)
+
+Design: design/orgs/JOURNEY.md (J8, §4 [trash], [board-in-trash]). Code: `server/auth/trash.js` (`trashService`: trash, restore, the Trash list, the board-URL notice; the routes only translate, `server/auth/http.js`),
+`server/trash-sweep.js` (`trashSweeper`: the purge), Registry calls `trashBoard`, `restoreBoard`, `trashSpace`, `restoreSpace`, `trashedBoards`, `trashedSpaces`, `trashDue`, `purgeClaim`, `purgeBoard`, `purgeSpace` (§ Registry), Store call `purgeBoard` (§ Store),
+the resolver's `trashed` answer (`server/auth/resolver.js`), web: `web/core/trash.js` (model), `web/adapters/trash/http.js` (the port's adapter), `web/adapters/dom/trash.js` (toast, Trash page, board notice).
+Every route authenticates like Home (`Authorization: Bearer`) and **checks permissions, never role names**. Trash is free on every plan.
+
+**What Trash is.** A deleted board (or Space) is **soft-deleted**: its Registry row stays, marked `trashedAt` (ms), `trashedBy` (user id) and, for a board taken by its Space, `trashedWith` (the Space id). For `TRASH.ttlMs` = **30 days** it is out of everyone's reach and can be restored; then it is purged for good.
+**Nothing about who reaches the board is deleted by trashing**: its direct grants, Team grants, `memberRole`, invites, share links and link uses stay as rows, so **Restore brings back exactly what was there** (an invite or link that expired meanwhile is expired, as it would have been anyway; a revoked one stays revoked).
+
+**Permissions (RBAC, never role names).**
+- **`delete`** (§ Tenancy, "Permissions") is the one permission for **moving to Trash, restoring and purging**, read from the same resolved access as every other permission: held on the board, or at its Space, Group or the Unit (a board owner, a Space or Group owner, a Unit admin, a custom role that carries it). Trashing a **Space** needs `delete` on the Space. A personal Space is never trashed (`403`).
+- **Personal-space boards are their owner's.** For a board in a personal space, `delete` alone is not enough: the caller must also have been able to **open it before it went to Trash** (`trashed.ladder != null`: the space's owner, or a Unit-scope holder of `content.personal`, which gives the owner ladder there). A **manage-only** Unit admin holds `delete` on every board but gets nothing for these: no trash, no restore, no Trash-list row, no notice (the one `403`). Boards in shared Spaces keep the plain `delete` rule. This is a permission read (board-content access is permissions plus a ladder), never a role name; the tiers (#88) are exactly that read: `content.personal`.
+- **Who sees a trashed item.** (1) The **Trash list** shows an item to everyone who holds `delete` on it **as it was resolved** (the resolver keeps `delete`, and nothing else, on a trashed target). (2) The **board-URL notice** (below) is shown to anyone who **could open the board before it was trashed** (they know it exists) and to a `delete` holder; for everyone else the answer is the same `403 forbidden` as an unknown board (no existence leak).
+  Who deleted it, where it was and the Space's name are shown **only to a `delete` holder**, and a container's name only when the caller could open that container (#51's name rule).
+- **A trashed target is gone to everything else.** The resolver (`resolveAccess`) returns, for a board that is trashed or sits in a trashed Space, or a trashed Space itself: `ladder: null` (so `opens` is false everywhere: Home, Space pages, search, the room, the pickers and every admin route see no board), `permissions` = `{ delete }` or empty, and `trashed: { at, by, ladder }` where `ladder` is the board role the caller held before (so `seen` is `ladder != null`).
+  `combine` therefore gives the room **no role**: a hello is refused (`auth`), a re-check closes the open sockets. The Registry lists (`boardsIn`, `spacesIn`, `spaces`, `spaceCandidates`, `searchBoards`, `sharedBoards`) also leave trashed rows out, so a trashed board takes no slot of a page.
+- **No new access by restoring.** Restore changes no grant. A board that went to Trash **with its Space** cannot be restored alone (`409 with-space`): restore the Space. A board trashed **on its own** whose Space is now in Trash is restored **into the restorer's personal space** (design J8 step 3; the answer and toast say where it went), under #53's no-escalation rule, the **per-person gain rule** of § Move board (`gainContext`/`raisesAbove`, `server/auth/move.js`) against the restorer's pre-trash board role **without the content tier** (`ownLadder`: the tier never launders into a personal space the restorer would own; a personal space that does not exist yet counts as owned by them), else `409 would-escalate` and the notice's `canRestore` is false. The board keeps its own clock until restored. A Space is never purged before a board that was trashed on its own earlier (the board is purged on its own clock, the Space only once no board references it), so a trashed board's Space exists until the board is gone or restored elsewhere.
+- **Invites and links:** creating or revoking an invite or link on a trashed board is a `403` (the board has no permissions but `delete`), and **redeeming a link answers like an unknown link while the board is in Trash** (`Registry.addLinkUse` rejects code `in-trash` in the same atomic step as the use, so there is no race with a trash, and `tenancy.redeemLink` turns it into the unknown-link answer). An invite has no redeem step (it matches the signed-in email when access is resolved), so it gives nothing while the board is in Trash and works again after Restore.
+
+| Route | Needs | Answers |
+|---|---|---|
+| `POST /boards/:board/trash` `{ from }` (`Idempotency-Key`) | `delete` on the board | 200 `{ board: { id, title, space: { id, name } }, trashed, trashedAt, expiresAt, undo: { restore: true } }`. `from`: the Space the caller believes the board is in (required id): a **compare-and-set** like Move. In `from` and live → trashed (`trashed: true`); already in Trash → the same success, `trashed: false`; in another Space → `409 moved` |
+| `POST /boards/:board/restore` (`Idempotency-Key`) | `delete` on the board | 200 `{ board: { id, title, space: { id, name } }, restored, movedTo?: { id, name, personal: true } }`. In Trash on its own → live (`movedTo` when its Space is in Trash and it went into the restorer's personal space); not in Trash → `restored: false` (a double click, or someone else's restore); taken by its Space → `409 with-space`; the restore would raise the restorer's role → `409 would-escalate`; being purged → `409 purged`. The service chooses the destination before the write; if the Space went to Trash in between (Registry `space-in-trash`), it chooses again once, with the same no-escalation check, so `space-in-trash` is never answered to a client. The personal space is **created by the POST only, after the no-escalation check passed** (a refused restore leaves nothing behind; a not-yet-existing personal space is assumed to give the restorer `owner`, as the GET does); the GET looks it up |
+| `GET /boards/:board/trash` | could open it before, or `delete` | 200 the **notice**: `{ board: { id, title }, trashedAt, expiresAt, daysLeft, canRestore, into?: { id, name, personal: true }, ...(delete holders: { by: { id, name }, from: { space, group } }), via?: { space: { id, name }, canRestore } }`. `canRestore` is exactly whether `POST …/restore` would succeed now (the same `delete`, personal-space and no-escalation checks); `into`: the personal space a restore would use because the board's own Space is in Trash (`id: null` and `name: null` when the caller has none yet: the client words "created on restore"; a GET writes nothing). `via`: the board went to Trash with its Space; `canRestore` there is `delete` on that Space. A live board, an unknown one and a caller with neither: `403 forbidden`. The web page asks for this notice only after the room refused the hello; once the notice stands it hides the room's "refused this sign-in" banner (signing in again cannot open a trashed board) |
+| `POST /spaces/:space/trash` (`Idempotency-Key`) | `delete` on the Space | 200 `{ space: { id, name }, trashed, boards, undo: { restore: true } }`: the Space and every live board in it, in **one atomic step** (`boards`: how many went with it) |
+| `POST /spaces/:space/restore` (`Idempotency-Key`) | `delete` on the Space | 200 `{ space: { id, name }, restored, boards }`: the Space and the boards that went with it (`trashedWith` = this Space), atomically; their purge claims, if any, are cleared. Refused `409 purged` if the Space or any of its boards is claimed for purge. Boards trashed on their own before stay in Trash with their own clock. The stored answer of a keyed Space call carries the count (`<space>:trashed:<n>`), so a replay reports the real `boards` |
+| `GET /trash` | a Unit member | 200 `{ items: [Item], more }`: the Trash the caller may restore, below |
+
+An **Item** is `{ type: "board", id, title, from: { space: { id, name, personal } \| null, group: { id, name } \| null }, by: { id, name }, trashedAt, expiresAt, daysLeft }` or `{ type: "space", id, name, group, boards, by, trashedAt, expiresAt, daysLeft }`, newest first, at most 50, `more` when the scan stopped. A board that went with its Space is **not listed**: the Space's row stands for it.
+`daysLeft` is whole days rounded up, so the last day reads 1; 0 means the 30 days are over and the purge has not run yet; `expiresAt` = `trashedAt + 30 d`. `403 forbidden` for a guest or a caller outside the Unit, `400 bad-request`, `422 idempotency-key-reused` and the 503 of the request deadline are as everywhere. The routes are in the deadline guard's table (`test/auth/http-deadline.test.js`).
+
+**Trash a board.** `trashBoard({ board, from, by, idem })` (§ Registry) is ONE atomic compare-and-set (the key row in the same step): live and in `from` → marked; already in Trash → no change; in another Space → `moved`. **Undo** is Restore under its own key; the toast offers it for 10 s ("Moved to Trash · Undo") and Trash keeps it for 30 days.
+**Trash a Space.** `trashSpace({ space, by, idem })` marks the Space and **every live board in it** in one transaction, each board with `trashedWith` = the Space and the same `trashedAt`. A board already in Trash keeps its own clock and reason. No board can be created in, moved into, or restored into a trashed Space (a restore of an own-clock board goes to the restorer's personal space instead). `restoreSpace` clears the Space and exactly the boards with `trashedWith` = it.
+
+**Freshness.** Trashing and restoring change who reaches a board, so each announces `{ board }` on the board's `grants` subject (the announcing Registry, `server/main.js`; a Space announces every board in it, trashed ones included, off the request path with the same bounded fan-out as a general-access change): gateways drop the board's cached roles, record and chain and re-check at once, **closing open sockets promptly** (`1008`); a restore is seen by the next hello. The timed re-check (≤ 60 s) covers a lost announcement. A lost announcement can leave a cached chain (board row and Space, which carry `trashedAt`) in use for at most the role cache's TTL, 30 s, and the timed pass reads it fresh.
+**Races (Postgres).** `trashSpace` holds the Space `FOR UPDATE` and then marks its boards; every write that puts or keeps a board in a Space (`createBoard`, `moveBoard`'s current and target Spaces, in id order, `restoreBoard`, with its `into`) reads that Space `FOR SHARE` first, in the same Space-then-board lock order, and `addLinkUse` reads the board `FOR SHARE`. So a trash that is in flight either waits for such a write (and then trashes its board too) or is seen by it (and the write is refused): a live board is never left in a Space that went to Trash, and a Space is never stuck `purging` over one.
+
+**Purge.** `trashSweeper` (`server/trash-sweep.js`) runs on a timer on **every node with the Registry** (main.js; a node that is not a gateway or room host too), judging **only an injected clock** (`now()`; tests advance it, nobody waits 30 days). Each pass reads `trashDue({ before: now - 30 d, limit, claimed: false })` (own-clock boards and Spaces past their time, oldest first; a board that went with its Space is not offered: it follows its Space), claims them, then works a page of **claimed** rows (`trashDue({ claimed: true, after })`, by id after a cursor the sweeper keeps across sweeps, so a row that keeps failing is retried in turn and never holds the head of every read). Per item:
+1. **Claim** (`purgeClaim`): one conditional write marks the row *purging* if it is still in Trash and past its time (a Space also claims the boards that went with it, **in the same transaction**; a board that went with its Space is claimed **only** that way: `purgeClaim` of it alone is `false` unless its Space already claimed it). From here **Restore is refused** (`409 purged`; `restoreSpace` too, if the Space or any of its boards is claimed): nothing that could still be restored is ever deleted. Every restore clears the purging mark of what it restores, and `purgeBoard` also requires the board to be in Trash.
+2. **Delete the content** through the ports: `Store.purgeBoard(tenant, board)` (log entries, checkpoints, lease row and epoch, **and the board's blob references**, which condemns the blobs nothing else references, in the same transaction; idempotent). The blob bytes themselves are deleted later by the blob reaper (§ Blobs, "References and purge"), never in the purge's own path.
+3. **Delete the Registry rows** (`purgeBoard`: grants, scoped grants, invites, links and uses, recents, stars, access requests and the board, one transaction; a Space: `purgeSpace` after its boards, its scoped grants and requests). Both refuse (`false`) for a row that was not claimed (`purgeBoard`: or is not in Trash). A claimed row whose Store purge or Registry delete failed stays claimed and is retried; `purgeSpace` waits (`false`) while a board of it remains.
+**Failure.** Every step is idempotent and ordered so a crash leaves a claimed row that still lists in `trashDue({ claimed: true })`: the next pass (on any node) resumes at step 2 or 3; a failed item is logged and left for a later pass, the pass goes on with the rest. A failed Space claim claims nothing, so its boards stay restorable. Two nodes purging one board at once both succeed (deletes of absent rows are no-ops, the claim is a conditional write). A pass handles at most `limit` boards and Spaces; a sweep makes at most `passes` passes and reports `more` when it stopped full (the next timer tick goes on).
+
+## Leaver offboarding (#55)
+
+Design: design/orgs/JOURNEY.md (J7, §4 [admin-offboard]). Code: `server/auth/offboard.js` (`offboardService`: the list, the per-item reassignment and the removal; the routes only translate, `server/auth/http.js`),
+Registry calls `ownedAlone`, `reassignOwner`, `removeMember`, `memberState` (§ Registry), the resolver's `ctx.removed` (`server/auth/resolver.js`), `tenancy.tenantOf`, web: `web/core/offboard.js` (model), `web/adapters/offboard/http.js` (the port's adapter),
+`web/adapters/dom/offboard.js` (the page, `?offboard=1`). Every route authenticates like Home (`Authorization: Bearer`) and **checks permissions, never role names**. Pre-launch: no compat path for stores that predate it (§ Organization, "No migration").
+
+**What "removed" is.** A Unit member is an identity whose `hd` is one of the Unit's domains, and that is not stored (§ Tenancy), so deleting a person's rows removes nobody: the next sign-in would put them back. Removal is therefore a **durable marker on the Unit's directory row**
+(`reg_members.removed_at`, `removed_by`), honoured at every membership reader: `resolveAccess` (a removed identity is **not a member**: no general access, no Unit member role, no Space, Group, Unit or Team source; it is a **guest**, holding only board-scope sources: a direct board grant, an invite, a link),
+`tenancy.tenantOf` (a removed member has **no Unit**: every route answers them as a guest, 403), `touchMember` (never clears it), `ensurePersonalSpace`, `createSpace` and `createGroup` with an `owner` (code `removed`, nothing written), `findMembers` (not offered in a picker) and the "known person" checks of the grant routes (a removed person
+is `400 unknown-person`; `membersAmong` still answers their row, with `removed: true`, so history keeps their name). The marker rides the volatile, per-`users` part of `accessContext` / `accessContexts` (`ctx.removed`: the requested users that are removed), never the cached chain, so every fetch path (a hello, the gateway's re-check, Home, `accessMany`) agrees and a re-check sees it at once.
+Fail-closed: a removed identity gets nothing the Unit gave; it keeps only what was given on a board itself and not removed (below). A Unit **admin** is **not removable** (409 `is-admin`), whether named by user id or by an `email:<address>` entry matching the member's directory email: admin lists only grow (the role cache relies on it), so refusing is simpler and safer than stripping entries (a second write path to admin lists, with its own races); demoting an admin is a separate, later feature (#88). The resolver also treats a removed identity as **not an admin** (`admin` is off with `ctx.removed`), so an admin entry added after a removal grants nothing to that person until an operator reinstates them. The removal's announcement reaches their sockets like any other (the announcing Registry, Unit-wide revocation).
+There is **no reinstate** in this issue (an operator clears the marker); SCIM (#36) will re-provision.
+
+**What the leaver solely owns (the "items").** The oracle is the Registry's own last-owner rule: an item is something whose last counted owner removal would be refused. A **Group or Space** whose only counted `owner` (§ Organization) is the leaver (a Team owner with a member counts, so a co-owning Team makes it shared), the leaver's **personal space**
+(always an item, even empty), **trashed Spaces included** (a Restore must not bring back an ownerless Space). **Boards are not items:** a board always lives in a Space and a Space keeps a counted owner, so a board whose only owner grant is the leaver's stays managed by its Space's owners (and by every Unit admin); a board inside a sole-owned Space or the personal space travels with that Space's reassignment.
+The leaver's own direct board grants are removed at removal (below), never reassigned one by one. This is why the list is a handful of rows, not a row per board the leaver ever made. `ownedAlone(tenant, user)` lists the items, by `<type>\n<id>`, in bounded pages.
+
+**Permissions (RBAC, never role names).** Everything needs **`members.manage` at the Unit root** (the resolver's answer at the Unit); a caller without it, a guest, a removed member, an unknown or another Unit's person all get the one `403 forbidden`. Reassigning an item is
+the act of **granting `owner` on it**, so it is checked exactly like a grant (`grantable`, `server/auth/access.js`, § Teams and access, "Who may grant or change what"): the owner role's management permissions must be a subset of the caller's own **at that Space or Group**, and **the recipient never gains more board role than the caller holds** (`withinLadder`, § Share dialog), **unless the caller holds the content tier there** (`holdsTier`). Offboarding keeps one narrow exemption: a Unit admin may reassign a leaver's shared Space or Group to **another** live member (never to themself, which needs the tier).
+A non-admin `members.manage` holder therefore sees every item with `can.reassign: false` and "Needs a Unit admin" unless their own role reaches owner there.
+**Who opens and controls a personal space (the resolver's rule, TECH-DEBT rows 66 and 67).** On a personal space and its boards, every Unit-scope source gives **no permission at all**, content or management (`move`, `delete`, `transfer`, `members.manage`, `board.edit`, rename, grant): not the Unit member role, not a Unit-scope grant (a custom role), not a Unit Team's grant, and not the `admin` source (it carries no board content) unless the source also holds `content.personal`. A manage-only Unit admin therefore sees and controls nothing there, and holds exactly what the owner gave them (a viewer grant is `board.view` and nothing more). The routes that used the admin list instead of the resolver read it now: `PUT /boards/:board/grants/:user` (`managed()` asks the resolver for `members.manage` on a personal board), the access routes, links and invites (`members.manage`), rename (`board.edit`), trash and move (`delete`, `move`), adding a member to a Team that holds a grant there (`PUT /teams/:id/members/:user`, § Teams and access; removing stays open to admins), and the Unit-admin exemption from the no-escalation rules applies only where the caller holds the permission at all. What counts: the owner (a Space-scope source), board-level sources (a direct grant, an invite, a link: each gives what it gives) and a Unit-scope source holding **`content.personal`** (the content tier, #88) open it. Home's tree lists another person's personal space only to that admin, and Trash, search and the room agree because they all read this one answer.
+**A personal space is private to its owner, and it is never reassigned on its own.** The rule is a **permission**, not a role name: handing a personal space over (and therefore removing its owner) needs the **content-access permission `board.view` and a ladder role on that Space** (its owner, or a holder of `content.personal`; named explicitly, `openable()` in `server/auth/offboard.js`) **and** `holdsTier` there (`content.personal`; not `grantable(owner)`, which the tier does not give, § Admin levels). A manage-only Unit admin (and a holder of `content.shared` alone) is **not** that: for them the personal item shows `can: { reassign: false, handover: false, why }`, `canRemove` is false, `POST /members/:user/remove` is `403 forbidden` for a leaver who has a personal space (nothing changes), and the page shows only a **count** of its boards (capped, `boardsCapped`), never a board title (no route here returns a title). Such an admin can still offboard anyone who has no personal space and reassign every shared item. `POST .../reassign` of a personal space is `409 personal` for everyone, so a live member's personal space can never end up owned by someone else while its owner is still active.
+A shared Space's or Group's **name** is shown to a `members.manage` holder (a container name is not board content, and the screen cannot ask "who takes this?" without it); this is the one place a name is shown to someone who may not open the container, and it is deliberate. (Reversible: drop the name from the item.)
+
+**Who gets it: the default recipient.** `managerOf(unit, user)` is an injected seam (`offboardService({ managerOf })`, default `async () => null`; there is no manager field until SCIM / Entra sync, #36): the leaver's manager **if the directory knows them and they are a live member**, else **the removing admin** (the caller). The reply carries `defaults: { recipient: { id, name }, reason: "manager" | "remover" }`; the page puts that person in every item's recipient picker and the admin can change each item (the picker is the Unit directory search, `GET /directory`).
+Nothing goes to "the oldest admin": there is no further fallback, and the confirm step names every recipient. The recipient must be a **live** directory member of the Unit, not the leaver (`400 bad-recipient`); an admin who never signed in has no directory row and cannot be a recipient.
+
+| Route | Needs | Answers |
+|---|---|---|
+| `GET /members/:user/offboarding?after=` | `members.manage` at the Unit; `:user` in the Unit's directory | 200 `{ member: { id, name, email, removed }, defaults: { recipient, reason }, items: [Item], next, blocked: "admin" \| null, canRemove }`; items by `<type>\n<id>`, 50 a page; `canRemove` = the whole list is one page, holds nothing but the leaver's personal space, which the caller may hand over, the member is not an admin and not already removed |
+| `POST /members/:user/offboarding/reassign` `{ type: "space"\|"group", id, to }` (`Idempotency-Key`) | as above, plus `grantable(owner)` at the item (a Unit admin passes the board-ladder part; `to` may not be the caller unless they hold the content tier there) | 200 `{ item: { type, id, name, archived }, to: { id, name }, done }`; `done: false` = the leaver no longer solely owned it (someone else took it or it was reassigned already): nothing changed |
+| `POST /members/:user/remove` `{ to? }` (`Idempotency-Key`) | `members.manage` at the Unit; if the leaver has a personal space, a ladder role on it (above) | 200 `{ removed, grants, scopedGrants, teams, invites, handedOver }` (counts); `to` (required when they have a personal space, else ignored) = the new owner of that space, a live member other than the leaver (`400 bad-recipient`); `409 still-owns` while any other item is left (nothing changes), `409 is-admin` |
+
+An **Item** is `{ type: "space"\|"group", id, name, personal, archived, trashed, boards?, boardsCapped?, can: { reassign, handover?, why? } }` (`handover` only on the personal item). `409 personal`, `403 forbidden`, `400 bad-request`, `422 idempotency-key-reused` and the 503 of the request deadline are as everywhere; the routes are in the deadline guard's table.
+
+**Reassigning one item.** `reassignOwner({ scope, from, to, idem })` is ONE atomic compare-and-set (the key row in the same step; Postgres: the tenant's owners lock first, § Registry, then the container's row, a row purged meanwhile is "no such space|group", `404 not-found`): if `from` is **still** the only counted owner, `to` becomes `owner` and `from`'s grant goes in the same step, so the container is never ownerless;
+otherwise nothing changes (`done: false`), which makes a double submit, a retry and a second admin harmless. A personal space is refused (code `personal`).
+**Handing over the personal space** is part of the removal: `removeMember({ ..., handover: { to, name } })` turns it into an ordinary Space in the same step as the marker: `kind` shared, `owner` null, **`archivedAt` set**, named `name` ("Sam's space (archived)"), general access stays `null` (private), `to` its owner. A person with no personal space needs no `to`. **Board URLs and guests' access stay**: nothing about any board row, its direct grants, Team grants, invites, links or link uses changes, so every board id, link and guest keeps working.
+**"Archived" means a label and nothing else:** it is listed with an "Archived" tag and restricts nothing (boards can still be created, moved in, restored); the owner may rename it like any Space. (Minimal on purpose: one flag, no behaviour to get wrong.)
+
+**Removing, and the order (what a half-done offboarding looks like).** Reassign first, remove last, and **the removal refuses while anything is left**. `removeMember({ tenant, user, by, handover, idem })` is ONE atomic step: it takes the owners lock, re-reads `ownedAlone` **inside the step** and refuses with `still-owns` (nothing changes) if there is any item other than the personal space being handed over; otherwise it hands that over, sets the marker, deletes the leaver's direct board grants,
+their scoped grants on the Unit, its Groups and Spaces, their Team memberships and their pending access requests, and **revokes the invites addressed to their email** on the Unit's boards (so an invite cannot give the removed person a ladder role: `tenancy.role` of their identity through it is null), in the same transaction. So:
+- **removed before every item is reassigned** cannot happen through this API: the removal is refused. A crash or a closed tab between items leaves the leaver **active**, with some items already reassigned and the rest still theirs: every state is valid, nothing is ownerless, and the screen resumes (the list is read fresh).
+- **an item created or gained while the admin works** (the leaver makes a new Space) is caught by the removal's own re-read, and `createSpace` / `createGroup` / `ensurePersonalSpace` for a removed owner are refused inside their own step, so nothing can be created for a removed person after the marker commits. The same goes for **a grant or a Team seat given to a removed person** (`setScopedGrant` for a user subject, `setTeamMember` add: code `removed`, nothing written). Postgres: those writes read the member row `FOR SHARE` (the removal holds it `FOR UPDATE`), so a seat given in the removal's window is either seen by the removal or refused; **creating a Space takes no tenant-wide lock** (only the owner's own member row), and only a write that changes who OWNS something takes the tenant's owners lock.
+- **a concurrent demotion of the other owner** of a Space the leaver co-owns waits on the owners lock and then sees the leaver's grant gone, so `last-owner` still holds.
+- A SCIM deprovision later must reassign first (using `defaults` from `managerOf`), then call the same removal; it cannot skip the order.
+**What is not touched:** invites and share links the leaver **created** stay valid until they expire (decision #61: guests keep access; the new owner vouches for them by owning the board's Space), and so does a **link the leaver redeemed**: a guest-style source written by someone who still has the right to give it. Revoking any is the board owner's act (§ Share dialog). (Invites addressed to the leaver's own email are revoked, above.)
+**Admin checks outside the resolver** (`liveAdmin`, `server/admin/boards.js`): a removed person is never an admin there either (board grant PUT/DELETE, share, the known-person check by admin id), whatever the admin list says.
+
+**Freshness.** Both steps change who reaches boards. A reassignment announces the item (`announceChange(scope, { revoke: true })`: every board in the Space, or Group's Spaces); the removal announces the **Unit** as a **revocation** (every board of the Unit, the priority queue, never dropped, § Spaces and Groups), so the leaver's open sockets are re-checked and closed (`1008`) within the gateway's pass; the announcement is bounded (20 pages of 500 boards): a Unit larger than that is finished by the timed re-check (≤ 60 s) with one log line, the bound role edits have.
+HTTP stops at once: `tenantOf` reads the marker per request. The node that served the removal also calls `forget(user)` (`roleCache.forgetUser`, wired in `server/main.js`): every warm cached role of that user on every board goes at once and a hello's read in flight across it never refills, so a hello after the removal reads fresh; other nodes get the Unit-wide revocation. **Idempotency:** both writes take `Idempotency-Key` like Move (§ Idempotent creates); the stored ref is `<scope id>:reassigned` or `<scope id>:noop`, `<user>:removed` or `<user>:noop`, and a replay rebuilds its answer fresh and re-authorizes.
+
+**Accessibility (the page).** A single page at `?offboard=1` (Home links to it from the Unit's People area for a `members.manage` holder): a person search (combobox over `GET /directory`), then a table of items with a labelled recipient picker (a native `<select>` of "Default: Name" plus a search field for another person) per row and a status per row; the
+**confirm step is a modal dialog** (`role="dialog"`, `aria-modal`, labelled by its heading, focus trapped, Escape and Cancel close it and return focus to the button that opened it) that lists, as a plain list, exactly what moves where ("Sam's space (14 boards) will be owned by Ada, as an archived Space") and says what is removed; confirming applies the items **one at a time**, announces each result in a polite live region, and
+never hides a failure; **Remove Sam** unlocks only when the server's `canRemove` is true (everything shared handed on, and the personal space, if any, one the caller may hand over; the recipient picked for the personal space is named in the removal's dialog and sent as `to`). The default-recipient sentence is shown only to a caller who can hand something on. After a redraw focus goes back to the control of the same `data-fk` in the current page (the Review and Remove buttons, a row's picker), else the heading. No colour-only meaning; every control is keyboard reachable.
+
+## Sign-in code exchange
+
+No long-lived token ever appears in a URL. After Google sign-in the server hands the page a single-use code, and the
+page trades it for a session token.
+
+1. **Callback.** `GET /auth/callback` answers 302 to the post-login URL with `#code=<code>` (for a share link, the
+   board URL with `#code=<code>`, plus `&link=invalid` or `&link=unavailable` where that applies). It also sets
+   `__Host-plen_xchg`, an HttpOnly, Secure, SameSite=Strict, host-only cookie that lives 60 s and carries the signed
+   identity.
+2. **Client.** Read `#code`, drop the fragment at once (`history.replaceState`), then `POST /auth/exchange` from the
+   same origin with `credentials: "same-origin"`, `Content-Type: application/json` and body `{"code":"<code>"}`.
+   The server accepts only the post-login URL's origin, so the auth routes and the page share one origin.
+3. **Answers** (JSON, always `Cache-Control: no-store`):
+   - `200 {token, user, name, email, domain, exp}`; the exchange cookie is cleared.
+   - `400 {error:"invalid-code"}`: unknown, expired (> 60 s), already used, or not this browser's. One answer for all,
+     so there is no oracle.
+   - `403 {error:"bad-origin"}`: the `Origin` header is not the post-login origin.
+   - `503 {error:"unavailable"}`: the server can't issue a session right now; the code is not spent, so one jittered
+     retry is reasonable. Sign-in not configured at all answers `503 {error:"sign-in-unavailable"}`.
+   - A body that is not JSON (by content type) is refused with 415, an oversized one with 413, and a JSON content type
+     with a body that can't be read, isn't an object, or has a field other than `code` with `400 {error:"bad-request"}`
+     (`"unknown-field"` for the extra field), and with a body that doesn't parse as JSON with `400 {error:"bad-json"}`.
+   - `{error:"network"}` is client-only: no answer at all. The server never sends it.
+4. The token then goes in `hello` (kept in memory and sessionStorage, never localStorage or a URL).
+
+Field types of the 200 body:
+
+- `user`: a non-empty string (`google:<sub>`, or `dev:<name>` for dev tokens).
+- `name`: a string, or null (Google sent none; an empty name becomes null).
+- `email`: a string, or null whenever Google isn't authoritative for it (a consumer account not at `@gmail.com`, or a
+  Workspace user on a secondary domain). Show it only if present.
+- `domain`: a string, or null: the Workspace `hd` domain, null for any non-Workspace account. It says who the user
+  is, not how they got access (an invite or share-link user from a Workspace keeps their own domain).
+- `exp`: an integer, seconds since the epoch.
+
+The client side of this contract is `web/ports/auth.js`; `test/web/contracts/auth-contract.js` runs it against every
+adapter.
+
+## Metrics (`/metrics`, #69)
+
+Prometheus text-format metrics for operators. Off by default; nothing is recorded while off.
+
+**Access.** `PLENARY_METRICS_TOKEN` (at least 16 characters, only letters, digits and `-._~+/` with optional trailing `=`: an RFC 6750 token, so no whitespace; anything else, blank included, refuses the start) turns it on. Every node
+that has it serves `GET /metrics` on its normal port, on every role (a host-only node too, which otherwise answers only
+`/health`), and it answers only a request that carries `Authorization: Bearer <token>`.
+- Unset: `/metrics` is `404 {"error":"not-found"}` on every node, same as any unknown path, and the node records nothing (the no-op Metrics adapter).
+- Set, no header or a wrong token: `401 {"error":"unauthorized"}` with `WWW-Authenticate: Bearer`. The token is compared in constant time: both sides are hashed with SHA-256 and the 32-byte digests are XOR-folded, so neither length nor content shows in the time. The `Bearer` scheme name is matched case-insensitively (RFC 7235). Never logged.
+- Set, right token, a method other than GET: `405`. GET: `200`, `content-type: text/plain; version=0.0.4; charset=utf-8`, `cache-control: no-store`.
+- A bearer token over plain HTTP is readable by anyone on the path: scrape over a private network or behind TLS, and have the
+  public edge refuse `/metrics`. One token per cluster is fine; each node answers for itself, so scrape every node.
+- Chosen over a separate bind address: one env var, no second listener to forget, and it works on every role. A scrape never touches the Store, the Bus or a board (the gauges read counters the node already keeps).
+
+**The Metrics port** (`server/metrics/port.js`; the domain records through it and sees no exposition format):
+```
+counter(name, help, labelNames?, seed?)      -> { inc(n = 1, labels?) }   // seed: label sets that read 0 from the start
+gauge(name, help, read: () => number)        // sampled at scrape time; registering a name again replaces the reader
+histogram(name, help, { buckets?, labelNames? }) -> { observe(value, labels?) }
+```
+- Every call, including a null options argument, is non-throwing and never waits: a bad value, an unknown label name or a name that is already another type is dropped (the registration then returns a no-op instrument). Metrics must never take down the hot path.
+- Registering the same counter or histogram name and type again returns the same instrument (several gateways in one process share it).
+- Label values are rendered with `String()` (the number 1 and the string "1" are one series). Labels are bounded: only the declared `labelNames`, values from a fixed set named below, at most 64 series per metric (more are dropped). No per-board, per-user, per-tenant or per-connection label, ever.
+- Adapters: `server/metrics/prometheus.js` (the text format, `render()`), and `noopMetrics` in the port module. `server/main.js` picks one.
+
+**Metrics.** All names start `plenary_`. Counters are cumulative since process start (use `rate()`); durations are seconds.
+
+| Name | Type | Labels | Unit | Meaning | Where |
+|---|---|---|---|---|---|
+| `plenary_connections` | gauge | none | connections | WebSockets open on this gateway now. | gateway nodes |
+| `plenary_boards_hosted` | gauge | none | boards | Rooms this host holds or is building (one sequencer per board, under its lease). | host nodes |
+| `plenary_ops_total` | counter | none | ops | Ops this host sequenced and the Store made durable (counted when the append settles, even if the lease was lost meanwhile and the op is never acked). Ops per second = `rate(plenary_ops_total[1m])`. | host nodes |
+| `plenary_lease_changes_total` | counter | `event`: `acquired`, `lost`, `released` | leases | Board lease changes on this host: taken, lost (fenced, refused renew or no renew by the host deadline), given back. A rising `lost` is a flapping cluster. | host nodes |
+| `plenary_fanout_lag_seconds` | histogram | none | seconds | From the room sequencing a run of entries (the entry's `at`) to the gateway handing its frame to its viewers' queues, per frame. Spans two nodes' wall clocks, so it includes their skew (negative values are recorded as 0). Only entries that reach a gateway's feed after its first load count: from the bus, or from a repair of a gap or a silent bus (those show the delay they really suffered). A feed's first load, the catch-up of a joiner, is not observed. Buckets 5 ms to 30 s. | gateway nodes |
+| `plenary_store_seconds` | histogram | `op`: `append`, `read`, `lastSeq`, `putCheckpoint`, `getCheckpoint`, `openEpoch`, `epoch`, `acquire`, `renew`, `release`, `lease` | seconds | How long each Store call took until it settled (success or failure), as every node calls it. Buckets 1 ms to 10 s. | every node with a Store |
+| `plenary_store_errors_total` | counter | `op` as above | calls | Store calls that rejected. | every node with a Store |
+
+Histograms render as `<name>_bucket{le="..."}`, `<name>_sum`, `<name>_count`. `test/server/metrics.test.js` checks that every metric a running node exposes is named in this section.
 
 ## Ports
 
@@ -736,11 +1673,17 @@ method names are stable. Ids are server-minted over `[a-z0-9-]`.
 
 | Area | Calls |
 |---|---|
-| tenants | `createTenant({ domain, admins })`, `tenant(id)`, `tenantByDomain(domain)` (Workspace domain → tenant), `addTenantAdmin(tenant, user)` |
-| boards | `createBoard({ tenant, title, memberRole }) → { id, tenant, title, memberRole, createdAt }`, `board(id) → { tenant, title, memberRole, … } \| null` |
+| tenants | `createTenant({ domain, domains, kind, admins })` (`kind` default `company`), `tenant(id) → { id, domain, domains, kind, admins, createdAt }`, `tenantByDomain(domain)` (any of the Unit's domains → tenant), `addTenantAdmin(tenant, user)`, `addTenantDomain(tenant, domain)` |
+| boards | `createBoard({ tenant, title, memberRole, space, owner?, idem? }) → { id, tenant, title, memberRole, space, createdAt }`, `board(id) → { tenant, title, memberRole, space, … } \| null` (`space` is required by `createBoard` and never null) |
 | grants | `setGrant(board, user, role \| null)`, `grant(board, user) → role \| null`, `grants(board)` |
-| invites | `createInvite({ board, email, role, expiresAt, by })`, `invite(id)`, `invites(board)`, `invitesFor(board, email)`, `revokeInvite(id)` |
-| share links | `createLink({ board, role, expiresAt, by })` (role per link), `link(id)`, `links(board)`, `revokeLink(id)`, `addLinkUse(link, user)`, `linkUses(board, user)` |
+| invites | `createInvite({ board, email, role, expiresAt, by, idem? })`, `invite(id)`, `invites(board)`, `invitesFor(board, email)`, `revokeInvite(id)` |
+| share links | `createLink({ board, role, expiresAt, by, idem? })` (role per link), `link(id)`, `links(board)`, `revokeLink(id)`, `addLinkUse(link, user)`, `linkUses(board, user)` |
+| trash | `trashBoard({ board, from, by, idem })` (`from` = the Space the caller saw: compare-and-set, else `moved`) `→ { board, trashed }`, `restoreBoard({ board, idem, into? })` (`with-space`, `space-in-trash` unless `into` names a live Space of the Unit the board then moves to, `purged`; clears the claim), `trashSpace({ space, by, idem })` (personal Space: `personal`) `→ { space, trashed, boards }`, `restoreSpace`, `trashedBoards`, `trashedSpaces`, `trashDue({ before, limit, claimed?, after? })` (`claimed: false` = due and unclaimed own-clock rows, `claimed: true` = claimed rows by id after `after`), `purgeClaim({ type, id, before })` (a with-Space board only together with its Space), `purgeBoard(id)` (claimed and in Trash), `purgeSpace(id)`; `personalSpace(tenant, user)` is the pure read of a personal space (null if none); `boardsIn(…, { withTrashed })`; `addLinkUse` throws `in-trash` for a trashed board. All are one transaction with their idempotency key; lists other than `trashed*` exclude trashed rows. § Trash and restore. |
+| idempotency | the optional `idem: { user, key, fp }` of `createBoard`, `createGroup`, `createSpace`, `createTeam`, `createInvite`, `createLink` (the key row is written in the create's own atomic step; a live one rejects with `code` `idem-replay` + `ref`, or `idem-mismatch`), and `idemGet({ user, key, fp }) → { state: "none" \| "done" \| "mismatch", ref? }` (§ Idempotent creates) |
+| home | `markOpened(user, board)`, `recents(user, { limit })`, `setStarred(user, board, on)`, `starred(user, { limit })`, `starredAmong(user, boards)`, `sharedBoards(user, email, { limit })`, `searchBoards(tenant, { q, after, scan })`, `spaceCandidates(tenant, { user, all, after, limit })`, `groupCandidates(tenant, { user, all, limit })`, `boardRows(boards, { user, email })` (§ Home) |
+| access requests (#51) | `requestAccess({ tenant, scope, user, role, idem?, limits?, supersede? }) → AccessRequest` (one atomic step: key, existing row, cooldown, per-user and per-scope limits, write; rejects code `rate-limited` with `retryAfterMs`), `accessRequest(scope, user) → AccessRequest \| null`, `accessRequests(scope, { limit }) → AccessRequest[]` (pending, newest first, default 50, at most 200), `closeAccessRequest(scope, user, "dismissed" \| "granted") → boolean` (both keep the row with `closedAt`: `dismissed` holds the cooldown, `granted` only the per-person count; a closed pending row is never reopened by a read), `grantHolders(scope, roles, { limit }) → ScopedGrant[]` (scoped grants at the scope whose role is in `roles`, by subject, at most 20); table `reg_access_requests` (tenant, scope, member, role, state `pending`|`dismissed`|`granted`, at, closed_at; unique per scope and member) |
+| move (#53) | `moveBoard({ board, from, to, idem? }) → { board, moved }` (§ Move board): ONE atomic step compare-and-sets the board's Space (`from`: the id of the Space it must be in, required (a non-string rejects `registry: no such space`); `to`: a Space of the board's Unit): in `from` → set, `moved: true`; already in `to` → no change, `moved: false`; anywhere else rejects code `moved`, nothing written; the key row (`idem`) is written in the same step. An unknown board or Space rejects `registry: no such board` / `no such space` |
+| organization | `createGroup`, `group`, `groups`; `createSpace`, `space`, `spaces`, `ensurePersonalSpace(tenant, user)`; `createTeam`, `team`, `teams`, `setTeamMember`, `teamMembers`; `setScopedGrant({ scope, subject, role \| null })` (a role shaped `r-…` must be a custom role of the scope's Unit, checked in the write: code `no-role`), `scopedGrants(scope)`; `createRole({ tenant, name, base, boardRole, permissions, max? })` (`max`: rejects code `limit` when the Unit already has `max` custom roles, atomically), `updateRole`, `role`, `roles`; Roles (§ Roles): `deleteRole(tenant, id)` (ONE atomic step: rejects code `in-use` while any scoped grant holds the role, `member` is never deleted, an unknown id rejects `registry: no such role`), `roleUsage(tenant, ids, { cap })` (per id, **this Unit's grants only**: a scoped grant has no tenant column, so its scope's row says whose it is and another Unit's grant of the same role string never counts, nor does a Team id of another Unit appear; `member` is refused: `{ places, users, teams }` = grant rows holding it counted to `cap + 1`, DISTINCT user subjects counted to `cap + 1`, and up to 50 Team ids, in one statement per id; index on `reg_scope_grants (role)`), `memberCount(tenant, { cap })` (directory rows, counted to `cap + 1`); `accessContext(scope, { users, chain })`; `boardsIn(scope, { after, limit })`, `scopesOf(subject, { after, limit })`; `accessContexts(scopes, { users })` (the batch of `accessContext`, one statement on Postgres), `rename({ type: "board"\|"space"\|"group", id }, name)`, `updateScope({ type: "space"\|"group", id }, { name?, generalRole? })` (atomic; returns the row), `spacesIn(group, { after, limit })` (§ Spaces and Groups); Teams and access (§ Teams and access): `renameTeam`, `deleteTeam` (atomic, `last-owner`), `teamsPage(tenant, { after, limit, q })`, `teamsAmong(tenant, ids)`, `teamMembersPage(team, { after, limit })`, `scopedGrant(scope, subject)`, `scopedGrantsPage(scope, { after, limit })`, and the member directory `touchMember(tenant, { user, name, email })`, `membersAmong(tenant, users)`, `findMembers(tenant, { q, limit })` (table `reg_members`) |
 
 Single node: SQLite; cluster: Postgres. The room never calls it; gateways and Auth do. On Postgres the server
 runs as a role that doesn't own the schema (§ Store, Least privilege).
@@ -751,28 +1694,60 @@ runs as a role that doesn't own the schema (§ Store, Least privilege).
   **one atomic step** (one transaction, or a conditional delete/update), so two concurrent removals can't both
   pass. The call that would remove the last owner fails and changes nothing. Every durable adapter (phase 3/4)
   must honour this.
-- **`createBoard` takes no creator**, so `POST /boards` is `createBoard` then `setGrant(board, creator, "owner")`:
-  two calls. If the second fails, the endpoint must retry it or report the failure with the board id; it must not
-  report success for a board with no owner.
-- **A crash between the two calls** leaves a board with no owner, and nothing retries it. That board is still
-  safe and usable: roles come from `memberRole`, invites and links as usual, and only a tenant admin could grant
-  `owner` anyway. A tenant admin repairs it with `setGrant(board, user, "owner")` (they manage every board of
-  their tenant). Guaranteed: no ownerless board is reported as created. May happen: an ownerless board until an
-  admin repairs it.
+- **`createBoard` takes the creator as `owner`**, so `POST /boards` is one call: the board, its `owner` grant and (with a key) the idempotency row are one atomic
+  step. There is no state with an ownerless created board. (`setGrant(board, user, "owner")` remains the admin's repair for a board made without `owner`, e.g. by a script.)
+- **Organization** (§ Tenancy, "Organization"). `accessContext({ type: "board"|"space"|"group"|"unit", id }, { users, chain })`
+  is the resolver's one read: the tenant, the scope's board / Space / Group, the grants on each scope of the chain, the
+  Unit's roles, and the members of every Team named in those grants, as one consistent answer (null for an unknown
+  scope). `users` limits the Team members returned to those users (a hello passes its user, a re-check pass its users),
+  so a Team of 100k costs nothing; `chain` hands back the stable records a cache already holds, and the adapter then
+  reads only the volatile rows. Its cost is **one statement on Postgres** (a single snapshot) and a fixed number in a
+  SQLite transaction, however many grants, Teams or members exist, and it never takes a list of boards: the resolver makes
+  no per-row follow-up queries and builds one user→Teams index per pass. Who owns what: the Registry owns every row; the
+  resolver owns no state (a function of what it is handed); `tenancy` owns none beyond `roleCache`'s bounded entries
+  and chains. Adapters validate shape (names, scope and subject types, same tenant) and store role strings as given; whether
+  a role is valid where it is held is `server/auth/permissions.js`'s rule, applied by the admin layer on write and by the
+  resolver on read.
+- **Last owner for Groups and Spaces.** `setScopedGrant` refuses to remove or demote the last *counted* `owner` of a Group
+  or Space, atomically. A user owner always counts; a Team owner counts only while the Team has at least one member (an
+  empty Team guards nothing). `setTeamMember` refuses to remove the last member of a Team that is the only counted owner
+  of a Group or Space. Both are `last-owner`. Postgres lock order, in both calls: the tenant's owners lock (a
+  transaction advisory lock, `plenary-owners:<schema>:<tenant>`, taken by every write that can lower a Group's or Space's
+  counted owners: a Group or Space grant change and a Team member's removal, all rare admin writes) first, then the
+  container's row (Group or Space), then the Team's member rows, never the Team row. The tenant lock is what keeps the count
+  honest when two Teams lose their last members at once. A demotion that counts a Team owner share-locks the Team's member rows
+  before counting; a member's removal locks them all, deletes its own, and, if the Team is now empty, re-reads the
+  containers the Team owns (grants made while it waited are visible) and refuses if any has no counted owner.
+- **Postgres tables** (all created only if missing, like the first seven; nothing is ever altered): `reg_tenant_meta` (kind),
+  `reg_tenant_domains` (a Unit's domains after its first, which stays in `reg_tenants.domain`; a domain is unique across both,
+  serialised by an advisory lock), `reg_groups`, `reg_spaces` (unique `(tenant, owner_user)`: one personal space per member),
+  `reg_board_spaces` (a board's Space; exactly one row per board), `reg_teams`, `reg_team_members`, `reg_scope_grants` (scope, subject,
+  role), `reg_roles` (custom roles and the Unit's `member` override). SQLite has the same tables with the same names.
 - `memberRole` may be `null` (§ Tenancy). Calls keyed by an id alone carry no tenant: the admin API checks it
   (§ Tenancy).
 
 ### Store
 
-The log, checkpoints and each board's epoch (boards live in the Registry).
+The log, checkpoints, each board's epoch and its lease (boards live in the Registry). **The contract is `server/store/port.js`**
+(every method, argument rule, error code, bound and guarantee); `test/server/store-contract.js` runs it against SQLite and
+Postgres. In short:
 
 | Call | Contract |
 |---|---|
-| `append(tenant, board, entries, expectSeq)` | atomic: writes every entry or none, only if the board's last `seq` is `expectSeq`; else throws `conflict` |
-| `read(tenant, board, fromSeq, limit) → entries` | ascending `seq` |
-| `putCheckpoint(tenant, board, cp)`, `getCheckpoint(tenant, board, beforeSeq?) → cp \| null` | the highest `seq` wins, never the last write; `beforeSeq` finds the one before a bad checkpoint |
-| `openEpoch(tenant, board) → epoch` | durable atomic increment of the board's epoch in its lease record (1 on first call); every room build calls it before its first `welcome` (§ Recovery, Room identity). Phase 4's lease acquire does the same increment in the same step |
+| `purgeBoard(tenant, board)` | Deletes the board's log entries, checkpoints (and parts), lease, blob references and pending blob references, and **condemns** every hash that is left with no reference and no live pending one (§ Blobs, "References and purge"), all in ONE transaction: the Trash purge, after the Registry claim. Idempotent (an absent board is a no-op). Blob bytes are not touched. |
+| `append(tenant, board, entries, expectSeq, epoch, { blobRefs }?)` | atomic: writes every entry or none, only if `epoch` is the board's lease epoch (else `fenced`, checked first) and the board's last `seq` is `expectSeq` (else `conflict`); no epoch is `bad-entry`. `blobRefs` (the SHA-1 `fileId`s of the entries' image elements, any number, each 40 lowercase hex, else `bad-entry`; **an append is never refused over their number**: they are written in chunks of 10,000) are recorded as the board's references in the SAME transaction, which also turns each one's pending reference into a real one, ends the hash's unclaimed condemnation, and marks a **claimed** one *revived* |
+| `blobPend(tenant, board, sha1, ttlMs)` | records a **pending** reference (until the Store's clock + `ttlMs`, at most one day) for an upload about to happen; ends an unclaimed condemnation (a claimed one is marked revived); `unavailable` while a reaper's claim on the hash is live (ask again) |
+| `blobCondemned({ graceMs, after?, limit })` | `[{ tenant, sha1 }]` condemned at least `graceMs` ago on the Store's clock and not under a live claim (a lapsed claim is listed again), ascending by `(tenant, sha1)` after the cursor `after`, at most `limit` (1 to 1,000) |
+| `blobClaim(tenant, sha1, { graceMs, claimMs })` | the reaper's conditional claim: true (and the hash is claimed for `claimMs`) only if the hash is condemned for `graceMs`, not under a live claim, and either **still unreferenced with no live pending reference** or claimed before (a reaper died mid-way and must put the bytes back or finish); an unclaimed hash that turns out referenced loses its condemnation; false otherwise |
+| `blobReaped(tenant, sha1, { deleted, restored }?)` | the settle. Without options (the bytes are quarantined): true = nothing references the hash (no revived mark, reference or live pending upload), delete them; false = put them back, and the row is marked revived. **Either way the claimed row stays**, so a delete or a restore that fails (or a node that dies between) is retried by the next claim, whose verdict is the same. With `restored: true` (after the restore) the row is dropped. With `deleted: true` (after the delete) it is dropped; false = a reference arrived since the verdict; a missing row is true |
+| `blobPrune(limit)` | deletes at most `limit` expired pending references; returns the count |
+| `read(tenant, board, fromSeq, limit, maxBytes?) → entries` | ascending `seq`, at most `limit` (capped at 10,000); `maxBytes` stops the page near that much text; the array carries `bytes` |
+| `lastSeq(tenant, board)` | the board's last `seq`, 0 = empty |
+| `putCheckpoint(tenant, board, cp, epoch)`, `getCheckpoint(tenant, board, beforeSeq?) → cp \| null` | the highest `seq` wins, never the last write; fenced like `append`; `beforeSeq` finds the one before a bad checkpoint |
+| `openEpoch(tenant, board) → epoch` | durable atomic increment of the board's epoch in its lease record (1 on first call); every room build calls it before its first `welcome` (§ Recovery, Room identity); it takes the board without a lease |
 | `epoch(tenant, board) → epoch \| 0` | reads it (gateways, for a viewer's `welcome`); 0 = no room was ever built, sent as `room.epoch: 0` |
+| `acquire` / `renew` / `release` / `lease` | the board's lease on the Store's own clock (§ Recovery, host lease); every `acquire` bumps the epoch |
+| `clusterId()` | optional (Postgres): this database's cluster id (§ Bus) |
 
 - **Durable** = resolves only once the write survives a process crash and power loss on its node (SQLite
   `synchronous=FULL`; Postgres commit with `synchronous_commit=on`).
@@ -795,6 +1770,37 @@ The log, checkpoints and each board's epoch (boards live in the Registry).
 
 - Tenant and board ids are server-minted (`[a-z0-9-]`, no `.`, `*`, `>`), never a domain name, so subjects can't
   collide or wildcard across tenants.
+- **Cluster id (isolation on a shared bus).** Two clusters may share one NATS server, so every subject on the wire
+  starts with the cluster id: `<cluster>.<subject>`, e.g. `c-k3j9x0a1b2c3d4e5.plen.<tenant>.<board>.entries` and
+  `c-….plen-hosts.open`. Every subject named below is written without it; the Bus adapters take the id as their
+  `cluster` option (`natsBus`, `memoryBus`; both apply `scopeBus` from server/bus/port.js), which adds it on publish
+  and subscribe and strips it from what handlers see, so no gateway, room host or feed knows about it, and only the
+  adapters build wire subjects. An adapter refuses a malformed id (anything but `c-` + 16 of `[a-z0-9]`) before it
+  connects; the composition root (server/main.js) reads the id from the Store and passes it in. A node never publishes or subscribes outside its own cluster's prefix.
+  - **Where the id comes from: the Store.** The id is `c-` + 16 of `[a-z0-9]`, minted once by the first node that asks
+    and kept in the Postgres Store (table `pl_cluster`, at most one row), so **two nodes on one Postgres database
+    are one cluster by definition and two clusters never share an id**, with nothing for an operator to configure or
+    mistype. `store.clusterId()` returns it (Postgres adapter only; a single node uses the in-memory bus, which no
+    other process can reach, and has no id). The id is durable before it is returned. A node whose Store has no id, returns a
+    malformed one or fails to read it **refuses to start** (fail closed: it never joins the bus unscoped; the adapters
+    it opened are closed and the entry point logs `start refused`).
+  - **Why this isolates.** The lease and the log live in the Store, so a board's sequencer is unique per Store. A
+    host answering a remote open (or reading a board's `.inbox`) from another cluster is what splits the brain: it
+    would lease and ack the board into its own Store, and the gateway's client would hold an ack the board's real
+    Store never saw. With the id in the subject a foreign host cannot see the request, the board's inbox or its
+    heartbeats, so a gateway whose cluster has no host answers `unavailable` rather than being served by a stranger.
+  - **Not a security boundary.** The prefix keeps honest clusters apart; any client that can connect to the NATS
+    server can still subscribe to another cluster's subjects. For real separation give each cluster its own NATS
+    account or user, limited to publish and subscribe on `<id>.>` (and the inbox prefix it uses).
+  - **Finding the id.** It is on the `cluster adapters open` log line (`cluster`) and in
+    `SELECT id FROM pl_cluster`; it is minted at the first node's first start and never changes.
+  - **A restored or cloned database keeps its id.** A copy of a production database (staging, a restore test) that
+    shares a NATS server with the original is, by this rule, the same cluster. Give the copy its own id before it
+    joins a shared bus: with every node of the copy stopped, `DELETE FROM pl_cluster;` (the next start mints a new one).
+  - **Replace a cluster's nodes together.** The id is part of every wire subject, so nodes built before it (unscoped `plen.…`
+    subjects) never exchange a message with nodes that have it. They cannot split-brain either: leases are in the Store, and
+    its conditional, epoch-fenced append stays the last line of defence (§ Store). The schema's table `pl_cluster` is created
+    by `migrate` (`deploy/README.md`).
 - Subjects per board: `plen.<tenant>.<board>.entries` (the room, after an append resolves), `.presence`, `.emotes`
   and `.here` (gateways), `.inbox` (gateway → room, numbered per connection: rule 6), `.gw.<gateway>` (room →
   that one gateway: `welcome`, `ack`, `error`, each addressed to a `conn`), and `.grants` (whoever changes the
@@ -808,19 +1814,71 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   tabs (§ Presence, `here`). Small by construction (≤ 50 entries) whatever the board's size.
 - **At-most-once.** Entries carry `seq`, so a gateway that sees a gap reads the missing range from the Store and
   delivers in order; duplicates are dropped by `seq`. Presence has no repair.
-- **A lost last entry is repaired two ways.** While it runs, the room publishes a `{ seq, epoch }` **heartbeat**
-  (resolved seq, the room's epoch) on `.entries` every 2 s. And a gateway that has heard neither an entry nor a heartbeat for
-  **5 s** on a board it serves reads the Store from its last delivered `seq` + 1, and again every 5 s while the
-  silence lasts. The poll needs no room, so it also works after the room stopped or its host died (viewers never
-  restart a room). Guaranteed: every connected client gets every resolved entry, in order, within about 5 s of
+- **A lost last entry is repaired two ways.** While it runs, the room publishes a `{ seq, epoch, cp }` **heartbeat**
+  (resolved seq, the room's epoch, its latest durable checkpoint: below) on `.entries` every 2 s. And a gateway that has heard neither an entry nor a heartbeat for
+  **5 s** on a board it serves reads the Store from its last delivered `seq` + 1 (checked every 2.5 s, so 5 to 7.5 s
+  after the last live message), and again 5 to 7.5 s later while the silence lasts. The poll needs no room, so it also works after the room stopped or its host died (viewers never
+  restart a room). Guaranteed: every connected client gets every resolved entry, in order, within 7.5 s of
   the bus going quiet. Delivery to clients is effectively at-least-once, eventually consistent.
+- **The heartbeat, exactly.** Publisher: the room host (`server/room-host.js`), one message per board it holds a live
+  room for, on `.entries`, every `heartbeatMs` (2,000 ms) from one timer of the host (all boards beat on the same tick:
+  a burst of N publishes, no jitter). Payload `{ seq, epoch, cp }`: `seq` = the resolved seq (never the speculative
+  one), `epoch` = the room's epoch (the lease's, § Recovery, Room identity), `cp` = newest durable checkpoint (below).
+  Two variants share the shape: `{ seq, epoch, cp, opened: true }` once at room build, before the inbox is served, and
+  `{ seq, epoch, cp, released: true }` after a clean stop, and `{ seq: 0, epoch, cp: 0, released: true }` after it
+  released the lease of a build that failed (a timed-out Store call, § Recovery "Stuck host"). A host whose lease renew
+  deadline has passed, or whose progress watchdog fired (ops waiting, resolved `seq` unmoved for `stuckMs`), publishes
+  nothing and stops the room instead; it keeps no lease and no cooldown-time claim (§ Recovery). Consumers and what each does with it:
+  (1) **gateway feed** (`server/feed.js`): a heartbeat or an entries batch whose `epoch` is at least the feed's (a
+  missing or non-integer `epoch` counts as lower) resets its silence timer; one from a lower epoch (a dead incarnation's,
+  delayed on the bus) does not, so stale traffic cannot hold off the Store poll. A `released` message is a host leaving: it neither resets the silence timer nor raises the feed's epoch (a failed build's release carries the epoch of a room that never served), though its `cp` is still read. It reads the Store when `seq` is above its own
+  (a lost last entry); raises its epoch (never lowers: a late or duplicate beat with a lower `epoch`, `seq` or `cp` changes
+  nothing); records `cp` (max) to decide a re-base. (2) **waiting host** (a host that found another host's live lease,
+  `watchEntries`): a message (heartbeat or entries batch) with an integer `epoch` at least the highest it knows (seeded
+  from the lease it read) counts as "the holder is alive" and re-arms its silence timer (2 x `heartbeatMs`); one with
+  a lower or missing `epoch` is a late one from a dead incarnation and counts for nothing, `released` included. A late
+  message of the **same** epoch is indistinguishable from a live holder's and does count; it delays the takeover by
+  at most 2 beats after the last such message. Hellos held while waiting are never dropped without an answer: a
+  later message from the holder drops only those held longer than 2 beats (a live holder had its chance to answer);
+  younger ones stay, and the silence, a new holder or the `unavailable` answer resolves them. `opened`, or an epoch above
+  the last one heard, answers the held hellos `unavailable`; `released` (current epoch) makes it try the lease at once.
+  **A heartbeat never grants or moves the lease**: it only decides *when* a waiting host asks. The Store's
+  `acquire` is the sole arbiter (live lease: refused; otherwise a new, higher epoch, and the old holder is fenced on its
+  next write or renew). So a missed, late, duplicate or forged heartbeat can cause an early *attempt* (one Store read,
+  refused while the lease is live, then the next try at the lease's remaining time + a margin, at least every ttl/3)
+  and never a wrong takeover. Missing beats: a gateway polls the Store once its silence reaches 5 s, checked every 2.5 s, so a lost
+  last entry is repaired 5 to 7.5 s after the last live message (then again 5 to 7.5 s later while the silence lasts); a waiting host attempts after 2 beats of silence. Cost: 1 message per hosted board per 2 s (30 per
+  minute, 26 bytes each as JSON with small numbers, 780 B per board per minute, payload bytes only (no subject or
+  NATS framing); test/server/heartbeat.test.js counts them on virtual time: 1, 100 and 1,000 boards give exactly 30,
+  3,000 and 30,000 messages a minute. Indicative CPU, publisher side only, in-memory bus (consumers not measured):
+  a whole beat tick about 0.01, 0.14 and 0.35 ms); the beat loop does no Store work. Batching across boards is not done: subjects are per board and a gateway subscribes per board, so a batch
+  would have to be fanned out again on every gateway.
+- **`cp`, the latest durable checkpoint.** The heartbeat's `cp` is the `seq` of the newest checkpoint the room
+  knows is in the Store: the one it was rebuilt from, or a later one whose write the Store has acknowledged (0 =
+  none). A checkpoint is announced only after its write succeeds, never when it is taken, so `cp` never names a
+  checkpoint a reader can't find. A gateway keeps its cached tail short by re-basing it on a newer checkpoint (§
+  Recovery, Rebuild; for a gateway whose host announces no `cp`, once the tail passes 1,000 entries or 4 MB): it reads one from the Store only when the
+  largest `cp` it has heard is above both its base and the `cp` of its last completed look, so a gateway reads each
+  checkpoint at most once, and an idle board, or a room that hasn't folded, costs no reads. A look that fails (a
+  Store error) is not completed and is tried again (on the backoff below). A gateway whose last heartbeat for the
+  board had no `cp` (its host predates `cp`), or that has had none since it began serving the board (the Store poll
+  below delivers), looks when its tail is due, and after a look that finds nothing newer, again on at most 3 later
+  heartbeats or polls, then not until the tail is due again. Mixed versions are safe both ways: an older gateway
+  ignores `cp`. A host that stops cleanly checkpoints, releases the lease and then publishes
+  `{ seq, epoch, cp, released: true }` on `.entries` (so a waiting host takes the board at once): it carries `cp`
+  like a heartbeat, which announces the stop checkpoint. A look that fails (a Store error) is tried again on a
+  jittered backoff of heartbeats: after the n-th failure in a row, with b = min(31, 2^(n-1) - 1), the next k
+  heartbeats or polls are skipped, k drawn from [⌈b/2⌉, b] (so gateways don't look in lockstep). While skipping, no
+  look is made at all, also not one a due tail would trigger (a host without `cp`), so a persistent failure costs at
+  most one look per 17 heartbeats or polls once the backoff is at its cap, plus one per newly announced checkpoint. A heartbeat naming a `cp` above the one
+  the failing look was for ends the skip (a checkpoint was just written: look now). A successful look resets n.
 - A gateway subscribes to the board's subjects **before** it forwards a hello or serves any catch-up, so
   nothing between catch-up and live is missed.
 - Gateway → room messages on `.inbox`: a hello or op as `{ n, conn, gateway, user, name, role, client, msg }`; a
   close notice as `{ n, conn, gateway, closed: true }`; and, every 5 s, `{ gateway, conns: [conn…] }` listing that
   gateway's open writer connections on the board (rule 6). A lost close notice is repaired by the next list; a
   lost reply by rule 2's or rule 12's timeout.
-- **Remote open** (a gateway-only node; no tenant or board in the subject): `plen-hosts.open` carries
+- **Remote open** (a gateway-only node; no tenant or board in the subject, and, like every subject, the cluster id in front of it: only this cluster's hosts hear it): `plen-hosts.open` carries
   `{ tenant, board, gateway, n }` to every room host, which opens the board itself (takes the lease or watches the
   holder) and only then answers `{ n, board, state: "held" | "watching" }` on `plen-hosts.opened.<requester>`. The
   gateway forwards the writer's hello on the first `held`; a `watching` answer starts a grace of
@@ -833,30 +1891,108 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
     sends them straight to the client (rules 3, 8). A room never publishes catch-up frames on `.gw.<gateway>`.
   - **`.inbox`:** one hello or op plus its envelope. An op is ≤ 1 MB (§ Limits), so it always fits. A gateway
     that still can't publish one answers `too-large` with the op's `id`.
-  - **`.entries`:** a group commit's entries are published as one or more messages, each under 2 MB, in `seq`
-    order. A single entry always fits (one op plus its fields). Gateways deliver by `seq`, so a split batch is
+  - **`.entries`:** a group commit's entries are published as one or more messages `{ from, to, items, epoch }`
+    (`epoch` = the room's, as in the heartbeat), each under 2 MB, in `seq` order. A single entry always fits (one op plus its fields). Gateways deliver by `seq`, so a split batch is
     the same as several appends.
   - **`.gw.<gateway>`:** `welcome`, `ack`, `error` only (small).
   - Guaranteed: no message the protocol needs is over the cap. A publish refused anyway (misconfigured bus) is
     repaired like a lost message: Store poll for entries, the client's timeouts for replies.
 - Single node: an in-memory bus with the same contract. Cluster: NATS core.
 
+#### Fan-out cost (#66)
+
+What one live frame costs a gateway for N viewers, measured by `scripts/fanout-bench.js` (default modes in-process: fake viewer sockets, stub Store, the in-memory Bus, no real sockets; `--presence` times only the presence timer's synchronous tick, not `here` or emotes; `--root <checkout>` compares trees; a report, not a gate; run it `nice -n 19 timeout 60`, one process at a time). Findings an agent must keep true:
+
+- **Already encode-once** (before #66): the feed encodes a resolved run of entries once (`frameOf`), the gateway hands the same string to every connection's queue, and presence, `here` and emote frames are encoded once per board. Live frames are never compressed (deflate exists only for catch-up texts, § Joining): a per-connection compression context would cost O(viewers x frame) CPU and memory per frame; the shared catch-up deflate stays the only compression. Per-viewer state stays per viewer: `next` (resume seq, a gap cuts the connection), the queue and its budgets, `blocked` (waits for `drain`), and `presence`/`here` dropping for a reader over half its queue bound.
+- **Where the time went** (10,000 viewers, one 8,000-char entry per frame, stub sockets, before): 2.9 ms wall per frame, of which the per-viewer `Buffer.byteLength` of the same text was ~2 ms (a scan of the whole frame per connection, O(viewers x frame size)); the rest, ~0.1 us per viewer, is queue bookkeeping (`push`, `flush`, `observe`). A 300-char frame: ~1.0 ms, dominated by that bookkeeping.
+- **Change:** a frame sent to many connections is measured once by its sender and passed to `push(ws, data, len)` (`onLive`, the presence batch, `here`, emotes). Results, N = 10,000 viewers, median of three runs per tree, same machine (under load: CPU is noisy, wall is steadier):
+
+  | frame | wall ms/frame before -> after | CPU ms/frame before -> after | CPU us per viewer before -> after |
+  |---|---|---|---|
+  | 8,000-char entry | 2.86 -> 0.75 to 0.82 (about 3.7x) | 3.4 -> 1.3 | 0.34 -> 0.13 (a single-run pair was 0.30 -> 0.14) |
+  | 300-char entry | 0.93 to 1.09 -> 0.74 to 0.80 (about 1.3x) | 1.4 -> 1.4 (no change beyond noise) | 0.14 -> 0.14 |
+
+  "Per viewer" is the gateway's JS cost with a stub socket; it excludes the native send below. Presence tick at 10,000 viewers: about 1.3 ms of synchronous work per 50 ms tick, unchanged. The count must stay UTF-8 bytes (the unit of `getBufferedAmount` and the budgets): `test/server/fanout.test.js` fails if any of the four call sites passes characters or 0 (the one exception is the count-only `here` text, which is ASCII, so characters equal bytes there).
+- **Not in the JS path** (`bun scripts/fanout-bench.js --real-sockets`: at most 100 loopback sockets in one process, Bun 1.4.4; figures vary 2x with machine load, these are two runs): native `ws.send(string)` costs about 3 to 4 us per socket for a 300-char frame, 3.5 to 10 us for 8,000 chars and 12 to 27 us for 100,000 chars. That is 10 to 30 times the gateway's JS cost above, and the real per-viewer floor on one core: more viewers per gateway means more gateways or cores, not more JS tuning. `server.publish(topic, text)` (uWS pub/sub) returned at once for small frames but its end-to-end time (until every client had it) was inconclusive against the send loop under load (7 to 13 us vs 7 to 18 us per socket at 8,000 chars); it would bypass the per-connection queue, budgets and `next` check, so it is not used.
+- Numbers are one machine under load (other agents running); compare with `--root` on the same machine in the same minute.
+
 ### Blobs
 
-- `put(tenant, sha1, bytes)`, `get(tenant, sha1) → bytes | null`.
-- **No token on HTTP.** A client asks over its socket: `{ t: "blob", sha1, put?: true }`; the server checks the role
-  and answers `{ t: "blob", sha1, url }`, a signed URL scoped to (tenant, board, sha1, GET or PUT), valid 5 minutes.
-  Works for `<img>`, browsers and Herdr alike, and keeps the token out of headers and URLs.
-- **`sha1` is exactly 40 lowercase hex characters.** Anything else is answered `bad-op` (an `error` with no `id`)
-  before the server signs anything or calls Blobs, so no adapter ever sees a key like `../other-tenant/x`.
-- **Rates:** `blob` requests 10/s per connection; put URLs 30 per minute per user per board. Over → `error`
-  `limit` with no `id` (nothing is dropped; ask again later).
+- `put(tenant, sha1, bytes) → boolean` (true: stored now; false: the tenant already had it), `get(tenant, sha1) → bytes | null`,
+  `usage(tenant) → bytes` (the total the tenant's blobs take; the quota's starting point),
+  `quarantine(tenant, sha1)` (moves the blob out of reach: `get` answers null, bytes kept and still counted by `usage`, so another node's count taken mid-reap does not miss them), `restore(tenant, sha1)` (puts a quarantined blob back, unless the tenant stored it again meanwhile: then the quarantined copy is dropped) and `delete(tenant, sha1)` (removes the blob and its quarantined copy for good); all three idempotent, an absent blob is not an error, and only the blob reaper calls them. Disk: one rename into `<dir>/.quarantine/<tenant>/<sha1>` and back; S3: copy to the key `.quarantine/<tenant>/<sha1>` then delete the original. An adapter may expose `deadlineMs`, the longest one call takes (S3: its put/get timeout).
+- **No token on HTTP.** A client asks over its socket (on the connection that has been welcomed, never a second one):
+  `{ t: "blob", sha1, put?: true }`; the gateway checks the role and answers `{ t: "blob", sha1, url }`, a signed URL
+  scoped to (tenant, board, sha1, GET or PUT), valid 5 minutes. The tenant and board are the connection's, never the
+  message's. Works for `<img>`, browsers and Herdr alike, and keeps the token out of headers and URLs.
+- **`sha1` is exactly 40 lowercase hex characters, and `put` is `true` or absent.** Anything else is answered
+  `bad-op` before the server signs anything or calls Blobs, so no adapter ever sees a key like `../other-tenant/x`.
+- **Refusals** are an `error` with no `id` and the request's `sha1` (echoed as given when it is a string of at most 64 characters, even a malformed one), so the client matches it
+  to its request; nothing else is dropped for it. `bad-op` (shape), `forbidden` (role), `limit` (rate), `unavailable`
+  (this node has no blob store, signing is down, the pending reference could not be recorded, or the hash is being deleted: ask again later), `auth` (before `welcome`; the connection stays).
+  Checks run in this order: rate, shape, role, put rate.
+- **Rates:** `blob` requests 10/s per connection (every request counts, refused ones too); put URLs 30 per minute per
+  user per board per gateway. Over -> `error` `limit` (ask again later).
+- **The URL is `<PUBLIC_URL>/blobs/<token>`** when `PUBLIC_URL` is set, else the path `/blobs/<token>`, which the client
+  resolves against the origin it connected to (the `ws` URL with `http`). `token = base64url(payload) "." base64url(HMAC-SHA256(key, "b1." payload))`,
+  `payload` the JSON `{ tenant, board, sha1, verb: "GET" | "PUT", user?, exp }` (`exp` in epoch ms). `key` is derived from the
+  deployment's shared `COOKIE_KEY`, so every gateway verifies every other gateway's URLs; a single node without one
+  signs with a random key per process, so a URL does not survive a restart (the client asks again). A bad, forged,
+  tampered or expired token is `401 { "error": "bad-token" }`, a verb other than the token's is `405`. The role is
+  checked when the URL is asked for, not when it is used: a URL is a 5-minute bearer capability.
+- **A cluster must name its storage.** `main.js` refuses a cluster node (`DATABASE_URL`/`NATS_URL`) without `S3_ENDPOINT`:
+  a picture put through one node would be unreadable through another. `PLENARY_BLOBS=local-disk` opts a cluster with a
+  single gateway into disk (the start warns).
 - **A signed PUT URL ends at our server**, never directly at S3: the server must hash and type-check the bytes
   before they are stored.
+- **`PUT /blobs/<token>`** (a put URL): the body is the bytes, with a `Content-Length` (chunked bodies are refused).
+  The server refuses before reading more than 10 MB, hashes the bytes and refuses a mismatch, checks they are a
+  PNG, JPEG, GIF or WebP (SVG refused), then reserves quota and stores. The first bytes for a hash are kept: a put
+  of a stored blob succeeds without storing. `201` stored now, `200` already stored, `400 bad-length` (no or
+  zero length), `413 too-large`, `415 not-image`, `422 hash-mismatch`, `507 quota`, `503 unavailable`
+  (the store failed or took too long; safe to retry), `503 busy` (a node reads at most 8 PUT bodies at once and one account (per tenant, across its boards) at most 2; retry), `409 in-flight` (a second PUT on a token already being read), `408 timeout` (the whole body must arrive within 120 s however slowly it drips; retryable), `401`.
+  The body is read as it arrives (memory follows the bytes sent, not the `Content-Length` claimed). Bodies are JSON `{ "error": code }`.
+- **`GET /blobs/<token>`** (a get URL): `200` with the bytes, `Content-Type` of the sniffed kind, `X-Content-Type-Options:
+  nosniff`, `Cache-Control: no-store`, and a `Content-Security-Policy: default-src 'none'; sandbox`; `404 not-found`
+  (nothing stored under that hash yet: an element's op can arrive before its upload finishes, so a client retries);
+  `503 unavailable`; `401`.
 - Upload needs write on `board` or `notes` (not `records`: commenters can't place images); reading needs any role
-  on the board. The server hashes the bytes and refuses a mismatch; cap **10 MB**; per-tenant quota (§ Limits);
-  images only (PNG, JPEG, GIF, WebP; SVG refused). Put is idempotent: the first bytes for a hash are kept.
+  on the board, a viewer included. Cap **10 MB**.
+- **Quota** (default 10 GB per tenant, `PLENARY_BLOB_QUOTA_BYTES`): a node reads `usage(tenant)` once (its first put
+  for that tenant), then adds what it stores. A put reserves its bytes before storing and gives them back when it
+  fails or the blob was already there, so concurrent puts on one node never go over. Several nodes each count their own
+  puts after the first read: the real overshoot is at most the sum of what the other nodes store before this one
+  restarts (Known limits).
+- **Client rules** (web client, `wsNet`): an upload is `blob` ask then PUT; a download is `blob` ask then GET. Only
+  well-formed ids (40 lowercase hex) are asked for. A failure that can pass (no welcome yet, a dropped connection,
+  `unavailable`, 408, 429, 5xx, a network error, a timeout) is asked again with backoff on a fresh URL, up to 6 tries;
+  a GET `404` the same way (not yet). A `limit` is not a failed try: it backs off (2 s doubling to 30 s, up to 20
+  times) and the user is told once. A PUT answered `503 busy` or `409 in-flight` was reachable, not failed: the client waits
+  the `Retry-After` and sends the same URL again while it is fresh (4 minutes), without a new ask or a counted try, and says
+  "the server is busy" once. At most 2 PUTs (the server's per-account cap) and 4 GETs run at once; a PUT may take up to
+  150 s (the server's body deadline is 120 s). After the tries, a download rests 30 s, doubling each round up to 10 min (asked again by the next `want` after the rest, at once when a
+  document change touching that picture arrives, and after a reconnect), an upload
+  wakes itself after 30 s and tries again, so a picture someone placed always goes up once the server takes it. `quota`,
+  `too-large`, `not-image`, `hash-mismatch`, `forbidden` and `bad-op` are final and shown to the user. Requests wait
+  for `welcome` and are asked again after every reconnect.
 - Bytes never travel in ops. A blob is stored once per tenant, shared by that tenant's boards.
+
+#### References and purge (#92)
+
+Blobs are per-Unit and content-addressed, so a hash may be used by several boards. The Store keeps the index that says which.
+- **References.** `pl_blob_refs (tenant, sha1, board)` (SQLite `blob_refs`; indexed by `(tenant, board)`). The room host reads the image `fileId`s of the entries it appends (`blobRefsOf`, `packages/protocol/envelope.js`: every element with `type: "image"` and a SHA-1 `fileId`, deleted ones too, since an undo brings them back) and hands them to `Store.append`, which writes them in the entries' own transaction: an acknowledged op always has its references, and no number of references ever refuses an append. References are only removed by `purgeBoard`. They **survive Trash**, so a Restore never misses a blob. The log is never pruned and checkpoints are folded from it, so a checkpoint holds no reference the entries do not, and the room host is the only writer of entries.
+- **Pending references.** `pl_blob_pending (tenant, sha1, board, until_at)` (indexed by `(tenant, board)` and by `until_at`). The gateway records one (`blobPend`, 10 minutes, `BLOB_PENDING_MS`) before it signs a PUT URL, so an upload that lands before its op is not condemned. The op's append replaces it; the reaper's `blobPrune` deletes expired ones (looping until a short page or its time budget).
+- **Condemned.** `pl_blob_condemned (tenant, sha1, condemned_at, claimed_until, revived)`. `purgeBoard` condemns each hash that was this board's and now has no reference and no live pending one (a hash shared with another board is kept). A new reference (`append`, `blobPend`) ends an **unclaimed** condemnation. Under a **claim** (live or lapsed) the row is never deleted by a reference: it is marked `revived` and stays, because the reaper may already have moved the bytes.
+- **The reaper** (`server/blob-reaper.js`, a timer on every gateway node, `PLENARY_BLOB_REAP_MS`, default 10 minutes) works on an injected Clock: per sweep it prunes pending references, then reads at most `limit` condemned items per page after a cursor it keeps (a stuck item never holds the head), within a time budget. Per item, in two phases:
+  1. `blobClaim` (condemned for at least the grace, `BLOB_GRACE_MS` = 60 minutes, which must exceed the URL TTL, 5 minutes; not under a live claim; **still unreferenced**, pending included). While the claim is live a PUT-URL ask for the hash is refused (`unavailable`) and a new reference only marks the row revived.
+  2. **Quarantine** (`Blobs.quarantine`): the bytes leave the tenant's reach but are kept.
+  3. **Settle** (`blobReaped`): references are checked again in one transaction. Referenced, revived or pending: the row is marked revived and kept, `Blobs.restore` puts the bytes back, and only then `blobReaped({ restored: true })` drops the row (**a reference landing at any moment before this check never loses the bytes**). Otherwise `Blobs.delete` destroys them and `blobReaped({ deleted: true })` drops the row. The row stays through the restore or the delete, so a call that fails, or a node that dies, is retried by the next claim (a lapsed claim is claimable again even if a reference arrived; the quarantine is a no-op by then and the verdict is the same).
+  A reaper slower than half its `claimMs` (default 2 minutes) after the quarantine does not settle; the Blobs adapter's `deadlineMs` must be below half the claim (checked at start). A claim is a conditional write, so two nodes never run one hash at once; every step is idempotent; a failure is logged and retried by a later sweep, which never throws.
+- **The one window left.** A reference that lands during the final `Blobs.delete` call (after the verdict, before the row is dropped) cannot stop it: `blobReaped({ deleted: true })` answers false, the reaper counts it `raced` and logs an error. The op is kept and the picture is a placeholder until a client that holds its bytes uploads them again, which the client does (next point).
+- **The client puts what it places.** Bytes never travel in ops, so a pasted selection or a library item brings its pictures only in the clipboard or the library. `session.unsavedFiles` (web) offers, to the app's frame loop, every picture that a committed op of this client **places** (a new image element, or one whose `fileId` changed; never a move, resize or restyle of a picture already there) whose bytes the client holds and which this client has not put or fetched within `BLOB_PENDING_MS`; the app puts each (`net.put`). An op sent offline is resent after the reconnect without passing the Editor, so the session remembers the image elements it placed until the room sequences them and offers their pictures again (same age rule) once the op is sequenced; an op the room refuses is never sequenced and its picture is dropped, never offered. The blob client treats a finished upload as no reason to skip a later offer, so a PUT answered `200` ("already had it") never stops a picture being put again 10 minutes later. A picture placed by `addPicture` is uploaded by the app and is not offered twice. A viewer never holds bytes it did not fetch, so a picture whose every holder is gone and whose bytes were reaped stays a placeholder.
+- **Quota.** After a sweep deletes blobs, the reaper's node drops each affected tenant's cached usage (`access.recount`). Every node also reads `usage(tenant)` again when its cached count is older than the reap interval (`usageTtlMs`; a usage read **sets** the count to what it saw plus every byte put while it was in flight, and a superseded read is ignored, so the count may briefly over-state but never under-states), so another node's deletes show up within one interval. Between reads a node errs towards refusing. `usage` counts quarantined bytes too (they may come back), so a read taken mid-reap never misses them; the reaper tells the quota hook once per tenant per sweep, not once per hash.
+- **No back-compat.** A store from before this version is refused at start-up (`old-format`: any of the adapter's tables present with other columns, or only some of them present); reset it (delete the SQLite file, drop the Postgres schema). Only an empty file or schema is created.
+- **Never referenced, never deleted.** An upload whose op never came (pending expired, no reference) is not condemned; only the quota bounds it.
 
 ## Known limits of v1.1
 
@@ -867,20 +2003,35 @@ re-check without one). `.grants` is at-most-once like all bus traffic: a lost on
   a pane that still holds the file's old copy can write it back. A copy at 1,001 or just above (within 1,000 of
   the room's version) is accepted and undoes later edits to it without a word; anything higher is held back with
   a warning. drawh warns at import time.
-- Within a tenant, a guest with a role on one board can read another board's blob if they know its SHA-1.
+- **Blobs are tenant-wide, by decision.** Within a tenant, anyone with a role on one board can read another board's blob
+  if they know its SHA-1. Hashes are not guessable, and a `200` against a `404` only tells you whether the tenant holds
+  an image whose bytes you already have. Per-board blobs would cost storage and cross-board dedupe; not done.
+- **`/blobs/*` sends no CORS headers**, so the page must be same-origin with it: `PUBLIC_URL` must be the origin the
+  page is served from (unset, the URL is a path and always is).
 - **SHA-1 keys, first put wins:** a tenant writer able to make a chosen-prefix collision could plant bytes another
   user's image later resolves to. Small in practice; the fix (key by SHA-256, keep `fileId` as a lookup) is open.
-- Blobs are never garbage-collected; only the quota bounds them.
+- A picture reaped while an element still names it (a stale paste whose holders are gone, or a reference landing during the final delete call) is a placeholder until a client that holds its bytes uploads it again (§ Blobs, "References and purge").
+- Blobs are deleted only when their last board is purged from Trash (§ Blobs, "References and purge"); an upload that was never referenced stays, bounded by the quota.
 - Tombstones are never compacted; the stream caps count them.
 - **The log grows forever in M2** (never pruned).
 - **Durability is per Store node** (§ Store): losing that node's disk, or failing over to a replica that lags,
   can lose acked entries. Replicated durability is M7.
 - **Big boards join slowly:** the caps allow a snapshot over 100 MB, which doesn't fit 100k joins in 2 minutes.
-  Unmeasured; M4's load test sets the real cap.
+  Compressed catch-up (§ Joining) takes a varied 2,000-element board from 1.1 to 2.2 MB down to 0.15 to 0.6 MB (4× to 7×;
+  near-identical shapes reach 30×), but a board near the caps is still tens of MB after it. M4's load test sets the
+  real cap.
+- **A big checkpoint's write is in parts** (§ Recovery, "Checkpoint parts"; `scripts/fold-bench.js` prints `sqlitePutMaxStallMs`
+  and, with `DATABASE_URL`, `pgPutMaxStallMs`). What still holds the loop in one call: one part's insert (about 3 to 15 ms at 1 MiB,
+  fsync-bound, plus a WAL checkpoint every few parts), `JSON.parse` of a whole checkpoint when a room rebuilds or a gateway feeds one,
+  and `Buffer.from(text)` before the catch-up deflate (about 10 to 20 ms per 18 MB text, once per text). The independent review measured about 20 ms worst case at 50 MB and judged it acceptable: it is fsync-bound (plus the WAL's automatic checkpoint), so smaller parts do not help.
+- **Compressed catch-up is for clients that can inflate.** A runtime with no zlib (Herdr's QuickJS) joins as before:
+  plain text, the full size.
 - **The op rate is per gateway:** a user connected through G gateways can write up to G × 8 connections × 20
   ops/s. The connection cap (8 per user per board) is per gateway too.
 - **Blob quota:** any writer, guests included, can fill the tenant's quota at the put rate (300 MB a minute).
-  Per-user quotas are M6.
+  Per-user quotas are M6. The count is per node after its first read of `usage` (§ Blobs): with N nodes a tenant can
+  overshoot by what the other N-1 store until a node restarts. A tab closed before its upload finishes leaves an
+  element whose bytes only that tab ever had (the placeholder, for everyone else).
 - **Checkpoint bodies aren't checksummed** by the protocol (the pure package has no hash in every runtime); a
   damaged body is the Store adapter's to detect. The whole log is kept, so a rebuild from 0 always works.
 - **Author names on comments are the name at write time** and stay in the log.
@@ -917,10 +2068,10 @@ pacer take an **injected clock** (`tick(now)` or a `now` argument).
 | `presence.js` (new) | `presenceProblem`, rate limiter and coalescer (pure, clock injected); unit-tested in phase 2, relayed by gateways in phase 3 (the room never sees presence). Ships the emote set `EMOTES` = 👍 ❤️ 😂 🎉 👏 😮 🙏 🔥 |
 | `records.js` (new) | the `records` state (`Records`): threads, comments, reactions, tombstones; `check` against the speculative state before logging, `apply` on live entries and replay alike (no-ops for dead targets), snapshot shape `toJSON()`; pure, shared by the room and the replica |
 
-The v1.1 changes (§ What changed in v1.1) land after phase 2, as their own code job; its file-by-file list is in
-docs/m2/reports/p1-v11.md.
+The v1.1 changes (§ What changed in v1.1) land after phase 2, as their own code job; its file-by-file list is in the
+commit that landed it.
 
-Tests (PLAN.md phase 2 done-when, plus what this spec adds):
+Tests (phase 2 done-when, plus what this spec adds):
 
 | Test | Proves |
 |---|---|
@@ -967,7 +2118,7 @@ Tests that change:
   connection.
 - `convergence.test.js` calls `compact()`: becomes `checkpoint()`.
 
-## Open questions for the CEO
+## Open questions
 
 1. **Durable reactions by viewers?** v1 says no: viewers send emotes (live, summed, not saved); comments and
    reactions need commenter or above, keeping 100k viewers off the sequencer. Yes would need a per-board cap.

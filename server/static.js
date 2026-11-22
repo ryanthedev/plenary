@@ -42,7 +42,7 @@ export const DEFAULT_MOUNTS = Object.freeze([
   { url: "/packages/protocol/", dir: join(REPO, "packages", "protocol") },
 ]);
 
-export const CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; " +
+export const CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; " +
   "connect-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
 
 export const MIME = Object.freeze({
@@ -244,7 +244,7 @@ export function staticSite({ mounts = DEFAULT_MOUNTS, log = { info() {}, warn() 
     if (req.method !== "GET" && req.method !== "HEAD") return null;
     const path = url.pathname;
     if (!safePath(path)) return null;
-    let key = path === "/" ? "/index.html" : path;
+    let key = path === "/" ? "/index.html" : path === "/favicon.ico" ? "/favicon.svg" : path;
     let immutable = false;
     if (path.startsWith("/v/")) {
       if (!path.startsWith(versionPrefix)) return null;

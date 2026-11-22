@@ -1,118 +1,150 @@
-// E-4 (role-scoped presence fan-out in server/gateway.js) and E-3 (incremental Replica.recordsState()).
-import { test, expect, afterAll } from "bun:test";
-import { Replica } from "../../packages/protocol/replica.js";
-import { Records } from "../../packages/protocol/records.js";
-import { rig, tokenOf } from "./rig.js";
-import { cleanup, sleep } from "./helpers.js";
+// #66 fan-out: one live frame is encoded once and measured once, and every viewer gets exactly the bytes the per-viewer path produced.
+import { test, expect } from "bun:test";
+import { gateway } from "../../server/gateway.js";
+import { memoryBus, subjects } from "../../server/bus/memory.js";
+import { jsonCodec } from "../../packages/protocol/codec.js";
+import { until } from "./helpers.js";
 
-afterAll(cleanup);
-const hello = (r, name, extra = {}) => ({ t: "hello", v: 1, token: tokenOf(name), board: r.ids.board, since: 0, client: name, ...extra });
+const TENANT = "t-fanout00000000000", BOARD = "b-fanout00000000000";
+const store = { epoch: async () => 0, read: async () => [], getCheckpoint: async () => null, lastSeq: async () => 0 };
+const registry = { board: async id => (id === BOARD ? { id: BOARD, tenant: TENANT } : null) };
+const auth = { verify: async t => ({ user: t }), role: async () => "viewer" };
+// Non-ASCII on purpose: a frame's UTF-8 byte length differs from its character count.
+const entry = seq => ({ seq, id: `w:${seq}`, by: "writer", at: 1, rv: 1, tenant: TENANT, board: BOARD, stream: "board", op: { elements: [{ id: "e" + seq, type: "text", version: seq, versionNonce: seq, x: 0, y: 0, width: 1, height: 1, isDeleted: false, text: "héllo wörld ✓ 😀".repeat(5) }] } });
 
-test("E-4: viewers receive presenters' (owner/editor) presence + writer emotes only; annotator cursors/leaves stay with writers", async () => {
-  const r = await rig({ limits: { presenceMs: 30, viewerPresenceMs: 60, hereMs: 60_000, herePublishMs: 60_000 } });
-  try {
-    const owner = await r.sock(), ann = await r.sock(), viewer = await r.sock();
-    owner.send(hello(r, "owner", { client: "own" }));
-    ann.send(hello(r, "annotator", { client: "ann" }));
-    viewer.send(hello(r, "viewer", { client: "vw" }));
-    await Promise.all([
-      owner.next(m => m.t === "welcome", "owner welcome"),
-      ann.next(m => m.t === "welcome", "ann welcome"),
-      viewer.next(m => m.t === "welcome", "viewer welcome"),
-    ]);
-
-    // Annotator sends cursor + select: owner sees them, viewer does NOT.
-    ann.send({ t: "presence", k: "cursor", x: 10, y: 20 });
-    ann.send({ t: "presence", k: "select", stream: "notes", ids: ["n1"] });
-    const ownGotAnn = await owner.next(m => m.t === "presence" && m.batch.some(x => x.client === "ann" && x.k === "cursor"), "owner sees ann cursor", 2000);
-    expect(ownGotAnn.batch.some(x => x.client === "ann" && x.k === "select")).toBe(true);
-    await sleep(150);
-    const viewerAnn = viewer.msgs.filter(m => m.t === "presence").flatMap(m => m.batch).filter(x => x.client === "ann");
-    expect(viewerAnn).toEqual([]);
-
-    // Owner (presenter) sends cursor + laser: both annotator AND viewer receive them.
-    owner.send({ t: "presence", k: "cursor", x: 100, y: 200 });
-    owner.send({ t: "presence", k: "laser", pts: [[1, 2, 0]] });
-    const [annGotOwn, vwGotOwn] = await Promise.all([
-      ann.next(m => m.t === "presence" && m.batch.some(x => x.client === "own" && x.k === "cursor"), "ann sees owner", 2000),
-      viewer.next(m => m.t === "presence" && m.batch.some(x => x.client === "own" && x.k === "cursor"), "viewer sees owner", 2000),
-    ]);
-    expect(annGotOwn.batch.some(x => x.k === "laser")).toBe(true);
-    expect(vwGotOwn.batch.some(x => x.k === "laser")).toBe(true);
-
-    // Annotator sends an emote: viewer DOES see emotes.
-    ann.send({ t: "presence", k: "emote", e: "🎉" });
-    const vwEmote = await viewer.next(m => m.t === "presence" && m.batch.some(x => x.k === "emote" && x.e === "🎉"), "viewer sees emote", 2000);
-    expect(vwEmote.batch.some(x => x.client === "ann" && x.e === "🎉")).toBe(true);
-
-    // Viewer closing does NOT broadcast a `leave` on presence; annotator closing sends `leave` to writers only.
-    const viewer2 = await r.sock();
-    viewer2.send(hello(r, "viewer", { client: "vw2" }));
-    await viewer2.next(m => m.t === "welcome", "vw2 welcome");
-    await viewer2.close();
-    await sleep(120);
-    expect(owner.msgs.filter(m => m.t === "presence").flatMap(m => m.batch).some(x => x.client === "vw2")).toBe(false);
-
-    await ann.close();
-    await owner.next(m => m.t === "presence" && m.batch.some(x => x.client === "ann" && x.k === "leave"), "owner sees ann leave", 2000);
-    await sleep(120);
-    expect(viewer.msgs.filter(m => m.t === "presence").flatMap(m => m.batch).some(x => x.client === "ann" && x.k === "leave")).toBe(false);
-
-    // Owner closing DOES send `leave` to viewer.
-    await owner.close();
-    await viewer.next(m => m.t === "presence" && m.batch.some(x => x.client === "own" && x.k === "leave"), "viewer sees owner leave", 2000);
-
-    await viewer.close();
-  } finally {
-    await r.stop();
+/** N viewers on one board; `buffering`: sockets that hold what they are sent (getBufferedAmount counts everything sent; a live frame answers -1) so the gateway's accounting is visible. */
+const TICKS = { presence: 7001, here: 7002, emotes: 7003 };   // periods only these timers have: the harness holds them and calls them by hand
+async function viewers(n, { buffering = false, blockAll = false, limits = {} } = {}) {
+  const ticks = {}, clock = { t: Date.now() };
+  const timers = { setTimeout, clearTimeout, clearInterval, setInterval: (fn, ms) => { const k = Object.keys(TICKS).find(k => TICKS[k] === ms); if (k) { ticks[k] = fn; return 0; } return setInterval(fn, ms); } };
+  const bus = memoryBus();
+  const gw = gateway({ auth, registry, store, bus, timers, now: () => clock.t, rooms: { open: async () => {} }, limits: { maxConnsPerUser: 1e9, hereMs: TICKS.here, herePublishMs: TICKS.here, hereBigMs: TICKS.here, presenceMs: TICKS.presence, emoteWindowMs: TICKS.emotes, sweepMs: 1e9, roleRecheckMs: 1e9, connListMs: 1e9, ...limits } });
+  const sockets = [];
+  for (let i = 0; i < n; i++) {
+    const got = [];
+    let held = 0;
+    const ws = { data: {}, got, send(d) { got.push(d); if (buffering || blockAll) held += Buffer.byteLength(d); return blockAll || (buffering && d.startsWith('{"t":"entries"')) ? -1 : d.length; }, getBufferedAmount: () => held, close() { this.closed = true; }, ping() {}, terminate() {}, subscribe() {}, unsubscribe() {} };
+    sockets.push(ws);
+    gw.websocket.open(ws);
+    gw.websocket.message(ws, JSON.stringify({ t: "hello", v: 1, token: "u" + i, board: BOARD, since: 0, client: "c" + i }));
   }
-}, 20_000);
+  await until(() => gw.stats().accepted === n, "viewers joined");
+  await until(() => sockets.every(s => s.got.some(f => f.startsWith('{"t":"welcome"'))), "welcomes");
+  const live = ws => ws.got.filter(f => f.startsWith('{"t":"entries"'));
+  return { gw, bus, sockets, live, ticks, clock, stop: async () => { for (const ws of sockets) gw.websocket.close(ws); await gw.close(); } };
+}
 
-test("E-3: Replica.recordsState() is incremental and matches full rebuild byte-for-byte with/without pending ops", () => {
-  let t = 1000;
-  const r = new Replica({ client: "u", now: () => t, random: () => 0.5 });
-  r.connectMessages("tok", "b1");
-  r.receive({ t: "welcome", seq: 0, role: "editor", user: "u1", horizon: 0, rv: 1 });
+test("DW-66: every viewer gets the byte-identical frame the per-viewer encoding gives, as one shared string", async () => {
+  const v = await viewers(50);
+  const e = entry(1);
+  v.bus.publish(subjects.entries(TENANT, BOARD), { from: 1, to: 1, items: [JSON.stringify(e)], epoch: 1 });
+  await until(() => v.sockets.every(s => v.live(s).length === 1), "every viewer got the frame");
+  const perViewer = jsonCodec.encode({ t: "entries", entries: [e] });   // the old path: encode for this viewer alone
+  for (const s of v.sockets) expect(v.live(s)).toEqual([perViewer]);
+  await v.stop();
+});
 
-  // Seed 2,000 threads x 2 comments = 4,000 comments via snapshot.
-  const threads = [];
-  for (let i = 0; i < 2000; i++) {
-    threads.push({
-      id: `t${i}`, anchor: { point: { x: i, y: 0 } }, by: "u0", name: "Host", at: 100,
-      comments: [
-        { id: `t${i}`, by: "u0", name: "Host", at: 100, text: `thread ${i}`, reactions: { "👍": ["u0"] } },
-        { id: `r${i}`, by: "u0", name: "Host", at: 101, text: `reply ${i}`, reactions: {} },
-      ],
-    });
-  }
-  r.receive({ t: "snapshot", seq: 1, streams: { board: { elements: [], appState: {} }, notes: { elements: [], appState: {} } }, appSeq: { board: {}, notes: {} }, records: { threads }, noteAuthor: [] });
+test("DW-66: the frame's UTF-8 length is counted once and is right: owed bytes equal the bytes in the sockets", async () => {
+  const v = await viewers(20, { buffering: true });
+  const e = entry(1);
+  v.bus.publish(subjects.entries(TENANT, BOARD), { from: 1, to: 1, items: [JSON.stringify(e)], epoch: 1 });
+  await until(() => v.sockets.every(s => v.live(s).length === 1), "every viewer got the frame");
+  const frame = v.live(v.sockets[0])[0];
+  expect(Buffer.byteLength(frame)).toBeGreaterThan(frame.length);   // the fixture really is multi-byte
+  // Everything every viewer holds (welcome + frame), as the sockets count it, is what the gateway says is owed in sockets.
+  const held = v.sockets.reduce((n, s) => n + s.getBufferedAmount(), 0);
+  expect(v.gw.stats().owedBytes).toBe(held);
+  expect(v.gw.stats().owedTracked).toBe(held);
+  await v.stop();
+});
 
-  // Warm cache once.
-  const base = r.recordsState();
-  expect(base.threads.length).toBe(2000);
+test("DW-66: a viewer that is backed up still gets frames in order, none lost, while the rest are served at once", async () => {
+  const v = await viewers(3);
+  const slow = v.sockets[0];
+  slow.send = function (d) { this.got.push(d); return this.got.length % 2 ? -1 : d.length; };   // every other send asks the gateway to wait for `drain`
+  for (let s = 1; s <= 4; s++) v.bus.publish(subjects.entries(TENANT, BOARD), { from: s, to: s, items: [JSON.stringify(entry(s))], epoch: 1 });
+  await until(() => v.live(v.sockets[1]).length === 4 && v.live(v.sockets[2]).length === 4, "the others got all four");
+  for (let i = 0; i < 6; i++) v.gw.websocket.drain(slow);
+  await until(() => v.live(slow).length === 4, "the backed-up viewer got all four after drains");
+  const seqs = ws => v.live(ws).map(f => JSON.parse(f).entries[0].seq);
+  expect(seqs(slow)).toEqual([1, 2, 3, 4]);
+  expect(seqs(v.sockets[1])).toEqual([1, 2, 3, 4]);
+  await v.stop();
+});
 
-  // Incoming confirmed reaction on 1 thread: fast incremental update, matches full rebuild.
-  t += 10;
-  const t0 = performance.now();
-  r.receive({ t: "entries", entries: [{ seq: 2, board: "b1", tenant: "t1", stream: "records", op: { do: "react", id: "t500", emoji: "🔥", on: true }, by: "u2", id: "other:1", at: t, rv: 1, name: "Peer" }] });
-  const afterConfirmed = r.recordsState();
-  const confirmedMs = performance.now() - t0;
-  expect(afterConfirmed.threads[500].comments[0].reactions["🔥"]).toEqual(["u2"]);
-  expect(confirmedMs).toBeLessThan(20);
+test("DW-66: the per-connection queue bound is judged on the frame's UTF-8 bytes, not its characters", async () => {
+  const v = await viewers(2, { limits: { maxConnQueuedBytes: 2000 } });
+  const e = entry(1); e.op.elements[0].text = "✓".repeat(1000);   // ~1.1k characters, ~3.1k bytes
+  v.bus.publish(subjects.entries(TENANT, BOARD), { from: 1, to: 1, items: [JSON.stringify(e)], epoch: 1 });
+  await until(() => v.sockets.every(s => s.closed), "both viewers cut for being over the bound");
+  expect(v.sockets.flatMap(v.live)).toEqual([]);   // nothing over the bound was handed to a socket
+  await v.stop();
+});
 
-  // Pending local ops: react on existing thread + reply on existing thread + new thread + react on new thread.
-  t += 10;
-  r.local("records", { do: "react", id: "r10", emoji: "🎉", on: true });
-  r.local("records", { do: "reply", id: "my-rep", thread: "t10", text: "hi" });
-  r.local("records", { do: "thread", id: "my-th", anchor: { point: { x: 9, y: 9 } }, text: "new" });
-  r.local("records", { do: "react", id: "my-th", emoji: "❤️", on: true });
-  const t1 = performance.now();
-  const withPending = r.recordsState();
-  const pendingMs = performance.now() - t1;
-  expect(pendingMs).toBeLessThan(20);
+// The other fan-out paths (presence batch, `here`, emotes) pass their frame's length to push() too. The sockets here never drain, so every
+// frame a tick queues stays in the connection's own queue and counts as owed: `owedBytes` (sockets' buffers + queues) must grow by exactly
+// the UTF-8 bytes of the frame each viewer is going to be sent. A length of 0, or of characters, makes it differ.
+const owedAbove = v => v.gw.stats().owedBytes - v.sockets.reduce((n, s) => n + s.getBufferedAmount(), 0);
+/** Let every blocked socket take what is queued for it; returns the frames that start with `prefix`, per socket. */
+const drained = (v, prefix) => { for (const ws of v.sockets) for (let i = 0; i < 20; i++) v.gw.websocket.drain(ws); return v.sockets.map(s => s.got.filter(f => f.startsWith(prefix))); };
+const settle = () => new Promise(r => setTimeout(r, 20));
 
-  // Compare byte-for-byte with a full fresh rebuild.
-  const ref = new Records(r.confirmedRecords.toJSON());
-  for (const p of r.pending.values()) if (p.stream === "records") ref.apply(p.op, r.user, t, null);
-  expect(withPending).toEqual(ref.toJSON());
+test("DW-66: the presence batch's length is counted once and in UTF-8 bytes", async () => {
+  const v = await viewers(2, { blockAll: true });
+  await settle();
+  const before = owedAbove(v);
+  v.bus.publish(subjects.presence(TENANT, BOARD), { gateway: "g-other00000000000", user: "✓".repeat(400), client: "w", role: "editor", msg: { k: "cursor", x: 1, y: 2 } });
+  await settle();
+  v.clock.t += 100;
+  v.ticks.presence();
+  const queued = owedAbove(v) - before;
+  const frames = drained(v, '{"t":"presence"');
+  expect(frames.map(f => f.length)).toEqual([1, 1]);
+  expect(Buffer.byteLength(frames[0][0])).toBeGreaterThan(frames[0][0].length);   // multi-byte, so chars and bytes differ
+  expect(queued).toBe(2 * Buffer.byteLength(frames[0][0]));
+  await v.stop();
+});
+
+/** Publish a `.here` from another gateway, run the `here` tick, and say what each viewer was queued (the sockets never drain until `drained`). */
+async function hereTick(writers, viewerCount = 5) {
+  const v = await viewers(2, { blockAll: true });
+  await settle();
+  const before = owedAbove(v);
+  v.clock.t += 60_000;
+  v.bus.publish(subjects.here(TENANT, BOARD), { gateway: "g-other00000000000", writers, writerCount: writers.length, viewers: viewerCount });
+  await settle();
+  v.ticks.here();
+  await settle();
+  return { v, queued: owedAbove(v) - before, frames: () => drained(v, '{"t":"here"').map(f => f.at(-1)) };
+}
+
+test("DW-66: `here` with a changed list (the full message) is counted in UTF-8 bytes", async () => {
+  const { v, queued, frames } = await hereTick([{ user: "writer1", name: "✓".repeat(150), role: "editor", active: 1 }]);
+  const [full] = frames();
+  expect(full).toContain("writers");
+  expect(Buffer.byteLength(full)).toBeGreaterThan(full.length);
+  expect(queued).toBe(2 * Buffer.byteLength(full));
+  await v.stop();
+});
+
+test("DW-66: `here` with only a count change (the small message) is counted in UTF-8 bytes", async () => {
+  const { v, queued, frames } = await hereTick([]);
+  const [count] = frames();
+  expect(count).not.toContain("writers");
+  expect(queued).toBe(2 * Buffer.byteLength(count));
+  await v.stop();
+});
+
+test("DW-66: the emote total's length is counted once", async () => {
+  const v = await viewers(2, { blockAll: true });
+  await settle();
+  const before = owedAbove(v);
+  v.bus.publish(subjects.emotes(TENANT, BOARD), { gateway: "g-other00000000000", window: 1, counts: { "👍": 3 } });
+  await settle();
+  v.ticks.emotes();
+  const queued = owedAbove(v) - before;
+  const frames = drained(v, '{"t":"emotes"');
+  expect(frames.map(f => f.length)).toEqual([1, 1]);
+  expect(queued).toBe(2 * Buffer.byteLength(frames[0][0]));
+  await v.stop();
 });

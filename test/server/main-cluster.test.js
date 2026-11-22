@@ -1,14 +1,16 @@
 // `bun server/main.js` as a cluster (p4-wire): three child processes on one Postgres and one NATS, roles gateway,
 // gateway, host, each with its own PLENARY_DATA_DIR (so no shared local state hides a gap), serve one board end to
-// end; then the host is killed -9 and a second host started: acked ops survive, writers are welcomed again within
-// ttl + 3 s. Skips without DATABASE_URL and NATS_URL. A fresh database per run (main.js has no schema setting).
+// end; then the host is killed -9 and a second host started: acked ops survive, the dead host's lease has at most the
+// configured ttl left (so writers wait at most that), and writers are welcomed again (backstop ttl + 30 s). Skips without DATABASE_URL and NATS_URL. A fresh database per run (main.js has no schema setting).
 import { test, expect, afterAll, describe } from "bun:test";
 import { SQL } from "bun";
-import { tempDir, cleanup, until } from "./helpers.js";
+import { tempDir, cleanup, until, spawnTracked } from "./helpers.js";
 import { sock } from "./rig.js";
 import { postgresStore } from "../../server/store/postgres.js";
 
 afterAll(cleanup);
+// The rig's S3 (the cluster's picture storage): a cluster node refuses to start without it. Many nodes share it, which the single-gateway local-disk opt-in could not serve.
+const S3_ENV = () => Object.fromEntries(["S3_ENDPOINT", "S3_BUCKET", "S3_REGION", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"].filter(k => process.env[k]).map(k => [k, process.env[k]]));
 const MAIN = new URL("../../server/main.js", import.meta.url).pathname;
 const PG = process.env.DATABASE_URL, NATS = process.env.NATS_URL;
 const TTL = 3_000;
@@ -16,7 +18,7 @@ const TOKEN = "S3CR3T-cluster-token";
 const TOKENS = JSON.stringify({ [TOKEN]: { name: "ann", role: "owner", domain: "cluster.test", email: "ann@cluster.test", admin: true } });
 
 function spawn(env) {
-  const child = Bun.spawn([process.execPath, MAIN], { cwd: tempDir("plenary-cluster-cwd-"), env: { PATH: process.env.PATH, HOME: process.env.HOME, PORT: "0", ...env }, stdout: "pipe", stderr: "pipe" });
+  const child = spawnTracked([process.execPath, MAIN], { cwd: tempDir("plenary-cluster-cwd-"), env: { PATH: process.env.PATH, HOME: process.env.HOME, PORT: "0", ...env }, stdout: "pipe", stderr: "pipe" });
   const out = { text: "", err: "" };
   const pump = async (stream, key) => { const dec = new TextDecoder(); for await (const chunk of stream) out[key] += dec.decode(chunk, { stream: true }); };
   pump(child.stdout, "text"); pump(child.stderr, "err");
@@ -28,13 +30,16 @@ function spawn(env) {
 describe.skipIf(!PG || !NATS)("cluster: three main.js processes on Postgres + NATS", () => {
   let dbUrl, dbName, admin;
   const procs = [];
+  // Teardown does real process and database work (kill the children, then a forced DROP DATABASE that Postgres must finish
+  // under whatever load the machine has: 30 ms to 0.8 s measured on a busy one), so it gets an explicit budget rather than
+  // the 5 s default. The children are signalled together, then awaited together, so their exits overlap.
   afterAll(async () => {
-    for (const p of procs) { try { p.child.kill("SIGKILL"); await p.child.exited; } catch { /* gone */ } }
+    await Promise.all(procs.map(async p => { try { p.child.kill("SIGKILL"); await p.child.exited; } catch { /* gone */ } }));
     if (admin) { await admin.unsafe(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`).catch(() => {}); await admin.close(); }
-  });
+  }, 60_000);
 
   async function node(id, roles) {
-    const p = spawn({ DATABASE_URL: dbUrl, NATS_URL: NATS, COOKIE_KEY: "c".repeat(40), PLENARY_DEV_TOKENS: TOKENS, LOG_LEVEL: "info",
+    const p = spawn({ DATABASE_URL: dbUrl, NATS_URL: NATS, COOKIE_KEY: "c".repeat(40), ...S3_ENV(), PLENARY_DEV_TOKENS: TOKENS, LOG_LEVEL: "info",
       PLENARY_NODE_ID: id, PLENARY_ROLES: roles, PLENARY_LEASE_TTL_MS: String(TTL), PLENARY_DATA_DIR: tempDir(`plenary-cluster-${id}-`) });
     procs.push(p);
     const { port } = await p.line("server listening");
@@ -42,7 +47,7 @@ describe.skipIf(!PG || !NATS)("cluster: three main.js processes on Postgres + NA
     return { p, id, port, url: `http://127.0.0.1:${port}`, ws: `ws://127.0.0.1:${port}/ws` };
   }
 
-  test("gateway / gateway / host serve one board end to end; kill -9 the host, start another: acked ops survive, writers welcomed within ttl + 3 s", async () => {
+  test("gateway / gateway / host serve one board end to end; kill -9 the host, start another: acked ops survive, the dead host's lease ends within its ttl, writers are welcomed again", async () => {
     admin = new SQL({ url: PG, max: 1 });
     dbName = `plen_wire_${process.pid}_${Date.now().toString(36)}`;
     await admin.unsafe(`CREATE DATABASE "${dbName}"`);
@@ -93,8 +98,12 @@ describe.skipIf(!PG || !NATS)("cluster: three main.js processes on Postgres + NA
     for (let k = 31; k <= 40; k++) a.send(op("a", k));
     h1.p.child.kill("SIGKILL"); await h1.p.child.exited;
     const killedAt = Date.now();
+    // Its last renew set expiresAt = then + its ttl (the database's clock): at most PLENARY_LEASE_TTL_MS remains, where a
+    // host on the 10 s default would leave more. Time only shrinks it: no flake.
+    const pg = await postgresStore({ url: dbUrl, max: 1 });
+    try { expect((await pg.lease(board.tenant, board.id)).remainingMs).toBeLessThanOrEqual(TTL); } finally { await pg.close(); }
     const h2 = await node("host-2", "host");
-    const end = killedAt + TTL + 3_000;
+    const end = killedAt + TTL + 30_000;
     const a2 = await welcomed(g1, "a", end), b2 = await welcomed(g2, "b", end);
     expect(Date.now()).toBeLessThanOrEqual(end);
     record(a);
@@ -117,5 +126,5 @@ describe.skipIf(!PG || !NATS)("cluster: three main.js processes on Postgres + NA
     expect(log.length).toBe(71);
     for (const [id, seq] of acked) expect([id, seqOf.get(id)]).toEqual([id, seq]);
     for (const p of [g1.p, g2.p, h2.p]) { expect(p.out.err).toBe(""); expect(p.out.text).not.toContain("S3CR3T"); expect(p.out.text).not.toContain(dbUrl); }
-  }, 60000);
+  }, 120000);
 });

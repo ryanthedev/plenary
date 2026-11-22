@@ -5,7 +5,8 @@
 //                                               "conflict"; an `epoch` not the lease's throws "fenced"; none: "bad-entry"
 //   read(tenant, board, fromSeq, limit, maxBytes?)   entries with seq >= fromSeq, ascending, at most `limit`
 //   lastSeq(tenant, board)                      the board's last seq (0 = empty)
-//   putCheckpoint(tenant, board, cp, epoch)     kept by cp.seq; the newest few per board are kept; fenced like append
+//   putCheckpoint(tenant, board, cp, epoch)     kept by cp.seq; the newest few per board are kept; fenced like append.
+//                                               A big one is stored as parts, each committed and fenced apart (§ Recovery, "Checkpoint parts")
 //   getCheckpoint(tenant, board, beforeSeq?)    the highest seq (below beforeSeq, if given), never the last write
 //   openEpoch(tenant, board), epoch(tenant, board)   the board's epoch in its lease record (pl_leases)
 //   acquire / renew / release / lease           the board's lease (holder, epoch, expires_at), as in sqlite.js
@@ -28,7 +29,7 @@
 //
 // Least privilege: start-up creates only missing tables (migrate() in server/pg/schema.js, to_regclass first), so
 // the server may run as a role that reads and writes the tables without owning the schema. It never ALTERs: a
-// pl_leases from before the lease is refused with the owner's one-off fix (LEASE_UPGRADE_SQL). Start-up waits at most
+// pl_leases from before the lease is an old-format store, refused with code "old-format" (reset it). Start-up waits at most
 // `lockTimeoutMs` for the schema's start-up lock, and a missing privilege is reported as such.
 //
 // Durable = the write's transaction commits with `SET LOCAL synchronous_commit = on` (the WAL record is flushed on
@@ -46,11 +47,12 @@
 // per test). The adapter never reads the environment.
 
 import { SQL } from "bun";
-import { needId, PortError } from "../ids.js";
-import { needSchema, migrate } from "../pg/schema.js";
+import { needId, PortError, mintClusterId } from "../ids.js";
+import { encodeSliced } from "../encode/sliced.js";
+import { PART_CHARS, splitParts, headerOf, parseHeader, orphanGroups, headerLike } from "../encode/cp-parts.js";
+import { needSchema, migrate, assertShapes, missing } from "../pg/schema.js";
+import { DEFAULT_READ_LIMIT, needBoard, needLeaseEpoch, needTtl, checkAppend, checkRead, fitBytes, checkCheckpoint, checkBeforeSeq, checkBlobRefs, checkPend, checkReap, BLOB_REF_CHUNK } from "./port.js";
 
-const MAX_READ = 10_000;
-const posInt = v => Number.isSafeInteger(v) && v > 0;
 /** Postgres SQLSTATE for a unique violation. Bun's PostgresError carries it as `errno`. */
 const UNIQUE = "23505";
 
@@ -62,60 +64,71 @@ const UNIQUE = "23505";
 export const STORE_TABLES = Object.freeze({
   pl_entries: "tenant TEXT NOT NULL, board TEXT NOT NULL, seq BIGINT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq)",
   pl_checkpoints: "tenant TEXT NOT NULL, board TEXT NOT NULL, seq BIGINT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq)",
+  // Parts of a checkpoint too big for one row (server/encode/cp-parts.js); readable only when a pl_checkpoints header names (seq, wid).
+  pl_checkpoint_parts: "tenant TEXT NOT NULL, board TEXT NOT NULL, seq BIGINT NOT NULL, wid TEXT NOT NULL, n INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (tenant, board, seq, wid, n)",
   // The board's lease record (§ Recovery, Room identity): holder NULL = unheld (released, or a single-node openEpoch).
   // expires_at: ms on the database's clock.
   pl_leases: "tenant TEXT NOT NULL, board TEXT NOT NULL, epoch BIGINT NOT NULL, holder TEXT, expires_at BIGINT, PRIMARY KEY (tenant, board)",
+  // Blob references (PROTOCOL.md § Blobs, "References and purge"): which boards use a hash; uploads about to be used (until_at, database clock, ms);
+  // hashes no board uses any more (condemned_at, database clock; claimed_until: a reaper's claim).
+  pl_blob_refs: "tenant TEXT NOT NULL, sha1 TEXT NOT NULL, board TEXT NOT NULL, PRIMARY KEY (tenant, sha1, board)",
+  pl_blob_pending: "tenant TEXT NOT NULL, sha1 TEXT NOT NULL, board TEXT NOT NULL, until_at BIGINT NOT NULL, PRIMARY KEY (tenant, sha1, board)",
+  pl_blob_condemned: "tenant TEXT NOT NULL, sha1 TEXT NOT NULL, condemned_at BIGINT NOT NULL, claimed_until BIGINT, revived BOOLEAN NOT NULL DEFAULT false, PRIMARY KEY (tenant, sha1)",
+  // The cluster id (§ Bus, Cluster id): at most one row, minted by the first node that asks; `singleton` is the key, so a second row can't exist.
+  pl_cluster: "id TEXT NOT NULL, singleton BOOLEAN NOT NULL DEFAULT true PRIMARY KEY CHECK (singleton)",
 });
-/** Columns a pl_leases made before the lease (epoch only) lacks. Start-up checks for them and never adds them. */
-const LEASE_COLUMNS = Object.freeze({ holder: "TEXT", expires_at: "BIGINT" });
-/**
- * The operator's one-off upgrade of a pre-lease schema, run as the schema owner (deploy/README.md). Idempotent.
- * @param {string} schema
- */
-export const LEASE_UPGRADE_SQL = schema =>
-  `ALTER TABLE "${needSchema(schema)}".pl_leases ADD COLUMN IF NOT EXISTS holder TEXT, ADD COLUMN IF NOT EXISTS expires_at BIGINT;`;
+/** Index name → "table (columns)": created after the tables, only if missing (to_regclass), like the Registry's (REGISTRY_INDEXES). The purge looks references up by board, the prune by expiry. */
+export const STORE_INDEXES = Object.freeze({
+  pl_blob_refs_board: "pl_blob_refs (tenant, board)",
+  pl_blob_pending_board: "pl_blob_pending (tenant, board)",
+  pl_blob_pending_until: "pl_blob_pending (until_at)",
+});
 /** SQLSTATEs: insufficient_privilege; lock_not_available (lock_timeout fired); idle_in_transaction_session_timeout. */
 const DENIED = "42501", LOCK_TIMEOUT = "55P03", IDLE_CUT = "25P03";
 /** What the Store's statements need on each table (L3: probed at start-up, so a misgrant fails at open). */
 const NEEDS = Object.freeze({
-  pl_entries: ["SELECT", "INSERT"],
+  pl_entries: ["SELECT", "INSERT", "DELETE"],   // DELETE: purgeBoard
   pl_checkpoints: ["SELECT", "INSERT", "DELETE"],
-  pl_leases: ["SELECT", "INSERT", "UPDATE"],   // UPDATE: the lease calls, and FOR SHARE in a fenced write
+  pl_checkpoint_parts: ["SELECT", "INSERT", "DELETE"],
+  pl_leases: ["SELECT", "INSERT", "UPDATE", "DELETE"],   // UPDATE: the lease calls, and FOR SHARE in a fenced write; DELETE: purgeBoard
+  pl_blob_refs: ["SELECT", "INSERT", "DELETE"],   // DELETE: purgeBoard
+  pl_blob_pending: ["SELECT", "INSERT", "UPDATE", "DELETE"],   // UPDATE: a second pend extends it (ON CONFLICT DO UPDATE); DELETE: an append, purgeBoard, blobPrune
+  pl_blob_condemned: ["SELECT", "INSERT", "UPDATE", "DELETE"],   // UPDATE: the reaper's claim
+  pl_cluster: ["SELECT", "INSERT"],
 });
 /** The database's clock, ms since 1970. */
 const DB_NOW = "(extract(epoch FROM clock_timestamp()) * 1000)::bigint";
-const MAX_TTL = 10 * 60_000;
 
 /**
  * @param {{ url?: string, sql?: import("bun").SQL, max?: number, schema?: string, keepCheckpoints?: number, lockTimeoutMs?: number }} o
  *   lockTimeoutMs: how long start-up waits for the schema's start-up lock (default 15 s), then fails with code "lock-timeout".
  *   txIdleTimeoutMs: a write transaction idle this long (its client paused mid-write) is ended by the server (default 5 s).
  *   leaseLockTimeoutMs: the longest a lease call waits on a row lock (default 2 s, at most half its ttl), then "unavailable".
+ *   partChars: the most chars in one checkpoint part (default 1 Mi). onPart: test hook, awaited before each part
+ *   ("part:<n>"), before the header ("header"), after its part count ("header-counted") and before each orphan group's delete ("sweep"); a throw aborts the write there (a sweep never fails a write). onSkip: called once for each checkpoint getCheckpoint skips because its parts are missing (the server logs it).
  * @returns {Promise<{ append: Function, read: Function, lastSeq: Function, putCheckpoint: Function,
  *   getCheckpoint: Function, openEpoch: Function, epoch: Function, acquire: Function, renew: Function,
- *   release: Function, lease: Function, settings(): Promise<object>, close(): Promise<void> }>}
+ *   release: Function, lease: Function, settings(): Promise<object>, clusterId(): Promise<string>, close(): Promise<void> }>}
  */
 export async function postgresStore({ url, sql, max, schema = "public", keepCheckpoints = 3, lockTimeoutMs = 15_000,
-  txIdleTimeoutMs = 5_000, leaseLockTimeoutMs = 2_000 }) {
+  txIdleTimeoutMs = 5_000, leaseLockTimeoutMs = 2_000, partChars = PART_CHARS, onPart, onSkip }) {
   if (!sql && !url) throw new Error("postgres store: pass url or sql");
   const s = needSchema(schema);
   const owned = !sql;
   const db = sql ?? new SQL(max ? { url, max } : url);
   let open = true;
-  const E = `"${s}".pl_entries`, C = `"${s}".pl_checkpoints`, L = `"${s}".pl_leases`;
+  const K = `"${s}".pl_cluster`, E = `"${s}".pl_entries`, C = `"${s}".pl_checkpoints`, CP = `"${s}".pl_checkpoint_parts`, L = `"${s}".pl_leases`;
+  const BR = `"${s}".pl_blob_refs`, BP = `"${s}".pl_blob_pending`, BC = `"${s}".pl_blob_condemned`;
 
   try {
     await db.begin(async tx => {
       // A wedged migrator or a hung node holding the schema lock must not block every start-up forever.
       await tx.unsafe(`SET LOCAL lock_timeout = ${Math.max(1, Math.floor(lockTimeoutMs))}`);
       await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-schema:${s}`]);
+      await assertShapes(tx, s, STORE_TABLES);   // the old-format rule (a pl_leases from before the lease columns, any other changed table), before anything is created
       await migrate(tx, s, STORE_TABLES);
-      // Start-up never ALTERs (least privilege): a pl_leases from before the lease is refused with the operator's fix.
-      const have = new Set((await tx.unsafe(`SELECT attname FROM pg_attribute
-        WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped`, [L])).map(r => r.attname));
-      const missing = Object.keys(LEASE_COLUMNS).filter(c => !have.has(c));
-      if (missing.length) throw Object.assign(new Error(`postgres store: ${L} predates the lease (missing ${missing.join(", ")}). `
-        + `Run as the schema owner: ${LEASE_UPGRADE_SQL(s)}`), { code: "needs-migration" });
+      const noIndex = await missing(tx, s, Object.keys(STORE_INDEXES));
+      if (noIndex.length) await tx.unsafe(noIndex.map(name => `CREATE INDEX ${name} ON "${s}".${STORE_INDEXES[name]}`).join(";\n"));
       // L3: every privilege the Store's statements use, checked now (a misgrant would otherwise surface at the first
       // fenced write, as a raw 42501). Thrown as Postgres's own 42501, so it is reported like any refusal below.
       const lacking = [];
@@ -141,7 +154,7 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
 
   const ready = (tenant, board) => {
     if (!open) throw new PortError("closed", "the store is closed");
-    needId(tenant, "tenant"); needId(board, "board");
+    needBoard(tenant, board);
   };
   const ms = v => Math.max(1, Math.floor(v));
   /**
@@ -165,10 +178,6 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
   };
   /** A lease call's lock bound: leaseLockTimeoutMs, and at most half its ttl. */
   const leaseLock = ttlMs => Math.min(leaseLockTimeoutMs, ttlMs === undefined ? leaseLockTimeoutMs : ttlMs / 2);
-  const needEpoch = epoch => { if (epoch !== undefined && !posInt(epoch)) throw new PortError("bad-entry", "epoch must be a positive integer"); };
-  /** Every write is fenced (p4-host, L5): append and putCheckpoint without the writer's lease epoch are refused. */
-  const needWriteEpoch = epoch => { if (!posInt(epoch)) throw new PortError("bad-entry", "a write needs the board's lease epoch (a positive integer)"); };
-  const needTtl = ttlMs => { if (!posInt(ttlMs) || ttlMs > MAX_TTL) throw new PortError("bad-entry", `ttlMs must be a positive integer up to ${MAX_TTL}`); };
   const granted = rows => rows.length ? { epoch: Number(rows[0].epoch), expiresAt: Number(rows[0].expires_at) } : null;
   /** The epoch fence, inside a write transaction: FOR SHARE holds off a takeover until this transaction ends. */
   const fence = async (tx, tenant, board, epoch) => {
@@ -179,25 +188,41 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
   const lastOf = async (q, tenant, board) =>
     Number((await q.unsafe(`SELECT coalesce(max(seq), 0) AS m FROM ${E} WHERE tenant = $1 AND board = $2`, [tenant, board]))[0].m);
 
+  /** The board's checkpoint lock (a header's commit vs a sweep's delete), held to the end of `tx`; a wait past lock_timeout is "unavailable". */
+  const cpLock = async (tx, tenant, board) => {
+    try { await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-cp:${s}:${tenant}:${board}`]); }
+    catch (err) { if (err?.errno === LOCK_TIMEOUT) throw new PortError("unavailable", "the checkpoint lock is held by another session: try again"); throw err; }
+  };
+  /** Removes part rows no header names (aborted, fenced, pruned or crashed writes), older than the newest header. Never throws. */
+  const sweepParts = async (tenant, board, mine) => {
+    try {
+      const gone = orphanGroups(await db.unsafe(`SELECT seq, data FROM ${C} WHERE tenant = $1 AND board = $2`, [tenant, board]),
+        await db.unsafe(`SELECT DISTINCT seq, wid FROM ${CP} WHERE tenant = $1 AND board = $2`, [tenant, board]));
+      if (mine && !gone.some(g => g.wid === mine.wid)) gone.push(mine);   // an aborted write's own, whatever the newest header
+      // Under the board's checkpoint lock (the header's transaction takes it too) and only while no header names the write: a
+      // header that lands while the sweep runs (a slow write finishing) keeps its parts. Bounded like every write (lock_timeout,
+      // idle cut); a sweep that can't get the lock gives up here and the next write sweeps again.
+      for (const g of gone) {
+        await onPart?.("sweep");
+        await write(async tx => {
+          await cpLock(tx, tenant, board);
+          await tx.unsafe(`DELETE FROM ${CP} WHERE tenant = $1 AND board = $2 AND seq = $3 AND wid = $4
+            AND NOT EXISTS (SELECT 1 FROM ${C} WHERE tenant = $1 AND board = $2 AND seq = $3 AND data LIKE $5)`, [tenant, board, g.seq, g.wid, headerLike(g.wid)]);
+        }, leaseLockTimeoutMs);
+      }
+    } catch { /* best effort: the next checkpoint's sweep takes what is left */ }
+  };
+
   return {
     /**
      * Writes every entry or none, only if the board's last seq is `expectSeq` and only if `epoch` is
      * the board's lease epoch (else PortError "fenced"; no epoch at all is "bad-entry": every write is fenced). Resolves once durable.
      */
-    async append(tenant, board, entries, expectSeq, epoch) {
-      ready(tenant, board); needWriteEpoch(epoch);
-      if (!Number.isSafeInteger(expectSeq) || expectSeq < 0) throw new PortError("bad-entry", "expectSeq must be a non-negative integer");
-      if (!Array.isArray(entries) || !entries.length) throw new PortError("bad-entry", "append needs at least one entry");
+    async append(tenant, board, entries, expectSeq, epoch, opts) {
+      ready(tenant, board);
+      const refs = checkBlobRefs(opts);
       // Everything is checked and serialised before the transaction starts: a bad entry writes nothing.
-      const seqs = [], datas = [];
-      entries.forEach((e, i) => {
-        if (!e || typeof e !== "object" || e.seq !== expectSeq + 1 + i) throw new PortError("bad-entry", `entry ${i} must have seq ${expectSeq + 1 + i}`);
-        if (e.tenant !== tenant || e.board !== board) throw new PortError("bad-entry", `entry ${i} belongs to another board`);
-        let data;
-        try { data = JSON.stringify(e); } catch { data = undefined; }
-        if (typeof data !== "string") throw new PortError("bad-entry", `entry ${i} can't be serialised`);
-        seqs.push(e.seq); datas.push(data);
-      });
+      const { seqs, datas } = checkAppend(tenant, board, entries, expectSeq, epoch);
       try {
         await write(async tx => {
           await fence(tx, tenant, board, epoch);   // first: a fenced host hears "fenced" (stop), not "conflict" (rebuild)
@@ -205,6 +230,15 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
           if (last !== expectSeq) throw new PortError("conflict", `board is at seq ${last}, not ${expectSeq}`);
           await tx.unsafe(`INSERT INTO ${E} (tenant, board, seq, data)
             SELECT $1, $2, u.seq, u.data FROM unnest($3::int8[], $4::text[]) AS u(seq, data)`, [tenant, board, seqs, datas]);
+          // In the entries' transaction (an acknowledged op always has its references), in chunks (an append is never refused over their number):
+          // each reference replaces the board's pending one, ends an unclaimed condemnation, and marks a claimed one revived (the reaper puts the bytes back).
+          for (let i = 0; i < refs.length; i += BLOB_REF_CHUNK) {
+            const part = refs.slice(i, i + BLOB_REF_CHUNK);
+            await tx.unsafe(`INSERT INTO ${BR} (tenant, sha1, board) SELECT $1, h, $2 FROM unnest($3::text[]) AS h ON CONFLICT DO NOTHING`, [tenant, board, part]);
+            await tx.unsafe(`DELETE FROM ${BP} WHERE tenant = $1 AND board = $2 AND sha1 = ANY($3::text[])`, [tenant, board, part]);
+            await tx.unsafe(`DELETE FROM ${BC} WHERE tenant = $1 AND sha1 = ANY($2::text[]) AND claimed_until IS NULL`, [tenant, part]);
+            await tx.unsafe(`UPDATE ${BC} SET revived = true WHERE tenant = $1 AND sha1 = ANY($2::text[]) AND claimed_until IS NOT NULL`, [tenant, part]);
+          }
         });
       } catch (err) {
         if (err instanceof PortError) throw err;
@@ -219,18 +253,14 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
      * page also stops once it holds about that much stored text (always >= 1 entry); the array carries `bytes`
      * (each entry's stored length, same order). Same extension as the SQLite adapter.
      */
-    async read(tenant, board, fromSeq = 1, limit = 1000, maxBytes) {
+    async read(tenant, board, fromSeq = 1, limit = DEFAULT_READ_LIMIT, maxBytes) {
       ready(tenant, board);
-      if (!Number.isSafeInteger(fromSeq) || fromSeq < 0) throw new PortError("bad-entry", "fromSeq must be a non-negative integer");
-      if (!posInt(limit)) throw new PortError("bad-entry", "limit must be a positive integer");
-      if (maxBytes !== undefined && !posInt(maxBytes)) throw new PortError("bad-entry", "maxBytes must be a positive integer");
-      let n = Math.min(limit, MAX_READ);
+      let n = checkRead(fromSeq, limit, maxBytes);
       if (maxBytes !== undefined) {
         // Sizes first (no row text is sent), then only as many rows as fit.
         const sizes = await db.unsafe(`SELECT length(data) AS n FROM ${E} WHERE tenant = $1 AND board = $2 AND seq >= $3
           ORDER BY seq ASC LIMIT $4`, [tenant, board, fromSeq, n]);
-        let sum = 0, fit = 0;
-        for (const r of sizes) { const k = Number(r.n); if (fit && sum + k > maxBytes) break; sum += k; fit++; }
+        const fit = fitBytes(sizes.map(r => Number(r.n)), maxBytes);
         if (!fit) return Object.assign([], { bytes: [] });
         n = fit;
       }
@@ -252,25 +282,64 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
      * `keepCheckpoints` per board are pruned in the same transaction. An older one never hides a newer one.
      */
     async putCheckpoint(tenant, board, cp, epoch) {
-      ready(tenant, board); needWriteEpoch(epoch);
-      if (!cp || typeof cp !== "object" || !Number.isSafeInteger(cp.seq) || cp.seq < 0) throw new PortError("bad-entry", "a checkpoint needs a seq");
-      const data = JSON.stringify(cp);
-      await write(async tx => {
-        await fence(tx, tenant, board, epoch);
-        await tx.unsafe(`INSERT INTO ${C} (tenant, board, seq, data) VALUES ($1, $2, $3, $4)
-          ON CONFLICT (tenant, board, seq) DO NOTHING`, [tenant, board, cp.seq, data]);
-        await tx.unsafe(`DELETE FROM ${C} WHERE tenant = $1 AND board = $2 AND seq NOT IN
-          (SELECT seq FROM ${C} WHERE tenant = $1 AND board = $2 ORDER BY seq DESC LIMIT $3)`, [tenant, board, keepCheckpoints]);
-      });
+      ready(tenant, board); checkCheckpoint(cp, epoch);
+      const text = await encodeSliced(cp);   // in slices: the event loop breathes between them
+      // Bounded lock wait (the fence's FOR SHARE on the lease row): a stuck write is "unavailable", never forever.
+      const put = (tx, data) => tx.unsafe(`INSERT INTO ${C} (tenant, board, seq, data) VALUES ($1, $2, $3, $4)
+        ON CONFLICT (tenant, board, seq) DO NOTHING`, [tenant, board, cp.seq, data]);
+      const prune = tx => tx.unsafe(`DELETE FROM ${C} WHERE tenant = $1 AND board = $2 AND seq NOT IN
+        (SELECT seq FROM ${C} WHERE tenant = $1 AND board = $2 ORDER BY seq DESC LIMIT $3)`, [tenant, board, keepCheckpoints]);
+      if (text.length <= partChars) {
+        return void await write(async tx => { await fence(tx, tenant, board, epoch); await put(tx, text); await prune(tx); }, leaseLockTimeoutMs);
+      }
+      // Parts: each in its own fenced transaction; the header row makes them visible (§ Recovery, "Checkpoint parts").
+      // A crash or abort before it leaves the previous checkpoint the newest.
+      const parts = splitParts(text, partChars), wid = crypto.randomUUID();
+      try {
+        for (let n = 0; n < parts.length; n++) {
+          await onPart?.(`part:${n}`);
+          await write(async tx => {
+            await fence(tx, tenant, board, epoch);
+            await tx.unsafe(`INSERT INTO ${CP} (tenant, board, seq, wid, n, data) VALUES ($1, $2, $3, $4, $5, $6)`, [tenant, board, cp.seq, wid, n, parts[n]]);
+          }, leaseLockTimeoutMs);
+        }
+        await onPart?.("header");
+        await write(async tx => {
+          await fence(tx, tenant, board, epoch);
+          await cpLock(tx, tenant, board);   // vs a sweep's delete
+          const [{ c }] = await tx.unsafe(`SELECT count(*)::int AS c FROM ${CP} WHERE tenant = $1 AND board = $2 AND seq = $3 AND wid = $4`, [tenant, board, cp.seq, wid]);
+          await onPart?.("header-counted");   // test hook: the window between the count and the commit
+          if (c !== parts.length) throw new PortError("unavailable", "a checkpoint part is missing: try again");
+          await put(tx, headerOf(wid, parts.length, text.length)); await prune(tx);
+        }, leaseLockTimeoutMs);
+      } catch (err) { await sweepParts(tenant, board, { seq: cp.seq, wid }); throw err; }
+      await sweepParts(tenant, board);   // the first write of a seq stays: a second one's parts are orphans now, as are the pruned ones
     },
 
     /** The checkpoint with the highest seq; with `beforeSeq`, the highest below it (to step back past a bad one). */
     async getCheckpoint(tenant, board, beforeSeq) {
       ready(tenant, board);
-      if (beforeSeq !== undefined && (!Number.isSafeInteger(beforeSeq) || beforeSeq < 0)) throw new PortError("bad-entry", "beforeSeq must be a non-negative integer");
-      const rows = await db.unsafe(`SELECT data FROM ${C} WHERE tenant = $1 AND board = $2 AND seq < $3
-        ORDER BY seq DESC LIMIT 1`, [tenant, board, beforeSeq ?? Number.MAX_SAFE_INTEGER]);
-      return rows.length ? JSON.parse(rows[0].data) : null;
+      checkBeforeSeq(beforeSeq);
+      // A header may name parts a newer checkpoint's prune has just removed: look again (it then finds a newer header).
+      // A header whose parts stay missing is a bad checkpoint: skipped, so the caller gets the next one below it.
+      for (let below = beforeSeq ?? Number.MAX_SAFE_INTEGER; ;) {
+        let text = null, seq;
+        for (let attempt = 0; attempt < 3 && text === null; attempt++) {
+          const rows = await db.unsafe(`SELECT seq, data FROM ${C} WHERE tenant = $1 AND board = $2 AND seq < $3
+            ORDER BY seq DESC LIMIT 1`, [tenant, board, below]);
+          if (!rows.length) return null;
+          const head = parseHeader(rows[0].data);
+          if (!head) return JSON.parse(rows[0].data);
+          seq = Number(rows[0].seq);
+          const got = await db.unsafe(`SELECT data FROM ${CP} WHERE tenant = $1 AND board = $2 AND seq = $3 AND wid = $4 ORDER BY n`, [tenant, board, seq, head.wid]);
+          if (got.length !== head.parts) continue;
+          text = got.map(r => r.data).join("");
+          if (text.length !== head.chars) throw new PortError("corrupt", `checkpoint ${seq}'s parts hold ${text.length} chars, not ${head.chars}`);
+        }
+        if (text !== null) return JSON.parse(text);
+        try { onSkip?.({ tenant, board, seq }); } catch { /* a logger must not fail a read */ }
+        below = seq;
+      }
     },
 
     /**
@@ -308,16 +377,14 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
 
     /** Extends the lease to now + ttlMs (database clock), only for its holder at that epoch; else null. */
     async renew(tenant, board, holder, epoch, ttlMs) {
-      ready(tenant, board); needId(holder, "holder"); needEpoch(epoch); needTtl(ttlMs);
-      if (epoch === undefined) throw new PortError("bad-entry", "renew needs the lease's epoch");
+      ready(tenant, board); needId(holder, "holder"); needLeaseEpoch(epoch); needTtl(ttlMs);
       return granted(await write(tx => tx.unsafe(`UPDATE ${L} SET expires_at = ${DB_NOW} + $5
         WHERE tenant = $1 AND board = $2 AND holder = $3 AND epoch = $4 RETURNING epoch, expires_at`, [tenant, board, holder, epoch, ttlMs]), leaseLock(ttlMs)));
     },
 
     /** Gives the lease up if `holder` holds it at `epoch`; otherwise does nothing. The epoch is kept. */
     async release(tenant, board, holder, epoch) {
-      ready(tenant, board); needId(holder, "holder"); needEpoch(epoch);
-      if (epoch === undefined) throw new PortError("bad-entry", "release needs the lease's epoch");
+      ready(tenant, board); needId(holder, "holder"); needLeaseEpoch(epoch);
       await write(tx => tx.unsafe(`UPDATE ${L} SET holder = NULL, expires_at = NULL
         WHERE tenant = $1 AND board = $2 AND holder = $3 AND epoch = $4`, [tenant, board, holder, epoch]), leaseLock());
     },
@@ -335,6 +402,108 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
       const r = rows[0], live = r.live === true;
       return { holder: r.holder, epoch: Number(r.epoch), expiresAt: r.expires_at === null ? null : Number(r.expires_at), live,
         remainingMs: live ? Number(r.expires_at) - Number(r.now) : 0 };
+    },
+
+    /** Deletes everything the store holds for one board, in one transaction (PROTOCOL.md § Trash and restore, "Purge"). Idempotent. */
+    async purgeBoard(tenant, board) {
+      ready(tenant, board);
+      await write(async tx => {
+        for (const tb of [E, C, CP, L]) await tx.unsafe(`DELETE FROM ${tb} WHERE tenant = $1 AND board = $2`, [tenant, board]);
+        // Separate statements: each sees the one before, so "no other reference" is judged after this board's own are gone.
+        const gone = [...await tx.unsafe(`DELETE FROM ${BR} WHERE tenant = $1 AND board = $2 RETURNING sha1`, [tenant, board]),
+          ...await tx.unsafe(`DELETE FROM ${BP} WHERE tenant = $1 AND board = $2 RETURNING sha1`, [tenant, board])].map(r => r.sha1);
+        const hashes = [...new Set(gone)].sort();
+        for (let i = 0; i < hashes.length; i += BLOB_REF_CHUNK) await tx.unsafe(`INSERT INTO ${BC} (tenant, sha1, condemned_at) SELECT $1, h, ${DB_NOW} FROM unnest($2::text[]) AS h
+          WHERE NOT EXISTS (SELECT 1 FROM ${BR} r WHERE r.tenant = $1 AND r.sha1 = h)
+            AND NOT EXISTS (SELECT 1 FROM ${BP} p WHERE p.tenant = $1 AND p.sha1 = h AND p.until_at > ${DB_NOW}) ON CONFLICT DO NOTHING`, [tenant, hashes.slice(i, i + BLOB_REF_CHUNK)]);
+      });
+    },
+
+    /** A pending reference, and the end of any condemnation; refused while a reaper's claim is live. */
+    async blobPend(tenant, board, sha1, ttlMs) {
+      ready(tenant, board); checkPend(sha1, ttlMs);
+      await write(async tx => {
+        // Locks the condemnation (waits for a claim in flight to commit), then looks: a live claim means the delete may be running.
+        const [row] = await tx.unsafe(`SELECT claimed_until > ${DB_NOW} AS live FROM ${BC} WHERE tenant = $1 AND sha1 = $2 FOR UPDATE`, [tenant, sha1]);
+        if (row?.live) throw new PortError("unavailable", "the blob is being deleted: ask again shortly");
+        // Unclaimed: the condemnation ends. Claimed but lapsed (a reaper died mid-way, the bytes may be quarantined): revived, for the reaper to settle.
+        if (row) await tx.unsafe(`UPDATE ${BC} SET revived = true WHERE tenant = $1 AND sha1 = $2 AND claimed_until IS NOT NULL`, [tenant, sha1]);
+        if (row) await tx.unsafe(`DELETE FROM ${BC} WHERE tenant = $1 AND sha1 = $2 AND claimed_until IS NULL`, [tenant, sha1]);
+        await tx.unsafe(`INSERT INTO ${BP} (tenant, sha1, board, until_at) VALUES ($1, $2, $3, ${DB_NOW} + $4)
+          ON CONFLICT (tenant, sha1, board) DO UPDATE SET until_at = greatest(${BP}.until_at, excluded.until_at)`, [tenant, sha1, board, ttlMs]);
+      }, leaseLockTimeoutMs);
+    },
+
+    /** Condemned long enough and not claimed, in (tenant, sha1) order after the cursor. */
+    async blobCondemned({ graceMs, after = null, limit } = {}) {
+      if (!open) throw new PortError("closed", "the store is closed");
+      checkReap({ graceMs, limit, after });
+      const rows = await db.unsafe(`SELECT tenant, sha1 FROM ${BC} WHERE condemned_at <= ${DB_NOW} - $1 AND (claimed_until IS NULL OR claimed_until <= ${DB_NOW})
+        AND (tenant, sha1) > ($2, $3) ORDER BY tenant, sha1 LIMIT $4`, [graceMs, after?.tenant ?? "", after?.sha1 ?? "", limit]);
+      return rows.map(r => ({ tenant: r.tenant, sha1: r.sha1 }));
+    },
+
+    /** The reaper's conditional claim: only while the hash is still condemned for graceMs, unclaimed and unreferenced. */
+    async blobClaim(tenant, sha1, { graceMs, claimMs } = {}) {
+      needId(tenant, "tenant"); checkPend(sha1, 1); checkReap({ graceMs, claimMs }, { claim: true });
+      if (!open) throw new PortError("closed", "the store is closed");
+      return write(async tx => {
+        const got = await tx.unsafe(`UPDATE ${BC} SET claimed_until = ${DB_NOW} + $4 WHERE tenant = $1 AND sha1 = $2 AND condemned_at <= ${DB_NOW} - $3
+          AND (claimed_until IS NULL OR claimed_until <= ${DB_NOW})
+          AND (claimed_until IS NOT NULL OR (NOT EXISTS (SELECT 1 FROM ${BR} r WHERE r.tenant = $1 AND r.sha1 = $2)
+            AND NOT EXISTS (SELECT 1 FROM ${BP} p WHERE p.tenant = $1 AND p.sha1 = $2 AND p.until_at > ${DB_NOW}))) RETURNING 1 AS x`, [tenant, sha1, graceMs, claimMs]);
+        if (got.length) return true;
+        // A hash a board references is not condemned (a purge raced a new reference).
+        await tx.unsafe(`DELETE FROM ${BC} WHERE tenant = $1 AND sha1 = $2 AND claimed_until IS NULL
+          AND EXISTS (SELECT 1 FROM ${BR} r WHERE r.tenant = $1 AND r.sha1 = $2)`, [tenant, sha1]);
+        return false;
+      }, leaseLockTimeoutMs);
+    },
+
+    /**
+     * The reaper's settle calls (PROTOCOL.md § Blobs, "References and purge"). Without options, after the bytes were quarantined: is anything
+     * referencing the hash (a revived mark, a reference, a live pending upload)? Yes: false says put the bytes back, and the claimed row STAYS (marked
+     * revived). No: true says delete them, and the row stays too. So a restore or a delete that fails is retried by the next claim, whose verdict is
+     * the same. With `{ restored: true }`, after the restore: drops the row. With `{ deleted: true }`, after the delete: drops the row; false = a
+     * reference arrived since the verdict (the bytes are gone: the client's re-upload heals it); a missing row is true.
+     */
+    async blobReaped(tenant, sha1, { deleted = false, restored = false } = {}) {
+      needId(tenant, "tenant"); checkPend(sha1, 1);
+      if (!open) throw new PortError("closed", "the store is closed");
+      const keep = `revived OR EXISTS (SELECT 1 FROM ${BR} r WHERE r.tenant = $1 AND r.sha1 = $2)
+        OR EXISTS (SELECT 1 FROM ${BP} p WHERE p.tenant = $1 AND p.sha1 = $2 AND p.until_at > ${DB_NOW})`;
+      return write(async tx => {
+        if (restored) { await tx.unsafe(`DELETE FROM ${BC} WHERE tenant = $1 AND sha1 = $2 AND claimed_until IS NOT NULL`, [tenant, sha1]); return true; }
+        if (deleted) {
+          const rows = await tx.unsafe(`DELETE FROM ${BC} WHERE tenant = $1 AND sha1 = $2 AND claimed_until IS NOT NULL RETURNING ${keep} AS keep`, [tenant, sha1]);
+          return !rows.length || rows[0].keep === false;
+        }
+        const rows = await tx.unsafe(`SELECT ${keep} AS keep FROM ${BC} WHERE tenant = $1 AND sha1 = $2 AND claimed_until IS NOT NULL FOR UPDATE`, [tenant, sha1]);
+        if (!rows.length) return false;
+        if (rows[0].keep) { await tx.unsafe(`UPDATE ${BC} SET revived = true WHERE tenant = $1 AND sha1 = $2`, [tenant, sha1]); return false; }   // the row STAYS until the restore is done
+        return true;
+      });
+    },
+
+    /** Deletes at most `limit` expired pending references. */
+    async blobPrune(limit) {
+      if (!open) throw new PortError("closed", "the store is closed");
+      if (!Number.isSafeInteger(limit) || limit < 1) throw new PortError("bad-entry", "limit must be a positive integer");
+      return (await write(tx => tx.unsafe(`DELETE FROM ${BP} WHERE ctid IN (SELECT ctid FROM ${BP} WHERE until_at <= ${DB_NOW} LIMIT $1) RETURNING 1 AS x`, [limit]))).length;
+    },
+
+    /**
+     * This database's cluster id (§ Bus, Cluster id): "c-" + 16 of [a-z0-9], minted by the first caller and the same
+     * for every node and every later call, so two clusters on different databases never share an id and nodes on one
+     * database always do. Durable before it is returned (a lost id would give nodes different ones).
+     */
+    async clusterId() {
+      if (!open) throw new PortError("closed", "the store is closed");
+      const read = async () => (await db.unsafe(`SELECT id FROM ${K}`))[0]?.id;
+      const have = await read();
+      if (have) return have;
+      await write(tx => tx.unsafe(`INSERT INTO ${K} (id) VALUES ($1) ON CONFLICT DO NOTHING`, [mintClusterId()]));
+      return read();   // the winner's row, whoever's it is
     },
 
     /** What a write transaction runs with, read back from Postgres (for /health and tests). */

@@ -2,6 +2,7 @@
 // § Pacing (writer cap, op bucket, queue cap), revocation by token expiry, and rule 6's connection lists.
 import { test, expect, afterAll } from "bun:test";
 import { rig, client, tokenOf, settled, rawSock } from "./rig.js";
+import { virtualTime } from "./virtual.js";
 import { cleanup, sleep, until } from "./helpers.js";
 import { subjects } from "../../server/bus/port.js";
 import { splitEntries } from "../../server/room-host.js";
@@ -112,7 +113,7 @@ test("the bus cap: `.entries` batches are split under it in seq order, and an op
   const items = entries.map((e, i) => JSON.stringify({ seq: e.seq, text: '"'.repeat(300 + i) }));
   const parts = splitEntries(entries, items, 1500);
   expect(parts.flatMap(p => p.items)).toEqual(items);
-  expect(parts.every(p => JSON.stringify(p).length <= 1500)).toBe(true);
+  expect(parts.every(p => JSON.stringify({ ...p, epoch: Number.MAX_SAFE_INTEGER }).length <= 1500)).toBe(true);
   expect(parts.length).toBeGreaterThan(1);
   expect(parts.map(p => [p.from, p.to])).toEqual(parts.map(p => [JSON.parse(p.items[0]).seq, JSON.parse(p.items.at(-1)).seq]));
 
@@ -156,12 +157,18 @@ test("§ Pacing: a ninth writer connection per (user, board) gets `limit` and is
 });
 
 test("§ Pacing: over-rate ops wait in the gateway in order and are all acked; past the queue cap the connection gets `unavailable`", async () => {
-  const r = await rig({ limits: { opRate: 50, opBurst: 5, maxOpQueue: 30 } });
+  // The gateway's clock is virtual and starts frozen: the bucket refills only when the test says so, so "paced" is
+  // counted (exactly the burst gets through, the rest waits) and never timed.
+  let clock = 1_000_000;
+  const r = await rig({ now: () => clock, limits: { opRate: 50, opBurst: 5, maxOpQueue: 30 } });
   const s = await r.sock(); s.send(hello(r, "editor")); await s.next(m => m.t === "welcome");
-  const t0 = Date.now();
   for (let i = 1; i <= 25; i++) s.send(op("editor", i, rect("p" + i)));
-  await s.next(m => m.t === "ack" && m.id === "editor:25", "the last ack", 10_000);
-  expect(Date.now() - t0).toBeGreaterThan(300);                        // 20 over the burst at 50/s: ≥ 400 ms, paced
+  await s.next(m => m.t === "ack" && m.id === "editor:5", "the burst's last ack", 10_000);
+  await r.bus.flush(); await r.idle(); await sleep(50);                // the settle for a negative: nothing more may come on a frozen clock
+  expect(s.msgs.filter(m => m.t === "ack").map(m => m.id)).toEqual(Array.from({ length: 5 }, (_, i) => `editor:${i + 1}`));
+  expect(await r.rawStore.lastSeq(r.ids.tenant, r.ids.board)).toBe(5);
+  // 20 over the burst at 50/s: the clock runs on (100 ms a poll) until the bucket has let them all through, in order.
+  await until(() => { clock += 100; return s.msgs.some(m => m.t === "ack" && m.id === "editor:25"); }, "the last ack", 10_000);
   const acks = s.msgs.filter(m => m.t === "ack");
   expect(acks.map(m => m.id)).toEqual(Array.from({ length: 25 }, (_, i) => `editor:${i + 1}`));
   expect(acks.map(m => m.seq)).toEqual(Array.from({ length: 25 }, (_, i) => i + 1));
@@ -174,13 +181,15 @@ test("§ Pacing: over-rate ops wait in the gateway in order and are all acked; p
 });
 
 test("a connection is closed with `auth` when its token's expiry passes; an expired token is refused at hello", async () => {
-  // The expiry is stamped when verify runs (1-2 s ahead), not before the rig is built: on a loaded machine, building
-  // the rig and saying hello took over a second, the token was already expired at hello, and the welcome never came
-  // (bun's 5 s default timeout, manager t18m, 2026-11-12). `expired` switches to a past expiry for the second half.
+  // The gateway's clock and timers are virtual and start frozen: the token's life is 2 s of that clock, which the test runs
+  // out (the old version waited 1-2 real seconds, and on a loaded machine the token was gone before the hello arrived).
+  // `expired` switches to a past expiry for the second half.
+  const V = virtualTime({ start: Date.now(), settle: () => new Promise(res => setImmediate(res)) });
   let expired = false;
-  const r = await rig({ wrapAuth: a => ({ ...a, verify: async t => { const id = await a.verify(t); return id && { ...id, exp: Math.floor(Date.now() / 1000) + (expired ? -1 : 2) }; } }) });
+  const r = await rig({ now: V.now, timers: V.timers, wrapAuth: a => ({ ...a, verify: async t => { const id = await a.verify(t); return id && { ...id, exp: Math.floor(V.now() / 1000) + (expired ? -1 : 2) }; } }) });
   const s = await r.sock(); s.send(hello(r, "editor")); await s.next(m => m.t === "welcome");
-  expect((await s.whenClosed(5_000)).code).toBe(1008);
+  await V.advance(2_001);                                              // the token's 2 s pass on the gateway's clock
+  expect((await s.whenClosed()).code).toBe(1008);
   expect(s.msgs.at(-1)).toMatchObject({ t: "error", code: "auth", message: "your sign-in expired" });
   expired = true;
   const late = await r.sock(); late.send(hello(r, "editor"));
@@ -205,8 +214,8 @@ test("rule 6: a room forgets a gateway silent for 30 s (its clock), unless the g
 
 test("a board feed picks up the host's checkpoint written just after the entries that triggered it (on the next heartbeat): a joiner from 0 gets that snapshot and only the entries after it", async () => {
   // One 50 KB text rewritten 10 times: the host folds by bytes (tailFoldBytes 64 KB) only when nothing is in flight
-  // (room-host.js foldIfDue). Its checkpoint is written right after the entries are published, so the feed's look on
-  // those entries misses it; the heartbeat (2 s) brings the retry.
+  // (room-host.js foldIfDue). Its checkpoint is written right after the entries are published; the first heartbeat
+  // after the write names it (`cp`), and the feed reads it then.
   // Deterministic order (p2-tunev LOW 2): op 1, then ops 2 and 3 together (op 2's fold is skipped while 3 is in flight),
   // then 4 to 10 one at a time. Folds land on 3, 5, 7, 9 and op 10 alone is under the trigger, so the room's base
   // settles at 9, not 10. The test asserts on whatever base the room settles at, never on a fixed seq.
@@ -238,37 +247,44 @@ test("a board feed picks up the host's checkpoint written just after the entries
   await r.stop();
 }, 20000);
 
-test("§ Pacing: frames read from a live socket faster than they are handled are capped in bytes: past maxLiveQueuedBytes, `unavailable` and close", async () => {
-  // One TCP write of 300 frames of ~1 KB: Bun hands them to the gateway back to back, before its pump handles one.
+test("§ Pacing (real socket): one frame bigger than maxLiveQueuedBytes gets `unavailable` and close 1013, a bystander on the board is untouched", async () => {
+  // One frame over the cap overflows however the kernel chunks the read (no burst, no race with the pump): the live cap
+  // over a real socket, the error frame and the close code. The burst-of-small-frames case is test/server/pacing-queue.test.js.
   const r = await rig({ limits: { maxLiveQueuedBytes: 32 * 1024 } });
-  const s = await rawSock(r.server.wsUrl, { frames: true }); s.send(hello(r, "editor"));
-  s.read();
-  await until(() => s.texts.some(t => t.includes('"welcome"')), "the welcome");
-  const pad = "x".repeat(1000);
-  const burst = Array.from({ length: 300 }, (_, i) => ({ t: "presence", k: "cursor", x: i, y: 0, pad }));
-  for (const m of burst) s.send(m);
-  await s.closed;
-  expect(s.texts.map(t => JSON.parse(t)).filter(m => m.t === "error")).toEqual([{ t: "error", code: "unavailable", message: "too much sent at once" }]);
-  expect(r.logs().some(l => l.msg === "frame queue overflow" && l.state === "live")).toBe(true);
-  // A well-behaved client on the same board is untouched.
+  const s = await r.sock(); s.send(hello(r, "editor")); await s.next(m => m.t === "welcome");
   const ok = await r.sock(); ok.send(hello(r, "viewer")); await ok.next(m => m.t === "welcome");
+  s.send({ t: "presence", k: "cursor", x: 1, y: 0, pad: "x".repeat(40 * 1024) });
+  expect((await s.whenClosed(5000)).code).toBe(1013);                       // a short deadline: with no cap this fails here, not after 30 s
+  expect(s.msgs.filter(m => m.t === "error")).toEqual([{ t: "error", code: "unavailable", message: "too much sent at once" }]);
+  expect(r.logs().some(l => l.msg === "frame queue overflow" && l.state === "live")).toBe(true);
+  ok.send({ t: "presence", k: "cursor", x: 2, y: 0 });                      // the bystander still talks, and is still connected
+  await sleep(50);
   expect(ok.closed).toBe(null);
   await r.stop();
 }, 20000);
 
-test("§ Pacing: an idle viewer that answers pings survives the idle timeout; a socket that never answers is closed", async () => {
-  // idleTimeoutSec 8 (Bun's smallest useful value; it pings idle sockets itself). Bun's client answers pings; the raw
-  // socket never does (it reads frames but writes nothing after its hello).
+test("§ Pacing: an idle viewer that answers pings survives the idle timeout twice over; a socket that never answers is closed", async () => {
+  // idleTimeoutSec 8 (Bun's smallest useful value; its timer ticks every 4 s): Bun pings a socket idle for half of it and
+  // closes it at the full timeout if nothing came back. Bun's client answers pings; a raw socket never does (it reads
+  // frames but writes nothing after its hello). Nothing here asserts a duration: the idle periods are marked by events,
+  // two silent sockets' closes, one after the other.
   const r = await rig({ limits: { idleTimeoutSec: 8 } });
+  const conns = () => r.server.gateway.stats().conns;
   const v = await r.sock(); v.send(hello(r, "viewer")); await v.next(m => m.t === "welcome");
-  const raw = await rawSock(r.server.wsUrl); raw.send(hello(r, "viewer", { client: "raw" })); raw.read();
-  await until(() => r.server.gateway.stats().conns === 2, "both connected");
-  const t0 = Date.now();
-  await until(() => raw.ended, "the silent socket to be closed", 25000);
-  const after = (Date.now() - t0) / 1000;
-  expect(after).toBeGreaterThan(4);                                     // not at once: only after the idle timeout
-  await sleep(10_000);                                                  // past the timeout again for the idle viewer
+  const silent = async client => { const s = await rawSock(r.server.wsUrl, { frames: true }); s.send(hello(r, "viewer", { client })); s.read(); return s; };
+  const raw = await silent("raw");
+  await until(() => conns() === 2, "both connected");
+  await until(() => raw.ended, "the silent socket to be closed (one idle period)", 25000);
+  expect(raw.pings).toBeGreaterThanOrEqual(1);                            // not at once: pinged first, closed for not answering
+  // The viewer connected before it and was just as quiet: had its pongs not counted it would have gone by now. A second
+  // silent socket, opened only now, marks a second full idle period by its own close.
+  await until(() => conns() === 1, "the silent socket's close to reach the gateway", 5000);
+  const raw2 = await silent("raw2");
+  await until(() => conns() === 2, "the second silent socket connected");
+  await until(() => raw2.ended, "the second silent socket to be closed (a second idle period)", 25000);
+  expect(raw2.pings).toBeGreaterThanOrEqual(1);
+  await until(() => conns() <= 1, "its close to reach the gateway", 5000);
   expect(v.closed).toBe(null);
-  expect(r.server.gateway.stats().conns).toBe(1);
+  expect(conns()).toBe(1);
   await r.stop();
 }, 60000);

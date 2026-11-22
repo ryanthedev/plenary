@@ -1,4 +1,4 @@
-// Sign-in core: who this tab is and the token its hello carries (docs/m2/contracts/auth-exchange.md). Core code:
+// Sign-in core: who this tab is and the token its hello carries. Core code:
 // it imports only ports (the auth port's error list) and touches no globals; the composition root passes the
 // fragment, a function that drops it from the address bar (history.replaceState), the session-storage adapter
 // (never localStorage), the auth adapter and the clock. Replaces web/ui/token.js's job (p6-hex wires it).
@@ -107,12 +107,44 @@ export function signOut(storage) { try { storage.remove(SESSION_KEY); } catch {}
  * @returns {{ token: string, identity: Identity, exp: null, outcome: "dev", link: null } | null}
  */
 export function devSignIn({ query = "", allowed = null }) {
+  const as = asParam(query);
+  if (as === null || (allowed && ![...allowed].includes(as))) return null;
+  return { token: `dev-${as}`, identity: { user: `dev:${as}`, name: as, email: null, domain: null }, exp: null, outcome: "dev", link: null };
+}
+
+/** The `as` of a query string when it appears exactly once and is a plain name, else null. */
+export function asParam(query = "") {
   if (typeof query !== "string" || query.length > MAX_FRAGMENT) return null;
   const q = query.startsWith("?") ? query.slice(1) : query;
   const as = q.split("&").filter(p => p === "as" || p.startsWith("as=")).map(p => p.slice(3));
-  if (as.length !== 1 || !DEV_RE.test(as[0])) return null;
-  if (allowed && ![...allowed].includes(as[0])) return null;
-  return { token: `dev-${as[0]}`, identity: { user: `dev:${as[0]}`, name: as[0], email: null, domain: null }, exp: null, outcome: "dev", link: null };
+  return as.length === 1 && DEV_RE.test(as[0]) ? as[0] : null;
+}
+
+/** How long a dev sign-in is kept in the tab's storage (a dev convenience: a reload without `?as=` stays signed in). */
+export const DEV_SESSION_S = 30 * 24 * 3600;
+
+/**
+ * The served page's dev sign-in: `?as=<name>` names a user in the server's dev menu (web/ports/devconfig.js), and the
+ * token is that user's own from the menu. Only a menu the server gave counts (null menu: dev sign-in is off, so `?as=`
+ * is ignored). The session is kept in this tab's storage like any other. Returns null when there is no menu, no `as`,
+ * or the name is not in the menu.
+ * @param {{ query: string, menu: import("../ports/devconfig.js").DevMenu | null, storage: import("../ports/storage.js").Storage,
+ *           clock: import("../ports/clock.js").Clock }} o
+ * @returns {{ token: string, identity: Identity, exp: number, outcome: "dev", link: null } | null}
+ */
+export function menuSignIn({ query, menu, storage, clock }) {
+  const as = menu ? asParam(query) : null;
+  const u = as === null ? null : menu.users.find(x => x.name === as);
+  if (!u) return null;
+  const exp = Math.floor(clock.now() / 1000) + DEV_SESSION_S;
+  const identity = { user: `dev:${u.name}`, name: u.name, email: null, domain: null };
+  try { storage.set(SESSION_KEY, JSON.stringify({ token: u.token, user: identity.user, name: u.name, email: null, domain: null, exp })); } catch {}
+  return { token: u.token, identity, exp, outcome: "dev", link: null };
+}
+
+/** The sign-in screen's dev buttons: one link per menu user, each to `board` as that user (a relative `?` href). */
+export function devLinks(menu, board) {
+  return menu.users.map(u => ({ href: `?${new URLSearchParams({ board, as: u.name })}`, text: `Continue as ${u.name} (${u.role})` }));
 }
 
 /**
@@ -198,7 +230,7 @@ export async function pageSignIn({ query, fragment, replaceFragment, storage, au
 }
 
 /**
- * What to tell the person after sign-in, or null. Never blames the person for a code the network spent (p6-edgev
+ * What to tell the user after sign-in, or null. Never blames the user for a code the network spent (p6-edgev
  * LOW-4: a lost answer then a retry reads as invalid-code), and says when the tab is still someone else (LOW-5).
  * @param {SignIn & { dev?: string | null }} s
  * @param {string | null} [still]  the display name the tab is still signed in as, when an exchange failed

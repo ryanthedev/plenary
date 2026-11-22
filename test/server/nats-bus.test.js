@@ -1,18 +1,25 @@
 // The NATS Bus (server/bus/nats.js) against the Bus contract, and the contract against memory.js too (so the
 // contract itself is known to describe the single-node bus). NATS tests skip when NATS_URL is unset; when it is
 // set, a NATS that can't be reached fails them (it never skips).
-import { test, expect, afterAll } from "bun:test";
+import { test, expect, afterAll, setDefaultTimeout } from "bun:test";
 import { memoryBus } from "../../server/bus/memory.js";
 import { natsBus, subjects, encodeMessage, decodeMessage, MAX_BUS_BYTES } from "../../server/bus/nats.js";
 import { busContract, runTenant } from "./bus-contract.js";
-import { until, sleep } from "./helpers.js";
+import { until, sleep, spawnTracked } from "./helpers.js";
 
 const URL = process.env.NATS_URL;
+// Failure-only ceiling for tests doing real NATS work: bun's 5 s default fails them under machine load (TECH-DEBT row 36). It fires only when
+// something never completes; nothing asserts on how long a test took.
+setDefaultTimeout(30_000);
 const nt = URL ? test : test.skip;
 const code = async p => { try { await p; return "resolved"; } catch (e) { return e.code ?? `threw ${e.message}`; } };
 
 busContract("memory bus", o => memoryBus(o));
-busContract("nats bus", o => natsBus({ url: URL, ...o }), { skip: !URL });
+busContract("nats bus", o => natsBus({ url: URL, cluster: null, ...o }), { skip: !URL });
+// The same contract on a bus scoped to a cluster: handlers, onError and subscriberCount all speak unprefixed subjects.
+const SCOPE = "c-0123456789abcdef";
+busContract("memory bus (scoped)", o => memoryBus({ cluster: SCOPE, ...o }));
+busContract("nats bus (scoped)", o => natsBus({ url: URL, cluster: SCOPE, ...o }), { skip: !URL });
 
 // ---- the wire format (no server needed) ----
 
@@ -44,7 +51,7 @@ test("nats wire: nested bytes, bare bytes and bigints are refused, not mangled",
 // ---- NATS only ----
 
 const open = [];
-const make = async o => { const b = await natsBus({ url: URL, ...o }); open.push(b); return b; };
+const make = async o => { const b = await natsBus({ url: URL, cluster: null, ...o }); open.push(b); return b; };
 afterAll(async () => { for (const b of open.splice(0)) await b.close().catch(() => {}); });
 const tenant = runTenant();
 
@@ -98,22 +105,31 @@ nt("nats: a 2 MB message (encoded) travels; one byte more is refused before the 
   await until(() => got.length === 2, "the binary message");
   expect(got[1].data.byteLength).toBe(binFits.data.byteLength);
   expect(Buffer.isBuffer(got[1].data)).toBe(false);
-  await a.flush(); await b.flush(); await sleep(50);
-  expect(got.length).toBe(2);
+  // Nothing else arrives: the refused publishes never reached the wire. A sentinel from the same publisher is the barrier (per-publisher order),
+  // so a stray 2 MB+ message sent before it would sit ahead of it in `got`.
+  await a.publish(s, { data: "sentinel" });
+  await until(() => got.some(m => m.data === "sentinel"), "the sentinel after the refused publishes");
+  expect(got.map(m => m.data.length)).toEqual([edge.data.length, binFits.data.byteLength, "sentinel".length]);
 });
 
 nt("nats: a refused publish nobody awaits goes to onError, not to an unhandled rejection", async () => {
-  const errors = [], bus = await make({ onError: e => errors.push(e.code) });
-  let unhandled = 0; const onUnhandled = () => { unhandled++; };
-  process.on("unhandledRejection", onUnhandled);
-  try {
-    bus.publish(subjects.inbox(tenant, "b-ff"), { data: "x".repeat(MAX_BUS_BYTES + 1) });   // not awaited
-    bus.publish("plen.*.b", 1);                                                            // not awaited
-    bus.publish(subjects.inbox(tenant, "b-ff"), { deep: { b: new Uint8Array(1) } });       // not awaited
-    await sleep(50);
-  } finally { process.off("unhandledRejection", onUnhandled); }
-  expect(errors).toEqual(["too-large", "bad-id", "bad-entry"]);
-  expect(unhandled).toBe(0);
+  // Under `bun test` an unhandled rejection fails the running test at once and never reaches a process listener, so the count is taken in a child
+  // bun process that has its own listener and prints what it saw.
+  const script = `
+    import { natsBus, subjects, MAX_BUS_BYTES } from ${JSON.stringify(`${import.meta.dir}/../../server/bus/nats.js`)};
+    let unhandled = 0; process.on("unhandledRejection", () => { unhandled++; });
+    const errors = [];
+    const bus = await natsBus({ url: process.env.NATS_URL, cluster: null, onError: e => errors.push(e.code) });
+    bus.publish(subjects.inbox("t-unh", "b-ff"), { data: "x".repeat(MAX_BUS_BYTES + 1) });   // not awaited
+    bus.publish("plen.*.b", 1);                                                              // not awaited
+    bus.publish(subjects.inbox("t-unh", "b-ff"), { deep: { b: new Uint8Array(1) } });        // not awaited
+    await new Promise(r => setTimeout(r, 0));   // one macrotask: an unhandled rejection is reported by now
+    await bus.close();
+    console.log(JSON.stringify({ errors, unhandled }));`;
+  const child = spawnTracked([process.execPath, "--no-env-file", "-e", script], { stdout: "pipe", stderr: "pipe", env: { ...process.env, NATS_URL: URL } });
+  const [out, err] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+  let seen; try { seen = JSON.parse(out.trim().split("\n").at(-1)); } catch { seen = { unparsable: out, stderr: err }; }
+  expect(seen).toEqual({ errors: ["too-large", "bad-id", "bad-entry"], unhandled: 0 });
 });
 
 nt("nats: wildcards and malformed subjects are refused on publish and subscribe", async () => {
@@ -132,15 +148,16 @@ nt("nats: a wildcard listener elsewhere would hear us, but our subscribe can't b
   bus.subscribe(subjects.entries(`${tenant}-b`, "b-1"), m => got.push(m));
   await bus.flush();
   await bus.publish(subjects.entries(`${tenant}-a`, "b-1"), "for a");
-  await bus.flush(); await sleep(50);
-  expect(got).toEqual([]);
+  // Barrier: a sentinel on the same connection, to the listener's own subject. Anything forwarded from tenant A's subject would precede it.
+  await bus.publish(subjects.entries(`${tenant}-b`, "b-1"), "sentinel");
+  await until(() => got.includes("sentinel"), "the sentinel on tenant b's subject");
+  expect(got).toEqual(["sentinel"]);
 });
 
 nt("nats: an unreachable server rejects natsBus (callers decide; nothing hangs)", async () => {
-  const t0 = Date.now();
-  expect(await code(natsBus({ url: "nats://127.0.0.1:1", connectTimeoutMs: 1000 }))).not.toBe("resolved");
-  expect(Date.now() - t0).toBeLessThan(5000);
-});
+  // (A connect that never gave up never returns, and the test's own limit fails it.)
+  expect(await code(natsBus({ url: "nats://127.0.0.1:1", cluster: null, connectTimeoutMs: 1000 }))).not.toBe("resolved");
+}, 30_000);
 
 test("nats: natsBus needs a url (never reads env itself)", async () => {
   expect(await code(natsBus({}))).toBe("threw natsBus needs a url");
@@ -159,7 +176,7 @@ ot("nats outage: publishes are refused (unavailable) while down, reported once p
   const conf = mb => { const f = `${dir}/n${mb}.conf`; writeFileSync(f, `listen: "127.0.0.1:${port}"\nmax_payload: ${mb}MB\n`); return f; };
   const procs = [];
   const start = async mb => {
-    const p = Bun.spawn([natsBin, "--config", conf(mb)], { stdout: "ignore", stderr: "ignore" });
+    const p = spawnTracked([natsBin, "--config", conf(mb)], { stdout: "ignore", stderr: "ignore" });
     procs.push(p);
     await until(async () => { try { (await Bun.connect({ hostname: "127.0.0.1", port, socket: { data() {} } })).end(); return true; } catch { return false; } }, "nats-server up");
     return p;
@@ -168,8 +185,8 @@ ot("nats outage: publishes are refused (unavailable) while down, reported once p
   try {
     let srv = await start(2);
     const errors = [], url = `nats://127.0.0.1:${port}`;
-    const bus = await natsBus({ url, onError: e => errors.push(e.code), reconnectWaitMs: 100 });
-    const listener = await natsBus({ url, reconnectWaitMs: 100 });
+    const bus = await natsBus({ url, cluster: null, onError: e => errors.push(e.code), reconnectWaitMs: 100 });
+    const listener = await natsBus({ url, cluster: null, reconnectWaitMs: 100 });
     open.push(bus, listener);
     const got = [], s = "plen.t-out.b-1.presence";
     listener.subscribe(s, m => got.push(m));
@@ -190,8 +207,7 @@ ot("nats outage: publishes are refused (unavailable) while down, reported once p
     await listener.flush();
     await bus.publish(s, "after");
     await until(() => got.includes("after"), "after");
-    await bus.flush(); await sleep(100);
-    expect(got).toEqual(["before", "after"]);                                                  // nothing from the outage replays
+    expect(got).toEqual(["before", "after"]);   // nothing from the outage replays: it would sit ahead of "after" (one publisher, one connection, in order)
 
     await stop(srv);                                                                            // a second outage is reported again
     await until(() => errors.length === 2, "second outage reported");
@@ -222,15 +238,16 @@ test("nats wire: a foreign header can't name __proto__ (or other prototype keys)
 ot("nats stall: a frozen server (SIGSTOP) caps what is queued, is declared stale by pings, and what was queued is dropped, not replayed", async () => {
   const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
-  const dir = mkdtempSync(`${tmpdir()}/plen-nats-`), port = freePort(), conf = `${dir}/n.conf`;
-  writeFileSync(conf, `listen: "127.0.0.1:${port}"\nmax_payload: 2MB\n`);
-  const srv = Bun.spawn([natsBin, "--config", conf], { stdout: "ignore", stderr: "ignore" });
+  const dir = mkdtempSync(`${tmpdir()}/plen-nats-`), port = freePort(), mport = freePort(), conf = `${dir}/n.conf`;
+  writeFileSync(conf, `listen: "127.0.0.1:${port}"\nhttp: "127.0.0.1:${mport}"\nmax_payload: 2MB\n`);
+  const connz = async q => (await fetch(`http://127.0.0.1:${mport}/connz?${q}`)).json();   // the server's own monitor: what it received per connection
+  const srv = spawnTracked([natsBin, "--config", conf], { stdout: "ignore", stderr: "ignore" });
   let frozen = false;
   try {
     await until(async () => { try { (await Bun.connect({ hostname: "127.0.0.1", port, socket: { data() {} } })).end(); return true; } catch { return false; } }, "nats-server up");
     const url = `nats://127.0.0.1:${port}`, errors = [];
-    const bus = await natsBus({ url, onError: e => errors.push([e.code, e.message]), pingIntervalMs: 500, maxPingOut: 2, maxPendingBytes: 8 * 1024 * 1024, reconnectWaitMs: 100, connectTimeoutMs: 1000 });
-    const listener = await natsBus({ url });
+    const bus = await natsBus({ url, cluster: null, onError: e => errors.push([e.code, e.message]), pingIntervalMs: 500, maxPingOut: 2, maxPendingBytes: 24 * 1024 * 1024, reconnectWaitMs: 100, connectTimeoutMs: 1000 });
+    const listener = await natsBus({ url, cluster: null });
     open.push(bus, listener);
     const got = [], s = "plen.t-stall.b-1.presence";
     listener.subscribe(s, m => got.push(m.k));
@@ -238,15 +255,19 @@ ot("nats stall: a frozen server (SIGSTOP) caps what is queued, is declared stale
     await bus.publish(s, { k: "before" });
     await until(() => got.includes("before"), "before");
 
+    // The publisher is the one connection with no subscription (the listener holds the only one); the server counts what it read from it.
+    const pub = (await connz("subs=1")).connections.find(c => !c.num_subscriptions);
+    expect(pub?.cid).toBeGreaterThan(0);
     process.kill(srv.pid, "SIGSTOP"); frozen = true;
     const big = "x".repeat(1024 * 1024);
     let accepted = 0, refused = 0;
-    for (let i = 0; i < 60; i++) {                     // 60 MB offered while frozen
+    for (let i = 0; i < 80; i++) {                     // 80 MB offered while frozen
       (await code(bus.publish(s, { k: `frozen-${i}`, big }))) === "resolved" ? accepted++ : refused++;
       if (i % 10 === 9) await sleep(20);
     }
-    expect(accepted).toBeLessThanOrEqual(8);           // the cap: at most 8 MB queued, not 60
-    expect(refused).toBe(60 - accepted);
+    expect(accepted).toBeLessThanOrEqual(24);          // the cap: at most 24 MB queued, not 80
+    expect(accepted).toBeGreaterThan(12);              // (and it did queue up to it)
+    expect(refused).toBe(80 - accepted);
     expect(bus.isUp()).toBe(false);
     expect(errors.map(e => e[0])).toEqual(["unavailable"]);           // congestion, reported once
     await until(() => errors.length === 2, "declared stale by pings", 5000);
@@ -260,12 +281,22 @@ ot("nats stall: a frozen server (SIGSTOP) caps what is queued, is declared stale
     await listener.flush();
     await bus.publish(s, { k: "after" });
     await until(() => got.includes("after"), "after");
-    await sleep(200);
-    const replayed = got.filter(k => k.startsWith("frozen-")).length;
-    // Only what already sat in the frozen server's kernel receive buffer can still arrive (1 in local runs);
-    // everything queued in this process was dropped with the socket.
-    expect(replayed).toBeLessThan(accepted);
-    expect(replayed).toBeLessThanOrEqual(2);
+    // Barrier: the server read the old connection's buffered bytes in order and then saw it close; once it lists that connection as closed, every
+    // message it took from it was already routed ahead of anything published after. A sentinel on the new connection then proves they all arrived.
+    const closed = await until(async () => (await connz(`state=closed&cid=${pub.cid}`)).connections[0], "the server to close the old publisher connection", 10000);
+    await bus.publish(s, { k: "sentinel" });
+    await until(() => got.includes("sentinel"), "the sentinel");
+    const late = got.filter(k => k.startsWith("frozen-"));
+    // Only what had already left this process can still arrive: the bytes in the kernel's TCP buffers (this socket's send
+    // buffer and the frozen server's receive buffer), delivered in order once it resumes. Everything still queued in
+    // this process was dropped with the socket. So what arrives is exactly the first k messages published, in order,
+    // and k is bounded by the kernels' buffer maxima, not by how many were accepted: autotuned at most 4 + 4 MB on
+    // macOS (net.inet.tcp.autosndbufmax / autorcvbufmax) and 4 + 6 MB with Linux defaults (tcp_wmem / tcp_rmem), so
+    // at most 10 of these 1 MB messages, where a replay of the queue would bring back up to all 24 accepted.
+    expect(late).toEqual(late.map((_, i) => `frozen-${i}`));
+    expect(late.length).toBeLessThanOrEqual(10);
+    expect(late.length).toBeLessThan(accepted);
+    expect(late.length).toBe(closed.in_msgs - 1);      // exactly what the server took from the old connection ("before" was the first), none lost on the way, none replayed
     expect(got).not.toContain("during");
     await bus.close(); await listener.close();
   } finally {
@@ -277,5 +308,5 @@ ot("nats stall: a frozen server (SIGSTOP) caps what is queued, is declared stale
 
 test("nats: stall settings must be sane", async () => {
   for (const o of [{ pingIntervalMs: 0 }, { maxPingOut: -1 }, { maxPendingBytes: 1024 }, { ackEveryMs: NaN }])
-    expect(await code(natsBus({ url: "nats://127.0.0.1:1", ...o }))).toMatch(/^threw natsBus/);
+    expect(await code(natsBus({ url: "nats://127.0.0.1:1", cluster: null, ...o }))).toMatch(/^threw natsBus/);
 });

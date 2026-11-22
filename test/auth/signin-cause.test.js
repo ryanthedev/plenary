@@ -306,14 +306,16 @@ function sourceLabels(text, calls) {
   return [...out];
 }
 
-// p5-tidyv V5: the CEO's hand-off table (docs/m2/reports/p5-google2.md, section (e)) lists exactly what can be logged.
-test("the hand-off cause table lists every label the server can log, and nothing else", async () => {
-  const doc = await Bun.file(new URL("../../docs/m2/reports/p5-google2.md", import.meta.url)).text();
-  const from = doc.indexOf("**(e) If it fails:**");
+// The operator guide's cause table (deploy/README.md, "Sign-in failures") lists exactly what can be logged.
+test("the operator cause table lists every label the server can log, and nothing else", async () => {
+  const doc = await Bun.file(new URL("../../deploy/README.md", import.meta.url)).text();
+  const from = doc.indexOf("## Sign-in failures");
   expect(from).toBeGreaterThan(-1);
-  const rows = doc.slice(from).split("\n").slice(1).filter(Boolean);
-  const table = rows.slice(0, rows.findIndex(r => !r.startsWith("|")));
-  expect(table[0]).toMatch(/^\| `cause` \|/);
+  const rows = doc.slice(from).split("\n").filter(Boolean).slice(1);
+  const start = rows.findIndex(r => r.startsWith("| `cause` |"));
+  expect(start).toBeGreaterThan(-1);
+  const rest = rows.slice(start);
+  const table = rest.slice(0, rest.findIndex(r => !r.startsWith("|")));
   const listed = table.slice(2).flatMap(r => [...r.split("|")[1].matchAll(/`([^`]+)`/g)].map(m => norm(m[1])));
   const known = [...new Set([...CAUSES, ...SIGN_IN_CAUSES].map(norm))];
   for (const c of known) expect(listed, `${c} missing from the table`).toContain(c);

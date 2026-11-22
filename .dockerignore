@@ -10,6 +10,10 @@
 .dockerignore
 docs
 CLAUDE.md
+README.md
+PROTOCOL.md
+.rig
+.code-foundations
 
 # Packaging files. Docker reads deploy/Dockerfile itself; nothing in deploy/ is used at runtime.
 # This also keeps deploy/.env (where Compose reads secrets) out of the image.
@@ -18,6 +22,10 @@ deploy
 # Tests run in CI from a checkout, not from the image; test/ holds fakes (a fake identity provider, a fake
 # store) that should not ship. Nothing in server/, web/ or packages/ imports from test/.
 test
+
+# Design notes and dev/CI scripts (rig, clean, test-cluster): not part of the running server.
+design
+scripts
 
 # Dependencies are installed inside the image from bun.lock (`bun install --frozen-lockfile --production`), never
 # copied from the host. bun.lock itself must stay in the context: never list it here.

@@ -1,3 +1,4 @@
+// @ts-check
 // The incremental checkpoint (PROTOCOL.md § Recovery, "Incremental fold"): a checkpoint as a job of small steps, so
 // a big board never holds the event loop for the whole copy. Pure and synchronous: it never schedules itself; the
 // room (or a test) calls step() and the host decides when (the room's `schedule`).

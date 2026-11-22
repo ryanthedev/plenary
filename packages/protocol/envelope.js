@@ -1,3 +1,4 @@
+// @ts-check
 // The rules every message obeys (PROTOCOL.md v1.1): streams, roles, what an op may hold, the limits.
 // Pure: imports nothing, so a room, a browser, a phone and a Herdr pane all check the same way.
 

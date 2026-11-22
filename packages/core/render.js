@@ -1,3 +1,4 @@
+// @ts-check
 // Board → display list: what to paint, in screen coordinates, in order.
 // Adapters (Herdr, SVG, a browser canvas) only paint these items:
 //   { t: "path", cmds, stroke, width, dash?, opacity? }   cmds: ["M",x,y] ["L",x,y] ["Q",x,y,cx,cy]

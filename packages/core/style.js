@@ -1,3 +1,4 @@
+// @ts-check
 // Excalidraw's drawing vocabulary, so files from excalidraw.com look the same here:
 // rounded corners (roundness), fill styles (hachure, cross-hatch), arrowhead types
 // and font families. Pure geometry: everything returns points or path commands.

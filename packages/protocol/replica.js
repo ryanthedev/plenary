@@ -1,3 +1,4 @@
+// @ts-check
 // A client's copy of a board (PROTOCOL.md v1.1): applies the room's entries in seq order, whatever order they
 // arrive in, and shows its own ops at once (optimistic) until the room acknowledges them.
 // Runs in a browser, a phone, Node or a Herdr pane: imports only the core's model and merge rules.

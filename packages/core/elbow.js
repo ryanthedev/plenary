@@ -1,3 +1,4 @@
+// @ts-check
 // Elbow arrows: right-angle routes between two shapes (Excalidraw's `elbowed: true`).
 //
 // The route leaves the start shape from the side that faces the target and
@@ -32,6 +33,7 @@ export function sidePoint(b, side, gap = 0) {
 // Determine the outward cardinal side of a normalized fixedPoint [fx, fy] in [0, 1] x [0, 1].
 export function sideFromFixedPoint(fp, fallback) {
   const fx = Math.max(0, Math.min(1, fp[0])), fy = Math.max(0, Math.min(1, fp[1]));
+  /** @type {[string, number][]} */
   const d = [
     ["top", fy],
     ["bottom", 1 - fy],

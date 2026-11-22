@@ -1,3 +1,4 @@
+// @ts-check
 // The side panel's layout and the person's own choices for it, free of Herdr so it's tested
 // headless: which sections show and in what order, which are folded, stacked or as tabs, how
 // wide, and the person's palette and recent colors. One set for every board (prefs.json); the
@@ -118,6 +119,10 @@ export function panelLayout(state, paneW) {
 // section has anything to show right now (no selection: no Arrange). In tabs mode every visible
 // section gets a tab, and only the active one is drawn (`active`); its tab falls back to the
 // first available one.
+/**
+ * @param {any} state
+ * @param {(id: string) => boolean} [available]
+ */
 export function panelSections(state, available = () => true) {
   const s = normalizePanel(state);
   const list = s.order.filter(id => !s.hidden.includes(id) && available(id));

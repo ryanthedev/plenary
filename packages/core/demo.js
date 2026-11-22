@@ -1,3 +1,4 @@
+// @ts-check
 // The demo board: a short animated tour that teaches the keys by showing them. Spell keys out
 // (Cmd, Shift): the hand font has no ⌘/⇧ glyphs.
 // Built fresh each time (never saved): the pane plays it in its own Editor, beside the person's

@@ -1,3 +1,4 @@
+// @ts-check
 // The board's data: a superset of the .excalidraw file format (version 2).
 // Everything herdr-draw adds lives where Excalidraw keeps foreign data, so the
 // file still opens there: per element in `customData` ({ layer, z, anim }),

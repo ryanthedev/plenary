@@ -1,3 +1,4 @@
+// @ts-check
 // The board in memory, and the one way to change it: apply an op.
 //
 // An op is { elements?: Element[], appState?: object, files?: object } — whole

@@ -1,3 +1,4 @@
+// @ts-check
 // The board picker's logic, free of Herdr so it's tested headless: which boards to offer for a
 // query (recent first when there's no query), the recent list, and a new board's file name.
 //
@@ -59,7 +60,7 @@ export function rankBoards(query, files, recent = [], { home = "", current = nul
     }
     rows.push({ path, name, folder, recent: ri >= 0, current: path === current, s, ri, m: mtime.get(path) ?? 0 });
   }
-  rows.sort((a, b) => b.s - a.s || (a.ri < 0) - (b.ri < 0) || (a.ri >= 0 && b.ri >= 0 ? a.ri - b.ri : b.m - a.m) || a.name.localeCompare(b.name));
+  rows.sort((a, b) => b.s - a.s || Number(a.ri < 0) - Number(b.ri < 0) || (a.ri >= 0 && b.ri >= 0 ? a.ri - b.ri : b.m - a.m) || a.name.localeCompare(b.name));
   return rows.map(({ s, ri, m, ...r }) => r);
 }
 

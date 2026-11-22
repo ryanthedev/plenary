@@ -1,3 +1,4 @@
+// @ts-check
 // Pure Jira, Linear & GitHub rich link card URL parser, sanitizer, and element builder.
 // Strictly pure: no DOM, Node, or network globals. Produces 100% protocol v1.1-valid
 // Excalidraw rectangle elements with `link` and `customData.linkCard`.

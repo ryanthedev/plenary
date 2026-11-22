@@ -1,3 +1,4 @@
+// @ts-check
 // Geometry on scene coordinates: boxes, hit testing, arrow binding, transforms.
 
 import { isShape, isLinear, isLabel, isMedia, textSize } from "./model.js";
@@ -185,6 +186,7 @@ export function bindTargetAt(doc, p, except, pad = 4) {
 // A shape's connection points: the middle of each side (a diamond's corners, an ellipse's
 // ends), on the outline (`at`) and `gap` out from it (`bind`), with the Excalidraw
 // `fixedPoint` an arrow end stores to stay there.
+/** @type {[string, number, number, number, number][]} */
 const SIDES = [["top", 0.5, 0, 0, -1], ["right", 1, 0.5, 1, 0], ["bottom", 0.5, 1, 0, 1], ["left", 0, 0.5, -1, 0]];
 const BOX_CORNERS = [[0, 0, -Math.SQRT1_2, -Math.SQRT1_2], [1, 0, Math.SQRT1_2, -Math.SQRT1_2], [1, 1, Math.SQRT1_2, Math.SQRT1_2], [0, 1, -Math.SQRT1_2, Math.SQRT1_2]];
 const SIDE_VEC = { top: [0, -1], right: [1, 0], bottom: [0, 1], left: [-1, 0] };
@@ -253,6 +255,7 @@ export function closestPerimeterPoint(el, p) {
     }
   } else if (el.type === "diamond") {
     const verts = [[cx, b.y, 0, -1], [b.x + b.w, cy, 1, 0], [cx, b.y + b.h, 0, 1], [b.x, cy, -1, 0]];
+    /** @type {[number[], number[], number, number][]} */
     const segs = [
       [verts[0], verts[1], ry, -rx],
       [verts[1], verts[2], ry, rx],
@@ -335,6 +338,13 @@ export function portAt(doc, p, tol, except) {
 
 // Closest perimeter point within `tol` of `p` on any bindable target (except `except`),
 // with gentle magnetic pull to cardinal ports (and corners on box shapes) within tight thresholds.
+/**
+ * @param {any} doc
+ * @param {{ x: number, y: number }} p
+ * @param {number} tol
+ * @param {string | null} [except]
+ * @param {{ portTol?: number, cornerTol?: number }} [opts]
+ */
 export function perimeterAt(doc, p, tol, except = null, { portTol, cornerTol } = {}) {
   let best = null;
   for (const el of doc.visible()) {
@@ -406,6 +416,11 @@ export function perimeterAt(doc, p, tol, except = null, { portTol, cornerTol } =
 
 // Resolve the binding at world point `p`: perimeter snap (with cardinal/corner magnet) first,
 // else interior body binding (aimed at the other end) for shapes & media.
+/**
+ * @param {any} doc
+ * @param {{ x: number, y: number }} p
+ * @param {{ tol?: number, portTol?: number, cornerTol?: number, pad?: number, except?: string | null, gap?: number }} [opts]
+ */
 export function bindingAt(doc, p, { tol = 12, portTol, cornerTol, pad = 8, except = null, gap = 6 } = {}) {
   const perim = perimeterAt(doc, p, tol, except, { portTol, cornerTol });
   if (perim) {

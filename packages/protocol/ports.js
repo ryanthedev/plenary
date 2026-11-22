@@ -1,3 +1,4 @@
+// @ts-check
 // What a room needs from the outside world, as interfaces, plus in-memory versions for tests and
 // single-process use. A deployment swaps these (SQLite, Postgres, a bus) without touching the room.
 // The server's ports are async (PROTOCOL.md § Ports); the ones here are synchronous, and a room takes both.

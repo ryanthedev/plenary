@@ -1,3 +1,4 @@
+// @ts-check
 // Overlap checks for a board as it is drawn (after settle + fileScene): label words wider than their
 // shape allows, shapes partly covering each other, edges through shapes other than their ends, edge labels on shapes or on each other,
 // edges through another edge's label, frame titles on anything, two edges drawn on top of each other.

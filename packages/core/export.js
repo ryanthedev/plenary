@@ -1,3 +1,4 @@
+// @ts-check
 // Export: the drawing cropped to what is painted, ready for any painter at any pixel ratio.
 // Pure: it builds its own view, so the editor's scroll, zoom, selection and overlays never
 // show. exportScene() returns toSvg's arguments: `const s = exportScene(...); toSvg(s.items, s)`.

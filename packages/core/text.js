@@ -1,3 +1,4 @@
+// @ts-check
 // Text layout without a font engine: word wrap by an estimated glyph width.
 // Every adapter (Herdr, SVG, a browser later) draws the same lines, so labels
 // wrap identically everywhere and the file stays the single source of truth.

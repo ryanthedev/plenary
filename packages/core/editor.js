@@ -1,3 +1,4 @@
+// @ts-check
 // The editor: tools, selection, gestures, history, layers, commands.
 //
 // Platform-free. An adapter feeds it pointer/key events in screen pixels
@@ -61,6 +62,9 @@ const DRAWING_TOOLS = new Set(["rectangle", "diamond", "ellipse", "arrow", "line
 const RESIZE_CURSOR = { n: "ns-resize", s: "ns-resize", e: "ew-resize", w: "ew-resize", nw: "nwse-resize", se: "nwse-resize", ne: "nesw-resize", sw: "nesw-resize" };
 
 export class Editor {
+  /**
+   * @param {{ scene?: any, onOp?: (op: any) => void, onOpenLink?: ((url: string, el?: any, card?: any) => void) | null, clock?: () => number, readOnly?: boolean }} [opts]
+   */
   constructor({ scene, onOp = () => {}, onOpenLink = null, clock = () => Date.now(), readOnly = false } = {}) {
     this.doc = new Doc(scene ?? { elements: [] });
     this.onOp = onOp; this.onOpenLink = onOpenLink; this.clock = clock;
@@ -109,6 +113,10 @@ export class Editor {
   // ── changing the board ─────────────────────────────────────────────────
 
   // Run fn(tx) and commit its edits as one undoable step.
+  /**
+   * @param {(tx: any) => any} fn
+   * @param {{ history?: boolean, files?: Record<string, any> }} [opts]
+   */
   transact(fn, { history = true, files } = {}) {
     const tx = new Tx(this.doc);
     const result = fn(tx);
@@ -227,8 +235,9 @@ export class Editor {
     const c = mid(nw, se), len = Math.hypot(n.x - c.x, n.y - c.y) || 1;
     const rot = { kind: "rotate", x: n.x + (n.x - c.x) / len * ROT_GAP, y: n.y + (n.y - c.y) / len * ROT_GAP };
     if (els.length === 1 && els[0].type === "text") return [rot];
-    return [["nw", nw], ["n", n], ["ne", ne], ["e", mid(ne, se)], ["se", se], ["s", mid(se, sw)], ["sw", sw], ["w", mid(sw, nw)]]
-      .map(([dir, p]) => ({ kind: "resize", dir, x: p.x, y: p.y })).concat([rot]);
+    /** @type {[string, { x: number, y: number }][]} */
+    const corners = [["nw", nw], ["n", n], ["ne", ne], ["e", mid(ne, se)], ["se", se], ["s", mid(se, sw)], ["sw", sw], ["w", mid(sw, nw)]];
+    return [...corners.map(([dir, p]) => ({ kind: "resize", dir, x: p.x, y: p.y })), rot];
   }
   slopScale(pointerType = this.lastPointerType) { return pointerType === "touch" ? TOUCH_SLOP_MULT : 1; }
   handleAt(p, pointerType = this.lastPointerType) {
@@ -654,7 +663,9 @@ export class Editor {
         return this.commitGesture(g.before, dirty);
       }
       case "resize": case "point": case "rotate": {
-        const dirty = new Map([...g.orig.keys()].map(id => [id, clone(this.doc.get(id))]).filter(([, e]) => e));
+        /** @type {[string, any][]} */
+        const entries = [...g.orig.keys()].map(id => /** @type {[string, any]} */ ([id, clone(this.doc.get(id))])).filter(([, e]) => e);
+        const dirty = new Map(entries);
         if (g.kind === "point") this.linkBound(dirty.values().next().value, g.before, dirty);
         return this.commitGesture(g.before, dirty);
       }
@@ -872,7 +883,9 @@ export class Editor {
       const ids = new Set(this.sel);
       for (const id of [...ids]) { const el = this.doc.get(id); const l = el && isShape(el) && this.doc.labelOf(el); if (l) ids.add(l.id); }
       g.extra = [...ids].filter(id => !this.sel.has(id));
-      g.orig = new Map([...ids].map(id => [id, clone(this.doc.get(id))]).filter(([, e]) => e && this.doc.editable(e)));
+      /** @type {[string, any][]} */
+      const origEntries = [...ids].map(id => /** @type {[string, any]} */ ([id, clone(this.doc.get(id))])).filter(([, e]) => e && this.doc.editable(e));
+      g.orig = new Map(origEntries);
       g.before = new Map([...g.orig].map(([id, e]) => [id, clone(e)]));
       g.box = unionBox([...g.orig.values()].filter(e => !isLabel(e)).map(e => bounds(e, this.doc)));
     }
@@ -1569,6 +1582,10 @@ export class Editor {
   // ── animation ──────────────────────────────────────────────────────────
 
   // Give the selection a preset, staggered in selection order after what's already animated.
+  /**
+   * @param {string} preset
+   * @param {{ duration?: number, stagger?: number, start?: number, easing?: string, loop?: boolean }} [opts]
+   */
   animate(preset, { duration, stagger = 150, start, easing, loop } = {}) {
     const els = this.selected(), meta = getPreset(preset); if (!els.length || !meta) return;
     const dur = Math.max(50, Math.round(Number.isFinite(duration) ? duration : (meta.duration ?? 600)));

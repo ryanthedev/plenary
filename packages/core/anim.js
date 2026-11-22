@@ -1,3 +1,4 @@
+// @ts-check
 // Animation: each element may carry customData.anim, played on the board's timeline.
 //
 //   anim = { preset, start, duration, easing?, loop? }      a preset (below), or

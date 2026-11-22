@@ -1,3 +1,4 @@
+// @ts-check
 // The library: reusable drawings, in Excalidraw's .excalidrawlib format so libraries move
 // between excalidraw.com and here. Read: v2 { libraryItems: [{ id, status, created, name?,
 // elements }] } and v1 { library: [[elements], …] }. Written: v2. Items may carry `files`
@@ -40,6 +41,10 @@ export function mergeLibrary(items, incoming) {
 }
 
 // An item from elements (labels already included); keeps only the files its pictures use.
+/**
+ * @param {any[]} elements
+ * @param {{ name?: string, files?: Record<string, any>, now?: number }} [opts]
+ */
 export function itemFromElements(elements, { name, files = {}, now = Date.now() } = {}) {
   const els = elements.map(clone), used = {};
   for (const e of els) {

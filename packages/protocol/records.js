@@ -1,3 +1,4 @@
+// @ts-check
 // Comment threads and reactions (PROTOCOL.md § Records): the state behind the `records` stream.
 // Records don't merge by version: every copy applies the same actions in seq order. The room checks an
 // action before logging it (`check`), so `apply` never meets a forbidden one; an action on a deleted

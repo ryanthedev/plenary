@@ -1,3 +1,4 @@
+// @ts-check
 // Mermaid flowchart → editable board elements, laid out in layers.
 //
 // Supported (the flowchart subset people and agents actually write):
@@ -238,6 +239,7 @@ export function layoutGraph(g) {
     for (const p of place.values()) { if (g.dir === "BT") p.y = total - p.y - p.h; else p.x = total - p.x - p.w; }
   }
   // The nodes, by id; .lanes: per edge (as g.edges), the lane boxes it passes through, in order.
+  /** @type {Map<string, any> & { lanes?: any[][], all?: Map<string, any>, ranks?: Map<string, number> }} */
   const nodes = new Map(ids.map(id => [id, place.get(id)]));
   nodes.lanes = lanes.map(chain => chain.map(id => place.get(id)));
   nodes.all = place;

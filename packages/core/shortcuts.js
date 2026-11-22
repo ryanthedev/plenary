@@ -1,3 +1,4 @@
+// @ts-check
 // Every shortcut, in one list: the help overlay (?) shows it, and test/shortcuts.test.js presses
 // each `probe` on a real Editor so the list can't drift from the key handler (Editor.key).
 //

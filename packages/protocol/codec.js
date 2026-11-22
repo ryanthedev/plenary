@@ -1,3 +1,4 @@
+// @ts-check
 // How messages become bytes. JSON in v0; a binary codec (MessagePack, CBOR) can replace it later
 // without touching rooms or replicas: they only ever see decoded objects.
 

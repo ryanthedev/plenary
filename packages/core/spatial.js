@@ -1,3 +1,4 @@
+// @ts-check
 // Uniform-grid spatial index over Doc's visible elements (M3 Phase 1).
 // Pure core module: no DOM or host globals. Invalidated automatically when `doc.rev` changes.
 // Preserves exact `doc.visible()` paint order on every query.

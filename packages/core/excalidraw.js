@@ -1,3 +1,4 @@
+// @ts-check
 // Excalidraw v2 interoperability: pure import, export, clipboard round-trip, and ID remapping.
 //
 // Strictly pure: no DOM, browser, or Node globals. Runs in browsers, servers, and QuickJS.
@@ -469,6 +470,8 @@ function sanitizeFiles(rawFiles, elements, {
 /**
  * Parses and sanitizes an Excalidraw v2 file (`type: "excalidraw"`) or clipboard payload
  * (`type: "excalidraw/clipboard"`). Never throws on malformed input.
+ * @param {any} input
+ * @param {{ allowVideo?: boolean, now?: number, maxInputBytes?: number, maxElements?: number, maxTotalPoints?: number, maxFileBytes?: number, maxTotalFileBytes?: number }} [opts]
  */
 export function parseExcalidraw(input, {
   allowVideo,
@@ -644,6 +647,8 @@ export function remapExcalidrawIds(elements, files = {}, { fileIdMap = null, lay
 /**
  * High-level import helper: parses an Excalidraw file or clipboard payload and optionally
  * remaps IDs + fileIds so the resulting elements can be committed safely via protocol v1.1 ops.
+ * @param {any} input
+ * @param {{ remapIds?: boolean, fileIdMap?: Map<string, string> | Record<string, string> | null, layer?: string, zStart?: number, dropNonSha1?: boolean, allowVideo?: boolean, now?: number }} [opts]
  */
 export function importExcalidrawPayload(input, { remapIds = true, fileIdMap = null, layer = BASE_LAYER, zStart = 0, dropNonSha1 = false, allowVideo, now = Date.now() } = {}) {
   const parsed = parseExcalidraw(input, { allowVideo, now });
@@ -772,6 +777,8 @@ function buildExportFiles(elements, docFiles, { includeVideo = false, now = Date
 /**
  * Exports a Plenary `Doc` or scene object to a 100% valid Excalidraw v2 JSON object
  * (`{ type: "excalidraw", version: 2, source, elements, appState, files }`).
+ * @param {any} docOrScene
+ * @param {{ source?: string, viewBackgroundColor?: string, now?: number }} [opts]
  */
 export function exportToExcalidraw(docOrScene, { source = EXCALIDRAW_SOURCE, viewBackgroundColor, now = Date.now() } = {}) {
   const doc = docOrScene instanceof Doc ? docOrScene : new Doc(docOrScene ?? { elements: [] });

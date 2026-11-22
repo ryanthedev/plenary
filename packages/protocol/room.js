@@ -1,3 +1,4 @@
+// @ts-check
 // The reference room: the one sequencer for a board (PROTOCOL.md v1.1). Its state is a pure function of the
 // log, so it can be rebuilt from a checkpoint plus the entries after it (§ Recovery). Storage comes in
 // through the Log port; identity comes with the hello, already verified by a gateway (rule 8): a room
@@ -39,11 +40,26 @@ export function catchUp(base, tail, since) {
   return out;
 }
 
+/**
+ * @typedef {object} RoomOptions
+ * @property {string} board
+ * @property {string} tenant
+ * @property {import("./ports.js").Log | null} log
+ * @property {() => number} [now]
+ * @property {number} [epoch]
+ * @property {Record<number, any>} [rules]
+ * @property {boolean} [auto]
+ * @property {number} [foldBytes]
+ * @property {((fn: () => void) => void) | null} [schedule]
+ * @property {number} [foldUnits]
+ * @property {boolean} [measure]
+ * @property {(what: string, detail: object) => void} [report]
+ */
+
 export class Room {
   /**
    * A new, empty room. To bring a board back, use Room.rebuild or Room.fromLog.
-   * @param {{ board: string, tenant: string, log: import("./ports.js").Log, now?: () => number, epoch?: number,
-   *           rules?: object, auto?: boolean, foldBytes?: number, schedule?: (fn: () => void) => void, foldUnits?: number, report?: (what: string, detail: object) => void }} o
+   * @param {RoomOptions} o
    *   `now`: the room's clock in ms (entries carry it as `at`). `epoch`: this incarnation's number from
    *   Store.openEpoch, which the host calls before building the room (§ Recovery, Room identity); every
    *   welcome carries it. Omitted: the log's openEpoch() if it has one, else 1. `rules`: per rules version { W, H, every }; only tests pass it. `auto`: checkpoint
@@ -54,7 +70,18 @@ export class Room {
   constructor({ board, tenant, log, now = Date.now, epoch, rules = RULES, auto = true, foldBytes = CHECKPOINT_BYTES, schedule = null, foldUnits = FOLD_STEP_UNITS, measure = true, report = () => {} }) {
     // A host passes the epoch it opened; without one, open the log's next (so two builds never share one), else 1.
     if (epoch === undefined) epoch = typeof log?.openEpoch === "function" ? log.openEpoch() : 1;
-    Object.assign(this, { board, tenant, log, now, epoch, rules, auto, foldBytes, schedule, foldUnits, measure, report });
+    this.board = board;
+    this.tenant = tenant;
+    this.log = log;
+    this.now = now;
+    this.epoch = epoch;
+    this.rules = rules;
+    this.auto = auto;
+    this.foldBytes = foldBytes;
+    this.schedule = schedule;
+    this.foldUnits = foldUnits;
+    this.measure = measure;
+    this.report = report;
     this.conns = new Set();
     this.queue = [];          // accepted, not yet handed to an append: [{ entry, c, key, counter, horizon }]
     this.inflight = null;     // the batch in the one append in flight
@@ -166,6 +193,7 @@ export class Room {
    * ascending, from the checkpoint's own entry S (needed to check it) to the end; without a checkpoint,
    * from seq 1. Throws `bad-checkpoint` if entry S doesn't match (the caller steps back to the checkpoint
    * before it), and `corrupt-log` on a gap, a repeated seq or another board's entry.
+   * @param {RoomOptions & { checkpoint?: any, entries?: any[] }} o
    */
   static rebuild({ checkpoint = null, entries = [], ...opts }) {
     const room = new Room(opts);

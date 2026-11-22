@@ -1,3 +1,4 @@
+// @ts-check
 // Presence (PROTOCOL.md § Presence): cursors, selections, laser, previews, emotes. Never sequenced, never
 // logged, may drop at any hop. A room never sees it; gateways check, rate-limit, coalesce and relay it.
 // Pure, with the clock passed in.

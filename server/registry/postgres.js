@@ -70,7 +70,7 @@
 
 import { SQL } from "bun";
 import { mint } from "../auth/registry-port.js";
-import { normEmail } from "../auth/util.js";
+import { normEmail, capTo, higher, ROLES, INVITE_ROLES, LINK_ROLES } from "../auth/util.js";
 import { needSchema, migrate } from "../pg/schema.js";
 
 /**
@@ -107,11 +107,15 @@ const REGISTRY_TABLE_DDL = {
   reg_invites: "n BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES $S.reg_boards(id), email TEXT NOT NULL, role TEXT NOT NULL, expires_at BIGINT, revoked BOOLEAN NOT NULL, by_user TEXT, created_at BIGINT NOT NULL",
   reg_links: "n BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES $S.reg_boards(id), role TEXT NOT NULL, expires_at BIGINT, revoked BOOLEAN NOT NULL, by_user TEXT, created_at BIGINT NOT NULL",
   reg_link_uses: "board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES $S.reg_links(id), n BIGINT GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (board, member, link)",
+  reg_audit: "id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), board TEXT, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT, detail TEXT, at BIGINT NOT NULL",
 };
 /** Index name → "table (columns)"; created after the tables, only if missing (to_regclass), like the tables. */
 export const REGISTRY_INDEXES = {
+  reg_boards_tenant: "reg_boards (tenant, created_at DESC, id ASC)",
   reg_invites_board: "reg_invites (board, email)",
   reg_links_board: "reg_links (board)",
+  reg_audit_tenant: "reg_audit (tenant, at DESC, id DESC)",
+  reg_audit_board: "reg_audit (tenant, board, at DESC, id DESC)",
 };
 /** The tables' column definitions for one schema (foreign keys name it), as `migrate` takes them. */
 export const registryTables = schema => {
@@ -122,6 +126,12 @@ export const registryTables = schema => {
 const key = v => typeof v === "string" && !v.includes("\0");
 const num = v => (v == null ? null : Number(v));
 const nz = v => (v === undefined ? null : v);
+const parseCursor = before => {
+  if (before == null || before === "") return null;
+  if (typeof before !== "string") return "invalid";
+  const m = /^(\d+):(\d+)$/.exec(before);
+  return m ? { at: Number(m[1]), id: Number(m[2]) } : "invalid";
+};
 
 /**
  * @param {{ url?: string, sql?: import("bun").SQL, max?: number, schema?: string, now?: () => number,
@@ -142,7 +152,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     connection: { lock_timeout: String(lockMs), statement_timeout: String(stmtMs) } });
   let open = true;
   const T = `"${s}".reg_tenants`, A = `"${s}".reg_tenant_admins`, BD = `"${s}".reg_boards`, G = `"${s}".reg_grants`,
-    I = `"${s}".reg_invites`, L = `"${s}".reg_links`, U = `"${s}".reg_link_uses`;
+    I = `"${s}".reg_invites`, L = `"${s}".reg_links`, U = `"${s}".reg_link_uses`, AU = `"${s}".reg_audit`;
 
   try {
     await db.begin(async tx => {
@@ -207,6 +217,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
   const rowBoard = r => r && { id: r.id, tenant: r.tenant, title: r.title, memberRole: r.member_role, createdAt: num(r.created_at) };
   const rowInvite = r => r && { id: r.id, board: r.board, email: r.email, role: r.role, expiresAt: num(r.expires_at), revoked: !!r.revoked, by: r.by_user, createdAt: num(r.created_at) };
   const rowLink = r => r && { id: r.id, board: r.board, role: r.role, expiresAt: num(r.expires_at), revoked: !!r.revoked, by: r.by_user, createdAt: num(r.created_at) };
+  const rowAudit = r => r && { id: num(r.id), tenant: r.tenant, board: r.board, actor: r.actor, action: r.action, target: r.target, detail: r.detail == null ? null : JSON.parse(r.detail), at: num(r.at) };
   const boardExists = async (q, id) => key(id) && !!(await one(q, `SELECT 1 AS x FROM ${BD} WHERE id = $1`, [id]));
 
   const api = {
@@ -259,6 +270,43 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       });
     },
     async board(id) { ready(); return key(id) ? rowBoard(await one(db, `SELECT * FROM ${BD} WHERE id = $1`, [id])) : null; },
+    async listBoards(tenant) {
+      ready();
+      if (!key(tenant)) return [];
+      return (await db.unsafe(`SELECT id, tenant, title, member_role, created_at FROM ${BD} WHERE tenant = $1 ORDER BY created_at DESC, id ASC`, [tenant])).map(rowBoard);
+    },
+    async listBoardsFor(tenant, user, { email = null, isMember = true, at } = {}) {
+      ready();
+      if (!key(tenant) || !key(user)) return [];
+      const boards = (await db.unsafe(`SELECT id, tenant, title, member_role, created_at FROM ${BD} WHERE tenant = $1 ORDER BY created_at DESC, id ASC`, [tenant])).map(rowBoard);
+      if (!boards.length) return [];
+      const t = Number.isFinite(at) ? at : now();
+      const grantsBy = new Map((await db.unsafe(`SELECT g.board, g.role FROM ${G} g JOIN ${BD} b ON b.id = g.board WHERE b.tenant = $1 AND g.member = $2`, [tenant, user])).map(r => [r.board, r.role]));
+      const linksBy = new Map();
+      for (const r of await db.unsafe(`SELECT l.board, l.role, l.expires_at, l.revoked FROM ${U} u JOIN ${L} l ON l.id = u.link JOIN ${BD} b ON b.id = l.board WHERE b.tenant = $1 AND u.member = $2`, [tenant, user])) {
+        if (!linksBy.has(r.board)) linksBy.set(r.board, []);
+        linksBy.get(r.board).push({ role: r.role, expiresAt: num(r.expires_at), revoked: !!r.revoked });
+      }
+      const invitesBy = new Map();
+      const e = normEmail(email);
+      if (e && key(e)) {
+        for (const r of await db.unsafe(`SELECT i.board, i.role, i.expires_at, i.revoked FROM ${I} i JOIN ${BD} b ON b.id = i.board WHERE b.tenant = $1 AND i.email = $2`, [tenant, e])) {
+          if (!invitesBy.has(r.board)) invitesBy.set(r.board, []);
+          invitesBy.get(r.board).push({ role: r.role, expiresAt: num(r.expires_at), revoked: !!r.revoked });
+        }
+      }
+      const out = [];
+      for (const b of boards) {
+        let r = capTo(grantsBy.get(b.id) ?? null, ROLES);
+        for (const i of invitesBy.get(b.id) ?? [])
+          if (!i.revoked && (i.expiresAt == null || t < i.expiresAt)) r = higher(r, capTo(i.role, INVITE_ROLES));
+        for (const l of linksBy.get(b.id) ?? [])
+          if (!l.revoked && (l.expiresAt == null || t < l.expiresAt)) r = higher(r, capTo(l.role, LINK_ROLES));
+        if (isMember && b.memberRole) r = higher(r, capTo(b.memberRole, INVITE_ROLES));
+        if (r != null) out.push({ ...b, role: r });
+      }
+      return out;
+    },
 
     async setGrant(board, user, role) {
       ready();
@@ -365,6 +413,42 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         AND member IN (SELECT jsonb_array_elements_text($2::text::jsonb)) ORDER BY member, n`, [board, JSON.stringify(us)]);
       for (const r of rows) { if (!out.has(r.member)) out.set(r.member, []); out.get(r.member).push(r.link); }
       return out;
+    },
+
+    async appendAudit({ tenant, board = null, actor, action, target = null, detail = null, at }) {
+      ready();
+      if (!key(tenant)) throw new Error("registry: no such tenant");
+      const ts = Number.isFinite(at) ? Math.floor(at) : now();
+      const b = board == null ? null : String(board);
+      const t = target == null ? null : String(target);
+      const d = detail == null ? null : JSON.stringify(detail);
+      return write(async tx => {
+        if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
+        const r = await one(tx, `INSERT INTO ${AU} (tenant, board, actor, action, target, detail, at)
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
+          RETURNING id, tenant, board, actor, action, target, detail, at`,
+        [tenant, b, String(actor), String(action), t, d, ts]);
+        return rowAudit(r);
+      });
+    },
+    async listAudit({ tenant, board = null, limit = 50, before = null } = {}) {
+      ready();
+      if (!key(tenant)) return { events: [], nextBefore: null };
+      if (board != null && !key(board)) return { events: [], nextBefore: null };
+      const cur = parseCursor(before);
+      if (cur === "invalid") return { events: [], nextBefore: null };
+      const cap = Math.min(200, Math.max(1, Math.floor(Number(limit) || 50)));
+      const rows = board == null
+        ? (cur
+          ? await db.unsafe(`SELECT id, tenant, board, actor, action, target, detail, at FROM ${AU} WHERE tenant = $1 AND (at < $2 OR (at = $2 AND id < $3)) ORDER BY at DESC, id DESC LIMIT $4`, [tenant, cur.at, cur.id, cap + 1])
+          : await db.unsafe(`SELECT id, tenant, board, actor, action, target, detail, at FROM ${AU} WHERE tenant = $1 ORDER BY at DESC, id DESC LIMIT $2`, [tenant, cap + 1]))
+        : (cur
+          ? await db.unsafe(`SELECT id, tenant, board, actor, action, target, detail, at FROM ${AU} WHERE tenant = $1 AND board = $2 AND (at < $3 OR (at = $3 AND id < $4)) ORDER BY at DESC, id DESC LIMIT $5`, [tenant, board, cur.at, cur.id, cap + 1])
+          : await db.unsafe(`SELECT id, tenant, board, actor, action, target, detail, at FROM ${AU} WHERE tenant = $1 AND board = $2 ORDER BY at DESC, id DESC LIMIT $3`, [tenant, board, cap + 1]));
+      const hasMore = rows.length > cap;
+      const events = (hasMore ? rows.slice(0, cap) : rows).map(rowAudit);
+      const last = events[events.length - 1];
+      return { events, nextBefore: hasMore ? `${last.at}:${last.id}` : null };
     },
 
     /** What a write transaction runs with, read back from Postgres (for /health and tests). */

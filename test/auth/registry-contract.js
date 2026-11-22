@@ -262,5 +262,121 @@ export function registryContract(name, makeRegistry, opts = {}) {
       await r.addLinkUse(l1.id, many[999]);
       expect((await r.linkUsesFor(b.id, many)).get(many[999])).toEqual([l1.id]);
     });
+
+    // ---- board listing ----
+
+    test("listBoards: per tenant, ordered createdAt DESC then id ASC, returns copies", async () => {
+      const t1 = await r.createTenant({ domain: "acme.com" });
+      const t2 = await r.createTenant({ domain: "globex.com" });
+      expect(await r.listBoards(t1.id)).toEqual([]);
+      expect(await r.listBoards("t-nope00000000")).toEqual([]);
+      const b1 = await r.createBoard({ tenant: t1.id, title: "Old" });
+      clock.t = T0 + 1000;
+      const b2 = await r.createBoard({ tenant: t1.id, title: "SameA" });
+      const b3 = await r.createBoard({ tenant: t1.id, title: "SameB" });
+      await r.createBoard({ tenant: t2.id, title: "OtherTenant" });
+      const listed = await r.listBoards(t1.id);
+      const tieOrder = [b2, b3].sort((a, b) => (a.id < b.id ? -1 : 1));
+      expect(listed.map(b => b.id)).toEqual([tieOrder[0].id, tieOrder[1].id, b1.id]);
+      listed[0].title = "mutated";
+      expect((await r.listBoards(t1.id))[0].title).toBe(tieOrder[0].title);
+    });
+
+    test("listBoardsFor: effective role from grants, memberRole, live links and live invites; excludes inaccessible", async () => {
+      const t1 = await r.createTenant({ domain: "acme.com" });
+      const t2 = await r.createTenant({ domain: "globex.com" });
+      clock.t = T0;
+      const bMember = await r.createBoard({ tenant: t1.id, title: "Member", memberRole: "editor" });
+      clock.t = T0 + 10;
+      const bPrivate = await r.createBoard({ tenant: t1.id, title: "Private", memberRole: null });
+      clock.t = T0 + 20;
+      const bLink = await r.createBoard({ tenant: t1.id, title: "ViaLink", memberRole: null });
+      clock.t = T0 + 30;
+      const bInvite = await r.createBoard({ tenant: t1.id, title: "ViaInvite", memberRole: null });
+      clock.t = T0 + 40;
+      const bHidden = await r.createBoard({ tenant: t1.id, title: "Hidden", memberRole: null });
+      await r.createBoard({ tenant: t2.id, title: "Other", memberRole: "editor" });
+
+      // Lower explicit grant does not demote memberRole (highest wins).
+      await r.setGrant(bMember.id, "google:ann", "viewer");
+      // Explicit owner grant on private board.
+      await r.setGrant(bPrivate.id, "google:ann", "owner");
+      // Live link on bLink + revoked link on bHidden.
+      const lLive = await r.createLink({ board: bLink.id, role: "annotator", expiresAt: T0 + 500, by: "google:root" });
+      const lRev = await r.createLink({ board: bHidden.id, role: "editor", by: "google:root" });
+      await r.addLinkUse(lLive.id, "google:ann");
+      await r.addLinkUse(lRev.id, "google:ann");
+      await r.revokeLink(lRev.id);
+      // Live invite on bInvite + expired invite on bHidden.
+      await r.createInvite({ board: bInvite.id, email: "Ann@Acme.com", role: "commenter", expiresAt: T0 + 500, by: "google:root" });
+      await r.createInvite({ board: bHidden.id, email: "ann@acme.com", role: "editor", expiresAt: T0 + 10, by: "google:root" });
+
+      const res = await r.listBoardsFor(t1.id, "google:ann", { email: "ann@acme.com", isMember: true });
+      expect(res.map(b => [b.id, b.role])).toEqual([
+        [bInvite.id, "commenter"],
+        [bLink.id, "annotator"],
+        [bPrivate.id, "owner"],
+        [bMember.id, "editor"],
+      ]);
+      // isMember: false does not apply memberRole (explicit viewer grant remains).
+      const nonMember = await r.listBoardsFor(t1.id, "google:ann", { isMember: false });
+      expect(nonMember.map(b => [b.id, b.role])).toEqual([
+        [bLink.id, "annotator"],
+        [bPrivate.id, "owner"],
+        [bMember.id, "viewer"],
+      ]);
+      // After link & invite expire, they disappear.
+      clock.t = T0 + 600;
+      const afterExp = await r.listBoardsFor(t1.id, "google:ann", { email: "ann@acme.com", isMember: true });
+      expect(afterExp.map(b => [b.id, b.role])).toEqual([
+        [bPrivate.id, "owner"],
+        [bMember.id, "editor"],
+      ]);
+      expect(await r.listBoardsFor("t-nope00000000", "google:ann")).toEqual([]);
+    });
+
+    // ---- audit log ----
+
+    test("appendAudit / listAudit: durable, tenant/board scoped, newest-first, keyset cursor pagination", async () => {
+      const t1 = await r.createTenant({ domain: "acme.com" });
+      const t2 = await r.createTenant({ domain: "globex.com" });
+      const b1 = await r.createBoard({ tenant: t1.id, title: "B1" });
+      const b2 = await r.createBoard({ tenant: t1.id, title: "B2" });
+      await expect(r.appendAudit({ tenant: "t-nope00000000", actor: "u", action: "x" })).rejects.toThrow();
+
+      const e1 = await r.appendAudit({ tenant: t1.id, board: b1.id, actor: "google:a", action: "board.create", target: b1.id, detail: { title: "B1" } });
+      const e2 = await r.appendAudit({ tenant: t1.id, board: b1.id, actor: "google:a", action: "grant.set", target: "google:b", detail: { role: "editor" } }); // same timestamp T0
+      clock.t = T0 + 100;
+      const e3 = await r.appendAudit({ tenant: t1.id, board: b2.id, actor: "google:a", action: "board.create", target: b2.id, detail: null });
+      clock.t = T0 + 200;
+      const e4 = await r.appendAudit({ tenant: t1.id, board: null, actor: "google:a", action: "tenant.admin", target: "google:c" });
+      await r.appendAudit({ tenant: t2.id, board: null, actor: "google:x", action: "other.tenant" });
+
+      expect(e1).toMatchObject({ tenant: t1.id, board: b1.id, actor: "google:a", action: "board.create", target: b1.id, detail: { title: "B1" }, at: T0 });
+      expect(e2.id).toBeGreaterThan(e1.id);
+      // Returned copy isolation.
+      e1.detail.title = "tampered";
+
+      // Tenant-wide newest-first with exact pagination (4 events, limit 2 → 2 pages, last nextBefore is null).
+      const p1 = await r.listAudit({ tenant: t1.id, limit: 2 });
+      expect(p1.events.map(e => e.id)).toEqual([e4.id, e3.id]);
+      expect(p1.nextBefore).toBe(`${e3.at}:${e3.id}`);
+      const p2 = await r.listAudit({ tenant: t1.id, limit: 2, before: p1.nextBefore });
+      expect(p2.events.map(e => e.id)).toEqual([e2.id, e1.id]);
+      expect(p2.events[1].detail).toEqual({ title: "B1" });
+      expect(p2.nextBefore).toBe(null);
+
+      // Tie-breaking across pages when two events share the exact same `at`:
+      const tie1 = await r.listAudit({ tenant: t1.id, board: b1.id, limit: 1 });
+      expect(tie1.events.map(e => e.id)).toEqual([e2.id]);
+      expect(tie1.nextBefore).toBe(`${e2.at}:${e2.id}`);
+      const tie2 = await r.listAudit({ tenant: t1.id, board: b1.id, limit: 1, before: tie1.nextBefore });
+      expect(tie2.events.map(e => e.id)).toEqual([e1.id]);
+      expect(tie2.nextBefore).toBe(null);
+
+      // Unknown tenant or invalid cursor returns empty page, never throws.
+      expect(await r.listAudit({ tenant: "t-nope00000000" })).toEqual({ events: [], nextBefore: null });
+      expect(await r.listAudit({ tenant: t1.id, before: "not-a-cursor" })).toEqual({ events: [], nextBefore: null });
+    });
   });
 }

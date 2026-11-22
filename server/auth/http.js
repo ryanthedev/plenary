@@ -35,7 +35,10 @@
 //   POST   /auth/exchange                      { code } + exchange cookie + Origin → 200 { token, user, name, email,
 //                                              domain, exp }; 400 invalid-code; 403 bad-origin; 503 unavailable
 //   GET    /auth/logout                        clears the login cookie, 302 to postLogoutUrl
+//   GET    /boards                             → 200 { boards, isAdmin }; boards accessible in caller's tenant
 //   POST   /boards                             { title?, memberRole? } → 201 { board }; tenant = the caller's
+//   GET    /boards/:board/audit                ?limit=&before= → 200 { events, nextBefore } (owner or tenant admin)
+//   GET    /admin/audit                        ?limit=&before=&board= → 200 { events, nextBefore } (tenant admin)
 //   GET    /boards/:board/invites              → { invites }
 //   POST   /boards/:board/invites              { email, role, expiresAt? } → 201 { invite }
 //   DELETE /boards/:board/invites/:invite      → 204
@@ -69,7 +72,7 @@
 //   This handler never throws (the engine would turn a throw into a 500).
 
 import { b64url, unb64url, utf8, fromUtf8 } from "./util.js";
-import { AdminError, createBoard, createInvite, listInvites, revokeInvite, createLink, listLinks, revokeLink, setGrant } from "../admin/boards.js";
+import { AdminError, listBoards, createBoard, createInvite, listInvites, revokeInvite, createLink, listLinks, revokeLink, setGrant, listBoardAudit, listTenantAudit } from "../admin/boards.js";
 
 export const LOGIN_COOKIE = "__Host-plen_login";
 export const EXCHANGE_COOKIE = "__Host-plen_xchg";
@@ -377,18 +380,54 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
 
   // ---- routes ----
   const admin = { registry, now };
+  function auditQuery(url) {
+    let limit = 50;
+    if (url.searchParams.has("limit") && url.searchParams.get("limit") !== "") {
+      const raw = url.searchParams.get("limit");
+      if (!/^\d+$/.test(raw) || Number(raw) < 1) throw refuse(400, "bad-request");
+      limit = Math.min(200, Number(raw));
+    }
+    let before = null;
+    if (url.searchParams.has("before") && url.searchParams.get("before") !== "") {
+      const raw = url.searchParams.get("before");
+      if (!/^\d+:\d+$/.test(raw)) throw refuse(400, "bad-request");
+      before = raw;
+    }
+    const rawBoard = url.searchParams.get("board");
+    return { limit, before, board: rawBoard ? rawBoard : null };
+  }
   const routes = [
     ["/auth/login", { GET: () => beginLogin(null) }],
     ["/auth/callback", { GET: (req, url) => callback(req, url) }],
     ["/auth/exchange", { POST: req => exchange(req) }],
     ["/auth/logout", { GET: () => redirect(postLogoutUrl, [clearLogin]) }],
-    ["/boards", { POST: async req => {
+    ["/admin/audit", { GET: async (req, url) => {
       const who = await caller(req);
-      const b = await body(req, ["title", "memberRole"]);
+      const { limit, before, board } = auditQuery(url);
       const t = await tenancy.tenantOf(who);
       if (!t) throw new AdminError("forbidden", "not allowed");
-      const board = await createBoard(defined({ caller: who, tenant: t.id, title: b.title, memberRole: b.memberRole }), admin);
-      return json(201, { board });
+      return json(200, await listTenantAudit({ caller: who, tenant: t.id, board, limit, before }, admin));
+    } }],
+    ["/boards", {
+      GET: async req => {
+        const who = await caller(req);
+        const t = await tenancy.tenantOf(who);
+        if (!t) return json(200, { boards: [], isAdmin: false });
+        return json(200, await listBoards({ caller: who, tenant: t.id }, admin));
+      },
+      POST: async req => {
+        const who = await caller(req);
+        const b = await body(req, ["title", "memberRole"]);
+        const t = await tenancy.tenantOf(who);
+        if (!t) throw new AdminError("forbidden", "not allowed");
+        const board = await createBoard(defined({ caller: who, tenant: t.id, title: b.title, memberRole: b.memberRole }), admin);
+        return json(201, { board });
+      },
+    }],
+    ["/boards/:board/audit", { GET: async (req, p, url) => {
+      const who = await caller(req);
+      const { limit, before } = auditQuery(url);
+      return json(200, await listBoardAudit({ caller: who, board: p.board, limit, before }, admin));
     } }],
     ["/boards/:board/snapshot", { GET: serveSnapshot, HEAD: serveSnapshot }],
     ["/boards/:board/invites", {

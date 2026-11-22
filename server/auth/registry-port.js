@@ -44,8 +44,11 @@ export const mint = {
  * @typedef {"owner"|"editor"|"annotator"|"commenter"|"viewer"} Role
  * @typedef {{ id: string, domain: string|null, admins: string[], createdAt: number }} Tenant
  * @typedef {{ id: string, tenant: string, title: string, memberRole: Role|null, createdAt: number }} Board
+ * @typedef {Board & { role: Role }} BoardAccess
  * @typedef {{ id: string, board: string, email: string, role: Role, expiresAt: number|null, revoked: boolean, by: string, createdAt: number }} Invite
  * @typedef {{ id: string, board: string, role: Role, expiresAt: number|null, revoked: boolean, by: string, createdAt: number }} Link
+ * @typedef {{ id: number, tenant: string, board: string|null, actor: string, action: string, target: string|null, detail: any, at: number }} AuditEvent
+ * @typedef {{ events: AuditEvent[], nextBefore: string|null }} AuditPage
  *
  * @typedef {{
  *   createTenant(o: { domain: string|null, admins?: string[] }): Promise<Tenant>,
@@ -54,6 +57,8 @@ export const mint = {
  *   addTenantAdmin(tenant: string, user: string): Promise<void>,
  *   createBoard(o: { tenant: string, title?: string, memberRole?: Role|null }): Promise<Board>,
  *   board(id: string): Promise<Board|null>,
+ *   listBoards(tenant: string): Promise<Board[]>,
+ *   listBoardsFor(tenant: string, user: string, opts?: { email?: string|null, isMember?: boolean, at?: number }): Promise<BoardAccess[]>,
  *   setGrant(board: string, user: string, role: Role|null): Promise<void>,   // rejects code "last-owner" (atomic)
  *   grant(board: string, user: string): Promise<Role|null>,
  *   grants(board: string): Promise<{ user: string, role: Role }[]>,
@@ -69,6 +74,8 @@ export const mint = {
  *   addLinkUse(link: string, user: string): Promise<void>,
  *   linkUses(board: string, user: string): Promise<string[]>,
  *   linkUsesFor?(board: string, users: string[]): Promise<Map<string, string[]>>,   // OPTIONAL batch (below)
+ *   appendAudit(o: { tenant: string, board?: string|null, actor: string, action: string, target?: string|null, detail?: any, at?: number }): Promise<AuditEvent>,
+ *   listAudit(o: { tenant: string, board?: string|null, limit?: number, before?: string|null }): Promise<AuditPage>,
  * }} Registry
  */
 

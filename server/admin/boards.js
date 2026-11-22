@@ -65,13 +65,31 @@ const expiry = (v, now) => {
   return v;
 };
 
+async function recordAudit(registry, entry) {
+  if (typeof registry.appendAudit === "function") await registry.appendAudit(entry);
+}
+
+/**
+ * GET /boards. Lists every board in `tenant` the caller has access to (with effective role) plus `isAdmin`.
+ * @param {{ caller: Identity, tenant: string }} req
+ * @param {{ registry: Registry, now?: () => number }} deps
+ */
+export async function listBoards({ caller, tenant }, { registry, now = Date.now }) {
+  if (!caller || typeof caller.user !== "string" || typeof tenant !== "string") return { boards: [], isAdmin: false };
+  const [boards, isAdmin] = await Promise.all([
+    registry.listBoardsFor(tenant, caller.user, { email: caller.email ?? null, isMember: true, at: now() }),
+    isTenantAdmin(registry, caller, tenant),
+  ]);
+  return { boards, isAdmin };
+}
+
 /**
  * POST /boards. The caller must be an admin of `tenant`. Mints the board id, writes the registry, makes the
  * caller owner. `memberRole` = what Workspace members of the tenant get (default `viewer`; null = nothing).
  * @param {{ caller: Identity, tenant: string, title?: string, memberRole?: string|null }} req
- * @param {{ registry: Registry }} deps
+ * @param {{ registry: Registry, now?: () => number }} deps
  */
-export async function createBoard({ caller, tenant, title = "", memberRole = "viewer" }, { registry }) {
+export async function createBoard({ caller, tenant, title = "", memberRole = "viewer" }, { registry, now = Date.now }) {
   if (!(await isTenantAdmin(registry, caller, tenant))) throw forbidden();
   if (memberRole !== null && (!ROLES.includes(memberRole) || memberRole === "owner")) throw bad("bad memberRole");
   if (typeof title !== "string" || title.length > 200) throw bad("bad title");
@@ -79,16 +97,26 @@ export async function createBoard({ caller, tenant, title = "", memberRole = "vi
   // PROTOCOL.md § Registry: createBoard takes no creator, so the owner grant is a second call. Retry it once; if it
   // still fails, report the failure WITH the board id (never success for an ownerless board). A tenant admin can
   // still fix that board: they manage every board of their tenant, owner grants included.
-  let last;
+  let granted = false, last;
   for (let attempt = 0; attempt < 2; attempt++) {
-    try { await registry.setGrant(board.id, caller.user, "owner"); return board; }
+    try { await registry.setGrant(board.id, caller.user, "owner"); granted = true; break; }
     catch (err) { last = err; }
   }
-  throw new AdminError("owner-grant-failed", `board ${board.id} was created but its owner grant failed`, { board: board.id, cause: last });
+  if (!granted) throw new AdminError("owner-grant-failed", `board ${board.id} was created but its owner grant failed`, { board: board.id, cause: last });
+  await recordAudit(registry, {
+    tenant: board.tenant,
+    board: board.id,
+    actor: caller.user,
+    action: "board.create",
+    target: board.id,
+    detail: { title: board.title, memberRole: board.memberRole },
+    at: now(),
+  });
+  return board;
 }
 
 /** Give a user an explicit role on a board (or remove it with null). See the rules at the top. */
-export async function setGrant({ caller, board, user, role }, { registry }) {
+export async function setGrant({ caller, board, user, role }, { registry, now = Date.now }) {
   const b = await managed(registry, caller, board);
   if (role !== null && !ROLES.includes(role)) throw bad("bad role");
   if (typeof user !== "string" || !user) throw bad("bad user");
@@ -108,6 +136,15 @@ export async function setGrant({ caller, board, user, role }, { registry }) {
     if (err?.code === "last-owner") throw new AdminError("last-owner", "a board keeps at least one owner");
     throw err;
   }
+  await recordAudit(registry, {
+    tenant: b.tenant,
+    board: b.id,
+    actor: caller.user,
+    action: "grant.set",
+    target: user,
+    detail: { role, previousRole: current },
+    at: now(),
+  });
 }
 
 /** Invite an email to a board. Works across domains. */
@@ -116,32 +153,82 @@ export async function createInvite({ caller, board, email, role, expiresAt = nul
   const e = normEmail(email);
   if (!e || !/^[^@\s]+@[^@\s]+$/.test(e) || e.length > 320) throw bad("bad email");
   if (!INVITE_ROLES.includes(role)) throw bad("bad role");
-  return registry.createInvite({ board: b.id, email: e, role, expiresAt: expiry(expiresAt, now()), by: caller.user });
+  const invite = await registry.createInvite({ board: b.id, email: e, role, expiresAt: expiry(expiresAt, now()), by: caller.user });
+  await recordAudit(registry, {
+    tenant: b.tenant,
+    board: b.id,
+    actor: caller.user,
+    action: "invite.create",
+    target: invite.id,
+    detail: { email: invite.email, role: invite.role, expiresAt: invite.expiresAt },
+    at: now(),
+  });
+  return invite;
 }
 export async function listInvites({ caller, board }, { registry }) {
   const b = await managed(registry, caller, board);
   return registry.invites(b.id);
 }
-export async function revokeInvite({ caller, board, invite }, { registry }) {
+export async function revokeInvite({ caller, board, invite }, { registry, now = Date.now }) {
   const b = await managed(registry, caller, board);
   const i = await registry.invite(invite);
   if (!i || i.board !== b.id) throw forbidden();
   await registry.revokeInvite(i.id);
+  await recordAudit(registry, {
+    tenant: b.tenant,
+    board: b.id,
+    actor: caller.user,
+    action: "invite.revoke",
+    target: i.id,
+    detail: { email: i.email, role: i.role },
+    at: now(),
+  });
 }
 
 /** Make a share link: an unguessable id, a role (editor, annotator or viewer), optional expiry. */
 export async function createLink({ caller, board, role, expiresAt = null }, { registry, now = Date.now }) {
   const b = await managed(registry, caller, board);
   if (!LINK_ROLES.includes(role)) throw bad("links carry only editor, annotator or viewer");
-  return registry.createLink({ board: b.id, role, expiresAt: expiry(expiresAt, now()), by: caller.user });
+  const link = await registry.createLink({ board: b.id, role, expiresAt: expiry(expiresAt, now()), by: caller.user });
+  await recordAudit(registry, {
+    tenant: b.tenant,
+    board: b.id,
+    actor: caller.user,
+    action: "link.create",
+    target: link.id,
+    detail: { role: link.role, expiresAt: link.expiresAt },
+    at: now(),
+  });
+  return link;
 }
 export async function listLinks({ caller, board }, { registry }) {
   const b = await managed(registry, caller, board);
   return registry.links(b.id);
 }
-export async function revokeLink({ caller, board, link }, { registry }) {
+export async function revokeLink({ caller, board, link }, { registry, now = Date.now }) {
   const b = await managed(registry, caller, board);
   const l = await registry.link(link);
   if (!l || l.board !== b.id) throw forbidden();
   await registry.revokeLink(l.id);
+  await recordAudit(registry, {
+    tenant: b.tenant,
+    board: b.id,
+    actor: caller.user,
+    action: "link.revoke",
+    target: l.id,
+    detail: { role: l.role },
+    at: now(),
+  });
+}
+
+/** GET /boards/:board/audit. Board owner or tenant admin; unknown/cross-tenant board gives `forbidden`. */
+export async function listBoardAudit({ caller, board, limit = 50, before = null }, { registry }) {
+  const b = await managed(registry, caller, board);
+  return registry.listAudit({ tenant: b.tenant, board: b.id, limit, before });
+}
+
+/** GET /admin/audit. Tenant admin only; optional `board` filter stays scoped to `tenant`. */
+export async function listTenantAudit({ caller, tenant, board = null, limit = 50, before = null }, { registry }) {
+  if (!(await isTenantAdmin(registry, caller, tenant))) throw forbidden();
+  return registry.listAudit({ tenant, board, limit, before });
 }

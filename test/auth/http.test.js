@@ -429,9 +429,9 @@ test("createBoard: an owner grant that fails twice reports the board id (503); o
 test("not my route: /health, /ws, /blobs/*, /metrics and unknown paths give null; wrong method 405", async () => {
   for (const p of ["/health", "/ws", "/blobs/abc", "/blobs/t/x/y", "/metrics", "/", "/auth", "/auth/other", "/boards/x", "/boards/x/y", "/links", "/links/a/b", "/varz"])
     for (const m of ["GET", "POST", "PUT", "DELETE"]) expect(await call(p, { method: m })).toBe(null);
-  const r = await call("/boards", { method: "GET" });
+  const r = await call("/boards", { method: "DELETE" });
   expect(r.status).toBe(405);
-  expect(r.headers.get("allow")).toBe("POST");
+  expect(r.headers.get("allow")).toBe("GET, POST");
   // The engine passes the parsed URL as the second argument; it is used if given.
   expect(await routes(new Request(ORIGIN + "/boards", { method: "GET" }), new URL(ORIGIN + "/health"))).toBe(null);
 });

@@ -1,7 +1,7 @@
 // The in-memory Registry adapter (tests, single-process dev). The port (typedefs, `mint`, `RegistryError`, the
 // last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
-import { normEmail } from "./util.js";
+import { normEmail, capTo, higher, ROLES, INVITE_ROLES, LINK_ROLES } from "./util.js";
 import { mint, RegistryError } from "./registry-port.js";
 
 /**
@@ -11,7 +11,16 @@ import { mint, RegistryError } from "./registry-port.js";
  * @typedef {import("./registry-port.js").Board} Board
  * @typedef {import("./registry-port.js").Invite} Invite
  * @typedef {import("./registry-port.js").Link} Link
+ * @typedef {import("./registry-port.js").AuditEvent} AuditEvent
  */
+
+const cmpBoard = (a, b) => (b.createdAt !== a.createdAt ? b.createdAt - a.createdAt : a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+const parseCursor = before => {
+  if (before == null || before === "") return null;
+  if (typeof before !== "string") return "invalid";
+  const m = /^(\d+):(\d+)$/.exec(before);
+  return m ? { at: Number(m[1]), id: Number(m[2]) } : "invalid";
+};
 
 /**
  * An in-memory Registry (tests, single-process dev). Returns copies, so callers can't mutate its state.
@@ -25,6 +34,8 @@ export function memoryRegistry({ now = Date.now } = {}) {
   /** @type {Map<string, Invite>} */ const invites = new Map();
   /** @type {Map<string, Link>} */ const links = new Map();
   /** @type {Map<string, Set<string>>} key board + "\n" + user → link ids */ const uses = new Map();
+  /** @type {AuditEvent[]} */ const audits = [];
+  let auditSeq = 0;
   const copy = x => (x ? structuredClone(x) : null);
   const fresh = (map, f) => { let id; do id = f(); while (map.has(id)); return id; };
 
@@ -55,6 +66,32 @@ export function memoryRegistry({ now = Date.now } = {}) {
       return copy(b);
     },
     async board(id) { return copy(boards.get(id)); },
+    async listBoards(tenant) {
+      if (typeof tenant !== "string") return [];
+      return [...boards.values()].filter(b => b.tenant === tenant).sort(cmpBoard).map(copy);
+    },
+    async listBoardsFor(tenant, user, { email = null, isMember = true, at } = {}) {
+      if (typeof tenant !== "string" || typeof user !== "string") return [];
+      const t = Number.isFinite(at) ? at : now();
+      const e = normEmail(email);
+      const out = [];
+      for (const b of [...boards.values()].filter(x => x.tenant === tenant).sort(cmpBoard)) {
+        let r = capTo(grants.get(b.id)?.get(user) ?? null, ROLES);
+        if (e) {
+          for (const i of invites.values())
+            if (i.board === b.id && i.email === e && !i.revoked && (i.expiresAt == null || t < i.expiresAt))
+              r = higher(r, capTo(i.role, INVITE_ROLES));
+        }
+        for (const lid of uses.get(b.id + "\n" + user) ?? []) {
+          const l = links.get(lid);
+          if (l && l.board === b.id && !l.revoked && (l.expiresAt == null || t < l.expiresAt))
+            r = higher(r, capTo(l.role, LINK_ROLES));
+        }
+        if (isMember && b.memberRole) r = higher(r, capTo(b.memberRole, INVITE_ROLES));
+        if (r != null) out.push({ ...copy(b), role: r });
+      }
+      return out;
+    },
 
     async setGrant(board, user, role) {
       if (!boards.has(board)) throw new Error("registry: no such board");
@@ -104,6 +141,38 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const out = new Map();
       for (const u of users ?? []) { const s = uses.get(board + "\n" + u); if (s?.size) out.set(u, [...s]); }
       return out;
+    },
+
+    async appendAudit({ tenant, board = null, actor, action, target = null, detail = null, at }) {
+      if (typeof tenant !== "string" || !tenants.has(tenant)) throw new Error("registry: no such tenant");
+      const rec = {
+        id: ++auditSeq,
+        tenant,
+        board: board == null ? null : String(board),
+        actor: String(actor),
+        action: String(action),
+        target: target == null ? null : String(target),
+        detail: detail == null ? null : JSON.parse(JSON.stringify(detail)),
+        at: Number.isFinite(at) ? Math.floor(at) : now(),
+      };
+      audits.push(rec);
+      return copy(rec);
+    },
+    async listAudit({ tenant, board = null, limit = 50, before = null } = {}) {
+      if (typeof tenant !== "string") return { events: [], nextBefore: null };
+      if (board != null && typeof board !== "string") return { events: [], nextBefore: null };
+      const cur = parseCursor(before);
+      if (cur === "invalid") return { events: [], nextBefore: null };
+      const cap = Math.min(200, Math.max(1, Math.floor(Number(limit) || 50)));
+      const filtered = audits.filter(a =>
+        a.tenant === tenant
+        && (board == null || a.board === board)
+        && (!cur || a.at < cur.at || (a.at === cur.at && a.id < cur.id)),
+      ).sort((a, b) => (b.at !== a.at ? b.at - a.at : b.id - a.id));
+      const hasMore = filtered.length > cap;
+      const events = (hasMore ? filtered.slice(0, cap) : filtered).map(copy);
+      const last = events[events.length - 1];
+      return { events, nextBefore: hasMore ? `${last.at}:${last.id}` : null };
     },
   };
 }

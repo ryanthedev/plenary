@@ -355,3 +355,34 @@ test("the real tree: defaults come from static.js's own path; / and main.js and 
     "/adapters/transport/local.js", "/adapters/transport/shared-worker/client.js"])
     expect([u, (await get(site, u))?.status ?? 404]).toEqual([u, 404]);
 });
+
+test("E-5: immutable /v/<build>/... serves from startup memory cache with max-age=31536000, immutable; wrong build or index.html is 404", async () => {
+  const p = plant();
+  const site = staticSite({ mounts: p.mounts });
+  expect(site.build).toMatch(/^[A-Za-z0-9_-]{12}$/);
+
+  const res = await get(site, `/v/${site.build}/main.js`);
+  expect(res.status).toBe(200);
+  expect(res.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+  expect(res.headers.get("content-type")).toBe("text/javascript");
+  const etag = res.headers.get("etag");
+  expect(etag).toMatch(/^"[A-Za-z0-9_-]{43}"$/);
+
+  // 304 on matching If-None-Match keeps immutable cache-control.
+  const r304 = await get(site, `/v/${site.build}/main.js`, { headers: { "if-none-match": etag } });
+  expect(r304.status).toBe(304);
+  expect(r304.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+
+  // Wrong build id, index.html under /v/, and denied paths under /v/ are all 404.
+  expect(await get(site, `/v/wrongbuildid/main.js`)).toBe(null);
+  expect(await get(site, `/v/${site.build}/index.html`)).toBe(null);
+  expect(await get(site, `/v/${site.build}/dev.js`)).toBe(null);
+
+  // Immutable URL and cache:true both serve startup bytes even if the file changes on disk.
+  const cached = staticSite({ mounts: p.mounts, cache: true });
+  const orig = await res.text();
+  p.put("web/main.js", "export const changed = 1;");
+  expect(await (await get(site, `/v/${site.build}/main.js`)).text()).toBe(orig);
+  p.put("web/a.js", "export const a = 999;");
+  expect(await (await get(cached, "/a.js")).text()).toBe("");
+});

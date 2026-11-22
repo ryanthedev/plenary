@@ -24,8 +24,10 @@
 // backslash, a NUL, a "." or ".." segment, or an empty segment are refused (Bun already collapses literal ".." and
 // "\" before the handler sees the URL; the exact-match map is the real guard). Not served -> null, and server.js
 // answers its usual 404.
-// Headers: the CSP below, nosniff, no-referrer, the file's MIME type, Cache-Control: no-cache, a strong ETag (sha-256
-// of the bytes, read on every request so an edit shows on reload) and 304 on a matching If-None-Match.
+// Headers: the CSP below, nosniff, no-referrer, the file's MIME type, a strong ETag (sha-256 of the bytes, computed
+// once at start-up and cached in memory; refreshed only when mtime/size changes unless `cache: true`), and 304 on a
+// matching If-None-Match. Unversioned paths carry `Cache-Control: no-cache`; versioned `/v/<build>/...` paths (E-5)
+// serve from the startup memory cache with `Cache-Control: public, max-age=31536000, immutable`.
 
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -133,7 +135,7 @@ const extOf = p => { const i = p.lastIndexOf("."); return i > p.lastIndexOf("/")
  * @returns {{ handle: (req: Request, url?: URL) => Promise<Response | null>, files: Map<string, string>, skipped: object[] }}
  *   files: URL path -> real file path (what is served). skipped: what the scan found and left out, with why.
  */
-export function staticSite({ mounts = DEFAULT_MOUNTS, log = { info() {}, warn() {} } } = {}) {
+export function staticSite({ mounts = DEFAULT_MOUNTS, log = { info() {}, warn() {} }, cache = false } = {}) {
   const roots = mounts.map(m => ({ url: m.url, dir: resolve(m.dir), real: real(resolve(m.dir)) })).filter(m => m.real);
   const web = roots.find(m => m.url === "/");
   const files = new Map(), skipped = [], seen = new Set();
@@ -190,26 +192,56 @@ export function staticSite({ mounts = DEFAULT_MOUNTS, log = { info() {}, warn() 
       }
     }
   }
-  log.info("static: serving", { files: files.size, skipped: skipped.length, root: web?.dir ?? null });
+  // E-5: pre-read and pre-hash every allowed file at start-up so a join wave does zero disk I/O and zero sha-256 per
+  // request, and compute a single build id for immutable `/v/<build>/...` URLs.
+  const entries = new Map();
+  const buildHash = createHash("sha256");
+  for (const url of [...files.keys()].sort()) {
+    const file = files.get(url);
+    try {
+      const st = statSync(file), body = readFileSync(file);
+      const etag = `"${createHash("sha256").update(body).digest("base64url")}"`;
+      entries.set(url, { body, etag, mtimeMs: st.mtimeMs, size: st.size });
+      buildHash.update(url).update("\0").update(etag).update("\n");
+    } catch { /* unreadable after add: handled on request */ }
+  }
+  const build = entries.size ? buildHash.digest("base64url").slice(0, 12) : "empty";
+  const versionPrefix = `/v/${build}/`;
+  log.info("static: serving", { files: files.size, skipped: skipped.length, build, root: web?.dir ?? null });
 
   async function handle(req, url = new URL(req.url)) {
     if (req.method !== "GET" && req.method !== "HEAD") return null;
     const path = url.pathname;
     if (!safePath(path)) return null;
-    const key = path === "/" ? "/index.html" : path;
+    let key = path === "/" ? "/index.html" : path;
+    let immutable = false;
+    if (path.startsWith("/v/")) {
+      if (!path.startsWith(versionPrefix)) return null;
+      key = "/" + path.slice(versionPrefix.length);
+      if (key === "/index.html") return null;   // index.html is always unversioned (entry point)
+      immutable = true;
+    }
     if (denied(key)) return null;                      // belt and braces: the map never holds one
     const file = files.get(key);
     if (!file) return null;
-    let body;
-    try {
-      const r = realpathSync(file);                    // swapped for a symlink since start-up?
-      if (!roots.some(m => r.startsWith(m.real + sep))) return null;
-      body = readFileSync(r);
-    } catch { return null; }
-    const etag = `"${createHash("sha256").update(body).digest("base64url")}"`;
+    let entry = entries.get(key);
+    if (!entry || (!immutable && !cache)) {
+      try {
+        const st = statSync(file);
+        if (!entry || st.mtimeMs !== entry.mtimeMs || st.size !== entry.size) {
+          const r = realpathSync(file);                // swapped for a symlink since start-up?
+          if (!roots.some(m => r.startsWith(m.real + sep))) return null;
+          const body = readFileSync(r);
+          const etag = `"${createHash("sha256").update(body).digest("base64url")}"`;
+          entry = { body, etag, mtimeMs: st.mtimeMs, size: st.size };
+          entries.set(key, entry);
+        }
+      } catch { return null; }
+    }
+    const { body, etag } = entry;
     const headers = {
       "content-type": MIME[extOf(key)],
-      "cache-control": "no-cache",
+      "cache-control": immutable ? "public, max-age=31536000, immutable" : "no-cache",
       "etag": etag,
       "content-security-policy": CSP,
       "x-content-type-options": "nosniff",
@@ -223,7 +255,7 @@ export function staticSite({ mounts = DEFAULT_MOUNTS, log = { info() {}, warn() 
     return new Response(body, { status: 200, headers });
   }
 
-  return { handle, files, skipped };
+  return { handle, files, skipped, build };
 }
 
 /** If-None-Match uses the weak comparison (RFC 9110 13.1.2): "*" or any listed tag, W/ ignored. */

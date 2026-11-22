@@ -18,6 +18,7 @@ import { getPreset, getEasing, timelineEnd, stepTimeline, effectiveAnimTime } fr
 import { labelHostHeight, labelHostWidth } from "./text.js";
 import { isMermaid, mermaidToElements } from "./mermaid.js";
 import { itemFromElements } from "./library.js";
+import { parseExcalidraw, toExcalidrawClipboard, remapExcalidrawIds } from "./excalidraw.js";
 
 export const TOOLS = [
   { id: "select", keys: ["v", "1"], icon: "↖", name: "Select" },
@@ -1235,17 +1236,8 @@ export class Editor {
 
   copy() {
     const els = this.selected(); if (!els.length) return null;
-    const all = fileScene(this.doc, { elements: this.withLabels(els) }).elements;
-    // Excalidraw's clipboard format (label boxes as the file has them), so pasting into excalidraw.com works too.
-    const files = {};
-    for (const el of all) {
-      const f = (el.type === "image" || el.type === "video") && this.doc.files[el.fileId];
-      if (!f) continue;
-      files[el.fileId] = el.type === "video"
-        ? { id: f.id ?? el.fileId, mimeType: f.mimeType ?? el.mimeType ?? "video/mp4" }
-        : f;
-    }
-    this.clipboard = JSON.stringify({ type: "excalidraw/clipboard", elements: all.map(clone), files });
+    const payload = toExcalidrawClipboard(this.doc, this.withLabels(els), { now: this.clock() });
+    this.clipboard = JSON.stringify(payload);
     return this.clipboard;
   }
 
@@ -1309,6 +1301,13 @@ export class Editor {
 
   paste(text = this.clipboard, at) {
     if (isMermaid(text)) { try { this.importMermaid(text, at); this.flash = "imported Mermaid"; } catch (e) { this.flash = String(e.message ?? e); } return; }
+    if (typeof text === "string") {
+      const ex = parseExcalidraw(text, { now: this.clock() });
+      if (ex.ok) {
+        if (ex.elements.length) this.insertElements(ex.elements, ex.files, at);
+        return;
+      }
+    }
     let data; try { data = JSON.parse(text); } catch { data = null; }
     if (!data?.elements?.length) {
       if (text && typeof text === "string") { const c = at ?? this.toWorld({ x: this.size.w / 2, y: this.size.h / 2 }); this.beginText(null, c); this.text.value = text; this.commitText(); }
@@ -1317,27 +1316,43 @@ export class Editor {
     this.insertElements(data.elements, data.files, at);
   }
 
-  // Elements from elsewhere (a clipboard, a library item) as new ones, centered at `at`, as one
-  // undo step: fresh ids, groups and bindings that point inside the set (others dropped), layer and z here.
+  // Import a parsed or raw Excalidraw v2 scene / clipboard payload into the board, centered at `at`,
+  // bringing it into view when `fitIfNeeded` is set. Returns the inserted element ids.
+  importExcalidraw(input, at, { fileIdMap = null, fitIfNeeded = true, dropNonSha1 = false } = {}) {
+    const parsed = typeof input === "string" || !input?.ok ? parseExcalidraw(input, { now: this.clock() }) : input;
+    if (!parsed.ok || !parsed.elements.length) return [];
+    const ids = this.insertElements(parsed.elements, parsed.files, at, { fileIdMap, dropNonSha1 });
+    if (fitIfNeeded && ids.length) {
+      const sel = this.selected();
+      const nb = sel.length ? unionBox(sel.map(bounds)) : null;
+      if (nb) {
+        const a = this.toScreen(nb), z = this.toScreen({ x: nb.x + nb.w, y: nb.y + nb.h });
+        if (a.x < 0 || a.y < 0 || z.x > this.size.w || z.y > this.size.h) this.fit(sel);
+      }
+    }
+    return ids;
+  }
+
+  // Elements from elsewhere (a clipboard, a library item, an .excalidraw import) as new ones, centered at `at`,
+  // as one undo step: fresh ids, groups, frames and bindings that point inside the set (others dropped), layer and z here.
   // Returns the new ids, labels included; selects the new top-level elements.
-  insertElements(elements, files, at) {
+  insertElements(elements, files, at, { fileIdMap = null, dropNonSha1 = false } = {}) {
     const els = (elements ?? []).filter(e => e && !e.isDeleted); if (!els.length) return [];
-    if (files && typeof files === "object") this.addFiles(files);
-    const box = unionBox(els.filter(e => !isLabel(e)).map(bbox)) ?? unionBox(els.map(bbox));
+    const z = this.doc.maxZ(this.activeLayer);
+    const { elements: remapped, files: remappedFiles } = remapExcalidrawIds(els, files ?? {}, {
+      fileIdMap, layer: this.activeLayer, zStart: z, dropNonSha1,
+    });
+    if (remappedFiles && Object.keys(remappedFiles).length) this.addFiles(remappedFiles);
+    const box = unionBox(remapped.filter(e => !isLabel(e)).map(bbox)) ?? unionBox(remapped.map(bbox));
     const target = at ?? this.toWorld({ x: this.size.w / 2, y: this.size.h / 2 });
-    const dx = target.x - (box.x + box.w / 2), dy = target.y - (box.y + box.h / 2);
-    const idMap = new Map(els.map(e => [e.id, newId()])), groups = new Map(), z = this.doc.maxZ(this.activeLayer);
+    const dx = box ? target.x - (box.x + box.w / 2) : 0;
+    const dy = box ? target.y - (box.y + box.h / 2) : 0;
     const out = [];
     this.transact(tx => {
-      els.forEach((e, i) => {
-        const c = clone(e); c.id = idMap.get(e.id); c.x += dx; c.y += dy; c.version = 0; c.isDeleted = false;
-        if (c.containerId) c.containerId = idMap.get(c.containerId) ?? null;
-        c.groupIds = (c.groupIds ?? []).map(g => groups.get(g) ?? groups.set(g, newId()).get(g));
-        c.boundElements = (c.boundElements ?? []).filter(b => idMap.has(b.id)).map(b => ({ ...b, id: idMap.get(b.id) }));
-        for (const k of ["startBinding", "endBinding"]) if (c[k]) c[k] = idMap.has(c[k].elementId) ? { ...c[k], elementId: idMap.get(c[k].elementId) } : null;
-        c.customData = { ...(c.customData ?? {}), layer: this.activeLayer, z: z + 1 + i };
+      for (const c of remapped) {
+        c.x += dx; c.y += dy;
         tx.add(c); out.push(c);
-      });
+      }
     });
     this.select(out.filter(e => !isLabel(e)).map(e => e.id));
     return out.map(e => e.id);

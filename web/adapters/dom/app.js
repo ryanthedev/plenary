@@ -9,6 +9,7 @@ import { parsePanel, serializePanel, applyPanel, panelLayout, dragWidth } from "
 import { isMermaid } from "../../../packages/core/mermaid.js";
 import { isLabel } from "../../../packages/core/model.js";
 import { parseLibrary } from "../../../packages/core/library.js";
+import { parseExcalidraw, isExcalidrawPayload } from "../../../packages/core/excalidraw.js";
 import { paint, imageCache, THEMES, color as safeColor, cappedDpr } from "./paint.js";
 import { toolsFor, pillFor, pillTitleFor, connectionBanner, expiryNotice, shouldProbe, RESUME_PROBE_MS } from "../../core/roles.js";
 
@@ -16,7 +17,7 @@ import { toolsFor, pillFor, pillTitleFor, connectionBanner, expiryNotice, should
 export const PROBE_JITTER_MS = Object.freeze({ presenter: 2000, other: 15_000 });
 export const probeJitterMs = role => (role === "presenter" ? PROBE_JITTER_MS.presenter : PROBE_JITTER_MS.other);
 import { renderPanel, loadLibrary, saveLibrary, addToLibrary, propsModel } from "./panel.js";
-import { exportSvg, paintPng, loadPictures } from "./export.js";
+import { exportSvg, exportExcalidraw, paintPng, loadPictures } from "./export.js";
 import { h, $, replace } from "./dom.js";
 import { mountShareDialog } from "./admin.js";
 import { icon } from "./icons.js";
@@ -346,7 +347,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const files = [...(e.clipboardData?.files ?? [])].filter(f => f.type.startsWith("image/") || f.type.startsWith("video/"));
     if (files.length) return files.forEach(f => (f.type.startsWith("video/") ? addVideoFile(f) : addPicture(f)));
     const text = e.clipboardData?.getData("text/plain");
-    if (text) { S.paste(text); chromeDirty = true; }
+    if (text) { pasteText(text); }
   });
 
   // Explicit clipboard read for mobile (Chrome on iOS / WKWebView): must be invoked directly from a tap gesture
@@ -401,8 +402,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
             const text = blob ? await blob.text() : "";
             if (text) {
               if (!S.may()) { toast("View only: nothing is pasted"); return false; }
-              S.paste(text);
-              chromeDirty = true;
+              await pasteText(text);
               return true;
             }
           }
@@ -419,8 +419,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
           const text = await clip.readText();
           if (text) {
             if (!S.may()) { toast("View only: nothing is pasted"); return false; }
-            S.paste(text);
-            chromeDirty = true;
+            await pasteText(text);
             return true;
           }
           toast("Nothing to paste — use Photo / Video for images");
@@ -504,13 +503,111 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     }
     chromeDirty = true;
   }
+  function decodeDataUrlBytes(dataURL) {
+    const comma = dataURL.indexOf(",");
+    if (comma < 0) return null;
+    const b64 = dataURL.slice(comma + 1).replace(/\s+/g, "");
+    try {
+      const bin = atob(b64);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    } catch {
+      return null;
+    }
+  }
+  async function prepareExcalidrawFiles(files) {
+    const fileIdMap = new Map();
+    const outFiles = {};
+    for (const [origId, entry] of Object.entries(files ?? {})) {
+      if (!entry || typeof entry.dataURL !== "string") {
+        if (entry && entry.mimeType) outFiles[origId] = entry;
+        continue;
+      }
+      const bytes = decodeDataUrlBytes(entry.dataURL);
+      if (!bytes || !bytes.length || bytes.length > 10 * 1024 * 1024) continue;
+      const sha1 = [...new Uint8Array(await crypto.subtle.digest("SHA-1", bytes))].map(b => b.toString(16).padStart(2, "0")).join("");
+      fileIdMap.set(origId, sha1);
+      const next = { id: sha1, mimeType: entry.mimeType || "image/png", dataURL: entry.dataURL, created: entry.created ?? clock.now() };
+      outFiles[sha1] = next;
+      if (RASTER.test(next.mimeType)) {
+        if (typeof net.uploadBlob === "function") {
+          try { await S.uploadBlob(sha1, bytes, next.mimeType); } catch {}
+        } else {
+          net.put?.(next);
+        }
+      }
+    }
+    return { fileIdMap, files: outFiles };
+  }
+  async function importExcalidrawText(text, { at, label = null, fitIfNeeded = false, silent = false } = {}) {
+    if (!S.may()) return false;
+    const parsed = parseExcalidraw(text, { now: clock.now() });
+    if (!parsed.ok) {
+      if (!silent) toast("That isn't a valid .excalidraw file");
+      return false;
+    }
+    if (!parsed.elements.length) {
+      if (!silent) toast("No elements in that .excalidraw file");
+      return false;
+    }
+    const hasImageData = Object.values(parsed.files).some(f => typeof f?.dataURL === "string");
+    let fileIdMap = null, files = parsed.files;
+    if (hasImageData) {
+      const prepared = await prepareExcalidrawFiles(parsed.files);
+      fileIdMap = prepared.fileIdMap;
+      files = prepared.files;
+      if (!S.may()) return false;
+    }
+    const stream = S.role === "presenter" ? S.active : "notes";
+    let ids = [];
+    S.act(stream, ed => {
+      ids = ed.importExcalidraw({ ...parsed, files }, at, { fileIdMap, fitIfNeeded, dropNonSha1: true });
+    });
+    chromeDirty = true;
+    if (!silent && ids.length) {
+      const n = parsed.elements.filter(e => !isLabel(e)).length || ids.length;
+      const from = label ? ` from ${label}` : "";
+      toast(`Imported ${n} element${n === 1 ? "" : "s"}${from}`);
+    }
+    return ids.length > 0;
+  }
+  function pasteText(text, at) {
+    if (isExcalidrawPayload(text)) {
+      const parsed = parseExcalidraw(text, { now: clock.now() });
+      if (parsed.ok) {
+        const hasImageData = Object.values(parsed.files).some(f => typeof f?.dataURL === "string");
+        if (hasImageData) return importExcalidrawText(text, { at, fitIfNeeded: false, silent: true });
+        if (parsed.elements.length) {
+          const stream = S.role === "presenter" ? S.active : "notes";
+          S.act(stream, ed => ed.importExcalidraw(parsed, at, { fitIfNeeded: false, dropNonSha1: true }));
+          chromeDirty = true;
+          return true;
+        }
+        return false;
+      }
+    }
+    S.paste(text, at);
+    chromeDirty = true;
+    return true;
+  }
+  async function addExcalidrawFile(file, at) {
+    if (!S.may()) return;
+    try {
+      const text = await file.text();
+      await importExcalidrawText(text, { at, label: file.name || "Excalidraw", fitIfNeeded: !at, silent: false });
+    } catch {
+      toast("That isn't a valid .excalidraw file");
+    }
+  }
   async function addLibraryFile(file) {
     try { const items = parseLibrary(await file.text()); if (!items.length) return toast("No library items in that file"); setLibrary(addToLibrary(ui.library, items)); toast(`Library: ${items.length} added`); }
     catch { toast("That isn't an .excalidrawlib file"); }
   }
   function takeFiles(files, at) {
     for (const f of files) {
-      if (/\.excalidrawlib$/i.test(f.name)) addLibraryFile(f);
+      if (/\.excalidraw$/i.test(f.name)) addExcalidrawFile(f, at);
+      else if (/\.excalidrawlib$/i.test(f.name)) addLibraryFile(f);
       else if (f.type?.startsWith("video/")) addVideoFile(f, at);
       else addPicture(f, at);
     }
@@ -707,7 +804,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const actions = h("div.island.top-right.header-actions", {},
       role === "presenter" ? [
         h("button.btn.ghost.desk-only.header-extra", { title: "Insert a Mermaid flowchart", "aria-label": "Insert Mermaid flowchart", disabled: !may, onclick: () => openDialog("mermaid") }, icon("mermaid", { size: 16 })),
-        h("button.btn.ghost.desk-only.header-extra", { title: "Export SVG / PNG (⌘⇧E)", "aria-label": "Export board", onclick: toggleExport }, icon("export", { size: 16 }))] : null,
+        h("button.btn.ghost.desk-only.header-extra", { title: "Export SVG / PNG / .excalidraw (⌘⇧E)", "aria-label": "Export board", onclick: toggleExport }, icon("export", { size: 16 }))] : null,
       h("button.btn.ghost.desk-only.header-extra", { "aria-label": "Notes", title: "Notes", onclick: toggleNotes }, icon("note", { size: 16 }), "Notes ", h("span.dim", {}, String(notesCount()))),
       collab ? h("button.btn.ghost.desk-only.header-extra", { "aria-label": "Comments", title: "Comments (or right-click the board)", onclick: () => toggleDrawer("comments") }, icon("comments", { size: 16 })) : null,
       // Who's here (`here`): the collab UI's live avatar row, kept across rebuilds (a node, moved, never rebuilt here).
@@ -943,7 +1040,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   async function download() {
     const { format, scale, page } = ui.export, doc = S.eds.board.doc, name = `${board}.${format}`;
     let blob;
-    if (format === "svg") blob = new Blob([exportSvg(doc, { page, theme: ui.theme, scale })], { type: "image/svg+xml" });
+    if (format === "excalidraw") blob = new Blob([exportExcalidraw(doc, { page, theme: ui.theme })], { type: "application/vnd.excalidraw+json" });
+    else if (format === "svg") blob = new Blob([exportSvg(doc, { page, theme: ui.theme, scale })], { type: "image/svg+xml" });
     else { const cv = paintPng(doc, document.createElement("canvas"), { page, theme: ui.theme, scale, loadImage: await loadPictures(doc.files) }); blob = await new Promise(r => cv.toBlob(r, "image/png")); }
     const a = h("a", { href: URL.createObjectURL(blob), download: name }); document.body.append(a); a.click(); a.remove();
     clock.set(() => URL.revokeObjectURL(a.href), 5000);
@@ -975,10 +1073,12 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       replace(d, h("div.dialog-veil", { onclick: e => { if (e.target === e.currentTarget) close(); } }, h("div.dialog", { style: { width: "min(520px,100%)" }, role: "dialog", "aria-label": "Export the board" },
         h("h2", {}, icon("export", { size: 17 }), " Export the board", h("span.spacer"), h("button.tb", { onclick: close, title: "Close", "aria-label": "Close" }, icon("close", { size: 16 }))),
         h("div.dbody", {}, h("div.preview", { style: { minHeight: "120px" } }, cv),
-          h("div.row", {}, h("span.lab", {}, "Format"), h("span.opts", {}, chip("SVG", x.format === "svg", () => set("format", "svg")), chip("PNG", x.format === "png", () => set("format", "png")))),
-          h("div.row", {}, h("span.lab", {}, "Scale"), h("span.opts", {}, chip("1×", x.scale === 1, () => set("scale", 1)), chip("2×", x.scale === 2, () => set("scale", 2)))),
+          h("div.row", {}, h("span.lab", {}, "Format"), h("span.opts", {}, chip("SVG", x.format === "svg", () => set("format", "svg")), chip("PNG", x.format === "png", () => set("format", "png")), chip(".excalidraw", x.format === "excalidraw", () => set("format", "excalidraw")))),
+          x.format !== "excalidraw" ? h("div.row", {}, h("span.lab", {}, "Scale"), h("span.opts", {}, chip("1×", x.scale === 1, () => set("scale", 1)), chip("2×", x.scale === 2, () => set("scale", 2)))) : null,
           h("div.row", {}, h("span.lab", {}, "Page"), h("span.opts", {}, chip("board color", x.page === "board", () => set("page", "board")), chip("white", x.page === "white", () => set("page", "white")))),
-          h("div.hint", {}, "The board stream only, cropped to what's drawn, 32 units of padding. Notes, selection, cursors and comments never show.")),
+          h("div.hint", {}, x.format === "excalidraw"
+            ? "Excalidraw v2 JSON with embedded images. Opens directly in excalidraw.com or Plenary."
+            : "The board stream only, cropped to what's drawn, 32 units of padding. Notes, selection, cursors and comments never show.")),
         h("footer", {}, h("button.btn", { onclick: close }, "Cancel"), h("button.btn.primary", { onclick: () => { download(); close(); } }, "Download")))));
       exportPreview(cv);
     } else { ui.dialog = null; d.replaceChildren(); }

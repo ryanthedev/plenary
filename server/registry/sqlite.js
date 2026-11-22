@@ -745,13 +745,20 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     idemPut(idem, id, createdAt);
     return rowSpace(q.space.get(id));
   });
-  const personalTx = db.transaction((tenant, user, createdAt) => {
+  const personalTx = db.transaction((tenant, user, desiredName, createdAt) => {
     needRow(q.tenantExists.get(tenant), "tenant");
     const have = q.personal.get(tenant, user);
-    if (have) return rowSpace(have);
+    if (have) {
+      if (orgDefaults.isNumericPersonalName(have.name, user) && have.name !== desiredName) {
+        noRemoved(tenant, user);
+        q.patchSpace.run(have.id, 1, desiredName, 0, null);
+        return rowSpace(q.space.get(have.id));
+      }
+      return rowSpace(have);
+    }
     noRemoved(tenant, user);
     const id = fresh(mint.space, i => !!q.space.get(i));
-    q.insSpace.run(id, tenant, null, orgDefaults.personalName(user), "personal", user, null, createdAt);
+    q.insSpace.run(id, tenant, null, desiredName, "personal", user, null, createdAt);
     putSg("space", id, "user", user, "owner");
     return rowSpace(q.space.get(id));
   });
@@ -1228,12 +1235,14 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       return row(get.get(id));
     },
     async personalSpace(tenant, user) { ready(); return str(tenant) ? rowSpace(q.personal.get(tenant, String(user))) ?? null : null; },
-    async ensurePersonalSpace(tenant, user) {
+    async ensurePersonalSpace(tenant, user, opts) {
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");
-      // Read first: Home calls this on every load, and the write lock (BEGIN IMMEDIATE) is taken only when the row is missing.
-      const had = rowSpace(q.personal.get(tenant, String(user)));
-      return had ?? personalTx.immediate(tenant, String(user), now());
+      const u = String(user), desired = orgDefaults.personalName(u, opts);
+      // Read first: Home calls this on every load, and the write lock (BEGIN IMMEDIATE) is taken only when the row is missing or needs a numeric-name repair.
+      const had = rowSpace(q.personal.get(tenant, u));
+      if (had && (!orgDefaults.isNumericPersonalName(had.name, u) || had.name === desired)) return had;
+      return personalTx.immediate(tenant, u, desired, now());
     },
     async createTeam({ tenant, name, idem }) {
       ready();

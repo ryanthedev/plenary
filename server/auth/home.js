@@ -9,9 +9,9 @@
 // board they reach some other way shows as "Shared with you" (SHARED_PART), and a Space-name search match counts only
 // for a Space they can open.
 
-import { asciiFold, HOME } from "./registry-port.js";
+import { asciiFold, HOME, orgDefaults } from "./registry-port.js";
 import { resolveAccess, mayMove } from "./resolver.js";
-import { isTenantAdminRecord } from "./util.js";
+import { isTenantAdminRecord, verifiedEmail } from "./util.js";
 
 /** @typedef {import("./idp-port.js").Identity} Identity */
 /** @typedef {{ type: "group"|"space"|"other"|"shared", id?: string, name: string }} PathPart */
@@ -31,9 +31,12 @@ const byTitle = (a, b) => (a.title.toLowerCase() < b.title.toLowerCase() ? -1 : 
  * @param {{ registry: import("./registry-port.js").Registry, tenancy: ReturnType<typeof import("./tenancy.js").tenancy>, now?: () => number }} deps
  */
 export function homeService({ registry, tenancy, now = Date.now }) {
+  const spaceName = (s, identity) => (s.kind === "personal" && orgDefaults.isNumericPersonalName(s.name, s.owner)
+    ? (s.owner === identity.user ? orgDefaults.personalName(identity.user, { name: identity.name, email: identity.email }) : "Personal")
+    : s.name);
   /** The path a card shows: only what the person can open is named (module comment). */
-  const pathOf = f => [...(f.group && f.groupOpen ? [{ type: "group", id: f.group.id, name: f.group.name }] : []),
-    f.spaceOpen ? { type: "space", id: f.space.id, name: f.space.name } : SHARED_PART];
+  const pathOf = (f, identity) => [...(f.group && f.groupOpen ? [{ type: "group", id: f.group.id, name: f.group.name }] : []),
+    f.spaceOpen ? { type: "space", id: f.space.id, name: spaceName(f.space, identity) } : SHARED_PART];
   const openable = f => !!f && f.access.ladder != null;
   /** `accessMany` over any number of ids, HOME.batch at a time. */
   const accessAll = async (identity, ids) => {
@@ -41,14 +44,14 @@ export function homeService({ registry, tenancy, now = Date.now }) {
     for (let i = 0; i < ids.length; i += HOME.batch) for (const [k, v] of await tenancy.accessMany(identity, ids.slice(i, i + HOME.batch))) out.set(k, v);
     return out;
   };
-  const card = (f, extra = {}) => ({ id: f.board.id, title: f.board.title, role: f.access.ladder, path: pathOf(f), starred: false, ...extra });
+  const card = (f, identity, extra = {}) => ({ id: f.board.id, title: f.board.title, role: f.access.ladder, path: pathOf(f, identity), starred: false, ...extra });
 
   /** Cards for `entries` ({ id, at? }) in order, dropping what the person can't open; star flags in one query. `keep(found)` filters further. */
   async function cards(identity, unit, entries, { found: given, keep, can = !!unit } = {}) {
     const found = given ?? await accessAll(identity, [...new Set(entries.map(e => e.id))]);
     // `can` (the Space page and a member's Home cards, never a guest's): what the person may do to the board, as permissions the resolver already computed (never a role name).
     const extra = f => (can ? { can: { rename: f.access.permissions.has("board.edit") || f.access.permissions.has("members.manage"), move: mayMove(f.access), trash: f.access.permissions.has("delete") } } : {});
-    const out = entries.filter(e => openable(found.get(e.id)) && (!keep || keep(found.get(e.id)))).map(e => card(found.get(e.id), { ...(e.at != null ? { at: e.at } : {}), ...extra(found.get(e.id)) }));
+    const out = entries.filter(e => openable(found.get(e.id)) && (!keep || keep(found.get(e.id)))).map(e => card(found.get(e.id), identity, { ...(e.at != null ? { at: e.at } : {}), ...extra(found.get(e.id)) }));
     if (out.length) {
       const stars = new Set(await registry.starredAmong(identity.user, out.map(c => c.id)));
       for (const c of out) c.starred = stars.has(c.id);
@@ -63,14 +66,27 @@ export function homeService({ registry, tenancy, now = Date.now }) {
    */
   async function reached(identity, unit) {
     const directIds = await registry.sharedBoards(identity.user, identity.email ?? null, { limit: SCAN.shared });
-    let ids = directIds;
+    const idSet = new Set(directIds);
     const isPersonalUnit = Boolean(unit && unit.domain === null);
-    if (isPersonalUnit && typeof registry.boardsIn === "function") {
-      const unitPage = await registry.boardsIn({ type: "unit", id: unit.id }, { limit: SCAN.shared });
-      ids = [...new Set([...directIds, ...unitPage.ids])].slice(0, SCAN.shared);
+    if (typeof registry.boardsIn === "function") {
+      if (isPersonalUnit && idSet.size < SCAN.shared) {
+        const unitPage = await registry.boardsIn({ type: "unit", id: unit.id }, { limit: SCAN.shared });
+        for (const id of unitPage.ids) { if (idSet.size >= SCAN.shared) break; idSet.add(id); }
+      }
+      const vEmail = verifiedEmail(identity);
+      if (vEmail && typeof registry.tenantsForMember === "function" && idSet.size < SCAN.shared) {
+        const memberTenants = await registry.tenantsForMember(vEmail);
+        for (const pt of memberTenants) {
+          if (pt.domain !== null || pt.id === unit?.id) continue;
+          if (idSet.size >= SCAN.shared) break;
+          const page = await registry.boardsIn({ type: "unit", id: pt.id }, { limit: SCAN.shared });
+          for (const id of page.ids) { if (idSet.size >= SCAN.shared) break; idSet.add(id); }
+        }
+      }
     }
+    const ids = [...idSet].slice(0, SCAN.shared);
     const found = await accessAll(identity, ids);
-    const inTree = f => !!unit && !isPersonalUnit && f.spaceOpen;
+    const inTree = f => !!unit && !isPersonalUnit && f.board.tenant === unit.id && f.spaceOpen;
     const mine = f => f.grant === "owner";
     const list = (keep) => cards(identity, unit, ids.map(id => ({ id })), { found, keep });
     // "Your boards" cards carry no path: a guest's own board is not "shared with" them, and what is above it is not theirs to name.
@@ -79,7 +95,7 @@ export function homeService({ registry, tenancy, now = Date.now }) {
     return { owned, shared };
   }
 
-  const asNode = s => ({ id: s.id, name: s.name, personal: s.kind === "personal" });
+  const asNode = (s, identity) => ({ id: s.id, name: spaceName(s, identity), personal: s.kind === "personal" });
 
   /** The tree: the Spaces and Groups the person can open boards in. Every step is bounded (module header, PROTOCOL.md § Home). */
   async function tree(identity, unit) {
@@ -124,8 +140,8 @@ export function homeService({ registry, tenancy, now = Date.now }) {
     }
     return {
       groups: [...shown.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : a.id < b.id ? -1 : 1))
-        .map(g => ({ id: g.id, name: g.name, spaces: visible.filter(s => s.group === g.id).map(asNode) })),
-      spaces: visible.filter(s => !s.group || !shown.has(s.group)).map(asNode),
+        .map(g => ({ id: g.id, name: g.name, spaces: visible.filter(s => s.group === g.id).map(s => asNode(s, identity)) })),
+      spaces: visible.filter(s => !s.group || !shown.has(s.group)).map(s => asNode(s, identity)),
       more,
     };
   }
@@ -150,7 +166,7 @@ export function homeService({ registry, tenancy, now = Date.now }) {
         } : null,
         limits: LIMITS,
       };
-      if (unit) { await registry.ensurePersonalSpace(unit.id, identity.user); await touch(unit, identity); }        // a member always has a place to put a board (JOURNEY J1)
+      if (unit) { await registry.ensurePersonalSpace(unit.id, identity.user, { name: identity.name, email: identity.email }); await touch(unit, identity); }        // a member always has a place to put a board (JOURNEY J1)
       const [rec, star, { owned, shared }, theTree, unitAccess] = await Promise.all([
         registry.recents(identity.user, { limit: SCAN.recent }),
         unit ? registry.starred(identity.user, { limit: SCAN.starred }) : [],
@@ -217,7 +233,7 @@ export function homeService({ registry, tenancy, now = Date.now }) {
       }
       const results = (await cards(identity, unit, ids.map(id => ({ id })), { found, can })).sort(byTitle);
       // As in search: `more` never reflects boards the person can't open. For a Space they can't open it is only the 50-card overflow.
-      return { space: named ? { id: sp.id, name: sp.name } : null, results: results.slice(0, LIMITS.space), more: results.length > LIMITS.space || (named && after != null) };
+      return { space: named ? { id: sp.id, name: spaceName(sp, identity) } : null, results: results.slice(0, LIMITS.space), more: results.length > LIMITS.space || (named && after != null) };
     },
 
     /** PUT /home/stars/:board. Guests have no Starred. @returns {Promise<boolean>} false = refused (guest, no role, or no such board): nothing was written */

@@ -582,15 +582,18 @@ export function memoryRegistry({ now = Date.now } = {}) {
       return copy(row);
     },
     async personalSpace(tenant, user) { const sp = [...spaces.values()].find(s => s.tenant === tenant && s.owner === String(user)); return sp ? copy(sp) : null; },
-    async ensurePersonalSpace(tenant, user) {
+    async ensurePersonalSpace(tenant, user, opts) {
       need(tenants.has(tenant), "tenant");
       user = String(user);
       noRemoved(tenant, user);
+      const desired = orgDefaults.personalName(user, opts);
       let sp = [...spaces.values()].find(s => s.tenant === tenant && s.owner === user);
       if (!sp) {
-        sp = { id: fresh(spaces, mint.space), tenant, group: null, name: orgDefaults.personalName(user), kind: "personal", owner: user, generalRole: null, createdAt: now(), trashedAt: null, trashedBy: null, archivedAt: null };
+        sp = { id: fresh(spaces, mint.space), tenant, group: null, name: desired, kind: "personal", owner: user, generalRole: null, createdAt: now(), trashedAt: null, trashedBy: null, archivedAt: null };
         spaces.set(sp.id, sp);
         putScoped("space", sp.id, "user", user, "owner");
+      } else if (orgDefaults.isNumericPersonalName(sp.name, user) && sp.name !== desired) {
+        sp.name = desired;
       }
       return copy(sp);
     },

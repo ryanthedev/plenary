@@ -168,7 +168,7 @@ export const mint = {
  *   space(id: string): Promise<Space|null>,
  *   spaces(tenant: string): Promise<Space[]>,
  *   personalSpace(tenant: string, user: string): Promise<Space|null>,   // the user's personal space, or null when it does not exist yet: a pure read (a GET never creates it; ensurePersonalSpace does)
- *   ensurePersonalSpace(tenant: string, user: string): Promise<Space>,   // idempotent, one per (tenant, user); private (generalRole null), the user is its owner; a removed user rejects code "removed" (nothing written)
+ *   ensurePersonalSpace(tenant: string, user: string, o?: { name?: string|null, email?: string|null }): Promise<Space>,   // idempotent, one per (tenant, user); private (generalRole null), the user is its owner; a removed user rejects code "removed" (nothing written)
  *   createTeam(o: { tenant: string, name: string, idem?: Idem }): Promise<Team>,
  *   renameTeam(team: string, name: string): Promise<Team>,   // trimmed 1-200; rejects an unknown Team
  *   deleteTeam(team: string): Promise<void>,   // removes the Team, its members and EVERY grant it holds, atomically; code "last-owner" (nothing changes) when it is the only counted owner of a Group or Space; rejects an unknown Team
@@ -367,8 +367,35 @@ export const orgDefaults = {
     if (!s || !types.includes(s.type) || typeof s.id !== "string" || !s.id || s.id.includes("\0")) fail("scope");
     return { type: s.type, id: s.id };
   },
-  /** The name of a member's personal Space until they rename it. */
-  personalName: user => `${String(user).replace(/^[a-z]+:/, "")}'s space`,
+  /** Whether a stored personal-space name is a raw numeric ID (e.g. a Google `sub` like `111216884807336592079` or `111216884807336592079's space`). */
+  isNumericPersonalName(spaceName, ownerUser = null) {
+    const t = typeof spaceName === "string" ? spaceName.trim() : "";
+    if (!t) return true;
+    if (/^\d{10,}(?:'s space)?$/i.test(t)) return true;
+    if (typeof ownerUser === "string" && ownerUser.startsWith("google:")) {
+      const sub = ownerUser.slice("google:".length).trim();
+      if (/^\d+$/.test(sub) && (t === sub || t.toLowerCase() === `${sub}'s space`)) return true;
+    }
+    return false;
+  },
+  /** The name of a member's personal Space until they rename it: prefers display name, then email local part, then non-numeric user id, else "Personal". */
+  personalName(user, { name, email } = {}) {
+    const suffix = "'s space";
+    const maxBase = 200 - suffix.length;
+    const format = raw => `${raw.slice(0, maxBase)}${suffix}`;
+    const isRawNumeric = s => /^\d{10,}$/.test(s);
+    const u = String(user ?? "");
+    const sub = u.replace(/^[a-z]+:/, "").trim();
+    const isGoogleNumericSub = s => u.startsWith("google:") && /^\d+$/.test(sub) && s === sub;
+    const cleanName = typeof name === "string" ? name.trim() : "";
+    if (cleanName && !isRawNumeric(cleanName) && !isGoogleNumericSub(cleanName)) return format(cleanName);
+    const cleanEmail = typeof email === "string" ? email.trim() : "";
+    const at = cleanEmail.indexOf("@");
+    const local = at > 0 ? cleanEmail.slice(0, at).trim() : "";
+    if (local && !isRawNumeric(local) && !isGoogleNumericSub(local)) return format(local);
+    if (sub && !isRawNumeric(sub) && !isGoogleNumericSub(sub)) return format(sub);
+    return "Personal";
+  },
   /** @returns {import("./registry-port.js").ScopeRef} */
   scope(s) {
     if (!s || !SCOPES.includes(s.type) || typeof s.id !== "string" || !s.id || s.id.includes("\0")) fail("scope");

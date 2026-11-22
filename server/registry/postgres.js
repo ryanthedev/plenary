@@ -1030,21 +1030,30 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       });
     },
     async personalSpace(tenant, user) { ready(); return key(tenant) ? rowSpace(await one(db, `SELECT * FROM ${SP} WHERE tenant = $1 AND owner_user = $2`, [tenant, String(user)])) ?? null : null; },
-    async ensurePersonalSpace(tenant, user) {
+    async ensurePersonalSpace(tenant, user, opts) {
       ready();
       if (!key(tenant)) throw new Error("registry: no such tenant");
-      const u = String(user), createdAt = now();
-      // Read first: Home calls this on every load; the primary write happens only when the row is missing.
+      const u = String(user), desired = orgDefaults.personalName(u, opts), createdAt = now();
+      // Read first: Home calls this on every load; the primary write happens only when the row is missing or needs a numeric-name repair.
       const had = rowSpace(await one(db, `SELECT * FROM ${SP} WHERE tenant = $1 AND owner_user = $2`, [tenant, u]));
-      if (had) return had;
+      if (had && (!orgDefaults.isNumericPersonalName(had.name, u) || had.name === desired)) return had;
       return write(async tx => {
         if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
+        const existing = await one(tx, `SELECT * FROM ${SP} WHERE tenant = $1 AND owner_user = $2`, [tenant, u]);
+        if (existing) {
+          if (orgDefaults.isNumericPersonalName(existing.name, u) && existing.name !== desired) {
+            await noRemoved(tx, tenant, u);
+            await tx.unsafe(`UPDATE ${SP} SET name = $2 WHERE id = $1`, [existing.id, desired]);
+            return rowSpace(await one(tx, `SELECT * FROM ${SP} WHERE id = $1`, [existing.id]));
+          }
+          return rowSpace(existing);
+        }
         await noRemoved(tx, tenant, u);
         // One per (tenant, user): the unique key settles two racing first sign-ins; the loser reads the winner's row.
         const id = await fresh(tx, mint.space, SP);
         const made = await one(tx, `INSERT INTO ${SP} (id, tenant, grp, name, kind, owner_user, general_role, created_at)
           VALUES ($1, $2, NULL, $3, 'personal', $4, NULL, $5) ON CONFLICT (tenant, owner_user) DO NOTHING RETURNING id`,
-          [id, tenant, orgDefaults.personalName(u), u, createdAt]);
+          [id, tenant, desired, u, createdAt]);
         if (made) await putSg(tx, "space", id, "user", u, "owner");
         return rowSpace(await one(tx, `SELECT * FROM ${SP} WHERE tenant = $1 AND owner_user = $2`, [tenant, u]));
       });

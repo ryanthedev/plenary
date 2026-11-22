@@ -3,6 +3,7 @@
 // what a guest sees, the batch access check agreeing with the single-board resolver, and its statement count.
 import { test, expect, beforeEach, describe } from "bun:test";
 import { memoryRegistry } from "../../server/auth/registry.js";
+import { sqliteRegistry } from "../../server/registry/sqlite.js";
 import { tenancy } from "../../server/auth/tenancy.js";
 import { accessEquivalence } from "./access-equivalence.js";
 import { homeService, recentRecorder, LIMITS, SHARED_PART } from "../../server/auth/home.js";
@@ -566,6 +567,101 @@ describe("recentRecorder under a join storm", () => {
     rec("u0", "b-dropped-earlier");                                                      // a dropped welcome wasn't remembered: the next one writes
     await Promise.resolve(); await Promise.resolve();
     expect(started).toBe(17);
+  });
+});
+
+describe("human-friendly personal space names for Google users", () => {
+  test("prefers display name, falls back to email local part, then Personal — never a raw numeric Google sub", async () => {
+    const withName = { user: "google:111216884807336592079", name: "Ryan", email: "papaender@gmail.com", domain: "acme.com" };
+    const withEmailOnly = { user: "google:222216884807336592079", name: null, email: "papaender@gmail.com", domain: "acme.com" };
+    const withNeither = { user: "google:333216884807336592079", name: null, email: null, domain: "acme.com" };
+
+    expect((await home.home(withName)).tree.spaces.map(s => s.name)).toEqual(["Ryan's space"]);
+    expect((await home.home(withEmailOnly)).tree.spaces.map(s => s.name)).toEqual(["papaender's space"]);
+    expect((await home.home(withNeither)).tree.spaces.map(s => s.name)).toEqual(["Personal"]);
+  });
+
+  test("normalizes an already-created personal space whose stored name is a raw numeric Google sub (memory and sqlite)", async () => {
+    const ryan = { user: "google:111216884807336592079", name: "Ryan", email: "papaender@gmail.com", domain: "acme.com" };
+    const root = ident("root");
+    // Simulate legacy rows with raw numeric sub names in both memory and sqlite registries.
+    for (const [label, reg] of [["memory", r], ["sqlite", sqliteRegistry({ path: ":memory:" })]]) {
+      try {
+        const tenant = label === "memory" ? acme : await reg.createTenant({ domain: "acme.com", admins: [root.user] });
+        const sp = await reg.ensurePersonalSpace(tenant.id, ryan.user);
+        await reg.rename({ type: "space", id: sp.id }, "111216884807336592079's space");
+        expect((await reg.space(sp.id)).name).toBe("111216884807336592079's space");
+
+        const tenSvc = tenancy({ registry: reg, now });
+        const homeSvc = homeService({ registry: reg, tenancy: tenSvc });
+        // Before Ryan loads Home, a content-admin viewing Ryan's unhealed numeric personal space sees "Personal", not digits.
+        await reg.setScopedGrant({ scope: { type: "unit", id: tenant.id }, subject: { type: "user", id: root.user }, role: "content-admin-personal" });
+        const adminTree = (await homeSvc.home(root)).tree.spaces;
+        expect(adminTree.find(s => s.id === sp.id)?.name).toBe("Personal");
+
+        // When Ryan loads Home, his personal space is healed in-place to "Ryan's space".
+        const h = await homeSvc.home(ryan);
+        expect(h.tree.spaces.find(s => s.id === sp.id)?.name).toBe("Ryan's space");
+        expect((await reg.space(sp.id)).name).toBe("Ryan's space");
+
+        // Also handles bare numeric ID without "'s space" suffix.
+        await reg.rename({ type: "space", id: sp.id }, "111216884807336592079");
+        expect((await homeSvc.home(ryan)).tree.spaces.find(s => s.id === sp.id)?.name).toBe("Ryan's space");
+        expect((await reg.space(sp.id)).name).toBe("Ryan's space");
+      } finally {
+        if (label === "sqlite") await reg.close();
+      }
+    }
+  });
+});
+
+describe("cross-org Shared with me for personal org members", () => {
+  test("a Workspace user added to another user's personal org sees its shared boards in Shared with me, never its private personal-space boards", async () => {
+    const papa = { user: "google:111216884807336592079", name: "Ryan", email: "papaender@gmail.com", domain: null };
+    const alice = { user: "google:alice-acme", name: "Alice", email: "alice@acme.com", domain: "acme.com" };
+    const unverifiedAlice = { ...alice, emailVerified: false };
+
+    const papaOrg = await r.createTenant({ name: "Ryan's org", domain: null, admins: [papa.user] });
+    await r.addTenantMember(papaOrg.id, alice.email);
+
+    const papaPersonal = await r.ensurePersonalSpace(papaOrg.id, papa.user, { name: papa.name, email: papa.email });
+    const papaGeneral = await r.createSpace({ tenant: papaOrg.id, name: "General", generalRole: null });
+    const papaOpen = await r.createSpace({ tenant: papaOrg.id, name: "Team Space", generalRole: "viewer" });
+
+    const privateBoard = await r.createBoard({ tenant: papaOrg.id, space: papaPersonal.id, title: "Private Journal", memberRole: null, owner: papa.user });
+    const sharedBoard = await r.createBoard({ tenant: papaOrg.id, space: papaGeneral.id, title: "Shared Plan", memberRole: "viewer", owner: papa.user });
+    const openSpaceBoard = await r.createBoard({ tenant: papaOrg.id, space: papaOpen.id, title: "Team Notes", memberRole: null, owner: papa.user });
+
+    const h = await home.home(alice);
+    expect(h.unit?.id).toBe(acme.id);
+    expect(ids(h.shared)).toEqual([sharedBoard.id, openSpaceBoard.id]);
+    expect(ids(h.shared)).not.toContain(privateBoard.id);
+
+    // Search also finds the cross-org shared boards and never the private personal board.
+    expect(ids((await home.search(alice, "Shared Plan")).results)).toEqual([sharedBoard.id]);
+    expect(ids((await home.search(alice, "Private Journal")).results)).toEqual([]);
+
+    // Unverified email does not gain personal-org member visibility.
+    expect(ids((await home.home(unverifiedAlice)).shared)).toEqual([]);
+  });
+
+  test("a personal-org user added to a second personal org sees the second org's shared boards in Shared with me", async () => {
+    const papa = { user: "google:111216884807336592079", name: "Ryan", email: "papaender@gmail.com", domain: null };
+    const bob = { user: "google:222216884807336592079", name: "Bob", email: "bob@gmail.com", domain: null };
+
+    const bobOrg = await r.createTenant({ name: "Bob's org", domain: null, admins: [bob.user] });
+    const papaOrg = await r.createTenant({ name: "Ryan's org", domain: null, admins: [papa.user] });
+    await r.addTenantMember(papaOrg.id, bob.email);
+
+    const papaPersonal = await r.ensurePersonalSpace(papaOrg.id, papa.user, { name: papa.name, email: papa.email });
+    const papaGeneral = await r.createSpace({ tenant: papaOrg.id, name: "General", generalRole: null });
+    const privateBoard = await r.createBoard({ tenant: papaOrg.id, space: papaPersonal.id, title: "Secret", memberRole: null, owner: papa.user });
+    const sharedBoard = await r.createBoard({ tenant: papaOrg.id, space: papaGeneral.id, title: "Collab", memberRole: "editor", owner: papa.user });
+
+    const h = await home.home(bob);
+    expect(h.unit?.id).toBe(bobOrg.id);
+    expect(ids(h.shared)).toEqual([sharedBoard.id]);
+    expect(ids(h.shared)).not.toContain(privateBoard.id);
   });
 });
 

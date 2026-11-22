@@ -169,7 +169,7 @@ export async function createBoard({ caller, tenant, title = "", memberRole = "vi
       const existing = (await registry.spaces(tenant)).find(s => s.kind !== "personal" && s.trashedAt == null);
       targetSpace = existing ? existing.id : (await registry.createSpace({ tenant, name: "General", generalRole: null })).id;
     } else {
-      targetSpace = (await registry.ensurePersonalSpace(tenant, caller.user)).id;
+      targetSpace = (await registry.ensurePersonalSpace(tenant, caller.user, { name: caller.name, email: caller.email })).id;
     }
   }
   const board = await registry.createBoard({ tenant, title, memberRole, space: targetSpace, owner: caller.user });

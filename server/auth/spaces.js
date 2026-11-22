@@ -160,7 +160,7 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
 
   /** The Spaces the person can open and `board.create` in (their personal space first), for the picker. One batch read settles every candidate. */
   async function creatableSpaces(identity, unit) {
-    const personal = await registry.ensurePersonalSpace(unit.id, identity.user);
+    const personal = await registry.ensurePersonalSpace(unit.id, identity.user, { name: identity.name, email: identity.email });
     const all = opens(await tenancy.effective(identity, { type: "unit", id: unit.id }));   // a Unit-level role covers everything inside
     const cand = await registry.spaceCandidates(unit.id, { user: identity.user, all, limit: LIMITS.spaces });
     const groups = new Map(cand.groups.map(g => [g.id, g]));
@@ -255,7 +255,7 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
       const unit = await unitOf(identity);
       if (!unit) throw refused();
       let target;
-      if (space === null) target = (await registry.ensurePersonalSpace(unit.id, identity.user)).id;
+      if (space === null) target = (await registry.ensurePersonalSpace(unit.id, identity.user, { name: identity.name, email: identity.email })).id;
       else {
         // Nobody writes into another member's personal space, an admin included (it is private until its owner shares from it).
         target = (await boardCreateAccess(identity, unit, space)).row.id;

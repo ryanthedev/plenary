@@ -108,7 +108,7 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
       const d = await deleter(identity, boardId);
       const go = async dest => {
         if (dest && !dest.ok) throw asAdminError({ code: "would-escalate" });
-        if (dest) dest.space ??= await registry.ensurePersonalSpace(d.unit.id, identity.user);   // created only now: a refused restore leaves nothing behind
+        if (dest) dest.space ??= await registry.ensurePersonalSpace(d.unit.id, identity.user, { name: identity.name, email: identity.email });   // created only now: a refused restore leaves nothing behind
         return registry.restoreBoard({ board: d.row.id, idem, ...(dest ? { into: dest.space.id } : {}) });
       };
       let dest = d.row.trashedAt == null ? null : await destination(identity, d), out;

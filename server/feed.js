@@ -168,6 +168,24 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
     return chunks;
   }
 
+  /** The base snapshot, encoded once per base and lazily gzipped for HTTP snapshot serving (F9). */
+  self.snapshot = () => {
+    if (!self.snap) {
+      const data = codec.encode(snapshotOf(self.base));
+      self.snap = { seq: self.base.seq, data, bytes: utf8Length(data), shared: `${key}/s${self.base.seq}`, gz: null };
+    }
+    return {
+      seq: self.snap.seq,
+      data: self.snap.data,
+      bytes: self.snap.bytes,
+      gzip: () => {
+        if (!self.snap.gz && typeof Bun !== "undefined" && typeof Bun.gzipSync === "function")
+          self.snap.gz = Bun.gzipSync(Buffer.from(self.snap.data, "utf8"));
+        return self.snap.gz;
+      },
+    };
+  };
+
   /**
    * Rule 3: the frames that bring a client at `since` up to the feed's seq, as `{ data, bytes, shared }` (`shared`
    * names encode-once text many joiners hold; a client starting inside a chunk gets its own cut of it).
@@ -175,7 +193,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
   self.catchUp = since => {
     const frames = [];
     if (since < self.base.seq) {
-      if (!self.snap) { const data = codec.encode(snapshotOf(self.base)); self.snap = { data, bytes: utf8Length(data), shared: `${key}/s${self.base.seq}` }; }
+      self.snapshot();
       frames.push(self.snap);
       since = self.base.seq;
     }

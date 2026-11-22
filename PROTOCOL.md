@@ -247,7 +247,7 @@ Client → server
 
 | `t` | Fields | |
 |---|---|---|
-| `hello` | `v: 1`, `token`, `board`, `since`, `client`, `tab?` | first message; the token travels here, never in a header (Herdr refuses credential headers). `client` = name + per-session part, no colon, ≤ 128 chars. `tab` = the browser tab this connection belongs to (§ Messages, `hello.tab`). Unknown `v` → `version`, closed |
+| `hello` | `v: 1`, `token`, `board`, `since`, `client`, `tab?`, `snap?` | first message; the token travels here, never in a header (Herdr refuses credential headers). `client` = name + per-session part, no colon, ≤ 128 chars. `tab` = the browser tab this connection belongs to (§ Messages, `hello.tab`). `snap: "http"` opts into off-WS HTTP snapshot catch-up (§ Recovery, HTTP snapshots). Unknown `v` → `version`, closed |
 | `op` | `id` (`client:counter`), `sentAt`, `stream`, `op` | durable change; `counter` is a positive safe integer, larger than every earlier counter of this client; `sentAt` = the `seq` the client had applied when it first sent this op. Encoded with `t` then `id` first (§ Limits) |
 | `presence` | `k`, kind fields (§ Presence) | never logged, may drop |
 | `blob` | `sha1` (40 lowercase hex), `put?` | asks for a signed blob URL (§ Blobs) |
@@ -256,7 +256,7 @@ Server → client
 
 | `t` | Fields | |
 |---|---|---|
-| `welcome` | `seq`, `role`, `user`, `high`, `horizon`, `rv`, `room`, `hb?` | `seq` = resolved seq; `high` = this (user, client)'s highest accepted counter (0 if none; omitted for viewers); `horizon` (§ Op ids); `rv` = the room's rules version (§ Recovery); `room` = `{ board, epoch }` (§ Recovery, Room identity); `hb` = gateway downstream heartbeat interval in ms (10,000; omitted when no gateway sends `hb`) |
+| `welcome` | `seq`, `role`, `user`, `high`, `horizon`, `rv`, `room`, `hb?`, `snapshot?` | `seq` = resolved seq; `high` = this (user, client)'s highest accepted counter (0 if none; omitted for viewers); `horizon` (§ Op ids); `rv` = the room's rules version (§ Recovery); `room` = `{ board, epoch }` (§ Recovery, Room identity); `hb` = gateway downstream heartbeat interval in ms (10,000; omitted when no gateway sends `hb`); `snapshot` = `{ seq, url, bytes }` when `hello.snap === "http"` and the board's base snapshot is served over HTTP (§ Recovery, HTTP snapshots) |
 | `snapshot` | `seq`, `streams: { board, notes }`, `appSeq`, `records`, `noteAuthor` | the client-facing board state at a resolved `seq`, tombstones included; never holds the op-id table |
 | `entries` | `entries: [{ seq, board, tenant, stream, op, by, id, at, rv, name? }]` | catch-up and live, ascending `seq`; `name` only on `records` entries (§ Records) |
 | `ack` | `id`, `seq` | the entry is durable (§ Store says against what); it is never lost short of losing the Store's own media |
@@ -435,6 +435,17 @@ accepted with, give the same state.
 (size, and other people's op ids). `noteAuthor` is in it so a client knows which notes an annotator may change.
 Its `streams` and `records` **include tombstones**, as the checkpoint's do: without them a later entry carrying an
 older version of a deleted element would bring it back on that client only.
+
+**HTTP snapshots (`F9`).** To keep large-board catch-up off the WebSocket frame path, a client may send
+`snap: "http"` in `hello`. When the client needs a snapshot (`since < base.seq`) and the base snapshot is at or
+above the gateway's threshold (`httpSnapshotBytes`, default 1 MiB), `welcome` carries
+`snapshot: { seq, url, bytes }` where `url` is `/boards/:board/snapshot?seq=<seq>&ticket=<ticket>`, and the
+WebSocket catch-up sends only the tail `entries` after `snapshot.seq`. The ticket is an offline-verifiable
+HMAC-SHA256 token (`snap1.<payload>.<mac>`, 5 min TTL, scoped to `(board, seq)`, no user PII, never accepted as a
+session token). `GET`/`HEAD /boards/:board/snapshot?ticket=...` verifies the ticket with zero Registry lookups,
+serves the snapshot JSON (gzip-compressed once per `(board, seq)` when `Accept-Encoding: gzip` is sent), and sets
+`ETag: "snap-<board>-<seq>"` + `Cache-Control: private, max-age=300, immutable` (with `304 Not Modified` on
+`If-None-Match`). Clients that omit `hello.snap` receive the snapshot over the WebSocket as before.
 
 - **One step.** Live ops and replay go through the same `applyEntry(entry)`: merge into the stream (or records),
   record the op id under `(entry.by, client of entry.id)`, record note authors, run eviction (§ Op ids). Role and

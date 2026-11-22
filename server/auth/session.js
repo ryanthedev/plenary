@@ -12,12 +12,13 @@ import { b64url, unb64url, utf8, fromUtf8 } from "./util.js";
 /** @typedef {import("./idp-port.js").Identity} Identity */
 /** @typedef {import("./idp-port.js").Session} Session */
 
-/** @param {{ key: Uint8Array|string, ttlSec?: number, now?: () => number }} config */
-export async function sessions({ key, ttlSec = 12 * 3600, now = Date.now }) {
+/** @param {{ key: Uint8Array|string, ttlSec?: number, snapshotTtlSec?: number, now?: () => number }} config */
+export async function sessions({ key, ttlSec = 12 * 3600, snapshotTtlSec = 300, now = Date.now }) {
   const raw = typeof key === "string" ? utf8(key) : key;
   if (!raw || raw.length < 32) throw new Error("session: key must be at least 32 bytes");
   // `exp` = iat + ttlSec must be an integer (the Verifier port and the exchange's 200 body promise one).
   if (!Number.isInteger(ttlSec) || ttlSec <= 0) throw new Error("session: ttlSec must be a positive integer");
+  if (!Number.isInteger(snapshotTtlSec) || snapshotTtlSec <= 0) throw new Error("session: snapshotTtlSec must be a positive integer");
   const k = await crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
 
   return {
@@ -41,6 +42,30 @@ export async function sessions({ key, ttlSec = 12 * 3600, now = Date.now }) {
         if (typeof c?.u !== "string" || !Number.isInteger(c.exp)) return null;
         if (Math.floor(now() / 1000) >= c.exp) return null;
         return { user: c.u, name: c.n ?? null, email: c.e ?? null, domain: c.d ?? null, exp: c.exp };
+      } catch { return null; }
+    },
+    /** Short-lived HMAC-signed ticket for HTTP snapshot fetch (F9). Prefix "snap1." never verifies as "s1."/"l1."/"x1.". */
+    async issueSnapshotTicket(board, seq, ttl = snapshotTtlSec) {
+      if (typeof board !== "string" || !board || board.length > 128) throw new Error("session: snapshot ticket requires board id");
+      if (!Number.isSafeInteger(seq) || seq < 0) throw new Error("session: snapshot ticket requires non-negative integer seq");
+      if (!Number.isInteger(ttl) || ttl <= 0) throw new Error("session: snapshot ticket ttl must be a positive integer");
+      const exp = Math.floor(now() / 1000) + ttl;
+      const payload = b64url(utf8(JSON.stringify({ b: board, s: seq, exp })));
+      const mac = await crypto.subtle.sign("HMAC", k, utf8("snap1." + payload));
+      return `snap1.${payload}.${b64url(mac)}`;
+    },
+    /** Verify a snapshot ticket offline (no store/registry lookup). Returns `{ board, seq, exp }` or null. */
+    async verifySnapshotTicket(ticket) {
+      if (typeof ticket !== "string" || ticket.length > 1024 || !ticket.startsWith("snap1.")) return null;
+      const parts = ticket.split(".");
+      if (parts.length !== 3) return null;
+      try {
+        const ok = await crypto.subtle.verify("HMAC", k, unb64url(parts[2]), utf8("snap1." + parts[1]));
+        if (!ok) return null;
+        const c = JSON.parse(fromUtf8(unb64url(parts[1])));
+        if (typeof c?.b !== "string" || !c.b || !Number.isSafeInteger(c.s) || c.s < 0 || !Number.isInteger(c.exp)) return null;
+        if (Math.floor(now() / 1000) >= c.exp) return null;
+        return { board: c.b, seq: c.s, exp: c.exp };
       } catch { return null; }
     },
   };

@@ -60,7 +60,7 @@ export function formatMetrics({ uptimeMs, rooms, gateway, memory = process.memor
  *   (names a gateway-only node's open requests).
  */
 export function createServer({ auth, registry, store, bus, blobs = null, log = quietLogger, port = 0, hostname = "127.0.0.1", http, limits, host = {}, static: web = {},
-  roles = { gateway: true, host: true }, node = "node" }) {
+  roles = { gateway: true, host: true }, node = "node", snapshotTickets = null }) {
   if (!roles || (!roles.gateway && !roles.host)) throw new TypeError("createServer needs at least one role (gateway, host)");
   const started = Date.now();
   const site = web === false || !roles.gateway ? null : staticSite({ log, ...web });
@@ -68,7 +68,7 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
     ? roomHost({ store, bus, log, ...host })
     : remoteRooms({ bus, node, timeoutMs: host.leaseTtlMs ?? 10_000, log });
   const unserve = roles.host ? serveOpens({ bus, rooms, log }) : () => {};
-  const gw = roles.gateway ? makeGateway({ auth, registry, store, bus, rooms, log, limits }) : null;
+  const gw = roles.gateway ? makeGateway({ auth, registry, store, bus, rooms, log, limits, snapshotTickets }) : null;
 
   const server = Bun.serve({
     port, hostname,

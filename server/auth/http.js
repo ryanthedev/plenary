@@ -110,7 +110,7 @@ const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
  *   now?: () => number, config: object, dev?: { enabled?: boolean, verify(t: string): Promise<object|null> } | null,
  *   testHooks?: { pruned?(p: { visited: number, expired: number, live: number }): void } | null }} deps   (tests only, not an API)
  */
-export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Date.now, config = {}, dev = null, log = stdoutLog, testHooks = null }) {
+export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Date.now, config = {}, dev = null, log = stdoutLog, testHooks = null, snapshot = null, snapshotTickets = null }) {
   if (!registry || !sessions || !tenancy) throw new Error("http: registry, sessions and tenancy are required");
   const postLoginUrl = absUrl(config.postLoginUrl, "postLoginUrl");
   const postLogoutUrl = config.postLogoutUrl ? absUrl(config.postLogoutUrl, "postLogoutUrl") : postLoginUrl;
@@ -341,6 +341,40 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
   }
   const defined = o => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined));
 
+  // ---- snapshot route (F9): off-WS HTTP catch-up with short-lived signed ticket ----
+  const verifyTicket = snapshotTickets?.verify ?? (typeof sessions.verifySnapshotTicket === "function" ? t => sessions.verifySnapshotTicket(t) : null);
+  async function serveSnapshot(req, p, url) {
+    if (!snapshot || !verifyTicket) return err(503, "snapshot-unavailable");
+    const ticket = url.searchParams.get("ticket");
+    if (!ticket) return err(401, "auth");
+    let claims;
+    try { claims = await verifyTicket(ticket); } catch { return err(503, "unavailable"); }
+    if (!claims) return err(401, "auth");
+    if (claims.board !== p.board) return err(403, "forbidden");
+    if (url.searchParams.has("seq")) {
+      const raw = url.searchParams.get("seq");
+      if (!/^\d+$/.test(raw) || Number(raw) !== claims.seq) return err(400, "bad-request");
+    }
+    const snap = await snapshot.get(p.board, claims.seq);
+    if (!snap) return err(404, "not-found");
+    const etag = `"snap-${p.board}-${snap.seq}"`;
+    const cacheControl = snap.seq > 0 ? "private, max-age=300, immutable" : "private, max-age=60";
+    const baseHeaders = { etag, "cache-control": cacheControl, vary: "Accept-Encoding" };
+    if (req.headers.get("if-none-match") === etag) return new Response(null, { status: 304, headers: baseHeaders });
+    const wantsGzip = /\bgzip\b/i.test(req.headers.get("accept-encoding") ?? "");
+    const gz = wantsGzip ? (typeof snap.gzip === "function" ? snap.gzip() : snap.gzip) : null;
+    if (gz) {
+      return new Response(req.method === "HEAD" ? null : gz, {
+        status: 200,
+        headers: { "content-type": "application/json; charset=utf-8", "content-encoding": "gzip", ...baseHeaders },
+      });
+    }
+    return new Response(req.method === "HEAD" ? null : snap.data, {
+      status: 200,
+      headers: { "content-type": "application/json; charset=utf-8", ...baseHeaders },
+    });
+  }
+
   // ---- routes ----
   const admin = { registry, now };
   const routes = [
@@ -356,6 +390,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
       const board = await createBoard(defined({ caller: who, tenant: t.id, title: b.title, memberRole: b.memberRole }), admin);
       return json(201, { board });
     } }],
+    ["/boards/:board/snapshot", { GET: serveSnapshot, HEAD: serveSnapshot }],
     ["/boards/:board/invites", {
       GET: async (req, p) => json(200, { invites: await listInvites({ caller: await caller(req), board: p.board }, admin) }),
       POST: async (req, p) => {
@@ -412,7 +447,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
         const params = {};
         try { r.names.forEach((n, i) => { params[n] = decodeURIComponent(m[i + 1]); }); }
         catch { return err(400, "bad-request"); }
-        if (r.names.length) return await fn(req, params);
+        if (r.names.length) return await fn(req, params, url);
         return await fn(req, url);
       }
       return null;

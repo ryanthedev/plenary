@@ -23,6 +23,7 @@
 // there is no room for is told `unavailable`, a reader that drains nothing for stallMs is cut, whatever it sends.
 
 import { jsonCodec } from "../packages/protocol/codec.js";
+import { snapshotOf } from "../packages/protocol/room.js";
 import { ROLES, MAX_CLIENT_CHARS, PROTOCOL_VERSION, RULES_VERSION, MAX_WRITER_CONNS, MAX_TAB_CONNS, HB_IDLE_MS, opProblem, parseOpId, isTab } from "../packages/protocol/envelope.js";
 import { presenceProblem, presenceLimiter, presenceCoalescer, EMOTES } from "../packages/protocol/presence.js";
 import { subjects, busBytes, MAX_BUS_BYTES } from "./bus/port.js";
@@ -92,6 +93,7 @@ export const LIMITS = {
   hereTtlMs: 15_000,                        // another gateway's `.here` counts this long
   hereBigBoard: 1_000,                      // more connections than this on a board here…
   hereBigMs: 5_000,                         // …and `here` goes to them at most this often
+  httpSnapshotBytes: 1024 * 1024,           // F9: snapshots at/above this size offload to HTTP when the client sends hello.snap = "http"
   feed: {},                               // options for each board's feed (pollMs, chunkBytes, …; tests)
 };
 
@@ -134,7 +136,7 @@ const OP_ID = /^\s*\{\s*"t"\s*:\s*"op"\s*,\s*"id"\s*:\s*"([^"\\]{1,256})"/;
  *   log?: object, codec?: object, id?: string, limits?: Partial<typeof LIMITS>, now?: () => number,
  * }} o
  */
-export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed }) {
+export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed, snapshotTickets = null }) {
   const lim = { ...LIMITS, ...limits };
   const maxBusBytes = bus.maxBytes ?? MAX_BUS_BYTES;
   // § Messages, hello.tab. A connection's tab key is "t:<tab>" for a hello with `tab`, else "c:<conn id>" (a tab of
@@ -712,19 +714,35 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     // socket before it; `welcoming` stops a second welcome being taken meanwhile.
     c.welcoming = true; c.answered = true; clearTimeout(c.timer);
     const b = c.b, since = c.since;
-    b.feed.reach(upTo).then(() => b.feed.atomically(() => {
-      if (c.state !== "live") return;
-      push(ws, typeof welcomeData === "function" ? welcomeData() : welcomeData);
-      c.welcomed = true;
-      for (const f of b.feed.catchUp(since)) pushShared(ws, f);
-      c.next = b.feed.seq + 1;
-      // Who's here, right after the catch-up: the full list. A board this gateway hasn't published for yet gets its
-      // own entry now (else the first joiner's list is empty until the next tick); otherwise the cached list, at most
-      // one tick old, so a join costs no merge.
-      if (!b.hFrom.has(id)) { const t = now(); b.hFrom.set(id, { msg: hereMine(b), at: t }); hereRefresh(b, t); }
-      else if (!b.hText) hereRefresh(b, now());
-      push(ws, b.hText); c.hVer = b.hVer;
-    })).catch(err => { log.error("catch-up failed", { conn: c.id, err }); if (c.state === "live") refuse(ws, "unavailable", "try again shortly", 1013, "unavailable"); });
+    const attachSnapshot = (raw, snapInfo) => {
+      const text = typeof raw === "function" ? raw() : raw;
+      if (!snapInfo) return text;
+      return codec.encode({ ...codec.decode(text), snapshot: snapInfo });
+    };
+    b.feed.reach(upTo).then(async () => {
+      let offloaded = null;
+      if (c.state === "live" && c.snapHttp && snapshotTickets && since < b.feed.base.seq) {
+        const snap = b.feed.snapshot();
+        if (snap.seq > 0 && snap.bytes >= lim.httpSnapshotBytes) {
+          const ticket = await snapshotTickets.issue(c.board, snap.seq);
+          offloaded = { seq: snap.seq, url: `/boards/${encodeURIComponent(c.board)}/snapshot?seq=${snap.seq}&ticket=${encodeURIComponent(ticket)}`, bytes: snap.bytes };
+        }
+      }
+      return b.feed.atomically(() => {
+        if (c.state !== "live") return;
+        const useHttp = offloaded && b.feed.base.seq === offloaded.seq;
+        push(ws, attachSnapshot(welcomeData, useHttp ? offloaded : null));
+        c.welcomed = true;
+        for (const f of b.feed.catchUp(useHttp ? offloaded.seq : since)) pushShared(ws, f);
+        c.next = b.feed.seq + 1;
+        // Who's here, right after the catch-up: the full list. A board this gateway hasn't published for yet gets its
+        // own entry now (else the first joiner's list is empty until the next tick); otherwise the cached list, at most
+        // one tick old, so a join costs no merge.
+        if (!b.hFrom.has(id)) { const t = now(); b.hFrom.set(id, { msg: hereMine(b), at: t }); hereRefresh(b, t); }
+        else if (!b.hText) hereRefresh(b, now());
+        push(ws, b.hText); c.hVer = b.hVer;
+      });
+    }).catch(err => { log.error("catch-up failed", { conn: c.id, err }); if (c.state === "live") refuse(ws, "unavailable", "try again shortly", 1013, "unavailable"); });
   }
 
   // ---- `here` (PROTOCOL.md § Presence, `here`; § Bus `.here`): never logged, bounded per board ----
@@ -915,6 +933,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
       return badFrame(ws, "hello-client", "hello needs a client id (no colon)");
     if (msg.since !== undefined && (!Number.isSafeInteger(msg.since) || msg.since < 0)) return badFrame(ws, "hello-since", "since must be a non-negative integer");
     if (msg.tab !== undefined && !isTab(msg.tab)) return badFrame(ws, "hello-tab", "tab must be 1-32 of A-Z a-z 0-9 _ -");
+    if (msg.snap !== undefined && msg.snap !== "http") return badFrame(ws, "hello-snap", "snap must be \"http\"");
     c.state = "auth";
     const deny = why => { counts.refusedAuth++; log.info("hello refused", { conn: c.id, why }); refuse(ws, "auth", "not allowed", 1008, "auth"); };
     const down = (what, err) => { log.error("hello failed", { conn: c.id, what, err }); refuse(ws, "unavailable", "try again shortly", 1013, "unavailable"); };
@@ -973,7 +992,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     if (tooMany()) return;
 
     Object.assign(c, { state: "live", tenant: board.tenant, board: board.id, user: identity.user, identity, name: typeof identity.name === "string" ? identity.name.slice(0, 200) : null, role, client: msg.client,
-      since: msg.since ?? 0, welcomed: false, next: undefined, wkey: writer ? wkey : null, tkey: writer ? tkey : null, tabKey,
+      since: msg.since ?? 0, snapHttp: msg.snap === "http", welcomed: false, next: undefined, wkey: writer ? wkey : null, tkey: writer ? tkey : null, tabKey,
       out: [], outBytes: 0, buffered: 0, owed: 0, blocked: false, flushing: false, waitSince: 0, progressAt: now(), winStart: now(), winDrained: 0,
       opq: [], opqBytes: 0, tokens: lim.opBurst, tokenAt: now(), opTimer: null, limiter: presenceLimiter(now) });
     c.b.conns.add(ws);
@@ -1167,6 +1186,33 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
     },
     /** A board's feed as this gateway holds it (null if it serves no one there): its base checkpoint, seq and tail. */
     feed: (tenant, board) => { const f = boards.get(`${tenant}/${board}`)?.feed; return f ? { base: f.base.seq, seq: f.seq, tail: f.tail.length, tailBytes: f.tailBytes } : null; },
+    /** Serve a board's snapshot at `seq` for HTTP catch-up (F9): warm feed hit in O(1), else Store checkpoint verified against the log. */
+    async snapshot(board, seq) {
+      if (!isId(board) || !Number.isSafeInteger(seq) || seq < 0) return null;
+      for (const b of boards.values()) {
+        if (b.board === board && b.feed.base.seq === seq) return b.feed.snapshot();
+      }
+      const rec = await registry.board(board);
+      if (!rec || rec.id !== board || !isId(rec.tenant)) return null;
+      const pack = (s, data) => ({
+        seq: s, data, bytes: bytesOf(data),
+        gzip: () => (typeof Bun !== "undefined" && typeof Bun.gzipSync === "function" ? Bun.gzipSync(Buffer.from(data, "utf8")) : null),
+      });
+      if (seq === 0) {
+        const data = codec.encode(snapshotOf({ seq: 0, streams: { board: { elements: [], appState: {} }, notes: { elements: [], appState: {} } }, appSeq: { board: {}, notes: {} }, records: { threads: [] }, noteAuthor: [] }));
+        return pack(0, data);
+      }
+      for (let before; ;) {
+        const cp = await store.getCheckpoint(rec.tenant, rec.id, before);
+        if (!cp || !(cp.seq > 0) || cp.seq < seq) return null;
+        if (cp.seq === seq) {
+          const [e] = await store.read(rec.tenant, rec.id, cp.seq, 1);
+          if (e && e.seq === cp.seq && e.id === cp.id && e.by === cp.by && e.at === cp.at) return pack(cp.seq, codec.encode(snapshotOf(cp)));
+          return null;
+        }
+        before = cp.seq;
+      }
+    },
     /** Re-check every connection's role on a board now: `grants` (what a grants message does) or `timed` (the timer). */
     recheck: async (board, kind = "grants") => { for (const b of [...boards.values()]) if (b.board === board) await requestRecheck(b, kind === "timed" ? "timed" : "grants"); },
     async close() {

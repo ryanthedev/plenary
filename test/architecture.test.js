@@ -49,6 +49,7 @@ const COMPOSITION_ROOTS = [
   "scripts/cluster-rig.js",       // platform (p8-rig): local cluster rig CLI; spawns processes, imports no project module
   "scripts/load/run.js", "scripts/load/worker.js", "scripts/load/tokens.js", "scripts/load/client.js", "scripts/load/server.js",
   "scripts/load/stats.js",        // platform (p8-load): load client; run.js and worker.js are entry points, the rest their modules
+  "scripts/plenary-client.js", "scripts/plenary-cli.js", "scripts/plenary-mcp.js", // agent tools: CLI & stdio MCP server
 ];
 /** Files in adapter folders that are not adapters (explicit; anything else there is an adapter). */
 const NOT_ADAPTERS = {

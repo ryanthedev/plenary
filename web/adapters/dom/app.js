@@ -63,6 +63,25 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   net.onFile(file => { S.receiveFiles({ [file.id]: file }); });
 
   const isPhone = () => matchMedia("(max-width: 640px)").matches;
+  const isCoarse = () => matchMedia("(pointer: coarse)").matches;
+  // Sync Chrome-on-iOS / WKWebView visual viewport (dynamic toolbar & software keyboard) to CSS custom properties.
+  const vv = globalThis.visualViewport;
+  const syncVisualViewport = () => {
+    const root = document.documentElement?.style;
+    if (!root) return;
+    if (vv && Number.isFinite(vv.height) && vv.height > 0) {
+      root.setProperty("--vv-height", `${Math.round(vv.height)}px`);
+      root.setProperty("--vv-top", `${Math.max(0, Math.round(vv.offsetTop || 0))}px`);
+    } else {
+      root.setProperty("--vv-height", "100dvh");
+      root.setProperty("--vv-top", "0px");
+    }
+  };
+  syncVisualViewport();
+  if (vv && typeof vv.addEventListener === "function") {
+    vv.addEventListener("resize", syncVisualViewport);
+    vv.addEventListener("scroll", syncVisualViewport);
+  }
   const canvas = $("#board"), ink = $("#ink"), ctx = canvas.getContext("2d");
   const allFiles = () => ({ ...S.eds.notes.doc.files, ...S.eds.board.doc.files });
 
@@ -127,7 +146,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   function syncText() {
     const ed = S.textEditor(), box = ed?.textBox();
     if (!box) { if (ink.style.display !== "none") { ink.style.display = "none"; ink.value = ""; } return; }
-    Object.assign(ink.style, { display: "block", left: `${box.x}px`, top: `${box.y}px`, width: `${box.w}px`, height: `${box.h}px`, fontSize: `${box.size}px`, textAlign: box.align });
+    const fontSize = isCoarse() ? Math.max(16, box.size) : box.size;
+    Object.assign(ink.style, { display: "block", left: `${box.x}px`, top: `${box.y}px`, width: `${box.w}px`, height: `${box.h}px`, fontSize: `${fontSize}px`, textAlign: box.align });
     if (ink.value !== ed.text.value) ink.value = ed.text.value;
     if (document.activeElement !== ink) { ink.focus(); ink.setSelectionRange(ink.value.length, ink.value.length); }
   }
@@ -208,6 +228,12 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     // No chromeDirty (C-2): the zoom % is updated in place; nothing else the chrome shows moves with the view.
   }, { passive: false });
   canvas.addEventListener("dblclick", e => e.preventDefault());
+  // Prevent WebKit page-zoom gestures on the board canvas (Chrome/Safari on iOS).
+  const stopGesture = e => { e.preventDefault(); };
+  for (const t of ["gesturestart", "gesturechange", "gestureend"]) {
+    canvas.addEventListener(t, stopGesture, { passive: false });
+    $("#canvas").addEventListener(t, stopGesture, { passive: false });
+  }
 
   document.addEventListener("keydown", e => {
     const t = e.target;
@@ -351,7 +377,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         h("span.stack", {}, h("span.av.live", { style: { background: "var(--u-me)" }, title: `${me.name} (you)` }, me.name.slice(0, 2).toUpperCase()))),
       pillEl,                                                   // the pill: one node, updated in place (inPlace)
       role !== "viewer" ? h("button.tb.desk-only" + (ui.panel.open ? ".on" : ""), { title: "Side panel (I)", onclick: () => setPanel({ type: "open" }) }, h("span.ic", {}, "◧"), h("span.k", {}, "I")) : null,
-      h("button.tb" + (role === "viewer" ? "" : ".theme-btn"), { title: "Light / dark", onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, ui.theme === "dark" ? "☀" : "☾")),
+      h("button.tb.theme-btn", { title: "Light / dark", onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, ui.theme === "dark" ? "☀" : "☾")),
+      h("button.tb.phone-only.overflow-btn", { title: "More", "aria-label": "More options", onclick: () => { ui.sheet = ui.sheet === "tools" ? null : "tools"; chromeDirty = true; } }, h("span.ic", {}, "⋯")),
     ];
   }
   const pillTitle = cls => pillTitleFor({ cls, status: S.status, viewer: S.effective === "viewer", readOnly: S.readOnly });
@@ -435,8 +462,51 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     else items = [btn("‹", "Prev", false, () => S.stepFrame(-1)), btn("⤢", "Fit", false, () => S.fit()), btn("›", "Next", false, () => S.stepFrame(1)), btn("❏", "Notes", ui.sheet === "notes", sheet("notes")), btn("💬", "Comments", ui.sheet === "comments", sheet("comments"))];
     replace($("#dock"), items);
   }
+  const SHEET_DISMISS_PX = 72, SHEET_FLICK_VY = 0.55;
+  function sheetHandle(el) {
+    let drag = null, suppressClick = false;
+    const reset = () => { drag = null; el.classList.remove("dragging"); el.style.transform = ""; };
+    const handle = h("div.sheet-handle", { role: "button", "aria-label": "Dismiss sheet", title: "Drag down or tap to close" }, h("div.grab"));
+    handle.addEventListener("pointerdown", e => {
+      if (e.button && e.button !== 0) return;
+      handle.setPointerCapture?.(e.pointerId);
+      drag = { id: e.pointerId ?? 0, startY: e.clientY ?? 0, lastY: e.clientY ?? 0, lastT: clock.mono(), dy: 0, vy: 0, moved: false };
+      suppressClick = false;
+      el.classList.add("dragging");
+      el.style.transform = "translateY(0px)";
+    });
+    handle.addEventListener("pointermove", e => {
+      if (!drag || (e.pointerId != null && e.pointerId !== drag.id)) return;
+      const y = e.clientY ?? drag.lastY;
+      const dy = Math.max(0, y - drag.startY);
+      const now = clock.mono(), dt = Math.max(1, now - drag.lastT);
+      drag.vy = (y - drag.lastY) / dt;
+      drag.lastY = y; drag.lastT = now; drag.dy = dy;
+      if (dy > 4) drag.moved = true;
+      el.style.transform = `translateY(${Math.round(dy)}px)`;
+    });
+    handle.addEventListener("pointerup", e => {
+      if (!drag || (e.pointerId != null && e.pointerId !== drag.id)) return;
+      const { dy, vy, moved } = drag;
+      reset();
+      if (moved) suppressClick = true;
+      if (dy > SHEET_DISMISS_PX || (dy > 24 && vy > SHEET_FLICK_VY)) { ui.sheet = null; chromeDirty = true; }
+    });
+    handle.addEventListener("pointercancel", e => {
+      if (!drag || (e.pointerId != null && e.pointerId !== drag.id)) return;
+      if (drag.moved) suppressClick = true;
+      reset();
+    });
+    handle.addEventListener("click", () => {
+      if (suppressClick) { suppressClick = false; return; }
+      ui.sheet = null; chromeDirty = true;
+    });
+    return handle;
+  }
   function sheetView() {
     const el = $("#sheet");
+    el.classList.remove("dragging");
+    el.style.transform = "";
     if (!ui.sheet || !isPhone()) { el.hidden = true; el.replaceChildren(); return; }
     el.hidden = false;
     let body;
@@ -449,7 +519,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         h("button.tb", { onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, ui.theme === "dark" ? "☀" : "☾"), ui.theme === "dark" ? "Light" : "Dark"));
     } else if (ui.sheet === "panel") body = h("div.scroll", {}, panelNodes(true));
     else body = [h("div.tabs", { style: { justifyContent: "center" } }, drawerTabs("sheet")), h("div.scroll", {}, drawerBody(ui.sheet))];
-    replace(el, h("div.grab", { onclick: () => { ui.sheet = null; chromeDirty = true; } }), body);
+    replace(el, sheetHandle(el), body);
   }
   const panelNodes = (inSheet = false) => renderPanel(null, { session: S, state: ui.panel, h, inSheet, library: ui.library, setLibrary, setState: setPanel, onChange: () => { chromeDirty = true; } });
 

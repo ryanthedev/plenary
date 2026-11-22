@@ -42,7 +42,7 @@
 .collab-emotes .tb b { font-weight: 600; font-variant-numeric: tabular-nums; margin-left: 2px; font-size: 11px; }
 
 .collab-drawer { display: flex; flex-direction: column; min-height: 0; height: 100%; }
-.collab-drawer .notes-list { overflow: auto; flex: 1; }
+.collab-drawer .notes-list { overflow: auto; flex: 1; overscroll-behavior: contain; touch-action: pan-y; -webkit-overflow-scrolling: touch; }
 .collab-drawer .note-row .txt { min-width: 0; flex: 1; overflow-wrap: anywhere; }
 .collab-drawer .acts { display: flex; gap: 8px; font-size: 11px; color: var(--muted); margin-top: 2px; }
 .collab-drawer .meta { display: flex; gap: 8px; font-size: 11px; color: var(--muted); }
@@ -58,12 +58,17 @@
 @media (max-width: 640px) {
   .collab-avatars .desk-more { display: none; }
   .collab-avatars .phone-more { display: grid; }
-  .collab-picker { bottom: 130px; }
+  .collab-picker { bottom: calc(130px + env(safe-area-inset-bottom)); }
   .collab-avatars .stack .av:nth-child(n+3):not(.more) { display: none; }
   .collab-avatars .eye, .collab-avatars .wtxt { display: none; }
-  .collab-pop { left: 8px !important; right: 8px; width: auto; top: auto !important; bottom: 76px; }
+  .collab-pop { left: calc(8px + env(safe-area-inset-left)) !important; right: calc(8px + env(safe-area-inset-right)); width: auto; top: auto !important; bottom: calc(76px + env(safe-area-inset-bottom)); }
   .collab-emotes .tb:nth-child(n+4):not(:last-child) { display: none; }
   .collab-emotes .sep { display: none; }
+}
+
+@media (pointer: coarse) {
+  .collab-pop textarea.field, .collab-pop input.field { font-size: 16px; }
+  .collab-emotes .tb, .collab-emotebtn .tb, .collab-picker button, .collab-reactrow button { min-width: 44px; min-height: 44px; }
 }
 
 /* Mounted in the canvas page (web/adapters/dom/app.js): presence paints on its own canvas over the board; the

@@ -376,7 +376,10 @@ one may still be closing.
     identity; a viewer's `welcome` is never checked for epoch); or it is behind `welcome.seq` and no `snapshot` or `entries`
     message arrives for **10 s**; or it is caught up (`applied ≥ welcome.seq`), `welcome.hb` was given, and no server
     message at all arrives for `ceil(2.5 × hb)` (**25 s** at the 10 s default, `IDLE_TIMEOUT_MS`); or rule 2's op timeout fires. Before each reconnect (also after `unavailable`)
-    it waits min(30 s, 0.5 s × 2^k) × a random factor in [0.5, 1), k = failed attempts in a row. A failed attempt
+    it waits min(30 s, 0.5 s × 2^k) × a random factor in [0.5, 1), k = failed attempts in a row — except on the
+    **first** retry immediately after a **proven** connection drops (`k = 1`, e.g. a gateway restart), where it uses
+    full jitter over `[0, 5 s)` (`BACKOFF.firstJitterMs`) to spread a correlated reconnect wave across 5 s instead of
+    0.5 s. A failed attempt
     is a connection that ended by one of these timeouts, by `unavailable`, or by the socket closing without the
     client asking; each connection counts once. k resets to 0 only after a connection has **proven itself**: it
     applied `welcome.seq` and then stayed connected for **10 s** more (the silent 10 s before a timeout don't

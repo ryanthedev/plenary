@@ -24,19 +24,22 @@ import { Records } from "./records.js";
 import { PREVIEW_TTL_MS } from "./presence.js";
 
 export class Replica {
-  /** @param {{ client: string, tab?: string, now?: () => number, random?: () => number }} o — a name for this client (each
+  /** @param {{ client: string, tab?: string, session?: string, now?: () => number, random?: () => number, idleTimeoutMs?: number | null }} o — a name for this client (each
    *  Replica adds its own session part, so a reloaded page reusing the name never collides with its old op
-   *  ids), the browser tab it belongs to (sent as hello.tab, § Messages; omitted when not given), a clock in ms,
-   *  and a random source in [0, 1) for the backoff's jitter. */
-  constructor({ client, tab, now = Date.now, random = Math.random, idleTimeoutMs = null }) {
+   *  ids; pass `session` to supply one deterministically without Math.random), the browser tab it belongs to
+   *  (sent as hello.tab, § Messages; omitted when not given), a clock in ms, and a random source in [0, 1) for
+   *  the backoff's jitter. */
+  constructor({ client, tab, session, now = Date.now, random = Math.random, idleTimeoutMs = null }) {
     if (tab !== undefined && !isTab(tab)) throw new Error("tab must match /^[A-Za-z0-9_-]{1,32}$/");
+    if (session !== undefined && (typeof session !== "string" || !session || session.includes(":"))) throw new Error("session must be a non-empty string without ':'");
     this.tab = tab;
-    this.client = `${client}.${Math.floor(Math.random() * 2 ** 31).toString(36)}`; this.counter = 0;
+    this.client = `${client}.${session ?? Math.floor(Math.random() * 2 ** 31).toString(36)}`; this.counter = 0;
     this.now = now; this.random = random;
     this.idleTimeoutMs = idleTimeoutMs;   // explicit override (ms), or null to use ceil(2.5 * welcome.hb)
     this.hbTimeoutMs = 0;
     this.fails = 0;             // failed connections in a row (rule 12); back to 0 only after a proven connection
     this.goodAt = null;         // when this connection caught up to welcome.seq (null: not yet)
+    this.wasProven = false;     // true when the connection that just ended proved itself (full jitter U(0, 5 s) on first retry)
     this.helloAt = null; this.progressAt = null; this.heardAt = null;
     this.pending = new Map();   // op id → { stream, op, msg, ackSeq?, wrote, answered, resend }: kept across resets and connections
     this.tokens = OP_RATE.burst; this.tokensAt = now();   // the send pace: a bucket of OP_RATE
@@ -92,7 +95,7 @@ export class Replica {
     this.resync = false; this.needAuth = false; this.welcomed = false; this.target = null; this.board = board;
     this.early = [];   // entries and snapshots of this connection that arrived before its welcome
     this.proven();
-    this.helloAt = this.now(); this.progressAt = null; this.heardAt = null; this.hbTimeoutMs = 0; this.counted = false;
+    this.helloAt = this.now(); this.progressAt = null; this.heardAt = null; this.hbTimeoutMs = 0; this.wasProven = false; this.counted = false;
     for (const p of this.pending.values()) { p.wrote = null; p.answered = false; p.resend = p.msg.sentAt !== undefined; }
     const hello = { t: "hello", v: PROTOCOL_VERSION, token, board, since: this.applied, client: this.client };
     if (this.tab !== undefined) hello.tab = this.tab;
@@ -334,7 +337,7 @@ export class Replica {
   // and still connected 10 s later (`upTo`: when it stopped being good). Looked at when the next wait is
   // worked out, once per connection.
   proven(upTo = this.now()) {
-    if (this.goodAt !== null && upTo - this.goodAt >= CONNECT_TIMEOUT_MS) this.fails = 0;
+    if (this.goodAt !== null && upTo - this.goodAt >= CONNECT_TIMEOUT_MS) { this.fails = 0; this.wasProven = true; }
     this.goodAt = null;
   }
 
@@ -348,8 +351,13 @@ export class Replica {
    */
   connectionFailed() { if (this.helloAt !== null && !this.resync) this.failed(); this.helloAt = null; }
 
-  /** ms to wait before opening the next connection (rule 12): min(30 s, 0.5 s × 2^k) × a random factor in [0.5, 1). */
-  reconnectWait() { this.proven(); return Math.min(BACKOFF.maxMs, BACKOFF.baseMs * 2 ** Math.min(this.fails, 16)) * (0.5 + this.random() / 2); }
+  /** ms to wait before opening the next connection (rule 12): U(0, 5 s) on the first retry after a proven link
+   *  drops (spreads a gateway-restart herd); else min(30 s, 0.5 s × 2^k) × a random factor in [0.5, 1). */
+  reconnectWait() {
+    this.proven();
+    if (this.wasProven && this.fails === 1) return this.random() * BACKOFF.firstJitterMs;
+    return Math.min(BACKOFF.maxMs, BACKOFF.baseMs * 2 ** Math.min(this.fails, 16)) * (0.5 + this.random() / 2);
+  }
 
   /** ms until the pace lets the next waiting op go (0 = now), or null if none is waiting on the pace. */
   paceWait() {

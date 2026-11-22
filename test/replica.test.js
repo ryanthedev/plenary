@@ -356,8 +356,8 @@ test("a socket that drops counts toward the backoff: before welcome, after it, o
   a.open().sync();                                                            // a good connection: caught up, and it stays up
   expect([a.r.fails, a.r.pending.size, d.log.entries.length]).toEqual([7, 0, 1]);
   clock.t += 10_000;
-  a.r.connectionFailed();                                                     // proven, then dropped: counted as the first failure
-  expect([a.r.fails, a.r.resync, a.r.applied, a.r.reconnectWait()]).toEqual([1, true, 1, 500]);
+  a.r.connectionFailed();                                                     // proven, then dropped: counted as the first failure (E-2 full jitter U(0, 5 s) at random=0 -> 0)
+  expect([a.r.fails, a.r.resync, a.r.applied, a.r.reconnectWait()]).toEqual([1, true, 1, 0]);
   const idle = new Replica({ client: "never", now: () => clock.t });
   idle.connectionFailed();                                                    // no connection was ever started: nothing to count
   expect([idle.fails, idle.resync]).toEqual([0, false]);
@@ -376,7 +376,7 @@ test("a server that welcomes and then drops still meets growing waits; only 10 s
   expect(drops).toEqual([500, 1000, 2000, 4000, 8000, 15_000]);
   a.open().sync(); clock.t += 10_000;                                         // this one stays up 10 s: proven
   a.r.connectionFailed();
-  expect([a.r.reconnectWait(), a.r.fails]).toEqual([500, 1]);
+  expect([a.r.reconnectWait(), a.r.fails]).toEqual([0, 1]);                   // E-2: U(0, 5 s) at random=0 -> 0
   // The same with an op that gets no answer for 10 s on each connection (welcomed, caught up, then silence).
   const b = link(d, clock, "u2", "editor", "b");
   for (let i = 0; i < 6; i++) {
@@ -393,7 +393,7 @@ test("a server that welcomes and then drops still meets growing waits; only 10 s
   b.open().sync(); clock.t += 10_000;
   b.r.local("board", { elements: [rect("late")] }); b.r.outgoing();
   clock.t += 10_000; b.r.outgoing();
-  expect([b.r.resync, b.r.reconnectWait()]).toEqual([true, 500]);
+  expect([b.r.resync, b.r.reconnectWait()]).toEqual([true, 0]);               // E-2: U(0, 5 s) at random=0 -> 0
   // A refusal's resync after a long healthy connection is not held back by old failures.
   b.open().sync(); clock.t += 10_000;
   const bad = b.r.local("board", { appState: { bogus: 1 } });
@@ -480,4 +480,36 @@ test("hello.tab: `new Replica({ tab })` puts it in every hello; without `tab` th
   const d = direct(), got = [], c = d.room.connect(m => got.push(wire(m)));
   d.room.receive(c, wire(h1), { n: 1, user: "u", role: "editor" });
   expect(got[0]).toMatchObject({ t: "welcome", user: "u" });
+});
+
+test("E-2: first retry after a proven connection uses full jitter U(0, 5 s); subsequent retries return to exponential", () => {
+  let t = 0, roll = 0;
+  const r = new Replica({ client: "v", now: () => t, random: () => roll });
+  r.connectMessages("tok", "b1");
+  r.receive({ t: "welcome", seq: 0, role: "viewer", user: "u1", horizon: 0, rv: 1 });
+  // Stay up 10 s -> proven, then gateway drops the socket.
+  t += 10_000;
+  r.connectionFailed();
+  expect(r.fails).toBe(1);
+  roll = 0; expect(r.reconnectWait()).toBe(0);
+  roll = 0.5; expect(r.reconnectWait()).toBe(2500);
+  roll = 0.999; expect(Math.round(r.reconnectWait())).toBe(4995);
+
+  // If the next reconnect also fails (unproven), exponential [0.5, 1) resumes.
+  r.connectMessages("tok", "b1");
+  r.connectionFailed();
+  expect(r.fails).toBe(2);
+  roll = 0; expect(r.reconnectWait()).toBe(1000);   // 500 * 2^2 * 0.5
+  roll = 0.999; expect(Math.round(r.reconnectWait())).toBe(1999);
+});
+
+test("E-2: optional `session` sets client.<session> without calling Math.random; rejects empty or colon", () => {
+  const orig = Math.random;
+  Math.random = () => { throw new Error("Math.random called"); };
+  try {
+    const r = new Replica({ client: "web", session: "s123" });
+    expect(r.client).toBe("web.s123");
+    expect(r.connectMessages("tok", "b1")[0].client).toBe("web.s123");
+  } finally { Math.random = orig; }
+  for (const bad of ["", "a:b", 123, null]) expect(() => new Replica({ client: "web", session: bad })).toThrow();
 });

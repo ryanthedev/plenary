@@ -69,14 +69,14 @@ export function bindEditor(editor, { stream = "board", ...o }) {
  *   onRoom(ev): what the room said, once per link: presence, here, emotes, records, refused, role, limit, and
  *   settings ({ type: "settings", stream }).
  */
-export function openLink({ transport, token: firstToken, board, client = "web", tab = null, onStatus = () => {}, onRoom = () => {}, onHeard = () => {},
+export function openLink({ transport, token: firstToken, board, client = "web", tab = null, session, onStatus = () => {}, onRoom = () => {}, onHeard = () => {},
   timeoutMs = 10_000, clock = null, timers = clock ? { set: clock.set, clear: clock.clear } : null, now = clock?.now, random = clock?.random }) {
   if (typeof transport?.reopen !== "function") throw new TypeError("bindEditor: the transport must have reopen() (web/ports/transport.js)");
   if (typeof now !== "function" || typeof random !== "function" || (timeoutMs !== 0 && typeof timers?.set !== "function"))
     throw new TypeError("bindEditor: pass the clock port (clock) or timers, now and random");
   // hello.tab: the Replica puts `tab` in every hello (first, backoff, reconnect, resync) and throws on one that fails
   // TAB_RE. It must be absent, not null, when there is none: Replica checks every value it is given.
-  const replica = new Replica({ client, ...(tab != null ? { tab } : {}), now, random });
+  const replica = new Replica({ client, ...(tab != null ? { tab } : {}), ...(session !== undefined ? { session } : {}), now, random });
   let token = firstToken;
   const timed = timeoutMs !== 0;
   // Rate limits measure intervals: monotonic time when the clock port is given (p6-portsv R2-L4), else `now`.

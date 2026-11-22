@@ -1,3 +1,4 @@
+// @ts-check
 // Focus that survives a redraw (part of the dom group; imports nothing). A page that rebuilds its controls would otherwise drop focus to
 // <body> whenever the person Tabs, clicks or activates something that redraws. Two tools:
 //   keeper()            for pages that mark their controls with stable keys (Home, Space, Group): `keep` hands back the same element every
@@ -51,7 +52,7 @@ export function keeper() {
     focusKey(key) { marks.get(key)?.focus?.(); },
     /** `to`: the key focus is about to be given on purpose (the caller's own follow-up); when the focused control is gone, focus goes there silently instead of to a neighbour with a "no longer here" announcement. */
     around(fn, { to: intended = null } = {}) {
-      const had = fk(), prev = doc()?.activeElement ?? null, before = [...marks.keys()];
+      const had = fk(), prev = /** @type {HTMLElement | null} */ (doc()?.activeElement ?? null), before = [...marks.keys()];
       used = new Set(); marks = new Map();
       fn();
       for (const k of [...kept.keys()]) if (!used.has(k)) kept.delete(k);

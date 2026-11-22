@@ -1,3 +1,4 @@
+// @ts-check
 // The canvas page's chrome: a driving adapter over the DOM (it calls into the core; it implements no port). Draws the verified
 // mock, paints through ./paint.js, feeds input to the core session (web/core/session.js), and
 // keeps UI preferences in the storage port it is given. Every write goes through session.act/setTool/key; nothing
@@ -41,9 +42,10 @@ import { hitTest } from "../../../packages/core/geometry.js";
  * @param {{ startSession: (o: { mine: string[], onChange: () => void }) => ReturnType<typeof import("../../core/session.js").createSession>,
  *           net: import("../../ports/net.js").Net, board: string, me: { user: string, name: string, role: string | null },
  *           prefs: import("../../ports/storage.js").Storage, theme?: string | null, notice?: string | null,
- *           collab?: (S: object, o: { jumpTo(p: { x: number, y: number, scale?: number }): void }) => object,
+ *           collab?: ((S: any, o: { jumpTo(p: { x: number, y: number, scale?: number }): void }) => any) | null,
  *           clock: import("../../ports/clock.js").Clock, expAt?: number | null,
- *           relogin?: { href: string, go(): void } | null, homeHref?: string | null }} o
+ *           relogin?: { href: string, go(): void } | null, admin?: any, homeHref?: string | null,
+ *           access?: any, newKey?: (() => string) | null, share?: any, move?: any, trashShown?: () => boolean }} o
  *   collab: the root's collab port factory (web/ports/collab.js; production and dev: web/adapters/collab/sync.js over
  *   the session). The collaboration UI (./collab/ui.js) mounts over it: avatars, emotes, cursors, selections, laser,
  *   previews, comment threads. Without it the page has none of that.
@@ -54,7 +56,7 @@ import { hitTest } from "../../../packages/core/geometry.js";
  *   ends (ms on the clock's now() scale), null when unknown: the page warns EXPIRY_WARN_MS before it. relogin: where
  *   a refused or expiring page signs in again (href shown, go() remembers the board and leaves); null = no link (dev).
  *   homeHref: where the top bar's Home link goes (the Home screen); null = no link (dev rooms).
- * @returns {{ S: object, ui: object, net: object, setTheme(t: string): void, openDialog(d: string): void, setPanel(op: object): void }}
+ * @returns {{ S: any, ui: any, net: any, collab: any, port: any, setTheme(t: string): void, openDialog(d: string): void, openShare(): any, setPanel(op: any): void, startComment(p: { x: number, y: number }): void }}
  */
 export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null, admin = null, homeHref = null, access = null, newKey = null, share = null, move = null, trashShown = () => false }) {
   if (!clock || typeof clock.now !== "function" || typeof clock.mono !== "function") throw new Error("mountApp: the clock port is required");
@@ -138,7 +140,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   if (collab) collab.showDrawer("comments");
   const worldAt = p => S.eds.board.toWorld(p);
   // Selection presence and pin layout, once per frame (./collab/frame.js).
-  const collabTick = collab ? collabFrame(S, collab) : () => {};
+  const collabTick = collab ? collabFrame(/** @type {any} */ (S), collab) : () => {};
   // Right-click (or the 💬 button): a comment on the element under the pointer, else on that spot.
   function startComment(p) {
     if (!collab) return;
@@ -526,7 +528,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       if (!S.may()) return;
       S.addVideo(f, at);
     } else if (S.addVideo(f, at)) {
-      net.put(f);          // local / shared-worker tab relay
+      net.put(/** @type {any} */ (f));          // local / shared-worker tab relay
     }
     chromeDirty = true;
   }
@@ -567,6 +569,10 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     }
     return { fileIdMap, files: outFiles };
   }
+  /**
+   * @param {any} parsed
+   * @param {{ at?: any, label?: string | null, fitIfNeeded?: boolean, silent?: boolean }} [opts]
+   */
   async function importExcalidrawParsed(parsed, { at, label = null, fitIfNeeded = false, silent = false } = {}) {
     if (!S.may()) return false;
     if (!parsed.ok) {
@@ -827,7 +833,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
 
   // Share (PROTOCOL.md § Share dialog): offered only when the welcome said `can.share` (members.manage on the board); if that changed mid-session the server answers 403 and the dialog says so.
   // The chrome is rebuilt while the dialog is open, so focus goes back to whichever of the Share button and the More button is shown now, not to the element that opened it.
-  const shareOpener = { focus() { const c = [document.querySelector("[data-share-open]"), document.querySelector(".header-more"), document.querySelector("[data-dock-more]")]; (c.find(e => e && e.offsetParent !== null) ?? c.find(Boolean))?.focus?.(); } };
+  const shareOpener = { focus() { const c = /** @type {(HTMLElement | null)[]} */ ([document.querySelector("[data-share-open]"), document.querySelector(".header-more"), document.querySelector("[data-dock-more]")]); (c.find(e => e && e.offsetParent !== null) ?? c.find(Boolean))?.focus?.(); } };
   function openShareDialog() {
     dismissOverlays();
     if (!share) return openAdminShare();
@@ -1465,7 +1471,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   };
   addEventListener("online", () => { S.online = true; chromeDirty = true; probe(); });
   addEventListener("offline", () => { S.online = false; chromeDirty = true; });
-  addEventListener("pageshow", e => {
+  addEventListener("pageshow", /** @param {PageTransitionEvent} e */ e => {
     if (!e?.persisted) return;
     hiddenAt = null;
     if (heard && since(heard) <= HEARD_MS) return;

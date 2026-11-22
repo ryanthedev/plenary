@@ -1,3 +1,4 @@
+// @ts-check
 // Crisp 24×24 inline SVG icon set (docs/design/DESIGN.md § 4).
 // Zero Unicode tool glyphs; works in real browsers (createElementNS) and stub DOMs (createElement fallback).
 

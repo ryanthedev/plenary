@@ -1,3 +1,4 @@
+// @ts-check
 // A tiny element builder. Board content (frame, layer, library, note text, user names) is untrusted, so
 // text only ever goes in through textContent, never innerHTML.
 //   h("button.tb.on", { title: "x", onclick }, "label", child, …)

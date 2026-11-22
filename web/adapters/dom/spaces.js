@@ -1,3 +1,4 @@
+// @ts-check
 // The Space page and the Group page (driving adapter over the DOM): a board grid / a Space grid, rename in place, an overflow menu, and the
 // New board / New space actions (dialogs: ./dialogs.js). Renders web/core/spaces.js's page model. Names and titles are other people's words:
 // they go in through textContent only. Every control is a real button or link (keyboard), menus follow the ARIA menu pattern, and the
@@ -12,7 +13,8 @@ import { generalText, spaceEmpty, groupEmpty } from "../../core/spaces.js";
 
 /**
  * An overflow menu: a button that opens a `role="menu"`. Arrow keys move, Enter/Space choose, Escape closes and returns focus to the
- * button, a click elsewhere closes. @returns {{ el: HTMLElement, button: HTMLElement }}
+ * button, a click elsewhere closes.
+ * @returns {{ el: HTMLElement, button: HTMLElement, close: () => void, update: (n: { label: string, items: any[] }) => void }}
  */
 export function overflowMenu({ label, items }) {
   const cfg = { label, items };                 // read at open time, so a re-render can update them without a new button
@@ -107,8 +109,8 @@ const afterRender = () => { let fn = null; return { set: f => { fn = f; }, run: 
 
 /**
  * @param {{ root: HTMLElement, move?: { port: import("../../ports/move.js").MovePort, clock: import("../../ports/clock.js").Clock, newKey?: (() => string)|null }|null, model: ReturnType<typeof import("../../core/spaces.js").createPageModel>, dialogs: ReturnType<typeof import("./dialogs.js").createDialogs>,
- *   hrefs: { home: string, board(id: string): string, space(id: string): string, group(id: string): string },
- *   signIn?: { href: string, text?: string } | null }} o
+ *   hrefs: { home: string, board(id: string): string, space(id: string): string, group(id: string): string, access?(type: string, id: string): string },
+ *   signIn?: { href: string, text?: string } | null, access?: any, newKey?: (() => string) | null, trash?: any }} o
  * @returns {{ destroy(): void }}
  */
 export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null, access = null, newKey = null, move = null, trash = null }) {
@@ -162,7 +164,7 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null, acc
     if (gate(S, main, () => model.load(), signIn)) return;
     // Only the in-flight flag changed (a rename is saving): nothing to rebuild, so a control the person just moved to keeps focus and
     // a click that began on it still lands.
-    const sig = editing ? `${editing.type}:${editing.id ?? ""}` : "";
+    const sig = editing ? `${editing.type}:${editing.type === "board" ? editing.id : ""}` : "";
     if (S.busy && shown && shown.page === S.page && shown.sig === sig) return;
     shown = { page: S.page, sig };
     keys.around(draw);

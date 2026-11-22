@@ -1,3 +1,4 @@
+// @ts-check
 // Admin & Share DOM UI (part of the `dom` adapter group).
 // Two self-contained components styled with Warm Studio / Obsidian CSS custom properties:
 //   - mountBoardsHome({ root, admin, me, onOpenBoard, onLogout, theme, setTheme })
@@ -498,6 +499,7 @@ function boardPreviewSvg() {
   svg.setAttribute("height", "80");
   svg.setAttribute("aria-hidden", "true");
   svg.setAttribute("fill", "none");
+  /** @type {[string, Record<string, string>][]} */
   const shapes = [
     ["rect", { x: "16", y: "20", width: "54", height: "34", rx: "6", stroke: "var(--border-strong, #858178)", "stroke-width": "1.6", fill: "var(--surface, #FFFFFF)" }],
     ["rect", { x: "124", y: "34", width: "58", height: "34", rx: "6", stroke: "var(--accent, #3B48E8)", "stroke-width": "1.6", fill: "var(--accent-soft, rgba(59,72,232,0.10))" }],
@@ -953,9 +955,11 @@ export const openShareSheet = mountShareDialog;
  *   admin: import("../../ports/admin.js").AdminPort,
  *   me?: { user?: string, name?: string, email?: string | null, domain?: string | null },
  *   onOpenBoard: (boardId: string) => void,
- *   onLogout?: () => void,
- *   theme?: "light" | "dark",
- *   setTheme?: (t: "light" | "dark") => void,
+ *   onLogout?: (() => void) | null,
+ *   onRelogin?: (() => void) | null,
+ *   notice?: string | null,
+ *   theme?: "light" | "dark" | null,
+ *   setTheme?: ((t: "light" | "dark") => void) | null,
  * }} o
  */
 export function mountBoardsHome({ root, admin, me = {}, onOpenBoard, onLogout = null, onRelogin = null, notice = null, theme: theme0 = null, setTheme = null }) {

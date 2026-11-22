@@ -1,3 +1,4 @@
+// @ts-check
 // Canvas overlays for others' presence: selections, previews, laser trails, cursors with name tags. Pure draw
 // functions: each takes a 2D context and the view and paints in screen pixels (CSS px; scale the context for
 // devicePixelRatio first). Names are drawn with fillText, which never parses anything.

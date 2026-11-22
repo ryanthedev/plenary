@@ -1,3 +1,4 @@
+// @ts-check
 // DEV-ONLY composition root (web/dev-main.html; never loaded by index.html, never served by server/static.js, whose
 // allowlist is index.html + web/main.js's import graph). Wires the in-browser rooms: the SharedWorker room (or the
 // in-page room when SharedWorker is missing or ?net=local) and the dev users (web/core/dev-users.js).
@@ -22,6 +23,7 @@ import { pageSignIn, signInNotice } from "./core/signin.js";
 import { createSession } from "./core/session.js";
 
 const clock = browserClock();
+const fetchNow = /** @type {typeof globalThis.fetch} */ ((input, init) => globalThis.fetch(input, init));
 if (location.hash) showGate({ title: "Signing in…" });   // before the exchange starts (p6-hexv MEDIUM)
 
 // First thing: the sign-in fragment off the address bar (pageSignIn drops it before anything else).
@@ -30,7 +32,7 @@ const signIn = await pageSignIn({
   fragment: location.hash,
   replaceFragment: () => { if (location.hash) history.replaceState(history.state, "", location.pathname + location.search); },
   storage: sessionStore(),
-  auth: httpAuth({ fetch: (...a) => globalThis.fetch(...a), timers: clock }),
+  auth: httpAuth({ fetch: fetchNow, timers: clock }),
   clock,
   devUsers: DEV_USERS,
 });

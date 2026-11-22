@@ -1,3 +1,4 @@
+// @ts-check
 // The page before the canvas: a full-page "Signing in…" while the code exchange runs (p6-hexv MEDIUM: never a blank
 // page for up to ~22 s), and a signed-out screen with a sign-in link when there is no session. Part of the dom adapter;
 // the composition roots call it. Text only through textContent (the notice may quote a display name).

@@ -1,3 +1,4 @@
+// @ts-check
 // The Home page: a driving adapter over the DOM that renders web/core/home.js's model (Recent, Starred, Shared with me,
 // the Group/Space tree, search). Part of the dom group; the composition root (web/main.js) mounts it when someone is signed in with no
 // board in the link. All text goes in through textContent (titles and names are other people's words). Keyboard: "/"
@@ -12,6 +13,7 @@ import { pathText, whenText } from "../../core/home.js";
 /**
  * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/home.js").createHomeModel>, clock: import("../../ports/clock.js").Clock,
  *   boardHref: (id: string) => string, spaceHref: (id: string) => string, groupHref: (id: string) => string,
+ *   teamsHref?: string | null, trashHref?: string | null, rolesHref?: string | null, offboardHref?: string | null, unitAccessHref?: ((id: string) => string) | null,
  *   move?: { port: import("../../ports/move.js").MovePort, clock: import("../../ports/clock.js").Clock, newKey?: (() => string)|null }|null,
  *   org?: Pick<import("../../ports/admin.js").AdminPort, "createTenant"|"listTenantMembers"|"addTenantMember"|"removeTenantMember"|"adminAudit"> | null,
  *   dialogs: Pick<ReturnType<typeof import("./dialogs.js").createDialogs>, "newBoard"|"newSpace"|"newGroup">, homeHref?: string, signIn?: { href: string, text?: string } | null }} o

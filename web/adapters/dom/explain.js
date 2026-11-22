@@ -1,3 +1,4 @@
+// @ts-check
 // The access explanation as DOM (part of the dom group): the why-card that stands in for a disabled control, the Ask for access control, and the canvas pill's popover.
 // Rules this file keeps: other people's words (names) go in through textContent only (h()); an explanation is ALWAYS visible text, never only a hover title, so keyboard and
 // screen-reader users get it (a disabled control is `aria-disabled` + `aria-describedby` this card, and stays in the tab order); the Ask button is a real button outside any
@@ -12,7 +13,7 @@ import { createAskModel, whyLines, pillLine, sourceText, ownersText, waitText, n
  * @param {{ api: { ask(type: string, id: string, role: string, key?: string|null): Promise<any> }, type: string, id: string, why: import("../../core/explain.js").Explain, newKey?: (() => string)|null, reload?: (() => Promise<import("../../core/explain.js").Explain|null>)|null, setTimer?: Function, clearTimer?: Function }} o
  */
 export function askView({ api, type, id, why, newKey = null, reload = null, setTimer = setTimeout, clearTimer = clearTimeout }) {
-  const model = createAskModel({ api, type, id, why, newKey, reload, onChange: () => paint() });
+  const model = createAskModel(/** @type {any} */ ({ api, type, id, why, newKey, reload, onChange: () => paint() }));
   const S = model.state;
   const select = h("select.field", { "aria-label": "Role to ask for", onchange: e => model.choose(e.target.value) },
     why.ask.roles.map(r => h("option", { value: r.id, selected: r.id === S.role }, r.name)));

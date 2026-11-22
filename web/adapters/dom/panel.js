@@ -4,7 +4,7 @@
 
 import { STROKES, FILLS, WIDTHS, STYLES } from "../../../packages/core/editor.js";
 import { panelSections, applyPanel } from "../../../packages/core/panel.js";
-import { PRESET_NAMES } from "../../../packages/core/anim.js";
+import { getPreset, EASING_META, canonicalEasing, presetsByCategory, timelineSpans, formatTime } from "../../../packages/core/anim.js";
 import { FONT_FAMILY, fontClass } from "../../../packages/core/style.js";
 import { isShape, isLabel, layerOf } from "../../../packages/core/model.js";
 import { parseLibrary, mergeLibrary } from "../../../packages/core/library.js";
@@ -150,12 +150,70 @@ export function renderPanel(root, ctx) {
       ];
     },
     animate: () => {
-      const cur = B.selected()[0]?.customData?.anim?.preset;
-      return [
-        h("div.row", {}, h("span.opts", {}, PRESET_NAMES.map(p => chip(p, cur === p, () => S.act("board", e => e.animate(p)))), chip("none", false, () => S.act("board", e => e.clearAnimation()), "clearAnimation"))),
-        h("div.row", {}, h("span.opts", {}, chip([icon(B.play ? "pause" : "play", { size: 14 }), B.play ? " pause" : " play"], !!B.play, () => { B.playToggle(); ctx.onChange(); }, "⇧Space", true))),
-        h("div.hint", {}, "Select shapes, pick an effect: they join the timeline in order (start + 150 ms stagger)."),
+      const selEl = B.selected().filter(e => !isLabel(e))[0];
+      const anim = selEl?.customData?.anim ?? null;
+      const cur = anim?.preset ?? null;
+      const curMeta = cur ? getPreset(cur) : null;
+      const curEasing = canonicalEasing(anim?.easing ?? curMeta?.easing ?? "ease-out");
+      const curStart = anim?.start ?? 0;
+      const curDur = anim?.duration ?? curMeta?.duration ?? 600;
+      const curLoop = anim ? (anim.loop ?? curMeta?.loop ?? false) : false;
+      const groups = presetsByCategory();
+      const spans = timelineSpans(B.doc.live());
+
+      const out = [
+        ...groups.map(g => h("div.anim-group", { "data-category": g.id },
+          h("div.anim-cat", {}, g.label),
+          h("span.opts", {}, g.presets.map(p => chip(p.id, cur === p.id, () => S.act("board", e => e.animate(p.id)), `${g.label}: ${p.label} (${p.duration} ms, ${p.easing})`))))),
+        h("div.row", { style: { marginTop: "4px" } }, h("span.opts", {},
+          chip("none", !cur && !!selEl, () => S.act("board", e => e.clearAnimation()), "Clear animation"))),
       ];
+
+      if (anim && !anim.keys) {
+        const easingSel = h("select.anim-sel", {
+          "aria-label": "Easing curve",
+          disabled: dis,
+          value: curEasing,
+          onchange: e => S.act("board", ed => ed.updateAnimation({ easing: e.currentTarget.value })),
+        }, EASING_META.map(ea => h("option", { value: ea.id, selected: curEasing === ea.id }, ea.label)));
+
+        const numField = (label, val, step, min, prop) => h("label.anim-num", {},
+          h("span", {}, label),
+          h("input", {
+            type: "number",
+            min: String(min),
+            step: String(step),
+            value: String(val),
+            disabled: dis,
+            onchange: e => S.act("board", ed => ed.updateAnimation({ [prop]: Number(e.currentTarget.value) })),
+            onkeydown: k => k.stopPropagation(),
+          }));
+
+        out.push(
+          row("Easing", "", easingSel),
+          h("div.anim-fields", {},
+            numField("Delay ms", curStart, 50, 0, "start"),
+            numField("Dur ms", curDur, 50, 50, "duration")),
+          row("Repeat", "", chip(curLoop ? "Loop on" : "Loop off", curLoop, () => S.act("board", ed => ed.updateAnimation({ loop: !curLoop })), "Toggle per-element loop")),
+        );
+      }
+
+      out.push(
+        h("div.row", { style: { marginTop: "6px" } }, h("span.opts", {},
+          chip([icon(B.play ? "pause" : "play", { size: 14 }), B.play ? " pause" : " play"], !!B.play, () => { B.playToggle(); ctx.onChange(); }, "⇧Space", true),
+          chip([icon("skipBack", { size: 13 }), " restart"], false, () => { B.restartPlay(); ctx.onChange(); }, "Restart playback", true),
+          chip([icon("stop", { size: 13 }), " stop"], false, () => { B.stopPlay(); ctx.onChange(); }, "Stop (Esc)", true))),
+      );
+
+      if (spans.length) {
+        out.push(h("div.anim-steps", {},
+          spans.slice(0, 20).map((sp, i) => h("button.list-row" + (B.sel.has(sp.id) ? ".on" : ""), {
+            onclick: () => { B.select([sp.id]); B.seekTo(sp.start); ctx.onChange(); },
+          }, h("span.dim", {}, String(i + 1)), " ", sp.label, h("span.n", {}, formatTime(sp.start))))));
+      } else {
+        out.push(h("div.hint", {}, "Select shapes, pick an effect: they join the timeline in order (start + 150 ms stagger)."));
+      }
+      return out;
     },
     layers: () => {
       const ls = [...B.doc.layers].reverse(), count = id => B.doc.live().filter(e => layerOf(e) === id && !isLabel(e)).length;

@@ -135,6 +135,20 @@ export const ICONS = Object.freeze({
     ["rect", { x: 14, y: 5, width: 4, height: 14, rx: 1 }],
   ],
   stop: [["rect", { x: 6, y: 6, width: 12, height: 12, rx: 1.5 }]],
+  skipBack: [
+    ["polygon", { points: "19 20 9 12 19 4 19 20" }],
+    ["line", { x1: 5, y1: 5, x2: 5, y2: 19 }],
+  ],
+  skipForward: [
+    ["polygon", { points: "5 4 15 12 5 20 5 4" }],
+    ["line", { x1: 19, y1: 5, x2: 19, y2: 19 }],
+  ],
+  repeat: [
+    ["polyline", { points: "17 2 21 6 17 10" }],
+    ["path", { d: "M3 11V9a4 4 0 0 1 4-4h14" }],
+    ["polyline", { points: "7 22 3 18 7 14" }],
+    ["path", { d: "M21 13v2a4 4 0 0 1-4 4H3" }],
+  ],
   eyedropper: [
     ["path", { d: "M19.5 4.5a2.12 2.12 0 0 0-3 0l-2.8 2.8-1.4-1.4-1.4 1.4 1.4 1.4-7.3 7.3V19h3l7.3-7.3 1.4 1.4 1.4-1.4-1.4-1.4 2.8-2.8a2.12 2.12 0 0 0 0-3z" }],
   ],

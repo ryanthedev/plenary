@@ -235,12 +235,27 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
   const layer = doc.layer(el.customData?.layer);
   const opacity = (el.opacity / 100) * ((layer?.opacity ?? 100) / 100) * (a ? a.opacity : 1);
   const progress = a ? a.progress : 1;
-  // Animation offsets and scale apply about the element's center.
-  let Q = P;
-  if (a && (a.dx || a.dy || a.scale !== 1)) {
+  // Animation offsets, non-uniform scale, and rotation apply about the element's center.
+  // QNoRot applies scale + translate only (for text/images whose rotation is applied via `angle` in paint.js).
+  const sx = a ? (a.scale ?? 1) * (a.scaleX ?? 1) : 1;
+  const sy = a ? (a.scale ?? 1) * (a.scaleY ?? 1) : 1;
+  const aRot = a?.rotate ?? 0;
+  const aScale = Math.max(Math.abs(sx), Math.abs(sy));
+  let Q = P, QNoRot = P;
+  if (a && (a.dx || a.dy || sx !== 1 || sy !== 1 || aRot)) {
     const b = bbox(el), cx = b.x + b.w / 2, cy = b.y + b.h / 2;
-    Q = (x, y) => P(cx + (x - cx) * a.scale + a.dx, cy + (y - cy) * a.scale + a.dy);
+    QNoRot = (x, y) => P(cx + (x - cx) * sx + a.dx, cy + (y - cy) * sy + a.dy);
+    if (aRot) {
+      const cos = Math.cos(aRot), sin = Math.sin(aRot);
+      Q = (x, y) => {
+        const lx = (x - cx) * sx, ly = (y - cy) * sy;
+        return P(cx + lx * cos - ly * sin + a.dx, cy + lx * sin + ly * cos + a.dy);
+      };
+    } else {
+      Q = QNoRot;
+    }
   }
+  const glow = a?.glow ?? 0;
   // Zoomed far out the hand-drawn wobble is under a pixel: draw clean (a quarter of the commands).
   const s = view.scale, r = rng(el.seed), rough = s < CLEAN_BELOW ? 0 : (el.roughness ?? 1) * Math.min(1.5, s);
   const stroke = ink(el.strokeColor, theme), fill = ink(el.backgroundColor, theme);
@@ -248,7 +263,7 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
 
   if (el.type === "text") {
     // Too small to read in the pane: skip it before wrapping it (and an arrow label's background patch with it).
-    if (!opts.allText && el.fontSize * s * (a?.scale ?? 1) < TEXT_MIN) return;
+    if (!opts.allText && el.fontSize * s * aScale < TEXT_MIN) return;
     if (isLabel(el)) {
       const box = doc.get(el.containerId); if (!box) return;
       let b = bbox(box);
@@ -256,28 +271,28 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
         const m = labelAnchor(doc, box) ?? [0, 0], lw = Math.max(40, textSize(el.text, el.fontSize, 1.25, el.fontFamily).w), lh = el.fontSize * 1.4;
         b = { x: m[0] - lw / 2, y: m[1] - lh / 2, w: lw, h: lh };
       }
-      const [x0, y0] = Q(b.x, b.y), [x1, y1] = Q(b.x + b.w, b.y + b.h);
+      const [x0, y0] = QNoRot(b.x, b.y), [x1, y1] = QNoRot(b.x + b.w, b.y + b.h);
       const color = box.backgroundColor !== "transparent" && (!box.fillStyle || box.fillStyle === "solid") && INK.has(el.strokeColor) ? "#1e1e1e" : ink(el.strokeColor, theme);
       const text = isShape(box) ? labelLines(el, box).join("\n") : el.text;   // labels wrap to their shape
       if (isLinear(box)) {   // on a line: a patch of background behind the text, like Excalidraw's gap
         const lines = String(text).split("\n"), s2 = el.fontSize * s, w = Math.max(...lines.map(l => textWidth(l, s2, el.fontFamily))) + 10, h = lines.length * s2 * (el.lineHeight ?? 1.25) + 4;
-        const [mx, my] = Q(b.x + b.w / 2, b.y + b.h / 2);
+        const [mx, my] = QNoRot(b.x + b.w / 2, b.y + b.h / 2);
         out.push({ t: "path", id: el.id + ":bg", cmds: [["M", mx - w / 2, my - h / 2], ["L", mx + w / 2, my - h / 2], ["L", mx + w / 2, my + h / 2], ["L", mx - w / 2, my + h / 2]], fill: theme.bg, opacity });
       }
-      const [cx, cy] = Q(b.x + b.w / 2, b.y + b.h / 2);
-      out.push({ t: "text", id: el.id, font: fontClass(el.fontFamily), angle: angleOf(box), cx, cy, x: x0, y: y0, text, size: el.fontSize * s * (a?.scale ?? 1), color, align: "center", box: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, lineHeight: el.lineHeight ?? 1.25, opacity, reveal: progress });
+      const [cx, cy] = QNoRot(b.x + b.w / 2, b.y + b.h / 2);
+      out.push({ t: "text", id: el.id, font: fontClass(el.fontFamily), angle: angleOf(box) + aRot, cx, cy, x: x0, y: y0, text, size: el.fontSize * s * aScale, color, align: "center", box: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, lineHeight: el.lineHeight ?? 1.25, opacity, reveal: progress });
     } else {
-      const [x, y] = Q(el.x, el.y), c = centerOf(el), [cx, cy] = Q(c.x, c.y);
-      out.push({ t: "text", id: el.id, font: fontClass(el.fontFamily), angle: angleOf(el), cx, cy, x, y, text: el.text, size: el.fontSize * s * (a?.scale ?? 1), color: ink(el.strokeColor, theme), align: "left", lineHeight: el.lineHeight ?? 1.25, opacity, reveal: progress });
+      const [x, y] = QNoRot(el.x, el.y), c = centerOf(el), [cx, cy] = QNoRot(c.x, c.y);
+      out.push({ t: "text", id: el.id, font: fontClass(el.fontFamily), angle: angleOf(el) + aRot, cx, cy, x, y, text: el.text, size: el.fontSize * s * aScale, color: ink(el.strokeColor, theme), align: "left", lineHeight: el.lineHeight ?? 1.25, opacity, reveal: progress });
     }
     return;
   }
 
   if (el.type === "image") {
-    const b = bbox(el), [x0, y0] = Q(b.x, b.y), [x1, y1] = Q(b.x + b.w, b.y + b.h), [cx, cy] = Q(b.x + b.w / 2, b.y + b.h / 2);
+    const b = bbox(el), [x0, y0] = QNoRot(b.x, b.y), [x1, y1] = QNoRot(b.x + b.w, b.y + b.h), [cx, cy] = QNoRot(b.x + b.w / 2, b.y + b.h / 2);
     const file = doc.files?.[el.fileId];
     if (file && typeof file.dataURL === "string") {
-      out.push({ t: "image", id: el.id, fileId: el.fileId, mimeType: file.mimeType, x: x0, y: y0, w: x1 - x0, h: y1 - y0, angle: angleOf(el), cx, cy, opacity: opacity * progress });
+      out.push({ t: "image", id: el.id, fileId: el.fileId, mimeType: file.mimeType, x: x0, y: y0, w: x1 - x0, h: y1 - y0, angle: angleOf(el) + aRot, cx, cy, opacity: opacity * progress });
     } else {   // the file hasn't arrived (or was lost): a dashed box where it goes
       const pts = outlinePoints({ ...el, type: "rectangle", roundness: null }).map(p => Q(p[0], p[1]));
       out.push({ t: "path", id: el.id, cmds: pts.map((p, i) => [i ? "L" : "M", ...p]), stroke: theme.dim, width: 1, dash: [6, 4], opacity });
@@ -292,6 +307,9 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
       out.push({ t: "text", id: el.id + ":name", x: pts[0][0], y: pts[0][1] - 18 * Math.min(1, s), text: el.name || "Frame", size: 12 * Math.min(1, s) + 2, color: theme.dim, align: "left", lineHeight: 1.2, opacity });
       return;
     }
+    if (glow > 0 && pts.length >= 2) {
+      out.push({ t: "path", id: el.id + ":glow", cmds: pts.map((p, i) => [i ? "L" : "M", ...p]), stroke: theme.accent, width: width + 8 * s * glow, dash: null, opacity: opacity * 0.28 * glow });
+    }
     if (fill && progress >= 1) {
       const poly = pts.slice(0, -1);
       if (!el.fillStyle || el.fillStyle === "solid") out.push({ t: "path", id: el.id, cmds: poly.map((p, i) => [i ? "L" : "M", ...p]), fill, opacity });
@@ -301,15 +319,19 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
         if (cmds.length) out.push({ t: "path", id: el.id, cmds, stroke: fill, width: Math.max(0.5, width / 2), dash: null, opacity });
       }
     }
-    if (stroke) { const cmds = []; sketch(cmds, trim(pts, progress), r, rough, progress >= 1); out.push({ t: "path", id: el.id, cmds, stroke, width, dash, opacity }); }
+    if (stroke) { const cmds = []; sketch(cmds, trim(pts, progress), r, rough, progress >= 1); if (cmds.length) out.push({ t: "path", id: el.id, cmds, stroke, width, dash, opacity }); }
     return;
   }
 
   if (isLinear(el) && stroke) {
+    if (progress <= 0) return;
     const rawPts = cachedLinear(doc, el, opts.stats);
     let pts = rawPts.map(p => Q(p[0], p[1]));
     pts = trim(pts, progress);
     const cmds = [];
+    if (glow > 0 && pts.length >= 2) {
+      out.push({ t: "path", id: el.id + ":glow", cmds: pts.map((p, i) => [i ? "L" : "M", ...p]), stroke: theme.accent, width: width + 8 * s * glow, dash: null, opacity: opacity * 0.28 * glow });
+    }
     if (el.type === "freedraw") {
       const baseW = Math.max(1, width * 1.1);
       const pressures = validPressures(el, rawPts.length);

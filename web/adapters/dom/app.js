@@ -19,6 +19,8 @@ import { exportSvg, paintPng, loadPictures } from "./export.js";
 import { h, $, replace } from "./dom.js";
 import { mountShareDialog } from "./admin.js";
 import { icon } from "./icons.js";
+import { buildTimeline, updateTimelineInPlace, prefersReducedMotion } from "./timeline.js";
+import { timelineSpans } from "../../../packages/core/anim.js";
 import { cancelActiveSampler } from "./color-picker.js";
 import { mountCollab } from "./collab/ui.js";
 import { collabFrame } from "./collab/frame.js";
@@ -256,14 +258,16 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     hasClass(x, "dialog") || hasClass(x, "dialog-veil") || attrOf(x, "role") === "dialog" || tagOf(x) === "DIALOG"
   );
   const isInteractive = el => matchUp(el, x =>
-    /^(BUTTON|A|SUMMARY)$/.test(tagOf(x)) || attrOf(x, "role") === "button"
+    /^(BUTTON|A|SUMMARY)$/.test(tagOf(x)) || attrOf(x, "role") === "button" || attrOf(x, "role") === "slider"
   );
+  const isSlider = el => matchUp(el, x => attrOf(x, "role") === "slider");
 
   const hasOpenDialog = () => Boolean($("#dialogs")?.childNodes?.length);
 
   document.addEventListener("keydown", e => {
+    if (e.defaultPrevented) return;
     const t = e.target;
-    if (hasOpenDialog() || isEditable(t) || inDialog(t)) return;   // inputs, dialogs keep their keys
+    if (hasOpenDialog() || isEditable(t) || inDialog(t) || isSlider(t)) return;   // inputs, dialogs, sliders keep their keys
     if (isInteractive(t) && (e.key === "Enter" || e.key === " " || e.code === "Space")) return;   // let focused buttons/links activate
     if (e.key === " " || e.code === "Space") space = true;
     const k = keyName(e), m = mods(e);
@@ -348,20 +352,18 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     for (const e of live) if (!isLabel(e)) { const l = e.customData?.layer ?? ""; counts[l] = (counts[l] ?? 0) + 1; }
     const frames = B.frames();
     const marks = [...new Set(live.map(e => e.customData?.anim?.start).filter(Number.isFinite))];
-    return { frames, framesSig: JSON.stringify(frames.map(f => [f.id, f.name ?? ""])), marks, dur: B.duration(), counts: JSON.stringify(counts) };
+    const spans = timelineSpans(live);
+    const spansSig = JSON.stringify(spans.map(s => [s.id, s.preset, s.start, s.duration, s.easing, s.loop]));
+    return { frames, framesSig: JSON.stringify(frames.map(f => [f.id, f.name ?? ""])), marks, spans, spansSig, dur: B.duration(), counts: JSON.stringify(counts) };
   });
   const notesCount = () => notesInfo(S.eds.notes.doc).notes.length;
   // Updated in place every frame (cheap compares), never by a rebuild: the zoom % and the connection pill.
   const zoomPct = h("span.pct");
-  const tl = { fill: null, head: null, text: null, sig: "" };
+  const tl = { fill: null, head: null, text: null, track: null, sig: "" };
   function timelineInPlace() {
     if (!tl.fill || S.role !== "presenter") return;
-    const B = S.eds.board, { dur } = boardInfo(B.doc), t = B.time() ?? 0, pct = Math.min(100, (t / dur) * 100);
-    const sig = `${pct}|${t}`;
-    if (sig === tl.sig) return;
-    tl.sig = sig;
-    tl.fill.style.width = `${pct}%`; tl.head.style.left = `${pct}%`;
-    tl.text.textContent = `${(t / 1000).toFixed(1)}s / ${(dur / 1000).toFixed(1)}s`;
+    const B = S.eds.board, { dur } = boardInfo(B.doc);
+    updateTimelineInPlace(tl, B, dur);
   }
   // The pill: a click while not live reconnects now (the user's own click skips the resume jitter, C-4 / p8-tidy).
   const pillEl = h("span.pill", { onclick: () => { if (S.status !== "live" && shouldProbe({ status: S.status, gesture: S.gesture })) reconnectNow(); } });
@@ -492,15 +494,14 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const el = $("#timeline"), B = S.eds.board;
     el.hidden = S.role !== "presenter";
     if (el.hidden) return;
-    const { dur, marks: starts } = boardInfo(B.doc);
-    const marks = starts.map(s => h("div.mark", { style: { left: `${(s / dur) * 100}%` } }));
-    // The head, fill and time are kept and moved in place every frame while playing (inPlace).
-    tl.fill = h("div.fill"); tl.head = h("div.head"); tl.text = h("span.t"); tl.sig = "";
-    const track = h("div.track", { title: "Click to scrub", onclick: e => { const r = e.currentTarget.getBoundingClientRect(); B.play = null; B.scrub = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * dur; B.changed(); chromeDirty = true; } },
-      tl.fill, marks, tl.head);
-    replace(el, h("button.c", { title: "Play / pause (⇧Space)", "aria-label": B.play ? "Pause" : "Play", "data-state": B.play ? "playing" : "paused", onclick: () => { B.playToggle(); chromeDirty = true; } }, icon(B.play ? "pause" : "play", { size: 14 })),
-      h("button.c", { title: "Back to editing (Esc)", "aria-label": "Stop", onclick: () => { B.stopPlay(); chromeDirty = true; } }, icon("stop", { size: 14 })), track, tl.text);
-    timelineInPlace();
+    const reduced = prefersReducedMotion();
+    B.setReducedMotion(reduced);
+    const { dur, marks, spans } = boardInfo(B.doc);
+    buildTimeline(el, {
+      board: B, dur, marks, spans, tl, h, replace, reducedMotion: reduced,
+      onChange: () => { chromeDirty = true; },
+      onSeek: () => { timelineInPlace(); dirty = true; },
+    });
   }
 
   // The notes stream as a list: text, author (you, or unknown until v1's noteAuthor), jump / edit / delete.
@@ -727,8 +728,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // counts, the active layer, the playback chip and the library (panel.js renderPanel).
   const panelKey = () => {
     const B = S.eds.board, ed = S.eds[S.role === "annotator" ? "notes" : S.active], bi = boardInfo(B.doc);
-    return JSON.stringify([propsModel(ed), B.sel.size > 0, S.eds.notes.sel.size > 0, B.selected()[0]?.customData?.anim?.preset ?? null,
-      bi.framesSig, B.frameAt, !!B.play, B.doc.layers, bi.counts, B.activeLayer, ui.colorPicker]);
+    return JSON.stringify([propsModel(ed), B.sel.size > 0, S.eds.notes.sel.size > 0, B.selected()[0]?.customData?.anim ?? null,
+      bi.spansSig, bi.framesSig, B.frameAt, !!B.play, B.doc.layers, bi.counts, B.activeLayer, ui.colorPicker]);
   };
   const hudKey = () => {
     const { canUndo, canRedo } = undoRedoState();
@@ -740,7 +741,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     topbar: { key: () => notesCount(), build: () => replace($("#topbar"), topbar()) },
     panel: { key: () => (S.role === "viewer" || !ui.panel.open ? "" : panelKey()), build: buildPanel },
     drawer: { key: () => (ui.drawer === "notes" ? notesRowsKey() : ""), build: buildDrawer },
-    timeline: { key: () => { const B = S.eds.board, bi = boardInfo(B.doc), t = B.time(); return S.role !== "presenter" ? "" : JSON.stringify([bi.marks, bi.dur, !!B.play, B.play ? null : t]); }, build: timeline },
+    timeline: { key: () => { const B = S.eds.board, bi = boardInfo(B.doc); return S.role !== "presenter" ? "" : JSON.stringify([bi.marks, bi.spansSig, bi.dur, !!B.play, B.playLoop, B.playSpeed, B.reducedMotion]); }, build: timeline },
     hud: { key: hudKey, build: hud },
     overlays: { key: () => JSON.stringify([S.status, S.online, S.pending, S.limited, nextTryIn() == null ? null : Math.ceil(nextTryIn() / 1000), S.settingsRefused.map(r => [r.stream, r.i, r.ready, r.code, r.keys]), expiry()?.bucket ?? null]), build: () => replace($("#overlays"), banners()) },
     dock: { key: () => "", build: dock },

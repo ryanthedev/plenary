@@ -14,7 +14,7 @@ import {
   bounds, corners, rotate, rotateAbout, angleOf, centerOf, toLocal, toWorld as elToWorld, normAngle,
 } from "./geometry.js";
 import { paintScene, paintElement, project, rectCmds, withAlpha, paintSnapIndicator } from "./render.js";
-import { PRESETS, timelineEnd } from "./anim.js";
+import { getPreset, getEasing, timelineEnd, stepTimeline, effectiveAnimTime } from "./anim.js";
 import { labelHostHeight, labelHostWidth } from "./text.js";
 import { isMermaid, mermaidToElements } from "./mermaid.js";
 import { itemFromElements } from "./library.js";
@@ -79,6 +79,9 @@ export class Editor {
     this.peers = new Map();      // presence: id → { name, color, cursor, sel } (networking comes later)
     this.play = null;            // { t0, from } while the timeline plays
     this.scrub = null;           // a paused timeline time, or null for the editing view
+    this.playLoop = false;       // repeat timeline playback on end
+    this.playSpeed = 1;          // playback speed multiplier (0.5, 1, 1.5, 2)
+    this.reducedMotion = false;  // prefers-reduced-motion: settle animations to timeline end
     this.flash = null;
     this.camAnim = null;         // M3: smooth camera animation { from, to, elapsed, duration }
     this.camVel = null;          // M3: pan inertia velocity { vx, vy } in screen px/s
@@ -1466,19 +1469,46 @@ export class Editor {
   // ── animation ──────────────────────────────────────────────────────────
 
   // Give the selection a preset, staggered in selection order after what's already animated.
-  animate(preset, { duration = 600, stagger = 150, start } = {}) {
-    const els = this.selected(); if (!els.length || !PRESETS[preset]) return;
-    let t = start ?? timelineEnd(this.doc.live().filter(e => !this.sel.has(e.id)));
+  animate(preset, { duration, stagger = 150, start, easing, loop } = {}) {
+    const els = this.selected(), meta = getPreset(preset); if (!els.length || !meta) return;
+    const dur = Math.max(50, Math.round(Number.isFinite(duration) ? duration : (meta.duration ?? 600)));
+    let t = start != null && Number.isFinite(start) ? Math.max(0, Math.round(start)) : timelineEnd(this.doc.live().filter(e => !this.sel.has(e.id)));
     this.transact(tx => {
       for (const e of els) {
-        const anim = { preset, start: t, duration };
+        const anim = { preset, start: t, duration: dur };
+        if (easing && getEasing(easing)) anim.easing = easing;
+        if (typeof loop === "boolean") anim.loop = loop;
         tx.get(e.id).customData = { ...e.customData, anim };
         const l = isShape(e) && this.doc.labelOf(e); if (l) tx.get(l.id).customData = { ...l.customData, anim };
         t += stagger;
       }
     });
   }
-  clearAnimation() { const els = this.selected(); this.transact(tx => els.forEach(e => { const c = tx.get(e.id); const { anim, ...rest } = c.customData ?? {}; c.customData = rest; })); }
+  updateAnimation(patch = {}) {
+    const els = this.selected().filter(e => e.customData?.anim);
+    if (!els.length) return;
+    this.transact(tx => {
+      for (const e of els) {
+        const cur = e.customData.anim;
+        const next = { ...cur };
+        if (patch.preset && getPreset(patch.preset)) next.preset = patch.preset;
+        if (patch.easing && getEasing(patch.easing)) next.easing = patch.easing;
+        if (patch.start != null && Number.isFinite(+patch.start)) next.start = Math.max(0, Math.round(+patch.start));
+        if (patch.duration != null && Number.isFinite(+patch.duration)) next.duration = Math.max(50, Math.round(+patch.duration));
+        if (typeof patch.loop === "boolean") next.loop = patch.loop;
+        tx.get(e.id).customData = { ...e.customData, anim: next };
+        const l = isShape(e) && this.doc.labelOf(e); if (l) tx.get(l.id).customData = { ...l.customData, anim: next };
+      }
+    });
+  }
+  clearAnimation() {
+    const els = this.selected();
+    this.transact(tx => els.forEach(e => {
+      const c = tx.get(e.id); const { anim, ...rest } = c.customData ?? {}; c.customData = rest;
+      const l = isShape(e) && this.doc.labelOf(e);
+      if (l) { const lc = tx.get(l.id); const { anim: _la, ...lrest } = lc.customData ?? {}; lc.customData = lrest; }
+    }));
+  }
   duration() { return Math.max(timelineEnd(this.doc.live()), 1); }
   playToggle() {
     if (this.play) { this.scrub = this.time(); this.play = null; }
@@ -1486,8 +1516,29 @@ export class Editor {
     this.changed();
   }
   stopPlay() { this.play = null; this.scrub = null; this.changed(); }
+  seekTo(ms) {
+    const t = Math.max(0, Math.min(this.duration(), Number.isFinite(ms) ? ms : 0));
+    this.play = null; this.scrub = t; this.changed();
+  }
+  stepToStart() { this.seekTo(0); }
+  stepToEnd() { this.seekTo(this.duration()); }
+  restartPlay() { this.scrub = 0; this.play = { t0: this.clock(), from: 0 }; this.changed(); }
+  setPlayLoop(on) { this.playLoop = !!on; this.changed(); }
+  setReducedMotion(on) { const v = !!on; if (this.reducedMotion !== v) { this.reducedMotion = v; this.changed(); } }
+  setPlaySpeed(speed) {
+    const s = Number(speed);
+    if (!Number.isFinite(s) || s <= 0) return;
+    const t = this.play ? this.time() : null;
+    if (this.play && t != null) this.play = { t0: this.clock(), from: t };
+    this.playSpeed = s;
+    this.changed();
+  }
   time() {
-    if (this.play) { const t = this.play.from + this.clock() - this.play.t0; if (t > this.duration() + 400) { this.play = null; this.scrub = null; return null; } return t; }
+    if (this.play) {
+      const res = stepTimeline({ from: this.play.from, elapsedMs: this.clock() - this.play.t0, duration: this.duration(), speed: this.playSpeed, loop: this.playLoop });
+      if (res.ended) { this.play = null; this.scrub = null; return null; }
+      return res.time;
+    }
     return this.scrub;
   }
 
@@ -1624,11 +1675,12 @@ export class Editor {
   }
 
   displayList(theme) {
-    const time = this.time();
+    const rawTime = this.time();
+    const time = effectiveAnimTime(rawTime, this.duration(), this.reducedMotion);
     const items = paintScene(this.doc, this.view, theme, { time: time ?? undefined, clip: this.size ? { w: this.size.w, h: this.size.h } : null });
     if (this.text) { const hide = this.text.id; for (let i = items.length - 1; i >= 0; i--) if (items[i].id === hide && items[i].t === "text") items.splice(i, 1); }
     if (this.erasing.size) for (const it of items) if (this.erasing.has(it.id)) it.opacity = (it.opacity ?? 1) * 0.25;
-    if (time != null) return items;   // playback: the board only
+    if (rawTime != null) return items;   // playback: the board only
     const P = project(this.view), acc = theme.accent;
     if (this.hover && !this.sel.has(this.hover)) {
       const el = this.doc.get(this.hover);

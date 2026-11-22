@@ -353,7 +353,7 @@ test("playback: the timeline head, fill and time move every frame in place, with
   expect(head()).toBe(h0);                                      // the same node
   expect(app.ui.rebuilds.timeline).toBe(r1);
   expect(new Set(seen).size).toBe(10);                          // it moved on every frame
-  expect(find(page.byId.timeline, e => e.className === "t").textContent).toMatch(/^\d+\.\ds \/ /);
+  expect(find(page.byId.timeline, e => e.className === "t").textContent).toMatch(/^\d{2}:\d{2}\.\d \/ \d{2}:\d{2}\.\d$/);
 });
 
 // ── verifier (p7-chromev) cases ──

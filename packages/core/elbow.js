@@ -29,6 +29,36 @@ export function sidePoint(b, side, gap = 0) {
   return { x: b.x + b.w / 2, y: (side === "bottom" ? b.y + b.h : b.y) + ny * gap };
 }
 
+// Determine the outward cardinal side of a normalized fixedPoint [fx, fy] in [0, 1] x [0, 1].
+export function sideFromFixedPoint(fp, fallback) {
+  const fx = Math.max(0, Math.min(1, fp[0])), fy = Math.max(0, Math.min(1, fp[1]));
+  const d = [
+    ["top", fy],
+    ["bottom", 1 - fy],
+    ["left", fx],
+    ["right", 1 - fx],
+  ];
+  let min = Infinity;
+  for (const [, v] of d) if (v < min) min = v;
+  const tied = d.filter(([, v]) => v <= min + 1e-4).map(([s]) => s);
+  if (tied.length === 1) return tied[0];
+  if (fallback && tied.includes(fallback)) return fallback;
+  const dx = fx - 0.5, dy = fy - 0.5;
+  if (Math.abs(dx) >= Math.abs(dy)) return dx >= 0 ? "right" : "left";
+  return dy >= 0 ? "bottom" : "top";
+}
+
+function endPoint(end, side, gap) {
+  if (end.anchor) return end.anchor;
+  if (end.box && end.fixedPoint) {
+    const [nx, ny] = NORMAL[side];
+    const fx = Math.max(0, Math.min(1, end.fixedPoint[0])), fy = Math.max(0, Math.min(1, end.fixedPoint[1]));
+    return { x: end.box.x + fx * end.box.w + nx * gap, y: end.box.y + fy * end.box.h + ny * gap };
+  }
+  if (end.box) return sidePoint(end.box, side, gap);
+  return end.point;
+}
+
 // Drop repeated points and middle points of straight runs.
 export function simplify(pts) {
   const out = [];
@@ -55,7 +85,8 @@ export function elbowRoute(from, to, gap = 6, obstacles = []) {
   const near = nearby(obstacles, first.points, from, to);
   if (!near.length || !crossings(first.points, near)) return first;
   let best = { r: first, score: score(first.points, near) };
-  const sidesFrom = from.box && !from.side ? SIDES : [first.sides[0]], sidesTo = to.box && !to.side ? SIDES : [first.sides[1]];
+  const sidesFrom = from.box && !from.side && !from.fixedPoint && !from.anchor ? SIDES : [first.sides[0]];
+  const sidesTo = to.box && !to.side && !to.fixedPoint && !to.anchor ? SIDES : [first.sides[1]];
   for (const sf of sidesFrom) for (const st of sidesTo) {
     for (const variant of ["mid", "early", "late", "over", "under"]) {
       const r = basicRoute({ ...from, side: sf }, { ...to, side: st }, gap, variant, near);
@@ -94,10 +125,12 @@ function basicRoute(from, to, gap, variant = "mid", boxes = []) {
   const fc = from.box ? { x: from.box.x + from.box.w / 2, y: from.box.y + from.box.h / 2 } : from.point;
   const tc = to.box ? { x: to.box.x + to.box.w / 2, y: to.box.y + to.box.h / 2 } : to.point;
   // Free ends get a virtual side: the one pointing toward the other end.
-  const sideFrom = from.side ?? (from.box ? facingSide(from.box, tc) : facingSide({ x: fc.x, y: fc.y, w: 0, h: 0 }, tc));
-  const sideTo = to.side ?? (to.box ? facingSide(to.box, fc) : facingSide({ x: tc.x, y: tc.y, w: 0, h: 0 }, fc));
-  const a = from.box ? sidePoint(from.box, sideFrom, gap) : fc;
-  const b = to.box ? sidePoint(to.box, sideTo, gap) : tc;
+  const autoFrom = from.box ? facingSide(from.box, tc) : facingSide({ x: fc.x, y: fc.y, w: 0, h: 0 }, tc);
+  const autoTo = to.box ? facingSide(to.box, fc) : facingSide({ x: tc.x, y: tc.y, w: 0, h: 0 }, fc);
+  const sideFrom = from.side ?? (from.box && from.fixedPoint ? sideFromFixedPoint(from.fixedPoint, autoFrom) : autoFrom);
+  const sideTo = to.side ?? (to.box && to.fixedPoint ? sideFromFixedPoint(to.fixedPoint, autoTo) : autoTo);
+  const a = endPoint(from, sideFrom, gap);
+  const b = endPoint(to, sideTo, gap);
   const [ax, ay] = NORMAL[sideFrom], [bx, by] = NORMAL[sideTo];
   const stubA = from.box ? STUB : 0, stubB = to.box ? STUB : 0;
   const pa = { x: a.x + ax * stubA, y: a.y + ay * stubA }, pb = { x: b.x + bx * stubB, y: b.y + by * stubB };

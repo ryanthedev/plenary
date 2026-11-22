@@ -7,9 +7,8 @@
 # Cluster env (p4-wire, 7bf171b; docs/m2/reports/p4-wirev.md): server/main.js reads DATABASE_URL (Postgres store and
 # registry), NATS_URL (NATS bus), PLENARY_NODE_ID (lease holder prefix; start and end it with a letter or digit),
 # PLENARY_ROLES (gateway/host split) and PLENARY_LEASE_TTL_MS, plus COOKIE_KEY, which cluster mode requires. Set
-# PLENARY_ROLES on every app node: an empty DATABASE_URL and NATS_URL (e.g. an unset interpolation) mean single node
-# (SQLite, in-memory bus), and the explicit roles make such a node refuse to start instead of running alone. NATS
-# stays without auth for now: the bus drops user:pass from NATS_URL (p4-wirev M1, engine's fix pending). S3_* are never
+# PLENARY_ROLES on every app node: a set-but-empty DATABASE_URL or NATS_URL refuses to start (p4-wire2 L7), and
+# NATS_URL userinfo (user:pass@ or token@) is honoured by server/bus/nats.js (p4-wire2 M1). S3_* are never
 # read: blobs stay on each node's local disk for M2 (engine, 2026-11-12), so the blobs services below are kept for
 # later and unused.
 #

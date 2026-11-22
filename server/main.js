@@ -184,19 +184,21 @@ export function redactingLogger(log, urls) {
   const parts = secretsOf(urls);   // once, not per string
   const r = t => redact(t, urls, parts);
   const scrub = (v, depth) => {
-    if (typeof v === "string") return r(v);
-    if (v instanceof Error) {
-      const e = new Error(r(v.message));
-      e.name = r(v.name);
-      if (v.code !== undefined) e.code = r(String(v.code));
-      e.stack = v.stack ? r(v.stack) : undefined;
-      return e;
-    }
-    if (!v || typeof v !== "object" || depth >= 5 || ArrayBuffer.isView(v) || v instanceof ArrayBuffer) return v;
-    if (Array.isArray(v)) return v.map(x => scrub(x, depth + 1));
-    const out = {};
-    for (const [k, x] of Object.entries(v)) out[k] = scrub(x, depth + 1);
-    return out;
+    try {
+      if (typeof v === "string") return r(v);
+      if (v instanceof Error) {
+        const e = new Error(r(v.message));
+        e.name = r(v.name);
+        if (v.code !== undefined) e.code = r(String(v.code));
+        e.stack = v.stack ? r(v.stack) : undefined;
+        return e;
+      }
+      if (!v || typeof v !== "object" || depth >= 5 || ArrayBuffer.isView(v) || v instanceof ArrayBuffer) return v;
+      if (Array.isArray(v)) return v.map(x => scrub(x, depth + 1));
+      const out = {};
+      for (const [k, x] of Object.entries(v)) out[r(k)] = scrub(x, depth + 1);
+      return out;
+    } catch { return "[unserializable]"; }
   };
   const wrap = inner => ({
     debug: (msg, fields) => inner.debug(r(msg), scrub(fields, 0)),

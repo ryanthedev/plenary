@@ -9,6 +9,8 @@
 //              a new thread every 400 replies: under the 500-per-thread cap), cursors at cursorRate/s
 //   viewer     receives only
 //
+// Counted: opsMade when an op is made (local()), opsSent when it is first written to a socket, acks and echoes once
+// per op. run.js judges the ops answered against opsMade.
 // Measured, into the worker's shared `stats` (scripts/load/stats.js histograms, mergeable across processes):
 //   join     hello sent → welcome (ms), per connection
 //   ack      op first written to the socket → its ack (ms), per sender role
@@ -20,6 +22,14 @@
 import { Replica } from "../../packages/protocol/replica.js";
 import { jsonCodec } from "../../packages/protocol/codec.js";
 import { makeElement } from "../../packages/core/model.js";
+
+/** A writer is due to make ops when rate x (genEndAt - firstWelcomeAt) reaches this: its first op comes within 1.5/rate s. */
+export const DUE_TICKS = 1.5;
+export function writerRate(role, cfg) {
+  if (role === "editor") return cfg?.opRate ?? 0;
+  if (role === "annotator") return Math.max(cfg?.noteRate ?? 0, cfg?.commentRate ?? 0);
+  return 0;
+}
 
 /** The one place a Replica is made (engine may add an optional `{ tab }` option: add it here). */
 export function makeReplica(clientName) {
@@ -38,6 +48,7 @@ export class LoadClient {
     this.replica = makeReplica(name);
     this.ws = null; this.ownClose = false; this.running = true; this.generating = false;
     this.helloAt = null; this.liveFrom = Infinity; this.welcomedOnce = false; this.welcomed = false;
+    this.firstWelcomeAt = null; this.loopsStarted = false;
     this.writeAt = new Map();   // op id → { t: first write time (ms), acked, echoed }; gone once both are seen
     this.timers = new Set(); this.flushTimer = null;
     this.seq = 0; this.thread = null; this.replies = 0;
@@ -84,8 +95,13 @@ export class LoadClient {
     const t = now();
     if (msg.t === "welcome" && !this.welcomed) {
       this.welcomed = true;
-      this.stats.join(t - this.helloAt, t, !this.welcomedOnce);
+      const first = !this.welcomedOnce;
+      this.stats.join(t - this.helloAt, t, first);
       this.welcomedOnce = true;
+      if (first) {
+        this.firstWelcomeAt = t;
+        if (this.generating && !this.loopsStarted) this.startLoops();
+      }
       this.liveFrom = msg.seq;   // entries after the welcome's seq are live; before it, catch-up
     } else if (msg.t === "ack") {
       const w = this.writeAt.get(msg.id);
@@ -145,8 +161,14 @@ export class LoadClient {
   }
 
   // ---- load ----
+  // Start generating from the first welcome (not connect) so a slow welcome on a healthy server never wastes ticks
+  // before the client can write.
   startGenerating() {
     this.generating = true;
+    if (this.welcomedOnce && !this.loopsStarted) this.startLoops();
+  }
+  startLoops() {
+    this.loopsStarted = true;
     const c = this.cfg, jitter = ms => ms * (0.5 + Math.random());
     const loop = (rate, fn) => { if (!(rate > 0)) return; const tick = () => { if (!this.generating) return; fn(); this.later(jitter(1000 / rate), tick); }; this.later(jitter(1000 / rate), tick); };
     if (this.role === "editor") { loop(c.opRate, () => this.draw("board")); loop(c.cursorRate, () => this.cursor()); }
@@ -157,7 +179,7 @@ export class LoadClient {
   // Only while connected, and never more than 50 ops waiting: a client that can't send skips (counted), so a
   // stalled server shows as skipped ops, not as an ever-growing queue on this side.
   canWrite() {
-    if (!this.welcomed || !this.ws) { this.stats.count("skippedOffline"); return false; }
+    if (!this.welcomed || !this.ws) { this.stats.count("skippedOffline"); this.stats.count("skippedOffline_" + this.role); return false; }
     if (this.replica.pending.size >= 50) { this.stats.count("skippedBacklog"); return false; }
     return true;
   }
@@ -166,7 +188,7 @@ export class LoadClient {
     if (!this.canWrite()) return;
     const i = this.seq++ % this.cfg.pool;
     const el = makeElement("rectangle", { id: `${this.name}-${stream[0]}${i}`, x: (this.seq * 7) % 2000, y: i * 40, width: 30, height: 30 });
-    this.replica.local(stream, { elements: [el] });
+    this.replica.local(stream, { elements: [el] }); this.made();
     this.flush();
   }
 
@@ -177,6 +199,7 @@ export class LoadClient {
       this.thread = id; this.replies = 0;
       this.replica.local("records", { do: "thread", id, anchor: { point: { x: this.seq, y: 0 } }, text: "load" });
     } else { this.replies++; this.replica.local("records", { do: "reply", id, thread: this.thread, text: "load" }); }
+    this.made();
     this.flush();
   }
 
@@ -186,6 +209,10 @@ export class LoadClient {
     ws.send(jsonCodec.encode({ t: "presence", k: "cursor", x: Math.random() * 1000, y: Math.random() * 1000 }));
     this.stats.count("presenceSent");
   }
+
+  // Counted when made (local()), not when first written: an op the Replica never gets to send (a welcome with no
+  // catch-up after it, a connection that never comes back) is still an op the server did not answer.
+  made() { this.stats.count("opsMade"); this.stats.count("opsMade_" + this.role); }
 
   pendingCount() { return this.replica.pending.size; }
 

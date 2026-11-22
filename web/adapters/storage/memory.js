@@ -1,3 +1,4 @@
+// @ts-check
 // Storage adapter: in memory (tests, and the fallback when the browser's store is unavailable). Lost on reload.
 // Implements web/ports/storage.js.
 

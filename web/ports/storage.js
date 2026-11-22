@@ -1,3 +1,4 @@
+// @ts-check
 // Storage port: a small string key/value store (the session token, the per-browser library, UI preferences).
 // Imports nothing. Contract test: test/web/contracts/storage-contract.js (storageContract).
 //

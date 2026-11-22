@@ -1,3 +1,4 @@
+// @ts-check
 // Storage adapter: the browser's localStorage (per origin, kept across sessions: the library, preferences).
 // NEVER for the session token (web/core/signin.js keeps it in session storage only). Implements web/ports/storage.js.
 // Same few lines as session.js on purpose: adapters never import each other.

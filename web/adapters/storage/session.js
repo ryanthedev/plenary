@@ -1,3 +1,4 @@
+// @ts-check
 // Storage adapter: the browser's sessionStorage (per tab, survives a reload; the sign-in token lives here).
 // Implements web/ports/storage.js. Same few lines as local.js on purpose: adapters never import each other.
 //

@@ -1,3 +1,4 @@
+// @ts-check
 // The Share dialog as state with no DOM (web/adapters/dom/share.js renders it; the data comes through web/ports/share.js and web/ports/access.js).
 // The server decides everything: who may open it (`members.manage`: a 403 here is the whole answer), which roles an invite or link may take (`limits`), who is a guest
 // (`invite.guest`). The model words it, keeps one Idempotency-Key per submit (reused by its retries), and refuses nonsense early. Copy follows design/orgs/JOURNEY.md J6.
@@ -81,7 +82,7 @@ export function createShareModel({ share, access = null, board, urls, now, newKe
       const [v, a] = await Promise.all([share.view(board), access ? access.access("board", board) : Promise.resolve({ error: "notfound" })]);
       if (v.error) { S.status = v.error === "auth" ? "signed-out" : v.error === "forbidden" ? "forbidden" : v.error === "notfound" ? "notfound" : "error"; S.notice = S.status === "error" ? failText(v) : null; emit(); return; }
       S.view = v.view; S.status = "ready";
-      S.page = a.page ?? null; S.pageStatus = a.page ? "ok" : "unavailable";
+      S.page = ("page" in a && a.page) ? a.page : null; S.pageStatus = S.page ? "ok" : "unavailable";
       if (INVITE_EXPIRY.some(([, d]) => d === defaultDays())) S.form.inviteDays = defaultDays();   // the server's own default life (limits.inviteTtlMs)
       if (!S.view.limits.inviteRoles.includes(S.form.role)) S.form.role = S.view.limits.inviteRoles[0] ?? "viewer";
       if (!S.view.limits.linkRoles.includes(S.form.linkRole)) S.form.linkRole = S.view.limits.linkRoles[0] ?? "viewer";

@@ -1,3 +1,4 @@
+// @ts-check
 // Trash as state with no DOM (web/adapters/dom/trash.js renders it; the data comes through web/ports/trash.js): the Undo of a Move to Trash, the Trash page's list with Restore, and
 // the board-URL notice. The server decides everything (who may, what is listed, what is left to restore: PROTOCOL.md § Trash and restore); the models word it, keep one Idempotency-Key
 // per submit (reused by its retries) and never invent a name. Copy follows design/orgs/JOURNEY.md J8.

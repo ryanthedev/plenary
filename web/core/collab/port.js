@@ -1,3 +1,4 @@
+// @ts-check
 // The collab port (web/ports/collab.js) over the live session (web/core/session.js): core policy, so it lives in core
 // (p7-audit C-13). The production adapter (web/adapters/collab/sync.js) only supplies the browser's frame scheduler;
 // the fake (web/adapters/collab/fake.js) is the test double. Both pass test/web/contracts/collab-contract.js. It never

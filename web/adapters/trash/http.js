@@ -1,3 +1,4 @@
+// @ts-check
 // Trash adapter over fetch: implements web/ports/trash.js against PROTOCOL.md § Trash and restore. Imports nothing (fetch and timers are injected). Bodies are checked here because the page
 // renders them: ids are 1-64 of [A-Za-z0-9_-], strings and lists are capped, anything else is dropped. Names and titles are other people's words: the page renders text only.
 

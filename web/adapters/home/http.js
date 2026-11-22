@@ -1,3 +1,4 @@
+// @ts-check
 // Home adapter over fetch: implements web/ports/home.js against GET /home, GET /home/search?q= and PUT/DELETE /home/stars/:board.
 // Imports nothing (fetch and timers are injected). The body's shape is checked here, because the page renders it and puts
 // ids in links: ids are 1-64 of [A-Za-z0-9_-], strings are capped, lists are capped, anything else is dropped.
@@ -19,11 +20,12 @@ const tree = t => (t && typeof t === "object" ? {
   more: t.more === true,
 } : null);
 
-/** @param {object} b a parsed GET /home body @returns {import("../../ports/home.js").HomeData | null} */
+/** @param {Record<string, any>} b a parsed GET /home body @returns {import("../../ports/home.js").HomeData | null} */
 export function normalizeHome(b) {
   if (!b || typeof b !== "object" || typeof b.guest !== "boolean" || !Array.isArray(b.shared)) return null;
+  /** @type {Record<string, number>} */
   const limits = {};
-  for (const [k, v] of Object.entries(b.limits ?? {})) if (Number.isFinite(v)) limits[k.slice(0, 20)] = v;
+  for (const [k, v] of Object.entries(b.limits ?? {})) if (typeof v === "number" && Number.isFinite(v)) limits[k.slice(0, 20)] = v;
   return {
     guest: b.guest, user: { user: str(b.user?.user, 80), name: str(b.user?.name, 80) },
     unit: b.unit && typeof b.unit === "object"

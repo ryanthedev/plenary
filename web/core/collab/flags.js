@@ -1,3 +1,4 @@
+// @ts-check
 // The open product questions, one flag each, at the mock's default.
 // Change a default here once the maintainer answers; nothing else reads these questions.
 export const FLAGS = Object.freeze({

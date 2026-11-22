@@ -1,3 +1,4 @@
+// @ts-check
 // The collab port: everything the collaboration UI (web/adapters/dom/collab/ui.js) needs from the sync layer, and
 // nothing else. The collab UI never imports packages/protocol. Adapters: web/adapters/collab/sync.js (production and
 // dev rooms: core's policy in web/core/collab/port.js over the session's one link, sync.js being the only protocol

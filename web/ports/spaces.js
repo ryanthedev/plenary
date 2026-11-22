@@ -1,3 +1,4 @@
+// @ts-check
 // Spaces port: the Space and Group pages, the New board / New space pickers, create, rename and general access
 // (PROTOCOL.md § Spaces and Groups). Imports nothing. Contract test: test/web/adapters/spaces-http.test.js (the http adapter over a fake fetch).
 //

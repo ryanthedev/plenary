@@ -1,3 +1,4 @@
+// @ts-check
 // The rooms behind the SharedWorker (worker.js): one in-process room per board (the root passes `makeNet`: the
 // local transport adapter's localRoom), so several tabs or windows of one browser edit together until the phase-3 server is wired in.
 // Also a stand-in Blobs port: picture bytes never travel in ops (the room refuses `files`), so tabs hand them

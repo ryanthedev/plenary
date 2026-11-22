@@ -1,3 +1,4 @@
+// @ts-check
 // The Move dialog and its Undo as state with no DOM (web/adapters/dom/move.js renders them; the data comes through web/ports/move.js). The server decides everything: who may
 // move (a 403 is the whole answer), which Spaces are valid destinations (`options`), who gains, keeps and loses (`preview`, the enforcing code's own answer) and whether Undo is
 // possible (`undo`). The model words it, keeps one Idempotency-Key per submit (reused by its retries), and drops a preview that a later choice has outdated.

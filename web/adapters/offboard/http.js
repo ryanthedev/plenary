@@ -1,3 +1,4 @@
+// @ts-check
 // Offboarding adapter over fetch: implements web/ports/offboard.js against PROTOCOL.md § Leaver offboarding. Imports nothing (fetch and timers are injected). Bodies are checked here because the page
 // renders them: ids are short, strings and lists are capped, anything else is dropped. Names are other people's words: the page renders text only.
 

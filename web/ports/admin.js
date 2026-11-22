@@ -1,3 +1,4 @@
+// @ts-check
 // Admin & share API port: boards list/create, share links, email invites, member grants, and audit logs.
 // Pure JSDoc contract — imports nothing at runtime (checked by test/web/architecture.test.js).
 // Production adapter: web/adapters/admin/http.js (Bearer-authenticated over fetch).

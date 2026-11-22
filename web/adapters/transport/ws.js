@@ -1,3 +1,4 @@
+// @ts-check
 // Transport adapter: one board stream over a browser WebSocket. Implements web/ports/transport.js (contract test:
 // test/web/contracts/transport-contract.js, run in test/web/adapters/transport-ws.test.js).
 //
@@ -94,6 +95,7 @@ export function wsTransport({ url, WebSocket: WS, codec = jsonCodec, maxQueued =
   if (codec !== jsonCodec) inflate = null;
   const target = inflate ? withDeflate(url) : url;
   let done = false;
+  /** @type {(msg: any) => void} */
   let onMsg = () => {};
   /** @type {(() => void) | null} */
   let onDrop = null;
@@ -314,7 +316,7 @@ export function httpBlobClient({ origin = null, fetch: fetchFn = (...a) => globa
       const res = await fetchFn(target, {
         method: "PUT",
         headers: mimeType ? { "content-type": mimeType } : {},
-        body: bytes,
+        body: /** @type {BodyInit} */ (bytes),
         ...(signal ? { signal } : {}),
       });
       if (!res?.ok) throw new Error(`uploadBlob: HTTP ${res?.status ?? "error"}`);
@@ -468,6 +470,7 @@ function blobClient({ fetch: fetchFn, clock, base }) {
   return {
     /** Wrap a transport: read what is ours, pass the rest on. */
     attach(tr) {
+      /** @type {(msg: any) => void} */
       let handler = () => {};
       const self = { ...tr,
         onMessage(fn) { handler = fn; },
@@ -531,10 +534,10 @@ export function wsNet({ url, WebSocket: WS, fetch: fetchFn = globalThis.fetch?.b
   if (typeof url !== "string" || !/^wss?:\/\//.test(url)) throw new TypeError("wsNet: a ws:// or wss:// url is required");
   const u = new URL(url);
   const origin = `${u.protocol === "wss:" ? "https:" : "http:"}//${u.host}`;
-  const fetchOpt = fetchFn ? { fetch: (...a) => fetchFn(...a) } : {};
+  const fetchOpt = fetchFn ? { fetch: /** @type {typeof globalThis.fetch} */ ((input, init) => fetchFn(input, init)) } : {};
   const fetchSnapshot = httpSnapshotFetcher({ origin, ...fetchOpt });
   const { uploadBlob, fetchBlob } = httpBlobClient({ origin, ...fetchOpt });
-  const blobs = blobClient({ fetch: (...a) => fetchFn(...a), clock: clock ?? globalClock, base: url.replace(/^ws/, "http") });
+  const blobs = blobClient({ fetch: /** @type {typeof globalThis.fetch} */ ((input, init) => fetchFn(input, init)), clock: clock ?? globalClock, base: url.replace(/^ws/, "http") });
   return {
     kind: "ws",
     join: () => blobs.attach(wsTransport({ url, WebSocket: WS, ...(clock ? { clock } : {}), ...(inflate ? { inflate } : {}) })),

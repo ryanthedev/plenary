@@ -1,3 +1,4 @@
+// @ts-check
 // Auth adapter: POST /auth/exchange over fetch. Implements web/ports/auth.js.
 // Imports nothing: fetch, the base URL and the timers are injected; the composition root passes globalThis.fetch.
 //

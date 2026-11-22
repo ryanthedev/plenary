@@ -1,3 +1,4 @@
+// @ts-check
 // Clock adapter: a deterministic virtual clock for tests. Implements web/ports/clock.js, plus advance(ms).
 // Time moves only in advance(); timers fire there in due order, equal due times in the order they were set, with
 // now() (and mono()) equal to the timer's due time inside its callback; a timer due exactly at the target fires. A timer set during advance() that falls due before the

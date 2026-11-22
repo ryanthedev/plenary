@@ -1,3 +1,4 @@
+// @ts-check
 // Move adapter over fetch: implements web/ports/move.js against PROTOCOL.md § Move board. Imports nothing (fetch and timers are injected). Bodies are checked here because the
 // dialog renders them: ids are 1-64 of [A-Za-z0-9_-], strings and lists are capped, anything else is dropped. Names are other people's words: the dialog renders text only.
 

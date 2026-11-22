@@ -1,3 +1,4 @@
+// @ts-check
 // The Home screen's state, with no DOM: what to show (sections, empty states, the sidebar), search with a debounce and
 // a stale-answer guard, and optimistic stars. The page (web/adapters/dom/home.js) renders `model.state` and calls the
 // actions; the data comes through the Home port (web/ports/home.js). Time and timers come from the clock port.

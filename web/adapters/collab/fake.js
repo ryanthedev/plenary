@@ -1,3 +1,4 @@
+// @ts-check
 // A fake collab port (port.js) for tests and web/collab/dev.html: no network, no packages/protocol.
 // It plays the room for `records` (a sequencer that applies actions in order, the same way § Records does,
 // no-ops and dead targets included), and lets a test or the dev page push presence, `here` and `emotes` in.
@@ -74,7 +75,7 @@ function refusal(threads, op, by, role) {
 
 /**
  * @param {{ role?: string, me?: { user: string, name: string, client: string }, status?: string, now?: () => number,
- *   autoAck?: boolean, threads?: object[], notes?: object[], noteAuthors?: Record<string, string>, elements?: Record<string, object> }} [o]
+ *   autoAck?: boolean, threads?: Record<string, any>[], notes?: Record<string, any>[], noteAuthors?: Record<string, string>, elements?: Record<string, Record<string, any>> }} [o]
  */
 export function createFakePort(o = {}) {
   const now = o.now ?? (() => Date.now());

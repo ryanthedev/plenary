@@ -1,3 +1,4 @@
+// @ts-check
 // Bearer-authenticated HTTP adapter for the Admin & Share API (implements web/ports/admin.js).
 // Zero runtime imports: fetch, origin, and session token are injected by the composition root.
 // Never logs or puts the token in any URL; parses JSON responses and throws structured { status, code, message } errors.
@@ -109,7 +110,8 @@ export function httpAdmin({ origin = "", token, fetch }) {
     listLinks(board) {
       return request("GET", `/boards/${enc(board)}/links`);
     },
-    createLink(board, { role, expiresAt } = {}) {
+    createLink(board, opts) {
+      const { role, expiresAt } = opts || /** @type {{ role: string, expiresAt?: number | null }} */ ({});
       const payload = { role };
       if (expiresAt !== undefined) payload.expiresAt = expiresAt;
       return request("POST", `/boards/${enc(board)}/links`, payload);
@@ -120,7 +122,8 @@ export function httpAdmin({ origin = "", token, fetch }) {
     listInvites(board) {
       return request("GET", `/boards/${enc(board)}/invites`);
     },
-    createInvite(board, { email, role, expiresAt } = {}) {
+    createInvite(board, opts) {
+      const { email, role, expiresAt } = opts || /** @type {{ email: string, role: string, expiresAt?: number | null }} */ ({});
       const payload = { email, role };
       if (expiresAt !== undefined) payload.expiresAt = expiresAt;
       return request("POST", `/boards/${enc(board)}/invites`, payload);

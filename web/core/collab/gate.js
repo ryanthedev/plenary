@@ -1,3 +1,4 @@
+// @ts-check
 // What this client may send, and when. Pure (clock and timers injected).
 // - mayPresence / recordProblem: the role table and caps, checked before anything reaches the port, so the UI
 //   never sends what the role can't (the gateway and room check again; this only spares the round trip).
@@ -22,8 +23,8 @@ const textProblem = t => (typeof t !== "string" || !t.trim() ? "write something 
  * per-board and per-comment caps against the state shown. A no-op on a dead target is allowed (the room
  * accepts it too). `state` = port.records().threads.
  * @param {string} role  @param {string} me user id
- * @param {{ do: string }} op
- * @param {object[]} threads
+ * @param {{ do: string, id?: string, anchor?: any, text?: string, thread?: string, emoji?: string, on?: boolean }} op
+ * @param {Record<string, any>[]} threads
  * @returns {null | { code: string, message: string }}
  */
 export function recordProblem(role, me, op, threads = []) {

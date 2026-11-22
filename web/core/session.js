@@ -1,3 +1,4 @@
+// @ts-check
 // One person's canvas: two core Editors (the `board` and `notes` streams of one board), one shared view,
 // input routed by tool and role, and one write chokepoint. No DOM: app.js feeds it events, and the tests
 // drive it headless.
@@ -31,14 +32,15 @@ const ORDER = { viewer: 0, annotator: 1, presenter: 2 };
  * copied only own enumerable members). A member the adapter lacks stays absent (p8-one-linkv L3), so sync.js's own
  * checks (a transport without reopen() is refused) still fire through createSession. `fail` is the dev hook's
  * unasked drop, kept where the adapter has one.
- * @param {import("../ports/transport.js").Transport & { fail?: () => void }} t
+ * @param {import("../ports/transport.js").Transport} t
+ * @returns {import("../ports/transport.js").Transport}
  */
 export function wrapTransport(t) {
   const w = {};
   for (const k of ["send", "onMessage", "reopen", "close", "congested", "backlogBytes", "onDrop", "fail"]) {
     if (typeof t?.[k] === "function") w[k] = (...a) => t[k](...a);
   }
-  return w;
+  return /** @type {import("../ports/transport.js").Transport} */ (w);
 }
 
 /**
@@ -53,9 +55,13 @@ export function mintTab(random) {
 }
 
 /**
- * @param {{ join: () => object, token: string, board: string, client?: string, tab?: string, mine?: Iterable<string>,
+ * @param {{ join?: () => import("../ports/transport.js").Transport,
+ *           fetchSnapshot?: import("../ports/net.js").FetchSnapshot | null,
+ *           uploadBlob?: import("../ports/net.js").UploadBlob | null,
+ *           fetchBlob?: import("../ports/net.js").FetchBlob | null,
+ *           token?: string, board?: string, client?: string, tab?: string, mine?: Iterable<string>,
  *           noteAuthor?: (id: string) => string | null, user?: string, onChange?: () => void,
- *           clock?: import("../ports/clock.js").Clock, timers?: object, now?: () => number, random?: () => number }} o
+ *           clock?: import("../ports/clock.js").Clock, timers?: any, now?: () => number, random?: () => number }} [o]
  *   join: the tab's one transport (sync.js's transport port), called once. mine: note ids this person made (kept by
  *   the page across reloads). noteAuthor: optional fallback author lookup when the connection has no author for a note id (defaults to () => null).
  *   tab: this browser tab's id; minted once from `random` (or the clock's) when not given. Kept in s.tab and handed

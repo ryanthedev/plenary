@@ -1,3 +1,4 @@
+// @ts-check
 // Teams, the access page of a scope and the people/Team picker, as state with no DOM (web/adapters/dom/access.js renders them; the data comes
 // through web/ports/access.js). The server decides every permission (`can.*`, the `roles` it lists): the models only ask, show and refuse
 // nonsense early. Copy follows design/orgs/JOURNEY.md (J4, J9, J10).
@@ -26,7 +27,12 @@ export const viaText = row => (row.via === "team" ? "Team" : row.via === "inheri
 /** The general-access lines of an access page, e.g. "Everyone in the organization can view (Space Design)". */
 export const generalLine = g => `Everyone in the organization: ${g.role} (${SCOPE_NOUN[g.scope.type] ?? g.scope.type}${g.scope.name ? " " + g.scope.name : ""})`;
 
-function base(extra = {}) {
+/**
+ * @template {Record<string, any>} T
+ * @param {T} extra
+ */
+function base(extra) {
+  /** @type {{ status: string, error: string | null, notice: string | null, busy: boolean } & T} */
   const state = { status: "loading", error: null, notice: null, busy: false, ...extra };
   const subs = new Set();
   const emit = () => { for (const f of [...subs]) f(state); };
@@ -116,7 +122,7 @@ export function createTeamModel({ api, id }) {
       if (n === S.page.team.name) return true;
       return act(m, () => api.renameTeam(id, n), r => { S.page.team = { ...S.page.team, name: r.team.name }; }, r => `Renamed to ${r.team.name}`);
     },
-    /** @param {{ user: string, name: string }} person */
+    /** @param {{ user: string, name: string, email?: string | null }} person */
     async addMember(person) {
       if (S.page.members.some(x => x.user === person.user)) { S.said = `${person.name} is already in this team`; m.emit(); return true; }
       return act(m, () => api.setMember(id, person.user, true), () => {

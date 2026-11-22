@@ -1,5 +1,5 @@
 // The Blobs port on local disk (PROTOCOL.md § Blobs), for a single node.
-//   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB, a hash mismatch, and anything that isn't a PNG/JPEG/GIF/WebP
+//   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB (images) / > 50 MB (videos), a hash mismatch, and anything that isn't PNG/JPEG/GIF/WebP/MP4/WebM/QuickTime
 //   get(tenant, sha1)          bytes, or null
 // A blob lives at <dir>/<tenant>/<first 2 hex>/<sha1>. Both ids are validated before they touch a path, so there is
 // no traversal and one tenant can't name another's file. Writes go to a temp file, are fsynced, then hard-linked

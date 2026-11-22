@@ -1,5 +1,5 @@
 // The Blobs port on S3-compatible storage (PROTOCOL.md § Blobs), for a cluster. Same contract as disk.js:
-//   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB, a hash mismatch, and anything that isn't a PNG/JPEG/GIF/WebP
+//   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB (images) / > 50 MB (videos), a hash mismatch, and anything that isn't PNG/JPEG/GIF/WebP/MP4/WebM/QuickTime
 //   get(tenant, sha1)          bytes, or null when there is no such blob (every other failure throws)
 // A blob is the object `<tenant>/<sha1>` in one bucket. Both ids are validated before they reach a key, so one
 // tenant can't name another's object. An S3 PUT is atomic (readers see the whole object or none) and durable once

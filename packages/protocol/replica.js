@@ -19,7 +19,7 @@
 
 import { Doc } from "../core/doc.js";
 import { emptyScene, clone, randomInt } from "../core/model.js";
-import { ELEMENT_STREAMS, PROTOCOL_VERSION, RULES, OP_RATE, OP_TIMEOUT_MS, CONNECT_TIMEOUT_MS, IDLE_TIMEOUT_MS, BACKOFF, mergeAppState, appBaseProblem, isTab } from "./envelope.js";
+import { ELEMENT_STREAMS, PROTOCOL_VERSION, RULES, OP_RATE, OP_TIMEOUT_MS, CONNECT_TIMEOUT_MS, BACKOFF, mergeAppState, appBaseProblem, isTab } from "./envelope.js";
 import { Records } from "./records.js";
 import { PREVIEW_TTL_MS } from "./presence.js";
 

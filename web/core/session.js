@@ -57,7 +57,7 @@ export function mintTab(random) {
  *           noteAuthor?: (id: string) => string | null, user?: string, onChange?: () => void,
  *           clock?: import("../ports/clock.js").Clock, timers?: object, now?: () => number, random?: () => number }} o
  *   join: the tab's one transport (sync.js's transport port), called once. mine: note ids this person made (kept by
- *   the page across reloads). noteAuthor: the v1 snapshot's table when it exists (SEAM(v1): null in v0).
+ *   the page across reloads). noteAuthor: optional fallback author lookup when the connection has no author for a note id (defaults to () => null).
  *   tab: this browser tab's id; minted once from `random` (or the clock's) when not given. Kept in s.tab and handed
  *   to sync.js, which sends it in every hello of the link (reconnects and resyncs keep it). No random: no tab.
  *   clock: the clock port (the root passes browserClock()); the Editors' clock is its now(). timers / now / random:

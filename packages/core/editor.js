@@ -6,14 +6,14 @@
 // remote/agent ops come in through editor.receive(op).
 
 import {
-  DEFAULT_STROKE, BASE_LAYER, makeElement, clone, touch, isShape, isLinear, isLabel, layerOf, zOf, defaultLayer, newId, textSize, clampPressure,
+  DEFAULT_STROKE, makeElement, clone, touch, isShape, isLinear, isLabel, layerOf, zOf, defaultLayer, newId, textSize, clampPressure,
 } from "./model.js";
 import { Doc } from "./doc.js";
 import {
-  bbox, unionBox, inBox, boxInBox, center, normalize, hits, hitTest, shapeAt, bindTargetAt, resolvedPoints, drawnPoints, curveThrough, settle, fileScene, portsOf, portAt, outlineDistance, mapIntoBox, distToSeg, segmentsIntersect,
+  bbox, unionBox, inBox, boxInBox, center, normalize, hits, hitTest, shapeAt, bindTargetAt, resolvedPoints, drawnPoints, curveThrough, settle, fileScene, portAt, mapIntoBox, segmentsIntersect,
   bounds, corners, rotate, rotateAbout, angleOf, centerOf, toLocal, toWorld as elToWorld, normAngle,
 } from "./geometry.js";
-import { paintScene, paintElement, project, rectCmds, withAlpha, paintSnapIndicator } from "./render.js";
+import { paintScene, project, rectCmds, withAlpha, paintSnapIndicator } from "./render.js";
 import { getPreset, getEasing, timelineEnd, stepTimeline, effectiveAnimTime } from "./anim.js";
 import { labelHostHeight, labelHostWidth } from "./text.js";
 import { isMermaid, mermaidToElements } from "./mermaid.js";

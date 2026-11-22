@@ -593,7 +593,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     });
   }
 
-  // The notes stream as a list: text, author (you, or unknown until v1's noteAuthor), jump / edit / delete.
+  // The notes stream as a list: text, author (you, or "—" for others), jump / edit / delete.
   function notesList() {
     const N = S.eds.notes, may = S.may();
     const { notes, labels } = notesInfo(N.doc);

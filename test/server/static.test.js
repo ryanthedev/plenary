@@ -322,10 +322,21 @@ async function bundlerGraph() {
     if (rel.startsWith("packages/core/") || rel.startsWith("packages/protocol/")) return "/" + rel;
     return null;
   };
-  // index.html's own stylesheets, read with a plain regex here (not static.js's scanHtml), so the crawl stays independent.
+  // index.html's own stylesheets, manifest and icons, read with plain regexes here (not static.js's scanHtml), so the crawl stays independent.
   const html = await Bun.file(join(repo, "web/index.html")).text();
   const sheets = [...html.matchAll(/<link\s+rel="stylesheet"\s+href="([^"]+)"/g)].map(m => "/" + m[1]);
-  const served = new Set(["/index.html", ...sheets.filter(u => !denied(u))]), seen = new Set(), q = [join(repo, "web/main.js")];
+  const pwaLinks = [...html.matchAll(/<link\b[^>]*\brel="(?:manifest|icon|apple-touch-icon)"[^>]*>/g)]
+    .map(m => /\bhref="([^"]+)"/.exec(m[0])?.[1])
+    .filter(Boolean)
+    .map(u => (u.startsWith("/") ? u : "/" + u));
+  const manifestUrl = pwaLinks.find(u => u.endsWith(".webmanifest"));
+  const manifestIcons = manifestUrl
+    ? (JSON.parse(await Bun.file(join(repo, "web", manifestUrl.slice(1))).text()).icons ?? [])
+      .map(i => i?.src)
+      .filter(s => typeof s === "string")
+      .map(s => (s.startsWith("/") ? s : "/" + s))
+    : [];
+  const served = new Set(["/index.html", ...[...sheets, ...pwaLinks, ...manifestIcons].filter(u => !denied(u))]), seen = new Set(), q = [join(repo, "web/main.js")];
   while (q.length) {
     const f = q.shift();
     if (seen.has(f)) continue;
@@ -385,4 +396,79 @@ test("E-5: immutable /v/<build>/... serves from startup memory cache with max-ag
   expect(await (await get(site, `/v/${site.build}/main.js`)).text()).toBe(orig);
   p.put("web/a.js", "export const a = 999;");
   expect(await (await get(cached, "/a.js")).text()).toBe("");
+});
+
+test("M5 PWA: GET & HEAD /manifest.webmanifest and every declared icon return 200 with valid content; traversal/unknown paths still 404", async () => {
+  const site = staticSite();
+
+  // Manifest GET & HEAD
+  const mGet = await get(site, "/manifest.webmanifest");
+  expect(mGet?.status).toBe(200);
+  expect(mGet.headers.get("content-type")).toBe("application/manifest+json");
+  const mBytes = new Uint8Array(await mGet.arrayBuffer());
+  const manifest = JSON.parse(new TextDecoder().decode(mBytes));
+  expect(manifest.name).toBe("Plenary");
+  expect(manifest.display).toBe("standalone");
+  expect(manifest.start_url).toBe("/");
+  expect(Array.isArray(manifest.icons) && manifest.icons.length >= 3).toBe(true);
+
+  const mHead = await get(site, "/manifest.webmanifest", { method: "HEAD" });
+  expect(mHead?.status).toBe(200);
+  expect(mHead.headers.get("content-type")).toBe("application/manifest+json");
+  expect(Number(mHead.headers.get("content-length"))).toBe(mBytes.byteLength);
+  expect(await mHead.text()).toBe("");
+
+  // Every declared icon URL (GET & HEAD + magic bytes / SVG check)
+  const PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  for (const icon of manifest.icons) {
+    const res = await get(site, icon.src);
+    expect([icon.src, res?.status]).toEqual([icon.src, 200]);
+    const buf = new Uint8Array(await res.arrayBuffer());
+    const head = await get(site, icon.src, { method: "HEAD" });
+    expect([icon.src, head?.status, Number(head.headers.get("content-length"))]).toEqual([icon.src, 200, buf.byteLength]);
+    expect(await head.text()).toBe("");
+    if (icon.src.endsWith(".png")) {
+      expect(res.headers.get("content-type")).toBe("image/png");
+      expect([...buf.slice(0, 8)]).toEqual(PNG_SIG);
+      const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+      const [w, h] = [dv.getUint32(16, false), dv.getUint32(20, false)];
+      if (icon.sizes === "192x192") expect([w, h]).toEqual([192, 192]);
+      if (icon.sizes === "512x512") expect([w, h]).toEqual([512, 512]);
+    } else if (icon.src.endsWith(".svg")) {
+      expect(res.headers.get("content-type")).toBe("image/svg+xml");
+      expect(new TextDecoder().decode(buf)).toContain("<svg");
+    }
+  }
+
+  // Unknown and traversal icon paths still 404
+  for (const bad of ["/icons/missing.png", "/manifest.webmanifest.bak", "/icons/dev.js"]) {
+    expect([bad, (await get(site, bad))?.status ?? 404]).toEqual([bad, 404]);
+  }
+  for (const trav of ["/icons/../index.html", "/icons/%2e%2e/main.js", "/icons/%2e%2e/index.html"]) {
+    expect([trav, safePath(trav)]).toEqual([trav, false]);
+    expect([trav, await site.handle(new Request("http://x/"), { pathname: trav })]).toEqual([trav, null]);
+  }
+
+  // Planted manifest with traversal / external / denied icon srcs never serves them
+  const root = tempDir("plenary-static-pwa-");
+  const put = (rel, body) => { mkdirSync(dirname(join(root, rel)), { recursive: true }); writeFileSync(join(root, rel), body); };
+  put("web/index.html", `<!doctype html><link rel="manifest" href="/manifest.webmanifest"><script type="module" src="main.js"></script>`);
+  put("web/main.js", "export const ok = 1;");
+  put("secret.png", Buffer.from(PNG_SIG));
+  put("web/icons/ok.svg", "<svg xmlns='http://www.w3.org/2000/svg'></svg>");
+  put("web/manifest.webmanifest", JSON.stringify({
+    name: "Test",
+    icons: [
+      { src: "/icons/ok.svg", type: "image/svg+xml" },
+      { src: "/../secret.png", type: "image/png" },
+      { src: "https://evil.example/x.png", type: "image/png" },
+      { src: "/dev.js", type: "text/javascript" },
+    ],
+  }));
+  const planted = staticSite({ mounts: [{ url: "/", dir: join(root, "web") }] });
+  expect((await get(planted, "/manifest.webmanifest"))?.status).toBe(200);
+  expect((await get(planted, "/icons/ok.svg"))?.status).toBe(200);
+  expect((await get(planted, "/../secret.png"))?.status ?? 404).toBe(404);
+  expect((await get(planted, "/secret.png"))?.status ?? 404).toBe(404);
+  expect((await get(planted, "/dev.js"))?.status ?? 404).toBe(404);
 });

@@ -345,7 +345,16 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   }
   const setPanel = op => { const n = applyPanel(ui.panel, op); if (n !== ui.panel) { ui.panel = n; put("plenary.panel", serializePanel(n)); } chromeDirty = true; };
   function setLibrary(items) { ui.library = items; saveLibrary(prefs, items); chromeDirty = true; }
-  const setTheme = t => { ui.theme = t; document.documentElement.dataset.theme = t; dirty = true; chromeDirty = true; collab?.setTheme(t); };
+  const THEME_COLORS = { light: "#f6f6f8", dark: "#18181b" };
+  const setTheme = t => {
+    ui.theme = t;
+    document.documentElement.dataset.theme = t;
+    const meta = document.querySelector?.('meta[name="theme-color"]');
+    if (meta) meta.setAttribute("content", THEME_COLORS[t] ?? THEME_COLORS.light);
+    dirty = true;
+    chromeDirty = true;
+    collab?.setTheme(t);
+  };
   function openDialog(d) { ui.dialog = d; ui.sheet = null; chromeDirty = true; }
   const keyLabel = t => (t.keys?.length ? t.keys.map(k => k.toUpperCase()).join(" ") : "");
 
@@ -704,8 +713,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // The idle-link watchdog itself is sync.js's (J3, after engine's heartbeat E-1).
   // A tab coming back skips the reconnect when the room spoke within HEARD_MS (presence, here, emotes, records: any
   // room event): its link is alive, and on a busy all-hands that is every tab, so a mass return sends no hellos.
-  const HEARD_MS = 10_000;
-  let probeTimer = null, hiddenAt = null, heard = null;
+  const HEARD_MS = 10_000, PROBE_COALESCE_MS = 1000;
+  let probeTimer = null, hiddenAt = null, heard = null, lastProbe = null;
   // A probe remembers two counts when armed and stands down at fire time if either moved: messages heard from the room
   // (S.onHeard: welcome, here, presence, … never a local action, p8-tidyv R2-L1), so the link is alive (H3); and hellos
   // the link sent (any reconnect: backoff, pill, Retry), so a hello is already out and waiting for its welcome
@@ -726,17 +735,27 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     userReconnect = clock.set(() => { userReconnect = null; }, USER_RECONNECT_MS);
   }
   const probe = () => {
-    cancelProbe();
+    if (probeTimer != null) return;
+    if (lastProbe && since(lastProbe) < PROBE_COALESCE_MS) return;
     const armed = heardN, armedHellos = S.connection.hellos;
     probeTimer = clock.set(() => {
       probeTimer = null;
       if (heardN !== armed) return;                        // heard since armed: the link is alive (H3)
       if (S.connection.hellos !== armedHellos) return;     // a hello went out since armed: wait for it (R2-M2)
-      if (shouldProbe({ status: S.status, gesture: S.gesture })) S.reconnect();
+      if (shouldProbe({ status: S.status, gesture: S.gesture })) {
+        lastProbe = { mono: clock.mono(), wall: clock.now() };
+        S.reconnect();
+      }
     }, clock.random() * probeJitterMs(S.roleSeen ? S.effective : null));
   };
   addEventListener("online", () => { S.online = true; chromeDirty = true; probe(); });
   addEventListener("offline", () => { S.online = false; chromeDirty = true; });
+  addEventListener("pageshow", e => {
+    if (!e?.persisted) return;
+    hiddenAt = null;
+    if (heard && since(heard) <= HEARD_MS) return;
+    probe();
+  });
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") { hiddenAt = { mono: clock.mono(), wall: clock.now() }; return; }
     const was = hiddenAt; hiddenAt = null;

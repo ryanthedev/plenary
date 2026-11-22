@@ -47,7 +47,7 @@ export const CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'uns
 
 export const MIME = Object.freeze({
   ".js": "text/javascript", ".mjs": "text/javascript", ".css": "text/css", ".html": "text/html; charset=utf-8",
-  ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png", ".woff2": "font/woff2",
+  ".json": "application/json", ".webmanifest": "application/manifest+json", ".svg": "image/svg+xml", ".png": "image/png", ".woff2": "font/woff2",
 });
 
 /**
@@ -115,13 +115,34 @@ export function scanModule(src) {
   return { specs, computed };
 }
 
-/** Relative src/href of <script> and <link> tags in an HTML page. */
+/** Relative src/href of <script> and <link> tags in an HTML page (plus `rel` on <link> tags). */
 export function scanHtml(src) {
   const out = [];
-  for (const tag of src.replace(/<!--[\s\S]*?-->/g, "").matchAll(/<(script|link)\b[^>]*>/gi))
-    for (const m of tag[0].matchAll(/\b(src|href)\s*=\s*["']([^"']+)["']/gi)) out.push({ spec: m[2], how: `<${tag[1]} ${m[1]}>` });
+  for (const tag of src.replace(/<!--[\s\S]*?-->/g, "").matchAll(/<(script|link)\b[^>]*>/gi)) {
+    let rel = "";
+    if (tag[1].toLowerCase() === "link") {
+      const rm = /\brel\s*=\s*(?:["']([^"']+)["']|([^\s>]+))/i.exec(tag[0]);
+      rel = (rm?.[1] ?? rm?.[2] ?? "").trim().toLowerCase();
+    }
+    for (const m of tag[0].matchAll(/\b(src|href)\s*=\s*["']([^"']+)["']/gi))
+      out.push({ spec: m[2], how: `<${tag[1]} ${m[1]}>`, ...(rel ? { rel } : {}) });
+  }
   return out;
 }
+
+/** Icon `src` URLs declared in a Web App Manifest JSON file. Throws if `src` is not valid JSON. */
+export function scanManifest(src) {
+  const m = JSON.parse(src);
+  const out = [];
+  if (m && Array.isArray(m.icons)) {
+    for (const icon of m.icons) {
+      if (icon && typeof icon.src === "string" && icon.src.trim()) out.push({ spec: icon.src, how: "manifest icon" });
+    }
+  }
+  return out;
+}
+
+const PWA_LINK_RELS = new Set(["manifest", "icon", "apple-touch-icon", "shortcut icon"]);
 
 const isRelative = s => s.startsWith("./") || s.startsWith("../");
 const isFile = p => { try { return statSync(p).isFile(); } catch { return false; } };
@@ -173,18 +194,28 @@ export function staticSite({ mounts = DEFAULT_MOUNTS, log = { info() {}, warn() 
     while (queue.length) {
       const { abs, url } = queue.shift();
       const ext = extOf(abs);
-      if (ext !== ".js" && ext !== ".mjs" && ext !== ".html") continue;
+      if (ext !== ".js" && ext !== ".mjs" && ext !== ".html" && ext !== ".webmanifest") continue;
       let src;
       try { src = readFileSync(abs, "utf8"); } catch (err) { skip("unreadable", { from: url, err }); continue; }
       let scanned;
-      try { scanned = ext === ".html" ? { specs: scanHtml(src), computed: [] } : scanModule(src); }
-      catch (err) { skip("unparseable (its imports are not served)", { from: url, err }); continue; }
+      try {
+        scanned = ext === ".html" ? { specs: scanHtml(src), computed: [] }
+          : ext === ".webmanifest" ? { specs: scanManifest(src), computed: [] }
+          : scanModule(src);
+      } catch (err) { skip("unparseable (its imports are not served)", { from: url, err }); continue; }
       const { specs, computed } = scanned;
       for (const c of computed) skip("computed import() (not resolvable statically)", { from: url, spec: c, how: "import()" });
-      for (const { spec, how } of specs) {
+      for (const { spec, how, rel } of specs) {
         const clean = spec.split(/[?#]/)[0];
         if (!isRelative(clean)) {
-          if (ext === ".html" && /^[\w-]+(\/[\w.-]+)*\.\w+$/.test(clean)) { add(resolve(dirname(abs), clean), url, spec, how); continue; }
+          if ((ext === ".html" || ext === ".webmanifest") && /^[\w-]+(\/[\w.-]+)*\.\w+$/.test(clean)) {
+            add(resolve(dirname(abs), clean), url, spec, how);
+            continue;
+          }
+          if ((ext === ".webmanifest" || (ext === ".html" && PWA_LINK_RELS.has(rel))) && clean.startsWith("/") && !clean.startsWith("//") && safePath(clean)) {
+            add(join(web.dir, clean.slice(1)), url, spec, how);
+            continue;
+          }
           skip("not a relative path", { from: url, spec, how });
           continue;
         }

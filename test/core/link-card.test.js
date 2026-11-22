@@ -253,6 +253,48 @@ describe("render.js rich link card display list", () => {
       expect(rotatedText.angle).toBeCloseTo(0.25, 5);
     }
   });
+
+  test("tiny resized cards (10x10 and 2x2) keep all rendered primitives and badge hit-testing strictly inside card bounds", () => {
+    for (const [w, h] of [[10, 10], [2, 2], [28, 20]]) {
+      const card = buildLinkCard("https://github.com/acme/plenary/pull/30", { x: 100, y: 200, width: w, height: h });
+      const doc = new Doc({ elements: [card] });
+      const items = paintScene(doc, { x: 0, y: 0, scale: 1 }, LIGHT, { allText: true });
+      expect(items.length).toBeGreaterThan(0);
+      for (const it of items) {
+        if (it.t === "path") {
+          for (const c of it.cmds) {
+            for (let i = 1; i + 1 < c.length; i += 2) {
+              expect(c[i]).toBeGreaterThanOrEqual(100 - 1e-6);
+              expect(c[i]).toBeLessThanOrEqual(100 + w + 1e-6);
+              expect(c[i + 1]).toBeGreaterThanOrEqual(200 - 1e-6);
+              expect(c[i + 1]).toBeLessThanOrEqual(200 + h + 1e-6);
+            }
+          }
+        } else if (it.t === "text") {
+          expect(it.x).toBeGreaterThanOrEqual(100 - 1e-6);
+          expect(it.x).toBeLessThanOrEqual(100 + w + 1e-6);
+          expect(it.y).toBeGreaterThanOrEqual(200 - 1e-6);
+          expect(it.y).toBeLessThanOrEqual(200 + h + 1e-6);
+        }
+      }
+      // Badge hit-test is disabled on tiny cards so it never overflows outside card bounds
+      expect(linkCardOpenBadgeRect(card)).toBeNull();
+      expect(isPointInLinkCardOpenAction(card, { x: 100 + w / 2, y: 200 + h / 2 })).toBe(false);
+      expect(isPointInLinkCardOpenAction(card, { x: 95, y: 195 })).toBe(false);
+    }
+
+    // For a card just large enough to show the badge, badge rect and hit-test stay strictly within bounds
+    const small = buildLinkCard("https://linear.app/plenary/issue/ENG-1/small", { x: 50, y: 60, width: 48, height: 32 });
+    const badge = linkCardOpenBadgeRect(small);
+    expect(badge).not.toBeNull();
+    expect(badge.x).toBeGreaterThanOrEqual(50);
+    expect(badge.x + badge.w).toBeLessThanOrEqual(50 + 48);
+    expect(badge.y).toBeGreaterThanOrEqual(60);
+    expect(badge.y + badge.h).toBeLessThanOrEqual(60 + 32);
+    expect(isPointInLinkCardOpenAction(small, { x: badge.x + badge.w / 2, y: badge.y + badge.h / 2 })).toBe(true);
+    // Point outside the card's right edge must not trigger even with hit padding
+    expect(isPointInLinkCardOpenAction(small, { x: 50 + 48 + 2, y: badge.y + badge.h / 2 })).toBe(false);
+  });
 });
 
 describe("Editor paste, cursor & click-to-open", () => {

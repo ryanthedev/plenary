@@ -548,8 +548,8 @@ function paintLinkCard(el, card, Q, QNoRot, view, theme, out, { opacity, progres
     out.push({ t: "path", id: el.id + ":glow", cmds: cardPolyCmds(el, cardPts, Q, true), stroke: theme.accent, width: Math.max(1, s) + 8 * s * glow, dash: null, opacity: opacity * 0.28 * glow });
   }
 
-  // Subtle drop shadow
-  if (progress >= 1) {
+  // Subtle drop shadow (omitted on very small resized cards to stay strictly inside card bounds)
+  if (progress >= 1 && b.w >= 40 && b.h >= 32) {
     const shPts = cardRoundRectPts(b.x, b.y + 2, b.w, b.h, radius, 4);
     out.push({ t: "path", id: el.id + ":shadow", cmds: cardPolyCmds(el, shPts, Q), fill: shadow, opacity });
   }
@@ -557,38 +557,48 @@ function paintLinkCard(el, card, Q, QNoRot, view, theme, out, { opacity, progres
   // Card surface
   out.push({ t: "path", id: el.id, cmds: cardPolyCmds(el, cardPts, Q), fill: surface, opacity });
 
-  // Left provider accent stripe (crisp 4px vertical bar inset inside left curve)
-  const barW = Math.min(4, b.w * 0.04);
+  // Left provider accent stripe (inset strictly within card bounds)
+  const barInsetX = Math.min(1, b.w * 0.15);
+  const barW = Math.min(4, Math.max(0, b.w - barInsetX * 2) * 0.08);
   const barInsetY = Math.min(radius * 0.45, b.h * 0.12);
-  const barPts = cardRoundRectPts(b.x + 1, b.y + barInsetY, barW, Math.max(4, b.h - barInsetY * 2), barW / 2, 3);
-  out.push({ t: "path", id: el.id + ":accent", cmds: cardPolyCmds(el, barPts, Q), fill: accent, opacity });
+  const barH = b.h - barInsetY * 2;
+  const hasBar = barW >= 1 && barH >= 2 && b.x + barInsetX + barW <= b.x + b.w;
+  if (hasBar) {
+    const barPts = cardRoundRectPts(b.x + barInsetX, b.y + barInsetY, barW, barH, barW / 2, 3);
+    out.push({ t: "path", id: el.id + ":accent", cmds: cardPolyCmds(el, barPts, Q), fill: accent, opacity });
+  }
 
   // Card border
   out.push({ t: "path", id: el.id + ":border", cmds: cardPolyCmds(el, cardPts, Q, true), stroke: border, width: Math.max(0.75, 1 * s), dash: null, opacity });
 
-  // Layout metrics in local scene coords
+  // Layout metrics in local scene coords — hide inner details gracefully when card is too small
   const padX = Math.min(14, b.w * 0.06);
   const padY = Math.min(12, b.h * 0.12);
-  const contentX = b.x + padX + barW + 4;
+  const contentX = b.x + padX + (hasBar ? barW + 4 : 0);
   const openRect = linkCardOpenBadgeRect(el);
-  const contentRight = openRect.x - 8;
-  const contentW = Math.max(20, contentRight - contentX);
+  const contentRight = openRect ? openRect.x - 8 : b.x + b.w - padX;
+  const contentW = Math.max(0, contentRight - contentX);
 
-  // Provider icon badge (top-left)
-  const iconSize = Math.min(22, Math.max(14, b.h * 0.21));
+  // External-link (`↗`) action button (top-right, only when it fits cleanly inside card bounds)
+  if (openRect) {
+    const openPts = cardRoundRectPts(openRect.x, openRect.y, openRect.w, openRect.h, Math.min(6, openRect.w * 0.25), 3);
+    out.push({ t: "path", id: el.id + ":openbg", cmds: cardPolyCmds(el, openPts, Q), fill: openBg, opacity });
+    const ox = openRect.x, oy = openRect.y, ow = openRect.w, oh = openRect.h;
+    const arrowSw = Math.max(1, 1.5 * s);
+    out.push({ t: "path", id: el.id + ":open", cmds: cardPolyCmds(el, [[ox + ow * 0.32, oy + oh * 0.68], [ox + ow * 0.68, oy + oh * 0.32]], Q), stroke: openFg, width: arrowSw, dash: null, opacity });
+    out.push({ t: "path", id: el.id + ":open", cmds: cardPolyCmds(el, [[ox + ow * 0.42, oy + oh * 0.32], [ox + ow * 0.68, oy + oh * 0.32], [ox + ow * 0.68, oy + oh * 0.58]], Q), stroke: openFg, width: arrowSw, dash: null, opacity });
+  }
+
+  // Provider icon badge (top-left, clamped to available inner box and hidden when too tiny)
+  const availIconH = Math.max(0, b.h - padY * 2);
+  const iconSize = Math.min(22, Math.max(10, b.h * 0.21), availIconH, contentW);
   const iconX = contentX;
   const iconY = b.y + padY;
+  if (iconSize < 10 || iconX + iconSize > contentRight || iconY + iconSize > b.y + b.h - padY) return;
+
   const iconPts = cardRoundRectPts(iconX, iconY, iconSize, iconSize, Math.min(6, iconSize * 0.27), 3);
   out.push({ t: "path", id: el.id + ":badge", cmds: cardPolyCmds(el, iconPts, Q), fill: badgeBg, opacity });
   paintProviderEmblem(el, card.provider, iconX, iconY, iconSize, meta.badgeFg, Q, s, out, opacity);
-
-  // External-link (`↗`) action button (top-right)
-  const openPts = cardRoundRectPts(openRect.x, openRect.y, openRect.w, openRect.h, Math.min(6, openRect.w * 0.25), 3);
-  out.push({ t: "path", id: el.id + ":openbg", cmds: cardPolyCmds(el, openPts, Q), fill: openBg, opacity });
-  const ox = openRect.x, oy = openRect.y, ow = openRect.w, oh = openRect.h;
-  const arrowSw = Math.max(1, 1.5 * s);
-  out.push({ t: "path", id: el.id + ":open", cmds: cardPolyCmds(el, [[ox + ow * 0.32, oy + oh * 0.68], [ox + ow * 0.68, oy + oh * 0.32]], Q), stroke: openFg, width: arrowSw, dash: null, opacity });
-  out.push({ t: "path", id: el.id + ":open", cmds: cardPolyCmds(el, [[ox + ow * 0.42, oy + oh * 0.32], [ox + ow * 0.68, oy + oh * 0.32], [ox + ow * 0.68, oy + oh * 0.58]], Q), stroke: openFg, width: arrowSw, dash: null, opacity });
 
   // Rotation center for text items
   const [cx, cy] = QNoRot(b.x + b.w / 2, b.y + b.h / 2);
@@ -598,13 +608,13 @@ function paintLinkCard(el, card, Q, QNoRot, view, theme, out, { opacity, progres
   const pillFontSize = Math.min(11, Math.max(8, b.h * 0.105));
   const pillLabel = card.provider === "github" ? `${card.kind} ${card.shortKey}` : card.shortKey;
   const pillPadX = 6;
-  const pillH = Math.min(20, Math.max(14, iconSize - 2));
+  const pillH = Math.min(20, iconSize, Math.max(12, iconSize - 2));
   const pillTextW = textWidth(pillLabel, pillFontSize, FONT_FAMILY.mono);
-  const pillW = Math.min(contentW - iconSize - 8, pillTextW + pillPadX * 2);
   const pillX = iconX + iconSize + 8;
+  const pillW = Math.min(Math.max(0, contentRight - pillX), pillTextW + pillPadX * 2);
   const pillY = iconY + (iconSize - pillH) / 2;
 
-  if (pillW >= 24) {
+  if (pillW >= 24 && pillX + pillW <= contentRight && pillY >= b.y && pillY + pillH <= b.y + b.h) {
     const pillPts = cardRoundRectPts(pillX, pillY, pillW, pillH, Math.min(5, pillH / 2), 3);
     out.push({ t: "path", id: el.id + ":pill", cmds: cardPolyCmds(el, pillPts, Q), fill: pillBg, opacity });
     if (allText || pillFontSize * s * aScale >= TEXT_MIN) {
@@ -622,9 +632,10 @@ function paintLinkCard(el, card, Q, QNoRot, view, theme, out, { opacity, progres
   const subFontSize = Math.min(11.5, Math.max(8, b.h * 0.11));
   const subX = pillX + pillW + 7;
   const subMaxW = contentRight - subX;
-  if (subMaxW >= 28 && (allText || subFontSize * s * aScale >= TEXT_MIN)) {
+  const subY = iconY + (iconSize - subFontSize * 1.2) / 2;
+  if (subMaxW >= 28 && subY >= b.y && subY + subFontSize * 1.2 <= b.y + b.h && (allText || subFontSize * s * aScale >= TEXT_MIN)) {
     const subText = fitCardText(card.subtitle, subMaxW, subFontSize, FONT_FAMILY.sans);
-    const [sx0, sy0] = QNoRot(subX, iconY + (iconSize - subFontSize * 1.2) / 2);
+    const [sx0, sy0] = QNoRot(subX, subY);
     out.push({
       t: "text", id: el.id + ":sub", font: "sans", angle, cx, cy,
       x: sx0, y: sy0, text: subText, size: subFontSize * s * aScale,
@@ -635,8 +646,8 @@ function paintLinkCard(el, card, Q, QNoRot, view, theme, out, { opacity, progres
   // Main title line
   const titleFontSize = Math.min(14.5, Math.max(10, b.h * 0.135));
   const titleY = iconY + iconSize + Math.min(12, b.h * 0.10);
-  const fullContentW = Math.max(24, b.x + b.w - padX - contentX);
-  if (titleY + titleFontSize < b.y + b.h - 6 && (allText || titleFontSize * s * aScale >= TEXT_MIN)) {
+  const fullContentW = Math.max(0, b.x + b.w - padX - contentX);
+  if (fullContentW >= 24 && titleY + titleFontSize * 1.25 <= b.y + b.h - padY * 0.5 && (allText || titleFontSize * s * aScale >= TEXT_MIN)) {
     const titleText = fitCardText(card.title, fullContentW, titleFontSize, FONT_FAMILY.sans);
     const [tx0, ty0] = QNoRot(contentX, titleY);
     out.push({
@@ -649,7 +660,7 @@ function paintLinkCard(el, card, Q, QNoRot, view, theme, out, { opacity, progres
   // Footer display URL line (when card height has room)
   const urlFontSize = Math.min(10.5, Math.max(8, b.h * 0.095));
   const urlY = titleY + titleFontSize * 1.45;
-  if (urlY + urlFontSize * 1.1 <= b.y + b.h - padY * 0.5 && (allText || urlFontSize * s * aScale >= TEXT_MIN)) {
+  if (fullContentW >= 24 && urlY + urlFontSize * 1.2 <= b.y + b.h - padY * 0.5 && (allText || urlFontSize * s * aScale >= TEXT_MIN)) {
     const urlText = fitCardText(card.displayUrl, fullContentW, urlFontSize, FONT_FAMILY.mono);
     const [ux0, uy0] = QNoRot(contentX, urlY);
     out.push({

@@ -308,7 +308,8 @@ export function parseLinkCardFromElement(el) {
 export const isLinkCard = el => parseLinkCardFromElement(el) !== null;
 
 /**
- * Local (unrotated) hit rectangle for the top-right open-link (`↗`) badge on a rich link card.
+ * Local (unrotated) hit rectangle for the top-right open-link (`↗`) badge on a rich link card,
+ * or `null` when the card is too small to display the badge inside its bounds.
  * Shared by `render.js` (drawing) and `editor.js` / `app.js` (hit-testing & pointer cursor).
  */
 export function linkCardOpenBadgeRect(el) {
@@ -316,14 +317,19 @@ export function linkCardOpenBadgeRect(el) {
   const y = Math.min(el.y, el.y + el.height);
   const w = Math.abs(el.width);
   const h = Math.abs(el.height);
-  const size = Math.min(LINK_CARD_OPEN_BADGE_SIZE, Math.max(16, Math.min(w, h) * 0.28));
-  const pad = Math.min(LINK_CARD_OPEN_BADGE_PAD, Math.max(6, Math.min(w, h) * 0.12));
+  if (w < 32 || h < 24) return null;
+  const pad = Math.min(LINK_CARD_OPEN_BADGE_PAD, Math.max(2, Math.min(w, h) * 0.12));
+  const maxSize = Math.min(w - pad * 2, h - pad * 2);
+  if (maxSize < 12) return null;
+  const size = Math.min(LINK_CARD_OPEN_BADGE_SIZE, maxSize, Math.max(12, Math.min(w, h) * 0.28));
   return { x: x + w - pad - size, y: y + pad, w: size, h: size };
 }
 
 /** Test whether a scene point `p` (accounting for element rotation) hits the card's `↗` open badge. */
 export function isPointInLinkCardOpenAction(el, p, pad = 4) {
   if (!isLinkCard(el) || !p) return false;
+  const r = linkCardOpenBadgeRect(el);
+  if (!r) return false;
   const x = Math.min(el.x, el.x + el.width);
   const y = Math.min(el.y, el.y + el.height);
   const w = Math.abs(el.width);
@@ -337,6 +343,6 @@ export function isPointInLinkCardOpenAction(el, p, pad = 4) {
     lx = cx + dx * c - dy * s;
     ly = cy + dx * s + dy * c;
   }
-  const r = linkCardOpenBadgeRect(el);
+  if (lx < x || lx > x + w || ly < y || ly > y + h) return false;
   return lx >= r.x - pad && lx <= r.x + r.w + pad && ly >= r.y - pad && ly <= r.y + r.h + pad;
 }

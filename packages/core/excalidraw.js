@@ -22,6 +22,15 @@ export const EXCALIDRAW_SOURCE = "https://plenary.app";
 export const EXCALIDRAW_TYPES = new Set([
   "rectangle", "diamond", "ellipse", "line", "arrow", "freedraw", "text", "frame", "image",
 ]);
+export const TEXT_CONTAINERS = new Set(["rectangle", "diamond", "ellipse", "arrow", "line"]);
+export const BINDABLE_TARGETS = new Set(["rectangle", "diamond", "ellipse", "frame", "image", "video"]);
+export const MAX_EXCALIDRAW_INPUT_BYTES = 50 * 1024 * 1024;
+export const MAX_EXCALIDRAW_ELEMENTS = 20_000;
+export const MAX_EXCALIDRAW_POINTS_PER_EL = 50_000;
+export const MAX_EXCALIDRAW_TOTAL_POINTS = 250_000;
+export const MAX_EXCALIDRAW_FILE_BYTES = 10 * 1024 * 1024;
+export const MAX_EXCALIDRAW_TOTAL_FILE_BYTES = 40 * 1024 * 1024;
+
 const CLIPBOARD_TYPES = new Set([...EXCALIDRAW_TYPES, "video"]);
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -36,7 +45,8 @@ const ARROWHEADS = new Set([
 ]);
 const IMAGE_STATUSES = new Set(["saved", "pending", "error"]);
 const VIDEO_MIMES = new Set(["video/mp4", "video/webm", "video/quicktime"]);
-const IMAGE_DATA_URL_RE = /^data:(image\/(?:png|jpeg|gif|webp|svg\+xml));base64,([A-Za-z0-9+/=\s]+)$/;
+// Safe raster image MIME types only (matches Plenary blob upload & imageCache; rejects image/svg+xml).
+const IMAGE_DATA_URL_RE = /^data:(image\/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/=\s]+)$/;
 const HEX_COLOR_RE = /^#(?:[0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
 const SHA1_RE = /^[0-9a-f]{40}$/;
 
@@ -44,7 +54,7 @@ const MAX_COORD = 1e7;
 const MAX_DIM = 1e6;
 const MAX_ID_LEN = 64;
 const MAX_GROUP_IDS = 32;
-const MAX_POINTS = 50_000;
+const MAX_POINTS = MAX_EXCALIDRAW_POINTS_PER_EL;
 const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 const own = (o, k) => o != null && typeof o === "object" && Object.prototype.hasOwnProperty.call(o, k);
@@ -190,9 +200,11 @@ export function fractionalIndex(i) {
 }
 
 /**
- * Reconciles bidirectional `boundElements` across an element array in place (on clones).
- * Ensures every bound text (`containerId`) and bound arrow/line (`startBinding`/`endBinding`)
- * is listed in its container's `boundElements`, and removes dangling references.
+ * Reconciles bidirectional `boundElements`, `containerId`, `startBinding`/`endBinding`, and `frameId`
+ * across an element array in place. Validates target types strictly:
+ *   - `text.containerId` may only point to `TEXT_CONTAINERS` (rectangle, diamond, ellipse, arrow, line)
+ *   - `startBinding`/`endBinding` may only point to `BINDABLE_TARGETS` (rectangle, diamond, ellipse, frame, image, video)
+ *   - `frameId` may only point to an element with `type === "frame"` (never itself)
  */
 export function reconcileBoundElements(elements) {
   const byId = new Map();
@@ -208,36 +220,52 @@ export function reconcileBoundElements(elements) {
     if (!m.has(childId)) m.set(childId, type);
   };
 
-  // Preserve valid existing boundElements order first.
+  // Validate frameId, containerId, and arrow/line bindings against compatible target types first.
+  for (const el of elements) {
+    if (!el || el.isDeleted) continue;
+    if (el.frameId) {
+      const f = byId.get(el.frameId);
+      if (!f || f.type !== "frame" || f.id === el.id) el.frameId = null;
+    }
+    if (el.type === "text" && el.containerId) {
+      const host = byId.get(el.containerId);
+      if (!host || host.id === el.id || !TEXT_CONTAINERS.has(host.type)) el.containerId = null;
+    }
+    if (el.type === "arrow" || el.type === "line") {
+      if (el.startBinding?.elementId) {
+        const target = byId.get(el.startBinding.elementId);
+        if (!target || target.id === el.id || !BINDABLE_TARGETS.has(target.type)) el.startBinding = null;
+      }
+      if (el.endBinding?.elementId) {
+        const target = byId.get(el.endBinding.elementId);
+        if (!target || target.id === el.id || !BINDABLE_TARGETS.has(target.type)) el.endBinding = null;
+      }
+    }
+  }
+
+  // Preserve valid existing boundElements order first (only if inverse reference is also valid).
   for (const el of elements) {
     if (!el || el.isDeleted || !Array.isArray(el.boundElements)) continue;
     for (const b of el.boundElements) {
       if (!isPlainObj(b)) continue;
       const target = byId.get(b.id);
-      if (!target) continue;
-      const t = b.type === "text" || target.type === "text"
-        ? "text"
-        : (target.type === "arrow" || target.type === "line" ? target.type : null);
-      if (t) addRef(el.id, target.id, t);
+      if (!target || target.id === el.id) continue;
+      if (target.type === "text" && TEXT_CONTAINERS.has(el.type) && target.containerId === el.id) {
+        addRef(el.id, target.id, "text");
+      } else if ((target.type === "arrow" || target.type === "line") && BINDABLE_TARGETS.has(el.type) &&
+        (target.startBinding?.elementId === el.id || target.endBinding?.elementId === el.id)) {
+        addRef(el.id, target.id, target.type);
+      }
     }
   }
 
-  // Add missing inverse references from text.containerId and arrow/line bindings.
+  // Add any missing inverse references from validated text.containerId and arrow/line bindings.
   for (const el of elements) {
     if (!el || el.isDeleted) continue;
-    if (el.type === "text" && el.containerId) {
-      if (byId.has(el.containerId)) addRef(el.containerId, el.id, "text");
-      else el.containerId = null;
-    }
+    if (el.type === "text" && el.containerId) addRef(el.containerId, el.id, "text");
     if (el.type === "arrow" || el.type === "line") {
-      if (el.startBinding?.elementId) {
-        if (byId.has(el.startBinding.elementId)) addRef(el.startBinding.elementId, el.id, el.type);
-        else el.startBinding = null;
-      }
-      if (el.endBinding?.elementId) {
-        if (byId.has(el.endBinding.elementId)) addRef(el.endBinding.elementId, el.id, el.type);
-        else el.endBinding = null;
-      }
+      if (el.startBinding?.elementId) addRef(el.startBinding.elementId, el.id, el.type);
+      if (el.endBinding?.elementId) addRef(el.endBinding.elementId, el.id, el.type);
     }
   }
 
@@ -250,11 +278,12 @@ export function reconcileBoundElements(elements) {
 }
 
 /** True if `input` (JSON string or object) looks like an Excalidraw file or clipboard payload. */
-export function isExcalidrawPayload(input) {
+export function isExcalidrawPayload(input, { maxInputBytes = MAX_EXCALIDRAW_INPUT_BYTES } = {}) {
   let data = input;
   if (typeof input === "string") {
+    if (input.length > maxInputBytes) return false;
     const trimmed = input.trim();
-    if (!trimmed.startsWith("{")) return false;
+    if (!trimmed.startsWith("{") || !trimmed.includes('"excalidraw')) return false;
     try { data = JSON.parse(trimmed); } catch { return false; }
   }
   if (!isPlainObj(data)) return false;
@@ -392,45 +421,69 @@ function sanitizeElement(raw, { allowVideo = false, now = Date.now() } = {}) {
   return normalize(el);
 }
 
-function sanitizeFiles(rawFiles, elements, { allowVideo = false, now = Date.now() } = {}) {
+function sanitizeFiles(rawFiles, elements, {
+  allowVideo = false,
+  now = Date.now(),
+  maxFileBytes = MAX_EXCALIDRAW_FILE_BYTES,
+  maxTotalFileBytes = MAX_EXCALIDRAW_TOTAL_FILE_BYTES,
+} = {}) {
   const out = {};
-  if (!isPlainObj(rawFiles)) return out;
+  const rejectedIds = new Set();
+  if (!isPlainObj(rawFiles)) return { files: out, rejectedIds };
   const usedImageIds = new Set();
   const usedVideoIds = new Set();
   for (const el of elements) {
     if (el.type === "image" && el.fileId) usedImageIds.add(el.fileId);
     else if (allowVideo && el.type === "video" && el.fileId) usedVideoIds.add(el.fileId);
   }
+  let totalBytes = 0;
   for (const k of Object.keys(rawFiles)) {
     if (FORBIDDEN_KEYS.has(k)) continue;
     const f = rawFiles[k];
-    if (!isPlainObj(f)) continue;
-    const id = safeId(k) ?? safeId(f.id);
+    const id = safeId(k) ?? (isPlainObj(f) ? safeId(f.id) : null);
     if (!id) continue;
+    if (!isPlainObj(f)) { rejectedIds.add(id); continue; }
     if (usedVideoIds.has(id) && !usedImageIds.has(id)) {
       out[id] = { id, mimeType: VIDEO_MIMES.has(f.mimeType) ? f.mimeType : "video/mp4" };
       continue;
     }
-    if (typeof f.dataURL !== "string") continue;
+    if (typeof f.dataURL !== "string") { rejectedIds.add(id); continue; }
     const m = IMAGE_DATA_URL_RE.exec(f.dataURL.trim());
-    if (!m) continue;
+    if (!m) { rejectedIds.add(id); continue; }
     const mimeType = m[1];
     const cleanB64 = m[2].replace(/\s+/g, "");
+    const approxBytes = Math.floor(cleanB64.length * 3 / 4);
+    if (!approxBytes || approxBytes > maxFileBytes || totalBytes + approxBytes > maxTotalFileBytes) {
+      rejectedIds.add(id);
+      continue;
+    }
+    totalBytes += approxBytes;
     const dataURL = `data:${mimeType};base64,${cleanB64}`;
     const created = finiteInt(f.created, now, 0, Number.MAX_SAFE_INTEGER);
     const lastRetrieved = finiteInt(f.lastRetrieved, created, 0, Number.MAX_SAFE_INTEGER);
     out[id] = { id, mimeType, dataURL, created, lastRetrieved };
   }
-  return out;
+  return { files: out, rejectedIds };
 }
 
 /**
  * Parses and sanitizes an Excalidraw v2 file (`type: "excalidraw"`) or clipboard payload
  * (`type: "excalidraw/clipboard"`). Never throws on malformed input.
  */
-export function parseExcalidraw(input, { allowVideo, now = Date.now() } = {}) {
+export function parseExcalidraw(input, {
+  allowVideo,
+  now = Date.now(),
+  maxInputBytes = MAX_EXCALIDRAW_INPUT_BYTES,
+  maxElements = MAX_EXCALIDRAW_ELEMENTS,
+  maxTotalPoints = MAX_EXCALIDRAW_TOTAL_POINTS,
+  maxFileBytes = MAX_EXCALIDRAW_FILE_BYTES,
+  maxTotalFileBytes = MAX_EXCALIDRAW_TOTAL_FILE_BYTES,
+} = {}) {
   let data = input;
   if (typeof input === "string") {
+    if (input.length > maxInputBytes) {
+      return { ok: false, error: `Payload exceeds ${maxInputBytes} byte limit`, elements: [], files: {}, appState: {}, skipped: 0 };
+    }
     try { data = JSON.parse(input); }
     catch { return { ok: false, error: "Invalid JSON", elements: [], files: {}, appState: {}, skipped: 0 }; }
   }
@@ -443,30 +496,47 @@ export function parseExcalidraw(input, { allowVideo, now = Date.now() } = {}) {
   if (!Array.isArray(data.elements)) {
     return { ok: false, error: "Missing elements array", elements: [], files: {}, appState: {}, skipped: 0 };
   }
+  if (data.elements.length > maxElements) {
+    return { ok: false, error: `Element count exceeds ${maxElements} limit`, elements: [], files: {}, appState: {}, skipped: 0 };
+  }
 
   const videoOk = allowVideo ?? (data.type === "excalidraw/clipboard");
-  const elements = [];
+  let elements = [];
   const seenIds = new Set();
   let skipped = 0;
+  let totalPoints = 0;
 
   for (const raw of data.elements) {
     const el = sanitizeElement(raw, { allowVideo: videoOk, now });
     if (!el) { skipped++; continue; }
+    if (Array.isArray(el.points)) {
+      totalPoints += el.points.length;
+      if (totalPoints > maxTotalPoints) {
+        return { ok: false, error: `Aggregate point count exceeds ${maxTotalPoints} limit`, elements: [], files: {}, appState: {}, skipped: 0 };
+      }
+    }
     // Deduplicate colliding IDs within the same payload cleanly.
     if (seenIds.has(el.id)) el.id = newId();
     seenIds.add(el.id);
     elements.push(el);
   }
 
-  // Drop dangling frameId references that don't point to a frame in this payload.
-  const frameIds = new Set(elements.filter(e => e.type === "frame").map(e => e.id));
-  for (const el of elements) {
-    if (el.frameId && !frameIds.has(el.frameId)) el.frameId = null;
+  const { files, rejectedIds } = sanitizeFiles(data.files, elements, {
+    allowVideo: videoOk, now, maxFileBytes, maxTotalFileBytes,
+  });
+
+  // Drop image elements whose embedded file was explicitly rejected (e.g. image/svg+xml or oversize).
+  if (rejectedIds.size) {
+    const kept = [];
+    for (const el of elements) {
+      if (el.type === "image" && el.fileId && rejectedIds.has(el.fileId)) { skipped++; continue; }
+      kept.push(el);
+    }
+    elements = kept;
   }
 
   reconcileBoundElements(elements);
 
-  const files = sanitizeFiles(data.files, elements, { allowVideo: videoOk, now });
   const rawApp = isPlainObj(data.appState) ? data.appState : {};
   const appState = {
     viewBackgroundColor: typeof rawApp.viewBackgroundColor === "string" && HEX_COLOR_RE.test(rawApp.viewBackgroundColor.trim())
@@ -564,6 +634,7 @@ export function remapExcalidrawIds(elements, files = {}, { fileIdMap = null, lay
     if (!isPlainObj(f)) continue;
     const mapped = lookupFile(k);
     if (!mapped || FORBIDDEN_KEYS.has(mapped)) continue;
+    if (dropNonSha1 && !SHA1_RE.test(mapped)) continue;
     remappedFiles[mapped] = { ...f, id: mapped };
   }
 

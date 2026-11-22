@@ -1304,7 +1304,7 @@ export class Editor {
     if (typeof text === "string") {
       const ex = parseExcalidraw(text, { now: this.clock() });
       if (ex.ok) {
-        if (ex.elements.length) this.insertElements(ex.elements, ex.files, at);
+        if (ex.elements.length) this.insertElements(ex.elements, ex.files, at, { dropNonSha1: true });
         return;
       }
     }
@@ -1313,12 +1313,12 @@ export class Editor {
       if (text && typeof text === "string") { const c = at ?? this.toWorld({ x: this.size.w / 2, y: this.size.h / 2 }); this.beginText(null, c); this.text.value = text; this.commitText(); }
       return;
     }
-    this.insertElements(data.elements, data.files, at);
+    this.insertElements(data.elements, data.files, at, { dropNonSha1: true });
   }
 
   // Import a parsed or raw Excalidraw v2 scene / clipboard payload into the board, centered at `at`,
   // bringing it into view when `fitIfNeeded` is set. Returns the inserted element ids.
-  importExcalidraw(input, at, { fileIdMap = null, fitIfNeeded = true, dropNonSha1 = false } = {}) {
+  importExcalidraw(input, at, { fileIdMap = null, fitIfNeeded = true, dropNonSha1 = true } = {}) {
     const parsed = typeof input === "string" || !input?.ok ? parseExcalidraw(input, { now: this.clock() }) : input;
     if (!parsed.ok || !parsed.elements.length) return [];
     const ids = this.insertElements(parsed.elements, parsed.files, at, { fileIdMap, dropNonSha1 });

@@ -9,7 +9,7 @@ import { parsePanel, serializePanel, applyPanel, panelLayout, dragWidth } from "
 import { isMermaid } from "../../../packages/core/mermaid.js";
 import { isLabel } from "../../../packages/core/model.js";
 import { parseLibrary } from "../../../packages/core/library.js";
-import { parseExcalidraw, isExcalidrawPayload } from "../../../packages/core/excalidraw.js";
+import { parseExcalidraw, MAX_EXCALIDRAW_INPUT_BYTES } from "../../../packages/core/excalidraw.js";
 import { paint, imageCache, THEMES, color as safeColor, cappedDpr } from "./paint.js";
 import { toolsFor, pillFor, pillTitleFor, connectionBanner, expiryNotice, shouldProbe, RESUME_PROBE_MS } from "../../core/roles.js";
 
@@ -540,9 +540,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     }
     return { fileIdMap, files: outFiles };
   }
-  async function importExcalidrawText(text, { at, label = null, fitIfNeeded = false, silent = false } = {}) {
+  async function importExcalidrawParsed(parsed, { at, label = null, fitIfNeeded = false, silent = false } = {}) {
     if (!S.may()) return false;
-    const parsed = parseExcalidraw(text, { now: clock.now() });
     if (!parsed.ok) {
       if (!silent) toast("That isn't a valid .excalidraw file");
       return false;
@@ -573,11 +572,12 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     return ids.length > 0;
   }
   function pasteText(text, at) {
-    if (isExcalidrawPayload(text)) {
+    // Cheap string pre-check avoids double-parsing JSON on clipboard paste.
+    if (typeof text === "string" && text.length <= MAX_EXCALIDRAW_INPUT_BYTES && text.trimStart().startsWith("{") && text.includes('"excalidraw')) {
       const parsed = parseExcalidraw(text, { now: clock.now() });
       if (parsed.ok) {
         const hasImageData = Object.values(parsed.files).some(f => typeof f?.dataURL === "string");
-        if (hasImageData) return importExcalidrawText(text, { at, fitIfNeeded: false, silent: true });
+        if (hasImageData) return importExcalidrawParsed(parsed, { at, fitIfNeeded: false, silent: true });
         if (parsed.elements.length) {
           const stream = S.role === "presenter" ? S.active : "notes";
           S.act(stream, ed => ed.importExcalidraw(parsed, at, { fitIfNeeded: false, dropNonSha1: true }));
@@ -593,9 +593,11 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   }
   async function addExcalidrawFile(file, at) {
     if (!S.may()) return;
+    if (file.size > MAX_EXCALIDRAW_INPUT_BYTES) return toast("That .excalidraw file is too large (max 50 MB)");
     try {
       const text = await file.text();
-      await importExcalidrawText(text, { at, label: file.name || "Excalidraw", fitIfNeeded: !at, silent: false });
+      const parsed = parseExcalidraw(text, { now: clock.now() });
+      await importExcalidrawParsed(parsed, { at, label: file.name || "Excalidraw", fitIfNeeded: !at, silent: false });
     } catch {
       toast("That isn't a valid .excalidraw file");
     }

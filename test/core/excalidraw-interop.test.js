@@ -429,8 +429,8 @@ describe("core excalidraw: malformed input safety & prototype pollution defense"
 
     const res = parseExcalidraw(hostile);
     expect(res.ok).toBe(true);
-    expect(res.skipped).toBe(4); // null, 42, del-1, unk-1
-    expect(res.elements.length).toBe(3);
+    expect(res.skipped).toBe(5); // null, 42, del-1, unk-1, bad-img (rejected evil-file)
+    expect(res.elements.length).toBe(2);
 
     // No prototype pollution occurred anywhere
     expect(({}).pollutedRoot).toBeUndefined();
@@ -454,8 +454,9 @@ describe("core excalidraw: malformed input safety & prototype pollution defense"
     expect(Math.abs(huge.x)).toBeLessThanOrEqual(1e7);
     expect(huge.width).toBeLessThanOrEqual(1e6);
 
-    // Non-image dataURL was rejected
+    // Non-image dataURL was rejected and its referencing image element dropped
     expect(res.files["evil-file"]).toBeUndefined();
+    expect(res.elements.find(e => e.id === "bad-img")).toBeUndefined();
 
     // NaN / Infinity in object input
     const nanRes = parseExcalidraw({
@@ -464,5 +465,126 @@ describe("core excalidraw: malformed input safety & prototype pollution defense"
     });
     expect(nanRes.ok).toBe(true);
     expect(nanRes.elements[0]).toMatchObject({ x: 0, y: 0, width: 0, height: 0 });
+  });
+
+  test("regression M1: Editor.paste() and Editor.importExcalidraw() never emit non-SHA-1 fileId ops", () => {
+    const ops = [];
+    const ed = new Editor({ onOp: op => ops.push(op) });
+    ed.setSize(800, 600);
+    const clip = JSON.stringify({
+      type: "excalidraw/clipboard",
+      elements: [
+        { id: "img-nonsha", type: "image", x: 10, y: 10, width: 100, height: 100, fileId: "not-a-sha1-id" },
+      ],
+      files: {
+        "not-a-sha1-id": { id: "not-a-sha1-id", mimeType: "image/png", dataURL: TINY_PNG, created: 1 },
+      },
+    });
+
+    ed.paste(clip);
+    const img = ed.doc.live().find(e => e.type === "image");
+    expect(img).toBeTruthy();
+    expect(img.fileId).toBeNull();
+    expect(ed.doc.files["not-a-sha1-id"]).toBeUndefined();
+
+    const rep = new Replica({ client: "c1", session: "s1" });
+    const elOp = ops.find(o => o.elements?.length);
+    const msg = rep.local("board", { elements: elOp.elements });
+    msg.sentAt = 0;
+    expect(opProblem(msg)).toBeNull();
+  });
+
+  test("regression M2: image/svg+xml data URLs are rejected and referencing image elements are skipped", () => {
+    const svgDataUrl = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxzY3JpcHQ+YWxlcnQoMSk8L3NjcmlwdD48L3N2Zz4=";
+    const res = parseExcalidraw({
+      type: "excalidraw",
+      version: 2,
+      elements: [
+        { id: "r1", type: "rectangle", x: 0, y: 0, width: 100, height: 50 },
+        { id: "svg-img", type: "image", x: 120, y: 0, width: 100, height: 100, fileId: "svg-file-1" },
+        { id: "png-img", type: "image", x: 240, y: 0, width: 100, height: 100, fileId: SHA1_IMG },
+      ],
+      files: {
+        "svg-file-1": { id: "svg-file-1", mimeType: "image/svg+xml", dataURL: svgDataUrl, created: 1 },
+        [SHA1_IMG]: { id: SHA1_IMG, mimeType: "image/png", dataURL: TINY_PNG, created: 1 },
+      },
+    });
+    expect(res.ok).toBe(true);
+    expect(res.files["svg-file-1"]).toBeUndefined();
+    expect(res.elements.some(e => e.id === "svg-img")).toBe(false);
+    expect(res.elements.some(e => e.id === "png-img")).toBe(true);
+    expect(res.files[SHA1_IMG].dataURL).toBe(TINY_PNG);
+    expect(res.skipped).toBe(1);
+  });
+
+  test("regression M3: malformed bindings to incompatible target types are stripped and reconciled cleanly", () => {
+    const res = parseExcalidraw({
+      type: "excalidraw",
+      version: 2,
+      elements: [
+        { id: "t1", type: "text", x: 0, y: 0, width: 80, height: 24, text: "Host?", boundElements: [{ id: "t2", type: "text" }, { id: "a1", type: "arrow" }] },
+        { id: "t2", type: "text", x: 10, y: 10, width: 60, height: 24, text: "Bad child", containerId: "t1", frameId: "t1" },
+        { id: "f1", type: "frame", x: 0, y: 0, width: 300, height: 200, name: "F", frameId: "f1" },
+        { id: "t3", type: "text", x: 20, y: 20, width: 60, height: 24, text: "Frame child", containerId: "f1", frameId: "f1" },
+        { id: "p1", type: "freedraw", x: 0, y: 0, points: [[0, 0], [10, 10]] },
+        {
+          id: "a1", type: "arrow", x: 0, y: 0, points: [[0, 0], [50, 0]],
+          startBinding: { elementId: "t1", focus: 0, gap: 6 },
+          endBinding: { elementId: "p1", focus: 0, gap: 6 },
+        },
+      ],
+    });
+    expect(res.ok).toBe(true);
+    const byId = new Map(res.elements.map(e => [e.id, e]));
+    // Text cannot contain text; frame cannot be a text container; frameId cannot point to non-frame or self
+    expect(byId.get("t2").containerId).toBeNull();
+    expect(byId.get("t2").frameId).toBeNull();
+    expect(byId.get("f1").frameId).toBeNull();
+    expect(byId.get("t3").containerId).toBeNull();
+    expect(byId.get("t3").frameId).toBe("f1");
+    // Arrow cannot bind to text or freedraw
+    expect(byId.get("a1").startBinding).toBeNull();
+    expect(byId.get("a1").endBinding).toBeNull();
+    // Invalid boundElements stripped
+    expect(byId.get("t1").boundElements).toBeNull();
+  });
+
+  test("regression M4: enforces pre-parse input size cap, element cap, aggregate points cap, and aggregate file bytes cap", () => {
+    const bigStr = JSON.stringify({ type: "excalidraw", elements: [{ id: "r1", type: "rectangle", x: 0, y: 0, width: 10, height: 10 }] });
+    expect(parseExcalidraw(bigStr, { maxInputBytes: 20 }).ok).toBe(false);
+    expect(isExcalidrawPayload(bigStr, { maxInputBytes: 20 })).toBe(false);
+
+    const manyEls = {
+      type: "excalidraw",
+      elements: Array.from({ length: 10 }, (_, i) => ({ id: `r${i}`, type: "rectangle", x: i, y: 0, width: 10, height: 10 })),
+    };
+    expect(parseExcalidraw(manyEls, { maxElements: 5 }).ok).toBe(false);
+
+    const manyPts = {
+      type: "excalidraw",
+      elements: [
+        { id: "p1", type: "freedraw", x: 0, y: 0, points: [[0, 0], [1, 1], [2, 2], [3, 3]] },
+        { id: "p2", type: "freedraw", x: 0, y: 0, points: [[0, 0], [1, 1], [2, 2], [3, 3]] },
+      ],
+    };
+    expect(parseExcalidraw(manyPts, { maxTotalPoints: 6 }).ok).toBe(false);
+
+    const bigFiles = {
+      type: "excalidraw",
+      elements: [
+        { id: "i1", type: "image", x: 0, y: 0, width: 10, height: 10, fileId: "f1" },
+        { id: "i2", type: "image", x: 20, y: 0, width: 10, height: 10, fileId: "f2" },
+      ],
+      files: {
+        f1: { id: "f1", mimeType: "image/png", dataURL: TINY_PNG },
+        f2: { id: "f2", mimeType: "image/png", dataURL: TINY_PNG },
+      },
+    };
+    // Allow 1 image (~68 bytes) but reject the 2nd under aggregate cap of 100 bytes
+    const capped = parseExcalidraw(bigFiles, { maxTotalFileBytes: 100 });
+    expect(capped.ok).toBe(true);
+    expect(Object.keys(capped.files)).toEqual(["f1"]);
+    expect(capped.elements.map(e => e.id)).toEqual(["i1"]);
+    expect(capped.skipped).toBe(1);
   });
 });

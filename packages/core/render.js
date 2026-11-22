@@ -11,7 +11,8 @@ import { bbox, resolvedPoints, drawnPoints, toWorld, angleOf, centerOf, labelAnc
 import { spatialIndex } from "./spatial.js";
 import { animState } from "./anim.js";
 import { labelLines, textWidth } from "./text.js";
-import { cornerRadius, roundPolygon, fillLines, arrowheadCmds, fontClass } from "./style.js";
+import { cornerRadius, roundPolygon, fillLines, arrowheadCmds, fontClass, FONT_FAMILY } from "./style.js";
+import { parseLinkCardFromElement, linkCardOpenBadgeRect } from "./link-card.js";
 
 /** View-independent world-space geometry cache keyed by element object (auto-GC'd on doc edits). */
 const geoCache = new WeakMap();
@@ -319,6 +320,11 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
   }
 
   if (isShape(el)) {
+    const card = el.type === "rectangle" ? parseLinkCardFromElement(el) : null;
+    if (card) {
+      paintLinkCard(el, card, Q, QNoRot, view, theme, out, { opacity, progress, aRot, aScale, glow, allText: opts.allText });
+      return;
+    }
     const pts = cachedOutline(el, opts.stats).map(p => Q(p[0], p[1]));
     if (el.type === "frame") {
       out.push({ t: "path", id: el.id, cmds: pts.map((p, i) => [i ? "L" : "M", ...p]), stroke: theme.dim, width: 1, dash: null, opacity });
@@ -434,6 +440,236 @@ const union = (a, b) => (a ? { x0: Math.min(a.x0, b.x0), y0: Math.min(a.y0, b.y0
 
 // Helpers for overlays (selection, handles, cursors, snap indicators).
 export function rectCmds(x, y, w, h) { return [["M", x, y], ["L", x + w, y], ["L", x + w, y + h], ["L", x, y + h], ["L", x, y]]; }
+
+function isDarkTheme(theme) {
+  const bg = theme?.bg;
+  if (typeof bg !== "string" || !/^#[0-9a-f]{6}/i.test(bg)) return false;
+  const r = parseInt(bg.slice(1, 3), 16) / 255;
+  const g = parseInt(bg.slice(3, 5), 16) / 255;
+  const b = parseInt(bg.slice(5, 7), 16) / 255;
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.5;
+}
+
+function fitCardText(str, maxW, fontSize, fontFamily = FONT_FAMILY.sans) {
+  const s = String(str ?? "");
+  if (!s || maxW <= 0) return "";
+  if (textWidth(s, fontSize, fontFamily) <= maxW) return s;
+  let lo = 0, hi = s.length;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (textWidth(s.slice(0, mid) + "…", fontSize, fontFamily) <= maxW) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo > 0 ? s.slice(0, lo).trimEnd() + "…" : "…";
+}
+
+function cardMapPts(el, pts, Q) {
+  const hasAngle = !!angleOf(el);
+  return pts.map(([x, y]) => {
+    const w = hasAngle ? toWorld(el, { x, y }) : { x, y };
+    return Q(w.x, w.y);
+  });
+}
+
+function cardPolyCmds(el, pts, Q, closed = false) {
+  const mapped = cardMapPts(el, pts, Q);
+  if (!mapped.length) return [];
+  const cmds = mapped.map((p, i) => [i ? "L" : "M", p[0], p[1]]);
+  if (closed && mapped.length > 2) cmds.push(["L", mapped[0][0], mapped[0][1]]);
+  return cmds;
+}
+
+function cardRoundRectPts(x, y, w, h, r, steps = 4) {
+  const rr = Math.max(0, Math.min(r, w / 2, h / 2));
+  const pts = roundPolygon([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], rr, steps);
+  return pts.slice(0, -1);
+}
+
+function cardCirclePts(cx, cy, r, steps = 14) {
+  const pts = [];
+  for (let i = 0; i < steps; i++) {
+    const t = (i / steps) * Math.PI * 2;
+    pts.push([cx + Math.cos(t) * r, cy + Math.sin(t) * r]);
+  }
+  return pts;
+}
+
+/** Crisp vector provider emblem drawn strictly with pure 2D path primitives. */
+function paintProviderEmblem(el, provider, ix, iy, size, fg, Q, s, out, opacity) {
+  const sw = Math.max(1, 1.6 * s);
+  const pt = (fx, fy) => [ix + size * fx, iy + size * fy];
+  if (provider === "github") {
+    // Crisp git PR / issue branch glyph: left vertical stem with 2 nodes + right curved branch node
+    out.push({ t: "path", id: el.id + ":ic", cmds: cardPolyCmds(el, [pt(0.32, 0.30), pt(0.32, 0.70)], Q), stroke: fg, width: sw, dash: null, opacity });
+    out.push({ t: "path", id: el.id + ":ic", cmds: cardPolyCmds(el, [pt(0.32, 0.42), pt(0.56, 0.42), pt(0.68, 0.54), pt(0.68, 0.68)], Q), stroke: fg, width: sw, dash: null, opacity });
+    for (const [fx, fy] of [[0.32, 0.28], [0.32, 0.72], [0.68, 0.72]]) {
+      const [cx, cy] = pt(fx, fy);
+      out.push({ t: "path", id: el.id + ":ic", cmds: cardPolyCmds(el, cardCirclePts(cx, cy, size * 0.10, 10), Q), fill: fg, opacity });
+    }
+    return;
+  }
+  if (provider === "linear") {
+    // Crisp Linear emblem: outer circle + three diagonal parallel stripes
+    const [cx, cy] = pt(0.5, 0.5);
+    out.push({ t: "path", id: el.id + ":ic", cmds: cardPolyCmds(el, cardCirclePts(cx, cy, size * 0.34, 16), Q, true), stroke: fg, width: sw, dash: null, opacity });
+    out.push({ t: "path", id: el.id + ":ic", cmds: cardPolyCmds(el, [pt(0.24, 0.58), pt(0.42, 0.76)], Q), stroke: fg, width: sw, dash: null, opacity });
+    out.push({ t: "path", id: el.id + ":ic", cmds: cardPolyCmds(el, [pt(0.22, 0.40), pt(0.60, 0.78)], Q), stroke: fg, width: sw, dash: null, opacity });
+    out.push({ t: "path", id: el.id + ":ic", cmds: cardPolyCmds(el, [pt(0.30, 0.28), pt(0.72, 0.70)], Q), stroke: fg, width: sw, dash: null, opacity });
+    return;
+  }
+  // Jira: crisp layered dual-chevron diamond mark
+  out.push({ t: "path", id: el.id + ":ic", cmds: cardPolyCmds(el, [pt(0.50, 0.20), pt(0.78, 0.48), pt(0.64, 0.62), pt(0.50, 0.48), pt(0.36, 0.62), pt(0.22, 0.48)], Q), fill: fg, opacity });
+  out.push({ t: "path", id: el.id + ":ic", cmds: cardPolyCmds(el, [pt(0.50, 0.54), pt(0.68, 0.72), pt(0.50, 0.84), pt(0.32, 0.72)], Q), fill: fg, opacity });
+}
+
+/** Paint a Jira, Linear, or GitHub rich link card with pure vector display-list items. */
+function paintLinkCard(el, card, Q, QNoRot, view, theme, out, { opacity, progress, aRot, aScale, glow, allText }) {
+  const b = bbox(el);
+  const s = view.scale;
+  const dark = isDarkTheme(theme);
+  const meta = card.meta;
+  const accent = dark ? meta.accentDark : meta.accent;
+  const surface = dark ? "#1C1C20" : "#FFFFFF";
+  const border = dark ? "#2E2E36" : "#E4E4E7";
+  const shadow = dark ? "#00000040" : "#00000014";
+  const titleColor = dark ? "#F4F4F5" : "#18181B";
+  const subColor = dark ? "#A1A1AA" : "#625F57";
+  const urlColor = dark ? "#71717A" : "#868E96";
+  const badgeBg = dark ? meta.badgeBgDark : meta.badgeBg;
+  const pillBg = dark ? meta.pillBgDark : meta.pillBg;
+  const pillFg = dark ? meta.pillFgDark : meta.pillFg;
+  const openBg = dark ? "#27272E" : "#F4F4F5";
+  const openFg = dark ? "#D4D4D8" : "#52525B";
+
+  const radius = Math.min(10, Math.min(b.w, b.h) * 0.18);
+  const cardPts = cardRoundRectPts(b.x, b.y, b.w, b.h, radius, 5);
+
+  if (glow > 0) {
+    out.push({ t: "path", id: el.id + ":glow", cmds: cardPolyCmds(el, cardPts, Q, true), stroke: theme.accent, width: Math.max(1, s) + 8 * s * glow, dash: null, opacity: opacity * 0.28 * glow });
+  }
+
+  // Subtle drop shadow (omitted on very small resized cards to stay strictly inside card bounds)
+  if (progress >= 1 && b.w >= 40 && b.h >= 32) {
+    const shPts = cardRoundRectPts(b.x, b.y + 2, b.w, b.h, radius, 4);
+    out.push({ t: "path", id: el.id + ":shadow", cmds: cardPolyCmds(el, shPts, Q), fill: shadow, opacity });
+  }
+
+  // Card surface
+  out.push({ t: "path", id: el.id, cmds: cardPolyCmds(el, cardPts, Q), fill: surface, opacity });
+
+  // Left provider accent stripe (inset strictly within card bounds)
+  const barInsetX = Math.min(1, b.w * 0.15);
+  const barW = Math.min(4, Math.max(0, b.w - barInsetX * 2) * 0.08);
+  const barInsetY = Math.min(radius * 0.45, b.h * 0.12);
+  const barH = b.h - barInsetY * 2;
+  const hasBar = barW >= 1 && barH >= 2 && b.x + barInsetX + barW <= b.x + b.w;
+  if (hasBar) {
+    const barPts = cardRoundRectPts(b.x + barInsetX, b.y + barInsetY, barW, barH, barW / 2, 3);
+    out.push({ t: "path", id: el.id + ":accent", cmds: cardPolyCmds(el, barPts, Q), fill: accent, opacity });
+  }
+
+  // Card border
+  out.push({ t: "path", id: el.id + ":border", cmds: cardPolyCmds(el, cardPts, Q, true), stroke: border, width: Math.max(0.75, 1 * s), dash: null, opacity });
+
+  // Layout metrics in local scene coords — hide inner details gracefully when card is too small
+  const padX = Math.min(14, b.w * 0.06);
+  const padY = Math.min(12, b.h * 0.12);
+  const contentX = b.x + padX + (hasBar ? barW + 4 : 0);
+  const openRect = linkCardOpenBadgeRect(el);
+  const contentRight = openRect ? openRect.x - 8 : b.x + b.w - padX;
+  const contentW = Math.max(0, contentRight - contentX);
+
+  // External-link (`↗`) action button (top-right, only when it fits cleanly inside card bounds)
+  if (openRect) {
+    const openPts = cardRoundRectPts(openRect.x, openRect.y, openRect.w, openRect.h, Math.min(6, openRect.w * 0.25), 3);
+    out.push({ t: "path", id: el.id + ":openbg", cmds: cardPolyCmds(el, openPts, Q), fill: openBg, opacity });
+    const ox = openRect.x, oy = openRect.y, ow = openRect.w, oh = openRect.h;
+    const arrowSw = Math.max(1, 1.5 * s);
+    out.push({ t: "path", id: el.id + ":open", cmds: cardPolyCmds(el, [[ox + ow * 0.32, oy + oh * 0.68], [ox + ow * 0.68, oy + oh * 0.32]], Q), stroke: openFg, width: arrowSw, dash: null, opacity });
+    out.push({ t: "path", id: el.id + ":open", cmds: cardPolyCmds(el, [[ox + ow * 0.42, oy + oh * 0.32], [ox + ow * 0.68, oy + oh * 0.32], [ox + ow * 0.68, oy + oh * 0.58]], Q), stroke: openFg, width: arrowSw, dash: null, opacity });
+  }
+
+  // Provider icon badge (top-left, clamped to available inner box and hidden when too tiny)
+  const availIconH = Math.max(0, b.h - padY * 2);
+  const iconSize = Math.min(22, Math.max(10, b.h * 0.21), availIconH, contentW);
+  const iconX = contentX;
+  const iconY = b.y + padY;
+  if (iconSize < 10 || iconX + iconSize > contentRight || iconY + iconSize > b.y + b.h - padY) return;
+
+  const iconPts = cardRoundRectPts(iconX, iconY, iconSize, iconSize, Math.min(6, iconSize * 0.27), 3);
+  out.push({ t: "path", id: el.id + ":badge", cmds: cardPolyCmds(el, iconPts, Q), fill: badgeBg, opacity });
+  paintProviderEmblem(el, card.provider, iconX, iconY, iconSize, meta.badgeFg, Q, s, out, opacity);
+
+  // Rotation center for text items
+  const [cx, cy] = QNoRot(b.x + b.w / 2, b.y + b.h / 2);
+  const angle = angleOf(el) + aRot;
+
+  // Header row: monospace key pill + subtitle
+  const pillFontSize = Math.min(11, Math.max(8, b.h * 0.105));
+  const pillLabel = card.provider === "github" ? `${card.kind} ${card.shortKey}` : card.shortKey;
+  const pillPadX = 6;
+  const pillH = Math.min(20, iconSize, Math.max(12, iconSize - 2));
+  const pillTextW = textWidth(pillLabel, pillFontSize, FONT_FAMILY.mono);
+  const pillX = iconX + iconSize + 8;
+  const pillW = Math.min(Math.max(0, contentRight - pillX), pillTextW + pillPadX * 2);
+  const pillY = iconY + (iconSize - pillH) / 2;
+
+  if (pillW >= 24 && pillX + pillW <= contentRight && pillY >= b.y && pillY + pillH <= b.y + b.h) {
+    const pillPts = cardRoundRectPts(pillX, pillY, pillW, pillH, Math.min(5, pillH / 2), 3);
+    out.push({ t: "path", id: el.id + ":pill", cmds: cardPolyCmds(el, pillPts, Q), fill: pillBg, opacity });
+    if (allText || pillFontSize * s * aScale >= TEXT_MIN) {
+      const [px0, py0] = QNoRot(pillX, pillY), [px1, py1] = QNoRot(pillX + pillW, pillY + pillH);
+      out.push({
+        t: "text", id: el.id + ":key", font: "mono", angle, cx, cy,
+        x: px0, y: py0, text: fitCardText(pillLabel, pillW - 6, pillFontSize, FONT_FAMILY.mono),
+        size: pillFontSize * s * aScale, color: pillFg, align: "center",
+        box: { x: px0, y: py0, w: px1 - px0, h: py1 - py0 }, lineHeight: 1.15, opacity, reveal: progress,
+      });
+    }
+  }
+
+  // Subtitle (repo / workspace / host) to the right of key pill
+  const subFontSize = Math.min(11.5, Math.max(8, b.h * 0.11));
+  const subX = pillX + pillW + 7;
+  const subMaxW = contentRight - subX;
+  const subY = iconY + (iconSize - subFontSize * 1.2) / 2;
+  if (subMaxW >= 28 && subY >= b.y && subY + subFontSize * 1.2 <= b.y + b.h && (allText || subFontSize * s * aScale >= TEXT_MIN)) {
+    const subText = fitCardText(card.subtitle, subMaxW, subFontSize, FONT_FAMILY.sans);
+    const [sx0, sy0] = QNoRot(subX, subY);
+    out.push({
+      t: "text", id: el.id + ":sub", font: "sans", angle, cx, cy,
+      x: sx0, y: sy0, text: subText, size: subFontSize * s * aScale,
+      color: subColor, align: "left", lineHeight: 1.2, opacity, reveal: progress,
+    });
+  }
+
+  // Main title line
+  const titleFontSize = Math.min(14.5, Math.max(10, b.h * 0.135));
+  const titleY = iconY + iconSize + Math.min(12, b.h * 0.10);
+  const fullContentW = Math.max(0, b.x + b.w - padX - contentX);
+  if (fullContentW >= 24 && titleY + titleFontSize * 1.25 <= b.y + b.h - padY * 0.5 && (allText || titleFontSize * s * aScale >= TEXT_MIN)) {
+    const titleText = fitCardText(card.title, fullContentW, titleFontSize, FONT_FAMILY.sans);
+    const [tx0, ty0] = QNoRot(contentX, titleY);
+    out.push({
+      t: "text", id: el.id + ":title", font: "sans", angle, cx, cy,
+      x: tx0, y: ty0, text: titleText, size: titleFontSize * s * aScale,
+      color: titleColor, align: "left", lineHeight: 1.25, opacity, reveal: progress,
+    });
+  }
+
+  // Footer display URL line (when card height has room)
+  const urlFontSize = Math.min(10.5, Math.max(8, b.h * 0.095));
+  const urlY = titleY + titleFontSize * 1.45;
+  if (fullContentW >= 24 && urlY + urlFontSize * 1.2 <= b.y + b.h - padY * 0.5 && (allText || urlFontSize * s * aScale >= TEXT_MIN)) {
+    const urlText = fitCardText(card.displayUrl, fullContentW, urlFontSize, FONT_FAMILY.mono);
+    const [ux0, uy0] = QNoRot(contentX, urlY);
+    out.push({
+      t: "text", id: el.id + ":url", font: "mono", angle, cx, cy,
+      x: ux0, y: uy0, text: urlText, size: urlFontSize * s * aScale,
+      color: urlColor, align: "left", lineHeight: 1.2, opacity, reveal: progress,
+    });
+  }
+}
 
 // Visual port / anchor snap indicators for line/arrow hover & endpoint drag preview.
 export function paintSnapIndicator(doc, snap, view, theme, out) {

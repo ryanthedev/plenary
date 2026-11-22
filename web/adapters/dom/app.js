@@ -9,6 +9,7 @@ import { Editor } from "../../../packages/core/editor.js";
 import { parsePanel, serializePanel, applyPanel, panelLayout, dragWidth } from "../../../packages/core/panel.js";
 import { isMermaid } from "../../../packages/core/mermaid.js";
 import { isLabel } from "../../../packages/core/model.js";
+import { parseLinkCardUrl, parseLinkCardFromElement, isPointInLinkCardOpenAction } from "../../../packages/core/link-card.js";
 import { parseLibrary } from "../../../packages/core/library.js";
 import { parseExcalidraw, MAX_EXCALIDRAW_INPUT_BYTES } from "../../../packages/core/excalidraw.js";
 import { paint, imageCache, THEMES, color as safeColor, cappedDpr } from "./paint.js";
@@ -240,6 +241,22 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     pressure: typeof e.pressure === "number" && Number.isFinite(e.pressure) ? e.pressure : undefined,
   });
 
+  // Strict https:// re-validation right before opening an external link card URL.
+  function openSafeLink(rawUrl) {
+    const parsed = parseLinkCardUrl(rawUrl);
+    if (!parsed) return false;
+    const opener = globalThis.window?.open ?? globalThis.open;
+    if (typeof opener === "function") opener.call(globalThis.window ?? globalThis, parsed.url, "_blank", "noopener,noreferrer");
+    return true;
+  }
+  function findLinkCardHit(p, { badgeOnly = true } = {}) {
+    for (const ed of [S.eds.notes, S.eds.board]) {
+      const hit = ed.linkCardAt(p, { badgeOnly });
+      if (hit) return hit;
+    }
+    return null;
+  }
+
   // Pointer input: core Editor owns multi-touch (pinch-zoom/pan, 2/3-finger tap undo/redo, palm rejection).
   canvas.addEventListener("pointerdown", e => {
     lastPointerTouch = e.pointerType === "touch";
@@ -248,6 +265,15 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     clicks = Math.max(e.detail || 0, countClick(e));
     if (S.tool === "image") { openPicker(); return; }
     const p = at(e);
+    if (e.button === 0 && !space && (S.tool === "select" || S.tool === "hand" || !S.may())) {
+      const badgeOnly = !(e.metaKey || e.ctrlKey) && clicks < 2;
+      const linkHit = findLinkCardHit(p, { badgeOnly });
+      if (linkHit) {
+        openSafeLink(linkHit.card.url);
+        chromeDirty = true;
+        return;
+      }
+    }
     S.pointerDown(p, pmods(e));
     if (collab && S.tool === "laser" && e.button === 0 && S.ed.pointers.size <= 1) collab.laser(worldAt(p));
   });
@@ -933,7 +959,17 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const { canUndo, canRedo } = undoRedoState();
     const ed = activeEditor();
     const sel = ed ? ed.selected().filter(e => !isLabel(e)) : [];
+    const selCard = sel.length === 1 ? parseLinkCardFromElement(sel[0]) : null;
     const selColor = sel[0]?.strokeColor ?? "#3B48E8";
+    const openCardPill = selCard
+      ? h("div.grp.link-card-pill", { "aria-label": "Link card action" },
+          h("button.btn.ghost", {
+            "data-action": "open-link",
+            title: `Open ${selCard.url}`,
+            "aria-label": `Open ${selCard.providerName} ${selCard.kind} ${selCard.key}`,
+            onclick: () => { openSafeLink(selCard.url); },
+          }, `${selCard.providerName} ${selCard.shortKey} ↗`))
+      : null;
     const selPill = isPhone() && S.role !== "viewer" && may && sel.length > 0
       ? h("div.grp.phone-only.phone-sel-pill", { "aria-label": "Selected shape actions" },
           h("button.tb", { title: "Color & Style", "aria-label": "Color", "aria-haspopup": "dialog", "data-action": "color", onclick: e => { ui.colorPicker = "strokeColor"; setSheet("panel", { opener: e?.currentTarget }); } },
@@ -944,6 +980,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
             h("span.ic", {}, icon("trash", { size: 18 }))))
       : null;
     const bl = [
+      openCardPill,
       selPill,
       h("div.grp" + (S.role === "viewer" ? ".desk-only" : ""), {}, h("button.tb", { title: "Previous frame (PgUp)", "aria-label": "Previous frame", onclick: () => S.stepFrame(-1) }, icon("chevronLeft", { size: 16 })), h("span.pct", {}, fs.length ? `${i < 0 ? "–" : i + 1} / ${fs.length}` : "0 / 0"), h("button.tb", { title: "Next frame (PgDn)", "aria-label": "Next frame", onclick: () => S.stepFrame(1) }, icon("chevronRight", { size: 16 }))),
       h("div.grp.desk-only", {},
@@ -1274,8 +1311,10 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const hudKey = () => {
     const { canUndo, canRedo } = undoRedoState();
     const ed = activeEditor();
-    const sel = isPhone() && ed ? ed.selected().filter(e => !isLabel(e)) : [];
-    return JSON.stringify([boardInfo(S.eds.board.doc).framesSig, S.eds.board.frameAt, canUndo, canRedo, sel.length, sel[0]?.strokeColor ?? ""]);
+    const sel = ed ? ed.selected().filter(e => !isLabel(e)) : [];
+    const selCardUrl = sel.length === 1 ? (parseLinkCardFromElement(sel[0])?.url ?? "") : "";
+    const phoneSel = isPhone() ? sel : [];
+    return JSON.stringify([boardInfo(S.eds.board.doc).framesSig, S.eds.board.frameAt, canUndo, canRedo, phoneSel.length, phoneSel[0]?.strokeColor ?? "", selCardUrl]);
   };
   const buildTopbar = () => {
     const root = $("#topbar"), active = document.activeElement;

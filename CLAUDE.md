@@ -35,8 +35,8 @@ nothing is registered or published yet. Do not create GitHub repos, orgs, npm pa
 - **Full canvas UI** over core's Editor (design mock approved before building) and **full collaboration**:
   annotations, cursors, avatars, selections, laser, draw, highlighter, emotes, reactions, comment threads,
   a connection status pill.
-- **drawh** gets the protocol by byte-identical copy + SOURCE.json for now; maybe a published package later
-  (nothing published until the person says so).
+- **herdr-draw sunset (2026-11-21):** herdr-draw will be sunset in lieu of Plenary. Plenary may support other
+  clients later, not today. The `drawh` proposal is dropped, and `packages/core/` is now owned directly here.
 
 ## Milestones
 
@@ -48,19 +48,15 @@ M7 multi-region · M8 hardening. Each milestone's gate becomes a CI check.
 ## Shape
 
 ```
-packages/core/       herdr-draw's core/, copied byte-identical (SOURCE.json: commit + sha256 per file)
-packages/protocol/   PROTOCOL.md v0 as code: envelope + codec, Replica (client), Room (reference sequencer), ports
+packages/core/       canvas core (originally forked from herdr-draw's core/; now owned directly here)
+packages/protocol/   PROTOCOL.md v1 as code: envelope + codec, Replica (client), Room (reference sequencer), ports
 test/                bun test
 ```
 
-- **packages/core is not edited here.** Change it in herdr-draw (its tests, its scripts/release.sh), then
-  re-copy and update SOURCE.json. `test/core-source.test.js` fails on drift. Moving herdr-draw onto this
-  package is a separate step the person approves.
-- **Plain JS + JSDoc, no build step**: Herdr loads .js as copied, and its QuickJS runtime lacks some
-  globals (no TextDecoder). packages/protocol imports only core's doc.js/model.js and its own files;
+- **packages/core is owned here** (2026-11-21: herdr-draw is being sunset in lieu of Plenary).
+- **Plain JS + JSDoc, no build step**: packages/protocol imports only core's doc.js/model.js and its own files;
   `test/purity.test.js` checks it.
-- Herdr mods can open WebSockets (`import { WebSocket } from "websocket"`, capability-gated) but refuse
-  credential headers, so the token goes in the first message (`hello`), never a header. Untested live.
+- Tokens travel in the first message (`hello`), never a credential header.
 
 ## Dev loop
 

@@ -38,35 +38,11 @@ jobs:
           test -f bun.lock || { echo "bun.lock is missing; dependencies must be locked." >&2; exit 1; }
           bun install --frozen-lockfile
 
-      # test/core-source.test.js compares packages/core with ../herdr-draw/core and skips that check when the
-      # directory is missing. Put herdr-draw there, at the commit packages/core/SOURCE.json names, so the check
-      # runs in CI too. Public repo, anonymous read-only clone; nothing is pushed. A full clone (not shallow),
-      # because SOURCE.json holds a short SHA and a shallow clone cannot resolve one.
-      # This proves core equals herdr-draw AT THAT COMMIT. It does not notice newer herdr-draw commits.
-      - name: Check out herdr-draw at the commit in SOURCE.json
-        run: |
-          set -euo pipefail
-          sha="$(bun -e 'const c = JSON.parse(require("node:fs").readFileSync("packages/core/SOURCE.json", "utf8")).commit; if (typeof c !== "string" || !/^[0-9a-f]{7,40}$/.test(c)) { console.error("SOURCE.json: commit is missing or is not a hex SHA"); process.exit(1); } console.log(c);')"
-          if [ -e ../herdr-draw ]; then
-            echo "../herdr-draw already exists; refusing to reuse it." >&2
-            exit 1
-          fi
-          git clone --quiet --no-tags https://github.com/ryanthedev/herdr-draw ../herdr-draw
-          # Fails, with a message, if the SHA is unknown or (for a short SHA) ambiguous.
-          full="$(git -C ../herdr-draw rev-parse --verify --quiet "${sha}^{commit}")" || {
-            echo "herdr-draw has no single commit matching '$sha' (from packages/core/SOURCE.json): unknown or ambiguous." >&2
-            exit 1
-          }
-          git -C ../herdr-draw checkout --quiet --detach "$full"
-          test -d ../herdr-draw/core
-          echo "herdr-draw at $full (SOURCE.json commit: $sha)"
-
       - name: Test
         run: bun test
 
   # Phase 4: the same `bun test` with Postgres, NATS (2 MB max_payload) and an S3-compatible blob store beside it, so
   # engine's cluster-adapter tests run against real services here (they skip in the `test` job, where none is set).
-  # It does not clone herdr-draw: test/core-source.test.js skips here, and the `test` job above covers it.
   test-cluster-services:
     runs-on: ubuntu-latest
     timeout-minutes: 15

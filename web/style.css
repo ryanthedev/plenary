@@ -397,9 +397,11 @@ body .phone-only { display: none !important; }
 @media (max-width: 640px) {
   .desk-only { display: none !important; }
   body .hud .grp.phone-only { display: inline-flex !important; }
-  body .topbar .phone-only { display: inline-flex !important; }
+  body .topbar .phone-only { display: inline-flex !important; min-width: 44px; min-height: 44px; }
   .topbar { height: calc(50px + env(safe-area-inset-top)); gap: 6px; padding: env(safe-area-inset-top) calc(8px + env(safe-area-inset-right)) 0 calc(8px + env(safe-area-inset-left)); background: var(--surface); border-bottom: 1px solid var(--border); pointer-events: auto; }
   .top-left, .top-right { background: none; border: 0; box-shadow: none; border-radius: 0; height: 44px; padding: 0; }
+  .top-left { min-width: 0; flex-shrink: 1; }
+  .top-right { flex-shrink: 0; }
   .topbar .theme-btn { display: none; }
   .watching { font-size: 11px; }
   .avatars { gap: 4px; }
@@ -432,6 +434,8 @@ body .phone-only { display: none !important; }
   .sheet .c, .sheet .sw { height: 36px; min-width: 36px; }
   .sheet .sw { width: 36px; border-radius: 9px; }
   .sheet .row .lab { width: 58px; }
+  .sheet .sheet-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 4px 12px 0; }
+  .sheet .sheet-actions .sheet-action { min-height: 44px; min-width: 44px; border-radius: 12px; font-weight: 600; font-size: 13px; background: var(--surface-subtle); }
   .sheet .tool-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; padding: 12px; }
   .sheet .tool-grid .tb { height: 64px; flex-direction: column; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-subtle); color: var(--fg); gap: 4px; font-size: 11px; }
   .sheet .tool-grid .tb.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }

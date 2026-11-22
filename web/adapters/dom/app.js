@@ -341,6 +341,95 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (text) { S.paste(text); chromeDirty = true; }
   });
 
+  // Explicit clipboard read for mobile (Chrome on iOS / WKWebView): must be invoked directly from a tap gesture
+  // so iOS displays its native Paste confirmation pill and returns ClipboardItem[].
+  let pasting = false;
+  async function pasteFromClipboard() {
+    if (pasting) return false;
+    if (!S.may()) { toast("View only: nothing is pasted"); return false; }
+    const clip = globalThis.navigator?.clipboard;
+    pasting = true;
+    try {
+      if (typeof clip?.read === "function") {
+        let items;
+        try {
+          items = await clip.read();
+        } catch (err) {
+          if (err?.name === "NotAllowedError" || err?.name === "SecurityError") toast("Clipboard paste was cancelled");
+          else if (err?.name === "NotFoundError" || err?.name === "DataError") toast("Nothing to paste from clipboard");
+          else toast("Couldn't read clipboard — try Photo / Video");
+          return false;
+        }
+        if (!S.may()) { toast("View only: nothing is pasted"); return false; }
+        const list = Array.isArray(items) ? items : [...(items ?? [])];
+        if (!list.length) { toast("Nothing to paste from clipboard"); return false; }
+        try {
+          let pastedMedia = false;
+          for (const item of list) {
+            const types = Array.isArray(item?.types) ? item.types : [...(item?.types ?? [])];
+            const imgType = types.find(t => RASTER.test(t));
+            if (imgType) {
+              const blob = await item.getType(imgType);
+              if (!blob) continue;
+              const pic = RASTER.test(blob.type) ? blob : new Blob([blob], { type: imgType });
+              await addPicture(pic);
+              pastedMedia = true;
+              continue;
+            }
+            const vidType = types.find(t => VIDEO_MIME.test(t));
+            if (vidType) {
+              const blob = await item.getType(vidType);
+              if (!blob) continue;
+              const vid = VIDEO_MIME.test(blob.type) ? blob : new Blob([blob], { type: vidType });
+              await addVideoFile(vid);
+              pastedMedia = true;
+            }
+          }
+          if (pastedMedia) return true;
+          for (const item of list) {
+            const types = Array.isArray(item?.types) ? item.types : [...(item?.types ?? [])];
+            if (!types.includes("text/plain")) continue;
+            const blob = await item.getType("text/plain");
+            const text = blob ? await blob.text() : "";
+            if (text) {
+              if (!S.may()) { toast("View only: nothing is pasted"); return false; }
+              S.paste(text);
+              chromeDirty = true;
+              return true;
+            }
+          }
+        } catch (err) {
+          if (err?.name === "NotAllowedError" || err?.name === "SecurityError") toast("Clipboard paste was cancelled");
+          else toast("Couldn't read clipboard — try Photo / Video");
+          return false;
+        }
+        toast("Nothing to paste from clipboard");
+        return false;
+      }
+      if (typeof clip?.readText === "function") {
+        try {
+          const text = await clip.readText();
+          if (text) {
+            if (!S.may()) { toast("View only: nothing is pasted"); return false; }
+            S.paste(text);
+            chromeDirty = true;
+            return true;
+          }
+          toast("Nothing to paste — use Photo / Video for images");
+          return false;
+        } catch (err) {
+          if (err?.name === "NotAllowedError" || err?.name === "SecurityError") toast("Clipboard paste was cancelled");
+          else toast("Clipboard unavailable — use Photo / Video for images");
+          return false;
+        }
+      }
+      toast("Clipboard unavailable — use Photo / Video for images");
+      return false;
+    } finally {
+      pasting = false;
+    }
+  }
+
   // Pictures, videos and libraries: drop, paste, the Image tool's picker.
   const RASTER = /^image\/(png|jpeg|gif|webp)$/;
   const VIDEO_MIME = /^video\/(mp4|webm|quicktime)$/;
@@ -351,13 +440,16 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (file.size > 10 * 1024 * 1024) return toast("Pictures are limited to 10 MB");
     const buf = await file.arrayBuffer();
     const id = [...new Uint8Array(await crypto.subtle.digest("SHA-1", buf))].map(b => b.toString(16).padStart(2, "0")).join("");
-    const dataURL = await new Promise(res => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(file); });
+    const dataURL = await new Promise(res => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => res(null); r.readAsDataURL(file); });
+    if (!dataURL) return toast("That picture couldn't be read");
     const img = await new Promise(res => { const i = new Image(); i.onload = () => res(i); i.onerror = () => res(null); i.src = dataURL; });
     if (!img) return toast("That picture couldn't be read");
+    if (!S.may()) return;
     const f = { id, mimeType: file.type, dataURL, width: img.naturalWidth, height: img.naturalHeight };
     if (typeof net.uploadBlob === "function") {
       try { await S.uploadBlob(id, new Uint8Array(buf), file.type); }
       catch { return toast("Picture upload failed"); }
+      if (!S.may()) return;
       S.addPicture(f, at);
     } else if (S.addPicture(f, at)) {
       net.put(f);          // local / shared-worker tab relay
@@ -535,6 +627,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         admin ? h("button.btn.primary.desk-only", { title: "Share board", "aria-label": "Share board", onclick: () => openShare() }, icon("share", { size: 15 }), "Share") : null,
         role !== "viewer" ? h("button.tb.desk-only" + (ui.panel.open ? ".on" : ""), { title: "Side panel (I)", "aria-label": "Inspector panel", onclick: () => setPanel({ type: "open" }) }, h("span.ic", {}, icon("panel", { size: 17 })), h("span.k", {}, "I")) : null,
         h("button.tb.theme-btn", { title: "Light / dark", "aria-label": "Toggle color theme", onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 17 }))),
+        role !== "viewer" ? h("button.tb.phone-only.paste-btn", { title: "Paste from clipboard", "aria-label": "Paste from clipboard", "data-action": "paste", disabled: !may, onclick: () => { pasteFromClipboard(); } }, h("span.ic", {}, icon("paste", { size: 18 }))) : null,
         h("button.tb.phone-only.overflow-btn", { title: "More", "aria-label": "More options", onclick: () => { ui.sheet = ui.sheet === "tools" ? null : "tools"; chromeDirty = true; } }, h("span.ic", {}, icon("more", { size: 18 })))),
     ];
   }
@@ -692,11 +785,16 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (ui.sheet === "tools") {
       // Every write here passes S.setTool / S.may: read-only greys and refuses it (p6-mockv round 2, MEDIUM).
       const may = S.may();
-      body = h("div.tool-grid", {}, toolsFor(S.role).map(t => h("button.tb" + (S.tool === t.id ? ".on" : ""), { disabled: t.id !== "hand" && !may, "data-tool": t.id, onclick: () => { if (t.id === "image") openPicker(); S.setTool(t.id); ui.sheet = null; chromeDirty = true; } }, h("span.ic", {}, icon(t.id, { size: 20 })), t.name)),
+      const quickActions = S.role !== "viewer"
+        ? h("div.sheet-actions", {},
+            h("button.btn.sheet-action", { disabled: !may, "data-action": "paste", "aria-label": "Paste from clipboard", onclick: () => { pasteFromClipboard().then(ok => { if (ok && ui.sheet === "tools") { ui.sheet = null; chromeDirty = true; } }); } }, icon("paste", { size: 18 }), "Paste"),
+            h("button.btn.sheet-action", { disabled: !may, "data-action": "media", "aria-label": "Insert photo or video", onclick: () => { openPicker(); ui.sheet = null; chromeDirty = true; } }, icon("image", { size: 18 }), "Photo / Video"))
+        : null;
+      body = h("div.scroll", {}, quickActions, h("div.tool-grid", {}, toolsFor(S.role).map(t => h("button.tb" + (S.tool === t.id ? ".on" : ""), { disabled: t.id !== "hand" && !may, "data-tool": t.id, onclick: () => { if (t.id === "image") openPicker(); S.setTool(t.id); ui.sheet = null; chromeDirty = true; } }, h("span.ic", {}, icon(t.id, { size: 20 })), t.name)),
         S.role === "presenter" ? [h("button.tb", { disabled: !may, onclick: () => openDialog("mermaid") }, h("span.ic", {}, icon("mermaid", { size: 20 })), "Mermaid"), h("button.tb", { onclick: () => openDialog("export") }, h("span.ic", {}, icon("export", { size: 20 })), "Export")] : null,
         admin ? h("button.tb", { onclick: () => { ui.sheet = null; chromeDirty = true; openShare(); } }, h("span.ic", {}, icon("share", { size: 20 })), "Share") : null,
         S.role !== "viewer" ? h("button.tb" + (S.toolLock() ? ".on" : ""), { disabled: !may, onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 20 })), "Lock tool") : null,
-        h("button.tb", { onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 20 })), ui.theme === "dark" ? "Light" : "Dark"));
+        h("button.tb", { onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 20 })), ui.theme === "dark" ? "Light" : "Dark")));
     } else if (ui.sheet === "panel") body = h("div.scroll", {}, panelNodes(true));
     else body = [h("div.tabs", { style: { justifyContent: "center" } }, drawerTabs("sheet")), h("div.scroll", {}, drawerBody(ui.sheet))];
     replace(el, sheetHandle(el), body);

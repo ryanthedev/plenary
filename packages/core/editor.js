@@ -7,7 +7,7 @@
 // remote/agent ops come in through editor.receive(op).
 
 import {
-  DEFAULT_STROKE, makeElement, clone, touch, isShape, isLinear, isLabel, layerOf, zOf, defaultLayer, newId, textSize, clampPressure,
+  DEFAULT_STROKE, makeElement, clone, touch, isShape, isLinear, isLabel, layerOf, zOf, defaultLayer, newId, textSize, clampPressure, utf8Bytes,
 } from "./model.js";
 import { Doc } from "./doc.js";
 import {
@@ -58,6 +58,9 @@ const MT_TAP_MS = 250;         // M5: max duration for 2-finger Undo / 3-finger 
 const MT_TAP_SLOP = 12;        // M5: max per-finger movement for multi-touch tap
 const PALM_GRACE_MS = 300;     // M5: suppress single-finger touch this long after pen up
 const STALE_POINTER_MS = 15_000; // M5: prune orphaned pointers from missed pointerup/cancel
+const OP_CHUNK_TARGET_BYTES = 512 * 1024;  // target UTF-8 JSON bytes per emitted op (well below 1 MB protocol MAX_OP_BYTES)
+const MAX_ELEMENT_OP_BYTES = 950_000;      // single-element wire cap (headroom for wrapper & version fields)
+const OP_WRAPPER_BYTES = 16;               // {"elements":[]}
 const DRAWING_TOOLS = new Set(["rectangle", "diamond", "ellipse", "arrow", "line", "freedraw", "text", "frame"]);
 const RESIZE_CURSOR = { n: "ns-resize", s: "ns-resize", e: "ew-resize", w: "ew-resize", nw: "nwse-resize", se: "nwse-resize", ne: "nesw-resize", sw: "nesw-resize" };
 
@@ -120,35 +123,68 @@ export class Editor {
   transact(fn, { history = true, files } = {}) {
     const tx = new Tx(this.doc);
     const result = fn(tx);
-    this.commit(tx.before, tx.dirty, history, files);
-    return result;
+    const ok = this.commit(tx.before, tx.dirty, history, files);
+    return ok ? result : undefined;
   }
 
   // `files`: image blobs that ride along in the same op (so no replica sees the element without its file).
   commit(before, dirty, history = true, files) {
-    if (!dirty.size) return;
+    if (!dirty.size) return true;
     const elements = [];
-    for (const [id, el] of dirty) {
-      // Arrows bound to anything that moved get their baked geometry refreshed.
-      elements.push(touch(el));
+    for (const [, el] of dirty) {
+      const next = touch(el);
+      if (utf8Bytes(JSON.stringify(next)) + OP_WRAPPER_BYTES > MAX_ELEMENT_OP_BYTES) {
+        this.flash = "Element too large to sync (exceeds 1 MB limit)";
+        this.changed();
+        return false;
+      }
+      elements.push(next);
     }
     this.doc.apply({ elements }, { force: true });
-    const settled = this.settleArrows(new Set(dirty.keys()), before);
+    const settled = this.settleArrows(new Set(dirty.keys()));
     if (settled.length) elements.push(...settled);
-    if (files) { this.doc.apply({ files }); this.onOp({ elements, files }); }
-    else this.onOp({ elements });
+    if (files) this.doc.apply({ files });
+    this.emitElementsOp(elements, files);
     if (history) { this.undoStack.push(before); this.redoStack = []; if (this.undoStack.length > 200) this.undoStack.shift(); }
     this.changed();
+    return true;
   }
 
-  settleArrows(ids, before) {
+  // Emit an element batch in UTF-8 byte-budgeted chunks so bulk ops (large imports, pastes, undos)
+  // stay comfortably below the protocol's 1 MB MAX_OP_BYTES cap.
+  emitElementsOp(elements, files) {
+    if (!elements.length) return;
+    const deduped = [...new Map(elements.map(el => [el.id, el])).values()];
+    const chunks = [];
+    let cur = [], curBytes = OP_WRAPPER_BYTES;
+    for (const el of deduped) {
+      const elBytes = utf8Bytes(JSON.stringify(el));
+      if (cur.length && curBytes + 1 + elBytes > OP_CHUNK_TARGET_BYTES) {
+        chunks.push(cur);
+        cur = [];
+        curBytes = OP_WRAPPER_BYTES;
+      }
+      cur.push(el);
+      curBytes += (cur.length > 1 ? 1 : 0) + elBytes;
+    }
+    if (cur.length) chunks.push(cur);
+    for (let i = 0; i < chunks.length; i++) {
+      if (i === 0 && files) this.onOp({ elements: chunks[i], files });
+      else this.onOp({ elements: chunks[i] });
+    }
+  }
+
+  // Passively re-settle arrows bound to edited shapes. Never records passively-settled arrows
+  // in `before`, so undoing a shape move re-settles against the arrow's current state without
+  // clobbering concurrent remote style/color edits on that arrow.
+  settleArrows(ids) {
     const out = [];
     for (const el of this.doc.live()) {
       if (el.type !== "arrow" && el.type !== "line") continue;
       const s = el.startBinding?.elementId, e = el.endBinding?.elementId;
       if (!ids.has(el.id) && !ids.has(s) && !ids.has(e)) continue;
       const c = clone(el);
-      if (settle(this.doc, c)) { if (!before.has(el.id)) before.set(el.id, clone(el)); touch(c); this.doc.apply({ elements: [c] }, { force: true }); out.push(c); }
+      if (settle(this.doc, c)) { touch(c); this.doc.apply({ elements: [c] }, { force: true }); out.push(c); }
     }
     return out;
   }
@@ -157,18 +193,23 @@ export class Editor {
   undo() { this.swapHistory(this.undoStack, this.redoStack); }
   redo() { this.swapHistory(this.redoStack, this.undoStack); }
   swapHistory(from, to) {
+    if (this.g) this.cancelGesture();
     const before = from.pop(); if (!before) return;
     const back = new Map(), elements = [];
     for (const [id, old] of before) {
       const cur = this.doc.getAny(id);
+      if (!old && !cur) continue;
       back.set(id, cur ? clone(cur) : null);
       const next = old ? clone(old) : { ...clone(cur), isDeleted: true };
       next.version = Math.max(cur?.version ?? 0, old?.version ?? 0); touch(next);
       elements.push(next);
     }
+    if (!elements.length) return;
     to.push(back);
     this.doc.apply({ elements }, { force: true });
-    this.onOp({ elements });
+    const settled = this.settleArrows(new Set(before.keys()));
+    if (settled.length) elements.push(...settled);
+    this.emitElementsOp(elements);
     this.pruneSnapPreview(); this.pruneSel(); this.changed();
   }
 
@@ -419,8 +460,8 @@ export class Editor {
     }
     if (m.clickCount >= 2 && (this.tool === "select" || this.tool === "text")) {
       const hit = hitTest(this.doc, w, this.tol(type)) ?? shapeAt(this.doc, w);
-      if (hit && parseLinkCardFromElement(hit)) {
-        const card = parseLinkCardFromElement(hit);
+      const card = hit ? parseLinkCardFromElement(hit) : null;
+      if (card) {
         if (typeof this.onOpenLink === "function") this.onOpenLink(card.url, hit, card);
         return;
       }
@@ -1409,18 +1450,20 @@ export class Editor {
     const { elements: remapped, files: remappedFiles } = remapExcalidrawIds(els, files ?? {}, {
       fileIdMap, layer: this.activeLayer, zStart: z, dropNonSha1,
     });
-    if (remappedFiles && Object.keys(remappedFiles).length) this.addFiles(remappedFiles);
     const box = unionBox(remapped.filter(e => !isLabel(e)).map(bbox)) ?? unionBox(remapped.map(bbox));
     const target = at ?? this.toWorld({ x: this.size.w / 2, y: this.size.h / 2 });
     const dx = box ? target.x - (box.x + box.w / 2) : 0;
     const dy = box ? target.y - (box.y + box.h / 2) : 0;
     const out = [];
-    this.transact(tx => {
+    const ok = this.transact(tx => {
       for (const c of remapped) {
         c.x += dx; c.y += dy;
         tx.add(c); out.push(c);
       }
+      return true;
     });
+    if (!ok) return [];
+    if (remappedFiles && Object.keys(remappedFiles).length) this.addFiles(remappedFiles);
     this.select(out.filter(e => !isLabel(e)).map(e => e.id));
     return out.map(e => e.id);
   }

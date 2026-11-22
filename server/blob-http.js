@@ -63,7 +63,7 @@ export function blobRoutes({ access, maxPuts = MAX_CONCURRENT_PUTS, maxPutsPerUs
       if (!token || token.includes("/")) return json(404, { error: "not-found" });
       if (req.method === "GET" || req.method === "HEAD") {
         const r = await access.get(token);
-        if ("code" in r) return fail(r.code);
+        if (!r.ok || "code" in r) return fail("code" in r ? r.code : "unavailable");
         const baseHeaders = {
           "accept-ranges": "bytes",
           "x-content-type-options": "nosniff",
@@ -94,7 +94,7 @@ export function blobRoutes({ access, maxPuts = MAX_CONCURRENT_PUTS, maxPutsPerUs
       }
       if (req.method === "PUT") {
         const v = await access.verify(token, "PUT");     // before a byte of body is read: no token, no upload
-        if ("code" in v) return fail(v.code);
+        if (!v.ok || "code" in v) return fail("code" in v ? v.code : "bad-token");
         const raw = req.headers.get("content-length");
         if (!raw || !/^\d{1,12}$/.test(raw) || req.headers.has("transfer-encoding")) return fail("bad-length");
         const len = Number(raw);
@@ -110,7 +110,7 @@ export function blobRoutes({ access, maxPuts = MAX_CONCURRENT_PUTS, maxPutsPerUs
           const bytes = await readExactly(req, len, ctl.signal);
           if (!bytes) return ctl.signal.aborted ? json(408, { error: "timeout" }) : fail("bad-length");
           const r = await access.put(token, bytes);
-          return "code" in r ? fail(r.code) : json(r.created ? 201 : 200, { ok: true });
+          return !r.ok || "code" in r ? fail("code" in r ? r.code : "unavailable") : json(r.created ? 201 : 200, { ok: true });
         } finally {
           timers.clear(timer); puts--; tokens.delete(token);
           const n = (byUser.get(who) ?? 1) - 1; if (n > 0) byUser.set(who, n); else byUser.delete(who);

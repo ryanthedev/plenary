@@ -75,7 +75,9 @@ export function collabPort(session, { name, frame, jumpTo = null }) {
   const op = o => { C.record(o); };
   const elementBounds = (stream, el) => {
     if (!el) return null;
-    const doc = {
+    const realDoc = C.streamDoc?.(stream);
+    const doc = realDoc ?? {
+      rev: C.streamRev?.(stream),
       get: id => C.element(stream, id),
       visible: () => (C.elements ? C.elements(stream).filter(e => e && !e.isDeleted) : []),
     };

@@ -24,7 +24,7 @@ export const FOLD_STEP_UNITS = 8192;
 const ENTRY_UNITS = 16, CHARS_PER_UNIT = 16;
 
 export class Folder {
-  /** @param {{ blank: () => object, base: () => object, tail: () => object[], sizes: () => number[] }} room  blank(): an empty log-less Room for the shadow;
+  /** @param {{ blank: () => Record<string, any>, base: () => Record<string, any>, tail: () => Record<string, any>[], sizes: () => number[] }} room  blank(): an empty log-less Room for the shadow;
    *   base()/tail()/sizes(): the room's current checkpoint, the resolved entries after it and each one's op chars. */
   constructor(room) {
     this.room = room; this.shadow = null;

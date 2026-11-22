@@ -71,7 +71,7 @@ export function presenceLimiter(now) {
 /**
  * Gathers presence between two sends and gives back one batch: the latest cursor and selection per
  * (user, client), the latest preview per element, every laser batch and emote, and `leave`.
- * @returns {{ add(user: string, client: string, msg: object): void, leave(user: string, client: string): void, flush(): object[], size: number }}
+ * @returns {{ add(user: string, client: string, msg: Record<string, any>): void, leave(user: string, client: string): void, flush(): Record<string, any>[], size: number }}
  */
 export function presenceCoalescer() {
   let latest = new Map(), each = [];

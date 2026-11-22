@@ -2,7 +2,7 @@
 // How messages become bytes. JSON in v0; a binary codec (MessagePack, CBOR) can replace it later
 // without touching rooms or replicas: they only ever see decoded objects.
 
-/** @typedef {{ encode(msg: object): string | Uint8Array, decode(data: string | Uint8Array): object }} Codec */
+/** @typedef {{ encode(msg: Record<string, any>): string | Uint8Array, decode(data: string | Uint8Array): Record<string, any> }} Codec */
 
 /** @type {Codec} */
 export const jsonCodec = {

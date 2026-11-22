@@ -259,10 +259,10 @@ const b64 = bytes => { let s = ""; for (let i = 0; i < bytes.length; i += 0x8000
 /**
  * HTTP snapshot fetch adapter (F9, implements web/ports/net.js's `fetchSnapshot`).
  * Resolves relative snapshot URLs against `origin` and refuses cross-origin URLs.
- * @param {{ origin?: string, fetch?: typeof globalThis.fetch }} [o]
+ * @param {{ origin?: string | null, fetch?: (input: any, init?: RequestInit) => Promise<Response> }} [opts]
  * @returns {import("../../ports/net.js").FetchSnapshot}
  */
-export function httpSnapshotFetcher({ origin = null, fetch: fetchFn = (...a) => globalThis.fetch(...a) } = {}) {
+export function httpSnapshotFetcher({ origin = null, fetch: fetchFn = (input, init) => globalThis.fetch(input, init) } = {}) {
   const base = origin ? new URL(origin) : null;
   return async function fetchSnapshot(url, { signal } = {}) {
     if (typeof url !== "string" || !url) throw new Error("fetchSnapshot: url is required");
@@ -295,9 +295,9 @@ export function httpSnapshotFetcher({ origin = null, fetch: fetchFn = (...a) => 
 /**
  * HTTP blob upload/fetch adapter (PROTOCOL.md § Blobs, implements web/ports/net.js's `uploadBlob` and `fetchBlob`).
  * Resolves relative signed URLs against `origin` and refuses cross-origin URLs.
- * @param {{ origin?: string, fetch?: typeof globalThis.fetch }} [o]
+ * @param {{ origin?: string | null, fetch?: (input: any, init?: RequestInit) => Promise<Response> }} [opts]
  */
-export function httpBlobClient({ origin = null, fetch: fetchFn = (...a) => globalThis.fetch(...a) } = {}) {
+export function httpBlobClient({ origin = null, fetch: fetchFn = (input, init) => globalThis.fetch(input, init) } = {}) {
   const base = origin ? new URL(origin) : null;
   function resolveUrl(url, label) {
     if (typeof url !== "string" || !url) throw new Error(`${label}: url is required`);

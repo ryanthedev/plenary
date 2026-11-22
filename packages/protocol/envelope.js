@@ -135,7 +135,7 @@ export function deeperThan(value, max) {
 /**
  * What's wrong with an op message, or null. Shape first (`bad-op`, `no-files`, `too-large`), then the id
  * and `sentAt` (§ Limits, order of checks), so a bad id never hides a shape error. Roles are the room's job.
- * @param {object} msg
+ * @param {Record<string, any>} msg
  * @param {number} [bytes] the op's JSON size in UTF-8 bytes, when the caller already has it (v1.1: bytes, no longer chars)
  * @returns {null | { code: string, message: string }}
  */

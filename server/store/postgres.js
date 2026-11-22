@@ -1,3 +1,4 @@
+// @ts-check
 // The Store port on Postgres (PROTOCOL.md § Store): the durable log and checkpoints for a cluster.
 // Same contract as server/store/sqlite.js (method names, errors, the `maxBytes` / `bytes` read extension):
 //
@@ -100,22 +101,22 @@ const NEEDS = Object.freeze({
 const DB_NOW = "(extract(epoch FROM clock_timestamp()) * 1000)::bigint";
 
 /**
- * @param {{ url?: string, sql?: import("bun").SQL, max?: number, schema?: string, keepCheckpoints?: number, lockTimeoutMs?: number }} o
+ * @param {{ url?: string, sql?: import("bun").SQL, max?: number, schema?: string, keepCheckpoints?: number, lockTimeoutMs?: number,
+ *   txIdleTimeoutMs?: number, leaseLockTimeoutMs?: number, partChars?: number,
+ *   onPart?: (step: string) => void | Promise<void>, onSkip?: (s: { tenant: string, board: string, seq: number }) => void }} o
  *   lockTimeoutMs: how long start-up waits for the schema's start-up lock (default 15 s), then fails with code "lock-timeout".
  *   txIdleTimeoutMs: a write transaction idle this long (its client paused mid-write) is ended by the server (default 5 s).
  *   leaseLockTimeoutMs: the longest a lease call waits on a row lock (default 2 s, at most half its ttl), then "unavailable".
  *   partChars: the most chars in one checkpoint part (default 1 Mi). onPart: test hook, awaited before each part
  *   ("part:<n>"), before the header ("header"), after its part count ("header-counted") and before each orphan group's delete ("sweep"); a throw aborts the write there (a sweep never fails a write). onSkip: called once for each checkpoint getCheckpoint skips because its parts are missing (the server logs it).
- * @returns {Promise<{ append: Function, read: Function, lastSeq: Function, putCheckpoint: Function,
- *   getCheckpoint: Function, openEpoch: Function, epoch: Function, acquire: Function, renew: Function,
- *   release: Function, lease: Function, settings(): Promise<object>, clusterId(): Promise<string>, close(): Promise<void> }>}
+ * @returns {Promise<import("./port.js").Store & { settings(): Promise<object>, clusterId(): Promise<string> }>}
  */
 export async function postgresStore({ url, sql, max, schema = "public", keepCheckpoints = 3, lockTimeoutMs = 15_000,
   txIdleTimeoutMs = 5_000, leaseLockTimeoutMs = 2_000, partChars = PART_CHARS, onPart, onSkip }) {
   if (!sql && !url) throw new Error("postgres store: pass url or sql");
   const s = needSchema(schema);
   const owned = !sql;
-  const db = sql ?? new SQL(max ? { url, max } : url);
+  const db = sql ?? (max ? new SQL({ url, max }) : new SQL(url));
   let open = true;
   const K = `"${s}".pl_cluster`, E = `"${s}".pl_entries`, C = `"${s}".pl_checkpoints`, CP = `"${s}".pl_checkpoint_parts`, L = `"${s}".pl_leases`;
   const BR = `"${s}".pl_blob_refs`, BP = `"${s}".pl_blob_pending`, BC = `"${s}".pl_blob_condemned`;
@@ -435,7 +436,7 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
     },
 
     /** Condemned long enough and not claimed, in (tenant, sha1) order after the cursor. */
-    async blobCondemned({ graceMs, after = null, limit } = {}) {
+    async blobCondemned({ graceMs, after = null, limit } = /** @type {any} */ ({})) {
       if (!open) throw new PortError("closed", "the store is closed");
       checkReap({ graceMs, limit, after });
       const rows = await db.unsafe(`SELECT tenant, sha1 FROM ${BC} WHERE condemned_at <= ${DB_NOW} - $1 AND (claimed_until IS NULL OR claimed_until <= ${DB_NOW})
@@ -444,7 +445,7 @@ export async function postgresStore({ url, sql, max, schema = "public", keepChec
     },
 
     /** The reaper's conditional claim: only while the hash is still condemned for graceMs, unclaimed and unreferenced. */
-    async blobClaim(tenant, sha1, { graceMs, claimMs } = {}) {
+    async blobClaim(tenant, sha1, { graceMs, claimMs } = /** @type {any} */ ({})) {
       needId(tenant, "tenant"); checkPend(sha1, 1); checkReap({ graceMs, claimMs }, { claim: true });
       if (!open) throw new PortError("closed", "the store is closed");
       return write(async tx => {

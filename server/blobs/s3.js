@@ -1,3 +1,4 @@
+// @ts-check
 // The Blobs port on S3-compatible storage (PROTOCOL.md § Blobs), for a cluster. Same contract as disk.js:
 //   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB (images) / > 50 MB (videos), a hash mismatch, and anything that isn't PNG/JPEG/GIF/WebP/MP4/WebM/QuickTime;
 //                              true when it stored the blob, false when the tenant already had it
@@ -38,7 +39,7 @@ const SIGNED_FOR = 300;    // seconds a presigned request stays valid; each is u
  * @param {{ endpoint: string, bucket: string, region: string, accessKeyId: string, secretAccessKey: string,
  *           sessionToken?: string, putTimeoutMs?: number, getTimeoutMs?: number, usageTimeoutMs?: number }} o
  */
-export function s3Blobs({ endpoint, bucket, region, accessKeyId, secretAccessKey, sessionToken, putTimeoutMs = 30_000, getTimeoutMs = 10_000, usageTimeoutMs = 60_000 } = {}) {
+export function s3Blobs({ endpoint, bucket, region, accessKeyId, secretAccessKey, sessionToken, putTimeoutMs = 30_000, getTimeoutMs = 10_000, usageTimeoutMs = 60_000 } = /** @type {any} */ ({})) {
   for (const [k, v] of Object.entries({ endpoint, bucket, region, accessKeyId, secretAccessKey }))
     if (typeof v !== "string" || !v) throw new TypeError(`s3Blobs needs ${k}`);
   if (sessionToken !== undefined && (typeof sessionToken !== "string" || !sessionToken)) throw new TypeError("s3Blobs sessionToken must be a non-empty string when given");

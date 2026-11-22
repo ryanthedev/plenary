@@ -1,3 +1,4 @@
+// @ts-check
 // GET /metrics (PROTOCOL.md § Metrics): a driving adapter. It checks a bearer token and hands back whatever `render()` returns.
 // Disabled (no token configured): a plain 404, indistinguishable from an unknown path. It reads no Store, Bus or board.
 
@@ -20,7 +21,7 @@ export const METRICS_TOKEN_MIN = 16;
 export const METRICS_TOKEN_RE = /^[A-Za-z0-9\-._~+/]+=*$/;
 
 /**
- * @param {{ token?: string | null, render?: () => string, log?: object } | null} [o]  no token (or no render) = disabled
+ * @param {{ token?: string | null, render?: () => string, log?: { error(msg: string, fields?: object): void } } | null} [o]  no token (or no render) = disabled
  * @returns {{ handle(req: Request): Promise<Response> }}  answers every request to /metrics, enabled or not
  */
 export function metricsRoute(o) {

@@ -1,3 +1,4 @@
+// @ts-check
 // The Store port (PROTOCOL.md § Store, § Recovery): the durable log, checkpoints and lease of every board. THE contract
 // for adapters (sqlite.js, postgres.js); the room never sees it (a room host binds tenant, board and epoch into a Log,
 // packages/protocol/ports.js). Port-level: core code imports this and never an adapter; adapters import their
@@ -60,7 +61,7 @@ export const STORE_METHODS = Object.freeze(["append", "read", "lastSeq", "putChe
  * @typedef {{ holder: null | string, epoch: number, expiresAt: null | number, live: boolean, remainingMs: number }} LeaseRecord
  *   holder null = nobody holds it (released, or a single-node openEpoch); `live` = held and not expired; `remainingMs` = ms
  *   until expiry on the Store's clock, measured there (0 unless live).
- * @typedef {object[] & { bytes: number[] }} EntryPage  entries ascending by seq; `bytes[i]` = entry i's stored length in chars
+ * @typedef {Record<string, any>[] & { bytes: number[] }} EntryPage  entries ascending by seq; `bytes[i]` = entry i's stored length in chars
  *
  * @typedef {object} Store
  * @property {(tenant: string, board: string, entries: object[], expectSeq: number, epoch: number, opts?: { blobRefs?: string[] }) => Promise<void>} append
@@ -75,11 +76,11 @@ export const STORE_METHODS = Object.freeze(["append", "read", "lastSeq", "putChe
  *   maxBytes the page also stops once it holds about that much stored text, and always holds >= 1 entry if any
  *   qualifies. fromSeq: integer >= 0; limit, maxBytes: positive integers (else bad-entry). [] when none.
  * @property {(tenant: string, board: string) => Promise<number>} lastSeq  the board's last seq; 0 = empty
- * @property {(tenant: string, board: string, cp: object, epoch: number) => Promise<void>} putCheckpoint
+ * @property {(tenant: string, board: string, cp: Record<string, any> & { seq: number }, epoch: number) => Promise<void>} putCheckpoint
  *   Stored under cp.seq (integer >= 0, else bad-entry). The highest seq wins, never the last write; a second write of one
  *   seq is ignored; all but the newest KEEP are pruned. epoch as in append (fenced). May reject "unavailable" when it is
  *   overtaken mid-write by a newer checkpoint; nothing of it stays visible.
- * @property {(tenant: string, board: string, beforeSeq?: number) => Promise<null | object>} getCheckpoint
+ * @property {(tenant: string, board: string, beforeSeq?: number) => Promise<null | Record<string, any>>} getCheckpoint
  *   The checkpoint with the highest seq, or the highest below beforeSeq (integer >= 0), so a caller steps back past a bad
  *   one. A header whose parts are gone is skipped (onSkip hook), never returned. null = none.
  * @property {(tenant: string, board: string) => Promise<number>} openEpoch
@@ -180,7 +181,11 @@ export function checkPend(sha1, ttlMs) {
   if (!posInt(ttlMs) || ttlMs > MAX_PENDING_MS) throw bad(`ttlMs must be a positive integer up to ${MAX_PENDING_MS}`);
 }
 
-/** `blobCondemned`'s and `blobClaim`'s numbers and cursor. */
+/**
+ * `blobCondemned`'s and `blobClaim`'s numbers and cursor.
+ * @param {{ graceMs?: number, claimMs?: number, limit?: number, after?: { tenant: string, sha1: string } | null }} [o]
+ * @param {{ claim?: boolean }} [opts]
+ */
 export function checkReap({ graceMs, claimMs, limit, after } = {}, { claim = false } = {}) {
   if (!Number.isSafeInteger(graceMs) || graceMs < 0) throw bad("graceMs must be a non-negative integer");
   if (claim) { if (!posInt(claimMs)) throw bad("claimMs must be a positive integer"); return; }

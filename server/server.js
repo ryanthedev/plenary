@@ -1,3 +1,4 @@
+// @ts-check
 // One program, two roles (CLAUDE.md, M2): a gateway and a room host joined by a bus, behind one Bun HTTP server.
 // `roles` picks them (default both, as on a single node):
 //   gateway + host  as below; the host also answers other nodes' remote opens (`plen-hosts.open`).
@@ -25,14 +26,21 @@ const json = (status, body) => new Response(JSON.stringify(body), { status, head
 
 /**
  * @param {{
- *   auth: object, registry: object, store: object, bus: object, blobs?: object, log?: object,
+ *   auth: import("./auth/port.js").Auth,
+ *   registry: { board(id: string): Promise<{ id: string, tenant: string }|null> },
+ *   store: import("./store/port.js").Store,
+ *   bus: import("./bus/port.js").Bus,
+ *   blobs?: import("./blobs/port.js").Blobs | null,
+ *   log?: { debug?(msg: string, f?: object): void, info(msg: string, f?: object): void, warn(msg: string, f?: object): void, error(msg: string, f?: object): void },
  *   port?: number, hostname?: string,
- *   http?: (req: Request, url: URL) => Response | undefined | Promise<Response | undefined>,
- *   blobKey?: Uint8Array, quotaBytes?: number, publicUrl?: string, maxBlobPuts?: number, blobHttp?: object, idleTimeoutSec?: number,   // blobHttp: more blobRoutes options (maxPutsPerUser, bodyDeadlineMs, timers). blobs: ≥ 32-byte signing key (default: random per process), tenant quota, the origin signed URLs name (default none: a path)
- *   metrics?: object, metricsEndpoint?: { token: string, render: () => string },   // metrics: the Metrics port given to the gateway and the room host (default: records nothing); metricsEndpoint: turns /metrics on
- *   limits?: object, host?: object, static?: false | { mounts?: { url: string, dir: string }[] },
- *   roles?: { gateway: boolean, host: boolean }, node?: string, now?: () => number, timers?: object,
- *   deflate?: (data: string | Uint8Array) => Promise<Uint8Array | null>,   // compresses a shared catch-up text once, for clients that ask (PROTOCOL.md § Joining); absent: everyone gets plain text
+ *   http?: (((req: Request, url: URL) => Response | undefined | Promise<Response | undefined>) & { stats?: () => object }) | null,
+ *   blobKey?: Uint8Array, quotaBytes?: number, blobUsageTtlMs?: number, publicUrl?: string, maxBlobPuts?: number, blobHttp?: Record<string, any>, idleTimeoutSec?: number,
+ *   metrics?: import("./metrics/port.js").Metrics, metricsEndpoint?: { token: string, render: () => string } | null,
+ *   limits?: Record<string, any>, host?: Record<string, any>, static?: false | { mounts?: readonly { url: string, dir: string }[], cache?: boolean },
+ *   roles?: { gateway: boolean, host: boolean }, node?: string, now?: () => number, timers?: Record<string, any>,
+ *   deflate?: ((data: string | Uint8Array) => Promise<Uint8Array | null>) | null,
+ *   onWelcomed?: ((user: string, board: string) => void) | null,
+ *   snapshotTickets?: { issue(board: string, seq: number): Promise<string> } | null,
  * }} o — `port: 0` picks a free port. `host` options go to the room host (tests; main.js passes hostname and
  *   leaseTtlMs). `static: false` serves no web app; an object passes its `mounts` to staticSite (default: the repo's
  *   web/ and packages/, from static.js's own path). `roles`: see the header (default both). `node`: this node's id
@@ -69,7 +77,7 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
         if (url.pathname === "/metrics") return await metricsHttp.handle(req);   // before the host-only 404: a host node is the one with the leases
         if (!gw) return json(404, { error: "not-found" });   // host only: nothing but /health
         if (url.pathname === "/ws") {
-          if (srv.upgrade(req, { data: { z: url.searchParams.get("z") === "deflate" } })) return undefined;   // § Joining: the client can inflate catch-up
+          if (srv.upgrade(req, /** @type {any} */ ({ data: { z: url.searchParams.get("z") === "deflate" } }))) return undefined;   // § Joining: the client can inflate catch-up
           return json(426, { error: "upgrade", message: "this is a WebSocket endpoint" });
         }
         if (blobHttp) { const res = await blobHttp.handle(req, url); if (res) return res; }

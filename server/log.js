@@ -1,3 +1,4 @@
+// @ts-check
 // Structured logs: one JSON object per line on stdout: { time, level, msg, ...fields }.
 // Never pass a frame, a hello, a token or a decode error's text (JSON.parse echoes its input) as a field.
 // As a second line of defence, fields whose key looks like a credential are replaced with "[redacted]".
@@ -7,7 +8,10 @@ const SECRET_KEY = /token|secret|password|passwd|authorization|cookie|credential
 const MAX_STRING = 2000;
 
 function clean(v, depth) {
-  if (v instanceof Error) return { name: v.name, message: clip(v.message), ...(v.code ? { code: String(v.code) } : {}), ...(v.stack ? { stack: clip(v.stack) } : {}) };
+  if (v instanceof Error) {
+    const code = /** @type {Error & { code?: unknown }} */ (v).code;
+    return { name: v.name, message: clip(v.message), ...(code ? { code: String(code) } : {}), ...(v.stack ? { stack: clip(v.stack) } : {}) };
+  }
   if (typeof v === "string") return clip(v);
   if (typeof v === "bigint") return String(v);
   if (typeof v === "function" || typeof v === "symbol") return undefined;

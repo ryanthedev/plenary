@@ -1,3 +1,4 @@
+// @ts-check
 // The gateway: holds the sockets. It decodes frames, proves who is there, and passes verified messages to the
 // board's room over the bus; what the room answers comes back over the bus, already encoded, addressed to a conn.
 //
@@ -132,15 +133,20 @@ const OP_ID = /^\s*\{\s*"t"\s*:\s*"op"\s*,\s*"id"\s*:\s*"([^"\\]{1,256})"/;
 
 /**
  * @param {{
- *   auth: { verify(token: string): Promise<object|null>, role(identity: object, board: string): Promise<string|null> },
+ *   auth: import("./auth/port.js").Auth,
  *   registry: { board(id: string): Promise<{ id: string, tenant: string }|null> },
- *   store: { read: Function, getCheckpoint: Function, epoch: Function, blobPend: Function },
- *   bus: object,
- *   rooms: { open(tenant: string, board: string): Promise<void> },
- *   onWelcomed?: (user: string, board: string) => void,   // called after a connection is welcomed (Recent, PROTOCOL.md § Home); must not throw or block
- *   log?: object, codec?: object, deflate?: (data: string | Uint8Array) => Promise<Uint8Array | null>, id?: string, limits?: Partial<typeof LIMITS>, now?: () => number,
- *   blobUrl?: (tenant: string, board: string, sha1: string, verb: "GET" | "PUT", user: string) => Promise<string>,   // signs a blob URL (blob-access.js); absent: `blob` requests get `unavailable`
- *   metrics?: import("./metrics/port.js").Metrics,   // PROTOCOL.md § Metrics: plenary_connections, plenary_fanout_lag_seconds (default: records nothing)
+ *   store: Pick<import("./store/port.js").Store, "read"|"getCheckpoint"|"epoch"|"blobPend">,
+ *   bus: import("./bus/port.js").Bus,
+ *   rooms: { open(tenant: string, board: string): Promise<any> },
+ *   onWelcomed?: ((user: string, board: string) => void) | null,
+ *   log?: { debug?(msg: string, f?: object): void, info(msg: string, f?: object): void, warn(msg: string, f?: object): void, error(msg: string, f?: object): void },
+ *   codec?: { encode(v: any): any, decode(v: any): any },
+ *   deflate?: ((data: string | Uint8Array) => Promise<Uint8Array | null>) | null,
+ *   id?: string, limits?: Partial<typeof LIMITS>, now?: () => number,
+ *   feedOf?: typeof boardFeed, timers?: Record<string, any>,
+ *   blobUrl?: ((tenant: string, board: string, sha1: string, verb: "GET" | "PUT", user: string) => Promise<string>) | null,
+ *   metrics?: import("./metrics/port.js").Metrics,
+ *   snapshotTickets?: { issue(board: string, seq: number): Promise<string> } | null,
  * }} o
  */
 export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, codec = jsonCodec, id = mintId("gw"), limits = {}, now = Date.now, feedOf = boardFeed, timers = globalThis, deflate = null, blobUrl = null, onWelcomed = null, metrics = noopMetrics, snapshotTickets = null }) {
@@ -472,7 +478,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
   const boards = new Map();
   const welcomedOn = b => [...b.conns].filter(ws => ws.data.state === "live" && ws.data.welcomed);
 
-  function onLive(b, { from, to, at, data }) {
+  function onLive(b, { from, to, at = undefined, data }) {
     if (Number.isFinite(at)) fanoutLag.observe(Math.max(0, now() - at) / 1000);
     const len = bytesOf(data);   // once for the frame, not once per viewer
     for (const ws of b.conns) {
@@ -526,7 +532,7 @@ export function gateway({ auth, registry, store, bus, rooms, log = quietLogger, 
   }
 
   // ---- revocation: a board's `grants` subject, watched from before a hello's role check until its socket closes ----
-  /** @type {Map<string, { gen: number, refs: number, unsub: () => void }>} "tenant/board" → its grants watch */
+  /** @type {Map<string, { gen: number, refs: number, board: string, unsub: () => void }>} "tenant/board" → its grants watch */
   const grantWatches = new Map();
   /**
    * Watch a board's `grants` for this connection. Every message bumps `gen` and re-checks the board's live

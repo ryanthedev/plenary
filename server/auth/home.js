@@ -1,3 +1,4 @@
+// @ts-check
 // The Home screen's read side (PROTOCOL.md § Home): Recent, Starred, Shared with me, the Group/Space tree and search, each
 // holding only boards the person can open NOW (the resolver's answer, never a stored list). Core: depends on the Registry
 // port and `tenancy` (accessMany / effective), imports no adapter.
@@ -46,7 +47,13 @@ export function homeService({ registry, tenancy, now = Date.now }) {
   };
   const card = (f, identity, extra = {}) => ({ id: f.board.id, title: f.board.title, role: f.access.ladder, path: pathOf(f, identity), starred: false, ...extra });
 
-  /** Cards for `entries` ({ id, at? }) in order, dropping what the person can't open; star flags in one query. `keep(found)` filters further. */
+  /**
+   * Cards for `entries` ({ id, at? }) in order, dropping what the person can't open; star flags in one query. `keep(found)` filters further.
+   * @param {any} identity
+   * @param {any} unit
+   * @param {{ id: string, at?: number }[]} entries
+   * @param {{ found?: Map<string, any>, keep?: (f: any) => boolean, can?: boolean }} [opts]
+   */
   async function cards(identity, unit, entries, { found: given, keep, can = !!unit } = {}) {
     const found = given ?? await accessAll(identity, [...new Set(entries.map(e => e.id))]);
     // `can` (the Space page and a member's Home cards, never a guest's): what the person may do to the board, as permissions the resolver already computed (never a role name).
@@ -113,7 +120,7 @@ export function homeService({ registry, tenancy, now = Date.now }) {
     const t = now();
     // What general access alone gives, from the rows in hand (no read); anything more needs the resolver's full answer.
     const noGrants = { unit: [], group: [], space: [], board: [] };
-    const general = (space, group) => resolveAccess({ ctx: { tenant: unit, board: null, space, group, scoped: noGrants, roles: [], teams: {} } }, identity, t).ladder != null;
+    const general = (space, group) => resolveAccess({ ctx: { tenant: unit, board: null, space, group, scoped: noGrants, roles: [], teams: {}, removed: [] } }, identity, t).ladder != null;
     let more = cand.next != null, checks = 0;
     const visible = [], pending = [];
     for (const s of cand.spaces) {

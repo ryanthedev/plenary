@@ -1,3 +1,4 @@
+// @ts-check
 // Tenant bootstrap: make a Workspace domain's tenant exist and name its first admins (brief p5-devadmin).
 // Core over the Registry port; the CLI (scripts/admin-bootstrap.js) and server/main.js's dev path wire it.
 //
@@ -126,9 +127,14 @@ export async function bootstrapTenant({ registry, domain, personal = false, admi
   const shared = [...new Set(contentAdmins.map(normContentAdmin))], personalRoles = [...new Set(contentAdminsPersonal.map(normContentAdmin))];
   const applyContent = async t => {
     const content = [], skipped = [];
+    /** @type {import("../auth/registry-port.js").ScopeRef} */
     const scope = { type: "unit", id: t.id };
-    for (const [users, role] of [[shared, "content-admin"], [personalRoles, "content-admin-personal"]]) for (const user of users) {
-      const subject = { type: "user", id: user }, cur = await registry.scopedGrant(scope, subject);
+    /** @type {[string[], string][]} */
+    const pairs = [[shared, "content-admin"], [personalRoles, "content-admin-personal"]];
+    for (const [users, role] of pairs) for (const user of users) {
+      /** @type {import("../auth/registry-port.js").Subject} */
+      const subject = { type: "user", id: user };
+      const cur = await registry.scopedGrant(scope, subject);
       if (cur === role || (cur === "content-admin-personal" && role === "content-admin")) continue;   // already there (or higher): nothing to do
       if (cur != null && !(cur === "content-admin" && role === "content-admin-personal")) { skipped.push({ user, role: cur }); continue; }   // additive: a user holding another Unit role keeps it, and the caller is told
       await registry.setScopedGrant({ scope, subject, role });

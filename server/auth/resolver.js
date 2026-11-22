@@ -1,3 +1,4 @@
+// @ts-check
 // The permission resolver (PROTOCOL.md § Tenancy, "Resolution"). Pure: every row it reads is handed in, so one rule
 // serves a hello (one user) and a re-check pass (many) and can't disagree with itself.
 //
@@ -82,7 +83,7 @@ export function movedContext(ctx, target) {
 }
 
 /**
- * @param {{ ctx: AccessContext, grant?: Role|null, invites?: object[], links?: (object|null)[], teams?: Set<string> }} rows
+ * @param {{ ctx: AccessContext, grant?: Role|null, invites?: import("./registry-port.js").Invite[], links?: (import("./registry-port.js").Link|null)[], teams?: Set<string> }} rows
  *   ctx: the registry's view of the target's scope chain (registry.accessContext); the target is the innermost scope in
  *   it. grant/invites/links: the board-scope rows of this user (direct grant, invites to their email, link records of
  *   their uses); ignored off a board. teams: this user's Teams (from `teamIndex`), computed from ctx if absent.
@@ -117,7 +118,7 @@ export function resolveAccess({ ctx, grant = null, invites = [], links = [], tea
     const tier = scope.type === "unit" && role !== MEMBER_ROLE_ID ? tierReach(def.permissions, personal) : null;
     const dead = personal && scope.type === "unit" && !tier;
     const perms = dead ? [] : [...new Set([...def.permissions, ...(tier?.perms ?? [])])].filter(p => keep.has(p));
-    sources.push({ kind, scope, role, ...(team ? { team } : {}), permissions: perms, ladder: dead ? null : higher(def.ladder, tier?.ladder ?? null), ...(tier ? { content: tier.via, own: def.ladder } : {}) });
+    sources.push({ kind, scope, role, ...(team ? { team } : {}), permissions: perms, ladder: dead ? null : higher(def.ladder, tier?.ladder ?? null), ...(tier ? { content: /** @type {"content.shared"|"content.personal"} */ (tier.via), own: def.ladder } : {}) });
   };
   /** Grants on a Space, Group or the Unit, or a Team's grant anywhere, count only for the inside; and never the Unit roles `admin` and `member`. */
   const grantsOn = scope => {

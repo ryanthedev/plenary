@@ -1,3 +1,4 @@
+// @ts-check
 // Small helpers for the auth module: base64url, random ids, roles. WebCrypto only (no dependencies).
 
 /** Roles, lowest to highest (PROTOCOL.md § Streams). Kept local: packages/protocol's ports are engine-owned. */

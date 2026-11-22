@@ -1,3 +1,4 @@
+// @ts-check
 // The session token the server issues after sign-in. It travels in `hello.token` (never a header).
 //
 // Format:  s1.<payload>.<mac>
@@ -20,7 +21,7 @@ export async function sessions({ key, ttlSec = 12 * 3600, snapshotTtlSec = 300, 
   if (!Number.isInteger(ttlSec) || ttlSec <= 0) throw new Error("session: ttlSec must be a positive integer");
   if (!Number.isInteger(snapshotTtlSec) || snapshotTtlSec <= 0) throw new Error("session: snapshotTtlSec must be a positive integer");
   if (!Number.isInteger(blobTtlSec) || blobTtlSec <= 0) throw new Error("session: blobTtlSec must be a positive integer");
-  const k = await crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+  const k = await crypto.subtle.importKey("raw", /** @type {BufferSource} */ (raw), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
 
   return {
     /** @param {Identity} id */

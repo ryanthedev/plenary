@@ -1,3 +1,4 @@
+// @ts-check
 // A board's feed, as one gateway sees it: the resolved log, served to clients (PROTOCOL.md rules 3 and 8, § Bus).
 // Core code: depends on the Store and Bus ports only.
 //
@@ -24,8 +25,9 @@ import { breathe } from "./breather.js";
 const EMPTY = { seq: 0, id: null, by: null, at: null, streams: { board: { elements: [], appState: {} }, notes: { elements: [], appState: {} } }, appSeq: { board: {}, notes: {} }, records: { threads: [] }, noteAuthor: [] };
 
 /**
- * @param {{ tenant: string, board: string, store: object, bus: object, onLive: (e: { from: number, to: number, at?: number, data: string }) => void,
- *   log?: object, codec?: object, deflate?: (data: string | Uint8Array) => Promise<Uint8Array | null>, pollMs?: number, chunkBytes?: number, pageSize?: number, pageBytes?: number, rebaseEvery?: number, rebaseBytes?: number, zSlack?: number, random?: () => number }} o
+ * @param {{ tenant: string, board: string, store: Pick<import("./store/port.js").Store, "read"|"getCheckpoint"|"epoch">, bus: Pick<import("./bus/port.js").Bus, "subscribe">, onLive: (e: { from: number, to: number, at?: number, data: string }) => void,
+ *   log?: { info?(msg: string, f?: object): void, warn(msg: string, f?: object): void, error(msg: string, f?: object): void },
+ *   codec?: { encode(v: any): any, decode(v: any): any }, deflate?: ((data: string | Uint8Array) => Promise<Uint8Array | null>) | null, pollMs?: number, chunkBytes?: number, pageSize?: number, pageBytes?: number, rebaseEvery?: number, rebaseBytes?: number, zSlack?: number, random?: () => number, now?: () => number, timers?: Record<string, any> }} o
  *   deflate: compresses one catch-up text once (PROTOCOL.md § Joining); absent, or answering null for a frame, joiners get it plain.
  *   zSlack: bytes of new entries after which the open last chunk's compressed prefix is made again (default 16 KiB).
  *   random: the backoff's jitter source, [0, 1) (tests pass a fixed one).
@@ -38,7 +40,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
   const key = `${tenant}/${board}`;
   const self = {
     tenant, board, seq: 0, epoch: 0, ready: /** @type {Promise<void> | null} */ (null), close: /** @type {() => void} */ (() => {}), closed: false, gapAt: 0,
-    base: EMPTY, tail: [],   // tail: [{ seq, id, by, at, text }], seq = base.seq + 1 …
+    base: /** @type {Record<string, any>} */ (EMPTY), tail: [],   // tail: [{ seq, id, by, at, text }], seq = base.seq + 1 …
     snap: null, zTails: new Map(), chunks: [], chunksLen: 0, lastHeard: now(), nextRebase: rebaseEvery, tailBytes: 0, nextRebaseBytes: rebaseBytes,
     cpHeard: null, lookedAt: 0, retries: 0, looks: 0, failures: 0, skip: 0, failedFor: 0,   // the checkpoint look (rebase, below)
   };
@@ -284,6 +286,7 @@ export function boardFeed({ tenant, board, store, bus, onLive, log = quietLogger
     if (z && part.z) return [{ data: part.z, bytes: part.z.byteLength, shared: shared + "/z", z: true }];
     const pre = z && part.from !== undefined && !part.z ? zTailOf(part) : null;
     if (pre) {
+      /** @type {{ data: any, bytes: number, shared: string | false, z?: boolean }[]} */
       const out = [{ data: pre.z, bytes: pre.z.byteLength, shared: `${key}/c${self.base.seq}.${part.from}-${pre.to}/z`, z: true }];
       if (part.to > pre.to) {
         const cut = frameOf(self.tail.slice(pre.to - self.base.seq, part.to - self.base.seq));

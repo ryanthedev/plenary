@@ -1,3 +1,4 @@
+// @ts-check
 // The web app over HTTP (brief p-serve): a driving adapter that serves the canvas page and the modules it imports.
 // It imports only node: built-ins (no room host, gateway or driven adapter), and server.js mounts it as the last
 // fallback, after /health, /ws and platform's routes.
@@ -151,9 +152,9 @@ const extOf = p => { const i = p.lastIndexOf("."); return i > p.lastIndexOf("/")
 
 /**
  * Build the servable set and the request handler.
- * @param {{ mounts?: { url: string, dir: string }[], log?: { info: Function, warn: Function } }} [o]
+ * @param {{ mounts?: readonly { url: string, dir: string }[], log?: { info: Function, warn: Function }, cache?: boolean }} [o]
  *   mounts: URL prefix (ends with "/") -> folder; the first is the web root (index.html, style.css, main.js).
- * @returns {{ handle: (req: Request, url?: URL) => Promise<Response | null>, files: Map<string, string>, skipped: object[] }}
+ * @returns {{ handle: (req: Request, url?: URL) => Promise<Response | null>, files: Map<string, string>, skipped: object[], build: string }}
  *   files: URL path -> real file path (what is served). skipped: what the scan found and left out, with why.
  */
 export function staticSite({ mounts = DEFAULT_MOUNTS, log = { info() {}, warn() {} }, cache = false } = {}) {

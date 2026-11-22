@@ -1,3 +1,4 @@
+// @ts-check
 // Roles (PROTOCOL.md § Roles, #50). Core: depends on the Registry port and `tenancy`, imports no adapter; the HTTP routes only translate.
 // Every decision is the PERMISSION `roles.manage` read from the resolver's answer at the Unit root (`tenancy.effective`), never a role name.
 //
@@ -52,8 +53,8 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
   const unitWide = st => st.admin;
   /** No escalation: the caller holds every permission (a Unit admin is exempt from the management ones, never from the content tier: only a holder passes `content.*` on, #88). */
   const within = (st, perms) => [...perms].every(p => st.access.permissions.has(p) || (st.admin && !TIER_PERMS.includes(p)));
-  const scopesOf = (id, roles) => Object.fromEntries(SCOPES.map(t => [t, [...(roleDef(id, t, roles)?.permissions ?? [])]]));
-  const allMgmt = id => mgmtOf({ permissions: new Set(SCOPES.flatMap(t => [...(roleDef(id, t, new Map())?.permissions ?? [])])) });
+  const scopesOf = (id, roles) => Object.fromEntries(SCOPES.map(t => [t, [...(roleDef(id, /** @type {import("./permissions.js").ScopeType} */ (t), roles)?.permissions ?? [])]]));
+  const allMgmt = id => mgmtOf({ permissions: new Set(SCOPES.flatMap(t => [...(roleDef(id, /** @type {import("./permissions.js").ScopeType} */ (t), new Map())?.permissions ?? [])])) });
 
   /** One role as the screen shows it. `used`: `{ places, capped }` (custom), `{ members, capped }` (member), or null (built-in). */
   function view(role, roles, used = null, st = null) {

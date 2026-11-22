@@ -1,3 +1,4 @@
+// @ts-check
 // How a big checkpoint is stored as parts (PROTOCOL.md § Recovery, "Checkpoint parts"). Pure helpers shared by the Store
 // adapters (server/store/sqlite.js, postgres.js); this folder is adapter-only support (test/architecture.test.js).
 //

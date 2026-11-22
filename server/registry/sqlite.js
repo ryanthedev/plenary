@@ -1,3 +1,4 @@
+// @ts-check
 // The Registry port on SQLite (PROTOCOL.md § Registry): tenants (Units), boards, grants, invites, share links, link uses, and
 // the board organization (Groups, Spaces, Teams, scoped grants, roles, `accessContext`). Start-up only ever ADDS tables
 // (CREATE TABLE IF NOT EXISTS); a file from an older shape is refused (code "old-format"), never migrated.
@@ -35,7 +36,7 @@ const parseCursor = before => {
 
 /**
  * @param {{ path: string, now?: () => number, fullfsync?: boolean, busyTimeoutMs?: number,
- *   busy?: { clock?: () => number, onAttempt?: (budgetMs: number) => void } }} o
+ *   busy?: { clock?: () => number, onAttempt?: (budgetMs: number) => void } }} opts
  *   `path` is a file (":memory:" for throwaway use). `busy` (tests): the clock the start-up budget is read on
  *   (default Date.now) and a hook told the busy_timeout each start-up attempt was given.
  * @returns {import("../auth/registry-port.js").Registry & { close(): Promise<void>, pragmas(): object }}
@@ -142,6 +143,10 @@ const createSchema = d => {
     d.run("CREATE INDEX IF NOT EXISTS reg_audit_board ON reg_audit (tenant, board, at DESC, id DESC)");
 };
 
+/**
+ * @param {import("bun:sqlite").Database} db
+ * @param {{ path: string, now?: () => number, fullfsync?: boolean, busyTimeoutMs?: number, busy?: { clock?: () => number, onAttempt?: (budgetMs: number) => void } }} opts
+ */
 function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 5000, busy = {} }) {
   const { clock = Date.now, onAttempt } = busy;
   let open = true;
@@ -899,6 +904,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   /** `accessContexts`: every scope's context from ONE transaction (one snapshot). */
   const contextsTx = db.transaction((list, users) => list.map(sc => [sc.type + "\n" + sc.id, contextTx(sc.type, sc.id, users, null)]));
 
+  /** @type {import("../auth/registry-port.js").Registry & { close(): Promise<void>, pragmas(): object, idemSize(): number }} */
   const api = {
     async createTenant({ name = null, domain, domains = [], kind = "company", admins = [] }) {
       ready();
@@ -922,7 +928,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     },
     async listPersonalTenants() {
       ready();
-      return q.personalTenants.all().map(rowTenant);
+      return q.personalTenants.all().map(r => rowTenant(r));
     },
     async tenantAdminsAmong(users) { ready(); return q.adminsAmong.all(JSON.stringify(users.filter(str))).map(r => r.member); },
     async addTenantAdmin(tenant, user) {
@@ -954,14 +960,14 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     async tenantsForMember(email) {
       ready();
       const e = normEmail(email);
-      return e ? q.tenantsForMember.all(e).map(rowTenant) : [];
+      return e ? q.tenantsForMember.all(e).map(r => rowTenant(r)) : [];
     },
     async tenantsForAdmin(user, email = null) {
       ready();
       if (!str(user) || !user) return [];
       const e = normEmail(email);
       const rows = e ? q.tenantsForAdmin2.all(user, "email:" + e) : q.tenantsForAdmin1.all(user);
-      return rows.map(rowTenant);
+      return rows.map(r => rowTenant(r));
     },
 
     async createBoard({ tenant, title = "", memberRole, space, owner, idem }) {
@@ -1095,7 +1101,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       const rows = str(tenant) ? q.trashedSpaces.all(tenant, cur, n + 1, TRASH.sizeCap + 1).map(r => ({ ...rowSpace(r), boards: r.boards })) : [];
       return { spaces: rows.slice(0, n), next: rows.length > n ? rows[n - 1].id : null };
     },
-    async trashDue({ before, limit, claimed, after } = {}) {
+    async trashDue({ before, limit, claimed, after } = /** @type {any} */ ({})) {
       ready();
       if (!Number.isFinite(before)) throw new Error("registry: bad time");
       const n = smallLimit(limit, TRASH.due.default, TRASH.due.max);
@@ -1181,7 +1187,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
         ts,
       );
     },
-    async listAudit({ tenant, board = null, limit = 50, before = null } = {}) {
+    async listAudit({ tenant, board = null, limit = 50, before = null } = /** @type {any} */ ({})) {
       ready();
       if (!str(tenant)) return { events: [], nextBefore: null };
       if (board != null && !str(board)) return { events: [], nextBefore: null };
@@ -1441,7 +1447,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       const edge = q.searchEdge.all(tenant, cur, cap - 1);          // [last board examined, one more] when the Unit goes on past the window
       return { ids, next: edge.length === 2 ? edge[0].id : null };
     },
-    async spaceCandidates(tenant, { user, all = false, personal = false, after = null, limit } = {}) {
+    async spaceCandidates(tenant, { user, all = false, personal = false, after = null, limit } = /** @type {any} */ ({})) {
       ready();
       const cur = orgDefaults.cursor(after, "id"), n = smallLimit(limit, HOME.candidates.spaces.default, HOME.candidates.spaces.max);
       if (!str(tenant) || !str(user)) return { spaces: [], groups: [], next: null };
@@ -1449,11 +1455,11 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       const gids = [...new Set(page.map(r => r.grp).filter(Boolean))];
       return { spaces: page.map(rowSpace), groups: gids.length ? q.groupsByIds.all(JSON.stringify(gids)).map(rowGroup) : [], next: rows.length > n ? page[n - 1].id : null };
     },
-    async groupCandidates(tenant, { user, all = false, limit } = {}) {
+    async groupCandidates(tenant, { user, all = false, limit } = /** @type {any} */ ({})) {
       ready();
       return str(tenant) && str(user) ? q.groupCand.all(tenant, user, all ? 1 : 0, smallLimit(limit, HOME.candidates.groups.default, HOME.candidates.groups.max)).map(rowGroup) : [];
     },
-    async boardRows(ids, { user, email = null } = {}) {
+    async boardRows(ids, { user, email = null } = /** @type {any} */ ({})) {
       ready();
       const out = new Map(), bs = [...new Set((ids ?? []).filter(str))].slice(0, HOME.batch);
       if (!bs.length || !str(user)) return out;

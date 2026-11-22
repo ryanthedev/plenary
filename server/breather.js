@@ -1,3 +1,4 @@
+// @ts-check
 // Everything here runs on one event loop, and a durable append is a synchronous fsync. So a long run of work (one
 // writer's burst of thousands of ops, a rebuild of a long log) must hand the loop back now and then, or every
 // other board, socket and /health request on the process waits for the whole run. `breathe()` is awaited between

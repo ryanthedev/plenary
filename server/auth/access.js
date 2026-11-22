@@ -1,3 +1,4 @@
+// @ts-check
 // Teams and access (PROTOCOL.md § Teams and access, #49). Core: depends on the Registry port and `tenancy`, imports no adapter; the HTTP
 // routes only translate. Every decision is a PERMISSION read from the resolver's answer at the scope the request names (`tenancy.effective`),
 // never a role name. Names are access: an id the caller may not use (unknown, another Unit's, hidden) is one answer and the same Registry work.
@@ -55,6 +56,7 @@ export function grantable(access, role, type, roles, exempt) {
 
 /**
  * @param {{ registry: import("./registry-port.js").Registry, tenancy: ReturnType<typeof import("./tenancy.js").tenancy>,
+ *   now?: () => number, explainer?: ReturnType<typeof explainService>,
  *   announce?: (unit: { id: string }, scope: { type: string, id: string }, o?: { revoke?: boolean }) => void,
  *   backlog?: () => number, settled?: () => Promise<void>, log?: { warn(msg: string, f?: object): void } }} deps
  *   announce: hands a change to the announcement scheduler (spaceService.announceChange); backlog / settled: its load, so a long walk waits instead of piling up.
@@ -151,7 +153,7 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
     if (!p.scopes.length) return true;
     const roles = new Map((await registry.roles(unit.id)).map(r => [r.id, r]));
     const containers = p.scopes.filter(s => s.type !== "board");
-    const got = containers.length ? await tenancy.effectiveMany(identity, containers.map(s => ({ type: s.type, id: s.id }))) : new Map();
+    const got = containers.length ? await tenancy.effectiveMany(identity, containers.map(s => ({ type: /** @type {"group"|"space"|"unit"} */ (s.type), id: s.id }))) : new Map();
     const subject = { type: "team", id: team };
     for (const sc of p.scopes) {
       if (!validAt(sc.role, sc.type, roles)) continue;                          // a stale role counts for nothing: nothing to give or take
@@ -203,14 +205,14 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
 
   /**
    * The scope row and the caller's access to it: the SAME two reads whatever the id, so a refusal can't be told from another by how much work it did.
-   * @returns {Promise<{ row: object, access: import("./resolver.js").Access, type: string }|null>}
+   * @returns {Promise<{ row: any, access: import("./resolver.js").Access, type: string }|null>}
    */
   async function scopeOf(identity, unit, type, id) {
     if (!TYPES.includes(type) || !idOf(id)) return null;
     const [row, access] = type === "board"
       ? await Promise.all([registry.board(id), tenancy.effective(identity, id, { uniform: true })])
       : await Promise.all([type === "unit" ? registry.tenant(id) : type === "group" ? registry.group(id) : registry.space(id), tenancy.effective(identity, { type, id })]);
-    const tenant = type === "unit" ? row?.id : row?.tenant;
+    const tenant = type === "unit" ? row?.id : /** @type {any} */ (row)?.tenant;
     return row && unit && tenant === unit.id ? { row, access, type } : null;
   }
   /** A personal space's access is its owner's own. */
@@ -231,7 +233,7 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
     if (!list.length) return [];
     const label = await named(unit, list.map(r => ({ type: "user", id: r.user })));
     // Every directory row is a Unit member (only members are recorded), so they stand as members of the Unit's first domain.
-    const ids = list.map(r => ({ user: r.user, email: label({ type: "user", id: r.user }).email, domain: unit.domains?.[0] ?? null }));
+    const ids = list.map(r => ({ user: r.user, name: null, email: label({ type: "user", id: r.user }).email, domain: unit.domains?.[0] ?? null }));
     const got = await tenancy.effectiveAmong(scope, ids);
     return list.filter(r => !reaches(got.get(r.user), r.role, scope.type, roles))
       .map(r => ({ user: label({ type: "user", id: r.user }), role: r.role, roleName: roleLabel(r.role, roles), at: r.at }));
@@ -358,7 +360,9 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
       if (type === "board" || type === "space") {
         const space = type === "board" ? await registry.space(row.space) : row;
         const group = type === "space" ? (row.group ? await registry.group(row.group) : null) : space?.group ? await registry.group(space.group) : null;
-        const cands = type === "board" ? [space && { type: "space", row: space }, group && { type: "group", row: group }] : [group && { type: "group", row: group }];
+        const cands = type === "board"
+          ? [space && { type: /** @type {"space"} */ ("space"), row: space }, group && { type: /** @type {"group"} */ ("group"), row: group }]
+          : [group && { type: /** @type {"group"} */ ("group"), row: group }];
         const list = cands.filter(Boolean);
         const got = await tenancy.effectiveMany(identity, list.map(c => ({ type: c.type, id: c.row.id })));
         const closed = [];
@@ -378,6 +382,7 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
       const canRemove = (role, g) => canTouch(role, g) || (manage && hasTier(role, type, roles));   // clearing a content-tier grant never widens access: any manager may
       const toRow = (g, extra = {}) => ({ subject: nameOfSubject(g.subject), role: g.role, roleName: roleLabel(g.role, roles), via: g.subject.type === "team" ? "team" : "direct", ...extra });
       const rows = rawRows.map(g => toRow(g, { can: { change: canTouch(g.role, g.subject), remove: canRemove(g.role, g.subject) } }));
+      /** @type {any[]} */
       const inherited = above.flatMap((c, i) => inheritedPages[i].grants.map(g => ({ scope: { type: c.type, id: c.row.id, name: c.row.name }, subject: nameOfSubject(g.subject), role: g.role, roleName: roleLabel(g.role, roles), via: "inherited" })));
       for (const g of unitGrants) inherited.push({ scope: { type: "unit", id: unit.id }, subject: nameOfSubject(g.subject), role: g.role, roleName: roleLabel(g.role, roles), via: "inherited" });
       const general = [];
@@ -450,7 +455,7 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
         else if (!(await registry.teamsAmong(unit.id, [sid])).length) throw refused();
       }
       try {
-        if (personBoard) await registry.setGrant(row.id, sid, role);
+        if (personBoard) await registry.setGrant(row.id, sid, /** @type {import("./registry-port.js").Role | null} */ (role));
         else await registry.setScopedGrant({ scope, subject: sub, role });
       } catch (err) {
         if (err?.code === "last-owner") throw new AdminError("last-owner", `a ${type} keeps at least one owner`);

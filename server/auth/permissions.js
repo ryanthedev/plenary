@@ -1,3 +1,4 @@
+// @ts-check
 // Permissions and roles (PROTOCOL.md § Tenancy, "Permissions"). Pure data and functions; no I/O. The server checks
 // PERMISSIONS, never role names: `roleDef` turns any role held at a scope into the permissions it grants there plus
 // the board-content ladder role it gives the live room. The room only ever sees that one ladder role.

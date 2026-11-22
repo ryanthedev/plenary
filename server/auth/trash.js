@@ -1,3 +1,4 @@
+// @ts-check
 // Trash and restore (PROTOCOL.md § Trash and restore, #54). Core: depends on the Registry port and `tenancy`, imports no adapter; the HTTP routes only translate.
 //
 // Every check is a PERMISSION read from the resolver's answer (`delete`), never a role name. A target in Trash answers `{ ladder: null, permissions: {delete?}, trashed }`
@@ -95,7 +96,13 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
       try { out = await registry.trashBoard({ board: d.row.id, from, by: identity.user, idem }); } catch (e) { throw asAdminError(e); }
       return { board: boardOut(out.board, await spaceView(identity, from), d.access), trashed: out.trashed, ...clockOf(out.board.trashedAt), undo: out.trashed ? { restore: true } : null };
     },
-    /** The replay of a keyed trash: the caller still holds `delete` (the resolver keeps it on a trashed board). `ref` is `<board>:trashed` or `<board>:noop`. */
+    /**
+     * The replay of a keyed trash: the caller still holds `delete` (the resolver keeps it on a trashed board). `ref` is `<board>:trashed` or `<board>:noop`.
+     * @param {any} identity
+     * @param {string} boardId
+     * @param {{ from?: string }} [o]
+     * @param {string} [ref]
+     */
     async replayTrash(identity, boardId, { from } = {}, ref = "") {
       const d = await deleter(identity, boardId);
       if (d.row.trashedAt == null) throw new AdminError("moved", "the board has been restored since");
@@ -167,6 +174,7 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
       const manage = access.permissions.has("delete") && !!row;
       if (!unit || !row || row.tenant !== unit.id || !access.trashed || !(manage || could(access))) throw refused();
       const t = now(), withSpace = row.trashedWith != null;
+      /** @type {Record<string, any>} */
       const out = { board: { id: row.id, ...(could(access) ? { title: row.title } : {}) }, ...clockOf(access.trashed.at), daysLeft: daysLeft(access.trashed.at, t), canRestore: manage && !withSpace };
       if (out.canRestore) {
         const dest = await destination(identity, { unit, row, access });
@@ -182,7 +190,7 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
         const gAccess = grp ? await tenancy.effective(identity, { type: "group", id: grp }) : null;
         const g = grp && gAccess && could(gAccess) ? await registry.group(grp) : null;
         out.by = name(access.trashed.by);
-        out.from = { space: space.name ? space : null, group: g ? { id: g.id, name: g.name } : null };
+        out.from = { space: "name" in space && space.name ? space : null, group: g ? { id: g.id, name: g.name } : null };
       }
       return out;
     },
@@ -218,10 +226,10 @@ export function trashService({ registry, tenancy, spaces, now = Date.now }) {
       after = null;
       for (let page = 0; ; page++) {
         const p = await registry.trashedSpaces(unit.id, { after, limit: LIMITS.page });
-        const scopes = p.spaces.map(s => ({ type: "space", id: s.id })).slice(0, HOME.batch);
+        const scopes = p.spaces.map(s => ({ type: /** @type {"space"} */ ("space"), id: s.id })).slice(0, HOME.batch);
         const got = scopes.length ? await tenancy.effectiveMany(identity, scopes) : new Map();
         const groups = [...new Set(p.spaces.map(s => s.group).filter(Boolean))].slice(0, HOME.batch);
-        const gGot = groups.length ? await tenancy.effectiveMany(identity, groups.map(id => ({ type: "group", id }))) : new Map();
+        const gGot = groups.length ? await tenancy.effectiveMany(identity, groups.map(id => ({ type: /** @type {"group"} */ ("group"), id }))) : new Map();
         for (const s of p.spaces) {
           const a = got.get("space\n" + s.id);
           if (!a?.trashed || !a.permissions.has("delete")) continue;

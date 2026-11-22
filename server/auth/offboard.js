@@ -1,3 +1,4 @@
+// @ts-check
 // Leaver offboarding (PROTOCOL.md § Leaver offboarding, #55). Core: depends on the Registry port and `tenancy`, imports no adapter; the HTTP routes only translate.
 //
 // Three steps, in this order, each one atomic in the Registry: list what the leaver solely owns (`ownedAlone`), reassign each item (`reassignOwner`, a compare-and-set), then remove the
@@ -17,6 +18,10 @@ import { normEmail } from "./util.js";
 export const LIMITS = Object.freeze({ items: 50, boards: 100 });
 
 const refused = () => new AdminError("forbidden", "not allowed");
+/**
+ * @param {string} m
+ * @param {ConstructorParameters<typeof AdminError>[0]} [code]
+ */
 const bad = (m, code = "bad-request") => new AdminError(code, m);
 const userIdOf = v => (typeof v === "string" && v.length > 0 && v.length <= 200 && !/[\0\n]/.test(v) && !v.startsWith("email:") ? v : null);
 const plainName = id => String(id).replace(/^[a-z]+:/, "");
@@ -86,7 +91,7 @@ export function offboardService({ registry, tenancy, announce = () => {}, manage
     const leaver = await leaverOf(unit, userId);
     const [row, access] = await Promise.all([type === "space" ? registry.space(id) : registry.group(id), tenancy.effective(identity, { type, id })]);
     if (!row || row.tenant !== unit.id) throw refused();
-    if (type === "space" && row.kind === "personal") { if (!openable(access) || !holdsTier(access)) throw refused(); throw bad("a personal space is handed over with the removal", "personal"); }
+    if (type === "space" && "kind" in row && row.kind === "personal") { if (!openable(access) || !holdsTier(access)) throw refused(); throw bad("a personal space is handed over with the removal", "personal"); }
     if (!reassignable(access, type, admin)) throw refused();
     if (to === identity.user && !holdsTier(access)) throw refused();               // handing a shared item to yourself is taking its content: it needs the tier (#88)
     const recipient = await registry.memberState(unit.id, to);

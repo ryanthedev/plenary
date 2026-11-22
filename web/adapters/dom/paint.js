@@ -21,6 +21,18 @@ export const FACES = {
   sans: "Helvetica, Arial, sans-serif",
 };
 
+/** Maximum canvas backing-store pixel area (≈ 8 MP): keeps 3× iPhones crisp within WKWebView GPU limits. */
+export const MAX_CANVAS_PIXELS = 8_388_608;
+
+/** Compute effective DPR capped so `cssW * cssH * dpr^2 <= maxPixels`. */
+export function cappedDpr(cssW, cssH, dpr = 1, maxPixels = MAX_CANVAS_PIXELS) {
+  const w = Math.max(1, num(cssW, 1)), h = Math.max(1, num(cssH, 1));
+  const raw = num(dpr, 1) > 0 ? num(dpr, 1) : 1;
+  const area = w * h * raw * raw;
+  if (area <= maxPixels) return raw;
+  return Math.max(1, Math.sqrt(maxPixels / (w * h)));
+}
+
 /** Light and dark themes in core's shape ({ fg, bg, accent, dim }), as in core/export.js. */
 export const THEMES = {
   light: { fg: "#1e1e1e", bg: "#ffffff", accent: "#6965db", dim: "#868e96" },

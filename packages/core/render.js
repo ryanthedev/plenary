@@ -8,9 +8,63 @@
 
 import { DEFAULT_STROKE, isShape, isLinear, isLabel, textSize } from "./model.js";
 import { bbox, resolvedPoints, drawnPoints, toWorld, angleOf, centerOf, labelAnchor } from "./geometry.js";
+import { spatialIndex } from "./spatial.js";
 import { animState } from "./anim.js";
 import { labelLines, textWidth } from "./text.js";
 import { cornerRadius, roundPolygon, fillLines, arrowheadCmds, fontClass } from "./style.js";
+
+/** View-independent world-space geometry cache keyed by element object (auto-GC'd on doc edits). */
+const geoCache = new WeakMap();
+const _f64 = new Float64Array(1);
+const _u32 = new Uint32Array(_f64.buffer);
+function pointsSig(pts) {
+  if (!pts || !pts.length) return "";
+  let h1 = 2166136261 >>> 0, h2 = 335903614 >>> 0;
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i];
+    _f64[0] = p[0] || 0;
+    h1 = Math.imul(h1 ^ _u32[0], 16777619) >>> 0;
+    h1 = Math.imul(h1 ^ _u32[1], 16777619) >>> 0;
+    h2 = Math.imul(h2 ^ (_u32[0] + i), 2246822519) >>> 0;
+    _f64[0] = p[1] || 0;
+    h1 = Math.imul(h1 ^ _u32[0], 16777619) >>> 0;
+    h1 = Math.imul(h1 ^ _u32[1], 16777619) >>> 0;
+    h2 = Math.imul(h2 ^ (_u32[1] ^ (i << 5)), 3266489917) >>> 0;
+  }
+  return `${pts.length}:${h1.toString(36)}:${h2.toString(36)}`;
+}
+const geoSig = el => `${el.version ?? 0}:${el.versionNonce ?? 0}:${el.x}:${el.y}:${el.width}:${el.height}:${el.angle ?? 0}:${el.roundness?.type ?? ""}:${el.elbowed ? 1 : 0}:${pointsSig(el.points)}`;
+
+function cachedOutline(el, stats) {
+  const sig = geoSig(el);
+  const hit = geoCache.get(el);
+  if (hit && hit.sig === sig && hit.outline) {
+    if (stats) stats.cacheHits = (stats.cacheHits ?? 0) + 1;
+    return hit.outline;
+  }
+  if (stats) stats.cacheMisses = (stats.cacheMisses ?? 0) + 1;
+  const pts = outlinePoints(el);
+  geoCache.set(el, { ...(hit?.sig === sig ? hit : { sig }), outline: pts });
+  return pts;
+}
+
+function cachedLinear(doc, el, stats) {
+  // Bound arrows depend on their target shapes' positions, so never cache their routed points on `el` alone.
+  if (el.startBinding?.elementId || el.endBinding?.elementId) {
+    if (stats) stats.cacheMisses = (stats.cacheMisses ?? 0) + 1;
+    return el.type === "freedraw" ? resolvedPoints(doc, el) : drawnPoints(doc, el);
+  }
+  const sig = geoSig(el);
+  const hit = geoCache.get(el);
+  if (hit && hit.sig === sig && hit.linear) {
+    if (stats) stats.cacheHits = (stats.cacheHits ?? 0) + 1;
+    return hit.linear;
+  }
+  if (stats) stats.cacheMisses = (stats.cacheMisses ?? 0) + 1;
+  const pts = el.type === "freedraw" ? resolvedPoints(doc, el) : drawnPoints(doc, el);
+  geoCache.set(el, { ...(hit?.sig === sig ? hit : { sig }), linear: pts });
+  return pts;
+}
 
 export function rng(seed) {
   let s = (seed >>> 0) || 1;
@@ -186,7 +240,7 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
   }
 
   if (isShape(el)) {
-    const pts = outlinePoints(el).map(p => Q(p[0], p[1]));
+    const pts = cachedOutline(el, opts.stats).map(p => Q(p[0], p[1]));
     if (el.type === "frame") {
       out.push({ t: "path", id: el.id, cmds: pts.map((p, i) => [i ? "L" : "M", ...p]), stroke: theme.dim, width: 1, dash: null, opacity });
       out.push({ t: "text", id: el.id + ":name", x: pts[0][0], y: pts[0][1] - 18 * Math.min(1, s), text: el.name || "Frame", size: 12 * Math.min(1, s) + 2, color: theme.dim, align: "left", lineHeight: 1.2, opacity });
@@ -206,7 +260,7 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
   }
 
   if (isLinear(el) && stroke) {
-    let pts = (el.type === "freedraw" ? resolvedPoints(doc, el) : drawnPoints(doc, el)).map(p => Q(p[0], p[1]));
+    let pts = cachedLinear(doc, el, opts.stats).map(p => Q(p[0], p[1]));
     pts = trim(pts, progress);
     const cmds = [];
     if (el.type === "freedraw") {
@@ -235,7 +289,15 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
 // The whole board. `opts.time` (ms) plays the timeline; omit it for the editing view.
 export function paintScene(doc, view, theme, opts = {}) {
   const out = [], P = project(view), seen = clipTest(doc, view, opts);
-  for (const el of doc.visible()) if (!seen || seen(el)) paintElement(doc, el, P, view, theme, out, opts);
+  let candidates;
+  if (opts.clip && opts.time === undefined) {
+    const s = view.scale, x0 = -view.x, y0 = -view.y, x1 = x0 + opts.clip.w / s, y1 = y0 + opts.clip.h / s, m = 40 / s;
+    candidates = spatialIndex(doc).queryRect(x0 - m, y0 - m, x1 + m, y1 + m);
+  } else {
+    candidates = doc.visible();
+  }
+  if (opts.stats) opts.stats.visited = (opts.stats.visited ?? 0) + candidates.length;
+  for (const el of candidates) if (!seen || seen(el)) paintElement(doc, el, P, view, theme, out, opts);
   return opts.allText ? out : out.filter(it => it.t !== "text" || !(it.size < TEXT_MIN));
 }
 

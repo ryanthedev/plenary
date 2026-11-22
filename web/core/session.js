@@ -248,6 +248,7 @@ export function createSession({ join, token, board, client = "web", tab = null, 
     return hitTest(n.doc, w, n.tol()) ?? shapeAt(n.doc, w);
   }
   s.pointerDown = (p, m = {}) => {
+    eds.board.cancelCamera(); eds.notes.cancelCamera();
     const pan = m.button === "middle" || m.space || s.tool === "hand" || !may();
     if (pan) { s.gesture = s.active; const ed = eds[s.active]; const t = ed.tool; ed.tool = "hand"; ed.pointerDown(p, m); ed.tool = t; return; }
     if (s.tool === "note") { s.gesture = null; s.placeNote(world(p)); return; }
@@ -278,11 +279,11 @@ export function createSession({ join, token, board, client = "web", tab = null, 
     prune(); ed.pointerUp(p, m); prune(); s.syncView(s.gesture ?? s.active); s.gesture = null;
     if (ed.tool === "select" && s.tool !== "select" && s.tool !== "highlighter" && !ed.toolLock && !["note", "image", "hand"].includes(s.tool)) { s.tool = "select"; onChange(); }
   };
-  s.wheel = (d, p, m = {}) => { eds[s.active].wheel(d, p, m); s.syncView(); };
-  s.zoomAt = (scale, p) => { eds.board.zoomAt(scale, p); s.syncView("board"); };
-  s.fit = () => { const els = [...eds.board.doc.visible(), ...eds.notes.doc.visible()].filter(e => !isLabel(e)); eds.board.fit(els); s.syncView("board"); };
-  s.goToFrame = id => { eds.board.goToFrame(id); s.syncView("board"); };
-  s.stepFrame = n => { eds.board.stepFrame(n); s.syncView("board"); };
+  s.wheel = (d, p, m = {}) => { eds.board.cancelCamera(); eds.notes.cancelCamera(); eds[s.active].wheel(d, p, m); s.syncView(); };
+  s.zoomAt = (scale, p) => { eds.board.cancelCamera(); eds.notes.cancelCamera(); eds.board.zoomAt(scale, p); s.syncView("board"); };
+  s.fit = opts => { const els = [...eds.board.doc.visible(), ...eds.notes.doc.visible()].filter(e => !isLabel(e)); eds.notes.cancelCamera(); eds.board.fit(els, 40, opts); s.syncView("board"); };
+  s.goToFrame = (id, opts) => { eds.notes.cancelCamera(); eds.board.goToFrame(id, opts); s.syncView("board"); };
+  s.stepFrame = (n, opts) => { eds.notes.cancelCamera(); eds.board.stepFrame(n, opts); s.syncView("board"); };
 
   /** A sticky note at a world point: a filled rectangle, then type its label. */
   s.placeNote = (at, text) => s.act("notes", n => {

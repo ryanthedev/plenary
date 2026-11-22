@@ -323,17 +323,17 @@ test("jumpTo (the collab port's): centres a world point, at an optional scale cl
   const { S, hooks, step } = rig;
   const B = S.eds.board, centre = () => B.toWorld({ x: B.size.w / 2, y: B.size.h / 2 });
   const s0 = B.view.scale;
-  hooks.jumpTo({ x: 400, y: 250 }); step();
+  hooks.jumpTo({ x: 400, y: 250 }); step(16);
   expect(B.view.scale).toBe(s0);
   expect(centre()).toEqual({ x: 400, y: 250 });
-  hooks.jumpTo({ x: -100, y: 30, scale: 2.5 }); step();
+  hooks.jumpTo({ x: -100, y: 30, scale: 2.5 }); step(16);
   expect(B.view.scale).toBe(2.5);
   expect(centre().x).toBeCloseTo(-100); expect(centre().y).toBeCloseTo(30);
-  expect(S.eds.notes.view).toEqual(B.view);                   // both Editors share the view
-  hooks.jumpTo({ x: 0, y: 0, scale: 50 }); step(); expect(B.view.scale).toBe(8);
-  hooks.jumpTo({ x: 0, y: 0, scale: 0.001 }); step(); expect(B.view.scale).toBe(0.1);
+  expect(S.eds.notes.view).toEqual(B.view);                   // both Editors share the view (including final animation frame)
+  hooks.jumpTo({ x: 0, y: 0, scale: 50 }); step(16); expect(B.view.scale).toBe(8);
+  hooks.jumpTo({ x: 0, y: 0, scale: 0.001 }); step(16); expect(B.view.scale).toBe(0.1);
   expect(centre().x).toBeCloseTo(0);
-  hooks.jumpTo({ x: 0, y: 0, scale: NaN }); step(); expect(B.view.scale).toBe(0.1);
+  hooks.jumpTo({ x: 0, y: 0, scale: NaN }); step(16); expect(B.view.scale).toBe(0.1);
   expect(text(find(page.byId.hudBL, e => e.className === "pct" && /%$/.test(e.textContent)))).toBe("10%");
 });
 
@@ -700,7 +700,7 @@ test("p8-tidy zoomToFit, wired: on the page a cluster zooms to 8× (the page's m
   const clusters = () => app.collab.layer.all().filter(e => /\bcluster\b/.test(e.className));
   const big = () => clusters().reduce((a, b) => (Number(b.textContent) > Number(a.textContent) ? b : a));
   expect(clusters().length).toBeGreaterThan(0);
-  big().click(); step(3);
+  big().click(); step(16);
   expect(S.eds.board.view.scale).toBe(8);                          // past the old cap of 4, clamped by jumpTo's 8
   expect(app.ui.drawer).toBe(null);
   expect(clusters().length).toBeGreaterThan(0);                    // 320 in 30×20 at 8×: still over the cap
@@ -868,4 +868,82 @@ test("p8-tidyv R3-H1: a message on the old socket while the link is down (a resy
   deliver({ t: "here", writerCount: 1, viewers: 3 });           // the old socket still delivers while down
   net.advance(200); step(1);                                     // the probe fires before the backoff
   expect(reopens()).toBe(1);
+});
+
+test("M3 camera: jumpTo / fit / flingCamera animate smoothly and sync board & notes views on the final frame", () => {
+  rig = setup({ collab: true });
+  const { S, hooks, step } = rig;
+  const B = S.eds.board, N = S.eds.notes;
+  const startScale = B.view.scale;
+  hooks.jumpTo({ x: 300, y: 200, scale: 3 });
+  step(2);   // mid-animation: moving toward 3, not yet settled
+  expect(B.view.scale).toBeGreaterThan(startScale);
+  expect(B.view.scale).toBeLessThan(3);
+  expect(N.view).toEqual(B.view);
+
+  // Step until the exact final frame settles; notes.view MUST match board.view on that final frame.
+  let guard = 0;
+  while (B.hasCameraMotion() && guard++ < 40) step(1);
+  expect(B.hasCameraMotion()).toBe(false);
+  expect(B.view.scale).toBe(3);
+  expect(N.view).toEqual(B.view);
+
+  // Inertia fling: final frame also syncs notes.view with board.view.
+  B.flingCamera(600, -400);
+  guard = 0;
+  while (B.hasCameraMotion() && guard++ < 200) step(1);
+  expect(B.hasCameraMotion()).toBe(false);
+  expect(N.view).toEqual(B.view);
+
+  // Escape hatch: animate: false snaps synchronously.
+  hooks.jumpTo({ x: -50, y: 75, scale: 1.5 }, { animate: false });
+  expect(B.hasCameraMotion()).toBe(false);
+  expect(B.view.scale).toBe(1.5);
+  expect(N.view).toEqual(B.view);
+});
+
+test("M3 camera: pointerDown, wheel, and zoomAt cancel camera motion on both board and notes editors", () => {
+  rig = setup();
+  const { S, step } = rig;
+  const B = S.eds.board, N = S.eds.notes;
+  drawRect(S, 100, 100);
+  S.setTool("note");
+  S.active = "notes";
+  expect(S.active).toBe("notes");
+
+  // pointerDown cancels active motion on both board (fit) and notes (fling)
+  S.fit();
+  N.flingCamera(300, -200);
+  expect(B.hasCameraMotion()).toBe(true);
+  expect(N.hasCameraMotion()).toBe(true);
+  S.pointerDown({ x: 200, y: 200 }, { space: true });
+  S.pointerUp({ x: 200, y: 200 });
+  expect(B.hasCameraMotion()).toBe(false);
+  expect(N.hasCameraMotion()).toBe(false);
+
+  // wheel cancels active motion on both editors even when s.active === "notes"
+  S.fit();
+  N.flingCamera(300, -200);
+  expect(B.hasCameraMotion()).toBe(true);
+  expect(N.hasCameraMotion()).toBe(true);
+  S.wheel({ x: 20, y: 10 }, { x: 400, y: 300 });
+  expect(B.hasCameraMotion()).toBe(false);
+  expect(N.hasCameraMotion()).toBe(false);
+  const afterWheel = { ...B.view };
+  step(5);
+  expect(B.view).toEqual(afterWheel);
+  expect(N.view).toEqual(afterWheel);
+
+  // zoomAt cancels active motion on both editors
+  S.fit();
+  N.flingCamera(300, -200);
+  expect(B.hasCameraMotion()).toBe(true);
+  expect(N.hasCameraMotion()).toBe(true);
+  S.zoomAt(1.5, { x: 400, y: 300 });
+  expect(B.hasCameraMotion()).toBe(false);
+  expect(N.hasCameraMotion()).toBe(false);
+  const afterZoom = { ...B.view };
+  step(5);
+  expect(B.view).toEqual(afterZoom);
+  expect(N.view).toEqual(afterZoom);
 });

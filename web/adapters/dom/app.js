@@ -8,7 +8,7 @@ import { parsePanel, serializePanel, applyPanel, panelLayout, dragWidth } from "
 import { isMermaid } from "../../../packages/core/mermaid.js";
 import { isLabel } from "../../../packages/core/model.js";
 import { parseLibrary } from "../../../packages/core/library.js";
-import { paint, imageCache, THEMES, color as safeColor } from "./paint.js";
+import { paint, imageCache, THEMES, color as safeColor, cappedDpr } from "./paint.js";
 import { toolsFor, pillFor, pillTitleFor, connectionBanner, expiryNotice, shouldProbe, RESUME_PROBE_MS } from "../../core/roles.js";
 
 /** The resume probe's jitter window (ms) for a page role (uiRole: presenter | annotator | viewer; null = not known yet). */
@@ -72,10 +72,14 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // Centre the board on a world point; `scale` (optional: a cluster click zooms in) is clamped to the page's zoom
   // limits, and the centre is worked out at the new scale.
   const ZOOM_MIN = 0.1, ZOOM_MAX = 8;
-  const jumpTo = p => {
+  const jumpTo = (p, { animate = true } = {}) => {
     const B = S.eds.board, { w, h: hh } = B.size;
     const sc = Number.isFinite(p.scale) && p.scale > 0 ? Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, p.scale)) : B.view.scale;
-    B.view = { ...B.view, scale: sc, x: w / 2 / sc - p.x, y: hh / 2 / sc - p.y }; B.changed(); S.syncView("board"); chromeDirty = true;
+    const target = { scale: sc, x: w / 2 / sc - p.x, y: hh / 2 / sc - p.y };
+    S.eds.notes.cancelCamera();
+    if (animate && p.animate !== false) B.animateViewTo(target);
+    else { B.cancelCamera(); B.view = { ...B.view, ...target }; B.changed(); S.syncView("board"); }
+    chromeDirty = true;
   };
   const port = collabPort ? collabPort(S, { jumpTo }) : null;
   // The clock port (C-6) and the frame scheduler.
@@ -135,7 +139,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   ink.addEventListener("blur", () => { const ed = S.textEditor(); if (ed?.text) ed.commitText(); });
 
   new ResizeObserver(() => {
-    const r = $("#canvas").getBoundingClientRect(), dpr = devicePixelRatio || 1;
+    const r = $("#canvas").getBoundingClientRect(), dpr = cappedDpr(r.width, r.height, devicePixelRatio || 1);
     canvas.width = Math.round(r.width * dpr); canvas.height = Math.round(r.height * dpr);
     S.setSize(r.width, r.height); dirty = true; chromeDirty = true;
   }).observe($("#canvas"));
@@ -386,7 +390,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const label = e => (e.type === "text" ? e.text : labels.get(e.id)?.text) || { freedraw: "Highlight / drawing", image: "Picture", arrow: "Arrow", line: "Line" }[e.type] || "Note";
     const rows = notes.slice(0, 200).map(e => {
       const mine = S.isMine(e.id), canChange = may && mine;
-      const jump = () => { N.fit([e]); S.syncView("notes"); chromeDirty = true; };
+      const jump = () => { S.eds.board.cancelCamera(); N.fit([e]); S.syncView("notes"); chromeDirty = true; };
       return h("div.note-row", {}, h("span.sw", { style: { background: safeColor(e.backgroundColor !== "transparent" ? e.backgroundColor : e.strokeColor), width: "10px", height: "10px" } }),
         h("div.txt", {}, h("div", {}, label(e)),
           h("div.meta", {}, h("span", { style: { fontWeight: 600 } }, S.mine.has(e.id) ? "You" : "—"), e.type === "freedraw" ? h("span", {}, "highlight") : null),
@@ -448,7 +452,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   function mermaidPreview(cv) {
     const x = cv.getContext("2d"), theme = THEMES[ui.theme], scratch = new Editor();
     scratch.setSize(cv.width, cv.height);
-    try { if (!isMermaid(ui.mermaid.src)) throw new Error("Not a Mermaid flowchart (start with flowchart or graph)"); scratch.importMermaid(ui.mermaid.src, undefined, { elbow: ui.mermaid.elbow }); scratch.fit(undefined, 12); scratch.select([]); }
+    try { if (!isMermaid(ui.mermaid.src)) throw new Error("Not a Mermaid flowchart (start with flowchart or graph)"); scratch.importMermaid(ui.mermaid.src, undefined, { elbow: ui.mermaid.elbow }); scratch.fit(undefined, 12, { animate: false }); scratch.select([]); }
     catch (e) { paint(x, [], { width: cv.width, height: cv.height, background: theme.bg }); x.fillStyle = theme.dim; x.font = "12px system-ui"; x.fillText(String(e.message ?? e).slice(0, 60), 10, 20); return false; }
     paint(x, scratch.displayList(theme), { width: cv.width, height: cv.height, background: theme.bg });
     return true;
@@ -679,8 +683,15 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (S.mine.size !== savedMine) { savedMine = S.mine.size; put(mineKeyOf(mineUser), JSON.stringify([...S.mine].slice(-5000))); }
   }
   // First catch-up done: show everything once.
-  function fitOnce() { if (fitted || S.status !== "live") return; fitted = true; if (S.eds.board.doc.live().length || S.eds.notes.doc.live().length) S.fit(); }
+  function fitOnce() { if (fitted || S.status !== "live") return; fitted = true; if (S.eds.board.doc.live().length || S.eds.notes.doc.live().length) S.fit({ animate: false }); }
+  let lastFrameAt = clock.mono();
   (function frame() {
+    const nowAt = clock.mono(), dt = Math.max(0, Math.min(100, nowAt - lastFrameAt));
+    lastFrameAt = nowAt;
+    if (dt > 0) {
+      if (S.eds.board.hasCameraMotion()) { S.eds.board.stepCamera(dt); S.eds.notes.view = { ...S.eds.board.view }; dirty = true; }
+      else if (S.eds.notes.hasCameraMotion()) { S.eds.notes.stepCamera(dt); S.eds.board.view = { ...S.eds.notes.view }; dirty = true; }
+    }
     const live = S.eds.board.needsTick() || S.eds.notes.needsTick();
     if (dirty || live || seen !== S.version()) { dirty = false; draw(); seen = S.version(); }
     collabTick();

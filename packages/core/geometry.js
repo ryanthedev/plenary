@@ -3,6 +3,7 @@
 import { isShape, isLinear, isLabel, textSize } from "./model.js";
 import { elbowRoute } from "./elbow.js";
 import { labelLines } from "./text.js";
+import { spatialIndex } from "./spatial.js";
 
 export function bbox(el) {
   if (isLinear(el)) {
@@ -128,8 +129,9 @@ export function hits(doc, el, p, tol) {
 // smallest unfilled shape the point is inside: empty boxes are selectable from
 // anywhere inside, but a big one drawn on top doesn't block the shapes under it.
 // Frames stay click-through inside so a marquee can start within them.
-export function hitTest(doc, p, tol = 6) {
-  const els = doc.visible();
+export function hitTest(doc, p, tol = 6, opts) {
+  const els = spatialIndex(doc).queryPoint(p.x, p.y, tol + 24);
+  if (opts?.stats) opts.stats.checked = (opts.stats.checked ?? 0) + els.length;
   for (let i = els.length - 1; i >= 0; i--) if (hits(doc, els[i], p, tol)) return els[i];
   let best = null, area = Infinity;
   for (const el of els) {

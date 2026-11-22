@@ -67,6 +67,8 @@ export class Editor {
     this.play = null;            // { t0, from } while the timeline plays
     this.scrub = null;           // a paused timeline time, or null for the editing view
     this.flash = null;
+    this.camAnim = null;         // M3: smooth camera animation { from, to, elapsed, duration }
+    this.camVel = null;          // M3: pan inertia velocity { vx, vy } in screen px/s
     this.version = 0;            // bumps on any visible change; adapters may diff on it
   }
 
@@ -213,6 +215,7 @@ export class Editor {
   // ── pointer input (screen px) ──────────────────────────────────────────
 
   pointerDown(p, m = {}) {
+    this.cancelCamera();
     if (this.text) this.commitText();
     // A press that arrives mid-gesture means we missed a release (outside the pane): finish it first.
     if (this.g && this.g.kind !== "poly") this.pointerUp(this.g.last ?? p, {});
@@ -309,7 +312,20 @@ export class Editor {
     g.last = p;
     const w = this.toWorld(p);
     switch (g.kind) {
-      case "pan": this.view = { ...g.view, x: g.view.x + (p.x - g.start.x) / this.view.scale, y: g.view.y + (p.y - g.start.y) / this.view.scale }; return this.changed();
+      case "pan": {
+        const t = this.clock();
+        if (g.prev && t > g.prev.t) {
+          const dt = (t - g.prev.t) / 1000;
+          if (dt > 0 && dt < 0.25) {
+            const ivx = (p.x - g.prev.x) / dt, ivy = (p.y - g.prev.y) / dt;
+            g.vx = g.vx === undefined ? ivx : g.vx * 0.4 + ivx * 0.6;
+            g.vy = g.vy === undefined ? ivy : g.vy * 0.4 + ivy * 0.6;
+          }
+        }
+        g.prev = { x: p.x, y: p.y, t };
+        this.view = { ...g.view, x: g.view.x + (p.x - g.start.x) / this.view.scale, y: g.view.y + (p.y - g.start.y) / this.view.scale };
+        return this.changed();
+      }
       case "marquee": {
         g.end = w;
         const box = normBox(g.start, w);
@@ -346,11 +362,79 @@ export class Editor {
       case "create": return this.finishCreate(g, p);
       case "erase": return this.finishErase();
       case "laser": return;
+      case "pan": {
+        if (g.prev && this.clock() - g.prev.t <= 80 && Math.hypot(g.vx ?? 0, g.vy ?? 0) > 120) this.flingCamera(g.vx, g.vy);
+        return this.changed();
+      }
       default: return this.changed();
     }
   }
 
+  /** Cancel any in-flight camera animation or pan inertia. */
+  cancelCamera() { this.camAnim = null; this.camVel = null; }
+
+  /** Whether a camera animation or inertia fling is currently active. */
+  hasCameraMotion() { return !!(this.camAnim || this.camVel); }
+
+  /** Smoothly animate `this.view` to `target` ({ x, y, scale }) over `durationMs`. Pure & deterministic via `stepCamera(dtMs)`. */
+  animateViewTo(target, { durationMs = 220 } = {}) {
+    const scale = Math.max(0.1, Math.min(8, Number.isFinite(target?.scale) ? target.scale : this.view.scale));
+    const x = Number.isFinite(target?.x) ? target.x : this.view.x;
+    const y = Number.isFinite(target?.y) ? target.y : this.view.y;
+    this.camVel = null;
+    if (!(durationMs > 0)) { this.camAnim = null; this.view = { x, y, scale }; return this.changed(); }
+    this.camAnim = { from: { ...this.view }, to: { x, y, scale }, elapsed: 0, duration: durationMs };
+    this.changed();
+  }
+
+  /** Start pan inertia with screen-space velocity `(vx, vy)` px/s. */
+  flingCamera(vx, vy) {
+    this.camAnim = null;
+    if (!Number.isFinite(vx) || !Number.isFinite(vy) || Math.hypot(vx, vy) < 8) { this.camVel = null; return; }
+    this.camVel = { vx, vy };
+  }
+
+  /** Advance active camera animation or inertia by `dtMs`. Returns `true` if another frame is needed. */
+  stepCamera(dtMs) {
+    if (!(dtMs > 0)) return !!(this.camAnim || this.camVel);
+    if (this.camAnim) {
+      const a = this.camAnim;
+      a.elapsed += dtMs;
+      const t = Math.min(1, a.elapsed / a.duration);
+      if (t >= 1) {
+        this.view = { ...a.to };
+        this.camAnim = null;
+      } else {
+        const e = 1 - (1 - t) ** 3;   // cubic ease-out
+        const scale = a.from.scale * (a.to.scale / a.from.scale) ** e;
+        this.view = {
+          x: a.from.x + (a.to.x - a.from.x) * e,
+          y: a.from.y + (a.to.y - a.from.y) * e,
+          scale,
+        };
+      }
+      this.changed();
+      return !!this.camAnim;
+    }
+    if (this.camVel) {
+      const dt = Math.min(dtMs, 100) / 1000;
+      const decay = Math.exp(-Math.min(dtMs, 100) / 180);
+      this.view = {
+        ...this.view,
+        x: this.view.x + (this.camVel.vx * dt) / this.view.scale,
+        y: this.view.y + (this.camVel.vy * dt) / this.view.scale,
+      };
+      this.camVel.vx *= decay;
+      this.camVel.vy *= decay;
+      if (Math.hypot(this.camVel.vx, this.camVel.vy) < 8) this.camVel = null;
+      this.changed();
+      return !!this.camVel;
+    }
+    return false;
+  }
+
   wheel(delta, p, m = {}) {
+    this.cancelCamera();
     if (m.ctrl || m.cmd) {
       const f = Math.exp(-delta.y * 0.01);
       return this.zoomAt(this.view.scale * f, p);
@@ -360,6 +444,7 @@ export class Editor {
   }
 
   zoomAt(next, p = { x: this.size.w / 2, y: this.size.h / 2 }) {
+    this.cancelCamera();
     next = Math.max(0.1, Math.min(8, next));
     const w = this.toWorld(p);
     this.view = { scale: next, x: p.x / next - w.x, y: p.y / next - w.y };
@@ -1073,12 +1158,16 @@ export class Editor {
 
   // ── view ───────────────────────────────────────────────────────────────
 
-  fit(els = this.doc.visible().filter(e => !isLabel(e)), pad = 40) {
-    if (!els.length) { this.view = { x: 40, y: 40, scale: 1 }; return this.changed(); }
-    const b = unionBox(els.map(bounds));
-    const scale = Math.max(0.1, Math.min(1, Math.min((this.size.w - pad * 2) / (b.w || 1), (this.size.h - pad * 2) / (b.h || 1))));
-    this.view = { scale, x: (this.size.w / scale - b.w) / 2 - b.x, y: (this.size.h / scale - b.h) / 2 - b.y };
-    this.changed();
+  fit(els = this.doc.visible().filter(e => !isLabel(e)), pad = 40, { animate = true } = {}) {
+    const target = !els.length
+      ? { x: 40, y: 40, scale: 1 }
+      : (() => {
+        const b = unionBox(els.map(bounds));
+        const scale = Math.max(0.1, Math.min(1, Math.min((this.size.w - pad * 2) / (b.w || 1), (this.size.h - pad * 2) / (b.h || 1))));
+        return { scale, x: (this.size.w / scale - b.w) / 2 - b.x, y: (this.size.h / scale - b.h) / 2 - b.y };
+      })();
+    if (animate) this.animateViewTo(target);
+    else { this.cancelCamera(); this.view = target; this.changed(); }
   }
 
   // ── frames as pages ────────────────────────────────────────────────────
@@ -1089,18 +1178,18 @@ export class Editor {
       .sort((a, b) => (Math.abs(a.y - b.y) < 40 ? a.x - b.x : a.y - b.y));
   }
   // Show one frame filling the view (it becomes the current page).
-  goToFrame(id) {
+  goToFrame(id, opts) {
     const fs = this.frames(), i = fs.findIndex(f => f.id === id); if (i < 0) return;
-    this.frameAt = id; this.fit([fs[i]], 24);
+    this.frameAt = id; this.fit([fs[i]], 24, opts);
     this.flash = `${fs[i].name || "Frame"} · ${i + 1} of ${fs.length}`;
   }
   // The next (step 1) or previous (-1) frame after the current one, wrapping around.
-  stepFrame(step) {
+  stepFrame(step, opts) {
     const fs = this.frames();
     if (!fs.length) { this.flash = "no frames yet: F draws one, then they're pages"; return this.changed(); }
     const i = fs.findIndex(f => f.id === this.frameAt);
     const next = i < 0 ? (step > 0 ? 0 : fs.length - 1) : (i + step + fs.length) % fs.length;
-    this.goToFrame(fs[next].id);
+    this.goToFrame(fs[next].id, opts);
   }
 
   // ── keys ───────────────────────────────────────────────────────────────

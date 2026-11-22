@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 // @ts-check
-// Plenary Agent CLI: interact with a Plenary server's HTTP Admin API and Protocol v1.1 WebSocket rooms.
+// Plenary Agent CLI v2: interact with a Plenary server's HTTP Admin API and Protocol v1.1 WebSocket rooms.
 //
 // Auth: PLENARY_URL and PLENARY_TOKEN env vars, or --url / --token flags.
 // Output: JSON to stdout by default; errors to stderr. Exit 0 = ok, 2 = usage error, 1 = runtime/API error.
@@ -30,11 +30,18 @@ Commands:
   get-audit               [--board <id>] [--scope <board|tenant>] [--limit <n>] [--before <cursor>]
   read-board              --board <id>
   add-elements            --board <id> (--elements <json> | --file <path>) [--stream <board|notes>]
+  update-elements         --board <id> (--updates <json> | --file <path>) [--stream <board|notes>]
+  delete-elements         --board <id> (--ids <id1,id2|json> | --file <path>) [--base-versions <json>] [--stream <board|notes>]
+  set-animation           --board <id> --ids <id1,id2|json> (--preset <name> [--start <ms>] [--duration <ms>] [--easing <name>] [--loop] | --anim <json> | --clear) [--base-versions <json>] [--stream <board|notes>]
+  manage-layers           --board <id> --action <list|create|rename|toggle_visible|toggle_locked|reorder> [--id <id>] [--name <name>] [--visible <true|false>] [--locked <true|false>] [--opacity <0-100>] [--order <id1,id2|json>]
+  add-link-card           --board <id> (--link <url> | --card-url <url>) [--title <title>] [--x <n>] [--y <n>] [--width <n>] [--height <n>] [--layer <id>] [--id <id>]
+  list-frames             --board <id>
+  manage-views            --board <id> --action <list|create|delete> [--id <id>] [--name <name>] [--frame-id <id>] [--visible-layers <id1,id2|json>]
   add-mermaid             --board <id> (--source <mermaid> | --file <path>) [--x <n>] [--y <n>] [--layer <id>] [--elbow]
   add-note                --board <id> --text <text> [--x <n>] [--y <n>] [--width <n>] [--height <n>] [--color <hex>]
   add-comment             --board <id> --text <text> [--x <n>] [--y <n>] [--thread <id>] [--element <id>] [--stream <board|notes>]
 
-Aliases: snake_case command names (e.g. list_boards, read_board, add_mermaid) are also accepted.`;
+Aliases: snake_case command names (e.g. list_boards, read_board, update_elements) are also accepted.`;
 
 const COMMAND_ALIASES = {
   "list-boards": "list_boards",
@@ -49,6 +56,20 @@ const COMMAND_ALIASES = {
   "read_board": "read_board",
   "add-elements": "add_elements",
   "add_elements": "add_elements",
+  "update-elements": "update_elements",
+  "update_elements": "update_elements",
+  "delete-elements": "delete_elements",
+  "delete_elements": "delete_elements",
+  "set-animation": "set_animation",
+  "set_animation": "set_animation",
+  "manage-layers": "manage_layers",
+  "manage_layers": "manage_layers",
+  "add-link-card": "add_link_card",
+  "add_link_card": "add_link_card",
+  "list-frames": "list_frames",
+  "list_frames": "list_frames",
+  "manage-views": "manage_views",
+  "manage_views": "manage_views",
   "add-mermaid": "add_mermaid",
   "add_mermaid": "add_mermaid",
   "add-note": "add_note",
@@ -57,7 +78,7 @@ const COMMAND_ALIASES = {
   "add_comment": "add_comment",
 };
 
-const BOOL_FLAGS = new Set(["--help", "-h", "--json", "--elbow", "--tenant"]);
+const BOOL_FLAGS = new Set(["--help", "-h", "--json", "--elbow", "--tenant", "--loop", "--clear"]);
 
 /**
  * Parse CLI argv into `{ help, command, flags, positional }`.
@@ -66,7 +87,9 @@ const BOOL_FLAGS = new Set(["--help", "-h", "--json", "--elbow", "--tenant"]);
 export function parseCliArgs(argv) {
   let command = null;
   let help = false;
+  /** @type {Record<string, any>} */
   const flags = {};
+  /** @type {string[]} */
   const positional = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -120,6 +143,30 @@ function parseIntOpt(val, name) {
   const n = Number(val);
   if (!Number.isInteger(n)) throw new CliUsageError(`${name} must be an integer`);
   return n;
+}
+
+function parseBoolOpt(val, name) {
+  if (val === "true" || val === true) return true;
+  if (val === "false" || val === false) return false;
+  throw new CliUsageError(`${name} must be 'true' or 'false'`);
+}
+
+function parseJsonOpt(raw, name) {
+  try { return JSON.parse(raw); }
+  catch { throw new CliUsageError(`${name} must be valid JSON`); }
+}
+
+/** Parse either a JSON array (`["a","b"]` or `[{"id":"a"}]`) or a comma-separated list (`a,b`). */
+function parseListOrJson(raw, name) {
+  const trimmed = String(raw).trim();
+  if (trimmed.startsWith("[")) {
+    const parsed = parseJsonOpt(trimmed, name);
+    if (!Array.isArray(parsed)) throw new CliUsageError(`${name} must be a JSON array or comma-separated list`);
+    return parsed;
+  }
+  const items = trimmed.split(",").map(s => s.trim()).filter(Boolean);
+  if (items.length === 0) throw new CliUsageError(`${name} must not be empty`);
+  return items;
 }
 
 /**
@@ -204,10 +251,103 @@ export async function runCli(
         if (!board) throw new CliUsageError("add-elements requires --board <id>");
         const rawJson = flags.file !== undefined ? readFileSync(flags.file, "utf8") : flags.elements;
         if (!rawJson) throw new CliUsageError("add-elements requires --elements <json> or --file <path>");
-        let elements;
-        try { elements = JSON.parse(rawJson); }
-        catch { throw new CliUsageError("--elements must be valid JSON"); }
+        const elements = parseJsonOpt(rawJson, "--elements");
         result = await client.addElements({ board, elements, stream: flags.stream ?? "board" });
+        break;
+      }
+      case "update_elements": {
+        if (!board) throw new CliUsageError("update-elements requires --board <id>");
+        const rawJson = flags.file !== undefined ? readFileSync(flags.file, "utf8") : flags.updates;
+        if (!rawJson) throw new CliUsageError("update-elements requires --updates <json> or --file <path>");
+        const updates = parseJsonOpt(rawJson, "--updates");
+        result = await client.updateElements({ board, updates, stream: flags.stream ?? "board" });
+        break;
+      }
+      case "delete_elements": {
+        if (!board) throw new CliUsageError("delete-elements requires --board <id>");
+        const rawIds = flags.file !== undefined ? readFileSync(flags.file, "utf8") : flags.ids;
+        if (!rawIds) throw new CliUsageError("delete-elements requires --ids <id1,id2|json> or --file <path>");
+        const ids = parseListOrJson(rawIds, "--ids");
+        const opts = { board, ids, stream: flags.stream ?? "board" };
+        if (flags["base-versions"] !== undefined) {
+          opts.baseVersions = parseJsonOpt(flags["base-versions"], "--base-versions");
+        }
+        result = await client.deleteElements(opts);
+        break;
+      }
+      case "set_animation": {
+        if (!board) throw new CliUsageError("set-animation requires --board <id>");
+        if (!flags.ids) throw new CliUsageError("set-animation requires --ids <id1,id2|json>");
+        const ids = parseListOrJson(flags.ids, "--ids");
+        let anim;
+        if (flags.clear) {
+          anim = null;
+        } else if (flags.anim !== undefined) {
+          anim = parseJsonOpt(flags.anim, "--anim");
+        } else if (flags.preset !== undefined) {
+          anim = { preset: flags.preset };
+          if (flags.start !== undefined) anim.start = parseNumber(flags.start, "--start");
+          if (flags.duration !== undefined) anim.duration = parseNumber(flags.duration, "--duration");
+          if (flags.easing !== undefined) anim.easing = flags.easing;
+          if (flags.loop !== undefined) anim.loop = Boolean(flags.loop);
+        } else {
+          throw new CliUsageError("set-animation requires --preset <name>, --anim <json>, or --clear");
+        }
+        const opts = { board, ids, anim, stream: flags.stream ?? "board" };
+        if (flags["base-versions"] !== undefined) {
+          opts.baseVersions = parseJsonOpt(flags["base-versions"], "--base-versions");
+        }
+        result = await client.setAnimation(opts);
+        break;
+      }
+      case "manage_layers": {
+        if (!board) throw new CliUsageError("manage-layers requires --board <id>");
+        const action = flags.action ?? (flags.board ? positional[0] : positional[1]);
+        if (!action) throw new CliUsageError("manage-layers requires --action <list|create|rename|toggle_visible|toggle_locked|reorder>");
+        const opts = { board, action };
+        if (flags.id !== undefined) opts.id = flags.id;
+        if (flags.name !== undefined) opts.name = flags.name;
+        if (flags.visible !== undefined) opts.visible = parseBoolOpt(flags.visible, "--visible");
+        if (flags.locked !== undefined) opts.locked = parseBoolOpt(flags.locked, "--locked");
+        if (flags.opacity !== undefined) opts.opacity = parseNumber(flags.opacity, "--opacity");
+        if (flags.order !== undefined) opts.order = parseListOrJson(flags.order, "--order");
+        result = await client.manageLayers(opts);
+        break;
+      }
+      case "add_link_card": {
+        if (!board) throw new CliUsageError("add-link-card requires --board <id>");
+        const cardUrl = flags.link ?? flags["card-url"];
+        if (!cardUrl) throw new CliUsageError("add-link-card requires --link <url> (or --card-url <url>)");
+        const opts = { board, url: cardUrl };
+        if (flags.title !== undefined) opts.title = flags.title;
+        if (flags.x !== undefined) opts.x = parseNumber(flags.x, "--x");
+        if (flags.y !== undefined) opts.y = parseNumber(flags.y, "--y");
+        if (flags.width !== undefined) opts.width = parseNumber(flags.width, "--width");
+        if (flags.height !== undefined) opts.height = parseNumber(flags.height, "--height");
+        if (flags.layer !== undefined) opts.layer = flags.layer;
+        if (flags.id !== undefined) opts.id = flags.id;
+        result = await client.addLinkCard(opts);
+        break;
+      }
+      case "list_frames": {
+        if (!board) throw new CliUsageError("list-frames requires --board <id>");
+        result = await client.listFrames({ board });
+        break;
+      }
+      case "manage_views": {
+        if (!board) throw new CliUsageError("manage-views requires --board <id>");
+        const action = flags.action ?? (flags.board ? positional[0] : positional[1]);
+        if (!action) throw new CliUsageError("manage-views requires --action <list|create|delete>");
+        const opts = { board, action };
+        if (flags.id !== undefined) opts.id = flags.id;
+        if (flags.name !== undefined) opts.name = flags.name;
+        if (flags["frame-id"] !== undefined) {
+          opts.frameId = flags["frame-id"] === "null" ? null : flags["frame-id"];
+        }
+        if (flags["visible-layers"] !== undefined) {
+          opts.visibleLayers = parseListOrJson(flags["visible-layers"], "--visible-layers");
+        }
+        result = await client.manageViews(opts);
         break;
       }
       case "add_mermaid": {
@@ -259,7 +399,12 @@ export async function runCli(
       err(`${e.message}\n\n${USAGE}`);
       return 2;
     }
-    err(JSON.stringify({ ok: false, error: e?.message ?? String(e), code: e?.code ?? "error" }));
+    err(JSON.stringify({
+      ok: false,
+      error: e?.message ?? String(e),
+      code: e?.code ?? "error",
+      ...(e?.details !== undefined ? { details: e.details } : {}),
+    }));
     return 1;
   }
 }

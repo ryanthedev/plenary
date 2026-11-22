@@ -183,6 +183,13 @@ describe("plenary-mcp JSON-RPC handler", () => {
       "add_mermaid",
       "add_note",
       "add_comment",
+      "update_elements",
+      "delete_elements",
+      "set_animation",
+      "manage_layers",
+      "add_link_card",
+      "list_frames",
+      "manage_views",
     ]);
     for (const t of TOOLS) {
       expect(typeof t.description).toBe("string");
@@ -508,7 +515,7 @@ describe("live E2E against real Plenary server (HTTP Admin API + Protocol v1.1 W
     // id 2: ping
     expect(byId.get(2)).toEqual({ jsonrpc: "2.0", id: 2, result: {} });
     // id 3: tools/list
-    expect(byId.get(3).result.tools.length).toBe(9);
+    expect(byId.get(3).result.tools.length).toBe(16);
     // id 4: list_boards
     const listed = JSON.parse(byId.get(4).result.content[0].text);
     expect(listed.boards.some(b => b.id === boardId)).toBe(true);

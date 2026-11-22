@@ -1,15 +1,58 @@
 #!/usr/bin/env bun
 // @ts-check
-// Plenary MCP Server (JSON-RPC 2.0 over stdio).
-// Exposes Plenary HTTP Admin API & Protocol v1.1 board operations as MCP tools.
+// Plenary MCP Server v2 (JSON-RPC 2.0 over stdio).
+// Exposes Plenary HTTP Admin API & Protocol v1.1 board operations as 16 MCP tools.
 // Never writes non-JSON-RPC output to stdout; diagnostics go to stderr only.
 
 import { createPlenaryClient, PlenaryError } from "./plenary-client.js";
 
 export const MCP_PROTOCOL_VERSION = "2024-11-05";
 export const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2024-11-05", "2025-03-26", "2025-06-18"]);
-export const SERVER_INFO = { name: "plenary-mcp", version: "0.1.0" };
+export const SERVER_INFO = { name: "plenary-mcp", version: "0.2.0" };
 export const MAX_LINE_BYTES = 16 * 1024 * 1024; // 16 MiB cap on a single JSON-RPC line
+
+const ANIM_SCHEMA = {
+  type: "object",
+  properties: {
+    preset: { type: "string", description: "Animation preset name (e.g. fade, pop, slide-up, draw, pulse, bounce-in)." },
+    start: { type: "number", minimum: 0, description: "Start time in milliseconds (default 0)." },
+    duration: { type: "number", exclusiveMinimum: 0, description: "Duration in milliseconds." },
+    easing: { type: "string", description: "Optional easing name (linear, ease-in, ease-out, ease-in-out, back-out, spring, bounce)." },
+    loop: { type: "boolean", description: "Optional loop flag." },
+  },
+  required: ["preset"],
+};
+
+const BINDING_SCHEMA = {
+  type: ["object", "null"],
+  properties: {
+    elementId: { type: "string", description: "Target element ID to bind to." },
+    focus: { type: "number", description: "Optional focus offset in [-100, 100] (default 0)." },
+    gap: { type: "number", minimum: 0, description: "Optional gap in pixels (default 6)." },
+    fixedPoint: {
+      type: ["array", "null"],
+      items: { type: "number" },
+      minItems: 2,
+      maxItems: 2,
+      description: "Optional normalized anchor point [fx, fy].",
+    },
+    side: { type: "string", enum: ["top", "right", "bottom", "left"] },
+  },
+  required: ["elementId"],
+};
+
+const CROP_SCHEMA = {
+  type: ["object", "null"],
+  properties: {
+    x: { type: "number", minimum: 0 },
+    y: { type: "number", minimum: 0 },
+    width: { type: "number", exclusiveMinimum: 0 },
+    height: { type: "number", exclusiveMinimum: 0 },
+    naturalWidth: { type: "number", exclusiveMinimum: 0 },
+    naturalHeight: { type: "number", exclusiveMinimum: 0 },
+  },
+  required: ["x", "y", "width", "height"],
+};
 
 export const TOOLS = [
   {
@@ -86,7 +129,7 @@ export const TOOLS = [
   },
   {
     name: "add_elements",
-    description: "Add one or more canvas elements (rectangle, ellipse, diamond, text, arrow, line, frame, etc.) to a board via Protocol v1.1 WebSocket.",
+    description: "Add one or more canvas elements (rectangle, ellipse, diamond, text, arrow, line, frame, freedraw) to a board via Protocol v1.1 WebSocket. Supports layer, anim, startBinding/endBinding, and crop; automatically chunks large batches into ≤512 KB ops.",
     inputSchema: {
       type: "object",
       properties: {
@@ -105,8 +148,14 @@ export const TOOLS = [
               width: { type: "number" },
               height: { type: "number" },
               text: { type: "string" },
+              name: { type: ["string", "null"] },
               strokeColor: { type: "string" },
               backgroundColor: { type: "string" },
+              layer: { type: "string", description: "Target layer ID stored in customData.layer (default 'base')." },
+              anim: ANIM_SCHEMA,
+              startBinding: BINDING_SCHEMA,
+              endBinding: BINDING_SCHEMA,
+              crop: CROP_SCHEMA,
             },
           },
           description: "Array of element specifications to create.",
@@ -173,6 +222,203 @@ export const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "update_elements",
+    description: "Patch existing elements on a board by id with optional per-element baseVersion optimistic concurrency guard (checks synced board version on connect and returns a structured version-conflict error on stale reads; also moves/re-layers bound text labels with their host shape).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        board: { type: "string", description: "Board ID to modify." },
+        stream: { type: "string", enum: ["board", "notes"], description: "Target element stream (default 'board')." },
+        updates: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string", description: "ID of the existing element to patch." },
+              baseVersion: { type: "integer", minimum: 0, description: "Optional expected element version for optimistic concurrency control." },
+              x: { type: "number" },
+              y: { type: "number" },
+              width: { type: "number" },
+              height: { type: "number" },
+              angle: { type: "number" },
+              strokeColor: { type: "string" },
+              backgroundColor: { type: "string" },
+              fillStyle: { type: "string" },
+              strokeStyle: { type: "string" },
+              strokeWidth: { type: "number" },
+              roughness: { type: "number" },
+              opacity: { type: "number" },
+              locked: { type: "boolean" },
+              link: { type: ["string", "null"] },
+              frameId: { type: ["string", "null"] },
+              text: { type: "string" },
+              name: { type: ["string", "null"] },
+              layer: { type: "string" },
+              z: { type: "number" },
+              anim: { oneOf: [ANIM_SCHEMA, { type: "null" }] },
+              startBinding: BINDING_SCHEMA,
+              endBinding: BINDING_SCHEMA,
+              crop: CROP_SCHEMA,
+            },
+            required: ["id"],
+          },
+          description: "Array of element patch objects.",
+        },
+      },
+      required: ["board", "updates"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "delete_elements",
+    description: "Soft-delete (isDeleted: true) one or more elements by id (cascading to bound text labels and clearing bindings on attached arrows) with optional per-element baseVersion optimistic concurrency guard against stale reads.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        board: { type: "string", description: "Board ID to modify." },
+        stream: { type: "string", enum: ["board", "notes"], description: "Target element stream (default 'board')." },
+        ids: {
+          type: "array",
+          minItems: 1,
+          items: {
+            oneOf: [
+              { type: "string" },
+              {
+                type: "object",
+                properties: {
+                  id: { type: "string" },
+                  baseVersion: { type: "integer", minimum: 0 },
+                },
+                required: ["id"],
+              },
+            ],
+          },
+          description: "Array of element IDs (or { id, baseVersion } objects) to soft-delete.",
+        },
+        baseVersions: {
+          type: "object",
+          additionalProperties: { type: "integer", minimum: 0 },
+          description: "Optional map of elementId -> expected version for optimistic concurrency control.",
+        },
+      },
+      required: ["board", "ids"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "set_animation",
+    description: "Set or clear customData.anim (preset, start, duration, easing, loop) on one or more elements on a board.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        board: { type: "string", description: "Board ID to modify." },
+        stream: { type: "string", enum: ["board", "notes"], description: "Target element stream (default 'board')." },
+        ids: {
+          type: "array",
+          minItems: 1,
+          items: { type: "string" },
+          description: "Array of element IDs to animate (or clear animation from).",
+        },
+        anim: {
+          oneOf: [ANIM_SCHEMA, { type: "null" }],
+          description: "Animation spec { preset, start, duration, easing?, loop? }, or null to clear animation.",
+        },
+        baseVersions: {
+          type: "object",
+          additionalProperties: { type: "integer", minimum: 0 },
+          description: "Optional map of elementId -> expected version.",
+        },
+      },
+      required: ["board", "ids", "anim"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "manage_layers",
+    description: "List, create, rename, toggle visibility, toggle lock, or reorder board layers in appState.herdr.layers.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        board: { type: "string", description: "Board ID." },
+        action: {
+          type: "string",
+          enum: ["list", "create", "rename", "toggle_visible", "toggle_locked", "reorder"],
+          description: "Layer management action to perform.",
+        },
+        id: { type: "string", description: "Layer ID (optional for create; required for rename, toggle_visible, toggle_locked)." },
+        name: { type: "string", description: "Layer display name (required for create and rename, max 200 chars)." },
+        visible: { type: "boolean", description: "Explicit visibility (optional for create and toggle_visible)." },
+        locked: { type: "boolean", description: "Explicit lock state (optional for create and toggle_locked)." },
+        opacity: { type: "number", minimum: 0, maximum: 100, description: "Layer opacity 0..100 (optional for create, default 100)." },
+        order: {
+          type: "array",
+          items: { type: "string" },
+          description: "Full permutation of existing layer IDs (required for reorder).",
+        },
+      },
+      required: ["board", "action"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "add_link_card",
+    description: "Parse and add a validated GitHub, Linear, or Jira rich link card element to a board via Protocol v1.1 WebSocket.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        board: { type: "string", description: "Board ID." },
+        url: { type: "string", description: "Strict https:// URL for a GitHub issue/PR/discussion, Linear issue, or Jira issue." },
+        x: { type: "number", description: "X coordinate on the canvas (default 0)." },
+        y: { type: "number", description: "Y coordinate on the canvas (default 0)." },
+        width: { type: "number", exclusiveMinimum: 0, description: "Optional card width (default 340)." },
+        height: { type: "number", exclusiveMinimum: 0, description: "Optional card height (default 112)." },
+        title: { type: "string", description: "Optional display title override." },
+        layer: { type: "string", description: "Optional target layer ID (default 'base')." },
+        id: { type: "string", description: "Optional element ID." },
+      },
+      required: ["board", "url"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "list_frames",
+    description: "List all live frames on a board with { id, name, x, y, width, height, layer }.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        board: { type: "string", description: "Board ID." },
+      },
+      required: ["board"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "manage_views",
+    description: "List, create, or delete Named Presentation Views ({ id, name, frameId, visibleLayers }) in appState.herdr.views.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        board: { type: "string", description: "Board ID." },
+        action: {
+          type: "string",
+          enum: ["list", "create", "delete"],
+          description: "View management action to perform.",
+        },
+        id: { type: "string", description: "View ID (optional for create; required for delete)." },
+        name: { type: "string", description: "View display name (required for create, max 200 chars)." },
+        frameId: { type: ["string", "null"], description: "Optional target frame ID (default null)." },
+        visibleLayers: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional list of visible layer IDs (defaults to currently visible layers on create).",
+        },
+      },
+      required: ["board", "action"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 const TOOL_NAMES = new Set(TOOLS.map(t => t.name));
@@ -193,6 +439,13 @@ export async function executeTool(client, name, args = {}, { signal } = {}) {
     case "get_audit": return client.getAudit(withSig);
     case "read_board": return client.readBoard(withSig);
     case "add_elements": return client.addElements(withSig);
+    case "update_elements": return client.updateElements(withSig);
+    case "delete_elements": return client.deleteElements(withSig);
+    case "set_animation": return client.setAnimation(withSig);
+    case "manage_layers": return client.manageLayers(withSig);
+    case "add_link_card": return client.addLinkCard(withSig);
+    case "list_frames": return client.listFrames(withSig);
+    case "manage_views": return client.manageViews(withSig);
     case "add_mermaid": return client.addMermaid(withSig);
     case "add_note": return client.addNote(withSig);
     case "add_comment": return client.addComment(withSig);
@@ -306,6 +559,7 @@ export function createMcpHandler({ env = process.env, clientFactory } = {}) {
           error: err?.message ?? String(err),
           code: err?.code ?? "tool-error",
           ...(err?.status !== undefined ? { status: err.status } : {}),
+          ...(err?.details !== undefined ? { details: err.details } : {}),
         };
         return okResp(id, {
           content: [{ type: "text", text: JSON.stringify(payload) }],

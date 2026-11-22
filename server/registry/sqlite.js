@@ -115,6 +115,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
   const q = {
     tenant: db.query("SELECT id, domain, created_at FROM reg_tenants WHERE id = ?"),
     tenantByDomain: db.query("SELECT id, domain, created_at FROM reg_tenants WHERE domain = ?"),
+    personalTenants: db.query("SELECT id, domain, created_at FROM reg_tenants WHERE domain IS NULL ORDER BY created_at ASC, id ASC"),
     tenantExists: db.query("SELECT 1 AS x FROM reg_tenants WHERE id = ?"),
     insTenant: db.query("INSERT INTO reg_tenants (id, domain, created_at) VALUES (?, ?, ?)"),
     admins: db.query("SELECT member FROM reg_tenant_admins WHERE tenant = ? ORDER BY n"),
@@ -240,6 +241,10 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     async tenantByDomain(domain) {
       ready();
       return str(domain) && domain ? rowTenant(q.tenantByDomain.get(domain.toLowerCase())) ?? null : null;
+    },
+    async listPersonalTenants() {
+      ready();
+      return q.personalTenants.all().map(rowTenant);
     },
     async addTenantAdmin(tenant, user) {
       ready();

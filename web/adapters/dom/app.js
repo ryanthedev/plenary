@@ -17,6 +17,7 @@ export const probeJitterMs = role => (role === "presenter" ? PROBE_JITTER_MS.pre
 import { renderPanel, loadLibrary, saveLibrary, addToLibrary, propsModel } from "./panel.js";
 import { exportSvg, paintPng, loadPictures } from "./export.js";
 import { h, $, replace } from "./dom.js";
+import { mountShareDialog } from "./admin.js";
 import { mountCollab } from "./collab/ui.js";
 import { collabFrame } from "./collab/frame.js";
 import { hitTest } from "../../../packages/core/geometry.js";
@@ -39,7 +40,7 @@ import { hitTest } from "../../../packages/core/geometry.js";
  *   a refused or expiring page signs in again (href shown, go() remembers the board and leaves); null = no link (dev).
  * @returns {{ S: object, ui: object, net: object, setTheme(t: string): void, openDialog(d: string): void, setPanel(op: object): void }}
  */
-export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null }) {
+export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null, admin = null }) {
   if (!clock || typeof clock.now !== "function" || typeof clock.mono !== "function") throw new Error("mountApp: the clock port is required");
   const get = k => { try { return prefs.get(k); } catch { return null; } };
   const put = (k, v) => { try { prefs.set(k, v); } catch {} };
@@ -833,6 +834,22 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     requestAnimationFrame(frame);
   })();
 
+  let activeShare = null;
+  function openShare() {
+    if (!admin) return null;
+    activeShare?.destroy();
+    activeShare = mountShareDialog({
+      root: $("#dialogs"),
+      board,
+      boardTitle: board,
+      role: S.effective ?? me.role ?? "viewer",
+      isAdmin: S.effective === "owner",
+      admin,
+      origin: globalThis.location?.origin ?? "",
+      onClose: () => { activeShare = null; canvas.focus(); },
+    });
+    return activeShare;
+  }
   if (notice) toast(notice, 6000);
-  return { S, ui, net, collab, port, setTheme, openDialog, setPanel, startComment };
+  return { S, ui, net, collab, port, setTheme, openDialog, openShare, setPanel, startComment };
 }

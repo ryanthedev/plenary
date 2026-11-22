@@ -13,8 +13,10 @@ import { browserClock } from "./adapters/clock/browser.js";
 import { sessionStore } from "./adapters/storage/session.js";
 import { localStore } from "./adapters/storage/local.js";
 import { httpAuth } from "./adapters/auth/http.js";
+import { httpAdmin } from "./adapters/admin/http.js";
 import { wsNet, sameOriginWsUrl } from "./adapters/transport/ws.js";
 import { mountApp } from "./adapters/dom/app.js";
+import { mountBoardsHome } from "./adapters/dom/admin.js";
 import { syncCollabPort } from "./adapters/collab/sync.js";
 import { showGate, hideGate } from "./adapters/dom/gate.js";
 import { takeSignIn, signInNotice } from "./core/signin.js";
@@ -48,27 +50,50 @@ const signInLink = { href: "/auth/login", text: "Sign in with Google" };
 if (!signIn.token) {
   // Signed out on a board's link (an expired sign-in, after a reload): the gate's sign-in comes back to that board.
   if (board) rememberBoard(tabStore, board);
-  showGate({ title: "Sign in to Plenary", detail: signInNotice({ ...signIn, dev: null }) ?? "Sign in with your work Google account to open this board.", link: signInLink });
-} else if (!board) {
-  showGate({ title: "No board in this link", detail: "Open the board from the link you were sent." });
+  showGate({ title: "Sign in to Plenary", detail: signInNotice({ ...signIn, dev: null }) ?? "Sign in with your Google account to open Plenary.", link: signInLink });
 } else {
-  // Display only (p6-landv L5): the room decides the real user and role on every hello (the note lock uses welcome.user).
   const id = signIn.identity;
-  const me = { role: null, user: id?.user ?? "me", name: id?.name ?? id?.email ?? "You" };
-  const net = wsNet({ url: sameOriginWsUrl(location), WebSocket: globalThis.WebSocket, clock, fetch: (...a) => globalThis.fetch(...a) });
-  const app = mountApp({
-    startSession: ({ mine, onChange }) => createSession({
-      join: () => net.join(), fetchSnapshot: net.fetchSnapshot, uploadBlob: net.uploadBlob, fetchBlob: net.fetchBlob, token: signIn.token, board, client: "web", user: me.user, mine, onChange, clock,
-    }),
-    net, board, me, prefs: localStore(), theme: q.get("theme"),
-    // The collaboration UI over this session (presence and records ride the board connection; web/adapters/collab/sync.js).
-    collab: (S, o) => syncCollabPort(S, { name: me.name, ...o }),
-    notice: signInNotice({ ...signIn, dev: null }, me.name),
-    clock,
-    // exp: seconds (the sign-in contract); the page warns before it on the clock's ms scale.
-    expAt: Number.isFinite(signIn.exp) ? signIn.exp * 1000 : null,
-    relogin: { href: signInLink.href, go: () => { rememberBoard(tabStore, board); location.assign(signInLink.href); } },
-  });
-  hideGate();
-  globalThis.plenary = app;
+  const me = { role: null, user: id?.user ?? "me", name: id?.name ?? id?.email ?? "You", email: id?.email ?? null, domain: id?.domain ?? null };
+  const admin = httpAdmin({ origin: location.origin, token: signIn.token, fetch: (...a) => globalThis.fetch(...a) });
+  if (!board) {
+    const appEl = document.querySelector(".app");
+    if (appEl) appEl.hidden = true;
+    const homeRoot = document.createElement("div");
+    homeRoot.id = "boards-home";
+    document.body.append(homeRoot);
+    const theme0 = q.get("theme");
+    const initTheme = theme0 === "dark" || (theme0 !== "light" && matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
+    const setTheme = t => { document.documentElement.dataset.theme = t; };
+    setTheme(initTheme);
+    mountBoardsHome({
+      root: homeRoot,
+      admin,
+      me,
+      onOpenBoard: b => location.assign(`${location.pathname}?board=${encodeURIComponent(b)}`),
+      onLogout: () => { try { tabStore.remove?.("plenary.session"); } catch {} location.assign("/auth/logout"); },
+      onRelogin: () => location.assign(signInLink.href),
+      notice: signInNotice({ ...signIn, dev: null }, me.name),
+      theme: initTheme,
+      setTheme,
+    });
+    hideGate();
+  } else {
+    // Display only (p6-landv L5): the room decides the real user and role on every hello (the note lock uses welcome.user).
+    const net = wsNet({ url: sameOriginWsUrl(location), WebSocket: globalThis.WebSocket, clock, fetch: (...a) => globalThis.fetch(...a) });
+    const app = mountApp({
+      startSession: ({ mine, onChange }) => createSession({
+        join: () => net.join(), fetchSnapshot: net.fetchSnapshot, uploadBlob: net.uploadBlob, fetchBlob: net.fetchBlob, token: signIn.token, board, client: "web", user: me.user, mine, onChange, clock,
+      }),
+      net, board, me, prefs: localStore(), theme: q.get("theme"), admin,
+      // The collaboration UI over this session (presence and records ride the board connection; web/adapters/collab/sync.js).
+      collab: (S, o) => syncCollabPort(S, { name: me.name, ...o }),
+      notice: signInNotice({ ...signIn, dev: null }, me.name),
+      clock,
+      // exp: seconds (the sign-in contract); the page warns before it on the clock's ms scale.
+      expAt: Number.isFinite(signIn.exp) ? signIn.exp * 1000 : null,
+      relogin: { href: signInLink.href, go: () => { rememberBoard(tabStore, board); location.assign(signInLink.href); } },
+    });
+    hideGate();
+    globalThis.plenary = app;
+  }
 }

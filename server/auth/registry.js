@@ -53,6 +53,12 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const id = typeof domain === "string" ? byDomain.get(domain.toLowerCase()) : undefined;
       return id ? copy(tenants.get(id)) : null;
     },
+    async listPersonalTenants() {
+      return [...tenants.values()]
+        .filter(t => t.domain === null)
+        .sort((a, b) => (a.createdAt !== b.createdAt ? a.createdAt - b.createdAt : a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+        .map(copy);
+    },
     async addTenantAdmin(tenant, user) {
       const t = tenants.get(tenant);
       if (!t) throw new Error("registry: no such tenant");

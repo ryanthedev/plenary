@@ -94,7 +94,9 @@ export function normAdmin(a, domain) {
   if (/^google:[^\s]{1,255}$/.test(s) || /^dev:[A-Za-z0-9_.@-]{1,64}$/.test(s)) return s;
   const e = normEmail(s.startsWith("email:") ? s.slice(6) : s);
   if (e && EMAIL.test(e) && e.length <= 320) {
-    if (domain !== undefined && e.slice(e.lastIndexOf("@") + 1) !== domain)
+    if (domain === null && !e.endsWith("@gmail.com"))
+      throw new BootstrapError(`personal tenant email admin must end in @gmail.com (use google:<sub> for other accounts): ${shown(a)}`);
+    if (domain !== undefined && domain !== null && e.slice(e.lastIndexOf("@") + 1) !== domain)
       throw new BootstrapError(`email admin is not on the tenant's domain ${domain}: ${shown(a)}`);
     return "email:" + e;
   }
@@ -102,12 +104,31 @@ export function normAdmin(a, domain) {
 }
 
 /**
- * @param {{ registry: Registry, domain: string, admins?: string[] }} o
+ * @param {{ registry: Registry, domain?: string|null, personal?: boolean, admins?: string[] }} o
  * @returns {Promise<{ tenant: Tenant, created: boolean, added: string[] }>}  `added`: admins this call added
  */
-export async function bootstrapTenant({ registry, domain, admins = [] }) {
-  const d = normDomain(domain);
+export async function bootstrapTenant({ registry, domain, personal = false, admins = [] }) {
   if (!Array.isArray(admins)) throw new BootstrapError("admins must be a list");
+  if (personal) {
+    if (domain !== undefined && domain !== null) throw new BootstrapError("cannot specify both personal and domain");
+    const want = [...new Set(admins.map(a => normAdmin(a, null)))];
+    const existing = typeof registry.listPersonalTenants === "function" ? await registry.listPersonalTenants() : [];
+    let t = existing.find(x => want.some(a => x.admins.includes(a))) ?? existing[0] ?? null;
+    let created = false;
+    if (!t) {
+      t = await registry.createTenant({ domain: null, admins: want });
+      created = true;
+    }
+    const added = created ? want.filter(a => t.admins.includes(a)) : [];
+    for (const a of want) {
+      if (t.admins.includes(a)) continue;
+      await registry.addTenantAdmin(t.id, a);
+      added.push(a);
+    }
+    return { tenant: (await registry.tenant(t.id)) ?? t, created, added };
+  }
+
+  const d = normDomain(domain);
   const want = [...new Set(admins.map(a => normAdmin(a, d)))];
 
   let t = await registry.tenantByDomain(d), created = false;

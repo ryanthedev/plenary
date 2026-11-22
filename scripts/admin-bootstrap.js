@@ -23,9 +23,9 @@ import { bootstrapTenant, normDomain, normAdmin, shown, escapeUnsafe } from "../
 import { sqliteRegistry } from "../server/registry/sqlite.js";
 import { postgresRegistry } from "../server/registry/postgres.js";
 
-const USAGE = "usage: bun scripts/admin-bootstrap.js --domain <domain> --admin <google:sub|dev:name|email> [--admin …] [--data-dir <dir>]";
+const USAGE = "usage: bun scripts/admin-bootstrap.js (--domain <domain> | --personal) --admin <google:sub|dev:name|email> [--admin …] [--data-dir <dir>]";
 
-/** @returns {{ domain?: string, admins: string[], dataDir?: string }} */
+/** @returns {{ domain?: string, personal?: boolean, admins: string[], dataDir?: string }} */
 export function parseArgs(argv) {
   const o = { admins: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -37,12 +37,19 @@ export function parseArgs(argv) {
       if (v === undefined || v.startsWith("--")) throw new UsageError(`${flag} needs a value`);
       return v;
     };
-    if (flag === "--domain") o.domain = value();
-    else if (flag === "--admin") o.admins.push(value());
+    if (flag === "--personal") {
+      if (inline !== undefined) throw new UsageError("--personal takes no value");
+      o.personal = true;
+    } else if (flag === "--domain") {
+      const v = value();
+      if (v.trim().toLowerCase() === "personal") o.personal = true;
+      else o.domain = v;
+    } else if (flag === "--admin") o.admins.push(value());
     else if (flag === "--data-dir") o.dataDir = value();
     else throw new UsageError(`unknown argument: ${shown(flag)}`);   // escaped: argv can hold any byte
   }
-  if (!o.domain) throw new UsageError("--domain is required");
+  if (o.personal && o.domain) throw new UsageError("cannot use both --personal and --domain");
+  if (!o.personal && !o.domain) throw new UsageError("--domain or --personal is required");
   // A tenant with no admins can't create boards; refuse rather than make one. Re-runs still only add.
   if (o.admins.length === 0) throw new UsageError("--admin is required (at least one)");
   return o;
@@ -59,7 +66,7 @@ export async function run(argv, env = {}, { out = s => console.log(s), err = s =
   let args;
   try {   // validate before opening anything
     args = parseArgs(argv);
-    const domain = normDomain(args.domain);
+    const domain = args.personal ? null : normDomain(args.domain);
     for (const a of args.admins) normAdmin(a, domain);
   }
   catch (e) { err(`${e.message}\n${USAGE}`); return 2; }
@@ -73,7 +80,11 @@ export async function run(argv, env = {}, { out = s => console.log(s), err = s =
       registry = sqliteRegistry({ path: join(dir, "registry.db") });
       store = "sqlite";
     }
-    const { tenant, created, added } = await bootstrapTenant({ registry, domain: args.domain, admins: args.admins });
+    const { tenant, created, added } = await bootstrapTenant({
+      registry,
+      ...(args.personal ? { personal: true } : { domain: args.domain }),
+      admins: args.admins,
+    });
     out(JSON.stringify({ ok: true, registry: store, tenant: tenant.id, domain: tenant.domain, created, added, admins: tenant.admins }));
     return 0;
   } catch (e) {

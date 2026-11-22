@@ -247,6 +247,16 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       const r = await one(db, `SELECT id FROM ${T} WHERE domain = $1`, [domain.toLowerCase()]);
       return r ? getTenant(db, r.id) : null;
     },
+    async listPersonalTenants() {
+      ready();
+      const rows = await db.unsafe(`SELECT id FROM ${T} WHERE domain IS NULL ORDER BY created_at ASC, id ASC`);
+      const out = [];
+      for (const r of rows) {
+        const t = await getTenant(db, r.id);
+        if (t) out.push(t);
+      }
+      return out;
+    },
     async addTenantAdmin(tenant, user) {
       ready();
       if (!key(tenant)) throw new Error("registry: no such tenant");

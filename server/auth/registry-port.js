@@ -54,6 +54,7 @@ export const mint = {
  *   createTenant(o: { domain: string|null, admins?: string[] }): Promise<Tenant>,
  *   tenant(id: string): Promise<Tenant|null>,
  *   tenantByDomain(domain: string): Promise<Tenant|null>,
+ *   listPersonalTenants?(): Promise<Tenant[]>,
  *   addTenantAdmin(tenant: string, user: string): Promise<void>,
  *   createBoard(o: { tenant: string, title?: string, memberRole?: Role|null }): Promise<Board>,
  *   board(id: string): Promise<Board|null>,

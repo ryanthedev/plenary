@@ -147,9 +147,27 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
       return { board: l.board };
     },
 
-    /** The tenant an identity belongs to by Workspace domain, or null (no `hd` = guest only). */
+    /** The tenant an identity belongs to by Workspace domain, or a personal (`domain: null`) tenant
+     *  where this verified identity is an admin (or has a board grant/invite/link); else null. */
     async tenantOf(identity) {
-      return identity?.domain ? registry.tenantByDomain(identity.domain) : null;
+      if (!okIdentity(identity)) return null;
+      if (identity.domain) return registry.tenantByDomain(identity.domain);
+      if (typeof registry.listPersonalTenants !== "function") return null;
+      const personal = await registry.listPersonalTenants();
+      if (!personal.length) return null;
+      const email = identity.user.startsWith("google:") ? normEmail(identity.email) : null;
+      for (const t of personal) {
+        if (!identity.user.startsWith("email:") && t.admins.includes(identity.user)) return t;
+        if (email && t.admins.includes("email:" + email)) return t;
+      }
+      if (typeof registry.listBoardsFor === "function") {
+        const at = now();
+        for (const t of personal) {
+          const boards = await registry.listBoardsFor(t.id, identity.user, { email, isMember: false, at });
+          if (boards.length > 0) return t;
+        }
+      }
+      return null;
     },
   };
 }

@@ -46,7 +46,9 @@ async function isTenantAdmin(registry, caller, tenantId) {
   if (!caller.user.startsWith("email:") && t.admins.includes(caller.user)) return true;
   if (!caller.user.startsWith("google:")) return false;
   const email = normEmail(caller.email);
-  return !!email && !!t.domain && caller.domain === t.domain && t.admins.includes("email:" + email);
+  if (!email || !t.admins.includes("email:" + email)) return false;
+  // Workspace tenant: caller's hd must match t.domain. Personal tenant (t.domain === null): consumer Google account (no hd).
+  return t.domain === null ? !caller.domain : caller.domain === t.domain;
 }
 
 /** The board, if the caller may manage it; else throws `forbidden` (unknown board included). */
@@ -76,8 +78,10 @@ async function recordAudit(registry, entry) {
  */
 export async function listBoards({ caller, tenant }, { registry, now = Date.now }) {
   if (!caller || typeof caller.user !== "string" || typeof tenant !== "string") return { boards: [], isAdmin: false };
+  const t = await registry.tenant(tenant);
+  const isMember = Boolean(t && t.domain && caller.domain && t.domain === caller.domain);
   const [boards, isAdmin] = await Promise.all([
-    registry.listBoardsFor(tenant, caller.user, { email: caller.email ?? null, isMember: true, at: now() }),
+    registry.listBoardsFor(tenant, caller.user, { email: caller.email ?? null, isMember, at: now() }),
     isTenantAdmin(registry, caller, tenant),
   ]);
   return { boards, isAdmin };

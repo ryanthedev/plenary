@@ -1,3 +1,4 @@
+// @ts-check
 // The purge of Trash (PROTOCOL.md § Trash and restore, "Purge"). Core: depends on the Registry and Store ports and an injected Clock, nothing else; main.js wires a timer to `sweep()`.
 //
 // Order, per board (every step idempotent, so a crash at any point leaves a claimed row that `trashDue({ claimed: true })` still lists and the next pass, on any node, resumes):
@@ -44,7 +45,9 @@ export function trashSweeper({ registry, store, clock = { now: Date.now }, log =
     const due = await registry.trashDue({ before, limit, claimed: false });
     out.full = due.boards.length >= limit || due.spaces.length >= limit;
     // Spaces first: claiming one claims the boards that went with it.
-    for (const [type, rows] of [["space", due.spaces], ["board", due.boards]]) {
+    /** @type {(["space", { id: string }[]] | ["board", { id: string }[]])[]} */
+    const groups = [["space", due.spaces], ["board", due.boards]];
+    for (const [type, rows] of groups) {
       for (const r of rows) {
         try { if (await registry.purgeClaim({ type, id: r.id, before })) out.claimed++; }
         catch (err) { out.failed++; warn(`trash claim of a ${type} failed`, { [type]: r.id, err }); }

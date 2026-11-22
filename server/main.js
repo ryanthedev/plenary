@@ -1,3 +1,4 @@
+// @ts-check
 // Entry point (single node or one cluster node): `bun server/main.js`.
 //   Single node (neither DATABASE_URL nor NATS_URL): SQLite store and registry, in-memory bus, both roles.
 //   Cluster node (both set): Postgres store and registry, NATS bus, the roles PLENARY_ROLES names.
@@ -118,7 +119,7 @@ export function defaultNodeId(host) {
 
 /**
  * Reads the cluster part of env (nothing else), or throws an Error naming the variable. Never puts a URL's value
- * in a message. @returns {{ cluster: boolean, node: string, roles: { gateway: boolean, host: boolean }, leaseTtlMs: number }}
+ * in a message. @returns {{ cluster: boolean, node: string, roles: { gateway: boolean, host: boolean }, leaseTtlMs: number, requestDeadlineMs: number }}
  */
 export function nodeConfig(env, host = osHostname()) {
   // Present but empty is a mistake (an unset compose interpolation), not "single node" (p4-wire2 L7).
@@ -231,7 +232,8 @@ export function redactingLogger(log, urls) {
       if (v instanceof Error) {
         const e = new Error(r(v.message));
         e.name = r(v.name);
-        if (v.code !== undefined) e.code = r(String(v.code));
+        const code = /** @type {Error & { code?: unknown }} */ (v).code;
+        if (code !== undefined) /** @type {Error & { code?: string }} */ (e).code = r(String(code));
         e.stack = v.stack ? r(v.stack) : undefined;
         return e;
       }
@@ -360,12 +362,12 @@ export function devMenuOff({ users, host, google, gateway, publicHost = null }) 
 /** The hostname of a PUBLIC_URL value, or null when unset or not a URL. */
 const publicHostOf = v => { try { return v ? new URL(v).hostname : null; } catch { return null; } };
 
-/** @param {Record<string, string|undefined>} env @param {{ fetch?: typeof fetch }} [deps] tests pass a stub fetch for Google */
+/** @param {Record<string, string|undefined>} env @param {{ fetch?: typeof fetch, write?: (line: string) => void, hostname?: string, adapters?: Record<string, any> }} [deps] tests pass a stub fetch for Google */
 export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write, hostname, adapters } = {}) {
   // write: tests capture log lines; hostname: tests fix the default node id; adapters: tests replace the cluster
   // adapter factories ({ postgresStore?, postgresRegistry?, natsBus? }) with fakes.
   // Every line this node logs, from any component, has the URLs' secrets redacted (p4-wire2 L2).
-  const log = redactingLogger(createLogger({ level: env.LOG_LEVEL || "info", ...(write ? { write } : {}) }), [env.DATABASE_URL, env.NATS_URL]);
+  const log = redactingLogger(createLogger({ level: /** @type {"debug"|"info"|"warn"|"error"} */ (env.LOG_LEVEL || "info"), ...(write ? { write } : {}) }), [env.DATABASE_URL, env.NATS_URL]);
   // Every refusal of the cluster env comes before anything is created, connected or listening.
   const { cluster, node, roles, leaseTtlMs, requestDeadlineMs } = nodeConfig(env, hostname ?? osHostname());
   const sweepRaw = env.PLENARY_TRASH_SWEEP_MS;   // checked here, before anything opens
@@ -643,7 +645,7 @@ async function openCluster(env, node, log, adapters = {}, requestDeadlineMs = RE
 
 if (import.meta.main) {
   const env = process.env;   // the process entry point is the one place that reads the real environment
-  const log = redactingLogger(createLogger({ level: env.LOG_LEVEL || "info" }), [env.DATABASE_URL, env.NATS_URL]);
+  const log = redactingLogger(createLogger({ level: /** @type {"debug"|"info"|"warn"|"error"} */ (env.LOG_LEVEL || "info") }), [env.DATABASE_URL, env.NATS_URL]);
   // Handlers catch their own errors; these are the last line, so one bug never takes every board down with it.
   process.on("uncaughtException", err => log.error("uncaught exception", { err }));
   process.on("unhandledRejection", err => log.error("unhandled rejection", { err }));

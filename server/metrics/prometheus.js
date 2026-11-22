@@ -1,3 +1,4 @@
+// @ts-check
 // The Metrics adapter that keeps instruments in memory and renders them in the Prometheus text format (exposition 0.0.4).
 // PROTOCOL.md § Metrics. Never throws and never waits: a bad value, an unknown label, a type clash or a 65th series is
 // dropped. Gauges are read at render time, so a scrape costs what the gauge's reader costs (a counter the node keeps).
@@ -35,6 +36,14 @@ export function prometheusMetrics() {
     if (!s) { if (f.series.size >= MAX_SERIES) return null; s = make(); f.series.set(k, s); }
     return s;
   };
+  /**
+   * @param {string} type
+   * @param {string} name
+   * @param {string} help
+   * @param {string[]} [labelNames]
+   * @param {object} [extra]
+   * @returns {{ type: string, help: string, labelNames: string[], series: Map<string, any>, buckets?: number[], read?: () => number } | null}
+   */
   const family = (type, name, help, labelNames = [], extra = {}) => {
     try {
       if (!NAME.test(name) || !Array.isArray(labelNames) || !labelNames.every(n => LABEL.test(n) && n !== "le")) return null;
@@ -51,9 +60,9 @@ export function prometheusMetrics() {
       let f;
       try {
         f = family("counter", name, help, labelNames);
-        if (!f) return noopMetrics.counter();
+        if (!f) return noopMetrics.counter("", "");
         if (Array.isArray(seed)) for (const labels of seed) seriesOf(f, labels, () => ({ v: 0 }));   // fixed label values read 0 from the start
-      } catch { return noopMetrics.counter(); }
+      } catch { return noopMetrics.counter("", ""); }
       if (!f.labelNames.length && !f.series.size) f.series.set("", { v: 0 });   // an unlabelled counter reads 0 from the start
       return { inc(n = 1, labels) {
         try { if (!(n >= 0) || !Number.isFinite(n)) return; const s = seriesOf(f, labels, () => ({ v: 0 })); if (s) s.v += n; } catch { /* never into the hot path */ }
@@ -72,9 +81,9 @@ export function prometheusMetrics() {
         const { buckets = DEFAULT_BUCKETS, labelNames } = o ?? {};
         const bs = Array.isArray(buckets) ? [...buckets].filter(Number.isFinite).sort((a, b) => a - b) : DEFAULT_BUCKETS;
         f = family("histogram", name, help, labelNames, { buckets: bs });
-        if (!f) return noopMetrics.histogram();
+        if (!f) return noopMetrics.histogram("", "");
         if (!f.labelNames.length && !f.series.size) f.series.set("", { counts: new Array(f.buckets.length).fill(0), sum: 0, count: 0 });
-      } catch { return noopMetrics.histogram(); }
+      } catch { return noopMetrics.histogram("", ""); }
       return { observe(value, labels) {
         try {
           if (!Number.isFinite(value)) return;

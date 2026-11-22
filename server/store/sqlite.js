@@ -1,3 +1,4 @@
+// @ts-check
 // The Store port on SQLite (PROTOCOL.md § Store): the durable log and checkpoints for a single node.
 //
 //   append(tenant, board, entries, expectSeq, epoch)    atomic and conditional; a stale expectSeq throws PortError
@@ -38,10 +39,11 @@ const DROP_STEP = 1;
 
 /**
  * @param {{ path: string, fullfsync?: boolean, busyTimeoutMs?: number, keepCheckpoints?: number, now?: () => number,
- *   partChars?: number, onPart?: (step: string) => void | Promise<void>, onSkip?: (s: { tenant: string, board: string, seq: number }) => void }} o
+ *   partChars?: number, onPart?: (step: string) => void | Promise<void>, onSkip?: (s: { tenant: string, board: string, seq: number }) => void }} opts
  *   `path` is a file (":memory:" for throwaway use). `now`: the lease clock in ms (default Date.now; tests inject one).
  *   `partChars`: the most chars in one checkpoint part (default 1 Mi). `onPart`: test hook, awaited before each part
  *   ("part:<n>"), before the header ("header") and before each orphan group's delete ("sweep"); a throw aborts the write there (a sweep never fails a write). `onSkip`: called once for each checkpoint getCheckpoint skips because its parts are missing (the server logs it).
+ * @returns {import("./port.js").Store & { pragmas(): Record<string, any> }}
  */
 export function sqliteStore(opts) {
   const db = new Database(opts.path, { create: true, strict: true });
@@ -80,7 +82,7 @@ const createTables = d => {
   d.run("CREATE INDEX IF NOT EXISTS blob_pending_until ON blob_pending (until_at)");
 };
 
-function build(db, { fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3, now = Date.now, partChars = PART_CHARS, onPart, onSkip }) {
+function build(db, { fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3, now = Date.now, partChars = PART_CHARS, onPart = undefined, onSkip = undefined }) {
   let open = true;
   db.run(`PRAGMA busy_timeout=${Math.max(0, Math.floor(busyTimeoutMs))}`);
   // Before any write to the file (no WAL switch, no CREATE): an old-format file is refused as it was found.
@@ -378,7 +380,7 @@ function build(db, { fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3
     },
 
     /** Condemned long enough and not claimed, in (tenant, sha1) order after the cursor. */
-    async blobCondemned({ graceMs, after = null, limit } = {}) {
+    async blobCondemned({ graceMs, after = null, limit } = /** @type {any} */ ({})) {
       if (!open) throw new PortError("closed", "the store is closed");
       checkReap({ graceMs, limit, after });
       const t = clock();
@@ -386,7 +388,7 @@ function build(db, { fullfsync = true, busyTimeoutMs = 5000, keepCheckpoints = 3
     },
 
     /** The reaper's conditional claim: only while the hash is still condemned for graceMs, unclaimed and unreferenced. */
-    async blobClaim(tenant, sha1, { graceMs, claimMs } = {}) {
+    async blobClaim(tenant, sha1, { graceMs, claimMs } = /** @type {any} */ ({})) {
       needId(tenant, "tenant"); checkPend(sha1, 1); checkReap({ graceMs, claimMs }, { claim: true });
       if (!open) throw new PortError("closed", "the store is closed");
       return db.transaction(() => {

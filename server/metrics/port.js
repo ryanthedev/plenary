@@ -1,3 +1,4 @@
+// @ts-check
 // The Metrics port (PROTOCOL.md § Metrics): how the domain records what an operator watches. Core code imports this
 // and never an adapter; the adapter (prometheus.js) owns the exposition format. THE contract:
 //   counter(name, help, labelNames?, seed?)           -> { inc(n = 1, labels?) }   seed: label sets to show as 0 from the start
@@ -10,7 +11,7 @@
 /** @typedef {{ observe(value: number, labels?: Record<string, string>): void }} Histogram */
 /** @typedef {{ counter(name: string, help: string, labelNames?: string[], seed?: Record<string, string>[]): Counter,
  *   gauge(name: string, help: string, read: () => number): void,
- *   histogram(name: string, help: string, o?: { buckets?: number[], labelNames?: string[] }): Histogram }} Metrics */
+ *   histogram(name: string, help: string, o?: { buckets?: readonly number[], labelNames?: string[] }): Histogram }} Metrics */
 
 const noCounter = Object.freeze({ inc() {} });
 const noHistogram = Object.freeze({ observe() {} });

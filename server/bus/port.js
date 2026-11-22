@@ -1,3 +1,4 @@
+// @ts-check
 // The Bus port (PROTOCOL.md § Bus): subject names, the message size cap and how a message is measured. Port-level,
 // so the core (gateway, room host, feed) imports this and never an adapter; memory.js and nats.js implement it.
 //
@@ -15,11 +16,11 @@ export const BUS_MEMBERS = Object.freeze(["publish", "subscribe", "flush", "clos
 /**
  * Ordered per subject for one publisher; no order across publishers.
  * @typedef {object} Bus
- * @property {(subject: string, msg: object) => void | Promise<void>} publish
+ * @property {(subject: string, msg: Record<string, any>) => Promise<void>} publish
  *   Fire and forget, at-most-once, asynchronous delivery. msg is plain data (a top-level Uint8Array field is allowed).
  *   Rejects PortError "too-large" over MAX_BUS_BYTES (nothing sent); "unavailable" while a networked bus is down (dropped, not queued);
  *   "bad-id" / TypeError for a bad subject. After close(): resolves, delivers nothing.
- * @property {(subject: string, fn: (msg: object, subject: string) => void) => () => void} subscribe
+ * @property {(subject: string, fn: (msg: Record<string, any>, subject: string) => void) => () => void} subscribe
  *   Exact subject, no wildcards. One handler subscribed twice is one subscription. Returns an idempotent unsubscribe.
  *   A handler that throws or rejects loses that message only (onError hears it); others and later messages are unaffected.
  * @property {() => Promise<void>} flush  resolves once everything published so far has left this process
@@ -77,7 +78,7 @@ export const subjects = {
  * never share a subject either. A handler subscribed twice to one subject is still one subscription (the adapters
  * keep handlers in a Set), so this keeps one wrapper per (subject, handler).
  * Every other adapter member (flush, close, maxBytes, subscriberCount, isUp, ...) is the underlying bus's own.
- * @template {{ publish: Function, subscribe: Function }} B
+ * @template {{ publish: Function, subscribe: Function, subscriberCount?: (subject: string) => number }} B
  * @param {B} bus
  * @param {string} cluster
  * @returns {B}

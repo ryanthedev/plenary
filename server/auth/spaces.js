@@ -1,3 +1,4 @@
+// @ts-check
 // Spaces and Groups: their pages, the New board / New space pickers, create, rename and general access (PROTOCOL.md § Spaces and
 // Groups, #48). Core: depends on the Registry port, `tenancy` and the Home service, imports no adapter; the HTTP routes only translate.
 //
@@ -49,7 +50,7 @@ const idOf = v => (typeof v === "string" && /^[\w-]{1,64}$/.test(v) ? v : null);
 /**
  * @param {{ registry: import("./registry-port.js").Registry, tenancy: ReturnType<typeof import("./tenancy.js").tenancy>,
  *   home?: ReturnType<typeof homeService>, announce?: (tenant: string, board: string) => Promise<void>|void, now?: () => number,
- *   log?: { warn(msg: string, f?: object): void } }} deps
+ *   explainer?: ReturnType<typeof explainService>, log?: { warn(msg: string, f?: object): void } }} deps
  *   announce: tells every live connection on a board to re-check its role (the `.grants` message; main.js gives the bus's). Best effort.
  */
 export function spaceService({ registry, tenancy, home = null, announce = async () => {}, now = Date.now, explainer = explainService({ registry, now }), log = { warn() {} } }) {
@@ -63,6 +64,7 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
   /**
    * The Space or Group `id` in the caller's Unit with the caller's access to it, or null. The SAME two reads happen whatever the id (fine,
    * unknown, in another Unit or hidden), so a refusal can't be told from another by how much work it did (PROTOCOL.md § Spaces and Groups).
+   * @returns {Promise<{ row: any, access: import("./resolver.js").Access } | null>}
    */
   async function scopeOf(identity, unit, type, id) {
     if (!idOf(id)) return null;
@@ -71,7 +73,7 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
   }
 
   /** What general access alone gives, from the rows in hand (no read): enough to say yes; a "no" needs the full answer. */
-  const general = (unit, identity, space, group, t) => resolveAccess({ ctx: { tenant: unit, board: null, space, group, scoped: NO_GRANTS, roles: [], teams: {} } }, identity, t);
+  const general = (unit, identity, space, group, t) => resolveAccess({ ctx: { tenant: unit, board: null, space, group, scoped: NO_GRANTS, roles: [], teams: {}, removed: [] } }, identity, t);
   /** The single rule for "may create a board here" (picker and POST /boards both): the resolver's answer holds `board.create`. */
   const createsBoards = a => may(a, "board.create");
   const opens = a => a.ladder != null;
@@ -261,7 +263,7 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
         target = (await boardCreateAccess(identity, unit, space)).row.id;
       }
       // The board, its owner grant and the idempotency key (if any) are one Registry step: no ownerless board, no key without its board.
-      return registry.createBoard({ tenant: unit.id, title: t, space: target, owner: identity.user, idem, ...(memberRole !== undefined ? { memberRole } : {}) });
+      return registry.createBoard({ tenant: unit.id, title: t, space: target, owner: identity.user, idem, ...(memberRole !== undefined ? { memberRole: /** @type {import("./registry-port.js").Role | null} */ (memberRole) } : {}) });
     },
 
     /**
@@ -288,7 +290,7 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
 
     /**
      * POST /spaces: a Space at the Unit root (`space.create` there) or in a Group (`space.create` at the Group). The caller becomes its owner.
-     * @param {Identity} identity @param {{ name: string, group?: string|null, general?: string|null }} o
+     * @param {Identity} identity @param {{ name?: string, group?: string|null, general?: string|null }} [o] @param {import("./registry-port.js").Idem} [idem]
      */
     async createSpace(identity, { name, group = null, general: gen = "viewer" } = {}, idem) {
       const n = nameOf(name);
@@ -297,7 +299,7 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
       const unit = await unitOf(identity);
       if (!unit) throw refused();
       const { g, access } = await spaceCreateAccess(identity, unit, group);
-      const s = await registry.createSpace({ tenant: unit.id, name: n, group: g?.id ?? null, generalRole: gen, owner: identity.user, idem });
+      const s = await registry.createSpace({ tenant: unit.id, name: n, group: g?.id ?? null, generalRole: /** @type {import("./registry-port.js").Role | null} */ (gen), owner: identity.user, idem });
       return spaceView(s, g && opens(access) ? g : null);
     },
 
@@ -351,20 +353,20 @@ export function spaceService({ registry, tenancy, home = null, announce = async 
       // just sent, never the name they did not set.
       if (!opens(sc.access)) return { id: out.id, ...(name !== undefined ? { name } : {}), ...(gen !== undefined ? { general: gen } : {}) };
       if (type === "group") return { id: out.id, name: out.name, general: out.generalRole ?? null };
-      const g = out.group ? await registry.group(out.group) : null;
+      const g = "group" in out && out.group ? await registry.group(out.group) : null;
       return spaceView(out, g && opens(await tenancy.effective(identity, { type: "group", id: g.id })) ? g : null);
     },
 
     /**
      * POST /groups: a Group at the Unit root; needs `group.create` there. The creator becomes its owner. General access defaults to none.
-     * @param {Identity} identity @param {{ name: string, general?: string|null }} o
+     * @param {Identity} identity @param {{ name?: string, general?: string|null }} [o] @param {import("./registry-port.js").Idem} [idem]
      */
     async createGroup(identity, { name, general: gen = null } = {}, idem) {
       const n = nameOf(name);
       generalOf(gen);
       const unit = await unitOf(identity);
       if (!unit || !may(await tenancy.effective(identity, { type: "unit", id: unit.id }), "group.create")) throw refused();
-      const g = await registry.createGroup({ tenant: unit.id, name: n, generalRole: gen, owner: identity.user, idem });
+      const g = await registry.createGroup({ tenant: unit.id, name: n, generalRole: /** @type {import("./registry-port.js").Role | null} */ (gen), owner: identity.user, idem });
       return { id: g.id, name: g.name, general: g.generalRole ?? null };
     },
 

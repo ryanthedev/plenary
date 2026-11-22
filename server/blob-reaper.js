@@ -1,3 +1,4 @@
+// @ts-check
 // The blob reaper (PROTOCOL.md § Blobs, "References and purge"): deletes the bytes of hashes no board references any more.
 // Core: it knows the Store port (the condemned index), the Blobs port (delete), an injected Clock and a Log, nothing else;
 // main.js wires a timer to `sweep()` on every gateway node.

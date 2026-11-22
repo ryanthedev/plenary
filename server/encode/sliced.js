@@ -1,3 +1,4 @@
+// @ts-check
 // JSON.stringify for a value too big to encode in one go: the same text, produced in slices with the event loop handed
 // back between them (`yieldNow`: one setImmediate turn by default), so encoding a checkpoint of tens of MB never blocks every other board on the host.
 // Adapter-side by design: the room hands over a plain object (the Store port is unchanged); how it becomes bytes is the

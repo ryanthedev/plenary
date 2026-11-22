@@ -1,3 +1,4 @@
+// @ts-check
 // Access explanation (PROTOCOL.md § Access explanation and requests, #51). Core: depends on the Registry port and the resolver's own types, imports no adapter.
 //
 // ONE SOURCE OF TRUTH. Every answer here is built from the `Access` that `tenancy.effective` returned for the request in hand (the object the same handler used
@@ -83,7 +84,7 @@ export function explainService({ registry, now = Date.now }) {
     const subjects = out.slice(0, 10);
     const users = subjects.filter(s => s.type === "user").map(s => s.id), teams = subjects.filter(s => s.type === "team").map(s => s.id);
     const [people, groups] = await Promise.all([users.length ? registry.membersAmong(unitId, users) : [], teams.length ? registry.teamsAmong(unitId, teams) : []]);
-    const byUser = new Map(people.map(m => [m.user, m])), byTeam = new Map(groups.map(t => [t.id, t]));
+    const byUser = new Map(people.map(m => /** @type {[string, typeof m]} */ ([m.user, m]))), byTeam = new Map(groups.map(t => /** @type {[string, typeof t]} */ ([t.id, t])));
     return subjects.map(s => (s.type === "team"
       ? { type: "team", id: s.id, name: byTeam.get(s.id)?.name ?? "Unknown team" }
       : { type: "user", id: s.id, name: byUser.get(s.id)?.name ?? String(s.id).replace(/^[a-z]+:/, "") }));
@@ -93,7 +94,7 @@ export function explainService({ registry, now = Date.now }) {
     /**
      * `{ mine, needs, owners, ask }` for a scope the caller can open, from the Access the handler already holds.
      * @param {import("./idp-port.js").Identity} identity
-     * @param {{ type: "unit"|"group"|"space"|"board", row: object, access: import("./resolver.js").Access, unit: { id: string }|null, manage?: boolean, personal?: boolean }} o
+     * @param {{ type: "unit"|"group"|"space"|"board", row: any, access: import("./resolver.js").Access, unit: { id: string }|null, manage?: boolean, personal?: boolean }} o
      *   unit: the caller's own Unit when it is the scope's (null for a guest: they get their own sources only, no owners, no Ask).
      */
     async explain(identity, { type, row, access, unit, manage = false, personal = false }) {

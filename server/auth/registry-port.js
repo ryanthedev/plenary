@@ -1,3 +1,4 @@
+// @ts-check
 // The Registry port (PROTOCOL.md § Registry): tenants, the board registry (`Registry.board(id)`; the Store has no
 // board lookup), per-board grants, invites and share links. No adapter code here: adapters are server/auth/registry.js
 // (memory) and server/registry/{sqlite,postgres}.js (engine). Every adapter passes test/auth/registry-contract.js.
@@ -197,7 +198,7 @@ export const mint = {
  *   role(tenant: string, id: string): Promise<CustomRole|null>,
  *   roles(tenant: string): Promise<CustomRole[]>,
  *   accessContexts(scopes: ScopeRef[], o?: { users?: string[] }): Promise<Map<string, AccessContext|null>>,   // `accessContext` for many Unit, Group or Space scopes (at most HOME.batch, else rejects) in ONE step; keys are `type + "\n" + id`, null for an unknown scope
- *   accessContext(scope: ScopeRef, o?: { users?: string[], chain?: Chain }): Promise<AccessContext|null>,   // null for an unknown scope; see "accessContext" below
+ *   accessContext(scope: ScopeRef, o?: { users?: string[], chain?: Chain, fresh?: boolean }): Promise<AccessContext|null>,   // null for an unknown scope; see "accessContext" below
  *   boardsIn(scope: ScopeRef, o?: { after?: string|null, limit?: number, withTrashed?: boolean }): Promise<{ ids: string[], next: string|null }>,   // board ids in a Unit, Group or Space, by id, one bounded page; boards in Trash are left out unless `withTrashed` (an announcement reaches them too)
  *   scopesOf(subject: Subject, o?: { after?: string|null, limit?: number }): Promise<{ scopes: (ScopeRef & { role: string })[], next: string|null }>,   // the scopes a user or Team holds a grant on (not boards: a board's own user grants are `grants`)
  *   personalScopesOf(subject: Subject, o?: { limit?: number }): Promise<{ scopes: (ScopeRef & { role: string })[], more: boolean }>,   // the subset of scopesOf that is a personal space or a board in one (one join, at most `limit` (default and cap 50), `more` = there are further ones): what an admin's Team change must check against the resolver
@@ -239,7 +240,7 @@ export const mint = {
  *   grantHolders(scope: ScopeRef, roles: string[], o?: { limit?: number }): Promise<ScopedGrant[]>,   // the scoped grants AT the scope whose role is one of `roles`, by subject, at most `limit` (default and cap ASK.holders)
  *   memberState(tenant: string, user: string): Promise<{ user: string, name: string|null, email: string|null, removed: boolean, removedAt: number|null, removedBy: string|null }|null>,   // the directory row, or null when the person was never seen (PROTOCOL.md § Leaver offboarding); `tenancy.tenantOf` reads `removed` on every request
  *   ownedAlone(tenant: string, user: string, o?: { after?: string|null, limit?: number }): Promise<{ items: { type: "space"|"group", id: string, personal: boolean }[], next: string|null }>,   // what the user solely owns: their personal space (always), and every Group or Space (trashed ones too) whose only COUNTED owner they are; by "<type>\n<id>", default 50, cap 200
- *   reassignOwner(o: { scope: { type: "space"|"group", id: string }, from: string, to: string, idem?: Idem }): Promise<{ done: boolean }>,   // ONE atomic compare-and-set (tenant owners lock, then the container row): `from` still the only counted owner -> `to` becomes owner and `from`'s grant goes, `done` true; otherwise nothing changes, `done` false. A PERSONAL space is refused (code "personal": it goes with `removeMember`, never alone). `to` must be a live directory member of the scope's Unit (code "bad-recipient"), not `from`; a scope purged meanwhile rejects "registry: no such space|group"; ref `<scope id>:reassigned` / `<scope id>:noop`
+ *   reassignOwner(o: { scope: { type: "space"|"group", id: string }, from: string, to: string, name?: string|null, idem?: Idem }): Promise<{ done: boolean }>,   // ONE atomic compare-and-set (tenant owners lock, then the container row): `from` still the only counted owner -> `to` becomes owner and `from`'s grant goes, `done` true; otherwise nothing changes, `done` false. A PERSONAL space is refused (code "personal": it goes with `removeMember`, never alone). `to` must be a live directory member of the scope's Unit (code "bad-recipient"), not `from`; a scope purged meanwhile rejects "registry: no such space|group"; ref `<scope id>:reassigned` / `<scope id>:noop`
  *   removeMember(o: { tenant: string, user: string, by: string, handover?: { to: string, name?: string }, idem?: Idem }): Promise<{ removed: boolean, grants: number, scopedGrants: number, teams: number, invites: number, handedOver: boolean }>,   // ONE atomic step (owners lock, then the member row): refuses code "still-owns" (nothing changes) while `ownedAlone` holds anything but the personal space, "is-admin" for a tenant admin, rejects a person not in the directory. `handover` makes the personal space, if any, an archived shared Space (owner null, archivedAt now, named `name`) owned by `to` IN THE SAME STEP (a live member other than the leaver, else "bad-recipient"; without it a personal space counts as owned and the removal is refused). Then marks the row removed, deletes the user's board grants, scoped grants in this Unit, Team memberships and access requests, and revokes invites addressed to their email on this Unit's boards (invites and links they CREATED stay); already removed -> removed false; ref `<user>:removed` / `<user>:noop`
  *   boardRows(boards: string[], o: { user: string, email?: string|null }): Promise<Map<string, BoardRows>>,   // the board-scope rows the resolver reads for one user over at most BATCH boards, in a fixed number of statements; unknown ids are absent
  *   close(): Promise<void>,   // idempotent; the memory adapter has nothing to release and resolves at once
@@ -378,7 +379,11 @@ export const orgDefaults = {
     }
     return false;
   },
-  /** The name of a member's personal Space until they rename it: prefers display name, then email local part, then non-numeric user id, else "Personal". */
+  /**
+   * The name of a member's personal Space until they rename it: prefers display name, then email local part, then non-numeric user id, else "Personal".
+   * @param {string} user
+   * @param {{ name?: string | null, email?: string | null }} [profile]
+   */
   personalName(user, { name, email } = {}) {
     const suffix = "'s space";
     const maxBase = 200 - suffix.length;

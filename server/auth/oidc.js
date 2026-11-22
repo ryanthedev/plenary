@@ -1,3 +1,4 @@
+// @ts-check
 // Google sign-in (OpenID Connect): authorization code + PKCE (S256), and ID-token verification against Google's
 // JWKS. Everything that touches the network goes through an injected `fetch`, so tests run against a fake IdP.
 // Client id/secret come from config (the caller reads env); nothing here holds a credential.
@@ -231,7 +232,7 @@ export function googleOidc(config) {
      * @returns {Promise<Identity|null>}
      */
     async finish(o) {
-      const { code, state, expected, why } = o && typeof o === "object" ? o : {};
+      const { code, state, expected, why } = /** @type {any} */ (o && typeof o === "object" ? o : {});
       const no = cause => { try { if (typeof why === "function") why(cause); } catch { /* never changes the verdict */ } return null; };
       const ok = v => typeof v === "string" && v.length > 0;
       if (!expected || !ok(expected.state) || !ok(expected.nonce) || !ok(expected.verifier)) return no("bad_expected");

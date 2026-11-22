@@ -1,3 +1,4 @@
+// @ts-check
 // Blob access (PROTOCOL.md § Blobs): the application service between the Blobs port and the two ways in. Core: it
 // knows no HTTP, no socket and no adapter, only the Blobs port (server/blobs/port.js), a key and a clock.
 //   url(tenant, board, sha1, verb)   a signed, 5-minute URL for one blob and one verb ("GET" | "PUT"); the gateway asks
@@ -35,7 +36,7 @@ const CODES = { "too-large": "too-large", "hash-mismatch": "hash-mismatch", "not
 
 /**
  * @param {{ blobs: { put: Function, get: Function, usage: Function }, key: Uint8Array, origin?: string,
- *           now?: () => number, quotaBytes?: number, ttlMs?: number, usageTtlMs?: number, log?: object }} o
+ *           now?: () => number, quotaBytes?: number, ttlMs?: number, usageTtlMs?: number, log?: { error(msg: string, fields?: object): void } }} o
  *   usageTtlMs: a tenant's cached usage is read again when it is older than this (other nodes' puts and the reaper's deletes change it; default never, main.js passes the reap interval)
  *   key: ≥ 32 bytes (derive it from the shared key; never the key itself). origin: where browsers reach this server
  *   (PUBLIC_URL, no trailing slash); "" (the default) makes every URL the path /blobs/<token>, which the client resolves
@@ -46,12 +47,15 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
   if (!(key instanceof Uint8Array) || key.length < 32) throw new TypeError("blobAccess: key must be at least 32 bytes");
   if (typeof origin !== "string") throw new TypeError("blobAccess: origin must be a string");
   if (!Number.isFinite(quotaBytes) || quotaBytes < 0) throw new TypeError("blobAccess: quotaBytes must be a number ≥ 0");
-  const mac = crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+  const mac = crypto.subtle.importKey("raw", /** @type {BufferSource} */ (key), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
 
   /** @type {Map<string, { used: number, reserved: number, ready: Promise<void> | null, at: number, seq: number, sinceRead: number, reading: boolean }>} at: when the last read of usage answered; seq: the newest read's number; sinceRead: bytes put while it was in flight */
   const tenants = new Map();
 
-  /** The signed claims of a token for `verb`, or { ok: false, code }. */
+  /**
+   * The signed claims of a token for `verb`, or { ok: false, code }.
+   * @returns {Promise<{ ok: true, tenant: string, board: string, sha1: string, user: string | null } | { ok: false, code: string }>}
+   */
   async function verify(token, verb) {
     if (typeof token !== "string" || token.length > MAX_TOKEN_CHARS) return { ok: false, code: "bad-token" };
     const parts = token.split(".");
@@ -96,6 +100,7 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
     return st.ready.then(() => st);
   }
 
+  /** @returns {{ ok: false, code: string }} */
   const unavailable = (what, tenant, err) => { log.error(`blob ${what} failed`, { tenant, code: err?.code, err }); return { ok: false, code: "unavailable" }; };
 
   return {
@@ -116,7 +121,7 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
     /** @returns {Promise<{ ok: true, created: boolean } | { ok: false, code: string }>} */
     async put(token, bytes) {
       const v = await verify(token, "PUT");
-      if (!v.ok) return v;
+      if ("code" in v) return v;
       if (!(bytes instanceof Uint8Array) || !bytes.byteLength) return { ok: false, code: "bad-length" };
       if (bytes.byteLength > (videoKind(bytes) ? MAX_VIDEO_BLOB_BYTES : MAX_BLOB_BYTES)) return { ok: false, code: "too-large" };
       let st;
@@ -140,7 +145,7 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
     /** @returns {Promise<{ ok: true, bytes: Uint8Array, type: string } | { ok: false, code: string }>} */
     async get(token) {
       const v = await verify(token, "GET");
-      if (!v.ok) return v;
+      if ("code" in v) return v;
       try {
         const bytes = await blobs.get(v.tenant, v.sha1);
         if (!bytes) return { ok: false, code: "not-found" };

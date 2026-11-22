@@ -1,3 +1,4 @@
+// @ts-check
 // The Bus port on NATS core (PROTOCOL.md § Bus), for a cluster. Same contract as server/bus/memory.js:
 //   - exact subjects, no wildcards (every subject is checked: [a-z0-9-] tokens joined by ".");
 //   - at-most-once (NATS core, no JetStream): a message published with no subscriber is gone; a subscriber that
@@ -147,7 +148,7 @@ export function natsConnectOptions(url) {
  *           in deploy); nothing is read from env here. connect: the client's connect (tests pass a fake).
  */
 export async function natsBus({ url, name = "plenary", onError = () => {}, connectTimeoutMs = 5000, reconnectWaitMs = 2000,
-  pingIntervalMs = 5000, maxPingOut = 2, maxPendingBytes = 32 * 1024 * 1024, ackEveryMs = 250, connect: connectFn, cluster } = {}) {
+  pingIntervalMs = 5000, maxPingOut = 2, maxPendingBytes = 32 * 1024 * 1024, ackEveryMs = 250, connect: connectFn, cluster } = /** @type {any} */ ({})) {
   if (!url || (typeof url !== "string" && !Array.isArray(url))) throw new TypeError("natsBus needs a url");
   // `cluster`: every subject on the wire gets `<cluster>.` in front (PROTOCOL.md § Bus, Cluster id; scopeBus in port.js).
   // Required, so a bus is never unscoped by omission: an id, or null for an unscoped bus (tests and tools that speak
@@ -248,7 +249,7 @@ export async function natsBus({ url, name = "plenary", onError = () => {}, conne
       // NATS counts headers toward max_payload, so the cap covers them too.
       const h = byteFields ? makeHeaders() : null;
       if (h) h.set(BYTES_HEADER, JSON.stringify(byteFields));
-      const size = payload.byteLength + (h ? h.encode().byteLength : 0);
+      const size = payload.byteLength + (h ? /** @type {any} */ (h).encode().byteLength : 0);
       if (size > MAX_BUS_BYTES)
         return refuse(new PortError("too-large", `a bus message is limited to ${MAX_BUS_BYTES} bytes, headers included (this one is ${size})`), subject);
       if (congested) return refuse(congested, subject, true);

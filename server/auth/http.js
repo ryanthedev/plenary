@@ -1,3 +1,4 @@
+// @ts-check
 // HTTP routes for sign-in and the admin API, as one standalone handler (brief p5-http). The engine's server mounts
 // it with `createServer({ http: httpRoutes(deps) })`: its own routes run first, then these, then a 404.
 //
@@ -139,11 +140,28 @@ class Refusal { constructor(res) { this.res = res; } }
 const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
 
 /**
- * @param {{ registry: object, sessions: { issue(id: object): Promise<string>, verify(t: string): Promise<{ exp?: number }|null> },
+ * @param {{
+ *   registry: import("./registry-port.js").Registry,
+ *   sessions: { issue(id: import("./idp-port.js").Identity): Promise<string>, verify(t: string): Promise<import("./idp-port.js").Session|null>, verifySnapshotTicket?(t: string): Promise<{ board: string, seq: number, exp: number }|null> },
  *   oidc?: import("./idp-port.js").IdP | null,
- *   tenancy: { redeemLink(id: object, link: string): Promise<{board: string}|null>, tenantOf(id: object): Promise<{id: string}|null> },
- *   now?: () => number, config: object, dev?: { enabled?: boolean, verify(t: string): Promise<object|null> } | null,
- *   testHooks?: { pruned?(p: { visited: number, expired: number, live: number }): void, routes?(table: { pattern: string, methods: string[], names: string[] }[]): void } | null }} deps   (tests only, not an API)
+ *   tenancy: ReturnType<typeof import("./tenancy.js").tenancy>,
+ *   home?: ReturnType<typeof import("./home.js").homeService> | null,
+ *   now?: () => number,
+ *   explainer?: ReturnType<typeof explainService>,
+ *   spaces?: ReturnType<typeof spaceService>,
+ *   moves?: ReturnType<typeof moveService>,
+ *   trash?: ReturnType<typeof trashService>,
+ *   access?: ReturnType<typeof accessService>,
+ *   roles?: ReturnType<typeof rolesService>,
+ *   offboard?: ReturnType<typeof offboardService>,
+ *   config?: Record<string, any>,
+ *   dev?: { enabled?: boolean, verify(t: string): Promise<import("./idp-port.js").Session|null> } | null,
+ *   log?: { warn(msg: string, fields?: object): void, info?(msg: string, fields?: object): void, error?(msg: string, fields?: object): void },
+ *   testHooks?: { pruned?(p: { visited: number, expired: number, live: number }): void, routes?(table: { pattern: string, methods: string[], names: string[] }[]): void } | null,
+ *   snapshot?: { get(board: string, seq: number): Promise<any> } | null,
+ *   snapshotTickets?: { verify(t: string): Promise<{ board: string, seq: number, exp: number }|null> } | null,
+ *   timers?: { set(fn: () => void, ms: number): any, clear(h: any): void },
+ * }} deps
  */
 export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, explainer = explainService({ registry, now }), spaces = spaceService({ registry, tenancy, home, now, explainer }), moves = moveService({ registry, tenancy, spaces, now }), trash = trashService({ registry, tenancy, spaces, now }), access = accessService({ registry, tenancy, now, explainer, announce: spaces.announceChange, backlog: spaces.backlog, settled: spaces.settled }), roles = rolesService({ registry, tenancy, announce: spaces.announceChange }), offboard = offboardService({ registry, tenancy, announce: spaces.announceChange }), config = {}, dev = null, log = stdoutLog, testHooks = null, snapshot = null, snapshotTickets = null, timers = { set: (f, ms) => setTimeout(f, ms), clear: h => clearTimeout(h) } }) {
   if (!registry || !sessions || !tenancy) throw new Error("http: registry, sessions and tenancy are required");
@@ -175,7 +193,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
   if (oidc) {
     const raw = typeof config.cookieKey === "string" ? utf8(config.cookieKey) : config.cookieKey;
     if (!(raw instanceof Uint8Array) || raw.length < 32) throw new Error("http: config.cookieKey must be at least 32 bytes");
-    macKey = crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+    macKey = crypto.subtle.importKey("raw", /** @type {BufferSource} */ (raw), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
   }
   const clearLogin = `${LOGIN_COOKIE}=; ${COOKIE_ATTRS}; Max-Age=0`;
   const clearXchg = `${EXCHANGE_COOKIE}=; ${XCHG_ATTRS}; Max-Age=0`;
@@ -748,13 +766,13 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
             throw new AdminError("forbidden", "not allowed");
           }
           if (targetTenant.domain === null) {
-            const board = await createBoard(defined({ caller: who, tenant: b.tenant, title: b.title, memberRole: b.memberRole, space: b.space }), admin);
+            const board = await createBoard(/** @type {any} */ (defined({ caller: who, tenant: b.tenant, title: b.title, memberRole: b.memberRole, space: b.space })), admin);
             return json(201, { board });
           }
         } else {
           const unit = await tenancy.tenantOf(who);
           if (unit && unit.domain === null && isTenantAdminRecord(unit, who)) {
-            const board = await createBoard(defined({ caller: who, tenant: unit.id, title: b.title, memberRole: b.memberRole, space: b.space }), admin);
+            const board = await createBoard(/** @type {any} */ (defined({ caller: who, tenant: unit.id, title: b.title, memberRole: b.memberRole, space: b.space })), admin);
             return json(201, { board });
           }
         }
@@ -780,7 +798,8 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
         if (typeof b.title !== "string" || /[\p{Cc}\u2028\u2029\u202A-\u202E\u2066-\u2069\u200E\u200F\u061C]/u.test(b.title)) throw refuse(400, "bad-request");
         const board = await spaces.renameBoard(who, p.board, b.title);
         if (typeof registry.appendAudit === "function") {
-          await registry.appendAudit({ tenant: board.tenant, board: board.id, actor: who.user, action: "board.update", target: board.id, detail: { title: board.title, memberRole: board.memberRole }, at: now() });
+          const br = /** @type {import("./registry-port.js").Board} */ (board);
+          await registry.appendAudit({ tenant: br.tenant, board: br.id, actor: who.user, action: "board.update", target: br.id, detail: { title: br.title, memberRole: br.memberRole }, at: now() });
         }
         return json(200, { board });
       },
@@ -859,8 +878,9 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
     } }],
   ].map(([pattern, methods]) => {
     const names = [];
-    const re = new RegExp("^" + pattern.replace(/:(\w+)/g, (_, n) => { names.push(n); return "([^/]+)"; }) + "$");
-    return { re, names, methods, pattern };
+    const pat = String(pattern);
+    const re = new RegExp("^" + pat.replace(/:(\w+)/g, (_, n) => { names.push(n); return "([^/]+)"; }) + "$");
+    return { re, names, methods, pattern: pat };
   });
 
   // One deadline for the whole route table (PROTOCOL.md "HTTP request deadline"). The work is not cancellable (the Registry port has no

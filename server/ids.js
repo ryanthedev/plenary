@@ -1,3 +1,4 @@
+// @ts-check
 // Ids the server trusts in keys, paths and bus subjects (PROTOCOL.md § Bus): server-minted, [a-z0-9-] only,
 // so no ".", "*", ">" (subject wildcards) and no "/" or ".." (paths). Check at every port, whoever the caller is.
 

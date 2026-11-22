@@ -1,3 +1,4 @@
+// @ts-check
 // The Blobs port (PROTOCOL.md § Blobs): what every Blobs adapter (disk.js, s3.js) checks before storing.
 //   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB (images) / > 50 MB (videos), a hash mismatch, and anything that isn't PNG/JPEG/GIF/WebP/MP4/WebM/QuickTime
 //   get(tenant, sha1)          bytes, or null

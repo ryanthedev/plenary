@@ -1,3 +1,4 @@
+// @ts-check
 // Move a board between Spaces (PROTOCOL.md § Move board, #53). Core: depends on the Registry port, `tenancy` and the Space service's destination rule, imports no adapter; the
 // HTTP routes only translate.
 //
@@ -123,7 +124,9 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
       const [picked, from] = await Promise.all([spaces.boardPicker(identity), openSpace(identity, m.unit, m.row.space)]);
       const cand = picked.spaces.filter(s => s.id !== m.row.space).slice(0, HOME.batch);
       // Rule 4 for every candidate from batch reads: their contexts for the mover, then everyone they name (one union of users), the board's context and the candidates again with those users.
-      const key = s => "space\n" + s.id, refs = cand.map(s => ({ type: "space", id: s.id }));
+      const key = s => "space\n" + s.id;
+      /** @type {import("./registry-port.js").ScopeRef[]} */
+      const refs = cand.map(s => ({ type: "space", id: s.id }));
       const first = cand.length ? await registry.accessContexts(refs, { users: [identity.user] }) : new Map();
       const users = namedUsers(identity, [...first.values()].filter(Boolean)).slice(0, LIMITS.people + 1);
       const [ctxs, bctx] = cand.length ? await Promise.all([registry.accessContexts(refs, { users }), registry.accessContext({ type: "board", id: m.row.id }, { users })]) : [new Map(), null];
@@ -141,22 +144,33 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
       const dst = await target(identity, m, to);                     // first: a Space the caller can't open is the one 403, whether or not the board is in it
       if (m.row.space && m.row.space === to) throw bad("the board is already there");
       const t = now();
+      /** @type {import("./registry-port.js").ScopeRef} */
       const board = { type: "board", id: m.row.id };
       // Phase 1 (light reads: Team members only for the caller): who is on the scopes involved. Phase 2 reads again for exactly those people.
       const ctx0 = await registry.accessContext(board, { users: [identity.user] }), boardOpen = opens(m.access);
       if (!ctx0?.board) throw refused();
-      const seen = await tenancy.effectiveMany(identity, [ctx0.space && { type: "space", id: ctx0.space.id }, ctx0.group && { type: "group", id: ctx0.group.id }, dst.ctx.group && { type: "group", id: dst.ctx.group.id }].filter(Boolean));
+      /** @type {{ type: "group"|"space"|"unit", id: string }[]} */
+      const seenScopes = [
+        ...(ctx0.space ? [{ type: /** @type {"space"} */ ("space"), id: ctx0.space.id }] : []),
+        ...(ctx0.group ? [{ type: /** @type {"group"} */ ("group"), id: ctx0.group.id }] : []),
+        ...(dst.ctx.group ? [{ type: /** @type {"group"} */ ("group"), id: dst.ctx.group.id }] : []),
+      ];
+      const seen = await tenancy.effectiveMany(identity, seenScopes);
       const see = (type, id) => !id || seen.has(type + "\n" + id) ? opens(seen.get(type + "\n" + id)) : false;
       const visible = new Set([dst.row.id]);                               // the destination Space: the caller opens it (rule 2)
-      for (const [type, c] of [["space", ctx0.space], ["group", ctx0.group], ["group", dst.ctx.group]]) if (c && see(type, c.id)) visible.add(c.id);
-      const hidden = [[ctx0.space, ctx0.scoped.space], [ctx0.group, ctx0.scoped.group], [dst.ctx.group, dst.ctx.scoped.group]]
-        .some(([c, g]) => c && !visible.has(c.id) && (g.length > 0 || c.generalRole != null));
+      /** @type {[string, { id: string } | null][]} */
+      const visList = [["space", ctx0.space], ["group", ctx0.group], ["group", dst.ctx.group]];
+      for (const [type, c] of visList) if (c && see(type, c.id)) visible.add(c.id);
+      /** @type {[{ id: string, generalRole?: string | null } | null, import("./registry-port.js").ScopedGrant[]][]} */
+      const hiddenList = [[ctx0.space, ctx0.scoped.space], [ctx0.group, ctx0.scoped.group], [dst.ctx.group, dst.ctx.scoped.group]];
+      const hidden = hiddenList.some(([c, g]) => c && !visible.has(c.id) && (g.length > 0 || c.generalRole != null));
       const shown = s => s.scope.type === "unit" || s.scope.type === "board" || visible.has(s.scope.id);   // a source from a container the caller can't open never counts
       const topOf = a => a.sources.filter(shown).reduce((r, s) => higher(r, s.ladder), null);
 
       // Who is named: the board's own rows (if the caller opens the board) and the grants of the containers the caller opens.
       const users = new Set([identity.user]), teams = new Set();
       const take = list => { for (const g of list ?? []) { if (UNIT_ROLES.includes(g.role)) continue; (g.subject.type === "user" ? users : teams).add(g.subject.id); } };
+      /** @type {[{ id: string } | null, import("./registry-port.js").ScopedGrant[]][]} */
       const lists = [[ctx0.space, ctx0.scoped.space], [ctx0.group, ctx0.scoped.group], [dst.ctx.space, dst.ctx.scoped.space], [dst.ctx.group, dst.ctx.scoped.group]];
       for (const [c, g] of lists) if (c && visible.has(c.id)) take(g);
       if (boardOpen) { take(ctx0.scoped.board); for (const g of await registry.grants(m.row.id)) users.add(g.user); }
@@ -228,6 +242,10 @@ export function moveService({ registry, tenancy, spaces, now = Date.now }) {
      * The replay of a keyed move by the same user (the key row is per user). `ref` is the Registry's stored answer, `<board>:moved` or `<board>:noop`, so `moved` is the real first
      * answer. The caller is re-checked only as far as no leak needs: they must still be able to OPEN the destination (not `move` on the source: the board is not there any more). A board
      * that is no longer in `to` answers `moved`.
+     * @param {import("./idp-port.js").Identity} identity
+     * @param {string} boardId
+     * @param {{ from?: string, to?: string }} [o]
+     * @param {string} [ref]
      */
     async replay(identity, boardId, { from, to } = {}, ref = "") {
       const id = idOf(boardId), unit = await tenancy.tenantOf(identity);

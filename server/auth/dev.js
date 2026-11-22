@@ -1,3 +1,4 @@
+// @ts-check
 // Dev tokens: a fixed table of token → identity, for local runs and load tests. OFF unless the caller passes
 // `{ enabled: true, tokens }` explicitly (`tokens` a plain object or a Map; every entry needs a name); with no config, or enabled without a table, every token is refused.
 // Dev users are namespaced "dev:<name>", so they can never collide with a Google user ("google:<sub>").

@@ -1,3 +1,4 @@
+// @ts-check
 // Admin functions: invite / share-link / grant management, as plain functions (HTTP wiring: server/auth/http.js). Board creation is
 // server/auth/spaces.js (`board.create` at a Space, or the personal space). A hello never creates a board.
 //
@@ -19,9 +20,9 @@ import { withinLadder } from "../auth/permissions.js";
 
 export class AdminError extends Error {
   /**
-   * @param {"forbidden"|"bad-request"|"not-found"|"last-owner"|"unknown-person"|"bad-role"|"too-large"|"in-use"|"confirm-required"|"rate-limited"|"moved"|"with-space"|"space-in-trash"|"purged"|"would-escalate"} code
+   * @param {"forbidden"|"bad-request"|"not-found"|"last-owner"|"unknown-person"|"bad-role"|"too-large"|"in-use"|"confirm-required"|"rate-limited"|"moved"|"with-space"|"space-in-trash"|"purged"|"would-escalate"|"limit"|"personal"|"bad-recipient"|"is-admin"|"still-owns"|"superseded"} code
    * @param {string} [message]
-   * @param {{ cause?: unknown, data?: object }} [extra]  `data`: fields the HTTP answer adds (`in-use`, `confirm-required`)
+   * @param {{ cause?: unknown, data?: Record<string, any> }} [extra]  `data`: fields the HTTP answer adds (`in-use`, `confirm-required`)
    */
   constructor(code, message, extra = {}) {
     super(message);
@@ -172,7 +173,7 @@ export async function createBoard({ caller, tenant, title = "", memberRole = "vi
       targetSpace = (await registry.ensurePersonalSpace(tenant, caller.user, { name: caller.name, email: caller.email })).id;
     }
   }
-  const board = await registry.createBoard({ tenant, title, memberRole, space: targetSpace, owner: caller.user });
+  const board = await registry.createBoard({ tenant, title, memberRole: /** @type {import("../auth/registry-port.js").Role | null} */ (memberRole), space: targetSpace, owner: caller.user });
   await recordAudit(registry, {
     tenant: board.tenant,
     board: board.id,
@@ -197,6 +198,7 @@ export async function updateBoard({ caller, board, title, memberRole }, { regist
   const hasTitle = title !== undefined;
   const hasRole = memberRole !== undefined;
   if (!hasTitle && !hasRole) throw bad("nothing to update");
+  /** @type {{ title?: string, memberRole?: import("../auth/registry-port.js").Role | "none" | null }} */
   const patch = {};
   if (hasTitle) {
     if (typeof title !== "string" || CONTROL.test(title)) throw bad("bad title");
@@ -207,7 +209,7 @@ export async function updateBoard({ caller, board, title, memberRole }, { regist
   if (hasRole) {
     if (!(await isTenantAdmin(registry, caller, b.tenant))) throw forbidden();
     if (memberRole === null || memberRole === "none") patch.memberRole = null;
-    else if (typeof memberRole === "string" && INVITE_ROLES.includes(memberRole)) patch.memberRole = memberRole;
+    else if (typeof memberRole === "string" && INVITE_ROLES.includes(memberRole)) patch.memberRole = /** @type {import("../auth/registry-port.js").Role} */ (memberRole);
     else throw bad("bad memberRole");
   }
   const updated = await registry.updateBoard(b.id, patch);

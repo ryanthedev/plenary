@@ -1,3 +1,4 @@
+// @ts-check
 // Identity, and the two ports that produce one: the IdP port (interactive sign-in) and the Verifier port (a token
 // the server already issued). Types only; no adapter code. Adapters: oidc.js (IdP: Google), session.js and dev.js
 // (Verifier). Contract tests: test/auth/idp-contract.js, test/auth/verifier-contract.js.
@@ -38,13 +39,13 @@
 //     `identity.exp` and the same object goes on to role(identity, board) and the admin use cases unchanged.
 
 /**
- * @typedef {{ user: string, name: string|null, email: string|null, domain: string|null }} Identity
+ * @typedef {{ user: string, name: string|null, email: string|null, domain: string|null, emailVerified?: boolean }} Identity
  *
  * @typedef {{ url: string, state: string, nonce: string, verifier: string }} LoginStart
  *
  * @typedef {{
  *   begin(): Promise<LoginStart>,
- *   finish(o: { code: unknown, state: unknown, expected: Partial<LoginStart>|null|undefined }): Promise<Identity|null>,
+ *   finish(o: { code: unknown, state: unknown, expected: Partial<LoginStart>|null|undefined, why?: (cause: string) => void }): Promise<Identity|null>,
  * }} IdP
  *
  * @typedef {Identity & { exp?: number }} Session

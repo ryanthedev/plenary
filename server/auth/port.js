@@ -1,3 +1,4 @@
+// @ts-check
 // The Auth port (PROTOCOL.md § Auth), and `authPort`, its one implementation: a composition over injected Verifier
 // adapters (session.js, dev.js) and tenancy.js, importing no adapter. The only thing the gateway imports from
 // server/auth. The Identity and Verifier types it uses live in idp-port.js.
@@ -21,13 +22,23 @@
  * @typedef {import("./idp-port.js").Identity} Identity
  * @typedef {import("./idp-port.js").Session} Session
  * @typedef {import("./idp-port.js").Verifier} Verifier
- * @typedef {{ verify(token: unknown): Promise<Session|null>, role(id: Identity, board: string): Promise<string|null> }} Auth
+ * @typedef {{
+ *   verify(token: unknown): Promise<Session|null>,
+ *   role(id: Identity, board: string): Promise<string|null>,
+ *   access?(id: Identity, board: string): Promise<{ role: string|null, share: boolean, move: boolean }>,
+ *   rolesFor?(board: string, ids: Identity[]): Promise<Map<string, string|null>>,
+ *   invalidate?(board: string, user?: string): void,
+ * }} Auth
  */
 
 /**
  * @param {{ sessions?: Verifier, dev?: Verifier,
- *   tenancy: { role(id: Identity, board: string): Promise<string|null>,
- *     rolesFor?(board: string, ids: Identity[]): Promise<Map<string, string|null>>, invalidate?(board: string, user?: string): void } }} deps
+ *   tenancy: {
+ *     role(id: Identity, board: string): Promise<string|null>,
+ *     access?(id: Identity, board: string): Promise<{ role: string|null, share: boolean, move: boolean }>,
+ *     rolesFor?(board: string, ids: Identity[]): Promise<Map<string, string|null>>,
+ *     invalidate?(board: string, user?: string): void,
+ *   } }} deps
  * @returns {Auth}
  */
 export function authPort({ sessions, dev, tenancy }) {

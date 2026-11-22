@@ -1,3 +1,4 @@
+// @ts-check
 // Shared SQLite start-up helper for the SQLite adapters (server/store/sqlite.js, server/registry/sqlite.js). Adapter-only
 // support code, like server/pg/schema.js: core must not import it (test/architecture.test.js). It imports no project module.
 //

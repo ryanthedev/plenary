@@ -1,3 +1,4 @@
+// @ts-check
 // Role resolution: who may do what on a board. Read live from the Registry on every call, so an expired or
 // revoked invite or link stops working on the next role() (i.e. the next hello). `tenancy` never caches; the
 // optional cache over it, `roleCache`, is at the end of this file (p5-load).
@@ -36,7 +37,7 @@ export const USE_CHUNK = 1000;
 /**
  * The key `rolesFor` answers by: what a role reads (user; email, for invites; domain, for membership). The gateway's
  * re-check pass groups connections by exactly this key and looks its answers up with it.
- * @param {{ user: string, email?: string|null, domain?: string|null }} id
+ * @param {{ user: string, email?: string|null, domain?: string|null, emailVerified?: boolean }} id
  */
 export const identityKey = id => `${id.user}\n${id.email ?? ""}\n${id.domain ?? ""}${id.emailVerified === false ? "\n0" : ""}`;
 
@@ -147,7 +148,7 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
    * Many identities' roles on one board, from the board's rows read once. Keyed by `identityKey` (user, email,
    * domain: what a role reads), so two identities of one user (tabs signed in with different emails or domains) get
    * their own answers (p5-loadv finding 2). `ctx`: the board's context when the caller already read it; `target` (a move's dry run): the destination Space's context, and
-   * each entry then also carries the full `before` and `after` Access of the same rows with the board in that Space. @returns {Promise<Map<string, Resolved & { identity: Identity }>>}
+   * each entry then also carries the full `before` and `after` Access of the same rows with the board in that Space. @returns {Promise<Map<string, Resolved & { identity: Identity, before?: import("./resolver.js").Access, after?: import("./resolver.js").Access }>>}
    * one entry per distinct requested identity key
    */
   async function resolveMany(boardId, identities, { ctx: given = null, target = null } = {}) {
@@ -438,7 +439,7 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
 
   // ---- records: board, link (by id) ----
   /** @type {Map<string, { value: any, until: number, board: string|null }>} */ const records = new Map();
-  /** @type {Map<string, { p: Promise<any>, c0: number }>} in-flight record reads, with the clock they began at */ const recordReads = new Map();
+  /** @type {Map<string, { p: Promise<any>, c0: number, t: number }>} in-flight record reads, with the clock they began at */ const recordReads = new Map();
   /** @type {Map<string, Set<string>>} board → its memoized link keys */ const linksOf = new Map();
   const dropLinks = board => { for (const k of linksOf.get(board) ?? []) records.delete(k); linksOf.delete(board); };
   function memo(kind, fetch) {
@@ -564,7 +565,7 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
         if (m) {
           const boardMoved = (boardStamp.get(boardId) ?? 0) > c0, others = reading > 1;
           // `moved` for every identity first (stamps below must not mark this call's own other identities moved)
-          const rows = [...m.values()].map(r => ({ r, uk: ukey(boardId, r.identity.user) }));
+          const rows = [...m.values()].map(r => ({ r, uk: ukey(boardId, r.identity.user), moved: false }));
           for (const x of rows) x.moved = boardMoved || (userStamp.get(x.uk) ?? 0) > c0;
           for (const { r, uk, moved } of rows) {
             remove(ekey(boardId, r.identity));

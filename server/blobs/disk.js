@@ -1,3 +1,4 @@
+// @ts-check
 // The Blobs port on local disk (PROTOCOL.md § Blobs), for a single node.
 //   put(tenant, sha1, bytes)   idempotent; refuses > 10 MB (images) / > 50 MB (videos), a hash mismatch, and anything that isn't PNG/JPEG/GIF/WebP/MP4/WebM/QuickTime;
 //                              true when it stored the blob, false when the tenant already had it

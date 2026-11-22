@@ -1,3 +1,4 @@
+// @ts-check
 // The Bus port in memory (PROTOCOL.md § Bus), for a single node. Same contract as the cluster bus (NATS core):
 //   - exact subjects, no wildcards;
 //   - at-most-once: a message published with no subscriber is gone; a subscriber that throws loses that message;
@@ -12,7 +13,7 @@ import { PortError, isClusterId } from "../ids.js";
 export { subjects };
 
 /**
- * @param {{ onError?: (err: unknown, subject: string) => void, maxBytes?: number }} [o]
+ * @param {{ onError?: (err: unknown, subject: string) => void, maxBytes?: number, cluster?: string | null }} [o]
  *   maxBytes: the message cap (§ Bus, 2 MB by default, as NATS); a bigger publish is refused like NATS refuses it
  *   (the promise rejects with PortError "too-large", and onError hears of it). Tests pass a small one.
  *   cluster: scope every subject to a cluster id, as the NATS adapter does (PROTOCOL.md § Bus, Cluster id).

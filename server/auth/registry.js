@@ -1,3 +1,4 @@
+// @ts-check
 // The in-memory Registry adapter (tests, single-process dev), including the board organization. The port (typedefs, `mint`, `RegistryError`, the
 // last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
@@ -28,7 +29,7 @@ const parseCursor = before => {
 
 /**
  * An in-memory Registry (tests, single-process dev). Returns copies, so callers can't mutate its state.
- * @returns {Registry}
+ * @returns {Registry & { idemSize(): number }}
  */
 export function memoryRegistry({ now = Date.now } = {}) {
   /** @type {Map<string, Tenant>} */ const tenants = new Map();
@@ -45,7 +46,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
   /** @type {Map<string, Space>} */ const spaces = new Map();
   /** @type {Map<string, Team>} */ const teams = new Map();
   /** @type {Map<string, Set<string>>} team → members */ const members = new Map();
-  /** @type {Map<string, Map<string, { user: string, name: string|null, email: string|null }>>} tenant → user → directory row (`removedAt`/`removedBy`: PROTOCOL.md § Leaver offboarding) */ const directory = new Map();
+  /** @type {Map<string, Map<string, { user: string, name: string|null, email: string|null, removedAt?: number|null, removedBy?: string|null }>>} tenant → user → directory row (`removedAt`/`removedBy`: PROTOCOL.md § Leaver offboarding) */ const directory = new Map();
   /** @type {Map<string, Map<string, string>>} "type\nid" → ("type\nid" of the subject → role) */ const scoped = new Map();
   /** @type {Map<string, Map<string, CustomRole>>} tenant → id → role */ const roles = new Map();
   /** @type {Map<string, Map<string, number>>} user → board → opened at (Recent) */ const recent = new Map();
@@ -91,7 +92,9 @@ export function memoryRegistry({ now = Date.now } = {}) {
   /** What `user` solely owns in a Unit: their personal space, and every Group or Space whose only counted owner they are (trashed ones too). One page, by "<type>\n<id>". */
   const aloneOf = (tenant, user, after, n) => {
     const all = [];
-    for (const [type, map] of [["group", groups], ["space", spaces]]) for (const row of map.values()) {
+    /** @type {(["group"|"space", Map<string, any>])[]} */
+    const maps = [["group", groups], ["space", spaces]];
+    for (const [type, map] of maps) for (const row of map.values()) {
       if (row.tenant !== tenant) continue;
       const personal = type === "space" && row.kind === "personal" && row.owner === user;
       if (personal || soleOwner(type, row.id, user)) all.push({ type, id: row.id, personal });
@@ -400,7 +403,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const size = id => Math.min([...boards.values()].filter(b => b.trashedWith === id).length, TRASH.sizeCap + 1);
       return { spaces: rest.slice(0, n).map(s => ({ ...copy(s), boards: size(s.id) })), next: rest.length > n ? rest[n - 1].id : null };
     },
-    async trashDue({ before, limit, claimed: want, after } = {}) {
+    async trashDue({ before, limit, claimed: want, after } = /** @type {any} */ ({})) {
       if (!Number.isFinite(before)) throw new Error("registry: bad time");
       const n = smallLimit(limit, TRASH.due.default, TRASH.due.max);
       const byId = (a, b) => (a.id < b.id ? -1 : 1), oldest = (a, b) => a.trashedAt - b.trashedAt || byId(a, b);
@@ -419,7 +422,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
       if ((type !== "board" && type !== "space") || !Number.isFinite(before)) throw new Error("registry: bad purge");
       const row = (type === "board" ? boards : spaces).get(id), c = type === "board" ? "b" : "s";
       if (!row || row.trashedAt == null || !(row.trashedAt <= before || claimed.has(c + "\n" + id))) return false;
-      if (type === "board" && row.trashedWith != null && !claimed.has("b\n" + id)) return false;   // a board that went with its Space is claimed only with it
+      if (type === "board" && "trashedWith" in row && row.trashedWith != null && !claimed.has("b\n" + id)) return false;   // a board that went with its Space is claimed only with it
       claimed.add(c + "\n" + id);
       if (type === "space") for (const b of boards.values()) if (b.trashedWith === id) claimed.add("b\n" + b.id);
       return true;
@@ -517,7 +520,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
       audits.push(rec);
       return copy(rec);
     },
-    async listAudit({ tenant, board = null, limit = 50, before = null } = {}) {
+    async listAudit({ tenant, board = null, limit = 50, before = null } = /** @type {any} */ ({})) {
       if (typeof tenant !== "string") return { events: [], nextBefore: null };
       if (board != null && typeof board !== "string") return { events: [], nextBefore: null };
       const cur = parseCursor(before);
@@ -553,7 +556,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
       if (group != null) need(groups.get(group)?.tenant === tenant, "group");
       noRemoved(tenant, owner);
       const k = idemEnter(key);
-      const sp = { id: fresh(spaces, mint.space), tenant, group, name: orgDefaults.name(name), kind: "shared", owner: null, generalRole, createdAt: now(), trashedAt: null, trashedBy: null, archivedAt: null };
+      const sp = { id: fresh(spaces, mint.space), tenant, group, name: orgDefaults.name(name), kind: /** @type {"shared"} */ ("shared"), owner: null, generalRole, createdAt: now(), trashedAt: null, trashedBy: null, archivedAt: null };
       spaces.set(sp.id, sp);
       if (owner != null) putScoped("space", sp.id, "user", String(owner), "owner");
       idemPut(k, sp.id);
@@ -570,7 +573,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const { type, id } = orgDefaults.renamable(scope, ["board", "space", "group"]);
       const row = (type === "board" ? boards : type === "space" ? spaces : groups).get(id);
       need(row, type);
-      if (type === "board") row.title = orgDefaults.title(name); else row.name = orgDefaults.name(name);
+      if (type === "board") /** @type {Board} */ (row).title = orgDefaults.title(name); else /** @type {Space | Group} */ (row).name = orgDefaults.name(name);
       return copy(row);
     },
     async updateScope(scope, patch) {
@@ -662,7 +665,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
     async scopedGrantsPage(scope, { after = null, limit } = {}) {
       const { type, id } = orgDefaults.scope(scope), cur = orgDefaults.cursor(after, "subject"), n = smallLimit(limit, TEAMS.page.default, TEAMS.page.max);
       const all = [...(scoped.get(sk(type, id)) ?? [])].filter(([k]) => cur == null || k > cur).sort(([a], [b]) => (a < b ? -1 : 1));
-      const rows = all.slice(0, n).map(([k, role]) => { const [t, ...i] = k.split("\n"); return { subject: { type: t, id: i.join("\n") }, role }; });
+      const rows = all.slice(0, n).map(([k, role]) => { const [t, ...i] = k.split("\n"); return { subject: { type: /** @type {"user"|"team"} */ (t), id: i.join("\n") }, role }; });
       return { grants: rows, next: all.length > n ? all[n - 1][0] : null };
     },
     async touchMember(tenant, { user, name = null, email = null }) {
@@ -700,7 +703,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
     },
     async scopedGrants(scope) {
       const { type, id } = orgDefaults.scope(scope);
-      return [...(scoped.get(sk(type, id)) ?? [])].map(([k, role]) => { const [t, ...i] = k.split("\n"); return { subject: { type: t, id: i.join("\n") }, role }; });
+      return [...(scoped.get(sk(type, id)) ?? [])].map(([k, role]) => { const [t, ...i] = k.split("\n"); return { subject: { type: /** @type {"user"|"team"} */ (t), id: i.join("\n") }, role }; });
     },
 
     async createRole({ tenant, name, base = null, boardRole, permissions = [], max, idem: key }) {
@@ -769,7 +772,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
 
     async accessContexts(scopes, { users } = {}) {
       const out = new Map();
-      for (const sc of batchScopes(scopes)) out.set(sc.type + "\n" + sc.id, await this.accessContext(sc, { users }));
+      for (const sc of batchScopes(scopes)) out.set(sc.type + "\n" + sc.id, await this.accessContext(/** @type {import("./registry-port.js").ScopeRef} */ (sc), { users }));
       return out;
     },
 
@@ -792,7 +795,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const ids = new Set([...requests.values()].map(v => v.id));
       let id;
       while (!id || ids.has(id)) id = mint.request();
-      const row = { id, tenant, scope: sc, user, role: r, state: "pending", at: t, closedAt: null };
+      const row = { id, tenant, scope: sc, user, role: r, state: /** @type {"pending"} */ ("pending"), at: t, closedAt: null };
       requests.set(k, row);
       idemPut(i, row.id);
       return copy(row);
@@ -814,7 +817,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
     async grantHolders(scope, rolesIn, { limit } = {}) {
       const sc = orgDefaults.scope(scope), want = new Set(rolesIn ?? []);
       return [...(scoped.get(sk(sc.type, sc.id)) ?? [])].filter(([, role]) => want.has(role))
-        .map(([k, role]) => { const [st, ...si] = k.split("\n"); return { subject: { type: st, id: si.join("\n") }, role }; })
+        .map(([k, role]) => { const [st, ...si] = k.split("\n"); return { subject: { type: /** @type {"user"|"team"} */ (st), id: si.join("\n") }, role }; })
         .sort((a, b) => (a.subject.type + "\n" + a.subject.id < b.subject.type + "\n" + b.subject.id ? -1 : 1)).slice(0, smallLimit(limit, ASK.holders, ASK.holders));
     },
 
@@ -861,7 +864,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const scanned = window.slice(0, cap);
       return { ids: scanned.filter(id => hit(boards.get(id))), next: window.length > cap ? scanned[cap - 1] : null };   // `next`: the Unit goes on past the window, whatever matched
     },
-    async spaceCandidates(tenant, { user, all = false, personal = false, after = null, limit } = {}) {
+    async spaceCandidates(tenant, { user, all = false, personal = false, after = null, limit } = /** @type {any} */ ({})) {
       after = orgDefaults.cursor(after, "id");
       const n = smallLimit(limit, HOME.candidates.spaces.default, HOME.candidates.spaces.max);
       const mine = [sk("user", user), ...[...members].filter(([, m]) => m.has(user)).map(([t]) => sk("team", t))];
@@ -872,13 +875,13 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const page = rows.slice(0, n), gs = [...new Set(page.map(sp => sp.group).filter(Boolean))].map(g => groups.get(g)).filter(Boolean);
       return copy({ spaces: page, groups: gs, next: rows.length > n ? page[n - 1].id : null });
     },
-    async groupCandidates(tenant, { user, all = false, limit } = {}) {
+    async groupCandidates(tenant, { user, all = false, limit } = /** @type {any} */ ({})) {
       const n = smallLimit(limit, HOME.candidates.groups.default, HOME.candidates.groups.max);
       const mine = [sk("user", user), ...[...members].filter(([, m]) => m.has(user)).map(([t]) => sk("team", t))];
       const granted = id => { const g = scoped.get(sk("group", id)); return !!g && mine.some(k => g.has(k)); };
       return copy([...groups.values()].filter(g => g.tenant === tenant && (all || g.generalRole != null || granted(g.id))).sort((a, b) => (a.id < b.id ? -1 : 1)).slice(0, n));
     },
-    async boardRows(ids, { user, email = null } = {}) {
+    async boardRows(ids, { user, email = null } = /** @type {any} */ ({})) {
       const out = new Map(), e = email ? normEmail(email) : null;
       for (const id of [...new Set(ids)].slice(0, HOME.batch)) {
         const board = boards.get(id);
@@ -910,14 +913,14 @@ export function memoryRegistry({ now = Date.now } = {}) {
     async ownedAlone(tenant, user, { after = null, limit } = {}) {
       return aloneOf(tenant, String(user), orgDefaults.cursor(after, "scope"), smallLimit(limit, TEAMS.page.default, TEAMS.page.max));
     },
-    async reassignOwner({ scope, from, to, name, idem: key }) {
+    async reassignOwner({ scope, from, to, idem: key }) {
       const sc = orgDefaults.renamable(scope, ["space", "group"]);
       const row = (sc.type === "space" ? spaces : groups).get(sc.id);
       need(row, sc.type);
       from = String(from); to = String(to);
       const dir = directory.get(row.tenant);
       if (from === to || !dir?.has(to) || dir.get(to).removedAt != null) throw new RegistryError("bad-recipient", "registry: the recipient is not a live member of the Unit");
-      if (sc.type === "space" && row.kind === "personal") throw new RegistryError("personal", "registry: a personal space is handed over only by removeMember");
+      if (sc.type === "space" && "kind" in row && row.kind === "personal") throw new RegistryError("personal", "registry: a personal space is handed over only by removeMember");
       const k = idemEnter(key);
       const done = soleOwner(sc.type, sc.id, from);
       if (done) {
@@ -966,7 +969,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
     async personalScopesOf(subject, { limit = 50 } = {}) {
       const sub = orgDefaults.subject(subject), me = sk(sub.type, sub.id), n = Math.min(Math.max(Number.isSafeInteger(limit) ? limit : 50, 1), 50);
       const personal = (type, id) => spaces.get(type === "space" ? id : type === "board" ? boards.get(id)?.space : null)?.kind === "personal";
-      const all = [...scoped].filter(([, g]) => g.has(me)).map(([k, g]) => { const [type, ...i] = k.split("\n"); return { type, id: i.join("\n"), role: g.get(me) }; })
+      const all = [...scoped].filter(([, g]) => g.has(me)).map(([k, g]) => { const [type, ...i] = k.split("\n"); return { type: /** @type {"unit"|"group"|"space"|"board"} */ (type), id: i.join("\n"), role: g.get(me) }; })
         .filter(x => personal(x.type, x.id)).sort((x, y) => (x.type + "\n" + x.id < y.type + "\n" + y.id ? -1 : 1));
       return { scopes: all.slice(0, n), more: all.length > n };
     },
@@ -974,7 +977,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
     async scopesOf(subject, { after = null, limit } = {}) {
       const sub = orgDefaults.subject(subject), me = sk(sub.type, sub.id);
       after = orgDefaults.cursor(after, "scope");
-      const all = [...scoped].filter(([, g]) => g.has(me)).map(([k, g]) => { const [type, ...i] = k.split("\n"); return { type, id: i.join("\n"), role: g.get(me) }; })
+      const all = [...scoped].filter(([, g]) => g.has(me)).map(([k, g]) => { const [type, ...i] = k.split("\n"); return { type: /** @type {"unit"|"group"|"space"|"board"} */ (type), id: i.join("\n"), role: g.get(me) }; })
         .sort((x, y) => (x.type + "\n" + x.id < y.type + "\n" + y.id ? -1 : 1));
       const cur = s => s.type + "\n" + s.id, n = pageLimit(limit), rest = after == null ? all : all.filter(x => cur(x) > after), page = rest.slice(0, n);
       return { scopes: page, next: rest.length > n ? cur(page[n - 1]) : null };

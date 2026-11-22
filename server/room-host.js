@@ -1,3 +1,4 @@
+// @ts-check
 // The room host: runs one packages/protocol Room (v1.1) per open board and joins it to the Store and the Bus.
 // Core code: it depends on the Store and Bus ports only (main.js picks the adapters).
 //
@@ -82,9 +83,13 @@ export function newHolder(hostname) {
 }
 
 /**
- * @param {{ store: object, bus: object, log?: object, codec?: object, now?: () => number, appendTimeoutMs?: number,
- *   sweepMs?: number, heartbeatMs?: number, pageSize?: number, pageBytes?: number, rules?: object, maxBusBytes?: number,
- *   holder?: string, hostname?: string, leaseTtlMs?: number, watchIdleMs?: number, storeTimeoutMs?: number, stuckMs?: number, monotonic?: () => number, timers?: object,
+ * @param {{ store: Pick<import("./store/port.js").Store, "append"|"read"|"lastSeq"|"putCheckpoint"|"getCheckpoint"|"openEpoch"|"epoch"|"acquire"|"renew"|"release"|"lease">,
+ *   bus: import("./bus/port.js").Bus,
+ *   log?: { debug?(msg: string, f?: object): void, info(msg: string, f?: object): void, warn(msg: string, f?: object): void, error(msg: string, f?: object): void },
+ *   codec?: { encode(v: any): any, decode(v: any): any }, now?: () => number, appendTimeoutMs?: number,
+ *   sweepMs?: number, heartbeatMs?: number, pageSize?: number, pageBytes?: number, rules?: Record<string, any>, maxBusBytes?: number,
+ *   tailFoldBytes?: number, foldUnits?: number, schedule?: (fn: () => void) => void, checkpointTimeoutMs?: number,
+ *   holder?: string, hostname?: string, leaseTtlMs?: number, watchIdleMs?: number, storeTimeoutMs?: number, stuckMs?: number, monotonic?: () => number, timers?: Record<string, any>,
  *   metrics?: import("./metrics/port.js").Metrics }} o   metrics: plenary_boards_hosted, plenary_ops_total, plenary_lease_changes_total (PROTOCOL.md § Metrics; default records nothing)
  *   now: the rooms' clock (entries' `at`, the 30 s gateway silence). rules: per rules version { W, H, every } (tests).
  *   holder: this instance's lease holder id (tests); default newHolder(hostname). leaseTtlMs: the Store lease's ttl
@@ -117,7 +122,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
   // compares the Store's clock (`expiresAt`) with its own. While it still loses, it tries again every ttl/3.
   const margin = Math.max(20, Math.floor(leaseTtlMs / 50));
   const silentAfter = 2 * heartbeatMs;
-  /** @type {Map<string, Promise<object>>} key "tenant/board" → the slot, once built */
+  /** @type {Map<string, Promise<Record<string, any>>>} key "tenant/board" → the slot, once built */
   const slots = new Map();
   // PROTOCOL.md § Metrics. `metrics` records only; a failure inside it never reaches this code (the port never throws).
   metrics.gauge("plenary_boards_hosted", "Rooms this host holds or is building.", () => slots.size);
@@ -662,7 +667,7 @@ export function roomHost({ store, bus, log = quietLogger, codec = jsonCodec, now
  * watching), then replies `{ n, board, state }` on `subjects.opened(gateway)`. A reply goes only after the local open
  * settled, so a "held" reply means the room already listens on the board's inbox. A local open that throws sends no
  * reply (logged): the requester times out. Returns the unsubscribe.
- * @param {{ bus: object, rooms: { open(tenant: string, board: string): Promise<string> }, log?: object }} o
+ * @param {{ bus: import("./bus/port.js").Bus, rooms: { open(tenant: string, board: string): Promise<string> }, log?: { warn(msg: string, f?: object): void, error(msg: string, f?: object): void } }} o
  */
 export function serveOpens({ bus, rooms, log = quietLogger }) {
   return bus.subscribe(subjects.open, m => {
@@ -689,7 +694,7 @@ export function serveOpens({ bus, rooms, log = quietLogger }) {
  * is answered 1013 (or lost) instead of welcomed (p4-wire round 2). No reply at all rejects after `timeoutMs` (the
  * gateway then answers the hello `unavailable`). Never cached: every writer hello asks again, because a replaced
  * host has no room until someone asks. At most one request in flight per board; other opens share it.
- * @param {{ bus: object, node: string, timeoutMs: number, log?: object,
+ * @param {{ bus: import("./bus/port.js").Bus, node: string, timeoutMs: number, log?: { warn(msg: string, f?: object): void, error?(msg: string, f?: object): void },
  *   timers?: { setTimeout: Function, clearTimeout: Function } }} o node: this node's id (the requester id is
  *   `r-<node>-<random>`, unique per instance). timers: the ttl and grace clock (tests pass a fake).
  */
@@ -732,6 +737,7 @@ export function remoteRooms({ bus, node, timeoutMs, log = quietLogger, timers = 
       let msg;
       try { subjects.entries(tenant, board); msg = { tenant, board, gateway: me, n: ++next }; }
       catch (err) { return Promise.reject(err); }
+      /** @type {Record<string, any>} */
       const r = { n: msg.n, board };
       r.promise = new Promise((res, rej) => { r.resolve = res; r.reject = rej; });
       r.timer = later(() => settle(key, new PortError("unavailable", "no room host answered the open: is a host node running?")), timeoutMs);

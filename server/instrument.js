@@ -1,3 +1,4 @@
+// @ts-check
 // Store latency (PROTOCOL.md § Metrics): a decorator over the Store port that times every call and counts rejections.
 // Core: it sees only the port's method names and the Metrics port. The caller (main.js) wraps the Store once, so the
 // room host, the gateway's feeds and everything else are measured the same way. Behaviour is unchanged: same results,

@@ -1,3 +1,4 @@
+// @ts-check
 // Catch-up compression adapter (PROTOCOL.md § Joining, "Compressed catch-up"): one zlib stream per shared catch-up frame.
 // The feed calls it once per snapshot or chunk text and keeps the result, so a thousand joiners pay for one deflate.
 // Runs on libuv's thread pool (async), never on the event loop: a 100 MB snapshot must not stall every socket.

@@ -1,3 +1,4 @@
+// @ts-check
 // The Registry port on Postgres (PROTOCOL.md § Registry): tenants (Units), boards, grants, invites, share links, link uses, and
 // the board organization (Groups, Spaces, Teams, scoped grants, roles, `accessContext`). The organization tables are created
 // like the rest (only if missing, to_regclass); nothing is ever altered, and a store from an older shape is refused (code "old-format").
@@ -156,8 +157,11 @@ export const registryTables = schema => {
   const q = `"${needSchema(schema)}"`;
   return Object.fromEntries(Object.entries(REGISTRY_TABLE_DDL).map(([k, v]) => [k, v.replaceAll("$S", q)]));
 };
-/** A tenant row always has its kind row (createTenant writes both in one step): a missing one is a corrupt store, never a silent default. */
-const needKind = (kind, id) => { if (typeof kind !== "string") throw new RegistryError("corrupt", `tenant ${id} has no kind row`); return kind; };
+/**
+ * A tenant row always has its kind row (createTenant writes both in one step): a missing one is a corrupt store, never a silent default.
+ * @returns {import("../auth/registry-port.js").UnitKind}
+ */
+const needKind = (kind, id) => { if (typeof kind !== "string") throw new RegistryError("corrupt", `tenant ${id} has no kind row`); return /** @type {import("../auth/registry-port.js").UnitKind} */ (kind); };
 /** A string Postgres will take as text (no NUL). */
 const key = v => typeof v === "string" && !v.includes("\0");
 const num = v => (v == null ? null : Number(v));
@@ -176,7 +180,7 @@ const parseCursor = before => {
  *   lockTimeoutMs: the longest a statement waits for a lock, and start-up for the schema's start-up lock (default 15 s).
  *   statementTimeoutMs: the longest a statement runs, lock waits included (default 15 s). See "Timeouts" above.
  *   maxInFlight, maxQueued, queueTimeoutMs: the client-side gate (see "The gate" above for the defaults).
- * @returns {Promise<import("../auth/registry-port.js").Registry & { close(): Promise<void>, settings(): Promise<object> }>}
+ * @returns {Promise<import("../auth/registry-port.js").Registry & { close(): Promise<void>, settings(): Promise<object>, gate?: () => { running: number, waiting: number, maxInFlight: number, maxQueued: number, queueTimeoutMs: number } }>}
  */
 export async function postgresRegistry({ url, sql, max, schema = "public", now = Date.now, lockTimeoutMs = 15_000, statementTimeoutMs = 15_000,
   maxInFlight, maxQueued, queueTimeoutMs }) {
@@ -362,6 +366,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
   const rowAudit = r => r && { id: num(r.id), tenant: r.tenant, board: r.board, actor: r.actor, action: r.action, target: r.target, detail: r.detail == null ? null : JSON.parse(r.detail), at: num(r.at) };
   const boardExists = async (q, id) => key(id) && !!(await one(q, `SELECT 1 AS x FROM ${BD} WHERE id = $1`, [id]));
 
+  /** @type {import("../auth/registry-port.js").Registry & { close(): Promise<void>, settings(): Promise<object>, readSettings?(): Promise<object>, gate?: () => { running: number, waiting: number, maxInFlight: number, maxQueued: number, queueTimeoutMs: number }, idemPrune?(t: number): Promise<void>, idemSize?(): Promise<number> }} */
   const api = {
     async createTenant({ name = null, domain, domains = [], kind = "company", admins = [] }) {
       ready();
@@ -642,7 +647,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         WHERE s.tenant = $1 AND s.trashed_at IS NOT NULL AND NOT s.purging AND ($2::text IS NULL OR s.id > $2) ORDER BY s.id LIMIT $3`, [tenant, cur, n + 1, TRASH.sizeCap + 1])).map(r => ({ ...rowSpace(r), boards: Number(r.boards) }));
       return { spaces: rows.slice(0, n), next: rows.length > n ? rows[n - 1].id : null };
     },
-    async trashDue({ before, limit, claimed, after } = {}) {
+    async trashDue({ before, limit, claimed, after } = /** @type {any} */ ({})) {
       ready();
       if (!Number.isFinite(before)) throw new Error("registry: bad time");
       const n = smallLimit(limit, TRASH.due.default, TRASH.due.max);
@@ -941,7 +946,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         return rowAudit(r);
       });
     },
-    async listAudit({ tenant, board = null, limit = 50, before = null } = {}) {
+    async listAudit({ tenant, board = null, limit = 50, before = null } = /** @type {any} */ ({})) {
       ready();
       if (!key(tenant)) return { events: [], nextBefore: null };
       if (board != null && !key(board)) return { events: [], nextBefore: null };
@@ -1536,7 +1541,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       const edge = await db.unsafe(`SELECT id FROM ${BD} WHERE tenant = $1 AND trashed_at IS NULL AND ($2::text IS NULL OR id > $2) ORDER BY id LIMIT 2 OFFSET $3`, [tenant, cur, cap - 1]);
       return { ids, next: edge.length === 2 ? edge[0].id : null };
     },
-    async spaceCandidates(tenant, { user, all = false, personal = false, after = null, limit } = {}) {
+    async spaceCandidates(tenant, { user, all = false, personal = false, after = null, limit } = /** @type {any} */ ({})) {
       ready();
       const cur = orgDefaults.cursor(after, "id"), n = smallLimit(limit, HOME.candidates.spaces.default, HOME.candidates.spaces.max);
       if (!key(tenant) || !key(user)) return { spaces: [], groups: [], next: null };
@@ -1552,7 +1557,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       const groups = gids.length ? await db.unsafe(`SELECT * FROM ${GR} WHERE id IN (SELECT jsonb_array_elements_text($1::text::jsonb))`, [JSON.stringify(gids)]) : [];
       return { spaces: page.map(rowSpace), groups: groups.map(rowGroup), next: rows.length > n ? page[n - 1].id : null };
     },
-    async groupCandidates(tenant, { user, all = false, limit } = {}) {
+    async groupCandidates(tenant, { user, all = false, limit } = /** @type {any} */ ({})) {
       ready();
       if (!key(tenant) || !key(user)) return [];
       return (await db.unsafe(`SELECT gr.* FROM ${GR} gr WHERE gr.tenant = $1 AND ($3::boolean OR gr.general_role IS NOT NULL
@@ -1560,7 +1565,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
             OR (g.subject_type = 'team' AND g.subject IN (SELECT team FROM ${TU} WHERE member = $2))))) ORDER BY gr.id LIMIT $4`,
       [tenant, user, !!all, smallLimit(limit, HOME.candidates.groups.default, HOME.candidates.groups.max)])).map(rowGroup);
     },
-    async boardRows(ids, { user, email = null } = {}) {
+    async boardRows(ids, { user, email = null } = /** @type {any} */ ({})) {
       ready();
       const out = new Map(), bs = [...new Set((ids ?? []).filter(key))].slice(0, HOME.batch);
       if (!bs.length || !key(user)) return out;
@@ -1610,7 +1615,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       const rows = (await ownedAloneRows(db, tenant, user, cur, n + 1)).map(r => ({ type: r.type, id: r.id, personal: !!r.personal })), page = rows.slice(0, n);
       return { items: page, next: rows.length > n ? page[n - 1].type + "\n" + page[n - 1].id : null };
     },
-    async reassignOwner({ scope, from, to, name, idem }) {
+    async reassignOwner({ scope, from, to, idem }) {
       ready();
       const sc = orgDefaults.renamable(scope, ["space", "group"]);
       if (!key(from) || !key(to) || !key(sc.id)) throw new Error("registry: no such member");
